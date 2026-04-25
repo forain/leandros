@@ -76,14 +76,17 @@ const STACK_SIZE: usize = 16 * 1024; // 16 KiB
 /// Field offsets are part of the assembly ABI:
 ///   offset 0  (`gs:0`)  — `kernel_stack_top`: kernel RSP to load on entry.
 ///   offset 8  (`gs:8`)  — `user_rsp_save`:    slot for the user RSP.
-#[repr(C)]
+#[repr(C, align(16))]
 struct PerCpuSyscall {
     kernel_stack_top: u64,
     user_rsp_save:    u64,
 }
 
+#[repr(align(16))]
+struct SyscallStack([u8; STACK_SIZE]);
+
 /// Static kernel stacks, one per CPU (placed in .bss, zero-initialized).
-static mut SYSCALL_STACKS: [[u8; STACK_SIZE]; MAX_CPUS] = [[0u8; STACK_SIZE]; MAX_CPUS];
+static mut SYSCALL_STACKS: [SyscallStack; MAX_CPUS] = [const { SyscallStack([0u8; STACK_SIZE]) }; MAX_CPUS];
 
 /// Per-CPU SYSCALL metadata (KERNEL_GS_BASE points here for each CPU).
 static mut PER_CPU: [PerCpuSyscall; MAX_CPUS] =
@@ -99,7 +102,7 @@ fn init_per_cpu(cpu_id: usize) {
     let idx = cpu_id.min(MAX_CPUS - 1);
     unsafe {
         // Stack grows downward; top = base + size.
-        let stack_top = SYSCALL_STACKS[idx].as_ptr().add(STACK_SIZE) as u64;
+        let stack_top = SYSCALL_STACKS[idx].0.as_ptr().add(STACK_SIZE) as u64;
         PER_CPU[idx].kernel_stack_top = stack_top;
 
         let per_cpu_ptr = core::ptr::addr_of!(PER_CPU[idx]) as u64;
@@ -185,32 +188,35 @@ syscall_entry:
     mov   rsp, gs:[0]     // RSP = PerCpuSyscall.kernel_stack_top (16-byte aligned)
 
     // 3. Save user RFLAGS and RIP (clobbered by SYSCALL instruction).
+    //    These MUST be saved first because they are in r11/rcx and the rearrangement below will clobber them.
     push  r11             // user RFLAGS                   RSP = top-8
     push  rcx             // user RIP                      RSP = top-16 (aligned)
 
     // 4. Save user registers that the rearrangement below will clobber.
-    //    Pushed before any modification so the original values land on stack.
     push  r10             // user r10 = a3                 RSP = top-24
-    push  r9              // user r9  = a5 (arg7 copy too) RSP = top-32 (aligned)
+    push  r9              // user r9  = a5                 RSP = top-32 (aligned)
     push  r8              // user r8  = a4                 RSP = top-40
     push  rdx             // user rdx = a2                 RSP = top-48 (aligned)
     push  rsi             // user rsi = a1                 RSP = top-56
     push  rdi             // user rdi = a0                 RSP = top-64 (aligned)
 
     // 5. Push stack args for syscall_dispatch (8 args: 6 in regs, 2 on stack).
-    //    r9 still holds the original a5 value here (not yet rearranged).
+    //    r9 still holds the original a5 value here.
     push  0               // arg8 = frame_ptr = 0          RSP = top-72
-    push  r9              // arg7 = a5                     RSP = top-80 (aligned) ✓
+    push  r9              // arg7 = a5                     RSP = top-80 (aligned)
 
     // 6. Rearrange regs for System V 6-register calling convention.
-    mov   r9,  r8         // a4 → r9  (before r8 is clobbered)
-    mov   r8,  r10        // a3 → r8
-    mov   rcx, rdx        // a2 → rcx (user RIP already saved)
-    mov   rdx, rsi        // a1 → rdx
-    mov   rsi, rdi        // a0 → rsi
-    mov   rdi, rax        // number → rdi
+    //    SysV: rdi, rsi, rdx, rcx, r8, r9
+    //    Cyanos: rax=nr, rdi=a0, rsi=a1, rdx=a2, r10=a3, r8=a4, r9=a5
+    mov   r9,  r8         // a4 → r9  (arg6)
+    mov   r8,  r10        // a3 → r8  (arg5)
+    mov   rcx, rdx        // a2 → rcx (arg4)
+    mov   rdx, rsi        // a1 → rdx (arg3)
+    mov   rsi, rdi        // a0 → rsi (arg2)
+    mov   rdi, rax        // number → rdi (arg1)
+    
     call  syscall_dispatch
-    // rax = return value (isize) — preserved through the restores below.
+    // rax = return value (isize)
 
     // 7. Remove arg7 + arg8 from stack (16 bytes).
     add   rsp, 16         // RSP = top-64
@@ -232,7 +238,7 @@ syscall_entry:
     swapgs
 
     // 11. Return to user space.
-    sysret
+    sysretq
 
 // ── arch_execve_return — drop into user space at a new entry / stack ──────
 //
