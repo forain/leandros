@@ -14,6 +14,7 @@
 /// FPU/SIMD state is always saved eagerly on every context switch.
 /// This is simpler than lazy-FPU (trap-on-use) and correct for all workloads.
 #[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct CpuContext {
     /// x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29(fp), x30(lr)
@@ -40,6 +41,7 @@ pub struct CpuContext {
 
 /// On all non-AArch64 targets (x86-64 and future ports).
 #[cfg(not(target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct CpuContext {
     /// Saved kernel stack pointer.
@@ -461,24 +463,24 @@ cpu_switch_to_with_pt:
     ret                          // branch to x30
 "#);
 
-// ─── x86-64 context switch + user-mode trampoline (AT&T syntax) ───────────────
+// ─── x86-64 context switch + user-mode trampoline (Intel syntax) ──────────────
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(r#"
+.intel_syntax noprefix
+
 .global cpu_switch_to
 .type   cpu_switch_to, @function
 cpu_switch_to:
     // rdi = *mut CpuContext (old)
     // rsi = *const CpuContext (new)
-    //
-    // CpuContext layout (x86-64):
-    //   Offset   0: rsp    (u64)
-    //   Offset   8: xmm[0..15] (16 × u128 = 256 bytes)
-    //   Offset 264: mxcsr  (u32)
-    //   Offset 268: _pad   (u32)
 
-    // ── save FS.base (TLS pointer) via RDMSR on MSR_FS_BASE (0xC0000100) ─────
-    // RDMSR: ecx=MSR, returns edx:eax.  Combine into rax then store at offset 272.
+    // Debug: 'S' for Start switch
+    mov al, 'S'
+    mov dx, 0x3F8
+    out dx, al
+
+    // ── save FS.base ─────────────────────────────────────────────────────────
     mov   ecx, 0xC0000100
     rdmsr
     shl   rdx, 32
@@ -541,28 +543,140 @@ cpu_switch_to:
     movdqu xmm14, [rsi + 232]
     movdqu xmm15, [rsi + 248]
 
-    // ── restore FS.base (TLS pointer) via WRMSR on MSR_FS_BASE ──────────────
-    // WRMSR: ecx=MSR, edx:eax=value.  Load from offset 272.
+    // ── restore FS.base ──────────────────────────────────────────────────────
     mov  rax, [rsi + 272]
     mov  rdx, rax
     shr  rdx, 32
     mov  ecx, 0xC0000100
     wrmsr
 
-    ret                     // jump to return address / entry point
+    ret
+.size cpu_switch_to, .-cpu_switch_to
+
+// ─── x86-64 context switch with page table switch ────────────────────────────
+.global cpu_switch_to_with_pt
+.type   cpu_switch_to_with_pt, @function
+cpu_switch_to_with_pt:
+    // rdi = *mut CpuContext (old)
+    // rsi = *const CpuContext (new)
+    // rdx = page_table (physical address, 0 = no change)
+
+    // Debug: 'S' for Start switch
+    mov al, 'S'
+    mov dx, 0x3F8
+    out dx, al
+
+    // Debug: '1' before MSR
+    mov al, '1'
+    out dx, al
+
+    // ── save FS.base ─────────────────────────────────────────────────────────
+    mov   ecx, 0xC0000100
+    rdmsr
+    shl   rdx, 32
+    or    rax, rdx
+    mov   [rdi + 272], rax
+
+    // Debug: '2' before SSE
+    mov al, '2'
+    mov dx, 0x3F8
+    out dx, al
+
+    // ── save outgoing SSE/FPU state ──────────────────────────────────────────
+    movdqu [rdi + 8],   xmm0
+    movdqu [rdi + 24],  xmm1
+    movdqu [rdi + 40],  xmm2
+    movdqu [rdi + 56],  xmm3
+    movdqu [rdi + 72],  xmm4
+    movdqu [rdi + 88],  xmm5
+    movdqu [rdi + 104], xmm6
+    movdqu [rdi + 120], xmm7
+    movdqu [rdi + 136], xmm8
+    movdqu [rdi + 152], xmm9
+    movdqu [rdi + 168], xmm10
+    movdqu [rdi + 184], xmm11
+    movdqu [rdi + 200], xmm12
+    movdqu [rdi + 216], xmm13
+    movdqu [rdi + 232], xmm14
+    movdqu [rdi + 248], xmm15
+    stmxcsr [rdi + 264]
+
+    // Debug: '3' before push
+    mov al, '3'
+    mov dx, 0x3F8
+    out dx, al
+
+    // ── switch page table if needed ─────────────────────────────────────────
+    // rdx still holds page_table from call
+    test rdx, rdx
+    jz 1f
+    
+    // Debug: 'P' for Page table
+    mov al, 'P'
+    mov dx, 0x3F8
+    out dx, al
+    
+    mov cr3, rdx
+1:
+
+    // ── restore incoming integer registers ───────────────────────────────────
+    mov  rsp, [rsi]
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbp
+    pop  rbx
+
+    // ── restore incoming SSE/FPU state ───────────────────────────────────────
+    ldmxcsr [rsi + 264]
+    movdqu xmm0,  [rsi + 8]
+    movdqu xmm1,  [rsi + 24]
+    movdqu xmm2,  [rsi + 40]
+    movdqu xmm3,  [rsi + 56]
+    movdqu xmm4,  [rsi + 72]
+    movdqu xmm5,  [rsi + 88]
+    movdqu xmm6,  [rsi + 104]
+    movdqu xmm7,  [rsi + 120]
+    movdqu xmm8,  [rsi + 136]
+    movdqu xmm9,  [rsi + 152]
+    movdqu xmm10, [rsi + 168]
+    movdqu xmm11, [rsi + 184]
+    movdqu xmm12, [rsi + 200]
+    movdqu xmm13, [rsi + 216]
+    movdqu xmm14, [rsi + 232]
+    movdqu xmm15, [rsi + 248]
+
+    // ── restore FS.base ──────────────────────────────────────────────────────
+    mov  rax, [rsi + 272]
+    mov  rdx, rax
+    shr  rdx, 32
+    mov  ecx, 0xC0000100
+    wrmsr
+
+    // Debug: 'E' for End switch
+    mov al, 'E'
+    mov dx, 0x3F8
+    out dx, al
+
+    ret
+.size cpu_switch_to_with_pt, .-cpu_switch_to_with_pt
 
 // ── iret_to_user — first entry into a user-space task (x86-64) ───────────────
-//
-// Called via `retq` from cpu_switch_to when the kernel stack was built by
-// CpuContext::new_user_task.  On entry RSP points at the 5-word IRET frame:
-//   [rsp+0]:  user RIP
-//   [rsp+8]:  user CS  (0x23)
-//   [rsp+16]: user RFLAGS (0x202)
-//   [rsp+24]: user RSP
-//   [rsp+32]: user SS   (0x1b)
 .global iret_to_user
 .type   iret_to_user, @function
 iret_to_user:
-    iret
+    // Debug: 'U' for User entry
+    mov al, 'U'
+    mov dx, 0x3F8
+    out dx, al
+
+    // Set up segment registers for userspace (DPL 3)
+    mov ax, 0x1B
+    mov ds, ax
+    mov es, ax
+    // FS/GS are handled separately via MSRs
+    iretq
+.size iret_to_user, .-iret_to_user
 "#);
 

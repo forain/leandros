@@ -19,5 +19,5 @@ pub fn init() {
     port::init();
     // Register cleanup callback so the scheduler can release ports when a
     // task exits, without creating a sched→ipc dependency cycle.
-    sched::set_task_exit_hook(port::release_by_owner);
+    sched::register_task_exit_hook(port::release_by_owner);
 }

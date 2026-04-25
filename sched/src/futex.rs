@@ -49,7 +49,7 @@ pub fn futex_wait(uaddr: usize, _timeout_ptr: usize) -> isize {
         // 2. Mark Blocked.
         {
             let mut rq = RUN_QUEUE.lock();
-            if let Some(idx) = rq.find_pid(pid) {
+            if let Some(idx) = rq.find_pid_idx(pid) {
                 if let Some(t) = rq.get_mut(idx) {
                     t.state         = TaskState::Blocked;
                     t.blocked_futex = uaddr;
@@ -77,7 +77,7 @@ pub fn futex_wait(uaddr: usize, _timeout_ptr: usize) -> isize {
         }
         {
             let mut rq = RUN_QUEUE.lock();
-            if let Some(idx) = rq.find_pid(pid) {
+            if let Some(idx) = rq.find_pid_idx(pid) {
                 if let Some(t) = rq.get_mut(idx) {
                     t.blocked_futex = 0;
                 }
@@ -114,7 +114,7 @@ pub fn futex_wake(uaddr: usize, n: u32) -> u32 {
     {
         let mut rq = RUN_QUEUE.lock();
         for &pid in &pids[..count] {
-            if let Some(idx) = rq.find_pid(pid) {
+            if let Some(idx) = rq.find_pid_idx(pid) {
                 if let Some(t) = rq.get_mut(idx) {
                     if t.state == TaskState::Blocked {
                         t.state         = TaskState::Ready;

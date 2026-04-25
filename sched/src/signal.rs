@@ -61,7 +61,7 @@ pub fn check_and_deliver_signals(frame_ptr: usize) {
         // before any further work (signal frame writing might block elsewhere).
         let sample = {
             let rq = super::RUN_QUEUE.lock();
-            match rq.find_pid(pid).and_then(|i| rq.get(i)) {
+            match rq.find_pid(pid) {
                 Some(t) => {
                     let unmasked = t.signal_pending & !t.signal_mask;
                     if unmasked == 0 { return; }
@@ -83,7 +83,7 @@ pub fn check_and_deliver_signals(frame_ptr: usize) {
         // Clear the pending bit and update the signal mask under the lock.
         {
             let mut rq = super::RUN_QUEUE.lock();
-            if let Some(idx) = rq.find_pid(pid) {
+            if let Some(idx) = rq.find_pid_idx(pid) {
                 if let Some(t) = rq.get_mut(idx) {
                     t.signal_pending &= !(1u64 << (sig - 1));
                     // Block the signal during its own handler (re-entrant delivery
@@ -142,6 +142,52 @@ pub fn restore_signal_frame(frame_ptr: usize) {
     let pid = unsafe { super::CURRENT_PID[super::cpu_id()] };
     if pid == 0 { return; }
     arch_restore_signal_frame(frame_ptr, pid);
+}
+
+pub fn sys_sigaction(signum: u32, act_ptr: usize, oldact_ptr: usize) -> isize {
+    let pid = unsafe { super::CURRENT_PID[super::cpu_id()] };
+    let mut rq = super::RUN_QUEUE.lock();
+    if let Some(t) = rq.find_pid_mut(pid) {
+        if oldact_ptr != 0 {
+            // Write old action to user space
+            // (Simplified: just write back the current action in the table)
+            let old = t.signal_actions[(signum - 1) as usize];
+            unsafe { core::ptr::write(oldact_ptr as *mut crate::task::SigAction, old); }
+        }
+        if act_ptr != 0 {
+            let new = unsafe { core::ptr::read(act_ptr as *const crate::task::SigAction) };
+            t.signal_actions[(signum - 1) as usize] = new;
+        }
+        0
+    } else {
+        -3 // ESRCH
+    }
+}
+
+pub fn sys_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
+    const SIG_BLOCK:   usize = 0;
+    const SIG_UNBLOCK: usize = 1;
+    const SIG_SETMASK: usize = 2;
+
+    let pid = unsafe { super::CURRENT_PID[super::cpu_id()] };
+    let mut rq = super::RUN_QUEUE.lock();
+    if let Some(t) = rq.find_pid_mut(pid) {
+        if oldset_ptr != 0 {
+            unsafe { core::ptr::write(oldset_ptr as *mut u64, t.signal_mask); }
+        }
+        if set_ptr != 0 {
+            let set = unsafe { core::ptr::read(set_ptr as *const u64) };
+            match how {
+                SIG_BLOCK   => t.signal_mask |= set,
+                SIG_UNBLOCK => t.signal_mask &= !set,
+                SIG_SETMASK => t.signal_mask = set,
+                _           => return -22, // EINVAL
+            }
+        }
+        0
+    } else {
+        -3 // ESRCH
+    }
 }
 
 // ── Arch dispatch ─────────────────────────────────────────────────────────────
@@ -236,7 +282,6 @@ mod aarch64 {
             let pid = unsafe { super::super::CURRENT_PID[super::super::cpu_id()] };
             let rq = super::super::RUN_QUEUE.lock();
             let phys = rq.find_pid(pid)
-                .and_then(|i| rq.get(i))
                 .and_then(|t| t.address_space.as_ref())
                 .and_then(|a| a.virt_to_phys(new_sp));
             match phys {
@@ -315,7 +360,6 @@ mod aarch64 {
         let frame_phys: usize = {
             let rq = super::super::RUN_QUEUE.lock();
             let phys = rq.find_pid(pid)
-                .and_then(|i| rq.get(i))
                 .and_then(|t| t.address_space.as_ref())
                 .and_then(|a| a.virt_to_phys(sigframe_virt));
             match phys {
@@ -343,7 +387,7 @@ mod aarch64 {
         };
         {
             let mut rq = super::super::RUN_QUEUE.lock();
-            if let Some(idx) = rq.find_pid(pid) {
+            if let Some(idx) = rq.find_pid_idx(pid) {
                 if let Some(t) = rq.get_mut(idx) {
                     t.signal_mask = saved_mask;
                 }

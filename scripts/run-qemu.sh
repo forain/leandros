@@ -134,11 +134,13 @@ else
     if [ "$ARCH" = "aarch64" ]; then
         exec $QEMU_SYSTEM $MACHINE_ARGS -m 256M -nographic \
             -kernel "$KERNEL_DIRECT" \
+            -initrd "initrd-aarch64.cpio.gz" \
             -append "console=ttyAMA0" \
             -no-reboot
     else
         exec $QEMU_SYSTEM $MACHINE_ARGS -m 256M -nographic \
             -kernel "$KERNEL_DIRECT" \
+            -initrd "initrd-x86_64.cpio.gz" \
             -append "console=ttyS0,115200" \
             -serial mon:stdio \
             -no-reboot

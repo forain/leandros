@@ -66,10 +66,11 @@ create_initrd() {
     local initrd_name="initrd-$arch.cpio.gz"
     local target_arch=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-none" || echo "x86_64-unknown-none")
     local userland_dir="userland/target/$target_arch/release"
-    local temp_dir=$(mktemp -d)
-    cp "$userland_dir/init" "$userland_dir/shell" "$userland_dir/hello" "$temp_dir/"
-    (cd "$temp_dir" && find . -print0 | cpio --null -ov --format=newc | gzip > "$ROOT_DIR/$initrd_name")
-    rm -rf "$temp_dir"
+    
+    # We use the raw init binary as the initrd because the kernel 
+    # doesn't have a working global allocator for decompression yet.
+    echo "  Using raw init binary as initrd..."
+    cp "$userland_dir/init" "$ROOT_DIR/$initrd_name"
 }
 
 # Function to build kernel
@@ -124,11 +125,9 @@ create_disk_image() {
     mcopy -oi "$temp_fat" "$limine_dir/$boot_efi" ::/EFI/BOOT/$boot_efi
     mcopy -oi "$temp_fat" "$limine_dir/limine-bios.sys" ::/boot/limine/limine-bios.sys
     mcopy -oi "$temp_fat" "$limine_dir/limine-bios.sys" ::/limine-bios.sys
-    mcopy -oi "$temp_fat" "target/final-$arch/kernel" ::/cyanos-kernel
-    mcopy -oi "$temp_fat" "initrd-$arch.cpio.gz" ::/initrd-raw.bin
+    mcopy -oi "$temp_fat" "target/final-$arch/kernel" ::/kernel.elf
+    mcopy -oi "$temp_fat" "initrd-$arch.cpio.gz" ::/initrd.gz
     mcopy -oi "$temp_fat" limine/limine.conf ::/limine.conf
-    mcopy -oi "$temp_fat" limine/limine.conf ::/boot/limine/limine.conf
-    mcopy -oi "$temp_fat" limine/limine.conf ::/EFI/BOOT/limine.conf
     
     dd if="$temp_fat" of="$image_name" bs=512 seek=2048 conv=notrunc 2>/dev/null
     rm -f "$temp_fat"

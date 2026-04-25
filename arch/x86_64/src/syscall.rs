@@ -150,17 +150,30 @@ pub fn init_ap() {
 //   rcx = user RIP (written by SYSCALL; NOT a user arg)
 //   r11 = user RFLAGS (written by SYSCALL)
 //
-// syscall_dispatch(number, a0, a1, a2, a3, a4, a5) uses System V C ABI:
-//   rdi = number, rsi = a0, rdx = a1, rcx = a2, r8 = a3, r9 = a4
-//   [rsp+8] = a5  (7th arg on stack after callq)
+// syscall_dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr) uses SysV ABI:
+//   rdi=number, rsi=a0, rdx=a1, rcx=a2, r8=a3, r9=a4
+//   [rsp+8]=a5, [rsp+16]=frame_ptr  (stack args)
 //
-// Stack alignment: kernel_stack_top is 16-byte aligned.
-// After pushq %r11 and pushq %rcx, RSP = top - 16 (16-byte aligned).
-// To place a5 on the stack and keep RSP 16-byte aligned before callq:
-//   pushq $0   → RSP = top - 24 (RSP%16 == 8)
-//   pushq %r9  → RSP = top - 32 (RSP%16 == 0) ← aligned for callq
+// Linux x86-64 syscall ABI: the kernel must preserve all registers except
+// rax (return value), rcx (user RIP, trashed by SYSCALL), and r11 (user
+// RFLAGS, trashed by SYSCALL).  We save rdi/rsi/rdx/r8/r9/r10 because the
+// register-rearrangement below clobbers them before syscall_dispatch, and
+// syscall_dispatch may further trash caller-saved regs.
+//
+// Stack layout (RSP grows downward from kernel_stack_top = 16-byte aligned):
+//   top -  8 : r11  (user RFLAGS, for SYSRET)
+//   top - 16 : rcx  (user RIP,    for SYSRET)   ← 16-byte aligned
+//   top - 24 : r10  (user r10 = a3, to restore)
+//   top - 32 : r9   (user r9  = a5, to restore) ← 16-byte aligned
+//   top - 40 : r8   (user r8  = a4, to restore)
+//   top - 48 : rdx  (user rdx = a2, to restore) ← 16-byte aligned
+//   top - 56 : rsi  (user rsi = a1, to restore)
+//   top - 64 : rdi  (user rdi = a0, to restore) ← 16-byte aligned
+//   top - 72 : 0    (arg8 = frame_ptr)
+//   top - 80 : r9   (arg7 = a5, original value)  RSP%16==0 before call ✓
 
 core::arch::global_asm!(r#"
+.section .text, "ax", @progbits
 .global syscall_entry
 .type   syscall_entry, @function
 syscall_entry:
@@ -171,48 +184,54 @@ syscall_entry:
     mov   gs:[8], rsp     // PerCpuSyscall.user_rsp_save = user RSP
     mov   rsp, gs:[0]     // RSP = PerCpuSyscall.kernel_stack_top (16-byte aligned)
 
-    // 3. Save user RFLAGS (r11) and user RIP (rcx) — clobbered by SYSCALL.
-    //    After these two pushes RSP = top-16 (16-byte aligned).
-    push  r11             // user RFLAGS
-    push  rcx             // user RIP
+    // 3. Save user RFLAGS and RIP (clobbered by SYSCALL instruction).
+    push  r11             // user RFLAGS                   RSP = top-8
+    push  rcx             // user RIP                      RSP = top-16 (aligned)
 
-    // 4. Push stack args for syscall_dispatch(number,a0,a1,a2,a3,a4,a5,frame_ptr).
-    //    syscall_dispatch takes 8 args; the first 6 go in registers, args 7+8
-    //    go on the stack.  System V AMD64 ABI requires RSP 16-byte aligned
-    //    BEFORE call.
-    //
-    //    RSP is currently 16-byte aligned (top-16 after push r11, push rcx).
-    //    push arg8=frame_ptr=0 → RSP%16 == 8
-    //    push arg7=a5(r9)      → RSP%16 == 0  ← aligned for call ✓
-    //
-    //    r9 (a5) is pushed BEFORE it is overwritten with a4 below.
-    push  0               // arg8 = frame_ptr = 0  (fork not supported on x86-64 yet)
-    push  r9              // arg7 = a5
+    // 4. Save user registers that the rearrangement below will clobber.
+    //    Pushed before any modification so the original values land on stack.
+    push  r10             // user r10 = a3                 RSP = top-24
+    push  r9              // user r9  = a5 (arg7 copy too) RSP = top-32 (aligned)
+    push  r8              // user r8  = a4                 RSP = top-40
+    push  rdx             // user rdx = a2                 RSP = top-48 (aligned)
+    push  rsi             // user rsi = a1                 RSP = top-56
+    push  rdi             // user rdi = a0                 RSP = top-64 (aligned)
 
-    // 5. Rearrange remaining regs for System V 6-register calling convention:
-    //    syscall_dispatch(number, a0, a1, a2, a3, a4, ...)
-    //    On entry: rax=number, rdi=a0, rsi=a1, rdx=a2, r10=a3, r8=a4, r9=pushed
-    mov   r9,  r8         // a4 → r9  (must come before r8 is overwritten)
+    // 5. Push stack args for syscall_dispatch (8 args: 6 in regs, 2 on stack).
+    //    r9 still holds the original a5 value here (not yet rearranged).
+    push  0               // arg8 = frame_ptr = 0          RSP = top-72
+    push  r9              // arg7 = a5                     RSP = top-80 (aligned) ✓
+
+    // 6. Rearrange regs for System V 6-register calling convention.
+    mov   r9,  r8         // a4 → r9  (before r8 is clobbered)
     mov   r8,  r10        // a3 → r8
-    mov   rcx, rdx        // a2 → rcx
+    mov   rcx, rdx        // a2 → rcx (user RIP already saved)
     mov   rdx, rsi        // a1 → rdx
     mov   rsi, rdi        // a0 → rsi
     mov   rdi, rax        // number → rdi
     call  syscall_dispatch
-    // rax = return value (isize) — left in rax for SYSRET.
+    // rax = return value (isize) — preserved through the restores below.
 
-    // 6. Remove arg7 + arg8 from stack (16 bytes).
-    add   rsp, 16
+    // 7. Remove arg7 + arg8 from stack (16 bytes).
+    add   rsp, 16         // RSP = top-64
 
-    // 7. Restore user RIP and RFLAGS.
-    pop   rcx             // user RIP   → rcx (restored by SYSRET)
-    pop   r11             // user RFLAGS → r11 (restored by SYSRET)
+    // 8. Restore user registers in reverse push order.
+    pop   rdi             // RSP = top-56
+    pop   rsi             // RSP = top-48
+    pop   rdx             // RSP = top-40
+    pop   r8              // RSP = top-32
+    pop   r9              // RSP = top-24
+    pop   r10             // RSP = top-16
 
-    // 8. Restore user RSP and deactivate kernel GS.
+    // 9. Restore user RIP and RFLAGS for SYSRET.
+    pop   rcx             // user RIP    RSP = top-8
+    pop   r11             // user RFLAGS RSP = top
+
+    // 10. Restore user RSP and deactivate kernel GS.
     mov   rsp, gs:[8]
     swapgs
 
-    // 9. Return to user space.
+    // 11. Return to user space.
     sysret
 
 // ── arch_execve_return — drop into user space at a new entry / stack ──────

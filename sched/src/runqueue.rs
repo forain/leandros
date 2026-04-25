@@ -75,8 +75,29 @@ impl RunQueue {
         self.tasks[idx].as_ref().map(|boxed_task| boxed_task.as_ref())
     }
 
-    /// Find the slot index of the task with the given PID.
-    pub fn find_pid(&self, pid: Pid) -> Option<usize> {
+    pub fn find_pid(&self, pid: Pid) -> Option<&Task> {
+        for slot in &self.tasks {
+            if let Some(task) = slot {
+                if task.pid == pid {
+                    return Some(task);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn find_pid_mut(&mut self, pid: Pid) -> Option<&mut Task> {
+        for slot in &mut self.tasks {
+            if let Some(task) = slot {
+                if task.pid == pid {
+                    return Some(task);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn find_pid_idx(&self, pid: Pid) -> Option<usize> {
         self.tasks.iter().position(|s| {
             s.as_ref().map(|t| t.pid == pid).unwrap_or(false)
         })

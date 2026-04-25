@@ -9,49 +9,45 @@
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 #![cfg_attr(target_arch = "x86_64", feature(sync_unsafe_cell))]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
 use core::alloc::{GlobalAlloc, Layout};
 
 // ── Global Allocator ─────────────────────────────────────────────────────────
 
-struct DummyAllocator;
-
-unsafe impl GlobalAlloc for DummyAllocator {
-    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
-        core::ptr::null_mut()
+struct KernelAllocator;
+unsafe impl GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        mm::slab::alloc(layout.size()).unwrap_or(core::ptr::null_mut())
     }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        mm::slab::free(ptr, layout.size());
     }
 }
-
 #[global_allocator]
-static ALLOCATOR: DummyAllocator = DummyAllocator;
+static ALLOCATOR: KernelAllocator = KernelAllocator;
+
+// ── Architecture support ─────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
-extern crate arch_x86_64;
+core::arch::global_asm!(include_str!("entry_x86_64.s"));
 #[cfg(target_arch = "aarch64")]
-extern crate arch_aarch64;
+core::arch::global_asm!(include_str!("entry_aarch64.s"));
+
+// ── Limine Requests ──────────────────────────────────────────────────────────
 
 mod init;
 mod syscall;
 mod mem;
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(include_str!("entry_aarch64.s"));
-
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(include_str!("entry_x86_64.s"));
-
-// ── Limine Requests ──────────────────────────────────────────────────────────
-
 #[no_mangle]
-#[link_section = ".limine_reqs"]
+#[link_section = ".limine_requests"]
 #[used]
-pub static mut limine_base_revision: [u64; 3] = [0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 0];
+pub static LIMINE_BASE_REVISION: [u64; 3] = [0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 0];
 
 #[no_mangle]
-#[link_section = ".limine_reqs"]
+#[link_section = ".limine_requests"]
 #[used]
 pub static ENTRY_POINT_REQUEST: boot::limine::EntryPointRequest = boot::limine::EntryPointRequest {
     id:       [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x13d86c035a1cd3e1, 0x2b0caa89d8f3026a],
@@ -61,16 +57,16 @@ pub static ENTRY_POINT_REQUEST: boot::limine::EntryPointRequest = boot::limine::
 };
 
 #[no_mangle]
-#[link_section = ".limine_reqs"]
+#[link_section = ".limine_requests"]
 #[used]
-pub static HHDM_REQUEST: boot::limine::Request<boot::limine::HhdmResponse> = boot::limine::Request {
-    id:       [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x48d1236851f558a7, 0xff2b207279178864],
+pub static mut HHDM_REQUEST: boot::limine::Request<boot::limine::HhdmResponse> = boot::limine::Request {
+    id:       [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x48dcf1cb8ad2b852, 0x63984e959a98244b],
     revision: 0,
     response: core::cell::UnsafeCell::new(core::ptr::null()),
 };
 
 #[no_mangle]
-#[link_section = ".limine_reqs"]
+#[link_section = ".limine_requests"]
 #[used]
 pub static MEMMAP_REQUEST: boot::limine::Request<boot::limine::MemMapResponse> = boot::limine::Request {
     id:       [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x67cf3d9d378a806f, 0xe304acdfc50c3c62],
@@ -79,10 +75,28 @@ pub static MEMMAP_REQUEST: boot::limine::Request<boot::limine::MemMapResponse> =
 };
 
 #[no_mangle]
-#[link_section = ".limine_reqs"]
+#[link_section = ".limine_requests"]
 #[used]
 pub static FRAMEBUFFER_REQUEST: boot::limine::Request<boot::limine::FramebufferResponse> = boot::limine::Request {
     id:       [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x9d5827dcd881dd75, 0xa3148604f6fab11b],
+    revision: 0,
+    response: core::cell::UnsafeCell::new(core::ptr::null()),
+};
+
+#[no_mangle]
+#[link_section = ".limine_requests"]
+#[used]
+pub static mut RSDP_REQUEST: boot::limine::Request<boot::limine::RsdpResponse> = boot::limine::Request {
+    id:       [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0xc5e77b6b397e7b43, 0x27637845accdcf3c],
+    revision: 0,
+    response: core::cell::UnsafeCell::new(core::ptr::null()),
+};
+
+#[no_mangle]
+#[link_section = ".limine_requests"]
+#[used]
+pub static mut MODULE_REQUEST: boot::limine::Request<boot::limine::ModuleResponse> = boot::limine::Request {
+    id:       [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x3e7e279702be32af, 0xca1c4f3bd1280cee],
     revision: 0,
     response: core::cell::UnsafeCell::new(core::ptr::null()),
 };
@@ -198,7 +212,16 @@ extern "C" {
 
 #[no_mangle]
 pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
-    unsafe { early_serial_init(); }
+    unsafe {
+        core::ptr::read_volatile(&raw const LIMINE_BASE_REVISION as *const _);
+        core::ptr::read_volatile(&raw const ENTRY_POINT_REQUEST as *const _);
+        core::ptr::read_volatile(&raw const HHDM_REQUEST as *const _);
+        core::ptr::read_volatile(&raw const MEMMAP_REQUEST as *const _);
+        core::ptr::read_volatile(&raw const FRAMEBUFFER_REQUEST as *const _);
+        core::ptr::read_volatile(&raw const RSDP_REQUEST as *const _);
+        core::ptr::read_volatile(&raw const MODULE_REQUEST as *const _);
+        early_serial_init();
+    }
     serial_print("\n[CYANOS] Kernel starting...\n");
 
     serial_print("[INIT] Parsing boot info...\n");
@@ -209,9 +232,36 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     };
 
     if boot_info_addr == 0 {
-        let resp = unsafe { *HHDM_REQUEST.response.get() };
-        if !resp.is_null() {
-            boot_info.hhdm_offset = unsafe { (*resp).offset };
+        unsafe {
+            let resp_ptr = core::ptr::read_volatile(ENTRY_POINT_REQUEST.response.get());
+            if !resp_ptr.is_null() {
+                serial_print("  DEBUG: ENTRY_POINT_REQUEST satisfied!\n");
+            } else {
+                serial_print("  DEBUG: ENTRY_POINT_REQUEST NOT satisfied\n");
+            }
+        }
+
+        unsafe {
+            let resp_ptr = core::ptr::read_volatile(MODULE_REQUEST.response.get());
+            if !resp_ptr.is_null() {
+                let resp = &*resp_ptr;
+                serial_print("  DEBUG: MODULE_REQUEST satisfied! count: ");
+                print_number(resp.module_count as u32);
+                serial_print("\n");
+                if resp.module_count > 0 {
+                    let module = &**resp.modules;
+                    boot_info.initrd_base = module.address as u64;
+                    boot_info.initrd_size = module.size;
+                }
+            } else {
+                serial_print("  DEBUG: MODULE_REQUEST NOT satisfied\n");
+            }
+        }
+
+        let resp_ptr = unsafe { core::ptr::read_volatile(HHDM_REQUEST.response.get()) };
+        if !resp_ptr.is_null() {
+            let resp = unsafe { &*resp_ptr };
+            boot_info.hhdm_offset = resp.offset;
             serial_print("  HHDM Offset: 0x");
             print_number((boot_info.hhdm_offset >> 32) as u32);
             print_number(boot_info.hhdm_offset as u32);
@@ -221,7 +271,6 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             boot_info.hhdm_offset = 0xffff800000000000;
         }
 
-        // Set the global offset for the architecture driver
         #[cfg(target_arch = "x86_64")]
         unsafe { arch_x86_64::apic::set_hhdm_offset(boot_info.hhdm_offset); }
     }
@@ -233,13 +282,13 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     arch_aarch64::init(&boot_info);
 
     serial_print("[INIT] Memory management init...\n");
-    mm::init_with_map(boot_info.memory_regions());
+    mm::init_with_map(boot_info.memory_regions(), boot_info.hhdm_offset as usize);
 
     serial_print("[INIT] Scheduler init...\n");
     sched::init();
 
     serial_print("[INIT] Spawning init task...\n");
-    init::init_task_main();
+    init::init_task_main(&boot_info);
 }
 
 #[panic_handler]

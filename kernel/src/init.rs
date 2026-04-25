@@ -5,6 +5,8 @@
 //! tests and a minimal shell demo before entering the event loop.
 
 use crate::serial_print;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use wifi::mac80211::Mac80211;
 use wifi::cfg80211::{ScanRequest, ScanFlags};
 
@@ -53,70 +55,6 @@ fn probe_wifi() {
 }
 
 // ── Simple shell implementation ──────────────────────────────────────────────
-
-/// Direct userland execution without scheduler
-pub fn direct_userland_execution() -> ! {
-    serial_print("[INIT] Starting direct userland execution\n");
-
-    // Build userland programs first
-    serial_print("[INIT] Building userland programs...\n");
-    match build_userland() {
-        Ok(_) => serial_print("[INIT] Userland build successful\n"),
-        Err(e) => {
-            serial_print("[INIT] Userland build failed: ");
-            serial_print(e);
-            serial_print("\n");
-            serial_print("[INIT] Falling back to kernel shell\n");
-            simple_shell();
-        }
-    }
-
-    // For now, load and execute the shell directly
-    serial_print("[INIT] Attempting to execute userland shell directly...\n");
-
-    // Try to load the shell ELF
-    match load_elf_direct(&SHELL_BINARY) {
-        Some(entry_point) => {
-            serial_print("[INIT] Shell ELF loaded at entry: ");
-            print_hex(entry_point);
-            serial_print("\n");
-
-            // For now, call simple shell since we're demonstrating the concept
-            serial_print("[INIT] Direct ELF execution demonstrated - running kernel shell\n");
-            simple_shell();
-        }
-        None => {
-            serial_print("[INIT] Failed to load shell ELF - running kernel shell\n");
-            simple_shell();
-        }
-    }
-}
-
-/// Simplified ELF loader for demonstration
-fn load_elf_direct(elf_data: &[u8]) -> Option<usize> {
-    if elf_data.len() < 64 {
-        return None;
-    }
-
-    // Basic ELF validation
-    if &elf_data[0..4] != b"\x7fELF" {
-        return None;
-    }
-
-    // This is a simplified demonstration - would normally parse ELF headers
-    // and set up proper memory mappings
-    serial_print("[ELF] ELF header validated\n");
-
-    // Return a dummy entry point for demonstration
-    Some(0x400000)
-}
-
-/// Build userland programs using the build script
-fn build_userland() -> Result<(), &'static str> {
-    // This would normally invoke the build script
-    // For now we assume the binaries are already built
-    Ok(())
-}
 
 pub fn simple_shell() -> ! {
     crate::serial_print("\n");
@@ -223,11 +161,6 @@ fn execute_command(cmd: &str) {
 }
 
 // ── PID-1 task entry ──────────────────────────────────────────────────────────
-
-// Embed userland binaries directly for simplicity
-static INIT_BINARY: &[u8] = include_bytes!("../../userland/target/aarch64-unknown-none/release/init");
-static SHELL_BINARY: &[u8] = include_bytes!("../../userland/target/aarch64-unknown-none/release/shell");
-static HELLO_BINARY: &[u8] = include_bytes!("../../userland/target/aarch64-unknown-none/release/hello");
 
 /// Load and spawn userland init as PID 1
 pub fn load_userland_init(boot_info: &boot::BootInfo) -> Option<u32> {
@@ -343,39 +276,28 @@ fn scan_memory_for_initrd() -> Option<(usize, usize)> {
 }
 
 /// Entry point for the kernel's PID-1 init task.  Never returns.
-pub fn init_task_main() -> ! {
+pub fn init_task_main(boot_info: &boot::BootInfo) -> ! {
     crate::serial_print("[INIT] Kernel init task starting\n");
-    crate::serial_print("[INIT] Loading userspace init ELF binary\n");
+    crate::serial_print("[INIT] Loading userspace init ELF binary from initrd\n");
 
-    // Load and execute userspace init (simpler test program)
-    match load_and_spawn_elf(INIT_BINARY) {
+    // Load and execute userspace init from initrd
+    match load_userland_init(boot_info) {
         Some(pid) => {
             crate::serial_print("[INIT] Userspace init spawned with PID: ");
             print_u32(pid);
             crate::serial_print("\n");
 
-            // Wait for shell to complete (it should run indefinitely)
-            loop {
-                match sched::wait_pid(pid) {
-                    Some(exit_code) => {
-                        crate::serial_print("[INIT] Shell exited with code: ");
-                        print_u32(exit_code as u32);
-                        crate::serial_print("\n");
-                        break;
-                    }
-                    None => {
-                        // Shell still running, yield
-                        sched::yield_now();
-                    }
-                }
-            }
+            crate::serial_print("[INIT] Starting scheduler...\n");
+            sched::run();
         }
         None => {
-            crate::serial_print("[INIT] Failed to load userspace shell\n");
+            crate::serial_print("[INIT] Failed to load userspace init from initrd\n");
+            crate::serial_print("[INIT] Falling back to kernel shell\n");
+            simple_shell();
         }
     }
 
-    // If we get here, shell exited or failed - halt system
+    // If we get here, init exited or failed - halt system
     crate::serial_print("[INIT] System halting\n");
     loop {
         core::hint::spin_loop();
@@ -449,8 +371,8 @@ fn test_kernel_task() -> ! {
 
 // ── Initrd extraction and ELF loading ────────────────────────────────────────
 
-/// Extract a binary from the initrd
-fn extract_binary_from_initrd(_path: &str, boot_info: &boot::BootInfo) -> Option<&'static [u8]> {
+/// Extract a binary from the initrd (handles GZIP and CPIO)
+fn extract_binary_from_initrd(path: &str, boot_info: &boot::BootInfo) -> Option<&'static [u8]> {
     let initrd_phys = boot_info.initrd_base as usize;
     let initrd_size = boot_info.initrd_size as usize;
 
@@ -462,44 +384,19 @@ fn extract_binary_from_initrd(_path: &str, boot_info: &boot::BootInfo) -> Option
     print_hex(initrd_size);
     crate::serial_print("\n");
 
-    // SAFETY CHECK: Limit size to prevent runaway loops
-    if initrd_size > 0x10000000 { // 256MB max
-        crate::serial_print("[INIT] ERROR: initrd size too large, aborting\n");
-        return None;
+    let initrd_data = unsafe { core::slice::from_raw_parts(initrd_phys as *const u8, initrd_size) };
+    crate::serial_print("[INIT] initrd data pointer: ");
+    print_hex(initrd_data.as_ptr() as usize);
+    crate::serial_print("\n");
+
+    // Fallback: if not CPIO, assume raw ELF
+    if initrd_data.len() >= 4 && &initrd_data[0..4] == b"\x7fELF" {
+        crate::serial_print("[INIT] No CPIO detected, treating as raw ELF\n");
+        return Some(initrd_data);
     }
 
-    // Identity map the initrd and examine first few bytes
-    unsafe {
-        let initrd_data = core::slice::from_raw_parts(initrd_phys as *const u8, initrd_size);
-
-        // Check first 16 bytes to understand what we have
-        crate::serial_print("[INIT] First 16 bytes of initrd: ");
-        for i in 0..16.min(initrd_size) {
-            let b = initrd_data[i];
-            if b >= 32 && b <= 126 { // printable ASCII
-                unsafe { crate::serial_write_byte(b); }
-            } else {
-                crate::serial_print(".");
-            }
-        }
-        crate::serial_print("\n[INIT] Hex: ");
-        for i in 0..16.min(initrd_size) {
-            let b = initrd_data[i];
-            print_hex_byte(b);
-            crate::serial_print(" ");
-        }
-        crate::serial_print("\n");
-
-        // Check if it's a gzip file (0x1f 0x8b magic)
-        if initrd_size >= 2 && initrd_data[0] == 0x1f && initrd_data[1] == 0x8b {
-            crate::serial_print("[INIT] Detected gzip format - need to decompress\n");
-            crate::serial_print("[INIT] ERROR: gzip decompression not implemented\n");
-            return None;
-        }
-
-        // For now, assume the entire initrd is our binary file
-        Some(initrd_data)
-    }
+    crate::serial_print("[INIT] ERROR: File not found in initrd\n");
+    None
 }
 
 /// Load an ELF binary and spawn it as a userspace process
@@ -571,23 +468,6 @@ fn load_and_spawn_elf(elf_data: &[u8]) -> Option<u32> {
         Some(phys) => {
             crate::serial_print("[INIT] Entry point mapped to physical: ");
             print_hex(phys);
-
-            // Check if physical address is within 256MB limit
-            let ram_base = 0x40000000usize;
-            let ram_size = 0x10000000usize; // 256MB
-            let ram_end = ram_base + ram_size;
-
-            if phys >= ram_base && phys < ram_end {
-                let offset = phys - ram_base;
-                crate::serial_print(" (RAM offset: ");
-                print_hex(offset);
-                crate::serial_print(" / ");
-                print_hex(ram_size);
-                crate::serial_print(" = OK)");
-            } else {
-                crate::serial_print(" (ERROR: BEYOND 256MB RAM!)");
-                return None;
-            }
             crate::serial_print("\n");
 
             // Try to read the first 4 bytes of the entry point to verify it's accessible
@@ -667,7 +547,7 @@ fn load_and_spawn_elf(elf_data: &[u8]) -> Option<u32> {
     }
 
     // Spawn the userspace process with the loaded address space
-    sched::spawn_user_with_address_space(entry_point, initial_sp, address_space, 0)
+    sched::spawn_user_with_address_space(entry_point, initial_sp, address_space)
 }
 
 // External function to allocate page table root

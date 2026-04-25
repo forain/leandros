@@ -67,7 +67,7 @@ pub struct VmaRegion {
 /// Per-process address space.
 pub struct AddressSpace {
     pub page_table_root: usize,
-    pub regions: [Option<VmaRegion>; 4],  // Reduced from 64 to 4 for smaller Task struct
+    pub regions: [Option<VmaRegion>; 8],
     /// Virtual address where the heap begins (set by ELF loader; 0 = no heap).
     pub heap_start: usize,
     /// Current heap break (end of heap VMA).
@@ -111,7 +111,7 @@ impl AddressSpace {
     pub fn new(page_table_root: usize) -> Self {
         Self {
             page_table_root,
-            regions: [None; 4],
+            regions: [None; 8],
             heap_start: 0,
             heap_end: 0,
         }
@@ -149,8 +149,8 @@ impl AddressSpace {
             None    => return false,
         };
 
-        // Zero the backing memory.
-        unsafe { (phys as *mut u8).write_bytes(0, pages * PAGE_SIZE); }
+        // Zero the backing memory via HHDM virtual address.
+        unsafe { (crate::phys_to_virt(phys) as *mut u8).write_bytes(0, pages * PAGE_SIZE); }
 
         // Map each page.  If any individual mapping fails (OOM in page-table
         // node allocation), unmap the pages already installed, free the buddy
@@ -273,7 +273,7 @@ impl AddressSpace {
             Some(p) => p,
             None    => return false, // OOM
         };
-        unsafe { (phys as *mut u8).write_bytes(0, PAGE_SIZE); }
+        unsafe { (crate::phys_to_virt(phys) as *mut u8).write_bytes(0, PAGE_SIZE); }
 
         // Map just the faulting page.  If the page-table walk itself runs out
         // of memory, free the backing page and return false (segfault).
@@ -419,6 +419,53 @@ impl AddressSpace {
         } else {
             Some(vma.phys + (virt - vma.start))
         }
+    }
+
+    /// Read data from user virtual memory into a kernel buffer.
+    pub fn read_user_buf(&self, user_va: usize, dest: &mut [u8]) -> bool {
+        let mut offset = 0;
+        while offset < dest.len() {
+            let va = user_va + offset;
+            let phys = match self.virt_to_phys(va) {
+                Some(p) => p,
+                None => return false,
+            };
+            
+            // Calculate how many bytes we can read from this page
+            let page_off = va % PAGE_SIZE;
+            let avail = PAGE_SIZE - page_off;
+            let chunk = usize::min(avail, dest.len() - offset);
+            
+            unsafe {
+                let src_ptr = crate::phys_to_virt(phys) as *const u8;
+                core::ptr::copy_nonoverlapping(src_ptr, dest.as_mut_ptr().add(offset), chunk);
+            }
+            offset += chunk;
+        }
+        true
+    }
+
+    /// Write data from a kernel buffer into user virtual memory.
+    pub fn write_user_buf(&self, user_va: usize, src: &[u8]) -> bool {
+        let mut offset = 0;
+        while offset < src.len() {
+            let va = user_va + offset;
+            let phys = match self.virt_to_phys(va) {
+                Some(p) => p,
+                None => return false,
+            };
+            
+            let page_off = va % PAGE_SIZE;
+            let avail = PAGE_SIZE - page_off;
+            let chunk = usize::min(avail, src.len() - offset);
+            
+            unsafe {
+                let dest_ptr = crate::phys_to_virt(phys) as *mut u8;
+                core::ptr::copy_nonoverlapping(src.as_ptr().add(offset), dest_ptr, chunk);
+            }
+            offset += chunk;
+        }
+        true
     }
 
     /// Change protection flags on `[addr, addr+len)`.

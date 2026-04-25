@@ -107,12 +107,20 @@ pub struct ModuleResponse {
 
 #[repr(C, align(8))]
 pub struct Module {
+    pub revision: u64,
     pub address:  *const u8,
     pub size:     u64,
     pub path:     *const u8,
     pub cmdline:  *const u8,
-    pub media_type: u64,
-    pub unused:   [u64; 4],
+    pub media_type: u32,
+    pub unused:   u32,
+    pub tftp_ip: u32,
+    pub tftp_port: u32,
+    pub partition_index: u32,
+    pub mbr_disk_id: u32,
+    pub gpt_disk_uuid: [u8; 16],
+    pub gpt_part_uuid: [u8; 16],
+    pub part_uuid: [u8; 16],
 }
 
 // ── Static memory-map storage ─────────────────────────────────────────────────

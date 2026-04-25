@@ -10,6 +10,12 @@ pub mod smp;
 pub mod timer;
 pub mod uart;
 
+/// Returns the current CPU's logical index (0 for BSP, etc.).
+#[no_mangle]
+pub extern "C" fn cpu_id() -> usize {
+    unsafe { smp::arch_cpu_id() }
+}
+
 /// Initialise AArch64 hardware.
 ///
 /// Call order matters:

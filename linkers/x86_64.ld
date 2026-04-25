@@ -3,29 +3,23 @@ OUTPUT_FORMAT(elf64-x86-64)
 
 PHDRS
 {
-    limine_requests PT_LOAD;
-    text PT_LOAD;
-    rodata PT_LOAD;
-    data PT_LOAD;
+    text   PT_LOAD FLAGS(5); /* R E */
+    rodata PT_LOAD FLAGS(4); /* R   */
+    data   PT_LOAD FLAGS(6); /* RW  */
 }
 
 SECTIONS
 {
     . = 0xffffffff80000000;
 
-    .limine_requests : {
-        KEEP(*(.limine_reqs))
-    } :limine_requests
-
-    . = ALIGN(4K);
-
     .text : {
+        KEEP(*(.limine_requests))
         __text_start = .;
         *(.text .text.*)
         __text_end = .;
     } :text
 
-    . = ALIGN(4K);
+    . = ALIGN(0x1000);
 
     .rodata : {
         __rodata_start = .;
@@ -34,19 +28,16 @@ SECTIONS
         __rodata_end = .;
     } :rodata
 
-    . = ALIGN(4K);
+    . = ALIGN(0x1000);
 
     .data : {
         __data_start = .;
         *(.data .data.*)
         *(.got .got.*)
-        *(.data.rel.ro .data.rel.ro.*)
-        *(.tdata .tdata.*)
         __data_end = .;
     } :data
 
     .bss : {
-        . = ALIGN(8);
         PROVIDE(__bss_start = .);
         *(.bss .bss.*)
         *(.tbss .tbss.*)

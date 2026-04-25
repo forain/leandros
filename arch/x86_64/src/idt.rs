@@ -51,25 +51,32 @@ pub struct InterruptStackFrame {
 
 pub fn init() {
     unsafe {
-        // Exceptions without an error code: 0-7, 9, 15-16, 18-20, 28.
+        // Default: catch-all for vectors 0-31.
         for i in 0..32usize {
-            IDT.0[i] = IdtEntry::new(fault_no_err as *const () as usize, 0x08, 0, 0x8E);
+            IDT.0[i] = IdtEntry::new(exc_misc as *const () as usize, 0x08, 0, 0x8E);
         }
 
-        // Exceptions that push an error code: 8, 10-14, 17, 21, 29-30.
-        for &v in &[8u8, 10, 11, 12, 13, 17, 21, 29, 30] {
-            IDT.0[v as usize] =
-                IdtEntry::new(fault_with_err as *const () as usize, 0x08, 0, 0x8E);
-        }
-
-        // Vector 8 = double fault — must use IST1 so it runs on a dedicated
-        // stack.  Without IST the handler would execute on the same exhausted
-        // or corrupted stack that caused the double fault, triple-faulting.
-        // IST1 corresponds to TSS.ist[0], initialised in gdt::init().
-        IDT.0[8] = IdtEntry::new(fault_with_err as *const () as usize, 0x08, 1, 0x8E);
-
+        // Per-exception handlers with correct vector numbers.
+        IDT.0[0]  = IdtEntry::new(exc_de  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[1]  = IdtEntry::new(exc_db  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[2]  = IdtEntry::new(exc_nmi as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[3]  = IdtEntry::new(exc_bp  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[4]  = IdtEntry::new(exc_of  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[5]  = IdtEntry::new(exc_br  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[6]  = IdtEntry::new(exc_ud  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[7]  = IdtEntry::new(exc_nm  as *const () as usize, 0x08, 0, 0x8E);
+        // Vector 8 = double fault — uses IST1 (dedicated stack in TSS).
+        IDT.0[8]  = IdtEntry::new(exc_df  as *const () as usize, 0x08, 1, 0x8E);
+        IDT.0[10] = IdtEntry::new(exc_ts  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[11] = IdtEntry::new(exc_np  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[12] = IdtEntry::new(exc_ss  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[13] = IdtEntry::new(exc_gp  as *const () as usize, 0x08, 0, 0x8E);
         // Vector 14 = page fault — needs CR2 in addition to error code.
         IDT.0[14] = IdtEntry::new(page_fault as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[16] = IdtEntry::new(exc_mf  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[17] = IdtEntry::new(exc_ac  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[18] = IdtEntry::new(exc_mc  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[19] = IdtEntry::new(exc_xf  as *const () as usize, 0x08, 0, 0x8E);
 
         // Vector 32 = IRQ0 (8253/8254 timer after PIC remapping).
         IDT.0[32] = IdtEntry::new(timer_irq as *const () as usize, 0x08, 0, 0x8E);
@@ -145,34 +152,58 @@ fn from_user(frame: &InterruptStackFrame) -> bool {
     frame.cs & 0x3 == 3
 }
 
-/// Handler for exceptions that do NOT push an error code.
-///
-/// If from user space, kill the task.  If from the kernel, halt — it's a bug.
-#[cfg(target_arch = "x86_64")]
-extern "x86-interrupt" fn fault_no_err(frame: InterruptStackFrame) {
-    if from_user(&frame) {
-        serial_str(b"user fault (no errcode): task killed\r\n");
-        sched::exit(1);
-    } else {
-        print_exception(&frame, 0xFF, 0);
-        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+/// Generate a named exception handler that doesn't take an error code.
+/// Each exception gets its own function so the actual vector number is known.
+macro_rules! fault_no_err_handler {
+    ($name:ident, $vector:expr) => {
+        #[cfg(target_arch = "x86_64")]
+        extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
+            if from_user(&frame) {
+                serial_str(b"user fault (no errcode): task killed\r\n");
+                sched::exit(1);
+            } else {
+                print_exception(&frame, $vector, 0);
+                loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+            }
+        }
     }
 }
 
-/// Handler for exceptions that push an error code.
-///
-/// If from user space, kill the task.  If from the kernel, halt — it's a bug.
-#[cfg(target_arch = "x86_64")]
-extern "x86-interrupt" fn fault_with_err(frame: InterruptStackFrame, error_code: u64) {
-    if from_user(&frame) {
-        serial_str(b"user fault (errcode): task killed\r\n");
-        let _ = error_code;
-        sched::exit(1);
-    } else {
-        print_exception(&frame, 0xFF, error_code);
-        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+/// Generate a named exception handler that takes an error code.
+macro_rules! fault_with_err_handler {
+    ($name:ident, $vector:expr) => {
+        #[cfg(target_arch = "x86_64")]
+        extern "x86-interrupt" fn $name(frame: InterruptStackFrame, error_code: u64) {
+            if from_user(&frame) {
+                serial_str(b"user fault (errcode): task killed\r\n");
+                let _ = error_code;
+                sched::exit(1);
+            } else {
+                print_exception(&frame, $vector, error_code);
+                loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+            }
+        }
     }
 }
+
+fault_no_err_handler!(exc_de,  0);   // #DE Divide Error
+fault_no_err_handler!(exc_db,  1);   // #DB Debug
+fault_no_err_handler!(exc_nmi, 2);   // NMI
+fault_no_err_handler!(exc_bp,  3);   // #BP Breakpoint
+fault_no_err_handler!(exc_of,  4);   // #OF Overflow
+fault_no_err_handler!(exc_br,  5);   // #BR Bound Range
+fault_no_err_handler!(exc_ud,  6);   // #UD Invalid Opcode
+fault_no_err_handler!(exc_nm,  7);   // #NM Device Not Available
+fault_with_err_handler!(exc_df,  8); // #DF Double Fault
+fault_with_err_handler!(exc_ts, 10); // #TS Invalid TSS
+fault_with_err_handler!(exc_np, 11); // #NP Segment Not Present
+fault_with_err_handler!(exc_ss, 12); // #SS Stack-Segment Fault
+fault_with_err_handler!(exc_gp, 13); // #GP General Protection
+fault_no_err_handler!(exc_mf, 16);   // #MF x87 FPE
+fault_with_err_handler!(exc_ac, 17); // #AC Alignment Check
+fault_no_err_handler!(exc_mc, 18);   // #MC Machine Check
+fault_no_err_handler!(exc_xf, 19);   // #XF SIMD FPE
+fault_no_err_handler!(exc_misc, 0xFE); // catch-all for other vectors
 
 /// Page fault handler — also reads CR2 (faulting virtual address).
 ///
@@ -205,17 +236,9 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
 
 // Non-x86 stubs (satisfy the compiler on other targets).
 #[cfg(not(target_arch = "x86_64"))]
-extern "C" fn fault_no_err(_frame: InterruptStackFrame) {
-    loop {}
-}
+extern "C" fn exc_misc(_frame: InterruptStackFrame) { loop {} }
 #[cfg(not(target_arch = "x86_64"))]
-extern "C" fn fault_with_err(_frame: InterruptStackFrame, _error_code: u64) {
-    loop {}
-}
-#[cfg(not(target_arch = "x86_64"))]
-extern "C" fn page_fault(_frame: InterruptStackFrame, _error_code: u64) {
-    loop {}
-}
+extern "C" fn page_fault(_frame: InterruptStackFrame, _error_code: u64) { loop {} }
 
 /// Timer IRQ handler — APIC timer at 100 Hz.
 ///

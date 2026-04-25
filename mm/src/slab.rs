@@ -40,8 +40,9 @@ impl Cache {
             Some(p) => p,
             None    => return false,
         };
+        let virt = crate::phys_to_virt(phys);
         let n = PAGE_SIZE / self.obj_size;
-        let mut addr = phys;
+        let mut addr = virt;
         for _ in 0..n {
             unsafe { (addr as *mut usize).write(self.free_head); }
             self.free_head = addr;
@@ -119,7 +120,7 @@ pub fn alloc(size: usize) -> Option<*mut u8> {
             // Larger than the biggest class: round up to pages, use buddy.
             let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
             let order = pages_to_order(pages)?; // None → OOM (too large)
-            buddy::alloc(order).map(|p| p as *mut u8)
+            buddy::alloc(order).map(|p| crate::phys_to_virt(p) as *mut u8)
         }
     }
 }
@@ -135,10 +136,8 @@ pub unsafe fn free(ptr: *mut u8, size: usize) {
         None => {
             let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
             if let Some(order) = pages_to_order(pages) {
-                buddy::free(ptr as usize, order);
+                buddy::free(crate::virt_to_phys(ptr as usize), order);
             }
-            // If pages_to_order returns None the allocation was never made
-            // (alloc returns None for the same size), so there is nothing to free.
         }
     }
 }

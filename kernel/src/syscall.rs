@@ -9,7 +9,20 @@
 //! Cyanos-private syscalls (IPC, spawn) use numbers above 509.
 
 use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
+use alloc::vec::Vec;
+use crate::print_number;
 use ipc::{Message, port};
+use sched::{
+    fork_current, clone_thread, 
+    sys_sigaction, sys_sigprocmask, restore_signal_frame,
+    futex_wait, futex_wake,
+    current_pid, current_ppid, current_pgid, current_sid,
+    ticks, yield_now, exit, spawn_user,
+    deliver_signal, pending_signals, clear_pending_signal, replace_signal_mask,
+    current_reply_port, set_current_reply_port, block_on, set_clear_child_tid,
+    set_fs_base, get_fs_base, replace_address_space,
+    with_current_address_space, with_current_address_space_mut
+};
 use mm::paging::PageFlags;
 use elf;
 use vfs_server as vfs;
@@ -527,7 +540,7 @@ pub fn dispatch(
 ) -> isize {
     let ret = dispatch_inner(number, a0, a1, a2, a3, a4, a5, frame_ptr);
     // Fire any expired POSIX timers before returning to user-space.
-    tty_server::check_timers(sched::current_pid());
+    tty_server::check_timers(current_pid());
     ret
 }
 
@@ -537,6 +550,10 @@ fn dispatch_inner(
     a3: usize, a4: usize, a5: usize,
     frame_ptr: usize,
 ) -> isize {
+    crate::serial_print("[SYSCALL] nr=");
+    print_number(number as u32);
+    crate::serial_print("\n");
+
     match number {
         // ── Cyanos-private IPC syscalls ───────────────────────────────────────
         SYS_IPC_SEND => sys_send(a0, a1, a2),
@@ -552,14 +569,14 @@ fn dispatch_inner(
         MINCORE  => 0, // pretend all pages are resident
 
         // ── Scheduling ────────────────────────────────────────────────────────
-        SCHED_YIELD => { sched::yield_now(); 0 }
+        SCHED_YIELD => { yield_now(); 0 }
 
         // ── Process lifecycle ─────────────────────────────────────────────────
-        EXIT    => { vfs_close_all_current(); sched::exit(a0 as i32) }
+        EXIT    => { vfs_close_all_current(); exit(a0 as i32) }
         SYS_SPAWN => sys_spawn(a0, a1, a2),
         WAIT4   => sys_wait(a0, a1),
         WAITID  => sys_waitid(a0, a1, a2, a3),
-        GETPID  => sched::current_pid() as isize,
+        GETPID  => current_pid() as isize,
         GETPPID => sys_getppid(),
 
         // ── exec / fork ───────────────────────────────────────────────────────
@@ -567,8 +584,8 @@ fn dispatch_inner(
         CLONE   => sys_clone_or_fork(a0, a1, a2, a3, a4, frame_ptr),
         #[cfg(not(target_arch = "aarch64"))]
         FORK    => {
-            let parent_pid = sched::current_pid();
-            let ret = sched::fork_current(frame_ptr);
+            let parent_pid = current_pid();
+            let ret = fork_current(frame_ptr);
             if ret > 0 {
                 let msg = make_vfs_msg(vfs::VFS_FORK_DUP, &[parent_pid as u64, ret as u64]);
                 let _ = vfs::handle(&msg, parent_pid);
@@ -791,7 +808,7 @@ fn dispatch_inner(
 
         // ── Credentials ───────────────────────────────────────────────────────
         GETUID | GETEUID | GETGID | GETEGID => 0, // all root for now
-        GETTID    => sched::current_pid() as isize,
+        GETTID    => current_pid() as isize,
         TGKILL    => sys_tgkill(a0, a1, a2),
 
         // ── Signal helpers ────────────────────────────────────────────────────
@@ -815,7 +832,7 @@ fn dispatch_inner(
         // ── Misc ──────────────────────────────────────────────────────────────
         UNAME      => sys_uname(a0),
         PRLIMIT64  => sys_prlimit64(a0, a1, a2, a3),
-        EXIT_GROUP => { vfs_close_all_current(); sched::exit(a0 as i32) }
+        EXIT_GROUP => { vfs_close_all_current(); exit(a0 as i32) }
 
         // ── File advise / range operations (advisory — safe to no-op) ────────
         POSIX_FADVISE | SYNC_FILE_RANGE | READAHEAD => 0,
@@ -850,7 +867,7 @@ fn sys_send(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
 fn sys_recv(port_id: usize, msg_ptr: usize) -> isize {
     // Message must be naturally aligned (8-byte) so the write is defined.
     if !validate_user_ptr_aligned(msg_ptr, core::mem::size_of::<Message>(), 8) { return -14; }
-    let caller = sched::current_pid();
+    let caller = current_pid();
     if !port::is_owner(port_id as u32, caller) { return -13; }  // EACCES
     loop {
         match port::recv_as(port_id as u32, caller) {
@@ -865,7 +882,7 @@ fn sys_recv(port_id: usize, msg_ptr: usize) -> isize {
                 if !port::is_owner(port_id as u32, caller) {
                     return -9; // EBADF — port was closed
                 }
-                sched::block_on(port_id as u32);
+                block_on(port_id as u32);
                 // After being woken (either by a send or by release_by_owner),
                 // re-check port existence before looping back to recv_as.
                 if !port::is_owner(port_id as u32, caller) {
@@ -890,13 +907,13 @@ fn sys_call(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
 
     // Lazily allocate the caller's reply port.
     let reply_port = {
-        let rp = sched::current_reply_port();
+        let rp = current_reply_port();
         if rp != u32::MAX {
             rp
         } else {
-            let caller = sched::current_pid();
+            let caller = current_pid();
             match port::create(caller) {
-                Some(p) => { sched::set_current_reply_port(p); p }
+                Some(p) => { set_current_reply_port(p); p }
                 None    => return -12, // ENOMEM — port table full
             }
         }
@@ -979,7 +996,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
 
     // ── Anonymous mmap ────────────────────────────────────────────────────────
     if flags & MAP_ANONYMOUS != 0 {
-        let mapped = sched::with_current_address_space(|as_| {
+        let mapped = with_current_address_space_mut(|as_| {
             if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
             as_.map_lazy(virt, len, page_flags)
         });
@@ -988,7 +1005,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
             Some(false) => {
                 if flags & MAP_FIXED == 0 && addr != 0 {
                     let bump = MMAP_BUMP.fetch_add(len, Ordering::Relaxed);
-                    let m2 = sched::with_current_address_space(|as_| as_.map_lazy(bump, len, page_flags));
+                    let m2 = with_current_address_space_mut(|as_| as_.map_lazy(bump, len, page_flags));
                     match m2 { Some(true) => bump as isize, _ => -12 }
                 } else { -12 }
             }
@@ -1007,7 +1024,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     // MAP_SHARED is not supported (no VMO page cache yet); silently treat as
     // MAP_PRIVATE — data is copied on map, modifications are local only.
 
-    let pid = sched::current_pid();
+    let pid = current_pid();
 
     // Step 1: seek the fd to the requested offset.
     if off != 0 {
@@ -1022,7 +1039,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     // The final page_flags (which may be read-only) are applied via map_flags
     // on the VMA; subsequent accesses use those bits.
     let write_flags = page_flags | PageFlags::WRITABLE;
-    let mapped_phys = sched::with_current_address_space(|as_| {
+    let mapped_phys = with_current_address_space_mut(|as_| {
         if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
         if !as_.map(virt, len, write_flags) { return None; }
         // Retrieve the physical base of the just-created VMA.
@@ -1041,7 +1058,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     let n = vfs_reply_val(&vfs::handle(&read_msg, pid));
     if n < 0 {
         // Read failed — unmap the eagerly-allocated VMA and return error.
-        sched::with_current_address_space(|as_| as_.unmap(virt, len));
+        with_current_address_space_mut(|as_| as_.unmap(virt, len));
         return n as isize;
     }
 
@@ -1061,7 +1078,7 @@ fn sys_unmap_mem(virt: usize, size: usize) -> isize {
     if virt == 0 || size == 0 { return -22; } // EINVAL
     if virt >= USER_SPACE_END  { return -22; }
 
-    sched::with_current_address_space(|as_| as_.unmap(virt, size));
+    with_current_address_space_mut(|as_| as_.unmap(virt, size));
     0
 }
 
@@ -1088,7 +1105,7 @@ fn sys_mremap(
         // Shrink: unmap the tail pages.
         let tail = old_addr + new_pages * PAGE;
         let tail_len = (old_pages - new_pages) * PAGE;
-        sched::with_current_address_space(|as_| as_.unmap(tail, tail_len));
+        with_current_address_space_mut(|as_| as_.unmap(tail, tail_len));
         return old_addr as isize;
     }
 
@@ -1098,7 +1115,7 @@ fn sys_mremap(
                           0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */, usize::MAX, 0);
     if result < 0 { return result; }
     // Unmap the old region.
-    sched::with_current_address_space(|as_| as_.unmap(old_addr, old_size));
+    with_current_address_space_mut(|as_| as_.unmap(old_addr, old_size));
     result
 }
 
@@ -1120,7 +1137,7 @@ fn sys_spawn(entry_va: usize, stack_va: usize, priority_raw: usize) -> isize {
     if stack_va  >= USER_SPACE_END                 { return -22; }
 
     let priority = priority_raw as i8;
-    match sched::spawn_user(entry_va, stack_va, priority) {
+    match spawn_user(entry_va, stack_va, priority) {
         Some(pid) => pid as isize,
         None      => -12, // ENOMEM
     }
@@ -1185,14 +1202,14 @@ fn sys_rt_sigsuspend(mask_ptr: usize, _sigsetsize: usize) -> isize {
     } else {
         0
     };
-    let old_mask = sched::replace_signal_mask(new_mask);
+    let old_mask = replace_signal_mask(new_mask);
     // Yield until a signal arrives that is not blocked by new_mask.
     loop {
-        if sched::pending_signals() & !new_mask != 0 { break; }
-        sched::yield_now();
+        if pending_signals() & !new_mask != 0 { break; }
+        yield_now();
     }
     // Restore old mask before returning.
-    let _ = sched::replace_signal_mask(old_mask);
+    let _ = replace_signal_mask(old_mask);
     -4 // EINTR
 }
 
@@ -1208,21 +1225,21 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
         let tv_sec  = unsafe { core::ptr::read(timeout_ptr as *const i64) };
         let tv_nsec = unsafe { core::ptr::read((timeout_ptr + 8) as *const i64) };
         if tv_sec == 0 && tv_nsec == 0 {
-            Some(sched::ticks()) // zero timeout = poll only
+            Some(ticks()) // zero timeout = poll only
         } else {
-            let ticks = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
-            Some(sched::ticks() + ticks.max(1))
+            let ticks_val = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
+            Some(ticks() + ticks_val.max(1))
         }
     } else {
         None // no timeout — wait indefinitely
     };
 
     loop {
-        let pending = sched::pending_signals() & wait_mask;
+        let pending = pending_signals() & wait_mask;
         if pending != 0 {
             let signo = pending.trailing_zeros() as u32 + 1;
             // Clear the signal from pending.
-            sched::clear_pending_signal(signo);
+            clear_pending_signal(signo);
             // Optionally fill siginfo_t (128 bytes) with signo.
             if info_ptr != 0 && validate_user_buf(info_ptr, 128) {
                 unsafe {
@@ -1233,9 +1250,9 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
             return signo as isize;
         }
         if let Some(dl) = deadline {
-            if sched::ticks() >= dl { return -110; } // ETIMEDOUT
+            if ticks() >= dl { return -110; } // ETIMEDOUT
         }
-        sched::yield_now();
+        yield_now();
     }
 }
 
@@ -1246,7 +1263,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
 /// Tick frequency is ~100 Hz (10 ms per tick).
 fn sys_clock_gettime(_clkid: usize, tp_ptr: usize) -> isize {
     if !validate_user_ptr_aligned(tp_ptr, 16, 8) { return -14; }
-    let ticks = sched::ticks();
+    let ticks = ticks();
     // Treat each tick as 10 ms.
     let tv_sec  = (ticks / 100) as i64;
     let tv_nsec = ((ticks % 100) * 10_000_000) as i64;
@@ -1265,7 +1282,7 @@ fn sys_getrandom(buf_ptr: usize, count: usize, _flags: usize) -> isize {
     if count == 0 { return 0; }
     if !validate_user_buf(buf_ptr, count) { return -14; }
     // LCG with 64-bit state; seeded from monotonic ticks.
-    let mut state = sched::ticks().wrapping_add(0x_dead_beef_cafe_babe);
+    let mut state = ticks().wrapping_add(0x_dead_beef_cafe_babe);
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
     for chunk in buf.chunks_mut(8) {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -1320,7 +1337,7 @@ fn sys_clock_getres(_clkid: usize, res_ptr: usize) -> isize {
 fn sys_pread64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize {
     if count == 0 { return 0; }
     if !validate_user_buf(buf_ptr, count) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     // Seek to offset, read, seek back (best-effort; position state is in VFS).
     let seek_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, offset as u64, 0 /* SEEK_SET */]);
     let cur = vfs_reply_val(&vfs::handle(&seek_msg, pid));
@@ -1337,7 +1354,7 @@ fn sys_pread64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize 
 fn sys_pwrite64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize {
     if count == 0 { return 0; }
     if !validate_user_buf(buf_ptr, count) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     // Get current position.
     let cur_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, 0u64, 1 /* SEEK_CUR */]);
     let cur = vfs_reply_val(&vfs::handle(&cur_msg, pid));
@@ -1356,7 +1373,7 @@ fn sys_pwrite64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize
 
 /// sys_ftruncate(fd, length) — set tmpfs file size.
 fn sys_ftruncate(fd: usize, length: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_FTRUNCATE, &[fd as u64, length as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
@@ -1370,7 +1387,7 @@ fn sys_times(buf_ptr: usize) -> isize {
     if buf_ptr != 0 && validate_user_buf(buf_ptr, 32) {
         unsafe { core::ptr::write_bytes(buf_ptr as *mut u8, 0, 32); }
     }
-    sched::ticks() as isize
+    ticks() as isize
 }
 
 /// sys_ppoll(fds_ptr, nfds, timeout_ptr, sigmask_ptr) — wait for events on fd set.
@@ -1389,7 +1406,7 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
     let sz = nfds.saturating_mul(8);
     if !validate_user_buf(fds_ptr, sz) { return -14; }
 
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let mut nready = 0isize;
 
     for i in 0..nfds {
@@ -1439,9 +1456,9 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
         let tv_nsec = unsafe { core::ptr::read((timeout_ptr + 8) as *const i64) };
         if tv_sec == 0 && tv_nsec == 0 { return 0; }
         // Non-zero timeout: yield once before returning (cooperative).
-        sched::yield_now();
+        yield_now();
     } else if nready == 0 {
-        sched::yield_now();
+        yield_now();
     }
     nready
 }
@@ -1461,10 +1478,10 @@ fn sys_nanosleep(rqtp_ptr: usize, _rmtp: usize) -> isize {
     // Convert to ticks (~100 Hz).
     let ticks_needed = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
     if ticks_needed == 0 { return 0; }
-    let deadline = sched::ticks().wrapping_add(ticks_needed);
+    let deadline = ticks().wrapping_add(ticks_needed);
     loop {
-        sched::yield_now();
-        if sched::ticks() >= deadline { break; }
+        yield_now();
+        if ticks() >= deadline { break; }
     }
     0
 }
@@ -1477,7 +1494,7 @@ fn sys_gettimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
     // struct timeval { tv_sec: i64, tv_usec: i64 }
     if tv_ptr != 0 {
         if !validate_user_buf(tv_ptr, 16) { return -14; }
-        let ticks = sched::ticks();
+        let ticks = ticks();
         let tv_sec  = (ticks / 100) as i64;
         let tv_usec = ((ticks % 100) * 10_000) as i64;
         unsafe {
@@ -1497,7 +1514,7 @@ fn sys_gettimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
 /// x86-64 only (AArch64 does not have syscall #201 for `time`).
 #[cfg(not(target_arch = "aarch64"))]
 fn sys_time(tloc: usize) -> isize {
-    let t = (sched::ticks() / 100) as i64;
+    let t = (ticks() / 100) as i64;
     if tloc != 0 && validate_user_buf(tloc, 8) {
         unsafe { core::ptr::write(tloc as *mut i64, t); }
     }
@@ -1526,7 +1543,7 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
     if !validate_user_buf(info_ptr, SYSINFO_SIZE) { return -14; }
     unsafe { core::ptr::write_bytes(info_ptr as *mut u8, 0, SYSINFO_SIZE); }
 
-    let ticks = sched::ticks();
+    let ticks = ticks();
     let uptime = (ticks / 100) as i64;
     // Free memory estimate from buddy allocator.
     let free_pages = mm::buddy::free_pages();
@@ -1553,18 +1570,18 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
 
 fn sys_rt_sigaction(signum: usize, act_ptr: usize, oldact_ptr: usize) -> isize {
     if signum == 0 || signum >= 64 { return -22; } // EINVAL
-    sched::sys_sigaction(signum as u32, act_ptr, oldact_ptr)
+    sys_sigaction(signum as u32, act_ptr, oldact_ptr)
 }
 
 fn sys_rt_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
-    sched::sys_sigprocmask(how, set_ptr, oldset_ptr)
+    sys_sigprocmask(how, set_ptr, oldset_ptr)
 }
 
 fn sys_rt_sigreturn(frame_ptr: usize) -> isize {
     // Restore the pre-signal user register context from the rt_sigframe on the
     // user stack, including the signal mask.  The return value written into
     // the frame's x0 / rax slot will be overwritten by the restored context.
-    sched::restore_signal_frame(frame_ptr);
+    restore_signal_frame(frame_ptr);
     0 // only reached if frame_ptr == 0 (x86-64 stub path)
 }
 
@@ -1572,18 +1589,18 @@ fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
     let pid = pid_raw as u32;
     let sig = sig_raw as u32;
     if sig >= 64 { return -22; } // EINVAL
-    sched::deliver_signal(pid, sig)
+    deliver_signal(pid, sig)
 }
 
 fn sys_getppid() -> isize {
-    sched::current_ppid() as isize
+    current_ppid() as isize
 }
 
 // ── Thread stubs (Phase 4 will provide real implementations) ─────────────────
 
 fn sys_set_tid_address(tidptr: usize) -> isize {
-    sched::set_clear_child_tid(tidptr);
-    sched::current_pid() as isize
+    set_clear_child_tid(tidptr);
+    current_pid() as isize
 }
 
 fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize) -> isize {
@@ -1613,7 +1630,7 @@ fn sys_arch_prctl(code: usize, addr: usize) -> isize {
         const ARCH_GET_FS: usize = 0x1003;
         match code {
             ARCH_SET_FS => {
-                sched::set_fs_base(addr as u64);
+                set_fs_base(addr as u64);
                 // Immediately write to hardware for the current task.
                 unsafe {
                     core::arch::asm!(
@@ -1626,7 +1643,7 @@ fn sys_arch_prctl(code: usize, addr: usize) -> isize {
             }
             ARCH_GET_FS => {
                 if !validate_user_ptr_aligned(addr, 8, 8) { return -14; }
-                let base = sched::get_fs_base();
+                let base = get_fs_base();
                 unsafe { core::ptr::write(addr as *mut u64, base); }
                 0
             }
@@ -1641,7 +1658,7 @@ fn sys_arch_prctl(code: usize, addr: usize) -> isize {
 
 fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     if addr == 0 || len == 0 { return -22; }
-    let ok = sched::with_current_address_space(|as_| as_.mprotect(addr, len, prot as u32));
+    let ok = with_current_address_space_mut(|as_| as_.mprotect(addr, len, prot as u32));
     match ok {
         Some(true)  =>  0,
         Some(false) => -22, // EINVAL
@@ -1650,7 +1667,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 }
 
 fn sys_brk(new_end: usize) -> isize {
-    sched::with_current_address_space(|as_| as_.brk(new_end))
+    with_current_address_space_mut(|as_| as_.brk(new_end))
         .unwrap_or(-12) // ENOMEM
 }
 
@@ -1908,7 +1925,7 @@ fn sys_execve(path_or_elf: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     write64(w * W, 0); w += 1; // envp null terminator
 
     // auxv
-    let t = sched::ticks();
+    let t = ticks();
     let auxv: &[(u64, u64)] = &[
         (25, rand_va as u64),                      // AT_RANDOM
         (6,  mm::buddy::PAGE_SIZE as u64),          // AT_PAGESZ
@@ -1941,11 +1958,12 @@ fn sys_execve(path_or_elf: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     drop(envp);
 
     // ── VFS lifecycle and address space replacement ────────────────────────────
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let cloexec_msg = make_vfs_msg(vfs::VFS_EXEC_CLOEXEC, &[pid as u64]);
     let _ = vfs::handle(&cloexec_msg, pid);
 
-    sched::replace_address_space(new_as, pt_root, heap_start, entry, user_sp);
+    replace_address_space(new_as, pt_root, heap_start, entry, user_sp);
+    0
 }
 
 // ── I/O syscalls ──────────────────────────────────────────────────────────────
@@ -1955,15 +1973,39 @@ fn sys_execve(path_or_elf: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 /// fd 1/2 write directly to serial.  All other fds route through VFS.
 fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
     if count == 0 { return 0; }
+    
+    // Debug print for all writes to fd 1/2
+    if fd == 1 || fd == 2 {
+        crate::serial_print("[SYSCALL] write fd=");
+        let fd_char = (b'0' + fd as u8) as char;
+        let mut buf = [0u8; 1];
+        buf[0] = fd_char as u8;
+        crate::serial_write_raw(&buf);
+        crate::serial_print(" count=");
+        print_number(count as u32);
+        crate::serial_print("\n");
+    }
+
     if !validate_user_buf(buf_ptr, count) { return -14; }
     match fd {
         1 | 2 => {
-            let bytes = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
-            crate::serial_write_raw(bytes);
+            let mut kbuf = Vec::with_capacity(count);
+            unsafe { kbuf.set_len(count); }
+            
+            let ok = with_current_address_space(|as_| {
+                as_.read_user_buf(buf_ptr, &mut kbuf)
+            }).unwrap_or(false);
+
+            if !ok { 
+                crate::serial_print("[SYSCALL] write: read_user_buf failed\n");
+                return -14; 
+            }
+            
+            crate::serial_write_raw(&kbuf);
             count as isize
         }
         _ => {
-            let pid = sched::current_pid();
+            let pid = current_pid();
             let msg = make_vfs_msg(vfs::VFS_WRITE, &[fd as u64, buf_ptr as u64, count as u64]);
             let reply = vfs::handle(&msg, pid);
             vfs_reply_val(&reply)
@@ -1984,31 +2026,41 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
             let first = loop {
                 match crate::serial_read_byte() {
                     Some(b) => break b,
-                    None    => sched::yield_now(),
+                    None    => yield_now(),
                 }
             };
-            let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
-            buf[0] = first;
+            
+            let mut kbuf = Vec::with_capacity(count);
+            unsafe { kbuf.set_len(count); }
+            
+            kbuf[0] = first;
             let mut n = 1usize;
             // Drain any additional bytes that arrived without blocking.
             while n < count {
                 match crate::serial_read_byte() {
-                    Some(b) => { buf[n] = b; n += 1; }
+                    Some(b) => { kbuf[n] = b; n += 1; }
                     None    => break,
                 }
             }
+            
+            let ok = with_current_address_space(|as_| {
+                as_.write_user_buf(buf_ptr, &kbuf[..n])
+            }).unwrap_or(false);
+            
+            if !ok { return -14; }
+            
             n as isize
         }
         _ => {
             if count != 0 && !validate_user_buf(buf_ptr, count) { return -14; }
-            let pid = sched::current_pid();
+            let pid = current_pid();
             let msg = make_vfs_msg(vfs::VFS_READ, &[fd as u64, buf_ptr as u64, count as u64]);
             // Pipe read: VFS returns -EAGAIN when write end is open but empty.
             // Block (yield-loop) until data arrives or the write end closes.
             loop {
                 let n = vfs_reply_val(&vfs::handle(&msg, pid));
                 if n != -11 { return n; }
-                sched::yield_now();
+                yield_now();
             }
         }
     }
@@ -2054,7 +2106,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
             0
         }
         _ => {
-            let pid = sched::current_pid();
+            let pid = current_pid();
             let mut total: isize = 0;
             for i in 0..iovcnt {
                 let iov_addr = iov_ptr + i * 16;
@@ -2067,7 +2119,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
                 let n = loop {
                     let v = vfs_reply_val(&vfs::handle(&msg, pid));
                     if v != -11 { break v; }
-                    sched::yield_now();
+                    yield_now();
                 };
                 if n < 0 { return if total > 0 { total } else { n }; }
                 total = total.saturating_add(n);
@@ -2246,7 +2298,7 @@ fn sys_statx(dirfd: usize, path_ptr: usize, _flags: usize, _mask: usize, statxbu
 
 /// sys_close_range(first, last, flags) — close a range of file descriptors.
 fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let end = last.min(1023);
     for fd in first..=end {
         let msg = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]);
@@ -2262,7 +2314,7 @@ fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
 fn sys_stat_at_path(path_ptr: usize, statbuf_ptr: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
     if !validate_user_buf(statbuf_ptr, 144) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let omsg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, 0u64, 0]);
     let fd = vfs_reply_val(&vfs::handle(&omsg, pid));
     if fd < 0 { return fd; }
@@ -2297,13 +2349,13 @@ fn sys_prlimit64(
 
 fn sys_openat(_dirfd: usize, path_ptr: usize, flags: usize, _mode: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, flags as u64, 0]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
 fn sys_close(fd: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     // Route socket fds (≥ SOCK_FD_BASE) to the net server.
     if fd >= net_server::SOCK_FD_BASE {
         let msg = make_vfs_msg(net_server::NET_CLOSE, &[fd as u64]);
@@ -2330,7 +2382,7 @@ fn sys_fstat(fd: usize, statbuf_ptr: usize) -> isize {
         return 0;
     }
 
-    let pid = sched::current_pid();
+    let pid = current_pid();
     // Get current position.
     let cur_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, 0u64, 1u64 /* SEEK_CUR */]);
     let cur = vfs_reply_val(&vfs::handle(&cur_msg, pid));
@@ -2362,7 +2414,7 @@ fn sys_fstat(fd: usize, statbuf_ptr: usize) -> isize {
 fn sys_newfstatat(_dirfd: usize, path_ptr: usize, statbuf_ptr: usize, _flags: usize) -> isize {
     if !validate_user_buf(path_ptr, 1)      { return -14; }
     if !validate_user_buf(statbuf_ptr, 144) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     // Check for directory first (no fd needed).
     if vfs::is_directory(path_ptr) {
         unsafe { core::ptr::write_bytes(statbuf_ptr as *mut u8, 0, 144); }
@@ -2381,13 +2433,13 @@ fn sys_newfstatat(_dirfd: usize, path_ptr: usize, statbuf_ptr: usize, _flags: us
 }
 
 fn sys_lseek(fd: usize, offset: usize, whence: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, offset as u64, whence as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
 fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_FCNTL, &[fd as u64, cmd as u64, arg as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
@@ -2397,20 +2449,20 @@ fn sys_pipe2(pipefd_ptr: usize, _flags: usize) -> isize {
     if !validate_user_buf(pipefd_ptr, 8) { return -14; }
     let rfd_ptr = pipefd_ptr;
     let wfd_ptr = pipefd_ptr + 4;
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_PIPE, &[rfd_ptr as u64, wfd_ptr as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
 fn sys_dup(oldfd: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     // Allocate a new fd: pass newfd=u32::MAX as sentinel for "any free fd".
     let msg = make_vfs_msg(vfs::VFS_DUP2, &[oldfd as u64, u64::MAX]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
 fn sys_dup3(oldfd: usize, newfd: usize, _flags: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     // If newfd == u64::MAX this is sys_dup (allocate any free fd).
     let tag = if newfd == usize::MAX { vfs::VFS_ALLOC_FD } else { vfs::VFS_DUP2 };
     let msg = make_vfs_msg(tag, &[oldfd as u64, newfd as u64]);
@@ -2419,21 +2471,21 @@ fn sys_dup3(oldfd: usize, newfd: usize, _flags: usize) -> isize {
 
 fn sys_getdents64(fd: usize, buf_ptr: usize, count: usize) -> isize {
     if !validate_user_buf(buf_ptr, count.min(1)) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_GETDENTS64, &[fd as u64, buf_ptr as u64, count as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
 fn sys_mkdirat(_dirfd: usize, path_ptr: usize, _mode: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_MKDIR, &[path_ptr as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
 fn sys_unlinkat(_dirfd: usize, path_ptr: usize, _flags: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_UNLINK, &[path_ptr as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
@@ -2478,7 +2530,7 @@ fn sys_getcwd(buf_ptr: usize, size: usize) -> isize {
 }
 
 fn sys_setpgid(pid_raw: usize, pgid_raw: usize) -> isize {
-    let pid  = if pid_raw  == 0 { sched::current_pid() } else { pid_raw as u32 };
+    let pid  = if pid_raw  == 0 { current_pid() } else { pid_raw as u32 };
     let pgid = if pgid_raw == 0 { pid } else { pgid_raw as u32 };
     if sched::set_pgid(pid, pgid) { 0 } else { -3 } // ESRCH
 }
@@ -2546,7 +2598,7 @@ fn sys_readlinkat(_dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) -
             fd = fd * 10 + (d - b'0') as usize;
         }
         if valid {
-            let pid = sched::current_pid();
+            let pid = current_pid();
             let msg = make_vfs_msg(vfs::VFS_FD_PATH, &[fd as u64, buf_ptr as u64, size as u64]);
             return vfs_reply_val(&vfs::handle(&msg, pid));
         }
@@ -2608,7 +2660,7 @@ fn read_cstr_for_vfs(path: &[u8]) -> Option<([u8; 256], usize)> {
 
 /// Close all FDs for the current process in VFS (called on exit).
 fn vfs_close_all_current() {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[pid as u64]);
     let _ = vfs::handle(&msg, pid);
     // Also close net sockets and TTY fds.
@@ -2619,7 +2671,7 @@ fn vfs_close_all_current() {
 
 /// sys_ioctl — try VFS first (FIONREAD on pipes/files), then TTY server.
 fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     const FIONREAD: usize = 0x541B;
     const ENOTTY: isize = -25;
     if cmd == FIONREAD {
@@ -2642,7 +2694,7 @@ fn sys_timer_create(_clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) ->
     } else {
         14 // SIGALRM default
     };
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(tty_server::TIMER_CREATE, &[signo as u64, timerid_ptr as u64]);
     let reply = tty_server::handle(&msg, pid);
     net_reply_val(&reply)
@@ -2650,7 +2702,7 @@ fn sys_timer_create(_clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) ->
 
 fn sys_timer_settime(timerid: usize, _flags: usize, ispec_ptr: usize, ospec_ptr: usize) -> isize {
     if ispec_ptr != 0 && !validate_user_buf(ispec_ptr, 32) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(tty_server::TIMER_SETTIME,
         &[timerid as u64, ispec_ptr as u64, ospec_ptr as u64]);
     let reply = tty_server::handle(&msg, pid);
@@ -2659,14 +2711,14 @@ fn sys_timer_settime(timerid: usize, _flags: usize, ispec_ptr: usize, ospec_ptr:
 
 fn sys_timer_gettime(timerid: usize, ospec_ptr: usize) -> isize {
     if !validate_user_buf(ospec_ptr, 32) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(tty_server::TIMER_GETTIME, &[timerid as u64, ospec_ptr as u64]);
     let reply = tty_server::handle(&msg, pid);
     net_reply_val(&reply)
 }
 
 fn sys_timer_delete(timerid: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(tty_server::TIMER_DELETE, &[timerid as u64]);
     let reply = tty_server::handle(&msg, pid);
     net_reply_val(&reply)
@@ -2675,7 +2727,7 @@ fn sys_timer_delete(timerid: usize) -> isize {
 // ── Net server syscalls (Phase 7) ─────────────────────────────────────────────
 
 fn sys_socket(domain: usize, sock_type: usize, protocol: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SOCKET,
         &[domain as u64, sock_type as u64, protocol as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
@@ -2683,20 +2735,20 @@ fn sys_socket(domain: usize, sock_type: usize, protocol: usize) -> isize {
 
 fn sys_bind(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     if addrlen > 128 || !validate_user_buf(addr_ptr, addrlen) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_BIND,
         &[sockfd as u64, addr_ptr as u64, addrlen as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
 }
 
 fn sys_listen(sockfd: usize, backlog: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_LISTEN, &[sockfd as u64, backlog as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
 }
 
 fn sys_accept(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_ACCEPT,
         &[sockfd as u64, addr_ptr as u64, addrlen_ptr as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
@@ -2704,7 +2756,7 @@ fn sys_accept(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
 
 fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     if addrlen > 128 || !validate_user_buf(addr_ptr, addrlen) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_CONNECT,
         &[sockfd as u64, addr_ptr as u64, addrlen as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
@@ -2713,7 +2765,7 @@ fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
 fn sys_sendto(sockfd: usize, buf_ptr: usize, len: usize,
               flags: usize, addr_ptr: usize, addrlen: usize) -> isize {
     if len != 0 && !validate_user_buf(buf_ptr, len) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SEND,
         &[sockfd as u64, buf_ptr as u64, len as u64,
           flags as u64, addr_ptr as u64, addrlen as u64]);
@@ -2723,7 +2775,7 @@ fn sys_sendto(sockfd: usize, buf_ptr: usize, len: usize,
 fn sys_recvfrom(sockfd: usize, buf_ptr: usize, len: usize,
                 flags: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
     if len != 0 && !validate_user_buf(buf_ptr, len) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_RECV,
         &[sockfd as u64, buf_ptr as u64, len as u64,
           flags as u64, addr_ptr as u64, addrlen_ptr as u64]);
@@ -2732,7 +2784,7 @@ fn sys_recvfrom(sockfd: usize, buf_ptr: usize, len: usize,
 
 fn sys_sendmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
     if !validate_user_buf(msghdr_ptr, 48) { return -14; } // sizeof(msghdr)≥48
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SENDMSG,
         &[sockfd as u64, msghdr_ptr as u64, flags as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
@@ -2740,27 +2792,27 @@ fn sys_sendmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
 
 fn sys_recvmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
     if !validate_user_buf(msghdr_ptr, 48) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_RECVMSG,
         &[sockfd as u64, msghdr_ptr as u64, flags as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
 }
 
 fn sys_net_shutdown(sockfd: usize, how: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SHUTDOWN, &[sockfd as u64, how as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
 }
 
 fn sys_getsockname(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_GETSOCKNAME,
         &[sockfd as u64, addr_ptr as u64, addrlen_ptr as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
 }
 
 fn sys_getpeername(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_GETPEERNAME,
         &[sockfd as u64, addr_ptr as u64, addrlen_ptr as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
@@ -2768,7 +2820,7 @@ fn sys_getpeername(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize 
 
 fn sys_socketpair(domain: usize, sock_type: usize, protocol: usize, sv_ptr: usize) -> isize {
     if !validate_user_buf(sv_ptr, 8) { return -14; } // int sv[2]
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SOCKETPAIR,
         &[domain as u64, sock_type as u64, protocol as u64, sv_ptr as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
@@ -2777,7 +2829,7 @@ fn sys_socketpair(domain: usize, sock_type: usize, protocol: usize, sv_ptr: usiz
 fn sys_setsockopt(sockfd: usize, level: usize, optname: usize,
                   optval_ptr: usize, optlen: usize) -> isize {
     if optlen > 128 || (optlen != 0 && !validate_user_buf(optval_ptr, optlen)) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SETSOCKOPT,
         &[sockfd as u64, level as u64, optname as u64, optval_ptr as u64, optlen as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
@@ -2785,7 +2837,7 @@ fn sys_setsockopt(sockfd: usize, level: usize, optname: usize,
 
 fn sys_getsockopt(sockfd: usize, level: usize, optname: usize,
                   optval_ptr: usize, optlen_ptr: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_GETSOCKOPT,
         &[sockfd as u64, level as u64, optname as u64, optval_ptr as u64, optlen_ptr as u64]);
     net_reply_val(&net_server::handle(&msg, pid))
@@ -2833,7 +2885,7 @@ static EPOLL_INSTANCES: spin::Mutex<[EpollInstance; MAX_EPOLL_INSTANCES]> =
     spin::Mutex::new([const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES]);
 
 fn sys_epoll_create1(_flags: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let mut ep = EPOLL_INSTANCES.lock();
     match ep.iter().position(|e| !e.in_use) {
         Some(i) => {
@@ -2859,7 +2911,7 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
         return -9; // EBADF
     };
 
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let mut ep = EPOLL_INSTANCES.lock();
     if !ep[slot].in_use || ep[slot].owner_pid != pid { return -9; }
 
@@ -2907,7 +2959,7 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, _timeout: us
         return -9;
     };
 
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let ep = EPOLL_INSTANCES.lock();
     if !ep[slot].in_use || ep[slot].owner_pid != pid { return -9; }
 
@@ -2965,7 +3017,7 @@ fn probe_fd_events(_pid: u32, _fd: usize, requested: u32) -> u32 {
 }
 
 fn sys_eventfd2(initval: usize, _flags: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_EVENTFD, &[initval as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
@@ -2986,7 +3038,7 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
     } else {
         path[plen] = b'0'; let _ = plen;
     }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_OPEN, &[
         path.as_ptr() as u64,
         (0x041 | 0x200) as u64, // O_WRONLY|O_CREAT|O_TRUNC
@@ -2996,7 +3048,7 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
 }
 
 fn sys_timerfd_create(_clockid: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_TIMERFD_CREATE, &[]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
@@ -3015,13 +3067,13 @@ fn sys_timerfd_settime(fd: usize, _flags: usize, new_ptr: usize, _old_ptr: usize
         let value    = (vl_sec as u64) * 1_000_000_000 + (vl_nsec as u64);
         (value, interval)
     };
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_TIMERFD_SETTIME, &[fd as u64, value_ns, interval_ns]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
 fn sys_timerfd_gettime(fd: usize, cur_ptr: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_TIMERFD_GETTIME, &[fd as u64, cur_ptr as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
@@ -3063,7 +3115,7 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, _efds: usize, _tv: usize) -
 fn sys_renameat(old_path_ptr: usize, new_path_ptr: usize) -> isize {
     if !validate_user_buf(old_path_ptr, 1) { return -14; }
     if !validate_user_buf(new_path_ptr, 1) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_RENAME, &[old_path_ptr as u64, new_path_ptr as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
@@ -3071,7 +3123,7 @@ fn sys_renameat(old_path_ptr: usize, new_path_ptr: usize) -> isize {
 /// sys_truncate(path_ptr, length) — set a file's size by path.
 fn sys_truncate(path_ptr: usize, length: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
     let omsg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, 0x0002u64 /* O_RDWR */, 0]);
     let fd = vfs_reply_val(&vfs::handle(&omsg, pid));
     if fd < 0 { return fd; }
@@ -3087,7 +3139,7 @@ fn sys_truncate(path_ptr: usize, length: usize) -> isize {
 /// chunks and writes to `out_fd`.  Updates *offset_ptr on success.
 fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: usize, count: usize) -> isize {
     if count == 0 { return 0; }
-    let pid = sched::current_pid();
+    let pid = current_pid();
 
     // If offset_ptr is given, seek in_fd to the caller-supplied offset.
     if offset_ptr != 0 {
@@ -3138,7 +3190,7 @@ fn sys_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize {
     // We only implement ITIMER_REAL (0).
     if which != 0 { return 0; } // silently succeed for VIRTUAL/PROF
 
-    let pid = sched::current_pid();
+    let pid = current_pid();
 
     // Read new itimerval: {it_interval.tv_sec, it_interval.tv_usec, it_value.tv_sec, it_value.tv_usec}
     const TICK_HZ: u64 = 100;
@@ -3194,7 +3246,7 @@ fn sys_getitimer(which: usize, cur_ptr: usize) -> isize {
 /// sys_sigpending(set_ptr) — return the set of pending signals.
 fn sys_sigpending(set_ptr: usize) -> isize {
     if !validate_user_buf(set_ptr, 8) { return -14; }
-    let pending = sched::pending_signals();
+    let pending = pending_signals();
     unsafe { core::ptr::write(set_ptr as *mut u64, pending); }
     0
 }
@@ -3202,7 +3254,7 @@ fn sys_sigpending(set_ptr: usize) -> isize {
 /// sys_alarm(seconds) — schedule SIGALRM after `seconds` seconds (x86-64 only).
 #[cfg(not(target_arch = "aarch64"))]
 fn sys_alarm(seconds: usize) -> isize {
-    let pid = sched::current_pid();
+    let pid = current_pid();
     const TICK_HZ: u64 = 100;
     const NSEC_PER_TICK: u64 = 1_000_000_000 / TICK_HZ;
     let value_ticks = seconds as u64 * TICK_HZ;
@@ -3246,11 +3298,11 @@ fn sys_clone_or_fork(
     const CLONE_VM: usize = 0x0000_0100;
 
     if flags & CLONE_VM != 0 {
-        sched::clone_thread(flags, child_stack, tls, ctid, frame_ptr)
+        clone_thread(flags, child_stack, tls, ctid, frame_ptr)
     } else {
         let _ = (child_stack, _ptid, tls, ctid);
-        let parent_pid = sched::current_pid();
-        let ret = sched::fork_current(frame_ptr);
+        let parent_pid = current_pid();
+        let ret = fork_current(frame_ptr);
         if ret > 0 {
             // ret is child PID — duplicate FD table for child.
             let msg = make_vfs_msg(vfs::VFS_FORK_DUP,

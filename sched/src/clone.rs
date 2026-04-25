@@ -72,19 +72,12 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         let as_raw_ptr: *const mm::vmm::AddressSpace = {
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid) {
-                Some(idx) => match rq.get(idx) {
-                    Some(t) => match t.address_space.as_ref() {
-                        Some(as_) => as_ as *const mm::vmm::AddressSpace,
-                        None => {
-                            mm::buddy::free(stack_base, 1);
-                            mm::buddy::free(child_pt, 0);
-                            return -38; // kernel task → can't fork
-                        }
-                    },
+                Some(t) => match t.address_space.as_ref() {
+                    Some(as_) => as_ as *const mm::vmm::AddressSpace,
                     None => {
                         mm::buddy::free(stack_base, 1);
                         mm::buddy::free(child_pt, 0);
-                        return -3; // ESRCH
+                        return -38; // kernel task → can't fork
                     }
                 },
                 None => {
@@ -135,18 +128,12 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         // ── Step 6: gather parent credentials ────────────────────────────────
         let (heap_start, heap_end, ppid, tgid, pgid, sid, uid, gid, euid, egid) = {
             let rq = super::RUN_QUEUE.lock();
-            if let Some(idx) = rq.find_pid(parent_pid) {
-                if let Some(t) = rq.get(idx) {
-                    let (hs, he) = t.address_space.as_ref()
-                        .map(|a| (a.heap_start, a.heap_end))
-                        .unwrap_or((0, 0));
-                    (hs, he, t.pid, t.tgid, t.pgid, t.sid,
-                     t.uid, t.gid, t.euid, t.egid)
-                } else {
-                    mm::buddy::free(stack_base, 1);
-                    mm::buddy::free(child_pt, 0);
-                    return -3;
-                }
+            if let Some(t) = rq.find_pid(parent_pid) {
+                let (hs, he) = t.address_space.as_ref()
+                    .map(|a| (a.heap_start, a.heap_end))
+                    .unwrap_or((0, 0));
+                (hs, he, t.pid, t.tgid, t.pgid, t.sid,
+                 t.uid, t.gid, t.euid, t.egid)
             } else {
                 mm::buddy::free(stack_base, 1);
                 mm::buddy::free(child_pt, 0);
@@ -265,7 +252,7 @@ pub fn clone_thread(
         let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, heap_start, heap_end,
              ctid_phys) = {
             let rq = super::RUN_QUEUE.lock();
-            match rq.find_pid(parent_pid).and_then(|i| rq.get(i)) {
+            match rq.find_pid(parent_pid) {
                 Some(t) => {
                     let cp = if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
                         t.address_space.as_ref()

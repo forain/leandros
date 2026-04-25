@@ -52,6 +52,7 @@ const ELF_MAGIC:     [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64:    u8      = 2;
 const ELFDATA2LSB:   u8      = 1;
 const ET_EXEC:       u16     = 2;
+const ET_DYN:        u16     = 3;
 const PT_LOAD:       u32     = 1;
 
 const PF_X: u32 = 1;
@@ -112,7 +113,7 @@ fn parse_ehdr(b: &[u8]) -> Result<Ehdr, ElfError> {
     let e_phentsize = r16(b, 54).ok_or(ElfError::TooShort)?;
     let e_phnum     = r16(b, 56).ok_or(ElfError::TooShort)?;
 
-    if e_type    != ET_EXEC   { return Err(ElfError::NotExecutable); }
+    if e_type != ET_EXEC && e_type != ET_DYN { return Err(ElfError::NotExecutable); }
     if e_machine != EM_TARGET { return Err(ElfError::UnsupportedArch); }
 
     Ok(Ehdr { e_type, e_machine, e_entry, e_phoff, e_phentsize, e_phnum })
@@ -224,14 +225,14 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
             vma.phys + (vaddr - vma.start)
         };
 
-        // Copy `filesz` bytes from the ELF image to the physical backing pages.
-        // The backing pages are identity-mapped in kernel space, so we can write
-        // directly to phys_base.  The rest (memsz - filesz BSS) is already zero.
+        // Copy `filesz` bytes via the HHDM virtual address so this works
+        // regardless of whether an identity map is present.
+        let virt_base = mm::phys_to_virt(phys_base);
         if filesz > 0 {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     bytes.as_ptr().add(foffset),
-                    phys_base as *mut u8,
+                    virt_base as *mut u8,
                     filesz,
                 );
 

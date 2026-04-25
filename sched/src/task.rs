@@ -422,7 +422,9 @@ impl Task {
                 o
             };
 
-            let ptr = mm::buddy::alloc(order).unwrap() as *mut Task;
+            // Use HHDM virtual address so the Box is accessible after any PML4 switch.
+            let phys = mm::buddy::alloc(order).unwrap();
+            let ptr = mm::phys_to_virt(phys) as *mut Task;
             core::ptr::write_bytes(ptr as *mut u8, 0, task_size);
 
             // Set basic task fields
