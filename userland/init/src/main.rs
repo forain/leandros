@@ -9,12 +9,6 @@ extern crate cyanos_libc;
 
 use cyanos_libc::{write, STDOUT_FILENO, getpid, exit, fork, execve, sched_yield};
 
-// Embedded shell binary for Phase 1 execve
-#[cfg(target_arch = "aarch64")]
-static SHELL_BINARY: &[u8] = include_bytes!("../../target/aarch64-unknown-none/release/shell");
-#[cfg(target_arch = "x86_64")]
-static SHELL_BINARY: &[u8] = include_bytes!("../../target/x86_64-unknown-none/release/shell");
-
 /// Called by `__libc_start_main` after the C runtime is set up.
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
@@ -29,12 +23,11 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     
     write_str("Launching shell via execve...\n");
     
-    // Phase 1 backward-compat: if path points to ELF magic and argv is a length,
-    // the kernel loads the ELF directly from that memory.
-    let path_ptr = SHELL_BINARY.as_ptr() as usize;
-    let len_as_argv = SHELL_BINARY.len();
+    // Call shell via its path in the initrd
+    let path = b"/bin/shell\0";
+    let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
     
-    execve(path_ptr as *const u8, len_as_argv as *const *const u8, core::ptr::null());
+    execve(path.as_ptr(), argv.as_ptr(), core::ptr::null());
 
     write_str("ERROR: execve failed!\n");
     loop {

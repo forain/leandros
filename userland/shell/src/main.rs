@@ -13,6 +13,7 @@ use cyanos_libc::{write, read, STDOUT_FILENO, STDIN_FILENO, getpid};
 /// Called by `__libc_start_main` after the C runtime is set up.
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
+    write_str("Shell main reached!\n");
     // Display shell banner
     write_str("\n");
     write_str("  ██████╗██╗   ██╗ █████╗ ███╗   ██╗ ██████╗ ███████╗\n");

@@ -67,10 +67,20 @@ create_initrd() {
     local target_arch=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-none" || echo "x86_64-unknown-none")
     local userland_dir="userland/target/$target_arch/release"
     
-    # We use the raw init binary as the initrd because the kernel 
-    # doesn't have a working global allocator for decompression yet.
-    echo "  Using raw init binary as initrd..."
-    cp "$userland_dir/init" "$ROOT_DIR/$initrd_name"
+    echo "  Creating CPIO initrd..."
+    local temp_dir="temp_initrd_$arch"
+    rm -rf "$temp_dir"
+    mkdir -p "$temp_dir/bin"
+    
+    cp "$userland_dir/init" "$temp_dir/init"
+    cp "$userland_dir/shell" "$temp_dir/bin/shell"
+    
+    # Create uncompressed CPIO archive
+    cd "$temp_dir"
+    find . | cpio -o -H newc > "$ROOT_DIR/$initrd_name"
+    cd "$ROOT_DIR"
+    
+    rm -rf "$temp_dir"
 }
 
 # Function to build kernel

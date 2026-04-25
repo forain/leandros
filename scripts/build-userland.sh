@@ -53,6 +53,10 @@ if $CHECK; then
 fi
 
 echo "[userland] cargo build …"
+# Build shell first so init can embed it
+cargo build "${CARGO_ARGS[@]}" -p cyanos-shell \
+    --config "target.${TARGET}.rustflags=[\"-C\",\"link-arg=--entry=_start\",\"-C\",\"link-arg=-static\",\"-C\",\"linker=rust-lld\",\"-C\",\"relocation-model=static\"]"
+
 cargo build "${CARGO_ARGS[@]}" \
     --config "target.${TARGET}.rustflags=[\"-C\",\"link-arg=--entry=_start\",\"-C\",\"link-arg=-static\",\"-C\",\"linker=rust-lld\",\"-C\",\"relocation-model=static\"]"
 
