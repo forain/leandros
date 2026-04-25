@@ -41,6 +41,9 @@ mod init;
 mod syscall;
 mod mem;
 
+/// Global pointer to the boot info structure.
+pub static mut BOOT_INFO_PTR: usize = 0;
+
 #[no_mangle]
 #[link_section = ".limine_requests"]
 #[used]
@@ -189,13 +192,29 @@ pub extern "C" fn serial_print_bytes(ptr: *const u8, len: usize) {
 }
 
 fn print_number(n: u32) {
-    let mut buf = [0u8; 8];
-    for i in 0..8 {
-        let nibble = (n >> ((7 - i) * 4)) & 0xF;
-        buf[i] = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+    let mut buf = [0u8; 10];
+    if n == 0 {
+        serial_print("0");
+        return;
     }
-    let s = unsafe { core::str::from_utf8_unchecked(&buf) };
+    let mut i = 10usize;
+    let mut val = n;
+    while val > 0 {
+        i -= 1;
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
     serial_print(s);
+}
+
+pub fn print_hex(n: usize) {
+    serial_print("0x");
+    let digits = b"0123456789ABCDEF";
+    for i in (0..core::mem::size_of::<usize>() * 2).rev() {
+        let digit = (n >> (i * 4)) & 0xF;
+        unsafe { serial_write_byte(digits[digit]); }
+    }
 }
 
 // ── Kernel main ───────────────────────────────────────────────────────────────
@@ -230,6 +249,9 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     } else {
         unsafe { boot::multiboot2::parse(boot_info_addr) }
     };
+    
+    // Store global pointer for syscalls
+    unsafe { BOOT_INFO_PTR = core::ptr::addr_of!(boot_info) as usize; }
 
     if boot_info_addr == 0 {
         unsafe {

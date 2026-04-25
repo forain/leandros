@@ -4,7 +4,7 @@
 //! then hands off to `init_server::init_main()` which runs the POSIX smoke
 //! tests and a minimal shell demo before entering the event loop.
 
-use crate::serial_print;
+use crate::{serial_print, serial_write_byte, serial_write_raw, serial_read_byte};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use wifi::mac80211::Mac80211;
@@ -14,9 +14,9 @@ use wifi::cfg80211::{ScanRequest, ScanFlags};
 
 /// Kernel-side I/O callbacks passed to the init server library.
 static INIT_IO: init_server::IoHooks = init_server::IoHooks {
-    print_str:  |s|   crate::serial_print(s),
-    write_raw:  |buf| crate::serial_write_raw(buf),
-    read_byte:  ||    crate::serial_read_byte(),
+    print_str:  |s|   serial_print(s),
+    write_raw:  |buf| serial_write_raw(buf),
+    read_byte:  ||    serial_read_byte(),
 };
 
 // ── Driver probes ─────────────────────────────────────────────────────────────
@@ -372,31 +372,95 @@ fn test_kernel_task() -> ! {
 // ── Initrd extraction and ELF loading ────────────────────────────────────────
 
 /// Extract a binary from the initrd (handles GZIP and CPIO)
-fn extract_binary_from_initrd(path: &str, boot_info: &boot::BootInfo) -> Option<&'static [u8]> {
-    let initrd_phys = boot_info.initrd_base as usize;
+pub fn extract_binary_from_initrd(path: &str, boot_info: &boot::BootInfo) -> Option<&'static [u8]> {
+    let initrd_base = boot_info.initrd_base as usize;
     let initrd_size = boot_info.initrd_size as usize;
 
     if initrd_size == 0 {
         return None;
     }
 
-    crate::serial_print("[INIT] Attempting to extract from initrd, size: ");
-    print_hex(initrd_size);
-    crate::serial_print("\n");
+    // Limine provides the module address as a virtual address in the HHDM.
+    let mut data = unsafe { core::slice::from_raw_parts(initrd_base as *const u8, initrd_size) };
 
-    let initrd_data = unsafe { core::slice::from_raw_parts(initrd_phys as *const u8, initrd_size) };
-    crate::serial_print("[INIT] initrd data pointer: ");
-    print_hex(initrd_data.as_ptr() as usize);
-    crate::serial_print("\n");
-
-    // Fallback: if not CPIO, assume raw ELF
-    if initrd_data.len() >= 4 && &initrd_data[0..4] == b"\x7fELF" {
-        crate::serial_print("[INIT] No CPIO detected, treating as raw ELF\n");
-        return Some(initrd_data);
+    // 1. Decompress if GZIP
+    let decompressed: Vec<u8>;
+    if data.len() > 2 && data[0] == 0x1f && data[1] == 0x8b {
+        crate::serial_print("[INIT] GZIP initrd detected, decompressing...\n");
+        match miniz_oxide::inflate::decompress_to_vec_zlib(data) {
+            Ok(v) => {
+                decompressed = v;
+                // Leak the vector to get a 'static slice (Stage 1 boot-only leak)
+                data = Box::leak(decompressed.into_boxed_slice());
+                crate::serial_print("[INIT] Decompression successful, size: ");
+                print_hex(data.len());
+                crate::serial_print("\n");
+            }
+            Err(_e) => {
+                crate::serial_print("[INIT] GZIP decompression failed\n");
+                return None;
+            }
+        }
     }
 
-    crate::serial_print("[INIT] ERROR: File not found in initrd\n");
+    // 2. Parse CPIO if detected
+    if data.len() > 6 && &data[0..6] == b"070701" {
+        crate::serial_print("[INIT] CPIO (newc) archive detected\n");
+        let mut offset = 0;
+        loop {
+            if offset + 110 > data.len() { break; }
+            let header = &data[offset..offset+110];
+            if &header[0..6] != b"070701" { break; }
+            
+            let namesize = parse_cpio_hex(&header[94..102])?;
+            let filesize = parse_cpio_hex(&header[54..62])?;
+            
+            let name_offset = offset + 110;
+            if name_offset + namesize > data.len() { break; }
+            let name = core::str::from_utf8(&data[name_offset..name_offset + namesize - 1]).ok()?;
+            
+            // Align offsets to 4 bytes
+            let file_offset = (name_offset + namesize + 3) & !3;
+            
+            if name == "TRAILER!!!" { break; }
+            
+            // Normalize path (strip leading dots and slashes)
+            let clean_name = name.trim_start_matches('.').trim_start_matches('/');
+            let clean_path = path.trim_start_matches('.').trim_start_matches('/');
+            
+            if clean_name == clean_path {
+                crate::serial_print("[INIT] Found file: ");
+                crate::serial_print(name);
+                crate::serial_print("\n");
+                return Some(&data[file_offset..file_offset + filesize]);
+            }
+            
+            offset = (file_offset + filesize + 3) & !3;
+        }
+    } else if data.len() >= 4 && &data[0..4] == b"\x7fELF" {
+        // Fallback: if not CPIO, assume raw ELF
+        crate::serial_print("[INIT] No CPIO detected, treating as raw ELF\n");
+        return Some(data);
+    }
+
+    crate::serial_print("[INIT] ERROR: File not found in initrd: ");
+    crate::serial_print(path);
+    crate::serial_print("\n");
     None
+}
+
+fn parse_cpio_hex(s: &[u8]) -> Option<usize> {
+    let mut val = 0usize;
+    for &b in s {
+        let digit = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return None,
+        };
+        val = (val << 4) | (digit as usize);
+    }
+    Some(val)
 }
 
 /// Load an ELF binary and spawn it as a userspace process
@@ -556,12 +620,12 @@ extern "C" {
 }
 
 fn print_hex(n: usize) {
-    crate::serial_print("0x");
+    serial_print("0x");
     let digits = b"0123456789abcdef";
     for i in (0..16).rev() {
         let digit = (n >> (i * 4)) & 0xf;
         unsafe {
-            crate::serial_write_byte(digits[digit]);
+            serial_write_byte(digits[digit]);
         }
     }
 }
@@ -569,14 +633,14 @@ fn print_hex(n: usize) {
 fn print_hex_byte(n: u8) {
     let digits = b"0123456789abcdef";
     unsafe {
-        crate::serial_write_byte(digits[(n >> 4) as usize]);
-        crate::serial_write_byte(digits[(n & 0xf) as usize]);
+        serial_write_byte(digits[(n >> 4) as usize]);
+        serial_write_byte(digits[(n & 0xf) as usize]);
     }
 }
 
 fn print_u32(mut n: u32) {
     if n == 0 {
-        crate::serial_print("0");
+        serial_print("0");
         return;
     }
     let mut buf = [0u8; 10];
@@ -587,7 +651,7 @@ fn print_u32(mut n: u32) {
         n /= 10;
     }
     let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
-    crate::serial_print(s);
+    serial_print(s);
 }
 
 // ── Userspace shell creation ─────────────────────────────────────────────────
