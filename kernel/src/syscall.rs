@@ -10,7 +10,7 @@
 
 use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 use alloc::vec::Vec;
-use crate::print_number;
+use crate::{serial_print, serial_write_byte, serial_write_raw, print_number, print_hex, BOOT_INFO_PTR, init};
 use ipc::{Message, port};
 use sched::{
     fork_current, clone_thread, 
@@ -550,9 +550,9 @@ fn dispatch_inner(
     a3: usize, a4: usize, a5: usize,
     frame_ptr: usize,
 ) -> isize {
-    crate::serial_print("[SYSCALL] nr=");
+    serial_print("[SYSCALL] nr=");
     print_number(number as u32);
-    crate::serial_print("\n");
+    serial_print("\n");
 
     match number {
         // ── Cyanos-private IPC syscalls ───────────────────────────────────────
@@ -1769,10 +1769,35 @@ fn sys_execve(path_or_elf: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let (elf_ptr, elf_len) = if is_elf_ptr {
         (path_or_elf, maybe_elf_len)
     } else {
-        // VFS path lookup — returns a pointer into static RamFS data.
+        // Resolve path string from user space
+        let mut path_buf = [0u8; 256];
+        let ok = with_current_address_space(|as_| {
+            as_.read_user_buf(path_or_elf, &mut path_buf)
+        }).unwrap_or(false);
+        if !ok { return -14; }
+        
+        // Find null terminator
+        let path_len = path_buf.iter().position(|&b| b == 0).unwrap_or(256);
+        let path = core::str::from_utf8(&path_buf[..path_len]).unwrap_or("");
+
+        // 1. Try VFS lookup (RamFS)
         match vfs::get_file_data(path_or_elf) {
             Some((ptr, len)) => (ptr as usize, len),
-            None             => return -2, // ENOENT
+            None => {
+                // 2. Fallback to initrd lookup
+                let (ptr, len) = unsafe {
+                    if BOOT_INFO_PTR != 0 {
+                        let boot_info = &*(BOOT_INFO_PTR as *const boot::BootInfo);
+                        match init::extract_binary_from_initrd(path, boot_info) {
+                            Some(data) => (data.as_ptr() as usize, data.len()),
+                            None => return -2, // ENOENT
+                        }
+                    } else {
+                        return -2;
+                    }
+                };
+                (ptr, len)
+            }
         }
     };
 
@@ -1793,8 +1818,15 @@ fn sys_execve(path_or_elf: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
                 if i >= MAX_EXEC_ARGS { break; }
                 let ptr_addr = argv_ptr + i * core::mem::size_of::<usize>();
                 if !validate_user_buf(ptr_addr, core::mem::size_of::<usize>()) { break; }
-                let str_ptr = unsafe { core::ptr::read(ptr_addr as *const usize) };
-                if str_ptr == 0 { break; }
+                
+                let mut str_ptr: usize = 0;
+                let ok = with_current_address_space(|as_| {
+                    as_.read_user_buf(ptr_addr, unsafe {
+                        core::slice::from_raw_parts_mut(&mut str_ptr as *mut usize as *mut u8, core::mem::size_of::<usize>())
+                    })
+                }).unwrap_or(false);
+                if !ok || str_ptr == 0 { break; }
+                
                 argv.push_cstr(str_ptr);
                 i += 1;
             }
@@ -1806,8 +1838,15 @@ fn sys_execve(path_or_elf: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
                 if i >= MAX_EXEC_ARGS { break; }
                 let ptr_addr = envp_ptr + i * core::mem::size_of::<usize>();
                 if !validate_user_buf(ptr_addr, core::mem::size_of::<usize>()) { break; }
-                let str_ptr = unsafe { core::ptr::read(ptr_addr as *const usize) };
-                if str_ptr == 0 { break; }
+                
+                let mut str_ptr: usize = 0;
+                let ok = with_current_address_space(|as_| {
+                    as_.read_user_buf(ptr_addr, unsafe {
+                        core::slice::from_raw_parts_mut(&mut str_ptr as *mut usize as *mut u8, core::mem::size_of::<usize>())
+                    })
+                }).unwrap_or(false);
+                if !ok || str_ptr == 0 { break; }
+
                 envp.push_cstr(str_ptr);
                 i += 1;
             }
@@ -1963,8 +2002,13 @@ fn sys_execve(path_or_elf: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let cloexec_msg = make_vfs_msg(vfs::VFS_EXEC_CLOEXEC, &[pid as u64]);
     let _ = vfs::handle(&cloexec_msg, pid);
 
+    serial_print("[EXEC] Jumping to entry=0x");
+    print_hex(entry);
+    serial_print(" sp=0x");
+    print_hex(user_sp);
+    serial_print("\n");
+
     replace_address_space(new_as, pt_root, heap_start, entry, user_sp);
-    0
 }
 
 // ── I/O syscalls ──────────────────────────────────────────────────────────────
@@ -1977,14 +2021,14 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
     
     // Debug print for all writes to fd 1/2
     if fd == 1 || fd == 2 {
-        crate::serial_print("[SYSCALL] write fd=");
+        serial_print("[SYSCALL] write fd=");
         let fd_char = (b'0' + fd as u8) as char;
         let mut buf = [0u8; 1];
         buf[0] = fd_char as u8;
-        crate::serial_write_raw(&buf);
-        crate::serial_print(" count=");
+        serial_write_raw(&buf);
+        serial_print(" count=");
         print_number(count as u32);
-        crate::serial_print("\n");
+        serial_print("\n");
     }
 
     if !validate_user_buf(buf_ptr, count) { return -14; }
@@ -1998,11 +2042,11 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
             }).unwrap_or(false);
 
             if !ok { 
-                crate::serial_print("[SYSCALL] write: read_user_buf failed\n");
+                serial_print("[SYSCALL] write: read_user_buf failed\n");
                 return -14; 
             }
             
-            crate::serial_write_raw(&kbuf);
+            serial_write_raw(&kbuf);
             count as isize
         }
         _ => {
@@ -2082,7 +2126,7 @@ fn sys_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
                 if len == 0 { continue; }
                 if !validate_user_buf(base, len) { return -14; }
                 let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
-                crate::serial_write_raw(bytes);
+                serial_write_raw(bytes);
                 total = total.saturating_add(len as isize);
             }
             total
