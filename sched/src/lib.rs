@@ -193,22 +193,6 @@ fn scheduler_run_loop() -> ! {
             };
 
             unsafe {
-                extern "C" { fn arch_serial_putc(c: u8); }
-                arch_serial_putc(b'[');
-                arch_serial_putc(b'S');
-                arch_serial_putc(b'C');
-                arch_serial_putc(b'H');
-                arch_serial_putc(b'E');
-                arch_serial_putc(b'D');
-                arch_serial_putc(b']');
-                arch_serial_putc(b' ');
-                arch_serial_putc(b'P');
-                arch_serial_putc(b'I');
-                arch_serial_putc(b'D');
-                arch_serial_putc(b'=');
-                arch_serial_putc(b'0' + (pid % 10) as u8);
-                arch_serial_putc(b'\n');
-
                 CURRENT_CTX[id] = ctx_ptr as *mut CpuContext;
                 CURRENT_PID[id] = pid;
                 
@@ -223,17 +207,14 @@ fn scheduler_run_loop() -> ! {
                 arch_set_kernel_stack(kernel_stack_top_virt as u64);
 
                 if page_table != 0 {
-                    arch_serial_putc(b'T'); // T for Table switch
                     arch_set_page_table(page_table);
                 }
 
-                arch_serial_putc(b'X'); // X for eXecute switch
                 context::cpu_switch_to(
                     core::ptr::addr_of_mut!(SCHEDULER_CTX[id]),
                     ctx_ptr,
                 );
 
-                arch_serial_putc(b'R'); // R for Returned
                 arch_set_page_table(0);
                 CURRENT_CTX[id] = core::ptr::null_mut();
                 CURRENT_PID[id] = 0;
@@ -501,6 +482,8 @@ pub fn replace_address_space(
     }
 
     unsafe {
+        // Switch to the new address space before entering userspace.
+        arch_set_page_table(pt_root);
         arch_execve_return(entry, user_sp);
     }
 }
