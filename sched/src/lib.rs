@@ -211,6 +211,15 @@ fn scheduler_run_loop() -> ! {
 
                 CURRENT_CTX[id] = ctx_ptr as *mut CpuContext;
                 CURRENT_PID[id] = pid;
+                
+                // Mark task as Running before switching to it
+                {
+                    let mut rq = RUN_QUEUE.lock();
+                    if let Some(t) = rq.get_mut(idx) {
+                        t.state = TaskState::Running;
+                    }
+                }
+
                 arch_set_kernel_stack(kernel_stack_top_virt as u64);
 
                 if page_table != 0 {
@@ -228,6 +237,17 @@ fn scheduler_run_loop() -> ! {
                 arch_set_page_table(0);
                 CURRENT_CTX[id] = core::ptr::null_mut();
                 CURRENT_PID[id] = 0;
+
+                // Task returned to scheduler. If it's still "Running", 
+                // it means it yielded or was preempted, so set it back to Ready.
+                {
+                    let mut rq = RUN_QUEUE.lock();
+                    if let Some(t) = rq.get_mut(idx) {
+                        if t.state == TaskState::Running {
+                            t.state = TaskState::Ready;
+                        }
+                    }
+                }
             }
 
             let zombie_info = {
@@ -236,7 +256,6 @@ fn scheduler_run_loop() -> ! {
                     if t.state == TaskState::Zombie {
                         Some((t.kernel_stack, t.pid, t.exit_code))
                     } else {
-                        t.state = TaskState::Running;
                         None
                     }
                 } else {
