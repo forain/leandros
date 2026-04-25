@@ -280,7 +280,7 @@ arch_execve_return:
     xor   r15, r15
     // Restore user GS (kernel GS was activated on SYSCALL entry).
     swapgs
-    iret
+    iretq
 "#);
 
 extern "C" {

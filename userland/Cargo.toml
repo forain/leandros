@@ -13,4 +13,4 @@ panic = "abort"
 panic = "abort"
 opt-level = "s"
 lto = true
-strip = true
+strip = false

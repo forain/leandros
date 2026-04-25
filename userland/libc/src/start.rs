@@ -20,11 +20,8 @@ global_asm!(
     "   mov  x30, #0",           // clear link register  (no return address)
     "   mov  x0,  sp",           // argument: initial stack pointer → argc
     "   bl   __libc_start_main", // tail-call to libc (never returns)
-
-    "   mov  x29, #0",           // clear frame pointer (no parent frame)
-    "   mov  x30, #0",           // clear link register  (no return address)
-    "   mov  x0,  sp",           // argument: initial stack pointer → argc
-    "   bl   __libc_start_main", // tail-call (never returns)
+    "1: wfe",
+    "   b    1b",
 
     "debug_start_msg:",
     ".ascii \"[USERSPACE] _start reached! Assembly entry point working correctly!\\n\""
@@ -41,6 +38,8 @@ global_asm!(
     "   xor  rbp, rbp",          // clear frame pointer (no parent frame)
     "   mov  rdi, rsp",          // argument: initial stack pointer → argc
     "   call __libc_start_main", // tail-call to libc (never returns)
+    "1: hlt",
+    "   jmp 1b",
 
     "debug_start_msg:",
     ".ascii \"[USERSPACE] _start reached! Assembly entry point working correctly!\\n\""

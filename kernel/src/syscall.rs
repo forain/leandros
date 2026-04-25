@@ -1894,14 +1894,15 @@ fn sys_execve(path_or_elf: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let phys_base = match new_as.virt_to_phys(user_sp) {
         Some(p) => p, None => { drop(new_as); return -12; }
     };
+    let virt_base = mm::phys_to_virt(phys_base);
 
-    // Write the stack frame to kernel-accessible physical memory.
+    // Write the stack frame to kernel-accessible virtual memory (HHDM).
     // Helper: write a u64 at byte offset `off` into the physical frame.
     let write64 = |off: usize, val: u64| unsafe {
-        core::ptr::write((phys_base + off) as *mut u64, val);
+        core::ptr::write((virt_base + off) as *mut u64, val);
     };
     let write8 = |off: usize, src: *const u8, len: usize| unsafe {
-        core::ptr::copy_nonoverlapping(src, (phys_base + off) as *mut u8, len);
+        core::ptr::copy_nonoverlapping(src, (virt_base + off) as *mut u8, len);
     };
 
     // Pointer table section.

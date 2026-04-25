@@ -482,15 +482,26 @@ pub fn replace_address_space(
     new_as: mm::vmm::AddressSpace,
     pt_root: usize,
     heap_start: usize,
-    _entry: usize,
-    _user_sp: usize
-) {
+    entry: usize,
+    user_sp: usize
+) -> ! {
     let pid = current_pid();
-    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        t.address_space = Some(new_as);
-        t.page_table    = pt_root;
-        t.heap_start    = heap_start;
-        t.heap_end      = heap_start;
+    {
+        let mut rq = RUN_QUEUE.lock();
+        if let Some(t) = rq.find_pid_mut(pid) {
+            t.address_space = Some(new_as);
+            t.page_table    = pt_root;
+            t.heap_start    = heap_start;
+            t.heap_end      = heap_start;
+        }
+    }
+
+    extern "C" {
+        fn arch_execve_return(entry: usize, user_sp: usize) -> !;
+    }
+
+    unsafe {
+        arch_execve_return(entry, user_sp);
     }
 }
 

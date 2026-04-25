@@ -198,9 +198,12 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
             flags |= PageFlags::EXECUTE;
             // DEBUG: Critical debug output
             // This is ugly but necessary for debugging
-            let debug_msg = b"[ELF] EXECUTABLE segment detected! PF_X=1, setting EXECUTE flag\r\n";
-            for &byte in debug_msg {
-                unsafe { (0x09000000 as *mut u8).write(byte); }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let debug_msg = b"[ELF] EXECUTABLE segment detected! PF_X=1, setting EXECUTE flag\r\n";
+                for &byte in debug_msg {
+                    unsafe { (0x09000000 as *mut u8).write(byte); }
+                }
             }
         }
         // PF_R (read permission) is always granted; no separate flag needed.
@@ -259,9 +262,12 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
                         core::arch::asm!("isb");
                     }
 
-                    let debug_msg = b"[ELF] Cache maintenance completed for executable segment\r\n";
-                    for &byte in debug_msg {
-                        (0x09000000 as *mut u8).write(byte);
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let debug_msg = b"[ELF] Cache maintenance completed for executable segment\r\n";
+                        for &byte in debug_msg {
+                            unsafe { (0x09000000 as *mut u8).write(byte); }
+                        }
                     }
                 }
             }

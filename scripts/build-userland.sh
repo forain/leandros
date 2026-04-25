@@ -54,7 +54,7 @@ fi
 
 echo "[userland] cargo build …"
 cargo build "${CARGO_ARGS[@]}" \
-    --config "target.${TARGET}.rustflags=[\"-C\",\"link-arg=--entry=_start\",\"-C\",\"link-arg=-static\",\"-C\",\"linker=rust-lld\"]"
+    --config "target.${TARGET}.rustflags=[\"-C\",\"link-arg=--entry=_start\",\"-C\",\"link-arg=-static\",\"-C\",\"linker=rust-lld\",\"-C\",\"relocation-model=static\"]"
 
 OUT="userland/target/${TARGET}/${MODE}"
 echo ""

@@ -10,7 +10,10 @@ extern crate cyanos_libc;
 use cyanos_libc::{write, STDOUT_FILENO, getpid, exit, fork, execve, sched_yield};
 
 // Embedded shell binary for Phase 1 execve
-// static SHELL_BINARY: &[u8] = include_bytes!("../../target/aarch64-unknown-none/release/shell");
+#[cfg(target_arch = "aarch64")]
+static SHELL_BINARY: &[u8] = include_bytes!("../../target/aarch64-unknown-none/release/shell");
+#[cfg(target_arch = "x86_64")]
+static SHELL_BINARY: &[u8] = include_bytes!("../../target/x86_64-unknown-none/release/shell");
 
 /// Called by `__libc_start_main` after the C runtime is set up.
 #[no_mangle]
@@ -23,34 +26,19 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     write_str("\n");
 
     write_str("Init process running successfully!\n");
-    write_str("Testing basic syscalls...\n");
+    
+    write_str("Launching shell via execve...\n");
+    
+    // Phase 1 backward-compat: if path points to ELF magic and argv is a length,
+    // the kernel loads the ELF directly from that memory.
+    let path_ptr = SHELL_BINARY.as_ptr() as usize;
+    let len_as_argv = SHELL_BINARY.len();
+    
+    execve(path_ptr as *const u8, len_as_argv as *const *const u8, core::ptr::null());
 
-    // Test basic syscalls without fork/execve to isolate scheduler vs memory issues
-    for i in 0..5 {
-        write_str("Test iteration: ");
-        write_u32(i);
-        write_str("\n");
-
-        // Test yield
-        sched_yield();
-
-        // Small delay loop
-        for _ in 0..100000 {
-            core::hint::spin_loop();
-        }
-    }
-
-    write_str("All tests completed successfully!\n");
-
-    // Simple init loop - in a real system this would reap children
+    write_str("ERROR: execve failed!\n");
     loop {
-        write_str("Init: yielding to scheduler\n");
         sched_yield();
-
-        // Small delay
-        for _ in 0..1000000 {
-            core::hint::spin_loop();
-        }
     }
 }
 
