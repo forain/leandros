@@ -513,22 +513,6 @@ pub extern "C" fn syscall_dispatch(
     a3: usize, a4: usize, a5: usize,
     frame_ptr: usize,
 ) -> isize {
-    // Debug: Print syscall info
-    unsafe {
-        extern "C" { fn arch_serial_putc(ch: u8); }
-        let debug_msg = b"[SYSCALL] Got syscall #";
-        for &b in debug_msg { arch_serial_putc(b); }
-        let mut n = number;
-        if n == 0 { arch_serial_putc(b'0'); } else {
-            let mut buf = [0u8; 10];
-            let mut i = 10;
-            while n > 0 { i -= 1; buf[i] = b'0' + ((n % 10) as u8); n /= 10; }
-            for &c in &buf[i..] { arch_serial_putc(c); }
-        }
-        let debug_nl = b"\r\n";
-        for &b in debug_nl { arch_serial_putc(b); }
-    }
-
     dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr)
 }
 
@@ -550,10 +534,6 @@ fn dispatch_inner(
     a3: usize, a4: usize, a5: usize,
     frame_ptr: usize,
 ) -> isize {
-    serial_print("[SYSCALL] nr=");
-    print_number(number as u32);
-    serial_print("\n");
-
     match number {
         // ── Cyanos-private IPC syscalls ───────────────────────────────────────
         SYS_IPC_SEND => sys_send(a0, a1, a2),
@@ -615,45 +595,7 @@ fn dispatch_inner(
         ARCH_PRCTL => sys_arch_prctl(a0, a1),
 
         // ── I/O ───────────────────────────────────────────────────────────────
-        WRITE  => {
-            // Debug the write syscall parameters
-            unsafe {
-                extern "C" { fn arch_serial_putc(ch: u8); }
-                let debug_write = b"[SYSCALL] write(";
-                for &b in debug_write { arch_serial_putc(b); }
-                // Print fd
-                let mut n = a0;
-                if n == 0 { arch_serial_putc(b'0'); } else {
-                    let mut buf = [0u8; 10];
-                    let mut i = 10;
-                    while n > 0 { i -= 1; buf[i] = b'0' + ((n % 10) as u8); n /= 10; }
-                    for &c in &buf[i..] { arch_serial_putc(c); }
-                }
-                arch_serial_putc(b',');
-                arch_serial_putc(b' ');
-                // Print buffer address
-                let debug_0x = b"0x";
-                for &b in debug_0x { arch_serial_putc(b); }
-                for shift in (0..16).rev() {
-                    let nibble = (a1 >> (shift * 4)) & 0xF;
-                    let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-                    arch_serial_putc(ch);
-                }
-                let debug_comma = b", ";
-                for &b in debug_comma { arch_serial_putc(b); }
-                // Print count
-                let mut n = a2;
-                if n == 0 { arch_serial_putc(b'0'); } else {
-                    let mut buf = [0u8; 10];
-                    let mut i = 10;
-                    while n > 0 { i -= 1; buf[i] = b'0' + ((n % 10) as u8); n /= 10; }
-                    for &c in &buf[i..] { arch_serial_putc(c); }
-                }
-                let debug_end = b")\r\n";
-                for &b in debug_end { arch_serial_putc(b); }
-            }
-            sys_write(a0, a1, a2)
-        }
+        WRITE  => sys_write(a0, a1, a2),
         READ   => sys_read(a0, a1, a2),
         WRITEV => sys_writev(a0, a1, a2),
         READV  => sys_readv(a0, a1, a2),
@@ -2019,18 +1961,6 @@ fn sys_execve(path_or_elf: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
     if count == 0 { return 0; }
     
-    // Debug print for all writes to fd 1/2
-    if fd == 1 || fd == 2 {
-        serial_print("[SYSCALL] write fd=");
-        let fd_char = (b'0' + fd as u8) as char;
-        let mut buf = [0u8; 1];
-        buf[0] = fd_char as u8;
-        serial_write_raw(&buf);
-        serial_print(" count=");
-        print_number(count as u32);
-        serial_print("\n");
-    }
-
     if !validate_user_buf(buf_ptr, count) { return -14; }
     match fd {
         1 | 2 => {
@@ -2042,7 +1972,7 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
             }).unwrap_or(false);
 
             if !ok { 
-                serial_print("[SYSCALL] write: read_user_buf failed\n");
+                serial_print("sys_write: read_user_buf failed\n");
                 return -14; 
             }
             
