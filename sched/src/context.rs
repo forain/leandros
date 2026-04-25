@@ -475,11 +475,6 @@ cpu_switch_to:
     // rdi = *mut CpuContext (old)
     // rsi = *const CpuContext (new)
 
-    // Debug: 'S' for Start switch
-    mov al, 'S'
-    mov dx, 0x3F8
-    out dx, al
-
     // ── save FS.base ─────────────────────────────────────────────────────────
     mov   ecx, 0xC0000100
     rdmsr
@@ -561,26 +556,12 @@ cpu_switch_to_with_pt:
     // rsi = *const CpuContext (new)
     // rdx = page_table (physical address, 0 = no change)
 
-    // Debug: 'S' for Start switch
-    mov al, 'S'
-    mov dx, 0x3F8
-    out dx, al
-
-    // Debug: '1' before MSR
-    mov al, '1'
-    out dx, al
-
     // ── save FS.base ─────────────────────────────────────────────────────────
     mov   ecx, 0xC0000100
     rdmsr
     shl   rdx, 32
     or    rax, rdx
     mov   [rdi + 272], rax
-
-    // Debug: '2' before SSE
-    mov al, '2'
-    mov dx, 0x3F8
-    out dx, al
 
     // ── save outgoing SSE/FPU state ──────────────────────────────────────────
     movdqu [rdi + 8],   xmm0
@@ -601,21 +582,10 @@ cpu_switch_to_with_pt:
     movdqu [rdi + 248], xmm15
     stmxcsr [rdi + 264]
 
-    // Debug: '3' before push
-    mov al, '3'
-    mov dx, 0x3F8
-    out dx, al
-
     // ── switch page table if needed ─────────────────────────────────────────
     // rdx still holds page_table from call
     test rdx, rdx
     jz 1f
-    
-    // Debug: 'P' for Page table
-    mov al, 'P'
-    mov dx, 0x3F8
-    out dx, al
-    
     mov cr3, rdx
 1:
 
@@ -654,11 +624,6 @@ cpu_switch_to_with_pt:
     mov  ecx, 0xC0000100
     wrmsr
 
-    // Debug: 'E' for End switch
-    mov al, 'E'
-    mov dx, 0x3F8
-    out dx, al
-
     ret
 .size cpu_switch_to_with_pt, .-cpu_switch_to_with_pt
 
@@ -666,11 +631,6 @@ cpu_switch_to_with_pt:
 .global iret_to_user
 .type   iret_to_user, @function
 iret_to_user:
-    // Debug: 'U' for User entry
-    mov al, 'U'
-    mov dx, 0x3F8
-    out dx, al
-
     // Set up segment registers for userspace (DPL 3)
     mov ax, 0x1B
     mov ds, ax
