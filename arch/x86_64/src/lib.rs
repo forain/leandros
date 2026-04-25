@@ -91,3 +91,22 @@ pub unsafe extern "C" fn arch_serial_putc(c: u8) {
     // Send the character
     asm!("out dx, al", in("dx") 0x3F8u16, in("al") c, options(nomem, nostack));
 }
+
+/// x86_64 serial input.
+///
+/// Returns Some(byte) if a character is available in the UART RX FIFO.
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn arch_serial_read_byte() -> i16 {
+    use core::arch::asm;
+    let lsr: u8;
+    asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
+    
+    if lsr & 0x01 != 0 {
+        let b: u8;
+        asm!("in al, dx", out("al") b, in("dx") 0x3F8u16, options(nomem, nostack));
+        b as i16
+    } else {
+        -1
+    }
+}

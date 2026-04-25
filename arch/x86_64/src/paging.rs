@@ -186,7 +186,7 @@ unsafe fn pt_print_hex64(v: u64) {
 
 /// Walk and print the 4-level page-table chain for `virt` using `pml4_phys`.
 /// Prints each entry and whether it has the XD (NX) bit set.
-unsafe fn debug_walk_pte(pml4_phys: usize, virt: usize) {
+pub unsafe fn debug_walk_pte(pml4_phys: usize, virt: usize) {
     let hhdm    = mm::phys_to_virt(0);
     let idx4    = (virt >> 39) & 0x1FF;
     let idx3    = (virt >> 30) & 0x1FF;
@@ -320,7 +320,19 @@ pub unsafe extern "C" fn arch_map_page(
     phys: usize,
     flags: u64,
 ) -> bool {
-    map_4k(page_table_root, virt, phys, translate_flags(flags))
+    let f = translate_flags(flags);
+    /*
+    if virt >= 0x200000 && virt < 0x300000 {
+        for b in b"[PGT] Mapping 0x" { crate::arch_serial_putc(*b); }
+        pt_print_hex64(virt as u64);
+        for b in b" to 0x" { crate::arch_serial_putc(*b); }
+        pt_print_hex64(phys as u64);
+        for b in b" flags=0x" { crate::arch_serial_putc(*b); }
+        pt_print_hex64(f.bits());
+        crate::arch_serial_putc(b'\n');
+    }
+    */
+    map_4k(page_table_root, virt, phys, f)
 }
 
 #[no_mangle]

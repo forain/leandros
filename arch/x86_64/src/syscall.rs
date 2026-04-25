@@ -68,8 +68,6 @@ unsafe fn wrmsr(msr: u32, val: u64) {
 
 /// Number of CPUs supported (must match `sched::MAX_CPUS`).
 const MAX_CPUS:   usize = 8;
-/// Size of each CPU's private SYSCALL kernel stack.
-const STACK_SIZE: usize = 16 * 1024; // 16 KiB
 
 /// Per-CPU metadata accessed via GS during the SYSCALL path.
 ///
@@ -82,29 +80,28 @@ struct PerCpuSyscall {
     user_rsp_save:    u64,
 }
 
-#[repr(align(16))]
-struct SyscallStack([u8; STACK_SIZE]);
-
-/// Static kernel stacks, one per CPU (placed in .bss, zero-initialized).
-static mut SYSCALL_STACKS: [SyscallStack; MAX_CPUS] = [const { SyscallStack([0u8; STACK_SIZE]) }; MAX_CPUS];
-
 /// Per-CPU SYSCALL metadata (KERNEL_GS_BASE points here for each CPU).
 static mut PER_CPU: [PerCpuSyscall; MAX_CPUS] =
     [const { PerCpuSyscall { kernel_stack_top: 0, user_rsp_save: 0 } }; MAX_CPUS];
 
+/// Update the kernel stack top for the current CPU.
+/// Called by `arch_set_kernel_stack` during context switches.
+pub fn set_syscall_stack(rsp: u64) {
+    let cpu_id = unsafe { crate::smp::arch_cpu_id() };
+    let idx = cpu_id.min(MAX_CPUS - 1);
+    unsafe {
+        PER_CPU[idx].kernel_stack_top = rsp;
+    }
+}
+
 /// Initialise the per-CPU SYSCALL state for `cpu_id`.
 ///
-/// Sets `PER_CPU[cpu_id].kernel_stack_top` to the top of the static stack
-/// for that CPU, then writes the address of `PER_CPU[cpu_id]` into the
-/// `IA32_KERNEL_GS_BASE` MSR so that `swapgs` on SYSCALL entry makes
-/// GS point directly to the per-CPU struct.
+/// Writes the address of `PER_CPU[cpu_id]` into the `IA32_KERNEL_GS_BASE`
+/// MSR so that `swapgs` on SYSCALL entry makes GS point directly to the
+/// per-CPU struct.
 fn init_per_cpu(cpu_id: usize) {
     let idx = cpu_id.min(MAX_CPUS - 1);
     unsafe {
-        // Stack grows downward; top = base + size.
-        let stack_top = SYSCALL_STACKS[idx].0.as_ptr().add(STACK_SIZE) as u64;
-        PER_CPU[idx].kernel_stack_top = stack_top;
-
         let per_cpu_ptr = core::ptr::addr_of!(PER_CPU[idx]) as u64;
         wrmsr(MSR_KERNEL_GSBASE, per_cpu_ptr);
     }
@@ -113,8 +110,9 @@ fn init_per_cpu(cpu_id: usize) {
 /// Configure SYSCALL/SYSRET MSRs and initialise per-CPU state for the BSP (CPU 0).
 pub fn init() {
     unsafe {
-        // Enable SCE (System Call Extensions) in EFER.
-        wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1);
+        // Enable SCE (System Call Extensions) and NXE (No-Execute Enable) in EFER.
+        // SCE is bit 0, NXE is bit 11.
+        wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 0x801);
 
         // STAR segments:
         //   bits[47:32] = 0x08  → SYSCALL CS = 0x08, SS = 0x10
@@ -183,31 +181,41 @@ syscall_entry:
     // 1. Activate kernel GS (IA32_KERNEL_GS_BASE → GS; user GS stashed).
     swapgs
 
-    // 2. Save user RSP; switch to this CPU's kernel SYSCALL stack.
-    mov   gs:[8], rsp     // PerCpuSyscall.user_rsp_save = user RSP
-    mov   rsp, gs:[0]     // RSP = PerCpuSyscall.kernel_stack_top (16-byte aligned)
+    // 2. Save user RSP in scratch slot, then switch to kernel stack.
+    mov   gs:[8], rsp     // user RSP → scratch
+    mov   rsp, gs:[0]     // RSP = kernel stack top (16-byte aligned)
 
-    // 3. Save user RFLAGS and RIP (clobbered by SYSCALL instruction).
-    //    These MUST be saved first because they are in r11/rcx and the rearrangement below will clobber them.
-    push  r11             // user RFLAGS                   RSP = top-8
-    push  rcx             // user RIP                      RSP = top-16 (aligned)
+    // 3. Build an IRETQ frame on the kernel stack.
+    //    Layout: SS, RSP, RFLAGS, CS, RIP
+    push  0x1B            // user data selector (DPL 3)
+    push  gs:[8]          // user RSP
+    push  r11             // user RFLAGS (from SYSCALL instruction)
+    push  0x23            // user code selector (DPL 3)
+    push  rcx             // user RIP (from SYSCALL instruction)
 
     // 4. Save user registers that the rearrangement below will clobber.
-    push  r10             // user r10 = a3                 RSP = top-24
-    push  r9              // user r9  = a5                 RSP = top-32 (aligned)
-    push  r8              // user r8  = a4                 RSP = top-40
-    push  rdx             // user rdx = a2                 RSP = top-48 (aligned)
-    push  rsi             // user rsi = a1                 RSP = top-56
-    push  rdi             // user rdi = a0                 RSP = top-64 (aligned)
+    push  r10             // user r10 = a3
+    push  r9              // user r9  = a5
+    push  r8              // user r8  = a4
+    push  rdx             // user rdx = a2
+    push  rsi             // user rsi = a1
+    push  rdi             // user rdi = a0
 
-    // 5. Push stack args for syscall_dispatch (8 args: 6 in regs, 2 on stack).
-    //    r9 still holds the original a5 value here.
-    push  0               // arg8 = frame_ptr = 0          RSP = top-72
-    push  r9              // arg7 = a5                     RSP = top-80 (aligned)
+    // 5. Push stack args for syscall_dispatch (8 args total).
+    //    Current RSP is top - 40 (IRET frame) - 48 (6 regs) = top - 88.
+    //    We need top - 96 for 16-byte alignment before call.
+    push  0               // arg8 = frame_ptr = 0
+    push  r9              // arg7 = a5 (original value)
+    
+    // RSP is now top - 104? Let's re-calculate.
+    // IRET frame: 5 * 8 = 40 bytes.
+    // Saved regs: 6 * 8 = 48 bytes.
+    // Stack args: 2 * 8 = 16 bytes.
+    // Total: 40 + 48 + 16 = 104 bytes.
+    // 104 % 16 = 8.
+    // RSP % 16 == 8 before 'call' is CORRECT for System V ABI.
 
     // 6. Rearrange regs for System V 6-register calling convention.
-    //    SysV: rdi, rsi, rdx, rcx, r8, r9
-    //    Cyanos: rax=nr, rdi=a0, rsi=a1, rdx=a2, r10=a3, r8=a4, r9=a5
     mov   r9,  r8         // a4 → r9  (arg6)
     mov   r8,  r10        // a3 → r8  (arg5)
     mov   rcx, rdx        // a2 → rcx (arg4)
@@ -216,29 +224,23 @@ syscall_entry:
     mov   rdi, rax        // number → rdi (arg1)
     
     call  syscall_dispatch
-    // rax = return value (isize)
+    // rax = return value
 
-    // 7. Remove arg7 + arg8 from stack (16 bytes).
-    add   rsp, 16         // RSP = top-64
+    // 7. Remove arg7 + arg8 from stack.
+    add   rsp, 16
 
-    // 8. Restore user registers in reverse push order.
-    pop   rdi             // RSP = top-56
-    pop   rsi             // RSP = top-48
-    pop   rdx             // RSP = top-40
-    pop   r8              // RSP = top-32
-    pop   r9              // RSP = top-24
-    pop   r10             // RSP = top-16
+    // 8. Restore user registers.
+    pop   rdi
+    pop   rsi
+    pop   rdx
+    pop   r8
+    pop   r9
+    pop   r10
 
-    // 9. Restore user RIP and RFLAGS for SYSRET.
-    pop   rcx             // user RIP    RSP = top-8
-    pop   r11             // user RFLAGS RSP = top
-
-    // 10. Restore user RSP and deactivate kernel GS.
-    mov   rsp, gs:[8]
+    // 9. Return to user space via IRETQ.
+    //    Restores user RIP, CS, RFLAGS, RSP, SS from the frame we built.
     swapgs
-
-    // 11. Return to user space.
-    sysretq
+    iretq
 
 // ── arch_execve_return — drop into user space at a new entry / stack ──────
 //

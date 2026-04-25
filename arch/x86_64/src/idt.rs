@@ -215,7 +215,11 @@ fault_no_err_handler!(exc_misc, 0xFE); // catch-all for other vectors
 #[cfg(target_arch = "x86_64")]
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64) {
     let cr2: u64;
-    unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)); }
+    let cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    }
 
     if from_user(&frame) {
         // Bit 0 of the error code: 0 = page not present (translation fault).
@@ -224,8 +228,12 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
             return; // fault handled — resume user task
         }
         serial_str(b"user page fault CR2=0x"); serial_hex64(cr2);
+        serial_str(b" CR3=0x"); serial_hex64(cr3);
         serial_str(b" err=0x"); serial_hex64(error_code);
         serial_str(b": task killed\r\n");
+
+        unsafe { super::paging::debug_walk_pte((cr3 & !0xFFF) as usize, cr2 as usize); }
+
         sched::exit(1);
     } else {
         print_exception(&frame, 14, error_code);

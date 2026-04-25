@@ -151,7 +151,11 @@ pub fn init() {
 /// Update RSP0 in the TSS — called by the scheduler before switching to a
 /// user task so that ring-0 exceptions use the correct kernel stack.
 pub fn set_kernel_stack(rsp: u64) {
-    unsafe { TSS.rsp0 = rsp; }
+    unsafe {
+        TSS.rsp0 = rsp;
+        // Also update the SYSCALL entry stack pointer in the per-CPU metadata.
+        crate::syscall::set_syscall_stack(rsp);
+    }
 }
 
 /// C-callable wrapper used by `sched` (which cannot depend on this crate
