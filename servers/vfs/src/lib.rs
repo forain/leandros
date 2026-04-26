@@ -768,6 +768,12 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
                 found = Some(VnodeKind::DevNull); // placeholder for empty dir fd
             }
         }
+        // Fall back to the initrd CPIO archive for files like /bin/doom1.wad.
+        if found.is_none() {
+            if let Some(data) = find_in_initrd(path) {
+                found = Some(VnodeKind::RamFile { data, pos: 0 });
+            }
+        }
         match found { Some(v) => v, None => return err_reply(-2) }
     };
 
@@ -817,7 +823,11 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             if cur >= total_size { return val_reply(0); }
             let n = count.min(total_size - cur);
 
-            let fb_virt = mm::phys_to_virt(base as usize + cur);
+            let fb_virt = if base >= 0xFFFF_0000_0000_0000 {
+                base as usize + cur
+            } else {
+                mm::phys_to_virt(base as usize + cur)
+            };
             unsafe {
                 core::ptr::copy_nonoverlapping(fb_virt as *const u8, buf, n);
             }
@@ -826,7 +836,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
         }
         VnodeKind::RamFile { data, pos } => {
             let remaining = data.len().saturating_sub(*pos);
-            let n = count.min(remaining).min(4096);
+            let n = count.min(remaining);
             if n == 0 { return val_reply(0); }
             unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(*pos), buf, n); }
             *pos += n;
@@ -986,7 +996,11 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             if cur >= total_size { return val_reply(0); }
             let n = count.min(total_size - cur);
 
-            let fb_virt = mm::phys_to_virt(base as usize + cur);
+            let fb_virt = if base >= 0xFFFF_0000_0000_0000 {
+                base as usize + cur
+            } else {
+                mm::phys_to_virt(base as usize + cur)
+            };
             // We use the user-provided buf_ptr directly because we are in the
             // syscall context of the caller (lower-half mapping is active).
             unsafe {
@@ -1346,6 +1360,51 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
 
     tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
     val_reply(off as u64)
+}
+
+/// Look up a file by absolute path in the initrd CPIO archive.
+/// Returns a `'static` slice to the raw file bytes, or `None` if not found.
+fn find_in_initrd(path: &[u8]) -> Option<&'static [u8]> {
+    let initrd_base = INITRD_BASE.load(atomic::Ordering::SeqCst);
+    let initrd_size = INITRD_SIZE.load(atomic::Ordering::SeqCst);
+    if initrd_base == 0 || initrd_size == 0 { return None; }
+
+    let ptr = mm::phys_to_virt(initrd_base) as *const u8;
+    let data: &'static [u8] = unsafe { core::slice::from_raw_parts(ptr, initrd_size) };
+
+    if data.len() < 6 || &data[0..6] != b"070701" { return None; }
+
+    // Strip leading slash from the query path for comparison.
+    let query = if path.starts_with(b"/") { &path[1..] } else { path };
+
+    let mut offset = 0usize;
+    loop {
+        if offset + 110 > data.len() { break; }
+        let header = &data[offset..offset + 110];
+        if &header[0..6] != b"070701" { break; }
+        let namesize = parse_cpio_hex(&header[94..102]);
+        let filesize = parse_cpio_hex(&header[54..62]);
+        let name_off = offset + 110;
+        if name_off + namesize > data.len() { break; }
+        let name = &data[name_off..name_off + namesize.saturating_sub(1)];
+        if name == b"TRAILER!!!" { break; }
+
+        // Normalise CPIO name: strip "./" or leading "/"
+        let mut cpio_name = if name.starts_with(b"./") { &name[2..] } else { name };
+        if cpio_name.starts_with(b"/") { cpio_name = &cpio_name[1..]; }
+
+        let file_off = (name_off + namesize + 3) & !3;
+        if cpio_name == query {
+            let end = file_off + filesize;
+            if end <= data.len() {
+                return Some(&data[file_off..end]);
+            }
+        }
+        let next_off = (file_off + filesize + 3) & !3;
+        if next_off <= offset { break; }
+        offset = next_off;
+    }
+    None
 }
 
 fn parse_cpio_hex(s: &[u8]) -> usize {

@@ -286,6 +286,21 @@ impl AddressSpace {
         true
     }
 
+    /// Demand-page all unmapped pages in `[addr, addr+len)` so the kernel can
+    /// safely write to user buffers without taking a kernel-mode page fault.
+    pub fn prefault_range(&mut self, addr: usize, len: usize) {
+        if len == 0 { return; }
+        let page_start = addr & !(PAGE_SIZE - 1);
+        let page_end   = (addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let mut va = page_start;
+        while va < page_end {
+            if self.virt_to_phys(va).is_none() {
+                self.handle_user_page_fault(va);
+            }
+            va += PAGE_SIZE;
+        }
+    }
+
     /// Unmap a virtual address range `[virt, virt+len)`, freeing any backing pages.
     ///
     /// Handles full removal, front-trim, and back-trim for each overlapping VMA.

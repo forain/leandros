@@ -2023,6 +2023,11 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
         }
         _ => {
             if count != 0 && !validate_user_buf(buf_ptr, count) { return -14; }
+            // Demand-page any not-yet-faulted pages in the destination buffer
+            // so the VFS can copy directly without taking a kernel-mode fault.
+            if count != 0 {
+                with_current_address_space_mut(|as_| as_.prefault_range(buf_ptr, count));
+            }
             let pid = current_pid();
             let msg = make_vfs_msg(vfs::VFS_READ, &[fd as u64, buf_ptr as u64, count as u64]);
             // Pipe read: VFS returns -EAGAIN when write end is open but empty.
