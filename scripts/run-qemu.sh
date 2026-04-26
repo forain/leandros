@@ -120,6 +120,7 @@ if [ "$BOOT_MODE" = "uefi" ]; then
         exec $QEMU_SYSTEM $MACHINE_ARGS -m 256M -serial mon:stdio \
             -drive if=pflash,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             -drive format=raw,file="$DISK_IMAGE" \
+            -display gtk \
             -no-reboot
     fi
 else
