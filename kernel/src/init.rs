@@ -278,6 +278,10 @@ fn scan_memory_for_initrd() -> Option<(usize, usize)> {
 /// Entry point for the kernel's PID-1 init task.  Never returns.
 pub fn init_task_main(boot_info: &boot::BootInfo) -> ! {
     crate::serial_print("[INIT] Kernel init task starting\n");
+
+    // Initialize VFS with initrd information
+    vfs_server::set_initrd(boot_info.initrd_base as usize, boot_info.initrd_size as usize);
+
     crate::serial_print("[INIT] Loading userspace init ELF binary from initrd\n");
 
     // Load and execute userspace init from initrd
@@ -380,8 +384,9 @@ pub fn extract_binary_from_initrd(path: &str, boot_info: &boot::BootInfo) -> Opt
         return None;
     }
 
-    // Limine provides the module address as a virtual address in the HHDM.
-    let mut data = unsafe { core::slice::from_raw_parts(initrd_base as *const u8, initrd_size) };
+    // Convert physical address to virtual via HHDM
+    let initrd_virt = mm::phys_to_virt(initrd_base);
+    let mut data = unsafe { core::slice::from_raw_parts(initrd_virt as *const u8, initrd_size) };
 
     // 1. Decompress if GZIP
     let decompressed: Vec<u8>;
@@ -512,7 +517,7 @@ fn load_and_spawn_elf(elf_data: &[u8]) -> Option<u32> {
     }
 
     // Create a new address space for the process
-    let mut address_space = mm::vmm::AddressSpace::new(page_table_root);
+    let mut address_space = alloc::boxed::Box::new(mm::vmm::AddressSpace::new(page_table_root));
 
     // Load the ELF binary into the address space
     let entry_point = match elf::load(elf_data, &mut address_space) {
@@ -611,7 +616,7 @@ fn load_and_spawn_elf(elf_data: &[u8]) -> Option<u32> {
     }
 
     // Spawn the userspace process with the loaded address space
-    sched::spawn_user_with_address_space(entry_point, initial_sp, address_space)
+    sched::spawn_user_with_address_space(entry_point, initial_sp, *address_space)
 }
 
 // External function to allocate page table root

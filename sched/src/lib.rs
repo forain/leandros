@@ -53,32 +53,30 @@ fn log_exit(pid: Pid, code: i32) {
     *idx = (*idx + 1) % EXIT_LOG_LEN;
 }
 
-pub fn take_exit_code(pid: Pid) -> Option<i32> {
-    let mut log = EXIT_LOG.lock();
-    for entry in log.iter_mut() {
-        if let Some(record) = entry {
-            if record.pid == pid {
-                let code = record.code;
-                *entry = None;
-                return Some(code);
-            }
-        }
+pub fn get_exit_code(pid: Pid) -> Option<i32> {
+    let log = EXIT_LOG.lock();
+    for entry in log.iter().filter_map(|e| e.as_ref()) {
+        if entry.pid == pid { return Some(entry.code); }
     }
     None
 }
 
-// ── Per-CPU state ────────────────────────────────────────────────────────────
+// ── Context switching ─────────────────────────────────────────────────────────
 
-pub const MAX_CPUS: usize = 16;
+pub const MAX_CPUS: usize = 8;
 static mut SCHEDULER_CTX: [CpuContext; MAX_CPUS] = [const { CpuContext::zeroed() }; MAX_CPUS];
 static mut CURRENT_CTX:   [*mut CpuContext; MAX_CPUS] = [core::ptr::null_mut(); MAX_CPUS];
 static mut CURRENT_PID:   [Pid; MAX_CPUS] = [0; MAX_CPUS];
 
 extern "C" {
-    pub fn cpu_id() -> usize;
-    fn arch_set_kernel_stack(addr: u64);
-    fn arch_set_page_table(addr: usize);
+    fn arch_set_page_table(root: usize);
+    fn arch_set_kernel_stack(rsp: u64);
+    fn arch_cpu_id() -> usize;
     pub fn arch_alloc_page_table_root() -> usize;
+}
+
+pub unsafe fn cpu_id() -> usize {
+    arch_cpu_id()
 }
 
 pub fn alloc_pid() -> Pid {
@@ -88,11 +86,170 @@ pub fn alloc_pid() -> Pid {
     pid
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+pub fn current_pid() -> Pid {
+    unsafe { CURRENT_PID[cpu_id()] }
+}
 
-pub fn init() {
-    // Initialise the boot CPU's run queue with nothing (idle).
-    // The kernel will call spawn() to add the first task.
+pub fn current_ppid() -> Pid {
+    let pid = current_pid();
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.ppid).unwrap_or(0)
+}
+
+pub fn current_pgid() -> Pid {
+    let pid = current_pid();
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.pgid).unwrap_or(0)
+}
+
+pub fn current_sid() -> Pid {
+    let pid = current_pid();
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.sid).unwrap_or(0)
+}
+
+pub fn ticks() -> u64 {
+    TIMER_TICKS.load(Ordering::Relaxed)
+}
+
+pub fn deliver_signal(pid: Pid, signo: u32) -> isize {
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        if signo > 0 && signo <= 64 {
+            t.signal_pending |= 1 << (signo - 1);
+            if t.state == TaskState::Blocked {
+                t.state = TaskState::Ready;
+            }
+            return 0;
+        }
+        return -22; // EINVAL
+    }
+    -3 // ESRCH
+}
+
+pub fn pending_signals() -> u64 {
+    let pid = current_pid();
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.signal_pending).unwrap_or(0)
+}
+
+pub fn clear_pending_signal(signo: u32) {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        if signo > 0 && signo <= 64 {
+            t.signal_pending &= !(1 << (signo - 1));
+        }
+    }
+}
+
+pub fn replace_signal_mask(new_mask: u64) -> u64 {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        let old = t.signal_mask;
+        t.signal_mask = new_mask;
+        old
+    } else { 0 }
+}
+
+pub fn current_reply_port() -> u32 {
+    let pid = current_pid();
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.reply_port).unwrap_or(u32::MAX)
+}
+
+pub fn set_current_reply_port(port: u32) {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        t.reply_port = port;
+    }
+}
+
+pub fn current_cwd(buf: *mut u8, max_len: usize) -> isize {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid(pid) {
+        let len = t.cwd_len.min(max_len);
+        unsafe { core::ptr::copy_nonoverlapping(t.cwd.as_ptr(), buf, len); }
+        return len as isize;
+    }
+    -1
+}
+
+pub fn set_cwd(path: &[u8]) -> bool {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        let len = path.len().min(127);
+        t.cwd[..len].copy_from_slice(&path[..len]);
+        t.cwd_len = len;
+        return true;
+    }
+    false
+}
+
+pub fn set_pgid(pid: Pid, pgid: Pid) -> bool {
+    let mut rq = RUN_QUEUE.lock();
+    if let Some(t) = rq.find_pid_mut(pid) {
+        t.pgid = pgid;
+        return true;
+    }
+    false
+}
+
+pub fn setsid() -> Pid {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    if let Some(t) = rq.find_pid_mut(pid) {
+        t.sid  = pid;
+        t.pgid = pid;
+        return pid;
+    }
+    0
+}
+
+pub fn block_on(port: u32) {
+    block_on_port(port);
+}
+
+pub fn umask(mask: u32) -> u32 {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        let old = t.umask;
+        if mask != u32::MAX { t.umask = mask & 0o777; }
+        return old;
+    }
+    0
+}
+
+pub fn heap_end() -> usize {
+    let pid = current_pid();
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.heap_end).unwrap_or(0)
+}
+
+pub fn init() {}
+
+pub fn wait_pid(pid: Pid) -> Option<i32> {
+    loop {
+        {
+            let mut rq = RUN_QUEUE.lock();
+            if let Some(idx) = rq.find_pid_idx(pid) {
+                let state = rq.get(idx).unwrap().state;
+                if state == TaskState::Zombie {
+                    let code = rq.get(idx).unwrap().exit_code;
+                    rq.remove(idx);
+                    return Some(code);
+                }
+            } else {
+                if let Some(code) = get_exit_code(pid) { return Some(code); }
+                return None;
+            }
+        }
+        yield_now();
+    }
+}
+
+pub fn yield_now() {
+    let id = unsafe { cpu_id() };
+    unsafe {
+        if let Some(ctx_ptr) = CURRENT_CTX[id].as_mut() {
+            context::cpu_switch_to(
+                ctx_ptr,
+                core::ptr::addr_of!(SCHEDULER_CTX[id]),
+            );
+        }
+    }
 }
 
 pub fn timer_tick_irq() {
@@ -109,7 +266,7 @@ pub fn preempt_check() {
 pub fn handle_page_fault(addr: usize) -> bool {
     let pid = current_pid();
     if pid == 0 { return false; }
-    
+
     let mut rq = RUN_QUEUE.lock();
     if let Some(t) = rq.find_pid_mut(pid) {
         if let Some(ref mut as_) = t.address_space {
@@ -128,46 +285,39 @@ pub fn unblock_port(port: u32) {
 }
 
 pub fn spawn(entry: fn() -> !, _flags: usize) -> Option<Pid> {
-    let mut pid_guard = NEXT_PID.lock();
-    let pid = *pid_guard;
-    *pid_guard += 1;
+    let pid = alloc_pid();
 
-    // Allocate stack for the kernel task
-    let stack_base = mm::buddy::alloc(1)?; // 2 pages = 8KB
-    let stack_size = mm::buddy::PAGE_SIZE * 2;
+    // Allocate stack for the kernel task (32KB)
+    let stack_base = mm::buddy::alloc(3)?; 
+    let stack_size = mm::buddy::PAGE_SIZE * 8;
 
     let task = Task::new_kernel(pid, entry as usize, stack_base, stack_size, 0);
     let mut rq = RUN_QUEUE.lock();
     if rq.enqueue(task) {
         Some(pid)
     } else {
-        mm::buddy::free(stack_base, 1);
+        mm::buddy::free(stack_base, 3);
         None
     }
 }
 
 pub fn spawn_user_with_address_space(entry_point: usize, sp: usize, as_: mm::vmm::AddressSpace) -> Option<Pid> {
-    let mut pid_guard = NEXT_PID.lock();
-    let pid = *pid_guard;
-    *pid_guard += 1;
+    let pid = alloc_pid();
 
-    let stack_phys = mm::buddy::alloc(1)?; // 8KB kernel stack for syscalls/interrupts
-    // Pass the HHDM virtual address as the stack base so that ctx.rsp points to
-    // an address accessible after the user PML4 is loaded (HHDM is always present).
+    let stack_phys = mm::buddy::alloc(3)?; // 32KB kernel stack
     let stack_virt = mm::phys_to_virt(stack_phys);
-    let stack_size = mm::buddy::PAGE_SIZE * 2;
+    let stack_size = mm::buddy::PAGE_SIZE * 8;
     let page_table = as_.page_table_root;
 
     let mut task = Task::new_userspace(pid, entry_point, sp, stack_virt, stack_size, page_table);
-    // Store physical address for buddy::free on task exit.
     task.kernel_stack = stack_phys;
     task.address_space = Some(as_);
-    
+
     let mut rq = RUN_QUEUE.lock();
     if rq.enqueue(task) {
         Some(pid)
     } else {
-        mm::buddy::free(stack_phys, 1);
+        mm::buddy::free(stack_phys, 3);
         None
     }
 }
@@ -185,10 +335,7 @@ fn scheduler_run_loop() -> ! {
             let (ctx_ptr, pid, kernel_stack_top_virt, page_table) = {
                 let rq = RUN_QUEUE.lock();
                 let t = rq.get(idx).unwrap();
-                // RSP0 must be a virtual (HHDM) address accessible in any PML4.
-                // kernel_stack stores the physical page base for both kernel and user tasks;
-                // phys_to_virt converts it to the HHDM virtual used as the kernel stack.
-                let kst = mm::phys_to_virt(t.kernel_stack) + mm::buddy::PAGE_SIZE * 2;
+                let kst = mm::phys_to_virt(t.kernel_stack) + mm::buddy::PAGE_SIZE * 8;
                 (&t.ctx as *const CpuContext, t.pid, kst, t.page_table)
             };
 
@@ -196,7 +343,6 @@ fn scheduler_run_loop() -> ! {
                 CURRENT_CTX[id] = ctx_ptr as *mut CpuContext;
                 CURRENT_PID[id] = pid;
                 
-                // Mark task as Running before switching to it
                 {
                     let mut rq = RUN_QUEUE.lock();
                     if let Some(t) = rq.get_mut(idx) {
@@ -205,10 +351,7 @@ fn scheduler_run_loop() -> ! {
                 }
 
                 arch_set_kernel_stack(kernel_stack_top_virt as u64);
-
-                if page_table != 0 {
-                    arch_set_page_table(page_table);
-                }
+                if page_table != 0 { arch_set_page_table(page_table); }
 
                 context::cpu_switch_to(
                     core::ptr::addr_of_mut!(SCHEDULER_CTX[id]),
@@ -219,8 +362,6 @@ fn scheduler_run_loop() -> ! {
                 CURRENT_CTX[id] = core::ptr::null_mut();
                 CURRENT_PID[id] = 0;
 
-                // Task returned to scheduler. If it's still "Running", 
-                // it means it yielded or was preempted, so set it back to Ready.
                 {
                     let mut rq = RUN_QUEUE.lock();
                     if let Some(t) = rq.get_mut(idx) {
@@ -236,12 +377,8 @@ fn scheduler_run_loop() -> ! {
                 if let Some(t) = rq.get_mut(idx) {
                     if t.state == TaskState::Zombie {
                         Some((t.kernel_stack, t.pid, t.exit_code))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                    } else { None }
+                } else { None }
             };
 
             if let Some((stack_base, zombie_pid, exit_code)) = zombie_info {
@@ -250,9 +387,10 @@ fn scheduler_run_loop() -> ! {
                     let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
                     hook(zombie_pid);
                 }
-                log_exit(zombie_pid, exit_code);
+
                 { RUN_QUEUE.lock().remove(idx); }
-                mm::buddy::free(stack_base, 1);
+                mm::buddy::free(stack_base, 3);
+                log_exit(zombie_pid, exit_code);
             }
         } else {
             core::hint::spin_loop();
@@ -260,19 +398,8 @@ fn scheduler_run_loop() -> ! {
     }
 }
 
-pub fn yield_now() {
-    unsafe {
-        let id  = cpu_id();
-        let ctx = CURRENT_CTX[id];
-        if !ctx.is_null() {
-            context::cpu_switch_to(ctx, core::ptr::addr_of_mut!(SCHEDULER_CTX[id]));
-        }
-    }
-}
-
 pub fn exit(code: i32) -> ! {
-    let id = unsafe { cpu_id() };
-    let pid = unsafe { CURRENT_PID[id] };
+    let pid = current_pid();
     {
         let mut rq = RUN_QUEUE.lock();
         if let Some(t) = rq.find_pid_mut(pid) {
@@ -284,153 +411,7 @@ pub fn exit(code: i32) -> ! {
     loop { core::hint::spin_loop(); }
 }
 
-pub fn wait_pid(pid: Pid) -> Option<i32> {
-    if let Some(code) = take_exit_code(pid) {
-        return Some(code);
-    }
-    None
-}
-
-pub fn current_pid() -> Pid {
-    unsafe { CURRENT_PID[cpu_id()] }
-}
-
-pub fn current_ppid() -> Pid {
-    let pid = current_pid();
-    RUN_QUEUE.lock().find_pid(pid).map(|t| t.ppid).unwrap_or(0)
-}
-
-pub fn current_pgid() -> Pid {
-    let pid = current_pid();
-    RUN_QUEUE.lock().find_pid(pid).map(|t| t.pgid).unwrap_or(0)
-}
-
-pub fn ticks() -> u64 {
-    TIMER_TICKS.load(Ordering::Relaxed)
-}
-
-pub fn deliver_signal(pid: Pid, signo: u32) -> isize {
-    let mut rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        t.signal_pending |= 1u64 << (signo - 1);
-        0
-    } else {
-        -3 // ESRCH
-    }
-}
-
-pub fn current_cwd(buf: *mut u8, len: usize) -> isize {
-    let pid = current_pid();
-    let rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid(pid) {
-        let n = t.cwd_len.min(len);
-        unsafe {
-            core::ptr::copy_nonoverlapping(t.cwd.as_ptr(), buf, n);
-        }
-        n as isize
-    } else {
-        -1
-    }
-}
-
-pub fn set_cwd(path: &[u8]) -> bool {
-    let pid = current_pid();
-    let mut rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        let n = path.len().min(32);
-        t.cwd[..n].copy_from_slice(&path[..n]);
-        t.cwd_len = n;
-        true
-    } else {
-        false
-    }
-}
-
-pub fn set_pgid(pid: Pid, pgid: Pid) -> bool {
-    let mut rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        t.pgid = pgid;
-        true
-    } else {
-        false
-    }
-}
-
-pub fn setsid() -> Pid {
-    let pid = current_pid();
-    let mut rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        t.sid = pid;
-        t.pgid = pid;
-        pid
-    } else {
-        0
-    }
-}
-
-pub fn umask(mask: u32) -> u32 {
-    let pid = current_pid();
-    let mut rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        let old = t.umask;
-        if mask != u32::MAX {
-            t.umask = mask & 0o777;
-        }
-        old
-    } else {
-        0
-    }
-}
-
-pub fn heap_end() -> usize {
-    let pid = current_pid();
-    let rq = RUN_QUEUE.lock();
-    rq.find_pid(pid).map(|t| t.heap_end).unwrap_or(0)
-}
-
-pub fn current_sid() -> Pid {
-    let pid = current_pid();
-    let rq = RUN_QUEUE.lock();
-    rq.find_pid(pid).map(|t| t.sid).unwrap_or(0)
-}
-
-pub fn pending_signals() -> u64 {
-    let pid = current_pid();
-    let rq = RUN_QUEUE.lock();
-    rq.find_pid(pid).map(|t| t.signal_pending).unwrap_or(0)
-}
-
-pub fn clear_pending_signal(signo: u32) {
-    let pid = current_pid();
-    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        t.signal_pending &= !(1u64 << (signo - 1));
-    }
-}
-
-pub fn replace_signal_mask(new_mask: u64) -> u64 {
-    let pid = current_pid();
-    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        let old = t.signal_mask;
-        t.signal_mask = new_mask;
-        old
-    } else {
-        0
-    }
-}
-
-pub fn current_reply_port() -> u32 {
-    let pid = current_pid();
-    RUN_QUEUE.lock().find_pid(pid).map(|t| t.reply_port).unwrap_or(u32::MAX)
-}
-
-pub fn set_current_reply_port(port: u32) {
-    let pid = current_pid();
-    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        t.reply_port = port;
-    }
-}
-
-pub fn block_on(port: u32) {
+pub fn block_on_port(port: u32) {
     let pid = current_pid();
     RUN_QUEUE.lock().block_on_port(pid, port);
     yield_now();
@@ -482,14 +463,13 @@ pub fn replace_address_space(
     }
 
     unsafe {
-        // Switch to the new address space before entering userspace.
         arch_set_page_table(pt_root);
         arch_execve_return(entry, user_sp);
     }
 }
 
 pub fn spawn_user(_entry_va: usize, _stack_va: usize, _priority: i8) -> Option<Pid> {
-    None 
+    None
 }
 
 pub fn with_current_address_space<F, R>(f: F) -> Option<R>

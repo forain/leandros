@@ -88,8 +88,8 @@ pub struct Task {
     pub tls_base: u64,
 
     // ── Filesystem state ──────────────────────────────────────────────────────
-    /// Current working directory (reduced for testing).
-    pub cwd:     [u8; 32],
+    /// Current working directory (fixed-size buffer for Phase 1).
+    pub cwd:     [u8; 128],
     pub cwd_len: usize,
     /// File-creation mask (POSIX umask).
     pub umask:   u32,
@@ -109,7 +109,7 @@ impl Task {
         for &b in msg_direct { unsafe { arch_serial_putc(b); } }
 
         // Create task struct directly using Box::new for clean, single allocation
-        let temp_task = Task {
+        let mut temp_task = Task {
             pid,
             state: TaskState::Ready,
             priority: 0,
@@ -140,10 +140,11 @@ impl Task {
             heap_start: 0,
             heap_end: 0,
             tls_base: 0,
-            cwd: [0; 32],
-            cwd_len: 0,
+            cwd: [0; 128],
+            cwd_len: 1, // Default to "/"
             umask: 0o022,
         };
+        temp_task.cwd[0] = b'/';
 
         let msg_done = b"Task::new_kernel: task ready with clean allocation\r\n";
         for &b in msg_done { unsafe { arch_serial_putc(b); } }
@@ -387,10 +388,13 @@ impl Task {
         }
 
         // Initialize cwd array to all zeros, then set first byte to '/'
-        let cwd_ptr = (dest as usize + core::mem::offset_of!(Task, cwd)) as *mut [u8; 32];
-        core::ptr::write_bytes(cwd_ptr as *mut u8, 0, 32);
+        let cwd_ptr = (dest as usize + core::mem::offset_of!(Task, cwd)) as *mut [u8; 128];
+        core::ptr::write_bytes(cwd_ptr as *mut u8, 0, 128);
         let cwd_first_ptr = cwd_ptr as *mut u8;
         core::ptr::write_volatile(cwd_first_ptr, b'/');
+        
+        let cwd_len_ptr = (dest as usize + core::mem::offset_of!(Task, cwd_len)) as *mut usize;
+        core::ptr::write_volatile(cwd_len_ptr, 1);
 
         let msg2 = b"Task::new_kernel_inplace: completed\r\n";
         for &b in msg2 { arch_serial_putc(b); }
@@ -409,49 +413,43 @@ impl Task {
         let debug_msg = b"Task::new_userspace: creating userspace task\r\n";
         for &b in debug_msg { unsafe { arch_serial_putc(b); } }
 
-        unsafe {
-            let task_size = core::mem::size_of::<Task>();
-            let page_size = mm::buddy::PAGE_SIZE;
-            let order = {
-                let mut o = 0;
-                let mut size = page_size;
-                while size < task_size {
-                    size *= 2;
-                    o += 1;
-                }
-                o
-            };
+        let mut task = Task {
+            pid,
+            state: TaskState::Ready,
+            priority: 0,
+            ctx: crate::context::CpuContext::new_user_task(user_entry, user_sp, kernel_stack_base + kernel_stack_size),
+            page_table,
+            kernel_stack: kernel_stack_base,
+            blocked_on: None,
+            blocked_futex: 0,
+            address_space: None,
+            exit_code: 0,
+            reply_port: u32::MAX,
+            ppid: 0,
+            tgid: pid,
+            pgid: pid,
+            sid: pid,
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
+            signal_pending: 0,
+            signal_mask: 0,
+            signal_actions: [DEFAULT_SIGACTION; 4],
+            clear_child_tid: 0,
+            heap_start: 0,
+            heap_end: 0,
+            tls_base: 0,
+            cwd: [0; 128],
+            cwd_len: 1, // Default to "/"
+            umask: 0o022,
+        };
+        task.cwd[0] = b'/';
 
-            // Use HHDM virtual address so the Box is accessible after any PML4 switch.
-            let phys = mm::buddy::alloc(order).unwrap();
-            let ptr = mm::phys_to_virt(phys) as *mut Task;
-            core::ptr::write_bytes(ptr as *mut u8, 0, task_size);
+        let success_msg = b"Task::new_userspace: userspace task created successfully\r\n";
+        for &b in success_msg { unsafe { arch_serial_putc(b); } }
 
-            // Set basic task fields
-            let pid_ptr = (ptr as usize + core::mem::offset_of!(Task, pid)) as *mut Pid;
-            core::ptr::write_volatile(pid_ptr, pid);
-
-            let state_ptr = (ptr as usize + core::mem::offset_of!(Task, state)) as *mut TaskState;
-            core::ptr::write_volatile(state_ptr, TaskState::Ready);
-
-            let page_table_ptr = (ptr as usize + core::mem::offset_of!(Task, page_table)) as *mut usize;
-            core::ptr::write_volatile(page_table_ptr, page_table);
-
-            let kernel_stack_ptr = (ptr as usize + core::mem::offset_of!(Task, kernel_stack)) as *mut usize;
-            core::ptr::write_volatile(kernel_stack_ptr, kernel_stack_base);
-
-            // Create userspace context directly
-            let kernel_stack_top = kernel_stack_base + kernel_stack_size;
-            let ctx = crate::context::CpuContext::new_user_task(user_entry, user_sp, kernel_stack_top);
-
-            let ctx_ptr = (ptr as usize + core::mem::offset_of!(Task, ctx)) as *mut crate::context::CpuContext;
-            core::ptr::write_volatile(ctx_ptr, ctx);
-
-            let success_msg = b"Task::new_userspace: userspace task created successfully\r\n";
-            for &b in success_msg { arch_serial_putc(b); }
-
-            alloc::boxed::Box::from_raw(ptr)
-        }
+        alloc::boxed::Box::new(task)
     }
 
     /// Create a minimal test task using unsafe initialization to avoid stack issues.
