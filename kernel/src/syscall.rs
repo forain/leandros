@@ -511,9 +511,11 @@ extern "C" { fn arch_alloc_page_table_root() -> usize; }
 pub extern "C" fn syscall_dispatch(
     number: usize,
     a0: usize, a1: usize, a2: usize,
-    a3: usize, a4: usize, a5: usize,
-    frame_ptr: usize,
+    a3: usize, a4: usize,
+    a5: usize, frame_ptr: usize, _padding: usize,
 ) -> isize {
+    // x86-64 assembly pushes: [rsp+0]=a5, [rsp+8]=frame_ptr, [rsp+16]=0 (padding)
+    // Register args: rdi=number, rsi=a0, rdx=a1, rcx=a2, r8=a3, r9=a4
     dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr)
 }
 

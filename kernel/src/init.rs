@@ -279,8 +279,14 @@ fn scan_memory_for_initrd() -> Option<(usize, usize)> {
 pub fn init_task_main(boot_info: &boot::BootInfo) -> ! {
     crate::serial_print("[INIT] Kernel init task starting\n");
 
-    // Initialize VFS with initrd information
+    // Initialize VFS with initrd and framebuffer information
     vfs_server::set_initrd(boot_info.initrd_base as usize, boot_info.initrd_size as usize);
+    vfs_server::set_framebuffer(
+        boot_info.framebuffer_base,
+        boot_info.framebuffer_width,
+        boot_info.framebuffer_height,
+        boot_info.framebuffer_pitch,
+    );
 
     crate::serial_print("[INIT] Loading userspace init ELF binary from initrd\n");
 

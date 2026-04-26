@@ -263,33 +263,6 @@ pub unsafe extern "C" fn arch_alloc_page_table_root() -> usize {
                 new_pml4.add(i).write(src_pml4.add(i).read());
             }
 
-            // Diagnostic: read LSTAR and walk page tables from both source
-            // and new PML4 so we can see where (if anywhere) XD=1 is set.
-            let lstar_lo: u32;
-            let lstar_hi: u32;
-            core::arch::asm!(
-                "rdmsr",
-                in("ecx")  0xC000_0082u32,
-                out("eax") lstar_lo,
-                out("edx") lstar_hi,
-                options(nomem, nostack, preserves_flags)
-            );
-            let lstar = ((lstar_hi as usize) << 32) | lstar_lo as usize;
-
-            for b in b"[PGT] LSTAR=0x" { crate::arch_serial_putc(*b); }
-            pt_print_hex64(lstar as u64);
-            crate::arch_serial_putc(b'\n');
-
-            for b in b"[PGT] Source PML4 (CR3_phys=0x" { crate::arch_serial_putc(*b); }
-            pt_print_hex64(cr3_phys as u64);
-            for b in b"):\n" { crate::arch_serial_putc(*b); }
-            debug_walk_pte(cr3_phys, lstar);
-
-            for b in b"[PGT] New PML4 (phys=0x" { crate::arch_serial_putc(*b); }
-            pt_print_hex64(phys as u64);
-            for b in b"):\n" { crate::arch_serial_putc(*b); }
-            debug_walk_pte(phys, lstar);
-
             phys
         }
         None => 0,

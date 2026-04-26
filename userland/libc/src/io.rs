@@ -147,3 +147,9 @@ pub unsafe extern "C" fn unlink(path: *const u8) -> c_int {
 pub unsafe extern "C" fn getdents64(fd: c_int, buf: *mut u8, count: size_t) -> ssize_t {
     ret_or_errno(syscall3(nr::GETDENTS64, fd as usize, buf as usize, count))
 }
+
+/// I/O control.
+#[no_mangle]
+pub unsafe extern "C" fn ioctl(fd: c_int, cmd: usize, arg: usize) -> c_int {
+    ret_or_errno(syscall3(nr::IOCTL, fd as usize, cmd, arg)) as c_int
+}

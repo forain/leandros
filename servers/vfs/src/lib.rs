@@ -119,6 +119,8 @@ enum VnodeKind {
     DevUrandom,
     /// /dev/stdin|stdout|stderr — proxy to fd 0/1/2 of the owning process.
     DevStdio { target_fd: usize },
+    /// /dev/fb0 — linear framebuffer.
+    DevFb { pos: usize },
 }
 
 // ── Pipe ring buffers ─────────────────────────────────────────────────────────
@@ -247,9 +249,21 @@ static FD_TABLES: Mutex<[ProcFdTable; MAX_PROCS]> =
 static INITRD_BASE: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
 static INITRD_SIZE: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
 
+static FB_BASE:   atomic::AtomicU64 = atomic::AtomicU64::new(0);
+static FB_WIDTH:  atomic::AtomicU32 = atomic::AtomicU32::new(0);
+static FB_HEIGHT: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+static FB_PITCH:  atomic::AtomicU32 = atomic::AtomicU32::new(0);
+
 pub fn set_initrd(base: usize, size: usize) {
     INITRD_BASE.store(base, atomic::Ordering::SeqCst);
     INITRD_SIZE.store(size, atomic::Ordering::SeqCst);
+}
+
+pub fn set_framebuffer(base: u64, width: u32, height: u32, pitch: u32) {
+    FB_BASE.store(base, atomic::Ordering::SeqCst);
+    FB_WIDTH.store(width, atomic::Ordering::SeqCst);
+    FB_HEIGHT.store(height, atomic::Ordering::SeqCst);
+    FB_PITCH.store(pitch, atomic::Ordering::SeqCst);
 }
 
 use core::sync::atomic;
@@ -669,6 +683,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
         VnodeKind::DevStdio { target_fd: 1 }
     } else if path == b"/dev/stderr" {
         VnodeKind::DevStdio { target_fd: 2 }
+    } else if path == b"/dev/fb0" {
+        VnodeKind::DevFb { pos: 0 }
     } else if is_tmp_path(path) && path != b"/tmp" {
         // ── Writable /tmp file ────────────────────────────────────────────────
         let writable = flags & (O_WRONLY | O_RDWR) != 0;
@@ -789,6 +805,24 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             drop(tbls);
             // Re-enter as read on the target fd.
             handle_read(pid, tfd, buf_ptr, count)
+        }
+        VnodeKind::DevFb { pos } => {
+            let base = FB_BASE.load(atomic::Ordering::SeqCst);
+            if base == 0 { return err_reply(-19); } // ENODEV
+            let height = FB_HEIGHT.load(atomic::Ordering::SeqCst) as usize;
+            let pitch  = FB_PITCH.load(atomic::Ordering::SeqCst) as usize;
+            let total_size = height * pitch;
+
+            let cur = *pos;
+            if cur >= total_size { return val_reply(0); }
+            let n = count.min(total_size - cur);
+
+            let fb_virt = mm::phys_to_virt(base as usize + cur);
+            unsafe {
+                core::ptr::copy_nonoverlapping(fb_virt as *const u8, buf, n);
+            }
+            *pos = cur + n;
+            val_reply(n as u64)
         }
         VnodeKind::RamFile { data, pos } => {
             let remaining = data.len().saturating_sub(*pos);
@@ -941,6 +975,26 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             drop(tbls);
             handle_write(pid, tfd, buf_ptr, count)
         }
+        VnodeKind::DevFb { pos } => {
+            let base = FB_BASE.load(atomic::Ordering::SeqCst);
+            if base == 0 { return err_reply(-19); } // ENODEV
+            let height = FB_HEIGHT.load(atomic::Ordering::SeqCst) as usize;
+            let pitch  = FB_PITCH.load(atomic::Ordering::SeqCst) as usize;
+            let total_size = height * pitch;
+
+            let cur = *pos;
+            if cur >= total_size { return val_reply(0); }
+            let n = count.min(total_size - cur);
+
+            let fb_virt = mm::phys_to_virt(base as usize + cur);
+            // We use the user-provided buf_ptr directly because we are in the
+            // syscall context of the caller (lower-half mapping is active).
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf, fb_virt as *mut u8, n);
+            }
+            *pos = cur + n;
+            val_reply(n as u64)
+        }
         _ => err_reply(-9),
     }
 }
@@ -985,6 +1039,20 @@ fn handle_lseek(pid: u32, fd: usize, offset: i64, whence: u32) -> Message {
     match &mut tbl.fds[fd].kind {
         VnodeKind::RamFile { data, pos } => {
             let len = data.len() as i64;
+            let new_pos = match whence {
+                SEEK_SET => offset,
+                SEEK_CUR => *pos as i64 + offset,
+                SEEK_END => len + offset,
+                _        => return err_reply(-22),
+            };
+            if new_pos < 0 { return err_reply(-22); }
+            *pos = new_pos as usize;
+            val_reply(new_pos as u64)
+        }
+        VnodeKind::DevFb { pos } => {
+            let height = FB_HEIGHT.load(atomic::Ordering::SeqCst) as usize;
+            let pitch  = FB_PITCH.load(atomic::Ordering::SeqCst) as usize;
+            let len = (height * pitch) as i64;
             let new_pos = match whence {
                 SEEK_SET => offset,
                 SEEK_CUR => *pos as i64 + offset,
@@ -1428,8 +1496,30 @@ fn handle_timerfd_gettime(pid: u32, fd: usize, out_ptr: usize) -> Message {
 }
 
 const FIONREAD: usize = 0x541B;
+const FBIOGET_VSCREENINFO: usize = 0x4600;
 
 fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
+    if cmd == FBIOGET_VSCREENINFO {
+        let mut tbls = FD_TABLES.lock();
+        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        if let VnodeKind::DevFb { .. } = &tbl.fds[fd].kind {
+            let width  = FB_WIDTH.load(atomic::Ordering::SeqCst);
+            let height = FB_HEIGHT.load(atomic::Ordering::SeqCst);
+            drop(tbls);
+            unsafe {
+                let p = arg as *mut u32;
+                p.write(width);     // xres
+                p.add(1).write(height); // yres
+                p.add(2).write(width);  // xres_virtual
+                p.add(3).write(height); // yres_virtual
+                p.add(4).write(0);      // xoffset
+                p.add(5).write(0);      // yoffset
+                p.add(6).write(32);     // bits_per_pixel
+            }
+            return ok_reply();
+        }
+    }
     if cmd != FIONREAD { return err_reply(-25); }
     if arg == 0 { return err_reply(-14); }
     let mut tbls = FD_TABLES.lock();

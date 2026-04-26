@@ -25,6 +25,7 @@ pub mod mem;
 pub mod string;
 pub mod stdio;
 pub mod errno;
+pub mod time;
 
 // Re-export every public symbol so dependents can do `use cyanos_libc::*`.
 pub use io::*;
@@ -33,6 +34,7 @@ pub use string::*;
 pub use stdio::*;
 pub use process::*;
 pub use errno::*;
+pub use time::*;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

@@ -247,6 +247,9 @@ pub mod nr {
     #[cfg(target_arch = "aarch64")] pub const NEWFSTATAT:     usize = 79;
     #[cfg(target_arch = "x86_64")]  pub const NEWFSTATAT:     usize = 262;
 
+    #[cfg(target_arch = "aarch64")] pub const IOCTL:          usize = 29;
+    #[cfg(target_arch = "x86_64")]  pub const IOCTL:          usize = 16;
+
     #[cfg(target_arch = "aarch64")] pub const FCNTL:          usize = 25;
     #[cfg(target_arch = "x86_64")]  pub const FCNTL:          usize = 72;
 
@@ -374,6 +377,8 @@ pub mod nr {
     pub const FSTAT: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const NEWFSTATAT: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const IOCTL: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const FCNTL: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]

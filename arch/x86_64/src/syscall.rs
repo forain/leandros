@@ -266,10 +266,12 @@ syscall_entry:
 // ── fork_ret_to_user — first entry into a child process after fork ───────
 //
 // Called from cpu_switch_to when a newly-forked task is first scheduled.
-// RSP points to a full UserFrame.
+// RSP points to the GP register part of a UserFrame.
 .global fork_ret_to_user
 .type   fork_ret_to_user, @function
 fork_ret_to_user:
+    // UserFrame layout: r15, r14, r13, r12, rbp, rbx, r10, r9, r8, rdx, rsi, rdi, rax, rcx, r11,
+    // followed by [rip, cs, rflags, rsp, ss].
     pop   r15
     pop   r14
     pop   r13
@@ -285,6 +287,7 @@ fork_ret_to_user:
     pop   rax             // Restore rax (contains 0 in child)
     pop   rcx             // restore user RIP
     pop   r11             // restore user RFLAGS
+    // Restore user GS (kernel GS was activated on SYSCALL entry).
     swapgs
     iretq
 

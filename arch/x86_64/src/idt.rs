@@ -158,7 +158,9 @@ macro_rules! fault_no_err_handler {
     ($name:ident, $vector:expr) => {
         #[cfg(target_arch = "x86_64")]
         extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
-            if from_user(&frame) {
+            let from_user = (frame.cs & 3) != 0;
+            if from_user {
+                unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
                 serial_str(b"user fault (no errcode): task killed\r\n");
                 sched::exit(1);
             } else {
@@ -174,7 +176,9 @@ macro_rules! fault_with_err_handler {
     ($name:ident, $vector:expr) => {
         #[cfg(target_arch = "x86_64")]
         extern "x86-interrupt" fn $name(frame: InterruptStackFrame, error_code: u64) {
-            if from_user(&frame) {
+            let from_user = (frame.cs & 3) != 0;
+            if from_user {
+                unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
                 serial_str(b"user fault (errcode): task killed\r\n");
                 let _ = error_code;
                 sched::exit(1);
@@ -214,6 +218,11 @@ fault_no_err_handler!(exc_misc, 0xFE); // catch-all for other vectors
 /// All other user faults kill the task; kernel faults halt.
 #[cfg(target_arch = "x86_64")]
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64) {
+    let from_user = (frame.cs & 3) != 0;
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+    }
+
     let cr2: u64;
     let cr3: u64;
     unsafe {
@@ -221,10 +230,11 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
     }
 
-    if from_user(&frame) {
+    if from_user {
         // Bit 0 of the error code: 0 = page not present (translation fault).
         // Try demand paging before giving up.
         if error_code & 1 == 0 && sched::handle_page_fault(cr2 as usize) {
+            unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
             return; // fault handled — resume user task
         }
         serial_str(b"user page fault CR2=0x"); serial_hex64(cr2);
@@ -254,10 +264,19 @@ extern "C" fn page_fault(_frame: InterruptStackFrame, _error_code: u64) { loop {
 /// task should be preempted.  `sched::preempt_check()` calls `yield_now()`
 /// if needed; the `iretq` epilogue then resumes the correct task.
 #[cfg(target_arch = "x86_64")]
-extern "x86-interrupt" fn timer_irq(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_irq(frame: InterruptStackFrame) {
+    let from_user = (frame.cs & 3) != 0;
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+    }
+
     super::apic::eoi();
     super::timer::on_tick();
     sched::preempt_check();
+
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]

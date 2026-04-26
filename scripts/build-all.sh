@@ -76,6 +76,16 @@ create_initrd() {
     cp "$userland_dir/shell" "$temp_dir/bin/shell"
     cp "$userland_dir/hello" "$temp_dir/bin/hello"
     
+    local doom_bin="doomgeneric/doomgeneric/doom-$arch"
+    if [ -f "$doom_bin" ]; then
+        cp "$doom_bin" "$temp_dir/bin/doom"
+    fi
+
+    local doom_wad="doomgeneric/doom1.wad"
+    if [ -f "$doom_wad" ]; then
+        cp "$doom_wad" "$temp_dir/bin/doom1.wad"
+    fi
+    
     # Create uncompressed CPIO archive
     cd "$temp_dir"
     find . | cpio -o -H newc > "$ROOT_DIR/$initrd_name"

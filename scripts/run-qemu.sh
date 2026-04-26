@@ -111,13 +111,13 @@ if [ "$BOOT_MODE" = "uefi" ]; then
             [ -f "$VARS_TEMPLATE" ] && cp "$VARS_TEMPLATE" aarch64_vars.fd && chmod +w aarch64_vars.fd
         fi
         
-        exec $QEMU_SYSTEM $MACHINE_ARGS -m 512M -nographic \
+        exec $QEMU_SYSTEM $MACHINE_ARGS -m 512M -serial mon:stdio \
             -drive if=pflash,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             $( [ -f "aarch64_vars.fd" ] && echo "-drive if=pflash,format=raw,file=aarch64_vars.fd" ) \
             -drive file="$DISK_IMAGE",if=virtio,format=raw \
             -no-reboot
     else
-        exec $QEMU_SYSTEM $MACHINE_ARGS -m 256M -nographic -serial mon:stdio \
+        exec $QEMU_SYSTEM $MACHINE_ARGS -m 256M -serial mon:stdio \
             -drive if=pflash,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             -drive format=raw,file="$DISK_IMAGE" \
             -no-reboot
@@ -132,13 +132,13 @@ else
     echo "🏗️  Using Kernel: $KERNEL_DIRECT"
     
     if [ "$ARCH" = "aarch64" ]; then
-        exec $QEMU_SYSTEM $MACHINE_ARGS -m 256M -nographic \
+        exec $QEMU_SYSTEM $MACHINE_ARGS -m 256M -serial mon:stdio \
             -kernel "$KERNEL_DIRECT" \
             -initrd "initrd-aarch64.cpio.gz" \
             -append "console=ttyAMA0" \
             -no-reboot
     else
-        exec $QEMU_SYSTEM $MACHINE_ARGS -m 256M -nographic \
+        exec $QEMU_SYSTEM $MACHINE_ARGS -m 256M \
             -kernel "$KERNEL_DIRECT" \
             -initrd "initrd-x86_64.cpio.gz" \
             -append "console=ttyS0,115200" \
