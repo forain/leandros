@@ -1,8 +1,23 @@
 //! Process lifecycle: exit, abort, fork, exec, getpid, wait.
 
-use crate::syscall::{nr, syscall0, syscall1, syscall3};
+use crate::syscall::{nr, syscall0, syscall1, syscall3, syscall4};
 
 pub type pid_t = i32;
+
+/// Wait for a child process to change state.
+#[no_mangle]
+pub unsafe extern "C" fn wait4(
+    pid: pid_t,
+    wstatus: *mut i32,
+    options: i32,
+    rusage: *mut u8,
+) -> pid_t {
+    let r = syscall4(
+        nr::WAIT4, pid as usize,
+        wstatus as usize, options as usize, rusage as usize,
+    );
+    if r < 0 { crate::errno::set_errno(-r as i32); -1 } else { r as pid_t }
+}
 
 /// Terminate the process with `status`.  Never returns.
 #[no_mangle]

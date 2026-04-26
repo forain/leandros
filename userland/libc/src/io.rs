@@ -9,6 +9,16 @@ pub type size_t  = usize;
 pub type off_t   = i64;
 pub type mode_t  = u32;
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct linux_dirent64 {
+    pub d_ino: u64,
+    pub d_off: i64,
+    pub d_reclen: u16,
+    pub d_type: u8,
+    pub d_name: [u8; 0], // Flexible array member
+}
+
 pub const AT_FDCWD: i32 = -100i32;
 pub const STDIN_FILENO:  i32 = 0;
 pub const STDOUT_FILENO: i32 = 1;
@@ -130,4 +140,10 @@ pub unsafe extern "C" fn mkdir(path: *const u8, mode: mode_t) -> c_int {
 pub unsafe extern "C" fn unlink(path: *const u8) -> c_int {
     let r = syscall3(nr::UNLINKAT, AT_FDCWD as usize, path as usize, 0);
     if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Read directory entries.
+#[no_mangle]
+pub unsafe extern "C" fn getdents64(fd: c_int, buf: *mut u8, count: size_t) -> ssize_t {
+    ret_or_errno(syscall3(nr::GETDENTS64, fd as usize, buf as usize, count))
 }
