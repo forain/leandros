@@ -68,7 +68,8 @@ fn make_vfs_msg(tag: u64, args: &[u64]) -> Message {
 
 /// Extract the i64 return value from a VFS reply (first 8 bytes of data).
 fn vfs_reply_val(reply: &Message) -> isize {
-    let bytes: [u8; 8] = reply.data[0..8].try_into().unwrap_or([0u8; 8]);
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&reply.data[0..8]);
     i64::from_le_bytes(bytes) as isize
 }
 
@@ -601,6 +602,8 @@ fn dispatch_inner(
         READV  => sys_readv(a0, a1, a2),
 
         // ── VFS syscalls ──────────────────────────────────────────────────────
+        #[cfg(not(target_arch = "aarch64"))]
+        OPEN        => sys_open(a0, a1, a2),
         OPENAT      => sys_openat(a0, a1, a2, a3),
         CLOSE       => sys_close(a0),
         FSTAT       => sys_fstat(a0, a1),
@@ -761,11 +764,6 @@ fn dispatch_inner(
         SETRLIMIT  => 0, // silently accept any limit
 
         // ── Old-style (non-AT) syscalls (x86-64 only) ─────────────────────────
-        #[cfg(not(target_arch = "aarch64"))]
-        OPEN  => sys_openat(0, a0, a1, a2),
-        #[cfg(not(target_arch = "aarch64"))]
-        CREAT => sys_openat(0, a0,
-                            0x41 /* O_CREAT|O_WRONLY */, a1),
         #[cfg(not(target_arch = "aarch64"))]
         STAT  => sys_stat_at_path(a0, a1),
         #[cfg(not(target_arch = "aarch64"))]
@@ -1695,56 +1693,54 @@ static EXEC_ENVP: spin::Mutex<ExecStrBuf> = spin::Mutex::new(ExecStrBuf::new());
 ///   -38     ENOSYS  — not an ELF image (no VFS yet)
 ///   -8      ENOEXEC — ELF parse / load error
 ///   -12     ENOMEM  — OOM
-fn sys_execve(path_or_elf: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
-    if !validate_user_buf(path_or_elf, 1) { return -14; }
+fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
+    if !validate_user_buf(path_ptr, 1) { return -14; }
 
-    // ── Detect Phase 1 backward-compat ABI ───────────────────────────────────
-    // If path_or_elf points to ELF magic AND argv_ptr looks like a byte length,
-    // treat as (elf_ptr, elf_len) call.
-    let maybe_elf_len = argv_ptr;
-    let is_elf_ptr = if validate_user_buf(path_or_elf, 4) {
-        let magic = unsafe { core::ptr::read(path_or_elf as *const [u8; 4]) };
-        magic == [0x7f, b'E', b'L', b'F'] && maybe_elf_len > 0 && maybe_elf_len <= 64 << 20
-    } else { false };
+    // Resolve path string from user space
+    let mut path_buf = [0u8; 256];
+    let ok = with_current_address_space(|as_| {
+        as_.read_user_buf(path_ptr, &mut path_buf)
+    }).unwrap_or(false);
+    if !ok { return -14; }
+
+    // Find null terminator
+    let path_len = path_buf.iter().position(|&b| b == 0).unwrap_or(256);
+    let path_str = core::str::from_utf8(&path_buf[..path_len]).unwrap_or("");
+
+    // Resolve to absolute path using CWD
+    let mut abs_path_buf = [0u8; 256];
+    let abs_len = resolve_path(&path_buf[..path_len], &mut abs_path_buf);
+    let path = core::str::from_utf8(&abs_path_buf[..abs_len]).unwrap_or(path_str);
 
     // ── Resolve ELF bytes ─────────────────────────────────────────────────────
-    let (elf_ptr, elf_len) = if is_elf_ptr {
-        (path_or_elf, maybe_elf_len)
-    } else {
-        // Resolve path string from user space
-        let mut path_buf = [0u8; 256];
-        let ok = with_current_address_space(|as_| {
-            as_.read_user_buf(path_or_elf, &mut path_buf)
-        }).unwrap_or(false);
-        if !ok { return -14; }
-        
-        // Find null terminator
-        let path_len = path_buf.iter().position(|&b| b == 0).unwrap_or(256);
-        let path = core::str::from_utf8(&path_buf[..path_len]).unwrap_or("");
-
-        // 1. Try VFS lookup (RamFS)
-        match vfs::get_file_data(path_or_elf) {
-            Some((ptr, len)) => (ptr as usize, len),
-            None => {
-                // 2. Fallback to initrd lookup
-                let (ptr, len) = unsafe {
-                    if BOOT_INFO_PTR != 0 {
-                        let boot_info = &*(BOOT_INFO_PTR as *const boot::BootInfo);
-                        match init::extract_binary_from_initrd(path, boot_info) {
-                            Some(data) => (data.as_ptr() as usize, data.len()),
-                            None => return -2, // ENOENT
+    // 1. Try VFS lookup (RamFS) using the resolved absolute path
+    // We'll use the already read 'path' string to check RamFS.
+    // For now, we still use the helper if it's available.
+    let (elf_ptr, elf_len) = match vfs::get_file_data_by_path(path) {
+        Some((ptr, len)) => (ptr as usize, len),
+        None => {
+            // 2. Fallback to initrd lookup using the resolved absolute path
+            let (ptr, len) = unsafe {
+                if BOOT_INFO_PTR != 0 {
+                    let boot_info = &*(BOOT_INFO_PTR as *const boot::BootInfo);
+                    match init::extract_binary_from_initrd(path, boot_info) {
+                        Some(data) => (data.as_ptr() as usize, data.len()),
+                        None => {
+                            serial_print("[EXEC] Failed to find binary in initrd: ");
+                            serial_print(path);
+                            serial_print("\n");
+                            return -2; // ENOENT
                         }
-                    } else {
-                        return -2;
                     }
-                };
-                (ptr, len)
-            }
+                } else {
+                    return -2;
+                }
+            };
+            (ptr, len)
         }
     };
 
     if elf_len == 0 { return -22; }
-    if is_elf_ptr && !validate_user_buf(elf_ptr, elf_len) { return -14; }
 
     // ── Collect argv / envp strings ───────────────────────────────────────────
     let mut argv = EXEC_ARGV.lock();
@@ -1752,56 +1748,53 @@ fn sys_execve(path_or_elf: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     argv.reset();
     envp.reset();
 
-    if !is_elf_ptr {
-        // Read argv[] from user-space (array of pointers, null-terminated).
-        if argv_ptr != 0 {
-            let mut i = 0usize;
-            loop {
-                if i >= MAX_EXEC_ARGS { break; }
-                let ptr_addr = argv_ptr + i * core::mem::size_of::<usize>();
-                if !validate_user_buf(ptr_addr, core::mem::size_of::<usize>()) { break; }
-                
-                let mut str_ptr: usize = 0;
-                let ok = with_current_address_space(|as_| {
-                    as_.read_user_buf(ptr_addr, unsafe {
-                        core::slice::from_raw_parts_mut(&mut str_ptr as *mut usize as *mut u8, core::mem::size_of::<usize>())
-                    })
-                }).unwrap_or(false);
-                if !ok || str_ptr == 0 { break; }
-                
-                argv.push_cstr(str_ptr);
-                i += 1;
-            }
-        }
-        // Read envp[] similarly.
-        if envp_ptr != 0 {
-            let mut i = 0usize;
-            loop {
-                if i >= MAX_EXEC_ARGS { break; }
-                let ptr_addr = envp_ptr + i * core::mem::size_of::<usize>();
-                if !validate_user_buf(ptr_addr, core::mem::size_of::<usize>()) { break; }
-                
-                let mut str_ptr: usize = 0;
-                let ok = with_current_address_space(|as_| {
-                    as_.read_user_buf(ptr_addr, unsafe {
-                        core::slice::from_raw_parts_mut(&mut str_ptr as *mut usize as *mut u8, core::mem::size_of::<usize>())
-                    })
-                }).unwrap_or(false);
-                if !ok || str_ptr == 0 { break; }
+    // Read argv[] from user-space (array of pointers, null-terminated).
+    if argv_ptr != 0 {
+        let mut i = 0usize;
+        loop {
+            if i >= MAX_EXEC_ARGS { break; }
+            let ptr_addr = argv_ptr + i * core::mem::size_of::<usize>();
+            if !validate_user_buf(ptr_addr, core::mem::size_of::<usize>()) { break; }
 
-                envp.push_cstr(str_ptr);
-                i += 1;
-            }
+            let mut str_ptr: usize = 0;
+            let ok = with_current_address_space(|as_| {
+                as_.read_user_buf(ptr_addr, unsafe {
+                    core::slice::from_raw_parts_mut(&mut str_ptr as *mut usize as *mut u8, core::mem::size_of::<usize>())
+                })
+            }).unwrap_or(false);
+            if !ok || str_ptr == 0 { break; }
+
+            argv.push_cstr(str_ptr);
+            i += 1;
         }
     }
+    // Read envp[] similarly.
+    if envp_ptr != 0 {
+        let mut i = 0usize;
+        loop {
+            if i >= MAX_EXEC_ARGS { break; }
+            let ptr_addr = envp_ptr + i * core::mem::size_of::<usize>();
+            if !validate_user_buf(ptr_addr, core::mem::size_of::<usize>()) { break; }
 
+            let mut str_ptr: usize = 0;
+            let ok = with_current_address_space(|as_| {
+                as_.read_user_buf(ptr_addr, unsafe {
+                    core::slice::from_raw_parts_mut(&mut str_ptr as *mut usize as *mut u8, core::mem::size_of::<usize>())
+                })
+            }).unwrap_or(false);
+            if !ok || str_ptr == 0 { break; }
+
+            envp.push_cstr(str_ptr);
+            i += 1;
+        }
+    }
     let argc = argv.count;
     let envc = envp.count;
 
     // ── Load ELF into fresh address space ─────────────────────────────────────
     let pt_root = unsafe { arch_alloc_page_table_root() };
     if pt_root == 0 { return -12; }
-    let mut new_as = mm::vmm::AddressSpace::new(pt_root);
+    let mut new_as = alloc::boxed::Box::new(mm::vmm::AddressSpace::new(pt_root));
 
     let elf_bytes = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_len) };
     let entry = match elf::load(elf_bytes, &mut new_as) {
@@ -1950,7 +1943,7 @@ fn sys_execve(path_or_elf: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     print_hex(user_sp);
     serial_print("\n");
 
-    replace_address_space(new_as, pt_root, heap_start, entry, user_sp);
+    replace_address_space(*new_as, pt_root, heap_start, entry, user_sp);
 }
 
 // ── I/O syscalls ──────────────────────────────────────────────────────────────
@@ -2322,11 +2315,29 @@ fn sys_prlimit64(
 
 // ── VFS syscall implementations ───────────────────────────────────────────────
 
-fn sys_openat(_dirfd: usize, path_ptr: usize, flags: usize, _mode: usize) -> isize {
-    if !validate_user_buf(path_ptr, 1) { return -14; }
+fn sys_open(path_ptr: usize, flags: usize, mode: usize) -> isize {
+    let (path_raw, path_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(path_ptr as *const u8, 256) }) {
+        Some(p) => p,
+        None => return -14, // EFAULT
+    };
+
+    let mut abs = [0u8; 256];
+    let abs_len = resolve_path(&path_raw[..path_len], &mut abs);
+    if abs_len == 0 { return -2; }
+
+    // Ensure NUL termination for VFS string readers
+    let mut vfs_path = [0u8; 257];
+    vfs_path[..abs_len].copy_from_slice(&abs[..abs_len]);
+    vfs_path[abs_len] = 0;
+
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, flags as u64, 0]);
+    let msg = make_vfs_msg(vfs::VFS_OPEN, &[vfs_path.as_ptr() as u64, flags as u64, mode as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+fn sys_openat(_dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
+    // dirfd is ignored for now; treat as AT_FDCWD
+    sys_open(path_ptr, flags, mode)
 }
 
 fn sys_close(fd: usize) -> isize {
@@ -2467,28 +2478,22 @@ fn sys_unlinkat(_dirfd: usize, path_ptr: usize, _flags: usize) -> isize {
 
 fn sys_chdir(path_ptr: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
-    // Read the path string.
-    let mut buf = [0u8; 256];
-    let mut len = 0usize;
-    for i in 0..255 {
-        let b = unsafe { *(path_ptr as *const u8).add(i) };
-        if b == 0 { len = i; break; }
-        buf[i] = b;
-    }
-    if len == 0 && buf[0] == 0 { return -2; } // ENOENT — empty path
-
-    // Resolve to absolute path (prepend cwd if relative).
+    
+    // Read the path string to resolve it.
+    let (path_raw, path_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(path_ptr as *const u8, 256) }) {
+        Some(p) => p,
+        None => return -14,
+    };
     let mut abs = [0u8; 256];
-    let abs_len = resolve_path(&buf[..len], &mut abs);
-    let abs_path = &abs[..abs_len];
+    let abs_len = resolve_path(&path_raw[..path_len], &mut abs);
+    if abs_len == 0 { return -2; }
 
-    // Check the path exists (directory or file).
-    // Accept if it's a known directory or file.
-    let known = vfs::is_directory(abs.as_ptr() as usize)
-                || vfs::get_file_data(abs.as_ptr() as usize).is_some();
-    if !known { return -2; } // ENOENT
+    // Check if path exists by attempting to open it O_RDONLY.
+    let fd = sys_open(path_ptr, 0, 0);
+    if fd < 0 { return fd; }
+    sys_close(fd as usize);
 
-    sched::set_cwd(abs_path);
+    sched::set_cwd(&abs[..abs_len]);
     0
 }
 
@@ -2499,9 +2504,19 @@ fn sys_fchdir(_fd: usize) -> isize {
 
 fn sys_getcwd(buf_ptr: usize, size: usize) -> isize {
     if !validate_user_buf(buf_ptr, size.min(1)) { return -14; }
-    let n = sched::current_cwd(buf_ptr as *mut u8, size);
-    if n < 0 { return -1; }
-    n + 1  // return ptr value (Linux getcwd returns ptr, but musl checks > 0)
+    let mut tmp = [0u8; 256];
+    let res = sched::current_cwd(tmp.as_mut_ptr(), 256);
+    if res <= 0 { return -34; } // ERANGE or error
+    let len = res as usize;
+
+    // len is the number of bytes in CWD. If len >= size, it won't fit (+ NUL).
+    if len >= size { return -34; } // ERANGE
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf_ptr as *mut u8, len);
+        *(buf_ptr as *mut u8).add(len) = 0; // NUL terminate
+    }
+    buf_ptr as isize
 }
 
 fn sys_setpgid(pid_raw: usize, pgid_raw: usize) -> isize {
@@ -2601,26 +2616,78 @@ fn sys_statfs(path_or_fd: usize, buf_ptr: usize) -> isize {
 /// `out`  — output buffer (256 bytes), written without null terminator.
 /// Returns the length of the resolved path written to `out`.
 fn resolve_path(path: &[u8], out: &mut [u8; 256]) -> usize {
-    if path.is_empty() { out[0] = b'/'; return 1; }
-    if path[0] == b'/' {
-        // Absolute: copy as-is (simplified, no ".." normalization for now).
-        let len = path.len().min(255);
-        out[..len].copy_from_slice(&path[..len]);
-        // Remove trailing slash unless root.
-        let end = if len > 1 && out[len - 1] == b'/' { len - 1 } else { len };
-        return end;
+    // path may contain a NUL terminator if it came from read_cstr_for_vfs's raw slice;
+    // ensure we only process up to the first NUL.
+    let path_to_process = if let Some(nul_pos) = path.iter().position(|&b| b == 0) {
+        &path[..nul_pos]
+    } else {
+        path
+    };
+
+    let mut resolved = [0u8; 256];
+    let mut res_len;
+
+    // 1. Initialise base path (absolute vs relative).
+    if !path_to_process.is_empty() && path_to_process[0] == b'/' {
+        resolved[0] = b'/';
+        res_len = 1;
+    } else {
+        // Use a local buffer to get CWD
+        let mut cwd_buf = [0u8; 256];
+        let cwd_len = sched::current_cwd(cwd_buf.as_mut_ptr(), 256);
+        if cwd_len > 0 {
+            let n = (cwd_len as usize).min(255);
+            resolved[..n].copy_from_slice(&cwd_buf[..n]);
+            res_len = n;
+        } else {
+            // Default to root if task has no CWD
+            resolved[0] = b'/';
+            res_len = 1;
+        }
     }
-    // Relative: prepend cwd.
-    let mut cwd = [0u8; 256];
-    let cwd_len = sched::current_cwd(cwd.as_mut_ptr(), 256) as usize;
-    let cwd_len = cwd_len.min(255);
-    let sep = if cwd_len > 1 { 1 } else { 0 }; // add "/" unless cwd is "/"
-    let total = (cwd_len + sep + path.len()).min(255);
-    out[..cwd_len].copy_from_slice(&cwd[..cwd_len]);
-    if sep == 1 { out[cwd_len] = b'/'; }
-    let src_len = path.len().min(total - cwd_len - sep);
-    out[cwd_len + sep..cwd_len + sep + src_len].copy_from_slice(&path[..src_len]);
-    cwd_len + sep + src_len
+
+    // 2. Iterate components.
+    for component in path_to_process.split(|&b| b == b'/') {
+        if component.is_empty() || component == b"." {
+            continue;
+        } else if component == b".." {
+            if res_len > 1 {
+                let mut last = res_len - 1;
+                while last > 0 && resolved[last] != b'/' {
+                    last -= 1;
+                }
+                res_len = if last == 0 { 1 } else { last };
+            }
+        } else {
+            // Append with separator if not at root.
+            if res_len > 1 && resolved[res_len - 1] != b'/' {
+                if res_len < 255 {
+                    resolved[res_len] = b'/';
+                    res_len += 1;
+                }
+            } else if res_len == 0 {
+                resolved[0] = b'/';
+                res_len = 1;
+            }
+
+            let copy = component.len().min(256 - res_len);
+            resolved[res_len..res_len + copy].copy_from_slice(&component[..copy]);
+            res_len += copy;
+        }
+    }
+
+    // 3. Finalise: default to root if empty, and strip trailing slash unless root.
+    if res_len == 0 {
+        resolved[0] = b'/';
+        res_len = 1;
+    }
+    if res_len > 1 && resolved[res_len - 1] == b'/' {
+        res_len -= 1;
+    }
+
+    let final_len = res_len.min(256);
+    out[..final_len].copy_from_slice(&resolved[..final_len]);
+    final_len
 }
 
 /// Read a cstr from user-space into a fixed buffer for VFS path lookup.
@@ -2628,8 +2695,11 @@ fn resolve_path(path: &[u8], out: &mut [u8; 256]) -> usize {
 fn read_cstr_for_vfs(path: &[u8]) -> Option<([u8; 256], usize)> {
     if path.is_empty() { return None; }
     let mut buf = [0u8; 256];
-    let len = path.len().min(255);
-    buf[..len].copy_from_slice(&path[..len]);
+    let mut len = 0;
+    while len < 255 && len < path.len() && path[len] != 0 {
+        buf[len] = path[len];
+        len += 1;
+    }
     Some((buf, len))
 }
 

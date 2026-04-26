@@ -244,6 +244,16 @@ impl ProcFdTable {
 static FD_TABLES: Mutex<[ProcFdTable; MAX_PROCS]> =
     Mutex::new([const { ProcFdTable::empty() }; MAX_PROCS]);
 
+static INITRD_BASE: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+static INITRD_SIZE: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+
+pub fn set_initrd(base: usize, size: usize) {
+    INITRD_BASE.store(base, atomic::Ordering::SeqCst);
+    INITRD_SIZE.store(size, atomic::Ordering::SeqCst);
+}
+
+use core::sync::atomic;
+
 // ── Static RamFS ──────────────────────────────────────────────────────────────
 
 struct RamEntry { path: &'static [u8], data: &'static [u8] }
@@ -347,6 +357,17 @@ pub fn get_file_data(path_ptr: usize) -> Option<(*const u8, usize)> {
     let (pbuf, plen) = read_cstr_raw(path_ptr)?;
     for entry in RAMFS {
         if path_eq(&pbuf, plen, entry.path) {
+            return Some((entry.data.as_ptr(), entry.data.len()));
+        }
+    }
+    None
+}
+
+/// Look up a path string in RamFS and return a pointer + length to its data.
+pub fn get_file_data_by_path(path: &str) -> Option<(*const u8, usize)> {
+    let bytes = path.as_bytes();
+    for entry in RAMFS {
+        if entry.path == bytes {
             return Some((entry.data.as_ptr(), entry.data.len()));
         }
     }
@@ -627,19 +648,26 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
         Some(r) => r,
         None    => return err_reply(-14),
     };
-    let path = &pbuf[..plen];
+    let mut path = &pbuf[..plen];
 
-    let kind = if path_eq(&pbuf, plen, b"/dev/null") {
+    // Basic normalization: . to /, strip trailing slash
+    if path == b"." {
+        path = b"/";
+    } else if path.len() > 1 && path.ends_with(b"/") {
+        path = &path[..path.len()-1];
+    }
+
+    let kind = if path == b"/dev/null" {
         VnodeKind::DevNull
-    } else if path_eq(&pbuf, plen, b"/dev/zero") {
+    } else if path == b"/dev/zero" {
         VnodeKind::DevZero
-    } else if path_eq(&pbuf, plen, b"/dev/urandom") || path_eq(&pbuf, plen, b"/dev/random") {
+    } else if path == b"/dev/urandom" || path == b"/dev/random" {
         VnodeKind::DevUrandom
-    } else if path_eq(&pbuf, plen, b"/dev/stdin") {
+    } else if path == b"/dev/stdin" {
         VnodeKind::DevStdio { target_fd: 0 }
-    } else if path_eq(&pbuf, plen, b"/dev/stdout") {
+    } else if path == b"/dev/stdout" {
         VnodeKind::DevStdio { target_fd: 1 }
-    } else if path_eq(&pbuf, plen, b"/dev/stderr") {
+    } else if path == b"/dev/stderr" {
         VnodeKind::DevStdio { target_fd: 2 }
     } else if is_tmp_path(path) && path != b"/tmp" {
         // ── Writable /tmp file ────────────────────────────────────────────────
@@ -650,7 +678,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
         let mut tmp = TMP_FILES.lock();
         // Look for an existing entry.
         let existing = tmp.iter().position(|e| {
-            e.in_use && !e.is_dir && e.path_len == plen && &e.path[..plen] == path
+            e.in_use && !e.is_dir && e.path_len == path.len() && &e.path[..path.len()] == path
         });
         match existing {
             Some(idx) => {
@@ -667,7 +695,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
                         tmp[idx] = TmpFileEntry::empty();
                         tmp[idx].in_use   = true;
                         tmp[idx].is_dir   = false;
-                        let copy_len = plen.min(MAX_TMP_PATH - 1);
+                        let copy_len = path.len().min(MAX_TMP_PATH - 1);
                         tmp[idx].path[..copy_len].copy_from_slice(&path[..copy_len]);
                         tmp[idx].path_len = copy_len;
                         VnodeKind::TmpFile { idx, pos: 0, writable }
@@ -677,7 +705,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
             }
             None => return err_reply(-2), // ENOENT
         }
-    } else if path.starts_with(b"/proc/self/") && !path_eq(&pbuf, plen, b"/proc/self") {
+    } else if path.starts_with(b"/proc/self/") && path != b"/proc/self/" {
         // ── Dynamic /proc/self/ entries — generated at open time ─────────────────
         let kind = gen_proc_self(pid, path);
         match kind {
@@ -696,7 +724,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
         // Check RamFS files first.
         let mut found = None;
         for entry in RAMFS {
-            if path_eq(&pbuf, plen, entry.path) {
+            if path == entry.path {
                 found = Some(VnodeKind::RamFile { data: entry.data, pos: 0 });
                 break;
             }
@@ -704,7 +732,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
         if found.is_none() {
             // Check known directories and /tmp subdirs (opened for getdents64).
             for &dir in RAMFS_DIRS {
-                if path_eq(&pbuf, plen, dir) {
+                if path == dir {
                     found = Some(VnodeKind::RamFile { data: dir, pos: 0 });
                     break;
                 }
@@ -718,7 +746,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
         if found.is_none() {
             let tmp = TMP_FILES.lock();
             if let Some(_idx) = tmp.iter().position(|e| {
-                e.in_use && e.is_dir && e.path_len == plen && &e.path[..plen] == path
+                e.in_use && e.is_dir && e.path_len == path.len() && &e.path[..path.len()] == path
             }) {
                 drop(tmp);
                 found = Some(VnodeKind::DevNull); // placeholder for empty dir fd
@@ -1099,10 +1127,6 @@ fn handle_alloc_fd(pid: u32, oldfd: usize) -> Message {
 }
 
 /// getdents64 — fill `buf` with `struct linux_dirent64` entries for `fd`.
-///
-/// For now, fd must be opened on a known directory path; we read the directory
-/// from the static RAMFS layout.  Each call fills as many entries as fit and
-/// advances the fd position (stored in the fd's pos field via RamFile trick).
 fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
     if count < 64 { return err_reply(-22); }
 
@@ -1110,27 +1134,15 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
 
-    // We overload RamFile to store the directory path + position.
-    // For DevNull/DevZero/Pipe, return ENOTDIR.
     let (dir_path, start_pos) = match &tbl.fds[fd].kind {
         VnodeKind::RamFile { data, pos } => (*data, *pos),
         _ => return err_reply(-20), // ENOTDIR
     };
-
-    // Collect entries: first "." and "..", then children.
-    // An FD opened on a directory has data = the directory path as a static slice.
-    // We identify the directory by its path and scan RAMFS for children.
     let dir_len = dir_path.len();
-
-    // Build dirent64 entries in the user buffer.
-    // struct linux_dirent64 { ino(8), off(8), reclen(2), type(1), name[...] }
-    // minimum reclen = 8+8+2+1+1 (name=NUL) = 20, padded to 8 bytes.
     let buf = buf_ptr as *mut u8;
-    let mut off = 0usize; // offset within buf
-    let mut pos = start_pos; // index into our virtual entry list
+    let mut off = 0usize;
+    let mut pos = start_pos;
 
-    // Virtual entry list: 0=".", 1="..", 2..=N=children
-    // Children = RAMFS dirs + RAMFS files whose parent == dir_path
     let write_dirent = |buf: *mut u8, off: usize, count: usize,
                         ino: u64, name: &[u8], d_type: u8| -> Option<usize> {
         let name_len = name.len();
@@ -1139,298 +1151,180 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         if off + reclen > count { return None; }
         unsafe {
             let p = buf.add(off);
-            core::ptr::write(p           as *mut u64, ino);     // d_ino
-            core::ptr::write(p.add(8)    as *mut u64, 0u64);    // d_off
-            core::ptr::write(p.add(16)   as *mut u16, reclen as u16); // d_reclen
-            *p.add(18) = d_type;                                 // d_type
+            core::ptr::write(p           as *mut u64, ino);
+            core::ptr::write(p.add(8)    as *mut u64, 0u64);
+            core::ptr::write(p.add(16)   as *mut u16, reclen as u16);
+            *p.add(18) = d_type;
             core::ptr::copy_nonoverlapping(name.as_ptr(), p.add(19), name_len);
-            *p.add(19 + name_len) = 0;                          // NUL
+            *p.add(19 + name_len) = 0;
         }
         Some(reclen)
     };
 
-    // Entry 0: "."
     if pos == 0 {
-        match write_dirent(buf, off, count, 1, b".", 4 /*DT_DIR*/) {
-            Some(r) => { off += r; pos += 1; }
-            None    => { tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos }; return val_reply(0); }
-        }
+        if let Some(r) = write_dirent(buf, off, count, 1, b".", 4) { off += r; pos += 1; }
+        else { return val_reply(0); }
     }
-    // Entry 1: ".."
     if pos == 1 {
-        match write_dirent(buf, off, count, 1, b"..", 4) {
-            Some(r) => { off += r; pos += 1; }
-            None    => { tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos }; return val_reply(off as u64); }
-        }
+        if let Some(r) = write_dirent(buf, off, count, 1, b"..", 4) { off += r; pos += 1; }
+        else { tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos }; return val_reply(off as u64); }
     }
 
-    // Entries 2..: directories that are direct children of dir_path.
-    let mut child_idx = 2usize;
+    let mut virtual_idx = 2usize;
+
+    // RAMFS directories
     for &child_dir in RAMFS_DIRS {
-        if child_dir == dir_path { continue; } // skip self
-        // Check that child_dir is a direct child: starts with dir_path + "/" and has no more "/"
+        if child_dir == dir_path { continue; }
         let is_root = dir_path == b"/";
         let is_child = if is_root {
             child_dir.len() > 1 && child_dir[0] == b'/' && !child_dir[1..].contains(&b'/')
         } else {
-            child_dir.len() > dir_len + 1
-            && child_dir[..dir_len] == *dir_path
-            && child_dir[dir_len] == b'/'
-            && !child_dir[dir_len+1..].contains(&b'/')
+            child_dir.len() > dir_len + 1 && child_dir.starts_with(dir_path) && child_dir[dir_len] == b'/' && !child_dir[dir_len+1..].contains(&b'/')
         };
-        if !is_child { continue; }
-        if child_idx < pos { child_idx += 1; continue; }
-        let name_start = if is_root { 1 } else { dir_len + 1 };
-        let name = &child_dir[name_start..];
-        let ino = child_idx as u64 + 100;
-        match write_dirent(buf, off, count, ino, name, 4) {
-            Some(r) => { off += r; pos += 1; child_idx += 1; }
-            None    => { tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos }; return val_reply(off as u64); }
+        if is_child {
+            if virtual_idx >= pos {
+                let name = if is_root { &child_dir[1..] } else { &child_dir[dir_len+1..] };
+                if let Some(r) = write_dirent(buf, off, count, virtual_idx as u64 + 100, name, 4) {
+                    off += r; pos += 1;
+                } else {
+                    tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
+                    return val_reply(off as u64);
+                }
+            }
+            virtual_idx += 1;
         }
-        child_idx += 1;
     }
 
-    // Entries: RAMFS files that are direct children of dir_path.
-    let mut file_idx = RAMFS_DIRS.len() + 2;
+    // RAMFS files
     for entry in RAMFS {
         let is_root = dir_path == b"/";
         let is_child = if is_root {
-            entry.path.len() > 1 && entry.path[0] == b'/'
-            && !entry.path[1..].contains(&b'/')
+            entry.path.len() > 1 && entry.path[0] == b'/' && !entry.path[1..].contains(&b'/')
         } else {
-            entry.path.len() > dir_len + 1
-            && entry.path[..dir_len] == *dir_path
-            && entry.path[dir_len] == b'/'
-            && !entry.path[dir_len+1..].contains(&b'/')
+            entry.path.len() > dir_len + 1 && entry.path.starts_with(dir_path) && entry.path[dir_len] == b'/' && !entry.path[dir_len+1..].contains(&b'/')
         };
-        if !is_child { continue; }
-        if file_idx < pos { file_idx += 1; continue; }
-        let name_start = if is_root { 1 } else { dir_len + 1 };
-        let name = &entry.path[name_start..];
-        let ino = file_idx as u64 + 200;
-        match write_dirent(buf, off, count, ino, name, 8 /*DT_REG*/) {
-            Some(r) => { off += r; pos += 1; file_idx += 1; }
-            None    => { tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos }; return val_reply(off as u64); }
+        if is_child {
+            if virtual_idx >= pos {
+                let name = if is_root { &entry.path[1..] } else { &entry.path[dir_len+1..] };
+                if let Some(r) = write_dirent(buf, off, count, virtual_idx as u64 + 200, name, 8) {
+                    off += r; pos += 1;
+                } else {
+                    tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
+                    return val_reply(off as u64);
+                }
+            }
+            virtual_idx += 1;
         }
-        file_idx += 1;
     }
 
-    // Entries: tmpfs files and dirs that are direct children of dir_path.
-    // We read TMP_FILES without holding tbls lock (drop tbls first).
-    drop(tbls);
-    let tmp_snapshot: [(bool, bool, [u8; MAX_TMP_PATH], usize); MAX_TMP_FILES] = {
-        let tmp = TMP_FILES.lock();
-        core::array::from_fn(|i| (tmp[i].in_use, tmp[i].is_dir, tmp[i].path, tmp[i].path_len))
-    };
-    let mut tmp_idx = RAMFS_DIRS.len() + RAMFS.len() + 2;
-    for (in_use, is_dir, tpath, tplen) in &tmp_snapshot {
-        if !in_use { tmp_idx += 1; continue; }
-        let ep = &tpath[..*tplen];
-        let is_root = dir_path == b"/";
-        let is_child = if is_root {
-            ep.len() > 1 && ep[0] == b'/' && !ep[1..].contains(&b'/')
-        } else {
-            ep.len() > dir_len + 1
-            && ep[..dir_len] == *dir_path
-            && ep[dir_len] == b'/'
-            && !ep[dir_len+1..].contains(&b'/')
-        };
-        if !is_child { tmp_idx += 1; continue; }
-        if tmp_idx < pos { tmp_idx += 1; continue; }
-        let name_start = if is_root { 1 } else { dir_len + 1 };
-        let name = &ep[name_start..];
-        let dt = if *is_dir { 4u8 } else { 8u8 };
-        let ino = tmp_idx as u64 + 300;
-        match write_dirent(buf, off, count, ino, name, dt) {
-            Some(r) => { off += r; pos += 1; }
-            None    => {
-                // Out of buffer space — save position and return what we have.
-                let mut tbls3 = FD_TABLES.lock();
-                if let Some(t3) = find_tbl(pid, &mut *tbls3) {
-                    if fd < MAX_FDS { t3.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos }; }
+    // Initrd files (Deduplicated)
+    let initrd_base = INITRD_BASE.load(atomic::Ordering::SeqCst);
+    let initrd_size = INITRD_SIZE.load(atomic::Ordering::SeqCst);
+    if initrd_base != 0 && initrd_size != 0 {
+        let initrd_ptr = mm::phys_to_virt(initrd_base) as *const u8;
+        let data = unsafe { core::slice::from_raw_parts(initrd_ptr, initrd_size) };
+        if data.len() > 6 && &data[0..6] == b"070701" {
+            let mut offset = 0;
+            loop {
+                if offset + 110 > data.len() { break; }
+                let header = &data[offset..offset+110];
+                if &header[0..6] != b"070701" { break; }
+                let namesize = parse_cpio_hex(&header[94..102]);
+                let filesize = parse_cpio_hex(&header[54..62]);
+                let mode = parse_cpio_hex(&header[14..22]);
+                let name_offset = offset + 110;
+                if name_offset + namesize > data.len() { break; }
+                let name_bytes = &data[name_offset..name_offset + namesize - 1];
+                if name_bytes == b"TRAILER!!!" { break; }
+
+                // match_name is the CPIO path without ./ prefix
+                let mut match_name = if name_bytes.starts_with(b"./") { &name_bytes[2..] } else { name_bytes };
+                if match_name.starts_with(b"/") { match_name = &match_name[1..]; }
+
+                let is_root = dir_path == b"/";
+                // match_dir is dir_path without leading /
+                let mut match_dir = if dir_path.starts_with(b"/") { &dir_path[1..] } else { dir_path };
+                if match_dir.ends_with(b"/") { match_dir = &match_dir[..match_dir.len()-1]; }
+
+                let is_match = if is_root {
+                    !match_name.is_empty() && !match_name.contains(&b'/') && match_name != b"."
+                } else if !match_dir.is_empty() && match_name.starts_with(match_dir) && match_name.len() > match_dir.len() && match_name[match_dir.len()] == b'/' {
+                    let r = &match_name[match_dir.len()+1..];
+                    !r.is_empty() && !r.contains(&b'/')
+                } else {
+                    false
+                };
+
+                if is_match && !is_duplicated(name_bytes) {
+                    if virtual_idx >= pos {
+                        let d_type = if (mode & 0o170000) == 0o040000 { 4 } else { 8 };
+                        let child_name = if is_root { match_name } else { &match_name[match_dir.len()+1..] };
+                        if let Some(r) = write_dirent(buf, off, count, 1000 + offset as u64, child_name, d_type) {
+                            off += r; pos += 1;
+                        } else {
+                            tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
+                            return val_reply(off as u64);
+                        }
+                    }
+                    virtual_idx += 1;
                 }
-                return val_reply(off as u64);
+                let file_offset = (name_offset + namesize + 3) & !3;
+                let next_offset = (file_offset + filesize + 3) & !3;
+                if next_offset <= offset { break; }
+                offset = next_offset;
             }
         }
-        tmp_idx += 1;
     }
 
-    // All entries exhausted — save position.
-    let mut tbls4 = FD_TABLES.lock();
-    if let Some(t4) = find_tbl(pid, &mut *tbls4) {
-        if fd < MAX_FDS { t4.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos }; }
-    }
+    tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
     val_reply(off as u64)
 }
 
-// ── Tmpfs management ─────────────────────────────────────────────────────────
-
-fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
-    match tbl.fds[fd].kind {
-        VnodeKind::TmpFile { idx, .. } => {
-            drop(tbls);
-            let mut tmp = TMP_FILES.lock();
-            let entry = &mut tmp[idx];
-            if new_len > MAX_TMP_SIZE { return err_reply(-28); } // ENOSPC
-            if new_len > entry.len {
-                // Extend with zeros.
-                for b in &mut entry.data[entry.len..new_len] { *b = 0; }
-            }
-            entry.len = new_len;
-            ok_reply()
-        }
-        _ => err_reply(-22), // EINVAL — not a regular file or not seekable
-    }
-}
-
-fn handle_rename(old_ptr: usize, new_ptr: usize) -> Message {
-    let (obuf, olen) = match read_cstr_raw(old_ptr) { Some(r) => r, None => return err_reply(-14) };
-    let (nbuf, nlen) = match read_cstr_raw(new_ptr) { Some(r) => r, None => return err_reply(-14) };
-    let old = &obuf[..olen];
-    let new = &nbuf[..nlen];
-    if !is_tmp_path(old) || !is_tmp_path(new) { return err_reply(-30); } // EROFS
-    let mut tmp = TMP_FILES.lock();
-    match tmp.iter().position(|e| e.in_use && !e.is_dir && e.path_len == olen && &e.path[..olen] == old) {
-        Some(idx) => {
-            let copy_len = nlen.min(MAX_TMP_PATH - 1);
-            tmp[idx].path[..copy_len].copy_from_slice(&new[..copy_len]);
-            tmp[idx].path_len = copy_len;
-            ok_reply()
-        }
-        None => err_reply(-2), // ENOENT
-    }
-}
-
-fn handle_unlink(path_ptr: usize) -> Message {
-    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
-    let path = &pbuf[..plen];
-    if !is_tmp_path(path) { return err_reply(-30); } // EROFS — can only unlink /tmp files
-    let mut tmp = TMP_FILES.lock();
-    match tmp.iter().position(|e| e.in_use && !e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
-        Some(idx) => { tmp[idx] = TmpFileEntry::empty(); ok_reply() }
-        None      => err_reply(-2), // ENOENT
-    }
-}
-
-fn handle_mkdir(path_ptr: usize) -> Message {
-    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
-    let path = &pbuf[..plen];
-    if !is_tmp_path(path) { return err_reply(-30); } // EROFS
-    // Check if already exists as a static dir.
-    for &dir in RAMFS_DIRS { if path == dir { return err_reply(-17); } } // EEXIST
-    let mut tmp = TMP_FILES.lock();
-    // Already exists in tmpfs?
-    if tmp.iter().any(|e| e.in_use && e.path_len == plen && &e.path[..plen] == path) {
-        return err_reply(-17); // EEXIST
-    }
-    match tmp.iter().position(|e| !e.in_use) {
-        Some(idx) => {
-            tmp[idx] = TmpFileEntry::empty();
-            tmp[idx].in_use  = true;
-            tmp[idx].is_dir  = true;
-            let copy_len = plen.min(MAX_TMP_PATH - 1);
-            tmp[idx].path[..copy_len].copy_from_slice(&path[..copy_len]);
-            tmp[idx].path_len = copy_len;
-            ok_reply()
-        }
-        None => err_reply(-28), // ENOSPC
-    }
-}
-
-// Tag values for what kind of fd we're looking at.
-enum FdInfo { Static(&'static [u8]), Pipe(usize), RamData(*const u8), TmpIdx(usize), Bad }
-
-fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Message {
-    if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
-
-    // Extract the fd info under the lock, then release before any writes.
-    let info = {
-        let tbls = FD_TABLES.lock();
-        let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
-            Some(t) => t, None => return err_reply(-9),
+fn parse_cpio_hex(s: &[u8]) -> usize {
+    let mut val = 0usize;
+    for &b in s {
+        let digit = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return 0,
         };
-        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
-        match &tbl.fds[fd].kind {
-            VnodeKind::DevNull              => FdInfo::Static(b"/dev/null"),
-            VnodeKind::DevZero              => FdInfo::Static(b"/dev/zero"),
-            VnodeKind::Pipe { ring, .. }    => FdInfo::Pipe(*ring),
-            VnodeKind::RamFile { data, .. } => FdInfo::RamData(data.as_ptr()),
-            VnodeKind::TmpFile { idx, .. }  => FdInfo::TmpIdx(*idx),
-            VnodeKind::EventFd { .. }              => FdInfo::Static(b"eventfd"),
-            VnodeKind::TimerFd { .. }              => FdInfo::Static(b"timerfd"),
-            VnodeKind::DevUrandom                  => FdInfo::Static(b"/dev/urandom"),
-            VnodeKind::DevStdio { target_fd: 0 }   => FdInfo::Static(b"/dev/stdin"),
-            VnodeKind::DevStdio { target_fd: 1 }   => FdInfo::Static(b"/dev/stdout"),
-            VnodeKind::DevStdio { .. }             => FdInfo::Static(b"/dev/stderr"),
-            VnodeKind::None                        => FdInfo::Bad,
-        }
-    };
-
-    match info {
-        FdInfo::Bad => err_reply(-9),
-
-        FdInfo::Static(path) => {
-            let copy = path.len().min(buf_len);
-            unsafe { core::ptr::copy_nonoverlapping(path.as_ptr(), buf_ptr as *mut u8, copy); }
-            val_reply(copy as u64)
-        }
-
-        FdInfo::Pipe(ring) => {
-            let mut tmp_buf = [0u8; 32];
-            let prefix = b"pipe:[";
-            tmp_buf[..prefix.len()].copy_from_slice(prefix);
-            let mut n = prefix.len();
-            let mut r = ring;
-            if r == 0 { tmp_buf[n] = b'0'; n += 1; }
-            else {
-                let mut digits = [0u8; 10];
-                let mut di = 0;
-                while r > 0 { digits[di] = b'0' + (r % 10) as u8; di += 1; r /= 10; }
-                for i in (0..di).rev() { tmp_buf[n] = digits[i]; n += 1; }
-            }
-            tmp_buf[n] = b']'; n += 1;
-            let copy = n.min(buf_len);
-            unsafe { core::ptr::copy_nonoverlapping(tmp_buf.as_ptr(), buf_ptr as *mut u8, copy); }
-            val_reply(copy as u64)
-        }
-
-        FdInfo::RamData(data_ptr) => {
-            match RAMFS.iter().find(|e| e.data.as_ptr() == data_ptr) {
-                Some(entry) => {
-                    let copy = entry.path.len().min(buf_len);
-                    unsafe { core::ptr::copy_nonoverlapping(entry.path.as_ptr(), buf_ptr as *mut u8, copy); }
-                    val_reply(copy as u64)
-                }
-                None => err_reply(-2),
-            }
-        }
-
-        FdInfo::TmpIdx(idx) => {
-            let tmp = TMP_FILES.lock();
-            if idx < tmp.len() && tmp[idx].in_use {
-                let plen = tmp[idx].path_len.min(buf_len);
-                unsafe { core::ptr::copy_nonoverlapping(tmp[idx].path.as_ptr(), buf_ptr as *mut u8, plen); }
-                val_reply(plen as u64)
-            } else {
-                err_reply(-9)
-            }
-        }
+        val = (val << 4) | (digit as usize);
     }
+    val
 }
 
-// ── Table lookup helpers ──────────────────────────────────────────────────────
+fn is_duplicated(path: &[u8]) -> bool {
+    let mut abs_path = [0u8; 256];
+    let mut len = 0;
+    
+    let mut src = if path.starts_with(b"./") { &path[2..] } else { path };
+    if src.starts_with(b"/") { src = &src[1..]; }
+
+    // Convert to absolute for comparison with RAMFS
+    abs_path[0] = b'/';
+    len = 1;
+    let copy_len = src.len().min(254);
+    abs_path[len..len + copy_len].copy_from_slice(&src[..copy_len]);
+    len += copy_len;
+    
+    let p = &abs_path[..len];
+
+    for entry in RAMFS {
+        if entry.path == p { return true; }
+    }
+    for &dir in RAMFS_DIRS {
+        if dir == p { return true; }
+    }
+    false
+}
 
 fn find_tbl<'a>(pid: u32, tbls: &'a mut [ProcFdTable]) -> Option<&'a mut ProcFdTable> {
     tbls.iter_mut().find(|t| t.in_use && t.pid == pid)
 }
 
 fn get_or_create<'a>(pid: u32, tbls: &'a mut [ProcFdTable]) -> Option<&'a mut ProcFdTable> {
-    if let Some(pos) = tbls.iter().position(|t| t.in_use && t.pid == pid) {
-        return Some(&mut tbls[pos]);
-    }
+    if let Some(pos) = tbls.iter().position(|t| t.in_use && t.pid == pid) { return Some(&mut tbls[pos]); }
     if let Some(pos) = tbls.iter().position(|t| !t.in_use) {
         tbls[pos] = ProcFdTable::empty();
         tbls[pos].in_use = true;
@@ -1439,8 +1333,6 @@ fn get_or_create<'a>(pid: u32, tbls: &'a mut [ProcFdTable]) -> Option<&'a mut Pr
     }
     None
 }
-
-// ── C-string reader ───────────────────────────────────────────────────────────
 
 fn read_cstr_raw(ptr: usize) -> Option<([u8; 256], usize)> {
     if ptr == 0 { return None; }
@@ -1457,153 +1349,222 @@ fn path_eq(buf: &[u8; 256], len: usize, path: &[u8]) -> bool {
     len == path.len() && buf[..len] == *path
 }
 
-// ── eventfd ───────────────────────────────────────────────────────────────────
+static SERVER_PORT_ID: atomic::AtomicU32 = atomic::AtomicU32::new(u32::MAX);
 
 fn handle_eventfd(pid: u32, initval: u64) -> Message {
     let mut counters = EVENTFD_COUNTERS.lock();
     let slot = match counters.iter().position(|&v| v == u64::MAX) {
-        Some(s) => s,
-        None => return err_reply(-24), // EMFILE
+        Some(s) => s, None => return err_reply(-24),
     };
     counters[slot] = if initval == u64::MAX { u64::MAX - 1 } else { initval };
     drop(counters);
-
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) {
-        Some(t) => t,
-        None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; return err_reply(-24); }
+        Some(t) => t, None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; return err_reply(-24); }
     };
     let fd = match tbl.fds.iter().position(|e| !e.in_use) {
-        Some(f) => f,
-        None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; return err_reply(-24); }
+        Some(f) => f, None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; return err_reply(-24); }
     };
     tbl.fds[fd] = FdEntry { kind: VnodeKind::EventFd { slot }, flags: 0, in_use: true };
     val_reply(fd as u64)
 }
 
-// ── timerfd handlers ──────────────────────────────────────────────────────────
-
 fn handle_timerfd_create(pid: u32) -> Message {
     let mut pool = TIMERFD_POOL.lock();
     let slot = match pool.iter().position(|e| e.is_free()) {
-        Some(s) => s,
-        None => return err_reply(-24), // EMFILE
+        Some(s) => s, None => return err_reply(-24),
     };
-    pool[slot] = TimerFdEntry::free(); // mark in-use by clearing free marker below
-    // Use deadline_ticks=1 as "allocated but unarmed" sentinel (not 0 which means free).
+    pool[slot] = TimerFdEntry::free();
     pool[slot].deadline_ticks = 1;
     drop(pool);
-
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) {
-        Some(t) => t,
-        None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); return err_reply(-24); }
+        Some(t) => t, None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); return err_reply(-24); }
     };
     let fd = match tbl.fds.iter().position(|e| !e.in_use) {
-        Some(f) => f,
-        None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); return err_reply(-24); }
+        Some(f) => f, None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); return err_reply(-24); }
     };
     tbl.fds[fd] = FdEntry { kind: VnodeKind::TimerFd { slot }, flags: 0, in_use: true };
     val_reply(fd as u64)
 }
 
-/// timerfd_settime: args = (fd, flags, value_ns, interval_ns)
-/// Converts nanoseconds to ticks at 100 Hz (10_000_000 ns/tick).
 fn handle_timerfd_settime(pid: u32, fd: usize, value_ns: u64, interval_ns: u64) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
-    let slot = match tbl.fds[fd].kind {
-        VnodeKind::TimerFd { slot } => slot,
-        _ => return err_reply(-22),
-    };
+    let slot = match tbl.fds[fd].kind { VnodeKind::TimerFd { slot } => slot, _ => return err_reply(-22) };
     drop(tbls);
-    const NS_PER_TICK: u64 = 10_000_000; // 100 Hz
+    const NS_PER_TICK: u64 = 10_000_000;
     let now = sched::ticks();
     let mut pool = TIMERFD_POOL.lock();
     let e = &mut pool[slot];
-    if value_ns == 0 {
-        e.armed = false;
-        e.expirations = 0;
-    } else {
-        e.armed = true;
-        e.deadline_ticks = now + (value_ns / NS_PER_TICK).max(1);
-        e.interval_ticks = interval_ns / NS_PER_TICK;
-        e.expirations = 0;
-    }
+    if value_ns == 0 { e.armed = false; e.expirations = 0; }
+    else { e.armed = true; e.deadline_ticks = now + (value_ns / NS_PER_TICK).max(1); e.interval_ticks = interval_ns / NS_PER_TICK; e.expirations = 0; }
     ok_reply()
 }
 
-/// timerfd_gettime: writes itimerspec { interval, value } to out_ptr (2×16 bytes).
 fn handle_timerfd_gettime(pid: u32, fd: usize, out_ptr: usize) -> Message {
     if out_ptr == 0 { return err_reply(-14); }
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
-    let slot = match tbl.fds[fd].kind {
-        VnodeKind::TimerFd { slot } => slot,
-        _ => return err_reply(-22),
-    };
+    let slot = match tbl.fds[fd].kind { VnodeKind::TimerFd { slot } => slot, _ => return err_reply(-22) };
     drop(tbls);
     const NS_PER_TICK: u64 = 10_000_000;
     let pool = TIMERFD_POOL.lock();
     let e = &pool[slot];
     let now = sched::ticks();
-    let remaining_ns = if e.armed && e.deadline_ticks > now {
-        (e.deadline_ticks - now) * NS_PER_TICK
-    } else {
-        0
-    };
+    let remaining_ns = if e.armed && e.deadline_ticks > now { (e.deadline_ticks - now) * NS_PER_TICK } else { 0 };
     let interval_ns = e.interval_ticks * NS_PER_TICK;
     drop(pool);
-    // Write itimerspec: { interval: timespec, value: timespec }
-    // timespec = { tv_sec: i64, tv_nsec: i64 } (16 bytes each)
     unsafe {
         let p = out_ptr as *mut i64;
-        p.write(    (interval_ns / 1_000_000_000) as i64); // interval.tv_sec
-        p.add(1).write((interval_ns % 1_000_000_000) as i64); // interval.tv_nsec
-        p.add(2).write((remaining_ns / 1_000_000_000) as i64); // value.tv_sec
-        p.add(3).write((remaining_ns % 1_000_000_000) as i64); // value.tv_nsec
+        p.write((interval_ns / 1_000_000_000) as i64);
+        p.add(1).write((interval_ns % 1_000_000_000) as i64);
+        p.add(2).write((remaining_ns / 1_000_000_000) as i64);
+        p.add(3).write((remaining_ns % 1_000_000_000) as i64);
     }
     ok_reply()
 }
 
-// ── ioctl ─────────────────────────────────────────────────────────────────────
-
 const FIONREAD: usize = 0x541B;
 
 fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
-    if cmd != FIONREAD { return err_reply(-25); } // ENOTTY
-    if arg == 0 { return err_reply(-14); } // EFAULT
+    if cmd != FIONREAD { return err_reply(-25); }
+    if arg == 0 { return err_reply(-14); }
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
     let bytes_avail: i32 = match &tbl.fds[fd].kind {
-        VnodeKind::Pipe { ring, is_write: false } => {
-            let ring_idx = *ring;
-            drop(tbls);
-            PIPE_RINGS.lock()[ring_idx].count as i32
-        }
-        VnodeKind::RamFile { data, pos } => {
-            (data.len().saturating_sub(*pos)) as i32
-        }
-        VnodeKind::TmpFile { idx, pos, .. } => {
-            let idx = *idx; let cur = *pos;
-            drop(tbls);
-            TMP_FILES.lock()[idx].len.saturating_sub(cur) as i32
-        }
-        VnodeKind::EventFd { slot } => {
-            let s = *slot;
-            drop(tbls);
-            if EVENTFD_COUNTERS.lock()[s] > 0 { 8 } else { 0 }
-        }
-        VnodeKind::TimerFd { slot } => {
-            let s = *slot;
-            drop(tbls);
-            if TIMERFD_POOL.lock()[s].expirations > 0 { 8 } else { 0 }
-        }
-        _ => return err_reply(-25), // ENOTTY
+        VnodeKind::Pipe { ring, is_write: false } => { let r = *ring; drop(tbls); PIPE_RINGS.lock()[r].count as i32 }
+        VnodeKind::RamFile { data, pos } => (data.len().saturating_sub(*pos)) as i32,
+        VnodeKind::TmpFile { idx, pos, .. } => { let i = *idx; let c = *pos; drop(tbls); TMP_FILES.lock()[i].len.saturating_sub(c) as i32 }
+        VnodeKind::EventFd { slot } => { let s = *slot; drop(tbls); if EVENTFD_COUNTERS.lock()[s] > 0 { 8 } else { 0 } }
+        VnodeKind::TimerFd { slot } => { let s = *slot; drop(tbls); if TIMERFD_POOL.lock()[s].expirations > 0 { 8 } else { 0 } }
+        _ => return err_reply(-25),
     };
     unsafe { (arg as *mut i32).write(bytes_avail); }
     val_reply(0)
+}
+
+fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    match tbl.fds[fd].kind {
+        VnodeKind::TmpFile { idx, .. } => {
+            drop(tbls);
+            let mut tmp = TMP_FILES.lock();
+            let entry = &mut tmp[idx];
+            if new_len > MAX_TMP_SIZE { return err_reply(-28); }
+            if new_len > entry.len { for b in &mut entry.data[entry.len..new_len] { *b = 0; } }
+            entry.len = new_len;
+            ok_reply()
+        }
+        _ => err_reply(-22),
+    }
+}
+
+fn handle_rename(old_ptr: usize, new_ptr: usize) -> Message {
+    let (obuf, olen) = match read_cstr_raw(old_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let (nbuf, nlen) = match read_cstr_raw(new_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let old = &obuf[..olen]; let new = &nbuf[..nlen];
+    if !is_tmp_path(old) || !is_tmp_path(new) { return err_reply(-30); }
+    let mut tmp = TMP_FILES.lock();
+    match tmp.iter().position(|e| e.in_use && !e.is_dir && e.path_len == olen && &e.path[..olen] == old) {
+        Some(idx) => {
+            let copy_len = nlen.min(MAX_TMP_PATH - 1);
+            tmp[idx].path[..copy_len].copy_from_slice(&new[..copy_len]);
+            tmp[idx].path_len = copy_len;
+            ok_reply()
+        }
+        None => err_reply(-2),
+    }
+}
+
+fn handle_unlink(path_ptr: usize) -> Message {
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let path = &pbuf[..plen];
+    if !is_tmp_path(path) { return err_reply(-30); }
+    let mut tmp = TMP_FILES.lock();
+    match tmp.iter().position(|e| e.in_use && !e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
+        Some(idx) => { tmp[idx] = TmpFileEntry::empty(); ok_reply() }
+        None      => err_reply(-2),
+    }
+}
+
+fn handle_mkdir(path_ptr: usize) -> Message {
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let path = &pbuf[..plen];
+    if !is_tmp_path(path) { return err_reply(-30); }
+    for &dir in RAMFS_DIRS { if path == dir { return err_reply(-17); } }
+    let mut tmp = TMP_FILES.lock();
+    if tmp.iter().any(|e| e.in_use && e.path_len == plen && &e.path[..plen] == path) { return err_reply(-17); }
+    match tmp.iter().position(|e| !e.in_use) {
+        Some(idx) => {
+            tmp[idx] = TmpFileEntry::empty(); tmp[idx].in_use = true; tmp[idx].is_dir = true;
+            let copy_len = plen.min(MAX_TMP_PATH - 1);
+            tmp[idx].path[..copy_len].copy_from_slice(&path[..copy_len]);
+            tmp[idx].path_len = copy_len;
+            ok_reply()
+        }
+        None => err_reply(-28),
+    }
+}
+
+enum FdInfo { Static(&'static [u8]), Pipe(usize), RamData(*const u8), TmpIdx(usize), Bad }
+
+fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Message {
+    if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
+    let info = {
+        let tbls = FD_TABLES.lock();
+        let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
+        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        match &tbl.fds[fd].kind {
+            VnodeKind::DevNull => FdInfo::Static(b"/dev/null"),
+            VnodeKind::DevZero => FdInfo::Static(b"/dev/zero"),
+            VnodeKind::Pipe { ring, .. } => FdInfo::Pipe(*ring),
+            VnodeKind::RamFile { data, .. } => FdInfo::RamData(data.as_ptr()),
+            VnodeKind::TmpFile { idx, .. } => FdInfo::TmpIdx(*idx),
+            VnodeKind::EventFd { .. } => FdInfo::Static(b"eventfd"),
+            VnodeKind::TimerFd { .. } => FdInfo::Static(b"timerfd"),
+            VnodeKind::DevUrandom => FdInfo::Static(b"/dev/urandom"),
+            VnodeKind::DevStdio { target_fd: 0 } => FdInfo::Static(b"/dev/stdin"),
+            VnodeKind::DevStdio { target_fd: 1 } => FdInfo::Static(b"/dev/stdout"),
+            VnodeKind::DevStdio { .. } => FdInfo::Static(b"/dev/stderr"),
+            _ => FdInfo::Bad,
+        }
+    };
+    match info {
+        FdInfo::Bad => err_reply(-9),
+        FdInfo::Static(p) => {
+            let c = p.len().min(buf_len);
+            unsafe { core::ptr::copy_nonoverlapping(p.as_ptr(), buf_ptr as *mut u8, c); }
+            val_reply(c as u64)
+        }
+        FdInfo::Pipe(r) => {
+            let mut b = [0u8; 32]; let pref = b"pipe:["; b[..6].copy_from_slice(pref);
+            let mut n = 6; let mut v = r;
+            if v == 0 { b[n] = b'0'; n += 1; }
+            else { let mut d = [0u8; 10]; let mut di = 0; while v > 0 { d[di] = b'0'+(v%10) as u8; di += 1; v /= 10; } for i in (0..di).rev() { b[n] = d[i]; n += 1; } }
+            b[n] = b']'; n += 1;
+            let c = n.min(buf_len);
+            unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), buf_ptr as *mut u8, c); }
+            val_reply(c as u64)
+        }
+        FdInfo::RamData(ptr) => {
+            match RAMFS.iter().find(|e| e.data.as_ptr() == ptr) {
+                Some(e) => { let c = e.path.len().min(buf_len); unsafe { core::ptr::copy_nonoverlapping(e.path.as_ptr(), buf_ptr as *mut u8, c); } val_reply(c as u64) }
+                None => err_reply(-2),
+            }
+        }
+        FdInfo::TmpIdx(i) => {
+            let tmp = TMP_FILES.lock();
+            if i < tmp.len() && tmp[i].in_use {
+                let l = tmp[i].path_len.min(buf_len);
+                unsafe { core::ptr::copy_nonoverlapping(tmp[i].path.as_ptr(), buf_ptr as *mut u8, l); }
+                val_reply(l as u64)
+            } else { err_reply(-9) }
+        }
+    }
 }
