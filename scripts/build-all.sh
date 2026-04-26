@@ -74,6 +74,7 @@ create_initrd() {
     
     cp "$userland_dir/init" "$temp_dir/init"
     cp "$userland_dir/shell" "$temp_dir/bin/shell"
+    cp "$userland_dir/hello" "$temp_dir/bin/hello"
     
     # Create uncompressed CPIO archive
     cd "$temp_dir"

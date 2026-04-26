@@ -195,7 +195,8 @@ pub unsafe fn parse() -> BootInfo {
     if let Some(resp) = MODULE_REQUEST.response() {
         if resp.module_count > 0 {
             let module = &**resp.modules;
-            info.initrd_base = module.address as u64;
+            // Limine provides virtual address in HHDM; convert to physical.
+            info.initrd_base = (module.address as u64).saturating_sub(info.hhdm_offset);
             info.initrd_size = module.size;
         }
     }

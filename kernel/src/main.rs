@@ -272,7 +272,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 serial_print("\n");
                 if resp.module_count > 0 {
                     let module = &**resp.modules;
-                    boot_info.initrd_base = module.address as u64;
+                    // Limine provides virtual address in HHDM; convert to physical.
+                    boot_info.initrd_base = (module.address as u64).saturating_sub(boot_info.hhdm_offset);
                     boot_info.initrd_size = module.size;
                 }
             } else {
@@ -284,9 +285,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         if !resp_ptr.is_null() {
             let resp = unsafe { &*resp_ptr };
             boot_info.hhdm_offset = resp.offset;
-            serial_print("  HHDM Offset: 0x");
-            print_number((boot_info.hhdm_offset >> 32) as u32);
-            print_number(boot_info.hhdm_offset as u32);
+            serial_print("  HHDM Offset: ");
+            print_hex(boot_info.hhdm_offset as usize);
             serial_print("\n");
         } else {
             serial_print("  WARNING: HHDM Request NOT satisfied, using fallback\n");

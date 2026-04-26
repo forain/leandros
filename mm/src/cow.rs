@@ -65,8 +65,8 @@ pub fn clone_as(src: &AddressSpace, new_page_table_root: usize) -> Option<Addres
                 let dst_phys = buddy_alloc(0)?; // order 0 = one 4 KiB page
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        src_phys as *const u8,
-                        dst_phys as *mut u8,
+                        crate::phys_to_virt(src_phys) as *const u8,
+                        crate::phys_to_virt(dst_phys) as *mut u8,
                         PAGE_SIZE,
                     );
                     // Install PTE in the child's page table.
@@ -90,8 +90,8 @@ pub fn clone_as(src: &AddressSpace, new_page_table_root: usize) -> Option<Addres
 
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    region.phys as *const u8,
-                    dst_phys    as *mut u8,
+                    crate::phys_to_virt(region.phys) as *const u8,
+                    crate::phys_to_virt(dst_phys)    as *mut u8,
                     n_pages * PAGE_SIZE,
                 );
                 for i in 0..n_pages {
