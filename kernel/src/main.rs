@@ -151,6 +151,25 @@ pub fn serial_read_byte() -> Option<u8> {
 }
 
 #[no_mangle]
+pub fn serial_has_data() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::asm;
+        let mut status: u8;
+        asm!("in al, dx", out("al") status, in("dx") 0x3FDu16, options(nomem, nostack));
+        return status & 0x01 != 0;
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let base = 0x09000000usize;
+        let fr = (base + 0x18) as *const u32;
+        return fr.read_volatile() & (1 << 4) == 0;
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    false
+}
+
+#[no_mangle]
 pub unsafe fn serial_write_byte(b: u8) {
     #[cfg(target_arch = "x86_64")]
     {

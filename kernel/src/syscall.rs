@@ -2725,8 +2725,21 @@ fn vfs_close_all_current() {
 fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     let pid = current_pid();
     const FIONREAD: usize = 0x541B;
+    const FBIOGET_VSCREENINFO: usize = 0x4600;
     const ENOTTY: isize = -25;
-    if cmd == FIONREAD {
+    
+    if cmd == FIONREAD && fd == 0 {
+        if arg == 0 || !validate_user_buf(arg, 4) { return -14; }
+        let has_data = crate::serial_has_data();
+        unsafe { (arg as *mut i32).write(if has_data { 1 } else { 0 }) };
+        return 0;
+    }
+    
+    if cmd == FIONREAD || cmd == FBIOGET_VSCREENINFO {
+        if cmd == FBIOGET_VSCREENINFO && arg != 0 {
+            if !validate_user_buf(arg, 32) { return -14; }
+            with_current_address_space_mut(|as_| as_.prefault_range(arg, 32));
+        }
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
         let r = vfs_reply_val(&vfs::handle(&msg, pid));
         if r != ENOTTY { return r; }
