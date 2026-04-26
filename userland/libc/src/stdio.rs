@@ -119,7 +119,7 @@ pub(crate) unsafe fn do_format(sink: &mut Sink<'_>, fmt: *const u8, argv: *const
 
         // Parse flags.
         let left_align = *fmt.add(fi) == b'-'; if left_align { fi += 1; }
-        let zero_pad   = !left_align && *fmt.add(fi) == b'0'; if zero_pad { fi += 1; }
+        let mut zero_pad = !left_align && *fmt.add(fi) == b'0'; if zero_pad { fi += 1; }
 
         // Parse width.
         let mut width = 0usize;
@@ -127,10 +127,20 @@ pub(crate) unsafe fn do_format(sink: &mut Sink<'_>, fmt: *const u8, argv: *const
             width = width * 10 + (*fmt.add(fi) - b'0') as usize; fi += 1;
         }
 
-        // Skip precision.
+        // Skip precision (with basic support for zero-padding)
         if *fmt.add(fi) == b'.' {
             fi += 1;
-            while { let d = *fmt.add(fi); d >= b'0' && d <= b'9' } { fi += 1; }
+            let mut prec = 0usize;
+            let mut has_prec = false;
+            while { let d = *fmt.add(fi); d >= b'0' && d <= b'9' } {
+                prec = prec * 10 + (*fmt.add(fi) - b'0') as usize;
+                fi += 1;
+                has_prec = true;
+            }
+            if has_prec && !zero_pad && width == 0 {
+                zero_pad = true;
+                width = prec;
+            }
         }
 
         // Length modifier.
