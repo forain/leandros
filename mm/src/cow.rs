@@ -11,7 +11,9 @@
 //! partially-built `child_as` is dropped (freeing whatever was allocated so
 //! far) and `None` is returned — there is no leak.
 
-use crate::vmm::{AddressSpace, VmaRegion, MAX_LAZY_PAGES};
+extern crate alloc;
+use alloc::vec::Vec;
+use crate::vmm::{AddressSpace, VmaRegion};
 use crate::paging::map_page;
 use crate::buddy::{PAGE_SIZE, alloc as buddy_alloc};
 
@@ -33,15 +35,14 @@ pub fn clone_as(src: &AddressSpace, new_page_table_root: usize) -> Option<Addres
             None    => continue,
         };
 
-        // Initialise the destination VMA entry with the same metadata.
-        // Physical-page fields are filled in below depending on VMA kind.
+        // Initialise the destination VMA with the same metadata.
         *dst_slot = Some(VmaRegion {
             start:      region.start,
             end:        region.end,
             phys:       0,
             flags:      region.flags,
             lazy:       region.lazy,
-            lazy_pages: [0usize; MAX_LAZY_PAGES],
+            lazy_pages: Vec::new(),
             lazy_count: 0,
             prot:       region.prot,
             map_flags:  region.map_flags,
@@ -52,14 +53,9 @@ pub fn clone_as(src: &AddressSpace, new_page_table_root: usize) -> Option<Addres
         let dst_region = dst_slot.as_mut().unwrap();
 
         if region.lazy {
-            // ── Lazy VMA ─────────────────────────────────────────────────────
             // Copy only the pages that have actually been faulted in; un-faulted
-            // pages remain zero-init (the child will fault them on demand).
-            let n_pages = (region.end - region.start) / PAGE_SIZE;
-            let max_idx = n_pages.min(MAX_LAZY_PAGES);
-
-            for i in 0..max_idx {
-                let src_phys = region.lazy_pages[i];
+            // pages remain absent (the child will fault them on demand).
+            for (i, &src_phys) in region.lazy_pages.iter().enumerate() {
                 if src_phys == 0 { continue; }
 
                 let dst_phys = buddy_alloc(0)?; // order 0 = one 4 KiB page
@@ -69,7 +65,6 @@ pub fn clone_as(src: &AddressSpace, new_page_table_root: usize) -> Option<Addres
                         crate::phys_to_virt(dst_phys) as *mut u8,
                         PAGE_SIZE,
                     );
-                    // Install PTE in the child's page table.
                     map_page(
                         new_page_table_root,
                         region.start + i * PAGE_SIZE,
@@ -77,13 +72,15 @@ pub fn clone_as(src: &AddressSpace, new_page_table_root: usize) -> Option<Addres
                         region.flags,
                     );
                 }
+                // Grow the dst tracking Vec to cover index i.
+                if dst_region.lazy_pages.len() <= i {
+                    dst_region.lazy_pages.resize(i + 1, 0);
+                }
                 dst_region.lazy_pages[i] = dst_phys;
                 dst_region.lazy_count   += 1;
             }
         } else if region.phys != 0 {
-            // ── Eager VMA ────────────────────────────────────────────────────
-            // The entire VMA is backed by one contiguous buddy allocation;
-            // copy it in one shot.
+            // Eager VMA: copy the whole contiguous allocation in one shot.
             let n_pages = (region.end - region.start) / PAGE_SIZE;
             let order   = pages_to_order(n_pages);
             let dst_phys = buddy_alloc(order)?;

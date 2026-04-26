@@ -7,19 +7,14 @@
 //! `map_lazy()` records a VMA without allocating or installing any page-table
 //! entries.  On the first access the CPU takes a page fault; the fault handler
 //! calls `handle_user_page_fault(fault_va)` which allocates exactly one 4 KiB
-//! page, zeroes it, and maps it into the page table.  Subsequent accesses to
-//! other pages in the same VMA each trigger their own fault.  A lazy VMA may
-//! span at most `MAX_LAZY_PAGES` pages; faults beyond that limit return `false`
-//! (treated as a segfault) to prevent untracked allocations that cannot be freed.
+//! page, zeroes it, and maps it into the page table.  Each additional access
+//! triggers its own fault.  Lazy VMAs are tracked with a heap-allocated Vec so
+//! there is no per-VMA page-count limit.
 
+extern crate alloc;
+use alloc::vec::Vec;
 use crate::paging::{PageFlags, map_page, unmap_page, tlb_shootdown_all};
 use crate::buddy::{PAGE_SIZE, alloc as buddy_alloc, free as buddy_free};
-
-/// Maximum number of individual pages tracked per lazy VMA.
-///
-/// Phase 6 will migrate to a slab-allocated linked list for larger regions.
-/// Increased to 512 (2MB per VMA) to support Doom.
-pub const MAX_LAZY_PAGES: usize = 512;
 
 // ── POSIX mmap/mprotect protection flags ─────────────────────────────────────
 pub const PROT_NONE:  u32 = 0;
@@ -34,7 +29,7 @@ pub const MAP_ANONYMOUS: u32 = 1 << 5;
 pub const MAP_FIXED:     u32 = 1 << 4;
 
 /// Represents a contiguous virtual memory region within an address space.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct VmaRegion {
     pub start: usize,
     pub end:   usize,   // exclusive
@@ -45,9 +40,10 @@ pub struct VmaRegion {
     /// True if physical pages are allocated lazily on first access.
     pub lazy:  bool,
     /// Per-page physical addresses for lazy VMAs (0 = not yet faulted in).
-    /// Indexed by `(fault_va - start) / PAGE_SIZE`.
-    pub lazy_pages: [usize; MAX_LAZY_PAGES],
-    /// Number of entries in `lazy_pages` that have been filled.
+    /// Indexed by `(fault_va - start) / PAGE_SIZE`.  Grows on demand; no
+    /// fixed upper bound on VMA size.
+    pub lazy_pages: Vec<usize>,
+    /// Number of faulted-in pages tracked in `lazy_pages`.
     pub lazy_count: usize,
 
     // ── POSIX fields added in Phase 0 ────────────────────────────────────────
@@ -85,12 +81,8 @@ impl Drop for AddressSpace {
         for slot in self.regions.iter_mut() {
             if let Some(region) = slot.take() {
                 if region.lazy {
-                    let max_idx = ((region.end - region.start) / PAGE_SIZE)
-                        .min(MAX_LAZY_PAGES);
-                    for i in 0..max_idx {
-                        if region.lazy_pages[i] != 0 {
-                            buddy_free(region.lazy_pages[i], 0);
-                        }
+                    for phys in region.lazy_pages.iter().copied() {
+                        if phys != 0 { buddy_free(phys, 0); }
                     }
                 } else if region.phys != 0 {
                     let pages = (region.end - region.start) / PAGE_SIZE;
@@ -111,7 +103,7 @@ impl AddressSpace {
     pub fn new(page_table_root: usize) -> Self {
         Self {
             page_table_root,
-            regions: [None; 8],
+            regions: [None, None, None, None, None, None, None, None],
             heap_start: 0,
             heap_end: 0,
         }
@@ -180,7 +172,7 @@ impl AddressSpace {
             phys,
             flags,
             lazy: false,
-            lazy_pages: [0; MAX_LAZY_PAGES],
+            lazy_pages: Vec::new(),
             lazy_count: 0,
             prot:      PROT_READ | PROT_WRITE,
             map_flags: MAP_ANONYMOUS | MAP_PRIVATE,
@@ -224,7 +216,7 @@ impl AddressSpace {
             phys: 0,
             flags,
             lazy: true,
-            lazy_pages: [0; MAX_LAZY_PAGES],
+            lazy_pages: Vec::new(),
             lazy_count: 0,
             prot:      PROT_READ | PROT_WRITE,
             map_flags: MAP_ANONYMOUS | MAP_PRIVATE,
@@ -264,7 +256,7 @@ impl AddressSpace {
         let page_idx = (page_va - region.start) / PAGE_SIZE;
 
         // If this page was already faulted in, it is a protection fault.
-        if page_idx < MAX_LAZY_PAGES && region.lazy_pages[page_idx] != 0 {
+        if region.lazy_pages.get(page_idx).copied().unwrap_or(0) != 0 {
             return false;
         }
 
@@ -275,8 +267,7 @@ impl AddressSpace {
         };
         unsafe { (crate::phys_to_virt(phys) as *mut u8).write_bytes(0, PAGE_SIZE); }
 
-        // Map just the faulting page.  If the page-table walk itself runs out
-        // of memory, free the backing page and return false (segfault).
+        // Map just the faulting page.
         let mapped = unsafe {
             map_page(self.page_table_root, page_va, phys, region.flags)
         };
@@ -285,19 +276,10 @@ impl AddressSpace {
             return false;
         }
 
-        // Reject pages beyond the tracking table capacity.  This branch is only
-        // reached when `page_idx >= MAX_LAZY_PAGES` AND the map_page call above
-        // succeeded (the `!mapped` early-return already handled map failure).
-        // Mapping them would succeed but they could never be freed (silent leak),
-        // so we unmap the freshly-installed PTE, free the physical page, and
-        // return false to trigger a segfault.
-        if page_idx >= MAX_LAZY_PAGES {
-            unsafe { unmap_page(self.page_table_root, page_va); }
-            buddy_free(phys, 0);
-            return false;
+        // Grow the tracking Vec to cover page_idx, then record the physical page.
+        if region.lazy_pages.len() <= page_idx {
+            region.lazy_pages.resize(page_idx + 1, 0);
         }
-
-        // Track the physical address so unmap() can free it later.
         region.lazy_pages[page_idx] = phys;
         region.lazy_count += 1;
 
@@ -334,7 +316,7 @@ impl AddressSpace {
             if region.lazy {
                 let pg_first = (clip_s - r_start) / PAGE_SIZE;
                 let pg_last  = (clip_e - r_start + PAGE_SIZE - 1) / PAGE_SIZE;
-                for i in pg_first..pg_last.min(MAX_LAZY_PAGES) {
+                for i in pg_first..pg_last.min(region.lazy_pages.len()) {
                     if region.lazy_pages[i] != 0 {
                         unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); }
                         buddy_free(region.lazy_pages[i], 0);
@@ -360,14 +342,13 @@ impl AddressSpace {
             } else if clip_s == r_start {
                 // Front trim: VMA shrinks to [clip_e, r_end).
                 if region.lazy {
-                    // Shift tracked pages down so index 0 maps to the new start.
+                    // Drain the entries for the removed prefix so index 0 aligns with the new start.
                     let shift = (clip_e - r_start) / PAGE_SIZE;
-                    let total = ((r_end - r_start) / PAGE_SIZE).min(MAX_LAZY_PAGES);
-                    for i in 0..total.saturating_sub(shift) {
-                        region.lazy_pages[i] =
-                            if i + shift < MAX_LAZY_PAGES { region.lazy_pages[i + shift] } else { 0 };
+                    if shift < region.lazy_pages.len() {
+                        region.lazy_pages.drain(0..shift);
+                    } else {
+                        region.lazy_pages.clear();
                     }
-                    for i in total.saturating_sub(shift)..total { region.lazy_pages[i] = 0; }
                 } else if region.phys != 0 {
                     region.phys += clip_e - r_start;
                 }
@@ -403,17 +384,15 @@ impl AddressSpace {
     /// For lazy VMAs each faulted-in page is stored separately in `lazy_pages[]`.
     ///
     /// Returns `None` if:
-    /// - no VMA covers `virt`,
-    /// - the containing VMA is lazy and the page hasn't been faulted in yet, or
-    /// - the page index overflows `MAX_LAZY_PAGES`.
+    /// - no VMA covers `virt`, or
+    /// - the containing VMA is lazy and the page hasn't been faulted in yet.
     pub fn virt_to_phys(&self, virt: usize) -> Option<usize> {
         let vma = self.find(virt)?;
         if vma.lazy {
             let offset     = virt - vma.start;
             let page_index = offset / PAGE_SIZE;
             let page_off   = offset % PAGE_SIZE;
-            if page_index >= MAX_LAZY_PAGES { return None; }
-            let phys_page  = vma.lazy_pages[page_index];
+            let phys_page  = vma.lazy_pages.get(page_index).copied().unwrap_or(0);
             if phys_page == 0 { return None; } // not yet faulted in
             Some(phys_page + page_off)
         } else {
@@ -502,12 +481,11 @@ impl AddressSpace {
 
             // Remap pages that are already backed (lazy pages that have been faulted in).
             if region.lazy {
-                let max_idx = ((region.end - region.start) / PAGE_SIZE).min(MAX_LAZY_PAGES);
-                for i in 0..max_idx {
-                    if region.lazy_pages[i] != 0 {
+                for (i, &phys) in region.lazy_pages.iter().enumerate() {
+                    if phys != 0 {
                         let page_va = region.start + i * PAGE_SIZE;
                         if page_va >= addr && page_va < end {
-                            unsafe { map_page(self.page_table_root, page_va, region.lazy_pages[i], new_flags); }
+                            unsafe { map_page(self.page_table_root, page_va, phys, new_flags); }
                         }
                     }
                 }
@@ -596,7 +574,7 @@ impl AddressSpace {
             // Page indices are relative to the VMA start (heap_start).
             let first_idx = (new_end - heap_start) / PAGE_SIZE;
             let last_idx  = (old_end  - heap_start + PAGE_SIZE - 1) / PAGE_SIZE;
-            for i in first_idx..last_idx.min(MAX_LAZY_PAGES) {
+            for i in first_idx..last_idx.min(region.lazy_pages.len()) {
                 if region.lazy_pages[i] != 0 {
                     let page_va = heap_start + i * PAGE_SIZE;
                     unsafe { unmap_page(self.page_table_root, page_va); }
