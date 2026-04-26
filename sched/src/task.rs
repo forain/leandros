@@ -46,7 +46,7 @@ pub struct Task {
     /// Futex user-space address this task is waiting on (0 = none).
     pub blocked_futex: usize,
     /// Per-process virtual address space (None for kernel tasks).
-    pub address_space: Option<AddressSpace>,
+    pub address_space: Option<alloc::boxed::Box<AddressSpace>>,
     /// Exit status set by `exit()`.  Valid only when `state == Zombie`.
     pub exit_code:    i32,
     /// Dedicated reply port for sys_call.  Allocated at spawn; freed on exit.

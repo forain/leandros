@@ -17,9 +17,9 @@ use crate::buddy::{PAGE_SIZE, alloc as buddy_alloc, free as buddy_free};
 
 /// Maximum number of individual pages tracked per lazy VMA.
 ///
-/// Reduced to 64 to keep Task struct small enough for stack operations.
 /// Phase 6 will migrate to a slab-allocated linked list for larger regions.
-pub const MAX_LAZY_PAGES: usize = 64;
+/// Increased to 512 (2MB per VMA) to support Doom.
+pub const MAX_LAZY_PAGES: usize = 512;
 
 // ── POSIX mmap/mprotect protection flags ─────────────────────────────────────
 pub const PROT_NONE:  u32 = 0;

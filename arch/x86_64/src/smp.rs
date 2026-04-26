@@ -198,7 +198,7 @@ pub unsafe fn smp_init(ncpus: usize) {
     write32(AP_CTR_OFF,     0);
     write32(AP_CTR_OFF + 4, 0); // padding
 
-    // Per-AP kernel stacks (8 KiB each).
+    // Per-AP kernel stacks (64 KiB each).
     //
     // The SIPI below is a broadcast shorthand: ALL non-BSP APs start and use
     // an atomic counter to grab a sequential index, then load
@@ -210,10 +210,10 @@ pub unsafe fn smp_init(ncpus: usize) {
     // start, but no AP will crash with a null stack.
     let mut stacks_ok = true;
     for i in 0..ncpus {
-        match buddy::alloc(1) {
+        match buddy::alloc(4) {
             Some(stack) => {
-                (stack as *mut u8).write_bytes(0, buddy::PAGE_SIZE * 2);
-                write64(AP_STACKS_OFF + i * 8, (stack + buddy::PAGE_SIZE * 2) as u64);
+                (stack as *mut u8).write_bytes(0, buddy::PAGE_SIZE * 16);
+                write64(AP_STACKS_OFF + i * 8, (stack + buddy::PAGE_SIZE * 16) as u64);
             }
             None => { stacks_ok = false; break; }
         }

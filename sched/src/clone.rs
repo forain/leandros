@@ -46,7 +46,7 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         if parent_pid == 0 { return -38; }
 
         // ── Step 1: allocate child kernel stack ───────────────────────────────
-        let stack_pages = 3; // 32 KiB
+        let stack_pages = 4; // 64 KiB
         let stack_base_phys = match mm::buddy::alloc(stack_pages) {
             Some(a) => a,
             None    => return -12, // ENOMEM
@@ -67,7 +67,7 @@ pub fn fork_current(frame_ptr: usize) -> isize {
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid) {
                 Some(t) => match t.address_space.as_ref() {
-                    Some(as_) => as_ as *const mm::vmm::AddressSpace,
+                    Some(as_) => &**as_ as *const mm::vmm::AddressSpace,
                     None => {
                         mm::buddy::free(stack_base_phys, 3);
                         mm::buddy::free(child_pt, 0);
@@ -165,7 +165,7 @@ pub fn fork_current(frame_ptr: usize) -> isize {
             child_pid, 0, stack_base_phys, stack_size, child_pt,
         );
         child.ctx           = child_ctx;
-        child.address_space = Some(child_as);
+        child.address_space = Some(alloc::boxed::Box::new(child_as));
         child.ppid          = pid;
         child.tgid          = tgid;
         child.pgid          = pgid;
@@ -217,7 +217,7 @@ pub fn clone_thread(
         if parent_pid == 0 { return -38; }
 
         // ── Allocate child kernel stack ───────────────────────────────────────
-        let stack_pages = 1;
+        let stack_pages = 4; // 64 KiB
         let stack_base_phys = match mm::buddy::alloc(stack_pages) {
             Some(a) => a,
             None    => return -12,
@@ -262,6 +262,8 @@ pub fn clone_thread(
                 (*child_frame_ptr).rax = 0;
                 if child_stack != 0 { (*child_frame_ptr).rsp = child_stack as u64; }
             }
+
+            // Initial child RSP for context switch
             let child_ksp = (child_frame_ptr as usize).wrapping_sub(7 * 8);
             unsafe {
                 let p = child_ksp as *mut u64;
@@ -270,6 +272,7 @@ pub fn clone_thread(
                 p.add(6).write(fork_ret_to_user as *const () as u64);
             }
             child_ctx.rsp = child_ksp as u64;
+
             // TODO: FS.base setup for CLONE_SETTLS on x86_64
         }
 

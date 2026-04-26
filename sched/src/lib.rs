@@ -287,16 +287,16 @@ pub fn unblock_port(port: u32) {
 pub fn spawn(entry: fn() -> !, _flags: usize) -> Option<Pid> {
     let pid = alloc_pid();
 
-    // Allocate stack for the kernel task (32KB)
-    let stack_base = mm::buddy::alloc(3)?; 
-    let stack_size = mm::buddy::PAGE_SIZE * 8;
+    // Allocate stack for the kernel task (64KB)
+    let stack_base = mm::buddy::alloc(4)?; 
+    let stack_size = mm::buddy::PAGE_SIZE * 16;
 
     let task = Task::new_kernel(pid, entry as usize, stack_base, stack_size, 0);
     let mut rq = RUN_QUEUE.lock();
     if rq.enqueue(task) {
         Some(pid)
     } else {
-        mm::buddy::free(stack_base, 3);
+        mm::buddy::free(stack_base, 4);
         None
     }
 }
@@ -304,20 +304,20 @@ pub fn spawn(entry: fn() -> !, _flags: usize) -> Option<Pid> {
 pub fn spawn_user_with_address_space(entry_point: usize, sp: usize, as_: mm::vmm::AddressSpace) -> Option<Pid> {
     let pid = alloc_pid();
 
-    let stack_phys = mm::buddy::alloc(3)?; // 32KB kernel stack
+    let stack_phys = mm::buddy::alloc(4)?; // 64KB kernel stack
     let stack_virt = mm::phys_to_virt(stack_phys);
-    let stack_size = mm::buddy::PAGE_SIZE * 8;
+    let stack_size = mm::buddy::PAGE_SIZE * 16;
     let page_table = as_.page_table_root;
 
     let mut task = Task::new_userspace(pid, entry_point, sp, stack_virt, stack_size, page_table);
     task.kernel_stack = stack_phys;
-    task.address_space = Some(as_);
+    task.address_space = Some(alloc::boxed::Box::new(as_));
 
     let mut rq = RUN_QUEUE.lock();
     if rq.enqueue(task) {
         Some(pid)
     } else {
-        mm::buddy::free(stack_phys, 3);
+        mm::buddy::free(stack_phys, 4);
         None
     }
 }
@@ -335,7 +335,7 @@ fn scheduler_run_loop() -> ! {
             let (ctx_ptr, pid, kernel_stack_top_virt, page_table) = {
                 let rq = RUN_QUEUE.lock();
                 let t = rq.get(idx).unwrap();
-                let kst = mm::phys_to_virt(t.kernel_stack) + mm::buddy::PAGE_SIZE * 8;
+                let kst = mm::phys_to_virt(t.kernel_stack) + mm::buddy::PAGE_SIZE * 16;
                 (&t.ctx as *const CpuContext, t.pid, kst, t.page_table)
             };
 
@@ -389,7 +389,7 @@ fn scheduler_run_loop() -> ! {
                 }
 
                 { RUN_QUEUE.lock().remove(idx); }
-                mm::buddy::free(stack_base, 3);
+                mm::buddy::free(stack_base, 4);
                 log_exit(zombie_pid, exit_code);
             }
         } else {
@@ -451,7 +451,7 @@ pub fn replace_address_space(
     {
         let mut rq = RUN_QUEUE.lock();
         if let Some(t) = rq.find_pid_mut(pid) {
-            t.address_space = Some(new_as);
+            t.address_space = Some(alloc::boxed::Box::new(new_as));
             t.page_table    = pt_root;
             t.heap_start    = heap_start;
             t.heap_end      = heap_start;

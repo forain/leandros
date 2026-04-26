@@ -153,16 +153,16 @@ pub unsafe fn smp_init(mpidrs: &[u64]) {
     for (i, &mpidr) in mpidrs.iter().enumerate() {
         if i >= MAX_APS { break; }
 
-        // Allocate and zero an 8 KiB kernel stack.
+        // Allocate and zero a 64 KiB kernel stack.
         // On OOM: `continue` skips the cpu_on call for this AP, so the AP is
         // simply never started and ap_stack_table[i] remains 0.  That is safe
         // because the AP entry stub only runs after cpu_on succeeds.
-        let stack = match mm::buddy::alloc(1) {
+        let stack = match mm::buddy::alloc(4) {
             Some(p) => p,
             None    => continue,
         };
-        (stack as *mut u8).write_bytes(0, mm::buddy::PAGE_SIZE * 2);
-        let stack_top = stack + mm::buddy::PAGE_SIZE * 2;
+        (stack as *mut u8).write_bytes(0, mm::buddy::PAGE_SIZE * 16);
+        let stack_top = stack + mm::buddy::PAGE_SIZE * 16;
 
         // Store stack top before issuing CPU_ON.
         ap_stack_table[i] = stack_top as u64;
