@@ -193,52 +193,98 @@ syscall_entry:
     push  0x23            // user code selector (DPL 3)
     push  rcx             // user RIP (from SYSCALL instruction)
 
-    // 4. Save user registers that the rearrangement below will clobber.
-    push  r10             // user r10 = a3
-    push  r9              // user r9  = a5
-    push  r8              // user r8  = a4
-    push  rdx             // user rdx = a2
-    push  rsi             // user rsi = a1
-    push  rdi             // user rdi = a0
+    // 4. Save user registers to complete the UserFrame.
+    push  r11             // r11 (user RFLAGS)
+    push  rcx             // rcx (user RIP)
+    push  rax             // rax
+    push  rdi             // rdi
+    push  rsi             // rsi
+    push  rdx             // rdx
+    push  r8              // r8
+    push  r9              // r9
+    push  r10             // r10
+    push  rbx             // rbx
+    push  rbp             // rbp
+    push  r12             // r12
+    push  r13             // r13
+    push  r14             // r14
+    push  r15             // r15
 
-    // 5. Push stack args for syscall_dispatch (8 args total).
-    //    Current RSP is top - 40 (IRET frame) - 48 (6 regs) = top - 88.
-    //    We need top - 96 for 16-byte alignment before call.
-    push  0               // arg8 = frame_ptr = 0
+    // 5. Prepare arguments for syscall_dispatch.
+    // Our dispatch: number, a0, a1, a2, a3, a4, a5, frame_ptr
+
+    mov   r11, rsp        // frame_ptr = current RSP (pointing to r15)
+
+    // Stack args: [rsp+8]=a5, [rsp+16]=frame_ptr
+    // Initial RSP was 16-byte aligned.
+    // We pushed 21 words (gs[0] + 5-word iret + 15-regs) = 168 bytes.
+    // 168 is not 16-aligned. We need one padding word to make it 176,
+    // then the call will push 8 bytes to make it 184 (not aligned) or...
+    // Actually, System V says RSP+8 must be 16-aligned on entry.
+    // So RSP must be 16-aligned BEFORE the call.
+    // 168 + 24 (3 pushes) = 192 (16-aligned).
+    push  0               // padding (ensure 16-byte alignment for call)
+    push  r11             // arg8 = frame_ptr
     push  r9              // arg7 = a5 (original value)
-    
-    // RSP is now top - 104? Let's re-calculate.
-    // IRET frame: 5 * 8 = 40 bytes.
-    // Saved regs: 6 * 8 = 48 bytes.
-    // Stack args: 2 * 8 = 16 bytes.
-    // Total: 40 + 48 + 16 = 104 bytes.
-    // 104 % 16 = 8.
-    // RSP % 16 == 8 before 'call' is CORRECT for System V ABI.
 
     // 6. Rearrange regs for System V 6-register calling convention.
-    mov   r9,  r8         // a4 → r9  (arg6)
-    mov   r8,  r10        // a3 → r8  (arg5)
-    mov   rcx, rdx        // a2 → rcx (arg4)
-    mov   rdx, rsi        // a1 → rdx (arg3)
-    mov   rsi, rdi        // a0 → rsi (arg2)
-    mov   rdi, rax        // number → rdi (arg1)
-    
+    // number(rax), a0(rdi), a1(rsi), a2(rdx), a3(r10), a4(r8)
+    mov   r9,  r8         // a4 (r8)  → r9  (arg6)
+    mov   r8,  r10        // a3 (r10) → r8  (arg5)
+    mov   rcx, rdx        // a2 (rdx) → rcx (arg4)
+    mov   rdx, rsi        // a1 (rsi) → rdx (arg3)
+    mov   rsi, rdi        // a0 (rdi) → rsi (arg2)
+    mov   rdi, rax        // number (rax) → rdi (arg1)
+
     call  syscall_dispatch
     // rax = return value
 
-    // 7. Remove arg7 + arg8 from stack.
-    add   rsp, 16
+    // 7. Clean up stack args.
+    add   rsp, 24
 
     // 8. Restore user registers.
-    pop   rdi
-    pop   rsi
-    pop   rdx
-    pop   r8
-    pop   r9
+    pop   r15
+    pop   r14
+    pop   r13
+    pop   r12
+    pop   rbp
+    pop   rbx
     pop   r10
+    pop   r9
+    pop   r8
+    pop   rdx
+    pop   rsi
+    pop   rdi
+    add   rsp, 8          // skip rax (it's the return value)
+    pop   rcx             // restore user RIP
+    pop   r11             // restore user RFLAGS
 
     // 9. Return to user space via IRETQ.
-    //    Restores user RIP, CS, RFLAGS, RSP, SS from the frame we built.
+    swapgs
+    iretq
+
+// ── fork_ret_to_user — first entry into a child process after fork ───────
+//
+// Called from cpu_switch_to when a newly-forked task is first scheduled.
+// RSP points to a full UserFrame.
+.global fork_ret_to_user
+.type   fork_ret_to_user, @function
+fork_ret_to_user:
+    pop   r15
+    pop   r14
+    pop   r13
+    pop   r12
+    pop   rbp
+    pop   rbx
+    pop   r10
+    pop   r9
+    pop   r8
+    pop   rdx
+    pop   rsi
+    pop   rdi
+    pop   rax             // Restore rax (contains 0 in child)
+    pop   rcx             // restore user RIP
+    pop   r11             // restore user RFLAGS
     swapgs
     iretq
 
