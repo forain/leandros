@@ -1565,6 +1565,7 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
         if let VnodeKind::DevFb { .. } = &tbl.fds[fd].kind {
             let width  = FB_WIDTH.load(atomic::Ordering::SeqCst);
             let height = FB_HEIGHT.load(atomic::Ordering::SeqCst);
+            let pitch  = FB_PITCH.load(atomic::Ordering::SeqCst);
             drop(tbls);
             unsafe {
                 let p = arg as *mut u32;
@@ -1575,6 +1576,7 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
                 p.add(4).write(0);      // xoffset
                 p.add(5).write(0);      // yoffset
                 p.add(6).write(32);     // bits_per_pixel
+                p.add(7).write(pitch);  // pitch
             }
             return ok_reply();
         }
