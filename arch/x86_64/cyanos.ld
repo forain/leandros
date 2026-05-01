@@ -25,18 +25,13 @@ SECTIONS {
         *(.text*)
     }
 
-    .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_OFFSET) {
-        __text_end = .;
-        __rodata_start = .;
-        *(.rodata*)
-        /* ── Limine request structures ────────────────────────────────────────── */
-        . = ALIGN(8);
-        KEEP(*(.limine_requests))
-        __rodata_end = .;
-    }
-
     .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_OFFSET) {
         *(.data*)
+        /* ── Limine request structures ────────────────────────────────────────── */
+        . = ALIGN(8);
+        KEEP(*(.limine_requests_start))
+        KEEP(*(.limine_requests))
+        KEEP(*(.limine_requests_end))
         . = ALIGN(4K);
         __bss_start = .;
         *(.bss*)
