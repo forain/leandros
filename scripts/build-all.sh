@@ -136,7 +136,11 @@ create_disk_image() {
     local image_name="cyanos-limine-$arch.img"
     echo "💽 Creating $arch disk image..."
     dd if=/dev/zero of="$image_name" bs=1M count=64 2>/dev/null
-    printf "g\nn\n1\n2048\n\nt\n1\nw\n" | fdisk "$image_name" >/dev/null 2>&1 || true
+    if command -v sgdisk &> /dev/null; then
+        sgdisk -n 1:2048:0 -t 1:ef00 "$image_name" >/dev/null 2>&1
+    else
+        printf "g\nn\n1\n2048\n\nt\n1\nw\n" | fdisk "$image_name" >/dev/null 2>&1 || true
+    fi
     local temp_fat="temp_fat_$arch.img"
     rm -f "$temp_fat"
     mkfs.fat -C "$temp_fat" 61440 -F 32 -n CYANOS >/dev/null 2>&1
