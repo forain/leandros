@@ -4,6 +4,10 @@
 
 set -e  # Exit on any error
 
+# Detect Host OS and Architecture
+OS=$(uname -s)
+HOST_ARCH=$(uname -m)
+
 # Default settings
 ARCH="aarch64"
 BOOT_MODE="uefi"
@@ -69,30 +73,71 @@ AARCH64_FW_PATHS=(
     "/usr/share/edk2/aarch64/QEMU_EFI.fd"
     "/usr/share/AAVMF/AAVMF_CODE.fd"
     "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd"
+    "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+    "/usr/local/share/qemu/edk2-aarch64-code.fd"
 )
 
 X86_64_FW_PATHS=(
     "/usr/share/edk2/x64/OVMF_CODE.4m.fd"
     "/usr/share/ovmf/x64/OVMF_CODE.fd"
     "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd"
+    "/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
+    "/usr/local/share/qemu/edk2-x86_64-code.fd"
+)
+
+AARCH64_VARS_TEMPLATES=(
+    "/usr/share/edk2/aarch64/QEMU_VARS.fd"
+    "/opt/homebrew/share/qemu/edk2-arm-vars.fd"
+    "/usr/local/share/qemu/edk2-arm-vars.fd"
+)
+
+X86_64_VARS_TEMPLATES=(
+    "/usr/share/edk2/x64/OVMF_VARS.4m.fd"
+    "/usr/share/ovmf/x64/OVMF_VARS.fd"
+    "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"
+    "/opt/homebrew/share/qemu/edk2-i386-vars.fd"
+    "/usr/local/share/qemu/edk2-i386-vars.fd"
 )
 
 # Set architecture-specific parameters
 if [ "$ARCH" = "aarch64" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
-    MACHINE_ARGS="-machine virt -cpu cortex-a57"
+    MACHINE_ARGS="-machine virt"
+    CPU_ARGS="-cpu cortex-a57"
+    ACCEL_ARGS=""
+    
+    # macOS Acceleration
+    if [ "$OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ]; then
+        ACCEL_ARGS="-accel hvf"
+        CPU_ARGS="-cpu host"
+    fi
+    
     DISK_IMAGE="cyanos-limine-aarch64.img"
     KERNEL_DIRECT="target/final-aarch64/kernel-direct"
     FW_PATHS=("${AARCH64_FW_PATHS[@]}")
+    VARS_TEMPLATES=("${AARCH64_VARS_TEMPLATES[@]}")
+    VARS_FILE="aarch64_vars.fd"
 else
     QEMU_SYSTEM="qemu-system-x86_64"
     MACHINE_ARGS="-machine q35"
+    CPU_ARGS=""
+    ACCEL_ARGS=""
+    
+    # macOS Acceleration
+    if [ "$OS" = "Darwin" ] && [ "$HOST_ARCH" = "x86_64" ]; then
+        ACCEL_ARGS="-accel hvf"
+        CPU_ARGS="-cpu host"
+    fi
+    
     DISK_IMAGE="cyanos-limine-x86_64.img"
     KERNEL_DIRECT="target/final-x86_64/kernel-direct"
     FW_PATHS=("${X86_64_FW_PATHS[@]}")
+    VARS_TEMPLATES=("${X86_64_VARS_TEMPLATES[@]}")
+    VARS_FILE="x86_64_vars.fd"
 fi
 
 echo "🚀 Starting CyanOS ($ARCH) in $BOOT_MODE mode"
+echo "💻 Host: $OS ($HOST_ARCH)"
 echo "=========================================="
 
 if [ "$BOOT_MODE" = "uefi" ]; then
@@ -104,25 +149,41 @@ if [ "$BOOT_MODE" = "uefi" ]; then
     
     echo "🏗️  Using UEFI: $UEFI_FIRMWARE"
     
-    if [ "$ARCH" = "aarch64" ]; then
-        # Check for local vars file
-        if [ ! -f "aarch64_vars.fd" ]; then
-            VARS_TEMPLATE="/usr/share/edk2/aarch64/QEMU_VARS.fd"
-            [ -f "$VARS_TEMPLATE" ] && cp "$VARS_TEMPLATE" aarch64_vars.fd && chmod +w aarch64_vars.fd
+    # Check for local vars file
+    if [ ! -f "$VARS_FILE" ]; then
+        VARS_TEMPLATE=$(find_firmware "${VARS_TEMPLATES[@]}")
+        if [ -n "$VARS_TEMPLATE" ]; then
+            echo "📝 Initializing $VARS_FILE from template"
+            cp "$VARS_TEMPLATE" "$VARS_FILE"
+            chmod +w "$VARS_FILE"
         fi
-        
-        exec $QEMU_SYSTEM $MACHINE_ARGS -m 512M -serial mon:stdio \
-            -drive if=pflash,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
-            $( [ -f "aarch64_vars.fd" ] && echo "-drive if=pflash,format=raw,file=aarch64_vars.fd" ) \
-            -drive file="$DISK_IMAGE",if=virtio,format=raw \
-            -no-reboot
-    else
-        exec $QEMU_SYSTEM $MACHINE_ARGS -m 256M -serial mon:stdio \
-            -drive if=pflash,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
-            -drive format=raw,file="$DISK_IMAGE" \
-            -display gtk \
-            -no-reboot
     fi
+
+    # Build QEMU arguments
+    # Using virtio-blk-pci with bootindex=0 is the most reliable way to boot UEFI images
+    QEMU_ARGS=(
+        $MACHINE_ARGS
+        $CPU_ARGS
+        $ACCEL_ARGS
+        -m 512M
+        -serial mon:stdio
+        -net none
+        -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE"
+        -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE"
+        -device virtio-blk-pci,drive=drive0,bootindex=0
+        -no-reboot
+    )
+
+    if [ -f "$VARS_FILE" ]; then
+        QEMU_ARGS+=(-drive if=pflash,unit=1,format=raw,file="$VARS_FILE")
+    fi
+
+    # Display settings
+    if [ "$OS" != "Darwin" ]; then
+        QEMU_ARGS+=(-display gtk)
+    fi
+
+    exec $QEMU_SYSTEM "${QEMU_ARGS[@]}"
 else
     # Direct boot
     if [ ! -f "$KERNEL_DIRECT" ]; then
@@ -133,13 +194,13 @@ else
     echo "🏗️  Using Kernel: $KERNEL_DIRECT"
     
     if [ "$ARCH" = "aarch64" ]; then
-        exec $QEMU_SYSTEM $MACHINE_ARGS -m 256M -serial mon:stdio \
+        exec $QEMU_SYSTEM $MACHINE_ARGS $CPU_ARGS $ACCEL_ARGS -m 256M -serial mon:stdio \
             -kernel "$KERNEL_DIRECT" \
             -initrd "initrd-aarch64.cpio.gz" \
             -append "console=ttyAMA0" \
             -no-reboot
     else
-        exec $QEMU_SYSTEM $MACHINE_ARGS -m 256M \
+        exec $QEMU_SYSTEM $MACHINE_ARGS $CPU_ARGS $ACCEL_ARGS -m 256M \
             -kernel "$KERNEL_DIRECT" \
             -initrd "initrd-x86_64.cpio.gz" \
             -append "console=ttyS0,115200" \
