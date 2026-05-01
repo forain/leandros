@@ -293,18 +293,8 @@ pub unsafe extern "C" fn arch_map_page(
     phys: usize,
     flags: u64,
 ) -> bool {
-    let f = translate_flags(flags);
-    /*
-    if virt >= 0x200000 && virt < 0x300000 {
-        for b in b"[PGT] Mapping 0x" { crate::arch_serial_putc(*b); }
-        pt_print_hex64(virt as u64);
-        for b in b" to 0x" { crate::arch_serial_putc(*b); }
-        pt_print_hex64(phys as u64);
-        for b in b" flags=0x" { crate::arch_serial_putc(*b); }
-        pt_print_hex64(f.bits());
-        crate::arch_serial_putc(b'\n');
-    }
-    */
+    let mut f = translate_flags(flags);
+    f |= PageTableFlags::PRESENT; // Always set present bit for valid mappings
     map_4k(page_table_root, virt, phys, f)
 }
 
