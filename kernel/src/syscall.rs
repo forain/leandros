@@ -563,7 +563,15 @@ fn dispatch_inner(
         GETPPID => sys_getppid(),
 
         // ── exec / fork ───────────────────────────────────────────────────────
-        EXECVE  => sys_execve(a0, a1, a2),
+        EXECVE  => {
+            let res = sys_execve(a0, a1, a2);
+            if res < 0 {
+                crate::serial_print("  [SYSCALL] sys_execve failed with error: ");
+                crate::print_hex(res as usize);
+                crate::serial_print("\n");
+            }
+            res
+        }
         CLONE   => sys_clone_or_fork(a0, a1, a2, a3, a4, frame_ptr),
         #[cfg(not(target_arch = "aarch64"))]
         FORK    => {
@@ -1971,7 +1979,7 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
                 return -14; 
             }
             
-            serial_write_raw(&kbuf);
+            serial_write_raw(kbuf.as_slice());
             count as isize
         }
         _ => {

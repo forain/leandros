@@ -1,62 +1,46 @@
 //! Cyanos kernel entry point.
-//!
-//! `kernel_main` is called by the arch-specific `_start` stub (entry_*.s)
-//! after the stack is set up and BSS is zeroed.  It receives the physical
-//! address of the boot information structure (MBI for x86-64, DTB for AArch64).
 
 #![no_std]
 #![no_main]
-#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
-#![cfg_attr(target_arch = "x86_64", feature(sync_unsafe_cell))]
 
 extern crate alloc;
-
-use core::panic::PanicInfo;
-use core::alloc::{GlobalAlloc, Layout};
-
-// ── Global Allocator ─────────────────────────────────────────────────────────
-
-struct KernelAllocator;
-unsafe impl GlobalAlloc for KernelAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        mm::slab::alloc(layout.size()).unwrap_or(core::ptr::null_mut())
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        mm::slab::free(ptr, layout.size());
-    }
-}
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
-
-// ── Architecture support ─────────────────────────────────────────────────────
-
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(include_str!("entry_x86_64.s"));
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(include_str!("entry_aarch64.s"));
-
-// ── Limine Requests ──────────────────────────────────────────────────────────
 
 mod init;
 mod syscall;
 mod mem;
 
-/// Global pointer to the boot info structure.
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(include_str!("entry_aarch64.s"));
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(include_str!("entry_x86_64.s"));
+
+#[repr(C, align(16))]
+pub struct Stack<const N: usize>([u8; N]);
+
+#[no_mangle]
+pub static mut EARLY_STACK: Stack<0x10000> = Stack([0u8; 0x10000]);
+
 pub static mut BOOT_INFO_PTR: usize = 0;
 
+// ── Limine Requests ──────────────────────────────────────────────────────────
+
 #[no_mangle]
-#[link_section = ".limine_requests"]
+#[link_section = ".limine_requests_start"]
 #[used]
-pub static LIMINE_BASE_REVISION: [u64; 3] = [0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 0];
+pub static LIMINE_REQUESTS_START_MARKER: [u64; 4] = [0xf6b8f4b39de7d1ae, 0xfab91a6940fcb9cf, 0x785c6ed015d3e316, 0x181e920a7852b9d9];
 
 #[no_mangle]
 #[link_section = ".limine_requests"]
 #[used]
-pub static ENTRY_POINT_REQUEST: boot::limine::EntryPointRequest = boot::limine::EntryPointRequest {
-    id:       [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x13d86c035a1cd3e1, 0x2b0caa89d8f3026a],
+pub static LIMINE_BASE_REVISION: [u64; 3] = [0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 6];
+
+#[no_mangle]
+#[link_section = ".limine_requests"]
+#[used]
+pub static mut KERNEL_ADDR_REQUEST: boot::limine::Request<boot::limine::KernelAddressResponse> = boot::limine::Request {
+    id:       [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x71ba76863bc3007b, 0x87d73f452900c67f],
     revision: 0,
     response: core::cell::UnsafeCell::new(core::ptr::null()),
-    entry_point: crate::_start,
 };
 
 #[no_mangle]
@@ -71,7 +55,7 @@ pub static mut HHDM_REQUEST: boot::limine::Request<boot::limine::HhdmResponse> =
 #[no_mangle]
 #[link_section = ".limine_requests"]
 #[used]
-pub static MEMMAP_REQUEST: boot::limine::Request<boot::limine::MemMapResponse> = boot::limine::Request {
+pub static mut MEMMAP_REQUEST: boot::limine::Request<boot::limine::MemMapResponse> = boot::limine::Request {
     id:       [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x67cf3d9d378a806f, 0xe304acdfc50c3c62],
     revision: 0,
     response: core::cell::UnsafeCell::new(core::ptr::null()),
@@ -80,7 +64,7 @@ pub static MEMMAP_REQUEST: boot::limine::Request<boot::limine::MemMapResponse> =
 #[no_mangle]
 #[link_section = ".limine_requests"]
 #[used]
-pub static FRAMEBUFFER_REQUEST: boot::limine::Request<boot::limine::FramebufferResponse> = boot::limine::Request {
+pub static mut FRAMEBUFFER_REQUEST: boot::limine::Request<boot::limine::FramebufferResponse> = boot::limine::Request {
     id:       [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, 0x9d5827dcd881dd75, 0xa3148604f6fab11b],
     revision: 0,
     response: core::cell::UnsafeCell::new(core::ptr::null()),
@@ -104,239 +88,156 @@ pub static mut MODULE_REQUEST: boot::limine::Request<boot::limine::ModuleRespons
     response: core::cell::UnsafeCell::new(core::ptr::null()),
 };
 
+#[no_mangle]
+#[link_section = ".limine_requests_end"]
+#[used]
+pub static LIMINE_REQUESTS_END_MARKER: [u64; 2] = [0xadc0e0531bb10d03, 0x9572709f31764c62];
+
+#[global_allocator]
+static ALLOCATOR: mm::slab::SlabAllocator = mm::slab::SlabAllocator;
+
 // ── Serial port ──────────────────────────────────────────────────────────────
 
-#[cfg(target_arch = "x86_64")]
-unsafe fn early_serial_init() {
-    use core::arch::asm;
-    macro_rules! outb {
-        ($port:expr, $val:expr) => {
-            asm!("out dx, al", in("dx") $port as u16, in("al") $val as u8,
-                 options(nomem, nostack));
-        }
+pub fn serial_write_byte(b: u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        arch_x86_64::putc(b);
     }
-    outb!(0x3F9, 0x00u8);
-    outb!(0x3FB, 0x80u8);
-    outb!(0x3F8, 0x01u8);
-    outb!(0x3F9, 0x00u8);
-    outb!(0x3FB, 0x03u8);
-    outb!(0x3FA, 0xC7u8);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // Direct write to UART data register (assuming QEMU virt base)
+        core::arch::asm!(
+            "str {val:w}, [{base}]",
+            val = in(reg) b as u32,
+            base = in(reg) 0x09000000usize,
+            options(nostack, nomem)
+        );
+    }
 }
 
-#[cfg(target_arch = "aarch64")]
-unsafe fn early_serial_init() {}
+#[no_mangle]
+pub unsafe extern "C" fn arch_serial_putc(c: u8) {
+    serial_write_byte(c);
+}
 
 #[no_mangle]
+pub unsafe extern "C" fn serial_print_bytes(ptr: *const u8, len: usize) {
+    let slice = core::slice::from_raw_parts(ptr, len);
+    for &b in slice { serial_write_byte(b); }
+}
+
 pub fn serial_read_byte() -> Option<u8> {
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        use core::arch::asm;
-        let mut status: u8;
-        asm!("in al, dx", out("al") status, in("dx") 0x3FDu16, options(nomem, nostack));
-        if status & 0x01 != 0 {
-            let mut b: u8;
-            asm!("in al, dx", out("al") b, in("dx") 0x3F8u16, options(nomem, nostack));
-            return Some(b);
-        }
-        return None;
-    }
+    unsafe { arch_x86_64::serial_read_byte() }
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let base = 0x09000000usize;
-        let fr = (base + 0x18) as *const u32;
-        if fr.read_volatile() & (1 << 4) != 0 { return None; }
-        let dr = base as *const u32;
-        Some((dr.read_volatile() & 0xFF) as u8)
-    }
+    None
 }
 
-#[no_mangle]
 pub fn serial_has_data() -> bool {
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        use core::arch::asm;
-        let mut status: u8;
-        asm!("in al, dx", out("al") status, in("dx") 0x3FDu16, options(nomem, nostack));
-        return status & 0x01 != 0;
-    }
+    unsafe { arch_x86_64::serial_has_data() }
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let base = 0x09000000usize;
-        let fr = (base + 0x18) as *const u32;
-        return fr.read_volatile() & (1 << 4) == 0;
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     false
 }
 
-#[no_mangle]
-pub unsafe fn serial_write_byte(b: u8) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use core::arch::asm;
-        loop {
-            let mut status: u8;
-            asm!("in al, dx", out("al") status, in("dx") 0x3FDu16, options(nomem, nostack));
-            if status & 0x20 != 0 { break; }
-        }
-        asm!("out dx, al", in("dx") 0x3F8u16, in("al") b, options(nomem, nostack));
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        let base = 0x09000000usize;
-        let fr = (base + 0x18) as *const u32;
-        while fr.read_volatile() & (1 << 5) != 0 {}
-        let dr = base as *mut u32;
-        dr.write_volatile(b as u32);
-    }
+pub fn serial_write_raw(msg: &[u8]) {
+    for &b in msg { serial_write_byte(b); }
 }
 
-pub fn serial_print(s: &str) {
-    for b in s.bytes() {
-        unsafe { serial_write_byte(b); }
-        if b == b'\n' { unsafe { serial_write_byte(b'\r'); } }
-    }
+pub fn serial_print(msg: &str) {
+    serial_write_raw(msg.as_bytes());
 }
 
-#[no_mangle]
-pub fn serial_write_raw(buf: &[u8]) {
-    for &b in buf { unsafe { serial_write_byte(b); } }
-}
-
-#[no_mangle]
-pub extern "C" fn serial_print_bytes(ptr: *const u8, len: usize) {
-    if ptr.is_null() { return; }
-    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-    serial_write_raw(bytes);
-}
-
-fn print_number(n: u32) {
+pub fn print_number(n: u32) {
+    if n == 0 { serial_write_byte(b'0'); return; }
     let mut buf = [0u8; 10];
-    if n == 0 {
-        serial_print("0");
-        return;
-    }
-    let mut i = 10usize;
-    let mut val = n;
-    while val > 0 {
-        i -= 1;
-        buf[i] = b'0' + (val % 10) as u8;
-        val /= 10;
-    }
-    let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
-    serial_print(s);
+    let mut i = 0;
+    let mut num = n;
+    while num > 0 { buf[i] = b'0' + (num % 10) as u8; num /= 10; i += 1; }
+    for j in (0..i).rev() { serial_write_byte(buf[j]); }
 }
 
 pub fn print_hex(n: usize) {
-    serial_print("0x");
     let digits = b"0123456789ABCDEF";
-    for i in (0..core::mem::size_of::<usize>() * 2).rev() {
-        let digit = (n >> (i * 4)) & 0xF;
-        unsafe { serial_write_byte(digits[digit]); }
-    }
+    serial_print("0x");
+    for i in (0..16).rev() { serial_write_byte(digits[(n >> (i * 4)) & 0xF]); }
 }
 
-// ── Kernel main ───────────────────────────────────────────────────────────────
-
-#[repr(C, align(16))]
-struct Stack<const N: usize>([u8; N]);
-
-#[no_mangle]
-static mut EARLY_STACK: Stack<0x10000> = Stack([0; 0x10000]);
-
-extern "C" {
-    fn _start() -> !;
-}
+// ── Kernel Entry ─────────────────────────────────────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
-    unsafe {
-        core::ptr::read_volatile(&raw const LIMINE_BASE_REVISION as *const _);
-        core::ptr::read_volatile(&raw const ENTRY_POINT_REQUEST as *const _);
-        core::ptr::read_volatile(&raw const HHDM_REQUEST as *const _);
-        core::ptr::read_volatile(&raw const MEMMAP_REQUEST as *const _);
-        core::ptr::read_volatile(&raw const FRAMEBUFFER_REQUEST as *const _);
-        core::ptr::read_volatile(&raw const RSDP_REQUEST as *const _);
-        core::ptr::read_volatile(&raw const MODULE_REQUEST as *const _);
-        early_serial_init();
-    }
+    serial_write_byte(b'M');
+    serial_write_byte(b'1');
+
     serial_print("\n[CYANOS] Kernel starting...\n");
 
-    serial_print("[INIT] Parsing boot info...\n");
-    let mut boot_info = if boot_info_addr == 0 {
+    let is_limine = unsafe {
+        let resp_ptr = *HHDM_REQUEST.response.get();
+        !resp_ptr.is_null()
+    };
+
+    let mut boot_info = if is_limine {
         unsafe { boot::limine::parse() }
     } else {
-        unsafe { boot::multiboot2::parse(boot_info_addr) }
+        #[cfg(target_arch = "x86_64")]
+        { unsafe { boot::multiboot2::parse(boot_info_addr) } }
+        #[cfg(target_arch = "aarch64")]
+        { unsafe { boot::device_tree::parse(boot_info_addr) } }
     };
-    
-    // Store global pointer for syscalls
-    unsafe { BOOT_INFO_PTR = core::ptr::addr_of!(boot_info) as usize; }
 
-    if boot_info_addr == 0 {
+    if is_limine {
         unsafe {
-            let resp_ptr = core::ptr::read_volatile(ENTRY_POINT_REQUEST.response.get());
-            if !resp_ptr.is_null() {
-                serial_print("  DEBUG: ENTRY_POINT_REQUEST satisfied!\n");
-            } else {
-                serial_print("  DEBUG: ENTRY_POINT_REQUEST NOT satisfied\n");
-            }
-        }
-
-        unsafe {
-            let resp_ptr = core::ptr::read_volatile(MODULE_REQUEST.response.get());
+            let resp_ptr = *MODULE_REQUEST.response.get();
             if !resp_ptr.is_null() {
                 let resp = &*resp_ptr;
-                serial_print("  DEBUG: MODULE_REQUEST satisfied! count: ");
-                print_number(resp.module_count as u32);
-                serial_print("\n");
                 if resp.module_count > 0 {
                     let module = &**resp.modules;
-                    // Limine provides virtual address in HHDM; convert to physical.
                     boot_info.initrd_base = (module.address as u64).saturating_sub(boot_info.hhdm_offset);
                     boot_info.initrd_size = module.size;
                 }
-            } else {
-                serial_print("  DEBUG: MODULE_REQUEST NOT satisfied\n");
             }
         }
 
-        let resp_ptr = unsafe { core::ptr::read_volatile(HHDM_REQUEST.response.get()) };
+        let resp_ptr = unsafe { *HHDM_REQUEST.response.get() };
         if !resp_ptr.is_null() {
             let resp = unsafe { &*resp_ptr };
             boot_info.hhdm_offset = resp.offset;
-            serial_print("  HHDM Offset: ");
-            print_hex(boot_info.hhdm_offset as usize);
-            serial_print("\n");
-        } else {
-            serial_print("  WARNING: HHDM Request NOT satisfied, using fallback\n");
-            boot_info.hhdm_offset = 0xffff800000000000;
         }
-
-        #[cfg(target_arch = "x86_64")]
-        unsafe { arch_x86_64::apic::set_hhdm_offset(boot_info.hhdm_offset); }
     }
+
+    mm::init_with_map(boot_info.memory_regions(), boot_info.hhdm_offset as usize);
+    serial_print("  mm::phys_to_virt(0) = ");
+    print_hex(mm::phys_to_virt(0));
+    serial_print("\n");
 
     serial_print("[INIT] Architecture-specific init...\n");
     #[cfg(target_arch = "x86_64")]
-    arch_x86_64::init(&boot_info);
+    { arch_x86_64::init(&boot_info); }
     #[cfg(target_arch = "aarch64")]
-    arch_aarch64::init(&boot_info);
-
-    serial_print("[INIT] Memory management init...\n");
-    mm::init_with_map(boot_info.memory_regions(), boot_info.hhdm_offset as usize);
+    { arch_aarch64::init(&boot_info); }
 
     serial_print("[INIT] Scheduler init...\n");
     sched::init();
 
-    serial_print("[INIT] Spawning init task...\n");
+    unsafe {
+        BOOT_INFO_PTR = &boot_info as *const _ as usize;
+    }
     init::init_task_main(&boot_info);
 }
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    serial_print("\n[CYANOS] KERNEL PANIC: ");
-    if let Some(msg) = info.message().as_str() {
-        serial_print(msg);
+struct SerialWriter;
+impl core::fmt::Write for SerialWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        serial_print(s);
+        Ok(())
     }
+}
+
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    serial_print("\n[CYANOS] KERNEL PANIC: ");
+    let mut writer = SerialWriter;
+    let _ = core::fmt::write(&mut writer, core::format_args!("{}", info));
     loop { core::hint::spin_loop(); }
 }
