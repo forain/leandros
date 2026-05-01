@@ -57,8 +57,13 @@ multiboot2_header_end:
 
     .section .text
     .code64
-    .global _start
-_start:
+    .globl _start
+    _start:
+
+
+
+
+
     cli
 
     // ── Detect boot protocol ──────────────────────────────────────────────────

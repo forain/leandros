@@ -48,9 +48,9 @@ pub fn init(info: &boot::BootInfo) {
         );
 
         // Initialise PL011 UART for early debug output.
-        uart::init();
+        // uart::init(); // UART already initialized by assembly/Limine.
     }
-    exception::init();
+    // exception::init() is disabled for Limine boots as it currently causes sync exceptions.
     gic::init();
     timer::init();
 

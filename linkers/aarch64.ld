@@ -3,24 +3,19 @@ OUTPUT_FORMAT("elf64-littleaarch64", "elf64-littleaarch64", "elf64-littleaarch64
 
 PHDRS
 {
-    limine_requests PT_LOAD;
-    text PT_LOAD;
-    rodata PT_LOAD;
-    data PT_LOAD;
+    limine_requests PT_LOAD FLAGS(6);
+    text PT_LOAD FLAGS(5);
+    rodata PT_LOAD FLAGS(4);
+    data PT_LOAD FLAGS(6);
 }
 
 SECTIONS
 {
     . = 0xffffffff80000000;
 
-    .limine_requests : {
-        KEEP(*(.limine_reqs))
-    } :limine_requests
-
-    . = ALIGN(4K);
-
     .text : {
         __text_start = .;
+        KEEP(*(.text.boot))
         *(.text .text.*)
         __text_end = .;
     } :text
@@ -42,6 +37,11 @@ SECTIONS
         *(.got .got.*)
         *(.data.rel.ro .data.rel.ro.*)
         *(.tdata .tdata.*)
+        /* ── Limine request structures ────────────────────────────────────────── */
+        . = ALIGN(8);
+        KEEP(*(.limine_requests_start))
+        KEEP(*(.limine_requests))
+        KEEP(*(.limine_requests_end))
         __data_end = .;
     } :data
 
@@ -51,6 +51,7 @@ SECTIONS
         *(.bss .bss.*)
         *(.tbss .tbss.*)
         *(COMMON)
+        . = ALIGN(8);
         PROVIDE(__bss_end = .);
     } :data
 

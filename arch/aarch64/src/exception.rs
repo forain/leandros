@@ -823,21 +823,11 @@ unsafe extern "C" fn irq_dispatch() {
 /// EL1 synchronous exception — always a kernel bug; panic with diagnostics.
 #[no_mangle]
 unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
-    // Get additional fault information
-    #[cfg(target_arch = "aarch64")]
-    let far: u64 = {
-        let far: u64;
-        core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
-        far
-    };
-    #[cfg(not(target_arch = "aarch64"))]
-    let far: u64 = 0;
-
-    // Print detailed data abort information
-    print_detailed_data_abort_info(esr, elr, far);
-
-    // This is a real kernel fault - we need to panic and debug the issue
-    panic!("EL1 sync exception: ESR={:#010x} ELR={:#010x} FAR={:#010x}", esr, elr, far);
+    extern "C" { fn arch_serial_putc(b: u8); }
+    let msg = b"\n[EXCEPTION] EL1 Sync! ESR=";
+    for &b in msg { arch_serial_putc(b); }
+    // Just loop for life confirmation
+    loop { core::hint::spin_loop(); }
 }
 
 /// Print detailed information about data abort exceptions for debugging
