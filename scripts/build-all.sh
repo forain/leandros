@@ -1,5 +1,5 @@
 #!/bin/bash
-# CyanOS Cross-Platform Build Script
+# LeandrOS Cross-Platform Build Script
 # Builds userland, kernel, and generates disk images
 
 set -e  # Exit on any error
@@ -28,7 +28,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "🚀 CyanOS Build Process Started"
+echo "🚀 LeandrOS Build Process Started"
 echo "🏗️  Architecture(s): $ARCH"
 
 ROOT_DIR=$(pwd)
@@ -121,8 +121,8 @@ build_kernel() {
 # Function to convert raw image to VDI
 convert_to_vdi() {
     local arch=$1
-    local raw_image="cyanos-limine-$arch.img"
-    local vdi_image="cyanos-limine-$arch.vdi"
+    local raw_image="leandros-limine-$arch.img"
+    local vdi_image="leandros-limine-$arch.vdi"
     if command -v VBoxManage &> /dev/null; then
         rm -f "$vdi_image"
         VBoxManage convertfromraw "$raw_image" "$vdi_image" --format VDI >/dev/null 2>&1
@@ -133,7 +133,7 @@ convert_to_vdi() {
 create_disk_image() {
     local arch=$1
     local limine_dir="$2"
-    local image_name="cyanos-limine-$arch.img"
+    local image_name="leandros-limine-$arch.img"
     echo "💽 Creating $arch disk image..."
     dd if=/dev/zero of="$image_name" bs=1M count=64 2>/dev/null
     if command -v sgdisk &> /dev/null; then
@@ -143,7 +143,7 @@ create_disk_image() {
     fi
     local temp_fat="temp_fat_$arch.img"
     rm -f "$temp_fat"
-    mkfs.fat -C "$temp_fat" 61440 -F 32 -n CYANOS >/dev/null 2>&1
+    mkfs.fat -C "$temp_fat" 61440 -F 32 -n LEANDROS >/dev/null 2>&1
     mmd -i "$temp_fat" ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
     
     local boot_efi=$([[ "$arch" == "aarch64" ]] && echo "BOOTAA64.EFI" || echo "BOOTX64.EFI")

@@ -1,6 +1,6 @@
 #!/bin/bash
-# CyanOS Cross-Platform QEMU Runner Script
-# Boots CyanOS on both AArch64 and x86_64 architectures
+# LeandrOS Cross-Platform QEMU Runner Script
+# Boots LeandrOS on both AArch64 and x86_64 architectures
 
 set -e  # Exit on any error
 
@@ -112,7 +112,7 @@ if [ "$ARCH" = "aarch64" ]; then
         CPU_ARGS="-cpu host"
     fi
     
-    DISK_IMAGE="cyanos-limine-aarch64.img"
+    DISK_IMAGE="leandros-limine-aarch64.img"
     KERNEL_DIRECT="target/final-aarch64/kernel-direct"
     FW_PATHS=("${AARCH64_FW_PATHS[@]}")
     VARS_TEMPLATES=("${AARCH64_VARS_TEMPLATES[@]}")
@@ -129,14 +129,14 @@ else
         CPU_ARGS="-cpu host"
     fi
     
-    DISK_IMAGE="cyanos-limine-x86_64.img"
+    DISK_IMAGE="leandros-limine-x86_64.img"
     KERNEL_DIRECT="target/final-x86_64/kernel-direct"
     FW_PATHS=("${X86_64_FW_PATHS[@]}")
     VARS_TEMPLATES=("${X86_64_VARS_TEMPLATES[@]}")
     VARS_FILE="x86_64_vars.fd"
 fi
 
-echo "🚀 Starting CyanOS ($ARCH) in $BOOT_MODE mode"
+echo "🚀 Starting LeandrOS ($ARCH) in $BOOT_MODE mode"
 echo "💻 Host: $OS ($HOST_ARCH)"
 echo "=========================================="
 

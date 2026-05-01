@@ -48,7 +48,7 @@ pub unsafe fn write(off: usize, val: u32) {
     ((LAPIC_BASE + off) as *mut u32).write_volatile(val)
 }
 
-unsafe fn rdmsr(msr: u32) -> u64 {
+pub unsafe fn rdmsr(msr: u32) -> u64 {
     let lo: u32;
     let hi: u32;
     core::arch::asm!(

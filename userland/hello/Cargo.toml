@@ -8,4 +8,4 @@ name = "hello"
 path = "src/main.rs"
 
 [dependencies]
-cyanos-libc = { path = "../libc" }
+leandros-libc = { path = "../libc" }

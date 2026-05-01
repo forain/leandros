@@ -1,6 +1,6 @@
 /* AArch64 linker script for Raspberry Pi 5
  *
- * The RPi5 firmware (config.txt: kernel=cyanos.elf) reads ELF PT_LOAD
+ * The RPi5 firmware (config.txt: kernel=leandros.elf) reads ELF PT_LOAD
  * segments and loads the kernel at the address specified by the ELF header.
  * The standard RPi load address is 0x80000; firmware maps the first 2 GiB
  * of DRAM starting at physical 0x0.

@@ -71,7 +71,7 @@ pub unsafe extern "C" fn sched_yield() -> i32 {
     syscall0(nr::SCHED_YIELD) as i32
 }
 
-/// Return the real user ID (always 0 on Cyanos for now).
+/// Return the real user ID (always 0 on Leandros for now).
 #[no_mangle]
 pub unsafe extern "C" fn getuid() -> u32 {
     syscall0(nr::GETUID) as u32

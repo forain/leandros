@@ -1,8 +1,8 @@
-# CyanOS Release - Keyboard Interactive Shell Support
+# LeandrOS Release - Keyboard Interactive Shell Support
 
 ## 🎯 Release Overview
 
-This release adds **full keyboard input support** to CyanOS, enabling interactive shell usage through keyboard input in QEMU and other platforms.
+This release adds **full keyboard input support** to LeandrOS, enabling interactive shell usage through keyboard input in QEMU and other platforms.
 
 ## ✅ New Features
 
@@ -10,7 +10,7 @@ This release adds **full keyboard input support** to CyanOS, enabling interactiv
 - **Real-time keyboard input processing** - Type commands and see characters appear immediately
 - **Backspace/Delete support** - Edit commands with visual feedback
 - **Enter key command execution** - Submit commands by pressing Enter
-- **Command prompt interface** - Clean `cyanos> ` prompt for user interaction
+- **Command prompt interface** - Clean `leandros> ` prompt for user interaction
 
 ### Enhanced User Experience
 - **Character echoing** - See what you type as you type it
@@ -73,8 +73,8 @@ qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 256M -nographic \
 ```
 
 ### Interactive Usage
-1. Boot CyanOS in QEMU
-2. Wait for the `cyanos> ` prompt
+1. Boot LeandrOS in QEMU
+2. Wait for the `leandros> ` prompt
 3. Type commands like `help`, `info`, `test`
 4. Use backspace to edit commands
 5. Press Enter to execute commands
@@ -150,14 +150,14 @@ qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 256M -nographic \
 
 ## 🎉 Summary
 
-This release marks a significant milestone in CyanOS usability. The addition of interactive keyboard input transforms CyanOS from a demonstration system to a usable interactive operating system. Users can now:
+This release marks a significant milestone in LeandrOS usability. The addition of interactive keyboard input transforms LeandrOS from a demonstration system to a usable interactive operating system. Users can now:
 
 - **Type commands naturally** instead of watching demos
 - **Edit their input** with backspace support
 - **See immediate feedback** from the system
 - **Explore the system** through built-in commands
 
-The implementation leverages existing kernel infrastructure while adding a polished user interface layer, demonstrating the power and flexibility of the CyanOS microkernel architecture.
+The implementation leverages existing kernel infrastructure while adding a polished user interface layer, demonstrating the power and flexibility of the LeandrOS microkernel architecture.
 
 ---
 

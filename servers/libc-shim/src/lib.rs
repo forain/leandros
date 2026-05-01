@@ -1,9 +1,9 @@
-//! Cyanos libc shim — user-space runtime helper.
+//! Leandros libc shim — user-space runtime helper.
 //!
 //! This library is linked into every user-space binary (before `libc.a`) to:
 //!
-//!  1. Parse the kernel's auxv on startup and cache the Cyanos-private entries
-//!     (e.g. `AT_CYANOS_VFS_PORT = 256`) in `static` variables accessible from
+//!  1. Parse the kernel's auxv on startup and cache the Leandros-private entries
+//!     (e.g. `AT_LEANDROS_VFS_PORT = 256`) in `static` variables accessible from
 //!     C and Rust user-space code.
 //!
 //!  2. Provide `getauxval(type)` — musl has its own internal implementation,
@@ -16,7 +16,7 @@
 //!
 //! # Initialisation
 //!
-//! Call `cyanos_shim_init_from_sp(sp)` from `_start` with the initial stack
+//! Call `leandros_shim_init_from_sp(sp)` from `_start` with the initial stack
 //! pointer (which points at `argc`).  The function walks past argc/argv/envp to
 //! find the auxv array and caches all known entries.
 //!
@@ -58,7 +58,7 @@ fn panic(_: &PanicInfo) -> ! {
 const AT_NULL:            usize = 0;
 const AT_PAGESZ:          usize = 6;
 const AT_RANDOM:          usize = 25;
-const AT_CYANOS_VFS_PORT: usize = 256; // Cyanos-private
+const AT_LEANDROS_VFS_PORT: usize = 256; // Leandros-private
 
 // ── Cached auxv values ────────────────────────────────────────────────────────
 
@@ -71,19 +71,19 @@ static AUX_VFS_PORT: AtomicU32   = AtomicU32::new(u32::MAX);
 
 /// Return the kernel page size (`AT_PAGESZ`).
 #[no_mangle]
-pub extern "C" fn cyanos_page_size() -> usize {
+pub extern "C" fn leandros_page_size() -> usize {
     AUX_PAGESZ.load(Ordering::Relaxed)
 }
 
 /// Return the pointer to 16 bytes of random seed data (`AT_RANDOM`).
 #[no_mangle]
-pub extern "C" fn cyanos_random_ptr() -> usize {
+pub extern "C" fn leandros_random_ptr() -> usize {
     AUX_RANDOM.load(Ordering::Relaxed)
 }
 
-/// Return the Cyanos VFS server IPC port, or `u32::MAX` if not registered.
+/// Return the Leandros VFS server IPC port, or `u32::MAX` if not registered.
 #[no_mangle]
-pub extern "C" fn cyanos_vfs_port() -> u32 {
+pub extern "C" fn leandros_vfs_port() -> u32 {
     AUX_VFS_PORT.load(Ordering::Relaxed)
 }
 
@@ -97,7 +97,7 @@ pub extern "C" fn getauxval(r#type: usize) -> usize {
     match r#type {
         AT_PAGESZ             => AUX_PAGESZ.load(Ordering::Relaxed),
         AT_RANDOM             => AUX_RANDOM.load(Ordering::Relaxed),
-        AT_CYANOS_VFS_PORT    => AUX_VFS_PORT.load(Ordering::Relaxed) as usize,
+        AT_LEANDROS_VFS_PORT    => AUX_VFS_PORT.load(Ordering::Relaxed) as usize,
         _                     => 0,
     }
 }
@@ -113,7 +113,7 @@ pub extern "C" fn getauxval(r#type: usize) -> usize {
 ///
 /// `auxv_ptr` must be a valid, properly terminated auxv from the kernel.
 #[no_mangle]
-pub unsafe extern "C" fn cyanos_shim_init(auxv_ptr: *const usize) {
+pub unsafe extern "C" fn leandros_shim_init(auxv_ptr: *const usize) {
     if auxv_ptr.is_null() { return; }
     let mut p = auxv_ptr;
     loop {
@@ -123,7 +123,7 @@ pub unsafe extern "C" fn cyanos_shim_init(auxv_ptr: *const usize) {
             AT_NULL            => break,
             AT_PAGESZ          => { AUX_PAGESZ.store(val, Ordering::Relaxed); }
             AT_RANDOM          => { AUX_RANDOM.store(val, Ordering::Relaxed); }
-            AT_CYANOS_VFS_PORT => { AUX_VFS_PORT.store(val as u32, Ordering::Relaxed); }
+            AT_LEANDROS_VFS_PORT => { AUX_VFS_PORT.store(val as u32, Ordering::Relaxed); }
             _                  => {}
         }
         p = unsafe { p.add(2) };
@@ -133,14 +133,14 @@ pub unsafe extern "C" fn cyanos_shim_init(auxv_ptr: *const usize) {
 /// Initialise the shim from an `_start`-style initial stack pointer.
 ///
 /// Walks past argc/argv/envp on the stack to locate the auxv array, then
-/// calls [`cyanos_shim_init`].
+/// calls [`leandros_shim_init`].
 ///
 /// # Safety
 ///
 /// `sp` must be the initial stack pointer provided by the kernel, pointing
 /// at `argc`.
 #[no_mangle]
-pub unsafe extern "C" fn cyanos_shim_init_from_sp(sp: *const usize) {
+pub unsafe extern "C" fn leandros_shim_init_from_sp(sp: *const usize) {
     if sp.is_null() { return; }
     let argc = unsafe { sp.read() };
     // argv starts at sp+1; the null terminator is at sp+1+argc.
@@ -151,7 +151,7 @@ pub unsafe extern "C" fn cyanos_shim_init_from_sp(sp: *const usize) {
     }
     // p is now the envp null terminator; auxv immediately follows.
     let auxv = unsafe { p.add(1) };
-    cyanos_shim_init(auxv);
+    leandros_shim_init(auxv);
 }
 
 // ── IPC message layout (Phase 6+) ────────────────────────────────────────────

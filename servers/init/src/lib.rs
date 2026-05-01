@@ -1,4 +1,4 @@
-//! Cyanos PID-1 init server.
+//! Leandros PID-1 init server.
 //!
 //! Called from `kernel/src/init.rs`.  Runs a POSIX smoke-test suite, then a
 //! shell demo that exercises the full userland API surface.
@@ -1144,7 +1144,7 @@ fn cmd_ls(path: &[u8]) {
 }
 
 fn cmd_uname() {
-    kprintln!("Cyanos 1.0.0 #1 SMP aarch64/x86_64");
+    kprintln!("Leandros 1.0.0 #1 SMP aarch64/x86_64");
 }
 
 fn cmd_pwd() {
@@ -1268,7 +1268,7 @@ fn cmd_ps() {
     kprintln!("  PID TTY      STAT  COMMAND");
     let pid = sched::current_pid();
     kprint!("    "); kraw!(&u32_dec(pid).0[..u32_dec(pid).1]);
-    kprintln!(" ttyS0   R     cyanos-init");
+    kprintln!(" ttyS0   R     leandros-init");
 }
 
 fn cmd_free() {
@@ -2532,12 +2532,12 @@ fn dispatch_command(line: &[u8]) -> bool {
 
 fn run_shell() -> ! {
     kprintln!("[init] ═══════════════════════════════════════════");
-    kprintln!("[init] Cyanos interactive shell");
+    kprintln!("[init] Leandros interactive shell");
     kprintln!("[init] Type 'help' for available commands.");
     kprintln!("[init] ═══════════════════════════════════════════");
     let mut line = [0u8; 256];
     loop {
-        kraw!(b"cyanos> ");
+        kraw!(b"leandros> ");
         let n = readline(&mut line);
         if n == 0 { continue; }
         if !dispatch_command(&line[..n]) {

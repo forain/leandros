@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Deploy the Cyanos kernel to a USB drive for bare-metal x86-64 boot.
+# Deploy the Leandros kernel to a USB drive for bare-metal x86-64 boot.
 #
 # Usage:
 #   ./deploy-x86_64.sh <kernel.elf> <device>
 #
 # Example:
-#   ./deploy-x86_64.sh target/x86_64-unknown-none/release/cyanos /dev/sdb
+#   ./deploy-x86_64.sh target/x86_64-unknown-none/release/leandros /dev/sdb
 #
 # This script reuses the same FAT32 image built by run-x86_64.sh and writes
 # it to the target USB device with dd.  The device is overwritten completely —
@@ -84,7 +84,7 @@ trap 'rm -f "$LIMINE_CFG"' EXIT
 cat > "$LIMINE_CFG" <<'EOF'
 timeout: 0
 
-/Cyanos
+/Leandros
     protocol: limine
     path: boot():/kernel.elf
     kaslr: no
@@ -93,7 +93,7 @@ EOF
 # Build FAT32 image.
 echo "[disk] Building $DISK_SIZE_MB MiB FAT32 disk image..."
 dd if=/dev/zero of="$DISK" bs=1M count="$DISK_SIZE_MB" status=none
-mkfs.fat -F 32 -n CYANOS "$DISK" >/dev/null
+mkfs.fat -F 32 -n LEANDROS "$DISK" >/dev/null
 
 mmd   -i "$DISK" ::/EFI
 mmd   -i "$DISK" ::/EFI/BOOT

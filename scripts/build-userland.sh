@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Cyanos user-space programs.
+# Build Leandros user-space programs.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

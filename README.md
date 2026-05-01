@@ -1,8 +1,8 @@
-# Cyanos
+# Leandros
 
 A `no_std` bare-metal microkernel written in Rust, targeting **x86-64** (UEFI/QEMU) and **AArch64** (QEMU virt, Raspberry Pi 5).
 
-Cyanos follows the classic microkernel design: the kernel itself provides only scheduling, IPC, and memory management. Everything else — drivers, file systems, network stacks — runs as isolated user-space tasks that communicate via typed message passing.
+Leandros follows the classic microkernel design: the kernel itself provides only scheduling, IPC, and memory management. Everything else — drivers, file systems, network stacks — runs as isolated user-space tasks that communicate via typed message passing.
 
 ---
 
@@ -55,7 +55,7 @@ Cyanos follows the classic microkernel design: the kernel itself provides only s
 | `drivers` | PL011/16550 serial, linear framebuffer |
 | `drivers/usb` | xHCI host controller |
 | `drivers/wifi` | mac80211 + virtio-wifi |
-| `userland` | User-space programs (init, shell, hello) with cyanos-libc |
+| `userland` | User-space programs (init, shell, hello) with leandros-libc |
 | `lib` | `align_up` / `align_down` utilities shared across crates |
 
 ---
@@ -74,7 +74,7 @@ Cyanos follows the classic microkernel design: the kernel itself provides only s
 
 ### Toolchain
 
-Cyanos requires a Rust **nightly** toolchain with bare-metal cross-compilation targets. The `rust-toolchain.toml` at the repo root pins the exact channel and fetches all required components automatically on first build.
+Leandros requires a Rust **nightly** toolchain with bare-metal cross-compilation targets. The `rust-toolchain.toml` at the repo root pins the exact channel and fetches all required components automatically on first build.
 
 ```
 rustup show   # confirms toolchain is active
@@ -284,7 +284,7 @@ Firmware → _start (MMU off, x0 = DTB physical address)
 
 ## Userland programs
 
-CyanOS includes a userland development framework with a minimal C runtime (`cyanos-libc`):
+LeandrOS includes a userland development framework with a minimal C runtime (`leandros-libc`):
 
 ### Built-in programs
 
@@ -302,7 +302,7 @@ CyanOS includes a userland development framework with a minimal C runtime (`cyan
 ./scripts/build-userland.sh
 ```
 
-The userland build system creates statically-linked binaries using a custom `cyanos-libc` that provides:
+The userland build system creates statically-linked binaries using a custom `leandros-libc` that provides:
 - Linux-compatible syscall ABI (AArch64)
 - Basic libc functions (`printf`, `malloc`, `memcpy`, etc.)
 - Process management (`fork`, `exec`, `wait`)

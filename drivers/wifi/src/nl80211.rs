@@ -1,6 +1,6 @@
 //! nl80211 IPC interface — userspace control plane for WiFi.
 //!
-//! In Linux, nl80211 is a Netlink family.  Here we use the Cyanos IPC port system
+//! In Linux, nl80211 is a Netlink family.  Here we use the Leandros IPC port system
 //! to achieve the same: a userspace WiFi manager sends typed messages to the
 //! nl80211 port, which dispatches them to cfg80211 / mac80211.
 

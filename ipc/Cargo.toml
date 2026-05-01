@@ -4,6 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-cyanos-lib = { path = "../lib" }
+leandros-lib = { path = "../lib" }
 sched   = { path = "../sched" }
 spin.workspace = true

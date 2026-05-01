@@ -1,4 +1,4 @@
-# Cyanos build configuration
+# Leandros build configuration
 #
 # rust-toolchain.toml pins the nightly toolchain and pre-fetches both targets,
 # so no manual rustup commands are needed.

@@ -89,8 +89,8 @@ unsafe fn debug_print_userspace_entry() {
     crate::syscall::syscall3(crate::syscall::nr::WRITE, 1, msg.as_ptr() as usize, msg.len());
 }
 
-/// Parse auxv and cache Cyanos-private entries for Stage 2 IPC routing.
-/// Currently a no-op placeholder; Stage 2 will read AT_CYANOS_VFS_PORT etc.
+/// Parse auxv and cache Leandros-private entries for Stage 2 IPC routing.
+/// Currently a no-op placeholder; Stage 2 will read AT_LEANDROS_VFS_PORT etc.
 unsafe fn parse_auxv(mut av: *const usize) {
     const AT_NULL: usize = 0;
     loop {

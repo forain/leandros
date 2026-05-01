@@ -838,7 +838,7 @@ unsafe fn print_detailed_data_abort_info(esr: u64, elr: u64, far: u64) {
     let iss = esr & 0x1FFFFFF;    // Instruction Specific Syndrome
 
     // Print basic info
-    let msg = b"[CYANOS] DETAILED DATA ABORT:\r\n";
+    let msg = b"[LEANDROS] DETAILED DATA ABORT:\r\n";
     for &b in msg { arch_serial_putc(b); }
 
     // Exception Class
