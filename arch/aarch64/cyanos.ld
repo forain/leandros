@@ -46,17 +46,15 @@ SECTIONS
         *(.text .text.*)
     }
 
-    /* ── Read-only data ───────────────────────────────────────────────────── */
-    .rodata ALIGN(4096) : AT(ADDR(.rodata) - KERNEL_OFFSET) {
-        *(.rodata .rodata.*)
-        /* ── Limine request structures ────────────────────────────────────────── */
-        . = ALIGN(8);
-        KEEP(*(.limine_requests))
-    }
-
     /* ── Initialised read-write data ─────────────────────────────────────── */
     .data ALIGN(4096) : AT(ADDR(.data) - KERNEL_OFFSET) {
         *(.data .data.*)
+        /* ── Limine request structures ────────────────────────────────────────── */
+        . = ALIGN(8);
+        KEEP(*(.limine_requests_start))
+        KEEP(*(.limine_requests))
+        KEEP(*(.limine_requests_end))
+    }
         . = ALIGN(4096);
         __bss_start = .;
         *(.bss .bss.*)

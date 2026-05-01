@@ -20,7 +20,10 @@ SECTIONS {
 
     .data : {
         *(.data*)
-        *(.limine_requests*)
+        . = ALIGN(8);
+        KEEP(*(.limine_requests_start))
+        KEEP(*(.limine_requests))
+        KEEP(*(.limine_requests_end))
         . = ALIGN(4096);
         __bss_start = .;
         *(.bss*)

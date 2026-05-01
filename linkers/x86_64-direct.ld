@@ -32,7 +32,10 @@ SECTIONS {
     .data ALIGN(4K) : {
         __rodata_end = .;
         *(.data*)
-        *(.limine_requests*)
+        . = ALIGN(8);
+        KEEP(*(.limine_requests_start))
+        KEEP(*(.limine_requests))
+        KEEP(*(.limine_requests_end))
         . = ALIGN(4K);
         __bss_start = .;
         *(.bss*)
