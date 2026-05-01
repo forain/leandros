@@ -141,3 +141,17 @@ pub unsafe fn free(ptr: *mut u8, size: usize) {
         }
     }
 }
+
+// ── Global Allocator Interface ───────────────────────────────────────────────
+
+pub struct SlabAllocator;
+
+unsafe impl core::alloc::GlobalAlloc for SlabAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        alloc(layout.size()).unwrap_or(core::ptr::null_mut())
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        free(ptr, layout.size())
+    }
+}
