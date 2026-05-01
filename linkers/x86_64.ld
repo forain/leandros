@@ -13,7 +13,6 @@ SECTIONS
     . = 0xffffffff80000000;
 
     .text : {
-        KEEP(*(.limine_requests))
         __text_start = .;
         *(.text .text.*)
         __text_end = .;
@@ -34,6 +33,13 @@ SECTIONS
         __data_start = .;
         *(.data .data.*)
         *(.got .got.*)
+        *(.data.rel.ro .data.rel.ro.*)
+        *(.tdata .tdata.*)
+        /* ── Limine request structures ────────────────────────────────────────── */
+        . = ALIGN(8);
+        KEEP(*(.limine_requests_start))
+        KEEP(*(.limine_requests))
+        KEEP(*(.limine_requests_end))
         __data_end = .;
     } :data
 
