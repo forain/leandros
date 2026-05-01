@@ -38,11 +38,11 @@ pub fn init_from_map(regions: &[boot::MemoryRegion]) {
     for region in regions {
         if region.kind != boot::MemoryType::Available { continue; }
         // Skip the first 2 MiB — reserved for kernel image, page tables, etc.
-        let start = cyanos_lib::align_up(
+        let start = leandros_lib::align_up(
             region.base as usize,
             PAGE_SIZE << (MAX_ORDER - 1),
         );
-        let end = cyanos_lib::align_down(
+        let end = leandros_lib::align_down(
             (region.base + region.length) as usize,
             PAGE_SIZE,
         );

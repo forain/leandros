@@ -284,14 +284,14 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/dev/tty",     data: b"" },
     // /etc
     RamEntry { path: b"/etc/motd",
-               data: b"Welcome to Cyanos!\nType 'help' for available commands.\n" },
+               data: b"Welcome to Leandros!\nType 'help' for available commands.\n" },
     RamEntry { path: b"/etc/passwd",
                data: b"root:x:0:0:root:/root:/bin/sh\ndaemon:x:1:1:daemon:/:/bin/false\n" },
     RamEntry { path: b"/etc/group",
                data: b"root:x:0:root\ndaemon:x:1:\n" },
-    RamEntry { path: b"/etc/hostname", data: b"cyanos\n" },
+    RamEntry { path: b"/etc/hostname", data: b"leandros\n" },
     RamEntry { path: b"/etc/hosts",
-               data: b"127.0.0.1\tlocalhost\n::1\t\tlocalhost\n127.0.0.1\tcyanos\n" },
+               data: b"127.0.0.1\tlocalhost\n::1\t\tlocalhost\n127.0.0.1\tleandros\n" },
     RamEntry { path: b"/etc/resolv.conf",
                data: b"nameserver 8.8.8.8\nnameserver 8.8.4.4\n" },
     RamEntry { path: b"/etc/services",
@@ -301,11 +301,11 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/etc/nsswitch.conf",
                data: b"hosts: files dns\npasswd: files\ngroup: files\n" },
     RamEntry { path: b"/etc/os-release",
-               data: b"NAME=\"Cyanos\"\nVERSION=\"1.0\"\nID=cyanos\nPRETTY_NAME=\"Cyanos 1.0\"\n" },
+               data: b"NAME=\"Leandros\"\nVERSION=\"1.0\"\nID=leandros\nPRETTY_NAME=\"Leandros 1.0\"\n" },
     RamEntry { path: b"/proc/version",
-               data: b"Linux version 6.0.0-cyanos (Cyanos Project) (gcc 13.0)\n" },
+               data: b"Linux version 6.0.0-leandros (Leandros Project) (gcc 13.0)\n" },
     RamEntry { path: b"/proc/cpuinfo",
-               data: b"processor\t: 0\nmodel name\t: Cyanos Virtual CPU\ncpu MHz\t\t: 1000.000\n\
+               data: b"processor\t: 0\nmodel name\t: Leandros Virtual CPU\ncpu MHz\t\t: 1000.000\n\
                        cache size\t: 4096 KB\nflags\t\t: fpu vme de pse tsc msr pae mce\n" },
     RamEntry { path: b"/proc/filesystems",
                data: b"nodev\ttmpfs\nnodev\tramfs\nnodev\tprocfs\n\text2\n" },
@@ -318,9 +318,9 @@ static RAMFS: &[RamEntry] = &[
                    lo:      0       0    0    0    0     0          0         0       0       0    0    0    0     0       0          0\n" },
     RamEntry { path: b"/proc/net/if_inet6",  data: b"" },
     RamEntry { path: b"/proc/net/fib_trie",  data: b"Main:\n  +-- 0.0.0.0/0\n" },
-    RamEntry { path: b"/proc/sys/kernel/hostname",   data: b"cyanos\n" },
+    RamEntry { path: b"/proc/sys/kernel/hostname",   data: b"leandros\n" },
     RamEntry { path: b"/proc/sys/kernel/ostype",     data: b"Linux\n" },
-    RamEntry { path: b"/proc/sys/kernel/osrelease",  data: b"6.0.0-cyanos\n" },
+    RamEntry { path: b"/proc/sys/kernel/osrelease",  data: b"6.0.0-leandros\n" },
     RamEntry { path: b"/proc/sys/vm/overcommit_memory", data: b"0\n" },
 ];
 
@@ -612,7 +612,7 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
 
     if path == b"/proc/self/status" || path.ends_with(b"/status") {
         let mut p = 0;
-        p = write_lit(buf, p, b"Name:\tcyanos\nState:\tR (running)\nPid:\t");
+        p = write_lit(buf, p, b"Name:\tleandros\nState:\tR (running)\nPid:\t");
         p = write_u32(buf, p, pid);
         p = write_lit(buf, p, b"\nPPid:\t");
         p = write_u32(buf, p, ppid);
@@ -627,7 +627,7 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         // Format: pid (comm) state ppid pgid ...
         let mut p = 0;
         p = write_u32(buf, p, pid);
-        p = write_lit(buf, p, b" (cyanos) R ");
+        p = write_lit(buf, p, b" (leandros) R ");
         p = write_u32(buf, p, ppid);
         p = write_lit(buf, p, b" ");
         p = write_u32(buf, p, pgid);
@@ -638,7 +638,7 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
     }
 
     if path == b"/proc/self/cmdline" || path.ends_with(b"/cmdline") {
-        let s = b"cyanos\x00";
+        let s = b"leandros\x00";
         let copy = s.len().min(TMP_BUF_SIZE);
         buf[..copy].copy_from_slice(&s[..copy]);
         return Some(copy);

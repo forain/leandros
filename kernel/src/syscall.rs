@@ -6,7 +6,7 @@
 //!   x86-64:  rax = number, rdi/rsi/rdx/r10/r8/r9 = args, rax = return value
 //!
 //! Syscall numbers match Linux ABI so that musl libc requires no patching.
-//! Cyanos-private syscalls (IPC, spawn) use numbers above 509.
+//! Leandros-private syscalls (IPC, spawn) use numbers above 509.
 
 use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 use alloc::vec::Vec;
@@ -35,8 +35,8 @@ static MMAP_BUMP: AtomicUsize = AtomicUsize::new(0x0000_1000_0000_usize);
 /// IPC port of the VFS server; u32::MAX = not yet registered.
 static VFS_SERVER_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// Auxv tag: Cyanos VFS server port (private, value > AT_MINSIGSTKSZ).
-const AT_CYANOS_VFS_PORT: u64 = 256;
+/// Auxv tag: Leandros VFS server port (private, value > AT_MINSIGSTKSZ).
+const AT_LEANDROS_VFS_PORT: u64 = 256;
 
 /// Register the VFS server port so sys_execve can embed it in auxv.
 pub fn set_vfs_server_port(port: u32) {
@@ -46,8 +46,8 @@ pub fn set_vfs_server_port(port: u32) {
 /// IPC port of the net server; u32::MAX = not yet registered.
 static NET_SERVER_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// Auxv tag: Cyanos net server port.
-const AT_CYANOS_NET_PORT: u64 = 257;
+/// Auxv tag: Leandros net server port.
+const AT_LEANDROS_NET_PORT: u64 = 257;
 
 pub fn set_net_server_port(port: u32) {
     NET_SERVER_PORT.store(port, Ordering::Relaxed);
@@ -109,7 +109,7 @@ fn validate_user_ptr_aligned(ptr: usize, size: usize, align: usize) -> bool {
 // AArch64 and x86-64 use different numbers for the same syscall.  These cfg-
 // gated constants ensure the dispatch table matches what musl/user-space sends.
 
-// ── Cyanos-private (same on all architectures) ────────────────────────────────
+// ── Leandros-private (same on all architectures) ────────────────────────────────
 pub const SYS_IPC_SEND: usize = 511;
 pub const SYS_IPC_RECV: usize = 512;
 pub const SYS_IPC_CALL: usize = 513;
@@ -538,7 +538,7 @@ fn dispatch_inner(
     frame_ptr: usize,
 ) -> isize {
     match number {
-        // ── Cyanos-private IPC syscalls ───────────────────────────────────────
+        // ── Leandros-private IPC syscalls ───────────────────────────────────────
         SYS_IPC_SEND => sys_send(a0, a1, a2),
         SYS_IPC_RECV => sys_recv(a0, a1),
         SYS_IPC_CALL => sys_call(a0, a1, a2),
@@ -787,7 +787,7 @@ fn dispatch_inner(
         // ── File advise / range operations (advisory — safe to no-op) ────────
         POSIX_FADVISE | SYNC_FILE_RANGE | READAHEAD => 0,
 
-        // ── inotify (no filesystem events in Cyanos) ──────────────────────────
+        // ── inotify (no filesystem events in Leandros) ──────────────────────────
         INOTIFY_INIT1 | INOTIFY_ADD_WATCH | INOTIFY_RM_WATCH => -38,
 
         _ => -38, // ENOSYS
@@ -1245,7 +1245,7 @@ fn sys_getrandom(buf_ptr: usize, count: usize, _flags: usize) -> isize {
 /// sys_prctl(option, arg2..5) — process control.
 ///
 /// PR_SET_NAME (15): ignore (we don't track thread names).
-/// PR_GET_NAME (16): write "cyanos\0" to arg2.
+/// PR_GET_NAME (16): write "leandros\0" to arg2.
 /// All others: return 0 (silently ignore).
 fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> isize {
     const PR_SET_NAME: usize = 15;
@@ -1257,7 +1257,7 @@ fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> 
         PR_GET_NAME => {
             // Write a 16-byte NUL-padded thread name.
             if validate_user_buf(arg2, 16) {
-                let name = b"cyanos\0\0\0\0\0\0\0\0\0\0";
+                let name = b"leandros\0\0\0\0\0\0\0\0\0\0";
                 unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), arg2 as *mut u8, 16); }
             }
             0
@@ -1829,7 +1829,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     //   [argv strings, null-terminated]
     //   [16-byte alignment pad]
     //   [AT_NULL pair (0, 0)]
-    //   [AT_CYANOS_VFS_PORT pair]
+    //   [AT_LEANDROS_VFS_PORT pair]
     //   [AT_EGID pair]
     //   [AT_GID pair]
     //   [AT_EUID pair]
@@ -1855,7 +1855,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 
     // pointer table: argc(1) + argv[argc](argc) + null(1) + envp[envc](envc) + null(1)
     let ptr_words = 1 + argc + 1 + envc + 1;
-    // auxv: AT_RANDOM + AT_PAGESZ + AT_UID + AT_EUID + AT_GID + AT_EGID + AT_CYANOS_VFS_PORT + AT_NULL = 8 pairs
+    // auxv: AT_RANDOM + AT_PAGESZ + AT_UID + AT_EUID + AT_GID + AT_EGID + AT_LEANDROS_VFS_PORT + AT_NULL = 8 pairs
     let auxv_words = 8 * 2;
     let total_words = ptr_words + auxv_words;
     let total_ptr_bytes = total_words * W;
@@ -1918,7 +1918,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         (12, 0),                                   // AT_EUID
         (13, 0),                                   // AT_GID
         (14, 0),                                   // AT_EGID
-        (AT_CYANOS_VFS_PORT, VFS_SERVER_PORT.load(Ordering::Relaxed) as u64),
+        (AT_LEANDROS_VFS_PORT, VFS_SERVER_PORT.load(Ordering::Relaxed) as u64),
         (0,  0),                                   // AT_NULL
     ];
     for &(k, v) in auxv {
@@ -2150,8 +2150,8 @@ fn sys_uname(buf_ptr: usize) -> isize {
     unsafe { core::ptr::write_bytes(buf_ptr as *mut u8, 0, UTSNAME_SIZE); }
 
     let fields: [(&[u8], usize); 5] = [
-        (b"Cyanos\0",  0),    // sysname
-        (b"cyanos\0",  65),   // nodename
+        (b"Leandros\0",  0),    // sysname
+        (b"leandros\0",  65),   // nodename
         (b"1.0.0\0",   130),  // release
         (b"#1\0",      195),  // version
         (#[cfg(target_arch = "aarch64")] b"aarch64\0",

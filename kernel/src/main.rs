@@ -1,4 +1,4 @@
-//! Cyanos kernel entry point.
+//! Leandros kernel entry point.
 
 #![no_std]
 #![no_main]
@@ -170,7 +170,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     serial_write_byte(b'M');
     serial_write_byte(b'1');
 
-    serial_print("\n[CYANOS] Kernel starting...\n");
+    serial_print("\n[LEANDROS] Kernel starting...\n");
 
     let is_limine = unsafe {
         let resp_ptr = *HHDM_REQUEST.response.get();
@@ -236,7 +236,7 @@ impl core::fmt::Write for SerialWriter {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    serial_print("\n[CYANOS] KERNEL PANIC: ");
+    serial_print("\n[LEANDROS] KERNEL PANIC: ");
     let mut writer = SerialWriter;
     let _ = core::fmt::write(&mut writer, core::format_args!("{}", info));
     loop { core::hint::spin_loop(); }

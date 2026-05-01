@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Deploy the Cyanos kernel to a Raspberry Pi 5 SD card.
+# Deploy the Leandros kernel to a Raspberry Pi 5 SD card.
 #
 # Usage:
 #   ./deploy-rpi5.sh <kernel.elf> <device>
 #
 # Example:
-#   ./deploy-rpi5.sh target/aarch64-unknown-none/release/cyanos /dev/mmcblk0
+#   ./deploy-rpi5.sh target/aarch64-unknown-none/release/leandros /dev/mmcblk0
 #
 # The SD card must already have a FAT32 boot partition (partition 1).
 # This script mounts partition 1, copies kernel.elf and config.txt, then unmounts.
@@ -15,7 +15,7 @@
 #   SoC ROM → firmware (start4.elf) → config.txt → kernel.elf (bare ELF/bin)
 #
 # The kernel is loaded at the address specified by kernel_address in config.txt.
-# Cyanos entry point must be at that address (0x80000 by default for AArch64).
+# Leandros entry point must be at that address (0x80000 by default for AArch64).
 #
 # Requirements:
 #   sudo apt install mount util-linux   (usually pre-installed)

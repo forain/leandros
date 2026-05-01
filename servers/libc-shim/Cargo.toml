@@ -1,16 +1,16 @@
 [package]
-name = "cyanos-libc-shim"
+name = "leandros-libc-shim"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 # Built as a static library; linked into every user-space binary before libc.a.
 [lib]
-name = "cyanos_libc_shim"
+name = "leandros_libc_shim"
 crate-type = ["staticlib"]
 
 [dependencies]
-cyanos-lib = { path = "../../lib" }
+leandros-lib = { path = "../../lib" }
 
 [features]
 default = []

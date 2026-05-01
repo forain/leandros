@@ -1,14 +1,14 @@
-//! CyanOS Shell - userspace shell program
+//! LeandrOS Shell - userspace shell program
 //!
 //! This is a separate userspace binary that provides shell functionality
-//! using system calls through cyanos-libc.
+//! using system calls through leandros-libc.
 
 #![no_std]
 #![no_main]
 
-extern crate cyanos_libc;
+extern crate leandros_libc;
 
-use cyanos_libc::{
+use leandros_libc::{
     write, read, STDOUT_FILENO, STDIN_FILENO, getpid,
     open, close, getdents64, O_RDONLY,
     fork, execve, wait4,
@@ -21,13 +21,13 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     write_str("Shell main reached!\n");
     // Display shell banner
     write_str("\n");
-    write_str("  ██████╗██╗   ██╗ █████╗ ███╗   ██╗ ██████╗ ███████╗\n");
-    write_str(" ██╔════╝╚██╗ ██╔╝██╔══██╗████╗  ██║██╔═══██╗██╔════╝\n");
-    write_str(" ██║      ╚████╔╝ ███████║██╔██╗ ██║██║   ██║███████╗\n");
-    write_str(" ██║       ╚██╔╝  ██╔══██║██║╚██╗██║██║   ██║╚════██║\n");
-    write_str(" ╚██████╗   ██║   ██║  ██║██║ ╚████║╚██████╔╝███████║\n");
-    write_str("  ╚═════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚══════╝\n\n");
-    write_str("CyanOS Shell (Userspace)\n");
+    write_str(" ██╗      ███████╗ █████╗ ███╗   ██╗██████╗ ██████╗  ██████╗ ███████╗\n");
+    write_str(" ██║      ██╔════╝██╔══██╗████╗  ██║██╔══██╗██╔══██╗██╔═══██╗██╔════╝\n");
+    write_str(" ██║      █████╗  ███████║██╔██╗ ██║██║  ██║██████╔╝██║   ██║███████╗\n");
+    write_str(" ██║      ██╔══╝  ██╔══██║██║╚██╗██║██║  ██║██╔══██╗██║   ██║╚════██║\n");
+    write_str(" ███████╗ ███████╗██║  ██║██║ ╚████║██████╔╝██║  ██║╚██████╔╝███████║\n");
+    write_str(" ╚══════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝\n\n");
+    write_str("LeandrOS Shell (Userspace)\n");
     write_str("Type 'help' for available commands\n\n");
 
     // Show initial PID
@@ -165,7 +165,7 @@ unsafe fn process_line(line: &str) {
             write_str("  [binary]      - Execute a binary file\n");
         }
         "info" => {
-            write_str("CyanOS Microkernel (Userspace Shell)\n");
+            write_str("LeandrOS Microkernel (Userspace Shell)\n");
             write_str("Status: Running in userspace\n");
             write_str("PID: ");
             write_u32(getpid() as u32);
@@ -271,7 +271,7 @@ unsafe fn ls_command(path: &str) {
 
         let mut pos = 0;
         while pos < n as usize {
-            let dirent = &*(buf.as_ptr().add(pos) as *const cyanos_libc::linux_dirent64);
+            let dirent = &*(buf.as_ptr().add(pos) as *const leandros_libc::linux_dirent64);
             let name_ptr = buf.as_ptr().add(pos + 19); // 19 is offset to d_name in linux_dirent64
 
             // Find name length (NUL terminated)
@@ -331,7 +331,7 @@ unsafe fn execute_binary(cmd: &str) {
         write_str("shell: command not found: ");
         write_str(cmd);
         write_str("\n");
-        cyanos_libc::exit(1);
+        leandros_libc::exit(1);
     } else {
         // Parent
         let mut status = 0i32;

@@ -1,5 +1,5 @@
 [package]
-name = "cyanos-shell"
+name = "leandros-shell"
 version.workspace = true
 edition.workspace = true
 
@@ -8,4 +8,4 @@ name = "shell"
 path = "src/main.rs"
 
 [dependencies]
-cyanos-libc = { path = "../libc" }
+leandros-libc = { path = "../libc" }

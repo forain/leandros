@@ -1,17 +1,17 @@
-//! CyanOS Init - userspace init program (PID 1)
+//! LeandrOS Init - userspace init program (PID 1)
 //!
 //! This is the first userspace program that runs and manages the system.
 
 #![no_std]
 #![no_main]
 
-extern crate cyanos_libc;
+extern crate leandros_libc;
 
-use cyanos_libc::{write, STDOUT_FILENO, getpid, execve, sched_yield};
+use leandros_libc::{write, STDOUT_FILENO, getpid, execve, sched_yield};
 
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    write_str("CyanOS Init (PID 1) starting...\n");
+    write_str("LeandrOS Init (PID 1) starting...\n");
 
     // Print PID for confirmation
     write_str("Init PID: ");

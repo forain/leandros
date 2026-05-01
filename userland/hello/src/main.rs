@@ -1,15 +1,15 @@
-//! hello — minimal Cyanos user-space program.
+//! hello — minimal Leandros user-space program.
 //!
-//! Links against cyanos-libc which provides `_start`, memory allocation,
+//! Links against leandros-libc which provides `_start`, memory allocation,
 //! and I/O.  Build with `scripts/build-userland.sh` to get a static ELF.
 
 #![no_std]
 #![no_main]
 
-// Pull in cyanos-libc so its `_start` / `__libc_start_main` are linked.
-extern crate cyanos_libc;
+// Pull in leandros-libc so its `_start` / `__libc_start_main` are linked.
+extern crate leandros_libc;
 
-use cyanos_libc::{write, STDOUT_FILENO, getpid};
+use leandros_libc::{write, STDOUT_FILENO, getpid};
 
 /// Called by `__libc_start_main` after the C runtime is set up.
 #[no_mangle]
@@ -17,7 +17,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     let pid = getpid();
 
     // Write a greeting using the raw write() syscall wrapper.
-    let msg = b"Hello from Cyanos userland!\n";
+    let msg = b"Hello from Leandros userland!\n";
     write(STDOUT_FILENO, msg.as_ptr(), msg.len());
 
     // Print PID using puts-level formatting (no printf dependency for Stage 1).

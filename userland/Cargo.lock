@@ -3,26 +3,26 @@
 version = 4
 
 [[package]]
-name = "cyanos-init"
-version = "0.1.0"
-dependencies = [
- "cyanos-libc",
-]
-
-[[package]]
-name = "cyanos-libc"
-version = "0.1.0"
-
-[[package]]
-name = "cyanos-shell"
-version = "0.1.0"
-dependencies = [
- "cyanos-libc",
-]
-
-[[package]]
 name = "hello"
 version = "0.1.0"
 dependencies = [
- "cyanos-libc",
+ "leandros-libc",
+]
+
+[[package]]
+name = "leandros-init"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
+]
+
+[[package]]
+name = "leandros-libc"
+version = "0.1.0"
+
+[[package]]
+name = "leandros-shell"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
 ]

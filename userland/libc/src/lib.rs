@@ -1,8 +1,8 @@
-//! cyanos-libc — minimal C runtime for Cyanos user-space programs.
+//! leandros-libc — minimal C runtime for Leandros user-space programs.
 //!
 //! Provides the symbols that relibc (Stage 2) will eventually supply.
 //! Every function makes raw Linux-ABI syscalls (SVC #0 on AArch64) using
-//! the same syscall numbers Cyanos's kernel already implements.
+//! the same syscall numbers Leandros's kernel already implements.
 //!
 //! # Layers
 //! - `syscall`  — raw inline-asm wrappers + syscall number constants
@@ -27,7 +27,7 @@ pub mod stdio;
 pub mod errno;
 pub mod time;
 
-// Re-export every public symbol so dependents can do `use cyanos_libc::*`.
+// Re-export every public symbol so dependents can do `use leandros_libc::*`.
 pub use io::*;
 pub use mem::*;
 pub use string::*;

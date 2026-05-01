@@ -1,10 +1,10 @@
 [package]
-name = "cyanos-libc"
+name = "leandros-libc"
 version.workspace = true
 edition.workspace = true
 
 # Produces both a Rust rlib (for use as a Cargo dependency by `hello`) and a
 # standalone libc.a archive that C programs can link against directly.
 [lib]
-name = "cyanos_libc"
+name = "leandros_libc"
 crate-type = ["staticlib", "rlib"]

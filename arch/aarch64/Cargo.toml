@@ -11,7 +11,7 @@ rpi5 = []
 
 [dependencies]
 boot    = { path = "../../boot" }
-cyanos-lib = { path = "../../lib" }
+leandros-lib = { path = "../../lib" }
 mm      = { path = "../../mm" }
 sched   = { path = "../../sched" }
 bitflags.workspace = true

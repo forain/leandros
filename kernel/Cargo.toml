@@ -25,7 +25,7 @@ tty-server  = { path = "../servers/tty" }
 init-server = { path = "../servers/init" }
 usb     = { path = "../drivers/usb" }
 wifi    = { path = "../drivers/wifi" }
-cyanos-lib = { path = "../lib" }
+leandros-lib = { path = "../lib" }
 miniz_oxide = { version = "0.7", default-features = false, features = ["with-alloc"] }
 bitflags.workspace = true
 spin.workspace = true
