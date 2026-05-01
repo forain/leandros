@@ -6,7 +6,7 @@
     "env": "",
     "exe-suffix": "",
     "executables": true,
-    "features": "+strict-align,+neon,+fp-armv8",
+    "features": "+neon,+fp-armv8",
     "frame-pointer": "always",
     "has-rpath": false,
     "linker": "rust-lld",

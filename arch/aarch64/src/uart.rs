@@ -10,8 +10,6 @@
 //!   QEMU:  24_000_000 / (16 × 115_200) ≈ 13.0208  → IBRD=13, FBRD=round(0.0208×64)=1
 //!   RPi5:  48_000_000 / (16 × 115_200) ≈ 26.0417  → IBRD=26, FBRD=round(0.0417×64)=3
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 // ── Board-specific constants ──────────────────────────────────────────────────
 
 /// MMIO base address of the PL011.
@@ -46,17 +44,33 @@ const CR:   usize = 0x030; // Control register
 // ── Flag register bits ────────────────────────────────────────────────────────
 const FR_TXFF: u32 = 1 << 5; // TX FIFO full — spin until clear before writing
 
+// ── Runtime UART base ─────────────────────────────────────────────────────────
+//
+// Initialised to the compile-time BASE constant; updated by `reinit()` when
+// the DTB reports a different address.  Using a static mut ensures we don't
+// depend on atomic operations in early boot.
+
+static mut UART_BASE_ADDR: usize = BASE;
+
+// ── Register helpers ──────────────────────────────────────────────────────────
+
+#[inline(always)]
+unsafe fn rd(off: usize) -> u32 {
+    let base = UART_BASE_ADDR;
+    ((base + off) as *const u32).read_volatile()
+}
+
+#[inline(always)]
+unsafe fn wr(off: usize, val: u32) {
+    let base = UART_BASE_ADDR;
+    ((base + off) as *mut u32).write_volatile(val);
+}
+
 // ── Initialise the PL011 for 115 200 8N1 with FIFO enabled ───────────────────
 
 /// Initialise the PL011 UART at the compile-time `BASE` address.
-///
-/// # Safety
-/// Must be called from a context where MMIO at `BASE` is accessible
-/// (identity-mapped or the MMU is off).
 pub unsafe fn init() {
-    // Stamp the compile-time base so rd/wr helpers use the correct address
-    // even if reinit() was somehow called first (defensive).
-    UART_BASE_ADDR.store(BASE, Ordering::Relaxed);
+    UART_BASE_ADDR = BASE;
 
     // Disable UART while programming line-control registers.
     wr(CR, 0);
@@ -72,17 +86,9 @@ pub unsafe fn init() {
 }
 
 /// Re-initialise the PL011 at a runtime-discovered base address.
-///
-/// Called from `kernel_main` when the DTB reports a UART base address
-/// different from the compile-time `BASE` constant.  Updates `UART_BASE_ADDR`
-/// first so that all subsequent `rd`/`wr` (and `putc`) calls target the new
-/// address — including `arch_serial_putc` called from exception handlers.
-///
-/// # Safety
-/// `base` must point to a valid, identity-mapped PL011 MMIO region.
 pub unsafe fn reinit(base: usize) {
     // Update the runtime base BEFORE any register access so wr() uses it.
-    UART_BASE_ADDR.store(base, Ordering::Relaxed);
+    UART_BASE_ADDR = base;
 
     wr(CR,   0);
     wr(IBRD, IBRD_VAL);
@@ -92,49 +98,9 @@ pub unsafe fn reinit(base: usize) {
 }
 
 /// Write one byte to the TX FIFO, spinning until space is available.
-///
-/// # Safety
-/// `init()` must have been called first.
 pub unsafe fn putc(c: u8) {
     while rd(FR) & FR_TXFF != 0 {
         core::hint::spin_loop();
     }
     wr(DR, c as u32);
-}
-
-// ── Runtime UART base ─────────────────────────────────────────────────────────
-//
-// Initialised to the compile-time BASE constant; updated by `reinit()` when
-// the DTB reports a different address.  Using an AtomicUsize ensures that
-// `arch_serial_putc` (called from IRQ/exception context) always sees the
-// most recently configured base without needing a lock.
-
-static UART_BASE_ADDR: AtomicUsize = AtomicUsize::new(BASE);
-
-// ── Register helpers ──────────────────────────────────────────────────────────
-
-#[inline(always)]
-unsafe fn rd(off: usize) -> u32 {
-    let base = UART_BASE_ADDR.load(Ordering::Relaxed);
-    ((base + off) as *const u32).read_volatile()
-}
-
-#[inline(always)]
-unsafe fn wr(off: usize, val: u32) {
-    let base = UART_BASE_ADDR.load(Ordering::Relaxed);
-    ((base + off) as *mut u32).write_volatile(val);
-}
-
-// ── C-callable wrappers (resolved by the drivers crate at link time) ──────────
-
-/// Initialise the PL011 — called from `Serial::probe()` on non-x86 targets.
-#[no_mangle]
-pub unsafe extern "C" fn arch_serial_init() {
-    init();
-}
-
-/// Write one byte — called from `Serial::write_byte()` on non-x86 targets.
-#[no_mangle]
-pub unsafe extern "C" fn arch_serial_putc(c: u8) {
-    putc(c);
 }

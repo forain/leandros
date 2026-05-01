@@ -24,7 +24,7 @@ pub extern "C" fn cpu_id() -> usize {
 ///   2. exception vectors (VBAR_EL1)
 ///   3. GIC distributor + CPU interface
 ///   4. generic timer — arms the countdown and unmasks IRQs
-pub fn init(_info: &boot::BootInfo) {
+pub fn init(info: &boot::BootInfo) {
     // MAIR_EL1: index 0 = normal WB/WA memory (0xFF),
     //           index 1 = device nGnRnE memory   (0x00).
     unsafe {
@@ -49,9 +49,6 @@ pub fn init(_info: &boot::BootInfo) {
 
         // Initialise PL011 UART for early debug output.
         uart::init();
-        // Enable the MMU with a 4 GiB identity mapping.  MAIR must be written
-        // first so the translation table walks use the correct memory attributes.
-        mmu::enable_identity();
     }
     exception::init();
     gic::init();
