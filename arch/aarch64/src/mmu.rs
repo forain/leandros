@@ -1,6 +1,6 @@
 //! AArch64 Memory Management Unit (MMU) initialization.
 
-use boot::{BootInfo, MemoryType};
+use boot::BootInfo;
 
 #[repr(C, align(4096))]
 struct PageTable([u64; 512]);
@@ -16,7 +16,7 @@ pub unsafe fn enable_identity(boot_info: &BootInfo) {
     // Normal WB/WA inner-shareable (MAIR index 0): 0x701
     let normal: u64 = 0b01 | (0b000 << 2) | (0b11 << 8) | (1 << 10);
     // Device nGnRnE non-shareable (MAIR index 1): 0x405
-    let device: u64 = 0b01 | (0b001 << 2) | (0b00 << 8) | (1 << 10);
+    let _device: u64 = 0b01 | (0b001 << 2) | (0b00 << 8) | (1 << 10);
 
     // ── Populate L1 table ─────────────────────────────────────────────────────
     // 1. Identity map the first 1GB (where UART at 0x09000000 lives).

@@ -148,7 +148,7 @@ fn print_exception(frame: &InterruptStackFrame, vector: u64, error_code: u64) {
 /// Returns true if the exception was taken from ring 3 (user mode).
 #[cfg(target_arch = "x86_64")]
 #[inline]
-fn from_user(frame: &InterruptStackFrame) -> bool {
+fn _from_user(frame: &InterruptStackFrame) -> bool {
     frame.cs & 0x3 == 3
 }
 

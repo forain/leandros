@@ -822,7 +822,7 @@ unsafe extern "C" fn irq_dispatch() {
 
 /// EL1 synchronous exception — always a kernel bug; panic with diagnostics.
 #[no_mangle]
-unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
+unsafe extern "C" fn exc_el1_sync_handler(_esr: u64, _elr: u64) {
     extern "C" { fn arch_serial_putc(b: u8); }
     let msg = b"\n[EXCEPTION] EL1 Sync! ESR=";
     for &b in msg { arch_serial_putc(b); }
@@ -831,6 +831,7 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
 }
 
 /// Print detailed information about data abort exceptions for debugging
+#[allow(dead_code)]
 unsafe fn print_detailed_data_abort_info(esr: u64, elr: u64, far: u64) {
     extern "C" { fn arch_serial_putc(b: u8); }
 
@@ -884,7 +885,7 @@ unsafe fn print_detailed_data_abort_info(esr: u64, elr: u64, far: u64) {
             arch_serial_putc(c);
         }
 
-        if dfsc >= 0b000000 && dfsc <= 0b000011 {
+        if dfsc <= 0b000011 {
             let msg = b" (Address size fault)\r\n";
             for &b in msg { arch_serial_putc(b); }
         } else if dfsc >= 0b000100 && dfsc <= 0b000111 {
@@ -936,6 +937,7 @@ unsafe fn print_detailed_data_abort_info(esr: u64, elr: u64, far: u64) {
 }
 
 /// Print a hex value to serial
+#[allow(dead_code)]
 unsafe fn print_hex_value(prefix: &[u8], value: u64) {
     extern "C" { fn arch_serial_putc(b: u8); }
 
