@@ -242,13 +242,13 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
                 // CRITICAL: Cache maintenance for executable code
                 // After copying code to memory, we must ensure cache coherency
                 if ph.p_flags & PF_X != 0 {
-                    // Clean data cache and invalidate instruction cache for the code region
-                    let start_addr = phys_base;
-                    let end_addr = phys_base + filesz;
-
                     // AArch64 cache maintenance
                     #[cfg(target_arch = "aarch64")]
                     {
+                        // Clean data cache and invalidate instruction cache for the code region
+                        let start_addr = phys_base;
+                        let end_addr = phys_base + filesz;
+
                         // Clean data cache to point of coherency
                         let mut addr = start_addr & !63; // Align to cache line (64 bytes)
                         while addr < end_addr {
@@ -258,15 +258,11 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
                         // Invalidate instruction cache for the entire range
                         core::arch::asm!("ic iallu"); // Invalidate all instruction cache
                         // Ensure completion
-                        core::arch::asm!("dsb ish");
                         core::arch::asm!("isb");
-                    }
 
-                    #[cfg(target_arch = "aarch64")]
-                    {
                         let debug_msg = b"[ELF] Cache maintenance completed for executable segment\r\n";
                         for &byte in debug_msg {
-                            unsafe { (0x09000000 as *mut u8).write(byte); }
+                            (0x09000000 as *mut u8).write(byte);
                         }
                     }
                 }
