@@ -24,9 +24,11 @@ pub fn init_task_main(boot_info: &boot::BootInfo) -> ! {
     serial_print("[INIT] Kernel init task starting\n");
 
     // 1. Initialise in-kernel VFS and net servers.
-    vfs_server::init(0);
+    if let Some(vfs_port) = vfs_server::init(0) {
+        crate::syscall::set_vfs_server_port(vfs_port);
+    }
 
-    // 2. Spawn the userland init process.
+    // 2. Find the initrd.
     serial_print("[INIT] Loading userspace init ELF binary from initrd\n");
 
     let mut initrd_base = boot_info.initrd_base;
@@ -52,7 +54,18 @@ pub fn init_task_main(boot_info: &boot::BootInfo) -> ! {
     print_hex(initrd_size as usize);
     serial_print("\n");
 
-    // Extract init binary from initrd
+    // 3. Pass boot information to the VFS server so it can expose initrd and framebuffer.
+    vfs_server::set_initrd(initrd_base as usize, initrd_size as usize);
+    if boot_info.framebuffer_base != 0 {
+        vfs_server::set_framebuffer(
+            boot_info.framebuffer_base,
+            boot_info.framebuffer_width,
+            boot_info.framebuffer_height,
+            boot_info.framebuffer_pitch,
+        );
+    }
+
+    // 4. Extract and spawn the userland init process.
     let initrd_info = boot::BootInfo {
         initrd_base,
         initrd_size,
