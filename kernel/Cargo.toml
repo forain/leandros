@@ -26,6 +26,7 @@ init-server = { path = "../servers/init" }
 usb     = { path = "../drivers/usb" }
 wifi    = { path = "../drivers/wifi" }
 leandros-lib = { path = "../lib" }
+limine = "0.6.3"
 miniz_oxide = { version = "0.7", default-features = false, features = ["with-alloc"] }
 bitflags.workspace = true
 spin.workspace = true

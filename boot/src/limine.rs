@@ -1,143 +1,41 @@
-//! Limine boot protocol — response structures and parser.
-//!
-//! Ref: Limine Boot Protocol Specification
-//!      https://github.com/limine-bootloader/limine/blob/stable/PROTOCOL.md
+//! Limine boot protocol handler using the official `limine` crate.
 
 use super::{BootInfo, MemoryRegion, MemoryType};
-use core::cell::UnsafeCell;
+use limine::request::{
+    HhdmRequest, MemmapRequest, FramebufferRequest, RsdpRequest, ModulesRequest, ExecutableAddressRequest
+};
 
-// ── Limine Request / Response structures ─────────────────────────────────────
+// ── Limine Requests ──────────────────────────────────────────────────────────
 
-#[repr(C)]
-pub struct Request<T> {
-    pub id:       [u64; 4],
-    pub revision: u64,
-    pub response: UnsafeCell<*const T>,
-}
+// Placing requests in the `.limine_reqs` section.
+// Markers are handled in kernel/src/main.rs to ensure they are linked.
 
-impl<T> Request<T> {
-    pub fn response(&self) -> Option<&T> {
-        let ptr = unsafe { *self.response.get() };
-        if ptr.is_null() { None } else { Some(unsafe { &*ptr }) }
-    }
-}
+#[used]
+#[link_section = ".limine_reqs"]
+pub static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
-unsafe impl<T> Sync for Request<T> {}
+#[used]
+#[link_section = ".limine_reqs"]
+pub static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 
-#[repr(C)]
-pub struct HhdmResponse {
-    pub revision: u64,
-    pub offset:   u64,
-}
+#[used]
+#[link_section = ".limine_reqs"]
+pub static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
-#[repr(C)]
-pub struct MemMapResponse {
-    pub revision:    u64,
-    pub entry_count: u64,
-    pub entries:     *const *const MemMapEntry,
-}
+#[used]
+#[link_section = ".limine_reqs"]
+pub static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
-#[repr(C)]
-pub struct MemMapEntry {
-    pub base:   u64,
-    pub length: u64,
-    pub typ:    u64,
-}
+#[used]
+#[link_section = ".limine_reqs"]
+pub static MODULE_REQUEST: ModulesRequest = ModulesRequest::new();
 
-const USABLE:           u64 = 0;
-const ACPI_RECLAIMABLE: u64 = 1;
-const ACPI_NVS:         u64 = 2;
-const BAD_MEMORY:       u64 = 3;
-
-#[repr(C)]
-pub struct FramebufferResponse {
-    pub revision:          u64,
-    pub framebuffer_count: u64,
-    pub framebuffers:      *const *const Framebuffer,
-}
-
-#[repr(C)]
-pub struct Framebuffer {
-    pub address: u64,
-    pub width:   u32,
-    pub height:  u32,
-    pub pitch:   u32,
-    pub bpp:     u16,
-    pub memory_model: u8,
-    pub red_mask_size:   u8,
-    pub red_mask_shift:  u8,
-    pub green_mask_size: u8,
-    pub green_mask_shift: u8,
-    pub blue_mask_size:  u8,
-    pub blue_mask_shift: u8,
-    pub unused: [u8; 7],
-    pub edid_size: u64,
-    pub edid: *const u8,
-}
-
-#[repr(C)]
-pub struct RsdpResponse {
-    pub revision: u64,
-    pub address:  u64,
-}
-
-#[repr(C)]
-pub struct ModuleResponse {
-    pub revision:     u64,
-    pub module_count: u64,
-    pub modules:      *const *const Module,
-}
-
-#[repr(C)]
-pub struct Module {
-    pub revision: u64,
-    pub address:  u64,
-    pub size:     u64,
-    pub path:     *const u8,
-    pub cmdline:  *const u8,
-    pub media_type: u32,
-    pub unused:     u32,
-    pub tftp_ip:    u32,
-    pub tftp_port:  u32,
-    pub partition_index: u32,
-    pub tftp_err_no:     u32,
-    pub tftp_err_str:    u32,
-}
-
-#[repr(C)]
-pub struct EntryPointRequest {
-    pub id:       [u64; 4],
-    pub revision: u64,
-    pub response: UnsafeCell<*const EntryPointResponse>,
-    pub entry_point: extern "C" fn(usize) -> !,
-}
-
-unsafe impl Sync for EntryPointRequest {}
-
-#[repr(C)]
-pub struct EntryPointResponse {
-    pub revision: u64,
-}
-
-#[repr(C)]
-pub struct KernelAddressResponse {
-    pub revision:      u64,
-    pub physical_base: u64,
-    pub virtual_base:  u64,
-}
+#[used]
+#[link_section = ".limine_reqs"]
+pub static KERNEL_ADDR_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
 
 // ── Static storage for the parsed memory map ──────────────────────────────────
 static mut MM: [MemoryRegion; 128] = [MemoryRegion { base: 0, length: 0, kind: MemoryType::Reserved }; 128];
-
-// ── External requests (defined in kernel crate's main.rs) ──────────────────────
-
-extern "C" {
-    pub static HHDM_REQUEST: Request<HhdmResponse>;
-    pub static MEMMAP_REQUEST: Request<MemMapResponse>;
-    pub static FRAMEBUFFER_REQUEST: Request<FramebufferResponse>;
-    pub static RSDP_REQUEST: Request<RsdpResponse>;
-    pub static MODULE_REQUEST: Request<ModuleResponse>;
-}
 
 // ── Parser ───────────────────────────────────────────────────────────────────
 
@@ -162,19 +60,19 @@ pub unsafe fn parse() -> BootInfo {
 
     if let Some(resp) = MEMMAP_REQUEST.response() {
         let mut idx = 0usize;
-        let n = (resp.entry_count as usize).min(512);
-        for i in 0..n {
+        for e in resp.entries() {
             if idx >= 128 { break; }
-            let e_ptr = *resp.entries.add(i);
-            if e_ptr.is_null() { continue; }
-            let e = &*e_ptr;
 
-            let kind = match e.typ {
-                USABLE           => MemoryType::Available,
-                ACPI_RECLAIMABLE => MemoryType::AcpiReclaimable,
-                ACPI_NVS         => MemoryType::AcpiNvs,
-                BAD_MEMORY       => MemoryType::BadMemory,
-                _                => MemoryType::Reserved,
+            let kind = match e.type_ {
+                0 => MemoryType::Available,       // Usable
+                1 => MemoryType::Reserved,        // Reserved
+                2 => MemoryType::AcpiReclaimable, // ACPI reclaimable
+                3 => MemoryType::AcpiNvs,         // ACPI NVS
+                4 => MemoryType::BadMemory,       // Bad memory
+                5 => MemoryType::Available,       // Bootloader reclaimable
+                6 => MemoryType::Reserved,        // Kernel and modules
+                7 => MemoryType::Reserved,        // Framebuffer
+                _ => MemoryType::Reserved,
             };
             MM[idx] = MemoryRegion { base: e.base, length: e.length, kind };
             idx += 1;
@@ -184,24 +82,27 @@ pub unsafe fn parse() -> BootInfo {
     }
 
     if let Some(resp) = FRAMEBUFFER_REQUEST.response() {
-        if resp.framebuffer_count > 0 {
-            let fb = &**resp.framebuffers;
-            info.framebuffer_base   = fb.address as u64;
-            info.framebuffer_width  = fb.width  as u32;
+        let framebuffers = resp.framebuffers();
+        if !framebuffers.is_empty() {
+            let fb = framebuffers[0];
+            // Normalize address to physical.
+            info.framebuffer_base = (fb.address() as u64).saturating_sub(info.hhdm_offset);
+            info.framebuffer_width  = fb.width as u32;
             info.framebuffer_height = fb.height as u32;
-            info.framebuffer_pitch  = fb.pitch  as u32;
+            info.framebuffer_pitch  = fb.pitch as u32;
         }
     }
 
     if let Some(resp) = RSDP_REQUEST.response() {
-        info.rsdp_addr = resp.address as u64;
+        info.rsdp_addr = (resp.address as u64).saturating_sub(info.hhdm_offset);
     }
 
     if let Some(resp) = MODULE_REQUEST.response() {
-        if resp.module_count > 0 {
-            let module = &**resp.modules;
-            info.initrd_base = (module.address as u64).saturating_sub(info.hhdm_offset);
-            info.initrd_size = module.size;
+        let modules = resp.modules();
+        if !modules.is_empty() {
+            let module = modules[0];
+            info.initrd_base = (module.data().as_ptr() as u64).saturating_sub(info.hhdm_offset);
+            info.initrd_size = module.data().len() as u64;
         }
     }
 

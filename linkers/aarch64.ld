@@ -39,9 +39,9 @@ SECTIONS
         *(.tdata .tdata.*)
         /* ── Limine request structures ────────────────────────────────────────── */
         . = ALIGN(8);
-        KEEP(*(.limine_requests_start))
-        KEEP(*(.limine_requests))
-        KEEP(*(.limine_requests_end))
+        KEEP(*(.limine_reqs_start))
+        KEEP(*(.limine_reqs))
+        KEEP(*(.limine_reqs_end))
         __data_end = .;
     } :data
 

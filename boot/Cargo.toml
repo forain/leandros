@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 leandros-lib = { path = "../lib" }
+limine = "0.6.3"
