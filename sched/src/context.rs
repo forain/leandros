@@ -15,7 +15,7 @@
 /// This is simpler than lazy-FPU (trap-on-use) and correct for all workloads.
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, align(16))]
 pub struct CpuContext {
     /// x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29(fp), x30(lr)
     /// Offsets: 0..96 (12 × 8 bytes)
@@ -236,7 +236,7 @@ impl UserFrame {
 ///
 /// Total size: 272 bytes (17 × 16 — 16-byte aligned).
 #[cfg(target_arch = "aarch64")]
-#[repr(C)]
+#[repr(C, align(16))]
 pub struct UserFrame {
     /// General-purpose registers x0–x30 (31 × 8 = 248 bytes).
     pub x:        [u64; 31],
@@ -291,13 +291,6 @@ cpu_switch_to:
     // x0 = *mut CpuContext (old)
     // x1 = *const CpuContext (new)
 
-    // Debug: Direct UART write 'A' to show we entered cpu_switch_to
-    stp  x0, x1, [sp, #-16]!
-    mov  x0, #'A'
-    mov  x1, #0x09000000
-    str  w0, [x1]
-    ldp  x0, x1, [sp], #16
-
     // ── save outgoing integer registers ─────────────────────────────────────
     stp  x19, x20, [x0, #0]
     stp  x21, x22, [x0, #16]
@@ -334,13 +327,6 @@ cpu_switch_to:
     // save TLS register
     mrs  x10, tpidr_el0
     str  x10, [x0, #640]
-
-    // Debug: Direct UART write 'B' to show we finished saving
-    stp  x0, x1, [sp, #-16]!
-    mov  x0, #'B'
-    mov  x1, #0x09000000
-    str  w0, [x1]
-    ldp  x0, x1, [sp], #16
 
     // ── restore incoming integer registers ──────────────────────────────────
     ldp  x19, x20, [x1, #0]
@@ -379,13 +365,6 @@ cpu_switch_to:
     ldr  x10, [x1, #640]
     msr  tpidr_el0, x10
 
-    // Debug: Direct UART write 'C' to show we're about to ret
-    stp  x0, x1, [sp, #-16]!
-    mov  x0, #'C'
-    mov  x1, #0x09000000
-    str  w0, [x1]
-    ldp  x0, x1, [sp], #16
-
     ret                          // branch to x30
 
 // ─── AArch64 context switch with page table switch ────────────────────────────
@@ -395,13 +374,6 @@ cpu_switch_to_with_pt:
     // x0 = *mut CpuContext (old)
     // x1 = *const CpuContext (new)
     // x2 = page_table (physical address, 0 = no change)
-
-    // Debug: Direct UART write 'D' to show we entered cpu_switch_to_with_pt
-    stp  x0, x1, [sp, #-16]!
-    mov  x0, #'D'
-    mov  x1, #0x09000000
-    str  w0, [x1]
-    ldp  x0, x1, [sp], #16
 
     // ── save outgoing integer registers ─────────────────────────────────────
     stp  x19, x20, [x0, #0]
@@ -441,13 +413,6 @@ cpu_switch_to_with_pt:
     str  x10, [x0, #640]
 
     // ── switch page table if needed ─────────────────────────────────────────
-    // Debug: Direct UART write 'P' before page table switch
-    stp  x0, x1, [sp, #-16]!
-    mov  x0, #'P'
-    mov  x1, #0x09000000
-    str  w0, [x1]
-    ldp  x0, x1, [sp], #16
-
     cbz  x2, 1f                 // if page_table == 0, skip page table switch
     msr  ttbr0_el1, x2          // switch to new page table
     isb                         // ensure page table switch is complete
@@ -489,13 +454,6 @@ cpu_switch_to_with_pt:
     // restore TLS register
     ldr  x10, [x1, #640]
     msr  tpidr_el0, x10
-
-    // Debug: Direct UART write 'R' before ret (which jumps to ret_to_user)
-    stp  x0, x1, [sp, #-16]!
-    mov  x0, #'R'
-    mov  x1, #0x09000000
-    str  w0, [x1]
-    ldp  x0, x1, [sp], #16
 
     ret                          // branch to x30
 "#);
