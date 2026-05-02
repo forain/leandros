@@ -17,6 +17,7 @@ pub enum TaskState {
 
 /// Per-signal disposition, matching the POSIX `struct sigaction` layout.
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct SigAction {
     /// Handler address: 0 = SIG_DFL, 1 = SIG_IGN, else a user-space fn ptr.
     pub handler:  usize,
@@ -31,6 +32,7 @@ pub struct SigAction {
 pub const DEFAULT_SIGACTION: SigAction =
     SigAction { handler: 0, flags: 0, mask: 0, restorer: 0 };
 
+#[repr(C)]
 pub struct Task {
     pub pid:          Pid,
     pub state:        TaskState,
