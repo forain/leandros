@@ -308,6 +308,26 @@ pub fn spawn_user_with_address_space(entry_point: usize, sp: usize, as_: mm::vmm
     let stack_size = mm::buddy::PAGE_SIZE * 16;
     let page_table = as_.page_table_root;
 
+    // DEBUG: Trace task creation values
+    extern "C" { fn arch_serial_putc(b: u8); }
+    let msg = b"[SCHED] spawn_user: entry=";
+    for &b in msg { unsafe { arch_serial_putc(b); } }
+    unsafe {
+        let n = entry_point;
+        for i in (0..16).rev() {
+            let digit = ((n >> (i * 4)) & 0xF) as u8;
+            arch_serial_putc(if digit < 10 { b'0' + digit } else { b'A' + digit - 10 });
+        }
+        let msg2 = b" sp=";
+        for &b in msg2 { arch_serial_putc(b); }
+        let n2 = sp;
+        for i in (0..16).rev() {
+            let digit = ((n2 >> (i * 4)) & 0xF) as u8;
+            arch_serial_putc(if digit < 10 { b'0' + digit } else { b'A' + digit - 10 });
+        }
+        arch_serial_putc(b'\r'); arch_serial_putc(b'\n');
+    }
+
     let mut task = Task::new_userspace(pid, entry_point, sp, stack_virt, stack_size, page_table);
     task.kernel_stack = stack_phys;
     task.address_space = Some(alloc::boxed::Box::new(as_));

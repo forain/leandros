@@ -217,6 +217,9 @@ const fn include_font() -> [u8; 128 * 8] {
     font
 }
 
+#[no_mangle]
+pub static mut UART_BASE: usize = 0x09000000;
+
 pub fn serial_write_byte(b: u8) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -224,11 +227,12 @@ pub fn serial_write_byte(b: u8) {
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        // Direct write to UART data register (assuming QEMU virt base)
+        let base = UART_BASE;
+        // Direct write to UART data register
         core::arch::asm!(
             "str {val:w}, [{base}]",
             val = in(reg) b as u32,
-            base = in(reg) 0x09000000usize,
+            base = in(reg) base,
             options(nostack, nomem)
         );
     }
@@ -314,6 +318,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     };
 
     mm::init_with_map(boot_info.memory_regions(), boot_info.hhdm_offset as usize);
+    
     serial_print("  mm::phys_to_virt(0) = ");
     print_hex(mm::phys_to_virt(0));
     serial_print("\n");
