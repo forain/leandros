@@ -10,10 +10,14 @@
 .section ".text.boot", "ax", @progbits
 .globl _start
 _start:
+    // ── Force SP_EL1 for kernel execution ─────────────────────────────────────
+    msr     SPSel, #1
+    isb
+
     // Debug: _start reached - write 'B' IMMEDIATELY
-    mov     x20, 0x09000000         // QEMU virt UART base
-    mov     w21, #'B'
-    str     w21, [x20]
+    // mov     x20, 0x09000000         // QEMU virt UART base
+    // mov     w21, #'B'
+    // str     w21, [x20]
 
     // ── Enable FP / SIMD (NEON) ──────────────────────────────────────────────
     // CPACR_EL1.FPEN (bits 20-21) = 0b11: do not trap FP/SIMD instructions.
@@ -23,8 +27,8 @@ _start:
 
     // ── Zero the BSS section ──────────────────────────────────────────────────
     // Debug: Starting BSS clear - write 'F'
-    mov     w21, #'F'
-    str     w21, [x20]
+    // mov     w21, #'F'
+    // str     w21, [x20]
 
     adrp    x0, __bss_start
     add     x0, x0, :lo12:__bss_start
@@ -44,24 +48,27 @@ _start:
     isb
 
     // Debug: BSS cleared - write 'G'
-    mov     w21, #'G'
-    str     w21, [x20]
+    // mov     w21, #'G'
+    // str     w21, [x20]
 
     // ── Set up initial stack (SP_EL1) ─────────────────────────────────────────
     adrp    x1, EARLY_STACK
     add     x1, x1, :lo12:EARLY_STACK
+    // Force virtual address if we are executing identity mapped
+    mov     x2, #0xffffffff80000000
+    orr     x1, x1, x2
     mov     x2, #0x10000            // 64 KiB
     add     x1, x1, x2
     mov     sp, x1
 
     // Debug: Stack set up - write 'E'
-    mov     w21, #'E'
-    str     w21, [x20]
+    // mov     w21, #'E'
+    // str     w21, [x20]
 
     // ── Call kernel_main(dtb_ptr: usize) ─────────────────────────────────────
     // Debug: Write 'A' after basic setup before kernel_main
-    mov     w1, #'A'
-    str     w1, [x20]
+    // mov     w1, #'A'
+    // str     w1, [x20]
 
     // Preserve x0 (boot info addr) just in case
     mov     x19, x0
@@ -71,8 +78,8 @@ _start:
     add     x1, x1, :lo12:kernel_main
     
     // Debug: Write 'J' to indicate we are about to jump to the address in x1
-    mov     w2, #'J'
-    str     w2, [x20]
+    // mov     w2, #'J'
+    // str     w2, [x20]
     
     // Restore x0 before jump
     mov     x0, x19
@@ -114,27 +121,27 @@ _start:
 .align 7; b .Lexc_halt_serror      // SError
 
 .Lexc_halt_sync:
-    mov     x0, 0x09000000
-    mov     w1, #'S'
-    str     w1, [x0]
+    // mov     x0, 0x09000000
+    // mov     w1, #'S'
+    // str     w1, [x0]
     b .Lexc_park
 
 .Lexc_halt_irq:
-    mov     x0, 0x09000000
-    mov     w1, #'I'
-    str     w1, [x0]
+    // mov     x0, 0x09000000
+    // mov     w1, #'I'
+    // str     w1, [x0]
     b .Lexc_park
 
 .Lexc_halt_fiq:
-    mov     x0, 0x09000000
-    mov     w1, #'F'
-    str     w1, [x0]
+    // mov     x0, 0x09000000
+    // mov     w1, #'F'
+    // str     w1, [x0]
     b .Lexc_park
 
 .Lexc_halt_serror:
-    mov     x0, 0x09000000
-    mov     w1, #'R'
-    str     w1, [x0]
+    // mov     x0, 0x09000000
+    // mov     w1, #'R'
+    // str     w1, [x0]
     b .Lexc_park
 
 .Lexc_park:

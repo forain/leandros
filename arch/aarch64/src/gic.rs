@@ -64,30 +64,30 @@ unsafe fn dsb_st() {
     core::arch::asm!("dsb st", options(nomem, nostack));
 }
 
-/// Initialise GICv2 and enable PPI #30 (EL1 physical timer).
+/// Initialise GICv2 and enable PPI #27 (EL1 virtual timer).
 pub fn init() {
     unsafe {
         // Enable distributor.
         gicd_w32(GICD_CTLR, 1);
         dsb_st();
 
-        // Enable PPI 30.  GICD_ISENABLER[0] is a write-set register covering
+        // Enable PPI 27.  GICD_ISENABLER[0] is a write-set register covering
         // IRQ IDs 0-31; writing a 1 to bit N enables IRQ N.
-        gicd_w32(GICD_ISENABLER0, 1 << 30);
+        gicd_w32(GICD_ISENABLER0, 1 << 27);
         dsb_st();
 
-        // Priority for IRQ 30 (mid-priority = 0xA0).
-        // IPRIORITYR is byte-addressed: IRQ 30 lives at byte 30 = word 7, byte 2.
-        let pri_word_off = GICD_IPRIORITYR + (30 / 4) * 4;
-        let pri_shift    = (30 % 4) * 8;
+        // Priority for IRQ 27 (mid-priority = 0xA0).
+        // IPRIORITYR is byte-addressed: IRQ 27 lives at byte 27 = word 6, byte 3.
+        let pri_word_off = GICD_IPRIORITYR + (27 / 4) * 4;
+        let pri_shift    = (27 % 4) * 8;
         let pri_v = (gicd_r32(pri_word_off) & !(0xFF << pri_shift)) | (0xA0 << pri_shift);
         gicd_w32(pri_word_off, pri_v);
         dsb_st();
 
-        // Route IRQ 30 to CPU 0.
+        // Route IRQ 27 to CPU 0.
         // ITARGETSR is byte-addressed similarly; bit 0 of the byte = CPU 0.
-        let tgt_word_off = GICD_ITARGETSR + (30 / 4) * 4;
-        let tgt_shift    = (30 % 4) * 8;
+        let tgt_word_off = GICD_ITARGETSR + (27 / 4) * 4;
+        let tgt_shift    = (27 % 4) * 8;
         let tgt_v = (gicd_r32(tgt_word_off) & !(0xFF << tgt_shift)) | (0x01 << tgt_shift);
         gicd_w32(tgt_word_off, tgt_v);
         dsb_st();

@@ -35,30 +35,21 @@ bitflags! {
 /// `pgd` must point to a valid, 4-KiB-aligned Level-0 (PGD) page table that
 /// lies within a region addressable without MMU (identity-mapped or physical
 /// address space).
-pub unsafe fn map_4k(pgd: *mut u64, virt: usize, phys: usize, flags: PageDescFlags) -> bool {
+pub unsafe fn map_4k(pgd_phys: *mut u64, virt: usize, phys: usize, flags: PageDescFlags) -> bool {
+    let pgd = mm::phys_to_virt(pgd_phys as usize) as *mut u64;
     let l0 = (virt >> 39) & 0x1FF;
     let l1 = (virt >> 30) & 0x1FF;
     let l2 = (virt >> 21) & 0x1FF;
     let l3 = (virt >> 12) & 0x1FF;
 
-
-    let p1 = match ensure_table(pgd, l0) { Some(p) => p, None => return false };
-    let p2 = match ensure_table(p1,  l1) { Some(p) => p, None => return false };
-    let p3 = match ensure_table(p2,  l2) { Some(p) => p, None => return false };
+    let p1 = match ensure_table(pgd, l0) { Some(p) => mm::phys_to_virt(p as usize) as *mut u64, None => return false };
+    let p2 = match ensure_table(p1,  l1) { Some(p) => mm::phys_to_virt(p as usize) as *mut u64, None => return false };
+    let p3 = match ensure_table(p2,  l2) { Some(p) => mm::phys_to_virt(p as usize) as *mut u64, None => return false };
 
     // L3 entry: page descriptor (bit 1 = 1, bit 0 = 1).
     let final_entry = phys as u64 | flags.bits() | 0b11;
     p3.add(l3).write(final_entry);
 
-    // Flush TLB for this address (inner-shareable broadcast).
-    core::arch::asm!(
-        "dsb ishst",
-        "tlbi vaae1is, {va}",
-        "dsb ish",
-        "isb",
-        va = in(reg) (virt >> 12) as u64,
-        options(nostack)
-    );
     true
 }
 
@@ -66,7 +57,8 @@ pub unsafe fn map_4k(pgd: *mut u64, virt: usize, phys: usize, flags: PageDescFla
 ///
 /// # Safety
 /// `pgd` must point to a valid PGD and `virt` must be 4-KiB aligned.
-pub unsafe fn unmap_4k(pgd: *mut u64, virt: usize) {
+pub unsafe fn unmap_4k(pgd_phys: *mut u64, virt: usize) {
+    let pgd = mm::phys_to_virt(pgd_phys as usize) as *mut u64;
     let l0 = (virt >> 39) & 0x1FF;
     let l1 = (virt >> 30) & 0x1FF;
     let l2 = (virt >> 21) & 0x1FF;
@@ -74,15 +66,15 @@ pub unsafe fn unmap_4k(pgd: *mut u64, virt: usize) {
 
     let e0 = pgd.add(l0).read();
     if e0 & PageDescFlags::VALID.bits() == 0 { return; }
-    let p1 = (e0 & 0x0000_FFFF_FFFF_F000) as *mut u64;
+    let p1 = mm::phys_to_virt((e0 & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
 
     let e1 = p1.add(l1).read();
     if e1 & PageDescFlags::VALID.bits() == 0 { return; }
-    let p2 = (e1 & 0x0000_FFFF_FFFF_F000) as *mut u64;
+    let p2 = mm::phys_to_virt((e1 & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
 
     let e2 = p2.add(l2).read();
     if e2 & PageDescFlags::VALID.bits() == 0 { return; }
-    let p3 = (e2 & 0x0000_FFFF_FFFF_F000) as *mut u64;
+    let p3 = mm::phys_to_virt((e2 & 0x0000_FFFF_FFFF_F000) as usize) as *mut u64;
 
     p3.add(l3).write(0);
 
@@ -104,18 +96,22 @@ unsafe fn ensure_table(parent: *mut u64, idx: usize) -> Option<*mut u64> {
         // Table is already present; extract the physical address.
         return Some((entry & 0x0000_FFFF_FFFF_F000) as *mut u64);
     }
-    let table = alloc_zeroed_page()?;
+    let table_phys = mm::buddy::alloc(0)? as *mut u64;
+    let table_virt = mm::phys_to_virt(table_phys as usize) as *mut u8;
+    table_virt.write_bytes(0, mm::buddy::PAGE_SIZE);
+
     parent.add(idx).write(
-        table as u64 | PageDescFlags::TABLE.bits() | PageDescFlags::VALID.bits()
+        table_phys as u64 | PageDescFlags::TABLE.bits() | PageDescFlags::VALID.bits()
     );
-    Some(table)
+    Some(table_phys)
 }
 
 /// Allocate and zero a 4 KiB physical page for an intermediate page-table node.
 /// Returns `None` on OOM instead of panicking.
 unsafe fn alloc_zeroed_page() -> Option<*mut u64> {
     let phys = mm::buddy::alloc(0)?;
-    let ptr = phys as *mut u8;
+    let virt = mm::phys_to_virt(phys);
+    let ptr = virt as *mut u8;
     ptr.write_bytes(0, mm::buddy::PAGE_SIZE);
     Some(phys as *mut u64)
 }
@@ -162,25 +158,11 @@ pub unsafe extern "C" fn arch_tlb_shootdown_all() {
 /// user task, and with 0 on return to the scheduler idle loop.
 #[no_mangle]
 pub unsafe extern "C" fn arch_set_page_table(root: usize) {
-    // Debug output
-    extern "C" { fn serial_print_bytes(ptr: *const u8, len: usize); fn arch_serial_putc(ch: u8); }
-    if root == 0 {
-        let msg = b"[MMU] Clearing TTBR0_EL1 (back to kernel)\r\n";
-        serial_print_bytes(msg.as_ptr(), msg.len());
-    } else {
-        let msg = b"[MMU] Setting TTBR0_EL1 to userspace page table: 0x";
-        serial_print_bytes(msg.as_ptr(), msg.len());
-        for shift in (0..16).rev() {
-            let nibble = (root >> (shift * 4)) & 0xF;
-            let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-            arch_serial_putc(ch);
-        }
-        let debug_nl = b"\r\n";
-        serial_print_bytes(debug_nl.as_ptr(), debug_nl.len());
-    };
-
     core::arch::asm!(
         "msr ttbr0_el1, {r}",
+        "isb",
+        "tlbi vmalle1",
+        "dsb nsh",
         "isb",
         r = in(reg) root as u64,
         options(nostack)
@@ -232,41 +214,15 @@ pub unsafe extern "C" fn arch_get_next_user_page_table() -> usize {
 pub unsafe extern "C" fn arch_alloc_page_table_root() -> usize {
     match mm::buddy::alloc(0) {
         Some(phys) => {
-            (phys as *mut u8).write_bytes(0, mm::buddy::PAGE_SIZE);
-
-            // BRUTE FORCE: Map entire kernel memory region as read-write to debug
-            extern "C" { fn serial_print_bytes(ptr: *const u8, len: usize); }
-
-            let kernel_base = 0x40000000usize;  // Start earlier - include all possible kernel regions
-            let kernel_end = 0x44000000usize;   // 64MB total - very generous over-mapping to debug
-            let rw_flags = PageDescFlags::VALID | PageDescFlags::AF | PageDescFlags::INNER_SHR;
-                         // No RDONLY flag = read-write for everything (debugging)
-
-            let debug_msg = b"[PAGING] BRUTE FORCE: Mapping entire kernel 0x40000000-0x44000000 (RW)\r\n";
-            serial_print_bytes(debug_msg.as_ptr(), debug_msg.len());
-
-            let mut addr = kernel_base;
-            while addr < kernel_end {
-                map_4k(phys as *mut u64, addr, addr, rw_flags);
-                addr += mm::buddy::PAGE_SIZE;
-            }
+            let virt = mm::phys_to_virt(phys) as *mut u8;
+            virt.write_bytes(0, mm::buddy::PAGE_SIZE);
 
             // Map critical device regions (UART for debug output)
-            let uart_base = 0x09000000usize;
-            let uart_end = 0x09100000usize;
+            // Identity mapping for early boot/ret_to_user debug prints
+            let uart_phys = 0x09000000usize;
+            // VALID | AF | INNER_SHR | ATTR_DEV (index 1)
             let device_flags = PageDescFlags::VALID | PageDescFlags::AF | PageDescFlags::INNER_SHR | PageDescFlags::ATTR_DEV;
-
-            let debug_msg2 = b"[PAGING] Mapping UART device 0x09000000-0x09100000\r\n";
-            serial_print_bytes(debug_msg2.as_ptr(), debug_msg2.len());
-
-            let mut addr = uart_base;
-            while addr < uart_end {
-                map_4k(phys as *mut u64, addr, addr, device_flags);
-                addr += mm::buddy::PAGE_SIZE;
-            }
-
-            let debug_msg3 = b"[PAGING] All kernel and device mappings complete\r\n";
-            serial_print_bytes(debug_msg3.as_ptr(), debug_msg3.len());
+            map_4k(phys as *mut u64, uart_phys, uart_phys, device_flags);
 
             phys
         }
