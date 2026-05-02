@@ -192,7 +192,7 @@ pub unsafe fn smp_init(ncpus: usize) {
     write64(AP_CR3_OFF, cr3);
 
     // Entry function pointer
-    write64(AP_ENTRY_OFF, sched_ap_entry as u64);
+    write64(AP_ENTRY_OFF, sched_ap_entry as *const () as u64);
 
     // AP sequential counter (starts at 0)
     write32(AP_CTR_OFF,     0);

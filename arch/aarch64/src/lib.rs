@@ -24,7 +24,7 @@ pub extern "C" fn cpu_id() -> usize {
 ///   2. exception vectors (VBAR_EL1)
 ///   3. GIC distributor + CPU interface
 ///   4. generic timer — arms the countdown and unmasks IRQs
-pub fn init(info: &boot::BootInfo) {
+pub fn init(_info: &boot::BootInfo) {
     // MAIR_EL1: index 0 = normal WB/WA memory (0xFF),
     //           index 1 = device nGnRnE memory   (0x00).
     unsafe {
