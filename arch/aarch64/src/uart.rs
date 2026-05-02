@@ -71,7 +71,7 @@ unsafe fn wr(off: usize, val: u32) {
 
 /// Initialise the PL011 UART at the compile-time `BASE` address.
 pub unsafe fn init() {
-    UART_BASE_ADDR = mm::phys_to_virt(BASE);
+    UART_BASE_ADDR = BASE;
 
     // Disable UART while programming line-control registers.
     wr(CR, 0);
@@ -89,7 +89,7 @@ pub unsafe fn init() {
 /// Re-initialise the PL011 at a runtime-discovered base address.
 pub unsafe fn reinit(base: usize) {
     // Update the runtime base BEFORE any register access so wr() uses it.
-    UART_BASE_ADDR = mm::phys_to_virt(base);
+    UART_BASE_ADDR = base;
 
     wr(CR,   0);
     wr(IBRD, IBRD_VAL);
