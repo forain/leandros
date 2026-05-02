@@ -259,14 +259,14 @@ pub fn serial_read_byte() -> Option<u8> {
     #[cfg(target_arch = "x86_64")]
     unsafe { arch_x86_64::serial_read_byte() }
     #[cfg(target_arch = "aarch64")]
-    None
+    unsafe { arch_aarch64::uart::getc() }
 }
 
 pub fn serial_has_data() -> bool {
     #[cfg(target_arch = "x86_64")]
     unsafe { arch_x86_64::serial_has_data() }
     #[cfg(target_arch = "aarch64")]
-    false
+    unsafe { arch_aarch64::uart::has_data() }
 }
 
 pub fn serial_write_raw(msg: &[u8]) {

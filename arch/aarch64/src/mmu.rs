@@ -13,9 +13,4 @@ pub unsafe fn enable_identity(_boot_info: &BootInfo) {
 
     // 2. Ensure we are using SP_EL1 for the kernel
     core::arch::asm!("msr SPSel, #1", "isb");
-    
-    extern "C" { fn arch_serial_putc(c: u8); }
-    arch_serial_putc(b'O');
-    arch_serial_putc(b'K');
-    arch_serial_putc(b'!');
 }

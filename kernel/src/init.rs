@@ -148,9 +148,6 @@ fn load_and_spawn_elf(elf_bytes: &[u8]) -> Option<u32> {
     let mut as_ = mm::vmm::AddressSpace::new(pt_root);
 
     let entry = elf::load(elf_bytes, &mut as_).ok()?;
-    serial_print("[INIT] ELF loaded, entry = ");
-    print_hex(entry);
-    serial_print("\n");
     
     // Initial user stack
     let stack_base = 0x40000000;
