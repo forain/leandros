@@ -4,12 +4,10 @@
 //! then hands off to `init_server::init_main()` which runs the POSIX smoke
 //! tests and a minimal shell demo before entering the event loop.
 
-use crate::{serial_print, serial_write_byte, serial_write_raw, serial_read_byte, serial_has_data, print_hex, print_number};
-use alloc::boxed::Box;
-use alloc::vec::Vec;
+use crate::{serial_print, serial_write_raw, serial_read_byte, print_hex, print_number};
 
 /// Kernel-side I/O callbacks passed to the init server library.
-static INIT_IO: init_server::IoHooks = init_server::IoHooks {
+static _INIT_IO: init_server::IoHooks = init_server::IoHooks {
     print_str:  |s|   serial_print(s),
     write_raw:  |buf| serial_write_raw(buf),
     read_byte:  ||    serial_read_byte(),
