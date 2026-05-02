@@ -76,7 +76,7 @@ create_initrd() {
     cp "$userland_dir/shell" "$temp_dir/bin/shell"
     cp "$userland_dir/hello" "$temp_dir/bin/hello"
     
-    local doom_bin="doomgeneric/doomgeneric/doom-$arch"
+    local doom_bin="doomgeneric/doom-$arch"
     if [ -f "$doom_bin" ]; then
         cp "$doom_bin" "$temp_dir/bin/doom"
     fi
@@ -164,12 +164,22 @@ create_disk_image() {
     convert_to_vdi "$arch"
 }
 
+# Function to build doomgeneric
+build_doom() {
+    local arch=$1
+    echo "🎮 Building $arch doomgeneric..."
+    cd doomgeneric
+    make -f Makefile.leandros ARCH=$arch
+    cd "$ROOT_DIR"
+}
+
 # Main
 download_limine "$LIMINE_VERSION"
 LIMINE_DIR="$LIMINE_CACHE_DIR/limine-$LIMINE_VERSION-binary"
 
 if [[ "$ARCH" == "both" || "$ARCH" == "aarch64" ]]; then
     build_userland "aarch64"
+    build_doom "aarch64"
     create_initrd "aarch64"
     build_kernel "aarch64"
     create_disk_image "aarch64" "$LIMINE_DIR"
@@ -177,6 +187,7 @@ fi
 
 if [[ "$ARCH" == "both" || "$ARCH" == "x86_64" ]]; then
     build_userland "x86_64"
+    build_doom "x86_64"
     create_initrd "x86_64"
     build_kernel "x86_64"
     create_disk_image "x86_64" "$LIMINE_DIR"
