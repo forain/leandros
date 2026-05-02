@@ -21,7 +21,7 @@ show_usage() {
 }
 
 while [[ $# -gt 0 ]]; do
-    case $1 in
+    case "$1" in
         --arch) ARCH="$2"; shift 2 ;;
         --help) show_usage; exit 0 ;;
         *) echo "❌ Unknown option: $1"; show_usage; exit 1 ;;
@@ -31,27 +31,30 @@ done
 echo "🚀 LeandrOS Build Process Started"
 echo "🏗️  Architecture(s): $ARCH"
 
-ROOT_DIR=$(pwd)
+ROOT_DIR="$PWD"
 
 # Function to download and cache Limine
 download_limine() {
-    local version=$1
+    local version="$1"
     local cache_dir="$LIMINE_CACHE_DIR/limine-$version-binary"
-    if [ -d "$cache_dir" ]; then return 0; fi
+    if [[ -d "$cache_dir" ]]; then return 0; fi
     mkdir -p "$LIMINE_CACHE_DIR"
-    local major_version=$(echo "$version" | cut -d'.' -f1)
+    local major_version
+    major_version=$(echo "$version" | cut -d'.' -f1)
     local url="https://github.com/limine-bootloader/limine/archive/refs/heads/v${major_version}.x-binary.tar.gz"
-    cd "$LIMINE_CACHE_DIR"
-    curl -L -o "limine-$version-binary.tar.gz" "$url"
-    tar -xzf "limine-$version-binary.tar.gz"
-    mv "Limine-${major_version}.x-binary" "limine-$version-binary"
-    rm "limine-$version-binary.tar.gz"
-    cd "$ROOT_DIR"
+    
+    (
+        cd "$LIMINE_CACHE_DIR" || exit 1
+        curl -L -o "limine-$version-binary.tar.gz" "$url"
+        tar -xzf "limine-$version-binary.tar.gz"
+        mv "Limine-${major_version}.x-binary" "limine-$version-binary"
+        rm "limine-$version-binary.tar.gz"
+    )
 }
 
 # Function to build userland
 build_userland() {
-    local arch=$1
+    local arch="$1"
     echo "📦 Building $arch userland..."
     if [[ "$arch" == "aarch64" ]]; then
         ./scripts/build-userland.sh --release
@@ -62,9 +65,10 @@ build_userland() {
 
 # Function to create initrd
 create_initrd() {
-    local arch=$1
+    local arch="$1"
     local initrd_name="initrd-$arch.cpio.gz"
-    local target_arch=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-none" || echo "x86_64-unknown-none")
+    local target_arch
+    target_arch=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-none" || echo "x86_64-unknown-none")
     local userland_dir="userland/target/$target_arch/release"
     
     echo "  Creating CPIO initrd..."
@@ -77,26 +81,27 @@ create_initrd() {
     cp "$userland_dir/hello" "$temp_dir/bin/hello"
     
     local doom_bin="doomgeneric/doom-$arch"
-    if [ -f "$doom_bin" ]; then
+    if [[ -f "$doom_bin" ]]; then
         cp "$doom_bin" "$temp_dir/bin/doom"
     fi
 
     local doom_wad="doomgeneric/doom1.wad"
-    if [ -f "$doom_wad" ]; then
+    if [[ -f "$doom_wad" ]]; then
         cp "$doom_wad" "$temp_dir/bin/doom1.wad"
     fi
     
     # Create uncompressed CPIO archive
-    cd "$temp_dir"
-    find . | cpio -o -H newc > "$ROOT_DIR/$initrd_name"
-    cd "$ROOT_DIR"
+    (
+        cd "$temp_dir" || exit 1
+        find . -print0 | cpio -0 -o -H newc > "$ROOT_DIR/$initrd_name"
+    )
     
     rm -rf "$temp_dir"
 }
 
 # Function to build kernel
 build_kernel() {
-    local arch=$1
+    local arch="$1"
     echo "🔧 Building $arch kernel..."
     
     local target_root="target/build-$arch"
@@ -104,7 +109,6 @@ build_kernel() {
     
     local target_spec="$ROOT_DIR/targets/$arch-unknown-kernel.json"
     local linker="$ROOT_DIR/linkers/$arch.ld"
-    local rust_target="$arch-unknown-kernel"
     
     echo "  Running cargo build..."
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
@@ -113,14 +117,19 @@ build_kernel() {
     
     # Identify and preserve the binary
     mkdir -p "target/final-$arch"
-    local built_kernel=$(find "$target_root" -name "kernel" -type f | grep release | grep -v deps | head -1)
+    local built_kernel
+    built_kernel=$(find "$target_root" -name "kernel" -type f | grep release | grep -v deps | head -1)
+    if [[ -z "$built_kernel" ]]; then
+        echo "❌ Failed to find built kernel for $arch"
+        exit 1
+    fi
     cp "$built_kernel" "target/final-$arch/kernel"
     cp "$built_kernel" "target/final-$arch/kernel-direct"
 }
 
 # Function to convert raw image to VDI
 convert_to_vdi() {
-    local arch=$1
+    local arch="$1"
     local raw_image="leandros-limine-$arch.img"
     local vdi_image="leandros-limine-$arch.vdi"
     if command -v VBoxManage &> /dev/null; then
@@ -131,7 +140,7 @@ convert_to_vdi() {
 
 # Function to create disk image
 create_disk_image() {
-    local arch=$1
+    local arch="$1"
     local limine_dir="$2"
     local image_name="leandros-limine-$arch.img"
     echo "💽 Creating $arch disk image..."
@@ -146,8 +155,9 @@ create_disk_image() {
     mkfs.fat -C "$temp_fat" 61440 -F 32 -n LEANDROS >/dev/null 2>&1
     mmd -i "$temp_fat" ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
     
-    local boot_efi=$([[ "$arch" == "aarch64" ]] && echo "BOOTAA64.EFI" || echo "BOOTX64.EFI")
-    mcopy -oi "$temp_fat" "$limine_dir/$boot_efi" ::/EFI/BOOT/$boot_efi
+    local boot_efi
+    boot_efi=$([[ "$arch" == "aarch64" ]] && echo "BOOTAA64.EFI" || echo "BOOTX64.EFI")
+    mcopy -oi "$temp_fat" "$limine_dir/$boot_efi" ::/EFI/BOOT/"$boot_efi"
     mcopy -oi "$temp_fat" "$limine_dir/limine-bios.sys" ::/boot/limine/limine-bios.sys
     mcopy -oi "$temp_fat" "$limine_dir/limine-bios.sys" ::/limine-bios.sys
     mcopy -oi "$temp_fat" "target/final-$arch/kernel" ::/kernel.elf
@@ -166,11 +176,12 @@ create_disk_image() {
 
 # Function to build doomgeneric
 build_doom() {
-    local arch=$1
+    local arch="$1"
     echo "🎮 Building $arch doomgeneric..."
-    cd doomgeneric
-    make -f Makefile.leandros ARCH=$arch
-    cd "$ROOT_DIR"
+    (
+        cd doomgeneric || exit 1
+        make -f Makefile.leandros ARCH="$arch"
+    )
 }
 
 # Main
