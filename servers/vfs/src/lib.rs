@@ -1424,14 +1424,13 @@ fn parse_cpio_hex(s: &[u8]) -> usize {
 
 fn is_duplicated(path: &[u8]) -> bool {
     let mut abs_path = [0u8; 256];
-    let mut len = 0;
     
     let mut src = if path.starts_with(b"./") { &path[2..] } else { path };
     if src.starts_with(b"/") { src = &src[1..]; }
 
     // Convert to absolute for comparison with RAMFS
     abs_path[0] = b'/';
-    len = 1;
+    let mut len = 1;
     let copy_len = src.len().min(254);
     abs_path[len..len + copy_len].copy_from_slice(&src[..copy_len]);
     len += copy_len;
@@ -1477,7 +1476,7 @@ fn path_eq(buf: &[u8; 256], len: usize, path: &[u8]) -> bool {
     len == path.len() && buf[..len] == *path
 }
 
-static SERVER_PORT_ID: atomic::AtomicU32 = atomic::AtomicU32::new(u32::MAX);
+static _SERVER_PORT_ID: atomic::AtomicU32 = atomic::AtomicU32::new(u32::MAX);
 
 fn handle_eventfd(pid: u32, initval: u64) -> Message {
     let mut counters = EVENTFD_COUNTERS.lock();
