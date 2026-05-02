@@ -106,17 +106,7 @@ unsafe fn ensure_table(parent: *mut u64, idx: usize) -> Option<*mut u64> {
     Some(table_phys)
 }
 
-/// Allocate and zero a 4 KiB physical page for an intermediate page-table node.
-/// Returns `None` on OOM instead of panicking.
-unsafe fn alloc_zeroed_page() -> Option<*mut u64> {
-    let phys = mm::buddy::alloc(0)?;
-    let virt = mm::phys_to_virt(phys);
-    let ptr = virt as *mut u8;
-    ptr.write_bytes(0, mm::buddy::PAGE_SIZE);
-    Some(phys as *mut u64)
-}
-
-// ── arch_tlb_shootdown_all ────────────────────────────────────────────────────
+// ── arch_map_page / arch_unmap_page ──────────────────────────────────────────
 
 /// Broadcast a TLB invalidation for all user-space entries to all CPUs.
 ///
@@ -216,14 +206,6 @@ pub unsafe extern "C" fn arch_alloc_page_table_root() -> usize {
         Some(phys) => {
             let virt = mm::phys_to_virt(phys) as *mut u8;
             virt.write_bytes(0, mm::buddy::PAGE_SIZE);
-
-            // Map critical device regions (UART for debug output)
-            // Identity mapping for early boot/ret_to_user debug prints
-            let uart_phys = 0x09000000usize;
-            // VALID | AF | INNER_SHR | ATTR_DEV (index 1)
-            let device_flags = PageDescFlags::VALID | PageDescFlags::AF | PageDescFlags::INNER_SHR | PageDescFlags::ATTR_DEV;
-            map_4k(phys as *mut u64, uart_phys, uart_phys, device_flags);
-
             phys
         }
         None => 0,

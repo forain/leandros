@@ -371,21 +371,21 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
 }
 
 unsafe fn print_detailed_data_abort_info(esr: u64, elr: u64, far: u64) {
-    extern "C" { fn arch_serial_putc(b: u8); }
     print_hex_value(b"[LEANDROS] ESR_EL1=0x", esr);
     print_hex_value(b"[LEANDROS] ELR_EL1=0x", elr);
     print_hex_value(b"[LEANDROS] FAR_EL1=0x", far);
 }
 
 unsafe fn print_hex_value(prefix: &[u8], value: u64) {
-    extern "C" { fn arch_serial_putc(b: u8); }
-    for &b in prefix { arch_serial_putc(b); }
+    extern "C" { fn serial_print_bytes(ptr: *const u8, len: usize); }
+    serial_print_bytes(prefix.as_ptr(), prefix.len());
     for i in (0..16).rev() {
         let nibble = ((value >> (i * 4)) & 0xF) as u8;
         let c = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
-        arch_serial_putc(c);
+        serial_print_bytes(&c, 1);
     }
-    arch_serial_putc(b'\r'); arch_serial_putc(b'\n');
+    let nl = b"\r\n";
+    serial_print_bytes(nl.as_ptr(), 2);
 }
 
 #[no_mangle]

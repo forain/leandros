@@ -14,14 +14,17 @@
 //! Ref: ARM GIC Architecture Specification v2.0
 
 #[cfg(not(feature = "rpi5"))]
-const GICD_BASE: usize = 0x0800_0000;
+const GICD_PHYS: usize = 0x0800_0000;
 #[cfg(not(feature = "rpi5"))]
-const GICC_BASE: usize = 0x0801_0000;
+const GICC_PHYS: usize = 0x0801_0000;
 
 #[cfg(feature = "rpi5")]
-const GICD_BASE: usize = 0x107F_FF90_00;
+const GICD_PHYS: usize = 0x107F_FF90_00;
 #[cfg(feature = "rpi5")]
-const GICC_BASE: usize = 0x107F_FFA0_00;
+const GICC_PHYS: usize = 0x107F_FFA0_00;
+
+pub static mut GICD_BASE: usize = GICD_PHYS;
+pub static mut GICC_BASE: usize = GICC_PHYS;
 
 // Distributor register offsets
 const GICD_CTLR:       usize = 0x000; // distributor control
@@ -67,6 +70,10 @@ unsafe fn dsb_st() {
 /// Initialise GICv2 and enable PPI #27 (EL1 virtual timer).
 pub fn init() {
     unsafe {
+        // Update bases to use HHDM virtual addresses
+        GICD_BASE = mm::phys_to_virt(GICD_PHYS);
+        GICC_BASE = mm::phys_to_virt(GICC_PHYS);
+
         // Enable distributor.
         gicd_w32(GICD_CTLR, 1);
         dsb_st();
