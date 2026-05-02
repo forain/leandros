@@ -303,28 +303,32 @@ unsafe fn execute_binary(cmd: &str) {
     let actual_path = cmd;
 
     let path_len = actual_path.len().min(255);
-    core::ptr::copy_nonoverlapping(actual_path.as_ptr(), EXEC_PATH_BUFFER.as_mut_ptr(), path_len);
-    EXEC_PATH_BUFFER[path_len] = 0;
+    let exec_ptr = core::ptr::addr_of_mut!(EXEC_PATH_BUFFER) as *mut u8;
+    core::ptr::copy_nonoverlapping(actual_path.as_ptr(), exec_ptr, path_len);
+    *exec_ptr.add(path_len) = 0;
 
     let pid = fork();
     if pid < 0 {
         write_str("shell: fork failed\n");
     } else if pid == 0 {
         // Child
-        let argv: [*const u8; 2] = [EXEC_PATH_BUFFER.as_ptr(), core::ptr::null()];
+        let exec_ptr_const = core::ptr::addr_of!(EXEC_PATH_BUFFER) as *const u8;
+        let argv: [*const u8; 2] = [exec_ptr_const, core::ptr::null()];
         let envp: [*const u8; 1] = [core::ptr::null()];
-        execve(EXEC_PATH_BUFFER.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        execve(exec_ptr_const, argv.as_ptr(), envp.as_ptr());
 
         // If execve fails and it doesn't start with /, try /bin/
         if !cmd.starts_with('/') {
             let bin_prefix = b"/bin/";
-            core::ptr::copy_nonoverlapping(bin_prefix.as_ptr(), BIN_PATH_BUFFER.as_mut_ptr(), bin_prefix.len());
+            let bin_ptr = core::ptr::addr_of_mut!(BIN_PATH_BUFFER) as *mut u8;
+            core::ptr::copy_nonoverlapping(bin_prefix.as_ptr(), bin_ptr, bin_prefix.len());
             let copy_len = cmd.len().min(256 - bin_prefix.len() - 1);
-            core::ptr::copy_nonoverlapping(cmd.as_ptr(), BIN_PATH_BUFFER.as_mut_ptr().add(bin_prefix.len()), copy_len);
-            BIN_PATH_BUFFER[bin_prefix.len() + copy_len] = 0;
+            core::ptr::copy_nonoverlapping(cmd.as_ptr(), bin_ptr.add(bin_prefix.len()), copy_len);
+            *bin_ptr.add(bin_prefix.len() + copy_len) = 0;
 
-            let argv: [*const u8; 2] = [BIN_PATH_BUFFER.as_ptr(), core::ptr::null()];
-            execve(BIN_PATH_BUFFER.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            let bin_ptr_const = core::ptr::addr_of!(BIN_PATH_BUFFER) as *const u8;
+            let argv: [*const u8; 2] = [bin_ptr_const, core::ptr::null()];
+            execve(bin_ptr_const, argv.as_ptr(), envp.as_ptr());
         }
 
         // If we get here, execve failed
