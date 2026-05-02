@@ -42,6 +42,7 @@ const LCRH: usize = 0x02C; // Line control register (high)
 const CR:   usize = 0x030; // Control register
 
 // ── Flag register bits ────────────────────────────────────────────────────────
+const FR_RXFE: u32 = 1 << 4; // RX FIFO empty
 const FR_TXFF: u32 = 1 << 5; // TX FIFO full — spin until clear before writing
 
 // ── Runtime UART base ─────────────────────────────────────────────────────────
@@ -103,4 +104,18 @@ pub unsafe fn putc(c: u8) {
         core::hint::spin_loop();
     }
     wr(DR, c as u32);
+}
+
+/// Read one byte from the RX FIFO, or return `None` if empty.
+pub unsafe fn getc() -> Option<u8> {
+    if rd(FR) & FR_RXFE != 0 {
+        None
+    } else {
+        Some((rd(DR) & 0xFF) as u8)
+    }
+}
+
+/// Check if the RX FIFO has data.
+pub unsafe fn has_data() -> bool {
+    rd(FR) & FR_RXFE == 0
 }
