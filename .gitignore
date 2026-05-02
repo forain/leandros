@@ -4,4 +4,3 @@ target/
 *.img
 *.vdi
 *.cpio.gz
-temp_fat_*.img
