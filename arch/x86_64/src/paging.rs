@@ -21,6 +21,9 @@ bitflags! {
 
 pub const PAGE_SIZE: usize = 4096;
 
+/// Mask for physical address bits in a page-table entry (bits 12-51).
+const PHYS_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
 /// Map a single 4 KiB page.
 ///
 /// `pml4_phys` is the PHYSICAL address of the PML4 root (as stored in CR3).
@@ -40,7 +43,7 @@ pub unsafe fn map_4k(pml4_phys: usize, virt: usize, phys: usize, flags: PageTabl
     let pd   = match ensure_table(pdpt, pdpt_idx, flags) { Some(p) => p, None => return false };
     let pt   = match ensure_table(pd,   pd_idx,   flags) { Some(p) => p, None => return false };
 
-    pt.add(pt_idx).write(phys as u64 | flags.bits());
+    pt.add(pt_idx).write((phys as u64 & PHYS_ADDR_MASK) | flags.bits());
     true
 }
 
@@ -57,15 +60,15 @@ pub unsafe fn unmap_4k(pml4_phys: usize, virt: usize) {
     let pml4 = mm::phys_to_virt(pml4_phys) as *mut u64;
     let pdpt_entry = pml4.add(pml4_idx).read();
     if pdpt_entry & PageTableFlags::PRESENT.bits() == 0 { return; }
-    let pdpt = mm::phys_to_virt((pdpt_entry & !0xFFF) as usize) as *mut u64;
+    let pdpt = mm::phys_to_virt((pdpt_entry & PHYS_ADDR_MASK) as usize) as *mut u64;
 
     let pd_entry = pdpt.add(pdpt_idx).read();
     if pd_entry & PageTableFlags::PRESENT.bits() == 0 { return; }
-    let pd = mm::phys_to_virt((pd_entry & !0xFFF) as usize) as *mut u64;
+    let pd = mm::phys_to_virt((pd_entry & PHYS_ADDR_MASK) as usize) as *mut u64;
 
     let pt_entry = pd.add(pd_idx).read();
     if pt_entry & PageTableFlags::PRESENT.bits() == 0 { return; }
-    let pt = mm::phys_to_virt((pt_entry & !0xFFF) as usize) as *mut u64;
+    let pt = mm::phys_to_virt((pt_entry & PHYS_ADDR_MASK) as usize) as *mut u64;
 
     pt.add(pt_idx).write(0);
 
@@ -95,16 +98,20 @@ unsafe fn ensure_table(parent: *mut u64, idx: usize, flags: PageTableFlags) -> O
 
     let entry = parent.add(idx).read();
     if entry & PageTableFlags::PRESENT.bits() != 0 {
+        // If this is a huge page, we cannot traverse deeper into it.
+        if entry & PageTableFlags::HUGE.bits() != 0 {
+            return None;
+        }
         // Upgrade the existing entry with any newly required W/U bits.
         let upgraded = entry | intermediate_flags.bits();
         if upgraded != entry {
             parent.add(idx).write(upgraded);
         }
-        let next_phys = (entry & !0xFFF) as usize;
+        let next_phys = (entry & PHYS_ADDR_MASK) as usize;
         return Some(mm::phys_to_virt(next_phys) as *mut u64);
     }
     let table_phys = alloc_zeroed_page()?;
-    parent.add(idx).write(table_phys as u64 | intermediate_flags.bits());
+    parent.add(idx).write((table_phys as u64 & PHYS_ADDR_MASK) | intermediate_flags.bits());
     Some(mm::phys_to_virt(table_phys) as *mut u64)
 }
 

@@ -49,6 +49,23 @@ pub fn init(info: &boot::BootInfo) {
         paging::map_4k(root, virt_base, phys_base as usize, 
             paging::PageTableFlags::PRESENT | paging::PageTableFlags::WRITABLE | paging::PageTableFlags::NO_CACHE);
 
+        // Also map the framebuffer if present, as Limine might not have mapped it in HHDM.
+        if info.framebuffer_base != 0 {
+            let fb_size = info.framebuffer_pitch as usize * info.framebuffer_height as usize;
+            let num_pages = (fb_size + 4095) / 4096;
+            for i in 0..num_pages {
+                let offset = i * 4096;
+                let virt = info.framebuffer_base as usize + info.hhdm_offset as usize + offset;
+                let phys = info.framebuffer_base as usize + offset;
+                if !paging::map_4k(root, virt, phys,
+                    paging::PageTableFlags::PRESENT | paging::PageTableFlags::WRITABLE | paging::PageTableFlags::NO_CACHE) {
+                    // This might happen if we hit a huge page that we can't split yet.
+                }
+            }
+            // Flush TLB to ensure the new mappings are active.
+            core::arch::asm!("mov rax, cr3", "mov cr3, rax", out("rax") _);
+        }
+
         apic::init();
     }
     #[cfg(target_arch = "x86_64")]
