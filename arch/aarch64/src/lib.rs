@@ -24,33 +24,16 @@ pub extern "C" fn cpu_id() -> usize {
 ///   2. exception vectors (VBAR_EL1)
 ///   3. GIC distributor + CPU interface
 ///   4. generic timer — arms the countdown and unmasks IRQs
-pub fn init(_info: &boot::BootInfo) {
-    // MAIR_EL1: index 0 = normal WB/WA memory (0xFF),
-    //           index 1 = device nGnRnE memory   (0x00).
+pub fn init(info: &boot::BootInfo) {
     unsafe {
-        core::arch::asm!(
-            "msr MAIR_EL1, {v}",
-            "isb",
-            v = in(reg) 0x00FFu64,
-            options(nostack)
-        );
+        // 1. Initialise exception vectors early to catch any faults during MMU setup.
+        exception::init();
 
-        // Enable FP/SIMD access via CPACR_EL1.FPEN (bits 21:20) = 0b11
-        // This prevents "Access to SVE, Advanced SIMD, or floating-point functionality trapped" exceptions
-        let mut cpacr: u64;
-        core::arch::asm!("mrs {}, CPACR_EL1", out(reg) cpacr, options(nostack, nomem));
-        cpacr |= 0b11 << 20;  // FPEN = 0b11 (no trapping of FP/SIMD at EL0 and EL1)
-        core::arch::asm!(
-            "msr CPACR_EL1, {}",
-            "isb",
-            in(reg) cpacr,
-            options(nostack)
-        );
-
-        // Initialise PL011 UART for early debug output.
-        // uart::init(); // UART already initialized by assembly/Limine.
+        // 2. Initialise MMU (identity + higher-half) and architectural registers (MAIR, TCR, CPACR)
+        mmu::enable_identity(info);
     }
-    // exception::init() is disabled for Limine boots as it currently causes sync exceptions.
+
+    // 3. Initialise peripherals
     gic::init();
     timer::init();
 

@@ -35,16 +35,16 @@ fn interval() -> u64 {
     if f == 0 { 1_000_000 } else { f / TICK_HZ } // guard against uninitialised freq
 }
 
-/// Initialise the physical timer and unmask IRQs at EL1.
+/// Initialise the virtual timer and unmask IRQs at EL1.
 ///
 /// Must be called after `gic::init()` so the IRQ reaches the CPU.
 pub fn init() {
     unsafe {
-        // Load the countdown value (CNTP_TVAL_EL0).
-        core::arch::asm!("msr cntp_tval_el0, {}", in(reg) interval(),
+        // Load the countdown value (CNTV_TVAL_EL0).
+        core::arch::asm!("msr cntv_tval_el0, {}", in(reg) interval(),
                          options(nomem, nostack));
         // Enable the timer: ENABLE=1, IMASK=0.
-        core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1u64,
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64,
                          options(nomem, nostack));
         core::arch::asm!("isb", options(nomem, nostack));
 
@@ -53,14 +53,12 @@ pub fn init() {
     }
 }
 
-/// Called from the IRQ handler when PPI #30 fires.
+/// Called from the IRQ handler when PPI #27 fires (Virtual Timer).
 ///
 /// Reloads the countdown register and increments the tick counter.
-/// Calls `sched::timer_tick_irq()` to notify the scheduler.
-/// This function runs in IRQ context — must not acquire spin locks.
 pub fn on_tick() {
     unsafe {
-        core::arch::asm!("msr cntp_tval_el0, {}", in(reg) interval(),
+        core::arch::asm!("msr cntv_tval_el0, {}", in(reg) interval(),
                          options(nomem, nostack));
     }
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
