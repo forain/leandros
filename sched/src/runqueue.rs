@@ -6,7 +6,6 @@ use super::task::{Pid, Task, TaskState};
 pub const MAX_TASKS: usize = 256;
 
 use alloc::boxed::Box;
-use alloc::format;
 
 pub struct RunQueue {
     pub tasks: [Option<Box<Task>>; MAX_TASKS],
@@ -26,7 +25,7 @@ impl RunQueue {
 
     /// Insert a task into the first free slot. Returns false if the queue is full.
     pub fn enqueue(&mut self, task: Box<Task>) -> bool {
-        for (idx, slot) in self.tasks.iter_mut().enumerate() {
+        for (_idx, slot) in self.tasks.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(task);
                 self.len += 1;

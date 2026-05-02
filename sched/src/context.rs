@@ -152,7 +152,7 @@ impl CpuContext {
                 p.add(3).write(0);                      // r13
                 p.add(4).write(0);                      // r14
                 p.add(5).write(0);                      // r15
-                p.add(6).write(iret_to_user as u64);    // ret target → iretq
+                p.add(6).write(iret_to_user as *const () as u64);    // ret target → iretq
                 p.add(7).write(user_entry as u64);      // IRET: user RIP
                 p.add(8).write(0x23);                   // IRET: user CS  (DPL 3, 64-bit)
                 p.add(9).write(0x202);                  // IRET: RFLAGS (IF=1)
@@ -504,8 +504,6 @@ cpu_switch_to_with_pt:
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(r#"
-.intel_syntax noprefix
-
 .global cpu_switch_to
 .type   cpu_switch_to, @function
 cpu_switch_to:

@@ -193,10 +193,12 @@ pub fn fork_current(frame_ptr: usize) -> isize {
 pub fn clone_thread(
     flags:       usize,
     child_stack: usize,
+    #[allow(unused_variables)]
     tls:         usize,
     ctid:        usize,
     frame_ptr:   usize,
 ) -> isize {
+    #[allow(dead_code)]
     const CLONE_SETTLS:         usize = 0x0008_0000;
     const CLONE_THREAD:         usize = 0x0001_0000;
     const CLONE_CHILD_SETTID:   usize = 0x0100_0000;

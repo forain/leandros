@@ -26,7 +26,6 @@ use spin::Mutex;
 use task::{Pid, Task, TaskState};
 use context::CpuContext;
 use runqueue::RunQueue;
-use alloc::boxed::Box;
 
 static RUN_QUEUE:       Mutex<RunQueue> = Mutex::new(RunQueue::new());
 static NEXT_PID:        Mutex<Pid>      = Mutex::new(1);
