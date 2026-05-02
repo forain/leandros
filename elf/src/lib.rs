@@ -196,15 +196,6 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
         }
         if ph.p_flags & PF_X != 0 {
             flags |= PageFlags::EXECUTE;
-            // DEBUG: Critical debug output
-            // This is ugly but necessary for debugging
-            #[cfg(target_arch = "aarch64")]
-            {
-                let debug_msg = b"[ELF] EXECUTABLE segment detected! PF_X=1, setting EXECUTE flag\r\n";
-                for &byte in debug_msg {
-                    unsafe { (0x09000000 as *mut u8).write(byte); }
-                }
-            }
         }
         // PF_R (read permission) is always granted; no separate flag needed.
 
@@ -212,6 +203,14 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
         let page_vaddr   = vaddr & !(page_size - 1);
         let page_offset  = vaddr - page_vaddr;          // byte offset into the first page
         let map_size     = memsz + page_offset;         // total bytes to map
+
+        // DEBUG: Trace segment mapping
+        #[cfg(target_arch = "aarch64")]
+        {
+            extern "C" { fn arch_serial_putc(c: u8); }
+            let msg = b"[ELF] Mapping segment...\r\n";
+            for &byte in msg { unsafe { arch_serial_putc(byte); } }
+        }
 
         // Map the segment.  map() zeroes all backing pages so the BSS tail
         // (memsz > filesz) is already zeroed.
@@ -246,8 +245,8 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
                     #[cfg(target_arch = "aarch64")]
                     {
                         // Clean data cache and invalidate instruction cache for the code region
-                        let start_addr = phys_base;
-                        let end_addr = phys_base + filesz;
+                        let start_addr = mm::phys_to_virt(phys_base);
+                        let end_addr = start_addr + filesz;
 
                         // Clean data cache to point of coherency
                         let mut addr = start_addr & !63; // Align to cache line (64 bytes)
@@ -259,11 +258,10 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
                         core::arch::asm!("ic iallu"); // Invalidate all instruction cache
                         // Ensure completion
                         core::arch::asm!("isb");
-
-                        let debug_msg = b"[ELF] Cache maintenance completed for executable segment\r\n";
-                        for &byte in debug_msg {
-                            (0x09000000 as *mut u8).write(byte);
-                        }
+                        
+                        let msg = b"[ELF] Segment mapped and cache maintained\r\n";
+                        extern "C" { fn arch_serial_putc(c: u8); }
+                        for &byte in msg { arch_serial_putc(byte); }
                     }
                 }
             }
