@@ -10,19 +10,20 @@
 
 use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 use alloc::vec::Vec;
-use crate::{serial_print, serial_write_byte, serial_write_raw, print_number, print_hex, BOOT_INFO_PTR, init};
+use crate::{serial_print, serial_write_raw, print_hex, BOOT_INFO_PTR, init};
 use ipc::{Message, port};
 use sched::{
     fork_current, clone_thread, 
     sys_sigaction, sys_sigprocmask, restore_signal_frame,
-    futex_wait, futex_wake,
-    current_pid, current_ppid, current_pgid, current_sid,
+    current_pid, current_ppid,
     ticks, yield_now, exit, spawn_user,
     deliver_signal, pending_signals, clear_pending_signal, replace_signal_mask,
     current_reply_port, set_current_reply_port, block_on, set_clear_child_tid,
-    set_fs_base, get_fs_base, replace_address_space,
+    replace_address_space,
     with_current_address_space, with_current_address_space_mut
 };
+#[cfg(target_arch = "x86_64")]
+use sched::{set_fs_base, get_fs_base};
 use mm::paging::PageFlags;
 use elf;
 use vfs_server as vfs;

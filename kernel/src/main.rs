@@ -68,11 +68,14 @@ impl FbConsole {
         } else if c == b'\r' {
             self.cursor_x = 0;
         } else {
-            self.draw_char(self.cursor_x, self.cursor_y, c, 0xFFFFFF);
-            self.cursor_x += Self::CHAR_WIDTH;
-            if self.cursor_x + Self::CHAR_WIDTH > self.width {
-                self.cursor_x = 0;
-                self.cursor_y += Self::CHAR_HEIGHT;
+            // Skip UTF-8 continuation bytes to keep cursor alignment
+            if (c & 0xC0) != 0x80 {
+                self.draw_char(self.cursor_x, self.cursor_y, c, 0xFFFFFF);
+                self.cursor_x += Self::CHAR_WIDTH;
+                if self.cursor_x + Self::CHAR_WIDTH > self.width {
+                    self.cursor_x = 0;
+                    self.cursor_y += Self::CHAR_HEIGHT;
+                }
             }
         }
 
@@ -82,6 +85,9 @@ impl FbConsole {
     }
 
     fn draw_char(&mut self, x: usize, y: usize, c: u8, color: u32) {
+        if (c as usize) * 8 + 8 > Self::FONT.len() {
+            return;
+        }
         let glyph = &Self::FONT[(c as usize) * 8 .. (c as usize) * 8 + 8];
         for (gy, &row) in glyph.iter().enumerate() {
             for gx in 0..8 {
@@ -193,6 +199,15 @@ const fn include_font() -> [u8; 128 * 8] {
     font[b']' as usize * 8 + 1] = 0x3c; font[b']' as usize * 8 + 2] = 0x0c; font[b']' as usize * 8 + 3] = 0x0c; font[b']' as usize * 8 + 4] = 0x0c; font[b']' as usize * 8 + 5] = 0x0c; font[b']' as usize * 8 + 6] = 0x3c;
     font[b'(' as usize * 8 + 1] = 0x0c; font[b'(' as usize * 8 + 2] = 0x18; font[b'(' as usize * 8 + 3] = 0x18; font[b'(' as usize * 8 + 4] = 0x18; font[b'(' as usize * 8 + 5] = 0x18; font[b'(' as usize * 8 + 6] = 0x0c;
     font[b')' as usize * 8 + 1] = 0x30; font[b')' as usize * 8 + 2] = 0x18; font[b')' as usize * 8 + 3] = 0x18; font[b')' as usize * 8 + 4] = 0x18; font[b')' as usize * 8 + 5] = 0x18; font[b')' as usize * 8 + 6] = 0x30;
+    font[b'>' as usize * 8 + 2] = 0x60; font[b'>' as usize * 8 + 3] = 0x30; font[b'>' as usize * 8 + 4] = 0x18; font[b'>' as usize * 8 + 5] = 0x30; font[b'>' as usize * 8 + 6] = 0x60;
+    font[b'-' as usize * 8 + 4] = 0x7e;
+    font[b'/' as usize * 8 + 1] = 0x06; font[b'/' as usize * 8 + 2] = 0x0c; font[b'/' as usize * 8 + 3] = 0x18; font[b'/' as usize * 8 + 4] = 0x30; font[b'/' as usize * 8 + 5] = 0x60; font[b'/' as usize * 8 + 6] = 0xc0;
+    font[b'_' as usize * 8 + 7] = 0xff;
+    font[b'*' as usize * 8 + 2] = 0x66; font[b'*' as usize * 8 + 3] = 0x3c; font[b'*' as usize * 8 + 4] = 0xff; font[b'*' as usize * 8 + 5] = 0x3c; font[b'*' as usize * 8 + 6] = 0x66;
+    font[b'+' as usize * 8 + 2] = 0x18; font[b'+' as usize * 8 + 3] = 0x18; font[b'+' as usize * 8 + 4] = 0x7e; font[b'+' as usize * 8 + 5] = 0x18; font[b'+' as usize * 8 + 6] = 0x18;
+    font[b'=' as usize * 8 + 3] = 0x7e; font[b'=' as usize * 8 + 5] = 0x7e;
+    font[b'?' as usize * 8 + 1] = 0x3c; font[b'?' as usize * 8 + 2] = 0x66; font[b'?' as usize * 8 + 3] = 0x06; font[b'?' as usize * 8 + 4] = 0x0c; font[b'?' as usize * 8 + 6] = 0x18;
+    font[b'#' as usize * 8 + 2] = 0x66; font[b'#' as usize * 8 + 3] = 0x7e; font[b'#' as usize * 8 + 4] = 0x66; font[b'#' as usize * 8 + 5] = 0x7e; font[b'#' as usize * 8 + 6] = 0x66;
     font[b':' as usize * 8 + 2] = 0x18; font[b':' as usize * 8 + 5] = 0x18;
     font[b'.' as usize * 8 + 6] = 0x18;
     font[b',' as usize * 8 + 6] = 0x18; font[b',' as usize * 8 + 7] = 0x10;
@@ -311,7 +326,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
 
     if boot_info.framebuffer_base != 0 {
         unsafe {
-            let mut console = FbConsole::new(
+            let console = FbConsole::new(
                 mm::phys_to_virt(boot_info.framebuffer_base as usize) as *mut u32,
                 boot_info.framebuffer_width as usize,
                 boot_info.framebuffer_height as usize,
