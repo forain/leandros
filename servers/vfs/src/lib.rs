@@ -282,6 +282,7 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/dev/stdout",  data: b"" },
     RamEntry { path: b"/dev/stderr",  data: b"" },
     RamEntry { path: b"/dev/tty",     data: b"" },
+    RamEntry { path: b"/dev/fb0",     data: b"" },
     // /etc
     RamEntry { path: b"/etc/motd",
                data: b"Welcome to Leandros!\nType 'help' for available commands.\n" },
