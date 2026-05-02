@@ -25,13 +25,8 @@ pub unsafe fn enable_identity(boot_info: &BootInfo) {
     // 2. Determine physical address of the kernel.
     let mut kernel_phys_base = 0usize;
     
-    extern "C" {
-        pub static KERNEL_ADDR_REQUEST: boot::limine::Request<boot::limine::KernelAddressResponse>;
-    }
-    
-    let resp_ptr = *KERNEL_ADDR_REQUEST.response.get();
-    if !resp_ptr.is_null() {
-        kernel_phys_base = (*resp_ptr).physical_base as usize;
+    if let Some(resp) = boot::limine::KERNEL_ADDR_REQUEST.response() {
+        kernel_phys_base = resp.physical_base as usize;
     } else {
         // Fallback: scan memory regions for the kernel.
         for region in boot_info.memory_regions() {
