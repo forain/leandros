@@ -3,7 +3,6 @@ OUTPUT_FORMAT("elf64-littleaarch64", "elf64-littleaarch64", "elf64-littleaarch64
 
 PHDRS
 {
-    limine_requests PT_LOAD FLAGS(6);
     text PT_LOAD FLAGS(5);
     rodata PT_LOAD FLAGS(4);
     data PT_LOAD FLAGS(6);
@@ -37,11 +36,13 @@ SECTIONS
         *(.got .got.*)
         *(.data.rel.ro .data.rel.ro.*)
         *(.tdata .tdata.*)
+
         /* ── Limine request structures ────────────────────────────────────────── */
         . = ALIGN(8);
         KEEP(*(.limine_reqs_start))
         KEEP(*(.limine_reqs))
         KEEP(*(.limine_reqs_end))
+
         __data_end = .;
     } :data
 

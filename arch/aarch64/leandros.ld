@@ -15,7 +15,7 @@
 
 ENTRY(_start)
 
-KERNEL_OFFSET = 0xFFFFFF0000000000;
+KERNEL_OFFSET = 0xFFFFFFFF80000000;
 
 SECTIONS
 {
@@ -51,11 +51,14 @@ SECTIONS
         *(.data .data.*)
         /* ── Limine request structures ────────────────────────────────────────── */
         . = ALIGN(8);
-        KEEP(*(.limine_requests_start))
-        KEEP(*(.limine_requests))
-        KEEP(*(.limine_requests_end))
+        KEEP(*(.limine_reqs_start))
+        KEEP(*(.limine_reqs))
+        KEEP(*(.limine_reqs_end))
+
+        __data_end = .;
     }
-        . = ALIGN(4096);
+
+    .bss ALIGN(4096) : AT(ADDR(.bss) - KERNEL_OFFSET) {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
