@@ -15,8 +15,10 @@ bitflags! {
         /// Entry is a table (L0-L2) or page (L3).  Must be 1 for L3 entries.
         const TABLE     = 1 << 1;
         /// Memory attributes index (MAIR_EL1).
-        const ATTR_NORM = 0 << 2; // index 0 (normal WB/WA)
-        const ATTR_DEV  = 1 << 2; // index 1 (device nGnRnE)
+        const ATTR_NORM    = 0 << 2; // index 0 (normal WB/WA)
+        const ATTR_DEV     = 1 << 2; // index 1 (device nGnRE)
+        const ATTR_STRICT  = 2 << 2; // index 2 (device nGnRnE)
+        const ATTR_NOCACHE = 3 << 2; // index 3 (normal NC)
         /// Non-secure access.
         const NS        = 1 << 5;
         /// User (EL0) access allowed.
@@ -93,6 +95,11 @@ pub unsafe fn unmap_4k(pgd_phys: *mut u64, virt: usize) {
 unsafe fn ensure_table(parent: *mut u64, idx: usize) -> Option<*mut u64> {
     let entry = parent.add(idx).read();
     if entry & PageDescFlags::VALID.bits() != 0 {
+        // If this is a block (not a table), we can't traverse deeper.
+        // Bit 1 is 1 for table (L0-L2) or page (L3).
+        if entry & 0b10 == 0 {
+            return None;
+        }
         // Table is already present; extract the physical address.
         return Some((entry & 0x0000_FFFF_FFFF_F000) as *mut u64);
     }
@@ -135,7 +142,7 @@ fn translate_flags(bits: u64) -> PageDescFlags {
     if src.contains(PageFlags::USER)     { f |= PageDescFlags::USER; }
     if !src.contains(PageFlags::WRITABLE){ f |= PageDescFlags::RDONLY; }
     if !src.contains(PageFlags::EXECUTE) { f |= PageDescFlags::NO_EXEC; }
-    if src.contains(PageFlags::NOCACHE)  { f |= PageDescFlags::ATTR_DEV; } // MAIR index 1
+    if src.contains(PageFlags::NOCACHE)  { f |= PageDescFlags::ATTR_NOCACHE; } // MAIR index 3
 
     f
 }
