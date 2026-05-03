@@ -154,26 +154,23 @@ pub unsafe fn smp_init(mpidrs: &[u64]) {
         if i >= MAX_APS { break; }
 
         // Allocate and zero a 64 KiB kernel stack.
-        // On OOM: `continue` skips the cpu_on call for this AP, so the AP is
-        // simply never started and ap_stack_table[i] remains 0.  That is safe
-        // because the AP entry stub only runs after cpu_on succeeds.
-        let stack = match mm::buddy::alloc(4) {
+        let stack_phys = match mm::buddy::alloc(4) {
             Some(p) => p,
             None    => continue,
         };
-        (stack as *mut u8).write_bytes(0, mm::buddy::PAGE_SIZE * 16);
-        let stack_top = stack + mm::buddy::PAGE_SIZE * 16;
+        let stack_virt = mm::phys_to_virt(stack_phys) as *mut u8;
+        stack_virt.write_bytes(0, mm::buddy::PAGE_SIZE * 16);
+        let stack_top = stack_phys + mm::buddy::PAGE_SIZE * 16;
 
         // Store stack top before issuing CPU_ON.
         ap_stack_table[i] = stack_top as u64;
 
-        // Issue PSCI CPU_ON: entry = aarch64_ap_entry, context = AP index.
-        // PSCI success = 0; negative values are error codes.
-        // PSCI_ALREADY_ON (−4) is non-fatal: the AP is already running.
-        let rc = cpu_on(mpidr, aarch64_ap_entry as *const () as usize, i as u64);
+        // Issue PSCI CPU_ON: entry = aarch64_ap_entry (physical), context = AP index.
+        let entry_phys = mm::virt_to_phys(aarch64_ap_entry as *const () as usize);
+        let rc = cpu_on(mpidr, entry_phys, i as u64);
         if rc != 0 && rc != -4 {
             // Roll back the stack allocation and skip this AP.
-            mm::buddy::free(stack, 1);
+            mm::buddy::free(stack_phys, 1);
             ap_stack_table[i] = 0;
             // PSCI error codes: -1=INTERNAL_FAILURE, -2=NOT_PRESENT,
             // -3=DENIED, -5=INVALID_ADDRESS, -6=INVALID_PARAMS.
