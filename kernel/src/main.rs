@@ -117,7 +117,7 @@ impl FbConsole {
             );
             // Clear bottom line
             let bottom_start = rows_to_copy * (self.pitch / 4);
-            core::ptr::write_bytes(self.base.add(bottom_start), 0, Self::CHAR_HEIGHT * self.pitch);
+            core::ptr::write_bytes(self.base.add(bottom_start), 0, Self::CHAR_HEIGHT * (self.pitch / 4));
         }
         self.cursor_y -= Self::CHAR_HEIGHT;
     }
@@ -220,6 +220,7 @@ const fn include_font() -> [u8; 128 * 8] {
 #[no_mangle]
 pub static mut UART_BASE: usize = 0x09000000;
 
+#[no_mangle]
 pub fn serial_write_byte(b: u8) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -227,14 +228,7 @@ pub fn serial_write_byte(b: u8) {
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        let base = UART_BASE;
-        // Direct write to UART data register
-        core::arch::asm!(
-            "str {val:w}, [{base}]",
-            val = in(reg) b as u32,
-            base = in(reg) base,
-            options(nostack, nomem)
-        );
+        arch_aarch64::uart::putc(b);
     }
 
     unsafe {
@@ -296,30 +290,52 @@ pub fn print_hex(n: usize) {
 
 #[no_mangle]
 pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
-    // Dummy references to ensure markers are linked.
+    // Dummy references to ensure markers and requests are linked.
     core::hint::black_box(&START_MARKER);
     core::hint::black_box(&BASE_REVISION);
+    core::hint::black_box(&boot::limine::HHDM_REQUEST);
+    core::hint::black_box(&boot::limine::MEMMAP_REQUEST);
+    core::hint::black_box(&boot::limine::FRAMEBUFFER_REQUEST);
+    core::hint::black_box(&boot::limine::RSDP_REQUEST);
+    core::hint::black_box(&boot::limine::MODULE_REQUEST);
+    core::hint::black_box(&boot::limine::KERNEL_ADDR_REQUEST);
     core::hint::black_box(&END_MARKER);
 
     serial_write_byte(b'M');
     serial_write_byte(b'1');
 
     serial_print("\n[LEANDROS] Kernel starting...\n");
+    serial_print("[TRACE 1] x0 (magic): ");
+    print_hex(boot_info_addr);
+    serial_print("\n");
 
+    serial_print("[TRACE 2] Detecting bootloader...\n");
     let is_limine = boot::limine::HHDM_REQUEST.response().is_some();
+    serial_print("[TRACE 3] is_limine: ");
+    serial_write_byte(if is_limine { b'Y' } else { b'N' });
+    serial_print("\n");
 
     let boot_info = if is_limine {
-        unsafe { boot::limine::parse() }
+        serial_print("[TRACE 4] Parsing Limine...\n");
+        let info = unsafe { boot::limine::parse() };
+        serial_print("[TRACE 5] Limine parsed. Memory regions: ");
+        print_number(info.memory_map_len as u32);
+        serial_print("\n");
+        info
     } else {
         #[cfg(target_arch = "x86_64")]
         { unsafe { boot::multiboot2::parse(boot_info_addr) } }
         #[cfg(target_arch = "aarch64")]
-        { unsafe { boot::device_tree::parse(boot_info_addr) } }
+        { 
+            serial_print("[TRACE 4b] Parsing DTB...\n");
+            unsafe { boot::device_tree::parse(boot_info_addr) } 
+        }
     };
 
+    serial_print("[TRACE 6] mm::init_with_map...\n");
     mm::init_with_map(boot_info.memory_regions(), boot_info.hhdm_offset as usize);
     
-    serial_print("  mm::phys_to_virt(0) = ");
+    serial_print("[TRACE 7] mm::phys_to_virt(0) = ");
     print_hex(mm::phys_to_virt(0));
     serial_print("\n");
 
@@ -329,7 +345,19 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     #[cfg(target_arch = "aarch64")]
     { arch_aarch64::init(&boot_info); }
 
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        if boot_info.uart_base != 0 {
+            UART_BASE = boot_info.uart_base as usize;
+        }
+        UART_BASE = mm::phys_to_virt(UART_BASE);
+        arch_aarch64::uart::reinit(UART_BASE);
+    }
+
     if boot_info.framebuffer_base != 0 {
+        serial_print("[INIT] Framebuffer found at physical ");
+        print_hex(boot_info.framebuffer_base as usize);
+        serial_print("\n");
         unsafe {
             let console = FbConsole::new(
                 mm::phys_to_virt(boot_info.framebuffer_base as usize) as *mut u32,
@@ -344,6 +372,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             FB_CONSOLE = Some(console);
         }
         serial_print("[INIT] Framebuffer console initialized\n");
+    } else if is_limine {
+        serial_print("[WARN] Limine did not provide a framebuffer request response\n");
     }
 
     serial_print("[INIT] Scheduler init...\n");
