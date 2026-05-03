@@ -167,6 +167,8 @@ if [ "$BOOT_MODE" = "uefi" ]; then
         $ACCEL_ARGS
         -m 512M
         -serial mon:stdio
+        -device virtio-gpu-pci
+        -boot menu=on,splash-time=0
         -net none
         -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE"
         -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE"
