@@ -41,16 +41,20 @@ pub const SPURIOUS: u32 = 1023;
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 unsafe fn gicd_r32(off: usize) -> u32 {
-    ((GICD_BASE + off) as *const u32).read_volatile()
+    let base = mm::phys_to_virt(GICD_BASE);
+    ((base + off) as *const u32).read_volatile()
 }
 unsafe fn gicd_w32(off: usize, v: u32) {
-    ((GICD_BASE + off) as *mut u32).write_volatile(v)
+    let base = mm::phys_to_virt(GICD_BASE);
+    ((base + off) as *mut u32).write_volatile(v)
 }
 unsafe fn gicc_r32(off: usize) -> u32 {
-    ((GICC_BASE + off) as *const u32).read_volatile()
+    let base = mm::phys_to_virt(GICC_BASE);
+    ((base + off) as *const u32).read_volatile()
 }
 unsafe fn gicc_w32(off: usize, v: u32) {
-    ((GICC_BASE + off) as *mut u32).write_volatile(v)
+    let base = mm::phys_to_virt(GICC_BASE);
+    ((base + off) as *mut u32).write_volatile(v)
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
