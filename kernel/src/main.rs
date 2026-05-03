@@ -319,11 +319,6 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
 
     mm::init_with_map(boot_info.memory_regions(), boot_info.hhdm_offset as usize);
     
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        UART_BASE = mm::phys_to_virt(0x09000000);
-    }
-
     serial_print("  mm::phys_to_virt(0) = ");
     print_hex(mm::phys_to_virt(0));
     serial_print("\n");
