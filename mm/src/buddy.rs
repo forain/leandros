@@ -30,19 +30,13 @@ impl FreeList {
 static FREE_LISTS: Mutex<[FreeList; MAX_ORDER]> = Mutex::new([const { FreeList::empty() }; MAX_ORDER]);
 
 /// Initialise the buddy allocator from the boot memory map.
-///
-/// Each Available region is broken into the largest possible order-aligned
-/// blocks and inserted into the free lists — mirroring `free_area_init` in
-/// Linux `mm/page_alloc.c`.
 pub fn init_from_map(regions: &[boot::MemoryRegion]) {
     for region in regions {
         if region.kind != boot::MemoryType::Available { continue; }
-        // Skip the first 32 MiB of usable RAM — reserved for kernel image, page tables, etc.
-        let r_start = region.base as usize;
-        let r_end = (region.base + region.length) as usize;
         
-        let start = leandros_lib::align_up(r_start + 0x02000000, PAGE_SIZE << (MAX_ORDER - 1));
-        let end = leandros_lib::align_down(r_end, PAGE_SIZE);
+        // Use all available RAM. Limine marks kernel/modules as reserved.
+        let start = leandros_lib::align_up(region.base as usize, PAGE_SIZE);
+        let end = leandros_lib::align_down((region.base + region.length) as usize, PAGE_SIZE);
         
         if start >= end { continue; }
 
@@ -70,10 +64,22 @@ pub fn alloc(order: usize) -> Option<usize> {
     // Walk up from requested order looking for a free block.
     for o in order..MAX_ORDER {
         if let Some(addr) = lists[o].head.take() {
+            // Pop from head: set head to next block stored in the page.
+            unsafe {
+                let next_ptr = crate::phys_to_virt(addr) as *const usize;
+                let next_val = *next_ptr;
+                lists[o].head = if next_val == 0 { None } else { Some(next_val) };
+            }
+
             // Split excess blocks back down.
             for split in (order..o).rev() {
                 let buddy = addr + (PAGE_SIZE << split);
-                lists[split].head = Some(buddy);
+                // Push buddy to head of its list.
+                unsafe {
+                    let next_ptr = crate::phys_to_virt(buddy) as *mut usize;
+                    *next_ptr = lists[split].head.unwrap_or(0);
+                    lists[split].head = Some(buddy);
+                }
             }
             FREE_PAGES.fetch_sub(1 << order, Ordering::Relaxed);
             return Some(addr);
@@ -91,18 +97,12 @@ pub fn free(addr: usize, order: usize) {
     assert!(order < MAX_ORDER);
     FREE_PAGES.fetch_add(1 << order, Ordering::Relaxed);
     let mut lists = FREE_LISTS.lock();
-    let mut current = addr;
-    let mut current_order = order;
-    // Merge with buddy while possible.
-    while current_order < MAX_ORDER - 1 {
-        let buddy = current ^ (PAGE_SIZE << current_order);
-        if lists[current_order].head == Some(buddy) {
-            lists[current_order].head = None;
-            current = current.min(buddy);
-            current_order += 1;
-        } else {
-            break;
-        }
+    
+    // For now, we skip complex merging of non-head buddies to avoid O(N) scans.
+    // We just push the freed block to the head.
+    unsafe {
+        let next_ptr = crate::phys_to_virt(addr) as *mut usize;
+        *next_ptr = lists[order].head.unwrap_or(0);
+        lists[order].head = Some(addr);
     }
-    lists[current_order].head = Some(current);
 }
