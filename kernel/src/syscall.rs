@@ -10,7 +10,7 @@
 
 use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 use alloc::vec::Vec;
-use crate::{serial_print, serial_write_raw, print_hex, BOOT_INFO_PTR, init};
+use crate::{serial_print_str, serial_write_raw, print_hex, BOOT_INFO_PTR, init, serial_read_byte, serial_has_data};
 use ipc::{Message, port};
 use sched::{
     fork_current, clone_thread, 
@@ -515,8 +515,6 @@ pub extern "C" fn syscall_dispatch(
     a3: usize, a4: usize,
     a5: usize, frame_ptr: usize, _padding: usize,
 ) -> isize {
-    // x86-64 assembly pushes: [rsp+0]=a5, [rsp+8]=frame_ptr, [rsp+16]=0 (padding)
-    // Register args: rdi=number, rsi=a0, rdx=a1, rcx=a2, r8=a3, r9=a4
     dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr)
 }
 
@@ -553,7 +551,7 @@ fn dispatch_inner(
         MINCORE  => 0, // pretend all pages are resident
 
         // ── Scheduling ────────────────────────────────────────────────────────
-        SCHED_YIELD => { yield_now(); 0 }
+        SCHED_YIELD => { yield_now("syscall_yield"); 0 }
 
         // ── Process lifecycle ─────────────────────────────────────────────────
         EXIT    => { vfs_close_all_current(); exit(a0 as i32) }
@@ -567,9 +565,9 @@ fn dispatch_inner(
         EXECVE  => {
             let res = sys_execve(a0, a1, a2);
             if res < 0 {
-                crate::serial_print("  [SYSCALL] sys_execve failed with error: ");
+                crate::serial_print_str("  [SYSCALL] sys_execve failed with error: ");
                 crate::print_hex(res as usize);
-                crate::serial_print("\n");
+                crate::serial_print_str("\n");
             }
             res
         }
@@ -1157,7 +1155,7 @@ fn sys_rt_sigsuspend(mask_ptr: usize, _sigsetsize: usize) -> isize {
     // Yield until a signal arrives that is not blocked by new_mask.
     loop {
         if pending_signals() & !new_mask != 0 { break; }
-        yield_now();
+        yield_now("sigsuspend");
     }
     // Restore old mask before returning.
     let _ = replace_signal_mask(old_mask);
@@ -1203,7 +1201,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
         if let Some(dl) = deadline {
             if ticks() >= dl { return -110; } // ETIMEDOUT
         }
-        yield_now();
+        yield_now("sigtimedwait");
     }
 }
 
@@ -1407,9 +1405,9 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
         let tv_nsec = unsafe { core::ptr::read((timeout_ptr + 8) as *const i64) };
         if tv_sec == 0 && tv_nsec == 0 { return 0; }
         // Non-zero timeout: yield once before returning (cooperative).
-        yield_now();
+        yield_now("ppoll");
     } else if nready == 0 {
-        yield_now();
+        yield_now("ppoll");
     }
     nready
 }
@@ -1431,7 +1429,7 @@ fn sys_nanosleep(rqtp_ptr: usize, _rmtp: usize) -> isize {
     if ticks_needed == 0 { return 0; }
     let deadline = ticks().wrapping_add(ticks_needed);
     loop {
-        yield_now();
+        yield_now("nanosleep");
         if ticks() >= deadline { break; }
     }
     0
@@ -1732,14 +1730,15 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         None => {
             // 2. Fallback to initrd lookup using the resolved absolute path
             let (ptr, len) = unsafe {
-                if BOOT_INFO_PTR != 0 {
-                    let boot_info = &*(BOOT_INFO_PTR as *const boot::BootInfo);
+                let bi_ptr = BOOT_INFO_PTR.load(Ordering::SeqCst);
+                if bi_ptr != 0 {
+                    let boot_info = &*(bi_ptr as *const boot::BootInfo);
                     match init::extract_binary_from_initrd(path, boot_info) {
                         Some(data) => (data.as_ptr() as usize, data.len()),
                         None => {
-                            serial_print("[EXEC] Failed to find binary in initrd: ");
-                            serial_print(path);
-                            serial_print("\n");
+                            serial_print_str("[EXEC] Failed to find binary in initrd: ");
+                            serial_print_str(path);
+                            serial_print_str("\n");
                             return -2; // ENOENT
                         }
                     }
@@ -1948,11 +1947,11 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let cloexec_msg = make_vfs_msg(vfs::VFS_EXEC_CLOEXEC, &[pid as u64]);
     let _ = vfs::handle(&cloexec_msg, pid);
 
-    serial_print("[EXEC] Jumping to entry=0x");
+    serial_print_str("[EXEC] Jumping to entry=0x");
     print_hex(entry);
-    serial_print(" sp=0x");
+    serial_print_str(" sp=0x");
     print_hex(user_sp);
-    serial_print("\n");
+    serial_print_str("\n");
 
     replace_address_space(*new_as, pt_root, heap_start, entry, user_sp);
 }
@@ -1964,25 +1963,23 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 /// fd 1/2 write directly to serial.  All other fds route through VFS.
 fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
     if count == 0 { return 0; }
-    
+
     if !validate_user_buf(buf_ptr, count) { return -14; }
     match fd {
         1 | 2 => {
             let mut kbuf = Vec::with_capacity(count);
             unsafe { kbuf.set_len(count); }
-            
+
             let ok = with_current_address_space(|as_| {
                 as_.read_user_buf(buf_ptr, &mut kbuf)
             }).unwrap_or(false);
 
-            if !ok { 
-                serial_print("sys_write: read_user_buf failed\n");
-                return -14; 
-            }
-            
+            if !ok { return -14; }
+
             serial_write_raw(kbuf.as_slice());
             count as isize
         }
+
         _ => {
             let pid = current_pid();
             let msg = make_vfs_msg(vfs::VFS_WRITE, &[fd as u64, buf_ptr as u64, count as u64]);
@@ -2005,7 +2002,7 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
             let first = loop {
                 match crate::serial_read_byte() {
                     Some(b) => break b,
-                    None    => yield_now(),
+                    None    => yield_now("sys_read_stdin"),
                 }
             };
             
@@ -2044,7 +2041,7 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
             loop {
                 let n = vfs_reply_val(&vfs::handle(&msg, pid));
                 if n != -11 { return n; }
-                yield_now();
+                yield_now("sys_read_vfs");
             }
         }
     }
@@ -2103,7 +2100,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
                 let n = loop {
                     let v = vfs_reply_val(&vfs::handle(&msg, pid));
                     if v != -11 { break v; }
-                    yield_now();
+                    yield_now("sys_readv_vfs");
                 };
                 if n < 0 { return if total > 0 { total } else { n }; }
                 total = total.saturating_add(n);
