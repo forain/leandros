@@ -103,6 +103,7 @@ static void addKeyToQueue(int pressed, unsigned char keyCode) {
 
 static uint32_t key_expiration[256] = {0};
 static int key_is_down[256] = {0};
+static int capslock_run_locked = 0;
 
 struct leandros_input_event {
     struct {
@@ -158,8 +159,24 @@ int DG_GetKey(int* pressed, unsigned char* key) {
                         case ' ': dkey = ' '; break;
                         case 'e':
                         case 'E': dkey = KEY_USE; break;
-                        case 'f':
-                        case 'F': dkey = KEY_FIRE; break;
+                        case 'c':
+                        case 'C': dkey = KEY_FIRE; break;
+                        case ',': dkey = KEY_STRAFE_L; break;
+                        case '.': dkey = KEY_STRAFE_R; break;
+                        case 182: dkey = KEY_RSHIFT; break;
+                        case 186:
+                            if (ev.value == 1 || ev.value == 2) {
+                                // Only toggle on initial press, or allow repeat to toggle?
+                                // Actually, capslock is a toggle, so only on down (value==1).
+                                // But if it's serial input, it sends value==2 repeatedly. We should probably just toggle on value==1.
+                                if (ev.value == 1) {
+                                    capslock_run_locked = !capslock_run_locked;
+                                    addKeyToQueue(capslock_run_locked ? 1 : 0, KEY_RSHIFT);
+                                    key_is_down[KEY_RSHIFT] = capslock_run_locked;
+                                }
+                            }
+                            dkey = 0;
+                            break;
                         default:
                             if (ev.code >= 'a' && ev.code <= 'z') dkey = ev.code;
                             else if (ev.code >= 'A' && ev.code <= 'Z') dkey = ev.code - 'A' + 'a';
@@ -180,9 +197,13 @@ int DG_GetKey(int* pressed, unsigned char* key) {
                             }
                         } else if (ev.value == 0) { // Native Up
                             if (key_is_down[dkey]) {
-                                key_is_down[dkey] = 0;
-                                key_expiration[dkey] = 0;
-                                addKeyToQueue(0, dkey);
+                                if (dkey == KEY_RSHIFT && capslock_run_locked) {
+                                    // Ignore manual Shift release if capslock is keeping it ON
+                                } else {
+                                    key_is_down[dkey] = 0;
+                                    key_expiration[dkey] = 0;
+                                    addKeyToQueue(0, dkey);
+                                }
                             }
                         }
                     }

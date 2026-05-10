@@ -28,13 +28,20 @@ unsafe fn inb(port: u16) -> u8 {
 unsafe fn inb(_port: u16) -> u8 { 0 }
 
 fn handle_scancode(scancode: u8) {
-    match scancode {
-        0x2A | 0x36 => unsafe { SHIFT = true; },
-        0xAA | 0xB6 => unsafe { SHIFT = false; },
-        _ => {
-            let is_up = (scancode & 0x80) != 0;
-            let code = scancode & 0x7F;
+    let is_up = (scancode & 0x80) != 0;
+    let code = scancode & 0x7F;
 
+    match code {
+        0x2A | 0x36 => unsafe { 
+            SHIFT = !is_up; 
+            evdev_server::push_event(0, 1 /* EV_KEY */, 182, if is_up { 0 } else { 1 });
+            evdev_server::push_event(0, 0 /* EV_SYN */, 0, 0);
+        },
+        0x3A => { // Capslock
+            evdev_server::push_event(0, 1 /* EV_KEY */, 186, if is_up { 0 } else { 1 });
+            evdev_server::push_event(0, 0 /* EV_SYN */, 0, 0);
+        },
+        _ => {
             let ascii = if unsafe { SHIFT } {
                 SHIFT_MAP[code as usize]
             } else {
