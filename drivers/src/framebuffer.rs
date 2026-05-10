@@ -8,6 +8,7 @@
 
 use spin::Mutex;
 use super::{Driver, DriverError};
+use crate::vector_font::{VectorFont, get_fira_code_char, include_fira_code_ttf};
 
 // ── Boot-time registration ────────────────────────────────────────────────────
 
@@ -37,6 +38,9 @@ pub struct Framebuffer {
     pitch:  usize, // bytes per row
     cursor_x: usize,
     cursor_y: usize,
+    vector_font: Option<VectorFont>,
+    char_width: usize,
+    char_height: usize,
 }
 
 // Safety: kernel owns the framebuffer exclusively.
@@ -44,9 +48,7 @@ unsafe impl Send for Framebuffer {}
 unsafe impl Sync for Framebuffer {}
 
 impl Framebuffer {
-    const CHAR_WIDTH: usize = 8;
-    const CHAR_HEIGHT: usize = 8;
-    const FONT: [u8; 128 * 8] = include_font();
+    const FALLBACK_FONT: [u8; 128 * 8] = include_font();
 
     /// Construct an uninitialised framebuffer driver.
     ///
@@ -59,7 +61,19 @@ impl Framebuffer {
             pitch:  0,
             cursor_x: 0,
             cursor_y: 0,
+            vector_font: None,
+            char_width: 12,  // Vector font character width
+            char_height: 20, // Vector font character height
         }
+    }
+
+    /// Initialize vector font
+    pub fn init_vector_font(&mut self) {
+        // Temporarily disable vector font to debug boot crash
+        // Use bitmap font only for now
+        self.vector_font = None;
+        self.char_width = 8;
+        self.char_height = 16;
     }
 
     pub fn set_pixel(&mut self, x: usize, y: usize, color: u32) {
@@ -84,55 +98,242 @@ impl Framebuffer {
     pub fn putc(&mut self, c: u8) {
         if self.base.is_null() { return; }
 
+        static mut UTF8_STATE: (usize, u32) = (0, 0);
+        static mut ANSI_STATE: (bool, [u8; 16], usize) = (false, [0; 16], 0);
+
+        unsafe {
+            // Handle ANSI escape sequences
+            if c == 0x1b {  // ESC character starts escape sequence
+                ANSI_STATE.0 = true;
+                ANSI_STATE.2 = 0;
+                return;
+            } else if ANSI_STATE.0 {
+                // We're in an escape sequence
+                if ANSI_STATE.2 < ANSI_STATE.1.len() {
+                    ANSI_STATE.1[ANSI_STATE.2] = c;
+                    ANSI_STATE.2 += 1;
+                }
+
+                // Check for complete escape sequences
+                if c.is_ascii_alphabetic() {
+                    // End of escape sequence
+                    self.handle_ansi_sequence(&ANSI_STATE.1[..ANSI_STATE.2]);
+                    ANSI_STATE.0 = false;
+                    ANSI_STATE.2 = 0;
+                }
+                return;
+            }
+        }
+
         if c == b'\n' {
             self.cursor_x = 0;
-            self.cursor_y += Self::CHAR_HEIGHT;
+            self.cursor_y += self.char_height;
         } else if c == b'\r' {
             self.cursor_x = 0;
+        } else if c == b'\x08' {  // Backspace (ASCII 8)
+            self.handle_backspace();
         } else {
-            // Skip UTF-8 continuation bytes to keep cursor alignment
-            if (c & 0xC0) != 0x80 {
-                self.draw_char(self.cursor_x, self.cursor_y, c, 0xFFFFFF);
-                self.cursor_x += Self::CHAR_WIDTH;
-                if self.cursor_x + Self::CHAR_WIDTH > self.width {
+            unsafe {
+                // Handle UTF-8 decoding for Unicode box-drawing characters
+                if c < 0x80 {
+                    // ASCII character
+                    UTF8_STATE = (0, 0);
+                    self.draw_char_vector(self.cursor_x, self.cursor_y, c as char, 0xFFFFFF);
+                    self.cursor_x += self.char_width;
+                } else if c & 0xE0 == 0xC0 {
+                    // Start of 2-byte UTF-8
+                    UTF8_STATE = (1, (c & 0x1F) as u32);
+                } else if c & 0xF0 == 0xE0 {
+                    // Start of 3-byte UTF-8
+                    UTF8_STATE = (2, (c & 0x0F) as u32);
+                } else if c & 0xF8 == 0xF0 {
+                    // Start of 4-byte UTF-8
+                    UTF8_STATE = (3, (c & 0x07) as u32);
+                } else if c & 0xC0 == 0x80 && UTF8_STATE.0 > 0 {
+                    // UTF-8 continuation byte
+                    UTF8_STATE.1 = (UTF8_STATE.1 << 6) | (c & 0x3F) as u32;
+                    UTF8_STATE.0 -= 1;
+
+                    if UTF8_STATE.0 == 0 {
+                        // Complete UTF-8 character
+                        let unicode_char = UTF8_STATE.1;
+                        let display_char = self.map_unicode_to_ascii(unicode_char);
+                        self.draw_char_vector(self.cursor_x, self.cursor_y, display_char, 0xFFFFFF);
+                        self.cursor_x += self.char_width;
+                        UTF8_STATE = (0, 0);
+                    }
+                } else {
+                    // Invalid UTF-8, reset state
+                    UTF8_STATE = (0, 0);
+                }
+
+                if self.cursor_x + self.char_width > self.width {
                     self.cursor_x = 0;
-                    self.cursor_y += Self::CHAR_HEIGHT;
+                    self.cursor_y += self.char_height;
                 }
             }
         }
 
-        if self.cursor_y + Self::CHAR_HEIGHT > self.height {
-            self.scroll();
+        if self.cursor_y + self.char_height > self.height {
+            self.scroll_vector();
+        }
+    }
+
+    /// Handle backspace character - move cursor back and clear the character
+    fn handle_backspace(&mut self) {
+        if self.cursor_x >= self.char_width {
+            // Move cursor back one character
+            self.cursor_x -= self.char_width;
+
+            // Clear the character at the cursor position by drawing a space (background color)
+            for y in 0..self.char_height {
+                for x in 0..self.char_width {
+                    self.set_pixel(self.cursor_x + x, self.cursor_y + y, 0x000000);
+                }
+            }
+        } else if self.cursor_y >= self.char_height {
+            // At beginning of line, move to end of previous line
+            self.cursor_y -= self.char_height;
+            // Find the rightmost position on the previous line by scanning backwards
+            // For simplicity, just move to the end of the line
+            self.cursor_x = (self.width / self.char_width - 1) * self.char_width;
+
+            // Clear the character at the cursor position
+            for y in 0..self.char_height {
+                for x in 0..self.char_width {
+                    self.set_pixel(self.cursor_x + x, self.cursor_y + y, 0x000000);
+                }
+            }
+        }
+        // If we're at position (0,0), do nothing
+    }
+
+    /// Handle ANSI escape sequences for terminal control
+    fn handle_ansi_sequence(&mut self, sequence: &[u8]) {
+        if sequence.len() >= 2 && sequence[0] == b'[' {
+            match sequence {
+                [b'[', b'2', b'J'] => {
+                    // Clear entire screen
+                    self.clear_screen();
+                }
+                [b'[', b'H'] => {
+                    // Move cursor to home position (0,0)
+                    self.cursor_x = 0;
+                    self.cursor_y = 0;
+                }
+                [b'[', b'K'] => {
+                    // Clear from cursor to end of line
+                    self.clear_line_from_cursor();
+                }
+                _ => {
+                    // Ignore unsupported escape sequences
+                }
+            }
+        }
+    }
+
+    /// Clear the entire screen with background color
+    fn clear_screen(&mut self) {
+        for y in 0..self.height {
+            for x in 0..self.width {
+                self.set_pixel(x, y, 0x000000);
+            }
+        }
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+    }
+
+    /// Clear from cursor position to end of current line
+    fn clear_line_from_cursor(&mut self) {
+        for x in self.cursor_x..self.width {
+            for y in self.cursor_y..(self.cursor_y + self.char_height).min(self.height) {
+                self.set_pixel(x, y, 0x000000);
+            }
+        }
+    }
+
+    /// Map Unicode box-drawing characters to ASCII equivalents
+    fn map_unicode_to_ascii(&self, unicode: u32) -> char {
+        match unicode {
+            // Map to graphics characters using low ASCII range (1-31)
+            0x2550 => 1 as char,  // ═ -> ASCII 1 (custom horizontal line)
+            0x2551 => 2 as char,  // ║ -> ASCII 2 (custom vertical line)
+            0x2554 => 3 as char,  // ╔ -> ASCII 3 (custom top-left corner)
+            0x2557 => 4 as char,  // ╗ -> ASCII 4 (custom top-right corner)
+            0x255A => 5 as char,  // ╚ -> ASCII 5 (custom bottom-left corner)
+            0x255D => 6 as char,  // ╝ -> ASCII 6 (custom bottom-right corner)
+            0x2569 => 7 as char,  // ╩ -> ASCII 7 (custom T junction up)
+            0x2566 => 8 as char,  // ╦ -> ASCII 8 (custom T junction down)
+            0x2560 => 9 as char,  // ╠ -> ASCII 9 (custom T junction right)
+            0x2563 => 10 as char, // ╣ -> ASCII 10 (custom T junction left)
+            0x2588 => 11 as char, // █ -> ASCII 11 (custom full block)
+            _ => '?',              // Unknown Unicode -> question mark
         }
     }
 
     fn draw_char(&mut self, x: usize, y: usize, c: u8, color: u32) {
-        if (c as usize) * 8 + 8 > Self::FONT.len() {
+        if (c as usize) * 8 + 8 > Self::FALLBACK_FONT.len() {
             return;
         }
-        let glyph = &Self::FONT[(c as usize) * 8 .. (c as usize) * 8 + 8];
+        let glyph = &Self::FALLBACK_FONT[(c as usize) * 8 .. (c as usize) * 8 + 8];
         for (gy, &row) in glyph.iter().enumerate() {
             for gx in 0..8 {
                 if (row & (1 << (7 - gx))) != 0 {
                     self.set_pixel(x + gx, y + gy, color);
+                } else {
+                    self.set_pixel(x + gx, y + gy, 0x000000);
                 }
             }
         }
     }
 
+    /// Draw character using Fira Code bitmap font
+    fn draw_char_vector(&mut self, x: usize, y: usize, c: char, color: u32) {
+        // Simplified to use bitmap font only during debugging
+        if let Some(bitmap) = get_fira_code_char(c) {
+            // Render Fira Code bitmap (16 rows)
+            for (gy, &row) in bitmap.iter().enumerate() {
+                for gx in 0..8 {
+                    if (row & (1 << (7 - gx))) != 0 {
+                        self.set_pixel(x + gx, y + gy, color);
+                    }
+                }
+            }
+        } else {
+            // Fallback to original bitmap font
+            self.draw_char(x, y, c as u8, color);
+        }
+    }
+
     fn scroll(&mut self) {
-        let rows_to_copy = self.height - Self::CHAR_HEIGHT;
+        let rows_to_copy = self.height - 8; // fallback char height
         unsafe {
             core::ptr::copy(
-                self.base.add(Self::CHAR_HEIGHT * (self.pitch / 4)),
+                self.base.add(8 * (self.pitch / 4)),
                 self.base,
                 rows_to_copy * (self.pitch / 4)
             );
             // Clear bottom line
             let bottom_start = rows_to_copy * (self.pitch / 4);
-            core::ptr::write_bytes(self.base.add(bottom_start), 0, Self::CHAR_HEIGHT * (self.pitch / 4));
+            core::ptr::write_bytes(self.base.add(bottom_start), 0, 8 * (self.pitch / 4));
         }
-        self.cursor_y -= Self::CHAR_HEIGHT;
+        self.cursor_y -= 8;
+    }
+
+    /// Scroll screen for vector font
+    fn scroll_vector(&mut self) {
+        let rows_to_copy = self.height - self.char_height;
+        unsafe {
+            core::ptr::copy(
+                self.base.add(self.char_height * (self.pitch / 4)),
+                self.base,
+                rows_to_copy * (self.pitch / 4)
+            );
+            // Clear bottom lines
+            let bottom_start = rows_to_copy * (self.pitch / 4);
+            core::ptr::write_bytes(self.base.add(bottom_start), 0, self.char_height * (self.pitch / 4));
+        }
+        self.cursor_y -= self.char_height;
     }
 }
 
@@ -182,7 +383,19 @@ pub unsafe fn init_kernel_fb(base: *mut u32, width: usize, height: usize, pitch:
     fb.width = width;
     fb.height = height;
     fb.pitch = pitch;
+    fb.init_vector_font(); // Initialize vector font
     fb.clear(0);
+}
+
+/// Initialize the kernel-space framebuffer console without clearing screen.
+pub unsafe fn update_kernel_fb(base: *mut u32, width: usize, height: usize, pitch: usize) {
+    let mut fb = KERNEL_FB.lock();
+    fb.base = base;
+    fb.width = width;
+    fb.height = height;
+    fb.pitch = pitch;
+    fb.init_vector_font(); // Initialize vector font
+    // Don't clear - preserve existing content
 }
 
 // ── Bitmap Font ───────────────────────────────────────────────────────────────
