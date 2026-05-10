@@ -142,8 +142,5 @@ pub fn on_tick() {
         evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
     }
 
-    // Poll PS/2 Keyboard for native input and push to evdev.
-    super::keyboard::poll();
-
     sched::timer_tick_irq();
 }

@@ -4,14 +4,11 @@ use evdev_server;
 
 static mut SHIFT: bool = false;
 
-/// Poll the PS/2 keyboard controller for pending scancodes.
-/// Called from the APIC timer tick to bypass complex IOAPIC/legacy PIC routing.
-pub fn poll() {
+/// Called from the keyboard IRQ handler (vector 33).
+pub fn on_irq() {
     unsafe {
-        while (inb(0x64) & 0x01) != 0 {
-            let scancode = inb(0x60);
-            handle_scancode(scancode);
-        }
+        let scancode = inb(0x60);
+        handle_scancode(scancode);
     }
 }
 

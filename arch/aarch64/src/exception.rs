@@ -52,6 +52,40 @@ pub use sched::context::UserFrame;
 
 // ── Sync Exception Handlers ──────────────────────────────────────────────────
 
+fn handle_irq(_frame: *mut UserFrame) {
+    let iar = super::gic::ack();
+    let irq_id = super::gic::irq_id(iar);
+
+    if irq_id == 27 || irq_id == 30 {
+        // Virtual or Physical Timer
+        super::timer::on_tick();
+    } else if irq_id == 33 {
+        // PL011 UART
+        while let Some(b) = unsafe { super::uart::getc() } {
+            evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 1);
+            evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
+        }
+        unsafe { super::uart::clear_irq(); }
+    } else if irq_id != super::gic::SPURIOUS {
+        serial_print_str("\n[EXC] Unhandled IRQ ");
+        unsafe { print_number(irq_id); }
+        serial_print_str("\n");
+    }
+
+    super::gic::eoi(iar);
+    sched::preempt_check();
+}
+
+#[no_mangle]
+unsafe extern "C" fn exc_el1_irq_handler(frame: *mut UserFrame) {
+    handle_irq(frame);
+}
+
+#[no_mangle]
+unsafe extern "C" fn exc_el0_irq_handler(frame: *mut UserFrame) {
+    handle_irq(frame);
+}
+
 #[no_mangle]
 unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
     serial_print_str("\n[EXC] EL1 Sync Fault! ESR=");
