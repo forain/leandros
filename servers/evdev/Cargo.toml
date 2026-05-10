@@ -1,0 +1,10 @@
+[package]
+name = "evdev-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ipc   = { path = "../../ipc" }
+sched = { path = "../../sched" }
+vfs-server = { path = "../vfs" }
+spin.workspace = true
