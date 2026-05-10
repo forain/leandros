@@ -8,6 +8,8 @@
 
 pub mod serial;
 pub mod framebuffer;
+pub mod kms;
+pub mod vector_font;
 
 /// Trait every driver server must implement.
 pub trait Driver {
