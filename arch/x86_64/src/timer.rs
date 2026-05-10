@@ -138,7 +138,7 @@ pub fn on_tick() {
     // Poll UART for keyboard input and push to evdev.
     // NOTE: This consumes bytes that would otherwise go to fd 0 (stdin).
     while let Some(b) = unsafe { super::serial_read_byte() } {
-        evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 1); // Key down only
+        evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2); // 2 = typematic/serial
         evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
     }
 

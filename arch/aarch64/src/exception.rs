@@ -62,7 +62,7 @@ fn handle_irq(_frame: *mut UserFrame) {
     } else if irq_id == 33 {
         // PL011 UART
         while let Some(b) = unsafe { super::uart::getc() } {
-            evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 1);
+            evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2);
             evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
         }
         unsafe { super::uart::clear_irq(); }
