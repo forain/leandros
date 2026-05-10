@@ -235,7 +235,22 @@ pub fn wait_pid(pid: Pid) -> Option<i32> {
                 return None;
             }
         }
+        
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!("sti");
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!("msr daifclr, #2");
+        }
+
         yield_now("wait_pid");
+
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!("cli");
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!("msr daifset, #2");
+        }
     }
 }
 
@@ -434,10 +449,11 @@ fn scheduler_run_loop() -> ! {
             }
         } else {
             unsafe {
-                extern "C" { fn arch_serial_putc(b: u8); }
-                arch_serial_putc(b'.');
+                #[cfg(target_arch = "x86_64")]
+                core::arch::asm!("sti; hlt; cli");
+                #[cfg(target_arch = "aarch64")]
+                core::arch::asm!("msr daifclr, #2; wfi; msr daifset, #2");
             }
-            core::hint::spin_loop();
         }
     }
 }
