@@ -74,8 +74,6 @@ pub fn init(info: &boot::BootInfo) {
         }
 
         apic::init();
-        pic::init();
-        pic::unmask(1); // Keyboard IRQ
     }
     #[cfg(target_arch = "x86_64")]
     unsafe { timer::init(); }
