@@ -10,7 +10,7 @@
 
 use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 use alloc::vec::Vec;
-use crate::{serial_print_str, serial_write_raw, print_hex, BOOT_INFO_PTR, init, serial_read_byte, serial_has_data};
+use crate::{serial_print_str, serial_write_raw, print_hex, BOOT_INFO_PTR, init};
 use ipc::{Message, port};
 use sched::{
     fork_current, clone_thread, 
@@ -29,6 +29,7 @@ use elf;
 use vfs_server as vfs;
 use net_server;
 use tty_server;
+use evdev_server;
 
 /// Bump allocator base for anonymous mmap with no hint (addr=0).
 static MMAP_BUMP: AtomicUsize = AtomicUsize::new(0x0000_1000_0000_usize);
@@ -1370,10 +1371,10 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
         let fd = fd as usize;
 
         let revents: i16 = if fd <= 2 {
-            // fd 0 = stdin: report readable if serial has data, else 0.
+            // fd 0 = stdin: report readable if evdev has data, else 0.
             // fd 1/2 = stdout/stderr: always writable.
             if fd == 0 {
-                if crate::serial_read_byte().is_some() { POLLIN } else { 0 }
+                if evdev_server::has_events(0) || crate::serial_has_data() { POLLIN } else { 0 }
             } else {
                 events & POLLOUT
             }
@@ -1958,6 +1959,20 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 
 // ── I/O syscalls ──────────────────────────────────────────────────────────────
 
+/// Helper to read a single ASCII byte from evdev0 (unifying UART and keyboard).
+fn read_input_byte() -> Option<u8> {
+    loop {
+        if let Some(ev) = evdev_server::pop_event(0) {
+            if ev.type_ == 1 /* EV_KEY */ && ev.value == 1 /* DOWN */ {
+                return Some(ev.code as u8);
+            }
+            // Continue loop to skip EV_SYN or other events.
+        } else {
+            return None;
+        }
+    }
+}
+
 /// sys_write(fd, buf, count) — write bytes to a file descriptor.
 ///
 /// fd 1/2 write directly to serial.  All other fds route through VFS.
@@ -1998,27 +2013,26 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
         0 => {
             if count == 0 { return 0; }
             if !validate_user_buf(buf_ptr, count) { return -14; }
-            // Yield-loop until the UART RX FIFO has at least one byte.
+            // Yield-loop until evdev has at least one key event.
             let first = loop {
-                match crate::serial_read_byte() {
+                match read_input_byte() {
                     Some(b) => break b,
                     None    => yield_now("sys_read_stdin"),
                 }
             };
-            
+
             let mut kbuf = Vec::with_capacity(count);
             unsafe { kbuf.set_len(count); }
-            
+
             kbuf[0] = first;
             let mut n = 1usize;
             // Drain any additional bytes that arrived without blocking.
             while n < count {
-                match crate::serial_read_byte() {
+                match read_input_byte() {
                     Some(b) => { kbuf[n] = b; n += 1; }
                     None    => break,
                 }
             }
-            
             let ok = with_current_address_space(|as_| {
                 as_.write_user_buf(buf_ptr, &kbuf[..n])
             }).unwrap_or(false);

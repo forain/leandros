@@ -21,6 +21,23 @@ pub unsafe extern "C" fn arch_flush_cache_range(addr: usize, len: usize) {
     core::arch::asm!("dsb ish", "isb", options(nostack));
 }
 
+#[no_mangle]
+pub extern "C" fn arch_interrupt_save() -> usize {
+    let daif: usize;
+    unsafe {
+        core::arch::asm!("mrs {}, daif", out(reg) daif);
+        core::arch::asm!("msr daifset, #2"); // Disable IRQ
+    }
+    daif
+}
+
+#[no_mangle]
+pub extern "C" fn arch_interrupt_restore(flags: usize) {
+    unsafe {
+        core::arch::asm!("msr daif, {}", in(reg) flags);
+    }
+}
+
 pub fn init(boot_info: &boot::BootInfo) {
     unsafe {
         // Enable SIMD/FP (set CPACR_EL1.FPEN to 0b11)

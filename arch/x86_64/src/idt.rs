@@ -80,6 +80,8 @@ pub fn init() {
 
         // Vector 32 = IRQ0 (8253/8254 timer after PIC remapping).
         IDT.0[32] = IdtEntry::new(timer_irq as *const () as usize, 0x08, 0, 0x8E);
+        // Vector 33 = IRQ1 (PS/2 keyboard).
+        IDT.0[33] = IdtEntry::new(keyboard_irq as *const () as usize, 0x08, 0, 0x8E);
 
         #[cfg(target_arch = "x86_64")]
         let ptr = IdtPointer {
@@ -279,7 +281,29 @@ extern "x86-interrupt" fn timer_irq(frame: InterruptStackFrame) {
     }
 }
 
+/// Keyboard IRQ handler — PS/2 keyboard at IRQ 1 (vector 33).
+#[cfg(target_arch = "x86_64")]
+extern "x86-interrupt" fn keyboard_irq(frame: InterruptStackFrame) {
+    let from_user = (frame.cs & 3) != 0;
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+    }
+
+    super::apic::eoi();
+    unsafe { super::pic::eoi(1); }
+    super::keyboard::on_irq();
+
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+    }
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 extern "C" fn timer_irq(_frame: InterruptStackFrame) {
     // No-op: timer module is only present on x86_64.
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+extern "C" fn keyboard_irq(_frame: InterruptStackFrame) {
+    // No-op.
 }
