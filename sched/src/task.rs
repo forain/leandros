@@ -407,7 +407,7 @@ impl Task {
         pid: Pid,
         user_entry: usize,
         user_sp: usize,
-        kernel_stack_base: usize,
+        kernel_stack_phys: usize,
         kernel_stack_size: usize,
         page_table: usize,
     ) -> alloc::boxed::Box<Self> {
@@ -415,13 +415,16 @@ impl Task {
         let debug_msg = b"Task::new_userspace: creating userspace task\r\n";
         for &b in debug_msg { unsafe { arch_serial_putc(b); } }
 
+        let kernel_stack_virt = mm::phys_to_virt(kernel_stack_phys);
+
         let mut task = Task {
             pid,
             state: TaskState::Ready,
             priority: 0,
-            ctx: crate::context::CpuContext::new_user_task(user_entry, user_sp, kernel_stack_base + kernel_stack_size),
+            ctx: crate::context::CpuContext::new_user_task_with_pt(user_entry, user_sp, kernel_stack_virt + kernel_stack_size, page_table),
             page_table,
-            kernel_stack: kernel_stack_base,
+
+            kernel_stack: kernel_stack_phys,
             blocked_on: None,
             blocked_futex: 0,
             address_space: None,

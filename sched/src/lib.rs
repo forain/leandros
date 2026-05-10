@@ -235,21 +235,22 @@ pub fn wait_pid(pid: Pid) -> Option<i32> {
                 return None;
             }
         }
-        yield_now();
+        yield_now("wait_pid");
     }
 }
 
-pub fn yield_now() {
-    let id = unsafe { cpu_id() };
-    unsafe {
-        if let Some(ctx_ptr) = CURRENT_CTX[id].as_mut() {
-            context::cpu_switch_to(
-                ctx_ptr,
-                core::ptr::addr_of!(SCHEDULER_CTX[id]),
-            );
+    pub fn yield_now(reason: &str) {
+        let _ = reason;
+        let id = unsafe { cpu_id() };
+        unsafe {
+            if let Some(ctx_ptr) = CURRENT_CTX[id].as_mut() {
+                context::cpu_switch_to(
+                    ctx_ptr,
+                    core::ptr::addr_of!(SCHEDULER_CTX[id]),
+                );
+            }
         }
     }
-}
 
 pub fn timer_tick_irq() {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
@@ -258,7 +259,7 @@ pub fn timer_tick_irq() {
 
 pub fn preempt_check() {
     if PREEMPT_NEEDED.swap(false, Ordering::Relaxed) {
-        yield_now();
+        yield_now("preempt");
     }
 }
 
@@ -301,14 +302,37 @@ pub fn spawn(entry: fn() -> !, _flags: usize) -> Option<Pid> {
 }
 
 pub fn spawn_user_with_address_space(entry_point: usize, sp: usize, as_: mm::vmm::AddressSpace) -> Option<Pid> {
+    extern "C" { 
+        fn serial_print(s: *const u8, len: usize); 
+        fn print_hex(n: usize);
+        fn print_number(n: u32);
+    }
+    unsafe {
+        let msg = b"[SCHED] spawn_user: entry=";
+        serial_print(msg.as_ptr(), msg.len());
+        print_hex(entry_point);
+        let msg2 = b" sp=";
+        serial_print(msg2.as_ptr(), msg2.len());
+        print_hex(sp);
+        serial_print(b"\n".as_ptr(), 1);
+    }
+
     let pid = alloc_pid();
 
+    unsafe { serial_print(b"[SCHED] Allocating kernel stack...\n".as_ptr(), 32); }
     let stack_phys = mm::buddy::alloc(4)?; // 64KB kernel stack
-    let stack_virt = mm::phys_to_virt(stack_phys);
+    let _stack_virt = mm::phys_to_virt(stack_phys);
     let stack_size = mm::buddy::PAGE_SIZE * 16;
     let page_table = as_.page_table_root;
 
-    let mut task = Task::new_userspace(pid, entry_point, sp, stack_virt, stack_size, page_table);
+    unsafe {
+        let msg = b"[SCHED] Creating task struct for PID ";
+        serial_print(msg.as_ptr(), msg.len());
+        print_number(pid);
+        serial_print(b"\n".as_ptr(), 1);
+    }
+
+    let mut task = Task::new_userspace(pid, entry_point, sp, stack_phys, stack_size, page_table);
     task.kernel_stack = stack_phys;
     task.address_space = Some(alloc::boxed::Box::new(as_));
 
@@ -326,16 +350,31 @@ pub fn run() -> ! {
 }
 
 fn scheduler_run_loop() -> ! {
+    extern "C" { 
+        fn serial_print(s: *const u8, len: usize); 
+        fn print_number(n: u32);
+    }
+    unsafe {
+        let msg = b"[SCHED] scheduler_run_loop started...\n";
+        serial_print(msg.as_ptr(), msg.len());
+    }
     let id = unsafe { cpu_id() };
+    unsafe {
+        let msg = b"[SCHED] CPU ID: ";
+        serial_print(msg.as_ptr(), msg.len());
+        print_number(id as u32);
+        serial_print(b"\n".as_ptr(), 1);
+    }
     loop {
         let maybe_idx = { RUN_QUEUE.lock().pick_next() };
 
         if let Some(idx) = maybe_idx {
             let (ctx_ptr, pid, kernel_stack_top_virt, page_table) = {
-                let rq = RUN_QUEUE.lock();
-                let t = rq.get(idx).unwrap();
+                let mut rq = RUN_QUEUE.lock();
+                let t = rq.get_mut(idx).unwrap();
+                let pid = t.pid;
                 let kst = mm::phys_to_virt(t.kernel_stack) + mm::buddy::PAGE_SIZE * 16;
-                (&t.ctx as *const CpuContext, t.pid, kst, t.page_table)
+                (&t.ctx as *const CpuContext, pid, kst, t.page_table)
             };
 
             unsafe {
@@ -350,14 +389,16 @@ fn scheduler_run_loop() -> ! {
                 }
 
                 arch_set_kernel_stack(kernel_stack_top_virt as u64);
-                if page_table != 0 { arch_set_page_table(page_table); }
+                if page_table != 0 {
+                    arch_set_page_table(page_table); 
+                }
 
                 context::cpu_switch_to(
                     core::ptr::addr_of_mut!(SCHEDULER_CTX[id]),
                     ctx_ptr,
                 );
 
-                arch_set_page_table(0);
+                // When we return here, we are in the scheduler context.
                 CURRENT_CTX[id] = core::ptr::null_mut();
                 CURRENT_PID[id] = 0;
 
@@ -392,6 +433,10 @@ fn scheduler_run_loop() -> ! {
                 log_exit(zombie_pid, exit_code);
             }
         } else {
+            unsafe {
+                extern "C" { fn arch_serial_putc(b: u8); }
+                arch_serial_putc(b'.');
+            }
             core::hint::spin_loop();
         }
     }
@@ -406,14 +451,14 @@ pub fn exit(code: i32) -> ! {
             t.exit_code = code;
         }
     }
-    yield_now();
+    yield_now("exit");
     loop { core::hint::spin_loop(); }
 }
 
 pub fn block_on_port(port: u32) {
     let pid = current_pid();
     RUN_QUEUE.lock().block_on_port(pid, port);
-    yield_now();
+    yield_now("block_on_port");
 }
 
 pub fn set_clear_child_tid(tidptr: usize) {
