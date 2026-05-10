@@ -1407,28 +1407,18 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
         if tv_sec == 0 && tv_nsec == 0 { return 0; }
         // Non-zero timeout: yield once before returning (cooperative).
         #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("sti"); }
+        unsafe { core::arch::asm!("sti; nop; cli"); }
         #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("msr daifclr, #2"); }
+        unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
 
         yield_now("ppoll");
-
-        #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("cli"); }
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("msr daifset, #2"); }
     } else if nready == 0 {
         #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("sti"); }
+        unsafe { core::arch::asm!("sti; nop; cli"); }
         #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("msr daifclr, #2"); }
+        unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
 
         yield_now("ppoll");
-
-        #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("cli"); }
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("msr daifset, #2"); }
     }
     nready
 }
@@ -1451,16 +1441,11 @@ fn sys_nanosleep(rqtp_ptr: usize, _rmtp: usize) -> isize {
     let deadline = ticks().wrapping_add(ticks_needed);
     loop {
         #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("sti"); }
+        unsafe { core::arch::asm!("sti; nop; cli"); }
         #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("msr daifclr, #2"); }
+        unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
 
         yield_now("nanosleep");
-
-        #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("cli"); }
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("msr daifset, #2"); }
         if ticks() >= deadline { break; }
     }
     0
@@ -1993,7 +1978,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 fn read_input_byte() -> Option<u8> {
     loop {
         if let Some(ev) = evdev_server::pop_event(0) {
-            if ev.type_ == 1 /* EV_KEY */ && ev.value == 1 /* DOWN */ {
+            // EV_KEY down (1) or serial typematic (2)
+            if ev.type_ == 1 && (ev.value == 1 || ev.value == 2) {
                 return Some(ev.code as u8);
             }
             // Continue loop to skip EV_SYN or other events.
@@ -2049,16 +2035,11 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
                     Some(b) => break b,
                     None    => {
                         #[cfg(target_arch = "x86_64")]
-                        unsafe { core::arch::asm!("sti"); }
+                        unsafe { core::arch::asm!("sti; nop; cli"); }
                         #[cfg(target_arch = "aarch64")]
-                        unsafe { core::arch::asm!("msr daifclr, #2"); }
+                        unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
 
                         yield_now("sys_read_stdin");
-
-                        #[cfg(target_arch = "x86_64")]
-                        unsafe { core::arch::asm!("cli"); }
-                        #[cfg(target_arch = "aarch64")]
-                        unsafe { core::arch::asm!("msr daifset, #2"); }
                     }
                 }
             };
@@ -2098,16 +2079,11 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
                 let n = vfs_reply_val(&vfs::handle(&msg, pid));
                 if n != -11 { return n; }
                 #[cfg(target_arch = "x86_64")]
-                unsafe { core::arch::asm!("sti"); }
+                unsafe { core::arch::asm!("sti; nop; cli"); }
                 #[cfg(target_arch = "aarch64")]
-                unsafe { core::arch::asm!("msr daifclr, #2"); }
+                unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
 
                 yield_now("sys_read_vfs");
-
-                #[cfg(target_arch = "x86_64")]
-                unsafe { core::arch::asm!("cli"); }
-                #[cfg(target_arch = "aarch64")]
-                unsafe { core::arch::asm!("msr daifset, #2"); }
             }
         }
     }

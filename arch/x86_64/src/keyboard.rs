@@ -32,18 +32,18 @@ fn handle_scancode(scancode: u8) {
         0x2A | 0x36 => unsafe { SHIFT = true; },
         0xAA | 0xB6 => unsafe { SHIFT = false; },
         _ => {
-            if scancode < 0x80 {
-                let ascii = if unsafe { SHIFT } {
-                    SHIFT_MAP[scancode as usize]
-                } else {
-                    MAP[scancode as usize]
-                };
-                if ascii != 0 {
-                    evdev_server::push_event(0, 1 /* EV_KEY */, ascii as u16, 1); // Down
-                    evdev_server::push_event(0, 0 /* EV_SYN */, 0, 0);
-                    // For now, we don't push Up events because serial doesn't either,
-                    // and doomgeneric_leandros handles timed expiration.
-                }
+            let is_up = (scancode & 0x80) != 0;
+            let code = scancode & 0x7F;
+
+            let ascii = if unsafe { SHIFT } {
+                SHIFT_MAP[code as usize]
+            } else {
+                MAP[code as usize]
+            };
+            
+            if ascii != 0 {
+                evdev_server::push_event(0, 1 /* EV_KEY */, ascii as u16, if is_up { 0 } else { 1 });
+                evdev_server::push_event(0, 0 /* EV_SYN */, 0, 0);
             }
         }
     }
