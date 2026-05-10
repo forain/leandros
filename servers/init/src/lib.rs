@@ -260,7 +260,7 @@ fn vfs_read_blocking(fd: i32, buf: *mut u8, len: usize) -> isize {
     loop {
         let n = vfs_read(fd, buf, len);
         if n != -11 { return n; }
-        sched::yield_now();
+        sched::yield_now("init_idle");
     }
 }
 
@@ -542,7 +542,7 @@ fn t_spawn_exit() {
     CHILD_RAN.store(false, Ordering::SeqCst);
     match sched::spawn(child_fn, 0) {
         Some(_) => {
-            for _ in 0..20 { sched::yield_now(); }
+            for _ in 0..20 { sched::yield_now("init_idle"); }
             if CHILD_RAN.load(Ordering::SeqCst) { pass("spawn + exit"); }
             else { fail("spawn", "child didn't run in 20 yields"); }
         }
@@ -1057,7 +1057,7 @@ fn readline(buf: &mut [u8]) -> usize {
         let b = loop {
             match unsafe { ((*IO).read_byte)() } {
                 Some(b) => break b,
-                None    => sched::yield_now(),
+                None    => sched::yield_now("init_idle"),
             }
         };
         match b {
@@ -1364,7 +1364,7 @@ fn cmd_sleep(arg: &[u8]) {
     if secs == 0 { return; }
     let start = sched::ticks();
     while sched::ticks().wrapping_sub(start) < secs * 100 {
-        sched::yield_now();
+        sched::yield_now("init_idle");
     }
 }
 
@@ -2012,7 +2012,7 @@ fn cmd_read(var_name: &[u8]) {
             match byte {
                 Some(b'\n') | Some(b'\r') => break,
                 Some(b) if blen < MAX_VAR_VAL - 1 => { buf[blen] = b; blen += 1; }
-                None => sched::yield_now(),
+                None => sched::yield_now("init_idle"),
                 _ => {}
             }
         }
@@ -2572,7 +2572,7 @@ fn event_loop() -> ! {
             last = t;
             kprintln!("[init] heartbeat");
         }
-        sched::yield_now();
+        sched::yield_now("init_idle");
     }
 }
 

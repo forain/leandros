@@ -15,6 +15,9 @@ global_asm!(
     ".global _start",
     ".type   _start, %function",
     "_start:",
+    // Trace: yield syscall
+    "   mov  x8, #124", // aarch64 SCHED_YIELD
+    "   svc  #0",
     // Call libc_start_main properly to enable normal init process
     "   mov  x29, #0",           // clear frame pointer (no parent frame)
     "   mov  x30, #0",           // clear link register  (no return address)
@@ -34,6 +37,9 @@ global_asm!(
     ".global _start",
     ".type   _start, @function",
     "_start:",
+    // Trace: yield syscall
+    "   mov  rax, 24", // x86_64 SCHED_YIELD
+    "   syscall",
     // Call libc_start_main properly to enable normal init process
     "   xor  rbp, rbp",          // clear frame pointer (no parent frame)
     "   mov  rdi, rsp",          // argument: initial stack pointer → argc
@@ -59,9 +65,7 @@ global_asm!(
 /// ```
 #[no_mangle]
 pub unsafe extern "C" fn __libc_start_main(sp: *const usize) -> ! {
-    // IMMEDIATE DEBUG: If we reach here, userspace execution is working!
     debug_print_userspace_entry();
-
     extern "C" {
         fn main(argc: i32, argv: *const *const u8, envp: *const *const u8) -> i32;
     }
