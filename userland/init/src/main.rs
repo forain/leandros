@@ -11,6 +11,7 @@ use leandros_libc::{write, STDOUT_FILENO, getpid, execve, sched_yield};
 
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
+    sched_yield();
     write_str("LeandrOS Init (PID 1) starting...\n");
 
     // Print PID for confirmation
