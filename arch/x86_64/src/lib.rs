@@ -5,6 +5,7 @@
 
 pub mod gdt;
 pub mod idt;
+pub mod ioapic;
 pub mod keyboard;
 pub mod paging;
 #[cfg(target_arch = "x86_64")]
@@ -74,6 +75,10 @@ pub fn init(info: &boot::BootInfo) {
         }
 
         apic::init();
+        
+        ioapic::init(info.hhdm_offset, root);
+        // Route IRQ 1 (keyboard) -> APIC ID 0, Vector 33
+        ioapic::set_irq(1, 0, 33);
     }
     #[cfg(target_arch = "x86_64")]
     unsafe { timer::init(); }

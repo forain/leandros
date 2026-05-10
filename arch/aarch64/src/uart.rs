@@ -30,6 +30,8 @@ const IBRD: usize = 0x024;
 const FBRD: usize = 0x028;
 const LCRH: usize = 0x02C;
 const CR:   usize = 0x030;
+const IMSC: usize = 0x038;
+const ICR:  usize = 0x044;
 
 // ── Flag register bits ────────────────────────────────────────────────────────
 const FR_RXFE: u32 = 1 << 4;
@@ -70,6 +72,14 @@ pub unsafe fn reinit(base: usize) {
     wr(FBRD, FBRD_VAL);
     wr(LCRH, (0b11 << 5) | (1 << 4));
     wr(CR,   (1 << 0) | (1 << 8) | (1 << 9));
+    
+    // Enable RX interrupt (bit 4) and RT interrupt (bit 6)
+    wr(IMSC, (1 << 4) | (1 << 6));
+}
+
+pub unsafe fn clear_irq() {
+    if UART_BASE_ADDR == 0 { return; }
+    wr(ICR, (1 << 4) | (1 << 6));
 }
 
 pub unsafe fn putc(c: u8) {

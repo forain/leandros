@@ -75,25 +75,37 @@ pub fn init() {
         gicd_w32(GICD_CTLR, 1);
         dsb_st();
 
-        // Enable PPI 27.  GICD_ISENABLER[0] is a write-set register covering
-        // IRQ IDs 0-31; writing a 1 to bit N enables IRQ N.
+        // Enable PPI 27 (Virtual Timer).
         gicd_w32(GICD_ISENABLER0, 1 << 27);
+        // Enable SPI 1 / IRQ 33 (PL011 UART).
+        // IRQ 33 is in ISENABLER1 (IRQ IDs 32-63), bit 1 (33 - 32 = 1).
+        gicd_w32(GICD_ISENABLER0 + 4, 1 << 1);
         dsb_st();
 
         // Priority for IRQ 27 (mid-priority = 0xA0).
-        // IPRIORITYR is byte-addressed: IRQ 27 lives at byte 27 = word 6, byte 3.
         let pri_word_off = GICD_IPRIORITYR + (27 / 4) * 4;
         let pri_shift    = (27 % 4) * 8;
         let pri_v = (gicd_r32(pri_word_off) & !(0xFF << pri_shift)) | (0xA0 << pri_shift);
         gicd_w32(pri_word_off, pri_v);
+        
+        // Priority for IRQ 33 (mid-priority = 0xA0).
+        let pri_word_off_33 = GICD_IPRIORITYR + (33 / 4) * 4;
+        let pri_shift_33    = (33 % 4) * 8;
+        let pri_v_33 = (gicd_r32(pri_word_off_33) & !(0xFF << pri_shift_33)) | (0xA0 << pri_shift_33);
+        gicd_w32(pri_word_off_33, pri_v_33);
         dsb_st();
 
         // Route IRQ 27 to CPU 0.
-        // ITARGETSR is byte-addressed similarly; bit 0 of the byte = CPU 0.
         let tgt_word_off = GICD_ITARGETSR + (27 / 4) * 4;
         let tgt_shift    = (27 % 4) * 8;
         let tgt_v = (gicd_r32(tgt_word_off) & !(0xFF << tgt_shift)) | (0x01 << tgt_shift);
         gicd_w32(tgt_word_off, tgt_v);
+
+        // Route IRQ 33 to CPU 0.
+        let tgt_word_off_33 = GICD_ITARGETSR + (33 / 4) * 4;
+        let tgt_shift_33    = (33 % 4) * 8;
+        let tgt_v_33 = (gicd_r32(tgt_word_off_33) & !(0xFF << tgt_shift_33)) | (0x01 << tgt_shift_33);
+        gicd_w32(tgt_word_off_33, tgt_v_33);
         dsb_st();
 
         // Enable CPU interface.
