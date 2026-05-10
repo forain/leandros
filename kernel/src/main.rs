@@ -96,6 +96,8 @@ pub extern "C" fn serial_write_byte(b: u8) {
     unsafe { arch_x86_64::putc(b); }
     #[cfg(target_arch = "aarch64")]
     unsafe { arch_aarch64::uart::putc(b); }
+
+    drivers::framebuffer::fb_putc(b);
 }
 
 #[no_mangle]
@@ -242,6 +244,23 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
 
     #[cfg(target_arch = "x86_64")] { arch_x86_64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
+
+    unsafe {
+        if (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_base != 0 {
+            drivers::framebuffer::init_kernel_fb(
+                mm::phys_to_virt((*core::ptr::addr_of!(BOOT_INFO)).framebuffer_base as usize) as *mut u32,
+                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_width as usize,
+                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_height as usize,
+                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_pitch as usize,
+            );
+            drivers::framebuffer::set_boot_framebuffer(
+                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_base,
+                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_width,
+                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_height,
+                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_pitch,
+            );
+        }
+    }
 
     serial_print_str("\n[LEANDROS] Kernel starting...\n");
     serial_print_str("[TRACE] boot_info_addr: ");
