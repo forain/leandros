@@ -16,6 +16,12 @@ extern "C" {
 pub fn init_task_main(boot_info: &boot::BootInfo) {
     serial_print_str("[INIT] Kernel init task starting\n");
 
+    // ── In-Kernel Servers ──────────────────────────────────────────────────
+    if let Some(vfs_port) = vfs_server::init(0) {
+        crate::syscall::set_vfs_server_port(vfs_port);
+    }
+    evdev_server::init(0);
+
     // ── Userspace Init ───────────────────────────────────────────────────────
     // We attempt to load the 'init' server from the initrd.
     serial_print_str("[INIT] Loading userspace init ELF binary from initrd\n");

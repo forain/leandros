@@ -15,6 +15,7 @@ use spin::Mutex;
 use super::message::Message;
 
 pub type Port = u32;
+pub type HandlerFn = fn(&Message, u32) -> Message;
 
 /// Maximum number of simultaneously open IPC ports.
 pub const MAX_PORTS:   usize = 65536;
@@ -38,6 +39,7 @@ struct PortEntry {
     queue:     [Option<Message>; QUEUE_DEPTH],
     head:      usize,
     tail:      usize,
+    handler:   Option<HandlerFn>,
 }
 
 impl PortEntry {
@@ -48,6 +50,7 @@ impl PortEntry {
             queue:     [const { None }; QUEUE_DEPTH],
             head:      0,
             tail:      0,
+            handler:   None,
         }
     }
 
@@ -203,20 +206,41 @@ pub fn create(pid: u32) -> Option<Port> {
 
 /// Enqueue `msg` on `port`.
 pub fn send(port: Port, msg: Message) -> Result<(), SendError> {
-    let result: Result<(), SendError> = {
-        let mut table = PORT_TABLE.lock();
-        match table.find_mut(port) {
-            None      => Err(SendError::PortNotFound),
-            Some(idx) => {
-                if table.buckets[idx].enqueue(msg) { Ok(()) }
-                else                               { Err(SendError::QueueFull) }
-            }
+    let mut table = PORT_TABLE.lock();
+    let idx = table.find_mut(port).ok_or(SendError::PortNotFound)?;
+    
+    // If there's a direct handler, call it synchronously.
+    if let Some(handler) = table.buckets[idx].handler {
+        let caller_pid = sched::current_pid();
+        let reply_port = msg.reply_port;
+        drop(table);
+        
+        let reply = handler(&msg, caller_pid);
+        
+        if reply_port != u32::MAX {
+            let _ = send(reply_port, reply);
         }
-    };
-    if result.is_ok() {
-        sched::unblock_port(port);
+        return Ok(());
     }
-    result
+
+    if table.buckets[idx].enqueue(msg) {
+        drop(table);
+        sched::unblock_port(port);
+        Ok(())
+    } else {
+        Err(SendError::QueueFull)
+    }
+}
+
+/// Register a direct handler function for an IPC port.
+pub fn register_handler(port: Port, handler: HandlerFn) -> bool {
+    let mut table = PORT_TABLE.lock();
+    if let Some(idx) = table.find_mut(port) {
+        table.buckets[idx].handler = Some(handler);
+        true
+    } else {
+        false
+    }
 }
 
 /// Return queue depth and capacity for `port`.

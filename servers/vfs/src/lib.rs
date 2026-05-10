@@ -70,6 +70,41 @@ fn ok_reply()        -> Message { make_reply(0) }
 fn err_reply(e: i32) -> Message { make_reply(e as i64) }
 fn val_reply(v: u64) -> Message { make_reply(v as i64) }
 
+// ── IPC Call helper ──────────────────────────────────────────────────────────
+
+/// Synchronously call another server via its IPC port.
+/// Blocks the current task until a reply is received on its reply port.
+fn ipc_call(port_id: u32, mut msg: Message) -> Option<Message> {
+    // Lazily allocate the caller's reply port.
+    let reply_port = {
+        let rp = sched::current_reply_port();
+        if rp != u32::MAX {
+            rp
+        } else {
+            let caller = sched::current_pid();
+            match port::create(caller) {
+                Some(p) => { sched::set_current_reply_port(p); p }
+                None    => return None,
+            }
+        }
+    };
+
+    msg.reply_port = reply_port;
+    if port::send(port_id, msg).is_err() {
+        return None;
+    }
+
+    let caller = sched::current_pid();
+    loop {
+        match port::recv_as(reply_port, caller) {
+            Some(reply) => return Some(reply),
+            None => {
+                sched::block_on(reply_port);
+            }
+        }
+    }
+}
+
 // ── Writable tmpfs pool ───────────────────────────────────────────────────────
 
 const MAX_TMP_FILES: usize = 32;
@@ -121,6 +156,37 @@ enum VnodeKind {
     DevStdio { target_fd: usize },
     /// /dev/fb0 — linear framebuffer.
     DevFb { pos: usize },
+    /// Dynamically registered device proxy.
+    DynamicDevice { port: u32, dev_id: u32 },
+}
+
+// ── Dynamic Device Registry ───────────────────────────────────────────────────
+
+const MAX_DYNAMIC_DEVICES: usize = 16;
+
+#[derive(Clone, Copy)]
+pub struct DynamicDeviceEntry {
+    pub path: &'static str,
+    pub port: u32,
+    pub dev_id: u32,
+    pub in_use: bool,
+}
+
+impl DynamicDeviceEntry {
+    const fn empty() -> Self {
+        Self { path: "", port: 0, dev_id: 0, in_use: false }
+    }
+}
+
+static DYNAMIC_DEVICES: Mutex<[DynamicDeviceEntry; MAX_DYNAMIC_DEVICES]> =
+    Mutex::new([const { DynamicDeviceEntry::empty() }; MAX_DYNAMIC_DEVICES]);
+
+/// Register a dynamic device path to be proxied to a specific IPC port.
+pub fn register_device(path: &'static str, port: u32, dev_id: u32) {
+    let mut devices = DYNAMIC_DEVICES.lock();
+    if let Some(slot) = devices.iter_mut().find(|d| !d.in_use) {
+        *slot = DynamicDeviceEntry { path, port, dev_id, in_use: true };
+    }
 }
 
 // ── Pipe ring buffers ─────────────────────────────────────────────────────────
@@ -738,12 +804,21 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
             None    => return err_reply(-2),
         }
     } else {
-        // Check RamFS files first.
-        let mut found = None;
-        for entry in RAMFS {
-            if path == entry.path {
-                found = Some(VnodeKind::RamFile { data: entry.data, pos: 0 });
-                break;
+        // Check dynamic devices.
+        let mut found = {
+            let devices = DYNAMIC_DEVICES.lock();
+            devices.iter()
+                .find(|d| d.in_use && d.path.as_bytes() == path)
+                .map(|d| VnodeKind::DynamicDevice { port: d.port, dev_id: d.dev_id })
+        };
+
+        if found.is_none() {
+            // Check RamFS files first.
+            for entry in RAMFS {
+                if path == entry.path {
+                    found = Some(VnodeKind::RamFile { data: entry.data, pos: 0 });
+                    break;
+                }
             }
         }
         if found.is_none() {
@@ -834,6 +909,20 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             }
             *pos = cur + n;
             val_reply(n as u64)
+        }
+        VnodeKind::DynamicDevice { port, dev_id } => {
+            let port = *port;
+            let dev_id = *dev_id;
+            drop(tbls);
+            let mut proxy_msg = Message::empty();
+            proxy_msg.tag = VFS_READ;
+            proxy_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
+            proxy_msg.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
+            proxy_msg.data[16..24].copy_from_slice(&(count as u64).to_le_bytes());
+            match ipc_call(port, proxy_msg) {
+                Some(reply) => reply,
+                None => err_reply(-5), // EIO
+            }
         }
         VnodeKind::RamFile { data, pos } => {
             let remaining = data.len().saturating_sub(*pos);
@@ -1009,6 +1098,20 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             }
             *pos = cur + n;
             val_reply(n as u64)
+        }
+        VnodeKind::DynamicDevice { port, dev_id } => {
+            let port = *port;
+            let dev_id = *dev_id;
+            drop(tbls);
+            let mut proxy_msg = Message::empty();
+            proxy_msg.tag = VFS_WRITE;
+            proxy_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
+            proxy_msg.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
+            proxy_msg.data[16..24].copy_from_slice(&(count as u64).to_le_bytes());
+            match ipc_call(port, proxy_msg) {
+                Some(reply) => reply,
+                None => err_reply(-5), // EIO
+            }
         }
         _ => err_reply(-9),
     }
@@ -1558,10 +1661,26 @@ const FIONREAD: usize = 0x541B;
 const FBIOGET_VSCREENINFO: usize = 0x4600;
 
 fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+
+    if let VnodeKind::DynamicDevice { port, dev_id } = &tbl.fds[fd].kind {
+        let port = *port;
+        let dev_id = *dev_id;
+        drop(tbls);
+        let mut proxy_msg = Message::empty();
+        proxy_msg.tag = VFS_IOCTL;
+        proxy_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
+        proxy_msg.data[8..16].copy_from_slice(&(cmd as u64).to_le_bytes());
+        proxy_msg.data[16..24].copy_from_slice(&(arg as u64).to_le_bytes());
+        match ipc_call(port, proxy_msg) {
+            Some(reply) => return reply,
+            None => return err_reply(-5),
+        }
+    }
+
     if cmd == FBIOGET_VSCREENINFO {
-        let mut tbls = FD_TABLES.lock();
-        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
         if let VnodeKind::DevFb { .. } = &tbl.fds[fd].kind {
             let width  = FB_WIDTH.load(atomic::Ordering::SeqCst);
             let height = FB_HEIGHT.load(atomic::Ordering::SeqCst);
@@ -1581,11 +1700,10 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
             return ok_reply();
         }
     }
+
     if cmd != FIONREAD { return err_reply(-25); }
     if arg == 0 { return err_reply(-14); }
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+
     let bytes_avail: i32 = match &tbl.fds[fd].kind {
         VnodeKind::Pipe { ring, is_write: false } => { let r = *ring; drop(tbls); PIPE_RINGS.lock()[r].count as i32 }
         VnodeKind::RamFile { data, pos } => (data.len().saturating_sub(*pos)) as i32,
