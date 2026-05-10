@@ -60,7 +60,7 @@ pub unsafe fn parse_with_requests(
                 kind,
             };
         }
-        info.memory_map = LIMINE_REGIONS.as_ptr();
+        info.memory_map = core::ptr::addr_of!(LIMINE_REGIONS) as *const MemoryRegion;
         info.memory_map_len = count;
     }
 

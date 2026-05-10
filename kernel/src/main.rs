@@ -236,9 +236,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         }
     }
 
-    unsafe {
-        BOOT_INFO_PTR.store(&raw mut BOOT_INFO as usize, Ordering::SeqCst);
-    }
+    BOOT_INFO_PTR.store(&raw mut BOOT_INFO as usize, Ordering::SeqCst);
 
     mm::init_with_map(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() }, hhdm_offset as usize);
 

@@ -14,6 +14,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "boot",
+ "evdev-server",
  "leandros-lib",
  "mm",
  "sched",
@@ -25,6 +26,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "boot",
+ "evdev-server",
  "leandros-lib",
  "mm",
  "sched",
@@ -68,6 +70,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "evdev-server"
+version = "0.1.0"
+dependencies = [
+ "ipc",
+ "sched",
+ "spin",
+ "vfs-server",
+]
+
+[[package]]
 name = "init-server"
 version = "0.1.0"
 dependencies = [
@@ -98,6 +110,7 @@ dependencies = [
  "boot",
  "drivers",
  "elf",
+ "evdev-server",
  "init-server",
  "ipc",
  "leandros-lib",

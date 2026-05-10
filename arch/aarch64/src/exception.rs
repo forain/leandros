@@ -18,6 +18,7 @@ fn serial_print_str(s: &str) {
     unsafe { serial_print_str_raw(s.as_ptr(), s.len()); }
 }
 
+#[allow(dead_code)]
 extern "C" {
     /// Save all registers and call the appropriate Rust handler.
     fn exc_vector_table();
@@ -35,7 +36,7 @@ fn exc_vector_table_ptr() -> usize {
     extern "C" {
         static __exception_vectors: u8;
     }
-    unsafe { core::ptr::addr_of!(__exception_vectors) as usize }
+    core::ptr::addr_of!(__exception_vectors) as usize
 }
 
 /// Updates the per-CPU kernel stack pointer used on EL0 exception entry.
@@ -80,13 +81,11 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
         
         // Print instruction at ELR if possible
         if elr >= 0x200000 && elr < 0x80000000 {
-            unsafe {
-                let instr_ptr = elr as *const u32;
-                // We need to be in the same address space to read this!
-                // But wait! We are in EL1, we can't easily read TTBR0 memory if it's not mapped in EL1.
-                // However, we are identity mapped for the first 1GB in some boot paths.
-                // For now, let's just print the ESR/ELR and try to deduce.
-            }
+            // We need to be in the same address space to read this!
+            // But wait! We are in EL1, we can't easily read TTBR0 memory if it's not mapped in EL1.
+            // However, we are identity mapped for the first 1GB in some boot paths.
+            // For now, let's just print the ESR/ELR and try to deduce.
+            let _instr_ptr = elr as *const u32;
         }
         
         // Print some regs from frame
