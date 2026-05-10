@@ -43,23 +43,23 @@ pub struct UserFrame {
     #[cfg(target_arch = "x86_64")]
     pub rbx: u64,
     #[cfg(target_arch = "x86_64")]
-    pub r11: u64,
-    #[cfg(target_arch = "x86_64")]
     pub r10: u64,
     #[cfg(target_arch = "x86_64")]
     pub r9:  u64,
     #[cfg(target_arch = "x86_64")]
     pub r8:  u64,
     #[cfg(target_arch = "x86_64")]
-    pub rax: u64,
-    #[cfg(target_arch = "x86_64")]
-    pub rcx: u64,
-    #[cfg(target_arch = "x86_64")]
     pub rdx: u64,
     #[cfg(target_arch = "x86_64")]
     pub rsi: u64,
     #[cfg(target_arch = "x86_64")]
     pub rdi: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub rax: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub rcx: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub r11: u64,
     #[cfg(target_arch = "x86_64")]
     pub rip: u64,
     #[cfg(target_arch = "x86_64")]

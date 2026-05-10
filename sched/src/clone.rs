@@ -124,20 +124,12 @@ pub fn fork_current(frame_ptr: usize) -> isize {
             unsafe { (*child_frame_ptr).rax = 0; } // Return 0 to child
 
             // Initial child RSP for context switch:
-            // CpuContext::cpu_switch_to expects RSP to point to its frame:
-            // [r15, r14, r13, r12, rbp, rbx, ret_target]
-            // This is 7 words total. We place it right below the UserFrame.
-            let child_ksp_virt = (child_frame_ptr as usize).wrapping_sub(7 * 8);
+            // CpuContext::cpu_switch_to will 'ret' to the target address on the stack.
+            // We place 'fork_ret_to_user' right below the UserFrame.
+            let child_ksp_virt = (child_frame_ptr as usize).wrapping_sub(8);
             unsafe {
                 let p = child_ksp_virt as *mut u64;
-                // Pop order in cpu_switch_to: r15, r14, r13, r12, rbp, rbx, then 'ret'
-                p.add(0).write(0); // r15
-                p.add(1).write(0); // r14
-                p.add(2).write(0); // r13
-                p.add(3).write(0); // r12
-                p.add(4).write(0); // rbp
-                p.add(5).write(0); // rbx
-                p.add(6).write(fork_ret_to_user as *const () as u64); // return target
+                p.write(fork_ret_to_user as *const () as u64);
             }
             child_ctx.rsp = child_ksp_virt as u64;
         }
@@ -266,12 +258,10 @@ pub fn clone_thread(
             }
 
             // Initial child RSP for context switch
-            let child_ksp = (child_frame_ptr as usize).wrapping_sub(7 * 8);
+            let child_ksp = (child_frame_ptr as usize).wrapping_sub(8);
             unsafe {
                 let p = child_ksp as *mut u64;
-                p.add(0).write(0); p.add(1).write(0); p.add(2).write(0);
-                p.add(3).write(0); p.add(4).write(0); p.add(5).write(0);
-                p.add(6).write(fork_ret_to_user as *const () as u64);
+                p.write(fork_ret_to_user as *const () as u64);
             }
             child_ctx.rsp = child_ksp as u64;
 
