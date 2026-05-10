@@ -238,19 +238,12 @@ pub fn wait_pid(pid: Pid) -> Option<i32> {
         
         unsafe {
             #[cfg(target_arch = "x86_64")]
-            core::arch::asm!("sti");
+            core::arch::asm!("sti; nop; cli");
             #[cfg(target_arch = "aarch64")]
-            core::arch::asm!("msr daifclr, #2");
+            core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2");
         }
 
         yield_now("wait_pid");
-
-        unsafe {
-            #[cfg(target_arch = "x86_64")]
-            core::arch::asm!("cli");
-            #[cfg(target_arch = "aarch64")]
-            core::arch::asm!("msr daifset, #2");
-        }
     }
 }
 
