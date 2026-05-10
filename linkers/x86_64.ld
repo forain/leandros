@@ -1,60 +1,48 @@
 ENTRY(_start)
 OUTPUT_FORMAT(elf64-x86-64)
 
+KERNEL_OFFSET = 0xffffffff80000000;
+PHYS_OFFSET   = 0x100000; /* 1MB */
+
 PHDRS
 {
-    text   PT_LOAD FLAGS(5); /* R E */
-    rodata PT_LOAD FLAGS(4); /* R   */
-    data   PT_LOAD FLAGS(6); /* RW  */
+    kernel PT_LOAD FLAGS(7); /* R W E */
 }
 
 SECTIONS
 {
-    . = 0xffffffff80000000;
+    . = KERNEL_OFFSET + PHYS_OFFSET;
 
-    .text : {
-        __text_start = .;
+    .text : AT(ADDR(.text) - KERNEL_OFFSET) {
+        *(.header)
+        *(.text.boot)
+        *(.text.pvh)
         *(.text .text.*)
-        __text_end = .;
-    } :text
+    } :kernel
 
-    . = ALIGN(0x1000);
-
-    .rodata : {
-        __rodata_start = .;
+    .rodata : AT(ADDR(.rodata) - KERNEL_OFFSET) {
         *(.rodata .rodata.*)
-        *(.gcc_except_table*)
-        __rodata_end = .;
-    } :rodata
+    } :kernel
 
-    . = ALIGN(0x1000);
-
-    .data : {
-        __data_start = .;
+    .data : AT(ADDR(.data) - KERNEL_OFFSET) {
         *(.data .data.*)
-        *(.got .got.*)
-        *(.data.rel.ro .data.rel.ro.*)
-        *(.tdata .tdata.*)
-        /* ── Limine request structures ────────────────────────────────────────── */
         . = ALIGN(8);
         KEEP(*(.limine_reqs_start))
         KEEP(*(.limine_reqs))
         KEEP(*(.limine_reqs_end))
-        __data_end = .;
-    } :data
+    } :kernel
 
-    .bss : {
-        PROVIDE(__bss_start = .);
+    .bss : AT(ADDR(.bss) - KERNEL_OFFSET) {
+        __bss_start = .;
         *(.bss .bss.*)
-        *(.tbss .tbss.*)
         *(COMMON)
-        PROVIDE(__bss_end = .);
-    } :data
+        __bss_end = .;
+    } :kernel
 
     /DISCARD/ : {
+        *(.note.pvh)
         *(.comment*)
         *(.eh_frame*)
         *(.note*)
-        *(.multiboot2_header*)
     }
 }

@@ -1,30 +1,41 @@
 ENTRY(_start)
 OUTPUT_FORMAT("elf64-littleaarch64", "elf64-littleaarch64", "elf64-littleaarch64")
 
-SECTIONS {
-    . = 0x40080000;  /* Physical address for direct boot - QEMU virt machine loads here */
+KERNEL_VIRT = 0xffff800000000000;
+KERNEL_PHYS = 0x40080000;
 
-    .text : {
+SECTIONS {
+    . = KERNEL_VIRT + KERNEL_PHYS;
+
+    .text : AT(KERNEL_PHYS) {
         __text_start = .;
+        KEEP(*(.boot))
+        . = ALIGN(2048);
+        __exception_vectors = .;
         *(.text*)
         . = ALIGN(4096);
         __text_end = .;
     }
 
-    .rodata : {
+    .rodata : AT(ADDR(.rodata) - KERNEL_VIRT) {
         __rodata_start = .;
         *(.rodata*)
         . = ALIGN(4096);
         __rodata_end = .;
     }
 
-    .data : {
+    .data : AT(ADDR(.data) - KERNEL_VIRT) {
+        __data_start = .;
         *(.data*)
         . = ALIGN(8);
         KEEP(*(.limine_requests_start))
         KEEP(*(.limine_requests))
         KEEP(*(.limine_requests_end))
         . = ALIGN(4096);
+        __data_end = .;
+    }
+
+    .bss : AT(ADDR(.bss) - KERNEL_VIRT) {
         __bss_start = .;
         *(.bss*)
         . = ALIGN(8);
