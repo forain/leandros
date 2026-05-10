@@ -5,6 +5,7 @@
 
 pub mod gdt;
 pub mod idt;
+pub mod keyboard;
 pub mod paging;
 #[cfg(target_arch = "x86_64")]
 pub mod apic;
@@ -73,6 +74,8 @@ pub fn init(info: &boot::BootInfo) {
         }
 
         apic::init();
+        pic::init();
+        pic::unmask(1); // Keyboard IRQ
     }
     #[cfg(target_arch = "x86_64")]
     unsafe { timer::init(); }
@@ -133,6 +136,23 @@ pub unsafe fn putc(c: u8) {
 /// Compatibility wrapper for serial output.
 pub fn arch_serial_putc(c: u8) {
     unsafe { putc(c); }
+}
+
+#[no_mangle]
+pub extern "C" fn arch_interrupt_save() -> usize {
+    let rflags: usize;
+    unsafe {
+        core::arch::asm!("pushfq", "pop {}", out(reg) rflags);
+        core::arch::asm!("cli");
+    }
+    rflags
+}
+
+#[no_mangle]
+pub extern "C" fn arch_interrupt_restore(flags: usize) {
+    if flags & (1 << 9) != 0 {
+        unsafe { core::arch::asm!("sti"); }
+    }
 }
 
 /// x86_64 serial input.

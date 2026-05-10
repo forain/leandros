@@ -71,23 +71,6 @@ unsafe fn wrmsr(msr: u32, val: u64) {
     );
 }
 
-/// Mask all 8259 PIC IRQs so ghost interrupts do not reach the CPU.
-///
-/// On UEFI the firmware may have already done this, but we do it explicitly
-/// before unmasking LAPIC interrupts.
-unsafe fn mask_pic() {
-    core::arch::asm!(
-        "out 0x21, al",   // OCW1: mask all master PIC IRQs
-        in("al") 0xFFu8,
-        options(nomem, nostack)
-    );
-    core::arch::asm!(
-        "out 0xA1, al",   // OCW1: mask all slave PIC IRQs
-        in("al") 0xFFu8,
-        options(nomem, nostack)
-    );
-}
-
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Initialise the Local APIC.
@@ -125,7 +108,8 @@ pub unsafe fn init() {
     wrmsr(IA32_APIC_BASE_MSR, apic_msr | APIC_GLOBAL_ENABLE);
 
     // Mask 8259 before unmasking LAPIC to prevent spurious legacy IRQs.
-    mask_pic();
+    // NOTE: We now use the PIC for keyboard IRQs, so we don't mask it here.
+    // mask_pic();
 
     // Accept all interrupt priorities (TPR = 0).
     write(LAPIC_TPR, 0);

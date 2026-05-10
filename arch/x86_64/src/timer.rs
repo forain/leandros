@@ -134,5 +134,13 @@ pub unsafe fn init() {
 #[inline]
 pub fn on_tick() {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Poll UART for keyboard input and push to evdev.
+    // NOTE: This consumes bytes that would otherwise go to fd 0 (stdin).
+    while let Some(b) = unsafe { super::serial_read_byte() } {
+        evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 1); // Key down only
+        evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
+    }
+
     sched::timer_tick_irq();
 }
