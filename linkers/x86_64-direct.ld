@@ -1,36 +1,37 @@
-ENTRY(_start)
+ENTRY(_start_pvh)
 OUTPUT_FORMAT(elf64-x86-64)
 
+PHDRS
+{
+    note PT_NOTE FLAGS(0);
+    kernel PT_LOAD FLAGS(7);
+}
+
 SECTIONS {
-    . = 0x100000;  /* Physical address 1MB for direct boot */
+    . = 0x100000;
 
-    .multiboot2_header ALIGN(8) : {
-        *(.multiboot2_header*)
-    }
+    .note.pvh : {
+        KEEP(*(.note.pvh))
+    } :note
 
-    .text ALIGN(4K) : {
+    .text : {
         __text_start = .;
+        KEEP(*(.header))
+        KEEP(*(.text.boot))
         *(.text*)
-    }
+        . = ALIGN(4K);
+        __text_end = .;
+    } :kernel
 
     .rodata ALIGN(4K) : {
-        __text_end = .;
         __rodata_start = .;
         *(.rodata*)
-        __altcode_start = .;
-        KEEP(*(.altcode*))
-        __altcode_end = .;
-        . = ALIGN(8);
-        __altrelocs_start = .;
-        KEEP(*(.altrelocs*))
-        __altrelocs_end = .;
-        __altfeatures_start = .;
-        KEEP(*(.altfeatures*))
-        __altfeatures_end = .;
-    }
+        . = ALIGN(4K);
+        __rodata_end = .;
+    } :kernel
 
     .data ALIGN(4K) : {
-        __rodata_end = .;
+        __data_start = .;
         *(.data*)
         . = ALIGN(8);
         KEEP(*(.limine_requests_start))
@@ -41,7 +42,7 @@ SECTIONS {
         *(.bss*)
         . = ALIGN(8);
         __bss_end = .;
-    }
+    } :kernel
 
     __end = .;
     __kernel_end = .;
@@ -50,7 +51,6 @@ SECTIONS {
         *(.comment*)
         *(.eh_frame*)
         *(.gcc_except_table*)
-        *(.note*)
         *(.rel.eh_frame*)
     }
 }

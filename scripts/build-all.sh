@@ -66,20 +66,20 @@ build_userland() {
 # Function to create initrd
 create_initrd() {
     local arch="$1"
-    local initrd_name="initrd-$arch.cpio.gz"
+    local initrd_name="initrd-$arch.cpio"
     local target_arch
     target_arch=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-none" || echo "x86_64-unknown-none")
     local userland_dir="userland/target/$target_arch/release"
-    
+
     echo "  Creating CPIO initrd..."
     local temp_dir="temp_initrd_$arch"
     rm -rf "$temp_dir"
     mkdir -p "$temp_dir/bin"
-    
-    cp "$userland_dir/init" "$temp_dir/init"
+
+    cp "$userland_dir/init" "$temp_dir/bin/init"
     cp "$userland_dir/shell" "$temp_dir/bin/shell"
     cp "$userland_dir/hello" "$temp_dir/bin/hello"
-    
+
     local doom_bin="doomgeneric/doom-$arch"
     if [[ -f "$doom_bin" ]]; then
         cp "$doom_bin" "$temp_dir/bin/doom"
@@ -89,13 +89,13 @@ create_initrd() {
     if [[ -f "$doom_wad" ]]; then
         cp "$doom_wad" "$temp_dir/bin/doom1.wad"
     fi
-    
-    # Create uncompressed CPIO archive
+
     (
         cd "$temp_dir" || exit 1
         find . -print0 | cpio -0 -o -H newc > "$ROOT_DIR/$initrd_name"
+        gzip -c "$ROOT_DIR/$initrd_name" > "$ROOT_DIR/$initrd_name.gz"
     )
-    
+
     rm -rf "$temp_dir"
 }
 
@@ -108,23 +108,38 @@ build_kernel() {
     mkdir -p "$target_root"
     
     local target_spec="$ROOT_DIR/targets/$arch-unknown-kernel.json"
-    local linker="$ROOT_DIR/linkers/$arch.ld"
     
-    echo "  Running cargo build..."
+    # 1. Standard (Limine) kernel
+    echo "  Building standard kernel..."
+    local linker="$ROOT_DIR/linkers/$arch.ld"
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
     RUSTFLAGS="-C link-arg=-T$linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro" \
     cargo +nightly build -p kernel --target "$target_spec" --target-dir "$target_root" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
     
-    # Identify and preserve the binary
     mkdir -p "target/final-$arch"
-    local built_kernel
-    built_kernel=$(find "$target_root" -name "kernel" -type f | grep release | grep -v deps | head -1)
-    if [[ -z "$built_kernel" ]]; then
-        echo "❌ Failed to find built kernel for $arch"
-        exit 1
+    local target_triple
+    target_triple=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-kernel" || echo "x86_64-unknown-kernel")
+    cp "$target_root/$target_triple/release/kernel" "target/final-$arch/kernel"
+
+    # 2. Direct boot kernel
+    echo "  Building direct-boot kernel..."
+    local direct_linker="$ROOT_DIR/linkers/$arch-direct.ld"
+    cargo clean -p kernel --target "$target_spec" --target-dir "$target_root" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
+    RUSTFLAGS="-C link-arg=-T$direct_linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro" \
+    cargo +nightly build -p kernel --target "$target_spec" --target-dir "$target_root" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
+    
+    cp "$target_root/$target_triple/release/kernel" "target/final-$arch/kernel-direct"
+    
+    # Generate flat binary and 32-bit ELF for direct boot
+    local objcopy="/Users/forain/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-objcopy"
+    if [[ -f "$objcopy" ]]; then
+        "$objcopy" -O binary "target/final-$arch/kernel-direct" "target/final-$arch/kernel-direct.bin"
+        echo "  Flat binary generated: target/final-$arch/kernel-direct.bin"
+        if [[ "$arch" == "x86_64" ]]; then
+            "$objcopy" -O elf32-i386 "target/final-$arch/kernel-direct" "target/final-$arch/kernel-direct-32.elf"
+            echo "  32-bit ELF generated: target/final-$arch/kernel-direct-32.elf"
+        fi
     fi
-    cp "$built_kernel" "target/final-$arch/kernel"
-    cp "$built_kernel" "target/final-$arch/kernel-direct"
 }
 
 # Function to convert raw image to VDI
@@ -161,7 +176,8 @@ create_disk_image() {
     mcopy -oi "$temp_fat" "$limine_dir/limine-bios.sys" ::/boot/limine/limine-bios.sys
     mcopy -oi "$temp_fat" "$limine_dir/limine-bios.sys" ::/limine-bios.sys
     mcopy -oi "$temp_fat" "target/final-$arch/kernel" ::/kernel.elf
-    mcopy -oi "$temp_fat" "initrd-$arch.cpio.gz" ::/initrd.gz
+    # Use uncompressed for now as our simple parser doesn't handle .gz
+    mcopy -oi "$temp_fat" "initrd-$arch.cpio" ::/initrd.gz
     mcopy -oi "$temp_fat" limine/limine.conf ::/limine.conf
     
     dd if="$temp_fat" of="$image_name" bs=512 seek=2048 conv=notrunc 2>/dev/null

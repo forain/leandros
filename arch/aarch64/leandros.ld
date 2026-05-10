@@ -48,13 +48,14 @@ SECTIONS
 
     /* ── Initialised read-write data ─────────────────────────────────────── */
     .data ALIGN(4096) : AT(ADDR(.data) - KERNEL_OFFSET) {
-        *(.data .data.*)
-        /* ── Limine request structures ────────────────────────────────────────── */
+        /* ── Limine request structures — MUST be writable ──────────────────── */
         . = ALIGN(8);
         KEEP(*(.limine_reqs_start))
         KEEP(*(.limine_reqs))
         KEEP(*(.limine_reqs_end))
+        . = ALIGN(8);
 
+        *(.data .data.*)
         __data_end = .;
     }
 

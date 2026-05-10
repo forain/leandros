@@ -1,149 +1,129 @@
-// AArch64 bare-metal entry point — kernel/src/entry_aarch64.s
-//
-// Supports two boot environments:
-//   QEMU -machine virt : enters at EL1 directly.
-//   Raspberry Pi 5     : firmware (VideoCore / TF-A) enters at EL2.
-//
-// On Limine:
-//   Enters at EL1 with MMU enabled and kernel mapped at 0xffffffff80000000.
+// AArch64 bare-metal entry point supporting Limine — kernel/src/entry_aarch64.s
 
-.section ".text.boot", "ax", @progbits
+.section ".boot", "ax", @progbits
 .globl _start
 _start:
-    // ── Force SP_EL1 for kernel execution ─────────────────────────────────────
+    // ── Diagnostic: 'A' ──
+    mov     x0, #0x09000000
+    mov     x1, #0x41
+    str     w1, [x0]
+
+    // ── PRESERVE ARGUMENTS IMMEDIATELY ──
+    mov     x19, x0
+    mov     x20, x1
+
+    // Force SP_EL1
     msr     SPSel, #1
     isb
+    
+    // Check if MMU is on
+    mrs     x4, sctlr_el1
+    tst     x4, #1
+    b.ne    .Llimine_entry
 
-    // Debug: _start reached - write 'B' IMMEDIATELY
-    // mov     x20, 0x09000000         // QEMU virt UART base
-    // mov     w21, #'B'
-    // str     w21, [x20]
+    // ── Direct Boot Path (MMU is OFF) ────────────────────────────────────────
+    
+    // Diagnostic: 'D'
+    mov     x0, #0x09000000
+    mov     x1, #0x44
+    str     w1, [x0]
 
-    // ── Enable FP / SIMD (NEON) ──────────────────────────────────────────────
-    // CPACR_EL1.FPEN (bits 20-21) = 0b11: do not trap FP/SIMD instructions.
-    mov     x1, #(3 << 20)
-    msr     cpacr_el1, x1
+    // 1. MAIR
+    mov     x4, #0x04FF
+    msr     mair_el1, x4
+
+    // 2. TCR: 48-bit VA, 4KB granule
+    ldr     x4, =0x280100010
+    msr     tcr_el1, x4
     isb
 
-    // ── Zero the BSS section ──────────────────────────────────────────────────
-    // Debug: Starting BSS clear - write 'F'
-    // mov     w21, #'F'
-    // str     w21, [x20]
+    // 3. Setup temporary page tables using early_pgtables
+    adrp    x0, early_pgtables
+    add     x0, x0, :lo12:early_pgtables
+    
+    mov     x5, #32768
+    mov     x6, x0
+.Lclear_pgt:
+    str     xzr, [x6], #8
+    subs    x5, x5, #8
+    b.ne    .Lclear_pgt
 
+    // Level 0 (PGD)
+    mov     x5, #0x1003
+    add     x5, x0, x5
+    str     x5, [x0, #0]
+    str     x5, [x0, #2048]
+    str     x5, [x0, #4088]
+
+    // Level 1 (PUD)
+    add     x6, x0, #0x1000
+    ldr     x5, =0x0000000000000705 // 0..1GB (Device)
+    str     x5, [x6, #0]
+    ldr     x5, =0x0000000040000701 // 1..2GB (Normal)
+    str     x5, [x6, #8]
+    ldr     x5, =0x0000000080000701 // 2..3GB (Normal)
+    str     x5, [x6, #16]
+    ldr     x5, =0x00000000C0000701 // 3..4GB (Normal)
+    str     x5, [x6, #24]
+
+    // Set page tables
+    msr     ttbr0_el1, x0
+    msr     ttbr1_el1, x0
+    isb
+
+    // Invalidate TLB
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+
+    // 4. Enable MMU and SIMD
+    mrs     x4, sctlr_el1
+    orr     x4, x4, #1
+    msr     sctlr_el1, x4
+    
+    mrs     x5, cpacr_el1
+    orr     x5, x5, #(3 << 20)
+    msr     cpacr_el1, x5
+    isb
+
+    // Transition to high virtual address
+    ldr     x4, =1f
+    br      x4
+1:
+    // Diagnostic: 'H'
+    mov     x0, #0x09000000
+    mov     x1, #0x48
+    str     w1, [x0]
+
+.Llimine_entry:
+    // ── Zero BSS ─────────────────────────────────────────────────────────────
     adrp    x0, __bss_start
     add     x0, x0, :lo12:__bss_start
     adrp    x1, __bss_end
     add     x1, x1, :lo12:__bss_end
-    
+.Lbss_loop:
     cmp     x0, x1
     b.ge    .Lbss_done
-    
-.Lbss_loop:
-    strb    wzr, [x0], #1
-    cmp     x0, x1
-    b.lt    .Lbss_loop
-
+    str     xzr, [x0], #8
+    b       .Lbss_loop
 .Lbss_done:
-    dsb     sy
-    isb
 
-    // Debug: BSS cleared - write 'G'
-    // mov     w21, #'G'
-    // str     w21, [x20]
-
-    // ── Set up initial stack (SP_EL1) ─────────────────────────────────────────
+    // Set up initial stack
     adrp    x1, EARLY_STACK
     add     x1, x1, :lo12:EARLY_STACK
-    // Force virtual address if we are executing identity mapped
-    mov     x2, #0xffffffff80000000
-    orr     x1, x1, x2
-    mov     x2, #0x10000            // 64 KiB
+    mov     x2, #0x10000
     add     x1, x1, x2
     mov     sp, x1
 
-    // Debug: Stack set up - write 'E'
-    // mov     w21, #'E'
-    // str     w21, [x20]
-
-    // ── Call kernel_main(dtb_ptr: usize) ─────────────────────────────────────
-    // Debug: Write 'A' after basic setup before kernel_main
-    // mov     w1, #'A'
-    // str     w1, [x20]
-
-    // Preserve x0 (boot info addr) just in case
-    mov     x19, x0
-    
-    // Call into Rust using PC-relative address
-    adrp    x1, kernel_main
-    add     x1, x1, :lo12:kernel_main
-    
-    // Debug: Write 'J' to indicate we are about to jump to the address in x1
-    // mov     w2, #'J'
-    // str     w2, [x20]
-    
-    // Restore x0 before jump
+    // Call kernel_main
     mov     x0, x19
+    ldr     x1, .Lkernel_main_val
     blr     x1
+
+.align 3
+.Lkernel_main_val:
+    .quad kernel_main
 
 .Lhalt:
     wfe
     b       .Lhalt
-
-// ── Exception Vectors ────────────────────────────────────────────────────────
-// Minimal table to catch early boot faults.
-
-.section ".text", "ax", @progbits
-.align 11                           // 2^11 = 2048 = 2 KiB alignment
-.Llocal_exception_vectors:
-
-// Current EL, SP0
-.align 7; b .Lexc_halt_sync        // Synchronous
-.align 7; b .Lexc_halt_irq         // IRQ
-.align 7; b .Lexc_halt_fiq         // FIQ
-.align 7; b .Lexc_halt_serror      // SError
-
-// Current EL, SPx
-.align 7; b .Lexc_halt_sync        // Synchronous
-.align 7; b .Lexc_halt_irq         // IRQ
-.align 7; b .Lexc_halt_fiq         // FIQ
-.align 7; b .Lexc_halt_serror      // SError
-
-// Lower EL, AArch64
-.align 7; b .Lexc_halt_sync        // Synchronous
-.align 7; b .Lexc_halt_irq         // IRQ
-.align 7; b .Lexc_halt_fiq         // FIQ
-.align 7; b .Lexc_halt_serror      // SError
-
-// Lower EL, AArch32
-.align 7; b .Lexc_halt_sync        // Synchronous
-.align 7; b .Lexc_halt_irq         // IRQ
-.align 7; b .Lexc_halt_fiq         // FIQ
-.align 7; b .Lexc_halt_serror      // SError
-
-.Lexc_halt_sync:
-    // mov     x0, 0x09000000
-    // mov     w1, #'S'
-    // str     w1, [x0]
-    b .Lexc_park
-
-.Lexc_halt_irq:
-    // mov     x0, 0x09000000
-    // mov     w1, #'I'
-    // str     w1, [x0]
-    b .Lexc_park
-
-.Lexc_halt_fiq:
-    // mov     x0, 0x09000000
-    // mov     w1, #'F'
-    // str     w1, [x0]
-    b .Lexc_park
-
-.Lexc_halt_serror:
-    // mov     x0, 0x09000000
-    // mov     w1, #'R'
-    // str     w1, [x0]
-    b .Lexc_park
-
-.Lexc_park:
-    wfe
-    b       .Lexc_park

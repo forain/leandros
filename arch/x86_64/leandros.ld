@@ -1,10 +1,14 @@
-ENTRY(kstart)
+ENTRY(_start)
 OUTPUT_FORMAT(elf64-x86-64)
 
 KERNEL_OFFSET = 0xFFFFFFFF80000000;
 
 SECTIONS {
     . = KERNEL_OFFSET;
+
+    .multiboot2_header : AT(ADDR(.multiboot2_header) - KERNEL_OFFSET) {
+        KEEP(*(.multiboot2_header))
+    }
 
     . += SIZEOF_HEADERS;
 
@@ -26,12 +30,13 @@ SECTIONS {
     }
 
     .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_OFFSET) {
-        *(.data*)
-        /* ── Limine request structures ────────────────────────────────────────── */
+        /* ── Limine request structures — MUST be writable ──────────────────── */
         . = ALIGN(8);
-        KEEP(*(.limine_requests_start))
-        KEEP(*(.limine_requests))
-        KEEP(*(.limine_requests_end))
+        KEEP(*(.limine_reqs_start))
+        KEEP(*(.limine_reqs))
+        KEEP(*(.limine_reqs_end))
+        . = ALIGN(8);
+        *(.data*)
         . = ALIGN(4K);
         __bss_start = .;
         *(.bss*)

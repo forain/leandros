@@ -1,5 +1,9 @@
 # LeandrOS Development Guidelines
 
+## Boot Protocol
+- **MANDATORY**: Minimal Limine revision must be **6**.
+- Never downgrade the Limine revision under any circumstances.
+
 ## Git Practices
 - Never mention Claude in commit messages or authorship
 - Keep commit history clean and professional
