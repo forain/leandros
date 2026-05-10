@@ -56,6 +56,16 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         if let Some(init_elf) = extract_binary_from_initrd("bin/init", &tmp_info) {
             serial_print_str("[INIT] Successfully extracted init binary from initrd\n");
             
+            // Register initrd with VFS so it can find files later (like doom1.wad)
+            vfs_server::set_initrd(actual_initrd_base, actual_initrd_size);
+            // Also register framebuffer with VFS
+            vfs_server::set_framebuffer(
+                boot_info.framebuffer_base,
+                boot_info.framebuffer_width,
+                boot_info.framebuffer_height,
+                boot_info.framebuffer_pitch,
+            );
+
             // Load and spawn the ELF
             let pid = load_and_spawn_elf(init_elf);
             serial_print_str("[INIT] Userspace init spawned with PID: ");
