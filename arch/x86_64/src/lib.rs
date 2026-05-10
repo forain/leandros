@@ -17,6 +17,12 @@ pub mod syscall;
 #[cfg(target_arch = "x86_64")]
 pub mod timer;
 
+#[no_mangle]
+pub unsafe extern "C" fn arch_flush_cache_range(_addr: usize, _len: usize) {
+    // x86-64 is coherent for framebuffer writes usually, or we use NO_CACHE.
+    // If we wanted to be absolutely sure, we could use CLFLUSH, but it's slow.
+}
+
 /// Initialise x86-64 hardware: GDT, IDT, APIC, APIC timer, SYSCALL.
 ///
 /// Init order matters:
