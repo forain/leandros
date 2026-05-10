@@ -245,18 +245,37 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
 
     unsafe {
         if (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_base != 0 {
-            drivers::framebuffer::init_kernel_fb(
-                mm::phys_to_virt((*core::ptr::addr_of!(BOOT_INFO)).framebuffer_base as usize) as *mut u32,
-                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_width as usize,
-                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_height as usize,
-                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_pitch as usize,
-            );
+            // Set boot framebuffer info for fallback
             drivers::framebuffer::set_boot_framebuffer(
                 (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_base,
                 (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_width,
                 (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_height,
                 (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_pitch,
             );
+
+            // Initialize boot framebuffer first
+            drivers::framebuffer::init_kernel_fb(
+                mm::phys_to_virt((*core::ptr::addr_of!(BOOT_INFO)).framebuffer_base as usize) as *mut u32,
+                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_width as usize,
+                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_height as usize,
+                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_pitch as usize,
+            );
+
+            // Try KMS to detect native resolution (for informational purposes)
+            match drivers::kms::init_kms() {
+                Ok(mode) => {
+                    serial_print_str("[KMS] Detected native resolution: ");
+                    print_number(mode.width);
+                    serial_print_str("x");
+                    print_number(mode.height);
+                    serial_print_str("@");
+                    print_number(mode.refresh_rate);
+                    serial_print_str("Hz (using boot framebuffer for console)\n");
+                }
+                Err(_) => {
+                    serial_print_str("[KMS] Could not detect native resolution, using boot framebuffer\n");
+                }
+            }
         }
     }
 
