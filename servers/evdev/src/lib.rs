@@ -1,0 +1,220 @@
+#![no_std]
+
+use ipc::{Message, port};
+use spin::Mutex;
+
+// ── Protocol helper ──────────────────────────────────────────────────────────
+
+fn arg(msg: &Message, n: usize) -> u64 {
+    let off = n * 8;
+    u64::from_le_bytes(msg.data[off..off + 8].try_into().unwrap_or([0u8; 8]))
+}
+
+fn make_reply(v: i64) -> Message {
+    let mut m = Message::empty();
+    m.data[0..8].copy_from_slice(&(v as u64).to_le_bytes());
+    m
+}
+
+fn err_reply(e: i32) -> Message { make_reply(e as i64) }
+fn val_reply(v: u64) -> Message { make_reply(v as i64) }
+
+// ── Linux input_event ────────────────────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct timeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct input_event {
+    pub time: timeval,
+    pub type_: u16,
+    pub code: u16,
+    pub value: i32,
+}
+
+// ── Device State ─────────────────────────────────────────────────────────────
+
+const MAX_EVENTS: usize = 64;
+const MAX_DEVICES: usize = 4;
+
+struct EvdevDevice {
+    events: [input_event; MAX_EVENTS],
+    head:   usize,
+    tail:   usize,
+    count:  usize,
+    in_use: bool,
+}
+
+impl EvdevDevice {
+    const fn empty() -> Self {
+        Self {
+            events: [const { input_event {
+                time: timeval { tv_sec: 0, tv_usec: 0 },
+                type_: 0, code: 0, value: 0
+            } }; MAX_EVENTS],
+            head:   0,
+            tail:   0,
+            count:  0,
+            in_use: false,
+        }
+    }
+
+    fn push(&mut self, ev: input_event) {
+        if self.count >= MAX_EVENTS {
+            self.head = (self.head + 1) % MAX_EVENTS;
+            self.count -= 1;
+        }
+        self.events[self.tail] = ev;
+        self.tail = (self.tail + 1) % MAX_EVENTS;
+        self.count += 1;
+    }
+
+    fn pop(&mut self) -> Option<input_event> {
+        if self.count == 0 { return None; }
+        let ev = self.events[self.head];
+        self.head = (self.head + 1) % MAX_EVENTS;
+        self.count -= 1;
+        Some(ev)
+    }
+}
+
+static DEVICES: Mutex<[EvdevDevice; MAX_DEVICES]> = Mutex::new([const { EvdevDevice::empty() }; MAX_DEVICES]);
+
+// ── Interrupt Safety ─────────────────────────────────────────────────────────
+
+extern "C" {
+    fn arch_interrupt_save() -> usize;
+    fn arch_interrupt_restore(f: usize);
+}
+
+// ── Message Dispatch ──────────────────────────────────────────────────────────
+
+pub fn handle(msg: &Message, _caller_pid: u32) -> Message {
+    let tag = msg.tag;
+    let dev_id = arg(msg, 0) as usize;
+    
+    if dev_id >= MAX_DEVICES { return err_reply(-19); } // ENODEV
+    
+    match tag {
+        vfs_server::VFS_READ => {
+            let buf_ptr = arg(msg, 1) as usize;
+            let count = arg(msg, 2) as usize;
+            
+            let f = unsafe { arch_interrupt_save() };
+            let mut devs = DEVICES.lock();
+            let dev = &mut devs[dev_id];
+            
+            if dev.count == 0 {
+                drop(devs);
+                unsafe { arch_interrupt_restore(f); }
+                return err_reply(-11); // EAGAIN
+            }
+            
+            let event_size = core::mem::size_of::<input_event>();
+            let mut n = 0;
+            while n + event_size <= count {
+                if let Some(ev) = dev.pop() {
+                    unsafe {
+                        core::ptr::write((buf_ptr + n) as *mut input_event, ev);
+                    }
+                    n += event_size;
+                } else {
+                    break;
+                }
+            }
+            drop(devs);
+            unsafe { arch_interrupt_restore(f); }
+            val_reply(n as u64)
+        }
+        vfs_server::VFS_WRITE => {
+            let count = arg(msg, 2) as u64;
+            val_reply(count)
+        }
+        vfs_server::VFS_IOCTL => {
+            let cmd = arg(msg, 1) as usize;
+            if cmd == 0x541B { // FIONREAD
+                let arg_ptr = arg(msg, 2) as usize;
+                let f = unsafe { arch_interrupt_save() };
+                let devs = DEVICES.lock();
+                let count = (devs[dev_id].count * core::mem::size_of::<input_event>()) as i32;
+                drop(devs);
+                unsafe {
+                    arch_interrupt_restore(f);
+                    *(arg_ptr as *mut i32) = count;
+                }
+                return val_reply(0);
+            }
+            if cmd == 0x80044501 { // EVIOCGVERSION
+                return val_reply(0x00010001);
+            }
+            if cmd == 0x80084502 { // EVIOCGID
+                let arg_ptr = arg(msg, 2) as usize;
+                unsafe {
+                    let p = arg_ptr as *mut u16;
+                    p.write(0x0001); // bustype (BUS_USB)
+                    p.add(1).write(0x1234); // vendor
+                    p.add(2).write(0x5678); // product
+                    p.add(3).write(0x0001); // version
+                }
+                return val_reply(0);
+            }
+            err_reply(-25) // ENOTTY
+        }
+        _ => err_reply(-38), // ENOSYS
+    }
+}
+
+pub fn pop_event(dev_id: u32) -> Option<input_event> {
+    if dev_id as usize >= MAX_DEVICES { return None; }
+    let f = unsafe { arch_interrupt_save() };
+    let mut devs = DEVICES.lock();
+    let ev = devs[dev_id as usize].pop();
+    drop(devs);
+    unsafe { arch_interrupt_restore(f); }
+    ev
+}
+
+pub fn has_events(dev_id: u32) -> bool {
+    if dev_id as usize >= MAX_DEVICES { return false; }
+    let f = unsafe { arch_interrupt_save() };
+    let devs = DEVICES.lock();
+    let count = devs[dev_id as usize].count;
+    drop(devs);
+    unsafe { arch_interrupt_restore(f); }
+    count > 0
+}
+
+pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
+    if dev_id as usize >= MAX_DEVICES { return; }
+    let now_ticks = sched::ticks();
+    let ev = input_event {
+        time: timeval {
+            tv_sec: (now_ticks / 100) as i64,
+            tv_usec: ((now_ticks % 100) * 10000) as i64,
+        },
+        type_,
+        code,
+        value,
+    };
+    let f = unsafe { arch_interrupt_save() };
+    let mut devs = DEVICES.lock();
+    devs[dev_id as usize].push(ev);
+    drop(devs);
+    unsafe { arch_interrupt_restore(f); }
+}
+
+pub fn init(owner_pid: u32) -> Option<u32> {
+    let port_id = port::create(owner_pid)?;
+    {
+        let mut devs = DEVICES.lock();
+        devs[0].in_use = true; // event0 (keyboard)
+    }
+    vfs_server::register_device("/dev/input/event0", port_id, 0);
+    port::register_handler(port_id, handle);
+    Some(port_id)
+}
