@@ -63,6 +63,20 @@ impl RunQueue {
             }
         }
 
+        extern "C" { 
+            fn serial_print(s: *const u8, len: usize); 
+            fn print_number(n: u32);
+        }
+        unsafe {
+            let msg = b"[SCHED] pick_next: no ready task! len=";
+            serial_print(msg.as_ptr(), msg.len());
+            print_number(self.len as u32);
+            let msg2 = b" cursor=";
+            serial_print(msg2.as_ptr(), msg2.len());
+            print_number(self.cursor as u32);
+            serial_print(b"\n".as_ptr(), 1);
+        }
+
         None
     }
 

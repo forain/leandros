@@ -37,15 +37,13 @@ static FREE_LISTS: Mutex<[FreeList; MAX_ORDER]> = Mutex::new([const { FreeList::
 pub fn init_from_map(regions: &[boot::MemoryRegion]) {
     for region in regions {
         if region.kind != boot::MemoryType::Available { continue; }
-        // Skip the first 2 MiB — reserved for kernel image, page tables, etc.
-        let start = leandros_lib::align_up(
-            region.base as usize,
-            PAGE_SIZE << (MAX_ORDER - 1),
-        );
-        let end = leandros_lib::align_down(
-            (region.base + region.length) as usize,
-            PAGE_SIZE,
-        );
+        // Skip the first 32 MiB of usable RAM — reserved for kernel image, page tables, etc.
+        let r_start = region.base as usize;
+        let r_end = (region.base + region.length) as usize;
+        
+        let start = leandros_lib::align_up(r_start + 0x02000000, PAGE_SIZE << (MAX_ORDER - 1));
+        let end = leandros_lib::align_down(r_end, PAGE_SIZE);
+        
         if start >= end { continue; }
 
         // Walk from start to end, releasing the largest aligned block each time.
@@ -81,6 +79,10 @@ pub fn alloc(order: usize) -> Option<usize> {
             return Some(addr);
         }
     }
+    
+    extern "C" { fn serial_print(s: *const u8, len: usize); }
+    let msg = b"[BUDDY] Allocation failed! Out of memory.\n";
+    unsafe { serial_print(msg.as_ptr(), msg.len()); }
     None
 }
 
