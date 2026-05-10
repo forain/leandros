@@ -1406,9 +1406,29 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
         let tv_nsec = unsafe { core::ptr::read((timeout_ptr + 8) as *const i64) };
         if tv_sec == 0 && tv_nsec == 0 { return 0; }
         // Non-zero timeout: yield once before returning (cooperative).
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("sti"); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("msr daifclr, #2"); }
+
         yield_now("ppoll");
+
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("cli"); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("msr daifset, #2"); }
     } else if nready == 0 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("sti"); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("msr daifclr, #2"); }
+
         yield_now("ppoll");
+
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("cli"); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("msr daifset, #2"); }
     }
     nready
 }
@@ -1430,7 +1450,17 @@ fn sys_nanosleep(rqtp_ptr: usize, _rmtp: usize) -> isize {
     if ticks_needed == 0 { return 0; }
     let deadline = ticks().wrapping_add(ticks_needed);
     loop {
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("sti"); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("msr daifclr, #2"); }
+
         yield_now("nanosleep");
+
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("cli"); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("msr daifset, #2"); }
         if ticks() >= deadline { break; }
     }
     0
@@ -2017,7 +2047,19 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
             let first = loop {
                 match read_input_byte() {
                     Some(b) => break b,
-                    None    => yield_now("sys_read_stdin"),
+                    None    => {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe { core::arch::asm!("sti"); }
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe { core::arch::asm!("msr daifclr, #2"); }
+
+                        yield_now("sys_read_stdin");
+
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe { core::arch::asm!("cli"); }
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe { core::arch::asm!("msr daifset, #2"); }
+                    }
                 }
             };
 
@@ -2055,7 +2097,17 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
             loop {
                 let n = vfs_reply_val(&vfs::handle(&msg, pid));
                 if n != -11 { return n; }
+                #[cfg(target_arch = "x86_64")]
+                unsafe { core::arch::asm!("sti"); }
+                #[cfg(target_arch = "aarch64")]
+                unsafe { core::arch::asm!("msr daifclr, #2"); }
+
                 yield_now("sys_read_vfs");
+
+                #[cfg(target_arch = "x86_64")]
+                unsafe { core::arch::asm!("cli"); }
+                #[cfg(target_arch = "aarch64")]
+                unsafe { core::arch::asm!("msr daifset, #2"); }
             }
         }
     }

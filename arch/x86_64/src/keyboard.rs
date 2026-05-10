@@ -7,8 +7,10 @@ static mut SHIFT: bool = false;
 /// Called from the keyboard IRQ handler (vector 33).
 pub fn on_irq() {
     unsafe {
-        let scancode = inb(0x60);
-        handle_scancode(scancode);
+        while (inb(0x64) & 0x01) != 0 {
+            let scancode = inb(0x60);
+            handle_scancode(scancode);
+        }
     }
 }
 
