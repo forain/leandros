@@ -23,6 +23,8 @@ pub const LAPIC_TPR:        usize = 0x080; // Task Priority
 pub const LAPIC_EOI:        usize = 0x0B0; // End-of-Interrupt (write 0)
 pub const LAPIC_SVR:        usize = 0x0F0; // Spurious Interrupt Vector
 pub const LAPIC_LVT_TIMER:  usize = 0x320; // LVT: Timer
+pub const LAPIC_LVT_LINT0:  usize = 0x350; // LVT: LINT0
+pub const LAPIC_LVT_LINT1:  usize = 0x360; // LVT: LINT1
 pub const LAPIC_TIMER_INIT: usize = 0x380; // Timer Initial Count
 pub const LAPIC_TIMER_CURR: usize = 0x390; // Timer Current Count (RO)
 pub const LAPIC_TIMER_DIV:  usize = 0x3E0; // Timer Divide Configuration
@@ -71,6 +73,23 @@ unsafe fn wrmsr(msr: u32, val: u64) {
     );
 }
 
+/// Mask all 8259 PIC IRQs so ghost interrupts do not reach the CPU.
+///
+/// On UEFI the firmware may have already done this, but we do it explicitly
+/// before unmasking LAPIC interrupts.
+unsafe fn mask_pic() {
+    core::arch::asm!(
+        "out 0x21, al",   // OCW1: mask all master PIC IRQs
+        in("al") 0xFFu8,
+        options(nomem, nostack)
+    );
+    core::arch::asm!(
+        "out 0xA1, al",   // OCW1: mask all slave PIC IRQs
+        in("al") 0xFFu8,
+        options(nomem, nostack)
+    );
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Initialise the Local APIC.
@@ -108,8 +127,7 @@ pub unsafe fn init() {
     wrmsr(IA32_APIC_BASE_MSR, apic_msr | APIC_GLOBAL_ENABLE);
 
     // Mask 8259 before unmasking LAPIC to prevent spurious legacy IRQs.
-    // NOTE: We now use the PIC for keyboard IRQs, so we don't mask it here.
-    // mask_pic();
+    mask_pic();
 
     // Accept all interrupt priorities (TPR = 0).
     write(LAPIC_TPR, 0);
