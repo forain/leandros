@@ -197,10 +197,8 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
         }
     }
 
-    unsafe {
-        info.memory_map = MM.as_ptr();
-        info.memory_map_len = mm_idx;
-    }
+    info.memory_map = core::ptr::addr_of!(MM) as *const MemoryRegion;
+    info.memory_map_len = mm_idx;
     info
 }
 

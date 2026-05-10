@@ -299,6 +299,12 @@ fn vfs_dup2(old: i32, new: i32) -> i32 {
     reply_i64(&vfs::handle(&msg, pid)) as i32
 }
 
+fn vfs_ioctl(fd: i32, cmd: u64, arg: u64) -> isize {
+    let pid = sched::current_pid();
+    let msg = make_msg(vfs::VFS_IOCTL, &[fd as u64, cmd, arg]);
+    reply_i64(&vfs::handle(&msg, pid)) as isize
+}
+
 fn vfs_getdents64(fd: i32, buf: *mut u8, count: usize) -> isize {
     let pid = sched::current_pid();
     let msg = make_msg(vfs::VFS_GETDENTS64, &[fd as u64, buf as u64, count as u64]);
@@ -992,12 +998,32 @@ fn t_shell_funcs() {
     else { fail("source FILE", "variable not set"); }
 }
 
+fn t_evdev() {
+    let fd = vfs_open(b"/dev/input/event0", 0, 0);
+    if fd < 0 {
+        fail("evdev open", "/dev/input/event0 not found");
+        return;
+    }
+    
+    // Test EVIOCGVERSION
+    let mut version: u32 = 0;
+    let r = vfs_ioctl(fd, 0x80044501, &mut version as *mut u32 as u64);
+    if r == 0 && version == 0x00010001 {
+        pass("evdev ioctl EVIOCGVERSION");
+    } else {
+        fail("evdev ioctl", "version mismatch or error");
+    }
+    
+    vfs_close(fd);
+}
+
 fn run_posix_tests() {
     kprintln!("[init] ══════════ POSIX smoke tests ══════════");
     t_getpid();
     t_getcwd();
     t_chdir();
     t_open_read_close();
+    t_evdev();
     t_write_stdout();
     t_pipe();
     t_dup2();

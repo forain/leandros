@@ -20,6 +20,7 @@ ipc        = { path = "../ipc" }
 boot       = { path = "../boot" }
 drivers    = { path = "../drivers" }
 vfs-server  = { path = "../servers/vfs" }
+evdev-server = { path = "../servers/evdev" }
 net-server  = { path = "../servers/net" }
 tty-server  = { path = "../servers/tty" }
 init-server = { path = "../servers/init" }
