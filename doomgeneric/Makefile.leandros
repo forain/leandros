@@ -1,0 +1,69 @@
+CC = clang
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    # On macOS, we use rust-lld from the rust toolchain as a fallback for ld.lld
+    LD_PATH := $(shell find $$(rustc --print sysroot) -name rust-lld | head -n 1)
+    LD = $(LD_PATH) -flavor gnu
+else
+    LD = ld.lld
+endif
+
+ARCH ?= x86_64
+
+ifeq ($(ARCH),x86_64)
+    TARGET = x86_64-unknown-none
+    CFLAGS_ARCH = -m64
+    LDFLAGS_ARCH = 
+else ifeq ($(ARCH),aarch64)
+    TARGET = aarch64-unknown-none
+    CFLAGS_ARCH = 
+    LDFLAGS_ARCH = 
+endif
+
+CFLAGS = --target=$(TARGET) -DOOMGENERIC_RESX=640 -DOOMGENERIC_RESY=400 -I. -Iinclude -static -fno-stack-protector -ffreestanding -nostdlib -O2 $(CFLAGS_ARCH)
+LDFLAGS = -static -nostdlib $(LDFLAGS_ARCH)
+
+LIBC = ../userland/target/$(TARGET)/release/libleandros_libc.a
+
+# Select DRM or legacy framebuffer version
+USE_DRM ?= 1
+
+ifeq ($(USE_DRM),1)
+    PLATFORM_SRC = doomgeneric_leandros_drm.c
+    CFLAGS += -DUSE_DRM=1
+else
+    PLATFORM_SRC = doomgeneric_leandros.c
+endif
+
+SRCS = am_map.c d_event.c d_items.c d_iwad.c d_loop.c d_main.c d_mode.c d_net.c \
+       doomdef.c doomgeneric.c $(PLATFORM_SRC) doomstat.c dstrings.c \
+       f_finale.c f_wipe.c g_game.c hu_lib.c hu_stuff.c info.c \
+       i_cdmus.c i_endoom.c i_input.c i_joystick.c i_scale.c i_sound.c i_system.c \
+       i_timer.c i_video.c m_argv.c m_bbox.c m_cheat.c m_config.c m_controls.c \
+       m_fixed.c m_menu.c m_misc.c m_random.c p_ceilng.c p_doors.c p_enemy.c \
+       p_floor.c p_inter.c p_lights.c p_map.c p_maputl.c p_mobj.c p_plats.c \
+       p_pspr.c p_saveg.c p_setup.c p_sight.c p_spec.c p_switch.c p_telept.c \
+       p_tick.c p_user.c r_bsp.c r_data.c r_draw.c r_main.c r_plane.c r_segs.c \
+       r_sky.c r_things.c sounds.c s_sound.c st_lib.c st_stuff.c tables.c \
+       v_video.c w_wad.c z_zone.c w_main.c w_file_leandros.c leandros_stubs.c
+
+OBJS = $(addprefix $(ARCH)/, $(SRCS:.c=.o))
+
+all: doom-$(ARCH)
+
+drm:
+	$(MAKE) USE_DRM=1
+
+legacy:
+	$(MAKE) USE_DRM=0
+
+$(ARCH)/%.o: %.c
+	@mkdir -p $(ARCH)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+doom-$(ARCH): $(OBJS)
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LIBC)
+
+clean:
+	rm -rf x86_64 aarch64 doom-x86_64 doom-aarch64
