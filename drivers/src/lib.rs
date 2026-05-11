@@ -6,10 +6,18 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub mod serial;
 pub mod framebuffer;
 pub mod kms;
 pub mod vector_font;
+pub mod drm;
+pub mod drm_driver;
+pub mod drm_console;
+pub mod console_commands;
+pub mod console_properties;
+pub mod drm_device_interface;
 
 /// Trait every driver server must implement.
 pub trait Driver {
