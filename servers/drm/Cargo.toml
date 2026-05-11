@@ -1,0 +1,10 @@
+[package]
+name = "drm-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+drivers = { path = "../../drivers" }
+ipc = { path = "../../ipc" }
+vfs-server = { path = "../vfs" }
+spin.workspace = true
