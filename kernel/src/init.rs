@@ -22,6 +22,13 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     }
     evdev_server::init(0);
 
+    // Initialize DRM server and check for success
+    if drm_server::init(0).is_some() {
+        serial_print_str("[INIT] DRM server initialized successfully\n");
+    } else {
+        serial_print_str("[INIT] ERROR: DRM server initialization failed\n");
+    }
+
     // ── Userspace Init ───────────────────────────────────────────────────────
     // We attempt to load the 'init' server from the initrd.
     serial_print_str("[INIT] Loading userspace init ELF binary from initrd\n");
@@ -71,6 +78,15 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
                 boot_info.framebuffer_height,
                 boot_info.framebuffer_pitch,
             );
+
+            // Debug: Log framebuffer console resolution
+            serial_print_str("[INIT] Framebuffer console resolution: ");
+            crate::print_number(boot_info.framebuffer_width);
+            serial_print_str("x");
+            crate::print_number(boot_info.framebuffer_height);
+            serial_print_str(" pitch=");
+            crate::print_number(boot_info.framebuffer_pitch);
+            serial_print_str("\n");
 
             // Load and spawn the ELF
             let pid = load_and_spawn_elf(init_elf);

@@ -21,6 +21,7 @@ boot       = { path = "../boot" }
 drivers    = { path = "../drivers" }
 vfs-server  = { path = "../servers/vfs" }
 evdev-server = { path = "../servers/evdev" }
+drm-server = { path = "../servers/drm" }
 net-server  = { path = "../servers/net" }
 tty-server  = { path = "../servers/tty" }
 init-server = { path = "../servers/init" }
