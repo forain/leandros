@@ -30,6 +30,7 @@ use vfs_server as vfs;
 use net_server;
 use tty_server;
 use evdev_server;
+use drm_server;
 
 /// Bump allocator base for anonymous mmap with no hint (addr=0).
 static MMAP_BUMP: AtomicUsize = AtomicUsize::new(0x0000_1000_0000_usize);
@@ -2775,15 +2776,26 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     const FIONREAD: usize = 0x541B;
     const FBIOGET_VSCREENINFO: usize = 0x4600;
     const ENOTTY: isize = -25;
-    
+
     if cmd == FIONREAD && fd == 0 {
         if arg == 0 || !validate_user_buf(arg, 4) { return -14; }
         let has_data = crate::serial_has_data();
         unsafe { (arg as *mut i32).write(if has_data { 1 } else { 0 }) };
         return 0;
     }
-    
-    if cmd == FIONREAD || cmd == FBIOGET_VSCREENINFO {
+
+    // DRM ioctl commands
+    const DRM_IOCTL_GET_MODE: usize = 0x1003;
+    const DRM_IOCTL_SET_MODE: usize = 0x1001;
+    const DRM_IOCTL_CREATE_FB: usize = 0x1002;
+    const DRM_IOCTL_FLIP_PAGE: usize = 0x1004;
+    const DRM_IOCTL_SET_PLANE: usize = 0x1005;
+    const DRM_IOCTL_GET_CAPS: usize = 0x1006;
+
+    if cmd == FIONREAD || cmd == FBIOGET_VSCREENINFO ||
+       cmd == DRM_IOCTL_GET_MODE || cmd == DRM_IOCTL_SET_MODE ||
+       cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||
+       cmd == DRM_IOCTL_SET_PLANE || cmd == DRM_IOCTL_GET_CAPS {
         if cmd == FBIOGET_VSCREENINFO && arg != 0 {
             if !validate_user_buf(arg, 32) { return -14; }
             with_current_address_space_mut(|as_| as_.prefault_range(arg, 32));
