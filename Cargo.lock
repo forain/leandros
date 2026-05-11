@@ -63,6 +63,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "drm-server"
+version = "0.1.0"
+dependencies = [
+ "drivers",
+ "ipc",
+ "spin",
+ "vfs-server",
+]
+
+[[package]]
 name = "elf"
 version = "0.1.0"
 dependencies = [
@@ -109,6 +119,7 @@ dependencies = [
  "bitflags",
  "boot",
  "drivers",
+ "drm-server",
  "elf",
  "evdev-server",
  "init-server",

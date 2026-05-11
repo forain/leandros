@@ -13,6 +13,7 @@ members = [
     "servers/tty",
     "servers/libc-shim",
     "servers/init",
+    "servers/drm",
     "drivers",
     "drivers/usb",
     "drivers/wifi",
