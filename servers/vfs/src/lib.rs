@@ -24,6 +24,7 @@
 
 use ipc::{Message, port};
 use spin::Mutex;
+use core::fmt::Write;
 
 // ── Protocol tag constants ────────────────────────────────────────────────────
 
@@ -332,6 +333,48 @@ pub fn set_framebuffer(base: u64, width: u32, height: u32, pitch: u32) {
     FB_PITCH.store(pitch, atomic::Ordering::SeqCst);
 }
 
+/// Get current framebuffer information for DRM
+#[no_mangle]
+pub extern "C" fn vfs_get_framebuffer_info() -> (u32, u32, u32) {
+    let width = FB_WIDTH.load(atomic::Ordering::SeqCst);
+    let height = FB_HEIGHT.load(atomic::Ordering::SeqCst);
+    let pitch = FB_PITCH.load(atomic::Ordering::SeqCst);
+    (width, height, pitch)
+}
+
+/// Get framebuffer base address for DRM mmap
+#[no_mangle]
+pub extern "C" fn vfs_get_framebuffer_base() -> u64 {
+    FB_BASE.load(atomic::Ordering::SeqCst)
+}
+
+/// Write data to framebuffer - called by DRM driver
+#[no_mangle]
+pub extern "C" fn vfs_write_framebuffer(buffer_ptr: *const u8, count: usize) -> i64 {
+    let base = FB_BASE.load(atomic::Ordering::SeqCst);
+    if base == 0 { return -19; } // ENODEV
+
+    let height = FB_HEIGHT.load(atomic::Ordering::SeqCst) as usize;
+    let pitch = FB_PITCH.load(atomic::Ordering::SeqCst) as usize;
+    let total_size = height * pitch;
+
+    // Limit write to framebuffer size
+    let n = count.min(total_size);
+    if n == 0 { return 0; }
+
+    let fb_virt = if base >= 0xFFFF_0000_0000_0000 {
+        base as usize // Already virtual
+    } else {
+        mm::phys_to_virt(base as usize) // Convert physical to virtual
+    };
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(buffer_ptr, fb_virt as *mut u8, n);
+    }
+
+    n as i64
+}
+
 use core::sync::atomic;
 
 // ── Static RamFS ──────────────────────────────────────────────────────────────
@@ -415,6 +458,20 @@ static SERVER_PORT: Mutex<u32> = Mutex::new(u32::MAX);
 pub fn init(owner_pid: u32) -> Option<u32> {
     let port_id = port::create(owner_pid)?;
     *SERVER_PORT.lock() = port_id;
+
+    // Test: manually register a test device that should route to DRM server for testing
+    {
+        let mut devices = DYNAMIC_DEVICES.lock();
+        if let Some(slot) = devices.iter_mut().find(|d| !d.in_use) {
+            *slot = DynamicDeviceEntry {
+                path: "/dev/input/testdrm",
+                port: 999, // Invalid port - should fail but help us debug
+                dev_id: 888,
+                in_use: true
+            };
+        }
+    }
+
     // Register PID 1 with stdin/stdout/stderr → /dev/null.
     let mut tbls = FD_TABLES.lock();
     for slot in tbls.iter_mut() {
@@ -1403,6 +1460,30 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         }
     }
 
+    // Dynamic devices
+    if dir_path == b"/dev" {
+        let devices = DYNAMIC_DEVICES.lock();
+        for device in devices.iter() {
+            if device.in_use {
+                // Extract device name from path (e.g., "/dev/drm0" -> "drm0")
+                if let Some(name_start) = device.path.rfind('/') {
+                    let name = &device.path.as_bytes()[(name_start + 1)..];
+                    if virtual_idx >= pos {
+                        if let Some(r) = write_dirent(buf, off, count, virtual_idx as u64 + 300, name, 8) {
+                            off += r; pos += 1;
+                        } else {
+                            drop(devices);
+                            tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
+                            return val_reply(off as u64);
+                        }
+                    }
+                    virtual_idx += 1;
+                }
+            }
+        }
+        drop(devices);
+    }
+
     // Initrd files (Deduplicated)
     let initrd_base = INITRD_BASE.load(atomic::Ordering::SeqCst);
     let initrd_size = INITRD_SIZE.load(atomic::Ordering::SeqCst);
@@ -1664,6 +1745,7 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+
 
     if let VnodeKind::DynamicDevice { port, dev_id } = &tbl.fds[fd].kind {
         let port = *port;
