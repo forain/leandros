@@ -32,4 +32,5 @@ pub enum DriverError {
     NotFound,
     Io,
     Unsupported,
+    InvalidParameter,
 }

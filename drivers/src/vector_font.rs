@@ -302,6 +302,7 @@ impl VectorFont {
             'S' => self.create_letter_s_outline(),
             'K' => self.create_letter_k_outline(),
             'O' => self.create_letter_o_outline(),
+            'v' | 'V' => self.create_letter_v_outline(),
             'a'..='z' | 'A'..='Z' | '0'..='9' => {
                 // Create a simple rectangular outline for unimplemented characters
                 self.create_fallback_outline(ch)
@@ -457,6 +458,33 @@ impl VectorFont {
     fn create_letter_s_outline(&self) -> GlyphOutline { self.create_fallback_outline('S') }
     fn create_letter_k_outline(&self) -> GlyphOutline { self.create_fallback_outline('K') }
     fn create_letter_o_outline(&self) -> GlyphOutline { self.create_fallback_outline('O') }
+
+    fn create_letter_v_outline(&self) -> GlyphOutline {
+        // Create a V shape - two diagonal lines meeting at the bottom
+        GlyphOutline {
+            contours: vec![
+                Contour {
+                    points: vec![
+                        // Left diagonal line (top-left to bottom-center)
+                        GlyphPoint { x: 100.0, y: 700.0, on_curve: true },
+                        GlyphPoint { x: 200.0, y: 700.0, on_curve: true },
+                        GlyphPoint { x: 350.0, y: 50.0, on_curve: true },
+                        GlyphPoint { x: 300.0, y: 50.0, on_curve: true },
+                    ],
+                },
+                Contour {
+                    points: vec![
+                        // Right diagonal line (top-right to bottom-center)
+                        GlyphPoint { x: 500.0, y: 700.0, on_curve: true },
+                        GlyphPoint { x: 600.0, y: 700.0, on_curve: true },
+                        GlyphPoint { x: 400.0, y: 50.0, on_curve: true },
+                        GlyphPoint { x: 350.0, y: 50.0, on_curve: true },
+                    ],
+                },
+            ],
+            advance_width: 700,
+        }
+    }
 
     fn create_space_outline(&self) -> GlyphOutline {
         GlyphOutline {
@@ -993,6 +1021,10 @@ const fn include_fira_code_bitmap() -> [u8; 256 * 16] {
     // u (117) - lowercase u
     font[117 * 16 + 5] = 0x66; font[117 * 16 + 6] = 0x66; font[117 * 16 + 7] = 0x66; font[117 * 16 + 8] = 0x66;
     font[117 * 16 + 9] = 0x66; font[117 * 16 + 10] = 0x66; font[117 * 16 + 11] = 0x66; font[117 * 16 + 12] = 0x3E;
+
+    // v (118) - lowercase v
+    font[118 * 16 + 5] = 0x66; font[118 * 16 + 6] = 0x66; font[118 * 16 + 7] = 0x66; font[118 * 16 + 8] = 0x66;
+    font[118 * 16 + 9] = 0x66; font[118 * 16 + 10] = 0x3C; font[118 * 16 + 11] = 0x18; font[118 * 16 + 12] = 0x00;
 
     // w (119) - lowercase w
     font[119 * 16 + 5] = 0x66; font[119 * 16 + 6] = 0x66; font[119 * 16 + 7] = 0x66; font[119 * 16 + 8] = 0x66;

@@ -21,6 +21,8 @@ static HHDM_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_hhdm_offset(offset: usize) {
     HHDM_OFFSET.store(offset, Ordering::Relaxed);
+    // Note: Debug logging would be added here but we don't have access to kernel print functions
+    // The debug info will be logged from the kernel where this is called
 }
 
 pub fn phys_to_virt(phys: usize) -> usize {

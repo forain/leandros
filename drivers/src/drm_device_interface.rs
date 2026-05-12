@@ -25,29 +25,33 @@ impl DrmDeviceInterface {
         }
     }
 
-    /// Handle ioctl commands from userspace
+    /// Handle incoming IPC messages
     pub fn handle_ioctl(&mut self, cmd: u32, arg: usize) -> Result<usize, DriverError> {
+        let device = get_drm_device();
+        let mut device_lock = device.lock();
+
         match cmd {
             // Mode setting ioctls
-            0x1001 => self.handle_set_mode(arg),
-            0x1003 => self.handle_get_mode(arg),
+            0x1001 => self.handle_set_mode(&mut device_lock, arg),
+            0x1003 => self.handle_get_mode(&mut device_lock, arg),
 
             // Framebuffer ioctls
-            0x1002 => self.handle_create_framebuffer(arg),
-            0x1004 => self.handle_flip_page(arg),
-
-            // Plane ioctls
-            0x1005 => self.handle_set_plane(arg),
+            0x1002 => self.handle_create_framebuffer(&mut device_lock, arg),
+            0x1004 => self.handle_flip_page(&mut device_lock, arg),
+            0x1005 => self.handle_set_plane(&mut device_lock, arg),
 
             // Capability ioctls
             0x1006 => self.handle_get_capabilities(arg),
+
+            // Mmap ioctl - returns physical address for device mapping
+            0x1007 => self.handle_ioctl_mmap(arg),
 
             _ => Err(DriverError::Unsupported),
         }
     }
 
     /// Handle DRM_IOCTL_SET_MODE
-    fn handle_set_mode(&mut self, arg: usize) -> Result<usize, DriverError> {
+    fn handle_set_mode(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         // arg points to [width, height, refresh] array
         let mode_data = unsafe {
             slice::from_raw_parts(arg as *const u32, 3)
@@ -57,6 +61,10 @@ impl DrmDeviceInterface {
         let height = mode_data[1];
         let refresh = mode_data[2];
 
+        // Drop the lock here because ModeSet::set_display_mode will acquire it
+        // This is safe because we are at the top level handler
+        drop(_device);
+
         // Set display mode using our DRM subsystem
         match ModeSet::set_display_mode(width, height, refresh) {
             Ok(()) => Ok(0),
@@ -65,135 +73,146 @@ impl DrmDeviceInterface {
     }
 
     /// Handle DRM_IOCTL_GET_MODE
-    fn handle_get_mode(&mut self, arg: usize) -> Result<usize, DriverError> {
+    fn handle_get_mode(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         // arg points to [width, height, refresh] array to fill
         let mode_data = unsafe {
             slice::from_raw_parts_mut(arg as *mut u32, 3)
         };
 
         // Try to get actual display mode first
-        if let Some((width, height, refresh)) = ModeSet::get_display_mode() {
-            mode_data[0] = width;
-            mode_data[1] = height;
-            mode_data[2] = refresh;
+        if let Some(crtc) = device.crtcs.first() {
+            if let Some(mode) = &crtc.mode {
+                mode_data[0] = mode.hdisplay as u32;
+                mode_data[1] = mode.vdisplay as u32;
+                mode_data[2] = mode.vrefresh;
+                return Ok(0);
+            }
+        }
+
+        // Get mode from existing KMS framebuffer console
+        // Use the bootloader framebuffer dimensions stored in VFS
+        extern "C" {
+            fn vfs_get_framebuffer_info() -> (u32, u32, u32);
+        }
+
+        let (width, height, _pitch) = unsafe { vfs_get_framebuffer_info() };
+
+        if width > 0 && height > 0 {
+            mode_data[0] = width;   // Bootloader framebuffer width
+            mode_data[1] = height;  // Bootloader framebuffer height
+            mode_data[2] = 60;      // Default refresh rate
             Ok(0)
         } else {
-            // Get mode from existing KMS framebuffer console
-            // Use the bootloader framebuffer dimensions stored in VFS
-            extern "C" {
-                fn vfs_get_framebuffer_info() -> (u32, u32, u32);
-            }
-
-            let (width, height, _pitch) = unsafe { vfs_get_framebuffer_info() };
-
-            if width > 0 && height > 0 {
-                mode_data[0] = width;   // Bootloader framebuffer width
-                mode_data[1] = height;  // Bootloader framebuffer height
-                mode_data[2] = 60;      // Default refresh rate
-                // Debug: The mode_data array should now contain the framebuffer dimensions
-                Ok(0)
-            } else {
-                // Final fallback - should always work
-                mode_data[0] = 1280;
-                mode_data[1] = 800;
-                mode_data[2] = 60;
-                Ok(0)
-            }
+            // Final fallback - should always work
+            mode_data[0] = 1280;
+            mode_data[1] = 800;
+            mode_data[2] = 60;
+            Ok(0)
         }
     }
 
     /// Handle DRM_IOCTL_CREATE_FB
-    fn handle_create_framebuffer(&mut self, arg: usize) -> Result<usize, DriverError> {
-        // arg points to [width, height, format, fb_id_out, buffer_ptr_out, size_out]
+    fn handle_create_framebuffer(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        // arg points to [width, height, format, fb_id_out, buffer_ptr_out, mmap_offset_out]
         let fb_data = unsafe {
             slice::from_raw_parts_mut(arg as *mut u32, 6)
         };
 
         let width = fb_data[0];
         let height = fb_data[1];
-        let format = fb_data[2];
-
-        // Create framebuffer using DRM subsystem
-        let device = get_drm_device();
-        let mut device_lock = device.lock();
+        let _format = fb_data[2];
 
         // Allocate dumb buffer
-        let size = width * height * 4; // Assuming 32-bit XRGB
         let buffer = DrmDumbBuffer::create(width, height, 32)?;
+        let mmap_offset = buffer.mmap_offset;
 
         // Create framebuffer object
-        let fb = DrmFramebuffer::new(
+        let mut fb = DrmFramebuffer::new(
             width,
             height,
             DrmFormat::Xrgb8888,
             buffer.handle,
             width * 4 // pitch
         );
+        fb.physical_addresses[0] = mmap_offset as u64;
 
         let fb_id = fb.id().0;
-        device_lock.framebuffers.insert(fb.id(), fb);
+        device.framebuffers.insert(fb.id(), fb);
 
         // Return results to userspace
         fb_data[3] = fb_id; // fb_id
-        // Instead of returning a memory address that might not be accessible,
-        // return a special value that tells DOOM to use write() operations
-        fb_data[4] = 0; // No direct memory access - use file operations
-        fb_data[5] = size; // buffer size
+        fb_data[4] = 0;     // No direct memory address - use mmap()
+        fb_data[5] = mmap_offset as u32; // Pass physical address as mmap offset
 
         Ok(0)
     }
 
-    /// Handle DRM_IOCTL_FLIP_PAGE
-    fn handle_flip_page(&mut self, arg: usize) -> Result<usize, DriverError> {
-        // arg points to [fb_id, flags]
+    /// Handle DRM_IOCTL_FLIP_PAGE with hardware scaling
+    fn handle_flip_page(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        // arg points to [fb_id, flags, src_width, src_height] for scaling support
         let flip_data = unsafe {
-            slice::from_raw_parts(arg as *const u32, 2)
+            slice::from_raw_parts(arg as *const u32, 4)
         };
 
         let fb_id = DrmObjectId(flip_data[0]);
         let _flags = flip_data[1];
-
-        let device = get_drm_device();
-        let device_lock = device.lock();
+        let src_width = if flip_data[2] != 0 { flip_data[2] } else { 320 };
+        let src_height = if flip_data[3] != 0 { flip_data[3] } else { 200 };
 
         // Get first CRTC for page flip
-        if let Some(crtc) = device_lock.crtcs.first() {
+        if let Some(crtc) = device.crtcs.first() {
             let crtc_id = crtc.id();
 
-            // Create atomic state for page flip
-            let mut atomic_state = AtomicModeSet::begin();
-
-            // Set the new framebuffer on the primary plane
-            if let Some(plane) = device_lock.planes.first() {
-                let plane_id = plane.id();
-
-                // Get current mode for plane configuration
-                if let Some(mode) = &crtc.mode {
-                    AtomicModeSet::set_plane(
-                        &mut atomic_state,
-                        plane_id,
-                        Some(crtc_id),
-                        Some(fb_id),
-                        0, 0, // crtc x,y
-                        mode.hdisplay as u32, mode.vdisplay as u32, // crtc w,h
-                        0, 0, // src x,y (fixed point)
-                        (mode.hdisplay as u32) << 16, (mode.vdisplay as u32) << 16, // src w,h (fixed point)
-                    );
+            // Get display dimensions
+            let (display_width, display_height) = if let Some(mode) = &crtc.mode {
+                (mode.hdisplay as u32, mode.vdisplay as u32)
+            } else {
+                // Fallback to VFS info if mode not initialized
+                extern "C" {
+                    fn vfs_get_framebuffer_info() -> (u32, u32, u32);
                 }
+                let (w, h, _) = unsafe { vfs_get_framebuffer_info() };
+                (w, h)
+            };
+
+            if display_width == 0 || display_height == 0 {
+                return Err(DriverError::NotFound);
             }
 
-            drop(device_lock);
+            // Set the new framebuffer on the primary plane with hardware scaling
+            if let Some(plane) = device.planes.first() {
+                let plane_id = plane.id();
 
-            // Commit the atomic state
-            AtomicModeSet::commit(atomic_state, 0)?;
-            Ok(0)
+                // Create atomic state for hardware-scaled page flip
+                let mut atomic_state = AtomicModeSet::begin();
+
+                // Use hardware scaling from source framebuffer to full display
+                AtomicModeSet::set_plane_scaling(
+                    &mut atomic_state,
+                    plane_id,
+                    crtc_id,
+                    fb_id,
+                    src_width,     // Source framebuffer dimensions (e.g., 320x200)
+                    src_height,
+                    0, 0,          // Destination position (full screen)
+                    display_width, // Destination dimensions (e.g., 1280x800)
+                    display_height
+                )?;
+
+                // Commit the atomic state with hardware scaling
+                // Pass device directly to avoid deadlock
+                AtomicModeSet::commit(device, atomic_state, 0)?;
+                Ok(0)
+            } else {
+                Err(DriverError::NotFound)
+            }
         } else {
             Err(DriverError::NotFound)
         }
     }
 
     /// Handle DRM_IOCTL_SET_PLANE
-    fn handle_set_plane(&mut self, arg: usize) -> Result<usize, DriverError> {
+    fn handle_set_plane(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         // arg points to plane configuration data
         let plane_data = unsafe {
             slice::from_raw_parts(arg as *const u32, 12)
@@ -228,7 +247,7 @@ impl DrmDeviceInterface {
             src_h,
         );
 
-        AtomicModeSet::commit(atomic_state, 0)?;
+        AtomicModeSet::commit(device, atomic_state, 0)?;
         Ok(0)
     }
 
@@ -255,8 +274,42 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
+    /// Handle DRM_IOCTL_MMAP - returns physical address of framebuffer
+    fn handle_ioctl_mmap(&mut self, arg: usize) -> Result<usize, DriverError> {
+        // arg points to a u64 which contains the requested physical address/offset
+        if arg == 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+
+        let phys_addr_ptr = arg as *mut u64;
+        let requested_phys = unsafe { *phys_addr_ptr };
+
+        if requested_phys == 0 {
+            // Default: return the hardware framebuffer
+            extern "C" {
+                fn vfs_get_framebuffer_base() -> u64;
+            }
+
+            let fb_base = unsafe { vfs_get_framebuffer_base() };
+            if fb_base == 0 {
+                return Err(DriverError::NotFound);
+            }
+            unsafe {
+                *phys_addr_ptr = fb_base;
+            }
+        } else {
+            // The physical address was passed as the offset to mmap()
+            // We just return it back to the kernel to confirm we support mapping it.
+            unsafe {
+                *phys_addr_ptr = requested_phys;
+            }
+        }
+
+        Ok(0)
+    }
+
     /// Handle read operations (for events)
-    pub fn handle_read(&mut self, buffer: &mut [u8]) -> Result<usize, DriverError> {
+    pub fn handle_read(&mut self, _buffer: &mut [u8]) -> Result<usize, DriverError> {
         // For now, return no events
         // In a full implementation, this would return DRM events like vsync
         Ok(0)
@@ -264,29 +317,42 @@ impl DrmDeviceInterface {
 
     /// Handle write operations (for framebuffer data)
     pub fn handle_write(&mut self, buffer: &[u8]) -> Result<usize, DriverError> {
-        // Forward DRM writes to VFS framebuffer function
-        // This provides real DRM write functionality with proper memory mapping
-        extern "C" {
-            fn vfs_write_framebuffer(buffer_ptr: *const u8, count: usize) -> i64;
-        }
-
-        let result = unsafe {
-            vfs_write_framebuffer(buffer.as_ptr(), buffer.len())
-        };
-
-        if result < 0 {
-            // Convert error codes
-            match result {
-                -19 => Err(DriverError::NotFound), // ENODEV
-                _ => Err(DriverError::Io),
+        // Find the primary framebuffer and its buffer
+        let device = get_drm_device();
+        let mut device_lock = device.lock();
+        
+        // Use the first CRTC's current framebuffer
+        if let Some(_crtc) = device_lock.crtcs.first() {
+            if let Some(fb_id) = device_lock.planes.first().and_then(|p| p.fb_id) {
+                if let Some(fb) = device_lock.get_framebuffer(fb_id) {
+                    let src_phys = fb.physical_addresses[0];
+                    if src_phys != 0 {
+                        let src_virt = mm::phys_to_virt(src_phys as usize) as *mut u8;
+                        let count = buffer.len().min(fb.size() as usize);
+                        
+                        // Copy data to the private DRM buffer
+                        unsafe {
+                            ptr::copy_nonoverlapping(buffer.as_ptr(), src_virt, count);
+                        }
+                        
+                        // Now trigger the flip logic to perform the scaling copy to screen
+                        // Create a dummy arg for flip_page
+                        let flip_data = [fb_id.raw(), 0, fb.width, fb.height];
+                        
+                        // Pass device_lock directly
+                        self.handle_flip_page(&mut device_lock, &flip_data as *const _ as usize)?;
+                        
+                        return Ok(count);
+                    }
+                }
             }
-        } else {
-            Ok(result as usize)
         }
+        
+        Err(DriverError::Unsupported)
     }
 
     /// Handle mmap operations for framebuffer access
-    pub fn handle_mmap(&mut self, offset: usize, size: usize) -> Result<*mut u8, DriverError> {
+    pub fn handle_mmap(&mut self, _offset: usize, size: usize) -> Result<*mut u8, DriverError> {
         // Get the real framebuffer base address from VFS
         extern "C" {
             fn vfs_get_framebuffer_base() -> u64;
@@ -360,32 +426,25 @@ impl DrmDumbBuffer {
         let pitch = width * ((bpp + 7) / 8);
         let size = pitch * height;
 
-        // Get the actual framebuffer address from VFS
-        extern "C" {
-            fn vfs_get_framebuffer_base() -> u64;
+        // Calculate pages and buddy order
+        let pages = (size as usize + 4095) / 4096;
+        let order = pages.next_power_of_two().trailing_zeros() as usize;
+
+        // Allocate physical memory for the framebuffer
+        // We use buddy_alloc to get contiguous physical memory
+        let phys_addr = mm::buddy::alloc(order).ok_or(DriverError::Io)? as u64;
+
+        // Zero the newly allocated buffer
+        let virt_addr = mm::phys_to_virt(phys_addr as usize) as *mut u8;
+        unsafe {
+            ptr::write_bytes(virt_addr, 0, size as usize);
         }
 
         let handle = Self::next_handle();
-        let fb_base = unsafe { vfs_get_framebuffer_base() };
-
-        // Get the framebuffer address using the same approach as VFS /dev/fb0
-        let mmap_offset = if fb_base != 0 {
-            // Use VFS logic for address conversion
-            if fb_base >= 0xFFFF_0000_0000_0000 {
-                fb_base as usize // Already virtual
-            } else {
-                // Physical address - convert to virtual using same logic as VFS
-                // VFS uses: mm::phys_to_virt(base as usize + cur)
-                // But we can't access mm from here, so we need a different approach
-                //
-                // Instead, let's use the known kernel virtual mapping
-                // LeandrOS maps physical memory to virtual with an offset
-                // Check the logs to see what mm::phys_to_virt(0) returns
-                0xFFFF_0000_0000_0000 + (fb_base as usize)
-            }
-        } else {
-            return Err(DriverError::NotFound);
-        };
+        
+        // mmap_offset for userspace will be the physical address
+        // The syscall handler will use this to map the device memory
+        let mmap_offset = phys_addr as usize;
 
         Ok(DrmDumbBuffer {
             width,

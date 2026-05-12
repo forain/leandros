@@ -84,7 +84,7 @@ impl Drop for AddressSpace {
                     for phys in region.lazy_pages.iter().copied() {
                         if phys != 0 { buddy_free(phys, 0); }
                     }
-                } else if region.phys != 0 {
+                } else if region.phys != 0 && region.file_cap != usize::MAX {
                     let pages = (region.end - region.start) / PAGE_SIZE;
                     buddy_free(region.phys, pages_to_order(pages));
                 }
@@ -180,8 +180,69 @@ impl AddressSpace {
             file_off:  0,
             cow:       false,
         });
+
         true
-    }
+        }
+
+        /// Map `size` bytes (rounded up to pages) at virtual address `virt`,
+        /// backed by an existing physical address (e.g., a hardware framebuffer).
+        ///
+        /// Returns `true` on success, `false` if the VMA table is full or mapping fails.
+        pub fn map_device(&mut self, virt: usize, phys: usize, size: usize, flags: PageFlags) -> bool {
+        if size == 0 { return false; }
+
+        // Find a free VMA slot.
+        let slot = match self.regions.iter().position(|r| r.is_none()) {
+            Some(i) => i,
+            None    => return false,
+        };
+
+        // Align virt/phys down and size up to page granularity.
+        let virt  = virt & !(PAGE_SIZE - 1);
+        let phys  = phys & !(PAGE_SIZE - 1);
+        let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+        let end   = match virt.checked_add(pages * PAGE_SIZE) {
+            Some(e) => e,
+            None    => return false, // overflow → reject
+        };
+
+        // Reject if the new range overlaps any existing VMA.
+        for r in self.regions.iter().filter_map(|r| r.as_ref()) {
+            if virt < r.end && end > r.start { return false; }
+        }
+
+        // Map each page to the specified physical address.
+        for i in 0..pages {
+            let v = virt + i * PAGE_SIZE;
+            let p = phys + i * PAGE_SIZE;
+            unsafe {
+                if !crate::paging::map_page(self.page_table_root, v, p, flags) {
+                    for j in 0..i {
+                        crate::paging::unmap_page(self.page_table_root, virt + j * PAGE_SIZE);
+                    }
+                    return false;
+                }
+            }
+        }
+
+        self.regions[slot] = Some(VmaRegion {
+            start: virt,
+            end,
+            phys,
+            flags,
+            lazy: false,
+            lazy_pages: Vec::new(),
+            lazy_count: 0,
+            prot:      PROT_READ | PROT_WRITE,
+            map_flags: MAP_SHARED, // Devices are shared
+            file_cap:  usize::MAX, // Special marker for device mappings (do not free)
+            file_off:  0,
+            cow:       false,
+        });
+
+        true
+        }
+
 
     /// Reserve a virtual address range without allocating physical pages.
     ///
@@ -350,7 +411,7 @@ impl AddressSpace {
             // ── Reshape the VMA ───────────────────────────────────────────────
             if clip_s == r_start && clip_e == r_end {
                 // Whole VMA removed.
-                if !region.lazy && region.phys != 0 {
+                if !region.lazy && region.phys != 0 && region.file_cap != usize::MAX {
                     buddy_free(region.phys, pages_to_order((r_end - r_start) / PAGE_SIZE));
                 }
                 *slot = None;

@@ -24,7 +24,8 @@
 
 use ipc::{Message, port};
 use spin::Mutex;
-use core::fmt::Write;
+
+extern crate mm;
 
 // ── Protocol tag constants ────────────────────────────────────────────────────
 
@@ -352,24 +353,31 @@ pub extern "C" fn vfs_get_framebuffer_base() -> u64 {
 #[no_mangle]
 pub extern "C" fn vfs_write_framebuffer(buffer_ptr: *const u8, count: usize) -> i64 {
     let base = FB_BASE.load(atomic::Ordering::SeqCst);
-    if base == 0 { return -19; } // ENODEV
+    if base == 0 {
+        return -19; // ENODEV - no framebuffer available
+    }
 
+    if count == 0 || buffer_ptr.is_null() {
+        return -14; // EFAULT - invalid parameters
+    }
+
+    // For DRM hardware scaling, we accept writes directly to framebuffer
+    // The DRM hardware will handle scaling from source to display resolution
     let height = FB_HEIGHT.load(atomic::Ordering::SeqCst) as usize;
     let pitch = FB_PITCH.load(atomic::Ordering::SeqCst) as usize;
-    let total_size = height * pitch;
 
-    // Limit write to framebuffer size
-    let n = count.min(total_size);
-    if n == 0 { return 0; }
+    if height == 0 || pitch == 0 {
+        return -19; // ENODEV - invalid framebuffer configuration
+    }
 
-    let fb_virt = if base >= 0xFFFF_0000_0000_0000 {
-        base as usize // Already virtual
-    } else {
-        mm::phys_to_virt(base as usize) // Convert physical to virtual
-    };
+    let display_fb_size = height * pitch;
+    let n = count.min(display_fb_size);
+
+    // Map the physical framebuffer to a kernel virtual address
+    let fb_virt = mm::phys_to_virt(base as usize) as *mut u8;
 
     unsafe {
-        core::ptr::copy_nonoverlapping(buffer_ptr, fb_virt as *mut u8, n);
+        core::ptr::copy_nonoverlapping(buffer_ptr, fb_virt, n);
     }
 
     n as i64
@@ -1147,13 +1155,12 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 base as usize + cur
             } else {
                 mm::phys_to_virt(base as usize + cur)
-            };
-            // We use the user-provided buf_ptr directly because we are in the
-            // syscall context of the caller (lower-half mapping is active).
+            } as *mut u8;
+
             unsafe {
-                core::ptr::copy_nonoverlapping(buf, fb_virt as *mut u8, n);
+                core::ptr::copy_nonoverlapping(buf, fb_virt, n);
             }
-            *pos = cur + n;
+            *pos += n;
             val_reply(n as u64)
         }
         VnodeKind::DynamicDevice { port, dev_id } => {

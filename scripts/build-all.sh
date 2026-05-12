@@ -196,6 +196,7 @@ build_doom() {
     echo "🎮 Building $arch doomgeneric..."
     (
         cd doomgeneric || exit 1
+        make -f Makefile.leandros ARCH="$arch" clean
         make -f Makefile.leandros ARCH="$arch"
     )
 }

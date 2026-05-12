@@ -269,7 +269,7 @@ impl DrmObject for DrmEncoder {
     fn object_type(&self) -> DrmObjectType { DrmObjectType::Encoder }
 }
 
-/// DRM Plane - hardware overlay support
+/// DRM Plane - hardware overlay support with scaling capabilities
 pub struct DrmPlane {
     id: DrmObjectId,
     pub plane_type: u32,
@@ -277,14 +277,23 @@ pub struct DrmPlane {
     pub formats: Vec<u32>,
     pub crtc_id: Option<DrmObjectId>,
     pub fb_id: Option<DrmObjectId>,
+
+    // Destination (CRTC) coordinates and size
     pub crtc_x: i32,
     pub crtc_y: i32,
     pub crtc_w: u32,
     pub crtc_h: u32,
+
+    // Source framebuffer coordinates and size (fixed-point 16.16)
     pub src_x: u32,
     pub src_y: u32,
     pub src_w: u32,
     pub src_h: u32,
+
+    // Hardware scaling capabilities
+    pub scaling_supported: bool,
+    pub max_upscale: u32,    // Maximum upscaling factor (e.g., 8 = 8x upscale)
+    pub max_downscale: u32,  // Maximum downscaling factor (e.g., 4 = 1/4 downscale)
 }
 
 impl DrmPlane {
@@ -308,7 +317,56 @@ impl DrmPlane {
             src_y: 0,
             src_w: 0,
             src_h: 0,
+            scaling_supported: true,
+            max_upscale: 8,    // Support up to 8x upscaling
+            max_downscale: 4,  // Support down to 1/4 downscaling
         }
+    }
+
+    /// Set plane scaling from source to destination
+    pub fn set_scaling(&mut self,
+                      src_x: u32, src_y: u32, src_w: u32, src_h: u32,
+                      crtc_x: i32, crtc_y: i32, crtc_w: u32, crtc_h: u32) -> Result<(), DriverError> {
+
+        if !self.scaling_supported {
+            return Err(DriverError::Unsupported);
+        }
+
+        // Validate scaling factors
+        let upscale_x = if src_w > 0 { (crtc_w + (src_w >> 16) - 1) / (src_w >> 16) } else { 1 };
+        let upscale_y = if src_h > 0 { (crtc_h + (src_h >> 16) - 1) / (src_h >> 16) } else { 1 };
+        let downscale_x = if crtc_w > 0 { ((src_w >> 16) + crtc_w - 1) / crtc_w } else { 1 };
+        let downscale_y = if crtc_h > 0 { ((src_h >> 16) + crtc_h - 1) / crtc_h } else { 1 };
+
+        if upscale_x > self.max_upscale || upscale_y > self.max_upscale {
+            return Err(DriverError::InvalidParameter);
+        }
+        if downscale_x > self.max_downscale || downscale_y > self.max_downscale {
+            return Err(DriverError::InvalidParameter);
+        }
+
+        // Set the scaling parameters
+        self.src_x = src_x;
+        self.src_y = src_y;
+        self.src_w = src_w;
+        self.src_h = src_h;
+        self.crtc_x = crtc_x;
+        self.crtc_y = crtc_y;
+        self.crtc_w = crtc_w;
+        self.crtc_h = crtc_h;
+
+        Ok(())
+    }
+
+    /// Calculate scaling factors for debugging/info
+    pub fn get_scale_factors(&self) -> (f32, f32) {
+        let scale_x = if self.src_w > 0 {
+            (self.crtc_w as f32) / ((self.src_w >> 16) as f32)
+        } else { 1.0 };
+        let scale_y = if self.src_h > 0 {
+            (self.crtc_h as f32) / ((self.src_h >> 16) as f32)
+        } else { 1.0 };
+        (scale_x, scale_y)
     }
 }
 

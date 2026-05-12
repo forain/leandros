@@ -68,6 +68,10 @@ int usleep(unsigned int usec);
 int mkdir(const char *path, int mode);
 int access(const char *path, int amode);
 
+// mman.h
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset);
+int munmap(void *addr, size_t length);
+
 // fcntl.h
 
 #define O_RDONLY 0

@@ -57,8 +57,10 @@ dependencies = [
 name = "drivers"
 version = "0.1.0"
 dependencies = [
+ "boot",
  "ipc",
  "leandros-lib",
+ "mm",
  "spin",
 ]
 

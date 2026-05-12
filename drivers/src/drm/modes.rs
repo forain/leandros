@@ -129,7 +129,7 @@ pub struct ModeValidator;
 
 impl ModeValidator {
     /// Validate if a mode is supported by hardware
-    pub fn validate_mode(mode: &DrmModeInfo, crtc_id: DrmObjectId) -> Result<(), DriverError> {
+    pub fn validate_mode(device: &DrmDevice, mode: &DrmModeInfo, crtc_id: DrmObjectId) -> Result<(), DriverError> {
         // Check basic constraints
         if mode.hdisplay == 0 || mode.vdisplay == 0 {
             return Err(DriverError::Unsupported);
@@ -144,7 +144,6 @@ impl ModeValidator {
         }
 
         // Check if CRTC exists and can support this mode
-        let device = get_drm_device().lock();
         if device.get_crtc(crtc_id).is_none() {
             return Err(DriverError::NotFound);
         }
@@ -245,20 +244,62 @@ impl AtomicModeSet {
         state.add_plane(plane_state);
     }
 
+    /// Set plane with hardware scaling from source framebuffer to destination display
+    pub fn set_plane_scaling(state: &mut DrmAtomicState, plane_id: DrmObjectId,
+                             crtc_id: DrmObjectId, fb_id: DrmObjectId,
+                             src_width: u32, src_height: u32,
+                             dst_x: i32, dst_y: i32, dst_width: u32, dst_height: u32) -> Result<(), DriverError> {
+
+        // Validate scaling parameters
+        if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+
+        // Calculate scaling factors
+        let _scale_x = dst_width as f32 / src_width as f32;
+        let _scale_y = dst_height as f32 / src_height as f32;
+
+        // Check if hardware supports these scaling factors
+        // We'll perform the detailed hardware-specific validation in AtomicModeSet::test
+        // or during commit. For now, we'll assume basic scaling is supported if requested.
+
+        // Convert source dimensions to fixed-point 16.16 format
+        let src_x_fp = 0u32;
+        let src_y_fp = 0u32;
+        let src_w_fp = src_width << 16;
+        let src_h_fp = src_height << 16;
+
+        // Set plane state with scaling
+        let plane_state = DrmPlaneState {
+            plane_id,
+            crtc_id: Some(crtc_id),
+            fb_id: Some(fb_id),
+            crtc_x: dst_x,
+            crtc_y: dst_y,
+            crtc_w: dst_width,
+            crtc_h: dst_height,
+            src_x: src_x_fp,
+            src_y: src_y_fp,
+            src_w: src_w_fp,
+            src_h: src_h_fp,
+        };
+
+        state.add_plane(plane_state);
+        Ok(())
+    }
+
     /// Commit atomic state
-    pub fn commit(state: DrmAtomicState, flags: u32) -> Result<(), DriverError> {
-        let mut device = get_drm_device().lock();
+    pub fn commit(device: &mut DrmDevice, state: DrmAtomicState, flags: u32) -> Result<(), DriverError> {
         device.atomic_commit(state, flags)
     }
 
     /// Test atomic state (check if it would succeed)
-    pub fn test(state: &DrmAtomicState) -> Result<(), DriverError> {
+    pub fn test(device: &DrmDevice, state: &DrmAtomicState) -> Result<(), DriverError> {
         // Validate all changes without actually applying them
-        let device = get_drm_device().lock();
 
         // Validate CRTC states
         for (crtc_id, mode, _enabled) in &state.crtc_states {
-            ModeValidator::validate_mode(mode, *crtc_id)?;
+            ModeValidator::validate_mode(device, mode, *crtc_id)?;
         }
 
         // Validate plane states
@@ -279,7 +320,7 @@ impl ModeSet {
     /// Set mode on display pipeline (CRTC + Connector + Plane)
     pub fn set_display_mode(width: u32, height: u32, refresh: u32) -> Result<(), DriverError> {
         let device = get_drm_device();
-        let device_lock = device.lock();
+        let mut device_lock = device.lock();
 
         // Find best mode
         let mode = StandardModes::find_best_mode(width, height, refresh)
@@ -298,8 +339,6 @@ impl ModeSet {
             .map(|p| p.id())
             .ok_or(DriverError::NotFound)?;
 
-        drop(device_lock); // Release lock before committing
-
         // Create atomic state
         let mut atomic_state = AtomicModeSet::begin();
 
@@ -314,7 +353,7 @@ impl ModeSet {
                                  0, 0, width, height, 0, 0, width << 16, height << 16);
 
         // Commit changes
-        AtomicModeSet::commit(atomic_state, 0)
+        AtomicModeSet::commit(&mut device_lock, atomic_state, 0)
     }
 
     /// Get current display mode

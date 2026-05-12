@@ -6,4 +6,6 @@ edition.workspace = true
 [dependencies]
 leandros-lib = { path = "../lib" }
 ipc = { path = "../ipc" }
+mm = { path = "../mm" }
+boot = { path = "../boot" }
 spin.workspace = true
