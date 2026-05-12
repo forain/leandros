@@ -238,6 +238,11 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
 
     BOOT_INFO_PTR.store(&raw mut BOOT_INFO as usize, Ordering::SeqCst);
 
+    // Debug HHDM setup
+    serial_print_str("[MM] Initializing memory management with HHDM offset: 0x");
+    print_hex(hhdm_offset as usize);
+    serial_print_str("\n");
+
     mm::init_with_map(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() }, hhdm_offset as usize);
 
     #[cfg(target_arch = "x86_64")] { arch_x86_64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }

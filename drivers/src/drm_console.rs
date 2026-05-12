@@ -321,7 +321,9 @@ impl DrmConsole {
                     }
                 }
 
-                AtomicModeSet::commit(atomic_state, 0)?;
+                let device = get_drm_device();
+                let mut device_lock = device.lock();
+                AtomicModeSet::commit(&mut device_lock, atomic_state, 0)?;
             }
         }
 

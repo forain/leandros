@@ -10,6 +10,8 @@ use super::super::DriverError;
 pub enum DrmFormat {
     /// 32-bit XRGB8888 format (0xRRGGBB)
     Xrgb8888 = 0x34325258,
+    /// 32-bit BGRX8888 format (0xBBGGRR)
+    Bgrx8888 = 0x34325242,
     /// 32-bit ARGB8888 format with alpha
     Argb8888 = 0x34324752,
     /// 24-bit RGB888 format
@@ -21,7 +23,7 @@ pub enum DrmFormat {
 impl DrmFormat {
     pub fn bytes_per_pixel(self) -> u32 {
         match self {
-            DrmFormat::Xrgb8888 | DrmFormat::Argb8888 => 4,
+            DrmFormat::Xrgb8888 | DrmFormat::Bgrx8888 | DrmFormat::Argb8888 => 4,
             DrmFormat::Rgb888 => 3,
             DrmFormat::Rgb565 => 2,
         }
@@ -46,6 +48,7 @@ pub struct DrmFramebuffer {
     pub handles: [u32; 4], // Buffer object handles for each plane
     pub offsets: [u32; 4], // Byte offset of each plane
     pub pitches: [u32; 4], // Pitch of each plane
+    pub physical_addresses: [u64; 4], // Physical address of each plane
 }
 
 impl DrmFramebuffer {
@@ -54,10 +57,15 @@ impl DrmFramebuffer {
         let mut handles = [0u32; 4];
         let mut pitches = [0u32; 4];
         let mut offsets = [0u32; 4];
+        let physical_addresses = [0u64; 4];
 
         handles[0] = handle;
         pitches[0] = pitch;
         offsets[0] = 0;
+        
+        // In our simplified DRM, we store the physical address in the handle
+        // or look it up. For now, we'll initialize it to 0 and set it later
+        // or pass it in.
 
         Self {
             id: DrmObjectId::new(),
@@ -69,6 +77,7 @@ impl DrmFramebuffer {
             handles,
             offsets,
             pitches,
+            physical_addresses,
         }
     }
 
@@ -85,6 +94,7 @@ impl DrmFramebuffer {
             handles,
             offsets,
             pitches,
+            physical_addresses: [0u64; 4],
         }
     }
 
@@ -102,7 +112,7 @@ impl DrmFramebuffer {
     pub fn num_planes(&self) -> u32 {
         // Most formats use single plane
         match self.format {
-            DrmFormat::Xrgb8888 | DrmFormat::Argb8888 |
+            DrmFormat::Xrgb8888 | DrmFormat::Bgrx8888 | DrmFormat::Argb8888 |
             DrmFormat::Rgb888 | DrmFormat::Rgb565 => 1,
         }
     }

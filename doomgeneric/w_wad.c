@@ -70,8 +70,7 @@ static lumpinfo_t **lumphash;
 unsigned int W_LumpNameHash(const char *s)
 {
     // This is the djb2 string hash function, modded to work on strings
-    // that have a maximum length of 8.
-
+    // that have a maximum length of 8 and handle non-null-terminated strings.
     unsigned int result = 5381;
     unsigned int i;
 
@@ -253,6 +252,21 @@ int W_NumLumps (void)
 // Returns -1 if name not found.
 //
 
+// Custom name comparison for W_CheckNumForName
+// DOOM names are 8 bytes fixed, but often null-terminated if shorter.
+static int W_NameCompare(const char *s1, const char *s2)
+{
+    int i;
+    for (i = 0; i < 8; ++i)
+    {
+        if (toupper((int)s1[i]) != toupper((int)s2[i]))
+            return 1;
+        if (s1[i] == '\0')
+            return 0;
+    }
+    return 0;
+}
+
 int W_CheckNumForName (char* name)
 {
     lumpinfo_t *lump_p;
@@ -263,28 +277,28 @@ int W_CheckNumForName (char* name)
     if (lumphash != NULL)
     {
         int hash;
-        
+
         // We do! Excellent.
 
         hash = W_LumpNameHash(name) % numlumps;
-        
+
         for (lump_p = lumphash[hash]; lump_p != NULL; lump_p = lump_p->next)
         {
-            if (!strncasecmp(lump_p->name, name, 8))
+            if (!W_NameCompare(lump_p->name, name))
             {
                 return lump_p - lumpinfo;
             }
         }
-    } 
+    }
     else
     {
         // We don't have a hash table generate yet. Linear search :-(
-        // 
+        //
         // scan backwards so patch lump files take precedence
 
         for (i=numlumps-1; i >= 0; --i)
         {
-            if (!strncasecmp(lumpinfo[i].name, name, 8))
+            if (!W_NameCompare(lumpinfo[i].name, name))
             {
                 return i;
             }
@@ -295,7 +309,6 @@ int W_CheckNumForName (char* name)
 
     return -1;
 }
-
 
 
 
@@ -355,12 +368,11 @@ void W_ReadLump(unsigned int lump, void *dest)
 	
     c = W_Read(l->wad_file, l->position, dest, l->size);
 
-    if (c < l->size)
+    if (c < 0 || (unsigned int)c < l->size)
     {
-	I_Error ("W_ReadLump: only read %i of %i on lump %i",
-		 c, l->size, lump);	
+    I_Error ("W_ReadLump: only read %i of %i on lump %i",
+    c, l->size, lump);
     }
-
     I_EndRead ();
 }
 

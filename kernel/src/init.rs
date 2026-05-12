@@ -71,6 +71,30 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             
             // Register initrd with VFS so it can find files later (like doom1.wad)
             vfs_server::set_initrd(actual_initrd_base, actual_initrd_size);
+
+            // Debug framebuffer and HHDM before registering with VFS
+            serial_print_str("[INIT] Framebuffer debug info:\n");
+            serial_print_str("[INIT]   Physical base: 0x");
+            crate::print_hex(boot_info.framebuffer_base as usize);
+            serial_print_str("\n[INIT]   Resolution: ");
+            crate::print_number(boot_info.framebuffer_width);
+            serial_print_str("x");
+            crate::print_number(boot_info.framebuffer_height);
+            serial_print_str("\n[INIT]   Pitch: ");
+            crate::print_number(boot_info.framebuffer_pitch);
+
+            // Test virtual address conversion
+            let fb_virt = mm::phys_to_virt(boot_info.framebuffer_base as usize);
+            serial_print_str("\n[INIT]   Virtual address: 0x");
+            crate::print_hex(fb_virt);
+
+            // Check if virtual address is in valid kernel space
+            if fb_virt >= 0xFFFF_0000_0000_0000 {
+                serial_print_str("\n[INIT]   Virtual address is in kernel space - OK\n");
+            } else {
+                serial_print_str("\n[INIT]   WARNING: Virtual address is NOT in kernel space!\n");
+            }
+
             // Also register framebuffer with VFS
             vfs_server::set_framebuffer(
                 boot_info.framebuffer_base,

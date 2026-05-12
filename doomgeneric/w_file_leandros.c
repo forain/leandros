@@ -45,12 +45,12 @@ static void W_Leandros_CloseFile(wad_file_t *wad)
     Z_Free(leandros_wad);
 }
 
-size_t W_Leandros_Read(wad_file_t *wad, unsigned int offset,
+int W_Leandros_Read(wad_file_t *wad, unsigned int offset,
                    void *buffer, size_t buffer_len)
 {
     leandros_wad_file_t *leandros_wad = (leandros_wad_file_t *) wad;
     lseek(leandros_wad->fd, offset, 0); // SEEK_SET
-    return read(leandros_wad->fd, buffer, buffer_len);
+    return (int)read(leandros_wad->fd, buffer, buffer_len);
 }
 
 wad_file_class_t leandros_wad_file = 
@@ -71,7 +71,7 @@ void W_CloseFile(wad_file_t *wad)
     wad->file_class->CloseFile(wad);
 }
 
-size_t W_Read(wad_file_t *wad, unsigned int offset,
+int W_Read(wad_file_t *wad, unsigned int offset,
               void *buffer, size_t buffer_len)
 {
     return wad->file_class->Read(wad, offset, buffer, buffer_len);

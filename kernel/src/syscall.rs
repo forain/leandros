@@ -30,10 +30,9 @@ use vfs_server as vfs;
 use net_server;
 use tty_server;
 use evdev_server;
-use drm_server;
 
 /// Bump allocator base for anonymous mmap with no hint (addr=0).
-static MMAP_BUMP: AtomicUsize = AtomicUsize::new(0x0000_1000_0000_usize);
+static MMAP_BUMP: AtomicUsize = AtomicUsize::new(0x0000_4000_0000_usize);
 
 /// IPC port of the VFS server; u32::MAX = not yet registered.
 static VFS_SERVER_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -936,7 +935,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     } else if addr != 0 {
         addr
     } else {
-        MMAP_BUMP.fetch_add(len, Ordering::Relaxed)
+        MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed)
     };
 
     let end = match virt.checked_add(len) {
@@ -955,7 +954,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
             Some(true)  => virt as isize,
             Some(false) => {
                 if flags & MAP_FIXED == 0 && addr != 0 {
-                    let bump = MMAP_BUMP.fetch_add(len, Ordering::Relaxed);
+                    let bump = MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed);
                     let m2 = with_current_address_space_mut(|as_| as_.map_lazy(bump, len, page_flags));
                     match m2 { Some(true) => bump as isize, _ => -12 }
                 } else { -12 }
@@ -966,17 +965,36 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
 
     // ── File-backed mmap ──────────────────────────────────────────────────────
     // Strategy (mirrors the ELF loader):
-    //   1. Seek the fd to `off` in the VFS server.
-    //   2. Map the virtual range eagerly (allocates contiguous physical pages).
-    //   3. Obtain the physical base address of the new VMA.
-    //   4. Read file data directly into physical memory (kernel identity map).
-    //   5. If prot is read-only, the VMA page_flags already enforce that.
+    //   1. Check if the fd is a device supporting direct mmap via ioctl.
+    //   2. Seek the fd to `off` in the VFS server.
+    //   3. Map the virtual range eagerly (allocates contiguous physical pages).
+    //   4. Obtain the physical base address of the new VMA.
+    //   5. Read file data directly into physical memory (kernel identity map).
+    //   6. If prot is read-only, the VMA page_flags already enforce that.
     //
     // MAP_SHARED is not supported (no VMO page cache yet); silently treat as
     // MAP_PRIVATE — data is copied on map, modifications are local only.
 
     let pid = current_pid();
 
+    // Step 1: Check if the fd is a device supporting direct mmap via ioctl 0x1007
+    let mut phys_addr: u64 = off as u64;
+    let ioctl_msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, 0x1007 /* DRM_IOCTL_MMAP */, &mut phys_addr as *mut _ as u64]);
+    let ioctl_reply = vfs::handle(&ioctl_msg, pid);
+
+    if ioctl_reply.tag == 0 && phys_addr != 0 {
+        // This is a device mapping — map the physical address directly.
+        let mapped = with_current_address_space_mut(|as_| {
+            if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
+            as_.map_device(virt, phys_addr as usize, len, page_flags)
+        });
+        return match mapped {
+            Some(true)  => virt as isize,
+            _           => -12, // ENOMEM
+        };
+    }
+
+    // Normal file-backed mmap follows...
     // Step 1: seek the fd to the requested offset.
     if off != 0 {
         let seek_msg = make_vfs_msg(vfs::VFS_LSEEK,

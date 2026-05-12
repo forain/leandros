@@ -27,13 +27,12 @@ int putc(int c, FILE* stream) {
 }
 
 int vfprintf(FILE* stream, const char* fmt, va_list ap) {
-    // Print format string and first string argument so I_Error is visible.
-    write(2, fmt, strlen(fmt));
-    // Try to print the first va_arg as a string (best-effort for error messages).
-    const char* arg = va_arg(ap, const char*);
-    if (arg) { write(2, ": ", 2); write(2, arg, strlen(arg)); }
-    write(2, "\n", 1);
-    return 0;
+    char buf[1024];
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    if (n > 0) {
+        write(stream == stderr ? 2 : 1, buf, (size_t)n);
+    }
+    return n;
 }
 
 int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
@@ -43,26 +42,55 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
     while (*p && out < size - 1) {
         if (*p == '%' && *(p + 1)) {
             p++;
+            // Basic support for width (e.g., %02x)
+            int width = 0;
+            while (*p >= '0' && *p <= '9') {
+                width = width * 10 + (*p - '0');
+                p++;
+            }
+
             if (*p == 'd' || *p == 'i') {
-                int val = va_arg(ap, int);
+                long val = va_arg(ap, int);
+                char tmp[24];
+                int n = 0;
+                int neg = 0;
+                if (val < 0) { neg = 1; val = -val; }
+                if (val == 0) { tmp[n++] = '0'; }
+                else { while (val > 0) { tmp[n++] = '0' + (val % 10); val /= 10; } }
+                if (neg) tmp[n++] = '-';
+                for (int i = 0, j = n-1; i < j; i++, j--) { char t = tmp[i]; tmp[i] = tmp[j]; tmp[j] = t; }
+                while (n < width && out < size - 1) { str[out++] = ' '; width--; } // basic padding
+                for (int i = 0; i < n && out < size - 1; i++) str[out++] = tmp[i];
+            } else if (*p == 'x' || *p == 'X') {
+                unsigned int val = va_arg(ap, unsigned int);
                 char tmp[20];
                 int n = 0;
-                if (val < 0) { tmp[n++] = '-'; val = -val; }
+                char *digits = (*p == 'x') ? "0123456789abcdef" : "0123456789ABCDEF";
                 if (val == 0) { tmp[n++] = '0'; }
-                else { int v = val; while (v > 0) { tmp[n++] = '0' + v % 10; v /= 10; }
-                       for (int i = 0, j = n-1; i < j; i++, j--) { char t = tmp[i]; tmp[i] = tmp[j]; tmp[j] = t; } }
+                else { while (val > 0) { tmp[n++] = digits[val % 16]; val /= 16; } }
+                for (int i = 0, j = n-1; i < j; i++, j--) { char t = tmp[i]; tmp[i] = tmp[j]; tmp[j] = t; }
+                while (n < width && out < size - 1) { str[out++] = '0'; width--; } // basic zero-padding
                 for (int i = 0; i < n && out < size - 1; i++) str[out++] = tmp[i];
             } else if (*p == 's') {
                 const char *s = va_arg(ap, const char *);
-                if (s) while (*s && out < size - 1) str[out++] = *s++;
+                if (!s) s = "(null)";
+                while (*s && out < size - 1) str[out++] = *s++;
             } else if (*p == 'c') {
                 char c = (char)va_arg(ap, int);
                 if (out < size - 1) str[out++] = c;
+            } else if (*p == 'p') {
+                unsigned long val = va_arg(ap, unsigned long);
+                if (out < size - 3) { str[out++] = '0'; str[out++] = 'x'; }
+                char tmp[20]; int n = 0;
+                if (val == 0) { tmp[n++] = '0'; }
+                else { while (val > 0) { tmp[n++] = "0123456789abcdef"[val % 16]; val /= 16; } }
+                for (int i = 0, j = n-1; i < j; i++, j--) { char t = tmp[i]; tmp[i] = tmp[j]; tmp[j] = t; }
+                for (int i = 0; i < n && out < size - 1; i++) str[out++] = tmp[i];
             } else if (*p == '%') {
                 if (out < size - 1) str[out++] = '%';
             } else {
-                // Skip unknown format specs; consume one argument
-                va_arg(ap, int);
+                // Consume one arg of unknown type
+                va_arg(ap, long);
             }
         } else {
             str[out++] = *p;
@@ -119,29 +147,28 @@ int toupper(int c) {
     return c;
 }
 
-int strcasecmp(const char *s1, const char *s2) {
-    while (*s1 && *s2) {
-        char c1 = *s1;
-        char c2 = *s2;
-        if (c1 >= 'A' && c1 <= 'Z') c1 += 'a' - 'A';
-        if (c2 >= 'A' && c2 <= 'Z') c2 += 'a' - 'A';
-        if (c1 != c2) return c1 - c2;
-        s1++; s2++;
+int strncasecmp(const char *s1, const char *s2, size_t n) {
+    if (n == 0) return 0;
+    while (n-- > 0) {
+        unsigned char c1 = (unsigned char)*s1++;
+        unsigned char c2 = (unsigned char)*s2++;
+        if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        if (c1 != c2) return (int)c1 - (int)c2;
+        if (c1 == 0) return 0;
     }
-    return (unsigned char)*s1 - (unsigned char)*s2;
+    return 0;
 }
 
-int strncasecmp(const char *s1, const char *s2, size_t n) {
-    while (n > 0 && *s1 && *s2) {
-        char c1 = *s1;
-        char c2 = *s2;
-        if (c1 >= 'A' && c1 <= 'Z') c1 += 'a' - 'A';
-        if (c2 >= 'A' && c2 <= 'Z') c2 += 'a' - 'A';
-        if (c1 != c2) return c1 - c2;
-        s1++; s2++; n--;
+int strcasecmp(const char *s1, const char *s2) {
+    while (1) {
+        unsigned char c1 = (unsigned char)*s1++;
+        unsigned char c2 = (unsigned char)*s2++;
+        if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        if (c1 != c2) return (int)c1 - (int)c2;
+        if (c1 == 0) return 0;
     }
-    if (n == 0) return 0;
-    return (unsigned char)*s1 - (unsigned char)*s2;
 }
 
 // Dummy symbols for things that seem to be missing

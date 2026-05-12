@@ -97,6 +97,39 @@ pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: size_t) -> *mut u8 {
     s
 }
 
+/// Map memory into the process address space.
+#[no_mangle]
+pub unsafe extern "C" fn mmap(
+    addr: *mut u8, len: size_t, prot: i32, flags: i32, fd: i32, offset: i64,
+) -> *mut u8 {
+    let r = crate::syscall::syscall6(
+        nr::MMAP,
+        addr as usize,
+        len,
+        prot as usize,
+        flags as usize,
+        fd as usize,
+        offset as usize,
+    );
+    if r < 0 {
+        crate::errno::set_errno(-r as i32);
+        return (-1isize) as *mut u8;
+    }
+    r as *mut u8
+}
+
+/// Unmap memory from the process address space.
+#[no_mangle]
+pub unsafe extern "C" fn munmap(addr: *mut u8, len: size_t) -> i32 {
+    let r = crate::syscall::syscall2(nr::MUNMAP, addr as usize, len);
+    if r < 0 {
+        crate::errno::set_errno(-r as i32);
+        -1
+    } else {
+        0
+    }
+}
+
 /// Compare `n` bytes of `a` and `b`.
 #[no_mangle]
 pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: size_t) -> i32 {
