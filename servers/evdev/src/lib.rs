@@ -163,6 +163,27 @@ pub fn handle(msg: &Message, _caller_pid: u32) -> Message {
                 }
                 return val_reply(0);
             }
+
+            // EVIOCGBIT(ev, len) - base is 0x4520 + ev
+            let ioctl_base = cmd & 0xFF;
+            if (0x20..0x40).contains(&ioctl_base) && (cmd >> 8) & 0xFF == 0x45 {
+                let ev_type = ioctl_base - 0x20;
+                let arg_ptr = arg(msg, 2) as usize;
+                let max_len = (cmd >> 16) & 0x3FFF;
+
+                if ev_type == 0 { // Supported event types (EV_SYN=0, EV_KEY=1)
+                    let bits: u32 = 0x03;
+                    let n = core::cmp::min(max_len as usize, 4);
+                    unsafe { core::ptr::copy_nonoverlapping(&bits as *const u32 as *const u8, arg_ptr as *mut u8, n) };
+                    return val_reply(n as u64);
+                } else if ev_type == 1 { // EV_KEY - supported keys
+                    // Report a generous range of keys as supported for the virtual keyboard
+                    let n = core::cmp::min(max_len as usize, 64);
+                    unsafe { core::ptr::write_bytes(arg_ptr as *mut u8, 0xFF, n) };
+                    return val_reply(n as u64);
+                }
+                return val_reply(0);
+            }
             err_reply(-25) // ENOTTY
         }
         _ => err_reply(-38), // ENOSYS
