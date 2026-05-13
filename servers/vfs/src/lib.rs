@@ -322,25 +322,39 @@ static FB_WIDTH:  atomic::AtomicU32 = atomic::AtomicU32::new(0);
 static FB_HEIGHT: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 static FB_PITCH:  atomic::AtomicU32 = atomic::AtomicU32::new(0);
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferInfo {
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+}
+
 pub fn set_initrd(base: usize, size: usize) {
     INITRD_BASE.store(base, atomic::Ordering::SeqCst);
     INITRD_SIZE.store(size, atomic::Ordering::SeqCst);
 }
 
 pub fn set_framebuffer(base: u64, width: u32, height: u32, pitch: u32) {
+    // Ensure pitch is in bytes
+    let p_bytes = if pitch < width * 4 { width * 4 } else { pitch };
+    
     FB_BASE.store(base, atomic::Ordering::SeqCst);
     FB_WIDTH.store(width, atomic::Ordering::SeqCst);
     FB_HEIGHT.store(height, atomic::Ordering::SeqCst);
-    FB_PITCH.store(pitch, atomic::Ordering::SeqCst);
+    FB_PITCH.store(p_bytes, atomic::Ordering::SeqCst);
 }
 
 /// Get current framebuffer information for DRM
 #[no_mangle]
-pub extern "C" fn vfs_get_framebuffer_info() -> (u32, u32, u32) {
+pub extern "C" fn vfs_get_framebuffer_info(info: &mut FramebufferInfo) {
     let width = FB_WIDTH.load(atomic::Ordering::SeqCst);
-    let height = FB_HEIGHT.load(atomic::Ordering::SeqCst);
     let pitch = FB_PITCH.load(atomic::Ordering::SeqCst);
-    (width, height, pitch)
+    
+    info.width = width;
+    info.height = FB_HEIGHT.load(atomic::Ordering::SeqCst);
+    // Ensure pitch is in bytes and at least width * 4
+    info.pitch = if pitch < width * 4 { width * 4 } else { pitch };
 }
 
 /// Get framebuffer base address for DRM mmap
@@ -1185,29 +1199,31 @@ fn handle_close(pid: u32, fd: usize) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
-    match tbl.fds[fd].kind {
+    
+    let kind = tbl.fds[fd].kind;
+    tbl.fds[fd] = FdEntry::empty();
+    drop(tbls);
+    
+    match kind {
         VnodeKind::Pipe { ring, is_write } => {
-            drop(tbls);
             let mut rings = PIPE_RINGS.lock();
             if is_write { rings[ring].write_open = false; }
             else        { rings[ring].read_open  = false; }
-            return ok_reply();
         }
         VnodeKind::EventFd { slot } => {
-            tbl.fds[fd] = FdEntry::empty();
-            drop(tbls);
             EVENTFD_COUNTERS.lock()[slot] = u64::MAX;
-            return ok_reply();
         }
         VnodeKind::TimerFd { slot } => {
-            tbl.fds[fd] = FdEntry::empty();
-            drop(tbls);
             TIMERFD_POOL.lock()[slot] = TimerFdEntry::free();
-            return ok_reply();
+        }
+        VnodeKind::DynamicDevice { port, dev_id } => {
+            let mut close_msg = Message::empty();
+            close_msg.tag = VFS_CLOSE;
+            close_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
+            let _ = ipc_call(port, close_msg);
         }
         _ => {}
     }
-    tbl.fds[fd] = FdEntry::empty();
     ok_reply()
 }
 
@@ -1335,7 +1351,39 @@ fn handle_exec_cloexec(pid: u32) -> Message {
 fn handle_close_all(pid: u32) -> Message {
     let mut tbls = FD_TABLES.lock();
     if let Some(t) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
+        // Collect active FDs to close
+        let mut fds_to_close = [VnodeKind::None; MAX_FDS];
+        for i in 0..MAX_FDS {
+            if t.fds[i].in_use {
+                fds_to_close[i] = t.fds[i].kind;
+            }
+        }
         *t = ProcFdTable::empty();
+        drop(tbls);
+        
+        // Close them all properly
+        for kind in fds_to_close {
+            match kind {
+                VnodeKind::Pipe { ring, is_write } => {
+                    let mut rings = PIPE_RINGS.lock();
+                    if is_write { rings[ring].write_open = false; }
+                    else        { rings[ring].read_open  = false; }
+                }
+                VnodeKind::EventFd { slot } => {
+                    EVENTFD_COUNTERS.lock()[slot] = u64::MAX;
+                }
+                VnodeKind::TimerFd { slot } => {
+                    TIMERFD_POOL.lock()[slot] = TimerFdEntry::free();
+                }
+                VnodeKind::DynamicDevice { port, dev_id } => {
+                    let mut close_msg = Message::empty();
+                    close_msg.tag = VFS_CLOSE;
+                    close_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
+                    let _ = ipc_call(port, close_msg);
+                }
+                _ => {}
+            }
+        }
     }
     ok_reply()
 }
@@ -1468,27 +1516,53 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     }
 
     // Dynamic devices
-    if dir_path == b"/dev" {
+    {
         let devices = DYNAMIC_DEVICES.lock();
+        let dir_len = dir_path.len();
+        let mut seen_dirs: [Option<&'static str>; 4] = [None; 4]; // Avoid duplicate directory entries
+
         for device in devices.iter() {
-            if device.in_use {
-                // Extract device name from path (e.g., "/dev/drm0" -> "drm0")
-                if let Some(name_start) = device.path.rfind('/') {
-                    let name = &device.path.as_bytes()[(name_start + 1)..];
-                    if virtual_idx >= pos {
-                        if let Some(r) = write_dirent(buf, off, count, virtual_idx as u64 + 300, name, 8) {
-                            off += r; pos += 1;
-                        } else {
-                            drop(devices);
-                            tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
-                            return val_reply(off as u64);
+            if device.in_use && device.path.as_bytes().starts_with(dir_path) {
+                let rel_path = &device.path[dir_len..];
+                if rel_path.starts_with('/') {
+                    let name = &rel_path[1..];
+                    if let Some(slash_pos) = name.find('/') {
+                        // This is a directory (e.g., "dri" in "/dev/dri/card0" when listing "/dev")
+                        let dir_name = &name[..slash_pos];
+                        
+                        // Check if we already added this directory
+                        if !seen_dirs.iter().any(|&d| d == Some(dir_name)) {
+                            if virtual_idx >= pos {
+                                if let Some(r) = write_dirent(buf, off, count, virtual_idx as u64 + 300, dir_name.as_bytes(), 4) { // 4 = DT_DIR
+                                    off += r; pos += 1;
+                                } else {
+                                    drop(devices);
+                                    tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
+                                    return val_reply(off as u64);
+                                }
+                            }
+                            virtual_idx += 1;
+                            // Add to seen dirs
+                            if let Some(empty_slot) = seen_dirs.iter_mut().find(|s| s.is_none()) {
+                                *empty_slot = Some(dir_name);
+                            }
                         }
+                    } else if !name.is_empty() {
+                        // This is the device itself (e.g., "card0" when listing "/dev/dri")
+                        if virtual_idx >= pos {
+                            if let Some(r) = write_dirent(buf, off, count, virtual_idx as u64 + 300, name.as_bytes(), 8) { // 8 = DT_REG
+                                off += r; pos += 1;
+                            } else {
+                                drop(devices);
+                                tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
+                                    return val_reply(off as u64);
+                            }
+                        }
+                        virtual_idx += 1;
                     }
-                    virtual_idx += 1;
                 }
             }
         }
-        drop(devices);
     }
 
     // Initrd files (Deduplicated)
