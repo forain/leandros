@@ -1999,7 +1999,35 @@ fn read_input_byte() -> Option<u8> {
         if let Some(ev) = evdev_server::pop_event(0) {
             // EV_KEY down (1) or serial typematic (2)
             if ev.type_ == 1 && (ev.value == 1 || ev.value == 2) {
-                return Some(ev.code as u8);
+                // Map standard Linux evdev scan codes back to ASCII for the kernel console
+                let ascii = match ev.code {
+                    1 => 27, // ESC
+                    2..=11 => b'0' + ((ev.code - 1) % 10) as u8,
+                    12 => b'-',
+                    13 => b'=',
+                    14 => 127, // Backspace
+                    15 => 9,   // Tab
+                    16 => b'q', 17 => b'w', 18 => b'e', 19 => b'r', 20 => b't',
+                    21 => b'y', 22 => b'u', 23 => b'i', 24 => b'o', 25 => b'p',
+                    26 => b'[', 27 => b']',
+                    28 => b'\n', // Enter
+                    30 => b'a', 31 => b's', 32 => b'd', 33 => b'f', 34 => b'g',
+                    35 => b'h', 36 => b'j', 37 => b'k', 38 => b'l', 39 => b';',
+                    40 => b'\'', 41 => b'`',
+                    43 => b'\\', 44 => b'z', 45 => b'x', 46 => b'c', 47 => b'v',
+                    48 => b'b', 49 => b'n', 50 => b'm', 51 => b',', 52 => b'.',
+                    53 => b'/',
+                    57 => b' ', // Space
+                    96 => b'\n', // KPEnter
+                    _ => {
+                        // If it's already ASCII-range (e.g. from UART), use it as-is
+                        if ev.code < 128 && ev.code > 31 { ev.code as u8 } else { 0 }
+                    }
+                };
+                
+                if ascii != 0 {
+                    return Some(ascii);
+                }
             }
             // Continue loop to skip EV_SYN or other events.
         } else {
@@ -2810,13 +2838,23 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     const DRM_IOCTL_SET_PLANE: usize = 0x1005;
     const DRM_IOCTL_GET_CAPS: usize = 0x1006;
 
+    // Check if it's a standard Linux EVDEV (type 'E' = 0x45) or DRM (type 'd' = 0x64) ioctl
+    let ioctl_type = (cmd >> 8) & 0xFF;
+    let is_evdev = ioctl_type == 0x45;
+    let is_drm = ioctl_type == 0x64;
+
     if cmd == FIONREAD || cmd == FBIOGET_VSCREENINFO ||
        cmd == DRM_IOCTL_GET_MODE || cmd == DRM_IOCTL_SET_MODE ||
        cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||
-       cmd == DRM_IOCTL_SET_PLANE || cmd == DRM_IOCTL_GET_CAPS {
-        if cmd == FBIOGET_VSCREENINFO && arg != 0 {
-            if !validate_user_buf(arg, 32) { return -14; }
-            with_current_address_space_mut(|as_| as_.prefault_range(arg, 32));
+       cmd == DRM_IOCTL_SET_PLANE || cmd == DRM_IOCTL_GET_CAPS ||
+       is_evdev || is_drm {
+        if (cmd == FBIOGET_VSCREENINFO || is_evdev || is_drm) && arg != 0 {
+            // Validate and prefault buffer if it looks like a pointer
+            let size = (cmd >> 16) & 0x3FFF;
+            if size > 0 && size < 4096 {
+                if !validate_user_buf(arg, size) { return -14; }
+                with_current_address_space_mut(|as_| as_.prefault_range(arg, size));
+            }
         }
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
         let r = vfs_reply_val(&vfs::handle(&msg, pid));

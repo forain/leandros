@@ -10,10 +10,168 @@ use super::drm::*;
 use super::drm_driver::*;
 use super::{Driver, DriverError};
 
+// ── Standard Linux DRM IOCTL Constants ───────────────────────────────────────
+
+const DRM_IOCTL_MODE_GETRESOURCES: u32 = 0xC04064A0;
+const DRM_IOCTL_MODE_GETCONNECTOR: u32 = 0xC05064A7;
+const DRM_IOCTL_MODE_GETENCODER: u32 = 0xC01464A6;
+const DRM_IOCTL_MODE_GETCRTC: u32 = 0xC06864A1;
+const DRM_IOCTL_MODE_CREATE_DUMB: u32 = 0xC02064B2;
+const DRM_IOCTL_MODE_MAP_DUMB: u32 = 0xC01064B3;
+const DRM_IOCTL_MODE_ADDFB: u32 = 0xC01C64AE;
+const DRM_IOCTL_MODE_SETCRTC: u32 = 0xC06864A2;
+const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC01864B0;
+const DRM_IOCTL_VERSION: u32 = 0xC0406400;
+
+// ── Standard Linux DRM Structs ───────────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_mode_card_res {
+    fb_id_ptr: u64,
+    crtc_id_ptr: u64,
+    connector_id_ptr: u64,
+    encoder_id_ptr: u64,
+    count_fbs: u32,
+    count_crtcs: u32,
+    count_connectors: u32,
+    count_encoders: u32,
+    min_width: u32,
+    max_width: u32,
+    min_height: u32,
+    max_height: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_mode_modeinfo {
+    clock: u32,
+    hdisplay: u16, hsync_start: u16, hsync_end: u16, htotal: u16, hskew: u16,
+    vdisplay: u16, vsync_start: u16, vsync_end: u16, vtotal: u16, vscan: u16,
+    vrefresh: u32,
+    flags: u32,
+    type_: u32,
+    name: [u8; 32],
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_mode_get_connector {
+    encoders_ptr: u64,
+    modes_ptr: u64,
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    count_modes: u32,
+    count_props: u32,
+    count_encoders: u32,
+    encoder_id: u32,
+    connector_id: u32,
+    connector_type: u32,
+    connector_type_id: u32,
+    connection: u32,
+    mm_width: u32,
+    mm_height: u32,
+    subpixel: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_mode_get_encoder {
+    encoder_id: u32,
+    encoder_type: u32,
+    crtc_id: u32,
+    possible_crtcs: u32,
+    possible_clones: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_mode_crtc {
+    set_connectors_ptr: u64,
+    count_connectors: u32,
+    crtc_id: u32,
+    fb_id: u32,
+    x: u32,
+    y: u32,
+    gamma_size: u32,
+    mode_valid: u32,
+    mode: drm_mode_modeinfo,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_mode_create_dumb {
+    height: u32,
+    width: u32,
+    bpp: u32,
+    flags: u32,
+    handle: u32,
+    pitch: u32,
+    size: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_mode_map_dumb {
+    handle: u32,
+    pad: u32,
+    offset: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_mode_fb_cmd {
+    fb_id: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    bpp: u32,
+    depth: u32,
+    handle: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_mode_crtc_page_flip {
+    crtc_id: u32,
+    fb_id: u32,
+    flags: u32,
+    reserved: u32,
+    user_data: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct drm_version {
+    version_major: i32,
+    version_minor: i32,
+    version_patchlevel: i32,
+    name_len: usize,
+    name: u64,
+    date_len: usize,
+    date: u64,
+    desc_len: usize,
+    desc: u64,
+}
+
+use alloc::collections::BTreeMap;
+use spin::Mutex;
+
+static DUMB_BUFFERS: Mutex<BTreeMap<u32, usize>> = Mutex::new(BTreeMap::new());
+
 /// DRM device interface for userspace communication
 pub struct DrmDeviceInterface {
     driver: DrmDriver,
     device_path: &'static str,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferInfo {
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
 }
 
 impl DrmDeviceInterface {
@@ -21,7 +179,7 @@ impl DrmDeviceInterface {
     pub fn new() -> Self {
         Self {
             driver: DrmDriver::new(),
-            device_path: "/dev/drm0",
+            device_path: "/dev/dri/card0",
         }
     }
 
@@ -30,21 +188,38 @@ impl DrmDeviceInterface {
         let device = get_drm_device();
         let mut device_lock = device.lock();
 
+        // If this is a mode-setting or flip call, disable the kernel console
+        if cmd == 0x1001 || cmd == 0x1004 || cmd == 0xC06864A2 || cmd == 0xC01864B0 {
+            crate::framebuffer::set_console_disabled(true);
+        }
+
         match cmd {
-            // Mode setting ioctls
+            // Mode setting ioctls (Custom LeandrOS)
             0x1001 => self.handle_set_mode(&mut device_lock, arg),
             0x1003 => self.handle_get_mode(&mut device_lock, arg),
 
-            // Framebuffer ioctls
+            // Framebuffer ioctls (Custom LeandrOS)
             0x1002 => self.handle_create_framebuffer(&mut device_lock, arg),
             0x1004 => self.handle_flip_page(&mut device_lock, arg),
             0x1005 => self.handle_set_plane(&mut device_lock, arg),
 
-            // Capability ioctls
+            // Capability ioctls (Custom LeandrOS)
             0x1006 => self.handle_get_capabilities(arg),
 
             // Mmap ioctl - returns physical address for device mapping
             0x1007 => self.handle_ioctl_mmap(arg),
+
+            // Standard Linux DRM IOCTLs
+            DRM_IOCTL_VERSION => self.std_handle_version(arg),
+            DRM_IOCTL_MODE_GETRESOURCES => self.std_handle_get_resources(&mut device_lock, arg),
+            DRM_IOCTL_MODE_GETCONNECTOR => self.std_handle_get_connector(&mut device_lock, arg),
+            DRM_IOCTL_MODE_GETENCODER => self.std_handle_get_encoder(&mut device_lock, arg),
+            DRM_IOCTL_MODE_GETCRTC => self.std_handle_get_crtc(&mut device_lock, arg),
+            DRM_IOCTL_MODE_CREATE_DUMB => self.std_handle_create_dumb(&mut device_lock, arg),
+            DRM_IOCTL_MODE_MAP_DUMB => self.std_handle_map_dumb(&mut device_lock, arg),
+            DRM_IOCTL_MODE_ADDFB => self.std_handle_addfb(&mut device_lock, arg),
+            DRM_IOCTL_MODE_SETCRTC => self.std_handle_set_crtc(&mut device_lock, arg),
+            DRM_IOCTL_MODE_PAGE_FLIP => self.std_handle_page_flip(&mut device_lock, arg),
 
             _ => Err(DriverError::Unsupported),
         }
@@ -92,23 +267,29 @@ impl DrmDeviceInterface {
         // Get mode from existing KMS framebuffer console
         // Use the bootloader framebuffer dimensions stored in VFS
         extern "C" {
-            fn vfs_get_framebuffer_info() -> (u32, u32, u32);
+            fn vfs_get_framebuffer_info(info: &mut FramebufferInfo);
         }
 
-        let (width, height, _pitch) = unsafe { vfs_get_framebuffer_info() };
+        let mut fb_info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
+        unsafe { vfs_get_framebuffer_info(&mut fb_info); }
 
-        if width > 0 && height > 0 {
-            mode_data[0] = width;   // Bootloader framebuffer width
-            mode_data[1] = height;  // Bootloader framebuffer height
+        if fb_info.width > 0 && fb_info.height > 0 {
+            mode_data[0] = fb_info.width;   // Bootloader framebuffer width
+            mode_data[1] = fb_info.height;  // Bootloader framebuffer height
             mode_data[2] = 60;      // Default refresh rate
             Ok(0)
         } else {
-            // Final fallback - should always work
-            mode_data[0] = 1280;
-            mode_data[1] = 800;
+            // Final fallback
+            mode_data[0] = 640;
+            mode_data[1] = 480;
             mode_data[2] = 60;
             Ok(0)
         }
+    }
+
+    /// Release DRM resources and re-enable kernel console
+    pub fn release(&mut self) {
+        crate::framebuffer::set_console_disabled(false);
     }
 
     /// Handle DRM_IOCTL_CREATE_FB
@@ -169,10 +350,11 @@ impl DrmDeviceInterface {
             } else {
                 // Fallback to VFS info if mode not initialized
                 extern "C" {
-                    fn vfs_get_framebuffer_info() -> (u32, u32, u32);
+                    fn vfs_get_framebuffer_info(info: &mut FramebufferInfo);
                 }
-                let (w, h, _) = unsafe { vfs_get_framebuffer_info() };
-                (w, h)
+                let mut info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
+                unsafe { vfs_get_framebuffer_info(&mut info); }
+                (info.width, info.height)
             };
 
             if display_width == 0 || display_height == 0 {
@@ -187,17 +369,14 @@ impl DrmDeviceInterface {
                 let mut atomic_state = AtomicModeSet::begin();
 
                 // Use hardware scaling from source framebuffer to full display
-                AtomicModeSet::set_plane_scaling(
+                AtomicModeSet::set_plane(
                     &mut atomic_state,
                     plane_id,
-                    crtc_id,
-                    fb_id,
-                    src_width,     // Source framebuffer dimensions (e.g., 320x200)
-                    src_height,
-                    0, 0,          // Destination position (full screen)
-                    display_width, // Destination dimensions (e.g., 1280x800)
-                    display_height
-                )?;
+                    Some(crtc_id),
+                    Some(fb_id),
+                    0, 0, display_width, display_height, // Dst
+                    0, 0, src_width << 16, src_height << 16, // Src
+                );
 
                 // Commit the atomic state with hardware scaling
                 // Pass device directly to avoid deadlock
@@ -274,6 +453,213 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
+    // ── Standard Linux DRM IOCTL Handlers ─────────────────────────────────────
+
+    fn std_handle_version(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let v = unsafe { &mut *(arg as *mut drm_version) };
+        v.version_major = 1;
+        v.version_minor = 6;
+        v.version_patchlevel = 0;
+
+        let name = "leandros-drm\0";
+        let date = "20261201\0";
+        let desc = "LeandrOS DRM driver\0";
+
+        if v.name != 0 && v.name_len >= name.len() {
+            unsafe { ptr::copy_nonoverlapping(name.as_ptr(), v.name as *mut u8, name.len()); }
+        }
+        v.name_len = name.len();
+
+        if v.date != 0 && v.date_len >= date.len() {
+            unsafe { ptr::copy_nonoverlapping(date.as_ptr(), v.date as *mut u8, date.len()); }
+        }
+        v.date_len = date.len();
+
+        if v.desc != 0 && v.desc_len >= desc.len() {
+            unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), v.desc as *mut u8, desc.len()); }
+        }
+        v.desc_len = desc.len();
+
+        Ok(0)
+    }
+
+    fn std_handle_get_resources(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let res = unsafe { &mut *(arg as *mut drm_mode_card_res) };
+        
+        // We report 1 of each for a simple virtual device
+        let crtc_ids = [1u32];
+        let connector_ids = [1u32];
+        let encoder_ids = [1u32];
+
+        if res.crtc_id_ptr != 0 && res.count_crtcs >= 1 {
+            unsafe { ptr::copy_nonoverlapping(crtc_ids.as_ptr(), res.crtc_id_ptr as *mut u32, 1); }
+        }
+        res.count_crtcs = 1;
+
+        if res.connector_id_ptr != 0 && res.count_connectors >= 1 {
+            unsafe { ptr::copy_nonoverlapping(connector_ids.as_ptr(), res.connector_id_ptr as *mut u32, 1); }
+        }
+        res.count_connectors = 1;
+
+        if res.encoder_id_ptr != 0 && res.count_encoders >= 1 {
+            unsafe { ptr::copy_nonoverlapping(encoder_ids.as_ptr(), res.encoder_id_ptr as *mut u32, 1); }
+        }
+        res.count_encoders = 1;
+
+        res.min_width = 320;
+        res.max_width = 4096;
+        res.min_height = 200;
+        res.max_height = 4096;
+
+        Ok(0)
+    }
+
+    fn std_handle_get_connector(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let conn = unsafe { &mut *(arg as *mut drm_mode_get_connector) };
+        
+        conn.connector_id = 1;
+        conn.connector_type = 11; // DRM_MODE_CONNECTOR_VIRTUAL
+        conn.connector_type_id = 1;
+        conn.connection = 1; // Connected
+        conn.mm_width = 320;
+        conn.mm_height = 200;
+
+        if conn.encoders_ptr != 0 && conn.count_encoders >= 1 {
+            let encoders = [1u32];
+            unsafe { ptr::copy_nonoverlapping(encoders.as_ptr(), conn.encoders_ptr as *mut u32, 1); }
+        }
+        conn.count_encoders = 1;
+
+        // Provide at least one mode
+        if conn.modes_ptr != 0 && conn.count_modes >= 1 {
+            extern "C" { fn vfs_get_framebuffer_info(info: &mut FramebufferInfo); }
+            let mut info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
+            unsafe { vfs_get_framebuffer_info(&mut info); }
+            let mut mode = drm_mode_modeinfo::default();
+            mode.hdisplay = info.width as u16;
+            mode.vdisplay = info.height as u16;
+            mode.vrefresh = 60;
+            mode.clock = (info.width * info.height * 60) / 1000;
+            let name = b"Native\0";
+            mode.name[..name.len()].copy_from_slice(name);
+            
+            unsafe { ptr::copy_nonoverlapping(&mode, conn.modes_ptr as *mut drm_mode_modeinfo, 1); }
+        }
+        conn.count_modes = 1;
+        conn.encoder_id = 1;
+
+        Ok(0)
+    }
+
+    fn std_handle_get_encoder(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let enc = unsafe { &mut *(arg as *mut drm_mode_get_encoder) };
+        enc.encoder_id = 1;
+        enc.encoder_type = 3; // DRM_MODE_ENCODER_VIRTUAL
+        enc.crtc_id = 1;
+        enc.possible_crtcs = 1;
+        Ok(0)
+    }
+
+    fn std_handle_get_crtc(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let crtc_out = unsafe { &mut *(arg as *mut drm_mode_crtc) };
+        let crtc_id = DrmObjectId(crtc_out.crtc_id);
+        if let Some(crtc) = device.get_crtc(crtc_id) {
+            // Find FB ID from planes associated with this CRTC
+            crtc_out.fb_id = device.planes.iter()
+                .find(|p| p.crtc_id == Some(crtc_id))
+                .and_then(|p| p.fb_id)
+                .map(|id| id.0)
+                .unwrap_or(0);
+            crtc_out.x = crtc.x as u32;
+            crtc_out.y = crtc.y as u32;
+            if let Some(mode) = &crtc.mode {
+                crtc_out.mode.hdisplay = mode.hdisplay as u16;
+                crtc_out.mode.vdisplay = mode.vdisplay as u16;
+                crtc_out.mode.vrefresh = mode.vrefresh;
+            }
+            crtc_out.mode_valid = if crtc.mode.is_some() { 1 } else { 0 };
+            Ok(0)
+        } else {
+            Err(DriverError::NotFound)
+        }
+    }
+
+    fn std_handle_create_dumb(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let create = unsafe { &mut *(arg as *mut drm_mode_create_dumb) };
+        let buffer = DrmDumbBuffer::create(create.width, create.height, create.bpp)?;
+        
+        create.handle = buffer.handle;
+        create.pitch = buffer.pitch;
+        create.size = buffer.size as u64;
+
+        Ok(0)
+    }
+
+    fn std_handle_map_dumb(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let map = unsafe { &mut *(arg as *mut drm_mode_map_dumb) };
+
+        // Return the hardware framebuffer base address to enable direct-to-screen rendering.
+        // This is safe because we've disabled the competing kernel-side scaling copy.
+        extern "C" { fn vfs_get_framebuffer_base() -> u64; }
+        map.offset = unsafe { vfs_get_framebuffer_base() };
+
+        Ok(0)
+    }
+    fn std_handle_addfb(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let add = unsafe { &mut *(arg as *mut drm_mode_fb_cmd) };
+        
+        let mut fb = DrmFramebuffer::new(
+            add.width,
+            add.height,
+            DrmFormat::Xrgb8888,
+            add.handle,
+            add.pitch
+        );
+        
+        // Use the physical address associated with the dumb buffer handle
+        let phys_addr = DUMB_BUFFERS.lock().get(&add.handle).copied().unwrap_or(0);
+        fb.physical_addresses[0] = phys_addr as u64;
+        
+        let fb_id = fb.id().0;
+        device.framebuffers.insert(fb.id(), fb);
+        add.fb_id = fb_id;
+        
+        Ok(0)
+    }
+
+    fn std_handle_set_crtc(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let set = unsafe { &mut *(arg as *mut drm_mode_crtc) };
+        let crtc_id = DrmObjectId(set.crtc_id);
+        let fb_id = Some(DrmObjectId(set.fb_id));
+        let mode = Some(DrmModeInfo::new(set.mode.hdisplay, set.mode.vdisplay, set.mode.vrefresh));
+        
+        device.set_crtc(crtc_id, mode, set.x, set.y, &[], fb_id)?;
+        Ok(0)
+    }
+
+    fn std_handle_page_flip(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let flip = unsafe { &mut *(arg as *mut drm_mode_crtc_page_flip) };
+
+        let mut src_w = 320;
+        let mut src_h = 200;
+        if let Some(fb) = device.get_framebuffer(DrmObjectId(flip.fb_id)) {
+            src_w = fb.width;
+            src_h = fb.height;
+        }
+
+        let flip_args = [flip.fb_id, flip.flags, src_w, src_h];
+        self.handle_flip_page(device, flip_args.as_ptr() as usize)
+    }
     /// Handle DRM_IOCTL_MMAP - returns physical address of framebuffer
     fn handle_ioctl_mmap(&mut self, arg: usize) -> Result<usize, DriverError> {
         // arg points to a u64 which contains the requested physical address/offset
@@ -441,6 +827,7 @@ impl DrmDumbBuffer {
         }
 
         let handle = Self::next_handle();
+        DUMB_BUFFERS.lock().insert(handle, phys_addr as usize);
         
         // mmap_offset for userspace will be the physical address
         // The syscall handler will use this to map the device memory
