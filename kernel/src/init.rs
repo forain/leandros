@@ -95,13 +95,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
                 serial_print_str("\n[INIT]   WARNING: Virtual address is NOT in kernel space!\n");
             }
 
-            // Also register framebuffer with VFS
-            vfs_server::set_framebuffer(
-                boot_info.framebuffer_base,
-                boot_info.framebuffer_width,
-                boot_info.framebuffer_height,
-                boot_info.framebuffer_pitch,
-            );
+            // Registering framebuffer with VFS is now centralized in main.rs
+            // to ensure correct pitch heuristics are applied.
 
             // Debug: Log framebuffer console resolution
             serial_print_str("[INIT] Framebuffer console resolution: ");
