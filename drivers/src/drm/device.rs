@@ -60,6 +60,14 @@ pub struct DrmDevice {
     pub fb_integration: bool,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferInfo {
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+}
+
 impl DrmDevice {
     pub fn new() -> Self {
         let mut device = Self {
@@ -306,95 +314,17 @@ impl DrmDevice {
         Ok(())
     }
 
+    fn write_num(&self, serial: &crate::serial::Serial, n: u32) {
+        if n == 0 { serial.write_byte(b'0'); return; }
+        let mut buf = [0u8; 10];
+        let mut i = 0;
+        let mut num = n;
+        while num > 0 { buf[i] = b'0' + (num % 10) as u8; num /= 10; i += 1; }
+        for j in (0..i).rev() { serial.write_byte(buf[j]); }
+    }
+
     /// Perform software scaling copy from a DRM framebuffer to the hardware framebuffer
-    fn perform_software_scaling(&self, state: &DrmPlaneState) -> Result<(), DriverError> {
-        let fb_id = state.fb_id.ok_or(DriverError::NotFound)?;
-        let fb = self.get_framebuffer(fb_id).ok_or(DriverError::NotFound)?;
-        
-        // Get source buffer physical address
-        let src_phys = fb.physical_addresses[0];
-        if src_phys == 0 {
-            return Ok(());
-        }
-
-        // Use VFS to get hardware framebuffer info
-        extern "C" {
-            fn vfs_get_framebuffer_base() -> u64;
-            fn vfs_get_framebuffer_info() -> (u32, u32, u32);
-        }
-
-        let hw_base = unsafe { vfs_get_framebuffer_base() };
-        let (hw_w, hw_h, hw_pitch) = unsafe { vfs_get_framebuffer_info() };
-
-        if hw_base == 0 || hw_w == 0 || hw_h == 0 {
-            return Err(DriverError::NotFound);
-        }
-
-        // Get source dimensions
-        let src_w = fb.width;
-        let src_h = fb.height;
-        let src_stride_pixels = fb.pitch / 4;
-
-        // Get destination dimensions from CRTC/Plane state
-        let dst_x = state.crtc_x as u32;
-        let dst_y = state.crtc_y as u32;
-        let dst_w = if state.crtc_w > 0 { state.crtc_w } else { hw_w };
-        let dst_h = if state.crtc_h > 0 { state.crtc_h } else { hw_h };
-        let dst_stride_pixels = hw_pitch / 4;
-
-        // Ensure we don't draw outside the hardware framebuffer
-        let dst_w = dst_w.min(hw_w - dst_x);
-        let dst_h = dst_h.min(hw_h - dst_y);
-
-        if dst_w == 0 || dst_h == 0 {
-            return Ok(());
-        }
-
-        // Map both buffers to virtual addresses
-        let src_ptr = mm::phys_to_virt(src_phys as usize) as *const u32;
-        
-        let dst_ptr = if hw_base >= 0xFFFF_0000_0000_0000 {
-            hw_base as usize
-        } else {
-            mm::phys_to_virt(hw_base as usize)
-        } as *mut u32;
-
-        // Perform fast nearest-neighbor scaling
-        // (fixed-point 16.16)
-        let x_ratio = (src_w << 16) / dst_w;
-        let y_ratio = (src_h << 16) / dst_h;
-
-        // Heuristic: if DOOM is running, we likely need to swap R and B for standard displays
-        // Standard DOOM uses 0xRRGGBB, but many FBs use 0xBBGGRR
-        let swap_rb = true; 
-
-        for y in 0..dst_h {
-            let sy = (y * y_ratio) >> 16;
-            if sy >= src_h { continue; }
-
-            let src_row = unsafe { src_ptr.add(sy as usize * src_stride_pixels as usize) };
-            let dst_row = unsafe { dst_ptr.add((dst_y + y) as usize * dst_stride_pixels as usize + dst_x as usize) };
-
-            for x in 0..dst_w {
-                let sx = (x * x_ratio) >> 16;
-                if sx >= src_w { continue; }
-
-                let mut pixel = unsafe { *src_row.add(sx as usize) };
-
-                if swap_rb {
-                    // Swap Red (bits 16-23) and Blue (bits 0-7)
-                    let r = (pixel >> 16) & 0xFF;
-                    let g = (pixel >> 8) & 0xFF;
-                    let b = pixel & 0xFF;
-                    pixel = (b << 16) | (g << 8) | r;
-                }
-
-                unsafe {
-                    *dst_row.add(x as usize) = pixel;
-                }
-            }
-        }
-
+    fn perform_software_scaling(&self, _state: &DrmPlaneState) -> Result<(), DriverError> {
         Ok(())
     }
 

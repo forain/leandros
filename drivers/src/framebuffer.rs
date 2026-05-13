@@ -371,8 +371,33 @@ impl Driver for Framebuffer {
 
 static KERNEL_FB: Mutex<Framebuffer> = Mutex::new(Framebuffer::new());
 
+static CONSOLE_DISABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Disable or enable kernel console output to prevent blinking during DRM operations.
+pub fn set_console_disabled(disabled: bool) {
+    let was_disabled = CONSOLE_DISABLED.swap(disabled, core::sync::atomic::Ordering::SeqCst);
+    
+    // If we are re-enabling the console, trigger a redraw
+    if was_disabled && !disabled {
+        let mut fb = KERNEL_FB.lock();
+        fb.clear(0x000000);
+        fb.cursor_x = 0;
+        fb.cursor_y = 0;
+        
+        // Print a message to show the console is back
+        let msg = b"\n[Console Resumed]\n> \0";
+        for &b in msg {
+            if b == 0 { break; }
+            fb.putc(b);
+        }
+    }
+}
+
 /// Output a character to the global kernel framebuffer.
 pub fn fb_putc(c: u8) {
+    if CONSOLE_DISABLED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     KERNEL_FB.lock().putc(c);
 }
 

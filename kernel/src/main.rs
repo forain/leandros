@@ -144,6 +144,17 @@ pub fn serial_print_str(msg: &str) {
 }
 
 #[no_mangle]
+pub extern "C" fn serial_print_str_c(s: *const u8) {
+    let mut i = 0;
+    unsafe {
+        while *s.add(i) != 0 {
+            serial_write_byte(*s.add(i));
+            i += 1;
+        }
+    }
+}
+
+#[no_mangle]
 pub fn serial_write_raw(msg: &[u8]) {
     for &b in msg { serial_write_byte(b); }
 }
@@ -249,21 +260,25 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
 
     unsafe {
-        if (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_base != 0 {
-            // Set boot framebuffer info for fallback
-            drivers::framebuffer::set_boot_framebuffer(
-                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_base,
-                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_width,
-                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_height,
-                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_pitch,
-            );
+        let bi = &*core::ptr::addr_of!(BOOT_INFO);
+        if bi.framebuffer_base != 0 {
+            // Set VFS framebuffer info for DRM driver
+            let width = bi.framebuffer_width;
+            let height = bi.framebuffer_height;
+            let pitch = bi.framebuffer_pitch;
+
+            // Ensure pitch is in bytes
+            let pitch_bytes = if pitch < width * 4 { width * 4 } else { pitch };
+
+            vfs_server::set_framebuffer(bi.framebuffer_base, width, height, pitch_bytes);
+            drivers::framebuffer::set_boot_framebuffer(bi.framebuffer_base, width, height, pitch_bytes);
 
             // Initialize boot framebuffer first
             drivers::framebuffer::init_kernel_fb(
-                mm::phys_to_virt((*core::ptr::addr_of!(BOOT_INFO)).framebuffer_base as usize) as *mut u32,
-                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_width as usize,
-                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_height as usize,
-                (*core::ptr::addr_of!(BOOT_INFO)).framebuffer_pitch as usize,
+                mm::phys_to_virt(bi.framebuffer_base as usize) as *mut u32,
+                width as usize,
+                height as usize,
+                pitch_bytes as usize,
             );
 
             // Try KMS to detect native resolution (for informational purposes)
