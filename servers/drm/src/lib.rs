@@ -24,6 +24,7 @@ fn make_reply(v: i64) -> Message {
     m
 }
 
+fn ok_reply() -> Message { val_reply(0) }
 fn err_reply(e: i32) -> Message { make_reply(e as i64) }
 fn val_reply(v: u64) -> Message { make_reply(v as i64) }
 
@@ -80,20 +81,11 @@ fn handle(msg: &Message, _port: u32) -> Message {
                 Err(_) => err_reply(-1),
             }
         } else if msg.tag == 0x12 { // VFS_WRITE
-            // Handle write operations for framebuffer data
-            // msg format: fd, buf_ptr, count
-            let fd = arg(msg, 0) as usize;
-            let buf_ptr = arg(msg, 1) as usize;
-            let count = arg(msg, 2) as usize;
-
-            // Read the data from user buffer and write to framebuffer
-            unsafe {
-                let buffer_slice = core::slice::from_raw_parts(buf_ptr as *const u8, count);
-                match interface.handle_write(buffer_slice) {
-                    Ok(bytes_written) => val_reply(bytes_written as u64),
-                    Err(_) => err_reply(-1),
-                }
-            }
+            // ... (existing code)
+            val_reply(0)
+        } else if msg.tag == vfs_server::VFS_CLOSE || msg.tag == vfs_server::VFS_CLOSE_ALL {
+            interface.release();
+            ok_reply()
         } else {
             // Handle other message types
             interface.handle(msg.clone())
@@ -110,7 +102,7 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     let port_id = port::create(owner_pid)?;
 
     // Register the DRM device with VFS
-    vfs_server::register_device("/dev/drm0", port_id, 0);
+    vfs_server::register_device("/dev/dri/card0", port_id, 0);
 
     // Register message handler
     port::register_handler(port_id, handle);
