@@ -170,6 +170,13 @@ pub unsafe extern "C" fn arch_unmap_page(page_table_root: usize, virt: usize) {
 /// Called by the scheduler immediately before every `cpu_switch_to` into a
 /// user task, and with 0 on return to the scheduler idle loop.
 #[no_mangle]
+pub unsafe extern "C" fn arch_get_current_root() -> usize {
+    let ttbr1: u64;
+    core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1);
+    ttbr1 as usize
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn arch_set_page_table(root: usize) {
     core::arch::asm!(
         "msr ttbr0_el1, {r}",
