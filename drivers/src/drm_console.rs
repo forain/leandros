@@ -170,6 +170,11 @@ impl DrmConsole {
         // Initialize DRM subsystem
         init_drm()?;
 
+        // Use capabilities to configure driver
+        if self.capabilities.double_buffering {
+            // Placeholder for double buffering setup
+        }
+
         // Create authentication session
         self.master_session = Some(create_session());
 
@@ -347,16 +352,28 @@ impl DrmConsole {
     }
 
     /// Render virtual terminal to DRM framebuffer
-    fn render_vt_to_framebuffer(&mut self, vt: &VirtualTerminal, _fb_id: DrmObjectId) -> Result<(), DriverError> {
-        // This would render the character and color buffers to the framebuffer
-        // For now, just mark as rendered
-        // In a real implementation, this would:
-        // 1. Map the framebuffer memory
-        // 2. Render each character using font data
-        // 3. Apply colors
-        // 4. Handle cursor rendering
+    fn render_vt_to_framebuffer(&mut self, _vt: &VirtualTerminal, fb_id: DrmObjectId) -> Result<(), DriverError> {
+        // If we have double buffering enabled, use the provided fb_id
+        // and then flip it to be the front buffer
+        if let Some(back_fb) = self.back_buffer_id {
+            if back_fb == fb_id {
+                // Swap front and back buffer IDs
+                let temp = self.front_buffer_id;
+                self.front_buffer_id = self.back_buffer_id;
+                self.back_buffer_id = temp;
+
+                // Set the current framebuffer ID
+                self.current_framebuffer_id = self.front_buffer_id;
+            }
+        } else {
+            self.current_framebuffer_id = Some(fb_id);
+        }
+
+        // In a real implementation, this would trigger the hardware flip
+        // For now, just mark the VT as rendered
         Ok(())
     }
+
 
     /// Render virtual terminal to legacy framebuffer
     fn render_vt_to_legacy(&mut self, vt: &VirtualTerminal) {
@@ -401,37 +418,37 @@ impl DrmConsole {
     }
 
     /// Set font size (console property integration)
-    pub fn set_font_size(&mut self, size: usize) {
+    pub fn set_font_size(&mut self, _size: usize) {
         // Update character dimensions based on font size
         self.virtual_terminals[self.active_vt].dirty = true;
     }
 
     /// Set text color (console property integration)
-    pub fn set_text_color(&mut self, color: u32) {
+    pub fn set_text_color(&mut self, _color: u32) {
         // Update text color for current VT
         self.virtual_terminals[self.active_vt].dirty = true;
     }
 
     /// Set background color (console property integration)
-    pub fn set_background_color(&mut self, color: u32) {
+    pub fn set_background_color(&mut self, _color: u32) {
         // Update background color and refresh display
         self.virtual_terminals[self.active_vt].dirty = true;
     }
 
     /// Set cursor style (console property integration)
-    pub fn set_cursor_style(&mut self, style: u32) {
+    pub fn set_cursor_style(&mut self, _style: u32) {
         // 0=Block, 1=Underline, 2=Bar, 3=None
         self.virtual_terminals[self.active_vt].dirty = true;
     }
 
     /// Set cursor blink (console property integration)
-    pub fn set_cursor_blink(&mut self, blink: bool) {
+    pub fn set_cursor_blink(&mut self, _blink: bool) {
         // Enable/disable cursor blinking
         self.virtual_terminals[self.active_vt].dirty = true;
     }
 
     /// Set auto wrap (console property integration)
-    pub fn set_auto_wrap(&mut self, wrap: bool) {
+    pub fn set_auto_wrap(&mut self, _wrap: bool) {
         // Enable/disable automatic line wrapping
         self.virtual_terminals[self.active_vt].dirty = true;
     }

@@ -1,6 +1,6 @@
 //! DRM property system for dynamic configuration
 
-use alloc::{vec::Vec, vec, collections::BTreeMap, string::{String, ToString}, boxed::Box};
+use alloc::{vec::Vec, vec, collections::BTreeMap, string::{String, ToString}};
 use super::core::{DrmObject, DrmObjectId, DrmObjectType};
 
 /// Property types

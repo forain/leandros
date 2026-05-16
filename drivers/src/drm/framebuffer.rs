@@ -1,6 +1,5 @@
 //! DRM framebuffer object management
 
-use alloc::{vec::Vec, vec};
 use super::core::{DrmObject, DrmObjectId, DrmObjectType};
 use super::super::DriverError;
 

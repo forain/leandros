@@ -1,11 +1,11 @@
 //! DRM device management and resource tracking
 
-use alloc::{vec::Vec, vec, collections::BTreeMap, boxed::Box};
+use alloc::{vec::Vec, collections::BTreeMap};
 use spin::Mutex;
 use super::core::*;
 use super::auth::*;
 use super::framebuffer::*;
-use super::super::{Driver, DriverError};
+use super::super::DriverError;
 
 /// DRM device capabilities
 pub struct DrmDeviceCaps {
@@ -314,15 +314,6 @@ impl DrmDevice {
         Ok(())
     }
 
-    fn write_num(&self, serial: &crate::serial::Serial, n: u32) {
-        if n == 0 { serial.write_byte(b'0'); return; }
-        let mut buf = [0u8; 10];
-        let mut i = 0;
-        let mut num = n;
-        while num > 0 { buf[i] = b'0' + (num % 10) as u8; num /= 10; i += 1; }
-        for j in (0..i).rev() { serial.write_byte(buf[j]); }
-    }
-
     /// Perform software scaling copy from a DRM framebuffer to the hardware framebuffer
     fn perform_software_scaling(&self, _state: &DrmPlaneState) -> Result<(), DriverError> {
         Ok(())
@@ -388,12 +379,18 @@ static DRM_DEVICE: Mutex<DrmDevice> = Mutex::new(DrmDevice {
 
 /// Initialize DRM device
 pub fn init_drm() -> Result<(), DriverError> {
-    let mut device = DRM_DEVICE.lock();
-    *device = DrmDevice::new();
+    {
+        let mut device = DRM_DEVICE.lock();
+        *device = DrmDevice::new();
+    }
 
-    // Try to integrate with existing drivers
-    let _ = device.enable_kms_integration();
-    let _ = device.enable_fb_integration();
+    // Try to integrate with existing drivers (WITHOUT holding the lock)
+    // to avoid deadlocks with ModeSet::set_display_mode
+    if crate::kms::init_kms().is_ok() {
+        DRM_DEVICE.lock().kms_integration = true;
+    }
+    
+    DRM_DEVICE.lock().fb_integration = true;
 
     Ok(())
 }

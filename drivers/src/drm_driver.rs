@@ -142,6 +142,53 @@ impl DrmDriver {
                 }
             },
 
+            DRM_MODE_GETENCODER => {
+                if data.len() >= 4 {
+                    let encoder_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    let device = get_drm_device().lock();
+                    if let Some(encoder) = device.get_encoder(DrmObjectId(encoder_id)) {
+                        Ok(encoder.serialize())
+                    } else {
+                        Err(DriverError::NotFound)
+                    }
+                } else {
+                    Err(DriverError::Unsupported)
+                }
+            },
+
+            DRM_MODE_GETPLANERESOURCES => {
+                let device = get_drm_device().lock();
+                let plane_res = DrmPlaneResources {
+                    planes: device.planes.iter().map(|p| p.id()).collect(),
+                };
+                Ok(plane_res.serialize())
+            },
+
+            DRM_MODE_GETPLANE => {
+                if data.len() >= 4 {
+                    let plane_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    let device = get_drm_device().lock();
+                    if let Some(plane) = device.get_plane(DrmObjectId(plane_id)) {
+                        Ok(plane.serialize())
+                    } else {
+                        Err(DriverError::NotFound)
+                    }
+                } else {
+                    Err(DriverError::Unsupported)
+                }
+            },
+
+            DRM_MODE_RMFB => {
+                if data.len() >= 4 {
+                    let fb_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    let mut device = get_drm_device().lock();
+                    device.remove_framebuffer(DrmObjectId(fb_id))?;
+                    Ok(vec![0])
+                } else {
+                    Err(DriverError::Unsupported)
+                }
+            },
+
             DRM_MODE_ADDFB => {
                 // Create framebuffer
                 if data.len() >= 20 {
@@ -345,6 +392,55 @@ impl DrmSerialize for DrmModeInfo {
         data.extend_from_slice(&self.type_.to_le_bytes());
         data.extend_from_slice(&self.name);
 
+        data
+    }
+}
+
+impl DrmSerialize for DrmEncoder {
+    fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.id().raw().to_le_bytes());
+        data.extend_from_slice(&self.encoder_type.to_le_bytes());
+        data.extend_from_slice(&self.crtc_id.map(|id| id.raw()).unwrap_or(0).to_le_bytes());
+        data.extend_from_slice(&self.possible_crtcs.to_le_bytes());
+        data.extend_from_slice(&self.possible_clones.to_le_bytes());
+        data
+    }
+}
+
+impl DrmSerialize for DrmPlaneResources {
+    fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(self.planes.len() as u32).to_le_bytes());
+        for &plane_id in &self.planes {
+            data.extend_from_slice(&plane_id.raw().to_le_bytes());
+        }
+        data
+    }
+}
+
+impl DrmSerialize for DrmPlane {
+    fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.id().raw().to_le_bytes());
+        data.extend_from_slice(&self.crtc_id.map(|id| id.raw()).unwrap_or(0).to_le_bytes());
+        data.extend_from_slice(&self.fb_id.map(|id| id.raw()).unwrap_or(0).to_le_bytes());
+        data.extend_from_slice(&self.possible_crtcs.to_le_bytes());
+        data.extend_from_slice(&self.plane_type.to_le_bytes());
+        data.extend_from_slice(&self.crtc_x.to_le_bytes());
+        data.extend_from_slice(&self.crtc_y.to_le_bytes());
+        data.extend_from_slice(&self.crtc_w.to_le_bytes());
+        data.extend_from_slice(&self.crtc_h.to_le_bytes());
+        data.extend_from_slice(&self.src_x.to_le_bytes());
+        data.extend_from_slice(&self.src_y.to_le_bytes());
+        data.extend_from_slice(&self.src_w.to_le_bytes());
+        data.extend_from_slice(&self.src_h.to_le_bytes());
+
+        // Add format count and formats
+        data.extend_from_slice(&(self.formats.len() as u32).to_le_bytes());
+        for &format in &self.formats {
+            data.extend_from_slice(&format.to_le_bytes());
+        }
         data
     }
 }

@@ -3,7 +3,6 @@
 //! This module provides the kernel-side interface that userspace applications
 //! like DOOM can use to communicate with the DRM subsystem.
 
-use alloc::vec::Vec;
 use ::core::slice;
 use ::core::ptr;
 use super::drm::*;
@@ -163,7 +162,7 @@ static DUMB_BUFFERS: Mutex<BTreeMap<u32, usize>> = Mutex::new(BTreeMap::new());
 /// DRM device interface for userspace communication
 pub struct DrmDeviceInterface {
     driver: DrmDriver,
-    device_path: &'static str,
+    _device_path: &'static str,
 }
 
 #[repr(C)]
@@ -179,7 +178,7 @@ impl DrmDeviceInterface {
     pub fn new() -> Self {
         Self {
             driver: DrmDriver::new(),
-            device_path: "/dev/dri/card0",
+            _device_path: "/dev/dri/card0",
         }
     }
 
@@ -195,7 +194,11 @@ impl DrmDeviceInterface {
 
         match cmd {
             // Mode setting ioctls (Custom LeandrOS)
-            0x1001 => self.handle_set_mode(&mut device_lock, arg),
+            0x1001 => {
+                // Drop the lock here because ModeSet::set_display_mode will acquire it
+                drop(device_lock);
+                self.handle_set_mode(arg)
+            },
             0x1003 => self.handle_get_mode(&mut device_lock, arg),
 
             // Framebuffer ioctls (Custom LeandrOS)
@@ -226,7 +229,7 @@ impl DrmDeviceInterface {
     }
 
     /// Handle DRM_IOCTL_SET_MODE
-    fn handle_set_mode(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+    fn handle_set_mode(&mut self, arg: usize) -> Result<usize, DriverError> {
         // arg points to [width, height, refresh] array
         let mode_data = unsafe {
             slice::from_raw_parts(arg as *const u32, 3)
@@ -235,10 +238,6 @@ impl DrmDeviceInterface {
         let width = mode_data[0];
         let height = mode_data[1];
         let refresh = mode_data[2];
-
-        // Drop the lock here because ModeSet::set_display_mode will acquire it
-        // This is safe because we are at the top level handler
-        drop(_device);
 
         // Set display mode using our DRM subsystem
         match ModeSet::set_display_mode(width, height, refresh) {
@@ -322,8 +321,14 @@ impl DrmDeviceInterface {
 
         // Return results to userspace
         fb_data[3] = fb_id; // fb_id
-        fb_data[4] = 0;     // No direct memory address - use mmap()
-        fb_data[5] = mmap_offset as u32; // Pass physical address as mmap offset
+        fb_data[4] = (mmap_offset & 0xFFFFFFFF) as u32; // Low 32 bits of offset
+        fb_data[5] = (mmap_offset >> 32) as u32;         // High 32 bits of offset
+
+        crate::pci::serial_debug("[DRM] Created FB id=");
+        crate::pci::serial_debug_hex(fb_id);
+        crate::pci::serial_debug(" offset=");
+        crate::pci::serial_debug_hex_64(mmap_offset as u64);
+        crate::pci::serial_debug("\n");
 
         Ok(0)
     }
