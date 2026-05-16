@@ -268,7 +268,6 @@ int	fuzzoffset[FUZZTABLE] =
     FUZZOFF,-FUZZOFF,-FUZZOFF,-FUZZOFF,-FUZZOFF,FUZZOFF,FUZZOFF,
     FUZZOFF,FUZZOFF,-FUZZOFF,FUZZOFF,FUZZOFF,-FUZZOFF,FUZZOFF 
 }; 
-
 int	fuzzpos = 0; 
 
 
@@ -530,7 +529,7 @@ void R_DrawTranslatedColumnLow (void)
 void R_InitTranslationTables (void)
 {
     int		i;
-	
+    
     translationtables = Z_Malloc (256*3, PU_STATIC, 0);
     
     // translate just the 16 green colors

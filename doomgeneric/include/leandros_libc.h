@@ -19,6 +19,8 @@ typedef __builtin_va_list va_list;
 int vsnprintf(char *str, size_t size, const char *format, va_list ap);
 int vfprintf(FILE *stream, const char *format, va_list ap);
 FILE *fopen(const char *path, const char *mode);
+int feof(FILE *stream);
+char *fgets(char *s, int size, FILE *stream);
 int fclose(FILE *stream);
 size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
@@ -34,6 +36,7 @@ int rename(const char *oldpath, const char *newpath);
 // string.h
 void *memset(void *s, int c, size_t n);
 void *memcpy(void *dest, const void *src, size_t n);
+int memcmp(const void *s1, const void *s2, size_t n);
 void *memmove(void *dest, const void *src, size_t n);
 char *strncpy(char *dest, const char *src, size_t n);
 char *strcpy(char *dest, const char *src);
@@ -49,12 +52,16 @@ char *strstr(const char *haystack, const char *needle);
 
 // stdlib.h
 void *malloc(size_t size);
+void *realloc(void *ptr, size_t size);
 void *calloc(size_t nmemb, size_t size);
 void free(void *ptr);
 void exit(int status);
+int atexit(void (*function)(void));
 int system(const char* command);
 int abs(int j);
 int atoi(const char *nptr);
+char *getenv(const char *name);
+int putenv(char *string);
 double atof(const char *nptr);
 long strtol(const char *nptr, char **endptr, int base);
 
@@ -67,6 +74,11 @@ int lseek(int fd, long offset, int whence);
 int usleep(unsigned int usec);
 int mkdir(const char *path, int mode);
 int access(const char *path, int amode);
+
+// socket.h
+struct sockaddr;
+int socket(int domain, int type, int protocol);
+int connect(int sockfd, const struct sockaddr *addr, uint32_t addrlen);
 
 // mman.h
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset);

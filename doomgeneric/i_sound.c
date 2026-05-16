@@ -57,8 +57,8 @@ char *snd_musiccmd = "";
 static sound_module_t *sound_module = NULL;
 static music_module_t *music_module = NULL;
 
-int snd_musicdevice = SNDDEVICE_SB;
-int snd_sfxdevice = SNDDEVICE_SB;
+int snd_musicdevice = SNDDEVICE_NONE;
+int snd_sfxdevice = SNDDEVICE_NONE;
 
 // DOS-specific options: These are unused but should be maintained
 // so that the config file can be shared between chocolate
@@ -171,8 +171,14 @@ void I_InitSound(boolean use_sfx_prefix)
 
     // Initialize the sound and music subsystems.
 
+    printf("[SDL] I_InitSound: nosound=%d screensaver=%d nosfx=%d nomusic=%d\n", nosound, screensaver_mode, nosfx, nomusic);
+
     if (!nosound && !screensaver_mode)
     {
+        // Force use of SDL module by setting device to SB if NONE
+        if (snd_sfxdevice == SNDDEVICE_NONE) snd_sfxdevice = SNDDEVICE_SB;
+        if (snd_musicdevice == SNDDEVICE_NONE) snd_musicdevice = SNDDEVICE_SB;
+
         // This is kind of a hack. If native MIDI is enabled, set up
         // the TIMIDITY_CFG environment variable here before SDL_mixer
         // is opened.

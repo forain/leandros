@@ -33,6 +33,7 @@ static struct drm_framebuffer back_fb;
 static uint32_t screen_width, screen_height;
 static uint32_t* scaling_buffer = NULL;
 static int double_buffered = 0;
+static int graphics_disabled = 0;
 
 // DRM ioctl commands
 #define DRM_IOCTL_SET_MODE      0x1001
@@ -69,12 +70,23 @@ static int drm_create_framebuffer(struct drm_framebuffer* fb, uint32_t width, ui
 
     fb->fb_id = create_data[3];
     fb->buffer = (void*)(unsigned long)create_data[4];
+    uint32_t mmap_offset = create_data[5];
+
+    printf("DOOM: DRM FB created (id=%d, size=%dx%d, offset=0x%x)\n", 
+           fb->fb_id, width, height, mmap_offset);
 
     // Check if we got a direct memory buffer or need to use file operations
     if (fb->buffer == NULL) {
-        printf("DOOM: DRM using file-based framebuffer access\n");
-        // We'll use write operations instead of direct memory access
-        // This is handled in the drawing code
+        printf("DOOM: DRM trying mmap for direct access...\n");
+        // Attempt to map the device memory directly
+        // PROT_READ | PROT_WRITE (3), MAP_SHARED (1)
+        void* mapped = mmap(NULL, width * height * 4, 3, 1, drm_fd, (long)mmap_offset);
+        if (mapped != (void*)-1) {
+            fb->buffer = mapped;
+            printf("DOOM: DRM successfully mmap'd framebuffer at %p\n", fb->buffer);
+        } else {
+            printf("DOOM: DRM mmap failed, using file-based framebuffer access\n");
+        }
     } else {
         printf("DOOM: DRM using direct memory buffer at %p\n", fb->buffer);
     }
@@ -112,7 +124,14 @@ static int drm_get_current_mode(struct drm_mode_info* mode) {
 static int drm_flip_page() {
     if (drm_fd < 0 || !double_buffered) return -1;
 
-    uint32_t flip_data[2] = { back_fb.fb_id, 0 }; // async flip
+    // Use hardware scaling: pass source framebuffer dimensions to DRM
+    uint32_t flip_data[4] = {
+        back_fb.fb_id,      // Framebuffer ID
+        0,                  // Flags (async flip)
+        DOOMGENERIC_RESX,   // Source width (320)
+        DOOMGENERIC_RESY    // Source height (200)
+    };
+
     return ioctl(drm_fd, DRM_IOCTL_FLIP_PAGE, (unsigned long)flip_data);
 }
 
@@ -136,8 +155,8 @@ void DG_Init() {
 
     // Try to open DRM device first
     printf("DOOM: Attempting DRM initialization...\n");
-    printf("DOOM: Opening device file: /dev/drm0\n");
-    drm_fd = open("/dev/drm0", 2, 0); // O_RDWR
+    printf("DOOM: Opening device file: /dev/dri/card0\n");
+    drm_fd = open("/dev/dri/card0", 2, 0); // O_RDWR
     printf("DOOM: open() returned fd = %d\n", drm_fd);
 
     if (drm_fd >= 0) {
@@ -152,23 +171,18 @@ void DG_Init() {
             printf("DOOM: DRM display mode: %dx%d@%dHz\n",
                    current_mode.width, current_mode.height, current_mode.refresh_rate);
 
-            // Create primary framebuffer
-            if (drm_create_framebuffer(&primary_fb, screen_width, screen_height) == 0) {
-                printf("DOOM: DRM primary framebuffer created\n");
+            // Create primary framebuffer at source resolution for hardware scaling
+            if (drm_create_framebuffer(&primary_fb, DOOMGENERIC_RESX, DOOMGENERIC_RESY) == 0) {
                 // Check for double buffering capability
                 int caps = drm_get_capabilities();
                 if (caps & 1) {
-                    // Create back buffer for double buffering
-                    if (drm_create_framebuffer(&back_fb, screen_width, screen_height) == 0) {
+                    // Create back buffer for double buffering at source resolution
+                    if (drm_create_framebuffer(&back_fb, DOOMGENERIC_RESX, DOOMGENERIC_RESY) == 0) {
                         double_buffered = 1;
                         printf("DOOM: DRM double buffering enabled\n");
                     }
                 }
 
-                // Allocate scaling buffer if needed
-                if (screen_width != DOOMGENERIC_RESX || screen_height != DOOMGENERIC_RESY) {
-                    scaling_buffer = malloc(screen_width * screen_height * 4);
-                }
                 return; // Success with DRM
             }
         }
@@ -259,37 +273,29 @@ static void fast_2x_scale(uint32_t* dest) {
 }
 
 void DG_DrawFrame() {
-    if (drm_fd < 0) {
-        // No output device available - just return
+    if (drm_fd < 0 || graphics_disabled) {
+        // No output device available or graphics disabled - just return
         return;
     }
 
     if (!use_drm) {
-        // Legacy framebuffer path - optimized for performance
+        // Legacy framebuffer path - always write native resolution
         static int first_frame = 1;
         if (first_frame) {
-            printf("DOOM: Rendering with legacy framebuffer (%dx%d)\n", screen_width, screen_height);
+            printf("DOOM: Rendering with legacy framebuffer (native %dx%d)\n", DOOMGENERIC_RESX, DOOMGENERIC_RESY);
             first_frame = 0;
         }
-        if (screen_width == DOOMGENERIC_RESX && screen_height == DOOMGENERIC_RESY) {
-            // Perfect match - direct write
-            lseek(drm_fd, 0, 0);
-            write(drm_fd, DG_ScreenBuffer, DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4);
-        } else if (scaling_buffer) {
-            // Check for common 2x scaling case for optimization
-            if (screen_width == DOOMGENERIC_RESX * 2 && screen_height == DOOMGENERIC_RESY * 2) {
-                // Use fast 2x scaling
-                fast_2x_scale(scaling_buffer);
-            } else {
-                // Use fast nearest neighbor scaling
-                fast_copy_frame(scaling_buffer, screen_width, screen_height);
-            }
-            lseek(drm_fd, 0, 0);
-            write(drm_fd, scaling_buffer, screen_width * screen_height * 4);
-        } else {
-            // Direct write without scaling
-            lseek(drm_fd, 0, 0);
-            write(drm_fd, DG_ScreenBuffer, DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4);
+        // For legacy framebuffer, always write native DOOM resolution
+        // Let the framebuffer console handle any scaling
+        lseek(drm_fd, 0, 0);
+        int legacy_result = write(drm_fd, DG_ScreenBuffer, DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4);
+
+        if (legacy_result < 0) {
+            // Legacy framebuffer write failed - disable graphics to prevent freeze
+            printf("DOOM: Legacy framebuffer write failed - disabling graphics output\n");
+            graphics_disabled = 1;
+            close(drm_fd);
+            drm_fd = -1;
         }
         return;
     }
@@ -313,63 +319,60 @@ void DG_DrawFrame() {
     }
 
     if (!target_buffer) {
-        // No direct memory access - fall back to file-based operations
-        // Use the same approach as legacy framebuffer mode
+        // No direct memory access - use hardware scaling with file operations
         static int first_fallback_msg = 1;
         if (first_fallback_msg) {
-            printf("DOOM: DRM using file-based framebuffer operations\n");
+            printf("DOOM: DRM using hardware-accelerated scaling via file operations\n");
             first_fallback_msg = 0;
         }
 
-        // Use scaling buffer for file operations
-        uint32_t* render_buffer = scaling_buffer;
-        if (!render_buffer) {
-            // No scaling buffer - use DOOM's screen buffer directly
-            render_buffer = DG_ScreenBuffer;
-        } else {
-            // Scale to target resolution
-            if (screen_width == DOOMGENERIC_RESX * 2 && screen_height == DOOMGENERIC_RESY * 2) {
-                fast_2x_scale(scaling_buffer);
-            } else {
-                fast_copy_frame(scaling_buffer, screen_width, screen_height);
-            }
-        }
-
-        // Try writing to DRM device first
-        size_t bytes_to_write = screen_width * screen_height * 4;
+        // Write DOOM's native resolution directly - let DRM hardware handle scaling
+        // No software scaling needed - hardware will scale 320x200 to display size
+        size_t bytes_to_write = DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4;
         lseek(drm_fd, 0, 0); // Seek to beginning
-        int result = write(drm_fd, render_buffer, bytes_to_write);
+        int result = write(drm_fd, DG_ScreenBuffer, bytes_to_write);
 
-        if (result < 0) {
-            // DRM write failed - fall back to /dev/fb0
+        if (result >= 0) {
+            // Trigger hardware scaling via page flip
+            drm_flip_page();
+        } else {
+            // DRM write failed - fall back to /dev/fb0 with software scaling
             static int fb0_fd = -1;
             static int fallback_warned = 0;
 
             if (fb0_fd < 0) {
                 fb0_fd = open("/dev/fb0", 1, 0); // O_WRONLY
                 if (!fallback_warned) {
-                    printf("DOOM: DRM write failed, falling back to /dev/fb0\n");
+                    printf("DOOM: DRM write failed, falling back to /dev/fb0 with software scaling\n");
                     fallback_warned = 1;
                 }
             }
 
             if (fb0_fd >= 0) {
+                // For /dev/fb0 fallback, write native resolution and let console scale
                 lseek(fb0_fd, 0, 0);
-                write(fb0_fd, render_buffer, bytes_to_write);
+                int fb_result = write(fb0_fd, DG_ScreenBuffer, DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4);
+
+                if (fb_result < 0) {
+                    // All graphics output has failed - disable rendering to prevent freeze
+                    static int no_graphics_warned = 0;
+                    if (!no_graphics_warned) {
+                        printf("DOOM: All graphics output failed - running in headless mode\n");
+                        no_graphics_warned = 1;
+                    }
+                    // Close the failed fd and disable all further graphics attempts
+                    close(fb0_fd);
+                    fb0_fd = -1;
+                    graphics_disabled = 1;
+                }
             }
         }
         return;
     }
 
-    // Direct memory access path
-    // Optimized scaling for DRM framebuffers
-    if (screen_width == DOOMGENERIC_RESX * 2 && screen_height == DOOMGENERIC_RESY * 2) {
-        // Fast 2x scaling
-        fast_2x_scale(target_buffer);
-    } else {
-        // Fast nearest neighbor scaling
-        fast_copy_frame(target_buffer, screen_width, screen_height);
-    }
+    // Direct memory access path with hardware scaling
+    // Simply copy DOOM's native framebuffer - hardware will handle scaling
+    __builtin_memcpy(target_buffer, DG_ScreenBuffer, DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4);
 
     // Flip buffers if double buffering is enabled
     if (double_buffered) {
@@ -587,4 +590,17 @@ int main(int argc, char **argv) {
     }
 
     return 0;
+}
+
+// Functions to expose DRM display dimensions to the video system
+int DG_GetDRMDisplayWidth(void) {
+    return (drm_fd >= 0) ? screen_width : 0;
+}
+
+int DG_GetDRMDisplayHeight(void) {
+    return (drm_fd >= 0) ? screen_height : 0;
+}
+
+int DG_IsDRMActive(void) {
+    return (drm_fd >= 0) ? 1 : 0;
 }
