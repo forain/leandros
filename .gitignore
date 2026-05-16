@@ -4,3 +4,13 @@ target/
 *.img
 *.vdi
 *.cpio.gz
+*.o
+*.cpio
+log
+*.snippet
+doomgeneric/doom
+doomgeneric/doom-aarch64
+doomgeneric/doom-x86_64
+doomgeneric/x86_64/
+doomgeneric/aarch64/
+doomgeneric/build/
