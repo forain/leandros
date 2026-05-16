@@ -49,9 +49,23 @@ if [ "$BOOT_MODE" = "uefi" ]; then
     for path in "${FW_PATHS[@]}"; do if [ -f "$path" ]; then UEFI_FIRMWARE="$path"; break; fi; done
     if [ -z "$UEFI_FIRMWARE" ]; then echo "❌ UEFI firmware not found"; exit 1; fi
     
-    QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 1G -serial mon:stdio -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" -device virtio-blk-pci,drive=drive0,bootindex=0 -no-reboot)
+    # Select audio backend
+    if [[ "$OS" == "Darwin" ]]; then
+        AUDIO_ARGS="-audiodev coreaudio,id=snd0"
+    else
+        AUDIO_ARGS="-audiodev pa,id=snd0"
+    fi
+
+    QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 1G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" -device virtio-blk-pci,drive=drive0,bootindex=0 -device virtio-gpu-pci -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
     exec $QEMU_SYSTEM "${QEMU_ARGS[@]}" "${QEMU_EXTRA_ARGS[@]}"
 else
+    # Select audio backend for direct boot as well
+    if [[ "$OS" == "Darwin" ]]; then
+        AUDIO_ARGS="-audiodev coreaudio,id=snd0"
+    else
+        AUDIO_ARGS="-audiodev pa,id=snd0"
+    fi
+
     if [ "$ARCH" = "aarch64" ]; then
         # Use FLAT BINARY for AArch64 to trigger QEMU Linux-style loader
         KERNEL_BIN="target/final-aarch64/kernel-direct.bin"
@@ -62,8 +76,10 @@ else
             -kernel "$KERNEL_BIN" \
             -initrd "initrd-aarch64.cpio" \
             -device virtio-gpu-pci \
+            -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -net none \
             -serial mon:stdio \
+            -parallel none \
             -no-reboot \
             "${QEMU_EXTRA_ARGS[@]}"
     else
@@ -80,6 +96,7 @@ else
             -kernel "$KERNEL_ELF" \
             -initrd "initrd-x86_64.cpio" \
             -device virtio-gpu-pci \
+            -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -net none \
             -serial mon:stdio \
             -no-reboot \

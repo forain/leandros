@@ -2020,8 +2020,12 @@ fn read_input_byte() -> Option<u8> {
                     57 => b' ', // Space
                     96 => b'\n', // KPEnter
                     _ => {
-                        // If it's already ASCII-range (e.g. from UART), use it as-is
-                        if ev.code < 128 && ev.code > 31 { ev.code as u8 } else { 0 }
+                        // If it's already ASCII-range (e.g. from UART), use it as-is.
+                        // Allow common control characters: Tab(9), LF(10), CR(13), BS(8/127).
+                        let c = ev.code;
+                        if c < 128 && (c > 31 || c == 10 || c == 13 || c == 9 || c == 127 || c == 8) {
+                            c as u8
+                        } else { 0 }
                     }
                 };
                 
@@ -2031,7 +2035,9 @@ fn read_input_byte() -> Option<u8> {
             }
             // Continue loop to skip EV_SYN or other events.
         } else {
-            return None;
+            // Fallback: poll serial UART directly if no evdev events are pending.
+            // This ensures input works on AArch64 serial console even if IRQs are missed.
+            return crate::serial_read_byte();
         }
     }
 }
