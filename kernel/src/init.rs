@@ -19,14 +19,35 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // ── In-Kernel Servers ──────────────────────────────────────────────────
     if let Some(vfs_port) = vfs_server::init(0) {
         crate::syscall::set_vfs_server_port(vfs_port);
+        serial_print_str("[INIT] VFS server port: ");
+        crate::print_number(vfs_port);
+        serial_print_str("\n");
     }
-    evdev_server::init(0);
+    if let Some(p) = evdev_server::init(0) {
+        serial_print_str("[INIT] evdev server port: ");
+        crate::print_number(p);
+        serial_print_str("\n");
+    }
 
     // Initialize DRM server and check for success
-    if drm_server::init(0).is_some() {
-        serial_print_str("[INIT] DRM server initialized successfully\n");
+    if let Some(p) = drm_server::init(0) {
+        serial_print_str("[INIT] DRM server port: ");
+        crate::print_number(p);
+        serial_print_str("\n");
     } else {
         serial_print_str("[INIT] ERROR: DRM server initialization failed\n");
+    }
+
+    // Initialize PipeWire server
+    match pipewire_server::init() {
+        Ok(p) => {
+            serial_print_str("[INIT] PipeWire server port: ");
+            crate::print_number(p);
+            serial_print_str("\n");
+        },
+        Err(_) => {
+            serial_print_str("[INIT] ERROR: PipeWire server initialization failed\n");
+        }
     }
 
     // ── Userspace Init ───────────────────────────────────────────────────────

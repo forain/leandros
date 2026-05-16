@@ -275,7 +275,31 @@ fn fd_to_slot(fd: usize) -> Option<usize> {
 
 // ── Public dispatch ───────────────────────────────────────────────────────────
 
+pub fn force_bind_unix(path_str: &str, _port: u32) {
+    let mut bound = BOUND_PATHS.lock();
+    let path_bytes = path_str.as_bytes();
+    let path_len = path_bytes.len().min(PATH_MAX);
+
+    if let Some(idx) = bound.iter().position(|b| !b.in_use) {
+        let mut path = [0u8; PATH_MAX];
+        path[..path_len].copy_from_slice(&path_bytes[..path_len]);
+        bound[idx] = BoundPath { 
+            in_use: true, 
+            path, 
+            path_len,
+            _owner_pid: 0, 
+            _owner_sock: 0 
+        };
+
+        // We also need a way for AF_UNIX to find this port during connect().
+        // In this minimal net-server, BoundPath is just a placeholder.
+        // Connecting to a BoundPath usually returns its owner's socket port.
+        // We'll update handle_connect to support this.
+    }
+}
+
 pub fn handle(msg: &Message, caller_pid: u32) -> Message {
+
     match msg.tag {
         NET_SOCKET     => handle_socket(caller_pid, arg(msg,0) as usize,
                                         arg(msg,1) as usize, arg(msg,2) as usize),
@@ -287,9 +311,9 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         NET_CONNECT    => handle_connect(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize),
         NET_SEND       => handle_send(caller_pid, arg(msg,0) as usize,
-                                      arg(msg,1) as usize, arg(msg,2) as usize),
+                                       arg(msg,1) as usize, arg(msg,2) as usize),
         NET_RECV       => handle_recv(caller_pid, arg(msg,0) as usize,
-                                      arg(msg,1) as usize, arg(msg,2) as usize),
+                                       arg(msg,1) as usize, arg(msg,2) as usize),
         NET_SENDMSG    => handle_sendmsg(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize),
         NET_RECVMSG    => handle_recvmsg(caller_pid, arg(msg,0) as usize,
@@ -311,7 +335,6 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         _              => err_reply(-38),
     }
 }
-
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 fn handle_socket(pid: u32, domain: usize, sock_type: usize, _protocol: usize) -> Message {
@@ -670,7 +693,12 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize) -> Message {
     if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
     let (conn_idx, is_a) = match tbl.socks[slot].state {
         SockState::Connected { conn_idx, is_a } => (conn_idx, is_a),
-        _ => return err_reply(-32), // EPIPE
+        _ => {
+            // Check if this socket is connected to a "forced" bound path (like PipeWire)
+            // In our minimal net-server, we just check if it's connected to nothing.
+            // For a real fix, we would need to store the target port in SockState.
+            return err_reply(-32);
+        }
     };
     drop(tbls);
 

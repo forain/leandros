@@ -1,0 +1,11 @@
+[package]
+name = "pipewire-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+drivers = { path = "../../drivers" }
+ipc = { path = "../../ipc" }
+vfs-server = { path = "../vfs" }
+net-server = { path = "../net" }
+spin.workspace = true

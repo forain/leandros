@@ -131,6 +131,7 @@ dependencies = [
  "miniz_oxide",
  "mm",
  "net-server",
+ "pipewire-server",
  "sched",
  "spin",
  "tty-server",
@@ -194,6 +195,17 @@ dependencies = [
  "ipc",
  "sched",
  "spin",
+]
+
+[[package]]
+name = "pipewire-server"
+version = "0.1.0"
+dependencies = [
+ "drivers",
+ "ipc",
+ "net-server",
+ "spin",
+ "vfs-server",
 ]
 
 [[package]]
