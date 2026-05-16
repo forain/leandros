@@ -163,10 +163,10 @@ impl ModeValidator {
         const M: f32 = 600.0;          // Gradient (%/kHz)
         const C: f32 = 40.0;           // Offset (μs)
         const K: f32 = 128.0;          // Scaling factor
-        const J: f32 = 20.0;           // Offset (%)
 
         // Calculate horizontal timing
-        let h_period_est = ((1.0 / refresh_rate) - (C / 1000000.0)) / (v_lines + (2.0 * M / K)) * 1000000.0;
+        let _h_period_est = ((1.0 / refresh_rate) - (C / 1000000.0)) / (v_lines + (2.0 * M / K)) * 1000000.0;
+
         let h_sync_width = ((h_pixels * 8.0 / 100.0) + 0.5) as u16;
         let h_back_porch = h_sync_width;
         let h_front_porch = h_sync_width;

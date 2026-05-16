@@ -2,9 +2,9 @@
 //!
 //! Defines the fundamental DRM objects and their relationships.
 
-use alloc::{vec::Vec, vec, boxed::Box};
+use alloc::vec::Vec;
 use spin::Mutex;
-use super::super::{Driver, DriverError};
+use super::super::DriverError;
 
 /// DRM object types
 #[repr(u32)]

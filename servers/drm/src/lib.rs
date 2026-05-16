@@ -71,7 +71,7 @@ fn handle(msg: &Message, _port: u32) -> Message {
         // Check message type
         if msg.tag == 0x28 { // VFS_IOCTL
             // Decode ioctl parameters from VFS message format
-            let dev_id = arg(msg, 0) as u32;
+            let _dev_id = arg(msg, 0) as u32;
             let cmd = arg(msg, 1) as u32;
             let arg_val = arg(msg, 2) as usize;
 

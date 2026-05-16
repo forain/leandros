@@ -1,6 +1,6 @@
 //! DRM authentication and security model
 
-use alloc::{vec::Vec, vec};
+use alloc::vec::Vec;
 use spin::Mutex;
 
 /// DRM authentication token

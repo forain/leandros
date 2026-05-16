@@ -5,7 +5,6 @@
 
 use alloc::{string::{String, ToString}, vec::Vec, format};
 use super::drm_console::*;
-use super::drm::ModeSet;
 
 /// Console command handler
 pub struct ConsoleCommands;

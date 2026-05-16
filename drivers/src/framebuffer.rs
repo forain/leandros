@@ -8,7 +8,7 @@
 
 use spin::Mutex;
 use super::{Driver, DriverError};
-use crate::vector_font::{VectorFont, get_fira_code_char, include_fira_code_ttf};
+use crate::vector_font::{VectorFont, get_fira_code_char};
 
 // ── Boot-time registration ────────────────────────────────────────────────────
 
