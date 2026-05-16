@@ -9,6 +9,8 @@
 extern crate alloc;
 
 pub mod serial;
+pub mod pci;
+pub mod snd;
 pub mod framebuffer;
 pub mod kms;
 pub mod vector_font;
