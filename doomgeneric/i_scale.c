@@ -70,7 +70,7 @@ void I_InitScale(byte *_src_buffer, byte *_dest_buffer, int _dest_pitch)
 //
 
 // 1x scale doesn't really do any scaling: it just copies the buffer
-// a line at a time for when pitch != SCREENWIDTH (!native_surface)
+// a line at a time for when pitch != 320 (!native_surface)
 
 static boolean I_Scale1x(int x1, int y1, int x2, int y2)
 {
@@ -80,21 +80,21 @@ static boolean I_Scale1x(int x1, int y1, int x2, int y2)
     
     // Need to byte-copy from buffer into the screen buffer
 
-    bufp = src_buffer + y1 * SCREENWIDTH + x1;
+    bufp = src_buffer + y1 * 320 + x1;
     screenp = (byte *) dest_buffer + y1 * dest_pitch + x1;
 
     for (y=y1; y<y2; ++y)
     {
         memcpy(screenp, bufp, w);
         screenp += dest_pitch;
-        bufp += SCREENWIDTH;
+        bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_scale_1x = {
-    SCREENWIDTH, SCREENHEIGHT,
+    320, 200,
     NULL,
     I_Scale1x,
     false,
@@ -109,7 +109,7 @@ static boolean I_Scale2x(int x1, int y1, int x2, int y2)
     int multi_pitch;
 
     multi_pitch = dest_pitch * 2;
-    bufp = src_buffer + y1 * SCREENWIDTH + x1;
+    bufp = src_buffer + y1 * 320 + x1;
     screenp = (byte *) dest_buffer + (y1 * dest_pitch + x1) * 2;
     screenp2 = screenp + dest_pitch;
 
@@ -128,14 +128,14 @@ static boolean I_Scale2x(int x1, int y1, int x2, int y2)
         }
         screenp += multi_pitch;
         screenp2 += multi_pitch;
-        bufp += SCREENWIDTH;
+        bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_scale_2x = {
-    SCREENWIDTH * 2, SCREENHEIGHT * 2,
+    320 * 2, 200 * 2,
     NULL,
     I_Scale2x,
     false,
@@ -150,7 +150,7 @@ static boolean I_Scale3x(int x1, int y1, int x2, int y2)
     int multi_pitch;
 
     multi_pitch = dest_pitch * 3;
-    bufp = src_buffer + y1 * SCREENWIDTH + x1;
+    bufp = src_buffer + y1 * 320 + x1;
     screenp = (byte *) dest_buffer + (y1 * dest_pitch + x1) * 3;
     screenp2 = screenp + dest_pitch;
     screenp3 = screenp + dest_pitch * 2;
@@ -173,14 +173,14 @@ static boolean I_Scale3x(int x1, int y1, int x2, int y2)
         screenp += multi_pitch;
         screenp2 += multi_pitch;
         screenp3 += multi_pitch;
-        bufp += SCREENWIDTH;
+        bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_scale_3x = {
-    SCREENWIDTH * 3, SCREENHEIGHT * 3,
+    320 * 3, 200 * 3,
     NULL,
     I_Scale3x,
     false,
@@ -195,7 +195,7 @@ static boolean I_Scale4x(int x1, int y1, int x2, int y2)
     int multi_pitch;
 
     multi_pitch = dest_pitch * 4;
-    bufp = src_buffer + y1 * SCREENWIDTH + x1;
+    bufp = src_buffer + y1 * 320 + x1;
     screenp = (byte *) dest_buffer + (y1 * dest_pitch + x1) * 4;
     screenp2 = screenp + dest_pitch;
     screenp3 = screenp + dest_pitch * 2;
@@ -222,14 +222,14 @@ static boolean I_Scale4x(int x1, int y1, int x2, int y2)
         screenp2 += multi_pitch;
         screenp3 += multi_pitch;
         screenp4 += multi_pitch;
-        bufp += SCREENWIDTH;
+        bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_scale_4x = {
-    SCREENWIDTH * 4, SCREENHEIGHT * 4,
+    320 * 4, 200 * 4,
     NULL,
     I_Scale4x,
     false,
@@ -244,7 +244,7 @@ static boolean I_Scale5x(int x1, int y1, int x2, int y2)
     int multi_pitch;
 
     multi_pitch = dest_pitch * 5;
-    bufp = src_buffer + y1 * SCREENWIDTH + x1;
+    bufp = src_buffer + y1 * 320 + x1;
     screenp = (byte *) dest_buffer + (y1 * dest_pitch + x1) * 5;
     screenp2 = screenp + dest_pitch;
     screenp3 = screenp + dest_pitch * 2;
@@ -275,14 +275,14 @@ static boolean I_Scale5x(int x1, int y1, int x2, int y2)
         screenp3 += multi_pitch;
         screenp4 += multi_pitch;
         screenp5 += multi_pitch;
-        bufp += SCREENWIDTH;
+        bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_scale_5x = {
-    SCREENWIDTH * 5, SCREENHEIGHT * 5,
+    320 * 5, 200 * 5,
     NULL,
     I_Scale5x,
     false,
@@ -436,7 +436,7 @@ static inline void WriteBlendedLine1x(byte *dest, byte *src1, byte *src2,
 {
     int x;
 
-    for (x=0; x<SCREENWIDTH; ++x)
+    for (x=0; x<320; ++x)
     {
         *dest = stretch_table[*src1 * 256 + *src2];
         ++dest;
@@ -454,51 +454,51 @@ static boolean I_Stretch1x(int x1, int y1, int x2, int y2)
 
     // Only works with full screen update
 
-    if (x1 != 0 || y1 != 0 || x2 != SCREENWIDTH || y2 != SCREENHEIGHT)
+    if (x1 != 0 || y1 != 0 || x2 != 320 || y2 != 200)
     {
         return false;
     }    
 
     // Need to byte-copy from buffer into the screen buffer
 
-    bufp = src_buffer + y1 * SCREENWIDTH + x1;
+    bufp = src_buffer + y1 * 320 + x1;
     screenp = (byte *) dest_buffer + y1 * dest_pitch + x1;
 
     // For every 5 lines of src_buffer, 6 lines are written to dest_buffer
     // (200 -> 240)
 
-    for (y=0; y<SCREENHEIGHT; y += 5)
+    for (y=0; y<200; y += 5)
     {
         // 100% line 0
-        memcpy(screenp, bufp, SCREENWIDTH);
+        memcpy(screenp, bufp, 320);
         screenp += dest_pitch;
 
         // 20% line 0, 80% line 1
-        WriteBlendedLine1x(screenp, bufp, bufp + SCREENWIDTH, stretch_tables[0]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine1x(screenp, bufp, bufp + 320, stretch_tables[0]);
+        screenp += dest_pitch; bufp += 320;
 
         // 40% line 1, 60% line 2
-        WriteBlendedLine1x(screenp, bufp, bufp + SCREENWIDTH, stretch_tables[1]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine1x(screenp, bufp, bufp + 320, stretch_tables[1]);
+        screenp += dest_pitch; bufp += 320;
 
         // 60% line 2, 40% line 3
-        WriteBlendedLine1x(screenp, bufp + SCREENWIDTH, bufp, stretch_tables[1]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine1x(screenp, bufp + 320, bufp, stretch_tables[1]);
+        screenp += dest_pitch; bufp += 320;
 
         // 80% line 3, 20% line 4
-        WriteBlendedLine1x(screenp, bufp + SCREENWIDTH, bufp, stretch_tables[0]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine1x(screenp, bufp + 320, bufp, stretch_tables[0]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 4
-        memcpy(screenp, bufp, SCREENWIDTH);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        memcpy(screenp, bufp, 320);
+        screenp += dest_pitch; bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_stretch_1x = {
-    SCREENWIDTH, SCREENHEIGHT_4_3,
+    320, 240,
     I_InitStretchTables,
     I_Stretch1x,
     true,
@@ -508,7 +508,7 @@ static inline void WriteLine2x(byte *dest, byte *src)
 {
     int x;
 
-    for (x=0; x<SCREENWIDTH; ++x)
+    for (x=0; x<320; ++x)
     {
         dest[0] = *src;
         dest[1] = *src;
@@ -523,7 +523,7 @@ static inline void WriteBlendedLine2x(byte *dest, byte *src1, byte *src2,
     int x;
     int val;
 
-    for (x=0; x<SCREENWIDTH; ++x)
+    for (x=0; x<320; ++x)
     {
         val = stretch_table[*src1 * 256 + *src2];
         dest[0] = val;
@@ -543,20 +543,20 @@ static boolean I_Stretch2x(int x1, int y1, int x2, int y2)
 
     // Only works with full screen update
 
-    if (x1 != 0 || y1 != 0 || x2 != SCREENWIDTH || y2 != SCREENHEIGHT)
+    if (x1 != 0 || y1 != 0 || x2 != 320 || y2 != 200)
     {
         return false;
     }    
 
     // Need to byte-copy from buffer into the screen buffer
 
-    bufp = src_buffer + y1 * SCREENWIDTH + x1;
+    bufp = src_buffer + y1 * 320 + x1;
     screenp = (byte *) dest_buffer + y1 * dest_pitch + x1;
 
     // For every 5 lines of src_buffer, 12 lines are written to dest_buffer.
     // (200 -> 480)
 
-    for (y=0; y<SCREENHEIGHT; y += 5)
+    for (y=0; y<200; y += 5)
     {
         // 100% line 0
         WriteLine2x(screenp, bufp);
@@ -567,16 +567,16 @@ static boolean I_Stretch2x(int x1, int y1, int x2, int y2)
         screenp += dest_pitch;
 
         // 40% line 0, 60% line 1
-        WriteBlendedLine2x(screenp, bufp, bufp + SCREENWIDTH, stretch_tables[1]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine2x(screenp, bufp, bufp + 320, stretch_tables[1]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 1
         WriteLine2x(screenp, bufp);
         screenp += dest_pitch;
 
         // 80% line 1, 20% line 2
-        WriteBlendedLine2x(screenp, bufp + SCREENWIDTH, bufp, stretch_tables[0]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine2x(screenp, bufp + 320, bufp, stretch_tables[0]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 2
         WriteLine2x(screenp, bufp);
@@ -587,16 +587,16 @@ static boolean I_Stretch2x(int x1, int y1, int x2, int y2)
         screenp += dest_pitch;
 
         // 20% line 2, 80% line 3
-        WriteBlendedLine2x(screenp, bufp, bufp + SCREENWIDTH, stretch_tables[0]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine2x(screenp, bufp, bufp + 320, stretch_tables[0]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 3
         WriteLine2x(screenp, bufp);
         screenp += dest_pitch;
 
         // 60% line 3, 40% line 4
-        WriteBlendedLine2x(screenp, bufp + SCREENWIDTH, bufp, stretch_tables[1]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine2x(screenp, bufp + 320, bufp, stretch_tables[1]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 4
         WriteLine2x(screenp, bufp);
@@ -604,14 +604,14 @@ static boolean I_Stretch2x(int x1, int y1, int x2, int y2)
 
         // 100% line 4
         WriteLine2x(screenp, bufp);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        screenp += dest_pitch; bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_stretch_2x = {
-    SCREENWIDTH * 2, SCREENHEIGHT_4_3 * 2,
+    320 * 2, 240 * 2,
     I_InitStretchTables,
     I_Stretch2x,
     false,
@@ -621,7 +621,7 @@ static inline void WriteLine3x(byte *dest, byte *src)
 {
     int x;
 
-    for (x=0; x<SCREENWIDTH; ++x)
+    for (x=0; x<320; ++x)
     {
         dest[0] = *src;
         dest[1] = *src;
@@ -637,7 +637,7 @@ static inline void WriteBlendedLine3x(byte *dest, byte *src1, byte *src2,
     int x;
     int val;
 
-    for (x=0; x<SCREENWIDTH; ++x)
+    for (x=0; x<320; ++x)
     {
         val = stretch_table[*src1 * 256 + *src2];
         dest[0] = val;
@@ -658,20 +658,20 @@ static boolean I_Stretch3x(int x1, int y1, int x2, int y2)
 
     // Only works with full screen update
 
-    if (x1 != 0 || y1 != 0 || x2 != SCREENWIDTH || y2 != SCREENHEIGHT)
+    if (x1 != 0 || y1 != 0 || x2 != 320 || y2 != 200)
     {
         return false;
     }    
 
     // Need to byte-copy from buffer into the screen buffer
 
-    bufp = src_buffer + y1 * SCREENWIDTH + x1;
+    bufp = src_buffer + y1 * 320 + x1;
     screenp = (byte *) dest_buffer + y1 * dest_pitch + x1;
 
     // For every 5 lines of src_buffer, 18 lines are written to dest_buffer.
     // (200 -> 720)
 
-    for (y=0; y<SCREENHEIGHT; y += 5)
+    for (y=0; y<200; y += 5)
     {
         // 100% line 0
         WriteLine3x(screenp, bufp);
@@ -686,8 +686,8 @@ static boolean I_Stretch3x(int x1, int y1, int x2, int y2)
         screenp += dest_pitch;
 
         // 60% line 0, 40% line 1
-        WriteBlendedLine3x(screenp, bufp + SCREENWIDTH, bufp, stretch_tables[1]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine3x(screenp, bufp + 320, bufp, stretch_tables[1]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 1
         WriteLine3x(screenp, bufp);
@@ -702,8 +702,8 @@ static boolean I_Stretch3x(int x1, int y1, int x2, int y2)
         screenp += dest_pitch;
 
         // 20% line 1, 80% line 2
-        WriteBlendedLine3x(screenp, bufp, bufp + SCREENWIDTH, stretch_tables[0]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine3x(screenp, bufp, bufp + 320, stretch_tables[0]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 2
         WriteLine3x(screenp, bufp);
@@ -714,8 +714,8 @@ static boolean I_Stretch3x(int x1, int y1, int x2, int y2)
         screenp += dest_pitch;
 
         // 80% line 2, 20% line 3
-        WriteBlendedLine3x(screenp, bufp + SCREENWIDTH, bufp, stretch_tables[0]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine3x(screenp, bufp + 320, bufp, stretch_tables[0]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 3
         WriteLine3x(screenp, bufp);
@@ -730,8 +730,8 @@ static boolean I_Stretch3x(int x1, int y1, int x2, int y2)
         screenp += dest_pitch;
 
         // 40% line 3, 60% line 4
-        WriteBlendedLine3x(screenp, bufp, bufp + SCREENWIDTH, stretch_tables[1]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine3x(screenp, bufp, bufp + 320, stretch_tables[1]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 4
         WriteLine3x(screenp, bufp);
@@ -743,14 +743,14 @@ static boolean I_Stretch3x(int x1, int y1, int x2, int y2)
 
         // 100% line 4
         WriteLine3x(screenp, bufp);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        screenp += dest_pitch; bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_stretch_3x = {
-    SCREENWIDTH * 3, SCREENHEIGHT_4_3 * 3,
+    320 * 3, 240 * 3,
     I_InitStretchTables,
     I_Stretch3x,
     false,
@@ -760,7 +760,7 @@ static inline void WriteLine4x(byte *dest, byte *src)
 {
     int x;
 
-    for (x=0; x<SCREENWIDTH; ++x)
+    for (x=0; x<320; ++x)
     {
         dest[0] = *src;
         dest[1] = *src;
@@ -777,7 +777,7 @@ static inline void WriteBlendedLine4x(byte *dest, byte *src1, byte *src2,
     int x;
     int val;
 
-    for (x=0; x<SCREENWIDTH; ++x)
+    for (x=0; x<320; ++x)
     {
         val = stretch_table[*src1 * 256 + *src2];
         dest[0] = val;
@@ -799,20 +799,20 @@ static boolean I_Stretch4x(int x1, int y1, int x2, int y2)
 
     // Only works with full screen update
 
-    if (x1 != 0 || y1 != 0 || x2 != SCREENWIDTH || y2 != SCREENHEIGHT)
+    if (x1 != 0 || y1 != 0 || x2 != 320 || y2 != 200)
     {
         return false;
     }    
 
     // Need to byte-copy from buffer into the screen buffer
 
-    bufp = src_buffer + y1 * SCREENWIDTH + x1;
+    bufp = src_buffer + y1 * 320 + x1;
     screenp = (byte *) dest_buffer + y1 * dest_pitch + x1;
 
     // For every 5 lines of src_buffer, 24 lines are written to dest_buffer.
     // (200 -> 960)
 
-    for (y=0; y<SCREENHEIGHT; y += 5)
+    for (y=0; y<200; y += 5)
     {
         // 100% line 0
         WriteLine4x(screenp, bufp);
@@ -831,8 +831,8 @@ static boolean I_Stretch4x(int x1, int y1, int x2, int y2)
         screenp += dest_pitch;
 
         // 90% line 0, 20% line 1
-        WriteBlendedLine4x(screenp, bufp + SCREENWIDTH, bufp, stretch_tables[0]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine4x(screenp, bufp + 320, bufp, stretch_tables[0]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 1
         WriteLine4x(screenp, bufp);
@@ -851,8 +851,8 @@ static boolean I_Stretch4x(int x1, int y1, int x2, int y2)
         screenp += dest_pitch;
 
         // 60% line 1, 40% line 2
-        WriteBlendedLine4x(screenp, bufp + SCREENWIDTH, bufp, stretch_tables[1]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine4x(screenp, bufp + 320, bufp, stretch_tables[1]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 2
         WriteLine4x(screenp, bufp);
@@ -871,8 +871,8 @@ static boolean I_Stretch4x(int x1, int y1, int x2, int y2)
         screenp += dest_pitch;
 
         // 40% line 2, 60% line 3
-        WriteBlendedLine4x(screenp, bufp, bufp + SCREENWIDTH, stretch_tables[1]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine4x(screenp, bufp, bufp + 320, stretch_tables[1]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 3
         WriteLine4x(screenp, bufp);
@@ -891,8 +891,8 @@ static boolean I_Stretch4x(int x1, int y1, int x2, int y2)
         screenp += dest_pitch;
 
         // 20% line 3, 80% line 4
-        WriteBlendedLine4x(screenp, bufp, bufp + SCREENWIDTH, stretch_tables[0]);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        WriteBlendedLine4x(screenp, bufp, bufp + 320, stretch_tables[0]);
+        screenp += dest_pitch; bufp += 320;
 
         // 100% line 4
         WriteLine4x(screenp, bufp);
@@ -908,14 +908,14 @@ static boolean I_Stretch4x(int x1, int y1, int x2, int y2)
 
         // 100% line 4
         WriteLine4x(screenp, bufp);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        screenp += dest_pitch; bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_stretch_4x = {
-    SCREENWIDTH * 4, SCREENHEIGHT_4_3 * 4,
+    320 * 4, 240 * 4,
     I_InitStretchTables,
     I_Stretch4x,
     false,
@@ -925,7 +925,7 @@ static inline void WriteLine5x(byte *dest, byte *src)
 {
     int x;
 
-    for (x=0; x<SCREENWIDTH; ++x)
+    for (x=0; x<320; ++x)
     {
         dest[0] = *src;
         dest[1] = *src;
@@ -946,20 +946,20 @@ static boolean I_Stretch5x(int x1, int y1, int x2, int y2)
 
     // Only works with full screen update
 
-    if (x1 != 0 || y1 != 0 || x2 != SCREENWIDTH || y2 != SCREENHEIGHT)
+    if (x1 != 0 || y1 != 0 || x2 != 320 || y2 != 200)
     {
         return false;
     }    
 
     // Need to byte-copy from buffer into the screen buffer
 
-    bufp = src_buffer + y1 * SCREENWIDTH + x1;
+    bufp = src_buffer + y1 * 320 + x1;
     screenp = (byte *) dest_buffer + y1 * dest_pitch + x1;
 
     // For every 1 line of src_buffer, 6 lines are written to dest_buffer.
     // (200 -> 1200)
 
-    for (y=0; y<SCREENHEIGHT; y += 1)
+    for (y=0; y<200; y += 1)
     {
         // 100% line 0
         WriteLine5x(screenp, bufp);
@@ -983,7 +983,7 @@ static boolean I_Stretch5x(int x1, int y1, int x2, int y2)
 
         // 100% line 0
         WriteLine5x(screenp, bufp);
-        screenp += dest_pitch; bufp += SCREENWIDTH;
+        screenp += dest_pitch; bufp += 320;
     }
 
     // test hack for Porsche Monty... scan line simulation:
@@ -1005,7 +1005,7 @@ static boolean I_Stretch5x(int x1, int y1, int x2, int y2)
 }
 
 screen_mode_t mode_stretch_5x = {
-    SCREENWIDTH * 5, SCREENHEIGHT_4_3 * 5,
+    320 * 5, 240 * 5,
     I_InitStretchTables,
     I_Stretch5x,
     false,
@@ -1031,7 +1031,7 @@ static inline void WriteSquashedLine1x(byte *dest, byte *src)
 {
     int x;
 
-    for (x=0; x<SCREENWIDTH; )
+    for (x=0; x<320; )
     {
         // Draw in blocks of 5
 
@@ -1065,7 +1065,7 @@ static boolean I_Squash1x(int x1, int y1, int x2, int y2)
 
     // Only works with full screen update
 
-    if (x1 != 0 || y1 != 0 || x2 != SCREENWIDTH || y2 != SCREENHEIGHT)
+    if (x1 != 0 || y1 != 0 || x2 != 320 || y2 != 200)
     {
         return false;
     }    
@@ -1073,19 +1073,19 @@ static boolean I_Squash1x(int x1, int y1, int x2, int y2)
     bufp = src_buffer;
     screenp = (byte *) dest_buffer;
 
-    for (y=0; y<SCREENHEIGHT; ++y) 
+    for (y=0; y<200; ++y) 
     {
         WriteSquashedLine1x(screenp, bufp);
 
         screenp += dest_pitch;
-        bufp += SCREENWIDTH;
+        bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_squash_1x = {
-    SCREENWIDTH_4_3, SCREENHEIGHT,
+    256, 200,
     I_InitStretchTables,
     I_Squash1x,
     true,
@@ -1106,7 +1106,7 @@ static inline void WriteSquashedLine2x(byte *dest, byte *src)
 
     dest2 = dest + dest_pitch;
 
-    for (x=0; x<SCREENWIDTH; )
+    for (x=0; x<320; )
     {
         // Draw in blocks of 5
 
@@ -1164,7 +1164,7 @@ static boolean I_Squash2x(int x1, int y1, int x2, int y2)
 
     // Only works with full screen update
 
-    if (x1 != 0 || y1 != 0 || x2 != SCREENWIDTH || y2 != SCREENHEIGHT)
+    if (x1 != 0 || y1 != 0 || x2 != 320 || y2 != 200)
     {
         return false;
     }    
@@ -1172,19 +1172,19 @@ static boolean I_Squash2x(int x1, int y1, int x2, int y2)
     bufp = src_buffer;
     screenp = (byte *) dest_buffer;
 
-    for (y=0; y<SCREENHEIGHT; ++y) 
+    for (y=0; y<200; ++y) 
     {
         WriteSquashedLine2x(screenp, bufp);
 
         screenp += dest_pitch * 2;
-        bufp += SCREENWIDTH;
+        bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_squash_2x = {
-    SCREENWIDTH_4_3 * 2, SCREENHEIGHT * 2,
+    256 * 2, 200 * 2,
     I_InitStretchTables,
     I_Squash2x,
     false,
@@ -1202,7 +1202,7 @@ static inline void WriteSquashedLine3x(byte *dest, byte *src)
     dest2 = dest + dest_pitch;
     dest3 = dest + dest_pitch * 2;
 
-    for (x=0; x<SCREENWIDTH; )
+    for (x=0; x<320; )
     {
         // Every 2 pixels is expanded to 5 pixels
 
@@ -1247,7 +1247,7 @@ static boolean I_Squash3x(int x1, int y1, int x2, int y2)
 
     // Only works with full screen update
 
-    if (x1 != 0 || y1 != 0 || x2 != SCREENWIDTH || y2 != SCREENHEIGHT)
+    if (x1 != 0 || y1 != 0 || x2 != 320 || y2 != 200)
     {
         return false;
     }    
@@ -1255,12 +1255,12 @@ static boolean I_Squash3x(int x1, int y1, int x2, int y2)
     bufp = src_buffer;
     screenp = (byte *) dest_buffer;
 
-    for (y=0; y<SCREENHEIGHT; ++y) 
+    for (y=0; y<200; ++y) 
     {
         WriteSquashedLine3x(screenp, bufp);
 
         screenp += dest_pitch * 3;
-        bufp += SCREENWIDTH;
+        bufp += 320;
     }
 
     return true;
@@ -1286,7 +1286,7 @@ static inline void WriteSquashedLine4x(byte *dest, byte *src)
     dest3 = dest + dest_pitch * 2;
     dest4 = dest + dest_pitch * 3;
 
-    for (x=0; x<SCREENWIDTH; )
+    for (x=0; x<320; )
     {
         // Draw in blocks of 5
 
@@ -1358,7 +1358,7 @@ static boolean I_Squash4x(int x1, int y1, int x2, int y2)
 
     // Only works with full screen update
 
-    if (x1 != 0 || y1 != 0 || x2 != SCREENWIDTH || y2 != SCREENHEIGHT)
+    if (x1 != 0 || y1 != 0 || x2 != 320 || y2 != 200)
     {
         return false;
     }    
@@ -1366,19 +1366,19 @@ static boolean I_Squash4x(int x1, int y1, int x2, int y2)
     bufp = src_buffer;
     screenp = (byte *) dest_buffer;
 
-    for (y=0; y<SCREENHEIGHT; ++y) 
+    for (y=0; y<200; ++y) 
     {
         WriteSquashedLine4x(screenp, bufp);
 
         screenp += dest_pitch * 4;
-        bufp += SCREENWIDTH;
+        bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_squash_4x = {
-    SCREENWIDTH_4_3 * 4, SCREENHEIGHT * 4,
+    256 * 4, 200 * 4,
     I_InitStretchTables,
     I_Squash4x,
     false,
@@ -1398,7 +1398,7 @@ static inline void WriteSquashedLine5x(byte *dest, byte *src)
     dest4 = dest + dest_pitch * 3;
     dest5 = dest + dest_pitch * 4;
 
-    for (x=0; x<SCREENWIDTH; ++x)
+    for (x=0; x<320; ++x)
     {
         // Draw in blocks of 5
 
@@ -1423,7 +1423,7 @@ static boolean I_Squash5x(int x1, int y1, int x2, int y2)
 
     // Only works with full screen update
 
-    if (x1 != 0 || y1 != 0 || x2 != SCREENWIDTH || y2 != SCREENHEIGHT)
+    if (x1 != 0 || y1 != 0 || x2 != 320 || y2 != 200)
     {
         return false;
     }    
@@ -1431,19 +1431,19 @@ static boolean I_Squash5x(int x1, int y1, int x2, int y2)
     bufp = src_buffer;
     screenp = (byte *) dest_buffer;
 
-    for (y=0; y<SCREENHEIGHT; ++y) 
+    for (y=0; y<200; ++y) 
     {
         WriteSquashedLine5x(screenp, bufp);
 
         screenp += dest_pitch * 5;
-        bufp += SCREENWIDTH;
+        bufp += 320;
     }
 
     return true;
 }
 
 screen_mode_t mode_squash_5x = {
-    SCREENWIDTH_4_3 * 5, SCREENHEIGHT * 5,
+    256 * 5, 200 * 5,
     I_InitStretchTables,
     I_Squash5x,
     false,

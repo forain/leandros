@@ -33,6 +33,7 @@ extern vissprite_t	vsprsortedhead;
 extern short		negonearray[SCREENWIDTH];
 extern short		screenheightarray[SCREENWIDTH];
 
+
 // vars for R_DrawMaskedColumn
 extern short*		mfloorclip;
 extern short*		mceilingclip;

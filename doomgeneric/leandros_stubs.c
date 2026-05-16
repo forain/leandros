@@ -147,6 +147,25 @@ int toupper(int c) {
     return c;
 }
 
+int tolower(int c) {
+    if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
+    return c;
+}
+
+int atexit(void (*function)(void)) {
+    return 0; // Stub
+}
+
+int DG_IsDRMActive(void) {
+#ifdef USE_SDL
+    return 1;
+#elif defined(USE_DRM)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 int strncasecmp(const char *s1, const char *s2, size_t n) {
     if (n == 0) return 0;
     while (n-- > 0) {
@@ -191,3 +210,13 @@ int fseek(FILE* stream, long offset, int whence) { return 0; }
 long ftell(FILE* stream) { return 0; }
 int remove(const char* pathname) { return -1; }
 int rename(const char* oldpath, const char* newpath) { return -1; }
+
+int feof(FILE *stream) { return 0; }
+char *getenv(const char *name) { return NULL; }
+int putenv(char *string) { return 0; }
+
+// SHA1 stubs
+typedef struct { uint32_t state[5]; uint32_t count[2]; unsigned char buffer[64]; } SHA1_CTX;
+void SHA1_Init(SHA1_CTX *context) {}
+void SHA1_Update(SHA1_CTX *context, const unsigned char *data, uint32_t len) {}
+void SHA1_Final(unsigned char digest[20], SHA1_CTX *context) {}

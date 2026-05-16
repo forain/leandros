@@ -10,6 +10,50 @@
 #include <stdbool.h>
 #include <SDL.h>
 
+struct drm_mode_card_res {
+    uint64_t fb_id_ptr;
+    uint64_t crtc_id_ptr;
+    uint64_t connector_id_ptr;
+    uint64_t encoder_id_ptr;
+    uint32_t count_fbs;
+    uint32_t count_crtcs;
+    uint32_t count_connectors;
+    uint32_t count_encoders;
+    uint32_t min_width;
+    uint32_t max_width;
+    uint32_t min_height;
+    uint32_t max_height;
+};
+
+struct drm_mode_modeinfo {
+    uint32_t clock;
+    uint16_t hdisplay, hsync_start, hsync_end, htotal, hskew;
+    uint16_t vdisplay, vsync_start, vsync_end, vtotal, vscan;
+    uint32_t vrefresh;
+    uint32_t flags;
+    uint32_t type;
+    char name[32];
+};
+
+struct drm_mode_get_connector {
+    uint64_t encoders_ptr;
+    uint64_t modes_ptr;
+    uint64_t props_ptr;
+    uint64_t prop_values_ptr;
+    uint32_t count_modes;
+    uint32_t count_props;
+    uint32_t count_encoders;
+    uint32_t encoder_id;
+    uint32_t connector_id;
+    uint32_t connector_type;
+    uint32_t connector_type_id;
+    uint32_t connection;
+    uint32_t mm_width;
+    uint32_t mm_height;
+    uint32_t subpixel;
+    uint32_t pad;
+};
+
 SDL_Window* window = NULL;
 SDL_Renderer* renderer = NULL;
 SDL_Texture* texture;
