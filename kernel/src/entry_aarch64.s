@@ -3,11 +3,6 @@
 .section ".boot", "ax", @progbits
 .globl _start
 _start:
-    // ── Diagnostic: 'A' ──
-    mov     x0, #0x09000000
-    mov     x1, #0x41
-    str     w1, [x0]
-
     // ── PRESERVE ARGUMENTS IMMEDIATELY ──
     mov     x19, x0
     mov     x20, x1
@@ -90,11 +85,6 @@ _start:
     ldr     x4, =1f
     br      x4
 1:
-    // Diagnostic: 'H'
-    mov     x0, #0x09000000
-    mov     x1, #0x48
-    str     w1, [x0]
-
 .Llimine_entry:
     // ── Zero BSS ─────────────────────────────────────────────────────────────
     adrp    x0, __bss_start
