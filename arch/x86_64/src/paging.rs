@@ -163,6 +163,13 @@ pub unsafe extern "C" fn arch_tlb_shootdown_all() {
 /// Called by the scheduler immediately before every `cpu_switch_to` into a
 /// user task, and with 0 on return to the scheduler idle loop.
 #[no_mangle]
+pub unsafe extern "C" fn arch_get_current_root() -> usize {
+    let cr3: usize;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    cr3 & !0xFFF
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn arch_set_page_table(root: usize) {
     if root != 0 {
         #[cfg(target_arch = "x86_64")]
