@@ -176,6 +176,7 @@ static void handleKeyInput(){
 
 
 void DG_Init(){
+  puts("DG_Init called");
   window = SDL_CreateWindow("DOOM",
                             SDL_WINDOWPOS_UNDEFINED,
                             SDL_WINDOWPOS_UNDEFINED,

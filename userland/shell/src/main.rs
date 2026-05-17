@@ -215,7 +215,7 @@ unsafe fn process_line(line: &str) {
             write_str("Exiting shell...\n");
         }
         _ => {
-            execute_binary(args[0]);
+            execute_binary(&args, arg_count);
         }
     }
 }
@@ -297,25 +297,29 @@ unsafe fn ls_command(path: &str) {
 }
 
 static mut BIN_PATH_BUFFER: [u8; 256] = [0u8; 256];
-static mut EXEC_PATH_BUFFER: [u8; 256] = [0u8; 256];
+static mut ARGV_PTRS: [*const u8; 17] = [core::ptr::null(); 17];
+static mut ARG_STRINGS: [[u8; 128]; 16] = [[0u8; 128]; 16];
 
-unsafe fn execute_binary(cmd: &str) {
-    let actual_path = cmd;
-
-    let path_len = actual_path.len().min(255);
-    let exec_ptr = core::ptr::addr_of_mut!(EXEC_PATH_BUFFER) as *mut u8;
-    core::ptr::copy_nonoverlapping(actual_path.as_ptr(), exec_ptr, path_len);
-    *exec_ptr.add(path_len) = 0;
-
+unsafe fn execute_binary(args: &[&str], count: usize) {
+    let cmd = args[0];
     let pid = fork();
     if pid < 0 {
         write_str("shell: fork failed\n");
     } else if pid == 0 {
         // Child
-        let exec_ptr_const = core::ptr::addr_of!(EXEC_PATH_BUFFER) as *const u8;
-        let argv: [*const u8; 2] = [exec_ptr_const, core::ptr::null()];
         let envp: [*const u8; 1] = [core::ptr::null()];
-        execve(exec_ptr_const, argv.as_ptr(), envp.as_ptr());
+
+        // Prepare argv
+        for i in 0..count {
+            let s = args[i];
+            let len = s.len().min(127);
+            core::ptr::copy_nonoverlapping(s.as_ptr(), ARG_STRINGS[i].as_mut_ptr(), len);
+            ARG_STRINGS[i][len] = 0;
+            ARGV_PTRS[i] = ARG_STRINGS[i].as_ptr();
+        }
+        ARGV_PTRS[count] = core::ptr::null();
+
+        execve(ARGV_PTRS[0], ARGV_PTRS.as_ptr(), envp.as_ptr());
 
         // If execve fails and it doesn't start with /, try /bin/
         if !cmd.starts_with('/') {
@@ -327,8 +331,8 @@ unsafe fn execute_binary(cmd: &str) {
             *bin_ptr.add(bin_prefix.len() + copy_len) = 0;
 
             let bin_ptr_const = core::ptr::addr_of!(BIN_PATH_BUFFER) as *const u8;
-            let argv: [*const u8; 2] = [bin_ptr_const, core::ptr::null()];
-            execve(bin_ptr_const, argv.as_ptr(), envp.as_ptr());
+            ARGV_PTRS[0] = bin_ptr_const;
+            execve(bin_ptr_const, ARGV_PTRS.as_ptr(), envp.as_ptr());
         }
 
         // If we get here, execve failed

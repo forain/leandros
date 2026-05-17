@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <SDL_mixer.h>
+#include "doomgeneric.h"
 
 // ── PipeWire / LeandrOS Audio Protocol ──────────────────────────────────────
 
@@ -137,11 +138,35 @@ void SDL_UnlockAudio(void) {}
 // ── Graphics Implementation (Simplified Fallback) ──────────────────────────
 
 static int s_drm_fd = -1;
+static uint32_t s_screen_width, s_screen_height, s_screen_pitch;
 
 SDL_Window* SDL_CreateWindow(const char* title, int x, int y, int w, int h, uint32_t flags) {
     write(1, "[SDL] SDL_CreateWindow\n", 23);
-    s_drm_fd = open("/dev/dri/card0", O_RDWR, 0);
-    if (s_drm_fd < 0) s_drm_fd = open("/dev/fb0", O_RDWR, 0);
+    
+    // Prefer /dev/fb0 for now as it's more reliable for direct writes
+    s_drm_fd = open("/dev/fb0", O_RDWR, 0);
+    if (s_drm_fd < 0) s_drm_fd = open("/dev/dri/card0", O_RDWR, 0);
+    
+    if (s_drm_fd >= 0) {
+        uint32_t info[8];
+        // 0x4600 = FBIOGET_VSCREENINFO
+        if (ioctl(s_drm_fd, 0x4600, (unsigned long)info) == 0) {
+            s_screen_width = info[0];
+            s_screen_height = info[1];
+            s_screen_pitch = info[7];
+            if (s_screen_pitch == 0) s_screen_pitch = s_screen_width * 4;
+            
+            char buf[128];
+            int n = snprintf(buf, sizeof(buf), "[SDL] Detected framebuffer: %dx%d pitch=%d\n", 
+                             (int)s_screen_width, (int)s_screen_height, (int)s_screen_pitch);
+            write(1, buf, n);
+        } else {
+            s_screen_width = 320;
+            s_screen_height = 200;
+            s_screen_pitch = 320 * 4;
+        }
+    }
+    
     return (SDL_Window*)0x1234;
 }
 
@@ -150,17 +175,146 @@ SDL_Texture* SDL_CreateTexture(SDL_Renderer* renderer, uint32_t format, int acce
 
 void SDL_UpdateTexture(SDL_Texture* texture, const void* rect, const void* pixels, int pitch) {
     if (s_drm_fd >= 0 && pixels) {
-        // Direct write() to framebuffer - slow but reliable for initial verification
-        // VFS should handle this by copying to the physical FB.
-        lseek(s_drm_fd, 0, SEEK_SET);
-        write(s_drm_fd, pixels, 320 * 200 * 4);
+        // If resolution matches exactly, use fast direct write
+        if (s_screen_width == DOOMGENERIC_RESX && s_screen_height == DOOMGENERIC_RESY && s_screen_pitch == DOOMGENERIC_RESX * 4) {
+            lseek(s_drm_fd, 0, SEEK_SET);
+            write(s_drm_fd, pixels, DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4);
+        } else {
+            // Software scaling fallback
+            static uint32_t* scaled_buffer = NULL;
+            static int* x_map = NULL;
+            static uint32_t last_width = 0, last_height = 0;
+            
+            if (scaled_buffer == NULL || last_width != s_screen_width || last_height != s_screen_height) {
+                if (scaled_buffer) free(scaled_buffer);
+                if (x_map) free(x_map);
+                
+                scaled_buffer = malloc(s_screen_width * s_screen_height * 4);
+                x_map = malloc(s_screen_width * sizeof(int));
+                
+                if (x_map) {
+                    for (int x = 0; x < s_screen_width; x++) {
+                        x_map[x] = x * DOOMGENERIC_RESX / s_screen_width;
+                    }
+                }
+                last_width = s_screen_width;
+                last_height = s_screen_height;
+            }
+            
+            if (!scaled_buffer || !x_map) return;
+
+            const uint32_t* src_pixels = (const uint32_t*)pixels;
+
+            for (int y = 0; y < s_screen_height; y++) {
+                int src_y = y * DOOMGENERIC_RESY / s_screen_height;
+                const uint32_t* src_row = &src_pixels[src_y * DOOMGENERIC_RESX];
+                uint32_t* dest_row = &scaled_buffer[y * s_screen_width];
+                
+                for (int x = 0; x < s_screen_width; x++) {
+                    dest_row[x] = src_row[x_map[x]];
+                }
+            }
+            
+            lseek(s_drm_fd, 0, SEEK_SET);
+            write(s_drm_fd, scaled_buffer, s_screen_width * s_screen_height * 4);
+        }
     }
 }
 
 void SDL_RenderClear(SDL_Renderer* renderer) {}
 void SDL_RenderCopy(SDL_Renderer* renderer, SDL_Texture* texture, const void* srcrect, const void* dstrect) {}
 void SDL_RenderPresent(SDL_Renderer* renderer) {}
-int SDL_PollEvent(SDL_Event* event) { return 0; }
+int SDL_PollEvent(SDL_Event* event) {
+    static int ev_fd = -2;
+    if (ev_fd == -2) {
+        ev_fd = open("/dev/input/event0", O_RDONLY, 0); 
+    }
+    
+    if (ev_fd < 0) return 0;
+
+    int bytes_available = 0;
+    if (ioctl(ev_fd, FIONREAD, &bytes_available) < 0 || bytes_available < 1) {
+        return 0;
+    }
+
+    struct {
+        uint64_t sec, usec;
+        uint16_t type, code;
+        int32_t value;
+    } ev;
+
+    if (read(ev_fd, &ev, sizeof(ev)) == sizeof(ev)) {
+        if (ev.type == 1) { // EV_KEY
+            event->type = (ev.value == 0) ? SDL_KEYUP : SDL_KEYDOWN;
+            
+            // Map common keys. This is a very minimal subset.
+            // Linux evdev codes to SDL keycodes.
+            uint32_t sym = 0;
+            switch (ev.code) {
+                case 1:   sym = SDLK_ESCAPE; break;
+                case 28:  sym = SDLK_RETURN; break;
+                case 57:  sym = SDLK_SPACE;  break;
+                case 103: sym = SDLK_UP;     break;
+                case 108: sym = SDLK_DOWN;   break;
+                case 105: sym = SDLK_LEFT;   break;
+                case 106: sym = SDLK_RIGHT;  break;
+                case 29:  sym = SDLK_LCTRL;  break;
+                case 97:  sym = SDLK_RCTRL;  break;
+                case 42:  sym = SDLK_LSHIFT; break;
+                case 54:  sym = SDLK_RSHIFT; break;
+                case 56:  sym = SDLK_LALT;   break;
+                case 100: sym = SDLK_RALT;   break;
+                
+                // Numbers
+                case 2: sym = '1'; break;
+                case 3: sym = '2'; break;
+                case 4: sym = '3'; break;
+                case 5: sym = '4'; break;
+                case 6: sym = '5'; break;
+                case 7: sym = '6'; break;
+                case 8: sym = '7'; break;
+                case 9: sym = '8'; break;
+                case 10: sym = '9'; break;
+                case 11: sym = '0'; break;
+
+                // Letters (simplified mapping)
+                case 16: sym = 'q'; break;
+                case 17: sym = 'w'; break;
+                case 18: sym = 'e'; break;
+                case 19: sym = 'r'; break;
+                case 30: sym = 'a'; break;
+                case 31: sym = 's'; break;
+                case 32: sym = 'd'; break;
+                case 33: sym = 'f'; break;
+                case 44: sym = 'z'; break;
+                case 45: sym = 'x'; break;
+                case 46: sym = 'c'; break;
+                case 47: sym = 'v'; break;
+                
+                // Function keys
+                case 60: sym = SDLK_F2; break;
+                case 61: sym = SDLK_F3; break;
+                case 62: sym = SDLK_F4; break;
+                case 63: sym = SDLK_F5; break;
+                case 64: sym = SDLK_F6; break;
+                case 65: sym = SDLK_F7; break;
+                case 66: sym = SDLK_F8; break;
+                case 67: sym = SDLK_F9; break;
+                case 68: sym = SDLK_F10; break;
+                case 87: sym = SDLK_F11; break;
+                
+                case 12: sym = SDLK_MINUS; break;
+                case 13: sym = SDLK_EQUALS; break;
+                
+                default: sym = ev.code; break; // Raw code as fallback
+            }
+            event->key.keysym.sym = sym;
+            return 1;
+        }
+    }
+
+    return 0;
+}
 
 #define CLOCK_MONOTONIC 1
 uint32_t SDL_GetTicks(void) {
