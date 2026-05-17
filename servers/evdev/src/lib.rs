@@ -117,19 +117,46 @@ pub fn handle(msg: &Message, _caller_pid: u32) -> Message {
             
             let event_size = core::mem::size_of::<input_event>();
             let mut n = 0;
+            let mut events_to_copy = [input_event {
+                time: timeval { tv_sec: 0, tv_usec: 0 },
+                type_: 0, code: 0, value: 0
+            }; 8]; // Copy in chunks
+            
+            let mut total_copied = 0;
             while n + event_size <= count {
-                if let Some(ev) = dev.pop() {
-                    unsafe {
-                        core::ptr::write((buf_ptr + n) as *mut input_event, ev);
+                let mut chunk_count = 0;
+                while chunk_count < 8 && n + event_size <= count {
+                    if let Some(ev) = dev.pop() {
+                        events_to_copy[chunk_count] = ev;
+                        chunk_count += 1;
+                        n += event_size;
+                    } else {
+                        break;
                     }
-                    n += event_size;
+                }
+                
+                if chunk_count > 0 {
+                    let bytes = chunk_count * event_size;
+                    let ok = sched::with_current_address_space(|as_| {
+                        unsafe {
+                            as_.write_user_buf(buf_ptr + total_copied, 
+                                core::slice::from_raw_parts(&events_to_copy as *const _ as *const u8, bytes))
+                        }
+                    }).unwrap_or(false);
+                    
+                    if !ok {
+                        drop(devs);
+                        unsafe { arch_interrupt_restore(f); }
+                        return err_reply(-14); // EFAULT
+                    }
+                    total_copied += bytes;
                 } else {
                     break;
                 }
             }
             drop(devs);
             unsafe { arch_interrupt_restore(f); }
-            val_reply(n as u64)
+            val_reply(total_copied as u64)
         }
         vfs_server::VFS_WRITE => {
             let count = arg(msg, 2) as u64;
@@ -143,10 +170,15 @@ pub fn handle(msg: &Message, _caller_pid: u32) -> Message {
                 let devs = DEVICES.lock();
                 let count = (devs[dev_id].count * core::mem::size_of::<input_event>()) as i32;
                 drop(devs);
-                unsafe {
-                    arch_interrupt_restore(f);
-                    *(arg_ptr as *mut i32) = count;
-                }
+                unsafe { arch_interrupt_restore(f); }
+                
+                let ok = sched::with_current_address_space(|as_| {
+                    unsafe {
+                        as_.write_user_buf(arg_ptr, core::slice::from_raw_parts(&count as *const _ as *const u8, 4))
+                    }
+                }).unwrap_or(false);
+                
+                if !ok { return err_reply(-14); } // EFAULT
                 return val_reply(0);
             }
             if cmd == 0x80044501 { // EVIOCGVERSION
@@ -154,13 +186,19 @@ pub fn handle(msg: &Message, _caller_pid: u32) -> Message {
             }
             if cmd == 0x80084502 { // EVIOCGID
                 let arg_ptr = arg(msg, 2) as usize;
-                unsafe {
-                    let p = arg_ptr as *mut u16;
-                    p.write(0x0001); // bustype (BUS_USB)
-                    p.add(1).write(0x1234); // vendor
-                    p.add(2).write(0x5678); // product
-                    p.add(3).write(0x0001); // version
-                }
+                let mut ids = [0u16; 4];
+                ids[0] = 0x0001; // bustype (BUS_USB)
+                ids[1] = 0x1234; // vendor
+                ids[2] = 0x5678; // product
+                ids[3] = 0x0001; // version
+                
+                let ok = sched::with_current_address_space(|as_| {
+                    unsafe {
+                        as_.write_user_buf(arg_ptr, core::slice::from_raw_parts(ids.as_ptr() as *const u8, 8))
+                    }
+                }).unwrap_or(false);
+                
+                if !ok { return err_reply(-14); } // EFAULT
                 return val_reply(0);
             }
 

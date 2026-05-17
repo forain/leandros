@@ -81,8 +81,21 @@ fn handle(msg: &Message, _port: u32) -> Message {
                 Err(_) => err_reply(-1),
             }
         } else if msg.tag == 0x12 { // VFS_WRITE
-            // ... (existing code)
-            val_reply(0)
+            // Handle raw write to framebuffer via DRM server
+            let count = arg(msg, 2) as usize;
+            let buf_ptr = arg(msg, 1) as usize;
+            
+            // Validate pointer (simple check for now)
+            if buf_ptr == 0 { return err_reply(-14); } // EFAULT
+
+            let buf = unsafe {
+                core::slice::from_raw_parts(buf_ptr as *const u8, count)
+            };
+
+            match interface.handle_write(buf) {
+                Ok(n) => val_reply(n as u64),
+                Err(_) => err_reply(-5), // EIO
+            }
         } else if msg.tag == vfs_server::VFS_CLOSE || msg.tag == vfs_server::VFS_CLOSE_ALL {
             interface.release();
             ok_reply()

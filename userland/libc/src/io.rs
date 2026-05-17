@@ -31,6 +31,7 @@ pub const O_RDWR:   i32 = 2;
 pub const O_CREAT:  i32 = 0o100;
 pub const O_TRUNC:  i32 = 0o1000;
 pub const O_APPEND: i32 = 0o2000;
+pub const O_NONBLOCK:i32 = 0o4000;
 pub const O_CLOEXEC:i32 = 0o2000000;
 
 // lseek(2) whence.
