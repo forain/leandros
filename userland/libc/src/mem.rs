@@ -70,6 +70,22 @@ pub unsafe extern "C" fn realloc(ptr: *mut u8, new_size: size_t) -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn free(_ptr: *mut u8) {}
 
+// ── Global Allocator ─────────────────────────────────────────────────────────
+
+struct LibcAllocator;
+
+unsafe impl core::alloc::GlobalAlloc for LibcAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        malloc(layout.size())
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: core::alloc::Layout) {
+        free(ptr)
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: LibcAllocator = LibcAllocator;
+
 // ── Core memory operations (also used by string.rs) ──────────────────────────
 
 /// Copy `n` bytes from `src` to `dst` (non-overlapping).

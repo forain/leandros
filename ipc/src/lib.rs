@@ -6,15 +6,20 @@
 
 #![no_std]
 
+#[cfg(feature = "kernel")]
 pub mod port;
 pub mod message;
+#[cfg(feature = "kernel")]
 pub mod channel;
 
+#[cfg(feature = "kernel")]
 pub use port::{Port, SendError};
 pub use message::{Message, MESSAGE_INLINE_BYTES};
+#[cfg(feature = "kernel")]
 pub use channel::Channel;
 
 /// Initialise the IPC subsystem. Called once from `kernel_main`.
+#[cfg(feature = "kernel")]
 pub fn init() {
     port::init();
     // Register cleanup callback so the scheduler can release ports when a

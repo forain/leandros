@@ -26,6 +26,7 @@ pub mod string;
 pub mod stdio;
 pub mod errno;
 pub mod time;
+pub mod ipc;
 
 // Re-export every public symbol so dependents can do `use leandros_libc::*`.
 pub use io::*;
@@ -35,6 +36,7 @@ pub use stdio::*;
 pub use process::*;
 pub use errno::*;
 pub use time::*;
+pub use ipc::*;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

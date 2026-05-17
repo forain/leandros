@@ -8,3 +8,6 @@ edition.workspace = true
 [lib]
 name = "leandros_libc"
 crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+ipc = { path = "../../ipc", default-features = false }

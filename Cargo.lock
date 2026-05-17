@@ -204,6 +204,7 @@ dependencies = [
  "drivers",
  "ipc",
  "net-server",
+ "sched",
  "spin",
  "vfs-server",
 ]

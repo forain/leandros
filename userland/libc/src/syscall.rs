@@ -334,6 +334,11 @@ pub mod nr {
     #[cfg(target_arch = "aarch64")] pub const GETEGID:        usize = 177;
     #[cfg(target_arch = "x86_64")]  pub const GETEGID:        usize = 108;
 
+    pub const IPC_SEND: usize = 511;
+    pub const IPC_RECV: usize = 512;
+    pub const IPC_CALL: usize = 513;
+    pub const SPAWN:    usize = 510;
+
     // Fallback for other architectures (cargo check host)
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const READ: usize = 0;
