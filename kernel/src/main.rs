@@ -35,7 +35,7 @@ static START_MARKER: limine::RequestsStartMarker = limine::RequestsStartMarker::
 
 #[used]
 #[link_section = ".limine_reqs"]
-static BASE_REVISION: limine::BaseRevision = limine::BaseRevision::new();
+static BASE_REVISION: limine::BaseRevision = limine::BaseRevision::with_revision(2);
 
 #[used]
 #[link_section = ".limine_reqs"]
@@ -107,6 +107,11 @@ pub unsafe extern "C" fn serial_print(ptr: *const u8, len: usize) {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn serial_print_str_raw(ptr: *const u8, len: usize) {
+    serial_print(ptr, len);
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn serial_print_bytes(ptr: *const u8, len: usize) {
     let slice = core::slice::from_raw_parts(ptr, len);
     for &b in slice { serial_write_byte(b); }
@@ -133,14 +138,12 @@ pub extern "C" fn print_hex(n: usize) {
     for i in (0..16).rev() { serial_write_byte(digits[(n >> (i * 4)) & 0xF]); }
 }
 
-#[no_mangle]
-pub extern "C" fn serial_print_str_raw(ptr: *const u8, len: usize) {
-    let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
-    for &b in slice { serial_write_byte(b); }
+pub fn serial_print_str(msg: &str) {
+    for &b in msg.as_bytes() { serial_write_byte(b); }
 }
 
-pub fn serial_print_str(msg: &str) {
-    serial_print_str_raw(msg.as_ptr(), msg.len());
+pub fn serial_write_raw(bytes: &[u8]) {
+    for &b in bytes { serial_write_byte(b); }
 }
 
 #[no_mangle]
@@ -152,11 +155,6 @@ pub extern "C" fn serial_print_str_c(s: *const u8) {
             i += 1;
         }
     }
-}
-
-#[no_mangle]
-pub fn serial_write_raw(msg: &[u8]) {
-    for &b in msg { serial_write_byte(b); }
 }
 
 #[no_mangle]
@@ -179,11 +177,26 @@ pub fn serial_has_data() -> bool {
 pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     let is_limine = HHDM_REQUEST.response().is_some();
     let mut hhdm_offset = 0xffff800000000000;
+    
     if is_limine {
-        hhdm_offset = HHDM_REQUEST.response().unwrap().offset;
-    }
-
-    if !is_limine {
+        unsafe {
+            BOOT_INFO = boot::limine::parse_with_requests(
+                &HHDM_REQUEST,
+                &MEMMAP_REQUEST,
+                &FRAMEBUFFER_REQUEST,
+                &MODULE_REQUEST,
+                &RSDP_REQUEST,
+                &KERNEL_ADDR_REQUEST,
+                &DTB_REQUEST,
+            );
+            hhdm_offset = BOOT_INFO.hhdm_offset;
+            serial_print_str("[MAIN] Limine boot info parsed. Memmap len: ");
+            print_hex(BOOT_INFO.memory_map_len);
+            serial_print_str(" HHDM: ");
+            print_hex(hhdm_offset as usize);
+            serial_print_str("\n");
+        }
+    } else {
         #[cfg(target_arch = "aarch64")]
         {
             let mut dtb_addr = boot_info_addr;
@@ -234,16 +247,6 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 BOOT_INFO = boot::multiboot2::parse(boot_info_addr);
                 BOOT_INFO.hhdm_offset = hhdm_offset;
             }
-        }
-    }
-
-    if is_limine {
-        unsafe {
-            BOOT_INFO = boot::limine::parse_with_requests(
-                &HHDM_REQUEST, &MEMMAP_REQUEST, &FRAMEBUFFER_REQUEST, &MODULE_REQUEST,
-                &RSDP_REQUEST, &KERNEL_ADDR_REQUEST, &DTB_REQUEST,
-            );
-            BOOT_INFO.hhdm_offset = hhdm_offset;
         }
     }
 
