@@ -79,6 +79,11 @@ create_initrd() {
     cp "$userland_dir/init" "$temp_dir/bin/init"
     cp "$userland_dir/shell" "$temp_dir/bin/shell"
     cp "$userland_dir/hello" "$temp_dir/bin/hello"
+    cp "$userland_dir/aplay" "$temp_dir/bin/aplay"
+
+    if [[ -f "userland/aplay/car-horn.wav" ]]; then
+        cp "userland/aplay/car-horn.wav" "$temp_dir/car-horn.wav"
+    fi
 
     local doom_bin="doomgeneric/doom-$arch"
     if [[ -f "$doom_bin" ]]; then
@@ -131,7 +136,12 @@ build_kernel() {
     cp "$target_root/$target_triple/release/kernel" "target/final-$arch/kernel-direct"
     
     # Generate flat binary and 32-bit ELF for direct boot
-    local objcopy="/Users/forain/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-objcopy"
+    local sysroot
+    sysroot=$(rustc --print sysroot)
+    local host
+    host=$(rustc -vV | grep host | cut -d' ' -f2)
+    local objcopy="$sysroot/lib/rustlib/$host/bin/llvm-objcopy"
+
     if [[ -f "$objcopy" ]]; then
         "$objcopy" -O binary "target/final-$arch/kernel-direct" "target/final-$arch/kernel-direct.bin"
         echo "  Flat binary generated: target/final-$arch/kernel-direct.bin"
@@ -139,6 +149,8 @@ build_kernel() {
             "$objcopy" -O elf32-i386 "target/final-$arch/kernel-direct" "target/final-$arch/kernel-direct-32.elf"
             echo "  32-bit ELF generated: target/final-$arch/kernel-direct-32.elf"
         fi
+    else
+        echo "⚠️  llvm-objcopy not found at $objcopy, skipping flat binary generation"
     fi
 }
 
@@ -205,20 +217,19 @@ build_doom() {
 download_limine "$LIMINE_VERSION"
 LIMINE_DIR="$LIMINE_CACHE_DIR/limine-$LIMINE_VERSION-binary"
 
-if [[ "$ARCH" == "both" || "$ARCH" == "aarch64" ]]; then
-    build_userland "aarch64"
-    build_doom "aarch64"
-    create_initrd "aarch64"
-    build_kernel "aarch64"
-    create_disk_image "aarch64" "$LIMINE_DIR"
+# Determine architectures to build
+if [[ "$ARCH" == "both" ]]; then
+    ARCHS=("aarch64" "x86_64")
+else
+    ARCHS=("$ARCH")
 fi
 
-if [[ "$ARCH" == "both" || "$ARCH" == "x86_64" ]]; then
-    build_userland "x86_64"
-    build_doom "x86_64"
-    create_initrd "x86_64"
-    build_kernel "x86_64"
-    create_disk_image "x86_64" "$LIMINE_DIR"
-fi
+for arch in "${ARCHS[@]}"; do
+    build_userland "$arch"
+    build_doom "$arch"
+    create_initrd "$arch"
+    build_kernel "$arch"
+    create_disk_image "$arch" "$LIMINE_DIR"
+done
 
 echo "🎉 Build Complete!"

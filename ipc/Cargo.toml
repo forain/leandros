@@ -5,5 +5,9 @@ edition.workspace = true
 
 [dependencies]
 leandros-lib = { path = "../lib" }
-sched   = { path = "../sched" }
+sched   = { path = "../sched", optional = true }
 spin.workspace = true
+
+[features]
+default = ["kernel"]
+kernel = ["dep:sched"]

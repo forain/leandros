@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["libc", "hello", "shell", "init"]
+members = ["libc", "hello", "shell", "init", "aplay"]
 
 [workspace.package]
 version = "0.1.0"
