@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+sched = { path = "../../sched" }
 drivers = { path = "../../drivers" }
 ipc = { path = "../../ipc" }
 vfs-server = { path = "../vfs" }

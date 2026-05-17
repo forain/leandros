@@ -1,0 +1,12 @@
+[package]
+name = "aplay"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+leandros-libc = { path = "../libc" }
+ipc = { path = "../../ipc", default-features = false }
+
+[[bin]]
+name = "aplay"
+path = "src/main.rs"
