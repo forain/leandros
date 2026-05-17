@@ -1171,9 +1171,14 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 mm::phys_to_virt(base as usize + cur)
             } as *mut u8;
 
-            unsafe {
-                core::ptr::copy_nonoverlapping(buf, fb_virt, n);
-            }
+            let ok = sched::with_current_address_space(|as_| {
+                unsafe {
+                    as_.read_user_buf(buf_ptr, core::slice::from_raw_parts_mut(fb_virt, n))
+                }
+            }).unwrap_or(false);
+
+            if !ok { return err_reply(-14); } // EFAULT
+
             *pos += n;
             val_reply(n as u64)
         }
@@ -1849,17 +1854,24 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
             let height = FB_HEIGHT.load(atomic::Ordering::SeqCst);
             let pitch  = FB_PITCH.load(atomic::Ordering::SeqCst);
             drop(tbls);
-            unsafe {
-                let p = arg as *mut u32;
-                p.write(width);     // xres
-                p.add(1).write(height); // yres
-                p.add(2).write(width);  // xres_virtual
-                p.add(3).write(height); // yres_virtual
-                p.add(4).write(0);      // xoffset
-                p.add(5).write(0);      // yoffset
-                p.add(6).write(32);     // bits_per_pixel
-                p.add(7).write(pitch);  // pitch
-            }
+
+            let mut info = [0u32; 8];
+            info[0] = width;
+            info[1] = height;
+            info[2] = width;
+            info[3] = height;
+            info[4] = 0;
+            info[5] = 0;
+            info[6] = 32;
+            info[7] = pitch;
+
+            let ok = sched::with_current_address_space(|as_| {
+                unsafe {
+                    as_.write_user_buf(arg, core::slice::from_raw_parts(&info as *const _ as *const u8, 32))
+                }
+            }).unwrap_or(false);
+
+            if !ok { return err_reply(-14); } // EFAULT
             return ok_reply();
         }
     }

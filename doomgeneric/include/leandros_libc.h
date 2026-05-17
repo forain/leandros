@@ -89,6 +89,9 @@ int munmap(void *addr, size_t length);
 #define O_RDONLY 0
 #define O_WRONLY 1
 #define O_RDWR   2
+#define O_NONBLOCK 04000
+
+#define FIONREAD 0x541B
 
 // time.h
 struct timespec {
