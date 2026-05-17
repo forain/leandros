@@ -47,11 +47,11 @@ pub unsafe fn parse_with_requests(
         let count = core::cmp::min(entries.len(), 256);
         for i in 0..count {
             let entry = entries[i];
-            let kind = match entry.type_ {
-                limine::memmap::MEMMAP_USABLE => MemoryType::Available,
-                limine::memmap::MEMMAP_ACPI_RECLAIMABLE => MemoryType::AcpiReclaimable,
-                limine::memmap::MEMMAP_ACPI_NVS => MemoryType::AcpiNvs,
-                limine::memmap::MEMMAP_BAD_MEMORY => MemoryType::BadMemory,
+            let kind = match entry.type_ as u64 {
+                0 => MemoryType::Available,       // USABLE
+                2 => MemoryType::AcpiReclaimable, // ACPI_RECLAIMABLE
+                3 => MemoryType::AcpiNvs,         // ACPI_NVS
+                4 => MemoryType::BadMemory,       // BAD_MEMORY
                 _ => MemoryType::Reserved,
             };
             LIMINE_REGIONS[i] = MemoryRegion {

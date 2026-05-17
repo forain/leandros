@@ -47,6 +47,18 @@ fn be64(p: *const u8) -> u64 {
     }
 }
 
+extern "C" {
+    #[allow(dead_code)]
+    fn serial_write_byte(b: u8);
+}
+
+#[allow(dead_code)]
+fn serial_print(msg: &str) {
+    for &b in msg.as_bytes() {
+        unsafe { serial_write_byte(b); }
+    }
+}
+
 /// Validate a DTB pointer and return true if it looks like a valid FDT.
 ///
 /// # Safety

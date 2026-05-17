@@ -70,9 +70,10 @@ pub fn init(info: &boot::BootInfo) {
                     // This might happen if we hit a huge page that we can't split yet.
                 }
             }
-            // Flush TLB to ensure the new mappings are active.
-            core::arch::asm!("mov rax, cr3", "mov cr3, rax", out("rax") _);
         }
+
+        // Flush TLB to ensure the new mappings are active.
+        core::arch::asm!("mov rax, cr3", "mov cr3, rax", out("rax") _);
 
         apic::init();
         
