@@ -1995,42 +1995,87 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 
 /// Helper to read a single ASCII byte from evdev0 (unifying UART and keyboard).
 fn read_input_byte() -> Option<u8> {
+    static mut SHIFT_PRESSED: bool = false;
     loop {
         if let Some(ev) = evdev_server::pop_event(0) {
-            // EV_KEY down (1) or serial typematic (2)
-            if ev.type_ == 1 && (ev.value == 1 || ev.value == 2) {
-                // Map standard Linux evdev scan codes back to ASCII for the kernel console
-                let ascii = match ev.code {
-                    1 => 27, // ESC
-                    2..=11 => b'0' + ((ev.code - 1) % 10) as u8,
-                    12 => b'-',
-                    13 => b'=',
-                    14 => 127, // Backspace
-                    15 => 9,   // Tab
-                    16 => b'q', 17 => b'w', 18 => b'e', 19 => b'r', 20 => b't',
-                    21 => b'y', 22 => b'u', 23 => b'i', 24 => b'o', 25 => b'p',
-                    26 => b'[', 27 => b']',
-                    28 => b'\n', // Enter
-                    30 => b'a', 31 => b's', 32 => b'd', 33 => b'f', 34 => b'g',
-                    35 => b'h', 36 => b'j', 37 => b'k', 38 => b'l', 39 => b';',
-                    40 => b'\'', 41 => b'`',
-                    43 => b'\\', 44 => b'z', 45 => b'x', 46 => b'c', 47 => b'v',
-                    48 => b'b', 49 => b'n', 50 => b'm', 51 => b',', 52 => b'.',
-                    53 => b'/',
-                    57 => b' ', // Space
-                    96 => b'\n', // KPEnter
-                    _ => {
-                        // If it's already ASCII-range (e.g. from UART), use it as-is.
-                        // Allow common control characters: Tab(9), LF(10), CR(13), BS(8/127).
-                        let c = ev.code;
-                        if c < 128 && (c > 31 || c == 10 || c == 13 || c == 9 || c == 127 || c == 8) {
-                            c as u8
-                        } else { 0 }
-                    }
-                };
+            // EV_KEY
+            if ev.type_ == 1 {
+                if ev.code == 42 || ev.code == 54 { // Left Shift or Right Shift
+                    unsafe { SHIFT_PRESSED = ev.value != 0; }
+                    continue;
+                }
                 
-                if ascii != 0 {
-                    return Some(ascii);
+                // EV_KEY down (1) or serial typematic (2)
+                if ev.value == 1 || ev.value == 2 {
+                    let shifted = unsafe { SHIFT_PRESSED };
+                    // Map standard Linux evdev scan codes back to ASCII for the kernel console
+                    let ascii = match ev.code {
+                        1 => 27, // ESC
+                        2 => if shifted { b'!' } else { b'1' },
+                        3 => if shifted { b'@' } else { b'2' },
+                        4 => if shifted { b'#' } else { b'3' },
+                        5 => if shifted { b'$' } else { b'4' },
+                        6 => if shifted { b'%' } else { b'5' },
+                        7 => if shifted { b'^' } else { b'6' },
+                        8 => if shifted { b'&' } else { b'7' },
+                        9 => if shifted { b'*' } else { b'8' },
+                        10 => if shifted { b'(' } else { b'9' },
+                        11 => if shifted { b')' } else { b'0' },
+                        12 => if shifted { b'_' } else { b'-' },
+                        13 => if shifted { b'+' } else { b'=' },
+                        14 => 127, // Backspace
+                        15 => 9,   // Tab
+                        16 => if shifted { b'Q' } else { b'q' }, 
+                        17 => if shifted { b'W' } else { b'w' }, 
+                        18 => if shifted { b'E' } else { b'e' }, 
+                        19 => if shifted { b'R' } else { b'r' }, 
+                        20 => if shifted { b'T' } else { b't' },
+                        21 => if shifted { b'Y' } else { b'y' }, 
+                        22 => if shifted { b'U' } else { b'u' }, 
+                        23 => if shifted { b'I' } else { b'i' }, 
+                        24 => if shifted { b'O' } else { b'o' }, 
+                        25 => if shifted { b'P' } else { b'p' },
+                        26 => if shifted { b'{' } else { b'[' }, 
+                        27 => if shifted { b'}' } else { b']' },
+                        28 => b'\n', // Enter
+                        30 => if shifted { b'A' } else { b'a' }, 
+                        31 => if shifted { b'S' } else { b's' }, 
+                        32 => if shifted { b'D' } else { b'd' }, 
+                        33 => if shifted { b'F' } else { b'f' }, 
+                        34 => if shifted { b'G' } else { b'g' },
+                        35 => if shifted { b'H' } else { b'h' }, 
+                        36 => if shifted { b'J' } else { b'j' }, 
+                        37 => if shifted { b'K' } else { b'k' }, 
+                        38 => if shifted { b'L' } else { b'l' }, 
+                        39 => if shifted { b':' } else { b';' },
+                        40 => if shifted { b'\"' } else { b'\'' }, 
+                        41 => if shifted { b'~' } else { b'`' },
+                        43 => if shifted { b'|' } else { b'\\' }, 
+                        44 => if shifted { b'Z' } else { b'z' }, 
+                        45 => if shifted { b'X' } else { b'x' }, 
+                        46 => if shifted { b'C' } else { b'c' }, 
+                        47 => if shifted { b'V' } else { b'v' },
+                        48 => if shifted { b'B' } else { b'b' }, 
+                        49 => if shifted { b'N' } else { b'n' }, 
+                        50 => if shifted { b'M' } else { b'm' }, 
+                        51 => if shifted { b'<' } else { b',' }, 
+                        52 => if shifted { b'>' } else { b'.' },
+                        53 => if shifted { b'?' } else { b'/' },
+                        57 => b' ', // Space
+                        96 => b'\n', // KPEnter
+                        _ => {
+                            // If it's already ASCII-range (e.g. from UART), use it as-is.
+                            // Allow common control characters: Tab(9), LF(10), CR(13), BS(8/127).
+                            let c = ev.code;
+                            if c < 128 && (c > 31 || c == 10 || c == 13 || c == 9 || c == 127 || c == 8) {
+                                c as u8
+                            } else { 0 }
+                        }
+                    };
+                    
+                    if ascii != 0 {
+                        return Some(ascii);
+                    }
                 }
             }
             // Continue loop to skip EV_SYN or other events.
