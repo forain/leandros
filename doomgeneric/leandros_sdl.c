@@ -247,67 +247,112 @@ int SDL_PollEvent(SDL_Event* event) {
         if (ev.type == 1) { // EV_KEY
             event->type = (ev.value == 0) ? SDL_KEYUP : SDL_KEYDOWN;
             
-            // Map common keys. This is a very minimal subset.
             // Linux evdev codes to SDL keycodes.
             uint32_t sym = 0;
             switch (ev.code) {
                 case 1:   sym = SDLK_ESCAPE; break;
+                case 2:   sym = '1'; break;
+                case 3:   sym = '2'; break;
+                case 4:   sym = '3'; break;
+                case 5:   sym = '4'; break;
+                case 6:   sym = '5'; break;
+                case 7:   sym = '6'; break;
+                case 8:   sym = '7'; break;
+                case 9:   sym = '8'; break;
+                case 10:  sym = '9'; break;
+                case 11:  sym = '0'; break;
+                case 12:  sym = SDLK_MINUS; break;
+                case 13:  sym = SDLK_EQUALS; break;
+                case 14:  sym = SDLK_BACKSPACE; break;
+                case 15:  sym = SDLK_TAB; break;
+                case 16:  sym = 'q'; break;
+                case 17:  sym = 'w'; break;
+                case 18:  sym = 'e'; break;
+                case 19:  sym = 'r'; break;
+                case 20:  sym = 't'; break;
+                case 21:  sym = 'y'; break;
+                case 22:  sym = 'u'; break;
+                case 23:  sym = 'i'; break;
+                case 24:  sym = 'o'; break;
+                case 25:  sym = 'p'; break;
+                case 26:  sym = SDLK_LEFTBRACKET; break;
+                case 27:  sym = SDLK_RIGHTBRACKET; break;
                 case 28:  sym = SDLK_RETURN; break;
-                case 57:  sym = SDLK_SPACE;  break;
-                case 103: sym = SDLK_UP;     break;
-                case 108: sym = SDLK_DOWN;   break;
-                case 105: sym = SDLK_LEFT;   break;
-                case 106: sym = SDLK_RIGHT;  break;
-                case 29:  sym = SDLK_LCTRL;  break;
-                case 97:  sym = SDLK_RCTRL;  break;
+                case 29:  sym = SDLK_LCTRL; break;
+                case 30:  sym = 'a'; break;
+                case 31:  sym = 's'; break;
+                case 32:  sym = 'd'; break;
+                case 33:  sym = 'f'; break;
+                case 34:  sym = 'g'; break;
+                case 35:  sym = 'h'; break;
+                case 36:  sym = 'j'; break;
+                case 37:  sym = 'k'; break;
+                case 38:  sym = 'l'; break;
+                case 39:  sym = SDLK_SEMICOLON; break;
+                case 40:  sym = SDLK_QUOTE; break;
+                case 41:  sym = SDLK_BACKQUOTE; break;
                 case 42:  sym = SDLK_LSHIFT; break;
+                case 43:  sym = SDLK_BACKSLASH; break;
+                case 44:  sym = 'z'; break;
+                case 45:  sym = 'x'; break;
+                case 46:  sym = 'c'; break;
+                case 47:  sym = 'v'; break;
+                case 48:  sym = 'b'; break;
+                case 49:  sym = 'n'; break;
+                case 50:  sym = 'm'; break;
+                case 51:  sym = SDLK_COMMA; break;
+                case 52:  sym = SDLK_PERIOD; break;
+                case 53:  sym = SDLK_SLASH; break;
                 case 54:  sym = SDLK_RSHIFT; break;
-                case 56:  sym = SDLK_LALT;   break;
-                case 100: sym = SDLK_RALT;   break;
+                case 55:  sym = SDLK_KP_MULTIPLY; break;
+                case 56:  sym = SDLK_LALT; break;
+                case 57:  sym = SDLK_SPACE; break;
+                case 58:  sym = SDLK_CAPSLOCK; break;
+                case 59:  sym = SDLK_F1; break;
+                case 60:  sym = SDLK_F2; break;
+                case 61:  sym = SDLK_F3; break;
+                case 62:  sym = SDLK_F4; break;
+                case 63:  sym = SDLK_F5; break;
+                case 64:  sym = SDLK_F6; break;
+                case 65:  sym = SDLK_F7; break;
+                case 66:  sym = SDLK_F8; break;
+                case 67:  sym = SDLK_F9; break;
+                case 68:  sym = SDLK_F10; break;
+                case 69:  sym = SDLK_NUMLOCKCLEAR; break;
+                case 70:  sym = SDLK_SCROLLLOCK; break;
+                case 71:  sym = SDLK_KP_7; break;
+                case 72:  sym = SDLK_KP_8; break;
+                case 73:  sym = SDLK_KP_9; break;
+                case 74:  sym = SDLK_KP_MINUS; break;
+                case 75:  sym = SDLK_KP_4; break;
+                case 76:  sym = SDLK_KP_5; break;
+                case 77:  sym = SDLK_KP_6; break;
+                case 78:  sym = SDLK_KP_PLUS; break;
+                case 79:  sym = SDLK_KP_1; break;
+                case 80:  sym = SDLK_KP_2; break;
+                case 81:  sym = SDLK_KP_3; break;
+                case 82:  sym = SDLK_KP_0; break;
+                case 83:  sym = SDLK_KP_PERIOD; break;
+                case 87:  sym = SDLK_F11; break;
+                case 88:  sym = SDLK_F12; break;
+                case 96:  sym = SDLK_KP_ENTER; break;
+                case 97:  sym = SDLK_RCTRL; break;
+                case 98:  sym = SDLK_KP_DIVIDE; break;
+                case 100: sym = SDLK_RALT; break;
+                case 102: sym = SDLK_HOME; break;
+                case 103: sym = SDLK_UP; break;
+                case 104: sym = SDLK_PAGEUP; break;
+                case 105: sym = SDLK_LEFT; break;
+                case 106: sym = SDLK_RIGHT; break;
+                case 107: sym = SDLK_END; break;
+                case 108: sym = SDLK_DOWN; break;
+                case 109: sym = SDLK_PAGEDOWN; break;
+                case 110: sym = SDLK_INSERT; break;
+                case 111: sym = SDLK_DELETE; break;
                 
-                // Numbers
-                case 2: sym = '1'; break;
-                case 3: sym = '2'; break;
-                case 4: sym = '3'; break;
-                case 5: sym = '4'; break;
-                case 6: sym = '5'; break;
-                case 7: sym = '6'; break;
-                case 8: sym = '7'; break;
-                case 9: sym = '8'; break;
-                case 10: sym = '9'; break;
-                case 11: sym = '0'; break;
-
-                // Letters (simplified mapping)
-                case 16: sym = 'q'; break;
-                case 17: sym = 'w'; break;
-                case 18: sym = 'e'; break;
-                case 19: sym = 'r'; break;
-                case 30: sym = 'a'; break;
-                case 31: sym = 's'; break;
-                case 32: sym = 'd'; break;
-                case 33: sym = 'f'; break;
-                case 44: sym = 'z'; break;
-                case 45: sym = 'x'; break;
-                case 46: sym = 'c'; break;
-                case 47: sym = 'v'; break;
-                
-                // Function keys
-                case 60: sym = SDLK_F2; break;
-                case 61: sym = SDLK_F3; break;
-                case 62: sym = SDLK_F4; break;
-                case 63: sym = SDLK_F5; break;
-                case 64: sym = SDLK_F6; break;
-                case 65: sym = SDLK_F7; break;
-                case 66: sym = SDLK_F8; break;
-                case 67: sym = SDLK_F9; break;
-                case 68: sym = SDLK_F10; break;
-                case 87: sym = SDLK_F11; break;
-                
-                case 12: sym = SDLK_MINUS; break;
-                case 13: sym = SDLK_EQUALS; break;
-                
-                default: sym = ev.code; break; // Raw code as fallback
+                default: sym = 0; break; 
             }
+            if (sym == 0) return 0;
             event->key.keysym.sym = sym;
             return 1;
         }
