@@ -86,8 +86,8 @@ const USER_SPACE_END: usize = 0x0000_8000_0000_0000;
 
 /// Default user stack top for a freshly exec'd process.
 const USER_STACK_TOP: usize = 0x0000_7fff_ffff_f000;
-/// Size of the initial user stack mapping (32 KiB).
-const USER_STACK_SIZE: usize = 8 * mm::buddy::PAGE_SIZE;
+/// Size of the initial user stack mapping (256 KiB).
+const USER_STACK_SIZE: usize = 64 * mm::buddy::PAGE_SIZE;
 
 /// Validate that `[ptr, ptr+len)` is entirely within user-space.
 fn validate_user_buf(ptr: usize, len: usize) -> bool {

@@ -189,12 +189,6 @@ impl VectorFont {
         // Find required tables
         let mut head_offset = None;
         let mut hhea_offset = None;
-        #[allow(unused_variables)]
-        let mut cmap_offset = None;
-        #[allow(unused_variables)]
-        let mut glyf_offset = None;
-        #[allow(unused_variables)]
-        let mut loca_offset = None;
 
         let table_start = mem::size_of::<TTHeader>();
         for i in 0..num_tables as usize {
@@ -213,9 +207,6 @@ impl VectorFont {
             match tag {
                 0x68656164 => head_offset = Some(offset), // 'head'
                 0x68686561 => hhea_offset = Some(offset), // 'hhea'
-                0x636D6170 => cmap_offset = Some(offset), // 'cmap'
-                0x676C7966 => glyf_offset = Some(offset), // 'glyf'
-                0x6C6F6361 => loca_offset = Some(offset), // 'loca'
                 _ => {}
             }
         }
@@ -285,6 +276,7 @@ impl VectorFont {
     }
 
     /// Get glyph outline (simplified for basic characters)
+    #[allow(dead_code)]
     fn get_glyph_outline(&self, ch: char) -> Option<GlyphOutline> {
         // For now, provide simple outlines for basic ASCII characters
         // In a full implementation, this would parse the actual font glyph data

@@ -109,7 +109,7 @@ impl Framebuffer {
                 return;
             } else if ANSI_STATE.0 {
                 // We're in an escape sequence
-                if ANSI_STATE.2 < ANSI_STATE.1.len() {
+                if ANSI_STATE.2 < (*core::ptr::addr_of!(ANSI_STATE)).1.len() {
                     ANSI_STATE.1[ANSI_STATE.2] = c;
                     ANSI_STATE.2 += 1;
                 }
@@ -305,6 +305,7 @@ impl Framebuffer {
         }
     }
 
+    #[allow(dead_code)]
     fn scroll(&mut self) {
         let rows_to_copy = self.height - 8; // fallback char height
         unsafe {
