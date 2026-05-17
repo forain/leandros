@@ -16,7 +16,6 @@ pub const VIRTIO_SND_VQ_TX:      u16 = 2;
 pub const VIRTIO_SND_VQ_RX:      u16 = 3;
 
 pub const VIRTIO_SND_R_JACK_INFO:        u32 = 0x0001;
-pub const VIRTIO_SND_R_JACK_REMAP:       u32 = 0x0002;
 pub const VIRTIO_SND_R_PCM_INFO:         u32 = 0x0100;
 pub const VIRTIO_SND_R_PCM_SET_PARAMS:   u32 = 0x0101;
 pub const VIRTIO_SND_R_PCM_PREPARE:      u32 = 0x0102;
@@ -153,6 +152,7 @@ impl VirtioSnd {
     }
 
     unsafe fn init_device(&mut self) -> Result<(), DriverError> {
+        pci::serial_debug("[SND] Initializing VirtIO Sound...\n");
         let dev = pci::find_device(VIRTIO_SND_VENDOR_ID, VIRTIO_SND_DEVICE_ID).ok_or(DriverError::NotFound)?;
         let pci_cmd = pci::pci_read_config_16(dev.bus, dev.dev, dev.func, 0x04);
         pci::pci_write_config_16(dev.bus, dev.dev, dev.func, 0x04, pci_cmd | 0x06);
@@ -170,9 +170,15 @@ impl VirtioSnd {
         self.write_common_8(20, 0); // Reset
         let mut status = 3; // ACKNOWLEDGE | DRIVER
         self.write_common_8(20, status);
-        self.write_common_32(8, 1); // Select features 1
+        
+        self.write_common_32(8, 0); // Features 0-31
+        let f0 = self.read_common_32(4);
+        self.write_common_32(12, f0);
+        
+        self.write_common_32(8, 1); // Features 32-63
         let f1 = self.read_common_32(4);
-        self.write_common_32(12, f1 & 1); // Accept VERSION_1
+        self.write_common_32(12, f1 | 1); // Accept VERSION_1
+
         status |= 8; // FEATURES_OK
         self.write_common_8(20, status);
         if self.read_common_8(20) & 8 == 0 { return Err(DriverError::Unsupported); }
@@ -182,6 +188,7 @@ impl VirtioSnd {
         self.write_common_8(20, status);
 
         self.initialized = true;
+        pci::serial_debug("[SND] Initialized.\n");
         Ok(())
     }
 
@@ -261,7 +268,7 @@ impl VirtioSnd {
     fn send_control_cmd<T>(&mut self, cmd: &T) {
         let code = unsafe { *(cmd as *const T as *const u32) };
         pci::serial_debug("[SND] Sending CTRL CMD "); pci::serial_debug_hex(code); pci::serial_debug("...\n");
-        let (head, vq_id, notify_off) = {
+        let (h, vq_id, notify_off) = {
             let vq = self.vqs[0].as_mut().unwrap();
             unsafe {
                 core::ptr::copy_nonoverlapping(cmd as *const T as *const u8, (*self.persistent).ctrl_cmd.as_mut_ptr(), core::mem::size_of::<T>());
@@ -285,7 +292,9 @@ impl VirtioSnd {
             let addr = self.notify_cfg + (notify_off as u32 * self.notify_off_multiplier) as usize;
             core::ptr::write_volatile(addr as *mut u16, vq_id);
             let vq = self.vqs[0].as_mut().unwrap();
-            while vq.last_used_idx == core::ptr::read_volatile(&(*vq.used).idx) { core::hint::spin_loop(); }
+            let mut timeout = 1000000;
+            while vq.last_used_idx == core::ptr::read_volatile(&(*vq.used).idx) && timeout > 0 { core::hint::spin_loop(); timeout -= 1; }
+            if timeout == 0 { pci::serial_debug("[SND] CTRL CMD TIMEOUT\n"); return; }
             while vq.last_used_idx != core::ptr::read_volatile(&(*vq.used).idx) {
                 vq.last_used_idx = vq.last_used_idx.wrapping_add(1);
                 vq.num_free += 2;
@@ -299,11 +308,13 @@ impl VirtioSnd {
     pub fn send_pcm_data(&mut self, data: &[u8]) {
         if !self.initialized { return; }
         let mut offset = 0;
-        while offset < data.len() {
+        let mut total_timeout = 1000000;
+        while offset < data.len() && total_timeout > 0 {
             let vq = self.vqs[2].as_mut().unwrap();
             let used = unsafe { core::ptr::read_volatile(&(*vq.used).idx) };
             while vq.last_used_idx != used { vq.last_used_idx = vq.last_used_idx.wrapping_add(1); vq.num_free += 3; }
-            if vq.num_free < 3 { core::hint::spin_loop(); continue; }
+            if vq.num_free < 3 { core::hint::spin_loop(); total_timeout -= 1; continue; }
+            total_timeout = 1000000; // Reset timeout on progress
             
             let chunk_len = (data.len() - offset).min(512);
             let (h, vq_id, notify_off) = unsafe {
