@@ -29,6 +29,7 @@ pub mod time;
 pub mod ipc;
 
 // Re-export every public symbol so dependents can do `use leandros_libc::*`.
+pub use start::{get_vfs_port, get_net_port, get_audio_port};
 pub use io::*;
 pub use mem::*;
 pub use string::*;
