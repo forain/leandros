@@ -65,7 +65,8 @@ pub fn serial_debug_hex(v: u32) {
 pub fn serial_debug_hex_64(v: u64) {
     serial_debug("0x");
     for i in (0..16).rev() {
-        serial_debug(unsafe { core::str::from_utf8_unchecked(&[hex_digit(((v >> (i * 4)) & 0xF) as u8)]) });
+        let digit = hex_digit(((v >> (i * 4)) & 0xF) as u8);
+        serial_debug(unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(&digit, 1)) });
     }
 }
 
