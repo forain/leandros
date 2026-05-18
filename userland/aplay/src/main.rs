@@ -23,11 +23,10 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     let len = filename.iter().position(|&b| b == 0).unwrap_or(256);
     let filename_str = core::str::from_utf8_unchecked(&filename[..len]);
 
-    // ── Get Audio Port from Kernel (via Auxv) ───────────────────────────────
     let pw_port = get_audio_port();
 
     if pw_port == u32::MAX {
-        write_str("Error: Audio server port not found in auxv. Is PipeWire running?\n");
+        write_str("Error: Audio server port not found in auxv.\n");
         return 1;
     }
 
@@ -54,16 +53,17 @@ unsafe fn play_test_tone(port: u32) {
     set_audio_params(44100, 2, port);
     
     let mut phase = 0.0f32;
-    let mut pcm = [0i16; 220];
-    for _ in 0..1000 {
-        for i in (0..220).step_by(2) {
+    let mut pcm = [0i16; 218]; // 109 stereo samples = 436 bytes
+    for _ in 0..2000 { // ~5 seconds
+        for i in (0..218).step_by(2) {
             phase += 440.0 / 44100.0;
             if phase > 1.0 { phase -= 1.0; }
             let val = if phase < 0.5 { 15000 } else { -15000 }; 
             pcm[i] = val; pcm[i+1] = val;
         }
-        send_pcm(core::slice::from_raw_parts(pcm.as_ptr() as *const u8, 440), port);
+        send_pcm(core::slice::from_raw_parts(pcm.as_ptr() as *const u8, 436), port);
     }
+    write_str("aplay: test tone finished.\n");
 }
 
 unsafe fn play_wav(path: &str, port: u32) {
@@ -74,9 +74,9 @@ unsafe fn play_wav(path: &str, port: u32) {
     let channels = u16::from_le_bytes([header[22], header[23]]) as u8;
     let freq = u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
     set_audio_params(freq, channels, port);
-    let mut buf = [0u8; 438];
+    let mut buf = [0u8; 436];
     loop {
-        let n = read(fd, buf.as_mut_ptr(), 438);
+        let n = read(fd, buf.as_mut_ptr(), 436);
         if n <= 0 { break; }
         send_pcm(&buf[..n as usize], port);
     }
@@ -94,10 +94,10 @@ unsafe fn set_audio_params(freq: u32, channels: u8, port: u32) {
 unsafe fn send_pcm(data: &[u8], port: u32) {
     let mut msg = Message::empty();
     msg.tag = 0x200;
-    let len = data.len() as u16;
+    let len = data.len().min(438) as u16;
     msg.data[0] = (len & 0xFF) as u8;
     msg.data[1] = ((len >> 8) & 0xFF) as u8;
-    msg.data[2..2 + data.len()].copy_from_slice(data);
+    msg.data[2..2 + len as usize].copy_from_slice(&data[..len as usize]);
     ipc_call(port, &mut msg);
 }
 
@@ -109,35 +109,67 @@ unsafe fn play_mid(path: &str, port: u32) {
     let n = read(fd, MIDI_DATA.as_mut_ptr(), 65536);
     close(fd);
     if n < 14 { return; }
+    
+    if &MIDI_DATA[0..4] != b"MThd" { return; }
+    let division = u16::from_be_bytes([MIDI_DATA[12], MIDI_DATA[13]]);
+    
     set_audio_params(44100, 1, port);
     let mut synth = Synth::new();
     let mut ptr = 14;
-    if &MIDI_DATA[ptr..ptr+4] == b"MTrk" {
-        let track_len = u32::from_be_bytes([MIDI_DATA[ptr+4], MIDI_DATA[ptr+5], MIDI_DATA[ptr+6], MIDI_DATA[ptr+7]]) as usize;
-        ptr += 8;
-        let track_end = ptr + track_len;
-        let mut tempo = 500_000u32;
-        while ptr < track_end {
-            let mut val = 0u32;
-            loop {
-                let b = MIDI_DATA[ptr]; ptr += 1;
-                val = (val << 7) | (b & 0x7F) as u32;
-                if b & 0x80 == 0 { break; }
-            }
-            synth.generate_and_send((val as u64 * tempo as u64 * 44100 / (128 * 1_000_000)) as usize, port);
-            let status = MIDI_DATA[ptr]; ptr += 1;
-            match status & 0xF0 {
-                0x80 => { synth.note_off(MIDI_DATA[ptr]); ptr += 2; }
-                0x90 => { let note = MIDI_DATA[ptr]; if MIDI_DATA[ptr+1] == 0 { synth.note_off(note); } else { synth.note_on(note); } ptr += 2; }
-                0xFF => { let t = MIDI_DATA[ptr]; ptr += 1;
-                    let mut l = 0u32; loop { let b = MIDI_DATA[ptr]; ptr += 1; l = (l << 7) | (b & 0x7F) as u32; if b & 0x80 == 0 { break; } }
-                    if t == 0x51 { tempo = ((MIDI_DATA[ptr] as u32) << 16) | ((MIDI_DATA[ptr+1] as u32) << 8) | (MIDI_DATA[ptr+2] as u32); }
-                    ptr += l as usize;
+    
+    // Find first MTrk
+    while ptr + 8 < n as usize {
+        if &MIDI_DATA[ptr..ptr+4] == b"MTrk" {
+            let track_len = u32::from_be_bytes([MIDI_DATA[ptr+4], MIDI_DATA[ptr+5], MIDI_DATA[ptr+6], MIDI_DATA[ptr+7]]) as usize;
+            ptr += 8;
+            let track_end = ptr + track_len;
+            let mut tempo = 500_000u32;
+            
+            while ptr < track_end {
+                let delta = read_varlen(&raw const MIDI_DATA, &mut ptr);
+                let samples = (delta as u64 * tempo as u64 * 44100 / (division as u64 * 1_000_000)) as usize;
+                synth.generate_and_send(samples, port);
+                
+                let status = MIDI_DATA[ptr]; ptr += 1;
+                match status & 0xF0 {
+                    0x80 => { synth.note_off(MIDI_DATA[ptr]); ptr += 2; }
+                    0x90 => {
+                        let note = MIDI_DATA[ptr];
+                        if MIDI_DATA[ptr+1] == 0 { synth.note_off(note); }
+                        else { synth.note_on(note); }
+                        ptr += 2;
+                    }
+                    0xFF => {
+                        let t = MIDI_DATA[ptr]; ptr += 1;
+                        let l = read_varlen(&raw const MIDI_DATA, &mut ptr);
+                        if t == 0x51 && l == 3 {
+                            tempo = ((MIDI_DATA[ptr] as u32) << 16) | ((MIDI_DATA[ptr+1] as u32) << 8) | (MIDI_DATA[ptr+2] as u32);
+                        }
+                        ptr += l as usize;
+                    }
+                    _ => {
+                        if status < 0x80 { ptr -= 1; }
+                        else if status < 0xC0 || status >= 0xE0 { ptr += 2; }
+                        else { ptr += 1; }
+                    }
                 }
-                _ => { if status < 0x80 { ptr -= 1; } else if status < 0xC0 || status >= 0xE0 { ptr += 2; } else { ptr += 1; } }
             }
+            break;
         }
+        ptr += 1;
     }
+}
+
+fn read_varlen(data_ptr: *const [u8; 65536], ptr: &mut usize) -> u32 {
+    let data = unsafe { &*data_ptr };
+    let mut val = 0u32;
+    loop {
+        let b = data[*ptr];
+        *ptr += 1;
+        val = (val << 7) | (b & 0x7F) as u32;
+        if b & 0x80 == 0 { break; }
+    }
+    val
 }
 
 struct Synth { active_notes: [Option<f32>; 16], phases: [f32; 16] }
@@ -149,22 +181,24 @@ impl Synth {
     }
     fn note_off(&mut self, note: u8) {
         let f = get_note_freq(note);
-        for i in 0..16 { if let Some(an) = self.active_notes[i] { let diff = if an > f { an - f } else { f - an }; if diff < 1.0 { self.active_notes[i] = None; } } }
+        for i in 0..16 { if let Some(an) = self.active_notes[i] { 
+            let diff = if an > f { an - f } else { f - an };
+            if diff < 1.0 { self.active_notes[i] = None; } 
+        } }
     }
     unsafe fn generate_and_send(&mut self, mut samples: usize, port: u32) {
-        let mut pcm = [0i16; 220];
+        let mut pcm = [0i16; 200]; // 100 mono samples = 200 bytes
         while samples > 0 {
-            let n = if samples > 110 { 110 } else { samples };
+            let n = if samples > 100 { 100 } else { samples };
             for i in 0..n {
                 let mut s = 0f32; let mut count = 0;
                 for j in 0..16 { if let Some(freq) = self.active_notes[j] {
                     self.phases[j] += freq / 44100.0; if self.phases[j] > 1.0 { self.phases[j] -= 1.0; }
-                    s += if self.phases[j] < 0.5 { 12000.0 } else { -12000.0 }; count += 1;
+                    s += if self.phases[j] < 0.5 { 8000.0 } else { -8000.0 }; count += 1;
                 }}
-                pcm[i*2] = if count > 0 { (s / count as f32) as i16 } else { 0 };
-                pcm[i*2+1] = pcm[i*2];
+                pcm[i] = if count > 0 { (s / count as f32) as i16 } else { 0 };
             }
-            send_pcm(core::slice::from_raw_parts(pcm.as_ptr() as *const u8, n * 4), port);
+            send_pcm(core::slice::from_raw_parts(pcm.as_ptr() as *const u8, n * 2), port);
             samples -= n;
         }
     }
