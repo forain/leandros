@@ -480,6 +480,17 @@ static SERVER_PORT: Mutex<u32> = Mutex::new(u32::MAX);
 pub fn init(owner_pid: u32) -> Option<u32> {
     let port_id = port::create(owner_pid)?;
     *SERVER_PORT.lock() = port_id;
+    
+    // Register IPC handler to respond to PINGs (prevents deadlocks during discovery scans)
+    port::register_handler(port_id, |msg, pid| {
+        if msg.tag == 0x1000 {
+            let mut reply = Message::empty();
+            reply.tag = 0x1001;
+            reply
+        } else {
+            handle(msg, pid)
+        }
+    });
 
     // Test: manually register a test device that should route to DRM server for testing
     {
@@ -581,7 +592,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                                         arg(msg,1) as usize),
         VFS_IOCTL            => handle_ioctl(caller_pid, arg(msg,0) as usize,
                                               arg(msg,1) as usize, arg(msg,2) as usize),
-        _                    => err_reply(-38),
+        _                    => err_reply(-38), // ENOSYS
     }
 }
 

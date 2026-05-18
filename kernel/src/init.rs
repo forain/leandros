@@ -44,6 +44,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             serial_print_str("[INIT] PipeWire server port: ");
             crate::print_number(p);
             serial_print_str("\n");
+            crate::syscall::set_audio_server_port(p);
         },
         Err(_) => {
             serial_print_str("[INIT] ERROR: PipeWire server initialization failed\n");
