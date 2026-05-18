@@ -24,28 +24,18 @@ pub const VIRTIO_SND_R_PCM_START:        u32 = 0x0104;
 pub const VIRTIO_SND_R_PCM_STOP:         u32 = 0x0105;
 
 pub const VIRTIO_SND_S_OK:               u32 = 0x8000;
-pub const VIRTIO_SND_S_BAD_MSG:          u32 = 0x8001;
-pub const VIRTIO_SND_S_NOT_SUPP:         u32 = 0x8002;
-pub const VIRTIO_SND_S_IO_ERR:           u32 = 0x8003;
 
 pub const VIRTIO_SND_PCM_FMT_S16:        u8 = 5;
-pub const VIRTIO_SND_PCM_RATE_11025:     u8 = 2;
-pub const VIRTIO_SND_PCM_RATE_22050:     u8 = 4;
 pub const VIRTIO_SND_PCM_RATE_44100:     u8 = 6;
 pub const VIRTIO_SND_PCM_RATE_48000:     u8 = 7;
 
 const QUEUE_SIZE: usize = 256;
 
 #[repr(C)]
-struct VirtioSndHdr {
-    code: u32,
-}
+struct VirtioSndHdr { code: u32 }
 
 #[repr(C)]
-struct VirtioSndPcmHdr {
-    hdr: VirtioSndHdr,
-    stream_id: u32,
-}
+struct VirtioSndPcmHdr { hdr: VirtioSndHdr, stream_id: u32 }
 
 #[repr(C)]
 struct VirtioSndPcmSetParams {
@@ -60,61 +50,29 @@ struct VirtioSndPcmSetParams {
 }
 
 #[repr(C)]
-struct VirtioSndPcmXfer {
-    stream_id: u32,
-}
+struct VirtioSndPcmXfer { stream_id: u32 }
 
 #[repr(C)]
-struct VirtioSndPcmStatus {
-    status: u32,
-    latency_bytes: u32,
-}
+struct VirtioSndPcmStatus { status: u32, latency_bytes: u32 }
 
 #[repr(C)]
-struct VirtioDesc {
-    addr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
-}
+struct VirtioDesc { addr: u64, len: u32, flags: u16, next: u16 }
 
 #[repr(C, align(2))]
-struct VirtioAvail {
-    flags: u16,
-    idx: u16,
-    ring: [u16; QUEUE_SIZE],
-    used_event: u16,
-}
+struct VirtioAvail { flags: u16, idx: u16, ring: [u16; QUEUE_SIZE], used_event: u16 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct VirtioUsedElem {
-    id: u32,
-    len: u32,
-}
+struct VirtioUsedElem { id: u32, len: u32 }
 
 #[repr(C, align(4))]
-struct VirtioUsed {
-    flags: u16,
-    idx: u16,
-    ring: [VirtioUsedElem; QUEUE_SIZE],
-    avail_event: u16,
-}
+struct VirtioUsed { flags: u16, idx: u16, ring: [VirtioUsedElem; QUEUE_SIZE], avail_event: u16 }
 
 struct VirtQueue {
-    id: u16,
-    notify_off: u16,
-    desc: *mut VirtioDesc,
-    avail: *mut VirtioAvail,
-    used: *mut VirtioUsed,
-    last_avail_idx: u16,
-    last_used_idx: u16,
-    free_head: u16,
-    num_free: u16,
+    id: u16, notify_off: u16,
+    desc: *mut VirtioDesc, avail: *mut VirtioAvail, used: *mut VirtioUsed,
+    last_avail_idx: u16, last_used_idx: u16, free_head: u16, num_free: u16,
 }
-
-unsafe impl Send for VirtQueue {}
-unsafe impl Sync for VirtQueue {}
 
 #[repr(C)]
 struct VirtioSndPersistent {
@@ -126,13 +84,11 @@ struct VirtioSndPersistent {
 }
 
 pub struct VirtioSnd {
-    common_cfg: usize,
-    notify_cfg: usize,
-    notify_off_multiplier: u32,
+    common_cfg: usize, notify_cfg: usize, notify_off_multiplier: u32,
     vqs: [Option<VirtQueue>; 4],
     persistent: *mut VirtioSndPersistent,
-    initialized: bool,
-    stream_active: bool,
+    initialized: bool, stream_active: bool,
+    tx_count: u32,
 }
 
 unsafe impl Send for VirtioSnd {}
@@ -141,44 +97,45 @@ unsafe impl Sync for VirtioSnd {}
 impl VirtioSnd {
     pub const fn new() -> Self {
         Self {
-            common_cfg: 0,
-            notify_cfg: 0,
-            notify_off_multiplier: 0,
-            vqs: [None, None, None, None],
-            persistent: core::ptr::null_mut(),
-            initialized: false,
-            stream_active: false,
+            common_cfg: 0, notify_cfg: 0, notify_off_multiplier: 0,
+            vqs: [None, None, None, None], persistent: core::ptr::null_mut(),
+            initialized: false, stream_active: false, tx_count: 0,
         }
     }
 
     unsafe fn init_device(&mut self) -> Result<(), DriverError> {
-        pci::serial_debug("[SND] Initializing VirtIO Sound...\n");
-        let dev = pci::find_device(VIRTIO_SND_VENDOR_ID, VIRTIO_SND_DEVICE_ID).ok_or(DriverError::NotFound)?;
+        pci::serial_debug("[SND] Probing VirtIO Sound...\n");
+        let dev = pci::find_device(VIRTIO_SND_VENDOR_ID, VIRTIO_SND_DEVICE_ID).ok_or_else(|| {
+            pci::serial_debug("[SND] Device not found in PCI scan\n");
+            DriverError::NotFound
+        })?;
+        
         let pci_cmd = pci::pci_read_config_16(dev.bus, dev.dev, dev.func, 0x04);
         pci::pci_write_config_16(dev.bus, dev.dev, dev.func, 0x04, pci_cmd | 0x06);
 
-        let pages = (core::mem::size_of::<VirtioSndPersistent>() + 4095) / 4096;
-        let mut order = 0;
-        while (1 << order) < pages { order += 1; }
-        let phys = buddy::alloc(order).ok_or(DriverError::Io)?;
+        let phys = buddy::alloc(6).ok_or(DriverError::Io)?; // Allocate 64 pages (order 6)
         self.persistent = phys_to_virt(phys) as *mut VirtioSndPersistent;
-        core::ptr::write_bytes(self.persistent as *mut u8, 0, (1 << order) * 4096);
+        core::ptr::write_bytes(self.persistent as *mut u8, 0, 64 * 4096);
 
+        pci::serial_debug("[SND] Parsing capabilities...\n");
         self.parse_caps(&dev)?;
-        if self.common_cfg == 0 { return Err(DriverError::NotFound); }
+        if self.common_cfg == 0 { 
+            pci::serial_debug("[SND] common_cfg not found!\n");
+            return Err(DriverError::NotFound); 
+        }
+        pci::serial_debug("[SND] common_cfg mapped at "); pci::serial_debug_hex(self.common_cfg as u32); pci::serial_debug("\n");
 
         self.write_common_8(20, 0); // Reset
         let mut status = 3; // ACKNOWLEDGE | DRIVER
         self.write_common_8(20, status);
         
-        self.write_common_32(8, 0); // Features 0-31
-        let f0 = self.read_common_32(4);
-        self.write_common_32(12, f0);
+        self.write_common_32(8, 0); // Feature selector 0
+        self.write_common_32(12, 0); // Reject all features in selector 0
         
-        self.write_common_32(8, 1); // Features 32-63
+        self.write_common_32(8, 1); // Feature selector 1
         let f1 = self.read_common_32(4);
-        self.write_common_32(12, f1 | 1); // Accept VERSION_1
-
+        self.write_common_32(12, f1 & 1); // Accept VERSION_1
+        
         status |= 8; // FEATURES_OK
         self.write_common_8(20, status);
         if self.read_common_8(20) & 8 == 0 { return Err(DriverError::Unsupported); }
@@ -188,7 +145,7 @@ impl VirtioSnd {
         self.write_common_8(20, status);
 
         self.initialized = true;
-        pci::serial_debug("[SND] Initialized.\n");
+        pci::serial_debug("[SND] Initialized successfully.\n");
         Ok(())
     }
 
@@ -203,6 +160,7 @@ impl VirtioSnd {
         core::ptr::write_bytes(virt as *mut u8, 0, 8192);
         for i in 0..QUEUE_SIZE as u16 {
             (*desc.add(i as usize)).next = (i + 1) % QUEUE_SIZE as u16;
+            (*desc.add(i as usize)).flags = 0;
         }
         self.write_common_16(24, QUEUE_SIZE as u16);
         self.write_common_64(32, phys as u64);
@@ -218,23 +176,53 @@ impl VirtioSnd {
 
     unsafe fn parse_caps(&mut self, dev: &pci::PciDevice) -> Result<(), DriverError> {
         let mut ptr = pci::pci_read_config_8(dev.bus, dev.dev, dev.func, 0x34);
+        pci::serial_debug("[SND] Capability chain starts at "); pci::serial_debug_hex(ptr as u32); pci::serial_debug("\n");
+        
         while ptr != 0 {
-            let dw0 = pci::pci_read_config_32(dev.bus, dev.dev, dev.func, ptr);
-            let dw1 = pci::pci_read_config_32(dev.bus, dev.dev, dev.func, ptr + 4);
-            let (id, typ, bar) = (dw0 as u8, (dw0 >> 24) as u8, dw1 as u8);
-            if id == 0x09 && bar < 6 {
-                let off = pci::pci_read_config_32(dev.bus, dev.dev, dev.func, ptr + 8);
-                let base = map_kernel_device((dev.bars[bar as usize] & !0xF) as usize, 0x10000, PageFlags::PRESENT|PageFlags::WRITABLE|PageFlags::NOCACHE).ok_or(DriverError::Io)?;
-                match typ {
-                    1 => self.common_cfg = base + off as usize,
-                    2 => {
-                        self.notify_cfg = base + off as usize;
-                        self.notify_off_multiplier = pci::pci_read_config_32(dev.bus, dev.dev, dev.func, ptr + 16);
+            let id = pci::pci_read_config_8(dev.bus, dev.dev, dev.func, ptr);
+            let next = pci::pci_read_config_8(dev.bus, dev.dev, dev.func, ptr + 1);
+            pci::serial_debug("  [SND] Found Cap ID "); pci::serial_debug_hex(id as u32);
+            pci::serial_debug(" at "); pci::serial_debug_hex(ptr as u32);
+            pci::serial_debug("\n");
+
+            if id == 0x09 {
+                let typ = pci::pci_read_config_8(dev.bus, dev.dev, dev.func, ptr + 3);
+                let bar_idx = pci::pci_read_config_8(dev.bus, dev.dev, dev.func, ptr + 4);
+                let off = pci::pci_read_config_32_any(dev.bus, dev.dev, dev.func, ptr + 8);
+                let len = pci::pci_read_config_32_any(dev.bus, dev.dev, dev.func, ptr + 12);
+                
+                pci::serial_debug("    [SND] VirtIO type="); pci::serial_debug_hex(typ as u32);
+                pci::serial_debug(" BAR="); pci::serial_debug_hex(bar_idx as u32);
+                pci::serial_debug("\n");
+
+                if bar_idx < 6 {
+                    let mut bar_val = dev.bars[bar_idx as usize] as u64;
+                    if (bar_val & 0x06) == 0x04 && bar_idx < 5 {
+                        let high = pci::pci_read_config_32(dev.bus, dev.dev, dev.func, 0x10 + (bar_idx + 1) * 4);
+                        bar_val |= (high as u64) << 32;
                     }
-                    _ => {}
+                    
+                    let phys = (bar_val & !0xF) as usize;
+                    if phys != 0 {
+                        let map_size = (off as usize + len as usize + 4095) & !4095;
+                        let base = map_kernel_device(phys, map_size.max(0x10000), PageFlags::PRESENT|PageFlags::WRITABLE|PageFlags::NOCACHE).ok_or(DriverError::Io)?;
+                        
+                        match typ {
+                            1 => {
+                                self.common_cfg = base + off as usize;
+                                pci::serial_debug("    [SND] common_cfg mapped at "); pci::serial_debug_hex(self.common_cfg as u32); pci::serial_debug("\n");
+                            }
+                            2 => {
+                                self.notify_cfg = base + off as usize;
+                                self.notify_off_multiplier = pci::pci_read_config_32_any(dev.bus, dev.dev, dev.func, ptr + 16);
+                                pci::serial_debug("    [SND] notify_cfg mapped multiplier="); pci::serial_debug_hex(self.notify_off_multiplier); pci::serial_debug("\n");
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
-            ptr = ((dw0 >> 8) & 0xFF) as u8;
+            ptr = next;
         }
         Ok(())
     }
@@ -247,10 +235,10 @@ impl VirtioSnd {
     unsafe fn read_common_32(&self, o: usize) -> u32 { core::ptr::read_volatile((self.common_cfg+o) as *const u32) }
     unsafe fn read_common_8(&self, o: usize) -> u8 { core::ptr::read_volatile((self.common_cfg+o) as *const u8) }
 
-    fn reconfigure_stream(&mut self, stream_id: u32, freq: u32, channels: u8) {
+    pub fn reconfigure_stream(&mut self, stream_id: u32, freq: u32, channels: u8) {
         let rate = match freq { 11025=>2, 22050=>4, 44100=>6, 48000=>7, _=>6 };
-        pci::serial_debug("[SND] Config stream freq="); pci::serial_debug_hex(freq);
-        pci::serial_debug(" v-rate="); pci::serial_debug_hex(rate as u32); pci::serial_debug("\n");
+        pci::serial_debug("[SND] Reconfiguring stream 0: freq="); pci::serial_debug_hex(freq);
+        pci::serial_debug(" rate="); pci::serial_debug_hex(rate as u32); pci::serial_debug("\n");
 
         if self.stream_active {
             self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_STOP }, stream_id });
@@ -263,11 +251,12 @@ impl VirtioSnd {
         self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_PREPARE }, stream_id });
         self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_START }, stream_id });
         self.stream_active = true;
+        self.tx_count = 0;
     }
 
     fn send_control_cmd<T>(&mut self, cmd: &T) {
         let code = unsafe { *(cmd as *const T as *const u32) };
-        pci::serial_debug("[SND] Sending CTRL CMD "); pci::serial_debug_hex(code); pci::serial_debug("...\n");
+        pci::serial_debug("[SND] CTRL CMD "); pci::serial_debug_hex(code); pci::serial_debug(" -> ");
         let (h, vq_id, notify_off) = {
             let vq = self.vqs[0].as_mut().unwrap();
             unsafe {
@@ -292,16 +281,15 @@ impl VirtioSnd {
             let addr = self.notify_cfg + (notify_off as u32 * self.notify_off_multiplier) as usize;
             core::ptr::write_volatile(addr as *mut u16, vq_id);
             let vq = self.vqs[0].as_mut().unwrap();
-            let mut timeout = 1000000;
+            let mut timeout = 5000000;
             while vq.last_used_idx == core::ptr::read_volatile(&(*vq.used).idx) && timeout > 0 { core::hint::spin_loop(); timeout -= 1; }
-            if timeout == 0 { pci::serial_debug("[SND] CTRL CMD TIMEOUT\n"); return; }
+            if timeout == 0 { pci::serial_debug("TIMEOUT\n"); return; }
             while vq.last_used_idx != core::ptr::read_volatile(&(*vq.used).idx) {
                 vq.last_used_idx = vq.last_used_idx.wrapping_add(1);
                 vq.num_free += 2;
             }
             let s = core::ptr::read_volatile(&(*self.persistent).ctrl_status.code);
-            if s != VIRTIO_SND_S_OK { pci::serial_debug("[SND] CTRL failed "); pci::serial_debug_hex(s); pci::serial_debug("\n"); }
-            else { pci::serial_debug("[SND] CTRL CMD OK\n"); }
+            pci::serial_debug_hex(s); pci::serial_debug("\n");
         }
     }
 
@@ -343,6 +331,8 @@ impl VirtioSnd {
                 core::ptr::write_volatile(addr as *mut u16, vq_id);
             }
             offset += chunk_len;
+            self.tx_count += 1;
+            if self.tx_count % 1000 == 0 { pci::serial_debug("[SND] TX pkts: "); pci::serial_debug_hex(self.tx_count); pci::serial_debug("\n"); }
         }
     }
 }
