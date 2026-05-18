@@ -42,17 +42,20 @@ static AUX_NET_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
 static AUX_AUDIO_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Returns the VFS server port resolved from auxv.
-pub fn get_vfs_port() -> u32 {
+#[no_mangle]
+pub extern "C" fn get_vfs_port() -> u32 {
     AUX_VFS_PORT.load(Ordering::Relaxed)
 }
 
 /// Returns the net server port resolved from auxv.
-pub fn get_net_port() -> u32 {
+#[no_mangle]
+pub extern "C" fn get_net_port() -> u32 {
     AUX_NET_PORT.load(Ordering::Relaxed)
 }
 
 /// Returns the audio server port resolved from auxv.
-pub fn get_audio_port() -> u32 {
+#[no_mangle]
+pub extern "C" fn get_audio_port() -> u32 {
     AUX_AUDIO_PORT.load(Ordering::Relaxed)
 }
 
