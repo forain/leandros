@@ -13,7 +13,8 @@
 
 // ── PipeWire / LeandrOS Audio Protocol ──────────────────────────────────────
 
-static uint32_t s_pw_port = 3; 
+extern uint32_t get_audio_port(void);
+static uint32_t s_pw_port = 0xFFFFFFFF; 
 
 struct ipc_msg {
     uint64_t tag;         // 0
@@ -43,35 +44,59 @@ static long syscall3(long num, long a0, long a1, long a2) {
 
 void leandros_audio_init() {
     write(1, "[SDL] leandros_audio_init\n", 26);
+    s_pw_port = get_audio_port();
+    if (s_pw_port == 0xFFFFFFFF) {
+        write(1, "[SDL]   PipeWire port not found in auxv\n", 40);
+        return;
+    }
     struct ipc_msg msg __attribute__((aligned(8)));
     memset(&msg, 0, sizeof(msg));
     msg.tag = 0x1000; // PING
     long ret = syscall3(513, s_pw_port, (long)&msg, 0);
     if (ret == 0 && msg.tag == 0x1001) {
-        write(1, "[SDL]   PipeWire verified on port 3\n", 36);
+        write(1, "[SDL]   PipeWire verified via IPC\n", 34);
     } else {
         write(1, "[SDL]   PipeWire verification failed!\n", 37);
+        s_pw_port = 0xFFFFFFFF;
     }
 }
 
+void leandros_audio_pump() {
+    if (s_pw_port == 0xFFFFFFFF) return;
+    struct ipc_msg msg __attribute__((aligned(8)));
+    memset(&msg, 0, sizeof(msg));
+    msg.tag = 0x300; // PUMP
+    syscall3(511, s_pw_port, (long)&msg, 0); // IPC_SEND
+}
+
 void leandros_audio_send_pcm(const void* data, size_t len) {
+    if (s_pw_port == 0xFFFFFFFF) return;
     const uint8_t* ptr = (const uint8_t*)data;
     size_t remaining = len;
     while (remaining > 0) {
         struct ipc_msg msg __attribute__((aligned(8)));
         memset(&msg, 0, sizeof(msg));
         msg.tag = 0x200;
-        uint16_t actual_len = remaining > 438 ? 438 : remaining;
+        uint16_t actual_len = remaining > 436 ? 436 : remaining;
         msg.data[0] = (uint8_t)(actual_len & 0xFF);
         msg.data[1] = (uint8_t)((actual_len >> 8) & 0xFF);
         memcpy(&msg.data[2], ptr, actual_len);
-        syscall3(513, s_pw_port, (long)&msg, 0); 
+        
+        // Use IPC_SEND (511) instead of IPC_CALL (513) to avoid blocking
+        long ret = syscall3(511, s_pw_port, (long)&msg, 0); 
+        if (ret == -11) { // EAGAIN (port queue full)
+            leandros_audio_pump();
+            usleep(1000); 
+            continue; 
+        }
+        
         ptr += actual_len;
         remaining -= actual_len;
     }
 }
 
 void leandros_audio_set_params(int freq, int channels) {
+    if (s_pw_port == 0xFFFFFFFF) return;
     struct ipc_msg msg __attribute__((aligned(8)));
     memset(&msg, 0, sizeof(msg));
     msg.tag = 0x100; // SET_PARAMS
@@ -173,7 +198,10 @@ SDL_Window* SDL_CreateWindow(const char* title, int x, int y, int w, int h, uint
 SDL_Renderer* SDL_CreateRenderer(SDL_Window* window, int index, uint32_t flags) { return (SDL_Renderer*)0x5678; }
 SDL_Texture* SDL_CreateTexture(SDL_Renderer* renderer, uint32_t format, int access, int w, int h) { return (SDL_Texture*)0x9ABC; }
 
+extern void leandros_audio_pump(void);
+
 void SDL_UpdateTexture(SDL_Texture* texture, const void* rect, const void* pixels, int pitch) {
+    leandros_audio_pump();
     if (s_drm_fd >= 0 && pixels) {
         // If resolution matches exactly, use fast direct write
         if (s_screen_width == DOOMGENERIC_RESX && s_screen_height == DOOMGENERIC_RESY && s_screen_pitch == DOOMGENERIC_RESX * 4) {
@@ -225,6 +253,7 @@ void SDL_RenderClear(SDL_Renderer* renderer) {}
 void SDL_RenderCopy(SDL_Renderer* renderer, SDL_Texture* texture, const void* srcrect, const void* dstrect) {}
 void SDL_RenderPresent(SDL_Renderer* renderer) {}
 int SDL_PollEvent(SDL_Event* event) {
+    leandros_audio_pump();
     static int ev_fd = -2;
     if (ev_fd == -2) {
         ev_fd = open("/dev/input/event0", O_RDONLY, 0); 
