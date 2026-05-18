@@ -55,6 +55,16 @@ pub fn set_net_server_port(port: u32) {
     NET_SERVER_PORT.store(port, Ordering::Relaxed);
 }
 
+/// IPC port of the audio server; u32::MAX = not yet registered.
+static AUDIO_SERVER_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Auxv tag: Leandros audio server port.
+const AT_LEANDROS_AUDIO_PORT: u64 = 258;
+
+pub fn set_audio_server_port(port: u32) {
+    AUDIO_SERVER_PORT.store(port, Ordering::Relaxed);
+}
+
 // ── VFS call helper ───────────────────────────────────────────────────────────
 
 /// Build a VFS message with up to 7 u64 arguments packed into data[].
@@ -1890,8 +1900,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 
     // pointer table: argc(1) + argv[argc](argc) + null(1) + envp[envc](envc) + null(1)
     let ptr_words = 1 + argc + 1 + envc + 1;
-    // auxv: AT_RANDOM + AT_PAGESZ + AT_UID + AT_EUID + AT_GID + AT_EGID + AT_LEANDROS_VFS_PORT + AT_NULL = 8 pairs
-    let auxv_words = 8 * 2;
+    // auxv: RANDOM + PAGESZ + UID + EUID + GID + EGID + VFS + NET + AUDIO + NULL = 10 pairs
+    let auxv_words = 10 * 2;
     let total_words = ptr_words + auxv_words;
     let total_ptr_bytes = total_words * W;
     // Align string section to 16 bytes.
@@ -1954,6 +1964,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         (13, 0),                                   // AT_GID
         (14, 0),                                   // AT_EGID
         (AT_LEANDROS_VFS_PORT, VFS_SERVER_PORT.load(Ordering::Relaxed) as u64),
+        (AT_LEANDROS_NET_PORT, NET_SERVER_PORT.load(Ordering::Relaxed) as u64),
+        (AT_LEANDROS_AUDIO_PORT, AUDIO_SERVER_PORT.load(Ordering::Relaxed) as u64),
         (0,  0),                                   // AT_NULL
     ];
     for &(k, v) in auxv {
