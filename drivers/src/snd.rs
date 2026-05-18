@@ -117,7 +117,6 @@ impl VirtioSnd {
         self.persistent = phys_to_virt(phys) as *mut VirtioSndPersistent;
         core::ptr::write_bytes(self.persistent as *mut u8, 0, 64 * 4096);
 
-        pci::serial_debug("[SND] Parsing capabilities...\n");
         self.parse_caps(&dev)?;
         if self.common_cfg == 0 { 
             pci::serial_debug("[SND] common_cfg not found!\n");
@@ -176,25 +175,15 @@ impl VirtioSnd {
 
     unsafe fn parse_caps(&mut self, dev: &pci::PciDevice) -> Result<(), DriverError> {
         let mut ptr = pci::pci_read_config_8(dev.bus, dev.dev, dev.func, 0x34);
-        pci::serial_debug("[SND] Capability chain starts at "); pci::serial_debug_hex(ptr as u32); pci::serial_debug("\n");
-        
         while ptr != 0 {
             let id = pci::pci_read_config_8(dev.bus, dev.dev, dev.func, ptr);
             let next = pci::pci_read_config_8(dev.bus, dev.dev, dev.func, ptr + 1);
-            pci::serial_debug("  [SND] Found Cap ID "); pci::serial_debug_hex(id as u32);
-            pci::serial_debug(" at "); pci::serial_debug_hex(ptr as u32);
-            pci::serial_debug("\n");
-
             if id == 0x09 {
                 let typ = pci::pci_read_config_8(dev.bus, dev.dev, dev.func, ptr + 3);
                 let bar_idx = pci::pci_read_config_8(dev.bus, dev.dev, dev.func, ptr + 4);
                 let off = pci::pci_read_config_32_any(dev.bus, dev.dev, dev.func, ptr + 8);
                 let len = pci::pci_read_config_32_any(dev.bus, dev.dev, dev.func, ptr + 12);
                 
-                pci::serial_debug("    [SND] VirtIO type="); pci::serial_debug_hex(typ as u32);
-                pci::serial_debug(" BAR="); pci::serial_debug_hex(bar_idx as u32);
-                pci::serial_debug("\n");
-
                 if bar_idx < 6 {
                     let mut bar_val = dev.bars[bar_idx as usize] as u64;
                     if (bar_val & 0x06) == 0x04 && bar_idx < 5 {
@@ -208,14 +197,10 @@ impl VirtioSnd {
                         let base = map_kernel_device(phys, map_size.max(0x10000), PageFlags::PRESENT|PageFlags::WRITABLE|PageFlags::NOCACHE).ok_or(DriverError::Io)?;
                         
                         match typ {
-                            1 => {
-                                self.common_cfg = base + off as usize;
-                                pci::serial_debug("    [SND] common_cfg mapped at "); pci::serial_debug_hex(self.common_cfg as u32); pci::serial_debug("\n");
-                            }
+                            1 => { self.common_cfg = base + off as usize; }
                             2 => {
                                 self.notify_cfg = base + off as usize;
                                 self.notify_off_multiplier = pci::pci_read_config_32_any(dev.bus, dev.dev, dev.func, ptr + 16);
-                                pci::serial_debug("    [SND] notify_cfg mapped multiplier="); pci::serial_debug_hex(self.notify_off_multiplier); pci::serial_debug("\n");
                             }
                             _ => {}
                         }
@@ -257,8 +242,13 @@ impl VirtioSnd {
     fn send_control_cmd<T>(&mut self, cmd: &T) {
         let code = unsafe { *(cmd as *const T as *const u32) };
         pci::serial_debug("[SND] CTRL CMD "); pci::serial_debug_hex(code); pci::serial_debug(" -> ");
-        let (h, vq_id, notify_off) = {
+        
+        let mut vq_id = 0;
+        let mut notify_off = 0;
+        let head = {
             let vq = self.vqs[0].as_mut().unwrap();
+            vq_id = vq.id;
+            notify_off = vq.notify_off;
             unsafe {
                 core::ptr::copy_nonoverlapping(cmd as *const T as *const u8, (*self.persistent).ctrl_cmd.as_mut_ptr(), core::mem::size_of::<T>());
                 core::ptr::write_volatile(&mut (*self.persistent).ctrl_status.code, 0xFFFF);
@@ -274,7 +264,7 @@ impl VirtioSnd {
                 vq.last_avail_idx = vq.last_avail_idx.wrapping_add(1);
                 atomic::compiler_fence(Ordering::SeqCst);
                 (*vq.avail).idx = vq.last_avail_idx;
-                (h, vq.id, vq.notify_off)
+                h
             }
         };
         unsafe {
@@ -293,47 +283,55 @@ impl VirtioSnd {
         }
     }
 
-    pub fn send_pcm_data(&mut self, data: &[u8]) {
-        if !self.initialized { return; }
-        let mut offset = 0;
-        let mut total_timeout = 1000000;
-        while offset < data.len() && total_timeout > 0 {
-            let vq = self.vqs[2].as_mut().unwrap();
-            let used = unsafe { core::ptr::read_volatile(&(*vq.used).idx) };
-            while vq.last_used_idx != used { vq.last_used_idx = vq.last_used_idx.wrapping_add(1); vq.num_free += 3; }
-            if vq.num_free < 3 { core::hint::spin_loop(); total_timeout -= 1; continue; }
-            total_timeout = 1000000; // Reset timeout on progress
-            
-            let chunk_len = (data.len() - offset).min(512);
-            let (h, vq_id, notify_off) = unsafe {
-                let slot = vq.last_avail_idx as usize % QUEUE_SIZE;
-                (*self.persistent).tx_xfer[slot].stream_id = 0;
-                core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), (*self.persistent).tx_data[slot].as_mut_ptr(), chunk_len);
-                let h = vq.free_head;
-                let d1 = vq.desc.add(h as usize);
-                (*d1).addr = virt_to_phys(&(*self.persistent).tx_xfer[slot] as *const _ as usize) as u64;
-                (*d1).len = 4; (*d1).flags = 1;
-                let d2 = vq.desc.add((*d1).next as usize);
-                (*d2).addr = virt_to_phys((*self.persistent).tx_data[slot].as_ptr() as usize) as u64;
-                (*d2).len = chunk_len as u32; (*d2).flags = 1;
-                let d3 = vq.desc.add((*d2).next as usize);
-                (*d3).addr = virt_to_phys(&(*self.persistent).tx_status[slot] as *const _ as usize) as u64;
-                (*d3).len = 8; (*d3).flags = 2;
-                vq.free_head = (*d3).next; vq.num_free -= 3;
-                (*vq.avail).ring[vq.last_avail_idx as usize % QUEUE_SIZE] = h;
-                vq.last_avail_idx = vq.last_avail_idx.wrapping_add(1);
-                atomic::compiler_fence(Ordering::SeqCst);
-                (*vq.avail).idx = vq.last_avail_idx;
-                (h, vq.id, vq.notify_off)
-            };
-            unsafe {
-                let addr = self.notify_cfg + (notify_off as u32 * self.notify_off_multiplier) as usize;
-                core::ptr::write_volatile(addr as *mut u16, vq_id);
-            }
-            offset += chunk_len;
-            self.tx_count += 1;
-            if self.tx_count % 1000 == 0 { pci::serial_debug("[SND] TX pkts: "); pci::serial_debug_hex(self.tx_count); pci::serial_debug("\n"); }
+    /// Non-blocking PCM transmission. Returns bytes actually queued.
+    pub fn send_pcm_data(&mut self, data: &[u8]) -> usize {
+        if !self.initialized { return 0; }
+        
+        let vq = self.vqs[2].as_mut().unwrap();
+        // Reclaim processed descriptors
+        let used = unsafe { core::ptr::read_volatile(&(*vq.used).idx) };
+        while vq.last_used_idx != used {
+            vq.last_used_idx = vq.last_used_idx.wrapping_add(1);
+            vq.num_free += 3;
         }
+
+        if vq.num_free < 3 { return 0; }
+        
+        let chunk_len = data.len().min(512);
+        let vq_id = vq.id;
+        let notify_off = vq.notify_off;
+        unsafe {
+            let slot = vq.last_avail_idx as usize % QUEUE_SIZE;
+            (*self.persistent).tx_xfer[slot].stream_id = 0;
+            core::ptr::copy_nonoverlapping(data.as_ptr(), (*self.persistent).tx_data[slot].as_mut_ptr(), chunk_len);
+            
+            let h = vq.free_head;
+            let d1 = vq.desc.add(h as usize);
+            (*d1).addr = virt_to_phys(&(*self.persistent).tx_xfer[slot] as *const _ as usize) as u64;
+            (*d1).len = 4; (*d1).flags = 1;
+            let d2 = vq.desc.add((*d1).next as usize);
+            (*d2).addr = virt_to_phys((*self.persistent).tx_data[slot].as_ptr() as usize) as u64;
+            (*d2).len = chunk_len as u32; (*d2).flags = 1;
+            let d3 = vq.desc.add((*d2).next as usize);
+            (*d3).addr = virt_to_phys(&(*self.persistent).tx_status[slot] as *const _ as usize) as u64;
+            (*d3).len = 8; (*d3).flags = 2;
+            
+            vq.free_head = (*d3).next; vq.num_free -= 3;
+            (*vq.avail).ring[vq.last_avail_idx as usize % QUEUE_SIZE] = h;
+            vq.last_avail_idx = vq.last_avail_idx.wrapping_add(1);
+            atomic::compiler_fence(Ordering::SeqCst);
+            (*vq.avail).idx = vq.last_avail_idx;
+        };
+        unsafe {
+            let addr = self.notify_cfg + (notify_off as u32 * self.notify_off_multiplier) as usize;
+            core::ptr::write_volatile(addr as *mut u16, vq_id);
+        }
+        
+        self.tx_count += 1;
+        if self.tx_count % 1000 == 0 {
+            pci::serial_debug("[SND] TX pkts: "); pci::serial_debug_hex(self.tx_count); pci::serial_debug("\n");
+        }
+        chunk_len
     }
 }
 
