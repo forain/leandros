@@ -23,6 +23,6 @@ pub struct Message {
 
 impl Message {
     pub const fn empty() -> Self {
-        Self { tag: 0, reply_port: 0, data: [0; MESSAGE_INLINE_BYTES], has_cap: 0, cap: 0 }
+        Self { tag: 0, reply_port: u32::MAX, data: [0; MESSAGE_INLINE_BYTES], has_cap: 0, cap: 0 }
     }
 }
