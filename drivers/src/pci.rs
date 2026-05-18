@@ -86,20 +86,30 @@ pub unsafe fn pci_read_config_32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 
     pci_read_config(bus, dev, func, offset)
 }
 
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn pci_read_config_32_any(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
+    let b0 = pci_read_config_8(bus, dev, func, offset) as u32;
+    let b1 = pci_read_config_8(bus, dev, func, offset + 1) as u32;
+    let b2 = pci_read_config_8(bus, dev, func, offset + 2) as u32;
+    let b3 = pci_read_config_8(bus, dev, func, offset + 3) as u32;
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn pci_read_config_8(_bus: u8, _dev: u8, _func: u8, _offset: u8) -> u8 { 0 }
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn pci_read_config_16(_bus: u8, _dev: u8, _func: u8, _offset: u8) -> u16 { 0 }
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn pci_read_config_32(_bus: u8, _dev: u8, _func: u8, _offset: u8) -> u32 { 0 }
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn pci_read_config_32_any(_bus: u8, _dev: u8, _func: u8, _offset: u8) -> u32 { 0 }
 
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn pci_write_config_16(bus: u8, dev: u8, func: u8, offset: u8, val: u16) {
     let address = ((bus as u32) << 16) | ((dev as u32) << 11) |
                   ((func as u32) << 8) | ((offset as u32) & 0xFC) | 0x8000_0000;
     
-    // Read dword first to preserve other bytes
-    let mut current = pci_read_config(bus, dev, func, offset);
+    let mut current = pci_read_config(bus, dev, func, offset & 0xFC);
     let shift = (offset & 3) * 8;
     current &= !(0xFFFF << shift);
     current |= (val as u32) << shift;
