@@ -29,6 +29,11 @@ pub fn set_boot_framebuffer(base: u64, width: u32, height: u32, pitch: u32) {
     *BOOT_FB.lock() = Some(FramebufferInfo { base, width, height, pitch });
 }
 
+/// Get hardware framebuffer information for DRM integration.
+pub fn get_hardware_fb_info() -> Option<(u64, u32, u32, u32)> {
+    BOOT_FB.lock().as_ref().map(|fb| (fb.base, fb.width, fb.height, fb.pitch))
+}
+
 // ── Driver struct ─────────────────────────────────────────────────────────────
 
 pub struct Framebuffer {

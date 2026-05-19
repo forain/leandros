@@ -1,5 +1,6 @@
 //! DRM device management and resource tracking
 
+use ::core::ptr;
 use alloc::{vec::Vec, collections::BTreeMap};
 use spin::Mutex;
 use super::core::*;
@@ -315,7 +316,47 @@ impl DrmDevice {
     }
 
     /// Perform software scaling copy from a DRM framebuffer to the hardware framebuffer
-    fn perform_software_scaling(&self, _state: &DrmPlaneState) -> Result<(), DriverError> {
+    fn perform_software_scaling(&self, state: &DrmPlaneState) -> Result<(), DriverError> {
+        let fb_id = state.fb_id.ok_or(DriverError::InvalidParameter)?;
+        let drm_fb = self.framebuffers.get(&fb_id).ok_or(DriverError::NotFound)?;
+        
+        let (hw_base, hw_width, hw_height, hw_pitch) = crate::framebuffer::get_hardware_fb_info()
+            .ok_or(DriverError::NotFound)?;
+
+        let src_phys = drm_fb.physical_addresses[0];
+        if src_phys == 0 { return Ok(()); } // No buffer bound
+
+        // Map physical addresses to kernel virtual space
+        let src_ptr = mm::phys_to_virt(src_phys as usize) as *const u32;
+        let dst_ptr = mm::phys_to_virt(hw_base as usize) as *mut u32;
+
+        let src_w = drm_fb.width as usize;
+        let src_h = drm_fb.height as usize;
+        let dst_w = hw_width as usize;
+        let dst_h = hw_height as usize;
+        let dst_pitch = hw_pitch as usize;
+
+        // Perform fast copy if resolutions match
+        if src_w == dst_w && src_h == dst_h {
+            unsafe {
+                ptr::copy_nonoverlapping(src_ptr, dst_ptr, src_w * src_h);
+            }
+            return Ok(());
+        }
+
+        // Nearest-neighbor scaling
+        for dy in 0..dst_h {
+            let sy = (dy * src_h) / dst_h;
+            unsafe {
+                let src_row = src_ptr.add(sy * src_w);
+                let dst_row = dst_ptr.add(dy * (dst_pitch / 4));
+                for dx in 0..dst_w {
+                    let sx = (dx * src_w) / dst_w;
+                    *dst_row.add(dx) = *src_row.add(sx);
+                }
+            }
+        }
+
         Ok(())
     }
 
