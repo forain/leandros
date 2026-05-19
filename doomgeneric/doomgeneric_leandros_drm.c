@@ -459,64 +459,101 @@ int DG_GetKey(int* pressed, unsigned char* key) {
 
                 if (ev.type == 1) { // EV_KEY
                     unsigned char dkey = 0;
+                    if (ev.value == 2) { // Serial ASCII input
+                        switch (ev.code) {
+                            case '\r':
+                            case '\n': dkey = KEY_ENTER; break;
+                            case 0x1B: dkey = KEY_ESCAPE; break;
+                            case '\t': dkey = KEY_TAB; break;
+                            case 0x08:
+                            case 0x7F: dkey = KEY_BACKSPACE; break;
 
-                    // Enhanced key mapping for DRM mode
-                    switch (ev.code) {
-                        case '\r':
-                        case '\n': dkey = KEY_ENTER; break;
-                        case 0x1B: dkey = KEY_ESCAPE; break;
-                        case '\t': dkey = KEY_TAB; break;
-                        case 0x08:
-                        case 0x7F: dkey = KEY_BACKSPACE; break;
+                            // Movement keys
+                            case 'w': case 'W': dkey = KEY_UPARROW; break;
+                            case 's': case 'S': dkey = KEY_DOWNARROW; break;
+                            case 'a': case 'A': dkey = KEY_LEFTARROW; break;
+                            case 'd': case 'D': dkey = KEY_RIGHTARROW; break;
 
-                        // Movement keys
-                        case 'w': case 'W': dkey = KEY_UPARROW; break;
-                        case 's': case 'S': dkey = KEY_DOWNARROW; break;
-                        case 'a': case 'A': dkey = KEY_LEFTARROW; break;
-                        case 'd': case 'D': dkey = KEY_RIGHTARROW; break;
+                            // Action keys
+                            case ' ': dkey = ' '; break;
+                            case 'e': case 'E': dkey = KEY_USE; break;
+                            case 'c': case 'C': dkey = KEY_FIRE; break;
+                            case ',': dkey = KEY_STRAFE_L; break;
+                            case '.': dkey = KEY_STRAFE_R; break;
+                            case 'r': case 'R': dkey = KEY_USE; break; // Alternative use key
+                            case 'f': case 'F': dkey = KEY_FIRE; break; // Alternative fire key
 
-                        // Action keys
-                        case ' ': dkey = ' '; break;
-                        case 'e': case 'E': dkey = KEY_USE; break;
-                        case 'c': case 'C': dkey = KEY_FIRE; break;
-                        case ',': dkey = KEY_STRAFE_L; break;
-                        case '.': dkey = KEY_STRAFE_R; break;
-                        case 'r': case 'R': dkey = KEY_USE; break; // Alternative use key
-                        case 'f': case 'F': dkey = KEY_FIRE; break; // Alternative fire key
-
-                        // Function keys for mode switching (DRM only)
-                        case 'p': case 'P':
-                            if (use_drm && ev.value == 1) {
-                                // Toggle between display modes
-                                struct drm_mode_info current;
-                                if (drm_get_current_mode(&current) == 0) {
-                                    if (current.width == 640 && current.height == 480) {
-                                        drm_set_mode(1024, 768, 60);
-                                    } else if (current.width == 1024 && current.height == 768) {
-                                        drm_set_mode(1920, 1080, 60);
-                                    } else {
-                                        drm_set_mode(640, 480, 60);
-                                    }
+                            default:
+                                if (ev.code >= 'a' && ev.code <= 'z') dkey = ev.code;
+                                else if (ev.code >= 'A' && ev.code <= 'Z') dkey = ev.code - 'A' + 'a';
+                                else if (ev.code >= '0' && ev.code <= '9') dkey = ev.code;
+                                break;
+                        }
+                    } else { // Keyboard scancode input (ev.value 0 or 1)
+                        switch (ev.code) {
+                            case 1: dkey = KEY_ESCAPE; break;
+                            case 2: dkey = '1'; break;
+                            case 3: dkey = '2'; break;
+                            case 4: dkey = '3'; break;
+                            case 5: dkey = '4'; break;
+                            case 6: dkey = '5'; break;
+                            case 7: dkey = '6'; break;
+                            case 8: dkey = '7'; break;
+                            case 9: dkey = '8'; break;
+                            case 10: dkey = '9'; break;
+                            case 11: dkey = '0'; break;
+                            case 12: dkey = KEY_MINUS; break;
+                            case 13: dkey = KEY_EQUALS; break;
+                            case 14: dkey = KEY_BACKSPACE; break;
+                            case 15: dkey = KEY_TAB; break;
+                            case 16: dkey = 'q'; break;
+                            case 17: dkey = KEY_UPARROW; break; // W
+                            case 18: dkey = KEY_USE; break; // E
+                            case 19: dkey = 'r'; break;
+                            case 20: dkey = 't'; break;
+                            case 21: dkey = 'y'; break;
+                            case 22: dkey = 'u'; break;
+                            case 23: dkey = 'i'; break;
+                            case 24: dkey = 'o'; break;
+                            case 25: dkey = 'p'; break;
+                            case 28: dkey = KEY_ENTER; break;
+                            case 29: dkey = KEY_FIRE; break; // LCTRL
+                            case 30: dkey = KEY_LEFTARROW; break; // A
+                            case 31: dkey = KEY_DOWNARROW; break; // S
+                            case 32: dkey = KEY_RIGHTARROW; break; // D
+                            case 33: dkey = KEY_FIRE; break; // F
+                            case 42: dkey = KEY_RSHIFT; break; // LSHIFT
+                            case 44: dkey = 'z'; break;
+                            case 45: dkey = 'x'; break;
+                            case 46: dkey = KEY_FIRE; break; // C
+                            case 51: dkey = KEY_STRAFE_L; break; // ,
+                            case 52: dkey = KEY_STRAFE_R; break; // .
+                            case 54: dkey = KEY_RSHIFT; break; // RSHIFT
+                            case 57: dkey = ' '; break; // SPACE
+                            case 58: // Caps Lock
+                                if (ev.value == 1) {
+                                    capslock_run_locked = !capslock_run_locked;
+                                    addKeyToQueue(capslock_run_locked ? 1 : 0, KEY_RSHIFT);
+                                    key_is_down[KEY_RSHIFT] = capslock_run_locked;
                                 }
-                            }
-                            dkey = 0; // Don't pass to game
-                            break;
-
-                        case 182: dkey = KEY_RSHIFT; break;
-                        case 186:
-                            if (ev.value == 1) {
-                                capslock_run_locked = !capslock_run_locked;
-                                addKeyToQueue(capslock_run_locked ? 1 : 0, KEY_RSHIFT);
-                                key_is_down[KEY_RSHIFT] = capslock_run_locked;
-                            }
-                            dkey = 0;
-                            break;
-
-                        default:
-                            if (ev.code >= 'a' && ev.code <= 'z') dkey = ev.code;
-                            else if (ev.code >= 'A' && ev.code <= 'Z') dkey = ev.code - 'A' + 'a';
-                            else if (ev.code >= '0' && ev.code <= '9') dkey = ev.code;
-                            break;
+                                dkey = 0;
+                                break;
+                            case 97: dkey = KEY_FIRE; break; // RCTRL
+                            case 103: dkey = KEY_UPARROW; break;
+                            case 108: dkey = KEY_DOWNARROW; break;
+                            case 105: dkey = KEY_LEFTARROW; break;
+                            case 106: dkey = KEY_RIGHTARROW; break;
+                            case 182: dkey = KEY_RSHIFT; break;
+                            case 186:
+                                if (ev.value == 1) {
+                                    capslock_run_locked = !capslock_run_locked;
+                                    addKeyToQueue(capslock_run_locked ? 1 : 0, KEY_RSHIFT);
+                                    key_is_down[KEY_RSHIFT] = capslock_run_locked;
+                                }
+                                dkey = 0;
+                                break;
+                            default: dkey = 0; break;
+                        }
                     }
 
                     if (dkey != 0) {
