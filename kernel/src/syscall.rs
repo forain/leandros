@@ -1033,7 +1033,8 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
 
     // Step 3: read file data into the physical pages.
     // We read up to `len` bytes; if the file is shorter, the rest stays zero.
-    let read_msg = make_vfs_msg(vfs::VFS_READ, &[fd as u64, phys as u64, len as u64]);
+    let hhdm_ptr = mm::phys_to_virt(phys) as *mut u8;
+    let read_msg = make_vfs_msg(vfs::VFS_READ, &[fd as u64, hhdm_ptr as u64, len as u64]);
     let n = vfs_reply_val(&vfs::handle(&read_msg, pid));
     if n < 0 {
         // Read failed — unmap the eagerly-allocated VMA and return error.

@@ -22,6 +22,19 @@ const DRM_IOCTL_MODE_SETCRTC: u32 = 0xC06864A2;
 const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC01864B0;
 const DRM_IOCTL_VERSION: u32 = 0xC0406400;
 
+// Virtio-GPU specific IOCTLs
+// const DRM_IOCTL_VIRTGPU_MAP: u32 = 0xC0106401;
+const DRM_IOCTL_VIRTGPU_EXECBUFFER: u32 = 0x40286402;
+// const DRM_IOCTL_VIRTGPU_GETPARAM: u32 = 0xC0106403;
+const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: u32 = 0xC0286404;
+// const DRM_IOCTL_VIRTGPU_RESOURCE_INFO: u32 = 0xC0186405;
+const DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: u32 = 0xC0186406;
+const DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: u32 = 0xC0186407;
+// const DRM_IOCTL_VIRTGPU_WAIT: u32 = 0x40086408;
+const DRM_IOCTL_VIRTGPU_GET_CAPS: u32 = 0xC0086409;
+// const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB: u32 = 0xC050640a;
+
+
 // ── Standard Linux DRM Structs ───────────────────────────────────────────────
 
 #[repr(C)]
@@ -154,6 +167,43 @@ struct drm_version {
     desc: u64,
 }
 
+#[repr(C)]
+struct drm_virtgpu_resource_create {
+    target: u32,
+    format: u32,
+    bind: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    array_size: u32,
+    last_level: u32,
+    nr_samples: u32,
+    flags: u32,
+    handle: u32,
+    res_id: u32,
+}
+
+#[repr(C)]
+struct drm_virtgpu_execbuffer {
+    command: u64,
+    size: u32,
+    flags: u32,
+    bo_handles: u64,
+    num_bo_handles: u32,
+    fence_fd: i32,
+    ring_idx: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+struct drm_virtgpu_get_caps {
+    cap_set_id: u32,
+    cap_set_ver: u32,
+    addr: u64,
+    size: u32,
+    pad: u32,
+}
+
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 
@@ -188,7 +238,12 @@ impl DrmDeviceInterface {
         let mut device_lock = device.lock();
 
         // If this is a mode-setting or flip call, disable the kernel console
-        if cmd == 0x1001 || cmd == 0x1004 || cmd == 0xC06864A2 || cmd == 0xC01864B0 {
+        // Note: 0x1001 is custom SET_MODE, 0x1004 is custom FLIP_PAGE
+        // 0xC06864A2 is standard SETCRTC, 0xC01864B0 is standard PAGE_FLIP
+        if cmd == 0x1004 || cmd == 0xC06864A2 || cmd == 0xC01864B0 {
+            crate::pci::serial_debug("[DRM] Disabling kernel console for command ");
+            crate::pci::serial_debug_hex(cmd);
+            crate::pci::serial_debug("\n");
             crate::framebuffer::set_console_disabled(true);
         }
 
@@ -223,6 +278,13 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_ADDFB => self.std_handle_addfb(&mut device_lock, arg),
             DRM_IOCTL_MODE_SETCRTC => self.std_handle_set_crtc(&mut device_lock, arg),
             DRM_IOCTL_MODE_PAGE_FLIP => self.std_handle_page_flip(&mut device_lock, arg),
+
+            // Virtio-GPU 3D IOCTLs
+            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => self.virtgpu_handle_resource_create(arg),
+            DRM_IOCTL_VIRTGPU_EXECBUFFER => self.virtgpu_handle_execbuffer(arg),
+            DRM_IOCTL_VIRTGPU_GET_CAPS => self.virtgpu_handle_get_caps(arg),
+            DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => self.virtgpu_handle_transfer_to_host(arg),
+            DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => self.virtgpu_handle_transfer_from_host(arg),
 
             _ => Err(DriverError::Unsupported),
         }
@@ -319,10 +381,23 @@ impl DrmDeviceInterface {
         let fb_id = fb.id().0;
         device.framebuffers.insert(fb.id(), fb);
 
+        // If Virtio-GPU is present, create a resource for this framebuffer
+        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+            // Use handle + 10 as resource ID to avoid conflict with kernel console (1)
+            let res_id = buffer.handle + 10;
+            gpu.create_resource_2d(res_id, width, height);
+            gpu.attach_backing(res_id, mmap_offset as u64, width * height * 4);
+            
+            // Also store the resource ID in the FB's handles for flip_page
+            if let Some(fb_obj) = device.framebuffers.get_mut(&DrmObjectId(fb_id)) {
+                fb_obj.handles[0] = res_id;
+            }
+        }
+
         // Return results to userspace
         fb_data[3] = fb_id; // fb_id
-        fb_data[4] = (mmap_offset & 0xFFFFFFFF) as u32; // Low 32 bits of offset
-        fb_data[5] = (mmap_offset >> 32) as u32;         // High 32 bits of offset
+        fb_data[4] = 0;     // Signal that mmap() is needed by returning NULL pointer
+        fb_data[5] = mmap_offset as u32; // Pass physical address as mmap offset (low 32 bits)
 
         crate::pci::serial_debug("[DRM] Created FB id=");
         crate::pci::serial_debug_hex(fb_id);
@@ -610,17 +685,19 @@ impl DrmDeviceInterface {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let map = unsafe { &mut *(arg as *mut drm_mode_map_dumb) };
 
-        // Return the hardware framebuffer base address to enable direct-to-screen rendering.
-        // This is safe because we've disabled the competing kernel-side scaling copy.
-        extern "C" { fn vfs_get_framebuffer_base() -> u64; }
-        map.offset = unsafe { vfs_get_framebuffer_base() };
-
-        Ok(0)
+        // Return the actual physical address associated with the dumb buffer handle
+        let buffers = DUMB_BUFFERS.lock();
+        if let Some(&phys_addr) = buffers.get(&map.handle) {
+            map.offset = phys_addr as u64;
+            Ok(0)
+        } else {
+            Err(DriverError::NotFound)
+        }
     }
     fn std_handle_addfb(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let add = unsafe { &mut *(arg as *mut drm_mode_fb_cmd) };
-        
+
         let mut fb = DrmFramebuffer::new(
             add.width,
             add.height,
@@ -628,18 +705,26 @@ impl DrmDeviceInterface {
             add.handle,
             add.pitch
         );
-        
+
         // Use the physical address associated with the dumb buffer handle
         let phys_addr = DUMB_BUFFERS.lock().get(&add.handle).copied().unwrap_or(0);
         fb.physical_addresses[0] = phys_addr as u64;
-        
+
+        // If Virtio-GPU is present, create a resource for this framebuffer
+        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+            // Use handle + 10 as resource ID to avoid conflict with kernel console (1)
+            let res_id = add.handle + 10;
+            gpu.create_resource_2d(res_id, add.width, add.height);
+            gpu.attach_backing(res_id, phys_addr as u64, add.width * add.height * 4);
+            fb.handles[0] = res_id;
+        }
+
         let fb_id = fb.id().0;
         device.framebuffers.insert(fb.id(), fb);
         add.fb_id = fb_id;
-        
+
         Ok(0)
     }
-
     fn std_handle_set_crtc(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let set = unsafe { &mut *(arg as *mut drm_mode_crtc) };
@@ -743,26 +828,102 @@ impl DrmDeviceInterface {
     }
 
     /// Handle mmap operations for framebuffer access
-    pub fn handle_mmap(&mut self, _offset: usize, size: usize) -> Result<*mut u8, DriverError> {
-        // Get the real framebuffer base address from VFS
+    pub fn handle_mmap(&mut self, offset: usize, size: usize) -> Result<*mut u8, DriverError> {
+        if offset != 0 {
+            // Map the requested physical address (likely a dumb buffer)
+            // Note: in a production driver we'd check if this physical address 
+            // belongs to a buffer we allocated.
+            let buffer_ptr = mm::phys_to_virt(offset) as *mut u8;
+            return Ok(buffer_ptr);
+        }
+
+        // Get the real hardware framebuffer base address from VFS
         extern "C" {
             fn vfs_get_framebuffer_base() -> u64;
         }
 
-        let fb_base = unsafe { vfs_get_framebuffer_base() };
-        if fb_base == 0 {
+        let fb_phys = unsafe { vfs_get_framebuffer_base() };
+        if fb_phys == 0 {
             return Err(DriverError::NotFound);
         }
 
-        // VFS returns virtual address ready for userspace access
-        let buffer_ptr = fb_base as *mut u8;
+        // Convert physical address to virtual address for userspace access
+        let buffer_ptr = mm::phys_to_virt(fb_phys as usize) as *mut u8;
 
         // Validate the requested mapping size
-        if size > 0x1000000 { // Limit to 16MB max for safety
+        if size > 0x10000000 { // Limit to 256MB max for safety
             return Err(DriverError::Unsupported);
         }
 
         Ok(buffer_ptr)
+    }
+
+    // ── Virtio-GPU IOCTL Handlers ───────────────────────────────────────────
+
+    fn virtgpu_handle_resource_create(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let create = unsafe { &mut *(arg as *mut drm_virtgpu_resource_create) };
+        
+        crate::pci::serial_debug("[DRM] Virtio-GPU Resource Create\n");
+        
+        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+            // Send ResourceCreate3d command to Virtio-GPU
+            let _res = gpu.send_command(crate::virtio_gpu::VirtioGpuCmd::ResourceCreate3d, &[]);
+            create.handle = 1; // Simplified handle management
+            create.res_id = 1;
+            Ok(0)
+        } else {
+            Err(DriverError::NotFound)
+        }
+    }
+
+    fn virtgpu_handle_execbuffer(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let _exec = unsafe { &mut *(arg as *mut drm_virtgpu_execbuffer) };
+        
+        crate::pci::serial_debug("[DRM] Virtio-GPU ExecBuffer\n");
+        
+        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+            // Send Submit3d command to Virtio-GPU
+            let _res = gpu.send_command(crate::virtio_gpu::VirtioGpuCmd::Submit3d, &[]);
+            Ok(0)
+        } else {
+            Err(DriverError::NotFound)
+        }
+    }
+
+    fn virtgpu_handle_get_caps(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let _caps = unsafe { &mut *(arg as *mut drm_virtgpu_get_caps) };
+        
+        crate::pci::serial_debug("[DRM] Virtio-GPU Get Caps\n");
+        
+        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+            let _res = gpu.send_command(crate::virtio_gpu::VirtioGpuCmd::GetCapset, &[]);
+            Ok(0)
+        } else {
+            Err(DriverError::NotFound)
+        }
+    }
+
+    fn virtgpu_handle_transfer_to_host(&mut self, _arg: usize) -> Result<usize, DriverError> {
+        crate::pci::serial_debug("[DRM] Virtio-GPU Transfer To Host\n");
+        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+            let _res = gpu.send_command(crate::virtio_gpu::VirtioGpuCmd::TransferToHost3d, &[]);
+            Ok(0)
+        } else {
+            Err(DriverError::NotFound)
+        }
+    }
+
+    fn virtgpu_handle_transfer_from_host(&mut self, _arg: usize) -> Result<usize, DriverError> {
+        crate::pci::serial_debug("[DRM] Virtio-GPU Transfer From Host\n");
+        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+            let _res = gpu.send_command(crate::virtio_gpu::VirtioGpuCmd::TransferFromHost3d, &[]);
+            Ok(0)
+        } else {
+            Err(DriverError::NotFound)
+        }
     }
 }
 
