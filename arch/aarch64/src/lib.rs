@@ -40,45 +40,68 @@ pub extern "C" fn arch_interrupt_restore(flags: usize) {
 
 pub fn init(boot_info: &boot::BootInfo) {
     unsafe {
-        // Enable SIMD/FP (set CPACR_EL1.FPEN to 0b11)
-        let mut cpacr: u64;
-        core::arch::asm!("mrs {}, cpacr_el1", out(reg) cpacr);
-        cpacr |= 3 << 20;
-        core::arch::asm!("msr cpacr_el1, {}", in(reg) cpacr);
-        core::arch::asm!("isb");
-
-        // Initialize exception vectors FIRST so we can catch early faults
-        exception::init();
+        // Initialize MMU features and memory attributes (MAIR_EL1)
+        mmu::enable_identity(boot_info);
 
         // Limine Base Revision 1+ (Revision 6) does not map MMIO in HHDM.
         // We must map critical devices explicitly into our current page tables.
         let ttbr1: usize;
         core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1);
-        let root = ttbr1 as *mut u64;
+        let root_phys = ttbr1 & 0x0000_FFFF_FFFF_F000;
 
         let device_flags = paging::PageDescFlags::VALID | paging::PageDescFlags::AF | paging::PageDescFlags::INNER_SHR | paging::PageDescFlags::ATTR_DEV;
         
         // Map UART (physical 0x09000000) to its HHDM address
+        let uart_phys = 0x09000000;
         let uart_virt = if boot_info.hhdm_offset != 0 {
-            0x09000000 + boot_info.hhdm_offset as usize
+            uart_phys + boot_info.hhdm_offset as usize
         } else {
-            0x09000000
+            uart_phys
         };
-        paging::map_4k(root, uart_virt, 0x09000000, device_flags);
+        
+        // We need to map it in the current page table.
+        // paging::map_4k uses mm::phys_to_virt which is now set.
+        paging::map_4k(root_phys as *mut u64, uart_virt, uart_phys, device_flags);
 
         // Map GIC Distributor and CPU interface to their HHDM addresses
+        let gicd_phys = gic::GICD_BASE;
+        let gicc_phys = gic::GICC_BASE;
         let gicd_virt = if boot_info.hhdm_offset != 0 {
-            gic::GICD_BASE + boot_info.hhdm_offset as usize
+            gicd_phys + boot_info.hhdm_offset as usize
         } else {
-            gic::GICD_BASE
+            gicd_phys
         };
         let gicc_virt = if boot_info.hhdm_offset != 0 {
-            gic::GICC_BASE + boot_info.hhdm_offset as usize
+            gicc_phys + boot_info.hhdm_offset as usize
         } else {
-            gic::GICC_BASE
+            gicc_phys
         };
-        paging::map_4k(root, gicd_virt, gic::GICD_BASE, device_flags);
-        paging::map_4k(root, gicc_virt, gic::GICC_BASE, device_flags);
+        paging::map_4k(root_phys as *mut u64, gicd_virt, gicd_phys, device_flags);
+        paging::map_4k(root_phys as *mut u64, gicc_virt, gicc_phys, device_flags);
+
+        // Also map the framebuffer if present, as Limine Revision 6 might not have mapped it in HHDM.
+        if boot_info.framebuffer_base != 0 {
+            let fb_size = boot_info.framebuffer_pitch as usize * boot_info.framebuffer_height as usize;
+            let num_pages = (fb_size + 4095) / 4096;
+            let fb_flags = paging::PageDescFlags::VALID | paging::PageDescFlags::AF | paging::PageDescFlags::INNER_SHR | paging::PageDescFlags::ATTR_NOCACHE;
+            
+            crate::uart::serial_print_str("[ARCH] Mapping framebuffer ");
+            crate::uart::print_hex(boot_info.framebuffer_base as usize);
+            crate::uart::serial_print_str(" size=");
+            crate::uart::print_hex(fb_size);
+            crate::uart::serial_print_str("\n");
+
+            for i in 0..num_pages {
+                let offset = i * 4096;
+                let virt = boot_info.framebuffer_base as usize + boot_info.hhdm_offset as usize + offset;
+                let phys = boot_info.framebuffer_base as usize + offset;
+                if !paging::map_4k(root_phys as *mut u64, virt, phys, fb_flags) {
+                    crate::uart::serial_print_str("[ARCH] Failed to map framebuffer page at ");
+                    crate::uart::print_hex(virt);
+                    crate::uart::serial_print_str("\n");
+                }
+            }
+        }
 
         // Flush TLB to ensure the new mappings are active.
         core::arch::asm!("tlbi vmalle1", "dsb ish", "isb", options(nostack));
@@ -91,6 +114,9 @@ pub fn init(boot_info: &boot::BootInfo) {
             // Standard init if needed, but set_base is already done
             uart::init();
         }
+
+        // Initialize exception vectors
+        exception::init();
 
         // Initialize GIC (needs virtual addresses; helpers use mm::phys_to_virt)
         gic::init();

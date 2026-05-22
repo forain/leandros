@@ -84,7 +84,6 @@ pub unsafe fn clear_irq() {
 
 pub unsafe fn putc(c: u8) {
     // Basic check: if UART_BASE_ADDR is physical and MMU is on, we might fault.
-    // However, in early boot we just have to be careful.
     if UART_BASE_ADDR == 0 { return; }
     
     while rd(FR) & FR_TXFF != 0 {
@@ -105,4 +104,28 @@ pub unsafe fn getc() -> Option<u8> {
 pub unsafe fn has_data() -> bool {
     if UART_BASE_ADDR == 0 { return false; }
     rd(FR) & FR_RXFE == 0
+}
+
+pub fn serial_print_str(s: &str) {
+    for &b in s.as_bytes() {
+        unsafe { putc(b); }
+    }
+}
+
+pub fn print_hex(mut n: usize) {
+    serial_print_str("0x");
+    let mut buf = [0u8; 16];
+    let mut i = 16;
+    if n == 0 {
+        serial_print_str("0");
+        return;
+    }
+    while n > 0 {
+        i -= 1;
+        buf[i] = b"0123456789abcdef"[(n & 0xF) as usize];
+        n >>= 4;
+    }
+    for &c in &buf[i..] {
+        unsafe { putc(c); }
+    }
 }
