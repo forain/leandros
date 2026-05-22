@@ -20,6 +20,8 @@ pub mod drm_console;
 pub mod console_commands;
 pub mod console_properties;
 pub mod drm_device_interface;
+pub mod virtio;
+pub mod virtio_gpu;
 
 /// Trait every driver server must implement.
 pub trait Driver {

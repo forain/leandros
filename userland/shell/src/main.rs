@@ -319,7 +319,7 @@ unsafe fn execute_binary(args: &[&str], count: usize) {
         }
         ARGV_PTRS[count] = core::ptr::null();
 
-        execve(ARGV_PTRS[0], ARGV_PTRS.as_ptr(), envp.as_ptr());
+        execve(ARGV_PTRS[0], core::ptr::addr_of!(ARGV_PTRS) as *const *const u8, envp.as_ptr());
 
         // If execve fails and it doesn't start with /, try /bin/
         if !cmd.starts_with('/') {
@@ -332,7 +332,7 @@ unsafe fn execute_binary(args: &[&str], count: usize) {
 
             let bin_ptr_const = core::ptr::addr_of!(BIN_PATH_BUFFER) as *const u8;
             ARGV_PTRS[0] = bin_ptr_const;
-            execve(bin_ptr_const, ARGV_PTRS.as_ptr(), envp.as_ptr());
+            execve(bin_ptr_const, core::ptr::addr_of!(ARGV_PTRS) as *const *const u8, envp.as_ptr());
         }
 
         // If we get here, execve failed

@@ -174,7 +174,7 @@ _start_pvh:
     // 6. Jump to 64-bit
     call 1f
 1:  pop eax
-    add eax, 17 // Distance from 1: to .Ltarget
+    add eax, 15 // Distance from 1: to .Ltarget
     
     // Diagnostic: 'J'
     mov dx, 0x3f8
@@ -186,18 +186,17 @@ _start_pvh:
     push eax
     retf
 
-    .align 16
     .code64
 .Ltarget:
-    // Diagnostic: '6'
-    mov dx, 0x3f8
-    mov al, 0x36
-    out dx, al
-
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov ss, ax
+
+    // Diagnostic: '6'
+    mov dx, 0x3f8
+    mov al, 0x36
+    out dx, al
     
     // Enable SSE/AVX
     mov rax, cr0

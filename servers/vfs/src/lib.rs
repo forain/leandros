@@ -856,10 +856,10 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
         match existing {
             Some(idx) => {
                 if trunc { tmp[idx].len = 0; }
-                let pos = if writable && flags & O_WRONLY != 0 && trunc { 0 }
-                          else if flags & O_WRONLY != 0 { tmp[idx].len } // append-style
+                let pos = if writable && trunc { 0 }
+                          else if flags & O_APPEND != 0 { tmp[idx].len }
                           else { 0 };
-                VnodeKind::TmpFile { idx, pos, writable }
+                VnodeKind::TmpFile { idx, pos, writable: writable || create }
             }
             None if create => {
                 // Allocate a new slot.
@@ -871,7 +871,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
                         let copy_len = path.len().min(MAX_TMP_PATH - 1);
                         tmp[idx].path[..copy_len].copy_from_slice(&path[..copy_len]);
                         tmp[idx].path_len = copy_len;
-                        VnodeKind::TmpFile { idx, pos: 0, writable }
+                        VnodeKind::TmpFile { idx, pos: 0, writable: true }
                     }
                     None => return err_reply(-28), // ENOSPC
                 }

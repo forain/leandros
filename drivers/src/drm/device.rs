@@ -293,8 +293,26 @@ impl DrmDevice {
 
         // Apply plane states and perform scaling if needed
         for plane_state in state.plane_states {
-            // Perform software scaling copy if integrated with framebuffer
-            if self.fb_integration {
+            // Try hardware scaling first if Virtio-GPU is available
+            let mut hardware_scaled = false;
+            if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+                if let Some(fb_id) = plane_state.fb_id {
+                    if let Some(fb) = self.framebuffers.get(&fb_id) {
+                        // Use hardware acceleration for scaling blit
+                        if gpu.scale_blit(
+                            fb.handles[0], // Resource ID
+                            0,         // Destination (scanout 0)
+                            (plane_state.src_x >> 16, plane_state.src_y >> 16, plane_state.src_w >> 16, plane_state.src_h >> 16),
+                            (plane_state.crtc_x as u32, plane_state.crtc_y as u32, plane_state.crtc_w, plane_state.crtc_h)
+                        ) {
+                            hardware_scaled = true;
+                        }
+                    }
+                }
+            }
+
+            // Perform software scaling copy as fallback
+            if !hardware_scaled && self.fb_integration {
                 self.perform_software_scaling(&plane_state)?;
             }
 

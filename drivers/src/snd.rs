@@ -243,9 +243,9 @@ impl VirtioSnd {
         let code = unsafe { *(cmd as *const T as *const u32) };
         pci::serial_debug("[SND] CTRL CMD "); pci::serial_debug_hex(code); pci::serial_debug(" -> ");
         
-        let mut vq_id = 0;
-        let mut notify_off = 0;
-        let head = {
+        let vq_id;
+        let notify_off;
+        let _head = {
             let vq = self.vqs[0].as_mut().unwrap();
             vq_id = vq.id;
             notify_off = vq.notify_off;

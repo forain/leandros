@@ -106,7 +106,7 @@ static mut MIDI_DATA: [u8; 65536] = [0u8; 65536];
 unsafe fn play_mid(path: &str, port: u32) {
     let fd = open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 { return; }
-    let n = read(fd, MIDI_DATA.as_mut_ptr(), 65536);
+    let n = read(fd, core::ptr::addr_of_mut!(MIDI_DATA) as *mut u8, 65536);
     close(fd);
     if n < 14 { return; }
     

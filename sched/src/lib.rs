@@ -327,7 +327,10 @@ pub fn spawn_user_with_address_space(entry_point: usize, sp: usize, as_: mm::vmm
 
     let pid = alloc_pid();
 
-    unsafe { serial_print(b"[SCHED] Allocating kernel stack...\n".as_ptr(), 32); }
+    unsafe {
+        let msg = b"[SCHED] Allocating kernel stack...\n";
+        serial_print(msg.as_ptr(), msg.len());
+    }
     let stack_phys = mm::buddy::alloc(4)?; // 64KB kernel stack
     let _stack_virt = mm::phys_to_virt(stack_phys);
     let stack_size = mm::buddy::PAGE_SIZE * 16;

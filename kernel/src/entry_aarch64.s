@@ -1,6 +1,6 @@
 // AArch64 bare-metal entry point supporting Limine — kernel/src/entry_aarch64.s
 
-.section ".boot", "ax", @progbits
+.section ".text.boot", "ax", @progbits
 .globl _start
 _start:
     // ── PRESERVE ARGUMENTS IMMEDIATELY ──
@@ -18,11 +18,6 @@ _start:
 
     // ── Direct Boot Path (MMU is OFF) ────────────────────────────────────────
     
-    // Diagnostic: 'D'
-    mov     x0, #0x09000000
-    mov     x1, #0x44
-    str     w1, [x0]
-
     // 1. MAIR
     mov     x4, #0x04FF
     msr     mair_el1, x4

@@ -270,6 +270,12 @@ fn scan_memory_for_initrd() -> Option<(usize, usize)> {
         end   = 0x80000000; // Search full 1GB RAM
     }
 
+    serial_print_str("[INIT-SCAN] Searching from 0x");
+    print_hex(start);
+    serial_print_str(" to 0x");
+    print_hex(end);
+    serial_print_str("...\n");
+
     let mut ptr = start;
     while ptr + 6 < end {
         let v_ptr = mm::phys_to_virt(ptr) as *const u8;
@@ -288,7 +294,7 @@ fn scan_memory_for_initrd() -> Option<(usize, usize)> {
                 return Some((ptr, 0x2000000)); // Default to 32MB max
             }
         }
-        ptr += 4;
+        ptr += 4096;
     }
     serial_print_str("[INIT-SCAN] No initrd signature found.\n");
     None

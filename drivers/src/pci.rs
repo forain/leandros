@@ -45,7 +45,23 @@ pub fn serial_debug(msg: &str) {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+pub fn serial_debug(msg: &str) {
+    // Standard QEMU virt UART0 address
+    let uart_base = 0x09000000usize;
+    let dr = uart_base as *mut u32;
+    let fr = (uart_base + 0x18) as *const u32;
+
+    for &b in msg.as_bytes() {
+        unsafe {
+            // Wait until TX FIFO not full (FR register bit 5 = TXFF)
+            while (core::ptr::read_volatile(fr) & (1 << 5)) != 0 {}
+            core::ptr::write_volatile(dr, b as u32);
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn serial_debug(_msg: &str) {}
 
 fn hex_digit(v: u8) -> u8 {

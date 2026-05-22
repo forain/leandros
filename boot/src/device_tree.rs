@@ -63,13 +63,11 @@ fn serial_print(msg: &str) {
 ///
 /// # Safety
 /// `dtb_phys` must be a readable physical address.
-pub unsafe fn is_valid_dtb(dtb_phys: usize) -> bool {
-    if dtb_phys == 0 || dtb_phys & 3 != 0 { return false; }
-    // Check for memory access safety - RAM starts at 0x40000000 on virt machine
-    if dtb_phys < 0x40000000 || dtb_phys > 0x80000000 { return false; }
+pub unsafe fn is_valid_dtb(dtb_virt: usize) -> bool {
+    if dtb_virt == 0 || dtb_virt & 3 != 0 { return false; }
     
-    // Read the magic directly from physical memory (we are in identity map)
-    let magic = be32(dtb_phys as *const u8);
+    // Read the magic directly from virtual memory
+    let magic = be32(dtb_virt as *const u8);
     magic == FDT_MAGIC
 }
 

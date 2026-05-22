@@ -12,6 +12,7 @@
 //! | `QUEUE_DEPTH` | 16    | Per-port message queue capacity.               |
 
 use spin::Mutex;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use super::message::Message;
 
 pub type Port = u32;
@@ -22,7 +23,7 @@ pub const MAX_PORTS:   usize = 65536;
 /// Per-port message queue capacity.
 pub const QUEUE_DEPTH: usize = 16;
 /// Sentinel value for an empty bucket's port-ID field.
-const EMPTY_ID: u32 = u32::MAX;
+const EMPTY_ID: u32 = 0;
 
 /// Error returned by [`send`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,21 +97,19 @@ impl PortEntry {
 //
 // This gives a compact static (4096 × sizeof(PortEntry)) while still allowing
 // port IDs up to 65535.
-const LIVE_BUCKETS: usize = 4096;
+const LIVE_BUCKETS: usize = 64;
 const PROBE_LIMIT:  usize = 16;
 
 struct PortTable {
     buckets: [PortEntry; LIVE_BUCKETS],
-    next_id: u32,
+    next_id: AtomicUsize,
 }
 
 impl PortTable {
     const fn new() -> Self {
-        // Workaround: `[PortEntry::empty(); LIVE_BUCKETS]` requires Copy, which
-        // Message doesn't implement.  Use a const-initialised array instead.
         Self {
             buckets: [const { PortEntry::empty() }; LIVE_BUCKETS],
-            next_id: 0,
+            next_id: AtomicUsize::new(0),
         }
     }
 
@@ -141,8 +140,8 @@ impl PortTable {
     fn alloc(&mut self, owner_pid: u32) -> Option<(Port, usize)> {
         // Linear-scan for a new port ID that fits in an unoccupied bucket.
         for _ in 0..MAX_PORTS {
-            let id = self.next_id;
-            self.next_id = self.next_id.wrapping_add(1) % MAX_PORTS as u32;
+            let id_raw = self.next_id.fetch_add(1, Ordering::SeqCst);
+            let id = (id_raw % (MAX_PORTS - 1)) as u32 + 1; // 1..MAX_PORTS
 
             let start = (id as usize) % LIVE_BUCKETS;
             for i in 0..PROBE_LIMIT {
