@@ -28,7 +28,7 @@ done
 
 if [ "$ARCH" = "aarch64" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
-    MACHINE_ARGS="-machine virt,gic-version=2 -m 1G"
+    MACHINE_ARGS="-machine virt,gic-version=2 -m 2G"
     CPU_ARGS="-cpu max"
     DISK_IMAGE="leandros-limine-aarch64.img"
 else
@@ -72,7 +72,7 @@ if [ "$BOOT_MODE" = "uefi" ]; then
             cp /opt/homebrew/share/qemu/edk2-arm-vars.fd "$VARS_FILE" 2>/dev/null || dd if=/dev/zero of="$VARS_FILE" bs=1M count=64
         fi
 
-        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 1G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
+        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 2G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             -drive if=pflash,unit=1,format=raw,file="$VARS_FILE" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
@@ -81,7 +81,7 @@ if [ "$BOOT_MODE" = "uefi" ]; then
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
     else
-        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 1G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
+        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 2G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
             -device virtio-blk-pci,drive=drive0,bootindex=0 \
@@ -125,7 +125,7 @@ else
         if [ ! -f "$KERNEL_ELF" ]; then echo "❌ Direct kernel ELF not found: $KERNEL_ELF"; exit 1; fi
         echo "🏗️  Using Direct Kernel ELF: $KERNEL_ELF"
         
-        exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg -m 1G \
+        exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg -m 2G \
             -kernel "$KERNEL_ELF" \
             -initrd "initrd-x86_64.cpio" \
             -device "$GPU_DEV" \

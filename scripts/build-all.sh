@@ -107,6 +107,7 @@ create_initrd() {
     local mame_bin="../mame/mame-$arch"
     if [[ -f "$mame_bin" ]]; then
         cp "$mame_bin" "$temp_dir/bin/mame"
+        echo "  Including MAME ($arch, $(du -sh "$mame_bin" | cut -f1))"
     fi
 
     (
@@ -187,7 +188,7 @@ create_disk_image() {
     local limine_dir="$2"
     local image_name="leandros-limine-$arch.img"
     echo "💽 Creating $arch disk image..."
-    dd if=/dev/zero of="$image_name" bs=1M count=64 2>/dev/null
+    dd if=/dev/zero of="$image_name" bs=1M count=512 2>/dev/null
     if command -v sgdisk &> /dev/null; then
         sgdisk -n 1:2048:0 -t 1:ef00 "$image_name" >/dev/null 2>&1
     else
@@ -195,7 +196,7 @@ create_disk_image() {
     fi
     local temp_fat="temp_fat_$arch.img"
     rm -f "$temp_fat"
-    mkfs.fat -C "$temp_fat" 61440 -F 32 -n LEANDROS >/dev/null 2>&1
+    mkfs.fat -C "$temp_fat" 491520 -F 32 -n LEANDROS >/dev/null 2>&1
     mmd -i "$temp_fat" ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
     
     local boot_efi

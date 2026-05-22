@@ -6,7 +6,7 @@ use spin::Mutex;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const PAGE_SIZE: usize = 4096;
-pub const MAX_ORDER: usize = 11; // 2^10 pages = 4 MiB max contiguous block.
+pub const MAX_ORDER: usize = 19; // 2^18 pages = 1 GiB max contiguous block.
 
 /// Total pages ever freed into the allocator (proxy for physical RAM size).
 static TOTAL_PAGES: AtomicUsize = AtomicUsize::new(0);
@@ -59,7 +59,7 @@ pub fn init_from_map(regions: &[boot::MemoryRegion]) {
 
 /// Allocate 2^order contiguous physical pages. Returns physical address or None.
 pub fn alloc(order: usize) -> Option<usize> {
-    assert!(order < MAX_ORDER);
+    if order >= MAX_ORDER { return None; }
     let mut lists = FREE_LISTS.lock();
     // Walk up from requested order looking for a free block.
     for o in order..MAX_ORDER {
@@ -96,7 +96,7 @@ pub fn alloc(order: usize) -> Option<usize> {
 
 /// Free 2^order contiguous pages starting at `addr`.
 pub fn free(addr: usize, order: usize) {
-    assert!(order < MAX_ORDER);
+    if order >= MAX_ORDER { return; }
     FREE_PAGES.fetch_add(1 << order, Ordering::Relaxed);
     let mut lists = FREE_LISTS.lock();
     
