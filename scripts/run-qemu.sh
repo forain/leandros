@@ -28,7 +28,7 @@ done
 
 if [ "$ARCH" = "aarch64" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
-    MACHINE_ARGS="-machine virt"
+    MACHINE_ARGS="-machine virt,gic-version=2 -m 1G"
     CPU_ARGS="-cpu max"
     DISK_IMAGE="leandros-limine-aarch64.img"
 else
@@ -36,6 +36,15 @@ else
     MACHINE_ARGS="-machine q35"
     CPU_ARGS="-cpu max"
     DISK_IMAGE="leandros-limine-x86_64.img"
+fi
+
+# Detect if QEMU supports OpenGL acceleration (virtio-gpu-gl-pci)
+if $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-gpu-gl-pci; then
+    GPU_DEV="virtio-gpu-gl-pci"
+    GL_ARGS=("-display" "default,gl=on")
+else
+    GPU_DEV="virtio-gpu-pci"
+    GL_ARGS=()
 fi
 
 
@@ -56,7 +65,30 @@ if [ "$BOOT_MODE" = "uefi" ]; then
         AUDIO_ARGS="-audiodev pa,id=snd0"
     fi
 
-    QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 1G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" -device virtio-blk-pci,drive=drive0,bootindex=0 -device virtio-gpu-pci -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
+    if [ "$ARCH" = "aarch64" ]; then
+        VARS_FILE="aarch64_vars.fd"
+        if [ ! -f "$VARS_FILE" ]; then
+            # Create a local copy of vars if not present
+            cp /opt/homebrew/share/qemu/edk2-arm-vars.fd "$VARS_FILE" 2>/dev/null || dd if=/dev/zero of="$VARS_FILE" bs=1M count=64
+        fi
+
+        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 1G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
+            -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
+            -drive if=pflash,unit=1,format=raw,file="$VARS_FILE" \
+            -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
+            -device virtio-blk-pci,drive=drive0,bootindex=0 \
+            -device "$GPU_DEV" \
+            "${GL_ARGS[@]}" \
+            -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
+    else
+        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 1G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
+            -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
+            -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
+            -device virtio-blk-pci,drive=drive0,bootindex=0 \
+            -device "$GPU_DEV" \
+            "${GL_ARGS[@]}" \
+            -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
+    fi
     exec $QEMU_SYSTEM "${QEMU_ARGS[@]}" "${QEMU_EXTRA_ARGS[@]}"
 else
     # Select audio backend for direct boot as well
@@ -67,15 +99,16 @@ else
     fi
 
     if [ "$ARCH" = "aarch64" ]; then
-        # Use FLAT BINARY for AArch64 to trigger QEMU Linux-style loader
-        KERNEL_BIN="target/final-aarch64/kernel-direct.bin"
-        if [ ! -f "$KERNEL_BIN" ]; then echo "❌ Direct kernel binary not found: $KERNEL_BIN"; exit 1; fi
-        echo "🏗️  Using Direct Kernel Binary: $KERNEL_BIN"
+        # Use ELF for AArch64
+        KERNEL_ELF="target/final-aarch64/kernel-direct"
+        if [ ! -f "$KERNEL_ELF" ]; then echo "❌ Direct kernel ELF not found: $KERNEL_ELF"; exit 1; fi
+        echo "🏗️  Using Direct Kernel ELF: $KERNEL_ELF"
         
-        exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg -m 1G \
-            -kernel "$KERNEL_BIN" \
+        exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg \
+            -kernel "$KERNEL_ELF" \
             -initrd "initrd-aarch64.cpio" \
-            -device virtio-gpu-pci \
+            -device "$GPU_DEV" \
+            "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -net none \
             -serial mon:stdio \
@@ -95,7 +128,8 @@ else
         exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg -m 1G \
             -kernel "$KERNEL_ELF" \
             -initrd "initrd-x86_64.cpio" \
-            -device virtio-gpu-pci \
+            -device "$GPU_DEV" \
+            "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -net none \
             -serial mon:stdio \
@@ -103,3 +137,4 @@ else
             "${QEMU_EXTRA_ARGS[@]}"
     fi
 fi
+

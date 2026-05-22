@@ -75,11 +75,20 @@ create_initrd() {
     local temp_dir="temp_initrd_$arch"
     rm -rf "$temp_dir"
     mkdir -p "$temp_dir/bin"
+    mkdir -p "$temp_dir/lib"
 
     cp "$userland_dir/init" "$temp_dir/bin/init"
     cp "$userland_dir/shell" "$temp_dir/bin/shell"
     cp "$userland_dir/hello" "$temp_dir/bin/hello"
     cp "$userland_dir/aplay" "$temp_dir/bin/aplay"
+
+    # Include relibc (libc.a) in the initrd for development/linking
+    local relibc_target
+    relibc_target=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-leandros" || echo "x86_64-unknown-leandros")
+    local relibc_dir="userland/relibc/target/$relibc_target/release"
+    if [[ -f "$relibc_dir/librelibc.a" ]]; then
+        cp "$relibc_dir/librelibc.a" "$temp_dir/lib/libc.a"
+    fi
 
     if [[ -f "userland/aplay/car-horn.wav" ]]; then
         cp "userland/aplay/car-horn.wav" "$temp_dir/car-horn.wav"
@@ -95,10 +104,16 @@ create_initrd() {
         cp "$doom_wad" "$temp_dir/bin/doom1.wad"
     fi
 
+    local mame_bin="../mame/mame-$arch"
+    if [[ -f "$mame_bin" ]]; then
+        cp "$mame_bin" "$temp_dir/bin/mame"
+    fi
+
     (
         cd "$temp_dir" || exit 1
         find . -print0 | cpio -0 -o -H newc > "$ROOT_DIR/$initrd_name"
-        gzip -c "$ROOT_DIR/$initrd_name" > "$ROOT_DIR/$initrd_name.gz"
+        # gzip -c "$ROOT_DIR/$initrd_name" > "$ROOT_DIR/$initrd_name.gz"
+        cp "$ROOT_DIR/$initrd_name" "$ROOT_DIR/$initrd_name.gz"
     )
 
     rm -rf "$temp_dir"
@@ -109,31 +124,32 @@ build_kernel() {
     local arch="$1"
     echo "🔧 Building $arch kernel..."
     
-    local target_root="target/build-$arch"
-    mkdir -p "$target_root"
-    
+    local target_triple
+    target_triple=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-kernel" || echo "x86_64-unknown-kernel")
     local target_spec="$ROOT_DIR/targets/$arch-unknown-kernel.json"
     
     # 1. Standard (Limine) kernel
     echo "  Building standard kernel..."
+    local target_root_std="target/build-$arch-standard"
+    mkdir -p "$target_root_std"
     local linker="$ROOT_DIR/linkers/$arch.ld"
-    cargo clean -p kernel --target "$target_spec" --target-dir "$target_root" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
+    cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_std" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
     RUSTFLAGS="-C link-arg=-T$linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro" \
-    cargo +nightly build -p kernel --target "$target_spec" --target-dir "$target_root" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
+    cargo +nightly build -p kernel --target "$target_spec" --target-dir "$target_root_std" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
     
     mkdir -p "target/final-$arch"
-    local target_triple
-    target_triple=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-kernel" || echo "x86_64-unknown-kernel")
-    cp "$target_root/$target_triple/release/kernel" "target/final-$arch/kernel"
+    cp "$target_root_std/$target_triple/release/kernel" "target/final-$arch/kernel"
 
     # 2. Direct boot kernel
     echo "  Building direct-boot kernel..."
+    local target_root_dir="target/build-$arch-direct"
+    mkdir -p "$target_root_dir"
     local direct_linker="$ROOT_DIR/linkers/$arch-direct.ld"
-    cargo clean -p kernel --target "$target_spec" --target-dir "$target_root" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
+    cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_dir" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
     RUSTFLAGS="-C link-arg=-T$direct_linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro" \
-    cargo +nightly build -p kernel --target "$target_spec" --target-dir "$target_root" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
+    cargo +nightly build -p kernel --target "$target_spec" --target-dir "$target_root_dir" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
     
-    cp "$target_root/$target_triple/release/kernel" "target/final-$arch/kernel-direct"
+    cp "$target_root_dir/$target_triple/release/kernel" "target/final-$arch/kernel-direct"
     
     # Generate flat binary and 32-bit ELF for direct boot
     local sysroot
@@ -213,6 +229,39 @@ build_doom() {
     )
 }
 
+# Function to build MAME
+build_mame() {
+    local arch="$1"
+    echo "🕹️  Building $arch MAME..."
+    local mame_dir="$ROOT_DIR/../mame"
+    if [[ ! -d "$mame_dir" ]]; then
+        echo "⚠️  MAME source not found at $mame_dir, skipping"
+        return 0
+    fi
+    (
+        cd "$mame_dir" || exit 1
+        make -f Makefile.leandros ARCH="$arch" \
+            LEANDROS_ROOT="$ROOT_DIR" \
+        || echo "⚠️  MAME $arch build failed, skipping"
+    )
+}
+
+# Function to build relibc
+build_relibc() {
+    local arch="$1"
+    echo "📚 Building $arch relibc..."
+    local target_spec="$ROOT_DIR/targets/$arch-unknown-leandros.json"
+    (
+        cd userland/relibc || exit 1
+        # Build relibc using cargo
+        cargo build --target "$target_spec" --release -Z build-std=core,alloc,compiler_builtins
+        
+        # Also build ld_so and crt if they are part of the workspace and needed
+        # (Already handled by workspace if configured correctly, but relibc's Makefile 
+        # is the traditional way to get the full sysroot. For now we use cargo to get libc.a)
+    )
+}
+
 # Main
 download_limine "$LIMINE_VERSION"
 LIMINE_DIR="$LIMINE_CACHE_DIR/limine-$LIMINE_VERSION-binary"
@@ -225,8 +274,10 @@ else
 fi
 
 for arch in "${ARCHS[@]}"; do
+    build_relibc "$arch"
     build_userland "$arch"
     build_doom "$arch"
+    build_mame "$arch"
     create_initrd "$arch"
     build_kernel "$arch"
     create_disk_image "$arch" "$LIMINE_DIR"
