@@ -86,9 +86,11 @@ pub fn alloc(order: usize) -> Option<usize> {
         }
     }
     
-    extern "C" { fn serial_print(s: *const u8, len: usize); }
+    extern "C" { fn serial_write_byte_direct(b: u8); }
     let msg = b"[BUDDY] Allocation failed! Out of memory.\n";
-    unsafe { serial_print(msg.as_ptr(), msg.len()); }
+    for &b in msg {
+        unsafe { serial_write_byte_direct(b); }
+    }
     None
 }
 

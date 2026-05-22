@@ -407,6 +407,17 @@ pub fn fb_putc(c: u8) {
     KERNEL_FB.lock().putc(c);
 }
 
+/// Flush the kernel framebuffer to the GPU if present.
+pub fn fb_flush() {
+    let fb = KERNEL_FB.lock();
+    let width = fb.width;
+    let height = fb.height;
+    if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+        // Flush the whole screen for simplicity
+        gpu.flush(1, 0, 0, width as u32, height as u32);
+    }
+}
+
 /// Initialize the kernel-space framebuffer console.
 pub unsafe fn init_kernel_fb(base: *mut u32, width: usize, height: usize, pitch: usize) {
     let mut fb = KERNEL_FB.lock();
