@@ -204,65 +204,61 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
         let page_offset  = vaddr - page_vaddr;          // byte offset into the first page
         let map_size     = memsz + page_offset;         // total bytes to map
 
-        // DEBUG: Trace segment mapping
-        #[cfg(target_arch = "aarch64")]
-        {
-            extern "C" { fn arch_serial_putc(c: u8); }
-            let msg = b"[ELF] Mapping segment...\r\n";
-            for &byte in msg { unsafe { arch_serial_putc(byte); } }
-        }
-
-        // Map the segment.  map() zeroes all backing pages so the BSS tail
-        // (memsz > filesz) is already zeroed.
-        if !as_.map(page_vaddr, map_size, flags) {
+        // Map lazily — avoids requiring one huge contiguous physical allocation
+        // (order 15/16 for large MAME-sized segments) that may not be available
+        // even with ample RAM due to physical memory fragmentation.
+        // BSS pages (memsz > filesz) will be zero-faulted in on first access.
+        if !as_.map_lazy(page_vaddr, map_size, flags) {
             return Err(ElfError::MappingFailed);
         }
 
-        // Locate the physical base for the copy.  as_.map() uses an eager
-        // buddy allocation, so the VMA has a contiguous phys range starting
-        // at vma.phys.  The VMA starts at page_vaddr (after alignment in map).
-        let phys_base = {
-            let vma = as_.find(page_vaddr).ok_or(ElfError::MappingFailed)?;
-            // vma.start == page_vaddr (map() aligns down to page boundary)
-            vma.phys + (vaddr - vma.start)
-        };
-
-        // Copy `filesz` bytes via the HHDM virtual address so this works
-        // regardless of whether an identity map is present.
-        let virt_base = mm::phys_to_virt(phys_base);
+        // Fault in and copy the file-image data page by page.
         if filesz > 0 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr().add(foffset),
-                    virt_base as *mut u8,
-                    filesz,
-                );
+            let mut src_off   = foffset;
+            let mut dst_va    = vaddr;
+            let mut remaining = filesz;
 
-                // CRITICAL: Cache maintenance for executable code
-                // After copying code to memory, we must ensure cache coherency
+            while remaining > 0 {
+                if !as_.handle_user_page_fault(dst_va) {
+                    return Err(ElfError::MappingFailed);
+                }
+                let phys     = as_.virt_to_phys(dst_va).ok_or(ElfError::MappingFailed)?;
+                let page_off = dst_va & (page_size - 1);
+                let chunk    = (page_size - page_off).min(remaining);
+
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr().add(src_off),
+                        mm::phys_to_virt(phys) as *mut u8,
+                        chunk,
+                    );
+                }
+
+                // AArch64: maintain cache coherency for executable pages.
+                #[cfg(target_arch = "aarch64")]
                 if ph.p_flags & PF_X != 0 {
-                    // AArch64 cache maintenance
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        // Clean data cache and invalidate instruction cache for the code region
-                        let start_addr = mm::phys_to_virt(phys_base);
-                        let end_addr = start_addr + filesz;
-
-                        // Clean data cache to point of coherency
-                        let mut addr = start_addr & !63; // Align to cache line (64 bytes)
+                    unsafe {
+                        let hhdm_addr = mm::phys_to_virt(phys);
+                        let end_addr  = hhdm_addr + chunk;
+                        let mut addr  = hhdm_addr & !63;
                         while addr < end_addr {
                             core::arch::asm!("dc cvac, {}", in(reg) addr);
                             addr += 64;
                         }
-                        // Invalidate instruction cache for the entire range
-                        core::arch::asm!("ic iallu"); // Invalidate all instruction cache
-                        // Ensure completion
-                        core::arch::asm!("isb");
-                        
-                        let msg = b"[ELF] Segment mapped and cache maintained\r\n";
-                        extern "C" { fn arch_serial_putc(c: u8); }
-                        for &byte in msg { arch_serial_putc(byte); }
                     }
+                }
+
+                dst_va    += chunk;
+                src_off   += chunk;
+                remaining -= chunk;
+            }
+
+            // AArch64: after all pages are copied, invalidate I-cache once.
+            #[cfg(target_arch = "aarch64")]
+            if ph.p_flags & PF_X != 0 {
+                unsafe {
+                    core::arch::asm!("ic iallu");
+                    core::arch::asm!("isb");
                 }
             }
         }
