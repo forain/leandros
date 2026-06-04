@@ -27,6 +27,23 @@ use spin::Mutex;
 
 extern crate mm;
 
+extern "C" { fn arch_serial_putc(c: u8); }
+
+fn serial_debug(msg: &str) {
+    for &b in msg.as_bytes() {
+        unsafe { arch_serial_putc(b); }
+    }
+}
+
+fn serial_debug_hex(v: u32) {
+    serial_debug("0x");
+    for i in (0..8).rev() {
+        let n = (v >> (i * 4)) & 0xF;
+        let c = if n < 10 { b'0' + n as u8 } else { b'A' + n as u8 - 10 };
+        unsafe { arch_serial_putc(c); }
+    }
+}
+
 // ── Protocol tag constants ────────────────────────────────────────────────────
 
 pub const VFS_OPEN:        u64 = 0x10;
@@ -76,7 +93,7 @@ fn val_reply(v: u64) -> Message { make_reply(v as i64) }
 
 /// Synchronously call another server via its IPC port.
 /// Blocks the current task until a reply is received on its reply port.
-fn ipc_call(port_id: u32, mut msg: Message) -> Option<Message> {
+pub fn call_port(port_id: u32, mut msg: Message) -> Message {
     // Lazily allocate the caller's reply port.
     let reply_port = {
         let rp = sched::current_reply_port();
@@ -85,21 +102,24 @@ fn ipc_call(port_id: u32, mut msg: Message) -> Option<Message> {
         } else {
             let caller = sched::current_pid();
             match port::create(caller) {
-                Some(p) => { sched::set_current_reply_port(p); p }
-                None    => return None,
+                Some(p) => {
+                    sched::set_current_reply_port(p);
+                    p
+                }
+                None    => return Message::empty(),
             }
         }
     };
 
     msg.reply_port = reply_port;
     if port::send(port_id, msg).is_err() {
-        return None;
+        return Message::empty();
     }
 
     let caller = sched::current_pid();
     loop {
         match port::recv_as(reply_port, caller) {
-            Some(reply) => return Some(reply),
+            Some(reply) => return reply,
             None => {
                 sched::block_on(reply_port);
             }
@@ -136,7 +156,7 @@ static TMP_FILES: Mutex<[TmpFileEntry; MAX_TMP_FILES]> =
 // ── Vnode kinds ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
-enum VnodeKind {
+pub enum VnodeKind {
     None,
     /// Static read-only RamFS file.
     RamFile { data: &'static [u8], pos: usize },
@@ -160,6 +180,21 @@ enum VnodeKind {
     DevFb { pos: usize },
     /// Dynamically registered device proxy.
     DynamicDevice { port: u32, dev_id: u32 },
+    /// File or directory on a mounted filesystem (F2FS, etc.).
+    MountedFile { port: u32, file_id: u32 },
+}
+
+/// Identify the kind of a vnode from a process's FD table.
+pub fn vfs_get_node_kind(pid: u32, fd: usize) -> Option<VnodeKind> {
+    let mut tbls = FD_TABLES.lock();
+    if let Some(tbl) = find_tbl(pid, &mut *tbls) {
+        if fd < MAX_FDS {
+            if tbl.fds[fd].in_use {
+                return Some(tbl.fds[fd].kind);
+            }
+        }
+    }
+    None
 }
 
 // ── Dynamic Device Registry ───────────────────────────────────────────────────
@@ -189,6 +224,52 @@ pub fn register_device(path: &'static str, port: u32, dev_id: u32) {
     if let Some(slot) = devices.iter_mut().find(|d| !d.in_use) {
         *slot = DynamicDeviceEntry { path, port, dev_id, in_use: true };
     }
+}
+
+// ── Filesystem mount registry ─────────────────────────────────────────────────
+
+const MAX_MOUNTS: usize = 8;
+
+#[derive(Clone, Copy)]
+pub struct MountEntry {
+    pub prefix: &'static str,
+    pub port:   u32,
+    pub in_use: bool,
+}
+
+impl MountEntry {
+    const fn empty() -> Self { Self { prefix: "", port: 0, in_use: false } }
+}
+
+static MOUNTS: Mutex<[MountEntry; MAX_MOUNTS]> =
+    Mutex::new([const { MountEntry::empty() }; MAX_MOUNTS]);
+
+/// Register a mounted filesystem at `prefix` (e.g. "/mnt") to an IPC `port`.
+pub fn register_mount(prefix: &'static str, port: u32) {
+    let mut m = MOUNTS.lock();
+    if let Some(slot) = m.iter_mut().find(|e| !e.in_use) {
+        *slot = MountEntry { prefix, port, in_use: true };
+    }
+}
+
+/// Longest-prefix match: if `path` falls under any registered mount, return its port.
+fn find_mount_port(path: &[u8]) -> Option<u32> {
+    let m = MOUNTS.lock();
+    let mut best_len = 0usize;
+    let mut best_port = 0u32;
+    let mut found = false;
+    for e in m.iter() {
+        if !e.in_use { continue; }
+        let pb = e.prefix.as_bytes();
+        if path.starts_with(pb) && (path.len() == pb.len() || path.get(pb.len()) == Some(&b'/')) {
+            if pb.len() >= best_len {
+                best_len = pb.len();
+                best_port = e.port;
+                found = true;
+            }
+        }
+    }
+    if found { Some(best_port) } else { None }
 }
 
 // ── Pipe ring buffers ─────────────────────────────────────────────────────────
@@ -482,7 +563,7 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     *SERVER_PORT.lock() = port_id;
     
     // Register IPC handler to respond to PINGs (prevents deadlocks during discovery scans)
-    port::register_handler(port_id, |msg, pid| {
+    port::register_handler(port_id, |msg, pid, _target| {
         if msg.tag == 0x1000 {
             let mut reply = Message::empty();
             reply.tag = 0x1001;
@@ -566,6 +647,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         VFS_WRITE        => handle_write(caller_pid, arg(msg,0) as usize,
                                           arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_CLOSE        => handle_close(caller_pid, arg(msg,0) as usize),
+        VFS_STAT         => handle_stat(arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_LSEEK        => handle_lseek(caller_pid, arg(msg,0) as usize,
                                           arg(msg,1) as i64, arg(msg,2) as u32),
         VFS_PIPE         => handle_pipe(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
@@ -940,6 +1022,23 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
                 found = Some(VnodeKind::RamFile { data, pos: 0 });
             }
         }
+        // Check mounted filesystems (F2FS, etc.) — longest-prefix match.
+        if found.is_none() {
+            if let Some(port) = find_mount_port(path) {
+                // Proxy VFS_OPEN to the mount server; it returns a file_id (≥0) or -errno.
+                let mut proxy = Message::empty();
+                proxy.tag = VFS_OPEN;
+                proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+                proxy.data[8..16].copy_from_slice(&(flags as u64).to_le_bytes());
+                proxy.data[16..24].copy_from_slice(&0u64.to_le_bytes());
+                let reply = call_port(port, proxy);
+                let file_id_raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
+                if file_id_raw < 0 {
+                    return make_reply(file_id_raw);
+                }
+                found = Some(VnodeKind::MountedFile { port, file_id: file_id_raw as u32 });
+            }
+        }
         match found { Some(v) => v, None => return err_reply(-2) }
     };
 
@@ -1009,9 +1108,9 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             proxy_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
             proxy_msg.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
             proxy_msg.data[16..24].copy_from_slice(&(count as u64).to_le_bytes());
-            match ipc_call(port, proxy_msg) {
-                Some(reply) => reply,
-                None => err_reply(-5), // EIO
+            proxy_msg.data[24..32].copy_from_slice(&(pid as u64).to_le_bytes());
+            match call_port(port, proxy_msg) {
+                reply => reply,
             }
         }
         VnodeKind::RamFile { data, pos } => {
@@ -1094,6 +1193,16 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             TIMERFD_POOL.lock()[slot].expirations = 0;
             unsafe { (buf as *mut u64).write(exp); }
             val_reply(8)
+        }
+        VnodeKind::MountedFile { port, file_id } => {
+            let port = *port; let file_id = *file_id;
+            drop(tbls);
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_READ;
+            proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
+            proxy.data[16..24].copy_from_slice(&(count as u64).to_le_bytes());
+            call_port(port, proxy)
         }
         _ => err_reply(-9),
     }
@@ -1191,6 +1300,11 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             if !ok { return err_reply(-14); } // EFAULT
 
             *pos += n;
+            
+            // If VirtIO-GPU is present, trigger a flush for the console resource (1)
+            extern "C" { fn fb_flush(); }
+            unsafe { fb_flush(); }
+            
             val_reply(n as u64)
         }
         VnodeKind::DynamicDevice { port, dev_id } => {
@@ -1202,10 +1316,20 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             proxy_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
             proxy_msg.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
             proxy_msg.data[16..24].copy_from_slice(&(count as u64).to_le_bytes());
-            match ipc_call(port, proxy_msg) {
-                Some(reply) => reply,
-                None => err_reply(-5), // EIO
+            proxy_msg.data[24..32].copy_from_slice(&(pid as u64).to_le_bytes());
+            match call_port(port, proxy_msg) {
+                reply => reply,
             }
+        }
+        VnodeKind::MountedFile { port, file_id } => {
+            let port = *port; let file_id = *file_id;
+            drop(tbls);
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_WRITE;
+            proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
+            proxy.data[16..24].copy_from_slice(&(count as u64).to_le_bytes());
+            call_port(port, proxy)
         }
         _ => err_reply(-9),
     }
@@ -1236,7 +1360,13 @@ fn handle_close(pid: u32, fd: usize) -> Message {
             let mut close_msg = Message::empty();
             close_msg.tag = VFS_CLOSE;
             close_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
-            let _ = ipc_call(port, close_msg);
+            let _ = call_port(port, close_msg);
+        }
+        VnodeKind::MountedFile { port, file_id } => {
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_CLOSE;
+            proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+            let _ = call_port(port, proxy);
         }
         _ => {}
     }
@@ -1292,6 +1422,16 @@ fn handle_lseek(pid: u32, fd: usize, offset: i64, whence: u32) -> Message {
             if new_pos < 0 { return err_reply(-22); }
             *pos = new_pos as usize;
             val_reply(new_pos as u64)
+        }
+        VnodeKind::MountedFile { port, file_id } => {
+            let port = *port; let file_id = *file_id;
+            drop(tbls);
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_LSEEK;
+            proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&(offset as u64).to_le_bytes());
+            proxy.data[16..24].copy_from_slice(&(whence as u64).to_le_bytes());
+            call_port(port, proxy)
         }
         _ => err_reply(-29), // ESPIPE — not seekable (pipes, devnull, etc.)
     }
@@ -1395,8 +1535,9 @@ fn handle_close_all(pid: u32) -> Message {
                     let mut close_msg = Message::empty();
                     close_msg.tag = VFS_CLOSE;
                     close_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
-                    let _ = ipc_call(port, close_msg);
+                    let _ = call_port(port, close_msg);
                 }
+
                 _ => {}
             }
         }
@@ -1450,6 +1591,16 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
 
     let (dir_path, start_pos) = match &tbl.fds[fd].kind {
         VnodeKind::RamFile { data, pos } => (*data, *pos),
+        VnodeKind::MountedFile { port, file_id } => {
+            let port = *port; let file_id = *file_id;
+            drop(tbls);
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_GETDENTS64;
+            proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
+            proxy.data[16..24].copy_from_slice(&(count as u64).to_le_bytes());
+            return call_port(port, proxy);
+        }
         _ => return err_reply(-20), // ENOTDIR
     };
     let dir_len = dir_path.len();
@@ -1848,15 +1999,16 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
         let port = *port;
         let dev_id = *dev_id;
         drop(tbls);
+
         let mut proxy_msg = Message::empty();
         proxy_msg.tag = VFS_IOCTL;
         proxy_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
         proxy_msg.data[8..16].copy_from_slice(&(cmd as u64).to_le_bytes());
         proxy_msg.data[16..24].copy_from_slice(&(arg as u64).to_le_bytes());
-        match ipc_call(port, proxy_msg) {
-            Some(reply) => return reply,
-            None => return err_reply(-5),
-        }
+        proxy_msg.data[24..32].copy_from_slice(&(pid as u64).to_le_bytes());
+
+        let reply = call_port(port, proxy_msg);
+        return reply;
     }
 
     if cmd == FBIOGET_VSCREENINFO {
@@ -1916,6 +2068,14 @@ fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
             entry.len = new_len;
             ok_reply()
         }
+        VnodeKind::MountedFile { port, file_id } => {
+            drop(tbls);
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_FTRUNCATE;
+            proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&(new_len as u64).to_le_bytes());
+            call_port(port, proxy)
+        }
         _ => err_reply(-22),
     }
 }
@@ -1940,6 +2100,12 @@ fn handle_rename(old_ptr: usize, new_ptr: usize) -> Message {
 fn handle_unlink(path_ptr: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let path = &pbuf[..plen];
+    if let Some(port) = find_mount_port(path) {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_UNLINK;
+        proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+        return call_port(port, proxy);
+    }
     if !is_tmp_path(path) { return err_reply(-30); }
     let mut tmp = TMP_FILES.lock();
     match tmp.iter().position(|e| e.in_use && !e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
@@ -1951,6 +2117,12 @@ fn handle_unlink(path_ptr: usize) -> Message {
 fn handle_mkdir(path_ptr: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let path = &pbuf[..plen];
+    if let Some(port) = find_mount_port(path) {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_MKDIR;
+        proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+        return call_port(port, proxy);
+    }
     if !is_tmp_path(path) { return err_reply(-30); }
     for &dir in RAMFS_DIRS { if path == dir { return err_reply(-17); } }
     let mut tmp = TMP_FILES.lock();
@@ -1965,6 +2137,104 @@ fn handle_mkdir(path_ptr: usize) -> Message {
         }
         None => err_reply(-28),
     }
+}
+
+// ── stat(2) support ──────────────────────────────────────────────────────────
+
+// Linux x86_64 struct stat layout (144 bytes):
+//   0:  st_dev  (u64)   8:  st_ino   (u64)   16: st_nlink (u64)
+//  24:  st_mode (u32)  28:  st_uid   (u32)   32: st_gid   (u32)
+//  36:  __pad0  (u32)  40:  st_rdev  (u64)   48: st_size  (i64)
+//  56:  st_blksize (i64) 64: st_blocks (i64)  72..120: timestamps (zeroed)
+fn write_stat(stat_ptr: usize, mode: u32, size: u64, ino: u64) {
+    unsafe {
+        let p = stat_ptr as *mut u8;
+        core::ptr::write_bytes(p, 0, 144);
+        (p.add( 0) as *mut u64).write_unaligned(1u64);       // st_dev
+        (p.add( 8) as *mut u64).write_unaligned(ino);        // st_ino
+        (p.add(16) as *mut u64).write_unaligned(1u64);       // st_nlink
+        (p.add(24) as *mut u32).write_unaligned(mode);       // st_mode
+        (p.add(48) as *mut u64).write_unaligned(size);       // st_size
+        (p.add(56) as *mut u64).write_unaligned(4096u64);    // st_blksize
+        (p.add(64) as *mut u64).write_unaligned((size + 511) / 512); // st_blocks
+    }
+}
+
+fn handle_stat(path_ptr: usize, stat_ptr: usize) -> Message {
+    if stat_ptr == 0 { return err_reply(-14); }
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let path = &pbuf[..plen];
+
+    // Mounted filesystems take priority.
+    if let Some(port) = find_mount_port(path) {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_STAT;
+        proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+        proxy.data[8..16].copy_from_slice(&(stat_ptr as u64).to_le_bytes());
+        return call_port(port, proxy);
+    }
+
+    // Known static directories.
+    for &dir in RAMFS_DIRS {
+        if path == dir {
+            write_stat(stat_ptr, 0o040755, 0, 1 + dir.as_ptr() as u64 & 0xFFFF);
+            return ok_reply();
+        }
+    }
+    // tmpfs directories.
+    {
+        let tmp = TMP_FILES.lock();
+        if let Some(e) = tmp.iter().find(|e| e.in_use && e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
+            let ino = plen as u64 + 10000;
+            let _ = e;
+            drop(tmp);
+            write_stat(stat_ptr, 0o040755, 0, ino);
+            return ok_reply();
+        }
+    }
+    // Special device files.
+    if path == b"/dev/null" || path == b"/dev/zero" || path == b"/dev/urandom"
+       || path == b"/dev/random" || path == b"/dev/fb0" {
+        write_stat(stat_ptr, 0o020666, 0, 2);
+        return ok_reply();
+    }
+    if path == b"/dev/stdin" || path == b"/dev/stdout" || path == b"/dev/stderr" {
+        write_stat(stat_ptr, 0o020666, 0, 3);
+        return ok_reply();
+    }
+    // Dynamic devices.
+    let dyn_found = {
+        let devices = DYNAMIC_DEVICES.lock();
+        devices.iter().any(|d| d.in_use && d.path.as_bytes() == path)
+    };
+    if dyn_found {
+        write_stat(stat_ptr, 0o020666, 0, 4);
+        return ok_reply();
+    }
+    // Static RamFS files.
+    for entry in RAMFS {
+        if path == entry.path {
+            write_stat(stat_ptr, 0o100444, entry.data.len() as u64, entry.path.as_ptr() as u64 & 0xFFFF);
+            return ok_reply();
+        }
+    }
+    // tmpfs files.
+    {
+        let tmp = TMP_FILES.lock();
+        if let Some(e) = tmp.iter().find(|e| e.in_use && !e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
+            let size = e.len as u64;
+            let ino = plen as u64 + 20000;
+            drop(tmp);
+            write_stat(stat_ptr, 0o100644, size, ino);
+            return ok_reply();
+        }
+    }
+    // initrd CPIO archive.
+    if let Some(data) = find_in_initrd(path) {
+        write_stat(stat_ptr, 0o100444, data.len() as u64, path_ptr as u64 & 0xFFFF);
+        return ok_reply();
+    }
+    err_reply(-2) // ENOENT
 }
 
 enum FdInfo { Static(&'static [u8]), Pipe(usize), RamData(*const u8), TmpIdx(usize), Bad }

@@ -16,14 +16,17 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use super::message::Message;
 
 pub type Port = u32;
-pub type HandlerFn = fn(&Message, u32) -> Message;
+/// Handler signature: (msg, caller_pid, target_port_id) -> reply
+pub type HandlerFn = fn(&Message, u32, u32) -> Message;
 
 /// Maximum number of simultaneously open IPC ports.
 pub const MAX_PORTS:   usize = 65536;
 /// Per-port message queue capacity.
 pub const QUEUE_DEPTH: usize = 16;
-/// Sentinel value for an empty bucket's port-ID field.
+/// Sentinel value for an empty (never-used) bucket.
 const EMPTY_ID: u32 = 0;
+/// Sentinel value for a deleted (tombstone) bucket — keeps the probe chain intact.
+const TOMBSTONE_ID: u32 = u32::MAX;
 
 /// Error returned by [`send`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,7 +37,8 @@ pub enum SendError {
 
 /// One open-addressing hash-table bucket.
 struct PortEntry {
-    /// Port ID stored in this bucket, or `EMPTY_ID` if the slot is free.
+    /// Port ID stored in this bucket.
+    /// `EMPTY_ID` (0) = never used; `TOMBSTONE_ID` (u32::MAX) = deleted; else live.
     id:        u32,
     owner_pid: u32,
     queue:     [Option<Message>; QUEUE_DEPTH],
@@ -55,7 +59,21 @@ impl PortEntry {
         }
     }
 
+    /// Create a tombstone entry — preserves the probe chain but marks slot as reusable.
+    fn tombstone() -> Self {
+        Self {
+            id:        TOMBSTONE_ID,
+            owner_pid: 0,
+            queue:     [const { None }; QUEUE_DEPTH],
+            head:      0,
+            tail:      0,
+            handler:   None,
+        }
+    }
+
     fn is_free(&self) -> bool { self.id == EMPTY_ID }
+    fn is_tombstone(&self) -> bool { self.id == TOMBSTONE_ID }
+    fn is_available(&self) -> bool { self.is_free() || self.is_tombstone() }
 
     fn enqueue(&mut self, msg: Message) -> bool {
         let next = (self.tail + 1) % QUEUE_DEPTH;
@@ -114,22 +132,26 @@ impl PortTable {
     }
 
     /// Find the bucket for `port_id`, or return `None` if not found.
+    /// Tombstone slots are skipped; only a genuinely free slot ends the search.
     fn find(&self, port_id: u32) -> Option<usize> {
         let start = (port_id as usize) % LIVE_BUCKETS;
         for i in 0..PROBE_LIMIT {
             let idx = (start + i) % LIVE_BUCKETS;
-            if self.buckets[idx].is_free() { return None; }
+            if self.buckets[idx].is_free() { return None; }      // end of chain
+            if self.buckets[idx].is_tombstone() { continue; }     // deleted slot, keep probing
             if self.buckets[idx].id == port_id { return Some(idx); }
         }
         None
     }
 
     /// Find the bucket for `port_id` (mutable), or return `None`.
+    /// Tombstone slots are skipped; only a genuinely free slot ends the search.
     fn find_mut(&mut self, port_id: u32) -> Option<usize> {
         let start = (port_id as usize) % LIVE_BUCKETS;
         for i in 0..PROBE_LIMIT {
             let idx = (start + i) % LIVE_BUCKETS;
-            if self.buckets[idx].is_free() { return None; }
+            if self.buckets[idx].is_free() { return None; }      // end of chain
+            if self.buckets[idx].is_tombstone() { continue; }     // deleted slot, keep probing
             if self.buckets[idx].id == port_id { return Some(idx); }
         }
         None
@@ -137,6 +159,7 @@ impl PortTable {
 
     /// Allocate an empty bucket for a new port owned by `owner_pid`.
     /// Returns `(port_id, bucket_index)` on success, `None` if full.
+    /// Tombstone slots may be reused.
     fn alloc(&mut self, owner_pid: u32) -> Option<(Port, usize)> {
         // Linear-scan for a new port ID that fits in an unoccupied bucket.
         for _ in 0..MAX_PORTS {
@@ -146,11 +169,14 @@ impl PortTable {
             let start = (id as usize) % LIVE_BUCKETS;
             for i in 0..PROBE_LIMIT {
                 let idx = (start + i) % LIVE_BUCKETS;
-                if self.buckets[idx].is_free() {
+                if self.buckets[idx].is_available() {
                     self.buckets[idx].id        = id;
                     self.buckets[idx].owner_pid = owner_pid;
                     self.buckets[idx].head      = 0;
                     self.buckets[idx].tail      = 0;
+                    self.buckets[idx].handler   = None;
+                    // Clear any leftover queue entries from a previous occupant.
+                    for slot in self.buckets[idx].queue.iter_mut() { *slot = None; }
                     return Some((id, idx));
                 }
             }
@@ -160,6 +186,21 @@ impl PortTable {
 }
 
 static PORT_TABLE: Mutex<PortTable> = Mutex::new(PortTable::new());
+
+extern "C" { fn arch_serial_putc(c: u8); }
+
+fn port_serial_debug(msg: &str) {
+    for &b in msg.as_bytes() { unsafe { arch_serial_putc(b); } }
+}
+
+fn port_serial_hex(v: u32) {
+    port_serial_debug("0x");
+    for i in (0..8).rev() {
+        let n = (v >> (i * 4)) & 0xF;
+        let c = if n < 10 { b'0' + n as u8 } else { b'A' + n as u8 - 10 };
+        unsafe { arch_serial_putc(c); }
+    }
+}
 
 pub fn init() {}
 
@@ -171,9 +212,10 @@ pub fn release_by_owner(pid: u32) {
     {
         let mut table = PORT_TABLE.lock();
         for bucket in table.buckets.iter_mut() {
-            if !bucket.is_free() && bucket.owner_pid == pid {
+            if !bucket.is_free() && !bucket.is_tombstone() && bucket.owner_pid == pid {
                 let id = bucket.id;
-                *bucket = PortEntry::empty();
+                // Use tombstone to preserve the probe chain for other ports.
+                *bucket = PortEntry::tombstone();
                 if n_closed < closed.len() {
                     closed[n_closed] = Some(id);
                     n_closed += 1;
@@ -193,7 +235,8 @@ pub fn release_by_owner(pid: u32) {
 pub fn close(port: Port) {
     let mut table = PORT_TABLE.lock();
     if let Some(idx) = table.find_mut(port) {
-        table.buckets[idx] = PortEntry::empty();
+        // Tombstone preserves the probe chain for ports inserted past this slot.
+        table.buckets[idx] = PortEntry::tombstone();
     }
 }
 
@@ -207,17 +250,25 @@ pub fn create(pid: u32) -> Option<Port> {
 pub fn send(port: Port, msg: Message) -> Result<(), SendError> {
     let mut table = PORT_TABLE.lock();
     let idx = table.find_mut(port).ok_or(SendError::PortNotFound)?;
-    
+
     // If there's a direct handler, call it synchronously.
     if let Some(handler) = table.buckets[idx].handler {
         let caller_pid = sched::current_pid();
+        let target_port = table.buckets[idx].id;
         let reply_port = msg.reply_port;
         drop(table);
-        
-        let reply = handler(&msg, caller_pid);
-        
+
+        let reply = handler(&msg, caller_pid, target_port);
+
         if reply_port != u32::MAX {
-            let _ = send(reply_port, reply);
+            match send(reply_port, reply) {
+                Ok(()) => {}
+                Err(e) => {
+                    port_serial_debug("[IPC] ERROR: reply delivery failed for port ");
+                    port_serial_hex(reply_port);
+                    port_serial_debug(if e == SendError::PortNotFound { " (PortNotFound)\n" } else { " (QueueFull)\n" });
+                }
+            }
         }
         return Ok(());
     }
@@ -261,8 +312,25 @@ pub fn recv(port: Port) -> Option<Message> {
 /// Like `recv`, but enforces that `caller_pid` owns the port.
 pub fn recv_as(port: Port, caller_pid: u32) -> Option<Message> {
     let mut table = PORT_TABLE.lock();
-    let idx = table.find_mut(port)?;
-    if table.buckets[idx].owner_pid != caller_pid { return None; }
+    let idx = match table.find_mut(port) {
+        Some(i) => i,
+        None => {
+            port_serial_debug("[IPC] recv_as: port not found ");
+            port_serial_hex(port);
+            port_serial_debug("\n");
+            return None;
+        }
+    };
+    if table.buckets[idx].owner_pid != caller_pid {
+        port_serial_debug("[IPC] recv_as: owner mismatch port ");
+        port_serial_hex(port);
+        port_serial_debug(" owner=");
+        port_serial_hex(table.buckets[idx].owner_pid);
+        port_serial_debug(" caller=");
+        port_serial_hex(caller_pid);
+        port_serial_debug("\n");
+        return None;
+    }
     table.buckets[idx].dequeue()
 }
 
