@@ -234,30 +234,35 @@ impl DrmDeviceInterface {
 
     /// Handle incoming IPC messages
     pub fn handle_ioctl(&mut self, cmd: u32, arg: usize) -> Result<usize, DriverError> {
-        let device = get_drm_device();
-        let mut device_lock = device.lock();
+        crate::pci::serial_debug("[DRM-IF] handle_ioctl cmd=");
+        crate::pci::serial_debug_hex(cmd);
+        crate::pci::serial_debug("\n");
 
         // If this is a mode-setting or flip call, disable the kernel console
-        // Note: 0x1001 is custom SET_MODE, 0x1004 is custom FLIP_PAGE
-        // 0xC06864A2 is standard SETCRTC, 0xC01864B0 is standard PAGE_FLIP
-        if cmd == 0x1004 || cmd == 0xC06864A2 || cmd == 0xC01864B0 {
-            crate::pci::serial_debug("[DRM] Disabling kernel console for command ");
-            crate::pci::serial_debug_hex(cmd);
-            crate::pci::serial_debug("\n");
+        if cmd == 0x1001 || cmd == 0x1004 || cmd == 0xC06864A2 || cmd == 0xC01864B0 {
+            crate::pci::serial_debug("[DRM-IF] Disabling console\n");
             crate::framebuffer::set_console_disabled(true);
         }
 
-        match cmd {
+        let device = get_drm_device();
+        crate::pci::serial_debug("[DRM-IF] Locking DRM_DEVICE...\n");
+        let mut device_lock = device.lock();
+        crate::pci::serial_debug("[DRM-IF] DRM_DEVICE locked\n");
+
+        let res = match cmd {
             // Mode setting ioctls (Custom LeandrOS)
             0x1001 => {
                 // Drop the lock here because ModeSet::set_display_mode will acquire it
                 drop(device_lock);
                 self.handle_set_mode(arg)
             },
-            0x1003 => self.handle_get_mode(&mut device_lock, arg),
-
-            // Framebuffer ioctls (Custom LeandrOS)
+            0x1003 => {
+                crate::pci::serial_debug("[DRM-IF] Dropping lock for GET_MODE\n");
+                drop(device_lock);
+                self.handle_get_mode_safe(arg)
+            },
             0x1002 => self.handle_create_framebuffer(&mut device_lock, arg),
+            0x4600 => self.handle_fbioget_vscreeninfo(&mut device_lock, arg),
             0x1004 => self.handle_flip_page(&mut device_lock, arg),
             0x1005 => self.handle_set_plane(&mut device_lock, arg),
 
@@ -265,7 +270,7 @@ impl DrmDeviceInterface {
             0x1006 => self.handle_get_capabilities(arg),
 
             // Mmap ioctl - returns physical address for device mapping
-            0x1007 => self.handle_ioctl_mmap(arg),
+            0x1007 => self.handle_ioctl_mmap(&mut device_lock, arg),
 
             // Standard Linux DRM IOCTLs
             DRM_IOCTL_VERSION => self.std_handle_version(arg),
@@ -287,7 +292,10 @@ impl DrmDeviceInterface {
             DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => self.virtgpu_handle_transfer_from_host(arg),
 
             _ => Err(DriverError::Unsupported),
-        }
+        };
+
+        crate::pci::serial_debug("[DRM-IF] handle_ioctl finished, returning Result\n");
+        res
     }
 
     /// Handle DRM_IOCTL_SET_MODE
@@ -308,44 +316,75 @@ impl DrmDeviceInterface {
         }
     }
 
-    /// Handle DRM_IOCTL_GET_MODE
-    fn handle_get_mode(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
-        // arg points to [width, height, refresh] array to fill
-        let mode_data = unsafe {
-            slice::from_raw_parts_mut(arg as *mut u32, 3)
-        };
+    /// Handle DRM_IOCTL_GET_MODE safely by not holding the lock during userspace write
+    fn handle_get_mode_safe(&mut self, arg: usize) -> Result<usize, DriverError> {
+        crate::pci::serial_debug("[DRM-IF] handle_get_mode_safe starting\n");
+        
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
 
-        // Try to get actual display mode first
-        if let Some(crtc) = device.crtcs.first() {
-            if let Some(mode) = &crtc.mode {
-                mode_data[0] = mode.hdisplay as u32;
-                mode_data[1] = mode.vdisplay as u32;
-                mode_data[2] = mode.vrefresh;
-                return Ok(0);
+        let mut width = 0;
+        let mut height = 0;
+        let mut refresh = 60;
+        let mut found = false;
+
+        // 1. Get info from device (acquiring lock briefly)
+        {
+            crate::pci::serial_debug("[DRM-IF] Locking DRM_DEVICE briefly...\n");
+            let device = get_drm_device().lock();
+            if let Some(crtc) = device.crtcs.first() {
+                if let Some(mode) = &crtc.mode {
+                    crate::pci::serial_debug("[DRM-IF] Got mode from CRTC\n");
+                    width = mode.hdisplay as u32;
+                    height = mode.vdisplay as u32;
+                    refresh = mode.vrefresh;
+                    found = true;
+                }
+            }
+            crate::pci::serial_debug("[DRM-IF] Unlocked DRM_DEVICE\n");
+        }
+
+        if !found {
+            crate::pci::serial_debug("[DRM-IF] Falling back to VFS info\n");
+            // Get mode from existing KMS framebuffer console
+            extern "C" {
+                fn vfs_get_framebuffer_info(info: &mut FramebufferInfo);
+            }
+
+            let mut fb_info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
+            unsafe { vfs_get_framebuffer_info(&mut fb_info); }
+
+            if fb_info.width > 0 && fb_info.height > 0 {
+                crate::pci::serial_debug("[DRM-IF] Got mode from VFS: ");
+                crate::pci::serial_debug_hex(fb_info.width);
+                crate::pci::serial_debug("x");
+                crate::pci::serial_debug_hex(fb_info.height);
+                crate::pci::serial_debug("\n");
+
+                width = fb_info.width;
+                height = fb_info.height;
+                refresh = 60;
+            } else {
+                crate::pci::serial_debug("[DRM-IF] Final fallback to 640x480\n");
+                width = 640;
+                height = 480;
+                refresh = 60;
             }
         }
 
-        // Get mode from existing KMS framebuffer console
-        // Use the bootloader framebuffer dimensions stored in VFS
-        extern "C" {
-            fn vfs_get_framebuffer_info(info: &mut FramebufferInfo);
+        // 2. Write to userspace
+        crate::pci::serial_debug("[DRM-IF] Writing to userspace at ");
+        crate::pci::serial_debug_hex(arg as u32);
+        crate::pci::serial_debug("\n");
+
+        unsafe {
+            let ptr = arg as *mut u32;
+            ptr.write_volatile(width);
+            ptr.add(1).write_volatile(height);
+            ptr.add(2).write_volatile(refresh);
         }
 
-        let mut fb_info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
-        unsafe { vfs_get_framebuffer_info(&mut fb_info); }
-
-        if fb_info.width > 0 && fb_info.height > 0 {
-            mode_data[0] = fb_info.width;   // Bootloader framebuffer width
-            mode_data[1] = fb_info.height;  // Bootloader framebuffer height
-            mode_data[2] = 60;      // Default refresh rate
-            Ok(0)
-        } else {
-            // Final fallback
-            mode_data[0] = 640;
-            mode_data[1] = 480;
-            mode_data[2] = 60;
-            Ok(0)
-        }
+        crate::pci::serial_debug("[DRM-IF] handle_get_mode_safe finished OK\n");
+        Ok(0)
     }
 
     /// Release DRM resources and re-enable kernel console
@@ -394,16 +433,15 @@ impl DrmDeviceInterface {
             }
         }
 
-        // Return results to userspace
-        fb_data[3] = fb_id; // fb_id
-        fb_data[4] = 0;     // Signal that mmap() is needed by returning NULL pointer
-        fb_data[5] = mmap_offset as u32; // Pass physical address as mmap offset (low 32 bits)
+        // Return results to userspace.
+        // Slot [4] = 0 forces DOOM through its mmap() branch, which calls sys_mmap →
+        // ioctl 0x1007 → map_device(virt, phys_addr, len) — giving DOOM a proper virtual
+        // address that maps to the same physical page VirtIO reads via attach_backing.
+        // Slot [5] carries the physical address used as the mmap offset (< 4 GiB assumed).
+        fb_data[3] = fb_id;
+        fb_data[4] = 0;                        // no direct buffer pointer — force mmap
+        fb_data[5] = mmap_offset as u32;       // physical address as mmap offset
 
-        crate::pci::serial_debug("[DRM] Created FB id=");
-        crate::pci::serial_debug_hex(fb_id);
-        crate::pci::serial_debug(" offset=");
-        crate::pci::serial_debug_hex_64(mmap_offset as u64);
-        crate::pci::serial_debug("\n");
 
         Ok(0)
     }
@@ -750,15 +788,34 @@ impl DrmDeviceInterface {
         let flip_args = [flip.fb_id, flip.flags, src_w, src_h];
         self.handle_flip_page(device, flip_args.as_ptr() as usize)
     }
-    /// Handle DRM_IOCTL_MMAP - returns physical address of framebuffer
-    fn handle_ioctl_mmap(&mut self, arg: usize) -> Result<usize, DriverError> {
-        // arg points to a u64 which contains the requested physical address/offset
-        if arg == 0 {
-            return Err(DriverError::InvalidParameter);
-        }
+    /// Handle FBIOGET_VSCREENINFO (0x4600)
+    fn handle_fbioget_vscreeninfo(&self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
 
-        let phys_addr_ptr = arg as *mut u64;
-        let requested_phys = unsafe { *phys_addr_ptr };
+        let (width, height, _pitch) = if let Some((_, w, h, p)) = crate::framebuffer::get_hardware_fb_info() {
+            (w as u32, h as u32, p as u32)
+        } else {
+            (1280, 800, 1280 * 4)
+        };
+
+        let data = unsafe { slice::from_raw_parts_mut(arg as *mut u32, 8) };
+        data[0] = width;
+        data[1] = height;
+        data[2] = width; // xres_virtual
+        data[3] = height; // yres_virtual
+        data[4] = 0; // xoffset
+        data[5] = 0; // yoffset
+        data[6] = 32; // bits_per_pixel
+        data[7] = 0; // grayscale
+
+        Ok(0)
+    }
+
+    /// Handle DRM_IOCTL_MMAP - returns physical address of framebuffer
+    fn handle_ioctl_mmap(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+        // arg contains the requested physical address/offset
+        let requested_phys = arg as u64;
+
 
         if requested_phys == 0 {
             // Default: return the hardware framebuffer
@@ -770,18 +827,12 @@ impl DrmDeviceInterface {
             if fb_base == 0 {
                 return Err(DriverError::NotFound);
             }
-            unsafe {
-                *phys_addr_ptr = fb_base;
-            }
+            Ok(fb_base as usize)
         } else {
             // The physical address was passed as the offset to mmap()
             // We just return it back to the kernel to confirm we support mapping it.
-            unsafe {
-                *phys_addr_ptr = requested_phys;
-            }
+            Ok(requested_phys as usize)
         }
-
-        Ok(0)
     }
 
     /// Handle read operations (for events)
@@ -864,7 +915,6 @@ impl DrmDeviceInterface {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let create = unsafe { &mut *(arg as *mut drm_virtgpu_resource_create) };
         
-        crate::pci::serial_debug("[DRM] Virtio-GPU Resource Create\n");
         
         if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
             // Send ResourceCreate3d command to Virtio-GPU
@@ -982,9 +1032,21 @@ impl DrmDumbBuffer {
         let pages = (size as usize + 4095) / 4096;
         let order = pages.next_power_of_two().trailing_zeros() as usize;
 
+        crate::pci::serial_debug("[DRM-IF] Creating dumb buffer ");
+        crate::pci::serial_debug_hex(width);
+        crate::pci::serial_debug("x");
+        crate::pci::serial_debug_hex(height);
+        crate::pci::serial_debug(" (order ");
+        crate::pci::serial_debug_hex(order as u32);
+        crate::pci::serial_debug(")\n");
+
         // Allocate physical memory for the framebuffer
         // We use buddy_alloc to get contiguous physical memory
         let phys_addr = mm::buddy::alloc(order).ok_or(DriverError::Io)? as u64;
+
+        crate::pci::serial_debug("[DRM-IF] Allocated at ");
+        crate::pci::serial_debug_hex_64(phys_addr);
+        crate::pci::serial_debug("\n");
 
         // Zero the newly allocated buffer
         let virt_addr = mm::phys_to_virt(phys_addr as usize) as *mut u8;
