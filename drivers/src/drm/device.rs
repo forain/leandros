@@ -291,42 +291,16 @@ impl DrmDevice {
             // Update connector to CRTC associations
         }
 
-        // Apply plane states and perform scaling if needed
+        // Apply plane states: software-scale the DRM framebuffer into resource 1
+        // (the display-resolution backing buffer) and flush it to the VirtIO GPU scanout.
+        //
+        // VirtIO GPU 2D has no hardware scaling — SET_SCANOUT with a 320×200 rect
+        // tells the host the display IS 320×200, shrinking/blanking the window.
+        // We therefore always CPU-scale into resource 1 and keep the scanout
+        // permanently pointed at it.
         for plane_state in state.plane_states {
-            // Try hardware scaling first if Virtio-GPU is available
-            let mut hardware_scaled = false;
-            if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-                if let Some(fb_id) = plane_state.fb_id {
-                    if let Some(fb) = self.framebuffers.get(&fb_id) {
-                        let res_id = fb.handles[0];
-                        crate::pci::serial_debug("[DRM] scale_blit res=");
-                        crate::pci::serial_debug_hex(res_id);
-                        crate::pci::serial_debug(" src=");
-                        crate::pci::serial_debug_hex(plane_state.src_w >> 16);
-                        crate::pci::serial_debug("x");
-                        crate::pci::serial_debug_hex(plane_state.src_h >> 16);
-                        crate::pci::serial_debug(" dst=");
-                        crate::pci::serial_debug_hex(plane_state.crtc_w);
-                        crate::pci::serial_debug("x");
-                        crate::pci::serial_debug_hex(plane_state.crtc_h);
-                        crate::pci::serial_debug("\n");
-                        // Use hardware acceleration for scaling blit
-                        if gpu.scale_blit(
-                            res_id,    // Resource ID
-                            0,         // Destination (scanout 0)
-                            (plane_state.src_x >> 16, plane_state.src_y >> 16, plane_state.src_w >> 16, plane_state.src_h >> 16),
-                            (plane_state.crtc_x as u32, plane_state.crtc_y as u32, plane_state.crtc_w, plane_state.crtc_h)
-                        ) {
-                            hardware_scaled = true;
-                        }
-                    }
-                }
-            }
-
-            // Perform software scaling copy as fallback
-            if !hardware_scaled && self.fb_integration {
+            if self.fb_integration {
                 self.perform_software_scaling(&plane_state)?;
-                // If we're using software scaling, we're updating the hardware framebuffer (Resource 1)
                 if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
                     let (_, hw_width, hw_height, _) = crate::framebuffer::get_hardware_fb_info()
                         .ok_or(DriverError::NotFound)?;

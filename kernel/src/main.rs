@@ -111,6 +111,12 @@ pub extern "C" fn serial_write_byte(b: u8) {
     
     if !IN_WRITE.swap(true, core::sync::atomic::Ordering::SeqCst) {
         drivers::framebuffer::fb_putc(b);
+        // Flush the framebuffer to VirtIO GPU on newline so the console stays
+        // visible after VirtIO GPU mode is active (SET_SCANOUT disables VGA
+        // shadow writes; only RESOURCE_FLUSH makes new pixels appear).
+        if b == b'\n' {
+            drivers::framebuffer::fb_flush();
+        }
         IN_WRITE.store(false, core::sync::atomic::Ordering::SeqCst);
     }
 }

@@ -408,14 +408,19 @@ pub fn fb_putc(c: u8) {
 }
 
 /// Flush the kernel framebuffer to the GPU if present.
+///
+/// Drops the KERNEL_FB lock before acquiring VIRTIO_GPU to avoid lock-order
+/// inversions.  Skips the call if dimensions are still zero (framebuffer not
+/// yet initialised) so that set_scanout(1, 0, 0) is never sent to the host.
 #[no_mangle]
 pub fn fb_flush() {
-    let fb = KERNEL_FB.lock();
-    let width = fb.width;
-    let height = fb.height;
+    let (width, height) = {
+        let fb = KERNEL_FB.lock();
+        (fb.width as u32, fb.height as u32)
+    };
+    if width == 0 || height == 0 { return; }
     if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-        // Flush the whole screen for simplicity
-        gpu.flush(1, 0, 0, width as u32, height as u32);
+        gpu.flush(1, 0, 0, width, height);
     }
 }
 
