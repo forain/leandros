@@ -100,38 +100,82 @@ impl KmsDriver {
         };
 
         if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-            crate::pci::serial_debug("[KMS] VirtIO GPU available, configuring boot resource\n");
-            
-            // Register bootloader FB as resource 1 (for kernel console)
-            crate::pci::serial_debug("[KMS] Checking boot FB info...\n");
-            if let Some((base, width, height, _pitch)) = get_hardware_fb_info() {
-                crate::pci::serial_debug("[KMS] Boot FB found: ");
-                crate::pci::serial_debug_hex(base as u32);
-                crate::pci::serial_debug(" (");
+            crate::pci::serial_debug("[KMS] VirtIO GPU available\n");
+
+            if let Some((limine_phys, width, height, _pitch)) = get_hardware_fb_info() {
+                crate::pci::serial_debug("[KMS] Limine FB at phys=");
+                crate::pci::serial_debug_hex(limine_phys as u32);
+                crate::pci::serial_debug(" ");
                 crate::pci::serial_debug_hex(width);
                 crate::pci::serial_debug("x");
                 crate::pci::serial_debug_hex(height);
-                crate::pci::serial_debug(")\n");
-                
-                crate::pci::serial_debug("[KMS] Creating resource 1\n");
-                gpu.create_resource_2d(1, width, height);
-                crate::pci::serial_debug("[KMS] Attaching backing to resource 1\n");
-                gpu.attach_backing(1, base, width * height * 4);
-                crate::pci::serial_debug("[KMS] Setting scanout for resource 1\n");
-                gpu.set_scanout(1, width, height);
-                crate::pci::serial_debug("[KMS] Flushing resource 1\n");
-                gpu.flush(1, 0, 0, width, height);
-                crate::pci::serial_debug("[KMS] Resource 1 configured successfully\n");
-                
-                mode.width = width;
-                mode.height = height;
+                crate::pci::serial_debug("\n");
+
+                let fb_bytes = (width as usize) * (height as usize) * 4;
+
+                // VirtIO GPU RESOURCE_ATTACH_BACKING requires guest physical pages in
+                // regular RAM — it cannot DMA from device MMIO/VRAM.  With virtio-vga,
+                // OVMF's GOP framebuffer often lives in the VirtIO VGA VRAM BAR, so
+                // directly backing resource 1 with that address causes TRANSFER_TO_HOST_2D
+                // to read zeroes and the scanout goes black the instant SET_SCANOUT fires.
+                //
+                // Allocate a fresh RAM buffer instead.  Copy existing Limine FB content
+                // so the boot console history is preserved across the DRM handoff.
+                let pages  = (fb_bytes + 4095) >> 12;
+                let order  = (usize::BITS - pages.leading_zeros()) as usize; // ceil_log2
+                let order  = order.min(mm::buddy::MAX_ORDER - 1);
+
+                if let Some(ram_phys) = mm::buddy::alloc(order) {
+                    let ram_virt = mm::phys_to_virt(ram_phys) as *mut u8;
+
+                    // Copy Limine FB → new RAM buffer (preserves pre-DRM console text)
+                    unsafe {
+                        let src = mm::phys_to_virt(limine_phys as usize) as *const u8;
+                        core::ptr::copy_nonoverlapping(src, ram_virt, fb_bytes);
+                    }
+
+                    crate::pci::serial_debug("[KMS] RAM-backed FB at phys=");
+                    crate::pci::serial_debug_hex(ram_phys as u32);
+                    crate::pci::serial_debug("\n");
+
+                    // Back resource 1 with the new RAM buffer and set it as the scanout
+                    gpu.create_resource_2d(1, width, height);
+                    gpu.attach_backing(1, ram_phys as u64, fb_bytes as u32);
+                    gpu.set_scanout(1, width, height);
+                    gpu.flush(1, 0, 0, width, height);
+
+                    // Redirect BOOT_FB and the kernel console to the RAM buffer so that
+                    // perform_software_scaling() and fb_flush() both target the same surface
+                    // that VirtIO GPU is reading.
+                    crate::framebuffer::set_boot_framebuffer(
+                        ram_phys as u64, width, height, width * 4);
+                    unsafe {
+                        crate::framebuffer::init_kernel_fb(
+                            ram_virt as *mut u32,
+                            width as usize, height as usize, (width * 4) as usize);
+                    }
+
+                    mode.width  = width;
+                    mode.height = height;
+                    crate::pci::serial_debug("[KMS] Resource 1 configured with RAM backing\n");
+                } else {
+                    // Out of contiguous RAM — fall back to Limine FB address.
+                    // May produce a black scanout on virtio-vga but won't crash.
+                    crate::pci::serial_debug("[KMS] RAM alloc failed, falling back to Limine FB\n");
+                    gpu.create_resource_2d(1, width, height);
+                    gpu.attach_backing(1, limine_phys, fb_bytes as u32);
+                    gpu.set_scanout(1, width, height);
+                    gpu.flush(1, 0, 0, width, height);
+                    mode.width  = width;
+                    mode.height = height;
+                }
             } else {
-                crate::pci::serial_debug("[KMS] No boot FB info available\n");
+                crate::pci::serial_debug("[KMS] No Limine FB — running without console surface\n");
             }
         }
 
         self.current_mode = Some(mode);
-        crate::pci::serial_debug("[KMS] detect_and_configure returning OK\n");
+        crate::pci::serial_debug("[KMS] detect_and_configure done\n");
         Ok(mode)
     }
 
