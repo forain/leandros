@@ -64,6 +64,9 @@ pub struct VirtioGpuDevice {
     notify_off_multiplier: u32,
     _device_cfg: *mut u8,
     _features: u32,
+    current_resource_id: u32,
+    scanout_w: u32,
+    scanout_h: u32,
     
     queues: [Option<VirtioQueue>; 2],
 }
@@ -129,7 +132,10 @@ impl VirtioQueue {
     unsafe fn submit(&mut self, head: u16) {
         let a = self.avail;
         let ring_idx = (*a).idx as usize % self.size as usize;
-        (*a).ring[ring_idx] = head;
+        // Use manual offset to avoid out-of-bounds on the 32-element ring array
+        let ring_ptr = (a as usize + 4) as *mut u16;
+        ring_ptr.add(ring_idx).write_volatile(head);
+        
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         (*a).idx = (*a).idx.wrapping_add(1);
     }
@@ -275,20 +281,49 @@ impl VirtioGpuDevice {
                     let offset = pci_read_config_32(dev.bus, dev.dev, dev.func, cap_ptr + 8);
                     let length = pci_read_config_32(dev.bus, dev.dev, dev.func, cap_ptr + 12);
                     
-                    let bar = dev.bars[bar_idx as usize] & !0xF;
-                    if bar != 0 {
-                        let virt = mm::paging::map_kernel_device(bar as usize + offset as usize, length as usize, mm::paging::PageFlags::PRESENT | mm::paging::PageFlags::WRITABLE | mm::paging::PageFlags::NOCACHE)
-                            .unwrap_or(mm::phys_to_virt(bar as usize + offset as usize));
-                            
-                        match cfg_type {
-                            VIRTIO_PCI_CAP_COMMON_CFG => common_cfg = virt as *mut VirtioPciCommonCfg,
-                            VIRTIO_PCI_CAP_NOTIFY_CFG => {
-                                notify_off_multiplier = pci_read_config_32(dev.bus, dev.dev, dev.func, cap_ptr + 16);
-                                notify_cfg = virt as *mut u32;
-                            },
-                            VIRTIO_PCI_CAP_ISR_CFG => _isr_cfg = virt as *mut u8,
-                            VIRTIO_PCI_CAP_DEVICE_CFG => device_cfg = virt as *mut u8,
-                            _ => {}
+                    if (bar_idx as usize) < 6 {
+                        let raw_bar = dev.bars[bar_idx as usize];
+                        if raw_bar & 1 == 0 {
+                            let bar64: u64 = if (raw_bar >> 1) & 3 == 2 && (bar_idx as usize) + 1 < 6 {
+                                let lo = (raw_bar & !0xF) as u64;
+                                let hi = dev.bars[bar_idx as usize + 1] as u64;
+                                lo | (hi << 32)
+                            } else {
+                                (raw_bar & !0xF) as u64
+                            };
+
+                            if bar64 != 0 {
+                                crate::pci::serial_debug("[GPU] Mapping BAR ");
+                                crate::pci::serial_debug_hex(bar_idx as u32);
+                                crate::pci::serial_debug(" at ");
+                                crate::pci::serial_debug_hex((bar64 >> 32) as u32);
+                                crate::pci::serial_debug_hex(bar64 as u32);
+                                crate::pci::serial_debug("\n");
+
+                                let virt = mm::paging::map_kernel_device(
+                                    bar64 as usize + offset as usize,
+                                    length as usize,
+                                    mm::paging::PageFlags::PRESENT | mm::paging::PageFlags::WRITABLE | mm::paging::PageFlags::MMIO,
+                                ).unwrap_or_else(|| mm::phys_to_virt(bar64 as usize + offset as usize));
+                                    
+                                match cfg_type {
+                                    VIRTIO_PCI_CAP_COMMON_CFG => {
+                                        crate::pci::serial_debug("[GPU] Found COMMON_CFG\n");
+                                        common_cfg = virt as *mut VirtioPciCommonCfg;
+                                    },
+                                    VIRTIO_PCI_CAP_NOTIFY_CFG => {
+                                        crate::pci::serial_debug("[GPU] Found NOTIFY_CFG\n");
+                                        notify_off_multiplier = pci_read_config_32(dev.bus, dev.dev, dev.func, cap_ptr + 16);
+                                        notify_cfg = virt as *mut u32;
+                                    },
+                                    VIRTIO_PCI_CAP_ISR_CFG => _isr_cfg = virt as *mut u8,
+                                    VIRTIO_PCI_CAP_DEVICE_CFG => {
+                                        crate::pci::serial_debug("[GPU] Found DEVICE_CFG\n");
+                                        device_cfg = virt as *mut u8;
+                                    },
+                                    _ => {}
+                                }
+                            }
                         }
                     }
                 }
@@ -308,6 +343,9 @@ impl VirtioGpuDevice {
             notify_off_multiplier,
             _device_cfg: device_cfg,
             _features: 0,
+            current_resource_id: 0,
+            scanout_w: 1280,
+            scanout_h: 800,
             queues: [None, None],
         };
 
@@ -390,42 +428,70 @@ impl VirtioGpuDevice {
     fn send_command_raw(&mut self, cmd_data: &[u8]) -> Result<(), ()> {
         let q = self.queues[0].as_mut().ok_or(())?;
         if q.num_free < 2 { return Err(()); }
-        
+
+        let hdr_type = u32::from_le_bytes(cmd_data[0..4].try_into().unwrap_or([0; 4]));
+        crate::pci::serial_debug("[GPU] Sending command ");
+        crate::pci::serial_debug_hex(hdr_type);
+        crate::pci::serial_debug("\n");
+
         let req_phys = mm::buddy::alloc(0).ok_or(())?;
         let req_virt = mm::phys_to_virt(req_phys) as *mut u8;
         unsafe { core::ptr::copy_nonoverlapping(cmd_data.as_ptr(), req_virt, cmd_data.len()); }
-        
+
         let resp_phys = mm::buddy::alloc(0).ok_or(())?;
         let resp_virt = mm::phys_to_virt(resp_phys) as *mut VirtioGpuCtrlHdr;
-        
+        unsafe { core::ptr::write_bytes(resp_virt as *mut u8, 0, 4096); }
+
         unsafe {
             let head = q.add_desc(req_phys as u64, cmd_data.len() as u32, VIRTQ_DESC_F_NEXT);
             let resp_idx = q.add_desc(resp_phys as u64, 4096, VIRTQ_DESC_F_WRITE);
             (*q.desc.add(head as usize)).next = resp_idx;
-            
+
             q.submit(head);
-            
+
             let notify_addr = (self.notify_cfg as usize + q.notify_off as usize * self.notify_off_multiplier as usize) as *mut u16;
+            crate::pci::serial_debug("[GPU] Notifying at ");
+            crate::pci::serial_debug_hex(notify_addr as u32);
+            crate::pci::serial_debug("\n");
+
             *notify_addr = 0;
-            
-            while q.last_used_idx == (*q.used).idx {
+
+            let mut timeout = 10_000_000;
+            while q.last_used_idx == (*q.used).idx && timeout > 0 {
                 core::hint::spin_loop();
+                timeout -= 1;
             }
+
+            if timeout == 0 {
+                crate::pci::serial_debug("[GPU] Command ");
+                crate::pci::serial_debug_hex(hdr_type);
+                crate::pci::serial_debug(" TIMEOUT!\n");
+                return Err(());
+            }
+
+            crate::pci::serial_debug("[GPU] Command ");
+            crate::pci::serial_debug_hex(hdr_type);
+            crate::pci::serial_debug(" COMPLETED\n");
+
             q.last_used_idx = q.last_used_idx.wrapping_add(1);
-            
+
             let resp_hdr = *resp_virt;
-            
+
             // Cleanup
             q.free_chain(head);
             mm::buddy::free(req_phys, 0);
             mm::buddy::free(resp_phys, 0);
-            
-            if resp_hdr.type_ >= 0x1100 && resp_hdr.type_ < 0x1200 { return Err(()); }
+
+            if resp_hdr.type_ != 0x1100 && resp_hdr.type_ != 0x1101 {
+                crate::pci::serial_debug("[GPU] Command failed with resp ");
+                crate::pci::serial_debug_hex(resp_hdr.type_);
+                crate::pci::serial_debug("\n");
+                return Err(());
+            }
         }
-        
+
         Ok(())
     }
-
     pub fn create_resource_2d(&mut self, resource_id: u32, width: u32, height: u32) -> bool {
         let cmd = VirtioGpuResourceCreate2d {
             hdr: VirtioGpuCtrlHdr {
@@ -470,17 +536,19 @@ impl VirtioGpuDevice {
             flags: 0, fence_id: 0, ctx_id: 0, padding: 0,
         };
         unsafe {
-            core::ptr::write(buf.as_mut_ptr() as *mut VirtioGpuCtrlHdr, hdr);
-            core::ptr::write(buf.as_mut_ptr().add(24) as *mut u32, resource_id);
-            core::ptr::write(buf.as_mut_ptr().add(28) as *mut u32, 1); // nr_entries
-            core::ptr::write(buf.as_mut_ptr().add(32) as *mut u64, phys_addr);
-            core::ptr::write(buf.as_mut_ptr().add(40) as *mut u32, size);
-            core::ptr::write(buf.as_mut_ptr().add(44) as *mut u32, 0); // padding
+            core::ptr::write_unaligned(buf.as_mut_ptr() as *mut VirtioGpuCtrlHdr, hdr);
+            core::ptr::write_unaligned(buf.as_mut_ptr().add(24) as *mut u32, resource_id);
+            core::ptr::write_unaligned(buf.as_mut_ptr().add(28) as *mut u32, 1); // nr_entries
+            core::ptr::write_unaligned(buf.as_mut_ptr().add(32) as *mut u64, phys_addr);
+            core::ptr::write_unaligned(buf.as_mut_ptr().add(40) as *mut u32, size);
+            core::ptr::write_unaligned(buf.as_mut_ptr().add(44) as *mut u32, 0); // padding
         }
         self.send_command_raw(&buf).is_ok()
     }
 
     pub fn set_scanout(&mut self, resource_id: u32, width: u32, height: u32) -> bool {
+        self.scanout_w = width;
+        self.scanout_h = height;
         let cmd = VirtioGpuSetScanout {
             hdr: VirtioGpuCtrlHdr {
                 type_: VirtioGpuCmd::SetScanout as u32,
@@ -495,6 +563,12 @@ impl VirtioGpuDevice {
     }
 
     pub fn flush(&mut self, resource_id: u32, x: u32, y: u32, width: u32, height: u32) -> bool {
+        // Switch scanout if needed
+        if self.current_resource_id != resource_id {
+            if !self.set_scanout(resource_id, width, height) { return false; }
+            self.current_resource_id = resource_id;
+        }
+
         let transfer = VirtioGpuTransferToHost2d {
             hdr: VirtioGpuCtrlHdr {
                 type_: VirtioGpuCmd::TransferToHost2d as u32,
@@ -550,8 +624,14 @@ impl VirtioGpuDevice {
         self.send_command_raw(transfer_data).is_ok()
     }
 
-    pub fn scale_blit(&mut self, resource_id: u32, _scanout_id: u32, src: (u32, u32, u32, u32), dst: (u32, u32, u32, u32)) -> bool {
-        // 1. Transfer the modified source region from guest to host
+    pub fn scale_blit(&mut self, resource_id: u32, _scanout_id: u32, src: (u32, u32, u32, u32), _dst: (u32, u32, u32, u32)) -> bool {
+        // Switch scanout if needed (use SOURCE dimensions for scaling)
+        if self.current_resource_id != resource_id {
+            if !self.set_scanout(resource_id, src.2, src.3) { return false; }
+            self.current_resource_id = resource_id;
+        }
+
+        // 1. Transfer to host (using source region)
         let transfer = VirtioGpuTransferToHost2d {
             hdr: VirtioGpuCtrlHdr {
                 type_: VirtioGpuCmd::TransferToHost2d as u32,
@@ -562,28 +642,20 @@ impl VirtioGpuDevice {
             resource_id,
             padding: 0,
         };
-        
-        let transfer_data = unsafe {
-            core::slice::from_raw_parts(&transfer as *const _ as *const u8, core::mem::size_of::<VirtioGpuTransferToHost2d>())
-        };
-        
+        let transfer_data = unsafe { core::slice::from_raw_parts(&transfer as *const _ as *const u8, core::mem::size_of::<VirtioGpuTransferToHost2d>()) };
         if self.send_command_raw(transfer_data).is_err() { return false; }
         
-        // 2. Flush the destination region to the screen. 
-        // QEMU handles the scaling from resource to scanout automatically.
+        // 2. Flush resource (using SOURCE region - host handles scaling to scanout)
         let flush = VirtioGpuResourceFlush {
             hdr: VirtioGpuCtrlHdr {
                 type_: VirtioGpuCmd::ResourceFlush as u32,
                 flags: 0, fence_id: 0, ctx_id: 0, padding: 0,
             },
-            r: VirtioGpuRect { x: dst.0, y: dst.1, width: dst.2, height: dst.3 },
+            r: VirtioGpuRect { x: src.0, y: src.1, width: src.2, height: src.3 },
             resource_id,
             padding: 0,
         };
-        
-        let flush_data = unsafe {
-            core::slice::from_raw_parts(&flush as *const _ as *const u8, core::mem::size_of::<VirtioGpuResourceFlush>())
-        };
+        let flush_data = unsafe { core::slice::from_raw_parts(&flush as *const _ as *const u8, core::mem::size_of::<VirtioGpuResourceFlush>()) };
         
         self.send_command_raw(flush_data).is_ok()
     }
@@ -630,8 +702,15 @@ impl VirtioGpuDevice {
             let notify_addr = (self.notify_cfg as usize + q.notify_off as usize * self.notify_off_multiplier as usize) as *mut u16;
             *notify_addr = 0;
             
-            while q.last_used_idx == (*q.used).idx {
+            let mut timeout = 100_000_000;
+            while q.last_used_idx == (*q.used).idx && timeout > 0 {
                 core::hint::spin_loop();
+                timeout -= 1;
+            }
+
+            if timeout == 0 {
+                crate::pci::serial_debug("[GPU] Command timeout!\n");
+                return Err(());
             }
             q.last_used_idx = q.last_used_idx.wrapping_add(1);
             

@@ -458,6 +458,14 @@ impl DrmDeviceInterface {
         let src_width = if flip_data[2] != 0 { flip_data[2] } else { 320 };
         let src_height = if flip_data[3] != 0 { flip_data[3] } else { 200 };
 
+        crate::pci::serial_debug("[DRM-IF] handle_flip_page fb_id=");
+        crate::pci::serial_debug_hex(fb_id.0);
+        crate::pci::serial_debug(" src=");
+        crate::pci::serial_debug_hex(src_width);
+        crate::pci::serial_debug("x");
+        crate::pci::serial_debug_hex(src_height);
+        crate::pci::serial_debug("\n");
+
         // Get first CRTC for page flip
         if let Some(crtc) = device.crtcs.first() {
             let crtc_id = crtc.id();
@@ -475,7 +483,14 @@ impl DrmDeviceInterface {
                 (info.width, info.height)
             };
 
+            crate::pci::serial_debug("[DRM-IF] flip display=");
+            crate::pci::serial_debug_hex(display_width);
+            crate::pci::serial_debug("x");
+            crate::pci::serial_debug_hex(display_height);
+            crate::pci::serial_debug("\n");
+
             if display_width == 0 || display_height == 0 {
+                crate::pci::serial_debug("[DRM-IF] flip aborted: zero display dims\n");
                 return Err(DriverError::NotFound);
             }
 
@@ -844,37 +859,32 @@ impl DrmDeviceInterface {
 
     /// Handle write operations (for framebuffer data)
     pub fn handle_write(&mut self, buffer: &[u8]) -> Result<usize, DriverError> {
-        // Find the primary framebuffer and its buffer
         let device = get_drm_device();
         let mut device_lock = device.lock();
-        
-        // Use the first CRTC's current framebuffer
-        if let Some(_crtc) = device_lock.crtcs.first() {
-            if let Some(fb_id) = device_lock.planes.first().and_then(|p| p.fb_id) {
-                if let Some(fb) = device_lock.get_framebuffer(fb_id) {
-                    let src_phys = fb.physical_addresses[0];
-                    if src_phys != 0 {
-                        let src_virt = mm::phys_to_virt(src_phys as usize) as *mut u8;
-                        let count = buffer.len().min(fb.size() as usize);
-                        
-                        // Copy data to the private DRM buffer
-                        unsafe {
-                            ptr::copy_nonoverlapping(buffer.as_ptr(), src_virt, count);
-                        }
-                        
-                        // Now trigger the flip logic to perform the scaling copy to screen
-                        // Create a dummy arg for flip_page
-                        let flip_data = [fb_id.raw(), 0, fb.width, fb.height];
-                        
-                        // Pass device_lock directly
-                        self.handle_flip_page(&mut device_lock, &flip_data as *const _ as usize)?;
-                        
-                        return Ok(count);
-                    }
+
+        // Prefer the plane's current fb, but fall back to the first available framebuffer.
+        // The plane's fb_id is None until the first atomic commit (flip), so we need the
+        // fallback so that write()-based rendering works before the first flip call.
+        let fb_id = device_lock.planes.first().and_then(|p| p.fb_id)
+            .or_else(|| device_lock.framebuffers.keys().next().copied());
+
+        if let Some(fb_id) = fb_id {
+            let (src_phys, fb_w, fb_h, fb_size) = {
+                let fb = device_lock.get_framebuffer(fb_id).ok_or(DriverError::NotFound)?;
+                (fb.physical_addresses[0], fb.width, fb.height, fb.size())
+            };
+            if src_phys != 0 {
+                let src_virt = mm::phys_to_virt(src_phys as usize) as *mut u8;
+                let count = buffer.len().min(fb_size as usize);
+                unsafe {
+                    ptr::copy_nonoverlapping(buffer.as_ptr(), src_virt, count);
                 }
+                let flip_data = [fb_id.raw(), 0, fb_w, fb_h];
+                self.handle_flip_page(&mut device_lock, &flip_data as *const _ as usize)?;
+                return Ok(count);
             }
         }
-        
+
         Err(DriverError::Unsupported)
     }
 

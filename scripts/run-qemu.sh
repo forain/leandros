@@ -48,6 +48,22 @@ else
 fi
 
 
+# ── F2FS data disks (created once, reused across runs) ──────────────────────
+for IDX in 0 1; do
+    FDISK="f2fs-data${IDX}.img"
+    if [ ! -f "$FDISK" ]; then
+        echo "Creating $FDISK (64 MB)..."
+        dd if=/dev/zero of="$FDISK" bs=1M count=64 2>/dev/null
+        if command -v mkfs.f2fs &>/dev/null; then
+            mkfs.f2fs -f -O "^extra_attr,^inline_data,^inline_dentry" "$FDISK"
+        elif command -v python3 &>/dev/null; then
+            python3 "$(dirname "$0")/mkfs-f2fs-minimal.py" "$FDISK"
+        else
+            echo "WARNING: neither mkfs.f2fs nor python3 found — $FDISK is blank"
+        fi
+    fi
+done
+
 echo "🚀 Starting LeandrOS ($ARCH) in $BOOT_MODE mode"
 echo "=========================================="
 
@@ -77,7 +93,11 @@ if [ "$BOOT_MODE" = "uefi" ]; then
             -drive if=pflash,unit=1,format=raw,file="$VARS_FILE" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
             -device virtio-blk-pci,drive=drive0,bootindex=0 \
-            -device "$GPU_DEV" \
+            -drive if=none,id=data0,format=raw,file=f2fs-data0.img \
+            -device virtio-blk-pci,drive=data0 \
+            -drive if=none,id=data1,format=raw,file=f2fs-data1.img \
+            -device virtio-blk-pci,drive=data1 \
+            -vga none -device "$GPU_DEV" \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
     else
@@ -85,7 +105,11 @@ if [ "$BOOT_MODE" = "uefi" ]; then
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
             -device virtio-blk-pci,drive=drive0,bootindex=0 \
-            -device "$GPU_DEV" \
+            -drive if=none,id=data0,format=raw,file=f2fs-data0.img \
+            -device virtio-blk-pci,drive=data0 \
+            -drive if=none,id=data1,format=raw,file=f2fs-data1.img \
+            -device virtio-blk-pci,drive=data1 \
+            -vga none -device "$GPU_DEV" \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
     fi

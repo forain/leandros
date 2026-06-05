@@ -298,9 +298,21 @@ impl DrmDevice {
             if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
                 if let Some(fb_id) = plane_state.fb_id {
                     if let Some(fb) = self.framebuffers.get(&fb_id) {
+                        let res_id = fb.handles[0];
+                        crate::pci::serial_debug("[DRM] scale_blit res=");
+                        crate::pci::serial_debug_hex(res_id);
+                        crate::pci::serial_debug(" src=");
+                        crate::pci::serial_debug_hex(plane_state.src_w >> 16);
+                        crate::pci::serial_debug("x");
+                        crate::pci::serial_debug_hex(plane_state.src_h >> 16);
+                        crate::pci::serial_debug(" dst=");
+                        crate::pci::serial_debug_hex(plane_state.crtc_w);
+                        crate::pci::serial_debug("x");
+                        crate::pci::serial_debug_hex(plane_state.crtc_h);
+                        crate::pci::serial_debug("\n");
                         // Use hardware acceleration for scaling blit
                         if gpu.scale_blit(
-                            fb.handles[0], // Resource ID
+                            res_id,    // Resource ID
                             0,         // Destination (scanout 0)
                             (plane_state.src_x >> 16, plane_state.src_y >> 16, plane_state.src_w >> 16, plane_state.src_h >> 16),
                             (plane_state.crtc_x as u32, plane_state.crtc_y as u32, plane_state.crtc_w, plane_state.crtc_h)
@@ -314,6 +326,12 @@ impl DrmDevice {
             // Perform software scaling copy as fallback
             if !hardware_scaled && self.fb_integration {
                 self.perform_software_scaling(&plane_state)?;
+                // If we're using software scaling, we're updating the hardware framebuffer (Resource 1)
+                if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+                    let (_, hw_width, hw_height, _) = crate::framebuffer::get_hardware_fb_info()
+                        .ok_or(DriverError::NotFound)?;
+                    gpu.flush(1, 0, 0, hw_width, hw_height);
+                }
             }
 
             if let Some(plane) = self.get_plane_mut(plane_state.plane_id) {
@@ -414,7 +432,7 @@ pub struct DrmPlaneResources {
 }
 
 /// Global DRM device instance
-static DRM_DEVICE: Mutex<DrmDevice> = Mutex::new(DrmDevice {
+pub static DRM_DEVICE: Mutex<DrmDevice> = Mutex::new(DrmDevice {
     caps: DrmDeviceCaps {
         dumb_buffer: true,
         vblank_high_crtc: true,
@@ -438,18 +456,33 @@ static DRM_DEVICE: Mutex<DrmDevice> = Mutex::new(DrmDevice {
 
 /// Initialize DRM device
 pub fn init_drm() -> Result<(), DriverError> {
+    crate::pci::serial_debug("[DRM] init_drm starting\n");
     {
+        crate::pci::serial_debug("[DRM] Locking DRM_DEVICE for new()...\n");
         let mut device = DRM_DEVICE.lock();
+        crate::pci::serial_debug("[DRM] DRM_DEVICE locked, calling DrmDevice::new()\n");
         *device = DrmDevice::new();
+        crate::pci::serial_debug("[DRM] DrmDevice::new() returned, dropping lock\n");
     }
+    crate::pci::serial_debug("[DRM] Device object created and lock dropped\n");
 
     // Try to integrate with existing drivers (WITHOUT holding the lock)
     // to avoid deadlocks with ModeSet::set_display_mode
-    if crate::kms::init_kms().is_ok() {
+    crate::pci::serial_debug("[DRM] Integrating with KMS...\n");
+    let kms_res = crate::kms::init_kms();
+    if kms_res.is_ok() {
+        crate::pci::serial_debug("[DRM] KMS integration successful, locking DRM_DEVICE to set flag\n");
         DRM_DEVICE.lock().kms_integration = true;
+        crate::pci::serial_debug("[DRM] KMS flag set and lock dropped\n");
+    } else {
+        crate::pci::serial_debug("[DRM] KMS integration failed\n");
     }
     
+    crate::pci::serial_debug("[DRM] Integrating with FB, locking DRM_DEVICE to set flag\n");
     DRM_DEVICE.lock().fb_integration = true;
+    crate::pci::serial_debug("[DRM] FB flag set and lock dropped\n");
+    
+    crate::pci::serial_debug("[DRM] init_drm finished\n");
 
     Ok(())
 }

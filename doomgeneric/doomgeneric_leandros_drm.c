@@ -333,8 +333,7 @@ void DG_DrawFrame() {
         int result = write(drm_fd, DG_ScreenBuffer, bytes_to_write);
 
         if (result >= 0) {
-            // Trigger hardware scaling via page flip
-            drm_flip_page();
+            // handle_write() already committed the flip internally; no second flip needed.
         } else {
             // DRM write failed - fall back to /dev/fb0 with software scaling
             static int fb0_fd = -1;

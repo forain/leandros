@@ -6,10 +6,26 @@
 #![no_std]
 
 use ipc::{Message, port};
-use spin::Mutex;
 use drivers::drm_device_interface::DrmDeviceInterface;
 use drivers::Driver;
 use vfs_server;
+
+extern "C" { fn arch_serial_putc(c: u8); }
+
+fn serial_debug(msg: &str) {
+    for &b in msg.as_bytes() {
+        unsafe { arch_serial_putc(b); }
+    }
+}
+
+fn serial_debug_hex(v: u32) {
+    serial_debug("0x");
+    for i in (0..8).rev() {
+        let n = (v >> (i * 4)) & 0xF;
+        let c = if n < 10 { b'0' + n as u8 } else { b'A' + n as u8 - 10 };
+        unsafe { arch_serial_putc(c); }
+    }
+}
 
 // ── Protocol helper ──────────────────────────────────────────────────────────
 
@@ -24,101 +40,69 @@ fn make_reply(v: i64) -> Message {
     m
 }
 
-fn ok_reply() -> Message { val_reply(0) }
+fn ok_reply()        -> Message { make_reply(0) }
 fn err_reply(e: i32) -> Message { make_reply(e as i64) }
 fn val_reply(v: u64) -> Message { make_reply(v as i64) }
 
-// ── DRM Device State ────────────────────────────────────────────────────────
-
-/// DRM device state
-struct DrmDevice {
-    interface: Option<DrmDeviceInterface>,
-    initialized: bool,
-}
-
-impl DrmDevice {
-    const fn new() -> Self {
-        Self {
-            interface: None,
-            initialized: false,
-        }
-    }
-}
-
-/// Global DRM device (single device for now)
-static DRM_DEVICE: Mutex<DrmDevice> = Mutex::new(DrmDevice::new());
+/// Global DRM interface instance (initialized on first use)
+static mut INTERFACE: Option<DrmDeviceInterface> = None;
 
 /// Handle DRM device requests
-fn handle(msg: &Message, _port: u32) -> Message {
-    #[allow(unreachable_code)]
-    {
-    let mut device = DRM_DEVICE.lock();
-
-    // Initialize device on first access
-    if !device.initialized {
-        let mut interface = DrmDeviceInterface::new();
-        match interface.probe() {
-            Ok(()) => {
-                device.interface = Some(interface);
-                device.initialized = true;
-            },
-            Err(_) => return err_reply(-19), // ENODEV
+fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
+    let interface = unsafe {
+        if INTERFACE.is_none() {
+            let mut i = DrmDeviceInterface::new();
+            if i.probe().is_ok() {
+                INTERFACE = Some(i);
+            } else {
+                return err_reply(-19); // ENODEV
+            }
         }
-    }
+        INTERFACE.as_mut().unwrap()
+    };
 
     // Handle VFS ioctl messages
-    if let Some(ref mut interface) = device.interface {
-        // Check message type
-        if msg.tag == 0x28 { // VFS_IOCTL
-            // Decode ioctl parameters from VFS message format
-            let _dev_id = arg(msg, 0) as u32;
-            let cmd = arg(msg, 1) as u32;
-            let arg_val = arg(msg, 2) as usize;
+    if msg.tag == 0x28 { // VFS_IOCTL
+        let cmd = arg(msg, 1) as u32;
+        let arg_val = arg(msg, 2) as usize;
 
-            // Handle the ioctl request properly
-            match interface.handle_ioctl(cmd, arg_val) {
-                Ok(result) => val_reply(result as u64),
-                Err(_) => err_reply(-1),
-            }
-        } else if msg.tag == 0x12 { // VFS_WRITE
-            // Handle raw write to framebuffer via DRM server
-            let count = arg(msg, 2) as usize;
-            let buf_ptr = arg(msg, 1) as usize;
-            
-            // Validate pointer (simple check for now)
-            if buf_ptr == 0 { return err_reply(-14); } // EFAULT
+        serial_debug("[DRM-SRV] handle VFS_IOCTL cmd=");
+        serial_debug_hex(cmd);
+        serial_debug("\n");
 
-            let buf = unsafe {
-                core::slice::from_raw_parts(buf_ptr as *const u8, count)
-            };
+        // Since we are called via a direct handler, we are in the caller's address space.
+        // No need to switch address space.
+        let res = match interface.handle_ioctl(cmd, arg_val) {
+            Ok(result) => val_reply(result as u64),
+            Err(_) => err_reply(-1),
+        };
 
-            match interface.handle_write(buf) {
-                Ok(n) => val_reply(n as u64),
-                Err(_) => err_reply(-5), // EIO
-            }
-        } else if msg.tag == vfs_server::VFS_CLOSE || msg.tag == vfs_server::VFS_CLOSE_ALL {
-            interface.release();
-            ok_reply()
-        } else {
-            // Handle other message types
-            interface.handle(msg.clone())
-        }
-    } else {
-        err_reply(-19) // ENODEV
+        serial_debug("[DRM-SRV] handle_ioctl finished, returning\n");
+        return res;
     }
-    } // Close unreachable block
+ else if msg.tag == 0x12 { // VFS_WRITE
+        let count = arg(msg, 2) as usize;
+        let buf_ptr = arg(msg, 1) as usize;
+        
+        if buf_ptr == 0 { return err_reply(-14); } // EFAULT
+        let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+
+        match interface.handle_write(buf) {
+            Ok(n) => val_reply(n as u64),
+            Err(_) => err_reply(-5), // EIO
+        }
+    } else if msg.tag == vfs_server::VFS_CLOSE || msg.tag == vfs_server::VFS_CLOSE_ALL {
+        interface.release();
+        ok_reply()
+    } else {
+        interface.handle(msg.clone())
+    }
 }
 
 /// Initialize DRM service
 pub fn init(owner_pid: u32) -> Option<u32> {
-    // Create port for DRM server
     let port_id = port::create(owner_pid)?;
-
-    // Register the DRM device with VFS
     vfs_server::register_device("/dev/dri/card0", port_id, 0);
-
-    // Register message handler
     port::register_handler(port_id, handle);
-
     Some(port_id)
 }

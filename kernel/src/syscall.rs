@@ -10,7 +10,7 @@
 
 use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 use alloc::vec::Vec;
-use crate::{serial_print_str, serial_write_raw, print_hex, BOOT_INFO_PTR, init};
+use crate::{serial_print_str, serial_write_raw, BOOT_INFO_PTR, init};
 use ipc::{Message, port};
 use sched::{
     fork_current, clone_thread, 
@@ -577,7 +577,7 @@ fn dispatch_inner(
             let res = sys_execve(a0, a1, a2);
             if res < 0 {
                 crate::serial_print_str("  [SYSCALL] sys_execve failed with error: ");
-                crate::print_hex(res as usize);
+                crate::serial_print_hex(res as usize);
                 crate::serial_print_str("\n");
             }
             res
@@ -988,20 +988,51 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     let pid = current_pid();
 
     // Step 1: Check if the fd is a device supporting direct mmap via ioctl 0x1007
-    let mut phys_addr: u64 = off as u64;
-    let ioctl_msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, 0x1007 /* DRM_IOCTL_MMAP */, &mut phys_addr as *mut _ as u64]);
-    let ioctl_reply = vfs::handle(&ioctl_msg, pid);
+    let kind = vfs::vfs_get_node_kind(pid, fd);
+    let mut phys_addr: usize = 0;
+    
+    if let Some(vfs::VnodeKind::DynamicDevice { port, dev_id }) = kind {
+        crate::serial_print_str("[MMAP] DynamicDevice fd, off=");
+        crate::serial_print_hex(off);
+        crate::serial_print_str("\n");
+        // This is a dynamic device, call its ioctl to get the physical address
+        let mut proxy_msg = Message::empty();
+        proxy_msg.tag = vfs::VFS_IOCTL as u64;
+        proxy_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
+        proxy_msg.data[8..16].copy_from_slice(&(0x1007u64).to_le_bytes()); // DRM_IOCTL_MMAP
+        proxy_msg.data[16..24].copy_from_slice(&(off as u64).to_le_bytes()); // Pass requested physical address
+        proxy_msg.data[24..32].copy_from_slice(&(pid as u64).to_le_bytes()); // PID
 
-    if ioctl_reply.tag == 0 && phys_addr != 0 {
+        let reply = vfs::call_port(port, proxy_msg);
+        if reply.tag == 0 {
+            let res = u64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8])) as usize;
+            crate::serial_print_str("[MMAP] device ioctl returned phys=");
+            crate::serial_print_hex(res);
+            crate::serial_print_str("\n");
+            if res != 0 {
+                phys_addr = res;
+            }
+        } else {
+            crate::serial_print_str("[MMAP] device ioctl reply tag non-zero\n");
+        }
+    }
+
+    if phys_addr != 0 {
         // This is a device mapping — map the physical address directly.
         let mapped = with_current_address_space_mut(|as_| {
             if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
-            as_.map_device(virt, phys_addr as usize, len, page_flags)
+            as_.map_device(virt, phys_addr, len, page_flags)
         });
-        return match mapped {
+        let ret = match mapped {
             Some(true)  => virt as isize,
             _           => -12, // ENOMEM
         };
+        crate::serial_print_str("[MMAP] map_device virt=");
+        crate::serial_print_hex(virt);
+        crate::serial_print_str(" result=");
+        crate::serial_print_hex(ret as usize);
+        crate::serial_print_str("\n");
+        return ret;
     }
 
     // Normal file-backed mmap follows...
@@ -1995,12 +2026,6 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let cloexec_msg = make_vfs_msg(vfs::VFS_EXEC_CLOEXEC, &[pid as u64]);
     let _ = vfs::handle(&cloexec_msg, pid);
 
-    serial_print_str("[EXEC] Jumping to entry=0x");
-    print_hex(entry);
-    serial_print_str(" sp=0x");
-    print_hex(user_sp);
-    serial_print_str("\n");
-
     replace_address_space(*new_as, pt_root, heap_start, entry, user_sp);
 }
 
@@ -2912,17 +2937,10 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
        cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||
        cmd == DRM_IOCTL_SET_PLANE || cmd == DRM_IOCTL_GET_CAPS ||
        is_evdev || is_drm {
-        if (cmd == FBIOGET_VSCREENINFO || is_evdev || is_drm) && arg != 0 {
-            // Validate and prefault buffer if it looks like a pointer
-            let size = (cmd >> 16) & 0x3FFF;
-            if size > 0 && size < 4096 {
-                if !validate_user_buf(arg, size) { return -14; }
-                with_current_address_space_mut(|as_| as_.prefault_range(arg, size));
-            }
-        }
+        
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
-        let r = vfs_reply_val(&vfs::handle(&msg, pid));
-        if r != ENOTTY { return r; }
+        let reply = vfs::handle(&msg, pid);
+        return u64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8])) as isize;
     }
     let msg = make_vfs_msg(tty_server::TTY_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
     net_reply_val(&tty_server::handle(&msg, pid))
