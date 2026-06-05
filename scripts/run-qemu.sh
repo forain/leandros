@@ -38,13 +38,29 @@ else
     DISK_IMAGE="leandros-limine-x86_64.img"
 fi
 
-# Detect if QEMU supports OpenGL acceleration (virtio-gpu-gl-pci)
-if $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-gpu-gl-pci; then
-    GPU_DEV="virtio-gpu-gl-pci"
-    GL_ARGS=("-display" "default,gl=on")
+# Select GPU device.
+# x86_64: prefer virtio-vga — it is VGA-compatible so UEFI/OVMF exposes a GOP
+#         framebuffer that Limine can use.  virtio-gpu-pci has no VGA interface
+#         and leaves UEFI with no display device to hand to Limine.
+# aarch64: virtio-gpu-pci is correct; VGA is an x86 concept.
+GL_ARGS=()
+if [ "$ARCH" = "aarch64" ]; then
+    if $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-gpu-gl-pci; then
+        GPU_DEV="virtio-gpu-gl-pci"
+        GL_ARGS=("-display" "default,gl=on")
+    else
+        GPU_DEV="virtio-gpu-pci"
+    fi
 else
-    GPU_DEV="virtio-gpu-pci"
-    GL_ARGS=()
+    # x86_64: virtio-vga provides VGA registers so OVMF can set up a GOP framebuffer.
+    if $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-vga; then
+        GPU_DEV="virtio-vga"
+    elif $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-gpu-gl-pci; then
+        GPU_DEV="virtio-gpu-gl-pci"
+        GL_ARGS=("-display" "default,gl=on")
+    else
+        GPU_DEV="virtio-gpu-pci"
+    fi
 fi
 
 
@@ -97,7 +113,7 @@ if [ "$BOOT_MODE" = "uefi" ]; then
             -device virtio-blk-pci,drive=data0 \
             -drive if=none,id=data1,format=raw,file=f2fs-data1.img \
             -device virtio-blk-pci,drive=data1 \
-            -vga none -device "$GPU_DEV" \
+            -device "$GPU_DEV" \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
     else
@@ -112,6 +128,7 @@ if [ "$BOOT_MODE" = "uefi" ]; then
             -vga none -device "$GPU_DEV" \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
+
     fi
     exec $QEMU_SYSTEM "${QEMU_ARGS[@]}" "${QEMU_EXTRA_ARGS[@]}"
 else
