@@ -117,7 +117,7 @@ pub fn init() -> Result<u32, i32> {
     Ok(server_port)
 }
 
-fn handle_msg(msg: &Message, _caller_pid: u32) -> Message {
+fn handle_msg(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
     handle(msg)
 }
 

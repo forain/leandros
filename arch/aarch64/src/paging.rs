@@ -40,12 +40,22 @@ bitflags! {
 
 // ── Low-level Page Table Walker ──────────────────────────────────────────────
 
+/// Map a range of 4 KiB pages into the specified PGD.
+pub unsafe fn map_range(pgd_phys: *mut u64, virt: usize, phys: usize, size: usize, flags: PageDescFlags) -> bool {
+    let num_pages = (size + 4095) / 4096;
+    for i in 0..num_pages {
+        let offset = i * 4096;
+        if !map_4k(pgd_phys, virt + offset, phys + offset, flags) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Map a single 4 KiB page into the specified PGD.
 ///
 /// # Safety
-/// `pgd` must point to a valid, 4-KiB-aligned Level-0 (PGD) page table that
-/// lies within a region addressable without MMU (identity-mapped or physical
-/// address space).
+/// `pgd_phys` must point to a valid Level-0 page table.
 pub unsafe fn map_4k(pgd_phys: *mut u64, virt: usize, phys: usize, flags: PageDescFlags) -> bool {
     let pgd = mm::phys_to_virt(pgd_phys as usize) as *mut u64;
     let l0 = (virt >> 39) & 0x1FF;
@@ -142,7 +152,8 @@ fn translate_flags(bits: u64) -> PageDescFlags {
     if src.contains(PageFlags::USER)     { f |= PageDescFlags::USER; }
     if !src.contains(PageFlags::WRITABLE){ f |= PageDescFlags::RDONLY; }
     if !src.contains(PageFlags::EXECUTE) { f |= PageDescFlags::NO_EXEC; }
-    if src.contains(PageFlags::NOCACHE)  { f |= PageDescFlags::ATTR_NOCACHE; } // MAIR index 3
+    if src.contains(PageFlags::MMIO)     { f |= PageDescFlags::ATTR_DEV; }     // MAIR index 1
+    else if src.contains(PageFlags::NOCACHE) { f |= PageDescFlags::ATTR_NOCACHE; } // MAIR index 3
 
     f
 }
@@ -171,9 +182,10 @@ pub unsafe extern "C" fn arch_unmap_page(page_table_root: usize, virt: usize) {
 /// user task, and with 0 on return to the scheduler idle loop.
 #[no_mangle]
 pub unsafe extern "C" fn arch_get_current_root() -> usize {
-    let ttbr1: u64;
-    core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1);
-    ttbr1 as usize
+    let ttbr0: u64;
+    core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
+    // Mask out ASID and flags. 
+    (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize
 }
 
 #[no_mangle]

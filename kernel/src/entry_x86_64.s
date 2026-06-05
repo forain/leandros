@@ -198,13 +198,13 @@ _start_pvh:
     mov al, 0x36
     out dx, al
     
-    // Enable SSE/AVX
+    // Enable SSE/AVX and FSGSBASE (CR4 bit 16)
     mov rax, cr0
     and rax, 0xFFFB
     or rax, 0x2
     mov cr0, rax
     mov rax, cr4
-    or rax, (3 << 9)
+    or rax, (3 << 9) | (1 << 16)
     mov cr4, rax
 
     // Diagnostic: '!'

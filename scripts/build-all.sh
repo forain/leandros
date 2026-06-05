@@ -240,6 +240,7 @@ build_mame() {
         return 0
     fi
     (
+        ulimit -n 65536 2>/dev/null || true
         cd "$mame_dir" || exit 1
         make -f Makefile.leandros ARCH="$arch" \
             LEANDROS_ROOT="$ROOT_DIR" \

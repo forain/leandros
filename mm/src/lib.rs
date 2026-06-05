@@ -33,6 +33,11 @@ pub fn virt_to_phys(virt: usize) -> usize {
     virt - HHDM_OFFSET.load(Ordering::Relaxed)
 }
 
+#[no_mangle]
+pub extern "C" fn mm_get_hhdm_offset() -> u64 {
+    HHDM_OFFSET.load(Ordering::Relaxed) as u64
+}
+
 /// Initialise all memory subsystems with a physical memory map.
 /// Called once from `kernel_main` after boot info is parsed.
 pub fn init_with_map(regions: &[boot::MemoryRegion], hhdm_offset: usize) {

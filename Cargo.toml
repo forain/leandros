@@ -15,6 +15,7 @@ members = [
     "servers/init",
     "servers/drm",
     "servers/pipewire",
+    "servers/f2fs",
     "drivers",
     "drivers/usb",
     "drivers/wifi",

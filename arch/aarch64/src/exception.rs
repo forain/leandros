@@ -9,13 +9,13 @@
 core::arch::global_asm!(include_str!("exception_asm.s"));
 
 extern "C" {
-    fn serial_print_str_raw(ptr: *const u8, len: usize);
+    fn serial_print(ptr: *const u8, len: usize);
     fn print_hex(n: usize);
     fn print_number(n: u32);
 }
 
 fn serial_print_str(s: &str) {
-    unsafe { serial_print_str_raw(s.as_ptr(), s.len()); }
+    unsafe { serial_print(s.as_ptr(), s.len()); }
 }
 
 #[allow(dead_code)]
@@ -88,10 +88,19 @@ unsafe extern "C" fn exc_el0_irq_handler(frame: *mut UserFrame) {
 
 #[no_mangle]
 unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
+    let far: u64;
+    let tcr: u64;
+    core::arch::asm!("mrs {}, far_el1", out(reg) far);
+    core::arch::asm!("mrs {}, tcr_el1", out(reg) tcr);
+    
     serial_print_str("\n[EXC] EL1 Sync Fault! ESR=");
     print_hex(esr as usize);
     serial_print_str(" ELR=");
     print_hex(elr as usize);
+    serial_print_str(" FAR=");
+    print_hex(far as usize);
+    serial_print_str(" TCR=");
+    print_hex(tcr as usize);
     serial_print_str("\n");
     loop { core::hint::spin_loop(); }
 }
@@ -102,10 +111,15 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
     if ec == 0x15 {
         serial_print_str("[EXC] Unexpected syscall in Rust handler\n");
     } else {
+        let far: u64;
+        core::arch::asm!("mrs {}, far_el1", out(reg) far);
+
         serial_print_str("\n[EXC] EL0 Fault! PID=");
         print_number(sched::current_pid());
         serial_print_str(" ESR=");
         print_hex(esr as usize);
+        serial_print_str(" FAR=");
+        print_hex(far as usize);
         serial_print_str(" EC=");
         print_hex(ec as usize);
         serial_print_str(" DFSC=");

@@ -33,6 +33,7 @@ pub unsafe fn parse_with_requests(
         framebuffer_pitch:   0,
         rsdp_addr:           0,
         uart_base:           0,
+        pci_ecam_base:       0,
         initrd_base:         0,
         initrd_size:         0,
         hhdm_offset:         0,
@@ -92,10 +93,13 @@ pub unsafe fn parse_with_requests(
 
     if let Some(resp) = dtb.response() {
         if !resp.dtb_ptr.is_null() {
-            info.uart_base = 0x09000000; // Default for QEMU virt
+            // Use the DTB parser to find addresses
+            let dtb_info = super::device_tree::parse(resp.dtb_ptr as usize);
+            info.uart_base = dtb_info.uart_base;
+            info.pci_ecam_base = dtb_info.pci_ecam_base;
         }
     }
-
+    
     info
 }
 
@@ -110,6 +114,7 @@ pub unsafe fn parse() -> BootInfo {
         framebuffer_pitch:   0,
         rsdp_addr:           0,
         uart_base:           0,
+        pci_ecam_base:       0,
         initrd_base:         0,
         initrd_size:         0,
         hhdm_offset:         0,

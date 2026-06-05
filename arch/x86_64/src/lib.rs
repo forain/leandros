@@ -106,7 +106,7 @@ unsafe fn enable_sse() {
 
     let mut cr4: u64;
     asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
-    cr4 |= (1u64 << 9) | (1u64 << 10); // set OSFXSR (bit 9) and OSXMMEXCPT (bit 10)
+    cr4 |= (1u64 << 9) | (1u64 << 10) | (1u64 << 16); // OSFXSR, OSXMMEXCPT, FSGSBASE
     asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
 }
 

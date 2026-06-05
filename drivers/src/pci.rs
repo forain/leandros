@@ -1,6 +1,7 @@
 //! PCI bus discovery and device enumeration.
 
 use alloc::vec::Vec;
+use spin::Mutex;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PciDevice {
@@ -31,33 +32,36 @@ unsafe fn pci_read_config(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     val
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+static mut PCI_ECAM_BASE: usize = 0;
+
+pub fn init_pci(ecam_base: usize) {
+    unsafe { PCI_ECAM_BASE = ecam_base; }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn pci_read_config(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
+    let ecam_base = PCI_ECAM_BASE;
+    if ecam_base == 0 { return 0xFFFF_FFFF; }
+    
+    let addr = ecam_base + 
+               ((bus as usize) << 20) + 
+               ((dev as usize) << 15) + 
+               ((func as usize) << 12) + 
+               (offset as usize & 0xFC);
+               
+    core::ptr::read_volatile(addr as *const u32)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 unsafe fn pci_read_config(_bus: u8, _dev: u8, _func: u8, _offset: u8) -> u32 {
     0xFFFF_FFFF
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn serial_debug(msg: &str) {
+    extern "C" { fn arch_serial_putc(c: u8); }
     for &b in msg.as_bytes() {
-        unsafe {
-            core::arch::asm!("out dx, al", in("dx") 0x3F8_u16, in("al") b);
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-pub fn serial_debug(msg: &str) {
-    // Standard QEMU virt UART0 address
-    let uart_base = 0x09000000usize;
-    let dr = uart_base as *mut u32;
-    let fr = (uart_base + 0x18) as *const u32;
-
-    for &b in msg.as_bytes() {
-        unsafe {
-            // Wait until TX FIFO not full (FR register bit 5 = TXFF)
-            while (core::ptr::read_volatile(fr) & (1 << 5)) != 0 {}
-            core::ptr::write_volatile(dr, b as u32);
-        }
+        unsafe { arch_serial_putc(b); }
     }
 }
 
@@ -86,24 +90,24 @@ pub fn serial_debug_hex_64(v: u64) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn pci_read_config_8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
     let val = pci_read_config(bus, dev, func, offset);
     ((val >> ((offset & 3) * 8)) & 0xFF) as u8
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn pci_read_config_16(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
     let val = pci_read_config(bus, dev, func, offset);
     ((val >> ((offset & 3) * 8)) & 0xFFFF) as u16
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn pci_read_config_32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     pci_read_config(bus, dev, func, offset)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn pci_read_config_32_any(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     let b0 = pci_read_config_8(bus, dev, func, offset) as u32;
     let b1 = pci_read_config_8(bus, dev, func, offset + 1) as u32;
@@ -112,13 +116,13 @@ pub unsafe fn pci_read_config_32_any(bus: u8, dev: u8, func: u8, offset: u8) -> 
     b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub unsafe fn pci_read_config_8(_bus: u8, _dev: u8, _func: u8, _offset: u8) -> u8 { 0 }
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub unsafe fn pci_read_config_16(_bus: u8, _dev: u8, _func: u8, _offset: u8) -> u16 { 0 }
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub unsafe fn pci_read_config_32(_bus: u8, _dev: u8, _func: u8, _offset: u8) -> u32 { 0 }
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub unsafe fn pci_read_config_32_any(_bus: u8, _dev: u8, _func: u8, _offset: u8) -> u32 { 0 }
 
 #[cfg(target_arch = "x86_64")]
@@ -144,7 +148,26 @@ pub unsafe fn pci_write_config_16(bus: u8, dev: u8, func: u8, offset: u8, val: u
     );
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pci_write_config_16(bus: u8, dev: u8, func: u8, offset: u8, val: u16) {
+    let ecam_base = PCI_ECAM_BASE;
+    if ecam_base == 0 { return; }
+    
+    let addr = ecam_base + 
+               ((bus as usize) << 20) + 
+               ((dev as usize) << 15) + 
+               ((func as usize) << 12) + 
+               (offset as usize & 0xFC);
+               
+    let mut current = core::ptr::read_volatile(addr as *const u32);
+    let shift = (offset & 3) * 8;
+    current &= !(0xFFFF << shift);
+    current |= (val as u32) << shift;
+    
+    core::ptr::write_volatile(addr as *mut u32, current);
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub unsafe fn pci_write_config_16(_bus: u8, _dev: u8, _func: u8, _offset: u8, _val: u16) {}
 
 impl PciDevice {
@@ -161,11 +184,22 @@ impl PciDevice {
     }
 }
 
+static PCI_DEVICES: Mutex<Option<Vec<PciDevice>>> = Mutex::new(None);
+
 pub fn scan() -> Vec<PciDevice> {
+    {
+        let lock = PCI_DEVICES.lock();
+        if let Some(ref devices) = *lock {
+            return devices.clone();
+        }
+    }
+
     let mut devices = Vec::new();
     serial_debug("[PCI] Scanning bus...\n");
 
-    for bus in 0..=255 {
+    let max_bus = if cfg!(target_arch = "aarch64") { 0 } else { 255 };
+
+    for bus in 0..=max_bus {
         for dev in 0..32 {
             let val = unsafe { pci_read_config(bus as u8, dev as u8, 0, 0) };
             if val == 0xFFFF_FFFF { continue; }
@@ -197,9 +231,14 @@ pub fn scan() -> Vec<PciDevice> {
             });
         }
     }
+    *PCI_DEVICES.lock() = Some(devices.clone());
     devices
 }
 
 pub fn find_device(vendor_id: u16, device_id: u16) -> Option<PciDevice> {
     scan().into_iter().find(|d| d.vendor_id == vendor_id && d.device_id == device_id)
+}
+
+pub fn find_all_devices(vendor_id: u16, device_id: u16) -> Vec<PciDevice> {
+    scan().into_iter().filter(|d| d.vendor_id == vendor_id && d.device_id == device_id).collect()
 }

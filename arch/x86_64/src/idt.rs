@@ -163,7 +163,11 @@ macro_rules! fault_no_err_handler {
             let from_user = (frame.cs & 3) != 0;
             if from_user {
                 unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
-                serial_str(b"user fault (no errcode): task killed\r\n");
+                serial_str(b"user fault vec="); serial_hex64($vector);
+                serial_str(b" RIP=0x"); serial_hex64(frame.ip);
+                serial_str(b" CS=0x"); serial_hex64(frame.cs);
+                serial_str(b" RSP=0x"); serial_hex64(frame.sp);
+                serial_str(b": task killed\r\n");
                 sched::exit(1);
             } else {
                 print_exception(&frame, $vector, 0);
@@ -181,8 +185,12 @@ macro_rules! fault_with_err_handler {
             let from_user = (frame.cs & 3) != 0;
             if from_user {
                 unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
-                serial_str(b"user fault (errcode): task killed\r\n");
-                let _ = error_code;
+                serial_str(b"user fault vec="); serial_hex64($vector);
+                serial_str(b" RIP=0x"); serial_hex64(frame.ip);
+                serial_str(b" CS=0x"); serial_hex64(frame.cs);
+                serial_str(b" RSP=0x"); serial_hex64(frame.sp);
+                serial_str(b" err=0x"); serial_hex64(error_code);
+                serial_str(b": task killed\r\n");
                 sched::exit(1);
             } else {
                 print_exception(&frame, $vector, error_code);

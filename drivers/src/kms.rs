@@ -103,22 +103,35 @@ impl KmsDriver {
             crate::pci::serial_debug("[KMS] VirtIO GPU available, configuring boot resource\n");
             
             // Register bootloader FB as resource 1 (for kernel console)
+            crate::pci::serial_debug("[KMS] Checking boot FB info...\n");
             if let Some((base, width, height, _pitch)) = get_hardware_fb_info() {
-                crate::pci::serial_debug("[KMS] Boot FB: ");
+                crate::pci::serial_debug("[KMS] Boot FB found: ");
                 crate::pci::serial_debug_hex(base as u32);
-                crate::pci::serial_debug("\n");
+                crate::pci::serial_debug(" (");
+                crate::pci::serial_debug_hex(width);
+                crate::pci::serial_debug("x");
+                crate::pci::serial_debug_hex(height);
+                crate::pci::serial_debug(")\n");
                 
+                crate::pci::serial_debug("[KMS] Creating resource 1\n");
                 gpu.create_resource_2d(1, width, height);
+                crate::pci::serial_debug("[KMS] Attaching backing to resource 1\n");
                 gpu.attach_backing(1, base, width * height * 4);
+                crate::pci::serial_debug("[KMS] Setting scanout for resource 1\n");
                 gpu.set_scanout(1, width, height);
+                crate::pci::serial_debug("[KMS] Flushing resource 1\n");
                 gpu.flush(1, 0, 0, width, height);
+                crate::pci::serial_debug("[KMS] Resource 1 configured successfully\n");
                 
                 mode.width = width;
                 mode.height = height;
+            } else {
+                crate::pci::serial_debug("[KMS] No boot FB info available\n");
             }
         }
 
         self.current_mode = Some(mode);
+        crate::pci::serial_debug("[KMS] detect_and_configure returning OK\n");
         Ok(mode)
     }
 
@@ -157,7 +170,9 @@ impl Driver for KmsDriver {
 }
 
 pub fn init_kms() -> Result<DisplayMode, DriverError> {
+    crate::pci::serial_debug("[KMS] init_kms starting, locking KMS_DRIVER\n");
     let mut kms = KMS_DRIVER.lock();
+    crate::pci::serial_debug("[KMS] KMS_DRIVER locked, calling detect_and_configure\n");
     kms.detect_and_configure()
 }
 

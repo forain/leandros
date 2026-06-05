@@ -21,8 +21,9 @@ bitflags! {
 
 pub const PAGE_SIZE: usize = 4096;
 
-/// Mask for physical address bits in a page-table entry (bits 12-51).
-const PHYS_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+/// Mask for physical address bits in a page-table entry (bits 12-47).
+/// Bits 48-51 are reserved on 4-level paging and must be zero.
+const PHYS_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 /// Map a single 4 KiB page.
 ///
@@ -294,7 +295,9 @@ fn translate_flags(bits: u64) -> PageTableFlags {
     if src.contains(PageFlags::PRESENT)  { f |= PageTableFlags::PRESENT; }
     if src.contains(PageFlags::WRITABLE) { f |= PageTableFlags::WRITABLE; }
     if src.contains(PageFlags::USER)     { f |= PageTableFlags::USER; }
-    if src.contains(PageFlags::NOCACHE)  { f |= PageTableFlags::NO_CACHE; }
+    if src.contains(PageFlags::NOCACHE) || src.contains(PageFlags::MMIO) { 
+        f |= PageTableFlags::NO_CACHE; 
+    }
     // NO_EXECUTE if EXECUTE is NOT requested.
     if !src.contains(PageFlags::EXECUTE) { f |= PageTableFlags::NO_EXECUTE; }
     f

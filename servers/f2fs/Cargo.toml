@@ -1,0 +1,15 @@
+[package]
+name = "f2fs-server"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+ipc     = { path = "../../ipc" }
+sched   = { path = "../../sched" }
+mm      = { path = "../../mm" }
+drivers = { path = "../../drivers" }
+spin    = "0.9"
+vfs-server = { path = "../vfs" }

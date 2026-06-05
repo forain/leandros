@@ -22,6 +22,7 @@ pub mod console_properties;
 pub mod drm_device_interface;
 pub mod virtio;
 pub mod virtio_gpu;
+pub mod virtio_blk;
 
 /// Trait every driver server must implement.
 pub trait Driver {
@@ -31,7 +32,7 @@ pub trait Driver {
     fn handle(&mut self, msg: ipc::Message) -> ipc::Message;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum DriverError {
     NotFound,
     Io,

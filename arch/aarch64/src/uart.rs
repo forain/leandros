@@ -44,15 +44,35 @@ static mut UART_BASE_ADDR: usize = BASE;
 
 #[inline(always)]
 unsafe fn rd(off: usize) -> u32 {
-    let base = UART_BASE_ADDR;
+    let mut base = UART_BASE_ADDR;
+    // If MMU is enabled (TTBR1_EL1 is not 0), use the HHDM address
+    let ttbr1: u64;
+    core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1);
+    if ttbr1 != 0 && base < 0xFFFF_0000_0000_0000 {
+        extern "C" { fn mm_get_hhdm_offset() -> u64; }
+        let hhdm = mm_get_hhdm_offset() as usize;
+        if hhdm != 0 {
+            base += hhdm;
+        }
+    }
     ((base + off) as *const u32).read_volatile()
 }
 
 #[inline(always)]
 unsafe fn wr(off: usize, val: u32) {
-    let base = UART_BASE_ADDR;
-    ((base + off) as *mut u32).write_volatile(val);
+    let mut base = UART_BASE_ADDR;
+    let ttbr1: u64;
+    core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1);
+    if ttbr1 != 0 && base < 0xFFFF_0000_0000_0000 {
+        extern "C" { fn mm_get_hhdm_offset() -> u64; }
+        let hhdm = mm_get_hhdm_offset() as usize;
+        if hhdm != 0 {
+            base += hhdm;
+        }
+    }
+    ((base + off) as *mut u32).write_volatile(val)
 }
+
 
 // ── Initialise ────────────────────────────────────────────────────────────────
 
@@ -113,11 +133,10 @@ pub fn serial_print_str(s: &str) {
 }
 
 pub fn print_hex(mut n: usize) {
-    serial_print_str("0x");
     let mut buf = [0u8; 16];
     let mut i = 16;
     if n == 0 {
-        serial_print_str("0");
+        serial_print_str("0000000000000000");
         return;
     }
     while n > 0 {
@@ -125,7 +144,12 @@ pub fn print_hex(mut n: usize) {
         buf[i] = b"0123456789abcdef"[(n & 0xF) as usize];
         n >>= 4;
     }
-    for &c in &buf[i..] {
+    // Pad with zeros to 16 chars
+    while i > 0 {
+        i -= 1;
+        buf[i] = b'0';
+    }
+    for &c in &buf {
         unsafe { putc(c); }
     }
 }

@@ -94,7 +94,7 @@ extern "C" {
 
 // ── Message Dispatch ──────────────────────────────────────────────────────────
 
-pub fn handle(msg: &Message, _caller_pid: u32) -> Message {
+pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
     let tag = msg.tag;
     let dev_id = arg(msg, 0) as usize;
     
@@ -164,22 +164,20 @@ pub fn handle(msg: &Message, _caller_pid: u32) -> Message {
         }
         vfs_server::VFS_IOCTL => {
             let cmd = arg(msg, 1) as usize;
+            let pid = arg(msg, 3) as u32;
+
             if cmd == 0x541B { // FIONREAD
                 let arg_ptr = arg(msg, 2) as usize;
-                let f = unsafe { arch_interrupt_save() };
-                let devs = DEVICES.lock();
-                let count = (devs[dev_id].count * core::mem::size_of::<input_event>()) as i32;
-                drop(devs);
-                unsafe { arch_interrupt_restore(f); }
+                let count = (DEVICES.lock()[dev_id].count * core::mem::size_of::<input_event>()) as i32;
                 
-                let ok = sched::with_current_address_space(|as_| {
-                    unsafe {
-                        as_.write_user_buf(arg_ptr, core::slice::from_raw_parts(&count as *const _ as *const u8, 4))
-                    }
-                }).unwrap_or(false);
-                
-                if !ok { return err_reply(-14); } // EFAULT
-                return val_reply(0);
+                let res = sched::with_task_address_space(pid, || {
+                    unsafe { (arg_ptr as *mut i32).write(count) };
+                    0
+                });
+                return match res {
+                    Some(0) => val_reply(0),
+                    _ => err_reply(-14),
+                };
             }
             if cmd == 0x80044501 { // EVIOCGVERSION
                 return val_reply(0x00010001);
@@ -192,16 +190,16 @@ pub fn handle(msg: &Message, _caller_pid: u32) -> Message {
                 ids[2] = 0x5678; // product
                 ids[3] = 0x0001; // version
                 
-                let ok = sched::with_current_address_space(|as_| {
-                    unsafe {
-                        as_.write_user_buf(arg_ptr, core::slice::from_raw_parts(ids.as_ptr() as *const u8, 8))
-                    }
-                }).unwrap_or(false);
-                
-                if !ok { return err_reply(-14); } // EFAULT
-                return val_reply(0);
+                let res = sched::with_task_address_space(pid, || {
+                    unsafe { core::ptr::copy_nonoverlapping(ids.as_ptr() as *const u8, arg_ptr as *mut u8, 8) };
+                    0
+                });
+                return match res {
+                    Some(0) => val_reply(0),
+                    _ => err_reply(-14),
+                };
             }
-
+            
             // EVIOCGBIT(ev, len) - base is 0x4520 + ev
             let ioctl_base = cmd & 0xFF;
             if (0x20..0x40).contains(&ioctl_base) && (cmd >> 8) & 0xFF == 0x45 {
@@ -212,12 +210,15 @@ pub fn handle(msg: &Message, _caller_pid: u32) -> Message {
                 if ev_type == 0 { // Supported event types (EV_SYN=0, EV_KEY=1)
                     let bits: u32 = 0x03;
                     let n = core::cmp::min(max_len as usize, 4);
-                    unsafe { core::ptr::copy_nonoverlapping(&bits as *const u32 as *const u8, arg_ptr as *mut u8, n) };
+                    let _ = sched::with_task_address_space(pid, || {
+                        unsafe { core::ptr::copy_nonoverlapping(&bits as *const u32 as *const u8, arg_ptr as *mut u8, n) };
+                    });
                     return val_reply(n as u64);
                 } else if ev_type == 1 { // EV_KEY - supported keys
-                    // Report a generous range of keys as supported for the virtual keyboard
                     let n = core::cmp::min(max_len as usize, 64);
-                    unsafe { core::ptr::write_bytes(arg_ptr as *mut u8, 0xFF, n) };
+                    let _ = sched::with_task_address_space(pid, || {
+                        unsafe { core::ptr::write_bytes(arg_ptr as *mut u8, 0xFF, n) };
+                    });
                     return val_reply(n as u64);
                 }
                 return val_reply(0);
@@ -250,6 +251,7 @@ pub fn has_events(dev_id: u32) -> bool {
 
 pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     if dev_id as usize >= MAX_DEVICES { return; }
+    
     let now_ticks = sched::ticks();
     let ev = input_event {
         time: timeval {

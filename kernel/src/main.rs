@@ -72,38 +72,45 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub static BOOT_INFO_PTR: AtomicUsize = AtomicUsize::new(0);
 static mut BOOT_INFO: boot::BootInfo = boot::BootInfo {
-    memory_map: core::ptr::null(),
-    memory_map_len: 0,
-    framebuffer_base: 0,
-    framebuffer_width: 0,
-    framebuffer_height: 0,
-    framebuffer_pitch: 0,
-    rsdp_addr: 0,
-    uart_base: 0,
-    initrd_base: 0,
-    initrd_size: 0,
-    hhdm_offset: 0,
+    memory_map:          core::ptr::null(),
+    memory_map_len:      0,
+    framebuffer_base:    0,
+    framebuffer_width:   0,
+    framebuffer_height:  0,
+    framebuffer_pitch:   0,
+    rsdp_addr:           0,
+    uart_base:           0,
+    pci_ecam_base:       0,
+    initrd_base:         0,
+    initrd_size:         0,
+    hhdm_offset:         0,
 };
+
 
 extern "C" {
     pub fn arch_flush_cache_range(addr: usize, len: usize);
 }
 
 #[no_mangle]
+pub static KERNEL_CONSOLE_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+#[no_mangle]
 pub extern "C" fn serial_write_byte(b: u8) {
+    // Always write to serial, it's fast and safe
     #[cfg(target_arch = "x86_64")]
     unsafe { arch_x86_64::putc(b); }
     #[cfg(target_arch = "aarch64")]
     unsafe { arch_aarch64::uart::putc(b); }
 
-    // Re-entrancy guard to avoid recursive flushes/deadlocks
+    if !KERNEL_CONSOLE_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+
+    // Use a per-CPU re-entrancy guard to avoid deadlocks/character loss
     static IN_WRITE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     
     if !IN_WRITE.swap(true, core::sync::atomic::Ordering::SeqCst) {
         drivers::framebuffer::fb_putc(b);
-        if b == b'\n' {
-            drivers::framebuffer::fb_flush();
-        }
         IN_WRITE.store(false, core::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -135,14 +142,31 @@ pub extern "C" fn print_number(n: u32) {
 #[no_mangle]
 pub extern "C" fn print_hex(n: usize) {
     let digits = b"0123456789ABCDEF";
-    serial_write_byte(b'0');
-    serial_write_byte(b'x');
     for i in (0..16).rev() { serial_write_byte(digits[(n >> (i * 4)) & 0xF]); }
 }
 
+pub fn serial_print_hex(n: usize) {
+    serial_write_byte(b'0');
+    serial_write_byte(b'x');
+    print_hex(n);
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_set_console_enabled(enabled: bool) {
+    serial_print_str("[KERN] Console enabled = ");
+    crate::print_number(if enabled { 1 } else { 0 });
+    serial_print_str("\n");
+    KERNEL_CONSOLE_ENABLED.store(enabled, core::sync::atomic::Ordering::SeqCst);
+}
 #[no_mangle]
 pub extern "C" fn serial_print(s: *const u8, len: usize) {
     if s.is_null() { return; }
+    if len > 65536 {
+        // Log crazy length as a direct write to avoid recursion
+        let msg = b"\n[KERN] ERROR: serial_print called with crazy length!\n";
+        for &b in msg { unsafe { serial_write_byte_direct(b); } }
+        return;
+    }
     let bytes = unsafe { core::slice::from_raw_parts(s, len) };
     for &b in bytes {
         serial_write_byte(b);
@@ -150,8 +174,8 @@ pub extern "C" fn serial_print(s: *const u8, len: usize) {
 }
 
 #[no_mangle]
-pub extern "C" fn serial_print_str_raw(s: *const u8) {
-    serial_print_str_c(s);
+pub extern "C" fn serial_print_str_raw(s: *const u8, len: usize) {
+    serial_print(s, len);
 }
 
 pub fn serial_print_str(msg: &str) {
@@ -160,17 +184,6 @@ pub fn serial_print_str(msg: &str) {
 
 pub fn serial_write_raw(bytes: &[u8]) {
     for &b in bytes { serial_write_byte(b); }
-}
-
-#[no_mangle]
-pub extern "C" fn serial_print_str_c(s: *const u8) {
-    let mut i = 0;
-    unsafe {
-        while *s.add(i) != 0 {
-            serial_write_byte(*s.add(i));
-            i += 1;
-        }
-    }
 }
 
 pub fn serial_has_data() -> bool {
@@ -195,7 +208,6 @@ pub fn serial_read_byte() -> Option<u8> {
 pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     let is_limine = HHDM_REQUEST.response().is_some();
     let mut hhdm_offset = 0xffff800000000000;
-    
     if is_limine {
         unsafe {
             BOOT_INFO = boot::limine::parse_with_requests(
@@ -208,6 +220,35 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 &DTB_REQUEST,
             );
             hhdm_offset = BOOT_INFO.hhdm_offset;
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                // If Limine didn't find DTB or hardware, try searching in RAM
+                if BOOT_INFO.uart_base == 0 || BOOT_INFO.pci_ecam_base == 0 {
+                    serial_print_str("[MAIN] DTB not found, searching in RAM...\n");
+                    // Search in first 32MB of RAM (QEMU virt RAM starts at 0x40000000)
+                    let start = 0x40000000 + hhdm_offset as usize;
+                    let mut found = false;
+                    for i in 0..8192 {
+                        let addr = start + i * 4096;
+                        if boot::device_tree::is_valid_dtb(addr) {
+                            serial_print_str("[MAIN] Found DTB in RAM at ");
+                            serial_print_hex(addr - hhdm_offset as usize);
+                            serial_print_str("\n");
+                            let dtb_info = boot::device_tree::parse(addr);
+                            if BOOT_INFO.uart_base == 0 { BOOT_INFO.uart_base = dtb_info.uart_base; }
+                            if BOOT_INFO.pci_ecam_base == 0 { BOOT_INFO.pci_ecam_base = dtb_info.pci_ecam_base; }
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        serial_print_str("[MAIN] DTB search failed. Using defaults for QEMU virt.\n");
+                        if BOOT_INFO.uart_base == 0 { BOOT_INFO.uart_base = 0x09000000; }
+                        if BOOT_INFO.pci_ecam_base == 0 { BOOT_INFO.pci_ecam_base = 0x3F000000; }
+                    }
+                }
+            }
         }
     } else {
         #[cfg(target_arch = "aarch64")]
@@ -234,11 +275,12 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                     framebuffer_width: 0,
                     framebuffer_height: 0,
                     framebuffer_pitch: 0,
-                    rsdp_addr: 0,
-                    uart_base: 0x09000000,
-                    initrd_base: 0,
-                    initrd_size: 0,
-                    hhdm_offset: 0,
+                    rsdp_addr:           0,
+                    uart_base:           0,
+                    pci_ecam_base:       0,
+                    initrd_base:         0,
+                    initrd_size:         0,
+                    hhdm_offset:         0,
                 }
             };
             unsafe {
@@ -262,27 +304,58 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     #[cfg(target_arch = "x86_64")] { arch_x86_64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
 
+    // NOW we can print safely
+    serial_print_str("[MAIN] Architecture initialized.\n");
+
+    if is_limine {
+        serial_print_str("[MAIN] Limine boot info parsed. Memmap len: ");
+        serial_print_hex(unsafe { BOOT_INFO.memory_map_len });
+        serial_print_str(" HHDM: ");
+        serial_print_hex(hhdm_offset as usize);
+        serial_print_str("\n");
+        serial_print_str("[MAIN] UART base: ");
+        serial_print_hex(unsafe { BOOT_INFO.uart_base as usize });
+        serial_print_str(" PCI ECAM: ");
+        serial_print_hex(unsafe { BOOT_INFO.pci_ecam_base as usize });
+        serial_print_str("\n");
+    }
+
+    // Initialize PCI
+    if unsafe { (*core::ptr::addr_of!(BOOT_INFO)).pci_ecam_base } != 0 {
+        let pci_phys = unsafe { (*core::ptr::addr_of!(BOOT_INFO)).pci_ecam_base as usize };
+        let pci_virt = pci_phys + hhdm_offset as usize;
+        serial_print_str("[MAIN] Initializing PCI ECAM at ");
+        serial_print_hex(pci_phys);
+        serial_print_str("\n");
+        drivers::pci::init_pci(pci_virt);
+    }
+
     // NOW we can print
     serial_print_str("[MAIN] Architecture initialized.\n");
 
     if is_limine {
         serial_print_str("[MAIN] Limine boot info parsed. Memmap len: ");
-        print_hex(unsafe { BOOT_INFO.memory_map_len });
+        serial_print_hex(unsafe { BOOT_INFO.memory_map_len });
         serial_print_str(" HHDM: ");
-        print_hex(hhdm_offset as usize);
+        serial_print_hex(hhdm_offset as usize);
+        serial_print_str("\n");
+        serial_print_str("[MAIN] UART base: ");
+        serial_print_hex(unsafe { BOOT_INFO.uart_base as usize });
+        serial_print_str(" PCI ECAM: ");
+        serial_print_hex(unsafe { BOOT_INFO.pci_ecam_base as usize });
         serial_print_str("\n");
     }
 
     // Debug HHDM setup
-    serial_print_str("[MM] Initializing memory management with HHDM offset: 0x");
-    print_hex(hhdm_offset as usize);
+    serial_print_str("[MM] Initializing memory management with HHDM offset: ");
+    serial_print_hex(hhdm_offset as usize);
     serial_print_str("\n");
 
     unsafe {
         let bi = &*core::ptr::addr_of!(BOOT_INFO);
         if bi.framebuffer_base != 0 {
             serial_print_str("[MAIN] Initializing framebuffer console: ");
-            print_hex(bi.framebuffer_base as usize);
+            serial_print_hex(bi.framebuffer_base as usize);
             serial_print_str(" ");
             print_number(bi.framebuffer_width);
             serial_print_str("x");
@@ -300,11 +373,19 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             let pitch_bytes = if pitch < width * 4 { width * 4 } else { pitch };
 
             vfs_server::set_framebuffer(bi.framebuffer_base, width, height, pitch_bytes);
+            
+            // Also set it in the framebuffer driver for KMS integration
+            drivers::framebuffer::set_boot_framebuffer(bi.framebuffer_base, width, height, pitch_bytes);
 
-            // Initialize boot framebuffer console
+            // Verify it was set
+            if drivers::framebuffer::get_hardware_fb_info().is_some() {
+                serial_print_str("[MAIN] BOOT_FB registered successfully\n");
+            } else {
+                serial_print_str("[MAIN] BOOT_FB registration FAILED\n");
+            }
             let fb_virt = mm::phys_to_virt(bi.framebuffer_base as usize);
             serial_print_str("[MAIN] Framebuffer virtual address: ");
-            print_hex(fb_virt);
+            serial_print_hex(fb_virt);
             serial_print_str("\n");
 
             drivers::framebuffer::init_kernel_fb(
@@ -319,8 +400,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         }
         
         serial_print_str("\n[LEANDROS] Kernel starting...\n");
-        serial_print_str("[TRACE] boot_info_addr: 0x");
-        print_hex(boot_info_addr);
+        serial_print_str("[TRACE] boot_info_addr: ");
+        serial_print_hex(boot_info_addr);
         serial_print_str("\n");
 
         init::init_task_main(bi);

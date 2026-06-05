@@ -85,6 +85,7 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
         framebuffer_pitch:   0,
         rsdp_addr:           0,
         uart_base:           0,
+        pci_ecam_base:       0,
         initrd_base:         0,
         initrd_size:         0,
         hhdm_offset:         0,
@@ -113,6 +114,7 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
     let mut in_memory = false;
     let mut in_pl011  = false;
     let mut in_framebuf = false;
+    let mut in_pcie = false;
 
     let mut address_cells = 2; 
     let mut size_cells = 2;    
@@ -133,6 +135,7 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
                 in_memory   = name.starts_with(b"memory@") || name == b"memory";
                 in_pl011    = name.starts_with(b"pl011@") || name.starts_with(b"uart@");
                 in_framebuf = name.starts_with(b"framebuffer@") || name == b"framebuffer";
+                in_pcie     = name.starts_with(b"pcie@") || name == b"pcie";
 
                 ptr = ptr.add(4 + align_up(name_len + 1, 4));
             }
@@ -170,8 +173,26 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
                     b"height" if in_framebuf && data_len >= 4 => { info.framebuffer_height = be32(data_ptr); }
                     b"stride" if in_framebuf && data_len >= 4 => { info.framebuffer_pitch = be32(data_ptr); }
 
+                    b"compatible" => {
+                    }
+
                     b"reg" if in_pl011 && data_len >= 4 => {
-                        info.uart_base = if address_cells >= 2 { be64(data_ptr) } else { be32(data_ptr) as u64 };
+                        let base = if address_cells >= 2 { be64(data_ptr) } else { be32(data_ptr) as u64 };
+                        info.uart_base = base;
+                    }
+
+                    b"reg" if in_pcie && data_len >= 8 => {
+                        let mut off = 0;
+                        while off + 8 <= data_len {
+                            let base = if address_cells >= 2 { be64(data_ptr.add(off)) } else { be32(data_ptr.add(off)) as u64 };
+                            
+                            // If this is the first one, assume it's ECAM
+                            if info.pci_ecam_base == 0 {
+                                info.pci_ecam_base = base;
+                            }
+                            
+                            off += (address_cells + size_cells) as usize * 4;
+                        }
                     }
 
                     b"reg" if in_memory && mm_idx < 60 => {

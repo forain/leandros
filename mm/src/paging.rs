@@ -14,6 +14,7 @@ bitflags! {
         const USER      = 1 << 2;
         const EXECUTE   = 1 << 3;
         const NOCACHE   = 1 << 4;
+        const MMIO      = 1 << 5;
     }
 }
 

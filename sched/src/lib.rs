@@ -528,6 +528,47 @@ pub fn spawn_user(_entry_va: usize, _stack_va: usize, _priority: i8) -> Option<P
     None
 }
 
+pub fn with_address_space<F, R>(pid: Pid, f: F) -> Option<R>
+where F: FnOnce(&mm::vmm::AddressSpace) -> R {
+    let rq = RUN_QUEUE.lock();
+    let task = rq.find_pid(pid)?;
+    match task.address_space {
+        Some(ref as_) => Some(f(as_)),
+        None => None,
+    }
+}
+
+pub fn with_address_space_mut<F, R>(pid: Pid, f: F) -> Option<R>
+where F: FnOnce(&mut mm::vmm::AddressSpace) -> R {
+    let mut rq = RUN_QUEUE.lock();
+    let task = rq.find_pid_mut(pid)?;
+    match task.address_space {
+        Some(ref mut as_) => Some(f(as_)),
+        None => None,
+    }
+}
+
+pub fn with_task_address_space<F, R>(pid: Pid, f: F) -> Option<R>
+where F: FnOnce() -> R {
+    let rq = RUN_QUEUE.lock();
+    let task = rq.find_pid(pid)?;
+    let pt_root = task.address_space.as_ref()?.root();
+    drop(rq);
+
+    extern "C" {
+        fn arch_get_current_root() -> usize;
+        fn arch_set_page_table(root: usize);
+    }
+
+    unsafe {
+        let old_root = arch_get_current_root();
+        arch_set_page_table(pt_root);
+        let res = f();
+        arch_set_page_table(old_root);
+        Some(res)
+    }
+}
+
 pub fn with_current_address_space<F, R>(f: F) -> Option<R>
 where F: FnOnce(&mm::vmm::AddressSpace) -> R {
     let pid = current_pid();

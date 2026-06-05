@@ -12,6 +12,7 @@ use crate::vector_font::{VectorFont, get_fira_code_char};
 
 // ── Boot-time registration ────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug)]
 struct FramebufferInfo {
     base:   u64,
     width:  u32,
@@ -19,7 +20,7 @@ struct FramebufferInfo {
     pitch:  u32,
 }
 
-static BOOT_FB: Mutex<Option<FramebufferInfo>> = Mutex::new(None);
+pub static BOOT_FB: Mutex<Option<FramebufferInfo>> = Mutex::new(None);
 
 /// Record framebuffer parameters discovered from boot information.
 ///
@@ -31,7 +32,10 @@ pub fn set_boot_framebuffer(base: u64, width: u32, height: u32, pitch: u32) {
 
 /// Get hardware framebuffer information for DRM integration.
 pub fn get_hardware_fb_info() -> Option<(u64, u32, u32, u32)> {
-    BOOT_FB.lock().as_ref().map(|fb| (fb.base, fb.width, fb.height, fb.pitch))
+    crate::pci::serial_debug("[FB] Locking BOOT_FB...\n");
+    let lock = BOOT_FB.lock();
+    crate::pci::serial_debug("[FB] BOOT_FB locked\n");
+    lock.as_ref().map(|fb| (fb.base, fb.width, fb.height, fb.pitch))
 }
 
 // ── Driver struct ─────────────────────────────────────────────────────────────
@@ -350,13 +354,13 @@ impl Driver for Framebuffer {
     /// linear framebuffer (e.g. text-mode boot, or the DTB has no /framebuffer
     /// node).
     fn probe(&mut self) -> Result<(), DriverError> {
-        let info = BOOT_FB.lock().take().ok_or(DriverError::NotFound)?;
+        let info = (*BOOT_FB.lock()).ok_or(DriverError::NotFound)?;
 
         if info.base == 0 || info.width == 0 || info.height == 0 || info.pitch == 0 {
             return Err(DriverError::NotFound);
         }
 
-        self.base   = info.base as *mut u32;
+        self.base   = mm::phys_to_virt(info.base as usize) as *mut u32;
         self.width  = info.width  as usize;
         self.height = info.height as usize;
         self.pitch  = info.pitch  as usize;
@@ -377,14 +381,13 @@ impl Driver for Framebuffer {
 
 static KERNEL_FB: Mutex<Framebuffer> = Mutex::new(Framebuffer::new());
 
-static CONSOLE_DISABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
 /// Disable or enable kernel console output to prevent blinking during DRM operations.
 pub fn set_console_disabled(disabled: bool) {
-    let was_disabled = CONSOLE_DISABLED.swap(disabled, core::sync::atomic::Ordering::SeqCst);
+    extern "C" { fn kernel_set_console_enabled(enabled: bool); }
+    unsafe { kernel_set_console_enabled(!disabled); }
     
     // If we are re-enabling the console, trigger a redraw
-    if was_disabled && !disabled {
+    if !disabled {
         let mut fb = KERNEL_FB.lock();
         fb.clear(0x000000);
         fb.cursor_x = 0;
@@ -401,13 +404,11 @@ pub fn set_console_disabled(disabled: bool) {
 
 /// Output a character to the global kernel framebuffer.
 pub fn fb_putc(c: u8) {
-    if CONSOLE_DISABLED.load(core::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
     KERNEL_FB.lock().putc(c);
 }
 
 /// Flush the kernel framebuffer to the GPU if present.
+#[no_mangle]
 pub fn fb_flush() {
     let fb = KERNEL_FB.lock();
     let width = fb.width;

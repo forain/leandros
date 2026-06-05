@@ -81,7 +81,7 @@ ap_trampoline_start:
     mov   fs, ax
     mov   gs, ax
     mov   eax, cr4
-    or    eax, (1 << 5)
+    or    eax, (1 << 5) | (1 << 16)
     mov   cr4, eax
     mov   eax, [0x7F00]
     mov   cr3, eax

@@ -5,7 +5,7 @@
 //! tests and eventually spawns the shell.
 
 use crate::serial_print_str;
-use crate::print_hex;
+use crate::serial_print_hex;
 use mm::paging::PageFlags;
 
 extern "C" {
@@ -51,6 +51,25 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         }
     }
 
+    // ── Block Devices & Filesystems ──────────────────────────────────────────
+    drivers::virtio_blk::init();
+    {
+        const MOUNT_POINTS: &[&str] = &["/mnt", "/data", "/home", "/var"];
+        let mut mp_idx = 0usize;
+        for dev in 0..drivers::virtio_blk::device_count() {
+            if drivers::virtio_blk::has_f2fs(dev) && mp_idx < MOUNT_POINTS.len() {
+                if let Some(_port) = f2fs_server::mount(dev, MOUNT_POINTS[mp_idx], 0) {
+                    serial_print_str("[INIT] F2FS dev ");
+                    crate::print_number(dev as u32);
+                    serial_print_str(" mounted at ");
+                    serial_print_str(MOUNT_POINTS[mp_idx]);
+                    serial_print_str("\n");
+                    mp_idx += 1;
+                }
+            }
+        }
+    }
+
     // ── Userspace Init ───────────────────────────────────────────────────────
     // We attempt to load the 'init' server from the initrd.
     serial_print_str("[INIT] Loading userspace init ELF binary from initrd\n");
@@ -68,25 +87,27 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     if actual_initrd_base != 0 {
         serial_print_str("[INIT] Found initrd at physical ");
-        print_hex(actual_initrd_base);
+        serial_print_hex(actual_initrd_base);
         serial_print_str(" size ");
-        print_hex(actual_initrd_size);
+        serial_print_hex(actual_initrd_size);
         serial_print_str("\n");
 
         // Create a temporary BootInfo for extraction
         let tmp_info = boot::BootInfo {
-            memory_map: boot_info.memory_map,
-            memory_map_len: boot_info.memory_map_len,
-            framebuffer_base: boot_info.framebuffer_base,
-            framebuffer_width: boot_info.framebuffer_width,
-            framebuffer_height: boot_info.framebuffer_height,
-            framebuffer_pitch: boot_info.framebuffer_pitch,
-            rsdp_addr: boot_info.rsdp_addr,
-            uart_base: boot_info.uart_base,
-            initrd_base: actual_initrd_base as u64,
-            initrd_size: actual_initrd_size as u64,
-            hhdm_offset: boot_info.hhdm_offset,
+            memory_map:          boot_info.memory_map,
+            memory_map_len:      boot_info.memory_map_len,
+            framebuffer_base:    boot_info.framebuffer_base,
+            framebuffer_width:   boot_info.framebuffer_width,
+            framebuffer_height:  boot_info.framebuffer_height,
+            framebuffer_pitch:   boot_info.framebuffer_pitch,
+            rsdp_addr:           boot_info.rsdp_addr,
+            uart_base:           boot_info.uart_base,
+            pci_ecam_base:       boot_info.pci_ecam_base,
+            initrd_base:         boot_info.initrd_base,
+            initrd_size:         boot_info.initrd_size,
+            hhdm_offset:         boot_info.hhdm_offset,
         };
+
 
         if let Some(init_elf) = extract_binary_from_initrd("bin/init", &tmp_info) {
             serial_print_str("[INIT] Successfully extracted init binary from initrd\n");
@@ -96,8 +117,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
             // Debug framebuffer and HHDM before registering with VFS
             serial_print_str("[INIT] Framebuffer debug info:\n");
-            serial_print_str("[INIT]   Physical base: 0x");
-            crate::print_hex(boot_info.framebuffer_base as usize);
+            serial_print_str("[INIT]   Physical base: ");
+            crate::serial_print_hex(boot_info.framebuffer_base as usize);
             serial_print_str("\n[INIT]   Resolution: ");
             crate::print_number(boot_info.framebuffer_width);
             serial_print_str("x");
@@ -107,8 +128,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
             // Test virtual address conversion
             let fb_virt = mm::phys_to_virt(boot_info.framebuffer_base as usize);
-            serial_print_str("\n[INIT]   Virtual address: 0x");
-            crate::print_hex(fb_virt);
+            serial_print_str("\n[INIT]   Virtual address: ");
+            crate::serial_print_hex(fb_virt);
 
             // Check if virtual address is in valid kernel space
             if fb_virt >= 0xFFFF_0000_0000_0000 {
@@ -168,7 +189,7 @@ pub fn extract_binary_from_initrd(name: &str, boot_info: &boot::BootInfo) -> Opt
     serial_print_str("[CPIO] First 16 bytes of initrd: ");
     for i in 0..16 {
         if i < initrd_slice.len() {
-            crate::print_hex(initrd_slice[i] as usize);
+            crate::serial_print_hex(initrd_slice[i] as usize);
             serial_print_str(" ");
         }
     }
@@ -242,10 +263,10 @@ fn load_and_spawn_elf(elf_data: &[u8]) -> u32 {
 
     let pid = sched::spawn_user_with_address_space(entry, user_sp, as_).expect("failed to spawn init");
     
-    serial_print_str("[INIT] load_and_spawn_elf: entry=0x");
-    print_hex(entry);
-    serial_print_str(" sp=0x");
-    print_hex(user_sp);
+    serial_print_str("[INIT] load_and_spawn_elf: entry=");
+    serial_print_hex(entry);
+    serial_print_str(" sp=");
+    serial_print_hex(user_sp);
     serial_print_str("\n");
 
     pid
@@ -270,10 +291,10 @@ fn scan_memory_for_initrd() -> Option<(usize, usize)> {
         end   = 0x80000000; // Search full 1GB RAM
     }
 
-    serial_print_str("[INIT-SCAN] Searching from 0x");
-    print_hex(start);
-    serial_print_str(" to 0x");
-    print_hex(end);
+    serial_print_str("[INIT-SCAN] Searching from ");
+    serial_print_hex(start);
+    serial_print_str(" to ");
+    serial_print_hex(end);
     serial_print_str("...\n");
 
     let mut ptr = start;
@@ -288,7 +309,7 @@ fn scan_memory_for_initrd() -> Option<(usize, usize)> {
                core::ptr::read_volatile(v_ptr.add(5)) == b'1' {
                 
                 serial_print_str("[INIT-SCAN] Found CPIO magic at physical ");
-                print_hex(ptr);
+                serial_print_hex(ptr);
                 serial_print_str("\n");
                 
                 return Some((ptr, 0x2000000)); // Default to 32MB max

@@ -70,6 +70,8 @@ version = "0.1.0"
 dependencies = [
  "drivers",
  "ipc",
+ "mm",
+ "sched",
  "spin",
  "vfs-server",
 ]
@@ -86,6 +88,18 @@ name = "evdev-server"
 version = "0.1.0"
 dependencies = [
  "ipc",
+ "sched",
+ "spin",
+ "vfs-server",
+]
+
+[[package]]
+name = "f2fs-server"
+version = "0.1.0"
+dependencies = [
+ "drivers",
+ "ipc",
+ "mm",
  "sched",
  "spin",
  "vfs-server",
@@ -124,6 +138,7 @@ dependencies = [
  "drm-server",
  "elf",
  "evdev-server",
+ "f2fs-server",
  "init-server",
  "ipc",
  "leandros-lib",

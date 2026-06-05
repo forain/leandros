@@ -7,4 +7,6 @@ edition.workspace = true
 drivers = { path = "../../drivers" }
 ipc = { path = "../../ipc" }
 vfs-server = { path = "../vfs" }
+sched = { path = "../../sched" }
+mm = { path = "../../mm" }
 spin.workspace = true
