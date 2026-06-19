@@ -391,7 +391,7 @@ static int drm_create_fb(struct drm_framebuffer* fb, uint32_t w, uint32_t h) {
 
     fb->fb_id = create_data[3];
     fb->buffer = NULL;
-    uint64_t mmap_offset = ((uint64_t)create_data[5] << 32) | create_data[4];
+    uint32_t mmap_offset = create_data[5];
 
     void* mapped = mmap(NULL, w * h * 4, 3, 1, s_drm_fd, (long)mmap_offset);
     if (mapped != (void*)-1) fb->buffer = mapped;
