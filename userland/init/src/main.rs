@@ -21,12 +21,11 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
 
     write_str("Init process running successfully!\n");
 
-    // Launch shell via execve
     write_str("Launching shell via execve...\n");
     let path = b"/bin/shell\0";
     let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
     let envp: [*const u8; 1] = [core::ptr::null()];
-    
+
     execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
 
     // If execve returns, it failed
