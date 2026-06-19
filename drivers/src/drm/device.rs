@@ -300,11 +300,30 @@ impl DrmDevice {
         // permanently pointed at it.
         for plane_state in state.plane_states {
             if self.fb_integration {
-                self.perform_software_scaling(&plane_state)?;
+                crate::pci::serial_debug("[DRM] atomic_commit: calling perform_software_scaling\n");
+                match self.perform_software_scaling(&plane_state) {
+                    Ok(()) => crate::pci::serial_debug("[DRM] scaling OK\n"),
+                    Err(_) => {
+                        crate::pci::serial_debug("[DRM] scaling FAILED\n");
+                        return Err(DriverError::Io);
+                    }
+                }
                 if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-                    let (_, hw_width, hw_height, _) = crate::framebuffer::get_hardware_fb_info()
-                        .ok_or(DriverError::NotFound)?;
-                    gpu.flush(1, 0, 0, hw_width, hw_height);
+                    let (_, hw_width, hw_height, _) = match crate::framebuffer::get_hardware_fb_info() {
+                        Some(info) => info,
+                        None => {
+                            crate::pci::serial_debug("[DRM] gpu flush: no hw fb info\n");
+                            return Err(DriverError::NotFound);
+                        }
+                    };
+                    crate::pci::serial_debug("[DRM] calling gpu.flush\n");
+                    if gpu.flush(1, 0, 0, hw_width, hw_height) {
+                        crate::pci::serial_debug("[DRM] gpu.flush OK\n");
+                    } else {
+                        crate::pci::serial_debug("[DRM] gpu.flush FAILED\n");
+                    }
+                } else {
+                    crate::pci::serial_debug("[DRM] no VirtIO GPU available for flush\n");
                 }
             }
 
