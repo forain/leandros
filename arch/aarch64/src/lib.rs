@@ -63,6 +63,12 @@ pub fn init(boot_info: &boot::BootInfo) {
         // paging::map_4k uses mm::phys_to_virt which is now set.
         paging::map_4k(root_phys as *mut u64, uart_virt, uart_phys, device_flags);
 
+        // Switch to the HHDM virtual address immediately so serial output works
+        // before the TLB flush. New mappings are visible to the page table walker
+        // on TLB miss without an explicit invalidation.
+        uart::set_base(uart_virt);
+        uart::reinit(uart_virt);
+
         // Map GIC Distributor and CPU interface to their HHDM addresses
         let gicd_phys = gic::GICD_BASE;
         let gicc_phys = gic::GICC_BASE;
@@ -103,15 +109,6 @@ pub fn init(boot_info: &boot::BootInfo) {
 
         // Flush TLB to ensure the new mappings are active.
         core::arch::asm!("tlbi vmalle1", "dsb ish", "isb", options(nostack));
-
-        // Initialize UART: use HHDM mapping
-        uart::set_base(uart_virt);
-        if boot_info.uart_base != 0 {
-            uart::reinit(uart_virt);
-        } else {
-            // Standard init if needed, but set_base is already done
-            uart::init();
-        }
 
         // Initialize exception vectors
         exception::init();

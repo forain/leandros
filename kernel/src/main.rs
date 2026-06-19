@@ -222,34 +222,9 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             );
             hhdm_offset = BOOT_INFO.hhdm_offset;
 
-            #[cfg(target_arch = "aarch64")]
-            {
-                // If Limine didn't find DTB or hardware, try searching in RAM
-                if BOOT_INFO.uart_base == 0 || BOOT_INFO.pci_ecam_base == 0 {
-                    serial_print_str("[MAIN] DTB not found, searching in RAM...\n");
-                    // Search in first 32MB of RAM (QEMU virt RAM starts at 0x40000000)
-                    let start = 0x40000000 + hhdm_offset as usize;
-                    let mut found = false;
-                    for i in 0..8192 {
-                        let addr = start + i * 4096;
-                        if boot::device_tree::is_valid_dtb(addr) {
-                            serial_print_str("[MAIN] Found DTB in RAM at ");
-                            serial_print_hex(addr - hhdm_offset as usize);
-                            serial_print_str("\n");
-                            let dtb_info = boot::device_tree::parse(addr);
-                            if BOOT_INFO.uart_base == 0 { BOOT_INFO.uart_base = dtb_info.uart_base; }
-                            if BOOT_INFO.pci_ecam_base == 0 { BOOT_INFO.pci_ecam_base = dtb_info.pci_ecam_base; }
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        serial_print_str("[MAIN] DTB search failed. Using defaults for QEMU virt.\n");
-                        if BOOT_INFO.uart_base == 0 { BOOT_INFO.uart_base = 0x09000000; }
-                        if BOOT_INFO.pci_ecam_base == 0 { BOOT_INFO.pci_ecam_base = 0x3F000000; }
-                    }
-                }
-            }
+            // aarch64 DTB fallback: deferred to after arch_aarch64::init() because
+            // device_tree::parse emits SIMD instructions (struct zeroing), and SIMD
+            // is not enabled until enable_identity() runs inside arch::init().
         }
     } else {
         #[cfg(target_arch = "aarch64")]
@@ -304,6 +279,35 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
 
     #[cfg(target_arch = "x86_64")] { arch_x86_64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
+
+    // aarch64: SIMD and UART are now available. Run DTB fallback search if Limine
+    // didn't provide uart_base/pci_ecam_base via its DTB request.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        if is_limine && (BOOT_INFO.uart_base == 0 || BOOT_INFO.pci_ecam_base == 0) {
+            serial_print_str("[MAIN] DTB not found via Limine, searching in RAM...\n");
+            let start = 0x40000000 + hhdm_offset as usize;
+            let mut found = false;
+            for i in 0..8192 {
+                let addr = start + i * 4096;
+                if boot::device_tree::is_valid_dtb(addr) {
+                    serial_print_str("[MAIN] Found DTB in RAM at ");
+                    serial_print_hex(addr - hhdm_offset as usize);
+                    serial_print_str("\n");
+                    let dtb_info = boot::device_tree::parse(addr);
+                    if BOOT_INFO.uart_base == 0 { BOOT_INFO.uart_base = dtb_info.uart_base; }
+                    if BOOT_INFO.pci_ecam_base == 0 { BOOT_INFO.pci_ecam_base = dtb_info.pci_ecam_base; }
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                serial_print_str("[MAIN] DTB search failed. Using defaults for QEMU virt.\n");
+                if BOOT_INFO.uart_base == 0 { BOOT_INFO.uart_base = 0x09000000; }
+                if BOOT_INFO.pci_ecam_base == 0 { BOOT_INFO.pci_ecam_base = 0x3F000000; }
+            }
+        }
+    }
 
     // NOW we can print safely
     serial_print_str("[MAIN] Architecture initialized.\n");
