@@ -104,15 +104,22 @@ if [ "$BOOT_MODE" = "uefi" ]; then
             cp /opt/homebrew/share/qemu/edk2-arm-vars.fd "$VARS_FILE" 2>/dev/null || dd if=/dev/zero of="$VARS_FILE" bs=1M count=64
         fi
 
+        # disable-legacy=on forces non-transitional (modern) VirtIO for block
+        # devices.  Transitional devices (0x1001) trigger a QEMU 10.x deadlock
+        # in the doorbell write handler on the virt machine because the new
+        # coroutine-based block I/O path needs the iothread event loop — which
+        # cannot run while inside the MMIO write handler.  Modern non-
+        # transitional devices use a different notification path that doesn't
+        # have this issue.
         QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 2G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             -drive if=pflash,unit=1,format=raw,file="$VARS_FILE" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
-            -device virtio-blk-pci,drive=drive0,bootindex=0 \
+            -device virtio-blk-pci,drive=drive0,bootindex=0,disable-legacy=on \
             -drive if=none,id=data0,format=raw,file=f2fs-data0.img \
-            -device virtio-blk-pci,drive=data0 \
+            -device virtio-blk-pci,drive=data0,disable-legacy=on \
             -drive if=none,id=data1,format=raw,file=f2fs-data1.img \
-            -device virtio-blk-pci,drive=data1 \
+            -device virtio-blk-pci,drive=data1,disable-legacy=on \
             -device "$GPU_DEV" \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
