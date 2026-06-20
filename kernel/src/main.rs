@@ -302,9 +302,22 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 }
             }
             if !found {
-                serial_print_str("[MAIN] DTB search failed. Using defaults for QEMU virt.\n");
+                serial_print_str("[MAIN] DTB search failed.\n");
+                // UART is always at 0x09000000 on QEMU virt regardless of highmem setting.
                 if BOOT_INFO.uart_base == 0 { BOOT_INFO.uart_base = 0x09000000; }
-                if BOOT_INFO.pci_ecam_base == 0 { BOOT_INFO.pci_ecam_base = 0x3F000000; }
+                // Try ACPI MCFG for ECAM — QEMU UEFI boot provides ACPI, not DTB.
+                // The ECAM base moved to 0x4010000000 in QEMU 5.0+ (highmem=on default).
+                if BOOT_INFO.pci_ecam_base == 0 && BOOT_INFO.rsdp_addr != 0 {
+                    let ecam = boot::acpi::find_ecam_base(BOOT_INFO.rsdp_addr, hhdm_offset);
+                    if ecam != 0 {
+                        serial_print_str("[MAIN] ECAM found via ACPI MCFG at 0x");
+                        serial_print_hex(ecam as usize);
+                        serial_print_str("\n");
+                        BOOT_INFO.pci_ecam_base = ecam;
+                    } else {
+                        serial_print_str("[MAIN] ACPI MCFG ECAM not found; skipping PCI.\n");
+                    }
+                }
             }
         }
     }
@@ -332,6 +345,12 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         serial_print_str("[MAIN] Initializing PCI ECAM at ");
         serial_print_hex(pci_phys);
         serial_print_str("\n");
+        // On aarch64 the ECAM is not covered by Limine's HHDM (HHDM only maps RAM).
+        // Map the bus-0 ECAM window (1 bus × 32 devs × 8 fns × 4 KiB = 1 MiB) with
+        // device-nGnRE attributes so PCI config-space reads don't fault.
+        // We round up to 2 MiB so the mapping fills exactly one L2 page table entry.
+        #[cfg(target_arch = "aarch64")]
+        unsafe { arch_aarch64::map_mmio_range(pci_phys, 0x0020_0000, hhdm_offset as usize); }
         drivers::pci::init_pci(pci_virt);
     }
 
