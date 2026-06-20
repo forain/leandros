@@ -5,6 +5,7 @@
 
 #![no_std]
 
+pub mod acpi;
 pub mod device_tree;
 pub mod limine;
 pub mod multiboot2;

@@ -77,7 +77,14 @@ pub unsafe fn parse_with_requests(
     }
 
     if let Some(resp) = rsdp.response() {
-        info.rsdp_addr = resp.address as u64;
+        // Limine base revision 6 provides a virtual (HHDM) address; subtract the
+        // offset to normalise to a physical address like all other BootInfo fields.
+        let raw = resp.address as u64;
+        info.rsdp_addr = if info.hhdm_offset != 0 && raw >= info.hhdm_offset {
+            raw - info.hhdm_offset
+        } else {
+            raw
+        };
     }
 
     if let Some(resp) = modules.response() {
