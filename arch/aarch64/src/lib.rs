@@ -121,6 +121,30 @@ pub fn init(boot_info: &boot::BootInfo) {
     }
 }
 
+/// Map a physical MMIO range into the kernel (TTBR1) page tables with device memory
+/// attributes (nGnRE, MAIR index 1). Must be called after mm::init_with_map so
+/// the buddy allocator can supply intermediate page table pages.
+///
+/// `phys` and `size` need not be page-aligned; the function rounds up internally.
+/// The mapping appears at `phys + hhdm_offset` in the kernel address space.
+pub unsafe fn map_mmio_range(phys: usize, size: usize, hhdm_offset: usize) {
+    let ttbr1: usize;
+    core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1);
+    let root_phys = (ttbr1 & 0x0000_FFFF_FFFF_F000) as *mut u64;
+
+    let device_flags = paging::PageDescFlags::VALID
+        | paging::PageDescFlags::AF
+        | paging::PageDescFlags::INNER_SHR
+        | paging::PageDescFlags::ATTR_DEV;
+
+    let virt = phys + hhdm_offset;
+    paging::map_range(root_phys, virt, phys, size, device_flags);
+
+    // DSB + ISB to ensure page table writes are ordered before any subsequent
+    // load/store that targets the newly-mapped region.
+    core::arch::asm!("dsb ish", "isb", options(nostack));
+}
+
 /// Early timer check/init.
 fn init_timer() {
     let freq: u64;

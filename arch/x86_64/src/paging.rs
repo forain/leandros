@@ -170,6 +170,13 @@ pub unsafe extern "C" fn arch_get_current_root() -> usize {
     cr3 & !0xFFF
 }
 
+/// On x86-64 there is one page table for the whole address space (kernel and
+/// user split by VA range), so the kernel root is the same as the current root.
+#[no_mangle]
+pub unsafe extern "C" fn arch_get_kernel_root() -> usize {
+    arch_get_current_root()
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn arch_set_page_table(root: usize) {
     if root != 0 {

@@ -175,17 +175,27 @@ pub unsafe extern "C" fn arch_unmap_page(page_table_root: usize, virt: usize) {
 
 // ── arch_set_page_table ───────────────────────────────────────────────────────
 
-/// Load `root` into TTBR0_EL1.
+/// Returns the current user-space page table root (TTBR0_EL1).
 ///
-/// If `root` is 0 the TTBR0 is cleared (safe — kernel code uses TTBR1_EL1).
-/// Called by the scheduler immediately before every `cpu_switch_to` into a
-/// user task, and with 0 on return to the scheduler idle loop.
+/// Used by the scheduler and process management to track the active user
+/// address space.  Kernel code lives in TTBR1_EL1 — see `arch_get_kernel_root`.
 #[no_mangle]
 pub unsafe extern "C" fn arch_get_current_root() -> usize {
     let ttbr0: u64;
     core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
-    // Mask out ASID and flags. 
     (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize
+}
+
+/// Returns the kernel page table root (TTBR1_EL1).
+///
+/// On AArch64 the kernel address space lives in TTBR1.  Kernel device
+/// mappings (HHDM addresses, 0xFFFF…) must be inserted here, not in TTBR0.
+/// This is distinct from `arch_get_current_root` which tracks the user space.
+#[no_mangle]
+pub unsafe extern "C" fn arch_get_kernel_root() -> usize {
+    let ttbr1: u64;
+    core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1);
+    (ttbr1 & 0x0000_FFFF_FFFF_F000) as usize
 }
 
 #[no_mangle]

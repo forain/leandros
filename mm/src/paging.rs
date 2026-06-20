@@ -20,6 +20,10 @@ bitflags! {
 
 extern "C" {
     fn arch_get_current_root() -> usize;
+    /// Arch-provided: return the kernel page table root.
+    /// On AArch64 this is TTBR1_EL1; on x86-64 it is the same as CR3.
+    /// Kernel device mappings (HHDM virtual addresses) must use this root.
+    fn arch_get_kernel_root() -> usize;
     /// Arch-provided: map `phys` at `virt` with the given flags in the page
     /// table rooted at `page_table_root`.  Returns `true` on success, `false`
     /// if an intermediate page-table node could not be allocated (OOM).
@@ -56,9 +60,15 @@ pub fn get_current_root() -> usize {
     unsafe { arch_get_current_root() }
 }
 
+pub fn get_kernel_root() -> usize {
+    unsafe { arch_get_kernel_root() }
+}
+
 /// Map a hardware device (MMIO) into the kernel virtual address space.
 pub unsafe fn map_kernel_device(phys: usize, size: usize, flags: PageFlags) -> Option<usize> {
-    let root = get_current_root();
+    // Must use the kernel root (TTBR1 on AArch64, CR3 on x86-64) because
+    // phys_to_virt produces HHDM addresses which live in the kernel VA range.
+    let root = get_kernel_root();
     let virt = crate::phys_to_virt(phys);
     let page_phys = phys & !(crate::buddy::PAGE_SIZE - 1);
     let page_virt = virt & !(crate::buddy::PAGE_SIZE - 1);
