@@ -113,7 +113,10 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         #[cfg(target_arch = "aarch64")]
         {
             extern "C" { fn ret_to_user_fork(); }
-            unsafe { (*child_frame_ptr).x[0] = 0; } // Return 0 to child
+            unsafe {
+                (*child_frame_ptr).x[0] = 0;           // fork returns 0 to child
+                (*child_frame_ptr).pt = child_pt as u64; // child must use its own page table
+            }
             child_ctx.gregs[11] = ret_to_user_fork as *const () as u64; // LR
             child_ctx.sp = (stack_base_virt + frame_offset) as u64;
         }
