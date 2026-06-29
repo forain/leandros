@@ -29,26 +29,67 @@ impl FreeList {
 
 static FREE_LISTS: Mutex<[FreeList; MAX_ORDER]> = Mutex::new([const { FreeList::empty() }; MAX_ORDER]);
 
+/// Physical [start, end) ranges that must never be handed out by the allocator
+/// (kernel image, page tables, initrd, …). Limine marks these reserved in its
+/// memory map; on direct boot the DTB map calls all RAM available, so the
+/// kernel registers them explicitly via `reserve_range` before `init_from_map`.
+const MAX_RESERVED: usize = 8;
+static RESERVED: Mutex<[(usize, usize); MAX_RESERVED]> =
+    Mutex::new([(0, 0); MAX_RESERVED]);
+
+/// Record a physical [start, end) range to exclude from the free pool.
+/// Must be called before `init_from_map`.
+pub fn reserve_range(start: usize, end: usize) {
+    if start >= end { return; }
+    let mut r = RESERVED.lock();
+    for slot in r.iter_mut() {
+        if slot.0 == slot.1 { // empty slot
+            *slot = (leandros_lib::align_down(start, PAGE_SIZE),
+                     leandros_lib::align_up(end, PAGE_SIZE));
+            return;
+        }
+    }
+}
+
+/// True if the page-aligned block [addr, addr + size) touches any reserved range.
+fn overlaps_reserved(addr: usize, size: usize) -> bool {
+    let r = RESERVED.lock();
+    for &(s, e) in r.iter() {
+        if s == e { continue; }
+        if addr < e && s < addr + size { return true; }
+    }
+    false
+}
+
 /// Initialise the buddy allocator from the boot memory map.
 pub fn init_from_map(regions: &[boot::MemoryRegion]) {
     for region in regions {
         if region.kind != boot::MemoryType::Available { continue; }
-        
+
         // Use all available RAM. Limine marks kernel/modules as reserved.
         let start = leandros_lib::align_up(region.base as usize, PAGE_SIZE);
         let end = leandros_lib::align_down((region.base + region.length) as usize, PAGE_SIZE);
-        
+
         if start >= end { continue; }
 
         // Walk from start to end, releasing the largest aligned block each time.
         let mut addr = start;
         while addr < end {
+            // Skip pages that fall inside a reserved range.
+            if overlaps_reserved(addr, PAGE_SIZE) {
+                addr += PAGE_SIZE;
+                continue;
+            }
             let remaining_pages = (end - addr) / PAGE_SIZE;
             let max_order = usize::min(MAX_ORDER - 1,
                 (usize::BITS - 1 - remaining_pages.leading_zeros()) as usize);
             // Also constrain by alignment.
             let align_order = (addr / PAGE_SIZE).trailing_zeros() as usize;
-            let order = usize::min(max_order, usize::min(align_order, MAX_ORDER - 1));
+            let mut order = usize::min(max_order, usize::min(align_order, MAX_ORDER - 1));
+            // Shrink the block until it no longer spans a reserved range.
+            while order > 0 && overlaps_reserved(addr, PAGE_SIZE << order) {
+                order -= 1;
+            }
             free(addr, order);
             addr += PAGE_SIZE << order;
         }
