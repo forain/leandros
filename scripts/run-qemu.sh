@@ -152,9 +152,14 @@ else
         if [ ! -f "$KERNEL_ELF" ]; then echo "❌ Direct kernel ELF not found: $KERNEL_ELF"; exit 1; fi
         echo "🏗️  Using Direct Kernel ELF: $KERNEL_ELF"
         
+        # QEMU's -initrd is part of the Linux boot protocol and is NOT loaded
+        # for a bare ELF entered at its own entry point. Place the initrd at a
+        # fixed physical address with -device loader instead; the kernel scans
+        # RAM for the CPIO 070701 magic and finds it there. 0x48000000 is well
+        # clear of the kernel image at 0x40080000.
         exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg \
             -kernel "$KERNEL_ELF" \
-            -initrd "initrd-aarch64.cpio" \
+            -device loader,file=initrd-aarch64.cpio,addr=0x48000000,force-raw=on \
             -device "$GPU_DEV" \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
