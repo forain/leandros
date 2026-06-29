@@ -140,12 +140,17 @@ _start_pvh:
     loop .Lmap_2gb_v11
     pop ebp
 
+    // Load CR3 from the clean page-table base in edx *before* any diagnostic
+    // runs: the serial diagnostics use `mov dx, 0x3f8`, which overwrites the
+    // low 16 bits of edx. Doing this after a diagnostic loaded CR3 with
+    // 0x000203f8 — whose reserved bits make the paging-enable `mov cr0` fault,
+    // leaving the CPU in 32-bit mode.
+    mov cr3, edx
+
     // Diagnostic: 'p'
     mov dx, 0x3f8
     mov al, 0x70
     out dx, al
-
-    mov cr3, edx
 
     // Diagnostic: '3'
     mov al, 0x33
@@ -168,20 +173,31 @@ _start_pvh:
     mov cr0, eax
 
     // Diagnostic: 'M'
+    mov dx, 0x3f8
     mov al, 0x4d
     out dx, al
 
     // 6. Jump to 64-bit
-    call 1f
-1:  pop eax
-    add eax, 15 // Distance from 1: to .Ltarget
-    
     // Diagnostic: 'J'
     mov dx, 0x3f8
     mov al, 0x4a
     out dx, al
-    
-    // Jump to 64-bit mode using far return
+
+    // Far-return into the 64-bit code segment at .Ltarget. Derive its runtime
+    // address from the current PC plus the assembler-computed distance to
+    // .Ltarget — a hand-counted offset silently breaks when the intervening
+    // instructions change, and an absolute relocation overflows the
+    // higher-half-linked Limine build that shares this code.
+    call 1f
+1:  pop eax
+    // eax = runtime address of label 1 (the pop). Add the byte distance from
+    // there to .Ltarget to get .Ltarget's runtime address. That distance is
+    // pop(1) + add(3) + push 0x08(2) + push eax(1) + retf(1) = 8 bytes; it must
+    // be recomputed if the instructions between label 1 and .Ltarget change.
+    // (LLVM's assembler won't fold `.Ltarget - 1b` into an immediate, and an
+    // absolute reference overflows the higher-half-linked Limine build.)
+    add eax, 8
+
     push 0x08
     push eax
     retf
@@ -198,9 +214,13 @@ _start_pvh:
     mov al, 0x36
     out dx, al
     
-    // Enable SSE/AVX and FSGSBASE (CR4 bit 16)
+    // Enable SSE/AVX and FSGSBASE (CR4 bit 16).
+    // Clear CR0.EM (bit 2) and CR0.TS (bit 3), set CR0.MP (bit 1). The mask
+    // must be full-width: 0xFFFFFFF3 sign-extends to 0xFFFF...FFF3, clearing
+    // only EM+TS. A 16-bit mask like 0xFFFB would also clear CR0.PG (bit 31),
+    // disabling paging and dropping the CPU out of 64-bit mode mid-trampoline.
     mov rax, cr0
-    and rax, 0xFFFB
+    and rax, -13        // ~0xC: clear EM(bit2)+TS(bit3), preserve all other bits
     or rax, 0x2
     mov cr0, rax
     mov rax, cr4
@@ -211,21 +231,26 @@ _start_pvh:
     mov al, 0x21
     out dx, al
 
-    lea rcx, [rip + _start_common]
+    // Jump to the kernel body via its absolute (higher-half) address. The
+    // direct-boot linker places _start_common and the rest of the kernel at
+    // KERNEL_OFFSET while this trampoline runs from low physical memory, so a
+    // RIP-relative LEA can't reach it. Load the linker-resolved 64-bit address
+    // from a nearby .quad instead (LLVM's assembler rejects `movabs sym`).
+    // (Harmless in the Limine build, where this trampoline is never executed.)
+    mov rcx, [rip + .Lstart_common_ptr]
     mov eax, edi
     mov rbx, rsi
     jmp rcx
+
+    .align 8
+.Lstart_common_ptr:
+    .quad _start_common
 
 .section .text
     .globl _start_common
     .code64
     .align 16
 _start_common:
-    // Diagnostic: 'C'
-    mov dx, 0x3f8
-    mov al, 0x43
-    out dx, al
-
     // ── Zero BSS ─────────────────────────────────────────────────────────────
     lea rdi, [rip + __bss_start]
     lea rcx, [rip + __bss_end]
