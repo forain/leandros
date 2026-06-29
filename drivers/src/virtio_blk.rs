@@ -4,7 +4,7 @@
 //! Public API: read_block / write_block (4096-byte granularity) and has_f2fs.
 
 use spin::Mutex;
-use crate::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_32};
+use crate::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
 use mm;
 
 const VIRTIO_PCI_VENDOR: u16 = 0x1af4;
@@ -86,8 +86,22 @@ unsafe impl Sync for VirtQueue {}
 impl VirtQueue {
     unsafe fn alloc(id: u16, cfg: *mut VirtioPciCommonCfg) -> Option<Self> {
         core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(id);
-        let size = core::ptr::addr_of!((*cfg).queue_size).read_volatile();
-        if size == 0 { return None; }
+        let reported = core::ptr::addr_of!((*cfg).queue_size).read_volatile();
+        if reported == 0 { return None; }
+
+        // The descriptor table, avail ring and used ring each live in a single
+        // 4096-byte page.  A VirtqDesc is 16 bytes, so one page holds at most 256
+        // descriptors.  If the device reports a larger max (or a bogus 0xFFFF,
+        // which is what an unmapped BAR reads back), cap the queue and tell the
+        // device via queue_size — otherwise the init loop below overruns the
+        // page by up to ~1 MiB and corrupts adjacent allocations (page tables,
+        // other queues), which manifests as spurious MMIO faults and QEMU
+        // "Desc next is N" errors.
+        const MAX_QUEUE: u16 = 256;
+        let size = if reported > MAX_QUEUE { MAX_QUEUE } else { reported };
+        if size != reported {
+            core::ptr::addr_of_mut!((*cfg).queue_size).write_volatile(size);
+        }
         let raw_notify_off = core::ptr::addr_of!((*cfg).queue_notify_off).read_volatile();
         // 0xFFFF is QEMU's signal that legacy I/O-port notification should be
         // used (not available on AArch64).  Treat it as 0: queue N's doorbell
@@ -191,6 +205,17 @@ unsafe impl Sync for VirtioBlkDevice {}
 
 // ── Cap walk helpers ──────────────────────────────────────────────────────────
 
+/// Enable PCI Memory Space (bit 1) and Bus Master (bit 2) for `pci`.
+///
+/// Without these the device's BARs do not decode (MMIO reads return all-ones)
+/// and it performs no virtqueue DMA.  UEFI firmware normally sets them, but it
+/// does not reliably cover every device (e.g. the third virtio-blk device on
+/// the aarch64 `virt` machine), so the driver must enable them itself.
+unsafe fn enable_pci_mmio(pci: &PciDevice) {
+    let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
+    pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd | 0x0006);
+}
+
 /// Resolve a BAR index to its 64-bit MMIO base address, or 0 if I/O space.
 fn bar64(pci: &PciDevice, bar_idx: usize) -> u64 {
     let raw = pci.bars[bar_idx];
@@ -259,6 +284,7 @@ unsafe fn walk_caps(
 /// MMIO write handler, where aio_poll() cannot run — causing a deadlock.
 /// Resetting all devices first means blk_drain() sees no pending I/O.
 unsafe fn pre_reset_device(pci: &PciDevice) {
+    enable_pci_mmio(pci);
     let (common_cfg, _, _) = walk_caps(pci);
     if let Some(cfg) = common_cfg {
         core::ptr::addr_of_mut!((*cfg).device_status).write_volatile(0u8);
@@ -271,6 +297,7 @@ impl VirtioBlkDevice {
     /// `reset_done`: if true, device_status=0 was already written in a prior
     /// pass and this function starts from ACKNOWLEDGE.
     unsafe fn new(pci: PciDevice, reset_done: bool) -> Option<Self> {
+        enable_pci_mmio(&pci);
         let (common_cfg, notify_cfg, notify_off_multiplier) = walk_caps(&pci);
         let common_cfg = common_cfg?;
         let notify_cfg = notify_cfg?;
