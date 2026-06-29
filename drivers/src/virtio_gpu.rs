@@ -1,6 +1,6 @@
 use spin::Mutex;
 use alloc::vec::Vec;
-use crate::pci::{PciDevice, find_device, pci_read_config_8, pci_read_config_32};
+use crate::pci::{PciDevice, find_device, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
 use mm;
 
 const VIRTIO_PCI_VENDOR: u16 = 0x1af4;
@@ -264,7 +264,17 @@ impl VirtioGpuDevice {
     pub fn new() -> Option<Self> {
         let dev = find_device(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_GPU)?;
         crate::pci::serial_debug("[GPU] Found VirtIO GPU device\n");
-        
+
+        // Enable PCI Memory Space (bit 1) and Bus Master (bit 2) in the command
+        // register.  Without these the device decodes no MMIO BAR accesses and
+        // performs no virtqueue DMA, so every command times out.  UEFI firmware
+        // normally sets them, but on direct (-kernel) boot there is no firmware,
+        // so the driver must enable them itself.
+        unsafe {
+            let cmd = pci_read_config_16(dev.bus, dev.dev, dev.func, 0x04);
+            pci_write_config_16(dev.bus, dev.dev, dev.func, 0x04, cmd | 0x0006);
+        }
+
         let mut common_cfg = core::ptr::null_mut();
         let mut notify_cfg = core::ptr::null_mut();
         let mut notify_off_multiplier = 0;
@@ -430,9 +440,6 @@ impl VirtioGpuDevice {
         if q.num_free < 2 { return Err(()); }
 
         let hdr_type = u32::from_le_bytes(cmd_data[0..4].try_into().unwrap_or([0; 4]));
-        crate::pci::serial_debug("[GPU] Sending command ");
-        crate::pci::serial_debug_hex(hdr_type);
-        crate::pci::serial_debug("\n");
 
         let req_phys = mm::buddy::alloc(0).ok_or(())?;
         let req_virt = mm::phys_to_virt(req_phys) as *mut u8;
@@ -450,10 +457,6 @@ impl VirtioGpuDevice {
             q.submit(head);
 
             let notify_addr = (self.notify_cfg as usize + q.notify_off as usize * self.notify_off_multiplier as usize) as *mut u16;
-            crate::pci::serial_debug("[GPU] Notifying at ");
-            crate::pci::serial_debug_hex(notify_addr as u32);
-            crate::pci::serial_debug("\n");
-
             *notify_addr = 0;
 
             let mut timeout = 10_000_000;
@@ -468,10 +471,6 @@ impl VirtioGpuDevice {
                 crate::pci::serial_debug(" TIMEOUT!\n");
                 return Err(());
             }
-
-            crate::pci::serial_debug("[GPU] Command ");
-            crate::pci::serial_debug_hex(hdr_type);
-            crate::pci::serial_debug(" COMPLETED\n");
 
             q.last_used_idx = q.last_used_idx.wrapping_add(1);
 
@@ -569,13 +568,17 @@ impl VirtioGpuDevice {
             self.current_resource_id = resource_id;
         }
 
+        // Byte offset of (x, y) within the resource backing.  The device uses the
+        // resource's own width as the stride, so a partial-rect transfer must
+        // point `offset` at the rect origin rather than the start of the buffer.
+        let offset = (y as u64 * self.scanout_w as u64 + x as u64) * 4;
         let transfer = VirtioGpuTransferToHost2d {
             hdr: VirtioGpuCtrlHdr {
                 type_: VirtioGpuCmd::TransferToHost2d as u32,
                 flags: 0, fence_id: 0, ctx_id: 0, padding: 0,
             },
             r: VirtioGpuRect { x, y, width, height },
-            offset: 0,
+            offset,
             resource_id,
             padding: 0,
         };
@@ -725,6 +728,38 @@ impl VirtioGpuDevice {
             Ok(response)
         }
     }
+
+    /// Query the host for the preferred display mode via GET_DISPLAY_INFO.
+    ///
+    /// Returns `(width, height)` of the first enabled scanout, or `None` if the
+    /// command fails or no scanout is enabled.  The response is a
+    /// `virtio_gpu_resp_display_info`: a 24-byte control header followed by
+    /// `VIRTIO_GPU_MAX_SCANOUTS` (16) `virtio_gpu_display_one` entries, each 24
+    /// bytes — `rect { x, y, width, height }` (16) + `enabled` (4) + `flags` (4).
+    pub fn get_display_info(&mut self) -> Option<(u32, u32)> {
+        const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+        const HDR_LEN: usize = 24;
+        const ENTRY_LEN: usize = 24;
+        const MAX_SCANOUTS: usize = 16;
+
+        let resp = self.send_command(VirtioGpuCmd::GetDisplayInfo, &[]).ok()?;
+        let resp_type = u32::from_le_bytes(resp.get(0..4)?.try_into().ok()?);
+        if resp_type != VIRTIO_GPU_RESP_OK_DISPLAY_INFO {
+            return None;
+        }
+
+        for i in 0..MAX_SCANOUTS {
+            let base = HDR_LEN + i * ENTRY_LEN;
+            // rect: x@0 y@4 width@8 height@12 ; enabled@16
+            let width   = u32::from_le_bytes(resp.get(base + 8..base + 12)?.try_into().ok()?);
+            let height  = u32::from_le_bytes(resp.get(base + 12..base + 16)?.try_into().ok()?);
+            let enabled = u32::from_le_bytes(resp.get(base + 16..base + 20)?.try_into().ok()?);
+            if enabled != 0 && width > 0 && height > 0 {
+                return Some((width, height));
+            }
+        }
+        None
+    }
 }
 
 pub static VIRTIO_GPU: Mutex<Option<VirtioGpuDevice>> = Mutex::new(None);
@@ -732,4 +767,75 @@ pub static VIRTIO_GPU: Mutex<Option<VirtioGpuDevice>> = Mutex::new(None);
 pub fn init() {
     let mut gpu = VIRTIO_GPU.lock();
     *gpu = VirtioGpuDevice::new();
+}
+
+/// Bring up the VirtIO GPU and create a scanout-backed framebuffer in guest RAM.
+///
+/// Used when the bootloader does not hand the kernel a linear framebuffer.  On
+/// AArch64 QEMU uses `virtio-gpu-pci`, which — unlike x86 `virtio-vga` — exposes
+/// no VGA/GOP-compatible linear framebuffer, so Limine reports no framebuffer at
+/// all and the early console has no surface to draw on.
+///
+/// We allocate a guest-RAM surface, attach it to resource 1, and set it as
+/// scanout 0.  Resource 1 is the same id `fb_flush()` transfers/flushes on every
+/// console character, so once this succeeds the kernel console renders on the
+/// host display.
+///
+/// The mode is taken from the host's preferred scanout (GET_DISPLAY_INFO);
+/// `default_width`/`default_height` are used only if that query fails.
+///
+/// Returns `(phys, virt, width, height, pitch_bytes)` of the new framebuffer, or
+/// `None` if no VirtIO GPU is present or device setup fails.  The width/height
+/// reflect the mode actually programmed, which may differ from the defaults.
+pub fn setup_console_framebuffer(default_width: u32, default_height: u32) -> Option<(u64, usize, u32, u32, u32)> {
+    init();
+
+    let mut guard = VIRTIO_GPU.lock();
+    let gpu = guard.as_mut()?;
+
+    // Prefer the display's reported mode; fall back to the caller's default.
+    let (width, height) = match gpu.get_display_info() {
+        Some((w, h)) => {
+            crate::pci::serial_debug("[GPU] Preferred display mode ");
+            crate::pci::serial_debug_hex(w);
+            crate::pci::serial_debug("x");
+            crate::pci::serial_debug_hex(h);
+            crate::pci::serial_debug("\n");
+            (w, h)
+        }
+        None => {
+            crate::pci::serial_debug("[GPU] GET_DISPLAY_INFO unavailable; using default mode\n");
+            (default_width, default_height)
+        }
+    };
+
+    let pitch = width * 4;
+    let fb_bytes = pitch as usize * height as usize;
+
+    // Smallest buddy order that covers the surface (ceil_log2 of the page count).
+    let pages = (fb_bytes + 4095) >> 12;
+    let order = (usize::BITS - pages.leading_zeros()) as usize;
+    let order = order.min(mm::buddy::MAX_ORDER - 1);
+
+    let phys = mm::buddy::alloc(order)?;
+    let virt = mm::phys_to_virt(phys);
+
+    // Start on a clean (black) surface.
+    unsafe { core::ptr::write_bytes(virt as *mut u8, 0, fb_bytes); }
+
+    if !gpu.create_resource_2d(1, width, height) {
+        crate::pci::serial_debug("[GPU] create_resource_2d failed\n");
+        return None;
+    }
+    if !gpu.attach_backing(1, phys as u64, fb_bytes as u32) {
+        crate::pci::serial_debug("[GPU] attach_backing failed\n");
+        return None;
+    }
+    if !gpu.set_scanout(1, width, height) {
+        crate::pci::serial_debug("[GPU] set_scanout failed\n");
+        return None;
+    }
+    gpu.flush(1, 0, 0, width, height);
+
+    Some((phys as u64, virt, width, height, pitch))
 }
