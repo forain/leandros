@@ -1805,12 +1805,12 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let (elf_ptr, elf_len) = match vfs::get_file_data_by_path(path) {
         Some((ptr, len)) => (ptr as usize, len),
         None => {
-            // 2. Fallback to initrd lookup using the resolved absolute path
-            let (ptr, len) = unsafe {
-                let bi_ptr = BOOT_INFO_PTR.load(Ordering::SeqCst);
-                if bi_ptr != 0 {
-                    let boot_info = &*(bi_ptr as *const boot::BootInfo);
-                    match init::extract_binary_from_initrd(path, boot_info) {
+    // 2. Fallback to initrd lookup using the resolved absolute path
+    let (ptr, len) = unsafe {
+        let bi_ptr = BOOT_INFO_PTR.load(Ordering::SeqCst);
+        if bi_ptr != 0 {
+            let boot_info = &*(bi_ptr as *const boot::BootInfo);
+            match init::extract_binary_from_initrd(path, boot_info) {
                         Some(data) => (data.as_ptr() as usize, data.len()),
                         None => {
                             serial_print_str("[EXEC] Failed to find binary in initrd: ");

@@ -82,6 +82,18 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         if let Some((base, size)) = scan_memory_for_initrd() {
             actual_initrd_base = base;
             actual_initrd_size = size;
+
+            // Persist the scanned location back into the global BootInfo so
+            // later consumers — notably sys_execve, which reads it through
+            // BOOT_INFO_PTR — can also find the initrd (e.g. for /bin/shell).
+            let bi_ptr = crate::BOOT_INFO_PTR.load(core::sync::atomic::Ordering::SeqCst);
+            if bi_ptr != 0 {
+                unsafe {
+                    let bi = &mut *(bi_ptr as *mut boot::BootInfo);
+                    bi.initrd_base = base as u64;
+                    bi.initrd_size = size as u64;
+                }
+            }
         }
     }
 
@@ -103,8 +115,11 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             rsdp_addr:           boot_info.rsdp_addr,
             uart_base:           boot_info.uart_base,
             pci_ecam_base:       boot_info.pci_ecam_base,
-            initrd_base:         boot_info.initrd_base,
-            initrd_size:         boot_info.initrd_size,
+            // Use the values resolved above (which may come from the memory
+            // scan), not the raw boot_info fields — on direct boot the latter
+            // are zero and the CPIO parser would see no initrd.
+            initrd_base:         actual_initrd_base as u64,
+            initrd_size:         actual_initrd_size as u64,
             hhdm_offset:         boot_info.hhdm_offset,
         };
 
@@ -175,15 +190,71 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     sched::run();
 }
 
+/// Walk a CPIO (newc) archive at `base_virt` and return its total length up to
+/// and including the `TRAILER!!!` sentinel. Returns 0 if there is no valid CPIO
+/// archive at that address. `base_virt` must be a directly-readable address
+/// (identity- or HHDM-mapped).
+pub fn cpio_image_size(base_virt: usize) -> usize {
+    let p = base_virt as *const u8;
+    let rd = |o: usize| unsafe { core::ptr::read_volatile(p.add(o)) };
+    let parse_hex = |start: usize| -> usize {
+        let mut v = 0usize;
+        for i in 0..8 {
+            let c = rd(start + i);
+            let d = match c {
+                b'0'..=b'9' => (c - b'0') as usize,
+                b'a'..=b'f' => (c - b'a' + 10) as usize,
+                b'A'..=b'F' => (c - b'A' + 10) as usize,
+                _ => return v,
+            };
+            v = (v << 4) | d;
+        }
+        v
+    };
+
+    let mut offset = 0usize;
+    loop {
+        // Validate the newc magic "070701" at the current entry.
+        for (i, b) in b"070701".iter().enumerate() {
+            if rd(offset + i) != *b { return offset; }
+        }
+        let namesize = parse_hex(offset + 94);
+        let filesize = parse_hex(offset + 54);
+        let name_start = offset + 110;
+
+        // The archive ends at the TRAILER!!! entry (which carries no data).
+        let trailer = b"TRAILER!!!";
+        if namesize >= trailer.len() + 1
+            && trailer.iter().enumerate().all(|(i, b)| rd(name_start + i) == *b)
+        {
+            return (name_start + namesize + 3) & !3;
+        }
+
+        let file_start = (name_start + namesize + 3) & !3;
+        offset = (file_start + filesize + 3) & !3;
+        // Sanity bound: never walk past 1.5 GiB of archive.
+        if offset > 0x6000_0000 { return offset; }
+    }
+}
+
 /// Locate a file in the CPIO initrd and return its data.
 pub fn extract_binary_from_initrd(name: &str, boot_info: &boot::BootInfo) -> Option<&'static [u8]> {
     let base = boot_info.initrd_base;
     let size = boot_info.initrd_size;
 
-    if base == 0 || size == 0 { return None; }
+    if base == 0 || size == 0 { 
+        serial_print_str("[CPIO] No initrd available\n");
+        return None; 
+    }
 
     let initrd_virt = mm::phys_to_virt(base as usize) as *const u8;
     let initrd_slice = unsafe { core::slice::from_raw_parts(initrd_virt, size as usize) };
+
+    // Make sure the initrd is valid before trying to parse it
+    if initrd_slice.len() < 110 {
+        serial_print_str("[CPIO] Initrd too small to contain CPIO header\n");
+        return None;
+    }
 
     // Diagnostic
     serial_print_str("[CPIO] First 16 bytes of initrd: ");
@@ -198,14 +269,20 @@ pub fn extract_binary_from_initrd(name: &str, boot_info: &boot::BootInfo) -> Opt
     // ── Simple CPIO (newc) parser ───────────────────────────────────────────
     let mut offset = 0;
     let target_name = name.trim_start_matches('/').trim_start_matches("./");
+    serial_print_str("[CPIO] Looking for file: ");
+    serial_print_str(target_name);
+    serial_print_str("\n");
 
     while offset + 110 <= initrd_slice.len() {
-        if &initrd_slice[offset..offset+6] != b"070701" {
+        // Check for valid CPIO header
+        if initrd_slice[offset] != b'0' || initrd_slice[offset+1] != b'7' || 
+           initrd_slice[offset+2] != b'0' || initrd_slice[offset+3] != b'7' || 
+           initrd_slice[offset+4] != b'0' || initrd_slice[offset+5] != b'1' {
             // Check for GZIP magic 1f 8b
             if initrd_slice[offset] == 0x1f && initrd_slice[offset+1] == 0x8b {
                 serial_print_str("[CPIO] Found GZIP initrd - extraction NOT SUPPORTED\n");
             } else if offset == 0 {
-                serial_print_str("[CPIO] Invalid magic: ");
+                serial_print_str("[CPIO] Invalid magic at offset 0: ");
                 serial_print_str(unsafe { core::str::from_utf8_unchecked(&initrd_slice[offset..offset+6]) });
                 serial_print_str("\n");
             }
@@ -215,25 +292,43 @@ pub fn extract_binary_from_initrd(name: &str, boot_info: &boot::BootInfo) -> Opt
         let namesize = usize::from_str_radix(core::str::from_utf8(&initrd_slice[offset+94..offset+102]).unwrap_or("0"), 16).unwrap_or(0);
         let filesize = usize::from_str_radix(core::str::from_utf8(&initrd_slice[offset+54..offset+62]).unwrap_or("0"), 16).unwrap_or(0);
 
-        if namesize == 0 { break; }
+        if namesize == 0 { 
+            serial_print_str("[CPIO] Zero namesize, breaking\n");
+            break; 
+        }
 
         let name_start = offset + 110;
-        if name_start + namesize > initrd_slice.len() { break; }
+        if name_start + namesize > initrd_slice.len() { 
+            serial_print_str("[CPIO] Name start + namesize exceeds slice length\n");
+            break; 
+        }
         
         let file_name = core::str::from_utf8(&initrd_slice[name_start..name_start + namesize - 1]).unwrap_or("");
         let current_entry_name = file_name.trim_start_matches('/').trim_start_matches("./");
+        
+        // Debug: Print the file name being compared
+        serial_print_str("[CPIO] Comparing with file: ");
+        serial_print_str(current_entry_name);
+        serial_print_str("\n");
         
         // Align to 4 bytes
         let file_start = (name_start + namesize + 3) & !3;
         
         if current_entry_name == target_name {
-            if file_start + filesize > initrd_slice.len() { return None; }
+            if file_start + filesize > initrd_slice.len() { 
+                serial_print_str("[CPIO] File data out of bounds\n");
+                return None; 
+            }
+            serial_print_str("[CPIO] Found file in initrd\n");
             return Some(unsafe { core::slice::from_raw_parts(initrd_virt.add(file_start), filesize) });
         }
 
         offset = (file_start + filesize + 3) & !3;
     }
 
+    serial_print_str("[CPIO] File not found in initrd: ");
+    serial_print_str(target_name);
+    serial_print_str("\n");
     None
 }
 
@@ -288,7 +383,8 @@ fn scan_memory_for_initrd() -> Option<(usize, usize)> {
     #[cfg(target_arch = "aarch64")]
     {
         start = 0x40000000;
-        end   = 0x80000000; // Search full 1GB RAM
+        end   = 0xC0000000; // Search full 2GB RAM (-m 2G); QEMU places the
+                            // initrd high, above the low 1GB window.
     }
 
     serial_print_str("[INIT-SCAN] Searching from ");
