@@ -4,9 +4,44 @@
 .globl _start
 _start:
     // ── PRESERVE ARGUMENTS IMMEDIATELY ──
+    // x0 holds the DTB pointer on direct (-kernel) boot; preserve across the
+    // EL2->EL1 drop below (eret does not clobber GPRs).
     mov     x19, x0
     mov     x20, x1
 
+    // ── Drop to EL1 if entered at EL2 ────────────────────────────────────────
+    // QEMU `-kernel` on `virt` with `-cpu max` (EL2 implemented, secure=off)
+    // enters at EL2.  The rest of this entry — and the kernel — only programs
+    // EL1 system registers, so we must hand off to EL1 first.  Limine already
+    // enters at EL1, so CurrentEL gates this and leaves that path untouched.
+    mrs     x4, CurrentEL
+    lsr     x4, x4, #2
+    and     x4, x4, #3
+    cmp     x4, #2
+    b.ne    .Lat_el1                // not EL2 → already where we want to be
+
+    // Let EL1 read the physical/virtual counter without trapping to EL2,
+    // otherwise the timer init later faults into nonexistent EL2 vectors.
+    mrs     x4, cnthctl_el2
+    orr     x4, x4, #3              // EL1PCTEN | EL1PCEN
+    msr     cnthctl_el2, x4
+    msr     cntvoff_el2, xzr        // zero virtual counter offset
+
+    movz    x4, #0x8000, lsl #16    // HCR_EL2.RW (bit 31): EL1 executes AArch64
+    msr     hcr_el2, x4
+
+    movz    x4, #0x0800             // SCTLR_EL1 reset: RES1 bits set, MMU off
+    movk    x4, #0x30d0, lsl #16
+    msr     sctlr_el1, x4
+
+    mov     x4, #0x3c5              // SPSR_EL2: return to EL1h, DAIF masked
+    msr     spsr_el2, x4
+    adr     x4, .Lat_el1            // PC-relative: physical addr (MMU still off)
+    msr     elr_el2, x4
+    isb
+    eret
+
+.Lat_el1:
     // Force SP_EL1
     msr     SPSel, #1
     isb
@@ -17,7 +52,24 @@ _start:
     b.ne    .Llimine_entry
 
     // ── Direct Boot Path (MMU is OFF) ────────────────────────────────────────
-    
+
+    // 0. Zero BSS *now*, before building page tables.
+    //    early_pgtables lives in .bss; once we install it as the live page
+    //    table we must never zero it again.  adrp/add is PC-relative, so with
+    //    the MMU off it yields the *physical* BSS addresses we can write here.
+    //    (The Limine path zeroes BSS later instead — there early_pgtables is
+    //    unused, so clearing it is harmless.)
+    adrp    x0, __bss_start
+    add     x0, x0, :lo12:__bss_start
+    adrp    x1, __bss_end
+    add     x1, x1, :lo12:__bss_end
+.Ldirect_bss:
+    cmp     x0, x1
+    b.ge    .Ldirect_bss_done
+    str     xzr, [x0], #8
+    b       .Ldirect_bss
+.Ldirect_bss_done:
+
     // 1. MAIR
     mov     x4, #0x04FF
     msr     mair_el1, x4
@@ -76,12 +128,15 @@ _start:
     msr     cpacr_el1, x5
     isb
 
-    // Transition to high virtual address
-    ldr     x4, =1f
+    // Transition to high virtual address — land *after* the BSS-zero loop so
+    // we don't wipe the page tables we just installed.
+    ldr     x4, =.Lsetup_stack
     br      x4
-1:
+
 .Llimine_entry:
-    // ── Zero BSS ─────────────────────────────────────────────────────────────
+    // ── Zero BSS (Limine path only) ──────────────────────────────────────────
+    // Limine supplies its own page tables, so clearing all of .bss here (which
+    // includes early_pgtables) is safe.
     adrp    x0, __bss_start
     add     x0, x0, :lo12:__bss_start
     adrp    x1, __bss_end
@@ -93,6 +148,7 @@ _start:
     b       .Lbss_loop
 .Lbss_done:
 
+.Lsetup_stack:
     // Set up initial stack
     adrp    x1, EARLY_STACK
     add     x1, x1, :lo12:EARLY_STACK
