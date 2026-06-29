@@ -170,6 +170,38 @@ pub unsafe fn pci_write_config_16(bus: u8, dev: u8, func: u8, offset: u8, val: u
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub unsafe fn pci_write_config_16(_bus: u8, _dev: u8, _func: u8, _offset: u8, _val: u16) {}
 
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn pci_write_config_32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
+    let address = ((bus as u32) << 16) | ((dev as u32) << 11) |
+                  ((func as u32) << 8) | ((offset as u32) & 0xFC) | 0x8000_0000;
+    core::arch::asm!(
+        "mov dx, 0xCF8",
+        "out dx, eax",
+        "mov eax, edi",
+        "mov dx, 0xCFC",
+        "out dx, eax",
+        in("eax") address,
+        in("edi") val,
+        out("dx") _,
+        options(nomem, nostack)
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn pci_write_config_32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
+    let ecam_base = PCI_ECAM_BASE;
+    if ecam_base == 0 { return; }
+    let addr = ecam_base +
+               ((bus as usize) << 20) +
+               ((dev as usize) << 15) +
+               ((func as usize) << 12) +
+               (offset as usize & 0xFC);
+    core::ptr::write_volatile(addr as *mut u32, val);
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub unsafe fn pci_write_config_32(_bus: u8, _dev: u8, _func: u8, _offset: u8, _val: u32) {}
+
 impl PciDevice {
     pub unsafe fn find_capability(&self, cap_id: u8) -> Option<u8> {
         let status = pci_read_config_16(self.bus, self.dev, self.func, 0x06);
@@ -197,6 +229,15 @@ pub fn scan() -> Vec<PciDevice> {
     let mut devices = Vec::new();
     serial_debug("[PCI] Scanning bus...\n");
 
+    // On a bare `-kernel` boot there is no firmware to assign PCI BARs, so we
+    // assign them ourselves from QEMU virt's 32-bit PCIe MMIO window. BARs that
+    // already hold an address (UEFI/x86, where firmware programmed them) are
+    // left untouched, so this is a no-op on the firmware-assisted paths.
+    #[cfg(target_arch = "aarch64")]
+    let mut mmio_next: usize = 0x1000_0000;
+    #[cfg(target_arch = "aarch64")]
+    const PCIE_MMIO_END: usize = 0x3eff_0000;
+
     let max_bus = if cfg!(target_arch = "aarch64") { 0 } else { 255 };
 
     for bus in 0..=max_bus {
@@ -216,14 +257,58 @@ pub fn scan() -> Vec<PciDevice> {
             let subclass = (class_rev >> 16) as u8;
 
             let mut bars = [0u32; 6];
-            for i in 0..6 {
-                let bar = unsafe { pci_read_config(bus as u8, dev as u8, 0, 0x10 + (i as u8 * 4)) };
-                bars[i] = bar;
+            let mut i = 0usize;
+            while i < 6 {
+                let off = 0x10 + (i as u8 * 4);
+                let orig = unsafe { pci_read_config(bus as u8, dev as u8, 0, off) };
+
+                // I/O-space BARs (bit 0 set): record and move on.
+                if orig & 1 == 1 {
+                    bars[i] = orig;
+                    i += 1;
+                    continue;
+                }
+
+                let is_64 = (orig & 0x6) == 0x4; // memory BAR type bits == 10b
+                let already_assigned = (orig & 0xFFFF_FFF0) != 0
+                    || (is_64 && unsafe { pci_read_config(bus as u8, dev as u8, 0, off + 4) } != 0);
+
+                // Direct boot: size and assign any unprogrammed memory BAR.
+                #[cfg(target_arch = "aarch64")]
+                if !already_assigned {
+                    unsafe {
+                        pci_write_config_32(bus as u8, dev as u8, 0, off, 0xFFFF_FFFF);
+                        let sz_lo = pci_read_config(bus as u8, dev as u8, 0, off) & 0xFFFF_FFF0;
+                        let sz_hi = if is_64 {
+                            pci_write_config_32(bus as u8, dev as u8, 0, off + 4, 0xFFFF_FFFF);
+                            pci_read_config(bus as u8, dev as u8, 0, off + 4)
+                        } else { 0xFFFF_FFFF };
+                        let mask = ((sz_hi as u64) << 32) | (sz_lo as u64);
+                        let size = (!mask).wrapping_add(1) as usize;
+                        if size != 0 && mmio_next + size <= PCIE_MMIO_END {
+                            let base = leandros_lib::align_up(mmio_next, size);
+                            pci_write_config_32(bus as u8, dev as u8, 0, off, base as u32);
+                            if is_64 {
+                                pci_write_config_32(bus as u8, dev as u8, 0, off + 4, (base >> 32) as u32);
+                            }
+                            mmio_next = base + size;
+                        }
+                    }
+                }
+
+                bars[i] = unsafe { pci_read_config(bus as u8, dev as u8, 0, off) };
                 serial_debug("  BAR");
                 serial_debug_hex(i as u32);
                 serial_debug("=");
-                serial_debug_hex(bar);
+                serial_debug_hex(bars[i]);
                 serial_debug("\n");
+
+                if is_64 && i + 1 < 6 {
+                    bars[i + 1] = unsafe { pci_read_config(bus as u8, dev as u8, 0, off + 4) };
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
             devices.push(PciDevice {
                 bus: bus as u8, dev: dev as u8, func: 0,
