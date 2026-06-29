@@ -282,6 +282,16 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             unsafe {
                 BOOT_INFO = boot_info;
                 BOOT_INFO.hhdm_offset = hhdm_offset;
+
+                // QEMU `-kernel` provides neither a DTB nor ACPI for a bare ELF,
+                // so the device-tree scan above finds nothing and UART/ECAM stay
+                // zero. Fall back to the fixed QEMU virt MMIO addresses: the PL011
+                // UART is always at 0x0900_0000, and with `-cpu max` (48-bit PA)
+                // the PCIe ECAM is the high window at 0x40_1000_0000 — the same
+                // base the Limine path discovers via ACPI MCFG. Without this the
+                // PCI bus scan finds no devices (e.g. virtio-sound).
+                if BOOT_INFO.uart_base == 0 { BOOT_INFO.uart_base = 0x0900_0000; }
+                if BOOT_INFO.pci_ecam_base == 0 { BOOT_INFO.pci_ecam_base = 0x40_1000_0000; }
             }
 
             // Direct boot: the DTB memory map calls *all* RAM available, unlike
