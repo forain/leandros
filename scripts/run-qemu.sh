@@ -178,9 +178,13 @@ else
         if [ ! -f "$KERNEL_ELF" ]; then echo "❌ Direct kernel ELF not found: $KERNEL_ELF"; exit 1; fi
         echo "🏗️  Using Direct Kernel ELF: $KERNEL_ELF"
         
+        # As on aarch64 direct boot, the kernel locates the initrd by scanning
+        # for the CPIO magic; place it at a fixed physical address with
+        # -device loader. 0x1000_0000 (256 MiB) is clear of the kernel image at
+        # 0x10_0000 and within the trampoline's low-2 GiB HHDM window.
         exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg -m 2G \
             -kernel "$KERNEL_ELF" \
-            -initrd "initrd-x86_64.cpio" \
+            -device loader,file=initrd-x86_64.cpio,addr=0x10000000,force-raw=on \
             -device "$GPU_DEV" \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
