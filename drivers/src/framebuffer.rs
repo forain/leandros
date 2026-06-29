@@ -50,6 +50,12 @@ pub struct Framebuffer {
     vector_font: Option<VectorFont>,
     char_width: usize,
     char_height: usize,
+    /// Bounding box of pixels modified since the last flush, as
+    /// `(min_x, min_y, max_x, max_y)` with the maxima exclusive.  Lets
+    /// `fb_flush` transfer only the changed region to the GPU instead of the
+    /// whole screen — cheap enough to flush on every character, which keeps the
+    /// shell prompt and typed input visible on the VirtIO-GPU path.
+    dirty: Option<(usize, usize, usize, usize)>,
 }
 
 // Safety: kernel owns the framebuffer exclusively.
@@ -73,7 +79,27 @@ impl Framebuffer {
             vector_font: None,
             char_width: 12,  // Vector font character width
             char_height: 20, // Vector font character height
+            dirty: None,
         }
+    }
+
+    /// Expand the dirty bounding box to include the `w`×`h` region at `(x, y)`.
+    fn mark_dirty(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        let (x1, y1) = (x + w, y + h);
+        self.dirty = Some(match self.dirty {
+            Some((dx0, dy0, dx1, dy1)) => (dx0.min(x), dy0.min(y), dx1.max(x1), dy1.max(y1)),
+            None => (x, y, x1, y1),
+        });
+    }
+
+    /// Take the accumulated dirty region (clamped to the screen) and clear it.
+    /// Returns `(x, y, width, height)`, or `None` if nothing changed.
+    pub fn take_dirty(&mut self) -> Option<(usize, usize, usize, usize)> {
+        let (x0, y0, x1, y1) = self.dirty.take()?;
+        let x1 = x1.min(self.width);
+        let y1 = y1.min(self.height);
+        if x1 <= x0 || y1 <= y0 { return None; }
+        Some((x0, y0, x1 - x0, y1 - y0))
     }
 
     /// Initialize vector font
@@ -91,6 +117,7 @@ impl Framebuffer {
                 let offset = y * (self.pitch / 4) + x;
                 self.base.add(offset).write_volatile(color);
             }
+            self.mark_dirty(x, y, 1, 1);
         }
     }
 
@@ -328,6 +355,10 @@ impl Framebuffer {
             core::ptr::write_bytes(self.base.add(bottom_start), 0, 8 * (self.pitch / 4));
         }
         self.cursor_y -= 8;
+        // The scroll rewrote the whole surface via raw memory ops (bypassing
+        // set_pixel), so the entire screen must be re-transmitted.
+        let (w, h) = (self.width, self.height);
+        self.mark_dirty(0, 0, w, h);
     }
 
     /// Scroll screen for vector font
@@ -344,6 +375,9 @@ impl Framebuffer {
             core::ptr::write_bytes(self.base.add(bottom_start), 0, self.char_height * (self.pitch / 4));
         }
         self.cursor_y -= self.char_height;
+        // Whole surface rewritten via raw memory ops — mark it all dirty.
+        let (w, h) = (self.width, self.height);
+        self.mark_dirty(0, 0, w, h);
     }
 }
 
@@ -414,13 +448,17 @@ pub fn fb_putc(c: u8) {
 /// yet initialised) so that set_scanout(1, 0, 0) is never sent to the host.
 #[no_mangle]
 pub fn fb_flush() {
-    let (width, height) = {
-        let fb = KERNEL_FB.lock();
-        (fb.width as u32, fb.height as u32)
+    // Pull (and clear) the changed region under the KERNEL_FB lock, then release
+    // it before taking the VIRTIO_GPU lock to preserve lock ordering.
+    let rect = {
+        let mut fb = KERNEL_FB.lock();
+        if fb.width == 0 || fb.height == 0 { return; }
+        fb.take_dirty()
     };
-    if width == 0 || height == 0 { return; }
-    if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-        gpu.flush(1, 0, 0, width, height);
+    if let Some((x, y, w, h)) = rect {
+        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+            gpu.flush(1, x as u32, y as u32, w as u32, h as u32);
+        }
     }
 }
 
