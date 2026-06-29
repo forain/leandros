@@ -63,9 +63,21 @@ pub unsafe fn map_4k(pgd_phys: *mut u64, virt: usize, phys: usize, flags: PageDe
     let l2 = (virt >> 21) & 0x1FF;
     let l3 = (virt >> 12) & 0x1FF;
 
-    let p1 = match ensure_table(pgd, l0) { Some(p) => mm::phys_to_virt(p as usize) as *mut u64, None => return false };
-    let p2 = match ensure_table(p1,  l1) { Some(p) => mm::phys_to_virt(p as usize) as *mut u64, None => return false };
-    let p3 = match ensure_table(p2,  l2) { Some(p) => mm::phys_to_virt(p as usize) as *mut u64, None => return false };
+    let p1 = match ensure_table(pgd, l0) {
+        Ensure::Table(p) => mm::phys_to_virt(p as usize) as *mut u64,
+        Ensure::Block    => return true,  // already mapped by a larger block
+        Ensure::Oom      => return false,
+    };
+    let p2 = match ensure_table(p1, l1) {
+        Ensure::Table(p) => mm::phys_to_virt(p as usize) as *mut u64,
+        Ensure::Block    => return true,
+        Ensure::Oom      => return false,
+    };
+    let p3 = match ensure_table(p2, l2) {
+        Ensure::Table(p) => mm::phys_to_virt(p as usize) as *mut u64,
+        Ensure::Block    => return true,
+        Ensure::Oom      => return false,
+    };
 
     // L3 entry: page descriptor (bit 1 = 1, bit 0 = 1).
     let final_entry = phys as u64 | flags.bits() | 0b11;
@@ -100,27 +112,40 @@ pub unsafe fn unmap_4k(pgd_phys: *mut u64, virt: usize) {
     p3.add(l3).write(0);
 }
 
-/// Returns `Some(ptr)` if the intermediate table at `parent[idx]` exists or
-/// was just allocated, or `None` on OOM.
-unsafe fn ensure_table(parent: *mut u64, idx: usize) -> Option<*mut u64> {
+/// Outcome of resolving an intermediate page-table level.
+enum Ensure {
+    /// The next-level table (physical pointer).
+    Table(*mut u64),
+    /// A valid block descriptor already maps this region. Callers mapping HHDM
+    /// device ranges treat this as success: the block is an identity-offset
+    /// mapping, so the target VA already resolves to the intended physical page.
+    Block,
+    /// Could not allocate an intermediate table (out of memory).
+    Oom,
+}
+
+/// Resolve `parent[idx]` to its next-level table, allocating one if absent.
+unsafe fn ensure_table(parent: *mut u64, idx: usize) -> Ensure {
     let entry = parent.add(idx).read();
     if entry & PageDescFlags::VALID.bits() != 0 {
-        // If this is a block (not a table), we can't traverse deeper.
-        // Bit 1 is 1 for table (L0-L2) or page (L3).
+        // Bit 1 is 1 for a table (L0-L2) or page (L3); 0 marks a block.
         if entry & 0b10 == 0 {
-            return None;
+            return Ensure::Block;
         }
         // Table is already present; extract the physical address.
-        return Some((entry & 0x0000_FFFF_FFFF_F000) as *mut u64);
+        return Ensure::Table((entry & 0x0000_FFFF_FFFF_F000) as *mut u64);
     }
-    let table_phys = mm::buddy::alloc(0)? as *mut u64;
+    let table_phys = match mm::buddy::alloc(0) {
+        Some(p) => p as *mut u64,
+        None => return Ensure::Oom,
+    };
     let table_virt = mm::phys_to_virt(table_phys as usize) as *mut u8;
     table_virt.write_bytes(0, mm::buddy::PAGE_SIZE);
 
     parent.add(idx).write(
         table_phys as u64 | PageDescFlags::TABLE.bits() | PageDescFlags::VALID.bits()
     );
-    Some(table_phys)
+    Ensure::Table(table_phys)
 }
 
 // ── arch_map_page / arch_unmap_page ──────────────────────────────────────────
