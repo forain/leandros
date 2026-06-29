@@ -111,6 +111,10 @@ pub extern "C" fn serial_write_byte(b: u8) {
     
     if !IN_WRITE.swap(true, core::sync::atomic::Ordering::SeqCst) {
         drivers::framebuffer::fb_putc(b);
+        // fb_flush only transfers the dirty region (typically a single character
+        // cell), so flushing per character is cheap and keeps the shell prompt
+        // and typed input visible.  On x86 the framebuffer is a host-visible
+        // linear surface and fb_flush is a no-op.
         drivers::framebuffer::fb_flush();
         IN_WRITE.store(false, core::sync::atomic::Ordering::SeqCst);
     }
@@ -517,7 +521,41 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             );
             serial_print_str("[MAIN] Framebuffer console initialized.\n");
         } else {
-            serial_print_str("[MAIN] No framebuffer base in boot info.\n");
+            // No bootloader-provided framebuffer.  This is the normal case on
+            // AArch64 with virtio-gpu-pci: unlike x86 virtio-vga, it exposes no
+            // VGA/GOP linear framebuffer for Limine to report.  Bring up the
+            // VirtIO GPU ourselves and create a scanout-backed RAM surface so the
+            // kernel console has somewhere to draw.
+            serial_print_str("[MAIN] No bootloader framebuffer; trying VirtIO GPU...\n");
+            // Defaults used only if the GPU does not report a preferred mode;
+            // setup_console_framebuffer returns the dimensions actually programmed.
+            const DEFAULT_WIDTH: u32 = 1024;
+            const DEFAULT_HEIGHT: u32 = 768;
+            if let Some((fb_phys, fb_virt, width, height, pitch_bytes)) =
+                drivers::virtio_gpu::setup_console_framebuffer(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            {
+                serial_print_str("[MAIN] VirtIO GPU framebuffer at phys=");
+                serial_print_hex(fb_phys as usize);
+                serial_print_str(" virt=");
+                serial_print_hex(fb_virt);
+                serial_print_str(" ");
+                print_number(width);
+                serial_print_str("x");
+                print_number(height);
+                serial_print_str("\n");
+
+                vfs_server::set_framebuffer(fb_phys, width, height, pitch_bytes);
+                drivers::framebuffer::set_boot_framebuffer(fb_phys, width, height, pitch_bytes);
+                drivers::framebuffer::init_kernel_fb(
+                    fb_virt as *mut u32,
+                    width as usize,
+                    height as usize,
+                    pitch_bytes as usize,
+                );
+                serial_print_str("[MAIN] VirtIO GPU framebuffer console initialized.\n");
+            } else {
+                serial_print_str("[MAIN] No VirtIO GPU framebuffer available.\n");
+            }
         }
         
         serial_print_str("\n[LEANDROS] Kernel starting...\n");
