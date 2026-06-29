@@ -326,8 +326,45 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         }
         #[cfg(target_arch = "x86_64")]
         {
-            unsafe { 
+            unsafe {
                 BOOT_INFO = boot::multiboot2::parse(boot_info_addr);
+
+                // Direct boot via SeaBIOS multiboot1 (or PVH) provides no
+                // multiboot2 MBI, so parse() finds no memory map. Fall back to a
+                // fixed QEMU map. The PVH trampoline maps the low 2 GiB into the
+                // HHDM, so usable RAM must stay within that window.
+                if BOOT_INFO.memory_map_len == 0 {
+                    static mut FALLBACK_MM: [boot::MemoryRegion; 1] = [boot::MemoryRegion {
+                        base:   0x0010_0000,
+                        length: 0x7F00_0000 - 0x0010_0000,
+                        kind:   boot::MemoryType::Available,
+                    }];
+                    BOOT_INFO.memory_map = core::ptr::addr_of!(FALLBACK_MM) as *const boot::MemoryRegion;
+                    BOOT_INFO.memory_map_len = 1;
+
+                    // Reserve the kernel image (loaded at phys 0x10_0000; the
+                    // body is linked in the higher half, so subtract
+                    // KERNEL_OFFSET to recover the physical end) and the
+                    // fixed-address initrd, so the buddy allocator never hands
+                    // out frames aliasing them.
+                    const KERNEL_OFFSET: usize = 0xffff_ffff_8000_0000;
+                    extern "C" { static __bss_end: u8; }
+                    let kernel_end_phys =
+                        (core::ptr::addr_of!(__bss_end) as usize) - KERNEL_OFFSET;
+                    mm::buddy::reserve_range(0x0010_0000, kernel_end_phys);
+
+                    // initrd is placed here by run-qemu.sh's -device loader. The
+                    // trampoline identity-maps the low 2 GiB, so it is readable
+                    // now (before the HHDM/buddy come up) to size and reserve it.
+                    const INITRD_PHYS: usize = 0x1000_0000;
+                    let initrd_len = init::cpio_image_size(INITRD_PHYS);
+                    if initrd_len > 0 {
+                        mm::buddy::reserve_range(INITRD_PHYS, INITRD_PHYS + initrd_len);
+                        BOOT_INFO.initrd_base = INITRD_PHYS as u64;
+                        BOOT_INFO.initrd_size = initrd_len as u64;
+                    }
+                }
+
                 BOOT_INFO.hhdm_offset = hhdm_offset;
             }
         }
