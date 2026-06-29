@@ -230,11 +230,31 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         #[cfg(target_arch = "aarch64")]
         {
             let mut dtb_addr = boot_info_addr;
-            // First check if boot_info_addr looks valid
+            // First check if boot_info_addr (x0) looks valid. QEMU `-kernel`
+            // with an ELF image enters with x0 = 0 rather than the DTB pointer,
+            // so this usually fails and we fall through to the RAM scan below.
             if dtb_addr == 0 || !unsafe { boot::device_tree::is_valid_dtb(dtb_addr) } {
-                 dtb_addr = 0;
+                dtb_addr = 0;
             }
-            
+
+            // RAM scan: QEMU still synthesises a DTB (with /chosen initrd-start
+            // /-end and the pl011/pcie reg windows) and loads it into guest RAM
+            // even when x0 isn't set. The early page tables map 0..4GB through
+            // the HHDM, so scan that window for the FDT magic (0xD00DFEED).
+            // The DTB is page-aligned, so step by 4 KiB.
+            if dtb_addr == 0 {
+                let scan_start = 0x4000_0000usize + hhdm_offset as usize;
+                let scan_end   = 0x8000_0000usize + hhdm_offset as usize;
+                let mut a = scan_start;
+                while a < scan_end {
+                    if unsafe { boot::device_tree::is_valid_dtb(a) } {
+                        dtb_addr = a;
+                        break;
+                    }
+                    a += 0x1000;
+                }
+            }
+
             let boot_info = if dtb_addr != 0 {
                 unsafe { boot::device_tree::parse(dtb_addr) }
             } else {
@@ -262,6 +282,36 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             unsafe {
                 BOOT_INFO = boot_info;
                 BOOT_INFO.hhdm_offset = hhdm_offset;
+            }
+
+            // Direct boot: the DTB memory map calls *all* RAM available, unlike
+            // Limine which marks the kernel image and modules reserved. Reserve
+            // them here so the buddy allocator never hands out frames that alias
+            // the live kernel image (its page tables live in .bss) or the initrd
+            // — doing so corrupts page tables and faults with translation errors.
+            //
+            // Direct aarch64 links the kernel at KERNEL_VIRT = 0xffff_8000_0000_0000
+            // + KERNEL_PHYS = 0x4008_0000 (see linkers/aarch64-direct.ld).
+            const KERNEL_VIRT: usize = 0xffff_8000_0000_0000;
+            const KERNEL_PHYS: usize = 0x4008_0000;
+            extern "C" { static __bss_end: u8; }
+            let kernel_end_phys =
+                unsafe { core::ptr::addr_of!(__bss_end) as usize } - KERNEL_VIRT;
+            mm::buddy::reserve_range(KERNEL_PHYS, kernel_end_phys);
+
+            // The initrd is loaded at a fixed physical address by run-qemu.sh's
+            // `-device loader` (see scripts/run-qemu.sh). The early page tables
+            // still identity-map low RAM, so we can read it here (before the
+            // HHDM/buddy come up) to learn its real size, reserve exactly that,
+            // and record it in BootInfo for init/execve to use later.
+            const INITRD_PHYS: usize = 0x4800_0000;
+            let initrd_len = init::cpio_image_size(INITRD_PHYS);
+            if initrd_len > 0 {
+                mm::buddy::reserve_range(INITRD_PHYS, INITRD_PHYS + initrd_len);
+                unsafe {
+                    BOOT_INFO.initrd_base = INITRD_PHYS as u64;
+                    BOOT_INFO.initrd_size = initrd_len as u64;
+                }
             }
         }
         #[cfg(target_arch = "x86_64")]
