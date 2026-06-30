@@ -63,7 +63,7 @@ pub struct VmaRegion {
 /// Per-process address space.
 pub struct AddressSpace {
     pub page_table_root: usize,
-    pub regions: [Option<VmaRegion>; 8],
+    pub regions: Vec<Option<VmaRegion>>,
     /// Virtual address where the heap begins (set by ELF loader; 0 = no heap).
     pub heap_start: usize,
     /// Current heap break (end of heap VMA).
@@ -101,9 +101,10 @@ impl Drop for AddressSpace {
 
 impl AddressSpace {
     pub fn new(page_table_root: usize) -> Self {
+        const NONE: Option<VmaRegion> = None;
         Self {
             page_table_root,
-            regions: [None, None, None, None, None, None, None, None],
+            regions: alloc::vec![NONE; 128],
             heap_start: 0,
             heap_end: 0,
         }
@@ -119,7 +120,10 @@ impl AddressSpace {
         // Find a free VMA slot.
         let slot = match self.regions.iter().position(|r| r.is_none()) {
             Some(i) => i,
-            None    => return false,
+            None    => {
+                self.regions.push(None);
+                self.regions.len() - 1
+            }
         };
 
         // Align virt down and size up to page granularity.
@@ -194,7 +198,10 @@ impl AddressSpace {
         // Find a free VMA slot.
         let slot = match self.regions.iter().position(|r| r.is_none()) {
             Some(i) => i,
-            None    => return false,
+            None    => {
+                self.regions.push(None);
+                self.regions.len() - 1
+            }
         };
 
         // Align virt/phys down and size up to page granularity.
@@ -257,18 +264,23 @@ impl AddressSpace {
 
         let slot = match self.regions.iter().position(|r| r.is_none()) {
             Some(i) => i,
-            None    => return false,
+            None    => {
+                self.regions.push(None);
+                self.regions.len() - 1
+            }
         };
 
         let virt  = virt & !(PAGE_SIZE - 1);
         let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
         let end   = match virt.checked_add(pages * PAGE_SIZE) {
             Some(e) => e,
-            None    => return false, // overflow → reject
+            None    => return false,
         };
 
         for r in self.regions.iter().filter_map(|r| r.as_ref()) {
-            if virt < r.end && end > r.start { return false; }
+            if virt < r.end && end > r.start {
+                return false;
+            }
         }
 
         self.regions[slot] = Some(VmaRegion {
@@ -308,17 +320,15 @@ impl AddressSpace {
         };
 
         if !region.lazy {
-            // The page should already be present; this is not a demand-paging
-            // fault — likely a protection fault.  Signal as unhandled.
             return false;
         }
 
         // Compute the page index within this VMA.
         let page_idx = (page_va - region.start) / PAGE_SIZE;
 
-        // If this page was already faulted in, it is a protection fault.
-        if region.lazy_pages.get(page_idx).copied().unwrap_or(0) != 0 {
-            return false;
+        let lazy_phys = region.lazy_pages.get(page_idx).copied().unwrap_or(0);
+        if lazy_phys != 0 {
+            return false; // page already present (protection fault)
         }
 
         // Allocate one physical page for this fault.

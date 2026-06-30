@@ -247,7 +247,8 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
             unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
             return; // fault handled — resume user task
         }
-        serial_str(b"user page fault CR2=0x"); serial_hex64(cr2);
+        serial_str(b"user page fault RIP=0x"); serial_hex64(frame.ip);
+        serial_str(b" CR2=0x"); serial_hex64(cr2);
         serial_str(b" CR3=0x"); serial_hex64(cr3);
         serial_str(b" err=0x"); serial_hex64(error_code);
         serial_str(b": task killed\r\n");

@@ -125,6 +125,10 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
         //   DFSC 0x04..=0x07 = translation fault (levels 0–3 ⇒ page not present).
         let dfsc = esr & 0x3F;
         if ec == 0x24 || ec == 0x20 {
+            if (0x04..=0x07).contains(&dfsc) && sched::handle_page_fault(far as usize) {
+                return; // page mapped — resume EL0 and retry the faulting access
+            }
+            
             serial_print_str("[FAULT] far=");
             print_hex(far as usize);
             serial_print_str(" dfsc=");
@@ -132,11 +136,6 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
             serial_print_str(" elr=");
             print_hex(elr as usize);
             serial_print_str("\n");
-            
-            if (0x04..=0x07).contains(&dfsc) && sched::handle_page_fault(far as usize) {
-                serial_print_str("[FAULT HANDLED]\n");
-                return; // page mapped — resume EL0 and retry the faulting access
-            }
         }
 
         serial_print_str("\n[EXC] EL0 Fault! PID=");
