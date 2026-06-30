@@ -37,18 +37,23 @@ struct VirtqDesc {
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
+// The avail/used rings are variable length (one entry per queue slot), sized
+// at runtime from the negotiated queue_size.  The `ring` field is a flexible
+// array: it carries no entries in the struct itself, and the ring is always
+// accessed through an explicit byte offset past the 4-byte header so the entry
+// count is bounded by the queue size rather than a hardcoded array length.
 #[repr(C, packed)]
 struct VirtqAvail {
     flags: u16,
     idx: u16,
-    ring: [u16; 32], // Minimal size
+    ring: [u16; 0],
 }
 
 #[repr(C, packed)]
 struct VirtqUsed {
     flags: u16,
     idx: u16,
-    ring: [VirtqUsedElem; 32],
+    ring: [VirtqUsedElem; 0],
 }
 
 #[repr(C, packed)]
@@ -132,7 +137,8 @@ impl VirtioQueue {
     unsafe fn submit(&mut self, head: u16) {
         let a = self.avail;
         let ring_idx = (*a).idx as usize % self.size as usize;
-        // Use manual offset to avoid out-of-bounds on the 32-element ring array
+        // The avail ring is a flexible array starting 4 bytes in (past flags +
+        // idx); index it explicitly, bounded by the negotiated queue size.
         let ring_ptr = (a as usize + 4) as *mut u16;
         ring_ptr.add(ring_idx).write_volatile(head);
         
@@ -393,30 +399,48 @@ impl VirtioGpuDevice {
 
     unsafe fn setup_queue(&mut self, id: u16) -> Option<VirtioQueue> {
         (*self.common_cfg).queue_select = id;
-        let size = (*self.common_cfg).queue_size;
-        if size == 0 { return None; }
-        
+        let max_size = (*self.common_cfg).queue_size;
+        if max_size == 0 { return None; } // 0 ⇒ queue unavailable
+
+        // Each ring lives in a single 4 KiB page allocated below.  The binding
+        // constraint is the descriptor table at 16 bytes/entry → 256 entries
+        // per page (the avail ring fits ≤2045, the used ring ≤511).  A device
+        // is free to advertise a larger queue, so cap to what fits and round
+        // down to a power of two (queue_size must be a power of two), then
+        // negotiate the reduced size back to the device.  This driver issues
+        // commands synchronously — one descriptor chain outstanding at a time —
+        // so even a small queue is ample.
+        const MAX_FIT: u16 = (4096 / core::mem::size_of::<VirtqDesc>()) as u16; // 256
+        let capped = max_size.min(MAX_FIT);
+        // floor to a power of two; `capped` is in [1, 256] here.
+        let size = 1u16 << (15 - capped.leading_zeros() as u16);
+        if size < 2 { return None; } // need ≥2 descriptors per command chain
+        if size != max_size {
+            // The driver may reduce queue_size before enabling the queue.
+            (*self.common_cfg).queue_size = size;
+        }
+
         let notify_off = (*self.common_cfg).queue_notify_off;
-        
+
         // Allocate descriptors, avail ring, and used ring
         let desc_phys = mm::buddy::alloc(0)?;
         let avail_phys = mm::buddy::alloc(0)?;
         let used_phys = mm::buddy::alloc(0)?;
-        
+
         let desc = mm::phys_to_virt(desc_phys) as *mut VirtqDesc;
         let avail = mm::phys_to_virt(avail_phys) as *mut VirtqAvail;
         let used = mm::phys_to_virt(used_phys) as *mut VirtqUsed;
-        
+
         core::ptr::write_bytes(desc as *mut u8, 0, 4096);
         core::ptr::write_bytes(avail as *mut u8, 0, 4096);
         core::ptr::write_bytes(used as *mut u8, 0, 4096);
-        
+
         // Link all descriptors into a free list chain
         for i in 0..(size - 1) {
             (*desc.add(i as usize)).next = i + 1;
         }
         (*desc.add((size - 1) as usize)).next = 0xFFFF; // Mark end of chain
-        
+
         (*self.common_cfg).queue_desc = desc_phys as u64;
         (*self.common_cfg).queue_driver = avail_phys as u64;
         (*self.common_cfg).queue_device = used_phys as u64;
@@ -663,6 +687,15 @@ impl VirtioGpuDevice {
         self.send_command_raw(flush_data).is_ok()
     }
 
+    /// True once a scanout resource has been bound on this device, e.g. by the
+    /// early boot console in [`setup_console_framebuffer`].  The DRM/KMS handoff
+    /// checks this to reuse the existing RAM-backed surface instead of resetting
+    /// the device and re-creating resource 1 — a rebuild the host rejects
+    /// (resource already exists) that leaves the control queue wedged.
+    pub fn scanout_configured(&self) -> bool {
+        self.current_resource_id != 0
+    }
+
     pub fn send_command(&mut self, cmd: VirtioGpuCmd, data: &[u8]) -> Result<Vec<u8>, ()> {
         let q = self.queues[0].as_mut().ok_or(())?;
         if q.num_free < (if data.is_empty() { 2 } else { 3 }) { return Err(()); }
@@ -766,7 +799,13 @@ pub static VIRTIO_GPU: Mutex<Option<VirtioGpuDevice>> = Mutex::new(None);
 
 pub fn init() {
     let mut gpu = VIRTIO_GPU.lock();
-    *gpu = VirtioGpuDevice::new();
+    // Idempotent: only probe/reset the device the first time.  A second
+    // `VirtioGpuDevice::new()` would write `device_status = 0` (a full device
+    // reset) on a GPU that the early boot console has already configured,
+    // destroying its resources and scanout and wedging the control queue.
+    if gpu.is_none() {
+        *gpu = VirtioGpuDevice::new();
+    }
 }
 
 /// Bring up the VirtIO GPU and create a scanout-backed framebuffer in guest RAM.

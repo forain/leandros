@@ -102,7 +102,20 @@ impl KmsDriver {
         if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
             crate::pci::serial_debug("[KMS] VirtIO GPU available\n");
 
-            if let Some((limine_phys, width, height, _pitch)) = get_hardware_fb_info() {
+            if gpu.scanout_configured() {
+                // The early boot console (direct-boot path) already brought up
+                // the VirtIO GPU and bound a RAM-backed surface to resource 1 as
+                // scanout 0.  BOOT_FB and the kernel console already target that
+                // surface, so re-creating resource 1 here is both unnecessary and
+                // harmful: the host rejects the duplicate resource and the device
+                // reset wedges the control queue.  Reuse the existing scanout and
+                // only report its mode.
+                if let Some((_phys, width, height, _pitch)) = get_hardware_fb_info() {
+                    mode.width = width;
+                    mode.height = height;
+                }
+                crate::pci::serial_debug("[KMS] Reusing existing VirtIO GPU console scanout\n");
+            } else if let Some((limine_phys, width, height, _pitch)) = get_hardware_fb_info() {
                 crate::pci::serial_debug("[KMS] Limine FB at phys=");
                 crate::pci::serial_debug_hex(limine_phys as u32);
                 crate::pci::serial_debug(" ");
