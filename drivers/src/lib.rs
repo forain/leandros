@@ -23,6 +23,7 @@ pub mod drm_device_interface;
 pub mod virtio;
 pub mod virtio_gpu;
 pub mod virtio_blk;
+pub mod virtio_keyboard;
 
 /// Trait every driver server must implement.
 pub trait Driver {

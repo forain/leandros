@@ -61,7 +61,16 @@ pub fn on_tick() {
         core::arch::asm!("msr cntv_tval_el0, {}", in(reg) interval(),
                          options(nomem, nostack));
     }
-    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    let _count = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Poll VirtIO Keyboard
+    drivers::virtio_keyboard::poll_events();
+
+    // Poll UART for keyboard input and push to evdev.
+    while let Some(b) = unsafe { super::uart::getc() } {
+        evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2); // 2 = typematic/serial
+        evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
+    }
 
     sched::timer_tick_irq();
 }

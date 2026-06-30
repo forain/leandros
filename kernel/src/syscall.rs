@@ -2053,6 +2053,14 @@ fn read_input_byte() -> Option<u8> {
                 
                 // EV_KEY down (1) or serial typematic (2)
                 if ev.value == 1 || ev.value == 2 {
+                    if ev.value == 2 {
+                        // Serial input: code is already ASCII
+                        let c = ev.code;
+                        if c < 128 && (c > 31 || c == 10 || c == 13 || c == 9 || c == 127 || c == 8) {
+                            return Some(c as u8);
+                        }
+                        continue;
+                    }
                     let shifted = unsafe { SHIFT_PRESSED };
                     // Map standard Linux evdev scan codes back to ASCII for the kernel console
                     let ascii = match ev.code {

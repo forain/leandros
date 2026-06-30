@@ -157,4 +157,5 @@ fn init_timer() {
     if freq < MIN_FREQ || freq > MAX_FREQ {
         // Don't panic, just log if possible
     }
+    unsafe { timer::init(); }
 }

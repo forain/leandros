@@ -121,6 +121,7 @@ if [ "$BOOT_MODE" = "uefi" ]; then
             -drive if=none,id=data1,format=raw,file=f2fs-data1.img \
             -device virtio-blk-pci,drive=data1,disable-legacy=on \
             -device "$GPU_DEV" \
+            -device virtio-keyboard-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
     else
@@ -161,6 +162,7 @@ else
             -kernel "$KERNEL_ELF" \
             -device loader,file=initrd-aarch64.cpio,addr=0x48000000,force-raw=on \
             -device "$GPU_DEV" \
+            -device virtio-keyboard-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -net none \

@@ -28,6 +28,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         crate::print_number(p);
         serial_print_str("\n");
     }
+    drivers::virtio_keyboard::init();
 
     // Initialize DRM server and check for success
     if let Some(p) = drm_server::init(0) {

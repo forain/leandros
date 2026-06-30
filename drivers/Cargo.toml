@@ -8,4 +8,5 @@ leandros-lib = { path = "../lib" }
 ipc = { path = "../ipc" }
 mm = { path = "../mm" }
 boot = { path = "../boot" }
+evdev-server = { path = "../servers/evdev" }
 spin.workspace = true
