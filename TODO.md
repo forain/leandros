@@ -24,8 +24,7 @@ implementation (`mod x86_64` in `sched/src/signal.rs`) matching the SysV
 A real bug was caught and fixed during QEMU testing: the inserted x86-64 call
 clobbered `rax` (the live syscall return value) because the existing return path
 restores `rax` from the register, not from the stack — fixed by stashing it in a
-callee-saved register across the call. `sigaltstack` remains a stub on both
-architectures (still open).
+callee-saved register across the call.
 
 **Security follow-up, fixed 2026-06-30**: AArch64's `rt_sigreturn` path restored
 `spsr_el1` verbatim from the user-writable signal-stack frame, with no masking —
@@ -36,6 +35,25 @@ N/Z/C/V condition flags only (`SPSR_NZCV_MASK`), forcing everything else —
 exception level, AArch64/32 state, DAIF — back to the same `spsr_el1 == 0`
 baseline a freshly created thread starts with. Mirrors the x86-64 path, which
 never restores `cs`/`ss` from user memory and masks `rflags` the same way.
+
+**`sigaltstack`, completed 2026-06-30**: was a stub on both architectures
+(always reported `SS_DISABLE`, ignored the requested alt-stack, and reported
+the wrong `SS_DISABLE` value — 4 instead of the real Linux/relibc value 2,
+per `userland/relibc/src/header/signal/linux.rs`). Now real per-thread state:
+`Task::altstack_{sp,size,flags}` (`sched/src/task.rs`), get/set through
+`sched::{current_altstack, set_current_altstack}`, and a real
+`sched::sys_sigaltstack()` implementing Linux's `do_sigaltstack()` semantics —
+`SS_ONSTACK`/the `EPERM`-while-active check are derived from the live user SP
+at syscall time via `on_altstack()`, not stored as separate state. Wired into
+signal delivery on both architectures: `SA_ONSTACK` in `sigaction.sa_flags`
+now redirects the signal frame onto the configured alt-stack
+(`sigframe_base_sp()` in `sched/src/signal.rs`), falling back to the normal
+stack if no alt-stack is configured/enabled or if already executing on it
+(nested-signal case, matching Linux's `get_sigframe()`). New threads
+(`fork`/`clone`) start with no alt-stack configured, matching Linux's
+`copy_process()`, which resets `sas_ss_*` unconditionally for every new task.
+This closes out Priority 1 item 1 — both signal delivery and `sigaltstack`
+are now real on both architectures.
 
 ### 2. Complete Thread Management (Phase 4)
 **Why Critical**: Threads are fundamental to multitasking and application execution.

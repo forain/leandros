@@ -95,6 +95,16 @@ pub struct Task {
     pub cwd_len: usize,
     /// File-creation mask (POSIX umask).
     pub umask:   u32,
+
+    // ── Alternate signal stack (sigaltstack) ──────────────────────────────────
+    /// User-space base of the alternate signal stack; 0 if none configured.
+    pub altstack_sp:    usize,
+    /// Size in bytes of the alternate signal stack.
+    pub altstack_size:  usize,
+    /// `SS_DISABLE` (2) if no stack is configured (the default), else 0.
+    /// `SS_ONSTACK` is never stored here — it's derived from the live user
+    /// SP at query time, matching Linux's `on_sig_stack()`.
+    pub altstack_flags: u32,
 }
 
 impl Task {
@@ -145,6 +155,9 @@ impl Task {
             cwd: [0; 128],
             cwd_len: 1, // Default to "/"
             umask: 0o022,
+            altstack_sp: 0,
+            altstack_size: 0,
+            altstack_flags: 2, // SS_DISABLE
         };
         temp_task.cwd[0] = b'/';
 
@@ -382,6 +395,15 @@ impl Task {
         let umask_ptr = (dest as usize + core::mem::offset_of!(Task, umask)) as *mut u32;
         core::ptr::write_volatile(umask_ptr, 0o022);
 
+        let altstack_sp_ptr = (dest as usize + core::mem::offset_of!(Task, altstack_sp)) as *mut usize;
+        core::ptr::write_volatile(altstack_sp_ptr, 0);
+
+        let altstack_size_ptr = (dest as usize + core::mem::offset_of!(Task, altstack_size)) as *mut usize;
+        core::ptr::write_volatile(altstack_size_ptr, 0);
+
+        let altstack_flags_ptr = (dest as usize + core::mem::offset_of!(Task, altstack_flags)) as *mut u32;
+        core::ptr::write_volatile(altstack_flags_ptr, 2); // SS_DISABLE
+
         // Initialize signal_actions array with DEFAULT_SIGACTION
         let signal_actions_ptr = (dest as usize + core::mem::offset_of!(Task, signal_actions)) as *mut [SigAction; 64];
         for i in 0..64 {
@@ -448,6 +470,9 @@ impl Task {
             cwd: [0; 128],
             cwd_len: 1, // Default to "/"
             umask: 0o022,
+            altstack_sp: 0,
+            altstack_size: 0,
+            altstack_flags: 2, // SS_DISABLE
         };
         task.cwd[0] = b'/';
 

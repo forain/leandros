@@ -18,7 +18,7 @@ pub mod signal;
 pub mod task;
 
 pub use clone::{fork_current, clone_thread};
-pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask};
+pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack};
 pub use futex::{futex_wait, futex_wake};
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -188,6 +188,26 @@ pub fn set_cwd(path: &[u8]) -> bool {
         return true;
     }
     false
+}
+
+/// Returns the current thread's configured alternate signal stack as
+/// `(ss_sp, ss_size, ss_flags)`. `ss_flags` is 0 (enabled) or `SS_DISABLE`
+/// (2) — never `SS_ONSTACK`, which callers derive from the live user SP.
+pub fn current_altstack() -> (usize, usize, u32) {
+    let pid = current_pid();
+    RUN_QUEUE.lock().find_pid(pid)
+        .map(|t| (t.altstack_sp, t.altstack_size, t.altstack_flags))
+        .unwrap_or((0, 0, 2)) // SS_DISABLE
+}
+
+/// Sets the current thread's alternate signal stack.
+pub fn set_current_altstack(sp: usize, size: usize, flags: u32) {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        t.altstack_sp    = sp;
+        t.altstack_size  = size;
+        t.altstack_flags = flags;
+    }
 }
 
 pub fn set_pgid(pid: Pid, pgid: Pid) -> bool {

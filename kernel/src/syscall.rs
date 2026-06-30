@@ -14,7 +14,7 @@ use crate::{serial_print_str, serial_write_raw, BOOT_INFO_PTR, init};
 use ipc::{Message, port};
 use sched::{
     fork_current, clone_thread,
-    sys_sigaction, sys_sigprocmask, restore_signal_frame,
+    sys_sigaction, sys_sigprocmask, sys_sigaltstack, restore_signal_frame,
     current_pid, current_ppid,
     ticks, yield_now, exit, spawn_user,
     deliver_signal, pending_signals, clear_pending_signal, replace_signal_mask,
@@ -784,7 +784,7 @@ fn dispatch_inner(
         TGKILL    => sys_tgkill(a0, a1, a2),
 
         // ── Signal helpers ────────────────────────────────────────────────────
-        SIGALTSTACK => sys_sigaltstack(a0, a1),
+        SIGALTSTACK => sys_sigaltstack(a0, a1, frame_ptr),
 
         // ── Resource limits ───────────────────────────────────────────────────
         GETRLIMIT  => sys_getrlimit(a0, a1),
@@ -2318,23 +2318,6 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
 fn sys_tgkill(_tgid: usize, tid: usize, sig: usize) -> isize {
     if sig >= 64 { return -22; } // EINVAL
     sched::deliver_signal(tid as u32, sig as u32)
-}
-
-/// sys_sigaltstack(ss, oss) — set/get alternate signal stack.
-///
-/// Stub: the kernel does not use an alternate signal stack yet.
-/// If `oss` is non-null, return a zeroed `stack_t` (SS_DISABLE).
-fn sys_sigaltstack(_ss: usize, oss: usize) -> isize {
-    // struct stack_t { ss_sp: *void (8), ss_flags: int (4), _pad (4), ss_size: usize (8) }
-    // = 24 bytes.  SS_DISABLE = 4 in ss_flags.
-    if oss != 0 && validate_user_buf(oss, 24) {
-        unsafe {
-            core::ptr::write_bytes(oss as *mut u8, 0, 24);
-            // ss_flags at offset 8: SS_DISABLE = 4
-            core::ptr::write((oss + 8) as *mut u32, 4);
-        }
-    }
-    0
 }
 
 // ── Misc syscalls ─────────────────────────────────────────────────────────────

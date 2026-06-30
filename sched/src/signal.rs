@@ -33,6 +33,14 @@
 const SA_RESTORER:  u32 = 0x04000000;
 const SA_NODEFER:   u32 = 0x40000000;
 const SA_RESETHAND: u32 = 0x80000000;
+const SA_ONSTACK:   u32 = 0x08000000;
+
+// ── sigaltstack() ss_flags bits (Linux values; relibc's
+// `header::signal::linux` is the source of truth, not generic Linux docs —
+// it previously diverged here: an earlier draft of this stub used 4). ──────
+const SS_ONSTACK:  u32 = 1;
+const SS_DISABLE:  u32 = 2;
+const MINSIGSTKSZ: usize = 2048;
 
 // Signals whose SIG_DFL action is "ignore" (bit N = signal N+1 is default-ignore).
 //   SIGCHLD = 17  (bit 16)
@@ -132,7 +140,7 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                     0 // no restorer — signal handler must not return
                 };
 
-                if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask) {
+                if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask, action.flags) {
                     // Frame write failed (stack fault) — deliver SIGSEGV.
                     super::exit(128 + SIGSEGV as i32);
                 }
@@ -207,23 +215,102 @@ pub fn sys_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
     }
 }
 
+/// sys_sigaltstack(ss, oss) — set/get the calling thread's alternate signal
+/// stack (per-thread state, like `signal_mask`, not shared across the
+/// thread group the way `signal_actions` is).
+///
+/// `frame_ptr` supplies the live user SP so we can tell whether the thread
+/// is currently executing on its alt-stack — needed both to report
+/// `SS_ONSTACK` in `oss` and to reject (`EPERM`) an attempt to change an
+/// alt-stack that's actively in use, matching Linux's `do_sigaltstack()`.
+pub fn sys_sigaltstack(ss_ptr: usize, oss_ptr: usize, frame_ptr: usize) -> isize {
+    let (cur_sp, cur_size, cur_flags) = super::current_altstack();
+    let user_sp = arch_current_user_sp(frame_ptr);
+    let active = cur_flags & SS_DISABLE == 0 && on_altstack(user_sp, cur_sp, cur_size);
+
+    if oss_ptr != 0 {
+        let report_flags = if active { SS_ONSTACK } else { cur_flags };
+        unsafe {
+            core::ptr::write(oss_ptr as *mut usize, cur_sp);
+            core::ptr::write((oss_ptr + 8) as *mut u32, report_flags);
+            core::ptr::write((oss_ptr + 16) as *mut usize, cur_size);
+        }
+    }
+
+    if ss_ptr != 0 {
+        if active { return -1; } // EPERM — alt-stack is in use
+        let new_sp    = unsafe { core::ptr::read(ss_ptr as *const usize) };
+        let new_flags = unsafe { core::ptr::read((ss_ptr + 8) as *const u32) };
+        let new_size  = unsafe { core::ptr::read((ss_ptr + 16) as *const usize) };
+
+        if new_flags & !SS_DISABLE != 0 { return -22; } // EINVAL — unknown flag bits
+        if new_flags & SS_DISABLE != 0 {
+            super::set_current_altstack(0, 0, SS_DISABLE);
+        } else {
+            if new_size < MINSIGSTKSZ { return -12; } // ENOMEM — too small
+            super::set_current_altstack(new_sp, new_size, 0);
+        }
+    }
+    0
+}
+
 // ── Arch dispatch ─────────────────────────────────────────────────────────────
 
+/// True if `sp` falls within `[alt_sp, alt_sp + alt_size)`. Mirrors Linux's
+/// `on_sig_stack()`; used both to compute `SS_ONSTACK` for `sigaltstack()`
+/// and to decide whether `SA_ONSTACK` delivery should reuse the current SP
+/// instead of restarting at the top of the alt-stack (nested-signal case).
+fn on_altstack(sp: usize, alt_sp: usize, alt_size: usize) -> bool {
+    alt_size != 0 && sp.wrapping_sub(alt_sp) < alt_size
+}
+
+/// Computes the base stack pointer signal delivery should build the frame
+/// below: the alt-stack's top, if `SA_ONSTACK` is set on the handler, a
+/// usable (non-disabled, non-empty) alt-stack is configured, and the thread
+/// isn't already executing on it. The "already on it" check keeps a nested
+/// signal delivered onto an active alt-stack growing that same stack
+/// downward instead of restarting at its top — matching Linux's
+/// `get_sigframe()`. Otherwise, just the thread's current user SP.
+fn sigframe_base_sp(old_sp: usize, action_flags: u32) -> usize {
+    if action_flags & SA_ONSTACK == 0 { return old_sp; }
+    let (alt_sp, alt_size, alt_flags) = super::current_altstack();
+    if alt_flags & SS_DISABLE == 0 && alt_size != 0 && !on_altstack(old_sp, alt_sp, alt_size) {
+        alt_sp + alt_size
+    } else {
+        old_sp
+    }
+}
+
+/// Reads the live user stack pointer out of the `UserFrame` at `frame_ptr`,
+/// or 0 if there is no frame (matches `current_altstack()`'s disabled
+/// default, which never reports `SS_ONSTACK` either way).
+fn arch_current_user_sp(frame_ptr: usize) -> usize {
+    if frame_ptr == 0 { return 0; }
+    let user_frame = unsafe { &*(frame_ptr as *const crate::context::UserFrame) };
+    #[cfg(target_arch = "aarch64")]
+    return user_frame.sp_el0 as usize;
+    #[cfg(target_arch = "x86_64")]
+    return user_frame.rsp as usize;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    { let _ = user_frame; 0 }
+}
+
 fn arch_prepare_signal_frame(
-    frame_ptr: usize,
-    sig:       u32,
-    handler:   usize,
-    restorer:  usize,
-    old_mask:  u64,
+    frame_ptr:    usize,
+    sig:          u32,
+    handler:      usize,
+    restorer:     usize,
+    old_mask:     u64,
+    action_flags: u32,
 ) -> bool {
     #[cfg(target_arch = "aarch64")]
-    return aarch64::prepare(frame_ptr, sig, handler, restorer, old_mask);
+    return aarch64::prepare(frame_ptr, sig, handler, restorer, old_mask, action_flags);
 
     #[cfg(target_arch = "x86_64")]
-    return x86_64::prepare(frame_ptr, sig, handler, restorer, old_mask);
+    return x86_64::prepare(frame_ptr, sig, handler, restorer, old_mask, action_flags);
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    { let _ = (frame_ptr, sig, handler, restorer, old_mask); false }
+    { let _ = (frame_ptr, sig, handler, restorer, old_mask, action_flags); false }
 }
 
 fn arch_restore_signal_frame(frame_ptr: usize, pid: u32) {
@@ -290,17 +377,19 @@ mod aarch64 {
     /// Builds the frame in a kernel buffer and writes it page-by-page via the
     /// TGID leader's address space, which handles HHDM translation and lazy VMAs.
     pub fn prepare(
-        frame_ptr: usize,
-        sig:       u32,
-        handler:   usize,
-        restorer:  usize,
-        old_mask:  u64,
+        frame_ptr:    usize,
+        sig:          u32,
+        handler:      usize,
+        restorer:     usize,
+        old_mask:     u64,
+        action_flags: u32,
     ) -> bool {
         let user_frame = unsafe { &mut *(frame_ptr as *mut UserFrame) };
 
         // Compute new SP below the current user SP, 16-byte aligned.
         let old_sp = user_frame.sp_el0 as usize;
-        let new_sp = match old_sp.checked_sub(SIGFRAME_SIZE) {
+        let base_sp = super::sigframe_base_sp(old_sp, action_flags);
+        let new_sp = match base_sp.checked_sub(SIGFRAME_SIZE) {
             Some(p) => p & !15usize,
             None    => return false,
         };
@@ -475,11 +564,12 @@ mod x86_64 {
     /// Builds the frame in a kernel buffer and writes it page-by-page via the
     /// TGID leader's address space, mirroring the AArch64 `prepare()` above.
     pub fn prepare(
-        frame_ptr: usize,
-        sig:       u32,
-        handler:   usize,
-        restorer:  usize,
-        old_mask:  u64,
+        frame_ptr:    usize,
+        sig:          u32,
+        handler:      usize,
+        restorer:     usize,
+        old_mask:     u64,
+        action_flags: u32,
     ) -> bool {
         let user_frame = unsafe { &mut *(frame_ptr as *mut UserFrame) };
 
@@ -487,7 +577,8 @@ mod x86_64 {
         // as if `call handler` had just executed (rsp points at pretcode),
         // so rsp % 16 must equal 8, not 0.
         let old_sp = user_frame.rsp as usize;
-        let aligned = match old_sp.checked_sub(SIGFRAME_SIZE) {
+        let base_sp = super::sigframe_base_sp(old_sp, action_flags);
+        let aligned = match base_sp.checked_sub(SIGFRAME_SIZE) {
             Some(p) => p & !15usize,
             None    => return false,
         };
