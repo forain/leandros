@@ -21,7 +21,7 @@ pub use clone::{fork_current, clone_thread};
 pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask};
 pub use futex::{futex_wait, futex_wake};
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 use task::{Pid, Task, TaskState};
 use context::CpuContext;
@@ -30,6 +30,18 @@ use runqueue::RunQueue;
 static RUN_QUEUE:       Mutex<RunQueue> = Mutex::new(RunQueue::new());
 static NEXT_PID:        Mutex<Pid>      = Mutex::new(1);
 static TIMER_TICKS:     AtomicU64       = AtomicU64::new(0);
+
+// ── System IPC port cache (set by kernel init, read by proc/self/auxv) ───────
+static SYS_VFS_PORT:   AtomicU32 = AtomicU32::new(u32::MAX);
+static SYS_NET_PORT:   AtomicU32 = AtomicU32::new(u32::MAX);
+static SYS_AUDIO_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+pub fn set_vfs_port(p: u32)   { SYS_VFS_PORT.store(p, Ordering::Relaxed); }
+pub fn set_net_port(p: u32)   { SYS_NET_PORT.store(p, Ordering::Relaxed); }
+pub fn set_audio_port(p: u32) { SYS_AUDIO_PORT.store(p, Ordering::Relaxed); }
+pub fn get_vfs_port()   -> u32 { SYS_VFS_PORT.load(Ordering::Relaxed) }
+pub fn get_net_port()   -> u32 { SYS_NET_PORT.load(Ordering::Relaxed) }
+pub fn get_audio_port() -> u32 { SYS_AUDIO_PORT.load(Ordering::Relaxed) }
 /// Set by timer_tick_irq; cleared and acted on by preempt_check.
 static PREEMPT_NEEDED:  AtomicBool      = AtomicBool::new(false);
 /// Optional hook called with a PID just before its task slot is reclaimed.

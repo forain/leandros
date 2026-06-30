@@ -893,6 +893,27 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         return Some(0);
     }
 
+    if path == b"/proc/self/auxv" || path.ends_with(b"/auxv") {
+        // Mirror the auxv written to the user stack at execve time.
+        // MAME's leandros_sound driver reads this to discover AT_LEANDROS_AUDIO_PORT.
+        let entries: &[(u64, u64)] = &[
+            (6,   4096),                                           // AT_PAGESZ
+            (11,  0), (12, 0), (13, 0), (14, 0),                  // AT_UID/EUID/GID/EGID
+            (256, sched::get_vfs_port()   as u64),                 // AT_LEANDROS_VFS_PORT
+            (257, sched::get_net_port()   as u64),                 // AT_LEANDROS_NET_PORT
+            (258, sched::get_audio_port() as u64),                 // AT_LEANDROS_AUDIO_PORT
+            (0,   0),                                              // AT_NULL
+        ];
+        let bytes = entries.len() * 16;
+        if bytes <= TMP_BUF_SIZE {
+            for (i, &(k, v)) in entries.iter().enumerate() {
+                buf[i * 16..i * 16 + 8].copy_from_slice(&k.to_le_bytes());
+                buf[i * 16 + 8..i * 16 + 16].copy_from_slice(&v.to_le_bytes());
+            }
+            return Some(bytes);
+        }
+    }
+
     None
 }
 

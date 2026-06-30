@@ -43,6 +43,7 @@ const AT_LEANDROS_VFS_PORT: u64 = 256;
 /// Register the VFS server port so sys_execve can embed it in auxv.
 pub fn set_vfs_server_port(port: u32) {
     VFS_SERVER_PORT.store(port, Ordering::Relaxed);
+    sched::set_vfs_port(port);
 }
 
 /// IPC port of the net server; u32::MAX = not yet registered.
@@ -53,6 +54,7 @@ const AT_LEANDROS_NET_PORT: u64 = 257;
 
 pub fn set_net_server_port(port: u32) {
     NET_SERVER_PORT.store(port, Ordering::Relaxed);
+    sched::set_net_port(port);
 }
 
 /// IPC port of the audio server; u32::MAX = not yet registered.
@@ -63,6 +65,7 @@ const AT_LEANDROS_AUDIO_PORT: u64 = 258;
 
 pub fn set_audio_server_port(port: u32) {
     AUDIO_SERVER_PORT.store(port, Ordering::Relaxed);
+    sched::set_audio_port(port);
 }
 
 // ── VFS call helper ───────────────────────────────────────────────────────────
