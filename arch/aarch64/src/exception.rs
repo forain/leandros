@@ -114,6 +114,31 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
         let far: u64;
         core::arch::asm!("mrs {}, far_el1", out(reg) far);
 
+        // Demand paging: a translation fault on a lazily-mapped region (BSS,
+        // growable heap/stack) just means the page has not been backed yet.
+        // Fault it in and return — the vector's `ret_to_user` path then `eret`s
+        // back to ELR_EL1, retrying the faulting instruction.  This mirrors the
+        // x86_64 #PF handler, which the shared ELF loader relies on to zero-fill
+        // BSS pages where `p_memsz > p_filesz`.
+        //
+        //   EC 0x24 = data abort, 0x20 = instruction abort, both from a lower EL.
+        //   DFSC 0x04..=0x07 = translation fault (levels 0–3 ⇒ page not present).
+        let dfsc = esr & 0x3F;
+        if ec == 0x24 || ec == 0x20 {
+            serial_print_str("[FAULT] far=");
+            print_hex(far as usize);
+            serial_print_str(" dfsc=");
+            print_hex(dfsc as usize);
+            serial_print_str(" elr=");
+            print_hex(elr as usize);
+            serial_print_str("\n");
+            
+            if (0x04..=0x07).contains(&dfsc) && sched::handle_page_fault(far as usize) {
+                serial_print_str("[FAULT HANDLED]\n");
+                return; // page mapped — resume EL0 and retry the faulting access
+            }
+        }
+
         serial_print_str("\n[EXC] EL0 Fault! PID=");
         print_number(sched::current_pid());
         serial_print_str(" ESR=");

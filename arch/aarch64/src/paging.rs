@@ -83,6 +83,14 @@ pub unsafe fn map_4k(pgd_phys: *mut u64, virt: usize, phys: usize, flags: PageDe
     let final_entry = phys as u64 | flags.bits() | 0b11;
     p3.add(l3).write(final_entry);
 
+    // Publish the new leaf descriptor before any subsequent translation can
+    // observe a stale (invalid) entry.  This matters for demand paging: the
+    // EL0 fault handler maps a page and `eret`s straight back to the faulting
+    // instruction, whose re-walk runs immediately on the same PE.  An
+    // invalid→valid transition needs no TLBI (the architecture never caches
+    // faulting entries), so a store barrier is sufficient.
+    core::arch::asm!("dsb ishst", "isb", options(nostack, preserves_flags));
+
     true
 }
 
