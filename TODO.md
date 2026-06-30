@@ -5,12 +5,27 @@ This document outlines all missing functionality in the LeandrOS codebase that n
 
 ## Priority 1: Critical System Components (Immediate Implementation)
 
-### 1. Complete x86-64 Signal Handling (Phase 2)
+### 1. Complete x86-64 Signal Handling (Phase 2) — DONE 2026-06-30
 **Why Critical**: The kernel has signal infrastructure but only AArch64 is fully implemented. x86-64 signal delivery is incomplete.
 - Implement full x86-64 signal frame restoration
 - Complete signal delivery timing for x86-64
 - Add proper signal stack handling
 - Ensure both architectures are fully compatible
+
+**Actual root cause found**: `check_and_deliver_signals()` had no caller anywhere in
+either architecture's trap-return path — signal delivery was dead code on AArch64
+too, not just x86-64 as originally described here. Fixed by wiring it into the EL0
+return paths in `exception_asm.s` (syscall, fault, and IRQ, but not the EL1 IRQ
+path, which must not deliver user signals) and into the x86-64 `syscall_entry`
+return path in `arch/x86_64/src/syscall.rs`. Added a full x86-64 `rt_sigframe`
+implementation (`mod x86_64` in `sched/src/signal.rs`) matching the SysV
+`ucontext`/`mcontext` layout used by relibc's Linux-ABI signal trampoline
+(`__restore_rt`).
+A real bug was caught and fixed during QEMU testing: the inserted x86-64 call
+clobbered `rax` (the live syscall return value) because the existing return path
+restores `rax` from the register, not from the stack — fixed by stashing it in a
+callee-saved register across the call. `sigaltstack` remains a stub on both
+architectures (still open).
 
 ### 2. Complete Thread Management (Phase 4)
 **Why Critical**: Threads are fundamental to multitasking and application execution.

@@ -99,6 +99,8 @@ exc_el0_sync:
     mov  x1, x22             // elr
     mov  x2, sp              // frame
     bl   exc_el0_sync_handler
+    mov  x0, sp
+    bl   check_and_deliver_signals
     b    ret_to_user
 
 exc_el1_irq:
@@ -166,6 +168,8 @@ exc_el0_irq:
 
     mov  x0, sp
     bl   exc_el0_irq_handler
+    mov  x0, sp
+    bl   check_and_deliver_signals
 
     b    ret_to_user
 
@@ -180,6 +184,8 @@ exc_el0_irq:
     mov  x7, sp
     bl   syscall_dispatch
     str  x0, [sp, #0]        // result to frame.x0
+    mov  x0, sp
+    bl   check_and_deliver_signals
 
 .globl ret_to_user
 ret_to_user:

@@ -242,6 +242,22 @@ syscall_entry:
     // 7. Clean up stack args.
     add   rsp, 24
 
+    // 7b. Check for and deliver pending signals. RSP is now back at the
+    // UserFrame base (the same value passed as frame_ptr above), and
+    // check_and_deliver_signals may redirect rip/rsp/regs in place — the
+    // pops below re-read everything from this same memory, so any edits
+    // take effect automatically.
+    //
+    // rax holds syscall_dispatch's return value and must survive this call:
+    // step 8 below restores it via the live register (the "skip rax" pop),
+    // not by re-reading the stack, and rax is caller-saved so a plain call
+    // would clobber it. Stash it in rbx (callee-saved, and about to be
+    // overwritten by its own pop below regardless of what we put there now).
+    mov   rbx, rax
+    mov   rdi, rsp
+    call  check_and_deliver_signals
+    mov   rax, rbx
+
     // 8. Restore user registers.
     pop   r15
     pop   r14

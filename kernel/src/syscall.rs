@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use crate::{serial_print_str, serial_write_raw, BOOT_INFO_PTR, init};
 use ipc::{Message, port};
 use sched::{
-    fork_current, clone_thread, 
+    fork_current, clone_thread,
     sys_sigaction, sys_sigprocmask, restore_signal_frame,
     current_pid, current_ppid,
     ticks, yield_now, exit, spawn_user,
@@ -523,7 +523,8 @@ extern "C" { fn arch_alloc_page_table_root() -> usize; }
 /// Top-level syscall handler, invoked from the arch-specific trap stub.
 ///
 /// The `frame_ptr` argument carries the address of the `UserFrame` saved on
-/// the kernel stack by the AArch64 EL0 exception handler.  It is 0 on x86-64.
+/// the kernel stack by the trap entry path, on both AArch64 (EL0 exception
+/// handler) and x86-64 (SYSCALL entry trampoline).
 #[no_mangle]
 pub extern "C" fn syscall_dispatch(
     number: usize,
@@ -602,7 +603,7 @@ fn dispatch_inner(
         // ── Time ─────────────────────────────────────────────────────────────
         CLOCK_GETTIME => sys_clock_gettime(a0, a1),
 
-        // ── Signals (stubs — full implementation in Phase 2) ─────────────────
+        // ── Signals ────────────────────────────────────────────────────────
         RT_SIGACTION   => sys_rt_sigaction(a0, a1, a2),
         RT_SIGPROCMASK => sys_rt_sigprocmask(a0, a1, a2),
         RT_SIGRETURN   => sys_rt_sigreturn(frame_ptr),
@@ -1614,7 +1615,7 @@ fn sys_rt_sigreturn(frame_ptr: usize) -> isize {
     // user stack, including the signal mask.  The return value written into
     // the frame's x0 / rax slot will be overwritten by the restored context.
     restore_signal_frame(frame_ptr);
-    0 // only reached if frame_ptr == 0 (x86-64 stub path)
+    0 // overwritten by the restored rax/x0 unless frame_ptr was 0 (no active frame)
 }
 
 fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
