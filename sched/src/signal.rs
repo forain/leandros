@@ -65,10 +65,14 @@ pub fn check_and_deliver_signals(frame_ptr: usize) {
                 Some(t) => {
                     let unmasked = t.signal_pending & !t.signal_mask;
                     if unmasked == 0 { return; }
-                    let bit    = unmasked.trailing_zeros() as u32; // lowest pending
-                    let sig    = bit + 1;                          // 1-based signal number
-                    let action = t.signal_actions[bit as usize];
-                    let mask   = t.signal_mask;
+                    let bit  = unmasked.trailing_zeros() as u32;
+                    let sig  = bit + 1;
+                    let mask = t.signal_mask;
+                    // Signal disposition is shared across the thread group: read
+                    // from the TGID leader so all threads see installed handlers.
+                    let action = rq.find_pid(t.tgid)
+                        .map(|leader| leader.signal_actions[bit as usize])
+                        .unwrap_or(crate::task::DEFAULT_SIGACTION);
                     Some((sig, action, mask))
                 }
                 None => return,
@@ -83,17 +87,21 @@ pub fn check_and_deliver_signals(frame_ptr: usize) {
         // Clear the pending bit and update the signal mask under the lock.
         {
             let mut rq = super::RUN_QUEUE.lock();
+            let tgid = rq.find_pid(pid).map(|t| t.tgid).unwrap_or(0);
+            // Update thread-local pending/mask.
             if let Some(idx) = rq.find_pid_idx(pid) {
                 if let Some(t) = rq.get_mut(idx) {
                     t.signal_pending &= !(1u64 << (sig - 1));
-                    // Block the signal during its own handler (re-entrant delivery
-                    // guard) unless SA_NODEFER is set.
                     if action.flags & SA_NODEFER == 0 {
                         t.signal_mask |= (1u64 << (sig - 1)) | action.mask;
                     }
-                    // SA_RESETHAND: revert to SIG_DFL after first delivery.
-                    if action.flags & SA_RESETHAND != 0 {
-                        t.signal_actions[(sig - 1) as usize].handler = 0;
+                }
+            }
+            // SA_RESETHAND: revert to SIG_DFL on the shared (TGID leader) table.
+            if action.flags & SA_RESETHAND != 0 && tgid != 0 {
+                if let Some(idx) = rq.find_pid_idx(tgid) {
+                    if let Some(leader) = rq.get_mut(idx) {
+                        leader.signal_actions[(sig - 1) as usize].handler = 0;
                     }
                 }
             }
@@ -145,22 +153,26 @@ pub fn restore_signal_frame(frame_ptr: usize) {
 }
 
 pub fn sys_sigaction(signum: u32, act_ptr: usize, oldact_ptr: usize) -> isize {
+    if signum == 0 || signum > 64 { return -22; }
     let pid = unsafe { super::CURRENT_PID[super::cpu_id()] };
     let mut rq = super::RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
+    // Signal actions belong to the thread group — always read/write through leader.
+    let tgid = match rq.find_pid(pid) {
+        Some(t) => t.tgid,
+        None    => return -3,
+    };
+    if let Some(leader) = rq.find_pid_mut(tgid) {
         if oldact_ptr != 0 {
-            // Write old action to user space
-            // (Simplified: just write back the current action in the table)
-            let old = t.signal_actions[(signum - 1) as usize];
+            let old = leader.signal_actions[(signum - 1) as usize];
             unsafe { core::ptr::write(oldact_ptr as *mut crate::task::SigAction, old); }
         }
         if act_ptr != 0 {
             let new = unsafe { core::ptr::read(act_ptr as *const crate::task::SigAction) };
-            t.signal_actions[(signum - 1) as usize] = new;
+            leader.signal_actions[(signum - 1) as usize] = new;
         }
         0
     } else {
-        -3 // ESRCH
+        -3
     }
 }
 
@@ -240,7 +252,6 @@ mod aarch64 {
     const UC_OFFSET:          usize = SIGINFO_SIZE;              // 128
     const SIGMASK_OFFSET:     usize = UC_OFFSET + 8 + 8 + 24;   // 168
     const MCONTEXT_OFFSET:    usize = SIGMASK_OFFSET + 128;      // 296
-    const FAULT_ADDR_OFFSET:  usize = MCONTEXT_OFFSET;           // 296
     const REGS_OFFSET:        usize = MCONTEXT_OFFSET + 8;       // 304
     const SP_OFFSET:          usize = REGS_OFFSET + 31 * 8;      // 552
     const PC_OFFSET:          usize = SP_OFFSET + 8;             // 560
@@ -254,8 +265,8 @@ mod aarch64 {
     /// Write an AArch64 `rt_sigframe` onto the user stack and redirect the
     /// kernel's `UserFrame` to invoke `handler(sig, &siginfo, &uc)`.
     ///
-    /// Returns `false` if the user stack doesn't have a backed physical page
-    /// at the new SP.
+    /// Builds the frame in a kernel buffer and writes it page-by-page via the
+    /// TGID leader's address space, which handles HHDM translation and lazy VMAs.
     pub fn prepare(
         frame_ptr: usize,
         sig:       u32,
@@ -267,81 +278,67 @@ mod aarch64 {
 
         // Compute new SP below the current user SP, 16-byte aligned.
         let old_sp = user_frame.sp_el0 as usize;
-        // Guard against tiny or zero SP.
         let new_sp = match old_sp.checked_sub(SIGFRAME_SIZE) {
             Some(p) => p & !15usize,
             None    => return false,
         };
-        // The new SP must be in user space.
         if new_sp == 0 || new_sp >= 0x0000_8000_0000_0000 { return false; }
 
-        // Translate the first byte of the new SP to a physical address so we can
-        // write the frame.  The user stack is an eager VMA (contiguous physical
-        // pages), so the full SIGFRAME_SIZE fits at `frame_phys`.
-        let frame_phys: usize = {
+        // Build the signal frame in a kernel buffer (zeroed — the null
+        // _aarch64_ctx terminator at RESERVED_OFFSET falls in naturally).
+        let mut buf = alloc::vec![0u8; SIGFRAME_SIZE];
+
+        // siginfo: si_signo at offset 0.
+        buf[SI_SIGNO_OFFSET..SI_SIGNO_OFFSET + 4]
+            .copy_from_slice(&sig.to_le_bytes());
+
+        // uc_sigmask (restored on sigreturn).
+        buf[SIGMASK_OFFSET..SIGMASK_OFFSET + 8]
+            .copy_from_slice(&old_mask.to_le_bytes());
+
+        // uc_mcontext: save current user register state.
+        for i in 0..31 {
+            buf[REGS_OFFSET + i * 8..REGS_OFFSET + i * 8 + 8]
+                .copy_from_slice(&user_frame.x[i].to_le_bytes());
+        }
+        buf[SP_OFFSET..SP_OFFSET + 8]
+            .copy_from_slice(&user_frame.sp_el0.to_le_bytes());
+        buf[PC_OFFSET..PC_OFFSET + 8]
+            .copy_from_slice(&user_frame.elr_el1.to_le_bytes());
+        buf[PSTATE_OFFSET..PSTATE_OFFSET + 8]
+            .copy_from_slice(&user_frame.spsr_el1.to_le_bytes());
+
+        // Prefault any lazy stack pages and write via TGID leader's address
+        // space.  write_user_buf translates each page through the HHDM and
+        // handles non-contiguous physical pages, so no physical-contiguity
+        // assumption is needed.
+        let ok = {
             let pid = unsafe { super::super::CURRENT_PID[super::super::cpu_id()] };
-            let rq = super::super::RUN_QUEUE.lock();
-            let phys = rq.find_pid(pid)
-                .and_then(|t| t.address_space.as_ref())
-                .and_then(|a| a.virt_to_phys(new_sp));
-            match phys {
-                Some(p) => p,
+            let mut rq = super::super::RUN_QUEUE.lock();
+            let tgid = match rq.find_pid(pid) {
+                Some(t) => t.tgid,
                 None    => return false,
+            };
+            match rq.find_pid_mut(tgid).and_then(|t| t.address_space.as_mut()) {
+                Some(as_) => {
+                    as_.prefault_range(new_sp, SIGFRAME_SIZE);
+                    as_.write_user_buf(new_sp, &buf)
+                }
+                None => false,
             }
         };
+        if !ok { return false; }
 
-        // Zero the entire frame region (sets the null _aarch64_ctx terminator in
-        // __reserved[0..8] automatically, and clears all other fields).
-        unsafe {
-            (frame_phys as *mut u8).write_bytes(0, SIGFRAME_SIZE);
-        }
-
-        // ── siginfo ───────────────────────────────────────────────────────────
-        unsafe {
-            let base = frame_phys as *mut u8;
-            core::ptr::write(base.add(SI_SIGNO_OFFSET) as *mut u32, sig);
-            // si_code = 0 (SI_USER — signal sent from user space / kill())
-        }
-
-        // ── uc_sigmask (old mask, restored on sigreturn) ──────────────────────
-        unsafe {
-            core::ptr::write((frame_phys + SIGMASK_OFFSET) as *mut u64, old_mask);
-        }
-
-        // ── uc_mcontext: save current user register state ─────────────────────
-        unsafe {
-            let base = frame_phys as *mut u8;
-            // Fault address = 0 (not a fault-triggered signal).
-            core::ptr::write(base.add(FAULT_ADDR_OFFSET) as *mut u64, 0);
-            // GPRs x0-x30.
-            for i in 0..31 {
-                core::ptr::write(
-                    base.add(REGS_OFFSET + i * 8) as *mut u64,
-                    user_frame.x[i],
-                );
-            }
-            // SP, PC (ELR_EL1), PSTATE (SPSR_EL1).
-            core::ptr::write(base.add(SP_OFFSET)     as *mut u64, user_frame.sp_el0);
-            core::ptr::write(base.add(PC_OFFSET)     as *mut u64, user_frame.elr_el1);
-            core::ptr::write(base.add(PSTATE_OFFSET) as *mut u64, user_frame.spsr_el1);
-        }
-
-        // ── Redirect UserFrame to the signal handler ──────────────────────────
-        //
+        // Redirect UserFrame to the signal handler.
         // AArch64 signal calling convention (matches Linux):
-        //   x0  = signum
-        //   x1  = pointer to siginfo (at new_sp + 0)
-        //   x2  = pointer to ucontext (at new_sp + UC_OFFSET)
-        //   x30 = restorer address (so `ret` in the handler calls the restorer)
-        //   ELR_EL1 = handler entry point
-        //   SP_EL0  = new_sp
+        //   x0 = signum,  x1 = &siginfo (new_sp),  x2 = &ucontext (new_sp + UC_OFFSET)
+        //   x30 = restorer,  ELR_EL1 = handler,  SP_EL0 = new_sp
         user_frame.x[0]    = sig as u64;
         user_frame.x[1]    = new_sp as u64;
         user_frame.x[2]    = (new_sp + UC_OFFSET) as u64;
         user_frame.x[30]   = restorer as u64;
         user_frame.elr_el1 = handler as u64;
         user_frame.sp_el0  = new_sp as u64;
-        // spsr_el1 unchanged — keep EL0t mode
 
         true
     }
@@ -349,42 +346,43 @@ mod aarch64 {
     /// Restore user context from the saved `rt_sigframe` on the user stack.
     ///
     /// Called during `rt_sigreturn`: reads back GPRs, SP, PC, PSTATE, and the
-    /// signal mask from the frame that was placed on the user stack at delivery.
+    /// signal mask from the frame placed on the user stack at delivery time.
     pub fn restore(frame_ptr: usize, pid: u32) {
         let user_frame = unsafe { &mut *(frame_ptr as *mut UserFrame) };
 
-        // When rt_sigreturn is called, the user's SP points to the sigframe
-        // (it was set to `new_sp` at delivery time).
+        // On rt_sigreturn the user SP points at the sigframe set at delivery.
         let sigframe_virt = user_frame.sp_el0 as usize;
 
-        let frame_phys: usize = {
+        let mut buf = alloc::vec![0u8; SIGFRAME_SIZE];
+
+        // Read the frame via TGID leader's address space (handles HHDM and
+        // non-contiguous lazy pages).
+        let ok = {
             let rq = super::super::RUN_QUEUE.lock();
-            let phys = rq.find_pid(pid)
-                .and_then(|t| t.address_space.as_ref())
-                .and_then(|a| a.virt_to_phys(sigframe_virt));
-            match phys {
-                Some(p) => p,
-                None    => super::super::exit(128 + 11), // SIGSEGV — bad frame
+            let tgid = match rq.find_pid(pid) {
+                Some(t) => t.tgid,
+                None    => { super::super::exit(128 + 11); }
+            };
+            match rq.find_pid(tgid).and_then(|t| t.address_space.as_ref()) {
+                Some(as_) => as_.read_user_buf(sigframe_virt, &mut buf),
+                None      => false,
             }
         };
+        if !ok { super::super::exit(128 + 11); }
 
         // Restore GPRs from uc_mcontext.
-        unsafe {
-            let base = frame_phys as *const u8;
-            for i in 0..31 {
-                user_frame.x[i] = core::ptr::read(
-                    base.add(REGS_OFFSET + i * 8) as *const u64
-                );
-            }
-            user_frame.sp_el0   = core::ptr::read(base.add(SP_OFFSET)     as *const u64);
-            user_frame.elr_el1  = core::ptr::read(base.add(PC_OFFSET)     as *const u64);
-            user_frame.spsr_el1 = core::ptr::read(base.add(PSTATE_OFFSET) as *const u64);
+        for i in 0..31 {
+            user_frame.x[i] = u64::from_le_bytes(
+                buf[REGS_OFFSET + i * 8..REGS_OFFSET + i * 8 + 8].try_into().unwrap()
+            );
         }
+        user_frame.sp_el0   = u64::from_le_bytes(buf[SP_OFFSET..SP_OFFSET+8].try_into().unwrap());
+        user_frame.elr_el1  = u64::from_le_bytes(buf[PC_OFFSET..PC_OFFSET+8].try_into().unwrap());
+        user_frame.spsr_el1 = u64::from_le_bytes(buf[PSTATE_OFFSET..PSTATE_OFFSET+8].try_into().unwrap());
 
         // Restore the pre-handler signal mask from uc_sigmask.
-        let saved_mask = unsafe {
-            core::ptr::read((frame_phys + SIGMASK_OFFSET) as *const u64)
-        };
+        let saved_mask =
+            u64::from_le_bytes(buf[SIGMASK_OFFSET..SIGMASK_OFFSET+8].try_into().unwrap());
         {
             let mut rq = super::super::RUN_QUEUE.lock();
             if let Some(idx) = rq.find_pid_idx(pid) {

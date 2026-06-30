@@ -307,6 +307,7 @@ mod nr {
     pub const POSIX_FADVISE:       usize = 223;
     pub const SYNC_FILE_RANGE:     usize = 84;
     pub const READAHEAD:           usize = 213;
+    pub const GETCPU:              usize = 168;
 }
 
 // ── x86-64 Linux syscall numbers ──────────────────────────────────────────────
@@ -508,6 +509,7 @@ mod nr {
     pub const POSIX_FADVISE:       usize = 221;
     pub const SYNC_FILE_RANGE:     usize = 277;
     pub const READAHEAD:           usize = 187;
+    pub const GETCPU:              usize = 309;
 }
 
 use nr::*;
@@ -755,6 +757,7 @@ fn dispatch_inner(
         SCHED_SETAFFINITY  => 0,
         SCHED_GETAFFINITY  => sys_sched_getaffinity(a0, a1, a2),
         SCHED_GET_PRIORITY_MAX | SCHED_GET_PRIORITY_MIN => 0,
+        GETCPU             => sys_getcpu(a0, a1, a2),
 
         // ── Resource usage ────────────────────────────────────────────────────
         GETRUSAGE => sys_getrusage(a0, a1),
@@ -2409,6 +2412,19 @@ fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask_ptr: usize) -> isi
     unsafe { core::ptr::write_bytes(mask_ptr as *mut u8, 0, bytes); }
     // Set bit 0 — CPU 0 is available.
     if bytes > 0 { unsafe { *(mask_ptr as *mut u8) = 0x01; } }
+    bytes as isize
+}
+
+/// sys_getcpu(cpu_ptr, node_ptr, _tcache) — report CPU 0, NUMA node 0.
+fn sys_getcpu(cpu_ptr: usize, node_ptr: usize, _tcache: usize) -> isize {
+    if cpu_ptr != 0 {
+        if !validate_user_buf(cpu_ptr, 4) { return -14; }
+        unsafe { core::ptr::write_unaligned(cpu_ptr as *mut u32, 0); }
+    }
+    if node_ptr != 0 {
+        if !validate_user_buf(node_ptr, 4) { return -14; }
+        unsafe { core::ptr::write_unaligned(node_ptr as *mut u32, 0); }
+    }
     0
 }
 
@@ -3567,14 +3583,20 @@ fn sys_alarm(seconds: usize) -> isize {
 /// which has CLONE_VM clear.  On x86-64 `FORK` (57) routes directly in the
 /// dispatch table; this function only sees `CLONE` (56).
 fn sys_clone_or_fork(
-    flags:       usize,
-    child_stack: usize,
-    _ptid:       usize,
-    tls:         usize,
-    ctid:        usize,
+    a0:          usize,
+    a1:          usize,
+    a2:          usize,
+    a3:          usize,
+    a4:          usize,
     frame_ptr:   usize,
 ) -> isize {
     const CLONE_VM: usize = 0x0000_0100;
+
+    #[cfg(target_arch = "x86_64")]
+    let (flags, child_stack, _ptid, ctid, tls) = (a0, a1, a2, a3, a4);
+
+    #[cfg(target_arch = "aarch64")]
+    let (flags, child_stack, _ptid, tls, ctid) = (a0, a1, a2, a3, a4);
 
     if flags & CLONE_VM != 0 {
         clone_thread(flags, child_stack, tls, ctid, frame_ptr)

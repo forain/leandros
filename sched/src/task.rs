@@ -73,7 +73,7 @@ pub struct Task {
     /// Bitmask of blocked (masked) signals.
     pub signal_mask:    u64,
     /// Per-signal disposition table (reduced for testing).
-    pub signal_actions: [SigAction; 4],
+    pub signal_actions: [SigAction; 64],
 
     // ── Thread state ──────────────────────────────────────────────────────────
     /// User-space address of the thread's TID word (for `set_tid_address`).
@@ -137,7 +137,7 @@ impl Task {
             egid: 0,
             signal_pending: 0,
             signal_mask: 0,
-            signal_actions: [DEFAULT_SIGACTION; 4],
+            signal_actions: [DEFAULT_SIGACTION; 64],
             clear_child_tid: 0,
             heap_start: 0,
             heap_end: 0,
@@ -383,8 +383,8 @@ impl Task {
         core::ptr::write_volatile(umask_ptr, 0o022);
 
         // Initialize signal_actions array with DEFAULT_SIGACTION
-        let signal_actions_ptr = (dest as usize + core::mem::offset_of!(Task, signal_actions)) as *mut [SigAction; 4];
-        for i in 0..4 {
+        let signal_actions_ptr = (dest as usize + core::mem::offset_of!(Task, signal_actions)) as *mut [SigAction; 64];
+        for i in 0..64 {
             let action_ptr = (signal_actions_ptr as usize + i * core::mem::size_of::<SigAction>()) as *mut SigAction;
             core::ptr::write_volatile(action_ptr, DEFAULT_SIGACTION);
         }
@@ -440,7 +440,7 @@ impl Task {
             egid: 0,
             signal_pending: 0,
             signal_mask: 0,
-            signal_actions: [DEFAULT_SIGACTION; 4],
+            signal_actions: [DEFAULT_SIGACTION; 64],
             clear_child_tid: 0,
             heap_start: 0,
             heap_end: 0,

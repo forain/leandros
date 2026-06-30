@@ -272,14 +272,36 @@ pub fn preempt_check() {
 }
 
 pub fn handle_page_fault(addr: usize) -> bool {
+    fn print_str(s: &str) {
+        extern "C" { fn arch_serial_putc(c: u8); }
+        for &b in s.as_bytes() {
+            unsafe { arch_serial_putc(b); }
+        }
+    }
+
     let pid = current_pid();
     if pid == 0 { return false; }
 
     let mut rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        if let Some(ref mut as_) = t.address_space {
-            return as_.handle_user_page_fault(addr);
+    let tgid = match rq.find_pid(pid) {
+        Some(t) => t.tgid,
+        None => {
+            print_str("[PF] find_pid failed\n");
+            return false;
         }
+    };
+    if let Some(t) = rq.find_pid_mut(tgid) {
+        if let Some(ref mut as_) = t.address_space {
+            let ok = as_.handle_user_page_fault(addr);
+            if !ok {
+                print_str("[PF] handle_user_page_fault returned false\n");
+            }
+            return ok;
+        } else {
+            print_str("[PF] leader address_space is None\n");
+        }
+    } else {
+        print_str("[PF] find_pid_mut for leader failed\n");
     }
     false
 }
@@ -555,8 +577,9 @@ pub fn spawn_user(_entry_va: usize, _stack_va: usize, _priority: i8) -> Option<P
 pub fn with_address_space<F, R>(pid: Pid, f: F) -> Option<R>
 where F: FnOnce(&mm::vmm::AddressSpace) -> R {
     let rq = RUN_QUEUE.lock();
-    let task = rq.find_pid(pid)?;
-    match task.address_space {
+    let t = rq.find_pid(pid)?;
+    let leader = rq.find_pid(t.tgid)?;
+    match leader.address_space {
         Some(ref as_) => Some(f(as_)),
         None => None,
     }
@@ -565,8 +588,9 @@ where F: FnOnce(&mm::vmm::AddressSpace) -> R {
 pub fn with_address_space_mut<F, R>(pid: Pid, f: F) -> Option<R>
 where F: FnOnce(&mut mm::vmm::AddressSpace) -> R {
     let mut rq = RUN_QUEUE.lock();
-    let task = rq.find_pid_mut(pid)?;
-    match task.address_space {
+    let tgid = rq.find_pid(pid)?.tgid;
+    let leader = rq.find_pid_mut(tgid)?;
+    match leader.address_space {
         Some(ref mut as_) => Some(f(as_)),
         None => None,
     }
@@ -575,8 +599,9 @@ where F: FnOnce(&mut mm::vmm::AddressSpace) -> R {
 pub fn with_task_address_space<F, R>(pid: Pid, f: F) -> Option<R>
 where F: FnOnce() -> R {
     let rq = RUN_QUEUE.lock();
-    let task = rq.find_pid(pid)?;
-    let pt_root = task.address_space.as_ref()?.root();
+    let t = rq.find_pid(pid)?;
+    let leader = rq.find_pid(t.tgid)?;
+    let pt_root = leader.address_space.as_ref()?.root();
     drop(rq);
 
     extern "C" {
@@ -597,8 +622,9 @@ pub fn with_current_address_space<F, R>(f: F) -> Option<R>
 where F: FnOnce(&mm::vmm::AddressSpace) -> R {
     let pid = current_pid();
     let rq = RUN_QUEUE.lock();
-    let task = rq.find_pid(pid)?;
-    match task.address_space {
+    let t = rq.find_pid(pid)?;
+    let leader = rq.find_pid(t.tgid)?;
+    match leader.address_space {
         Some(ref as_) => Some(f(as_)),
         None => None,
     }
@@ -608,8 +634,9 @@ pub fn with_current_address_space_mut<F, R>(f: F) -> Option<R>
 where F: FnOnce(&mut mm::vmm::AddressSpace) -> R {
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
-    let task = rq.find_pid_mut(pid)?;
-    match task.address_space {
+    let tgid = rq.find_pid(pid)?.tgid;
+    let leader = rq.find_pid_mut(tgid)?;
+    match leader.address_space {
         Some(ref mut as_) => Some(f(as_)),
         None => None,
     }

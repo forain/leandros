@@ -29,6 +29,8 @@ pub fn clone_as(src: &AddressSpace, new_page_table_root: usize) -> Option<Addres
     dst.heap_start = src.heap_start;
     dst.heap_end   = src.heap_end;
 
+    dst.regions.resize(src.regions.len(), None);
+
     for (src_slot, dst_slot) in src.regions.iter().zip(dst.regions.iter_mut()) {
         let region = match src_slot.as_ref() {
             Some(r) => r,

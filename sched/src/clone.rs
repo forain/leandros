@@ -66,16 +66,20 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         let as_raw_ptr: *const mm::vmm::AddressSpace = {
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid) {
-                Some(t) => match t.address_space.as_ref() {
-                    Some(as_) => &**as_ as *const mm::vmm::AddressSpace,
-                    None => {
-                        mm::buddy::free(stack_base_phys, 3);
-                        mm::buddy::free(child_pt, 0);
-                        return -38; // kernel task → can't fork
+                Some(t) => {
+                    let tgid = t.tgid;
+                    let leader = rq.find_pid(tgid).unwrap_or(t);
+                    match leader.address_space.as_ref() {
+                        Some(as_) => &**as_ as *const mm::vmm::AddressSpace,
+                        None => {
+                            mm::buddy::free(stack_base_phys, stack_pages);
+                            mm::buddy::free(child_pt, 0);
+                            return -38; // kernel task → can't fork
+                        }
                     }
-                    },
+                }
                     None => {
-                    mm::buddy::free(stack_base_phys, 3);
+                    mm::buddy::free(stack_base_phys, stack_pages);
                     mm::buddy::free(child_pt, 0);
                     return -3; // ESRCH
                     }
@@ -138,10 +142,11 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         }
 
         // ── Step 6: gather parent credentials ────────────────────────────────
-        let (heap_start, heap_end, pid, tgid, pgid, sid, uid, gid, euid, egid, cwd) = {
+        let (heap_start, heap_end, pid, _tgid, pgid, sid, uid, gid, euid, egid, cwd) = {
             let rq = super::RUN_QUEUE.lock();
             if let Some(t) = rq.find_pid(parent_pid) {
-                let (hs, he) = t.address_space.as_ref()
+                let leader = rq.find_pid(t.tgid).unwrap_or(t);
+                let (hs, he) = leader.address_space.as_ref()
                     .map(|a| (a.heap_start, a.heap_end))
                     .unwrap_or((0, 0));
                 (hs, he, t.pid, t.tgid, t.pgid, t.sid,
@@ -162,7 +167,7 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         child.ctx           = child_ctx;
         child.address_space = Some(alloc::boxed::Box::new(child_as));
         child.ppid          = pid;
-        child.tgid          = tgid;
+        child.tgid          = child_pid;
         child.pgid          = pgid;
         child.sid           = sid;
         child.uid           = uid;
@@ -172,7 +177,7 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         child.heap_start    = heap_start;
         child.heap_end      = heap_end;
         child.cwd           = cwd;
-        child.signal_actions = [DEFAULT_SIGACTION; 4];
+        child.signal_actions = [DEFAULT_SIGACTION; 64];
 
         if !super::RUN_QUEUE.lock().enqueue(child) {
             mm::buddy::free(stack_base_phys, stack_pages);
@@ -238,6 +243,7 @@ pub fn clone_thread(
 
         // ── Build child CpuContext ────────────────────────────────────────────
         let mut child_ctx = CpuContext::zeroed();
+        let child_tls = if flags & CLONE_SETTLS != 0 { tls as u64 } else { 0 };
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -248,7 +254,6 @@ pub fn clone_thread(
             }
             child_ctx.gregs[11] = ret_to_user_fork as *const () as u64; // LR
             child_ctx.sp        = (stack_base_virt + frame_offset) as u64;
-            let child_tls = if flags & CLONE_SETTLS != 0 { tls as u64 } else { 0 };
             child_ctx.tpidr_el0 = child_tls;
         }
 
@@ -267,8 +272,7 @@ pub fn clone_thread(
                 p.write(fork_ret_to_user as *const () as u64);
             }
             child_ctx.rsp = child_ksp as u64;
-
-            // TODO: FS.base setup for CLONE_SETTLS on x86_64
+            child_ctx.fs_base = child_tls;
         }
 
         // ── Collect parent credentials and page table ─────────────────────────
@@ -277,13 +281,14 @@ pub fn clone_thread(
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid) {
                 Some(t) => {
+                    let leader = rq.find_pid(t.tgid).unwrap_or(t);
                     let cp = if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
-                        t.address_space.as_ref()
+                        leader.address_space.as_ref()
                             .and_then(|a| a.virt_to_phys(ctid))
                     } else {
                         None
                     };
-                    let (hs, he) = t.address_space.as_ref()
+                    let (hs, he) = leader.address_space.as_ref()
                         .map(|a| (a.heap_start, a.heap_end))
                         .unwrap_or((0, 0));
                     (t.page_table, t.tgid, t.pgid, t.sid,
@@ -309,6 +314,7 @@ pub fn clone_thread(
             child_pid, 0, stack_base_phys, stack_size, page_table,
         );
         child.ctx        = child_ctx;
+        child.tls_base   = child_tls;
         child.ppid       = parent_pid;
         child.tgid       = if flags & CLONE_THREAD != 0 { parent_tgid } else { child_pid };
         child.pgid       = pgid;
@@ -318,7 +324,7 @@ pub fn clone_thread(
         child.heap_start = heap_start;
         child.heap_end   = heap_end;
         child.cwd        = cwd;
-        child.signal_actions = [DEFAULT_SIGACTION; 4];
+        child.signal_actions = [DEFAULT_SIGACTION; 64];
         if flags & CLONE_CHILD_CLEARTID != 0 {
             child.clear_child_tid = ctid;
         }
