@@ -455,7 +455,20 @@ fn scheduler_run_loop() -> ! {
 }
 
 pub fn exit(code: i32) -> ! {
+    extern "C" {
+        fn serial_print(s: *const u8, len: usize);
+        fn print_number(n: u32);
+    }
     let pid = current_pid();
+    unsafe {
+        let msg = b"[EXIT] pid=";
+        serial_print(msg.as_ptr(), msg.len());
+        print_number(pid);
+        let msg2 = b" code=";
+        serial_print(msg2.as_ptr(), msg2.len());
+        print_number(code as u32);
+        serial_print(b"\n".as_ptr(), 1);
+    }
     {
         let mut rq = RUN_QUEUE.lock();
         if let Some(t) = rq.find_pid_mut(pid) {
@@ -511,6 +524,17 @@ pub fn replace_address_space(
             t.page_table    = pt_root;
             t.heap_start    = heap_start;
             t.heap_end      = heap_start;
+            // Reset the TLS base so the new program starts with a clean slate.
+            // The hardware register is zeroed in arch_execve_return, but ctx.tpidr_el0
+            // (AArch64) / ctx.fs_base (x86-64) holds the kernel-visible copy used by
+            // cpu_switch_to.  If a timer IRQ fires between eret and the new program's
+            // static_init, cpu_switch_to restores from ctx, overwriting the zeroed
+            // hardware register with the previous program's stale TLS pointer.
+            t.tls_base = 0;
+            #[cfg(target_arch = "aarch64")]
+            { t.ctx.tpidr_el0 = 0; }
+            #[cfg(target_arch = "x86_64")]
+            { t.ctx.fs_base = 0; }
         }
     }
 

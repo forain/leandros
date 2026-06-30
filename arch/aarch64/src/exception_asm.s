@@ -229,6 +229,14 @@ arch_execve_return:
     msr  sp_el0,  x1
     mov  x0, #0
     msr  spsr_el1, x0
+    // Reset the user TLS register.  A freshly exec'd program has no TLS yet;
+    // per the aarch64 ABI it must start with tpidr_el0 = 0 so libc sets up its
+    // own TLS.  Unlike x86_64 (where libc queries the kernel-maintained FS base
+    // via arch_prctl), aarch64 reads tpidr_el0 directly, and this register
+    // survives the address-space replacement — leaving it set to the previous
+    // program's TLS pointer makes relibc skip TLS init and use a stale TCB
+    // (garbage allocator mspace → first malloc hangs).
+    msr  tpidr_el0, xzr
     // Ensure ttbr0 is set (caller should have set it, but we can do it here too)
     eret
 
