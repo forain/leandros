@@ -1884,7 +1884,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let mut new_as = alloc::boxed::Box::new(mm::vmm::AddressSpace::new(pt_root));
 
     let elf_bytes = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_len) };
-    let entry = match elf::load(elf_bytes, &mut new_as) {
+    let elf_info = match elf::load(elf_bytes, &mut new_as) {
         Ok(e)  => e,
         Err(_) => { drop(new_as); return -8; }
     };
@@ -1906,6 +1906,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     //   [argv strings, null-terminated]
     //   [16-byte alignment pad]
     //   [AT_NULL pair (0, 0)]
+    //   [AT_LEANDROS_AUDIO_PORT pair]
+    //   [AT_LEANDROS_NET_PORT pair]
     //   [AT_LEANDROS_VFS_PORT pair]
     //   [AT_EGID pair]
     //   [AT_GID pair]
@@ -1913,6 +1915,9 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     //   [AT_UID pair]
     //   [AT_PAGESZ pair]
     //   [AT_RANDOM pair]
+    //   [AT_PHNUM pair]
+    //   [AT_PHENT pair]
+    //   [AT_PHDR pair]
     //   [NULL (envp terminator)]
     //   [envp[envc-1] pointer]
     //   ...
@@ -1932,8 +1937,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 
     // pointer table: argc(1) + argv[argc](argc) + null(1) + envp[envc](envc) + null(1)
     let ptr_words = 1 + argc + 1 + envc + 1;
-    // auxv: RANDOM + PAGESZ + UID + EUID + GID + EGID + VFS + NET + AUDIO + NULL = 10 pairs
-    let auxv_words = 10 * 2;
+    // auxv: PHDR + PHENT + PHNUM + RANDOM + PAGESZ + UID + EUID + GID + EGID + VFS + NET + AUDIO + NULL = 13 pairs
+    let auxv_words = 13 * 2;
     let total_words = ptr_words + auxv_words;
     let total_ptr_bytes = total_words * W;
     // Align string section to 16 bytes.
@@ -1989,16 +1994,19 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // auxv
     let t = ticks();
     let auxv: &[(u64, u64)] = &[
-        (25, rand_va as u64),                      // AT_RANDOM
+        (3,  elf_info.phdr_va   as u64),           // AT_PHDR
+        (4,  elf_info.phentsize as u64),            // AT_PHENT
+        (5,  elf_info.phnum     as u64),            // AT_PHNUM
+        (25, rand_va as u64),                       // AT_RANDOM
         (6,  mm::buddy::PAGE_SIZE as u64),          // AT_PAGESZ
-        (11, 0),                                   // AT_UID
-        (12, 0),                                   // AT_EUID
-        (13, 0),                                   // AT_GID
-        (14, 0),                                   // AT_EGID
+        (11, 0),                                    // AT_UID
+        (12, 0),                                    // AT_EUID
+        (13, 0),                                    // AT_GID
+        (14, 0),                                    // AT_EGID
         (AT_LEANDROS_VFS_PORT, VFS_SERVER_PORT.load(Ordering::Relaxed) as u64),
         (AT_LEANDROS_NET_PORT, NET_SERVER_PORT.load(Ordering::Relaxed) as u64),
         (AT_LEANDROS_AUDIO_PORT, AUDIO_SERVER_PORT.load(Ordering::Relaxed) as u64),
-        (0,  0),                                   // AT_NULL
+        (0,  0),                                    // AT_NULL
     ];
     for &(k, v) in auxv {
         write64(w * W, k); w += 1;
@@ -2026,7 +2034,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let cloexec_msg = make_vfs_msg(vfs::VFS_EXEC_CLOEXEC, &[pid as u64]);
     let _ = vfs::handle(&cloexec_msg, pid);
 
-    replace_address_space(*new_as, pt_root, heap_start, entry, user_sp);
+    replace_address_space(*new_as, pt_root, heap_start, elf_info.entry, user_sp);
 }
 
 // ── I/O syscalls ──────────────────────────────────────────────────────────────

@@ -143,6 +143,18 @@ fn parse_phdr(b: &[u8], off: usize) -> Result<Phdr, ElfError> {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Information returned by [`load`] that the kernel needs to build the auxv.
+pub struct ElfInfo {
+    /// Virtual entry-point address.
+    pub entry:     usize,
+    /// Virtual address of the program header table in the loaded image.
+    pub phdr_va:   usize,
+    /// Size in bytes of one program-header entry (`e_phentsize`).
+    pub phentsize: usize,
+    /// Number of program-header entries (`e_phnum`).
+    pub phnum:     usize,
+}
+
 /// Load an ELF64 executable from `bytes` into `as_`.
 ///
 /// Maps all `PT_LOAD` segments into `as_` with the correct POSIX protection
@@ -150,14 +162,16 @@ fn parse_phdr(b: &[u8], off: usize) -> Result<Phdr, ElfError> {
 /// and sets `as_.heap_start` / `heap_end` to the first aligned page after the
 /// highest loaded address.
 ///
-/// Returns the virtual entry-point address on success.
+/// Returns [`ElfInfo`] on success, which includes the entry-point and the
+/// program-header location required to populate `AT_PHDR`, `AT_PHENT`, and
+/// `AT_PHNUM` in the process's auxiliary vector.
 ///
 /// # Safety
 ///
 /// `as_` must be a freshly-created `AddressSpace` for the new process.  The
 /// function writes to physical memory via identity-mapped kernel addresses, so
 /// it must run in kernel mode with interrupts allowed to be off.
-pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
+pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<ElfInfo, ElfError> {
     let ehdr       = parse_ehdr(bytes)?;
     let phoff      = ehdr.e_phoff     as usize;
     let phentsize  = ehdr.e_phentsize as usize;
@@ -170,7 +184,9 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
     if ph_table_end > bytes.len() { return Err(ElfError::BadProgramHeader); }
 
     let page_size = mm::buddy::PAGE_SIZE;
-    let mut highest: usize = 0; // highest virtual address loaded (inclusive end)
+    let mut highest:   usize = 0;           // highest virtual address loaded (inclusive end)
+    let mut load_base: usize = 0;           // base VA = first PT_LOAD's (p_vaddr - p_offset)
+    let mut first_load = true;
 
     for i in 0..phnum {
         let ph_off = phoff + i * phentsize;
@@ -183,6 +199,14 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
         let memsz   = ph.p_memsz  as usize;
         let filesz  = ph.p_filesz as usize;
         let foffset = ph.p_offset as usize;
+
+        if first_load {
+            // load_base is the virtual address that file offset 0 maps to.
+            // For ET_EXEC this equals p_vaddr (since p_offset is always 0 for the
+            // first segment), giving us AT_PHDR = load_base + e_phoff.
+            load_base = vaddr.wrapping_sub(foffset);
+            first_load = false;
+        }
 
         // Validate file data range.
         let fend = foffset.checked_add(filesz).ok_or(ElfError::SegmentOverflow)?;
@@ -278,5 +302,10 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
         as_.heap_end   = as_.heap_start;
     }
 
-    Ok(ehdr.e_entry as usize)
+    Ok(ElfInfo {
+        entry:     ehdr.e_entry as usize,
+        phdr_va:   load_base.wrapping_add(phoff),
+        phentsize: ehdr.e_phentsize as usize,
+        phnum:     ehdr.e_phnum     as usize,
+    })
 }
