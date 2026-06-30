@@ -27,6 +27,16 @@ restores `rax` from the register, not from the stack — fixed by stashing it in
 callee-saved register across the call. `sigaltstack` remains a stub on both
 architectures (still open).
 
+**Security follow-up, fixed 2026-06-30**: AArch64's `rt_sigreturn` path restored
+`spsr_el1` verbatim from the user-writable signal-stack frame, with no masking —
+a malicious program could forge the `M[3:0]` mode field to request a return to
+EL1 on the next `eret`, a privilege-escalation primitive. Fixed in
+`sched/src/signal.rs` (`aarch64::restore`) by masking the restored value to the
+N/Z/C/V condition flags only (`SPSR_NZCV_MASK`), forcing everything else —
+exception level, AArch64/32 state, DAIF — back to the same `spsr_el1 == 0`
+baseline a freshly created thread starts with. Mirrors the x86-64 path, which
+never restores `cs`/`ss` from user memory and masks `rflags` the same way.
+
 ### 2. Complete Thread Management (Phase 4)
 **Why Critical**: Threads are fundamental to multitasking and application execution.
 - Implement thread-local storage

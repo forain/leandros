@@ -273,6 +273,17 @@ mod aarch64 {
     // Offsets within siginfo.
     const SI_SIGNO_OFFSET: usize = 0; // __u32 si_signo
 
+    /// Allowed user-restorable PSTATE bits on sigreturn: the N/Z/C/V
+    /// condition flags only. Everything else — the M[4:0] exception-level
+    /// field, DAIF interrupt masks, SS/IL and the rest — is forced to the
+    /// same baseline a freshly created thread starts with (`spsr_el1 == 0`:
+    /// EL0t, AArch64 state, interrupts unmasked; see `sched/src/context.rs`).
+    /// Mirrors the x86-64 `SAFE_RFLAGS_MASK` in `mod x86_64` below: a
+    /// forged value on the user-writable signal stack must not be able to
+    /// request a return to EL1 via M[3:0], which an unmasked restore would
+    /// allow.
+    const SPSR_NZCV_MASK: u64 = 0xF000_0000;
+
     /// Write an AArch64 `rt_sigframe` onto the user stack and redirect the
     /// kernel's `UserFrame` to invoke `handler(sig, &siginfo, &uc)`.
     ///
@@ -389,7 +400,10 @@ mod aarch64 {
         }
         user_frame.sp_el0   = u64::from_le_bytes(buf[SP_OFFSET..SP_OFFSET+8].try_into().unwrap());
         user_frame.elr_el1  = u64::from_le_bytes(buf[PC_OFFSET..PC_OFFSET+8].try_into().unwrap());
-        user_frame.spsr_el1 = u64::from_le_bytes(buf[PSTATE_OFFSET..PSTATE_OFFSET+8].try_into().unwrap());
+        // spsr_el1 is NOT restored verbatim from user-writable memory (see
+        // SPSR_NZCV_MASK above) — only condition flags pass through.
+        let saved_pstate = u64::from_le_bytes(buf[PSTATE_OFFSET..PSTATE_OFFSET+8].try_into().unwrap());
+        user_frame.spsr_el1 = saved_pstate & SPSR_NZCV_MASK;
 
         // Restore the pre-handler signal mask from uc_sigmask.
         let saved_mask =
