@@ -55,12 +55,105 @@ stack if no alt-stack is configured/enabled or if already executing on it
 This closes out Priority 1 item 1 — both signal delivery and `sigaltstack`
 are now real on both architectures.
 
-### 2. Complete Thread Management (Phase 4)
+### 2. Complete Thread Management (Phase 4) — DONE 2026-07-01
 **Why Critical**: Threads are fundamental to multitasking and application execution.
 - Implement thread-local storage
 - Add mutex and condition variable support
 - Implement thread attributes and cleanup handlers
 - Add thread-specific data support
+
+**Architecture correction**: mutex/condvar, TSD (with destructors), and
+pthread_cleanup_push/pop do **not** belong in the kernel — they're
+POSIX/pthread-level concerns that belong in the C library sitting on top of
+a handful of generic kernel primitives (`clone`, `futex`, TLS setup), the
+same way glibc/musl do it on real Linux. `userland/relibc` already had a
+correct, complete userspace implementation of all three: `RlctMutex`/
+`RlctCondvar` (`src/sync/pthread_mutex.rs`, `src/sync/cond.rs`) built on the
+kernel's `futex` syscall, a `#[thread_local]` TSD map with destructors
+(`src/header/pthread/tls.rs`) wired into `pthread_exit`, and
+`pthread_cleanup_push`/`pop` (`src/header/pthread/mod.rs`). A prior session
+had started adding kernel-side `sys_pthread_key_create/delete/getspecific/
+setspecific` syscalls, a `sched::tsd` module, and free-function
+`FutexMutex`/`FutexCondvar` wrappers in `sched::mutex` to duplicate this —
+that work didn't compile (14 rustc errors) and nothing in userland ever
+called it, so it was reverted rather than fixed.
+
+**Root cause of the real gap**: `pthread_create()` couldn't succeed at all,
+on either architecture, because `Sys::rlct_clone` — the function that
+actually spawns the OS thread via `clone()` — was a hard
+`Err(Errno(ENOSYS))` stub in `userland/relibc/src/platform/leandros/mod.rs`
+(a separate, ~half-finished parallel reimplementation of the Pal trait for
+a custom `target_os = "leandros"`, alongside relibc's own mature, complete
+`platform::linux::mod.rs` used for real Linux builds). Since this kernel
+deliberately implements the real Linux syscall ABI (numbers, calling
+convention all match — confirmed: `platform::leandros`'s own syscall-number
+table was already identical to real Linux's), the fix was to stop
+maintaining two Pal implementations and reuse `platform::linux::mod.rs`
+directly:
+- `platform::mod.rs`'s `sys` module routing now points `target_os =
+  "leandros"` at `linux/mod.rs` (previously it pointed at its own
+  `leandros/mod.rs`, a ~50%-stubbed parallel copy).
+- `platform::linux::mod.rs` needs a `syscall!(NAME, ...)` macro and a
+  `nr::NAME` syscall-number table, normally supplied by the external `sc`
+  crate — but `sc`'s own internal `#[cfg(target_os = "linux")]` platform
+  dispatch doesn't recognize this custom target, and widening the actual
+  target JSON's `"os"` field to literally `"linux"` was tried and reverted:
+  it cascades `cfg(target_os = "linux")` into unrelated third-party
+  dependencies too (e.g. broke the `libc` crate, pulled in transitively by
+  something else in the tree, which assumes a real hosted Linux). Instead,
+  `platform::leandros::mod.rs` was trimmed down to just: the raw syscall
+  trampolines (already had correct, working, tested aarch64/x86_64 asm) and
+  a complete real-Linux syscall-number table (vendored verbatim from the
+  small, dependency-free `sc` crate, Apache-2.0/MIT — its own internal
+  target dispatch is what's unreachable for us, not the actual per-arch
+  code) plus the handful of LeandrOS-only syscalls (IPC ports, `spawn`) that
+  have no Linux equivalent and so live here as extra `impl Sys` methods
+  rather than in the shared `Pal` trait. `linux/mod.rs`'s aarch64
+  `rlct_clone` (previously `todo!()`) was implemented for real: raw `clone`
+  syscall (nr 220), parent/child branch on the returned value, child
+  unwinds the (entry_point, arg, tcb, mutex) tuple `pthread::create()`
+  prepared on the new stack via `ldp`/`ldr` and `br`s into `new_thread_shim`
+  — mirrors the existing x86_64 version's structure exactly.
+- Also needed: `#[macro_export]` on the local `syscall!` macro plus
+  declaring `leandros` (unconditionally providing it) *before* `sys` in
+  `platform::mod.rs` so it's in scope for `linux/mod.rs` the same way
+  `#[macro_use] extern crate sc;` used to work; ~35 call sites across
+  `linux/mod.rs`/`signal.rs`/`socket.rs`/`ld_so/{mod,tcb}.rs` needed an
+  explicit `unsafe {}` added or removed around `syscall!(...)` (Rust 2024
+  edition requires it explicitly even inside `unsafe fn` bodies — some
+  vendored call sites had it, some didn't, depending on whether `sc`'s own
+  macro used to add it).
+- One more real kernel-side bug, found only once threads could actually
+  run: relibc's real futex usage calls `FUTEX_WAIT_BITSET` (op 9, with
+  `FUTEX_BITSET_MATCH_ANY`) rather than plain `FUTEX_WAIT` (op 0) — the
+  kernel's `sys_futex` (`kernel/src/syscall.rs`) only recognized op 0/1 and
+  returned ENOSYS for 9. Fixed by treating 9 the same as 0 (the bitset is
+  always match-any in practice here, so they're behaviorally identical for
+  our purposes).
+- Unrelated latent bug fixed in passing: `OsTid.thread_id`
+  (`userland/relibc/src/pthread/mod.rs`) was `#[cfg(target_os =
+  "linux")]`-gated only, but referenced unconditionally — widened to
+  `any(linux, leandros)`.
+
+**Verified 2026-07-01**, built from scratch against a from-scratch sysroot
+(see the run-leandros skill session notes / project memory for the
+toolchain recipe) and run in QEMU on **both** x86_64 and aarch64: a test
+program exercising `pthread_create`/`join`, a mutex contended by two
+threads (2000/2000 correct increments, no lost updates), a condvar
+wait/signal, TSD `pthread_key_create`/`get`/`setspecific` with its
+destructor firing on thread exit, and `pthread_cleanup_push`/`pop` — all
+five passed cleanly on both architectures.
+
+**What's Left**:
+- [ ] Add automated/repeatable tests for this (the verification program
+      from this session lived in the QEMU scratch environment, not
+      committed anywhere — consider adding a real pthread test target to
+      the build if ongoing regression coverage is wanted).
+- [ ] `platform::leandros::mod.rs`'s 54-stub predecessor covered some Pal
+      methods `platform::linux::mod.rs` may still be missing or may
+      implement differently for non-thread-related syscalls (file I/O
+      edge cases, etc.) — not exercised by this pass; worth a broader
+      smoke test if VFS-heavy pthread-adjacent bugs show up later.
 
 ### 3. Complete Memory Management (Phase 6)
 **Why Critical**: Memory management is core to system operation.
