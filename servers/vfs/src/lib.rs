@@ -27,23 +27,6 @@ use spin::Mutex;
 
 extern crate mm;
 
-extern "C" { fn arch_serial_putc(c: u8); }
-
-fn serial_debug(msg: &str) {
-    for &b in msg.as_bytes() {
-        unsafe { arch_serial_putc(b); }
-    }
-}
-
-fn serial_debug_hex(v: u32) {
-    serial_debug("0x");
-    for i in (0..8).rev() {
-        let n = (v >> (i * 4)) & 0xF;
-        let c = if n < 10 { b'0' + n as u8 } else { b'A' + n as u8 - 10 };
-        unsafe { arch_serial_putc(c); }
-    }
-}
-
 // ── Protocol tag constants ────────────────────────────────────────────────────
 
 pub const VFS_OPEN:        u64 = 0x10;

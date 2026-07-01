@@ -30,7 +30,6 @@ const VFS_UNLINK:     u64 = 0x1F;
 const VFS_MKDIR:      u64 = 0x20;
 const VFS_FTRUNCATE:  u64 = 0x21;
 
-const O_RDONLY:  u64 = 0;
 const O_WRONLY:  u64 = 1;
 const O_RDWR:    u64 = 2;
 const O_CREAT:   u64 = 0o100;
@@ -44,11 +43,9 @@ const F2FS_SB_OFFSET: usize = 1024; // within first block
 
 // Superblock offsets (relative to F2FS_SB_OFFSET within block 0)
 const SB_MAGIC:            usize = 0;
-const SB_LOG_BLOCKSIZE:    usize = 16;
 const SB_LOG_BLK_PER_SEG:  usize = 20;
 const SB_SEG_CNT_CKPT:     usize = 52;
 const SB_SEG_CNT_NAT:       usize = 60;
-const SB_SEGMENT0_BLKADDR:  usize = 72;
 const SB_CP_BLKADDR:        usize = 76;
 const SB_SIT_BLKADDR:       usize = 80;
 const SB_NAT_BLKADDR:       usize = 84;
@@ -62,7 +59,6 @@ const CP_CUR_NODE_SEGNO: usize = 36;   // u32 [0] of node log
 const CP_CUR_NODE_BLKOFF:usize = 68;   // u16 [0] of node log
 const CP_CUR_DATA_SEGNO: usize = 84;   // u32 [0] of data log
 const CP_CUR_DATA_BLKOFF:usize = 116;  // u16 [0] of data log
-const CP_CKPT_FLAGS:     usize = 132;
 const CP_PACK_TOTAL:     usize = 136;
 const CP_NEXT_FREE_NID:  usize = 152;
 
@@ -78,8 +74,6 @@ const INODE_UNION:   usize = 364;
 // i_nid[5] start, footer at NODE_FOOTER_OFF
 const INODE_NIDS_OFF:usize = 4056;
 const NODE_FOOTER_OFF:usize = 4076; // footer = 5×u32 = 20 bytes
-const DEF_ADDRS_PER_INODE: usize = 923;
-const DEF_NIDS_PER_INODE:  usize = 5;
 
 // F2FS_INLINE flags
 const F2FS_EXTRA_ATTR:    u8 = 0x20;
@@ -92,7 +86,6 @@ const NAT_ENTRY_PER_BLK:  usize = 4096 / NAT_ENTRY_SIZE; // 455
 const SIT_ENTRY_SIZE:     usize = 74;
 const SIT_PER_BLK:        usize = 4096 / SIT_ENTRY_SIZE; // 55
 const SIT_VMAP_OFF:       usize = 2;   // valid_map offset within sit entry
-const SIT_VMAP_SIZE:      usize = 64;  // bits: one per block in segment
 const SIT_VBLOCKS_MASK:   u16   = 0x03FF;
 
 // Directory block constants (f2fs_dentry_block)
@@ -425,9 +418,9 @@ fn nat_update(ms: &mut MountState, ino: u32, blk_addr: u32) {
 // ── SIT: find a free segment ──────────────────────────────────────────────────
 
 fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
-    let main_segs = ms.sb.main_blkaddr; // count derived from sit
+    let _main_segs = ms.sb.main_blkaddr; // count derived from sit
     // Scan SIT blocks for a segment with 0 valid blocks
-    let sit_total_blks = ms.sb.seg_cnt_nat; // actually seg_cnt_main, but use what's available
+    let _sit_total_blks = ms.sb.seg_cnt_nat; // actually seg_cnt_main, but use what's available
     // Best approach: scan through SIT entries linearly starting from after+1
     let start_seg = after + 1;
     // Use a reasonable upper bound (scan up to 1024 segments)
@@ -534,11 +527,6 @@ fn maybe_flush(ms: &mut MountState) {
 }
 
 // ── Inode operations ──────────────────────────────────────────────────────────
-
-fn read_inode_blk<'a>(ms: &'a mut MountState, ino: u32) -> &'a [u8; BLOCK_SIZE] {
-    let blkaddr = nat_lookup(ms, ino);
-    ms.cache.read(ms.dev, blkaddr as u64)
-}
 
 fn inode_size(blk: &[u8]) -> u64 { r64(blk, INO_SIZE) }
 fn inode_mode(blk: &[u8]) -> u16 { r16(blk, INO_MODE) }
