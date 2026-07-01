@@ -1640,7 +1640,12 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize) -> isize {
     // Strip FUTEX_PRIVATE_FLAG (128) and FUTEX_CLOCK_REALTIME (256).
     const FUTEX_PRIVATE_FLAG: usize = 128;
     match op & !FUTEX_PRIVATE_FLAG {
-        0 => {
+        // FUTEX_WAIT and FUTEX_WAIT_BITSET (9): relibc's RlctMutex/condvar
+        // always call the bitset form with FUTEX_BITSET_MATCH_ANY (no actual
+        // bitmask filtering), so it's semantically identical to plain WAIT
+        // here — the extra uaddr2/val3 args (a4/a5, unused for *_WAIT) aren't
+        // even forwarded to this function.
+        0 | 9 => {
             // FUTEX_WAIT: if *uaddr == val, block until woken.
             if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
             let current = unsafe { core::ptr::read(uaddr as *const u32) };
