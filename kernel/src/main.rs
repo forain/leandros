@@ -310,7 +310,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             const KERNEL_PHYS: usize = 0x4008_0000;
             extern "C" { static __bss_end: u8; }
             let kernel_end_phys =
-                unsafe { core::ptr::addr_of!(__bss_end) as usize } - KERNEL_VIRT;
+                core::ptr::addr_of!(__bss_end) as usize - KERNEL_VIRT;
             mm::buddy::reserve_range(KERNEL_PHYS, kernel_end_phys);
 
             // The initrd is loaded at a fixed physical address by run-qemu.sh's

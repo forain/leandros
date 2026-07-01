@@ -29,9 +29,9 @@ pub unsafe fn enable_identity(_boot_info: &BootInfo) {
     // TG0  = 0b00 (4KB granule for TTBR0)
     // IPS  = 0b010 (36-bit PA, up to 64GB) or check ID_AA64MMFR0_EL1.PARange
     let mut tcr: u64 = (16 << 0) | (16 << 16); // T0SZ, T1SZ
-    tcr |= (0b00 << 14); // TG0 = 4KB
-    tcr |= (0b10 << 30); // TG1 = 4KB
-    tcr |= (0b010 << 32); // IPS = 36-bit (good for virt machine)
+    tcr |= 0b00 << 14; // TG0 = 4KB
+    tcr |= 0b10 << 30; // TG1 = 4KB
+    tcr |= 0b010 << 32; // IPS = 36-bit (good for virt machine)
     
     // SH0/SH1 = 0b11 (Inner Shareable)
     // ORGN0/IRGN0 = 0b01 (Normal WB/WA)
