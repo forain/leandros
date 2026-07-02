@@ -25,7 +25,7 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-CARGO_ARGS=(--target "$TARGET" --manifest-path userland/Cargo.toml)
+CARGO_ARGS=(--target "$TARGET" --manifest-path userland/Cargo.toml --workspace)
 
 if [[ "$MODE" == "release" ]]; then
     CARGO_ARGS+=(--release)
@@ -33,15 +33,40 @@ fi
 
 if $CHECK; then
     echo "[userland] cargo check …"
-    cargo check "${CARGO_ARGS[@]}"
+    cargo check "${CARGO_ARGS[@]}" --exclude pthreadtest
+    
+    if [[ "$TARGET" == "aarch64-unknown-none" ]]; then
+        LEANDROS_TARGET="targets/aarch64-unknown-leandros.json"
+    else
+        LEANDROS_TARGET="targets/x86_64-unknown-leandros.json"
+    fi
+    cargo +nightly check --manifest-path userland/Cargo.toml -p pthreadtest --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec
+    
     echo "[userland] OK — type-check passed"
     exit 0
 fi
 
 echo "[userland] cargo build …"
 RUSTFLAGS="-C link-arg=--entry=_start -C link-arg=-static -C linker=rust-lld -C relocation-model=static" \
-cargo build "${CARGO_ARGS[@]}"
+cargo build "${CARGO_ARGS[@]}" --exclude pthreadtest
 
+echo "[userland] Building pthreadtest..."
+if [[ "$TARGET" == "aarch64-unknown-none" ]]; then
+    LEANDROS_TARGET="targets/aarch64-unknown-leandros.json"
+    LEANDROS_TARGET_NAME="aarch64-unknown-leandros"
+else
+    LEANDROS_TARGET="targets/x86_64-unknown-leandros.json"
+    LEANDROS_TARGET_NAME="x86_64-unknown-leandros"
+fi
+
+RUSTFLAGS="-C link-arg=--entry=_start -C link-arg=-static -C linker=rust-lld -C relocation-model=static" \
+cargo +nightly build --manifest-path userland/Cargo.toml -p pthreadtest --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec --release
+
+# Copy output to where build-all.sh expects it
 OUT="userland/target/${TARGET}/${MODE}"
+mkdir -p "$OUT"
+cp "userland/target/${LEANDROS_TARGET_NAME}/release/pthreadtest" "${OUT}/pthreadtest"
+
 echo ""
 echo "[userland] Build complete in ${OUT}"
+

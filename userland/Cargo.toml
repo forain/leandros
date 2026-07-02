@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["libc", "hello", "shell", "init", "aplay", "memtest", "vfstest", "f2fstest"]
+members = ["libc", "hello", "shell", "init", "aplay", "memtest", "vfstest", "f2fstest", "pthreadtest"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,4 +13,4 @@ panic = "abort"
 panic = "abort"
 opt-level = "s"
 lto = true
-strip = true
+strip = false

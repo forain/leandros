@@ -1,0 +1,11 @@
+[package]
+name = "pthreadtest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "pthreadtest"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc! We link directly against librelibc.a.
