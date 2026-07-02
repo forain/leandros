@@ -33,24 +33,24 @@ fi
 
 if $CHECK; then
     echo "[userland] cargo check …"
-    cargo check "${CARGO_ARGS[@]}" --exclude pthreadtest
-    
+    cargo check "${CARGO_ARGS[@]}" --exclude pthreadtest --exclude timertest
+
     if [[ "$TARGET" == "aarch64-unknown-none" ]]; then
         LEANDROS_TARGET="targets/aarch64-unknown-leandros.json"
     else
         LEANDROS_TARGET="targets/x86_64-unknown-leandros.json"
     fi
     cargo +nightly check --manifest-path userland/Cargo.toml -p pthreadtest --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec
-    
+    cargo +nightly check --manifest-path userland/Cargo.toml -p timertest --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec
+
     echo "[userland] OK — type-check passed"
     exit 0
 fi
 
 echo "[userland] cargo build …"
 RUSTFLAGS="-C link-arg=--entry=_start -C link-arg=-static -C linker=rust-lld -C relocation-model=static" \
-cargo build "${CARGO_ARGS[@]}" --exclude pthreadtest
+cargo build "${CARGO_ARGS[@]}" --exclude pthreadtest --exclude timertest
 
-echo "[userland] Building pthreadtest..."
 if [[ "$TARGET" == "aarch64-unknown-none" ]]; then
     LEANDROS_TARGET="targets/aarch64-unknown-leandros.json"
     LEANDROS_TARGET_NAME="aarch64-unknown-leandros"
@@ -59,13 +59,23 @@ else
     LEANDROS_TARGET_NAME="x86_64-unknown-leandros"
 fi
 
+# pthreadtest and timertest link against real relibc directly (TLS, real
+# sigaction/timer syscalls) rather than the minimal leandros-libc, so they
+# need the custom leandros target JSON + build-std instead of the bare
+# *-unknown-none target the rest of userland uses.
+echo "[userland] Building pthreadtest..."
 RUSTFLAGS="-C link-arg=--entry=_start -C link-arg=-static -C linker=rust-lld -C relocation-model=static" \
 cargo +nightly build --manifest-path userland/Cargo.toml -p pthreadtest --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec --release
+
+echo "[userland] Building timertest..."
+RUSTFLAGS="-C link-arg=--entry=_start -C link-arg=-static -C linker=rust-lld -C relocation-model=static" \
+cargo +nightly build --manifest-path userland/Cargo.toml -p timertest --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec --release
 
 # Copy output to where build-all.sh expects it
 OUT="userland/target/${TARGET}/${MODE}"
 mkdir -p "$OUT"
 cp "userland/target/${LEANDROS_TARGET_NAME}/release/pthreadtest" "${OUT}/pthreadtest"
+cp "userland/target/${LEANDROS_TARGET_NAME}/release/timertest" "${OUT}/timertest"
 
 echo ""
 echo "[userland] Build complete in ${OUT}"

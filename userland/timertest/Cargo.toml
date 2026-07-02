@@ -1,0 +1,13 @@
+[package]
+name = "timertest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "timertest"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc! We link directly against librelibc.a, the same way
+# pthreadtest does, since POSIX timers need real sigaction()/signal
+# delivery and relibc_start_v1's TLS bring-up (errno etc. are thread-local).
