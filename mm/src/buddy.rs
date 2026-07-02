@@ -19,6 +19,14 @@ pub fn total_pages() -> usize { TOTAL_PAGES.load(Ordering::Relaxed) }
 pub fn free_pages()  -> usize { FREE_PAGES.load(Ordering::Relaxed) }
 
 /// A free list for one order level.
+///
+/// Doubly-linked: each free block stores its own `next` pointer at byte
+/// offset 0 and `prev` pointer at byte offset 8 (accessed via the HHDM).
+/// This gives O(1) removal of an arbitrary node once located, which
+/// `free()` needs to unlink a buddy from the middle of its list when
+/// coalescing.  `0` is never a valid block address (page 0 is always
+/// reserved by the boot memory map) so it doubles as the "no link" sentinel,
+/// matching the convention the allocator already used before coalescing.
 struct FreeList {
     head: Option<usize>, // physical address of first free block
 }
@@ -28,6 +36,49 @@ impl FreeList {
 }
 
 static FREE_LISTS: Mutex<[FreeList; MAX_ORDER]> = Mutex::new([const { FreeList::empty() }; MAX_ORDER]);
+
+unsafe fn node_next(addr: usize) -> usize { *(crate::phys_to_virt(addr) as *const usize) }
+unsafe fn node_set_next(addr: usize, v: usize) { *(crate::phys_to_virt(addr) as *mut usize) = v; }
+unsafe fn node_prev(addr: usize) -> usize { *((crate::phys_to_virt(addr) + 8) as *const usize) }
+unsafe fn node_set_prev(addr: usize, v: usize) { *((crate::phys_to_virt(addr) + 8) as *mut usize) = v; }
+
+/// Push `addr` onto the head of `lists[order]`.
+fn push_front(lists: &mut [FreeList; MAX_ORDER], order: usize, addr: usize) {
+    let old_head = lists[order].head;
+    unsafe {
+        node_set_next(addr, old_head.unwrap_or(0));
+        node_set_prev(addr, 0);
+        if let Some(h) = old_head { node_set_prev(h, addr); }
+    }
+    lists[order].head = Some(addr);
+}
+
+/// If `target` is present in `lists[order]`, unlink and remove it.
+///
+/// Safe to walk: every node visited here is, by definition, already-free
+/// memory holding real next/prev link data (never arbitrary or allocated
+/// memory), since the only way an address gets onto this list is via
+/// `push_front`.
+fn try_remove(lists: &mut [FreeList; MAX_ORDER], order: usize, target: usize) -> bool {
+    let mut cur = lists[order].head;
+    while let Some(addr) = cur {
+        let next = unsafe { node_next(addr) };
+        if addr == target {
+            let prev = unsafe { node_prev(addr) };
+            if prev != 0 {
+                unsafe { node_set_next(prev, next); }
+            } else {
+                lists[order].head = if next == 0 { None } else { Some(next) };
+            }
+            if next != 0 {
+                unsafe { node_set_prev(next, prev); }
+            }
+            return true;
+        }
+        cur = if next == 0 { None } else { Some(next) };
+    }
+    false
+}
 
 /// Physical [start, end) ranges that must never be handed out by the allocator
 /// (kernel image, page tables, initrd, …). Limine marks these reserved in its
@@ -105,22 +156,23 @@ pub fn alloc(order: usize) -> Option<usize> {
     // Walk up from requested order looking for a free block.
     for o in order..MAX_ORDER {
         if let Some(addr) = lists[o].head.take() {
-            // Pop from head: set head to next block stored in the page.
+            // Pop from head: the new head (if any) becomes the list head
+            // with no predecessor.
             unsafe {
-                let next_ptr = crate::phys_to_virt(addr) as *const usize;
-                let next_val = *next_ptr;
-                lists[o].head = if next_val == 0 { None } else { Some(next_val) };
+                let next_val = node_next(addr);
+                if next_val != 0 {
+                    node_set_prev(next_val, 0);
+                    lists[o].head = Some(next_val);
+                } else {
+                    lists[o].head = None;
+                }
             }
 
-            // Split excess blocks back down.
+            // Split excess blocks back down, pushing each buddy half onto
+            // its own order's free list.
             for split in (order..o).rev() {
                 let buddy = addr + (PAGE_SIZE << split);
-                // Push buddy to head of its list.
-                unsafe {
-                    let next_ptr = crate::phys_to_virt(buddy) as *mut usize;
-                    *next_ptr = lists[split].head.unwrap_or(0);
-                    lists[split].head = Some(buddy);
-                }
+                push_front(&mut lists, split, buddy);
             }
             FREE_PAGES.fetch_sub(1 << order, Ordering::Relaxed);
             return Some(addr);
@@ -136,16 +188,27 @@ pub fn alloc(order: usize) -> Option<usize> {
 }
 
 /// Free 2^order contiguous pages starting at `addr`.
+///
+/// Coalesces with the buddy block repeatedly (bounded by `MAX_ORDER`) before
+/// inserting, so freed memory is always merged back into the largest
+/// available contiguous block instead of fragmenting permanently.  Every
+/// block this allocator hands out is naturally aligned to its own order
+/// (preserved by both `init_from_map`'s alignment-constrained order pick and
+/// `alloc`'s splitting), so `addr ^ (PAGE_SIZE << order)` always yields the
+/// correct buddy address.
 pub fn free(addr: usize, order: usize) {
     if order >= MAX_ORDER { return; }
     FREE_PAGES.fetch_add(1 << order, Ordering::Relaxed);
     let mut lists = FREE_LISTS.lock();
-    
-    // For now, we skip complex merging of non-head buddies to avoid O(N) scans.
-    // We just push the freed block to the head.
-    unsafe {
-        let next_ptr = crate::phys_to_virt(addr) as *mut usize;
-        *next_ptr = lists[order].head.unwrap_or(0);
-        lists[order].head = Some(addr);
+
+    let mut addr = addr;
+    let mut order = order;
+    while order + 1 < MAX_ORDER {
+        let buddy = addr ^ (PAGE_SIZE << order);
+        if overlaps_reserved(buddy, PAGE_SIZE << order) { break; }
+        if !try_remove(&mut lists, order, buddy) { break; }
+        addr = addr.min(buddy);
+        order += 1;
     }
+    push_front(&mut lists, order, addr);
 }
