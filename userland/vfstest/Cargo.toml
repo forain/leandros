@@ -1,0 +1,11 @@
+[package]
+name = "vfstest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "vfstest"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

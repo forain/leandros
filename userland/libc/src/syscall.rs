@@ -370,6 +370,27 @@ pub mod nr {
     #[cfg(target_arch = "aarch64")] pub const GETEGID:        usize = 177;
     #[cfg(target_arch = "x86_64")]  pub const GETEGID:        usize = 108;
 
+    #[cfg(target_arch = "aarch64")] pub const SETUID:         usize = 146;
+    #[cfg(target_arch = "x86_64")]  pub const SETUID:         usize = 105;
+
+    #[cfg(target_arch = "aarch64")] pub const SETGID:         usize = 144;
+    #[cfg(target_arch = "x86_64")]  pub const SETGID:         usize = 106;
+
+    #[cfg(target_arch = "aarch64")] pub const FCHMOD:         usize = 52;
+    #[cfg(target_arch = "x86_64")]  pub const FCHMOD:         usize = 91;
+
+    #[cfg(target_arch = "aarch64")] pub const FCHMODAT:       usize = 53;
+    #[cfg(target_arch = "x86_64")]  pub const FCHMODAT:       usize = 268;
+
+    #[cfg(target_arch = "aarch64")] pub const FCHOWN:         usize = 55;
+    #[cfg(target_arch = "x86_64")]  pub const FCHOWN:         usize = 93;
+
+    #[cfg(target_arch = "aarch64")] pub const FCHOWNAT:       usize = 54;
+    #[cfg(target_arch = "x86_64")]  pub const FCHOWNAT:       usize = 260;
+
+    #[cfg(target_arch = "aarch64")] pub const FLOCK:          usize = 32;
+    #[cfg(target_arch = "x86_64")]  pub const FLOCK:          usize = 73;
+
     pub const IPC_SEND: usize = 511;
     pub const IPC_RECV: usize = 512;
     pub const IPC_CALL: usize = 513;
@@ -476,4 +497,18 @@ pub mod nr {
     pub const GETEUID: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const GETEGID: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const SETUID: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const SETGID: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const FCHMOD: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const FCHMODAT: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const FCHOWN: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const FCHOWNAT: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const FLOCK: usize = 0;
 }

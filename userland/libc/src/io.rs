@@ -3,6 +3,32 @@
 use crate::errno::set_errno;
 use crate::syscall::{nr, syscall1, syscall2, syscall3, syscall4};
 
+pub const AT_REMOVEDIR: i32 = 0x200;
+
+// fcntl(2) commands used by flock-style advisory locking.
+pub const F_GETLK:  i32 = 5;
+pub const F_SETLK:  i32 = 6;
+pub const F_SETLKW: i32 = 7;
+pub const F_RDLCK: i16 = 0;
+pub const F_WRLCK: i16 = 1;
+pub const F_UNLCK: i16 = 2;
+
+pub const LOCK_SH: i32 = 1;
+pub const LOCK_EX: i32 = 2;
+pub const LOCK_NB: i32 = 4;
+pub const LOCK_UN: i32 = 8;
+
+/// Linux `struct flock` (x86_64/aarch64 layout, 32 bytes).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct flock {
+    pub l_type:   i16,
+    pub l_whence: i16,
+    pub l_start:  i64,
+    pub l_len:    i64,
+    pub l_pid:    i32,
+}
+
 pub type c_int   = i32;
 pub type ssize_t = isize;
 pub type size_t  = usize;
@@ -153,4 +179,61 @@ pub unsafe extern "C" fn getdents64(fd: c_int, buf: *mut u8, count: size_t) -> s
 #[no_mangle]
 pub unsafe extern "C" fn ioctl(fd: c_int, cmd: usize, arg: usize) -> c_int {
     ret_or_errno(syscall3(nr::IOCTL, fd as usize, cmd, arg)) as c_int
+}
+
+/// Remove an empty directory.
+#[no_mangle]
+pub unsafe extern "C" fn rmdir(path: *const u8) -> c_int {
+    let r = syscall3(nr::UNLINKAT, AT_FDCWD as usize, path as usize, AT_REMOVEDIR as usize);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Rename (or move) a file or directory.
+#[no_mangle]
+pub unsafe extern "C" fn rename(old: *const u8, new: *const u8) -> c_int {
+    let r = syscall4(nr::RENAMEAT, AT_FDCWD as usize, old as usize,
+                      AT_FDCWD as usize, new as usize);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Change a file's permission bits.
+#[no_mangle]
+pub unsafe extern "C" fn chmod(path: *const u8, mode: mode_t) -> c_int {
+    let r = syscall4(nr::FCHMODAT, AT_FDCWD as usize, path as usize, mode as usize, 0);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Change an open file's permission bits.
+#[no_mangle]
+pub unsafe extern "C" fn fchmod(fd: c_int, mode: mode_t) -> c_int {
+    let r = syscall2(nr::FCHMOD, fd as usize, mode as usize);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Change a file's owning uid/gid (`u32::MAX` for either leaves it unchanged).
+#[no_mangle]
+pub unsafe extern "C" fn chown(path: *const u8, uid: u32, gid: u32) -> c_int {
+    let r = syscall4(nr::FCHOWNAT, AT_FDCWD as usize, path as usize, uid as usize, gid as usize);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Change an open file's owning uid/gid.
+#[no_mangle]
+pub unsafe extern "C" fn fchown(fd: c_int, uid: u32, gid: u32) -> c_int {
+    let r = syscall3(nr::FCHOWN, fd as usize, uid as usize, gid as usize);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Whole-file advisory lock (`LOCK_SH`/`LOCK_EX`/`LOCK_UN`, optionally `| LOCK_NB`).
+#[no_mangle]
+pub unsafe extern "C" fn flock(fd: c_int, op: c_int) -> c_int {
+    let r = syscall2(nr::FLOCK, fd as usize, op as usize);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Byte-range advisory locking via `fcntl(fd, F_SETLK/F_SETLKW/F_GETLK, &flock)`.
+#[no_mangle]
+pub unsafe extern "C" fn fcntl_lock(fd: c_int, cmd: c_int, lock: *mut flock) -> c_int {
+    let r = syscall3(nr::FCNTL, fd as usize, cmd as usize, lock as usize);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
 }

@@ -209,7 +209,7 @@ size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* stream) { return
 int fseek(FILE* stream, long offset, int whence) { return 0; }
 long ftell(FILE* stream) { return 0; }
 int remove(const char* pathname) { return -1; }
-int rename(const char* oldpath, const char* newpath) { return -1; }
+// rename() is provided by leandros-libc now that it implements a real one.
 
 int feof(FILE *stream) { return 0; }
 char *getenv(const char *name) { return NULL; }

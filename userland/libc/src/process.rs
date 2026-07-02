@@ -71,10 +71,24 @@ pub unsafe extern "C" fn sched_yield() -> i32 {
     syscall0(nr::SCHED_YIELD) as i32
 }
 
-/// Return the real user ID (always 0 on Leandros for now).
+/// Return the real user ID.
 #[no_mangle]
 pub unsafe extern "C" fn getuid() -> u32 {
     syscall0(nr::GETUID) as u32
+}
+
+/// Set the real (and, if privileged, effective) user ID.
+#[no_mangle]
+pub unsafe extern "C" fn setuid(uid: u32) -> i32 {
+    let r = syscall1(nr::SETUID, uid as usize);
+    if r < 0 { crate::errno::set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Set the real (and, if privileged, effective) group ID.
+#[no_mangle]
+pub unsafe extern "C" fn setgid(gid: u32) -> i32 {
+    let r = syscall1(nr::SETGID, gid as usize);
+    if r < 0 { crate::errno::set_errno(-r as i32); -1 } else { 0 }
 }
 
 /// Return the real group ID.
