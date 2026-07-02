@@ -339,12 +339,21 @@ direct boot (4 configurations): `vfstest` (5/5) and `memtest` (4/4,
 regression check) both pass cleanly on every configuration; the interactive
 shell's `ls`/`mkdir` still work normally afterward.
 
-### 5. Complete F2FS Implementation (Phase 7)
+### 5. Complete F2FS Implementation (Phase 7) — DONE 2026-07-02
 **Why Critical**: File system support is essential for data persistence.
 - Implement double-indirect block pointers
 - Add full F2FS file system operations
 - Implement file system mounting and unmounting
 - Add file system caching and buffering
+
+**Actual state found & implemented**:
+- **Double-indirect block pointers**: Implemented the complete F2FS multi-level block pointer lookup and allocation write path in `servers/f2fs/src/lib.rs` (supporting direct node blocks `i_nid[0..=1]`, single-indirect node blocks `i_nid[2..=3]`, and the double-indirect node block `i_nid[4]`). This allows F2FS to address and write sparse/large files up to the maximum theoretical F2FS file size (~4 TB, bounded in practice by disk image size).
+- **Mounting and Unmounting**: Created `unmount()` in the F2FS server, which flushes all cached dirty blocks and the checkpoint to disk, closes the IPC port, and deregisters the filesystem mount in VFS. Exposed `unregister_mount()` in the VFS server so filesystems can be cleanly removed from the active mounts list.
+- **Direct-boot F2FS Integration**: Fixed a bug where both architectures in direct boot mode didn't attach the F2FS data disk images (`f2fs-data0.img` / `f2fs-data1.img`). Updated QEMU direct-boot arguments in `scripts/run-qemu.sh` and the Python headless driver to include the F2FS drive/device setup so that F2FS mounts are fully functional in direct boot.
+- **Automated Verification**: Created `userland/f2fstest` binary and integrated it into the CPIO initrd build pipeline (`scripts/build-all.sh`). The tests cover basic F2FS reads/writes, direct node offset writes, single-indirect offset writes, double-indirect offset writes (verified via a sparse file seek/write to ~8.5 GB), directory operations, and unmounting.
+
+**Verified 2026-07-02** in QEMU on **both** architectures (aarch64, x86_64) across **both** boot protocols (UEFI/Limine, direct boot) - 4 configurations total. All `f2fstest`, `vfstest`, and `memtest` checks pass cleanly on all configurations.
+
 
 ## Priority 3: User Experience Features (Phase 8-9)
 
