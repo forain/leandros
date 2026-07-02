@@ -303,7 +303,7 @@ pub fn preempt_check() {
     }
 }
 
-pub fn handle_page_fault(addr: usize) -> bool {
+pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
     fn print_str(s: &str) {
         extern "C" { fn arch_serial_putc(c: u8); }
         for &b in s.as_bytes() {
@@ -324,7 +324,7 @@ pub fn handle_page_fault(addr: usize) -> bool {
     };
     if let Some(t) = rq.find_pid_mut(tgid) {
         if let Some(ref mut as_) = t.address_space {
-            let ok = as_.handle_user_page_fault(addr);
+            let ok = as_.handle_user_page_fault(addr, is_write);
             if !ok {
                 print_str("[PF] handle_user_page_fault returned false\n");
             }

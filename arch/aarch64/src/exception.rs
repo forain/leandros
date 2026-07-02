@@ -123,9 +123,17 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
         //
         //   EC 0x24 = data abort, 0x20 = instruction abort, both from a lower EL.
         //   DFSC 0x04..=0x07 = translation fault (levels 0–3 ⇒ page not present).
+        //   DFSC 0x0D..=0x0F = permission fault (levels 1–3 ⇒ present but
+        //   disallowed) — also routed here so a write to a read-only CoW
+        //   page can be promoted instead of killing the task outright.
+        //   WnR (ISS bit 6) only applies to data aborts; an instruction
+        //   abort is a fetch, never a CoW write.
         let dfsc = esr & 0x3F;
         if ec == 0x24 || ec == 0x20 {
-            if (0x04..=0x07).contains(&dfsc) && sched::handle_page_fault(far as usize) {
+            let is_translation = (0x04..=0x07).contains(&dfsc);
+            let is_permission  = (0x0D..=0x0F).contains(&dfsc);
+            let is_write = ec == 0x24 && (esr >> 6) & 1 != 0;
+            if (is_translation || is_permission) && sched::handle_page_fault(far as usize, is_write) {
                 return; // page mapped — resume EL0 and retry the faulting access
             }
             

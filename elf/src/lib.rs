@@ -232,7 +232,7 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<ElfInfo, ElfError> {
         // (order 15/16 for large MAME-sized segments) that may not be available
         // even with ample RAM due to physical memory fragmentation.
         // BSS pages (memsz > filesz) will be zero-faulted in on first access.
-        if !as_.map_lazy(page_vaddr, map_size, flags) {
+        if !as_.map_lazy(page_vaddr, map_size, flags, false) {
             return Err(ElfError::MappingFailed);
         }
 
@@ -243,7 +243,7 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<ElfInfo, ElfError> {
             let mut remaining = filesz;
 
             while remaining > 0 {
-                if !as_.handle_user_page_fault(dst_va) {
+                if !as_.handle_user_page_fault(dst_va, false) {
                     return Err(ElfError::MappingFailed);
                 }
                 let phys     = as_.virt_to_phys(dst_va).ok_or(ElfError::MappingFailed)?;

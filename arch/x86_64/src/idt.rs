@@ -241,9 +241,12 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
     }
 
     if from_user {
-        // Bit 0 of the error code: 0 = page not present (translation fault).
-        // Try demand paging before giving up.
-        if error_code & 1 == 0 && sched::handle_page_fault(cr2 as usize) {
+        // Bit 0 of the error code: 0 = not-present (translation fault), which
+        // demand-paging handles; 1 = protection violation, which is also
+        // routed through here so a write to a read-only CoW page can be
+        // promoted instead of killing the task outright. Bit 1 = write.
+        let is_write = error_code & 2 != 0;
+        if sched::handle_page_fault(cr2 as usize, is_write) {
             unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
             return; // fault handled — resume user task
         }

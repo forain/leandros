@@ -10,6 +10,7 @@
 
 pub mod buddy;
 pub mod cow;
+pub mod pageref;
 pub mod paging;
 pub mod slab;
 pub mod vmm;

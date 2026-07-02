@@ -63,32 +63,42 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         }
 
         // ── Step 3: clone the parent's address space (COW) ────────────────────
-        let as_raw_ptr: *const mm::vmm::AddressSpace = {
-            let rq = super::RUN_QUEUE.lock();
-            match rq.find_pid(parent_pid) {
-                Some(t) => {
-                    let tgid = t.tgid;
-                    let leader = rq.find_pid(tgid).unwrap_or(t);
-                    match leader.address_space.as_ref() {
-                        Some(as_) => &**as_ as *const mm::vmm::AddressSpace,
-                        None => {
-                            mm::buddy::free(stack_base_phys, stack_pages);
-                            mm::buddy::free(child_pt, 0);
-                            return -38; // kernel task → can't fork
-                        }
-                    }
-                }
-                    None => {
+        // A mutable pointer is required (not just `&`): sharing a page
+        // copy-on-write means downgrading the *parent's* own page-table
+        // entries to read-only too, and marking its own VmaRegions as
+        // CoW-tracked, not just the child's. Safe under this scheduler's
+        // single-CPU cooperative model — no concurrent access to the
+        // parent's AddressSpace can occur between the lock drop below and
+        // clone_as's use of the pointer.
+        let as_raw_ptr: *mut mm::vmm::AddressSpace = {
+            let mut rq = super::RUN_QUEUE.lock();
+            let tgid = match rq.find_pid(parent_pid) {
+                Some(t) => t.tgid,
+                None => {
                     mm::buddy::free(stack_base_phys, stack_pages);
                     mm::buddy::free(child_pt, 0);
                     return -3; // ESRCH
+                }
+            };
+            match rq.find_pid_mut(tgid) {
+                Some(leader) => match leader.address_space.as_mut() {
+                    Some(as_) => &mut **as_ as *mut mm::vmm::AddressSpace,
+                    None => {
+                        mm::buddy::free(stack_base_phys, stack_pages);
+                        mm::buddy::free(child_pt, 0);
+                        return -38; // kernel task → can't fork
                     }
-
+                },
+                None => {
+                    mm::buddy::free(stack_base_phys, stack_pages);
+                    mm::buddy::free(child_pt, 0);
+                    return -3; // ESRCH
+                }
             }
         };
 
         let child_as = unsafe {
-            match mm::cow::clone_as(&*as_raw_ptr, child_pt) {
+            match mm::cow::clone_as(&mut *as_raw_ptr, child_pt) {
                 Some(a) => a,
                 None    => {
                     mm::buddy::free(stack_base_phys, stack_pages);

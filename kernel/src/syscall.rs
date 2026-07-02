@@ -929,6 +929,7 @@ fn prot_to_page_flags(prot: usize) -> PageFlags {
 fn sys_mmap(addr: usize, len: usize, prot: usize,
             flags: usize, fd: usize, off: usize) -> isize {
     // Linux mmap flags.
+    const MAP_SHARED:    usize = 0x01;
     const MAP_FIXED:     usize = 0x10;
     const MAP_ANONYMOUS: usize = 0x20;
 
@@ -963,16 +964,17 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
 
     // ── Anonymous mmap ────────────────────────────────────────────────────────
     if flags & MAP_ANONYMOUS != 0 {
+        let is_shared = flags & MAP_SHARED != 0;
         let mapped = with_current_address_space_mut(|as_| {
             if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
-            as_.map_lazy(virt, len, page_flags)
+            as_.map_lazy(virt, len, page_flags, is_shared)
         });
         return match mapped {
             Some(true)  => virt as isize,
             Some(false) => {
                 if flags & MAP_FIXED == 0 && addr != 0 {
                     let bump = MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed);
-                    let m2 = with_current_address_space_mut(|as_| as_.map_lazy(bump, len, page_flags));
+                    let m2 = with_current_address_space_mut(|as_| as_.map_lazy(bump, len, page_flags, is_shared));
                     match m2 { Some(true) => bump as isize, _ => -12 }
                 } else { -12 }
             }
@@ -1201,7 +1203,16 @@ fn sys_wait(pid_raw: usize, status_ptr: usize) -> isize {
     match sched::wait_pid(pid_raw as u32) {
         Some(code) => {
             if status_ptr != 0 {
-                unsafe { core::ptr::write(status_ptr as *mut i32, code); }
+                // Write through the address space's own virt->phys/HHDM path
+                // rather than dereferencing the raw user pointer: this syscall
+                // runs in kernel context (ring 0 / EL1) but the target page
+                // may still be a CoW-shared, PTE-read-only page belonging to
+                // the current process (e.g. its own stack right after a
+                // fork()) — a raw write would fault in a context this
+                // kernel's page-fault handlers don't attempt to recover from.
+                with_current_address_space_mut(|as_| {
+                    as_.write_user_buf(status_ptr, &code.to_ne_bytes())
+                });
             }
             0
         }
@@ -1217,15 +1228,19 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, _options: usize) -> isize 
     let target_pid: u32 = if idtype == 1 { id as u32 } else { u32::MAX };
     let code = sched::wait_pid(target_pid);
     if let Some(exit_code) = code {
-        // Fill siginfo_t (si_signo=SIGCHLD at +0, si_code at +8, si_pid at +16, si_status at +24)
+        // Fill siginfo_t (si_signo=SIGCHLD at +0, si_code at +8, si_pid at +16, si_status at +24).
+        // Built as a kernel-local buffer and copied out via write_user_buf
+        // (virt->phys/HHDM), not a raw dereference of `infop`: this syscall
+        // runs in kernel context, and the target page may be a CoW-shared,
+        // PTE-read-only page the current process's own fault handler never
+        // gets a chance to promote in that context.
         if infop != 0 && validate_user_buf(infop, 128) {
-            unsafe {
-                core::ptr::write_bytes(infop as *mut u8, 0, 128);
-                core::ptr::write(infop            as *mut i32, 17);         // si_signo = SIGCHLD
-                core::ptr::write((infop + 8)      as *mut i32, 1);          // si_code = CLD_EXITED
-                core::ptr::write((infop + 16)     as *mut u32, target_pid); // si_pid
-                core::ptr::write((infop + 24)     as *mut i32, exit_code);  // si_status
-            }
+            let mut buf = [0u8; 128];
+            buf[0..4].copy_from_slice(&17i32.to_ne_bytes());          // si_signo = SIGCHLD
+            buf[8..12].copy_from_slice(&1i32.to_ne_bytes());          // si_code = CLD_EXITED
+            buf[16..20].copy_from_slice(&target_pid.to_ne_bytes());   // si_pid
+            buf[24..28].copy_from_slice(&exit_code.to_ne_bytes());    // si_status
+            with_current_address_space_mut(|as_| as_.write_user_buf(infop, &buf));
         }
         0
     } else {

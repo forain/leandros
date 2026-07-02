@@ -82,7 +82,7 @@ impl Drop for AddressSpace {
             if let Some(region) = slot.take() {
                 if region.lazy {
                     for phys in region.lazy_pages.iter().copied() {
-                        if phys != 0 { buddy_free(phys, 0); }
+                        if phys != 0 { crate::pageref::unref_or_free(phys, 0); }
                     }
                 } else if region.phys != 0 && region.file_cap != usize::MAX {
                     let pages = (region.end - region.start) / PAGE_SIZE;
@@ -254,12 +254,15 @@ impl AddressSpace {
     /// Reserve a virtual address range without allocating physical pages.
     ///
     /// Each page is allocated and mapped on the first access that faults into
-    /// it.  Mirrors `mmap(PROT_…, MAP_ANONYMOUS | MAP_PRIVATE, …)` with no
-    /// `MAP_POPULATE` flag.
+    /// it.  Mirrors `mmap(PROT_…, MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED, …)`
+    /// with no `MAP_POPULATE` flag; `is_shared` records which of
+    /// `MAP_PRIVATE`/`MAP_SHARED` the caller actually requested so a later
+    /// `fork()` knows whether to CoW-protect this region or share it with
+    /// full permissions (see `mm::cow::clone_as`).
     ///
     /// Returns `true` on success, `false` if the VMA table is full or the range
     /// overlaps an existing VMA.
-    pub fn map_lazy(&mut self, virt: usize, size: usize, flags: PageFlags) -> bool {
+    pub fn map_lazy(&mut self, virt: usize, size: usize, flags: PageFlags, is_shared: bool) -> bool {
         if size == 0 { return false; }
 
         let slot = match self.regions.iter().position(|r| r.is_none()) {
@@ -292,7 +295,7 @@ impl AddressSpace {
             lazy_pages: Vec::new(),
             lazy_count: 0,
             prot:      PROT_READ | PROT_WRITE,
-            map_flags: MAP_ANONYMOUS | MAP_PRIVATE,
+            map_flags: MAP_ANONYMOUS | if is_shared { MAP_SHARED } else { MAP_PRIVATE },
             file_cap:  0,
             file_off:  0,
             cow:       false,
@@ -302,14 +305,20 @@ impl AddressSpace {
 
     /// Handle a user-mode page fault at `fault_va`.
     ///
-    /// Looks up the VMA that contains `fault_va`.  If the VMA is lazy and the
-    /// faulting page has not been backed yet, allocates one 4 KiB physical page,
-    /// zeroes it, and maps it into `self.page_table_root`.
+    /// Looks up the VMA that contains `fault_va`.  Three cases:
+    ///   - Not backed yet (lazy VMA, page never faulted in): allocate one
+    ///     4 KiB physical page, zero it, map it.
+    ///   - Backed, write fault, `region.cow`: promote — copy the page (or
+    ///     reuse it in place if we're already the sole remaining owner) and
+    ///     remap it writable in this address space only.
+    ///   - Backed, anything else: a real protection violation.
     ///
     /// Returns `true` if the fault was handled (execution can resume), or `false`
-    /// if `fault_va` is not within any VMA (segmentation fault).
-    pub fn handle_user_page_fault(&mut self, fault_va: usize) -> bool {
+    /// if `fault_va` is not within any VMA, or it's a genuine protection
+    /// violation (segmentation fault either way).
+    pub fn handle_user_page_fault(&mut self, fault_va: usize, is_write: bool) -> bool {
         let page_va = fault_va & !(PAGE_SIZE - 1);
+        let page_table_root = self.page_table_root;
 
         // Find the VMA that covers the faulting address.
         let region = match self.regions.iter_mut().filter_map(|r| r.as_mut()).find(
@@ -328,7 +337,37 @@ impl AddressSpace {
 
         let lazy_phys = region.lazy_pages.get(page_idx).copied().unwrap_or(0);
         if lazy_phys != 0 {
-            return false; // page already present (protection fault)
+            // Page already present. The only fault we can legitimately
+            // service here is a write to a CoW-shared page; anything else
+            // is a real protection violation.
+            if !(is_write && region.cow) { return false; }
+
+            let refcount = crate::pageref::get(lazy_phys);
+            let new_phys = if refcount <= 1 {
+                lazy_phys // sole remaining owner: no copy needed
+            } else {
+                let np = match buddy_alloc(0) {
+                    Some(p) => p,
+                    None    => return false, // OOM
+                };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        crate::phys_to_virt(lazy_phys) as *const u8,
+                        crate::phys_to_virt(np)        as *mut u8,
+                        PAGE_SIZE,
+                    );
+                }
+                crate::pageref::dec(lazy_phys);
+                np
+            };
+
+            let mapped = unsafe { map_page(page_table_root, page_va, new_phys, region.flags) };
+            if !mapped {
+                if new_phys != lazy_phys { buddy_free(new_phys, 0); }
+                return false;
+            }
+            region.lazy_pages[page_idx] = new_phys;
+            return true;
         }
 
         // Allocate one physical page for this fault.
@@ -340,7 +379,7 @@ impl AddressSpace {
 
         // Map just the faulting page.
         let mapped = unsafe {
-            map_page(self.page_table_root, page_va, phys, region.flags)
+            map_page(page_table_root, page_va, phys, region.flags)
         };
         if !mapped {
             buddy_free(phys, 0);
@@ -366,7 +405,7 @@ impl AddressSpace {
         let mut va = page_start;
         while va < page_end {
             if self.virt_to_phys(va).is_none() {
-                self.handle_user_page_fault(va);
+                self.handle_user_page_fault(va, false);
             }
             va += PAGE_SIZE;
         }
@@ -405,7 +444,7 @@ impl AddressSpace {
                 for i in pg_first..pg_last.min(region.lazy_pages.len()) {
                     if region.lazy_pages[i] != 0 {
                         unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); }
-                        buddy_free(region.lazy_pages[i], 0);
+                        crate::pageref::unref_or_free(region.lazy_pages[i], 0);
                         region.lazy_pages[i] = 0;
                         region.lazy_count = region.lazy_count.saturating_sub(1);
                     }
@@ -567,11 +606,23 @@ impl AddressSpace {
 
             // Remap pages that are already backed (lazy pages that have been faulted in).
             if region.lazy {
+                let is_cow = region.cow;
                 for (i, &phys) in region.lazy_pages.iter().enumerate() {
                     if phys != 0 {
                         let page_va = region.start + i * PAGE_SIZE;
                         if page_va >= addr && page_va < end {
-                            unsafe { map_page(self.page_table_root, page_va, phys, new_flags); }
+                            // A page still shared with another address space
+                            // must stay read-only at the PTE level regardless
+                            // of the requested prot — region.flags (set above)
+                            // already records the real target permission, so
+                            // the CoW-promotion fault handler applies it in
+                            // full once this page is no longer shared.
+                            let install = if is_cow && crate::pageref::get(phys) > 1 {
+                                new_flags & !PageFlags::WRITABLE
+                            } else {
+                                new_flags
+                            };
+                            unsafe { map_page(self.page_table_root, page_va, phys, install); }
                         }
                     }
                 }
@@ -625,7 +676,7 @@ impl AddressSpace {
                 // No heap VMA yet — create one on the first upward brk call.
                 if new_end <= self.heap_start { return current_break as isize; }
                 let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE;
-                if self.map_lazy(self.heap_start, new_end - self.heap_start, flags) {
+                if self.map_lazy(self.heap_start, new_end - self.heap_start, flags, false) {
                     self.heap_end = new_end;
                     return new_end as isize;
                 }
@@ -664,7 +715,7 @@ impl AddressSpace {
                 if region.lazy_pages[i] != 0 {
                     let page_va = heap_start + i * PAGE_SIZE;
                     unsafe { unmap_page(self.page_table_root, page_va); }
-                    buddy_free(region.lazy_pages[i], 0);
+                    crate::pageref::unref_or_free(region.lazy_pages[i], 0);
                     region.lazy_pages[i] = 0;
                     region.lazy_count = region.lazy_count.saturating_sub(1);
                 }
