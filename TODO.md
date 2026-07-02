@@ -55,6 +55,38 @@ stack if no alt-stack is configured/enabled or if already executing on it
 This closes out Priority 1 item 1 — both signal delivery and `sigaltstack`
 are now real on both architectures.
 
+**Real bug found and fixed 2026-07-02, while building Phase 8's timer
+test**: `sched::task::SigAction`'s `mask`/`restorer` fields were declared
+in the wrong order relative to the real POSIX `struct sigaction` layout
+(`sa_handler, sa_flags, sa_restorer, sa_mask`). `sys_sigaction`
+(`sched/src/signal.rs`) reads/writes this struct via a raw
+`core::ptr::read`/`write` against whatever bytes the caller passed, so the
+swap meant `sa_restorer` (relibc's real sigreturn trampoline pointer)
+landed in the kernel's `mask` field and `sa_mask` (0) landed in
+`restorer` — any handler that actually ran crashed the process (EL0
+fault, `ELR=0`) trying to return through a NULL trampoline. Latent since
+this entry's original 2026-06-30 close-out because nothing had ever
+exercised `sigaction()` with a real custom handler end-to-end before.
+Fixed by reordering the struct fields (`sched/src/task.rs`); every other
+reference is by field name, so no other call site needed changes.
+
+**New test coverage**: `userland/sigtest` — a direct field-order
+regression (`sigaction(sig, NULL, &old)` round-trip checking `sa_mask`
+comes back as the exact bitmask set, not another field's bytes), real
+end-to-end delivery-and-return through the sigreturn trampoline (the
+exact path that used to crash), two signals with distinct handlers (no
+cross-wiring), `sigprocmask` blocking/deferring + `sigpending` reporting
++ delivery-on-unblock, and `SIG_IGN`'s default-disposition path. Verified
+2026-07-02 in QEMU on both architectures, both boot protocols (4
+configurations), all 5 checks passing.
+
+**Known adjacent gap, not fixed (out of scope for this pass)**: `raise()`
+in relibc calls `tgkill`-equivalent via a raw `TKILL` syscall
+(`platform/linux/signal.rs`), but the kernel's syscall dispatch table has
+no `TKILL` match arm at all — `raise()` always fails with `ENOSYS` on
+LeandrOS today. `sigtest` uses `kill(getpid(), sig)` instead, which is
+fully wired and exercises the same delivery path.
+
 ### 2. Complete Thread Management (Phase 4) — DONE 2026-07-01
 **Why Critical**: Threads are fundamental to multitasking and application execution.
 - Implement thread-local storage
@@ -414,7 +446,9 @@ process crashed with an EL0 fault at `ELR=0` on `sigreturn`. This was
 latent since Phase 2 (2026-06-30) and untriggered by every prior test
 suite, since none of them install a signal handler and unmask a signal
 that actually fires. Fixed by reordering the struct fields; all other code
-references fields by name, so no other call site needed changes.
+references fields by name, so no other call site needed changes. Full
+regression coverage for this fix (and signal handling generally) added
+separately as `userland/sigtest` — see the Phase 2 entry above.
 
 **New test coverage**: `userland/timertest` (mirrors the `pthreadtest`
 pattern — links `librelibc.a` directly via `relibc_start_v1`, since POSIX
