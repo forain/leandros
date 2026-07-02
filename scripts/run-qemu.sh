@@ -161,6 +161,10 @@ else
         exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg \
             -kernel "$KERNEL_ELF" \
             -device loader,file=initrd-aarch64.cpio,addr=0x48000000,force-raw=on \
+            -drive if=none,id=data0,format=raw,file=f2fs-data0.img \
+            -device virtio-blk-pci,drive=data0,disable-legacy=on \
+            -drive if=none,id=data1,format=raw,file=f2fs-data1.img \
+            -device virtio-blk-pci,drive=data1,disable-legacy=on \
             -device "$GPU_DEV" \
             -device virtio-keyboard-pci \
             "${GL_ARGS[@]}" \
@@ -191,6 +195,10 @@ else
         exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg -m 2G \
             -kernel "$KERNEL_ELF" \
             -device loader,file=initrd-x86_64.cpio,addr=0x10000000,force-raw=on \
+            -drive if=none,id=data0,format=raw,file=f2fs-data0.img \
+            -device virtio-blk-pci,drive=data0 \
+            -drive if=none,id=data1,format=raw,file=f2fs-data1.img \
+            -device virtio-blk-pci,drive=data1 \
             -vga none -device "$GPU_DEV" \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \

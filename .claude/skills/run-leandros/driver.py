@@ -134,6 +134,8 @@ def _build_direct_cmd(arch):
     chardev-socket serial/monitor/display setup used everywhere else in this
     driver instead of run-qemu.sh's `-serial mon:stdio` + graphical window.
     virtio-keyboard-pci is dropped (documented QEMU 10.x hang on this host)."""
+    data0 = os.path.join(REPO_ROOT, "f2fs-data0.img")
+    data1 = os.path.join(REPO_ROOT, "f2fs-data1.img")
     if arch == "aarch64":
         kernel = os.path.join(REPO_ROOT, "target/final-aarch64/kernel-direct")
         initrd = os.path.join(REPO_ROOT, "initrd-aarch64.cpio")
@@ -144,6 +146,10 @@ def _build_direct_cmd(arch):
             "-machine", "virt,gic-version=2", "-cpu", "max", "-m", "2G", "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
+            "-drive", f"if=none,id=data0,format=raw,file={data0}",
+            "-device", "virtio-blk-pci,drive=data0,disable-legacy=on",
+            "-drive", f"if=none,id=data1,format=raw,file={data1}",
+            "-device", "virtio-blk-pci,drive=data1,disable-legacy=on",
             "-device", "virtio-gpu-pci",
             "-audiodev", "none,id=snd0",
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
@@ -165,6 +171,10 @@ def _build_direct_cmd(arch):
             "-machine", "q35", "-cpu", "max", "-m", "2G", "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x10000000,force-raw=on",
+            "-drive", f"if=none,id=data0,format=raw,file={data0}",
+            "-device", "virtio-blk-pci,drive=data0",
+            "-drive", f"if=none,id=data1,format=raw,file={data1}",
+            "-device", "virtio-blk-pci,drive=data1",
             "-vga", "none", "-device", "virtio-vga",
             "-audiodev", "none,id=snd0",
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
