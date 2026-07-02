@@ -1,0 +1,13 @@
+[package]
+name = "sigtest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sigtest"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc! We link directly against librelibc.a, the same way
+# pthreadtest/timertest do, since signal handling needs real sigaction()/
+# TLS (relibc_start_v1 sets up the sigreturn trampoline's dependencies).
