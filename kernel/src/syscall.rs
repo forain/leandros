@@ -613,7 +613,7 @@ fn dispatch_inner(
         #[cfg(not(target_arch = "aarch64"))]
         PAUSE          => sys_rt_sigsuspend(0, 0),
 
-        // ── Threads (stubs — full implementation in Phase 4) ─────────────────
+        // ── Threads ────────────────────────────────────────────────────────────
         SET_TID_ADDR => sys_set_tid_address(a0),
         FUTEX        => sys_futex(a0, a1, a2, a3),
 
@@ -1599,7 +1599,7 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
     0
 }
 
-// ── Signal stubs (Phase 2 will provide real implementations) ─────────────────
+// ── Signal delivery syscalls ───────────────────────────────────────────────────
 
 fn sys_rt_sigaction(signum: usize, act_ptr: usize, oldact_ptr: usize) -> isize {
     if signum == 0 || signum >= 64 { return -22; } // EINVAL
@@ -1629,7 +1629,7 @@ fn sys_getppid() -> isize {
     current_ppid() as isize
 }
 
-// ── Thread stubs (Phase 4 will provide real implementations) ─────────────────
+// ── Thread primitives (futex, TID address, TLS base) ──────────────────────────
 
 fn sys_set_tid_address(tidptr: usize) -> isize {
     set_clear_child_tid(tidptr);

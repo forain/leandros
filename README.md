@@ -213,6 +213,17 @@ Register mapping follows the Linux convention on each architecture:
 - **AArch64**: syscall number in `x8`, args in `x0`–`x2`, return value in `x0`. Entry via `svc #0`.
 - **x86-64**: syscall number in `rax`, args in `rdi`/`rsi`/`rdx`, return value in `rax`. Entry via `syscall` instruction (STAR/LSTAR MSRs).
 
+The table above is the original minimal IPC/memory surface; the dispatcher (`kernel/src/syscall.rs`) has since grown to cover the real Linux syscall numbers relibc expects — `clone`, `futex`, `rt_sigaction`, the `mmap` family, VFS, and networking calls all reuse their actual Linux numbers rather than a custom scheme, so relibc's `platform::linux` Pal implementation works unmodified against this kernel.
+
+### Signal handling
+
+Full POSIX-style signal delivery is implemented on **both** architectures:
+
+- **Delivery path** — `check_and_deliver_signals()` runs on every return to userspace from a syscall, IRQ, or fault, on both AArch64 (`exception_asm.s`, EL0 paths only — the EL1 IRQ path deliberately skips it, since that path returns to interrupted kernel code) and x86-64 (`syscall_entry` return path in `arch/x86_64/src/syscall.rs`).
+- **Signal frames** — real `rt_sigframe`s on both architectures; the x86-64 frame matches the SysV `ucontext`/`mcontext` layout expected by relibc's Linux-ABI `__restore_rt` trampoline.
+- **`sigaltstack`** — real per-thread alt-stack state (`Task::altstack_sp/size/flags`). `SA_ONSTACK` redirects signal delivery onto the configured alt-stack; `SS_ONSTACK`/`EPERM`-while-active are derived from the live user stack pointer at syscall time rather than tracked separately, matching Linux's `get_sigframe()`/`do_sigaltstack()` semantics.
+- **Hardening** — `rt_sigreturn` masks the restored `spsr_el1`/`rflags` value to just the condition-code bits before applying it, so a forged signal-stack frame can't be used to request a privilege escalation (e.g. an EL0→EL1 mode-bit forgery on AArch64) via `sigreturn`.
+
 ### Boot flow
 
 **x86-64 (Limine)**
@@ -347,6 +358,16 @@ LeandrOS ships **relibc** (`userland/relibc`) — a full-featured C standard lib
 ### leandros-libc
 
 The thin `leandros-libc` (`userland/libc`) provides Rust-callable wrappers around the LeandrOS syscall ABI: `open`, `read`, `write`, `close`, `mmap`, `ipc_call`, `get_audio_port`, and port-discovery helpers exported with C linkage so that relibc and native Rust userland can share the same interface.
+
+### Threading (pthreads)
+
+Full pthread support — `pthread_create`/`join`, mutexes, condition variables, thread-local storage, and cleanup handlers — is verified working on both architectures.
+
+Following the same split real Linux libcs use, only a handful of generic primitives live in the kernel; everything POSIX-shaped is built on top of them in userspace:
+
+- **Kernel primitives** — `clone` (the `CLONE_VM` branch spawns a true OS thread sharing the caller's address space, distinct from the `CLONE_VM`-clear `fork` path) and `futex` (`FUTEX_WAIT`/`FUTEX_WAIT_BITSET` and `FUTEX_WAKE`) are the only thread-related kernel syscalls.
+- **Userspace (relibc)** — `RlctMutex`/`RlctCondvar` (built on `futex`), a `#[thread_local]` TSD map with destructor-on-exit support, and `pthread_cleanup_push`/`pop` all live in `userland/relibc`, the same layering glibc and musl use on real Linux. The kernel has no mutex, condvar, or TSD syscalls of its own.
+- Both `x86_64` and `aarch64` implement the raw thread-spawn path (`rlct_clone`) that `pthread_create` calls into; a contended mutex, condvar wait/signal, and TSD destructor ordering have all been exercised in QEMU on both targets.
 
 ---
 
