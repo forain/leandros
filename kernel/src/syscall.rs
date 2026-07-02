@@ -1105,8 +1105,9 @@ fn sys_unmap_mem(virt: usize, size: usize) -> isize {
 /// Conservative implementation: if new_size ≤ old_size, shrink by unmapping the
 /// tail.  If new_size > old_size, attempt a new anonymous mapping at new_addr
 /// (MREMAP_FIXED) or anywhere (returns ENOMEM if no room found — rare for
-/// anonymous mappings which use the bump allocator).  Copy is NOT performed;
-/// callers expecting content-preserving moves will see zeroes in the new pages.
+/// anonymous mappings which use the bump allocator), then copies the
+/// overlapping `old_size` bytes into the new mapping before releasing the old
+/// one, matching Linux's content-preserving semantics.
 fn sys_mremap(
     old_addr: usize, old_size: usize, new_size: usize,
     flags: usize, new_addr: usize,
@@ -1132,6 +1133,28 @@ fn sys_mremap(
     let result = sys_mmap(target, new_size, 3 /* PROT_READ|WRITE */,
                           0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */, usize::MAX, 0);
     if result < 0 { return result; }
+    let new_va = result as usize;
+
+    // Preserve the overlapping `old_size` bytes.  Old and new mappings are
+    // always in the caller's own address space, so both can be reached
+    // through a single lock acquisition.
+    let copied = with_current_address_space_mut(|as_| -> bool {
+        as_.prefault_range(new_va, old_size);
+        let mut off = 0usize;
+        while off < old_size {
+            let chunk = core::cmp::min(PAGE, old_size - off);
+            let mut tmp = [0u8; PAGE];
+            if !as_.read_user_buf(old_addr + off, &mut tmp[..chunk]) { return false; }
+            if !as_.write_user_buf(new_va + off, &tmp[..chunk]) { return false; }
+            off += chunk;
+        }
+        true
+    });
+    if copied != Some(true) {
+        with_current_address_space_mut(|as_| as_.unmap(new_va, new_size));
+        return -12; // ENOMEM
+    }
+
     // Unmap the old region.
     with_current_address_space_mut(|as_| as_.unmap(old_addr, old_size));
     result
