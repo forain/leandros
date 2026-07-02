@@ -44,6 +44,14 @@ pub const NET_SETSOCKOPT: u64 = 0x3D;
 pub const NET_GETSOCKOPT: u64 = 0x3E;
 pub const NET_CLOSE_ALL:  u64 = 0x3F;
 pub const NET_CLOSE:      u64 = 0x40; // close a single socket fd
+pub const NET_POLL:       u64 = 0x41; // poll(fd) → revents bitmask (POLLIN/OUT/HUP)
+
+/// Same numbering as `servers::vfs`'s POLLIN/POLLOUT/POLLHUP — see that
+/// crate's doc comment. Duplicated locally rather than depending on `vfs`
+/// purely to query four bit constants.
+const POLLIN:  u64 = 0x0001;
+const POLLOUT: u64 = 0x0004;
+const POLLHUP: u64 = 0x0010;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -332,6 +340,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                             arg(msg,3) as usize, arg(msg,4) as usize),
         NET_CLOSE_ALL  => { handle_close_all(caller_pid); ok_reply() }
         NET_CLOSE      => handle_close(caller_pid, arg(msg,0) as usize),
+        NET_POLL       => handle_poll(caller_pid, arg(msg,0) as usize),
         _              => err_reply(-38),
     }
 }
@@ -854,6 +863,62 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
         _ => { tbl.socks[slot] = SockEntry::empty(); }
     }
     ok_reply()
+}
+
+/// NET_POLL(fd) → revents bitmask reflecting the socket's *actual* current
+/// state, matching exactly what `handle_recv`/`handle_send`/`handle_accept`
+/// would do right now — never a guess. Callers AND this against their
+/// requested-events mask, except POLLHUP which is reported unconditionally
+/// (mirroring `poll(2)`/`epoll_wait(2)`).
+fn handle_poll(pid: u32, fd: usize) -> Message {
+    let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
+    let tbls = SOCK_TABLES.lock();
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+        Some(t) => t, None => return err_reply(-9),
+    };
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    let state = tbl.socks[slot].state;
+
+    let revents: u64 = match state {
+        SockState::Connected { conn_idx, is_a } => {
+            drop(tbls);
+            let conns = UNIX_CONNS.lock();
+            let conn = &conns[conn_idx];
+            // Mirrors handle_recv exactly: readable ⇔ our peer's ring has
+            // bytes for us, OR the connection is fully closed (recv() would
+            // return 0/EOF without blocking either way).
+            let readable   = if is_a { conn.ring_ba.count } else { conn.ring_ab.count };
+            let write_free = RING_SIZE - if is_a { conn.ring_ab.count } else { conn.ring_ba.count };
+            let mut ev = 0;
+            if readable > 0 || !conn.in_use { ev |= POLLIN; }
+            if conn.in_use && write_free > 0 { ev |= POLLOUT; }
+            if !conn.in_use { ev |= POLLHUP; }
+            ev
+        }
+        SockState::Listening { .. } => {
+            drop(tbls);
+            // Mirrors handle_accept's own global PendingAccept scan exactly,
+            // so "poll says readable" and "accept() succeeds" never disagree.
+            let tbls2 = SOCK_TABLES.lock();
+            let pending = tbls2.iter().any(|t| t.in_use && t.socks.iter()
+                .any(|s| matches!(s.state, SockState::PendingAccept { .. })));
+            if pending { POLLIN } else { 0 }
+        }
+        SockState::InetListening => {
+            let port = tbl.socks[slot].bound_port;
+            drop(tbls);
+            let listeners = INET_LISTENERS.lock();
+            match listeners.iter().find(|l| l.in_use && l.port == port) {
+                Some(l) if l.n_pending > 0 => POLLIN,
+                _ => 0,
+            }
+        }
+        // Unbound / PendingAccept / InetPendingAccept / None: connect()'s
+        // synchronous completion means these never linger observably; no
+        // readiness source is wired up for them.
+        _ => { drop(tbls); 0 }
+    };
+    val_reply(revents)
 }
 
 fn handle_close_all(pid: u32) {

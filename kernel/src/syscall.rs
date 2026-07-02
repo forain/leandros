@@ -1461,14 +1461,13 @@ fn sys_times(buf_ptr: usize) -> isize {
 
 /// sys_ppoll(fds_ptr, nfds, timeout_ptr, sigmask_ptr) — wait for events on fd set.
 ///
-/// Checks each struct pollfd once; marks revents for ready fds.
-/// If all fds report POLLNVAL (bad fd) or no events, returns 0 (timeout).
+/// Rechecks every struct pollfd against real per-fd readiness (see
+/// `probe_fd_events`) in a cooperative retry loop until at least one is
+/// ready or `timeout_ptr`'s `struct timespec` elapses (NULL = block
+/// indefinitely, `{0,0}` = check once and return immediately). If all fds
+/// report POLLNVAL (bad fd) or no events by the deadline, returns 0.
 fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -> isize {
     // struct pollfd { fd: i32, events: i16, revents: i16 } = 8 bytes.
-    const POLLIN:   i16 = 0x0001;
-    const POLLOUT:  i16 = 0x0004;
-    const POLLERR:  i16 = 0x0008;
-    const POLLHUP:  i16 = 0x0010;
     const POLLNVAL: i16 = 0x0020;
 
     if nfds == 0 { return 0; }
@@ -1476,62 +1475,36 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
     if !validate_user_buf(fds_ptr, sz) { return -14; }
 
     let pid = current_pid();
-    let mut nready = 0isize;
 
-    for i in 0..nfds {
-        let pfd = fds_ptr + i * 8;
-        let fd     = unsafe { core::ptr::read(pfd          as *const i32) };
-        let events = unsafe { core::ptr::read((pfd + 4)    as *const i16) };
-
-        if fd < 0 {
-            unsafe { core::ptr::write((pfd + 6) as *mut i16, 0); }
-            continue;
-        }
-        let fd = fd as usize;
-
-        let revents: i16 = if fd <= 2 {
-            // fd 0 = stdin: report readable if evdev has data, else 0.
-            // fd 1/2 = stdout/stderr: always writable.
-            if fd == 0 {
-                if evdev_server::has_events(0) || crate::serial_has_data() { POLLIN } else { 0 }
-            } else {
-                events & POLLOUT
-            }
-        } else {
-            // Check VFS: probe with a zero-count read.
-            let probe = make_vfs_msg(vfs::VFS_LSEEK,
-                &[fd as u64, 0u64, 1u64 /* SEEK_CUR */]);
-            let r = vfs_reply_val(&vfs::handle(&probe, pid));
-            if r == -9 {
-                POLLNVAL
-            } else {
-                // Assume writable; readable if it's a pipe with data.
-                let mut rev = 0i16;
-                if events & POLLOUT != 0 { rev |= POLLOUT; }
-                if events & POLLIN  != 0 { rev |= POLLIN; }
-                rev
-            }
-        };
-
-        unsafe { core::ptr::write((pfd + 6) as *mut i16, revents); }
-        if revents != 0 && revents != POLLNVAL { nready += 1; }
-    }
-
-    // If timeout_ptr is NULL (infinite wait) but no events yet, yield once and
-    // return 0 — caller should retry.  If timeout is {0,0}, return immediately.
-    if nready == 0 && timeout_ptr != 0 {
-        // Check if timeout is zero.
+    let (infinite, deadline) = if timeout_ptr == 0 {
+        (true, 0)
+    } else {
+        if !validate_user_buf(timeout_ptr, 16) { return -14; }
         let tv_sec  = unsafe { core::ptr::read(timeout_ptr       as *const i64) };
         let tv_nsec = unsafe { core::ptr::read((timeout_ptr + 8) as *const i64) };
-        if tv_sec == 0 && tv_nsec == 0 { return 0; }
-        // Non-zero timeout: yield once before returning (cooperative).
-        #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("sti; nop; cli"); }
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
+        if tv_sec < 0 || tv_nsec < 0 { return -22; } // EINVAL
+        let ticks_needed = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
+        (false, ticks().wrapping_add(ticks_needed))
+    };
 
-        yield_now("ppoll");
-    } else if nready == 0 {
+    loop {
+        let mut nready = 0isize;
+        for i in 0..nfds {
+            let pfd = fds_ptr + i * 8;
+            let fd     = unsafe { core::ptr::read(pfd       as *const i32) };
+            let events = unsafe { core::ptr::read((pfd + 4) as *const i16) };
+
+            if fd < 0 {
+                unsafe { core::ptr::write((pfd + 6) as *mut i16, 0); }
+                continue;
+            }
+            let revents = probe_fd_events(pid, fd as usize, events as u16 as u32) as i16;
+            unsafe { core::ptr::write((pfd + 6) as *mut i16, revents); }
+            if revents != 0 && revents != POLLNVAL { nready += 1; }
+        }
+        if nready > 0 { return nready; }
+        if !infinite && ticks() >= deadline { return 0; }
+
         #[cfg(target_arch = "x86_64")]
         unsafe { core::arch::asm!("sti; nop; cli"); }
         #[cfg(target_arch = "aarch64")]
@@ -1539,7 +1512,6 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
 
         yield_now("ppoll");
     }
-    nready
 }
 
 /// sys_nanosleep / sys_clock_nanosleep — yield-loop until the requested time
@@ -2747,8 +2719,9 @@ fn sys_pipe2(pipefd_ptr: usize, _flags: usize) -> isize {
 
 fn sys_dup(oldfd: usize) -> isize {
     let pid = current_pid();
-    // Allocate a new fd: pass newfd=u32::MAX as sentinel for "any free fd".
-    let msg = make_vfs_msg(vfs::VFS_DUP2, &[oldfd as u64, u64::MAX]);
+    // dup() picks the lowest free fd — that's VFS_ALLOC_FD. (VFS_DUP2 targets a
+    // specific newfd and rejects the u64::MAX "any" sentinel as out of range.)
+    let msg = make_vfs_msg(vfs::VFS_ALLOC_FD, &[oldfd as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
@@ -3238,9 +3211,13 @@ fn sys_getsockopt(sockfd: usize, level: usize, optname: usize,
 
 // ── poll / select / epoll (Phase 9) ──────────────────────────────────────────
 //
-// Strategy: we implement a simple "check once and return ready events" model.
-// Blocking poll is emulated by returning 0 (timeout) — the caller retries.
-// This is correct for most POSIX use cases: non-blocking I/O + eventfd loops.
+// Readiness for every fd is queried for real (see `probe_fd_events` /
+// `poll_fd_state`) by asking the owning server (VFS or net) about its actual
+// ring/counter state — never assumed. `epoll_wait`/`ppoll`/`select` each run
+// a cooperative check-then-yield loop (mirroring `sys_read`'s pipe-EAGAIN
+// loop and `sys_nanosleep`'s deadline loop elsewhere in this file) until
+// something is ready or their timeout elapses, so a real blocking multi-fd
+// wait no longer busy-returns "not ready" on the very first check.
 
 const MAX_EPOLL_INSTANCES: usize = 16;
 const MAX_EPOLL_INTERESTS: usize = 32;
@@ -3273,6 +3250,21 @@ impl EpollInstance {
 
 /// FD base for epoll instances — must not overlap VFS/TTY/net ranges.
 const EPOLL_FD_BASE: usize = 0x400;
+
+/// `struct epoll_event` on-the-wire layout: real Linux packs this to 12
+/// bytes (`data` at offset 4) on x86_64 only (`EPOLL_PACKED` in glibc's
+/// `bits/epoll.h`); every other architecture, aarch64 included, uses the
+/// natural 16-byte layout (`data` at offset 8). Must match
+/// `userland/relibc/src/header/sys_epoll/mod.rs`'s `epoll_event` exactly —
+/// see that struct's doc comment.
+#[cfg(target_arch = "x86_64")]
+const EPOLL_EVENT_SIZE: usize = 12;
+#[cfg(target_arch = "x86_64")]
+const EPOLL_EVENT_DATA_OFF: usize = 4;
+#[cfg(not(target_arch = "x86_64"))]
+const EPOLL_EVENT_SIZE: usize = 16;
+#[cfg(not(target_arch = "x86_64"))]
+const EPOLL_EVENT_DATA_OFF: usize = 8;
 
 static EPOLL_INSTANCES: spin::Mutex<[EpollInstance; MAX_EPOLL_INSTANCES]> =
     spin::Mutex::new([const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES]);
@@ -3310,10 +3302,13 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
 
     match op {
         CTL_ADD | CTL_MOD => {
-            // struct epoll_event: events(u32) + data(u64) = 12 bytes (packed) or 16 bytes.
-            if event_ptr == 0 || !validate_user_buf(event_ptr, 12) { return -14; }
+            if event_ptr == 0 || !validate_user_buf(event_ptr, EPOLL_EVENT_SIZE) { return -14; }
             let events = unsafe { core::ptr::read(event_ptr as *const u32) };
-            let data   = unsafe { core::ptr::read((event_ptr + 4) as *const u64) };
+            // Not necessarily 8-byte aligned on x86_64 (offset 4 in the
+            // packed layout) — read_unaligned is required, not read.
+            let data = unsafe {
+                core::ptr::read_unaligned((event_ptr + EPOLL_EVENT_DATA_OFF) as *const u64)
+            };
             // Find existing entry or allocate new one.
             let inst = &mut ep[slot];
             let idx = inst.interests.iter().position(|i| i.in_use && i.fd == fd as i32)
@@ -3339,12 +3334,14 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
 
 /// sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms)
 ///
-/// Checks each registered fd for readiness once.  Pipes and sockets with data
-/// in their ring buffers are immediately EPOLLIN-ready.  Everything else is
-/// considered ready-to-write (EPOLLOUT).  Returns the number of ready events.
-fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, _timeout: usize) -> isize {
+/// `timeout_ms` follows `epoll_wait(2)`: `usize::MAX` (the bit pattern of a
+/// raw `-1` `c_int` sign-extended by relibc's `syscall!` macro) blocks
+/// indefinitely, `0` checks once and returns immediately, otherwise it's a
+/// millisecond budget rounded to this kernel's ~10ms tick granularity.
+/// Returns the number of ready events, or 0 on timeout.
+fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usize) -> isize {
     if maxevents == 0 { return -22; }
-    if !validate_user_buf(events_ptr, maxevents * 12) { return -14; }
+    if !validate_user_buf(events_ptr, maxevents * EPOLL_EVENT_SIZE) { return -14; }
 
     let slot = if epfd >= EPOLL_FD_BASE && epfd < EPOLL_FD_BASE + MAX_EPOLL_INSTANCES {
         epfd - EPOLL_FD_BASE
@@ -3353,60 +3350,81 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, _timeout: us
     };
 
     let pid = current_pid();
-    let ep = EPOLL_INSTANCES.lock();
-    if !ep[slot].in_use || ep[slot].owner_pid != pid { return -9; }
-
-    let mut nready = 0usize;
-    let base = events_ptr;
-
-    for interest in ep[slot].interests.iter() {
-        if !interest.in_use || nready >= maxevents { break; }
-        // Determine if the fd has data available (EPOLLIN).
-        // We check VFS pipe rings and net socket rings.
-        let ready_events = probe_fd_events(pid, interest.fd as usize, interest.events);
-        if ready_events != 0 {
-            let off = nready * 12;
-            unsafe {
-                core::ptr::write((base + off) as *mut u32, ready_events);
-                core::ptr::write((base + off + 4) as *mut u64, interest.data);
-            }
-            nready += 1;
-        }
+    {
+        let ep = EPOLL_INSTANCES.lock();
+        if !ep[slot].in_use || ep[slot].owner_pid != pid { return -9; }
     }
-    nready as isize
+
+    let infinite = timeout == usize::MAX;
+    let deadline = ticks().wrapping_add((timeout as u64) / 10);
+
+    loop {
+        let nready = {
+            let ep = EPOLL_INSTANCES.lock();
+            let mut n = 0usize;
+            let base = events_ptr;
+            for interest in ep[slot].interests.iter() {
+                if !interest.in_use || n >= maxevents { break; }
+                let ready_events = probe_fd_events(pid, interest.fd as usize, interest.events);
+                if ready_events != 0 {
+                    let off = n * EPOLL_EVENT_SIZE;
+                    unsafe {
+                        core::ptr::write((base + off) as *mut u32, ready_events);
+                        // See the read_unaligned note in sys_epoll_ctl.
+                        core::ptr::write_unaligned(
+                            (base + off + EPOLL_EVENT_DATA_OFF) as *mut u64, interest.data);
+                    }
+                    n += 1;
+                }
+            }
+            n
+        };
+        if nready > 0 { return nready as isize; }
+        if timeout == 0 || (!infinite && ticks() >= deadline) { return 0; }
+
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("sti; nop; cli"); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
+        yield_now("epoll_wait");
+    }
 }
 
-/// Check what events are currently available on `fd` for `pid`.
-///
-/// Returns a bitmask of `EPOLLIN`/`EPOLLOUT` flags.  We probe the VFS and net
-/// server ring states directly without going through the full handle() path.
-fn probe_fd_events(_pid: u32, _fd: usize, requested: u32) -> u32 {
-    const EPOLLIN:  u32 = 0x0001;
-    const EPOLLOUT: u32 = 0x0004;
-    const EPOLLHUP: u32 = 0x0010;
+/// Query real, current readiness for `fd` — routes to the owning server
+/// (VFS for fd < `net_server::SOCK_FD_BASE`, net otherwise) or, for fd 0-2,
+/// the same evdev/serial/always-writable checks the console already used.
+/// Returns the fd's true POLLIN/POLLOUT/POLLERR/POLLHUP/POLLNVAL state.
+fn poll_fd_state(pid: u32, fd: usize) -> u32 {
+    const POLLIN:   u32 = 0x0001;
+    const POLLOUT:  u32 = 0x0004;
+    const POLLNVAL: u32 = 0x0020;
 
-    // For sockets and TTY fds, assume always writable.
-    // For VFS fds (pipe read-end), check ring count via a zero-byte read probe.
-    // Simplest correct behavior: check if a zero-count read/recv returns >0.
-    // We use the "send 0-byte read" trick — if VFS_READ(fd, null, 0) returns >=0,
-    // the fd is valid; actual readability is harder to check without reading data.
-    // For now: fd 0 (stdin) is never ready; pipes/sockets return EPOLLOUT always,
-    // plus EPOLLIN if there's data.
-
-    let mut events = 0u32;
-
-    // Pipes: probe by trying a zero-byte VFS_READ.  VFS returns 0 for an
-    // empty pipe (not -EAGAIN), so we can't detect empty vs. EOF this way.
-    // Return EPOLLOUT so writers are never blocked; return EPOLLIN speculatively.
-    if requested & EPOLLIN != 0 {
-        // Conservative: mark EPOLLIN ready for all readable fds.
-        // musl's stdio will do the actual read and handle blocking.
-        events |= EPOLLIN;
+    if fd == 0 {
+        return if evdev_server::has_events(0) || crate::serial_has_data() { POLLIN } else { 0 };
     }
-    if requested & EPOLLOUT != 0 {
-        events |= EPOLLOUT;
+    if fd == 1 || fd == 2 {
+        return POLLOUT;
     }
-    events
+    if fd >= net_server::SOCK_FD_BASE {
+        let msg = make_vfs_msg(net_server::NET_POLL, &[fd as u64]);
+        let r = net_reply_val(&net_server::handle(&msg, pid));
+        return if r < 0 { POLLNVAL } else { r as u32 };
+    }
+    let msg = make_vfs_msg(vfs::VFS_POLL, &[fd as u64]);
+    let r = vfs_reply_val(&vfs::handle(&msg, pid));
+    if r < 0 { POLLNVAL } else { r as u32 }
+}
+
+/// Mask real fd readiness (`poll_fd_state`) down to what the caller actually
+/// asked about, except POLLERR/POLLHUP/POLLNVAL — real `poll(2)`/
+/// `epoll_wait(2)` report those unconditionally regardless of the requested
+/// event mask.
+fn probe_fd_events(pid: u32, fd: usize, requested: u32) -> u32 {
+    const POLLERR:  u32 = 0x0008;
+    const POLLHUP:  u32 = 0x0010;
+    const POLLNVAL: u32 = 0x0020;
+    let state = poll_fd_state(pid, fd);
+    (state & requested) | (state & (POLLERR | POLLHUP | POLLNVAL))
 }
 
 fn sys_eventfd2(initval: usize, _flags: usize) -> isize {
@@ -3471,35 +3489,71 @@ fn sys_timerfd_gettime(fd: usize, cur_ptr: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-/// sys_select(nfds, readfds, writefds, exceptfds, timeout) — simplified.
+/// sys_select(nfds, readfds, writefds, exceptfds, timeout_ptr).
 ///
-/// Returns immediately: readfds and writefds are left unchanged (all bits set
-/// for fds that are valid — conservative "all ready" answer).
-fn sys_select(nfds: usize, rfds: usize, wfds: usize, _efds: usize, _tv: usize) -> isize {
-    // Number of bytes in fd_set for nfds descriptors: ceil(nfds/8).
+/// Only bits the caller actually set in `readfds`/`writefds` are ever
+/// considered — unlike the fake implementation this replaces, an fd is
+/// reported ready only once `probe_fd_events` confirms it for real. Retries
+/// in a cooperative loop until something is ready or `timeout_ptr`'s
+/// `struct timeval` elapses (NULL = block indefinitely). `exceptfds`, if
+/// given, is always cleared: no fd type in this kernel produces an
+/// "exceptional condition" distinct from POLLERR/POLLHUP. Bad fds (bits set
+/// past `nfds`'s real descriptor table) are simply never marked ready rather
+/// than failing the call with EBADF, unlike real Linux `select(2)`.
+fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize) -> isize {
+    const POLLIN:  u32 = 0x0001;
+    const POLLOUT: u32 = 0x0004;
+
+    if nfds > 1024 { return -22; } // EINVAL — matches relibc's FD_SETSIZE
     let bytes = (nfds + 7) / 8;
-    if rfds != 0 && validate_user_buf(rfds, bytes) {
-        // Set all bits up to nfds — conservatively "all ready".
-        unsafe {
-            let n_full = bytes.saturating_sub(1);
-            for i in 0..n_full { *(rfds as *mut u8).add(i) = 0xFF; }
-            // Last byte: only bits 0..(nfds%8) set.
-            let last_bits = nfds % 8;
-            *(rfds as *mut u8).add(n_full) = if last_bits == 0 { 0xFF }
-                                             else { (1u8 << last_bits) - 1 };
+    let pid = current_pid();
+
+    let has_r = rfds != 0 && validate_user_buf(rfds, bytes);
+    let has_w = wfds != 0 && validate_user_buf(wfds, bytes);
+    let has_e = efds != 0 && validate_user_buf(efds, bytes);
+
+    let (infinite, deadline) = if tv_ptr == 0 {
+        (true, 0)
+    } else {
+        if !validate_user_buf(tv_ptr, 16) { return -14; }
+        let tv_sec  = unsafe { core::ptr::read(tv_ptr       as *const i64) };
+        let tv_usec = unsafe { core::ptr::read((tv_ptr + 8) as *const i64) };
+        if tv_sec < 0 || tv_usec < 0 { return -22; } // EINVAL
+        let ticks_needed = (tv_sec as u64) * 100 + (tv_usec as u64) / 10_000;
+        (false, ticks().wrapping_add(ticks_needed))
+    };
+
+    loop {
+        // fd_set is capped at 1024 bits (FD_SETSIZE) above, so 128 bytes
+        // always covers `bytes`.
+        let mut out_r = [0u8; 128];
+        let mut out_w = [0u8; 128];
+        let mut nready = 0isize;
+
+        for fd in 0..nfds {
+            let want_r = has_r && unsafe { (*(rfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
+            let want_w = has_w && unsafe { (*(wfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
+            if !want_r && !want_w { continue; }
+            let requested = (if want_r { POLLIN } else { 0 }) | (if want_w { POLLOUT } else { 0 });
+            let ev = probe_fd_events(pid, fd, requested);
+            if want_r && ev & POLLIN  != 0 { out_r[fd / 8] |= 1 << (fd % 8); nready += 1; }
+            if want_w && ev & POLLOUT != 0 { out_w[fd / 8] |= 1 << (fd % 8); nready += 1; }
         }
-    }
-    if wfds != 0 && validate_user_buf(wfds, bytes) {
-        unsafe {
-            let n_full = bytes.saturating_sub(1);
-            for i in 0..n_full { *(wfds as *mut u8).add(i) = 0xFF; }
-            let last_bits = nfds % 8;
-            *(wfds as *mut u8).add(n_full) = if last_bits == 0 { 0xFF }
-                                             else { (1u8 << last_bits) - 1 };
+
+        if nready > 0 || (!infinite && ticks() >= deadline) {
+            if has_r { unsafe { core::ptr::copy_nonoverlapping(out_r.as_ptr(), rfds as *mut u8, bytes); } }
+            if has_w { unsafe { core::ptr::copy_nonoverlapping(out_w.as_ptr(), wfds as *mut u8, bytes); } }
+            if has_e { unsafe { core::ptr::write_bytes(efds as *mut u8, 0, bytes); } }
+            return nready;
         }
+
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("sti; nop; cli"); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
+
+        yield_now("select");
     }
-    // Return number of "ready" fds — nfds is an upper bound.
-    nfds as isize
 }
 
 // ── rename / truncate / sendfile / itimer / sigpending / alarm ───────────────

@@ -65,6 +65,16 @@ pub const VFS_CHMOD:           u64 = 0x2B; // chmod(path_ptr, mode) → 0 or -er
 pub const VFS_FCHMOD:          u64 = 0x2C; // fchmod(fd, mode) → 0 or -errno
 pub const VFS_CHOWN:           u64 = 0x2D; // chown(path_ptr, uid, gid) → 0 or -errno
 pub const VFS_FCHOWN:          u64 = 0x2E; // fchown(fd, uid, gid) → 0 or -errno
+pub const VFS_POLL:            u64 = 0x2F; // poll(fd) → revents bitmask (POLLIN/OUT/ERR/HUP)
+
+/// Readiness bitmask, numerically identical to Linux's POLLIN/POLLOUT/POLLERR/
+/// POLLHUP (and thus also EPOLLIN/EPOLLOUT/EPOLLERR/EPOLLHUP) so one value
+/// answers a `VFS_POLL` query regardless of which multiplexing syscall the
+/// kernel is servicing it for.
+pub const POLLIN:  u32 = 0x0001;
+pub const POLLOUT: u32 = 0x0004;
+pub const POLLERR: u32 = 0x0008;
+pub const POLLHUP: u32 = 0x0010;
 
 // ── Message helpers ───────────────────────────────────────────────────────────
 
@@ -292,8 +302,11 @@ struct PipeRing {
     read_pos:    usize,
     write_pos:   usize,
     count:       usize,
-    read_open:   bool,
-    write_open:  bool,
+    // Reference counts of open read / write endpoints, not booleans: a pipe end
+    // can be held by more than one fd (via dup/dup2 or inherited across fork), so
+    // EOF/EPIPE/POLLHUP must only fire once the LAST fd on that end is closed.
+    readers:     u32,
+    writers:     u32,
 }
 
 impl PipeRing {
@@ -301,7 +314,7 @@ impl PipeRing {
         Self {
             buf: [0u8; PIPE_RING_SIZE],
             read_pos: 0, write_pos: 0, count: 0,
-            read_open: false, write_open: false,
+            readers: 0, writers: 0,
         }
     }
 
@@ -324,6 +337,26 @@ impl PipeRing {
 
 static PIPE_RINGS: Mutex<[PipeRing; MAX_PIPES]> =
     Mutex::new([const { PipeRing::new() }; MAX_PIPES]);
+
+/// Bump the reader/writer refcount for a pipe endpoint when an fd referring to
+/// it is duplicated (dup, dup2, fork inheritance). No-op for non-pipe fds.
+/// Caller must NOT hold the FD_TABLES lock (we take PIPE_RINGS here).
+fn pipe_ref_inc(kind: &VnodeKind) {
+    if let VnodeKind::Pipe { ring, is_write } = kind {
+        let mut rings = PIPE_RINGS.lock();
+        if *is_write { rings[*ring].writers += 1; } else { rings[*ring].readers += 1; }
+    }
+}
+
+/// Drop one reference to a pipe endpoint (a close, or a dup2 that overwrites an
+/// already-open fd). Saturating so a stray double-close can never underflow.
+fn pipe_ref_dec(kind: &VnodeKind) {
+    if let VnodeKind::Pipe { ring, is_write } = kind {
+        let mut rings = PIPE_RINGS.lock();
+        if *is_write { rings[*ring].writers = rings[*ring].writers.saturating_sub(1); }
+        else         { rings[*ring].readers = rings[*ring].readers.saturating_sub(1); }
+    }
+}
 
 // ── eventfd counters ──────────────────────────────────────────────────────────
 
@@ -365,6 +398,30 @@ impl TimerFdEntry {
 
 static TIMERFD_POOL: Mutex<[TimerFdEntry; MAX_TIMERFDS]> =
     Mutex::new([const { TimerFdEntry::free() }; MAX_TIMERFDS]);
+
+/// Recompute a timerfd's pending-expiration count against the current tick,
+/// folding any missed periods into `expirations` and rearming the deadline —
+/// the same catch-up logic `handle_read`'s `TimerFd` arm used to run inline.
+/// Non-consuming: callers that read the count (rather than just probing
+/// readiness) are responsible for resetting `expirations` to 0 afterward.
+/// Shared with `handle_ioctl`'s `FIONREAD` and `handle_poll` so neither can
+/// under-report an expiry that hasn't been read yet.
+fn timerfd_poll_expirations(slot: usize) -> u64 {
+    let now = sched::ticks();
+    let mut pool = TIMERFD_POOL.lock();
+    let e = &mut pool[slot];
+    if e.armed && now >= e.deadline_ticks {
+        let elapsed = now - e.deadline_ticks;
+        let extra = if e.interval_ticks > 0 { elapsed / e.interval_ticks + 1 } else { 1 };
+        e.expirations += extra;
+        if e.interval_ticks > 0 {
+            e.deadline_ticks += extra * e.interval_ticks;
+        } else {
+            e.armed = false;
+        }
+    }
+    e.expirations
+}
 
 // ── FD table ─────────────────────────────────────────────────────────────────
 
@@ -692,6 +749,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                               arg(msg,1) as u32, arg(msg,2) as u32),
         VFS_FCHOWN           => handle_fchown(caller_pid, arg(msg,0) as usize,
                                                arg(msg,1) as u32, arg(msg,2) as u32),
+        VFS_POLL             => handle_poll(caller_pid, arg(msg,0) as usize),
         _                    => err_reply(-38), // ENOSYS
     }
 }
@@ -1191,7 +1249,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 // No data yet.  Signal the kernel whether to retry:
                 //   -11 (EAGAIN) = write end still open → caller should yield and retry
                 //    0 (EOF)     = write end closed → caller returns 0
-                return if r.write_open { err_reply(-11) } else { val_reply(0) };
+                return if r.writers > 0 { err_reply(-11) } else { val_reply(0) };
             }
             let mut n = 0usize;
             while n < count.min(4096) {
@@ -1234,22 +1292,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             let slot = *slot;
             drop(tbls);
             if count < 8 { return err_reply(-22); } // EINVAL
-            let now = sched::ticks();
-            let exp = {
-                let mut pool = TIMERFD_POOL.lock();
-                let e = &mut pool[slot];
-                if e.armed && now >= e.deadline_ticks {
-                    let elapsed = now - e.deadline_ticks;
-                    let extra = if e.interval_ticks > 0 { elapsed / e.interval_ticks + 1 } else { 1 };
-                    e.expirations += extra;
-                    if e.interval_ticks > 0 {
-                        e.deadline_ticks += extra * e.interval_ticks;
-                    } else {
-                        e.armed = false;
-                    }
-                }
-                e.expirations
-            };
+            let exp = timerfd_poll_expirations(slot);
             if exp == 0 { return err_reply(-11); } // EAGAIN
             TIMERFD_POOL.lock()[slot].expirations = 0;
             unsafe { (buf as *mut u64).write(exp); }
@@ -1283,7 +1326,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             drop(tbls);
             let mut rings = PIPE_RINGS.lock();
             let r = &mut rings[ring_idx];
-            if !r.read_open { return err_reply(-32); } // EPIPE
+            if r.readers == 0 { return err_reply(-32); } // EPIPE
             let mut n = 0usize;
             while n < count {
                 if !r.put(unsafe { *buf.add(n) }) { break; }
@@ -1410,8 +1453,8 @@ fn handle_close(pid: u32, fd: usize) -> Message {
     match kind {
         VnodeKind::Pipe { ring, is_write } => {
             let mut rings = PIPE_RINGS.lock();
-            if is_write { rings[ring].write_open = false; }
-            else        { rings[ring].read_open  = false; }
+            if is_write { rings[ring].writers = rings[ring].writers.saturating_sub(1); }
+            else        { rings[ring].readers = rings[ring].readers.saturating_sub(1); }
         }
         VnodeKind::EventFd { slot } => {
             EVENTFD_COUNTERS.lock()[slot] = u64::MAX;
@@ -1505,13 +1548,13 @@ fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize) -> Message {
         let mut rings = PIPE_RINGS.lock();
         let mut found = None;
         for (i, r) in rings.iter().enumerate() {
-            if !r.read_open && !r.write_open && r.count == 0 {
+            if r.readers == 0 && r.writers == 0 && r.count == 0 {
                 found = Some(i); break;
             }
         }
         let i = match found { Some(i) => i, None => return err_reply(-23) };
-        rings[i].read_open  = true;
-        rings[i].write_open = true;
+        rings[i].readers = 1;
+        rings[i].writers = 1;
         i
     };
     let mut tbls = FD_TABLES.lock();
@@ -1536,7 +1579,14 @@ fn handle_dup2(pid: u32, oldfd: usize, newfd: usize) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds[oldfd].in_use { return err_reply(-9); }
+    if oldfd == newfd { return val_reply(newfd as u64); } // dup2(fd, fd) is a no-op
+    // dup2 silently closes newfd first if it was open; drop its pipe ref.
+    let replaced = if tbl.fds[newfd].in_use { Some(tbl.fds[newfd].kind) } else { None };
+    let dupled = tbl.fds[oldfd].kind;
     tbl.fds[newfd] = tbl.fds[oldfd];
+    drop(tbls);
+    if let Some(old) = replaced { pipe_ref_dec(&old); }
+    pipe_ref_inc(&dupled); // newfd is a second fd on the same pipe endpoint
     val_reply(newfd as u64)
 }
 
@@ -1551,6 +1601,14 @@ fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
         slot.in_use = true;
         slot.pid    = child_pid;
         slot.fds    = parent_fds;
+    }
+    drop(tbls);
+    // The child now holds a second fd on every inherited pipe endpoint, so its
+    // reader/writer refcount must go up: otherwise the parent closing its copy
+    // would falsely signal EOF/EPIPE/POLLHUP to the still-open child (and vice
+    // versa) — the exact defect that broke poll/select/epoll across fork.
+    for f in parent_fds.iter() {
+        if f.in_use { pipe_ref_inc(&f.kind); }
     }
     ok_reply()
 }
@@ -1586,8 +1644,8 @@ fn handle_close_all(pid: u32) -> Message {
             match kind {
                 VnodeKind::Pipe { ring, is_write } => {
                     let mut rings = PIPE_RINGS.lock();
-                    if is_write { rings[ring].write_open = false; }
-                    else        { rings[ring].read_open  = false; }
+                    if is_write { rings[ring].writers = rings[ring].writers.saturating_sub(1); }
+                    else        { rings[ring].readers = rings[ring].readers.saturating_sub(1); }
                 }
                 VnodeKind::EventFd { slot } => {
                     EVENTFD_COUNTERS.lock()[slot] = u64::MAX;
@@ -1869,6 +1927,9 @@ fn handle_alloc_fd(pid: u32, oldfd: usize) -> Message {
     };
     tbl.fds[newfd] = tbl.fds[oldfd];
     tbl.fds[newfd].flags &= !O_CLOEXEC; // dup() clears O_CLOEXEC
+    let dupled = tbl.fds[newfd].kind;
+    drop(tbls);
+    pipe_ref_inc(&dupled); // newfd is a second fd on the same pipe endpoint
     val_reply(newfd as u64)
 }
 
@@ -2338,11 +2399,72 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
         VnodeKind::RamFile { data, pos } => (data.len().saturating_sub(*pos)) as i32,
         VnodeKind::TmpFile { idx, pos, .. } => { let i = *idx; let c = *pos; drop(tbls); TMP_FILES.lock()[i].len.saturating_sub(c) as i32 }
         VnodeKind::EventFd { slot } => { let s = *slot; drop(tbls); if EVENTFD_COUNTERS.lock()[s] > 0 { 8 } else { 0 } }
-        VnodeKind::TimerFd { slot } => { let s = *slot; drop(tbls); if TIMERFD_POOL.lock()[s].expirations > 0 { 8 } else { 0 } }
+        VnodeKind::TimerFd { slot } => { let s = *slot; drop(tbls); if timerfd_poll_expirations(s) > 0 { 8 } else { 0 } }
         _ => return err_reply(-25),
     };
     unsafe { (arg as *mut i32).write(bytes_avail); }
     val_reply(0)
+}
+
+/// VFS_POLL(fd) → revents bitmask reflecting the vnode's *actual* current
+/// state — never a guess.  Callers (poll/select/epoll in `kernel/src/syscall.rs`)
+/// AND this against their requested-events mask, except for POLLERR/POLLHUP
+/// which real `poll(2)`/`epoll_wait(2)` report unconditionally.
+///
+/// DevStdio and DynamicDevice fds beyond the kernel's own fd-0 fast path
+/// (evdev/serial, handled directly in `kernel/src/syscall.rs` before this is
+/// ever reached) have no readiness source wired through this crate yet — they
+/// conservatively report not-ready rather than risk a false POLLIN/POLLOUT.
+fn handle_poll(pid: u32, fd: usize) -> Message {
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+
+    let revents: u32 = match &tbl.fds[fd].kind {
+        VnodeKind::Pipe { ring, is_write: false } => {
+            let r = *ring;
+            drop(tbls);
+            let ring = &PIPE_RINGS.lock()[r];
+            let mut ev = 0;
+            if ring.count > 0 { ev |= POLLIN; }
+            if ring.writers == 0 { ev |= POLLIN | POLLHUP; } // EOF: read() returns 0 without blocking
+            ev
+        }
+        VnodeKind::Pipe { ring, is_write: true } => {
+            let r = *ring;
+            drop(tbls);
+            let ring = &PIPE_RINGS.lock()[r];
+            if ring.readers == 0 {
+                POLLERR // reader gone: next write() gets EPIPE
+            } else if ring.count < PIPE_RING_SIZE {
+                POLLOUT
+            } else {
+                0
+            }
+        }
+        VnodeKind::RamFile { .. } | VnodeKind::TmpFile { .. } | VnodeKind::MountedFile { .. }
+        | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom | VnodeKind::DevFb { .. } => {
+            drop(tbls);
+            POLLIN | POLLOUT // synchronous, memory- or polled-disk-backed I/O never blocks here
+        }
+        VnodeKind::EventFd { slot } => {
+            let s = *slot;
+            drop(tbls);
+            let mut ev = POLLOUT; // only EINVAL's on overflow, never actually blocks
+            if EVENTFD_COUNTERS.lock()[s] > 0 { ev |= POLLIN; }
+            ev
+        }
+        VnodeKind::TimerFd { slot } => {
+            let s = *slot;
+            drop(tbls);
+            if timerfd_poll_expirations(s) > 0 { POLLIN } else { 0 }
+        }
+        VnodeKind::DevStdio { .. } | VnodeKind::DynamicDevice { .. } | VnodeKind::None => {
+            drop(tbls);
+            0
+        }
+    };
+    val_reply(revents as u64)
 }
 
 fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
