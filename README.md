@@ -223,7 +223,7 @@ Full POSIX-style signal delivery is implemented on **both** architectures:
 - **Signal frames** — real `rt_sigframe`s on both architectures; the x86-64 frame matches the SysV `ucontext`/`mcontext` layout expected by relibc's Linux-ABI `__restore_rt` trampoline.
 - **`sigaltstack`** — real per-thread alt-stack state (`Task::altstack_sp/size/flags`). `SA_ONSTACK` redirects signal delivery onto the configured alt-stack; `SS_ONSTACK`/`EPERM`-while-active are derived from the live user stack pointer at syscall time rather than tracked separately, matching Linux's `get_sigframe()`/`do_sigaltstack()` semantics.
 - **Hardening** — `rt_sigreturn` masks the restored `spsr_el1`/`rflags` value to just the condition-code bits before applying it, so a forged signal-stack frame can't be used to request a privilege escalation (e.g. an EL0→EL1 mode-bit forgery on AArch64) via `sigreturn`.
-- **Testing** — `userland/sigtest` covers a `sigaction()` struct field-order round trip, real delivery-and-return through the sigreturn trampoline, per-signal handler dispatch, `sigprocmask`/`sigpending` blocking and deferred delivery, and `SIG_IGN`. `raise()` currently always fails with `ENOSYS` (the kernel has no `TKILL` dispatch arm, though `kill()` is fully wired) — a known gap, not yet fixed.
+- **Testing** — `userland/sigtest` covers a `sigaction()` struct field-order round trip, real delivery-and-return through the sigreturn trampoline, per-signal handler dispatch, `sigprocmask`/`sigpending` blocking and deferred delivery, `SIG_IGN`, and `raise()` (which resolves to a `TKILL` syscall against the caller's own tid, distinct from the `KILL`/`TGKILL` paths the other checks exercise).
 
 ### POSIX timers
 
@@ -436,7 +436,7 @@ VFS resource lifecycle (open/close notifications) ensures that server-side handl
 | `f2fstest` | Regression suite: F2FS direct/indirect/double-indirect block pointers, directories |
 | `pthreadtest` | Regression suite: `pthread_create`/`join`, mutex, condvar, TSD, cleanup handlers |
 | `timertest` | Regression suite: POSIX timers, `alarm`/`setitimer`, real `SIGALRM` delivery |
-| `sigtest` | Regression suite: `sigaction` struct layout, signal delivery/return, `sigprocmask`/`sigpending`, `SIG_IGN` |
+| `sigtest` | Regression suite: `sigaction` struct layout, signal delivery/return, `sigprocmask`/`sigpending`, `SIG_IGN`, `raise()` |
 
 Programs are linked against **relibc** for full POSIX compatibility, or against the lighter `leandros-libc` shim for `no_std` Rust programs. Binaries are embedded in the initrd image and extracted at boot. `pthreadtest`, `timertest`, and `sigtest` link `librelibc.a` directly rather than `leandros-libc`, since they need TLS bring-up (`relibc_start_v1`) for real `pthread`/`errno`/`sigaction` support.
 

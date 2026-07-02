@@ -80,12 +80,21 @@ cross-wiring), `sigprocmask` blocking/deferring + `sigpending` reporting
 2026-07-02 in QEMU on both architectures, both boot protocols (4
 configurations), all 5 checks passing.
 
-**Known adjacent gap, not fixed (out of scope for this pass)**: `raise()`
-in relibc calls `tgkill`-equivalent via a raw `TKILL` syscall
-(`platform/linux/signal.rs`), but the kernel's syscall dispatch table has
-no `TKILL` match arm at all — `raise()` always fails with `ENOSYS` on
-LeandrOS today. `sigtest` uses `kill(getpid(), sig)` instead, which is
-fully wired and exercises the same delivery path.
+**Adjacent gap found 2026-07-02, fixed same day**: `raise()` in relibc
+calls `GETTID` then issues a raw `TKILL` syscall against its own tid
+(`platform/linux/signal.rs`), but the kernel's syscall dispatch table
+(`kernel/src/syscall.rs`) had a `TGKILL` arm (used by `pthread_kill`) and
+a `KILL` arm, but no `TKILL` arm at all — every `raise()` call fell
+through to the default `_ => -38` (ENOSYS) case. Fixed by adding the
+`TKILL` syscall-number constants (130 on AArch64, 200 on x86-64, matching
+real Linux and relibc's own `nr_{aarch64,x86_64}.rs`) and a `sys_tkill`
+dispatch arm — identical in behavior to `sys_tgkill` minus the (ignored)
+thread-group-id argument, since this kernel has no separate thread-group
+concept and resolves both by task id via `sched::deliver_signal`.
+`sigtest` gained a sixth check, `raise_delivers_signal`, that calls
+`raise()` directly (rather than `kill(getpid(), sig)`, which was already
+wired and is what the other checks use) so a regression here fails loudly.
+Verified 2026-07-02 in QEMU on both architectures, all 6 checks passing.
 
 ### 2. Complete Thread Management (Phase 4) — DONE 2026-07-01
 **Why Critical**: Threads are fundamental to multitasking and application execution.
