@@ -1199,13 +1199,34 @@ fn sys_spawn(entry_va: usize, stack_va: usize, priority_raw: usize) -> isize {
     }
 }
 
-/// sys_wait(pid, status_ptr) — block until `pid` exits; write its exit code.
+/// Encode an internal exit code as a POSIX wait status.
 ///
-/// Blocks until the target task becomes a Zombie, writes its `i32` exit code
-/// to `status_ptr` (user-space aligned pointer), reaps the task, and returns 0.
+/// `<sys/wait.h>`'s `WIFEXITED`/`WEXITSTATUS` macros expect the musl/Linux
+/// layout, where a normal termination is `(code & 0xff) << 8` and the low 7
+/// bits are a terminating signal (0 ⇒ exited normally). Writing the raw code
+/// straight through — as this used to — makes `WIFEXITED(status)` read false
+/// and `WEXITSTATUS(status)` read 0 for any exit code ≥ 128, so every caller
+/// that inspects the status misreads it.
+///
+/// This kernel tracks only a single `i32` exit code per task with no separate
+/// "terminated by signal" flag (the signal path stores the shell-convention
+/// `128 + signo`), so every wait is reported as a normal exit. That is the
+/// honest encoding for what is tracked; distinguishing `WIFSIGNALED` would
+/// require threading a terminating-signal field through the exit path.
+#[inline]
+fn encode_wait_status(code: i32) -> i32 {
+    (code & 0xff) << 8
+}
+
+/// sys_wait(pid, status_ptr) — block until `pid` exits; write its wait status.
+///
+/// Blocks until the target task becomes a Zombie, writes the POSIX-encoded
+/// wait status to `status_ptr` (user-space aligned pointer), reaps the task,
+/// and returns the reaped child's pid (as POSIX `waitpid` requires).
 ///
 /// Returns:
-///   -3  (ESRCH)   — `pid` does not exist
+///   > 0           — the reaped child's pid
+///   -10 (ECHILD)  — `pid` is not a waitable child
 ///   -14 (EFAULT)  — `status_ptr` is null, misaligned, or out of range
 fn sys_wait(pid_raw: usize, status_ptr: usize) -> isize {
     // Validate before blocking — catches bad pointers before we yield.
@@ -1214,8 +1235,9 @@ fn sys_wait(pid_raw: usize, status_ptr: usize) -> isize {
     }
 
     match sched::wait_pid(pid_raw as u32) {
-        Some(code) => {
+        Some((reaped_pid, code)) => {
             if status_ptr != 0 {
+                let status = encode_wait_status(code);
                 // Write through the address space's own virt->phys/HHDM path
                 // rather than dereferencing the raw user pointer: this syscall
                 // runs in kernel context (ring 0 / EL1) but the target page
@@ -1224,12 +1246,12 @@ fn sys_wait(pid_raw: usize, status_ptr: usize) -> isize {
                 // fork()) — a raw write would fault in a context this
                 // kernel's page-fault handlers don't attempt to recover from.
                 with_current_address_space_mut(|as_| {
-                    as_.write_user_buf(status_ptr, &code.to_ne_bytes())
+                    as_.write_user_buf(status_ptr, &status.to_ne_bytes())
                 });
             }
-            0
+            reaped_pid as isize
         }
-        None => -3, // ESRCH — pid not found
+        None => -10, // ECHILD — no such waitable child
     }
 }
 
@@ -1240,7 +1262,7 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, _options: usize) -> isize 
     // idtype: 0=P_ALL, 1=P_PID, 2=P_PGID
     let target_pid: u32 = if idtype == 1 { id as u32 } else { u32::MAX };
     let code = sched::wait_pid(target_pid);
-    if let Some(exit_code) = code {
+    if let Some((_reaped_pid, exit_code)) = code {
         // Fill siginfo_t (si_signo=SIGCHLD at +0, si_code at +8, si_pid at +16, si_status at +24).
         // Built as a kernel-local buffer and copied out via write_user_buf
         // (virt->phys/HHDM), not a raw dereference of `infop`: this syscall

@@ -302,7 +302,19 @@ pub fn heap_end() -> usize {
 
 pub fn init() {}
 
-pub fn wait_pid(pid: Pid) -> Option<i32> {
+/// Block until child `pid` terminates, then reap it and return
+/// `(reaped_pid, exit_code)`.
+///
+/// Returns the pid alongside the code because POSIX `waitpid()` must report
+/// *which* child was reaped (its return value), not just the status. The
+/// zombie may already have been auto-reaped into `EXIT_LOG` by the scheduler
+/// before we get here, so both the live-zombie and the logged paths are
+/// handled — in either case the pid is the one we were asked to wait on.
+///
+/// NB: a `pid` of `u32::MAX` (POSIX `-1`, "any child") is not resolved here —
+/// `find_pid_idx`/`get_exit_code` can't match it — so it yields `None`
+/// (ECHILD). Waiting for an unspecified child is a separate feature.
+pub fn wait_pid(pid: Pid) -> Option<(Pid, i32)> {
     loop {
         {
             let mut rq = RUN_QUEUE.lock();
@@ -311,10 +323,10 @@ pub fn wait_pid(pid: Pid) -> Option<i32> {
                 if state == TaskState::Zombie {
                     let code = rq.get(idx).unwrap().exit_code;
                     rq.remove(idx);
-                    return Some(code);
+                    return Some((pid, code));
                 }
             } else {
-                if let Some(code) = get_exit_code(pid) { return Some(code); }
+                if let Some(code) = get_exit_code(pid) { return Some((pid, code)); }
                 return None;
             }
         }
