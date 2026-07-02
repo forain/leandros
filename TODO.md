@@ -234,12 +234,110 @@ do see each other's writes across a fork.
 
 ## Priority 2: Core System Integration (Phase 7)
 
-### 4. Complete VFS Server Implementation (Phase 3/7)
+### 4. Complete VFS Server Implementation (Phase 3/7) — DONE 2026-07-01
 **Why Critical**: VFS is the foundation for file operations and user-space compatibility.
 - Implement full file system operations (open, read, write, etc.)
 - Add device file support and directory operations
 - Implement file permissions and ownership
 - Add file locking and advisory locking support
+
+**Actual state found**: like items 1-3, this entry's framing was stale.
+`servers/vfs/src/lib.rs` already had a substantially complete VFS
+(open/read/write/close/lseek/stat/pipe/dup/getdents64/mkdir/unlink across
+tmpfs, RAMFS, devfs, and mounted filesystems) — "device file support" and
+most "directory operations" were already real, not stubbed. The genuine
+gaps, found by reading the code rather than the bullet list:
+- No `rmdir` at all — no protocol tag, no handler; `unlink()` explicitly
+  refused directories, with no path to remove one.
+- `rename()` only worked within `/tmp`; unlike `open`/`stat`/`unlink`/
+  `mkdir`, it was never proxied to a mounted filesystem.
+- No advisory locking anywhere: `flock(2)` was a kernel-side stub that
+  always returned success; `fcntl(F_SETLK/F_GETLK/F_SETLKW)` silently
+  no-op'd in the VFS server's fcntl fallthrough.
+- No file permissions/ownership model: every file's `st_uid`/`st_gid` was
+  always 0; `chmod`/`chown`/`setuid`/`setgid` were kernel-side no-ops that
+  discarded their arguments and always reported success; `open()`'s `mode`
+  argument was read but never stored or checked.
+
+**What was implemented**:
+- **rmdir**: new `VFS_RMDIR` tag + `handle_rmdir` (tmpfs, empty-check via
+  prefix scan, EBUSY on built-in dirs, EROFS elsewhere); kernel's
+  `sys_unlinkat` now honors `AT_REMOVEDIR` and routes accordingly; F2FS
+  gained a real `handle_rmdir` (with an empty-directory check), and its
+  `handle_unlink` now rejects directories with EISDIR instead of silently
+  unlinking them.
+- **rename to mounted filesystems**: `handle_rename` now proxies to a
+  mount's IPC port when either path resolves under one (EXDEV if old/new
+  resolve to different mounts); F2FS gained a `VFS_RENAME` dispatch +
+  `handle_rename` (rejects an existing destination name — no
+  overwrite-on-rename yet).
+- **Advisory locking**: a shared lock table in `servers/vfs/src/lib.rs`,
+  keyed by vnode identity (tmpfs slot, or mount port + file_id), backs both
+  a real `flock()` (whole-file shared/exclusive, `LOCK_NB`) and a real
+  byte-range `fcntl(F_GETLK/F_SETLK/F_SETLKW)` — both process-owned and
+  released on `close`/process exit. flock and fcntl share one lock domain
+  (stricter than real Linux's independent classes, never weaker). The
+  user's `struct flock` is read/written via
+  `AddressSpace::read_user_buf`/`write_user_buf` rather than a raw pointer
+  dereference — the same kernel-mode CoW-page-fault hazard class fixed in
+  Phase 6. Kernel's `FLOCK` stub replaced with a real `sys_flock`.
+- **Permissions/ownership**: `TmpFileEntry` now carries real
+  `mode`/`uid`/`gid`, set from the creating task's euid/egid and umask at
+  `open(O_CREAT)`/`mkdir()` time (both previously discarded the `mode`
+  argument entirely). `handle_open` enforces owner/group/other permission
+  bits against the caller's euid/egid (root bypasses, matching Unix
+  semantics). New `VFS_CHMOD`/`VFS_FCHMOD`/`VFS_CHOWN`/`VFS_FCHOWN` handlers
+  (tmpfs only — everywhere else now honestly returns EROFS/EPERM instead of
+  the previous silent-success lie) wired from the kernel's
+  `FCHMODAT`/`FCHMOD`/`FCHOWNAT`/`FCHOWN` (previously hardcoded `=> 0`).
+  `SETUID`/`SETGID` now really mutate the calling task's credentials
+  (`sched::set_current_uid/gid`, real setuid(2) drop-privilege semantics —
+  a root process can permanently drop to another uid but can't regain
+  root), and `GETUID`/`GETEUID`/`GETGID`/`GETEGID` report the real values
+  instead of a hardcoded 0. `stat()` reports real `st_uid`/`st_gid` for
+  tmpfs entries.
+
+**Real bug found and fixed in passing**: the kernel's `RENAMEAT`/
+`RENAMEAT2` dispatch called `sys_renameat(a1, a2)` — `a2` is `renameat`'s
+*new-directory-fd* argument (typically `AT_FDCWD`), not the new-path
+pointer (`a3`). Every `rename()`/`renameat()` call in the system (including
+via relibc, e.g. the shell's `mv`) was reading a bogus "path pointer" built
+from `AT_FDCWD`'s bit pattern and failing with EFAULT. Caught by writing a
+real end-to-end rename test rather than trusting the code read. Fixed to
+`sys_renameat(a1, a3)`.
+
+**New test coverage**: `userland/vfstest` (mirrors the Phase 6 `memtest`
+pattern) — `rmdir` (empty/non-empty/ENOTEMPTY), `rename` (move + content
+check), `flock_conflict` (cross-process EAGAIN denial + release/reacquire
+via `fork()`), `fcntl_byte_range_conflict` (cross-process byte-range denial
++ `F_GETLK` conflict reporting), `permission_enforced` (setuid privilege
+drop, EACCES on a 0600 file, and confirming root can't be regained).
+`leandros-libc` gained the corresponding syscall wrappers (`rmdir`,
+`rename`, `chmod`/`fchmod`, `chown`/`fchown`, `flock`, `fcntl_lock`,
+`setuid`/`setgid`) it didn't have before.
+
+**What's Left**:
+- [ ] Permissions/ownership and locking only cover tmpfs; F2FS-mounted
+      files have no chmod/chown/lock support (F2FS inodes don't carry
+      uid/gid on disk yet) — same on-disk-format dependency other F2FS gaps
+      share.
+- [ ] `rename()` across two different mounts (or between `/tmp` and a
+      mount) returns EXDEV rather than a copy+unlink fallback — matches
+      Linux's own syscall behavior, but userspace (`mv`/coreutils) would
+      need to implement that fallback itself, same as on real Linux.
+- [ ] Discovered, not fixed (out of scope for this pass): `servers/init`'s
+      `run_posix_tests()`/`init_main()` — a substantial POSIX smoke-test
+      suite (tmpfs, pipes, dup2, getdents64, /proc, shell pipe/redirect) —
+      is dead code. `kernel/src/init.rs`'s own doc comment claims it "hands
+      off to `init_server::init_main()`", but nothing in the kernel actually
+      calls it; the real boot path spawns the separate `userland/init` ELF,
+      which `execve`s straight into `bin/shell`. Worth fixing later, but
+      wiring dead code back up wasn't part of this task's scope.
+
+**Verified 2026-07-01** in QEMU on x86_64 and aarch64, both UEFI/Limine and
+direct boot (4 configurations): `vfstest` (5/5) and `memtest` (4/4,
+regression check) both pass cleanly on every configuration; the interactive
+shell's `ls`/`mkdir` still work normally afterward.
 
 ### 5. Complete F2FS Implementation (Phase 7)
 **Why Critical**: File system support is essential for data persistence.
