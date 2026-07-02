@@ -223,6 +223,7 @@ mod nr {
     pub const TIMER_CREATE:   usize = 107;
     pub const TIMER_SETTIME:  usize = 110;
     pub const TIMER_GETTIME:  usize = 108;
+    pub const TIMER_GETOVERRUN: usize = 109;
     pub const TIMER_DELETE:   usize = 111;
     // Process management
     pub const CHDIR:          usize = 49;
@@ -415,7 +416,8 @@ mod nr {
     pub const TIMER_CREATE:   usize = 222;
     pub const TIMER_SETTIME:  usize = 223;
     pub const TIMER_GETTIME:  usize = 224;
-    pub const TIMER_DELETE:   usize = 225;
+    pub const TIMER_GETOVERRUN: usize = 225;
+    pub const TIMER_DELETE:   usize = 226;
     // Process management
     pub const CHDIR:          usize = 80;
     pub const FCHDIR:         usize = 81;
@@ -723,6 +725,7 @@ fn dispatch_inner(
         TIMER_CREATE  => sys_timer_create(a0, a1, a2),
         TIMER_SETTIME => sys_timer_settime(a0, a1, a2, a3),
         TIMER_GETTIME => sys_timer_gettime(a0, a1),
+        TIMER_GETOVERRUN => sys_timer_getoverrun(a0),
         TIMER_DELETE  => sys_timer_delete(a0),
         NANOSLEEP       => sys_nanosleep(a0, a1),
         CLOCK_NANOSLEEP => sys_nanosleep(a2, a3), // clock_nanosleep(clk,flags,rqtp,rmtp)
@@ -3055,8 +3058,12 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
 fn sys_timer_create(_clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) -> isize {
     // struct sigevent: sigev_value(8) + sigev_signo(4) + sigev_notify(4) + ...
     // We only care about sigev_signo at offset 8 (SIGEV_SIGNAL = 0).
+    if timerid_ptr != 0 && !validate_user_buf(timerid_ptr, core::mem::size_of::<usize>()) { return -14; }
     let signo = if sigevent_ptr != 0 && validate_user_buf(sigevent_ptr, 12) {
-        unsafe { core::ptr::read((sigevent_ptr + 8) as *const u32) }
+        let mut buf = [0u8; 12];
+        let ok = with_current_address_space(|as_| as_.read_user_buf(sigevent_ptr, &mut buf))
+            .unwrap_or(false);
+        if ok { u32::from_ne_bytes(buf[8..12].try_into().unwrap()) } else { 14 }
     } else {
         14 // SIGALRM default
     };
@@ -3068,6 +3075,7 @@ fn sys_timer_create(_clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) ->
 
 fn sys_timer_settime(timerid: usize, _flags: usize, ispec_ptr: usize, ospec_ptr: usize) -> isize {
     if ispec_ptr != 0 && !validate_user_buf(ispec_ptr, 32) { return -14; }
+    if ospec_ptr != 0 && !validate_user_buf(ospec_ptr, 32) { return -14; }
     let pid = current_pid();
     let msg = make_vfs_msg(tty_server::TIMER_SETTIME,
         &[timerid as u64, ispec_ptr as u64, ospec_ptr as u64]);
@@ -3079,6 +3087,15 @@ fn sys_timer_gettime(timerid: usize, ospec_ptr: usize) -> isize {
     if !validate_user_buf(ospec_ptr, 32) { return -14; }
     let pid = current_pid();
     let msg = make_vfs_msg(tty_server::TIMER_GETTIME, &[timerid as u64, ospec_ptr as u64]);
+    let reply = tty_server::handle(&msg, pid);
+    net_reply_val(&reply)
+}
+
+/// sys_timer_getoverrun(timerid) — number of extra expirations since the
+/// timer's signal was last checked (reset to 0 on each call).
+fn sys_timer_getoverrun(timerid: usize) -> isize {
+    let pid = current_pid();
+    let msg = make_vfs_msg(tty_server::TIMER_GETOVERRUN, &[timerid as u64]);
     let reply = tty_server::handle(&msg, pid);
     net_reply_val(&reply)
 }
@@ -3547,74 +3564,83 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: usize, count: usize) ->
 ///
 /// Maps `ITIMER_REAL` (which=0) to a POSIX timer with SIGALRM.
 /// Other `which` values (VIRTUAL, PROF) are accepted but ignored.
+const ITIMER_TICK_HZ: u64 = 100;
+const ITIMER_USEC_PER_TICK: u64 = 1_000_000 / ITIMER_TICK_HZ;
+
+/// Parse a 32-byte `struct itimerval` (`{ it_interval, it_value }`, each a
+/// `{ tv_sec: i64, tv_usec: i64 }` pair) into `(interval_ticks, value_ticks)`.
+fn parse_itimerval(buf: &[u8; 32]) -> (u64, u64) {
+    let iv_sec  = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
+    let iv_usec = i64::from_ne_bytes(buf[8..16].try_into().unwrap());
+    let va_sec  = i64::from_ne_bytes(buf[16..24].try_into().unwrap());
+    let va_usec = i64::from_ne_bytes(buf[24..32].try_into().unwrap());
+    let itv = (iv_sec as u64 * ITIMER_TICK_HZ) + (iv_usec as u64 / ITIMER_USEC_PER_TICK);
+    let vtv = (va_sec as u64 * ITIMER_TICK_HZ) + (va_usec as u64 / ITIMER_USEC_PER_TICK);
+    (itv, vtv)
+}
+
+/// Encode `(interval_ticks, value_ticks)` as a 32-byte `struct itimerval`.
+fn itimerval_bytes(interval_ticks: u64, value_ticks: u64) -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    buf[0..8].copy_from_slice(&((interval_ticks / ITIMER_TICK_HZ) as i64).to_ne_bytes());
+    buf[8..16].copy_from_slice(&(((interval_ticks % ITIMER_TICK_HZ) * ITIMER_USEC_PER_TICK) as i64).to_ne_bytes());
+    buf[16..24].copy_from_slice(&((value_ticks / ITIMER_TICK_HZ) as i64).to_ne_bytes());
+    buf[24..32].copy_from_slice(&(((value_ticks % ITIMER_TICK_HZ) * ITIMER_USEC_PER_TICK) as i64).to_ne_bytes());
+    buf
+}
+
 fn sys_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize {
     // struct itimerval: { it_interval: timeval(16), it_value: timeval(16) } = 32 bytes
-    // struct timeval: { tv_sec: i64, tv_usec: i64 }
     if new_ptr != 0 && !validate_user_buf(new_ptr, 32) { return -14; }
-    if old_ptr != 0 && !validate_user_buf(old_ptr, 32) { return -22; }
+    if old_ptr != 0 && !validate_user_buf(old_ptr, 32) { return -14; }
 
     // We only implement ITIMER_REAL (0).
     if which != 0 { return 0; } // silently succeed for VIRTUAL/PROF
 
     let pid = current_pid();
 
-    // Read new itimerval: {it_interval.tv_sec, it_interval.tv_usec, it_value.tv_sec, it_value.tv_usec}
-    const TICK_HZ: u64 = 100;
     let (interval_ticks, value_ticks) = if new_ptr != 0 {
-        unsafe {
-            let iv_sec  = core::ptr::read(new_ptr          as *const i64);
-            let iv_usec = core::ptr::read((new_ptr +  8)   as *const i64);
-            let va_sec  = core::ptr::read((new_ptr + 16)   as *const i64);
-            let va_usec = core::ptr::read((new_ptr + 24)   as *const i64);
-            let itv = (iv_sec as u64 * TICK_HZ) + (iv_usec as u64 * TICK_HZ / 1_000_000);
-            let vtv = (va_sec as u64 * TICK_HZ) + (va_usec as u64 * TICK_HZ / 1_000_000);
-            (itv, vtv)
+        let mut buf = [0u8; 32];
+        if !with_current_address_space(|as_| as_.read_user_buf(new_ptr, &mut buf)).unwrap_or(false) {
+            return -14;
         }
+        parse_itimerval(&buf)
     } else {
         (0, 0)
     };
 
-    // If old_ptr requested, return zeros (we don't track the previous state here).
+    // Arm the reserved ITIMER_REAL slot directly (tick units — no synthetic
+    // user-space pointer round-trip; see set_real_itimer's doc comment).
+    let (old_interval_ticks, old_value_ticks) = tty_server::set_real_itimer(pid, interval_ticks, value_ticks);
+
     if old_ptr != 0 {
-        unsafe { core::ptr::write_bytes(old_ptr as *mut u8, 0, 32); }
+        let obuf = itimerval_bytes(old_interval_ticks, old_value_ticks);
+        if !with_current_address_space(|as_| as_.write_user_buf(old_ptr, &obuf)).unwrap_or(false) {
+            return -14;
+        }
     }
-
-    // Use POSIX timer slot 0 for ITIMER_REAL.
-    // First ensure the timer slot exists (create it if necessary).
-    let create_msg = make_vfs_msg(tty_server::TIMER_CREATE, &[14u64 /* SIGALRM */, 0u64]);
-    let _ = tty_server::handle(&create_msg, pid);
-
-    // Build a synthetic itimerspec in stack memory and call TIMER_SETTIME.
-    // struct itimerspec: { it_interval: timespec(16), it_value: timespec(16) }
-    const NSEC_PER_TICK: u64 = 1_000_000_000 / TICK_HZ;
-    let mut spec = [0i64; 4];
-    spec[0] = (interval_ticks / TICK_HZ) as i64;
-    spec[1] = ((interval_ticks % TICK_HZ) * NSEC_PER_TICK) as i64;
-    spec[2] = (value_ticks / TICK_HZ) as i64;
-    spec[3] = ((value_ticks % TICK_HZ) * NSEC_PER_TICK) as i64;
-    let spec_ptr = spec.as_ptr() as usize;
-
-    let set_msg = make_vfs_msg(tty_server::TIMER_SETTIME,
-        &[0u64 /* timerid=0 */, spec_ptr as u64, 0u64]);
-    let r = tty_server::handle(&set_msg, pid);
-    if net_reply_val(&r) < 0 { -22 } else { 0 }
+    0
 }
 
 /// sys_getitimer(which, cur_ptr) — get current interval timer state.
 fn sys_getitimer(which: usize, cur_ptr: usize) -> isize {
     if which != 0 { return 0; }
     if !validate_user_buf(cur_ptr, 32) { return -14; }
-    // Zero out the itimerval (simplified — we don't track remaining time per-itimer).
-    unsafe { core::ptr::write_bytes(cur_ptr as *mut u8, 0, 32); }
-    0
+    let pid = current_pid();
+    let (interval_ticks, value_ticks) = tty_server::get_real_itimer(pid);
+    let buf = itimerval_bytes(interval_ticks, value_ticks);
+    if with_current_address_space(|as_| as_.write_user_buf(cur_ptr, &buf)).unwrap_or(false) { 0 } else { -14 }
 }
 
 /// sys_sigpending(set_ptr) — return the set of pending signals.
 fn sys_sigpending(set_ptr: usize) -> isize {
     if !validate_user_buf(set_ptr, 8) { return -14; }
     let pending = pending_signals();
-    unsafe { core::ptr::write(set_ptr as *mut u64, pending); }
-    0
+    if with_current_address_space(|as_| as_.write_user_buf(set_ptr, &pending.to_ne_bytes())).unwrap_or(false) {
+        0
+    } else {
+        -14
+    }
 }
 
 /// sys_alarm(seconds) — schedule SIGALRM after `seconds` seconds (x86-64 only).
@@ -3622,25 +3648,15 @@ fn sys_sigpending(set_ptr: usize) -> isize {
 fn sys_alarm(seconds: usize) -> isize {
     let pid = current_pid();
     const TICK_HZ: u64 = 100;
-    const NSEC_PER_TICK: u64 = 1_000_000_000 / TICK_HZ;
     let value_ticks = seconds as u64 * TICK_HZ;
 
-    // Ensure POSIX timer slot 0 exists.
-    let create_msg = make_vfs_msg(tty_server::TIMER_CREATE, &[14u64 /* SIGALRM */, 0u64]);
-    let _ = tty_server::handle(&create_msg, pid);
+    // One-shot (no interval) — arm the reserved ITIMER_REAL slot directly.
+    let (_, old_value_ticks) = tty_server::set_real_itimer(pid, 0, value_ticks);
 
-    // Build itimerspec (one-shot, no interval).
-    let mut spec = [0i64; 4];
-    // it_interval = 0 (one-shot)
-    // it_value = seconds
-    spec[2] = (value_ticks / TICK_HZ) as i64;
-    spec[3] = ((value_ticks % TICK_HZ) * NSEC_PER_TICK) as i64;
-    let spec_ptr = spec.as_ptr() as usize;
-
-    let set_msg = make_vfs_msg(tty_server::TIMER_SETTIME,
-        &[0u64, spec_ptr as u64, 0u64]);
-    let _ = tty_server::handle(&set_msg, pid);
-    0 // previous alarm remaining seconds (we don't track)
+    // Real alarm() returns the number of seconds remaining on any previous
+    // alarm, rounded up so a caller never sees "0 seconds left" for an
+    // alarm that's about to fire (matches glibc/Linux behavior).
+    ((old_value_ticks + TICK_HZ - 1) / TICK_HZ) as isize
 }
 
 // ── fork / clone ──────────────────────────────────────────────────────────────

@@ -39,6 +39,7 @@ pub const TIMER_CREATE:   u64 = 0x50;
 pub const TIMER_SETTIME:  u64 = 0x51;
 pub const TIMER_GETTIME:  u64 = 0x52;
 pub const TIMER_DELETE:   u64 = 0x53;
+pub const TIMER_GETOVERRUN: u64 = 0x54;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -189,12 +190,13 @@ struct PosixTimer {
     signo:     u32,
     interval:  u64, // repeat interval in ticks (0 = one-shot)
     deadline:  u64, // absolute tick deadline (0 = disarmed)
+    overrun:   u32, // extra expirations missed since last timer_getoverrun()
     owner_pid: u32,
 }
 
 impl PosixTimer {
     const fn new() -> Self {
-        Self { in_use: false, signo: 0, interval: 0, deadline: 0, owner_pid: 0 }
+        Self { in_use: false, signo: 0, interval: 0, deadline: 0, overrun: 0, owner_pid: 0 }
     }
 }
 
@@ -218,11 +220,31 @@ impl ProcTimerTable {
 static TIMER_TABLES: Mutex<[ProcTimerTable; MAX_PROCS]> =
     Mutex::new([const { ProcTimerTable::empty() }; MAX_PROCS]);
 
+/// Find `pid`'s timer table, allocating a fresh one if this is its first timer.
+/// Returns `None` only if every one of `MAX_PROCS` process slots is already
+/// in use by a different pid.
+fn get_or_create_timer_table<'a>(pid: u32, tbls: &'a mut [ProcTimerTable]) -> Option<&'a mut ProcTimerTable> {
+    if let Some(pos) = tbls.iter().position(|t| t.in_use && t.pid == pid) {
+        return Some(&mut tbls[pos]);
+    }
+    let pos = tbls.iter().position(|t| !t.in_use)?;
+    tbls[pos] = ProcTimerTable::empty();
+    tbls[pos].in_use = true;
+    tbls[pos].pid    = pid;
+    Some(&mut tbls[pos])
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn arg(msg: &Message, n: usize) -> u64 {
     let off = n * 8;
     u64::from_le_bytes(msg.data[off..off + 8].try_into().unwrap_or([0u8; 8]))
+}
+
+/// Undo the `slot + 1` encoding `handle_timer_create` hands out as a
+/// `timer_t` (see its doc comment). A raw value of 0 was never issued.
+fn decode_timerid(raw: u64) -> Option<usize> {
+    (raw as usize).checked_sub(1)
 }
 
 fn make_reply(v: i64) -> Message {
@@ -271,11 +293,25 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         TTY_ISATTY  => handle_isatty(caller_pid, arg(msg,0) as usize),
         TIMER_CREATE  => handle_timer_create(caller_pid, arg(msg,0) as u32,
                                              arg(msg,1) as usize),
-        TIMER_SETTIME => handle_timer_settime(caller_pid, arg(msg,0) as usize,
-                                              arg(msg,1) as usize, arg(msg,2) as usize),
-        TIMER_GETTIME => handle_timer_gettime(caller_pid, arg(msg,0) as usize,
-                                              arg(msg,1) as usize),
-        TIMER_DELETE  => handle_timer_delete(caller_pid, arg(msg,0) as usize),
+        // `timer_t` handles are `slot + 1` (see handle_timer_create) so a
+        // valid handle never numerically equals NULL; undo that here at the
+        // single IPC boundary that decodes a caller-supplied timer_t.
+        TIMER_SETTIME => match decode_timerid(arg(msg,0)) {
+            Some(id) => handle_timer_settime(caller_pid, id, arg(msg,1) as usize, arg(msg,2) as usize),
+            None => err_reply(-22),
+        },
+        TIMER_GETTIME => match decode_timerid(arg(msg,0)) {
+            Some(id) => handle_timer_gettime(caller_pid, id, arg(msg,1) as usize),
+            None => err_reply(-22),
+        },
+        TIMER_GETOVERRUN => match decode_timerid(arg(msg,0)) {
+            Some(id) => handle_timer_getoverrun(caller_pid, id),
+            None => err_reply(-22),
+        },
+        TIMER_DELETE => match decode_timerid(arg(msg,0)) {
+            Some(id) => handle_timer_delete(caller_pid, id),
+            None => err_reply(-22),
+        },
         _ => err_reply(-38),
     }
 }
@@ -292,11 +328,35 @@ pub fn check_timers(pid: u32) {
         if now >= timer.deadline {
             sched::deliver_signal(timer.owner_pid, timer.signo);
             if timer.interval > 0 {
-                timer.deadline += timer.interval;
+                // A process descheduled for a while can miss more than one
+                // period; catch the deadline up to `now` in one step and
+                // remember how many extra expirations were folded in so
+                // timer_getoverrun() can report them (POSIX semantics).
+                let missed = (now - timer.deadline) / timer.interval;
+                timer.deadline += timer.interval * (missed + 1);
+                timer.overrun = timer.overrun.saturating_add(missed as u32);
             } else {
                 timer.deadline = 0; // disarm one-shot
             }
         }
+    }
+}
+
+/// Ensure `pid` has its reserved slot-0 timer armed for `signo`, without
+/// creating a fresh one if it already exists.  Used by `alarm()` and
+/// `setitimer(ITIMER_REAL)`, both of which model a single per-process timer
+/// that repeated calls rearm rather than a fresh POSIX timer each time —
+/// calling `handle_timer_create` unconditionally would leak a new slot (out
+/// of `MAX_TIMERS`) on every call, since it always allocates the first free
+/// slot rather than reusing slot 0.
+pub fn ensure_real_timer(pid: u32, signo: u32) {
+    let mut tbls = TIMER_TABLES.lock();
+    let tbl = match get_or_create_timer_table(pid, &mut *tbls) {
+        Some(t) => t, None => return,
+    };
+    if !tbl.timers[0].in_use {
+        tbl.timers[0] = PosixTimer { in_use: true, signo, interval: 0, deadline: 0,
+                                     overrun: 0, owner_pid: pid };
     }
 }
 
@@ -522,88 +582,175 @@ fn handle_isatty(pid: u32, fd: usize) -> Message {
 
 // ── POSIX timer handlers ──────────────────────────────────────────────────────
 
+const TICK_HZ: u64 = 100;
+const NSEC_PER_TICK: u64 = 1_000_000_000 / TICK_HZ;
+
+/// Encode `(interval_ticks, value_ticks)` as a 32-byte `struct itimerspec`
+/// (`{ it_interval: timespec, it_value: timespec }`, each `{ tv_sec, tv_nsec }`
+/// as `i64` pairs).
+fn itimerspec_bytes(interval_ticks: u64, value_ticks: u64) -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    buf[0..8].copy_from_slice(&((interval_ticks / TICK_HZ) as i64).to_ne_bytes());
+    buf[8..16].copy_from_slice(&(((interval_ticks % TICK_HZ) * NSEC_PER_TICK) as i64).to_ne_bytes());
+    buf[16..24].copy_from_slice(&((value_ticks / TICK_HZ) as i64).to_ne_bytes());
+    buf[24..32].copy_from_slice(&(((value_ticks % TICK_HZ) * NSEC_PER_TICK) as i64).to_ne_bytes());
+    buf
+}
+
+/// Write an itimerspec built from `(interval_ticks, value_ticks)` to user
+/// memory via the safe user-buffer accessor — never dereference the raw
+/// pointer directly, since it may sit on a CoW page a supervisor-mode fault
+/// can't recover from (see `read_flock`/`write_flock` in the VFS server for
+/// the same pattern, established during the Phase 6/7 hazard sweep).
+fn write_itimerspec(ptr: usize, interval_ticks: u64, value_ticks: u64) -> bool {
+    let buf = itimerspec_bytes(interval_ticks, value_ticks);
+    sched::with_current_address_space(|as_| as_.write_user_buf(ptr, &buf)).unwrap_or(false)
+}
+
 fn handle_timer_create(pid: u32, signo: u32, timerid_ptr: usize) -> Message {
     let mut tbls = TIMER_TABLES.lock();
-    let tbl = {
-        let pos = if let Some(p) = tbls.iter().position(|t| t.in_use && t.pid == pid) { p }
-                  else if let Some(p) = tbls.iter().position(|t| !t.in_use) { p }
-                  else { return err_reply(-12); };
-        tbls[pos].in_use = true;
-        tbls[pos].pid    = pid;
-        &mut tbls[pos]
+    let tbl = match get_or_create_timer_table(pid, &mut *tbls) {
+        Some(t) => t, None => return err_reply(-12),
     };
     let slot = match tbl.alloc() { Some(s) => s, None => return err_reply(-11) };
     tbl.timers[slot] = PosixTimer { in_use: true, signo, interval: 0, deadline: 0,
-                                    owner_pid: pid };
+                                    overrun: 0, owner_pid: pid };
+    drop(tbls);
     if timerid_ptr != 0 {
-        unsafe { core::ptr::write(timerid_ptr as *mut u32, slot as u32); }
+        // `timer_t` is a pointer-sized opaque handle (8 bytes on both our
+        // 64-bit targets) — writing only the low 4 bytes, as this used to,
+        // left the caller's high 32 bits uninitialized, so a later
+        // timer_settime()/timer_delete() call could pass back a garbage
+        // 64-bit value that no longer matches the small in-table index.
+        //
+        // Handed out as `slot + 1`, never the bare table index: relibc's
+        // timer_delete/settime/gettime/getoverrun all reject a NULL
+        // `timer_t` as EFAULT, and a raw index of 0 (this process's very
+        // first timer) *is* NULL once cast to `*mut c_void`. See
+        // `handle_timer_settime`/etc. below, which undo the offset.
+        let ok = sched::with_current_address_space(|as_| {
+            as_.write_user_buf(timerid_ptr, &((slot as u64) + 1).to_ne_bytes())
+        }).unwrap_or(false);
+        if !ok {
+            // Roll back: the pointer turned out to be unmapped even though
+            // it passed the earlier range check, so don't leak the slot.
+            let mut tbls = TIMER_TABLES.lock();
+            if let Some(tbl) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
+                tbl.timers[slot] = PosixTimer::new();
+            }
+            return err_reply(-14);
+        }
     }
     ok_reply()
 }
 
-fn handle_timer_settime(pid: u32, timerid: usize, ispec_ptr: usize, _ospec_ptr: usize)
+/// Core rearm logic in tick units, decoupled from parsing a user-space
+/// itimerspec pointer.  Kernel-internal callers (`alarm()`/`setitimer()`,
+/// via [`set_real_itimer`]) already have tick counts in hand and must not
+/// round-trip through a synthetic *user*-space pointer to reach this, since
+/// [`write_itimerspec`]/`read_user_buf` resolve addresses through the
+/// current task's own page tables. Returns the timer's previous
+/// `(interval_ticks, remaining_ticks)` on success.
+fn set_timer_ticks(pid: u32, timerid: usize, interval_ticks: u64, value_ticks: u64)
+    -> Option<(u64, u64)>
+{
+    let mut tbls = TIMER_TABLES.lock();
+    let tbl = tbls.iter_mut().find(|t| t.in_use && t.pid == pid)?;
+    if timerid >= MAX_TIMERS || !tbl.timers[timerid].in_use { return None; }
+    let old_interval = tbl.timers[timerid].interval;
+    let now = sched::ticks();
+    let old_remaining = {
+        let dl = tbl.timers[timerid].deadline;
+        if dl > now { dl - now } else { 0 }
+    };
+    tbl.timers[timerid].interval = interval_ticks;
+    tbl.timers[timerid].deadline = if value_ticks > 0 { now + value_ticks } else { 0 };
+    tbl.timers[timerid].overrun = 0;
+    Some((old_interval, old_remaining))
+}
+
+/// Core read logic in tick units — see [`set_timer_ticks`] for why this is
+/// split out from the user-pointer-parsing IPC handler.
+fn get_timer_ticks(pid: u32, timerid: usize) -> Option<(u64, u64)> {
+    let tbls = TIMER_TABLES.lock();
+    let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+    if timerid >= MAX_TIMERS || !tbl.timers[timerid].in_use { return None; }
+    let interval_ticks = tbl.timers[timerid].interval;
+    let now = sched::ticks();
+    let remaining = {
+        let dl = tbl.timers[timerid].deadline;
+        if dl > now { dl - now } else { 0 }
+    };
+    Some((interval_ticks, remaining))
+}
+
+/// Direct (non-IPC) API for `setitimer(ITIMER_REAL, ...)`: arms the
+/// reserved slot-0 timer and returns its previous `(interval_ticks,
+/// remaining_ticks)`, creating the slot on first use.
+pub fn set_real_itimer(pid: u32, interval_ticks: u64, value_ticks: u64) -> (u64, u64) {
+    ensure_real_timer(pid, 14 /* SIGALRM */);
+    set_timer_ticks(pid, 0, interval_ticks, value_ticks).unwrap_or((0, 0))
+}
+
+/// Direct (non-IPC) API for `getitimer(ITIMER_REAL, ...)` / `alarm()`'s
+/// "previous value" query.
+pub fn get_real_itimer(pid: u32) -> (u64, u64) {
+    get_timer_ticks(pid, 0).unwrap_or((0, 0))
+}
+
+fn handle_timer_settime(pid: u32, timerid: usize, ispec_ptr: usize, ospec_ptr: usize)
     -> Message
 {
     // struct itimerspec: { it_interval: timespec, it_value: timespec }
     // struct timespec:   { tv_sec: i64, tv_nsec: i64 } (16 bytes each)
     // Total: 32 bytes.  We convert to scheduler ticks (100 Hz assumed).
-    const TICK_HZ: u64 = 100;
-
     if ispec_ptr == 0 { return err_reply(-14); }
-    let interval_sec  = unsafe { core::ptr::read(ispec_ptr          as *const i64) };
-    let interval_nsec = unsafe { core::ptr::read((ispec_ptr + 8)    as *const i64) };
-    let value_sec     = unsafe { core::ptr::read((ispec_ptr + 16)   as *const i64) };
-    let value_nsec    = unsafe { core::ptr::read((ispec_ptr + 24)   as *const i64) };
+    let mut ispec = [0u8; 32];
+    let ok = sched::with_current_address_space(|as_| as_.read_user_buf(ispec_ptr, &mut ispec))
+        .unwrap_or(false);
+    if !ok { return err_reply(-14); }
+    let interval_sec  = i64::from_ne_bytes(ispec[0..8].try_into().unwrap());
+    let interval_nsec = i64::from_ne_bytes(ispec[8..16].try_into().unwrap());
+    let value_sec     = i64::from_ne_bytes(ispec[16..24].try_into().unwrap());
+    let value_nsec    = i64::from_ne_bytes(ispec[24..32].try_into().unwrap());
 
     let interval_ticks = (interval_sec as u64 * TICK_HZ)
                        + (interval_nsec as u64 / (1_000_000_000 / TICK_HZ));
     let value_ticks    = (value_sec as u64 * TICK_HZ)
                        + (value_nsec as u64 / (1_000_000_000 / TICK_HZ));
 
-    let mut tbls = TIMER_TABLES.lock();
-    if let Some(tbl) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
-        if timerid < MAX_TIMERS && tbl.timers[timerid].in_use {
-            tbl.timers[timerid].interval = interval_ticks;
-            tbl.timers[timerid].deadline = if value_ticks > 0 {
-                sched::ticks() + value_ticks
-            } else {
-                0 // disarm
-            };
-        }
+    let (old_interval, old_remaining) = match set_timer_ticks(pid, timerid, interval_ticks, value_ticks) {
+        Some(v) => v,
+        None => return err_reply(-22),
+    };
+
+    if ospec_ptr != 0 && !write_itimerspec(ospec_ptr, old_interval, old_remaining) {
+        return err_reply(-14);
     }
     ok_reply()
 }
 
 fn handle_timer_gettime(pid: u32, timerid: usize, ospec_ptr: usize) -> Message {
-    const TICK_HZ: u64 = 100;
-    const NSEC_PER_TICK: u64 = 1_000_000_000 / TICK_HZ;
-
     if ospec_ptr == 0 { return err_reply(-14); }
-    let tbls = TIMER_TABLES.lock();
-    if let Some(tbl) = tbls.iter().find(|t| t.in_use && t.pid == pid) {
-        if timerid < MAX_TIMERS && tbl.timers[timerid].in_use {
-            let interval_ticks = tbl.timers[timerid].interval;
-            let remaining = {
-                let dl = tbl.timers[timerid].deadline;
-                let now = sched::ticks();
-                if dl > now { dl - now } else { 0 }
-            };
-            unsafe {
-                // it_interval
-                core::ptr::write(ospec_ptr          as *mut i64,
-                                 (interval_ticks / TICK_HZ) as i64);
-                core::ptr::write((ospec_ptr + 8)    as *mut i64,
-                                 ((interval_ticks % TICK_HZ) * NSEC_PER_TICK) as i64);
-                // it_value (remaining)
-                core::ptr::write((ospec_ptr + 16)   as *mut i64,
-                                 (remaining / TICK_HZ) as i64);
-                core::ptr::write((ospec_ptr + 24)   as *mut i64,
-                                 ((remaining % TICK_HZ) * NSEC_PER_TICK) as i64);
-            }
-            return ok_reply();
+    let (interval_ticks, remaining) = match get_timer_ticks(pid, timerid) {
+        Some(v) => v,
+        None => return err_reply(-22),
+    };
+    if write_itimerspec(ospec_ptr, interval_ticks, remaining) { ok_reply() } else { err_reply(-14) }
+}
+
+/// timer_getoverrun(timerid) — number of extra expirations folded into the
+/// last delivered signal since this was last queried; resets to 0 on read.
+fn handle_timer_getoverrun(pid: u32, timerid: usize) -> Message {
+    let mut tbls = TIMER_TABLES.lock();
+    match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
+        Some(tbl) if timerid < MAX_TIMERS && tbl.timers[timerid].in_use => {
+            let overrun = tbl.timers[timerid].overrun;
+            tbl.timers[timerid].overrun = 0;
+            val_reply(overrun as u64)
         }
+        _ => err_reply(-22),
     }
-    err_reply(-22)
 }
 
 fn handle_timer_delete(pid: u32, timerid: usize) -> Message {
