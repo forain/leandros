@@ -54,6 +54,7 @@ extern "C" {
 
     pub fn getpid() -> pid_t;
     pub fn kill(pid: pid_t, sig: c_int) -> c_int;
+    pub fn raise(sig: c_int) -> c_int;
     pub fn sigaction(sig: c_int, act: *const sigaction, oact: *mut sigaction) -> c_int;
     pub fn sigprocmask(how: c_int, set: *const sigset_t, oset: *mut sigset_t) -> c_int;
     pub fn sigpending(set: *mut sigset_t) -> c_int;
@@ -110,6 +111,7 @@ pub unsafe extern "C" fn sig_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut
     if !test_two_signals_distinct_handlers() { failures += 1; }
     if !test_sigprocmask_blocks_and_defers() { failures += 1; }
     if !test_sig_ign_default_disposition() { failures += 1; }
+    if !test_raise_delivers_signal() { failures += 1; }
 
     puts(b"--- sigtest done ---\n\0".as_ptr());
     failures
@@ -260,6 +262,33 @@ unsafe fn test_sig_ign_default_disposition() -> bool {
     // default-ignore set) -- reaching here at all proves SIG_IGN, not
     // SIG_DFL, was actually honored.
     report(name, true)
+}
+
+// ── 6. raise() regression: TKILL had no kernel dispatch arm ─────────────────
+//
+// raise() resolves to Sys::raise(), which calls GETTID then issues a raw
+// TKILL syscall (nr 130 on AArch64, 200 on x86-64) against its own tid.
+// The kernel's dispatch table had every other thread-signal syscall
+// (KILL, TGKILL) wired up but no TKILL arm at all, so every call fell
+// through to the default `_ => -38` (ENOSYS) case: raise() always failed,
+// even though kill(getpid(), sig) — exercised by the tests above — worked
+// fine. This test calls raise() directly rather than kill(), so it fails
+// (return != 0) if the TKILL arm regresses.
+
+static COUNT_RAISED: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn raise_handler(_sig: c_int) { COUNT_RAISED.fetch_add(1, Ordering::SeqCst); }
+
+unsafe fn test_raise_delivers_signal() -> bool {
+    let name = b"raise_delivers_signal\0";
+    COUNT_RAISED.store(0, Ordering::SeqCst);
+
+    let act = zeroed_sigaction(Some(raise_handler));
+    if sigaction(SIGUSR1, &act, core::ptr::null_mut()) != 0 { return report(name, false); }
+
+    let raise_status = raise(SIGUSR1);
+
+    report(name, raise_status == 0 && COUNT_RAISED.load(Ordering::SeqCst) == 1)
 }
 
 // ── Helper ──────────────────────────────────────────────────────────────────
