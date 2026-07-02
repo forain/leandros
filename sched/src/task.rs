@@ -15,18 +15,23 @@ pub enum TaskState {
     Zombie,
 }
 
-/// Per-signal disposition, matching the POSIX `struct sigaction` layout.
+/// Per-signal disposition. `sys_sigaction` (`sched/src/signal.rs`) reads/
+/// writes this directly via `core::ptr::read`/`write` against whatever the
+/// caller passed as `struct sigaction*`, so the field order here must match
+/// the real POSIX/relibc layout (`sa_handler, sa_flags, sa_restorer,
+/// sa_mask` — see `userland/relibc/src/header/signal/mod.rs`) byte-for-byte,
+/// not just by name.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SigAction {
     /// Handler address: 0 = SIG_DFL, 1 = SIG_IGN, else a user-space fn ptr.
     pub handler:  usize,
     pub flags:    u32,
-    /// Signal mask to apply during handler execution.
-    pub mask:     u64,
     /// `sa_restorer` — user-space trampoline that calls `sys_rt_sigreturn`.
     /// 0 = use the kernel's built-in trampoline page.
     pub restorer: usize,
+    /// Signal mask to apply during handler execution.
+    pub mask:     u64,
 }
 
 pub const DEFAULT_SIGACTION: SigAction =
