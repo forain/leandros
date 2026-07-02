@@ -234,6 +234,15 @@ Full POSIX-style signal delivery is implemented on **both** architectures:
 - **`alarm()`/`setitimer(ITIMER_REAL)`** share one reserved, idempotently-rearmed table slot rather than allocating a fresh one per call, so repeated use can't exhaust the table.
 - User-pointer access from the in-kernel `tty` server goes through `AddressSpace::read_user_buf`/`write_user_buf`, not a raw pointer dereference, for the same reason `wait`/`waitid`/`flock` do — a supervisor-mode page fault on a not-yet-faulted CoW page has no recovery path.
 
+### Poll / select / epoll
+
+`poll` and `select` are implemented in relibc's userspace on top of the kernel's `epoll_create1`/`epoll_ctl`/`epoll_pwait`. Readiness is queried from the object that owns each fd, never fabricated.
+
+- **Real readiness** — the kernel routes each fd to a `VFS_POLL` (`servers/vfs`) or `NET_POLL` (`servers/net`) query that computes `POLLIN/POLLOUT/POLLERR/POLLHUP` from actual state (pipe ring occupancy and endpoint refcounts, eventfd counter, timerfd expiry, socket peer occupancy and liveness), then masks it against the requested event set. The pre-existing code reported whatever the caller *asked* for, unconditionally.
+- **Honoured timeouts** — `ppoll`, `epoll_wait`, and `select` are cooperative retry loops that read the caller's deadline (`NULL` = block forever, `{0,0}` = single poll), yield between probes, and return `0` on true expiry.
+- **`epoll_event` layout** — matches Linux exactly: 12-byte `#[repr(C, packed)]` (data at offset 4) on x86-64 only (`glibc EPOLL_PACKED`), natural 16-byte layout elsewhere. The kernel reads/writes the data word with arch-conditional offsets via `read_unaligned`/`write_unaligned`, so libc and kernel agree on both architectures.
+- **Pipe endpoints are reference-counted** — a pipe read/write end held by several fds (via `dup`/`dup2` or inherited across `fork`) only signals EOF/`POLLHUP`/`EPIPE` once the *last* fd on that end closes, so `poll`/`select`/`epoll` stay correct for pipes shared across a `fork` (shell pipelines).
+
 ### Boot flow
 
 **x86-64 (Limine)**
@@ -437,8 +446,9 @@ VFS resource lifecycle (open/close notifications) ensures that server-side handl
 | `pthreadtest` | Regression suite: `pthread_create`/`join`, mutex, condvar, TSD, cleanup handlers |
 | `timertest` | Regression suite: POSIX timers, `alarm`/`setitimer`, real `SIGALRM` delivery |
 | `sigtest` | Regression suite: `sigaction` struct layout, signal delivery/return, `sigprocmask`/`sigpending`, `SIG_IGN`, `raise()` |
+| `polltest` | Regression suite: `poll`/`select`/`epoll` real fd readiness, `epoll_wait` timeout, pipe `POLLHUP` writer refcount across `dup` |
 
-Programs are linked against **relibc** for full POSIX compatibility, or against the lighter `leandros-libc` shim for `no_std` Rust programs. Binaries are embedded in the initrd image and extracted at boot. `pthreadtest`, `timertest`, and `sigtest` link `librelibc.a` directly rather than `leandros-libc`, since they need TLS bring-up (`relibc_start_v1`) for real `pthread`/`errno`/`sigaction` support.
+Programs are linked against **relibc** for full POSIX compatibility, or against the lighter `leandros-libc` shim for `no_std` Rust programs. Binaries are embedded in the initrd image and extracted at boot. `pthreadtest`, `timertest`, `sigtest`, and `polltest` link `librelibc.a` directly rather than `leandros-libc`, since they need TLS bring-up (`relibc_start_v1`) for real `pthread`/`errno`/`sigaction`/`epoll` support.
 
 ---
 

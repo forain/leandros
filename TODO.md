@@ -473,12 +473,75 @@ configurations total. All 5 `timertest` checks pass cleanly on every
 configuration, alongside a full regression pass of `pthreadtest`,
 `memtest`, `vfstest`, and `f2fstest`.
 
-### 7. Poll/Select/Epoll (Phase 9)
+### 7. Poll/Select/Epoll (Phase 9) — DONE 2026-07-02
 **Why Critical**: Event notification is fundamental for I/O multiplexing.
-- Complete poll implementation
-- Implement select with proper event handling
-- Complete epoll with efficient event notification
-- Add performance optimizations for large fd sets
+
+**Actual state found**: `poll`/`select` were already implemented in relibc's
+userspace atop `epoll_create1`/`epoll_ctl`/`epoll_pwait`, and the kernel had
+`sys_ppoll`/`sys_epoll_*`/`sys_select` entry points — but they reported
+**fabricated readiness**. `probe_fd_events` returned whatever events the caller
+*requested*, unconditionally, regardless of the fd's real state, and
+`epoll_wait`/`ppoll` ignored their timeout arguments entirely (single-shot
+check, no blocking). So an `epoll_wait` on an empty pipe falsely reported
+`EPOLLIN`, and a timed wait never actually waited. The genuine gaps, found by
+reading the code:
+
+- **No real readiness query.** Added a `VFS_POLL` op to `servers/vfs` and a
+  `NET_POLL` op to `servers/net` that compute true `POLLIN/POLLOUT/POLLERR/
+  POLLHUP` from actual object state: pipe ring occupancy and endpoint refcounts,
+  eventfd counter, timerfd expiry (with the same lazy catch-up as `read`/
+  `FIONREAD`, factored into a shared `timerfd_poll_expirations`), socket peer
+  ring occupancy and connection liveness. The kernel's `poll_fd_state`/
+  `probe_fd_events` now route each fd to the owning server and mask the result
+  against the requested event set (plus always-reported `POLLERR/POLLHUP/
+  POLLNVAL`).
+- **Timeouts were ignored.** `sys_ppoll`, `sys_epoll_wait`, and `sys_select`
+  are now real cooperative retry loops that read the caller's `timespec`/
+  `timeval`/ms deadline (NULL = infinite, `{0,0}` = single poll), yield between
+  probes, and return `0` on genuine expiry.
+- **`epoll_event` ABI was wrong for x86-64.** Real Linux packs `struct
+  epoll_event` to 12 bytes (data at offset 4) **only** on x86-64 (`glibc
+  EPOLL_PACKED`); every other arch uses the natural 16-byte layout (data at
+  offset 8). relibc's `sys_epoll` used one layout for all targets, so the
+  kernel and libc disagreed on aarch64. Split into per-arch `#[repr(C, packed)]`
+  / `#[repr(C)]` definitions with compile-time size/offset assertions, and gave
+  the kernel matching arch-conditional `EPOLL_EVENT_SIZE`/`_DATA_OFF` constants
+  used by `sys_epoll_ctl`/`sys_epoll_wait` (via `read_unaligned`/
+  `write_unaligned`).
+- **Pipe endpoints were booleans, not refcounts** (`servers/vfs`). A pipe end
+  can be held by more than one fd — via `dup`/`dup2` or inherited across
+  `fork` — but `read_open`/`write_open` were single `bool`s, so the *first*
+  `close()` on a duplicated end falsely signalled EOF/EPIPE/`POLLHUP` to the
+  still-open peer. This is exactly what breaks poll/select/epoll for pipes
+  shared across `fork` (shell pipelines). Converted to `readers`/`writers`
+  reference counts, incremented on `VFS_FORK_DUP`/`dup`/`dup2` and decremented
+  on close, with EOF/HUP/EPIPE firing only at zero.
+- **`dup()` never worked.** `sys_dup` sent `VFS_DUP2` with the sentinel
+  `newfd = u64::MAX`, which `handle_dup2` rejects as out of range (`EBADF`);
+  only `sys_dup3`'s sentinel branch routed to `VFS_ALLOC_FD`. `dup()` had no
+  prior caller, so the bug was latent until the poll test exercised it. Routed
+  `sys_dup` to `VFS_ALLOC_FD` (lowest free fd).
+- **Bonus fork fix (`sched`).** `fork_current` left the child's `CpuContext` at
+  `zeroed()`, so `fs_base`/`tpidr_el0` were 0 and the child's first
+  `#[thread_local]` access (errno, etc.) faulted through a null TLS base. The
+  child now inherits the parent's `tls_base`.
+
+**Known limitation**: relibc's `fork()` wrapper (`unistd/mod.rs`) runs
+thread-local `atfork` hooks through `%fs`/`tpidr` in the child and mangles the
+child's return value; the raw kernel `clone`/`fork` path is correct (verified —
+`memtest`'s fork tests and a raw-`clone` probe both return `0` in the child).
+The poll test therefore exercises epoll blocking/timeout sequentially and the
+pipe-writer-refcount fix via `dup()` rather than `fork()`. Fixing the relibc
+atfork/TLS interaction is tracked separately.
+
+**Verification**: `userland/polltest` (see `userland/polltest/src/main.rs`) —
+six checks, all green on x86-64 **and** aarch64: no false-positive `EPOLLIN` on
+an empty pipe, `EPOLLOUT` reflecting a full ring, `poll`/`select` agreeing with
+real pipe readiness, socketpair epoll readiness followed by a real `recv`,
+`epoll_wait` honouring its timeout (returns 0 while empty, then sees a later
+write), and `POLLHUP` tracking the pipe writer refcount across `dup`. Full
+regression suite (`memtest`, `vfstest`, `f2fstest`, `pthreadtest`, `sigtest`,
+`timertest`) still passes on both architectures.
 
 ## Priority 4: Additional System Components
 
