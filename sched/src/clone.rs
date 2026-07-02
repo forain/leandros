@@ -138,7 +138,9 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         #[cfg(target_arch = "x86_64")]
         {
             extern "C" { fn fork_ret_to_user(); }
-            unsafe { (*child_frame_ptr).rax = 0; } // Return 0 to child
+            unsafe {
+                (*child_frame_ptr).rax = 0; // Return 0 to child
+            }
 
             // Initial child RSP for context switch:
             // CpuContext::cpu_switch_to will 'ret' to the target address on the stack.
@@ -152,7 +154,7 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         }
 
         // ── Step 6: gather parent credentials ────────────────────────────────
-        let (heap_start, heap_end, pid, _tgid, pgid, sid, uid, gid, euid, egid, cwd) = {
+        let (heap_start, heap_end, pid, _tgid, pgid, sid, uid, gid, euid, egid, cwd, tls_base) = {
             let rq = super::RUN_QUEUE.lock();
             if let Some(t) = rq.find_pid(parent_pid) {
                 let leader = rq.find_pid(t.tgid).unwrap_or(t);
@@ -160,13 +162,24 @@ pub fn fork_current(frame_ptr: usize) -> isize {
                     .map(|a| (a.heap_start, a.heap_end))
                     .unwrap_or((0, 0));
                 (hs, he, t.pid, t.tgid, t.pgid, t.sid,
-                 t.uid, t.gid, t.euid, t.egid, t.cwd.clone())
+                 t.uid, t.gid, t.euid, t.egid, t.cwd.clone(), t.tls_base)
             } else {
                 mm::buddy::free(stack_base_phys, stack_pages);
                 mm::buddy::free(child_pt, 0);
                 return -3;
             }
         };
+
+        // fork() duplicates the whole process, TLS included — unlike
+        // clone_thread's fresh `child_tls`, the child must keep running with
+        // the exact same TLS base the parent had at the moment of the fork
+        // syscall. child_ctx started at CpuContext::zeroed(), so without
+        // this the child's first #[thread_local] access (errno, etc.) reads
+        // through a null TLS base and faults.
+        #[cfg(target_arch = "x86_64")]
+        { child_ctx.fs_base = tls_base; }
+        #[cfg(target_arch = "aarch64")]
+        { child_ctx.tpidr_el0 = tls_base; }
 
         // ── Step 7: build and enqueue child task ──────────────────────────────
         let child_pid = super::alloc_pid();
@@ -175,6 +188,7 @@ pub fn fork_current(frame_ptr: usize) -> isize {
             child_pid, 0, stack_base_phys, stack_size, child_pt,
         );
         child.ctx           = child_ctx;
+        child.tls_base      = tls_base;
         child.address_space = Some(alloc::boxed::Box::new(child_as));
         child.ppid          = pid;
         child.tgid          = child_pid;
