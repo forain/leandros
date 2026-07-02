@@ -638,7 +638,7 @@ fn dispatch_inner(
         IOCTL       => sys_ioctl(a0, a1, a2),
         FCNTL       => sys_fcntl(a0, a1, a2),
         PIPE2       => sys_pipe2(a0, a1),
-        FLOCK       => 0, // advisory lock stub — always succeeds
+        FLOCK       => sys_flock(a0, a1),
         #[cfg(not(target_arch = "aarch64"))]
         PIPE        => sys_pipe2(a0, 0),
         #[cfg(not(target_arch = "aarch64"))]
@@ -666,7 +666,9 @@ fn dispatch_inner(
         // number as GETPGID on AArch64, so only emit this arm on x86-64.
         #[cfg(target_arch = "x86_64")]
         GETPGRP     => sched::current_pgid() as isize,
-        SETUID | SETGID | SETRESUID | SETRESGID | SETGROUPS => 0, // root: accept
+        SETUID => if sched::set_current_uid(a0 as u32) { 0 } else { -1 }, // EPERM
+        SETGID => if sched::set_current_gid(a0 as u32) { 0 } else { -1 }, // EPERM
+        SETRESUID | SETRESGID | SETGROUPS => 0, // root: accept
         GETRESUID   => sys_getresxid(a0, a1, a2, false),
         GETRESGID   => sys_getresxid(a0, a1, a2, true),
         GETGROUPS   => 0,   // 0 supplementary groups
@@ -674,11 +676,13 @@ fn dispatch_inner(
         // Filesystem operations (writable for /tmp, read-only otherwise)
         MKDIRAT     => sys_mkdirat(a0, a1, a2),
         UNLINKAT    => sys_unlinkat(a0, a1, a2),
-        RENAMEAT | RENAMEAT2 => sys_renameat(a1, a2),
+        RENAMEAT | RENAMEAT2 => sys_renameat(a1, a3),
         LINKAT      => -30,
         SYMLINKAT   => -30,
-        FCHMODAT | FCHMOD => 0, // pretend success (RamFS ignores permissions)
-        FCHOWNAT | FCHOWN => 0,
+        FCHMOD      => sys_fchmod(a0, a1),
+        FCHMODAT    => sys_fchmodat(a0, a1, a2, a3),
+        FCHOWN      => sys_fchown(a0, a1, a2),
+        FCHOWNAT    => sys_fchownat(a0, a1, a2, a3, a4),
         TRUNCATE    => sys_truncate(a0, a1),
         FTRUNCATE   => sys_ftruncate(a0, a1),
         FACCESSAT   => sys_faccessat(a0, a1, a2, a3),
@@ -779,7 +783,10 @@ fn dispatch_inner(
         PIDFD_OPEN  => -38,
 
         // ── Credentials ───────────────────────────────────────────────────────
-        GETUID | GETEUID | GETGID | GETEGID => 0, // all root for now
+        GETUID  => sched::current_uid()  as isize,
+        GETEUID => sched::current_euid() as isize,
+        GETGID  => sched::current_gid()  as isize,
+        GETEGID => sched::current_egid() as isize,
         GETTID    => current_pid() as isize,
         TGKILL    => sys_tgkill(a0, a1, a2),
 
@@ -2683,6 +2690,38 @@ fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
+fn sys_fchmod(fd: usize, mode: usize) -> isize {
+    let pid = current_pid();
+    let msg = make_vfs_msg(vfs::VFS_FCHMOD, &[fd as u64, mode as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+fn sys_fchmodat(_dirfd: usize, path_ptr: usize, mode: usize, _flags: usize) -> isize {
+    if !validate_user_buf(path_ptr, 1) { return -14; }
+    let pid = current_pid();
+    let msg = make_vfs_msg(vfs::VFS_CHMOD, &[path_ptr as u64, mode as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+fn sys_fchown(fd: usize, uid: usize, gid: usize) -> isize {
+    let pid = current_pid();
+    let msg = make_vfs_msg(vfs::VFS_FCHOWN, &[fd as u64, uid as u64, gid as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+fn sys_fchownat(_dirfd: usize, path_ptr: usize, uid: usize, gid: usize, _flags: usize) -> isize {
+    if !validate_user_buf(path_ptr, 1) { return -14; }
+    let pid = current_pid();
+    let msg = make_vfs_msg(vfs::VFS_CHOWN, &[path_ptr as u64, uid as u64, gid as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+fn sys_flock(fd: usize, op: usize) -> isize {
+    let pid = current_pid();
+    let msg = make_vfs_msg(vfs::VFS_FLOCK, &[fd as u64, op as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
 fn sys_pipe2(pipefd_ptr: usize, _flags: usize) -> isize {
     // int pipefd[2] — two ints (4 bytes each) packed at pipefd_ptr.
     if !validate_user_buf(pipefd_ptr, 8) { return -14; }
@@ -2715,17 +2754,19 @@ fn sys_getdents64(fd: usize, buf_ptr: usize, count: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_mkdirat(_dirfd: usize, path_ptr: usize, _mode: usize) -> isize {
+fn sys_mkdirat(_dirfd: usize, path_ptr: usize, mode: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_MKDIR, &[path_ptr as u64]);
+    let msg = make_vfs_msg(vfs::VFS_MKDIR, &[path_ptr as u64, mode as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_unlinkat(_dirfd: usize, path_ptr: usize, _flags: usize) -> isize {
+fn sys_unlinkat(_dirfd: usize, path_ptr: usize, flags: usize) -> isize {
+    const AT_REMOVEDIR: usize = 0x200;
     if !validate_user_buf(path_ptr, 1) { return -14; }
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_UNLINK, &[path_ptr as u64]);
+    let tag = if flags & AT_REMOVEDIR != 0 { vfs::VFS_RMDIR } else { vfs::VFS_UNLINK };
+    let msg = make_vfs_msg(tag, &[path_ptr as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 

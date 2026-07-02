@@ -19,6 +19,12 @@
 //! | VFS_FORK_DUP    | parent_pid | child_pid | 0       | 0                   |
 //! | VFS_EXEC_CLOEXEC| pid        | 0         | 0       | 0                   |
 //! | VFS_CLOSE_ALL   | pid        | 0         | 0       | 0                   |
+//! | VFS_RMDIR       | path_ptr   | 0         | 0       | 0 or -errno         |
+//! | VFS_FLOCK       | fd         | op        | 0       | 0 or -errno         |
+//! | VFS_CHMOD       | path_ptr   | mode      | 0       | 0 or -errno         |
+//! | VFS_FCHMOD      | fd         | mode      | 0       | 0 or -errno         |
+//! | VFS_CHOWN       | path_ptr   | uid       | gid     | 0 or -errno         |
+//! | VFS_FCHOWN      | fd         | uid       | gid     | 0 or -errno         |
 
 #![no_std]
 
@@ -53,6 +59,12 @@ pub const VFS_TIMERFD_CREATE:  u64 = 0x25; // timerfd_create(clockid) → fd
 pub const VFS_TIMERFD_SETTIME: u64 = 0x26; // timerfd_settime(fd, flags, new_ns, interval_ns)
 pub const VFS_TIMERFD_GETTIME: u64 = 0x27; // timerfd_gettime(fd, out_ptr)
 pub const VFS_IOCTL:           u64 = 0x28; // ioctl(fd, cmd, arg) → result or -errno
+pub const VFS_RMDIR:           u64 = 0x29; // rmdir(path_ptr) → 0 or -errno
+pub const VFS_FLOCK:           u64 = 0x2A; // flock(fd, op) → 0 or -errno
+pub const VFS_CHMOD:           u64 = 0x2B; // chmod(path_ptr, mode) → 0 or -errno
+pub const VFS_FCHMOD:          u64 = 0x2C; // fchmod(fd, mode) → 0 or -errno
+pub const VFS_CHOWN:           u64 = 0x2D; // chown(path_ptr, uid, gid) → 0 or -errno
+pub const VFS_FCHOWN:          u64 = 0x2E; // fchown(fd, uid, gid) → 0 or -errno
 
 // ── Message helpers ───────────────────────────────────────────────────────────
 
@@ -123,13 +135,17 @@ struct TmpFileEntry {
     len:      usize,
     in_use:   bool,
     is_dir:   bool,
+    mode:     u32, // permission bits (rwxrwxrwx), set at creation from umask
+    uid:      u32, // owner, set at creation from the creating task's euid
+    gid:      u32, // owner group, set at creation from the creating task's egid
 }
 
 impl TmpFileEntry {
     const fn empty() -> Self {
         Self { path: [0u8; MAX_TMP_PATH], path_len: 0,
                data: [0u8; MAX_TMP_SIZE], len: 0,
-               in_use: false, is_dir: false }
+               in_use: false, is_dir: false,
+               mode: 0, uid: 0, gid: 0 }
     }
 }
 
@@ -624,7 +640,7 @@ pub fn is_directory(path_ptr: usize) -> bool {
 
 pub fn handle(msg: &Message, caller_pid: u32) -> Message {
     match msg.tag {
-        VFS_OPEN         => handle_open(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        VFS_OPEN         => handle_open(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32),
         VFS_READ         => handle_read(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_WRITE        => handle_write(caller_pid, arg(msg,0) as usize,
@@ -644,7 +660,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                                arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_ALLOC_FD     => handle_alloc_fd(caller_pid, arg(msg,0) as usize),
         VFS_UNLINK       => handle_unlink(arg(msg,0) as usize),
-        VFS_MKDIR        => handle_mkdir(arg(msg,0) as usize),
+        VFS_MKDIR        => handle_mkdir(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         VFS_FTRUNCATE    => handle_ftruncate(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_RENAME       => handle_rename(arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_FD_PATH      => handle_fd_path(caller_pid, arg(msg,0) as usize,
@@ -657,6 +673,14 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                                         arg(msg,1) as usize),
         VFS_IOCTL            => handle_ioctl(caller_pid, arg(msg,0) as usize,
                                               arg(msg,1) as usize, arg(msg,2) as usize),
+        VFS_RMDIR            => handle_rmdir(arg(msg,0) as usize),
+        VFS_FLOCK            => handle_flock(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        VFS_CHMOD            => handle_chmod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        VFS_FCHMOD           => handle_fchmod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        VFS_CHOWN            => handle_chown(caller_pid, arg(msg,0) as usize,
+                                              arg(msg,1) as u32, arg(msg,2) as u32),
+        VFS_FCHOWN           => handle_fchown(caller_pid, arg(msg,0) as usize,
+                                               arg(msg,1) as u32, arg(msg,2) as u32),
         _                    => err_reply(-38), // ENOSYS
     }
 }
@@ -900,7 +924,18 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
     None
 }
 
-fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
+/// Check requested read/write access against `mode`'s owner/group/other bits.
+/// Root (euid == 0) always passes, matching Unix semantics.
+fn check_access(mode: u32, owner_uid: u32, owner_gid: u32, euid: u32, egid: u32,
+                want_read: bool, want_write: bool) -> bool {
+    if euid == 0 { return true; }
+    let bits = if euid == owner_uid { (mode >> 6) & 0o7 }
+               else if egid == owner_gid { (mode >> 3) & 0o7 }
+               else { mode & 0o7 };
+    (!want_read || bits & 0o4 != 0) && (!want_write || bits & 0o2 != 0)
+}
+
+fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) {
         Some(r) => r,
         None    => return err_reply(-14),
@@ -933,6 +968,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
         let writable = flags & (O_WRONLY | O_RDWR) != 0;
         let create   = flags & O_CREAT  != 0;
         let trunc    = flags & O_TRUNC  != 0;
+        let accmode  = flags & 0x3;
+        let want_read  = accmode != O_WRONLY;
+        let want_write = accmode == O_WRONLY || accmode == O_RDWR;
+        let euid = sched::euid_of(pid);
+        let egid = sched::egid_of(pid);
 
         let mut tmp = TMP_FILES.lock();
         // Look for an existing entry.
@@ -941,6 +981,9 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
         });
         match existing {
             Some(idx) => {
+                if !check_access(tmp[idx].mode, tmp[idx].uid, tmp[idx].gid, euid, egid, want_read, want_write) {
+                    return err_reply(-13); // EACCES
+                }
                 if trunc { tmp[idx].len = 0; }
                 let pos = if writable && trunc { 0 }
                           else if flags & O_APPEND != 0 { tmp[idx].len }
@@ -954,6 +997,9 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32) -> Message {
                         tmp[idx] = TmpFileEntry::empty();
                         tmp[idx].in_use   = true;
                         tmp[idx].is_dir   = false;
+                        tmp[idx].mode     = mode & 0o777 & !sched::umask(u32::MAX);
+                        tmp[idx].uid      = euid;
+                        tmp[idx].gid      = egid;
                         let copy_len = path.len().min(MAX_TMP_PATH - 1);
                         tmp[idx].path[..copy_len].copy_from_slice(&path[..copy_len]);
                         tmp[idx].path_len = copy_len;
@@ -1347,7 +1393,9 @@ fn handle_close(pid: u32, fd: usize) -> Message {
     let kind = tbl.fds[fd].kind;
     tbl.fds[fd] = FdEntry::empty();
     drop(tbls);
-    
+
+    if let Some(key) = lock_key_of(&kind) { release_locks(key, pid); }
+
     match kind {
         VnodeKind::Pipe { ring, is_write } => {
             let mut rings = PIPE_RINGS.lock();
@@ -1523,6 +1571,7 @@ fn handle_close_all(pid: u32) -> Message {
         
         // Close them all properly
         for kind in fds_to_close {
+            if let Some(key) = lock_key_of(&kind) { release_locks(key, pid); }
             match kind {
                 VnodeKind::Pipe { ring, is_write } => {
                     let mut rings = PIPE_RINGS.lock();
@@ -1549,12 +1598,234 @@ fn handle_close_all(pid: u32) -> Message {
     ok_reply()
 }
 
+// ── Advisory file locking (flock + fcntl F_GETLK/F_SETLK/F_SETLKW) ──────────────
+//
+// Locks are keyed by vnode identity (tmpfs slot, or mount port + remote file_id)
+// rather than by fd, so dup()'d fds and separate opens of the same path share
+// the same lock domain. flock() and fcntl() locks share one table: this is
+// stricter than POSIX (real Linux keeps the two lock classes independent) but
+// never grants access that either model would have denied on its own.
+
+const MAX_LOCKS: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LockKey { Tmp(usize), Mount(u32, u32) }
+
+#[derive(Clone, Copy)]
+struct LockRecord {
+    key:       LockKey,
+    pid:       u32,
+    start:     u64,
+    end:       u64, // exclusive upper bound; u64::MAX == to EOF
+    exclusive: bool,
+    in_use:    bool,
+}
+
+impl LockRecord {
+    const fn empty() -> Self {
+        Self { key: LockKey::Tmp(0), pid: 0, start: 0, end: 0, exclusive: false, in_use: false }
+    }
+}
+
+static LOCKS: Mutex<[LockRecord; MAX_LOCKS]> = Mutex::new([const { LockRecord::empty() }; MAX_LOCKS]);
+
+/// Identify the lock domain of a vnode. Only regular tmpfs/mounted files are lockable.
+fn lock_key_of(kind: &VnodeKind) -> Option<LockKey> {
+    match kind {
+        VnodeKind::TmpFile { idx, .. }           => Some(LockKey::Tmp(*idx)),
+        VnodeKind::MountedFile { port, file_id }  => Some(LockKey::Mount(*port, *file_id)),
+        _ => None,
+    }
+}
+
+fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+/// Find another pid's lock on `key` that conflicts with a request for `[start,end)`.
+/// A conflict requires either side to be exclusive (two shared locks never conflict).
+fn find_conflict(locks: &[LockRecord], key: LockKey, pid: u32, start: u64, end: u64, exclusive: bool) -> Option<LockRecord> {
+    locks.iter().find(|l| {
+        l.in_use && l.key == key && l.pid != pid
+            && ranges_overlap(l.start, l.end, start, end)
+            && (exclusive || l.exclusive)
+    }).copied()
+}
+
+/// Release every lock `pid` holds on `key`.
+fn release_locks(key: LockKey, pid: u32) {
+    let mut locks = LOCKS.lock();
+    for l in locks.iter_mut() {
+        if l.in_use && l.key == key && l.pid == pid { *l = LockRecord::empty(); }
+    }
+}
+
+/// Resolve an `l_whence`/`l_start`/`l_len` triple (from `struct flock`) into an
+/// absolute `[start, end)` byte range. SEEK_CUR/SEEK_END are only resolvable for
+/// tmpfs vnodes, whose position/size VFS tracks directly.
+fn resolve_lock_range(kind: &VnodeKind, whence: i16, l_start: i64, l_len: i64) -> Option<(u64, u64)> {
+    const SEEK_SET: i16 = 0;
+    const SEEK_CUR: i16 = 1;
+    const SEEK_END: i16 = 2;
+    let base: i64 = match whence {
+        SEEK_SET => 0,
+        SEEK_CUR => match kind { VnodeKind::TmpFile { pos, .. } => *pos as i64, _ => return None },
+        SEEK_END => match kind {
+            VnodeKind::TmpFile { idx, .. } => TMP_FILES.lock()[*idx].len as i64,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut start = base.checked_add(l_start)?;
+    let mut len = l_len;
+    if len < 0 { start = start.checked_add(len)?; len = -len; }
+    if start < 0 { return None; }
+    let start = start as u64;
+    let end = if len == 0 { u64::MAX } else { start.checked_add(len as u64)? };
+    Some((start, end))
+}
+
+/// Read a `struct flock` (Linux x86_64/aarch64 layout, 32 bytes) from user memory.
+/// Returns (l_type, l_whence, l_start, l_len, l_pid).
+fn read_flock(ptr: usize) -> Option<(i16, i16, i64, i64, u32)> {
+    let mut buf = [0u8; 32];
+    let ok = sched::with_current_address_space(|as_| as_.read_user_buf(ptr, &mut buf))
+        .unwrap_or(false);
+    if !ok { return None; }
+    Some((
+        i16::from_le_bytes(buf[0..2].try_into().unwrap()),
+        i16::from_le_bytes(buf[2..4].try_into().unwrap()),
+        i64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        i64::from_le_bytes(buf[16..24].try_into().unwrap()),
+        u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+    ))
+}
+
+/// Write a `struct flock` back to user memory via the safe user-buffer accessor
+/// (never dereference the raw pointer directly — it may sit on a CoW page that
+/// a supervisor-mode fault can't recover from).
+fn write_flock(ptr: usize, l_type: i16, l_whence: i16, l_start: i64, l_len: i64, l_pid: u32) -> bool {
+    let mut buf = [0u8; 32];
+    buf[0..2].copy_from_slice(&l_type.to_le_bytes());
+    buf[2..4].copy_from_slice(&l_whence.to_le_bytes());
+    buf[8..16].copy_from_slice(&l_start.to_le_bytes());
+    buf[16..24].copy_from_slice(&l_len.to_le_bytes());
+    buf[24..28].copy_from_slice(&l_pid.to_le_bytes());
+    sched::with_current_address_space(|as_| as_.write_user_buf(ptr, &buf)).unwrap_or(false)
+}
+
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
+
+fn handle_fcntl_lock(pid: u32, kind: VnodeKind, cmd: usize, arg: usize) -> Message {
+    const F_GETLK:  usize = 5;
+    const F_SETLK:  usize = 6;
+
+    let key = match lock_key_of(&kind) { Some(k) => k, None => return err_reply(-22) }; // EINVAL
+    let (l_type, l_whence, l_start, l_len, _) = match read_flock(arg) {
+        Some(v) => v, None => return err_reply(-14), // EFAULT
+    };
+    let (start, end) = match resolve_lock_range(&kind, l_whence, l_start, l_len) {
+        Some(r) => r, None => return err_reply(-22),
+    };
+
+    if l_type == F_UNLCK {
+        let mut locks = LOCKS.lock();
+        for l in locks.iter_mut() {
+            if l.in_use && l.key == key && l.pid == pid && ranges_overlap(l.start, l.end, start, end) {
+                *l = LockRecord::empty();
+            }
+        }
+        return ok_reply();
+    }
+
+    if cmd == F_GETLK {
+        let locks = LOCKS.lock();
+        match find_conflict(&*locks, key, pid, start, end, l_type == F_WRLCK) {
+            Some(c) => {
+                drop(locks);
+                let len = if c.end == u64::MAX { 0 } else { (c.end - c.start) as i64 };
+                write_flock(arg, if c.exclusive { F_WRLCK } else { F_RDLCK }, 0, c.start as i64, len, c.pid);
+            }
+            None => { drop(locks); write_flock(arg, F_UNLCK, 0, 0, 0, 0); }
+        }
+        return ok_reply();
+    }
+
+    // F_SETLK / F_SETLKW
+    let exclusive = l_type == F_WRLCK;
+    loop {
+        let mut locks = LOCKS.lock();
+        if find_conflict(&*locks, key, pid, start, end, exclusive).is_none() {
+            // No sub-range splitting: a new grant simply supersedes any range
+            // this same pid already held that overlaps it.
+            for l in locks.iter_mut() {
+                if l.in_use && l.key == key && l.pid == pid && ranges_overlap(l.start, l.end, start, end) {
+                    *l = LockRecord::empty();
+                }
+            }
+            return match locks.iter_mut().find(|l| !l.in_use) {
+                Some(slot) => { *slot = LockRecord { key, pid, start, end, exclusive, in_use: true }; ok_reply() }
+                None => err_reply(-37), // ENOLCK
+            };
+        }
+        drop(locks);
+        if cmd == F_SETLK { return err_reply(-11); } // EAGAIN
+        sched::yield_now("fcntl_setlkw");
+    }
+}
+
+fn handle_flock(pid: u32, fd: usize, op: u32) -> Message {
+    const LOCK_SH: u32 = 1;
+    const LOCK_EX: u32 = 2;
+    const LOCK_NB: u32 = 4;
+    const LOCK_UN: u32 = 8;
+
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    let key = match lock_key_of(&tbl.fds[fd].kind) { Some(k) => k, None => return err_reply(-22) };
+    drop(tbls);
+
+    if op & LOCK_UN != 0 {
+        release_locks(key, pid);
+        return ok_reply();
+    }
+
+    let exclusive = op & LOCK_EX != 0;
+    if !exclusive && op & LOCK_SH == 0 { return err_reply(-22); } // EINVAL
+    let nonblock = op & LOCK_NB != 0;
+
+    loop {
+        let mut locks = LOCKS.lock();
+        if find_conflict(&*locks, key, pid, 0, u64::MAX, exclusive).is_none() {
+            for l in locks.iter_mut() {
+                if l.in_use && l.key == key && l.pid == pid { *l = LockRecord::empty(); }
+            }
+            return match locks.iter_mut().find(|l| !l.in_use) {
+                Some(slot) => {
+                    *slot = LockRecord { key, pid, start: 0, end: u64::MAX, exclusive, in_use: true };
+                    ok_reply()
+                }
+                None => err_reply(-37), // ENOLCK
+            };
+        }
+        drop(locks);
+        if nonblock { return err_reply(-11); } // EWOULDBLOCK
+        sched::yield_now("flock");
+    }
+}
+
 fn handle_fcntl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
-    // F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4
-    const F_GETFD: usize = 1;
-    const F_SETFD: usize = 2;
-    const F_GETFL: usize = 3;
-    const F_SETFL: usize = 4;
+    // F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_GETLK=5, F_SETLK=6, F_SETLKW=7
+    const F_GETFD:  usize = 1;
+    const F_SETFD:  usize = 2;
+    const F_GETFL:  usize = 3;
+    const F_SETFL:  usize = 4;
+    const F_GETLK:  usize = 5;
+    const F_SETLK:  usize = 6;
+    const F_SETLKW: usize = 7;
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
@@ -1563,6 +1834,11 @@ fn handle_fcntl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
         F_SETFD => { tbl.fds[fd].flags = arg as u32; ok_reply() }
         F_GETFL => val_reply(tbl.fds[fd].flags as u64),
         F_SETFL => { tbl.fds[fd].flags = (tbl.fds[fd].flags & O_CLOEXEC) | arg as u32; ok_reply() }
+        F_GETLK | F_SETLK | F_SETLKW => {
+            let kind = tbl.fds[fd].kind;
+            drop(tbls);
+            handle_fcntl_lock(pid, kind, cmd, arg)
+        }
         _ => ok_reply(), // silently ignore unknown fcntl
     }
 }
@@ -2088,6 +2364,22 @@ fn handle_rename(old_ptr: usize, new_ptr: usize) -> Message {
     let (obuf, olen) = match read_cstr_raw(old_ptr) { Some(r) => r, None => return err_reply(-14) };
     let (nbuf, nlen) = match read_cstr_raw(new_ptr) { Some(r) => r, None => return err_reply(-14) };
     let old = &obuf[..olen]; let new = &nbuf[..nlen];
+
+    let old_port = find_mount_port(old);
+    let new_port = find_mount_port(new);
+    if old_port.is_some() || new_port.is_some() {
+        return match (old_port, new_port) {
+            (Some(op), Some(np)) if op == np => {
+                let mut proxy = Message::empty();
+                proxy.tag = VFS_RENAME;
+                proxy.data[0..8].copy_from_slice(&(old_ptr as u64).to_le_bytes());
+                proxy.data[8..16].copy_from_slice(&(new_ptr as u64).to_le_bytes());
+                call_port(op, proxy)
+            }
+            _ => err_reply(-18), // EXDEV — cross-device rename not supported
+        };
+    }
+
     if !is_tmp_path(old) || !is_tmp_path(new) { return err_reply(-30); }
     let mut tmp = TMP_FILES.lock();
     match tmp.iter().position(|e| e.in_use && !e.is_dir && e.path_len == olen && &e.path[..olen] == old) {
@@ -2112,19 +2404,21 @@ fn handle_unlink(path_ptr: usize) -> Message {
     }
     if !is_tmp_path(path) { return err_reply(-30); }
     let mut tmp = TMP_FILES.lock();
-    match tmp.iter().position(|e| e.in_use && !e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
+    match tmp.iter().position(|e| e.in_use && e.path_len == plen && &e.path[..plen] == path) {
+        Some(idx) if tmp[idx].is_dir => err_reply(-21), // EISDIR — use rmdir() instead
         Some(idx) => { tmp[idx] = TmpFileEntry::empty(); ok_reply() }
         None      => err_reply(-2),
     }
 }
 
-fn handle_mkdir(path_ptr: usize) -> Message {
+fn handle_mkdir(pid: u32, path_ptr: usize, mode: u32) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let path = &pbuf[..plen];
     if let Some(port) = find_mount_port(path) {
         let mut proxy = Message::empty();
         proxy.tag = VFS_MKDIR;
         proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+        proxy.data[8..16].copy_from_slice(&(mode as u64).to_le_bytes());
         return call_port(port, proxy);
     }
     if !is_tmp_path(path) { return err_reply(-30); }
@@ -2134,6 +2428,9 @@ fn handle_mkdir(path_ptr: usize) -> Message {
     match tmp.iter().position(|e| !e.in_use) {
         Some(idx) => {
             tmp[idx] = TmpFileEntry::empty(); tmp[idx].in_use = true; tmp[idx].is_dir = true;
+            tmp[idx].mode = mode & 0o777 & !sched::umask(u32::MAX);
+            tmp[idx].uid  = sched::euid_of(pid);
+            tmp[idx].gid  = sched::egid_of(pid);
             let copy_len = plen.min(MAX_TMP_PATH - 1);
             tmp[idx].path[..copy_len].copy_from_slice(&path[..copy_len]);
             tmp[idx].path_len = copy_len;
@@ -2141,6 +2438,122 @@ fn handle_mkdir(path_ptr: usize) -> Message {
         }
         None => err_reply(-28),
     }
+}
+
+fn handle_rmdir(path_ptr: usize) -> Message {
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let path = &pbuf[..plen];
+    if let Some(port) = find_mount_port(path) {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_RMDIR;
+        proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+        return call_port(port, proxy);
+    }
+    if !is_tmp_path(path) || path == b"/tmp" {
+        for &dir in RAMFS_DIRS { if path == dir { return err_reply(-16); } } // EBUSY
+        return err_reply(-30); // EROFS
+    }
+    let mut tmp = TMP_FILES.lock();
+    let idx = match tmp.iter().position(|e| e.in_use && e.path_len == plen && &e.path[..plen] == path) {
+        Some(i) => i,
+        None    => return err_reply(-2), // ENOENT
+    };
+    if !tmp[idx].is_dir { return err_reply(-20); } // ENOTDIR
+    // Directory must be empty: no other tmpfs entry may live under it.
+    let mut prefix = [0u8; MAX_TMP_PATH];
+    prefix[..plen].copy_from_slice(path);
+    if plen < MAX_TMP_PATH { prefix[plen] = b'/'; }
+    let child_prefix = &prefix[..(plen + 1).min(MAX_TMP_PATH)];
+    let has_children = tmp.iter().enumerate().any(|(i, e)| {
+        i != idx && e.in_use && e.path_len > plen && &e.path[..child_prefix.len()] == child_prefix
+    });
+    if has_children { return err_reply(-39); } // ENOTEMPTY
+    tmp[idx] = TmpFileEntry::empty();
+    ok_reply()
+}
+
+// ── chmod/chown ──────────────────────────────────────────────────────────────
+//
+// Only tmpfs entries carry real per-file mode/uid/gid; everything else (RAMFS,
+// device nodes, mounted filesystems) is EROFS/EPERM here rather than the
+// previous silent no-op, since we can't actually persist the change for them.
+
+fn handle_chmod(pid: u32, path_ptr: usize, mode: u32) -> Message {
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let path = &pbuf[..plen];
+    if find_mount_port(path).is_some() { return err_reply(-30); } // EROFS
+    if !is_tmp_path(path) { return err_reply(-30); }
+    let euid = sched::euid_of(pid);
+    let mut tmp = TMP_FILES.lock();
+    match tmp.iter().position(|e| e.in_use && e.path_len == plen && &e.path[..plen] == path) {
+        Some(idx) => {
+            if euid != 0 && euid != tmp[idx].uid { return err_reply(-1); } // EPERM
+            tmp[idx].mode = mode & 0o777;
+            ok_reply()
+        }
+        None => err_reply(-2), // ENOENT
+    }
+}
+
+fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    match tbl.fds[fd].kind {
+        VnodeKind::TmpFile { idx, .. } => {
+            drop(tbls);
+            let euid = sched::euid_of(pid);
+            let mut tmp = TMP_FILES.lock();
+            if euid != 0 && euid != tmp[idx].uid { return err_reply(-1); } // EPERM
+            tmp[idx].mode = mode & 0o777;
+            ok_reply()
+        }
+        VnodeKind::MountedFile { .. } => err_reply(-30), // EROFS
+        _ => err_reply(-1), // EPERM — devices/RAMFS have fixed, root-owned modes
+    }
+}
+
+/// `u32::MAX` for `uid`/`gid` means "leave unchanged" (mirrors chown(2)'s `-1`).
+fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32) -> Message {
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let path = &pbuf[..plen];
+    if find_mount_port(path).is_some() { return err_reply(-30); }
+    if !is_tmp_path(path) { return err_reply(-30); }
+    let euid = sched::euid_of(pid);
+    let mut tmp = TMP_FILES.lock();
+    match tmp.iter().position(|e| e.in_use && e.path_len == plen && &e.path[..plen] == path) {
+        Some(idx) => apply_chown(&mut tmp[idx], euid, uid, gid),
+        None => err_reply(-2), // ENOENT
+    }
+}
+
+fn handle_fchown(pid: u32, fd: usize, uid: u32, gid: u32) -> Message {
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    match tbl.fds[fd].kind {
+        VnodeKind::TmpFile { idx, .. } => {
+            drop(tbls);
+            let euid = sched::euid_of(pid);
+            let mut tmp = TMP_FILES.lock();
+            apply_chown(&mut tmp[idx], euid, uid, gid)
+        }
+        VnodeKind::MountedFile { .. } => err_reply(-30),
+        _ => err_reply(-1),
+    }
+}
+
+/// Only root may change the owning uid; the owner (or root) may change gid.
+fn apply_chown(e: &mut TmpFileEntry, euid: u32, uid: u32, gid: u32) -> Message {
+    if uid != u32::MAX {
+        if euid != 0 { return err_reply(-1); } // EPERM
+        e.uid = uid;
+    }
+    if gid != u32::MAX {
+        if euid != 0 && euid != e.uid { return err_reply(-1); } // EPERM
+        e.gid = gid;
+    }
+    ok_reply()
 }
 
 // ── stat(2) support ──────────────────────────────────────────────────────────
@@ -2151,6 +2564,10 @@ fn handle_mkdir(path_ptr: usize) -> Message {
 //  36:  __pad0  (u32)  40:  st_rdev  (u64)   48: st_size  (i64)
 //  56:  st_blksize (i64) 64: st_blocks (i64)  72..120: timestamps (zeroed)
 fn write_stat(stat_ptr: usize, mode: u32, size: u64, ino: u64) {
+    write_stat_owned(stat_ptr, mode, size, ino, 0, 0);
+}
+
+fn write_stat_owned(stat_ptr: usize, mode: u32, size: u64, ino: u64, uid: u32, gid: u32) {
     unsafe {
         let p = stat_ptr as *mut u8;
         core::ptr::write_bytes(p, 0, 144);
@@ -2158,6 +2575,8 @@ fn write_stat(stat_ptr: usize, mode: u32, size: u64, ino: u64) {
         (p.add( 8) as *mut u64).write_unaligned(ino);        // st_ino
         (p.add(16) as *mut u64).write_unaligned(1u64);       // st_nlink
         (p.add(24) as *mut u32).write_unaligned(mode);       // st_mode
+        (p.add(28) as *mut u32).write_unaligned(uid);        // st_uid
+        (p.add(32) as *mut u32).write_unaligned(gid);        // st_gid
         (p.add(48) as *mut u64).write_unaligned(size);       // st_size
         (p.add(56) as *mut u64).write_unaligned(4096u64);    // st_blksize
         (p.add(64) as *mut u64).write_unaligned((size + 511) / 512); // st_blocks
@@ -2190,9 +2609,10 @@ fn handle_stat(path_ptr: usize, stat_ptr: usize) -> Message {
         let tmp = TMP_FILES.lock();
         if let Some(e) = tmp.iter().find(|e| e.in_use && e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
             let ino = plen as u64 + 10000;
-            let _ = e;
+            let mode = 0o040000 | if e.mode != 0 { e.mode } else { 0o755 };
+            let (uid, gid) = (e.uid, e.gid);
             drop(tmp);
-            write_stat(stat_ptr, 0o040755, 0, ino);
+            write_stat_owned(stat_ptr, mode, 0, ino, uid, gid);
             return ok_reply();
         }
     }
@@ -2228,8 +2648,10 @@ fn handle_stat(path_ptr: usize, stat_ptr: usize) -> Message {
         if let Some(e) = tmp.iter().find(|e| e.in_use && !e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
             let size = e.len as u64;
             let ino = plen as u64 + 20000;
+            let mode = 0o100000 | if e.mode != 0 { e.mode } else { 0o644 };
+            let (uid, gid) = (e.uid, e.gid);
             drop(tmp);
-            write_stat(stat_ptr, 0o100644, size, ino);
+            write_stat_owned(stat_ptr, mode, size, ino, uid, gid);
             return ok_reply();
         }
     }

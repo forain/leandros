@@ -29,6 +29,8 @@ const VFS_GETDENTS64: u64 = 0x1D;
 const VFS_UNLINK:     u64 = 0x1F;
 const VFS_MKDIR:      u64 = 0x20;
 const VFS_FTRUNCATE:  u64 = 0x21;
+const VFS_RENAME:     u64 = 0x22;
+const VFS_RMDIR:      u64 = 0x29;
 
 const O_WRONLY:  u64 = 1;
 const O_RDWR:    u64 = 2;
@@ -1200,8 +1202,123 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
         resolve_path(ms, parent_rel)
     };
     if parent_ino == 0 { return err_reply(-2); }
+    let ino = dir_lookup(ms, parent_ino, name);
+    if ino == 0 { return err_reply(-2); }
+    let iblkaddr = nat_lookup(ms, ino);
+    let is_dir = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_is_dir(iblk) };
+    if is_dir { return err_reply(-21); } // EISDIR — use rmdir() instead
     if dir_remove_entry(ms, parent_ino, name) { maybe_flush(ms); ok_reply() }
     else { err_reply(-2) }
+}
+
+/// True if directory `dir_ino` contains no entries other than "." and "..".
+fn dir_is_empty(ms: &mut MountState, dir_ino: u32) -> bool {
+    let iblkaddr = nat_lookup(ms, dir_ino);
+    let iblk_copy = {
+        let b = ms.cache.read(ms.dev, iblkaddr as u64);
+        let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
+    };
+    let fsize = inode_size(&iblk_copy);
+    let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
+
+    for blk_idx in 0..n_data_blks {
+        let phys = inode_logical_to_phys(ms, dir_ino, blk_idx as u64);
+        if phys == 0 { continue; }
+        let dblk = ms.cache.read(ms.dev, phys as u64);
+        let dblk = unsafe { &*(dblk as *const [u8; BLOCK_SIZE]) };
+        let mut slot = 0usize;
+        while slot < NR_DENTRY_IN_BLK {
+            let byte = slot / 8;
+            let bit  = slot % 8;
+            if byte >= DENTRY_BITMAP_SIZE { break; }
+            if (dblk[byte] & (1 << bit)) == 0 { slot += 1; continue; }
+            let e_off    = DENTRY_ENTRIES_OFF + slot * DENTRY_ENTRY_SIZE;
+            let name_len = r16(dblk, e_off + 8) as usize;
+            let n_off    = DENTRY_NAMES_OFF + slot * DENTRY_SLOT_LEN;
+            let is_dot    = name_len == 1 && n_off + 1 <= BLOCK_SIZE && dblk[n_off] == b'.';
+            let is_dotdot = name_len == 2 && n_off + 2 <= BLOCK_SIZE && &dblk[n_off..n_off + 2] == b"..";
+            if !is_dot && !is_dotdot { return false; }
+            let slots_used = (name_len + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN;
+            slot += slots_used.max(1);
+        }
+    }
+    true
+}
+
+fn handle_rmdir(ms: &mut MountState, path_ptr: u64) -> Message {
+    let path_bytes = unsafe {
+        let ptr = path_ptr as *const u8;
+        let mut len = 0;
+        while *ptr.add(len) != 0 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    };
+    let rel = match strip_prefix(path_bytes, ms.mount_prefix.as_bytes()) {
+        Some(r) => r,
+        None    => return err_reply(-2),
+    };
+    let (parent_rel, name) = path_split(rel);
+    let parent_ino = if parent_rel.is_empty() || parent_rel == b"/" {
+        ms.sb.root_ino
+    } else {
+        resolve_path(ms, parent_rel)
+    };
+    if parent_ino == 0 { return err_reply(-2); }
+    let ino = dir_lookup(ms, parent_ino, name);
+    if ino == 0 { return err_reply(-2); }
+    let iblkaddr = nat_lookup(ms, ino);
+    let is_dir = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_is_dir(iblk) };
+    if !is_dir { return err_reply(-20); } // ENOTDIR
+    if !dir_is_empty(ms, ino) { return err_reply(-39); } // ENOTEMPTY
+    if dir_remove_entry(ms, parent_ino, name) { maybe_flush(ms); ok_reply() }
+    else { err_reply(-2) }
+}
+
+fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
+    let old_bytes = unsafe {
+        let ptr = old_ptr as *const u8;
+        let mut len = 0;
+        while *ptr.add(len) != 0 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    };
+    let new_bytes = unsafe {
+        let ptr = new_ptr as *const u8;
+        let mut len = 0;
+        while *ptr.add(len) != 0 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    };
+    let old_rel = match strip_prefix(old_bytes, ms.mount_prefix.as_bytes()) {
+        Some(r) => r, None => return err_reply(-2),
+    };
+    let new_rel = match strip_prefix(new_bytes, ms.mount_prefix.as_bytes()) {
+        Some(r) => r, None => return err_reply(-2),
+    };
+    let (old_parent_rel, old_name) = path_split(old_rel);
+    let (new_parent_rel, new_name) = path_split(new_rel);
+    let old_parent_ino = if old_parent_rel.is_empty() || old_parent_rel == b"/" {
+        ms.sb.root_ino
+    } else {
+        resolve_path(ms, old_parent_rel)
+    };
+    let new_parent_ino = if new_parent_rel.is_empty() || new_parent_rel == b"/" {
+        ms.sb.root_ino
+    } else {
+        resolve_path(ms, new_parent_rel)
+    };
+    if old_parent_ino == 0 || new_parent_ino == 0 { return err_reply(-2); }
+    let ino = dir_lookup(ms, old_parent_ino, old_name);
+    if ino == 0 { return err_reply(-2); }
+    if dir_lookup(ms, new_parent_ino, new_name) != 0 { return err_reply(-17); } // EEXIST
+    let iblkaddr = nat_lookup(ms, ino);
+    let is_dir = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_is_dir(iblk) };
+    let ftype = if is_dir { DT_DIR } else { DT_REG };
+    if !dir_add_entry(ms, new_parent_ino, new_name, ino, ftype) { return err_reply(-28); } // ENOSPC
+    dir_remove_entry(ms, old_parent_ino, old_name);
+    if is_dir && new_parent_ino != old_parent_ino {
+        dir_remove_entry(ms, ino, b"..");
+        dir_add_entry(ms, ino, b"..", new_parent_ino, DT_DIR);
+    }
+    maybe_flush(ms);
+    ok_reply()
 }
 
 fn handle_ftruncate(ms: &mut MountState, file_id: u64, length: u64) -> Message {
@@ -1241,6 +1358,8 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message) -> Message {
         VFS_GETDENTS64 => handle_getdents(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_MKDIR      => handle_mkdir(ms, arg(msg,0), arg(msg,1)),
         VFS_UNLINK     => handle_unlink(ms, arg(msg,0)),
+        VFS_RMDIR      => handle_rmdir(ms, arg(msg,0)),
+        VFS_RENAME     => handle_rename(ms, arg(msg,0), arg(msg,1)),
         VFS_FTRUNCATE  => handle_ftruncate(ms, arg(msg,0), arg(msg,1)),
         _              => err_reply(-22), // EINVAL
     }

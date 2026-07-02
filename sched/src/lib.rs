@@ -219,6 +219,57 @@ pub fn set_pgid(pid: Pid, pgid: Pid) -> bool {
     false
 }
 
+pub fn euid_of(pid: Pid) -> u32 {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.euid).unwrap_or(0)
+}
+
+pub fn egid_of(pid: Pid) -> u32 {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.egid).unwrap_or(0)
+}
+
+pub fn current_uid()  -> u32 { RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.uid).unwrap_or(0) }
+pub fn current_euid() -> u32 { euid_of(current_pid()) }
+pub fn current_gid()  -> u32 { RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.gid).unwrap_or(0) }
+pub fn current_egid() -> u32 { egid_of(current_pid()) }
+
+/// setuid(2) semantics: a privileged (euid==0) caller sets uid/euid unconditionally;
+/// an unprivileged caller may only set euid to its current real or effective uid.
+/// Returns false (⇒ EPERM) if the unprivileged case is violated.
+pub fn set_current_uid(new_uid: u32) -> bool {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    if let Some(t) = rq.find_pid_mut(pid) {
+        if t.euid == 0 {
+            t.uid = new_uid;
+            t.euid = new_uid;
+            return true;
+        }
+        if new_uid == t.uid || new_uid == t.euid {
+            t.euid = new_uid;
+            return true;
+        }
+    }
+    false
+}
+
+/// setgid(2) semantics — mirrors [`set_current_uid`] for the group identity.
+pub fn set_current_gid(new_gid: u32) -> bool {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    if let Some(t) = rq.find_pid_mut(pid) {
+        if t.euid == 0 {
+            t.gid = new_gid;
+            t.egid = new_gid;
+            return true;
+        }
+        if new_gid == t.gid || new_gid == t.egid {
+            t.egid = new_gid;
+            return true;
+        }
+    }
+    false
+}
+
 pub fn setsid() -> Pid {
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
