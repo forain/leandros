@@ -155,12 +155,82 @@ five passed cleanly on both architectures.
       edge cases, etc.) — not exercised by this pass; worth a broader
       smoke test if VFS-heavy pthread-adjacent bugs show up later.
 
-### 3. Complete Memory Management (Phase 6)
+### 3. Complete Memory Management (Phase 6) — DONE 2026-07-01
 **Why Critical**: Memory management is core to system operation.
 - Implement heap management with malloc/free
 - Add memory pools and advanced allocation strategies
 - Complete memory mapping with proper VMA management
 - Implement memory protection and sharing
+
+**Actual state found**: this entry's framing was stale, matching items 1 and
+2 above — heap allocation (a real buddy physical-page allocator plus a
+slab-style `#[global_allocator]`, `mm/src/buddy.rs`/`slab.rs`), VMA tracking,
+and `mmap`/`munmap`/`mprotect`/`brk` were already real and working on both
+architectures before this session. The genuine gaps, found by reading the
+code rather than trusting the bullet list, were narrower:
+
+- **Buddy allocator never coalesced on free** (`mm/src/buddy.rs`) — freed
+  blocks just went on the head of their own order's free list forever, so
+  long-running alloc/free churn permanently fragmented memory. Fixed with
+  doubly-linked free lists (next/prev stored inline in the freed page) and a
+  merge-with-buddy loop in `free()`.
+- **`sys_mremap`'s grow path silently zeroed data** instead of preserving it
+  — a live bug, not theoretical: `userland/relibc`'s dlmalloc calls `mremap`
+  directly for `realloc()`. Fixed by copying the overlapping bytes into the
+  new mapping before releasing the old one.
+- **Fork never did real copy-on-write** — `mm/src/cow.rs::clone_as` deep-copied
+  every faulted-in page up front; `VmaRegion.cow` existed but was always
+  `false` and never read. Replaced with real page-granular CoW: a new
+  `mm/src/pageref.rs` refcounts physical pages that have ever been shared,
+  `clone_as` now shares already-faulted pages read-only between parent and
+  child (converting still-contiguous eager regions to the same per-page
+  tracking lazy VMAs use, since each side can now diverge independently),
+  and both architectures' page-fault handlers were widened to also route
+  protection (not just not-present) faults through the recovery path with
+  a write/read bit, promoting a page in place or copying it depending on
+  the current refcount.
+- **`MAP_SHARED` was accepted but silently downgraded to `MAP_PRIVATE`**
+  everywhere, including the anonymous path (`map_lazy` hardcoded it). Now
+  real for anonymous mappings whose pages are already faulted in at fork
+  time (the realistic mmap-then-fork-to-share pattern): `clone_as` skips the
+  CoW read-only downgrade for these regions and maps both sides with full
+  permissions, refcounting only for correct teardown.
+
+**Bug exposed and fixed in passing**: `sys_wait`/`sys_waitid` wrote a child's
+exit status into the caller's pointer via a raw `core::ptr::write` from
+kernel context. That pointer is very often the caller's own stack, which
+now sits on a CoW-shared, read-only page immediately after `fork()` until
+the parent's own user-mode code triggers promotion — and this kernel's
+page-fault handlers don't attempt recovery for faults taken in
+supervisor/EL1 mode (x86_64 printed a fatal "KERNEL EXCEPTION" on the
+parent's own stack address right after the child exited). Fixed by routing
+both through `AddressSpace::write_user_buf` (virt→phys/HHDM), which never
+touches the raw PTE permission bit, instead of dereferencing the pointer
+directly. Broader syscalls that still write to user pointers this way
+were not swept — this fix only covers the two call sites this phase's own
+test suite exercises.
+
+**What's Left**:
+- [ ] A page in a region that's never been touched before a fork, in either
+      a private-CoW or a `MAP_SHARED` region, diverges independently per
+      side on first touch afterward rather than staying genuinely shared —
+      this needs the same VMO/backing-object refactor `unmap_range`'s
+      existing middle-split leak (`mm/src/vmm.rs`) is already deferred to;
+      not attempted here to avoid scope creep into that.
+- [ ] File-backed `MAP_SHARED` (as opposed to anonymous) still has no page
+      cache to share through — same VMO dependency as above.
+- [ ] The kernel-mode-direct-pointer-write hazard above is a general pattern
+      (`sys_waitid` had two more instances, both fixed; there may be others
+      across `kernel/src/syscall.rs` not exercised by this session's test
+      coverage) — worth a broader audit if more of these surface.
+
+**Verified 2026-07-01** in QEMU on x86_64 and aarch64, both UEFI/Limine and
+direct boot, via a new committed test binary
+(`userland/memtest`, see `userland/memtest/src/main.rs`): fork'd
+parent/child no longer see each other's writes to a pre-fork-touched page,
+`mremap`-grow preserves content, an alloc/free churn loop across varied
+sizes still allows a large allocation afterward, and `MAP_SHARED` siblings
+do see each other's writes across a fork.
 
 ## Priority 2: Core System Integration (Phase 7)
 
