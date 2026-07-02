@@ -65,7 +65,9 @@ def _cleanup_socks():
             pass
 
 
-def _build_cmd(arch):
+def _build_cmd(arch, mode="uefi"):
+    if mode == "direct":
+        return _build_direct_cmd(arch)
     if arch == "aarch64":
         fw = _find_fw(AARCH64_FW_PATHS)
         if not fw:
@@ -117,6 +119,56 @@ def _build_cmd(arch):
             "-audiodev", "none,id=snd0",
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-no-reboot", "-parallel", "none",
+            "-display", "none",
+            "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
+            "-serial", "chardev:serial0",
+            "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
+        ]
+    else:
+        sys.exit(f"ERROR: unknown arch '{arch}'")
+
+
+def _build_direct_cmd(arch):
+    """Direct-boot (bare ELF, no Limine/UEFI) headless variant of run-qemu.sh's
+    --direct path: same -kernel/-device loader placement, but with the
+    chardev-socket serial/monitor/display setup used everywhere else in this
+    driver instead of run-qemu.sh's `-serial mon:stdio` + graphical window.
+    virtio-keyboard-pci is dropped (documented QEMU 10.x hang on this host)."""
+    if arch == "aarch64":
+        kernel = os.path.join(REPO_ROOT, "target/final-aarch64/kernel-direct")
+        initrd = os.path.join(REPO_ROOT, "initrd-aarch64.cpio")
+        if not os.path.exists(kernel):
+            sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
+        return [
+            "qemu-system-aarch64",
+            "-machine", "virt,gic-version=2", "-cpu", "max", "-m", "2G", "-accel", "tcg",
+            "-kernel", kernel,
+            "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
+            "-device", "virtio-gpu-pci",
+            "-audiodev", "none,id=snd0",
+            "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
+            "-net", "none", "-parallel", "none", "-no-reboot",
+            "-display", "none",
+            "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
+            "-serial", "chardev:serial0",
+            "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
+        ]
+    elif arch == "x86_64":
+        kernel = os.path.join(REPO_ROOT, "target/final-x86_64/kernel-direct-32.elf")
+        if not os.path.exists(kernel):
+            kernel = os.path.join(REPO_ROOT, "target/final-x86_64/kernel-direct")
+        initrd = os.path.join(REPO_ROOT, "initrd-x86_64.cpio")
+        if not os.path.exists(kernel):
+            sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
+        return [
+            "qemu-system-x86_64",
+            "-machine", "q35", "-cpu", "max", "-m", "2G", "-accel", "tcg",
+            "-kernel", kernel,
+            "-device", f"loader,file={initrd},addr=0x10000000,force-raw=on",
+            "-vga", "none", "-device", "virtio-vga",
+            "-audiodev", "none,id=snd0",
+            "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
+            "-net", "none", "-no-reboot",
             "-display", "none",
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
             "-serial", "chardev:serial0",
@@ -189,7 +241,7 @@ def _read_serial_until(sentinel, timeout=120):
     return None
 
 
-def cmd_start(arch="aarch64"):
+def cmd_start(arch="aarch64", mode="uefi"):
     if _qemu_pid() is not None:
         print("QEMU already running. Run 'stop' first.")
         sys.exit(1)
@@ -197,7 +249,7 @@ def cmd_start(arch="aarch64"):
     _cleanup_socks()
     open(SERIAL_LOG, "wb").close()
 
-    qemu_cmd = _build_cmd(arch)
+    qemu_cmd = _build_cmd(arch, mode)
     proc = subprocess.Popen(
         qemu_cmd,
         stdout=subprocess.DEVNULL,
@@ -411,7 +463,9 @@ if __name__ == "__main__":
 
     sub = args[0]
     if sub == "start":
-        cmd_start(args[1] if len(args) > 1 else "aarch64")
+        arch = args[1] if len(args) > 1 else "aarch64"
+        mode = args[2] if len(args) > 2 else "uefi"
+        cmd_start(arch, mode)
     elif sub == "cmd":
         if len(args) < 2:
             sys.exit("Usage: driver.py cmd <shell-command>")
