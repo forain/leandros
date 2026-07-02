@@ -81,6 +81,7 @@ create_initrd() {
     cp "$userland_dir/shell" "$temp_dir/bin/shell"
     cp "$userland_dir/hello" "$temp_dir/bin/hello"
     cp "$userland_dir/aplay" "$temp_dir/bin/aplay"
+    cp "$userland_dir/memtest" "$temp_dir/bin/memtest"
 
     # Include relibc (libc.a) in the initrd for development/linking
     local relibc_target

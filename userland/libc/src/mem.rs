@@ -134,6 +134,27 @@ pub unsafe extern "C" fn mmap(
     r as *mut u8
 }
 
+/// Resize a mapping in place or (if it must move) to a new address,
+/// preserving the overlapping content.
+#[no_mangle]
+pub unsafe extern "C" fn mremap(
+    old_addr: *mut u8, old_size: size_t, new_size: size_t, flags: i32,
+) -> *mut u8 {
+    let r = crate::syscall::syscall5(
+        nr::MREMAP,
+        old_addr as usize,
+        old_size,
+        new_size,
+        flags as usize,
+        0,
+    );
+    if r < 0 {
+        crate::errno::set_errno(-r as i32);
+        return (-1isize) as *mut u8;
+    }
+    r as *mut u8
+}
+
 /// Unmap memory from the process address space.
 #[no_mangle]
 pub unsafe extern "C" fn munmap(addr: *mut u8, len: size_t) -> i32 {

@@ -51,6 +51,16 @@ pub unsafe fn syscall4(nr: usize, a0: usize, a1: usize, a2: usize, a3: usize) ->
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
+pub unsafe fn syscall5(nr: usize, a0: usize, a1: usize, a2: usize,
+                       a3: usize, a4: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!("svc #0", in("x8") nr, inlateout("x0") a0 => ret,
+         in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, options(nostack));
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
 pub unsafe fn syscall6(nr: usize, a0: usize, a1: usize, a2: usize,
                        a3: usize, a4: usize, a5: usize) -> isize {
     let ret: isize;
@@ -146,6 +156,26 @@ pub unsafe fn syscall4(nr: usize, a0: usize, a1: usize, a2: usize, a3: usize) ->
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
+pub unsafe fn syscall5(nr: usize, a0: usize, a1: usize, a2: usize,
+                       a3: usize, a4: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") nr => ret,
+        in("rdi") a0,
+        in("rsi") a1,
+        in("rdx") a2,
+        in("r10") a3,
+        in("r8")  a4,
+        out("rcx") _,
+        out("r11") _,
+        options(nostack),
+    );
+    ret
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 pub unsafe fn syscall6(nr: usize, a0: usize, a1: usize, a2: usize,
                        a3: usize, a4: usize, a5: usize) -> isize {
     let ret: isize;
@@ -178,6 +208,9 @@ pub unsafe fn syscall3(_nr: usize, _a0: usize, _a1: usize, _a2: usize) -> isize 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub unsafe fn syscall4(_nr: usize, _a0: usize, _a1: usize, _a2: usize, _a3: usize) -> isize { 0 }
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+pub unsafe fn syscall5(_nr: usize, _a0: usize, _a1: usize, _a2: usize,
+                       _a3: usize, _a4: usize) -> isize { 0 }
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub unsafe fn syscall6(_nr: usize, _a0: usize, _a1: usize, _a2: usize,
                        _a3: usize, _a4: usize, _a5: usize) -> isize { 0 }
 
@@ -207,6 +240,9 @@ pub mod nr {
 
     #[cfg(target_arch = "aarch64")] pub const BRK:            usize = 214;
     #[cfg(target_arch = "x86_64")]  pub const BRK:            usize = 12;
+
+    #[cfg(target_arch = "aarch64")] pub const MREMAP:         usize = 216;
+    #[cfg(target_arch = "x86_64")]  pub const MREMAP:         usize = 25;
 
     #[cfg(target_arch = "aarch64")] pub const CLONE:          usize = 220;
     #[cfg(target_arch = "x86_64")]  pub const CLONE:          usize = 56;

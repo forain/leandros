@@ -1,0 +1,11 @@
+[package]
+name = "memtest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "memtest"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }
