@@ -328,12 +328,107 @@ shell's `ls`/`mkdir` still work normally afterward.
 
 ## Priority 3: User Experience Features (Phase 8-9)
 
-### 6. POSIX Timers (Phase 8)
+### 6. POSIX Timers (Phase 8) — DONE 2026-07-02
 **Why Critical**: Timers are essential for applications and system scheduling.
-- Complete timer creation and expiration
-- Implement timer signal delivery
-- Add timer synchronization primitives
-- Implement timer accounting and statistics
+
+**Actual state found**: like items 3-5, this entry's framing was stale.
+`timer_create`/`timer_settime`/`timer_gettime`/`timer_delete`, `alarm`,
+`setitimer`/`getitimer`, and `nanosleep` were already wired end-to-end
+through a per-process POSIX timer table in `servers/tty/src/lib.rs`
+(`check_timers()` fires on every syscall return, delivering via
+`sched::deliver_signal`). The genuine gaps, found by reading the code
+rather than the bullet list:
+
+- **`timer_delete` was completely non-functional on x86-64**: the kernel's
+  x86-64 syscall-number table (`kernel/src/syscall.rs`) had
+  `TIMER_DELETE = 225`, but the real Linux ABI number vendored into
+  relibc's syscall table (`userland/relibc/src/platform/leandros/nr_x86_64.rs`)
+  is 226 — 225 is `TIMER_GETOVERRUN`, which didn't exist in the kernel's
+  dispatch table at all. Any real `timer_delete()` call from compiled
+  userland silently fell through to the default `ENOSYS` arm. Fixed the
+  constant and added `TIMER_GETOVERRUN` (both architectures) plus
+  `sys_timer_getoverrun`/`timer_getoverrun()` end-to-end (kernel dispatch →
+  `servers/tty` → relibc `Pal::timer_getoverrun`, previously an
+  `unimplemented!()` stub in `userland/relibc/src/header/time/mod.rs`).
+- **`timer_create`'s out-param write was truncated to 32 bits**:
+  `handle_timer_create` wrote only a `u32` into an 8-byte `timer_t`
+  out-pointer, leaving the caller's high 32 bits uninitialized garbage — a
+  later `timer_settime()`/`timer_delete()` call using that value could pass
+  back an out-of-range 64-bit `timerid`. Also, `sys_timer_create` in
+  `kernel/src/syscall.rs` never validated the out-pointer before forwarding
+  it, so a wild pointer from userland could crash the kernel outright. Both
+  fixed.
+- **A NULL-collision bug made the very first timer any process creates
+  unusable**: relibc's `timer_settime`/`timer_gettime`/`timer_delete`/
+  `timer_getoverrun` (`userland/relibc/src/header/time/mod.rs`) all reject a
+  NULL `timer_t` as `EFAULT` — correct per how Redox's backend uses
+  `timer_t` as a real heap pointer, but this backend hands back the raw
+  table-slot index as the literal pointer value, and slot 0 (a fresh
+  process's first timer) numerically *is* NULL. Fixed at the LeandrOS-
+  specific layer rather than touching the shared relibc header: handles are
+  now issued as `slot + 1` (`servers/tty/src/lib.rs`), decoded back at the
+  single IPC boundary that parses a caller-supplied `timer_t`.
+- **`alarm()`/`setitimer(ITIMER_REAL)` leaked a timer-table slot on every
+  call**: both unconditionally called `TIMER_CREATE` to "ensure" their
+  shared slot-0 timer existed, but `handle_timer_create` always allocates
+  the *first free* slot rather than reusing slot 0 — repeated calls (a
+  realistic pattern; some libc `sleep()` implementations use `alarm()`)
+  would exhaust `MAX_TIMERS` (8) and start failing real `timer_create()`
+  calls with `EAGAIN`. Fixed with a new idempotent `ensure_real_timer()`/
+  `set_real_itimer()`/`get_real_itimer()` direct API that targets slot 0
+  specifically and rearms in place.
+- **`setitimer`/`getitimer`/`timer_settime` never reported the previous
+  value**: `sys_getitimer` always zeroed its output, `sys_setitimer` always
+  zeroed the old-value out-param, and `handle_timer_settime` silently
+  discarded `ospec_ptr`. All three now report real previous
+  interval/remaining-time state, matching POSIX semantics real callers
+  (e.g. save-and-restore-the-previous-alarm patterns) rely on.
+- **Interval timers only advanced one period per check and never tracked
+  overrun**: a process descheduled across several periods would silently
+  lose all but the most recent expiration. `check_timers()` now computes
+  how many periods were missed in one step and folds them into a
+  per-timer `overrun` counter, exposed via the new `timer_getoverrun()`.
+- **Same kernel-mode raw-user-pointer-write hazard class as Phases 6/7**:
+  `handle_timer_create`/`settime`/`gettime` and `sys_setitimer`/
+  `getitimer`/`sigpending` dereferenced caller-supplied pointers directly
+  from kernel/supervisor context — unrecoverable if the page is CoW-shared
+  and not yet faulted in, per `project_memory_management_phase6`'s
+  writeup. Swept to `sched::with_current_address_space` +
+  `read_user_buf`/`write_user_buf`, mirroring `servers/vfs`'s
+  `read_flock`/`write_flock` pattern.
+
+**Real bug found and fixed in passing, one layer down (Phase 2 signal
+handling)**: while building an end-to-end timer test that installs a real
+`sigaction()` handler for `SIGALRM` — the first time any userland program
+in this repo has exercised `sigaction()` with a real custom handler —
+the kernel's internal `SigAction` struct (`sched/src/task.rs`) turned out
+to have its `mask` and `restorer` fields in the wrong order relative to
+the real POSIX `struct sigaction` layout relibc actually sends
+(`sa_handler, sa_flags, sa_restorer, sa_mask`). `sys_sigaction`
+(`sched/src/signal.rs`) reads/writes this struct via a raw
+`core::ptr::read`/`write` against whatever bytes the caller passed, so the
+swapped fields meant `sa_restorer` (a function pointer) was stored into
+`mask`, and `sa_mask` (0) was stored into `restorer` — the return
+trampoline address became 0. The instant a registered handler ran, the
+process crashed with an EL0 fault at `ELR=0` on `sigreturn`. This was
+latent since Phase 2 (2026-06-30) and untriggered by every prior test
+suite, since none of them install a signal handler and unmask a signal
+that actually fires. Fixed by reordering the struct fields; all other code
+references fields by name, so no other call site needed changes.
+
+**New test coverage**: `userland/timertest` (mirrors the `pthreadtest`
+pattern — links `librelibc.a` directly via `relibc_start_v1`, since POSIX
+timers need real `sigaction()`/TLS, not the minimal `leandros-libc`) — the
+slot-0/NULL-collision round trip, real one-shot `SIGALRM` delivery via
+`timer_settime`, periodic-timer overrun accounting, `MAX_TIMERS`
+exhaustion/`EAGAIN` boundary, and the `alarm()`/`setitimer()` shared-slot
+no-leak regression.
+
+**Verified 2026-07-02** in QEMU on **both** architectures (aarch64,
+x86_64) across **both** boot protocols (UEFI/Limine, direct boot) — 4
+configurations total. All 5 `timertest` checks pass cleanly on every
+configuration, alongside a full regression pass of `pthreadtest`,
+`memtest`, `vfstest`, and `f2fstest`.
 
 ### 7. Poll/Select/Epoll (Phase 9)
 **Why Critical**: Event notification is fundamental for I/O multiplexing.

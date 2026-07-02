@@ -224,6 +224,15 @@ Full POSIX-style signal delivery is implemented on **both** architectures:
 - **`sigaltstack`** — real per-thread alt-stack state (`Task::altstack_sp/size/flags`). `SA_ONSTACK` redirects signal delivery onto the configured alt-stack; `SS_ONSTACK`/`EPERM`-while-active are derived from the live user stack pointer at syscall time rather than tracked separately, matching Linux's `get_sigframe()`/`do_sigaltstack()` semantics.
 - **Hardening** — `rt_sigreturn` masks the restored `spsr_el1`/`rflags` value to just the condition-code bits before applying it, so a forged signal-stack frame can't be used to request a privilege escalation (e.g. an EL0→EL1 mode-bit forgery on AArch64) via `sigreturn`.
 
+### POSIX timers
+
+`timer_create`/`timer_settime`/`timer_gettime`/`timer_delete`/`timer_getoverrun`, `setitimer`/`getitimer`, and `alarm` are backed by a per-process timer table in `servers/tty`, checked on every syscall return; expiry delivers through the same signal path described above.
+
+- **Handle encoding** — `timer_t` values are handed out as `slot + 1`, never the bare table index, since a raw `0` cast to a pointer is indistinguishable from `NULL` and relibc rejects a `NULL` `timer_t` as `EFAULT`.
+- **Overrun accounting** — a timer descheduled across more than one period has its deadline caught up in a single step; the number of skipped periods accumulates in a per-timer counter read (and reset) by `timer_getoverrun()`.
+- **`alarm()`/`setitimer(ITIMER_REAL)`** share one reserved, idempotently-rearmed table slot rather than allocating a fresh one per call, so repeated use can't exhaust the table.
+- User-pointer access from the in-kernel `tty` server goes through `AddressSpace::read_user_buf`/`write_user_buf`, not a raw pointer dereference, for the same reason `wait`/`waitid`/`flock` do — a supervisor-mode page fault on a not-yet-faulted CoW page has no recovery path.
+
 ### Boot flow
 
 **x86-64 (Limine)**
@@ -421,8 +430,13 @@ VFS resource lifecycle (open/close notifications) ensures that server-side handl
 | `shell` | Interactive CLI with Unix-style commands and VFS integration |
 | `aplay` | Command-line audio player (WAV, MIDI, test tone) |
 | `hello` | Minimal "Hello, world!" demonstration |
+| `memtest` | Regression suite: fork/CoW isolation, `mremap`, buddy allocator churn, `MAP_SHARED` |
+| `vfstest` | Regression suite: `rmdir`, cross-mount `rename`, `flock`/`fcntl` locking, permissions |
+| `f2fstest` | Regression suite: F2FS direct/indirect/double-indirect block pointers, directories |
+| `pthreadtest` | Regression suite: `pthread_create`/`join`, mutex, condvar, TSD, cleanup handlers |
+| `timertest` | Regression suite: POSIX timers, `alarm`/`setitimer`, real `SIGALRM` delivery |
 
-Programs are linked against **relibc** for full POSIX compatibility, or against the lighter `leandros-libc` shim for `no_std` Rust programs. Binaries are embedded in the initrd image and extracted at boot.
+Programs are linked against **relibc** for full POSIX compatibility, or against the lighter `leandros-libc` shim for `no_std` Rust programs. Binaries are embedded in the initrd image and extracted at boot. `pthreadtest` and `timertest` link `librelibc.a` directly rather than `leandros-libc`, since they need TLS bring-up (`relibc_start_v1`) for real `pthread`/`errno`/`sigaction` support.
 
 ---
 
