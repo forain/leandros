@@ -1,0 +1,15 @@
+[package]
+name = "polltest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "polltest"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc! We link directly against librelibc.a, the same way
+# pthreadtest/timertest/sigtest do, since poll()/select() are implemented in
+# relibc's userspace atop epoll_create1/epoll_ctl/epoll_pwait (see
+# userland/relibc/src/header/poll/mod.rs and sys_select/mod.rs) — exercising
+# them for real means going through the real libc, not raw syscalls.

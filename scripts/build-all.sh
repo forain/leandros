@@ -87,6 +87,7 @@ create_initrd() {
     cp "$userland_dir/pthreadtest" "$temp_dir/bin/pthreadtest"
     cp "$userland_dir/timertest" "$temp_dir/bin/timertest"
     cp "$userland_dir/sigtest" "$temp_dir/bin/sigtest"
+    cp "$userland_dir/polltest" "$temp_dir/bin/polltest"
 
     # Include relibc (libc.a) in the initrd for development/linking
     local relibc_target
