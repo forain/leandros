@@ -1,0 +1,15 @@
+[package]
+name = "forktest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "forktest"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc! We link directly against librelibc.a, the same way
+# pthreadtest/timertest/sigtest/polltest do. fork()'s correctness is a
+# property of relibc's userspace wrapper (atfork hooks + TLS bring-up) atop
+# the raw kernel clone, so exercising it for real means going through the
+# real libc, not a raw syscall.
