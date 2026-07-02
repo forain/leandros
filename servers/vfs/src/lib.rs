@@ -251,6 +251,17 @@ pub fn register_mount(prefix: &'static str, port: u32) {
     }
 }
 
+/// Unregister a mounted filesystem at `prefix` (e.g. "/mnt").
+pub fn unregister_mount(prefix: &str) -> bool {
+    let mut m = MOUNTS.lock();
+    if let Some(slot) = m.iter_mut().find(|e| e.in_use && e.prefix == prefix) {
+        *slot = MountEntry::empty();
+        true
+    } else {
+        false
+    }
+}
+
 /// Longest-prefix match: if `path` falls under any registered mount, return its port.
 fn find_mount_port(path: &[u8]) -> Option<u32> {
     let m = MOUNTS.lock();

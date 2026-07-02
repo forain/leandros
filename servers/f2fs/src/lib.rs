@@ -575,18 +575,85 @@ fn inode_logical_to_phys(ms: &mut MountState, ino: u32, idx: u64) -> u32 {
         return inode_get_blkaddr(iblk, idx as usize);
     }
 
-    // Single-indirect (i_nid[0])
-    let nid0 = inode_get_nid(iblk, 0);
-    if nid0 == 0 { return 0; }
-    let indirect_idx = idx - max_direct;
-    const ADDRS_PER_DNODE: u64 = (NODE_FOOTER_OFF / 4) as u64; // 1019 for 20-byte footer
-    if indirect_idx < ADDRS_PER_DNODE {
-        let dblkaddr = nat_lookup(ms, nid0);
+    let mut rem = idx - max_direct;
+    const ADDRS_PER_DNODE: u64 = (NODE_FOOTER_OFF / 4) as u64; // 1019
+    const NIDS_PER_BLOCK: u64 = (NODE_FOOTER_OFF / 4) as u64;  // 1019
+
+    // Direct node 0: i_nid[0]
+    if rem < ADDRS_PER_DNODE {
+        let nid = inode_get_nid(iblk, 0);
+        if nid == 0 { return 0; }
+        let dblkaddr = nat_lookup(ms, nid);
         let dblk = ms.cache.read(ms.dev, dblkaddr as u64);
-        return dnode_get_blkaddr(dblk, indirect_idx as usize);
+        return dnode_get_blkaddr(dblk, rem as usize);
+    }
+    rem -= ADDRS_PER_DNODE;
+
+    // Direct node 1: i_nid[1]
+    if rem < ADDRS_PER_DNODE {
+        let nid = inode_get_nid(iblk, 1);
+        if nid == 0 { return 0; }
+        let dblkaddr = nat_lookup(ms, nid);
+        let dblk = ms.cache.read(ms.dev, dblkaddr as u64);
+        return dnode_get_blkaddr(dblk, rem as usize);
+    }
+    rem -= ADDRS_PER_DNODE;
+
+    // Indirect node 0: i_nid[2]
+    let blocks_per_indirect = NIDS_PER_BLOCK * ADDRS_PER_DNODE;
+    if rem < blocks_per_indirect {
+        let nid = inode_get_nid(iblk, 2);
+        if nid == 0 { return 0; }
+        let ind_blkaddr = nat_lookup(ms, nid);
+        let ind_blk = ms.cache.read(ms.dev, ind_blkaddr as u64);
+        let dnode_idx = rem / ADDRS_PER_DNODE;
+        let dnode_off = rem % ADDRS_PER_DNODE;
+        let dnid = dnode_get_blkaddr(ind_blk, dnode_idx as usize);
+        if dnid == 0 { return 0; }
+        let dblkaddr = nat_lookup(ms, dnid);
+        let dblk = ms.cache.read(ms.dev, dblkaddr as u64);
+        return dnode_get_blkaddr(dblk, dnode_off as usize);
+    }
+    rem -= blocks_per_indirect;
+
+    // Indirect node 1: i_nid[3]
+    if rem < blocks_per_indirect {
+        let nid = inode_get_nid(iblk, 3);
+        if nid == 0 { return 0; }
+        let ind_blkaddr = nat_lookup(ms, nid);
+        let ind_blk = ms.cache.read(ms.dev, ind_blkaddr as u64);
+        let dnode_idx = rem / ADDRS_PER_DNODE;
+        let dnode_off = rem % ADDRS_PER_DNODE;
+        let dnid = dnode_get_blkaddr(ind_blk, dnode_idx as usize);
+        if dnid == 0 { return 0; }
+        let dblkaddr = nat_lookup(ms, dnid);
+        let dblk = ms.cache.read(ms.dev, dblkaddr as u64);
+        return dnode_get_blkaddr(dblk, dnode_off as usize);
+    }
+    rem -= blocks_per_indirect;
+
+    // Double indirect node: i_nid[4]
+    let blocks_per_dindirect = NIDS_PER_BLOCK * blocks_per_indirect;
+    if rem < blocks_per_dindirect {
+        let nid = inode_get_nid(iblk, 4);
+        if nid == 0 { return 0; }
+        let dind_blkaddr = nat_lookup(ms, nid);
+        let dind_blk = ms.cache.read(ms.dev, dind_blkaddr as u64);
+        let ind_idx = rem / blocks_per_indirect;
+        let ind_rem = rem % blocks_per_indirect;
+        let ind_nid = dnode_get_blkaddr(dind_blk, ind_idx as usize);
+        if ind_nid == 0 { return 0; }
+        let ind_blkaddr = nat_lookup(ms, ind_nid);
+        let ind_blk = ms.cache.read(ms.dev, ind_blkaddr as u64);
+        let dnode_idx = ind_rem / ADDRS_PER_DNODE;
+        let dnode_off = ind_rem % ADDRS_PER_DNODE;
+        let dnid = dnode_get_blkaddr(ind_blk, dnode_idx as usize);
+        if dnid == 0 { return 0; }
+        let dblkaddr = nat_lookup(ms, dnid);
+        let dblk = ms.cache.read(ms.dev, dblkaddr as u64);
+        return dnode_get_blkaddr(dblk, dnode_off as usize);
     }
 
-    // Double-indirect (i_nid[1]) — not implemented for MVP
     0
 }
 
@@ -680,33 +747,193 @@ fn inode_logical_to_phys_for_write(
         }
         return 0;
     }
-    // Single-indirect
-    let indirect_idx = idx - max_direct;
-    const ADDRS_PER_DNODE: u64 = (NODE_FOOTER_OFF / 4) as u64;
-    if indirect_idx < ADDRS_PER_DNODE {
-        let mut nid0 = inode_get_nid(iblk, 0);
-        if nid0 == 0 {
-            // Allocate a new direct-node
-            let (new_nid, new_nblk) = match create_node_block(ms, ino) {
+
+    let mut rem = idx - max_direct;
+    const ADDRS_PER_DNODE: u64 = (NODE_FOOTER_OFF / 4) as u64; // 1019
+    const NIDS_PER_BLOCK: u64 = (NODE_FOOTER_OFF / 4) as u64;  // 1019
+
+    // Direct node 0: i_nid[0]
+    if rem < ADDRS_PER_DNODE {
+        let mut nid = inode_get_nid(iblk, 0);
+        if nid == 0 {
+            let (new_nid, _) = match create_node_block(ms, ino) {
                 Some(v) => v,
                 None => return 0,
             };
-            nid0 = new_nid;
-            inode_set_nid(iblk, 0, nid0);
+            nid = new_nid;
+            inode_set_nid(iblk, 0, nid);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
-            let _ = new_nblk;
         }
-        let dnblkaddr = nat_lookup(ms, nid0);
-        // Copy block to avoid split borrow when calling alloc_data_block.
+        let dnblkaddr = nat_lookup(ms, nid);
         let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
-        let phys = dnode_get_blkaddr(&dnblk_copy, indirect_idx as usize);
+        let phys = dnode_get_blkaddr(&dnblk_copy, rem as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_block(ms) {
-            dnode_set_blkaddr(&mut dnblk_copy, indirect_idx as usize, new_phys);
+            dnode_set_blkaddr(&mut dnblk_copy, rem as usize, new_phys);
             ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
         }
+        return 0;
     }
+    rem -= ADDRS_PER_DNODE;
+
+    // Direct node 1: i_nid[1]
+    if rem < ADDRS_PER_DNODE {
+        let mut nid = inode_get_nid(iblk, 1);
+        if nid == 0 {
+            let (new_nid, _) = match create_node_block(ms, ino) {
+                Some(v) => v,
+                None => return 0,
+            };
+            nid = new_nid;
+            inode_set_nid(iblk, 1, nid);
+            ms.cache.write(ms.dev, iblkaddr as u64, iblk);
+        }
+        let dnblkaddr = nat_lookup(ms, nid);
+        let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
+        let phys = dnode_get_blkaddr(&dnblk_copy, rem as usize);
+        if phys != 0 { return phys; }
+        if let Some(new_phys) = alloc_data_block(ms) {
+            dnode_set_blkaddr(&mut dnblk_copy, rem as usize, new_phys);
+            ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            return new_phys;
+        }
+        return 0;
+    }
+    rem -= ADDRS_PER_DNODE;
+
+    // Indirect node 0: i_nid[2]
+    let blocks_per_indirect = NIDS_PER_BLOCK * ADDRS_PER_DNODE;
+    if rem < blocks_per_indirect {
+        let mut nid = inode_get_nid(iblk, 2);
+        if nid == 0 {
+            let (new_nid, _) = match create_node_block(ms, ino) {
+                Some(v) => v,
+                None => return 0,
+            };
+            nid = new_nid;
+            inode_set_nid(iblk, 2, nid);
+            ms.cache.write(ms.dev, iblkaddr as u64, iblk);
+        }
+        let ind_blkaddr = nat_lookup(ms, nid);
+        let mut ind_blk = *ms.cache.read(ms.dev, ind_blkaddr as u64);
+        let dnode_idx = rem / ADDRS_PER_DNODE;
+        let dnode_off = rem % ADDRS_PER_DNODE;
+        let mut dnid = dnode_get_blkaddr(&ind_blk, dnode_idx as usize);
+        if dnid == 0 {
+            let (new_nid, _) = match create_node_block(ms, ino) {
+                Some(v) => v,
+                None => return 0,
+            };
+            dnid = new_nid;
+            dnode_set_blkaddr(&mut ind_blk, dnode_idx as usize, dnid);
+            ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
+        }
+        let dnblkaddr = nat_lookup(ms, dnid);
+        let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
+        let phys = dnode_get_blkaddr(&dnblk_copy, dnode_off as usize);
+        if phys != 0 { return phys; }
+        if let Some(new_phys) = alloc_data_block(ms) {
+            dnode_set_blkaddr(&mut dnblk_copy, dnode_off as usize, new_phys);
+            ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            return new_phys;
+        }
+        return 0;
+    }
+    rem -= blocks_per_indirect;
+
+    // Indirect node 1: i_nid[3]
+    if rem < blocks_per_indirect {
+        let mut nid = inode_get_nid(iblk, 3);
+        if nid == 0 {
+            let (new_nid, _) = match create_node_block(ms, ino) {
+                Some(v) => v,
+                None => return 0,
+            };
+            nid = new_nid;
+            inode_set_nid(iblk, 3, nid);
+            ms.cache.write(ms.dev, iblkaddr as u64, iblk);
+        }
+        let ind_blkaddr = nat_lookup(ms, nid);
+        let mut ind_blk = *ms.cache.read(ms.dev, ind_blkaddr as u64);
+        let dnode_idx = rem / ADDRS_PER_DNODE;
+        let dnode_off = rem % ADDRS_PER_DNODE;
+        let mut dnid = dnode_get_blkaddr(&ind_blk, dnode_idx as usize);
+        if dnid == 0 {
+            let (new_nid, _) = match create_node_block(ms, ino) {
+                Some(v) => v,
+                None => return 0,
+            };
+            dnid = new_nid;
+            dnode_set_blkaddr(&mut ind_blk, dnode_idx as usize, dnid);
+            ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
+        }
+        let dnblkaddr = nat_lookup(ms, dnid);
+        let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
+        let phys = dnode_get_blkaddr(&dnblk_copy, dnode_off as usize);
+        if phys != 0 { return phys; }
+        if let Some(new_phys) = alloc_data_block(ms) {
+            dnode_set_blkaddr(&mut dnblk_copy, dnode_off as usize, new_phys);
+            ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            return new_phys;
+        }
+        return 0;
+    }
+    rem -= blocks_per_indirect;
+
+    // Double indirect node: i_nid[4]
+    let blocks_per_dindirect = NIDS_PER_BLOCK * blocks_per_indirect;
+    if rem < blocks_per_dindirect {
+        let mut nid = inode_get_nid(iblk, 4);
+        if nid == 0 {
+            let (new_nid, _) = match create_node_block(ms, ino) {
+                Some(v) => v,
+                None => return 0,
+            };
+            nid = new_nid;
+            inode_set_nid(iblk, 4, nid);
+            ms.cache.write(ms.dev, iblkaddr as u64, iblk);
+        }
+        let dind_blkaddr = nat_lookup(ms, nid);
+        let mut dind_blk = *ms.cache.read(ms.dev, dind_blkaddr as u64);
+        let ind_idx = rem / blocks_per_indirect;
+        let ind_rem = rem % blocks_per_indirect;
+        let mut ind_nid = dnode_get_blkaddr(&dind_blk, ind_idx as usize);
+        if ind_nid == 0 {
+            let (new_nid, _) = match create_node_block(ms, ino) {
+                Some(v) => v,
+                None => return 0,
+            };
+            ind_nid = new_nid;
+            dnode_set_blkaddr(&mut dind_blk, ind_idx as usize, ind_nid);
+            ms.cache.write(ms.dev, dind_blkaddr as u64, &dind_blk);
+        }
+        let ind_blkaddr = nat_lookup(ms, ind_nid);
+        let mut ind_blk = *ms.cache.read(ms.dev, ind_blkaddr as u64);
+        let dnode_idx = ind_rem / ADDRS_PER_DNODE;
+        let dnode_off = ind_rem % ADDRS_PER_DNODE;
+        let mut dnid = dnode_get_blkaddr(&ind_blk, dnode_idx as usize);
+        if dnid == 0 {
+            let (new_nid, _) = match create_node_block(ms, ino) {
+                Some(v) => v,
+                None => return 0,
+            };
+            dnid = new_nid;
+            dnode_set_blkaddr(&mut ind_blk, dnode_idx as usize, dnid);
+            ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
+        }
+        let dnblkaddr = nat_lookup(ms, dnid);
+        let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
+        let phys = dnode_get_blkaddr(&dnblk_copy, dnode_off as usize);
+        if phys != 0 { return phys; }
+        if let Some(new_phys) = alloc_data_block(ms) {
+            dnode_set_blkaddr(&mut dnblk_copy, dnode_off as usize, new_phys);
+            ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            return new_phys;
+        }
+        return 0;
+    }
+
     0
 }
 
@@ -1411,3 +1638,22 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
 
     Some(port)
 }
+
+/// Unmount the F2FS volume mounted at `mount_point`.
+/// Returns true on success, false if no volume was mounted at that point.
+pub fn unmount(mount_point: &str) -> bool {
+    let mut mounts = F2FS_MOUNTS.lock();
+    if let Some(slot_idx) = mounts.iter().position(|s| s.as_ref().map_or(false, |m| m.mount_prefix == mount_point)) {
+        if let Some(mut ms) = mounts[slot_idx].take() {
+            // Flush cache and checkpoint
+            flush_checkpoint(&mut ms);
+            // Close IPC port (implicitly unregisters handler)
+            port::close(ms.port);
+            // Unregister from VFS
+            vfs_server::unregister_mount(mount_point);
+            return true;
+        }
+    }
+    false
+}
+
