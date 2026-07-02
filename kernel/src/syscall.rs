@@ -174,6 +174,7 @@ mod nr {
     pub const GETEGID:        usize = 177;
     pub const GETTID:         usize = 178;
     pub const TGKILL:         usize = 131;
+    pub const TKILL:          usize = 130;
     pub const SIGALTSTACK:    usize = 132;
     pub const UNAME:          usize = 160;
     pub const PRLIMIT64:      usize = 261;
@@ -360,6 +361,7 @@ mod nr {
     pub const GETEGID:        usize = 108;
     pub const GETTID:         usize = 186;
     pub const TGKILL:         usize = 234;
+    pub const TKILL:          usize = 200;
     pub const SIGALTSTACK:    usize = 131;
     pub const UNAME:          usize = 63;
     pub const PRLIMIT64:      usize = 302;
@@ -792,6 +794,7 @@ fn dispatch_inner(
         GETEGID => sched::current_egid() as isize,
         GETTID    => current_pid() as isize,
         TGKILL    => sys_tgkill(a0, a1, a2),
+        TKILL     => sys_tkill(a0, a1),
 
         // ── Signal helpers ────────────────────────────────────────────────────
         SIGALTSTACK => sys_sigaltstack(a0, a1, frame_ptr),
@@ -2369,6 +2372,13 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
 
 /// sys_tgkill(tgid, tid, sig) — send a signal to a specific thread.
 fn sys_tgkill(_tgid: usize, tid: usize, sig: usize) -> isize {
+    if sig >= 64 { return -22; } // EINVAL
+    sched::deliver_signal(tid as u32, sig as u32)
+}
+
+/// sys_tkill(tid, sig) — send a signal to a specific thread (legacy form of
+/// tgkill without the thread-group-id argument). Used by raise()/pthread_kill.
+fn sys_tkill(tid: usize, sig: usize) -> isize {
     if sig >= 64 { return -22; } // EINVAL
     sched::deliver_signal(tid as u32, sig as u32)
 }
