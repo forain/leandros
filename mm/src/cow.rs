@@ -25,7 +25,7 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use crate::vmm::{AddressSpace, VmaRegion, MAP_SHARED};
-use crate::paging::{map_page, PageFlags};
+use crate::paging::{map_page, tlb_shootdown_all, PageFlags};
 use crate::buddy::{PAGE_SIZE, alloc as buddy_alloc};
 use crate::pageref;
 
@@ -140,6 +140,18 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
             cow:        !is_shared,
         });
     }
+
+    // The downgrades above rewrote *live* PTEs of the calling (parent)
+    // process from writable to read-only. arch_map_page does not invalidate
+    // existing translations (its barrier reasoning covers invalid→valid
+    // transitions only), so this CPU's TLB still holds stale writable
+    // entries for the parent's pages — most critically its user stack. If
+    // the parent resumes and writes through such an entry before its next
+    // page-table switch, the write silently lands on the still-shared frame
+    // (no fault, no copy) and the child later reads the corruption. Flush
+    // now, while the parent's root is the active one, so the parent's first
+    // post-fork write takes the CoW fault it must.
+    tlb_shootdown_all();
 
     Some(dst)
 }
