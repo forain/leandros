@@ -24,6 +24,7 @@ pub mod virtio;
 pub mod virtio_gpu;
 pub mod virtio_blk;
 pub mod virtio_keyboard;
+pub mod virtio_net;
 
 /// Trait every driver server must implement.
 pub trait Driver {

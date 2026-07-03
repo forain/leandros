@@ -54,6 +54,11 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::virtio_blk::init();
+
+    // ── Network Stack ────────────────────────────────────────────────────────
+    drivers::virtio_net::init();
+    net_server::init();
+    sched::spawn(net_server::net_daemon, 0);
     {
         const MOUNT_POINTS: &[&str] = &["/mnt", "/data", "/home", "/var"];
         let mut mp_idx = 0usize;

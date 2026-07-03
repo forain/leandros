@@ -133,7 +133,7 @@ impl Task {
             ctx: if entry == 0 {
                 CpuContext::zeroed()
             } else {
-                CpuContext::new_task(entry, stack_base + stack_size)
+                 CpuContext::new_task(entry, mm::phys_to_virt(stack_base) + stack_size)
             },
             page_table,
             kernel_stack: stack_base,
@@ -188,7 +188,7 @@ impl Task {
         let msg1 = b"Task::new_kernel_inplace: starting\r\n";
         for &b in msg1 { arch_serial_putc(b); }
 
-        let stack_top = stack_base + stack_size;
+        let stack_top = mm::phys_to_virt(stack_base) + stack_size;
 
         let msg2 = b"Task::new_kernel_inplace: about to write pid to addr=";
         for &b in msg2 { arch_serial_putc(b); }
