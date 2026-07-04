@@ -78,7 +78,7 @@ def _build_cmd(arch, mode="uefi"):
         data1   = os.path.join(REPO_ROOT, "f2fs-data1.img")
         return [
             "qemu-system-aarch64",
-            "-machine", "virt,gic-version=2", "-cpu", "max", "-m", "2G",
+            "-machine", "virt,gic-version=2", "-smp", "4", "-cpu", "max", "-m", "2G",
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             "-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}",
@@ -106,7 +106,7 @@ def _build_cmd(arch, mode="uefi"):
         data1 = os.path.join(REPO_ROOT, "f2fs-data1.img")
         return [
             "qemu-system-x86_64",
-            "-machine", "q35", "-cpu", "max", "-m", "2G",
+            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", "-cpu", "max", "-m", "2G",
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             "-drive", f"if=none,id=drive0,format=raw,file={disk}",
@@ -143,7 +143,7 @@ def _build_direct_cmd(arch):
             sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
         return [
             "qemu-system-aarch64",
-            "-machine", "virt,gic-version=2", "-cpu", "max", "-m", "2G", "-accel", "tcg",
+            "-machine", "virt,gic-version=2", "-smp", "4", "-cpu", "max", "-m", "2G", "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
             "-drive", f"if=none,id=data0,format=raw,file={data0}",
@@ -168,7 +168,7 @@ def _build_direct_cmd(arch):
             sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
         return [
             "qemu-system-x86_64",
-            "-machine", "q35", "-cpu", "max", "-m", "2G", "-accel", "tcg",
+            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", "-cpu", "max", "-m", "2G", "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x10000000,force-raw=on",
             "-drive", f"if=none,id=data0,format=raw,file={data0}",

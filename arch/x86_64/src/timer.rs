@@ -14,13 +14,20 @@
 //!
 //! Ref: Intel SDM Vol 3A §10.5 (APIC Timer); OSDev wiki "APIC timer"
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use super::apic;
 
 const TICK_HZ: u32 = 100;
 
 /// Global tick counter incremented on every timer interrupt.
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// APIC-timer initial count for one 100 Hz interrupt, measured once by the
+/// BSP's PIT calibration.  APs program their local timers directly from this
+/// value (`init_local_timer`) — the PIT is a single shared device and must
+/// not be re-touched concurrently, and all LAPIC timers in one package run
+/// off the same clock anyway.
+static TICKS_PER_IRQ: AtomicU32 = AtomicU32::new(0);
 
 /// Return the number of scheduler ticks since boot.
 #[inline]
@@ -121,6 +128,8 @@ pub unsafe fn init() {
     let ticks_per_irq = ticks_10ms.saturating_mul(100 / TICK_HZ)
         .max(1000); // guard: never below 1000 (avoids infinite-IRQ storm)
 
+    TICKS_PER_IRQ.store(ticks_per_irq, Ordering::Release);
+
     // Programme APIC timer: vector 32, periodic mode, divide-by-16.
     // LVT_TIMER bits: [18:17]=00 (one-shot) / 01 (periodic) / 10 (TSC-deadline)
     //                 [16]=0 (not masked)
@@ -130,16 +139,40 @@ pub unsafe fn init() {
     apic::write(apic::LAPIC_TIMER_INIT, ticks_per_irq);
 }
 
+/// Programme this CPU's Local APIC timer using the BSP's calibration.
+///
+/// Called from `smp::sched_ap_entry` on each AP so secondary CPUs receive
+/// their own 100 Hz preemption ticks.  No PIT access, no re-calibration.
+///
+/// # Safety
+/// `apic::init()` must have run on this CPU, and the BSP must have completed
+/// `timer::init()` (so `TICKS_PER_IRQ` is populated).
+pub unsafe fn init_local_timer() {
+    let ticks_per_irq = TICKS_PER_IRQ.load(Ordering::Acquire)
+        .max(1000); // fallback guard if calibration never ran
+
+    apic::write(apic::LAPIC_TIMER_DIV,  0x3);                // divide by 16
+    apic::write(apic::LAPIC_LVT_TIMER,  (1 << 17) | 32);    // periodic, vec 32
+    apic::write(apic::LAPIC_TIMER_INIT, ticks_per_irq);
+}
+
 /// Called from the timer IRQ handler (vector 32) on every APIC timer tick.
+///
+/// Every CPU ticks its own LAPIC timer; global timekeeping and UART polling
+/// are BSP-only so wall-clock ticks don't advance N× faster with N CPUs and
+/// the single serial FIFO has a single consumer.
 #[inline]
 pub fn on_tick() {
-    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    let cpu = unsafe { super::smp::arch_cpu_id() };
+    if cpu == 0 {
+        TICK_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    // Poll UART for keyboard input and push to evdev.
-    // NOTE: This consumes bytes that would otherwise go to fd 0 (stdin).
-    while let Some(b) = unsafe { super::serial_read_byte() } {
-        evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2); // 2 = typematic/serial
-        evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
+        // Poll UART for keyboard input and push to evdev.
+        // NOTE: This consumes bytes that would otherwise go to fd 0 (stdin).
+        while let Some(b) = unsafe { super::serial_read_byte() } {
+            evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2); // 2 = typematic/serial
+            evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
+        }
     }
 
     sched::timer_tick_irq();

@@ -59,6 +59,10 @@ fn handle_irq(_frame: *mut UserFrame) {
     if irq_id == 27 || irq_id == 30 {
         // Virtual or Physical Timer
         super::timer::on_tick();
+    } else if irq_id == super::gic::SGI_RESCHED {
+        // Reschedule IPI from another CPU.  The sender already set this
+        // CPU's PREEMPT_NEEDED flag; the preempt_check below acts on it.
+        // An idle CPU parked in wfi is woken by the interrupt itself.
     } else if irq_id == 33 {
         // PL011 UART
         while let Some(b) = unsafe { super::uart::getc() } {

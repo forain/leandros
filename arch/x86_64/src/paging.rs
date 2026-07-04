@@ -128,31 +128,113 @@ unsafe fn alloc_zeroed_page() -> Option<usize> {
 
 // ── arch_tlb_shootdown_all ────────────────────────────────────────────────────
 
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+/// Serializes shootdown initiators so concurrent invalidations don't mix
+/// their acknowledgement counts.
+static TLB_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Number of remote CPUs that still owe an acknowledgement for the current
+/// shootdown round.  Set by the initiator, decremented by each target's
+/// vector-0xFD handler after its CR3 reload.
+static TLB_PENDING_ACKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Called from the TLB-shootdown IPI handler (vector 0xFD) after the local
+/// flush completed on the target CPU.
+pub fn tlb_shootdown_ack() {
+    // saturating decrement: a late ack after an initiator timed out and reset
+    // the counter must not wrap around and wedge the next round.
+    let _ = TLB_PENDING_ACKS.fetch_update(
+        Ordering::AcqRel, Ordering::Acquire,
+        |v| v.checked_sub(1),
+    );
+}
+
 /// Broadcast a TLB invalidation for all user-space entries to all CPUs.
 ///
-/// # SMP correctness requirement
+/// `arch_set_page_table` only writes CR3 on the **current** CPU, so after
+/// changing shared mappings (CoW downgrade, munmap, mprotect) every other
+/// online CPU must flush too:
 ///
-/// `arch_set_page_table` only writes CR3 on the **current** CPU.  On SMP,
-/// unmapping a page on CPU A while other CPUs may have cached translations for
-/// the same virtual address requires a TLB shootdown IPI.
+///   1. Reload CR3 locally.
+///   2. If other CPUs are online: serialize initiators, arm the ack counter,
+///      broadcast IPI vector 0xFD (shorthand all-excluding-self).
+///   3. Spin until every target acknowledged.
 ///
-/// **Current implementation**: single-CPU stub that reloads CR3 to flush the
-/// local TLB only.
-/// On a production SMP system this must:
-///   1. Collect the set of CPUs running threads that share the affected page table.
-///   2. Send an IPI (e.g. APIC vector 0xFE) to those CPUs.
-///   3. Each receiving CPU executes `invlpg` or reloads CR3.
-///   4. Wait for all CPUs to acknowledge before returning.
+/// The wait is **short and opportunistic**: this kernel runs syscalls and
+/// the scheduler loop with IF=0, and shootdowns are frequently initiated
+/// while holding the run-queue lock (mm operations run under
+/// `with_*_address_space_mut`).  A target CPU spinning on that same lock
+/// cannot take the IPI until the initiator releases it — so waiting "until
+/// all CPUs ack" can only ever complete for targets that are idle in the
+/// `sti; hlt` window (they ack within microseconds) and burns the full
+/// timeout whenever any target is lock-spinning, freezing fork/exec storms.
+/// On timeout we proceed: the IPI stays pended and the target flushes at its
+/// next interrupt window (≤ one 10 ms tick), which precedes its next return
+/// to user space.  The residual stale-TLB window only matters for another
+/// thread of the same process concurrently touching the remapped page from
+/// kernel context — accepted for now (the previous implementation never
+/// notified other CPUs at all).
 #[no_mangle]
 pub unsafe extern "C" fn arch_tlb_shootdown_all() {
-    // Reload CR3 to flush local TLB; on SMP an IPI to other CPUs is also needed.
     #[cfg(target_arch = "x86_64")]
-    core::arch::asm!(
-        "mov {tmp}, cr3",
-        "mov cr3, {tmp}",
-        tmp = out(reg) _,
-        options(nostack)
-    );
+    {
+        core::arch::asm!(
+            "mov {tmp}, cr3",
+            "mov cr3, {tmp}",
+            tmp = out(reg) _,
+            options(nostack)
+        );
+
+        let ncpus = super::smp::active_cpu_count();
+        if ncpus <= 1 { return; }
+
+        while TLB_LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+
+        TLB_PENDING_ACKS.store(ncpus - 1, Ordering::Release);
+        super::smp::send_tlb_shootdown_broadcast();
+
+        let mut spins: usize = 0;
+        while TLB_PENDING_ACKS.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+            spins += 1;
+            if spins > 200_000 { break; } // opportunistic — see note above
+        }
+
+        TLB_PENDING_ACKS.store(0, Ordering::Release);
+        TLB_LOCK.store(false, Ordering::Release);
+    }
+}
+
+// ── Kernel page-table root ────────────────────────────────────────────────────
+
+/// The boot (Limine) CR3 — the canonical kernel page table, captured once
+/// before any user address space is loaded.  Never freed.
+static KERNEL_CR3: AtomicUsize = AtomicUsize::new(0);
+
+/// Record the currently loaded CR3 as the kernel root.  Called from arch
+/// `init()` on the BSP before any user task can run.
+pub unsafe fn capture_kernel_root() {
+    KERNEL_CR3.store(arch_get_current_root(), Ordering::Release);
+}
+
+/// Switch this CPU back to the kernel page table.
+///
+/// The scheduler calls this after every switch-back so no CPU is ever left
+/// idling (or reaping) on a *task's* CR3: when a task exits, its page tables
+/// are freed and reused — a CPU still holding that CR3 triple-faults on its
+/// next TLB miss (or on the CR3 reload in the TLB-shootdown IPI handler).
+#[no_mangle]
+pub unsafe extern "C" fn arch_load_kernel_page_table() {
+    let root = KERNEL_CR3.load(Ordering::Acquire);
+    if root == 0 { return; } // pre-capture (early boot): current CR3 is the kernel's
+    #[cfg(target_arch = "x86_64")]
+    core::arch::asm!("mov cr3, {r}", r = in(reg) root, options(nostack));
 }
 
 // ── arch_set_page_table ───────────────────────────────────────────────────────

@@ -66,7 +66,7 @@ const SIGSEGV: u32 = 11;
 pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
     if frame_ptr == 0 { return; }
 
-    let pid = unsafe { super::CURRENT_PID[super::cpu_id()] };
+    let pid = super::current_pid();
     if pid == 0 { return; } // kernel idle task has no signals
 
     loop {
@@ -160,14 +160,14 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
 /// that was written by `check_and_deliver_signals` earlier.
 pub fn restore_signal_frame(frame_ptr: usize) {
     if frame_ptr == 0 { return; }
-    let pid = unsafe { super::CURRENT_PID[super::cpu_id()] };
+    let pid = super::current_pid();
     if pid == 0 { return; }
     arch_restore_signal_frame(frame_ptr, pid);
 }
 
 pub fn sys_sigaction(signum: u32, act_ptr: usize, oldact_ptr: usize) -> isize {
     if signum == 0 || signum > 64 { return -22; }
-    let pid = unsafe { super::CURRENT_PID[super::cpu_id()] };
+    let pid = super::current_pid();
     let mut rq = super::RUN_QUEUE.lock();
     // Signal actions belong to the thread group — always read/write through leader.
     let tgid = match rq.find_pid(pid) {
@@ -194,7 +194,7 @@ pub fn sys_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
     const SIG_UNBLOCK: usize = 1;
     const SIG_SETMASK: usize = 2;
 
-    let pid = unsafe { super::CURRENT_PID[super::cpu_id()] };
+    let pid = super::current_pid();
     let mut rq = super::RUN_QUEUE.lock();
     if let Some(t) = rq.find_pid_mut(pid) {
         if oldset_ptr != 0 {
@@ -424,7 +424,7 @@ mod aarch64 {
         // handles non-contiguous physical pages, so no physical-contiguity
         // assumption is needed.
         let ok = {
-            let pid = unsafe { super::super::CURRENT_PID[super::super::cpu_id()] };
+            let pid = super::super::current_pid();
             let mut rq = super::super::RUN_QUEUE.lock();
             let tgid = match rq.find_pid(pid) {
                 Some(t) => t.tgid,
@@ -628,7 +628,7 @@ mod x86_64 {
         // Prefault any lazy stack pages and write via TGID leader's address
         // space, exactly as the AArch64 path does.
         let ok = {
-            let pid = unsafe { super::super::CURRENT_PID[super::super::cpu_id()] };
+            let pid = super::super::current_pid();
             let mut rq = super::super::RUN_QUEUE.lock();
             let tgid = match rq.find_pid(pid) {
                 Some(t) => t.tgid,

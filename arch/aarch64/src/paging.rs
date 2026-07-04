@@ -244,6 +244,19 @@ pub unsafe extern "C" fn arch_set_page_table(root: usize) {
     );
 }
 
+/// Detach this CPU from any task page table — no-op on AArch64.
+///
+/// The kernel runs from TTBR1, which never changes; a stale TTBR0 is only
+/// walked if kernel code touches user VAs outside a task's own context,
+/// which legitimate paths (software walks via the HHDM, or the IRQ-atomic
+/// `with_task_address_space`) never do.  Unlike x86-64 there is also no
+/// IPI handler that reloads the root behind our back — TLB maintenance is
+/// hardware-broadcast (`tlbi …is`).  Clearing TTBR0 here is therefore not
+/// needed.
+#[no_mangle]
+pub unsafe extern "C" fn arch_load_kernel_page_table() {
+}
+
 // ── arch_alloc_page_table_root ────────────────────────────────────────────────
 
 /// Allocate a new page-table root (Level 0) for a user address space.

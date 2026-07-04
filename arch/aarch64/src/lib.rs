@@ -118,6 +118,13 @@ pub fn init(boot_info: &boot::BootInfo) {
 
         // Ensure timer is in a sane state
         init_timer();
+
+        // Bring up secondary CPUs last: page tables, GIC distributor and the
+        // buddy allocator are all ready now.  MPIDRs that don't exist (fewer
+        // cores than MAX_APS) fail CPU_ON harmlessly.  The APs initialise
+        // their banked GIC/timer state and park in sched::ap_entry until the
+        // BSP calls sched::run().
+        smp::smp_init(&[1, 2, 3, 4, 5, 6, 7]);
     }
 }
 

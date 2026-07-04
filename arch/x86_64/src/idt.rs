@@ -82,13 +82,26 @@ pub fn init() {
         IDT.0[32] = IdtEntry::new(timer_irq as *const () as usize, 0x08, 0, 0x8E);
         // Vector 33 = IRQ1 (PS/2 keyboard).
         IDT.0[33] = IdtEntry::new(keyboard_irq as *const () as usize, 0x08, 0, 0x8E);
+        // Vector 0x40 = reschedule IPI (cross-CPU preemption kick).
+        IDT.0[0x40] = IdtEntry::new(resched_irq as *const () as usize, 0x08, 0, 0x8E);
+        // Vector 0xFD = TLB shootdown IPI (remote TLB invalidation).
+        IDT.0[0xFD] = IdtEntry::new(tlb_shootdown_irq as *const () as usize, 0x08, 0, 0x8E);
 
-        #[cfg(target_arch = "x86_64")]
+        load();
+    }
+}
+
+/// Load the (shared) IDT on the calling CPU.
+///
+/// The IDT contents are CPU-independent, but the `lidt` register is per-CPU:
+/// every AP must call this before enabling interrupts.
+pub unsafe fn load() {
+    #[cfg(target_arch = "x86_64")]
+    {
         let ptr = IdtPointer {
             limit: (size_of::<Idt>() - 1) as u16,
             base:  core::ptr::addr_of!(IDT) as u64,
         };
-        #[cfg(target_arch = "x86_64")]
         core::arch::asm!("lidt [{}]", in(reg) &ptr, options(nostack));
     }
 }
@@ -247,7 +260,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
         // promoted instead of killing the task outright. Bit 1 = write.
         let is_write = error_code & 2 != 0;
         if sched::handle_page_fault(cr2 as usize, is_write) {
-            unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+            unsafe { super::syscall::restore_user_gs(); }
             return; // fault handled — resume user task
         }
         serial_str(b"user page fault RIP=0x"); serial_hex64(frame.ip);
@@ -289,9 +302,69 @@ extern "x86-interrupt" fn timer_irq(frame: InterruptStackFrame) {
     sched::preempt_check();
 
     if from_user {
-        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+        // preempt_check may have context-switched: this task can resume here
+        // on a different CPU, so re-derive GS from the live CPU instead of a
+        // bare swapgs (see restore_user_gs).
+        unsafe { super::syscall::restore_user_gs(); }
     }
 }
+
+/// Reschedule IPI handler — vector 0x40.
+///
+/// Sent by `sched::trigger_preempt` from another CPU.  The sender already set
+/// this CPU's `PREEMPT_NEEDED` slot; we only need to EOI and run
+/// `preempt_check`, which context-switches away if a reschedule is pending.
+/// An idle CPU parked in `sti; hlt` is woken by the interrupt itself and
+/// re-picks from the run queue when the handler returns.
+#[cfg(target_arch = "x86_64")]
+extern "x86-interrupt" fn resched_irq(frame: InterruptStackFrame) {
+    let from_user = (frame.cs & 3) != 0;
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+    }
+
+    super::apic::eoi();
+    sched::preempt_check();
+
+    if from_user {
+        // May have migrated across the preempt_check — see restore_user_gs.
+        unsafe { super::syscall::restore_user_gs(); }
+    }
+}
+
+/// TLB shootdown IPI handler — vector 0xFD.
+///
+/// Flushes this CPU's TLB (CR3 reload) and acknowledges the initiator.
+/// Must NOT reschedule: the initiator is spin-waiting for the ack and the
+/// flush must complete on this CPU before any user memory is touched again.
+#[cfg(target_arch = "x86_64")]
+extern "x86-interrupt" fn tlb_shootdown_irq(frame: InterruptStackFrame) {
+    let from_user = (frame.cs & 3) != 0;
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+    }
+
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp}, cr3",
+            "mov cr3, {tmp}",
+            tmp = out(reg) _,
+            options(nostack)
+        );
+    }
+    super::apic::eoi();
+    super::paging::tlb_shootdown_ack();
+
+    if from_user {
+        // No reschedule happens here, but keep the exit path uniform.
+        unsafe { super::syscall::restore_user_gs(); }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+extern "C" fn resched_irq(_frame: InterruptStackFrame) {}
+#[cfg(not(target_arch = "x86_64"))]
+extern "C" fn tlb_shootdown_irq(_frame: InterruptStackFrame) {}
 
 /// Keyboard IRQ handler — PS/2 keyboard at IRQ 1 (vector 33).
 #[cfg(target_arch = "x86_64")]
@@ -305,7 +378,7 @@ extern "x86-interrupt" fn keyboard_irq(frame: InterruptStackFrame) {
     super::keyboard::on_irq();
 
     if from_user {
-        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+        unsafe { super::syscall::restore_user_gs(); }
     }
 }
 

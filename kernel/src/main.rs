@@ -20,6 +20,15 @@ pub struct PageAligned<const N: usize>([u8; N]);
 #[no_mangle]
 pub static mut EARLY_STACK: PageAligned<0x10000> = PageAligned([0u8; 0x10000]);
 
+/// Set to 1 by the aarch64 entry stub when the kernel was entered at EL2.
+/// Read by arch-aarch64's PSCI code to pick the HVC vs SMC conduit.
+/// Placed in .data explicitly: it is written before the BSS-zero loop runs.
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+#[used]
+#[link_section = ".data"]
+pub static mut boot_entered_el2: u64 = 0;
+
 #[no_mangle]
 pub static mut early_pgtables: PageAligned<32768> = PageAligned([0u8; 32768]);
 

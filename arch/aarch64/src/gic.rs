@@ -25,9 +25,13 @@ pub const GICC_BASE: usize = 0x107F_FFA0_00;
 
 // Distributor register offsets
 const GICD_CTLR:       usize = 0x000; // distributor control
-const GICD_ISENABLER0: usize = 0x100; // set-enable  for IRQs  0-31
+const GICD_ISENABLER0: usize = 0x100; // set-enable  for IRQs  0-31 (banked per CPU for SGIs/PPIs)
 const GICD_IPRIORITYR: usize = 0x400; // priority    (1 byte / IRQ)
 const GICD_ITARGETSR:  usize = 0x800; // target CPUs (1 byte / IRQ)
+const GICD_SGIR:       usize = 0xF00; // software-generated interrupt register
+
+/// SGI used as the cross-CPU reschedule IPI.
+pub const SGI_RESCHED: u32 = 1;
 
 // CPU interface register offsets
 const GICC_CTLR: usize = 0x000; // CPU interface control
@@ -75,8 +79,10 @@ pub fn init() {
         gicd_w32(GICD_CTLR, 1);
         dsb_st();
 
-        // Enable PPI 27 (Virtual Timer).
-        gicd_w32(GICD_ISENABLER0, 1 << 27);
+        // Enable PPI 27 (Virtual Timer) and SGI 1 (reschedule IPI).
+        // This word is banked per CPU for IRQs 0-31 — this enables them for
+        // the BSP; each AP does the same in init_cpu_interface().
+        gicd_w32(GICD_ISENABLER0, (1 << 27) | (1 << SGI_RESCHED));
         // Enable SPI 1 / IRQ 33 (PL011 UART).
         // IRQ 33 is in ISENABLER1 (IRQ IDs 32-63), bit 1 (33 - 32 = 1).
         gicd_w32(GICD_ISENABLER0 + 4, 1 << 1);
@@ -119,11 +125,35 @@ pub fn init() {
 /// Initialise only the CPU interface for a secondary CPU (AP).
 ///
 /// The distributor was already configured by the BSP; each AP must separately
-/// enable its own banked CPU interface registers.
+/// enable its own banked registers: the CPU interface (GICC_*) plus the
+/// banked GICD_ISENABLER0 word covering SGIs and PPIs — without the latter,
+/// this CPU would never receive its virtual-timer PPI 27 or reschedule SGI 1.
 pub fn init_cpu_interface() {
     unsafe {
+        // Banked per-CPU enables: virtual timer PPI 27 + reschedule SGI 1.
+        gicd_w32(GICD_ISENABLER0, (1 << 27) | (1 << SGI_RESCHED));
+
+        // Banked per-CPU priority for PPI 27 (match the BSP's 0xA0).
+        let pri_word_off = GICD_IPRIORITYR + (27 / 4) * 4;
+        let pri_shift    = (27 % 4) * 8;
+        let pri_v = (gicd_r32(pri_word_off) & !(0xFF << pri_shift)) | (0xA0 << pri_shift);
+        gicd_w32(pri_word_off, pri_v);
+
         gicc_w32(GICC_CTLR, 1);    // enable CPU interface
         gicc_w32(GICC_PMR,  0xFF); // accept all priorities
+        dsb_st();
+    }
+}
+
+/// Send Software-Generated Interrupt `sgi_id` to the CPU with GIC interface
+/// number `cpu` (0-7 on GICv2).
+///
+/// GICD_SGIR layout: [25:24] target-list filter (0 = use CPU target list),
+/// [23:16] CPU target list bitmask, [3:0] SGI ID.
+pub fn send_sgi(cpu: usize, sgi_id: u32) {
+    if cpu >= 8 { return; } // GICv2 supports at most 8 CPU interfaces
+    unsafe {
+        gicd_w32(GICD_SGIR, ((1u32 << cpu) << 16) | (sgi_id & 0xF));
         dsb_st();
     }
 }

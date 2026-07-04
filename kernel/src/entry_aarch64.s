@@ -20,6 +20,15 @@ _start:
     cmp     x4, #2
     b.ne    .Lat_el1                // not EL2 → already where we want to be
 
+    // Record the EL2 entry: QEMU registers its PSCI emulation on the SMC
+    // conduit when the guest boots at EL2 (HVC otherwise), and smp.rs must
+    // use the matching instruction for CPU_ON.  boot_entered_el2 lives in
+    // .data (not .bss) so the BSS-zero loop below can't wipe it.
+    adrp    x5, boot_entered_el2
+    add     x5, x5, :lo12:boot_entered_el2
+    mov     x6, #1
+    str     x6, [x5]
+
     // Let EL1 read the physical/virtual counter without trapping to EL2,
     // otherwise the timer init later faults into nonexistent EL2 vectors.
     mrs     x4, cnthctl_el2

@@ -1,6 +1,19 @@
-//! Run queue — fixed-size array of task slots with round-robin selection.
+//! Run queue — fixed-size array of task slots with EEVDF selection.
 //!
-//! Future: replace with a red-black tree keyed on virtual runtime (à la CFS).
+//! Selection policy: Earliest Eligible Virtual Deadline First (EEVDF), the
+//! same family as Linux ≥ 6.6's default scheduler.
+//!
+//!  * Every runnable task has a `vruntime` (weighted virtual runtime) and a
+//!    `vdeadline` (`vruntime + slice/weight` at last renewal).
+//!  * A task is **eligible** when its `vruntime` is at or below the weighted
+//!    average vruntime of the runnable set — i.e. it has received no more
+//!    than its fair share of CPU so far.
+//!  * `pick_next` returns the eligible task with the earliest virtual
+//!    deadline.
+//!
+//! SMP: the queue is shared by all CPUs (guarded by the `RUN_QUEUE` mutex in
+//! lib.rs).  Tasks with `on_cpu.is_some()` are skipped — their register state
+//! is still live on another core.
 
 use super::task::{Pid, Task, TaskState};
 pub const MAX_TASKS: usize = 256;
@@ -10,12 +23,11 @@ use alloc::boxed::Box;
 pub struct RunQueue {
     pub tasks: [Option<Box<Task>>; MAX_TASKS],
     len:       usize,
-    cursor:    usize,
 }
 
 impl RunQueue {
     pub const fn new() -> Self {
-        Self { tasks: [const { None }; MAX_TASKS], len: 0, cursor: 0 }
+        Self { tasks: [const { None }; MAX_TASKS], len: 0 }
     }
 
     /// Get the number of tasks currently in the run queue.
@@ -23,9 +35,27 @@ impl RunQueue {
         self.len
     }
 
+    /// Minimum `vruntime` over all runnable (Ready or Running) tasks.
+    ///
+    /// Used to place newly enqueued or freshly woken tasks so they compete
+    /// fairly from "now" instead of replaying the virtual time they slept
+    /// through.
+    pub fn min_vruntime(&self) -> u64 {
+        self.tasks.iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|t| matches!(t.state, TaskState::Ready | TaskState::Running))
+            .map(|t| t.vruntime)
+            .min()
+            .unwrap_or(0)
+    }
+
     /// Insert a task into the first free slot. Returns false if the queue is full.
-    pub fn enqueue(&mut self, task: Box<Task>) -> bool {
-        for (_idx, slot) in self.tasks.iter_mut().enumerate() {
+    ///
+    /// The task is EEVDF-placed relative to the current runnable set.
+    pub fn enqueue(&mut self, mut task: Box<Task>) -> bool {
+        let min_vr = self.min_vruntime();
+        task.place(min_vr);
+        for slot in self.tasks.iter_mut() {
             if slot.is_none() {
                 *slot = Some(task);
                 self.len += 1;
@@ -35,49 +65,46 @@ impl RunQueue {
         false
     }
 
-    /// Pick the next Ready task using round-robin scheduling.
+    /// EEVDF pick: the eligible Ready task with the earliest virtual deadline.
     ///
-    /// Starts from the current cursor position and finds the next Ready task.
-    /// This ensures fair scheduling and prevents any single task from starving.
+    /// Tasks already running on another CPU (`on_cpu.is_some()`) are skipped.
     /// Returns the slot index so the caller can track which task is active.
     pub fn pick_next(&mut self) -> Option<usize> {
         if self.len == 0 { return None; }
 
-        // First, try from cursor to end
-        for i in self.cursor..MAX_TASKS {
-            if let Some(ref task) = self.tasks[i] {
-                if task.state == TaskState::Ready {
-                    self.cursor = (i + 1) % MAX_TASKS;
-                    return Some(i);
+        // Pass 1: total weight and weighted vruntime sum of the candidates.
+        // The weighted average sum_wv / sum_w is the virtual time "V" against
+        // which eligibility is judged.
+        let mut sum_w:  u64  = 0;
+        let mut sum_wv: u128 = 0;
+        for slot in self.tasks.iter() {
+            if let Some(t) = slot {
+                if t.state == TaskState::Ready && t.on_cpu.is_none() {
+                    sum_w  += t.weight as u64;
+                    sum_wv += t.weight as u128 * t.vruntime as u128;
                 }
             }
         }
+        if sum_w == 0 { return None; }
 
-        // Then try from start to cursor
-        for i in 0..self.cursor {
-            if let Some(ref task) = self.tasks[i] {
-                if task.state == TaskState::Ready {
-                    self.cursor = (i + 1) % MAX_TASKS;
-                    return Some(i);
+        // Pass 2: earliest virtual deadline among eligible tasks.  The task
+        // with the minimum vruntime is always eligible, so `best` is always
+        // found; `fallback` guards against arithmetic corner cases only.
+        let mut best:     Option<(usize, u64)> = None; // (idx, vdeadline)
+        let mut fallback: Option<(usize, u64)> = None; // (idx, vruntime)
+        for (i, slot) in self.tasks.iter().enumerate() {
+            if let Some(t) = slot {
+                if t.state != TaskState::Ready || t.on_cpu.is_some() { continue; }
+                let eligible = (t.vruntime as u128) * (sum_w as u128) <= sum_wv;
+                if eligible && best.map_or(true, |(_, d)| t.vdeadline < d) {
+                    best = Some((i, t.vdeadline));
+                }
+                if fallback.map_or(true, |(_, v)| t.vruntime < v) {
+                    fallback = Some((i, t.vruntime));
                 }
             }
         }
-
-        extern "C" { 
-            fn serial_print(s: *const u8, len: usize); 
-            fn print_number(n: u32);
-        }
-        unsafe {
-            let msg = b"[SCHED] pick_next: no ready task! len=";
-            serial_print(msg.as_ptr(), msg.len());
-            print_number(self.len as u32);
-            let msg2 = b" cursor=";
-            serial_print(msg2.as_ptr(), msg2.len());
-            print_number(self.cursor as u32);
-            serial_print(b"\n".as_ptr(), 1);
-        }
-
-        None
+        best.or(fallback).map(|(i, _)| i)
     }
 
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut Task> {
@@ -129,16 +156,22 @@ impl RunQueue {
         }
     }
 
-    /// Wake all tasks blocked on `port`.
-    pub fn unblock_port(&mut self, port: u32) {
+    /// Wake all tasks blocked on `port`.  Returns the number woken so the
+    /// caller can kick an idle CPU when work became available.
+    pub fn unblock_port(&mut self, port: u32) -> usize {
+        let min_vr = self.min_vruntime();
+        let mut woken = 0;
         for slot in &mut self.tasks {
             if let Some(task) = slot {
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked {
                     task.state      = TaskState::Ready;
                     task.blocked_on = None;
+                    task.place(min_vr);
+                    woken += 1;
                 }
             }
         }
+        woken
     }
 
     /// Mark a task as Zombie (terminal; will not be scheduled again).

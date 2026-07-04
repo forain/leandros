@@ -85,6 +85,19 @@ pub fn init(info: &boot::BootInfo) {
     unsafe { timer::init(); }
     #[cfg(target_arch = "x86_64")]
     syscall::init();
+
+    // Remember the boot CR3 as the canonical kernel page table.  The
+    // scheduler resets every CPU to it after running a task so a freed task
+    // root is never left loaded (see paging::arch_load_kernel_page_table).
+    #[cfg(target_arch = "x86_64")]
+    unsafe { paging::capture_kernel_root(); }
+
+    // Bring up the Application Processors last: everything they inherit
+    // (page tables, LAPIC mapping, timer calibration, IDT contents) is ready
+    // now.  They initialise their per-CPU state in smp::sched_ap_entry and
+    // then park in sched::ap_entry until the BSP calls sched::run().
+    #[cfg(target_arch = "x86_64")]
+    unsafe { smp::smp_init(sched::MAX_CPUS - 1); }
 }
 
 /// Enable SSE/SSE2 instructions in the CPU.
@@ -97,7 +110,7 @@ pub fn init(info: &boot::BootInfo) {
 ///   - CR4.OSFXSR=0  → `movdqu` raises #UD (Invalid Opcode, vector 6).
 ///   - CR0.TS=1      → any FPU/SSE access raises #NM (Device Not Available).
 #[cfg(target_arch = "x86_64")]
-unsafe fn enable_sse() {
+pub(crate) unsafe fn enable_sse() {
     use core::arch::asm;
     let mut cr0: u64;
     asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
@@ -110,13 +123,11 @@ unsafe fn enable_sse() {
     asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
 }
 
-/// Returns the ID of the current CPU.
-///
-/// Placeholder implementation: always returns 0 (BSP).
+/// Returns the ID of the current CPU (LAPIC-derived).
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn cpu_id() -> usize {
-    0
+    unsafe { smp::arch_cpu_id() }
 }
 
 /// x86_64 serial output for early debugging.

@@ -27,13 +27,21 @@ use crate::task::{self, DEFAULT_SIGACTION};
 /// `frame_ptr` — virtual address of the `UserFrame` saved on the parent's
 /// kernel stack by the exception entry stub.
 ///
+/// `before_enqueue` runs with the child's PID after the child task is fully
+/// constructed but **before** it is made runnable.  The kernel uses it to
+/// duplicate the parent's VFS fd table: on SMP another CPU can dispatch the
+/// child the instant it is enqueued, and if the child's first syscall
+/// (`pipe()`, `open()`) beats the fd-table clone, the VFS creates a fresh
+/// empty table and hands the child fd 0/1 for regular files — aliasing
+/// stdin/stdout.
+///
 /// Returns the child PID (> 0) to the parent, or a negative `errno` on error:
 /// * `-12` ENOMEM  — OOM or run queue full
 /// * `-38` ENOSYS  — architecture not supported
-pub fn fork_current(frame_ptr: usize) -> isize {
+pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        let _ = frame_ptr;
+        let _ = (frame_ptr, before_enqueue);
         return -38; // ENOSYS on other architectures
     }
 
@@ -42,7 +50,7 @@ pub fn fork_current(frame_ptr: usize) -> isize {
 
         if frame_ptr == 0 { return -38; }
 
-        let parent_pid = unsafe { super::CURRENT_PID[super::cpu_id()] };
+        let parent_pid = super::current_pid();
         if parent_pid == 0 { return -38; }
 
         // ── Step 1: allocate child kernel stack ───────────────────────────────
@@ -203,11 +211,16 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         child.cwd           = cwd;
         child.signal_actions = [DEFAULT_SIGACTION; 64];
 
+        // Give the caller its chance to set up per-child kernel state (VFS
+        // fd table) while the child is still invisible to other CPUs.
+        before_enqueue(child_pid);
+
         if !super::RUN_QUEUE.lock().enqueue(child) {
             mm::buddy::free(stack_base_phys, stack_pages);
             mm::buddy::free(child_pt, 0);
             return -12;
         }
+        super::wake_up_an_idle_cpu();
 
         child_pid as isize
     }
@@ -239,7 +252,7 @@ pub fn clone_thread(
 
         if frame_ptr == 0 { return -38; }
 
-        let parent_pid = unsafe { super::CURRENT_PID[super::cpu_id()] };
+        let parent_pid = super::current_pid();
         if parent_pid == 0 { return -38; }
 
         // ── Allocate child kernel stack ───────────────────────────────────────
@@ -357,6 +370,7 @@ pub fn clone_thread(
             mm::buddy::free(stack_base_phys, stack_pages);
             return -12;
         }
+        super::wake_up_an_idle_cpu();
 
         child_pid as isize
     }

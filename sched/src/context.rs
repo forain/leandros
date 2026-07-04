@@ -240,6 +240,10 @@ cpu_switch_to:
 .global iret_to_user
 .type   iret_to_user, @function
 iret_to_user:
+    // Establish this CPU's user-mode GS invariant (KERNEL_GS_BASE = per-CPU
+    // syscall block, GS_BASE = 0) before the first entry into user space.
+    // Defined in arch-x86_64 (syscall.rs); resolved at kernel link time.
+    call restore_user_gs
     mov ax, 0x1B
     mov ds, ax
     mov es, ax

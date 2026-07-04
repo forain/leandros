@@ -39,6 +39,7 @@ const MSR_EFER:         u32 = 0xC000_0080;
 const MSR_STAR:         u32 = 0xC000_0081;
 const MSR_LSTAR:        u32 = 0xC000_0082;
 const MSR_FMASK:        u32 = 0xC000_0084;
+const MSR_GSBASE:       u32 = 0xC000_0101;
 const MSR_KERNEL_GSBASE: u32 = 0xC000_0102;
 
 unsafe fn rdmsr(msr: u32) -> u64 {
@@ -107,34 +108,65 @@ fn init_per_cpu(cpu_id: usize) {
     }
 }
 
+/// Program the SYSCALL/SYSRET machine-state registers on the calling CPU.
+///
+/// EFER.SCE, STAR, LSTAR and FMASK are **per-CPU** MSRs: every CPU that will
+/// execute user code must run this, not just the BSP.
+unsafe fn init_msrs() {
+    // Enable SCE (System Call Extensions) and NXE (No-Execute Enable) in EFER.
+    // SCE is bit 0, NXE is bit 11.
+    wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 0x801);
+
+    // STAR segments:
+    //   bits[47:32] = 0x08  → SYSCALL CS = 0x08, SS = 0x10
+    //   bits[63:48] = 0x10  → SYSRET64 CS = 0x10+16 = 0x20|3, SS = 0x10+8 = 0x18|3
+    wrmsr(MSR_STAR, (0x0008u64 << 32) | (0x0010u64 << 48));
+
+    // LSTAR: entry point for 64-bit SYSCALL.
+    wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
+
+    // FMASK: clear IF (bit 9) on SYSCALL so we run with interrupts disabled.
+    wrmsr(MSR_FMASK, 1 << 9);
+}
+
 /// Configure SYSCALL/SYSRET MSRs and initialise per-CPU state for the BSP (CPU 0).
 pub fn init() {
-    unsafe {
-        // Enable SCE (System Call Extensions) and NXE (No-Execute Enable) in EFER.
-        // SCE is bit 0, NXE is bit 11.
-        wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 0x801);
-
-        // STAR segments:
-        //   bits[47:32] = 0x08  → SYSCALL CS = 0x08, SS = 0x10
-        //   bits[63:48] = 0x10  → SYSRET64 CS = 0x10+16 = 0x20|3, SS = 0x10+8 = 0x18|3
-        wrmsr(MSR_STAR, (0x0008u64 << 32) | (0x0010u64 << 48));
-
-        // LSTAR: entry point for 64-bit SYSCALL.
-        wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
-
-        // FMASK: clear IF (bit 9) on SYSCALL so we run with interrupts disabled.
-        wrmsr(MSR_FMASK, 1 << 9);
-    }
+    unsafe { init_msrs(); }
 
     // BSP is CPU 0.
     init_per_cpu(0);
 }
 
-/// Initialise per-CPU SYSCALL state for an Application Processor.
+/// Re-establish the user-mode GS invariant for the **current** CPU:
+/// `KERNEL_GS_BASE = &PER_CPU[cpu]` (consumed by the next entry `swapgs`)
+/// and `GS_BASE = 0` (user GS).
+///
+/// Every kernel→user transition must run this instead of a bare exit
+/// `swapgs`.  A bare `swapgs` pair is only correct if entry and exit execute
+/// on the same CPU — but on SMP a task that blocks mid-syscall or mid-IRQ
+/// can resume on a *different* CPU, and its exit `swapgs` would then corrupt
+/// that CPU's GS/KERNEL_GS pair (leaving KERNEL_GS_BASE=0 in user mode; the
+/// next syscall faults on `mov gs:[8], rsp`).  Writing both MSRs from the
+/// live CPU index makes the exit path migration-proof.
+///
+/// Interrupts are disabled first so a preemption can't migrate this task
+/// between reading the CPU index and the `iretq`/`sysret` that follows.
+#[no_mangle]
+pub unsafe extern "C" fn restore_user_gs() {
+    core::arch::asm!("cli", options(nomem, nostack));
+    let cpu = crate::smp::arch_cpu_id().min(MAX_CPUS - 1);
+    let ptr = core::ptr::addr_of!(PER_CPU[cpu]) as u64;
+    wrmsr(MSR_KERNEL_GSBASE, ptr);
+    wrmsr(MSR_GSBASE, 0);
+}
+
+/// Initialise SYSCALL support on an Application Processor: the full MSR set
+/// (all per-CPU) plus this CPU's KERNEL_GS_BASE.
 ///
 /// Must be called after `apic::init()` (so `arch_cpu_id()` returns the
 /// correct LAPIC-derived CPU index).  Called from `smp::sched_ap_entry`.
 pub fn init_ap() {
+    unsafe { init_msrs(); }
     let cpu_id = unsafe { crate::smp::arch_cpu_id() };
     init_per_cpu(cpu_id);
 }
@@ -256,6 +288,11 @@ syscall_entry:
     mov   rbx, rax
     mov   rdi, rsp
     call  check_and_deliver_signals
+    // Re-establish this CPU's user-mode GS invariant (migration-proof
+    // replacement for the old exit swapgs — see restore_user_gs).  Must run
+    // while the return value is still stashed in rbx: it clobbers
+    // caller-saved registers.
+    call  restore_user_gs
     mov   rax, rbx
 
     // 8. Restore user registers.
@@ -275,8 +312,8 @@ syscall_entry:
     pop   rcx             // restore user RIP
     pop   r11             // restore user RFLAGS
 
-    // 9. Return to user space via IRETQ.
-    swapgs
+    // 9. Return to user space via IRETQ.  GS was already restored by
+    // restore_user_gs above (no swapgs: entry/exit may be on different CPUs).
     iretq
 
 // ── fork_ret_to_user — first entry into a child process after fork ───────
@@ -286,6 +323,11 @@ syscall_entry:
 .global fork_ret_to_user
 .type   fork_ret_to_user, @function
 fork_ret_to_user:
+    // Establish this CPU's user-mode GS invariant before touching the frame
+    // (restore_user_gs clobbers caller-saved registers, so it must run
+    // before the register pops below).
+    call  restore_user_gs
+
     // UserFrame layout: r15, r14, r13, r12, rbp, rbx, r10, r9, r8, rdx, rsi, rdi, rax, rcx, r11,
     // followed by [rip, cs, rflags, rsp, ss].
     pop   r15
@@ -303,8 +345,7 @@ fork_ret_to_user:
     pop   rax             // Restore rax (contains 0 in child)
     pop   rcx             // restore user RIP
     pop   r11             // restore user RFLAGS
-    // Restore user GS (kernel GS was activated on SYSCALL entry).
-    swapgs
+    // GS already restored by restore_user_gs at function entry.
     iretq
 
 // ── arch_execve_return — drop into user space at a new entry / stack ──────
@@ -322,6 +363,15 @@ fork_ret_to_user:
 .global arch_execve_return
 .type   arch_execve_return, @function
 arch_execve_return:
+    // Establish this CPU's user-mode GS invariant.  rdi/rsi carry the
+    // entry/user_sp arguments and restore_user_gs clobbers caller-saved
+    // registers, so preserve them across the call.
+    push  rdi
+    push  rsi
+    call  restore_user_gs
+    pop   rsi
+    pop   rdi
+
     // Build 5-word IRET frame: [RIP, CS, RFLAGS, RSP, SS]
     // Pushed in reverse order (stack grows down).
     push  0x1B            // SS  = user data selector
@@ -345,8 +395,7 @@ arch_execve_return:
     xor   r13, r13
     xor   r14, r14
     xor   r15, r15
-    // Restore user GS (kernel GS was activated on SYSCALL entry).
-    swapgs
+    // GS already restored by restore_user_gs at function entry.
     iretq
 "#);
 

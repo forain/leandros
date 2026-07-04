@@ -1,8 +1,19 @@
-//! Cooperative scheduler — context switching, task lifecycle, IPC blocking.
+//! SMP scheduler — context switching, task lifecycle, IPC blocking.
 //!
-//! Design: single-CPU, cooperative.  Tasks run until they call `yield_now()`,
-//! `block_on()`, or `exit()`.  A static idle context in `run()` is the
-//! "scheduler thread" that picks the next ready task on each wake-up.
+//! Design: a single shared run queue (EEVDF policy, see runqueue.rs) served
+//! by every online CPU.  Each CPU runs `scheduler_run_loop()` on its own
+//! static scheduler context; tasks run until they call `yield_now()`,
+//! `block_on()`, `exit()`, or are preempted by their CPU's local timer.
+//!
+//! SMP invariants:
+//!  * `Task::on_cpu` guards against double dispatch: a task remains claimed
+//!    from the moment it is picked until the owning CPU has switched back to
+//!    its scheduler context (its saved registers are complete).
+//!  * Preemption flags are per CPU; cross-CPU wake-ups go through
+//!    `trigger_preempt` / `wake_up_an_idle_cpu`, which send architecture
+//!    reschedule IPIs (x86-64 vector 0x40, AArch64 SGI 1).
+//!  * APs park in `ap_entry()` until the BSP finishes kernel init and calls
+//!    `run()`, preserving the pre-SMP boot ordering.
 //!
 //! Analogues: Linux kernel/sched/core.c (`schedule`, `switch_to`).
 
@@ -42,8 +53,16 @@ pub fn set_audio_port(p: u32) { SYS_AUDIO_PORT.store(p, Ordering::Relaxed); }
 pub fn get_vfs_port()   -> u32 { SYS_VFS_PORT.load(Ordering::Relaxed) }
 pub fn get_net_port()   -> u32 { SYS_NET_PORT.load(Ordering::Relaxed) }
 pub fn get_audio_port() -> u32 { SYS_AUDIO_PORT.load(Ordering::Relaxed) }
-/// Set by timer_tick_irq; cleared and acted on by preempt_check.
-static PREEMPT_NEEDED:  AtomicBool      = AtomicBool::new(false);
+/// Per-CPU preemption flags: set by the CPU's own timer tick or by a remote
+/// CPU via `trigger_preempt`; cleared and acted on by `preempt_check` on the
+/// owning CPU.
+static PREEMPT_NEEDED: [AtomicBool; MAX_CPUS] =
+    [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Opened by `run()` on the BSP once kernel init is complete.  APs spin on
+/// this in `ap_entry()` so no task can run on a secondary CPU while the BSP
+/// is still bringing up servers and drivers.
+static SCHED_ONLINE: AtomicBool = AtomicBool::new(false);
 /// Optional hook called with a PID just before its task slot is reclaimed.
 /// Registered by the IPC layer to release ports owned by the exiting task.
 static TASK_EXIT_HOOK:  AtomicPtr<()>   = AtomicPtr::new(core::ptr::null_mut());
@@ -77,17 +96,81 @@ pub fn get_exit_code(pid: Pid) -> Option<i32> {
 pub const MAX_CPUS: usize = 8;
 static mut SCHEDULER_CTX: [CpuContext; MAX_CPUS] = [const { CpuContext::zeroed() }; MAX_CPUS];
 static mut CURRENT_CTX:   [*mut CpuContext; MAX_CPUS] = [core::ptr::null_mut(); MAX_CPUS];
-static mut CURRENT_PID:   [Pid; MAX_CPUS] = [0; MAX_CPUS];
+/// PID running on each CPU (0 = idle / in scheduler).  Atomic because
+/// `wake_up_an_idle_cpu` reads other CPUs' slots to find an idle target.
+static CURRENT_PID: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
 
 extern "C" {
     fn arch_set_page_table(root: usize);
+    /// Detach this CPU from any task page table (x86-64: reload the boot
+    /// kernel CR3; AArch64: clear TTBR0).  Called after every switch-back so
+    /// an exited task's freed page tables are never left live on a CPU.
+    fn arch_load_kernel_page_table();
     fn arch_set_kernel_stack(rsp: u64);
     fn arch_cpu_id() -> usize;
     pub fn arch_alloc_page_table_root() -> usize;
+    /// Send a reschedule IPI to `cpu` (x86-64: LAPIC vector 0x40; AArch64: SGI 1).
+    fn arch_send_resched_ipi(cpu: usize);
+    /// Number of CPUs that have entered the scheduler (BSP + booted APs).
+    fn arch_active_cpu_count() -> usize;
+    /// Physical core a logical CPU belongs to (SMT topology; identity when
+    /// the platform exposes no SMT).
+    fn arch_core_of(cpu: usize) -> usize;
 }
 
 pub unsafe fn cpu_id() -> usize {
     arch_cpu_id()
+}
+
+/// Mark `cpu` as needing a reschedule and, if it is a remote CPU, kick it
+/// with a reschedule IPI so it acts on the flag promptly (an idle CPU is
+/// sitting in `hlt`/`wfi`; a busy one preempts at the IPI return path).
+pub fn trigger_preempt(cpu: usize) {
+    if cpu >= MAX_CPUS { return; }
+    PREEMPT_NEEDED[cpu].store(true, Ordering::Release);
+    if cpu != unsafe { cpu_id() } {
+        unsafe { arch_send_resched_ipi(cpu); }
+    }
+}
+
+/// Find an idle CPU and send it a reschedule IPI.  Called whenever new work
+/// becomes runnable (spawn, fork/clone, port unblock, futex wake, signal).
+///
+/// SMT-aware: prefers an idle CPU whose *whole core* is idle, so new work
+/// lands on an unused physical core before doubling up on the hyperthread
+/// sibling of a busy one — SMT siblings share execution resources, so two
+/// tasks on one core run slower than two tasks on two cores.
+pub fn wake_up_an_idle_cpu() {
+    let n = unsafe { arch_active_cpu_count() }.min(MAX_CPUS);
+    if n <= 1 { return; }
+    let me = unsafe { cpu_id() };
+
+    let mut fallback: Option<usize> = None;
+    for i in 0..n {
+        if i == me { continue; }
+        if CURRENT_PID[i].load(Ordering::Relaxed) != 0 { continue; }
+
+        // Idle candidate — check whether its SMT siblings are idle too.
+        let core = unsafe { arch_core_of(i) };
+        let mut core_idle = true;
+        for j in 0..n {
+            if j == i { continue; }
+            if unsafe { arch_core_of(j) } != core { continue; }
+            if j == me || CURRENT_PID[j].load(Ordering::Relaxed) != 0 {
+                core_idle = false;
+                break;
+            }
+        }
+        if core_idle {
+            trigger_preempt(i);
+            return;
+        }
+        if fallback.is_none() { fallback = Some(i); }
+    }
+    if let Some(i) = fallback {
+        trigger_preempt(i);
+    }
 }
 
 pub fn alloc_pid() -> Pid {
@@ -98,7 +181,7 @@ pub fn alloc_pid() -> Pid {
 }
 
 pub fn current_pid() -> Pid {
-    unsafe { CURRENT_PID[cpu_id()] }
+    CURRENT_PID[unsafe { cpu_id() }].load(Ordering::Relaxed)
 }
 
 pub fn current_ppid() -> Pid {
@@ -121,17 +204,28 @@ pub fn ticks() -> u64 {
 }
 
 pub fn deliver_signal(pid: Pid, signo: u32) -> isize {
-    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        if signo > 0 && signo <= 64 {
-            t.signal_pending |= 1 << (signo - 1);
-            if t.state == TaskState::Blocked {
-                t.state = TaskState::Ready;
+    let mut woke = false;
+    let ret = {
+        let mut rq = RUN_QUEUE.lock();
+        let min_vr = rq.min_vruntime();
+        if let Some(t) = rq.find_pid_mut(pid) {
+            if signo > 0 && signo <= 64 {
+                t.signal_pending |= 1 << (signo - 1);
+                if t.state == TaskState::Blocked {
+                    t.state = TaskState::Ready;
+                    t.place(min_vr);
+                    woke = true;
+                }
+                0
+            } else {
+                -22 // EINVAL
             }
-            return 0;
+        } else {
+            -3 // ESRCH
         }
-        return -22; // EINVAL
-    }
-    -3 // ESRCH
+    };
+    if woke { wake_up_an_idle_cpu(); }
+    ret
 }
 
 pub fn pending_signals() -> u64 {
@@ -317,18 +411,19 @@ pub fn init() {}
 pub fn wait_pid(pid: Pid) -> Option<(Pid, i32)> {
     loop {
         {
-            let mut rq = RUN_QUEUE.lock();
-            if let Some(idx) = rq.find_pid_idx(pid) {
-                let state = rq.get(idx).unwrap().state;
-                if state == TaskState::Zombie {
-                    let code = rq.get(idx).unwrap().exit_code;
-                    rq.remove(idx);
-                    return Some((pid, code));
-                }
-            } else {
+            let rq = RUN_QUEUE.lock();
+            if rq.find_pid_idx(pid).is_none() {
+                drop(rq);
                 if let Some(code) = get_exit_code(pid) { return Some((pid, code)); }
                 return None;
             }
+            // Task still occupies a slot.  Even if it is already a Zombie we
+            // must NOT reap it here: on SMP its owning CPU may still be inside
+            // cpu_switch_to, actively saving registers into the Task and
+            // running on the kernel stack / page tables we would free.  The
+            // owning CPU's scheduler loop is the single reaper — it removes
+            // the slot and records the exit code in EXIT_LOG, which the
+            // `find_pid_idx == None` branch above then picks up.
         }
         
         unsafe {
@@ -356,12 +451,18 @@ pub fn wait_pid(pid: Pid) -> Option<(Pid, i32)> {
     }
 
 pub fn timer_tick_irq() {
-    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
-    PREEMPT_NEEDED.store(true, Ordering::Relaxed);
+    let id = unsafe { cpu_id() };
+    // Every CPU has its own local timer; only the BSP advances global time so
+    // TIMER_TICKS keeps its 100 Hz meaning regardless of CPU count.
+    if id == 0 {
+        TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+    PREEMPT_NEEDED[id.min(MAX_CPUS - 1)].store(true, Ordering::Relaxed);
 }
 
 pub fn preempt_check() {
-    if PREEMPT_NEEDED.swap(false, Ordering::Relaxed) {
+    let id = unsafe { cpu_id() };
+    if PREEMPT_NEEDED[id.min(MAX_CPUS - 1)].swap(false, Ordering::Relaxed) {
         yield_now("preempt");
     }
 }
@@ -402,11 +503,18 @@ pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
 }
 
 pub fn ap_entry() -> ! {
+    // Park until the BSP finishes kernel init and calls run().  This keeps
+    // the pre-SMP guarantee that no task executes before all servers and
+    // drivers are registered.
+    while !SCHED_ONLINE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
     scheduler_run_loop()
 }
 
 pub fn unblock_port(port: u32) {
-    RUN_QUEUE.lock().unblock_port(port);
+    let woken = RUN_QUEUE.lock().unblock_port(port);
+    if woken > 0 { wake_up_an_idle_cpu(); }
 }
 
 pub fn spawn(entry: fn() -> !, _flags: usize) -> Option<Pid> {
@@ -417,8 +525,9 @@ pub fn spawn(entry: fn() -> !, _flags: usize) -> Option<Pid> {
     let stack_size = mm::buddy::PAGE_SIZE * 16;
 
     let task = Task::new_kernel(pid, entry as usize, stack_base, stack_size, 0);
-    let mut rq = RUN_QUEUE.lock();
-    if rq.enqueue(task) {
+    let ok = RUN_QUEUE.lock().enqueue(task);
+    if ok {
+        wake_up_an_idle_cpu();
         Some(pid)
     } else {
         mm::buddy::free(stack_base, 4);
@@ -464,8 +573,9 @@ pub fn spawn_user_with_address_space(entry_point: usize, sp: usize, as_: mm::vmm
     task.kernel_stack = stack_phys;
     task.address_space = Some(alloc::boxed::Box::new(as_));
 
-    let mut rq = RUN_QUEUE.lock();
-    if rq.enqueue(task) {
+    let ok = RUN_QUEUE.lock().enqueue(task);
+    if ok {
+        wake_up_an_idle_cpu();
         Some(pid)
     } else {
         mm::buddy::free(stack_phys, 4);
@@ -474,6 +584,8 @@ pub fn spawn_user_with_address_space(entry_point: usize, sp: usize, as_: mm::vmm
 }
 
 pub fn run() -> ! {
+    // Release any parked APs — kernel init is complete.
+    SCHED_ONLINE.store(true, Ordering::Release);
     scheduler_run_loop()
 }
 
@@ -494,31 +606,32 @@ fn scheduler_run_loop() -> ! {
         serial_print(b"\n".as_ptr(), 1);
     }
     loop {
-        let maybe_idx = { RUN_QUEUE.lock().pick_next() };
+        // Pick, claim (on_cpu) and mark Running under a single lock so no
+        // other CPU can dispatch the same task between pick and claim.
+        let picked = {
+            let mut rq = RUN_QUEUE.lock();
+            match rq.pick_next() {
+                Some(idx) => {
+                    let t = rq.get_mut(idx).unwrap();
+                    t.on_cpu = Some(id);
+                    t.state  = TaskState::Running;
+                    let kst = mm::phys_to_virt(t.kernel_stack) + mm::buddy::PAGE_SIZE * 16;
+                    Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table))
+                }
+                None => None,
+            }
+        };
 
-        if let Some(idx) = maybe_idx {
-            let (ctx_ptr, pid, kernel_stack_top_virt, page_table) = {
-                let mut rq = RUN_QUEUE.lock();
-                let t = rq.get_mut(idx).unwrap();
-                let pid = t.pid;
-                let kst = mm::phys_to_virt(t.kernel_stack) + mm::buddy::PAGE_SIZE * 16;
-                (&t.ctx as *const CpuContext, pid, kst, t.page_table)
-            };
+        if let Some((idx, ctx_ptr, pid, kernel_stack_top_virt, page_table)) = picked {
+            let dispatched_at = ticks();
 
             unsafe {
                 CURRENT_CTX[id] = ctx_ptr as *mut CpuContext;
-                CURRENT_PID[id] = pid;
-                
-                {
-                    let mut rq = RUN_QUEUE.lock();
-                    if let Some(t) = rq.get_mut(idx) {
-                        t.state = TaskState::Running;
-                    }
-                }
+                CURRENT_PID[id].store(pid, Ordering::Relaxed);
 
                 arch_set_kernel_stack(kernel_stack_top_virt as u64);
                 if page_table != 0 {
-                    arch_set_page_table(page_table); 
+                    arch_set_page_table(page_table);
                 }
 
                 context::cpu_switch_to(
@@ -528,37 +641,56 @@ fn scheduler_run_loop() -> ! {
 
                 // When we return here, we are in the scheduler context.
                 CURRENT_CTX[id] = core::ptr::null_mut();
-                CURRENT_PID[id] = 0;
+                CURRENT_PID[id].store(0, Ordering::Relaxed);
 
-                {
-                    let mut rq = RUN_QUEUE.lock();
-                    if let Some(t) = rq.get_mut(idx) {
+                // Detach from the task's page table before it can be freed:
+                // if this task exits (reaped below) or exits later on another
+                // CPU, its tables are released and reused — a CPU still
+                // holding them in CR3/TTBR0 faults on its next TLB miss.
+                arch_load_kernel_page_table();
+            }
+
+            // Charge CPU time, release the on_cpu claim, and — if the task
+            // exited — atomically take its slot out of the queue.  All under
+            // one lock: once on_cpu is None other CPUs may dispatch or (for
+            // zombies) observe the slot, so the claim must drop in the same
+            // critical section that resolves the task's final state.
+            let zombie = {
+                let mut rq = RUN_QUEUE.lock();
+                match rq.get_mut(idx) {
+                    Some(t) if t.pid == pid => {
+                        let delta = ticks().saturating_sub(dispatched_at);
+                        t.charge_vruntime(delta);
+                        t.on_cpu = None;
                         if t.state == TaskState::Running {
                             t.state = TaskState::Ready;
                         }
+                        if t.state == TaskState::Zombie {
+                            // Log the exit code BEFORE the slot disappears:
+                            // a parent polling wait_pid on another CPU must
+                            // always find the pid either in the queue or in
+                            // EXIT_LOG — a gap between remove() and a later
+                            // log_exit() makes waitpid return ECHILD.
+                            log_exit(t.pid, t.exit_code);
+                            rq.remove(idx)
+                        } else {
+                            None
+                        }
                     }
+                    _ => None,
                 }
-            }
-
-            let zombie_info = {
-                let mut rq = RUN_QUEUE.lock();
-                if let Some(t) = rq.get_mut(idx) {
-                    if t.state == TaskState::Zombie {
-                        Some((t.kernel_stack, t.pid, t.exit_code))
-                    } else { None }
-                } else { None }
             };
 
-            if let Some((stack_base, zombie_pid, exit_code)) = zombie_info {
+            if let Some(t) = zombie {
+                // This CPU ran the task to its death and holds the only
+                // reference now — safe to run the exit hook and free its
+                // kernel stack.  Dropping the Box releases the address space.
                 let hook_ptr = TASK_EXIT_HOOK.load(Ordering::Acquire);
                 if !hook_ptr.is_null() {
                     let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
-                    hook(zombie_pid);
+                    hook(t.pid);
                 }
-
-                { RUN_QUEUE.lock().remove(idx); }
-                mm::buddy::free(stack_base, 4);
-                log_exit(zombie_pid, exit_code);
+                mm::buddy::free(t.kernel_stack, 4);
             }
         } else {
             unsafe {
@@ -702,13 +834,22 @@ where F: FnOnce() -> R {
     extern "C" {
         fn arch_get_current_root() -> usize;
         fn arch_set_page_table(root: usize);
+        fn arch_interrupt_save() -> usize;
+        fn arch_interrupt_restore(flags: usize);
     }
 
     unsafe {
+        // The borrowed root must not outlive this block on this CPU: if a
+        // timer IRQ preempts the caller mid-copy, the scheduler switches
+        // CR3/TTBR0 away and — kernel tasks being dispatched without a page
+        // table load — the copy would resume against the wrong (or no)
+        // address space and corrupt memory.  Keep the window IRQ-atomic.
+        let irq = arch_interrupt_save();
         let old_root = arch_get_current_root();
         arch_set_page_table(pt_root);
         let res = f();
         arch_set_page_table(old_root);
+        arch_interrupt_restore(irq);
         Some(res)
     }
 }

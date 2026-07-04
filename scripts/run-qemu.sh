@@ -28,12 +28,15 @@ done
 
 if [ "$ARCH" = "aarch64" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
-    MACHINE_ARGS="-machine virt,gic-version=2 -m 2G"
+    # -smp 4: SMP bringup via PSCI CPU_ON (GICv2 supports up to 8 CPUs).
+    MACHINE_ARGS="-machine virt,gic-version=2 -m 2G -smp 4"
     CPU_ARGS="-cpu max"
     DISK_IMAGE="leandros-limine-aarch64.img"
 else
     QEMU_SYSTEM="qemu-system-x86_64"
-    MACHINE_ARGS="-machine q35"
+    # 2 cores × 2 threads: exercises the scheduler's SMT-aware idle-CPU
+    # selection (CPUID leaf 0xB reports the hyperthread topology).
+    MACHINE_ARGS="-machine q35 -smp 4,sockets=1,cores=2,threads=2"
     CPU_ARGS="-cpu max"
     DISK_IMAGE="leandros-limine-x86_64.img"
 fi

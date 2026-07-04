@@ -596,12 +596,14 @@ fn dispatch_inner(
         #[cfg(not(target_arch = "aarch64"))]
         FORK    => {
             let parent_pid = current_pid();
-            let ret = fork_current(frame_ptr);
-            if ret > 0 {
-                let msg = make_vfs_msg(vfs::VFS_FORK_DUP, &[parent_pid as u64, ret as u64]);
+            // The fd table must be duplicated BEFORE the child is enqueued:
+            // on SMP another CPU can run the child immediately, and its
+            // first fd-allocating syscall would otherwise see an empty table.
+            fork_current(frame_ptr, |child_pid| {
+                let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
+                                       &[parent_pid as u64, child_pid as u64]);
                 let _ = vfs::handle(&msg, parent_pid);
-            }
-            ret
+            })
         }
 
         // ── Time ─────────────────────────────────────────────────────────────
@@ -1691,11 +1693,13 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize) -> isize {
         // here — the extra uaddr2/val3 args (a4/a5, unused for *_WAIT) aren't
         // even forwarded to this function.
         0 | 9 => {
-            // FUTEX_WAIT: if *uaddr == val, block until woken.
+            // FUTEX_WAIT: if *uaddr == val, block until woken.  The value
+            // check happens inside futex_wait under the FUTEX_TABLE lock —
+            // checking it out here would reopen the SMP lost-wake-up window
+            // (another CPU could change the value and issue FUTEX_WAKE
+            // between an early check and the waiter registration).
             if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
-            let current = unsafe { core::ptr::read(uaddr as *const u32) };
-            if current != val as u32 { return -11; } // EAGAIN — value changed
-            sched::futex_wait(uaddr, timeout_ptr)
+            sched::futex_wait(uaddr, val as u32, timeout_ptr)
         }
         1 => {
             // FUTEX_WAKE: wake up to `val` tasks sleeping on `uaddr`.
@@ -2191,9 +2195,14 @@ fn read_input_byte() -> Option<u8> {
             }
             // Continue loop to skip EV_SYN or other events.
         } else {
-            // Fallback: poll serial UART directly if no evdev events are pending.
-            // This ensures input works on AArch64 serial console even if IRQs are missed.
-            return crate::serial_read_byte();
+            // No events pending — report "no data yet" and let the caller
+            // yield-loop.  Do NOT read the UART FIFO directly here: on SMP
+            // this task may run on any CPU while CPU 0's timer tick drains
+            // the same FIFO into evdev, and two concurrent consumers reorder
+            // the byte stream (typing "ls" arrives as "sl").  CPU 0 polls the
+            // UART every 10 ms tick, so all input flows through evdev in
+            // order with at most one tick of latency.
+            return None;
         }
     }
 }
@@ -3776,13 +3785,12 @@ fn sys_clone_or_fork(
     } else {
         let _ = (child_stack, _ptid, tls, ctid);
         let parent_pid = current_pid();
-        let ret = fork_current(frame_ptr);
-        if ret > 0 {
-            // ret is child PID — duplicate FD table for child.
+        // Duplicate the fd table before the child becomes runnable (see the
+        // FORK arm of syscall_dispatch for the SMP race this prevents).
+        fork_current(frame_ptr, |child_pid| {
             let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
-                                   &[parent_pid as u64, ret as u64]);
+                                   &[parent_pid as u64, child_pid as u64]);
             let _ = vfs::handle(&msg, parent_pid);
-        }
-        ret
+        })
     }
 }

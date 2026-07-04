@@ -5,11 +5,23 @@
 //! FUTEX_PRIVATE (process-private) futexes.  Shared futexes (across processes)
 //! would require a physical-address key and are deferred to a later phase.
 //!
-//! Race-freedom: the scheduler is cooperative; no preemption occurs between
-//! the caller's value-check (in sys_futex) and the context switch here, so
-//! FUTEX_WAIT is race-free without additional locking.
+//! # SMP race-freedom
+//!
+//! On SMP the classic lost-wake-up race is: CPU A reads `*uaddr == val`,
+//! decides to sleep; CPU B changes the value and calls `futex_wake` before A
+//! registers itself; A then blocks forever.  We close it by serializing on
+//! the `FUTEX_TABLE` lock:
+//!
+//!  * `futex_wait` re-reads the user value, registers the waiter, **and**
+//!    marks the task Blocked all inside one `FUTEX_TABLE` critical section.
+//!  * `futex_wake` collects and wakes waiters while holding `FUTEX_TABLE`.
+//!
+//! A waker's value-store happens before its `futex_wake` lock acquisition, so
+//! either the waiter sees the new value (returns `EAGAIN`), or the waker sees
+//! the registered waiter (wakes it).  Lock order is always
+//! `FUTEX_TABLE → RUN_QUEUE`.
 
-use super::{CURRENT_PID, CURRENT_CTX, SCHEDULER_CTX, RUN_QUEUE, cpu_id, arch_set_page_table};
+use super::{CURRENT_CTX, SCHEDULER_CTX, RUN_QUEUE, cpu_id, current_pid, arch_set_page_table};
 use super::context;
 use super::task::TaskState;
 use spin::Mutex;
@@ -27,37 +39,52 @@ static FUTEX_TABLE: Mutex<[Option<FutexWaiter>; MAX_FUTEX_WAITERS]> =
 
 /// Block the current task on `uaddr` until a `futex_wake` targets it.
 ///
-/// Returns 0 on normal wake-up.  Signal delivery will also unblock the task
-/// (via `deliver_signal`'s Blocked → Ready transition); in that case the
+/// `expected` is validated against `*uaddr` under the `FUTEX_TABLE` lock; if
+/// the value already changed, returns `-EAGAIN` (-11) without blocking.
+/// The caller must have validated that `uaddr` is a mapped, aligned user
+/// address (the read below must not fault: kernel-mode page faults are fatal).
+///
+/// Returns 0 on wake-up.  Signal delivery also unblocks the task (via
+/// `deliver_signal`'s Blocked → Ready transition); in that case the
 /// FUTEX_TABLE entry is cleaned up here so no stale waiter remains.
-pub fn futex_wait(uaddr: usize, _timeout_ptr: usize) -> isize {
+pub fn futex_wait(uaddr: usize, expected: u32, _timeout_ptr: usize) -> isize {
     unsafe {
         let id  = cpu_id();
-        let pid = CURRENT_PID[id];
+        let pid = current_pid();
 
-        // 1. Register in table BEFORE marking Blocked so futex_wake can find us.
+        // 1. Under the FUTEX_TABLE lock: re-check the value, register the
+        //    waiter, and mark the task Blocked.  All three must be one
+        //    atomic step relative to futex_wake (see module docs).
         {
             let mut tbl = FUTEX_TABLE.lock();
+
+            let current = core::ptr::read_volatile(uaddr as *const u32);
+            if current != expected {
+                return -11; // EAGAIN — value changed before we could sleep
+            }
+
+            let mut registered = false;
             for slot in tbl.iter_mut() {
                 if slot.is_none() {
                     *slot = Some(FutexWaiter { pid, uaddr });
+                    registered = true;
                     break;
                 }
             }
-        }
+            if !registered {
+                return -11; // table full — let the caller retry
+            }
 
-        // 2. Mark Blocked.
-        {
             let mut rq = RUN_QUEUE.lock();
-            if let Some(idx) = rq.find_pid_idx(pid) {
-                if let Some(t) = rq.get_mut(idx) {
-                    t.state         = TaskState::Blocked;
-                    t.blocked_futex = uaddr;
-                }
+            if let Some(t) = rq.find_pid_mut(pid) {
+                t.state         = TaskState::Blocked;
+                t.blocked_futex = uaddr;
             }
         }
 
-        // 3. Yield to scheduler.
+        // 2. Yield to scheduler.  A wake racing with this switch only makes
+        //    the task Ready again; the scheduler's on_cpu claim keeps other
+        //    CPUs from dispatching it until our registers are fully saved.
         let ctx = CURRENT_CTX[id];
         if !ctx.is_null() {
             // Switch back to kernel page table and then to scheduler
@@ -65,7 +92,7 @@ pub fn futex_wait(uaddr: usize, _timeout_ptr: usize) -> isize {
             context::cpu_switch_to(ctx, core::ptr::addr_of!(SCHEDULER_CTX[id]));
         }
 
-        // 4. Woken (by futex_wake or by signal delivery).  Either way, ensure
+        // 3. Woken (by futex_wake or by signal delivery).  Either way, ensure
         //    our FUTEX_TABLE slot is freed and blocked_futex is cleared.
         {
             let mut tbl = FUTEX_TABLE.lock();
@@ -77,10 +104,8 @@ pub fn futex_wait(uaddr: usize, _timeout_ptr: usize) -> isize {
         }
         {
             let mut rq = RUN_QUEUE.lock();
-            if let Some(idx) = rq.find_pid_idx(pid) {
-                if let Some(t) = rq.get_mut(idx) {
-                    t.blocked_futex = 0;
-                }
+            if let Some(t) = rq.find_pid_mut(pid) {
+                t.blocked_futex = 0;
             }
         }
     }
@@ -92,39 +117,34 @@ pub fn futex_wait(uaddr: usize, _timeout_ptr: usize) -> isize {
 ///
 /// Pass `n = u32::MAX` to wake all waiters (used by `clear_child_tid`).
 pub fn futex_wake(uaddr: usize, n: u32) -> u32 {
-    // Collect PIDs under FUTEX_TABLE lock, then wake under RUN_QUEUE lock.
-    let mut pids  = [0u32; 32];
-    let mut count = 0usize;
+    let mut woken = 0u32;
 
+    // Hold FUTEX_TABLE across collection AND wake-up so this serializes
+    // completely against futex_wait's register-and-block step.
     {
         let mut tbl = FUTEX_TABLE.lock();
+        let mut rq  = RUN_QUEUE.lock();
+        let min_vr  = rq.min_vruntime();
+
         for slot in tbl.iter_mut() {
-            if count as u32 >= n { break; }
-            if let Some(w) = *slot {
-                if w.uaddr == uaddr && count < pids.len() {
-                    pids[count] = w.pid;
-                    count += 1;
-                    *slot = None;
+            if woken >= n { break; }
+            let Some(w) = *slot else { continue };
+            if w.uaddr != uaddr { continue; }
+
+            if let Some(t) = rq.find_pid_mut(w.pid) {
+                if t.state == TaskState::Blocked {
+                    t.state         = TaskState::Ready;
+                    t.blocked_futex = 0;
+                    t.place(min_vr);
+                    woken += 1;
                 }
             }
+            *slot = None;
         }
     }
 
-    let mut woken = 0u32;
-    {
-        let mut rq = RUN_QUEUE.lock();
-        for &pid in &pids[..count] {
-            if let Some(idx) = rq.find_pid_idx(pid) {
-                if let Some(t) = rq.get_mut(idx) {
-                    if t.state == TaskState::Blocked {
-                        t.state         = TaskState::Ready;
-                        t.blocked_futex = 0;
-                        woken += 1;
-                    }
-                }
-            }
-        }
+    if woken > 0 {
+        super::wake_up_an_idle_cpu();
     }
-
     woken
 }

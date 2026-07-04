@@ -15,6 +15,40 @@ pub enum TaskState {
     Zombie,
 }
 
+// ── EEVDF scheduling parameters ──────────────────────────────────────────────
+//
+// The run queue picks tasks with an Earliest-Eligible-Virtual-Deadline-First
+// policy (see runqueue.rs).  Each task carries a `weight` derived from its
+// nice value (`priority`), a `vruntime` that advances by
+// `ticks × NICE0_WEIGHT / weight` while it runs, and a `vdeadline` renewed to
+// `vruntime + BASE_SLICE_TICKS × NICE0_WEIGHT / weight` whenever it expires.
+
+/// Weight of a nice-0 task; vruntime is scaled so a nice-0 task accrues one
+/// unit of virtual time per timer tick.
+pub const NICE0_WEIGHT: u64 = 1024;
+
+/// Nominal slice, in 100 Hz timer ticks, granted per deadline period.
+pub const BASE_SLICE_TICKS: u64 = 4;
+
+/// Linux's `sched_prio_to_weight[]` — index by `nice + 20`.  Each step of one
+/// nice level changes the CPU share by ~1.25×.
+const NICE_TO_WEIGHT: [u32; 40] = [
+    88761, 71755, 56483, 46273, 36291,
+    29154, 23254, 18705, 14949, 11916,
+     9548,  7620,  6100,  4904,  3906,
+     3121,  2501,  1991,  1586,  1277,
+     1024,   820,   655,   526,   423,
+      335,   272,   215,   172,   137,
+      110,    87,    70,    56,    45,
+       36,    29,    23,    18,    15,
+];
+
+/// Map a nice value (clamped to −20..19) to a load weight.
+pub fn nice_to_weight(nice: i8) -> u32 {
+    let idx = (nice.clamp(-20, 19) + 20) as usize;
+    NICE_TO_WEIGHT[idx]
+}
+
 /// Per-signal disposition. `sys_sigaction` (`sched/src/signal.rs`) reads/
 /// writes this directly via `core::ptr::read`/`write` against whatever the
 /// caller passed as `struct sigaction*`, so the field order here must match
@@ -42,6 +76,20 @@ pub struct Task {
     pub pid:          Pid,
     pub state:        TaskState,
     pub priority:     i8,
+    /// CPU currently executing this task (`None` = not on any CPU).
+    ///
+    /// SMP guard: `pick_next` skips tasks with `on_cpu.is_some()` so a task
+    /// whose registers are still being saved on one core can never be picked
+    /// up by another.  Set by the scheduler when dispatching; cleared in the
+    /// scheduler context after `cpu_switch_to` returns.
+    pub on_cpu:       Option<usize>,
+    /// EEVDF load weight, derived from `priority` via [`nice_to_weight`].
+    pub weight:       u32,
+    /// EEVDF weighted virtual runtime (NICE0-tick units).
+    pub vruntime:     u64,
+    /// EEVDF virtual deadline; the runnable, eligible task with the earliest
+    /// deadline is picked next.
+    pub vdeadline:    u64,
     /// Saved CPU register state.
     pub ctx:          CpuContext,
     /// Root page table physical address (0 = use kernel tables).
@@ -113,6 +161,35 @@ pub struct Task {
 }
 
 impl Task {
+    /// Virtual-time length of one slice for a task of `weight`.
+    pub fn slice_vt(weight: u32) -> u64 {
+        (BASE_SLICE_TICKS * NICE0_WEIGHT / weight as u64).max(1)
+    }
+
+    /// Charge `delta_ticks` of CPU time against this task's virtual runtime
+    /// and renew the virtual deadline once it is used up.
+    ///
+    /// A minimum of one virtual-time unit is charged per dispatch so that
+    /// tasks yielding faster than the timer tick still make forward progress
+    /// in virtual time and cannot starve CPU-bound tasks.
+    pub fn charge_vruntime(&mut self, delta_ticks: u64) {
+        let charged = (delta_ticks * NICE0_WEIGHT / self.weight as u64).max(1);
+        self.vruntime += charged;
+        if self.vruntime >= self.vdeadline {
+            self.vdeadline = self.vruntime + Self::slice_vt(self.weight);
+        }
+    }
+
+    /// (Re-)place this task among the runnable set: clamp `vruntime` to the
+    /// queue's minimum so a long sleep doesn't turn into a burst of unfair
+    /// CPU time on wake-up (EEVDF lag limiting), and grant a fresh deadline.
+    pub fn place(&mut self, min_vruntime: u64) {
+        if self.vruntime < min_vruntime {
+            self.vruntime = min_vruntime;
+        }
+        self.vdeadline = self.vruntime + Self::slice_vt(self.weight);
+    }
+
     /// Create a kernel-mode task that starts at `entry`.
     pub fn new_kernel(
         pid:        Pid,
@@ -130,6 +207,10 @@ impl Task {
             pid,
             state: TaskState::Ready,
             priority: 0,
+            on_cpu: None,
+            weight: nice_to_weight(0),
+            vruntime: 0,
+            vdeadline: 0,
             ctx: if entry == 0 {
                 CpuContext::zeroed()
             } else {
@@ -288,6 +369,18 @@ impl Task {
 
         let priority_ptr = (dest as usize + core::mem::offset_of!(Task, priority)) as *mut i8;
         core::ptr::write_volatile(priority_ptr, 0);
+
+        let on_cpu_ptr = (dest as usize + core::mem::offset_of!(Task, on_cpu)) as *mut Option<usize>;
+        core::ptr::write_volatile(on_cpu_ptr, None);
+
+        let weight_ptr = (dest as usize + core::mem::offset_of!(Task, weight)) as *mut u32;
+        core::ptr::write_volatile(weight_ptr, nice_to_weight(0));
+
+        let vruntime_ptr = (dest as usize + core::mem::offset_of!(Task, vruntime)) as *mut u64;
+        core::ptr::write_volatile(vruntime_ptr, 0);
+
+        let vdeadline_ptr = (dest as usize + core::mem::offset_of!(Task, vdeadline)) as *mut u64;
+        core::ptr::write_volatile(vdeadline_ptr, 0);
 
         // Create the CPU context
         let ctx_msg = b"Task::new_kernel_inplace: creating CpuContext\r\n";
@@ -448,6 +541,10 @@ impl Task {
             pid,
             state: TaskState::Ready,
             priority: 0,
+            on_cpu: None,
+            weight: nice_to_weight(0),
+            vruntime: 0,
+            vdeadline: 0,
             ctx: crate::context::CpuContext::new_user_task_with_pt(user_entry, user_sp, kernel_stack_virt + kernel_stack_size, page_table),
             page_table,
 

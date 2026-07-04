@@ -55,21 +55,27 @@ pub fn init() {
 
 /// Called from the IRQ handler when PPI #27 fires (Virtual Timer).
 ///
-/// Reloads the countdown register and increments the tick counter.
+/// Reloads the (banked, per-CPU) countdown register.  Global timekeeping and
+/// device polling are BSP-only so wall-clock ticks don't advance N× faster
+/// with N CPUs and the single UART/virtio queues have a single consumer.
 pub fn on_tick() {
     unsafe {
         core::arch::asm!("msr cntv_tval_el0, {}", in(reg) interval(),
                          options(nomem, nostack));
     }
-    let _count = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    // Poll VirtIO Keyboard
-    drivers::virtio_keyboard::poll_events();
+    let cpu = unsafe { super::smp::arch_cpu_id() };
+    if cpu == 0 {
+        let _count = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    // Poll UART for keyboard input and push to evdev.
-    while let Some(b) = unsafe { super::uart::getc() } {
-        evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2); // 2 = typematic/serial
-        evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
+        // Poll VirtIO Keyboard
+        drivers::virtio_keyboard::poll_events();
+
+        // Poll UART for keyboard input and push to evdev.
+        while let Some(b) = unsafe { super::uart::getc() } {
+            evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2); // 2 = typematic/serial
+            evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
+        }
     }
 
     sched::timer_tick_irq();
