@@ -466,7 +466,14 @@ impl ProcFdTable {
     }
 
     fn alloc_fd(&mut self) -> Option<usize> {
-        self.fds.iter().position(|f| !f.in_use)
+        // Never hand out fds 0-2: the kernel's sys_read/sys_write fast paths
+        // hardwire them to the serial console before consulting the VFS, so a
+        // vnode on those numbers would be shadowed (a pipe write end on fd 1
+        // writes to the UART, its data never reaches the ring). Processes
+        // whose table is created fresh (no inherited entries) would otherwise
+        // get exactly that from their first pipe()/open().
+        self.fds.iter().enumerate().skip(3)
+            .find(|(_, f)| !f.in_use).map(|(i, _)| i)
     }
 }
 
@@ -1928,7 +1935,7 @@ fn handle_alloc_fd(pid: u32, oldfd: usize) -> Message {
     if !tbl.fds[oldfd].in_use { return err_reply(-9); }
     // Find an unused fd > oldfd (POSIX dup() picks lowest available).
     let newfd = match tbl.fds.iter().enumerate()
-                    .find(|(i, f)| *i != oldfd && !f.in_use)
+                    .find(|(i, f)| *i >= 3 && *i != oldfd && !f.in_use)
                     .map(|(i, _)| i) {
         Some(f) => f, None => return err_reply(-24) // EMFILE
     };
@@ -2280,7 +2287,7 @@ fn handle_eventfd(pid: u32, initval: u64) -> Message {
     let tbl = match get_or_create(pid, &mut *tbls) {
         Some(t) => t, None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; return err_reply(-24); }
     };
-    let fd = match tbl.fds.iter().position(|e| !e.in_use) {
+    let fd = match tbl.alloc_fd() {
         Some(f) => f, None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; return err_reply(-24); }
     };
     tbl.fds[fd] = FdEntry { kind: VnodeKind::EventFd { slot }, flags: 0, in_use: true };
@@ -2299,7 +2306,7 @@ fn handle_timerfd_create(pid: u32) -> Message {
     let tbl = match get_or_create(pid, &mut *tbls) {
         Some(t) => t, None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); return err_reply(-24); }
     };
-    let fd = match tbl.fds.iter().position(|e| !e.in_use) {
+    let fd = match tbl.alloc_fd() {
         Some(f) => f, None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); return err_reply(-24); }
     };
     tbl.fds[fd] = FdEntry { kind: VnodeKind::TimerFd { slot }, flags: 0, in_use: true };
