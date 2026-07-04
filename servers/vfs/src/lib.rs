@@ -350,11 +350,22 @@ fn pipe_ref_inc(kind: &VnodeKind) {
 
 /// Drop one reference to a pipe endpoint (a close, or a dup2 that overwrites an
 /// already-open fd). Saturating so a stray double-close can never underflow.
+/// When the last endpoint on BOTH sides is gone, reset the ring: the allocator
+/// in handle_pipe only reuses slots with `count == 0`, so a pipe abandoned with
+/// unread data would otherwise leak its slot for the lifetime of the system.
+fn pipe_drop_ref(rings: &mut [PipeRing; MAX_PIPES], ring: usize, is_write: bool) {
+    if is_write { rings[ring].writers = rings[ring].writers.saturating_sub(1); }
+    else        { rings[ring].readers = rings[ring].readers.saturating_sub(1); }
+    if rings[ring].readers == 0 && rings[ring].writers == 0 {
+        rings[ring].read_pos  = 0;
+        rings[ring].write_pos = 0;
+        rings[ring].count     = 0;
+    }
+}
+
 fn pipe_ref_dec(kind: &VnodeKind) {
     if let VnodeKind::Pipe { ring, is_write } = kind {
-        let mut rings = PIPE_RINGS.lock();
-        if *is_write { rings[*ring].writers = rings[*ring].writers.saturating_sub(1); }
-        else         { rings[*ring].readers = rings[*ring].readers.saturating_sub(1); }
+        pipe_drop_ref(&mut PIPE_RINGS.lock(), *ring, *is_write);
     }
 }
 
@@ -1452,9 +1463,7 @@ fn handle_close(pid: u32, fd: usize) -> Message {
 
     match kind {
         VnodeKind::Pipe { ring, is_write } => {
-            let mut rings = PIPE_RINGS.lock();
-            if is_write { rings[ring].writers = rings[ring].writers.saturating_sub(1); }
-            else        { rings[ring].readers = rings[ring].readers.saturating_sub(1); }
+            pipe_drop_ref(&mut PIPE_RINGS.lock(), ring, is_write);
         }
         VnodeKind::EventFd { slot } => {
             EVENTFD_COUNTERS.lock()[slot] = u64::MAX;
@@ -1643,9 +1652,7 @@ fn handle_close_all(pid: u32) -> Message {
             if let Some(key) = lock_key_of(&kind) { release_locks(key, pid); }
             match kind {
                 VnodeKind::Pipe { ring, is_write } => {
-                    let mut rings = PIPE_RINGS.lock();
-                    if is_write { rings[ring].writers = rings[ring].writers.saturating_sub(1); }
-                    else        { rings[ring].readers = rings[ring].readers.saturating_sub(1); }
+                    pipe_drop_ref(&mut PIPE_RINGS.lock(), ring, is_write);
                 }
                 VnodeKind::EventFd { slot } => {
                     EVENTFD_COUNTERS.lock()[slot] = u64::MAX;
