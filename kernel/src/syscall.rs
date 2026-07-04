@@ -2618,6 +2618,11 @@ fn sys_openat(_dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isiz
 
 fn sys_close(fd: usize) -> isize {
     let pid = current_pid();
+    // Epoll fds sit above the socket range, so this check must come before
+    // the `>= SOCK_FD_BASE` net-server routing or they never get freed.
+    if fd >= EPOLL_FD_BASE && fd < EPOLL_FD_BASE + MAX_EPOLL_INSTANCES {
+        return sys_epoll_close(fd);
+    }
     // Route socket fds (≥ SOCK_FD_BASE) to the net server.
     if fd >= net_server::SOCK_FD_BASE {
         let msg = make_vfs_msg(net_server::NET_CLOSE, &[fd as u64]);
@@ -3023,6 +3028,7 @@ fn vfs_close_all_current() {
     let nmsg = make_vfs_msg(net_server::NET_CLOSE_ALL, &[pid as u64]);
     let _ = net_server::handle(&nmsg, pid);
     tty_server::close_all(pid);
+    epoll_close_all(pid);
 }
 
 /// sys_ioctl — try VFS first (FIONREAD on pipes/files), then TTY server.
@@ -3299,6 +3305,26 @@ const EPOLL_EVENT_DATA_OFF: usize = 8;
 
 static EPOLL_INSTANCES: spin::Mutex<[EpollInstance; MAX_EPOLL_INSTANCES]> =
     spin::Mutex::new([const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES]);
+
+/// Close an epoll fd: release its instance slot (and all interests with it).
+fn sys_epoll_close(epfd: usize) -> isize {
+    let slot = epfd - EPOLL_FD_BASE;
+    let pid = current_pid();
+    let mut ep = EPOLL_INSTANCES.lock();
+    if !ep[slot].in_use || ep[slot].owner_pid != pid { return -9; } // EBADF
+    ep[slot] = EpollInstance::empty();
+    0
+}
+
+/// Free every epoll instance owned by `pid`. Called on process exit so a
+/// process that dies without closing its epoll fds can't leak instance slots
+/// (there are only MAX_EPOLL_INSTANCES of them for the whole system).
+fn epoll_close_all(pid: u32) {
+    let mut ep = EPOLL_INSTANCES.lock();
+    for inst in ep.iter_mut() {
+        if inst.in_use && inst.owner_pid == pid { *inst = EpollInstance::empty(); }
+    }
+}
 
 fn sys_epoll_create1(_flags: usize) -> isize {
     let pid = current_pid();
