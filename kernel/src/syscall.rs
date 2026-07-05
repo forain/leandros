@@ -836,7 +836,23 @@ fn dispatch_inner(
         // ── Misc ──────────────────────────────────────────────────────────────
         UNAME      => sys_uname(a0),
         PRLIMIT64  => sys_prlimit64(a0, a1, a2, a3),
-        EXIT_GROUP => { vfs_close_all_current(); exit(a0 as i32) }
+        EXIT_GROUP => {
+            // Linux exit_group(2) kills every thread in the calling process,
+            // not just the caller. Do that for real before tearing down the
+            // shared address space (owned by the thread-group leader's
+            // Task) — otherwise a sibling still mid-flight on another CPU
+            // (e.g. a std::thread worker that outlives main()) faults into
+            // page tables that vanished under it. See sched::kill_next_group_member.
+            loop {
+                match sched::kill_next_group_member(a0 as i32) {
+                    sched::GroupKillStep::Done => break,
+                    sched::GroupKillStep::Reaped(pid) => vfs_close_all_for(pid),
+                    sched::GroupKillStep::Kicking => core::hint::spin_loop(),
+                }
+            }
+            vfs_close_all_current();
+            exit(a0 as i32)
+        }
 
         // ── File advise / range operations (advisory — safe to no-op) ────────
         POSIX_FADVISE | SYNC_FILE_RANGE | READAHEAD => 0,
@@ -2674,7 +2690,7 @@ fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
 #[cfg(not(target_arch = "aarch64"))]
 fn sys_stat_at_path(path_ptr: usize, statbuf_ptr: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
-    if !validate_user_buf(statbuf_ptr, 144) { return -14; }
+    if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
     let pid = current_pid();
     let omsg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, 0u64, 0]);
     let fd = vfs_reply_val(&vfs::handle(&omsg, pid));
@@ -2749,15 +2765,30 @@ fn sys_close(fd: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
+/// Real Linux `struct stat` size: 144 bytes on x86-64, but only 128 on
+/// AArch64 (the generic `asm-generic/stat.h` layout musl/glibc use there
+/// packs `st_mode`/`st_nlink`/`st_uid`/`st_gid` into half the space and
+/// drops a padding word). Getting this wrong isn't just an ABI nit — the
+/// caller's buffer (typically a `struct stat` local) is only ever as big
+/// as its *own* platform's definition, so zero-filling/validating 144
+/// bytes on aarch64 overruns it by 16 bytes and corrupts whatever the
+/// compiler placed right after it on the stack (often the caller's saved
+/// FP/LR — see the crash this fixes: a `bottom` worker thread executing a
+/// stat-heavy /proc scan took an instruction-fetch fault at PC 0 because
+/// `ret` popped a zeroed LR that this overrun had stomped).
+#[cfg(target_arch = "x86_64")]
+const STAT_SIZE: usize = 144;
+#[cfg(target_arch = "aarch64")]
+const STAT_SIZE: usize = 128;
+
 /// sys_fstat(fd, statbuf_ptr) — fill struct stat for an open fd.
 ///
 /// Populates `st_size` (offset 48) by seeking to EOF and back.
 /// `st_mode` is set to S_IFREG|0644 (0x81A4) for regular files, or
 /// S_IFCHR|0666 (0x21B6) for character devices (fd 0/1/2 / /dev/*).
 fn sys_fstat(fd: usize, statbuf_ptr: usize) -> isize {
-    // struct stat is 144 bytes on Linux AArch64 / x86-64.
-    if !validate_user_buf(statbuf_ptr, 144) { return -14; }
-    unsafe { core::ptr::write_bytes(statbuf_ptr as *mut u8, 0, 144); }
+    if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
+    unsafe { core::ptr::write_bytes(statbuf_ptr as *mut u8, 0, STAT_SIZE); }
 
     #[cfg(target_arch = "x86_64")]
     const ST_MODE_OFF: usize = 24;
@@ -2791,8 +2822,15 @@ fn sys_fstat(fd: usize, statbuf_ptr: usize) -> isize {
     // st_size at offset 48.
     if size >= 0 {
         unsafe { core::ptr::write((statbuf_ptr + 48) as *mut i64, size as i64); }
-        // st_blksize at offset 56 = 512 (standard block size)
+        // st_blksize = 512 (standard block size): a `long` at offset 56 on
+        // x86-64, but only an `int` at offset 56 on AArch64 (followed by a
+        // 4-byte pad word) — an 8-byte write there would spill into that
+        // pad, which happens to be harmless (never read), but write the
+        // ABI-correct width anyway rather than relying on that.
+        #[cfg(target_arch = "x86_64")]
         unsafe { core::ptr::write((statbuf_ptr + 56) as *mut i64, 512i64); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::ptr::write((statbuf_ptr + 56) as *mut i32, 512i32); }
         // st_blocks at offset 64 = ceil(size/512)
         let blocks = ((size as i64) + 511) / 512;
         unsafe { core::ptr::write((statbuf_ptr + 64) as *mut i64, blocks); }
@@ -2909,12 +2947,12 @@ fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
 }
 
 fn sys_newfstatat(_dirfd: usize, path_ptr: usize, statbuf_ptr: usize, _flags: usize) -> isize {
-    if !validate_user_buf(path_ptr, 1)      { return -14; }
-    if !validate_user_buf(statbuf_ptr, 144) { return -14; }
+    if !validate_user_buf(path_ptr, 1)          { return -14; }
+    if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
     let pid = current_pid();
     // Check for directory first (no fd needed).
     if vfs::is_directory(path_ptr) {
-        unsafe { core::ptr::write_bytes(statbuf_ptr as *mut u8, 0, 144); }
+        unsafe { core::ptr::write_bytes(statbuf_ptr as *mut u8, 0, STAT_SIZE); }
         #[cfg(target_arch = "x86_64")]
         const ST_MODE_OFF: usize = 24;
         #[cfg(target_arch = "aarch64")]
@@ -3255,7 +3293,16 @@ fn read_cstr_for_vfs(path: &[u8]) -> Option<([u8; 256], usize)> {
 
 /// Close all FDs for the current process in VFS (called on exit).
 fn vfs_close_all_current() {
-    let pid = current_pid();
+    vfs_close_all_for(current_pid());
+}
+
+/// Close all FDs, sockets, TTY handles and epoll instances owned by `pid`.
+///
+/// Split out from `vfs_close_all_current` so `exit_group`'s forced-kill loop
+/// (`EXIT_GROUP` below) can release a *sibling* thread's resources too — that
+/// thread never gets to run its own `EXIT` syscall, since it's being killed
+/// out from under it.
+fn vfs_close_all_for(pid: u32) {
     let msg = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[pid as u64]);
     let _ = vfs::handle(&msg, pid);
     // Also close net sockets and TTY fds.

@@ -860,6 +860,98 @@ pub fn exit(code: i32) -> ! {
     loop { core::hint::spin_loop(); }
 }
 
+/// Outcome of one `kill_next_group_member` step.
+pub enum GroupKillStep {
+    /// No other thread-group member remains — only the caller is left.
+    Done,
+    /// `pid` was off-CPU and has been fully reaped (removed from the run
+    /// queue, kernel stack freed, exit hook run). The caller should still
+    /// release any kernel-side resources it owns that the reap hook doesn't
+    /// know about (e.g. VFS fds — see `vfs_close_all_for` in syscall.rs).
+    Reaped(Pid),
+    /// A member is mid-flight on another CPU — it has been marked to die
+    /// and that CPU kicked with a reschedule IPI. Call again after a short
+    /// spin; its own dispatch loop will reap it once it stops running.
+    Kicking,
+}
+
+/// Terminate one other member of the calling task's thread group.
+///
+/// Linux's `exit_group(2)` kills every thread in the process, not just the
+/// caller. Before this existed, `EXIT_GROUP` only called [`exit`] for the
+/// calling task, so e.g. a Rust `std::thread` worker that outlived `main()`
+/// (a common pattern — `bottom`'s data-collection threads do exactly this)
+/// kept running after the thread-group leader was reaped. The leader owns
+/// the shared `AddressSpace` (see `Task::address_space`); reaping it drops
+/// the page tables out from under any sibling still mid-execution on
+/// another CPU, which then takes an instruction-fetch page fault that
+/// `handle_page_fault` can't service — its `tgid` lookup fails because the
+/// leader is already gone (`lock_leader_address_space` returns `None`,
+/// logged as "no address space for faulting task").
+///
+/// Call this in a loop (see `EXIT_GROUP` in `kernel/src/syscall.rs`) until
+/// it returns `Done`, *then* call `exit` for the caller — that ordering
+/// guarantees every sibling has actually stopped running (not merely been
+/// asked to) before the leader's `AddressSpace` can be dropped.
+pub fn kill_next_group_member(exit_code: i32) -> GroupKillStep {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    let tgid = match rq.find_pid(pid) {
+        Some(t) => t.tgid,
+        None => return GroupKillStep::Done,
+    };
+
+    let mut target: Option<usize> = None;
+    for i in 0..runqueue::MAX_TASKS {
+        if let Some(t) = rq.get(i) {
+            if t.tgid == tgid && t.pid != pid {
+                target = Some(i);
+                break;
+            }
+        }
+    }
+    let idx = match target {
+        Some(i) => i,
+        None => return GroupKillStep::Done,
+    };
+
+    let (tpid, on_cpu) = {
+        let t = rq.get_mut(idx).unwrap();
+        t.state = TaskState::Zombie;
+        t.exit_code = exit_code;
+        (t.pid, t.on_cpu)
+    };
+
+    if let Some(cpu) = on_cpu {
+        // Still running on another core — cannot touch its kernel stack or
+        // the shared address space yet. Its own dispatch loop reaps it
+        // (scheduler_run_loop's post-`cpu_switch_to` check) the moment it
+        // actually stops, which the resched IPI hastens.
+        drop(rq);
+        trigger_preempt(cpu);
+        return GroupKillStep::Kicking;
+    }
+
+    // Ready/Blocked and not on any CPU: nothing is executing its code, so
+    // it's safe to reap right now — mirrors scheduler_run_loop's own
+    // post-dispatch reap exactly (log, remove, hook, free kernel stack).
+    log_exit(tpid, exit_code);
+    let reaped = rq.remove(idx);
+    drop(rq);
+
+    futex::remove_waiter(tpid);
+
+    if let Some(t) = reaped {
+        let hook_ptr = TASK_EXIT_HOOK.load(Ordering::Acquire);
+        if !hook_ptr.is_null() {
+            let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
+            hook(t.pid);
+        }
+        mm::buddy::free(t.kernel_stack, 4);
+    }
+    GroupKillStep::Reaped(tpid)
+}
+
 pub fn set_clear_child_tid(tidptr: usize) {
     let pid = current_pid();
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {

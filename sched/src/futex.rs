@@ -149,6 +149,21 @@ pub fn futex_wake(uaddr: usize, n: u32) -> u32 {
     woken
 }
 
+/// Drop any pending wait registration for `pid` without waking it.
+///
+/// Used when a thread is force-killed while `Blocked` in `futex_wait` (e.g.
+/// a sibling reaped by `exit_group`'s group-kill loop, see
+/// `kill_next_group_member` in lib.rs) — its `FUTEX_TABLE` slot would
+/// otherwise linger forever since it will never reach the wake path itself.
+pub fn remove_waiter(pid: u32) {
+    let mut tbl = FUTEX_TABLE.lock();
+    for slot in tbl.iter_mut() {
+        if slot.map(|w| w.pid) == Some(pid) {
+            *slot = None;
+        }
+    }
+}
+
 /// Requeue waiters from `uaddr` to `uaddr2`.
 ///
 /// Wakes up to `val` waiters on `uaddr`, and moves up to `requeue_limit` remaining waiters to `uaddr2`.
