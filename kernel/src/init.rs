@@ -59,22 +59,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     drivers::virtio_net::init();
     net_server::init();
     sched::spawn(net_server::net_daemon, 0);
-    {
-        const MOUNT_POINTS: &[&str] = &["/mnt", "/data", "/home", "/var"];
-        let mut mp_idx = 0usize;
-        for dev in 0..drivers::virtio_blk::device_count() {
-            if drivers::virtio_blk::has_f2fs(dev) && mp_idx < MOUNT_POINTS.len() {
-                if let Some(_port) = f2fs_server::mount(dev, MOUNT_POINTS[mp_idx], 0) {
-                    serial_print_str("[INIT] F2FS dev ");
-                    crate::print_number(dev as u32);
-                    serial_print_str(" mounted at ");
-                    serial_print_str(MOUNT_POINTS[mp_idx]);
-                    serial_print_str("\n");
-                    mp_idx += 1;
-                }
-            }
-        }
-    }
+    // Block devices are initialized, but f2fs disk mounting is deferred to userspace init.
 
     // ── Userspace Init ───────────────────────────────────────────────────────
     // We attempt to load the 'init' server from the initrd.

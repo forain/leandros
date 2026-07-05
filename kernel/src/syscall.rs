@@ -318,6 +318,8 @@ mod nr {
     pub const SYNC_FILE_RANGE:     usize = 84;
     pub const READAHEAD:           usize = 213;
     pub const GETCPU:              usize = 168;
+    pub const MOUNT:               usize = 40;
+    pub const PIVOT_ROOT:          usize = 41;
 }
 
 // ── x86-64 Linux syscall numbers ──────────────────────────────────────────────
@@ -523,6 +525,8 @@ mod nr {
     pub const SYNC_FILE_RANGE:     usize = 277;
     pub const READAHEAD:           usize = 187;
     pub const GETCPU:              usize = 309;
+    pub const MOUNT:               usize = 165;
+    pub const PIVOT_ROOT:          usize = 155;
 }
 
 use nr::*;
@@ -722,6 +726,9 @@ fn dispatch_inner(
         LINK | SYMLINK | CHMOD | CHOWN | LCHOWN | MKNOD => -30,
         #[cfg(not(target_arch = "aarch64"))]
         ACCESS      => sys_faccessat(0, a0, a1, 0),
+
+        MOUNT       => sys_mount(a0, a1, a2, a3, a4),
+        PIVOT_ROOT  => sys_pivot_root(a0, a1),
 
         // ── Socket syscalls ───────────────────────────────────────────────────
         SOCKET      => sys_socket(a0, a1, a2),
@@ -1913,6 +1920,40 @@ static EXEC_ENVP: spin::Mutex<ExecStrBuf> = spin::Mutex::new(ExecStrBuf::new());
 ///   -38     ENOSYS  — not an ELF image (no VFS yet)
 ///   -8      ENOEXEC — ELF parse / load error
 ///   -12     ENOMEM  — OOM
+fn read_file_from_vfs(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    let mut path_c = alloc::string::String::from(path);
+    path_c.push('\0');
+    
+    let fd = sys_open(path_c.as_ptr() as usize, 0 /* O_RDONLY */, 0);
+    if fd < 0 {
+        return None;
+    }
+    let fd_usize = fd as usize;
+    
+    let size = sys_lseek(fd_usize, 0, 2 /* SEEK_END */);
+    if size < 0 {
+        let _ = sys_close(fd_usize);
+        return None;
+    }
+    let size_usize = size as usize;
+    
+    let _ = sys_lseek(fd_usize, 0, 0 /* SEEK_SET */);
+    
+    let mut buf = alloc::vec![0u8; size_usize];
+    let mut total_read = 0;
+    while total_read < size_usize {
+        let r = sys_read_impl(fd_usize, buf.as_mut_ptr().wrapping_add(total_read) as usize, size_usize - total_read, true);
+        if r <= 0 {
+            let _ = sys_close(fd_usize);
+            return None;
+        }
+        total_read += r as usize;
+    }
+    
+    let _ = sys_close(fd_usize);
+    Some(buf)
+}
+
 fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
 
@@ -1933,31 +1974,30 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let path = core::str::from_utf8(&abs_path_buf[..abs_len]).unwrap_or(path_str);
 
     // ── Resolve ELF bytes ─────────────────────────────────────────────────────
-    // 1. Try VFS lookup (RamFS) using the resolved absolute path
-    // We'll use the already read 'path' string to check RamFS.
-    // For now, we still use the helper if it's available.
-    let (elf_ptr, elf_len) = match vfs::get_file_data_by_path(path) {
-        Some((ptr, len)) => (ptr as usize, len),
-        None => {
-    // 2. Fallback to initrd lookup using the resolved absolute path
-    let (ptr, len) = unsafe {
-        let bi_ptr = BOOT_INFO_PTR.load(Ordering::SeqCst);
-        if bi_ptr != 0 {
-            let boot_info = &*(bi_ptr as *const boot::BootInfo);
-            match init::extract_binary_from_initrd(path, boot_info) {
-                        Some(data) => (data.as_ptr() as usize, data.len()),
-                        None => {
-                            serial_print_str("[EXEC] Failed to find binary in initrd: ");
-                            serial_print_str(path);
-                            serial_print_str("\n");
-                            return -2; // ENOENT
-                        }
-                    }
-                } else {
-                    return -2;
+    let vfs_elf_data = read_file_from_vfs(path);
+    
+    let (elf_ptr, elf_len) = if let Some(ref data) = vfs_elf_data {
+        (data.as_ptr() as usize, data.len())
+    } else if let Some((ptr, len)) = vfs::get_file_data_by_path(path) {
+        (ptr as usize, len)
+    } else {
+        let mut initrd_data = None;
+        unsafe {
+            let bi_ptr = BOOT_INFO_PTR.load(Ordering::SeqCst);
+            if bi_ptr != 0 {
+                let boot_info = &*(bi_ptr as *const boot::BootInfo);
+                if let Some(data) = init::extract_binary_from_initrd(path, boot_info) {
+                    initrd_data = Some((data.as_ptr() as usize, data.len()));
                 }
-            };
+            }
+        }
+        if let Some((ptr, len)) = initrd_data {
             (ptr, len)
+        } else {
+            serial_print_str("[EXEC] Failed to find binary in VFS, RamFS, or initrd: ");
+            serial_print_str(path);
+            serial_print_str("\n");
+            return -2; // ENOENT
         }
     };
 
@@ -2315,11 +2355,11 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
 ///
 /// fd 0 (stdin) blocks on serial UART until at least one byte arrives.
 /// All other fds route through VFS.
-fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
+fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> isize {
     match fd {
         0 => {
             if count == 0 { return 0; }
-            if !validate_user_buf(buf_ptr, count) { return -14; }
+            if !is_kernel && !validate_user_buf(buf_ptr, count) { return -14; }
             // Yield-loop until evdev has at least one key event.
             let first = loop {
                 match read_input_byte() {
@@ -2344,20 +2384,25 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
                     None    => break,
                 }
             }
-            let ok = with_current_address_space(|as_| {
-                as_.write_user_buf(buf_ptr, &kbuf[..n])
-            }).unwrap_or(false);
-            
-            if !ok { return -14; }
+            if is_kernel {
+                unsafe { core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf_ptr as *mut u8, n); }
+            } else {
+                let ok = with_current_address_space(|as_| {
+                    as_.write_user_buf(buf_ptr, &kbuf[..n])
+                }).unwrap_or(false);
+                if !ok { return -14; }
+            }
             
             n as isize
         }
         _ => {
-            if count != 0 && !validate_user_buf(buf_ptr, count) { return -14; }
-            // Demand-page any not-yet-faulted pages in the destination buffer
-            // so the VFS can copy directly without taking a kernel-mode fault.
-            if count != 0 {
-                with_current_address_space_mut(|as_| as_.prefault_range(buf_ptr, count));
+            if !is_kernel {
+                if count != 0 && !validate_user_buf(buf_ptr, count) { return -14; }
+                // Demand-page any not-yet-faulted pages in the destination buffer
+                // so the VFS can copy directly without taking a kernel-mode fault.
+                if count != 0 {
+                    with_current_address_space_mut(|as_| as_.prefault_range(buf_ptr, count));
+                }
             }
             let pid = current_pid();
             let msg = make_vfs_msg(vfs::VFS_READ, &[fd as u64, buf_ptr as u64, count as u64]);
@@ -2372,6 +2417,10 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
             }
         }
     }
+}
+
+fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
+    sys_read_impl(fd, buf_ptr, count, false)
 }
 
 /// sys_writev(fd, iov, iovcnt) — scatter-gather write.
@@ -2749,6 +2798,114 @@ fn sys_fstat(fd: usize, statbuf_ptr: usize) -> isize {
         unsafe { core::ptr::write((statbuf_ptr + 64) as *mut i64, blocks); }
     }
     0
+}
+
+fn sys_mount(
+    source_ptr: usize,
+    target_ptr: usize,
+    fstype_ptr: usize,
+    _flags: usize,
+    _data_ptr: usize,
+) -> isize {
+    let (source_raw, source_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(source_ptr as *const u8, 256) }) {
+        Some(p) => p,
+        None => return -14, // EFAULT
+    };
+    let source_str = match core::str::from_utf8(&source_raw[..source_len]) {
+        Ok(s) => s,
+        Err(_) => return -22, // EINVAL
+    };
+
+    let (target_raw, target_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(target_ptr as *const u8, 256) }) {
+        Some(p) => p,
+        None => return -14, // EFAULT
+    };
+    let target_str = match core::str::from_utf8(&target_raw[..target_len]) {
+        Ok(s) => s,
+        Err(_) => return -22, // EINVAL
+    };
+
+    let (fstype_raw, fstype_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(fstype_ptr as *const u8, 256) }) {
+        Some(p) => p,
+        None => return -14, // EFAULT
+    };
+    let fstype_str = match core::str::from_utf8(&fstype_raw[..fstype_len]) {
+        Ok(s) => s,
+        Err(_) => return -22, // EINVAL
+    };
+
+    if fstype_str != "f2fs" {
+        return -22; // EINVAL
+    }
+
+    let dev_idx = if source_str.starts_with("/dev/vd") && source_str.len() >= 8 {
+        let drive_char = source_str.as_bytes()[7];
+        if drive_char >= b'a' && drive_char <= b'z' {
+            (drive_char - b'a') as usize
+        } else {
+            return -6; // ENXIO
+        }
+    } else if let Ok(idx) = source_str.parse::<usize>() {
+        idx
+    } else {
+        return -22; // EINVAL
+    };
+
+    if dev_idx >= drivers::virtio_blk::device_count() {
+        return -6; // ENXIO
+    }
+
+    if !drivers::virtio_blk::has_f2fs(dev_idx) {
+        return -22; // EINVAL
+    }
+
+    let mount_point: &'static str = match target_str {
+        "/mnt" => "/mnt",
+        "/mnt/" => "/mnt",
+        "/data" => "/data",
+        "/home" => "/home",
+        "/var" => "/var",
+        _ => {
+            let s = alloc::string::String::from(target_str);
+            alloc::boxed::Box::leak(s.into_boxed_str())
+        }
+    };
+
+    if let Some(_port) = f2fs_server::mount(dev_idx, mount_point, current_pid()) {
+        0
+    } else {
+        -1
+    }
+}
+
+fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
+    let pid = current_pid();
+    let (new_raw, new_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(new_root_ptr as *const u8, 256) }) {
+        Some(p) => p,
+        None => return -14, // EFAULT
+    };
+    let mut new_abs = [0u8; 256];
+    let new_abs_len = resolve_path(&new_raw[..new_len], &mut new_abs);
+    if new_abs_len == 0 { return -2; }
+    let mut new_vfs_path = [0u8; 257];
+    new_vfs_path[..new_abs_len].copy_from_slice(&new_abs[..new_abs_len]);
+    new_vfs_path[new_abs_len] = 0;
+
+    let (old_raw, old_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(put_old_ptr as *const u8, 256) }) {
+        Some(p) => p,
+        None => return -14, // EFAULT
+    };
+    let mut old_abs = [0u8; 256];
+    let old_abs_len = resolve_path(&old_raw[..old_len], &mut old_abs);
+    if old_abs_len == 0 { return -2; }
+    let mut old_vfs_path = [0u8; 257];
+    old_vfs_path[..old_abs_len].copy_from_slice(&old_abs[..old_abs_len]);
+    old_vfs_path[old_abs_len] = 0;
+
+    let msg = make_vfs_msg(vfs::VFS_PIVOT_ROOT, &[new_vfs_path.as_ptr() as u64, old_vfs_path.as_ptr() as u64]);
+    let reply = vfs::handle(&msg, pid);
+    let val = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
+    val as isize
 }
 
 fn sys_newfstatat(_dirfd: usize, path_ptr: usize, statbuf_ptr: usize, _flags: usize) -> isize {
