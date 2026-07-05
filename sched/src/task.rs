@@ -20,15 +20,33 @@ pub enum TaskState {
 // The run queue picks tasks with an Earliest-Eligible-Virtual-Deadline-First
 // policy (see runqueue.rs).  Each task carries a `weight` derived from its
 // nice value (`priority`), a `vruntime` that advances by
-// `ticks × NICE0_WEIGHT / weight` while it runs, and a `vdeadline` renewed to
-// `vruntime + BASE_SLICE_TICKS × NICE0_WEIGHT / weight` whenever it expires.
+// `ticks × VT_PER_TICK × NICE0_WEIGHT / weight` while it runs, and a
+// `vdeadline` renewed to
+// `vruntime + BASE_SLICE_TICKS × VT_PER_TICK × NICE0_WEIGHT / weight`
+// whenever it expires.
 
-/// Weight of a nice-0 task; vruntime is scaled so a nice-0 task accrues one
-/// unit of virtual time per timer tick.
+/// Weight of a nice-0 task; vruntime is scaled so a nice-0 task accrues
+/// `VT_PER_TICK` units of virtual time per timer tick it runs.
 pub const NICE0_WEIGHT: u64 = 1024;
 
 /// Nominal slice, in 100 Hz timer ticks, granted per deadline period.
 pub const BASE_SLICE_TICKS: u64 = 4;
+
+/// Virtual-time units per 100 Hz timer tick.
+///
+/// Sub-tick granularity exists for yield-pollers: a dispatch almost always
+/// starts and ends inside one 10 ms tick (`delta_ticks == 0`), so with the
+/// old 1-unit-per-tick scale the `.max(1)` minimum charge billed a full
+/// tick of virtual time per microsecond-scale dispatch.  A task polling in
+/// a kernel wait loop (nanosleep, ppoll, stdin read) inflated its vruntime
+/// ~1000× faster than its real CPU use, went ineligible, and stalled for
+/// however long the runnable set needed to advance the eligibility average
+/// past the inflation — visible as starvation-style pauses whenever
+/// runnable tasks exceeded the CPU count.  At 1024 units per tick the
+/// minimum charge is ~10 µs of virtual time, the actual order of magnitude
+/// of one dispatch, while a full tick still costs 1024 units — pollers and
+/// CPU-bound tasks are now billed on the same scale.
+pub const VT_PER_TICK: u64 = 1024;
 
 /// Linux's `sched_prio_to_weight[]` — index by `nice + 20`.  Each step of one
 /// nice level changes the CPU share by ~1.25×.
@@ -163,17 +181,20 @@ pub struct Task {
 impl Task {
     /// Virtual-time length of one slice for a task of `weight`.
     pub fn slice_vt(weight: u32) -> u64 {
-        (BASE_SLICE_TICKS * NICE0_WEIGHT / weight as u64).max(1)
+        (BASE_SLICE_TICKS * VT_PER_TICK * NICE0_WEIGHT / weight as u64).max(1)
     }
 
     /// Charge `delta_ticks` of CPU time against this task's virtual runtime
     /// and renew the virtual deadline once it is used up.
     ///
-    /// A minimum of one virtual-time unit is charged per dispatch so that
-    /// tasks yielding faster than the timer tick still make forward progress
-    /// in virtual time and cannot starve CPU-bound tasks.
+    /// A minimum of one virtual-time unit (~10 µs at `VT_PER_TICK` = 1024)
+    /// is charged per dispatch so that tasks yielding faster than the timer
+    /// tick still make forward progress in virtual time and cannot starve
+    /// CPU-bound tasks — without overcharging them a full tick per
+    /// dispatch (see `VT_PER_TICK`).
     pub fn charge_vruntime(&mut self, delta_ticks: u64) {
-        let charged = (delta_ticks * NICE0_WEIGHT / self.weight as u64).max(1);
+        let charged =
+            (delta_ticks * VT_PER_TICK * NICE0_WEIGHT / self.weight as u64).max(1);
         self.vruntime += charged;
         if self.vruntime >= self.vdeadline {
             self.vdeadline = self.vruntime + Self::slice_vt(self.weight);
