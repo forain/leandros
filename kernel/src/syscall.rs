@@ -18,7 +18,8 @@ use sched::{
     current_pid, current_ppid,
     ticks, yield_now, irq_window, exit, spawn_user,
     deliver_signal, pending_signals, clear_pending_signal, replace_signal_mask,
-    current_reply_port, set_current_reply_port, block_on, set_clear_child_tid,
+    current_reply_port, set_current_reply_port, set_clear_child_tid,
+    block_on_port_prepare, block_on_port_cancel, block_on_port_commit,
     replace_address_space,
     with_current_address_space, with_current_address_space_mut
 };
@@ -852,8 +853,16 @@ fn sys_recv(port_id: usize, msg_ptr: usize) -> isize {
     let caller = current_pid();
     if !port::is_owner(port_id as u32, caller) { return -13; }  // EACCES
     loop {
+        // Publish Blocked BEFORE looking at the queue: a sender that
+        // enqueues after recv_as reports empty must already see this task
+        // Blocked so its unblock_port() wake is never lost.  The old
+        // check-then-block order lost the wake when the send+unblock
+        // landed between the empty recv_as and block_on marking us
+        // Blocked — the message sat queued while we slept forever.
+        block_on_port_prepare(port_id as u32);
         match port::recv_as(port_id as u32, caller) {
             Some(msg) => {
+                block_on_port_cancel();
                 unsafe { core::ptr::write(msg_ptr as *mut Message, msg); }
                 return 0;
             }
@@ -862,9 +871,10 @@ fn sys_recv(port_id: usize, msg_ptr: usize) -> isize {
                 // It may have been closed by release_by_owner between the
                 // ownership check above and this point.
                 if !port::is_owner(port_id as u32, caller) {
+                    block_on_port_cancel();
                     return -9; // EBADF — port was closed
                 }
-                block_on(port_id as u32);
+                block_on_port_commit();
                 // After being woken (either by a send or by release_by_owner),
                 // re-check port existence before looping back to recv_as.
                 if !port::is_owner(port_id as u32, caller) {

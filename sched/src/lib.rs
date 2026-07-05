@@ -3,7 +3,8 @@
 //! Design: a single shared run queue (EEVDF policy, see runqueue.rs) served
 //! by every online CPU.  Each CPU runs `scheduler_run_loop()` on its own
 //! static scheduler context; tasks run until they call `yield_now()`,
-//! `block_on()`, `exit()`, or are preempted by their CPU's local timer.
+//! `block_on_port_commit()`, `exit()`, or are preempted by their CPU's
+//! local timer.
 //!
 //! SMP invariants:
 //!  * `Task::on_cpu` guards against double dispatch: a task remains claimed
@@ -375,8 +376,41 @@ pub fn setsid() -> Pid {
     0
 }
 
-pub fn block_on(port: u32) {
-    block_on_port(port);
+/// Three-phase blocking on an IPC port, closing the check-then-block
+/// lost-wake race:
+///
+///   1. `block_on_port_prepare(port)` — publish intent: mark the current
+///      task Blocked-on-`port` while it is still executing.
+///   2. Caller re-checks the message queue.  A sender that enqueues after
+///      the caller's last (empty) look at the queue now already sees the
+///      task Blocked, so its `unblock_port()` flips it back to Ready and
+///      the wake cannot be lost.  If the re-check finds a message, call
+///      `block_on_port_cancel()` and consume it instead of sleeping.
+///   3. `block_on_port_commit()` — actually yield.  If a wake raced in
+///      between, the task is already Ready and the scheduler simply
+///      re-dispatches it.
+///
+/// Publishing Blocked while still executing is safe: syscalls run with
+/// IRQs masked, and the `on_cpu` claim prevents any other CPU from
+/// dispatching this task until it really enters the scheduler.
+pub fn block_on_port_prepare(port: u32) {
+    let pid = current_pid();
+    RUN_QUEUE.lock().block_on_port(pid, port);
+}
+
+/// Undo `block_on_port_prepare` — the queue re-check found a message (or
+/// the port is gone), so the task keeps running instead of sleeping.
+pub fn block_on_port_cancel() {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        t.state      = TaskState::Running;
+        t.blocked_on = None;
+    }
+}
+
+/// Complete a prepared block by yielding to the scheduler.
+pub fn block_on_port_commit() {
+    yield_now("block_on_port");
 }
 
 pub fn umask(mask: u32) -> u32 {
@@ -763,12 +797,6 @@ pub fn exit(code: i32) -> ! {
     }
     yield_now("exit");
     loop { core::hint::spin_loop(); }
-}
-
-pub fn block_on_port(port: u32) {
-    let pid = current_pid();
-    RUN_QUEUE.lock().block_on_port(pid, port);
-    yield_now("block_on_port");
 }
 
 pub fn set_clear_child_tid(tidptr: usize) {

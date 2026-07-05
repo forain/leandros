@@ -123,10 +123,17 @@ pub fn call_port(port_id: u32, mut msg: Message) -> Message {
 
     let caller = sched::current_pid();
     loop {
+        // Publish Blocked before the queue check so a reply enqueued after
+        // an empty recv_as still finds us Blocked and its unblock_port()
+        // wake is never lost (same check-then-block race as sys_recv).
+        sched::block_on_port_prepare(reply_port);
         match port::recv_as(reply_port, caller) {
-            Some(reply) => return reply,
+            Some(reply) => {
+                sched::block_on_port_cancel();
+                return reply;
+            }
             None => {
-                sched::block_on(reply_port);
+                sched::block_on_port_commit();
             }
         }
     }
