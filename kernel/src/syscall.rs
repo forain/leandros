@@ -668,8 +668,17 @@ fn dispatch_inner(
         GETDENTS    => sys_getdents64(a0, a1, a2),
         #[cfg(not(target_arch = "aarch64"))]
         READLINK    => sys_readlinkat(0, a0, a1, a2),
+        // x86_64's legacy epoll_wait(2) syscall (232) takes a real 4th
+        // arg (timeout_ms) — unlike PIPE/DUP2 just above, which hardcode a
+        // 0 because those *real* legacy syscalls genuinely have no such
+        // argument. Forcing 0 here made every epoll_wait() with a caller
+        // timeout return instantly with "no events", so callers expecting
+        // to block (e.g. mio's epoll backend, which musl's libc routes
+        // through this exact syscall number on x86_64) busy-spun calling
+        // it in a tight loop instead of sleeping — see
+        // project_tty_isatty_and_vfork_tls.md.
         #[cfg(not(target_arch = "aarch64"))]
-        EPOLL_WAIT  => sys_epoll_wait(a0, a1, a2, 0),
+        EPOLL_WAIT  => sys_epoll_wait(a0, a1, a2, a3),
         GETDENTS64  => sys_getdents64(a0, a1, a2),
         DUP         => sys_dup(a0),
         DUP3        => sys_dup3(a0, a1, a2),
@@ -2369,18 +2378,45 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
 
 /// sys_read(fd, buf, count) — read bytes from a file descriptor.
 ///
-/// fd 0 (stdin) blocks on serial UART until at least one byte arrives.
-/// All other fds route through VFS.
+/// fd 0 (stdin) blocks on serial UART until at least one byte arrives,
+/// unless O_NONBLOCK is set via fcntl (see `stdio_nonblocking`), in which
+/// case an immediately-empty queue returns EAGAIN instead. All other fds
+/// route through VFS.
 fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> isize {
     match fd {
         0 => {
             if count == 0 { return 0; }
             if !is_kernel && !validate_user_buf(buf_ptr, count) { return -14; }
+            // Edge-triggered epoll consumers (crossterm/mio's TTY reader is
+            // exactly this) set O_NONBLOCK and expect a "readable" epoll
+            // notification to be followed by read-until-EAGAIN, not a
+            // second indefinite block — without this check, that second
+            // read() call hangs forever the instant input arrives one byte
+            // at a time (e.g. over a slow serial link) instead of in a
+            // single burst. See project_tty_isatty_and_vfork_tls.md.
+            //
+            // The retry budget below (not an immediate EAGAIN) exists
+            // because readiness and consumption look at different queues:
+            // poll_fd_state's `serial_has_data() || evdev_server::has_events`
+            // can see a raw byte sitting in the UART that the BSP-only
+            // timer tick (on_tick's `serial_read_byte` drain, arch/*/timer.rs)
+            // hasn't yet turned into an evdev event for `read_input_byte`
+            // to pop. An immediate single check loses that race almost
+            // every time right after a poll() wakeup; a few yield_now()
+            // spins give the next tick (~10ms) a chance to catch up while
+            // still bounding how long a "nonblocking" read can take.
+            let nonblocking = !is_kernel && stdio_nonblocking(current_pid());
+            const NONBLOCK_RETRY_SPINS: u32 = 32;
+            let mut spins = 0u32;
             // Yield-loop until evdev has at least one key event.
             let first = loop {
                 match read_input_byte() {
                     Some(b) => break b,
                     None    => {
+                        if nonblocking {
+                            spins += 1;
+                            if spins >= NONBLOCK_RETRY_SPINS { return -11; } // EAGAIN
+                        }
                         irq_window();
 
                         yield_now("sys_read_stdin");
@@ -2977,8 +3013,66 @@ fn sys_lseek(fd: usize, offset: usize, whence: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
+// ── Hardwired console fds (0/1/2): per-pid fcntl flags ────────────────────────
+// Just like isatty()/ioctl() (see servers/tty's ConsoleTermios), fcntl()
+// on stdin/stdout/stderr can't route through VFS_FCNTL — VFS's alloc_fd
+// deliberately never hands out 0-2 (see its own doc comment), so
+// `handle_fcntl` always sees "not in_use" and returns EBADF for these
+// fds. That silently breaks any nonblocking-I/O consumer that calls
+// fcntl(0, F_SETFL, O_NONBLOCK) before doing edge-triggered
+// epoll-driven reads (exactly what crossterm/mio does) — found while
+// chasing why `bottom`'s interactive TUI never responded to input; see
+// project_tty_isatty_and_vfork_tls.md. Only O_NONBLOCK is tracked: it's
+// the only flag `sys_read_impl`'s fd-0 branch actually consults.
+const MAX_STDIO_FLAGS_PROCS: usize = 64;
+const O_NONBLOCK: u32 = 0x800;
+
+struct StdioFlags { pid: u32, in_use: bool, flags: u32 }
+
+static STDIO_FLAGS: spin::Mutex<[StdioFlags; MAX_STDIO_FLAGS_PROCS]> =
+    spin::Mutex::new([const { StdioFlags { pid: 0, in_use: false, flags: 0 } }; MAX_STDIO_FLAGS_PROCS]);
+
+fn stdio_nonblocking(pid: u32) -> bool {
+    STDIO_FLAGS.lock().iter().any(|s| s.in_use && s.pid == pid && s.flags & O_NONBLOCK != 0)
+}
+
+/// Release `pid`'s STDIO_FLAGS slot on exit — otherwise, since slots are
+/// never reused except by a matching pid, a long-running system would
+/// eventually exhaust MAX_STDIO_FLAGS_PROCS after that many distinct
+/// processes had ever touched fcntl() on fd 0/1/2.
+fn stdio_flags_close_all(pid: u32) {
+    if let Some(s) = STDIO_FLAGS.lock().iter_mut().find(|s| s.in_use && s.pid == pid) {
+        *s = StdioFlags { pid: 0, in_use: false, flags: 0 };
+    }
+}
+
+fn set_stdio_flags(pid: u32, flags: u32) {
+    let mut tbl = STDIO_FLAGS.lock();
+    if let Some(s) = tbl.iter_mut().find(|s| s.in_use && s.pid == pid) {
+        s.flags = flags;
+        return;
+    }
+    if let Some(s) = tbl.iter_mut().find(|s| !s.in_use) {
+        *s = StdioFlags { pid, in_use: true, flags };
+    }
+}
+
 fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     let pid = current_pid();
+    if fd <= 2 {
+        const F_GETFL: usize = 3;
+        const F_SETFL: usize = 4;
+        return match cmd {
+            F_GETFL => {
+                let flags = STDIO_FLAGS.lock().iter()
+                    .find(|s| s.in_use && s.pid == pid)
+                    .map(|s| s.flags).unwrap_or(0);
+                flags as isize
+            }
+            F_SETFL => { set_stdio_flags(pid, arg as u32); 0 }
+            _ => 0, // F_GETFD/F_SETFD/etc: no real close-on-exec semantics needed for stdio
+        };
+    }
     let msg = make_vfs_msg(vfs::VFS_FCNTL, &[fd as u64, cmd as u64, arg as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
@@ -3310,6 +3404,7 @@ fn vfs_close_all_for(pid: u32) {
     let _ = net_server::handle(&nmsg, pid);
     tty_server::close_all(pid);
     epoll_close_all(pid);
+    stdio_flags_close_all(pid);
 }
 
 /// sys_ioctl — try VFS first (FIONREAD on pipes/files), then TTY server.
