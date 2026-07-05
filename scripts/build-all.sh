@@ -71,62 +71,11 @@ create_initrd() {
     target_arch=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-none" || echo "x86_64-unknown-none")
     local userland_dir="userland/target/$target_arch/release"
 
-    echo "  Creating CPIO initrd..."
     local temp_dir="temp_initrd_$arch"
     rm -rf "$temp_dir"
     mkdir -p "$temp_dir/bin"
-    mkdir -p "$temp_dir/lib"
 
     cp "$userland_dir/init" "$temp_dir/bin/init"
-    cp "$userland_dir/shell" "$temp_dir/bin/shell"
-    cp "$userland_dir/hello" "$temp_dir/bin/hello"
-    cp "$userland_dir/aplay" "$temp_dir/bin/aplay"
-    cp "$userland_dir/memtest" "$temp_dir/bin/memtest"
-    cp "$userland_dir/vfstest" "$temp_dir/bin/vfstest"
-    cp "$userland_dir/f2fstest" "$temp_dir/bin/f2fstest"
-    cp "$userland_dir/pthreadtest" "$temp_dir/bin/pthreadtest"
-    cp "$userland_dir/timertest" "$temp_dir/bin/timertest"
-    cp "$userland_dir/sigtest" "$temp_dir/bin/sigtest"
-    cp "$userland_dir/polltest" "$temp_dir/bin/polltest"
-    cp "$userland_dir/forktest" "$temp_dir/bin/forktest"
-    cp "$userland_dir/racetest" "$temp_dir/bin/racetest"
-
-    # Include relibc (libc.a) in the initrd for development/linking
-    local relibc_target
-    relibc_target=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-leandros" || echo "x86_64-unknown-leandros")
-    local relibc_dir="userland/relibc/target/$relibc_target/release"
-    if [[ -f "$relibc_dir/librelibc.a" ]]; then
-        cp "$relibc_dir/librelibc.a" "$temp_dir/lib/libc.a"
-    fi
-
-    if [[ -f "userland/aplay/car-horn.wav" ]]; then
-        cp "userland/aplay/car-horn.wav" "$temp_dir/car-horn.wav"
-    fi
-
-    local doom_bin="doomgeneric/doom-$arch"
-    if [[ -f "$doom_bin" ]]; then
-        cp "$doom_bin" "$temp_dir/bin/doom"
-    fi
-
-    local doom_wad="doomgeneric/doom1.wad"
-    if [[ -f "$doom_wad" ]]; then
-        cp "$doom_wad" "$temp_dir/bin/doom1.wad"
-    fi
-
-    local mame_bin="../mame/mame-$arch"
-    if [[ -f "$mame_bin" ]]; then
-        cp "$mame_bin" "$temp_dir/bin/mame"
-        echo "  Including MAME ($arch, $(du -sh "$mame_bin" | cut -f1))"
-    fi
-
-    local bottom_target
-    bottom_target=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-linux-musl" || echo "x86_64-unknown-linux-musl")
-    local bottom_bin="../bottom-leandros/target/$bottom_target/release/btm"
-    if [[ -f "$bottom_bin" ]]; then
-        cp "$bottom_bin" "$temp_dir/bin/btm"
-        cp "$bottom_bin" "$temp_dir/bin/bottom"
-        echo "  Including bottom ($arch, $(du -sh "$bottom_bin" | cut -f1))"
-    fi
 
     (
         cd "$temp_dir" || exit 1
@@ -325,6 +274,9 @@ for arch in "${ARCHS[@]}"; do
     create_initrd "$arch"
     build_kernel "$arch"
     create_disk_image "$arch" "$LIMINE_DIR"
+    echo "💾 Creating populated F2FS images for $arch..."
+    python3 scripts/mkfs-f2fs-populated.py f2fs-data0.img "$arch"
+    cp f2fs-data0.img f2fs-data1.img
 done
 
 echo "🎉 Build Complete!"
