@@ -74,45 +74,55 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         // A mutable pointer is required (not just `&`): sharing a page
         // copy-on-write means downgrading the *parent's* own page-table
         // entries to read-only too, and marking its own VmaRegions as
-        // CoW-tracked, not just the child's. Safe under this scheduler's
-        // single-CPU cooperative model — no concurrent access to the
-        // parent's AddressSpace can occur between the lock drop below and
-        // clone_as's use of the pointer.
-        let as_raw_ptr: *mut mm::vmm::AddressSpace = {
-            let mut rq = super::RUN_QUEUE.lock();
-            let tgid = match rq.find_pid(parent_pid) {
-                Some(t) => t.tgid,
-                None => {
-                    mm::buddy::free(stack_base_phys, stack_pages);
-                    mm::buddy::free(child_pt, 0);
-                    return -3; // ESRCH
-                }
-            };
-            match rq.find_pid_mut(tgid) {
-                Some(leader) => match leader.address_space.as_mut() {
-                    Some(as_) => &mut **as_ as *mut mm::vmm::AddressSpace,
-                    None => {
+        // CoW-tracked, not just the child's.  Exclusive access for the
+        // whole clone comes from the per-address-space busy flag, NOT the
+        // run-queue lock: the clone walks and remaps every VMA and ends in
+        // a TLB-shootdown broadcast, far too long to pin every other CPU's
+        // scheduler loop (see sched::lock_leader_address_space).  It also
+        // serializes against concurrent page faults and mm syscalls by
+        // other threads of the parent, which the old
+        // pointer-with-lock-dropped scheme raced with on SMP.
+        //
+        // Distinguish "no such task" (-3) from "kernel task without an
+        // address space" (-38) before taking the lock, since the lock
+        // helper folds both into None.
+        {
+            let rq = super::RUN_QUEUE.lock();
+            match rq.find_pid(parent_pid).and_then(|t| rq.find_pid(t.tgid)) {
+                Some(leader) => {
+                    if leader.address_space.is_none() {
+                        drop(rq);
                         mm::buddy::free(stack_base_phys, stack_pages);
                         mm::buddy::free(child_pt, 0);
                         return -38; // kernel task → can't fork
                     }
-                },
+                }
                 None => {
+                    drop(rq);
                     mm::buddy::free(stack_base_phys, stack_pages);
                     mm::buddy::free(child_pt, 0);
                     return -3; // ESRCH
                 }
             }
-        };
-
-        let child_as = unsafe {
-            match mm::cow::clone_as(&mut *as_raw_ptr, child_pt) {
-                Some(a) => a,
-                None    => {
+        }
+        let as_raw_ptr: *mut mm::vmm::AddressSpace =
+            match super::lock_leader_address_space(parent_pid) {
+                Some(p) => p,
+                None => {
                     mm::buddy::free(stack_base_phys, stack_pages);
                     mm::buddy::free(child_pt, 0);
-                    return -12;
+                    return -3; // ESRCH — task vanished since the check above
                 }
+            };
+
+        let cloned = unsafe { mm::cow::clone_as(&mut *as_raw_ptr, child_pt) };
+        unsafe { super::unlock_address_space(as_raw_ptr); }
+        let child_as = match cloned {
+            Some(a) => a,
+            None    => {
+                mm::buddy::free(stack_base_phys, stack_pages);
+                mm::buddy::free(child_pt, 0);
+                return -12;
             }
         };
 

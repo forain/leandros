@@ -68,6 +68,14 @@ pub struct AddressSpace {
     pub heap_start: usize,
     /// Current heap break (end of heap VMA).
     pub heap_end: usize,
+    /// Exclusive-access flag, held (CAS true → work → store false) around
+    /// every mutation of this address space — page-fault service, mmap/
+    /// munmap/mprotect/brk, fork's CoW clone — *instead of* the global
+    /// run-queue lock.  Address-space work allocates, copies whole pages,
+    /// and waits on TLB-shootdown acknowledgements; doing that under the
+    /// scheduler lock stalls every other CPU (see
+    /// `sched::lock_leader_address_space`).
+    pub busy: core::sync::atomic::AtomicBool,
 }
 
 impl Drop for AddressSpace {
@@ -107,6 +115,7 @@ impl AddressSpace {
             regions: alloc::vec![NONE; 128],
             heap_start: 0,
             heap_end: 0,
+            busy: core::sync::atomic::AtomicBool::new(false),
         }
     }
 

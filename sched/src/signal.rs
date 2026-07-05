@@ -422,21 +422,15 @@ mod aarch64 {
         // Prefault any lazy stack pages and write via TGID leader's address
         // space.  write_user_buf translates each page through the HHDM and
         // handles non-contiguous physical pages, so no physical-contiguity
-        // assumption is needed.
+        // assumption is needed.  Goes through the per-address-space lock
+        // (with_address_space_mut) so it serializes with faults and mm
+        // syscalls on other CPUs without pinning the run-queue lock.
         let ok = {
             let pid = super::super::current_pid();
-            let mut rq = super::super::RUN_QUEUE.lock();
-            let tgid = match rq.find_pid(pid) {
-                Some(t) => t.tgid,
-                None    => return false,
-            };
-            match rq.find_pid_mut(tgid).and_then(|t| t.address_space.as_mut()) {
-                Some(as_) => {
-                    as_.prefault_range(new_sp, SIGFRAME_SIZE);
-                    as_.write_user_buf(new_sp, &buf)
-                }
-                None => false,
-            }
+            super::super::with_address_space_mut(pid, |as_| {
+                as_.prefault_range(new_sp, SIGFRAME_SIZE);
+                as_.write_user_buf(new_sp, &buf)
+            }).unwrap_or(false)
         };
         if !ok { return false; }
 
@@ -467,18 +461,10 @@ mod aarch64 {
         let mut buf = alloc::vec![0u8; SIGFRAME_SIZE];
 
         // Read the frame via TGID leader's address space (handles HHDM and
-        // non-contiguous lazy pages).
-        let ok = {
-            let rq = super::super::RUN_QUEUE.lock();
-            let tgid = match rq.find_pid(pid) {
-                Some(t) => t.tgid,
-                None    => { super::super::exit(128 + 11); }
-            };
-            match rq.find_pid(tgid).and_then(|t| t.address_space.as_ref()) {
-                Some(as_) => as_.read_user_buf(sigframe_virt, &mut buf),
-                None      => false,
-            }
-        };
+        // non-contiguous lazy pages), under the per-address-space lock.
+        let ok = super::super::with_address_space(pid, |as_| {
+            as_.read_user_buf(sigframe_virt, &mut buf)
+        }).unwrap_or(false);
         if !ok { super::super::exit(128 + 11); }
 
         // Restore GPRs from uc_mcontext.
@@ -626,21 +612,14 @@ mod x86_64 {
         wreg(&mut buf, REG_CSGSFS, user_frame.cs);
 
         // Prefault any lazy stack pages and write via TGID leader's address
-        // space, exactly as the AArch64 path does.
+        // space, exactly as the AArch64 path does — under the
+        // per-address-space lock (see that path's comment).
         let ok = {
             let pid = super::super::current_pid();
-            let mut rq = super::super::RUN_QUEUE.lock();
-            let tgid = match rq.find_pid(pid) {
-                Some(t) => t.tgid,
-                None    => return false,
-            };
-            match rq.find_pid_mut(tgid).and_then(|t| t.address_space.as_mut()) {
-                Some(as_) => {
-                    as_.prefault_range(new_sp, SIGFRAME_SIZE);
-                    as_.write_user_buf(new_sp, &buf)
-                }
-                None => false,
-            }
+            super::super::with_address_space_mut(pid, |as_| {
+                as_.prefault_range(new_sp, SIGFRAME_SIZE);
+                as_.write_user_buf(new_sp, &buf)
+            }).unwrap_or(false)
         };
         if !ok { return false; }
 
@@ -670,17 +649,9 @@ mod x86_64 {
 
         let mut buf = alloc::vec![0u8; SIGFRAME_SIZE];
 
-        let ok = {
-            let rq = super::super::RUN_QUEUE.lock();
-            let tgid = match rq.find_pid(pid) {
-                Some(t) => t.tgid,
-                None    => { super::super::exit(128 + 11); }
-            };
-            match rq.find_pid(tgid).and_then(|t| t.address_space.as_ref()) {
-                Some(as_) => as_.read_user_buf(sigframe_virt, &mut buf),
-                None      => false,
-            }
-        };
+        let ok = super::super::with_address_space(pid, |as_| {
+            as_.read_user_buf(sigframe_virt, &mut buf)
+        }).unwrap_or(false);
         if !ok { super::super::exit(128 + 11); }
 
         let rreg = |buf: &alloc::vec::Vec<u8>, i: usize| -> u64 {

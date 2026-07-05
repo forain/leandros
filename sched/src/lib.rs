@@ -526,6 +526,56 @@ pub fn preempt_check() {
     }
 }
 
+/// Acquire exclusive access to the address space of `pid`'s thread-group
+/// leader and return a raw pointer to it, with the run-queue lock
+/// RELEASED.  Pair with `unlock_address_space`.
+///
+/// Servicing a fault or mutating mappings allocates, copies whole 4 KiB
+/// pages, and can wait on TLB-shootdown acknowledgements.  Doing that
+/// while holding RUN_QUEUE stalls every other CPU's scheduler loop and
+/// convoys with the shootdown wait itself: a target CPU spinning on
+/// RUN_QUEUE with IRQs masked can never take the shootdown IPI (see the
+/// timeout note in arch/x86_64/src/paging.rs).  The per-address-space
+/// `busy` flag keeps AddressSpace access exclusive without pinning the
+/// scheduler.
+///
+/// Why handing out a raw pointer is sound:
+///  * Every caller acts on behalf of a *running* member of the group, and
+///    a leader must outlive its threads — each running thread's CR3/TTBR0
+///    points into the leader's page tables, so a reaped leader would
+///    already mean freed page tables in live use.
+///  * Holders never yield or block while the flag is set (syscalls and
+///    fault handlers run with IRQs masked, and no holder sleeps), so hold
+///    times are bounded and spinning on `busy` cannot deadlock.
+///  * `replace_address_space` (execve) waits for `busy` to clear before
+///    dropping the displaced address space.
+pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::AddressSpace> {
+    loop {
+        {
+            let mut rq = RUN_QUEUE.lock();
+            let tgid = rq.find_pid(pid)?.tgid;
+            let leader = rq.find_pid_mut(tgid)?;
+            let as_ = leader.address_space.as_mut()?;
+            if as_
+                .busy
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(&mut **as_ as *mut mm::vmm::AddressSpace);
+            }
+        }
+        // Another CPU holds the address space (fault, mm syscall, or fork
+        // clone of the same process).  Retry with the run-queue lock
+        // dropped so schedulers stay unblocked while we wait.
+        core::hint::spin_loop();
+    }
+}
+
+/// Release exclusive access taken by `lock_leader_address_space`.
+pub(crate) unsafe fn unlock_address_space(as_ptr: *mut mm::vmm::AddressSpace) {
+    (*as_ptr).busy.store(false, Ordering::Release);
+}
+
 pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
     fn print_str(s: &str) {
         extern "C" { fn arch_serial_putc(c: u8); }
@@ -537,28 +587,24 @@ pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
     let pid = current_pid();
     if pid == 0 { return false; }
 
-    let mut rq = RUN_QUEUE.lock();
-    let tgid = match rq.find_pid(pid) {
-        Some(t) => t.tgid,
+    // Service the fault under the per-address-space lock, not RUN_QUEUE:
+    // the fault path allocates and may copy a full page, easily tens of
+    // microseconds during fork/CoW storms, and pinning the scheduler lock
+    // for that long stalls every other CPU (and convoys with shootdown
+    // waits — see lock_leader_address_space).
+    let as_ptr = match lock_leader_address_space(pid) {
+        Some(p) => p,
         None => {
-            print_str("[PF] find_pid failed\n");
+            print_str("[PF] no address space for faulting task\n");
             return false;
         }
     };
-    if let Some(t) = rq.find_pid_mut(tgid) {
-        if let Some(ref mut as_) = t.address_space {
-            let ok = as_.handle_user_page_fault(addr, is_write);
-            if !ok {
-                print_str("[PF] handle_user_page_fault returned false\n");
-            }
-            return ok;
-        } else {
-            print_str("[PF] leader address_space is None\n");
-        }
-    } else {
-        print_str("[PF] find_pid_mut for leader failed\n");
+    let ok = unsafe { (*as_ptr).handle_user_page_fault(addr, is_write) };
+    unsafe { unlock_address_space(as_ptr); }
+    if !ok {
+        print_str("[PF] handle_user_page_fault returned false\n");
     }
-    false
+    ok
 }
 
 pub fn ap_entry() -> ! {
@@ -830,10 +876,10 @@ pub fn replace_address_space(
     user_sp: usize
 ) -> ! {
     let pid = current_pid();
-    {
+    let old_as = {
         let mut rq = RUN_QUEUE.lock();
         if let Some(t) = rq.find_pid_mut(pid) {
-            t.address_space = Some(alloc::boxed::Box::new(new_as));
+            let displaced = t.address_space.replace(alloc::boxed::Box::new(new_as));
             t.page_table    = pt_root;
             t.heap_start    = heap_start;
             t.heap_end      = heap_start;
@@ -848,15 +894,34 @@ pub fn replace_address_space(
             { t.ctx.tpidr_el0 = 0; }
             #[cfg(target_arch = "x86_64")]
             { t.ctx.fs_base = 0; }
+            displaced
+        } else {
+            None
         }
-    }
+    };
 
     extern "C" {
         fn arch_execve_return(entry: usize, user_sp: usize) -> !;
     }
 
     unsafe {
+        // Switch to the new root BEFORE dropping the old address space:
+        // its Drop frees the old page tables, and this CPU must not be
+        // executing on a freed root even briefly.
         arch_set_page_table(pt_root);
+
+        // Drop the displaced address space outside the run-queue lock —
+        // its Drop frees every backing page and broadcasts a TLB shootdown
+        // whose ack wait must not pin the scheduler lock.  Wait for any
+        // in-flight holder of its busy flag (a fault on another CPU by a
+        // thread of the pre-exec image) to finish first.
+        if let Some(old) = old_as {
+            while old.busy.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            drop(old);
+        }
+
         arch_execve_return(entry, user_sp);
     }
 }
@@ -865,26 +930,27 @@ pub fn spawn_user(_entry_va: usize, _stack_va: usize, _priority: i8) -> Option<P
     None
 }
 
+// The with_*_address_space accessors all funnel through
+// lock_leader_address_space so the closure runs WITHOUT the run-queue
+// lock held (see that function's doc for why).  The `busy` flag is
+// exclusive, so the shared (&) variants serialize against the mutable
+// ones as well.  Closures must not yield, block, or take the run-queue
+// lock-and-wait on another address space.
+
 pub fn with_address_space<F, R>(pid: Pid, f: F) -> Option<R>
 where F: FnOnce(&mm::vmm::AddressSpace) -> R {
-    let rq = RUN_QUEUE.lock();
-    let t = rq.find_pid(pid)?;
-    let leader = rq.find_pid(t.tgid)?;
-    match leader.address_space {
-        Some(ref as_) => Some(f(as_)),
-        None => None,
-    }
+    let as_ptr = lock_leader_address_space(pid)?;
+    let r = f(unsafe { &*as_ptr });
+    unsafe { unlock_address_space(as_ptr); }
+    Some(r)
 }
 
 pub fn with_address_space_mut<F, R>(pid: Pid, f: F) -> Option<R>
 where F: FnOnce(&mut mm::vmm::AddressSpace) -> R {
-    let mut rq = RUN_QUEUE.lock();
-    let tgid = rq.find_pid(pid)?.tgid;
-    let leader = rq.find_pid_mut(tgid)?;
-    match leader.address_space {
-        Some(ref mut as_) => Some(f(as_)),
-        None => None,
-    }
+    let as_ptr = lock_leader_address_space(pid)?;
+    let r = f(unsafe { &mut *as_ptr });
+    unsafe { unlock_address_space(as_ptr); }
+    Some(r)
 }
 
 pub fn with_task_address_space<F, R>(pid: Pid, f: F) -> Option<R>
@@ -920,26 +986,12 @@ where F: FnOnce() -> R {
 
 pub fn with_current_address_space<F, R>(f: F) -> Option<R>
 where F: FnOnce(&mm::vmm::AddressSpace) -> R {
-    let pid = current_pid();
-    let rq = RUN_QUEUE.lock();
-    let t = rq.find_pid(pid)?;
-    let leader = rq.find_pid(t.tgid)?;
-    match leader.address_space {
-        Some(ref as_) => Some(f(as_)),
-        None => None,
-    }
+    with_address_space(current_pid(), f)
 }
 
 pub fn with_current_address_space_mut<F, R>(f: F) -> Option<R>
 where F: FnOnce(&mut mm::vmm::AddressSpace) -> R {
-    let pid = current_pid();
-    let mut rq = RUN_QUEUE.lock();
-    let tgid = rq.find_pid(pid)?.tgid;
-    let leader = rq.find_pid_mut(tgid)?;
-    match leader.address_space {
-        Some(ref mut as_) => Some(f(as_)),
-        None => None,
-    }
+    with_address_space_mut(current_pid(), f)
 }
 
 pub fn register_task_exit_hook(hook: fn(u32)) {
