@@ -391,6 +391,12 @@ pub mod nr {
     #[cfg(target_arch = "aarch64")] pub const FLOCK:          usize = 32;
     #[cfg(target_arch = "x86_64")]  pub const FLOCK:          usize = 73;
 
+    #[cfg(target_arch = "aarch64")] pub const MOUNT:          usize = 40;
+    #[cfg(target_arch = "x86_64")]  pub const MOUNT:          usize = 165;
+
+    #[cfg(target_arch = "aarch64")] pub const PIVOT_ROOT:     usize = 41;
+    #[cfg(target_arch = "x86_64")]  pub const PIVOT_ROOT:     usize = 155;
+
     pub const IPC_SEND: usize = 511;
     pub const IPC_RECV: usize = 512;
     pub const IPC_CALL: usize = 513;
@@ -511,4 +517,8 @@ pub mod nr {
     pub const FCHOWNAT: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const FLOCK: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const MOUNT: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const PIVOT_ROOT: usize = 0;
 }

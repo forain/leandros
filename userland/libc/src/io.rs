@@ -1,7 +1,7 @@
 //! File I/O: open, read, write, close, lseek, dup, pipe, getcwd, chdir.
 
 use crate::errno::set_errno;
-use crate::syscall::{nr, syscall1, syscall2, syscall3, syscall4};
+use crate::syscall::{nr, syscall1, syscall2, syscall3, syscall4, syscall5};
 
 pub const AT_REMOVEDIR: i32 = 0x200;
 
@@ -237,3 +237,48 @@ pub unsafe extern "C" fn fcntl_lock(fd: c_int, cmd: c_int, lock: *mut flock) -> 
     let r = syscall3(nr::FCNTL, fd as usize, cmd as usize, lock as usize);
     if r < 0 { set_errno(-r as i32); -1 } else { 0 }
 }
+
+/// Mount a filesystem.
+#[no_mangle]
+pub unsafe extern "C" fn mount(
+    source: *const u8,
+    target: *const u8,
+    filesystemtype: *const u8,
+    mountflags: usize,
+    data: *const u8,
+) -> c_int {
+    let r = syscall5(
+        nr::MOUNT,
+        source as usize,
+        target as usize,
+        filesystemtype as usize,
+        mountflags,
+        data as usize,
+    );
+    if r < 0 {
+        set_errno(-r as i32);
+        -1
+    } else {
+        0
+    }
+}
+
+/// Pivot the root filesystem.
+#[no_mangle]
+pub unsafe extern "C" fn pivot_root(
+    new_root: *const u8,
+    put_old: *const u8,
+) -> c_int {
+    let r = syscall2(
+        nr::PIVOT_ROOT,
+        new_root as usize,
+        put_old as usize,
+    );
+    if r < 0 {
+        set_errno(-r as i32);
+        -1
+    } else {
+        0
+    }
+}
+
