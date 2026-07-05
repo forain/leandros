@@ -119,6 +119,15 @@ create_initrd() {
         echo "  Including MAME ($arch, $(du -sh "$mame_bin" | cut -f1))"
     fi
 
+    local bottom_target
+    bottom_target=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-linux-musl" || echo "x86_64-unknown-linux-musl")
+    local bottom_bin="../bottom-leandros/target/$bottom_target/release/btm"
+    if [[ -f "$bottom_bin" ]]; then
+        cp "$bottom_bin" "$temp_dir/bin/btm"
+        cp "$bottom_bin" "$temp_dir/bin/bottom"
+        echo "  Including bottom ($arch, $(du -sh "$bottom_bin" | cut -f1))"
+    fi
+
     (
         cd "$temp_dir" || exit 1
         find . -print0 | cpio -0 -o -H newc > "$ROOT_DIR/$initrd_name"
@@ -257,6 +266,29 @@ build_mame() {
     )
 }
 
+# Function to build bottom
+build_bottom() {
+    local arch="$1"
+    echo "📊 Building $arch bottom..."
+    local bottom_dir="$ROOT_DIR/../bottom-leandros"
+    if [[ ! -d "$bottom_dir" ]]; then
+        echo "⚠️  bottom source not found at $bottom_dir, skipping"
+        return 0
+    fi
+    local target_triple
+    if [[ "$arch" == "aarch64" ]]; then
+        target_triple="aarch64-unknown-linux-musl"
+    else
+        target_triple="x86_64-unknown-linux-musl"
+    fi
+    (
+        cd "$bottom_dir" || exit 1
+        RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
+        cargo +nightly build --target "$target_triple" --release
+    )
+
+}
+
 # Function to build relibc
 build_relibc() {
     local arch="$1"
@@ -289,6 +321,7 @@ for arch in "${ARCHS[@]}"; do
     build_userland "$arch"
     build_doom "$arch"
     build_mame "$arch"
+    build_bottom "$arch"
     create_initrd "$arch"
     build_kernel "$arch"
     create_disk_image "$arch" "$LIMINE_DIR"
