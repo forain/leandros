@@ -125,7 +125,8 @@ def build_inode_block(mode, links, size, block_addrs, nid):
     w32(block, NODE_FOOTER_OFF + 16, 1)
     return block
 
-def write_checkpoint(image, blkaddr, ver, valid_blocks, valid_nodes, free_segs, next_nid, main_segs):
+def write_checkpoint(image, blkaddr, ver, valid_blocks, valid_nodes, free_segs, next_nid, main_segs,
+                      cur_node_segno, cur_node_blkoff, cur_data_segno, cur_data_blkoff):
     o = blkaddr * BLOCK_SIZE
     w64(image, o +  0, ver)
     w64(image, o +  8, 0)
@@ -134,13 +135,13 @@ def write_checkpoint(image, blkaddr, ver, valid_blocks, valid_nodes, free_segs, 
     w32(image, o + 28, 1)
     w32(image, o + 32, free_segs)
     for i in range(MAX_ACTIVE_LOGS):
-        w32(image, o + 36 + i * 4, 0xFFFFFFFF if i > 0 else 0)
+        w32(image, o + 36 + i * 4, 0xFFFFFFFF if i > 0 else cur_node_segno)
     for i in range(MAX_ACTIVE_LOGS):
-        w16(image, o + 68 + i * 2, 1 if i == 0 else 0)
+        w16(image, o + 68 + i * 2, cur_node_blkoff if i == 0 else 0)
     for i in range(MAX_ACTIVE_LOGS):
-        w32(image, o + 84 + i * 4, 0xFFFFFFFF if i > 0 else 1)
+        w32(image, o + 84 + i * 4, 0xFFFFFFFF if i > 0 else cur_data_segno)
     for i in range(MAX_ACTIVE_LOGS):
-        w16(image, o + 116 + i * 2, 0)
+        w16(image, o + 116 + i * 2, cur_data_blkoff if i == 0 else 0)
     w32(image, o + 132, CP_UMOUNT_FLAG)
     w32(image, o + 136, 5)
     w32(image, o + 140, 1)
@@ -215,6 +216,10 @@ def main():
         k = (size + BLOCK_SIZE - 1) // BLOCK_SIZE
         # Inode block + data blocks + potential direct nodes (1 per 1018 blocks)
         required_blocks += k + 1 + (k + 1017) // 1018
+    # Reserve two full segments beyond the statically-populated content for the
+    # runtime node/data allocator curseg pointers (see below) so first writes
+    # never land on blocks already occupied by pre-populated files/directories.
+    required_blocks += 2 * BLOCKS_PER_SEG
         
     # Align to segments (512 blocks) and set a minimum size of 64MB (16384 blocks)
     segs = (required_blocks + 511) // 512
@@ -498,9 +503,22 @@ def main():
     valid_nodes_count = next_nid - 3
     used_segs = (valid_blocks_count + BLOCKS_PER_SEG - 1) // BLOCKS_PER_SEG
     free_segs = main_segs - used_segs
-    
-    write_checkpoint(image, CP_BLKADDR, 1, valid_blocks_count, valid_nodes_count, free_segs, next_nid, main_segs)
-    write_checkpoint(image, CP_BLKADDR + BLOCKS_PER_SEG, 0, valid_blocks_count, valid_nodes_count, free_segs, next_nid, main_segs)
+
+    # The runtime allocator (servers/f2fs/src/lib.rs) starts handing out new
+    # node/data blocks from these curseg positions and bumps them one block at
+    # a time — it never consults the SIT valid-map to skip already-used blocks.
+    # They must therefore start on fresh, fully-empty segments *past* every
+    # block written above (not segment 0/1, which hold real directories and
+    # files), and node/data need distinct segments so their independent
+    # cursors can't collide with each other.
+    first_free_seg = used_segs
+    cur_node_segno, cur_data_segno = first_free_seg, first_free_seg + 1
+    assert cur_data_segno < main_segs, "not enough reserved segments for runtime node/data logs"
+
+    write_checkpoint(image, CP_BLKADDR, 1, valid_blocks_count, valid_nodes_count, free_segs, next_nid, main_segs,
+                      cur_node_segno, 0, cur_data_segno, 0)
+    write_checkpoint(image, CP_BLKADDR + BLOCKS_PER_SEG, 0, valid_blocks_count, valid_nodes_count, free_segs, next_nid, main_segs,
+                      cur_node_segno, 0, cur_data_segno, 0)
     
     # Write output file
     with open(out_file, 'wb') as f:
