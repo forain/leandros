@@ -16,7 +16,7 @@ use sched::{
     fork_current, clone_thread,
     sys_sigaction, sys_sigprocmask, sys_sigaltstack, restore_signal_frame,
     current_pid, current_ppid,
-    ticks, yield_now, exit, spawn_user,
+    ticks, yield_now, irq_window, exit, spawn_user,
     deliver_signal, pending_signals, clear_pending_signal, replace_signal_mask,
     current_reply_port, set_current_reply_port, block_on, set_clear_child_tid,
     replace_address_space,
@@ -1299,6 +1299,7 @@ fn sys_rt_sigsuspend(mask_ptr: usize, _sigsetsize: usize) -> isize {
     // Yield until a signal arrives that is not blocked by new_mask.
     loop {
         if pending_signals() & !new_mask != 0 { break; }
+        irq_window();
         yield_now("sigsuspend");
     }
     // Restore old mask before returning.
@@ -1345,6 +1346,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
         if let Some(dl) = deadline {
             if ticks() >= dl { return -110; } // ETIMEDOUT
         }
+        irq_window();
         yield_now("sigtimedwait");
     }
 }
@@ -1529,10 +1531,7 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
         if nready > 0 { return nready; }
         if !infinite && ticks() >= deadline { return 0; }
 
-        #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("sti; nop; cli"); }
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
+        irq_window();
 
         yield_now("ppoll");
     }
@@ -1555,10 +1554,7 @@ fn sys_nanosleep(rqtp_ptr: usize, _rmtp: usize) -> isize {
     if ticks_needed == 0 { return 0; }
     let deadline = ticks().wrapping_add(ticks_needed);
     loop {
-        #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("sti; nop; cli"); }
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
+        irq_window();
 
         yield_now("nanosleep");
         if ticks() >= deadline { break; }
@@ -2252,10 +2248,7 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
                 match read_input_byte() {
                     Some(b) => break b,
                     None    => {
-                        #[cfg(target_arch = "x86_64")]
-                        unsafe { core::arch::asm!("sti; nop; cli"); }
-                        #[cfg(target_arch = "aarch64")]
-                        unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
+                        irq_window();
 
                         yield_now("sys_read_stdin");
                     }
@@ -2296,10 +2289,7 @@ fn sys_read(fd: usize, buf_ptr: usize, count: usize) -> isize {
             loop {
                 let n = vfs_reply_val(&vfs::handle(&msg, pid));
                 if n != -11 { return n; }
-                #[cfg(target_arch = "x86_64")]
-                unsafe { core::arch::asm!("sti; nop; cli"); }
-                #[cfg(target_arch = "aarch64")]
-                unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
+                irq_window();
 
                 yield_now("sys_read_vfs");
             }
@@ -2360,6 +2350,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
                 let n = loop {
                     let v = vfs_reply_val(&vfs::handle(&msg, pid));
                     if v != -11 { break v; }
+                    irq_window();
                     yield_now("sys_readv_vfs");
                 };
                 if n < 0 { return if total > 0 { total } else { n }; }
@@ -3439,10 +3430,7 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
         if nready > 0 { return nready as isize; }
         if timeout == 0 || (!infinite && ticks() >= deadline) { return 0; }
 
-        #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("sti; nop; cli"); }
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
+        irq_window();
         yield_now("epoll_wait");
     }
 }
@@ -3604,10 +3592,7 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize)
             return nready;
         }
 
-        #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("sti; nop; cli"); }
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2"); }
+        irq_window();
 
         yield_now("select");
     }

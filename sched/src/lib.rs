@@ -426,29 +426,54 @@ pub fn wait_pid(pid: Pid) -> Option<(Pid, i32)> {
             // `find_pid_idx == None` branch above then picks up.
         }
         
-        unsafe {
-            #[cfg(target_arch = "x86_64")]
-            core::arch::asm!("sti; nop; cli");
-            #[cfg(target_arch = "aarch64")]
-            core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2");
-        }
+        irq_window();
 
         yield_now("wait_pid");
     }
 }
 
-    pub fn yield_now(reason: &str) {
-        let _ = reason;
-        let id = unsafe { cpu_id() };
-        unsafe {
-            if let Some(ctx_ptr) = CURRENT_CTX[id].as_mut() {
-                context::cpu_switch_to(
-                    ctx_ptr,
-                    core::ptr::addr_of!(SCHEDULER_CTX[id]),
-                );
-            }
+/// Briefly open an interrupt window so pended IRQs (local timer tick,
+/// reschedule IPI) get delivered, then mask again.  Every kernel-context
+/// wait loop must call this each iteration: syscalls run with IRQs
+/// masked, so a task that yield-polls in kernel mode otherwise keeps its
+/// CPU IF=0 indefinitely.  CPU 0 is the global timekeeper (TIMER_TICKS)
+/// and input drain, so starving it freezes nanosleep/poll deadlines and
+/// stdin system-wide.
+///
+/// x86-64: the window must be `sti; pause; cli`, NOT `sti; nop; cli`.
+/// Under QEMU TCG the `sti` interrupt shadow suppresses exactly one
+/// delivery check (at the TB boundary sti forces), and a plain `nop`
+/// then runs on in chained translated code with no further check before
+/// `cli` closes the window — a pended interrupt is essentially never
+/// taken, and the global tick freezes for seconds whenever CPU 0 hosts
+/// only kernel-mode pollers (observed as doom/shell multi-second
+/// stalls; LAPIC dump showed vector 32 stuck in IRR with IF=0).
+/// `pause` exits the TCG execution loop *after* the shadow is consumed,
+/// creating a real delivery point; on hardware it is the standard
+/// spin-wait hint.  AArch64 has no interrupt shadow — the DAIF write
+/// itself ends the translation block and the next entry delivers.
+#[inline(always)]
+pub fn irq_window() {
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("sti; pause; cli");
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("msr daifclr, #2; nop; msr daifset, #2");
+    }
+}
+
+pub fn yield_now(reason: &str) {
+    let _ = reason;
+    let id = unsafe { cpu_id() };
+    unsafe {
+        if let Some(ctx_ptr) = CURRENT_CTX[id].as_mut() {
+            context::cpu_switch_to(
+                ctx_ptr,
+                core::ptr::addr_of!(SCHEDULER_CTX[id]),
+            );
         }
     }
+}
 
 pub fn timer_tick_irq() {
     let id = unsafe { cpu_id() };
@@ -606,6 +631,17 @@ fn scheduler_run_loop() -> ! {
         serial_print(b"\n".as_ptr(), 1);
     }
     loop {
+        // Deliver any pended IRQs (timer tick, resched IPI) once per
+        // scheduling cycle.  This is the systemic guarantee that a CPU
+        // hosting only kernel-context wait loops still takes its local
+        // timer: every yield passes through here, whereas per-loop
+        // irq_window() calls depend on each wait site remembering to open
+        // one (several — init's poll loops, VFS lock waits — did not).
+        // Safe here: this is the scheduler context, not an IRQ handler, and
+        // a tick arriving in the window only sets PREEMPT_NEEDED (its
+        // preempt_check sees CURRENT_CTX == null and returns).
+        irq_window();
+
         // Pick, claim (on_cpu) and mark Running under a single lock so no
         // other CPU can dispatch the same task between pick and claim.
         let picked = {
