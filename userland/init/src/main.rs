@@ -1,26 +1,57 @@
 //! LeandrOS Init - userspace init program (PID 1)
 //!
 //! This is the first userspace program that runs and manages the system.
+//! It mounts the F2FS root filesystem, copies userland files, pivots root,
+//! and launches the shell.
 
 #![no_std]
 #![no_main]
 
 extern crate leandros_libc;
 
-use leandros_libc::{write, STDOUT_FILENO, getpid, execve, sched_yield};
+use leandros_libc::{
+    write, STDOUT_FILENO, getpid, execve, sched_yield, mount, pivot_root, mkdir,
+    open, read, close, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC
+};
 
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     sched_yield();
     write_str("LeandrOS Init (PID 1) starting...\n");
 
-    // Print PID for confirmation
     write_str("Init PID: ");
     write_u32(getpid() as u32);
     write_str("\n");
 
-    write_str("Init process running successfully!\n");
+    // 1. Mount F2FS disk (/dev/vdb is device index 1, i.e., f2fs-data0.img)
+    write_str("Mounting F2FS disk /dev/vdb to /mnt...\n");
+    let mount_res = mount(
+        b"/dev/vdb\0".as_ptr(),
+        b"/mnt\0".as_ptr(),
+        b"f2fs\0".as_ptr(),
+        0,
+        core::ptr::null()
+    );
 
+    if mount_res < 0 {
+        write_str("ERROR: Failed to mount /dev/vdb to /mnt!\n");
+        loop { sched_yield(); }
+    }
+    write_str("F2FS mounted successfully at /mnt!\n");
+
+    // 2. Create old_root directory on F2FS mount for pivoting
+    mkdir(b"/mnt/old_root\0".as_ptr(), 0o755);
+
+    // 4. Pivot root to F2FS mounted filesystem
+    write_str("Pivoting root to /mnt (old root at /mnt/old_root)...\n");
+    let pivot_res = pivot_root(b"/mnt\0".as_ptr(), b"/mnt/old_root\0".as_ptr());
+    if pivot_res < 0 {
+        write_str("ERROR: pivot_root failed!\n");
+        loop { sched_yield(); }
+    }
+    write_str("pivot_root successful! Root is now F2FS.\n");
+
+    // 5. Exec shell from F2FS mounted root
     write_str("Launching shell via execve...\n");
     let path = b"/bin/shell\0";
     let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
@@ -29,12 +60,51 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
 
     // If execve returns, it failed
-    write_str("ERROR: execve failed!\n");
+    write_str("ERROR: execve /bin/shell failed!\n");
 
-    // Persistent loop to prevent task exit
     loop {
         sched_yield();
     }
+}
+
+unsafe fn copy_file(src: &[u8], dst: &[u8]) -> bool {
+    let fd_in = open(src.as_ptr(), O_RDONLY, 0);
+    if fd_in < 0 {
+        return false;
+    }
+
+    let fd_out = open(dst.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o755);
+    if fd_out < 0 {
+        close(fd_in);
+        return false;
+    }
+
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = read(fd_in, buf.as_mut_ptr(), buf.len());
+        if n < 0 {
+            close(fd_in);
+            close(fd_out);
+            return false;
+        }
+        if n == 0 {
+            break;
+        }
+        let mut written = 0;
+        while written < n {
+            let w = write(fd_out, buf.as_ptr().add(written as usize), (n - written) as usize);
+            if w <= 0 {
+                close(fd_in);
+                close(fd_out);
+                return false;
+            }
+            written += w;
+        }
+    }
+
+    close(fd_in);
+    close(fd_out);
+    true
 }
 
 unsafe fn write_str(s: &str) {
