@@ -168,6 +168,46 @@ extern "C" {
     pub fn cpu_switch_to(old: *mut CpuContext, new: *const CpuContext);
 }
 
+/// Read this CPU's *live* TLS-base register directly, rather than trusting
+/// any `Task`-side shadow copy.
+///
+/// `Task::tls_base` (see `set_fs_base`) is only kept in sync on x86-64,
+/// where `arch_prctl(ARCH_SET_FS)` traps into the kernel. AArch64 has no
+/// such syscall — musl's startup code sets TPIDR_EL0 with a plain `msr`
+/// from EL0, which the kernel never observes — so `Task::tls_base` stays 0
+/// for the whole lifetime of an AArch64 process while the hardware register
+/// is very much set. `cpu_switch_to`'s own save/restore (above) proves the
+/// register itself is always the source of truth: it round-trips the live
+/// value on every switch instead of reading back a bookkeeping field.
+/// Callers that need "what TLS base does the *currently running* task have
+/// right now" (e.g. clone()'s vfork-style fallback, which inherits the
+/// caller's TLS when CLONE_SETTLS is absent) must ask the register, not the
+/// Task struct.
+#[cfg(target_arch = "x86_64")]
+pub fn current_tls_base() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") 0xC0000100u32,
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn current_tls_base() -> u64 {
+    let v: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) v, options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(r#"
 .global cpu_switch_to

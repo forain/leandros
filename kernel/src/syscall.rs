@@ -3326,6 +3326,30 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         return 0;
     }
 
+    // FIONBIO — std's `Pipe::set_nonblocking` (used by `Command::output()`'s
+    // internal read loop, which crossterm's `tput` terminal-size fallback
+    // goes through) issues this instead of fcntl(F_SETFL). Previously any
+    // fd outside the TTY server's own ranges fell straight through to
+    // tty_server::handle_ioctl and got ENOTTY, which std unconditionally
+    // unwraps deep in read_output() — a libstd invariant violation that
+    // panicked the whole process. Route it through the same F_GETFL/F_SETFL
+    // path plain fcntl() uses, scoped to ordinary VFS fds (pipes/files);
+    // net/tty fds keep their existing (or future) FIONBIO handling.
+    const FIONBIO: usize = 0x5421;
+    if cmd == FIONBIO && fd < net_server::SOCK_FD_BASE {
+        if arg == 0 || !validate_user_buf(arg, 4) { return -14; }
+        const F_GETFL: usize = 3;
+        const F_SETFL: usize = 4;
+        const O_NONBLOCK: usize = 0x800;
+        let nonblocking = unsafe { (arg as *const i32).read() } != 0;
+        let get_msg = make_vfs_msg(vfs::VFS_FCNTL, &[fd as u64, F_GETFL as u64, 0]);
+        let cur = vfs_reply_val(&vfs::handle(&get_msg, pid));
+        if cur < 0 { return cur; }
+        let flags = if nonblocking { cur as usize | O_NONBLOCK } else { cur as usize & !O_NONBLOCK };
+        let set_msg = make_vfs_msg(vfs::VFS_FCNTL, &[fd as u64, F_SETFL as u64, flags as u64]);
+        return vfs_reply_val(&vfs::handle(&set_msg, pid));
+    }
+
     // DRM ioctl commands
     const DRM_IOCTL_GET_MODE: usize = 0x1003;
     const DRM_IOCTL_SET_MODE: usize = 0x1001;

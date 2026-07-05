@@ -163,6 +163,39 @@ impl ProcTtyTable {
 static TTY_TABLES: Mutex<[ProcTtyTable; MAX_PROCS]> =
     Mutex::new([const { ProcTtyTable::empty() }; MAX_PROCS]);
 
+// ── Hardwired console fds (0/1/2) ─────────────────────────────────────────────
+// The kernel's sys_read/sys_write fast paths (and VFS's alloc_fd, which
+// refuses to ever hand out 0-2) route stdin/stdout/stderr straight to the
+// serial console without going through TTY_OPEN, so they never get a slot in
+// TTY_TABLES. But isatty()/tcgetattr()/tcsetattr() on those fds still need to
+// work — that's exactly what terminal apps (e.g. crossterm, used by
+// `bottom`) probe before entering raw mode — so give them their own small
+// per-pid termios record, keyed the same way as TTY_TABLES/TIMER_TABLES.
+#[derive(Clone, Copy)]
+struct ConsoleTermios {
+    pid:     u32,
+    in_use:  bool,
+    termios: Termios,
+}
+
+impl ConsoleTermios {
+    const fn empty() -> Self {
+        Self { pid: 0, in_use: false, termios: Termios::default_console() }
+    }
+}
+
+static CONSOLE_TERMIOS: Mutex<[ConsoleTermios; MAX_PROCS]> =
+    Mutex::new([const { ConsoleTermios::empty() }; MAX_PROCS]);
+
+fn get_or_create_console<'a>(pid: u32, tbl: &'a mut [ConsoleTermios]) -> Option<&'a mut ConsoleTermios> {
+    if let Some(pos) = tbl.iter().position(|t| t.in_use && t.pid == pid) {
+        return Some(&mut tbl[pos]);
+    }
+    let pos = tbl.iter().position(|t| !t.in_use)?;
+    tbl[pos] = ConsoleTermios { pid, in_use: true, termios: Termios::default_console() };
+    Some(&mut tbl[pos])
+}
+
 // ── PTY pairs ────────────────────────────────────────────────────────────────
 
 const MAX_PTS: usize = 8;
@@ -370,6 +403,10 @@ pub fn close_all(pid: u32) {
     if let Some(t) = timers.iter_mut().find(|t| t.in_use && t.pid == pid) {
         *t = ProcTimerTable::empty();
     }
+    let mut console = CONSOLE_TERMIOS.lock();
+    if let Some(c) = console.iter_mut().find(|c| c.in_use && c.pid == pid) {
+        *c = ConsoleTermios::empty();
+    }
 }
 
 // ── TTY handlers ──────────────────────────────────────────────────────────────
@@ -489,28 +526,37 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
 }
 
 fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg_ptr: usize) -> Message {
-    // Linux ioctl commands for termios:
-    // TCGETS  = 0x5401
-    // TCSETS  = 0x5402
-    // TCSETSW = 0x5403
-    // TCSETSF = 0x5404
-    // TIOCGWINSZ = 0x5413
+    if fd <= 2 {
+        // stdin/stdout/stderr never go through TTY_OPEN — see ConsoleTermios.
+        let mut console = CONSOLE_TERMIOS.lock();
+        let c = match get_or_create_console(pid, &mut *console) {
+            Some(c) => c, None => return err_reply(-25),
+        };
+        return termios_ioctl(cmd, arg_ptr, &mut c.termios);
+    }
+
+    let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-25) }; // ENOTTY
+    let mut tbls = TTY_TABLES.lock();
+    let tbl = match find_tty(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-25) };
+    if slot >= MAX_TTYS || !tbl.ttys[slot].in_use { return err_reply(-25); }
+    termios_ioctl(cmd, arg_ptr, &mut tbl.ttys[slot].termios)
+}
+
+/// Linux ioctl commands for termios:
+/// TCGETS = 0x5401, TCSETS = 0x5402, TCSETSW = 0x5403, TCSETSF = 0x5404,
+/// TIOCGWINSZ = 0x5413. Shared by [`handle_ioctl`]'s slot-table path and its
+/// fd-0/1/2 console path, which differ only in where `t` lives.
+fn termios_ioctl(cmd: usize, arg_ptr: usize, t: &mut Termios) -> Message {
     const TCGETS:     usize = 0x5401;
     const TCSETS:     usize = 0x5402;
     const TCSETSW:    usize = 0x5403;
     const TCSETSF:    usize = 0x5404;
     const TIOCGWINSZ: usize = 0x5413;
 
-    let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-25) }; // ENOTTY
-    let mut tbls = TTY_TABLES.lock();
-    let tbl = match find_tty(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-25) };
-    if slot >= MAX_TTYS || !tbl.ttys[slot].in_use { return err_reply(-25); }
-
     match cmd {
         TCGETS => {
             // struct termios is 36 bytes on Linux.  We write our fields.
             if arg_ptr == 0 { return err_reply(-14); }
-            let t = &tbl.ttys[slot].termios;
             unsafe {
                 core::ptr::write(arg_ptr           as *mut u32, t.c_iflag);
                 core::ptr::write((arg_ptr + 4)     as *mut u32, t.c_oflag);
@@ -523,7 +569,6 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg_ptr: usize) -> Message {
         }
         TCSETS | TCSETSW | TCSETSF => {
             if arg_ptr == 0 { return err_reply(-14); }
-            let t = &mut tbl.ttys[slot].termios;
             unsafe {
                 t.c_iflag = core::ptr::read(arg_ptr         as *const u32);
                 t.c_oflag = core::ptr::read((arg_ptr + 4)   as *const u32);
@@ -568,6 +613,7 @@ fn handle_close(pid: u32, fd: usize) -> Message {
 }
 
 fn handle_isatty(pid: u32, fd: usize) -> Message {
+    if fd <= 2 { return val_reply(1); } // hardwired to the serial console
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return val_reply(0) };
     let tbls = TTY_TABLES.lock();
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {

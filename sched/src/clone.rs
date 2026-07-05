@@ -290,7 +290,22 @@ pub fn clone_thread(
 
         // ── Build child CpuContext ────────────────────────────────────────────
         let mut child_ctx = CpuContext::zeroed();
-        let child_tls = if flags & CLONE_SETTLS != 0 { tls as u64 } else { 0 };
+        // Real Linux clone() always inherits the caller's *current* TLS base
+        // into the child; CLONE_SETTLS only *overrides* it with a caller-
+        // supplied one, it's never the difference between "some TLS" and
+        // "no TLS" (see fork_current's identical t.tls_base carry-over,
+        // which covers the CLONE_VM-clear fork() case). Forcing 0 here for
+        // any clone() that omits CLONE_SETTLS broke vfork()-style spawns —
+        // musl's Command::spawn() posix_spawn fast path calls
+        // clone(CLONE_VM|CLONE_VFORK|SIGCHLD) with no TLS args at all,
+        // expecting the child to keep running with the parent's live TLS
+        // block (e.g. for errno) until it execve()s or _exit()s. Zeroing it
+        // null-derefs on the child's very first thread-local access.
+        // Read the register directly (crate::context::current_tls_base), not
+        // Task::tls_base — that shadow field is never populated on AArch64
+        // (see current_tls_base's doc comment), and reading it here would
+        // silently reintroduce the same null-TLS crash on that arch alone.
+        let child_tls = if flags & CLONE_SETTLS != 0 { tls as u64 } else { crate::context::current_tls_base() };
 
         #[cfg(target_arch = "aarch64")]
         {
