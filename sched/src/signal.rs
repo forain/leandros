@@ -105,13 +105,13 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
             if let Some(idx) = rq.find_pid_idx(pid) {
                 if let Some(t) = rq.get_mut(idx) {
                     t.signal_pending &= !(1u64 << (sig - 1));
-                    if action.flags & SA_NODEFER == 0 {
+                    if action.get_flags() & SA_NODEFER == 0 {
                         t.signal_mask |= (1u64 << (sig - 1)) | action.mask;
                     }
                 }
             }
             // SA_RESETHAND: revert to SIG_DFL on the shared (TGID leader) table.
-            if action.flags & SA_RESETHAND != 0 && tgid != 0 {
+            if action.get_flags() & SA_RESETHAND != 0 && tgid != 0 {
                 if let Some(idx) = rq.find_pid_idx(tgid) {
                     if let Some(leader) = rq.get_mut(idx) {
                         leader.signal_actions[(sig - 1) as usize].handler = 0;
@@ -134,13 +134,13 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                 continue;
             }
             handler => {
-                let restorer = if action.flags & SA_RESTORER != 0 {
-                    action.restorer
+                let restorer = if action.get_flags() & SA_RESTORER != 0 {
+                    action.get_restorer()
                 } else {
                     0 // no restorer — signal handler must not return
                 };
 
-                if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask, action.flags) {
+                if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask, action.get_flags()) {
                     // Frame write failed (stack fault) — deliver SIGSEGV.
                     super::exit(128 + SIGSEGV as i32);
                 }

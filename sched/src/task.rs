@@ -70,24 +70,50 @@ pub fn nice_to_weight(nice: i8) -> u32 {
 /// Per-signal disposition. `sys_sigaction` (`sched/src/signal.rs`) reads/
 /// writes this directly via `core::ptr::read`/`write` against whatever the
 /// caller passed as `struct sigaction*`, so the field order here must match
-/// the real POSIX/relibc layout (`sa_handler, sa_flags, sa_restorer,
-/// sa_mask` — see `userland/relibc/src/header/signal/mod.rs`) byte-for-byte,
-/// not just by name.
+/// the real POSIX/relibc/Linux layout byte-for-byte, not just by name.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SigAction {
     /// Handler address: 0 = SIG_DFL, 1 = SIG_IGN, else a user-space fn ptr.
     pub handler:  usize,
+
+    #[cfg(target_arch = "x86_64")]
     pub flags:    u32,
+    #[cfg(target_arch = "x86_64")]
     /// `sa_restorer` — user-space trampoline that calls `sys_rt_sigreturn`.
     /// 0 = use the kernel's built-in trampoline page.
     pub restorer: usize,
+    #[cfg(target_arch = "x86_64")]
     /// Signal mask to apply during handler execution.
     pub mask:     u64,
+
+    #[cfg(target_arch = "aarch64")]
+    /// Signal mask to apply during handler execution.
+    pub mask:     u64,
+    #[cfg(target_arch = "aarch64")]
+    pub flags:    u64,
 }
 
+#[cfg(target_arch = "x86_64")]
 pub const DEFAULT_SIGACTION: SigAction =
-    SigAction { handler: 0, flags: 0, mask: 0, restorer: 0 };
+    SigAction { handler: 0, flags: 0, restorer: 0, mask: 0 };
+
+#[cfg(target_arch = "aarch64")]
+pub const DEFAULT_SIGACTION: SigAction =
+    SigAction { handler: 0, mask: 0, flags: 0 };
+
+impl SigAction {
+    pub fn get_flags(&self) -> u32 {
+        self.flags as u32
+    }
+
+    pub fn get_restorer(&self) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        { self.restorer }
+        #[cfg(target_arch = "aarch64")]
+        { 0 }
+    }
+}
 
 #[repr(C)]
 pub struct Task {
