@@ -130,6 +130,10 @@ pub const SYS_IPC_SEND: usize = 511;
 pub const SYS_IPC_RECV: usize = 512;
 pub const SYS_IPC_CALL: usize = 513;
 pub const SYS_SPAWN:    usize = 510;
+/// Create a queue-based port owned by the calling task and return its id.
+/// Exists so userspace can exercise the raw send/recv blocking path
+/// directly (see userland/racetest); servers create their ports kernel-side.
+pub const SYS_PORT_CREATE: usize = 514;
 
 // ── AArch64 Linux syscall numbers ─────────────────────────────────────────────
 #[cfg(target_arch = "aarch64")]
@@ -563,6 +567,10 @@ fn dispatch_inner(
         SYS_IPC_SEND => sys_send(a0, a1, a2),
         SYS_IPC_RECV => sys_recv(a0, a1),
         SYS_IPC_CALL => sys_call(a0, a1, a2),
+        SYS_PORT_CREATE => match port::create(current_pid()) {
+            Some(p) => p as isize,
+            None    => -12, // ENOMEM — port table full
+        },
 
         // ── Memory ────────────────────────────────────────────────────────────
         MMAP     => sys_mmap(a0, a1, a2, a3, a4, a5),
