@@ -148,3 +148,46 @@ pub fn futex_wake(uaddr: usize, n: u32) -> u32 {
     }
     woken
 }
+
+/// Requeue waiters from `uaddr` to `uaddr2`.
+///
+/// Wakes up to `val` waiters on `uaddr`, and moves up to `requeue_limit` remaining waiters to `uaddr2`.
+/// Returns the total number of waiters woken + requeued.
+pub fn futex_requeue(uaddr: usize, uaddr2: usize, val: u32, requeue_limit: u32) -> isize {
+    let mut tbl = FUTEX_TABLE.lock();
+    let mut rq  = RUN_QUEUE.lock();
+    let min_vr  = rq.min_vruntime();
+    let mut woken = 0u32;
+    let mut requeued = 0u32;
+
+    for slot in tbl.iter_mut() {
+        let Some(w) = *slot else { continue };
+        if w.uaddr != uaddr { continue; }
+
+        if woken < val {
+            if let Some(t) = rq.find_pid_mut(w.pid) {
+                if t.state == TaskState::Blocked {
+                    t.state         = TaskState::Ready;
+                    t.blocked_futex = 0;
+                    t.place(min_vr);
+                    woken += 1;
+                }
+            }
+            *slot = None;
+        } else if requeued < requeue_limit {
+            if let Some(t) = rq.find_pid_mut(w.pid) {
+                if t.state == TaskState::Blocked {
+                    t.blocked_futex = uaddr2;
+                    *slot = Some(FutexWaiter { pid: w.pid, uaddr: uaddr2 });
+                    requeued += 1;
+                }
+            }
+        }
+    }
+
+    if woken > 0 {
+        super::wake_up_an_idle_cpu();
+    }
+
+    (woken + requeued) as isize
+}

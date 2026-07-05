@@ -31,7 +31,7 @@ pub mod task;
 
 pub use clone::{fork_current, clone_thread};
 pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack};
-pub use futex::{futex_wait, futex_wake};
+pub use futex::{futex_wait, futex_wake, futex_requeue};
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
@@ -834,6 +834,21 @@ pub fn exit(code: i32) -> ! {
         print_number(code as u32);
         serial_print(b"\n".as_ptr(), 1);
     }
+
+    let clear_addr = {
+        let rq = RUN_QUEUE.lock();
+        rq.find_pid(pid).map(|t| t.clear_child_tid).unwrap_or(0)
+    };
+    if clear_addr != 0 {
+        let zero = 0u32;
+        let written = with_current_address_space(|as_| {
+            as_.write_user_buf(clear_addr, &zero.to_ne_bytes())
+        }).unwrap_or(false);
+        if written {
+            futex_wake(clear_addr, 1);
+        }
+    }
+
     {
         let mut rq = RUN_QUEUE.lock();
         if let Some(t) = rq.find_pid_mut(pid) {
