@@ -1147,10 +1147,23 @@ fn resolve_path(ms: &mut MountState, path: &[u8]) -> u32 {
 fn strip_prefix<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     if path.starts_with(prefix) {
         let rest = &path[prefix.len()..];
-        if rest.is_empty() || rest[0] == b'/' { Some(rest) } else { None }
+        if prefix == b"/" {
+            Some(rest)
+        } else if rest.is_empty() || rest[0] == b'/' {
+            Some(rest)
+        } else {
+            None
+        }
     } else {
         None
     }
+}
+
+fn get_relative_path<'a>(ms: &MountState, path: &'a [u8]) -> Option<&'a [u8]> {
+    if let Some(r) = strip_prefix(path, ms.mount_prefix.as_bytes()) {
+        return Some(r);
+    }
+    strip_prefix(path, b"/")
 }
 
 /// Return parent path and final component of path.
@@ -1171,7 +1184,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, _mode: u64) -> Me
         core::slice::from_raw_parts(ptr, len)
     };
 
-    let rel = match strip_prefix(path_bytes, ms.mount_prefix.as_bytes()) {
+    let rel = match get_relative_path(ms, path_bytes) {
         Some(r) => r,
         None    => return err_reply(-2), // ENOENT
     };
@@ -1271,7 +1284,7 @@ fn handle_stat(ms: &mut MountState, path_ptr: u64, stat_ptr: u64) -> Message {
         while *ptr.add(len) != 0 { len += 1; }
         core::slice::from_raw_parts(ptr, len)
     };
-    let rel = match strip_prefix(path_bytes, ms.mount_prefix.as_bytes()) {
+    let rel = match get_relative_path(ms, path_bytes) {
         Some(r) => r,
         None    => return err_reply(-2),
     };
@@ -1317,6 +1330,8 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) 
 
     let mut written = 0usize;
     let max = count as usize;
+    let current_pos = ms.open_files[slot].pos;
+    let mut entry_idx = 0u64;
 
     // linux_dirent64 layout: ino(8)+off(8)+reclen(2)+type(1)+name(var)+null(1), padded to 8
     for blk_idx in 0..n_data_blks {
@@ -1341,30 +1356,39 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) 
             // Compute dirent size: 8+8+2+1+name_len+1 rounded up to 8
             let base_size = 8 + 8 + 2 + 1 + name_len + 1;
             let reclen    = (base_size + 7) & !7;
-            if written + reclen > max { break; }
 
-            unsafe {
-                let d = (buf_ptr as *mut u8).add(written);
-                // d_ino
-                core::ptr::copy_nonoverlapping(child_ino.to_le_bytes().as_ptr(), d, 8);
-                // d_off (use running offset as dummy)
-                core::ptr::copy_nonoverlapping(((written + reclen) as u64).to_le_bytes().as_ptr(), d.add(8), 8);
-                // d_reclen
-                core::ptr::copy_nonoverlapping((reclen as u16).to_le_bytes().as_ptr(), d.add(16), 2);
-                // d_type
-                *d.add(18) = ftype;
-                // d_name
-                if n_off + name_len <= BLOCK_SIZE {
-                    core::ptr::copy_nonoverlapping(dblk[n_off..].as_ptr(), d.add(19), name_len);
+            if entry_idx >= current_pos {
+                if written + reclen > max {
+                    ms.open_files[slot].pos = entry_idx;
+                    return val_reply(written as u64);
                 }
-                *d.add(19 + name_len) = 0; // null terminator
-            }
-            written += reclen;
 
+                unsafe {
+                    let d = (buf_ptr as *mut u8).add(written);
+                    // d_ino
+                    core::ptr::copy_nonoverlapping(child_ino.to_le_bytes().as_ptr(), d, 8);
+                    // d_off
+                    let next_pos = entry_idx + 1;
+                    core::ptr::copy_nonoverlapping(next_pos.to_le_bytes().as_ptr(), d.add(8), 8);
+                    // d_reclen
+                    core::ptr::copy_nonoverlapping((reclen as u16).to_le_bytes().as_ptr(), d.add(16), 2);
+                    // d_type
+                    *d.add(18) = ftype;
+                    // d_name
+                    if n_off + name_len <= BLOCK_SIZE {
+                        core::ptr::copy_nonoverlapping(dblk[n_off..].as_ptr(), d.add(19), name_len);
+                    }
+                    *d.add(19 + name_len) = 0; // null terminator
+                }
+                written += reclen;
+            }
+
+            entry_idx += 1;
             let slots_used = (name_len + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN;
             slot_idx += slots_used.max(1);
         }
     }
+    ms.open_files[slot].pos = entry_idx;
     val_reply(written as u64)
 }
 
@@ -1375,7 +1399,7 @@ fn handle_mkdir(ms: &mut MountState, path_ptr: u64, _mode: u64) -> Message {
         while *ptr.add(len) != 0 { len += 1; }
         core::slice::from_raw_parts(ptr, len)
     };
-    let rel = match strip_prefix(path_bytes, ms.mount_prefix.as_bytes()) {
+    let rel = match get_relative_path(ms, path_bytes) {
         Some(r) => r,
         None    => return err_reply(-2),
     };
@@ -1418,7 +1442,7 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
         while *ptr.add(len) != 0 { len += 1; }
         core::slice::from_raw_parts(ptr, len)
     };
-    let rel = match strip_prefix(path_bytes, ms.mount_prefix.as_bytes()) {
+    let rel = match get_relative_path(ms, path_bytes) {
         Some(r) => r,
         None    => return err_reply(-2),
     };
@@ -1479,7 +1503,7 @@ fn handle_rmdir(ms: &mut MountState, path_ptr: u64) -> Message {
         while *ptr.add(len) != 0 { len += 1; }
         core::slice::from_raw_parts(ptr, len)
     };
-    let rel = match strip_prefix(path_bytes, ms.mount_prefix.as_bytes()) {
+    let rel = match get_relative_path(ms, path_bytes) {
         Some(r) => r,
         None    => return err_reply(-2),
     };
@@ -1513,10 +1537,10 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
         while *ptr.add(len) != 0 { len += 1; }
         core::slice::from_raw_parts(ptr, len)
     };
-    let old_rel = match strip_prefix(old_bytes, ms.mount_prefix.as_bytes()) {
+    let old_rel = match get_relative_path(ms, old_bytes) {
         Some(r) => r, None => return err_reply(-2),
     };
-    let new_rel = match strip_prefix(new_bytes, ms.mount_prefix.as_bytes()) {
+    let new_rel = match get_relative_path(ms, new_bytes) {
         Some(r) => r, None => return err_reply(-2),
     };
     let (old_parent_rel, old_name) = path_split(old_rel);

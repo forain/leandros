@@ -31,6 +31,7 @@
 use ipc::{Message, port};
 use spin::Mutex;
 
+extern crate alloc;
 extern crate mm;
 
 // ── Protocol tag constants ────────────────────────────────────────────────────
@@ -66,6 +67,8 @@ pub const VFS_FCHMOD:          u64 = 0x2C; // fchmod(fd, mode) → 0 or -errno
 pub const VFS_CHOWN:           u64 = 0x2D; // chown(path_ptr, uid, gid) → 0 or -errno
 pub const VFS_FCHOWN:          u64 = 0x2E; // fchown(fd, uid, gid) → 0 or -errno
 pub const VFS_POLL:            u64 = 0x2F; // poll(fd) → revents bitmask (POLLIN/OUT/ERR/HUP)
+pub const VFS_PIVOT_ROOT:      u64 = 0x30;
+
 
 /// Readiness bitmask, numerically identical to Linux's POLLIN/POLLOUT/POLLERR/
 /// POLLHUP (and thus also EPOLLIN/EPOLLOUT/EPOLLERR/EPOLLHUP) so one value
@@ -288,7 +291,7 @@ fn find_mount_port(path: &[u8]) -> Option<u32> {
     for e in m.iter() {
         if !e.in_use { continue; }
         let pb = e.prefix.as_bytes();
-        if path.starts_with(pb) && (path.len() == pb.len() || path.get(pb.len()) == Some(&b'/')) {
+        if path.starts_with(pb) && (pb == b"/" || path.len() == pb.len() || path.get(pb.len()) == Some(&b'/')) {
             if pb.len() >= best_len {
                 best_len = pb.len();
                 best_port = e.port;
@@ -637,6 +640,7 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/proc",
     b"/bin",
     b"/tmp",
+    b"/mnt",
     b"/home",
     b"/root",
     b"/proc/net",
@@ -775,9 +779,64 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         VFS_FCHOWN           => handle_fchown(caller_pid, arg(msg,0) as usize,
                                                arg(msg,1) as u32, arg(msg,2) as u32),
         VFS_POLL             => handle_poll(caller_pid, arg(msg,0) as usize),
+        VFS_PIVOT_ROOT       => handle_pivot_root(arg(msg,0) as usize, arg(msg,1) as usize),
         _                    => err_reply(-38), // ENOSYS
     }
 }
+
+fn handle_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> Message {
+    let (new_buf, new_len) = match read_cstr_raw(new_root_ptr) {
+        Some(r) => r,
+        None    => return err_reply(-14), // EFAULT
+    };
+    let new_root = &new_buf[..new_len];
+
+    let (old_buf, old_len) = match read_cstr_raw(put_old_ptr) {
+        Some(r) => r,
+        None    => return err_reply(-14), // EFAULT
+    };
+    let put_old = &old_buf[..old_len];
+
+    let mut norm_new = new_root;
+    if norm_new.ends_with(b"/") && norm_new.len() > 1 {
+        norm_new = &norm_new[..norm_new.len()-1];
+    }
+    let norm_new_str = match core::str::from_utf8(norm_new) {
+        Ok(s) => s,
+        Err(_) => return err_reply(-22), // EINVAL
+    };
+
+    let mut mounts = MOUNTS.lock();
+    let mount_idx = match mounts.iter().position(|m| m.in_use && m.prefix == norm_new_str) {
+        Some(idx) => idx,
+        None => return err_reply(-2), // ENOENT (new_root is not a mount point)
+    };
+
+    let rel_old = if put_old.starts_with(norm_new) {
+        let r = &put_old[norm_new.len()..];
+        if r.is_empty() {
+            b"/"
+        } else {
+            r
+        }
+    } else {
+        put_old
+    };
+
+    let put_old_str = match core::str::from_utf8(rel_old) {
+        Ok(s) => {
+            let s_obj = alloc::string::String::from(s);
+            alloc::boxed::Box::leak(s_obj.into_boxed_str())
+        }
+        Err(_) => return err_reply(-22), // EINVAL
+    };
+
+    mounts[mount_idx].prefix = "/";
+    *OLD_ROOT_PREFIX.lock() = Some(put_old_str);
+
+    ok_reply()
+}
+
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -790,10 +849,36 @@ const O_APPEND:    u32 = 0x400;
 #[allow(dead_code)]
 const O_DIRECTORY: u32 = 0x10000;
 
+static OLD_ROOT_PREFIX: Mutex<Option<&'static str>> = Mutex::new(None);
+
+fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
+    if path.starts_with(b"/dev/") || path.starts_with(b"/proc/")
+       || path.starts_with(b"/tmp/") || path.starts_with(b"/etc/")
+       || path == b"/dev" || path == b"/proc" || path == b"/tmp" || path == b"/etc"
+    {
+        return Some(path);
+    }
+    let old_root_prefix_lock = OLD_ROOT_PREFIX.lock();
+    if let Some(prefix) = *old_root_prefix_lock {
+        let pb = prefix.as_bytes();
+        if path.starts_with(pb) && (path.len() == pb.len() || path.get(pb.len()) == Some(&b'/')) {
+            let mut rest = &path[pb.len()..];
+            if rest.is_empty() {
+                rest = b"/";
+            }
+            return Some(rest);
+        }
+        None
+    } else {
+        Some(path)
+    }
+}
+
 /// Return true if `path` starts with the prefix `/tmp/` or equals `/tmp`.
 fn is_tmp_path(path: &[u8]) -> bool {
     path == b"/tmp" || path.starts_with(b"/tmp/")
 }
+
 
 /// Write a u32 decimal to `buf` starting at `pos`.  Returns new pos.
 fn write_u32(buf: &mut [u8; TMP_BUF_SIZE], pos: usize, mut v: u32) -> usize {
@@ -1043,147 +1128,156 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         path = &path[..path.len()-1];
     }
 
-    let kind = if path == b"/dev/null" {
-        VnodeKind::DevNull
-    } else if path == b"/dev/zero" {
-        VnodeKind::DevZero
-    } else if path == b"/dev/urandom" || path == b"/dev/random" {
-        VnodeKind::DevUrandom
-    } else if path == b"/dev/stdin" {
-        VnodeKind::DevStdio { target_fd: 0 }
-    } else if path == b"/dev/stdout" {
-        VnodeKind::DevStdio { target_fd: 1 }
-    } else if path == b"/dev/stderr" {
-        VnodeKind::DevStdio { target_fd: 2 }
-    } else if path == b"/dev/fb0" {
-        VnodeKind::DevFb { pos: 0 }
-    } else if is_tmp_path(path) && path != b"/tmp" {
-        // ── Writable /tmp file ────────────────────────────────────────────────
-        let writable = flags & (O_WRONLY | O_RDWR) != 0;
-        let create   = flags & O_CREAT  != 0;
-        let trunc    = flags & O_TRUNC  != 0;
-        let accmode  = flags & 0x3;
-        let want_read  = accmode != O_WRONLY;
-        let want_write = accmode == O_WRONLY || accmode == O_RDWR;
-        let euid = sched::euid_of(pid);
-        let egid = sched::egid_of(pid);
+    let kind = if let Some(lookup_path) = should_lookup_ramfs(path) {
+        if lookup_path == b"/dev/null" {
+            VnodeKind::DevNull
+        } else if lookup_path == b"/dev/zero" {
+            VnodeKind::DevZero
+        } else if lookup_path == b"/dev/urandom" || lookup_path == b"/dev/random" {
+            VnodeKind::DevUrandom
+        } else if lookup_path == b"/dev/stdin" {
+            VnodeKind::DevStdio { target_fd: 0 }
+        } else if lookup_path == b"/dev/stdout" {
+            VnodeKind::DevStdio { target_fd: 1 }
+        } else if lookup_path == b"/dev/stderr" {
+            VnodeKind::DevStdio { target_fd: 2 }
+        } else if lookup_path == b"/dev/fb0" {
+            VnodeKind::DevFb { pos: 0 }
+        } else if is_tmp_path(path) && (lookup_path != b"/tmp" && lookup_path != b"tmp") {
+            // ── Writable /tmp file ────────────────────────────────────────────────
+            let writable = flags & (O_WRONLY | O_RDWR) != 0;
+            let create   = flags & O_CREAT  != 0;
+            let trunc    = flags & O_TRUNC  != 0;
+            let accmode  = flags & 0x3;
+            let want_read  = accmode != O_WRONLY;
+            let want_write = accmode == O_WRONLY || accmode == O_RDWR;
+            let euid = sched::euid_of(pid);
+            let egid = sched::egid_of(pid);
 
-        let mut tmp = TMP_FILES.lock();
-        // Look for an existing entry.
-        let existing = tmp.iter().position(|e| {
-            e.in_use && !e.is_dir && e.path_len == path.len() && &e.path[..path.len()] == path
-        });
-        match existing {
-            Some(idx) => {
-                if !check_access(tmp[idx].mode, tmp[idx].uid, tmp[idx].gid, euid, egid, want_read, want_write) {
-                    return err_reply(-13); // EACCES
-                }
-                if trunc { tmp[idx].len = 0; }
-                let pos = if writable && trunc { 0 }
-                          else if flags & O_APPEND != 0 { tmp[idx].len }
-                          else { 0 };
-                VnodeKind::TmpFile { idx, pos, writable: writable || create }
-            }
-            None if create => {
-                // Allocate a new slot.
-                match tmp.iter().position(|e| !e.in_use) {
-                    Some(idx) => {
-                        tmp[idx] = TmpFileEntry::empty();
-                        tmp[idx].in_use   = true;
-                        tmp[idx].is_dir   = false;
-                        tmp[idx].mode     = mode & 0o777 & !sched::umask(u32::MAX);
-                        tmp[idx].uid      = euid;
-                        tmp[idx].gid      = egid;
-                        let copy_len = path.len().min(MAX_TMP_PATH - 1);
-                        tmp[idx].path[..copy_len].copy_from_slice(&path[..copy_len]);
-                        tmp[idx].path_len = copy_len;
-                        VnodeKind::TmpFile { idx, pos: 0, writable: true }
+            let mut tmp = TMP_FILES.lock();
+            // Look for an existing entry.
+            let existing = tmp.iter().position(|e| {
+                e.in_use && !e.is_dir && e.path_len == path.len() && &e.path[..path.len()] == path
+            });
+            match existing {
+                Some(idx) => {
+                    if !check_access(tmp[idx].mode, tmp[idx].uid, tmp[idx].gid, euid, egid, want_read, want_write) {
+                        return err_reply(-13); // EACCES
                     }
-                    None => return err_reply(-28), // ENOSPC
+                    if trunc { tmp[idx].len = 0; }
+                    let pos = if writable && trunc { 0 }
+                              else if flags & O_APPEND != 0 { tmp[idx].len }
+                              else { 0 };
+                    VnodeKind::TmpFile { idx, pos, writable: writable || create }
+                }
+                None if create => {
+                    // Allocate a new slot.
+                    match tmp.iter().position(|e| !e.in_use) {
+                        Some(idx) => {
+                            tmp[idx] = TmpFileEntry::empty();
+                            tmp[idx].in_use   = true;
+                            tmp[idx].is_dir   = false;
+                            tmp[idx].mode     = mode & 0o777 & !sched::umask(u32::MAX);
+                            tmp[idx].uid      = euid;
+                            tmp[idx].gid      = egid;
+                            let copy_len = path.len().min(MAX_TMP_PATH - 1);
+                            tmp[idx].path[..copy_len].copy_from_slice(&path[..copy_len]);
+                            tmp[idx].path_len = copy_len;
+                            VnodeKind::TmpFile { idx, pos: 0, writable: true }
+                        }
+                        None => return err_reply(-28), // ENOSPC
+                    }
+                }
+                None => return err_reply(-2), // ENOENT
+            }
+        } else if lookup_path.starts_with(b"/proc/self/") && lookup_path != b"/proc/self/" {
+            let kind = gen_proc_self(pid, lookup_path);
+            match kind {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/meminfo" || lookup_path == b"/proc/uptime"
+               || lookup_path == b"/proc/loadavg" || lookup_path == b"/proc/stat"
+               || lookup_path == b"/proc/self" {
+            match gen_proc_system(lookup_path) {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else {
+            // General lookup for RAMFS, initrd, and mounts
+            let mut found = {
+                let devices = DYNAMIC_DEVICES.lock();
+                devices.iter()
+                    .find(|d| d.in_use && d.path.as_bytes() == lookup_path)
+                    .map(|d| VnodeKind::DynamicDevice { port: d.port, dev_id: d.dev_id })
+            };
+            if found.is_none() {
+                for entry in RAMFS {
+                    if lookup_path == entry.path {
+                        found = Some(VnodeKind::RamFile { data: entry.data, pos: 0 });
+                        break;
+                    }
                 }
             }
-            None => return err_reply(-2), // ENOENT
-        }
-    } else if path.starts_with(b"/proc/self/") && path != b"/proc/self/" {
-        // ── Dynamic /proc/self/ entries — generated at open time ─────────────────
-        let kind = gen_proc_self(pid, path);
-        match kind {
-            Some(v) => v,
-            None    => return err_reply(-2), // ENOENT
-        }
-    } else if path == b"/proc/meminfo" || path == b"/proc/uptime"
-           || path == b"/proc/loadavg" || path == b"/proc/stat"
-           || path == b"/proc/self" {
-        // ── Dynamic /proc/ system-wide entries ───────────────────────────────────
-        match gen_proc_system(path) {
-            Some(v) => v,
-            None    => return err_reply(-2),
+            if found.is_none() {
+                for &dir in RAMFS_DIRS {
+                    if lookup_path == dir {
+                        found = Some(VnodeKind::RamFile { data: dir, pos: 0 });
+                        break;
+                    }
+                }
+            }
+            if found.is_none() && is_tmp_path(path) {
+                found = Some(VnodeKind::RamFile { data: b"/tmp", pos: 0 });
+            }
+            // Check tmpfs dirs
+            if found.is_none() && is_tmp_path(path) {
+                let tmp = TMP_FILES.lock();
+                if let Some(_idx) = tmp.iter().position(|e| {
+                    e.in_use && e.is_dir && e.path_len == path.len() && &e.path[..path.len()] == path
+                }) {
+                    found = Some(VnodeKind::DevNull);
+                }
+            }
+            if found.is_none() {
+                if let Some(data) = find_in_initrd(lookup_path) {
+                    found = Some(VnodeKind::RamFile { data, pos: 0 });
+                }
+            }
+            if found.is_none() {
+                if let Some(port) = find_mount_port(path) {
+                    let mut proxy = Message::empty();
+                    proxy.tag = VFS_OPEN;
+                    proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+                    proxy.data[8..16].copy_from_slice(&(flags as u64).to_le_bytes());
+                    proxy.data[16..24].copy_from_slice(&0u64.to_le_bytes());
+                    let reply = call_port(port, proxy);
+                    let file_id_raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
+                    if file_id_raw < 0 {
+                        return make_reply(file_id_raw);
+                    }
+                    found = Some(VnodeKind::MountedFile { port, file_id: file_id_raw as u32 });
+                }
+            }
+            match found { Some(v) => v, None => return err_reply(-2) }
         }
     } else {
-        // Check dynamic devices.
-        let mut found = {
-            let devices = DYNAMIC_DEVICES.lock();
-            devices.iter()
-                .find(|d| d.in_use && d.path.as_bytes() == path)
-                .map(|d| VnodeKind::DynamicDevice { port: d.port, dev_id: d.dev_id })
-        };
-
-        if found.is_none() {
-            // Check RamFS files first.
-            for entry in RAMFS {
-                if path == entry.path {
-                    found = Some(VnodeKind::RamFile { data: entry.data, pos: 0 });
-                    break;
-                }
+        // Only mounts should be checked if we are NOT looking up RAMFS
+        if let Some(port) = find_mount_port(path) {
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_OPEN;
+            proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&(flags as u64).to_le_bytes());
+            proxy.data[16..24].copy_from_slice(&0u64.to_le_bytes());
+            let reply = call_port(port, proxy);
+            let file_id_raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
+            if file_id_raw < 0 {
+                return make_reply(file_id_raw);
             }
+            VnodeKind::MountedFile { port, file_id: file_id_raw as u32 }
+        } else {
+            return err_reply(-2);
         }
-        if found.is_none() {
-            // Check known directories and /tmp subdirs (opened for getdents64).
-            for &dir in RAMFS_DIRS {
-                if path == dir {
-                    found = Some(VnodeKind::RamFile { data: dir, pos: 0 });
-                    break;
-                }
-            }
-        }
-        if found.is_none() && is_tmp_path(path) {
-            // /tmp itself — treat as directory
-            found = Some(VnodeKind::RamFile { data: b"/tmp", pos: 0 });
-        }
-        // Check tmpfs dirs
-        if found.is_none() {
-            let tmp = TMP_FILES.lock();
-            if let Some(_idx) = tmp.iter().position(|e| {
-                e.in_use && e.is_dir && e.path_len == path.len() && &e.path[..path.len()] == path
-            }) {
-                drop(tmp);
-                found = Some(VnodeKind::DevNull); // placeholder for empty dir fd
-            }
-        }
-        // Fall back to the initrd CPIO archive for files like /bin/doom1.wad.
-        if found.is_none() {
-            if let Some(data) = find_in_initrd(path) {
-                found = Some(VnodeKind::RamFile { data, pos: 0 });
-            }
-        }
-        // Check mounted filesystems (F2FS, etc.) — longest-prefix match.
-        if found.is_none() {
-            if let Some(port) = find_mount_port(path) {
-                // Proxy VFS_OPEN to the mount server; it returns a file_id (≥0) or -errno.
-                let mut proxy = Message::empty();
-                proxy.tag = VFS_OPEN;
-                proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
-                proxy.data[8..16].copy_from_slice(&(flags as u64).to_le_bytes());
-                proxy.data[16..24].copy_from_slice(&0u64.to_le_bytes());
-                let reply = call_port(port, proxy);
-                let file_id_raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
-                if file_id_raw < 0 {
-                    return make_reply(file_id_raw);
-                }
-                found = Some(VnodeKind::MountedFile { port, file_id: file_id_raw as u32 });
-            }
-        }
-        match found { Some(v) => v, None => return err_reply(-2) }
     };
 
     let mut tbls = FD_TABLES.lock();
@@ -2742,7 +2836,73 @@ fn handle_stat(path_ptr: usize, stat_ptr: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let path = &pbuf[..plen];
 
-    // Mounted filesystems take priority.
+    if let Some(lookup_path) = should_lookup_ramfs(path) {
+        // Known static directories.
+        for &dir in RAMFS_DIRS {
+            if lookup_path == dir {
+                write_stat(stat_ptr, 0o040755, 0, 1 + dir.as_ptr() as u64 & 0xFFFF);
+                return ok_reply();
+            }
+        }
+        // tmpfs directories.
+        if is_tmp_path(path) {
+            let tmp = TMP_FILES.lock();
+            if let Some(e) = tmp.iter().find(|e| e.in_use && e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
+                let ino = plen as u64 + 10000;
+                let mode = 0o040000 | if e.mode != 0 { e.mode } else { 0o755 };
+                let (uid, gid) = (e.uid, e.gid);
+                drop(tmp);
+                write_stat_owned(stat_ptr, mode, 0, ino, uid, gid);
+                return ok_reply();
+            }
+        }
+        // Special device files.
+        if lookup_path == b"/dev/null" || lookup_path == b"/dev/zero" || lookup_path == b"/dev/urandom"
+           || lookup_path == b"/dev/random" || lookup_path == b"/dev/fb0" {
+            write_stat(stat_ptr, 0o020666, 0, 2);
+            return ok_reply();
+        }
+        if lookup_path == b"/dev/stdin" || lookup_path == b"/dev/stdout" || lookup_path == b"/dev/stderr" {
+            write_stat(stat_ptr, 0o020666, 0, 3);
+            return ok_reply();
+        }
+        // Dynamic devices.
+        let dyn_found = {
+            let devices = DYNAMIC_DEVICES.lock();
+            devices.iter().any(|d| d.in_use && d.path.as_bytes() == lookup_path)
+        };
+        if dyn_found {
+            write_stat(stat_ptr, 0o020666, 0, 4);
+            return ok_reply();
+        }
+        // Static RamFS files.
+        for entry in RAMFS {
+            if lookup_path == entry.path {
+                write_stat(stat_ptr, 0o100444, entry.data.len() as u64, entry.path.as_ptr() as u64 & 0xFFFF);
+                return ok_reply();
+            }
+        }
+        // tmpfs files.
+        if is_tmp_path(path) {
+            let tmp = TMP_FILES.lock();
+            if let Some(e) = tmp.iter().find(|e| e.in_use && !e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
+                let size = e.len as u64;
+                let ino = plen as u64 + 20000;
+                let mode = 0o100000 | if e.mode != 0 { e.mode } else { 0o644 };
+                let (uid, gid) = (e.uid, e.gid);
+                drop(tmp);
+                write_stat_owned(stat_ptr, mode, size, ino, uid, gid);
+                return ok_reply();
+            }
+        }
+        // initrd CPIO archive.
+        if let Some(data) = find_in_initrd(lookup_path) {
+            write_stat(stat_ptr, 0o100444, data.len() as u64, path_ptr as u64 & 0xFFFF);
+            return ok_reply();
+        }
+    }
+
+    // Fall back to mounted filesystems.
     if let Some(port) = find_mount_port(path) {
         let mut proxy = Message::empty();
         proxy.tag = VFS_STAT;
@@ -2751,69 +2911,6 @@ fn handle_stat(path_ptr: usize, stat_ptr: usize) -> Message {
         return call_port(port, proxy);
     }
 
-    // Known static directories.
-    for &dir in RAMFS_DIRS {
-        if path == dir {
-            write_stat(stat_ptr, 0o040755, 0, 1 + dir.as_ptr() as u64 & 0xFFFF);
-            return ok_reply();
-        }
-    }
-    // tmpfs directories.
-    {
-        let tmp = TMP_FILES.lock();
-        if let Some(e) = tmp.iter().find(|e| e.in_use && e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
-            let ino = plen as u64 + 10000;
-            let mode = 0o040000 | if e.mode != 0 { e.mode } else { 0o755 };
-            let (uid, gid) = (e.uid, e.gid);
-            drop(tmp);
-            write_stat_owned(stat_ptr, mode, 0, ino, uid, gid);
-            return ok_reply();
-        }
-    }
-    // Special device files.
-    if path == b"/dev/null" || path == b"/dev/zero" || path == b"/dev/urandom"
-       || path == b"/dev/random" || path == b"/dev/fb0" {
-        write_stat(stat_ptr, 0o020666, 0, 2);
-        return ok_reply();
-    }
-    if path == b"/dev/stdin" || path == b"/dev/stdout" || path == b"/dev/stderr" {
-        write_stat(stat_ptr, 0o020666, 0, 3);
-        return ok_reply();
-    }
-    // Dynamic devices.
-    let dyn_found = {
-        let devices = DYNAMIC_DEVICES.lock();
-        devices.iter().any(|d| d.in_use && d.path.as_bytes() == path)
-    };
-    if dyn_found {
-        write_stat(stat_ptr, 0o020666, 0, 4);
-        return ok_reply();
-    }
-    // Static RamFS files.
-    for entry in RAMFS {
-        if path == entry.path {
-            write_stat(stat_ptr, 0o100444, entry.data.len() as u64, entry.path.as_ptr() as u64 & 0xFFFF);
-            return ok_reply();
-        }
-    }
-    // tmpfs files.
-    {
-        let tmp = TMP_FILES.lock();
-        if let Some(e) = tmp.iter().find(|e| e.in_use && !e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
-            let size = e.len as u64;
-            let ino = plen as u64 + 20000;
-            let mode = 0o100000 | if e.mode != 0 { e.mode } else { 0o644 };
-            let (uid, gid) = (e.uid, e.gid);
-            drop(tmp);
-            write_stat_owned(stat_ptr, mode, size, ino, uid, gid);
-            return ok_reply();
-        }
-    }
-    // initrd CPIO archive.
-    if let Some(data) = find_in_initrd(path) {
-        write_stat(stat_ptr, 0o100444, data.len() as u64, path_ptr as u64 & 0xFFFF);
-        return ok_reply();
-    }
     err_reply(-2) // ENOENT
 }
 
