@@ -324,6 +324,7 @@ mod nr {
 #[cfg(not(target_arch = "aarch64"))]
 mod nr {
     pub const MMAP:           usize = 9;
+    pub const POLL:           usize = 7;
     pub const MUNMAP:         usize = 11;
     pub const MPROTECT:       usize = 10;
     pub const BRK:            usize = 12;
@@ -556,6 +557,9 @@ pub fn dispatch(
     ret
 }
 
+
+
+
 fn dispatch_inner(
     number: usize,
     a0: usize, a1: usize, a2: usize,
@@ -630,7 +634,7 @@ fn dispatch_inner(
 
         // ── Threads ────────────────────────────────────────────────────────────
         SET_TID_ADDR => sys_set_tid_address(a0),
-        FUTEX        => sys_futex(a0, a1, a2, a3),
+        FUTEX        => sys_futex(a0, a1, a2, a3, a4, a5),
 
         // ── Architecture-specific ─────────────────────────────────────────────
         #[cfg(not(target_arch = "aarch64"))]
@@ -669,6 +673,8 @@ fn dispatch_inner(
         DUP2        => sys_dup3(a0, a1, 0),  // dup2(old,new) == dup3(old,new,0)
         READLINKAT  => sys_readlinkat(a0, a1, a2, a3),
         PPOLL       => sys_ppoll(a0, a1, a2, a3),
+        #[cfg(not(target_arch = "aarch64"))]
+        POLL        => sys_poll(a0, a1, a2 as isize),
         // Process management
         CHDIR       => sys_chdir(a0),
         FCHDIR      => sys_fchdir(a0),
@@ -1503,6 +1509,47 @@ fn sys_times(buf_ptr: usize) -> isize {
     ticks() as isize
 }
 
+/// sys_poll(fds_ptr, nfds, timeout_ms) — old-style poll syscall.
+#[cfg(not(target_arch = "aarch64"))]
+fn sys_poll(fds_ptr: usize, nfds: usize, timeout_ms: isize) -> isize {
+    if nfds == 0 { return 0; }
+    let sz = nfds.saturating_mul(8);
+    if !validate_user_buf(fds_ptr, sz) { return -14; }
+
+    let pid = current_pid();
+
+    let (infinite, deadline) = if timeout_ms < 0 {
+        (true, 0)
+    } else {
+        let ticks_needed = (timeout_ms as u64) / 10;
+        (false, ticks().wrapping_add(ticks_needed))
+    };
+
+    loop {
+        let mut nready = 0isize;
+        for i in 0..nfds {
+            let pfd = fds_ptr + i * 8;
+            let fd     = unsafe { core::ptr::read(pfd       as *const i32) };
+            let events = unsafe { core::ptr::read((pfd + 4) as *const i16) };
+
+            if fd < 0 {
+                unsafe { core::ptr::write((pfd + 6) as *mut i16, 0); }
+                continue;
+            }
+            let revents = probe_fd_events(pid, fd as usize, events as u16 as u32) as i16;
+            unsafe { core::ptr::write((pfd + 6) as *mut i16, revents); }
+            const POLLNVAL: i16 = 0x0020;
+            if revents != 0 && revents != POLLNVAL { nready += 1; }
+        }
+        if nready > 0 { return nready; }
+        if !infinite && ticks() >= deadline { return 0; }
+
+        irq_window();
+
+        yield_now("poll");
+    }
+}
+
 /// sys_ppoll(fds_ptr, nfds, timeout_ptr, sigmask_ptr) — wait for events on fd set.
 ///
 /// Rechecks every struct pollfd against real per-fd readiness (see
@@ -1697,7 +1744,7 @@ fn sys_set_tid_address(tidptr: usize) -> isize {
     current_pid() as isize
 }
 
-fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize) -> isize {
+fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: usize, val3: usize) -> isize {
     // Strip FUTEX_PRIVATE_FLAG (128) and FUTEX_CLOCK_REALTIME (256).
     const FUTEX_PRIVATE_FLAG: usize = 128;
     match op & !FUTEX_PRIVATE_FLAG {
@@ -1718,6 +1765,18 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize) -> isize {
         1 => {
             // FUTEX_WAKE: wake up to `val` tasks sleeping on `uaddr`.
             sched::futex_wake(uaddr, val as u32) as isize
+        }
+        3 | 4 => {
+            // FUTEX_REQUEUE = 3, FUTEX_CMP_REQUEUE = 4
+            if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
+            if !validate_user_ptr_aligned(uaddr2, 4, 4) { return -14; }
+            if op & !FUTEX_PRIVATE_FLAG == 4 {
+                let current = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+                if current != val3 as u32 {
+                    return -11; // EAGAIN
+                }
+            }
+            sched::futex_requeue(uaddr, uaddr2, val as u32, timeout_ptr as u32)
         }
         _ => -38, // ENOSYS
     }
@@ -2651,10 +2710,15 @@ fn sys_fstat(fd: usize, statbuf_ptr: usize) -> isize {
     if !validate_user_buf(statbuf_ptr, 144) { return -14; }
     unsafe { core::ptr::write_bytes(statbuf_ptr as *mut u8, 0, 144); }
 
+    #[cfg(target_arch = "x86_64")]
+    const ST_MODE_OFF: usize = 24;
+    #[cfg(target_arch = "aarch64")]
+    const ST_MODE_OFF: usize = 16;
+
     // fds 0/1/2 are character devices (serial console).
     if fd <= 2 {
-        // st_mode at offset 24: S_IFCHR | 0666
-        unsafe { core::ptr::write((statbuf_ptr + 24) as *mut u32, 0x21B6u32); }
+        // st_mode: S_IFCHR | 0666
+        unsafe { core::ptr::write((statbuf_ptr + ST_MODE_OFF) as *mut u32, 0x21B6u32); }
         return 0;
     }
 
@@ -2672,8 +2736,8 @@ fn sys_fstat(fd: usize, statbuf_ptr: usize) -> isize {
     let back_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, cur as u64, 0u64 /* SEEK_SET */]);
     let _ = vfs::handle(&back_msg, pid);
 
-    // st_mode at offset 24: S_IFREG | 0644 = 0x81A4
-    unsafe { core::ptr::write((statbuf_ptr + 24) as *mut u32, 0x81A4u32); }
+    // st_mode: S_IFREG | 0644 = 0x81A4
+    unsafe { core::ptr::write((statbuf_ptr + ST_MODE_OFF) as *mut u32, 0x81A4u32); }
 
     // st_size at offset 48.
     if size >= 0 {
@@ -2694,8 +2758,12 @@ fn sys_newfstatat(_dirfd: usize, path_ptr: usize, statbuf_ptr: usize, _flags: us
     // Check for directory first (no fd needed).
     if vfs::is_directory(path_ptr) {
         unsafe { core::ptr::write_bytes(statbuf_ptr as *mut u8, 0, 144); }
+        #[cfg(target_arch = "x86_64")]
+        const ST_MODE_OFF: usize = 24;
+        #[cfg(target_arch = "aarch64")]
+        const ST_MODE_OFF: usize = 16;
         // st_mode: S_IFDIR | 0755 = 0x41ED
-        unsafe { core::ptr::write((statbuf_ptr + 24) as *mut u32, 0x41EDu32); }
+        unsafe { core::ptr::write((statbuf_ptr + ST_MODE_OFF) as *mut u32, 0x41EDu32); }
         return 0;
     }
     // Open path, use sys_fstat, then close.
@@ -2841,7 +2909,7 @@ fn sys_getcwd(buf_ptr: usize, size: usize) -> isize {
         core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf_ptr as *mut u8, len);
         *(buf_ptr as *mut u8).add(len) = 0; // NUL terminate
     }
-    buf_ptr as isize
+    (len + 1) as isize
 }
 
 fn sys_setpgid(pid_raw: usize, pgid_raw: usize) -> isize {
