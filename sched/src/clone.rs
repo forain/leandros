@@ -207,7 +207,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         );
         child.ctx           = child_ctx;
         child.tls_base      = tls_base;
-        child.address_space = Some(alloc::boxed::Box::new(child_as));
+        child.address_space = Some(alloc::sync::Arc::new(child_as));
         child.ppid          = pid;
         child.tgid          = child_pid;
         child.pgid          = pgid;
@@ -339,7 +339,7 @@ pub fn clone_thread(
 
         // ── Collect parent credentials and page table ─────────────────────────
         let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, heap_start, heap_end,
-             ctid_phys, cwd) = {
+             ctid_phys, cwd, leader_as) = {
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid) {
                 Some(t) => {
@@ -353,8 +353,14 @@ pub fn clone_thread(
                     let (hs, he) = leader.address_space.as_ref()
                         .map(|a| (a.heap_start, a.heap_end))
                         .unwrap_or((0, 0));
+                    // Cheap Arc clone (refcount bump) — handed to non-
+                    // CLONE_THREAD (vfork-style) children below. Real
+                    // CLONE_THREAD siblings don't need it: they share the
+                    // leader's tgid, so lock_leader_address_space's tgid
+                    // lookup already resolves to it.
                     (t.page_table, t.tgid, t.pgid, t.sid,
-                     t.uid, t.gid, t.euid, t.egid, hs, he, cp, t.cwd.clone())
+                     t.uid, t.gid, t.euid, t.egid, hs, he, cp, t.cwd.clone(),
+                     leader.address_space.clone())
                 }
                 None => {
                     mm::buddy::free(stack_base_phys, stack_pages);
@@ -379,6 +385,18 @@ pub fn clone_thread(
         child.tls_base   = child_tls;
         child.ppid       = parent_pid;
         child.tgid       = if flags & CLONE_THREAD != 0 { parent_tgid } else { child_pid };
+        // Vfork-style children (CLONE_VM without CLONE_THREAD — musl/std's
+        // Command::spawn fast path) get their own tgid above, so they can't
+        // ride the leader's tgid lookup the way real CLONE_THREAD siblings
+        // do (see lock_leader_address_space). Without this, any real page
+        // fault the child takes (not just the deliberate exec-failure
+        // poison fault) hits "no address space for faulting task" and gets
+        // killed. Aliasing the same Arc — not a copy — is required: the
+        // whole point of CLONE_VM is that parent and child share one
+        // address space until the child execve()s or exits.
+        if flags & CLONE_THREAD == 0 {
+            child.address_space = leader_as;
+        }
         child.pgid       = pgid;
         child.sid        = sid;
         child.uid        = uid;  child.gid  = gid;

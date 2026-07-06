@@ -145,7 +145,16 @@ pub struct Task {
     /// Futex user-space address this task is waiting on (0 = none).
     pub blocked_futex: usize,
     /// Per-process virtual address space (None for kernel tasks).
-    pub address_space: Option<alloc::boxed::Box<AddressSpace>>,
+    ///
+    /// `Arc`, not `Box`: a vfork-style child (`clone(CLONE_VM)` without
+    /// `CLONE_THREAD` — e.g. `posix_spawn`/`Command::spawn`'s fast path)
+    /// genuinely shares its parent's address space rather than owning a
+    /// copy, and unlike a `CLONE_THREAD` sibling it has its own `tgid`
+    /// (see `clone_thread`), so it can't rely on tgid→leader resolution
+    /// to find the parent's — it must hold its own reference to the same
+    /// object. The space is freed only when the last `Arc` (parent or
+    /// vfork child) drops.
+    pub address_space: Option<alloc::sync::Arc<AddressSpace>>,
     /// Exit status set by `exit()`.  Valid only when `state == Zombie`.
     pub exit_code:    i32,
     /// Dedicated reply port for sys_call.  Allocated at spawn; freed on exit.

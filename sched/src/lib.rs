@@ -555,13 +555,19 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
             let mut rq = RUN_QUEUE.lock();
             let tgid = rq.find_pid(pid)?.tgid;
             let leader = rq.find_pid_mut(tgid)?;
-            let as_ = leader.address_space.as_mut()?;
+            let as_ = leader.address_space.as_ref()?;
             if as_
                 .busy
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                return Some(&mut **as_ as *mut mm::vmm::AddressSpace);
+                // `as_` is a shared `&Arc<AddressSpace>` now (see
+                // `Task::address_space`'s doc comment for why it's an `Arc`,
+                // not a `Box`) — the cast to `*mut` is the same "exclusivity
+                // comes from `busy`, not from the reference type" contract
+                // this function already documents; nothing else observes
+                // this pointer while `busy` is held.
+                return Some(&**as_ as *const mm::vmm::AddressSpace as *mut mm::vmm::AddressSpace);
             }
         }
         // Another CPU holds the address space (fault, mm syscall, or fork
@@ -676,7 +682,7 @@ pub fn spawn_user_with_address_space(entry_point: usize, sp: usize, as_: mm::vmm
 
     let mut task = Task::new_userspace(pid, entry_point, sp, stack_phys, stack_size, page_table);
     task.kernel_stack = stack_phys;
-    task.address_space = Some(alloc::boxed::Box::new(as_));
+    task.address_space = Some(alloc::sync::Arc::new(as_));
 
     let ok = RUN_QUEUE.lock().enqueue(task);
     if ok {
@@ -986,7 +992,7 @@ pub fn replace_address_space(
     let old_as = {
         let mut rq = RUN_QUEUE.lock();
         if let Some(t) = rq.find_pid_mut(pid) {
-            let displaced = t.address_space.replace(alloc::boxed::Box::new(new_as));
+            let displaced = t.address_space.replace(alloc::sync::Arc::new(new_as));
             t.page_table    = pt_root;
             t.heap_start    = heap_start;
             t.heap_end      = heap_start;
