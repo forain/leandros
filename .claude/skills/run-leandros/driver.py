@@ -74,8 +74,8 @@ def _build_cmd(arch, mode="uefi"):
             sys.exit("ERROR: AArch64 UEFI firmware not found")
         vars_fd = os.path.join(REPO_ROOT, "aarch64_vars.fd")
         disk    = os.path.join(REPO_ROOT, "leandros-limine-aarch64.img")
-        data0   = os.path.join(REPO_ROOT, "f2fs-data0.img")
-        data1   = os.path.join(REPO_ROOT, "f2fs-data1.img")
+        data0   = os.path.join(REPO_ROOT, "f2fs-data0-aarch64.img")
+        data1   = os.path.join(REPO_ROOT, "f2fs-data1-aarch64.img")
         return [
             "qemu-system-aarch64",
             "-machine", "virt,gic-version=2", "-smp", "4", "-cpu", "max", "-m", "2G",
@@ -102,8 +102,8 @@ def _build_cmd(arch, mode="uefi"):
         if not fw:
             sys.exit("ERROR: x86_64 UEFI firmware not found")
         disk  = os.path.join(REPO_ROOT, "leandros-limine-x86_64.img")
-        data0 = os.path.join(REPO_ROOT, "f2fs-data0.img")
-        data1 = os.path.join(REPO_ROOT, "f2fs-data1.img")
+        data0 = os.path.join(REPO_ROOT, "f2fs-data0-x86_64.img")
+        data1 = os.path.join(REPO_ROOT, "f2fs-data1-x86_64.img")
         return [
             "qemu-system-x86_64",
             "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", "-cpu", "max", "-m", "2G",
@@ -134,8 +134,8 @@ def _build_direct_cmd(arch):
     chardev-socket serial/monitor/display setup used everywhere else in this
     driver instead of run-qemu.sh's `-serial mon:stdio` + graphical window.
     virtio-keyboard-pci is dropped (documented QEMU 10.x hang on this host)."""
-    data0 = os.path.join(REPO_ROOT, "f2fs-data0.img")
-    data1 = os.path.join(REPO_ROOT, "f2fs-data1.img")
+    data0 = os.path.join(REPO_ROOT, f"f2fs-data0-{arch}.img")
+    data1 = os.path.join(REPO_ROOT, f"f2fs-data1-{arch}.img")
     if arch == "aarch64":
         kernel = os.path.join(REPO_ROOT, "target/final-aarch64/kernel-direct")
         initrd = os.path.join(REPO_ROOT, "initrd-aarch64.cpio")

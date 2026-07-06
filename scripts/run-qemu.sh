@@ -68,8 +68,10 @@ fi
 
 
 # ── F2FS data disks (created once, reused across runs) ──────────────────────
+DATA0_IMG="f2fs-data0-${ARCH}.img"
+DATA1_IMG="f2fs-data1-${ARCH}.img"
 for IDX in 0 1; do
-    FDISK="f2fs-data${IDX}.img"
+    FDISK="f2fs-data${IDX}-${ARCH}.img"
     if [ ! -f "$FDISK" ]; then
         echo "Creating $FDISK (64 MB)..."
         dd if=/dev/zero of="$FDISK" bs=1M count=64 2>/dev/null
@@ -119,9 +121,9 @@ if [ "$BOOT_MODE" = "uefi" ]; then
             -drive if=pflash,unit=1,format=raw,file="$VARS_FILE" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
             -device virtio-blk-pci,drive=drive0,bootindex=0,disable-legacy=on \
-            -drive if=none,id=data0,format=raw,file=f2fs-data0.img \
+            -drive if=none,id=data0,format=raw,file="$DATA0_IMG" \
             -device virtio-blk-pci,drive=data0,disable-legacy=on \
-            -drive if=none,id=data1,format=raw,file=f2fs-data1.img \
+            -drive if=none,id=data1,format=raw,file="$DATA1_IMG" \
             -device virtio-blk-pci,drive=data1,disable-legacy=on \
             -device "$GPU_DEV" \
             -device virtio-keyboard-pci \
@@ -132,9 +134,9 @@ if [ "$BOOT_MODE" = "uefi" ]; then
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
             -device virtio-blk-pci,drive=drive0,bootindex=0 \
-            -drive if=none,id=data0,format=raw,file=f2fs-data0.img \
+            -drive if=none,id=data0,format=raw,file="$DATA0_IMG" \
             -device virtio-blk-pci,drive=data0 \
-            -drive if=none,id=data1,format=raw,file=f2fs-data1.img \
+            -drive if=none,id=data1,format=raw,file="$DATA1_IMG" \
             -device virtio-blk-pci,drive=data1 \
             -vga none -device "$GPU_DEV" \
             "${GL_ARGS[@]}" \
@@ -164,9 +166,9 @@ else
         exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg \
             -kernel "$KERNEL_ELF" \
             -device loader,file=initrd-aarch64.cpio,addr=0x48000000,force-raw=on \
-            -drive if=none,id=data0,format=raw,file=f2fs-data0.img \
+            -drive if=none,id=data0,format=raw,file="$DATA0_IMG" \
             -device virtio-blk-pci,drive=data0,disable-legacy=on \
-            -drive if=none,id=data1,format=raw,file=f2fs-data1.img \
+            -drive if=none,id=data1,format=raw,file="$DATA1_IMG" \
             -device virtio-blk-pci,drive=data1,disable-legacy=on \
             -device "$GPU_DEV" \
             -device virtio-keyboard-pci \
@@ -198,9 +200,9 @@ else
         exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg -m 2G \
             -kernel "$KERNEL_ELF" \
             -device loader,file=initrd-x86_64.cpio,addr=0x10000000,force-raw=on \
-            -drive if=none,id=data0,format=raw,file=f2fs-data0.img \
+            -drive if=none,id=data0,format=raw,file="$DATA0_IMG" \
             -device virtio-blk-pci,drive=data0 \
-            -drive if=none,id=data1,format=raw,file=f2fs-data1.img \
+            -drive if=none,id=data1,format=raw,file="$DATA1_IMG" \
             -device virtio-blk-pci,drive=data1 \
             -vga none -device "$GPU_DEV" \
             "${GL_ARGS[@]}" \

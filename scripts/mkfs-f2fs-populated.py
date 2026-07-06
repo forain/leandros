@@ -191,7 +191,7 @@ def main():
     if os.path.exists(p):
         bin_files.append(("btm", p, 0o100755))
         bin_files.append(("bottom", p, 0o100755))
-        
+
     p = f"../mame/mame-{arch}"
     if os.path.exists(p):
         bin_files.append(("mame", p, 0o100755))
@@ -221,9 +221,12 @@ def main():
     # never land on blocks already occupied by pre-populated files/directories.
     required_blocks += 2 * BLOCKS_PER_SEG
         
-    # Align to segments (512 blocks) and set a minimum size of 64MB (16384 blocks)
+    # Align to segments (512 blocks) and set a minimum size of 64MB (16384 blocks).
+    # Double the segment count beyond what's needed for the pre-populated content
+    # so the image ships with roughly 50% free space — tests (f2fstest et al.)
+    # write new files at runtime and would otherwise exhaust a snugly-sized image.
     segs = (required_blocks + 511) // 512
-    total_segs = max(32, segs)
+    total_segs = max(32, segs * 2)
     total_blocks = total_segs * BLOCKS_PER_SEG
     main_segs = total_segs - META_SEGS
     

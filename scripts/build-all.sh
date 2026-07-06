@@ -275,8 +275,8 @@ for arch in "${ARCHS[@]}"; do
     build_kernel "$arch"
     create_disk_image "$arch" "$LIMINE_DIR"
     echo "💾 Creating populated F2FS images for $arch..."
-    python3 scripts/mkfs-f2fs-populated.py f2fs-data0.img "$arch"
-    cp f2fs-data0.img f2fs-data1.img
+    python3 scripts/mkfs-f2fs-populated.py "f2fs-data0-$arch.img" "$arch"
+    cp "f2fs-data0-$arch.img" "f2fs-data1-$arch.img"
 done
 
 echo "🎉 Build Complete!"
