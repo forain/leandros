@@ -3854,7 +3854,7 @@ fn poll_fd_state(pid: u32, fd: usize) -> u32 {
     const POLLNVAL: u32 = 0x0020;
 
     if fd == 0 {
-        return if evdev_server::has_events(0) || crate::serial_has_data() { POLLIN } else { 0 };
+        return if evdev_server::has_key_event(0) || crate::serial_has_data() { POLLIN } else { 0 };
     }
     if fd == 1 || fd == 2 {
         return POLLOUT;

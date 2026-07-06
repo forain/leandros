@@ -249,6 +249,34 @@ pub fn has_events(dev_id: u32) -> bool {
     count > 0
 }
 
+/// True if the pending queue holds at least one real key-down/serial event
+/// (`type_ == EV_KEY`, `value == 1` or `2`) rather than only SYN markers or
+/// key-release events. The kernel's `read_input_byte` silently discards
+/// those non-actionable entries by popping and skipping them, so a lone
+/// leftover SYN — always pushed right after every key event, including one
+/// whose matching key-down byte a single-byte `read()` already consumed —
+/// leaves `has_events()` true with nothing left that `read_input_byte`
+/// would ever actually return. Used for fd 0's poll/epoll readiness check,
+/// which must agree with what a following `read()` can really produce.
+pub fn has_key_event(dev_id: u32) -> bool {
+    if dev_id as usize >= MAX_DEVICES { return false; }
+    let f = unsafe { arch_interrupt_save() };
+    let devs = DEVICES.lock();
+    let dev = &devs[dev_id as usize];
+    let mut found = false;
+    for i in 0..dev.count {
+        let idx = (dev.head + i) % MAX_EVENTS;
+        let ev = &dev.events[idx];
+        if ev.type_ == 1 && (ev.value == 1 || ev.value == 2) {
+            found = true;
+            break;
+        }
+    }
+    drop(devs);
+    unsafe { arch_interrupt_restore(f); }
+    found
+}
+
 pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     if dev_id as usize >= MAX_DEVICES { return; }
     
