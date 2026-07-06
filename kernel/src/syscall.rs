@@ -4201,7 +4201,28 @@ fn sys_clone_or_fork(
     let (flags, child_stack, _ptid, tls, ctid) = (a0, a1, a2, a3, a4);
 
     if flags & CLONE_VM != 0 {
-        clone_thread(flags, child_stack, tls, ctid, frame_ptr)
+        const CLONE_THREAD: usize = 0x0001_0000;
+        let parent_pid = current_pid();
+        clone_thread(flags, child_stack, tls, ctid, frame_ptr, |child_pid| {
+            // Real CLONE_THREAD siblings (pthread_create) share the leader's
+            // tgid and, today, have no fd table of their own at all — every
+            // VFS call from such a thread already resolves fds by its own
+            // pid, unrelated to this dup. Only vfork-style children
+            // (CLONE_VM without CLONE_THREAD — e.g. musl/std's
+            // Command::spawn posix_spawn-fast-path clone(CLONE_VM|
+            // CLONE_VFORK|SIGCHLD)) need this: per POSIX they get their own
+            // *copy* of the fd table (same as fork), not a share, and
+            // without it every fd the child inherited (its stdio
+            // redirections, the exec-failure error-reporting pipe) is
+            // invisible to the VFS server the instant the child runs its
+            // first fd syscall — VFS_FORK_DUP is exactly fork_current's own
+            // fix for the identical fork() case (see the FORK arm above).
+            if flags & CLONE_THREAD == 0 {
+                let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
+                                       &[parent_pid as u64, child_pid as u64]);
+                let _ = vfs::handle(&msg, parent_pid);
+            }
+        })
     } else {
         let _ = (child_stack, _ptid, tls, ctid);
         let parent_pid = current_pid();

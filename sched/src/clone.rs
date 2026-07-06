@@ -237,6 +237,13 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
 }
 
 /// Spawn a new thread sharing the current process's virtual address space.
+///
+/// `before_enqueue` mirrors `fork_current`'s hook of the same name: it runs
+/// with the child's PID after construction but before the child is made
+/// runnable, so the caller can duplicate per-process kernel-side state (the
+/// VFS fd table) with no window for the child to run a syscall against a
+/// table that doesn't exist yet. Only used for the non-`CLONE_THREAD`
+/// (vfork-style) case in practice — see the call in `clone_thread`'s body.
 pub fn clone_thread(
     flags:       usize,
     child_stack: usize,
@@ -244,6 +251,7 @@ pub fn clone_thread(
     tls:         usize,
     ctid:        usize,
     frame_ptr:   usize,
+    before_enqueue: impl FnOnce(u32),
 ) -> isize {
     #[allow(dead_code)]
     const CLONE_SETTLS:         usize = 0x0008_0000;
@@ -408,6 +416,13 @@ pub fn clone_thread(
         if flags & CLONE_CHILD_CLEARTID != 0 {
             child.clear_child_tid = ctid;
         }
+
+        // Give the caller its chance to set up per-child kernel state (VFS
+        // fd table) while the child is still invisible to other CPUs — same
+        // SMP race fork_current's doc comment describes: another CPU could
+        // otherwise dispatch the child immediately and lose the race against
+        // its own first fd-allocating syscall.
+        before_enqueue(child_pid);
 
         if !super::RUN_QUEUE.lock().enqueue(child) {
             mm::buddy::free(stack_base_phys, stack_pages);
