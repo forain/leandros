@@ -307,7 +307,15 @@ unsafe fn execute_binary(args: &[&str], count: usize) {
         write_str("shell: fork failed\n");
     } else if pid == 0 {
         // Child
-        let envp: [*const u8; 1] = [core::ptr::null()];
+        //
+        // Children get PATH=/bin so libc-level PATH search (e.g. musl's
+        // execvp, used by non-native binaries like bottom) finds userland
+        // tools. Without this, execvp falls back to its compiled-in
+        // default "/usr/local/bin:/bin:/usr/bin" and tries /usr/local/bin
+        // first, which doesn't exist on this OS's F2FS image at all -
+        // everything ships under /bin (see mkfs-f2fs-populated.py).
+        static PATH_ENV: &[u8] = b"PATH=/bin\0";
+        let envp: [*const u8; 2] = [PATH_ENV.as_ptr(), core::ptr::null()];
 
         // Prepare argv
         for i in 0..count {
