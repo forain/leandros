@@ -122,6 +122,13 @@ name = "timertest"
 version = "0.1.0"
 
 [[package]]
+name = "tput"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
+]
+
+[[package]]
 name = "vfstest"
 version = "0.1.0"
 dependencies = [

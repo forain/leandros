@@ -1,0 +1,11 @@
+[package]
+name = "tput"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "tput"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

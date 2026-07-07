@@ -171,7 +171,7 @@ def main():
     
     bin_files = []
     bins = [
-        "shell", "hello", "aplay", "memtest", "vfstest", "f2fstest", 
+        "shell", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest"
     ]
     for b in bins:
