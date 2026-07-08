@@ -1792,7 +1792,24 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
             // (another CPU could change the value and issue FUTEX_WAKE
             // between an early check and the waiter registration).
             if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
-            sched::futex_wait(uaddr, val as u32, timeout_ptr)
+            // timeout_ptr is a `struct timespec` (relative — real FUTEX_WAIT
+            // semantics; treated the same for the WAIT_BITSET/9 case, which
+            // is technically absolute on real Linux, but no caller in this
+            // tree relies on that distinction and treating it as relative is
+            // never worse than this kernel's prior behavior of ignoring it
+            // outright). Converted to a `ticks()` deadline exactly like
+            // sys_nanosleep. NULL means no timeout (block indefinitely).
+            let deadline = if timeout_ptr == 0 {
+                None
+            } else {
+                if !validate_user_buf(timeout_ptr, 16) { return -14; }
+                let tv_sec  = unsafe { core::ptr::read(timeout_ptr as *const i64) };
+                let tv_nsec = unsafe { core::ptr::read((timeout_ptr + 8) as *const i64) };
+                if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 { return -22; } // EINVAL
+                let ticks_needed = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
+                Some(ticks().wrapping_add(ticks_needed))
+            };
+            sched::futex_wait(uaddr, val as u32, deadline)
         }
         1 => {
             // FUTEX_WAKE: wake up to `val` tasks sleeping on `uaddr`.

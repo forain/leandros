@@ -37,7 +37,8 @@ const MAX_FUTEX_WAITERS: usize = 256;
 static FUTEX_TABLE: Mutex<[Option<FutexWaiter>; MAX_FUTEX_WAITERS]> =
     Mutex::new([const { None }; MAX_FUTEX_WAITERS]);
 
-/// Block the current task on `uaddr` until a `futex_wake` targets it.
+/// Block the current task on `uaddr` until a `futex_wake` targets it, or
+/// (if `deadline` is `Some`) until `ticks() >= deadline`.
 ///
 /// `expected` is validated against `*uaddr` under the `FUTEX_TABLE` lock; if
 /// the value already changed, returns `-EAGAIN` (-11) without blocking.
@@ -47,7 +48,33 @@ static FUTEX_TABLE: Mutex<[Option<FutexWaiter>; MAX_FUTEX_WAITERS]> =
 /// Returns 0 on wake-up.  Signal delivery also unblocks the task (via
 /// `deliver_signal`'s Blocked → Ready transition); in that case the
 /// FUTEX_TABLE entry is cleaned up here so no stale waiter remains.
-pub fn futex_wait(uaddr: usize, expected: u32, _timeout_ptr: usize) -> isize {
+///
+/// `deadline` bypasses the FUTEX_TABLE/Blocked-state path entirely and
+/// instead yield-loops with a `ticks()` deadline check, exactly like every
+/// other bounded wait in this kernel (`sys_nanosleep`, `sys_epoll_wait`) —
+/// there is no scheduler-tick-driven mechanism to wake a genuinely `Blocked`
+/// task at a deadline, only `futex_wake`/signal delivery can do that today.
+/// This is safe for real callers: `parking_lot`'s futex-based parker (the
+/// confirmed source of this codepath — `std::process::Command`/crossterm's
+/// bounded mutex waits under musl) always re-checks its own park flag in a
+/// loop around `futex_wait` and treats a spurious/value-driven wake
+/// identically to an explicit `FUTEX_WAKE`, so polling for the value change
+/// instead of registering for an explicit wake is observably equivalent —
+/// it just costs up to one tick (~10ms) of extra latency on a real wake,
+/// never a correctness difference. A timed waiter that's never explicitly
+/// registered also never appears in `futex_wake`'s counted total, but no
+/// caller in this tree inspects that count.
+pub fn futex_wait(uaddr: usize, expected: u32, deadline: Option<u64>) -> isize {
+    if let Some(deadline) = deadline {
+        loop {
+            let current = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+            if current != expected { return -11; } // EAGAIN — value already differs
+            if super::ticks() >= deadline { return -110; } // ETIMEDOUT
+            super::irq_window();
+            super::yield_now("futex_wait_timed");
+        }
+    }
+
     unsafe {
         let id  = cpu_id();
         let pid = current_pid();
