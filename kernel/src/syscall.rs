@@ -3733,9 +3733,9 @@ static EPOLL_INSTANCES: spin::Mutex<[EpollInstance; MAX_EPOLL_INSTANCES]> =
 /// Close an epoll fd: release its instance slot (and all interests with it).
 fn sys_epoll_close(epfd: usize) -> isize {
     let slot = epfd - EPOLL_FD_BASE;
-    let pid = current_pid();
+    let tgid = sched::current_tgid();
     let mut ep = EPOLL_INSTANCES.lock();
-    if !ep[slot].in_use || ep[slot].owner_pid != pid { return -9; } // EBADF
+    if !ep[slot].in_use || sched::tgid_of(ep[slot].owner_pid) != tgid { return -9; } // EBADF
     ep[slot] = EpollInstance::empty();
     0
 }
@@ -3777,9 +3777,13 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
         return -9; // EBADF
     };
 
-    let pid = current_pid();
+    // Ownership is thread-group-scoped, not task-scoped: an epoll instance is
+    // an ordinary fd, shared by every CLONE_THREAD sibling of the creating
+    // process (real POSIX fd-table semantics) — see the identical comment on
+    // sys_epoll_wait's check for the bug this fixes.
+    let tgid = sched::current_tgid();
     let mut ep = EPOLL_INSTANCES.lock();
-    if !ep[slot].in_use || ep[slot].owner_pid != pid { return -9; }
+    if !ep[slot].in_use || sched::tgid_of(ep[slot].owner_pid) != tgid { return -9; }
 
     match op {
         CTL_ADD | CTL_MOD => {
@@ -3832,8 +3836,23 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
 
     let pid = current_pid();
     {
+        // Ownership is thread-group-scoped, not task-scoped: real epoll fds
+        // are ordinary file descriptors, shared by every CLONE_THREAD
+        // sibling of the creating process. A raw owner_pid == pid check
+        // rejects any thread other than the exact one that called
+        // epoll_create1 — e.g. crossterm's shared, lazily-created event
+        // reader (used by both bottom's background input-reader thread and
+        // its main thread's cursor-position query) is created by whichever
+        // thread wins that race, then unusable from every other thread of
+        // the same process, which manifests as every subsequent epoll_wait
+        // failing with EBADF instead of blocking/timing out — and crossterm
+        // treats that as a retry-forever condition (see
+        // crossterm's `read_position_raw`'s `Err(_) => {}` loop arm), an
+        // effectively permanent hang from the caller's perspective.
         let ep = EPOLL_INSTANCES.lock();
-        if !ep[slot].in_use || ep[slot].owner_pid != pid { return -9; }
+        if !ep[slot].in_use || sched::tgid_of(ep[slot].owner_pid) != sched::current_tgid() {
+            return -9;
+        }
     }
 
     let infinite = timeout == usize::MAX;

@@ -200,6 +200,16 @@ pub fn current_sid() -> Pid {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.sid).unwrap_or(0)
 }
 
+/// The thread-group id of `pid`, or `pid` itself if it's not a live task
+/// (matches every task's own fallback of being its own tgid at creation).
+pub fn tgid_of(pid: Pid) -> Pid {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.tgid).unwrap_or(pid)
+}
+
+pub fn current_tgid() -> Pid {
+    tgid_of(current_pid())
+}
+
 pub fn ticks() -> u64 {
     TIMER_TICKS.load(Ordering::Relaxed)
 }
