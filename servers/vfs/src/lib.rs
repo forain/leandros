@@ -1691,6 +1691,21 @@ fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize) -> Message {
     ok_reply()
 }
 
+/// True if `fd` (0-2, the range the kernel's sys_read/sys_write fast paths
+/// hardwire straight to the serial console) has been explicitly redirected
+/// via dup2/dup3 to a real VFS target, e.g. `dup2(pipefd[1], STDOUT_FILENO)`.
+/// The kernel consults this before applying the hardwire so a legitimate
+/// redirection (Command::output()'s stdout capture, used by crossterm's
+/// tput fallback) actually takes effect instead of being silently shadowed.
+pub fn fd_redirected(pid: u32, fd: usize) -> bool {
+    if fd >= MAX_FDS { return false; }
+    let mut tbls = FD_TABLES.lock();
+    match find_tbl(pid, &mut *tbls) {
+        Some(t) => t.fds[fd].in_use,
+        None    => false,
+    }
+}
+
 fn handle_dup2(pid: u32, oldfd: usize, newfd: usize) -> Message {
     if oldfd >= MAX_FDS || newfd >= MAX_FDS { return err_reply(-9); }
     let mut tbls = FD_TABLES.lock();

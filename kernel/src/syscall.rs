@@ -2352,8 +2352,13 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
     if count == 0 { return 0; }
 
     if !validate_user_buf(buf_ptr, count) { return -14; }
+    let pid = current_pid();
     match fd {
-        1 | 2 => {
+        // Only take the serial fast path if this fd hasn't been dup2'd to a
+        // real VFS target (e.g. Command::output()'s pipe capture) — otherwise
+        // the redirection is silently shadowed and the writer's data never
+        // reaches the pipe. See fd_redirected's doc comment.
+        1 | 2 if !vfs::fd_redirected(pid, fd) => {
             let mut kbuf = Vec::with_capacity(count);
             unsafe { kbuf.set_len(count); }
 
@@ -2368,7 +2373,6 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
         }
 
         _ => {
-            let pid = current_pid();
             let msg = make_vfs_msg(vfs::VFS_WRITE, &[fd as u64, buf_ptr as u64, count as u64]);
             let reply = vfs::handle(&msg, pid);
             vfs_reply_val(&reply)
@@ -2384,7 +2388,10 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
 /// route through VFS.
 fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> isize {
     match fd {
-        0 => {
+        // Only take the serial fast path if fd 0 hasn't been dup2'd to a real
+        // VFS target (e.g. a pipe feeding a child's stdin) — see fd_redirected's
+        // doc comment and the identical guard in sys_write.
+        0 if !vfs::fd_redirected(current_pid(), 0) => {
             if count == 0 { return 0; }
             if !is_kernel && !validate_user_buf(buf_ptr, count) { return -14; }
             // Edge-triggered epoll consumers (crossterm/mio's TTY reader is
