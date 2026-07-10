@@ -114,14 +114,18 @@ pub fn call_port(port_id: u32, mut msg: Message) -> Message {
                     sched::set_current_reply_port(p);
                     p
                 }
-                None    => return Message::empty(),
+                // A zeroed Message::empty() decodes as val_reply(0) — a
+                // phantom success (e.g. an empty file) rather than a visible
+                // error. Callers like handle_open's MountedFile path only
+                // check `< 0`, so this must be a real negative errno.
+                None    => return err_reply(-12), // ENOMEM
             }
         }
     };
 
     msg.reply_port = reply_port;
     if port::send(port_id, msg).is_err() {
-        return Message::empty();
+        return err_reply(-12); // ENOMEM
     }
 
     let caller = sched::current_pid();

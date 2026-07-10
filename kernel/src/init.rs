@@ -16,6 +16,18 @@ extern "C" {
 pub fn init_task_main(boot_info: &boot::BootInfo) {
     serial_print_str("[INIT] Kernel init task starting\n");
 
+    // Registers the task-exit hook that releases a dying process's IPC reply
+    // ports (ipc::port::release_by_owner). Without this, every process that
+    // ever calls into a mounted filesystem (which lazily allocates its own
+    // reply port on first use) leaks that port forever — the port table's
+    // real backing storage is only 64 buckets, so the 64th distinct process
+    // to touch a mounted fs permanently exhausts it for the rest of the
+    // uptime. See servers/vfs's call_port: a failed port::create() there is
+    // treated as silent success (an empty, all-zero reply), so callers like
+    // sys_execve's ELF-size lookup see a phantom empty file instead of an
+    // error.
+    ipc::init();
+
     // ── In-Kernel Servers ──────────────────────────────────────────────────
     if let Some(vfs_port) = vfs_server::init(0) {
         crate::syscall::set_vfs_server_port(vfs_port);
