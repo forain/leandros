@@ -58,8 +58,9 @@ static HHDM_REQUEST: limine::request::HhdmRequest = limine::request::HhdmRequest
 static MEMMAP_REQUEST: limine::request::MemmapRequest = limine::request::MemmapRequest::new();
 
 #[used]
+#[no_mangle]
 #[link_section = ".limine_reqs"]
-static FRAMEBUFFER_REQUEST: limine::request::FramebufferRequest = limine::request::FramebufferRequest::new();
+pub static FRAMEBUFFER_REQUEST: limine::request::FramebufferRequest = limine::request::FramebufferRequest::new();
 
 #[used]
 #[link_section = ".limine_reqs"]
@@ -70,8 +71,9 @@ static MODULE_REQUEST: limine::request::ModulesRequest = limine::request::Module
 static RSDP_REQUEST: limine::request::RsdpRequest = limine::request::RsdpRequest::new();
 
 #[used]
+#[no_mangle]
 #[link_section = ".limine_reqs"]
-static KERNEL_ADDR_REQUEST: limine::request::ExecutableAddressRequest = limine::request::ExecutableAddressRequest::new();
+pub static KERNEL_ADDR_REQUEST: limine::request::ExecutableAddressRequest = limine::request::ExecutableAddressRequest::new();
 
 #[used]
 #[link_section = ".limine_reqs"]
@@ -414,6 +416,10 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             if !found {
                 serial_print_str("[MAIN] DTB search failed.\n");
                 // UART is always at 0x09000000 on QEMU virt regardless of highmem setting.
+                // Real Raspberry Pi 5 firmware always hands off a DTB, so this fallback is
+                // only ever reached under QEMU (direct boot with no -dtb, or UEFI+ACPI-only
+                // boot) — a --rpi5 build must still land here with a QEMU-valid address,
+                // not the real hardware's UART MMIO address, or it hard-hangs in QEMU.
                 if BOOT_INFO.uart_base == 0 { BOOT_INFO.uart_base = 0x09000000; }
                 // Try ACPI MCFG for ECAM — QEMU UEFI boot provides ACPI, not DTB.
                 // The ECAM base moved to 0x4010000000 in QEMU 5.0+ (highmem=on default).
@@ -517,7 +523,11 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             } else {
                 serial_print_str("[MAIN] BOOT_FB registration FAILED\n");
             }
-            let fb_virt = mm::phys_to_virt(bi.framebuffer_base as usize);
+            let fb_virt = if cfg!(target_arch = "aarch64") {
+                0xFFFF_A000_0000_0000 + (bi.framebuffer_base as usize & 4095)
+            } else {
+                mm::phys_to_virt(bi.framebuffer_base as usize)
+            };
             serial_print_str("[MAIN] Framebuffer virtual address: ");
             serial_print_hex(fb_virt);
             serial_print_str("\n");

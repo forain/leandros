@@ -67,9 +67,28 @@ pub unsafe fn parse_with_requests(
 
     if let Some(resp) = framebuffer.response() {
         if let Some(fb) = resp.framebuffers().first() {
-            // Limine provides a virtual address in the HHDM.
-            // We store the physical address in BootInfo for consistency.
-            info.framebuffer_base   = fb.address() as u64 - info.hhdm_offset;
+            let fb_virt = fb.address() as usize;
+            #[cfg(target_arch = "aarch64")]
+            let fb_phys = unsafe {
+                let par: u64;
+                core::arch::asm!(
+                    "at s1e1r, {va}",
+                    "isb",
+                    "mrs {par}, par_el1",
+                    va = in(reg) fb_virt,
+                    par = out(reg) par,
+                    options(nostack)
+                );
+                if par & 1 == 0 {
+                    ((par & 0x0000_FFFF_FFFF_F000) as u64) | ((fb_virt & 0xFFF) as u64)
+                } else {
+                    fb_virt as u64 - info.hhdm_offset
+                }
+            };
+            #[cfg(not(target_arch = "aarch64"))]
+            let fb_phys = fb_virt as u64 - info.hhdm_offset;
+
+            info.framebuffer_base   = fb_phys;
             info.framebuffer_width  = fb.width as u32;
             info.framebuffer_height = fb.height as u32;
             info.framebuffer_pitch  = fb.pitch as u32;

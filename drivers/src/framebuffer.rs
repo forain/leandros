@@ -122,13 +122,23 @@ impl Framebuffer {
     }
 
     pub fn clear(&mut self, color: u32) {
-        for y in 0..self.height {
-            for x in 0..self.width {
-                self.set_pixel(x, y, color);
+        if self.base.is_null() { return; }
+        let total_words = self.height * (self.pitch / 4);
+        if color == 0 {
+            unsafe {
+                core::ptr::write_bytes(self.base, 0, total_words);
+            }
+        } else {
+            unsafe {
+                for i in 0..total_words {
+                    self.base.add(i).write_volatile(color);
+                }
             }
         }
         self.cursor_x = 0;
         self.cursor_y = 0;
+        let (w, h) = (self.width, self.height);
+        self.mark_dirty(0, 0, w, h);
     }
 
     pub fn putc(&mut self, c: u8) {

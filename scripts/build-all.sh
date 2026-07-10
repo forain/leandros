@@ -12,17 +12,20 @@ LIMINE_CACHE_DIR=".limine-cache"
 # Parse command line arguments
 ARCH="$DEFAULT_ARCH"
 LIMINE_VERSION="$DEFAULT_LIMINE_VERSION"
+RPI5="false"
 
 show_usage() {
     echo "Usage: $0 [OPTIONS]"
     echo "Options:"
     echo "  --arch ARCH          Build for specific architecture: aarch64, x86_64, or both (default: both)"
+    echo "  --rpi5               Build with features for Raspberry Pi 5"
     echo "  --help               Show this help message"
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch) ARCH="$2"; shift 2 ;;
+        --rpi5) RPI5="true"; shift ;;
         --help) show_usage; exit 0 ;;
         *) echo "❌ Unknown option: $1"; show_usage; exit 1 ;;
     esac
@@ -101,9 +104,13 @@ build_kernel() {
     local target_root_std="target/build-$arch-standard"
     mkdir -p "$target_root_std"
     local linker="$ROOT_DIR/linkers/$arch.ld"
+    local features_arg=""
+    if [[ "$arch" == "aarch64" && "$RPI5" == "true" ]]; then
+        features_arg="--features rpi5"
+    fi
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_std" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
     RUSTFLAGS="-C link-arg=-T$linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro" \
-    cargo +nightly build -p kernel --target "$target_spec" --target-dir "$target_root_std" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
+    cargo +nightly build -p kernel $features_arg --target "$target_spec" --target-dir "$target_root_std" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
     
     mkdir -p "target/final-$arch"
     cp "$target_root_std/$target_triple/release/kernel" "target/final-$arch/kernel"
@@ -115,7 +122,7 @@ build_kernel() {
     local direct_linker="$ROOT_DIR/linkers/$arch-direct.ld"
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_dir" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
     RUSTFLAGS="-C link-arg=-T$direct_linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro" \
-    cargo +nightly build -p kernel --target "$target_spec" --target-dir "$target_root_dir" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
+    cargo +nightly build -p kernel $features_arg --target "$target_spec" --target-dir "$target_root_dir" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
     
     cp "$target_root_dir/$target_triple/release/kernel" "target/final-$arch/kernel-direct"
     

@@ -48,9 +48,11 @@ SECTIONS
     } :kernel
 
     .bss : AT(ADDR(.bss) - KERNEL_OFFSET) {
+        . = ALIGN(8);
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
+        . = ALIGN(8);
         __bss_end = .;
     } :kernel
 

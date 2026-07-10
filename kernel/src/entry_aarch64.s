@@ -18,7 +18,7 @@ _start:
     lsr     x4, x4, #2
     and     x4, x4, #3
     cmp     x4, #2
-    b.ne    .Lat_el1                // not EL2 → already where we want to be
+    b.ne    at_el1                  // not EL2 → already where we want to be
 
     // Record the EL2 entry: QEMU registers its PSCI emulation on the SMC
     // conduit when the guest boots at EL2 (HVC otherwise), and smp.rs must
@@ -39,18 +39,37 @@ _start:
     movz    x4, #0x8000, lsl #16    // HCR_EL2.RW (bit 31): EL1 executes AArch64
     msr     hcr_el2, x4
 
-    movz    x4, #0x0800             // SCTLR_EL1 reset: RES1 bits set, MMU off
-    movk    x4, #0x30d0, lsl #16
-    msr     sctlr_el1, x4
+    // Check if we are running at a virtual address (MMU ON)
+    adr     x4, at_el1
+    tbz     x4, #63, el2_mmu_off    // if bit 63 is 0, MMU is already off
 
-    mov     x4, #0x3c5              // SPSR_EL2: return to EL1h, DAIF masked
-    msr     spsr_el2, x4
-    adr     x4, .Lat_el1            // PC-relative: physical addr (MMU still off)
-    msr     elr_el2, x4
+    // MMU is ON: Translate virtual at_el1 to physical address using KERNEL_ADDR_REQUEST
+    adrp    x0, KERNEL_ADDR_REQUEST
+    add     x0, x0, :lo12:KERNEL_ADDR_REQUEST
+    ldr     x1, [x0, #40]             // Response pointer
+    cbz     x1, translation_failed
+    ldr     x2, [x1, #8]              // physical_base
+    ldr     x3, [x1, #16]             // virtual_base
+    sub     x4, x4, x3                // at_el1 offset from kernel base
+    add     x4, x4, x2                // physical address of at_el1
+    b       el2_mmu_off
+
+translation_failed:
+    b       translation_failed
+
+el2_mmu_off:
+    // Configure SCTLR_EL1 with MMU OFF
+    movz    x5, #0x0800             // SCTLR_EL1 reset: RES1 bits set, MMU off
+    movk    x5, #0x30d0, lsl #16
+    msr     sctlr_el1, x5
+
+    mov     x5, #0x3c5              // SPSR_EL2: return to EL1h, DAIF masked
+    msr     spsr_el2, x5
+    msr     elr_el2, x4             // x4 contains physical address of at_el1
     isb
     eret
 
-.Lat_el1:
+at_el1:
     // Force SP_EL1
     msr     SPSel, #1
     isb
@@ -58,7 +77,7 @@ _start:
     // Check if MMU is on
     mrs     x4, sctlr_el1
     tst     x4, #1
-    b.ne    .Llimine_entry
+    b.ne    limine_entry
 
     // ── Direct Boot Path (MMU is OFF) ────────────────────────────────────────
 
@@ -72,12 +91,12 @@ _start:
     add     x0, x0, :lo12:__bss_start
     adrp    x1, __bss_end
     add     x1, x1, :lo12:__bss_end
-.Ldirect_bss:
+direct_bss:
     cmp     x0, x1
-    b.ge    .Ldirect_bss_done
+    b.ge    direct_bss_done
     str     xzr, [x0], #8
-    b       .Ldirect_bss
-.Ldirect_bss_done:
+    b       direct_bss
+direct_bss_done:
 
     // 1. MAIR
     mov     x4, #0x04FF
@@ -94,10 +113,10 @@ _start:
     
     mov     x5, #32768
     mov     x6, x0
-.Lclear_pgt:
+clear_pgt:
     str     xzr, [x6], #8
     subs    x5, x5, #8
-    b.ne    .Lclear_pgt
+    b.ne    clear_pgt
 
     // Level 0 (PGD)
     mov     x5, #0x1003
@@ -139,10 +158,17 @@ _start:
 
     // Transition to high virtual address — land *after* the BSS-zero loop so
     // we don't wipe the page tables we just installed.
-    ldr     x4, =.Lsetup_stack
+    ldr     x4, =setup_stack
     br      x4
 
-.Llimine_entry:
+limine_entry:
+    // FP/SIMD on before any Rust code runs.
+    mrs     x2, cpacr_el1
+    orr     x2, x2, #(3 << 20)
+    msr     cpacr_el1, x2
+    isb
+
+
     // ── Zero BSS (Limine path only) ──────────────────────────────────────────
     // Limine supplies its own page tables, so clearing all of .bss here (which
     // includes early_pgtables) is safe.
@@ -150,14 +176,14 @@ _start:
     add     x0, x0, :lo12:__bss_start
     adrp    x1, __bss_end
     add     x1, x1, :lo12:__bss_end
-.Lbss_loop:
+bss_loop:
     cmp     x0, x1
-    b.ge    .Lbss_done
+    b.ge    bss_done
     str     xzr, [x0], #8
-    b       .Lbss_loop
-.Lbss_done:
+    b       bss_loop
+bss_done:
 
-.Lsetup_stack:
+setup_stack:
     // Set up initial stack
     adrp    x1, EARLY_STACK
     add     x1, x1, :lo12:EARLY_STACK
@@ -167,13 +193,13 @@ _start:
 
     // Call kernel_main
     mov     x0, x19
-    ldr     x1, .Lkernel_main_val
+    ldr     x1, kernel_main_val
     blr     x1
 
 .align 3
-.Lkernel_main_val:
+kernel_main_val:
     .quad kernel_main
 
-.Lhalt:
+halt:
     wfe
-    b       .Lhalt
+    b       halt

@@ -311,7 +311,15 @@ pub unsafe fn cpu_on(mpidr: u64, entry: usize, context_id: u64) -> i64 {
         static boot_entered_el2: u64;
     }
     let result: i64;
-    if core::ptr::read_volatile(core::ptr::addr_of!(boot_entered_el2)) != 0 {
+
+    // On real Raspberry Pi 5 hardware, PSCI is handled by TF-A in EL3, which
+    // is reached via the SMC conduit. HVC will fault because there is no EL2 hypervisor.
+    #[cfg(feature = "rpi5")]
+    let use_smc = true;
+    #[cfg(not(feature = "rpi5"))]
+    let use_smc = core::ptr::read_volatile(core::ptr::addr_of!(boot_entered_el2)) != 0;
+
+    if use_smc {
         core::arch::asm!(
             ".inst 0xd4000003", // smc #0 (raw encoding: LLVM gates the mnemonic behind +el3)
             inout("x0") PSCI_CPU_ON => result,

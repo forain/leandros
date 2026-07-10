@@ -36,6 +36,7 @@ SECTIONS {
     }
 
     .bss : AT(ADDR(.bss) - KERNEL_VIRT) {
+        . = ALIGN(8);
         __bss_start = .;
         *(.bss*)
         . = ALIGN(8);

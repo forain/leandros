@@ -51,8 +51,8 @@ pub fn init(boot_info: &boot::BootInfo) {
 
         let device_flags = paging::PageDescFlags::VALID | paging::PageDescFlags::AF | paging::PageDescFlags::INNER_SHR | paging::PageDescFlags::ATTR_DEV;
         
-        // Map UART (physical 0x09000000) to its HHDM address
-        let uart_phys = 0x09000000;
+        // Map UART to its HHDM address
+        let uart_phys = uart::BASE;
         let uart_virt = if boot_info.hhdm_offset != 0 {
             uart_phys + boot_info.hhdm_offset as usize
         } else {
@@ -85,8 +85,10 @@ pub fn init(boot_info: &boot::BootInfo) {
         paging::map_4k(root_phys as *mut u64, gicd_virt, gicd_phys, device_flags);
         paging::map_4k(root_phys as *mut u64, gicc_virt, gicc_phys, device_flags);
         if boot_info.framebuffer_base != 0 {
+            let fb_start_phys = boot_info.framebuffer_base as usize & !4095;
             let fb_size = boot_info.framebuffer_pitch as usize * boot_info.framebuffer_height as usize;
-            let num_pages = (fb_size + 4095) / 4096;
+            let fb_end_phys = (boot_info.framebuffer_base as usize + fb_size + 4095) & !4095;
+            let num_pages = (fb_end_phys - fb_start_phys) / 4096;
             let fb_flags = paging::PageDescFlags::VALID | paging::PageDescFlags::AF | paging::PageDescFlags::INNER_SHR | paging::PageDescFlags::ATTR_NOCACHE;
             
             crate::uart::serial_print_str("[ARCH] Mapping framebuffer 0x");
@@ -97,8 +99,8 @@ pub fn init(boot_info: &boot::BootInfo) {
 
             for i in 0..num_pages {
                 let offset = i * 4096;
-                let virt = boot_info.framebuffer_base as usize + boot_info.hhdm_offset as usize + offset;
-                let phys = boot_info.framebuffer_base as usize + offset;
+                let virt = 0xFFFF_A000_0000_0000 + offset;
+                let phys = fb_start_phys + offset;
                 if !paging::map_4k(root_phys as *mut u64, virt, phys, fb_flags) {
                     crate::uart::serial_print_str("[ARCH] Failed to map framebuffer page at 0x");
                     crate::uart::print_hex(virt);
