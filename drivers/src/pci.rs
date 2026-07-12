@@ -12,6 +12,7 @@ pub struct PciDevice {
     pub device_id: u16,
     pub class: u8,
     pub subclass: u8,
+    pub prog_if: u8,
     pub bars: [u32; 6],
 }
 
@@ -244,76 +245,85 @@ pub fn scan() -> Vec<PciDevice> {
         for dev in 0..32 {
             let val = unsafe { pci_read_config(bus as u8, dev as u8, 0, 0) };
             if val == 0xFFFF_FFFF { continue; }
-            let vendor_id = (val & 0xFFFF) as u16;
-            let device_id = (val >> 16) as u16;
-            serial_debug("[PCI] Found dev ");
-            serial_debug_hex(vendor_id as u32);
-            serial_debug(":");
-            serial_debug_hex(device_id as u32);
-            serial_debug("\n");
 
-            let class_rev = unsafe { pci_read_config(bus as u8, dev as u8, 0, 0x08) };
-            let class = (class_rev >> 24) as u8;
-            let subclass = (class_rev >> 16) as u8;
+            let header_type = unsafe { pci_read_config_8(bus as u8, dev as u8, 0, 0x0E) };
+            let max_func = if header_type & 0x80 != 0 { 8 } else { 1 };
 
-            let mut bars = [0u32; 6];
-            let mut i = 0usize;
-            while i < 6 {
-                let off = 0x10 + (i as u8 * 4);
-                let orig = unsafe { pci_read_config(bus as u8, dev as u8, 0, off) };
-
-                // I/O-space BARs (bit 0 set): record and move on.
-                if orig & 1 == 1 {
-                    bars[i] = orig;
-                    i += 1;
-                    continue;
-                }
-
-                let is_64 = (orig & 0x6) == 0x4; // memory BAR type bits == 10b
-                let already_assigned = (orig & 0xFFFF_FFF0) != 0
-                    || (is_64 && unsafe { pci_read_config(bus as u8, dev as u8, 0, off + 4) } != 0);
-
-                // Direct boot: size and assign any unprogrammed memory BAR.
-                #[cfg(target_arch = "aarch64")]
-                if !already_assigned {
-                    unsafe {
-                        pci_write_config_32(bus as u8, dev as u8, 0, off, 0xFFFF_FFFF);
-                        let sz_lo = pci_read_config(bus as u8, dev as u8, 0, off) & 0xFFFF_FFF0;
-                        let sz_hi = if is_64 {
-                            pci_write_config_32(bus as u8, dev as u8, 0, off + 4, 0xFFFF_FFFF);
-                            pci_read_config(bus as u8, dev as u8, 0, off + 4)
-                        } else { 0xFFFF_FFFF };
-                        let mask = ((sz_hi as u64) << 32) | (sz_lo as u64);
-                        let size = (!mask).wrapping_add(1) as usize;
-                        if size != 0 && mmio_next + size <= PCIE_MMIO_END {
-                            let base = leandros_lib::align_up(mmio_next, size);
-                            pci_write_config_32(bus as u8, dev as u8, 0, off, base as u32);
-                            if is_64 {
-                                pci_write_config_32(bus as u8, dev as u8, 0, off + 4, (base >> 32) as u32);
-                            }
-                            mmio_next = base + size;
-                        }
-                    }
-                }
-
-                bars[i] = unsafe { pci_read_config(bus as u8, dev as u8, 0, off) };
-                serial_debug("  BAR");
-                serial_debug_hex(i as u32);
-                serial_debug("=");
-                serial_debug_hex(bars[i]);
+            for func in 0..max_func {
+                let val = unsafe { pci_read_config(bus as u8, dev as u8, func as u8, 0) };
+                if val == 0xFFFF_FFFF { continue; }
+                let vendor_id = (val & 0xFFFF) as u16;
+                let device_id = (val >> 16) as u16;
+                serial_debug("[PCI] Found dev ");
+                serial_debug_hex(vendor_id as u32);
+                serial_debug(":");
+                serial_debug_hex(device_id as u32);
                 serial_debug("\n");
 
-                if is_64 && i + 1 < 6 {
-                    bars[i + 1] = unsafe { pci_read_config(bus as u8, dev as u8, 0, off + 4) };
-                    i += 2;
-                } else {
-                    i += 1;
+                let class_rev = unsafe { pci_read_config(bus as u8, dev as u8, func as u8, 0x08) };
+                let class = (class_rev >> 24) as u8;
+                let subclass = (class_rev >> 16) as u8;
+                let prog_if = (class_rev >> 8) as u8;
+
+                let mut bars = [0u32; 6];
+                let mut i = 0usize;
+                while i < 6 {
+                    let off = 0x10 + (i as u8 * 4);
+                    let orig = unsafe { pci_read_config(bus as u8, dev as u8, func as u8, off) };
+
+                    // I/O-space BARs (bit 0 set): record and move on.
+                    if orig & 1 == 1 {
+                        bars[i] = orig;
+                        i += 1;
+                        continue;
+                    }
+
+                    let is_64 = (orig & 0x6) == 0x4; // memory BAR type bits == 10b
+                    let already_assigned = (orig & 0xFFFF_FFF0) != 0
+                        || (is_64 && unsafe { pci_read_config(bus as u8, dev as u8, func as u8, off + 4) } != 0);
+
+                    // Direct boot: size and assign any unprogrammed memory BAR.
+                    #[cfg(target_arch = "aarch64")]
+                    if !already_assigned {
+                        unsafe {
+                            pci_write_config_32(bus as u8, dev as u8, func as u8, off, 0xFFFF_FFFF);
+                            let sz_lo = pci_read_config(bus as u8, dev as u8, func as u8, off) & 0xFFFF_FFF0;
+                            let sz_hi = if is_64 {
+                                pci_write_config_32(bus as u8, dev as u8, func as u8, off + 4, 0xFFFF_FFFF);
+                                pci_read_config(bus as u8, dev as u8, func as u8, off + 4)
+                            } else { 0xFFFF_FFFF };
+                            let mask = ((sz_hi as u64) << 32) | (sz_lo as u64);
+                            let size = (!mask).wrapping_add(1) as usize;
+                            if size != 0 && mmio_next + size <= PCIE_MMIO_END {
+                                let base = leandros_lib::align_up(mmio_next, size);
+                                pci_write_config_32(bus as u8, dev as u8, func as u8, off, base as u32);
+                                if is_64 {
+                                    pci_write_config_32(bus as u8, dev as u8, func as u8, off + 4, (base >> 32) as u32);
+                                }
+                                mmio_next = base + size;
+                            }
+                        }
+                    }
+
+                    bars[i] = unsafe { pci_read_config(bus as u8, dev as u8, func as u8, off) };
+                    serial_debug("  BAR");
+                    serial_debug_hex(i as u32);
+                    serial_debug("=");
+                    serial_debug_hex(bars[i]);
+                    serial_debug("\n");
+
+                    if is_64 && i + 1 < 6 {
+                        bars[i + 1] = unsafe { pci_read_config(bus as u8, dev as u8, func as u8, off + 4) };
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
                 }
+                devices.push(PciDevice {
+                    bus: bus as u8, dev: dev as u8, func: func as u8,
+                    vendor_id, device_id, class, subclass, prog_if, bars,
+                });
             }
-            devices.push(PciDevice {
-                bus: bus as u8, dev: dev as u8, func: 0,
-                vendor_id, device_id, class, subclass, bars,
-            });
         }
     }
     *PCI_DEVICES.lock() = Some(devices.clone());
@@ -326,4 +336,10 @@ pub fn find_device(vendor_id: u16, device_id: u16) -> Option<PciDevice> {
 
 pub fn find_all_devices(vendor_id: u16, device_id: u16) -> Vec<PciDevice> {
     scan().into_iter().filter(|d| d.vendor_id == vendor_id && d.device_id == device_id).collect()
+}
+
+pub fn find_by_class(class: u8, subclass: u8, prog_if: u8) -> Vec<PciDevice> {
+    scan().into_iter()
+        .filter(|d| d.class == class && d.subclass == subclass && d.prog_if == prog_if)
+        .collect()
 }
