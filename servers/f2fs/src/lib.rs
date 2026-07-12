@@ -1618,6 +1618,14 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message) -> Message {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// `/dev/vd<letter>` names for device indices 0..7, used to populate the
+/// live mount table (`servers/vfs`) with something `/proc/mounts`/`lsblk`
+/// can display — mirrors the naming `sys_mount` already parses in reverse.
+const DEV_NAMES: [&str; 8] = [
+    "/dev/vda", "/dev/vdb", "/dev/vdc", "/dev/vdd",
+    "/dev/vde", "/dev/vdf", "/dev/vdg", "/dev/vdh",
+];
+
 /// Mount the F2FS volume on block device `dev_idx` at `mount_point`.
 /// Returns the IPC port of the server, or None on failure.
 pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Option<u32> {
@@ -1658,7 +1666,8 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
     });
 
     drop(mounts);
-    vfs_server::register_mount(mount_point, port);
+    let device_str = DEV_NAMES.get(dev_idx).copied().unwrap_or("/dev/vd?");
+    vfs_server::register_mount(mount_point, port, device_str, "f2fs");
 
     Some(port)
 }

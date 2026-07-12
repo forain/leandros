@@ -282,3 +282,15 @@ pub unsafe extern "C" fn pivot_root(
     }
 }
 
+/// Unmount a filesystem.
+#[no_mangle]
+pub unsafe extern "C" fn umount2(target: *const u8, flags: c_int) -> c_int {
+    let r = syscall2(nr::UMOUNT2, target as usize, flags as usize);
+    if r < 0 {
+        set_errno(-r as i32);
+        -1
+    } else {
+        0
+    }
+}
+

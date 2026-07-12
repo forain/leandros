@@ -172,7 +172,8 @@ def main():
     bin_files = []
     bins = [
         "shell", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
-        "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest"
+        "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest",
+        "mount", "umount", "fstab",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -206,13 +207,27 @@ def main():
     p = "userland/aplay/car-horn.wav"
     if os.path.exists(p):
         root_files.append(("car-horn.wav", p, 0o100644))
+
+    # /etc/fstab — vdb is the root F2FS volume userland/init already mounts
+    # via a hardcoded bootstrap call before pivot_root (chicken-and-egg: fstab
+    # itself lives on that filesystem); vdc is the second data disk QEMU has
+    # always attached but nothing mounted until init started consulting this
+    # file for secondary mounts.
+    etc_files = [("fstab", (
+        b"# <device>   <mountpoint>  <fstype>  <options>  <dump>  <pass>\n"
+        b"/dev/vdb     /             f2fs      rw         0       1\n"
+        b"/dev/vdc     /data         f2fs      rw         0       2\n"
+    ), 0o100644)]
         
     # 2. Dynamically calculate required blocks and image size
     # Each meta segment takes 512 blocks. We have 8 meta segments (4096 blocks).
     # Plus safety margin and blocks for directories.
+    def content_size(path):
+        return len(path) if isinstance(path, (bytes, bytearray)) else os.path.getsize(path)
+
     required_blocks = 4096 + 100
-    for name, path, mode in bin_files + lib_files + root_files:
-        size = os.path.getsize(path)
+    for name, path, mode in bin_files + lib_files + root_files + etc_files:
+        size = content_size(path)
         k = (size + BLOCK_SIZE - 1) // BLOCK_SIZE
         # Inode block + data blocks + potential direct nodes (1 per 1018 blocks)
         required_blocks += k + 1 + (k + 1017) // 1018
@@ -268,8 +283,11 @@ def main():
     def add_files_to_dir(parent_ino, files):
         nonlocal next_nid, next_blk
         for name, path, mode in files:
-            with open(path, 'rb') as f:
-                data = f.read()
+            if isinstance(path, (bytes, bytearray)):
+                data = bytes(path)
+            else:
+                with open(path, 'rb') as f:
+                    data = f.read()
             size = len(data)
             k = (size + BLOCK_SIZE - 1) // BLOCK_SIZE
             
@@ -417,6 +435,8 @@ def main():
     add_files_to_dir(11, lib_files)
     print("Packing files into /...")
     add_files_to_dir(3, root_files)
+    print("Packing files into /etc...")
+    add_files_to_dir(9, etc_files)
     
     # 5. Write directory blocks and inodes
     # Build dentry blocks list for each directory

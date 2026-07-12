@@ -394,6 +394,9 @@ pub mod nr {
     #[cfg(target_arch = "aarch64")] pub const MOUNT:          usize = 40;
     #[cfg(target_arch = "x86_64")]  pub const MOUNT:          usize = 165;
 
+    #[cfg(target_arch = "aarch64")] pub const UMOUNT2:        usize = 39;
+    #[cfg(target_arch = "x86_64")]  pub const UMOUNT2:        usize = 166;
+
     #[cfg(target_arch = "aarch64")] pub const PIVOT_ROOT:     usize = 41;
     #[cfg(target_arch = "x86_64")]  pub const PIVOT_ROOT:     usize = 155;
 
@@ -408,6 +411,8 @@ pub mod nr {
     pub const PCIDEV_INFO:  usize = 518;
     pub const USBDEV_COUNT: usize = 519;
     pub const USBDEV_INFO:  usize = 520;
+    pub const MOUNTS_COUNT: usize = 521;
+    pub const MOUNTS_INFO:  usize = 522;
 
     // Fallback for other architectures (cargo check host)
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -527,6 +532,8 @@ pub mod nr {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const MOUNT: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const UMOUNT2: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const PIVOT_ROOT: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const BLKDEV_COUNT: usize = 0;
@@ -540,4 +547,8 @@ pub mod nr {
     pub const USBDEV_COUNT: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const USBDEV_INFO: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const MOUNTS_COUNT: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const MOUNTS_INFO: usize = 0;
 }

@@ -1,0 +1,11 @@
+[package]
+name = "mount"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mount"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

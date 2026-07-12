@@ -258,21 +258,28 @@ pub struct MountEntry {
     pub prefix: &'static str,
     pub port:   u32,
     pub in_use: bool,
+    pub device: &'static str,
+    pub fstype: &'static str,
 }
 
 impl MountEntry {
-    const fn empty() -> Self { Self { prefix: "", port: 0, in_use: false } }
+    const fn empty() -> Self { Self { prefix: "", port: 0, in_use: false, device: "", fstype: "" } }
 }
 
 static MOUNTS: Mutex<[MountEntry; MAX_MOUNTS]> =
     Mutex::new([const { MountEntry::empty() }; MAX_MOUNTS]);
 
 /// Register a mounted filesystem at `prefix` (e.g. "/mnt") to an IPC `port`.
-pub fn register_mount(prefix: &'static str, port: u32) {
+pub fn register_mount(prefix: &'static str, port: u32, device: &'static str, fstype: &'static str) {
     let mut m = MOUNTS.lock();
     if let Some(slot) = m.iter_mut().find(|e| !e.in_use) {
-        *slot = MountEntry { prefix, port, in_use: true };
+        *slot = MountEntry { prefix, port, in_use: true, device, fstype };
     }
+}
+
+/// Snapshot of every currently registered mount (for `/proc/mounts`, `mount`, `lsblk`).
+pub fn list_mounts() -> [MountEntry; MAX_MOUNTS] {
+    *MOUNTS.lock()
 }
 
 /// Unregister a mounted filesystem at `prefix` (e.g. "/mnt").

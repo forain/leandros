@@ -142,6 +142,13 @@ pub const SYS_PCIDEV_COUNT: usize = 517;
 pub const SYS_PCIDEV_INFO:  usize = 518;
 pub const SYS_USBDEV_COUNT: usize = 519;
 pub const SYS_USBDEV_INFO:  usize = 520;
+/// Live mount table (servers/vfs::list_mounts), backing `mount`/`lsblk`.
+/// Deliberately a syscall rather than a `/proc/mounts` read: the VFS's
+/// RAMFS-served files are fixed &'static byte slices baked in at compile
+/// time (see servers/vfs/src/lib.rs RAMFS), not a place designed for
+/// per-open dynamic content, so this sidesteps that rather than fighting it.
+pub const SYS_MOUNTS_COUNT: usize = 521;
+pub const SYS_MOUNTS_INFO:  usize = 522;
 
 // ── AArch64 Linux syscall numbers ─────────────────────────────────────────────
 #[cfg(target_arch = "aarch64")]
@@ -326,6 +333,7 @@ mod nr {
     pub const SYNC_FILE_RANGE:     usize = 84;
     pub const READAHEAD:           usize = 213;
     pub const GETCPU:              usize = 168;
+    pub const UMOUNT2:             usize = 39;
     pub const MOUNT:               usize = 40;
     pub const PIVOT_ROOT:          usize = 41;
 }
@@ -534,6 +542,7 @@ mod nr {
     pub const READAHEAD:           usize = 187;
     pub const GETCPU:              usize = 309;
     pub const MOUNT:               usize = 165;
+    pub const UMOUNT2:             usize = 166;
     pub const PIVOT_ROOT:          usize = 155;
 }
 
@@ -595,6 +604,8 @@ fn dispatch_inner(
         SYS_PCIDEV_INFO  => sys_pcidev_info(a0, a1),
         SYS_USBDEV_COUNT => drivers::usb_hcd::device_count() as isize,
         SYS_USBDEV_INFO  => sys_usbdev_info(a0, a1),
+        SYS_MOUNTS_COUNT => vfs::list_mounts().iter().filter(|e| e.in_use).count() as isize,
+        SYS_MOUNTS_INFO  => sys_mounts_info(a0, a1),
 
         // ── Memory ────────────────────────────────────────────────────────────
         MMAP     => sys_mmap(a0, a1, a2, a3, a4, a5),
@@ -753,6 +764,7 @@ fn dispatch_inner(
         ACCESS      => sys_faccessat(0, a0, a1, 0),
 
         MOUNT       => sys_mount(a0, a1, a2, a3, a4),
+        UMOUNT2     => sys_umount2(a0, a1),
         PIVOT_ROOT  => sys_pivot_root(a0, a1),
 
         // ── Socket syscalls ───────────────────────────────────────────────────
@@ -2992,6 +3004,23 @@ fn sys_mount(
     }
 }
 
+fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
+    let (target_raw, target_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(target_ptr as *const u8, 256) }) {
+        Some(p) => p,
+        None => return -14, // EFAULT
+    };
+    let target_str = match core::str::from_utf8(&target_raw[..target_len]) {
+        Ok(s) => s,
+        Err(_) => return -22, // EINVAL
+    };
+
+    if f2fs_server::unmount(target_str) {
+        0
+    } else {
+        -22 // EINVAL — nothing mounted there
+    }
+}
+
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
     let pid = current_pid();
     let (new_raw, new_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(new_root_ptr as *const u8, 256) }) {
@@ -3089,6 +3118,35 @@ fn sys_usbdev_info(index: usize, out_ptr: usize) -> isize {
         core::ptr::write((out_ptr + 4) as *mut u16, info.vendor_id);
         core::ptr::write((out_ptr + 6) as *mut u16, info.product_id);
         core::ptr::write((out_ptr + 8) as *mut u8, info.class);
+    }
+    0
+}
+
+/// out layout: mountpoint:[u8;32]@0, device:[u8;16]@32, fstype:[u8;8]@48 (56 bytes)
+const MOUNTS_INFO_SIZE: usize = 56;
+
+fn sys_mounts_info(index: usize, out_ptr: usize) -> isize {
+    if !validate_user_buf(out_ptr, MOUNTS_INFO_SIZE) { return -14; } // EFAULT
+    let mounts = vfs::list_mounts();
+    let entry = match mounts.iter().filter(|e| e.in_use).nth(index) {
+        Some(e) => e,
+        None => return -19, // ENODEV
+    };
+    unsafe {
+        let mut mp = [0u8; 32];
+        let n = entry.prefix.len().min(32);
+        mp[..n].copy_from_slice(&entry.prefix.as_bytes()[..n]);
+        core::ptr::copy_nonoverlapping(mp.as_ptr(), out_ptr as *mut u8, 32);
+
+        let mut dev = [0u8; 16];
+        let n = entry.device.len().min(16);
+        dev[..n].copy_from_slice(&entry.device.as_bytes()[..n]);
+        core::ptr::copy_nonoverlapping(dev.as_ptr(), (out_ptr + 32) as *mut u8, 16);
+
+        let mut fst = [0u8; 8];
+        let n = entry.fstype.len().min(8);
+        fst[..n].copy_from_slice(&entry.fstype.as_bytes()[..n]);
+        core::ptr::copy_nonoverlapping(fst.as_ptr(), (out_ptr + 48) as *mut u8, 8);
     }
     0
 }

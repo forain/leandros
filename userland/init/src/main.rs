@@ -51,6 +51,11 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     }
     write_str("pivot_root successful! Root is now F2FS.\n");
 
+    // 4b. Mount anything else listed in /etc/fstab (the "/" entry was just
+    // handled above by the hardcoded bootstrap mount — fstab can't drive
+    // that one since fstab itself lives on the filesystem being mounted).
+    mount_from_fstab();
+
     // 5. Exec shell from F2FS mounted root
     write_str("Launching shell via execve...\n");
     let path = b"/bin/shell\0";
@@ -64,6 +69,58 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
 
     loop {
         sched_yield();
+    }
+}
+
+/// Read `/etc/fstab` and mount every entry except the root ("/") one, which
+/// the hardcoded bootstrap mount above already handled.
+unsafe fn mount_from_fstab() {
+    let fd = open(b"/etc/fstab\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    let n = read(fd, buf.as_mut_ptr(), buf.len());
+    close(fd);
+    if n <= 0 {
+        return;
+    }
+    let content = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+
+    for line in content.lines() {
+        let entry = match leandros_libc::fstab::parse_line(line) {
+            Some(e) => e,
+            None => continue,
+        };
+        if entry.mountpoint() == "/" {
+            continue;
+        }
+
+        write_str("Mounting ");
+        write_str(entry.device());
+        write_str(" at ");
+        write_str(entry.mountpoint());
+        write_str(" (");
+        write_str(entry.fstype());
+        write_str(")...\n");
+
+        let mut mp_buf = [0u8; 65];
+        let mp = entry.mountpoint();
+        mp_buf[..mp.len()].copy_from_slice(mp.as_bytes());
+        mkdir(mp_buf.as_ptr(), 0o755);
+
+        let mut dev_buf = [0u8; 65];
+        let dev = entry.device();
+        dev_buf[..dev.len()].copy_from_slice(dev.as_bytes());
+
+        let mut fst_buf = [0u8; 65];
+        let fst = entry.fstype();
+        fst_buf[..fst.len()].copy_from_slice(fst.as_bytes());
+
+        let r = mount(dev_buf.as_ptr(), mp_buf.as_ptr(), fst_buf.as_ptr(), 0, core::ptr::null());
+        if r < 0 {
+            write_str("  WARNING: mount failed\n");
+        }
     }
 }
 

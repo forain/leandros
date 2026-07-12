@@ -1,0 +1,11 @@
+[package]
+name = "fstab"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fstab"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

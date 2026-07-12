@@ -32,6 +32,22 @@ pub struct UsbDevInfo {
     pub class: u8,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MountInfo {
+    pub mountpoint: [u8; 32],
+    pub mountpoint_len: usize,
+    pub device: [u8; 16],
+    pub device_len: usize,
+    pub fstype: [u8; 8],
+    pub fstype_len: usize,
+}
+
+impl MountInfo {
+    pub fn mountpoint(&self) -> &[u8] { &self.mountpoint[..self.mountpoint_len] }
+    pub fn device(&self) -> &[u8] { &self.device[..self.device_len] }
+    pub fn fstype(&self) -> &[u8] { &self.fstype[..self.fstype_len] }
+}
+
 pub unsafe fn blkdev_count() -> isize {
     syscall1(nr::BLKDEV_COUNT, 0)
 }
@@ -77,5 +93,30 @@ pub unsafe fn usbdev_info(index: usize) -> Option<UsbDevInfo> {
         vendor_id: u16::from_ne_bytes(buf[4..6].try_into().unwrap()),
         product_id: u16::from_ne_bytes(buf[6..8].try_into().unwrap()),
         class: buf[8],
+    })
+}
+
+fn nul_len(buf: &[u8]) -> usize {
+    buf.iter().position(|&b| b == 0).unwrap_or(buf.len())
+}
+
+pub unsafe fn mounts_count() -> isize {
+    syscall1(nr::MOUNTS_COUNT, 0)
+}
+
+pub unsafe fn mounts_info(index: usize) -> Option<MountInfo> {
+    let mut buf = [0u8; 56];
+    let r = syscall2(nr::MOUNTS_INFO, index, buf.as_mut_ptr() as usize);
+    if r < 0 { return None; }
+    let mut mountpoint = [0u8; 32];
+    mountpoint.copy_from_slice(&buf[0..32]);
+    let mut device = [0u8; 16];
+    device.copy_from_slice(&buf[32..48]);
+    let mut fstype = [0u8; 8];
+    fstype.copy_from_slice(&buf[48..56]);
+    Some(MountInfo {
+        mountpoint_len: nul_len(&mountpoint), mountpoint,
+        device_len: nul_len(&device), device,
+        fstype_len: nul_len(&fstype), fstype,
     })
 }
