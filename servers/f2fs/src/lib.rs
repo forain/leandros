@@ -15,7 +15,7 @@ extern crate mm;
 
 use ipc::{Message, port};
 use spin::Mutex;
-use drivers::virtio_blk;
+use drivers::blkdev as virtio_blk;
 
 // ── VFS protocol constants ────────────────────────────────────────────────────
 

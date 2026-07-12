@@ -25,6 +25,19 @@ pub mod virtio_gpu;
 pub mod virtio_blk;
 pub mod virtio_keyboard;
 pub mod virtio_net;
+#[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
+pub mod sdhci;
+
+/// The active block-storage backend, selected at compile time. `virtio_blk`
+/// on QEMU `virt`/x86_64 (PCI transport); `sdhci` on rpi5/raspi4b builds
+/// (no PCI bus exists on either target — see drivers/src/sdhci.rs). Callers
+/// (kernel/src/init.rs, kernel/src/syscall.rs, servers/f2fs) use this alias
+/// exclusively so the backend swap is a one-line change here, not scattered
+/// per-call-site cfg.
+#[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
+pub use sdhci as blkdev;
+#[cfg(not(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b"))))]
+pub use virtio_blk as blkdev;
 
 /// Trait every driver server must implement.
 pub trait Driver {

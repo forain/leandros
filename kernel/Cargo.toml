@@ -9,8 +9,12 @@ path = "src/main.rs"
 
 [features]
 # Target Raspberry Pi 5 (BCM2712 + RP1).
-# Propagates to arch-aarch64 which selects correct MMIO addresses.
-rpi5 = ["arch-aarch64/rpi5"]
+# Propagates to arch-aarch64 (MMIO addresses) and drivers/f2fs-server
+# (selects the sdhci SD-card driver as drivers::blkdev instead of virtio_blk).
+rpi5 = ["arch-aarch64/rpi5", "drivers/rpi5", "f2fs-server/rpi5"]
+# Target QEMU's -M raspi4b machine — testable stepping stone for the sdhci
+# driver (see drivers/src/sdhci.rs). Not a hardware target.
+raspi4b = ["arch-aarch64/raspi4b", "drivers/raspi4b", "f2fs-server/raspi4b"]
 
 [dependencies]
 mm         = { path = "../mm" }

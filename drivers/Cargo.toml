@@ -3,6 +3,14 @@ name = "drivers"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Select the sdhci SD-card driver as drivers::blkdev instead of virtio_blk.
+# rpi5 targets real BCM2712 hardware; raspi4b targets QEMU's -M raspi4b
+# generic-sdhci model (used only as a testable stepping stone — see
+# drivers/src/sdhci.rs's top-of-file comment).
+rpi5 = []
+raspi4b = []
+
 [dependencies]
 leandros-lib = { path = "../lib" }
 ipc = { path = "../ipc" }

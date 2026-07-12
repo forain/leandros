@@ -2949,11 +2949,11 @@ fn sys_mount(
         return -22; // EINVAL
     };
 
-    if dev_idx >= drivers::virtio_blk::device_count() {
+    if dev_idx >= drivers::blkdev::device_count() {
         return -6; // ENXIO
     }
 
-    if !drivers::virtio_blk::has_f2fs(dev_idx) {
+    if !drivers::blkdev::has_f2fs(dev_idx) {
         return -22; // EINVAL
     }
 

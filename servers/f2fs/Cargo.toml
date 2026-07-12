@@ -6,6 +6,10 @@ edition.workspace = true
 [lib]
 crate-type = ["rlib"]
 
+[features]
+rpi5 = ["drivers/rpi5"]
+raspi4b = ["drivers/raspi4b"]
+
 [dependencies]
 ipc     = { path = "../../ipc" }
 sched   = { path = "../../sched" }
