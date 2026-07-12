@@ -13,12 +13,14 @@ LIMINE_CACHE_DIR=".limine-cache"
 ARCH="$DEFAULT_ARCH"
 LIMINE_VERSION="$DEFAULT_LIMINE_VERSION"
 RPI5="false"
+RASPI4B="false"
 
 show_usage() {
     echo "Usage: $0 [OPTIONS]"
     echo "Options:"
     echo "  --arch ARCH          Build for specific architecture: aarch64, x86_64, or both (default: both)"
     echo "  --rpi5               Build with features for Raspberry Pi 5"
+    echo "  --raspi4b            Build with features for QEMU -M raspi4b (sdhci driver test path)"
     echo "  --help               Show this help message"
 }
 
@@ -26,6 +28,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch) ARCH="$2"; shift 2 ;;
         --rpi5) RPI5="true"; shift ;;
+        --raspi4b) RASPI4B="true"; shift ;;
         --help) show_usage; exit 0 ;;
         *) echo "❌ Unknown option: $1"; show_usage; exit 1 ;;
     esac
@@ -107,6 +110,8 @@ build_kernel() {
     local features_arg=""
     if [[ "$arch" == "aarch64" && "$RPI5" == "true" ]]; then
         features_arg="--features rpi5"
+    elif [[ "$arch" == "aarch64" && "$RASPI4B" == "true" ]]; then
+        features_arg="--features raspi4b"
     fi
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_std" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
     RUSTFLAGS="-C link-arg=-T$linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro" \

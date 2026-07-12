@@ -21,12 +21,22 @@ while [[ "$#" -gt 0 ]]; do
     case $1 in
         --direct) BOOT_MODE="direct"; shift ;;
         --uefi) BOOT_MODE="uefi"; shift ;;
+        # QEMU raspi4b (BCM2711) — testable stepping stone for the sdhci
+        # driver (drivers/src/sdhci.rs); aarch64-only, no PCI bus, no
+        # GPU/sound/keyboard devices. Not a hardware target.
+        --raspi4b) BOOT_MODE="raspi4b"; ARCH="aarch64"; shift ;;
         -d) QEMU_EXTRA_ARGS+=("$2"); shift 2 ;;
         *) QEMU_EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
 
-if [ "$ARCH" = "aarch64" ]; then
+if [ "$BOOT_MODE" = "raspi4b" ]; then
+    QEMU_SYSTEM="qemu-system-aarch64"
+    # No gic-version=/-cpu override: raspi4b is a fixed-SoC board (4x
+    # cortex-a72, GIC-400), unlike the generic `virt` machine.
+    MACHINE_ARGS="-machine raspi4b -m 2G -smp 4"
+    DISK_IMAGE="leandros-limine-aarch64.img" # unused in raspi4b mode
+elif [ "$ARCH" = "aarch64" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
     # -smp 4: SMP bringup via PSCI CPU_ON (GICv2 supports up to 8 CPUs).
     MACHINE_ARGS="-machine virt,gic-version=2 -m 2G -smp 4"
@@ -88,7 +98,33 @@ done
 echo "🚀 Starting LeandrOS ($ARCH) in $BOOT_MODE mode"
 echo "=========================================="
 
-if [ "$BOOT_MODE" = "uefi" ]; then
+if [ "$BOOT_MODE" = "raspi4b" ]; then
+    KERNEL_ELF="target/final-aarch64/kernel-direct"
+    if [ ! -f "$KERNEL_ELF" ]; then
+        echo "❌ Direct kernel ELF not found: $KERNEL_ELF (build with: ./scripts/build-all.sh --arch aarch64 --raspi4b)"
+        exit 1
+    fi
+    echo "🏗️  Using Direct Kernel ELF: $KERNEL_ELF (QEMU raspi4b — sdhci driver test path)"
+
+    # No PCI bus exists on raspi4b (confirmed via QMP `info mtree`), so the
+    # F2FS test image attaches through the SD card slot instead of
+    # virtio-blk-pci. QEMU routes `-drive if=sd` to the second of two
+    # generic-sdhci instances (0xfe340000), matching SDHCI_BASE in
+    # drivers/src/sdhci.rs for this feature. No GPU/sound/keyboard devices
+    # exist on this board — verification is serial-log only.
+    # -accel tcg: force software emulation, matching the other direct-boot
+    # paths below (avoids any host-acceleration mismatch with the new
+    # EL3->EL2 boot prologue in kernel/src/entry_aarch64.s).
+    exec $QEMU_SYSTEM $MACHINE_ARGS -accel tcg \
+        -kernel "$KERNEL_ELF" \
+        -device loader,file=initrd-aarch64.cpio,addr=0x48000000,force-raw=on \
+        -drive if=sd,format=raw,file="$DATA0_IMG" \
+        -net none \
+        -serial mon:stdio \
+        -parallel none \
+        -no-reboot \
+        "${QEMU_EXTRA_ARGS[@]}"
+elif [ "$BOOT_MODE" = "uefi" ]; then
     UEFI_FIRMWARE=""
     FW_PATHS=("${X86_64_FW_PATHS[@]}")
     if [ "$ARCH" = "aarch64" ]; then FW_PATHS=("${AARCH64_FW_PATHS[@]}"); fi

@@ -68,6 +68,8 @@ def _cleanup_socks():
 def _build_cmd(arch, mode="uefi"):
     if mode == "direct":
         return _build_direct_cmd(arch)
+    if mode == "raspi4b":
+        return _build_raspi4b_cmd()
     if arch == "aarch64":
         fw = _find_fw(AARCH64_FW_PATHS)
         if not fw:
@@ -186,6 +188,36 @@ def _build_direct_cmd(arch):
         ]
     else:
         sys.exit(f"ERROR: unknown arch '{arch}'")
+
+
+def _build_raspi4b_cmd():
+    """QEMU -M raspi4b headless variant of run-qemu.sh's --raspi4b path —
+    testable stepping stone for the sdhci driver (drivers/src/sdhci.rs), not
+    a hardware target. aarch64-only. No PCI bus exists on this board
+    (confirmed via QMP `info mtree`), so the F2FS test image attaches
+    through the SD card slot (`-drive if=sd`, routed by QEMU to the second
+    of two generic-sdhci instances at 0xfe340000 — matching SDHCI_BASE for
+    this feature) instead of virtio-blk-pci. No GPU/sound/keyboard devices
+    exist on this board — serial log only, same chardev-socket setup as
+    every other mode here."""
+    kernel = os.path.join(REPO_ROOT, "target/final-aarch64/kernel-direct")
+    initrd = os.path.join(REPO_ROOT, "initrd-aarch64.cpio")
+    data0 = os.path.join(REPO_ROOT, "f2fs-data0-aarch64.img")
+    if not os.path.exists(kernel):
+        sys.exit(f"ERROR: direct-boot kernel not found: {kernel} "
+                  "(build with: ./scripts/build-all.sh --arch aarch64 --raspi4b)")
+    return [
+        "qemu-system-aarch64",
+        "-machine", "raspi4b", "-m", "2G", "-smp", "4", "-accel", "tcg",
+        "-kernel", kernel,
+        "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
+        "-drive", f"if=sd,format=raw,file={data0}",
+        "-net", "none", "-parallel", "none", "-no-reboot",
+        "-display", "none",
+        "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
+        "-serial", "chardev:serial0",
+        "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
+    ]
 
 
 def _qemu_pid():
