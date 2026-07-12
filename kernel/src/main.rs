@@ -305,8 +305,18 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 // the PCIe ECAM is the high window at 0x40_1000_0000 — the same
                 // base the Limine path discovers via ACPI MCFG. Without this the
                 // PCI bus scan finds no devices (e.g. virtio-sound).
+                //
+                // This fallback is `virt`-machine-specific and must not apply to
+                // rpi5/raspi4b builds: `uart::BASE` there is a compile-time
+                // constant this dynamic value never overrides (see
+                // arch/aarch64/src/uart.rs), and raspi4b (confirmed via QMP
+                // `info mtree`) has no PCIe/ECAM region anywhere in its memory
+                // map at all — mapping and probing this phantom address would
+                // hit genuinely unbacked physical memory instead of the safe
+                // ecam_base==0 early-return in drivers/src/pci.rs.
                 if BOOT_INFO.uart_base == 0 { BOOT_INFO.uart_base = 0x0900_0000; }
-                if BOOT_INFO.pci_ecam_base == 0 { BOOT_INFO.pci_ecam_base = 0x40_1000_0000; }
+                #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
+                { if BOOT_INFO.pci_ecam_base == 0 { BOOT_INFO.pci_ecam_base = 0x40_1000_0000; } }
             }
 
             // Direct boot: the DTB memory map calls *all* RAM available, unlike

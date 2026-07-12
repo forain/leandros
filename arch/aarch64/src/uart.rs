@@ -3,24 +3,32 @@
 // ── Board-specific constants ──────────────────────────────────────────────────
 
 /// MMIO base address of the PL011.
-#[cfg(not(feature = "rpi5"))]
+#[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 pub const BASE: usize = 0x0900_0000;       // QEMU virt
 
 #[cfg(feature = "rpi5")]
 pub const BASE: usize = 0x107D_0010_00;    // RPi 5 RP1 UART0
 
+/// QEMU -M raspi4b PL011 (BCM2711 peripheral base 0xFE000000 + UART0 offset
+/// 0x201000). Verified live via QMP `info mtree` — see drivers/src/sdhci.rs's
+/// top-of-file comment for the rest of the raspi4b address set.
+#[cfg(feature = "raspi4b")]
+pub const BASE: usize = 0xFE20_1000;
+
 /// Integer baud-rate divisor.
-#[cfg(not(feature = "rpi5"))]
+#[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 const IBRD_VAL: u32 = 13;
 
-#[cfg(feature = "rpi5")]
+// rpi5 and raspi4b's QEMU pl011 model both clock UART0 at 48MHz, giving the
+// same 115200-baud divisor (48_000_000 / (16 * 115200) = 26 + 1/24).
+#[cfg(any(feature = "rpi5", feature = "raspi4b"))]
 const IBRD_VAL: u32 = 26;
 
 /// Fractional baud-rate divisor.
-#[cfg(not(feature = "rpi5"))]
+#[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 const FBRD_VAL: u32 = 1;
 
-#[cfg(feature = "rpi5")]
+#[cfg(any(feature = "rpi5", feature = "raspi4b"))]
 const FBRD_VAL: u32 = 3;
 
 // ── Register offsets ──────────────────────────────────────────────────────────

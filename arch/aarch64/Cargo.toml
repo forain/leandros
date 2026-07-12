@@ -8,6 +8,9 @@ edition.workspace = true
 # Selects correct UART/GIC base addresses and UARTCLK divisors for RPi 5.
 # Without this flag the defaults target QEMU -machine virt.
 rpi5 = []
+# Target QEMU's -M raspi4b machine (BCM2711). Testable stepping stone for
+# the sdhci driver (see drivers/src/sdhci.rs) — not a hardware target.
+raspi4b = []
 
 [dependencies]
 boot    = { path = "../../boot" }

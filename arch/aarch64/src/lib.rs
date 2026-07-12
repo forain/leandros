@@ -126,6 +126,19 @@ pub fn init(boot_info: &boot::BootInfo) {
         // cores than MAX_APS) fail CPU_ON harmlessly.  The APs initialise
         // their banked GIC/timer state and park in sched::ap_entry until the
         // BSP calls sched::run().
+        //
+        // Skipped on raspi4b: unlike `virt` (APs stay PSCI-powered-off until
+        // this call) and presumably real RPi5 hardware, QEMU's raspi4b board
+        // releases all cores simultaneously at reset (see
+        // kernel/src/entry_aarch64.s's park loop) — APs 1-3 are already
+        // alive, just parked in our own WFE loop, not powered off. A CPU_ON
+        // SMC on an already-running core should return PSCI's ALREADY_ON
+        // error harmlessly per spec, but empirically (confirmed via GDB
+        // stub register dumps: the BSP gets stuck at PC=0x200/EL3h with
+        // X00 still holding the CPU_ON function ID) this board's SMC
+        // dispatch hangs instead. SMP is out of scope for this QEMU-only
+        // sdhci-driver test target — single-CPU operation is sufficient.
+        #[cfg(not(feature = "raspi4b"))]
         smp::smp_init(&[1, 2, 3, 4, 5, 6, 7]);
     }
 }

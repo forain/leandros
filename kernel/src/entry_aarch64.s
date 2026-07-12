@@ -3,17 +3,86 @@
 .section ".text.boot", "ax", @progbits
 .globl _start
 _start:
+    // ── Park non-primary cores ────────────────────────────────────────────────
+    // Unlike QEMU `-machine virt` (only CPU 0 ever executes _start; APs stay
+    // PSCI-powered-off until arch/aarch64/src/smp.rs explicitly calls
+    // cpu_on() much later), QEMU `-M raspi4b` releases all 4 cores
+    // simultaneously at reset with identical initial PC — confirmed via QMP
+    // register dumps showing multiple cores concurrently executing this
+    // file with garbage register state (a translation fault on a wild
+    // pointer, varying between runs — the signature of unsynchronized
+    // concurrent BSS-zero/page-table-build races, not a fixed bad address).
+    // Every step below assumes single-threaded execution by one core.
+    //
+    // Gated on MPIDR_EL1.Aff0 (bits [7:0], the same field
+    // arch/aarch64/src/smp.rs's arch_cpu_id()/record_own_mpidr() already use
+    // as the logical CPU index) — confirmed via QEMU's GDB stub reading each
+    // vCPU's VMPIDR_EL2 as 0/1/2/3 respectively before any of our code runs.
+    // An earlier version of this gate used a first-core-wins LDAXR/STLXR
+    // election instead, reasoning that QEMU's raspi4b MPIDR encoding was
+    // unconfirmed; that turned out to livelock all 4 vCPUs under QEMU TCG
+    // (confirmed via GDB stub single-stepping: the same LDAXR/STLXR sequence
+    // completes correctly for one core stepped in isolation but never
+    // resolves under real concurrent execution, with or without
+    // `-accel tcg,thread=multi`) — a QEMU TCG exclusive-monitor quirk under
+    // 4-way contention, not a logic bug. MPIDR reads are purely local to
+    // each core (no shared memory, no contention possible even in
+    // principle), so this is the more robust choice now that the encoding
+    // is confirmed.
+    //
+    // Real RPi5 firmware may already gate this like `virt` does —
+    // unconfirmed without hardware — so this is unconditional and harmless
+    // wherever only one core ever reaches here. SMP bring-up is out of scope
+    // for the raspi4b QEMU test target (a stepping stone for the sdhci
+    // driver, not a hardware target) — parked cores here are never released.
+    mrs     x4, mpidr_el1
+    and     x4, x4, #0xFF
+    cbz     x4, _start_primary
+
+park_secondary_core:
+    wfe
+    b       park_secondary_core
+
+_start_primary:
     // ── PRESERVE ARGUMENTS IMMEDIATELY ──
     // x0 holds the DTB pointer on direct (-kernel) boot; preserve across the
     // EL2->EL1 drop below (eret does not clobber GPRs).
     mov     x19, x0
     mov     x20, x1
 
+    // ── Drop to EL2 if entered at EL3 ────────────────────────────────────────
+    // QEMU `-M raspi4b` resets the boot CPU into EL3 (confirmed via QMP
+    // `info registers` at a halted boot: PC == _start, PSTATE decodes to
+    // EL3h) rather than EL2 like `-machine virt` does (no EL3 implemented
+    // there, secure=off). Real RPi5 firmware may already drop to EL2 before
+    // jumping here like `virt` does — unconfirmed without hardware — so
+    // this is a one-time, unconditional drop straight into the existing,
+    // already-tested EL2->EL1 logic below, not a parallel code path: it is
+    // a no-op everywhere CurrentEL is never observed to be 3.
+    mrs     x4, CurrentEL
+    lsr     x4, x4, #2
+    and     x4, x4, #3
+    cmp     x4, #3
+    b.ne    check_el2                // not EL3 → fall through to the EL2 check
+
+    mov     x5, #(1 << 0)            // SCR_EL3.NS: EL2/EL1/EL0 are Non-secure
+    orr     x5, x5, #(1 << 8)        // SCR_EL3.HCE: HVC enabled at lower ELs
+    orr     x5, x5, #(1 << 10)       // SCR_EL3.RW: EL2 executes AArch64
+    msr     scr_el3, x5
+
+    mov     x5, #0x3c9               // SPSR_EL3: return to EL2h, DAIF masked
+    msr     spsr_el3, x5
+    adr     x5, check_el2            // physical address (MMU off) of the EL2 check below
+    msr     elr_el3, x5
+    isb
+    eret
+
     // ── Drop to EL1 if entered at EL2 ────────────────────────────────────────
     // QEMU `-kernel` on `virt` with `-cpu max` (EL2 implemented, secure=off)
     // enters at EL2.  The rest of this entry — and the kernel — only programs
     // EL1 system registers, so we must hand off to EL1 first.  Limine already
     // enters at EL1, so CurrentEL gates this and leaves that path untouched.
+check_el2:
     mrs     x4, CurrentEL
     lsr     x4, x4, #2
     and     x4, x4, #3

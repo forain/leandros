@@ -8,20 +8,32 @@
 //!   GICD (distributor)    0x107F_FF90_00
 //!   GICC (CPU interface)  0x107F_FFA0_00
 //!
+//! **QEMU -M raspi4b (BCM2711 GIC-400)** — enabled by the `raspi4b` cargo
+//! feature. Testable stepping stone for the sdhci driver (see
+//! drivers/src/sdhci.rs's top-of-file comment) — not a hardware target.
+//! Verified live via QMP `info mtree`:
+//!   GICD (distributor)    0xFF84_1000
+//!   GICC (CPU interface)  0xFF84_2000
+//!
 //! We enable PPI #30 (EL1 physical timer, CNTP) so the generic timer can
 //! deliver IRQs to CPU 0.
 //!
 //! Ref: ARM GIC Architecture Specification v2.0
 
-#[cfg(not(feature = "rpi5"))]
+#[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 pub const GICD_BASE: usize = 0x0800_0000;
-#[cfg(not(feature = "rpi5"))]
+#[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 pub const GICC_BASE: usize = 0x0801_0000;
 
 #[cfg(feature = "rpi5")]
 pub const GICD_BASE: usize = 0x107F_FF90_00;
 #[cfg(feature = "rpi5")]
 pub const GICC_BASE: usize = 0x107F_FFA0_00;
+
+#[cfg(feature = "raspi4b")]
+pub const GICD_BASE: usize = 0xFF84_1000;
+#[cfg(feature = "raspi4b")]
+pub const GICC_BASE: usize = 0xFF84_2000;
 
 // Distributor register offsets
 const GICD_CTLR:       usize = 0x000; // distributor control
