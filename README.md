@@ -145,24 +145,31 @@ The AArch64 runner boots the ELF directly with `-kernel`, passing the virt machi
 
 ## Deploying to Raspberry Pi 5
 
-Build with the `rpi5` feature to select the correct UART, GIC, and MMU addresses for the BCM2712 SoC, and to link at the RPi firmware's expected load address (`0x80000`).
+Build with the `rpi5` feature to select the correct UART, GIC, and MMU addresses for the BCM2712 SoC, and to link at the RPi firmware's expected load address (`0x80000`):
 
 ```sh
-cargo build --release \
-    --target aarch64-unknown-none \
-    --features rpi5 \
-    -p kernel
+./scripts/build-all.sh --arch aarch64 --rpi5
 ```
 
-Copy to an SD card that already has RPi 5 firmware (`start4.elf`, `fixup4.dat`, `bcm2712-rpi-5-b.dtb`) on its FAT32 boot partition:
+**First-time SD card setup**: `scripts/prepare-rpi5-sdcard.sh` wipes a blank SD card, creates the single MBR/FAT32 boot partition the Pi 5's boot ROM expects, and populates it for one of two boot paths (Linux and macOS both supported):
+
+```sh
+# RPi firmware loads kernel.elf directly, no bootloader in between
+sudo ./scripts/prepare-rpi5-sdcard.sh --boot-mode direct /dev/mmcblk0   # or /dev/diskN on macOS
+
+# RPi firmware loads the vendored RPI_EFI.fd, which boots Limine, which loads kernel.elf + initrd
+sudo ./scripts/prepare-rpi5-sdcard.sh --boot-mode limine /dev/mmcblk0
+```
+
+It downloads and caches the Broadcom GPU firmware blobs (`start4.elf`, `fixup4.dat`) from the [RPi firmware repo](https://github.com/raspberrypi/firmware/tree/master/boot) on first run; pass `--firmware-dir <dir>` to supply them from a local copy instead.
+
+After that first-time setup, `deploy-rpi5.sh` updates just the kernel ELF on an already-prepared card:
 
 ```sh
 sudo ./scripts/deploy-rpi5.sh \
-    target/aarch64-unknown-none/release/kernel \
+    target/final-aarch64/kernel-direct \
     /dev/mmcblk0
 ```
-
-**First-time SD card setup** (one-off): flash Raspberry Pi OS Lite, or manually copy the [RPi firmware files](https://github.com/raspberrypi/firmware/tree/master/boot) to a FAT32 partition.
 
 ---
 

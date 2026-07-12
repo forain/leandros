@@ -20,3 +20,7 @@ doomgeneric/build/
 aarch64_vars.fd
 x86_64_vars.fd
 .!*!*
+
+# Downloaded RPi firmware blobs (start4.elf, fixup4.dat), cached by
+# prepare-rpi5-sdcard.sh on first run. Third-party binaries, not source.
+.rpi-firmware-cache/
