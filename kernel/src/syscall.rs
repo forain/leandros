@@ -134,6 +134,14 @@ pub const SYS_SPAWN:    usize = 510;
 /// Exists so userspace can exercise the raw send/recv blocking path
 /// directly (see userland/racetest); servers create their ports kernel-side.
 pub const SYS_PORT_CREATE: usize = 514;
+/// Device-enumeration syscalls backing lsblk/lspci/lsusb — no Linux
+/// equivalent (Linux does this via ioctls on device nodes or sysfs).
+pub const SYS_BLKDEV_COUNT: usize = 515;
+pub const SYS_BLKDEV_INFO:  usize = 516;
+pub const SYS_PCIDEV_COUNT: usize = 517;
+pub const SYS_PCIDEV_INFO:  usize = 518;
+pub const SYS_USBDEV_COUNT: usize = 519;
+pub const SYS_USBDEV_INFO:  usize = 520;
 
 // ── AArch64 Linux syscall numbers ─────────────────────────────────────────────
 #[cfg(target_arch = "aarch64")]
@@ -579,6 +587,14 @@ fn dispatch_inner(
             Some(p) => p as isize,
             None    => -12, // ENOMEM — port table full
         },
+
+        // ── Device enumeration (lsblk/lspci/lsusb) ──────────────────────────────
+        SYS_BLKDEV_COUNT => drivers::blkdev::device_count() as isize,
+        SYS_BLKDEV_INFO  => sys_blkdev_info(a0, a1),
+        SYS_PCIDEV_COUNT => drivers::pci::scan().len() as isize,
+        SYS_PCIDEV_INFO  => sys_pcidev_info(a0, a1),
+        SYS_USBDEV_COUNT => drivers::usb_hcd::device_count() as isize,
+        SYS_USBDEV_INFO  => sys_usbdev_info(a0, a1),
 
         // ── Memory ────────────────────────────────────────────────────────────
         MMAP     => sys_mmap(a0, a1, a2, a3, a4, a5),
@@ -3004,6 +3020,77 @@ fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
     let reply = vfs::handle(&msg, pid);
     let val = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
     val as isize
+}
+
+// ── Device enumeration syscalls (lsblk/lspci/lsusb) ───────────────────────────
+//
+// No Linux equivalent (Linux does this via ioctls on device nodes or sysfs);
+// see SYS_BLKDEV_COUNT et al. Each *_info syscall fills a fixed-layout struct
+// at `out_ptr` via raw offset writes, matching the sys_prlimit64 style above.
+
+/// out layout: total_blocks:u64@0, block_size:u32@8, has_fstype:u8@12, fstype:[u8;8]@13 (25 bytes)
+const BLKDEV_INFO_SIZE: usize = 24;
+
+fn sys_blkdev_info(index: usize, out_ptr: usize) -> isize {
+    if !validate_user_buf(out_ptr, BLKDEV_INFO_SIZE) { return -14; } // EFAULT
+    let info = match drivers::blkdev::info(index) {
+        Some(i) => i,
+        None => return -19, // ENODEV
+    };
+    unsafe {
+        core::ptr::write(out_ptr as *mut u64, info.total_blocks);
+        core::ptr::write((out_ptr + 8) as *mut u32, info.block_size);
+        let fstype = info.fstype.unwrap_or("");
+        core::ptr::write((out_ptr + 12) as *mut u8, if fstype.is_empty() { 0 } else { 1 });
+        let mut name_buf = [0u8; 8];
+        let n = fstype.len().min(8);
+        name_buf[..n].copy_from_slice(&fstype.as_bytes()[..n]);
+        core::ptr::copy_nonoverlapping(name_buf.as_ptr(), (out_ptr + 13) as *mut u8, 8);
+    }
+    0
+}
+
+/// out layout: bus:u8@0, dev:u8@1, func:u8@2, vendor_id:u16@4, device_id:u16@6,
+/// class:u8@8, subclass:u8@9, prog_if:u8@10 (12 bytes)
+const PCIDEV_INFO_SIZE: usize = 12;
+
+fn sys_pcidev_info(index: usize, out_ptr: usize) -> isize {
+    if !validate_user_buf(out_ptr, PCIDEV_INFO_SIZE) { return -14; } // EFAULT
+    let devices = drivers::pci::scan();
+    let dev = match devices.get(index) {
+        Some(d) => d,
+        None => return -19, // ENODEV
+    };
+    unsafe {
+        core::ptr::write(out_ptr as *mut u8, dev.bus);
+        core::ptr::write((out_ptr + 1) as *mut u8, dev.dev);
+        core::ptr::write((out_ptr + 2) as *mut u8, dev.func);
+        core::ptr::write((out_ptr + 4) as *mut u16, dev.vendor_id);
+        core::ptr::write((out_ptr + 6) as *mut u16, dev.device_id);
+        core::ptr::write((out_ptr + 8) as *mut u8, dev.class);
+        core::ptr::write((out_ptr + 9) as *mut u8, dev.subclass);
+        core::ptr::write((out_ptr + 10) as *mut u8, dev.prog_if);
+    }
+    0
+}
+
+/// out layout: bus:u8@0, address:u8@1, vendor_id:u16@4, product_id:u16@6, class:u8@8 (12 bytes)
+const USBDEV_INFO_SIZE: usize = 12;
+
+fn sys_usbdev_info(index: usize, out_ptr: usize) -> isize {
+    if !validate_user_buf(out_ptr, USBDEV_INFO_SIZE) { return -14; } // EFAULT
+    let info = match drivers::usb_hcd::device_info(index) {
+        Some(i) => i,
+        None => return -19, // ENODEV
+    };
+    unsafe {
+        core::ptr::write(out_ptr as *mut u8, info.bus);
+        core::ptr::write((out_ptr + 1) as *mut u8, info.address);
+        core::ptr::write((out_ptr + 4) as *mut u16, info.vendor_id);
+        core::ptr::write((out_ptr + 6) as *mut u16, info.product_id);
+        core::ptr::write((out_ptr + 8) as *mut u8, info.class);
+    }
+    0
 }
 
 fn sys_newfstatat(_dirfd: usize, path_ptr: usize, statbuf_ptr: usize, _flags: usize) -> isize {

@@ -25,6 +25,7 @@ pub mod virtio_gpu;
 pub mod virtio_blk;
 pub mod virtio_keyboard;
 pub mod virtio_net;
+pub mod usb_hcd;
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod sdhci;
 
@@ -38,6 +39,15 @@ pub mod sdhci;
 pub use sdhci as blkdev;
 #[cfg(not(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b"))))]
 pub use virtio_blk as blkdev;
+
+/// Per-device metadata surfaced to userspace via the block-device-enumeration
+/// syscalls (see kernel/src/syscall.rs SYS_BLKDEV_INFO), backing `lsblk`.
+#[derive(Debug, Clone, Copy)]
+pub struct BlkDevInfo {
+    pub total_blocks: u64,
+    pub block_size: u32,
+    pub fstype: Option<&'static str>,
+}
 
 /// Trait every driver server must implement.
 pub trait Driver {

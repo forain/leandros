@@ -401,6 +401,13 @@ pub mod nr {
     pub const IPC_RECV: usize = 512;
     pub const IPC_CALL: usize = 513;
     pub const SPAWN:    usize = 510;
+    pub const PORT_CREATE:  usize = 514;
+    pub const BLKDEV_COUNT: usize = 515;
+    pub const BLKDEV_INFO:  usize = 516;
+    pub const PCIDEV_COUNT: usize = 517;
+    pub const PCIDEV_INFO:  usize = 518;
+    pub const USBDEV_COUNT: usize = 519;
+    pub const USBDEV_INFO:  usize = 520;
 
     // Fallback for other architectures (cargo check host)
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -521,4 +528,16 @@ pub mod nr {
     pub const MOUNT: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const PIVOT_ROOT: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const BLKDEV_COUNT: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const BLKDEV_INFO: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const PCIDEV_COUNT: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const PCIDEV_INFO: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const USBDEV_COUNT: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const USBDEV_INFO: usize = 0;
 }

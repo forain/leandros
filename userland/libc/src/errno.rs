@@ -40,6 +40,7 @@ pub const EFAULT:  i32 = 14;
 pub const EBUSY:   i32 = 16;
 pub const EEXIST:  i32 = 17;
 pub const EXDEV:   i32 = 18;
+pub const ENODEV:  i32 = 19;
 pub const ENOTDIR: i32 = 20;
 pub const EISDIR:  i32 = 21;
 pub const EINVAL:  i32 = 22;
