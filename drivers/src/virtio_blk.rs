@@ -13,6 +13,7 @@ const VIRTIO_PCI_DEVICE_BLK_LEGACY: u16 = 0x1001;
 
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
 const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
 const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
 const VIRTIO_STATUS_DRIVER: u8 = 2;
@@ -198,6 +199,9 @@ struct VirtioBlkDevice {
     // Pre-allocated DMA pages reused per request (single-threaded polling).
     req_phys:  usize, // 4096-byte page: [VirtioBlkReqHdr (16B)] [status (1B)]
     data_phys: usize, // 4096-byte page: sector data
+    /// Device capacity in 512-byte sectors, from VIRTIO_PCI_CAP_DEVICE_CFG.
+    /// 0 if the device-config capability wasn't found (capacity unknown).
+    capacity_sectors: u64,
 }
 
 unsafe impl Send for VirtioBlkDevice {}
@@ -231,10 +235,11 @@ fn bar64(pci: &PciDevice, bar_idx: usize) -> u64 {
 /// COMMON_CFG and NOTIFY_CFG together with the notify_off_multiplier.
 unsafe fn walk_caps(
     pci: &PciDevice,
-) -> (Option<*mut VirtioPciCommonCfg>, Option<*mut u32>, u32) {
+) -> (Option<*mut VirtioPciCommonCfg>, Option<*mut u32>, u32, Option<*const u64>) {
     let mut common_cfg: Option<*mut VirtioPciCommonCfg> = None;
     let mut notify_cfg: Option<*mut u32> = None;
     let mut notify_off_multiplier = 0u32;
+    let mut device_cfg: Option<*const u64> = None;
 
     let mut cap_ptr = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x34);
     while cap_ptr != 0 {
@@ -265,6 +270,11 @@ unsafe fn walk_caps(
                                 pci_read_config_32(pci.bus, pci.dev, pci.func, cap_ptr + 16);
                             notify_cfg = Some(virt as *mut u32);
                         }
+                        VIRTIO_PCI_CAP_DEVICE_CFG => {
+                            // struct virtio_blk_config's first field is `capacity`
+                            // (u64, in 512-byte sectors) at offset 0.
+                            device_cfg = Some(virt as *const u64);
+                        }
                         _ => {}
                     }
                 }
@@ -273,7 +283,7 @@ unsafe fn walk_caps(
         cap_ptr = pci_read_config_8(pci.bus, pci.dev, pci.func, cap_ptr + 1);
     }
 
-    (common_cfg, notify_cfg, notify_off_multiplier)
+    (common_cfg, notify_cfg, notify_off_multiplier, device_cfg)
 }
 
 /// Write device_status=0 to reset `pci` without touching its virtqueues.
@@ -285,7 +295,7 @@ unsafe fn walk_caps(
 /// Resetting all devices first means blk_drain() sees no pending I/O.
 unsafe fn pre_reset_device(pci: &PciDevice) {
     enable_pci_mmio(pci);
-    let (common_cfg, _, _) = walk_caps(pci);
+    let (common_cfg, _, _, _) = walk_caps(pci);
     if let Some(cfg) = common_cfg {
         core::ptr::addr_of_mut!((*cfg).device_status).write_volatile(0u8);
     }
@@ -298,9 +308,10 @@ impl VirtioBlkDevice {
     /// pass and this function starts from ACKNOWLEDGE.
     unsafe fn new(pci: PciDevice, reset_done: bool) -> Option<Self> {
         enable_pci_mmio(&pci);
-        let (common_cfg, notify_cfg, notify_off_multiplier) = walk_caps(&pci);
+        let (common_cfg, notify_cfg, notify_off_multiplier, device_cfg) = walk_caps(&pci);
         let common_cfg = common_cfg?;
         let notify_cfg = notify_cfg?;
+        let capacity_sectors = device_cfg.map_or(0, |p| p.read_volatile());
 
         let ds = core::ptr::addr_of_mut!((*common_cfg).device_status);
 
@@ -359,6 +370,7 @@ impl VirtioBlkDevice {
             queue,
             req_phys,
             data_phys,
+            capacity_sectors,
         })
     }
 
@@ -500,4 +512,18 @@ pub fn has_f2fs(dev_idx: usize) -> bool {
     if F2FS_SB_OFFSET + 4 > BLOCK_SIZE { return false; }
     let magic = u32::from_le_bytes(buf[F2FS_SB_OFFSET..F2FS_SB_OFFSET + 4].try_into().unwrap());
     magic == F2FS_MAGIC
+}
+
+/// Metadata for `lsblk`. `total_blocks` comes from the VirtIO device-config
+/// capacity capability read at probe time.
+pub fn info(dev_idx: usize) -> Option<crate::BlkDevInfo> {
+    let devs = DEVICES.lock();
+    let dev = devs.get(dev_idx)?.as_ref()?;
+    let total_blocks = dev.capacity_sectors / SECTORS_PER_BLOCK;
+    drop(devs);
+    Some(crate::BlkDevInfo {
+        total_blocks,
+        block_size: BLOCK_SIZE as u32,
+        fstype: if has_f2fs(dev_idx) { Some("f2fs") } else { None },
+    })
 }

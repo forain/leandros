@@ -454,3 +454,17 @@ pub fn has_f2fs(dev_idx: usize) -> bool {
     let magic = u32::from_le_bytes(buf[F2FS_SB_OFFSET..F2FS_SB_OFFSET + 4].try_into().unwrap());
     magic == F2FS_MAGIC
 }
+
+/// Metadata for `lsblk`. Capacity is not currently tracked for SDHCI cards
+/// (would require parsing the CSD register via CMD9/SEND_CSD, unimplemented)
+/// so `total_blocks` is reported as 0 (unknown) rather than guessed.
+pub fn info(dev_idx: usize) -> Option<crate::BlkDevInfo> {
+    let devs = DEVICES.lock();
+    devs.get(dev_idx)?.as_ref()?;
+    drop(devs);
+    Some(crate::BlkDevInfo {
+        total_blocks: 0,
+        block_size: BLOCK_SIZE as u32,
+        fstype: if has_f2fs(dev_idx) { Some("f2fs") } else { None },
+    })
+}

@@ -1,0 +1,11 @@
+[package]
+name = "lsblk"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lsblk"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }
