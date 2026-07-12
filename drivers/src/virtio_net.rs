@@ -20,6 +20,15 @@ const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
 const VIRTQ_DESC_F_NEXT:  u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
+// If offered, must be negotiated and accounted for in the virtio_net_hdr size
+// (adds a trailing num_buffers: u16) — QEMU's virtio-net-pci uses the 12-byte
+// mergeable-header format on the wire whenever it offers this bit, regardless
+// of whether the driver "rejects" it, so a driver that assumes the basic
+// 10-byte header without checking this ends up with every TX/RX frame
+// misframed by exactly 2 bytes (found via packet capture: DHCP broadcasts
+// left the guest with a corrupted destination MAC/ethertype).
+const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
+
 const MAX_NET_DEVICES: usize = 4;
 
 #[repr(C, packed)]
@@ -171,6 +180,7 @@ struct VirtioNetHdr {
     gso_size: u16,
     csum_start: u16,
     csum_offset: u16,
+    num_buffers: u16, // only present on the wire when mrg_rxbuf is negotiated
 }
 
 struct VirtioNetDevice {
@@ -182,7 +192,8 @@ struct VirtioNetDevice {
     rx_queue: VirtQueue,
     tx_queue: VirtQueue,
     mac: [u8; 6],
-    
+    hdr_len: usize,
+
     rx_buffers_phys: [usize; 16],
     tx_req_phys: usize,
 }
@@ -281,9 +292,12 @@ impl VirtioNetDevice {
         ds.write_volatile(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
         core::ptr::addr_of_mut!((*common_cfg).device_feature_select).write_volatile(0u32);
-        let _ = core::ptr::addr_of!((*common_cfg).device_feature).read_volatile();
+        let dev_feat_lo = core::ptr::addr_of!((*common_cfg).device_feature).read_volatile();
+        let mrg_rxbuf = dev_feat_lo & VIRTIO_NET_F_MRG_RXBUF != 0;
         core::ptr::addr_of_mut!((*common_cfg).driver_feature_select).write_volatile(0u32);
-        core::ptr::addr_of_mut!((*common_cfg).driver_feature).write_volatile(0u32);
+        core::ptr::addr_of_mut!((*common_cfg).driver_feature).write_volatile(
+            if mrg_rxbuf { VIRTIO_NET_F_MRG_RXBUF } else { 0 }
+        );
 
         core::ptr::addr_of_mut!((*common_cfg).device_feature_select).write_volatile(1u32);
         let dev_feat_hi = core::ptr::addr_of!((*common_cfg).device_feature).read_volatile();
@@ -328,6 +342,7 @@ impl VirtioNetDevice {
             rx_queue,
             tx_queue,
             mac,
+            hdr_len: if mrg_rxbuf { 12 } else { 10 },
             rx_buffers_phys,
             tx_req_phys: mm::buddy::alloc(0)?,
         };
@@ -376,13 +391,13 @@ impl VirtioNetDevice {
 
             core::ptr::copy_nonoverlapping(
                 buf.as_ptr(),
-                req_virt.add(10),
+                req_virt.add(self.hdr_len),
                 buf.len(),
             );
 
             let d = {
                 let q = &mut self.tx_queue;
-                let d = q.alloc_desc(self.tx_req_phys as u64, (10 + buf.len()) as u32, 0);
+                let d = q.alloc_desc(self.tx_req_phys as u64, (self.hdr_len + buf.len()) as u32, 0);
                 q.submit(d);
                 d
             };
@@ -411,11 +426,11 @@ impl VirtioNetDevice {
             let len = elem.len as usize;
 
             let page_virt = mm::phys_to_virt(self.rx_buffers_phys[desc_id]) as *const u8;
-            if len > 10 {
-                let payload_len = len - 10;
+            if len > self.hdr_len {
+                let payload_len = len - self.hdr_len;
                 let copy_len = payload_len.min(packet_buf.len());
                 core::ptr::copy_nonoverlapping(
-                    page_virt.add(10),
+                    page_virt.add(self.hdr_len),
                     packet_buf.as_mut_ptr(),
                     copy_len,
                 );

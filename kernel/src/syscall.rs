@@ -2290,7 +2290,14 @@ fn read_input_byte() -> Option<u8> {
         if let Some(ev) = evdev_server::pop_event(0) {
             // EV_KEY
             if ev.type_ == 1 {
-                if ev.code == 42 || ev.code == 54 { // Left Shift or Right Shift
+                // value == 2 means this event carries a literal ASCII byte from serial
+                // input (see arch/x86_64/timer.rs's on_tick), not a real keyboard
+                // scancode — ASCII '6' and '*' are also 54/42, the evdev codes for
+                // Right/Left Shift, so without this guard those two characters get
+                // silently swallowed as shift-key state changes instead of reaching
+                // the console (found via ping's destination IP getting mangled:
+                // "192.168.105.1" -> "192.18.105.1").
+                if (ev.code == 42 || ev.code == 54) && ev.value != 2 { // Left Shift or Right Shift
                     unsafe { SHIFT_PRESSED = ev.value != 0; }
                     continue;
                 }

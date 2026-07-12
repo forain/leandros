@@ -173,7 +173,7 @@ def main():
     bins = [
         "shell", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest",
-        "mount", "umount", "fstab", "lsblk", "lspci", "lsusb",
+        "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)

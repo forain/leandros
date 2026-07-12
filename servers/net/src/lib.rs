@@ -9,7 +9,7 @@ pub mod nftables;
 use ipc::Message;
 use spin::Mutex;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
-use smoltcp::socket::{tcp, udp};
+use smoltcp::socket::{tcp, udp, icmp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 
@@ -44,6 +44,9 @@ pub const AF_UNIX:    usize = 1;
 pub const AF_INET:    usize = 2;
 pub const SOCK_STREAM: usize = 1;
 pub const SOCK_DGRAM:  usize = 2;
+pub const SOCK_RAW:    usize = 3;
+
+pub const IPPROTO_ICMP: usize = 1;
 
 pub const SOCK_FD_BASE: usize = 0x100;
 
@@ -199,6 +202,8 @@ enum SockState {
     InetBound { domain: u8, sock_type: u8, local_endpoint: IpEndpoint },
     InetListening { socket_handle: SocketHandle },
     InetConnected { socket_handle: SocketHandle, remote_endpoint: Option<IpEndpoint> },
+    IcmpUnbound,
+    IcmpBound { socket_handle: SocketHandle },
 }
 
 #[derive(Clone, Copy)]
@@ -462,6 +467,18 @@ pub fn net_daemon() -> ! {
                     s.interface.routes_mut().add_default_ipv4_route(gateway).unwrap();
                 }
             }
+
+            extern "C" { fn arch_serial_putc(b: u8); }
+            let msg = b"[NET] DHCP configured, address: ";
+            for &b in msg { unsafe { arch_serial_putc(b); } }
+            let octets = addr.address().0;
+            for (i, &o) in octets.iter().enumerate() {
+                if i > 0 { unsafe { arch_serial_putc(b'.'); } }
+                if o >= 100 { unsafe { arch_serial_putc(b'0' + o / 100); } }
+                if o >= 10  { unsafe { arch_serial_putc(b'0' + (o / 10) % 10); } }
+                unsafe { arch_serial_putc(b'0' + o % 10); }
+            }
+            for &b in b"\r\n" { unsafe { arch_serial_putc(b); } }
         }
 
         sched::yield_now("net_daemon");
@@ -530,7 +547,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
-fn handle_socket(pid: u32, domain: usize, sock_type: usize, _protocol: usize) -> Message {
+fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> Message {
     match domain {
         AF_UNIX | AF_INET => {}
         _                 => return err_reply(-97),
@@ -540,8 +557,13 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, _protocol: usize) ->
         Some(t) => t, None => return err_reply(-12),
     };
     let slot = match tbl.alloc() { Some(s) => s, None => return err_reply(-24) };
+    let state = if domain == AF_INET && protocol == IPPROTO_ICMP {
+        SockState::IcmpUnbound
+    } else {
+        SockState::Unbound { domain: domain as u8, sock_type: sock_type as u8 }
+    };
     tbl.socks[slot] = SockEntry {
-        state:      SockState::Unbound { domain: domain as u8, sock_type: sock_type as u8 },
+        state,
         in_use:     true,
         bound_port: 0,
         domain:     domain as u8,
@@ -976,6 +998,62 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                 err_reply(-100)
             }
         }
+        SockState::IcmpUnbound => {
+            if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); }
+            if len < 8 { return err_reply(-22); }
+            let sin_addr = unsafe { ((addr_ptr + 4) as *const u32).read_unaligned() };
+            let dest_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+            // Bind smoltcp's filter to whatever ident the caller already put in its
+            // own ICMP header (bytes 4..6), rather than picking one ourselves and
+            // having no way to tell the caller — see plan for why.
+            let ident = u16::from_be_bytes(unsafe {
+                [*(buf_ptr as *const u8).add(4), *(buf_ptr as *const u8).add(5)]
+            });
+            let mut data = alloc::vec![0u8; len];
+            unsafe { core::ptr::copy_nonoverlapping(buf_ptr as *const u8, data.as_mut_ptr(), len); }
+            drop(tbls);
+
+            let mut stack = NET_STACK.lock();
+            if stack.is_none() { return err_reply(-100); }
+            let s = stack.as_mut().unwrap();
+
+            let rx_buffer = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 4], alloc::vec![0; 2048]);
+            let tx_buffer = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 4], alloc::vec![0; 2048]);
+            let mut socket = icmp::Socket::new(rx_buffer, tx_buffer);
+            if socket.bind(icmp::Endpoint::Ident(ident)).is_err() { return err_reply(-22); }
+            let socket_handle = s.socket_set.add(socket);
+            let result = s.socket_set.get_mut::<icmp::Socket>(socket_handle).send_slice(&data, dest_ip);
+            drop(stack);
+
+            let mut tbls2 = SOCK_TABLES.lock();
+            if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
+                tbl2.socks[slot].state = SockState::IcmpBound { socket_handle };
+            }
+
+            match result {
+                Ok(()) => val_reply(len as u64),
+                Err(icmp::SendError::BufferFull)    => err_reply(-11),
+                Err(icmp::SendError::Unaddressable) => err_reply(-89),
+            }
+        }
+        SockState::IcmpBound { socket_handle } => {
+            if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); }
+            let sin_addr = unsafe { ((addr_ptr + 4) as *const u32).read_unaligned() };
+            let dest_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+            let mut data = alloc::vec![0u8; len];
+            unsafe { core::ptr::copy_nonoverlapping(buf_ptr as *const u8, data.as_mut_ptr(), len); }
+            drop(tbls);
+
+            let mut stack = NET_STACK.lock();
+            if stack.is_none() { return err_reply(-100); }
+            let s = stack.as_mut().unwrap();
+            let socket = s.socket_set.get_mut::<icmp::Socket>(socket_handle);
+            match socket.send_slice(&data, dest_ip) {
+                Ok(()) => val_reply(len as u64),
+                Err(icmp::SendError::BufferFull)    => err_reply(-11),
+                Err(icmp::SendError::Unaddressable) => err_reply(-89),
+            }
+        }
         _ => err_reply(-32),
     }
 }
@@ -1066,6 +1144,34 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                 }
             } else {
                 err_reply(-100)
+            }
+        }
+        SockState::IcmpBound { socket_handle } => {
+            let mut stack = NET_STACK.lock();
+            if stack.is_none() { return err_reply(-100); }
+            let s = stack.as_mut().unwrap();
+            let socket = s.socket_set.get_mut::<icmp::Socket>(socket_handle);
+            if !socket.can_recv() { return err_reply(-11); }
+            match socket.recv() {
+                Ok((payload, from_addr)) => {
+                    let n = len.min(payload.len());
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(payload.as_ptr(), buf_ptr as *mut u8, n);
+                    }
+                    if addr_ptr != 0 && addrlen_ptr != 0 {
+                        unsafe {
+                            core::ptr::write_bytes(addr_ptr as *mut u8, 0, 16);
+                            core::ptr::write(addr_ptr as *mut u16, AF_INET as u16);
+                            core::ptr::write((addr_ptr + 2) as *mut u16, 0u16); // ICMP has no port
+                            if let IpAddress::Ipv4(ipv4) = from_addr {
+                                core::ptr::write((addr_ptr + 4) as *mut u32, u32::from_ne_bytes(ipv4.0));
+                            }
+                            *(addrlen_ptr as *mut u32) = 16;
+                        }
+                    }
+                    val_reply(n as u64)
+                }
+                Err(_) => err_reply(-11),
             }
         }
         _ => err_reply(-9),
@@ -1187,6 +1293,14 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
                 s.socket_set.remove(socket_handle);
             }
         }
+        SockState::IcmpBound { socket_handle } => {
+            tbl.socks[slot] = SockEntry::empty();
+            drop(tbls);
+            let mut stack = NET_STACK.lock();
+            if let Some(ref mut s) = *stack {
+                s.socket_set.remove(socket_handle);
+            }
+        }
         _ => { tbl.socks[slot] = SockEntry::empty(); }
     }
     ok_reply()
@@ -1258,6 +1372,19 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
                 0
             }
         }
+        SockState::IcmpBound { socket_handle } => {
+            drop(tbls);
+            let mut stack = NET_STACK.lock();
+            if let Some(ref mut s) = *stack {
+                let socket = s.socket_set.get_mut::<icmp::Socket>(socket_handle);
+                let mut ev = 0;
+                if socket.can_recv() { ev |= POLLIN; }
+                ev |= POLLOUT;
+                ev
+            } else {
+                0
+            }
+        }
         _ => { drop(tbls); 0 }
     };
     val_reply(revents)
@@ -1274,7 +1401,9 @@ fn handle_close_all(pid: u32) {
                 SockState::UnixConnected { conn_idx, .. } => {
                     unix_to_close[i] = conn_idx;
                 }
-                SockState::InetConnected { socket_handle, .. } | SockState::InetListening { socket_handle } => {
+                SockState::InetConnected { socket_handle, .. }
+                | SockState::InetListening { socket_handle }
+                | SockState::IcmpBound { socket_handle } => {
                     inet_to_close[i] = Some(socket_handle);
                 }
                 _ => {}

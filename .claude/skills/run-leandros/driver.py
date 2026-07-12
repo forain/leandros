@@ -57,6 +57,22 @@ def _find_fw(paths):
     return None
 
 
+SOCKET_VMNET_PREFIXES = ["/opt/homebrew", "/usr/local"]
+
+
+def _socket_vmnet_prefix():
+    """Find socket_vmnet_client + its daemon socket (see run-qemu.sh's matching
+    comment for why the uefi path's -netdev socket,...,fd=3 needs this wrapper:
+    vmnet.framework networking requires root, and socket_vmnet is the properly
+    signed/notarized helper that holds that privilege so QEMU doesn't have to).
+    Daemon must already be running (`sudo brew services start socket_vmnet`)."""
+    for prefix in SOCKET_VMNET_PREFIXES:
+        client = os.path.join(prefix, "opt/socket_vmnet/bin/socket_vmnet_client")
+        if os.path.exists(client):
+            return client, os.path.join(prefix, "var/run/socket_vmnet")
+    sys.exit("ERROR: socket_vmnet_client not found (brew install socket_vmnet)")
+
+
 def _cleanup_socks():
     for p in [SERIAL_SOCK, MONITOR_SOCK]:
         try:
@@ -93,6 +109,8 @@ def _build_cmd(arch, mode="uefi"):
             "-device", "virtio-gpu-pci",
             "-audiodev", "none,id=snd0",
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
+            "-device", "virtio-net-pci,netdev=net0,disable-legacy=on",
+            "-netdev", "socket,id=net0,fd=3",
             "-no-reboot", "-parallel", "none",
             "-display", "none",
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
@@ -120,6 +138,8 @@ def _build_cmd(arch, mode="uefi"):
             "-vga", "none", "-device", "virtio-vga",
             "-audiodev", "none,id=snd0",
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
+            "-device", "virtio-net-pci,netdev=net0",
+            "-netdev", "socket,id=net0,fd=3",
             "-no-reboot", "-parallel", "none",
             "-display", "none",
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
@@ -292,6 +312,9 @@ def cmd_start(arch="aarch64", mode="uefi"):
     open(SERIAL_LOG, "wb").close()
 
     qemu_cmd = _build_cmd(arch, mode)
+    if mode == "uefi":
+        client, sock = _socket_vmnet_prefix()
+        qemu_cmd = [client, sock] + qemu_cmd
     proc = subprocess.Popen(
         qemu_cmd,
         stdout=subprocess.DEVNULL,
@@ -392,10 +415,10 @@ def _serial_send(command, timeout=8):
     return "\n".join(out)
 
 
-def cmd_cmd(command):
+def cmd_cmd(command, timeout=8):
     if _qemu_pid() is None:
         sys.exit("ERROR: QEMU not running. Run 'start' first.")
-    result = _serial_send(command)
+    result = _serial_send(command, timeout=timeout)
     print(result)
 
 
@@ -510,8 +533,9 @@ if __name__ == "__main__":
         cmd_start(arch, mode)
     elif sub == "cmd":
         if len(args) < 2:
-            sys.exit("Usage: driver.py cmd <shell-command>")
-        cmd_cmd(args[1])
+            sys.exit("Usage: driver.py cmd <shell-command> [timeout_seconds]")
+        timeout = int(args[2]) if len(args) > 2 else 8
+        cmd_cmd(args[1], timeout=timeout)
     elif sub == "screenshot":
         cmd_screenshot(args[1] if len(args) > 1 else None)
     elif sub == "stop":

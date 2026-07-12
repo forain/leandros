@@ -97,6 +97,9 @@ done
 
 echo "🚀 Starting LeandrOS ($ARCH) in $BOOT_MODE mode"
 echo "=========================================="
+if [ "$BOOT_MODE" = "uefi" ]; then
+    echo "🌐 Network: vmnet (via socket_vmnet), guest gets 192.168.105.2 via DHCP, host gateway 192.168.105.1"
+fi
 
 if [ "$BOOT_MODE" = "raspi4b" ]; then
     KERNEL_ELF="target/final-aarch64/kernel-direct"
@@ -164,7 +167,8 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -device "$GPU_DEV" \
             -device virtio-keyboard-pci \
             "${GL_ARGS[@]}" \
-            -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
+            -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
+            -device virtio-net-pci,netdev=net0,disable-legacy=on -netdev socket,id=net0,fd=3 -no-reboot)
     else
         QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 2G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
@@ -176,10 +180,20 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -device virtio-blk-pci,drive=data1 \
             -vga none -device "$GPU_DEV" \
             "${GL_ARGS[@]}" \
-            -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS -no-reboot)
+            -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
+            -device virtio-net-pci,netdev=net0 -netdev socket,id=net0,fd=3 -no-reboot)
 
     fi
-    exec $QEMU_SYSTEM "${QEMU_ARGS[@]}" "${QEMU_EXTRA_ARGS[@]}"
+    # -netdev socket,...,fd=3 above needs an already-connected fd 3, which only
+    # exists when launched through socket_vmnet's client wrapper (vmnet.framework
+    # networking requires root, and socket_vmnet is the properly signed/notarized
+    # helper daemon that holds that privilege so QEMU itself doesn't have to —
+    # see README at github.com/lima-vm/socket_vmnet). Start the daemon once via
+    # `sudo brew services start socket_vmnet` before running this.
+    HOMEBREW_PREFIX=$(brew --prefix 2>/dev/null || echo /opt/homebrew)
+    exec "$HOMEBREW_PREFIX/opt/socket_vmnet/bin/socket_vmnet_client" \
+        "$HOMEBREW_PREFIX/var/run/socket_vmnet" \
+        $QEMU_SYSTEM "${QEMU_ARGS[@]}" "${QEMU_EXTRA_ARGS[@]}"
 else
     # Select audio backend for direct boot as well
     if [[ "$OS" == "Darwin" ]]; then

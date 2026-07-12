@@ -8,4 +8,4 @@ ipc   = { path = "../../ipc" }
 sched = { path = "../../sched" }
 spin.workspace = true
 drivers = { path = "../../drivers" }
-smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-dhcpv4", "socket-raw"] }
+smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-dhcpv4", "socket-raw", "socket-icmp"] }

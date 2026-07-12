@@ -1,0 +1,15 @@
+[package]
+name = "ping"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ping"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc! Raw ICMP sockets (SOCK_RAW/IPPROTO_ICMP) only exist through
+# real relibc's socket syscall wrappers — the minimal leandros-libc used by
+# most userland tools has no socket support at all. Linked the same way
+# pthreadtest/timertest/sigtest/polltest/racetest are (see build-userland.sh's
+# RELIBC_LINKED array).
