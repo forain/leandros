@@ -86,7 +86,20 @@ pub fn init(boot_info: &boot::BootInfo) {
         paging::map_4k(root_phys as *mut u64, gicc_virt, gicc_phys, device_flags);
         if boot_info.framebuffer_base != 0 {
             let fb_start_phys = boot_info.framebuffer_base as usize & !4095;
-            let fb_size = boot_info.framebuffer_pitch as usize * boot_info.framebuffer_height as usize;
+            // Mirror kernel_main's pitch fallback (main.rs's `pitch_bytes` calc):
+            // some firmware DTBs omit or zero the `stride` property, in which case
+            // the console falls back to width*4 bytes/row when it *draws*. If this
+            // mapping used the raw (possibly zero) DTB pitch instead, it would map
+            // far fewer pages than the console later writes into, and the very
+            // first fb_putc/clear would walk off the mapped region into an
+            // unhandled data abort — silently hanging with a black screen and no
+            // console output at all.
+            let effective_pitch = if (boot_info.framebuffer_pitch as usize) < boot_info.framebuffer_width as usize * 4 {
+                boot_info.framebuffer_width as usize * 4
+            } else {
+                boot_info.framebuffer_pitch as usize
+            };
+            let fb_size = effective_pitch * boot_info.framebuffer_height as usize;
             let fb_end_phys = (boot_info.framebuffer_base as usize + fb_size + 4095) & !4095;
             let num_pages = (fb_end_phys - fb_start_phys) / 4096;
             let fb_flags = paging::PageDescFlags::VALID | paging::PageDescFlags::AF | paging::PageDescFlags::INNER_SHR | paging::PageDescFlags::ATTR_NOCACHE;
