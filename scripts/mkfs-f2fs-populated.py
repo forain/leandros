@@ -179,10 +179,10 @@ def main():
         if os.path.exists(p):
             bin_files.append((b, p, 0o100755))
             
-    p = f"doomgeneric/doom-{arch}"
+    p = f"../doomgeneric/doom-{arch}"
     if os.path.exists(p):
         bin_files.append(("doom", p, 0o100755))
-    p = "doomgeneric/doom1.wad"
+    p = "../doomgeneric/doom1.wad"
     if os.path.exists(p):
         bin_files.append(("doom1.wad", p, 0o100644))
         
@@ -198,7 +198,7 @@ def main():
         
     lib_files = []
     relibc_target = "aarch64-unknown-leandros" if arch == "aarch64" else "x86_64-unknown-leandros"
-    p = f"userland/relibc/target/{relibc_target}/release/librelibc.a"
+    p = f"../relibc/target/{relibc_target}/release/librelibc.a"
     if os.path.exists(p):
         lib_files.append(("libc.a", p, 0o100644))
         

@@ -6,7 +6,7 @@ fn main() {
         _ => return,
     };
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    println!("cargo:rustc-link-search=native={}/../relibc/target/{}/release", manifest_dir, relibc_target);
+    println!("cargo:rustc-link-search=native={}/../../../relibc/target/{}/release", manifest_dir, relibc_target);
     println!("cargo:rustc-link-lib=static=relibc");
     println!("cargo:rustc-link-arg=-z");
     println!("cargo:rustc-link-arg=muldefs");

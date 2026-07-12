@@ -202,10 +202,15 @@ create_disk_image() {
 build_doom() {
     local arch="$1"
     echo "🎮 Building $arch doomgeneric..."
+    local doom_dir="$ROOT_DIR/../doomgeneric"
+    if [[ ! -d "$doom_dir" ]]; then
+        echo "⚠️  doomgeneric source not found at $doom_dir, skipping"
+        return 0
+    fi
     (
-        cd doomgeneric || exit 1
-        make -f Makefile.leandros ARCH="$arch" clean
-        make -f Makefile.leandros ARCH="$arch"
+        cd "$doom_dir" || exit 1
+        make -f Makefile.leandros ARCH="$arch" LEANDROS_ROOT="$ROOT_DIR" clean
+        make -f Makefile.leandros ARCH="$arch" LEANDROS_ROOT="$ROOT_DIR"
     )
 }
 
@@ -255,8 +260,13 @@ build_relibc() {
     local arch="$1"
     echo "📚 Building $arch relibc..."
     local target_spec="$ROOT_DIR/targets/$arch-unknown-leandros.json"
+    local relibc_dir="$ROOT_DIR/../relibc"
+    if [[ ! -d "$relibc_dir" ]]; then
+        echo "⚠️  relibc source not found at $relibc_dir, skipping"
+        return 0
+    fi
     (
-        cd userland/relibc || exit 1
+        cd "$relibc_dir" || exit 1
         # Build relibc using cargo
         cargo build --target "$target_spec" --release -Z build-std=core,alloc,compiler_builtins
         

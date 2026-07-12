@@ -372,7 +372,7 @@ The evdev server (`servers/evdev`) exposes keyboard and pointer hardware using t
 
 ### relibc
 
-LeandrOS ships **relibc** (`userland/relibc`) — a full-featured C standard library originally developed for Redox OS — as its primary C runtime for userspace:
+LeandrOS ships **relibc** (external sibling checkout at `../relibc`, built by `scripts/build-all.sh`) — a full-featured C standard library originally developed for Redox OS — as its primary C runtime for userspace:
 
 - Complete POSIX libc implementation in Rust, compiled to a `staticlib`.
 - Covers `stdio`, `stdlib`, `string`, `math`, `pthread`, `signal`, `time`, `unistd`, `sys/mman`, `dlfcn`, and many more headers.
