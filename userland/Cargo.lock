@@ -101,6 +101,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lsusb"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
+]
+
+[[package]]
 name = "memtest"
 version = "0.1.0"
 dependencies = [

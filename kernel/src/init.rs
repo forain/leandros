@@ -67,6 +67,9 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::blkdev::init();
 
+    // ── USB ───────────────────────────────────────────────────────────────────
+    drivers::usb_hcd::init();
+
     // ── Network Stack ────────────────────────────────────────────────────────
     drivers::virtio_net::init();
     net_server::init();

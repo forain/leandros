@@ -15,6 +15,19 @@ use crate::hcd::HostControllerDriver;
 /// Maximum USB device address (§11.23.1).
 pub const USB_MAX_ADDRESS: u8 = 127;
 
+/// Back-to-back PORTSC reads/RW1C-writes with no gap between them were
+/// observed (via QEMU's `qemu-xhci` model) to corrupt unrelated kernel
+/// memory or hang the guest — each operation alone is safe, but the
+/// sequence isn't, unless given a moment to settle. No real per-port
+/// debounce timing is implemented here either (a real hub driver would
+/// wait ~100ms after connect before reset); this is a minimal spin delay,
+/// not a hardware-accurate wait.
+fn settle() {
+    for _ in 0..100_000 {
+        core::hint::spin_loop();
+    }
+}
+
 /// Per-port state tracked by the hub driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortState {
@@ -72,13 +85,16 @@ impl HubDriver {
         port: u8,
     ) -> Option<UsbDevice> {
         let (status, change) = hcd.get_port_status(port)?;
+        settle();
 
         // Acknowledge change bits.
         if change & PORT_CHANGE_CONNECTION != 0 {
             hcd.clear_port_feature(port, HUB_PORT_FEAT_C_CONNECTION);
+            settle();
         }
         if change & PORT_CHANGE_RESET != 0 {
             hcd.clear_port_feature(port, HUB_PORT_FEAT_C_RESET);
+            settle();
         }
 
         if status & PORT_STATUS_CONNECTION == 0 {
@@ -105,6 +121,7 @@ impl HubDriver {
 
         // 2. Issue port reset (≥10 ms).
         hcd.port_reset(port);
+        settle();
 
         // 3. Create device at address 0, read first 8 bytes of DeviceDescriptor.
         let mut dev = UsbDevice::new(0, speed);

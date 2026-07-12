@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["libc", "hello", "shell", "init", "aplay", "memtest", "vfstest", "f2fstest", "tput", "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest", "mount", "umount", "fstab", "lsblk", "lspci"]
+members = ["libc", "hello", "shell", "init", "aplay", "memtest", "vfstest", "f2fstest", "tput", "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest", "mount", "umount", "fstab", "lsblk", "lspci", "lsusb"]
 
 [workspace.package]
 version = "0.1.0"

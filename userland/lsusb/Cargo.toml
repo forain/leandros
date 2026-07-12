@@ -1,0 +1,11 @@
+[package]
+name = "lsusb"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lsusb"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

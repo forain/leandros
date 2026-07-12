@@ -4,7 +4,7 @@
 //! The Cycle State Bit (CSB) distinguishes HC-owned from driver-owned TRBs.
 //! A LINK TRB at the end of each segment chains segments together.
 
-use super::TRBS_PER_SEGMENT;
+use super::{TRBS_PER_SEGMENT, TRB_SEGMENT_SIZE};
 
 // ── TRB type codes (xHCI spec Table 6-91) ─────────────────────────────────────
 
@@ -170,10 +170,20 @@ pub enum RingType { Transfer, Command, Event }
 ///
 /// In the real driver (xhci-ring.c) rings can be multi-segment; here we use
 /// a single statically-allocated segment for simplicity.
+///
+/// The TRB array lives in a `buddy`-allocated page, not as plain struct
+/// storage: the xHC's DMA engine reads/writes TRBs directly, so it needs a
+/// real physical address (written into DCBAAP/CRCR/ERSTBA/ERDP/LINK-TRB
+/// fields) — a kernel virtual address (what `&self.trbs` would have given
+/// under the HHDM) would make the controller fault or hang on real
+/// hardware. The CPU side accesses the same page through its HHDM alias
+/// (`mm::phys_to_virt`) with volatile reads/writes, since the hardware can
+/// modify this memory concurrently (event ring cycle-bit polling).
 pub struct Ring {
     pub kind: RingType,
-    /// Ring buffer. Last TRB is always a LINK TRB.
-    trbs: [Trb; TRBS_PER_SEGMENT],
+    /// Physical base address of the one-page (4096 B = TRBS_PER_SEGMENT * 16)
+    /// TRB array backing this ring.
+    phys: usize,
     /// Index of the next TRB to produce (enqueue pointer).
     enq: usize,
     /// Index of the next TRB to consume (dequeue pointer, event rings only).
@@ -186,46 +196,54 @@ pub struct Ring {
 
 impl Ring {
     pub fn new(kind: RingType) -> Self {
-        let mut r = Self {
-            kind,
-            trbs: [Trb::default(); TRBS_PER_SEGMENT],
-            enq: 0, deq: 0,
-            pcs: true, ccs: true,
-        };
+        let phys = mm::buddy::alloc(0).expect("xhci: out of memory allocating ring");
+        unsafe {
+            core::ptr::write_bytes(mm::phys_to_virt(phys) as *mut u8, 0, TRB_SEGMENT_SIZE);
+        }
+        let r = Self { kind, phys, enq: 0, deq: 0, pcs: true, ccs: true };
         // Install LINK TRB at the last slot pointing back to slot 0.
-        // Physical address is a placeholder (real impl uses real phys addr).
-        let phys = core::ptr::addr_of!(r.trbs[0]) as u64;
-        r.trbs[TRBS_PER_SEGMENT - 1] = Trb::link(phys, true, true);
+        let link = Trb::link(r.phys as u64, true, true);
+        unsafe { r.trb_ptr(TRBS_PER_SEGMENT - 1).write_volatile(link); }
         r
+    }
+
+    /// Virtual pointer to TRB slot `idx` through the HHDM alias of this
+    /// ring's physical page.
+    fn trb_ptr(&self, idx: usize) -> *mut Trb {
+        (mm::phys_to_virt(self.phys) as *mut Trb).wrapping_add(idx)
     }
 
     /// Physical base address of TRB[0].
     pub fn phys_base(&self) -> u64 {
-        core::ptr::addr_of!(self.trbs[0]) as u64
+        self.phys as u64
     }
 
     /// Physical address of the current enqueue pointer.
     pub fn enq_phys(&self) -> u64 {
-        core::ptr::addr_of!(self.trbs[self.enq]) as u64
+        self.phys as u64 + (self.enq * core::mem::size_of::<Trb>()) as u64
     }
 
     /// Physical address of the current dequeue pointer (used to update ERDP).
     pub fn deq_phys(&self) -> u64 {
-        core::ptr::addr_of!(self.trbs[self.deq]) as u64
+        self.phys as u64 + (self.deq * core::mem::size_of::<Trb>()) as u64
     }
 
     /// Enqueue a TRB, advancing the enqueue pointer and toggling PCS at LINK.
     pub fn enqueue(&mut self, mut trb: Trb) {
         // Set cycle bit to current PCS.
         trb.control = (trb.control & !TRB_CYCLE) | (self.pcs as u32);
-        self.trbs[self.enq] = trb;
+        unsafe { self.trb_ptr(self.enq).write_volatile(trb); }
 
         self.enq += 1;
         // Skip the LINK TRB slot; if we hit it, toggle PCS and wrap.
         if self.enq == TRBS_PER_SEGMENT - 1 {
             // Update LINK TRB cycle bit.
-            let link = &mut self.trbs[TRBS_PER_SEGMENT - 1];
-            link.control = (link.control & !TRB_CYCLE) | (self.pcs as u32);
+            unsafe {
+                let link_ptr = self.trb_ptr(TRBS_PER_SEGMENT - 1);
+                let mut link = link_ptr.read_volatile();
+                link.control = (link.control & !TRB_CYCLE) | (self.pcs as u32);
+                link_ptr.write_volatile(link);
+            }
             self.pcs = !self.pcs;
             self.enq = 0;
         }
@@ -238,7 +256,7 @@ impl Ring {
     /// no new events are available.
     pub fn dequeue_event(&mut self) -> Option<Trb> {
         loop {
-            let trb = self.trbs[self.deq];
+            let trb = unsafe { self.trb_ptr(self.deq).read_volatile() };
             if trb.cycle_bit() != self.ccs { return None; }
 
             // Advance the dequeue pointer, wrapping at the LINK TRB slot.

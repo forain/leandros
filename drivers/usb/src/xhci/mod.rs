@@ -67,6 +67,10 @@ pub struct Xhci {
     /// Points to an array of 64-bit pointers to each slot's output device context.
     dcbaa_phys: u64,
 
+    /// Event Ring Segment Table (ERST) physical address — NOT the event
+    /// ring's own TRB array (see the field's constructor comment).
+    erst_phys: u64,
+
     /// Cycle State Bit for the command ring (alternates each pass).
     cmd_ccs: bool,
 }
@@ -83,7 +87,10 @@ impl Xhci {
         // all unused slot pointers read as 0.
         let dcbaa_phys: u64 = match buddy::alloc(0) {
             Some(pa) => {
-                (pa as *mut u8).write_bytes(0, buddy::PAGE_SIZE);
+                // `pa` is a physical address; the CPU must write through its
+                // HHDM virtual alias, not `pa` itself (see ring.rs doc comment
+                // on why this driver can't assume identity mapping).
+                (mm::phys_to_virt(pa) as *mut u8).write_bytes(0, buddy::PAGE_SIZE);
                 pa as u64
             }
             // If the allocator is not yet initialised (very early probe), leave
@@ -92,15 +99,53 @@ impl Xhci {
             None => 0,
         };
 
+        let event_ring = Ring::new(RingType::Event);
+
+        // ERSTBA must point at an Event Ring Segment Table — an array of
+        // {segment base addr: u64, segment size: u16, reserved: 6 bytes}
+        // entries — NOT at the event ring's own TRB array. Writing the
+        // ring's address directly into ERSTBA (the original bug here) means
+        // the HC reads the ring's first (zeroed) TRB as a segment table
+        // entry: base=0, size=0. Once running, any event the HC tries to
+        // post computes an address from that bogus entry and DMA-writes
+        // into arbitrary guest physical memory — this silently corrupted
+        // unrelated kernel state (traced via bisection to a delayed
+        // divide-by-zero panic in mm/src/slab.rs, present only once CMD_RUN
+        // was set — reset()/init_rings() alone, before this fix, were safe
+        // precisely because the HC hadn't started using ERSTBA yet).
+        let erst_phys: u64 = match buddy::alloc(0) {
+            Some(pa) => {
+                let virt = mm::phys_to_virt(pa) as *mut u8;
+                virt.write_bytes(0, buddy::PAGE_SIZE);
+                (virt as *mut u64).write_volatile(event_ring.phys_base());
+                (virt.add(8) as *mut u16).write_volatile(TRBS_PER_SEGMENT as u16);
+                pa as u64
+            }
+            None => 0,
+        };
+
         Self {
             mmio_base,
             regs: XhciRegs::new(mmio_base),
             state: HcdState::Halt,
             cmd_ring:   Ring::new(RingType::Command),
-            event_ring: Ring::new(RingType::Event),
+            event_ring,
             slots: core::array::from_fn(|_| None),
             dcbaa_phys,
+            erst_phys,
             cmd_ccs: true,
+        }
+    }
+
+    /// Maximum number of root-hub ports, from HCSPARAMS1 bits [31:24].
+    /// Used by the caller to drive `HubDriver::power_on_ports`/
+    /// `handle_port_change` over the right port range (see drivers/src/usb_hcd.rs).
+    pub fn max_ports(&self) -> u8 {
+        unsafe {
+            let hcsparams1 = (self.mmio_base as *const u32)
+                .add(regs::CAP_HCSPARAMS1 / 4)
+                .read_volatile();
+            ((hcsparams1 & regs::HCSPARAMS1_MAX_PORTS_MASK) >> 24) as u8
         }
     }
 
@@ -133,10 +178,13 @@ impl Xhci {
         let crcr = self.cmd_ring.phys_base() | CMD_RING_CYCLE as u64;
         self.regs.op_write64(OP_CRCR, crcr);
 
-        // Set up event ring segment table for interrupter 0.
+        // Set up event ring segment table for interrupter 0. ERSTBA points at
+        // the ERST (see `erst_phys`'s constructor comment) — ERDP points at
+        // the ring itself, since it's a direct TRB dequeue pointer, not a
+        // segment-table reference.
         let ir = &mut self.regs;
         ir.ir_write32(0, IR_ERSTSZ, 1); // 1-entry ERST
-        ir.ir_write64(0, IR_ERSTBA, self.event_ring.phys_base());
+        ir.ir_write64(0, IR_ERSTBA, self.erst_phys);
         ir.ir_write64(0, IR_ERDP, self.event_ring.phys_base());
     }
 
@@ -245,9 +293,17 @@ impl HostControllerDriver for Xhci {
             self.init_rings();
 
             use regs::*;
-            // Enable interrupts + run.
+            // Run only — no interrupt enable. This driver is entirely
+            // polling-based (every wait_transfer_event/enable_slot/etc. spins
+            // on dequeue_event()); nothing registers an IRQ handler for this
+            // device's line/MSI-X vector. Setting CMD_EIE caused the HC to
+            // raise an interrupt this kernel has no handler for, which
+            // corrupted unrelated kernel memory (traced via bisection: a
+            // divide-by-zero panic in mm/src/slab.rs appearing shortly after
+            // boot, present only when CMD_EIE was set — reset()/init_rings()
+            // alone are safe).
             let cmd = self.regs.op_read32(OP_USBCMD);
-            self.regs.op_write32(OP_USBCMD, cmd | CMD_RUN | CMD_EIE);
+            self.regs.op_write32(OP_USBCMD, cmd | CMD_RUN);
             self.state = HcdState::Running;
         }
         Ok(())
@@ -349,14 +405,14 @@ impl HostControllerDriver for Xhci {
         let slot = dev.devnum as usize;
         if slot == 0 || slot >= XHCI_MAX_SLOTS { return None; }
 
-        // Allocate a 4 KiB DMA page for the descriptor buffer.  buddy::alloc
-        // returns a physical address, which equals the virtual address in the
-        // kernel's identity-mapped region.  Using a dedicated DMA page avoids
-        // the stack-buffer-as-DMA-target anti-pattern: once the MMU is enabled
-        // with non-identity page tables, stack VA ≠ PA and the HC would DMA
-        // into the wrong memory.
+        // Allocate a 4 KiB DMA page for the descriptor buffer. `dma_phys` is
+        // what goes into the TRB (hardware needs a real physical address);
+        // the CPU reads/writes it through its HHDM virtual alias
+        // (`mm::phys_to_virt`) below. Using a dedicated DMA page avoids the
+        // stack-buffer-as-DMA-target anti-pattern: the HC would otherwise DMA
+        // into whatever a stack virtual address happens to translate to.
         let dma_phys = buddy::alloc(0)?;
-        unsafe { (dma_phys as *mut u8).write_bytes(0, 18); }
+        unsafe { (mm::phys_to_virt(dma_phys) as *mut u8).write_bytes(0, 18); }
 
         let ring = match self.slots[slot]
             .as_mut()
@@ -387,7 +443,7 @@ impl HostControllerDriver for Xhci {
 
         // Read the descriptor out of the DMA page before freeing it.
         let result = if ok {
-            let buf = unsafe { core::slice::from_raw_parts(dma_phys as *const u8, 18) };
+            let buf = unsafe { core::slice::from_raw_parts(mm::phys_to_virt(dma_phys) as *const u8, 18) };
             if buf[0] >= 18 && buf[1] == crate::descriptor::DT_DEVICE {
                 Some(DeviceDescriptor {
                     b_length:             buf[0],
@@ -429,10 +485,10 @@ impl HostControllerDriver for Xhci {
         let slot = dev.devnum as usize;
         if slot == 0 || slot >= XHCI_MAX_SLOTS { return None; }
 
-        // Allocate a 4 KiB DMA page for the descriptor buffer (physical ==
-        // virtual in the kernel identity map; avoids stack-VA-as-DMA anti-pattern).
+        // Allocate a 4 KiB DMA page for the descriptor buffer; see the
+        // `mm::phys_to_virt` note in `get_device_descriptor` above.
         let dma_phys = buddy::alloc(0)?;
-        unsafe { (dma_phys as *mut u8).write_bytes(0, 9); }
+        unsafe { (mm::phys_to_virt(dma_phys) as *mut u8).write_bytes(0, 9); }
 
         let ring = match self.slots[slot]
             .as_mut()
@@ -458,7 +514,7 @@ impl HostControllerDriver for Xhci {
         let ok = unsafe { self.wait_transfer_event().is_ok() };
 
         let result = if ok {
-            let buf = unsafe { core::slice::from_raw_parts(dma_phys as *const u8, 9) };
+            let buf = unsafe { core::slice::from_raw_parts(mm::phys_to_virt(dma_phys) as *const u8, 9) };
             if buf[0] >= 9 && buf[1] == crate::descriptor::DT_CONFIG {
                 Some(ConfigDescriptor {
                     b_length:              buf[0],
@@ -511,37 +567,44 @@ impl HostControllerDriver for Xhci {
                 .transfer_rings[1].as_ref().unwrap()
                 .phys_base();
 
-            let mut ic = context::InputContext::default();
+            // The HC reads the InputContext via DMA, so it needs a page with a
+            // real physical address — a stack local's address would be a
+            // kernel virtual address the HC cannot dereference (see ring.rs
+            // doc comment). Allocate one, write through its HHDM alias, pass
+            // the physical address to the command TRB, and free it once the
+            // HC has confirmed (CmdCompletion) that it finished reading it.
+            let ic_page_phys = buddy::alloc(0).expect("xhci: oom allocating input context");
+            let ic_ptr = mm::phys_to_virt(ic_page_phys) as *mut context::InputContext;
+            core::ptr::write(ic_ptr, context::InputContext::default());
+
             // add_flags: bit 0 = slot context, bit 1 = EP0 (context index 1).
-            ic.ctrl.add_flags = 0b11;
+            (*ic_ptr).ctrl.add_flags = 0b11;
 
             // Slot context: High-speed device on root-hub port 1, EP0 only.
-            ic.device.slot.dev_info  = context::SlotContext::build_dev_info(
+            (*ic_ptr).device.slot.dev_info  = context::SlotContext::build_dev_info(
                 0,                          // route string (root hub = 0)
                 context::SLOT_SPEED_HS,     // assume High-Speed (480 Mb/s)
                 false,                      // not a hub
                 1,                          // last_ctx = 1 (EP0 only)
             );
             // dev_info2 bits[23:16] = root-hub port number (1-based).
-            ic.device.slot.dev_info2 = 1 << 16;
+            (*ic_ptr).device.slot.dev_info2 = 1 << 16;
 
             // EP0 context: bidirectional control, cerr=3, max-packet=64.
-            ic.device.ep[0].ep_info2 = context::EndpointContext::build_ep_info2(
+            (*ic_ptr).device.ep[0].ep_info2 = context::EndpointContext::build_ep_info2(
                 context::EP_TYPE_CTRL, // 4
                 3,                     // CErr: 3 retries
                 0,                     // max burst = 0
                 64,                    // bMaxPacketSize0 for HS EP0
             );
             // Dequeue pointer: ring base, DCS=1 (matches initial PCS=1).
-            ic.device.ep[0].deq_lo  = ep0_ring_phys as u32 | 1;
-            ic.device.ep[0].deq_hi  = (ep0_ring_phys >> 32) as u32;
+            (*ic_ptr).device.ep[0].deq_lo  = ep0_ring_phys as u32 | 1;
+            (*ic_ptr).device.ep[0].deq_hi  = (ep0_ring_phys >> 32) as u32;
             // Average TRB length = 8 (SETUP packet size).
-            ic.device.ep[0].tx_info = 8;
+            (*ic_ptr).device.ep[0].tx_info = 8;
 
             // ── 4. Issue ADDRESS_DEVICE command ───────────────────────────────
-            // Hardware reads InputContext via DMA; we poll for completion before
-            // returning so the stack-allocated ic stays valid throughout.
-            let ic_phys = core::ptr::addr_of!(ic) as u64;
+            let ic_phys = ic_page_phys as u64;
             let trb = Trb::command(
                 TrbType::AddressDevice,
                 ic_phys as u32,
@@ -550,7 +613,8 @@ impl HostControllerDriver for Xhci {
             );
             self.send_command(trb);
 
-            // Poll for CmdCompletion so we know the HC has finished reading ic.
+            // Poll for CmdCompletion so we know the HC has finished reading ic
+            // before freeing its backing page.
             let mut spins: usize = 0;
             loop {
                 if let Some(evt) = self.event_ring.dequeue_event() {
@@ -564,6 +628,7 @@ impl HostControllerDriver for Xhci {
                 if spins > 1_000_000 { break; }
                 core::hint::spin_loop();
             }
+            buddy::free(ic_page_phys, 0);
         }
     }
 
@@ -665,7 +730,15 @@ impl HostControllerDriver for Xhci {
         }
 
         // ── 4. Build InputContext and issue CONFIGURE_ENDPOINT ────────────────
-        let mut ic = context::InputContext::default();
+        // Same DMA-page requirement as set_address's InputContext above: the
+        // HC reads this via DMA, so it must live at a real physical address,
+        // not a stack virtual address.
+        let ic_page_phys = match buddy::alloc(0) {
+            Some(p) => p,
+            None => return,
+        };
+        let ic_ptr = mm::phys_to_virt(ic_page_phys) as *mut context::InputContext;
+        unsafe { core::ptr::write(ic_ptr, context::InputContext::default()); }
 
         // Bit 0 = slot context; one bit per ep context index (1-based → bit n).
         let mut add_flags: u32 = 0b01;
@@ -679,22 +752,26 @@ impl HostControllerDriver for Xhci {
                 .map(|r| r.phys_base())
                 .unwrap_or(0);
 
-            let ep = &mut ic.device.ep[ctx_idx - 1];
-            ep.ep_info  = (interval as u32) << 16;   // bits[23:16] = Interval
-            ep.ep_info2 = context::EndpointContext::build_ep_info2(xhci_typ, 3, 0, mps);
-            ep.deq_lo   = ring_phys as u32 | 1;      // DCS = 1
-            ep.deq_hi   = (ring_phys >> 32) as u32;
-            ep.tx_info  = mps as u32;                 // average TRB length ≈ MPS
+            unsafe {
+                let ep = &mut (*ic_ptr).device.ep[ctx_idx - 1];
+                ep.ep_info  = (interval as u32) << 16;   // bits[23:16] = Interval
+                ep.ep_info2 = context::EndpointContext::build_ep_info2(xhci_typ, 3, 0, mps);
+                ep.deq_lo   = ring_phys as u32 | 1;      // DCS = 1
+                ep.deq_hi   = (ring_phys >> 32) as u32;
+                ep.tx_info  = mps as u32;                 // average TRB length ≈ MPS
+            }
 
             add_flags |= 1 << ctx_idx;
         }
 
-        ic.ctrl.add_flags  = add_flags;
-        ic.device.slot.dev_info = context::SlotContext::build_dev_info(
-            0, context::SLOT_SPEED_HS, false, last_ctx,
-        );
+        unsafe {
+            (*ic_ptr).ctrl.add_flags  = add_flags;
+            (*ic_ptr).device.slot.dev_info = context::SlotContext::build_dev_info(
+                0, context::SLOT_SPEED_HS, false, last_ctx,
+            );
+        }
 
-        let ic_phys = core::ptr::addr_of!(ic) as u64;
+        let ic_phys = ic_page_phys as u64;
 
         unsafe {
             let trb = Trb::command(
@@ -718,6 +795,7 @@ impl HostControllerDriver for Xhci {
                 if spins > 1_000_000 { break; }
                 core::hint::spin_loop();
             }
+            buddy::free(ic_page_phys, 0);
         }
     }
 
