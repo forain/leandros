@@ -29,6 +29,14 @@ const VIRTQ_DESC_F_WRITE: u16 = 2;
 const SECTORS_PER_BLOCK: u64 = 8; // 4096 / 512
 const BLOCK_SIZE: usize = 4096;
 
+/// Largest number of 4096-byte blocks a single request may carry.  The DMA
+/// data buffer is one order-6 buddy allocation (64 pages = 256 KiB); a
+/// multi-block read costs the same submit/notify/poll round trip as a
+/// single-block one, so batching contiguous reads through this buffer cuts
+/// per-block device overhead by up to 64x (large sequential file reads).
+pub const MAX_IO_BLOCKS: usize = 64;
+const DATA_BUF_ORDER: usize = 6; // 2^6 pages = MAX_IO_BLOCKS
+
 const F2FS_MAGIC: u32 = 0xF2F5_2010;
 const F2FS_SB_OFFSET: usize = 1024; // byte offset within first block
 
@@ -358,9 +366,10 @@ impl VirtioBlkDevice {
         );
 
         let req_phys  = mm::buddy::alloc(0)?;
-        let data_phys = mm::buddy::alloc(0)?;
+        let data_phys = mm::buddy::alloc(DATA_BUF_ORDER)?;
         core::ptr::write_bytes(mm::phys_to_virt(req_phys)  as *mut u8, 0, 4096);
-        core::ptr::write_bytes(mm::phys_to_virt(data_phys) as *mut u8, 0, 4096);
+        core::ptr::write_bytes(mm::phys_to_virt(data_phys) as *mut u8, 0,
+                               MAX_IO_BLOCKS * BLOCK_SIZE);
 
         Some(Self {
             _pci: pci,
@@ -384,7 +393,10 @@ impl VirtioBlkDevice {
     }
 
     // Returns true on success (VIRTIO_BLK_S_OK == 0).
-    fn do_io(&mut self, type_: u32, sector: u64, buf: *mut u8) -> bool {
+    // `nblocks` must be 1..=MAX_IO_BLOCKS; `buf` covers nblocks * BLOCK_SIZE bytes.
+    fn do_io(&mut self, type_: u32, sector: u64, buf: *mut u8, nblocks: usize) -> bool {
+        if nblocks == 0 || nblocks > MAX_IO_BLOCKS { return false; }
+        let span = nblocks * BLOCK_SIZE;
         unsafe {
             // Fill request header
             let hdr = mm::phys_to_virt(self.req_phys) as *mut VirtioBlkReqHdr;
@@ -397,11 +409,11 @@ impl VirtioBlkDevice {
             *status_ptr = 0xFF; // sentinel; device overwrites with 0=ok
 
             if type_ == VIRTIO_BLK_T_OUT {
-                // Copy caller data into DMA page before write
+                // Copy caller data into DMA buffer before write
                 core::ptr::copy_nonoverlapping(
                     buf,
                     mm::phys_to_virt(self.data_phys) as *mut u8,
-                    BLOCK_SIZE,
+                    span,
                 );
             }
 
@@ -410,7 +422,7 @@ impl VirtioBlkDevice {
                 let d0 = q.alloc_desc(self.req_phys as u64, 16, 0);
                 let d1 = q.alloc_desc(
                     self.data_phys as u64,
-                    BLOCK_SIZE as u32,
+                    span as u32,
                     if type_ == VIRTIO_BLK_T_IN { VIRTQ_DESC_F_WRITE } else { 0 },
                 );
                 let d2 = q.alloc_desc(status_phys as u64, 1, VIRTQ_DESC_F_WRITE);
@@ -424,11 +436,11 @@ impl VirtioBlkDevice {
             self.queue.free_chain(d0);
 
             if type_ == VIRTIO_BLK_T_IN {
-                // Copy DMA page into caller buffer after read
+                // Copy DMA buffer into caller buffer after read
                 core::ptr::copy_nonoverlapping(
                     mm::phys_to_virt(self.data_phys) as *const u8,
                     buf,
-                    BLOCK_SIZE,
+                    span,
                 );
             }
 
@@ -486,17 +498,40 @@ pub fn device_count() -> usize {
 pub fn read_block(dev_idx: usize, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool {
     let mut devs = DEVICES.lock();
     if let Some(ref mut dev) = devs[dev_idx] {
-        dev.do_io(VIRTIO_BLK_T_IN, blk * SECTORS_PER_BLOCK, buf.as_mut_ptr())
+        dev.do_io(VIRTIO_BLK_T_IN, blk * SECTORS_PER_BLOCK, buf.as_mut_ptr(), 1)
     } else {
         false
     }
+}
+
+/// Read `buf.len() / 4096` contiguous blocks starting at logical block `blk`
+/// into `buf`.  `buf.len()` must be a non-zero multiple of 4096.  Spans larger
+/// than [`MAX_IO_BLOCKS`] are split into multiple requests internally.
+pub fn read_blocks(dev_idx: usize, blk: u64, buf: &mut [u8]) -> bool {
+    if buf.is_empty() || buf.len() % BLOCK_SIZE != 0 { return false; }
+    let mut devs = DEVICES.lock();
+    let dev = match devs[dev_idx] { Some(ref mut d) => d, None => return false };
+    let total = buf.len() / BLOCK_SIZE;
+    let mut done = 0usize;
+    while done < total {
+        let n = (total - done).min(MAX_IO_BLOCKS);
+        let ok = dev.do_io(
+            VIRTIO_BLK_T_IN,
+            (blk + done as u64) * SECTORS_PER_BLOCK,
+            unsafe { buf.as_mut_ptr().add(done * BLOCK_SIZE) },
+            n,
+        );
+        if !ok { return false; }
+        done += n;
+    }
+    true
 }
 
 /// Write one 4096-byte block to device `dev_idx` at logical block `blk`.
 pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
     let mut devs = DEVICES.lock();
     if let Some(ref mut dev) = devs[dev_idx] {
-        dev.do_io(VIRTIO_BLK_T_OUT, blk * SECTORS_PER_BLOCK, buf.as_ptr() as *mut u8)
+        dev.do_io(VIRTIO_BLK_T_OUT, blk * SECTORS_PER_BLOCK, buf.as_ptr() as *mut u8, 1)
     } else {
         false
     }

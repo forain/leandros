@@ -675,6 +675,36 @@ fn read_file_data(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8, count: 
         let blk_off  = (file_off % BLOCK_SIZE as u64) as usize;
         let phys = inode_logical_to_phys(ms, ino, blk_idx);
         let chunk = (BLOCK_SIZE - blk_off).min(readable - done);
+
+        // Fast path: a full-block-aligned span. Gather the run of blocks that
+        // are *physically* contiguous on the device and fetch it with one
+        // multi-block virtio request straight into the destination buffer.
+        // This bypasses the LRU block cache, which (a) large sequential reads
+        // would otherwise evict entirely and (b) costs one device round trip
+        // per 4 KiB. Any block already present in the cache ends the run so a
+        // dirty (not yet flushed) copy is never shadowed by stale device data.
+        if blk_off == 0 && chunk == BLOCK_SIZE && phys != 0
+            && ms.cache.find(phys as u64).is_none()
+        {
+            let max_run = (readable - done) / BLOCK_SIZE;
+            let mut run = 1usize;
+            while run < max_run {
+                let next = inode_logical_to_phys(ms, ino, blk_idx + run as u64);
+                if next == 0 || next as u64 != phys as u64 + run as u64 { break; }
+                if ms.cache.find(next as u64).is_some() { break; }
+                run += 1;
+            }
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(buf.add(done), run * BLOCK_SIZE)
+            };
+            if virtio_blk::read_blocks(ms.dev, phys as u64, dst) {
+                done += run * BLOCK_SIZE;
+                continue;
+            }
+            // Device error — fall through to the single-block cached path,
+            // which reports the block via its own read (zeros on failure).
+        }
+
         if phys == 0 {
             // Sparse block — return zeros
             unsafe { core::ptr::write_bytes(buf.add(done), 0, chunk); }
@@ -1670,6 +1700,51 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
     vfs_server::register_mount(mount_point, port, device_str, "f2fs");
 
     Some(port)
+}
+
+/// Positional read for the kernel's demand-paged exec path.
+///
+/// Reads `len` bytes at byte `pos` of the open file `file_id` on the mount
+/// whose IPC port is `port`, into `dst` (a kernel HHDM pointer).  Unlike
+/// VFS_READ this never touches the open file's seek position, so concurrent
+/// page faults on the same backing file cannot race on it.  Called directly
+/// (no IPC) because it runs from page-fault context; everything below is
+/// synchronous polling I/O.
+///
+/// Returns bytes read, or a negative errno.
+pub fn pread_by_port(port: u32, file_id: u64, dst: *mut u8, len: usize, pos: u64) -> isize {
+    let mut mounts = F2FS_MOUNTS.lock();
+    for slot in mounts.iter_mut() {
+        if let Some(ref mut ms) = slot {
+            if ms.port == port {
+                let idx = file_id as usize;
+                if idx >= MAX_OPEN_FILES || !ms.open_files[idx].in_use {
+                    return -9; // EBADF
+                }
+                let ino = ms.open_files[idx].inode;
+                return read_file_data(ms, ino, pos, dst, len) as isize;
+            }
+        }
+    }
+    -9 // EBADF — no mount on this port
+}
+
+/// Close an open-file slot on the mount whose IPC port is `port` — the
+/// direct-call twin of VFS_CLOSE, used when the kernel releases the backing
+/// file of a demand-paged exec image.
+pub fn close_by_port(port: u32, file_id: u64) {
+    let mut mounts = F2FS_MOUNTS.lock();
+    for slot in mounts.iter_mut() {
+        if let Some(ref mut ms) = slot {
+            if ms.port == port {
+                let idx = file_id as usize;
+                if idx < MAX_OPEN_FILES {
+                    ms.open_files[idx].in_use = false;
+                }
+                return;
+            }
+        }
+    }
 }
 
 /// Unmount the F2FS volume mounted at `mount_point`.
