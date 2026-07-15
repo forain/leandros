@@ -74,7 +74,8 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
                 start: region.start, end: region.end, phys: dst_phys,
                 flags: region.flags, lazy: false, lazy_pages: Vec::new(), lazy_count: 0,
                 prot: region.prot, map_flags: region.map_flags,
-                file_cap: region.file_cap, file_off: region.file_off, cow: false,
+                file_cap: region.file_cap, file_off: region.file_off,
+                file_len: region.file_len, cow: false,
             });
             continue;
         }
@@ -125,6 +126,13 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
             if !is_shared { region.cow = true; }
         }
 
+        // The child VMA holds its own reference to any backing file: pages
+        // still absent after the fork are demand-read by whichever side
+        // touches them first, so the file must outlive both address spaces.
+        if crate::vmm::is_file_backed(region.file_cap) {
+            crate::vmm::file_retain(region.file_cap);
+        }
+
         *dst_slot = Some(VmaRegion {
             start:      region.start,
             end:        region.end,
@@ -137,6 +145,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
             map_flags:  region.map_flags,
             file_cap:   region.file_cap,
             file_off:   region.file_off,
+            file_len:   region.file_len,
             cow:        !is_shared,
         });
     }

@@ -96,7 +96,33 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
     let tcr: u64;
     core::arch::asm!("mrs {}, far_el1", out(reg) far);
     core::arch::asm!("mrs {}, tcr_el1", out(reg) tcr);
-    
+
+    // Kernel-mode data abort on a *user* (TTBR0) address: kernel/server code
+    // dereferenced a user pointer whose page is demand-paged (lazy heap, CoW,
+    // or a never-touched page of a file-backed exec image).  The servers run
+    // synchronously in the calling task's context, so the current task's
+    // address space is the right one — service it like a user fault; on
+    // success the vector stub erets back to the faulting kernel instruction.
+    //
+    // Deadlock note: faults needing a *file read* must never be taken while
+    // filesystem locks are held; the syscall layer prefaults every user
+    // buffer it forwards into VFS.  This path is the safety net for the rest.
+    //
+    //   EC 0x25 = data abort from the current EL (kernel mode).
+    //   DFSC 0x04..=0x07 translation fault, 0x0D..=0x0F permission fault.
+    let ec   = (esr >> 26) & 0x3F;
+    let dfsc = esr & 0x3F;
+    if ec == 0x25 && far >> 48 == 0 {
+        let is_translation = (0x04..=0x07).contains(&dfsc);
+        let is_permission  = (0x0D..=0x0F).contains(&dfsc);
+        let is_write = (esr >> 6) & 1 != 0;
+        if (is_translation || is_permission)
+            && sched::handle_page_fault(far as usize, is_write)
+        {
+            return; // fault serviced — resume the interrupted kernel code
+        }
+    }
+
     serial_print_str("\n[EXC] EL1 Sync Fault! ESR=");
     print_hex(esr as usize);
     serial_print_str(" ELR=");

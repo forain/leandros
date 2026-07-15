@@ -273,6 +273,22 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
 
         sched::exit(1);
     } else {
+        // Kernel-mode fault on a *user* address: kernel/server code
+        // dereferenced a user pointer whose page is demand-paged (lazy heap,
+        // CoW, or a file-backed exec image page never touched yet).  The
+        // servers run synchronously in the calling task's context, so the
+        // current task's address space is the right one — service it like a
+        // user fault and resume the faulting kernel instruction.
+        //
+        // Deadlock note: faults that require a *file read* must never be
+        // taken while the filesystem's own locks are held; the syscall layer
+        // prefaults every user buffer it forwards into VFS to guarantee
+        // that.  This path is the safety net for everything else.
+        const USER_VA_LIMIT: u64 = 0x0000_8000_0000_0000;
+        let is_write = error_code & 2 != 0;
+        if cr2 < USER_VA_LIMIT && sched::handle_page_fault(cr2 as usize, is_write) {
+            return;
+        }
         print_exception(&frame, 14, error_code);
         serial_str(b"CR2=0x"); serial_hex64(cr2); serial_str(b"\r\n");
         loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }

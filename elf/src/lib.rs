@@ -309,3 +309,95 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<ElfInfo, ElfError> {
         phnum:     ehdr.e_phnum     as usize,
     })
 }
+
+/// Map an ELF64 executable into `as_` as demand-paged, file-backed VMAs.
+///
+/// `header` needs to contain only the ELF header and the complete program-
+/// header table — no segment data is read here.  Each `PT_LOAD` becomes a
+/// lazy VMA backed by the kernel-registered file `file_cap`; the page-fault
+/// handler reads pages from the file on first touch and zero-fills anything
+/// past `p_filesz` (BSS).  Compared to [`load`], this avoids reading and
+/// copying the entire image (hundreds of MB for large binaries) at exec time.
+pub fn load_lazy(
+    header: &[u8],
+    as_: &mut AddressSpace,
+    file_cap: usize,
+) -> Result<ElfInfo, ElfError> {
+    let ehdr       = parse_ehdr(header)?;
+    let phoff      = ehdr.e_phoff     as usize;
+    let phentsize  = ehdr.e_phentsize as usize;
+    let phnum      = ehdr.e_phnum     as usize;
+
+    // The whole program-header table must be inside `header`.
+    let ph_table_end = phoff
+        .checked_add(phentsize.checked_mul(phnum).ok_or(ElfError::BadProgramHeader)?)
+        .ok_or(ElfError::BadProgramHeader)?;
+    if ph_table_end > header.len() { return Err(ElfError::BadProgramHeader); }
+
+    let page_size = mm::buddy::PAGE_SIZE;
+    let mut highest:   usize = 0;
+    let mut load_base: usize = 0;
+    let mut first_load = true;
+
+    for i in 0..phnum {
+        let ph_off = phoff + i * phentsize;
+        let ph     = parse_phdr(header, ph_off)?;
+
+        if ph.p_type != PT_LOAD { continue; }
+        if ph.p_memsz == 0      { continue; }
+
+        let vaddr   = ph.p_vaddr  as usize;
+        let memsz   = ph.p_memsz  as usize;
+        let filesz  = ph.p_filesz as usize;
+        let foffset = ph.p_offset as usize;
+
+        if first_load {
+            load_base = vaddr.wrapping_sub(foffset);
+            first_load = false;
+        }
+
+        // W^X enforcement, as in `load`.
+        let mut flags = PageFlags::PRESENT | PageFlags::USER;
+        if ph.p_flags & PF_W != 0 && ph.p_flags & PF_X == 0 {
+            flags |= PageFlags::WRITABLE;
+        }
+        if ph.p_flags & PF_X != 0 {
+            flags |= PageFlags::EXECUTE;
+        }
+
+        let page_vaddr  = vaddr & !(page_size - 1);
+        let page_offset = vaddr - page_vaddr;
+        let map_size    = memsz + page_offset;
+        // File offset of the first mapped page.  p_offset ≡ p_vaddr modulo
+        // the page size for a loadable segment, so this cannot underflow on
+        // a well-formed binary; reject it if it would.
+        let file_off = (foffset as u64)
+            .checked_sub(page_offset as u64)
+            .ok_or(ElfError::BadProgramHeader)?;
+        let file_len = (filesz + page_offset) as u64;
+
+        if !as_.map_lazy_file(page_vaddr, map_size, flags, file_cap, file_off, file_len) {
+            return Err(ElfError::MappingFailed);
+        }
+
+        let seg_end = vaddr
+            .checked_add(memsz)
+            .ok_or(ElfError::SegmentOverflow)?;
+        if seg_end > highest { highest = seg_end; }
+    }
+
+    if first_load { return Err(ElfError::BadProgramHeader); } // no PT_LOAD at all
+
+    if highest > 0 {
+        let heap_page = (highest + page_size - 1) & !(page_size - 1);
+        as_.heap_start = heap_page + page_size; // guard gap
+        as_.heap_end   = as_.heap_start;
+    }
+
+    Ok(ElfInfo {
+        entry:     ehdr.e_entry as usize,
+        phdr_va:   load_base.wrapping_add(phoff),
+        phentsize: ehdr.e_phentsize as usize,
+        phnum:     ehdr.e_phnum     as usize,
+    })
+}

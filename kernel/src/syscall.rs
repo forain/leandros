@@ -69,6 +69,105 @@ pub fn set_audio_server_port(port: u32) {
     sched::set_audio_port(port);
 }
 
+// ── Demand-paged exec: backing-file registry ──────────────────────────────────
+//
+// A demand-paged exec image keeps its ELF file open on the mounted
+// filesystem for the lifetime of the process image; the page-fault handler
+// reads pages from it on first touch.  Each entry is identified by a
+// capability token (`index + 1`, so 0 stays "anonymous" and usize::MAX stays
+// the device-mapping sentinel) stored in the VMAs' `file_cap`.  `refs`
+// counts live VMAs (across fork clones) plus a transient creation reference
+// held during sys_execve setup; the file is closed on the mount when it
+// drops to zero.
+
+#[derive(Clone, Copy)]
+struct ExecFileEntry {
+    port:    u32, // IPC port of the owning mount (used for direct f2fs calls)
+    file_id: u32, // open-file slot on that mount
+    refs:    u32,
+}
+
+const MAX_EXEC_FILES: usize = 64;
+static EXEC_FILES: spin::Mutex<[Option<ExecFileEntry>; MAX_EXEC_FILES]> =
+    spin::Mutex::new([None; MAX_EXEC_FILES]);
+
+fn exec_file_register(port: u32, file_id: u32) -> Option<usize> {
+    let mut tbl = EXEC_FILES.lock();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(ExecFileEntry { port, file_id, refs: 1 });
+            return Some(i + 1);
+        }
+    }
+    None
+}
+
+/// mm file-read hook.  Runs in page-fault context: everything below is a
+/// synchronous direct call into the f2fs server (registered port handlers
+/// execute in the caller's context) ending in polled virtio I/O — no
+/// blocking, no rescheduling, no IPC reply ports.
+fn exec_file_read(cap: usize, offset: u64, dst: *mut u8, len: usize) -> bool {
+    if cap == 0 || cap > MAX_EXEC_FILES { return false; }
+    let entry = match EXEC_FILES.lock()[cap - 1] {
+        Some(e) => e,
+        None    => return false,
+    };
+    f2fs_server::pread_by_port(entry.port, entry.file_id as u64, dst, len, offset)
+        == len as isize
+}
+
+/// mm file-retain hook (one reference per live VMA; fork clones retain).
+fn exec_file_retain(cap: usize) {
+    if cap == 0 || cap > MAX_EXEC_FILES { return; }
+    if let Some(ref mut e) = EXEC_FILES.lock()[cap - 1] {
+        e.refs += 1;
+    }
+}
+
+/// mm file-release hook; closes the mount-side file when the last VMA goes.
+fn exec_file_release(cap: usize) {
+    if cap == 0 || cap > MAX_EXEC_FILES { return; }
+    let closed = {
+        let mut tbl = EXEC_FILES.lock();
+        match tbl[cap - 1] {
+            Some(ref mut e) => {
+                e.refs -= 1;
+                if e.refs == 0 {
+                    let ent = *e;
+                    tbl[cap - 1] = None;
+                    Some(ent)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(e) = closed {
+        f2fs_server::close_by_port(e.port, e.file_id as u64);
+    }
+}
+
+/// Wire the mm crate's file-backed-VMA hooks to the registry above.
+/// Called once from kernel init, before userspace starts.
+pub fn init_exec_file_backing() {
+    mm::vmm::set_file_backing_hooks(exec_file_read, exec_file_retain, exec_file_release);
+}
+
+/// Fault in `[ptr, ptr+len)` of the current address space.
+///
+/// Kernel and server code dereferences user buffer pointers directly (the
+/// servers run synchronously in the caller's context).  With demand-paged
+/// exec images a user pointer can now name a page that was never touched —
+/// e.g. a string literal in a .rodata page — and taking that fault *inside*
+/// f2fs would re-enter the filesystem from the fault handler and deadlock on
+/// F2FS_MOUNTS.  Every user pointer that flows into vfs::handle must
+/// therefore be faulted in first, while no filesystem lock is held.
+fn prefault_user(ptr: usize, len: usize) {
+    if ptr == 0 || len == 0 { return; }
+    let _ = with_current_address_space_mut(|as_| as_.prefault_range(ptr, len));
+}
+
 // ── VFS call helper ───────────────────────────────────────────────────────────
 
 /// Build a VFS message with up to 7 u64 arguments packed into data[].
@@ -1323,6 +1422,9 @@ fn sys_wait(pid_raw: usize, status_ptr: usize) -> isize {
     match sched::wait_pid(pid_raw as u32) {
         Some((reaped_pid, code)) => {
             if status_ptr != 0 {
+                // Fault the destination in first: a demand-paged .bss status
+                // variable would otherwise make write_user_buf fail silently.
+                prefault_user(status_ptr, 4);
                 let status = encode_wait_status(code);
                 // Write through the address space's own virt->phys/HHDM path
                 // rather than dereferencing the raw user pointer: this syscall
@@ -1990,6 +2092,83 @@ static EXEC_ENVP: spin::Mutex<ExecStrBuf> = spin::Mutex::new(ExecStrBuf::new());
 ///   -38     ENOSYS  — not an ELF image (no VFS yet)
 ///   -8      ENOEXEC — ELF parse / load error
 ///   -12     ENOMEM  — OOM
+/// Read exactly `buf.len()` bytes from `fd` (kernel destination).  Returns
+/// bytes actually read (may be short at EOF); negative errno on failure.
+fn read_fd_upto(fd: usize, buf: &mut [u8]) -> isize {
+    let mut got = 0usize;
+    while got < buf.len() {
+        let r = sys_read_impl(
+            fd,
+            buf.as_mut_ptr().wrapping_add(got) as usize,
+            buf.len() - got,
+            true,
+        );
+        if r < 0 { return r; }
+        if r == 0 { break; }
+        got += r as usize;
+    }
+    got as isize
+}
+
+/// Cap on how far into a binary the program-header table may sit for the
+/// demand-paged exec path; anything stranger falls back to the eager loader.
+const EXEC_HEADER_MAX: usize = 512 * 1024;
+
+/// Open `path` and read its ELF header + full program-header table.
+///
+/// Returns the still-open fd and the header bytes if `path` is a mounted
+/// (disk) file containing ELF magic — the preconditions for demand-paged
+/// exec.  On any failure the fd is closed and None is returned so the caller
+/// can fall back to the eager whole-file loader.
+fn open_exec_header(path: &str, pid: u32) -> Option<(usize, alloc::vec::Vec<u8>)> {
+    let mut path_c = alloc::string::String::from(path);
+    path_c.push('\0');
+    let fd = sys_open(path_c.as_ptr() as usize, 0 /* O_RDONLY */, 0);
+    if fd < 0 { return None; }
+    let fd = fd as usize;
+
+    // Demand paging needs a filesystem-backed file (positional reads via the
+    // mount port); anything else (ramfs, devices) uses the eager path.
+    if !matches!(
+        vfs::vfs_get_node_kind(pid, fd),
+        Some(vfs::VnodeKind::MountedFile { .. })
+    ) {
+        let _ = sys_close(fd);
+        return None;
+    }
+
+    let mut hdr = alloc::vec![0u8; 4096];
+    let _ = sys_lseek(fd, 0, 0 /* SEEK_SET */);
+    let got = read_fd_upto(fd, &mut hdr);
+    if got < 64 || hdr[0..4] != [0x7F, b'E', b'L', b'F'] {
+        let _ = sys_close(fd);
+        return None;
+    }
+    hdr.truncate(got as usize);
+
+    // Make sure the whole program-header table is in the buffer.
+    let phoff     = u64::from_le_bytes(hdr[32..40].try_into().unwrap()) as usize;
+    let phentsize = u16::from_le_bytes(hdr[54..56].try_into().unwrap()) as usize;
+    let phnum     = u16::from_le_bytes(hdr[56..58].try_into().unwrap()) as usize;
+    let needed = match phentsize.checked_mul(phnum).and_then(|n| n.checked_add(phoff)) {
+        Some(n) => n,
+        None    => { let _ = sys_close(fd); return None; }
+    };
+    if needed > EXEC_HEADER_MAX {
+        let _ = sys_close(fd);
+        return None;
+    }
+    if needed > hdr.len() {
+        hdr = alloc::vec![0u8; needed];
+        let _ = sys_lseek(fd, 0, 0);
+        if read_fd_upto(fd, &mut hdr) != needed as isize {
+            let _ = sys_close(fd);
+            return None;
+        }
+    }
+    Some((fd, hdr))
+}
+
 fn read_file_from_vfs(path: &str) -> Option<alloc::vec::Vec<u8>> {
     let mut path_c = alloc::string::String::from(path);
     path_c.push('\0');
@@ -2026,8 +2205,10 @@ fn read_file_from_vfs(path: &str) -> Option<alloc::vec::Vec<u8>> {
 
 fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
+    let pid = current_pid();
 
     // Resolve path string from user space
+    prefault_user(path_ptr, 256);
     let mut path_buf = [0u8; 256];
     let ok = with_current_address_space(|as_| {
         as_.read_user_buf(path_ptr, &mut path_buf)
@@ -2043,10 +2224,42 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let abs_len = resolve_path(&path_buf[..path_len], &mut abs_path_buf);
     let path = core::str::from_utf8(&abs_path_buf[..abs_len]).unwrap_or(path_str);
 
-    // ── Resolve ELF bytes ─────────────────────────────────────────────────────
-    let vfs_elf_data = read_file_from_vfs(path);
-    
-    let (elf_ptr, elf_len) = if let Some(ref data) = vfs_elf_data {
+    // ── Resolve ELF source ────────────────────────────────────────────────────
+    //
+    // Preferred: the demand-paged path for filesystem-backed binaries — read
+    // only the ELF/program headers now, register the open file in
+    // EXEC_FILES, and map every PT_LOAD as a file-backed lazy VMA whose
+    // pages the fault handler reads in on first touch.  This replaces
+    // reading + copying the whole image at exec time (397 MB for MAME).
+    //
+    // Fallback: the eager whole-file loader, for ramfs/initrd binaries and
+    // for anything the header probe rejects.
+    let mut exec_cap: usize = 0;
+    let mut header_data: Option<alloc::vec::Vec<u8>> = None;
+
+    if let Some((fd, hdr)) = open_exec_header(path, pid) {
+        match vfs::steal_mounted_file(pid, fd) {
+            Some((port, file_id)) => match exec_file_register(port, file_id) {
+                Some(cap) => {
+                    exec_cap = cap;
+                    header_data = Some(hdr);
+                }
+                None => {
+                    // Registry full — close the stolen mount file, fall back.
+                    f2fs_server::close_by_port(port, file_id as u64);
+                }
+            },
+            None => {
+                let _ = sys_close(fd);
+            }
+        }
+    }
+
+    let vfs_elf_data = if exec_cap == 0 { read_file_from_vfs(path) } else { None };
+
+    let (elf_ptr, elf_len) = if exec_cap != 0 {
+        (0usize, 0usize) // unused on the demand-paged path
+    } else if let Some(ref data) = vfs_elf_data {
         (data.as_ptr() as usize, data.len())
     } else if let Some((ptr, len)) = vfs::get_file_data_by_path(path) {
         (ptr as usize, len)
@@ -2071,13 +2284,18 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         }
     };
 
-    if elf_len == 0 { return -22; }
+    if exec_cap == 0 && elf_len == 0 { return -22; }
 
     // ── Collect argv / envp strings ───────────────────────────────────────────
     let mut argv = EXEC_ARGV.lock();
     let mut envp = EXEC_ENVP.lock();
     argv.reset();
     envp.reset();
+
+    // Fault in the pointer arrays themselves (they can live in .data/.rodata
+    // of a demand-paged image, not just on the stack).
+    prefault_user(argv_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
+    prefault_user(envp_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
 
     // Read argv[] from user-space (array of pointers, null-terminated).
     if argv_ptr != 0 {
@@ -2095,6 +2313,10 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
             }).unwrap_or(false);
             if !ok || str_ptr == 0 { break; }
 
+            // The string may live in a not-yet-faulted page of a
+            // demand-paged image (e.g. argv literals in .rodata); push_cstr
+            // dereferences it raw, so fault it in first.
+            prefault_user(str_ptr, 512);
             argv.push_cstr(str_ptr);
             i += 1;
         }
@@ -2115,6 +2337,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
             }).unwrap_or(false);
             if !ok || str_ptr == 0 { break; }
 
+            prefault_user(str_ptr, 512);
             envp.push_cstr(str_ptr);
             i += 1;
         }
@@ -2124,21 +2347,39 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 
     // ── Load ELF into fresh address space ─────────────────────────────────────
     let pt_root = unsafe { arch_alloc_page_table_root() };
-    if pt_root == 0 { return -12; }
+    if pt_root == 0 {
+        if exec_cap != 0 { exec_file_release(exec_cap); }
+        return -12;
+    }
     let mut new_as = alloc::boxed::Box::new(mm::vmm::AddressSpace::new(pt_root));
 
-    let elf_bytes = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_len) };
-    let elf_info = match elf::load(elf_bytes, &mut new_as) {
-        Ok(e)  => e,
-        Err(_) => { drop(new_as); return -8; }
+    let elf_info = if exec_cap != 0 {
+        // Demand-paged: map PT_LOADs as file-backed lazy VMAs (each takes a
+        // reference on exec_cap), no segment data read here.
+        let r = elf::load_lazy(header_data.as_deref().unwrap_or(&[]), &mut new_as, exec_cap);
+        // Drop the creation reference: the image's lifetime is now carried
+        // by the VMAs (dropping new_as on the error paths below releases
+        // theirs, letting the refcount reach zero and close the file).
+        exec_file_release(exec_cap);
+        match r {
+            Ok(e)  => e,
+            Err(_) => { drop(new_as); return -8; }
+        }
+    } else {
+        let elf_bytes = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_len) };
+        match elf::load(elf_bytes, &mut new_as) {
+            Ok(e)  => e,
+            Err(_) => { drop(new_as); return -8; }
+        }
     };
 
-    // elf::load has copied every segment into the new address space, so the
-    // VFS read buffer is no longer referenced.  Free it explicitly here:
-    // replace_address_space below never returns, so destructors of locals
-    // still alive at that call never run, and this buffer is the size of the
-    // whole ELF (hundreds of MB for large binaries).
+    // The loaders are done with the file bytes (eager: copied into the new
+    // address space; lazy: only the header was ever read).  Free the buffers
+    // explicitly: replace_address_space below never returns, so destructors
+    // of locals still alive at that call never run, and the eager buffer is
+    // the size of the whole ELF (hundreds of MB for large binaries).
     drop(vfs_elf_data);
+    drop(header_data);
 
     // Map user stack (read+write, eager so virt_to_phys works immediately).
     let stack_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE;
@@ -2281,7 +2522,6 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     drop(envp);
 
     // ── VFS lifecycle and address space replacement ────────────────────────────
-    let pid = current_pid();
     let cloexec_msg = make_vfs_msg(vfs::VFS_EXEC_CLOEXEC, &[pid as u64]);
     let _ = vfs::handle(&cloexec_msg, pid);
 
@@ -2411,6 +2651,11 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
     if count == 0 { return 0; }
 
     if !validate_user_buf(buf_ptr, count) { return -14; }
+    // Fault the source in before it reaches VFS/f2fs: taking a demand-page
+    // fault inside the filesystem (its lock held) would deadlock, and the
+    // fd 1/2 fast path's read_user_buf would fail with EFAULT on a
+    // never-touched page (e.g. a .rodata string of a demand-paged binary).
+    prefault_user(buf_ptr, count);
     let pid = current_pid();
     match fd {
         // Only take the serial fast path if this fd hasn't been dup2'd to a
@@ -2559,6 +2804,7 @@ fn sys_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
                 let len  = unsafe { core::ptr::read((iov_addr + 8) as *const usize) };
                 if len == 0 { continue; }
                 if !validate_user_buf(base, len) { return -14; }
+                prefault_user(base, len);
                 let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
                 serial_write_raw(bytes);
                 total = total.saturating_add(len as isize);
@@ -2593,6 +2839,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
                 let len  = unsafe { core::ptr::read((iov_addr + 8) as *const usize) };
                 if len == 0 { continue; }
                 if !validate_user_buf(base, len) { return -14; }
+                prefault_user(base, len);
                 let msg = make_vfs_msg(vfs::VFS_READ, &[fd as u64, base as u64, len as u64]);
                 // Blocking pipe: yield-loop on EAGAIN.
                 let n = loop {
@@ -2797,6 +3044,8 @@ fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
 fn sys_stat_at_path(path_ptr: usize, statbuf_ptr: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
     if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
+    prefault_user(path_ptr, 256);
+    prefault_user(statbuf_ptr, STAT_SIZE);
     let pid = current_pid();
     let omsg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, 0u64, 0]);
     let fd = vfs_reply_val(&vfs::handle(&omsg, pid));
@@ -3172,6 +3421,8 @@ fn sys_mounts_info(index: usize, out_ptr: usize) -> isize {
 fn sys_newfstatat(_dirfd: usize, path_ptr: usize, statbuf_ptr: usize, _flags: usize) -> isize {
     if !validate_user_buf(path_ptr, 1)          { return -14; }
     if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
+    prefault_user(path_ptr, 256);
+    prefault_user(statbuf_ptr, STAT_SIZE);
     let pid = current_pid();
     // Check for directory first (no fd needed).
     if vfs::is_directory(path_ptr) {
@@ -3272,6 +3523,7 @@ fn sys_fchmod(fd: usize, mode: usize) -> isize {
 
 fn sys_fchmodat(_dirfd: usize, path_ptr: usize, mode: usize, _flags: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
+    prefault_user(path_ptr, 256);
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_CHMOD, &[path_ptr as u64, mode as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
@@ -3285,6 +3537,7 @@ fn sys_fchown(fd: usize, uid: usize, gid: usize) -> isize {
 
 fn sys_fchownat(_dirfd: usize, path_ptr: usize, uid: usize, gid: usize, _flags: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
+    prefault_user(path_ptr, 256);
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_CHOWN, &[path_ptr as u64, uid as u64, gid as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
@@ -3324,6 +3577,7 @@ fn sys_dup3(oldfd: usize, newfd: usize, _flags: usize) -> isize {
 
 fn sys_getdents64(fd: usize, buf_ptr: usize, count: usize) -> isize {
     if !validate_user_buf(buf_ptr, count.min(1)) { return -14; }
+    prefault_user(buf_ptr, count);
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_GETDENTS64, &[fd as u64, buf_ptr as u64, count as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
@@ -3331,6 +3585,7 @@ fn sys_getdents64(fd: usize, buf_ptr: usize, count: usize) -> isize {
 
 fn sys_mkdirat(_dirfd: usize, path_ptr: usize, mode: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
+    prefault_user(path_ptr, 256);
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_MKDIR, &[path_ptr as u64, mode as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
@@ -3339,6 +3594,7 @@ fn sys_mkdirat(_dirfd: usize, path_ptr: usize, mode: usize) -> isize {
 fn sys_unlinkat(_dirfd: usize, path_ptr: usize, flags: usize) -> isize {
     const AT_REMOVEDIR: usize = 0x200;
     if !validate_user_buf(path_ptr, 1) { return -14; }
+    prefault_user(path_ptr, 256);
     let pid = current_pid();
     let tag = if flags & AT_REMOVEDIR != 0 { vfs::VFS_RMDIR } else { vfs::VFS_UNLINK };
     let msg = make_vfs_msg(tag, &[path_ptr as u64]);
@@ -3423,6 +3679,8 @@ fn sys_faccessat(_dirfd: usize, path_ptr: usize, _mode: usize, _flags: usize) ->
 fn sys_readlinkat(_dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
     if size == 0 || !validate_user_buf(buf_ptr, size) { return -14; }
+    prefault_user(path_ptr, 256);
+    prefault_user(buf_ptr, size);
 
     // Read the link path from user space.
     let mut pb = [0u8; 256];
@@ -4219,6 +4477,8 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize)
 fn sys_renameat(old_path_ptr: usize, new_path_ptr: usize) -> isize {
     if !validate_user_buf(old_path_ptr, 1) { return -14; }
     if !validate_user_buf(new_path_ptr, 1) { return -14; }
+    prefault_user(old_path_ptr, 256);
+    prefault_user(new_path_ptr, 256);
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_RENAME, &[old_path_ptr as u64, new_path_ptr as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
@@ -4227,6 +4487,7 @@ fn sys_renameat(old_path_ptr: usize, new_path_ptr: usize) -> isize {
 /// sys_truncate(path_ptr, length) — set a file's size by path.
 fn sys_truncate(path_ptr: usize, length: usize) -> isize {
     if !validate_user_buf(path_ptr, 1) { return -14; }
+    prefault_user(path_ptr, 256);
     let pid = current_pid();
     let omsg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, 0x0002u64 /* O_RDWR */, 0]);
     let fd = vfs_reply_val(&vfs::handle(&omsg, pid));

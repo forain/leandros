@@ -36,14 +36,39 @@ __exception_vectors:
 // ── Exception Handlers ────────────────────────────────────────────────────────
 
 exc_el1_sync:
-    // Save minimal state on current stack (SP_EL1)
+    // Full frame save (mirrors exc_el1_irq): kernel-mode faults on user
+    // addresses are recoverable — the handler demand-pages the address and
+    // returns, and ret_to_user erets back to the faulting kernel instruction.
     sub  sp, sp, #288
     stp  x0, x1, [sp, #0]
     stp  x2, x3, [sp, #16]
+    stp  x4, x5, [sp, #32]
+    stp  x6, x7, [sp, #48]
+    stp  x8, x9, [sp, #64]
+    stp  x10, x11, [sp, #80]
+    stp  x12, x13, [sp, #96]
+    stp  x14, x15, [sp, #112]
+    stp  x16, x17, [sp, #128]
+    stp  x18, x19, [sp, #144]
+    stp  x20, x21, [sp, #160]
+    stp  x22, x23, [sp, #176]
+    stp  x24, x25, [sp, #192]
+    stp  x26, x27, [sp, #208]
+    stp  x28, x29, [sp, #224]
+    str  x30,      [sp, #240]
+
+    mrs  x21, sp_el0
+    mrs  x22, elr_el1
+    mrs  x23, spsr_el1
+    mrs  x24, ttbr0_el1
+    stp  x21, x22, [sp, #248]
+    stp  x23, x24, [sp, #264]
+
     mrs  x0, esr_el1
     mrs  x1, elr_el1
     bl   exc_el1_sync_handler
-    b    .
+
+    b    ret_to_user
 
 exc_el0_sync:
     // 1. We are in EL1. SP is already SP_EL1.

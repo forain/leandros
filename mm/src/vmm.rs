@@ -51,13 +51,74 @@ pub struct VmaRegion {
     pub prot:      u32,
     /// mmap flags (MAP_SHARED | MAP_PRIVATE | MAP_ANONYMOUS).
     pub map_flags: u32,
-    /// Capability token for file-backed VMAs (0 = anonymous).
+    /// Capability token for file-backed VMAs (0 = anonymous, usize::MAX =
+    /// device mapping).  Any other value identifies a kernel-registered
+    /// backing file; absent pages are populated through the file-read hook
+    /// (see `set_file_backing_hooks`) instead of plain zero-fill.
     pub file_cap:  usize,
     /// Offset into the backing file (for file-backed VMAs).
     pub file_off:  u64,
+    /// Number of bytes of file data backing this VMA, starting at `file_off`.
+    /// Pages (or page tails) beyond this extent are zero-filled (BSS).
+    pub file_len:  u64,
     /// True if this VMA is a copy-on-write clone; write faults allocate a
     /// new page and copy the content before remapping writable.
     pub cow:       bool,
+}
+
+// ── File-backed VMA hooks ─────────────────────────────────────────────────────
+//
+// The mm crate cannot call into the VFS/filesystem servers (they depend on
+// mm, not the reverse), so the kernel registers three function pointers at
+// boot.  All three run synchronously in the faulting task's context; the
+// filesystem side services them with direct handler calls and polling I/O,
+// so they never block or reschedule.
+
+/// Read `len` bytes at byte `offset` of the backing file identified by
+/// `file_cap` into `dst` (a kernel HHDM pointer).  Returns false on error.
+pub type FileReadFn = fn(file_cap: usize, offset: u64, dst: *mut u8, len: usize) -> bool;
+/// Adjust the reference count of `file_cap` (one reference per live VMA).
+pub type FileRefFn = fn(file_cap: usize);
+
+use core::sync::atomic::{AtomicUsize, Ordering};
+static FILE_READ_HOOK:    AtomicUsize = AtomicUsize::new(0);
+static FILE_RETAIN_HOOK:  AtomicUsize = AtomicUsize::new(0);
+static FILE_RELEASE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Register the kernel's file-backing callbacks.  Must be called once during
+/// boot, before the first file-backed VMA is created.
+pub fn set_file_backing_hooks(read: FileReadFn, retain: FileRefFn, release: FileRefFn) {
+    FILE_READ_HOOK.store(read as usize, Ordering::Release);
+    FILE_RETAIN_HOOK.store(retain as usize, Ordering::Release);
+    FILE_RELEASE_HOOK.store(release as usize, Ordering::Release);
+}
+
+/// True for caps that name a registered backing file (not anonymous, not the
+/// `usize::MAX` device-mapping sentinel).
+#[inline]
+pub fn is_file_backed(file_cap: usize) -> bool {
+    file_cap != 0 && file_cap != usize::MAX
+}
+
+fn file_read(file_cap: usize, offset: u64, dst: *mut u8, len: usize) -> bool {
+    let f = FILE_READ_HOOK.load(Ordering::Acquire);
+    if f == 0 { return false; }
+    let f: FileReadFn = unsafe { core::mem::transmute(f) };
+    f(file_cap, offset, dst, len)
+}
+
+pub(crate) fn file_retain(file_cap: usize) {
+    let f = FILE_RETAIN_HOOK.load(Ordering::Acquire);
+    if f == 0 { return; }
+    let f: FileRefFn = unsafe { core::mem::transmute(f) };
+    f(file_cap)
+}
+
+pub(crate) fn file_release(file_cap: usize) {
+    let f = FILE_RELEASE_HOOK.load(Ordering::Acquire);
+    if f == 0 { return; }
+    let f: FileRefFn = unsafe { core::mem::transmute(f) };
+    f(file_cap)
 }
 
 /// Per-process address space.
@@ -95,6 +156,9 @@ impl Drop for AddressSpace {
                 } else if region.phys != 0 && region.file_cap != usize::MAX {
                     let pages = (region.end - region.start) / PAGE_SIZE;
                     buddy_free(region.phys, pages_to_order(pages));
+                }
+                if is_file_backed(region.file_cap) {
+                    file_release(region.file_cap);
                 }
             }
         }
@@ -191,6 +255,7 @@ impl AddressSpace {
             map_flags: MAP_ANONYMOUS | MAP_PRIVATE,
             file_cap:  0,
             file_off:  0,
+            file_len:  0,
             cow:       false,
         });
 
@@ -253,6 +318,7 @@ impl AddressSpace {
             map_flags: MAP_SHARED, // Devices are shared
             file_cap:  usize::MAX, // Special marker for device mappings (do not free)
             file_off:  0,
+            file_len:  0,
             cow:       false,
         });
 
@@ -307,6 +373,72 @@ impl AddressSpace {
             map_flags: MAP_ANONYMOUS | if is_shared { MAP_SHARED } else { MAP_PRIVATE },
             file_cap:  0,
             file_off:  0,
+            file_len:  0,
+            cow:       false,
+        });
+        true
+    }
+
+    /// Reserve a file-backed virtual range without reading any data.
+    ///
+    /// The first access to each page faults; `handle_user_page_fault` then
+    /// allocates the page and populates it from the backing file identified
+    /// by `file_cap` (bytes `file_off .. file_off + file_len`; anything past
+    /// that extent within the VMA is zero-filled — ELF BSS).  The mapping is
+    /// private: pages diverge from the file once written and fork CoW-shares
+    /// them like anonymous memory.
+    ///
+    /// Takes one reference on `file_cap` (released when the VMA is destroyed).
+    pub fn map_lazy_file(
+        &mut self,
+        virt: usize,
+        size: usize,
+        flags: PageFlags,
+        file_cap: usize,
+        file_off: u64,
+        file_len: u64,
+    ) -> bool {
+        if size == 0 || !is_file_backed(file_cap) { return false; }
+
+        let slot = match self.regions.iter().position(|r| r.is_none()) {
+            Some(i) => i,
+            None    => {
+                self.regions.push(None);
+                self.regions.len() - 1
+            }
+        };
+
+        let virt  = virt & !(PAGE_SIZE - 1);
+        let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+        let end   = match virt.checked_add(pages * PAGE_SIZE) {
+            Some(e) => e,
+            None    => return false,
+        };
+
+        for r in self.regions.iter().filter_map(|r| r.as_ref()) {
+            if virt < r.end && end > r.start {
+                return false;
+            }
+        }
+
+        let mut prot = PROT_READ;
+        if flags.contains(PageFlags::WRITABLE) { prot |= PROT_WRITE; }
+        if flags.contains(PageFlags::EXECUTE)  { prot |= PROT_EXEC; }
+
+        file_retain(file_cap);
+        self.regions[slot] = Some(VmaRegion {
+            start: virt,
+            end,
+            phys: 0,
+            flags,
+            lazy: true,
+            lazy_pages: Vec::new(),
+            lazy_count: 0,
+            prot,
+            map_flags: MAP_PRIVATE,
+            file_cap,
+            file_off,
+            file_len,
             cow:       false,
         });
         true
@@ -386,28 +518,104 @@ impl AddressSpace {
             return true;
         }
 
-        // Allocate one physical page for this fault.
-        let phys = match buddy_alloc(0) {
-            Some(p) => p,
-            None    => return false, // OOM
-        };
-        unsafe { (crate::phys_to_virt(phys) as *mut u8).write_bytes(0, PAGE_SIZE); }
+        // ── Populate the absent page ──────────────────────────────────────────
+        //
+        // Anonymous VMAs get one zeroed page.  File-backed VMAs (demand-paged
+        // exec image) additionally read the page's bytes from the backing
+        // file — and fault around: a run of following absent pages is
+        // populated in the same fault, so one gathered file read (which the
+        // filesystem turns into few multi-block device requests) replaces up
+        // to FAULT_AROUND_PAGES separate fault round trips.
+        const FAULT_AROUND_PAGES: usize = 16;
 
-        // Map just the faulting page.
-        let mapped = unsafe {
-            map_page(page_table_root, page_va, phys, region.flags)
+        let region_pages = (region.end - region.start) / PAGE_SIZE;
+        let file_backed  = is_file_backed(region.file_cap);
+
+        let window = if file_backed {
+            let mut n = 1usize;
+            while n < FAULT_AROUND_PAGES
+                && page_idx + n < region_pages
+                && region.lazy_pages.get(page_idx + n).copied().unwrap_or(0) == 0
+            {
+                n += 1;
+            }
+            n
+        } else {
+            1
         };
-        if !mapped {
-            buddy_free(phys, 0);
-            return false;
+
+        // One gathered read for the window's file bytes (window tails past
+        // the file extent are BSS and stay zero).
+        let mut bounce: Vec<u8> = Vec::new();
+        let mut read_len = 0usize;
+        if file_backed {
+            let win_off = (page_idx * PAGE_SIZE) as u64;
+            if win_off < region.file_len {
+                read_len = ((region.file_len - win_off) as usize).min(window * PAGE_SIZE);
+                bounce = alloc::vec![0u8; read_len];
+                if !file_read(
+                    region.file_cap,
+                    region.file_off + win_off,
+                    bounce.as_mut_ptr(),
+                    read_len,
+                ) {
+                    return false;
+                }
+            }
         }
 
-        // Grow the tracking Vec to cover page_idx, then record the physical page.
-        if region.lazy_pages.len() <= page_idx {
-            region.lazy_pages.resize(page_idx + 1, 0);
+        if region.lazy_pages.len() < page_idx + window {
+            region.lazy_pages.resize(page_idx + window, 0);
         }
-        region.lazy_pages[page_idx] = phys;
-        region.lazy_count += 1;
+
+        for i in 0..window {
+            let idx = page_idx + i;
+            let phys = match buddy_alloc(0) {
+                Some(p) => p,
+                // OOM on a fault-around page is not a failure as long as the
+                // faulting page itself (i == 0) was populated.
+                None => return i > 0,
+            };
+            let dst = crate::phys_to_virt(phys) as *mut u8;
+            unsafe { dst.write_bytes(0, PAGE_SIZE); }
+            let copy_start = i * PAGE_SIZE;
+            if copy_start < read_len {
+                let n = (read_len - copy_start).min(PAGE_SIZE);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(bounce.as_ptr().add(copy_start), dst, n);
+                }
+            }
+            // AArch64: clean the D-cache for executable pages so the I-cache
+            // invalidate below refetches the freshly written bytes.
+            #[cfg(target_arch = "aarch64")]
+            if region.flags.contains(PageFlags::EXECUTE) {
+                unsafe {
+                    let mut line = dst as usize & !63;
+                    let end_a = dst as usize + PAGE_SIZE;
+                    while line < end_a {
+                        core::arch::asm!("dc cvac, {}", in(reg) line);
+                        line += 64;
+                    }
+                }
+            }
+            let mapped = unsafe {
+                map_page(page_table_root, region.start + idx * PAGE_SIZE, phys, region.flags)
+            };
+            if !mapped {
+                buddy_free(phys, 0);
+                return i > 0;
+            }
+            region.lazy_pages[idx] = phys;
+            region.lazy_count += 1;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if file_backed && region.flags.contains(PageFlags::EXECUTE) {
+            unsafe {
+                core::arch::asm!("ic iallu");
+                core::arch::asm!("isb");
+            }
+        }
 
         true
     }
@@ -478,6 +686,9 @@ impl AddressSpace {
                 // Whole VMA removed.
                 if !region.lazy && region.phys != 0 && region.file_cap != usize::MAX {
                     buddy_free(region.phys, pages_to_order((r_end - r_start) / PAGE_SIZE));
+                }
+                if is_file_backed(region.file_cap) {
+                    file_release(region.file_cap);
                 }
                 *slot = None;
             } else if clip_s == r_start {

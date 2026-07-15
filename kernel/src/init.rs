@@ -28,6 +28,10 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // error.
     ipc::init();
 
+    // Wire the mm crate's file-backed-VMA hooks to the kernel's exec-file
+    // registry (demand-paged exec reads ELF pages in from page faults).
+    crate::syscall::init_exec_file_backing();
+
     // ── In-Kernel Servers ──────────────────────────────────────────────────
     if let Some(vfs_port) = vfs_server::init(0) {
         crate::syscall::set_vfs_server_port(vfs_port);

@@ -223,6 +223,25 @@ pub fn fd_nonblock(pid: u32, fd: usize) -> bool {
     false
 }
 
+/// Transfer ownership of a mounted-file fd out of `pid`'s FD table.
+///
+/// Frees the fd slot WITHOUT proxying VFS_CLOSE to the mount, so the
+/// filesystem-side open file stays live; the caller (the kernel's
+/// demand-paged exec path) becomes responsible for closing it via the
+/// mount's port when the last reference goes away.  Returns the mount port
+/// and file id, or None if `fd` is not a MountedFile.
+pub fn steal_mounted_file(pid: u32, fd: usize) -> Option<(u32, u32)> {
+    let mut tbls = FD_TABLES.lock();
+    let tbl = find_tbl(pid, &mut *tbls)?;
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
+    if let VnodeKind::MountedFile { port, file_id } = tbl.fds[fd].kind {
+        tbl.fds[fd] = FdEntry::empty();
+        Some((port, file_id))
+    } else {
+        None
+    }
+}
+
 /// Identify the kind of a vnode from a process's FD table.
 pub fn vfs_get_node_kind(pid: u32, fd: usize) -> Option<VnodeKind> {
     let mut tbls = FD_TABLES.lock();
