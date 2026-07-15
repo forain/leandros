@@ -4,8 +4,8 @@
 //! restores them from `*new`, transferring execution to the new task.
 
 #[cfg(target_arch = "x86_64")]
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy)]
 pub struct CpuContext {
     pub rbx: u64,
     pub rbp: u64,
@@ -15,15 +15,30 @@ pub struct CpuContext {
     pub r15: u64,
     pub rsp: u64,
     pub fs_base: u64,
+    /// FXSAVE64 area (x87 + XMM0-15 + MXCSR), 16-byte aligned at offset 64.
+    ///
+    /// Preemptive switches (timer tick / resched IPI) interrupt a thread at
+    /// an arbitrary instruction where *every* XMM register may be live —
+    /// the SysV "caller-saved" convention only protects them across calls
+    /// the compiler can see. Without saving this state here, two SSE-using
+    /// threads scheduled on the same CPU silently corrupt each other's
+    /// vector registers (first seen as garbage pointers in MAME, whose
+    /// main + sound threads both run SSE memcpy concurrently).
+    pub fpu: [u8; 512],
 }
 
 #[cfg(target_arch = "aarch64")]
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy)]
 pub struct CpuContext {
     pub gregs: [u64; 12],
     pub sp:    u64,
     pub tpidr_el0: u64,
+    /// Full FP/SIMD state (q0-q31), 16-byte aligned at offset 112 — same
+    /// preemption rationale as the x86_64 `fpu` field above.
+    pub vregs: [u8; 512],
+    pub fpsr:  u64,
+    pub fpcr:  u64,
 }
 
 /// Saved CPU state on exception entry.
@@ -91,11 +106,19 @@ impl CpuContext {
     pub const fn zeroed() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
-            Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, fs_base: 0 }
+            // FXRSTOR64 validates the area, so a fresh task needs sane
+            // defaults: x87 FCW = 0x037F (all exceptions masked, 64-bit
+            // precision), MXCSR = 0x1F80 (all SSE exceptions masked).
+            // An all-zero MXCSR would UNMASK every SSE exception and the
+            // first float op after the first switch would raise #XM.
+            let mut fpu = [0u8; 512];
+            fpu[0] = 0x7F; fpu[1] = 0x03;   // FCW
+            fpu[24] = 0x80; fpu[25] = 0x1F; // MXCSR
+            Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, fs_base: 0, fpu }
         }
         #[cfg(target_arch = "aarch64")]
         {
-            Self { gregs: [0; 12], sp: 0, tpidr_el0: 0 }
+            Self { gregs: [0; 12], sp: 0, tpidr_el0: 0, vregs: [0; 512], fpsr: 0, fpcr: 0 }
         }
     }
 
@@ -224,6 +247,30 @@ cpu_switch_to:
     mrs  x9, tpidr_el0
     str  x9, [x0, #104]
 
+    // Full FP/SIMD state: a preempted thread can have any of q0-q31 live
+    // (AAPCS only makes v8-v15 callee-saved across visible calls). vregs
+    // starts at offset 112, fpsr/fpcr at 624/632 (see CpuContext).
+    stp  q0,  q1,  [x0, #112]
+    stp  q2,  q3,  [x0, #144]
+    stp  q4,  q5,  [x0, #176]
+    stp  q6,  q7,  [x0, #208]
+    stp  q8,  q9,  [x0, #240]
+    stp  q10, q11, [x0, #272]
+    stp  q12, q13, [x0, #304]
+    stp  q14, q15, [x0, #336]
+    stp  q16, q17, [x0, #368]
+    stp  q18, q19, [x0, #400]
+    stp  q20, q21, [x0, #432]
+    stp  q22, q23, [x0, #464]
+    stp  q24, q25, [x0, #496]
+    stp  q26, q27, [x0, #528]
+    stp  q28, q29, [x0, #560]
+    stp  q30, q31, [x0, #592]
+    mrs  x9, fpsr
+    str  x9, [x0, #624]
+    mrs  x9, fpcr
+    str  x9, [x0, #632]
+
     ldp  x19, x20, [x1, #0]
     ldp  x21, x22, [x1, #16]
     ldp  x23, x24, [x1, #32]
@@ -234,6 +281,27 @@ cpu_switch_to:
     mov  sp, x9
     ldr  x9, [x1, #104]
     msr  tpidr_el0, x9
+
+    ldp  q0,  q1,  [x1, #112]
+    ldp  q2,  q3,  [x1, #144]
+    ldp  q4,  q5,  [x1, #176]
+    ldp  q6,  q7,  [x1, #208]
+    ldp  q8,  q9,  [x1, #240]
+    ldp  q10, q11, [x1, #272]
+    ldp  q12, q13, [x1, #304]
+    ldp  q14, q15, [x1, #336]
+    ldp  q16, q17, [x1, #368]
+    ldp  q18, q19, [x1, #400]
+    ldp  q20, q21, [x1, #432]
+    ldp  q22, q23, [x1, #464]
+    ldp  q24, q25, [x1, #496]
+    ldp  q26, q27, [x1, #528]
+    ldp  q28, q29, [x1, #560]
+    ldp  q30, q31, [x1, #592]
+    ldr  x9, [x1, #624]
+    msr  fpsr, x9
+    ldr  x9, [x1, #632]
+    msr  fpcr, x9
 
     ret
 .size cpu_switch_to, .-cpu_switch_to
@@ -258,6 +326,11 @@ cpu_switch_to:
     mov   [rdi + 32], r14
     mov   [rdi + 40], r15
     mov   [rdi + 48], rsp
+
+    // Full x87/SSE state: live XMM registers of a preempted thread must
+    // survive the switch (see CpuContext::fpu). Area is 16-byte aligned.
+    fxsave64  [rdi + 64]
+    fxrstor64 [rsi + 64]
 
     mov   rbx, [rsi + 0]
     mov   rbp, [rsi + 8]

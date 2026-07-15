@@ -346,10 +346,17 @@ impl AddressSpace {
 
         let lazy_phys = region.lazy_pages.get(page_idx).copied().unwrap_or(0);
         if lazy_phys != 0 {
-            // Page already present. The only fault we can legitimately
-            // service here is a write to a CoW-shared page; anything else
-            // is a real protection violation.
-            if !(is_write && region.cow) { return false; }
+            // Page already present. A write to a CoW-shared page needs a
+            // promotion (below). Any other fault on a present page is most
+            // likely a *concurrent* fault: a sibling thread touched the same
+            // fresh page, lost the race on the per-AS fault lock, and by the
+            // time it got here the winner had already mapped the page. If
+            // the region's protections allow the access, resume — the retry
+            // will succeed. Only an access the region forbids is a real
+            // protection violation.
+            if !(is_write && region.cow) {
+                return !is_write || (region.prot & PROT_WRITE) != 0;
+            }
 
             let refcount = crate::pageref::get(lazy_phys);
             let new_phys = if refcount <= 1 {

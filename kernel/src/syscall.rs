@@ -2518,10 +2518,14 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
             let pid = current_pid();
             let msg = make_vfs_msg(vfs::VFS_READ, &[fd as u64, buf_ptr as u64, count as u64]);
             // Pipe read: VFS returns -EAGAIN when write end is open but empty.
-            // Block (yield-loop) until data arrives or the write end closes.
+            // Block (yield-loop) until data arrives or the write end closes —
+            // but only for blocking fds. O_NONBLOCK readers (e.g. an evdev
+            // poll loop) must see EAGAIN, or a single read() call spins here
+            // forever while the device stays empty.
+            let nonblock = vfs::fd_nonblock(pid, fd);
             loop {
                 let n = vfs_reply_val(&vfs::handle(&msg, pid));
-                if n != -11 { return n; }
+                if n != -11 || nonblock { return n; }
                 irq_window();
 
                 yield_now("sys_read_vfs");

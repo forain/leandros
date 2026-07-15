@@ -208,6 +208,13 @@ def main():
     if os.path.exists(p):
         root_files.append(("car-horn.wav", p, 0o100644))
 
+    # MAME ROM sets as zips in / — run with `mame -rompath / <game>`.
+    # A zip sidesteps this script's flat directory model (no nested
+    # /roms/<game>/ dirs needed); MAME's util/unzip.cpp reads it directly.
+    p = "../mame/roms/captcomm.zip"
+    if os.path.exists(p):
+        root_files.append(("captcomm.zip", p, 0o100644))
+
     # /etc/fstab — vdb is the root F2FS volume userland/init already mounts
     # via a hardcoded bootstrap call before pivot_root (chicken-and-egg: fstab
     # itself lives on that filesystem); vdc is the second data disk QEMU has
@@ -229,8 +236,12 @@ def main():
     for name, path, mode in bin_files + lib_files + root_files + etc_files:
         size = content_size(path)
         k = (size + BLOCK_SIZE - 1) // BLOCK_SIZE
-        # Inode block + data blocks + potential direct nodes (1 per 1018 blocks)
-        required_blocks += k + 1 + (k + 1017) // 1018
+        # Inode block + data blocks + potential direct nodes.
+        # ADDRS_PER_DNODE is 1019 in this simplified F2FS: the node footer
+        # sits at byte 4076 (5xu32 = 20 bytes), leaving 4076/4 = 1019 slots.
+        # This MUST match servers/f2fs/src/lib.rs (NODE_FOOTER_OFF / 4);
+        # a 1018 here shifted every block past ~7.9 MB when read back.
+        required_blocks += k + 1 + (k + 1018) // 1019
     # Reserve two full segments beyond the statically-populated content for the
     # runtime node/data allocator curseg pointers (see below) so first writes
     # never land on blocks already occupied by pre-populated files/directories.
@@ -316,8 +327,8 @@ def main():
                 next_blk += 1
                 i_nids[0] = dnode_nid
                 
-                dnode_blks = rem_blks[:1018]
-                rem_blks = rem_blks[1018:]
+                dnode_blks = rem_blks[:1019]
+                rem_blks = rem_blks[1019:]
                 
                 dnode_bytes = bytearray(4096)
                 for idx, addr in enumerate(dnode_blks):
@@ -338,8 +349,8 @@ def main():
                 next_blk += 1
                 i_nids[1] = dnode_nid
                 
-                dnode_blks = rem_blks[:1018]
-                rem_blks = rem_blks[1018:]
+                dnode_blks = rem_blks[:1019]
+                rem_blks = rem_blks[1019:]
                 
                 dnode_bytes = bytearray(4096)
                 for idx, addr in enumerate(dnode_blks):
@@ -363,8 +374,8 @@ def main():
                 ind_bytes = bytearray(4096)
                 chunk_idx = 0
                 while rem_blks:
-                    chunk_blks = rem_blks[:1018]
-                    rem_blks = rem_blks[1018:]
+                    chunk_blks = rem_blks[:1019]
+                    rem_blks = rem_blks[1019:]
                     
                     dn_nid = next_nid
                     next_nid += 1

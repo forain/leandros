@@ -207,6 +207,22 @@ pub enum VnodeKind {
     MountedFile { port: u32, file_id: u32 },
 }
 
+/// True if `fd` was opened with (or fcntl'd to) O_NONBLOCK. The kernel's
+/// sys_read EAGAIN retry loop consults this: blocking fds yield-and-retry,
+/// non-blocking fds must surface EAGAIN to the caller (POSIX). Without this
+/// check a non-blocking read of an empty device (e.g. MAME polling
+/// /dev/input/event0) never returns and the caller spins in-kernel forever.
+pub fn fd_nonblock(pid: u32, fd: usize) -> bool {
+    const O_NONBLOCK: u32 = 0o4000;
+    let mut tbls = FD_TABLES.lock();
+    if let Some(tbl) = find_tbl(pid, &mut *tbls) {
+        if fd < MAX_FDS && tbl.fds[fd].in_use {
+            return tbl.fds[fd].flags & O_NONBLOCK != 0;
+        }
+    }
+    false
+}
+
 /// Identify the kind of a vnode from a process's FD table.
 pub fn vfs_get_node_kind(pid: u32, fd: usize) -> Option<VnodeKind> {
     let mut tbls = FD_TABLES.lock();

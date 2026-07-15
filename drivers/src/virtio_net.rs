@@ -421,9 +421,12 @@ impl VirtioNetDevice {
             }
 
             let slot = q.last_used_idx as usize % q.size as usize;
-            let elem = &(*q.used).ring[slot];
-            let desc_id = elem.id as usize;
-            let len = elem.len as usize;
+            // The VirtqUsed overlay declares ring[32] but the real ring has
+            // q.size (up to 256) entries; index via raw pointer like submit()
+            // does, or slot >= 32 trips the array bounds check and panics.
+            let elem_ptr = (q.used as usize + 4 + slot * 8) as *const VirtqUsedElem;
+            let desc_id = core::ptr::addr_of!((*elem_ptr).id).read_volatile() as usize;
+            let len = core::ptr::addr_of!((*elem_ptr).len).read_volatile() as usize;
 
             let page_virt = mm::phys_to_virt(self.rx_buffers_phys[desc_id]) as *const u8;
             if len > self.hdr_len {
