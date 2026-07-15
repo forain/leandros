@@ -170,9 +170,11 @@ pub fn serial_print_hex(n: usize) {
 #[no_mangle]
 pub extern "C" fn kernel_set_console_enabled(enabled: bool) {
     KERNEL_CONSOLE_ENABLED.store(enabled, core::sync::atomic::Ordering::SeqCst);
-    serial_print_str("[KERN] Console enabled = ");
-    crate::print_number(if enabled { 1 } else { 0 });
-    serial_print_str("\n");
+    if drivers::pci::RENDER_DEBUG {
+        serial_print_str("[KERN] Console enabled = ");
+        crate::print_number(if enabled { 1 } else { 0 });
+        serial_print_str("\n");
+    }
 }
 #[no_mangle]
 pub extern "C" fn serial_print(s: *const u8, len: usize) {

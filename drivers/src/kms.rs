@@ -100,7 +100,7 @@ impl KmsDriver {
         };
 
         if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-            crate::pci::serial_debug("[KMS] VirtIO GPU available\n");
+            crate::pci::rdebug("[KMS] VirtIO GPU available\n");
 
             if gpu.scanout_configured() {
                 // The early boot console (direct-boot path) already brought up
@@ -114,15 +114,15 @@ impl KmsDriver {
                     mode.width = width;
                     mode.height = height;
                 }
-                crate::pci::serial_debug("[KMS] Reusing existing VirtIO GPU console scanout\n");
+                crate::pci::rdebug("[KMS] Reusing existing VirtIO GPU console scanout\n");
             } else if let Some((limine_phys, width, height, _pitch)) = get_hardware_fb_info() {
-                crate::pci::serial_debug("[KMS] Limine FB at phys=");
-                crate::pci::serial_debug_hex(limine_phys as u32);
-                crate::pci::serial_debug(" ");
-                crate::pci::serial_debug_hex(width);
-                crate::pci::serial_debug("x");
-                crate::pci::serial_debug_hex(height);
-                crate::pci::serial_debug("\n");
+                crate::pci::rdebug("[KMS] Limine FB at phys=");
+                crate::pci::rdebug_hex(limine_phys as u32);
+                crate::pci::rdebug(" ");
+                crate::pci::rdebug_hex(width);
+                crate::pci::rdebug("x");
+                crate::pci::rdebug_hex(height);
+                crate::pci::rdebug("\n");
 
                 let fb_bytes = (width as usize) * (height as usize) * 4;
 
@@ -147,9 +147,9 @@ impl KmsDriver {
                         core::ptr::copy_nonoverlapping(src, ram_virt, fb_bytes);
                     }
 
-                    crate::pci::serial_debug("[KMS] RAM-backed FB at phys=");
-                    crate::pci::serial_debug_hex(ram_phys as u32);
-                    crate::pci::serial_debug("\n");
+                    crate::pci::rdebug("[KMS] RAM-backed FB at phys=");
+                    crate::pci::rdebug_hex(ram_phys as u32);
+                    crate::pci::rdebug("\n");
 
                     // Back resource 1 with the new RAM buffer and set it as the scanout
                     gpu.create_resource_2d(1, width, height);
@@ -170,11 +170,11 @@ impl KmsDriver {
 
                     mode.width  = width;
                     mode.height = height;
-                    crate::pci::serial_debug("[KMS] Resource 1 configured with RAM backing\n");
+                    crate::pci::rdebug("[KMS] Resource 1 configured with RAM backing\n");
                 } else {
                     // Out of contiguous RAM — fall back to Limine FB address.
                     // May produce a black scanout on virtio-vga but won't crash.
-                    crate::pci::serial_debug("[KMS] RAM alloc failed, falling back to Limine FB\n");
+                    crate::pci::rdebug("[KMS] RAM alloc failed, falling back to Limine FB\n");
                     gpu.create_resource_2d(1, width, height);
                     gpu.attach_backing(1, limine_phys, fb_bytes as u32);
                     gpu.set_scanout(1, width, height);
@@ -183,12 +183,12 @@ impl KmsDriver {
                     mode.height = height;
                 }
             } else {
-                crate::pci::serial_debug("[KMS] No Limine FB — running without console surface\n");
+                crate::pci::rdebug("[KMS] No Limine FB — running without console surface\n");
             }
         }
 
         self.current_mode = Some(mode);
-        crate::pci::serial_debug("[KMS] detect_and_configure done\n");
+        crate::pci::rdebug("[KMS] detect_and_configure done\n");
         Ok(mode)
     }
 
@@ -227,9 +227,9 @@ impl Driver for KmsDriver {
 }
 
 pub fn init_kms() -> Result<DisplayMode, DriverError> {
-    crate::pci::serial_debug("[KMS] init_kms starting, locking KMS_DRIVER\n");
+    crate::pci::rdebug("[KMS] init_kms starting, locking KMS_DRIVER\n");
     let mut kms = KMS_DRIVER.lock();
-    crate::pci::serial_debug("[KMS] KMS_DRIVER locked, calling detect_and_configure\n");
+    crate::pci::rdebug("[KMS] KMS_DRIVER locked, calling detect_and_configure\n");
     kms.detect_and_configure()
 }
 

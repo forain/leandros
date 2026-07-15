@@ -300,11 +300,11 @@ impl DrmDevice {
         // permanently pointed at it.
         for plane_state in state.plane_states {
             if self.fb_integration {
-                crate::pci::serial_debug("[DRM] atomic_commit: calling perform_software_scaling\n");
+                crate::pci::rdebug("[DRM] atomic_commit: calling perform_software_scaling\n");
                 match self.perform_software_scaling(&plane_state) {
-                    Ok(()) => crate::pci::serial_debug("[DRM] scaling OK\n"),
+                    Ok(()) => crate::pci::rdebug("[DRM] scaling OK\n"),
                     Err(_) => {
-                        crate::pci::serial_debug("[DRM] scaling FAILED\n");
+                        crate::pci::rdebug("[DRM] scaling FAILED\n");
                         return Err(DriverError::Io);
                     }
                 }
@@ -312,18 +312,18 @@ impl DrmDevice {
                     let (_, hw_width, hw_height, _) = match crate::framebuffer::get_hardware_fb_info() {
                         Some(info) => info,
                         None => {
-                            crate::pci::serial_debug("[DRM] gpu flush: no hw fb info\n");
+                            crate::pci::rdebug("[DRM] gpu flush: no hw fb info\n");
                             return Err(DriverError::NotFound);
                         }
                     };
-                    crate::pci::serial_debug("[DRM] calling gpu.flush\n");
+                    crate::pci::rdebug("[DRM] calling gpu.flush\n");
                     if gpu.flush(1, 0, 0, hw_width, hw_height) {
-                        crate::pci::serial_debug("[DRM] gpu.flush OK\n");
+                        crate::pci::rdebug("[DRM] gpu.flush OK\n");
                     } else {
-                        crate::pci::serial_debug("[DRM] gpu.flush FAILED\n");
+                        crate::pci::rdebug("[DRM] gpu.flush FAILED\n");
                     }
                 } else {
-                    crate::pci::serial_debug("[DRM] no VirtIO GPU available for flush\n");
+                    crate::pci::rdebug("[DRM] no VirtIO GPU available for flush\n");
                 }
             }
 
@@ -449,33 +449,33 @@ pub static DRM_DEVICE: Mutex<DrmDevice> = Mutex::new(DrmDevice {
 
 /// Initialize DRM device
 pub fn init_drm() -> Result<(), DriverError> {
-    crate::pci::serial_debug("[DRM] init_drm starting\n");
+    crate::pci::rdebug("[DRM] init_drm starting\n");
     {
-        crate::pci::serial_debug("[DRM] Locking DRM_DEVICE for new()...\n");
+        crate::pci::rdebug("[DRM] Locking DRM_DEVICE for new()...\n");
         let mut device = DRM_DEVICE.lock();
-        crate::pci::serial_debug("[DRM] DRM_DEVICE locked, calling DrmDevice::new()\n");
+        crate::pci::rdebug("[DRM] DRM_DEVICE locked, calling DrmDevice::new()\n");
         *device = DrmDevice::new();
-        crate::pci::serial_debug("[DRM] DrmDevice::new() returned, dropping lock\n");
+        crate::pci::rdebug("[DRM] DrmDevice::new() returned, dropping lock\n");
     }
-    crate::pci::serial_debug("[DRM] Device object created and lock dropped\n");
+    crate::pci::rdebug("[DRM] Device object created and lock dropped\n");
 
     // Try to integrate with existing drivers (WITHOUT holding the lock)
     // to avoid deadlocks with ModeSet::set_display_mode
-    crate::pci::serial_debug("[DRM] Integrating with KMS...\n");
+    crate::pci::rdebug("[DRM] Integrating with KMS...\n");
     let kms_res = crate::kms::init_kms();
     if kms_res.is_ok() {
-        crate::pci::serial_debug("[DRM] KMS integration successful, locking DRM_DEVICE to set flag\n");
+        crate::pci::rdebug("[DRM] KMS integration successful, locking DRM_DEVICE to set flag\n");
         DRM_DEVICE.lock().kms_integration = true;
-        crate::pci::serial_debug("[DRM] KMS flag set and lock dropped\n");
+        crate::pci::rdebug("[DRM] KMS flag set and lock dropped\n");
     } else {
-        crate::pci::serial_debug("[DRM] KMS integration failed\n");
+        crate::pci::rdebug("[DRM] KMS integration failed\n");
     }
     
-    crate::pci::serial_debug("[DRM] Integrating with FB, locking DRM_DEVICE to set flag\n");
+    crate::pci::rdebug("[DRM] Integrating with FB, locking DRM_DEVICE to set flag\n");
     DRM_DEVICE.lock().fb_integration = true;
-    crate::pci::serial_debug("[DRM] FB flag set and lock dropped\n");
+    crate::pci::rdebug("[DRM] FB flag set and lock dropped\n");
     
-    crate::pci::serial_debug("[DRM] init_drm finished\n");
+    crate::pci::rdebug("[DRM] init_drm finished\n");
 
     Ok(())
 }

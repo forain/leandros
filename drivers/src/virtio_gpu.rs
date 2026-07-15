@@ -269,7 +269,7 @@ struct VirtioGpuTransferToHost3d {
 impl VirtioGpuDevice {
     pub fn new() -> Option<Self> {
         let dev = find_device(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_GPU)?;
-        crate::pci::serial_debug("[GPU] Found VirtIO GPU device\n");
+        crate::pci::rdebug("[GPU] Found VirtIO GPU device\n");
 
         // Enable PCI Memory Space (bit 1) and Bus Master (bit 2) in the command
         // register.  Without these the device decodes no MMIO BAR accesses and
@@ -309,12 +309,12 @@ impl VirtioGpuDevice {
                             };
 
                             if bar64 != 0 {
-                                crate::pci::serial_debug("[GPU] Mapping BAR ");
-                                crate::pci::serial_debug_hex(bar_idx as u32);
-                                crate::pci::serial_debug(" at ");
-                                crate::pci::serial_debug_hex((bar64 >> 32) as u32);
-                                crate::pci::serial_debug_hex(bar64 as u32);
-                                crate::pci::serial_debug("\n");
+                                crate::pci::rdebug("[GPU] Mapping BAR ");
+                                crate::pci::rdebug_hex(bar_idx as u32);
+                                crate::pci::rdebug(" at ");
+                                crate::pci::rdebug_hex((bar64 >> 32) as u32);
+                                crate::pci::rdebug_hex(bar64 as u32);
+                                crate::pci::rdebug("\n");
 
                                 let virt = mm::paging::map_kernel_device(
                                     bar64 as usize + offset as usize,
@@ -324,17 +324,17 @@ impl VirtioGpuDevice {
                                     
                                 match cfg_type {
                                     VIRTIO_PCI_CAP_COMMON_CFG => {
-                                        crate::pci::serial_debug("[GPU] Found COMMON_CFG\n");
+                                        crate::pci::rdebug("[GPU] Found COMMON_CFG\n");
                                         common_cfg = virt as *mut VirtioPciCommonCfg;
                                     },
                                     VIRTIO_PCI_CAP_NOTIFY_CFG => {
-                                        crate::pci::serial_debug("[GPU] Found NOTIFY_CFG\n");
+                                        crate::pci::rdebug("[GPU] Found NOTIFY_CFG\n");
                                         notify_off_multiplier = pci_read_config_32(dev.bus, dev.dev, dev.func, cap_ptr + 16);
                                         notify_cfg = virt as *mut u32;
                                     },
                                     VIRTIO_PCI_CAP_ISR_CFG => _isr_cfg = virt as *mut u8,
                                     VIRTIO_PCI_CAP_DEVICE_CFG => {
-                                        crate::pci::serial_debug("[GPU] Found DEVICE_CFG\n");
+                                        crate::pci::rdebug("[GPU] Found DEVICE_CFG\n");
                                         device_cfg = virt as *mut u8;
                                     },
                                     _ => {}
@@ -348,7 +348,7 @@ impl VirtioGpuDevice {
         }
 
         if common_cfg.is_null() || notify_cfg.is_null() || device_cfg.is_null() {
-            crate::pci::serial_debug("[GPU] Missing required VirtIO capabilities\n");
+            crate::pci::rdebug("[GPU] Missing required VirtIO capabilities\n");
             return None;
         }
 
@@ -394,7 +394,7 @@ impl VirtioGpuDevice {
             // 7. Set DRIVER_OK status bit
             (*self.common_cfg).device_status |= VIRTIO_STATUS_DRIVER_OK;
         }
-        crate::pci::serial_debug("[GPU] VirtIO GPU initialized\n");
+        crate::pci::rdebug("[GPU] VirtIO GPU initialized\n");
     }
 
     unsafe fn setup_queue(&mut self, id: u16) -> Option<VirtioQueue> {
@@ -490,9 +490,9 @@ impl VirtioGpuDevice {
             }
 
             if timeout == 0 {
-                crate::pci::serial_debug("[GPU] Command ");
-                crate::pci::serial_debug_hex(hdr_type);
-                crate::pci::serial_debug(" TIMEOUT!\n");
+                crate::pci::rdebug("[GPU] Command ");
+                crate::pci::rdebug_hex(hdr_type);
+                crate::pci::rdebug(" TIMEOUT!\n");
                 return Err(());
             }
 
@@ -506,9 +506,9 @@ impl VirtioGpuDevice {
             mm::buddy::free(resp_phys, 0);
 
             if resp_hdr.type_ != 0x1100 && resp_hdr.type_ != 0x1101 {
-                crate::pci::serial_debug("[GPU] Command failed with resp ");
-                crate::pci::serial_debug_hex(resp_hdr.type_);
-                crate::pci::serial_debug("\n");
+                crate::pci::rdebug("[GPU] Command failed with resp ");
+                crate::pci::rdebug_hex(resp_hdr.type_);
+                crate::pci::rdebug("\n");
                 return Err(());
             }
         }
@@ -745,7 +745,7 @@ impl VirtioGpuDevice {
             }
 
             if timeout == 0 {
-                crate::pci::serial_debug("[GPU] Command timeout!\n");
+                crate::pci::rdebug("[GPU] Command timeout!\n");
                 return Err(());
             }
             q.last_used_idx = q.last_used_idx.wrapping_add(1);
@@ -835,15 +835,15 @@ pub fn setup_console_framebuffer(default_width: u32, default_height: u32) -> Opt
     // Prefer the display's reported mode; fall back to the caller's default.
     let (width, height) = match gpu.get_display_info() {
         Some((w, h)) => {
-            crate::pci::serial_debug("[GPU] Preferred display mode ");
-            crate::pci::serial_debug_hex(w);
-            crate::pci::serial_debug("x");
-            crate::pci::serial_debug_hex(h);
-            crate::pci::serial_debug("\n");
+            crate::pci::rdebug("[GPU] Preferred display mode ");
+            crate::pci::rdebug_hex(w);
+            crate::pci::rdebug("x");
+            crate::pci::rdebug_hex(h);
+            crate::pci::rdebug("\n");
             (w, h)
         }
         None => {
-            crate::pci::serial_debug("[GPU] GET_DISPLAY_INFO unavailable; using default mode\n");
+            crate::pci::rdebug("[GPU] GET_DISPLAY_INFO unavailable; using default mode\n");
             (default_width, default_height)
         }
     };
@@ -863,15 +863,15 @@ pub fn setup_console_framebuffer(default_width: u32, default_height: u32) -> Opt
     unsafe { core::ptr::write_bytes(virt as *mut u8, 0, fb_bytes); }
 
     if !gpu.create_resource_2d(1, width, height) {
-        crate::pci::serial_debug("[GPU] create_resource_2d failed\n");
+        crate::pci::rdebug("[GPU] create_resource_2d failed\n");
         return None;
     }
     if !gpu.attach_backing(1, phys as u64, fb_bytes as u32) {
-        crate::pci::serial_debug("[GPU] attach_backing failed\n");
+        crate::pci::rdebug("[GPU] attach_backing failed\n");
         return None;
     }
     if !gpu.set_scanout(1, width, height) {
-        crate::pci::serial_debug("[GPU] set_scanout failed\n");
+        crate::pci::rdebug("[GPU] set_scanout failed\n");
         return None;
     }
     gpu.flush(1, 0, 0, width, height);

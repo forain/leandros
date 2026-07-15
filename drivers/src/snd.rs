@@ -104,9 +104,9 @@ impl VirtioSnd {
     }
 
     unsafe fn init_device(&mut self) -> Result<(), DriverError> {
-        pci::serial_debug("[SND] Probing VirtIO Sound...\n");
+        pci::rdebug("[SND] Probing VirtIO Sound...\n");
         let dev = pci::find_device(VIRTIO_SND_VENDOR_ID, VIRTIO_SND_DEVICE_ID).ok_or_else(|| {
-            pci::serial_debug("[SND] Device not found in PCI scan\n");
+            pci::rdebug("[SND] Device not found in PCI scan\n");
             DriverError::NotFound
         })?;
         
@@ -119,10 +119,10 @@ impl VirtioSnd {
 
         self.parse_caps(&dev)?;
         if self.common_cfg == 0 { 
-            pci::serial_debug("[SND] common_cfg not found!\n");
+            pci::rdebug("[SND] common_cfg not found!\n");
             return Err(DriverError::NotFound); 
         }
-        pci::serial_debug("[SND] common_cfg mapped at "); pci::serial_debug_hex(self.common_cfg as u32); pci::serial_debug("\n");
+        pci::rdebug("[SND] common_cfg mapped at "); pci::rdebug_hex(self.common_cfg as u32); pci::rdebug("\n");
 
         self.write_common_8(20, 0); // Reset
         let mut status = 3; // ACKNOWLEDGE | DRIVER
@@ -144,7 +144,7 @@ impl VirtioSnd {
         self.write_common_8(20, status);
 
         self.initialized = true;
-        pci::serial_debug("[SND] Initialized successfully.\n");
+        pci::rdebug("[SND] Initialized successfully.\n");
         Ok(())
     }
 
@@ -222,8 +222,8 @@ impl VirtioSnd {
 
     pub fn reconfigure_stream(&mut self, stream_id: u32, freq: u32, channels: u8) {
         let rate = match freq { 11025=>2, 22050=>4, 44100=>6, 48000=>7, _=>6 };
-        pci::serial_debug("[SND] Reconfiguring stream 0: freq="); pci::serial_debug_hex(freq);
-        pci::serial_debug(" rate="); pci::serial_debug_hex(rate as u32); pci::serial_debug("\n");
+        pci::rdebug("[SND] Reconfiguring stream 0: freq="); pci::rdebug_hex(freq);
+        pci::rdebug(" rate="); pci::rdebug_hex(rate as u32); pci::rdebug("\n");
 
         if self.stream_active {
             self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_STOP }, stream_id });
@@ -241,7 +241,7 @@ impl VirtioSnd {
 
     fn send_control_cmd<T>(&mut self, cmd: &T) {
         let code = unsafe { *(cmd as *const T as *const u32) };
-        pci::serial_debug("[SND] CTRL CMD "); pci::serial_debug_hex(code); pci::serial_debug(" -> ");
+        pci::rdebug("[SND] CTRL CMD "); pci::rdebug_hex(code); pci::rdebug(" -> ");
         
         let vq_id;
         let notify_off;
@@ -273,13 +273,13 @@ impl VirtioSnd {
             let vq = self.vqs[0].as_mut().unwrap();
             let mut timeout = 5000000;
             while vq.last_used_idx == core::ptr::read_volatile(&(*vq.used).idx) && timeout > 0 { core::hint::spin_loop(); timeout -= 1; }
-            if timeout == 0 { pci::serial_debug("TIMEOUT\n"); return; }
+            if timeout == 0 { pci::rdebug("TIMEOUT\n"); return; }
             while vq.last_used_idx != core::ptr::read_volatile(&(*vq.used).idx) {
                 vq.last_used_idx = vq.last_used_idx.wrapping_add(1);
                 vq.num_free += 2;
             }
             let s = core::ptr::read_volatile(&(*self.persistent).ctrl_status.code);
-            pci::serial_debug_hex(s); pci::serial_debug("\n");
+            pci::rdebug_hex(s); pci::rdebug("\n");
         }
     }
 
@@ -329,7 +329,7 @@ impl VirtioSnd {
         
         self.tx_count += 1;
         if self.tx_count % 1000 == 0 {
-            pci::serial_debug("[SND] TX pkts: "); pci::serial_debug_hex(self.tx_count); pci::serial_debug("\n");
+            pci::rdebug("[SND] TX pkts: "); pci::rdebug_hex(self.tx_count); pci::rdebug("\n");
         }
         chunk_len
     }

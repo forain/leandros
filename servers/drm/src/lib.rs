@@ -13,12 +13,14 @@ use vfs_server;
 extern "C" { fn arch_serial_putc(c: u8); }
 
 fn serial_debug(msg: &str) {
+    if !drivers::pci::RENDER_DEBUG { return; }
     for &b in msg.as_bytes() {
         unsafe { arch_serial_putc(b); }
     }
 }
 
 fn serial_debug_hex(v: u32) {
+    if !drivers::pci::RENDER_DEBUG { return; }
     serial_debug("0x");
     for i in (0..8).rev() {
         let n = (v >> (i * 4)) & 0xF;

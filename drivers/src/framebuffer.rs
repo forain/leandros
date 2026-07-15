@@ -32,9 +32,9 @@ pub fn set_boot_framebuffer(base: u64, width: u32, height: u32, pitch: u32) {
 
 /// Get hardware framebuffer information for DRM integration.
 pub fn get_hardware_fb_info() -> Option<(u64, u32, u32, u32)> {
-    crate::pci::serial_debug("[FB] Locking BOOT_FB...\n");
+    crate::pci::rdebug("[FB] Locking BOOT_FB...\n");
     let lock = BOOT_FB.lock();
-    crate::pci::serial_debug("[FB] BOOT_FB locked\n");
+    crate::pci::rdebug("[FB] BOOT_FB locked\n");
     lock.as_ref().map(|fb| (fb.base, fb.width, fb.height, fb.pitch))
 }
 

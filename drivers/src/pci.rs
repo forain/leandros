@@ -91,6 +91,28 @@ pub fn serial_debug_hex_64(v: u64) {
     }
 }
 
+/// Verbose per-frame/per-sample serial logging for the render and audio hot
+/// paths (DRM, DRM-IF, DRM-SRV, KERN, FB, GPU, KMS, SND, PW). Off by default:
+/// these call sites run on every frame or audio buffer, and the per-byte
+/// serial port writes measurably slow rendering and sound. Flip to `true`
+/// locally to re-enable while debugging those subsystems.
+pub const RENDER_DEBUG: bool = false;
+
+#[inline(always)]
+pub fn rdebug(msg: &str) {
+    if RENDER_DEBUG { serial_debug(msg); }
+}
+
+#[inline(always)]
+pub fn rdebug_hex(v: u32) {
+    if RENDER_DEBUG { serial_debug_hex(v); }
+}
+
+#[inline(always)]
+pub fn rdebug_hex_64(v: u64) {
+    if RENDER_DEBUG { serial_debug_hex_64(v); }
+}
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn pci_read_config_8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
     let val = pci_read_config(bus, dev, func, offset);

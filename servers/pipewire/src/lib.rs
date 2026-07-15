@@ -95,9 +95,9 @@ fn err_reply(e: i32) -> Message { make_reply(e as i64) }
 pub fn init() -> Result<u32, i32> {
     let mut state = STATE.lock();
     
-    pci::serial_debug("[PW] Initializing...\n");
+    pci::rdebug("[PW] Initializing...\n");
     if let Err(_) = state.snd_driver.probe() {
-        pci::serial_debug("[PW] Sound driver probe failed\n");
+        pci::rdebug("[PW] Sound driver probe failed\n");
         return Err(-19); // ENODEV
     }
 
@@ -111,9 +111,9 @@ pub fn init() -> Result<u32, i32> {
     net_server::force_bind_unix(PW_SOCKET_PATH, server_port);
 
     state.initialized = true;
-    pci::serial_debug("[PW] Ready on port ");
-    pci::serial_debug_hex(server_port);
-    pci::serial_debug("\n");
+    pci::rdebug("[PW] Ready on port ");
+    pci::rdebug_hex(server_port);
+    pci::rdebug("\n");
     Ok(server_port)
 }
 
