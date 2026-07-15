@@ -2133,6 +2133,13 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         Err(_) => { drop(new_as); return -8; }
     };
 
+    // elf::load has copied every segment into the new address space, so the
+    // VFS read buffer is no longer referenced.  Free it explicitly here:
+    // replace_address_space below never returns, so destructors of locals
+    // still alive at that call never run, and this buffer is the size of the
+    // whole ELF (hundreds of MB for large binaries).
+    drop(vfs_elf_data);
+
     // Map user stack (read+write, eager so virt_to_phys works immediately).
     let stack_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE;
     if !new_as.map(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, stack_flags) {
