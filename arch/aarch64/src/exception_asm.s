@@ -16,7 +16,7 @@ __exception_vectors:
     ventry exc_unexpected
 
     // Current EL with SPx
-    ventry exc_el1_sync
+    ventry exc_el1_sync_capture
     ventry exc_el1_irq
     ventry exc_unexpected
     ventry exc_unexpected
@@ -34,6 +34,66 @@ __exception_vectors:
     ventry exc_unexpected
 
 // ── Exception Handlers ────────────────────────────────────────────────────────
+
+// DIAGNOSTIC (HVF fork-race, see hvf_aarch64_fork_race.md): stack-free capture
+// of the last *non-recursive* EL1 sync fault per CPU. The frozen-fork bug
+// recursively re-faults inside exc_el1_sync's store prologue, destroying the
+// original fault's ESR/ELR/FAR before any handler can observe them. This stub
+// records them using only two sysreg stashes and a .bss buffer — no stack use,
+// since SP may be the very thing that's broken. It cannot itself fault (mrs +
+// stores to .bss only) and runs with IRQs masked (exception entry sets DAIF),
+// so the stashes cannot be clobbered by reentry.
+//
+// Per-CPU layout (128 B each, read via QEMU monitor after a freeze):
+//   +0  elr   +8  esr   +16 far   +24 sp   +32 x30   +40 spsr   <- slot A:
+//        latest fault whose ELR is OUTSIDE the exc_el1_sync save prologue,
+//        i.e. the freeze's original fault (recursive re-faults are filtered)
+//   +48 elr   +56 esr   +64 sp                                  <- latest fault, any
+//   +72 count (total EL1 sync faults on this cpu)
+//   +104 scratch spill for x2
+exc_el1_sync_capture:
+    msr  tpidrro_el0, x0            // stash x0 (same scratch trick as exc_el0_sync)
+    msr  par_el1, x1                // stash x1 (PAR only live between at/mrs pairs)
+    mrs  x0, mpidr_el1
+    and  x0, x0, #0x7               // cpu index (Aff0 on qemu-virt)
+    lsl  x0, x0, #7                 // * 128
+    adrp x1, EL1_SYNC_CAPTURE
+    add  x1, x1, :lo12:EL1_SYNC_CAPTURE
+    add  x0, x0, x1
+    str  x2, [x0, #104]             // spill x2 (safe: no fault, no IRQ, per-cpu)
+    ldr  x1, [x0, #72]
+    add  x1, x1, #1
+    str  x1, [x0, #72]
+    mrs  x1, elr_el1
+    str  x1, [x0, #48]
+    mrs  x2, esr_el1
+    str  x2, [x0, #56]
+    mov  x2, sp
+    str  x2, [x0, #64]
+    // Classify: ELR inside [exc_el1_sync, exc_el1_sync_prologue_end) means a
+    // recursive re-fault of the save prologue itself — keep slot A intact.
+    adrp x2, exc_el1_sync
+    add  x2, x2, :lo12:exc_el1_sync
+    cmp  x1, x2
+    b.lo 2f
+    adrp x2, exc_el1_sync_prologue_end
+    add  x2, x2, :lo12:exc_el1_sync_prologue_end
+    cmp  x1, x2
+    b.lo 3f
+2:  str  x1, [x0, #0]               // slot A: elr
+    mrs  x1, esr_el1
+    str  x1, [x0, #8]
+    mrs  x1, far_el1
+    str  x1, [x0, #16]
+    mov  x1, sp
+    str  x1, [x0, #24]
+    str  x30, [x0, #32]
+    mrs  x1, spsr_el1
+    str  x1, [x0, #40]
+3:  ldr  x2, [x0, #104]
+    mrs  x1, par_el1
+    mrs  x0, tpidrro_el0
+    b    exc_el1_sync
 
 exc_el1_sync:
     // Full frame save (mirrors exc_el1_irq): kernel-mode faults on user
@@ -64,6 +124,8 @@ exc_el1_sync:
     stp  x21, x22, [sp, #248]
     stp  x23, x24, [sp, #264]
 
+.globl exc_el1_sync_prologue_end
+exc_el1_sync_prologue_end:
     mrs  x0, esr_el1
     mrs  x1, elr_el1
     bl   exc_el1_sync_handler
@@ -276,3 +338,11 @@ exc_unexpected:
     mrs  x1, elr_el1
     bl   exc_unexpected_handler
     b    .
+
+// Per-CPU capture area for exc_el1_sync_capture (8 cpus x 128 B).
+.section ".bss"
+.align 4
+.globl EL1_SYNC_CAPTURE
+EL1_SYNC_CAPTURE:
+    .skip 1024
+.section ".text", "ax"

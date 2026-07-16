@@ -127,7 +127,13 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         };
 
         // ── Step 4: copy UserFrame to top of child kernel stack ───────────────
-        const FRAME_SIZE: usize = UserFrame::SIZE;
+        // The frame base becomes the child's kernel SP (ctx.sp on aarch64),
+        // so it must stay 16-byte aligned: with SCTLR_EL1.SA=1 real hardware
+        // (HVF) takes an SP-alignment fault on any SP-based access whose SP
+        // isn't 16-byte aligned, and the raw UserFrame size (280) is not a
+        // multiple of 16. QEMU TCG doesn't model this check, which masked the
+        // bug. 288 also matches exception_asm.s's `sub sp, sp, #288` frame.
+        const FRAME_SIZE: usize = (UserFrame::SIZE + 15) & !15;
         let frame_offset    = stack_size - FRAME_SIZE;
         let child_frame_ptr = (stack_base_virt + frame_offset) as *mut UserFrame;
 
@@ -284,7 +290,9 @@ pub fn clone_thread(
         unsafe { (stack_base_virt as *mut u8).write_bytes(0, stack_size); }
 
         // ── Copy parent's UserFrame to top of child kernel stack ──────────────
-        const FRAME_SIZE: usize = UserFrame::SIZE;
+        // Round up to keep the child's kernel SP 16-byte aligned — see the
+        // matching comment in fork_current (SCTLR_EL1.SA fault under HVF).
+        const FRAME_SIZE: usize = (UserFrame::SIZE + 15) & !15;
         let frame_offset    = stack_size - FRAME_SIZE;
         let child_frame_ptr = (stack_base_virt + frame_offset) as *mut UserFrame;
 
