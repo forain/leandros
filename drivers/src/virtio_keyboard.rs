@@ -181,36 +181,39 @@ impl VirtioKeyboardDevice {
 
     fn init_device(&mut self) {
         unsafe {
+            let cfg = self.common_cfg;
+            let status = core::ptr::addr_of_mut!((*cfg).device_status);
             // 1. Reset device
-            (*self.common_cfg).device_status = 0;
+            status.write_volatile(0);
             // 2. Set ACKNOWLEDGE
-            (*self.common_cfg).device_status |= VIRTIO_STATUS_ACKNOWLEDGE;
+            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_ACKNOWLEDGE);
             // 3. Set DRIVER
-            (*self.common_cfg).device_status |= VIRTIO_STATUS_DRIVER;
+            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER);
             // 4. Negotiate features
-            (*self.common_cfg).device_feature_select = 0;
-            let _f0 = (*self.common_cfg).device_feature;
-            (*self.common_cfg).driver_feature_select = 0;
-            (*self.common_cfg).driver_feature = 0;
+            core::ptr::addr_of_mut!((*cfg).device_feature_select).write_volatile(0);
+            let _f0 = core::ptr::addr_of!((*cfg).device_feature).read_volatile();
+            core::ptr::addr_of_mut!((*cfg).driver_feature_select).write_volatile(0);
+            core::ptr::addr_of_mut!((*cfg).driver_feature).write_volatile(0);
             // 5. Set FEATURES_OK
-            (*self.common_cfg).device_status |= VIRTIO_STATUS_FEATURES_OK;
+            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_FEATURES_OK);
             // 6. Setup queue 0 (eventq)
             self.queue = self.setup_queue(0);
             // 7. Set DRIVER_OK
-            (*self.common_cfg).device_status |= VIRTIO_STATUS_DRIVER_OK;
+            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER_OK);
         }
         crate::pci::serial_debug("[KBD] VirtIO Input device initialized\n");
     }
 
     unsafe fn setup_queue(&mut self, id: u16) -> Option<VirtioQueue> {
-        (*self.common_cfg).queue_select = id;
-        let max_size = (*self.common_cfg).queue_size;
+        let cfg = self.common_cfg;
+        core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(id);
+        let max_size = core::ptr::addr_of!((*cfg).queue_size).read_volatile();
         if max_size == 0 { return None; }
 
         let size = max_size.min(32); // Use at most 32 descriptors
-        (*self.common_cfg).queue_size = size;
+        core::ptr::addr_of_mut!((*cfg).queue_size).write_volatile(size);
 
-        let notify_off = (*self.common_cfg).queue_notify_off;
+        let notify_off = core::ptr::addr_of!((*cfg).queue_notify_off).read_volatile();
 
         let desc_phys = mm::buddy::alloc(0)?;
         let avail_phys = mm::buddy::alloc(0)?;
@@ -246,10 +249,10 @@ impl VirtioKeyboardDevice {
         (*avail).idx = size;
         (*avail).flags = 0; // Request interrupts (though we will poll)
 
-        (*self.common_cfg).queue_desc = desc_phys as u64;
-        (*self.common_cfg).queue_driver = avail_phys as u64;
-        (*self.common_cfg).queue_device = used_phys as u64;
-        (*self.common_cfg).queue_enable = 1;
+        core::ptr::addr_of_mut!((*cfg).queue_desc).write_volatile(desc_phys as u64);
+        core::ptr::addr_of_mut!((*cfg).queue_driver).write_volatile(avail_phys as u64);
+        core::ptr::addr_of_mut!((*cfg).queue_device).write_volatile(used_phys as u64);
+        core::ptr::addr_of_mut!((*cfg).queue_enable).write_volatile(1u16);
 
         // Notify the device
         let notify_ptr = (self.notify_cfg as usize + notify_off as usize * self.notify_off_multiplier as usize) as *mut u16;

@@ -372,34 +372,37 @@ impl VirtioGpuDevice {
 
     fn init_device(&mut self) {
         unsafe {
+            let cfg = self.common_cfg;
+            let status = core::ptr::addr_of_mut!((*cfg).device_status);
             // 1. Reset device
-            (*self.common_cfg).device_status = 0;
+            status.write_volatile(0);
             // 2. Set ACKNOWLEDGE status bit
-            (*self.common_cfg).device_status |= VIRTIO_STATUS_ACKNOWLEDGE;
+            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_ACKNOWLEDGE);
             // 3. Set DRIVER status bit
-            (*self.common_cfg).device_status |= VIRTIO_STATUS_DRIVER;
-            
+            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER);
+
             // 4. Negotiate features
-            (*self.common_cfg).device_feature_select = 0;
-            let _f0 = (*self.common_cfg).device_feature;
-            (*self.common_cfg).driver_feature_select = 0;
-            (*self.common_cfg).driver_feature = 0; // Minimal features for now
-            
+            core::ptr::addr_of_mut!((*cfg).device_feature_select).write_volatile(0);
+            let _f0 = core::ptr::addr_of!((*cfg).device_feature).read_volatile();
+            core::ptr::addr_of_mut!((*cfg).driver_feature_select).write_volatile(0);
+            core::ptr::addr_of_mut!((*cfg).driver_feature).write_volatile(0); // Minimal features for now
+
             // 5. Set FEATURES_OK status bit
-            (*self.common_cfg).device_status |= VIRTIO_STATUS_FEATURES_OK;
-            
+            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_FEATURES_OK);
+
             // 6. Setup queues
             self.queues[0] = self.setup_queue(0);
-            
+
             // 7. Set DRIVER_OK status bit
-            (*self.common_cfg).device_status |= VIRTIO_STATUS_DRIVER_OK;
+            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER_OK);
         }
         crate::pci::rdebug("[GPU] VirtIO GPU initialized\n");
     }
 
     unsafe fn setup_queue(&mut self, id: u16) -> Option<VirtioQueue> {
-        (*self.common_cfg).queue_select = id;
-        let max_size = (*self.common_cfg).queue_size;
+        let cfg = self.common_cfg;
+        core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(id);
+        let max_size = core::ptr::addr_of!((*cfg).queue_size).read_volatile();
         if max_size == 0 { return None; } // 0 ⇒ queue unavailable
 
         // Each ring lives in a single 4 KiB page allocated below.  The binding
@@ -417,10 +420,10 @@ impl VirtioGpuDevice {
         if size < 2 { return None; } // need ≥2 descriptors per command chain
         if size != max_size {
             // The driver may reduce queue_size before enabling the queue.
-            (*self.common_cfg).queue_size = size;
+            core::ptr::addr_of_mut!((*cfg).queue_size).write_volatile(size);
         }
 
-        let notify_off = (*self.common_cfg).queue_notify_off;
+        let notify_off = core::ptr::addr_of!((*cfg).queue_notify_off).read_volatile();
 
         // Allocate descriptors, avail ring, and used ring
         let desc_phys = mm::buddy::alloc(0)?;
@@ -441,11 +444,11 @@ impl VirtioGpuDevice {
         }
         (*desc.add((size - 1) as usize)).next = 0xFFFF; // Mark end of chain
 
-        (*self.common_cfg).queue_desc = desc_phys as u64;
-        (*self.common_cfg).queue_driver = avail_phys as u64;
-        (*self.common_cfg).queue_device = used_phys as u64;
-        (*self.common_cfg).queue_enable = 1;
-        
+        core::ptr::addr_of_mut!((*cfg).queue_desc).write_volatile(desc_phys as u64);
+        core::ptr::addr_of_mut!((*cfg).queue_driver).write_volatile(avail_phys as u64);
+        core::ptr::addr_of_mut!((*cfg).queue_device).write_volatile(used_phys as u64);
+        core::ptr::addr_of_mut!((*cfg).queue_enable).write_volatile(1u16);
+
         Some(VirtioQueue {
             _id: id,
             size,
@@ -481,7 +484,7 @@ impl VirtioGpuDevice {
             q.submit(head);
 
             let notify_addr = (self.notify_cfg as usize + q.notify_off as usize * self.notify_off_multiplier as usize) as *mut u16;
-            *notify_addr = 0;
+            notify_addr.write_volatile(0);
 
             let mut timeout = 10_000_000;
             while q.last_used_idx == (*q.used).idx && timeout > 0 {
@@ -736,8 +739,8 @@ impl VirtioGpuDevice {
             q.submit(head);
             
             let notify_addr = (self.notify_cfg as usize + q.notify_off as usize * self.notify_off_multiplier as usize) as *mut u16;
-            *notify_addr = 0;
-            
+            notify_addr.write_volatile(0);
+
             let mut timeout = 100_000_000;
             while q.last_used_idx == (*q.used).idx && timeout > 0 {
                 core::hint::spin_loop();

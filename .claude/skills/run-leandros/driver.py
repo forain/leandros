@@ -2,12 +2,18 @@
 """LeandrOS QEMU driver for agent interaction.
 
 Usage:
-  driver.py start [aarch64|x86_64]   Launch QEMU, wait for shell prompt
+  driver.py start [aarch64|x86_64] [mode]   Launch QEMU, wait for shell prompt
   driver.py cmd "<command>"           Send shell command, print output
   driver.py screenshot [out.ppm]      Capture GPU framebuffer via monitor
   driver.py stop                      Quit QEMU cleanly
   driver.py status                    Check if QEMU is running
   driver.py log                       Dump accumulated serial log
+
+`mode` (aarch64 only, default "uefi"): on an Apple Silicon host, "uefi" now
+boots with HVF acceleration automatically (fixed 2026-07-15). Pass "uefi-tcg"
+to force software emulation instead, or "uefi-hvf" to force HVF even on a
+non-Apple-Silicon host (where it will fail to launch). "direct" and
+"raspi4b" remain TCG-only regardless of host.
 
 All paths relative to the repo root (three levels up from this file).
 """
@@ -19,6 +25,7 @@ import time
 import os
 import re
 import select
+import platform
 
 SERIAL_SOCK  = "/tmp/leandros-serial.sock"
 MONITOR_SOCK = "/tmp/leandros-monitor.sock"
@@ -81,6 +88,10 @@ def _cleanup_socks():
             pass
 
 
+def _is_apple_silicon():
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
 def _build_cmd(arch, mode="uefi"):
     if mode == "direct":
         return _build_direct_cmd(arch)
@@ -90,13 +101,29 @@ def _build_cmd(arch, mode="uefi"):
         fw = _find_fw(AARCH64_FW_PATHS)
         if not fw:
             sys.exit("ERROR: AArch64 UEFI firmware not found")
+        # HVF passthrough requires `-cpu host` (real Apple Silicon ID registers) and
+        # `-accel hvf`; this is now the default for the UEFI/Limine boot path on an
+        # Apple Silicon host (fixed 2026-07-15, see drivers/src/virtio_gpu.rs's
+        # volatile-MMIO fix) since it's a large (order-of-magnitude class) speedup
+        # over TCG for CPU-bound guest workloads. "uefi-tcg" forces software
+        # emulation back on (for comparison/debugging); "uefi-hvf" forces HVF on
+        # even on a non-Apple-Silicon host, where it will simply fail to launch.
+        # The direct-kernel-boot path stays TCG-only regardless — it hits a
+        # separate, still-unfixed QEMU PL011-timer hang under HVF.
+        if mode == "uefi-tcg":
+            use_hvf = False
+        elif mode == "uefi-hvf":
+            use_hvf = True
+        else:
+            use_hvf = _is_apple_silicon()
+        cpu_flags = ["-cpu", "host", "-accel", "hvf"] if use_hvf else ["-cpu", "max"]
         vars_fd = os.path.join(REPO_ROOT, "aarch64_vars.fd")
         disk    = os.path.join(REPO_ROOT, "leandros-limine-aarch64.img")
         data0   = os.path.join(REPO_ROOT, "f2fs-data0-aarch64.img")
         data1   = os.path.join(REPO_ROOT, "f2fs-data1-aarch64.img")
         return [
             "qemu-system-aarch64",
-            "-machine", "virt,gic-version=2", "-smp", "4", "-cpu", "max", "-m", "2G",
+            "-machine", "virt,gic-version=2", "-smp", "4", *cpu_flags, "-m", "2G",
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             "-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}",
@@ -118,6 +145,9 @@ def _build_cmd(arch, mode="uefi"):
             "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
         ]
     elif arch == "x86_64":
+        if mode == "uefi-hvf":
+            sys.exit("ERROR: uefi-hvf is aarch64-only (Hypervisor.framework can't "
+                      "virtualize an x86_64 guest on Apple Silicon)")
         fw = _find_fw(X86_64_FW_PATHS)
         if not fw:
             sys.exit("ERROR: x86_64 UEFI firmware not found")
@@ -312,7 +342,7 @@ def cmd_start(arch="aarch64", mode="uefi"):
     open(SERIAL_LOG, "wb").close()
 
     qemu_cmd = _build_cmd(arch, mode)
-    if mode == "uefi":
+    if mode in ("uefi", "uefi-hvf", "uefi-tcg"):
         client, sock = _socket_vmnet_prefix()
         qemu_cmd = [client, sock] + qemu_cmd
     proc = subprocess.Popen(

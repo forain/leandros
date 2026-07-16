@@ -8,27 +8,45 @@ OS=$(uname -s)
 HOST_ARCH=$(uname -m)
 BOOT_MODE="uefi"
 ARCH="x86_64"
+# HVF (Hypervisor.framework) auto-selects on an Apple Silicon host below, once
+# ARCH/BOOT_MODE are known — only the aarch64 UEFI/Limine path supports it
+# (fixed 2026-07-15, see drivers/src/virtio_gpu.rs's volatile-MMIO fix). Force
+# override with --tcg (software emulation, e.g. for comparison/debugging) or
+# --hvf (force HVF even off Apple Silicon, where it will fail to launch).
+HVF=""
 QEMU_EXTRA_ARGS=()
 
 X86_64_FW_PATHS=("/usr/share/ovmf/OVMF.fd" "/usr/share/OVMF/OVMF_CODE.fd" "/opt/homebrew/share/qemu/edk2-x86_64-code.fd" "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd")
 AARCH64_FW_PATHS=("/usr/share/AAVMF/AAVMF_CODE.fd" "/opt/homebrew/share/qemu/edk2-aarch64-code.fd" "/usr/share/edk2-armvirt/aarch64/QEMU_EFI-pflash.raw")
 
-if [[ "$1" == "x86_64" || "$1" == "aarch64" ]]; then
-    ARCH="$1"; shift
-fi
-
 while [[ "$#" -gt 0 ]]; do
     case $1 in
+        x86_64|aarch64) ARCH="$1"; shift ;;
         --direct) BOOT_MODE="direct"; shift ;;
         --uefi) BOOT_MODE="uefi"; shift ;;
         # QEMU raspi4b (BCM2711) — testable stepping stone for the sdhci
         # driver (drivers/src/sdhci.rs); aarch64-only, no PCI bus, no
         # GPU/sound/keyboard devices. Not a hardware target.
         --raspi4b) BOOT_MODE="raspi4b"; ARCH="aarch64"; shift ;;
+        --hvf) HVF=1; shift ;;
+        --tcg) HVF=0; shift ;;
         -d) QEMU_EXTRA_ARGS+=("$2"); shift 2 ;;
         *) QEMU_EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
+
+if [ -z "$HVF" ]; then
+    # Default: HVF on an Apple Silicon host for the one boot path that
+    # supports it, TCG everywhere else.
+    if [ "$OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$ARCH" = "aarch64" ] && [ "$BOOT_MODE" = "uefi" ]; then
+        HVF=1
+    else
+        HVF=0
+    fi
+elif [ "$HVF" = "1" ] && { [ "$ARCH" != "aarch64" ] || [ "$BOOT_MODE" != "uefi" ]; }; then
+    echo "❌ --hvf only works with aarch64 --uefi (the default boot mode for that arch)"
+    exit 1
+fi
 
 if [ "$BOOT_MODE" = "raspi4b" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
@@ -40,7 +58,13 @@ elif [ "$ARCH" = "aarch64" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
     # -smp 4: SMP bringup via PSCI CPU_ON (GICv2 supports up to 8 CPUs).
     MACHINE_ARGS="-machine virt,gic-version=2 -m 2G -smp 4"
-    CPU_ARGS="-cpu max"
+    if [ "$HVF" = "1" ]; then
+        # -cpu host: real Apple Silicon ID registers, required by HVF passthrough
+        # (vs. -cpu max's synthesized model, which is TCG-only).
+        CPU_ARGS="-cpu host -accel hvf"
+    else
+        CPU_ARGS="-cpu max"
+    fi
     DISK_IMAGE="leandros-limine-aarch64.img"
 else
     QEMU_SYSTEM="qemu-system-x86_64"

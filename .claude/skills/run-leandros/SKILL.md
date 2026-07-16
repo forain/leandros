@@ -31,9 +31,13 @@ All commands run from the **repo root**:
 ```sh
 cd /Users/forain/code/leandros
 
-# 1. Boot (defaults to aarch64; takes ~5s on this machine)
+# 1. Boot (defaults to aarch64; takes ~5s on this machine). On an Apple
+# Silicon host, aarch64's default "uefi" mode now boots with HVF acceleration
+# automatically (fixed 2026-07-15). Pass "uefi-tcg" to force software
+# emulation instead. x86_64 is always TCG (no cross-arch HVF).
 python3 .claude/skills/run-leandros/driver.py start aarch64
 python3 .claude/skills/run-leandros/driver.py start x86_64
+python3 .claude/skills/run-leandros/driver.py start aarch64 uefi-tcg
 
 # 2. Send a shell command, get output
 python3 .claude/skills/run-leandros/driver.py cmd "help"
@@ -73,7 +77,13 @@ The framebuffer is 1280×800 (as negotiated with virtio-gpu-pci at boot).
 ```sh
 ./scripts/run-qemu.sh aarch64   # opens an interactive QEMU window (macOS Cocoa)
 ./scripts/run-qemu.sh x86_64
+./scripts/run-qemu.sh aarch64 --tcg   # force software emulation instead of HVF
 ```
+
+Same HVF-by-default-on-Apple-Silicon behavior as the driver (aarch64 UEFI mode
+only); `--tcg` opts out, `--hvf` forces it on elsewhere (and fails to launch
+there). The arch token (`aarch64`/`x86_64`) can go anywhere in the argument
+list, not just first.
 
 This is useless headless and blocks the terminal; use the agent path above.
 
@@ -89,9 +99,81 @@ Build time: ~3–5 minutes clean, ~30s incremental.
 
 ## Gotchas
 
-- **HVF acceleration crashes QEMU 10.x on Apple Silicon** — `Assertion failed: (isv),
-  function hvf_handle_exception, file hvf.c, line 1883`. The driver intentionally omits
-  `-accel hvf`. TCG (software emulation) is used instead and is fast enough (~5s boot).
+- **HVF acceleration doesn't boot LeandrOS on Apple Silicon** — on QEMU 10.x this was an
+  outright crash (`Assertion failed: (isv), function hvf_handle_exception, file hvf.c,
+  line 1883`). Re-tested and root-caused 2026-07-15 on QEMU 11.0.2: the crash is gone,
+  and the hang is NOT in LeandrOS's own boot path — bisected with serial markers through
+  every stage of `entry_aarch64.s` (secondary-core park, EL3→EL2→EL1 drop, MMU/page-table
+  setup) and into `kernel_main`, all of which complete correctly and fast under HVF. The
+  actual hang is inside `arch/aarch64/src/uart.rs::putc()`'s flow-control spin-wait
+  (`while rd(FR) & FR_TXFF != 0`): the *second* consecutive UART write blocks forever —
+  confirmed permanent (60s wait, byte count never advances), not merely slow, and
+  independent of `-smp 1` vs `4` and `highmem=off` vs default. This matches a known,
+  currently-unresolved upstream QEMU bug class: QEMU's PL011 model paces TX-FIFO drain
+  via a virtual-time timer that doesn't get serviced while an HVF-accelerated vCPU thread
+  runs (see [siderolabs/talos#13108](https://github.com/siderolabs/talos/issues/13108) —
+  same symptom, "zero console output, zero CPU usage" shortly after boot, on QEMU
+  virt+HVF+Apple Silicon, unresolved as of this writing). Not fixable from LeandrOS code —
+  would need a QEMU-side fix. The driver intentionally omits `-accel hvf`; TCG is used
+  instead.
+
+  **Tried the fix from that Talos issue's actual resolution comment
+  (`-machine virt,gic-version=max` instead of a fixed version) — made it WORSE, not
+  better.** Hangs immediately after the very first MMIO write (before the secondary-core
+  park check even completes), vs. `gic-version=2`'s hang which at least gets deep into
+  `kernel_main`. This isn't simply "our GIC driver is GICv2-only, can't talk to GICv3"
+  (true — `arch/aarch64/src/gic.rs` has no redistributor/`ICC_*`-system-register support —
+  but that gap can't explain a hang this early, since no GIC-touching code runs before the
+  park check). Don't attempt a GICv3 port expecting it to fix this without first
+  re-verifying with the same raw-UART-marker bisection technique (see
+  `project_mame_perf_investigation` memory) — the earlier hang may be a separate, unrelated
+  QEMU/HVF bug specific to this GIC-version/MMIO-trap combination.
+
+  See memory `project_mame_perf_investigation` for the full diagnosis. Re-test on
+  future QEMU version bumps since the failure mode already changed once (10.x crash →
+  11.0.2 hang); if it's ever fixed upstream, HVF would give a large (5-20x class) speedup
+  for aarch64 guest workloads like MAME.
+
+  **Everything above is about the direct-kernel-boot path only — still unfixed, still
+  needs an upstream QEMU fix.** The UEFI/Limine boot path (EDK2 firmware + Limine
+  bootloader — a completely different code path through `entry_aarch64.s`'s
+  `limine_entry:` branch) is a **different story: FIXED 2026-07-15, and now the
+  default** for `driver.py start aarch64` / `./scripts/run-qemu.sh aarch64` on an Apple
+  Silicon host (pass `uefi-tcg` / `--tcg` to opt back into software emulation). It used
+  to hard-crash with `assert(isv)` right after PCI-probing the virtio-sound device (full
+  firmware/bootloader/kernel-init/PCI-scan completing first — much further than the
+  direct-boot hang). Root cause: `drivers/src/virtio_gpu.rs`'s `init_device()`/
+  `setup_queue()` wrote `common_cfg`/`notify_cfg` BAR-mapped VirtIO registers through
+  plain (non-`volatile`) raw-pointer field assignments — including three adjacent `u64`
+  fields (`queue_desc`/`queue_driver`/`queue_device`) that happened to be 8-byte-aligned
+  inside the `#[repr(C, packed)]` struct. Because the writes weren't `volatile`, LLVM was
+  free to merge/reorder them; it synthesized a wide store (almost certainly an `STP`
+  load/store-pair) that QEMU's HVF backend can't decode (`ESR_EL2.ISV` is clear for that
+  instruction form) — a real QEMU bug, but triggered by a real LeandrOS bug.
+  `drivers/src/virtio_blk.rs` already used the correct
+  `core::ptr::addr_of_mut!(...).write_volatile(...)` idiom for the identical struct;
+  `virtio_gpu.rs` had strayed from it. Fixed by converting every `virtio_gpu.rs`
+  MMIO-register access (including the `notify_addr` kick writes in
+  `send_command`/`send_command_raw`) to the same volatile-safe pattern.
+
+  **A second instance of the identical bug was found the same day in
+  `drivers/src/virtio_keyboard.rs`** — surfaced by testing `run-qemu.sh` directly, since
+  (unlike `driver.py`'s headless command) it includes `-device virtio-keyboard-pci` by
+  default and hit the same `assert(isv)` right after `[KBD] Found VirtIO Input device`.
+  An initial grep for the non-volatile pattern across the other virtio drivers missed
+  this file because it accesses fields via `self.common_cfg` rather than a bare local
+  variable — a reminder to re-run that kind of check with a pattern that actually
+  matches the file's access style, not just the first one found. Fixed identically
+  (same `init_device()`/`setup_queue()` shape, same three-`u64`-field trigger).
+
+  Verified via `lldb` backtrace before each fix (crash squarely inside
+  `hvf_arch_vcpu_exec`, not LeandrOS code) and via full boot-to-shell + GPU-framebuffer
+  screenshot after, through both `driver.py` and a real `./scripts/run-qemu.sh aarch64`
+  run (which exercises virtio-keyboard-pci, virtio-net, virtio-sound, and virtio-gpu
+  together). Both architectures' TCG boot path re-verified unaffected. See
+  `project_mame_perf_investigation` memory for the full bisection writeup (serial
+  markers narrowed the GPU crash from "somewhere in PCI scan" down to the exact
+  three-statement window in `setup_queue()`).
 
 - **Socket "Connection refused" on first connect** — QEMU's Unix chardev creates the
   socket file before `listen()` is called. The driver retries for ~6s with 150ms gaps;
