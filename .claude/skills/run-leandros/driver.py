@@ -31,6 +31,7 @@ SERIAL_SOCK  = "/tmp/leandros-serial.sock"
 MONITOR_SOCK = "/tmp/leandros-monitor.sock"
 PID_FILE     = "/tmp/leandros-qemu.pid"
 SERIAL_LOG   = "/tmp/leandros-serial.log"
+QEMU_STDERR_LOG = "/tmp/leandros-qemu-stderr.log"
 
 REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../..")
@@ -92,6 +93,17 @@ def _is_apple_silicon():
     return sys.platform == "darwin" and platform.machine() == "arm64"
 
 
+def _audiodev_args():
+    """Guest audio backend. Default discards audio (headless). Set
+    LEANDROS_AUDIO_WAV=/path/out.wav to capture everything the guest plays
+    through virtio-sound into a wav file — the only way to verify audio
+    output headlessly."""
+    wav = os.environ.get("LEANDROS_AUDIO_WAV")
+    if wav:
+        return ["-audiodev", f"wav,id=snd0,path={wav}"]
+    return ["-audiodev", "none,id=snd0"]
+
+
 def _build_cmd(arch, mode="uefi"):
     if mode == "direct":
         return _build_direct_cmd(arch)
@@ -134,7 +146,7 @@ def _build_cmd(arch, mode="uefi"):
             "-drive", f"if=none,id=data1,format=raw,file={data1}",
             "-device", "virtio-blk-pci,drive=data1,disable-legacy=on",
             "-device", "virtio-gpu-pci",
-            "-audiodev", "none,id=snd0",
+            *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-device", "virtio-net-pci,netdev=net0,disable-legacy=on",
             "-netdev", "socket,id=net0,fd=3",
@@ -166,7 +178,7 @@ def _build_cmd(arch, mode="uefi"):
             "-drive", f"if=none,id=data1,format=raw,file={data1}",
             "-device", "virtio-blk-pci,drive=data1",
             "-vga", "none", "-device", "virtio-vga",
-            "-audiodev", "none,id=snd0",
+            *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-device", "virtio-net-pci,netdev=net0",
             "-netdev", "socket,id=net0,fd=3",
@@ -203,7 +215,7 @@ def _build_direct_cmd(arch):
             "-drive", f"if=none,id=data1,format=raw,file={data1}",
             "-device", "virtio-blk-pci,drive=data1,disable-legacy=on",
             "-device", "virtio-gpu-pci",
-            "-audiodev", "none,id=snd0",
+            *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-net", "none", "-parallel", "none", "-no-reboot",
             "-display", "none",
@@ -228,7 +240,7 @@ def _build_direct_cmd(arch):
             "-drive", f"if=none,id=data1,format=raw,file={data1}",
             "-device", "virtio-blk-pci,drive=data1",
             "-vga", "none", "-device", "virtio-vga",
-            "-audiodev", "none,id=snd0",
+            *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-net", "none", "-no-reboot",
             "-display", "none",
@@ -342,13 +354,23 @@ def cmd_start(arch="aarch64", mode="uefi"):
     open(SERIAL_LOG, "wb").close()
 
     qemu_cmd = _build_cmd(arch, mode)
+    # Debug escape hatch: extra QEMU args, e.g.
+    #   LEANDROS_QEMU_EXTRA='-trace enable=virtio_snd_*,file=/tmp/t.log'
+    extra = os.environ.get("LEANDROS_QEMU_EXTRA")
+    if extra:
+        import shlex
+        qemu_cmd += shlex.split(extra)
     if mode in ("uefi", "uefi-hvf", "uefi-tcg"):
         client, sock = _socket_vmnet_prefix()
         qemu_cmd = [client, sock] + qemu_cmd
+    # stderr goes to a file, not a pipe: the pipe's read end vanishes when
+    # this process exits, so a chatty QEMU (audio warnings, tracing) would
+    # eventually block on a full pipe. The file also survives for post-mortem.
+    stderr_f = open(QEMU_STDERR_LOG, "wb")
     proc = subprocess.Popen(
         qemu_cmd,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,  # capture so we can report crashes
+        stderr=stderr_f,
         close_fds=True,
     )
     with open(PID_FILE, "w") as f:
@@ -360,7 +382,8 @@ def cmd_start(arch="aarch64", mode="uefi"):
     deadline = time.time() + 15
     while not os.path.exists(SERIAL_SOCK):
         if time.time() > deadline:
-            err = proc.stderr.read(2048).decode(errors="replace")
+            with open(QEMU_STDERR_LOG, "rb") as ef:
+                err = ef.read(2048).decode(errors="replace")
             sys.exit(f"ERROR: serial socket did not appear.\nQEMU stderr:\n{err}")
         time.sleep(0.1)
 
@@ -404,7 +427,14 @@ def _serial_send(command, timeout=8):
         pass
 
     s.setblocking(True)
-    s.sendall((command + "\n").encode())
+    # Pace the write: the guest PL011 RX FIFO is 16 bytes and the shell polls
+    # it, so a single burst longer than ~16 bytes silently drops the head of
+    # the command. 8-byte chunks with a small gap keep long command lines
+    # intact.
+    payload = (command + "\n").encode()
+    for i in range(0, len(payload), 8):
+        s.sendall(payload[i:i + 8])
+        time.sleep(0.02)
     s.setblocking(False)
 
     buf = b""

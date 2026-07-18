@@ -39,10 +39,11 @@ python3 .claude/skills/run-leandros/driver.py start aarch64
 python3 .claude/skills/run-leandros/driver.py start x86_64
 python3 .claude/skills/run-leandros/driver.py start aarch64 uefi-tcg
 
-# 2. Send a shell command, get output
+# 2. Send a shell command, get output. Optional third arg = read-timeout in
+# seconds (default 8) — pass a larger value for long-running commands like mame.
 python3 .claude/skills/run-leandros/driver.py cmd "help"
 python3 .claude/skills/run-leandros/driver.py cmd "ls /bin"
-python3 .claude/skills/run-leandros/driver.py cmd "info"
+python3 .claude/skills/run-leandros/driver.py cmd "mame captcomm -rompath / -str 30 -skip_gameinfo" 90
 
 # 3. Screenshot (GPU framebuffer → PPM + auto-converts to PNG on macOS)
 python3 .claude/skills/run-leandros/driver.py screenshot /tmp/screen.ppm
@@ -59,6 +60,23 @@ python3 .claude/skills/run-leandros/driver.py stop
 
 Only one QEMU instance runs at a time. `start` refuses if one is already running.
 `stop` sends `quit` to the QEMU monitor then SIGTERMs as fallback.
+QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
+
+### Audio capture (headless verification)
+
+Guest audio is discarded by default (`-audiodev none`). To verify audio
+headlessly, set `LEANDROS_AUDIO_WAV=/path/out.wav` on `start` — QEMU then
+records everything the guest plays through virtio-sound into that wav
+(backend-native 44.1 kHz stereo S16). The RIFF header is only finalized when
+QEMU exits; while running, parse PCM from byte offset 44 and watch file size
+(~176,400 B/s when a stream plays — silence still grows the file). Verified
+workflow: `mame captcomm -rompath / -str 60 -skip_gameinfo` boots silent for
+~24 emulated seconds, then plays attract music — check per-second RMS of the
+captured PCM, not just file growth (a streaming-but-silent game grows the
+file too).
+
+`LEANDROS_QEMU_EXTRA` appends arbitrary QEMU args on `start` (shlex-split),
+e.g. `-trace enable=virtio_snd_*,file=/tmp/t.log` for device tracing.
 
 ### Shell commands supported
 
@@ -180,8 +198,32 @@ Build time: ~3–5 minutes clean, ~30s incremental.
   do not check `os.path.exists(sock)` alone as readiness gate.
 
 - **`-audiodev none,id=snd0`** — The VirtIO sound device requires an audiodev; `none`
-  is a valid backend in QEMU 10.x that discards audio. Without it, QEMU errors on the
-  `-device virtio-sound-pci` line.
+  is a valid backend that discards audio. Without it, QEMU errors on the
+  `-device virtio-sound-pci` line. Use `LEANDROS_AUDIO_WAV` (see Audio capture above)
+  to capture instead.
+
+- **QEMU 11.x permanently stalls a virtio-snd stream whose queue it ever polls
+  empty** — the split audio backend loses its frontend-refill wakeup on the first
+  empty poll (one-shot): every control command still returns OK, TX buffers are
+  accepted but never complete, capture stays empty. All backends (wav/none/
+  coreaudio) affected. The guest self-heals with three mechanisms
+  (`drivers/src/snd.rs` + `servers/pipewire/src/lib.rs`): a 100 Hz tick pump
+  (sched::register_tick_hook) that drains the spool and pads the ring with
+  silence below a watermark; the same padding from inside a blocked producer
+  push (the pump can't take the lock then); and a 250 ms frozen-used-index
+  stall detector that restarts the stream. A few `[SND] TX stalled …
+  recovering stream` lines during an app's silent startup phase are expected
+  and inaudible; recoveries during audible playback are a regression.
+  **Do not shrink the audio buffers below SPOOL_BYTES=64 KiB /
+  buffer_bytes=65536 / natural ring depth**: QEMU's first poll after START
+  gulps up to buffer_bytes at once, its timer slips multiply per-tick demand,
+  and configurations below this line are bimodally unstable (pass some boots,
+  death-spiral others — validated over ~25 test runs on 2026-07-18, aarch64
+  HVF). Steady-state audio latency is ~610 ms (43.5 KiB ring + 64 KiB spool,
+  both kept full by backpressure). Re-test with
+  `.claude/skills/run-leandros/audio-glitch-test.sh <label>`
+  runs (60 s MAME, count recoveries + music-region zero-runs) on QEMU
+  upgrades.
 
 - **AArch64 UEFI outputs VT100 cursor codes on serial** — UEFI and Limine use
   `\e[row;colH` cursor positioning and `\e[K` erase sequences. The serial log contains

@@ -519,12 +519,27 @@ pub fn yield_now(reason: &str) {
     }
 }
 
+/// Optional 100 Hz hook run from the BSP timer IRQ (see register_tick_hook).
+static TICK_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register a function to run on every BSP timer tick, in IRQ context.
+/// The hook must be non-blocking (try_lock only, no sleeps) and fast.
+/// Used by the audio server to pump its queue independently of producers.
+pub fn register_tick_hook(f: fn()) {
+    TICK_HOOK.store(f as usize, Ordering::Release);
+}
+
 pub fn timer_tick_irq() {
     let id = unsafe { cpu_id() };
     // Every CPU has its own local timer; only the BSP advances global time so
     // TIMER_TICKS keeps its 100 Hz meaning regardless of CPU count.
     if id == 0 {
         TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+        let hook = TICK_HOOK.load(Ordering::Acquire);
+        if hook != 0 {
+            let f: fn() = unsafe { core::mem::transmute(hook) };
+            f();
+        }
     }
     PREEMPT_NEEDED[id.min(MAX_CPUS - 1)].store(true, Ordering::Relaxed);
 }

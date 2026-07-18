@@ -12,16 +12,24 @@ use drivers::pci;
 
 pub const PW_SOCKET_PATH: &str = "/run/pipewire/pipewire-0";
 
+/// Latency knob: spool depth. With backpressure the spool runs full, so this
+/// plus the driver's TX_MAX_INFLIGHT×512 B is the steady-state audio latency
+/// (176,400 B ≈ 1 s at 44.1 kHz stereo S16). It is also the cushion that
+/// absorbs producer scheduling hiccups — too small and the stream underruns,
+/// which QEMU 11.x punishes by killing the voice (recovery = audible gap).
+const SPOOL_BYTES: usize = 64 * 1024;
+
 struct PipeWireState {
     snd_driver: VirtioSnd,
     bound_port: u32,
     initialized: bool,
     
     // Spooling buffer for non-blocking audio
-    spool: [u8; 128 * 1024],
+    spool: [u8; SPOOL_BYTES],
     spool_head: usize,
     spool_tail: usize,
     spool_len: usize,
+    last_pcm_us: u64,
 }
 
 impl PipeWireState {
@@ -30,10 +38,11 @@ impl PipeWireState {
             snd_driver: VirtioSnd::new(),
             bound_port: 0,
             initialized: false,
-            spool: [0u8; 128 * 1024],
+            spool: [0u8; SPOOL_BYTES],
             spool_head: 0,
             spool_tail: 0,
             spool_len: 0,
+            last_pcm_us: 0,
         }
     }
 
@@ -47,6 +56,60 @@ impl PipeWireState {
             total += 1;
         }
         total
+    }
+
+    /// Push with backpressure: when the spool is full, drain to the hardware
+    /// ring and wait for QEMU to consume (it drains at exactly realtime rate)
+    /// instead of silently dropping. This paces the producer to the audio
+    /// clock. Bounded so a stalled stream can't wedge the caller: worst case
+    /// ~438 bytes must wait ~2.5 ms for space; the bound allows ~100x that.
+    ///
+    /// Stall recovery: QEMU 11.x permanently stops consuming an output
+    /// stream that ever underruns (audio-core auto-disable; virtio-snd never
+    /// re-enables the voice). A live stream completes a 512-byte ring buffer
+    /// every ~3 ms, so if the TX used index freezes while we sit here with
+    /// data blocked, the stream is dead — recover it. This works precisely
+    /// because we are mid-push: data flows immediately after the restart, so
+    /// the revived stream doesn't underrun again.
+    fn push_spool_blocking(&mut self, data: &[u8]) -> usize {
+        use drivers::snd::monotonic_us;
+        let mut off = 0;
+        let start = monotonic_us();
+        let mut last_used = self.snd_driver.tx_used_idx();
+        let mut stall_start = start;
+        while off < data.len() {
+            self.drain_spool();
+            let pushed = self.push_spool(&data[off..]);
+            off += pushed;
+            if pushed == 0 {
+                // While blocked we hold the STATE lock continuously, which
+                // starves the 100 Hz tick pump (try_lock). Pad from here
+                // instead: after a recovery the spool is nearly empty and
+                // QEMU's next gulp would otherwise hit an empty queue —
+                // the one remaining path into the permanent-stall spiral.
+                self.snd_driver.top_up_silence();
+                let now = monotonic_us();
+                let used = self.snd_driver.tx_used_idx();
+                if used != last_used {
+                    last_used = used;
+                    stall_start = now;
+                } else if now.wrapping_sub(stall_start) > 250_000 {
+                    // 250 ms with zero completions while data is blocked.
+                    // QEMU's audio timer consumes in bursts every ~12.5 ms,
+                    // so a live stream never goes quiet for more than a few
+                    // tens of ms — spin-count thresholds false-triggered on
+                    // normal inter-tick gaps and thrashed the stream with
+                    // recoveries. Wall-clock 250 ms is ~20 tick periods.
+                    self.snd_driver.recover_stream();
+                    self.drain_spool();
+                    last_used = self.snd_driver.tx_used_idx();
+                    stall_start = monotonic_us();
+                }
+                if now.wrapping_sub(start) > 3_000_000 { break; } // give up: drop
+                for _ in 0..1000 { core::hint::spin_loop(); }
+            }
+        }
+        off
     }
 
     fn drain_spool(&mut self) {
@@ -111,6 +174,7 @@ pub fn init() -> Result<u32, i32> {
     net_server::force_bind_unix(PW_SOCKET_PATH, server_port);
 
     state.initialized = true;
+    sched::register_tick_hook(tick_pump);
     pci::rdebug("[PW] Ready on port ");
     pci::rdebug_hex(server_port);
     pci::rdebug("\n");
@@ -119,6 +183,21 @@ pub fn init() -> Result<u32, i32> {
 
 fn handle_msg(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
     handle(msg)
+}
+
+/// 100 Hz pump, run from the BSP timer IRQ (sched::register_tick_hook).
+/// Drains spooled PCM to the device and pads with silence below the
+/// watermark so the device-side queue is NEVER seen empty — QEMU 11.x's
+/// audio backend permanently loses its refill wakeup on the first empty
+/// poll. try_lock: if a producer is mid-push it holds the lock and its own
+/// blocked loop is already pumping; skipping a tick is fine.
+fn tick_pump() {
+    if let Some(mut state) = STATE.try_lock() {
+        if state.initialized {
+            state.drain_spool();
+            state.snd_driver.top_up_silence();
+        }
+    }
 }
 
 pub fn handle(msg: &Message) -> Message {
@@ -143,9 +222,9 @@ pub fn handle(msg: &Message) -> Message {
                         as_.read_user_buf(buf_ptr + total, &mut kbuf[..n])
                     }).unwrap_or(false);
                     if !ok { return err_reply(-14); }
-                    let pushed = state.push_spool(&kbuf[..n]);
+                    let pushed = state.push_spool_blocking(&kbuf[..n]);
                     total += pushed;
-                    if pushed < n { break; } // Spool full
+                    if pushed < n { break; } // Stream stalled
                 }
                 val_reply(total as u64)
             }
@@ -175,8 +254,17 @@ pub fn handle(msg: &Message) -> Message {
                 state.snd_driver.reconfigure_stream(0, freq, msg.data[4]);
                 Message::empty()
             } else {
+                // Diagnostic: surface large producer gaps (rare, cold path).
+                let now = drivers::snd::monotonic_us();
+                let last = state.last_pcm_us;
+                state.last_pcm_us = now;
+                if last != 0 && now.wrapping_sub(last) > 100_000 {
+                    pci::serial_debug("[PW] producer gap ms=");
+                    pci::serial_debug_hex((now.wrapping_sub(last) / 1000) as u32);
+                    pci::serial_debug("\n");
+                }
                 let len = u16::from_le_bytes([msg.data[0], msg.data[1]]) as usize;
-                state.push_spool(&msg.data[2..2+len]);
+                state.push_spool_blocking(&msg.data[2..2+len]);
                 Message::empty()
             }
         }

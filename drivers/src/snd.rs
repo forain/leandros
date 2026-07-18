@@ -31,6 +31,45 @@ pub const VIRTIO_SND_PCM_RATE_48000:     u8 = 7;
 
 const QUEUE_SIZE: usize = 256;
 
+/// Latency knob: max PCM buffers queued to the device at once
+/// (each = 512 B ≈ 2.9 ms at 44.1 kHz stereo S16). Safe to keep small ONLY
+/// because the 100 Hz tick pump (servers/pipewire tick_pump) guarantees the
+/// queue never runs empty — QEMU 11.x's split audio backend permanently
+/// loses the frontend-refill wakeup the first time it polls an empty
+/// stream queue (one-shot, unrecoverable without a stream restart).
+const TX_MAX_INFLIGHT: u16 = 256;
+
+/// Silence top-up watermark for the tick pump: when fewer than this many
+/// buffers are queued, top_up_silence() pads with zeros up to it. Sized at
+/// 2x QEMU's worst observed single-poll demand (its audio timer slips and
+/// gulps several periods of catch-up at once): 32 × 512 B ≈ 93 ms. Must
+/// stay below TX_MAX_INFLIGHT so real data always has room on top.
+const TX_TOPUP_BUFS: u16 = 32;
+
+/// Coarse monotonic clock for stall detection. Reads a hardware counter
+/// that keeps advancing even while spinning in kernel context with IRQs
+/// masked (unlike sched::ticks()). The x86_64 arm assumes ~1 GHz TSC —
+/// only ever used for order-of-magnitude stall thresholds, where a few x
+/// of error just makes detection proportionally slower.
+pub fn monotonic_us() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let cnt: u64;
+        let frq: u64;
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt, options(nomem, nostack));
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack));
+        ((cnt as u128 * 1_000_000) / frq.max(1) as u128) as u64
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_rdtsc() / 1000
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        0
+    }
+}
+
 #[repr(C)]
 struct VirtioSndHdr { code: u32 }
 
@@ -87,8 +126,12 @@ pub struct VirtioSnd {
     common_cfg: usize, notify_cfg: usize, notify_off_multiplier: u32,
     vqs: [Option<VirtQueue>; 4],
     persistent: *mut VirtioSndPersistent,
-    initialized: bool, stream_active: bool,
+    initialized: bool, stream_active: bool, stream_started: bool,
     tx_count: u32,
+    tx_len: [u16; QUEUE_SIZE],
+    last_freq: u32, last_channels: u8,
+    dbg_first_completion: bool, dbg_ring_full: bool,
+    dbg_min_level: u16,
 }
 
 unsafe impl Send for VirtioSnd {}
@@ -99,7 +142,11 @@ impl VirtioSnd {
         Self {
             common_cfg: 0, notify_cfg: 0, notify_off_multiplier: 0,
             vqs: [None, None, None, None], persistent: core::ptr::null_mut(),
-            initialized: false, stream_active: false, tx_count: 0,
+            initialized: false, stream_active: false, stream_started: false, tx_count: 0,
+            tx_len: [0; QUEUE_SIZE],
+            last_freq: 44100, last_channels: 2,
+            dbg_first_completion: false, dbg_ring_full: false,
+            dbg_min_level: 0xFFFF,
         }
     }
 
@@ -222,27 +269,114 @@ impl VirtioSnd {
 
     pub fn reconfigure_stream(&mut self, stream_id: u32, freq: u32, channels: u8) {
         let rate = match freq { 11025=>2, 22050=>4, 44100=>6, 48000=>7, _=>6 };
-        pci::rdebug("[SND] Reconfiguring stream 0: freq="); pci::rdebug_hex(freq);
-        pci::rdebug(" rate="); pci::rdebug_hex(rate as u32); pci::rdebug("\n");
+        pci::serial_debug("[SND] reconfigure: freq=");
+        pci::serial_debug_hex(freq);
+        pci::serial_debug(" ch=");
+        pci::serial_debug_hex(channels as u32);
+        pci::serial_debug("\n");
 
-        if self.stream_active {
-            self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_STOP }, stream_id });
-            self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_RELEASE }, stream_id });
-        }
-        self.send_control_cmd(&VirtioSndPcmSetParams {
+        self.last_freq = freq;
+        self.last_channels = channels;
+
+        // Tear down unconditionally: QEMU completes any in-flight TX buffers
+        // on STOP/RELEASE, and an invalid transition (stream never started)
+        // just returns BAD_MSG which is harmless. Gating this on
+        // stream_active leaves the stream in an undefined state when our
+        // bookkeeping disagrees with the device.
+        self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_STOP }, stream_id });
+        self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_RELEASE }, stream_id });
+
+        let s1 = self.send_control_cmd(&VirtioSndPcmSetParams {
             hdr: VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_SET_PARAMS }, stream_id },
             buffer_bytes: 65536, period_bytes: 4096, features: 0, channels, format: VIRTIO_SND_PCM_FMT_S16, rate, padding: 0,
         });
-        self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_PREPARE }, stream_id });
-        self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_START }, stream_id });
-        self.stream_active = true;
+        let s2 = self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_PREPARE }, stream_id });
+        let s3 = self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_START }, stream_id });
+
+        // START must be sent HERE, before any TX buffers are queued: QEMU
+        // does not reliably move buffers submitted on a merely-PREPARE'd
+        // stream into its playback queue (lazy-START experiments left the
+        // voice consuming exactly one timer tick, then permanently silent
+        // with a full guest ring). The initial-silence death that immediate
+        // START causes (producer opens the stream, then pauses before its
+        // first PCM) is handled once by the stall-recovery path.
+        self.stream_active = s1 == 0x8000 && s2 == 0x8000 && s3 == 0x8000;
+        self.stream_started = self.stream_active;
+        if !self.stream_active {
+            pci::serial_debug("[SND] stream setup FAILED: set_params=");
+            pci::serial_debug_hex(s1);
+            pci::serial_debug(" prepare=");
+            pci::serial_debug_hex(s2);
+            pci::serial_debug(" start=");
+            pci::serial_debug_hex(s3);
+            pci::serial_debug("\n");
+        }
         self.tx_count = 0;
+        self.dbg_first_completion = false;
+        self.dbg_ring_full = false;
     }
 
-    fn send_control_cmd<T>(&mut self, cmd: &T) {
+    /// TX used-index snapshot for stall detection: a live stream advances
+    /// this every ~3 ms (one 512-byte buffer at 44.1 kHz stereo); a stream
+    /// killed by QEMU's underrun auto-disable never advances it again.
+    pub fn tx_used_idx(&self) -> u16 {
+        match self.vqs[2].as_ref() {
+            Some(vq) => unsafe { core::ptr::read_volatile(&(*vq.used).idx) },
+            None => 0,
+        }
+    }
+
+    /// Queued-but-uncompleted TX buffers (device's backlog view).
+    pub fn tx_level(&self) -> u16 {
+        match self.vqs[2].as_ref() {
+            Some(vq) => {
+                let used = unsafe { core::ptr::read_volatile(&(*vq.used).idx) };
+                vq.last_avail_idx.wrapping_sub(used)
+            }
+            None => 0,
+        }
+    }
+
+    /// Pad the TX queue with silence up to TX_TOPUP_BUFS. Called from the
+    /// 100 Hz tick pump (and harmless anywhere else): keeps the device-side
+    /// queue non-empty during producer pauses, which is a hard liveness
+    /// requirement on QEMU 11.x (empty poll = permanently stalled voice).
+    /// Silence is semantically correct here — the producer had nothing to
+    /// play for this wall-clock interval.
+    pub fn top_up_silence(&mut self) {
+        if !self.initialized || !self.stream_active { return; }
+        let silence = [0u8; 512];
+        while self.tx_level() < TX_TOPUP_BUFS {
+            if self.send_pcm_data(&silence) == 0 { break; }
+        }
+    }
+
+    /// Recover a stream that QEMU has stopped consuming (underrun
+    /// auto-disable, see reconfigure_stream caller docs): full teardown +
+    /// bring-up with the last-configured params. QEMU completes all
+    /// in-flight ring buffers on STOP/RELEASE, so the caller's next
+    /// drain refills the ring and audio resumes. Must be called while data
+    /// is queued to flow — a revived stream that underruns again dies again.
+    pub fn recover_stream(&mut self) {
+        pci::serial_debug("[SND] TX stalled t_ms=");
+        pci::serial_debug_hex((monotonic_us() / 1000) as u32);
+        pci::serial_debug(" level=");
+        pci::serial_debug_hex(self.tx_level() as u32);
+        pci::serial_debug(" min_level=");
+        pci::serial_debug_hex(self.dbg_min_level as u32);
+        pci::serial_debug(" — recovering stream\n");
+        self.dbg_min_level = 0xFFFF;
+
+        let (f, c) = (self.last_freq, self.last_channels);
+        self.reconfigure_stream(0, f, c);
+    }
+
+    /// Sends one control command and returns the device status code
+    /// (VIRTIO_SND_S_OK = 0x8000), or 0xFFFF_FFFF on ctrl-queue timeout.
+    fn send_control_cmd<T>(&mut self, cmd: &T) -> u32 {
         let code = unsafe { *(cmd as *const T as *const u32) };
         pci::rdebug("[SND] CTRL CMD "); pci::rdebug_hex(code); pci::rdebug(" -> ");
-        
+
         let vq_id;
         let notify_off;
         let _head = {
@@ -262,8 +396,9 @@ impl VirtioSnd {
                 vq.free_head = (*d2).next; vq.num_free -= 2;
                 (*vq.avail).ring[vq.last_avail_idx as usize % QUEUE_SIZE] = h;
                 vq.last_avail_idx = vq.last_avail_idx.wrapping_add(1);
-                atomic::compiler_fence(Ordering::SeqCst);
-                (*vq.avail).idx = vq.last_avail_idx;
+                atomic::fence(Ordering::SeqCst);
+                core::ptr::write_volatile(&mut (*vq.avail).idx, vq.last_avail_idx);
+                atomic::fence(Ordering::SeqCst);
                 h
             }
         };
@@ -273,13 +408,19 @@ impl VirtioSnd {
             let vq = self.vqs[0].as_mut().unwrap();
             let mut timeout = 5000000;
             while vq.last_used_idx == core::ptr::read_volatile(&(*vq.used).idx) && timeout > 0 { core::hint::spin_loop(); timeout -= 1; }
-            if timeout == 0 { pci::rdebug("TIMEOUT\n"); return; }
+            if timeout == 0 {
+                pci::serial_debug("[SND] CTRL CMD ");
+                pci::serial_debug_hex(code);
+                pci::serial_debug(" TIMEOUT\n");
+                return 0xFFFF_FFFF;
+            }
             while vq.last_used_idx != core::ptr::read_volatile(&(*vq.used).idx) {
                 vq.last_used_idx = vq.last_used_idx.wrapping_add(1);
                 vq.num_free += 2;
             }
             let s = core::ptr::read_volatile(&(*self.persistent).ctrl_status.code);
             pci::rdebug_hex(s); pci::rdebug("\n");
+            s
         }
     }
 
@@ -287,15 +428,37 @@ impl VirtioSnd {
     pub fn send_pcm_data(&mut self, data: &[u8]) -> usize {
         if !self.initialized { return 0; }
         
+        let dbg_first = !self.dbg_first_completion;
         let vq = self.vqs[2].as_mut().unwrap();
         // Reclaim processed descriptors
         let used = unsafe { core::ptr::read_volatile(&(*vq.used).idx) };
+        if dbg_first && vq.last_used_idx != used {
+            let slot = vq.last_used_idx as usize % QUEUE_SIZE;
+            let st = unsafe { core::ptr::read_volatile(&(*self.persistent).tx_status[slot].status) };
+            pci::serial_debug("[SND] first TX completion: status=");
+            pci::serial_debug_hex(st);
+            pci::serial_debug("\n");
+            self.dbg_first_completion = true;
+        }
         while vq.last_used_idx != used {
             vq.last_used_idx = vq.last_used_idx.wrapping_add(1);
             vq.num_free += 3;
         }
+        let level_now = vq.last_avail_idx.wrapping_sub(vq.last_used_idx);
+        if level_now < self.dbg_min_level { self.dbg_min_level = level_now; }
 
-        if vq.num_free < 3 { return 0; }
+        // In-flight cap: each queued buffer is ~2.9 ms of audio, so the cap
+        // (not the 256-descriptor ring) sets the hardware-side latency:
+        // TX_MAX_INFLIGHT × 512 B. Must stay above TX_TOPUP_BUFS.
+        if vq.num_free < 3 || level_now >= TX_MAX_INFLIGHT {
+            if !self.dbg_ring_full {
+                pci::serial_debug("[SND] TX ring full (first time), submitted=");
+                pci::serial_debug_hex(self.tx_count);
+                pci::serial_debug("\n");
+                self.dbg_ring_full = true;
+            }
+            return 0;
+        }
         
         let chunk_len = data.len().min(512);
         let vq_id = vq.id;
@@ -304,6 +467,7 @@ impl VirtioSnd {
             let slot = vq.last_avail_idx as usize % QUEUE_SIZE;
             (*self.persistent).tx_xfer[slot].stream_id = 0;
             core::ptr::copy_nonoverlapping(data.as_ptr(), (*self.persistent).tx_data[slot].as_mut_ptr(), chunk_len);
+            self.tx_len[slot] = chunk_len as u16;
             
             let h = vq.free_head;
             let d1 = vq.desc.add(h as usize);
@@ -319,8 +483,9 @@ impl VirtioSnd {
             vq.free_head = (*d3).next; vq.num_free -= 3;
             (*vq.avail).ring[vq.last_avail_idx as usize % QUEUE_SIZE] = h;
             vq.last_avail_idx = vq.last_avail_idx.wrapping_add(1);
-            atomic::compiler_fence(Ordering::SeqCst);
-            (*vq.avail).idx = vq.last_avail_idx;
+            atomic::fence(Ordering::SeqCst);
+            core::ptr::write_volatile(&mut (*vq.avail).idx, vq.last_avail_idx);
+            atomic::fence(Ordering::SeqCst);
         };
         unsafe {
             let addr = self.notify_cfg + (notify_off as u32 * self.notify_off_multiplier) as usize;
@@ -331,6 +496,7 @@ impl VirtioSnd {
         if self.tx_count % 1000 == 0 {
             pci::rdebug("[SND] TX pkts: "); pci::rdebug_hex(self.tx_count); pci::rdebug("\n");
         }
+
         chunk_len
     }
 }
