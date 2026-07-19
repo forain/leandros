@@ -18,5 +18,6 @@ leandros-lib = { path = "../../lib" }
 mm      = { path = "../../mm" }
 sched   = { path = "../../sched" }
 evdev-server = { path = "../../servers/evdev" }
+tty-server = { path = "../../servers/tty" }
 drivers = { path = "../../drivers" }
 bitflags.workspace = true

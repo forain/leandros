@@ -71,8 +71,12 @@ pub fn on_tick() {
         // Poll VirtIO Keyboard
         drivers::virtio_keyboard::poll_events();
 
-        // Poll UART for keyboard input and push to evdev.
+        // Poll UART for keyboard input and push to evdev (fallback drain;
+        // the primary aarch64 path is the UART IRQ in exception.rs).
         while let Some(b) = unsafe { super::uart::getc() } {
+            // Line-discipline ISIG intercept: ^C/^\/^Z become signals to the
+            // foreground process group instead of input bytes.
+            if tty_server::console_intercept_byte(b) { continue; }
             evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2); // 2 = typematic/serial
             evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
         }
