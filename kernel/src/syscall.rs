@@ -4801,7 +4801,16 @@ fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>
     const POLLNVAL: u32 = 0x0020;
 
     // Only real VFS fds carry a seq; fd 0-2 and net sockets stay level.
-    if fd <= 2 || fd >= net_server::SOCK_FD_BASE {
+    // Console stdio proxies (/dev/tty, dup'd stdin — VFS DevStdio vnodes)
+    // must take the level path too: VFS handle_poll reports DevStdio as
+    // never-ready, so routing them to VFS_POLL below leaves an epoll
+    // interest that can never fire. poll(2) already probes these via
+    // poll_fd_state's console-proxy branch; without the same carve-out
+    // here, crossterm's mio-registered /dev/tty handle never wakes for
+    // the ESC[6n cursor-position reply and reedline bails out of
+    // interactive mode after its 2s CPR timeout.
+    if fd <= 2 || fd >= net_server::SOCK_FD_BASE
+        || vfs::fd_is_console_stdio(pid, fd) {
         return (probe_fd_events(pid, fd, requested), None);
     }
     let msg = make_vfs_msg(vfs::VFS_POLL, &[fd as u64]);
