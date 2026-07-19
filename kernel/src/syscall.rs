@@ -2930,6 +2930,34 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
     }
 }
 
+/// True when `buf` ends inside an unterminated ANSI escape sequence, so the
+/// console read should briefly wait for the rest before returning (see the
+/// coalescing loop in `sys_read_impl`'s console branch). Recognized shapes:
+/// a bare trailing ESC; CSI (`ESC [ params… final`), complete at the first
+/// byte in 0x40..=0x7E after the bracket; SS3 (`ESC O`), complete after one
+/// more byte. Anything else after ESC counts as complete. Sequences that
+/// grow past 16 bytes are treated as malformed and released as-is.
+fn console_ends_mid_escape(buf: &[u8]) -> bool {
+    // Only the tail matters; a sequence longer than 16 bytes is not one we
+    // should keep stalling a read for.
+    let tail = &buf[buf.len().saturating_sub(16)..];
+    let esc_pos = match tail.iter().rposition(|&b| b == 0x1b) {
+        Some(p) => p,
+        None => return false,
+    };
+    let after = &tail[esc_pos + 1..];
+    match after.first() {
+        None => true,                       // bare ESC — could be Esc key or sequence start
+        Some(b'[') => {
+            // CSI: terminated by the first byte in 0x40..=0x7E ('R' of a
+            // cursor-position report, '~' of a keypad key, letters, …).
+            !after[1..].iter().any(|&b| (0x40..=0x7e).contains(&b))
+        }
+        Some(b'O') => after.len() < 2,      // SS3: exactly one byte follows
+        Some(_) => false,                   // two-byte sequence (ESC 7, ESC 8, …)
+    }
+}
+
 /// sys_read(fd, buf, count) — read bytes from a file descriptor.
 ///
 /// fd 0 (stdin) blocks on serial UART until at least one byte arrives,
@@ -2995,6 +3023,32 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                 match read_input_byte() {
                     Some(b) => { kbuf[n] = b; n += 1; }
                     None    => break,
+                }
+            }
+            // ANSI escape sequences must be returned whole. Serial input
+            // reaches evdev one byte per tick-drain, so a burst like a
+            // terminal's cursor-position report (ESC[row;colR) can straddle
+            // reads — and crossterm's parser commits a read that ends in a
+            // bare ESC as the Esc KEY, after which the sequence's remaining
+            // printable bytes land in the line editor as typed text. If the
+            // buffer ends mid-sequence, wait (bounded) for the continuation;
+            // each arriving byte refreshes the deadline, so a byte-per-tick
+            // trickle still assembles. A real lone Esc keypress costs at
+            // most ESC_COALESCE_TICKS (~30ms) — the same disambiguation
+            // delay readline/vim use.
+            const ESC_COALESCE_TICKS: u64 = 3;
+            let mut deadline = ticks().wrapping_add(ESC_COALESCE_TICKS);
+            while n < count && console_ends_mid_escape(&kbuf[..n]) {
+                match read_input_byte() {
+                    Some(b) => {
+                        kbuf[n] = b; n += 1;
+                        deadline = ticks().wrapping_add(ESC_COALESCE_TICKS);
+                    }
+                    None => {
+                        if ticks() >= deadline { break; }
+                        irq_window();
+                        yield_now("sys_read_esc_seq");
+                    }
                 }
             }
             if is_kernel {
