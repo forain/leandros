@@ -1,0 +1,14 @@
+[package]
+name = "sigchldtest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sigchldtest"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc! We link directly against librelibc.a, the same way
+# pthreadtest/timertest/sigtest/polltest do, since SIGCHLD delivery needs
+# real sigaction()/TLS (relibc_start_v1 sets up the sigreturn trampoline's
+# dependencies).

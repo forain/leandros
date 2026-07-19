@@ -446,6 +446,17 @@ def _serial_send(command, timeout=8):
                 if not chunk:
                     break
                 buf += chunk
+                # Minimal VT emulation: full-screen/interactive programs
+                # (reedline/crossterm — e.g. /bin/brush) probe the terminal
+                # with a cursor-position report request (ESC[6n) and hang
+                # or bail if nothing answers. Reply like a real terminal.
+                if b"\x1b[6n" in chunk:
+                    try:
+                        s.setblocking(True)
+                        s.sendall(b"\x1b[24;1R" * chunk.count(b"\x1b[6n"))
+                        s.setblocking(False)
+                    except Exception:
+                        pass
                 try:
                     with open(SERIAL_LOG, "ab") as lf:
                         lf.write(chunk)
@@ -572,6 +583,68 @@ def cmd_status():
         print("QEMU not running.")
 
 
+def cmd_session(cmds, step_timeout=6):
+    """Interactive session: send each command in sequence over ONE socket,
+    answering terminal probes (cursor-position ESC[6n) like a real terminal
+    the whole time. Needed for full-screen/line-editor programs (brush,
+    reedline/crossterm) that bail out when the CPR query goes unanswered.
+    Prints the full raw transcript."""
+    s = _connect_with_retry(SERIAL_SOCK)
+    if s is None:
+        sys.exit("ERROR: cannot connect to serial socket")
+    s.setblocking(False)
+    transcript = b""
+    answered = 0  # CPR probes already replied to
+
+    def pump(duration):
+        nonlocal transcript, answered
+        end = time.time() + duration
+        while time.time() < end:
+            if select.select([s], [], [], 0.1)[0]:
+                try:
+                    chunk = s.recv(4096)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    return
+                transcript += chunk
+                try:
+                    with open(SERIAL_LOG, "ab") as lf:
+                        lf.write(chunk)
+                except Exception:
+                    pass
+                # Match against the whole transcript: the 4-byte ESC[6n probe
+                # routinely arrives split across serial chunks.
+                total = transcript.count(b"\x1b[6n")
+                if total > answered:
+                    try:
+                        s.setblocking(True)
+                        # Send the 7-byte cursor-position report as ONE burst:
+                        # it fits the guest PL011's 16-byte RX FIFO, and a
+                        # terminal escape sequence MUST arrive contiguously —
+                        # crossterm times a lone ESC out as an Escape keypress
+                        # and never assembles a byte-trickled CPR reply.
+                        for _ in range(total - answered):
+                            s.sendall(b"\x1b[24;1R")
+                            time.sleep(0.02)
+                        s.setblocking(False)
+                    except Exception:
+                        pass
+                    answered = total
+
+    pump(0.3)  # drain stale output, answer any pending probe
+    for c in cmds:
+        payload = (c + "\n").encode()
+        s.setblocking(True)
+        for i in range(0, len(payload), 8):
+            s.sendall(payload[i:i + 8])
+            time.sleep(0.02)
+        s.setblocking(False)
+        pump(step_timeout)
+    s.close()
+    sys.stdout.write(transcript.decode("utf-8", errors="replace"))
+
+
 def cmd_log():
     try:
         with open(SERIAL_LOG, "rb") as f:
@@ -604,6 +677,11 @@ if __name__ == "__main__":
         cmd_status()
     elif sub == "log":
         cmd_log()
+    elif sub == "session":
+        # driver.py session <step_timeout_s> <cmd1> [<cmd2> ...]
+        if len(args) < 3:
+            sys.exit("Usage: driver.py session <step_timeout_s> <cmd> [<cmd> ...]")
+        cmd_session(args[2:], step_timeout=int(args[1]))
     else:
         print(f"Unknown subcommand: {sub}")
         print(__doc__)

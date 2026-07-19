@@ -315,7 +315,15 @@ unsafe fn execute_binary(args: &[&str], count: usize) {
         // first, which doesn't exist on this OS's F2FS image at all -
         // everything ships under /bin (see mkfs-f2fs-populated.py).
         static PATH_ENV: &[u8] = b"PATH=/bin\0";
-        let envp: [*const u8; 2] = [PATH_ENV.as_ptr(), core::ptr::null()];
+        static HOME_ENV: &[u8] = b"HOME=/\0";
+        static TERM_ENV: &[u8] = b"TERM=xterm-256color\0";
+        // Surfaces real panic messages from Rust std children (human-panic
+        // steps aside when RUST_BACKTRACE is set) — invaluable over serial.
+        static BT_ENV:   &[u8] = b"RUST_BACKTRACE=full\0";
+        let envp: [*const u8; 5] = [
+            PATH_ENV.as_ptr(), HOME_ENV.as_ptr(), TERM_ENV.as_ptr(),
+            BT_ENV.as_ptr(), core::ptr::null(),
+        ];
 
         // Prepare argv
         for i in 0..count {

@@ -173,6 +173,7 @@ def main():
     bins = [
         "shell", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest",
+        "waittest", "sigchldtest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping",
     ]
     for b in bins:
@@ -196,6 +197,12 @@ def main():
     p = f"../mame/mame-{arch}"
     if os.path.exists(p):
         bin_files.append(("mame", p, 0o100755))
+
+    brush_target = "aarch64-unknown-linux-musl" if arch == "aarch64" else "x86_64-unknown-linux-musl"
+    p = f"../brush/target/{brush_target}/release/brush"
+    if os.path.exists(p):
+        bin_files.append(("brush", p, 0o100755))
+
         
     lib_files = []
     relibc_target = "aarch64-unknown-leandros" if arch == "aarch64" else "x86_64-unknown-leandros"
@@ -225,6 +232,16 @@ def main():
         b"/dev/vdb     /             f2fs      rw         0       1\n"
         b"/dev/vdc     /data         f2fs      rw         0       2\n"
     ), 0o100644)]
+
+    # /etc/passwd and /etc/group — musl's getpwuid/getgrgid (used by brush via
+    # the uzers crate) read these. Everything runs as uid 0; home is / since
+    # this script's flat directory model has no /root.
+    etc_files.append(("passwd", (
+        b"root:x:0:0:root:/:/bin/brush\n"
+    ), 0o100644))
+    etc_files.append(("group", (
+        b"root:x:0:\n"
+    ), 0o100644))
         
     # 2. Dynamically calculate required blocks and image size
     # Each meta segment takes 512 blocks. We have 8 meta segments (4096 blocks).

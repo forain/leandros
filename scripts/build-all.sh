@@ -255,6 +255,28 @@ build_bottom() {
 
 }
 
+# Function to build brush (bash-compatible shell)
+build_brush() {
+    local arch="$1"
+    echo "🐚 Building $arch brush..."
+    local brush_dir="$ROOT_DIR/../brush"
+    if [[ ! -d "$brush_dir" ]]; then
+        echo "⚠️  brush source not found at $brush_dir, skipping"
+        return 0
+    fi
+    local target_triple
+    if [[ "$arch" == "aarch64" ]]; then
+        target_triple="aarch64-unknown-linux-musl"
+    else
+        target_triple="x86_64-unknown-linux-musl"
+    fi
+    (
+        cd "$brush_dir" || exit 1
+        RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
+        cargo +nightly build -p brush-shell --target "$target_triple" --release
+    )
+}
+
 # Function to build relibc
 build_relibc() {
     local arch="$1"
@@ -293,6 +315,7 @@ for arch in "${ARCHS[@]}"; do
     build_doom "$arch"
     build_mame "$arch"
     build_bottom "$arch"
+    build_brush "$arch"
     create_initrd "$arch"
     build_kernel "$arch"
     create_disk_image "$arch" "$LIMINE_DIR"

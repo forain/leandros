@@ -1,0 +1,14 @@
+[package]
+name = "waittest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "waittest"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc! We link directly against librelibc.a, the same way
+# pthreadtest/timertest/sigtest/polltest/forktest/racetest do. wait4's
+# WNOHANG/blocking/ECHILD/negative-pid semantics are a property of the real
+# kernel wait path exercised through the real libc, not a raw syscall.
