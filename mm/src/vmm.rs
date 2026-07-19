@@ -490,6 +490,10 @@ impl AddressSpace {
                 return !is_write || (region.prot & PROT_WRITE) != 0;
             }
 
+            // Serialize the get→copy→dec promotion against clone_as and
+            // against promotions in the sibling address space — see
+            // cow::COW_LOCK's doc comment.
+            let _cow_guard = crate::cow::COW_LOCK.lock();
             let refcount = crate::pageref::get(lazy_phys);
             let new_phys = if refcount <= 1 {
                 lazy_phys // sole remaining owner: no copy needed
@@ -515,6 +519,19 @@ impl AddressSpace {
                 return false;
             }
             region.lazy_pages[page_idx] = new_phys;
+            // A *copy* promotion rewrote a live PTE to point at a different
+            // frame (old shared → fresh copy). `map_page` (arch_map_page) issues
+            // only a local store barrier, never a TLB invalidation — its barrier
+            // reasoning covers invalid→valid transitions only. The threads of a
+            // multithreaded process share this page table across CPUs, so a
+            // sibling on another CPU would otherwise keep a stale TLB entry
+            // pointing at the OLD frame. Broadcast an inner-shareable shootdown
+            // to drop those stale entries, exactly as clone_as does after its
+            // own downgrades. (Reuse-in-place keeps the same frame, so only the
+            // frame-changing copy path needs this.)
+            if new_phys != lazy_phys {
+                tlb_shootdown_all();
+            }
             return true;
         }
 
@@ -785,11 +802,11 @@ impl AddressSpace {
                 Some(p) => p,
                 None => return false,
             };
-            
+
             let page_off = va % PAGE_SIZE;
             let avail = PAGE_SIZE - page_off;
             let chunk = usize::min(avail, src.len() - offset);
-            
+
             unsafe {
                 let dest_ptr = crate::phys_to_virt(phys) as *mut u8;
                 core::ptr::copy_nonoverlapping(src.as_ptr().add(offset), dest_ptr, chunk);
