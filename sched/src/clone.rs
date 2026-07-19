@@ -86,6 +86,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         // Distinguish "no such task" (-3) from "kernel task without an
         // address space" (-38) before taking the lock, since the lock
         // helper folds both into None.
+        let parent_tgid_for_quiesce;
         {
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid).and_then(|t| rq.find_pid(t.tgid)) {
@@ -96,6 +97,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
                         mm::buddy::free(child_pt, 0);
                         return -38; // kernel task → can't fork
                     }
+                    parent_tgid_for_quiesce = leader.pid;
                 }
                 None => {
                     drop(rq);
@@ -105,10 +107,16 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
                 }
             }
         }
+        // Stop-the-world across the CoW clone: sibling threads with stale
+        // writable TLB entries must not run between the PTE downgrades and
+        // the final broadcast shootdown (see quiesce_thread_group's doc).
+        let quiesced =
+            super::quiesce_thread_group(parent_tgid_for_quiesce, parent_pid);
         let as_raw_ptr: *mut mm::vmm::AddressSpace =
             match super::lock_leader_address_space(parent_pid) {
                 Some(p) => p,
                 None => {
+                    if quiesced { super::unquiesce_thread_group(); }
                     mm::buddy::free(stack_base_phys, stack_pages);
                     mm::buddy::free(child_pt, 0);
                     return -3; // ESRCH — task vanished since the check above
@@ -117,6 +125,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
 
         let cloned = unsafe { mm::cow::clone_as(&mut *as_raw_ptr, child_pt) };
         unsafe { super::unlock_address_space(as_raw_ptr); }
+        if quiesced { super::unquiesce_thread_group(); }
         let child_as = match cloned {
             Some(a) => a,
             None    => {
@@ -200,10 +209,28 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         // syscall. child_ctx started at CpuContext::zeroed(), so without
         // this the child's first #[thread_local] access (errno, etc.) reads
         // through a null TLS base and faults.
+        //
+        // On x86-64 the kernel maintains the TLS base itself (arch_prctl
+        // ARCH_SET_FS traps into set_fs_base), so Task::tls_base is
+        // authoritative and used directly.
+        //
+        // On AArch64 there is NO such trap: musl (and any libc that follows
+        // the aarch64 ABI) installs the main thread's TLS with a bare
+        // `msr tpidr_el0` from EL0, which the kernel never observes, so the
+        // Task::tls_base shadow field stays 0 for the whole process lifetime
+        // (see context::current_tls_base's doc comment). Copying that 0 into
+        // the child gives it a NULL TLS base. The live register is the only
+        // source of truth, so read it directly — exactly as clone_thread
+        // already does for its vfork-style fallback. This was masked for the
+        // common fork-then-immediately-execve case (arch_execve_return zeroes
+        // tpidr_el0 anyway, and musl's raw fork+exec child touches no TLS),
+        // but Rust std's fork+exec child runs #[thread_local]-touching Rust
+        // code *between* fork and execve, so it faulted on the null base
+        // (e.g. brush -c spawning an external command).
         #[cfg(target_arch = "x86_64")]
         { child_ctx.fs_base = tls_base; }
         #[cfg(target_arch = "aarch64")]
-        { child_ctx.tpidr_el0 = tls_base; }
+        { child_ctx.tpidr_el0 = crate::context::current_tls_base(); }
 
         // ── Step 7: build and enqueue child task ──────────────────────────────
         let child_pid = super::alloc_pid();
@@ -264,6 +291,7 @@ pub fn clone_thread(
     const CLONE_THREAD:         usize = 0x0001_0000;
     const CLONE_CHILD_SETTID:   usize = 0x0100_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
+    const CLONE_VFORK:          usize = 0x0000_4000;
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
@@ -421,6 +449,7 @@ pub fn clone_thread(
         child.heap_end   = heap_end;
         child.cwd        = cwd;
         child.signal_actions = [DEFAULT_SIGACTION; 64];
+        child.vfork_pending = flags & CLONE_VFORK != 0;
         if flags & CLONE_CHILD_CLEARTID != 0 {
             child.clear_child_tid = ctid;
         }
@@ -437,6 +466,26 @@ pub fn clone_thread(
             return -12;
         }
         super::wake_up_an_idle_cpu();
+
+        // CLONE_VFORK: suspend the parent until the child execve()s or
+        // exits. Under CLONE_VM the child shares this address space — musl's
+        // posix_spawn even runs it on a buffer inside the parent's stack
+        // frame — so letting the parent run early means both sides corrupt
+        // each other's stack. No EINTR here: vfork isn't restartable.
+        if flags & CLONE_VFORK != 0 {
+            loop {
+                let pending = {
+                    let rq = super::RUN_QUEUE.lock();
+                    match rq.find_pid(child_pid) {
+                        Some(t) => t.vfork_pending,
+                        None    => false, // already reaped — definitely done
+                    }
+                };
+                if !pending { break; }
+                super::irq_window();
+                super::yield_now("vfork_wait");
+            }
+        }
 
         child_pid as isize
     }

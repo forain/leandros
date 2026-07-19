@@ -42,6 +42,17 @@ const SS_ONSTACK:  u32 = 1;
 const SS_DISABLE:  u32 = 2;
 const MINSIGSTKSZ: usize = 2048;
 
+/// User VA of the kernel-provided sigreturn trampoline page, mapped by
+/// sys_execve into every exec'd address space (fork/threads inherit it).
+///
+/// Linux aarch64 has no SA_RESTORER convention — libcs (musl in particular)
+/// install handlers *without* a restorer and rely on the kernel pointing the
+/// handler's return address at a vDSO `rt_sigreturn` trampoline. relibc
+/// happens to always pass SA_RESTORER, which is why this gap stayed hidden
+/// until the first musl binary (brush) took a signal: its handler returned
+/// through LR = 0 and the process died at PC 0.
+pub const SIGRET_TRAMPOLINE_VA: usize = 0x0000_7fff_ff00_0000;
+
 // Signals whose SIG_DFL action is "ignore" (bit N = signal N+1 is default-ignore).
 //   SIGCHLD = 17  (bit 16)
 //   SIGURG  = 23  (bit 22)
@@ -50,6 +61,40 @@ const SIGDFL_IGNORE: u64 = (1u64 << 16) | (1u64 << 22) | (1u64 << 27);
 
 // Signal numbers used for default-terminate calculation.
 const SIGSEGV: u32 = 11;
+
+/// True when the calling task has a pending, unmasked signal that would
+/// actually be *delivered* (a user handler runs, or the default action
+/// terminates) rather than discarded (SIG_IGN, or SIG_DFL for a
+/// default-ignore signal like SIGCHLD).
+///
+/// Blocking syscalls use this as their EINTR condition: POSIX requires that
+/// ignored signals do NOT interrupt a blocked syscall, so a bare
+/// `pending & !mask` test would make every child exit spuriously EINTR a
+/// parent that never installed a SIGCHLD handler.
+pub fn has_deliverable_signal() -> bool {
+    let pid = super::current_pid();
+    if pid == 0 { return false; }
+    let rq = super::RUN_QUEUE.lock();
+    let t = match rq.find_pid(pid) { Some(t) => t, None => return false };
+    let mut unmasked = t.signal_pending & !t.signal_mask;
+    if unmasked == 0 { return false; }
+    let leader = rq.find_pid(t.tgid);
+    while unmasked != 0 {
+        let bit = unmasked.trailing_zeros();
+        let action = leader
+            .map(|l| l.signal_actions[bit as usize])
+            .unwrap_or(crate::task::DEFAULT_SIGACTION);
+        match action.handler {
+            0 => {
+                if SIGDFL_IGNORE & (1u64 << bit) == 0 { return true; } // terminates
+            }
+            1 => {} // SIG_IGN — discarded, keep scanning
+            _ => return true, // user handler
+        }
+        unmasked &= !(1u64 << bit);
+    }
+    false
+}
 
 /// Check for pending signals on the currently-running task and deliver the
 /// first pending, unmasked signal.
@@ -68,6 +113,25 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
 
     let pid = super::current_pid();
     if pid == 0 { return; } // kernel idle task has no signals
+
+    // Claim any process-level pending signals (parked by deliver_signal_process
+    // when every thread masked them) that THIS thread now has unmasked, moving
+    // them into our own pending set so the delivery loop below handles them.
+    // This is how a process-directed SIGCHLD parked during a fork's
+    // all-signals-block window reaches the reactor thread once it re-unblocks.
+    {
+        let mut rq = super::RUN_QUEUE.lock();
+        let (tgid, mask) = match rq.find_pid(pid) { Some(t) => (t.tgid, t.signal_mask), None => return };
+        let claimable = rq.find_pid(tgid).map(|l| l.shared_signal_pending & !mask).unwrap_or(0);
+        if claimable != 0 {
+            if let Some(li) = rq.find_pid_idx(tgid) {
+                if let Some(l) = rq.get_mut(li) { l.shared_signal_pending &= !claimable; }
+            }
+            if let Some(ti) = rq.find_pid_idx(pid) {
+                if let Some(t) = rq.get_mut(ti) { t.signal_pending |= claimable; }
+            }
+        }
+    }
 
     loop {
         // Sample the pending+mask state under the queue lock, then release it
@@ -137,7 +201,15 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                 let restorer = if action.get_flags() & SA_RESTORER != 0 {
                     action.get_restorer()
                 } else {
-                    0 // no restorer — signal handler must not return
+                    // No SA_RESTORER: return through the kernel-provided
+                    // rt_sigreturn trampoline (Linux-aarch64 convention;
+                    // musl never sets SA_RESTORER there). Mapped by execve;
+                    // a pre-exec task without the page simply must not
+                    // return from its handler, as before.
+                    #[cfg(target_arch = "aarch64")]
+                    { SIGRET_TRAMPOLINE_VA }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    { 0 }
                 };
 
                 if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask, action.get_flags()) {

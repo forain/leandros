@@ -79,7 +79,9 @@ impl RunQueue {
         let mut sum_wv: u128 = 0;
         for slot in self.tasks.iter() {
             if let Some(t) = slot {
-                if t.state == TaskState::Ready && t.on_cpu.is_none() {
+                if t.state == TaskState::Ready && t.on_cpu.is_none()
+                    && !super::quiesce_filtered(t.tgid, t.pid)
+                {
                     sum_w  += t.weight as u64;
                     sum_wv += t.weight as u128 * t.vruntime as u128;
                 }
@@ -95,6 +97,10 @@ impl RunQueue {
         for (i, slot) in self.tasks.iter().enumerate() {
             if let Some(t) = slot {
                 if t.state != TaskState::Ready || t.on_cpu.is_some() { continue; }
+                // Stop-the-world fork: siblings of a mid-clone_as thread
+                // group stay parked until the CoW downgrade + TLB shootdown
+                // are complete (see sched::quiesce_thread_group).
+                if super::quiesce_filtered(t.tgid, t.pid) { continue; }
                 let eligible = (t.vruntime as u128) * (sum_w as u128) <= sum_wv;
                 if eligible && best.map_or(true, |(_, d)| t.vdeadline < d) {
                     best = Some((i, t.vdeadline));

@@ -178,6 +178,15 @@ pub struct Task {
     pub signal_pending: u64,
     /// Bitmask of blocked (masked) signals.
     pub signal_mask:    u64,
+    /// Process-level pending signals (bit N = signal N+1), meaningful only on
+    /// the thread-group leader. A process-directed signal (child-exit SIGCHLD,
+    /// kill(pid), killpg) that no thread can take *right now* — because every
+    /// thread currently masks it, e.g. during std's fork() all-signals-block
+    /// window — is parked here instead of on one thread, and claimed by
+    /// whichever thread next returns to user space with the signal unmasked
+    /// (see check_and_deliver_signals). Without this, such a signal pinned on
+    /// the (masked) leader would be lost forever and the waiter would hang.
+    pub shared_signal_pending: u64,
     /// Per-signal disposition table (reduced for testing).
     pub signal_actions: [SigAction; 64],
 
@@ -211,6 +220,19 @@ pub struct Task {
     /// `SS_ONSTACK` is never stored here — it's derived from the live user
     /// SP at query time, matching Linux's `on_sig_stack()`.
     pub altstack_flags: u32,
+
+    // ── Wait bookkeeping ──────────────────────────────────────────────────────
+    /// Set when a wait4/waitid caller was handed this task's exit status
+    /// while it was still a zombie on the run queue, so the exit-log record
+    /// created at slot recycling is born consumed (no double reporting).
+    pub wait_reported: bool,
+
+    /// CLONE_VFORK: true from creation until this child execve()s or exits.
+    /// The parent's clone() call spins on this flag — vfork semantics require
+    /// the parent suspended while the child borrows its address space (musl's
+    /// posix_spawn runs the child on a buffer inside the parent's stack
+    /// frame; an unsuspended parent races it and both corrupt each other).
+    pub vfork_pending: bool,
 }
 
 impl Task {
@@ -289,6 +311,7 @@ impl Task {
             egid: 0,
             signal_pending: 0,
             signal_mask: 0,
+            shared_signal_pending: 0,
             signal_actions: [DEFAULT_SIGACTION; 64],
             clear_child_tid: 0,
             heap_start: 0,
@@ -300,6 +323,8 @@ impl Task {
             altstack_sp: 0,
             altstack_size: 0,
             altstack_flags: 2, // SS_DISABLE
+            wait_reported: false,
+            vfork_pending: false,
         };
         temp_task.cwd[0] = b'/';
 
@@ -531,6 +556,9 @@ impl Task {
         let signal_mask_ptr = (dest as usize + core::mem::offset_of!(Task, signal_mask)) as *mut u64;
         core::ptr::write_volatile(signal_mask_ptr, 0);
 
+        let shared_sp_ptr = (dest as usize + core::mem::offset_of!(Task, shared_signal_pending)) as *mut u64;
+        core::ptr::write_volatile(shared_sp_ptr, 0);
+
         let clear_child_tid_ptr = (dest as usize + core::mem::offset_of!(Task, clear_child_tid)) as *mut usize;
         core::ptr::write_volatile(clear_child_tid_ptr, 0);
 
@@ -620,6 +648,7 @@ impl Task {
             egid: 0,
             signal_pending: 0,
             signal_mask: 0,
+            shared_signal_pending: 0,
             signal_actions: [DEFAULT_SIGACTION; 64],
             clear_child_tid: 0,
             heap_start: 0,
@@ -631,6 +660,8 @@ impl Task {
             altstack_sp: 0,
             altstack_size: 0,
             altstack_flags: 2, // SS_DISABLE
+            wait_reported: false,
+            vfork_pending: false,
         };
         task.cwd[0] = b'/';
 

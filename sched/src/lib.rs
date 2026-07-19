@@ -30,7 +30,7 @@ pub mod signal;
 pub mod task;
 
 pub use clone::{fork_current, clone_thread};
-pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack};
+pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal};
 pub use futex::{futex_wait, futex_wake, futex_requeue};
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -73,14 +73,27 @@ static TASK_EXIT_HOOK:  AtomicPtr<()>   = AtomicPtr::new(core::ptr::null_mut());
 const EXIT_LOG_LEN: usize = 256;
 
 #[derive(Clone, Copy)]
-struct ExitRecord { pid: Pid, code: i32 }
+struct ExitRecord {
+    pid:  Pid,
+    code: i32,
+    /// tgid of the parent process, resolved at exit time (the forking thread
+    /// may itself die before the child is waited on).
+    parent_tgid: Pid,
+    pgid: Pid,
+    /// Thread-group leaders only — plain threads are never waitable.
+    is_process: bool,
+    /// Set once a wait4/waitid caller has been handed this record (or the
+    /// zombie was already reported straight off the run queue), so the same
+    /// child is never reported twice.
+    consumed: bool,
+}
 static EXIT_LOG: Mutex<[Option<ExitRecord>; EXIT_LOG_LEN]> = Mutex::new([const { None }; EXIT_LOG_LEN]);
 static EXIT_LOG_IDX: Mutex<usize> = Mutex::new(0);
 
-fn log_exit(pid: Pid, code: i32) {
+fn log_exit(pid: Pid, code: i32, parent_tgid: Pid, pgid: Pid, is_process: bool, consumed: bool) {
     let mut log = EXIT_LOG.lock();
     let mut idx = EXIT_LOG_IDX.lock();
-    log[*idx] = Some(ExitRecord { pid, code });
+    log[*idx] = Some(ExitRecord { pid, code, parent_tgid, pgid, is_process, consumed });
     *idx = (*idx + 1) % EXIT_LOG_LEN;
 }
 
@@ -174,6 +187,81 @@ pub fn wake_up_an_idle_cpu() {
     }
 }
 
+// ── Stop-the-world fork (CoW quiesce) ────────────────────────────────────────
+//
+// fork() from a multithreaded process must not let sibling threads run while
+// clone_as downgrades live PTEs: a sibling holding a stale writable TLB
+// entry writes straight into a frame the child now shares — no fault, no
+// copy, silent cross-process corruption (observed as std's Process struct
+// getting zeroed under brush/tokio). Dispatch of the forking thread's
+// siblings is suspended (pick_next filter) and every mid-flight sibling is
+// IPI'd off its CPU before the address-space clone begins; the final
+// broadcast TLB shootdown then closes the stale-entry window before any
+// sibling can run again.
+static QUIESCE_TGID:   AtomicU32 = AtomicU32::new(0);
+static QUIESCE_EXCEPT: AtomicU32 = AtomicU32::new(0);
+
+/// pick_next filter: true when `pid`/`tgid` must not be dispatched right now.
+pub(crate) fn quiesce_filtered(tgid: Pid, pid: Pid) -> bool {
+    let q = QUIESCE_TGID.load(Ordering::Acquire);
+    q != 0 && tgid == q && pid != QUIESCE_EXCEPT.load(Ordering::Acquire)
+}
+
+/// Suspend dispatch of every other thread of `tgid` and wait until none is
+/// mid-flight on any CPU. Returns false (no-op) for single-threaded
+/// processes. Serializes concurrent forks via CAS on the quiesce slot.
+/// Call `unquiesce_thread_group` when done (only if this returned true).
+pub fn quiesce_thread_group(tgid: Pid, except: Pid) -> bool {
+    {
+        let rq = RUN_QUEUE.lock();
+        let mut has_sibling = false;
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(t) = rq.get(i) {
+                if t.tgid == tgid && t.pid != except { has_sibling = true; break; }
+            }
+        }
+        if !has_sibling { return false; }
+    }
+    // One quiesce at a time system-wide.
+    while QUIESCE_TGID
+        .compare_exchange(0, tgid, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        irq_window();
+        core::hint::spin_loop();
+    }
+    QUIESCE_EXCEPT.store(except, Ordering::Release);
+    // Kick every sibling off its CPU and wait for the last one to land.
+    loop {
+        let mut running_cpu: Option<usize> = None;
+        {
+            let rq = RUN_QUEUE.lock();
+            for i in 0..runqueue::MAX_TASKS {
+                if let Some(t) = rq.get(i) {
+                    if t.tgid == tgid && t.pid != except {
+                        if let Some(c) = t.on_cpu { running_cpu = Some(c); break; }
+                    }
+                }
+            }
+        }
+        match running_cpu {
+            None => break,
+            Some(c) => {
+                trigger_preempt(c);
+                irq_window();
+                core::hint::spin_loop();
+            }
+        }
+    }
+    true
+}
+
+/// Release the dispatch suspension taken by `quiesce_thread_group`.
+pub fn unquiesce_thread_group() {
+    QUIESCE_EXCEPT.store(0, Ordering::Release);
+    QUIESCE_TGID.store(0, Ordering::Release);
+}
+
 pub fn alloc_pid() -> Pid {
     let mut pid_guard = NEXT_PID.lock();
     let pid = *pid_guard;
@@ -237,6 +325,125 @@ pub fn deliver_signal(pid: Pid, signo: u32) -> isize {
     };
     if woke { wake_up_an_idle_cpu(); }
     ret
+}
+
+/// Deliver a *process-directed* signal (child-exit SIGCHLD, kill(pid), killpg)
+/// to thread group `tgid`.
+///
+/// POSIX (signal(7)): a process-directed signal is delivered to *any one*
+/// thread in the group that does not currently block it. Our per-thread
+/// `signal_pending`/`signal_mask` model, plus a naive "always target the tgid
+/// leader" delivery, breaks this: tokio/mio block SIGCHLD on the runtime's
+/// main thread (the leader) and handle it on another thread, so a SIGCHLD
+/// pinned onto the leader is never deliverable — `check_and_deliver_signals`
+/// skips it (masked), the reaping handler never runs, and `child.wait().await`
+/// hangs forever. Here we instead pick a thread that has the signal unmasked,
+/// preferring one already Blocked (so the delivery also wakes it); only if
+/// every thread blocks it do we fall back to the leader, leaving it pending
+/// until some thread unblocks it — again exactly POSIX.
+pub fn deliver_signal_process(tgid: Pid, signo: u32) -> isize {
+    if signo == 0 || signo > 64 { return -22; }
+    let bit = 1u64 << (signo - 1);
+    let mut woke = false;
+    let ret = {
+        let mut rq = RUN_QUEUE.lock();
+        let min_vr = rq.min_vruntime();
+        // Prefer a Blocked thread with the signal unmasked; otherwise any
+        // unmasked thread; otherwise the leader.
+        let mut chosen: Option<usize> = None;
+        let mut chosen_blocked = false;
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(t) = rq.get(i) {
+                if t.tgid == tgid && (t.signal_mask & bit) == 0 {
+                    let blocked = t.state == TaskState::Blocked;
+                    if chosen.is_none() || (blocked && !chosen_blocked) {
+                        chosen = Some(i);
+                        chosen_blocked = blocked;
+                        if blocked { break; }
+                    }
+                }
+            }
+        }
+        match chosen {
+            Some(idx) => {
+                // A thread can take it now: deliver directly, waking it if blocked.
+                if let Some(t) = rq.get_mut(idx) {
+                    t.signal_pending |= bit;
+                    if t.state == TaskState::Blocked {
+                        t.state = TaskState::Ready;
+                        t.place(min_vr);
+                        woke = true;
+                    }
+                    0
+                } else { -3 }
+            }
+            None => {
+                // Every thread currently masks it (e.g. std's fork() blocks all
+                // signals). Park it at the process level on the leader; the next
+                // thread to return to user space with it unmasked — typically
+                // right after the fork thread's rt_sigprocmask re-unblock —
+                // claims it in check_and_deliver_signals. No thread is woken:
+                // the unblock is itself a syscall whose return runs the claim.
+                match rq.find_pid_idx(tgid) {
+                    Some(li) => { if let Some(l) = rq.get_mut(li) { l.shared_signal_pending |= bit; } 0 }
+                    None => -3, // ESRCH
+                }
+            }
+        }
+    };
+    if woke { wake_up_an_idle_cpu(); }
+    ret
+}
+
+/// Mark a CLONE_VFORK child as done borrowing the parent's address space
+/// (called at successful execve and at exit) — releases the parent from its
+/// vfork suspension loop in `clone_thread`.
+pub fn vfork_complete(pid: Pid) {
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        t.vfork_pending = false;
+    }
+}
+
+/// kill(0-probe): 0 if `pid` names a live task, else -ESRCH.
+pub fn exists_probe(pid: Pid) -> isize {
+    if RUN_QUEUE.lock().find_pid(pid).is_some() { 0 } else { -3 }
+}
+
+/// Deliver `signo` to every *process* (thread-group leader) in process group
+/// `pgid` — kill(-pgid) / killpg semantics. One delivery per process; the
+/// per-thread routing happens at handler-delivery time via the shared
+/// TGID action table.
+pub fn kill_pgrp(pgid: Pid, signo: u32) -> isize {
+    // Collect targets first: deliver_signal takes the RUN_QUEUE lock itself.
+    let mut targets = [0 as Pid; runqueue::MAX_TASKS];
+    let mut n = 0;
+    {
+        let rq = RUN_QUEUE.lock();
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(t) = rq.get(i) {
+                if t.pgid == pgid && t.pid == t.tgid && n < targets.len() {
+                    targets[n] = t.pid;
+                    n += 1;
+                }
+            }
+        }
+    }
+    if n == 0 { return -3; } // ESRCH — no such process group
+    if signo == 0 { return 0; } // existence probe only
+    for &pid in &targets[..n] {
+        // Process-directed (killpg): route to an unmasked thread per process.
+        let _ = deliver_signal_process(pid, signo);
+    }
+    0
+}
+
+/// Process-level pending signals parked on the caller's thread-group leader
+/// (see `Task::shared_signal_pending`) — sigpending(2) must report these too.
+pub fn shared_pending_signals() -> u64 {
+    let pid = current_pid();
+    let rq = RUN_QUEUE.lock();
+    let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return 0 };
+    rq.find_pid(tgid).map(|l| l.shared_signal_pending).unwrap_or(0)
 }
 
 pub fn pending_signals() -> u64 {
@@ -452,6 +659,114 @@ pub fn init() {}
 /// NB: a `pid` of `u32::MAX` (POSIX `-1`, "any child") is not resolved here —
 /// `find_pid_idx`/`get_exit_code` can't match it — so it yields `None`
 /// (ECHILD). Waiting for an unspecified child is a separate feature.
+/// Child selector for `wait_try` — mirrors wait4(2)'s pid argument.
+#[derive(Clone, Copy)]
+pub enum WaitSel {
+    Pid(Pid),
+    Any,
+    Pgid(Pid),
+}
+
+/// One non-blocking wait attempt's outcome.
+pub enum WaitTry {
+    /// A matching child terminated: (pid, exit_code). The child is marked
+    /// reaped and will not be reported again.
+    Reaped(Pid, i32),
+    /// Matching children exist but none has terminated yet.
+    StillRunning,
+    /// The caller has no matching children at all — wait4 returns ECHILD.
+    NoChildren,
+}
+
+/// Non-consuming variant of `wait_try`: reports whether a matching child
+/// exists / has terminated without reaping it. Used by waitid() calls that
+/// don't include WEXITED (stopped/continued-only waits must leave exit
+/// statuses for a later wait4 to collect).
+pub fn wait_peek(sel: WaitSel, caller_tgid: Pid) -> WaitTry {
+    wait_scan(sel, caller_tgid, false)
+}
+
+/// Single non-blocking scan for a terminated child of `caller_tgid`.
+///
+/// Children forked from *any* thread of the caller count (their `ppid` is
+/// the forking thread's pid, so parentage is matched through the parent's
+/// tgid). Zombies still occupying a run-queue slot are reported in place —
+/// marking `wait_reported` — because only the owning CPU's scheduler loop
+/// may physically reap the slot (see `wait_pid`'s comment); the eventual
+/// `EXIT_LOG` record is then born consumed. This closes the
+/// SIGCHLD→wait4(WNOHANG) race: the child is waitable the moment it is a
+/// zombie, not only once the scheduler has recycled its slot.
+pub fn wait_try(sel: WaitSel, caller_tgid: Pid) -> WaitTry {
+    wait_scan(sel, caller_tgid, true)
+}
+
+fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool) -> WaitTry {
+    let matches = |pid: Pid, pgid: Pid| -> bool {
+        match sel {
+            WaitSel::Pid(p)  => pid == p,
+            WaitSel::Any     => true,
+            WaitSel::Pgid(g) => pgid == g,
+        }
+    };
+
+    // Both phases run under the RUN_QUEUE lock, taking EXIT_LOG inside it —
+    // the same lock order as the scheduler's zombie reap (which logs the
+    // exit and removes the slot under RUN_QUEUE). Scanning the two under
+    // separate lock acquisitions had a TOCTOU: a child reaped between the
+    // exit-log read and the queue read appeared in neither, and a blocking
+    // wait4 spuriously returned ECHILD for a child that just exited.
+    let mut rq = RUN_QUEUE.lock();
+
+    // Phase 1: live (or zombie-but-unrecycled) children on the run queue.
+    let mut found_live = false;
+    let mut zombie: Option<(usize, Pid, i32)> = None;
+    for i in 0..runqueue::MAX_TASKS {
+        let (pid, tgid, ppid, pgid, state, code, reported) = match rq.get(i) {
+            Some(t) => (t.pid, t.tgid, t.ppid, t.pgid, t.state, t.exit_code, t.wait_reported),
+            None => continue,
+        };
+        if pid != tgid { continue; } // threads are not waitable children
+        let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
+        if parent_tgid != caller_tgid || !matches(pid, pgid) { continue; }
+        if state == TaskState::Zombie {
+            if !reported && zombie.is_none() {
+                zombie = Some((i, pid, code));
+            }
+            // Reported zombies are logically reaped already — skip.
+        } else {
+            found_live = true;
+        }
+    }
+    if let Some((i, pid, code)) = zombie {
+        if consume {
+            if let Some(t) = rq.get_mut(i) { t.wait_reported = true; }
+        }
+        return WaitTry::Reaped(pid, code);
+    }
+
+    // Phase 2: already-recycled children in the exit log (still under the
+    // run-queue lock, so a concurrent reap cannot slip between the phases).
+    {
+        let mut log = EXIT_LOG.lock();
+        for entry in log.iter_mut().filter_map(|e| e.as_mut()) {
+            if entry.consumed || !entry.is_process { continue; }
+            if entry.parent_tgid != caller_tgid { continue; }
+            if matches(entry.pid, entry.pgid) {
+                if consume { entry.consumed = true; }
+                return WaitTry::Reaped(entry.pid, entry.code);
+            }
+        }
+    }
+
+    if found_live { WaitTry::StillRunning } else { WaitTry::NoChildren }
+}
+
+/// The calling task's blocked-signal mask.
+pub fn current_sigmask() -> u64 {
+    let pid = current_pid();
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.signal_mask).unwrap_or(0)
+}
+
 pub fn wait_pid(pid: Pid) -> Option<(Pid, i32)> {
     loop {
         {
@@ -804,7 +1119,7 @@ fn scheduler_run_loop() -> ! {
             // critical section that resolves the task's final state.
             let zombie = {
                 let mut rq = RUN_QUEUE.lock();
-                match rq.get_mut(idx) {
+                let zinfo = match rq.get_mut(idx) {
                     Some(t) if t.pid == pid => {
                         let delta = ticks().saturating_sub(dispatched_at);
                         t.charge_vruntime(delta);
@@ -813,18 +1128,25 @@ fn scheduler_run_loop() -> ! {
                             t.state = TaskState::Ready;
                         }
                         if t.state == TaskState::Zombie {
-                            // Log the exit code BEFORE the slot disappears:
-                            // a parent polling wait_pid on another CPU must
-                            // always find the pid either in the queue or in
-                            // EXIT_LOG — a gap between remove() and a later
-                            // log_exit() makes waitpid return ECHILD.
-                            log_exit(t.pid, t.exit_code);
-                            rq.remove(idx)
+                            Some((t.pid, t.exit_code, t.ppid, t.pgid,
+                                  t.pid == t.tgid, t.wait_reported))
                         } else {
                             None
                         }
                     }
                     _ => None,
+                };
+                if let Some((zpid, code, ppid, pgid, is_proc, reported)) = zinfo {
+                    // Log the exit code BEFORE the slot disappears:
+                    // a parent polling wait_pid/wait_try on another CPU must
+                    // always find the pid either in the queue or in
+                    // EXIT_LOG — a gap between remove() and a later
+                    // log_exit() makes waitpid return ECHILD.
+                    let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
+                    log_exit(zpid, code, parent_tgid, pgid, is_proc, reported);
+                    rq.remove(idx)
+                } else {
+                    None
                 }
             };
 
@@ -880,12 +1202,28 @@ pub fn exit(code: i32) -> ! {
         }
     }
 
-    {
+    let (tgid, ppid) = {
         let mut rq = RUN_QUEUE.lock();
-        if let Some(t) = rq.find_pid_mut(pid) {
-            t.state = TaskState::Zombie;
-            t.exit_code = code;
+        match rq.find_pid_mut(pid) {
+            Some(t) => {
+                t.state = TaskState::Zombie;
+                t.exit_code = code;
+                t.vfork_pending = false; // release a vfork-suspended parent
+                (t.tgid, t.ppid)
+            }
+            None => (pid, 0),
         }
+    };
+    // POSIX: the parent gets SIGCHLD when a child *process* terminates.
+    // Threads (pid != tgid) don't signal, and the signal goes to the parent's
+    // thread-group leader since the signal-action table is TGID-shared.
+    // Ignored by default (SIGCHLD is in the default-ignore set), but it wakes
+    // a parent blocked in read/epoll_wait with EINTR — which is exactly how
+    // tokio's child-reaping learns the child is gone.
+    if pid == tgid && ppid != 0 {
+        // Process-directed: deliver to any parent thread that hasn't masked
+        // SIGCHLD (tokio blocks it on the main thread), not blindly the leader.
+        let _ = deliver_signal_process(tgid_of(ppid), 17);
     }
     yield_now("exit");
     loop { core::hint::spin_loop(); }
@@ -946,11 +1284,12 @@ pub fn kill_next_group_member(exit_code: i32) -> GroupKillStep {
         None => return GroupKillStep::Done,
     };
 
-    let (tpid, on_cpu) = {
+    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported) = {
         let t = rq.get_mut(idx).unwrap();
         t.state = TaskState::Zombie;
         t.exit_code = exit_code;
-        (t.pid, t.on_cpu)
+        t.vfork_pending = false; // release a vfork-suspended parent
+        (t.pid, t.on_cpu, t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported)
     };
 
     if let Some(cpu) = on_cpu {
@@ -966,7 +1305,8 @@ pub fn kill_next_group_member(exit_code: i32) -> GroupKillStep {
     // Ready/Blocked and not on any CPU: nothing is executing its code, so
     // it's safe to reap right now — mirrors scheduler_run_loop's own
     // post-dispatch reap exactly (log, remove, hook, free kernel stack).
-    log_exit(tpid, exit_code);
+    let parent_tgid = rq.find_pid(tppid).map(|p| p.tgid).unwrap_or(tppid);
+    log_exit(tpid, exit_code, parent_tgid, tpgid, t_is_proc, t_reported);
     let reaped = rq.remove(idx);
     drop(rq);
 
