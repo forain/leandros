@@ -19,6 +19,7 @@ dependencies = [
  "leandros-lib",
  "mm",
  "sched",
+ "tty-server",
 ]
 
 [[package]]
@@ -31,6 +32,7 @@ dependencies = [
  "leandros-lib",
  "mm",
  "sched",
+ "tty-server",
 ]
 
 [[package]]

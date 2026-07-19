@@ -17,7 +17,7 @@ use sched::{
     sys_sigaction, sys_sigprocmask, sys_sigaltstack, restore_signal_frame,
     current_pid, current_ppid,
     ticks, yield_now, irq_window, exit, spawn_user,
-    deliver_signal, pending_signals, clear_pending_signal, replace_signal_mask,
+    pending_signals, clear_pending_signal, replace_signal_mask,
     current_reply_port, set_current_reply_port, set_clear_child_tid,
     block_on_port_prepare, block_on_port_cancel, block_on_port_commit,
     replace_address_space,
@@ -672,6 +672,61 @@ pub fn dispatch(
     frame_ptr: usize,
 ) -> isize {
     let ret = dispatch_inner(number, a0, a1, a2, a3, a4, a5, frame_ptr);
+    if SYSCALL_TRACE_EINVAL && ret == -22 && current_pid() >= 3 {
+        let _g = TRACE_LOCK.lock();
+        #[cfg(target_arch = "aarch64")]
+        if frame_ptr != 0 {
+            let uf = unsafe { &*(frame_ptr as *const sched::context::UserFrame) };
+            crate::serial_print_str("[SC-EINVAL] caller-pc=");
+            crate::serial_print_hex(uf.elr_el1 as usize);
+            crate::serial_print_str(" lr=");
+            crate::serial_print_hex(uf.x[30] as usize);
+            // Walk the user frame-pointer chain for a short backtrace:
+            // AArch64 frame record is [x29] = previous x29, [x29+8] = LR.
+            let mut fp = uf.x[29] as usize;
+            for _ in 0..6 {
+                if fp == 0 || fp % 8 != 0 { break; }
+                let mut rec = [0u8; 16];
+                let ok = with_current_address_space(|as_| as_.read_user_buf(fp, &mut rec))
+                    .unwrap_or(false);
+                if !ok { break; }
+                let prev_fp = usize::from_ne_bytes(rec[0..8].try_into().unwrap());
+                let lr = usize::from_ne_bytes(rec[8..16].try_into().unwrap());
+                crate::serial_print_str(" <- ");
+                crate::serial_print_hex(lr);
+                if prev_fp <= fp { break; }
+                fp = prev_fp;
+            }
+            crate::serial_print_str("\n");
+        }
+        crate::serial_print_str("[SC-EINVAL] nr=");
+        crate::serial_print_hex(number);
+        crate::serial_print_str(" a0=");
+        crate::serial_print_hex(a0);
+        crate::serial_print_str(" a1=");
+        crate::serial_print_hex(a1);
+        crate::serial_print_str(" a2=");
+        crate::serial_print_hex(a2);
+        crate::serial_print_str(" a3=");
+        crate::serial_print_hex(a3);
+        crate::serial_print_str(" pid=");
+        crate::serial_print_hex(current_pid() as usize);
+        crate::serial_print_str("\n");
+    }
+    if SYSCALL_TRACE && current_pid() >= 3 && number != 0x16 && number != 0x65 {
+        let _g = TRACE_LOCK.lock();
+        crate::serial_print_str("[SC] p=");
+        crate::serial_print_hex(current_pid() as usize);
+        crate::serial_print_str(" nr=");
+        crate::serial_print_hex(number);
+        crate::serial_print_str(" a0=");
+        crate::serial_print_hex(a0);
+        crate::serial_print_str(" a1=");
+        crate::serial_print_hex(a1);
+        crate::serial_print_str(" ret=");
+        crate::serial_print_hex(ret as usize);
+        crate::serial_print_str("\n");
+    }
     // Fire any expired POSIX timers before returning to user-space.
     tty_server::check_timers(current_pid());
     ret
@@ -679,6 +734,31 @@ pub fn dispatch(
 
 
 
+
+/// Log every syscall entry (number + pid) over serial. Extremely verbose —
+/// enable only while bisecting a userland bring-up failure.
+const SYSCALL_TRACE: bool = false;
+
+/// Log every syscall that fails with EINVAL (nr + args + pid). Cheap and
+/// high-signal while bringing up a new ported binary.
+const SYSCALL_TRACE_EINVAL: bool = false;
+
+/// Serializes multi-part trace prints — concurrent syscalls on other CPUs
+/// otherwise interleave their serial output into an unreadable shuffle.
+static TRACE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+/// Unsupported syscalls are logged unconditionally: they are rare, and a
+/// silent ENOSYS is the single most common cause of a ported binary dying
+/// with no output.
+fn log_enosys(number: usize) -> isize {
+    let _g = TRACE_LOCK.lock();
+    crate::serial_print_str("[SYSCALL] ENOSYS nr=");
+    crate::serial_print_hex(number);
+    crate::serial_print_str(" pid=");
+    crate::serial_print_hex(current_pid() as usize);
+    crate::serial_print_str("\n");
+    -38
+}
 
 fn dispatch_inner(
     number: usize,
@@ -720,7 +800,7 @@ fn dispatch_inner(
         // ── Process lifecycle ─────────────────────────────────────────────────
         EXIT    => { vfs_close_all_current(); exit(a0 as i32) }
         SYS_SPAWN => sys_spawn(a0, a1, a2),
-        WAIT4   => sys_wait(a0, a1),
+        WAIT4   => sys_wait4(a0, a1, a2, a3),
         WAITID  => sys_waitid(a0, a1, a2, a3),
         GETPID  => current_pid() as isize,
         GETPPID => sys_getppid(),
@@ -738,7 +818,9 @@ fn dispatch_inner(
         CLONE   => sys_clone_or_fork(a0, a1, a2, a3, a4, frame_ptr),
         #[cfg(not(target_arch = "aarch64"))]
         FORK    => {
-            let parent_pid = current_pid();
+            // fd tables are keyed by tgid — see the identical note in
+            // sys_clone_or_fork's fork arm.
+            let parent_pid = sched::tgid_of(current_pid());
             // The fd table must be duplicated BEFORE the child is enqueued:
             // on SMP another CPU can run the child immediately, and its
             // first fd-allocating syscall would otherwise see an empty table.
@@ -746,6 +828,9 @@ fn dispatch_inner(
                 let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
                                        &[parent_pid as u64, child_pid as u64]);
                 let _ = vfs::handle(&msg, parent_pid);
+                let nmsg = make_vfs_msg(net_server::NET_FORK_DUP,
+                                        &[parent_pid as u64, child_pid as u64]);
+                let _ = net_server::handle(&nmsg, parent_pid);
             })
         }
 
@@ -921,7 +1006,7 @@ fn dispatch_inner(
         EPOLL_CTL      => sys_epoll_ctl(a0, a1, a2, a3),
         EPOLL_PWAIT | EPOLL_PWAIT2 => sys_epoll_wait(a0, a1, a2, a3),
         EVENTFD2       => sys_eventfd2(a0, a1),
-        SIGNALFD4      => -38,
+        SIGNALFD4      => log_enosys(number),
 
         // ── Scheduling policy/affinity ────────────────────────────────────────
         SCHED_SETSCHEDULER | SCHED_SETPARAM => 0,
@@ -941,11 +1026,11 @@ fn dispatch_inner(
 
         // ── Modern Linux (stubs) ──────────────────────────────────────────────
         MEMBARRIER  => 0,
-        RSEQ        => -38, // ENOSYS
+        RSEQ        => -38, // ENOSYS (musl probes and falls back silently)
         STATX       => sys_statx(a0, a1, a2, a3, a4),
         OPENAT2     => sys_openat(a0, a1, a2, a3),
         CLOSE_RANGE => sys_close_range(a0, a1, a2),
-        PIDFD_OPEN  => -38,
+        PIDFD_OPEN  => log_enosys(number),
 
         // ── Credentials ───────────────────────────────────────────────────────
         GETUID  => sched::current_uid()  as isize,
@@ -994,9 +1079,9 @@ fn dispatch_inner(
         POSIX_FADVISE | SYNC_FILE_RANGE | READAHEAD => 0,
 
         // ── inotify (no filesystem events in Leandros) ──────────────────────────
-        INOTIFY_INIT1 | INOTIFY_ADD_WATCH | INOTIFY_RM_WATCH => -38,
+        INOTIFY_INIT1 | INOTIFY_ADD_WATCH | INOTIFY_RM_WATCH => log_enosys(number),
 
-        _ => -38, // ENOSYS
+        _ => log_enosys(number),
     }
 }
 
@@ -1403,71 +1488,152 @@ fn encode_wait_status(code: i32) -> i32 {
     (code & 0xff) << 8
 }
 
-/// sys_wait(pid, status_ptr) — block until `pid` exits; write its wait status.
+/// True when the calling task has a deliverable signal — the condition under
+/// which a blocking syscall must bail out with EINTR so the signal gets
+/// delivered on the return-to-user path. Disposition-aware: ignored signals
+/// never interrupt (see sched::has_deliverable_signal).
+fn interrupted() -> bool {
+    sched::has_deliverable_signal()
+}
+
+/// sys_wait4(pid, status_ptr, options, rusage) — full wait4(2) semantics.
 ///
-/// Blocks until the target task becomes a Zombie, writes the POSIX-encoded
-/// wait status to `status_ptr` (user-space aligned pointer), reaps the task,
-/// and returns the reaped child's pid (as POSIX `waitpid` requires).
+/// pid > 0: that child; pid == -1: any child; pid == 0: caller's process
+/// group; pid < -1: process group -pid. WNOHANG returns 0 when matching
+/// children exist but none has terminated. rusage is accepted and ignored.
+///
+/// Children forked from any thread of the caller are waitable (parentage is
+/// matched through the caller's tgid — see sched::wait_try).
 ///
 /// Returns:
 ///   > 0           — the reaped child's pid
-///   -10 (ECHILD)  — `pid` is not a waitable child
+///   0             — WNOHANG and no terminated child yet
+///   -4  (EINTR)   — interrupted by a deliverable signal (e.g. SIGCHLD)
+///   -10 (ECHILD)  — no matching waitable children
 ///   -14 (EFAULT)  — `status_ptr` is null, misaligned, or out of range
-fn sys_wait(pid_raw: usize, status_ptr: usize) -> isize {
+fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) -> isize {
     // Validate before blocking — catches bad pointers before we yield.
     if status_ptr != 0 && !validate_user_ptr_aligned(status_ptr, core::mem::size_of::<i32>(), 4) {
         return -14;
     }
+    const WNOHANG: usize = 1;
+    // pid_t travels as a sign-extended long; truncating through u32 maps
+    // both 0xFFFF_FFFF and 0xFFFF_FFFF_FFFF_FFFF to -1.
+    let pid_i = pid_raw as u32 as i32;
+    let sel = if pid_i == -1 {
+        sched::WaitSel::Any
+    } else if pid_i == 0 {
+        sched::WaitSel::Pgid(sched::current_pgid())
+    } else if pid_i < -1 {
+        sched::WaitSel::Pgid((-(pid_i as i64)) as u32)
+    } else {
+        sched::WaitSel::Pid(pid_i as u32)
+    };
+    let caller_tgid = sched::current_tgid();
 
-    match sched::wait_pid(pid_raw as u32) {
-        Some((reaped_pid, code)) => {
-            if status_ptr != 0 {
-                // Fault the destination in first: a demand-paged .bss status
-                // variable would otherwise make write_user_buf fail silently.
-                prefault_user(status_ptr, 4);
-                let status = encode_wait_status(code);
-                // Write through the address space's own virt->phys/HHDM path
-                // rather than dereferencing the raw user pointer: this syscall
-                // runs in kernel context (ring 0 / EL1) but the target page
-                // may still be a CoW-shared, PTE-read-only page belonging to
-                // the current process (e.g. its own stack right after a
-                // fork()) — a raw write would fault in a context this
-                // kernel's page-fault handlers don't attempt to recover from.
-                with_current_address_space_mut(|as_| {
-                    as_.write_user_buf(status_ptr, &status.to_ne_bytes())
-                });
+    loop {
+        match sched::wait_try(sel, caller_tgid) {
+            sched::WaitTry::Reaped(pid, code) => {
+                if status_ptr != 0 {
+                    // Fault the destination in first: a demand-paged .bss
+                    // status variable would otherwise make write_user_buf
+                    // fail silently.
+                    prefault_user(status_ptr, 4);
+                    let status = encode_wait_status(code);
+                    // Write through the address space's own virt->phys/HHDM
+                    // path rather than dereferencing the raw user pointer:
+                    // this syscall runs in kernel context (ring 0 / EL1) but
+                    // the target page may still be a CoW-shared, PTE-read-only
+                    // page belonging to the current process (e.g. its own
+                    // stack right after a fork()) — a raw write would fault
+                    // in a context this kernel's page-fault handlers don't
+                    // attempt to recover from.
+                    with_current_address_space_mut(|as_| {
+                        as_.write_user_buf(status_ptr, &status.to_ne_bytes())
+                    });
+                }
+                return pid as isize;
             }
-            reaped_pid as isize
+            sched::WaitTry::NoChildren => return -10, // ECHILD
+            sched::WaitTry::StillRunning => {
+                if options & WNOHANG != 0 { return 0; }
+                if interrupted() { return -4; } // EINTR
+                irq_window();
+                yield_now("wait4");
+            }
         }
-        None => -10, // ECHILD — no such waitable child
     }
 }
 
 /// sys_waitid(idtype, id, infop, options) — wait for a child state change.
 ///
-/// Simplified: delegates to wait_pid; fills siginfo_t at infop with exit code.
-fn sys_waitid(idtype: usize, id: usize, infop: usize, _options: usize) -> isize {
+/// Shares sched::wait_try with sys_wait4. With WNOHANG and no terminated
+/// child, returns 0 with a zeroed siginfo (si_pid == 0), per waitid(2) —
+/// brush polls exactly this shape after every SIGCHLD.
+fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
+    const WNOHANG:    usize = 1;
+    const WSTOPPED:   usize = 2;
+    const WEXITED:    usize = 4;
+    const WCONTINUED: usize = 8;
+    // Linux requires at least one wait-state flag.
+    if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 { return -22; } // EINVAL
     // idtype: 0=P_ALL, 1=P_PID, 2=P_PGID
-    let target_pid: u32 = if idtype == 1 { id as u32 } else { u32::MAX };
-    let code = sched::wait_pid(target_pid);
-    if let Some((_reaped_pid, exit_code)) = code {
-        // Fill siginfo_t (si_signo=SIGCHLD at +0, si_code at +8, si_pid at +16, si_status at +24).
-        // Built as a kernel-local buffer and copied out via write_user_buf
-        // (virt->phys/HHDM), not a raw dereference of `infop`: this syscall
-        // runs in kernel context, and the target page may be a CoW-shared,
-        // PTE-read-only page the current process's own fault handler never
-        // gets a chance to promote in that context.
+    let sel = match idtype {
+        0 => sched::WaitSel::Any,
+        1 => sched::WaitSel::Pid(id as u32),
+        2 => sched::WaitSel::Pgid(id as u32),
+        _ => return -22, // EINVAL
+    };
+    let caller_tgid = sched::current_tgid();
+    // Without WEXITED the caller only wants stop/continue reports (e.g.
+    // brush's poll_for_stopped_children uses WSTOPPED|WNOHANG) — exit
+    // statuses must be left for a later wait4/WEXITED wait to collect.
+    // This kernel has no stopped-task states yet, so such a wait can only
+    // ever report "no state change" (or ECHILD).
+    let reap_exits = options & WEXITED != 0;
+
+    // Fill siginfo_t (si_signo=SIGCHLD at +0, si_code at +8, si_pid at +16,
+    // si_status at +24). Built as a kernel-local buffer and copied out via
+    // write_user_buf (virt->phys/HHDM), not a raw dereference of `infop`:
+    // this syscall runs in kernel context, and the target page may be a
+    // CoW-shared, PTE-read-only page the current process's own fault handler
+    // never gets a chance to promote in that context.
+    let write_info = |pid: u32, code: i32| {
         if infop != 0 && validate_user_buf(infop, 128) {
             let mut buf = [0u8; 128];
-            buf[0..4].copy_from_slice(&17i32.to_ne_bytes());          // si_signo = SIGCHLD
-            buf[8..12].copy_from_slice(&1i32.to_ne_bytes());          // si_code = CLD_EXITED
-            buf[16..20].copy_from_slice(&target_pid.to_ne_bytes());   // si_pid
-            buf[24..28].copy_from_slice(&exit_code.to_ne_bytes());    // si_status
+            if pid != 0 {
+                buf[0..4].copy_from_slice(&17i32.to_ne_bytes());   // si_signo = SIGCHLD
+                buf[8..12].copy_from_slice(&1i32.to_ne_bytes());   // si_code = CLD_EXITED
+                buf[16..20].copy_from_slice(&pid.to_ne_bytes());   // si_pid
+                buf[24..28].copy_from_slice(&code.to_ne_bytes());  // si_status
+            }
             with_current_address_space_mut(|as_| as_.write_user_buf(infop, &buf));
         }
-        0
-    } else {
-        -10 // ECHILD
+    };
+
+    loop {
+        let attempt = if reap_exits {
+            sched::wait_try(sel, caller_tgid)
+        } else {
+            sched::wait_peek(sel, caller_tgid)
+        };
+        match attempt {
+            sched::WaitTry::Reaped(pid, code) if reap_exits => {
+                write_info(pid, code);
+                return 0;
+            }
+            sched::WaitTry::NoChildren => return -10, // ECHILD
+            _ => {
+                // StillRunning, or a terminated child we must not consume.
+                if options & WNOHANG != 0 {
+                    write_info(0, 0); // "no state change" — zeroed si_pid
+                    return 0;
+                }
+                if interrupted() { return -4; } // EINTR
+                irq_window();
+                yield_now("waitid");
+            }
+        }
     }
 }
 
@@ -1705,6 +1871,7 @@ fn sys_poll(fds_ptr: usize, nfds: usize, timeout_ms: isize) -> isize {
         }
         if nready > 0 { return nready; }
         if !infinite && ticks() >= deadline { return 0; }
+        if interrupted() { return -4; } // EINTR
 
         irq_window();
 
@@ -1757,6 +1924,7 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
         }
         if nready > 0 { return nready; }
         if !infinite && ticks() >= deadline { return 0; }
+        if interrupted() { return -4; } // EINTR
 
         irq_window();
 
@@ -1781,6 +1949,7 @@ fn sys_nanosleep(rqtp_ptr: usize, _rmtp: usize) -> isize {
     if ticks_needed == 0 { return 0; }
     let deadline = ticks().wrapping_add(ticks_needed);
     loop {
+        if interrupted() { return -4; } // EINTR (rmtp not filled — callers retry)
         irq_window();
 
         yield_now("nanosleep");
@@ -1881,18 +2050,41 @@ fn sys_rt_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
 }
 
 fn sys_rt_sigreturn(frame_ptr: usize) -> isize {
-    // Restore the pre-signal user register context from the rt_sigframe on the
-    // user stack, including the signal mask.  The return value written into
-    // the frame's x0 / rax slot will be overwritten by the restored context.
+    // Restore the pre-signal user register context from the rt_sigframe on
+    // the user stack, including the signal mask.
     restore_signal_frame(frame_ptr);
-    0 // overwritten by the restored rax/x0 unless frame_ptr was 0 (no active frame)
+    // The trap-return asm stores THIS function's return value into the
+    // frame's x0/rax slot AFTER dispatch returns — i.e. after the restore
+    // above already rewrote the frame. Return the just-restored value so
+    // that store is a no-op. Returning a literal 0 here clobbered the
+    // interrupted syscall's result: an EINTR'd read() appeared to return 0
+    // (EOF) to userspace instead of -EINTR, losing the whole EINTR contract
+    // for any process with a real signal handler.
+    if frame_ptr == 0 { return 0; }
+    let uf = unsafe { &*(frame_ptr as *const sched::context::UserFrame) };
+    #[cfg(target_arch = "aarch64")]
+    { uf.x[0] as isize }
+    #[cfg(target_arch = "x86_64")]
+    { uf.rax as isize }
 }
 
+/// kill(2) with full pid-argument semantics: pid > 0 signals that process;
+/// pid == 0 the caller's process group; pid < -1 the process group -pid;
+/// pid == -1 every process the caller may signal (not supported → EPERM).
+/// sig == 0 is the existence probe (no signal sent).
 fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
-    let pid = pid_raw as u32;
     let sig = sig_raw as u32;
     if sig >= 64 { return -22; } // EINVAL
-    deliver_signal(pid, sig)
+    let pid_i = pid_raw as u32 as i32; // pid_t travels sign-extended
+    if pid_i > 0 {
+        if sig == 0 { return sched::exists_probe(pid_i as u32); }
+        // kill(2) is process-directed: route to a thread in the target group
+        // that hasn't masked `sig`, not blindly its leader.
+        return sched::deliver_signal_process(sched::tgid_of(pid_i as u32), sig);
+    }
+    if pid_i == -1 { return -1; } // EPERM — kill-everything unsupported
+    let pgid = if pid_i == 0 { sched::current_pgid() } else { (-(pid_i as i64)) as u32 };
+    sched::kill_pgrp(pgid, sig)
 }
 
 fn sys_getppid() -> isize {
@@ -2386,6 +2578,25 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     if !new_as.map(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, stack_flags) {
         drop(new_as); return -12;
     }
+
+    // Map the sigreturn trampoline page (read+exec) and fill in the
+    // rt_sigreturn stub. Signal delivery points a handler's return address
+    // here when the sigaction carries no SA_RESTORER — the Linux-aarch64
+    // convention musl relies on (see sched::signal::SIGRET_TRAMPOLINE_VA).
+    #[cfg(target_arch = "aarch64")]
+    {
+        let tramp_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::EXECUTE;
+        if new_as.map(sched::signal::SIGRET_TRAMPOLINE_VA, 4096, tramp_flags) {
+            // movz x8, #139 (rt_sigreturn) ; svc #0
+            let stub: [u8; 8] = {
+                let mut b = [0u8; 8];
+                b[0..4].copy_from_slice(&0xD280_1168u32.to_le_bytes());
+                b[4..8].copy_from_slice(&0xD400_0001u32.to_le_bytes());
+                b
+            };
+            new_as.write_user_buf(sched::signal::SIGRET_TRAMPOLINE_VA, &stub);
+        }
+    }
     let heap_start = new_as.heap_start;
 
     // ── Build initial user stack ──────────────────────────────────────────────
@@ -2524,6 +2735,13 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // ── VFS lifecycle and address space replacement ────────────────────────────
     let cloexec_msg = make_vfs_msg(vfs::VFS_EXEC_CLOEXEC, &[pid as u64]);
     let _ = vfs::handle(&cloexec_msg, pid);
+    let net_cloexec = make_vfs_msg(net_server::NET_EXEC_CLOEXEC, &[pid as u64]);
+    let _ = net_server::handle(&net_cloexec, pid);
+
+    // A CLONE_VFORK child stops borrowing the parent's address space here —
+    // release the parent from its vfork suspension (POSIX: parent resumes on
+    // the child's successful exec or exit).
+    sched::vfork_complete(pid);
 
     replace_address_space(*new_as, pt_root, heap_start, elf_info.entry, user_sp);
 }
@@ -2552,9 +2770,17 @@ fn read_input_byte() -> Option<u8> {
                 // EV_KEY down (1) or serial typematic (2)
                 if ev.value == 1 || ev.value == 2 {
                     if ev.value == 2 {
-                        // Serial input: code is already ASCII
+                        // Serial input: code is already a raw byte. Pass
+                        // everything through — dropping control bytes here
+                        // swallowed the ESC of every ANSI escape sequence, so
+                        // a terminal's cursor-position report ("\x1b[n;mR")
+                        // arrived as "[n;mR" and crossterm's CPR parser never
+                        // matched (brush bailed out of interactive mode).
+                        // Line-discipline signal bytes (^C/^Z/^\) were
+                        // already intercepted at the UART drain; UTF-8 lead/
+                        // continuation bytes (>= 0x80) must survive too.
                         let c = ev.code;
-                        if c < 128 && (c > 31 || c == 10 || c == 13 || c == 9 || c == 127 || c == 8) {
+                        if c > 0 && c <= 255 {
                             return Some(c as u8);
                         }
                         continue;
@@ -2661,8 +2887,11 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
         // Only take the serial fast path if this fd hasn't been dup2'd to a
         // real VFS target (e.g. Command::output()'s pipe capture) — otherwise
         // the redirection is silently shadowed and the writer's data never
-        // reaches the pipe. See fd_redirected's doc comment.
-        1 | 2 if !vfs::fd_redirected(pid, fd) => {
+        // reaches the pipe. See fd_redirected's doc comment. A /dev/std*
+        // proxy whose target is the raw console (a dup'd stdio fd, possibly
+        // dup2'd back onto 1/2) is console output too.
+        f if (matches!(f, 1 | 2) && !vfs::fd_redirected(pid, f))
+            || (f < net_server::SOCK_FD_BASE && vfs::fd_is_console_stdio(pid, f)) => {
             let mut kbuf = Vec::with_capacity(count);
             unsafe { kbuf.set_len(count); }
 
@@ -2674,6 +2903,23 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
 
             serial_write_raw(kbuf.as_slice());
             count as isize
+        }
+
+        // write(2) on a socket ≡ send(fd, buf, len, 0). Without this route
+        // the VFS answers EBADF for the socket fd range — tokio's signal
+        // driver writes its self-pipe (a socketpair end) with plain write().
+        // Blocking sockets loop on a full ring; O_NONBLOCK ones see EAGAIN.
+        f if f >= net_server::SOCK_FD_BASE && f < EPOLL_FD_BASE => {
+            let msg = make_vfs_msg(net_server::NET_SEND,
+                &[fd as u64, buf_ptr as u64, count as u64, 0, 0, 0]);
+            let nonblock = net_fd_nonblock(pid, fd);
+            loop {
+                let n = net_reply_val(&net_server::handle(&msg, pid));
+                if n != -11 || nonblock { return n; }
+                if interrupted() { return -4; } // EINTR
+                irq_window();
+                yield_now("sys_write_sock");
+            }
         }
 
         _ => {
@@ -2694,8 +2940,11 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
     match fd {
         // Only take the serial fast path if fd 0 hasn't been dup2'd to a real
         // VFS target (e.g. a pipe feeding a child's stdin) — see fd_redirected's
-        // doc comment and the identical guard in sys_write.
-        0 if !vfs::fd_redirected(current_pid(), 0) => {
+        // doc comment and the identical guard in sys_write. Console /dev/std*
+        // proxies (dup'd stdio fds) read the console too.
+        f if (f == 0 && !vfs::fd_redirected(current_pid(), 0))
+            || (f < net_server::SOCK_FD_BASE
+                && vfs::fd_is_console_stdio(current_pid(), f)) => {
             if count == 0 { return 0; }
             if !is_kernel && !validate_user_buf(buf_ptr, count) { return -14; }
             // Edge-triggered epoll consumers (crossterm/mio's TTY reader is
@@ -2728,6 +2977,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                             spins += 1;
                             if spins >= NONBLOCK_RETRY_SPINS { return -11; } // EAGAIN
                         }
+                        if interrupted() { return -4; } // EINTR
                         irq_window();
 
                         yield_now("sys_read_stdin");
@@ -2758,6 +3008,30 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
             
             n as isize
         }
+        // read(2) on a socket ≡ recv(fd, buf, len, 0) — see the matching
+        // socket route in sys_write. Blocking sockets loop on an empty ring
+        // (std's exec-error socketpair is CLOEXEC but NOT nonblocking — the
+        // parent's read must block until the child's exec/exit closes the
+        // peer); O_NONBLOCK ones (mio/tokio) see EAGAIN immediately.
+        f if f >= net_server::SOCK_FD_BASE && f < EPOLL_FD_BASE => {
+            if !is_kernel {
+                if count != 0 && !validate_user_buf(buf_ptr, count) { return -14; }
+                if count != 0 {
+                    with_current_address_space_mut(|as_| as_.prefault_range(buf_ptr, count));
+                }
+            }
+            let pid = current_pid();
+            let msg = make_vfs_msg(net_server::NET_RECV,
+                &[fd as u64, buf_ptr as u64, count as u64, 0, 0, 0]);
+            let nonblock = net_fd_nonblock(pid, fd);
+            loop {
+                let n = net_reply_val(&net_server::handle(&msg, pid));
+                if n != -11 || nonblock { return n; }
+                if interrupted() { return -4; } // EINTR
+                irq_window();
+                yield_now("sys_read_sock");
+            }
+        }
         _ => {
             if !is_kernel {
                 if count != 0 && !validate_user_buf(buf_ptr, count) { return -14; }
@@ -2778,6 +3052,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
             loop {
                 let n = vfs_reply_val(&vfs::handle(&msg, pid));
                 if n != -11 || nonblock { return n; }
+                if interrupted() { return -4; } // EINTR
                 irq_window();
 
                 yield_now("sys_read_vfs");
@@ -2845,6 +3120,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
                 let n = loop {
                     let v = vfs_reply_val(&vfs::handle(&msg, pid));
                     if v != -11 { break v; }
+                    if interrupted() { break -4; } // EINTR (short read if partial)
                     irq_window();
                     yield_now("sys_readv_vfs");
                 };
@@ -3108,7 +3384,7 @@ fn sys_close(fd: usize) -> isize {
     let pid = current_pid();
     // Epoll fds sit above the socket range, so this check must come before
     // the `>= SOCK_FD_BASE` net-server routing or they never get freed.
-    if fd >= EPOLL_FD_BASE && fd < EPOLL_FD_BASE + MAX_EPOLL_INSTANCES {
+    if fd >= EPOLL_FD_BASE && fd < EPOLL_FD_BASE + MAX_EPOLL_FDS {
         return sys_epoll_close(fd);
     }
     // Route socket fds (≥ SOCK_FD_BASE) to the net server.
@@ -3471,6 +3747,9 @@ static STDIO_FLAGS: spin::Mutex<[StdioFlags; MAX_STDIO_FLAGS_PROCS]> =
     spin::Mutex::new([const { StdioFlags { pid: 0, in_use: false, flags: 0 } }; MAX_STDIO_FLAGS_PROCS]);
 
 fn stdio_nonblocking(pid: u32) -> bool {
+    // Keyed by tgid — stdio flags are process-wide state, and a worker
+    // thread must observe O_NONBLOCK set by the main thread (and vice versa).
+    let pid = sched::tgid_of(pid);
     STDIO_FLAGS.lock().iter().any(|s| s.in_use && s.pid == pid && s.flags & O_NONBLOCK != 0)
 }
 
@@ -3485,6 +3764,7 @@ fn stdio_flags_close_all(pid: u32) {
 }
 
 fn set_stdio_flags(pid: u32, flags: u32) {
+    let pid = sched::tgid_of(pid); // process-wide — see stdio_nonblocking
     let mut tbl = STDIO_FLAGS.lock();
     if let Some(s) = tbl.iter_mut().find(|s| s.in_use && s.pid == pid) {
         s.flags = flags;
@@ -3495,8 +3775,41 @@ fn set_stdio_flags(pid: u32, flags: u32) {
     }
 }
 
+/// True when a socket fd has O_NONBLOCK set (SOCK_NONBLOCK at creation or
+/// fcntl F_SETFL later) — decides whether the kernel read/write loops block.
+fn net_fd_nonblock(pid: u32, fd: usize) -> bool {
+    let msg = make_vfs_msg(net_server::NET_GETFL, &[fd as u64]);
+    let v = net_reply_val(&net_server::handle(&msg, pid));
+    v >= 0 && v & 0x800 != 0
+}
+
 fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     let pid = current_pid();
+    if fd >= EPOLL_FD_BASE && fd < EPOLL_FD_BASE + MAX_EPOLL_FDS {
+        return epoll_fcntl(fd, cmd);
+    }
+    if fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE {
+        const F_DUPFD: usize = 0;
+        const F_GETFL: usize = 3;
+        const F_SETFL: usize = 4;
+        const F_DUPFD_CLOEXEC: usize = 1030;
+        return match cmd {
+            F_DUPFD | F_DUPFD_CLOEXEC => {
+                let msg = make_vfs_msg(net_server::NET_DUP,
+                    &[fd as u64, (cmd == F_DUPFD_CLOEXEC) as u64]);
+                net_reply_val(&net_server::handle(&msg, pid))
+            }
+            F_SETFL => {
+                let msg = make_vfs_msg(net_server::NET_SETFL, &[fd as u64, arg as u64]);
+                net_reply_val(&net_server::handle(&msg, pid))
+            }
+            F_GETFL => {
+                let msg = make_vfs_msg(net_server::NET_GETFL, &[fd as u64]);
+                net_reply_val(&net_server::handle(&msg, pid))
+            }
+            _ => 0, // F_GETFD/F_SETFD: cloexec is tracked at creation/dup
+        };
+    }
     if fd <= 2 {
         const F_GETFL: usize = 3;
         const F_SETFL: usize = 4;
@@ -3844,11 +4157,15 @@ fn vfs_close_all_current() {
 fn vfs_close_all_for(pid: u32) {
     let msg = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[pid as u64]);
     let _ = vfs::handle(&msg, pid);
-    // Also close net sockets and TTY fds.
-    let nmsg = make_vfs_msg(net_server::NET_CLOSE_ALL, &[pid as u64]);
-    let _ = net_server::handle(&nmsg, pid);
+    // Net sockets and epoll instances are per-process (tgid-keyed), so only
+    // a thread-group leader's exit tears them down — a plain pthread exiting
+    // must not close the sockets its siblings still use.
+    if sched::tgid_of(pid) == pid {
+        let nmsg = make_vfs_msg(net_server::NET_CLOSE_ALL, &[pid as u64]);
+        let _ = net_server::handle(&nmsg, pid);
+        epoll_close_all(pid);
+    }
     tty_server::close_all(pid);
-    epoll_close_all(pid);
     stdio_flags_close_all(pid);
 }
 
@@ -3858,6 +4175,12 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     const FIONREAD: usize = 0x541B;
     const FBIOGET_VSCREENINFO: usize = 0x4600;
     const ENOTTY: isize = -25;
+
+    // Console proxies (/dev/tty, dup'd stdio fds) answer terminal ioctls
+    // exactly like the console fd they alias — crossterm probes TIOCGWINSZ
+    // and termios on its /dev/tty handle.
+    let fd = if fd > 2 && fd < net_server::SOCK_FD_BASE
+        && vfs::fd_is_console_stdio(pid, fd) { 0 } else { fd };
 
     if cmd == FIONREAD && fd == 0 {
         if arg == 0 || !validate_user_buf(arg, 4) { return -14; }
@@ -4010,6 +4333,21 @@ fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     net_reply_val(&net_server::handle(&msg, pid))
 }
 
+/// Shared blocking wrapper for the four send/recv syscalls: a blocking
+/// socket loops on EAGAIN (EINTR-aware), a nonblocking one — O_NONBLOCK on
+/// the fd or MSG_DONTWAIT in `flags` — returns it straight through.
+fn net_blocking_op(pid: u32, sockfd: usize, flags: usize, msg: &Message) -> isize {
+    const MSG_DONTWAIT: usize = 0x40;
+    let nonblock = flags & MSG_DONTWAIT != 0 || net_fd_nonblock(pid, sockfd);
+    loop {
+        let n = net_reply_val(&net_server::handle(msg, pid));
+        if n != -11 || nonblock { return n; }
+        if interrupted() { return -4; } // EINTR
+        irq_window();
+        yield_now("net_blocking_op");
+    }
+}
+
 fn sys_sendto(sockfd: usize, buf_ptr: usize, len: usize,
               flags: usize, addr_ptr: usize, addrlen: usize) -> isize {
     if len != 0 && !validate_user_buf(buf_ptr, len) { return -14; }
@@ -4017,7 +4355,7 @@ fn sys_sendto(sockfd: usize, buf_ptr: usize, len: usize,
     let msg = make_vfs_msg(net_server::NET_SEND,
         &[sockfd as u64, buf_ptr as u64, len as u64,
           flags as u64, addr_ptr as u64, addrlen as u64]);
-    net_reply_val(&net_server::handle(&msg, pid))
+    net_blocking_op(pid, sockfd, flags, &msg)
 }
 
 fn sys_recvfrom(sockfd: usize, buf_ptr: usize, len: usize,
@@ -4027,7 +4365,7 @@ fn sys_recvfrom(sockfd: usize, buf_ptr: usize, len: usize,
     let msg = make_vfs_msg(net_server::NET_RECV,
         &[sockfd as u64, buf_ptr as u64, len as u64,
           flags as u64, addr_ptr as u64, addrlen_ptr as u64]);
-    net_reply_val(&net_server::handle(&msg, pid))
+    net_blocking_op(pid, sockfd, flags, &msg)
 }
 
 fn sys_sendmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
@@ -4035,7 +4373,7 @@ fn sys_sendmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SENDMSG,
         &[sockfd as u64, msghdr_ptr as u64, flags as u64]);
-    net_reply_val(&net_server::handle(&msg, pid))
+    net_blocking_op(pid, sockfd, flags, &msg)
 }
 
 fn sys_recvmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
@@ -4043,7 +4381,7 @@ fn sys_recvmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_RECVMSG,
         &[sockfd as u64, msghdr_ptr as u64, flags as u64]);
-    net_reply_val(&net_server::handle(&msg, pid))
+    net_blocking_op(pid, sockfd, flags, &msg)
 }
 
 fn sys_net_shutdown(sockfd: usize, how: usize) -> isize {
@@ -4110,10 +4448,17 @@ struct EpollInterest {
     events: u32,
     data:   u64,
     in_use: bool,
+    /// Edge-trigger bookkeeping: the VFS object event-seq (see PipeRing::seq /
+    /// EVENTFD_SEQ) last delivered for this interest. An EPOLLET fd re-fires
+    /// only when its seq advances past this, so a permanently-level-ready fd
+    /// (pipe at EOF, mio's never-drained eventfd waker) can't pin tokio's
+    /// reactor in a 0-timeout epoll spin, yet no genuine edge is ever dropped.
+    /// u64::MAX = never delivered, so the first readiness always fires.
+    last_seq: u64,
 }
 
 impl EpollInterest {
-    const fn empty() -> Self { Self { fd: -1, events: 0, data: 0, in_use: false } }
+    const fn empty() -> Self { Self { fd: -1, events: 0, data: 0, in_use: false, last_seq: u64::MAX } }
 }
 
 #[derive(Clone, Copy)]
@@ -4121,12 +4466,62 @@ struct EpollInstance {
     owner_pid: u32,
     interests: [EpollInterest; MAX_EPOLL_INTERESTS],
     in_use:    bool,
+    /// Number of epoll fds (EPOLL_FDS entries) referencing this instance.
+    /// fcntl(F_DUPFD*) on an epoll fd creates a second fd aliasing the same
+    /// instance (mio/tokio clone their registry handle this way); the
+    /// instance is only torn down when the last alias closes.
+    refs:      u32,
 }
 
 impl EpollInstance {
     const fn empty() -> Self {
         Self { owner_pid: 0, interests: [const { EpollInterest::empty() }; MAX_EPOLL_INTERESTS],
-               in_use: false }
+               in_use: false, refs: 0 }
+    }
+}
+
+/// Epoll fd numbers are an indirection over instance slots so that two fds
+/// can alias one instance (dup semantics). fd = EPOLL_FD_BASE + entry index.
+const MAX_EPOLL_FDS: usize = 32;
+
+#[derive(Clone, Copy)]
+struct EpollFdEntry { in_use: bool, slot: u8 }
+
+static EPOLL_FDS: spin::Mutex<[EpollFdEntry; MAX_EPOLL_FDS]> =
+    spin::Mutex::new([EpollFdEntry { in_use: false, slot: 0 }; MAX_EPOLL_FDS]);
+
+/// Resolve an epoll fd to its instance slot, or None if out of range/closed.
+fn epoll_slot_of(epfd: usize) -> Option<usize> {
+    if !(EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&epfd) { return None; }
+    let t = EPOLL_FDS.lock();
+    let e = t[epfd - EPOLL_FD_BASE];
+    if e.in_use { Some(e.slot as usize) } else { None }
+}
+
+/// fcntl on an epoll fd. Supports the dup commands mio/tokio actually use;
+/// flag commands are accepted as no-ops (epoll fds carry no meaningful
+/// status flags here).
+fn epoll_fcntl(epfd: usize, cmd: usize) -> isize {
+    const F_DUPFD: usize = 0;
+    const F_DUPFD_CLOEXEC: usize = 1030;
+    match cmd {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let slot = match epoll_slot_of(epfd) { Some(s) => s, None => return -9 };
+            let mut ep = EPOLL_INSTANCES.lock();
+            if !ep[slot].in_use || sched::tgid_of(ep[slot].owner_pid) != sched::current_tgid() {
+                return -9;
+            }
+            let mut t = EPOLL_FDS.lock();
+            match t.iter().position(|e| !e.in_use) {
+                Some(i) => {
+                    t[i] = EpollFdEntry { in_use: true, slot: slot as u8 };
+                    ep[slot].refs += 1;
+                    (EPOLL_FD_BASE + i) as isize
+                }
+                None => -24, // EMFILE
+            }
+        }
+        _ => 0, // F_GETFD/F_SETFD/F_GETFL/F_SETFL
     }
 }
 
@@ -4151,35 +4546,54 @@ const EPOLL_EVENT_DATA_OFF: usize = 8;
 static EPOLL_INSTANCES: spin::Mutex<[EpollInstance; MAX_EPOLL_INSTANCES]> =
     spin::Mutex::new([const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES]);
 
-/// Close an epoll fd: release its instance slot (and all interests with it).
+/// Close an epoll fd alias: drop its fd entry; release the instance slot
+/// (and all interests with it) when the last alias goes away.
 fn sys_epoll_close(epfd: usize) -> isize {
-    let slot = epfd - EPOLL_FD_BASE;
+    let slot = match epoll_slot_of(epfd) { Some(s) => s, None => return -9 }; // EBADF
     let tgid = sched::current_tgid();
     let mut ep = EPOLL_INSTANCES.lock();
     if !ep[slot].in_use || sched::tgid_of(ep[slot].owner_pid) != tgid { return -9; } // EBADF
-    ep[slot] = EpollInstance::empty();
+    EPOLL_FDS.lock()[epfd - EPOLL_FD_BASE].in_use = false;
+    ep[slot].refs = ep[slot].refs.saturating_sub(1);
+    if ep[slot].refs == 0 { ep[slot] = EpollInstance::empty(); }
     0
 }
 
-/// Free every epoll instance owned by `pid`. Called on process exit so a
-/// process that dies without closing its epoll fds can't leak instance slots
-/// (there are only MAX_EPOLL_INSTANCES of them for the whole system).
+/// Free every epoll instance owned by `pid` (and all fd aliases onto them).
+/// Called on process exit so a process that dies without closing its epoll
+/// fds can't leak instance slots (there are only MAX_EPOLL_INSTANCES of
+/// them for the whole system).
 fn epoll_close_all(pid: u32) {
     let mut ep = EPOLL_INSTANCES.lock();
-    for inst in ep.iter_mut() {
-        if inst.in_use && inst.owner_pid == pid { *inst = EpollInstance::empty(); }
+    let mut t = EPOLL_FDS.lock();
+    for (i, inst) in ep.iter_mut().enumerate() {
+        if inst.in_use && inst.owner_pid == pid {
+            for e in t.iter_mut() {
+                if e.in_use && e.slot as usize == i { e.in_use = false; }
+            }
+            *inst = EpollInstance::empty();
+        }
     }
 }
 
 fn sys_epoll_create1(_flags: usize) -> isize {
-    let pid = current_pid();
+    // Owner is the thread group, not the creating thread: the instance must
+    // survive its creator thread's exit and be cleaned up with the process.
+    let pid = sched::current_tgid();
     let mut ep = EPOLL_INSTANCES.lock();
+    let mut t = EPOLL_FDS.lock();
+    let fd_idx = match t.iter().position(|e| !e.in_use) {
+        Some(i) => i,
+        None => return -24, // EMFILE
+    };
     match ep.iter().position(|e| !e.in_use) {
         Some(i) => {
             ep[i] = EpollInstance::empty();
             ep[i].in_use    = true;
             ep[i].owner_pid = pid;
-            (i + EPOLL_FD_BASE) as isize
+            ep[i].refs      = 1;
+            t[fd_idx] = EpollFdEntry { in_use: true, slot: i as u8 };
+            (fd_idx + EPOLL_FD_BASE) as isize
         }
         None => -12, // ENOMEM
     }
@@ -4192,10 +4606,9 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     const CTL_DEL: usize = 2;
     const CTL_MOD: usize = 3;
 
-    let slot = if epfd >= EPOLL_FD_BASE && epfd < EPOLL_FD_BASE + MAX_EPOLL_INSTANCES {
-        epfd - EPOLL_FD_BASE
-    } else {
-        return -9; // EBADF
+    let slot = match epoll_slot_of(epfd) {
+        Some(s) => s,
+        None => return -9, // EBADF
     };
 
     // Ownership is thread-group-scoped, not task-scoped: an epoll instance is
@@ -4221,7 +4634,7 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
                           .or_else(|| inst.interests.iter().position(|i| !i.in_use));
             match idx {
                 Some(i) => {
-                    inst.interests[i] = EpollInterest { fd: fd as i32, events, data, in_use: true };
+                    inst.interests[i] = EpollInterest { fd: fd as i32, events, data, in_use: true, last_seq: u64::MAX };
                     0
                 }
                 None => -12, // ENOMEM — too many interests
@@ -4249,10 +4662,9 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
     if maxevents == 0 { return -22; }
     if !validate_user_buf(events_ptr, maxevents * EPOLL_EVENT_SIZE) { return -14; }
 
-    let slot = if epfd >= EPOLL_FD_BASE && epfd < EPOLL_FD_BASE + MAX_EPOLL_INSTANCES {
-        epfd - EPOLL_FD_BASE
-    } else {
-        return -9;
+    let slot = match epoll_slot_of(epfd) {
+        Some(s) => s,
+        None => return -9, // EBADF
     };
 
     let pid = current_pid();
@@ -4279,18 +4691,38 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
     let infinite = timeout == usize::MAX;
     let deadline = ticks().wrapping_add((timeout as u64) / 10);
 
+    // EPOLLET (edge-triggered) bit and POLLIN. This kernel emulates epoll
+    // level for fds without an edge source (net sockets, fd 0-2, whose
+    // readiness only asserts when they actually have data/space and which
+    // tokio drains itself), edge-triggered for VFS fds via their event-seq.
+    // The seq (Some(_)) lets us re-fire an EPOLLET interest only when the
+    // object signalled a new event, so a permanently-level-ready fd — a pipe
+    // at EOF (POLLIN|POLLHUP forever), or mio's never-drained eventfd waker —
+    // fires once per real edge instead of pinning tokio's reactor in a
+    // 0-timeout spin, while a self-pipe byte written between two epoll_waits
+    // is never dropped (its seq advanced).
     loop {
         let nready = {
-            let ep = EPOLL_INSTANCES.lock();
+            let mut ep = EPOLL_INSTANCES.lock();
             let mut n = 0usize;
             let base = events_ptr;
-            for interest in ep[slot].interests.iter() {
-                if !interest.in_use || n >= maxevents { break; }
-                let ready_events = probe_fd_events(pid, interest.fd as usize, interest.events);
-                if ready_events != 0 {
+            for i in 0..MAX_EPOLL_INTERESTS {
+                if n >= maxevents { break; }
+                let interest = ep[slot].interests[i];
+                if !interest.in_use { continue; }
+                let (cur, seq) = probe_fd_events_seq(pid, interest.fd as usize, interest.events);
+                // Edge-triggered fds (seq present) fire only when the seq has
+                // advanced since we last delivered; level fds fire on any ready
+                // bit. Non-VFS fds report no seq and stay level-triggered.
+                let fire = cur != 0 && match seq {
+                    Some(s) => s != interest.last_seq,
+                    None    => true,
+                };
+                if fire {
+                    if let Some(s) = seq { ep[slot].interests[i].last_seq = s; }
                     let off = n * EPOLL_EVENT_SIZE;
                     unsafe {
-                        core::ptr::write((base + off) as *mut u32, ready_events);
+                        core::ptr::write((base + off) as *mut u32, cur);
                         // See the read_unaligned note in sys_epoll_ctl.
                         core::ptr::write_unaligned(
                             (base + off + EPOLL_EVENT_DATA_OFF) as *mut u64, interest.data);
@@ -4302,6 +4734,7 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
         };
         if nready > 0 { return nready as isize; }
         if timeout == 0 || (!infinite && ticks() >= deadline) { return 0; }
+        if interrupted() { return -4; } // EINTR — lets e.g. tokio's SIGCHLD handler run
 
         irq_window();
         yield_now("epoll_wait");
@@ -4323,6 +4756,17 @@ fn poll_fd_state(pid: u32, fd: usize) -> u32 {
     if fd == 1 || fd == 2 {
         return POLLOUT;
     }
+    // Console proxy fds (/dev/tty, a dup'd stdin) mirror fd 0/1/2 readiness —
+    // crossterm registers its /dev/tty handle in epoll and waits on it for
+    // the cursor-position reply; VFS_POLL reports DevStdio not-ready, which
+    // hung that wait.
+    if fd < net_server::SOCK_FD_BASE && vfs::fd_is_console_stdio(pid, fd) {
+        return if evdev_server::has_key_event(0) || crate::serial_has_data() {
+            POLLIN | POLLOUT
+        } else {
+            POLLOUT
+        };
+    }
     if fd >= net_server::SOCK_FD_BASE {
         let msg = make_vfs_msg(net_server::NET_POLL, &[fd as u64]);
         let r = net_reply_val(&net_server::handle(&msg, pid));
@@ -4343,6 +4787,30 @@ fn probe_fd_events(pid: u32, fd: usize, requested: u32) -> u32 {
     const POLLNVAL: u32 = 0x0020;
     let state = poll_fd_state(pid, fd);
     (state & requested) | (state & (POLLERR | POLLHUP | POLLNVAL))
+}
+
+/// Like `probe_fd_events`, but also returns the fd's edge-trigger event-seq
+/// so `sys_epoll_wait` can emulate EPOLLET without dropping edges. `Some(seq)`
+/// is a monotonic per-object counter for VFS fds (pipes/eventfd/timerfd — see
+/// VFS handle_poll); `None` means the fd has no edge source (net sockets, fd
+/// 0-2), so the caller must treat it level-triggered. The revents masking
+/// matches `probe_fd_events` exactly.
+fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>) {
+    const POLLERR:  u32 = 0x0008;
+    const POLLHUP:  u32 = 0x0010;
+    const POLLNVAL: u32 = 0x0020;
+
+    // Only real VFS fds carry a seq; fd 0-2 and net sockets stay level.
+    if fd <= 2 || fd >= net_server::SOCK_FD_BASE {
+        return (probe_fd_events(pid, fd, requested), None);
+    }
+    let msg = make_vfs_msg(vfs::VFS_POLL, &[fd as u64]);
+    let reply = vfs::handle(&msg, pid);
+    let r = vfs_reply_val(&reply);
+    let state = if r < 0 { POLLNVAL } else { r as u32 };
+    let seq = u64::from_le_bytes(reply.data[8..16].try_into().unwrap_or([0u8; 8]));
+    let masked = (state & requested) | (state & (POLLERR | POLLHUP | POLLNVAL));
+    (masked, Some(seq))
 }
 
 fn sys_eventfd2(initval: usize, _flags: usize) -> isize {
@@ -4464,6 +4932,7 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize)
             if has_e { unsafe { core::ptr::write_bytes(efds as *mut u8, 0, bytes); } }
             return nready;
         }
+        if interrupted() { return -4; } // EINTR
 
         irq_window();
 
@@ -4617,7 +5086,10 @@ fn sys_getitimer(which: usize, cur_ptr: usize) -> isize {
 /// sys_sigpending(set_ptr) — return the set of pending signals.
 fn sys_sigpending(set_ptr: usize) -> isize {
     if !validate_user_buf(set_ptr, 8) { return -14; }
-    let pending = pending_signals();
+    // Thread-pending plus process-level pending: a process-directed signal
+    // that every thread currently masks is parked on the leader
+    // (shared_signal_pending) but is still "pending" to sigpending(2).
+    let pending = pending_signals() | sched::shared_pending_signals();
     if with_current_address_space(|as_| as_.write_user_buf(set_ptr, &pending.to_ne_bytes())).unwrap_or(false) {
         0
     } else {
@@ -4669,7 +5141,9 @@ fn sys_clone_or_fork(
 
     if flags & CLONE_VM != 0 {
         const CLONE_THREAD: usize = 0x0001_0000;
-        let parent_pid = current_pid();
+        // Identify the parent by tgid: its fd table is keyed there, not by the
+        // (possibly non-leader) forking thread's pid.
+        let parent_pid = sched::tgid_of(current_pid());
         clone_thread(flags, child_stack, tls, ctid, frame_ptr, |child_pid| {
             // Real CLONE_THREAD siblings (pthread_create) share the leader's
             // tgid and, today, have no fd table of their own at all — every
@@ -4688,17 +5162,27 @@ fn sys_clone_or_fork(
                 let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
                                        &[parent_pid as u64, child_pid as u64]);
                 let _ = vfs::handle(&msg, parent_pid);
+                let nmsg = make_vfs_msg(net_server::NET_FORK_DUP,
+                                        &[parent_pid as u64, child_pid as u64]);
+                let _ = net_server::handle(&nmsg, parent_pid);
             }
         })
     } else {
         let _ = (child_stack, _ptid, tls, ctid);
-        let parent_pid = current_pid();
+        // fd tables are keyed by tgid, so the parent must be identified by its
+        // thread-group id — a fork issued by a non-leader thread (e.g. a tokio
+        // worker calling std's pre_exec fork path) otherwise names a pid the
+        // fd-table search never matches, and the child inherits an empty table.
+        let parent_pid = sched::tgid_of(current_pid());
         // Duplicate the fd table before the child becomes runnable (see the
         // FORK arm of syscall_dispatch for the SMP race this prevents).
         fork_current(frame_ptr, |child_pid| {
             let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
                                    &[parent_pid as u64, child_pid as u64]);
             let _ = vfs::handle(&msg, parent_pid);
+            let nmsg = make_vfs_msg(net_server::NET_FORK_DUP,
+                                    &[parent_pid as u64, child_pid as u64]);
+            let _ = net_server::handle(&nmsg, parent_pid);
         })
     }
 }
