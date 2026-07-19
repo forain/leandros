@@ -97,6 +97,14 @@ fn ok_reply()        -> Message { make_reply(0) }
 fn err_reply(e: i32) -> Message { make_reply(e as i64) }
 fn val_reply(v: u64) -> Message { make_reply(v as i64) }
 
+/// VFS_POLL reply carrying both the revents bitmask (data[0..8]) and the
+/// object's edge-trigger sequence (data[8..16]). See handle_poll / PipeRing::seq.
+fn poll_reply(revents: u32, seq: u64) -> Message {
+    let mut m = make_reply(revents as i64);
+    m.data[8..16].copy_from_slice(&seq.to_le_bytes());
+    m
+}
+
 // ── IPC Call helper ──────────────────────────────────────────────────────────
 
 /// Synchronously call another server via its IPC port.
@@ -214,6 +222,7 @@ pub enum VnodeKind {
 /// /dev/input/event0) never returns and the caller spins in-kernel forever.
 pub fn fd_nonblock(pid: u32, fd: usize) -> bool {
     const O_NONBLOCK: u32 = 0o4000;
+    let pid = sched::tgid_of(pid); // fd tables are per-process
     let mut tbls = FD_TABLES.lock();
     if let Some(tbl) = find_tbl(pid, &mut *tbls) {
         if fd < MAX_FDS && tbl.fds[fd].in_use {
@@ -221,6 +230,32 @@ pub fn fd_nonblock(pid: u32, fd: usize) -> bool {
         }
     }
     false
+}
+
+/// True when `fd` is a `/dev/stdin|stdout|stderr` proxy whose target is the
+/// raw console (untracked fd 0-2, or itself another console proxy). The
+/// kernel's console fast paths treat such fds exactly like bare 0/1/2 —
+/// without this, a dup'd stdio fd dup2'd back onto 0/1/2 (command_fds'
+/// identity mappings) would recurse inside the VFS instead of reaching the
+/// serial console.
+pub fn fd_is_console_stdio(pid: u32, fd: usize) -> bool {
+    let pid = sched::tgid_of(pid);
+    if fd >= MAX_FDS { return false; }
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return false };
+    let mut cur = fd;
+    // Follow at most a few proxy hops (cycles collapse to "console").
+    for _ in 0..4 {
+        if !tbl.fds[cur].in_use { return cur <= 2; }
+        match tbl.fds[cur].kind {
+            VnodeKind::DevStdio { target_fd } => {
+                if target_fd == cur { return true; }
+                cur = target_fd;
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Transfer ownership of a mounted-file fd out of `pid`'s FD table.
@@ -363,6 +398,15 @@ struct PipeRing {
     // EOF/EPIPE/POLLHUP must only fire once the LAST fd on that end is closed.
     readers:     u32,
     writers:     u32,
+    /// Monotonic event counter, bumped on every state change that can newly
+    /// assert readiness (data written, data read → write-end space freed,
+    /// last writer closed → EOF/HUP, last reader closed → EPIPE/ERR). The
+    /// epoll layer emulates edge-triggered (EPOLLET) delivery by remembering
+    /// the seq it last reported for an interest and re-firing only when the
+    /// seq advances — so a pipe stuck permanently readable at EOF (POLLIN|
+    /// POLLHUP) can't pin tokio's reactor in a level-triggered epoll spin, and
+    /// a self-pipe byte written between two epoll_waits is never lost.
+    seq:         u64,
 }
 
 impl PipeRing {
@@ -371,6 +415,7 @@ impl PipeRing {
             buf: [0u8; PIPE_RING_SIZE],
             read_pos: 0, write_pos: 0, count: 0,
             readers: 0, writers: 0,
+            seq: 0,
         }
     }
 
@@ -412,6 +457,12 @@ fn pipe_ref_inc(kind: &VnodeKind) {
 fn pipe_drop_ref(rings: &mut [PipeRing; MAX_PIPES], ring: usize, is_write: bool) {
     if is_write { rings[ring].writers = rings[ring].writers.saturating_sub(1); }
     else        { rings[ring].readers = rings[ring].readers.saturating_sub(1); }
+    // The last writer or reader going away is a new pollable edge (EOF/HUP on
+    // the read end, EPIPE/ERR on the write end) — advance the seq so epoll
+    // re-fires it once, edge-triggered.
+    if (is_write && rings[ring].writers == 0) || (!is_write && rings[ring].readers == 0) {
+        rings[ring].seq = rings[ring].seq.wrapping_add(1);
+    }
     if rings[ring].readers == 0 && rings[ring].writers == 0 {
         rings[ring].read_pos  = 0;
         rings[ring].write_pos = 0;
@@ -430,6 +481,11 @@ fn pipe_ref_dec(kind: &VnodeKind) {
 const MAX_EVENTFDS: usize = 16;
 // u64::MAX = free slot sentinel.
 static EVENTFD_COUNTERS: Mutex<[u64; MAX_EVENTFDS]> = Mutex::new([u64::MAX; MAX_EVENTFDS]);
+/// Per-eventfd monotonic event counter, bumped on every write. mio registers
+/// its waker eventfd edge-triggered (EPOLLET) and never drains it, so its
+/// POLLIN level stays high forever; the epoll layer compares this seq to
+/// re-fire once per wake() instead of spinning on the stuck level.
+static EVENTFD_SEQ: Mutex<[u64; MAX_EVENTFDS]> = Mutex::new([0u64; MAX_EVENTFDS]);
 
 // ── /dev/urandom LFSR ─────────────────────────────────────────────────────────
 
@@ -782,6 +838,13 @@ pub fn is_directory(path_ptr: usize) -> bool {
 // ── Message dispatch ──────────────────────────────────────────────────────────
 
 pub fn handle(msg: &Message, caller_pid: u32) -> Message {
+    // Fd tables are per-*process*: canonicalize the caller to its thread-
+    // group id so CLONE_THREAD siblings share one table (a pipe opened on a
+    // process's main thread must be readable/pollable from its worker
+    // threads). Ops that operate on explicit pids (VFS_FORK_DUP,
+    // VFS_CLOSE_ALL, VFS_EXEC_CLOEXEC) take them as message args and are
+    // unaffected by this canonicalization.
+    let caller_pid = sched::tgid_of(caller_pid);
     match msg.tag {
         VFS_OPEN         => handle_open(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32),
         VFS_READ         => handle_read(caller_pid, arg(msg,0) as usize,
@@ -1187,6 +1250,12 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             VnodeKind::DevStdio { target_fd: 1 }
         } else if lookup_path == b"/dev/stderr" {
             VnodeKind::DevStdio { target_fd: 2 }
+        } else if lookup_path == b"/dev/tty" || lookup_path == b"/dev/console" {
+            // The controlling terminal: a console proxy, exactly like a
+            // dup'd stdin (crossterm opens this when it decides stdin isn't
+            // usable; a plain empty RamFile here returned instant EOF and
+            // starved its input reader).
+            VnodeKind::DevStdio { target_fd: 0 }
         } else if lookup_path == b"/dev/fb0" {
             VnodeKind::DevFb { pos: 0 }
         } else if is_tmp_path(path) && (lookup_path != b"/tmp" && lookup_path != b"tmp") {
@@ -1357,7 +1426,12 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
         }
         VnodeKind::DevStdio { target_fd } => {
             let tfd = *target_fd;
+            // Same console/recursion guard as the write arm.
+            let target_is_proxy = tfd < MAX_FDS && tbl.fds[tfd].in_use
+                && matches!(tbl.fds[tfd].kind, VnodeKind::DevStdio { .. });
+            let target_tracked = tfd < MAX_FDS && tbl.fds[tfd].in_use;
             drop(tbls);
+            if !target_tracked || target_is_proxy { return err_reply(-9); }
             // Re-enter as read on the target fd.
             handle_read(pid, tfd, buf_ptr, count)
         }
@@ -1420,6 +1494,10 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             while n < count.min(4096) {
                 match r.get() { Some(b) => { unsafe { *buf.add(n) = b; } n += 1; } None => break }
             }
+            // Draining bytes frees ring space → a new POLLOUT edge for the
+            // write end. Advance the seq so an epoll writer blocked on a full
+            // pipe is re-woken edge-triggered.
+            if n > 0 { r.seq = r.seq.wrapping_add(1); }
             val_reply(n as u64)
         }
         VnodeKind::TmpFile { idx, pos, .. } => {
@@ -1497,6 +1575,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 if !r.put(unsafe { *buf.add(n) }) { break; }
                 n += 1;
             }
+            if n > 0 { r.seq = r.seq.wrapping_add(1); } // new readable edge for the read end
             val_reply(n as u64)
         }
         VnodeKind::TmpFile { idx, pos, writable } => {
@@ -1536,11 +1615,21 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             if addval == u64::MAX { return err_reply(-22); } // EINVAL
             let mut counters = EVENTFD_COUNTERS.lock();
             counters[slot] = counters[slot].saturating_add(addval);
+            drop(counters);
+            let mut seqs = EVENTFD_SEQ.lock();
+            seqs[slot] = seqs[slot].wrapping_add(1);
             val_reply(8)
         }
         VnodeKind::DevStdio { target_fd } => {
             let tfd = *target_fd;
+            // Console targets are served by the kernel's serial fast path
+            // (sys_write consults fd_is_console_stdio before routing here);
+            // recursing into another DevStdio would loop forever.
+            let target_is_proxy = tfd < MAX_FDS && tbl.fds[tfd].in_use
+                && matches!(tbl.fds[tfd].kind, VnodeKind::DevStdio { .. });
+            let target_tracked = tfd < MAX_FDS && tbl.fds[tfd].in_use;
             drop(tbls);
+            if !target_tracked || target_is_proxy { return err_reply(-9); }
             handle_write(pid, tfd, buf_ptr, count)
         }
         VnodeKind::DevFb { pos } => {
@@ -1744,6 +1833,7 @@ fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize) -> Message {
 /// redirection (Command::output()'s stdout capture, used by crossterm's
 /// tput fallback) actually takes effect instead of being silently shadowed.
 pub fn fd_redirected(pid: u32, fd: usize) -> bool {
+    let pid = sched::tgid_of(pid); // fd tables are per-process
     if fd >= MAX_FDS { return false; }
     let mut tbls = FD_TABLES.lock();
     match find_tbl(pid, &mut *tbls) {
@@ -1755,8 +1845,24 @@ pub fn fd_redirected(pid: u32, fd: usize) -> bool {
 fn handle_dup2(pid: u32, oldfd: usize, newfd: usize) -> Message {
     if oldfd >= MAX_FDS || newfd >= MAX_FDS { return err_reply(-9); }
     let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if !tbl.fds[oldfd].in_use { return err_reply(-9); }
+    let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    if !tbl.fds[oldfd].in_use {
+        // Untracked fd 0-2 = raw console — same implicit /dev/stdio proxy
+        // rule as handle_alloc_fd (e.g. dup2(dup-of-stdout, 1) round trips).
+        if oldfd <= 2 && oldfd != newfd {
+            let replaced = if tbl.fds[newfd].in_use { Some(tbl.fds[newfd].kind) } else { None };
+            tbl.fds[newfd] = FdEntry {
+                kind:   VnodeKind::DevStdio { target_fd: oldfd },
+                flags:  0,
+                in_use: true,
+            };
+            drop(tbls);
+            if let Some(old) = replaced { pipe_ref_dec(&old); }
+            return val_reply(newfd as u64);
+        }
+        if oldfd <= 2 && oldfd == newfd { return val_reply(newfd as u64); }
+        return err_reply(-9);
+    }
     if oldfd == newfd { return val_reply(newfd as u64); } // dup2(fd, fd) is a no-op
     // dup2 silently closes newfd first if it was open; drop its pipe ref.
     let replaced = if tbl.fds[newfd].in_use { Some(tbl.fds[newfd].kind) } else { None };
@@ -2094,7 +2200,26 @@ fn handle_alloc_fd(pid: u32, oldfd: usize) -> Message {
     if oldfd >= MAX_FDS { return err_reply(-9); }
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-12) };
-    if !tbl.fds[oldfd].in_use { return err_reply(-9); }
+    if !tbl.fds[oldfd].in_use {
+        // An untracked fd 0-2 is the raw console: dup() of it yields a
+        // /dev/stdin|stdout|stderr proxy, exactly what opening those paths
+        // creates. (std's try_clone_to_owned on stdio — fcntl F_DUPFD — and
+        // command_fds' stdio mappings depend on this producing a real fd.)
+        if oldfd <= 2 {
+            let newfd = match tbl.fds.iter().enumerate()
+                            .find(|(i, f)| *i >= 3 && !f.in_use)
+                            .map(|(i, _)| i) {
+                Some(f) => f, None => return err_reply(-24) // EMFILE
+            };
+            tbl.fds[newfd] = FdEntry {
+                kind:   VnodeKind::DevStdio { target_fd: oldfd },
+                flags:  0,
+                in_use: true,
+            };
+            return val_reply(newfd as u64);
+        }
+        return err_reply(-9);
+    }
     // Find an unused fd > oldfd (POSIX dup() picks lowest available).
     let newfd = match tbl.fds.iter().enumerate()
                     .find(|(i, f)| *i >= 3 && *i != oldfd && !f.in_use)
@@ -2596,7 +2721,12 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
 
-    let revents: u32 = match &tbl.fds[fd].kind {
+    // Returns (revents, seq). `seq` is a monotonic per-object event counter the
+    // epoll layer uses to emulate edge-triggered delivery (see PipeRing::seq /
+    // EVENTFD_SEQ). fd kinds with no re-arming edge source report seq 0, which
+    // makes an EPOLLET interest fire exactly once for their (constant)
+    // readiness — correct edge behaviour for an always-ready fd.
+    let (revents, seq): (u32, u64) = match &tbl.fds[fd].kind {
         VnodeKind::Pipe { ring, is_write: false } => {
             let r = *ring;
             drop(tbls);
@@ -2604,43 +2734,48 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             let mut ev = 0;
             if ring.count > 0 { ev |= POLLIN; }
             if ring.writers == 0 { ev |= POLLIN | POLLHUP; } // EOF: read() returns 0 without blocking
-            ev
+            (ev, ring.seq)
         }
         VnodeKind::Pipe { ring, is_write: true } => {
             let r = *ring;
             drop(tbls);
             let ring = &PIPE_RINGS.lock()[r];
-            if ring.readers == 0 {
+            let ev = if ring.readers == 0 {
                 POLLERR // reader gone: next write() gets EPIPE
             } else if ring.count < PIPE_RING_SIZE {
                 POLLOUT
             } else {
                 0
-            }
+            };
+            (ev, ring.seq)
         }
         VnodeKind::RamFile { .. } | VnodeKind::TmpFile { .. } | VnodeKind::MountedFile { .. }
         | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom | VnodeKind::DevFb { .. } => {
             drop(tbls);
-            POLLIN | POLLOUT // synchronous, memory- or polled-disk-backed I/O never blocks here
+            (POLLIN | POLLOUT, 0) // synchronous, memory- or polled-disk-backed I/O never blocks here
         }
         VnodeKind::EventFd { slot } => {
             let s = *slot;
             drop(tbls);
             let mut ev = POLLOUT; // only EINVAL's on overflow, never actually blocks
             if EVENTFD_COUNTERS.lock()[s] > 0 { ev |= POLLIN; }
-            ev
+            (ev, EVENTFD_SEQ.lock()[s])
         }
         VnodeKind::TimerFd { slot } => {
             let s = *slot;
             drop(tbls);
-            if timerfd_poll_expirations(s) > 0 { POLLIN } else { 0 }
+            // Cumulative expiration count doubles as the edge seq: each new
+            // expiration advances it; a read that resets expirations drops
+            // revents to 0 so no spurious fire results.
+            let exp = timerfd_poll_expirations(s);
+            (if exp > 0 { POLLIN } else { 0 }, exp)
         }
         VnodeKind::DevStdio { .. } | VnodeKind::DynamicDevice { .. } | VnodeKind::None => {
             drop(tbls);
-            0
+            (0, 0)
         }
     };
-    val_reply(revents as u64)
+    poll_reply(revents, seq)
 }
 
 fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {

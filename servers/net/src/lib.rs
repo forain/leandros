@@ -33,6 +33,11 @@ pub const NET_GETSOCKOPT: u64 = 0x3E;
 pub const NET_CLOSE_ALL:  u64 = 0x3F;
 pub const NET_CLOSE:      u64 = 0x40;
 pub const NET_POLL:       u64 = 0x41;
+pub const NET_DUP:        u64 = 0x42;
+pub const NET_FORK_DUP:   u64 = 0x43;
+pub const NET_EXEC_CLOEXEC: u64 = 0x44;
+pub const NET_SETFL:      u64 = 0x45;
+pub const NET_GETFL:      u64 = 0x46;
 
 const POLLIN:  u64 = 0x0001;
 const POLLOUT: u64 = 0x0004;
@@ -153,6 +158,10 @@ struct UnixConn {
     ring_ba: UnixRing,
     closed_a: bool,
     closed_b: bool,
+    /// Per-end fd alias counts. dup (fcntl F_DUPFD*) creates a second fd for
+    /// the same end; the end only really closes when its last alias does.
+    refs_a: u32,
+    refs_b: u32,
 }
 
 impl UnixConn {
@@ -163,6 +172,8 @@ impl UnixConn {
             ring_ba: UnixRing::new(),
             closed_a: false,
             closed_b: false,
+            refs_a: 1,
+            refs_b: 1,
         }
     }
 }
@@ -213,11 +224,17 @@ struct SockEntry {
     bound_port: u16,
     domain:     u8,
     sock_type:  u8,
+    /// SOCK_CLOEXEC / F_DUPFD_CLOEXEC: closed by NET_EXEC_CLOEXEC at execve.
+    cloexec:    bool,
+    /// SOCK_NONBLOCK / fcntl(F_SETFL, O_NONBLOCK): empty/full rings return
+    /// EAGAIN to the caller instead of the kernel read/write loop blocking.
+    nonblock:   bool,
 }
 
 impl SockEntry {
     const fn empty() -> Self {
-        Self { state: SockState::None, in_use: false, bound_port: 0, domain: 0, sock_type: 0 }
+        Self { state: SockState::None, in_use: false, bound_port: 0, domain: 0,
+               sock_type: 0, cloexec: false, nonblock: false }
     }
 }
 
@@ -506,6 +523,12 @@ pub fn force_bind_unix(path_str: &str, _port: u32) {
 }
 
 pub fn handle(msg: &Message, caller_pid: u32) -> Message {
+    // Socket tables are per-*process*: canonicalize the caller to its
+    // thread-group id so CLONE_THREAD siblings share one fd table (a
+    // socketpair created on brush's main thread is read by its tokio
+    // worker threads — with raw task pids the worker found an empty table
+    // and every operation failed with EBADF).
+    let caller_pid = sched::tgid_of(caller_pid);
     match msg.tag {
         NET_SOCKET      => handle_socket(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize),
@@ -541,6 +564,11 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         NET_CLOSE_ALL   => { handle_close_all(caller_pid); ok_reply() }
         NET_CLOSE       => handle_close(caller_pid, arg(msg,0) as usize),
         NET_POLL        => handle_poll(caller_pid, arg(msg,0) as usize),
+        NET_DUP         => handle_dup(caller_pid, arg(msg,0) as usize, arg(msg,1) != 0),
+        NET_FORK_DUP    => handle_fork_dup(arg(msg,0) as u32, arg(msg,1) as u32),
+        NET_EXEC_CLOEXEC => handle_exec_cloexec(arg(msg,0) as u32),
+        NET_SETFL       => handle_setfl(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        NET_GETFL       => handle_getfl(caller_pid, arg(msg,0) as usize),
         _               => err_reply(-38),
     }
 }
@@ -568,6 +596,8 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         bound_port: 0,
         domain:     domain as u8,
         sock_type:  sock_type as u8,
+        cloexec:    sock_type & 0x80000 != 0, // SOCK_CLOEXEC
+        nonblock:   sock_type & 0x800 != 0,    // SOCK_NONBLOCK
     };
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
@@ -705,6 +735,8 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Me
                     bound_port: 0,
                     domain: AF_INET as u8,
                     sock_type: SOCK_STREAM as u8,
+                    cloexec: false,
+                    nonblock: false,
                 };
 
                 if addr_ptr != 0 && addrlen_ptr != 0 {
@@ -750,6 +782,8 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Me
                         bound_port: 0,
                         domain:     AF_UNIX as u8,
                         sock_type,
+                        cloexec:    false,
+                        nonblock:   false,
                     };
 
                     for t in tbls.iter_mut() {
@@ -903,10 +937,15 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     let tbl = match get_or_create(pid, &mut *tbls) {
         Some(t) => t, None => return err_reply(-12),
     };
+    const SOCK_CLOEXEC: usize = 0x80000;
+    const SOCK_NONBLOCK: usize = 0x800;
+    let cloexec  = sock_type & SOCK_CLOEXEC != 0;
+    let nonblock = sock_type & SOCK_NONBLOCK != 0;
     let slot_a = match tbl.alloc() { Some(s) => s, None => return err_reply(-24) };
     tbl.socks[slot_a] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: true },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
+        cloexec, nonblock,
     };
     let slot_b = match tbl.alloc() { Some(s) => s, None => {
         tbl.socks[slot_a] = SockEntry::empty(); return err_reply(-24);
@@ -914,6 +953,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_b] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: false },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
+        cloexec, nonblock,
     };
     unsafe {
         core::ptr::write(sv_ptr as *mut u32, (slot_a + SOCK_FD_BASE) as u32);
@@ -939,6 +979,9 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             let mut conns = UNIX_CONNS.lock();
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return err_reply(-32); }
+            // Peer end closed (all its aliases gone): writes raise EPIPE.
+            let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
+            if peer_closed { return err_reply(-32); } // EPIPE
             let n = if sock_type == SOCK_STREAM as u8 {
                 if is_a {
                     conn.ring_ab.write(buf_ptr as *const u8, len)
@@ -1088,6 +1131,14 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                     conn.ring_ab.read_dgram(buf_ptr as *mut u8, len).unwrap_or(0)
                 }
             };
+            // POSIX stream semantics: 0 bytes means EOF, and EOF only exists
+            // once the peer end has closed. An empty ring with a live peer is
+            // EAGAIN — returning 0 here made tokio's signal driver see "EOF
+            // on self-pipe" on its very first empty poll and panic.
+            if n == 0 && len > 0 {
+                let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
+                if !peer_closed { return err_reply(-11); } // EAGAIN
+            }
             val_reply(n as u64)
         }
         SockState::InetConnected { socket_handle, .. } => {
@@ -1255,6 +1306,109 @@ fn handle_getsockopt(_pid: u32, _fd: usize, level: usize, optname: usize,
     ok_reply()
 }
 
+/// fork(): give `child` its own copies of `parent`'s socket fds, per POSIX
+/// fd-inheritance. Each copied fd is an alias of the same connection end
+/// (per-end refcount bumped), so the child closing its inherited exec-error
+/// socketpair — CLOEXEC at exec, or exit — participates in the same
+/// EOF/EPIPE accounting the parent observes. Inet/listening sockets are NOT
+/// copied: their smoltcp handles have no refcounting and a dup'd close
+/// would double-free them (fork children exec immediately in practice).
+fn handle_fork_dup(parent: u32, child: u32) -> Message {
+    let mut tbls = SOCK_TABLES.lock();
+    let parent_socks = match tbls.iter().find(|t| t.in_use && t.pid == parent) {
+        Some(t) => t.socks,
+        None    => return ok_reply(), // parent has no sockets — nothing to do
+    };
+    let child_tbl = match get_or_create(child, &mut *tbls) {
+        Some(t) => t, None => return err_reply(-12),
+    };
+    let mut ends: [Option<(usize, bool)>; MAX_SOCKS] = [None; MAX_SOCKS];
+    for (i, e) in parent_socks.iter().enumerate() {
+        if !e.in_use { continue; }
+        match e.state {
+            SockState::UnixConnected { conn_idx, is_a } => {
+                child_tbl.socks[i] = *e;
+                ends[i] = Some((conn_idx, is_a));
+            }
+            SockState::Unbound { .. } => { child_tbl.socks[i] = *e; }
+            _ => {} // inet/listening: skipped (see doc comment)
+        }
+    }
+    drop(tbls);
+    let mut conns = UNIX_CONNS.lock();
+    for end in ends.iter().flatten() {
+        let (conn_idx, is_a) = *end;
+        if !conns[conn_idx].in_use { continue; }
+        if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
+    }
+    ok_reply()
+}
+
+/// execve(): close every close-on-exec socket fd of `pid`'s process.
+fn handle_exec_cloexec(pid: u32) -> Message {
+    for slot in 0..MAX_SOCKS {
+        let is_cloexec = {
+            let tbls = SOCK_TABLES.lock();
+            match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+                Some(t) => t.socks[slot].in_use && t.socks[slot].cloexec,
+                None    => return ok_reply(),
+            }
+        };
+        if is_cloexec {
+            let _ = handle_close(pid, SOCK_FD_BASE + slot);
+        }
+    }
+    ok_reply()
+}
+
+/// fcntl(F_SETFL): only O_NONBLOCK (0x800) is meaningful for socket rings.
+fn handle_setfl(pid: u32, sockfd: usize, flags: u32) -> Message {
+    let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
+    let mut tbls = SOCK_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    tbl.socks[slot].nonblock = flags & 0x800 != 0;
+    ok_reply()
+}
+
+/// fcntl(F_GETFL) for sockets: report O_NONBLOCK.
+fn handle_getfl(pid: u32, sockfd: usize) -> Message {
+    let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
+    let tbls = SOCK_TABLES.lock();
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    val_reply(if tbl.socks[slot].nonblock { 0x800 } else { 0 })
+}
+
+/// fcntl(F_DUPFD/F_DUPFD_CLOEXEC) on a socket fd: allocate a second slot
+/// aliasing the same connection end (tokio/mio clone the fd of one
+/// socketpair end this way for their signal driver).
+fn handle_dup(pid: u32, sockfd: usize, cloexec: bool) -> Message {
+    let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
+    let mut tbls = SOCK_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) {
+        Some(t) => t, None => return err_reply(-9),
+    };
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    let entry = tbl.socks[slot];
+    let new_slot = match tbl.alloc() { Some(s) => s, None => return err_reply(-24) };
+    if let SockState::UnixConnected { conn_idx, is_a } = entry.state {
+        let mut conns = UNIX_CONNS.lock();
+        if !conns[conn_idx].in_use { return err_reply(-9); }
+        if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
+    }
+    // Inet/listening sockets alias fine at the table level: their smoltcp
+    // handle is only released by handle_close, which the refcountless copy
+    // would double-free — so restrict dup to states that carry no handle.
+    else if !matches!(entry.state, SockState::Unbound { .. }) {
+        return err_reply(-22); // EINVAL — dup of this socket kind unsupported
+    }
+    let mut new_entry = entry;
+    new_entry.cloexec = cloexec;
+    tbl.socks[new_slot] = new_entry;
+    val_reply((new_slot + SOCK_FD_BASE) as u64)
+}
+
 fn handle_close(pid: u32, sockfd: usize) -> Message {
     if sockfd < SOCK_FD_BASE { return err_reply(-9); }
     let slot = sockfd - SOCK_FD_BASE;
@@ -1267,10 +1421,20 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
     let state  = tbl.socks[slot].state;
     let port   = tbl.socks[slot].bound_port;
     match state {
-        SockState::UnixConnected { conn_idx, .. } => {
+        SockState::UnixConnected { conn_idx, is_a } => {
             drop(tbls);
             let mut conns = UNIX_CONNS.lock();
-            conns[conn_idx].in_use = false;
+            // Only the last alias of this end actually closes the end (dup'd
+            // fds share it — see refs_a/refs_b). Closing one end marks it
+            // closed so the peer observes EOF/EPIPE; the connection object
+            // itself lives until both ends are gone.
+            let c = &mut conns[conn_idx];
+            let refs = if is_a { &mut c.refs_a } else { &mut c.refs_b };
+            *refs = refs.saturating_sub(1);
+            if *refs == 0 {
+                if is_a { c.closed_a = true; } else { c.closed_b = true; }
+                if c.closed_a && c.closed_b { c.in_use = false; }
+            }
             drop(conns);
             let mut tbls2 = SOCK_TABLES.lock();
             if let Some(t2) = tbls2.iter_mut().find(|t| t.in_use && t.pid == pid) {
@@ -1323,10 +1487,13 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             let conn = &conns[conn_idx];
             let readable   = if is_a { conn.ring_ba.count } else { conn.ring_ab.count };
             let write_free = RING_SIZE - if is_a { conn.ring_ab.count } else { conn.ring_ba.count };
+            let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
             let mut ev = 0;
-            if readable > 0 || !conn.in_use { ev |= POLLIN; }
-            if conn.in_use && write_free > 0 { ev |= POLLOUT; }
-            if !conn.in_use { ev |= POLLHUP; }
+            // Peer-closed asserts readable: the pending EOF must wake
+            // poll/epoll waiters (level-triggered "read will not block").
+            if readable > 0 || peer_closed || !conn.in_use { ev |= POLLIN; }
+            if conn.in_use && !peer_closed && write_free > 0 { ev |= POLLOUT; }
+            if !conn.in_use || peer_closed { ev |= POLLHUP; }
             ev
         }
         SockState::UnixListening { .. } => {
