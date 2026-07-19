@@ -68,6 +68,9 @@ impl Termios {
     /// Return a sensible default for a serial console.
     const fn default_console() -> Self {
         let mut cc = [0u8; 19];
+        cc[0]  = 0x03; // VINTR  = Ctrl-C
+        cc[1]  = 0x1C; // VQUIT  = Ctrl-\
+        cc[10] = 0x1A; // VSUSP  = Ctrl-Z (Linux index; cc[9] kept for legacy)
         cc[2]  = 0x7F; // VERASE = DEL
         cc[3]  = 0x15; // VKILL  = Ctrl-U
         cc[4]  = 4;    // VEOF   = Ctrl-D (min bytes for raw read)
@@ -186,6 +189,91 @@ impl ConsoleTermios {
 
 static CONSOLE_TERMIOS: Mutex<[ConsoleTermios; MAX_PROCS]> =
     Mutex::new([const { ConsoleTermios::empty() }; MAX_PROCS]);
+
+/// Foreground process group of the console tty (0 = none set yet).
+/// Maintained by TIOCSPGRP/TIOCSCTTY; consulted by the input-drain
+/// intercept (`console_intercept_byte`) and TIOCGPGRP.
+static CONSOLE_FG_PGID: Mutex<u32> = Mutex::new(0);
+
+/// The console's current foreground process group (0 = unset).
+pub fn console_fg_pgid() -> u32 { *CONSOLE_FG_PGID.lock() }
+
+/// Line-discipline ISIG intercept, called from the per-tick UART drain for
+/// every incoming console byte BEFORE it is queued as input. Returns true
+/// when the byte was consumed as a signal (^C/^\/^Z → SIGINT/SIGQUIT/SIGTSTP
+/// to the foreground process group).
+///
+/// The termios that governs is the foreground pgroup leader's console
+/// record (a job's leader pid == its pgid in the setpgid(0,0) convention);
+/// processes that never touched termios get the console default, which has
+/// ISIG set — so ^C kills a plain busy child, while an interactive shell
+/// that put ITS record in raw mode (ISIG off) while ITSELF foreground keeps
+/// receiving ^C as an ordinary byte for its line editor.
+pub fn console_intercept_byte(b: u8) -> bool {
+    let pgid = *CONSOLE_FG_PGID.lock();
+    if pgid == 0 { return false; }
+    let (lflag, cc) = {
+        let tbl = CONSOLE_TERMIOS.lock();
+        match tbl.iter().find(|c| c.in_use && c.pid == pgid) {
+            Some(c) => (c.termios.c_lflag, c.termios.c_cc),
+            None => {
+                let d = Termios::default_console();
+                (d.c_lflag, d.c_cc)
+            }
+        }
+    };
+    const ISIG: u32 = 0x1;
+    if lflag & ISIG == 0 { return false; }
+    let sig = if cc[0] != 0 && b == cc[0] {
+        2  // VINTR → SIGINT
+    } else if cc[1] != 0 && b == cc[1] {
+        3  // VQUIT → SIGQUIT
+    } else if cc[10] != 0 && b == cc[10] {
+        20 // VSUSP → SIGTSTP
+    } else {
+        return false;
+    };
+    let _ = sched::kill_pgrp(pgid, sig);
+    true
+}
+
+/// Job-control ioctls shared by the console and slot paths. Returns None
+/// for commands that belong to `termios_ioctl`.
+fn jobctl_ioctl(cmd: usize, arg_ptr: usize) -> Option<Message> {
+    const TIOCSCTTY: usize = 0x540E;
+    const TIOCGPGRP: usize = 0x540F;
+    const TIOCSPGRP: usize = 0x5410;
+    const TIOCGSID:  usize = 0x5429;
+    match cmd {
+        TIOCGPGRP => {
+            if arg_ptr == 0 { return Some(err_reply(-14)); }
+            let fg = *CONSOLE_FG_PGID.lock();
+            // Never report "no foreground pgrp": fall back to the caller's
+            // own pgid so tcgetpgrp always looks sane during bring-up.
+            let fg = if fg == 0 { sched::current_pgid() } else { fg };
+            unsafe { core::ptr::write(arg_ptr as *mut u32, fg); }
+            Some(ok_reply())
+        }
+        TIOCSPGRP => {
+            if arg_ptr == 0 { return Some(err_reply(-14)); }
+            let pgid = unsafe { core::ptr::read(arg_ptr as *const u32) };
+            *CONSOLE_FG_PGID.lock() = pgid;
+            Some(ok_reply())
+        }
+        TIOCSCTTY => {
+            // Acquiring the controlling terminal also makes the caller's
+            // process group foreground (matches how shells use it).
+            *CONSOLE_FG_PGID.lock() = sched::current_pgid();
+            Some(ok_reply())
+        }
+        TIOCGSID => {
+            if arg_ptr == 0 { return Some(err_reply(-14)); }
+            unsafe { core::ptr::write(arg_ptr as *mut u32, sched::current_sid()); }
+            Some(ok_reply())
+        }
+        _ => None,
+    }
+}
 
 fn get_or_create_console<'a>(pid: u32, tbl: &'a mut [ConsoleTermios]) -> Option<&'a mut ConsoleTermios> {
     if let Some(pos) = tbl.iter().position(|t| t.in_use && t.pid == pid) {
@@ -526,6 +614,10 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
 }
 
 fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg_ptr: usize) -> Message {
+    // Termios records are per-process: thread siblings must see the same
+    // console state (same tgid canonicalization as the VFS/net servers).
+    let pid = sched::tgid_of(pid);
+    if let Some(r) = jobctl_ioctl(cmd, arg_ptr) { return r; }
     if fd <= 2 {
         // stdin/stdout/stderr never go through TTY_OPEN — see ConsoleTermios.
         let mut console = CONSOLE_TERMIOS.lock();
@@ -552,8 +644,45 @@ fn termios_ioctl(cmd: usize, arg_ptr: usize, t: &mut Termios) -> Message {
     const TCSETSW:    usize = 0x5403;
     const TCSETSF:    usize = 0x5404;
     const TIOCGWINSZ: usize = 0x5413;
+    // termios2 variants (struct termios2 = termios + c_ispeed/c_ospeed).
+    // rustix's linux_raw backend uses TCGETS2 for isatty() — answering
+    // ENOTTY there made crossterm decide stdin isn't a terminal and fall
+    // back to /dev/tty for its input path.
+    const TCGETS2:    usize = 0x802C_542A;
+    const TCSETS2:    usize = 0x402C_542B;
+    const TCSETSW2:   usize = 0x402C_542C;
+    const TCSETSF2:   usize = 0x402C_542D;
 
     match cmd {
+        TCGETS2 => {
+            if arg_ptr == 0 { return err_reply(-14); }
+            unsafe {
+                core::ptr::write(arg_ptr           as *mut u32, t.c_iflag);
+                core::ptr::write((arg_ptr + 4)     as *mut u32, t.c_oflag);
+                core::ptr::write((arg_ptr + 8)     as *mut u32, t.c_cflag);
+                core::ptr::write((arg_ptr + 12)    as *mut u32, t.c_lflag);
+                core::ptr::write((arg_ptr + 16)    as *mut u8,  t.c_line);
+                core::ptr::copy_nonoverlapping(t.c_cc.as_ptr(), (arg_ptr + 17) as *mut u8, 19);
+                // c_ispeed / c_ospeed at offsets 36/40 (u32 each).
+                core::ptr::write((arg_ptr + 36) as *mut u32, 38400);
+                core::ptr::write((arg_ptr + 40) as *mut u32, 38400);
+            }
+            ok_reply()
+        }
+        TCSETS2 | TCSETSW2 | TCSETSF2 => {
+            if arg_ptr == 0 { return err_reply(-14); }
+            unsafe {
+                t.c_iflag = core::ptr::read(arg_ptr         as *const u32);
+                t.c_oflag = core::ptr::read((arg_ptr + 4)   as *const u32);
+                t.c_cflag = core::ptr::read((arg_ptr + 8)   as *const u32);
+                t.c_lflag = core::ptr::read((arg_ptr + 12)  as *const u32);
+                t.c_line  = core::ptr::read((arg_ptr + 16)  as *const u8);
+                core::ptr::copy_nonoverlapping((arg_ptr + 17) as *const u8,
+                                               t.c_cc.as_mut_ptr(), 19);
+                // Speeds ignored — serial console rate is fixed.
+            }
+            ok_reply()
+        }
         TCGETS => {
             // struct termios is 36 bytes on Linux.  We write our fields.
             if arg_ptr == 0 { return err_reply(-14); }
