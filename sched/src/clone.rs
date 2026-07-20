@@ -188,7 +188,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
 
         // ── Step 6: gather parent credentials ────────────────────────────────
         let (heap_start, heap_end, pid, _tgid, pgid, sid, uid, gid, euid, egid, cwd, tls_base,
-             nice) = {
+             nice, umask) = {
             let rq = super::RUN_QUEUE.lock();
             if let Some(t) = rq.find_pid(parent_pid) {
                 let leader = rq.find_pid(t.tgid).unwrap_or(t);
@@ -197,7 +197,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
                     .unwrap_or((0, 0));
                 (hs, he, t.pid, t.tgid, t.pgid, t.sid,
                  t.uid, t.gid, t.euid, t.egid, (t.cwd.clone(), t.cwd_len), t.tls_base,
-                 t.priority)
+                 t.priority, t.umask)
             } else {
                 mm::buddy::free(stack_base_phys, stack_pages);
                 mm::buddy::free(child_pt, 0);
@@ -267,6 +267,9 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         // actually ran.
         child.priority      = nice;
         child.weight        = task::nice_to_weight(nice);
+        // umask is inherited too. Task::new_* hardcodes 0o022, so a child of a
+        // process that had set its own mask silently reverted to the default.
+        child.umask         = umask;
         child.signal_actions = [DEFAULT_SIGACTION; 64];
 
         // Give the caller its chance to set up per-child kernel state (VFS
@@ -398,7 +401,7 @@ pub fn clone_thread(
 
         // ── Collect parent credentials and page table ─────────────────────────
         let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, heap_start, heap_end,
-             ctid_phys, cwd, leader_as, nice) = {
+             ctid_phys, cwd, leader_as, nice, umask) = {
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid) {
                 Some(t) => {
@@ -419,7 +422,7 @@ pub fn clone_thread(
                     // lookup already resolves to it.
                     (t.page_table, t.tgid, t.pgid, t.sid,
                      t.uid, t.gid, t.euid, t.egid, hs, he, cp, (t.cwd.clone(), t.cwd_len),
-                     leader.address_space.clone(), t.priority)
+                     leader.address_space.clone(), t.priority, t.umask)
                 }
                 None => {
                     mm::buddy::free(stack_base_phys, stack_pages);
@@ -469,6 +472,7 @@ pub fn clone_thread(
         // new thread starts at its creator's value rather than the group's.
         child.priority   = nice;
         child.weight     = task::nice_to_weight(nice);
+        child.umask      = umask;
         child.signal_actions = [DEFAULT_SIGACTION; 64];
         child.vfork_pending = flags & CLONE_VFORK != 0;
         if flags & CLONE_CHILD_CLEARTID != 0 {

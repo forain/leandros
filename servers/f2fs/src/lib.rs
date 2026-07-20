@@ -41,6 +41,14 @@ const VFS_CHMOD:      u64 = 0x2B;
 const VFS_FCHMOD:     u64 = 0x2C;
 const VFS_CHOWN:      u64 = 0x2D;
 const VFS_FCHOWN:     u64 = 0x2E;
+// These MUST stay in lockstep with servers/vfs/src/lib.rs. They are duplicated
+// rather than imported, and an *undefined* upper-case name in the dispatch
+// `match` is not an error — Rust reads it as a catch-all binding that silently
+// swallows every later arm. That is exactly how VFS_LCHMOD/LCHOWN, added
+// without these definitions, made VFS_CHOWN unreachable and chown a no-op.
+const VFS_FSYNC:      u64 = 0x39;
+const VFS_LCHMOD:     u64 = 0x3B;
+const VFS_LCHOWN:     u64 = 0x3C;
 
 const O_WRONLY:  u64 = 1;
 const O_RDWR:    u64 = 2;
@@ -623,7 +631,8 @@ fn inode_links(blk: &[u8]) -> u32 { r32(blk, INO_LINKS) }
 fn inode_is_dir(blk: &[u8]) -> bool { (inode_mode(blk) & S_IFMT) == S_IFDIR }
 
 /// Allocate and initialize a new inode block; returns (ino, phys_blkaddr).
-fn create_inode(ms: &mut MountState, mode: u16, parent_ino: u32, name: &[u8]) -> Option<(u32, u32)> {
+fn create_inode(ms: &mut MountState, mode: u16, uid: u32, gid: u32,
+                parent_ino: u32, name: &[u8]) -> Option<(u32, u32)> {
     let ino = ms.cp.next_free_nid;
     ms.cp.next_free_nid = ino.wrapping_add(1);
 
@@ -631,6 +640,11 @@ fn create_inode(ms: &mut MountState, mode: u16, parent_ino: u32, name: &[u8]) ->
     let mut buf = [0u8; BLOCK_SIZE];
 
     w16(&mut buf, INO_MODE,    mode);
+    // Ownership has to be recorded at creation. Leaving these zero made every
+    // file on the volume claim root, which is not merely cosmetic: an
+    // ownership check against a uid nothing ever sets can never deny anything.
+    w32(&mut buf, INO_UID,     uid);
+    w32(&mut buf, INO_GID,     gid);
     w32(&mut buf, INO_LINKS,   1);
     w64(&mut buf, INO_SIZE,    0);
     w32(&mut buf, 84, parent_ino); // i_pino
@@ -1392,7 +1406,8 @@ fn path_split(path: &[u8]) -> (&[u8], &[u8]) {
 
 // ── VFS handler implementations ───────────────────────────────────────────────
 
-fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, _mode: u64) -> Message {
+fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
+               euid: u32, egid: u32) -> Message {
     let path_bytes = unsafe {
         let ptr = path_ptr as *const u8;
         let mut len = 0;
@@ -1429,8 +1444,10 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, _mode: u64) -> Me
             if p == 0 { return err_reply(-2); }
             p
         };
-        let mode = S_IFREG | 0o644;
-        let (new_ino, _) = match create_inode(ms, mode, parent_ino, name) {
+        // The caller's mode, not a hardcoded 0644. umask is applied kernel-side
+        // (where Linux applies it) so tmpfs and f2fs cannot disagree about it.
+        let imode = S_IFREG | (mode as u16 & 0o7777);
+        let (new_ino, _) = match create_inode(ms, imode, euid, egid, parent_ino, name) {
             Some(v) => v,
             None    => return err_reply(-28), // ENOSPC
         };
@@ -1649,7 +1666,8 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) 
     val_reply(written as u64)
 }
 
-fn handle_mkdir(ms: &mut MountState, path_ptr: u64, _mode: u64) -> Message {
+fn handle_mkdir(ms: &mut MountState, path_ptr: u64, mode: u64,
+                euid: u32, egid: u32) -> Message {
     let path_bytes = unsafe {
         let ptr = path_ptr as *const u8;
         let mut len = 0;
@@ -1678,8 +1696,8 @@ fn handle_mkdir(ms: &mut MountState, path_ptr: u64, _mode: u64) -> Message {
     // Check name doesn't already exist
     if dir_lookup(ms, parent_ino, name) != 0 { return err_reply(-17); } // EEXIST
 
-    let mode = S_IFDIR | 0o755;
-    let (new_ino, _) = match create_inode(ms, mode, parent_ino, name) {
+    let imode = S_IFDIR | (mode as u16 & 0o7777);
+    let (new_ino, _) = match create_inode(ms, imode, euid, egid, parent_ino, name) {
         Some(v) => v,
         None    => return err_reply(-28),
     };
@@ -1740,7 +1758,8 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
 /// The volume is built with `^inline_data`, so even a two-byte target costs a
 /// full data block. That matches how every other file on this volume is
 /// stored and keeps the read path (`read_file_data`) the single one.
-fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64) -> Message {
+fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64,
+                  euid: u32, egid: u32) -> Message {
     let target = unsafe {
         let ptr = target_ptr as *const u8;
         let mut len = 0;
@@ -1776,7 +1795,7 @@ fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64) -> Messag
     let tlen = target.len().min(255);
     tbuf[..tlen].copy_from_slice(&target[..tlen]);
 
-    let (new_ino, _) = match create_inode(ms, S_IFLNK | 0o777, parent_ino, name) {
+    let (new_ino, _) = match create_inode(ms, S_IFLNK | 0o777, euid, egid, parent_ino, name) {
         Some(v) => v,
         None    => return err_reply(-28), // ENOSPC
     };
@@ -1894,7 +1913,8 @@ fn handle_link(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
 /// VFS_OPEN/VFS_STAT in the VFS's `path_args()` table.
 /// `follow` is false for the AT_SYMLINK_NOFOLLOW form (VFS_LCHMOD), where the
 /// caller means the symlink itself rather than what it points at.
-fn handle_chmod(ms: &mut MountState, path_ptr: u64, mode: u32, follow: bool) -> Message {
+fn handle_chmod(ms: &mut MountState, path_ptr: u64, mode: u32, follow: bool,
+                euid: u32) -> Message {
     let path_bytes = unsafe {
         let ptr = path_ptr as *const u8;
         let mut len = 0;
@@ -1907,16 +1927,16 @@ fn handle_chmod(ms: &mut MountState, path_ptr: u64, mode: u32, follow: bool) -> 
     };
     let ino = resolve_path_ex(ms, rel, follow);
     if ino == 0 { return err_reply(-2); }
-    chmod_inode(ms, ino, mode)
+    chmod_inode(ms, ino, mode, euid)
 }
 
 /// fchmod(2) — the fd is already resolved to an inode via the open-file
 /// table, so no path walk (and no symlink-follow question) is involved.
-fn handle_fchmod(ms: &mut MountState, file_id: u64, mode: u32) -> Message {
+fn handle_fchmod(ms: &mut MountState, file_id: u64, mode: u32, euid: u32) -> Message {
     let slot = file_id as usize;
     if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
     let ino = ms.open_files[slot].inode;
-    chmod_inode(ms, ino, mode)
+    chmod_inode(ms, ino, mode, euid)
 }
 
 /// Mutate i_mode in place and write the inode block back, mirroring the
@@ -1927,8 +1947,16 @@ fn handle_fchmod(ms: &mut MountState, file_id: u64, mode: u32) -> Message {
 /// Only the permission/setuid/setgid/sticky bits change — the file-type
 /// bits (S_IFMT) are exactly what create_inode wrote and chmod(2) must
 /// never touch them.
-fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32) -> Message {
+/// `euid` is the caller's effective uid. Only the owner or root may change a
+/// file's mode; this mirrors what tmpfs already enforced in `apply_chown`
+/// (servers/vfs), so the two filesystems agree.
+fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32, euid: u32) -> Message {
     let addr = nat_lookup(ms, ino);
+    {
+        let iblk = ms.cache.read(ms.dev, addr as u64);
+        let owner = inode_uid(iblk);
+        if euid != 0 && euid != owner { return err_reply(-1); } // EPERM
+    }
     let iblk = ms.cache.get_mut(ms.dev, addr as u64);
     let cur = inode_mode(iblk);
     let new_mode = (cur & S_IFMT) | (mode as u16 & !S_IFMT);
@@ -1944,7 +1972,8 @@ fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32) -> Message {
 ///
 /// See `handle_chmod` for `follow`; lchown(2) is the usual false case, and
 /// arrives here as VFS_LCHOWN.
-fn handle_chown(ms: &mut MountState, path_ptr: u64, uid: u32, gid: u32, follow: bool) -> Message {
+fn handle_chown(ms: &mut MountState, path_ptr: u64, uid: u32, gid: u32, follow: bool,
+                euid: u32, egid: u32) -> Message {
     let path_bytes = unsafe {
         let ptr = path_ptr as *const u8;
         let mut len = 0;
@@ -1957,21 +1986,35 @@ fn handle_chown(ms: &mut MountState, path_ptr: u64, uid: u32, gid: u32, follow: 
     };
     let ino = resolve_path_ex(ms, rel, follow);
     if ino == 0 { return err_reply(-2); }
-    chown_inode(ms, ino, uid, gid)
+    chown_inode(ms, ino, uid, gid, euid, egid)
 }
 
 /// fchown(2) — fd already resolved to an inode via the open-file table.
-fn handle_fchown(ms: &mut MountState, file_id: u64, uid: u32, gid: u32) -> Message {
+fn handle_fchown(ms: &mut MountState, file_id: u64, uid: u32, gid: u32,
+                 euid: u32, egid: u32) -> Message {
     let slot = file_id as usize;
     if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); }
     let ino = ms.open_files[slot].inode;
-    chown_inode(ms, ino, uid, gid)
+    chown_inode(ms, ino, uid, gid, euid, egid)
 }
 
 /// Mutate i_uid/i_gid in place and write the inode block back, same
 /// nat_update + maybe_flush shape as chmod_inode/handle_link.
-fn chown_inode(ms: &mut MountState, ino: u32, uid: u32, gid: u32) -> Message {
+fn chown_inode(ms: &mut MountState, ino: u32, uid: u32, gid: u32,
+               euid: u32, egid: u32) -> Message {
     let addr = nat_lookup(ms, ino);
+    {
+        let iblk = ms.cache.read(ms.dev, addr as u64);
+        let owner = inode_uid(iblk);
+        if euid != 0 {
+            // Non-root: must own the file, may never hand it to someone else,
+            // and may only set a group it belongs to. With no supplementary
+            // groups, "belongs to" means egid.
+            if euid != owner { return err_reply(-1); }               // EPERM
+            if uid != u32::MAX && uid != owner { return err_reply(-1); }
+            if gid != u32::MAX && gid != egid  { return err_reply(-1); }
+        }
+    }
     let iblk = ms.cache.get_mut(ms.dev, addr as u64);
     if uid != u32::MAX { w32(iblk, INO_UID, uid); }
     if gid != u32::MAX { w32(iblk, INO_GID, gid); }
@@ -2158,45 +2201,60 @@ fn handle_statfs(ms: &mut MountState, buf_ptr: u64) -> Message {
 
 // ── IPC dispatch ──────────────────────────────────────────────────────────────
 
-fn f2fs_dispatch(msg: &Message, _caller_pid: u32, target_port: u32) -> Message {
+fn f2fs_dispatch(msg: &Message, caller_pid: u32, target_port: u32) -> Message {
     let mut mounts = F2FS_MOUNTS.lock();
     for slot in mounts.iter_mut() {
         if let Some(ref mut ms) = slot {
             if ms.port == target_port {
-                return dispatch_msg(ms, msg);
+                return dispatch_msg(ms, msg, caller_pid);
             }
         }
     }
     err_reply(-5) // EIO — no mount found for this port
 }
 
-fn dispatch_msg(ms: &mut MountState, msg: &Message) -> Message {
+/// Effective uid/gid of the process that made the call.
+///
+/// `port::send` invokes handlers synchronously in the caller's own task
+/// context and passes its pid, so this needs no protocol change — the value
+/// was already on the wire, it was simply discarded.
+///
+/// Note `sched::euid_of` answers 0 for a pid it cannot find, i.e. it fails
+/// *open* to root. That is the right answer for the boot-time mount path,
+/// which runs before there is a user process to attribute, but it is a
+/// deliberate choice rather than an accident.
+fn caller_creds(pid: u32) -> (u32, u32) {
+    (sched::euid_of(pid), sched::egid_of(pid))
+}
+
+fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message {
+    let (euid, egid) = caller_creds(caller_pid);
     match msg.tag {
-        VFS_OPEN       => handle_open(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
+        VFS_OPEN       => handle_open(ms, arg(msg,0), arg(msg,1), arg(msg,2), euid, egid),
         VFS_READ       => handle_read(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_WRITE      => handle_write(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_CLOSE      => handle_close(ms, arg(msg,0)),
         VFS_LSEEK      => handle_lseek(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_STAT       => handle_stat(ms, arg(msg,0), arg(msg,1)),
         VFS_GETDENTS64 => handle_getdents(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
-        VFS_MKDIR      => handle_mkdir(ms, arg(msg,0), arg(msg,1)),
+        VFS_MKDIR      => handle_mkdir(ms, arg(msg,0), arg(msg,1), euid, egid),
         VFS_UNLINK     => handle_unlink(ms, arg(msg,0)),
         VFS_RMDIR      => handle_rmdir(ms, arg(msg,0)),
         VFS_RENAME     => handle_rename(ms, arg(msg,0), arg(msg,1)),
         VFS_FTRUNCATE  => handle_ftruncate(ms, arg(msg,0), arg(msg,1)),
         VFS_STATFS     => handle_statfs(ms, arg(msg,1)),
         VFS_LSTAT      => handle_lstat(ms, arg(msg,0), arg(msg,1)),
-        VFS_SYMLINK    => handle_symlink(ms, arg(msg,0), arg(msg,1)),
+        VFS_SYMLINK    => handle_symlink(ms, arg(msg,0), arg(msg,1), euid, egid),
         VFS_FD_PATH    => handle_fd_path(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_READLINK   => handle_readlink(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_LINK       => handle_link(ms, arg(msg,0), arg(msg,1)),
-        VFS_CHMOD      => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, true),
-        VFS_LCHMOD     => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, false),
-        VFS_FCHMOD     => handle_fchmod(ms, arg(msg,0), arg(msg,1) as u32),
+        VFS_CHMOD      => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, true, euid),
+        VFS_LCHMOD     => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, false, euid),
+        VFS_FCHMOD     => handle_fchmod(ms, arg(msg,0), arg(msg,1) as u32, euid),
         VFS_FSYNC      => handle_fsync(ms),
-        VFS_CHOWN      => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, true),
-        VFS_LCHOWN     => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, false),
-        VFS_FCHOWN     => handle_fchown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32),
+        VFS_CHOWN      => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, true, euid, egid),
+        VFS_LCHOWN     => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, false, euid, egid),
+        VFS_FCHOWN     => handle_fchown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, euid, egid),
         _              => err_reply(-22), // EINVAL
     }
 }

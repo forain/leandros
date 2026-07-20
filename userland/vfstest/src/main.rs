@@ -24,6 +24,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_flock_conflict() { failures += 1; }
     if !test_fcntl_byte_range_conflict() { failures += 1; }
     if !test_permission_enforced() { failures += 1; }
+    if !test_f2fs_ownership_enforced() { failures += 1; }
 
     puts(b"--- vfstest done ---\0".as_ptr());
     failures
@@ -186,6 +187,45 @@ unsafe fn test_permission_enforced() -> bool {
     let ok = fd2 >= 0;
     if ok { close(fd2); }
     report(name, ok)
+}
+
+/// Ownership enforcement on the f2fs mount at `/data` (the tmpfs test above
+/// exercises the same rule for tmpfs). A file created by root and chowned to
+/// uid 1000 must reject a chmod from a *different* unprivileged uid with
+/// EPERM, while its actual owner is allowed. This is the check that was
+/// meaningless until f2fs began persisting i_uid — every file used to read
+/// back as root-owned, so `euid == owner` was true for everyone.
+unsafe fn test_f2fs_ownership_enforced() -> bool {
+    let name = b"f2fs_ownership_enforced\0";
+
+    let path = b"/data/vt_owned\0";
+    let fd = open(path.as_ptr(), O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    close(fd);
+    // Hand the file to uid 1000 while we are still root.
+    if chown(path.as_ptr(), 1000, 1000) != 0 { return report(name, false); }
+
+    // A stranger (uid 1001) must be refused with EPERM.
+    let stranger = fork();
+    if stranger == 0 {
+        if setuid(1001) != 0 { exit(1); }
+        let denied = chmod(path.as_ptr(), 0o600) == -1 && get_errno() == EPERM;
+        exit(if denied { 0 } else { 1 });
+    }
+    let mut st: i32 = -1;
+    wait4(stranger, &mut st as *mut i32, 0, core::ptr::null_mut());
+    if st != 0 { return report(name, false); }
+
+    // The real owner (uid 1000) must be allowed.
+    let owner = fork();
+    if owner == 0 {
+        if setuid(1000) != 0 { exit(1); }
+        let allowed = chmod(path.as_ptr(), 0o600) == 0;
+        exit(if allowed { 0 } else { 1 });
+    }
+    let mut st2: i32 = -1;
+    wait4(owner, &mut st2 as *mut i32, 0, core::ptr::null_mut());
+    report(name, st2 == 0)
 }
 
 // `struct flock` from leandros_libc::io, aliased for readability.

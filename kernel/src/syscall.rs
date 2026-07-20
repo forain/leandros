@@ -3804,8 +3804,19 @@ fn sys_prlimit64(
 /// and then lands here.
 fn vfs_open_resolved(path_ptr: usize, flags: usize, mode: usize) -> isize {
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, flags as u64, mode as u64]);
+    let msg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, flags as u64,
+                                            apply_umask(mode) as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// Strip the caller's umask from a creation mode.
+///
+/// Done here, in the kernel, because that is where Linux does it and because
+/// it is the one place both filesystems pass through — applying it per-server
+/// invites tmpfs and f2fs to disagree about the mode of the same new file.
+/// Passing `u32::MAX` reads the mask without altering it.
+fn apply_umask(mode: usize) -> usize {
+    mode & !(sched::umask(u32::MAX) as usize) & 0o7777
 }
 
 /// Open a kernel-resident path string (no user-pointer validation, no cwd
@@ -4400,7 +4411,7 @@ fn sys_getdents64(fd: usize, buf_ptr: usize, count: usize) -> isize {
 fn sys_mkdirat(dirfd: usize, path_ptr: usize, mode: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_MKDIR, &[path.ptr() as u64, mode as u64]);
+    let msg = make_vfs_msg(vfs::VFS_MKDIR, &[path.ptr() as u64, apply_umask(mode) as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 

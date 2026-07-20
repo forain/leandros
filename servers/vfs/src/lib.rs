@@ -2077,7 +2077,10 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     proxy.tag = VFS_OPEN;
                     proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
                     proxy.data[8..16].copy_from_slice(&(flags as u64).to_le_bytes());
-                    proxy.data[16..24].copy_from_slice(&0u64.to_le_bytes());
+                    // Forward the real creation mode. This used to be a
+                    // hardcoded 0, which was invisible only because the f2fs
+                    // server ignored the field and created everything 0644.
+                    proxy.data[16..24].copy_from_slice(&(mode as u64).to_le_bytes());
                     let reply = call_port(port, proxy);
                     let file_id_raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
                     if file_id_raw < 0 {
@@ -2095,7 +2098,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             proxy.tag = VFS_OPEN;
             proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
             proxy.data[8..16].copy_from_slice(&(flags as u64).to_le_bytes());
-            proxy.data[16..24].copy_from_slice(&0u64.to_le_bytes());
+            // See above: forward the real mode, not 0.
+            proxy.data[16..24].copy_from_slice(&(mode as u64).to_le_bytes());
             let reply = call_port(port, proxy);
             let file_id_raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
             if file_id_raw < 0 {
