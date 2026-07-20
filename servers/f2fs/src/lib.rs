@@ -579,8 +579,25 @@ fn flush_checkpoint(ms: &mut MountState) {
     w32(&mut buf, CP_PACK_TOTAL,      ms.cp.pack_total.max(1));
     w32(&mut buf, CP_NEXT_FREE_NID,   ms.cp.next_free_nid);
     virtio_blk::write_block(ms.dev, cp_blkno as u64, &buf);
+    // The checkpoint block is the commit record for everything flushed above
+    // it, so it is the one write that must actually be on the medium before
+    // this function claims the volume is consistent.
+    virtio_blk::flush(ms.dev);
 
     ms.dirty_writes = 0;
+}
+
+/// fsync(fd) — the file's data and metadata must be on stable storage when
+/// this returns.
+///
+/// This server has no per-file dirty tracking: the block cache is shared
+/// across the volume and the checkpoint is what makes any of it recoverable.
+/// So an fsync of one file is necessarily a checkpoint of the whole volume —
+/// heavier than Linux's, but honest, which the previous unconditional `0`
+/// was not.
+fn handle_fsync(ms: &mut MountState) -> Message {
+    flush_checkpoint(ms);
+    ok_reply()
 }
 
 fn maybe_flush(ms: &mut MountState) {
@@ -2147,6 +2164,7 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message) -> Message {
         VFS_LINK       => handle_link(ms, arg(msg,0), arg(msg,1)),
         VFS_CHMOD      => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32),
         VFS_FCHMOD     => handle_fchmod(ms, arg(msg,0), arg(msg,1) as u32),
+        VFS_FSYNC      => handle_fsync(ms),
         VFS_CHOWN      => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32),
         VFS_FCHOWN     => handle_fchown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32),
         _              => err_reply(-22), // EINVAL

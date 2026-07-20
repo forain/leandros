@@ -433,6 +433,8 @@ mod nr {
     pub const INOTIFY_RM_WATCH:    usize = 28;
     pub const POSIX_FADVISE:       usize = 223;
     pub const SYNC_FILE_RANGE:     usize = 84;
+    pub const SYNC:                usize = 81;
+    pub const SYNCFS:              usize = 267;
     pub const READAHEAD:           usize = 213;
     pub const GETCPU:              usize = 168;
     pub const UMOUNT2:             usize = 39;
@@ -647,6 +649,8 @@ mod nr {
     pub const INOTIFY_RM_WATCH:    usize = 255;
     pub const POSIX_FADVISE:       usize = 221;
     pub const SYNC_FILE_RANGE:     usize = 277;
+    pub const SYNC:                usize = 162;
+    pub const SYNCFS:              usize = 306;
     pub const READAHEAD:           usize = 187;
     pub const GETCPU:              usize = 309;
     pub const MOUNT:               usize = 165;
@@ -989,7 +993,8 @@ fn dispatch_inner(
         FACCESSAT   => sys_faccessat(a0, a1, a2, a3),
         STATFS  => sys_statfs(a0, a1),
         FSTATFS => sys_fstatfs(a0, a1),
-        FSYNC | FDATASYNC => 0,
+        FSYNC | FDATASYNC | SYNCFS => sys_fsync(a0),
+        SYNC        => sys_sync(),
         FALLOCATE   => 0, // advisory pre-allocation; no-op is valid
         UTIMENSAT   => 0,
         MKNODAT     => sys_mknodat(a0, a1, a2, a3),
@@ -1956,6 +1961,31 @@ fn sys_pwrite64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize
     let back_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, cur as u64, 0]);
     let _ = vfs::handle(&back_msg, pid);
     n
+}
+
+/// fsync(fd) / fdatasync(fd) / syncfs(fd) — flush the filesystem behind `fd`.
+///
+/// These used to return 0 unconditionally, which was worse than ENOSYS: f2fs
+/// keeps a write-back block cache and only checkpoints every 16 dirty
+/// operations, so a successful fsync routinely left the data in RAM. Callers
+/// that fsync precisely because they cannot afford to lose the write were
+/// being told the opposite of the truth.
+///
+/// fdatasync is deliberately the same call. The distinction is "skip metadata
+/// not needed to read the data back", and this server's checkpoint is
+/// all-or-nothing; collapsing them is conservative, never wrong.
+fn sys_fsync(fd: usize) -> isize {
+    let pid = current_pid();
+    let msg = make_vfs_msg(vfs::VFS_FSYNC, &[fd as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// sync() — flush every mounted filesystem. Cannot fail.
+fn sys_sync() -> isize {
+    let pid = current_pid();
+    let msg = make_vfs_msg(vfs::VFS_SYNC, &[]);
+    let _ = vfs::handle(&msg, pid);
+    0
 }
 
 /// sys_ftruncate(fd, length) — set tmpfs file size.

@@ -22,6 +22,9 @@ const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
 
 const VIRTIO_BLK_T_IN:  u32 = 0; // read from device
 const VIRTIO_BLK_T_OUT: u32 = 1; // write to device
+/// Commit the device's own volatile write cache. Carries no data buffer —
+/// header and status descriptors only.
+const VIRTIO_BLK_T_FLUSH: u32 = 4;
 
 const VIRTQ_DESC_F_NEXT:  u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
@@ -395,7 +398,10 @@ impl VirtioBlkDevice {
     // Returns true on success (VIRTIO_BLK_S_OK == 0).
     // `nblocks` must be 1..=MAX_IO_BLOCKS; `buf` covers nblocks * BLOCK_SIZE bytes.
     fn do_io(&mut self, type_: u32, sector: u64, buf: *mut u8, nblocks: usize) -> bool {
-        if nblocks == 0 || nblocks > MAX_IO_BLOCKS { return false; }
+        // FLUSH is the one request type with no data buffer: header + status
+        // only. Everything else must name at least one block.
+        let is_flush = type_ == VIRTIO_BLK_T_FLUSH;
+        if !is_flush && (nblocks == 0 || nblocks > MAX_IO_BLOCKS) { return false; }
         let span = nblocks * BLOCK_SIZE;
         unsafe {
             // Fill request header
@@ -420,14 +426,20 @@ impl VirtioBlkDevice {
             let d0 = {
                 let q = &mut self.queue;
                 let d0 = q.alloc_desc(self.req_phys as u64, 16, 0);
-                let d1 = q.alloc_desc(
-                    self.data_phys as u64,
-                    span as u32,
-                    if type_ == VIRTIO_BLK_T_IN { VIRTQ_DESC_F_WRITE } else { 0 },
-                );
                 let d2 = q.alloc_desc(status_phys as u64, 1, VIRTQ_DESC_F_WRITE);
-                q.chain(d0, d1);
-                q.chain(d1, d2);
+                if is_flush {
+                    // No data descriptor: a FLUSH that carries one is a spec
+                    // violation and QEMU rejects the whole request.
+                    q.chain(d0, d2);
+                } else {
+                    let d1 = q.alloc_desc(
+                        self.data_phys as u64,
+                        span as u32,
+                        if type_ == VIRTIO_BLK_T_IN { VIRTQ_DESC_F_WRITE } else { 0 },
+                    );
+                    q.chain(d0, d1);
+                    q.chain(d1, d2);
+                }
                 q.submit(d0);
                 d0
             };
@@ -532,6 +544,21 @@ pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
     let mut devs = DEVICES.lock();
     if let Some(ref mut dev) = devs[dev_idx] {
         dev.do_io(VIRTIO_BLK_T_OUT, blk * SECTORS_PER_BLOCK, buf.as_ptr() as *mut u8, 1)
+    } else {
+        false
+    }
+}
+
+/// Commit `dev_idx`'s volatile write cache to stable storage.
+///
+/// `write_block` waits for the device to consume each request, which is not
+/// the same as the data being durable: the backend may still be holding it in
+/// a writeback cache. Without this an `fsync` that flushed every kernel-side
+/// buffer would still be making a promise it could not keep.
+pub fn flush(dev_idx: usize) -> bool {
+    let mut devs = DEVICES.lock();
+    if let Some(ref mut dev) = devs[dev_idx] {
+        dev.do_io(VIRTIO_BLK_T_FLUSH, 0, core::ptr::null_mut(), 0)
     } else {
         false
     }

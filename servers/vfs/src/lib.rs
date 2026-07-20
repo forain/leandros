@@ -106,6 +106,14 @@ pub const VFS_LINK:            u64 = 0x37;
 /// the final component is not followed, so a symlink reports S_IFLNK and the
 /// length of its target as st_size.
 pub const VFS_LSTAT:           u64 = 0x38;
+/// fsync(fd) → 0 or -errno. Flush the filesystem backing `fd` to stable
+/// storage. Filesystems with no write-back state (tmpfs, procfs, devices)
+/// answer 0 without doing anything, which is honest rather than a stub: there
+/// is genuinely nothing of theirs that can outlive a reset.
+pub const VFS_FSYNC:           u64 = 0x39;
+/// sync() → 0. Flush *every* mounted filesystem. Takes no argument and cannot
+/// fail, matching `sync(2)`.
+pub const VFS_SYNC:            u64 = 0x3A;
 
 
 /// Readiness bitmask, numerically identical to Linux's POLLIN/POLLOUT/POLLERR/
@@ -1054,6 +1062,8 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_MKDIR        => handle_mkdir(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         VFS_MKNOD        => handle_mknod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         VFS_FTRUNCATE    => handle_ftruncate(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
+        VFS_FSYNC        => handle_fsync(caller_pid, arg(msg,0) as usize),
+        VFS_SYNC         => handle_sync(),
         VFS_RENAME       => handle_rename(arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_FD_PATH      => handle_fd_path(caller_pid, arg(msg,0) as usize,
                                             arg(msg,1) as usize, arg(msg,2) as usize),
@@ -3688,6 +3698,52 @@ fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
         }
         _ => err_reply(-22),
     }
+}
+
+/// fsync(fd) — flush the filesystem backing `fd`.
+///
+/// Only a mounted filesystem has anything to flush. tmpfs, procfs, pipes and
+/// device nodes hold no write-back state that could survive a reset, so
+/// reporting success for them is accurate, not a shortcut.
+fn handle_fsync(pid: u32, fd: usize) -> Message {
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); } // EBADF
+    match tbl.fds[fd].kind {
+        VnodeKind::MountedFile { port, .. } => {
+            drop(tbls);
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_FSYNC;
+            call_port(port, proxy)
+        }
+        _ => ok_reply(),
+    }
+}
+
+/// sync() — flush every mounted filesystem.
+///
+/// `sync(2)` returns void and cannot fail, so a port that answers with an
+/// error is logged by omission rather than propagated: there is no way to
+/// report it, and giving up on the remaining mounts would be worse.
+fn handle_sync() -> Message {
+    let ports = {
+        let m = MOUNTS.lock();
+        let mut ports = [0u32; MAX_MOUNTS];
+        let mut n = 0;
+        for e in m.iter() {
+            if e.in_use { ports[n] = e.port; n += 1; }
+        }
+        (ports, n)
+    };
+    // Collect the ports first, then release MOUNTS: call_port re-enters the
+    // server, and holding the mount table across that invites a deadlock.
+    let (ports, n) = ports;
+    for &port in &ports[..n] {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_FSYNC;
+        let _ = call_port(port, proxy);
+    }
+    ok_reply()
 }
 
 // NOTE — every handler below asks `tmpfs_path()` *before* `find_mount_port()`.
