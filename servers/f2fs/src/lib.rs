@@ -496,14 +496,21 @@ fn nat_update(ms: &mut MountState, ino: u32, blk_addr: u32) {
 // ── SIT: find a free segment ──────────────────────────────────────────────────
 
 fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
-    let _main_segs = ms.sb.main_blkaddr; // count derived from sit
-    // Scan SIT blocks for a segment with 0 valid blocks
-    let _sit_total_blks = ms.sb.seg_cnt_nat; // actually seg_cnt_main, but use what's available
-    // Best approach: scan through SIT entries linearly starting from after+1
-    let start_seg = after + 1;
-    // Use a reasonable upper bound (scan up to 1024 segments)
-    for seg_off in 0..1024u32 {
-        let seg = (start_seg + seg_off) % 1024;
+    // Bound the scan by the real main-area segment count, not a hardcoded
+    // 1024: on a volume with fewer segments the modulo wrapped onto segments
+    // past the end of SIT, and on a larger one it left everything above 1024
+    // permanently unreachable.
+    let total = ms.sb.seg_cnt_main.max(1);
+    let start_seg = (after + 1) % total;
+    for seg_off in 0..total {
+        let seg = (start_seg + seg_off) % total;
+        // Never hand back a segment one of the logs is *currently* writing
+        // into. Before reclaim existed this could not happen — vblocks only
+        // ever grew — but once a segment can drop back to zero valid blocks
+        // while the log's write pointer still sits inside it, allocating it to
+        // the other log would overwrite live data. This is the one guard that
+        // makes freeing safe; it is not optional.
+        if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno { continue; }
         let sit_blk_idx = seg / SIT_PER_BLK as u32;
         let sit_entry   = (seg % SIT_PER_BLK as u32) as usize;
         let sit_blkno   = ms.sb.sit_blkaddr + sit_blk_idx;
@@ -526,7 +533,8 @@ fn sit_mark_block_used(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
     let entry_off = sit_entry * SIT_ENTRY_SIZE;
     // Bump vblocks count
     let v = r16(blk, entry_off);
-    let cnt = (v & SIT_VBLOCKS_MASK) + 1;
+    let old_cnt = v & SIT_VBLOCKS_MASK;
+    let cnt = old_cnt + 1;
     let new_v = (v & !SIT_VBLOCKS_MASK) | (cnt & SIT_VBLOCKS_MASK);
     w16(blk, entry_off, new_v);
     // Set bit in valid_map
@@ -534,6 +542,63 @@ fn sit_mark_block_used(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
     let bit      = blk_in_seg as usize % 8;
     if entry_off + SIT_VMAP_OFF + byte_idx < BLOCK_SIZE {
         blk[entry_off + SIT_VMAP_OFF + byte_idx] |= 1 << bit;
+    }
+    let _ = old_cnt;
+    // NOTE: free_seg_cnt (which backs statfs/df) is deliberately NOT maintained
+    // here. It cannot be made accurate on this volume: the on-disk SIT vblocks
+    // counts are not reliably maintained by mkfs or the existing write path
+    // (a fresh write can leave a data segment reading a lower vblocks than it
+    // holds), so neither an incremental counter nor a live SIT scan yields a
+    // trustworthy free count. df therefore keeps reporting the static mkfs
+    // value, exactly as it did before reclaim existed. Making it truthful needs
+    // the allocator/SIT accounting reworked first — out of scope here.
+}
+
+/// Split a physical block address into `(segment, block-within-segment)`, or
+/// `None` for the hole sentinel / anything below the main area.
+///
+/// Every block-tree getter returns 0 for an unallocated slot, so the `phys == 0`
+/// guard is load-bearing: without it a sparse file's holes would each try to
+/// "free" segment 0, block 0 — the start of the main area.
+fn blkaddr_to_seg(ms: &MountState, phys: u32) -> Option<(u32, u32)> {
+    if phys < ms.sb.main_blkaddr { return None; }
+    let off = phys - ms.sb.main_blkaddr;
+    let bps = ms.sb.blocks_per_seg;
+    Some((off / bps, off % bps))
+}
+
+/// Clear one block's valid bit and decrement its segment's count — the inverse
+/// of `sit_mark_block_used`.
+///
+/// Idempotent: the count is only decremented if the bit was actually set. A
+/// double free otherwise corrupts vblocks, and with the reclaim walk touching
+/// shared indirect structures a block *can* be reached twice, so this is not
+/// theoretical.
+fn sit_mark_block_free(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
+    let sit_blk_idx = seg / SIT_PER_BLK as u32;
+    let sit_entry   = (seg % SIT_PER_BLK as u32) as usize;
+    let sit_blkno   = ms.sb.sit_blkaddr + sit_blk_idx;
+    let blk = ms.cache.get_mut(ms.dev, sit_blkno as u64);
+    let entry_off = sit_entry * SIT_ENTRY_SIZE;
+    let byte_idx = blk_in_seg as usize / 8;
+    let bit      = blk_in_seg as usize % 8;
+    let map_off  = entry_off + SIT_VMAP_OFF + byte_idx;
+    if map_off >= BLOCK_SIZE { return; }
+    let was_set = blk[map_off] & (1 << bit) != 0;
+    if !was_set { return; }
+    blk[map_off] &= !(1 << bit);
+    let v = r16(blk, entry_off);
+    let cnt = (v & SIT_VBLOCKS_MASK).saturating_sub(1);
+    w16(blk, entry_off, (v & !SIT_VBLOCKS_MASK) | cnt);
+    // See sit_mark_block_used on why free_seg_cnt is not touched. What matters
+    // for reclaim is that the valid_map bit is cleared and vblocks decremented,
+    // so sit_find_free_seg will hand this block's segment back once it empties.
+}
+
+/// Release a single physical block back to the allocator. No-op for holes.
+fn free_block(ms: &mut MountState, phys: u32) {
+    if let Some((seg, blk)) = blkaddr_to_seg(ms, phys) {
+        sit_mark_block_free(ms, seg, blk);
     }
 }
 
@@ -756,6 +821,112 @@ fn inode_logical_to_phys(ms: &mut MountState, ino: u32, idx: u64) -> u32 {
     }
 
     0
+}
+
+/// Copy a block out of the cache onto the stack.
+///
+/// Every reclaim walk must do this before it frees anything: `free_block`
+/// takes `cache.get_mut` on a SIT block, and with only `CACHE_SLOTS` slots
+/// that can evict the very node block being walked. Holding a `&` into the
+/// cache across a free is a use-after-evict.
+fn read_block_copy(ms: &mut MountState, blkaddr: u32) -> [u8; BLOCK_SIZE] {
+    let b = ms.cache.read(ms.dev, blkaddr as u64);
+    let mut c = [0u8; BLOCK_SIZE];
+    c.copy_from_slice(b);
+    c
+}
+
+/// Free every data block reachable through direct node `nid` (1019 slots),
+/// then the direct-node block itself.
+fn free_dnode(ms: &mut MountState, nid: u32) {
+    if nid == 0 { return; }
+    let dblkaddr = nat_lookup(ms, nid);
+    if dblkaddr == 0 { return; }
+    let dblk = read_block_copy(ms, dblkaddr);
+    const ADDRS_PER_DNODE: usize = NODE_FOOTER_OFF / 4; // 1019
+    for i in 0..ADDRS_PER_DNODE {
+        free_block(ms, dnode_get_blkaddr(&dblk, i));
+    }
+    free_block(ms, dblkaddr);
+}
+
+/// Free every block owned by inode `ino` — all data blocks and the entire node
+/// tree (direct, indirect, double-indirect), but not the inode block itself
+/// (the caller frees that, since only it knows whether the inode survives).
+///
+/// This is the whole-file case (unlink, rmdir, truncate-to-zero). It does not
+/// bother zeroing the freed pointers because every caller is about to discard
+/// or re-initialise the inode. NAT entries and nids are deliberately *not*
+/// recycled here — see the module notes on why nid reuse is unsafe without a
+/// free list.
+fn free_inode_data_and_nodes(ms: &mut MountState, ino: u32) {
+    let iblkaddr = nat_lookup(ms, ino);
+    if iblkaddr == 0 { return; }
+    let iblk = read_block_copy(ms, iblkaddr);
+
+    // Inline direct addresses.
+    let max_direct = inode_max_direct(&iblk);
+    for i in 0..max_direct {
+        free_block(ms, inode_get_blkaddr(&iblk, i));
+    }
+
+    // i_nid[0], i_nid[1]: direct nodes.
+    free_dnode(ms, inode_get_nid(&iblk, 0));
+    free_dnode(ms, inode_get_nid(&iblk, 1));
+
+    const NIDS_PER_BLOCK: usize = NODE_FOOTER_OFF / 4; // 1019
+
+    // i_nid[2], i_nid[3]: single-indirect — a block of dnode nids.
+    for slot in 2..=3usize {
+        let ind_nid = inode_get_nid(&iblk, slot);
+        if ind_nid == 0 { continue; }
+        let ind_blkaddr = nat_lookup(ms, ind_nid);
+        if ind_blkaddr == 0 { continue; }
+        let ind_blk = read_block_copy(ms, ind_blkaddr);
+        for i in 0..NIDS_PER_BLOCK {
+            free_dnode(ms, dnode_get_blkaddr(&ind_blk, i));
+        }
+        free_block(ms, ind_blkaddr);
+    }
+
+    // i_nid[4]: double-indirect — a block of indirect-node nids.
+    let dind_nid = inode_get_nid(&iblk, 4);
+    if dind_nid != 0 {
+        let dind_blkaddr = nat_lookup(ms, dind_nid);
+        if dind_blkaddr != 0 {
+            let dind_blk = read_block_copy(ms, dind_blkaddr);
+            for i in 0..NIDS_PER_BLOCK {
+                let ind_nid = dnode_get_blkaddr(&dind_blk, i);
+                if ind_nid == 0 { continue; }
+                let ind_blkaddr = nat_lookup(ms, ind_nid);
+                if ind_blkaddr == 0 { continue; }
+                let ind_blk = read_block_copy(ms, ind_blkaddr);
+                for j in 0..NIDS_PER_BLOCK {
+                    free_dnode(ms, dnode_get_blkaddr(&ind_blk, j));
+                }
+                free_block(ms, ind_blkaddr);
+            }
+            free_block(ms, dind_blkaddr);
+        }
+    }
+}
+
+/// Free every block of `ino` and reset all of its block pointers to zero,
+/// leaving a valid empty file. Used for truncate-to-zero (and O_TRUNC).
+///
+/// Reuses the same dnode-tree walk as `free_inode_data_and_nodes` — which the
+/// unlink path proves accounts correctly — rather than the per-logical-index
+/// `inode_logical_to_phys` walk, which returns scattered addresses once it
+/// passes the inline-direct region and mis-frees far more than it should.
+fn truncate_to_zero(ms: &mut MountState, ino: u32) {
+    free_inode_data_and_nodes(ms, ino);
+    let iblkaddr = nat_lookup(ms, ino);
+    if iblkaddr == 0 { return; }
+    let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
+    let max_direct = inode_max_direct(iblk);
+    for i in 0..max_direct { inode_set_blkaddr(iblk, i, 0); }
+    for n in 0..5 { inode_set_nid(iblk, n, 0); }
+    nat_update(ms, ino, iblkaddr);
 }
 
 /// Read `count` bytes from file `ino` at `pos` into `buf`.
@@ -1461,10 +1632,18 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         // destroy the winner's file on its way to the error.
         if create && flags & O_EXCL != 0 { return err_reply(-17); } // EEXIST
         if flags & O_TRUNC != 0 {
-            // Truncate: zero size in inode
+            // Truncate to zero: free the data blocks, not just the size field.
+            // Opening an existing file O_WRONLY|O_TRUNC is the usual way a
+            // shell rewrites it (`> file`), so leaking here leaked on every
+            // overwrite.
             let iblkaddr = nat_lookup(ms, ino);
+            let old_size = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_size(iblk) };
+            if old_size > 0 {
+                truncate_to_zero(ms, ino);
+            }
             let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
             w64(iblk, INO_SIZE, 0);
+            nat_update(ms, ino, iblkaddr);
         }
         ino
     };
@@ -1735,21 +1914,41 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
     if is_dir { return err_reply(-21); } // EISDIR — use rmdir() instead
     if !dir_remove_entry(ms, parent_ino, name) { return err_reply(-2); }
 
-    // Drop one reference. The inode block and its data blocks are only
-    // reclaimable once the count reaches zero — and this server has never
-    // reclaimed them (create/delete leaks blocks until the next mkfs), so the
-    // count is what stops a *surviving* hard link from being treated as the
-    // last name. Without it, `ln a b && rm a` left `b` pointing at an inode
-    // whose i_links_count still read 2, which every fsck and every st_nlink
-    // consumer would then disbelieve.
+    // Drop one reference. Blocks are reclaimable only when the count reaches
+    // zero, so the count is also what stops a *surviving* hard link from being
+    // treated as the last name: without it, `ln a b && rm a` left `b` pointing
+    // at an inode whose i_links_count still read 2, which every fsck and every
+    // st_nlink consumer would then disbelieve.
     let links = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_links(iblk) };
     if links > 1 {
         let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
         w32(iblk, INO_LINKS, links - 1);
         nat_update(ms, ino, iblkaddr);
+    } else if ino_is_open(ms, ino) {
+        // Last link, but a descriptor still holds it open. Linux keeps the
+        // inode alive until the final close; this server has no per-inode
+        // refcount, so the safe approximation is to leak the blocks rather
+        // than free storage a live fd is still reading. Zero the link count so
+        // the name is gone and a future fsck can reclaim it.
+        let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
+        w32(iblk, INO_LINKS, 0);
+        nat_update(ms, ino, iblkaddr);
+    } else {
+        // Last link, not open: reclaim for real. Data blocks and the whole
+        // node tree first, then the inode block itself.
+        free_inode_data_and_nodes(ms, ino);
+        free_block(ms, iblkaddr);
     }
     maybe_flush(ms);
     ok_reply()
+}
+
+/// True if any open descriptor on this mount still names `ino`.
+///
+/// Reclaim must skip an inode that is open — see the unlink path. Cheap linear
+/// scan; `MAX_OPEN_FILES` is small.
+fn ino_is_open(ms: &MountState, ino: u32) -> bool {
+    ms.open_files.iter().any(|f| f.in_use && f.inode == ino)
 }
 
 /// symlink(target, linkpath) — create a symlink inode holding `target` as its
@@ -2081,8 +2280,18 @@ fn handle_rmdir(ms: &mut MountState, path_ptr: u64) -> Message {
     let is_dir = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_is_dir(iblk) };
     if !is_dir { return err_reply(-20); } // ENOTDIR
     if !dir_is_empty(ms, ino) { return err_reply(-39); } // ENOTEMPTY
-    if dir_remove_entry(ms, parent_ino, name) { maybe_flush(ms); ok_reply() }
-    else { err_reply(-2) }
+    if !dir_remove_entry(ms, parent_ino, name) { return err_reply(-2); }
+    // An empty directory has no other links (no child ".." points back), so
+    // removing its name is always the last reference: reclaim its dentry
+    // blocks and inode. A directory is never held open through this server's
+    // fd table (opendir reads via getdents on a normal fd, closed promptly),
+    // but guard anyway for symmetry with unlink.
+    if !ino_is_open(ms, ino) {
+        free_inode_data_and_nodes(ms, ino);
+        free_block(ms, iblkaddr);
+    }
+    maybe_flush(ms);
+    ok_reply()
 }
 
 fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
@@ -2139,8 +2348,25 @@ fn handle_ftruncate(ms: &mut MountState, file_id: u64, length: u64) -> Message {
     if !ms.open_files[slot].writable { return err_reply(-13); }
     let ino = ms.open_files[slot].inode;
     let iblkaddr = nat_lookup(ms, ino);
+    let old_size = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_size(iblk) };
+
+    // Shrinking: release the blocks past the new end so the space actually
+    // comes back. Growing or same-size: nothing to free (the tail reads as a
+    // hole until written). Truncate used to write only i_size, so `truncate -s
+    // 0 big` freed nothing and df never moved.
+    // Truncate to zero reclaims everything. A non-zero shrink is deliberately
+    // left to only update the size for now: the per-index free walk needed to
+    // release just the tail returned scattered addresses past the inline-direct
+    // region and mis-freed live blocks, so it is safer to leak the tail than to
+    // corrupt the volume. The common cases — `> file`, `truncate -s 0`, and
+    // unlink — all go through the zero path and reclaim correctly.
+    if length == 0 && old_size > 0 {
+        truncate_to_zero(ms, ino);
+    }
+
     let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
     w64(iblk, INO_SIZE, length);
+    nat_update(ms, ino, iblkaddr);
     maybe_flush(ms);
     ok_reply()
 }
