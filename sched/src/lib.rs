@@ -67,6 +67,11 @@ static SCHED_ONLINE: AtomicBool = AtomicBool::new(false);
 /// Optional hook called with a PID just before its task slot is reclaimed.
 /// Registered by the IPC layer to release ports owned by the exiting task.
 static TASK_EXIT_HOOK:  AtomicPtr<()>   = AtomicPtr::new(core::ptr::null_mut());
+/// Optional hook called with a PID at the very top of [`exit`], while the
+/// dying task is still current, still runnable, and still owns its address
+/// space. Registered by the kernel to run the same fd/pipe/socket teardown
+/// the `EXIT` syscall performs — see `register_exit_teardown_hook`.
+static EXIT_TEARDOWN_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 // ── Exit-code log ────────────────────────────────────────────────────────────
 
@@ -1178,6 +1183,34 @@ pub fn exit(code: i32) -> ! {
         fn print_number(n: u32);
     }
     let pid = current_pid();
+
+    // Release this task's fds *before* it becomes a zombie.
+    //
+    // The `EXIT`/`EXIT_GROUP` syscalls already call `vfs_close_all_current()`
+    // on the way in, but they are not the only way a task dies: a default-
+    // action signal (`SIG_DFL` terminate), a failed signal-frame write, and a
+    // corrupt `rt_sigreturn` frame all call straight into here from
+    // `sched::signal`. Those paths used to skip fd teardown entirely, so a
+    // process killed by a signal while holding a pipe's write end left the
+    // ring's writer count above zero forever — the reader at the other end
+    // then blocked permanently instead of seeing EOF, which is the shell-wedge
+    // signature, and the ring slot leaked from a pool of only MAX_PIPES = 16.
+    // Ctrl-C'ing enough pipelines would exhaust it.
+    //
+    // Running it here rather than from the reap hook is deliberate: this is
+    // still the dying task's own context, with its address space live and no
+    // scheduler lock held, so a blocking IPC call into the VFS is as safe as
+    // it is from the `EXIT` syscall. The reap hook has none of those
+    // properties. Re-running teardown for a task that came through `EXIT` is
+    // harmless — the second pass finds an empty fd table and does nothing.
+    {
+        let hook_ptr = EXIT_TEARDOWN_HOOK.load(Ordering::Acquire);
+        if !hook_ptr.is_null() {
+            let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
+            hook(pid);
+        }
+    }
+
     unsafe {
         let msg = b"[EXIT] pid=";
         serial_print(msg.as_ptr(), msg.len());
@@ -1474,4 +1507,18 @@ where F: FnOnce(&mut mm::vmm::AddressSpace) -> R {
 
 pub fn register_task_exit_hook(hook: fn(u32)) {
     TASK_EXIT_HOOK.store(hook as *mut (), Ordering::Release);
+}
+
+/// Register the fd/pipe/socket teardown that [`exit`] must run for *every*
+/// dying task, however it came to die.
+///
+/// Distinct from [`register_task_exit_hook`], which fires from the scheduler's
+/// reap path — that runs under the run-queue lock, on some other CPU's
+/// dispatch loop, with the dead task's address space already gone. It is the
+/// right place to free a kernel stack and release IPC ports, and the wrong
+/// place to make a blocking IPC call into the VFS. This hook instead runs in
+/// the dying task's own context, before it becomes a zombie, which is exactly
+/// the context the `EXIT` syscall already calls `vfs_close_all_current()` from.
+pub fn register_exit_teardown_hook(hook: fn(u32)) {
+    EXIT_TEARDOWN_HOOK.store(hook as *mut (), Ordering::Release);
 }

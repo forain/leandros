@@ -4823,6 +4823,24 @@ fn read_cstr_for_vfs(path: &[u8]) -> Option<([u8; 256], usize)> {
     Some((buf, len))
 }
 
+/// Teach the scheduler how to release a dying task's fds.
+///
+/// `sched::exit` is the single funnel every death path goes through — the
+/// `EXIT`/`EXIT_GROUP` syscalls, but also `SIG_DFL`-terminate signal delivery
+/// and the two signal-frame failure paths in `sched/src/signal.rs`, which
+/// called `exit()` directly and skipped fd teardown entirely. A process killed
+/// by a signal while holding a pipe write end therefore left the ring's writer
+/// count non-zero forever, wedging the reader and leaking one of only 16 pipe
+/// slots. Registering the teardown with the scheduler closes that gap for
+/// every present and future caller of `exit()` at once, rather than patching
+/// each signal site.
+///
+/// `sched` cannot call this directly: it sits below the kernel crate and has
+/// no knowledge of the VFS, which is why this goes through a function pointer.
+pub fn init_exit_teardown() {
+    sched::register_exit_teardown_hook(vfs_close_all_for);
+}
+
 /// Close all FDs for the current process in VFS (called on exit).
 fn vfs_close_all_current() {
     vfs_close_all_for(current_pid());

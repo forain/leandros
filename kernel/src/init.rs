@@ -32,6 +32,11 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // registry (demand-paged exec reads ELF pages in from page faults).
     crate::syscall::init_exec_file_backing();
 
+    // Make every path out of a task — including signal-initiated death, which
+    // bypasses the EXIT syscall entirely — release its fds, pipes, sockets and
+    // TTY state. See syscall::init_exit_teardown.
+    crate::syscall::init_exit_teardown();
+
     // ── In-Kernel Servers ──────────────────────────────────────────────────
     if let Some(vfs_port) = vfs_server::init(0) {
         crate::syscall::set_vfs_server_port(vfs_port);
