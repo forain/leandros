@@ -4916,6 +4916,18 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         let reply = vfs::handle(&msg, pid);
         return u64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8])) as isize;
     }
+    // Everything left is a terminal ioctl, and a terminal ioctl on something
+    // that is not a terminal is ENOTTY. The TTY server answers fd 0/1/2
+    // unconditionally from the console termios — correct for the console, but
+    // it also made `prog < file` and `prog | other` look interactive, because
+    // isatty() *is* TCGETS/TCGETS2 and a success there is the whole test.
+    // fd_is_console_stdio is false exactly when 0/1/2 has been redirected onto
+    // a real VFS object (file, pipe, directory), and true for the console and
+    // for console proxies — including the fd>2 ones the remap above folded to 0.
+    if fd <= 2 && !vfs::fd_is_console_stdio(pid, fd) {
+        return ENOTTY;
+    }
+
     let msg = make_vfs_msg(tty_server::TTY_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
     net_reply_val(&tty_server::handle(&msg, pid))
 }

@@ -771,6 +771,19 @@ use core::sync::atomic;
 
 // ── Static RamFS ──────────────────────────────────────────────────────────────
 
+/// Inode number of the console character device.
+///
+/// One identity shared by every route that can name the console: `fstat` on an
+/// unredirected fd 0/1/2, `fstat` on a console proxy (a dup'd stdio fd or an
+/// fd opened on /dev/tty), and `stat("/dev/console")` / `stat("/dev/tty")`.
+///
+/// They have to agree because `ttyname()` — which is how `tty(1)` and every
+/// other "what terminal am I on" query is actually implemented — fstats the
+/// fd, readlinks /proc/self/fd/N, then stats the path it read back and demands
+/// that (st_dev, st_ino) match. Any disagreement reads as "not a tty".
+/// Distinct from the pipe (0x1000_0000) and tmpfs (0x2000_0000) ranges.
+pub const CONSOLE_INO: u64 = 0x3000_0000;
+
 struct RamEntry { path: &'static [u8], data: &'static [u8] }
 
 static RAMFS: &[RamEntry] = &[
@@ -783,6 +796,11 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/dev/stdout",  data: b"" },
     RamEntry { path: b"/dev/stderr",  data: b"" },
     RamEntry { path: b"/dev/tty",     data: b"" },
+    // The controlling terminal under its other conventional name. `open` has
+    // always accepted it (it maps to the same console proxy as /dev/tty), but
+    // without a table entry it did not exist for `access`, `ls /dev` or the
+    // RamFS half of `stat` — and it is the path `ttyname()` now reports.
+    RamEntry { path: b"/dev/console", data: b"" },
     RamEntry { path: b"/dev/fb0",     data: b"" },
     // /etc
     RamEntry { path: b"/etc/motd",
@@ -4606,6 +4624,14 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
                 return ok_reply();
             }
         }
+        // The console. Must be answered before the RamFS sweep below, which
+        // would otherwise report the placeholder /dev/tty entry as a zero-byte
+        // S_IFREG — and must carry CONSOLE_INO so it agrees with fstat on the
+        // console fd itself. See CONSOLE_INO for why ttyname() depends on it.
+        if lookup_path == b"/dev/tty" || lookup_path == b"/dev/console" {
+            write_stat(stat_ptr, 0o020666, 0, CONSOLE_INO);
+            return ok_reply();
+        }
         // Special device files.
         if lookup_path == b"/dev/null" || lookup_path == b"/dev/zero" || lookup_path == b"/dev/urandom"
            || lookup_path == b"/dev/random" || lookup_path == b"/dev/fb0" {
@@ -4667,19 +4693,52 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
     // Fall back to mounted filesystems.
     if let Some(port) = find_mount_port(path) {
         let mut proxy = Message::empty();
-        proxy.tag = VFS_STAT;
+        proxy.tag = if follow { VFS_STAT } else { VFS_LSTAT };
         proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
         proxy.data[8..16].copy_from_slice(&(stat_ptr as u64).to_le_bytes());
-        return call_port(port, proxy);
+        let r = call_port(port, proxy);
+        // A mount server that predates VFS_LSTAT answers ENOSYS; degrade to
+        // stat rather than failing the call outright.
+        if !follow && reply_val(&r) == -38 {
+            let mut retry = Message::empty();
+            retry.tag = VFS_STAT;
+            retry.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+            retry.data[8..16].copy_from_slice(&(stat_ptr as u64).to_le_bytes());
+            return call_port(port, retry);
+        }
+        return r;
     }
 
     err_reply(-2) // ENOENT
 }
 
-enum FdInfo { Static(&'static [u8]), Pipe(usize), RamData(*const u8), TmpIdx(usize), Bad }
+enum FdInfo { Static(&'static [u8]), Pipe(usize), RamData(*const u8), TmpIdx(usize),
+              Mounted(u32, u32), Bad }
 
 fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Message {
     if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
+    // fd tables are keyed by tgid, like every other lookup here (find_tbl).
+    // Matching the raw pid missed the table for any non-leader thread, so a
+    // threaded process got EBADF for descriptors it plainly held.
+    let pid = sched::tgid_of(pid);
+
+    // The console has no fd-table entry at all: an unredirected fd 0/1/2 is
+    // handled above this layer, so `tbl.fds[0].in_use` is false and the lookup
+    // below would answer EBADF for the one descriptor most likely to be asked
+    // about. That EBADF is what made `tty` print "not a tty" on a real console:
+    // ttyname() readlinks /proc/self/fd/0 and treats any error as "no tty".
+    //
+    // Answer with the console's own device path. Checked before the lock —
+    // fd_is_console_stdio takes FD_TABLES itself — and it is false for a
+    // redirected fd 0 (a file, pipe or directory has a real entry), so
+    // redirection keeps reporting the redirected target.
+    if fd_is_console_stdio(pid, fd) {
+        let p: &[u8] = b"/dev/console";
+        let c = p.len().min(buf_len);
+        unsafe { core::ptr::copy_nonoverlapping(p.as_ptr(), buf_ptr as *mut u8, c); }
+        return val_reply(c as u64);
+    }
+
     let info = {
         let tbls = FD_TABLES.lock();
         let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
@@ -4700,11 +4759,22 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             VnodeKind::DevStdio { target_fd: 0 } => FdInfo::Static(b"/dev/stdin"),
             VnodeKind::DevStdio { target_fd: 1 } => FdInfo::Static(b"/dev/stdout"),
             VnodeKind::DevStdio { .. } => FdInfo::Static(b"/dev/stderr"),
+            // A file on a mounted filesystem: only the owning mount server
+            // knows the path behind its file_id, so ask it.
+            VnodeKind::MountedFile { port, file_id } => FdInfo::Mounted(*port, *file_id),
             _ => FdInfo::Bad,
         }
     };
     match info {
         FdInfo::Bad => err_reply(-9),
+        FdInfo::Mounted(port, file_id) => {
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_FD_PATH;
+            proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
+            proxy.data[16..24].copy_from_slice(&(buf_len as u64).to_le_bytes());
+            call_port(port, proxy)
+        }
         FdInfo::Static(p) => {
             let c = p.len().min(buf_len);
             unsafe { core::ptr::copy_nonoverlapping(p.as_ptr(), buf_ptr as *mut u8, c); }
