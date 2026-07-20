@@ -712,9 +712,15 @@ fn termios_ioctl(cmd: usize, arg_ptr: usize, t: &mut Termios) -> Message {
         TIOCGWINSZ => {
             // struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel } — 4×u16 = 8 bytes
             if arg_ptr == 0 { return err_reply(-14); }
+            // Report the framebuffer's real cell grid: it is the primary
+            // console, and a line editor told 80x24 wraps and repaints against
+            // geometry the screen does not have.
+            extern "C" { fn kernel_console_winsize(rows: *mut u16, cols: *mut u16); }
+            let (mut rows, mut cols) = (24u16, 80u16);
+            unsafe { kernel_console_winsize(&mut rows, &mut cols); }
             unsafe {
-                core::ptr::write(arg_ptr       as *mut u16, 24);  // rows
-                core::ptr::write((arg_ptr + 2) as *mut u16, 80);  // cols
+                core::ptr::write(arg_ptr       as *mut u16, rows);
+                core::ptr::write((arg_ptr + 2) as *mut u16, cols);
                 core::ptr::write((arg_ptr + 4) as *mut u16, 0);
                 core::ptr::write((arg_ptr + 6) as *mut u16, 0);
             }

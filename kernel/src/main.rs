@@ -167,6 +167,21 @@ pub fn serial_print_hex(n: usize) {
     print_hex(n);
 }
 
+/// Console size in character cells, for the TTY server's `TIOCGWINSZ`.
+///
+/// The framebuffer is the primary console, so its cell grid is what programs
+/// are told about — a line editor that believes the screen is 80x24 while the
+/// framebuffer is much wider wraps and positions against the wrong geometry.
+/// Falls back to 80x24 before the framebuffer is initialised.  Lives here
+/// rather than in servers/tty because that crate does not depend on `drivers`;
+/// this mirrors the existing `kernel_set_console_enabled` callback.
+#[no_mangle]
+pub extern "C" fn kernel_console_winsize(rows: *mut u16, cols: *mut u16) {
+    let (c, r) = drivers::framebuffer::fb_console_size().unwrap_or((80, 24));
+    if !rows.is_null() { unsafe { *rows = r as u16; } }
+    if !cols.is_null() { unsafe { *cols = c as u16; } }
+}
+
 #[no_mangle]
 pub extern "C" fn kernel_set_console_enabled(enabled: bool) {
     KERNEL_CONSOLE_ENABLED.store(enabled, core::sync::atomic::Ordering::SeqCst);

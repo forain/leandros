@@ -2748,9 +2748,110 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 
 // ── I/O syscalls ──────────────────────────────────────────────────────────────
 
+/// A small ring of synthetic console input bytes waiting to be delivered.
+///
+/// Only the cursor-position report uses this today, so 32 bytes is ample; a
+/// full ring drops the newest byte rather than blocking a writer.
+struct ByteRing { buf: [u8; 32], head: usize, tail: usize }
+
+impl ByteRing {
+    const fn new() -> Self { Self { buf: [0; 32], head: 0, tail: 0 } }
+
+    fn push(&mut self, b: u8) {
+        let next = (self.tail + 1) % self.buf.len();
+        if next != self.head {
+            self.buf[self.tail] = b;
+            self.tail = next;
+        }
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.head == self.tail { return None; }
+        let b = self.buf[self.head];
+        self.head = (self.head + 1) % self.buf.len();
+        Some(b)
+    }
+}
+
+static PENDING_INPUT: spin::Mutex<ByteRing> = spin::Mutex::new(ByteRing::new());
+
+/// True when synthetic console input is waiting to be read.
+///
+/// `poll`/`epoll` readiness must account for this: crossterm registers its
+/// /dev/tty handle in epoll and blocks there for the cursor-position reply, so
+/// a reply invisible to the readiness check leaves that wait hanging until
+/// reedline's CPR timeout fires and brush drops out of interactive mode.
+fn console_input_pending() -> bool {
+    let q = PENDING_INPUT.lock();
+    q.head != q.tail
+}
+
+/// Queue the answer to a `CSI 6 n` cursor-position report.
+///
+/// The framebuffer is the primary console, so the reply must describe *its*
+/// cursor.  Letting the query reach the UART instead means whatever terminal
+/// is attached there answers on behalf of a screen with different geometry,
+/// and a line editor then repaints at a row that only makes sense on that
+/// other terminal.
+fn answer_cursor_position_report() {
+    // Read the cursor before taking the input lock: fb_cursor_cell takes the
+    // framebuffer lock internally and the two must never be held together.
+    let (row, col) = drivers::framebuffer::fb_cursor_cell();
+
+    fn push_dec(q: &mut ByteRing, mut n: usize) {
+        let mut digits = [0u8; 5];
+        let mut i = 0;
+        if n == 0 { q.push(b'0'); return; }
+        while n > 0 && i < digits.len() { digits[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
+        while i > 0 { i -= 1; q.push(digits[i]); }
+    }
+
+    let mut q = PENDING_INPUT.lock();
+    q.push(0x1b);
+    q.push(b'[');
+    push_dec(&mut q, row);
+    q.push(b';');
+    push_dec(&mut q, col);
+    q.push(b'R');
+}
+
+/// Console output from userspace, with `CSI 6 n` intercepted and answered
+/// locally instead of forwarded to the serial line.
+///
+/// Everything else passes through untouched, so the serial log still shows the
+/// full byte stream.  A query split across two `write` calls is not recognised
+/// and falls back to the old behaviour (an attached terminal answers it).
+fn console_write_user(bytes: &[u8]) {
+    const CPR_QUERY: &[u8] = b"\x1b[6n";
+
+    if bytes.len() < CPR_QUERY.len()
+        || !bytes.windows(CPR_QUERY.len()).any(|w| w == CPR_QUERY)
+    {
+        serial_write_raw(bytes);
+        return;
+    }
+
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(CPR_QUERY) {
+            if i > start { serial_write_raw(&bytes[start..i]); }
+            answer_cursor_position_report();
+            i += CPR_QUERY.len();
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < bytes.len() { serial_write_raw(&bytes[start..]); }
+}
+
 /// Helper to read a single ASCII byte from evdev0 (unifying UART and keyboard).
 fn read_input_byte() -> Option<u8> {
     static mut SHIFT_PRESSED: bool = false;
+    // Synthetic input (the cursor-position reply) is delivered ahead of the
+    // hardware queue so it reaches the reader in the order it was generated.
+    if let Some(b) = PENDING_INPUT.lock().pop() { return Some(b); }
     loop {
         if let Some(ev) = evdev_server::pop_event(0) {
             // EV_KEY
@@ -2901,7 +3002,8 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
 
             if !ok { return -14; }
 
-            serial_write_raw(kbuf.as_slice());
+            trace_fd_route(fd, "console");
+            console_write_user(kbuf.as_slice());
             count as isize
         }
 
@@ -4805,7 +4907,8 @@ fn poll_fd_state(pid: u32, fd: usize) -> u32 {
     const POLLNVAL: u32 = 0x0020;
 
     if fd == 0 {
-        return if evdev_server::has_key_event(0) || crate::serial_has_data() { POLLIN } else { 0 };
+        return if console_input_pending()
+            || evdev_server::has_key_event(0) || crate::serial_has_data() { POLLIN } else { 0 };
     }
     if fd == 1 || fd == 2 {
         return POLLOUT;
@@ -4815,7 +4918,8 @@ fn poll_fd_state(pid: u32, fd: usize) -> u32 {
     // the cursor-position reply; VFS_POLL reports DevStdio not-ready, which
     // hung that wait.
     if fd < net_server::SOCK_FD_BASE && vfs::fd_is_console_stdio(pid, fd) {
-        return if evdev_server::has_key_event(0) || crate::serial_has_data() {
+        return if console_input_pending()
+            || evdev_server::has_key_event(0) || crate::serial_has_data() {
             POLLIN | POLLOUT
         } else {
             POLLOUT

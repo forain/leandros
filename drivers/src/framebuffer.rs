@@ -697,6 +697,28 @@ pub fn fb_putc(c: u8) {
     KERNEL_FB.lock().putc(c);
 }
 
+/// Console cursor position in 1-based `(row, col)` character cells.
+///
+/// This is the authoritative answer to a `CSI 6 n` cursor-position report: the
+/// framebuffer is the primary console, so its cursor — not whatever terminal
+/// happens to be listening on the serial line — is what a line editor must be
+/// told about.  Returns `(1, 1)` before the framebuffer is initialised.
+pub fn fb_cursor_cell() -> (usize, usize) {
+    let fb = KERNEL_FB.lock();
+    if fb.char_width == 0 || fb.char_height == 0 { return (1, 1); }
+    (fb.row() + 1, fb.col() + 1)
+}
+
+/// Console size in character cells as `(cols, rows)`, or `None` if the
+/// framebuffer has not been initialised yet.
+pub fn fb_console_size() -> Option<(usize, usize)> {
+    let fb = KERNEL_FB.lock();
+    if fb.width == 0 || fb.height == 0 || fb.char_width == 0 || fb.char_height == 0 {
+        return None;
+    }
+    Some((fb.cols(), fb.rows()))
+}
+
 /// Flush the kernel framebuffer to the GPU if present.
 ///
 /// Drops the KERNEL_FB lock before acquiring VIRTIO_GPU to avoid lock-order
