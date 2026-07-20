@@ -38,7 +38,48 @@ pub fn get_hardware_fb_info() -> Option<(u64, u32, u32, u32)> {
     lock.as_ref().map(|fb| (fb.base, fb.width, fb.height, fb.pitch))
 }
 
+/// Resolve an xterm-256 colour index: 0-15 palette, 16-231 6×6×6 cube,
+/// 232-255 greyscale ramp.
+fn xterm256(n: usize, base: &[u32; 8], bright: &[u32; 8]) -> u32 {
+    match n {
+        0..=7   => base[n],
+        8..=15  => bright[n - 8],
+        16..=231 => {
+            const LEVELS: [u32; 6] = [0, 95, 135, 175, 215, 255];
+            let i = n - 16;
+            (LEVELS[i / 36] << 16) | (LEVELS[(i / 6) % 6] << 8) | LEVELS[i % 6]
+        }
+        232..=255 => {
+            let v = 8 + (n as u32 - 232) * 10;
+            (v << 16) | (v << 8) | v
+        }
+        _ => 0xFFFFFF,
+    }
+}
+
 // ── Driver struct ─────────────────────────────────────────────────────────────
+
+/// Where the escape-sequence parser is in a multi-byte sequence.
+///
+/// The console is the *only* VT emulator on the framebuffer path (serial hands
+/// raw bytes to the host terminal, which does this itself), so anything a line
+/// editor emits has to be understood here or it is lost.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EscState {
+    /// Not in a sequence — bytes are printable/control.
+    Ground,
+    /// Saw ESC; the next byte selects the sequence type.
+    Esc,
+    /// Saw `ESC [` — collecting parameter/intermediate bytes (0x20..=0x3F)
+    /// until a final byte (0x40..=0x7E).
+    Csi,
+    /// Saw `ESC ]` — swallow the string until BEL or ST (`ESC \`).
+    Osc,
+    /// Saw ESC inside an OSC string — `\` ends it, anything else resumes.
+    OscEsc,
+    /// Saw a two-byte escape like `ESC ( B` — swallow exactly one more byte.
+    Discard1,
+}
 
 pub struct Framebuffer {
     base:   *mut u32,
@@ -50,6 +91,15 @@ pub struct Framebuffer {
     vector_font: Option<VectorFont>,
     char_width: usize,
     char_height: usize,
+    /// Escape-sequence parser state.
+    esc: EscState,
+    /// Raw parameter/intermediate bytes of the CSI sequence being collected.
+    params: [u8; 32],
+    params_len: usize,
+    /// Current SGR foreground colour; reset to white by `SGR 0`.
+    fg: u32,
+    /// Cursor saved by `ESC 7` / `CSI s`, restored by `ESC 8` / `CSI u`.
+    saved_cursor: (usize, usize),
     /// Bounding box of pixels modified since the last flush, as
     /// `(min_x, min_y, max_x, max_y)` with the maxima exclusive.  Lets
     /// `fb_flush` transfer only the changed region to the GPU instead of the
@@ -79,6 +129,11 @@ impl Framebuffer {
             vector_font: None,
             char_width: 12,  // Vector font character width
             char_height: 20, // Vector font character height
+            esc: EscState::Ground,
+            params: [0; 32],
+            params_len: 0,
+            fg: 0xFFFFFF,
+            saved_cursor: (0, 0),
             dirty: None,
         }
     }
@@ -145,28 +200,65 @@ impl Framebuffer {
         if self.base.is_null() { return; }
 
         static mut UTF8_STATE: (usize, u32) = (0, 0);
-        static mut ANSI_STATE: (bool, [u8; 16], usize) = (false, [0; 16], 0);
 
-        unsafe {
-            // Handle ANSI escape sequences
-            if c == 0x1b {  // ESC character starts escape sequence
-                ANSI_STATE.0 = true;
-                ANSI_STATE.2 = 0;
+        // ESC restarts a sequence from any state (except inside an OSC string,
+        // where it may be the first half of the ST terminator).
+        if c == 0x1b {
+            self.esc = if self.esc == EscState::Osc { EscState::OscEsc } else { EscState::Esc };
+            self.params_len = 0;
+            return;
+        }
+
+        match self.esc {
+            EscState::Ground => {}
+            EscState::Esc => {
+                self.esc = match c {
+                    b'[' => { self.params_len = 0; EscState::Csi }
+                    b']' => EscState::Osc,
+                    // Charset / DEC selectors take one more byte: ESC ( B, ESC # 8, …
+                    b'(' | b')' | b'*' | b'+' | b'#' | b'%' => EscState::Discard1,
+                    b'7' => { self.saved_cursor = (self.cursor_x, self.cursor_y); EscState::Ground }
+                    b'8' => { let (x, y) = self.saved_cursor;
+                              self.cursor_x = x; self.cursor_y = y; EscState::Ground }
+                    b'M' => { self.reverse_index(); EscState::Ground }
+                    // ESC =, ESC >, ESC c, … — nothing we need to render.
+                    _ => EscState::Ground,
+                };
                 return;
-            } else if ANSI_STATE.0 {
-                // We're in an escape sequence
-                if ANSI_STATE.2 < (*core::ptr::addr_of!(ANSI_STATE)).1.len() {
-                    ANSI_STATE.1[ANSI_STATE.2] = c;
-                    ANSI_STATE.2 += 1;
+            }
+            EscState::Csi => {
+                if (0x20..=0x3f).contains(&c) {
+                    // Parameter or intermediate byte — accumulate. Overlong
+                    // sequences keep parsing; only the excess bytes are lost.
+                    if self.params_len < self.params.len() {
+                        self.params[self.params_len] = c;
+                        self.params_len += 1;
+                    }
+                } else if (0x40..=0x7e).contains(&c) {
+                    // Final byte — `params` is Copy, so take it by value to
+                    // release the borrow before the &mut self dispatch.
+                    let (params, len) = (self.params, self.params_len);
+                    self.handle_csi(&params[..len], c);
+                    self.esc = EscState::Ground;
+                } else {
+                    // A C0 control aborted the sequence; drop it and resync.
+                    self.esc = EscState::Ground;
                 }
-
-                // Check for complete escape sequences
-                if c.is_ascii_alphabetic() {
-                    // End of escape sequence
-                    self.handle_ansi_sequence(&ANSI_STATE.1[..ANSI_STATE.2]);
-                    ANSI_STATE.0 = false;
-                    ANSI_STATE.2 = 0;
-                }
+                return;
+            }
+            EscState::Osc => {
+                // OSC strings (e.g. `ESC ]0;title BEL`) carry arbitrary text.
+                // The old parser stopped at the first letter and spilled the
+                // rest of the title onto the screen; swallow to BEL instead.
+                if c == 0x07 { self.esc = EscState::Ground; }
+                return;
+            }
+            EscState::OscEsc => {
+                self.esc = if c == b'\\' { EscState::Ground } else { EscState::Osc };
+                return;
+            }
+            EscState::Discard1 => {
+                self.esc = EscState::Ground;
                 return;
             }
         }
@@ -184,7 +276,7 @@ impl Framebuffer {
                 if c < 0x80 {
                     // ASCII character
                     UTF8_STATE = (0, 0);
-                    self.draw_char_vector(self.cursor_x, self.cursor_y, c as char, 0xFFFFFF);
+                    self.draw_char_vector(self.cursor_x, self.cursor_y, c as char, self.fg);
                     self.cursor_x += self.char_width;
                 } else if c & 0xE0 == 0xC0 {
                     // Start of 2-byte UTF-8
@@ -204,7 +296,7 @@ impl Framebuffer {
                         // Complete UTF-8 character
                         let unicode_char = UTF8_STATE.1;
                         let display_char = self.map_unicode_to_ascii(unicode_char);
-                        self.draw_char_vector(self.cursor_x, self.cursor_y, display_char, 0xFFFFFF);
+                        self.draw_char_vector(self.cursor_x, self.cursor_y, display_char, self.fg);
                         self.cursor_x += self.char_width;
                         UTF8_STATE = (0, 0);
                     }
@@ -254,47 +346,194 @@ impl Framebuffer {
         // If we're at position (0,0), do nothing
     }
 
-    /// Handle ANSI escape sequences for terminal control
-    fn handle_ansi_sequence(&mut self, sequence: &[u8]) {
-        if sequence.len() >= 2 && sequence[0] == b'[' {
-            match sequence {
-                [b'[', b'2', b'J'] => {
-                    // Clear entire screen
-                    self.clear_screen();
-                }
-                [b'[', b'H'] => {
-                    // Move cursor to home position (0,0)
-                    self.cursor_x = 0;
-                    self.cursor_y = 0;
-                }
-                [b'[', b'K'] => {
-                    // Clear from cursor to end of line
-                    self.clear_line_from_cursor();
-                }
-                _ => {
-                    // Ignore unsupported escape sequences
-                }
+    // ── Cell-grid helpers ─────────────────────────────────────────────────
+    //
+    // `cursor_x`/`cursor_y` are pixel coordinates, but CSI positioning is in
+    // character cells, so convert at the boundary.
+
+    fn cols(&self) -> usize { self.width / self.char_width }
+    fn rows(&self) -> usize { self.height / self.char_height }
+    fn col(&self)  -> usize { self.cursor_x / self.char_width }
+    fn row(&self)  -> usize { self.cursor_y / self.char_height }
+
+    fn set_cell(&mut self, col: usize, row: usize) {
+        self.cursor_x = col * self.char_width;
+        self.cursor_y = row * self.char_height;
+    }
+
+    /// Fill a pixel rectangle, marking the whole region dirty once instead of
+    /// per pixel (erases cover thousands of pixels on every repaint).
+    fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
+        if self.base.is_null() { return; }
+        let x1 = (x + w).min(self.width);
+        let y1 = (y + h).min(self.height);
+        if x >= x1 || y >= y1 { return; }
+        let stride = self.pitch / 4;
+        unsafe {
+            for yy in y..y1 {
+                let row = self.base.add(yy * stride);
+                for xx in x..x1 { row.add(xx).write_volatile(color); }
             }
+        }
+        self.mark_dirty(x, y, x1 - x, y1 - y);
+    }
+
+    /// `ESC M` — move up one line, scrolling down if already at the top.
+    fn reverse_index(&mut self) {
+        if self.cursor_y >= self.char_height {
+            self.cursor_y -= self.char_height;
         }
     }
 
-    /// Clear the entire screen with background color
-    fn clear_screen(&mut self) {
-        for y in 0..self.height {
-            for x in 0..self.width {
-                self.set_pixel(x, y, 0x000000);
+    /// Dispatch a CSI sequence given its raw parameter bytes and final byte.
+    ///
+    /// This replaces an exact-match on three literal sequences.  Parameterised
+    /// forms are what line editors actually emit — reedline repaints with
+    /// `CSI <row>;1 H` followed by `CSI J`, neither of which the literal match
+    /// recognised, so the cursor never returned to the prompt and every
+    /// keystroke appended a fresh prompt line.
+    fn handle_csi(&mut self, params: &[u8], final_byte: u8) {
+        if self.cols() == 0 || self.rows() == 0 { return; }
+
+        // Parse `1;2;3` into numbers, tracking which were actually present so
+        // omitted parameters can take their (per-sequence) default rather than 0.
+        let mut nums = [0usize; 8];
+        let mut present = [false; 8];
+        let mut count = 0usize;
+        let mut cur: Option<usize> = None;
+        // A leading `?` marks a DEC private sequence (cursor visibility,
+        // bracketed paste, …) — parsed, then ignored below.
+        let private = params.first() == Some(&b'?');
+        for &b in params {
+            match b {
+                b'0'..=b'9' => cur = Some(cur.unwrap_or(0) * 10 + (b - b'0') as usize),
+                b';' => {
+                    if count < nums.len() {
+                        nums[count] = cur.unwrap_or(0);
+                        present[count] = cur.is_some();
+                        count += 1;
+                    }
+                    cur = None;
+                }
+                _ => {}
             }
         }
-        self.cursor_x = 0;
-        self.cursor_y = 0;
+        if count < nums.len() {
+            nums[count] = cur.unwrap_or(0);
+            present[count] = cur.is_some();
+            count += 1;
+        }
+        let p = |i: usize, default: usize| {
+            if i < count && present[i] { nums[i] } else { default }
+        };
+
+        let (cols, rows) = (self.cols(), self.rows());
+        let (mut col, mut row) = (self.col(), self.row());
+
+        match final_byte {
+            _ if private => {}                                   // DEC private modes
+            b'A' => row = row.saturating_sub(p(0, 1)),            // CUU
+            b'B' => row = (row + p(0, 1)).min(rows - 1),          // CUD
+            b'C' => col = (col + p(0, 1)).min(cols - 1),          // CUF
+            b'D' => col = col.saturating_sub(p(0, 1)),            // CUB
+            b'E' => { row = (row + p(0, 1)).min(rows - 1); col = 0; }        // CNL
+            b'F' => { row = row.saturating_sub(p(0, 1)); col = 0; }          // CPL
+            b'G' | b'`' => col = p(0, 1).saturating_sub(1).min(cols - 1),    // CHA
+            b'd' => row = p(0, 1).saturating_sub(1).min(rows - 1),           // VPA
+            b'H' | b'f' => {                                                 // CUP
+                row = p(0, 1).saturating_sub(1).min(rows - 1);
+                col = p(1, 1).saturating_sub(1).min(cols - 1);
+            }
+            b'J' => self.erase_in_display(p(0, 0)),              // ED
+            b'K' => self.erase_in_line(p(0, 0)),                 // EL
+            b'm' => self.apply_sgr(&nums[..count], &present[..count]),       // SGR
+            b's' => self.saved_cursor = (self.cursor_x, self.cursor_y),
+            b'u' => { let (x, y) = self.saved_cursor; self.cursor_x = x; self.cursor_y = y; }
+            _ => {}                                              // unimplemented — drop
+        }
+
+        self.set_cell(col, row);
     }
 
-    /// Clear from cursor position to end of current line
-    fn clear_line_from_cursor(&mut self) {
-        for x in self.cursor_x..self.width {
-            for y in self.cursor_y..(self.cursor_y + self.char_height).min(self.height) {
-                self.set_pixel(x, y, 0x000000);
+    /// `CSI <n> J` — 0: cursor to end of screen, 1: start of screen to cursor,
+    /// 2/3: the whole screen.  The cursor does not move (both in-tree callers
+    /// pair `CSI 2J` with an explicit `CSI H`).
+    fn erase_in_display(&mut self, mode: usize) {
+        let (w, h, ch) = (self.width, self.height, self.char_height);
+        let (x, y) = (self.cursor_x, self.cursor_y);
+        match mode {
+            0 => {
+                self.fill_rect(x, y, w - x.min(w), ch, 0x000000);
+                self.fill_rect(0, y + ch, w, h.saturating_sub(y + ch), 0x000000);
             }
+            1 => {
+                self.fill_rect(0, 0, w, y, 0x000000);
+                self.fill_rect(0, y, x, ch, 0x000000);
+            }
+            _ => self.fill_rect(0, 0, w, h, 0x000000),
+        }
+    }
+
+    /// `CSI <n> K` — 0: cursor to end of line, 1: start of line to cursor,
+    /// 2: the whole line.
+    fn erase_in_line(&mut self, mode: usize) {
+        let (w, ch) = (self.width, self.char_height);
+        let (x, y) = (self.cursor_x, self.cursor_y);
+        match mode {
+            0 => self.fill_rect(x, y, w - x.min(w), ch, 0x000000),
+            1 => self.fill_rect(0, y, x, ch, 0x000000),
+            _ => self.fill_rect(0, y, w, ch, 0x000000),
+        }
+    }
+
+    /// `CSI ... m` — foreground colour only; the background stays black.
+    /// Previously all text rendered hardcoded white, so a highlighting prompt
+    /// lost its colours entirely.
+    fn apply_sgr(&mut self, nums: &[usize], present: &[bool]) {
+        const BASE: [u32; 8] = [
+            0x000000, 0xCD0000, 0x00CD00, 0xCDCD00,
+            0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
+        ];
+        const BRIGHT: [u32; 8] = [
+            0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00,
+            0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
+        ];
+
+        // A bare `CSI m` means `CSI 0 m`.
+        if nums.is_empty() || !present.first().copied().unwrap_or(false) {
+            self.fg = 0xFFFFFF;
+            if nums.len() <= 1 { return; }
+        }
+
+        let mut i = 0;
+        while i < nums.len() {
+            match nums[i] {
+                0 => self.fg = 0xFFFFFF,
+                30..=37 => self.fg = BASE[nums[i] - 30],
+                90..=97 => self.fg = BRIGHT[nums[i] - 90],
+                39 => self.fg = 0xFFFFFF,
+                38 => {
+                    // 38;5;<n> (256-colour) or 38;2;<r>;<g>;<b> (truecolour)
+                    match nums.get(i + 1) {
+                        Some(5) => {
+                            if let Some(&n) = nums.get(i + 2) {
+                                self.fg = xterm256(n, &BASE, &BRIGHT);
+                            }
+                            i += 2;
+                        }
+                        Some(2) => {
+                            let r = nums.get(i + 2).copied().unwrap_or(0) as u32;
+                            let g = nums.get(i + 3).copied().unwrap_or(0) as u32;
+                            let b = nums.get(i + 4).copied().unwrap_or(0) as u32;
+                            self.fg = (r << 16) | (g << 8) | b;
+                            i += 4;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {} // bold/underline/background — not rendered
+            }
+            i += 1;
         }
     }
 
@@ -335,6 +574,13 @@ impl Framebuffer {
 
     /// Draw character using Fira Code bitmap font
     fn draw_char_vector(&mut self, x: usize, y: usize, c: char, color: u32) {
+        // Clear the cell first: glyph rendering only lights set bits, so
+        // overwriting one character with another would leave the previous
+        // glyph's pixels behind.  Append-only output never hit this, but a
+        // line editor repaints the same cells on every keystroke.
+        let (cw, ch) = (self.char_width, self.char_height);
+        self.fill_rect(x, y, cw, ch, 0x000000);
+
         // Simplified to use bitmap font only during debugging
         if let Some(bitmap) = get_fira_code_char(c) {
             // Render Fira Code bitmap (16 rows)
