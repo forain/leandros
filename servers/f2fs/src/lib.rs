@@ -57,8 +57,18 @@ const F2FS_SB_OFFSET: usize = 1024; // within first block
 // Superblock offsets (relative to F2FS_SB_OFFSET within block 0)
 const SB_MAGIC:            usize = 0;
 const SB_LOG_BLK_PER_SEG:  usize = 20;
+/// `__le64 block_count` — total 4 KiB blocks in the volume, including the
+/// metadata areas. Offset 36 in `struct f2fs_super_block`.
+const SB_BLOCK_COUNT:      usize = 36;
 const SB_SEG_CNT_CKPT:     usize = 52;
 const SB_SEG_CNT_NAT:       usize = 60;
+/// `__le32 segment_count_main` — segments in the main (user data) area. This
+/// times `blocks_per_seg` is Linux's `sbi->user_block_count`.
+const SB_SEG_CNT_MAIN:      usize = 68;
+/// `__le32 segment0_blkaddr` — first block of segment 0; blocks below it are
+/// not part of any segment, and Linux subtracts it from `block_count` to get
+/// `f_blocks`.
+const SB_SEGMENT0_BLKADDR:  usize = 72;
 const SB_CP_BLKADDR:        usize = 76;
 const SB_SIT_BLKADDR:       usize = 80;
 const SB_NAT_BLKADDR:       usize = 84;
@@ -315,8 +325,11 @@ impl BlockCache {
 #[derive(Clone, Copy)]
 struct SbInfo {
     blocks_per_seg: u32,
+    block_count: u64,
     seg_cnt_ckpt: u32,
     seg_cnt_nat: u32,
+    seg_cnt_main: u32,
+    segment0_blkaddr: u32,
     cp_blkaddr: u32,
     sit_blkaddr: u32,
     nat_blkaddr: u32,
@@ -331,8 +344,11 @@ impl SbInfo {
         let log_bps = r32(sb, SB_LOG_BLK_PER_SEG);
         Some(Self {
             blocks_per_seg:  1u32 << log_bps,
+            block_count:     r64(sb, SB_BLOCK_COUNT),
             seg_cnt_ckpt:    r32(sb, SB_SEG_CNT_CKPT),
             seg_cnt_nat:     r32(sb, SB_SEG_CNT_NAT),
+            seg_cnt_main:    r32(sb, SB_SEG_CNT_MAIN),
+            segment0_blkaddr: r32(sb, SB_SEGMENT0_BLKADDR),
             cp_blkaddr:      r32(sb, SB_CP_BLKADDR),
             sit_blkaddr:     r32(sb, SB_SIT_BLKADDR),
             nat_blkaddr:     r32(sb, SB_NAT_BLKADDR),
@@ -1485,29 +1501,26 @@ fn stat_common(ms: &mut MountState, path_ptr: u64, stat_ptr: u64, follow: bool) 
         Some(r) => r,
         None    => return err_reply(-2),
     };
-    let ino = resolve_path(ms, rel);
+    let ino = resolve_path_ex(ms, rel, follow);
     if ino == 0 { return err_reply(-2); }
 
     let iblkaddr = nat_lookup(ms, ino);
     let iblk = ms.cache.read(ms.dev, iblkaddr as u64);
     let mode  = inode_mode(iblk) as u32;
     let size  = inode_size(iblk);
-    let links = inode_links(iblk) as u16;
+    let links = inode_links(iblk);
+    let uid   = inode_uid(iblk);
+    let gid   = inode_gid(iblk);
 
-    // Write a simple stat structure (struct stat layout from libc)
-    // st_ino(8), st_mode(4), st_nlink(4), st_size(8) at known offsets
-    let stat_buf = stat_ptr as *mut u8;
-    unsafe {
-        core::ptr::write_bytes(stat_buf, 0, 144); // zero the stat buf
-        // st_ino at offset 8 (Linux x86-64 stat layout)
-        core::ptr::copy_nonoverlapping((ino as u64).to_le_bytes().as_ptr(), stat_buf.add(8), 8);
-        // st_mode at offset 24
-        core::ptr::copy_nonoverlapping(mode.to_le_bytes().as_ptr(), stat_buf.add(24), 4);
-        // st_nlink at offset 16 (as u64 in some layouts; use u32 here)
-        core::ptr::copy_nonoverlapping((links as u32).to_le_bytes().as_ptr(), stat_buf.add(16), 4);
-        // st_size at offset 48
-        core::ptr::copy_nonoverlapping(size.to_le_bytes().as_ptr(), stat_buf.add(48), 8);
-    }
+    // Emit the stat struct in the target's native layout. This used to
+    // open-code the x86-64 offsets, which put st_mode and st_nlink in the
+    // wrong slots on AArch64 (the two fields swap places there) and wrote
+    // 144 bytes into a 128-byte buffer. `mode` here is the on-disk i_mode,
+    // so it already carries the real type + permission bits (0o100755 for
+    // the /bin binaries), and `links` the real hard-link count. `uid`/`gid`
+    // used to be hardcoded 0/0 since nothing ever persisted a chown — now
+    // that handle_chown writes INO_UID/INO_GID, stat reflects it.
+    vfs_server::write_stat_full(stat_ptr as usize, mode, links as u64, size, ino as u64, uid, gid);
     ok_reply()
 }
 
@@ -2041,6 +2054,60 @@ fn handle_ftruncate(ms: &mut MountState, file_id: u64, length: u64) -> Message {
     let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
     w64(iblk, INO_SIZE, length);
     maybe_flush(ms);
+    ok_reply()
+}
+
+/// statfs — report this volume's real geometry from the superblock and the
+/// active checkpoint.
+///
+/// The path argument is deliberately ignored: one F2FS server instance owns
+/// exactly one volume, so the port the message arrived on already identifies
+/// the filesystem being asked about.
+///
+/// Figures, and how exact each one is:
+///
+/// * `f_blocks` = `block_count - segment0_blkaddr`, byte-for-byte what Linux's
+///   `f2fs_statfs` reports. Exact.
+/// * `f_bfree`/`f_bavail` = `free_segment_count * blocks_per_seg`, clamped to
+///   the main-area size. This is an *under*-estimate: the checkpoint counts
+///   wholly-free segments, so free blocks inside partially-used segments are
+///   not credited. Linux instead tracks `valid_user_blocks` live, which this
+///   server does not maintain. Erring low is the right direction — it never
+///   claims space that isn't there — and it is never zero on a fresh image.
+/// * `f_files` = total NAT entries, i.e. the inode capacity. Exact.
+/// * `f_ffree` is capped at `f_bavail` because a new inode also costs a node
+///   block; Linux applies the same cap on top of a live valid-node count we
+///   don't have, so this over-estimates on a heavily populated volume.
+fn handle_statfs(ms: &mut MountState, buf_ptr: u64) -> Message {
+    if buf_ptr == 0 { return err_reply(-14); } // EFAULT
+
+    let bps          = ms.sb.blocks_per_seg as u64;
+    let user_blocks  = ms.sb.seg_cnt_main as u64 * bps;
+    let total_blocks = ms.sb.block_count.saturating_sub(ms.sb.segment0_blkaddr as u64);
+    // A superblock we failed to make sense of must still not report zero —
+    // `df` silently drops any filesystem with f_blocks == 0.
+    let total_blocks = if total_blocks == 0 { user_blocks.max(1) } else { total_blocks };
+
+    let free_blocks = (ms.cp.free_seg_cnt as u64 * bps).min(user_blocks);
+
+    // Linux: total_node_count = (segment_count_nat / 2) * blocks_per_seg * NAT_ENTRY_PER_BLOCK.
+    // Half the NAT area is the shadow copy and holds no live entries.
+    let total_nodes = (ms.sb.seg_cnt_nat as u64 / 2) * bps * NAT_ENTRY_PER_BLK as u64;
+
+    let vals = vfs_server::StatfsVals {
+        f_type:  vfs_server::F2FS_MAGIC,
+        bsize:   BLOCK_SIZE as u64,
+        blocks:  total_blocks,
+        bfree:   free_blocks,
+        bavail:  free_blocks,
+        files:   total_nodes,
+        ffree:   total_nodes.min(free_blocks),
+        // f_fsid only has to be stable and distinct per mount; `df` uses it to
+        // recognise the same filesystem reached by two paths.
+        fsid:    (ms.dev as u64 + 1) << 32 | ms.sb.root_ino as u64,
+        namelen: 255, // F2FS_NAME_LEN
+    };
+    vfs_server::write_statfs(buf_ptr as usize, &vals);
     ok_reply()
 }
 

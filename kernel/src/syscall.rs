@@ -3447,14 +3447,18 @@ fn sys_capget(_hdr_ptr: usize, data_ptr: usize) -> isize {
 ///
 /// Delegates to sys_newfstatat for the path lookup, then zero-extends to the
 /// wider statx layout.  The statx struct is 256 bytes; struct stat is 144 bytes.
-fn sys_statx(dirfd: usize, path_ptr: usize, _flags: usize, _mask: usize, statxbuf: usize) -> isize {
+fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf: usize) -> isize {
     if !validate_user_buf(statxbuf, 256) { return -14; }
     // Zero the entire statx buffer first.
     unsafe { core::ptr::write_bytes(statxbuf as *mut u8, 0, 256); }
-    // Reuse a 144-byte stat buffer on the stack, fill it, then copy fields.
-    let mut stat_buf = [0u8; 144];
+    // Reuse a native-sized stat buffer on the stack, fill it, then copy fields.
+    let mut stat_buf = [0u8; STAT_SIZE];
     let stat_ptr = stat_buf.as_mut_ptr() as usize;
-    let r = sys_newfstatat(dirfd, path_ptr, stat_ptr, 0);
+    // Forward `flags` rather than 0 so AT_EMPTY_PATH (statx's spelling of
+    // fstat) reaches sys_newfstatat's descriptor branch. Path resolution
+    // against the cwd happens there too.
+    // stat_ptr is a kernel stack buffer — see fstatat_into's `user_dest`.
+    let r = fstatat_into(dirfd, path_ptr, stat_ptr, flags, false);
     if r < 0 { return r; }
     // Map struct stat → struct statx (fields differ in layout).
     // statx: stx_mask(u32@0), stx_blksize(u32@4), stx_attributes(u64@8),
@@ -3463,19 +3467,39 @@ fn sys_statx(dirfd: usize, path_ptr: usize, _flags: usize, _mask: usize, statxbu
     //        stx_blocks(u64@48), stx_atime(i64 pair@56), stx_btime(56+16),
     //        stx_ctime(56+32), stx_mtime(56+48), stx_rdev_major(u32@104),
     //        stx_rdev_minor(u32@108), stx_dev_major(u32@112), stx_dev_minor(u32@116).
+    // Source fields via the ABI-correct offsets rather than the x86-64 ones:
+    // st_mode and st_nlink sit in different slots (and different widths) on
+    // AArch64, and st_blksize is an `int` there, not a `long`.
+    #[cfg(target_arch = "x86_64")]
+    let (mode, nlink, blksize) = unsafe {
+        (
+            ((stat_ptr + 24) as *const u32).read_unaligned(),
+            ((stat_ptr + 16) as *const u64).read_unaligned() as u32,
+            ((stat_ptr + 56) as *const i64).read_unaligned() as u32,
+        )
+    };
+    #[cfg(target_arch = "aarch64")]
+    let (mode, nlink, blksize) = unsafe {
+        (
+            ((stat_ptr + 16) as *const u32).read_unaligned(),
+            ((stat_ptr + 20) as *const u32).read_unaligned(),
+            ((stat_ptr + 56) as *const i32).read_unaligned() as u32,
+        )
+    };
     unsafe {
-        let mode  = core::ptr::read((stat_ptr + 24) as *const u32);
-        let size  = core::ptr::read((stat_ptr + 48) as *const i64);
-        let blksize = core::ptr::read((stat_ptr + 56) as *const i64);
-        let blocks  = core::ptr::read((stat_ptr + 64) as *const i64);
+        let ino    = ((stat_ptr +  8) as *const u64).read_unaligned();
+        let size   = ((stat_ptr + 48) as *const i64).read_unaligned();
+        let blocks = ((stat_ptr + 64) as *const i64).read_unaligned();
         // stx_mask — report all fields valid (0x7ff)
         core::ptr::write(statxbuf          as *mut u32, 0x7ff);
         // stx_blksize
-        core::ptr::write((statxbuf +  4)   as *mut u32, blksize as u32);
-        // stx_nlink = 1
-        core::ptr::write((statxbuf + 16)   as *mut u32, 1);
+        core::ptr::write((statxbuf +  4)   as *mut u32, blksize);
+        // stx_nlink — the real link count, not a hardcoded 1
+        core::ptr::write((statxbuf + 16)   as *mut u32, nlink);
         // stx_mode
         core::ptr::write((statxbuf + 28)   as *mut u16, mode as u16);
+        // stx_ino
+        core::ptr::write((statxbuf + 32)   as *mut u64, ino);
         // stx_size
         core::ptr::write((statxbuf + 40)   as *mut i64, size);
         // stx_blocks
@@ -3497,21 +3521,14 @@ fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
 
 /// sys_stat_at_path(path_ptr, statbuf_ptr) — path-based stat (x86-64 `stat`/`lstat`).
 ///
-/// Opens the path, calls sys_fstat to fill the stat buf, then closes.
+/// Delegates to sys_newfstatat so both entry points share one metadata
+/// path. It previously did its own open()+sys_fstat(), which meant the
+/// x86-64 `stat`/`lstat` syscalls fabricated S_IFREG|0644 with a zeroed
+/// st_ino/st_nlink instead of consulting the owning filesystem.
 #[cfg(not(target_arch = "aarch64"))]
 fn sys_stat_at_path(path_ptr: usize, statbuf_ptr: usize) -> isize {
-    if !validate_user_buf(path_ptr, 1) { return -14; }
-    if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
-    prefault_user(path_ptr, 256);
-    prefault_user(statbuf_ptr, STAT_SIZE);
-    let pid = current_pid();
-    let omsg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, 0u64, 0]);
-    let fd = vfs_reply_val(&vfs::handle(&omsg, pid));
-    if fd < 0 { return fd; }
-    let r = sys_fstat(fd as usize, statbuf_ptr);
-    let cmsg = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]);
-    let _ = vfs::handle(&cmsg, pid);
-    r
+    // Legacy stat/lstat are cwd-relative by definition — AT_FDCWD is exact.
+    sys_newfstatat(AT_FDCWD, path_ptr, statbuf_ptr, 0)
 }
 
 /// sys_prlimit64(pid, resource, new_limit, old_limit)
@@ -3603,10 +3620,9 @@ fn sys_close(fd: usize) -> isize {
 /// FP/LR — see the crash this fixes: a `bottom` worker thread executing a
 /// stat-heavy /proc scan took an instruction-fetch fault at PC 0 because
 /// `ret` popped a zeroed LR that this overrun had stomped).
-#[cfg(target_arch = "x86_64")]
-const STAT_SIZE: usize = 144;
-#[cfg(target_arch = "aarch64")]
-const STAT_SIZE: usize = 128;
+/// Single source of truth lives in the VFS server alongside the writer that
+/// fills the struct, so the size and the field offsets can never drift apart.
+const STAT_SIZE: usize = vfs::STAT_SIZE;
 
 /// sys_fstat(fd, statbuf_ptr) — fill struct stat for an open fd.
 ///
@@ -3614,55 +3630,44 @@ const STAT_SIZE: usize = 128;
 /// `st_mode` is set to S_IFREG|0644 (0x81A4) for regular files, or
 /// S_IFCHR|0666 (0x21B6) for character devices (fd 0/1/2 / /dev/*).
 fn sys_fstat(fd: usize, statbuf_ptr: usize) -> isize {
-    if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
+    fstat_into(fd, statbuf_ptr, true)
+}
+
+/// Body of `fstat`. See `fstatat_into` for why `user_dest` exists: the
+/// `AT_EMPTY_PATH` branch below is reached from `sys_statx`, whose destination
+/// is a kernel stack buffer.
+fn fstat_into(fd: usize, statbuf_ptr: usize, user_dest: bool) -> isize {
+    if user_dest {
+        if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
+    } else if statbuf_ptr == 0 {
+        return -14;
+    }
     unsafe { core::ptr::write_bytes(statbuf_ptr as *mut u8, 0, STAT_SIZE); }
 
-    #[cfg(target_arch = "x86_64")]
-    const ST_MODE_OFF: usize = 24;
-    #[cfg(target_arch = "aarch64")]
-    const ST_MODE_OFF: usize = 16;
+    let pid = current_pid();
 
-    // fds 0/1/2 are character devices (serial console).
-    if fd <= 2 {
-        // st_mode: S_IFCHR | 0666
-        unsafe { core::ptr::write((statbuf_ptr + ST_MODE_OFF) as *mut u32, 0x21B6u32); }
+    // An *unredirected* fd 0/1/2 is the serial console: a character device.
+    // A redirected one is whatever it was dup2'd onto, so it must fall through
+    // to the VFS — a shell that redirects a child's stdout into a pipe and then
+    // fstat's fd 1 has to see S_IFIFO, not S_IFCHR.
+    if fd <= 2 && !vfs::fd_redirected(pid, fd) {
+        // st_mode: S_IFCHR | 0666, with the console's own inode — this used to
+        // report st_ino 0, which no path on the system stats to. ttyname()
+        // cross-checks (st_dev, st_ino) here against stat("/dev/console") and
+        // rejected the fd on the mismatch, so `tty` said "not a tty".
+        vfs::write_stat_full(statbuf_ptr, 0o020666, 1, 0, vfs::CONSOLE_INO, 0, 0);
         return 0;
     }
 
-    let pid = current_pid();
-    // Get current position.
-    let cur_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, 0u64, 1u64 /* SEEK_CUR */]);
-    let cur = vfs_reply_val(&vfs::handle(&cur_msg, pid));
-    if cur == -9 { return -9; } // EBADF
-
-    // Seek to end to get file size.
-    let end_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, 0u64, 2u64 /* SEEK_END */]);
-    let size = vfs_reply_val(&vfs::handle(&end_msg, pid));
-
-    // Seek back to original position.
-    let back_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, cur as u64, 0u64 /* SEEK_SET */]);
-    let _ = vfs::handle(&back_msg, pid);
-
-    // st_mode: S_IFREG | 0644 = 0x81A4
-    unsafe { core::ptr::write((statbuf_ptr + ST_MODE_OFF) as *mut u32, 0x81A4u32); }
-
-    // st_size at offset 48.
-    if size >= 0 {
-        unsafe { core::ptr::write((statbuf_ptr + 48) as *mut i64, size as i64); }
-        // st_blksize = 512 (standard block size): a `long` at offset 56 on
-        // x86-64, but only an `int` at offset 56 on AArch64 (followed by a
-        // 4-byte pad word) — an 8-byte write there would spill into that
-        // pad, which happens to be harmless (never read), but write the
-        // ABI-correct width anyway rather than relying on that.
-        #[cfg(target_arch = "x86_64")]
-        unsafe { core::ptr::write((statbuf_ptr + 56) as *mut i64, 512i64); }
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::ptr::write((statbuf_ptr + 56) as *mut i32, 512i32); }
-        // st_blocks at offset 64 = ceil(size/512)
-        let blocks = ((size as i64) + 511) / 512;
-        unsafe { core::ptr::write((statbuf_ptr + 64) as *mut i64, blocks); }
-    }
-    0
+    // The VFS owns the fd table, so it is the only thing that knows what kind
+    // of object an fd names. This used to fabricate a blanket S_IFREG|0644 for
+    // every fd above 2, which made a pipe end look like a regular file —
+    // tokio's `pipe::Receiver::from_file` checks S_ISFIFO and refused brush's
+    // command-substitution pipe with "not a pipe", so `$(...)` never ran.
+    // VFS_FSTAT reports the real file type (S_IFIFO / S_IFCHR / S_IFDIR /
+    // S_IFREG) and fills st_size and st_ino itself.
+    let msg = make_vfs_msg(vfs::VFS_FSTAT, &[fd as u64, statbuf_ptr as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
 fn sys_mount(
@@ -3867,28 +3872,72 @@ fn sys_mounts_info(index: usize, out_ptr: usize) -> isize {
     0
 }
 
-fn sys_newfstatat(_dirfd: usize, path_ptr: usize, statbuf_ptr: usize, _flags: usize) -> isize {
-    if !validate_user_buf(path_ptr, 1)          { return -14; }
-    if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
-    prefault_user(path_ptr, 256);
-    prefault_user(statbuf_ptr, STAT_SIZE);
+fn sys_newfstatat(dirfd: usize, path_ptr: usize, statbuf_ptr: usize, flags: usize) -> isize {
+    fstatat_into(dirfd, path_ptr, statbuf_ptr, flags, true)
+}
+
+/// Body of `fstatat`, with the destination buffer's provenance made explicit.
+///
+/// `user_dest == false` means `statbuf_ptr` is kernel memory, so the
+/// user-range check and the prefault must be skipped. `sys_statx` fills a
+/// stack `struct stat` this way; validating it as user memory rejected every
+/// kernel address (kernel stacks live above the user/kernel split), so statx
+/// returned `-EFAULT` unconditionally.
+fn fstatat_into(
+    dirfd: usize,
+    path_ptr: usize,
+    statbuf_ptr: usize,
+    flags: usize,
+    user_dest: bool,
+) -> isize {
+    if user_dest {
+        if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
+        prefault_user(statbuf_ptr, STAT_SIZE);
+    } else if statbuf_ptr == 0 {
+        return -14;
+    }
+
+    // fstatat(fd, "", ..., AT_EMPTY_PATH) is how several libcs spell fstat().
+    // It must consult the descriptor, not the (empty, hence ENOENT) path.
+    if flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
+        let empty = validate_user_buf(path_ptr, 1)
+            && unsafe { *(path_ptr as *const u8) } == 0;
+        if path_ptr == 0 || empty { return fstat_into(dirfd, statbuf_ptr, user_dest); }
+    }
+
+    let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    let path_ptr = path.ptr();
     let pid = current_pid();
-    // Check for directory first (no fd needed).
+
+    // Ask the VFS for real metadata first. VFS_STAT resolves RamFS, tmpfs,
+    // device nodes and — crucially — forwards to the mounted filesystem's
+    // own handler, so f2fs reports the true st_mode (0o100755 for the /bin
+    // binaries), st_ino and st_nlink. The open()+sys_fstat() path below
+    // cannot: sys_fstat has only an fd, so it *fabricates* S_IFREG|0644 and
+    // leaves st_ino/st_nlink zero, which is precisely the 0644/0/0 that
+    // `stat /bin/cat` reported on both architectures.
+    // AT_SYMLINK_NOFOLLOW selects lstat semantics: the final component is left
+    // unresolved, so a symlink reports S_IFLNK rather than whatever it points
+    // at. `ls -l` gets its 'l' type character from exactly this, and `rm -r`
+    // uses it to avoid descending through a link into a directory.
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    let stat_tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LSTAT } else { vfs::VFS_STAT };
+    let smsg = make_vfs_msg(stat_tag, &[path_ptr as u64, statbuf_ptr as u64]);
+    if vfs_reply_val(&vfs::handle(&smsg, pid)) >= 0 {
+        return 0;
+    }
+
+    // Fallbacks below only run when VFS_STAT could not describe the path.
     if vfs::is_directory(path_ptr) {
-        unsafe { core::ptr::write_bytes(statbuf_ptr as *mut u8, 0, STAT_SIZE); }
-        #[cfg(target_arch = "x86_64")]
-        const ST_MODE_OFF: usize = 24;
-        #[cfg(target_arch = "aarch64")]
-        const ST_MODE_OFF: usize = 16;
-        // st_mode: S_IFDIR | 0755 = 0x41ED
-        unsafe { core::ptr::write((statbuf_ptr + ST_MODE_OFF) as *mut u32, 0x41EDu32); }
+        // st_mode: S_IFDIR | 0755
+        vfs::write_stat_full(statbuf_ptr, 0o040755, 2, 0, 0, 0, 0);
         return 0;
     }
     // Open path, use sys_fstat, then close.
     let omsg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, 0u64, 0]);
     let fd = vfs_reply_val(&vfs::handle(&omsg, pid));
     if fd < 0 { return fd; }
-    let r = sys_fstat(fd as usize, statbuf_ptr);
+    let r = fstat_into(fd as usize, statbuf_ptr, user_dest);
     let cmsg = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]);
     let _ = vfs::handle(&cmsg, pid);
     r
@@ -4218,31 +4267,67 @@ fn sys_getresxid(r_ptr: usize, e_ptr: usize, s_ptr: usize, is_gid: bool) -> isiz
     0
 }
 
-fn sys_faccessat(_dirfd: usize, path_ptr: usize, _mode: usize, _flags: usize) -> isize {
-    if !validate_user_buf(path_ptr, 1) { return -14; }
-    // Accept if the path is a known file or directory.
-    if vfs::get_file_data(path_ptr).is_some() || vfs::is_directory(path_ptr) {
-        0
-    } else {
-        -2 // ENOENT
+/// sys_faccessat(dirfd, path, mode, flags) — permission probe.
+///
+/// This used to answer purely from `vfs::get_file_data` / `vfs::is_directory`,
+/// both of which only ever scan the compiled-in RamFS table and tmpfs — they
+/// know nothing about mounted filesystems. So every path on the f2fs root
+/// (i.e. all of /bin) reported ENOENT, and any shell that resolves PATH
+/// entries with `access(X_OK)` — brush does exactly that, via
+/// nix::unistd::access in brush-core/src/sys/unix/fs.rs — concluded the
+/// binary did not exist. That is the real "command not found" for `cat` and
+/// `hello` alike, independent of the st_mode bug below.
+///
+/// Route through VFS_STAT instead, which resolves RamFS, tmpfs, devices and
+/// mounted filesystems alike, then answer the R_OK/W_OK/X_OK question from
+/// the real mode bits.
+fn sys_faccessat(dirfd: usize, path_ptr: usize, mode: usize, _flags: usize) -> isize {
+    let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    let path_ptr = path.ptr();
+
+    const F_OK: usize = 0;
+    const X_OK: usize = 1;
+    const W_OK: usize = 2;
+    const R_OK: usize = 4;
+
+    let pid = current_pid();
+    let mut stat_buf = [0u8; STAT_SIZE];
+    let msg = make_vfs_msg(vfs::VFS_STAT, &[path_ptr as u64, stat_buf.as_mut_ptr() as u64]);
+    if vfs_reply_val(&vfs::handle(&msg, pid)) < 0 {
+        // Fall back to the legacy RamFS/tmpfs probe so anything VFS_STAT
+        // cannot describe yet still behaves as it did before.
+        return if vfs::get_file_data(path_ptr).is_some() || vfs::is_directory(path_ptr) {
+            0
+        } else {
+            -2 // ENOENT
+        };
     }
+
+    // Existence-only probe: getting here already proves the path resolves.
+    if mode == F_OK { return 0; }
+
+    let st_mode = vfs::read_stat_mode(stat_buf.as_ptr() as usize);
+    // Everything runs as root today, but X_OK must still require that *some*
+    // execute bit is set — POSIX carves that case out of root's blanket
+    // access, and brush relies on it to reject 0644 data files in PATH.
+    let perm = st_mode & 0o777;
+    if mode & X_OK != 0 && perm & 0o111 == 0 { return -13; } // EACCES
+    if mode & W_OK != 0 && perm & 0o222 == 0 { return -13; }
+    if mode & R_OK != 0 && perm & 0o444 == 0 { return -13; }
+    0
 }
 
-fn sys_readlinkat(_dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) -> isize {
-    if !validate_user_buf(path_ptr, 1) { return -14; }
+fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) -> isize {
     if size == 0 || !validate_user_buf(buf_ptr, size) { return -14; }
-    prefault_user(path_ptr, 256);
     prefault_user(buf_ptr, size);
 
-    // Read the link path from user space.
-    let mut pb = [0u8; 256];
-    let mut pl = 0usize;
-    for i in 0..255 {
-        let b = unsafe { *(path_ptr as *const u8).add(i) };
-        if b == 0 { pl = i; break; }
-        pb[i] = b;
-    }
-    let path = &pb[..pl];
+    // Resolve against the cwd first, so readlink("self/exe") from /proc — and
+    // any other relative link probe — names the same file the rest of the
+    // syscall surface would.
+    let kpath = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    let pb = &kpath.buf;
+    let pl = kpath.len;
+    let path = kpath.bytes();
 
     // /proc/self/exe → "/bin/init"
     if path == b"/proc/self/exe" {

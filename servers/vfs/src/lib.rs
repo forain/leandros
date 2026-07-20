@@ -25,6 +25,8 @@
 //! | VFS_FCHMOD      | fd         | mode      | 0       | 0 or -errno         |
 //! | VFS_CHOWN       | path_ptr   | uid       | gid     | 0 or -errno         |
 //! | VFS_FCHOWN      | fd         | uid       | gid     | 0 or -errno         |
+//! | VFS_STATFS      | path_ptr   | statfs_ptr| 0       | 0 or -errno         |
+//! | VFS_FSTATFS     | fd         | statfs_ptr| 0       | 0 or -errno         |
 
 #![no_std]
 
@@ -68,6 +70,42 @@ pub const VFS_CHOWN:           u64 = 0x2D; // chown(path_ptr, uid, gid) → 0 or
 pub const VFS_FCHOWN:          u64 = 0x2E; // fchown(fd, uid, gid) → 0 or -errno
 pub const VFS_POLL:            u64 = 0x2F; // poll(fd) → revents bitmask (POLLIN/OUT/ERR/HUP)
 pub const VFS_PIVOT_ROOT:      u64 = 0x30;
+/// fstat(fd, stat_ptr) → 0 or -errno. Reports the *kind* of the open file
+/// behind an fd (S_IFIFO for a pipe end, S_IFCHR for a console/dev proxy,
+/// S_IFDIR/S_IFREG for tmpfs and mounted files) instead of the blanket
+/// S_IFREG the kernel used to fabricate. Load-bearing: tokio's
+/// `net::unix::pipe::Receiver::from_file` gates on `S_ISFIFO(st_mode)` and
+/// rejects anything else with "not a pipe", which is what broke every
+/// `$(...)` command substitution in brush.
+pub const VFS_FSTAT:           u64 = 0x31;
+/// mknod(path_ptr, mode) → 0 or -errno. Creates a /tmp entry as a plain file
+/// or a FIFO depending on the S_IFMT bits of `mode` — see `handle_mknod`.
+pub const VFS_MKNOD:           u64 = 0x32;
+/// statfs(path_ptr, buf_ptr) → 0 or -errno. Fills a `struct statfs` for the
+/// filesystem that owns `path`. Forwarded to the mount server when `path`
+/// falls under a registered mount (the mount is the only thing that knows its
+/// real geometry); answered from the tmpfs pool otherwise. Mount servers
+/// receive this same tag and may ignore `path_ptr` — one port is one volume.
+pub const VFS_STATFS:          u64 = 0x33;
+/// fstatfs(fd, buf_ptr) → 0 or -errno. Same answer as VFS_STATFS, selected by
+/// an open descriptor rather than a path.
+pub const VFS_FSTATFS:         u64 = 0x34;
+/// symlink(target_ptr, linkpath_ptr) → 0 or -errno. `target_ptr` is the raw
+/// link body, stored verbatim and never resolved; `linkpath_ptr` is the name
+/// to create. The final component of `linkpath` is NOT followed.
+pub const VFS_SYMLINK:         u64 = 0x35;
+/// readlink(path_ptr, buf_ptr, buf_len) → len or -errno. -EINVAL when `path`
+/// exists but is not a symlink, which is exactly how callers distinguish
+/// "not a link" from "not there". Does NOT follow the final component.
+pub const VFS_READLINK:        u64 = 0x36;
+/// link(oldpath_ptr, newpath_ptr) → 0 or -errno. Neither path's final
+/// component is followed (Linux `link(2)` semantics). -EXDEV when the two
+/// paths live on different filesystems, -EPERM for a directory source.
+pub const VFS_LINK:            u64 = 0x37;
+/// lstat(path_ptr, stat_ptr) → 0 or -errno. Identical to VFS_STAT except that
+/// the final component is not followed, so a symlink reports S_IFLNK and the
+/// length of its target as st_size.
+pub const VFS_LSTAT:           u64 = 0x38;
 
 
 /// Readiness bitmask, numerically identical to Linux's POLLIN/POLLOUT/POLLERR/
@@ -91,6 +129,13 @@ fn make_reply(v: i64) -> Message {
     let mut m = Message::empty();
     m.data[0..8].copy_from_slice(&(v as u64).to_le_bytes());
     m
+}
+
+/// Inverse of `make_reply`: read back the i64 an internal handler returned, for
+/// the cases where one handler is built on another (e.g. handle_fstat sizing a
+/// mounted file via handle_lseek).
+fn reply_val(m: &Message) -> i64 {
+    i64::from_le_bytes(m.data[0..8].try_into().unwrap_or([0; 8]))
 }
 
 fn ok_reply()        -> Message { make_reply(0) }
@@ -758,8 +803,10 @@ static RAMFS: &[RamEntry] = &[
                        cache size\t: 4096 KB\nflags\t\t: fpu vme de pse tsc msr pae mce\n" },
     RamEntry { path: b"/proc/filesystems",
                data: b"nodev\ttmpfs\nnodev\tramfs\nnodev\tprocfs\n\text2\n" },
-    RamEntry { path: b"/proc/mounts",
-               data: b"proc /proc procfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n" },
+    // /proc/mounts is generated from list_mounts() by gen_proc_system_content
+    // (see the "/proc/mounts" arm there) — a static entry here would shadow
+    // the generated one and go stale the moment a real filesystem is
+    // mounted, which is exactly what broke `df`.
     RamEntry { path: b"/proc/net/dev",
                data: b"Inter-|   Receive                                       |  Transmit\n\
                        face |bytes packets errs drop fifo frame compressed multicast\
@@ -1456,6 +1503,97 @@ fn write_lit(buf: &mut [u8; TMP_BUF_SIZE], pos: usize, s: &[u8]) -> usize {
 
 const TMP_BUF_SIZE: usize = 512;
 
+/// Append one `/etc/mtab`-format line per in-use mount:
+/// `<device> <mountpoint> <fstype> <options> 0 0`.
+///
+/// This is the layout uucore's `MountInfo::new()` expects for both
+/// `/etc/mtab` and the legacy `/proc/mounts` (fsext.rs: `LINUX_MTAB` arm —
+/// `raw[0]`=dev_name, `raw[1]`=mount_dir, `raw[2]`=fs_type,
+/// `raw[3]`=mount_option, split on the raw space-separated line). Bounded by
+/// `TMP_BUF_SIZE` via `write_lit`/`write_u32`'s own clamping; if a line
+/// would overflow the buffer it — and everything after it — is dropped
+/// rather than emitted truncated (which would otherwise corrupt the last
+/// field of the previous line for a caller that assumes one mount per
+/// line).
+fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
+    for m in list_mounts().iter() {
+        if !m.in_use { continue; }
+        let start = p;
+        p = write_lit(buf, p, m.device.as_bytes());
+        p = write_lit(buf, p, b" ");
+        p = write_lit(buf, p, m.prefix.as_bytes());
+        p = write_lit(buf, p, b" ");
+        p = write_lit(buf, p, m.fstype.as_bytes());
+        p = write_lit(buf, p, b" rw 0 0\n");
+        if p >= buf.len() { p = start; break; }
+    }
+    p
+}
+
+/// Append one `/proc/self/mountinfo`-format line per in-use mount:
+/// `<id> <parent-id> <major>:<minor> <root> <mountpoint> <options> - <fstype> <source> <superoptions>`.
+///
+/// Field layout is dictated by uucore's `MountInfo::new()` `LINUX_MOUNTINFO`
+/// arm (fsext.rs): it splits the line on spaces, scans fields[6..] for a
+/// literal "-" separator, and reads `fs_type`/`dev_name` from the two fields
+/// immediately after it, while `raw[3]`/`raw[4]`/`raw[5]` are root/mountpoint/
+/// options. Emitting exactly zero optional fields (the "-" lands at index 6)
+/// keeps that scan trivial. Bounded the same way as `write_mtab_lines`.
+fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
+    let mut mount_id: u32 = 20;
+    for m in list_mounts().iter() {
+        if !m.in_use { continue; }
+        let start = p;
+        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" 1 0:");
+        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" / ");
+        p = write_lit(buf, p, m.prefix.as_bytes());
+        p = write_lit(buf, p, b" rw,relatime - ");
+        p = write_lit(buf, p, m.fstype.as_bytes());
+        p = write_lit(buf, p, b" ");
+        p = write_lit(buf, p, m.device.as_bytes());
+        p = write_lit(buf, p, b" rw\n");
+        if p >= buf.len() { p = start; break; }
+        mount_id += 1;
+    }
+    p
+}
+
+/// Generate `/etc/mtab` content from `list_mounts()`. Allocates an ephemeral
+/// tmpfs slot the same way `gen_proc_system`/`gen_proc_self` do, since
+/// `/etc/mtab` is not under `/proc` and so isn't routed through either of
+/// those.
+fn gen_etc_mtab() -> Option<VnodeKind> {
+    let mut buf = [0u8; TMP_BUF_SIZE];
+    let len = write_mtab_lines(&mut buf, 0);
+
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp.iter().position(|e| !e.in_use)?;
+    tmp[idx] = TmpFileEntry::empty();
+    tmp[idx].in_use    = true;
+    tmp[idx].ephemeral = true;
+    // Unique synthetic path "/tmp/.mtab_<idx>" — never conflicts with user files.
+    let mut fake_path = [0u8; 20];
+    let base = b"/tmp/.mtab_";
+    fake_path[..base.len()].copy_from_slice(base);
+    let mut fpl = base.len();
+    let mut n = idx;
+    if n == 0 { fake_path[fpl] = b'0'; fpl += 1; }
+    else {
+        let mut digits = [0u8; 5]; let mut di = 0;
+        while n > 0 { digits[di] = b'0' + (n % 10) as u8; di += 1; n /= 10; }
+        for i in (0..di).rev() { fake_path[fpl] = digits[i]; fpl += 1; }
+    }
+    let fp_len = fpl.min(MAX_TMP_PATH - 1);
+    tmp[idx].path[..fp_len].copy_from_slice(&fake_path[..fp_len]);
+    tmp[idx].path_len = fp_len;
+    let copy = len.min(TMP_BUF_SIZE);
+    tmp[idx].data[..copy].copy_from_slice(&buf[..copy]);
+    tmp[idx].len = copy;
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
+}
+
 /// Generate dynamic /proc/ system-wide entries (meminfo, uptime, loadavg, stat).
 fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
     let mut buf = [0u8; TMP_BUF_SIZE];
@@ -1544,6 +1682,12 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
         let mut p = 0;
         p = write_u32(buf, p, sched::current_pid());
         return Some(p);
+    }
+
+    if path == b"/proc/mounts" {
+        // Legacy mtab-format mount table, generated from the live mount
+        // registry — see write_mtab_lines for the field layout and why.
+        return Some(write_mtab_lines(buf, 0));
     }
 
     None
@@ -1652,6 +1796,12 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
             }
             return Some(bytes);
         }
+    }
+
+    if path == b"/proc/self/mountinfo" || path.ends_with(b"/mountinfo") {
+        // This is the file `df`/`read_fs_list()` prefers over /etc/mtab —
+        // see write_mountinfo_lines for the field layout and why.
+        return Some(write_mountinfo_lines(buf, 0));
     }
 
     None
@@ -1800,8 +1950,18 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/meminfo" || lookup_path == b"/proc/uptime"
                || lookup_path == b"/proc/loadavg" || lookup_path == b"/proc/stat"
-               || lookup_path == b"/proc/self" {
+               || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts" {
             match gen_proc_system(lookup_path) {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/etc/mtab" {
+            // Not under /proc, so it can't go through gen_proc_system/
+            // gen_proc_self — handled directly here, ahead of the general
+            // RAMFS/initrd/mount-proxy lookup below so a stale static entry
+            // (there isn't one, but a future RAMFS addition could shadow it)
+            // never wins over the live mount table.
+            match gen_etc_mtab() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
@@ -3897,32 +4057,390 @@ fn apply_chown(e: &mut TmpFileEntry, euid: u32, uid: u32, gid: u32) -> Message {
 
 // ── stat(2) support ──────────────────────────────────────────────────────────
 
-// Linux x86_64 struct stat layout (144 bytes):
-//   0:  st_dev  (u64)   8:  st_ino   (u64)   16: st_nlink (u64)
-//  24:  st_mode (u32)  28:  st_uid   (u32)   32: st_gid   (u32)
-//  36:  __pad0  (u32)  40:  st_rdev  (u64)   48: st_size  (i64)
-//  56:  st_blksize (i64) 64: st_blocks (i64)  72..120: timestamps (zeroed)
+// `struct stat` is NOT the same shape on both targets we build for, and
+// getting it wrong is worse than an ABI nit: the caller's buffer is only
+// ever as large as its *own* platform's definition, so writing the x86-64
+// 144-byte form into an AArch64 128-byte `struct stat` local overruns it
+// by 16 bytes and stomps whatever the compiler parked after it (often the
+// saved FP/LR). Every stat producer in the tree must go through the
+// helpers below rather than open-coding offsets.
+//
+// x86-64 (arch-specific layout, 144 bytes):
+//    0: st_dev  (u64)     8: st_ino  (u64)    16: st_nlink (u64)
+//   24: st_mode (u32)    28: st_uid  (u32)    32: st_gid   (u32)
+//   36: __pad0  (u32)    40: st_rdev (u64)    48: st_size  (i64)
+//   56: st_blksize (i64) 64: st_blocks (i64)  72..144: timestamps
+//
+// AArch64 (asm-generic layout, 128 bytes) — note st_mode and st_nlink are
+// both u32 and swap places relative to x86-64, which is exactly the pair
+// of fields that decides "is this executable":
+//    0: st_dev  (u64)     8: st_ino  (u64)    16: st_mode  (u32)
+//   20: st_nlink (u32)   24: st_uid  (u32)    28: st_gid   (u32)
+//   32: st_rdev (u64)    40: __pad1  (u64)    48: st_size  (i64)
+//   56: st_blksize (i32) 60: __pad2  (i32)    64: st_blocks (i64)
+//   72..128: timestamps
+#[cfg(target_arch = "x86_64")]
+pub const STAT_SIZE: usize = 144;
+#[cfg(target_arch = "aarch64")]
+pub const STAT_SIZE: usize = 128;
+
+/// Byte offset of `st_mode` within `struct stat` for the target ABI.
+#[cfg(target_arch = "x86_64")]
+pub const ST_MODE_OFF: usize = 24;
+#[cfg(target_arch = "aarch64")]
+pub const ST_MODE_OFF: usize = 16;
+
+/// Read `st_mode` back out of a filled `struct stat` buffer.
+pub fn read_stat_mode(stat_ptr: usize) -> u32 {
+    unsafe { ((stat_ptr + ST_MODE_OFF) as *const u32).read_unaligned() }
+}
+
+/// Synthesise a stable, path-unique inode number.
+///
+/// tmpfs and the initrd have no real inode numbers, so `st_ino` used to be
+/// derived either from the path *length* (`plen + 10000` / `plen + 20000`) or
+/// from the caller's path pointer. Both collide constantly: every /tmp file
+/// whose path happened to be the same length reported the same inode, and
+/// uutils `cp` compares `(st_dev, st_ino)` to refuse copying a file onto
+/// itself — so `cp /tmp/a.txt /tmp/b.txt` would fail with "are the same
+/// file". The pointer variant became actively wrong once the kernel started
+/// passing a resolved path buffer rather than the user pointer, since that
+/// address is a stack slot and repeats across calls.
+///
+/// FNV-1a over the path bytes is stable across calls and distinct per path.
+/// `salt` separates the tmpfs-dir / tmpfs-file / initrd namespaces.
+fn path_ino(path: &[u8], salt: u64) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ salt;
+    for &b in path {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Keep it nonzero — 0 reads as "no inode" to some callers.
+    (h & 0x0000_ffff_ffff_ffff) | 1
+}
+
 fn write_stat(stat_ptr: usize, mode: u32, size: u64, ino: u64) {
     write_stat_owned(stat_ptr, mode, size, ino, 0, 0);
 }
 
 fn write_stat_owned(stat_ptr: usize, mode: u32, size: u64, ino: u64, uid: u32, gid: u32) {
+    write_stat_full(stat_ptr, mode, 1, size, ino, uid, gid);
+}
+
+/// Fill a `struct stat` in the target's native layout.
+///
+/// `mode` carries both the file-type bits (S_IFREG/S_IFDIR/S_IFCHR/…) and
+/// the permission bits; `nlink` is the real hard-link count (the f2fs /bin
+/// directory has ~105 names sharing one coreutils inode, so a hardcoded 1
+/// is a visible lie).
+pub fn write_stat_full(
+    stat_ptr: usize,
+    mode:     u32,
+    nlink:    u64,
+    size:     u64,
+    ino:      u64,
+    uid:      u32,
+    gid:      u32,
+) {
     unsafe {
         let p = stat_ptr as *mut u8;
-        core::ptr::write_bytes(p, 0, 144);
-        (p.add( 0) as *mut u64).write_unaligned(1u64);       // st_dev
-        (p.add( 8) as *mut u64).write_unaligned(ino);        // st_ino
-        (p.add(16) as *mut u64).write_unaligned(1u64);       // st_nlink
-        (p.add(24) as *mut u32).write_unaligned(mode);       // st_mode
-        (p.add(28) as *mut u32).write_unaligned(uid);        // st_uid
-        (p.add(32) as *mut u32).write_unaligned(gid);        // st_gid
-        (p.add(48) as *mut u64).write_unaligned(size);       // st_size
-        (p.add(56) as *mut u64).write_unaligned(4096u64);    // st_blksize
-        (p.add(64) as *mut u64).write_unaligned((size + 511) / 512); // st_blocks
+        core::ptr::write_bytes(p, 0, STAT_SIZE);
+        (p.add(0) as *mut u64).write_unaligned(1u64); // st_dev
+        (p.add(8) as *mut u64).write_unaligned(ino);  // st_ino
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            (p.add(16) as *mut u64).write_unaligned(nlink); // st_nlink (u64)
+            (p.add(24) as *mut u32).write_unaligned(mode);  // st_mode
+            (p.add(28) as *mut u32).write_unaligned(uid);   // st_uid
+            (p.add(32) as *mut u32).write_unaligned(gid);   // st_gid
+            (p.add(56) as *mut i64).write_unaligned(4096i64); // st_blksize (long)
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            (p.add(16) as *mut u32).write_unaligned(mode);         // st_mode
+            (p.add(20) as *mut u32).write_unaligned(nlink as u32); // st_nlink (u32)
+            (p.add(24) as *mut u32).write_unaligned(uid);          // st_uid
+            (p.add(28) as *mut u32).write_unaligned(gid);          // st_gid
+            (p.add(56) as *mut i32).write_unaligned(4096i32);      // st_blksize (int)
+        }
+
+        (p.add(48) as *mut u64).write_unaligned(size);                // st_size
+        (p.add(64) as *mut u64).write_unaligned((size + 511) / 512);  // st_blocks
     }
 }
 
+// ── struct statfs ─────────────────────────────────────────────────────────────
+//
+// Unlike `struct stat` (whose x86-64 layout is bespoke and whose aarch64
+// layout is the asm-generic one — see STAT_SIZE above), `struct statfs` is the
+// *same* on both of our targets: arch/x86/include/uapi/asm/statfs.h just
+// includes <asm-generic/statfs.h>, and arm64 has no asm/statfs.h at all so it
+// gets the generic one too. With __BITS_PER_LONG == 64 the generic header
+// defines __statfs_word = __kernel_long_t, i.e. every field is 64-bit:
+//
+//    0: f_type     8: f_bsize   16: f_blocks  24: f_bfree   32: f_bavail
+//   40: f_files   48: f_ffree   56: f_fsid(8) 64: f_namelen 72: f_frsize
+//   80: f_flags   88: f_spare[4]                            → 120 bytes
+//
+// The cfg split is kept anyway so that the day a 32-bit or otherwise divergent
+// target appears, this is the one place to change — and so nobody has to
+// re-derive the "are these actually the same?" argument above.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub const STATFS_SIZE: usize = 120;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const STATFS_WORD: usize = 8;
+
+/// The numbers a filesystem reports for `statfs`/`fstatfs`.
+///
+/// All block counts are in units of `bsize`.
+#[derive(Clone, Copy)]
+pub struct StatfsVals {
+    pub f_type:   u64,
+    pub bsize:    u64,
+    pub blocks:   u64,
+    pub bfree:    u64,
+    pub bavail:   u64,
+    pub files:    u64,
+    pub ffree:    u64,
+    pub fsid:     u64,
+    pub namelen:  u64,
+}
+
+/// Well-known `f_type` magics, as reported by Linux.
+pub const TMPFS_MAGIC: u64 = 0x0102_1994;
+pub const F2FS_MAGIC:  u64 = 0xF2F5_2010;
+pub const PROC_MAGIC:  u64 = 0x0000_9fa0;
+
+/// Fill a `struct statfs` in the target's native layout.
+///
+/// `blocks` must never be zero for a filesystem that should be visible: uutils
+/// `df` drops every filesystem whose `f_blocks == 0` unless `-a` is given, and
+/// with all of them dropped it prints "no file systems processed". That is
+/// exactly what the old fixed-zero statfs stub caused.
+pub fn write_statfs(buf_ptr: usize, v: &StatfsVals) {
+    unsafe {
+        let p = buf_ptr as *mut u8;
+        core::ptr::write_bytes(p, 0, STATFS_SIZE);
+        let mut put = |idx: usize, val: u64| {
+            (p.add(idx * STATFS_WORD) as *mut u64).write_unaligned(val);
+        };
+        put(0, v.f_type);
+        put(1, v.bsize);
+        put(2, v.blocks);
+        put(3, v.bfree);
+        put(4, v.bavail);
+        put(5, v.files);
+        put(6, v.ffree);
+        put(7, v.fsid);      // f_fsid — two 32-bit words, written as one u64
+        put(8, v.namelen);
+        put(9, v.bsize);     // f_frsize: we have no fragment size distinct from bsize
+        put(10, 0);          // f_flags (ST_* mount flags) — nothing to report
+    }
+}
+
+/// Reply carrying nothing but a status; `statfs` handlers write through the
+/// caller's buffer pointer like the `stat` family does.
+fn statfs_reply() -> Message { ok_reply() }
+
+/// statfs(path) — answer for whichever filesystem owns `path`.
+///
+/// A path under a registered mount is forwarded verbatim to that mount's
+/// server, which is the only component that knows the volume's real geometry.
+/// Everything else (tmpfs, initrd/RamFS, /proc, /dev) is served from the tmpfs
+/// pool figures below, which are the true capacity of the in-memory store.
+fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
+    if buf_ptr == 0 || path_ptr == 0 { return err_reply(-14); }
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) {
+        Some(r) => r,
+        None    => return err_reply(-14),
+    };
+    let path = strip_trailing_slash(&pbuf[..plen]);
+
+    // /proc and /dev are synthetic and never live on a mount, even after
+    // pivot_root has made "/" a prefix match for everything.
+    if path.starts_with(b"/proc") || path.starts_with(b"/dev") || path.starts_with(b"/sys") {
+        write_statfs(buf_ptr, &procfs_statfs());
+        return statfs_reply();
+    }
+    if !is_tmp_path(path) {
+        if let Some(port) = find_mount_port(path) {
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_STATFS;
+            proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
+            return call_port(port, proxy);
+        }
+    }
+    write_statfs(buf_ptr, &tmpfs_statfs());
+    statfs_reply()
+}
+
+/// fstatfs(fd) — same answer as `handle_statfs`, selected by descriptor.
+///
+/// Only a `MountedFile` can name a real volume; every other vnode kind lives
+/// in this server's own memory, so it reports the tmpfs pool.
+fn handle_fstatfs(pid: u32, fd: usize, buf_ptr: usize) -> Message {
+    if buf_ptr == 0 { return err_reply(-14); }
+    let port = {
+        let mut tbls = FD_TABLES.lock();
+        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        match tbl.fds[fd].kind {
+            VnodeKind::MountedFile { port, .. } => Some(port),
+            _ => None,
+        }
+    };
+    if let Some(port) = port {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_STATFS;
+        proxy.data[0..8].copy_from_slice(&0u64.to_le_bytes()); // no path — port is the volume
+        proxy.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
+        return call_port(port, proxy);
+    }
+    write_statfs(buf_ptr, &tmpfs_statfs());
+    statfs_reply()
+}
+
+/// Live figures for the tmpfs pool: `MAX_TMP_FILES` slots of `MAX_TMP_SIZE`
+/// bytes each, counted in 4 KiB blocks. These are real, not invented — the
+/// pool is a fixed BSS array, so its capacity *is* the filesystem size and the
+/// used byte count is exact.
+fn tmpfs_statfs() -> StatfsVals {
+    const BSIZE: u64 = 4096;
+    let total_blocks = (MAX_TMP_FILES * MAX_TMP_SIZE) as u64 / BSIZE;
+    let (used_bytes, used_slots) = {
+        let tmp = TMP_FILES.lock();
+        let mut bytes = 0u64;
+        let mut slots = 0u64;
+        for e in tmp.iter() {
+            if !e.in_use { continue; }
+            slots += 1;
+            // Aliases (link_to != MAX) carry no bytes of their own — counting
+            // them would charge a hard-linked file to the volume twice.
+            if !e.is_dir && e.link_to == usize::MAX { bytes += e.len as u64; }
+        }
+        (bytes, slots)
+    };
+    let used_blocks = (used_bytes + BSIZE - 1) / BSIZE;
+    let free_blocks = total_blocks.saturating_sub(used_blocks);
+    StatfsVals {
+        f_type:  TMPFS_MAGIC,
+        bsize:   BSIZE,
+        blocks:  total_blocks,
+        bfree:   free_blocks,
+        bavail:  free_blocks,
+        files:   MAX_TMP_FILES as u64,
+        ffree:   (MAX_TMP_FILES as u64).saturating_sub(used_slots),
+        fsid:    0x0102_1994,
+        namelen: (MAX_TMP_PATH - 1) as u64,
+    }
+}
+
+/// /proc and /dev: zero-capacity pseudo-filesystems, exactly as Linux reports
+/// them. `df` filters these out by fstype long before f_blocks matters, and
+/// `df /proc` prints a 0-block line rather than an error — both match Linux.
+fn procfs_statfs() -> StatfsVals {
+    StatfsVals {
+        f_type: PROC_MAGIC, bsize: 4096, blocks: 0, bfree: 0, bavail: 0,
+        files: 0, ffree: 0, fsid: 0, namelen: 255,
+    }
+}
+
+/// fstat(fd) — report metadata for an *open descriptor*.
+///
+/// Unlike the path-based stat family this has only an fd, so it answers from
+/// the vnode kind recorded in the fd table. The file-type bits are the whole
+/// point: the kernel used to fabricate a flat `S_IFREG|0644` for every fd above
+/// 2, which made a pipe end indistinguishable from a regular file. tokio's
+/// `pipe::Receiver::from_file` gates on `S_ISFIFO` and rejected brush's
+/// command-substitution pipe with "not a pipe", so `$(...)` failed before it
+/// ever ran anything.
+///
+/// `MountedFile` still reports S_IFREG with an lseek-derived size — resolving
+/// its real type needs a per-mount "stat this open file" operation that no
+/// filesystem implements yet. That is unchanged from the previous behavior and
+/// is the one remaining gap.
+fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
+    const S_IFIFO: u32 = 0o010000;
+    const S_IFCHR: u32 = 0o020000;
+    const S_IFDIR: u32 = 0o040000;
+    const S_IFREG: u32 = 0o100000;
+
+    if stat_ptr == 0 { return err_reply(-14); }
+
+    let kind = {
+        let mut tbls = FD_TABLES.lock();
+        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        tbl.fds[fd].kind
+    };
+
+    // (mode, size, ino)
+    let (mode, size, ino): (u32, u64, u64) = match kind {
+        VnodeKind::Pipe { ring, .. } => {
+            // st_size on a FIFO is 0 on Linux; the ring index is a stable,
+            // unique-per-pipe inode number, which is what `pipe:[N]` in
+            // /proc/self/fd already reports.
+            (S_IFIFO | 0o600, 0, 0x1000_0000 + ring as u64)
+        }
+        // A console proxy (a dup'd stdio fd, or an fd opened on /dev/tty or
+        // /dev/stdin) is the console, so it reports the console's inode — the
+        // same one stat("/dev/console") reports. Without that agreement
+        // ttyname() rejects the fd; see CONSOLE_INO.
+        VnodeKind::DevStdio { .. } => (S_IFCHR | 0o666, 0, CONSOLE_INO),
+        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom
+        | VnodeKind::DevFb { .. }
+        | VnodeKind::DynamicDevice { .. } => (S_IFCHR | 0o666, 0, 0),
+        // A pseudo-directory reports S_IFDIR with size 0. It used to report
+        // S_IFREG with `size = data.len()`, i.e. the length of its own path —
+        // which is what let memmap2 map `/tmp` as a 4-byte "file".
+        VnodeKind::RamFile { is_dir: true, .. } => (S_IFDIR | 0o755, 0, 0),
+        VnodeKind::RamFile { data, .. } => (S_IFREG | 0o644, data.len() as u64, 0),
+        VnodeKind::TmpFile { idx, .. } => {
+            let t = TMP_FILES.lock();
+            let e = &t[idx];
+            if e.is_dir       { (S_IFDIR | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
+            else if e.is_fifo { (S_IFIFO | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
+            else              { (S_IFREG | (e.mode & 0o7777), e.len as u64, 0x2000_0000 + idx as u64) }
+        }
+        // eventfd/timerfd are anon-inode files on Linux and report S_IFREG.
+        VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. } => (S_IFREG | 0o600, 0, 0),
+        VnodeKind::MountedFile { .. } => {
+            // Size via seek-to-end-and-back, exactly as the kernel used to do.
+            let cur = reply_val(&handle_lseek(pid, fd, 0, 1 /* SEEK_CUR */));
+            if cur < 0 { return err_reply(-9); }
+            let end = reply_val(&handle_lseek(pid, fd, 0, 2 /* SEEK_END */));
+            let _ = handle_lseek(pid, fd, cur, 0 /* SEEK_SET */);
+            (S_IFREG | 0o644, if end >= 0 { end as u64 } else { 0 }, 0)
+        }
+        VnodeKind::None => return err_reply(-9),
+    };
+
+    // st_nlink must agree with what path-based stat reports for the same file,
+    // or `ln f g && stat f` and `ln f g && stat <fd>` disagree.
+    let nlink = match kind {
+        VnodeKind::TmpFile { idx, .. } => { let t = TMP_FILES.lock(); tmp_nlink(&t[..], idx) }
+        _ => 1,
+    };
+    write_stat_full(stat_ptr, mode, nlink, size, ino, 0, 0);
+    ok_reply()
+}
+
 fn handle_stat(path_ptr: usize, stat_ptr: usize) -> Message {
+    stat_common(path_ptr, stat_ptr, true)
+}
+
+/// Shared body of `stat` and `lstat`.
+///
+/// `follow == true` is `stat(2)`: the caller reached here through the
+/// resolution choke point in `handle()`, so `path` already names the symlink's
+/// target and no S_IFLNK entry can be found at the end of it.
+/// `follow == false` is `lstat(2)`: the final component was deliberately left
+/// unresolved, so a tmpfs symlink is reported as S_IFLNK with the length of
+/// its target as `st_size` (which is what `ls -l` prints after the `->`), and
+/// the query is forwarded to mount servers as VFS_LSTAT rather than VFS_STAT.
+fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
     if stat_ptr == 0 { return err_reply(-14); }
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let path = &pbuf[..plen];
@@ -3936,10 +4454,10 @@ fn handle_stat(path_ptr: usize, stat_ptr: usize) -> Message {
             }
         }
         // tmpfs directories.
-        if is_tmp_path(path) {
+        if let Some(tpath) = tmpfs_path(path) {
             let tmp = TMP_FILES.lock();
-            if let Some(e) = tmp.iter().find(|e| e.in_use && e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
-                let ino = plen as u64 + 10000;
+            if let Some(e) = tmp_find(&tmp[..], tpath).map(|i| &tmp[i]).filter(|e| e.is_dir) {
+                let ino = path_ino(tpath, 1);
                 let mode = 0o040000 | if e.mode != 0 { e.mode } else { 0o755 };
                 let (uid, gid) = (e.uid, e.gid);
                 drop(tmp);
@@ -3974,21 +4492,33 @@ fn handle_stat(path_ptr: usize, stat_ptr: usize) -> Message {
             }
         }
         // tmpfs files.
-        if is_tmp_path(path) {
+        if let Some(tpath) = tmpfs_path(path) {
             let tmp = TMP_FILES.lock();
-            if let Some(e) = tmp.iter().find(|e| e.in_use && !e.is_dir && e.path_len == plen && &e.path[..plen] == path) {
+            if let Some(idx) = tmp_find(&tmp[..], tpath).filter(|&i| !tmp[i].is_dir) {
+                // Hard links share one inode, so both st_ino and st_nlink must
+                // come from the data-owning slot — `ls -i` and `stat` are how
+                // callers verify a link took, and a per-name inode number would
+                // make two links look like two files.
+                let owner = tmp_owner(&tmp[..], idx);
+                let nlink = tmp_nlink(&tmp[..], idx);
+                let e = &tmp[owner];
                 let size = e.len as u64;
-                let ino = plen as u64 + 20000;
-                let mode = 0o100000 | if e.mode != 0 { e.mode } else { 0o644 };
+                // S_IFLNK / S_IFIFO / S_IFREG
+                let ifmt: u32 = if !follow && tmp[idx].is_link { 0o120000 }
+                                else if e.is_fifo { 0o010000 }
+                                else { 0o100000 };
+                let default_mode = if ifmt == 0o120000 { 0o777 } else { 0o644 };
+                let mode = ifmt | if e.mode != 0 { e.mode } else { default_mode };
+                let ino = 0x2000_0000 + owner as u64;
                 let (uid, gid) = (e.uid, e.gid);
                 drop(tmp);
-                write_stat_owned(stat_ptr, mode, size, ino, uid, gid);
+                write_stat_full(stat_ptr, mode, nlink, size, ino, uid, gid);
                 return ok_reply();
             }
         }
         // initrd CPIO archive.
         if let Some(data) = find_in_initrd(lookup_path) {
-            write_stat(stat_ptr, 0o100444, data.len() as u64, path_ptr as u64 & 0xFFFF);
+            write_stat(stat_ptr, 0o100444, data.len() as u64, path_ino(lookup_path, 3));
             return ok_reply();
         }
     }
