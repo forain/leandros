@@ -75,8 +75,32 @@ pub fn has_deliverable_signal() -> bool {
     let pid = super::current_pid();
     if pid == 0 { return false; }
     let rq = super::RUN_QUEUE.lock();
+    has_deliverable_signal_locked(&rq, pid)
+}
+
+/// Same predicate as [`has_deliverable_signal`], but evaluated against a
+/// run-queue borrow the caller already holds.
+///
+/// Splitting the test and the act-on-it into two separate acquisitions of
+/// `RUN_QUEUE` is not good enough for a caller that *parks* on the answer:
+/// `deliver_signal` sets `signal_pending` under this same lock and only
+/// performs a `Blocked → Ready` wake, so a signal landing in the gap does
+/// nothing (the task is still `Running`) and is then stranded on a task that
+/// has just gone to sleep. `futex::futex_wait` therefore tests this inside
+/// the very critical section that marks the task `Blocked`.
+pub(crate) fn has_deliverable_signal_locked(
+    rq: &super::runqueue::RunQueue,
+    pid: super::task::Pid,
+) -> bool {
     let t = match rq.find_pid(pid) { Some(t) => t, None => return false };
-    let mut unmasked = t.signal_pending & !t.signal_mask;
+    // Include signals parked at the *process* level by `deliver_signal_process`
+    // (its "every thread masked it" path stores them on the leader's
+    // `shared_signal_pending`). This thread may be the one that has the signal
+    // unmasked, in which case `check_and_deliver_signals` claims it on the next
+    // return to user space — so it is genuinely deliverable and must not be
+    // slept through.
+    let shared = rq.find_pid(t.tgid).map(|l| l.shared_signal_pending).unwrap_or(0);
+    let mut unmasked = (t.signal_pending | shared) & !t.signal_mask;
     if unmasked == 0 { return false; }
     let leader = rq.find_pid(t.tgid);
     while unmasked != 0 {

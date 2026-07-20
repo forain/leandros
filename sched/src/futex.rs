@@ -70,6 +70,12 @@ pub fn futex_wait(uaddr: usize, expected: u32, deadline: Option<u64>) -> isize {
             let current = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
             if current != expected { return -11; } // EAGAIN — value already differs
             if super::ticks() >= deadline { return -110; } // ETIMEDOUT
+            // Bail out on a pending signal, like every other bounded wait here
+            // (`sys_nanosleep`, `sys_epoll_wait`, …). This loop never returns to
+            // user space, so a signal raised during it is otherwise not
+            // delivered until the deadline expires. Reported as a spurious wake
+            // (0) for the same reason as the untimed path below.
+            if super::signal::has_deliverable_signal() { return 0; }
             super::irq_window();
             super::yield_now("futex_wait_timed");
         }
@@ -103,6 +109,53 @@ pub fn futex_wait(uaddr: usize, expected: u32, deadline: Option<u64>) -> isize {
             }
 
             let mut rq = RUN_QUEUE.lock();
+
+            // Don't park on top of a signal that is already pending.
+            //
+            // `deliver_signal` only ever performs a `Blocked → Ready` wake. A
+            // signal raised while this task was still `Running` therefore set
+            // `signal_pending` and woke nothing — correct at the time, because
+            // a running task collects its signals on the next return to user
+            // space. But if that task then descends straight into an *untimed*
+            // futex wait, it parks with the bit still set and nothing will ever
+            // wake it: no `futex_wake` is coming (the condition it is waiting
+            // on is the signal), and `deliver_signal` has already run. The task
+            // sleeps forever, and with it every task waiting on whatever it was
+            // supposed to do next.
+            //
+            // Concretely: tokio's SIGCHLD-driven child reaping. A child that
+            // exits in the narrow window after `deliver_signal_process` picked
+            // a *running* worker thread but before that worker parks strands
+            // the notification permanently — the handler never runs, the signal
+            // self-pipe is never written, the reactor never learns the child is
+            // gone. A short-lived child (`sleep 0`) lands squarely in that
+            // window; a long-lived one (`sleep 1`) exits once the runtime has
+            // quiesced, when `deliver_signal_process` finds an already-`Blocked`
+            // thread and takes the waking path instead.
+            //
+            // This must be tested here, under the same `RUN_QUEUE` acquisition
+            // that sets `Blocked` — `deliver_signal` mutates `signal_pending`
+            // under this lock, so checking it before or after reopens exactly
+            // the race being closed. Ignored signals must not count (POSIX), so
+            // this uses the disposition-aware predicate rather than a bare
+            // `pending & !mask`.
+            if super::signal::has_deliverable_signal_locked(&rq, pid) {
+                drop(rq);
+                // Un-register: we are not going to sleep after all.
+                for slot in tbl.iter_mut() {
+                    if let Some(w) = *slot {
+                        if w.pid == pid { *slot = None; break; }
+                    }
+                }
+                // Report a spurious wake rather than -EINTR. Every futex caller
+                // re-checks its own condition in a loop and treats a spurious
+                // wake as a retry, whereas -EINTR escapes to callers that may
+                // not expect it. The retry is bounded: returning to user space
+                // runs `check_and_deliver_signals`, which delivers (or discards)
+                // the pending signal, so the next `futex_wait` parks normally.
+                return 0;
+            }
+
             if let Some(t) = rq.find_pid_mut(pid) {
                 t.state         = TaskState::Blocked;
                 t.blocked_futex = uaddr;

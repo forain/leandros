@@ -2036,7 +2036,7 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
 /// `rqtp_ptr` points to `struct timespec { tv_sec: i64, tv_nsec: i64 }`.
 /// The second argument (`clockid` for clock_nanosleep, or `rmtp` for nanosleep)
 /// is ignored; remaining time is never written back.
-fn sys_nanosleep(rqtp_ptr: usize, _rmtp: usize) -> isize {
+fn sys_nanosleep(rqtp_ptr: usize, rmtp_ptr: usize) -> isize {
     if rqtp_ptr == 0 { return 0; }
     if !validate_user_buf(rqtp_ptr, 16) { return -14; }
     let tv_sec  = unsafe { core::ptr::read(rqtp_ptr         as *const i64) };
@@ -2045,9 +2045,26 @@ fn sys_nanosleep(rqtp_ptr: usize, _rmtp: usize) -> isize {
     // Convert to ticks (~100 Hz).
     let ticks_needed = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
     if ticks_needed == 0 { return 0; }
-    let deadline = ticks().wrapping_add(ticks_needed);
+    let start = ticks();
+    let deadline = start.wrapping_add(ticks_needed);
     loop {
-        if interrupted() { return -4; } // EINTR (rmtp not filled — callers retry)
+        if interrupted() {
+            // Report the time still owed in `rmtp`. Leaving it untouched is
+            // not a harmless omission: std::thread::sleep passes the *same*
+            // timespec for both arguments and re-sleeps whatever it finds
+            // there, so an unwritten rmtp makes every EINTR restart the full
+            // duration from scratch. Callers may also pass rqtp == rmtp, so
+            // the request was read out above before anything is written back.
+            if rmtp_ptr != 0 && validate_user_buf(rmtp_ptr, 16) {
+                let elapsed = ticks().wrapping_sub(start);
+                let left = ticks_needed.saturating_sub(elapsed);
+                unsafe {
+                    core::ptr::write(rmtp_ptr       as *mut i64, (left / 100) as i64);
+                    core::ptr::write((rmtp_ptr + 8) as *mut i64, ((left % 100) * 10_000_000) as i64);
+                }
+            }
+            return -4; // EINTR
+        }
         irq_window();
 
         yield_now("nanosleep");
