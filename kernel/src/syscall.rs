@@ -4440,8 +4440,14 @@ fn sys_setpgid(pid_raw: usize, pgid_raw: usize) -> isize {
 
 fn sys_getpgid(pid_raw: usize) -> isize {
     if pid_raw == 0 { return sched::current_pgid() as isize; }
-    // For other PIDs: we'd need to look them up — return our own pgid.
-    sched::current_pgid() as isize
+    // Honour the argument. Returning the *caller's* pgid for every pid made
+    // getpgid(other) silently wrong, which job control cannot survive: a shell
+    // uses it to decide whether a child ever made it into the group it was
+    // placed in, and "yes, always" is the one answer that hides the failure.
+    match sched::pgid_of(pid_raw as u32) {
+        Some(pgid) => pgid as isize,
+        None       => -3, // ESRCH
+    }
 }
 
 fn sys_getresxid(r_ptr: usize, e_ptr: usize, s_ptr: usize, is_gid: bool) -> isize {

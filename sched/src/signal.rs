@@ -62,6 +62,21 @@ const SIGDFL_IGNORE: u64 = (1u64 << 16) | (1u64 << 22) | (1u64 << 27);
 // Signal numbers used for default-terminate calculation.
 const SIGSEGV: u32 = 11;
 
+pub(crate) const SIGKILL: u32 = 9;
+pub(crate) const SIGSTOP: u32 = 19;
+
+/// The two signals POSIX makes undeniable: they can never be blocked, caught,
+/// or ignored.
+///
+/// Enforcing this is not pedantry. `sigprocmask` used to apply the caller's set
+/// verbatim, and musl (and Rust's `std`) block the *entire* signal set around
+/// `fork`/`posix_spawn` — so a process could, and routinely did, end up with
+/// SIGKILL masked on every thread. `deliver_signal_process` then found no
+/// eligible thread, parked the bit on the leader's `shared_signal_pending`, and
+/// returned success. `kill -9` reported that it had worked while the target
+/// went on running.
+pub(crate) const UNBLOCKABLE: u64 = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
+
 /// True when the calling task has a pending, unmasked signal that would
 /// actually be *delivered* (a user handler runs, or the default action
 /// terminates) rather than discarded (SIG_IGN, or SIG_DFL for a
@@ -171,9 +186,19 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                     let mask = t.signal_mask;
                     // Signal disposition is shared across the thread group: read
                     // from the TGID leader so all threads see installed handlers.
-                    let action = rq.find_pid(t.tgid)
-                        .map(|leader| leader.signal_actions[bit as usize])
-                        .unwrap_or(crate::task::DEFAULT_SIGACTION);
+                    //
+                    // SIGKILL/SIGSTOP ignore that table entirely: POSIX says
+                    // they can be neither caught nor ignored, so a handler
+                    // registered for them (which `sys_sigaction` now rejects,
+                    // but an already-installed one could predate that) must not
+                    // be able to divert them.
+                    let action = if UNBLOCKABLE & (1u64 << bit) != 0 {
+                        crate::task::DEFAULT_SIGACTION
+                    } else {
+                        rq.find_pid(t.tgid)
+                            .map(|leader| leader.signal_actions[bit as usize])
+                            .unwrap_or(crate::task::DEFAULT_SIGACTION)
+                    };
                     Some((sig, action, mask))
                 }
                 None => return,
@@ -214,8 +239,17 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                 if SIGDFL_IGNORE & (1u64 << (sig - 1)) != 0 {
                     continue; // check next pending signal
                 }
-                // Default action: terminate.
-                super::exit(128 + sig as i32);
+                // Default action: terminate — the whole thread group, not just
+                // this thread. A fatal signal ends a *process*; `exit` alone
+                // would reap only the thread that happened to take delivery,
+                // and `deliver_signal_process` prefers a blocked thread (an
+                // epoll-parked tokio worker, typically) over the leader. That
+                // is what made `kill -9` on a threaded process a coin flip.
+                //
+                // TODO: SIGSTOP's true default action is "stop the process",
+                // not "terminate" — it lands here because there is no stopped
+                // task state yet. Revisit when job control is implemented.
+                super::exit_group(128 + sig as i32);
             }
             1 => {
                 // SIG_IGN — skip, check next.
@@ -238,7 +272,7 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
 
                 if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask, action.get_flags()) {
                     // Frame write failed (stack fault) — deliver SIGSEGV.
-                    super::exit(128 + SIGSEGV as i32);
+                    super::exit_group(128 + SIGSEGV as i32);
                 }
 
                 // One signal delivered; re-check for more on the next syscall return.
@@ -276,6 +310,11 @@ pub fn sys_sigaction(signum: u32, act_ptr: usize, oldact_ptr: usize) -> isize {
             unsafe { core::ptr::write(oldact_ptr as *mut crate::task::SigAction, old); }
         }
         if act_ptr != 0 {
+            // Installing a disposition for SIGKILL/SIGSTOP is EINVAL — they can
+            // be neither caught nor ignored. Reported *after* `oldact` is
+            // filled, matching Linux: querying the current (always SIG_DFL)
+            // action is legal, only changing it is not.
+            if UNBLOCKABLE & (1u64 << (signum - 1)) != 0 { return -22; }
             let new = unsafe { core::ptr::read(act_ptr as *const crate::task::SigAction) };
             leader.signal_actions[(signum - 1) as usize] = new;
         }
@@ -297,11 +336,15 @@ pub fn sys_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
             unsafe { core::ptr::write(oldset_ptr as *mut u64, t.signal_mask); }
         }
         if set_ptr != 0 {
+            // Silently drop SIGKILL/SIGSTOP from anything that would *add* to
+            // the blocked set, exactly as Linux's `sigprocmask` does — the call
+            // still succeeds, those two bits just never take. Unblocking needs
+            // no filtering: clearing a bit that can never be set is a no-op.
             let set = unsafe { core::ptr::read(set_ptr as *const u64) };
             match how {
-                SIG_BLOCK   => t.signal_mask |= set,
+                SIG_BLOCK   => t.signal_mask |= set & !UNBLOCKABLE,
                 SIG_UNBLOCK => t.signal_mask &= !set,
-                SIG_SETMASK => t.signal_mask = set,
+                SIG_SETMASK => t.signal_mask = set & !UNBLOCKABLE,
                 _           => return -22, // EINVAL
             }
         }
@@ -561,7 +604,7 @@ mod aarch64 {
         let ok = super::super::with_address_space(pid, |as_| {
             as_.read_user_buf(sigframe_virt, &mut buf)
         }).unwrap_or(false);
-        if !ok { super::super::exit(128 + 11); }
+        if !ok { super::super::exit_group(128 + 11); }
 
         // Restore GPRs from uc_mcontext.
         for i in 0..31 {
@@ -803,7 +846,7 @@ mod x86_64 {
         let ok = super::super::with_address_space(pid, |as_| {
             as_.read_user_buf(sigframe_virt, &mut buf)
         }).unwrap_or(false);
-        if !ok { super::super::exit(128 + 11); }
+        if !ok { super::super::exit_group(128 + 11); }
 
         let rreg = |buf: &alloc::vec::Vec<u8>, i: usize| -> u64 {
             let o = greg_off(i);

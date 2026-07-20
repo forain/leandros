@@ -293,6 +293,15 @@ pub fn current_sid() -> Pid {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.sid).unwrap_or(0)
 }
 
+/// The process-group id of `pid`, or `None` if no such task is live.
+///
+/// `None` is the caller's cue to report ESRCH: `getpgid(2)` must distinguish
+/// "that process is in group 0" from "that process does not exist", which a
+/// bare `unwrap_or(0)` cannot.
+pub fn pgid_of(pid: Pid) -> Option<Pid> {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.pgid)
+}
+
 /// The thread-group id of `pid`, or `pid` itself if it's not a live task
 /// (matches every task's own fallback of being its own tgid at creation).
 pub fn tgid_of(pid: Pid) -> Pid {
@@ -350,6 +359,13 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32) -> isize {
     if signo == 0 || signo > 64 { return -22; }
     let bit = 1u64 << (signo - 1);
     let mut woke = false;
+    // SIGKILL and SIGSTOP cannot be blocked, so the "does this thread have it
+    // unmasked?" test must not gate their delivery. `sys_sigprocmask` already
+    // refuses to set these bits, but a stale mask (or a future path that sets
+    // `signal_mask` directly) must not be able to strand them on the shared
+    // pending set: for these two, any live thread in the group is a valid
+    // target. Belt and braces on the one pair of signals that must never fail.
+    let unblockable = signal::UNBLOCKABLE & bit != 0;
     let ret = {
         let mut rq = RUN_QUEUE.lock();
         let min_vr = rq.min_vruntime();
@@ -359,7 +375,7 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32) -> isize {
         let mut chosen_blocked = false;
         for i in 0..runqueue::MAX_TASKS {
             if let Some(t) = rq.get(i) {
-                if t.tgid == tgid && (t.signal_mask & bit) == 0 {
+                if t.tgid == tgid && (unblockable || (t.signal_mask & bit) == 0) {
                     let blocked = t.state == TaskState::Blocked;
                     if chosen.is_none() || (blocked && !chosen_blocked) {
                         chosen = Some(i);
@@ -1177,6 +1193,49 @@ fn scheduler_run_loop() -> ! {
     }
 }
 
+/// Run the registered fd/pipe/socket teardown for `pid`, if one is installed.
+///
+/// Factored out of [`exit`] so the group-kill paths can run it for every
+/// sibling they reap: `kill_next_group_member` stops a thread without that
+/// thread ever entering its own `exit`, so nothing else would release its fds.
+fn run_exit_teardown(pid: Pid) {
+    let hook_ptr = EXIT_TEARDOWN_HOOK.load(Ordering::Acquire);
+    if !hook_ptr.is_null() {
+        let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
+        hook(pid);
+    }
+}
+
+/// Terminate the *whole* thread group, then the caller — Linux `exit_group(2)`
+/// semantics.
+///
+/// [`exit`] kills only the calling thread. That is the right primitive for a
+/// thread returning from its start routine and the wrong one for anything that
+/// is meant to end a *process*. A fatal signal (`SIG_DFL` terminate) used to
+/// call `exit` directly, so when it landed on a non-leader thread it reaped
+/// just that thread and left the process running.
+///
+/// That was not a rare corner: `deliver_signal_process` deliberately prefers a
+/// *blocked* thread as the delivery target (so the signal also wakes it), and
+/// in a tokio program the blocked thread is almost always a worker parked in
+/// epoll rather than the leader. The result was that `kill -9` on a threaded
+/// process succeeded or did nothing depending on which thread happened to be
+/// parked at that instant.
+///
+/// The loop-then-`exit` ordering is required rather than stylistic — see
+/// [`kill_next_group_member`]: every sibling must have actually *stopped*
+/// before the leader's shared `AddressSpace` may be dropped.
+pub fn exit_group(code: i32) -> ! {
+    loop {
+        match kill_next_group_member(code) {
+            GroupKillStep::Done        => break,
+            GroupKillStep::Reaped(pid) => run_exit_teardown(pid),
+            GroupKillStep::Kicking     => core::hint::spin_loop(),
+        }
+    }
+    exit(code)
+}
+
 pub fn exit(code: i32) -> ! {
     extern "C" {
         fn serial_print(s: *const u8, len: usize);
@@ -1203,13 +1262,7 @@ pub fn exit(code: i32) -> ! {
     // it is from the `EXIT` syscall. The reap hook has none of those
     // properties. Re-running teardown for a task that came through `EXIT` is
     // harmless — the second pass finds an empty fd table and does nothing.
-    {
-        let hook_ptr = EXIT_TEARDOWN_HOOK.load(Ordering::Acquire);
-        if !hook_ptr.is_null() {
-            let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
-            hook(pid);
-        }
-    }
+    run_exit_teardown(pid);
 
     unsafe {
         let msg = b"[EXIT] pid=";
