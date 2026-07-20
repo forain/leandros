@@ -416,6 +416,9 @@ mod nr {
     pub const SCHED_GETAFFINITY:   usize = 123;
     pub const SCHED_GET_PRIORITY_MAX: usize = 125;
     pub const SCHED_GET_PRIORITY_MIN: usize = 126;
+    // Note the AArch64/asm-generic ordering is the reverse of x86-64's.
+    pub const SETPRIORITY:         usize = 140;
+    pub const GETPRIORITY:         usize = 141;
     pub const CAPGET:              usize = 90;
     pub const CAPSET:              usize = 91;
     pub const MEMBARRIER:          usize = 283;
@@ -625,6 +628,11 @@ mod nr {
     pub const SCHED_GETAFFINITY:   usize = 204;
     pub const SCHED_GET_PRIORITY_MAX: usize = 146;
     pub const SCHED_GET_PRIORITY_MIN: usize = 147;
+    // Reversed relative to AArch64 — see the note there. There is no `nice`
+    // syscall on x86-64 (34 is `pause`); it is i386-only, and musl implements
+    // nice(3) on top of get/setpriority.
+    pub const GETPRIORITY:         usize = 140;
+    pub const SETPRIORITY:         usize = 141;
     pub const CAPGET:              usize = 125;
     pub const CAPSET:              usize = 126;
     pub const MEMBARRIER:          usize = 324;
@@ -1108,6 +1116,8 @@ fn dispatch_inner(
         SCHED_SETAFFINITY  => 0,
         SCHED_GETAFFINITY  => sys_sched_getaffinity(a0, a1, a2),
         SCHED_GET_PRIORITY_MAX | SCHED_GET_PRIORITY_MIN => 0,
+        SETPRIORITY        => sys_setpriority(a0, a1, a2),
+        GETPRIORITY        => sys_getpriority(a0, a1),
         GETCPU             => sys_getcpu(a0, a1, a2),
 
         // ── Resource usage ────────────────────────────────────────────────────
@@ -3538,6 +3548,59 @@ fn sys_getrusage(_who: usize, usage_ptr: usize) -> isize {
     // ru_maxrss (offset 32) — report a plausible 4 MiB RSS.
     unsafe { core::ptr::write((usage_ptr + 32) as *mut i64, 4096); }
     0
+}
+
+// ── Nice values (setpriority/getpriority) ────────────────────────────────────
+//
+// There is no `nice` syscall on either architecture we build for — it is
+// i386-only — so nice(3) reaches the kernel as a getpriority/setpriority pair.
+
+const PRIO_PROCESS: usize = 0;
+const PRIO_PGRP:    usize = 1;
+const PRIO_USER:    usize = 2;
+
+/// Resolve a `(which, who)` pair, where `who == 0` means "the caller's own
+/// process / process group / user".
+fn nice_target(which: usize, who: usize) -> Option<sched::NiceTarget> {
+    let who = who as u32;
+    match which {
+        PRIO_PROCESS => Some(sched::NiceTarget::Process(
+            if who == 0 { current_pid() } else { who })),
+        PRIO_PGRP => Some(sched::NiceTarget::Pgrp(
+            if who == 0 { sched::current_pgid() } else { who })),
+        PRIO_USER => Some(sched::NiceTarget::User(
+            if who == 0 { sched::current_euid() } else { who })),
+        _ => None,
+    }
+}
+
+/// setpriority(which, who, prio) — set the nice value of the selected tasks.
+///
+/// Unprivileged callers may only lower priority (raise the nice value); Linux
+/// gates the other direction on RLIMIT_NICE/CAP_SYS_NICE, and root is exempt.
+fn sys_setpriority(which: usize, who: usize, prio: usize) -> isize {
+    let target = match nice_target(which, who) { Some(t) => t, None => return -22 };
+    // `prio` arrives as a sign-extended int; clamping happens in the scheduler.
+    let want = (prio as u32) as i32 as i8;
+    if sched::current_euid() != 0 {
+        let cur = match sched::get_nice_for(target) { Some(n) => n, None => return -3 };
+        if want < cur { return -1; } // EPERM — only root may raise priority
+    }
+    if sched::set_nice_for(target, want) { 0 } else { -3 }
+}
+
+/// getpriority(which, who) — report the most favourable nice value in the set.
+///
+/// Returns `20 - nice`, not the nice value itself. That is the Linux ABI, and
+/// it exists because a bare nice value spans -20..19 and would make a legal
+/// result of -1 indistinguishable from an error return; the biased form is
+/// 1..40, entirely positive. musl's `getpriority(3)` undoes the bias.
+fn sys_getpriority(which: usize, who: usize) -> isize {
+    let target = match nice_target(which, who) { Some(t) => t, None => return -22 };
+    match sched::get_nice_for(target) {
+        Some(nice) => 20 - nice as isize,
+        None       => -3, // ESRCH
+    }
 }
 
 /// sys_sched_getparam(pid, param_ptr) — fill sched_param with priority 0.

@@ -512,6 +512,71 @@ pub fn current_cwd(buf: *mut u8, max_len: usize) -> isize {
     -1
 }
 
+/// Which tasks a nice query/update applies to — the `which`/`who` pair of
+/// `getpriority(2)`/`setpriority(2)`, already resolved against the caller.
+///
+/// Resolving "who == 0 means me" in the kernel keeps the PRIO_* constants out
+/// of the scheduler, which has no business knowing the syscall ABI.
+#[derive(Clone, Copy)]
+pub enum NiceTarget {
+    Process(Pid),
+    Pgrp(Pid),
+    User(u32),
+}
+
+impl NiceTarget {
+    fn matches(&self, t: &task::Task) -> bool {
+        match *self {
+            NiceTarget::Process(pid) => t.pid  == pid,
+            NiceTarget::Pgrp(pgid)   => t.pgid == pgid,
+            NiceTarget::User(uid)    => t.uid  == uid,
+        }
+    }
+}
+
+/// Lowest nice value (i.e. most favourable priority) among the matching tasks,
+/// or `None` when nothing matches — the caller's cue to report ESRCH.
+///
+/// "Lowest wins" is what `getpriority(2)` specifies for the group and user
+/// forms; for `Process` there is at most one match, so it degenerates.
+pub fn get_nice_for(target: NiceTarget) -> Option<i8> {
+    let rq = RUN_QUEUE.lock();
+    (0..runqueue::MAX_TASKS)
+        .filter_map(|i| rq.get(i))
+        .filter(|t| target.matches(t))
+        .map(|t| t.priority)
+        .min()
+}
+
+/// Apply `nice` to every matching task. Returns false when nothing matched.
+///
+/// Re-placing each task is the part that is easy to miss: `weight` feeds
+/// `slice_vt`, and a task's deadline is only recomputed when the current one
+/// expires (`charge_vruntime`). Without `place` a renice would sit inert for up
+/// to a full slice, which reads as "the weight table is wrong" rather than
+/// "the change has not landed yet".
+///
+/// Placement uses the queue's current `min_vruntime`, exactly as wake-up does,
+/// so renicing cannot be abused to mint a fresh lag credit.
+pub fn set_nice_for(target: NiceTarget, nice: i8) -> bool {
+    let nice = nice.clamp(-20, 19);
+    let weight = task::nice_to_weight(nice);
+    let mut rq = RUN_QUEUE.lock();
+    let min_vr = rq.min_vruntime();
+    let mut found = false;
+    for i in 0..runqueue::MAX_TASKS {
+        let is_match = rq.get(i).map(|t| target.matches(t)).unwrap_or(false);
+        if !is_match { continue; }
+        if let Some(t) = rq.get_mut(i) {
+            t.priority = nice;
+            t.weight   = weight;
+            t.place(min_vr);
+            found = true;
+        }
+    }
+    found
+}
+
 pub fn set_cwd(path: &[u8]) -> bool {
     let pid = current_pid();
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {

@@ -187,7 +187,8 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         }
 
         // ── Step 6: gather parent credentials ────────────────────────────────
-        let (heap_start, heap_end, pid, _tgid, pgid, sid, uid, gid, euid, egid, cwd, tls_base) = {
+        let (heap_start, heap_end, pid, _tgid, pgid, sid, uid, gid, euid, egid, cwd, tls_base,
+             nice) = {
             let rq = super::RUN_QUEUE.lock();
             if let Some(t) = rq.find_pid(parent_pid) {
                 let leader = rq.find_pid(t.tgid).unwrap_or(t);
@@ -195,7 +196,8 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
                     .map(|a| (a.heap_start, a.heap_end))
                     .unwrap_or((0, 0));
                 (hs, he, t.pid, t.tgid, t.pgid, t.sid,
-                 t.uid, t.gid, t.euid, t.egid, (t.cwd.clone(), t.cwd_len), t.tls_base)
+                 t.uid, t.gid, t.euid, t.egid, (t.cwd.clone(), t.cwd_len), t.tls_base,
+                 t.priority)
             } else {
                 mm::buddy::free(stack_base_phys, stack_pages);
                 mm::buddy::free(child_pt, 0);
@@ -259,6 +261,12 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         // child (and getcwd() in the child answered "/").
         child.cwd           = cwd.0;
         child.cwd_len       = cwd.1;
+        // POSIX: a child inherits the parent's nice value. `Task::new_*` builds
+        // every task at nice 0, so without this a `nice -n 10 sh -c ...` lost
+        // the niceness at the first fork — i.e. for everything the shell
+        // actually ran.
+        child.priority      = nice;
+        child.weight        = task::nice_to_weight(nice);
         child.signal_actions = [DEFAULT_SIGACTION; 64];
 
         // Give the caller its chance to set up per-child kernel state (VFS
@@ -390,7 +398,7 @@ pub fn clone_thread(
 
         // ── Collect parent credentials and page table ─────────────────────────
         let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, heap_start, heap_end,
-             ctid_phys, cwd, leader_as) = {
+             ctid_phys, cwd, leader_as, nice) = {
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid) {
                 Some(t) => {
@@ -411,7 +419,7 @@ pub fn clone_thread(
                     // lookup already resolves to it.
                     (t.page_table, t.tgid, t.pgid, t.sid,
                      t.uid, t.gid, t.euid, t.egid, hs, he, cp, (t.cwd.clone(), t.cwd_len),
-                     leader.address_space.clone())
+                     leader.address_space.clone(), t.priority)
                 }
                 None => {
                     mm::buddy::free(stack_base_phys, stack_pages);
@@ -457,6 +465,10 @@ pub fn clone_thread(
         // See fork_current: cwd is (bytes, len); the length must travel too.
         child.cwd        = cwd.0;
         child.cwd_len    = cwd.1;
+        // See fork_current: nice is inherited. On Linux it is per-thread, so a
+        // new thread starts at its creator's value rather than the group's.
+        child.priority   = nice;
+        child.weight     = task::nice_to_weight(nice);
         child.signal_actions = [DEFAULT_SIGACTION; 64];
         child.vfork_pending = flags & CLONE_VFORK != 0;
         if flags & CLONE_CHILD_CLEARTID != 0 {
