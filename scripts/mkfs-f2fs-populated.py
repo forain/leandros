@@ -84,15 +84,34 @@ def write_superblock(image, base, total_blocks, total_segs, main_segs):
     w32(image, s +100, NODE_INO)
     w32(image, s +104, META_INO)
 
-def build_dentry_block(entries):
+def build_dentry_blocks(entries):
+    """Lay out directory entries across as many 4096-byte blocks as needed.
+
+    Returns a list of blocks. Spilling matters now that /bin holds the ~100
+    hardlinked coreutils names: a single block fits only NR_DENTRY_IN_BLK
+    slots, and long names burn two slots each. The f2fs server already reads
+    multi-block directories (it loops over blocks derived from the inode
+    size), so the image writer was the only single-block component.
+    """
+    blocks = []
     block = bytearray(4096)
     bitmap = bytearray(27)
     current_slot = 0
+
+    def flush():
+        block[0:27] = bitmap
+        blocks.append(block)
+
     for name, ino, ftype in entries:
         name_len = len(name)
         slots_used = (name_len + DENTRY_SLOT_LEN - 1) // DENTRY_SLOT_LEN
+        if slots_used > NR_DENTRY_IN_BLK:
+            raise ValueError(f"Directory entry name too long: {name!r}")
         if current_slot + slots_used > NR_DENTRY_IN_BLK:
-            raise ValueError("Too many directory entries for one block!")
+            flush()
+            block = bytearray(4096)
+            bitmap = bytearray(27)
+            current_slot = 0
         for i in range(slots_used):
             slot = current_slot + i
             byte = slot // 8
@@ -106,8 +125,9 @@ def build_dentry_block(entries):
         n_off = DENTRY_NAMES_OFF + current_slot * DENTRY_SLOT_LEN
         block[n_off : n_off + name_len] = name
         current_slot += slots_used
-    block[0:27] = bitmap
-    return block
+
+    flush()
+    return blocks
 
 def build_inode_block(mode, links, size, block_addrs, nid):
     block = bytearray(4096)
@@ -250,7 +270,15 @@ def main():
         return len(path) if isinstance(path, (bytes, bytearray)) else os.path.getsize(path)
 
     required_blocks = 4096 + 100
+    # Count each distinct host path once: repeated paths become hardlinks
+    # sharing a single inode and its data blocks, so charging the image for
+    # every name would over-allocate by ~100x once coreutils is installed.
+    _sized = set()
     for name, path, mode in bin_files + lib_files + root_files + etc_files:
+        if not isinstance(path, (bytes, bytearray)):
+            if path in _sized:
+                continue
+            _sized.add(path)
         size = content_size(path)
         k = (size + BLOCK_SIZE - 1) // BLOCK_SIZE
         # Inode block + data blocks + potential direct nodes.
@@ -307,10 +335,31 @@ def main():
     # 4. Process regular files, allocate data blocks and inodes
     file_entries = [] # (parent_ino, name, child_ino, file_type)
     next_nid = 12
+    packed_by_path = {}  # host path -> (nid, inode block) for hardlinking
+    nlink_by_path = {}   # host path -> current link count
     
     def add_files_to_dir(parent_ino, files):
         nonlocal next_nid, next_blk
         for name, path, mode in files:
+            # Hardlink: a host path already packed gets a second directory
+            # entry pointing at the same nid rather than a second copy of the
+            # content. This is what makes uutils/coreutils viable — its ~100
+            # commands are one multicall binary dispatching on argv[0], and
+            # duplicating a multi-MB binary per name would add gigabytes to
+            # the image. The f2fs server's lookup path reads the nid out of
+            # the dentry verbatim, so several names sharing one inode is
+            # indistinguishable to it from one name; its unlink path drops
+            # only the dentry and never touches the inode, so removing one
+            # name cannot corrupt the others.
+            key = None if isinstance(path, (bytes, bytearray)) else path
+            if key is not None and key in packed_by_path:
+                shared_nid, shared_inode_blk = packed_by_path[key]
+                nlink_by_path[key] += 1
+                w32(image, shared_inode_blk * BLOCK_SIZE + 12, nlink_by_path[key])
+                file_entries.append((parent_ino, name.encode('utf-8'), shared_nid, DT_REG))
+                print(f"  Linked {name} -> nid {shared_nid} (hardlink, no extra content)")
+                continue
+
             if isinstance(path, (bytes, bytearray)):
                 data = bytes(path)
             else:
@@ -454,6 +503,10 @@ def main():
                 image[dn_blk * BLOCK_SIZE : (dn_blk + 1) * BLOCK_SIZE] = dn_bytes
                 write_nat_entry(image, dn_nid, dn_blk)
                 
+            if key is not None:
+                packed_by_path[key] = (file_nid, file_inode_blk)
+                nlink_by_path[key] = 1
+
             file_entries.append((parent_ino, name.encode('utf-8'), file_nid, DT_REG))
             print(f"  Packed {name} (size: {size} bytes, inode blk: {file_inode_blk}, nid: {file_nid})")
             
@@ -506,10 +559,17 @@ def main():
         
     # Write directory data blocks and directory inodes
     for ino, name in dir_nodes.items():
-        db_addr = data_blocks[ino]
-        db_bytes = build_dentry_block(dentry_entries[ino])
-        image[db_addr * BLOCK_SIZE : (db_addr + 1) * BLOCK_SIZE] = db_bytes
-        
+        db_blocks = build_dentry_blocks(dentry_entries[ino])
+        # Each directory has one statically pre-allocated data block; a
+        # directory that outgrows it (/bin, once the coreutils names land)
+        # takes its extra blocks from the same bump allocator the files used.
+        db_addrs = [data_blocks[ino]]
+        for _ in range(len(db_blocks) - 1):
+            db_addrs.append(next_blk)
+            next_blk += 1
+        for db_addr, db_bytes in zip(db_addrs, db_blocks):
+            image[db_addr * BLOCK_SIZE : (db_addr + 1) * BLOCK_SIZE] = db_bytes
+
         in_addr = inode_blocks[ino]
         # Inodes point to their data block
         mode = 0o040755
@@ -519,7 +579,7 @@ def main():
         else:
             links = 2
             
-        inode_bytes = build_inode_block(mode, links, BLOCK_SIZE, [db_addr], ino)
+        inode_bytes = build_inode_block(mode, links, len(db_addrs) * BLOCK_SIZE, db_addrs, ino)
         image[in_addr * BLOCK_SIZE : (in_addr + 1) * BLOCK_SIZE] = inode_bytes
         
         write_nat_entry(image, ino, in_addr)
