@@ -640,6 +640,35 @@ mod x86_64 {
     const SAFE_RFLAGS_MASK: u64 = 0x0_0004_0DD5;
     const RFLAGS_FIXED: u64 = 0x202; // reserved bit 1 + IF
 
+    /// Flip to `true` to trace every x86-64 signal-frame construction over the
+    /// serial console. Prints, per delivery: the signal number, the user rsp
+    /// the frame is built below, the frame base, the rsp→frame gap (must be
+    /// ≥ 128 + SIGFRAME_SIZE once the red zone is reserved), and the rax being
+    /// captured into uc_mcontext.gregs — which is the interrupted syscall's
+    /// *result*, and must never be the syscall number. Left in, and left off:
+    /// this is the evidence path for both the red-zone reservation and the
+    /// return-value publication in arch/x86_64/src/syscall.rs step 7b.
+    const SIGFRAME_TRACE: bool = false;
+
+    fn trace_frame(sig: u32, old_sp: usize, frame: usize, rax: u64) {
+        extern "C" { fn arch_serial_putc(c: u8); }
+        fn put(s: &str) { for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } } }
+        fn hex(mut v: u64) {
+            put("0x");
+            if v == 0 { put("0"); return; }
+            let mut d = [0u8; 16];
+            let mut n = 0;
+            while v > 0 { d[n] = b"0123456789abcdef"[(v & 0xf) as usize]; n += 1; v >>= 4; }
+            for i in (0..n).rev() { unsafe { arch_serial_putc(d[i]); } }
+        }
+        put("[SIGFRAME] sig="); hex(sig as u64);
+        put(" rsp=");           hex(old_sp as u64);
+        put(" frame=");         hex(frame as u64);
+        put(" gap=");           hex(old_sp.saturating_sub(frame) as u64);
+        put(" saved_rax=");     hex(rax);
+        put("\n");
+    }
+
     /// Write an x86-64 `rt_sigframe` onto the user stack and redirect the
     /// kernel's `UserFrame` to invoke `handler(sig, &siginfo, &ucontext)`.
     ///
@@ -658,8 +687,27 @@ mod x86_64 {
         // Compute new SP below the current user SP. The handler is entered
         // as if `call handler` had just executed (rsp points at pretcode),
         // so rsp % 16 must equal 8, not 0.
+        //
+        // RED ZONE: the x86-64 System V ABI reserves the 128 bytes below rsp
+        // for the interrupted function's own use — leaf functions keep live
+        // locals and spills there without adjusting rsp, so that memory is not
+        // dead, it is in use. Building the signal frame at rsp therefore
+        // overwrites up to 128 bytes of live user data every time a signal is
+        // delivered outside an alt-stack. Linux's `get_sigframe()` subtracts
+        // the red zone for exactly this reason; we did not, which is why
+        // x86-64 saw intermittent user-mode faults through corrupted pointers
+        // in signal-heavy workloads (a shell reaping a pipeline takes a
+        // SIGCHLD per member) while AArch64 — which has no red zone — never
+        // did. `SA_ONSTACK` delivery onto a *fresh* alt-stack needs no such
+        // reservation, but sigframe_base_sp() also returns the current rsp for
+        // the nested-signal case, so subtract unconditionally: 128 wasted
+        // bytes on an alt-stack is harmless, skipping them is not.
+        const RED_ZONE: usize = 128;
         let old_sp = user_frame.rsp as usize;
-        let base_sp = super::sigframe_base_sp(old_sp, action_flags);
+        let base_sp = match super::sigframe_base_sp(old_sp, action_flags).checked_sub(RED_ZONE) {
+            Some(p) => p,
+            None    => return false,
+        };
         let aligned = match base_sp.checked_sub(SIGFRAME_SIZE) {
             Some(p) => p & !15usize,
             None    => return false,
@@ -719,6 +767,8 @@ mod x86_64 {
         };
         if !ok { return false; }
 
+        if SIGFRAME_TRACE { trace_frame(sig, old_sp, new_sp, user_frame.rax); }
+
         // Redirect UserFrame to the signal handler.
         // x86-64 signal calling convention (matches Linux):
         //   rdi = signum, rsi = &siginfo, rdx = &ucontext,
@@ -729,6 +779,11 @@ mod x86_64 {
         user_frame.rdx    = (new_sp + UC_OFFSET) as u64;
         user_frame.rip    = handler as u64;
         user_frame.rsp    = new_sp as u64;
+        // rax = 0 on handler entry, exactly as Linux's setup_rt_frame does:
+        // in the variadic ABI al carries the number of vector registers used,
+        // so a handler declared without a prototype reads it. The real rax was
+        // captured into uc_mcontext.gregs above and comes back on sigreturn.
+        user_frame.rax    = 0;
 
         true
     }

@@ -274,26 +274,33 @@ syscall_entry:
     // 7. Clean up stack args.
     add   rsp, 24
 
-    // 7b. Check for and deliver pending signals. RSP is now back at the
-    // UserFrame base (the same value passed as frame_ptr above), and
-    // check_and_deliver_signals may redirect rip/rsp/regs in place — the
-    // pops below re-read everything from this same memory, so any edits
-    // take effect automatically.
+    // 7b. Publish syscall_dispatch's return value into the UserFrame's rax
+    // slot ([rsp+96]; see the push order in step 4) BEFORE anything else can
+    // look at the frame.
     //
-    // rax holds syscall_dispatch's return value and must survive this call:
-    // step 8 below restores it via the live register (the "skip rax" pop),
-    // not by re-reading the stack, and rax is caller-saved so a plain call
-    // would clobber it. Stash it in rbx (callee-saved, and about to be
-    // overwritten by its own pop below regardless of what we put there now).
-    mov   rbx, rax
+    // This ordering is load-bearing, not tidiness. check_and_deliver_signals
+    // may build a signal frame, and that frame snapshots user_frame.rax as
+    // the value to restore on rt_sigreturn. The return value used to live
+    // only in a live register (stashed in rbx across the call, with step 8
+    // deliberately skipping the rax slot), so the frame still held the value
+    // saved on entry — the *syscall number*. Any syscall interrupted by a
+    // handled signal therefore returned its own number to userspace once the
+    // handler returned. musl's clock_nanosleep negates the raw result, so
+    // std::thread::sleep saw -230 (SYS_clock_nanosleep = 230) where it
+    // asserts EINTR; a blocked poll/read/wait4 came back as a bogus count or
+    // pid, which is how a shell reaping a pipeline ended up dereferencing
+    // garbage. AArch64 never had this: its trap stub does the equivalent
+    // `str x0, [sp, #0]` before calling check_and_deliver_signals, which is
+    // also exactly what sys_rt_sigreturn's "the asm stores this function's
+    // return value into the frame's x0/rax slot" comment already assumed.
+    mov   [rsp + 96], rax
     mov   rdi, rsp
     call  check_and_deliver_signals
     // Re-establish this CPU's user-mode GS invariant (migration-proof
-    // replacement for the old exit swapgs — see restore_user_gs).  Must run
-    // while the return value is still stashed in rbx: it clobbers
-    // caller-saved registers.
+    // replacement for the old exit swapgs — see restore_user_gs). Free to
+    // clobber caller-saved registers now: the return value lives in the
+    // frame and step 8 pops it back.
     call  restore_user_gs
-    mov   rax, rbx
 
     // 8. Restore user registers.
     pop   r15
@@ -308,7 +315,8 @@ syscall_entry:
     pop   rdx
     pop   rsi
     pop   rdi
-    add   rsp, 8          // skip rax (it's the return value)
+    pop   rax             // return value, published to the frame in step 7b
+                          // (was: "add rsp, 8 // skip rax" — see step 7b)
     pop   rcx             // restore user RIP
     pop   r11             // restore user RFLAGS
 
