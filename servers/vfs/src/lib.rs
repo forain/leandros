@@ -114,6 +114,13 @@ pub const VFS_FSYNC:           u64 = 0x39;
 /// sync() → 0. Flush *every* mounted filesystem. Takes no argument and cannot
 /// fail, matching `sync(2)`.
 pub const VFS_SYNC:            u64 = 0x3A;
+/// chmod/chown that act on a symlink itself rather than its target — the
+/// `AT_SYMLINK_NOFOLLOW` forms of fchmodat/fchownat, and `lchown(2)`.
+/// Separate tags rather than a flag argument, matching how VFS_LSTAT already
+/// distinguishes itself from VFS_STAT: the follow decision has to be made in
+/// `path_args`, above the handlers, so it must be visible in the opcode.
+pub const VFS_LCHMOD:          u64 = 0x3B;
+pub const VFS_LCHOWN:          u64 = 0x3C;
 
 
 /// Readiness bitmask, numerically identical to Linux's POLLIN/POLLOUT/POLLERR/
@@ -966,9 +973,19 @@ pub fn is_directory(path_ptr: usize) -> bool {
 /// set of operations that act on the link itself rather than its target —
 /// getting `VFS_UNLINK` into the wrong group is what makes `rm symlink`
 /// delete the *target*, so this table is the load-bearing part.
-fn path_args(tag: u64) -> (Option<(usize, bool)>, Option<(usize, bool)>) {
+///
+/// Takes the whole message because for `VFS_OPEN` the answer is not a property
+/// of the opcode at all: `O_NOFOLLOW` moves it from "follow" to "don't", and it
+/// lives in the flags argument.
+fn path_args(msg: &Message) -> (Option<(usize, bool)>, Option<(usize, bool)>) {
+    let tag = msg.tag;
     match tag {
-        VFS_OPEN | VFS_STAT | VFS_STATFS | VFS_CHMOD | VFS_CHOWN => (Some((0, true)), None),
+        // arg1 is the open flags word.
+        VFS_OPEN => (Some((0, arg(msg, 1) as u32 & O_NOFOLLOW == 0)), None),
+        // The l-prefixed variants exist for the same reason VFS_LSTAT does:
+        // AT_SYMLINK_NOFOLLOW makes the caller mean the link, not its target.
+        VFS_LCHMOD | VFS_LCHOWN                                 => (Some((0, false)), None),
+        VFS_STAT | VFS_STATFS | VFS_CHMOD | VFS_CHOWN           => (Some((0, true)), None),
         VFS_UNLINK | VFS_RMDIR | VFS_MKDIR | VFS_MKNOD
         | VFS_LSTAT | VFS_READLINK                              => (Some((0, false)), None),
         VFS_RENAME | VFS_LINK                                   => (Some((0, false)), Some((1, false))),
@@ -1020,7 +1037,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
     // frame, and the caller stays blocked in `call_port` for the whole round
     // trip, so they outlive every server that reads them (the same lifetime
     // argument `KPath` makes on the kernel side).
-    let (p0, p1) = path_args(msg.tag);
+    let (p0, p1) = path_args(&msg);
     if p0.is_some() || p1.is_some() {
         let mut b0 = [0u8; 257];
         let mut b1 = [0u8; 257];
@@ -1077,10 +1094,13 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
                                               arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_RMDIR            => handle_rmdir(arg(msg,0) as usize),
         VFS_FLOCK            => handle_flock(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
-        VFS_CHMOD            => handle_chmod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        VFS_CHMOD            => handle_chmod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, true),
+        VFS_LCHMOD           => handle_chmod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, false),
         VFS_FCHMOD           => handle_fchmod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         VFS_CHOWN            => handle_chown(caller_pid, arg(msg,0) as usize,
-                                              arg(msg,1) as u32, arg(msg,2) as u32),
+                                              arg(msg,1) as u32, arg(msg,2) as u32, true),
+        VFS_LCHOWN           => handle_chown(caller_pid, arg(msg,0) as usize,
+                                              arg(msg,1) as u32, arg(msg,2) as u32, false),
         VFS_FCHOWN           => handle_fchown(caller_pid, arg(msg,0) as usize,
                                                arg(msg,1) as u32, arg(msg,2) as u32),
         VFS_POLL             => handle_poll(caller_pid, arg(msg,0) as usize),
@@ -1159,6 +1179,10 @@ const O_TRUNC:     u32 = 0x200;
 const O_APPEND:    u32 = 0x400;
 #[allow(dead_code)]
 const O_DIRECTORY: u32 = 0x10000;
+/// Refuse to open a symlink through its target (`ELOOP`) — the flag a
+/// privileged writer uses so a symlink planted in a shared directory cannot
+/// redirect it.
+const O_NOFOLLOW:  u32 = 0x20000;
 /// `O_PATH` — open the file only as a *reference* to a location in the tree.
 /// The descriptor is legal to `fstat`, `dup`, `close` and pass as a `dirfd`,
 /// but carries no read/write access at all, so those must fail EBADF rather
@@ -4152,7 +4176,11 @@ fn handle_rmdir(path_ptr: usize) -> Message {
 // have no mount port and no per-file storage, so they remain EROFS/EPERM
 // rather than the previous silent no-op.
 
-fn handle_chmod(pid: u32, path_ptr: usize, mode: u32) -> Message {
+/// `follow` is false for the `AT_SYMLINK_NOFOLLOW` form. The tmpfs branch needs
+/// no special handling — `path_args` has already resolved (or deliberately not
+/// resolved) the path by the time we get here — but the mounted branch must
+/// forward the distinction, since the server does its own lookup.
+fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
     // tmpfs first: after pivot_root the F2FS mount's prefix is "/", so a
@@ -4176,7 +4204,7 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32) -> Message {
     // worked fine on the same volume.
     if let Some(port) = find_mount_port(raw) {
         let mut proxy = Message::empty();
-        proxy.tag = VFS_CHMOD;
+        proxy.tag = if follow { VFS_CHMOD } else { VFS_LCHMOD };
         proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
         proxy.data[8..16].copy_from_slice(&(mode as u64).to_le_bytes());
         return call_port(port, proxy);
@@ -4210,7 +4238,9 @@ fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
 }
 
 /// `u32::MAX` for `uid`/`gid` means "leave unchanged" (mirrors chown(2)'s `-1`).
-fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32) -> Message {
+/// See `handle_chmod` for what `follow` does — `lchown(2)` is the common
+/// caller of the false case.
+fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32, follow: bool) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
     if let Some(path) = tmpfs_path(raw) {
@@ -4224,7 +4254,7 @@ fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32) -> Message {
     // See handle_chmod: mounted filesystems now persist owner changes too.
     if let Some(port) = find_mount_port(raw) {
         let mut proxy = Message::empty();
-        proxy.tag = VFS_CHOWN;
+        proxy.tag = if follow { VFS_CHOWN } else { VFS_LCHOWN };
         proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
         proxy.data[8..16].copy_from_slice(&(uid as u64).to_le_bytes());
         proxy.data[16..24].copy_from_slice(&(gid as u64).to_le_bytes());

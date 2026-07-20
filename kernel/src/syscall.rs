@@ -1025,7 +1025,7 @@ fn dispatch_inner(
         #[cfg(not(target_arch = "aarch64"))]
         CHOWN  => sys_fchownat(AT_FDCWD, a0, a1, a2, 0),
         #[cfg(not(target_arch = "aarch64"))]
-        LCHOWN => sys_fchownat(AT_FDCWD, a0, a1, a2, 0x100), // AT_SYMLINK_NOFOLLOW
+        LCHOWN => sys_fchownat(AT_FDCWD, a0, a1, a2, AT_SYMLINK_NOFOLLOW),
         // creat(path, mode) == open(path, O_CREAT|O_WRONLY|O_TRUNC, mode).
         // The constant was declared but had no dispatch arm, so the call fell
         // through to the unknown-syscall path and reported ENOSYS.
@@ -4161,7 +4161,6 @@ fn fstatat_into(
     // unresolved, so a symlink reports S_IFLNK rather than whatever it points
     // at. `ls -l` gets its 'l' type character from exactly this, and `rm -r`
     // uses it to avoid descending through a link into a directory.
-    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
     let stat_tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LSTAT } else { vfs::VFS_STAT };
     let smsg = make_vfs_msg(stat_tag, &[path_ptr as u64, statbuf_ptr as u64]);
     if vfs_reply_val(&vfs::handle(&smsg, pid)) >= 0 {
@@ -4310,10 +4309,11 @@ fn sys_fchmod(fd: usize, mode: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_fchmodat(dirfd: usize, path_ptr: usize, mode: usize, _flags: usize) -> isize {
+fn sys_fchmodat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_CHMOD, &[path.ptr() as u64, mode as u64]);
+    let tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LCHMOD } else { vfs::VFS_CHMOD };
+    let msg = make_vfs_msg(tag, &[path.ptr() as u64, mode as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
@@ -4323,10 +4323,11 @@ fn sys_fchown(fd: usize, uid: usize, gid: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, _flags: usize) -> isize {
+fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, flags: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_CHOWN, &[path.ptr() as u64, uid as u64, gid as u64]);
+    let tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LCHOWN } else { vfs::VFS_CHOWN };
+    let msg = make_vfs_msg(tag, &[path.ptr() as u64, uid as u64, gid as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
@@ -4701,6 +4702,10 @@ const KPATH_MAX: usize = 256;
 const AT_FDCWD: usize = -100isize as usize;
 /// `AT_EMPTY_PATH` — operate on `dirfd` itself when the path is "".
 const AT_EMPTY_PATH: usize = 0x1000;
+/// `AT_SYMLINK_NOFOLLOW` — act on a final symlink itself, not its target.
+/// Shared by fstatat, fchmodat and fchownat; it used to be redeclared inside
+/// each of them, which is how the latter two ended up silently ignoring it.
+const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 
 /// A NUL-terminated, cwd-resolved absolute path held in kernel memory.
 ///

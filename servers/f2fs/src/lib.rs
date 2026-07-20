@@ -47,6 +47,12 @@ const O_RDWR:    u64 = 2;
 const O_CREAT:   u64 = 0o100;
 const O_EXCL:    u64 = 0o200;
 const O_TRUNC:   u64 = 0o1000;
+/// Refuse to open a symlink through its target (`ELOOP`). Security-relevant:
+/// it is how a privileged writer avoids being redirected by a symlink an
+/// unprivileged user planted in a shared directory.
+const O_NOFOLLOW:  u64 = 0o400000;
+/// Fail with `ENOTDIR` unless the result is a directory.
+const O_DIRECTORY: u64 = 0o200000;
 
 // ── F2FS on-disk byte-offset constants ────────────────────────────────────────
 
@@ -1401,8 +1407,16 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, _mode: u64) -> Me
 
     let writable = (flags & (O_WRONLY | O_RDWR)) != 0;
     let create   = (flags & O_CREAT) != 0;
+    let nofollow = (flags & O_NOFOLLOW) != 0;
 
-    let ino = resolve_path(ms, rel);
+    // With O_NOFOLLOW the final component must not be traversed, so that a
+    // symlink resolves to *itself* and can then be rejected below. Resolving
+    // first and checking afterwards would already have opened the target.
+    let ino = if nofollow {
+        resolve_path_ex(ms, rel, false)
+    } else {
+        resolve_path(ms, rel)
+    };
 
     let ino = if ino == 0 {
         if !create || !writable { return err_reply(-2); } // ENOENT
@@ -1437,6 +1451,22 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, _mode: u64) -> Me
         }
         ino
     };
+
+    // Reject the two type-conditional flags now that the target is known.
+    // A freshly created file is always a regular file, so neither can fire on
+    // the create path — but checking unconditionally keeps the rule in one
+    // place rather than duplicated into the `else` arm above.
+    {
+        let mode = {
+            let iblkaddr = nat_lookup(ms, ino);
+            let iblk = ms.cache.read(ms.dev, iblkaddr as u64);
+            inode_mode(iblk)
+        };
+        if nofollow && (mode & S_IFMT) == S_IFLNK { return err_reply(-40); } // ELOOP
+        if flags & O_DIRECTORY != 0 && (mode & S_IFMT) != S_IFDIR {
+            return err_reply(-20); // ENOTDIR
+        }
+    }
 
     // Find a free open-file slot
     let slot = match ms.open_files.iter().position(|f| !f.in_use) {
@@ -1862,7 +1892,9 @@ fn handle_link(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
 
 /// chmod(2) via path — follows the final symlink component, same group as
 /// VFS_OPEN/VFS_STAT in the VFS's `path_args()` table.
-fn handle_chmod(ms: &mut MountState, path_ptr: u64, mode: u32) -> Message {
+/// `follow` is false for the AT_SYMLINK_NOFOLLOW form (VFS_LCHMOD), where the
+/// caller means the symlink itself rather than what it points at.
+fn handle_chmod(ms: &mut MountState, path_ptr: u64, mode: u32, follow: bool) -> Message {
     let path_bytes = unsafe {
         let ptr = path_ptr as *const u8;
         let mut len = 0;
@@ -1873,7 +1905,7 @@ fn handle_chmod(ms: &mut MountState, path_ptr: u64, mode: u32) -> Message {
         Some(r) => r,
         None    => return err_reply(-2), // ENOENT
     };
-    let ino = resolve_path(ms, rel);
+    let ino = resolve_path_ex(ms, rel, follow);
     if ino == 0 { return err_reply(-2); }
     chmod_inode(ms, ino, mode)
 }
@@ -1910,13 +1942,9 @@ fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32) -> Message {
 /// mirrors chown(2)'s `-1` and matches apply_chown's tmpfs handling in
 /// servers/vfs/src/lib.rs.
 ///
-/// NOTE: like VFS_CHMOD, the VFS always follows the final symlink component
-/// for VFS_CHOWN (see path_args()), so this cannot honor AT_SYMLINK_NOFOLLOW
-/// (lchown) — there is no VFS_LCHOWN tag, and upstream of this server
-/// kernel/src/syscall.rs's sys_fchownat() already discards its `flags`
-/// argument before a distinction could even reach the VFS. Fixing that is a
-/// kernel + VFS protocol change, out of this server's scope.
-fn handle_chown(ms: &mut MountState, path_ptr: u64, uid: u32, gid: u32) -> Message {
+/// See `handle_chmod` for `follow`; lchown(2) is the usual false case, and
+/// arrives here as VFS_LCHOWN.
+fn handle_chown(ms: &mut MountState, path_ptr: u64, uid: u32, gid: u32, follow: bool) -> Message {
     let path_bytes = unsafe {
         let ptr = path_ptr as *const u8;
         let mut len = 0;
@@ -1927,7 +1955,7 @@ fn handle_chown(ms: &mut MountState, path_ptr: u64, uid: u32, gid: u32) -> Messa
         Some(r) => r,
         None    => return err_reply(-2),
     };
-    let ino = resolve_path(ms, rel);
+    let ino = resolve_path_ex(ms, rel, follow);
     if ino == 0 { return err_reply(-2); }
     chown_inode(ms, ino, uid, gid)
 }
@@ -2162,10 +2190,12 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message) -> Message {
         VFS_FD_PATH    => handle_fd_path(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_READLINK   => handle_readlink(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_LINK       => handle_link(ms, arg(msg,0), arg(msg,1)),
-        VFS_CHMOD      => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32),
+        VFS_CHMOD      => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, true),
+        VFS_LCHMOD     => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, false),
         VFS_FCHMOD     => handle_fchmod(ms, arg(msg,0), arg(msg,1) as u32),
         VFS_FSYNC      => handle_fsync(ms),
-        VFS_CHOWN      => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32),
+        VFS_CHOWN      => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, true),
+        VFS_LCHOWN     => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, false),
         VFS_FCHOWN     => handle_fchown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32),
         _              => err_reply(-22), // EINVAL
     }
