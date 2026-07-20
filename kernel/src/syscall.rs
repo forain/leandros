@@ -565,6 +565,7 @@ mod nr {
     pub const DUP2:           usize = 33;
     pub const MKDIRAT:        usize = 258;
     pub const MKDIR:          usize = 83;
+    pub const RMDIR:          usize = 84;
     pub const UNLINK:         usize = 87;
     pub const UNLINKAT:       usize = 263;
     pub const RENAME:         usize = 82;
@@ -978,21 +979,52 @@ fn dispatch_inner(
         TRUNCATE    => sys_truncate(a0, a1),
         FTRUNCATE   => sys_ftruncate(a0, a1),
         FACCESSAT   => sys_faccessat(a0, a1, a2, a3),
-        STATFS | FSTATFS => sys_statfs(a0, a1),
+        STATFS  => sys_statfs(a0, a1),
+        FSTATFS => sys_fstatfs(a0, a1),
         FSYNC | FDATASYNC => 0,
         FALLOCATE   => 0, // advisory pre-allocation; no-op is valid
         UTIMENSAT   => 0,
-        MKNODAT     => -30,
+        MKNODAT     => sys_mknodat(a0, a1, a2, a3),
         #[cfg(not(target_arch = "aarch64"))]
-        UNLINK => sys_unlinkat(0, a0, 0),
+        UNLINK => sys_unlinkat(AT_FDCWD, a0, 0),
         #[cfg(not(target_arch = "aarch64"))]
-        MKDIR  => sys_mkdirat(0, a0, a1),
+        MKDIR  => sys_mkdirat(AT_FDCWD, a0, a1),
+        // x86-64's legacy rmdir(2) had no dispatch arm at all, so it fell
+        // through to the unknown-syscall path. AT_REMOVEDIR (0x200) is what
+        // makes sys_unlinkat pick VFS_RMDIR over VFS_UNLINK.
+        #[cfg(not(target_arch = "aarch64"))]
+        RMDIR  => sys_unlinkat(AT_FDCWD, a0, 0x200),
         #[cfg(not(target_arch = "aarch64"))]
         RENAME => sys_renameat(a0, a1),
         #[cfg(not(target_arch = "aarch64"))]
-        LINK | SYMLINK | CHMOD | CHOWN | LCHOWN | MKNOD => -30,
+        LINK    => sys_linkat(AT_FDCWD, a0, AT_FDCWD, a1, 0),
         #[cfg(not(target_arch = "aarch64"))]
-        ACCESS      => sys_faccessat(0, a0, a1, 0),
+        SYMLINK => sys_symlinkat(a0, AT_FDCWD, a1),
+        // x86-64's legacy chmod(2)/chown(2)/lchown(2) used to be a blanket
+        // -EROFS. AArch64 has no such syscall numbers at all — libc there
+        // always emits fchmodat/fchownat, which have worked all along — so
+        // this was a pure x86-64 regression: `chmod 600 /tmp/f` reported
+        // "Read-only file system" on a writable tmpfs, and `install -m` failed
+        // with it. They are exactly their *at forms with AT_FDCWD; lchown
+        // additionally must not follow a final symlink (AT_SYMLINK_NOFOLLOW).
+        #[cfg(not(target_arch = "aarch64"))]
+        CHMOD  => sys_fchmodat(AT_FDCWD, a0, a1, 0),
+        #[cfg(not(target_arch = "aarch64"))]
+        CHOWN  => sys_fchownat(AT_FDCWD, a0, a1, a2, 0),
+        #[cfg(not(target_arch = "aarch64"))]
+        LCHOWN => sys_fchownat(AT_FDCWD, a0, a1, a2, 0x100), // AT_SYMLINK_NOFOLLOW
+        // creat(path, mode) == open(path, O_CREAT|O_WRONLY|O_TRUNC, mode).
+        // The constant was declared but had no dispatch arm, so the call fell
+        // through to the unknown-syscall path and reported ENOSYS.
+        #[cfg(not(target_arch = "aarch64"))]
+        CREAT  => sys_openat(AT_FDCWD, a0, 0o101 | 0o1000, a1),
+        // AArch64 has no legacy mknod(2) — MKNOD and MKNODAT share syscall
+        // number 33 there, so the MKNODAT arm above already covers it and a
+        // second arm for the same value would be a duplicate match pattern.
+        #[cfg(not(target_arch = "aarch64"))]
+        MKNOD => sys_mknodat(AT_FDCWD, a0, a1, a2),
+        #[cfg(not(target_arch = "aarch64"))]
+        ACCESS      => sys_faccessat(AT_FDCWD, a0, a1, 0),
 
         MOUNT       => sys_mount(a0, a1, a2, a3, a4),
         UMOUNT2     => sys_umount2(a0, a1),
