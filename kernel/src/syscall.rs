@@ -1329,7 +1329,19 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
 
     // Normal file-backed mmap follows...
     // Step 1: seek the fd to the requested offset.
-    if off != 0 {
+    //
+    // This must happen even when `off == 0`: mmap(2) reads from the file
+    // *offset argument*, never from the descriptor's current position, and the
+    // two routinely differ. The classic case is write-then-map — tempfile(3)
+    // copies stdin into a temp file (leaving the fd at EOF) and then maps it at
+    // offset 0; skipping the seek here read from EOF and produced a mapping of
+    // zeroes. Nor may mmap disturb the position it found, so it is restored
+    // below once the data has been copied in.
+    let saved_pos = {
+        let cur_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, 0, 1 /* SEEK_CUR */]);
+        vfs_reply_val(&vfs::handle(&cur_msg, pid))
+    };
+    {
         let seek_msg = make_vfs_msg(vfs::VFS_LSEEK,
             &[fd as u64, off as u64, 0 /* SEEK_SET */]);
         let r = vfs_reply_val(&vfs::handle(&seek_msg, pid));
@@ -1356,9 +1368,30 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
 
     // Step 3: read file data into the physical pages.
     // We read up to `len` bytes; if the file is shorter, the rest stays zero.
+    // Loop rather than issuing one big read: several VFS read paths (tmpfs and
+    // the pipe ring among them) cap a single reply at 4 KiB, so a one-shot read
+    // silently left everything past the first page zeroed in any mapping larger
+    // than that. Short reads are normal here, not EOF.
     let hhdm_ptr = mm::phys_to_virt(phys) as *mut u8;
-    let read_msg = make_vfs_msg(vfs::VFS_READ, &[fd as u64, hhdm_ptr as u64, len as u64]);
-    let n = vfs_reply_val(&vfs::handle(&read_msg, pid));
+    let mut filled: usize = 0;
+    let mut n: isize = 0;
+    while filled < len {
+        let read_msg = make_vfs_msg(vfs::VFS_READ,
+            &[fd as u64, (hhdm_ptr as usize + filled) as u64, (len - filled) as u64]);
+        let r = vfs_reply_val(&vfs::handle(&read_msg, pid));
+        if r < 0 { n = r; break; }
+        if r == 0 { break; } // genuine EOF; the rest of the mapping stays zero
+        filled += r as usize;
+    }
+    if n >= 0 { n = filled as isize; }
+
+    // Restore the descriptor's original file position — mmap(2) leaves it alone.
+    if saved_pos >= 0 {
+        let restore = make_vfs_msg(vfs::VFS_LSEEK,
+            &[fd as u64, saved_pos as u64, 0 /* SEEK_SET */]);
+        let _ = vfs_reply_val(&vfs::handle(&restore, pid));
+    }
+
     if n < 0 {
         // Read failed — unmap the eagerly-allocated VMA and return error.
         with_current_address_space_mut(|as_| as_.unmap(virt, len));
