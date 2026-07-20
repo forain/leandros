@@ -512,6 +512,36 @@ pub fn current_cwd(buf: *mut u8, max_len: usize) -> isize {
     -1
 }
 
+/// Copy `pid`'s chroot root (host-absolute) into `buf`. Returns its length, or
+/// 0 when the task is not chrooted (`root_len <= 1`) — the caller's cue to skip
+/// all root handling. `-1` if there is no such task.
+pub fn root_of(pid: Pid, buf: *mut u8, max_len: usize) -> isize {
+    if let Some(t) = RUN_QUEUE.lock().find_pid(pid) {
+        if t.root_len <= 1 { return 0; }
+        let len = t.root_len.min(max_len);
+        unsafe { core::ptr::copy_nonoverlapping(t.root.as_ptr(), buf, len); }
+        return len as isize;
+    }
+    -1
+}
+
+/// Root of the calling task — the common case, used by kernel path resolution.
+pub fn current_root(buf: *mut u8, max_len: usize) -> isize {
+    root_of(current_pid(), buf, max_len)
+}
+
+/// Establish `path` (host-absolute) as the calling task's chroot root.
+pub fn set_root(path: &[u8]) -> bool {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        let len = path.len().min(127);
+        t.root[..len].copy_from_slice(&path[..len]);
+        t.root_len = len;
+        return true;
+    }
+    false
+}
+
 /// Which tasks a nice query/update applies to — the `which`/`who` pair of
 /// `getpriority(2)`/`setpriority(2)`, already resolved against the caller.
 ///

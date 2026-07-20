@@ -208,6 +208,12 @@ pub struct Task {
     /// Current working directory (fixed-size buffer for Phase 1).
     pub cwd:     [u8; 128],
     pub cwd_len: usize,
+    /// chroot root, host-absolute. `root_len <= 1` means "not chrooted" (the
+    /// filesystem root is "/"), which is the state of every task until an
+    /// explicit `chroot(2)`. Storing it host-absolute lets the non-chrooted
+    /// path skip every root-related step and behave exactly as before.
+    pub root:     [u8; 128],
+    pub root_len: usize,
     /// File-creation mask (POSIX umask).
     pub umask:   u32,
 
@@ -319,6 +325,8 @@ impl Task {
             tls_base: 0,
             cwd: [0; 128],
             cwd_len: 1, // Default to "/"
+            root: [0; 128],
+            root_len: 0, // 0 = not chrooted
             umask: 0o022,
             altstack_sp: 0,
             altstack_size: 0,
@@ -602,6 +610,11 @@ impl Task {
         let cwd_len_ptr = (dest as usize + core::mem::offset_of!(Task, cwd_len)) as *mut usize;
         core::ptr::write_volatile(cwd_len_ptr, 1);
 
+        // `dest` may be uninitialised memory; root_len must be a definite 0 so
+        // a kernel task never reads as spuriously chrooted.
+        let root_len_ptr = (dest as usize + core::mem::offset_of!(Task, root_len)) as *mut usize;
+        core::ptr::write_volatile(root_len_ptr, 0);
+
         let msg2 = b"Task::new_kernel_inplace: completed\r\n";
         for &b in msg2 { arch_serial_putc(b); }
     }
@@ -656,6 +669,8 @@ impl Task {
             tls_base: 0,
             cwd: [0; 128],
             cwd_len: 1, // Default to "/"
+            root: [0; 128],
+            root_len: 0, // 0 = not chrooted
             umask: 0o022,
             altstack_sp: 0,
             altstack_size: 0,

@@ -348,6 +348,7 @@ mod nr {
     // Process management
     pub const CHDIR:          usize = 49;
     pub const FCHDIR:         usize = 50;
+    pub const CHROOT:         usize = 51;
     pub const GETCWD:         usize = 17;
     pub const SETPGID:        usize = 154;
     pub const GETPGID:        usize = 155;
@@ -551,6 +552,7 @@ mod nr {
     // Process management
     pub const CHDIR:          usize = 80;
     pub const FCHDIR:         usize = 81;
+    pub const CHROOT:         usize = 161;
     pub const GETCWD:         usize = 79;
     pub const SETPGID:        usize = 109;
     pub const GETPGID:        usize = 121;
@@ -962,6 +964,7 @@ fn dispatch_inner(
         // Process management
         CHDIR       => sys_chdir(a0),
         FCHDIR      => sys_fchdir(a0),
+        CHROOT      => sys_chroot(a0),
         GETCWD      => sys_getcwd(a0, a1),
         SETPGID     => sys_setpgid(a0, a1),
         GETPGID     => sys_getpgid(a0),
@@ -4525,16 +4528,71 @@ fn sys_getcwd(buf_ptr: usize, size: usize) -> isize {
     let mut tmp = [0u8; 256];
     let res = sched::current_cwd(tmp.as_mut_ptr(), 256);
     if res <= 0 { return -34; } // ERANGE or error
-    let len = res as usize;
+    let mut len = res as usize;
+    let mut start = 0usize;
 
-    // len is the number of bytes in CWD. If len >= size, it won't fit (+ NUL).
-    if len >= size { return -34; } // ERANGE
-
-    unsafe {
-        core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf_ptr as *mut u8, len);
-        *(buf_ptr as *mut u8).add(len) = 0; // NUL terminate
+    // Strip the jail root so a chrooted process sees itself at "/". The cwd is
+    // stored host-absolute and always under the root, so this is a prefix trim;
+    // when the cwd *is* the root, the remainder is empty and reads as "/".
+    let mut root = [0u8; 256];
+    let rn = sched::current_root(root.as_mut_ptr(), 256);
+    if rn > 1 {
+        let rn = (rn as usize).min(255);
+        if tmp[..len].starts_with(&root[..rn]) {
+            start = rn;
+            len -= rn;
+        }
     }
-    (len + 1) as isize
+    // Empty remainder (cwd == root) → "/".
+    let (src, srclen): (&[u8], usize) = if len == 0 { (b"/", 1) } else { (&tmp[start..start + len], len) };
+
+    if srclen >= size { return -34; } // ERANGE
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), buf_ptr as *mut u8, srclen);
+        *(buf_ptr as *mut u8).add(srclen) = 0; // NUL terminate
+    }
+    (srclen + 1) as isize
+}
+
+/// chroot(path) — confine the calling process to `path` as its filesystem root.
+///
+/// Requires euid 0, like Linux. `path` is resolved through the normal machinery,
+/// so a chroot issued *inside* an existing jail composes correctly (the new
+/// root is itself confined to the old one). The target must be a directory.
+///
+/// POSIX leaves cwd unchanged across chroot, but a cwd left pointing outside the
+/// new root is the classic escape (`chdir("..")` walks straight out). Since the
+/// cwd is stored host-absolute, we reset it to the new root unless it already
+/// lies within — closing that hole while still satisfying "cwd is somewhere
+/// under the root".
+fn sys_chroot(path_ptr: usize) -> isize {
+    if sched::current_euid() != 0 { return -1; } // EPERM
+    let path = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
+
+    // Must exist and be a directory.
+    const S_IFMT: u32 = 0o170000;
+    const S_IFDIR: u32 = 0o040000;
+    let mut stat_buf = [0u8; STAT_SIZE];
+    let smsg = make_vfs_msg(vfs::VFS_STAT, &[path.ptr() as u64, stat_buf.as_mut_ptr() as u64]);
+    if vfs_reply_val(&vfs::handle(&smsg, current_pid())) < 0 { return -2; } // ENOENT
+    if vfs::read_stat_mode(stat_buf.as_ptr() as usize) & S_IFMT != S_IFDIR { return -20; } // ENOTDIR
+
+    let new_root = path.bytes();
+    // Decide whether the current cwd survives: keep it only if it is at or below
+    // the new root, otherwise re-anchor at the root.
+    let mut cwd = [0u8; 256];
+    let cn = sched::current_cwd(cwd.as_mut_ptr(), 256);
+    let cwd_under_root = cn > 0 && {
+        let cn = (cn as usize).min(255);
+        cwd[..cn].starts_with(new_root)
+            && (new_root == b"/" || cn == new_root.len() || cwd.get(new_root.len()) == Some(&b'/'))
+    };
+
+    if !sched::set_root(new_root) { return -3; } // ESRCH
+    if !cwd_under_root {
+        sched::set_cwd(new_root);
+    }
+    0
 }
 
 fn sys_setpgid(pid_raw: usize, pgid_raw: usize) -> isize {
@@ -4908,13 +4966,31 @@ fn resolve_path(path: &[u8], out: &mut [u8; 256]) -> usize {
         path
     };
 
+    // Read the caller's chroot root (host-absolute). `rlen == 0` means "not
+    // chrooted" — the overwhelmingly common case, which takes the exact same
+    // path it always did. Everything below only diverges when `rlen > 1`.
+    let mut root_buf = [0u8; 256];
+    let rlen = {
+        let n = sched::current_root(root_buf.as_mut_ptr(), 256);
+        if n > 0 { (n as usize).min(255) } else { 0 }
+    };
+    // `..` may never climb above this offset. For a jailed task it is the end
+    // of the root prefix; otherwise it is 1 (the real "/"), unchanged.
+    let floor = if rlen > 1 { rlen } else { 1 };
+
     let mut resolved = [0u8; 256];
     let mut res_len;
 
     // 1. Initialise base path (absolute vs relative).
     if !path_to_process.is_empty() && path_to_process[0] == b'/' {
-        resolved[0] = b'/';
-        res_len = 1;
+        if rlen > 1 {
+            // An absolute path is relative to the jail root, so start there.
+            resolved[..rlen].copy_from_slice(&root_buf[..rlen]);
+            res_len = rlen;
+        } else {
+            resolved[0] = b'/';
+            res_len = 1;
+        }
     } else {
         // Use a local buffer to get CWD
         let mut cwd_buf = [0u8; 256];
@@ -4935,12 +5011,16 @@ fn resolve_path(path: &[u8], out: &mut [u8; 256]) -> usize {
         if component.is_empty() || component == b"." {
             continue;
         } else if component == b".." {
-            if res_len > 1 {
+            if res_len > floor {
                 let mut last = res_len - 1;
                 while last > 0 && resolved[last] != b'/' {
                     last -= 1;
                 }
-                res_len = if last == 0 { 1 } else { last };
+                // Clamp at the jail root: `..` from the top of the jail stays
+                // put, which is what makes the chroot a boundary rather than a
+                // suggestion. For a non-chrooted task `floor == 1`, so this is
+                // byte-for-byte the old behaviour.
+                res_len = if last < floor { floor } else if last == 0 { 1 } else { last };
             }
         } else {
             // Append with separator if not at root.

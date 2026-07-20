@@ -1430,16 +1430,22 @@ fn dir_remove_entry(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> bool {
 /// and "." components and resolving ".." lexically. Splicing a symlink body
 /// back into a path reintroduces all three, so the walk re-normalises after
 /// every hop.
-fn normalize_volume_path(src: &[u8], out: &mut [u8; 256]) -> usize {
+/// Lexically normalise a volume-relative path. `floor` is the byte offset below
+/// which `..` may not climb — 1 (the volume root) normally, or the length of a
+/// chroot jail's volume-relative root when confining a jailed symlink, so that
+/// an absolute link target cannot use `..` to escape the jail.
+fn normalize_volume_path_floor(src: &[u8], out: &mut [u8; 256], floor: usize) -> usize {
+    let floor = floor.max(1);
     let mut len = 1usize;
     out[0] = b'/';
     for comp in src.split(|&b| b == b'/') {
         if comp.is_empty() || comp == b"." { continue; }
         if comp == b".." {
-            if len > 1 {
+            if len > floor {
                 let mut last = len - 1;
                 while last > 0 && out[last] != b'/' { last -= 1; }
-                len = if last == 0 { 1 } else { last };
+                let clamped = if last == 0 { 1 } else { last };
+                len = if clamped < floor { floor } else { clamped };
             }
             continue;
         }
@@ -1449,6 +1455,32 @@ fn normalize_volume_path(src: &[u8], out: &mut [u8; 256]) -> usize {
         len += n;
     }
     len
+}
+
+fn normalize_volume_path(src: &[u8], out: &mut [u8; 256]) -> usize {
+    normalize_volume_path_floor(src, out, 1)
+}
+
+/// The calling task's chroot root expressed in this volume's coordinates, or an
+/// empty slice when the task is not chrooted or its jail lies on another mount.
+///
+/// f2fs resolves paths in volume-relative space (the mount prefix is already
+/// stripped), so to confine a jailed symlink we need the jail root in the same
+/// space. Runs in the caller's context (synchronous IPC), so `sched::current_root`
+/// names the right task without any protocol change.
+fn caller_jail_rel(ms: &MountState, out: &mut [u8; 128]) -> usize {
+    let mut host = [0u8; 256];
+    let n = sched::current_root(host.as_mut_ptr(), 256);
+    if n <= 1 { return 0; }
+    let n = (n as usize).min(255);
+    match get_relative_path(ms, &host[..n]) {
+        Some(rel) if rel.len() > 1 => {
+            let take = rel.len().min(128);
+            out[..take].copy_from_slice(&rel[..take]);
+            take
+        }
+        _ => 0, // jail is "/" of this volume, or on another mount → no prefix
+    }
 }
 
 /// Read a symlink inode's body (the target path) into `out`. Returns 0 for an
@@ -1485,8 +1517,15 @@ fn resolve_path(ms: &mut MountState, path: &[u8]) -> u32 {
 /// ENOENT rather than crossing over. Links the other way (a tmpfs symlink
 /// naming an f2fs path) do work, because the VFS re-routes the resolved path.
 fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 {
+    // Jail root in this volume's coordinates (empty = not confined here). An
+    // absolute symlink target must re-anchor here, not at the volume root, or
+    // a link inside a jail that sits below the mount point can climb out.
+    let mut jail = [0u8; 128];
+    let jlen = caller_jail_rel(ms, &mut jail);
+    let floor = if jlen > 1 { jlen } else { 1 };
+
     let mut buf = [0u8; 256];
-    let mut len = normalize_volume_path(path, &mut buf);
+    let mut len = normalize_volume_path_floor(path, &mut buf, floor);
     let mut hops = 0u32;
 
     'restart: loop {
@@ -1524,6 +1563,10 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
                     *n += take;
                 };
                 if target[0] == b'/' {
+                    // Absolute target: re-anchor at the jail root so it cannot
+                    // reach volume paths above the jail. Unjailed, jlen == 0 and
+                    // this is the old verbatim behaviour.
+                    if jlen > 1 { push(&jail[..jlen], &mut n); }
                     push(&target[..tlen], &mut n);
                 } else {
                     push(&buf[..comp_start], &mut n);
@@ -1533,7 +1576,7 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
                 push(&buf[comp_end..len], &mut n);
                 drop(push);
 
-                len = normalize_volume_path(&spliced[..n], &mut buf);
+                len = normalize_volume_path_floor(&spliced[..n], &mut buf, floor);
                 continue 'restart;
             }
 
