@@ -177,6 +177,43 @@ def write_nat_entry(image, ino, blk_addr):
     w32(image, o + 1, ino)
     w32(image, o + 5, blk_addr)
 
+def coreutils_command_names(coreutils_dir):
+    """The exact set of commands the coreutils multicall binary answers to.
+
+    Derived from upstream's own feature graph rather than a listing of
+    src/uu, so it stays in step with what build-all.sh actually compiled.
+    Listing the directory instead would install names the binary cannot
+    dispatch (chcon and runcon are SELinux-only and not in the musl set) plus
+    checksum_common, which is a shared module rather than a command.
+
+    Must mirror build_coreutils in build-all.sh: it builds
+    --features feat_os_unix_musl, which is upstream's musl set and already
+    excludes stdbuf (that util needs a cdylib, which a static musl target
+    cannot produce).
+    """
+    import tomllib
+
+    with open(os.path.join(coreutils_dir, "Cargo.toml"), "rb") as f:
+        features = tomllib.load(f)["features"]
+
+    visited = set()
+    def expand(name):
+        if name in visited:
+            return
+        visited.add(name)
+        for entry in features.get(name, []):
+            expand(entry.split("/")[0].rstrip("?"))
+
+    expand("feat_os_unix_musl")
+    # Intersect with src/uu so the feature-graph bookkeeping drops out and only
+    # real command names survive: the feat_* group names, and dependency
+    # aliases like uu_test (which backs the `test` feature — that one has to be
+    # matched on the feature name, since its leaf is the alias, not `test`).
+    uu_dir = os.path.join(coreutils_dir, "src", "uu")
+    available = set(os.listdir(uu_dir))
+    return sorted(visited & available)
+
+
 def main():
     if len(sys.argv) < 3:
         print("Usage: mkfs-f2fs-populated.py <output_img> <arch>")
@@ -223,7 +260,17 @@ def main():
     if os.path.exists(p):
         bin_files.append(("brush", p, 0o100755))
 
-        
+    # uutils/coreutils — cat, ls, cp, mv, rm and friends. One multicall binary
+    # that dispatches on argv[0], so every name below is a hardlink to the same
+    # inode (add_files_to_dir dedupes by host path); the content is stored once.
+    coreutils_target = "aarch64-unknown-linux-musl" if arch == "aarch64" else "x86_64-unknown-linux-musl"
+    p = f"../coreutils/target/{coreutils_target}/release/coreutils"
+    if os.path.exists(p):
+        bin_files.append(("coreutils", p, 0o100755))
+        for util in coreutils_command_names("../coreutils"):
+            bin_files.append((util, p, 0o100755))
+
+
     lib_files = []
     relibc_target = "aarch64-unknown-leandros" if arch == "aarch64" else "x86_64-unknown-leandros"
     p = f"../relibc/target/{relibc_target}/release/librelibc.a"

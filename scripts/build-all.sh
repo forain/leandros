@@ -255,6 +255,45 @@ build_bottom() {
 
 }
 
+# Function to build uutils/coreutils (cat, ls, cp, mv, rm, ...)
+build_coreutils() {
+    local arch="$1"
+    echo "🧰 Building $arch coreutils..."
+    local coreutils_dir="$ROOT_DIR/../coreutils"
+    if [[ ! -d "$coreutils_dir" ]]; then
+        echo "⚠️  coreutils source not found at $coreutils_dir, skipping"
+        return 0
+    fi
+    local target_triple
+    if [[ "$arch" == "aarch64" ]]; then
+        target_triple="aarch64-unknown-linux-musl"
+    else
+        target_triple="x86_64-unknown-linux-musl"
+    fi
+    local cc_var="CC_${target_triple//-/_}"
+    local ar_var="AR_${target_triple//-/_}"
+    (
+        cd "$coreutils_dir" || exit 1
+        # feat_os_unix_musl rather than the usual `unix`: it is upstream's own
+        # musl set, which drops stdbuf (that util needs a cdylib, and a static
+        # musl target cannot produce one).
+        #
+        # CC_<triple> points at the cc wrapper, not the linker wrapper, because
+        # blake3 and oniguruma compile C/.S sources through cc-rs, and cc-rs
+        # appends a --target spelling that zig rejects.
+        #
+        # AR_<triple> matters just as much: cc-rs otherwise defaults to the host
+        # macOS ar, whose Mach-O-format archives ld.lld cannot read — the C
+        # objects compile correctly and then every symbol in them comes back
+        # undefined at link time.
+        env "$cc_var=$ROOT_DIR/scripts/cc-$arch-musl.sh" \
+            "$ar_var=$ROOT_DIR/scripts/ar-musl.sh" \
+        RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
+        cargo +nightly build --target "$target_triple" --release \
+            --no-default-features --features feat_os_unix_musl
+    )
+}
+
 # Function to build brush (bash-compatible shell)
 build_brush() {
     local arch="$1"
@@ -316,6 +355,7 @@ for arch in "${ARCHS[@]}"; do
     build_mame "$arch"
     build_bottom "$arch"
     build_brush "$arch"
+    build_coreutils "$arch"
     create_initrd "$arch"
     build_kernel "$arch"
     create_disk_image "$arch" "$LIMINE_DIR"
