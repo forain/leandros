@@ -469,7 +469,15 @@ fn find_mount_port(path: &[u8]) -> Option<u32> {
 
 // ── Pipe ring buffers ─────────────────────────────────────────────────────────
 
-const PIPE_RING_SIZE: usize = 4096;
+/// Capacity of one pipe's ring. Linux's default is 65536; 16K is the
+/// compromise that keeps the static pool affordable (MAX_PIPES * this) while
+/// being large enough for the buffers real programs assume. It matters more
+/// now that a full ring blocks the writer instead of failing the write: brush
+/// stages here-documents by writing the whole body into a pipe *before*
+/// anything reads it, so a body larger than one ring would deadlock rather
+/// than merely error. See the F_SETPIPE_SZ arm in handle_fcntl, which refuses
+/// requests above this so that case fails cleanly instead of wedging.
+const PIPE_RING_SIZE: usize = 16384;
 const MAX_PIPES:      usize = 16;
 
 struct PipeRing {
@@ -1007,10 +1015,15 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
                                           arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_CLOSE        => handle_close(caller_pid, arg(msg,0) as usize),
         VFS_STAT         => handle_stat(arg(msg,0) as usize, arg(msg,1) as usize),
+        VFS_STATFS       => handle_statfs(arg(msg,0) as usize, arg(msg,1) as usize),
+        VFS_FSTATFS      => handle_fstatfs(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_LSEEK        => handle_lseek(caller_pid, arg(msg,0) as usize,
                                           arg(msg,1) as i64, arg(msg,2) as u32),
-        VFS_PIPE         => handle_pipe(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
-        VFS_DUP2         => handle_dup2(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
+        VFS_PIPE         => handle_pipe(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize,
+                                        arg(msg,2) as u32),
+        VFS_FSTAT        => handle_fstat(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
+        VFS_DUP2         => handle_dup2(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize,
+                                        arg(msg,2) as u32 & O_CLOEXEC != 0),
         VFS_FCNTL        => handle_fcntl(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_FORK_DUP     => handle_fork_dup(arg(msg,0) as u32, arg(msg,1) as u32),
@@ -2242,6 +2255,12 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 n += 1;
             }
             if n > 0 { r.seq = r.seq.wrapping_add(1); } // new readable edge for the read end
+            // A full ring must report EAGAIN, never a zero-length write: Rust's
+            // `write_all` maps Ok(0) to ErrorKind::WriteZero and gives up, so a
+            // pipeline moving more than PIPE_RING_SIZE bytes failed outright
+            // instead of applying backpressure. The kernel's sys_write blocks
+            // and retries on EAGAIN for blocking fds (mirroring sys_read).
+            if n == 0 && count > 0 { return err_reply(-11); } // EAGAIN
             val_reply(n as u64)
         }
         VnodeKind::TmpFile { idx, pos, writable } => {
@@ -2464,7 +2483,26 @@ fn handle_lseek(pid: u32, fd: usize, offset: i64, whence: u32) -> Message {
     }
 }
 
-fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize) -> Message {
+/// pipe2(pipefd, flags).
+///
+/// `flags` carries the caller's O_CLOEXEC/O_NONBLOCK (std's `io::pipe()` always
+/// passes O_CLOEXEC). Dropping them used to have two visible consequences:
+/// every pipe end leaked across execve, so a reader waiting on a child's stdout
+/// never saw EOF once the child inherited a stray copy of the write end; and
+/// `fd_nonblock` reported false for a pipe the caller had asked to be
+/// non-blocking.
+///
+/// The two ends are also given real access modes — O_RDONLY on the read end,
+/// O_WRONLY on the write end — because `fcntl(F_GETFL)` is how tokio decides
+/// whether a pipe fd it was handed may be read or written; with both ends
+/// reporting a flat 0 (== O_RDONLY) a `pipe::Sender` was rejected outright with
+/// "not in O_WRONLY or O_RDWR access mode".
+fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize, flags: u32) -> Message {
+    const O_NONBLOCK: u32 = 0o4000;
+    const O_WRONLY:   u32 = 0o1;
+    // Only the two flags pipe2 defines are meaningful here; anything else the
+    // caller passed is not ours to record.
+    let inherited = flags & (O_CLOEXEC | O_NONBLOCK);
     let ring_idx = {
         let mut rings = PIPE_RINGS.lock();
         let mut found = None;
@@ -2482,12 +2520,12 @@ fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize) -> Message {
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-12) };
     let rfd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
     tbl.fds[rfd] = FdEntry { kind: VnodeKind::Pipe { ring: ring_idx, is_write: false },
-                             flags: 0, in_use: true };
+                             flags: inherited, in_use: true };
     let wfd = match tbl.alloc_fd() { Some(f) => f, None => {
         tbl.fds[rfd] = FdEntry::empty(); return err_reply(-24);
     }};
     tbl.fds[wfd] = FdEntry { kind: VnodeKind::Pipe { ring: ring_idx, is_write: true },
-                             flags: 0, in_use: true };
+                             flags: inherited | O_WRONLY, in_use: true };
     unsafe {
         core::ptr::write(rfd_ptr as *mut u32, rfd as u32);
         core::ptr::write(wfd_ptr as *mut u32, wfd as u32);
@@ -2511,7 +2549,21 @@ pub fn fd_redirected(pid: u32, fd: usize) -> bool {
     }
 }
 
-fn handle_dup2(pid: u32, oldfd: usize, newfd: usize) -> Message {
+/// dup2(oldfd, newfd) / dup3(oldfd, newfd, flags).
+///
+/// `cloexec` comes from dup3's flags argument and is the ONLY thing that
+/// decides whether the new descriptor is close-on-exec. POSIX is explicit that
+/// the duplicate does not inherit FD_CLOEXEC from `oldfd`: plain dup2 always
+/// clears it.
+///
+/// Copying the whole FdEntry (flags included) used to violate that, which is
+/// precisely how a working pipeline still ended up on the console. std's
+/// `try_clone` hands the shell an O_CLOEXEC descriptor, posix_spawn's file
+/// actions dup2 it onto the child's fd 1, the flag rode along, and execve's
+/// close-on-exec sweep then closed the very descriptor the redirection had just
+/// installed — so the child wrote to the console, and a child whose stdin was
+/// closed the same way blocked forever on console input and wedged the shell.
+fn handle_dup2(pid: u32, oldfd: usize, newfd: usize, cloexec: bool) -> Message {
     if oldfd >= MAX_FDS || newfd >= MAX_FDS { return err_reply(-9); }
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
@@ -2522,7 +2574,7 @@ fn handle_dup2(pid: u32, oldfd: usize, newfd: usize) -> Message {
             let replaced = if tbl.fds[newfd].in_use { Some(tbl.fds[newfd].kind) } else { None };
             tbl.fds[newfd] = FdEntry {
                 kind:   VnodeKind::DevStdio { target_fd: oldfd },
-                flags:  0,
+                flags:  if cloexec { O_CLOEXEC } else { 0 },
                 in_use: true,
             };
             drop(tbls);
@@ -2537,6 +2589,9 @@ fn handle_dup2(pid: u32, oldfd: usize, newfd: usize) -> Message {
     let replaced = if tbl.fds[newfd].in_use { Some(tbl.fds[newfd].kind) } else { None };
     let dupled = tbl.fds[oldfd].kind;
     tbl.fds[newfd] = tbl.fds[oldfd];
+    // The duplicate never inherits close-on-exec — only dup3's own flag sets it.
+    if cloexec { tbl.fds[newfd].flags |= O_CLOEXEC; }
+    else       { tbl.fds[newfd].flags &= !O_CLOEXEC; }
     drop(tbls);
     if let Some(old) = replaced { pipe_ref_dec(&old); }
     pipe_ref_inc(&dupled); // newfd is a second fd on the same pipe endpoint
@@ -2566,14 +2621,51 @@ fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
     ok_reply()
 }
 
+/// Release whatever the vnode behind a closed fd was holding: pipe endpoint
+/// refcounts, eventfd/timerfd pool slots, dynamic-device handles, ephemeral
+/// tmpfs entries, and advisory locks. Shared by every path that retires an fd
+/// (close_all on exit, the O_CLOEXEC sweep on exec) so they can't drift apart.
+/// Caller must NOT hold the FD_TABLES lock.
+fn release_vnode(kind: VnodeKind, pid: u32) {
+    if let Some(key) = lock_key_of(&kind) { release_locks(key, pid); }
+    match kind {
+        VnodeKind::Pipe { ring, is_write } => {
+            pipe_drop_ref(&mut PIPE_RINGS.lock(), ring, is_write);
+        }
+        VnodeKind::EventFd { slot } => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; }
+        VnodeKind::TimerFd { slot } => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); }
+        VnodeKind::DynamicDevice { port, dev_id } => {
+            let mut close_msg = Message::empty();
+            close_msg.tag = VFS_CLOSE;
+            close_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
+            let _ = call_port(port, close_msg);
+        }
+        VnodeKind::TmpFile { idx, .. } => tmp_release_ephemeral(idx),
+        _ => {}
+    }
+}
+
 fn handle_exec_cloexec(pid: u32) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    if let Some(t) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
-        for fd in t.fds.iter_mut() {
-            if fd.in_use && fd.flags & O_CLOEXEC != 0 {
-                *fd = FdEntry::empty();
+    // Collect first, release after dropping the table lock: release_vnode takes
+    // PIPE_RINGS and may call out to a device port.
+    let mut closed = [VnodeKind::None; MAX_FDS];
+    {
+        let mut tbls = FD_TABLES.lock();
+        if let Some(t) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
+            for (i, fd) in t.fds.iter_mut().enumerate() {
+                if fd.in_use && fd.flags & O_CLOEXEC != 0 {
+                    closed[i] = fd.kind;
+                    *fd = FdEntry::empty();
+                }
             }
         }
+    }
+    // Without this the close-on-exec sweep silently leaked a reference on every
+    // pipe end it retired, so the peer's reader never reached EOF: brush's
+    // `$(...)` read_to_string and every `a | b` reader blocked forever waiting
+    // for a writer count that could no longer reach zero.
+    for kind in closed {
+        if !matches!(kind, VnodeKind::None) { release_vnode(kind, pid); }
     }
     ok_reply()
 }
@@ -2593,26 +2685,7 @@ fn handle_close_all(pid: u32) -> Message {
         
         // Close them all properly
         for kind in fds_to_close {
-            if let Some(key) = lock_key_of(&kind) { release_locks(key, pid); }
-            match kind {
-                VnodeKind::Pipe { ring, is_write } => {
-                    pipe_drop_ref(&mut PIPE_RINGS.lock(), ring, is_write);
-                }
-                VnodeKind::EventFd { slot } => {
-                    EVENTFD_COUNTERS.lock()[slot] = u64::MAX;
-                }
-                VnodeKind::TimerFd { slot } => {
-                    TIMERFD_POOL.lock()[slot] = TimerFdEntry::free();
-                }
-                VnodeKind::DynamicDevice { port, dev_id } => {
-                    let mut close_msg = Message::empty();
-                    close_msg.tag = VFS_CLOSE;
-                    close_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
-                    let _ = call_port(port, close_msg);
-                }
-
-                _ => {}
-            }
+            release_vnode(kind, pid);
         }
     }
     ok_reply()
@@ -2846,12 +2919,43 @@ fn handle_fcntl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
     const F_GETLK:  usize = 5;
     const F_SETLK:  usize = 6;
     const F_SETLKW: usize = 7;
+    // Duplication commands. These MUST be handled: they return a *file
+    // descriptor*, so the old catch-all `_ => ok_reply()` answered them with 0
+    // — a plausible-looking success that silently aliased every duplicated
+    // handle onto fd 0 (the console). std's `File::try_clone` /
+    // `PipeReader::try_clone` / `BorrowedFd::try_clone_to_owned` are all
+    // F_DUPFD_CLOEXEC, and brush uses exactly those to hand a redirection or a
+    // pipe end to a child process — so `a | b` sent a's stdout to the console
+    // and `cmd < file` gave cmd the console as stdin and hung the shell
+    // forever waiting on a keystroke.
+    const F_DUPFD:         usize = 0;
+    const F_DUPFD_CLOEXEC: usize = 1030;
+    const F_SETPIPE_SZ:    usize = 1031;
+    const F_GETPIPE_SZ:    usize = 1032;
+    // fcntl's FD_CLOEXEC is bit 0 of the *descriptor* flags, a different
+    // namespace from the O_CLOEXEC bit we store in `flags`.
+    const FD_CLOEXEC: u32 = 1;
+
+    if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
+        return dup_fd_min(pid, fd, arg, cmd == F_DUPFD_CLOEXEC);
+    }
+
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
     match cmd {
         F_GETFD => val_reply((tbl.fds[fd].flags & O_CLOEXEC != 0) as u64),
-        F_SETFD => { tbl.fds[fd].flags = arg as u32; ok_reply() }
+        // F_SETFD carries only FD_CLOEXEC. Assigning `arg` wholesale both
+        // failed to set our O_CLOEXEC bit (FD_CLOEXEC is 1, O_CLOEXEC is
+        // 0x80000, so fcntl-requested close-on-exec never actually fired) and
+        // wiped the access mode plus O_APPEND/O_NONBLOCK that handle_write and
+        // fd_nonblock read back.
+        F_SETFD => {
+            let cloexec = arg as u32 & FD_CLOEXEC != 0;
+            if cloexec { tbl.fds[fd].flags |= O_CLOEXEC; }
+            else       { tbl.fds[fd].flags &= !O_CLOEXEC; }
+            ok_reply()
+        }
         F_GETFL => val_reply(tbl.fds[fd].flags as u64),
         F_SETFL => { tbl.fds[fd].flags = (tbl.fds[fd].flags & O_CLOEXEC) | arg as u32; ok_reply() }
         F_GETLK | F_SETLK | F_SETLKW => {
@@ -2859,48 +2963,85 @@ fn handle_fcntl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
             drop(tbls);
             handle_fcntl_lock(pid, kind, cmd, arg)
         }
+        // Pipe capacity is fixed at PIPE_RING_SIZE. Report it honestly rather
+        // than accepting a larger request we cannot satisfy: brush sizes a pipe
+        // to a here-document's length and then writes the whole body before any
+        // reader exists, so silently "succeeding" here would leave the write
+        // blocked forever on a full ring. EINVAL surfaces as a clean shell error.
+        F_GETPIPE_SZ => val_reply(PIPE_RING_SIZE as u64),
+        F_SETPIPE_SZ => {
+            if arg > PIPE_RING_SIZE { err_reply(-22) } // EINVAL
+            else { val_reply(PIPE_RING_SIZE as u64) }
+        }
         _ => ok_reply(), // silently ignore unknown fcntl
     }
 }
 
-/// Allocate a new fd number pointing at the same vnode as `oldfd`.
-/// Used by sys_dup() which doesn't know the new fd number in advance.
-fn handle_alloc_fd(pid: u32, oldfd: usize) -> Message {
-    if oldfd >= MAX_FDS { return err_reply(-9); }
+/// Allocate a new fd number pointing at the same vnode as `oldfd`, choosing the
+/// lowest free number that is >= `minfd`. Backs both `dup()`/VFS_ALLOC_FD
+/// (`minfd` = 3, O_CLOEXEC cleared) and `fcntl(F_DUPFD{,_CLOEXEC})` (`minfd`
+/// from the caller's arg).
+///
+/// `cloexec` is what the *new* descriptor gets, independent of `oldfd`: plain
+/// dup() and F_DUPFD always clear it, F_DUPFD_CLOEXEC always sets it.
+fn dup_fd_min(pid: u32, oldfd: usize, minfd: usize, cloexec: bool) -> Message {
+    if oldfd >= MAX_FDS || minfd >= MAX_FDS { return err_reply(-9); }
+    // fds 0-2 are never handed out as dup targets: the kernel's read/write
+    // fast paths hardwire them to the console (see ProcFdTable::alloc_fd).
+    let floor = minfd.max(3);
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-12) };
+
+    let newfd = match tbl.fds.iter().enumerate()
+                    .find(|(i, f)| *i >= floor && *i != oldfd && !f.in_use)
+                    .map(|(i, _)| i) {
+        Some(f) => f, None => return err_reply(-24) // EMFILE
+    };
+
     if !tbl.fds[oldfd].in_use {
         // An untracked fd 0-2 is the raw console: dup() of it yields a
         // /dev/stdin|stdout|stderr proxy, exactly what opening those paths
         // creates. (std's try_clone_to_owned on stdio — fcntl F_DUPFD — and
         // command_fds' stdio mappings depend on this producing a real fd.)
         if oldfd <= 2 {
-            let newfd = match tbl.fds.iter().enumerate()
-                            .find(|(i, f)| *i >= 3 && !f.in_use)
-                            .map(|(i, _)| i) {
-                Some(f) => f, None => return err_reply(-24) // EMFILE
-            };
             tbl.fds[newfd] = FdEntry {
                 kind:   VnodeKind::DevStdio { target_fd: oldfd },
-                flags:  0,
+                flags:  if cloexec { O_CLOEXEC } else { 0 },
                 in_use: true,
             };
             return val_reply(newfd as u64);
         }
         return err_reply(-9);
     }
-    // Find an unused fd > oldfd (POSIX dup() picks lowest available).
-    let newfd = match tbl.fds.iter().enumerate()
-                    .find(|(i, f)| *i >= 3 && *i != oldfd && !f.in_use)
-                    .map(|(i, _)| i) {
-        Some(f) => f, None => return err_reply(-24) // EMFILE
-    };
+
     tbl.fds[newfd] = tbl.fds[oldfd];
-    tbl.fds[newfd].flags &= !O_CLOEXEC; // dup() clears O_CLOEXEC
+    tbl.fds[newfd].flags = if cloexec {
+        tbl.fds[oldfd].flags | O_CLOEXEC
+    } else {
+        tbl.fds[oldfd].flags & !O_CLOEXEC
+    };
     let dupled = tbl.fds[newfd].kind;
     drop(tbls);
     pipe_ref_inc(&dupled); // newfd is a second fd on the same pipe endpoint
     val_reply(newfd as u64)
+}
+
+/// Allocate a new fd number pointing at the same vnode as `oldfd`.
+/// Used by sys_dup() which doesn't know the new fd number in advance.
+fn handle_alloc_fd(pid: u32, oldfd: usize) -> Message {
+    dup_fd_min(pid, oldfd, 3, false)
+}
+
+/// Store the getdents64 cursor back into a directory fd without changing what
+/// kind of directory it is. A tmpfs directory is a `TmpFile` vnode whose pool
+/// slot carries `is_dir`; overwriting it with a `RamFile` (as the enumeration
+/// used to do unconditionally) would detach it from its pool entry.
+fn set_dir_pos(kind: &mut VnodeKind, new_pos: usize) {
+    match kind {
+        VnodeKind::RamFile { pos, .. } => *pos = new_pos,
+        VnodeKind::TmpFile { pos, .. }  => *pos = new_pos,
+        _ => {}
+    }
 }
 
 /// getdents64 — fill `buf` with `struct linux_dirent64` entries for `fd`.

@@ -743,9 +743,56 @@ const SYSCALL_TRACE: bool = false;
 /// high-signal while bringing up a new ported binary.
 const SYSCALL_TRACE_EINVAL: bool = false;
 
+/// Log the fd-lifecycle syscalls (pipe2/dup/dup2/dup3/fcntl/close/execve) with
+/// their arguments AND return value, plus how sys_write resolved each fd.
+///
+/// This is the trace to enable when a shell redirection or pipeline misbehaves:
+/// the failure mode is always "the fd the child ended up with is not the one the
+/// parent installed", and that is invisible from source alone — the install can
+/// be undone a step later by exec's close-on-exec sweep, by a dup that copied a
+/// flag it should not have, or by a spawn path that never issued the dup at all.
+///
+/// Enable, reproduce (`/bin/seq 1 5 | /bin/wc -l`), and read the sequence:
+/// expect pipe2 → fcntl(F_DUPFD_CLOEXEC)→N → clone → dup3(N,1,0) → execve, and
+/// then `write fd=1 -> pipe`. A `write fd=1 -> console` line is the smoking gun.
+const SYSCALL_TRACE_FDS: bool = false;
+
 /// Serializes multi-part trace prints — concurrent syscalls on other CPUs
 /// otherwise interleave their serial output into an unreadable shuffle.
 static TRACE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+/// One line of fd trace: `[FD] pid=<p> <what> a=<..> b=<..> c=<..> -> <ret>`.
+fn trace_fd(what: &str, a: usize, b: usize, c: usize, ret: isize) {
+    if !SYSCALL_TRACE_FDS { return; }
+    let _g = TRACE_LOCK.lock();
+    crate::serial_print_str("[FD] pid=");
+    crate::serial_print_hex(current_pid() as usize);
+    crate::serial_print_str(" ");
+    crate::serial_print_str(what);
+    crate::serial_print_str(" a=");
+    crate::serial_print_hex(a);
+    crate::serial_print_str(" b=");
+    crate::serial_print_hex(b);
+    crate::serial_print_str(" c=");
+    crate::serial_print_hex(c);
+    crate::serial_print_str(" -> ");
+    crate::serial_print_hex(ret as usize);
+    crate::serial_print_str("\n");
+}
+
+/// Records which route sys_write took for an fd — the single most diagnostic
+/// fact when a pipeline's output lands in the wrong place.
+fn trace_fd_route(fd: usize, route: &str) {
+    if !SYSCALL_TRACE_FDS { return; }
+    let _g = TRACE_LOCK.lock();
+    crate::serial_print_str("[FD] pid=");
+    crate::serial_print_hex(current_pid() as usize);
+    crate::serial_print_str(" write fd=");
+    crate::serial_print_hex(fd);
+    crate::serial_print_str(" -> ");
+    crate::serial_print_str(route);
+    crate::serial_print_str("\n");
+}
 
 /// Unsupported syscalls are logged unconditionally: they are rare, and a
 /// silent ENOSYS is the single most common cause of a ported binary dying
@@ -982,9 +1029,23 @@ fn dispatch_inner(
         GETTIMEOFDAY => sys_gettimeofday(a0, a1),
         SYSINFO      => sys_sysinfo(a0),
         SENDFILE     => sys_sendfile(a0, a1, a2, a3),
-        COPY_FILE_RANGE => sys_sendfile(a0, a2, a4, a5),
+        // copy_file_range(fd_in, off_in, fd_out, off_out, len, flags) puts the
+        // descriptors in a0/a2 with *offset pointers* in a1/a3, whereas
+        // sys_sendfile takes (out_fd, in_fd, offset_ptr, count). This arm used
+        // to forward the offset pointers as descriptors, so the copy silently
+        // targeted nonexistent fds and returned success having moved nothing.
+        // Offsets are passed as NULL, i.e. use the fds' own file positions.
+        COPY_FILE_RANGE => sys_sendfile(a2, a0, 0, a4),
         MEMFD_CREATE => sys_memfd_create(a0, a1),
-        SPLICE       => sys_sendfile(a1, a3, 0, a4), // in_fd, out_fd, offset=none, len
+        // splice(2) requires one end to be a pipe, and callers use it to move
+        // data file -> pipe -> stdout. Emulating it with sys_sendfile's plain
+        // read/write loop deadlocks: the write into the pipe blocks once the
+        // pipe buffer fills and nothing is draining the other end. Report
+        // ENOSYS so callers take their portable fallback — uutils `cat` does
+        // exactly that. (Before this, the arm forwarded offset pointers as
+        // descriptors, so `cat <file>` exited 0 having printed nothing; wiring
+        // the descriptors up correctly then turned that into a hang.)
+        SPLICE       => -38, // ENOSYS
         SETITIMER    => sys_setitimer(a0, a1, a2),
         GETITIMER    => sys_getitimer(a0, a1),
         SIGPENDING   => sys_sigpending(a0),
@@ -2759,10 +2820,18 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     drop(envp);
 
     // ── VFS lifecycle and address space replacement ────────────────────────────
-    let cloexec_msg = make_vfs_msg(vfs::VFS_EXEC_CLOEXEC, &[pid as u64]);
-    let _ = vfs::handle(&cloexec_msg, pid);
-    let net_cloexec = make_vfs_msg(net_server::NET_EXEC_CLOEXEC, &[pid as u64]);
-    let _ = net_server::handle(&net_cloexec, pid);
+    // VFS_EXEC_CLOEXEC takes the owning pid explicitly and so bypasses the
+    // tgid canonicalization vfs::handle applies to ordinary calls. fd tables
+    // are keyed by tgid, so an execve issued from a non-leader thread (a tokio
+    // worker, say) named a pid no table matches and closed nothing at all —
+    // leaking every close-on-exec fd, including the pipe ends whose closure is
+    // what signals EOF to the reader. sys_clone_or_fork already gets this right.
+    let fd_owner = sched::tgid_of(pid);
+    trace_fd("execve cloexec-sweep", pid as usize, fd_owner as usize, 0, 0);
+    let cloexec_msg = make_vfs_msg(vfs::VFS_EXEC_CLOEXEC, &[fd_owner as u64]);
+    let _ = vfs::handle(&cloexec_msg, fd_owner);
+    let net_cloexec = make_vfs_msg(net_server::NET_EXEC_CLOEXEC, &[fd_owner as u64]);
+    let _ = net_server::handle(&net_cloexec, fd_owner);
 
     // A CLONE_VFORK child stops borrowing the parent's address space here —
     // release the parent from its vfork suspension (POSIX: parent resumes on
@@ -3051,9 +3120,20 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
         }
 
         _ => {
+            trace_fd_route(fd, "vfs");
             let msg = make_vfs_msg(vfs::VFS_WRITE, &[fd as u64, buf_ptr as u64, count as u64]);
-            let reply = vfs::handle(&msg, pid);
-            vfs_reply_val(&reply)
+            // A full pipe answers EAGAIN. Blocking fds must wait for the reader
+            // to drain rather than surface it (mirroring the EAGAIN loop in
+            // sys_read), or any pipeline carrying more than one ring's worth of
+            // data dies with a spurious "failed to write whole buffer".
+            let nonblock = vfs::fd_nonblock(pid, fd);
+            loop {
+                let n = vfs_reply_val(&vfs::handle(&msg, pid));
+                if n != -11 || nonblock { return n; }
+                if interrupted() { return -4; } // EINTR
+                irq_window();
+                yield_now("sys_write_vfs");
+            }
         }
     }
 }
@@ -3252,24 +3332,43 @@ fn sys_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
     if iovcnt == 0 { return 0; }
     // Each `struct iovec` is { base: *const u8 (8 bytes), len: usize (8 bytes) }.
     if !validate_user_buf(iov_ptr, iovcnt.saturating_mul(16)) { return -14; }
-    match fd {
-        1 | 2 => {
-            let mut total: isize = 0;
-            for i in 0..iovcnt {
-                let iov_addr = iov_ptr + i * 16;
-                let base = unsafe { core::ptr::read(iov_addr as *const usize) };
-                let len  = unsafe { core::ptr::read((iov_addr + 8) as *const usize) };
-                if len == 0 { continue; }
-                if !validate_user_buf(base, len) { return -14; }
-                prefault_user(base, len);
-                let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
-                serial_write_raw(bytes);
-                total = total.saturating_add(len as isize);
-            }
-            total
+    let pid = current_pid();
+    // The console fast path applies only to a stdio fd that has NOT been
+    // redirected — the same rule sys_write follows. Without the fd_redirected
+    // check a writev to a dup2'd fd 1 bypassed the pipe and went straight to
+    // the UART; and the old `_ => -9` meant a writev to any other fd (a file, a
+    // pipe, a socket) failed with EBADF instead of being written at all.
+    let console = (matches!(fd, 1 | 2) && !vfs::fd_redirected(pid, fd))
+        || (fd < net_server::SOCK_FD_BASE && vfs::fd_is_console_stdio(pid, fd));
+    if console {
+        let mut total: isize = 0;
+        for i in 0..iovcnt {
+            let iov_addr = iov_ptr + i * 16;
+            let base = unsafe { core::ptr::read(iov_addr as *const usize) };
+            let len  = unsafe { core::ptr::read((iov_addr + 8) as *const usize) };
+            if len == 0 { continue; }
+            if !validate_user_buf(base, len) { return -14; }
+            prefault_user(base, len);
+            let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
+            console_write_user(bytes);
+            total = total.saturating_add(len as isize);
         }
-        _ => -9,
+        return total;
     }
+    // Everything else: one sys_write per iovec, which already routes sockets,
+    // pipes and files correctly and blocks on a full pipe.
+    let mut total: isize = 0;
+    for i in 0..iovcnt {
+        let iov_addr = iov_ptr + i * 16;
+        let base = unsafe { core::ptr::read(iov_addr as *const usize) };
+        let len  = unsafe { core::ptr::read((iov_addr + 8) as *const usize) };
+        if len == 0 { continue; }
+        let n = sys_write(fd, base, len);
+        if n < 0 { return if total > 0 { total } else { n }; }
+        total = total.saturating_add(n);
+        if (n as usize) < len { break; } // short write
+    }
+    total
 }
 
 /// sys_readv(fd, iov, iovcnt) — scatter-gather read, one iovec at a time via VFS.
@@ -4035,6 +4134,17 @@ fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     if fd <= 2 {
         const F_GETFL: usize = 3;
         const F_SETFL: usize = 4;
+        const F_DUPFD:         usize = 0;
+        const F_DUPFD_CLOEXEC: usize = 1030;
+        // Duplicating stdio must produce a real new fd (a /dev/std* proxy in
+        // the VFS), not the 0 the catch-all below returns. std's
+        // `BorrowedFd::try_clone_to_owned` is F_DUPFD_CLOEXEC, and answering it
+        // with "0" hands the caller a second alias for stdin that it will later
+        // close — which is how a redirect could wedge the shell's own console.
+        if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
+            let msg = make_vfs_msg(vfs::VFS_FCNTL, &[fd as u64, cmd as u64, arg as u64]);
+            return vfs_reply_val(&vfs::handle(&msg, pid));
+        }
         return match cmd {
             F_GETFL => {
                 let flags = STDIO_FLAGS.lock().iter()
@@ -4047,7 +4157,9 @@ fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
         };
     }
     let msg = make_vfs_msg(vfs::VFS_FCNTL, &[fd as u64, cmd as u64, arg as u64]);
-    vfs_reply_val(&vfs::handle(&msg, pid))
+    let r = vfs_reply_val(&vfs::handle(&msg, pid));
+    trace_fd("fcntl", fd, cmd, arg, r);
+    r
 }
 
 fn sys_fchmod(fd: usize, mode: usize) -> isize {
@@ -4082,14 +4194,30 @@ fn sys_flock(fd: usize, op: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_pipe2(pipefd_ptr: usize, _flags: usize) -> isize {
+/// sys_pipe2(pipefd, flags) — create a pipe.
+///
+/// `flags` (O_CLOEXEC / O_NONBLOCK) must reach the VFS. Discarding it meant no
+/// pipe end was ever close-on-exec, so every pipe the shell held leaked into
+/// each child it exec'd; with a stray copy of the write end alive in the child,
+/// the read end never reached EOF and the reader blocked forever. std's
+/// `io::pipe()` — which brush uses for both pipelines and `$(...)` — always
+/// passes O_CLOEXEC.
+fn sys_pipe2(pipefd_ptr: usize, flags: usize) -> isize {
     // int pipefd[2] — two ints (4 bytes each) packed at pipefd_ptr.
     if !validate_user_buf(pipefd_ptr, 8) { return -14; }
     let rfd_ptr = pipefd_ptr;
     let wfd_ptr = pipefd_ptr + 4;
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_PIPE, &[rfd_ptr as u64, wfd_ptr as u64]);
-    vfs_reply_val(&vfs::handle(&msg, pid))
+    let msg = make_vfs_msg(vfs::VFS_PIPE, &[rfd_ptr as u64, wfd_ptr as u64, flags as u64]);
+    let r = vfs_reply_val(&vfs::handle(&msg, pid));
+    if SYSCALL_TRACE_FDS && r >= 0 {
+        let rfd = unsafe { core::ptr::read(rfd_ptr as *const u32) } as usize;
+        let wfd = unsafe { core::ptr::read(wfd_ptr as *const u32) } as usize;
+        trace_fd("pipe2 r/w", rfd, wfd, flags, r);
+    } else {
+        trace_fd("pipe2", 0, 0, flags, r);
+    }
+    r
 }
 
 fn sys_dup(oldfd: usize) -> isize {
@@ -4100,12 +4228,22 @@ fn sys_dup(oldfd: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_dup3(oldfd: usize, newfd: usize, _flags: usize) -> isize {
+/// dup3(oldfd, newfd, flags) — also the implementation of dup2 (flags = 0).
+///
+/// `flags` (only O_CLOEXEC is defined) must reach the VFS: it is the sole
+/// source of the new descriptor's close-on-exec state. Dropping it left
+/// handle_dup2 inheriting oldfd's flag instead, so dup2'ing an O_CLOEXEC
+/// descriptor onto a child's stdio — exactly what posix_spawn's file actions do
+/// for every shell redirection — produced a redirection that execve then
+/// immediately closed.
+fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     let pid = current_pid();
     // If newfd == u64::MAX this is sys_dup (allocate any free fd).
     let tag = if newfd == usize::MAX { vfs::VFS_ALLOC_FD } else { vfs::VFS_DUP2 };
-    let msg = make_vfs_msg(tag, &[oldfd as u64, newfd as u64]);
-    vfs_reply_val(&vfs::handle(&msg, pid))
+    let msg = make_vfs_msg(tag, &[oldfd as u64, newfd as u64, flags as u64]);
+    let r = vfs_reply_val(&vfs::handle(&msg, pid));
+    trace_fd("dup3", oldfd, newfd, flags, r);
+    r
 }
 
 fn sys_getdents64(fd: usize, buf_ptr: usize, count: usize) -> isize {
@@ -5525,6 +5663,55 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: usize, count: usize) ->
     if count == 0 { return 0; }
     let pid = current_pid();
 
+    // Linux rejects a pipe on either end of sendfile(2)/copy_file_range(2)
+    // with EINVAL, and callers rely on that to fall back to a plain read/write
+    // loop. Emulating it here instead was actively harmful: a pipe read with
+    // no data yet returns EAGAIN (-11), which the `n <= 0` break below turned
+    // into a *successful* short copy — silent truncation — and a failing write
+    // likewise reported success having moved nothing. std's io::copy reads that
+    // 0 as EOF, which is how `printf '1\n2\n3\n' | tac` copied zero bytes into
+    // its temp file and never noticed.
+    for f in [in_fd, out_fd] {
+        if let Some(vfs::VnodeKind::Pipe { .. }) = vfs::vfs_get_node_kind(pid, f) {
+            return -22; // EINVAL
+        }
+    }
+
+    // Sockets are not a source or sink this loop can drive (a socket write has
+    // to go through net_server's NET_SEND and may block on a full ring); Linux
+    // likewise refuses a socket `in_fd`. Answer EINVAL so the caller uses its
+    // read/write fallback rather than getting EBADF out of the VFS, which does
+    // not own these descriptors at all.
+    if in_fd >= net_server::SOCK_FD_BASE || out_fd >= net_server::SOCK_FD_BASE {
+        return -22; // EINVAL
+    }
+
+    // ── Console endpoints ─────────────────────────────────────────────────────
+    // VFS's alloc_fd deliberately never hands out fds 0-2, so *any* VFS_READ /
+    // VFS_WRITE naming one answers EBADF. sys_read/sys_write dodge that with a
+    // console fast path; this loop talks to the VFS directly and so did not.
+    //
+    // That was invisible while a failed write merely broke the loop and
+    // reported a short copy, but sendfile now propagates errors (so that a
+    // failed copy is not mistaken for EOF — see the pipe note above), and the
+    // EBADF became a hard error in userspace. It surfaced as
+    // `tail -n3 <file> -> "tail: Bad file descriptor"`: std implements
+    // io::copy(File, StdoutLock) with sendfile(2), and uutils tail only reaches
+    // io::copy on its seek-backwards path, which it takes only when the file is
+    // larger than st_blksize — the 4096 we report from stat(2). Hence the
+    // sharp "4096 bytes passes, 4097 fails" boundary.
+    //
+    // `in_fd` on the console is a tty read, which sendfile(2) rejects (the
+    // source must be mmap-able); EINVAL sends the caller to read/write.
+    // `out_fd` on the console is the common case above and must actually work,
+    // so it takes the same route sys_write does. sys_write cannot simply be
+    // called here: its validate_user_buf rejects the kernel-side bounce buffer.
+    if (in_fd == 0 && !vfs::fd_redirected(pid, 0)) || vfs::fd_is_console_stdio(pid, in_fd) {
+        return -22; // EINVAL
+    }
+    let out_console = (matches!(out_fd, 1 | 2) && !vfs::fd_redirected(pid, out_fd))
+        || vfs::fd_is_console_stdio(pid, out_fd);
+
     // If offset_ptr is given, seek in_fd to the caller-supplied offset.
     if offset_ptr != 0 {
         if !validate_user_buf(offset_ptr, 8) { return -14; }
@@ -5544,11 +5731,20 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: usize, count: usize) ->
         let want = (count - transferred).min(CHUNK);
         let rmsg = make_vfs_msg(vfs::VFS_READ, &[in_fd as u64, buf_ptr as u64, want as u64]);
         let n = vfs_reply_val(&vfs::handle(&rmsg, pid));
-        if n <= 0 { break; }
-        let wmsg = make_vfs_msg(vfs::VFS_WRITE,
-            &[out_fd as u64, buf_ptr as u64, n as u64]);
-        let w = vfs_reply_val(&vfs::handle(&wmsg, pid));
-        if w <= 0 { break; }
+        // A read error must not masquerade as a clean end-of-input. Only a
+        // genuine 0 (EOF) ends the transfer; a negative errno is reported when
+        // nothing has been moved yet, matching sendfile(2).
+        if n < 0 { if transferred == 0 { return n as isize; } else { break; } }
+        if n == 0 { break; }
+        let w = if out_console {
+            console_write_user(&buf[..n as usize]);
+            n
+        } else {
+            let wmsg = make_vfs_msg(vfs::VFS_WRITE,
+                &[out_fd as u64, buf_ptr as u64, n as u64]);
+            vfs_reply_val(&vfs::handle(&wmsg, pid))
+        };
+        if w <= 0 { if transferred == 0 && w < 0 { return w as isize; } else { break; } }
         transferred += w as usize;
     }
 
