@@ -922,8 +922,8 @@ fn dispatch_inner(
         MKDIRAT     => sys_mkdirat(a0, a1, a2),
         UNLINKAT    => sys_unlinkat(a0, a1, a2),
         RENAMEAT | RENAMEAT2 => sys_renameat(a1, a3),
-        LINKAT      => -30,
-        SYMLINKAT   => -30,
+        LINKAT      => sys_linkat(a0, a1, a2, a3, a4),
+        SYMLINKAT   => sys_symlinkat(a0, a1, a2),
         FCHMOD      => sys_fchmod(a0, a1),
         FCHMODAT    => sys_fchmodat(a0, a1, a2, a3),
         FCHOWN      => sys_fchown(a0, a1, a2),
@@ -1052,7 +1052,11 @@ fn dispatch_inner(
         #[cfg(not(target_arch = "aarch64"))]
         STAT  => sys_stat_at_path(a0, a1),
         #[cfg(not(target_arch = "aarch64"))]
-        LSTAT => sys_stat_at_path(a0, a1), // no symlinks — same as stat
+        // lstat(2) is stat-without-following. 0x100 is AT_SYMLINK_NOFOLLOW,
+        // which routes fstatat_into at VFS_LSTAT instead of VFS_STAT. This
+        // used to be a plain alias for stat, so a symlink reported its
+        // target's type and `ls -l` never printed an 'l'.
+        LSTAT => sys_newfstatat(AT_FDCWD, a0, a1, 0x100),
 
         // ── Misc ──────────────────────────────────────────────────────────────
         UNAME      => sys_uname(a0),

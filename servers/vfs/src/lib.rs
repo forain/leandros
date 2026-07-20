@@ -156,9 +156,15 @@ pub fn call_port(port_id: u32, mut msg: Message) -> Message {
 
 // ── Writable tmpfs pool ───────────────────────────────────────────────────────
 
-const MAX_TMP_FILES: usize = 32;
-const MAX_TMP_SIZE:  usize = 4096;
-const MAX_TMP_PATH:  usize = 64;
+// Every entry is stored inline, so these bounds are a straight static-memory
+// trade: MAX_TMP_FILES * (MAX_TMP_SIZE + MAX_TMP_PATH) ≈ 4.2 MB of BSS.
+// The previous 32 / 4 KiB / 64 was far too tight for real userland — a
+// coreutils run in /tmp exhausts 32 slots quickly and then reports ENOSPC
+// from creat/mkdir, and 64 bytes of path cannot hold a couple of nested
+// directories. Raise before assuming a tmpfs failure is a logic bug.
+const MAX_TMP_FILES: usize = 128;
+const MAX_TMP_SIZE:  usize = 32768;
+const MAX_TMP_PATH:  usize = 128;
 
 struct TmpFileEntry {
     path:     [u8; MAX_TMP_PATH],
@@ -167,17 +173,41 @@ struct TmpFileEntry {
     len:      usize,
     in_use:   bool,
     is_dir:   bool,
+    /// True for a tmpfs entry created via mknod(S_IFIFO) — reported as
+    /// S_IFIFO/DT_FIFO by stat/fstat/getdents64. Does NOT get real FIFO
+    /// read/write semantics; see the scope note on `handle_mknod`.
+    is_fifo:  bool,
+    /// True for a tmpfs entry created via symlink(2). `data[..len]` holds the
+    /// link *target* verbatim — it is never normalised or resolved at creation
+    /// time, so a dangling or relative target is stored exactly as given and
+    /// only interpreted during lookup (see `tmp_resolve_links`).
+    is_link:  bool,
+    /// Hard-link indirection. `usize::MAX` means "this entry owns its own
+    /// bytes"; anything else is the pool index of the entry that does.
+    ///
+    /// A tmpfs "inode" is therefore the data-owning slot, and every name
+    /// pointing at it is a separate slot whose `link_to` names the owner.
+    /// `st_ino` and every read/write/truncate funnel through `tmp_owner()`, so
+    /// two hard links genuinely share one file rather than two copies of it.
+    /// Directories are never hard-linked (link(2) returns EPERM for them), so
+    /// `link_to` is always `usize::MAX` on an `is_dir` slot.
+    link_to:  usize,
     mode:     u32, // permission bits (rwxrwxrwx), set at creation from umask
     uid:      u32, // owner, set at creation from the creating task's euid
     gid:      u32, // owner group, set at creation from the creating task's egid
+    /// Synthetic /proc snapshot parked in the pool under a fake "/tmp/.proc_N"
+    /// path. Owned by the fd rather than by a name: invisible to lookup and to
+    /// getdents64, and freed on close (see `tmp_release_ephemeral`).
+    ephemeral: bool,
 }
 
 impl TmpFileEntry {
     const fn empty() -> Self {
         Self { path: [0u8; MAX_TMP_PATH], path_len: 0,
                data: [0u8; MAX_TMP_SIZE], len: 0,
-               in_use: false, is_dir: false,
-               mode: 0, uid: 0, gid: 0 }
+               in_use: false, is_dir: false, is_fifo: false, is_link: false,
+               link_to: usize::MAX,
+               mode: 0, uid: 0, gid: 0, ephemeral: false }
     }
 }
 
@@ -190,7 +220,16 @@ static TMP_FILES: Mutex<[TmpFileEntry; MAX_TMP_FILES]> =
 pub enum VnodeKind {
     None,
     /// Static read-only RamFS file.
-    RamFile { data: &'static [u8], pos: usize },
+    ///
+    /// `is_dir` distinguishes a real file (whose `data` is its *contents*) from
+    /// a RAMFS_DIRS pseudo-directory (whose `data` is its own **path**, used
+    /// solely as the enumeration root by `handle_getdents64`). Conflating the
+    /// two handed that path string to userspace as file data: `open("/tmp")`
+    /// returned a readable `S_IFREG` fd of size 4 whose bytes were `/tmp`, so
+    /// `cat /bin` printed "/bin" and — via tempfile(3)'s `O_TMPFILE` probe,
+    /// which we wrongly *succeeded* — `tac` fed from a pipe printed "/tmp"
+    /// instead of the reversed input. A directory must never serve content.
+    RamFile { data: &'static [u8], pos: usize, is_dir: bool },
     /// /dev/null — reads return 0; writes discarded.
     DevNull,
     /// /dev/zero — reads return zero bytes; writes discarded.
@@ -831,11 +870,59 @@ pub fn is_directory(path_ptr: usize) -> bool {
         if path_eq(&pbuf, plen, dir) { return true; }
     }
     // Check tmpfs dirs.
+    let path = match tmpfs_path(&pbuf[..plen]) { Some(p) => p, None => return false };
     let tmp = TMP_FILES.lock();
-    tmp.iter().any(|e| e.in_use && e.is_dir && e.path_len == plen && &e.path[..plen] == &pbuf[..plen])
+    tmp_find(&tmp[..], path).map_or(false, |i| tmp[i].is_dir)
 }
 
 // ── Message dispatch ──────────────────────────────────────────────────────────
+
+/// Which message arguments of `tag` are paths, and whether the *final*
+/// component of each must be followed through a symlink.
+///
+/// Intermediate components are always followed (POSIX has no flavour of
+/// lookup that doesn't); only the last one varies. The `false` group is the
+/// set of operations that act on the link itself rather than its target —
+/// getting `VFS_UNLINK` into the wrong group is what makes `rm symlink`
+/// delete the *target*, so this table is the load-bearing part.
+fn path_args(tag: u64) -> (Option<(usize, bool)>, Option<(usize, bool)>) {
+    match tag {
+        VFS_OPEN | VFS_STAT | VFS_STATFS | VFS_CHMOD | VFS_CHOWN => (Some((0, true)), None),
+        VFS_UNLINK | VFS_RMDIR | VFS_MKDIR | VFS_MKNOD
+        | VFS_LSTAT | VFS_READLINK                              => (Some((0, false)), None),
+        VFS_RENAME | VFS_LINK                                   => (Some((0, false)), Some((1, false))),
+        // arg0 of VFS_SYMLINK is the link *body*, stored verbatim — resolving
+        // it here would turn `ln -s ../x l` into an absolute link.
+        VFS_SYMLINK                                             => (None, Some((1, false))),
+        _                                                       => (None, None),
+    }
+}
+
+/// Replace one path argument with its symlink-resolved form, parked in `buf`.
+///
+/// Only `/tmp` paths are touched. Everything else — `/bin/shell`, `/bin/brush`,
+/// every RamFS and mount path — is handed to the handlers byte-identical to
+/// how it arrived, so no non-tmpfs lookup (the exec path above all) can change
+/// behaviour because of this.
+fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut [u8; 257])
+    -> Result<(), i32>
+{
+    let (idx, follow) = match spec { Some(s) => s, None => return Ok(()) };
+    let ptr = arg(msg, idx) as usize;
+    let (raw, rlen) = match read_cstr_raw(ptr) { Some(r) => r, None => return Ok(()) };
+    let path = strip_trailing_slash(&raw[..rlen]);
+    if !is_tmp_path(path) { return Ok(()); }
+
+    let mut resolved = [0u8; 256];
+    let n = tmp_resolve_links(path, follow, &mut resolved)?;
+    if resolved[..n] == raw[..rlen] { return Ok(()); }
+
+    buf[..n].copy_from_slice(&resolved[..n]);
+    buf[n] = 0; // handlers scan for the NUL
+    msg.data[idx * 8..idx * 8 + 8]
+        .copy_from_slice(&(buf.as_ptr() as u64).to_le_bytes());
+    Ok(())
+}
 
 pub fn handle(msg: &Message, caller_pid: u32) -> Message {
     // Fd tables are per-*process*: canonicalize the caller to its thread-
@@ -845,6 +932,26 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
     // VFS_CLOSE_ALL, VFS_EXEC_CLOEXEC) take them as message args and are
     // unaffected by this canonicalization.
     let caller_pid = sched::tgid_of(caller_pid);
+
+    // Symlink resolution happens here, once, for every path-taking operation —
+    // rather than in each of the fifteen handlers that would otherwise each
+    // need their own copy of the walk. The rewritten paths live in this
+    // frame, and the caller stays blocked in `call_port` for the whole round
+    // trip, so they outlive every server that reads them (the same lifetime
+    // argument `KPath` makes on the kernel side).
+    let (p0, p1) = path_args(msg.tag);
+    if p0.is_some() || p1.is_some() {
+        let mut b0 = [0u8; 257];
+        let mut b1 = [0u8; 257];
+        let mut m = *msg;
+        if let Err(e) = rewrite_one(&mut m, p0, &mut b0) { return err_reply(e); }
+        if let Err(e) = rewrite_one(&mut m, p1, &mut b1) { return err_reply(e); }
+        return dispatch(&m, caller_pid);
+    }
+    dispatch(msg, caller_pid)
+}
+
+fn dispatch(msg: &Message, caller_pid: u32) -> Message {
     match msg.tag {
         VFS_OPEN         => handle_open(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32),
         VFS_READ         => handle_read(caller_pid, arg(msg,0) as usize,
@@ -867,6 +974,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         VFS_ALLOC_FD     => handle_alloc_fd(caller_pid, arg(msg,0) as usize),
         VFS_UNLINK       => handle_unlink(arg(msg,0) as usize),
         VFS_MKDIR        => handle_mkdir(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        VFS_MKNOD        => handle_mknod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         VFS_FTRUNCATE    => handle_ftruncate(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_RENAME       => handle_rename(arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_FD_PATH      => handle_fd_path(caller_pid, arg(msg,0) as usize,
@@ -889,6 +997,11 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                                arg(msg,1) as u32, arg(msg,2) as u32),
         VFS_POLL             => handle_poll(caller_pid, arg(msg,0) as usize),
         VFS_PIVOT_ROOT       => handle_pivot_root(arg(msg,0) as usize, arg(msg,1) as usize),
+        VFS_SYMLINK          => handle_symlink(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
+        VFS_READLINK         => handle_readlink(arg(msg,0) as usize, arg(msg,1) as usize,
+                                                arg(msg,2) as usize),
+        VFS_LINK             => handle_link(arg(msg,0) as usize, arg(msg,1) as usize),
+        VFS_LSTAT            => stat_common(arg(msg,0) as usize, arg(msg,1) as usize, false),
         _                    => err_reply(-38), // ENOSYS
     }
 }
@@ -953,10 +1066,18 @@ fn handle_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> Message {
 const O_WRONLY:    u32 = 0x01;
 const O_RDWR:      u32 = 0x02;
 const O_CREAT:     u32 = 0x40;
+const O_EXCL:      u32 = 0x80;
 const O_TRUNC:     u32 = 0x200;
 const O_APPEND:    u32 = 0x400;
 #[allow(dead_code)]
 const O_DIRECTORY: u32 = 0x10000;
+/// `O_PATH` — open the file only as a *reference* to a location in the tree.
+/// The descriptor is legal to `fstat`, `dup`, `close` and pass as a `dirfd`,
+/// but carries no read/write access at all, so those must fail EBADF rather
+/// than succeed. It also suppresses the data-mutating flags: `O_PATH` ignores
+/// the access mode and everything that would create or truncate, so an
+/// `O_PATH | O_TRUNC` open must not destroy the file it is merely naming.
+const O_PATH:      u32 = 0x200000;
 
 static OLD_ROOT_PREFIX: Mutex<Option<&'static str>> = Mutex::new(None);
 
@@ -986,6 +1107,328 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
 /// Return true if `path` starts with the prefix `/tmp/` or equals `/tmp`.
 fn is_tmp_path(path: &[u8]) -> bool {
     path == b"/tmp" || path.starts_with(b"/tmp/")
+}
+
+// ── tmpfs path convention ────────────────────────────────────────────────────
+//
+// Every TMP_FILES entry stores an **absolute, normalised path with no trailing
+// slash**: "/tmp/f", "/tmp/d", "/tmp/d/f". Directories are stored in exactly
+// the same shape as files — the `is_dir` flag is the *only* thing that marks
+// one, never a trailing '/'. "/tmp" itself is never a pool entry (it is a
+// RAMFS_DIRS pseudo-directory), so the pool holds strict descendants of "/tmp"
+// and nothing else.
+//
+// Parent/child is decided purely by byte prefix: `P` is a direct child of
+// directory `D` iff `P.starts_with(D) && P[D.len()] == b'/'` and
+// `P[D.len()+1..]` contains no further '/'. `handle_getdents64`, `handle_rmdir`
+// and the directory rename below all use exactly that rule, so anything that
+// creates an entry must normalise first or it becomes invisible to all three
+// (an entry stored as "/tmp/d/" yields the child name "d/", which contains a
+// '/' and is therefore skipped by enumeration).
+
+/// Drop redundant trailing slashes ("/tmp/d/" → "/tmp/d"). "/" is left alone.
+fn strip_trailing_slash(p: &[u8]) -> &[u8] {
+    let mut p = p;
+    while p.len() > 1 && p[p.len() - 1] == b'/' { p = &p[..p.len() - 1]; }
+    p
+}
+
+/// Resolve `path` to the normalised tmpfs-pool path it names, or `None` when
+/// the tmpfs pool does not own it.
+///
+/// This is the single choke point for "is this a tmpfs path?", and every
+/// path-taking handler must consult it *before* `find_mount_port()`.
+///
+/// Why the ordering matters: `userland/init` pivot_roots onto F2FS, and
+/// `handle_pivot_root` rewrites that mount's prefix to "/". From that moment
+/// `find_mount_port()` matches *every* absolute path — `/tmp/...` included.
+/// `handle_open` and `handle_stat` were immune because they funnel through
+/// `should_lookup_ramfs()` first, but mkdir/rmdir/unlink/rename/chmod/chown
+/// asked the mount table first and shipped tmpfs paths off to F2FS. That is
+/// why `mv`/`rm` inside /tmp answered ENOENT while `cp` and `ls` worked, and
+/// why `mkdir /tmp/d` "succeeded" silently: it created the directory on the
+/// F2FS volume, where nothing enumerating /tmp could ever see it.
+fn tmpfs_path(path: &[u8]) -> Option<&[u8]> {
+    let lookup = strip_trailing_slash(should_lookup_ramfs(path)?);
+    if is_tmp_path(lookup) { Some(lookup) } else { None }
+}
+
+/// Parent directory of a normalised tmpfs path ("/tmp/d/f" → "/tmp/d").
+/// `None` for "/tmp" itself, which has no tmpfs parent.
+fn tmp_parent(path: &[u8]) -> Option<&[u8]> {
+    if path == b"/tmp" { return None; }
+    let i = path.iter().rposition(|&b| b == b'/')?;
+    Some(if i == 0 { &path[..1] } else { &path[..i] })
+}
+
+/// Find a *named* pool entry. Ephemeral /proc snapshots are excluded: they
+/// squat on synthetic "/tmp/.proc_N" paths that no user path can ever name.
+fn tmp_find(tmp: &[TmpFileEntry], path: &[u8]) -> Option<usize> {
+    tmp.iter().position(|e| {
+        e.in_use && !e.ephemeral && e.path_len == path.len() && &e.path[..e.path_len] == path
+    })
+}
+
+/// True when `path` names an existing directory that entries may be created
+/// under: "/tmp" always, otherwise an in-use `is_dir` pool entry.
+fn tmp_dir_exists(tmp: &[TmpFileEntry], path: &[u8]) -> bool {
+    path == b"/tmp" || tmp_find(tmp, path).map_or(false, |i| tmp[i].is_dir)
+}
+
+/// True when any pool entry (other than `skip`) lives under directory `dir`.
+fn tmp_has_descendants(tmp: &[TmpFileEntry], dir: &[u8], skip: usize) -> bool {
+    tmp.iter().enumerate().any(|(i, e)| {
+        i != skip && e.in_use && !e.ephemeral
+            && e.path_len > dir.len()
+            && &e.path[..dir.len()] == dir
+            && e.path[dir.len()] == b'/'
+    })
+}
+
+/// Overwrite an entry's stored path. Callers must have length-checked already.
+fn tmp_set_path(e: &mut TmpFileEntry, path: &[u8]) {
+    e.path = [0u8; MAX_TMP_PATH];
+    e.path[..path.len()].copy_from_slice(path);
+    e.path_len = path.len();
+}
+
+// ── Hard links ───────────────────────────────────────────────────────────────
+//
+// A name and an inode are the same pool slot for an unlinked file. A hard link
+// splits them: the *second* name gets its own slot whose `link_to` points at
+// the first, and every operation that touches file content resolves through
+// `tmp_owner()` first. That keeps the change surgical — `VnodeKind::TmpFile`
+// still carries a bare pool index, and read/write/lseek/ftruncate/fstat are
+// untouched — at the cost of one rule that must be honoured everywhere:
+//
+//   *Never* index the pool with a raw `tmp_find()` result when you are about
+//   to touch `.data`, `.len`, `.mode`, `.uid` or `.gid`. Map it through
+//   `tmp_owner()` first. Only path-shaped operations (rename, getdents,
+//   lookup) legitimately use the un-mapped index.
+
+/// Map a pool index to the slot that actually owns the bytes.
+fn tmp_owner(tmp: &[TmpFileEntry], idx: usize) -> usize {
+    let to = tmp[idx].link_to;
+    if to == usize::MAX || to >= tmp.len() || !tmp[to].in_use { idx } else { to }
+}
+
+/// Number of aliases pointing at data-owning slot `owner`.
+fn tmp_alias_count(tmp: &[TmpFileEntry], owner: usize) -> usize {
+    tmp.iter().enumerate().filter(|(i, e)| {
+        *i != owner && e.in_use && e.link_to == owner
+    }).count()
+}
+
+/// `st_nlink` for the file owned by slot `idx`.
+///
+/// An `ephemeral` owner is a *nameless* inode (see `tmp_drop_name`), so it
+/// contributes nothing — which is how `ln a b; rm a; stat b` correctly reports
+/// 1 rather than 2.
+fn tmp_nlink(tmp: &[TmpFileEntry], idx: usize) -> u64 {
+    let owner = tmp_owner(tmp, idx);
+    let named = if tmp[owner].ephemeral { 0 } else { 1 };
+    named + tmp_alias_count(tmp, owner) as u64
+}
+
+/// Drop one *name*. The inode (the data-owning slot) survives while any other
+/// name still refers to it — that is the whole point of `st_nlink`.
+///
+/// When the name being dropped is the data owner's own and aliases remain, the
+/// slot is marked `ephemeral` rather than freed: that flag already means
+/// "in use, but invisible to lookup and to getdents64", which is exactly a
+/// nameless inode. The alternative — promoting an alias and memcpy'ing the
+/// bytes into it — would invalidate every `VnodeKind::TmpFile { idx }` already
+/// held by an open descriptor, so `ln a b; exec 3<a; rm a` would break fd 3.
+/// An open descriptor keeps a nameless inode alive just as an alias does.
+/// `open_fds` is a `tmp_open_fd_mask()` snapshot taken before TMP_FILES was
+/// locked; without it, `fd = open(p); unlink(p)` freed the pool slot out from
+/// under `fd`, and the next creat() handed the same slot to an unrelated file.
+/// That is precisely the create-then-unlink idiom tempfile(3) uses for
+/// anonymous temporaries, so it is on the hot path for `tac`, `sort -o` and
+/// every other tool that buffers through a temp file.
+fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: u128) {
+    let referenced = |i: usize| i < MAX_TMP_FILES && open_fds & (1u128 << i) != 0;
+    let owner = tmp_owner(tmp, idx);
+    if owner != idx {
+        // An alias. Free it, and collect the inode if that was the last name
+        // and the owner had already lost its own.
+        tmp[idx] = TmpFileEntry::empty();
+        if tmp[owner].ephemeral && tmp_alias_count(tmp, owner) == 0 && !referenced(owner) {
+            tmp[owner] = TmpFileEntry::empty();
+        }
+        return;
+    }
+    if tmp_alias_count(tmp, idx) > 0 || referenced(idx) {
+        tmp[idx].ephemeral = true;
+    } else {
+        tmp[idx] = TmpFileEntry::empty();
+    }
+}
+
+/// Bitmask of tmpfs pool slots still referenced by an open descriptor.
+///
+/// Lock order is the established FD_TABLES → TMP_FILES, so callers must invoke
+/// this *before* taking the TMP_FILES lock and pass the result down.
+fn tmp_open_fd_mask() -> u128 {
+    let tbls = FD_TABLES.lock();
+    let mut mask: u128 = 0;
+    for t in tbls.iter().filter(|t| t.in_use) {
+        for f in t.fds.iter().filter(|f| f.in_use) {
+            if let VnodeKind::TmpFile { idx, .. } = f.kind {
+                if idx < MAX_TMP_FILES { mask |= 1u128 << idx; }
+            }
+        }
+    }
+    mask
+}
+
+// ── Symlinks ─────────────────────────────────────────────────────────────────
+
+/// Maximum number of symlink traversals in one path resolution before ELOOP.
+/// Linux uses 40 (`MAXSYMLINKS`); matching it means a path that resolves on
+/// Linux resolves here, and a cycle costs at most 40 bounded, *iterative*
+/// passes — there is no recursion anywhere in the resolver, so a hostile
+/// symlink graph cannot grow the kernel stack.
+const SYMLINK_MAX_HOPS: u32 = 40;
+
+/// Rewrite an absolute path in place, dropping empty / "." components and
+/// resolving ".." lexically. Needed because splicing a symlink target back
+/// into a path reintroduces both (the kernel normalised the *original* path,
+/// but it never saw the link body).
+fn normalize_abs(src: &[u8], out: &mut [u8; 256]) -> usize {
+    let mut len = 1usize;
+    out[0] = b'/';
+    for comp in src.split(|&b| b == b'/') {
+        if comp.is_empty() || comp == b"." { continue; }
+        if comp == b".." {
+            if len > 1 {
+                let mut last = len - 1;
+                while last > 0 && out[last] != b'/' { last -= 1; }
+                len = if last == 0 { 1 } else { last };
+            }
+            continue;
+        }
+        if len > 1 { if len >= 255 { break; } out[len] = b'/'; len += 1; }
+        let n = comp.len().min(255 - len);
+        out[len..len + n].copy_from_slice(&comp[..n]);
+        len += n;
+    }
+    len
+}
+
+/// Resolve every symlink in a **tmpfs** path, iteratively.
+///
+/// `follow_final` selects the two POSIX flavours of lookup: `false` stops one
+/// component short, which is what unlink/rmdir/rename/lstat/readlink/symlink
+/// need (they operate on the link itself); `true` is what open/stat/chmod/…
+/// need. Intermediate components are always followed regardless.
+///
+/// A relative target is resolved against the directory holding the *symlink*,
+/// never against the caller's cwd — that distinction is the classic bug here,
+/// and it is why the splice below reuses `path[..comp_start]` rather than
+/// anything derived from the process.
+///
+/// Returns the resolved path, which may legitimately leave the tmpfs pool
+/// (`/tmp/l -> /bin/ls`): the caller re-dispatches it through normal routing,
+/// so a tmpfs symlink into f2fs works. Returns `Err(-ELOOP)` on a cycle and
+/// `Err(-ENAMETOOLONG)` if a splice overflows.
+fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> Result<usize, i32> {
+    let mut cur = [0u8; 256];
+    let mut cur_len = normalize_abs(input, &mut cur);
+    let mut hops = 0u32;
+
+    loop {
+        let path = &cur[..cur_len];
+        // Left the tmpfs namespace (an absolute target pointing elsewhere) —
+        // stop resolving and let the caller route the result.
+        if !is_tmp_path(path) { break; }
+
+        // Locate the first component that is a symlink. `comp_start` is the
+        // index of the '/' preceding it, `comp_end` one past its last byte.
+        let hit = {
+            let tmp = TMP_FILES.lock();
+            let mut comp_start = 4usize; // past "/tmp"
+            let mut found = None;
+            while comp_start < path.len() {
+                let mut comp_end = comp_start + 1;
+                while comp_end < path.len() && path[comp_end] != b'/' { comp_end += 1; }
+                let is_last = comp_end == path.len();
+                if !(is_last && !follow_final) {
+                    if let Some(idx) = tmp_find(&tmp[..], &path[..comp_end]) {
+                        if tmp[idx].is_link {
+                            // A link body is a path, so 256 bytes is the whole
+                            // range — copying MAX_TMP_SIZE here would put a
+                            // 32 KiB buffer on the kernel stack per hop.
+                            let mut target = [0u8; 256];
+                            let tlen = tmp[idx].len.min(255);
+                            target[..tlen].copy_from_slice(&tmp[idx].data[..tlen]);
+                            found = Some((comp_start, comp_end, target, tlen));
+                            break;
+                        }
+                    }
+                }
+                comp_start = comp_end;
+            }
+            found
+        };
+
+        let (comp_start, comp_end, target, tlen) = match hit {
+            Some(h) => h,
+            None    => break, // fully resolved
+        };
+
+        hops += 1;
+        if hops > SYMLINK_MAX_HOPS { return Err(-40); } // ELOOP
+
+        // Splice: [prefix] + target + [remainder]. An absolute target replaces
+        // the prefix outright; a relative one hangs off the symlink's own
+        // parent directory (`path[..comp_start]`).
+        let mut next = [0u8; 256];
+        let mut n = 0usize;
+        let mut push = |bytes: &[u8], n: &mut usize| -> bool {
+            if *n + bytes.len() > 255 { return false; }
+            next[*n..*n + bytes.len()].copy_from_slice(bytes);
+            *n += bytes.len();
+            true
+        };
+        if tlen > 0 && target[0] == b'/' {
+            if !push(&target[..tlen], &mut n) { return Err(-36); }
+        } else {
+            if !push(&path[..comp_start], &mut n) { return Err(-36); }
+            if !push(b"/", &mut n) { return Err(-36); }
+            if !push(&target[..tlen], &mut n) { return Err(-36); }
+        }
+        if !push(&path[comp_end..], &mut n) { return Err(-36); }
+
+        cur_len = normalize_abs(&next[..n], &mut cur);
+    }
+
+    out[..cur_len].copy_from_slice(&cur[..cur_len]);
+    Ok(cur_len)
+}
+
+/// Release a pool slot backing an ephemeral /proc snapshot once no fd refers
+/// to it any more. Without this, every open of /proc/self/* burned one of the
+/// 32 pool slots forever, and the pool exhaustion surfaced much later as an
+/// unexplained ENOSPC from creat()/mkdir().
+///
+/// Lock order is the established FD_TABLES → TMP_FILES.
+fn tmp_release_ephemeral(idx: usize) {
+    let tbls = FD_TABLES.lock();
+    let still_referenced = tbls.iter().any(|t| {
+        t.in_use && t.fds.iter().any(|f| {
+            f.in_use && matches!(f.kind, VnodeKind::TmpFile { idx: i, .. } if i == idx)
+        })
+    });
+    let mut tmp = TMP_FILES.lock();
+    // `ephemeral` also marks a hard-linked inode whose own name was unlinked
+    // while other names survive. Those are still reachable through an alias,
+    // so an fd going away must not collect them.
+    if !still_referenced && tmp[idx].in_use && tmp[idx].ephemeral
+        && tmp_alias_count(&tmp[..], idx) == 0
+    {
+        tmp[idx] = TmpFileEntry::empty();
+    }
 }
 
 
@@ -1021,6 +1464,7 @@ fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
     let idx = tmp.iter().position(|e| !e.in_use)?;
     tmp[idx] = TmpFileEntry::empty();
     tmp[idx].in_use = true;
+    tmp[idx].ephemeral = true;
     // Unique synthetic path "/tmp/.psys_<idx>".
     let mut fake_path = [0u8; 20];
     let base = b"/tmp/.psys_";
@@ -1114,8 +1558,9 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
     let mut tmp = TMP_FILES.lock();
     let idx = tmp.iter().position(|e| !e.in_use)?;
     tmp[idx] = TmpFileEntry::empty();
-    tmp[idx].in_use   = true;
-    tmp[idx].is_dir   = false;
+    tmp[idx].in_use    = true;
+    tmp[idx].is_dir    = false;
+    tmp[idx].ephemeral = true;
     // Use a unique synthetic path: "/tmp/.proc_<idx>" — never conflicts with user files.
     let mut fake_path = [0u8; 20];
     let base = b"/tmp/.proc_";
@@ -1228,13 +1673,23 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         Some(r) => r,
         None    => return err_reply(-14),
     };
+    // O_PATH names a location without opening it for data access. Strip the
+    // access mode and the destructive flags before anything downstream reads
+    // them, so the open resolves and stats but neither creates nor truncates;
+    // handle_read/handle_write refuse the resulting fd by inspecting O_PATH in
+    // the stored flags.
+    let flags = if flags & O_PATH != 0 {
+        flags & !(O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND | O_EXCL)
+    } else {
+        flags
+    };
     let mut path = &pbuf[..plen];
 
     // Basic normalization: . to /, strip trailing slash
     if path == b"." {
         path = b"/";
-    } else if path.len() > 1 && path.ends_with(b"/") {
-        path = &path[..path.len()-1];
+    } else {
+        path = strip_trailing_slash(path);
     }
 
     let kind = if let Some(lookup_path) = should_lookup_ramfs(path) {
@@ -1263,6 +1718,13 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             let writable = flags & (O_WRONLY | O_RDWR) != 0;
             let create   = flags & O_CREAT  != 0;
             let trunc    = flags & O_TRUNC  != 0;
+            // O_EXCL only has meaning together with O_CREAT, and then it means
+            // "fail if the target already exists". It was ignored outright, so
+            // the atomic-create-a-lockfile idiom — the whole reason the flag
+            // exists — silently succeeded on an existing file and every caller
+            // believed it had won the race. mktemp-style flows and several
+            // coreutils safety checks are built on it.
+            let excl     = create && flags & O_EXCL != 0;
             let accmode  = flags & 0x3;
             let want_read  = accmode != O_WRONLY;
             let want_write = accmode == O_WRONLY || accmode == O_RDWR;
@@ -1270,12 +1732,30 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             let egid = sched::egid_of(pid);
 
             let mut tmp = TMP_FILES.lock();
-            // Look for an existing entry.
-            let existing = tmp.iter().position(|e| {
-                e.in_use && !e.is_dir && e.path_len == path.len() && &e.path[..path.len()] == path
-            });
+            // A mkdir'd tmpfs directory opens as a directory vnode — the
+            // TmpFile slot it already has, with `pos` doubling as the
+            // getdents64 cursor. Before this, the file lookup below skipped
+            // is_dir entries entirely, so opendir("/tmp/sub") was ENOENT and
+            // O_CREAT on it would have shadowed the directory with a file.
+            if let Some(idx) = tmp_find(&tmp[..], path).filter(|&i| tmp[i].is_dir) {
+                if excl { return err_reply(-17); } // EEXIST — beats EISDIR, as on Linux
+                if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
+                if !check_access(tmp[idx].mode, tmp[idx].uid, tmp[idx].gid, euid, egid, true, false) {
+                    return err_reply(-13); // EACCES
+                }
+                VnodeKind::TmpFile { idx, pos: 0, writable: false }
+            } else {
+            // Look for an existing entry. A hard-link alias carries no bytes,
+            // so the fd must be bound to the slot that owns them — do that
+            // once, here, and every downstream read/write/lseek/ftruncate/
+            // fstat keeps working on a bare pool index unchanged.
+            let existing = tmp_find(&tmp[..], path).map(|i| tmp_owner(&tmp[..], i));
             match existing {
                 Some(idx) => {
+                    // O_CREAT|O_EXCL on an existing file: EEXIST, checked
+                    // before access permissions so an unreadable file still
+                    // reports "already there" rather than leaking EACCES.
+                    if excl { return err_reply(-17); } // EEXIST
                     if !check_access(tmp[idx].mode, tmp[idx].uid, tmp[idx].gid, euid, egid, want_read, want_write) {
                         return err_reply(-13); // EACCES
                     }
@@ -1286,6 +1766,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     VnodeKind::TmpFile { idx, pos, writable: writable || create }
                 }
                 None if create => {
+                    // The parent directory must already exist, exactly as on
+                    // any real fs: `touch /tmp/nodir/f` is ENOENT, not a file
+                    // named "/tmp/nodir/f" that no directory can enumerate.
+                    match tmp_parent(path) {
+                        Some(p) if tmp_dir_exists(&tmp[..], p) => {}
+                        _ => return err_reply(-2), // ENOENT
+                    }
+                    if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }
                     // Allocate a new slot.
                     match tmp.iter().position(|e| !e.in_use) {
                         Some(idx) => {
@@ -1295,15 +1783,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                             tmp[idx].mode     = mode & 0o777 & !sched::umask(u32::MAX);
                             tmp[idx].uid      = euid;
                             tmp[idx].gid      = egid;
-                            let copy_len = path.len().min(MAX_TMP_PATH - 1);
-                            tmp[idx].path[..copy_len].copy_from_slice(&path[..copy_len]);
-                            tmp[idx].path_len = copy_len;
+                            tmp_set_path(&mut tmp[idx], path);
                             VnodeKind::TmpFile { idx, pos: 0, writable: true }
                         }
                         None => return err_reply(-28), // ENOSPC
                     }
                 }
                 None => return err_reply(-2), // ENOENT
+            }
             }
         } else if lookup_path.starts_with(b"/proc/self/") && lookup_path != b"/proc/self/" {
             let kind = gen_proc_self(pid, lookup_path);
@@ -1329,7 +1816,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             if found.is_none() {
                 for entry in RAMFS {
                     if lookup_path == entry.path {
-                        found = Some(VnodeKind::RamFile { data: entry.data, pos: 0 });
+                        found = Some(VnodeKind::RamFile { data: entry.data, pos: 0, is_dir: false });
                         break;
                     }
                 }
@@ -1337,13 +1824,13 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             if found.is_none() {
                 for &dir in RAMFS_DIRS {
                     if lookup_path == dir {
-                        found = Some(VnodeKind::RamFile { data: dir, pos: 0 });
+                        found = Some(VnodeKind::RamFile { data: dir, pos: 0, is_dir: true });
                         break;
                     }
                 }
             }
             if found.is_none() && is_tmp_path(path) {
-                found = Some(VnodeKind::RamFile { data: b"/tmp", pos: 0 });
+                found = Some(VnodeKind::RamFile { data: b"/tmp", pos: 0, is_dir: true });
             }
             // Check tmpfs dirs
             if found.is_none() && is_tmp_path(path) {
@@ -1356,7 +1843,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
             if found.is_none() {
                 if let Some(data) = find_in_initrd(lookup_path) {
-                    found = Some(VnodeKind::RamFile { data, pos: 0 });
+                    found = Some(VnodeKind::RamFile { data, pos: 0, is_dir: false });
                 }
             }
             if found.is_none() {
@@ -1395,6 +1882,17 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         }
     };
 
+    // A RAMFS pseudo-directory opens read-only, exactly as on Linux: it may be
+    // enumerated (opendir/getdents64) but never written. This is also the
+    // documented failure mode `O_TMPFILE` callers probe for — tempfile(3) opens
+    // its target *directory* with O_RDWR|O_TMPFILE and falls back to a named
+    // temp file on EISDIR. We used to succeed that open and hand back the
+    // directory's own path string as a readable regular file, which is how
+    // `printf '1\n2\n3\n' | tac` came to print "/tmp".
+    if let VnodeKind::RamFile { is_dir: true, .. } = kind {
+        if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
+    }
+
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) {
         Some(t) => t,
@@ -1410,6 +1908,8 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    // An O_PATH descriptor carries no access rights — POSIX/Linux answer EBADF.
+    if tbl.fds[fd].flags & O_PATH != 0 { return err_reply(-9); }
     let buf = buf_ptr as *mut u8;
     match &mut tbl.fds[fd].kind {
         VnodeKind::DevNull =>
@@ -1471,7 +1971,11 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 reply => reply,
             }
         }
-        VnodeKind::RamFile { data, pos } => {
+        VnodeKind::RamFile { data, pos, is_dir } => {
+            // read(2) on a directory is EISDIR. For a RAMFS_DIRS entry `data`
+            // is the directory's own path, not file content — returning it
+            // here leaked that static buffer to userspace as file data.
+            if *is_dir { return err_reply(-21); } // EISDIR
             let remaining = data.len().saturating_sub(*pos);
             let n = count.min(remaining);
             if n == 0 { return val_reply(0); }
@@ -1560,6 +2064,8 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    // See handle_read: O_PATH grants no access rights.
+    if tbl.fds[fd].flags & O_PATH != 0 { return err_reply(-9); }
     let buf = buf_ptr as *const u8;
     match &mut tbl.fds[fd].kind {
         VnodeKind::DevUrandom | VnodeKind::DevNull | VnodeKind::DevZero =>
@@ -1726,6 +2232,7 @@ fn handle_close(pid: u32, fd: usize) -> Message {
             proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
             let _ = call_port(port, proxy);
         }
+        VnodeKind::TmpFile { idx, .. } => tmp_release_ephemeral(idx),
         _ => {}
     }
     ok_reply()
@@ -1739,7 +2246,9 @@ fn handle_lseek(pid: u32, fd: usize, offset: i64, whence: u32) -> Message {
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
     match &mut tbl.fds[fd].kind {
-        VnodeKind::RamFile { data, pos } => {
+        VnodeKind::RamFile { data, pos, .. } => {
+            // For a pseudo-directory `pos` is the getdents64 cursor, so
+            // lseek(fd, 0, SEEK_SET) still works as rewinddir().
             let len = data.len() as i64;
             let new_pos = match whence {
                 SEEK_SET => offset,
@@ -2242,8 +2751,24 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
 
-    let (dir_path, start_pos) = match &tbl.fds[fd].kind {
-        VnodeKind::RamFile { data, pos } => (*data, *pos),
+    // A tmpfs directory's path is not `'static` (it lives in the TMP_FILES
+    // pool and can be rmdir'd), so copy it into a frame-local buffer and
+    // borrow *that* for the whole enumeration.
+    let mut tmp_dir_buf = [0u8; MAX_TMP_PATH];
+    let mut tmp_dir_len = 0usize;
+    let mut dir_is_tmp  = false;
+    let (static_path, start_pos): (&'static [u8], usize) = match &tbl.fds[fd].kind {
+        VnodeKind::RamFile { data, pos, .. } => (*data, *pos),
+        VnodeKind::TmpFile { idx, pos, .. } => {
+            let i = *idx; let p = *pos;
+            let t = TMP_FILES.lock();
+            if !t[i].in_use || !t[i].is_dir { return err_reply(-20); } // ENOTDIR
+            tmp_dir_len = t[i].path_len;
+            tmp_dir_buf[..tmp_dir_len].copy_from_slice(&t[i].path[..tmp_dir_len]);
+            drop(t);
+            dir_is_tmp = true;
+            (b"", p)
+        }
         VnodeKind::MountedFile { port, file_id } => {
             let port = *port; let file_id = *file_id;
             drop(tbls);
@@ -2256,6 +2781,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         }
         _ => return err_reply(-20), // ENOTDIR
     };
+    let dir_path: &[u8] = if dir_is_tmp { &tmp_dir_buf[..tmp_dir_len] } else { static_path };
     let dir_len = dir_path.len();
     let buf = buf_ptr as *mut u8;
     let mut off = 0usize;
@@ -2285,7 +2811,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     }
     if pos == 1 {
         if let Some(r) = write_dirent(buf, off, count, 1, b"..", 4) { off += r; pos += 1; }
-        else { tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos }; return val_reply(off as u64); }
+        else { set_dir_pos(&mut tbl.fds[fd].kind, pos); return val_reply(off as u64); }
     }
 
     let mut virtual_idx = 2usize;
@@ -2305,7 +2831,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                 if let Some(r) = write_dirent(buf, off, count, virtual_idx as u64 + 100, name, 4) {
                     off += r; pos += 1;
                 } else {
-                    tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
+                    set_dir_pos(&mut tbl.fds[fd].kind, pos);
                     return val_reply(off as u64);
                 }
             }
@@ -2327,7 +2853,45 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                 if let Some(r) = write_dirent(buf, off, count, virtual_idx as u64 + 200, name, 8) {
                     off += r; pos += 1;
                 } else {
-                    tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
+                    set_dir_pos(&mut tbl.fds[fd].kind, pos);
+                    return val_reply(off as u64);
+                }
+            }
+            virtual_idx += 1;
+        }
+    }
+
+    // Writable tmpfs pool (/tmp and anything mkdir'd underneath it).
+    //
+    // Without this pass every tmpfs directory enumerated as empty: `/tmp`
+    // opens as RamFile{b"/tmp"} (it is a RAMFS_DIRS entry) and the loops
+    // above only ever walk the *static* tables, so `ls /tmp` exited 0 with
+    // no output even though the files were readable by name.
+    {
+        let tmp = TMP_FILES.lock();
+        for (i, e) in tmp.iter().enumerate() {
+            // Ephemeral /proc snapshots park under fake "/tmp/.proc_N" paths;
+            // they are fd-owned scratch, not directory contents.
+            if !e.in_use || e.ephemeral { continue; }
+            let p = &e.path[..e.path_len];
+            // Direct child of dir_path? (tmpfs paths are always absolute and
+            // rooted at /tmp, so dir_path is never "/" here.)
+            if p.len() <= dir_len + 1 || !p.starts_with(dir_path) || p[dir_len] != b'/' { continue; }
+            let name = &p[dir_len + 1..];
+            if name.is_empty() || name.contains(&b'/') { continue; }
+            if virtual_idx >= pos {
+                // DT_DIR / DT_FIFO / DT_REG
+                // DT_DIR / DT_FIFO / DT_LNK / DT_REG. `ls -F` prints the '@'
+                // suffix and `ls -l` the 'l' type char straight off this.
+                let d_type = if e.is_dir { 4 }
+                             else if e.is_fifo { 1 }
+                             else if e.is_link { 10 }
+                             else { 8 };
+                if let Some(r) = write_dirent(buf, off, count, 400 + i as u64, name, d_type) {
+                    off += r; pos += 1;
+                } else {
+                    drop(tmp);
+                    set_dir_pos(&mut tbl.fds[fd].kind, pos);
                     return val_reply(off as u64);
                 }
             }
@@ -2357,7 +2921,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                                     off += r; pos += 1;
                                 } else {
                                     drop(devices);
-                                    tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
+                                    set_dir_pos(&mut tbl.fds[fd].kind, pos);
                                     return val_reply(off as u64);
                                 }
                             }
@@ -2374,7 +2938,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                                 off += r; pos += 1;
                             } else {
                                 drop(devices);
-                                tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
+                                set_dir_pos(&mut tbl.fds[fd].kind, pos);
                                     return val_reply(off as u64);
                             }
                         }
@@ -2430,7 +2994,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                         if let Some(r) = write_dirent(buf, off, count, 1000 + offset as u64, child_name, d_type) {
                             off += r; pos += 1;
                         } else {
-                            tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
+                            set_dir_pos(&mut tbl.fds[fd].kind, pos);
                             return val_reply(off as u64);
                         }
                     }
@@ -2444,7 +3008,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         }
     }
 
-    tbl.fds[fd].kind = VnodeKind::RamFile { data: dir_path, pos };
+    set_dir_pos(&mut tbl.fds[fd].kind, pos);
     val_reply(off as u64)
 }
 
@@ -2697,7 +3261,10 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
 
     let bytes_avail: i32 = match &tbl.fds[fd].kind {
         VnodeKind::Pipe { ring, is_write: false } => { let r = *ring; drop(tbls); PIPE_RINGS.lock()[r].count as i32 }
-        VnodeKind::RamFile { data, pos } => (data.len().saturating_sub(*pos)) as i32,
+        VnodeKind::RamFile { data, pos, is_dir } => {
+            if *is_dir { return err_reply(-25); } // ENOTTY — no readable byte stream
+            (data.len().saturating_sub(*pos)) as i32
+        }
         VnodeKind::TmpFile { idx, pos, .. } => { let i = *idx; let c = *pos; drop(tbls); TMP_FILES.lock()[i].len.saturating_sub(c) as i32 }
         VnodeKind::EventFd { slot } => { let s = *slot; drop(tbls); if EVENTFD_COUNTERS.lock()[s] > 0 { 8 } else { 0 } }
         VnodeKind::TimerFd { slot } => { let s = *slot; drop(tbls); if timerfd_poll_expirations(s) > 0 { 8 } else { 0 } }
@@ -2804,139 +3371,442 @@ fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
     }
 }
 
+// NOTE — every handler below asks `tmpfs_path()` *before* `find_mount_port()`.
+// See the comment on `tmpfs_path` for why the reverse order silently routed
+// all of /tmp's mutating operations at the pivoted-root F2FS mount.
+
 fn handle_rename(old_ptr: usize, new_ptr: usize) -> Message {
     let (obuf, olen) = match read_cstr_raw(old_ptr) { Some(r) => r, None => return err_reply(-14) };
     let (nbuf, nlen) = match read_cstr_raw(new_ptr) { Some(r) => r, None => return err_reply(-14) };
-    let old = &obuf[..olen]; let new = &nbuf[..nlen];
 
-    let old_port = find_mount_port(old);
-    let new_port = find_mount_port(new);
-    if old_port.is_some() || new_port.is_some() {
-        return match (old_port, new_port) {
-            (Some(op), Some(np)) if op == np => {
-                let mut proxy = Message::empty();
-                proxy.tag = VFS_RENAME;
-                proxy.data[0..8].copy_from_slice(&(old_ptr as u64).to_le_bytes());
-                proxy.data[8..16].copy_from_slice(&(new_ptr as u64).to_le_bytes());
-                call_port(op, proxy)
+    match (tmpfs_path(&obuf[..olen]), tmpfs_path(&nbuf[..nlen])) {
+        (Some(old), Some(new)) => tmpfs_rename(old, new),
+        // One side in tmpfs, the other not: a real cross-filesystem move,
+        // which is EXDEV. Coreutils' `mv` falls back to copy+unlink on this.
+        (Some(_), None) | (None, Some(_)) => err_reply(-18),
+        (None, None) => {
+            let old_port = find_mount_port(&obuf[..olen]);
+            let new_port = find_mount_port(&nbuf[..nlen]);
+            match (old_port, new_port) {
+                (Some(op), Some(np)) if op == np => {
+                    let mut proxy = Message::empty();
+                    proxy.tag = VFS_RENAME;
+                    proxy.data[0..8].copy_from_slice(&(old_ptr as u64).to_le_bytes());
+                    proxy.data[8..16].copy_from_slice(&(new_ptr as u64).to_le_bytes());
+                    call_port(op, proxy)
+                }
+                (None, None) => err_reply(-30), // EROFS — RAMFS and friends
+                _ => err_reply(-18),            // EXDEV
             }
-            _ => err_reply(-18), // EXDEV — cross-device rename not supported
-        };
+        }
+    }
+}
+
+/// rename(2) within the tmpfs pool. Both paths are already normalised.
+///
+/// Renaming a directory rewrites every descendant's stored path, since the
+/// pool is flat and parentage is encoded in the path bytes alone.
+fn tmpfs_rename(old: &[u8], new: &[u8]) -> Message {
+    if old == new { return ok_reply(); }
+    if old == b"/tmp" || new == b"/tmp" { return err_reply(-16); } // EBUSY
+    if new.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }     // ENAMETOOLONG
+
+    let open_fds = tmp_open_fd_mask(); // before TMP_FILES: FD_TABLES → TMP_FILES
+    let mut tmp = TMP_FILES.lock();
+    let idx = match tmp_find(&tmp[..], old) { Some(i) => i, None => return err_reply(-2) };
+    let src_is_dir = tmp[idx].is_dir;
+
+    // "mv d d/sub" would detach the subtree from the namespace.
+    if new.len() > old.len() && new.starts_with(old) && new[old.len()] == b'/' {
+        return err_reply(-22); // EINVAL
+    }
+    let parent = match tmp_parent(new) { Some(p) => p, None => return err_reply(-16) };
+    if !tmp_dir_exists(&tmp[..], parent) { return err_reply(-2); } // ENOENT
+
+    // Destination handling, POSIX order: type mismatches first, then the
+    // implicit removal of an existing target.
+    if let Some(didx) = tmp_find(&tmp[..], new) {
+        let dst_is_dir = tmp[didx].is_dir;
+        if src_is_dir && !dst_is_dir { return err_reply(-20); }  // ENOTDIR
+        if !src_is_dir && dst_is_dir { return err_reply(-21); }  // EISDIR
+        if dst_is_dir && tmp_has_descendants(&tmp[..], new, didx) {
+            return err_reply(-39); // ENOTEMPTY
+        }
+        // Clobbering the destination drops one name, not necessarily the file:
+        // if the victim was hard-linked elsewhere its bytes must survive.
+        tmp_drop_name(&mut tmp[..], didx, open_fds);
     }
 
-    if !is_tmp_path(old) || !is_tmp_path(new) { return err_reply(-30); }
-    let mut tmp = TMP_FILES.lock();
-    match tmp.iter().position(|e| e.in_use && !e.is_dir && e.path_len == olen && &e.path[..olen] == old) {
-        Some(idx) => {
-            let copy_len = nlen.min(MAX_TMP_PATH - 1);
-            tmp[idx].path[..copy_len].copy_from_slice(&new[..copy_len]);
-            tmp[idx].path_len = copy_len;
-            ok_reply()
-        }
-        None => err_reply(-2),
+    if !src_is_dir {
+        tmp_set_path(&mut tmp[idx], new);
+        return ok_reply();
     }
+
+    // Directory: check every descendant fits under the new prefix *before*
+    // mutating anything, so a failure leaves the pool untouched.
+    let grow = new.len() as isize - old.len() as isize;
+    for (i, e) in tmp.iter().enumerate() {
+        if i == idx || !e.in_use || e.ephemeral { continue; }
+        if e.path_len > old.len() && &e.path[..old.len()] == old && e.path[old.len()] == b'/' {
+            if (e.path_len as isize + grow) as usize > MAX_TMP_PATH - 1 {
+                return err_reply(-36); // ENAMETOOLONG
+            }
+        }
+    }
+    let mut buf = [0u8; MAX_TMP_PATH];
+    for i in 0..MAX_TMP_FILES {
+        if i == idx || !tmp[i].in_use || tmp[i].ephemeral { continue; }
+        let plen = tmp[i].path_len;
+        if plen <= old.len() || &tmp[i].path[..old.len()] != old || tmp[i].path[old.len()] != b'/' {
+            continue;
+        }
+        let tail_len = plen - old.len();
+        buf[..new.len()].copy_from_slice(new);
+        buf[new.len()..new.len() + tail_len].copy_from_slice(&tmp[i].path[old.len()..plen]);
+        let total = new.len() + tail_len;
+        tmp_set_path(&mut tmp[i], &buf[..total]);
+    }
+    tmp_set_path(&mut tmp[idx], new);
+    ok_reply()
 }
 
 fn handle_unlink(path_ptr: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
-    let path = &pbuf[..plen];
-    if let Some(port) = find_mount_port(path) {
+    let raw = &pbuf[..plen];
+
+    if let Some(path) = tmpfs_path(raw) {
+        if path == b"/tmp" { return err_reply(-21); } // EISDIR
+        let open_fds = tmp_open_fd_mask(); // before TMP_FILES: FD_TABLES → TMP_FILES
+        let mut tmp = TMP_FILES.lock();
+        return match tmp_find(&tmp[..], path) {
+            Some(idx) if tmp[idx].is_dir => err_reply(-21), // EISDIR — use rmdir()
+            // Drops the *name*. The bytes go only when the last name does —
+            // see tmp_drop_name. A symlink lands here too (the choke point
+            // deliberately did not follow the final component), so `rm l`
+            // removes the link and never the file it points at.
+            Some(idx) => { tmp_drop_name(&mut tmp[..], idx, open_fds); ok_reply() }
+            None      => err_reply(-2),
+        };
+    }
+    if let Some(port) = find_mount_port(raw) {
         let mut proxy = Message::empty();
         proxy.tag = VFS_UNLINK;
         proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
         return call_port(port, proxy);
     }
-    if !is_tmp_path(path) { return err_reply(-30); }
-    let mut tmp = TMP_FILES.lock();
-    match tmp.iter().position(|e| e.in_use && e.path_len == plen && &e.path[..plen] == path) {
-        Some(idx) if tmp[idx].is_dir => err_reply(-21), // EISDIR — use rmdir() instead
-        Some(idx) => { tmp[idx] = TmpFileEntry::empty(); ok_reply() }
-        None      => err_reply(-2),
-    }
+    err_reply(-30) // EROFS
 }
 
 fn handle_mkdir(pid: u32, path_ptr: usize, mode: u32) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
-    let path = &pbuf[..plen];
-    if let Some(port) = find_mount_port(path) {
+    let raw = &pbuf[..plen];
+
+    if let Some(path) = tmpfs_path(raw) {
+        if path == b"/tmp" { return err_reply(-17); }                  // EEXIST
+        if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }    // ENAMETOOLONG
+        let mut tmp = TMP_FILES.lock();
+        if tmp_find(&tmp[..], path).is_some() { return err_reply(-17); }
+        // Intermediate components must already exist — `mkdir -p` creates
+        // them outermost-first, so this is the check that makes it correct
+        // rather than silently producing an orphaned "/tmp/a/b".
+        match tmp_parent(path) {
+            Some(p) if tmp_dir_exists(&tmp[..], p) => {}
+            _ => return err_reply(-2), // ENOENT
+        }
+        let idx = match tmp.iter().position(|e| !e.in_use) {
+            Some(i) => i,
+            None    => return err_reply(-28), // ENOSPC
+        };
+        tmp[idx] = TmpFileEntry::empty();
+        tmp[idx].in_use = true;
+        tmp[idx].is_dir = true;
+        tmp[idx].mode = mode & 0o777 & !sched::umask(u32::MAX);
+        tmp[idx].uid  = sched::euid_of(pid);
+        tmp[idx].gid  = sched::egid_of(pid);
+        tmp_set_path(&mut tmp[idx], path);
+        return ok_reply();
+    }
+    if let Some(port) = find_mount_port(raw) {
         let mut proxy = Message::empty();
         proxy.tag = VFS_MKDIR;
         proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
         proxy.data[8..16].copy_from_slice(&(mode as u64).to_le_bytes());
         return call_port(port, proxy);
     }
-    if !is_tmp_path(path) { return err_reply(-30); }
-    for &dir in RAMFS_DIRS { if path == dir { return err_reply(-17); } }
-    let mut tmp = TMP_FILES.lock();
-    if tmp.iter().any(|e| e.in_use && e.path_len == plen && &e.path[..plen] == path) { return err_reply(-17); }
-    match tmp.iter().position(|e| !e.in_use) {
-        Some(idx) => {
-            tmp[idx] = TmpFileEntry::empty(); tmp[idx].in_use = true; tmp[idx].is_dir = true;
-            tmp[idx].mode = mode & 0o777 & !sched::umask(u32::MAX);
-            tmp[idx].uid  = sched::euid_of(pid);
-            tmp[idx].gid  = sched::egid_of(pid);
-            let copy_len = plen.min(MAX_TMP_PATH - 1);
-            tmp[idx].path[..copy_len].copy_from_slice(&path[..copy_len]);
-            tmp[idx].path_len = copy_len;
+    for &dir in RAMFS_DIRS { if raw == dir { return err_reply(-17); } }
+    err_reply(-30) // EROFS
+}
+
+/// mknod(path_ptr, mode) — create a /tmp entry as either a plain file (no
+/// S_IFMT bits, or S_IFREG) or a FIFO (S_IFIFO). Mirrors handle_mkdir's
+/// duplicate/parent-exists/free-slot checks; the kernel-side caller
+/// (sys_mknodat) has already rejected device/socket type bits with EPERM,
+/// so by the time a message reaches here `mode` only ever names a file or
+/// a FIFO.
+///
+/// SCOPE LIMIT: this only makes the tmpfs entry exist and reports the right
+/// type from fstat/stat/getdents64 (S_IFIFO / DT_FIFO). It does NOT
+/// implement FIFO read/write semantics — VFS_OPEN on an is_fifo entry still
+/// behaves like an empty regular file (no blocking open, no rendezvous
+/// between reader and writer). Real FIFO semantics would need their own
+/// vnode kind, the way `Pipe` already has one.
+fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
+    const S_IFMT:  u32 = 0o170000;
+    const S_IFIFO: u32 = 0o010000;
+
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let raw = &pbuf[..plen];
+
+    if let Some(path) = tmpfs_path(raw) {
+        if path == b"/tmp" { return err_reply(-17); }                  // EEXIST
+        if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }    // ENAMETOOLONG
+        let mut tmp = TMP_FILES.lock();
+        if tmp_find(&tmp[..], path).is_some() { return err_reply(-17); } // EEXIST
+        match tmp_parent(path) {
+            Some(p) if tmp_dir_exists(&tmp[..], p) => {}
+            _ => return err_reply(-2), // ENOENT
+        }
+        let idx = match tmp.iter().position(|e| !e.in_use) {
+            Some(i) => i,
+            None    => return err_reply(-28), // ENOSPC
+        };
+        tmp[idx] = TmpFileEntry::empty();
+        tmp[idx].in_use  = true;
+        tmp[idx].is_dir  = false;
+        tmp[idx].is_fifo = mode & S_IFMT == S_IFIFO;
+        tmp[idx].mode = mode & 0o777 & !sched::umask(u32::MAX);
+        tmp[idx].uid  = sched::euid_of(pid);
+        tmp[idx].gid  = sched::egid_of(pid);
+        tmp_set_path(&mut tmp[idx], path);
+        return ok_reply();
+    }
+    for &dir in RAMFS_DIRS { if raw == dir { return err_reply(-17); } }
+    err_reply(-30) // EROFS
+}
+
+/// symlink(target, linkpath) — create a symlink.
+///
+/// The target is stored verbatim in the entry's data bytes: no normalisation,
+/// no existence check, no resolution. A dangling link is a perfectly legal
+/// object (`ln -s /nonexistent l` succeeds on every Unix), and rewriting a
+/// relative target at creation time would break the "resolve against the
+/// link's own directory" rule that `tmp_resolve_links` implements.
+fn handle_symlink(pid: u32, target_ptr: usize, link_ptr: usize) -> Message {
+    let (tbuf, tlen) = match read_cstr_raw(target_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let (lbuf, llen) = match read_cstr_raw(link_ptr)   { Some(r) => r, None => return err_reply(-14) };
+    if tlen == 0 { return err_reply(-2); } // ENOENT — empty target
+    let raw = &lbuf[..llen];
+
+    if let Some(path) = tmpfs_path(raw) {
+        if path == b"/tmp" { return err_reply(-17); }               // EEXIST
+        if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); } // ENAMETOOLONG
+        let mut tmp = TMP_FILES.lock();
+        if tmp_find(&tmp[..], path).is_some() { return err_reply(-17); } // EEXIST
+        match tmp_parent(path) {
+            Some(p) if tmp_dir_exists(&tmp[..], p) => {}
+            _ => return err_reply(-2), // ENOENT
+        }
+        let idx = match tmp.iter().position(|e| !e.in_use) {
+            Some(i) => i,
+            None    => return err_reply(-28), // ENOSPC
+        };
+        tmp[idx] = TmpFileEntry::empty();
+        tmp[idx].in_use  = true;
+        tmp[idx].is_link = true;
+        // Symlink permission bits are 0777 everywhere and are never consulted;
+        // the target's bits are what govern access.
+        tmp[idx].mode = 0o777;
+        tmp[idx].uid  = sched::euid_of(pid);
+        tmp[idx].gid  = sched::egid_of(pid);
+        tmp[idx].len  = tlen;
+        tmp[idx].data[..tlen].copy_from_slice(&tbuf[..tlen]);
+        tmp_set_path(&mut tmp[idx], path);
+        return ok_reply();
+    }
+    if let Some(port) = find_mount_port(raw) {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_SYMLINK;
+        proxy.data[0..8].copy_from_slice(&(target_ptr as u64).to_le_bytes());
+        proxy.data[8..16].copy_from_slice(&(link_ptr as u64).to_le_bytes());
+        return call_port(port, proxy);
+    }
+    err_reply(-30) // EROFS
+}
+
+/// readlink(path, buf, len) — copy a symlink's body out, untruncated-length
+/// semantics included: the return is `min(target_len, buf_len)` and the buffer
+/// is never NUL-terminated, exactly as readlink(2) specifies.
+///
+/// EINVAL (not ENOENT) for a path that exists but is not a symlink — callers
+/// including coreutils' `ls` use precisely that to tell the two apart.
+fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
+    if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let raw = &pbuf[..plen];
+
+    if let Some(path) = tmpfs_path(raw) {
+        let tmp = TMP_FILES.lock();
+        return match tmp_find(&tmp[..], path) {
+            Some(idx) if tmp[idx].is_link => {
+                let n = tmp[idx].len.min(buf_len);
+                unsafe { core::ptr::copy_nonoverlapping(tmp[idx].data.as_ptr(), buf_ptr as *mut u8, n); }
+                val_reply(n as u64)
+            }
+            Some(_) => err_reply(-22), // EINVAL — exists, not a link
+            // "/tmp" itself is never a TMP_FILES entry — it is a RAMFS_DIRS
+            // pseudo-directory, and the pool holds only strict descendants of
+            // it. Falling through to a blanket ENOENT here made
+            // readlink("/tmp") claim /tmp does not exist, which is what broke
+            // every *relative* realpath(1) under /tmp: musl's realpath(3)
+            // readlink()s each path component in turn and aborts the whole
+            // call unless a failure is exactly EINVAL ("not a symlink"). Any
+            // other errno propagates, so ENOENT on the "/tmp" component made
+            // canonicalizing the cwd fail before the operand was ever looked
+            // at. Answer for the pseudo-directory the same way the RAMFS_DIRS
+            // arm below would.
+            None if path == b"/tmp" => err_reply(-22),
+            None    => err_reply(-2),  // ENOENT
+        };
+    }
+    if let Some(port) = find_mount_port(raw) {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_READLINK;
+        proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+        proxy.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
+        proxy.data[16..24].copy_from_slice(&(buf_len as u64).to_le_bytes());
+        return call_port(port, proxy);
+    }
+    // RamFS, devfs and /proc hold no symlinks. Distinguish "exists but isn't a
+    // link" from "isn't there" so callers get the same two errnos they would
+    // on Linux.
+    for &dir in RAMFS_DIRS { if raw == dir { return err_reply(-22); } }
+    for entry in RAMFS     { if raw == entry.path { return err_reply(-22); } }
+    err_reply(-2) // ENOENT
+}
+
+/// link(oldpath, newpath) — create a second name for an existing file.
+///
+/// Cross-filesystem links are EXDEV, and `cp -l`/`mv` rely on getting exactly
+/// that to fall back to a copy. Directory sources are EPERM (Linux reserves
+/// directory hard links for the filesystem's own "." and ".." and refuses them
+/// to userspace, because a directory cycle has no safe unwind).
+fn handle_link(old_ptr: usize, new_ptr: usize) -> Message {
+    let (obuf, olen) = match read_cstr_raw(old_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let (nbuf, nlen) = match read_cstr_raw(new_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let (oraw, nraw) = (&obuf[..olen], &nbuf[..nlen]);
+
+    let (otmp, ntmp) = (tmpfs_path(oraw), tmpfs_path(nraw));
+    match (otmp, ntmp) {
+        (Some(old), Some(new)) => {
+            if new.len() > MAX_TMP_PATH - 1 { return err_reply(-36); } // ENAMETOOLONG
+            let mut tmp = TMP_FILES.lock();
+            let src = match tmp_find(&tmp[..], old) { Some(i) => i, None => return err_reply(-2) };
+            if tmp[src].is_dir { return err_reply(-1); } // EPERM
+            if tmp_find(&tmp[..], new).is_some() { return err_reply(-17); } // EEXIST
+            match tmp_parent(new) {
+                Some(p) if tmp_dir_exists(&tmp[..], p) => {}
+                _ => return err_reply(-2), // ENOENT
+            }
+            let owner = tmp_owner(&tmp[..], src);
+            let idx = match tmp.iter().position(|e| !e.in_use) {
+                Some(i) => i,
+                None    => return err_reply(-28), // ENOSPC
+            };
+            tmp[idx] = TmpFileEntry::empty();
+            tmp[idx].in_use  = true;
+            // The alias carries no bytes of its own — everything that reads
+            // content goes through tmp_owner() to `owner`. Mode/uid/gid are
+            // mirrored only so a lock-free peek at the slot isn't nonsense;
+            // stat() reads them from the owner regardless.
+            tmp[idx].link_to = owner;
+            tmp[idx].is_fifo = tmp[owner].is_fifo;
+            tmp[idx].is_link = tmp[owner].is_link;
+            tmp[idx].mode    = tmp[owner].mode;
+            tmp[idx].uid     = tmp[owner].uid;
+            tmp[idx].gid     = tmp[owner].gid;
+            tmp_set_path(&mut tmp[idx], new);
             ok_reply()
         }
-        None => err_reply(-28),
+        (None, None) => {
+            // Both outside tmpfs: legal only if one mount owns both.
+            match (find_mount_port(oraw), find_mount_port(nraw)) {
+                (Some(a), Some(b)) if a == b => {
+                    let mut proxy = Message::empty();
+                    proxy.tag = VFS_LINK;
+                    proxy.data[0..8].copy_from_slice(&(old_ptr as u64).to_le_bytes());
+                    proxy.data[8..16].copy_from_slice(&(new_ptr as u64).to_le_bytes());
+                    call_port(a, proxy)
+                }
+                (Some(_), Some(_)) => err_reply(-18), // EXDEV
+                _                  => err_reply(-30), // EROFS
+            }
+        }
+        // Exactly one side is tmpfs — different filesystems by construction.
+        _ => err_reply(-18), // EXDEV
     }
 }
 
 fn handle_rmdir(path_ptr: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
-    let path = &pbuf[..plen];
-    if let Some(port) = find_mount_port(path) {
+    let raw = &pbuf[..plen];
+
+    if let Some(path) = tmpfs_path(raw) {
+        if path == b"/tmp" { return err_reply(-16); } // EBUSY — mount point
+        let mut tmp = TMP_FILES.lock();
+        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
+        if !tmp[idx].is_dir { return err_reply(-20); } // ENOTDIR
+        if tmp_has_descendants(&tmp[..], path, idx) { return err_reply(-39); } // ENOTEMPTY
+        tmp[idx] = TmpFileEntry::empty();
+        return ok_reply();
+    }
+    if let Some(port) = find_mount_port(raw) {
         let mut proxy = Message::empty();
         proxy.tag = VFS_RMDIR;
         proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
         return call_port(port, proxy);
     }
-    if !is_tmp_path(path) || path == b"/tmp" {
-        for &dir in RAMFS_DIRS { if path == dir { return err_reply(-16); } } // EBUSY
-        return err_reply(-30); // EROFS
-    }
-    let mut tmp = TMP_FILES.lock();
-    let idx = match tmp.iter().position(|e| e.in_use && e.path_len == plen && &e.path[..plen] == path) {
-        Some(i) => i,
-        None    => return err_reply(-2), // ENOENT
-    };
-    if !tmp[idx].is_dir { return err_reply(-20); } // ENOTDIR
-    // Directory must be empty: no other tmpfs entry may live under it.
-    let mut prefix = [0u8; MAX_TMP_PATH];
-    prefix[..plen].copy_from_slice(path);
-    if plen < MAX_TMP_PATH { prefix[plen] = b'/'; }
-    let child_prefix = &prefix[..(plen + 1).min(MAX_TMP_PATH)];
-    let has_children = tmp.iter().enumerate().any(|(i, e)| {
-        i != idx && e.in_use && e.path_len > plen && &e.path[..child_prefix.len()] == child_prefix
-    });
-    if has_children { return err_reply(-39); } // ENOTEMPTY
-    tmp[idx] = TmpFileEntry::empty();
-    ok_reply()
+    for &dir in RAMFS_DIRS { if raw == dir { return err_reply(-16); } } // EBUSY
+    err_reply(-30) // EROFS
 }
 
 // ── chmod/chown ──────────────────────────────────────────────────────────────
 //
-// Only tmpfs entries carry real per-file mode/uid/gid; everything else (RAMFS,
-// device nodes, mounted filesystems) is EROFS/EPERM here rather than the
-// previous silent no-op, since we can't actually persist the change for them.
+// tmpfs entries carry real per-file mode/uid/gid handled locally below.
+// Mounted filesystems (currently f2fs) are routed to their mount server,
+// which persists the change to the on-disk inode. RAMFS and device nodes
+// have no mount port and no per-file storage, so they remain EROFS/EPERM
+// rather than the previous silent no-op.
 
 fn handle_chmod(pid: u32, path_ptr: usize, mode: u32) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
-    let path = &pbuf[..plen];
-    if find_mount_port(path).is_some() { return err_reply(-30); } // EROFS
-    if !is_tmp_path(path) { return err_reply(-30); }
-    let euid = sched::euid_of(pid);
-    let mut tmp = TMP_FILES.lock();
-    match tmp.iter().position(|e| e.in_use && e.path_len == plen && &e.path[..plen] == path) {
-        Some(idx) => {
-            if euid != 0 && euid != tmp[idx].uid { return err_reply(-1); } // EPERM
-            tmp[idx].mode = mode & 0o777;
-            ok_reply()
-        }
-        None => err_reply(-2), // ENOENT
+    let raw = &pbuf[..plen];
+    // tmpfs first: after pivot_root the F2FS mount's prefix is "/", so a
+    // find_mount_port() probe here matched every /tmp path and turned every
+    // chmod under /tmp into EROFS.
+    if let Some(path) = tmpfs_path(raw) {
+        let euid = sched::euid_of(pid);
+        let mut tmp = TMP_FILES.lock();
+        return match tmp_find(&tmp[..], path) {
+            Some(idx) => {
+                if euid != 0 && euid != tmp[idx].uid { return err_reply(-1); } // EPERM
+                tmp[idx].mode = mode & 0o777;
+                ok_reply()
+            }
+            None => err_reply(-2), // ENOENT
+        };
     }
+    // Mounted filesystems (e.g. f2fs on / or /data) now persist mode changes
+    // themselves — this used to be a blanket EROFS regardless of mount, which
+    // is what made `chmod 640 /data/f` fail even though writes/mkdir/rm all
+    // worked fine on the same volume.
+    if let Some(port) = find_mount_port(raw) {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_CHMOD;
+        proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+        proxy.data[8..16].copy_from_slice(&(mode as u64).to_le_bytes());
+        return call_port(port, proxy);
+    }
+    err_reply(-30) // EROFS
 }
 
 fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
@@ -2952,7 +3822,14 @@ fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
             tmp[idx].mode = mode & 0o777;
             ok_reply()
         }
-        VnodeKind::MountedFile { .. } => err_reply(-30), // EROFS
+        VnodeKind::MountedFile { port, file_id } => {
+            drop(tbls);
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_FCHMOD;
+            proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&(mode as u64).to_le_bytes());
+            call_port(port, proxy)
+        }
         _ => err_reply(-1), // EPERM — devices/RAMFS have fixed, root-owned modes
     }
 }
@@ -2960,15 +3837,25 @@ fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
 /// `u32::MAX` for `uid`/`gid` means "leave unchanged" (mirrors chown(2)'s `-1`).
 fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
-    let path = &pbuf[..plen];
-    if find_mount_port(path).is_some() { return err_reply(-30); }
-    if !is_tmp_path(path) { return err_reply(-30); }
-    let euid = sched::euid_of(pid);
-    let mut tmp = TMP_FILES.lock();
-    match tmp.iter().position(|e| e.in_use && e.path_len == plen && &e.path[..plen] == path) {
-        Some(idx) => apply_chown(&mut tmp[idx], euid, uid, gid),
-        None => err_reply(-2), // ENOENT
+    let raw = &pbuf[..plen];
+    if let Some(path) = tmpfs_path(raw) {
+        let euid = sched::euid_of(pid);
+        let mut tmp = TMP_FILES.lock();
+        return match tmp_find(&tmp[..], path) {
+            Some(idx) => apply_chown(&mut tmp[idx], euid, uid, gid),
+            None => err_reply(-2), // ENOENT
+        };
     }
+    // See handle_chmod: mounted filesystems now persist owner changes too.
+    if let Some(port) = find_mount_port(raw) {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_CHOWN;
+        proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+        proxy.data[8..16].copy_from_slice(&(uid as u64).to_le_bytes());
+        proxy.data[16..24].copy_from_slice(&(gid as u64).to_le_bytes());
+        return call_port(port, proxy);
+    }
+    err_reply(-30) // EROFS
 }
 
 fn handle_fchown(pid: u32, fd: usize, uid: u32, gid: u32) -> Message {
@@ -2982,7 +3869,15 @@ fn handle_fchown(pid: u32, fd: usize, uid: u32, gid: u32) -> Message {
             let mut tmp = TMP_FILES.lock();
             apply_chown(&mut tmp[idx], euid, uid, gid)
         }
-        VnodeKind::MountedFile { .. } => err_reply(-30),
+        VnodeKind::MountedFile { port, file_id } => {
+            drop(tbls);
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_FCHOWN;
+            proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&(uid as u64).to_le_bytes());
+            proxy.data[16..24].copy_from_slice(&(gid as u64).to_le_bytes());
+            call_port(port, proxy)
+        }
         _ => err_reply(-1),
     }
 }
@@ -3122,6 +4017,10 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             VnodeKind::DevNull => FdInfo::Static(b"/dev/null"),
             VnodeKind::DevZero => FdInfo::Static(b"/dev/zero"),
             VnodeKind::Pipe { ring, .. } => FdInfo::Pipe(*ring),
+            // A pseudo-directory's `data` *is* its path, so report it directly;
+            // it is not in RAMFS and the reverse data-pointer lookup below
+            // would answer ENOENT for it.
+            VnodeKind::RamFile { data, is_dir: true, .. } => FdInfo::Static(data),
             VnodeKind::RamFile { data, .. } => FdInfo::RamData(data.as_ptr()),
             VnodeKind::TmpFile { idx, .. } => FdInfo::TmpIdx(*idx),
             VnodeKind::EventFd { .. } => FdInfo::Static(b"eventfd"),

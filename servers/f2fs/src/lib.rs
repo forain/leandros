@@ -31,10 +31,21 @@ const VFS_MKDIR:      u64 = 0x20;
 const VFS_FTRUNCATE:  u64 = 0x21;
 const VFS_RENAME:     u64 = 0x22;
 const VFS_RMDIR:      u64 = 0x29;
+const VFS_STATFS:     u64 = 0x33;
+const VFS_SYMLINK:    u64 = 0x35;
+const VFS_FD_PATH:    u64 = 0x23;
+const VFS_READLINK:   u64 = 0x36;
+const VFS_LINK:       u64 = 0x37;
+const VFS_LSTAT:      u64 = 0x38;
+const VFS_CHMOD:      u64 = 0x2B;
+const VFS_FCHMOD:     u64 = 0x2C;
+const VFS_CHOWN:      u64 = 0x2D;
+const VFS_FCHOWN:     u64 = 0x2E;
 
 const O_WRONLY:  u64 = 1;
 const O_RDWR:    u64 = 2;
 const O_CREAT:   u64 = 0o100;
+const O_EXCL:    u64 = 0o200;
 const O_TRUNC:   u64 = 0o1000;
 
 // ── F2FS on-disk byte-offset constants ────────────────────────────────────────
@@ -67,6 +78,13 @@ const CP_NEXT_FREE_NID:  usize = 152;
 // Inode (node block) field offsets
 const INO_MODE:      usize = 0;
 const INO_INLINE:    usize = 3;
+// `__le32 i_uid` / `__le32 i_gid` — real f2fs_inode layout puts these
+// immediately after i_mode/i_advise/i_inline and before i_links (offset 12).
+// scripts/mkfs-f2fs-populated.py never writes these bytes, so every packed
+// inode starts at uid=0/gid=0 (root), matching what stat_common used to
+// hardcode before chown could actually persist anything.
+const INO_UID:       usize = 4;
+const INO_GID:       usize = 8;
 const INO_LINKS:     usize = 12;
 const INO_SIZE:      usize = 16;
 const INO_NAMELEN:   usize = 88;
@@ -99,13 +117,24 @@ const DENTRY_SLOT_LEN:    usize = 8;
 const DENTRY_NAMES_OFF:   usize = DENTRY_ENTRIES_OFF + NR_DENTRY_IN_BLK * 11; // 30+2354=2384
 const DENTRY_ENTRY_SIZE:  usize = 11;
 
+// Directory-entry type byte. This volume format stores Linux's DT_* values
+// directly in the dentry (not the F2FS_FT_* enum), because that is what
+// scripts/mkfs-f2fs-populated.py writes and what handle_getdents hands
+// straight back as `d_type`. Keep the three in lockstep.
 const DT_DIR:  u8 = 4;
 const DT_REG:  u8 = 8;
+const DT_LNK:  u8 = 10;
 
 // File mode bits
 const S_IFMT:  u16 = 0o170000;
 const S_IFDIR: u16 = 0o040000;
 const S_IFREG: u16 = 0o100000;
+const S_IFLNK: u16 = 0o120000;
+
+/// Symlink traversals allowed in one path resolution before the walk gives up.
+/// Matches Linux's MAXSYMLINKS and the VFS server's `SYMLINK_MAX_HOPS`; the
+/// walk below is iterative, so a cycle costs 40 bounded passes and no stack.
+const SYMLINK_MAX_HOPS: u32 = 40;
 
 // ── Byte helpers ──────────────────────────────────────────────────────────────
 
@@ -350,17 +379,34 @@ impl CpInfo {
 
 const MAX_OPEN_FILES: usize = 32;
 
+/// Longest absolute path remembered per open file, for `VFS_FD_PATH`
+/// (`readlink("/proc/self/fd/N")`). Sized to fit any path the kernel's
+/// `KPATH_MAX`-bounded resolver can hand us; longer ones are simply not
+/// recovered rather than truncated into a lie.
+const MAX_OPEN_PATH: usize = 192;
+
 #[derive(Clone, Copy)]
+
 struct OpenFile {
     inode:    u32,
     pos:      u64,
     writable: bool,
     in_use:   bool,
+    /// The absolute path this fd was opened by. The kernel resolves every
+    /// path syscall against the caller's cwd before the VFS ever sees it
+    /// (`resolve_user_path` in kernel/src/syscall.rs), so what arrives here
+    /// is already absolute and normalised — which is exactly what
+    /// `/proc/self/fd/N` has to report. Nothing else can reconstruct it: the
+    /// slot otherwise holds only an inode number, and F2FS has no
+    /// inode→dentry reverse map.
+    path:     [u8; MAX_OPEN_PATH],
+    path_len: usize,
 }
 
 impl OpenFile {
     const fn empty() -> Self {
-        Self { inode: 0, pos: 0, writable: false, in_use: false }
+        Self { inode: 0, pos: 0, writable: false, in_use: false,
+               path: [0; MAX_OPEN_PATH], path_len: 0 }
     }
 }
 
@@ -532,6 +578,8 @@ fn maybe_flush(ms: &mut MountState) {
 
 fn inode_size(blk: &[u8]) -> u64 { r64(blk, INO_SIZE) }
 fn inode_mode(blk: &[u8]) -> u16 { r16(blk, INO_MODE) }
+fn inode_uid(blk: &[u8]) -> u32 { r32(blk, INO_UID) }
+fn inode_gid(blk: &[u8]) -> u32 { r32(blk, INO_GID) }
 fn inode_links(blk: &[u8]) -> u32 { r32(blk, INO_LINKS) }
 fn inode_is_dir(blk: &[u8]) -> bool { (inode_mode(blk) & S_IFMT) == S_IFDIR }
 
@@ -984,6 +1032,16 @@ fn create_node_block(ms: &mut MountState, owner_ino: u32) -> Option<(u32, u32)> 
 
 /// Find `name` in directory `dir_ino`. Returns child inode or 0.
 fn dir_lookup(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> u32 {
+    dir_lookup_ft(ms, dir_ino, name).0
+}
+
+/// `dir_lookup` that also reports the dentry's type byte.
+///
+/// The type byte is what lets path resolution decide whether a component is a
+/// symlink *without* reading its inode: checking `i_mode` instead would add a
+/// NAT lookup plus a block read to every component of every path, on a boot
+/// path (execve of /bin/shell) that has no symlinks in it at all.
+fn dir_lookup_ft(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> (u32, u8) {
     let iblkaddr = nat_lookup(ms, dir_ino);
     let iblk_copy = {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
@@ -1015,14 +1073,14 @@ fn dir_lookup(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> u32 {
                 if n_off + name_len <= BLOCK_SIZE
                     && &dblk[n_off..n_off + name_len] == name
                 {
-                    return ino;
+                    return (ino, dblk[e_off + 10]);
                 }
             }
             let slots_used = (name_len + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN;
             slot += slots_used.max(1);
         }
     }
-    0
+    (0, 0)
 }
 
 /// Add a directory entry `(name, child_ino, file_type)` to `dir_ino`.
@@ -1144,33 +1202,122 @@ fn dir_remove_entry(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> bool {
 
 // ── Path resolution ───────────────────────────────────────────────────────────
 
-/// Resolve an absolute path (with mount prefix stripped) to an inode.
-/// Returns 0 on failure (not found).
-fn resolve_path(ms: &mut MountState, path: &[u8]) -> u32 {
-    // Strip leading '/'
-    let path = if path.first() == Some(&b'/') { &path[1..] } else { path };
-    let mut ino = ms.sb.root_ino;
-
-    if path.is_empty() { return ino; }
-
-    let mut remaining = path;
-    loop {
-        let (component, rest) = match remaining.iter().position(|&b| b == b'/') {
-            Some(pos) => (&remaining[..pos], &remaining[pos+1..]),
-            None      => (remaining, b"" as &[u8]),
-        };
-        if component.is_empty() {
-            if rest.is_empty() { break; }
-            remaining = rest;
+/// Rewrite a volume-relative path into `/`-rooted normal form, dropping empty
+/// and "." components and resolving ".." lexically. Splicing a symlink body
+/// back into a path reintroduces all three, so the walk re-normalises after
+/// every hop.
+fn normalize_volume_path(src: &[u8], out: &mut [u8; 256]) -> usize {
+    let mut len = 1usize;
+    out[0] = b'/';
+    for comp in src.split(|&b| b == b'/') {
+        if comp.is_empty() || comp == b"." { continue; }
+        if comp == b".." {
+            if len > 1 {
+                let mut last = len - 1;
+                while last > 0 && out[last] != b'/' { last -= 1; }
+                len = if last == 0 { 1 } else { last };
+            }
             continue;
         }
-        let next_ino = dir_lookup(ms, ino, component);
-        if next_ino == 0 { return 0; }
-        ino = next_ino;
-        if rest.is_empty() { break; }
-        remaining = rest;
+        if len > 1 { if len >= 255 { break; } out[len] = b'/'; len += 1; }
+        let n = comp.len().min(255 - len);
+        out[len..len + n].copy_from_slice(&comp[..n]);
+        len += n;
     }
-    ino
+    len
+}
+
+/// Read a symlink inode's body (the target path) into `out`. Returns 0 for an
+/// empty or unreadable link.
+fn read_link_target(ms: &mut MountState, ino: u32, out: &mut [u8; 256]) -> usize {
+    let addr = nat_lookup(ms, ino);
+    if addr == 0 { return 0; }
+    let size = { let b = ms.cache.read(ms.dev, addr as u64); inode_size(b) as usize };
+    let n = size.min(255);
+    if n == 0 { return 0; }
+    read_file_data(ms, ino, 0, out.as_mut_ptr(), n)
+}
+
+/// Resolve an absolute path (with mount prefix stripped) to an inode.
+/// Returns 0 on failure (not found, or ELOOP).
+fn resolve_path(ms: &mut MountState, path: &[u8]) -> u32 {
+    resolve_path_ex(ms, path, true)
+}
+
+/// Path walk with explicit control over the final component.
+///
+/// `follow_final == true` is what open/stat/chmod want; `false` is what
+/// unlink/rename/readlink/lstat want — they act on the link, not its target.
+/// Intermediate components are followed either way.
+///
+/// A relative target is spliced against the *symlink's own* parent directory
+/// (`buf[..comp_start]`), never against anything caller-derived — resolving it
+/// against the process cwd is the classic way to get this wrong.
+///
+/// LIMITATION: an absolute target is re-rooted at this volume's root. Since
+/// this filesystem is mounted at "/" after pivot_root that is right for
+/// everything the volume can reach, but a link into a namespace the VFS
+/// intercepts ahead of the mount table (/tmp, /dev, /proc) resolves to 0 =
+/// ENOENT rather than crossing over. Links the other way (a tmpfs symlink
+/// naming an f2fs path) do work, because the VFS re-routes the resolved path.
+fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 {
+    let mut buf = [0u8; 256];
+    let mut len = normalize_volume_path(path, &mut buf);
+    let mut hops = 0u32;
+
+    'restart: loop {
+        if len <= 1 { return ms.sb.root_ino; }
+        let mut ino = ms.sb.root_ino;
+        let mut comp_start = 0usize; // index of the '/' before the component
+
+        while comp_start < len {
+            let mut comp_end = comp_start + 1;
+            while comp_end < len && buf[comp_end] != b'/' { comp_end += 1; }
+
+            // Copy the component out: dir_lookup needs &mut ms, which would
+            // otherwise conflict with a borrow of `buf`.
+            let mut name = [0u8; 256];
+            let nlen = comp_end - comp_start - 1;
+            name[..nlen].copy_from_slice(&buf[comp_start + 1..comp_end]);
+
+            let (next, ftype) = dir_lookup_ft(ms, ino, &name[..nlen]);
+            if next == 0 { return 0; }
+
+            let is_last = comp_end == len;
+            if ftype == DT_LNK && !(is_last && !follow_final) {
+                hops += 1;
+                if hops > SYMLINK_MAX_HOPS { return 0; } // ELOOP
+
+                let mut target = [0u8; 256];
+                let tlen = read_link_target(ms, next, &mut target);
+                if tlen == 0 { return 0; }
+
+                let mut spliced = [0u8; 640];
+                let mut n = 0usize;
+                let mut push = |bytes: &[u8], n: &mut usize| {
+                    let take = bytes.len().min(640 - *n);
+                    spliced[*n..*n + take].copy_from_slice(&bytes[..take]);
+                    *n += take;
+                };
+                if target[0] == b'/' {
+                    push(&target[..tlen], &mut n);
+                } else {
+                    push(&buf[..comp_start], &mut n);
+                    push(b"/", &mut n);
+                    push(&target[..tlen], &mut n);
+                }
+                push(&buf[comp_end..len], &mut n);
+                drop(push);
+
+                len = normalize_volume_path(&spliced[..n], &mut buf);
+                continue 'restart;
+            }
+
+            ino = next;
+            comp_start = comp_end;
+        }
+        return ino;
+    }
 }
 
 /// Strip the mount prefix from a full path and return the remainder.
@@ -1245,6 +1392,10 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, _mode: u64) -> Me
         }
         new_ino
     } else {
+        // O_CREAT|O_EXCL means "fail if it already exists" — the atomic
+        // lockfile idiom. Checked before O_TRUNC so a losing racer cannot
+        // destroy the winner's file on its way to the error.
+        if create && flags & O_EXCL != 0 { return err_reply(-17); } // EEXIST
         if flags & O_TRUNC != 0 {
             // Truncate: zero size in inode
             let iblkaddr = nat_lookup(ms, ino);
@@ -1259,7 +1410,12 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, _mode: u64) -> Me
         Some(i) => i,
         None    => return err_reply(-24), // EMFILE
     };
-    ms.open_files[slot] = OpenFile { inode: ino, pos: 0, writable, in_use: true };
+    ms.open_files[slot] = OpenFile { inode: ino, pos: 0, writable, in_use: true,
+                                     path: [0; MAX_OPEN_PATH], path_len: 0 };
+    if path_bytes.len() <= MAX_OPEN_PATH {
+        ms.open_files[slot].path[..path_bytes.len()].copy_from_slice(path_bytes);
+        ms.open_files[slot].path_len = path_bytes.len();
+    }
     val_reply(slot as u64)
 }
 
@@ -1307,7 +1463,18 @@ fn handle_lseek(ms: &mut MountState, file_id: u64, offset: u64, whence: u64) -> 
     val_reply(new_pos)
 }
 
+/// stat(2) — final component followed, so a symlink reports its target.
 fn handle_stat(ms: &mut MountState, path_ptr: u64, stat_ptr: u64) -> Message {
+    stat_common(ms, path_ptr, stat_ptr, true)
+}
+
+/// lstat(2) — final component NOT followed, so a symlink reports S_IFLNK and
+/// the byte length of its target as st_size (which is what `ls -l` prints).
+fn handle_lstat(ms: &mut MountState, path_ptr: u64, stat_ptr: u64) -> Message {
+    stat_common(ms, path_ptr, stat_ptr, false)
+}
+
+fn stat_common(ms: &mut MountState, path_ptr: u64, stat_ptr: u64, follow: bool) -> Message {
     let path_bytes = unsafe {
         let ptr = path_ptr as *const u8;
         let mut len = 0;
@@ -1488,8 +1655,271 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
     let iblkaddr = nat_lookup(ms, ino);
     let is_dir = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_is_dir(iblk) };
     if is_dir { return err_reply(-21); } // EISDIR — use rmdir() instead
-    if dir_remove_entry(ms, parent_ino, name) { maybe_flush(ms); ok_reply() }
-    else { err_reply(-2) }
+    if !dir_remove_entry(ms, parent_ino, name) { return err_reply(-2); }
+
+    // Drop one reference. The inode block and its data blocks are only
+    // reclaimable once the count reaches zero — and this server has never
+    // reclaimed them (create/delete leaks blocks until the next mkfs), so the
+    // count is what stops a *surviving* hard link from being treated as the
+    // last name. Without it, `ln a b && rm a` left `b` pointing at an inode
+    // whose i_links_count still read 2, which every fsck and every st_nlink
+    // consumer would then disbelieve.
+    let links = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_links(iblk) };
+    if links > 1 {
+        let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
+        w32(iblk, INO_LINKS, links - 1);
+        nat_update(ms, ino, iblkaddr);
+    }
+    maybe_flush(ms);
+    ok_reply()
+}
+
+/// symlink(target, linkpath) — create a symlink inode holding `target` as its
+/// file data.
+///
+/// The volume is built with `^inline_data`, so even a two-byte target costs a
+/// full data block. That matches how every other file on this volume is
+/// stored and keeps the read path (`read_file_data`) the single one.
+fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64) -> Message {
+    let target = unsafe {
+        let ptr = target_ptr as *const u8;
+        let mut len = 0;
+        while *ptr.add(len) != 0 && len < 255 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    };
+    let link_bytes = unsafe {
+        let ptr = link_ptr as *const u8;
+        let mut len = 0;
+        while *ptr.add(len) != 0 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    };
+    if target.is_empty() { return err_reply(-2); } // ENOENT
+
+    let rel = match get_relative_path(ms, link_bytes) {
+        Some(r) => r,
+        None    => return err_reply(-2),
+    };
+    let (parent_rel, name) = path_split(rel);
+    if name.is_empty() { return err_reply(-17); } // EEXIST — the mount point
+    let parent_ino = if parent_rel.is_empty() || parent_rel == b"/" {
+        ms.sb.root_ino
+    } else {
+        resolve_path(ms, parent_rel)
+    };
+    if parent_ino == 0 { return err_reply(-2); }
+    if dir_lookup(ms, parent_ino, name) != 0 { return err_reply(-17); } // EEXIST
+
+    // Copy the target off the caller's buffer before any allocation runs: the
+    // pointer is only guaranteed live for the duration of this call, and the
+    // block writes below can flush and re-enter the cache.
+    let mut tbuf = [0u8; 256];
+    let tlen = target.len().min(255);
+    tbuf[..tlen].copy_from_slice(&target[..tlen]);
+
+    let (new_ino, _) = match create_inode(ms, S_IFLNK | 0o777, parent_ino, name) {
+        Some(v) => v,
+        None    => return err_reply(-28), // ENOSPC
+    };
+    if write_file_data(ms, new_ino, 0, tbuf.as_ptr(), tlen) != tlen {
+        return err_reply(-28); // ENOSPC
+    }
+    if !dir_add_entry(ms, parent_ino, name, new_ino, DT_LNK) {
+        return err_reply(-28);
+    }
+    maybe_flush(ms);
+    ok_reply()
+}
+
+/// readlink(path, buf, len) — EINVAL when the path exists but is not a link.
+/// `VFS_FD_PATH(slot, buf, len)` — the absolute path an open fd was opened by,
+/// which is how `readlink("/proc/self/fd/N")` is answered for a file on this
+/// mount. Without it the VFS had no answer for `VnodeKind::MountedFile` at all
+/// and returned EBADF, so the standard "recover a filename from an fd" idiom
+/// failed for every file outside RamFS and tmpfs.
+fn handle_fd_path(ms: &mut MountState, slot: u64, buf_ptr: u64, buf_len: u64) -> Message {
+    if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
+    let slot = slot as usize;
+    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
+    let n = ms.open_files[slot].path_len;
+    if n == 0 { return err_reply(-2); } // ENOENT — path was too long to record
+    let n = n.min(buf_len as usize);
+    unsafe {
+        core::ptr::copy_nonoverlapping(ms.open_files[slot].path.as_ptr(), buf_ptr as *mut u8, n);
+    }
+    val_reply(n as u64)
+}
+
+fn handle_readlink(ms: &mut MountState, path_ptr: u64, buf_ptr: u64, buf_len: u64) -> Message {
+    if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
+    let path_bytes = unsafe {
+        let ptr = path_ptr as *const u8;
+        let mut len = 0;
+        while *ptr.add(len) != 0 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    };
+    let rel = match get_relative_path(ms, path_bytes) {
+        Some(r) => r,
+        None    => return err_reply(-2),
+    };
+    let ino = resolve_path_ex(ms, rel, false);
+    if ino == 0 { return err_reply(-2); }
+
+    let addr = nat_lookup(ms, ino);
+    let (mode, size) = {
+        let iblk = ms.cache.read(ms.dev, addr as u64);
+        (inode_mode(iblk), inode_size(iblk))
+    };
+    if mode & S_IFMT != S_IFLNK { return err_reply(-22); } // EINVAL
+
+    let n = (size as usize).min(buf_len as usize);
+    if n == 0 { return val_reply(0); }
+    let got = read_file_data(ms, ino, 0, buf_ptr as *mut u8, n);
+    val_reply(got as u64)
+}
+
+/// link(oldpath, newpath) — a second dentry pointing at the same nid, with
+/// i_links_count bumped. Exactly the shape scripts/mkfs-f2fs-populated.py
+/// already writes for the ~105 coreutils names that share one inode, so the
+/// read path needs no changes at all.
+fn handle_link(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
+    let read_path = |p: u64| unsafe {
+        let ptr = p as *const u8;
+        let mut len = 0;
+        while *ptr.add(len) != 0 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    };
+    let old_bytes = read_path(old_ptr);
+    let new_bytes = read_path(new_ptr);
+
+    let old_rel = match get_relative_path(ms, old_bytes) { Some(r) => r, None => return err_reply(-2) };
+    let new_rel = match get_relative_path(ms, new_bytes) { Some(r) => r, None => return err_reply(-18) }; // EXDEV
+
+    // link(2) does not follow the final component of either path.
+    let src_ino = resolve_path_ex(ms, old_rel, false);
+    if src_ino == 0 { return err_reply(-2); }
+
+    let addr = nat_lookup(ms, src_ino);
+    let (mode, links) = {
+        let iblk = ms.cache.read(ms.dev, addr as u64);
+        (inode_mode(iblk), inode_links(iblk))
+    };
+    // Hard links to directories are EPERM: a directory cycle has no safe
+    // unwind, so only the filesystem's own "." / ".." may point at one.
+    if mode & S_IFMT == S_IFDIR { return err_reply(-1); } // EPERM
+
+    let (parent_rel, name) = path_split(new_rel);
+    if name.is_empty() { return err_reply(-17); }
+    let parent_ino = if parent_rel.is_empty() || parent_rel == b"/" {
+        ms.sb.root_ino
+    } else {
+        resolve_path(ms, parent_rel)
+    };
+    if parent_ino == 0 { return err_reply(-2); }
+    if dir_lookup(ms, parent_ino, name) != 0 { return err_reply(-17); } // EEXIST
+
+    let ftype = match mode & S_IFMT {
+        S_IFLNK => DT_LNK,
+        _       => DT_REG,
+    };
+    if !dir_add_entry(ms, parent_ino, name, src_ino, ftype) { return err_reply(-28); }
+
+    let iblk = ms.cache.get_mut(ms.dev, addr as u64);
+    w32(iblk, INO_LINKS, links + 1);
+    nat_update(ms, src_ino, addr);
+    maybe_flush(ms);
+    ok_reply()
+}
+
+/// chmod(2) via path — follows the final symlink component, same group as
+/// VFS_OPEN/VFS_STAT in the VFS's `path_args()` table.
+fn handle_chmod(ms: &mut MountState, path_ptr: u64, mode: u32) -> Message {
+    let path_bytes = unsafe {
+        let ptr = path_ptr as *const u8;
+        let mut len = 0;
+        while *ptr.add(len) != 0 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    };
+    let rel = match get_relative_path(ms, path_bytes) {
+        Some(r) => r,
+        None    => return err_reply(-2), // ENOENT
+    };
+    let ino = resolve_path(ms, rel);
+    if ino == 0 { return err_reply(-2); }
+    chmod_inode(ms, ino, mode)
+}
+
+/// fchmod(2) — the fd is already resolved to an inode via the open-file
+/// table, so no path walk (and no symlink-follow question) is involved.
+fn handle_fchmod(ms: &mut MountState, file_id: u64, mode: u32) -> Message {
+    let slot = file_id as usize;
+    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
+    let ino = ms.open_files[slot].inode;
+    chmod_inode(ms, ino, mode)
+}
+
+/// Mutate i_mode in place and write the inode block back, mirroring the
+/// link-count update in handle_unlink/handle_link (nat_update + maybe_flush,
+/// no separate checksum: this simplified node-block footer carries no
+/// checksum field to fix up).
+///
+/// Only the permission/setuid/setgid/sticky bits change — the file-type
+/// bits (S_IFMT) are exactly what create_inode wrote and chmod(2) must
+/// never touch them.
+fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32) -> Message {
+    let addr = nat_lookup(ms, ino);
+    let iblk = ms.cache.get_mut(ms.dev, addr as u64);
+    let cur = inode_mode(iblk);
+    let new_mode = (cur & S_IFMT) | (mode as u16 & !S_IFMT);
+    w16(iblk, INO_MODE, new_mode);
+    nat_update(ms, ino, addr);
+    maybe_flush(ms);
+    ok_reply()
+}
+
+/// chown(2) via path. `u32::MAX` for `uid`/`gid` means "leave unchanged" —
+/// mirrors chown(2)'s `-1` and matches apply_chown's tmpfs handling in
+/// servers/vfs/src/lib.rs.
+///
+/// NOTE: like VFS_CHMOD, the VFS always follows the final symlink component
+/// for VFS_CHOWN (see path_args()), so this cannot honor AT_SYMLINK_NOFOLLOW
+/// (lchown) — there is no VFS_LCHOWN tag, and upstream of this server
+/// kernel/src/syscall.rs's sys_fchownat() already discards its `flags`
+/// argument before a distinction could even reach the VFS. Fixing that is a
+/// kernel + VFS protocol change, out of this server's scope.
+fn handle_chown(ms: &mut MountState, path_ptr: u64, uid: u32, gid: u32) -> Message {
+    let path_bytes = unsafe {
+        let ptr = path_ptr as *const u8;
+        let mut len = 0;
+        while *ptr.add(len) != 0 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    };
+    let rel = match get_relative_path(ms, path_bytes) {
+        Some(r) => r,
+        None    => return err_reply(-2),
+    };
+    let ino = resolve_path(ms, rel);
+    if ino == 0 { return err_reply(-2); }
+    chown_inode(ms, ino, uid, gid)
+}
+
+/// fchown(2) — fd already resolved to an inode via the open-file table.
+fn handle_fchown(ms: &mut MountState, file_id: u64, uid: u32, gid: u32) -> Message {
+    let slot = file_id as usize;
+    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); }
+    let ino = ms.open_files[slot].inode;
+    chown_inode(ms, ino, uid, gid)
+}
+
+/// Mutate i_uid/i_gid in place and write the inode block back, same
+/// nat_update + maybe_flush shape as chmod_inode/handle_link.
+fn chown_inode(ms: &mut MountState, ino: u32, uid: u32, gid: u32) -> Message {
+    let addr = nat_lookup(ms, ino);
+    let iblk = ms.cache.get_mut(ms.dev, addr as u64);
+    if uid != u32::MAX { w32(iblk, INO_UID, uid); }
+    if gid != u32::MAX { w32(iblk, INO_GID, gid); }
+    nat_update(ms, ino, addr);
+    maybe_flush(ms);
+    ok_reply()
 }
 
 /// True if directory `dir_ino` contains no entries other than "." and "..".
@@ -1642,6 +2072,16 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message) -> Message {
         VFS_RMDIR      => handle_rmdir(ms, arg(msg,0)),
         VFS_RENAME     => handle_rename(ms, arg(msg,0), arg(msg,1)),
         VFS_FTRUNCATE  => handle_ftruncate(ms, arg(msg,0), arg(msg,1)),
+        VFS_STATFS     => handle_statfs(ms, arg(msg,1)),
+        VFS_LSTAT      => handle_lstat(ms, arg(msg,0), arg(msg,1)),
+        VFS_SYMLINK    => handle_symlink(ms, arg(msg,0), arg(msg,1)),
+        VFS_FD_PATH    => handle_fd_path(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
+        VFS_READLINK   => handle_readlink(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
+        VFS_LINK       => handle_link(ms, arg(msg,0), arg(msg,1)),
+        VFS_CHMOD      => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32),
+        VFS_FCHMOD     => handle_fchmod(ms, arg(msg,0), arg(msg,1) as u32),
+        VFS_CHOWN      => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32),
+        VFS_FCHOWN     => handle_fchown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32),
         _              => err_reply(-22), // EINVAL
     }
 }
