@@ -878,7 +878,7 @@ fn dispatch_inner(
         #[cfg(not(target_arch = "aarch64"))]
         GETDENTS    => sys_getdents64(a0, a1, a2),
         #[cfg(not(target_arch = "aarch64"))]
-        READLINK    => sys_readlinkat(0, a0, a1, a2),
+        READLINK    => sys_readlinkat(AT_FDCWD, a0, a1, a2),
         // x86_64's legacy epoll_wait(2) syscall (232) takes a real 4th
         // arg (timeout_ms) — unlike PIPE/DUP2 just above, which hardcode a
         // 0 because those *real* legacy syscalls genuinely have no such
@@ -2313,9 +2313,9 @@ const EXEC_HEADER_MAX: usize = 512 * 1024;
 /// exec.  On any failure the fd is closed and None is returned so the caller
 /// can fall back to the eager whole-file loader.
 fn open_exec_header(path: &str, pid: u32) -> Option<(usize, alloc::vec::Vec<u8>)> {
-    let mut path_c = alloc::string::String::from(path);
-    path_c.push('\0');
-    let fd = sys_open(path_c.as_ptr() as usize, 0 /* O_RDONLY */, 0);
+    // `path` is already absolute (sys_execve resolved it) and lives in kernel
+    // memory, so it must bypass sys_open's user-pointer validation.
+    let fd = open_kernel_path(path, 0 /* O_RDONLY */, 0);
     if fd < 0 { return None; }
     let fd = fd as usize;
 
@@ -2362,10 +2362,9 @@ fn open_exec_header(path: &str, pid: u32) -> Option<(usize, alloc::vec::Vec<u8>)
 }
 
 fn read_file_from_vfs(path: &str) -> Option<alloc::vec::Vec<u8>> {
-    let mut path_c = alloc::string::String::from(path);
-    path_c.push('\0');
-    
-    let fd = sys_open(path_c.as_ptr() as usize, 0 /* O_RDONLY */, 0);
+    // Kernel-resident path — see open_kernel_path(); sys_open would reject it
+    // as a bad user pointer.
+    let fd = open_kernel_path(path, 0 /* O_RDONLY */, 0);
     if fd < 0 {
         return None;
     }
@@ -2396,25 +2395,15 @@ fn read_file_from_vfs(path: &str) -> Option<alloc::vec::Vec<u8>> {
 }
 
 fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
-    if !validate_user_buf(path_ptr, 1) { return -14; }
     let pid = current_pid();
 
-    // Resolve path string from user space
-    prefault_user(path_ptr, 256);
-    let mut path_buf = [0u8; 256];
-    let ok = with_current_address_space(|as_| {
-        as_.read_user_buf(path_ptr, &mut path_buf)
-    }).unwrap_or(false);
-    if !ok { return -14; }
-
-    // Find null terminator
-    let path_len = path_buf.iter().position(|&b| b == 0).unwrap_or(256);
-    let path_str = core::str::from_utf8(&path_buf[..path_len]).unwrap_or("");
-
-    // Resolve to absolute path using CWD
-    let mut abs_path_buf = [0u8; 256];
-    let abs_len = resolve_path(&path_buf[..path_len], &mut abs_path_buf);
-    let path = core::str::from_utf8(&abs_path_buf[..abs_len]).unwrap_or(path_str);
+    // Resolve against the cwd through the shared helper, so `./prog` and
+    // `prog` name the same file execve sees as every other path syscall.
+    let kpath = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
+    let path = match core::str::from_utf8(kpath.bytes()) {
+        Ok(s) => s,
+        Err(_) => return -2, // ENOENT — non-UTF-8 paths do not exist here
+    };
 
     // ── Resolve ELF source ────────────────────────────────────────────────────
     //
@@ -3511,29 +3500,43 @@ fn sys_prlimit64(
 
 // ── VFS syscall implementations ───────────────────────────────────────────────
 
-fn sys_open(path_ptr: usize, flags: usize, mode: usize) -> isize {
-    let (path_raw, path_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(path_ptr as *const u8, 256) }) {
-        Some(p) => p,
-        None => return -14, // EFAULT
-    };
-
-    let mut abs = [0u8; 256];
-    let abs_len = resolve_path(&path_raw[..path_len], &mut abs);
-    if abs_len == 0 { return -2; }
-
-    // Ensure NUL termination for VFS string readers
-    let mut vfs_path = [0u8; 257];
-    vfs_path[..abs_len].copy_from_slice(&abs[..abs_len]);
-    vfs_path[abs_len] = 0;
-
+/// Issue `VFS_OPEN` for an already-resolved, NUL-terminated path.
+///
+/// `path_ptr` must point at memory the VFS can read by plain dereference and
+/// must NOT be validated as user memory — kernel-internal callers (exec's
+/// loaders) legitimately pass a kernel address, which is exactly what
+/// `resolve_user_path` rejects.  Every user-facing entry point resolves first
+/// and then lands here.
+fn vfs_open_resolved(path_ptr: usize, flags: usize, mode: usize) -> isize {
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_OPEN, &[vfs_path.as_ptr() as u64, flags as u64, mode as u64]);
+    let msg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, flags as u64, mode as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_openat(_dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
-    // dirfd is ignored for now; treat as AT_FDCWD
-    sys_open(path_ptr, flags, mode)
+/// Open a kernel-resident path string (no user-pointer validation, no cwd
+/// resolution — callers inside the kernel already hold an absolute path).
+///
+/// This exists because `sys_open` now funnels through `resolve_user_path`,
+/// whose `validate_user_buf` check rejects any address at or above the
+/// user/kernel split.  Kernel callers that used to hand `sys_open` a heap
+/// pointer silently started getting `-EFAULT`.
+fn open_kernel_path(path: &str, flags: usize, mode: usize) -> isize {
+    if path.len() >= KPATH_MAX { return -36; } // ENAMETOOLONG
+    let mut buf = [0u8; KPATH_MAX + 1];
+    buf[..path.len()].copy_from_slice(path.as_bytes());
+    buf[path.len()] = 0;
+    vfs_open_resolved(buf.as_ptr() as usize, flags, mode)
+}
+
+fn sys_open(path_ptr: usize, flags: usize, mode: usize) -> isize {
+    let path = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
+    vfs_open_resolved(path.ptr(), flags, mode)
+}
+
+fn sys_openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
+    // dirfd is honoured only as AT_FDCWD — see resolve_at_path().
+    let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    vfs_open_resolved(path.ptr(), flags, mode)
 }
 
 fn sys_close(fd: usize) -> isize {
@@ -3641,11 +3644,10 @@ fn sys_mount(
         Err(_) => return -22, // EINVAL
     };
 
-    let (target_raw, target_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(target_ptr as *const u8, 256) }) {
-        Some(p) => p,
-        None => return -14, // EFAULT
-    };
-    let target_str = match core::str::from_utf8(&target_raw[..target_len]) {
+    // The mount point is a real path — resolve it against the cwd so
+    // `mount /dev/vda mnt` and `mount /dev/vda /mnt` agree.
+    let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+    let target_str = match core::str::from_utf8(target_path.bytes()) {
         Ok(s) => s,
         Err(_) => return -22, // EINVAL
     };
@@ -3704,11 +3706,8 @@ fn sys_mount(
 }
 
 fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
-    let (target_raw, target_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(target_ptr as *const u8, 256) }) {
-        Some(p) => p,
-        None => return -14, // EFAULT
-    };
-    let target_str = match core::str::from_utf8(&target_raw[..target_len]) {
+    let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+    let target_str = match core::str::from_utf8(target_path.bytes()) {
         Ok(s) => s,
         Err(_) => return -22, // EINVAL
     };
@@ -3722,29 +3721,10 @@ fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
 
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
     let pid = current_pid();
-    let (new_raw, new_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(new_root_ptr as *const u8, 256) }) {
-        Some(p) => p,
-        None => return -14, // EFAULT
-    };
-    let mut new_abs = [0u8; 256];
-    let new_abs_len = resolve_path(&new_raw[..new_len], &mut new_abs);
-    if new_abs_len == 0 { return -2; }
-    let mut new_vfs_path = [0u8; 257];
-    new_vfs_path[..new_abs_len].copy_from_slice(&new_abs[..new_abs_len]);
-    new_vfs_path[new_abs_len] = 0;
+    let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
+    let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };
 
-    let (old_raw, old_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(put_old_ptr as *const u8, 256) }) {
-        Some(p) => p,
-        None => return -14, // EFAULT
-    };
-    let mut old_abs = [0u8; 256];
-    let old_abs_len = resolve_path(&old_raw[..old_len], &mut old_abs);
-    if old_abs_len == 0 { return -2; }
-    let mut old_vfs_path = [0u8; 257];
-    old_vfs_path[..old_abs_len].copy_from_slice(&old_abs[..old_abs_len]);
-    old_vfs_path[old_abs_len] = 0;
-
-    let msg = make_vfs_msg(vfs::VFS_PIVOT_ROOT, &[new_vfs_path.as_ptr() as u64, old_vfs_path.as_ptr() as u64]);
+    let msg = make_vfs_msg(vfs::VFS_PIVOT_ROOT, &[new_path.ptr() as u64, old_path.ptr() as u64]);
     let reply = vfs::handle(&msg, pid);
     let val = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
     val as isize
@@ -3990,11 +3970,10 @@ fn sys_fchmod(fd: usize, mode: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_fchmodat(_dirfd: usize, path_ptr: usize, mode: usize, _flags: usize) -> isize {
-    if !validate_user_buf(path_ptr, 1) { return -14; }
-    prefault_user(path_ptr, 256);
+fn sys_fchmodat(dirfd: usize, path_ptr: usize, mode: usize, _flags: usize) -> isize {
+    let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_CHMOD, &[path_ptr as u64, mode as u64]);
+    let msg = make_vfs_msg(vfs::VFS_CHMOD, &[path.ptr() as u64, mode as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
@@ -4004,11 +3983,10 @@ fn sys_fchown(fd: usize, uid: usize, gid: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_fchownat(_dirfd: usize, path_ptr: usize, uid: usize, gid: usize, _flags: usize) -> isize {
-    if !validate_user_buf(path_ptr, 1) { return -14; }
-    prefault_user(path_ptr, 256);
+fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, _flags: usize) -> isize {
+    let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_CHOWN, &[path_ptr as u64, uid as u64, gid as u64]);
+    let msg = make_vfs_msg(vfs::VFS_CHOWN, &[path.ptr() as u64, uid as u64, gid as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
@@ -4052,48 +4030,116 @@ fn sys_getdents64(fd: usize, buf_ptr: usize, count: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_mkdirat(_dirfd: usize, path_ptr: usize, mode: usize) -> isize {
-    if !validate_user_buf(path_ptr, 1) { return -14; }
-    prefault_user(path_ptr, 256);
+fn sys_mkdirat(dirfd: usize, path_ptr: usize, mode: usize) -> isize {
+    let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_MKDIR, &[path_ptr as u64, mode as u64]);
+    let msg = make_vfs_msg(vfs::VFS_MKDIR, &[path.ptr() as u64, mode as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-fn sys_unlinkat(_dirfd: usize, path_ptr: usize, flags: usize) -> isize {
+fn sys_mknodat(dirfd: usize, path_ptr: usize, mode: usize, _dev: usize) -> isize {
+    let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+
+    // Decode the requested node type from the S_IFMT bits of `mode`, exactly
+    // as mknod(2)/mknodat(2) do. tmpfs can only back a plain file (S_IFREG,
+    // or the type left unset — 0 — which mknod also treats as "regular") or
+    // a FIFO (S_IFIFO); see the scope note on vfs::handle_mknod for what
+    // "FIFO" means here. Character/block devices (S_IFCHR/S_IFBLK) and
+    // sockets (S_IFSOCK) require CAP_MKNOD on Linux, which an unprivileged
+    // caller never has, so return EPERM exactly like Linux does rather than
+    // pretending to create a device tmpfs can't back.
+    const S_IFMT:  usize = 0o170000;
+    const S_IFREG: usize = 0o100000;
+    const S_IFIFO: usize = 0o010000;
+    let ftype = mode & S_IFMT;
+    if ftype != 0 && ftype != S_IFREG && ftype != S_IFIFO {
+        return -1; // EPERM
+    }
+
+    let pid = current_pid();
+    let msg = make_vfs_msg(vfs::VFS_MKNOD, &[path.ptr() as u64, mode as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// symlinkat(target, newdirfd, linkpath) — note the argument order: the target
+/// comes *first* and the dirfd applies to the link name, not to the target.
+///
+/// The target is copied verbatim (see `read_user_cstr_kpath`); only the link
+/// name is cwd-resolved.
+fn sys_symlinkat(target_ptr: usize, newdirfd: usize, linkpath_ptr: usize) -> isize {
+    let target = match read_user_cstr_kpath(target_ptr) { Ok(p) => p, Err(e) => return e };
+    let link   = match resolve_at_path(newdirfd, linkpath_ptr) { Ok(p) => p, Err(e) => return e };
+    let msg = make_vfs_msg(vfs::VFS_SYMLINK, &[target.ptr() as u64, link.ptr() as u64]);
+    vfs_reply_val(&vfs::handle(&msg, current_pid()))
+}
+
+/// linkat(olddirfd, oldpath, newdirfd, newpath, flags) — create a hard link.
+///
+/// `AT_SYMLINK_FOLLOW` is accepted and ignored: without it (the default, and
+/// what `ln` passes) `link(2)` links the symlink itself, which is what the VFS
+/// does unconditionally. Honouring the flag would need a "resolve then link"
+/// round trip that nothing in the coreutils suite asks for.
+fn sys_linkat(
+    olddirfd: usize,
+    oldpath_ptr: usize,
+    newdirfd: usize,
+    newpath_ptr: usize,
+    _flags: usize,
+) -> isize {
+    let old = match resolve_at_path(olddirfd, oldpath_ptr) { Ok(p) => p, Err(e) => return e };
+    let new = match resolve_at_path(newdirfd, newpath_ptr) { Ok(p) => p, Err(e) => return e };
+    let msg = make_vfs_msg(vfs::VFS_LINK, &[old.ptr() as u64, new.ptr() as u64]);
+    vfs_reply_val(&vfs::handle(&msg, current_pid()))
+}
+
+fn sys_unlinkat(dirfd: usize, path_ptr: usize, flags: usize) -> isize {
     const AT_REMOVEDIR: usize = 0x200;
-    if !validate_user_buf(path_ptr, 1) { return -14; }
-    prefault_user(path_ptr, 256);
+    let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
     let tag = if flags & AT_REMOVEDIR != 0 { vfs::VFS_RMDIR } else { vfs::VFS_UNLINK };
-    let msg = make_vfs_msg(tag, &[path_ptr as u64]);
+    let msg = make_vfs_msg(tag, &[path.ptr() as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
 fn sys_chdir(path_ptr: usize) -> isize {
-    if !validate_user_buf(path_ptr, 1) { return -14; }
-    
-    // Read the path string to resolve it.
-    let (path_raw, path_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(path_ptr as *const u8, 256) }) {
-        Some(p) => p,
-        None => return -14,
-    };
-    let mut abs = [0u8; 256];
-    let abs_len = resolve_path(&path_raw[..path_len], &mut abs);
-    if abs_len == 0 { return -2; }
+    let path = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
 
-    // Check if path exists by attempting to open it O_RDONLY.
-    let fd = sys_open(path_ptr, 0, 0);
+    // Check the target exists by opening it O_RDONLY. Probe the *resolved*
+    // path: re-resolving the user pointer here would repeat the work, and
+    // would drift if the user buffer changed under us in between.
+    let pid = current_pid();
+    let omsg = make_vfs_msg(vfs::VFS_OPEN, &[path.ptr() as u64, 0u64, 0]);
+    let fd = vfs_reply_val(&vfs::handle(&omsg, pid));
     if fd < 0 { return fd; }
     sys_close(fd as usize);
 
-    sched::set_cwd(&abs[..abs_len]);
+    sched::set_cwd(path.bytes());
     0
 }
 
-fn sys_fchdir(_fd: usize) -> isize {
-    // No directory fds yet — all fds are files; return ENOTDIR.
-    -20
+/// fchdir(fd) — make the directory `fd` names the new cwd.
+///
+/// This used to be a hardcoded ENOTDIR ("no directory fds yet"). Directory
+/// descriptors do work — `resolve_at_path` resolves against them — so recover
+/// the fd's absolute path the same way and adopt it, after confirming it
+/// really is a directory (fchdir on a regular file is ENOTDIR, as on Linux).
+fn sys_fchdir(fd: usize) -> isize {
+    let mut base = [0u8; KPATH_MAX];
+    let n = match fd_abs_path(fd, &mut base) { Some(n) => n, None => return -9 }; // EBADF
+
+    let mut kp = KPath { buf: [0u8; KPATH_MAX + 1], len: n };
+    kp.buf[..n].copy_from_slice(&base[..n]);
+    kp.buf[n] = 0;
+
+    const S_IFMT: u32 = 0o170000;
+    const S_IFDIR: u32 = 0o040000;
+    let mut stat_buf = [0u8; STAT_SIZE];
+    let msg = make_vfs_msg(vfs::VFS_STAT, &[kp.ptr() as u64, stat_buf.as_mut_ptr() as u64]);
+    if vfs_reply_val(&vfs::handle(&msg, current_pid())) < 0 { return -9; } // EBADF
+    if vfs::read_stat_mode(stat_buf.as_ptr() as usize) & S_IFMT != S_IFDIR { return -20; } // ENOTDIR
+
+    sched::set_cwd(kp.bytes());
+    0
 }
 
 fn sys_getcwd(buf_ptr: usize, size: usize) -> isize {
@@ -4175,8 +4221,11 @@ fn sys_readlinkat(_dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) -
     }
 
     // /proc/self/fd/N → resolve fd N via VFS
-    if pl > 15 && &pb[..15] == b"/proc/self/fd/" {
-        let num_str = &pb[15..pl];
+    // "/proc/self/fd/" is 14 bytes, not 15 — the old bounds compared a
+    // 15-byte slice against the 14-byte literal (never equal) and then sliced
+    // the digits from index 15, dropping the first one. This branch was dead.
+    if pl > 14 && &pb[..14] == b"/proc/self/fd/" {
+        let num_str = &pb[14..pl];
         let mut fd = 0usize;
         let mut valid = !num_str.is_empty();
         for &d in num_str {
@@ -4190,21 +4239,236 @@ fn sys_readlinkat(_dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) -
         }
     }
 
-    -2 // ENOENT
+    // Real symlinks. VFS_READLINK does not follow the final component (that
+    // would make readlink() answer about the *target*), and returns -EINVAL
+    // for a path that exists but is not a link — the distinction `ls` and
+    // `readlink` both rely on. This used to be an unconditional -ENOENT, so
+    // every symlink on the system read as "not there".
+    let msg = make_vfs_msg(vfs::VFS_READLINK, &[kpath.ptr() as u64, buf_ptr as u64, size as u64]);
+    vfs_reply_val(&vfs::handle(&msg, current_pid()))
 }
 
-/// Simple statfs stub — return a reasonable-looking result.
-fn sys_statfs(path_or_fd: usize, buf_ptr: usize) -> isize {
-    // struct statfs64 varies by arch; write 120 bytes of zeros with a few fields set.
-    const STATFS_SIZE: usize = 120;
-    if !validate_user_buf(buf_ptr, STATFS_SIZE) { return -14; }
-    unsafe { core::ptr::write_bytes(buf_ptr as *mut u8, 0, STATFS_SIZE); }
-    // f_type at offset 0 (EXT2_SUPER_MAGIC = 0xEF53)
-    unsafe { core::ptr::write(buf_ptr as *mut u32, 0xEF53u32); }
-    // f_bsize at offset 4
-    unsafe { core::ptr::write((buf_ptr + 4) as *mut u32, 4096u32); }
-    let _ = path_or_fd;
-    0
+/// statfs(path, buf) — per-mount figures, answered by whichever filesystem
+/// owns `path`.
+///
+/// This used to be a stub that wrote a fixed synthetic superblock: an
+/// `EXT2_SUPER_MAGIC` f_type and a 4096 f_bsize written as 32-bit words (both
+/// fields are 64-bit in the asm-generic layout, so even those two landed
+/// wrong), and zeros everywhere else. Zeros are what broke `df`: uutils drops
+/// every filesystem reporting `f_blocks == 0` unless `-a` is given, so with a
+/// correct mount table it parsed both mounts, discarded both, and printed
+/// "df: no file systems processed".
+///
+/// The path is now resolved against the cwd like every other path syscall and
+/// handed to the VFS, which forwards it to the owning mount server.
+fn sys_statfs(path_ptr: usize, buf_ptr: usize) -> isize {
+    if !validate_user_buf(buf_ptr, vfs::STATFS_SIZE) { return -14; }
+    let path = match resolve_user_path(path_ptr) {
+        Ok(p)  => p,
+        Err(e) => return e,
+    };
+    prefault_user(buf_ptr, vfs::STATFS_SIZE);
+    let msg = make_vfs_msg(vfs::VFS_STATFS, &[path.ptr() as u64, buf_ptr as u64]);
+    vfs_reply_val(&vfs::handle(&msg, current_pid()))
+}
+
+/// fstatfs(fd, buf) — same answer as `statfs`, selected by open descriptor.
+///
+/// Previously aliased onto `sys_statfs`, which treated its first argument as a
+/// path pointer — so an fd number was dereferenced as a `const char *`. It
+/// only ever "worked" because the stub ignored the argument entirely.
+fn sys_fstatfs(fd: usize, buf_ptr: usize) -> isize {
+    if !validate_user_buf(buf_ptr, vfs::STATFS_SIZE) { return -14; }
+    prefault_user(buf_ptr, vfs::STATFS_SIZE);
+    let msg = make_vfs_msg(vfs::VFS_FSTATFS, &[fd as u64, buf_ptr as u64]);
+    vfs_reply_val(&vfs::handle(&msg, current_pid()))
+}
+
+/// PATH_MAX for the kernel's path plumbing. Every kernel-side path buffer in
+/// this file — `read_cstr_for_vfs`, `resolve_path`, `KPath` — is sized to
+/// this, as is `read_cstr_raw` in the VFS server. Keep them in lockstep.
+const KPATH_MAX: usize = 256;
+
+/// `AT_FDCWD` — "interpret a relative path against the process cwd".
+const AT_FDCWD: usize = -100isize as usize;
+/// `AT_EMPTY_PATH` — operate on `dirfd` itself when the path is "".
+const AT_EMPTY_PATH: usize = 0x1000;
+
+/// A NUL-terminated, cwd-resolved absolute path held in kernel memory.
+///
+/// Handing the VFS a *kernel* pointer rather than the raw user pointer is
+/// what makes cwd resolution possible at all. The VFS server and the mount
+/// servers read path arguments by plain dereference of the pointer they are
+/// given (`read_cstr_raw` in servers/vfs/src/lib.rs, the `ptr as *const u8`
+/// loops in servers/f2fs/src/lib.rs) rather than through an address-space
+/// accessor. Kernel memory is mapped in every address space, so such a
+/// pointer is valid everywhere the old user pointer was — and it can carry a
+/// path we rewrote. The buffer lives in the calling syscall's frame, and the
+/// caller stays blocked in `call_port` for the whole round trip, so it
+/// outlives every server that reads it.
+struct KPath {
+    buf: [u8; KPATH_MAX + 1],
+    len: usize,
+}
+
+impl KPath {
+    /// Pointer to pass to the VFS in place of the user `path_ptr`.
+    #[inline]
+    fn ptr(&self) -> usize { self.buf.as_ptr() as usize }
+    #[inline]
+    fn bytes(&self) -> &[u8] { &self.buf[..self.len] }
+}
+
+/// Copy the user path at `path_ptr`, resolve it against the calling task's
+/// cwd when it is relative, normalise "." / ".." components, and return a
+/// kernel-resident absolute path.
+///
+/// This is the single choke point every path-taking syscall must funnel
+/// through. Before it existed, only `sys_open`, `sys_chdir`, `sys_execve` and
+/// `sys_pivot_root` resolved anything — every other path syscall forwarded the
+/// raw user pointer straight into a VFS message, so the VFS saw the bare
+/// relative string ("a.txt"), matched neither a RamFS entry nor a mount
+/// prefix, and answered ENOENT. That is why `cd /tmp; ls a.txt` failed while
+/// `ls /tmp/a.txt` worked.
+///
+/// Errors are already errnos: `-EFAULT` for an unreadable pointer, `-ENOENT`
+/// for the empty path (which is what Linux returns for `open("")`, `stat("")`
+/// and friends — callers that mean "operate on the dirfd" must pass
+/// `AT_EMPTY_PATH`, handled separately by `sys_newfstatat`).
+fn resolve_user_path(path_ptr: usize) -> Result<KPath, isize> {
+    if path_ptr == 0 || !validate_user_buf(path_ptr, 1) { return Err(-14); }
+    prefault_user(path_ptr, KPATH_MAX);
+
+    let (raw, raw_len) = match read_cstr_for_vfs(unsafe {
+        core::slice::from_raw_parts(path_ptr as *const u8, KPATH_MAX)
+    }) {
+        Some(p) => p,
+        None => return Err(-14),
+    };
+    // An empty path is ENOENT, never "the cwd" — resolve_path() would happily
+    // hand back the cwd for it, silently turning stat("") into stat(".").
+    if raw_len == 0 { return Err(-2); }
+
+    let mut abs = [0u8; KPATH_MAX];
+    let abs_len = resolve_path(&raw[..raw_len], &mut abs);
+    if abs_len == 0 { return Err(-2); }
+
+    let mut kp = KPath { buf: [0u8; KPATH_MAX + 1], len: abs_len };
+    kp.buf[..abs_len].copy_from_slice(&abs[..abs_len]);
+    kp.buf[abs_len] = 0; // VFS string readers scan for the NUL
+    Ok(kp)
+}
+
+/// Copy a user string into kernel memory **verbatim** — no cwd resolution and
+/// no "." / ".." normalisation.
+///
+/// `symlink(2)`'s first argument is not a path to look up; it is the link's
+/// body, and it is stored byte for byte. Running it through
+/// `resolve_user_path` would rewrite `ln -s ../x l` into an absolute link and
+/// destroy the property that a relative target resolves against the link's own
+/// directory rather than the creating process's cwd.
+fn read_user_cstr_kpath(ptr: usize) -> Result<KPath, isize> {
+    if ptr == 0 || !validate_user_buf(ptr, 1) { return Err(-14); }
+    prefault_user(ptr, KPATH_MAX);
+    let (raw, raw_len) = match read_cstr_for_vfs(unsafe {
+        core::slice::from_raw_parts(ptr as *const u8, KPATH_MAX)
+    }) {
+        Some(p) => p,
+        None    => return Err(-14),
+    };
+    if raw_len == 0 { return Err(-2); } // ENOENT — empty target
+    let mut kp = KPath { buf: [0u8; KPATH_MAX + 1], len: raw_len };
+    kp.buf[..raw_len].copy_from_slice(&raw[..raw_len]);
+    kp.buf[raw_len] = 0;
+    Ok(kp)
+}
+
+/// Ask the VFS for the absolute path an open descriptor was opened by, into
+/// `out`. Returns the length, or `None` when the fd names nothing with a
+/// filesystem path (a pipe, an eventfd, a socket, a closed fd, …).
+///
+/// This is the same `VFS_FD_PATH` query that answers
+/// `readlink("/proc/self/fd/N")`: the VFS resolves RamFS and tmpfs entries
+/// itself and forwards mounted files to the owning mount server, which
+/// remembers the absolute path each `OpenFile` slot was opened by. Directory
+/// descriptors are covered because a directory opens as an ordinary vnode on
+/// both backends (a `TmpFile` slot with `is_dir`, or a `MountedFile`).
+///
+/// `out` is kernel memory, which is mapped in every address space, so the
+/// pointer stays valid for the mount server that writes through it — the same
+/// property `KPath` documents above.
+fn fd_abs_path(fd: usize, out: &mut [u8; KPATH_MAX]) -> Option<usize> {
+    // Descriptors the VFS does not own at all (sockets, epoll) would be
+    // misinterpreted as VFS fd numbers — reject them up front.
+    if fd >= net_server::SOCK_FD_BASE { return None; }
+    let msg = make_vfs_msg(vfs::VFS_FD_PATH,
+                           &[fd as u64, out.as_mut_ptr() as u64, KPATH_MAX as u64]);
+    let n = vfs_reply_val(&vfs::handle(&msg, current_pid()));
+    if n <= 0 { return None; }
+    let n = n as usize;
+    // Only a real absolute path can serve as a resolution base; the synthetic
+    // names ("pipe:[7]", "eventfd", …) must not.
+    if n > KPATH_MAX || out[0] != b'/' { return None; }
+    Some(n)
+}
+
+/// Resolve an `*at()`-family path argument against its `dirfd`.
+///
+/// `AT_FDCWD` and absolute paths resolve against the process cwd exactly as
+/// before. A relative path with a real `dirfd` is now joined onto the
+/// directory that descriptor names, which is what POSIX requires and what the
+/// openat-relative traversal idiom depends on.
+///
+/// This used to ignore `dirfd` outright and always resolve against the cwd.
+/// That silently broke every caller that opens a directory and then operates
+/// through it — the TOCTOU-safe pattern GNU fts and `uucore::safe_traversal`
+/// both use. `rm /tmp/a/f` from a different cwd, for instance, opens
+/// `/tmp/a`, calls `unlinkat(dirfd, "f", 0)`, and got "f" resolved against the
+/// *caller's* cwd instead: ENOENT on a file that plainly exists. `du`'s
+/// `fstatat(dirfd, entry_name, …)` walk failed the same way, one directory
+/// level down. `ls` and `stat` were unaffected only because they pass whole
+/// paths with `AT_FDCWD`.
+///
+/// When the descriptor has no path the VFS can name, this falls back to the
+/// old cwd-relative behaviour rather than failing, so nothing that worked
+/// before can start returning EBADF.
+fn resolve_at_path(dirfd: usize, path_ptr: usize) -> Result<KPath, isize> {
+    if dirfd == AT_FDCWD { return resolve_user_path(path_ptr); }
+
+    if path_ptr == 0 || !validate_user_buf(path_ptr, 1) { return Err(-14); }
+    prefault_user(path_ptr, KPATH_MAX);
+    let (raw, raw_len) = match read_cstr_for_vfs(unsafe {
+        core::slice::from_raw_parts(path_ptr as *const u8, KPATH_MAX)
+    }) {
+        Some(p) => p,
+        None    => return Err(-14),
+    };
+    if raw_len == 0 { return Err(-2); }
+    // An absolute path ignores the dirfd entirely, per POSIX.
+    if raw[0] == b'/' { return resolve_user_path(path_ptr); }
+
+    let mut base = [0u8; KPATH_MAX];
+    let base_len = match fd_abs_path(dirfd, &mut base) {
+        Some(n) => n,
+        None    => return resolve_user_path(path_ptr),
+    };
+
+    // base + '/' + relative, then normalise "." / ".." the usual way.
+    let mut joined = [0u8; KPATH_MAX * 2];
+    let mut jl = base_len;
+    joined[..base_len].copy_from_slice(&base[..base_len]);
+    if joined[jl - 1] != b'/' { joined[jl] = b'/'; jl += 1; }
+    if jl + raw_len >= KPATH_MAX { return Err(-36); } // ENAMETOOLONG
+    joined[jl..jl + raw_len].copy_from_slice(&raw[..raw_len]);
+    jl += raw_len;
+
+    let mut abs = [0u8; KPATH_MAX];
+    let abs_len = resolve_path(&joined[..jl], &mut abs);
+    if abs_len == 0 { return Err(-2); }
+    let mut kp = KPath { buf: [0u8; KPATH_MAX + 1], len: abs_len };
+    kp.buf[..abs_len].copy_from_slice(&abs[..abs_len]);
+    kp.buf[abs_len] = 0;
+    Ok(kp)
 }
 
 /// Resolve a path to absolute form, handling ".." and "." components.
@@ -5111,21 +5375,18 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize)
 
 /// sys_renameat(old_path_ptr, new_path_ptr) — rename a /tmp file.
 fn sys_renameat(old_path_ptr: usize, new_path_ptr: usize) -> isize {
-    if !validate_user_buf(old_path_ptr, 1) { return -14; }
-    if !validate_user_buf(new_path_ptr, 1) { return -14; }
-    prefault_user(old_path_ptr, 256);
-    prefault_user(new_path_ptr, 256);
+    let old = match resolve_user_path(old_path_ptr) { Ok(p) => p, Err(e) => return e };
+    let new = match resolve_user_path(new_path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_RENAME, &[old_path_ptr as u64, new_path_ptr as u64]);
+    let msg = make_vfs_msg(vfs::VFS_RENAME, &[old.ptr() as u64, new.ptr() as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
 /// sys_truncate(path_ptr, length) — set a file's size by path.
 fn sys_truncate(path_ptr: usize, length: usize) -> isize {
-    if !validate_user_buf(path_ptr, 1) { return -14; }
-    prefault_user(path_ptr, 256);
+    let path = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
-    let omsg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, 0x0002u64 /* O_RDWR */, 0]);
+    let omsg = make_vfs_msg(vfs::VFS_OPEN, &[path.ptr() as u64, 0x0002u64 /* O_RDWR */, 0]);
     let fd = vfs_reply_val(&vfs::handle(&omsg, pid));
     if fd < 0 { return fd; }
     let r = sys_ftruncate(fd as usize, length);

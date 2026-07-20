@@ -195,7 +195,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
                     .map(|a| (a.heap_start, a.heap_end))
                     .unwrap_or((0, 0));
                 (hs, he, t.pid, t.tgid, t.pgid, t.sid,
-                 t.uid, t.gid, t.euid, t.egid, t.cwd.clone(), t.tls_base)
+                 t.uid, t.gid, t.euid, t.egid, (t.cwd.clone(), t.cwd_len), t.tls_base)
             } else {
                 mm::buddy::free(stack_base_phys, stack_pages);
                 mm::buddy::free(child_pt, 0);
@@ -251,7 +251,14 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         child.egid          = egid;
         child.heap_start    = heap_start;
         child.heap_end      = heap_end;
-        child.cwd           = cwd;
+        // The cwd is a (bytes, len) pair: `cwd` alone is a fixed 128-byte
+        // array whose tail is garbage, and `Task::new_kernel` initialises
+        // `cwd_len` to 1 ("/"). Copying only the bytes left every forked
+        // child with an effective cwd of "/" no matter where the parent had
+        // chdir'd, so `cd /tmp; prog a.txt` resolved to "/a.txt" in the
+        // child (and getcwd() in the child answered "/").
+        child.cwd           = cwd.0;
+        child.cwd_len       = cwd.1;
         child.signal_actions = [DEFAULT_SIGACTION; 64];
 
         // Give the caller its chance to set up per-child kernel state (VFS
@@ -403,7 +410,7 @@ pub fn clone_thread(
                     // leader's tgid, so lock_leader_address_space's tgid
                     // lookup already resolves to it.
                     (t.page_table, t.tgid, t.pgid, t.sid,
-                     t.uid, t.gid, t.euid, t.egid, hs, he, cp, t.cwd.clone(),
+                     t.uid, t.gid, t.euid, t.egid, hs, he, cp, (t.cwd.clone(), t.cwd_len),
                      leader.address_space.clone())
                 }
                 None => {
@@ -447,7 +454,9 @@ pub fn clone_thread(
         child.euid       = euid; child.egid = egid;
         child.heap_start = heap_start;
         child.heap_end   = heap_end;
-        child.cwd        = cwd;
+        // See fork_current: cwd is (bytes, len); the length must travel too.
+        child.cwd        = cwd.0;
+        child.cwd_len    = cwd.1;
         child.signal_actions = [DEFAULT_SIGACTION; 64];
         child.vfork_pending = flags & CLONE_VFORK != 0;
         if flags & CLONE_CHILD_CLEARTID != 0 {
