@@ -73,6 +73,10 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         }
     }
 
+    // K2 poll-deadline tick hook: wakes finite-timeout poll/select/epoll_wait
+    // waiters and timerfd sleepers on time (audio keeps its own hook slot).
+    sched::register_tick_hook(crate::syscall::poll_deadline_tick);
+
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::blkdev::init();
 

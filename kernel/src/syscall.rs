@@ -429,7 +429,9 @@ mod nr {
     pub const CLOSE_RANGE:         usize = 436;
     pub const PIDFD_OPEN:          usize = 434;
     pub const RT_SIGTIMEDWAIT:     usize = 137;
-    pub const INOTIFY_INIT1:       usize = 360;
+    // AArch64 asm-generic: inotify_init1 = 26 (was mistakenly 360, which only
+    // ever mattered once inotify stopped being ENOSYS in K2).
+    pub const INOTIFY_INIT1:       usize = 26;
     pub const INOTIFY_ADD_WATCH:   usize = 27;
     pub const INOTIFY_RM_WATCH:    usize = 28;
     pub const POSIX_FADVISE:       usize = 223;
@@ -1143,7 +1145,7 @@ fn dispatch_inner(
         EPOLL_CTL      => sys_epoll_ctl(a0, a1, a2, a3),
         EPOLL_PWAIT | EPOLL_PWAIT2 => sys_epoll_wait(a0, a1, a2, a3),
         EVENTFD2       => sys_eventfd2(a0, a1),
-        SIGNALFD4      => log_enosys(number),
+        SIGNALFD4      => sys_signalfd4(a0, a1, a2, a3),
 
         // ── Scheduling policy/affinity ────────────────────────────────────────
         SCHED_SETSCHEDULER | SCHED_SETPARAM => 0,
@@ -1237,8 +1239,10 @@ fn dispatch_inner(
         // ── File advise / range operations (advisory — safe to no-op) ────────
         POSIX_FADVISE | SYNC_FILE_RANGE | READAHEAD => 0,
 
-        // ── inotify (no filesystem events in Leandros) ──────────────────────────
-        INOTIFY_INIT1 | INOTIFY_ADD_WATCH | INOTIFY_RM_WATCH => log_enosys(number),
+        // ── inotify (valid fd, watches accepted, events never fire — K2) ───────
+        INOTIFY_INIT1     => sys_inotify_init1(a0),
+        INOTIFY_ADD_WATCH => sys_inotify_add_watch(a0, a1, a2),
+        INOTIFY_RM_WATCH  => sys_inotify_rm_watch(a0, a1),
 
         _ => log_enosys(number),
     }
@@ -2119,9 +2123,7 @@ fn sys_poll(fds_ptr: usize, nfds: usize, timeout_ms: isize) -> isize {
         if !infinite && ticks() >= deadline { return 0; }
         if interrupted() { return -4; } // EINTR
 
-        irq_window();
-
-        yield_now("poll");
+        poll_block(infinite, deadline, || poll_any_ready(pid, fds_ptr, nfds));
     }
 }
 
@@ -2172,9 +2174,7 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
         if !infinite && ticks() >= deadline { return 0; }
         if interrupted() { return -4; } // EINTR
 
-        irq_window();
-
-        yield_now("ppoll");
+        poll_block(infinite, deadline, || poll_any_ready(pid, fds_ptr, nfds));
     }
 }
 
@@ -3003,6 +3003,11 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // the child's successful exec or exit).
     sched::vfork_complete(pid);
 
+    // Record the executable path for /proc/self/exe (tgid-keyed side table);
+    // kpath is the resolved absolute path. Must precede replace_address_space,
+    // which never returns.
+    sched::set_exe_path(fd_owner, kpath.bytes());
+
     replace_address_space(*new_as, pt_root, heap_start, elf_info.entry, user_sp);
 }
 
@@ -3381,14 +3386,37 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                 match read_input_byte() {
                     Some(b) => break b,
                     None    => {
+                        if interrupted() { return -4; } // EINTR
                         if nonblocking {
                             spins += 1;
                             if spins >= NONBLOCK_RETRY_SPINS { return -11; } // EAGAIN
+                            irq_window();
+                            yield_now("sys_read_stdin"); // brief: don't sleep a NONBLOCK fd
+                        } else {
+                            // Blocking read: park on the poll wait-channel with a
+                            // one-tick deadline instead of pegging a vCPU. Serial
+                            // input is drained into evdev by the BSP tick, so the
+                            // tick both wakes us and produces the byte; a virtio
+                            // keypress wakes us early via wake_poll on its IRQ.
+                            // This is what drops idle host CPU at the login prompt
+                            // from a spun vCPU to ~100 Hz polling.
+                            // Re-probe only *consumable* input (evdev queue +
+                            // the synthetic-input ring) — NOT raw serial_has_data:
+                            // a byte still in the UART isn't poppable until the
+                            // tick drains it into evdev, and cancelling on it
+                            // would tight-loop with IRQs masked so that drain
+                            // tick could never fire. The now+1 deadline wakes us
+                            // each tick to retry, which is exactly when the drain
+                            // has run.
+                            sched::block_on_poll_prepare();
+                            sched::register_poll_deadline(ticks().wrapping_add(1));
+                            if console_input_pending() || evdev_server::has_key_event(0)
+                                || interrupted() {
+                                sched::block_on_poll_cancel();
+                            } else {
+                                sched::block_on_poll_commit();
+                            }
                         }
-                        if interrupted() { return -4; } // EINTR
-                        irq_window();
-
-                        yield_now("sys_read_stdin");
                     }
                 }
             };
@@ -4912,11 +4940,17 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
     let pl = kpath.len;
     let path = kpath.bytes();
 
-    // /proc/self/exe → "/bin/init"
+    // /proc/self/exe → the real path this process was execve'd from (stored in
+    // sched's tgid-keyed side table). Falls back to "/bin/init" only when unset
+    // — correct for the boot-loaded PID1, which never goes through sys_execve.
     if path == b"/proc/self/exe" {
-        let target = b"/bin/init";
-        let n = target.len().min(size);
-        unsafe { core::ptr::copy_nonoverlapping(target.as_ptr(), buf_ptr as *mut u8, n); }
+        let mut kb = [0u8; 256];
+        let bytes: &[u8] = match sched::exe_path(sched::current_tgid(), &mut kb) {
+            Some(len) => &kb[..len],
+            None      => b"/bin/init",
+        };
+        let n = bytes.len().min(size);
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, n); }
         return n as isize;
     }
 
@@ -5649,8 +5683,10 @@ fn sys_getsockopt(sockfd: usize, level: usize, optname: usize,
 // something is ready or their timeout elapses, so a real blocking multi-fd
 // wait no longer busy-returns "not ready" on the very first check.
 
-const MAX_EPOLL_INSTANCES: usize = 16;
-const MAX_EPOLL_INTERESTS: usize = 32;
+// K2 caps: one instance per {compositor, busd, each client, tokio runtime};
+// the compositor watches every client fd + input + timers on one instance.
+const MAX_EPOLL_INSTANCES: usize = 64;
+const MAX_EPOLL_INTERESTS: usize = 512;
 
 #[derive(Clone, Copy)]
 struct EpollInterest {
@@ -5665,10 +5701,14 @@ struct EpollInterest {
     /// reactor in a 0-timeout epoll spin, yet no genuine edge is ever dropped.
     /// u64::MAX = never delivered, so the first readiness always fires.
     last_seq: u64,
+    /// EPOLLONESHOT bookkeeping: cleared after the interest fires once, so it
+    /// stays quiet until an `epoll_ctl(MOD)` re-arms it. Interests without
+    /// EPOLLONESHOT stay permanently armed. `true` for a fresh/ADD'd interest.
+    armed: bool,
 }
 
 impl EpollInterest {
-    const fn empty() -> Self { Self { fd: -1, events: 0, data: 0, in_use: false, last_seq: u64::MAX } }
+    const fn empty() -> Self { Self { fd: -1, events: 0, data: 0, in_use: false, last_seq: u64::MAX, armed: true } }
 }
 
 #[derive(Clone, Copy)]
@@ -5692,7 +5732,9 @@ impl EpollInstance {
 
 /// Epoll fd numbers are an indirection over instance slots so that two fds
 /// can alias one instance (dup semantics). fd = EPOLL_FD_BASE + entry index.
-const MAX_EPOLL_FDS: usize = 32;
+/// ≥ MAX_EPOLL_INSTANCES to allow dup aliases; the [0x400, 0x480) fd range
+/// stays clear of TTY_FD_BASE (0x1000) and the socket range [0x100, 0x300).
+const MAX_EPOLL_FDS: usize = 128;
 
 #[derive(Clone, Copy)]
 struct EpollFdEntry { in_use: bool, slot: u8 }
@@ -5737,6 +5779,10 @@ fn epoll_fcntl(epfd: usize, cmd: usize) -> isize {
 
 /// FD base for epoll instances — must not overlap VFS/TTY/net ranges.
 const EPOLL_FD_BASE: usize = 0x400;
+
+/// epoll_event.events flag bits (high bits, above the POLL* revent bits).
+const EPOLLET:       u32 = 0x8000_0000; // edge-triggered
+const EPOLLONESHOT:  u32 = 0x4000_0000; // fire once, then disarm until MOD
 
 /// `struct epoll_event` on-the-wire layout: real Linux packs this to 12
 /// bytes (`data` at offset 4) on x86_64 only (`EPOLL_PACKED` in glibc's
@@ -5844,7 +5890,9 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
                           .or_else(|| inst.interests.iter().position(|i| !i.in_use));
             match idx {
                 Some(i) => {
-                    inst.interests[i] = EpollInterest { fd: fd as i32, events, data, in_use: true, last_seq: u64::MAX };
+                    // ADD and MOD both (re-)arm: MOD is how a caller re-arms an
+                    // EPOLLONESHOT interest that disarmed itself after firing.
+                    inst.interests[i] = EpollInterest { fd: fd as i32, events, data, in_use: true, last_seq: u64::MAX, armed: true };
                     0
                 }
                 None => -12, // ENOMEM — too many interests
@@ -5901,54 +5949,159 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
     let infinite = timeout == usize::MAX;
     let deadline = ticks().wrapping_add((timeout as u64) / 10);
 
-    // EPOLLET (edge-triggered) bit and POLLIN. This kernel emulates epoll
-    // level for fds without an edge source (net sockets, fd 0-2, whose
-    // readiness only asserts when they actually have data/space and which
-    // tokio drains itself), edge-triggered for VFS fds via their event-seq.
-    // The seq (Some(_)) lets us re-fire an EPOLLET interest only when the
-    // object signalled a new event, so a permanently-level-ready fd — a pipe
-    // at EOF (POLLIN|POLLHUP forever), or mio's never-drained eventfd waker —
-    // fires once per real edge instead of pinning tokio's reactor in a
-    // 0-timeout spin, while a self-pipe byte written between two epoll_waits
-    // is never dropped (its seq advanced).
+    // EPOLLET (edge-triggered) fires only when the object's per-event seq
+    // advanced since the last delivery — so a permanently-level-ready fd (a
+    // pipe at EOF, mio's never-drained eventfd waker, a level-writable socket)
+    // can't storm a tokio reactor that registered EPOLLET. Level interests
+    // (calloop's default) fire whenever a ready bit is set. A fd with no edge
+    // source (net listener, fd 0-2) reports seq None and stays level even
+    // under EPOLLET. K2 additionally blocks on the global poll wait-channel
+    // instead of yield-spinning; see §1 of the design.
     loop {
-        let nready = {
-            let mut ep = EPOLL_INSTANCES.lock();
-            let mut n = 0usize;
-            let base = events_ptr;
-            for i in 0..MAX_EPOLL_INTERESTS {
-                if n >= maxevents { break; }
-                let interest = ep[slot].interests[i];
-                if !interest.in_use { continue; }
-                let (cur, seq) = probe_fd_events_seq(pid, interest.fd as usize, interest.events);
-                // Edge-triggered fds (seq present) fire only when the seq has
-                // advanced since we last delivered; level fds fire on any ready
-                // bit. Non-VFS fds report no seq and stay level-triggered.
-                let fire = cur != 0 && match seq {
-                    Some(s) => s != interest.last_seq,
-                    None    => true,
-                };
-                if fire {
-                    if let Some(s) = seq { ep[slot].interests[i].last_seq = s; }
-                    let off = n * EPOLL_EVENT_SIZE;
-                    unsafe {
-                        core::ptr::write((base + off) as *mut u32, cur);
-                        // See the read_unaligned note in sys_epoll_ctl.
-                        core::ptr::write_unaligned(
-                            (base + off + EPOLL_EVENT_DATA_OFF) as *mut u64, interest.data);
-                    }
-                    n += 1;
+        // ---- PROBE ---- per-interest snapshot: hold EPOLL_INSTANCES only to
+        // copy one interest out, drop it before probe_fd_events_seq (which
+        // calls vfs/net and must never run under a spinlock — invariant
+        // 82d0cc3), write user memory lock-free, then re-lock briefly to
+        // commit last_seq / disarm ONESHOT, matching by fd since a sibling
+        // epoll_ctl may have mutated the slot meanwhile.
+        let mut n = 0usize;
+        for i in 0..MAX_EPOLL_INTERESTS {
+            if n >= maxevents { break; }
+            let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
+            if !interest.in_use || !interest.armed { continue; }
+            let (cur, seq) = probe_fd_events_seq(pid, interest.fd as usize, interest.events);
+            let et = interest.events & EPOLLET != 0;
+            let fire = cur != 0 && (!et || match seq {
+                Some(s) => s != interest.last_seq,
+                None    => true,
+            });
+            if fire {
+                let off = n * EPOLL_EVENT_SIZE;
+                unsafe {
+                    core::ptr::write((events_ptr + off) as *mut u32, cur);
+                    // See the read_unaligned note in sys_epoll_ctl.
+                    core::ptr::write_unaligned(
+                        (events_ptr + off + EPOLL_EVENT_DATA_OFF) as *mut u64, interest.data);
                 }
+                let mut ep = EPOLL_INSTANCES.lock();
+                if let Some(j) = ep[slot].interests.iter()
+                    .position(|x| x.in_use && x.fd == interest.fd) {
+                    if let Some(s) = seq { ep[slot].interests[j].last_seq = s; }
+                    if interest.events & EPOLLONESHOT != 0 { ep[slot].interests[j].armed = false; }
+                }
+                n += 1;
             }
-            n
-        };
-        if nready > 0 { return nready as isize; }
+        }
+        if n > 0 { return n as isize; }
         if timeout == 0 || (!infinite && ticks() >= deadline) { return 0; }
         if interrupted() { return -4; } // EINTR — lets e.g. tokio's SIGCHLD handler run
 
-        irq_window();
-        yield_now("epoll_wait");
+        // ---- BLOCK ---- three-phase on the global poll wait-channel; the
+        // re-probe between prepare and commit closes the check-then-sleep
+        // lost-wake (an edge landing after the probe above lands as a
+        // wake_poll against an already-Blocked task, or shows in the re-probe).
+        sched::block_on_poll_prepare();
+        if !infinite { sched::register_poll_deadline(deadline); }
+        if epoll_any_ready(pid, slot) || interrupted()
+            || (!infinite && ticks() >= deadline) {
+            sched::block_on_poll_cancel();
+            continue;
+        }
+        sched::block_on_poll_commit();
     }
+}
+
+/// Read-only readiness check for the block-loop re-probe: like the epoll_wait
+/// probe but mutates no `last_seq` and writes no user memory, so cancelling the
+/// block and looping re-delivers the edge instead of consuming it silently.
+fn epoll_any_ready(pid: u32, slot: usize) -> bool {
+    for i in 0..MAX_EPOLL_INTERESTS {
+        let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
+        if !interest.in_use || !interest.armed { continue; }
+        let (cur, seq) = probe_fd_events_seq(pid, interest.fd as usize, interest.events);
+        let et = interest.events & EPOLLET != 0;
+        let fire = cur != 0 && (!et || match seq {
+            Some(s) => s != interest.last_seq,
+            None    => true,
+        });
+        if fire { return true; }
+    }
+    false
+}
+
+/// 100 Hz poll-deadline tick hook (registered from kernel init, runs in BSP
+/// timer-IRQ context). Wakes all pollers once the earliest finite poll/select
+/// timeout or armed-timerfd expiry is reached — so an epoll_wait(-1) waiter on
+/// a timerfd, and every finite-timeout waiter, wakes on time with NO per-tick
+/// wake for infinite data-driven waiters (the ~0% idle goal). try_wake_poll
+/// honors the tick's try-lock-only contract: a contended tick defers ≤10 ms.
+pub fn poll_deadline_tick() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let due = core::cmp::min(
+        sched::NEXT_POLL_DEADLINE.load(Relaxed),
+        vfs::earliest_timerfd_deadline(),
+    );
+    if due != u64::MAX && ticks() >= due {
+        if sched::try_wake_poll() {
+            // Only clear the finite-timeout deadline; woken timed waiters that
+            // re-block republish it via fetch_min. Timerfd deadlines are
+            // recomputed from the pool each tick, so nothing to clear there.
+            sched::NEXT_POLL_DEADLINE.store(u64::MAX, Relaxed);
+        }
+        // else: RUN_QUEUE momentarily contended — leave the deadline, retry
+        // next tick (the ≤10 ms defer the design allows).
+    }
+    // Bring-up safety net (design §1), OFF: a periodic unconditional wake would
+    // turn any missed edge site into a ≤100 ms latency blip instead of a hang.
+    // Kept false so the idle-CPU test proves edge coverage is complete.
+    const POLL_SAFETY_WAKE: bool = false;
+    if POLL_SAFETY_WAKE && ticks() % 10 == 0 { sched::try_wake_poll(); }
+}
+
+/// Shared K2 block sequence for poll/ppoll/select: park on the global poll
+/// wait-channel until an edge (`wake_poll`), a deliverable signal, or the
+/// deadline tick. `reprobe` is a read-only "is anything ready now" check — it
+/// must not write user memory (that happens at the caller's loop top). The
+/// re-probe between prepare and commit closes the check-then-sleep lost-wake.
+fn poll_block(infinite: bool, deadline: u64, reprobe: impl FnOnce() -> bool) {
+    sched::block_on_poll_prepare();
+    if !infinite { sched::register_poll_deadline(deadline); }
+    if reprobe() || interrupted() || (!infinite && ticks() >= deadline) {
+        sched::block_on_poll_cancel();
+        return;
+    }
+    sched::block_on_poll_commit();
+}
+
+/// Read-only "any pollfd ready" scan for the poll/ppoll re-probe (no revents
+/// written back — the caller's loop re-scans and writes on the next pass).
+fn poll_any_ready(pid: u32, fds_ptr: usize, nfds: usize) -> bool {
+    const POLLNVAL: u32 = 0x0020;
+    for i in 0..nfds {
+        let pfd = fds_ptr + i * 8;
+        let fd     = unsafe { core::ptr::read(pfd       as *const i32) };
+        let events = unsafe { core::ptr::read((pfd + 4) as *const i16) };
+        if fd < 0 { continue; }
+        let revents = probe_fd_events(pid, fd as usize, events as u16 as u32);
+        if revents != 0 && revents != POLLNVAL { return true; }
+    }
+    false
+}
+
+/// Read-only "any fd ready" scan for the select re-probe.
+fn select_any_ready(pid: u32, nfds: usize, rfds: usize, wfds: usize,
+                    has_r: bool, has_w: bool) -> bool {
+    const POLLIN:  u32 = 0x0001;
+    const POLLOUT: u32 = 0x0004;
+    for fd in 0..nfds {
+        let want_r = has_r && unsafe { (*(rfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
+        let want_w = has_w && unsafe { (*(wfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
+        if !want_r && !want_w { continue; }
+        let requested = (if want_r { POLLIN } else { 0 }) | (if want_w { POLLOUT } else { 0 });
+        let ev = probe_fd_events(pid, fd, requested);
+        if (want_r && ev & POLLIN != 0) || (want_w && ev & POLLOUT != 0) { return true; }
+    }
+    false
 }
 
 /// Query real, current readiness for `fd` — routes to the owning server
@@ -6012,18 +6165,28 @@ fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>
     const POLLHUP:  u32 = 0x0010;
     const POLLNVAL: u32 = 0x0020;
 
-    // Only real VFS fds carry a seq; fd 0-2 and net sockets stay level.
-    // Console stdio proxies (/dev/tty, dup'd stdin — VFS DevStdio vnodes)
-    // must take the level path too: VFS handle_poll reports DevStdio as
-    // never-ready, so routing them to VFS_POLL below leaves an epoll
-    // interest that can never fire. poll(2) already probes these via
-    // poll_fd_state's console-proxy branch; without the same carve-out
-    // here, crossterm's mio-registered /dev/tty handle never wakes for
-    // the ESC[6n cursor-position reply and reedline bails out of
-    // interactive mode after its 2s CPR timeout.
-    if fd <= 2 || fd >= net_server::SOCK_FD_BASE
-        || vfs::fd_is_console_stdio(pid, fd) {
+    // fd 0-2 and console stdio proxies (/dev/tty, dup'd stdin — VFS DevStdio
+    // vnodes) have no edge source and stay level-triggered (None): VFS
+    // handle_poll reports DevStdio never-ready, so routing them to VFS_POLL
+    // below would leave an epoll interest that can never fire (crossterm's
+    // mio-registered /dev/tty handle waits there for the ESC[6n reply).
+    if fd <= 2 || vfs::fd_is_console_stdio(pid, fd) {
         return (probe_fd_events(pid, fd, requested), None);
+    }
+    // Net sockets: a connected AF_UNIX socket now carries a combined edge-seq
+    // (data[16]==1) so an EPOLLET tokio socket is edge-gated instead of
+    // re-firing on every level-writable epoll_wait return; listeners/inet
+    // report no seq (data[16]==0) → level.
+    if fd >= net_server::SOCK_FD_BASE {
+        let msg = make_vfs_msg(net_server::NET_POLL, &[fd as u64]);
+        let reply = net_server::handle(&msg, pid);
+        let r = net_reply_val(&reply);
+        let state = if r < 0 { POLLNVAL } else { r as u32 };
+        let seq = if reply.data[16] == 1 {
+            Some(u64::from_le_bytes(reply.data[8..16].try_into().unwrap_or([0u8; 8])))
+        } else { None };
+        let masked = (state & requested) | (state & (POLLERR | POLLHUP | POLLNVAL));
+        return (masked, seq);
     }
     let msg = make_vfs_msg(vfs::VFS_POLL, &[fd as u64]);
     let reply = vfs::handle(&msg, pid);
@@ -6039,6 +6202,39 @@ fn sys_eventfd2(initval: usize, _flags: usize) -> isize {
     let msg = make_vfs_msg(vfs::VFS_EVENTFD, &[initval as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
+
+/// signalfd4(ufd, mask, sizemask, flags) — minimal: a pseudo-fd that reports
+/// POLLIN when a masked signal is pending and, when read, dequeues each pending
+/// masked signal as a 128-byte signalfd_siginfo with ssi_signo populated (the
+/// rest zero — calloop reads only ssi_signo). `ufd == -1` creates a new
+/// signalfd; otherwise the named signalfd's mask is replaced.
+fn sys_signalfd4(ufd: usize, mask_ptr: usize, _sizemask: usize, _flags: usize) -> isize {
+    if mask_ptr == 0 || !validate_user_buf(mask_ptr, 8) { return -14; } // EFAULT
+    let mask = unsafe { core::ptr::read_unaligned(mask_ptr as *const u64) };
+    let existing = if ufd as isize == -1 { usize::MAX } else { ufd };
+    let pid = current_pid();
+    let msg = make_vfs_msg(vfs::VFS_SIGNALFD_CREATE, &[existing as u64, mask]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// inotify_init1(flags) — a valid fd that accepts watches but never delivers
+/// events (keeps a config-watch source quiet in an event loop; no live reload).
+fn sys_inotify_init1(_flags: usize) -> isize {
+    let pid = current_pid();
+    let msg = make_vfs_msg(vfs::VFS_INOTIFY_CREATE, &[]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// inotify_add_watch(fd, path, mask) → a fake watch descriptor (≥1). The path
+/// and mask are accepted and discarded — the watch never fires.
+fn sys_inotify_add_watch(fd: usize, _path_ptr: usize, _mask: usize) -> isize {
+    let pid = current_pid();
+    let msg = make_vfs_msg(vfs::VFS_INOTIFY_ADD, &[fd as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// inotify_rm_watch(fd, wd) → 0 (nothing to remove; watches never fired).
+fn sys_inotify_rm_watch(_fd: usize, _wd: usize) -> isize { 0 }
 
 /// memfd_create(name_ptr, flags) → writable anonymous fd backed by a TmpFile.
 fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
@@ -6163,9 +6359,7 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize)
         }
         if interrupted() { return -4; } // EINTR
 
-        irq_window();
-
-        yield_now("select");
+        poll_block(infinite, deadline, || select_any_ready(pid, nfds, rfds, wfds, has_r, has_w));
     }
 }
 
