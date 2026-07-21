@@ -379,6 +379,91 @@ impl AddressSpace {
         true
     }
 
+    /// Map a run of already-allocated physical frames as a `MAP_SHARED`
+    /// region, aliasing the frames rather than copying them.
+    ///
+    /// This is the K1 shared-VMO primitive: the frames belong to a tmpfs/memfd
+    /// VMO (see `servers/vfs`), and the caller has **already** taken one
+    /// `pageref` reference per frame (pin-before-publish, under the VMO lock).
+    /// The VMA is shaped exactly like an already-faulted anonymous
+    /// `MAP_SHARED` lazy region — `lazy = true` with `lazy_pages` pre-filled,
+    /// `map_flags = MAP_SHARED`, `file_cap = 0`, `cow = false`, PTEs installed
+    /// eagerly — so every existing fork/munmap/exit path handles it unchanged:
+    /// `clone_as`'s `MAP_SHARED` branch pageref-incs and shares the frames,
+    /// `unmap_range`/`AddressSpace::drop` `unref_or_free` them.
+    ///
+    /// The transferred +1 per frame becomes the VMA's reference, released by
+    /// munmap/exit. This method therefore does **not** call `pageref::inc`.
+    /// On any failure it unmaps whatever it installed and `unref_or_free`s
+    /// **all** passed frames (dropping the caller's pins), returning `false`.
+    pub fn map_shared_frames(&mut self, virt: usize, frames: &[usize], flags: PageFlags) -> bool {
+        if frames.is_empty() {
+            return false;
+        }
+
+        let release_all = || {
+            for &phys in frames {
+                if phys != 0 { crate::pageref::unref_or_free(phys, 0); }
+            }
+        };
+
+        let slot = match self.regions.iter().position(|r| r.is_none()) {
+            Some(i) => i,
+            None    => {
+                self.regions.push(None);
+                self.regions.len() - 1
+            }
+        };
+
+        let virt = virt & !(PAGE_SIZE - 1);
+        let pages = frames.len();
+        let end = match virt.checked_add(pages * PAGE_SIZE) {
+            Some(e) => e,
+            None    => { release_all(); return false; }
+        };
+
+        for r in self.regions.iter().filter_map(|r| r.as_ref()) {
+            if virt < r.end && end > r.start { release_all(); return false; }
+        }
+
+        // Install a PTE for each frame. On failure, roll back the PTEs already
+        // installed, then release every pin.
+        for i in 0..pages {
+            let ok = unsafe {
+                map_page(self.page_table_root, virt + i * PAGE_SIZE, frames[i], flags)
+            };
+            if !ok {
+                for j in 0..i {
+                    unsafe { unmap_page(self.page_table_root, virt + j * PAGE_SIZE); }
+                }
+                release_all();
+                return false;
+            }
+        }
+
+        self.regions[slot] = Some(VmaRegion {
+            start: virt,
+            end,
+            phys: 0,
+            flags,
+            lazy: true,
+            lazy_pages: frames.to_vec(),
+            lazy_count: pages,
+            prot:      {
+                let mut p = PROT_READ;
+                if flags.contains(PageFlags::WRITABLE) { p |= PROT_WRITE; }
+                if flags.contains(PageFlags::EXECUTE)  { p |= PROT_EXEC; }
+                p
+            },
+            map_flags: MAP_SHARED,
+            file_cap:  0,
+            file_off:  0,
+            file_len:  0,
+            cow:       false,
+        });
+        true
+    }
+
     /// Reserve a file-backed virtual range without reading any data.
     ///
     /// The first access to each page faults; `handle_user_page_fault` then

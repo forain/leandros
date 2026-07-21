@@ -311,6 +311,219 @@ impl TmpFileEntry {
 static TMP_FILES: Mutex<[TmpFileEntry; MAX_TMP_FILES]> =
     Mutex::new([const { TmpFileEntry::empty() }; MAX_TMP_FILES]);
 
+// ── Shared VMO store (K1 shared file-backed mmap) ────────────────────────────
+//
+// A tmpfs/memfd inode is "promoted" into a `TmpVmo` — a list of real 4 KiB
+// buddy frames that become the single source of truth for the file's bytes.
+// read/write/ftruncate operate on these frames, and `MAP_SHARED` mmap installs
+// the *same* frames into user page tables (see `vmo_acquire_frames` +
+// `AddressSpace::map_shared_frames`), so two mappings — or a mapping and a
+// read()/write() — of the same file alias the same physical pages. This is
+// what makes cross-process shared memory (wl_shm pools, memfd handoff over
+// SCM_RIGHTS) genuinely coherent.
+//
+// Keyed by the data-owning slot (`tmp_owner`), so hard links and fds passed
+// over SCM_RIGHTS share one VMO. Frames are **untracked** in `pageref` on
+// allocation (implicit refcount 1 = "the VMO owns it"); each shared mapping
+// takes one `pageref::inc` (in `vmo_acquire_frames`, under this lock), released
+// by munmap/exit via the existing lazy-VMA teardown. VMO teardown drops the
+// implicit ref with `unref_or_free`, freeing a frame only once the last mapping
+// is also gone.
+//
+// A file that is never memfd'd and never `MAP_SHARED`-mapped keeps its inline
+// `TmpFileEntry.data` path byte-for-byte, so vfstest/coreutils tmpfs I/O is
+// unchanged. The VMO branch in read/write/ftruncate activates only when
+// `TMP_VMOS[owner].is_some()`.
+struct TmpVmo {
+    /// Physical frame for each 4 KiB page index; non-sparse (every index in
+    /// `0..pages.len()` is a real buddy frame). Capacity (frame count) is
+    /// decoupled from `len`: a mapping larger than the file grows `pages`
+    /// without moving EOF.
+    pages: alloc::vec::Vec<usize>,
+    /// Logical file size in bytes (EOF). Mirrored into `TmpFileEntry.len` so
+    /// fstat/lseek/poll — which read `entry.len` — stay correct unchanged.
+    len:  usize,
+    /// `F_SEAL_*` bits. Only `F_SEAL_SHRINK` is enforced (in ftruncate).
+    seals: u32,
+    /// Seals are only permitted on memfd inodes; also gates `F_GET_SEALS`.
+    is_memfd: bool,
+}
+
+static TMP_VMOS: Mutex<[Option<TmpVmo>; MAX_TMP_FILES]> =
+    Mutex::new([const { None }; MAX_TMP_FILES]);
+
+// Linux memfd/fcntl seal bits (values fixed by the ABI).
+const F_ADD_SEALS:   usize = 1033;
+const F_GET_SEALS:   usize = 1034;
+const F_SEAL_SHRINK: u32   = 0x0002;
+
+/// Allocate one zeroed 4 KiB buddy frame for a VMO. Zeroing touches HHDM
+/// (kernel) memory only, never user memory.
+fn vmo_alloc_zeroed_frame() -> Option<usize> {
+    let phys = mm::buddy::alloc(0)?;
+    unsafe { (mm::phys_to_virt(phys) as *mut u8).write_bytes(0, 4096); }
+    Some(phys)
+}
+
+/// Copy `n` bytes out of the VMO frames starting at logical offset `off` into
+/// kernel/user `dst`. Walks page by page (an unaligned `off` may cross one
+/// frame boundary). Every touched page index is guaranteed present.
+unsafe fn vmo_copy_out(vmo: &TmpVmo, off: usize, dst: *mut u8, n: usize) {
+    let mut done = 0usize;
+    while done < n {
+        let pos  = off + done;
+        let page = pos / 4096;
+        let poff = pos % 4096;
+        let cnt  = (4096 - poff).min(n - done);
+        let src  = (mm::phys_to_virt(vmo.pages[page]) + poff) as *const u8;
+        core::ptr::copy_nonoverlapping(src, dst.add(done), cnt);
+        done += cnt;
+    }
+}
+
+/// Copy `n` bytes from `src` into the VMO frames at logical offset `off`. The
+/// caller must have grown `pages` to cover `off + n` first.
+unsafe fn vmo_copy_in(vmo: &mut TmpVmo, off: usize, src: *const u8, n: usize) {
+    let mut done = 0usize;
+    while done < n {
+        let pos  = off + done;
+        let page = pos / 4096;
+        let poff = pos % 4096;
+        let cnt  = (4096 - poff).min(n - done);
+        let dst  = (mm::phys_to_virt(vmo.pages[page]) + poff) as *mut u8;
+        core::ptr::copy_nonoverlapping(src.add(done), dst, cnt);
+        done += cnt;
+    }
+}
+
+/// Zero bytes `[from, to)` of the VMO frames (HHDM only). Used to clear the
+/// tail of the last previously-existing page on ftruncate-grow.
+fn vmo_zero_range(vmo: &mut TmpVmo, from: usize, to: usize) {
+    let mut pos = from;
+    while pos < to {
+        let page = pos / 4096;
+        if page >= vmo.pages.len() { break; }
+        let poff = pos % 4096;
+        let cnt  = (4096 - poff).min(to - pos);
+        unsafe { ((mm::phys_to_virt(vmo.pages[page]) + poff) as *mut u8).write_bytes(0, cnt); }
+        pos += cnt;
+    }
+}
+
+/// Release a VMO slot's implicit references and clear it. Called from every
+/// inode-free site (`tmp_drop_name`, `tmp_release_ephemeral`) with `TMP_FILES`
+/// already held — the lock order is TMP_FILES → TMP_VMOS. A frame still held by
+/// a live mapping survives (its `pageref` > 1); the last holder frees it.
+fn vmo_free_slot(owner: usize) {
+    if let Some(vmo) = TMP_VMOS.lock()[owner].take() {
+        for phys in vmo.pages {
+            if phys != 0 { mm::pageref::unref_or_free(phys, 0); }
+        }
+    }
+}
+
+/// Resolve `(pid, fd)` to the owning tmpfs slot index, or `None` if the fd is
+/// not an open `TmpFile`.
+fn tmpfile_owner_of(pid: u32, fd: usize) -> Option<usize> {
+    let mut tbls = FD_TABLES.lock();
+    let tbl = find_tbl(pid, &mut *tbls)?;
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
+    match tbl.fds[fd].kind {
+        VnodeKind::TmpFile { idx, .. } => Some(idx),
+        _ => None,
+    }
+}
+
+/// Mark the tmpfs inode behind `fd` as a memfd: create an empty seal-capable
+/// VMO on its owner slot. Called by `sys_memfd_create` right after open.
+pub fn mark_memfd(pid: u32, fd: usize) {
+    let idx = match tmpfile_owner_of(pid, fd) { Some(i) => i, None => return };
+    let mut vmos = TMP_VMOS.lock();
+    match vmos[idx].as_mut() {
+        Some(vmo) => vmo.is_memfd = true,
+        None => vmos[idx] = Some(TmpVmo {
+            pages: alloc::vec::Vec::new(), len: 0, seals: 0, is_memfd: true,
+        }),
+    }
+}
+
+/// Ensure the tmpfs/memfd file behind `fd` has a VMO whose frames cover the
+/// page range `[off, off+len)`, pin **one** `pageref` reference per mapped
+/// frame, and return those frames in order for
+/// `AddressSpace::map_shared_frames`.
+///
+/// First `MAP_SHARED` of a plain tmpfs file **promotes** it: the inline
+/// `data[..len]` bytes are migrated into freshly allocated frames. `off`/`len`
+/// are page-aligned by the caller (`sys_mmap`). The `pageref::inc` happens
+/// inside the VMO lock (pin-before-publish), so a concurrent ftruncate-shrink
+/// cannot free a frame between listing and pinning. Returns `None` on bad fd /
+/// non-tmpfs fd / OOM.
+///
+/// Lock order: FD_TABLES → TMP_FILES → TMP_VMOS, all leaf `spin::Mutex`es,
+/// never nested under AS-`busy` or RUN_QUEUE. The caller maps the returned
+/// frames *after* this returns (AS-`busy` taken second).
+pub fn vmo_acquire_frames(pid: u32, fd: usize, off: usize, len: usize)
+    -> Option<alloc::vec::Vec<usize>>
+{
+    if len == 0 || off % 4096 != 0 { return None; }
+    let idx = tmpfile_owner_of(pid, fd)?;
+    let first = off / 4096;
+    let n = (len + 4095) / 4096;
+    let need_pages = first.checked_add(n)?;
+
+    let mut tmp = TMP_FILES.lock();
+    let mut vmos = TMP_VMOS.lock();
+
+    // Promote a plain tmpfs file on first MAP_SHARED: migrate inline bytes.
+    if vmos[idx].is_none() {
+        let cur_len = tmp[idx].len;
+        let cur_pages = (cur_len + 4095) / 4096;
+        let mut pages = alloc::vec::Vec::new();
+        for p in 0..cur_pages {
+            let phys = match vmo_alloc_zeroed_frame() {
+                Some(f) => f,
+                None => { for &f in &pages { mm::buddy::free(f, 0); } return None; }
+            };
+            let start = p * 4096;
+            let cnt = (cur_len - start).min(4096);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    tmp[idx].data.as_ptr().add(start),
+                    mm::phys_to_virt(phys) as *mut u8, cnt);
+            }
+            pages.push(phys);
+        }
+        vmos[idx] = Some(TmpVmo { pages, len: cur_len, seals: 0, is_memfd: false });
+    }
+
+    let vmo = vmos[idx].as_mut().unwrap();
+    // Grow frame capacity to cover the mapped range. This does NOT move EOF
+    // (`vmo.len`) — a mapping past end-of-file gets zero-filled frames.
+    while vmo.pages.len() < need_pages {
+        let phys = vmo_alloc_zeroed_frame()?; // partial growth is harmless (VMO owns them)
+        vmo.pages.push(phys);
+    }
+
+    // Pin and collect the mapped range's frames (inc under the lock).
+    let mut out = alloc::vec::Vec::with_capacity(n);
+    for p in first..need_pages {
+        let phys = vmo.pages[p];
+        mm::pageref::inc(phys);
+        out.push(phys);
+    }
+    Some(out)
+}
+
+/// Release frames pinned by `vmo_acquire_frames` when the mapping could not be
+/// installed (drops the caller's `pageref::inc`). Only used for the
+/// no-address-space edge; `map_shared_frames` releases them itself on the
+/// mapping-failure path.
+pub fn vmo_release_frames(frames: &[usize]) {
+    for &phys in frames {
+        if phys != 0 { mm::pageref::unref_or_free(phys, 0); }
+    }
+}
+
 // ── Vnode kinds ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1432,10 +1645,12 @@ fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: u128) {
     let referenced = |i: usize| i < MAX_TMP_FILES && open_fds & (1u128 << i) != 0;
     let owner = tmp_owner(tmp, idx);
     if owner != idx {
-        // An alias. Free it, and collect the inode if that was the last name
-        // and the owner had already lost its own.
+        // An alias. Free it (an alias never owns a VMO — the VMO is keyed on
+        // `owner`), and collect the inode if that was the last name and the
+        // owner had already lost its own.
         tmp[idx] = TmpFileEntry::empty();
         if tmp[owner].ephemeral && tmp_alias_count(tmp, owner) == 0 && !referenced(owner) {
+            vmo_free_slot(owner); // release the inode's VMO frames (K1)
             tmp[owner] = TmpFileEntry::empty();
         }
         return;
@@ -1443,6 +1658,7 @@ fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: u128) {
     if tmp_alias_count(tmp, idx) > 0 || referenced(idx) {
         tmp[idx].ephemeral = true;
     } else {
+        vmo_free_slot(idx); // release the inode's VMO frames (K1)
         tmp[idx] = TmpFileEntry::empty();
     }
 }
@@ -1653,6 +1869,9 @@ fn tmp_release_ephemeral(idx: usize) {
     if !still_referenced && tmp[idx].in_use && tmp[idx].ephemeral
         && tmp_alias_count(&tmp[..], idx) == 0
     {
+        // A memfd whose name was unlinked while an fd stayed open lands here on
+        // the final close — release its VMO frames before freeing the slot (K1).
+        vmo_free_slot(idx);
         tmp[idx] = TmpFileEntry::empty();
     }
 }
@@ -2350,12 +2569,21 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             let idx = *idx;
             let cur = *pos;
             drop(tbls);
-            let mut tmp = TMP_FILES.lock();
-            let entry = &mut tmp[idx];
-            let remaining = entry.len.saturating_sub(cur);
+            let tmp = TMP_FILES.lock();
+            // `entry.len` mirrors `vmo.len` for a promoted file, so the EOF
+            // bound is the same whether or not a VMO backs this inode.
+            let remaining = tmp[idx].len.saturating_sub(cur);
             let n = count.min(remaining).min(4096);
             if n == 0 { return val_reply(0); }
-            unsafe { core::ptr::copy_nonoverlapping(entry.data.as_ptr().add(cur), buf, n); }
+            // Promoted (memfd / MAP_SHARED-mapped) files read from their VMO
+            // frames — the pages ARE the file, so read()↔mmap coherence is free.
+            let vmos = TMP_VMOS.lock();
+            if let Some(vmo) = vmos[idx].as_ref() {
+                unsafe { vmo_copy_out(vmo, cur, buf, n); }
+            } else {
+                unsafe { core::ptr::copy_nonoverlapping(tmp[idx].data.as_ptr().add(cur), buf, n); }
+            }
+            drop(vmos);
             drop(tmp);
             let mut tbls2 = FD_TABLES.lock();
             if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
@@ -2445,13 +2673,34 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 c
             };
             let mut tmp = TMP_FILES.lock();
-            let entry = &mut tmp[idx];
-            let avail = MAX_TMP_SIZE.saturating_sub(cur);
-            let n = count.min(avail);
-            if n == 0 { return err_reply(-28); } // ENOSPC
-            unsafe { core::ptr::copy_nonoverlapping(buf, entry.data.as_mut_ptr().add(cur), n); }
-            let new_pos = cur + n;
-            if new_pos > entry.len { entry.len = new_pos; }
+            let mut vmos = TMP_VMOS.lock();
+            let (n, new_pos) = if let Some(vmo) = vmos[idx].as_mut() {
+                // Promoted file: write into VMO frames, no 32 KiB cap. Grow the
+                // frame list to cover cur+count first (F_SEAL_WRITE/GROW are
+                // out of scope — not enforced here).
+                let end = cur + count;
+                let need_pages = (end + 4095) / 4096;
+                while vmo.pages.len() < need_pages {
+                    match vmo_alloc_zeroed_frame() { Some(f) => vmo.pages.push(f), None => break }
+                }
+                let cap_bytes = vmo.pages.len() * 4096;
+                let n = count.min(cap_bytes.saturating_sub(cur));
+                if n == 0 { return err_reply(-28); } // ENOSPC
+                unsafe { vmo_copy_in(vmo, cur, buf, n); }
+                let new_pos = cur + n;
+                if new_pos > vmo.len { vmo.len = new_pos; tmp[idx].len = new_pos; } // mirror EOF
+                (n, new_pos)
+            } else {
+                let entry = &mut tmp[idx];
+                let avail = MAX_TMP_SIZE.saturating_sub(cur);
+                let n = count.min(avail);
+                if n == 0 { return err_reply(-28); } // ENOSPC
+                unsafe { core::ptr::copy_nonoverlapping(buf, entry.data.as_mut_ptr().add(cur), n); }
+                let new_pos = cur + n;
+                if new_pos > entry.len { entry.len = new_pos; }
+                (n, new_pos)
+            };
+            drop(vmos);
             drop(tmp);
             let mut tbls2 = FD_TABLES.lock();
             if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
@@ -3227,6 +3476,31 @@ fn handle_fcntl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
             if arg > PIPE_RING_SIZE { err_reply(-22) } // EINVAL
             else { val_reply(PIPE_RING_SIZE as u64) }
         }
+        // memfd seals (K1). Only permitted on a memfd inode; F_SEAL_SHRINK is
+        // the only bit enforced (in handle_ftruncate). Other bits are accepted
+        // and stored but not acted on (F_SEAL_WRITE/GROW/SEAL out of scope).
+        F_ADD_SEALS => {
+            let kind = tbl.fds[fd].kind;
+            drop(tbls);
+            if let VnodeKind::TmpFile { idx, .. } = kind {
+                let mut vmos = TMP_VMOS.lock();
+                match vmos[idx].as_mut() {
+                    Some(vmo) if vmo.is_memfd => { vmo.seals |= arg as u32; ok_reply() }
+                    _ => err_reply(-22), // EINVAL — not a memfd
+                }
+            } else { err_reply(-22) }
+        }
+        F_GET_SEALS => {
+            let kind = tbl.fds[fd].kind;
+            drop(tbls);
+            if let VnodeKind::TmpFile { idx, .. } = kind {
+                let vmos = TMP_VMOS.lock();
+                match vmos[idx].as_ref() {
+                    Some(vmo) if vmo.is_memfd => val_reply(vmo.seals as u64),
+                    _ => err_reply(-22), // EINVAL — not a memfd
+                }
+            } else { err_reply(-22) }
+        }
         _ => ok_reply(), // silently ignore unknown fcntl
     }
 }
@@ -3908,6 +4182,40 @@ fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
         VnodeKind::TmpFile { idx, .. } => {
             drop(tbls);
             let mut tmp = TMP_FILES.lock();
+            let mut vmos = TMP_VMOS.lock();
+            if let Some(vmo) = vmos[idx].as_mut() {
+                // Enforce F_SEAL_SHRINK; grow/shrink the frame list. Frames a
+                // live mapping still holds survive shrink (unref_or_free), so
+                // there is no use-after-free (Linux would SIGBUS — out of scope).
+                if new_len < vmo.len && vmo.seals & F_SEAL_SHRINK != 0 {
+                    return err_reply(-1); // EPERM
+                }
+                let old_len   = vmo.len;
+                let old_pages = vmo.pages.len();
+                let new_pages = (new_len + 4095) / 4096;
+                if new_pages >= old_pages {
+                    while vmo.pages.len() < new_pages {
+                        match vmo_alloc_zeroed_frame() {
+                            Some(f) => vmo.pages.push(f),
+                            None    => return err_reply(-28), // ENOSPC
+                        }
+                    }
+                    // Clear the tail of the last previously-existing page; newly
+                    // appended frames are already zero from allocation.
+                    if new_len > old_len {
+                        let end = new_len.min(old_pages * 4096);
+                        if end > old_len { vmo_zero_range(vmo, old_len, end); }
+                    }
+                } else {
+                    for p in new_pages..old_pages {
+                        mm::pageref::unref_or_free(vmo.pages[p], 0);
+                    }
+                    vmo.pages.truncate(new_pages);
+                }
+                vmo.len = new_len;
+                tmp[idx].len = new_len; // mirror EOF
+                return ok_reply();
+            }
             let entry = &mut tmp[idx];
             if new_len > MAX_TMP_SIZE { return err_reply(-28); }
             if new_len > entry.len { for b in &mut entry.data[entry.len..new_len] { *b = 0; } }

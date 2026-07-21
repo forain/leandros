@@ -1486,6 +1486,35 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
         return ret;
     }
 
+    // ── Shared tmpfs/memfd mmap (K1 shared VMO) ───────────────────────────────
+    // MAP_SHARED of a tmpfs/memfd file aliases the file's VMO frames rather
+    // than copying them, so two mappings — or a mapping and read()/write() — of
+    // the same inode see each other's stores. The frames are pinned by the VFS
+    // acquire (pageref::inc each, under the VMO lock) BEFORE we take AS-busy to
+    // map them (lock order: never nest the tmpfs locks under AS-busy). f2fs
+    // MAP_SHARED still falls through to the eager private-copy path below.
+    if flags & MAP_SHARED != 0 {
+        if let Some(vfs::VnodeKind::TmpFile { .. }) = kind {
+            match vfs::vmo_acquire_frames(pid, fd, off, len) {
+                Some(frames) => {
+                    let mapped = with_current_address_space_mut(|as_| {
+                        if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
+                        as_.map_shared_frames(virt, &frames, page_flags)
+                    });
+                    return match mapped {
+                        // On success the VMA owns the transferred pins.
+                        Some(true)  => virt as isize,
+                        // map_shared_frames released the pins itself on failure.
+                        Some(false) => -12, // ENOMEM
+                        // No current address space: release the pins ourselves.
+                        None => { vfs::vmo_release_frames(&frames); -12 }
+                    };
+                }
+                None => return -12, // ENOMEM — promotion/allocation failed
+            }
+        }
+    }
+
     // Normal file-backed mmap follows...
     // Step 1: seek the fd to the requested offset.
     //
@@ -6030,10 +6059,18 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_OPEN, &[
         path.as_ptr() as u64,
-        (0x041 | 0x200) as u64, // O_WRONLY|O_CREAT|O_TRUNC
+        (0x042 | 0x200) as u64, // O_RDWR|O_CREAT|O_TRUNC — O_RDWR (not O_WRONLY)
+                                // so the wl_shm compositor-side read() coherence
+                                // path is legal on the same fd (K1).
         0o600u64,
     ]);
-    vfs_reply_val(&vfs::handle(&msg, pid))
+    let fd = vfs_reply_val(&vfs::handle(&msg, pid));
+    if fd >= 0 {
+        // Mark the inode as a memfd: creates an empty seal-capable VMO so the
+        // file is genuinely shareable and F_ADD_SEALS/F_GET_SEALS are honored.
+        vfs::mark_memfd(pid, fd as usize);
+    }
+    fd
 }
 
 fn sys_timerfd_create(_clockid: usize) -> isize {
