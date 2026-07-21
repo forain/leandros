@@ -441,6 +441,19 @@ mod nr {
     pub const UMOUNT2:             usize = 39;
     pub const MOUNT:               usize = 40;
     pub const PIVOT_ROOT:          usize = 41;
+    // Extended attributes (asm-generic 5..=16)
+    pub const SETXATTR:            usize = 5;
+    pub const LSETXATTR:           usize = 6;
+    pub const FSETXATTR:           usize = 7;
+    pub const GETXATTR:            usize = 8;
+    pub const LGETXATTR:           usize = 9;
+    pub const FGETXATTR:           usize = 10;
+    pub const LISTXATTR:           usize = 11;
+    pub const LLISTXATTR:          usize = 12;
+    pub const FLISTXATTR:          usize = 13;
+    pub const REMOVEXATTR:         usize = 14;
+    pub const LREMOVEXATTR:        usize = 15;
+    pub const FREMOVEXATTR:        usize = 16;
 }
 
 // ── x86-64 Linux syscall numbers ──────────────────────────────────────────────
@@ -658,6 +671,19 @@ mod nr {
     pub const MOUNT:               usize = 165;
     pub const UMOUNT2:             usize = 166;
     pub const PIVOT_ROOT:          usize = 155;
+    // Extended attributes (x86-64 188..=199)
+    pub const SETXATTR:            usize = 188;
+    pub const LSETXATTR:           usize = 189;
+    pub const FSETXATTR:           usize = 190;
+    pub const GETXATTR:            usize = 191;
+    pub const LGETXATTR:           usize = 192;
+    pub const FGETXATTR:           usize = 193;
+    pub const LISTXATTR:           usize = 194;
+    pub const LLISTXATTR:          usize = 195;
+    pub const FLISTXATTR:          usize = 196;
+    pub const REMOVEXATTR:         usize = 197;
+    pub const LREMOVEXATTR:        usize = 198;
+    pub const FREMOVEXATTR:        usize = 199;
 }
 
 use nr::*;
@@ -1143,7 +1169,18 @@ fn dispatch_inner(
         STATX       => sys_statx(a0, a1, a2, a3, a4),
         OPENAT2     => sys_openat(a0, a1, a2, a3),
         CLOSE_RANGE => sys_close_range(a0, a1, a2),
-        PIDFD_OPEN  => log_enosys(number),
+        // tokio (brush's runtime) probes pidfd_open once per process for
+        // pidfd-based child reaping and falls back to SIGCHLD on ENOSYS.
+        PIDFD_OPEN  => -38, // ENOSYS
+
+        // ── Extended attributes ───────────────────────────────────────────────
+        // No mounted filesystem stores xattrs, so every file's list is empty.
+        // `ls -l` calls listxattr per entry (ACL `+` / xattr `@` markers);
+        // an empty list — not an error — is what keeps it quiet and correct.
+        LISTXATTR | LLISTXATTR | FLISTXATTR => 0,
+        GETXATTR | LGETXATTR | FGETXATTR => -61,    // ENODATA: no such attribute
+        SETXATTR | LSETXATTR | FSETXATTR
+            | REMOVEXATTR | LREMOVEXATTR | FREMOVEXATTR => -95, // EOPNOTSUPP
 
         // ── Credentials ───────────────────────────────────────────────────────
         GETUID  => sched::current_uid()  as isize,
