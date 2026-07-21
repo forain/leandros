@@ -2783,6 +2783,75 @@ fn handle_dup2(pid: u32, oldfd: usize, newfd: usize, cloexec: bool) -> Message {
     val_reply(newfd as u64)
 }
 
+/// A file description in flight over an AF_UNIX SCM_RIGHTS control message.
+///
+/// The net server (which owns the byte stream and the message boundaries the
+/// fds ride with) cannot touch the per-process fd tables — those live here.
+/// So SCM_RIGHTS fd passing is split: `export_fd` lifts an fd out of the
+/// sender's table into one of these (taking an in-flight reference so the
+/// underlying object survives the sender closing its fd while the descriptor
+/// is still queued), the net server stows the `TransferFd` alongside the
+/// stream, and `import_fd` installs it into the receiver's table on the recv
+/// that consumes the carrying byte. `drop_transfer` releases one that was
+/// never delivered (control buffer too small → Linux closes it; or the socket
+/// was torn down with fds still queued).
+///
+/// `VnodeKind` is `Copy`, so this is just the sender's fd entry lifted out.
+/// This mirrors what `handle_fork_dup` already does across fork (a raw entry
+/// copy plus a pipe-endpoint refcount bump) — the same lifetime model, only
+/// the destination table belongs to a different, unrelated process.
+#[derive(Clone, Copy)]
+pub struct TransferFd {
+    kind:  VnodeKind,
+    flags: u32,
+}
+
+/// Lift `fd` out of `pid`'s table into a `TransferFd`, taking an in-flight
+/// reference on the underlying object. Returns None (→ EBADF) for a closed or
+/// out-of-range fd, or for the untracked console fds 0-2 (passing stdio over
+/// SCM_RIGHTS is not needed by Wayland/D-Bus; see the K1 report).
+pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
+    let (kind, flags) = {
+        let tbls = FD_TABLES.lock();
+        let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
+        (tbl.fds[fd].kind, tbl.fds[fd].flags)
+    };
+    // Second reference held by the queued descriptor: a pipe endpoint must not
+    // reach EOF/EPIPE just because the sender closed its fd before the peer
+    // recv'd. No-op for every non-pipe kind (their lifetime is table-scan
+    // driven — see `tmp_release_ephemeral`).
+    pipe_ref_inc(&kind);
+    Some(TransferFd { kind, flags })
+}
+
+/// Install a queued `TransferFd` as a fresh fd in `pid`'s table, consuming the
+/// in-flight reference `export_fd` took (the installed fd now owns it — so no
+/// extra ref bump). `cloexec` sets FD_CLOEXEC per MSG_CMSG_CLOEXEC. Returns the
+/// new fd, or -EMFILE if the table is full (in which case the reference is
+/// released, matching a close of the undelivered fd).
+pub fn import_fd(pid: u32, tf: TransferFd, cloexec: bool) -> isize {
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => {
+        drop(tbls); release_vnode(tf.kind, pid); return -24;
+    }};
+    let slot = match tbl.alloc_fd() { Some(s) => s, None => {
+        drop(tbls); release_vnode(tf.kind, pid); return -24; // EMFILE
+    }};
+    let mut flags = tf.flags;
+    if cloexec { flags |= O_CLOEXEC; } else { flags &= !O_CLOEXEC; }
+    tbl.fds[slot] = FdEntry { kind: tf.kind, flags, in_use: true };
+    slot as isize
+}
+
+/// Release a `TransferFd` that never reached a receiver — the in-flight
+/// reference `export_fd` took is dropped, and any last-reference teardown runs
+/// exactly as a close would. Linux closes SCM_RIGHTS fds that don't fit the
+/// receiver's control buffer, and drops queued fds when the socket dies.
+pub fn drop_transfer(tf: TransferFd) {
+    release_vnode(tf.kind, 0);
+}
+
 fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
     let mut tbls = FD_TABLES.lock();
     let parent_fds: [FdEntry; MAX_FDS] = match tbls.iter().find(|t| t.in_use && t.pid == parent_pid) {

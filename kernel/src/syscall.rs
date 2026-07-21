@@ -5550,7 +5550,7 @@ fn sys_recvfrom(sockfd: usize, buf_ptr: usize, len: usize,
 }
 
 fn sys_sendmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
-    if !validate_user_buf(msghdr_ptr, 48) { return -14; } // sizeof(msghdr)≥48
+    if !validate_user_buf(msghdr_ptr, 56) { return -14; } // struct msghdr (msg_flags at +48)
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SENDMSG,
         &[sockfd as u64, msghdr_ptr as u64, flags as u64]);
@@ -5558,7 +5558,7 @@ fn sys_sendmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
 }
 
 fn sys_recvmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
-    if !validate_user_buf(msghdr_ptr, 48) { return -14; }
+    if !validate_user_buf(msghdr_ptr, 56) { return -14; } // struct msghdr (msg_flags at +48)
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_RECVMSG,
         &[sockfd as u64, msghdr_ptr as u64, flags as u64]);

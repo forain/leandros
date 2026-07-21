@@ -302,6 +302,7 @@ dependencies = [
  "sched",
  "smoltcp",
  "spin",
+ "vfs-server",
 ]
 
 [[package]]

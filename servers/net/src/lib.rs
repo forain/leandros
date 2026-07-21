@@ -43,6 +43,23 @@ const POLLIN:  u64 = 0x0001;
 const POLLOUT: u64 = 0x0004;
 const POLLHUP: u64 = 0x0010;
 
+// ── SCM_RIGHTS / cmsg (Linux ABI, 64-bit) ─────────────────────────────────────
+const SOL_SOCKET:       i32   = 1;
+const SCM_RIGHTS:       i32   = 1;
+const SO_PEERCRED:      usize = 17;
+const MSG_CTRUNC:       i32   = 0x08;
+const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
+/// Linux SCM_MAX_FD: at most this many fds may ride one message.
+const SCM_MAX_FD:       usize = 253;
+/// `sizeof(struct cmsghdr)` on 64-bit: size_t len(8) + int level(4) + int type(4).
+const CMSG_HDR_LEN:     usize = 16;
+/// Bound on how much of a user control buffer we parse/emit (fits SCM_MAX_FD
+/// fds plus the header, rounded up).
+const MAX_CONTROL:      usize = CMSG_HDR_LEN + SCM_MAX_FD * 4 + 8;
+
+#[inline]
+fn cmsg_align(n: usize) -> usize { (n + 7) & !7 }
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub const AF_UNIX:    usize = 1;
@@ -87,11 +104,17 @@ struct UnixRing {
     rpos:  usize,
     wpos:  usize,
     count: usize,
+    /// Monotonic total bytes ever written / read on this direction. Unlike
+    /// rpos/wpos these never wrap, so an SCM_RIGHTS fd batch can be pinned to
+    /// the absolute stream offset of the byte it rides with (see
+    /// `PendingFdBatch`) and delivered on the recv that consumes that byte.
+    wtotal: u64,
+    rtotal: u64,
 }
 
 impl UnixRing {
     const fn new() -> Self {
-        Self { buf: [0u8; RING_SIZE], rpos: 0, wpos: 0, count: 0 }
+        Self { buf: [0u8; RING_SIZE], rpos: 0, wpos: 0, count: 0, wtotal: 0, rtotal: 0 }
     }
 
     fn write(&mut self, data: *const u8, len: usize) -> usize {
@@ -102,6 +125,7 @@ impl UnixRing {
             self.wpos = (self.wpos + 1) % RING_SIZE;
         }
         self.count += n;
+        self.wtotal += n as u64;
         n
     }
 
@@ -112,6 +136,7 @@ impl UnixRing {
             self.rpos = (self.rpos + 1) % RING_SIZE;
         }
         self.count -= n;
+        self.rtotal += n as u64;
         n
     }
 
@@ -152,6 +177,24 @@ impl UnixRing {
 
 // ── Unix connection pair ──────────────────────────────────────────────────────
 
+/// Credentials of a socket end, captured at socketpair/connect/accept time and
+/// reported to the peer via getsockopt(SO_PEERCRED) (D-Bus EXTERNAL auth).
+#[derive(Clone, Copy)]
+struct Ucred { pid: u32, uid: u32, gid: u32 }
+impl Ucred {
+    const fn zero() -> Self { Self { pid: 0, uid: 0, gid: 0 } }
+}
+
+/// One SCM_RIGHTS fd batch queued on a stream direction. `seq_byte` is the
+/// absolute stream offset (UnixRing::wtotal) of the first data byte these fds
+/// accompany; the recv that consumes that byte delivers them (Linux: fds ride
+/// with the first byte of their segment). Ordered ascending by `seq_byte`
+/// within a direction, since sends append in order.
+struct PendingFdBatch {
+    seq_byte: u64,
+    fds:      alloc::vec::Vec<vfs::TransferFd>,
+}
+
 struct UnixConn {
     in_use: bool,
     ring_ab: UnixRing,
@@ -162,6 +205,13 @@ struct UnixConn {
     /// the same end; the end only really closes when its last alias does.
     refs_a: u32,
     refs_b: u32,
+    /// In-flight SCM_RIGHTS fds. `fdq_ab` rides the a→b stream (written by the
+    /// a end, delivered to the b end), `fdq_ba` the reverse.
+    fdq_ab: alloc::vec::Vec<PendingFdBatch>,
+    fdq_ba: alloc::vec::Vec<PendingFdBatch>,
+    /// Credentials of each end for the peer's SO_PEERCRED.
+    cred_a: Ucred,
+    cred_b: Ucred,
 }
 
 impl UnixConn {
@@ -174,7 +224,18 @@ impl UnixConn {
             closed_b: false,
             refs_a: 1,
             refs_b: 1,
+            fdq_ab: alloc::vec::Vec::new(),
+            fdq_ba: alloc::vec::Vec::new(),
+            cred_a: Ucred::zero(),
+            cred_b: Ucred::zero(),
         }
+    }
+
+    /// Release every queued-but-undelivered fd on both directions (socket torn
+    /// down). Linux closes in-flight SCM_RIGHTS fds when the socket dies.
+    fn drain_fds(&mut self) {
+        for b in self.fdq_ab.drain(..) { for tf in b.fds { vfs::drop_transfer(tf); } }
+        for b in self.fdq_ba.drain(..) { for tf in b.fds { vfs::drop_transfer(tf); } }
     }
 }
 
@@ -546,9 +607,9 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                         arg(msg,1) as usize, arg(msg,2) as usize,
                                         arg(msg,4) as usize, arg(msg,5) as usize),
         NET_SENDMSG     => handle_sendmsg(caller_pid, arg(msg,0) as usize,
-                                          arg(msg,1) as usize),
+                                          arg(msg,1) as usize, arg(msg,2) as usize),
         NET_RECVMSG     => handle_recvmsg(caller_pid, arg(msg,0) as usize,
-                                          arg(msg,1) as usize),
+                                          arg(msg,1) as usize, arg(msg,2) as usize),
         NET_SHUTDOWN    => handle_shutdown(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         NET_GETSOCKNAME  => handle_getsockname(caller_pid, arg(msg,0) as usize,
                                                 arg(msg,1) as usize, arg(msg,2) as usize),
@@ -774,6 +835,10 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Me
             }
             match found {
                 Some(conn_idx) => {
+                    // The accepting socket is end B; record its creds for the
+                    // connector's SO_PEERCRED.
+                    let cred_b = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
+                    UNIX_CONNS.lock()[conn_idx].cred_b = cred_b;
                     let tbl = find_tbl(pid, &mut *tbls).unwrap();
                     let new_slot = match tbl.alloc() { Some(s) => s, None => return err_reply(-24) };
                     tbl.socks[new_slot] = SockEntry {
@@ -899,13 +964,17 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         };
         let _ = bound_idx;
 
+        // The connecting socket becomes end A at accept time; capture its creds.
+        let cred = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
         let conn_idx = {
             let mut conns = UNIX_CONNS.lock();
             let idx = match conns.iter().position(|c| !c.in_use) {
                 Some(i) => i, None => return err_reply(-12),
             };
+            conns[idx].drain_fds();
             conns[idx] = UnixConn::new();
             conns[idx].in_use = true;
+            conns[idx].cred_a = cred;
             idx
         };
 
@@ -923,13 +992,18 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
                      _protocol: usize, sv_ptr: usize) -> Message {
     if domain != AF_UNIX { return err_reply(-97); }
 
+    // Both ends belong to the creating process — SO_PEERCRED on either reports it.
+    let cred = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
     let conn_idx = {
         let mut conns = UNIX_CONNS.lock();
         let idx = match conns.iter().position(|c| !c.in_use) {
             Some(i) => i, None => return err_reply(-12),
         };
+        conns[idx].drain_fds();
         conns[idx] = UnixConn::new();
         conns[idx].in_use = true;
+        conns[idx].cred_a = cred;
+        conns[idx].cred_b = cred;
         idx
     };
 
@@ -1229,36 +1303,308 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
     }
 }
 
-fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize) -> Message {
-    if msghdr_ptr == 0 { return err_reply(-14); }
-    let iov_ptr    = unsafe { core::ptr::read((msghdr_ptr + 16) as *const usize) };
-    let iovcnt     = unsafe { core::ptr::read((msghdr_ptr + 24) as *const usize) };
-    let mut total = 0isize;
-    for i in 0..iovcnt.min(16) {
-        let iov = iov_ptr + i * 16;
-        let base = unsafe { core::ptr::read(iov as *const usize) };
-        let len  = unsafe { core::ptr::read((iov + 8) as *const usize) };
-        let n = net_val(&handle_send(pid, fd, base, len, 0, 0));
-        if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
-        total += n;
+/// Resolve `fd` to a connected AF_UNIX **stream** end. SCM_RIGHTS fd passing is
+/// scoped to stream sockets (Wayland/D-Bus): dgram framing and per-message fd
+/// attachment don't compose cleanly, so a dgram/inet fd returns None and the
+/// caller takes the plain-data path.
+fn unix_stream_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
+    let slot = fd_to_slot(fd)?;
+    let tbls = SOCK_TABLES.lock();
+    let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return None; }
+    if tbl.socks[slot].sock_type != SOCK_STREAM as u8 { return None; }
+    match tbl.socks[slot].state {
+        SockState::UnixConnected { conn_idx, is_a } => Some((conn_idx, is_a)),
+        _ => None,
     }
+}
+
+#[inline]
+unsafe fn rd_usize(p: usize) -> usize { core::ptr::read_unaligned(p as *const usize) }
+
+/// Parse SCM_RIGHTS control messages out of a user control buffer into
+/// `out` (int fds). Returns the fd count, or Err(errno) on a malformed cmsg
+/// (EINVAL). Non-SCM_RIGHTS cmsgs are skipped. Reads user memory directly
+/// (caller's address space is active) — no lock is held here.
+unsafe fn parse_scm_rights(ctrl_ptr: usize, ctrl_len: usize, out: &mut [i32; SCM_MAX_FD]) -> Result<usize, i32> {
+    let mut pos = 0usize;
+    let mut nfd = 0usize;
+    while pos + CMSG_HDR_LEN <= ctrl_len {
+        let cmsg_len   = rd_usize(ctrl_ptr + pos);
+        let cmsg_level = core::ptr::read_unaligned((ctrl_ptr + pos + 8) as *const i32);
+        let cmsg_type  = core::ptr::read_unaligned((ctrl_ptr + pos + 12) as *const i32);
+        if cmsg_len < CMSG_HDR_LEN || pos + cmsg_len > ctrl_len { return Err(-22); } // EINVAL
+        if cmsg_level == SOL_SOCKET && cmsg_type == SCM_RIGHTS {
+            let data_len = cmsg_len - CMSG_HDR_LEN;
+            let count = data_len / 4;
+            for i in 0..count {
+                if nfd >= SCM_MAX_FD { return Err(-22); } // > SCM_MAX_FD → EINVAL
+                out[nfd] = core::ptr::read_unaligned((ctrl_ptr + pos + CMSG_HDR_LEN + i * 4) as *const i32);
+                nfd += 1;
+            }
+        }
+        let step = cmsg_align(cmsg_len);
+        if step == 0 { break; }
+        pos += step;
+    }
+    Ok(nfd)
+}
+
+fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Message {
+    if msghdr_ptr == 0 { return err_reply(-14); }
+    let iov_ptr  = unsafe { rd_usize(msghdr_ptr + 16) };
+    let iovcnt   = unsafe { rd_usize(msghdr_ptr + 24) };
+    let ctrl_ptr = unsafe { rd_usize(msghdr_ptr + 32) };
+    let ctrl_len = unsafe { rd_usize(msghdr_ptr + 40) };
+
+    let unix_end = unix_stream_end(pid, fd);
+
+    // Parse SCM_RIGHTS fds only for a unix stream socket that actually carries
+    // a control buffer. Inet/dgram control is ignored (can't carry fds).
+    let mut fd_nums = [0i32; SCM_MAX_FD];
+    let mut nfd = 0usize;
+    if unix_end.is_some() && ctrl_ptr != 0 && ctrl_len >= CMSG_HDR_LEN {
+        match unsafe { parse_scm_rights(ctrl_ptr, ctrl_len.min(MAX_CONTROL), &mut fd_nums) } {
+            Ok(n)  => nfd = n,
+            Err(e) => return err_reply(e),
+        }
+    }
+
+    // No ancillary fds → original plain-data fast path (also covers inet).
+    if nfd == 0 {
+        let mut total = 0isize;
+        for i in 0..iovcnt.min(16) {
+            let iov  = iov_ptr + i * 16;
+            let base = unsafe { rd_usize(iov) };
+            let len  = unsafe { rd_usize(iov + 8) };
+            let n = net_val(&handle_send(pid, fd, base, len, 0, 0));
+            if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
+            total += n;
+        }
+        return val_reply(total as u64);
+    }
+
+    // Have fds. Export them out of the sender's fd table (locks FD_TABLES —
+    // done BEFORE taking UNIX_CONNS so the two locks are never nested here).
+    let (conn_idx, is_a) = unix_end.unwrap();
+    let mut batch: alloc::vec::Vec<vfs::TransferFd> = alloc::vec::Vec::new();
+    for i in 0..nfd {
+        match vfs::export_fd(pid, fd_nums[i] as usize) {
+            Some(tf) => batch.push(tf),
+            None => { for tf in batch { vfs::drop_transfer(tf); } return err_reply(-9); } // EBADF
+        }
+    }
+
+    // Pre-read the iov descriptors before taking the lock.
+    let mut iovs = [(0usize, 0usize); 16];
+    let n_iov = iovcnt.min(16);
+    let mut requested = 0usize;
+    for i in 0..n_iov {
+        let iov = iov_ptr + i * 16;
+        iovs[i] = (unsafe { rd_usize(iov) }, unsafe { rd_usize(iov + 8) });
+        requested += iovs[i].1;
+    }
+    // A stream sendmsg needs at least one data byte to carry the fds; with none
+    // requested there is no byte to ride and no EAGAIN retry could ever place
+    // one — drop the batch (Linux does not queue fds for a zero-length send).
+    if requested == 0 {
+        for tf in batch { vfs::drop_transfer(tf); }
+        return val_reply(0);
+    }
+
+    // Write the data and attach the fd batch to the first byte written, under a
+    // single UNIX_CONNS critical section so the stream offset can't race.
+    let mut conns = UNIX_CONNS.lock();
+    let conn = &mut conns[conn_idx];
+    if !conn.in_use {
+        drop(conns);
+        for tf in batch { vfs::drop_transfer(tf); }
+        return err_reply(-32);
+    }
+    let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
+    if peer_closed {
+        drop(conns);
+        for tf in batch { vfs::drop_transfer(tf); }
+        return err_reply(-32); // EPIPE
+    }
+    let seq = if is_a { conn.ring_ab.wtotal } else { conn.ring_ba.wtotal };
+    let mut total = 0usize;
+    for i in 0..n_iov {
+        let (base, len) = iovs[i];
+        let n = if is_a {
+            conn.ring_ab.write(base as *const u8, len)
+        } else {
+            conn.ring_ba.write(base as *const u8, len)
+        };
+        total += n;
+        if n < len { break; } // ring full → partial write
+    }
+    if total == 0 {
+        // Couldn't place even the first byte; the blocking wrapper will retry.
+        // Release the batch so the retry re-exports a fresh copy.
+        drop(conns);
+        for tf in batch { vfs::drop_transfer(tf); }
+        return err_reply(-11); // EAGAIN
+    }
+    if is_a {
+        conn.fdq_ab.push(PendingFdBatch { seq_byte: seq, fds: batch });
+    } else {
+        conn.fdq_ba.push(PendingFdBatch { seq_byte: seq, fds: batch });
+    }
+    drop(conns);
     val_reply(total as u64)
 }
 
-fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize) -> Message {
+/// Write msg_controllen (offset 40) and msg_flags (offset 48) into a user
+/// msghdr. Always called on the recvmsg success path — msg_flags must be set
+/// even when it is 0.
+unsafe fn write_msg_tail(msghdr_ptr: usize, controllen: usize, msg_flags: i32) {
+    core::ptr::write_unaligned((msghdr_ptr + 40) as *mut usize, controllen);
+    core::ptr::write_unaligned((msghdr_ptr + 48) as *mut i32, msg_flags);
+}
+
+fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Message {
     if msghdr_ptr == 0 { return err_reply(-14); }
-    let iov_ptr = unsafe { core::ptr::read((msghdr_ptr + 16) as *const usize) };
-    let iovcnt  = unsafe { core::ptr::read((msghdr_ptr + 24) as *const usize) };
-    let mut total = 0isize;
-    for i in 0..iovcnt.min(16) {
+    let iov_ptr  = unsafe { rd_usize(msghdr_ptr + 16) };
+    let iovcnt   = unsafe { rd_usize(msghdr_ptr + 24) };
+    let ctrl_ptr = unsafe { rd_usize(msghdr_ptr + 32) };
+    let ctrl_cap = unsafe { rd_usize(msghdr_ptr + 40) };
+
+    let unix_end = unix_stream_end(pid, fd);
+
+    // Non-unix (inet/dgram): plain-data path; still writes msg_flags/controllen.
+    let (conn_idx, is_a) = match unix_end {
+        Some(e) => e,
+        None => {
+            let mut total = 0isize;
+            for i in 0..iovcnt.min(16) {
+                let iov  = iov_ptr + i * 16;
+                let base = unsafe { rd_usize(iov) };
+                let len  = unsafe { rd_usize(iov + 8) };
+                let n = net_val(&handle_recv(pid, fd, base, len, 0, 0));
+                if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
+                total += n;
+            }
+            unsafe { write_msg_tail(msghdr_ptr, 0, 0); }
+            return val_reply(total as u64);
+        }
+    };
+
+    // Pre-read iov descriptors.
+    let mut iovs = [(0usize, 0usize); 16];
+    let n_iov = iovcnt.min(16);
+    let mut requested = 0usize;
+    for i in 0..n_iov {
         let iov = iov_ptr + i * 16;
-        let base = unsafe { core::ptr::read(iov as *const usize) };
-        let len  = unsafe { core::ptr::read((iov + 8) as *const usize) };
-        let n = net_val(&handle_recv(pid, fd, base, len, 0, 0));
-        if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
-        total += n;
+        iovs[i] = (unsafe { rd_usize(iov) }, unsafe { rd_usize(iov + 8) });
+        requested += iovs[i].1;
     }
-    val_reply(total as u64)
+    // A zero-length recv can't consume the fd-carrying byte and would spin the
+    // blocking wrapper on EAGAIN forever — return 0 immediately (msg_flags set).
+    if requested == 0 {
+        unsafe { write_msg_tail(msghdr_ptr, 0, 0); }
+        return val_reply(0);
+    }
+
+    // Read data and pop at most one deliverable fd batch, under one lock.
+    let mut conns = UNIX_CONNS.lock();
+    let conn = &mut conns[conn_idx];
+    if !conn.in_use {
+        drop(conns);
+        unsafe { write_msg_tail(msghdr_ptr, 0, 0); }
+        return val_reply(0);
+    }
+    let rstart = if is_a { conn.ring_ba.rtotal } else { conn.ring_ab.rtotal };
+    // Don't read across a second ancillary boundary: a recv delivers at most
+    // one fd batch, so cap the byte count so it can't consume the byte the
+    // *next* batch rides with (Linux stops coalescing at an ancillary skb).
+    let q_len = if is_a { conn.fdq_ba.len() } else { conn.fdq_ab.len() };
+    let max_read = if q_len >= 2 {
+        let second = if is_a { conn.fdq_ba[1].seq_byte } else { conn.fdq_ab[1].seq_byte };
+        (second - rstart) as usize
+    } else {
+        usize::MAX
+    };
+
+    let mut nread = 0usize;
+    for i in 0..n_iov {
+        if nread >= max_read { break; }
+        let (base, len) = iovs[i];
+        let want = len.min(max_read - nread);
+        let n = if is_a {
+            conn.ring_ba.read(base as *mut u8, want)
+        } else {
+            conn.ring_ab.read(base as *mut u8, want)
+        };
+        nread += n;
+        if n < want { break; } // ring drained
+    }
+
+    if nread == 0 {
+        // Empty ring: EOF only if the peer end has closed, else EAGAIN. Mirrors
+        // handle_recv — tokio's self-pipe must not see a spurious EOF.
+        let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
+        if !peer_closed && conn.in_use {
+            drop(conns);
+            return err_reply(-11); // EAGAIN — blocking wrapper retries
+        }
+    }
+
+    let rtotal = if is_a { conn.ring_ba.rtotal } else { conn.ring_ab.rtotal };
+    let deliver: Option<alloc::vec::Vec<vfs::TransferFd>> = {
+        let q = if is_a { &mut conn.fdq_ba } else { &mut conn.fdq_ab };
+        if !q.is_empty() && q[0].seq_byte < rtotal {
+            Some(q.remove(0).fds)
+        } else {
+            None
+        }
+    };
+    drop(conns); // release before importing (locks FD_TABLES)
+
+    // Install the delivered fds into the receiver and serialize the cmsg.
+    let cloexec = flags & MSG_CMSG_CLOEXEC != 0;
+    let mut ctrunc = false;
+    let mut ctrl_written = 0usize;
+    if let Some(fds) = deliver {
+        let nfds = fds.len();
+        // How many fds fit: need the cmsg header plus 4 bytes each.
+        let mut fit = if ctrl_ptr == 0 || ctrl_cap < CMSG_HDR_LEN + 4 {
+            0
+        } else {
+            ((ctrl_cap - CMSG_HDR_LEN) / 4).min(nfds)
+        };
+        if fit < nfds { ctrunc = true; }
+        let mut installed = [0i32; SCM_MAX_FD];
+        let mut i = 0usize;
+        while i < fit {
+            let newfd = vfs::import_fd(pid, fds[i], cloexec);
+            if newfd < 0 {
+                // Receiver's fd table is full: everything from here truncates.
+                ctrunc = true;
+                fit = i;
+                break;
+            }
+            installed[i] = newfd as i32;
+            i += 1;
+        }
+        // Close every fd that didn't fit (Linux drops the overflow).
+        for j in fit..nfds { vfs::drop_transfer(fds[j]); }
+        if fit > 0 {
+            unsafe {
+                let clen = CMSG_HDR_LEN + fit * 4;
+                core::ptr::write_unaligned(ctrl_ptr as *mut usize, clen);
+                core::ptr::write_unaligned((ctrl_ptr + 8) as *mut i32, SOL_SOCKET);
+                core::ptr::write_unaligned((ctrl_ptr + 12) as *mut i32, SCM_RIGHTS);
+                for k in 0..fit {
+                    core::ptr::write_unaligned((ctrl_ptr + CMSG_HDR_LEN + k * 4) as *mut i32, installed[k]);
+                }
+                ctrl_written = clen;
+            }
+        }
+    }
+
+    unsafe { write_msg_tail(msghdr_ptr, ctrl_written, if ctrunc { MSG_CTRUNC } else { 0 }); }
+    val_reply(nread as u64)
 }
 
 fn handle_shutdown(pid: u32, fd: usize, _how: usize) -> Message {
@@ -1271,6 +1617,7 @@ fn handle_shutdown(pid: u32, fd: usize, _how: usize) -> Message {
                 if is_a { conns[conn_idx].closed_a = true; }
                 else    { conns[conn_idx].closed_b = true; }
                 if conns[conn_idx].closed_a && conns[conn_idx].closed_b {
+                    conns[conn_idx].drain_fds();
                     conns[conn_idx].in_use = false;
                 }
             }
@@ -1293,8 +1640,23 @@ fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
     handle_getsockname(pid, fd, addr_ptr, addrlen_ptr)
 }
 
-fn handle_getsockopt(_pid: u32, _fd: usize, level: usize, optname: usize,
+fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                      optval_ptr: usize, optlen_ptr: usize) -> Message {
+    // SO_PEERCRED: report the peer end's captured {pid,uid,gid} (struct ucred).
+    // D-Bus EXTERNAL auth reads the uid from here.
+    if level == SOL_SOCKET as usize && optname == SO_PEERCRED {
+        if optval_ptr == 0 { return err_reply(-14); }
+        let cred = unix_peer_cred(pid, fd);
+        unsafe {
+            core::ptr::write_unaligned(optval_ptr as *mut u32, cred.pid);
+            core::ptr::write_unaligned((optval_ptr + 4) as *mut u32, cred.uid);
+            core::ptr::write_unaligned((optval_ptr + 8) as *mut u32, cred.gid);
+        }
+        if optlen_ptr != 0 {
+            unsafe { core::ptr::write_unaligned(optlen_ptr as *mut u32, 12); }
+        }
+        return ok_reply();
+    }
     if level == 1 && optname == 4 {
         if optval_ptr != 0 {
             unsafe { core::ptr::write(optval_ptr as *mut u32, 0); }
@@ -1304,6 +1666,18 @@ fn handle_getsockopt(_pid: u32, _fd: usize, level: usize, optname: usize,
         }
     }
     ok_reply()
+}
+
+/// The credentials of the peer of `fd` (the other end of the connection), for
+/// SO_PEERCRED. Falls back to zeroes for a non-connected/unknown fd.
+fn unix_peer_cred(pid: u32, fd: usize) -> Ucred {
+    let (conn_idx, is_a) = match unix_stream_end(pid, fd) {
+        Some(e) => e,
+        None => return Ucred::zero(),
+    };
+    let conns = UNIX_CONNS.lock();
+    // Peer of end A is end B and vice-versa.
+    if is_a { conns[conn_idx].cred_b } else { conns[conn_idx].cred_a }
 }
 
 /// fork(): give `child` its own copies of `parent`'s socket fds, per POSIX
@@ -1433,7 +1807,7 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
             *refs = refs.saturating_sub(1);
             if *refs == 0 {
                 if is_a { c.closed_a = true; } else { c.closed_b = true; }
-                if c.closed_a && c.closed_b { c.in_use = false; }
+                if c.closed_a && c.closed_b { c.drain_fds(); c.in_use = false; }
             }
             drop(conns);
             let mut tbls2 = SOCK_TABLES.lock();
@@ -1580,7 +1954,7 @@ fn handle_close_all(pid: u32) {
         
         let mut conns = UNIX_CONNS.lock();
         for &ci in &unix_to_close {
-            if ci != usize::MAX { conns[ci].in_use = false; }
+            if ci != usize::MAX { conns[ci].drain_fds(); conns[ci].in_use = false; }
         }
         drop(conns);
 
