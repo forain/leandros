@@ -1,0 +1,18 @@
+#!/bin/sh
+# zig cc musl cross-compiler wrapper with linker-script arg normalization.
+args=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -Wl,--version-script|-Wl,--dynamic-list)
+      flag="$1"; shift
+      # next token is the script path (positional). Merge into =form.
+      args="$args $flag=$1"
+      ;;
+    *)
+      args="$args $1"
+      ;;
+  esac
+  shift
+done
+# shellcheck disable=SC2086
+exec zig cc -target x86_64-linux-musl $args
