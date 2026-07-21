@@ -238,13 +238,23 @@ def main():
     bins = [
         "shell", "login", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest",
-        "waittest", "sigchldtest", "scmtest",
+        "waittest", "sigchldtest", "scmtest", "epolltest", "idletest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
         if os.path.exists(p):
             bin_files.append((b, p, 0o100755))
+
+    # Static-musl tokio binaries from the S1 spike — K2 acceptance
+    # (tokio-echo-selftest regression + the idle-CPU cross-check).
+    musl_target = "aarch64-unknown-linux-musl" if arch == "aarch64" else "x86_64-unknown-linux-musl"
+    tokio_dir = os.path.expanduser(
+        f"~/.claude-forain/jobs/afde2e74/tmp/s1-musl-spike/target/{musl_target}/release")
+    for tb in ("tokio-echo-selftest", "tokioidle"):
+        p = os.path.join(tokio_dir, tb)
+        if os.path.exists(p):
+            bin_files.append((tb, p, 0o100755))
             
     p = f"../doomgeneric/doom-{arch}"
     if os.path.exists(p):

@@ -1,0 +1,15 @@
+[package]
+name = "epolltest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "epolltest"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc! We link directly against librelibc.a, the same way
+# polltest/pthreadtest/timertest/sigtest do: this exercises the real
+# epoll_create1/epoll_ctl/epoll_wait/pipe2/sigprocmask/readlink Pal calls,
+# not a reimplementation, so going through the real libc (rather than raw
+# syscalls for everything) is the point.
