@@ -28,6 +28,7 @@ type pid_t = i32;
 
 const AF_UNIX: c_int = 1;
 const SOCK_STREAM: c_int = 1;
+const O_NONBLOCK: c_int = 0o4000;
 
 const POLLIN: c_short = 0x001;
 const POLLHUP: c_short = 0x010;
@@ -104,6 +105,7 @@ extern "C" {
     pub fn exit(status: i32) -> !;
 
     pub fn pipe(fildes: *mut c_int) -> c_int;
+    pub fn pipe2(fildes: *mut c_int, flags: c_int) -> c_int;
     pub fn dup(fildes: c_int) -> c_int;
 
     pub fn socketpair(domain: c_int, kind: c_int, protocol: c_int, sv: *mut c_int) -> c_int;
@@ -234,17 +236,25 @@ unsafe fn test_pipe_epoll_no_false_positive() -> bool {
 
 unsafe fn test_pipe_epoll_pollout_reflects_ring_full() -> bool {
     let name = b"pipe_epoll_pollout_reflects_ring_full\0";
-    let (rfd, wfd) = new_pipe();
+    // Non-blocking both ends: the kernel's pipe ring (PIPE_RING_SIZE) is larger
+    // than any single write below, so "full" is reached by writing until the
+    // write end reports EAGAIN, not by a hardcoded byte count. Filling to a
+    // fixed size silently stopped filling the ring the moment PIPE_RING_SIZE
+    // grew past that number, which is what made this test fail. O_NONBLOCK keeps
+    // the last (would-block) write from hanging once the ring is full.
+    let mut fds = [0i32; 2];
+    if pipe2(fds.as_mut_ptr(), O_NONBLOCK) != 0 { return report(name, false); }
+    let (rfd, wfd) = (fds[0], fds[1]);
 
     let big = [0u8; 8192];
     let mut total = 0usize;
     loop {
         let n = write(wfd, big.as_ptr(), 8192);
-        if n <= 0 { break; }
+        if n <= 0 { break; } // EAGAIN: ring is now full
         total += n as usize;
-        if total >= 4096 { break; } // ring is 4096 bytes; this must be enough
+        if total > (1 << 20) { break; } // safety valve; a real ring is far smaller
     }
-    let filled = total > 0 && total <= 4096;
+    let filled = total > 0;
 
     let ep = epoll_create1(0);
     let mut ev = epoll_event { events: EPOLLOUT, data: epoll_data { fd: wfd } };
