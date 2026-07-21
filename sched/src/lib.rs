@@ -338,6 +338,9 @@ pub fn deliver_signal(pid: Pid, signo: u32) -> isize {
         }
     };
     if woke { wake_up_an_idle_cpu(); }
+    // A signalfd registered in this tgid may be parked in epoll_wait; the
+    // new pending bit is a readiness edge for it. RUN_QUEUE is released above.
+    wake_poll();
     ret
 }
 
@@ -413,6 +416,8 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32) -> isize {
         }
     };
     if woke { wake_up_an_idle_cpu(); }
+    // Wake any signalfd poller in the target tgid (RUN_QUEUE released above).
+    wake_poll();
     ret
 }
 
@@ -790,6 +795,111 @@ pub fn block_on_port_commit() {
     yield_now("block_on_port");
 }
 
+// ── Global poll/epoll wait-channel (K2 event-loop blocking) ─────────────────
+//
+// poll/ppoll/select/epoll_wait share one wait-channel instead of per-object
+// waitqueues: the workload is a few dozen tasks, so a global wake that each
+// blocked poller re-probes against is cheaper than the register/deregister
+// bookkeeping a per-fd model needs, and it reuses the proven three-phase
+// `block_on_port` protocol verbatim. The sentinel is outside the real port-id
+// range (`port::alloc` only returns 1..MAX_PORTS), so `unblock_port` from a
+// genuine IPC never touches pollers and `wake_poll` never touches IPC waiters.
+pub const POLL_WAIT_CHANNEL: u32 = 0xFFFF_FF01;
+
+/// Phase 1: publish Blocked-on-poll intent while still executing.
+pub fn block_on_poll_prepare() { block_on_port_prepare(POLL_WAIT_CHANNEL) }
+/// Undo a prepared poll-block (the re-probe found readiness or a signal).
+pub fn block_on_poll_cancel()  { block_on_port_cancel() }
+/// Phase 3: yield; woken by `wake_poll`, a signal, or the deadline tick.
+pub fn block_on_poll_commit()  { block_on_port_commit() }
+
+/// Wake every task blocked on the poll wait-channel. Callers (edge publishers
+/// in net/vfs, the deadline tick, signal delivery) MUST hold no server lock —
+/// this takes RUN_QUEUE. Task context only (blocking lock); IRQ context uses
+/// `try_wake_poll`.
+pub fn wake_poll() { unblock_port(POLL_WAIT_CHANNEL); }
+
+/// Non-blocking `wake_poll` for IRQ / tick context: honors the tick hook's
+/// try_lock-only contract. Returns false (wake deferred) if RUN_QUEUE is
+/// momentarily contended on another CPU; the next tick retries.
+pub fn try_wake_poll() -> bool {
+    match RUN_QUEUE.try_lock() {
+        Some(mut rq) => {
+            let woken = rq.unblock_port(POLL_WAIT_CHANNEL);
+            drop(rq);
+            if woken > 0 { wake_up_an_idle_cpu(); }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Earliest absolute tick at which a timed poll/select/epoll_wait waiter wants
+/// to be re-woken (u64::MAX = no timed waiter). A finite-timeout waiter folds
+/// its deadline in via `register_poll_deadline` (fetch_min) when it blocks; the
+/// poll tick hook wakes all pollers once `ticks()` reaches it.
+pub static NEXT_POLL_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Publish a timed waiter's wake deadline (absolute ticks). Monotone-minimum so
+/// the earliest of all outstanding timed waiters governs the next tick wake.
+pub fn register_poll_deadline(deadline: u64) {
+    NEXT_POLL_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
+}
+
+// ── Per-process executable path (/proc/self/exe) ────────────────────────────
+//
+// A tgid-keyed side table rather than a `Task` field, so fork/clone's raw-copy
+// task layout is untouched. `sys_execve` sets it on success; a process leader's
+// exit clears it; fork inherits the parent's until the child execs; unset falls
+// back to "/bin/init" (correct for the boot-loaded PID1, which never execs).
+const MAX_EXE_PATHS: usize = 64;
+const EXE_PATH_MAX: usize = 256;
+struct ExePathEntry { tgid: Pid, len: u16, path: [u8; EXE_PATH_MAX] }
+impl ExePathEntry {
+    const fn empty() -> Self { Self { tgid: 0, len: 0, path: [0u8; EXE_PATH_MAX] } }
+}
+static EXE_PATHS: Mutex<[ExePathEntry; MAX_EXE_PATHS]> =
+    Mutex::new([const { ExePathEntry::empty() }; MAX_EXE_PATHS]);
+
+/// Record `tgid`'s executable path (bytes truncated to EXE_PATH_MAX). Replaces
+/// any existing entry for the tgid; allocates a free slot otherwise.
+pub fn set_exe_path(tgid: Pid, bytes: &[u8]) {
+    let n = bytes.len().min(EXE_PATH_MAX);
+    let mut t = EXE_PATHS.lock();
+    // Reuse the tgid's existing slot, else the first free one.
+    let idx = t.iter().position(|e| e.tgid == tgid)
+        .or_else(|| t.iter().position(|e| e.tgid == 0));
+    if let Some(i) = idx {
+        t[i].tgid = tgid;
+        t[i].len = n as u16;
+        t[i].path[..n].copy_from_slice(&bytes[..n]);
+    }
+}
+
+/// Copy `tgid`'s executable path into `out`; returns its length, or None if
+/// unset (caller falls back to "/bin/init").
+pub fn exe_path(tgid: Pid, out: &mut [u8]) -> Option<usize> {
+    let t = EXE_PATHS.lock();
+    let e = t.iter().find(|e| e.tgid == tgid)?;
+    let n = (e.len as usize).min(out.len());
+    out[..n].copy_from_slice(&e.path[..n]);
+    Some(n)
+}
+
+/// Release `tgid`'s executable-path slot (process leader exit).
+pub fn clear_exe_path(tgid: Pid) {
+    let mut t = EXE_PATHS.lock();
+    if let Some(e) = t.iter_mut().find(|e| e.tgid == tgid) { *e = ExePathEntry::empty(); }
+}
+
+/// Child (a new tgid) inherits the parent's exe path until it execs.
+pub fn inherit_exe_path(parent_tgid: Pid, child_tgid: Pid) {
+    let mut buf = [0u8; EXE_PATH_MAX];
+    if let Some(n) = exe_path(parent_tgid, &mut buf) {
+        set_exe_path(child_tgid, &buf[..n]);
+    }
+}
+
 pub fn umask(mask: u32) -> u32 {
     let pid = current_pid();
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
@@ -994,14 +1104,23 @@ pub fn yield_now(reason: &str) {
     }
 }
 
-/// Optional 100 Hz hook run from the BSP timer IRQ (see register_tick_hook).
-static TICK_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Up to 4 optional 100 Hz hooks run from the BSP timer IRQ (see
+/// register_tick_hook). Audio owns one slot (its queue pump is load-bearing for
+/// MAME sound latency — never regress it); K2 registers the poll-deadline hook.
+const MAX_TICK_HOOKS: usize = 4;
+static TICK_HOOKS: [core::sync::atomic::AtomicUsize; MAX_TICK_HOOKS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_TICK_HOOKS];
 
 /// Register a function to run on every BSP timer tick, in IRQ context.
 /// The hook must be non-blocking (try_lock only, no sleeps) and fast.
-/// Used by the audio server to pump its queue independently of producers.
+/// Used by the audio server (queue pump) and the K2 poll-deadline waker.
+/// Silently ignored past MAX_TICK_HOOKS registrations.
 pub fn register_tick_hook(f: fn()) {
-    TICK_HOOK.store(f as usize, Ordering::Release);
+    for h in TICK_HOOKS.iter() {
+        if h.compare_exchange(0, f as usize, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return;
+        }
+    }
 }
 
 pub fn timer_tick_irq() {
@@ -1010,10 +1129,12 @@ pub fn timer_tick_irq() {
     // TIMER_TICKS keeps its 100 Hz meaning regardless of CPU count.
     if id == 0 {
         TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
-        let hook = TICK_HOOK.load(Ordering::Acquire);
-        if hook != 0 {
-            let f: fn() = unsafe { core::mem::transmute(hook) };
-            f();
+        for h in TICK_HOOKS.iter() {
+            let hook = h.load(Ordering::Acquire);
+            if hook != 0 {
+                let f: fn() = unsafe { core::mem::transmute(hook) };
+                f();
+            }
         }
     }
     PREEMPT_NEEDED[id.min(MAX_CPUS - 1)].store(true, Ordering::Relaxed);
@@ -1439,6 +1560,8 @@ pub fn exit(code: i32) -> ! {
             None => (pid, 0),
         }
     };
+    // Release the /proc/self/exe side-table slot when the process leader dies.
+    if pid == tgid { clear_exe_path(tgid); }
     // POSIX: the parent gets SIGCHLD when a child *process* terminates.
     // Threads (pid != tgid) don't signal, and the signal goes to the parent's
     // thread-group leader since the signal-action table is TGID-shared.

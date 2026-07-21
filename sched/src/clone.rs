@@ -277,6 +277,10 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         child.root_len      = root.1;
         child.signal_actions = [DEFAULT_SIGACTION; 64];
 
+        // The child is a new process (its tgid == child_pid); inherit the
+        // parent's /proc/self/exe path until it execs.
+        super::inherit_exe_path(super::tgid_of(parent_pid), child_pid);
+
         // Give the caller its chance to set up per-child kernel state (VFS
         // fd table) while the child is still invisible to other CPUs.
         before_enqueue(child_pid);
@@ -492,6 +496,11 @@ pub fn clone_thread(
         // SMP race fork_current's doc comment describes: another CPU could
         // otherwise dispatch the child immediately and lose the race against
         // its own first fd-allocating syscall.
+        // A non-CLONE_THREAD clone is a new process (own tgid) — inherit the
+        // parent's /proc/self/exe path; CLONE_THREAD siblings share it by tgid.
+        if flags & CLONE_THREAD == 0 {
+            super::inherit_exe_path(parent_tgid, child_pid);
+        }
         before_enqueue(child_pid);
 
         if !super::RUN_QUEUE.lock().enqueue(child) {
