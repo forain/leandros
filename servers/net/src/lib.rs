@@ -112,6 +112,20 @@ fn ok_reply()        -> Message { make_reply(0) }
 fn err_reply(e: i32) -> Message { make_reply(e as i64) }
 fn val_reply(v: u64) -> Message { make_reply(v as i64) }
 
+/// NET_POLL reply: revents in data[0..8], the connection edge-seq in
+/// data[8..16], and data[16] = 1 when the seq is meaningful (a connected
+/// AF_UNIX socket), 0 for level-only sockets (listeners, inet) so the epoll
+/// layer treats them level-triggered. Mirrors vfs::poll_reply plus the
+/// has-seq flag.
+fn net_poll_reply(revents: u64, seq: Option<u64>) -> Message {
+    let mut m = make_reply(revents as i64);
+    if let Some(s) = seq {
+        m.data[8..16].copy_from_slice(&s.to_le_bytes());
+        m.data[16] = 1;
+    }
+    m
+}
+
 // ── Unix connection ring buffers ──────────────────────────────────────────────
 
 struct UnixRing {
@@ -227,6 +241,17 @@ struct UnixConn {
     /// Credentials of each end for the peer's SO_PEERCRED.
     cred_a: Ucred,
     cred_b: Ucred,
+    /// Combined per-connection edge-trigger sequence, bumped on every state
+    /// change that can newly assert readiness on either end (data-in,
+    /// space-freed, peer-close, connect/accept). handle_poll returns it so the
+    /// epoll layer emulates EPOLLET on AF_UNIX sockets without dropping edges
+    /// (before this, sockets reported no seq → an EPOLLET tokio socket that
+    /// was level-writable re-fired on every epoll_wait return, a POLLOUT
+    /// storm under real blocking). One combined counter is enough for
+    /// tokio/mio: they register both directions on one interest and re-derive
+    /// per-direction readiness after each wake; a cross-direction spurious
+    /// wake just finds nothing new and re-blocks.
+    seq: u64,
 }
 
 impl UnixConn {
@@ -243,6 +268,7 @@ impl UnixConn {
             fdq_ba: alloc::vec::Vec::new(),
             cred_a: Ucred::zero(),
             cred_b: Ucred::zero(),
+            seq: 0,
         }
     }
 
@@ -938,7 +964,13 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Me
                     // The accepting socket is end B; record its creds for the
                     // connector's SO_PEERCRED.
                     let cred_b = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
-                    UNIX_CONNS.lock()[conn_idx].cred_b = cred_b;
+                    {
+                        let mut c = UNIX_CONNS.lock();
+                        c[conn_idx].cred_b = cred_b;
+                        // Connection established: the connector's poll becomes
+                        // writable/connected (an edge for it).
+                        c[conn_idx].seq = c[conn_idx].seq.wrapping_add(1);
+                    }
                     let tbl = find_tbl(pid, &mut *tbls).unwrap();
                     let new_slot = match tbl.alloc() { Some(s) => s, None => return err_reply(-24) };
                     tbl.socks[new_slot] = SockEntry {
@@ -966,6 +998,9 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Me
                     if addr_ptr != 0 {
                         unsafe { core::ptr::write_bytes(addr_ptr as *mut u8, 0, 2); }
                     }
+                    drop(tbls);
+                    // Wake the connector parked in poll/connect (K2).
+                    sched::wake_poll();
                     val_reply((new_slot + SOCK_FD_BASE) as u64)
                 }
                 None => err_reply(-11),
@@ -1100,6 +1135,10 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         };
         if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
         tbl.socks[slot].state = SockState::UnixPendingAccept { conn_idx, sock_id };
+        drop(tbls);
+        // A listener parked in accept/poll now has a pending connect on its
+        // address (K2 real blocking).
+        sched::wake_poll();
         ok_reply()
     }
 }
@@ -1185,6 +1224,10 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                     conn.ring_ba.write_dgram(buf_ptr as *const u8, len).unwrap_or(0)
                 }
             };
+            // New readable edge for the peer end.
+            if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
+            drop(conns); // release UNIX_CONNS before waking pollers (K2 lock order)
+            if n > 0 { sched::wake_poll(); }
             val_reply(n as u64)
         }
         SockState::InetConnected { socket_handle, remote_endpoint } => {
@@ -1329,6 +1372,10 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                 let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
                 if !peer_closed { return err_reply(-11); } // EAGAIN
             }
+            // Draining bytes frees ring space → a POLLOUT edge for the peer.
+            if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
+            drop(conns); // release UNIX_CONNS before waking pollers (K2 lock order)
+            if n > 0 { sched::wake_poll(); }
             val_reply(n as u64)
         }
         SockState::InetConnected { socket_handle, .. } => {
@@ -1580,7 +1627,10 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     } else {
         conn.fdq_ba.push(PendingFdBatch { seq_byte: seq, fds: batch });
     }
-    drop(conns);
+    // New readable edge for the peer (total > 0 guaranteed above).
+    conn.seq = conn.seq.wrapping_add(1);
+    drop(conns); // release UNIX_CONNS before waking pollers (K2 lock order)
+    sched::wake_poll();
     val_reply(total as u64)
 }
 
@@ -1688,7 +1738,11 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
             None
         }
     };
+    // Draining bytes frees ring space → a POLLOUT edge for the peer.
+    let freed = nread > 0;
+    if freed { conn.seq = conn.seq.wrapping_add(1); }
     drop(conns); // release before importing (locks FD_TABLES)
+    if freed { sched::wake_poll(); }
 
     // Install the delivered fds into the receiver and serialize the cmsg.
     let cloexec = flags & MSG_CMSG_CLOEXEC != 0;
@@ -1739,20 +1793,27 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
 fn handle_shutdown(pid: u32, fd: usize, _how: usize) -> Message {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     let mut tbls = SOCK_TABLES.lock();
+    let mut do_wake = false;
     if let Some(tbl) = find_tbl(pid, &mut *tbls) {
         if slot < MAX_SOCKS && tbl.socks[slot].in_use {
             if let SockState::UnixConnected { conn_idx, is_a } = tbl.socks[slot].state {
                 let mut conns = UNIX_CONNS.lock();
                 if is_a { conns[conn_idx].closed_a = true; }
                 else    { conns[conn_idx].closed_b = true; }
+                conns[conn_idx].seq = conns[conn_idx].seq.wrapping_add(1);
                 if conns[conn_idx].closed_a && conns[conn_idx].closed_b {
                     conns[conn_idx].drain_fds();
                     conns[conn_idx].in_use = false;
                 }
+                drop(conns);
+                do_wake = true;
             }
             tbl.socks[slot] = SockEntry::empty();
         }
     }
+    drop(tbls);
+    // Peer sees POLLHUP/POLLIN (EOF) — wake after releasing all server locks.
+    if do_wake { sched::wake_poll(); }
     ok_reply()
 }
 
@@ -1939,8 +2000,11 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
             let c = &mut conns[conn_idx];
             let refs = if is_a { &mut c.refs_a } else { &mut c.refs_b };
             *refs = refs.saturating_sub(1);
+            let mut end_closed = false;
             if *refs == 0 {
                 if is_a { c.closed_a = true; } else { c.closed_b = true; }
+                c.seq = c.seq.wrapping_add(1);
+                end_closed = true;
                 if c.closed_a && c.closed_b { c.drain_fds(); c.in_use = false; }
             }
             drop(conns);
@@ -1948,6 +2012,9 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
             if let Some(t2) = tbls2.iter_mut().find(|t| t.in_use && t.pid == pid) {
                 t2.socks[slot] = SockEntry::empty();
             }
+            drop(tbls2);
+            // Peer sees POLLHUP/POLLIN (EOF) once this end really closed.
+            if end_closed { sched::wake_poll(); }
         }
         SockState::InetConnected { socket_handle, .. } => {
             tbl.socks[slot] = SockEntry::empty();
@@ -2004,7 +2071,7 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
 
-    let revents: u64 = match state {
+    let (revents, seq): (u64, Option<u64>) = match state {
         SockState::UnixConnected { conn_idx, is_a } => {
             drop(tbls);
             let conns = UNIX_CONNS.lock();
@@ -2018,19 +2085,30 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             if readable > 0 || peer_closed || !conn.in_use { ev |= POLLIN; }
             if conn.in_use && !peer_closed && write_free > 0 { ev |= POLLOUT; }
             if !conn.in_use || peer_closed { ev |= POLLHUP; }
-            ev
+            // Connected sockets carry the edge-seq so EPOLLET works.
+            (ev, Some(conn.seq))
         }
-        SockState::UnixListening { .. } => {
+        SockState::UnixListening { bound_idx } => {
             drop(tbls);
+            // Readable only when a connect is pending against *this* listener's
+            // address (matched by its unique sock_id — see handle_accept), not
+            // against any listener in the system. Without this filter a connect
+            // to one listener made every listener report POLLIN — spurious
+            // wakeups / thundering herd under real blocking (K1-C handoff #1).
+            let listen_sock_id = {
+                let bound = BOUND_PATHS.lock();
+                if !bound[bound_idx].in_use { 0 } else { bound[bound_idx].sock_id }
+            };
             let tbls2 = SOCK_TABLES.lock();
-            let pending = tbls2.iter().any(|t| t.in_use && t.socks.iter()
-                .any(|s| matches!(s.state, SockState::UnixPendingAccept { .. })));
-            if pending { POLLIN } else { 0 }
+            let pending = listen_sock_id != 0 && tbls2.iter().any(|t| t.in_use && t.socks.iter()
+                .any(|s| matches!(s.state,
+                    SockState::UnixPendingAccept { sock_id, .. } if sock_id == listen_sock_id)));
+            (if pending { POLLIN } else { 0 }, None)
         }
         SockState::InetConnected { socket_handle, .. } => {
             drop(tbls);
             let mut stack = NET_STACK.lock();
-            if let Some(ref mut s) = *stack {
+            let ev = if let Some(ref mut s) = *stack {
                 if sock_type == SOCK_STREAM as u8 {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
                     let mut ev = 0;
@@ -2047,12 +2125,13 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
                 }
             } else {
                 0
-            }
+            };
+            (ev, None)
         }
         SockState::InetListening { socket_handle } => {
             drop(tbls);
             let mut stack = NET_STACK.lock();
-            if let Some(ref mut s) = *stack {
+            let ev = if let Some(ref mut s) = *stack {
                 let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
                 if socket.is_active() && socket.state() == tcp::State::Established {
                     POLLIN
@@ -2061,12 +2140,13 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
                 }
             } else {
                 0
-            }
+            };
+            (ev, None)
         }
         SockState::IcmpBound { socket_handle } => {
             drop(tbls);
             let mut stack = NET_STACK.lock();
-            if let Some(ref mut s) = *stack {
+            let ev = if let Some(ref mut s) = *stack {
                 let socket = s.socket_set.get_mut::<icmp::Socket>(socket_handle);
                 let mut ev = 0;
                 if socket.can_recv() { ev |= POLLIN; }
@@ -2074,11 +2154,12 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
                 ev
             } else {
                 0
-            }
+            };
+            (ev, None)
         }
-        _ => { drop(tbls); 0 }
+        _ => { drop(tbls); (0, None) }
     };
-    val_reply(revents)
+    net_poll_reply(revents, seq)
 }
 
 fn handle_close_all(pid: u32) {
@@ -2110,8 +2191,14 @@ fn handle_close_all(pid: u32) {
         drop(tbls);
 
         let mut conns = UNIX_CONNS.lock();
+        let mut peer_hup = false;
         for ci in unix_to_close {
-            if ci < MAX_CONNS && conns[ci].in_use { conns[ci].drain_fds(); conns[ci].in_use = false; }
+            if ci < MAX_CONNS && conns[ci].in_use {
+                conns[ci].drain_fds();
+                conns[ci].in_use = false;
+                conns[ci].seq = conns[ci].seq.wrapping_add(1);
+                peer_hup = true;
+            }
         }
         drop(conns);
 
@@ -2129,6 +2216,9 @@ fn handle_close_all(pid: u32) {
         if let Some(tbl) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
             tbl.reset();
         }
+        drop(tbls);
+        // Peers of the torn-down connections see POLLHUP/EOF (K2).
+        if peer_hup { sched::wake_poll(); }
     }
 }
 

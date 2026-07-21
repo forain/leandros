@@ -152,6 +152,14 @@ pub const VFS_FREMOVEXATTR:    u64 = 0x48;
 /// is just existence). The owning filesystem answers via xattr::access_check
 /// so stored POSIX ACLs are honored; the kernel's faccessat routes here.
 pub const VFS_ACCESS:          u64 = 0x49;
+/// signalfd4(fd, mask, flags) → fd or -errno. fd == u64::MAX creates a new
+/// SignalFd vnode with `mask`; an existing signalfd fd updates its mask.
+pub const VFS_SIGNALFD_CREATE: u64 = 0x4A;
+/// inotify_init1(flags) → fd or -errno. Allocates an Inotify vnode (a valid fd
+/// that accepts watches but never delivers events — see the K2 design).
+pub const VFS_INOTIFY_CREATE:  u64 = 0x4B;
+/// inotify_add_watch(fd, path_ptr, mask) → watch descriptor (≥1) or -errno.
+pub const VFS_INOTIFY_ADD:     u64 = 0x4C;
 
 
 /// Readiness bitmask, numerically identical to Linux's POLLIN/POLLOUT/POLLERR/
@@ -569,6 +577,13 @@ pub enum VnodeKind {
     DynamicDevice { port: u32, dev_id: u32 },
     /// File or directory on a mounted filesystem (F2FS, etc.).
     MountedFile { port: u32, file_id: u32 },
+    /// signalfd: POLLIN iff a signal in `mask` is pending for the caller;
+    /// read yields one `signalfd_siginfo` per pending signal in the mask.
+    SignalFd { mask: u64 },
+    /// inotify: a valid fd that accepts watches (init/add_watch) but never
+    /// delivers events — keeps a config-watch source quiet in an event loop.
+    /// `next_wd` hands out monotonic watch descriptors (≥1).
+    Inotify { next_wd: u32 },
 }
 
 /// True if `fd` was opened with (or fcntl'd to) O_NONBLOCK. The kernel's
@@ -1354,6 +1369,9 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_FD_PATH      => handle_fd_path(caller_pid, arg(msg,0) as usize,
                                             arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_EVENTFD          => handle_eventfd(caller_pid, arg(msg,0) as u64),
+        VFS_SIGNALFD_CREATE  => handle_signalfd_create(caller_pid, arg(msg,0) as usize, arg(msg,1) as u64),
+        VFS_INOTIFY_CREATE   => handle_inotify_create(caller_pid),
+        VFS_INOTIFY_ADD      => handle_inotify_add(caller_pid, arg(msg,0) as usize),
         VFS_TIMERFD_CREATE   => handle_timerfd_create(caller_pid),
         VFS_TIMERFD_SETTIME  => handle_timerfd_settime(caller_pid, arg(msg,0) as usize,
                                                         arg(msg,1) as u64, arg(msg,2) as u64),
@@ -2612,6 +2630,9 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // write end. Advance the seq so an epoll writer blocked on a full
             // pipe is re-woken edge-triggered.
             if n > 0 { r.seq = r.seq.wrapping_add(1); }
+            drop(rings); // release PIPE_RINGS before waking pollers (K2 lock order)
+            // A writer parked on a full pipe now has POLLOUT space freed.
+            if n > 0 { sched::wake_poll(); }
             val_reply(n as u64)
         }
         VnodeKind::TmpFile { idx, pos, .. } => {
@@ -2674,6 +2695,37 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             proxy.data[16..24].copy_from_slice(&(count as u64).to_le_bytes());
             call_port(port, proxy)
         }
+        VnodeKind::SignalFd { mask } => {
+            let mask = *mask;
+            drop(tbls);
+            if count < 128 { return err_reply(-22); } // EINVAL — buffer too small
+            // Accept (dequeue) each pending signal in the mask, emitting a
+            // 128-byte signalfd_siginfo per signal. Only ssi_signo (offset 0)
+            // is populated — calloop reads only that; ssi_code/pid/uid stay 0.
+            // Reading consumes the pending bit (POSIX: the signal is accepted,
+            // not run through a handler), relying on the caller having blocked
+            // it in all threads.
+            let pending = (sched::pending_signals() | sched::shared_pending_signals()) & mask;
+            if pending == 0 { return err_reply(-11); } // EAGAIN
+            let mut written = 0usize;
+            let mut sig = 1u32;
+            while sig <= 64 && written + 128 <= count {
+                if pending & (1u64 << (sig - 1)) != 0 {
+                    unsafe {
+                        core::ptr::write_bytes(buf.add(written), 0, 128);
+                        core::ptr::write(buf.add(written) as *mut u32, sig); // ssi_signo
+                    }
+                    sched::clear_pending_signal(sig);
+                    written += 128;
+                }
+                sig += 1;
+            }
+            val_reply(written as u64)
+        }
+        VnodeKind::Inotify { .. } => {
+            drop(tbls);
+            err_reply(-11) // EAGAIN — a watch was accepted but never fires
+        }
         _ => err_reply(-9),
     }
 }
@@ -2701,12 +2753,18 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 n += 1;
             }
             if n > 0 { r.seq = r.seq.wrapping_add(1); } // new readable edge for the read end
+            let no_space = n == 0 && count > 0;
+            drop(rings); // release PIPE_RINGS before waking pollers (K2 lock order)
             // A full ring must report EAGAIN, never a zero-length write: Rust's
             // `write_all` maps Ok(0) to ErrorKind::WriteZero and gives up, so a
             // pipeline moving more than PIPE_RING_SIZE bytes failed outright
             // instead of applying backpressure. The kernel's sys_write blocks
             // and retries on EAGAIN for blocking fds (mirroring sys_read).
-            if n == 0 && count > 0 { return err_reply(-11); } // EAGAIN
+            if no_space { return err_reply(-11); } // EAGAIN
+            // A reader parked in poll/epoll_wait on the read end has a new
+            // POLLIN edge (K2 real blocking — the seq bump above alone no
+            // longer suffices once the reader actually sleeps).
+            if n > 0 { sched::wake_poll(); }
             val_reply(n as u64)
         }
         VnodeKind::TmpFile { idx, pos, writable } => {
@@ -2770,6 +2828,10 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             drop(counters);
             let mut seqs = EVENTFD_SEQ.lock();
             seqs[slot] = seqs[slot].wrapping_add(1);
+            drop(seqs);
+            // eventfd is mio/tokio's runtime waker: a POLLIN edge for whoever
+            // is parked in epoll_wait (K2 real blocking).
+            sched::wake_poll();
             val_reply(8)
         }
         VnodeKind::DevStdio { target_fd } => {
@@ -4024,6 +4086,56 @@ fn handle_eventfd(pid: u32, initval: u64) -> Message {
     val_reply(fd as u64)
 }
 
+/// signalfd4(existing_fd, mask, flags). `existing_fd == usize::MAX` (the kernel
+/// maps the -1 sentinel to this) allocates a new SignalFd vnode; otherwise the
+/// named signalfd's mask is replaced. State lives entirely in the vnode — no
+/// backing pool — so close needs no special teardown.
+fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64) -> Message {
+    let mut tbls = FD_TABLES.lock();
+    if existing_fd != usize::MAX {
+        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        if existing_fd >= MAX_FDS || !tbl.fds[existing_fd].in_use { return err_reply(-9); }
+        match tbl.fds[existing_fd].kind {
+            VnodeKind::SignalFd { .. } => {
+                tbl.fds[existing_fd].kind = VnodeKind::SignalFd { mask };
+                val_reply(existing_fd as u64)
+            }
+            _ => err_reply(-22), // EINVAL — fd is not a signalfd
+        }
+    } else {
+        let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-24) };
+        let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
+        tbl.fds[fd] = FdEntry { kind: VnodeKind::SignalFd { mask }, flags: 0, in_use: true };
+        val_reply(fd as u64)
+    }
+}
+
+/// inotify_init1(flags) → a valid Inotify fd that accepts watches but never
+/// delivers events.
+fn handle_inotify_create(pid: u32) -> Message {
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-24) };
+    let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
+    tbl.fds[fd] = FdEntry { kind: VnodeKind::Inotify { next_wd: 1 }, flags: 0, in_use: true };
+    val_reply(fd as u64)
+}
+
+/// inotify_add_watch(fd, path, mask) → a monotonic fake watch descriptor (≥1).
+/// The path/mask are accepted and discarded — the watch never fires.
+fn handle_inotify_add(pid: u32, fd: usize) -> Message {
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    match &mut tbl.fds[fd].kind {
+        VnodeKind::Inotify { next_wd } => {
+            let wd = *next_wd;
+            *next_wd = next_wd.checked_add(1).unwrap_or(1);
+            val_reply(wd as u64)
+        }
+        _ => err_reply(-22), // EINVAL — fd is not an inotify instance
+    }
+}
+
 fn handle_timerfd_create(pid: u32) -> Message {
     let mut pool = TIMERFD_POOL.lock();
     let slot = match pool.iter().position(|e| e.is_free()) {
@@ -4055,7 +4167,33 @@ fn handle_timerfd_settime(pid: u32, fd: usize, value_ns: u64, interval_ns: u64) 
     let e = &mut pool[slot];
     if value_ns == 0 { e.armed = false; e.expirations = 0; }
     else { e.armed = true; e.deadline_ticks = now + (value_ns / NS_PER_TICK).max(1); e.interval_ticks = interval_ns / NS_PER_TICK; e.expirations = 0; }
+    let armed_deadline = if e.armed { Some(e.deadline_ticks) } else { None };
+    drop(pool);
+    // Publish the expiry so the poll-deadline tick wakes an epoll_wait(-1)
+    // waiter parked on this timerfd (K2). If it is already due, wake now.
+    if let Some(d) = armed_deadline {
+        sched::register_poll_deadline(d);
+        if sched::ticks() >= d { sched::wake_poll(); }
+    }
     ok_reply()
+}
+
+/// Earliest absolute tick at which any armed timerfd next expires (u64::MAX =
+/// none). Folded into the K2 poll-deadline tick so a periodic timerfd nobody
+/// re-arms still fires, and an epoll_wait(-1) waiter on a timerfd wakes on
+/// time with no per-tick wake_poll. try_lock only (tick contract): a contended
+/// scan just defers this tick's decision ≤10 ms.
+pub fn earliest_timerfd_deadline() -> u64 {
+    match TIMERFD_POOL.try_lock() {
+        Some(pool) => {
+            let mut m = u64::MAX;
+            for e in pool.iter() {
+                if e.armed && e.deadline_ticks < m { m = e.deadline_ticks; }
+            }
+            m
+        }
+        None => u64::MAX,
+    }
 }
 
 fn handle_timerfd_gettime(pid: u32, fd: usize, out_ptr: usize) -> Message {
@@ -4215,6 +4353,18 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             // revents to 0 so no spurious fire results.
             let exp = timerfd_poll_expirations(s);
             (if exp > 0 { POLLIN } else { 0 }, exp)
+        }
+        VnodeKind::SignalFd { mask } => {
+            let mask = *mask;
+            drop(tbls);
+            // POLLIN once a signal in the mask is pending for the caller. seq 0
+            // (level); calloop's Signals source registers this level-triggered.
+            let pending = (sched::pending_signals() | sched::shared_pending_signals()) & mask;
+            (if pending != 0 { POLLIN } else { 0 }, 0)
+        }
+        VnodeKind::Inotify { .. } => {
+            drop(tbls);
+            (0, 0) // never fires — accepted watches silently produce no events
         }
         VnodeKind::DevStdio { .. } | VnodeKind::DynamicDevice { .. } | VnodeKind::None => {
             drop(tbls);
@@ -5641,8 +5791,9 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
             else if e.is_fifo { (S_IFIFO | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
             else              { (S_IFREG | (e.mode & 0o7777), e.len as u64, 0x2000_0000 + idx as u64) }
         }
-        // eventfd/timerfd are anon-inode files on Linux and report S_IFREG.
-        VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. } => (S_IFREG | 0o600, 0, 0),
+        // eventfd/timerfd/signalfd/inotify are anon-inode files and report S_IFREG.
+        VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. }
+        | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. } => (S_IFREG | 0o600, 0, 0),
         // Handled by the early return above (proxied to the owning mount);
         // this arm exists only for match exhaustiveness.
         VnodeKind::MountedFile { .. } => return err_reply(-9),

@@ -294,6 +294,10 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     let mut devs = DEVICES.lock();
     devs[dev_id as usize].push(ev);
     drop(devs);
+    // A key event is a POLLIN edge for a console reader / evdev poller parked on
+    // the poll wait-channel. try_wake (non-blocking) honors IRQ context; the
+    // 100 Hz console-read tick is the backstop if RUN_QUEUE is momentarily busy.
+    sched::try_wake_poll();
     unsafe { arch_interrupt_restore(f); }
 }
 
