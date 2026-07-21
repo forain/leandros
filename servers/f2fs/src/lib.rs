@@ -602,6 +602,30 @@ fn free_block(ms: &mut MountState, phys: u32) {
     }
 }
 
+/// Sum the valid-block counts across every main-area segment, reading each SIT
+/// block *through the cache* so counts dirtied by an alloc or a reclaim that
+/// has not been checkpointed yet are still seen. `statfs` reports free space as
+/// `user_blocks - this`, so it is current the instant a block is used or freed.
+///
+/// This replaces `cp.free_seg_cnt` — a whole-segment counter parsed once at
+/// mount and never adjusted by the allocator or by reclaim — which is why df
+/// stayed frozen at the mkfs value across create/delete/reclaim churn. The
+/// vblocks field, by contrast, is maintained on every `sit_mark_block_used` /
+/// `sit_mark_block_free`, so a live sum of it tracks reality.
+fn sit_count_valid_blocks(ms: &mut MountState) -> u64 {
+    let total = ms.sb.seg_cnt_main;
+    let mut valid = 0u64;
+    for seg in 0..total {
+        let sit_blk_idx = seg / SIT_PER_BLK as u32;
+        let sit_entry   = (seg % SIT_PER_BLK as u32) as usize;
+        let sit_blkno   = ms.sb.sit_blkaddr + sit_blk_idx;
+        let sit_blk = ms.cache.read(ms.dev, sit_blkno as u64);
+        let entry_off = sit_entry * SIT_ENTRY_SIZE;
+        valid += (r16(sit_blk, entry_off) & SIT_VBLOCKS_MASK) as u64;
+    }
+    valid
+}
+
 // ── Log-structured block allocator ───────────────────────────────────────────
 
 fn alloc_data_block(ms: &mut MountState) -> Option<u32> {
@@ -912,21 +936,173 @@ fn free_inode_data_and_nodes(ms: &mut MountState, ino: u32) {
 }
 
 /// Free every block of `ino` and reset all of its block pointers to zero,
-/// leaving a valid empty file. Used for truncate-to-zero (and O_TRUNC).
-///
-/// Reuses the same dnode-tree walk as `free_inode_data_and_nodes` — which the
-/// unlink path proves accounts correctly — rather than the per-logical-index
-/// `inode_logical_to_phys` walk, which returns scattered addresses once it
-/// passes the inline-direct region and mis-frees far more than it should.
+/// leaving a valid empty file. Used for truncate-to-zero (and O_TRUNC); it is
+/// just the whole-file case of `truncate_to`.
 fn truncate_to_zero(ms: &mut MountState, ino: u32) {
-    free_inode_data_and_nodes(ms, ino);
+    truncate_to(ms, ino, 0);
+}
+
+/// Shrink `ino` to `new_len` bytes: free every data block wholly past the new
+/// end, free any node block that empties out, zero the sub-block tail so a
+/// later extension reads zeros there, and write the new `i_size`.
+///
+/// Structural walk (mirrors `free_inode_data_and_nodes`), *not* the
+/// per-logical-index `inode_logical_to_phys` walk — that one returned scattered
+/// addresses past the inline-direct region and mis-freed live blocks. Each
+/// level copies its node block to the stack before touching `free_block`, which
+/// takes the SIT block through the 4-slot cache and can evict the node being
+/// walked; the freed data slots (logical index `>= keep`) are cleared in the
+/// stack copy, and a node with nothing live left is itself freed and unlinked
+/// from its parent. NAT entries for freed nids are deliberately left stale: nid
+/// reuse is unsafe without a free list, exactly as in the unlink path.
+fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
     let iblkaddr = nat_lookup(ms, ino);
     if iblkaddr == 0 { return; }
-    let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
-    let max_direct = inode_max_direct(iblk);
-    for i in 0..max_direct { inode_set_blkaddr(iblk, i, 0); }
-    for n in 0..5 { inode_set_nid(iblk, n, 0); }
+
+    // Number of leading data blocks to keep. `keep == 0` frees everything —
+    // the truncate-to-zero case.
+    let keep = (new_len + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+
+    // Zero from the new EOF to the end of its (kept) block, so a later
+    // extension reads zeros rather than the stale bytes left in that block.
+    let tail_off = (new_len % BLOCK_SIZE as u64) as usize;
+    if tail_off != 0 {
+        let phys = inode_logical_to_phys(ms, ino, new_len / BLOCK_SIZE as u64);
+        if phys != 0 {
+            let dblk = ms.cache.get_mut(ms.dev, phys as u64);
+            for b in &mut dblk[tail_off..] { *b = 0; }
+        }
+    }
+
+    const ADDRS: u64 = (NODE_FOOTER_OFF / 4) as u64; // 1019
+    const NIDS:  u64 = (NODE_FOOTER_OFF / 4) as u64; // 1019
+
+    let mut iblk = read_block_copy(ms, iblkaddr);
+
+    // Inline direct addresses: logical index == slot.
+    let max_direct = inode_max_direct(&iblk);
+    for i in 0..max_direct {
+        if i as u64 >= keep {
+            free_block(ms, inode_get_blkaddr(&iblk, i));
+            inode_set_blkaddr(&mut iblk, i, 0);
+        }
+    }
+    let mut base = max_direct as u64;
+
+    // i_nid[0], i_nid[1]: direct nodes.
+    for slot in 0..=1usize {
+        let nid = inode_get_nid(&iblk, slot);
+        if truncate_dnode(ms, nid, base, keep) { inode_set_nid(&mut iblk, slot, 0); }
+        base += ADDRS;
+    }
+
+    // i_nid[2], i_nid[3]: single-indirect.
+    let per_ind = NIDS * ADDRS;
+    for slot in 2..=3usize {
+        let nid = inode_get_nid(&iblk, slot);
+        if truncate_indirect(ms, nid, base, keep) { inode_set_nid(&mut iblk, slot, 0); }
+        base += per_ind;
+    }
+
+    // i_nid[4]: double-indirect.
+    let dind_nid = inode_get_nid(&iblk, 4);
+    if truncate_dindirect(ms, dind_nid, base, keep) { inode_set_nid(&mut iblk, 4, 0); }
+
+    w64(&mut iblk, INO_SIZE, new_len);
+    ms.cache.write(ms.dev, iblkaddr as u64, &iblk);
     nat_update(ms, ino, iblkaddr);
+}
+
+/// Free the data blocks of direct node `nid` whose logical index is `>= keep`
+/// (its slots cover indices `[base, base + 1019)`). Returns `true` when the
+/// node block itself was freed because nothing live remained, so the caller
+/// must clear its pointer.
+fn truncate_dnode(ms: &mut MountState, nid: u32, base: u64, keep: u64) -> bool {
+    const ADDRS_PER_DNODE: usize = NODE_FOOTER_OFF / 4; // 1019
+    if nid == 0 { return false; }
+    // Wholly within the kept region: nothing to do, and skipping avoids reading
+    // (and re-dirtying) every node block of a large file on a small shrink.
+    if base + ADDRS_PER_DNODE as u64 <= keep { return false; }
+    let dblkaddr = nat_lookup(ms, nid);
+    if dblkaddr == 0 { return false; }
+    let mut dblk = read_block_copy(ms, dblkaddr);
+    let mut any_kept = false;
+    for i in 0..ADDRS_PER_DNODE {
+        if base + i as u64 >= keep {
+            free_block(ms, dnode_get_blkaddr(&dblk, i));
+            dnode_set_blkaddr(&mut dblk, i, 0);
+        } else if dnode_get_blkaddr(&dblk, i) != 0 {
+            any_kept = true;
+        }
+    }
+    if any_kept {
+        ms.cache.write(ms.dev, dblkaddr as u64, &dblk);
+        false
+    } else {
+        free_block(ms, dblkaddr);
+        true
+    }
+}
+
+/// One level up from `truncate_dnode`: an indirect node holding up to 1019
+/// direct-node nids, each covering 1019 logical indices.
+fn truncate_indirect(ms: &mut MountState, nid: u32, base: u64, keep: u64) -> bool {
+    const NIDS_PER_BLOCK: usize = NODE_FOOTER_OFF / 4; // 1019
+    const ADDRS: u64 = (NODE_FOOTER_OFF / 4) as u64;
+    if nid == 0 { return false; }
+    if base + NIDS_PER_BLOCK as u64 * ADDRS <= keep { return false; }
+    let ind_blkaddr = nat_lookup(ms, nid);
+    if ind_blkaddr == 0 { return false; }
+    let mut ind_blk = read_block_copy(ms, ind_blkaddr);
+    let mut any_kept = false;
+    for i in 0..NIDS_PER_BLOCK {
+        let child_nid = dnode_get_blkaddr(&ind_blk, i);
+        if child_nid == 0 { continue; }
+        let child_base = base + i as u64 * ADDRS;
+        if truncate_dnode(ms, child_nid, child_base, keep) {
+            dnode_set_blkaddr(&mut ind_blk, i, 0);
+        } else {
+            any_kept = true;
+        }
+    }
+    if any_kept {
+        ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
+        false
+    } else {
+        free_block(ms, ind_blkaddr);
+        true
+    }
+}
+
+/// One more level up: a double-indirect node holding up to 1019 indirect-node
+/// nids.
+fn truncate_dindirect(ms: &mut MountState, nid: u32, base: u64, keep: u64) -> bool {
+    const NIDS_PER_BLOCK: usize = NODE_FOOTER_OFF / 4; // 1019
+    const ADDRS: u64 = (NODE_FOOTER_OFF / 4) as u64;
+    let per_ind = NIDS_PER_BLOCK as u64 * ADDRS;
+    if nid == 0 { return false; }
+    if base + NIDS_PER_BLOCK as u64 * per_ind <= keep { return false; }
+    let dind_blkaddr = nat_lookup(ms, nid);
+    if dind_blkaddr == 0 { return false; }
+    let mut dind_blk = read_block_copy(ms, dind_blkaddr);
+    let mut any_kept = false;
+    for i in 0..NIDS_PER_BLOCK {
+        let child_nid = dnode_get_blkaddr(&dind_blk, i);
+        if child_nid == 0 { continue; }
+        let child_base = base + i as u64 * per_ind;
+        if truncate_indirect(ms, child_nid, child_base, keep) {
+            dnode_set_blkaddr(&mut dind_blk, i, 0);
+        } else {
+            any_kept = true;
+        }
+    }
+    if any_kept {
+        ms.cache.write(ms.dev, dind_blkaddr as u64, &dind_blk);
+        false
+    } else {
+        free_block(ms, dind_blkaddr);
+        true
+    }
 }
 
 /// Read `count` bytes from file `ino` at `pos` into `buf`.
@@ -2393,23 +2569,19 @@ fn handle_ftruncate(ms: &mut MountState, file_id: u64, length: u64) -> Message {
     let iblkaddr = nat_lookup(ms, ino);
     let old_size = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_size(iblk) };
 
-    // Shrinking: release the blocks past the new end so the space actually
-    // comes back. Growing or same-size: nothing to free (the tail reads as a
-    // hole until written). Truncate used to write only i_size, so `truncate -s
-    // 0 big` freed nothing and df never moved.
-    // Truncate to zero reclaims everything. A non-zero shrink is deliberately
-    // left to only update the size for now: the per-index free walk needed to
-    // release just the tail returned scattered addresses past the inline-direct
-    // region and mis-freed live blocks, so it is safer to leak the tail than to
-    // corrupt the volume. The common cases — `> file`, `truncate -s 0`, and
-    // unlink — all go through the zero path and reclaim correctly.
-    if length == 0 && old_size > 0 {
-        truncate_to_zero(ms, ino);
+    // Shrinking: release the blocks past the new end (and zero the sub-block
+    // tail) so the space comes back. `truncate_to` handles the whole file at
+    // length 0 and just the tail for a non-zero shrink; both walk the node tree
+    // structurally and set the new i_size. Growing or same-size: nothing to
+    // free — the tail beyond the old end reads as a hole until written — so
+    // only i_size changes.
+    if length < old_size {
+        truncate_to(ms, ino, length);
+    } else {
+        let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
+        w64(iblk, INO_SIZE, length);
+        nat_update(ms, ino, iblkaddr);
     }
-
-    let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
-    w64(iblk, INO_SIZE, length);
-    nat_update(ms, ino, iblkaddr);
     maybe_flush(ms);
     ok_reply()
 }
@@ -2425,12 +2597,13 @@ fn handle_ftruncate(ms: &mut MountState, file_id: u64, length: u64) -> Message {
 ///
 /// * `f_blocks` = `block_count - segment0_blkaddr`, byte-for-byte what Linux's
 ///   `f2fs_statfs` reports. Exact.
-/// * `f_bfree`/`f_bavail` = `free_segment_count * blocks_per_seg`, clamped to
-///   the main-area size. This is an *under*-estimate: the checkpoint counts
-///   wholly-free segments, so free blocks inside partially-used segments are
-///   not credited. Linux instead tracks `valid_user_blocks` live, which this
-///   server does not maintain. Erring low is the right direction — it never
-///   claims space that isn't there — and it is never zero on a fresh image.
+/// * `f_bfree`/`f_bavail` = `user_blocks - valid_blocks`, where `valid_blocks`
+///   is a live sum of the per-segment SIT vblocks counts read through the block
+///   cache (`sit_count_valid_blocks`). This is Linux's `valid_user_blocks`
+///   model and is block-granular, so it moves the instant a block is allocated
+///   or reclaimed — including for a free still sitting dirty in the SIT cache.
+///   It replaced `free_segment_count * blocks_per_seg`, a mount-time-static
+///   value that never reflected create/delete churn.
 /// * `f_files` = total NAT entries, i.e. the inode capacity. Exact.
 /// * `f_ffree` is capped at `f_bavail` because a new inode also costs a node
 ///   block; Linux applies the same cap on top of a live valid-node count we
@@ -2445,7 +2618,8 @@ fn handle_statfs(ms: &mut MountState, buf_ptr: u64) -> Message {
     // `df` silently drops any filesystem with f_blocks == 0.
     let total_blocks = if total_blocks == 0 { user_blocks.max(1) } else { total_blocks };
 
-    let free_blocks = (ms.cp.free_seg_cnt as u64 * bps).min(user_blocks);
+    let valid_blocks = sit_count_valid_blocks(ms);
+    let free_blocks  = user_blocks.saturating_sub(valid_blocks);
 
     // Linux: total_node_count = (segment_count_nat / 2) * blocks_per_seg * NAT_ENTRY_PER_BLOCK.
     // Half the NAT area is the shadow copy and holds no live entries.
