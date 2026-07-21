@@ -1,6 +1,8 @@
 //! vfstest — regression coverage for TODO.md item #4 (VFS server): rmdir,
 //! cross-mount-capable rename, advisory locking (flock + fcntl byte-range),
-//! and real file permissions/ownership (including setuid privilege drop).
+//! real file permissions/ownership (including setuid privilege drop), and
+//! extended attributes / POSIX ACLs (setxattr/getxattr/listxattr/removexattr
+//! and their l*/f* variants, plus ACL-driven access enforcement).
 //!
 //! Each check prints "<name>: PASS" or "<name>: FAIL" to stdout (serial
 //! console); `main` returns the number of failures as the exit code.
@@ -14,7 +16,7 @@
 
 extern crate leandros_libc;
 use leandros_libc::*;
-use leandros_libc::syscall::{syscall1, syscall3};
+use leandros_libc::syscall::{syscall1, syscall2, syscall3, syscall4, syscall5};
 
 // chroot(2) and symlink(2) are not (yet) wrapped by leandros-libc, so this
 // test makes the raw syscalls directly, matching the style of
@@ -43,6 +45,510 @@ unsafe fn raw_symlink(target: *const u8, linkpath: *const u8) -> i32 {
     if r < 0 { set_errno(-r as i32); -1 } else { 0 }
 }
 
+// ── xattr(2) family + POSIX ACLs (TODO.md item: extended attributes) ───────
+//
+// setxattr/getxattr/listxattr/removexattr and their l*/f* variants are not
+// (yet) wrapped by leandros-libc, so — following the raw_chroot/raw_symlink
+// pattern above — this test makes the raw syscalls directly. Numbers match
+// the kernel's own `nr::SETXATTR`..`nr::FREMOVEXATTR` dispatch table in
+// `kernel/src/syscall.rs` (AArch64 5-16, x86-64 188-199, both in the same
+// setxattr/lsetxattr/fsetxattr/getxattr/lgetxattr/fgetxattr/listxattr/
+// llistxattr/flistxattr/removexattr/lremovexattr/fremovexattr order Linux
+// uses). `struct stat`/`faccessat` are needed too, to check ACL-driven group
+// mode bits and ACL-enforced access denial; also not yet wrapped.
+#[cfg(target_arch = "aarch64")] const SYS_SETXATTR:     usize = 5;
+#[cfg(target_arch = "aarch64")] const SYS_LSETXATTR:    usize = 6;
+#[cfg(target_arch = "aarch64")] const SYS_FSETXATTR:    usize = 7;
+#[cfg(target_arch = "aarch64")] const SYS_GETXATTR:     usize = 8;
+#[cfg(target_arch = "aarch64")] const SYS_LGETXATTR:    usize = 9;
+#[cfg(target_arch = "aarch64")] const SYS_FGETXATTR:    usize = 10;
+#[cfg(target_arch = "aarch64")] const SYS_LISTXATTR:    usize = 11;
+#[cfg(target_arch = "aarch64")] const SYS_LLISTXATTR:   usize = 12;
+#[cfg(target_arch = "aarch64")] const SYS_FLISTXATTR:   usize = 13;
+#[cfg(target_arch = "aarch64")] const SYS_REMOVEXATTR:  usize = 14;
+#[cfg(target_arch = "aarch64")] const SYS_LREMOVEXATTR: usize = 15;
+#[cfg(target_arch = "aarch64")] const SYS_FREMOVEXATTR: usize = 16;
+
+#[cfg(target_arch = "x86_64")] const SYS_SETXATTR:     usize = 188;
+#[cfg(target_arch = "x86_64")] const SYS_LSETXATTR:    usize = 189;
+#[cfg(target_arch = "x86_64")] const SYS_FSETXATTR:    usize = 190;
+#[cfg(target_arch = "x86_64")] const SYS_GETXATTR:     usize = 191;
+#[cfg(target_arch = "x86_64")] const SYS_LGETXATTR:    usize = 192;
+#[cfg(target_arch = "x86_64")] const SYS_FGETXATTR:    usize = 193;
+#[cfg(target_arch = "x86_64")] const SYS_LISTXATTR:    usize = 194;
+#[cfg(target_arch = "x86_64")] const SYS_LLISTXATTR:   usize = 195;
+#[cfg(target_arch = "x86_64")] const SYS_FLISTXATTR:   usize = 196;
+#[cfg(target_arch = "x86_64")] const SYS_REMOVEXATTR:  usize = 197;
+#[cfg(target_arch = "x86_64")] const SYS_LREMOVEXATTR: usize = 198;
+#[cfg(target_arch = "x86_64")] const SYS_FREMOVEXATTR: usize = 199;
+
+#[cfg(target_arch = "aarch64")] const SYS_NEWFSTATAT: usize = 79;
+#[cfg(target_arch = "x86_64")]  const SYS_NEWFSTATAT: usize = 262;
+#[cfg(target_arch = "aarch64")] const SYS_FACCESSAT:  usize = 48;
+#[cfg(target_arch = "x86_64")]  const SYS_FACCESSAT:  usize = 269;
+
+// `struct stat` layout (see servers/vfs/src/lib.rs's own comment above its
+// `STAT_SIZE`/`st_mode`-offset constants, which this mirrors): the 128-byte
+// asm-generic layout on AArch64, x86-64's native 144-byte layout elsewhere.
+#[cfg(target_arch = "aarch64")] const STAT_SIZE: usize = 128;
+#[cfg(target_arch = "x86_64")]  const STAT_SIZE: usize = 144;
+#[cfg(target_arch = "aarch64")] const STAT_MODE_OFF: usize = 16;
+#[cfg(target_arch = "x86_64")]  const STAT_MODE_OFF: usize = 24;
+
+const XATTR_CREATE:  i32 = 1;
+const XATTR_REPLACE: i32 = 2;
+
+// errno values not yet in leandros-libc's errno module (kept local, same as
+// the errno consts already re-exported from there follow POSIX numbering).
+const ENODATA:    i32 = 61;
+const EOPNOTSUPP: i32 = 95;
+const ERANGE:     i32 = 34;
+
+const R_OK: i32 = 4;
+
+fn xret(r: isize) -> isize {
+    if r < 0 { set_errno(-r as i32); -1 } else { r }
+}
+
+unsafe fn raw_setxattr(path: *const u8, name: *const u8, value: *const u8, size: usize, flags: i32) -> isize {
+    xret(syscall5(SYS_SETXATTR, path as usize, name as usize, value as usize, size, flags as usize))
+}
+unsafe fn raw_lsetxattr(path: *const u8, name: *const u8, value: *const u8, size: usize, flags: i32) -> isize {
+    xret(syscall5(SYS_LSETXATTR, path as usize, name as usize, value as usize, size, flags as usize))
+}
+unsafe fn raw_fsetxattr(fd: i32, name: *const u8, value: *const u8, size: usize, flags: i32) -> isize {
+    xret(syscall5(SYS_FSETXATTR, fd as usize, name as usize, value as usize, size, flags as usize))
+}
+unsafe fn raw_getxattr(path: *const u8, name: *const u8, buf: *mut u8, size: usize) -> isize {
+    xret(syscall4(SYS_GETXATTR, path as usize, name as usize, buf as usize, size))
+}
+unsafe fn raw_lgetxattr(path: *const u8, name: *const u8, buf: *mut u8, size: usize) -> isize {
+    xret(syscall4(SYS_LGETXATTR, path as usize, name as usize, buf as usize, size))
+}
+unsafe fn raw_fgetxattr(fd: i32, name: *const u8, buf: *mut u8, size: usize) -> isize {
+    xret(syscall4(SYS_FGETXATTR, fd as usize, name as usize, buf as usize, size))
+}
+unsafe fn raw_listxattr(path: *const u8, buf: *mut u8, size: usize) -> isize {
+    xret(syscall3(SYS_LISTXATTR, path as usize, buf as usize, size))
+}
+unsafe fn raw_llistxattr(path: *const u8, buf: *mut u8, size: usize) -> isize {
+    xret(syscall3(SYS_LLISTXATTR, path as usize, buf as usize, size))
+}
+unsafe fn raw_flistxattr(fd: i32, buf: *mut u8, size: usize) -> isize {
+    xret(syscall3(SYS_FLISTXATTR, fd as usize, buf as usize, size))
+}
+unsafe fn raw_removexattr(path: *const u8, name: *const u8) -> isize {
+    xret(syscall2(SYS_REMOVEXATTR, path as usize, name as usize))
+}
+unsafe fn raw_lremovexattr(path: *const u8, name: *const u8) -> isize {
+    xret(syscall2(SYS_LREMOVEXATTR, path as usize, name as usize))
+}
+unsafe fn raw_fremovexattr(fd: i32, name: *const u8) -> isize {
+    xret(syscall2(SYS_FREMOVEXATTR, fd as usize, name as usize))
+}
+
+/// Fetch `st_mode` (type + permission bits) for `path`, following symlinks.
+unsafe fn raw_mode(path: *const u8) -> i32 {
+    let mut buf = [0u8; STAT_SIZE];
+    let r = syscall4(SYS_NEWFSTATAT, AT_FDCWD as usize, path as usize, buf.as_mut_ptr() as usize, 0);
+    if r < 0 { set_errno(-r as i32); return -1; }
+    let p = buf.as_ptr().add(STAT_MODE_OFF) as *const u32;
+    core::ptr::read_unaligned(p) as i32
+}
+
+/// `faccessat(AT_FDCWD, path, mode, 0)` — used to probe ACL-enforced access.
+unsafe fn raw_faccessat(path: *const u8, mode: i32) -> i32 {
+    let r = syscall4(SYS_FACCESSAT, AT_FDCWD as usize, path as usize, mode as usize, 0);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Build a NUL-terminated path by concatenating `root` and `suffix` (neither
+/// includes its own terminator) into `buf`.
+fn mkpath<'a>(buf: &'a mut [u8; 96], root: &[u8], suffix: &[u8]) -> *const u8 {
+    let mut i = 0;
+    for &b in root { buf[i] = b; i += 1; }
+    for &b in suffix { buf[i] = b; i += 1; }
+    buf[i] = 0;
+    buf.as_ptr()
+}
+
+/// Whether NUL-separated `buf[..len]` (as returned by listxattr) contains
+/// `name` as one of its entries — order-insensitive.
+fn contains_name(buf: &[u8], len: usize, name: &[u8]) -> bool {
+    let data = &buf[..len];
+    let mut start = 0;
+    for i in 0..data.len() {
+        if data[i] == 0 {
+            if &data[start..i] == name { return true; }
+            start = i + 1;
+        }
+    }
+    false
+}
+
+// POSIX ACL wire format (little-endian): u32 version, then 8-byte entries
+// {u16 e_tag, u16 e_perm, u32 e_id}; e_id is ACL_UNDEFINED_ID for tags that
+// aren't qualified by a uid/gid.
+const ACL_USER_OBJ:  u16 = 1;
+const ACL_USER:      u16 = 2;
+const ACL_GROUP_OBJ: u16 = 4;
+#[allow(dead_code)]
+const ACL_GROUP:     u16 = 8;
+const ACL_MASK:      u16 = 0x10;
+const ACL_OTHER:     u16 = 0x20;
+const ACL_UNDEFINED_ID: u32 = 0xFFFFFFFF;
+
+/// Encode `entries` (already in canonical order: USER_OBJ, USER*, GROUP_OBJ,
+/// GROUP*, MASK, OTHER) into the wire format above. Returns the byte length.
+fn build_acl(buf: &mut [u8], version: u32, entries: &[(u16, u16, u32)]) -> usize {
+    buf[0..4].copy_from_slice(&version.to_le_bytes());
+    let mut off = 4;
+    for &(tag, perm, id) in entries {
+        buf[off..off + 2].copy_from_slice(&tag.to_le_bytes());
+        buf[off + 2..off + 4].copy_from_slice(&perm.to_le_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&id.to_le_bytes());
+        off += 8;
+    }
+    off
+}
+
+/// The non-trivial ACL shared by tests 8/9: root (USER_OBJ) gets rwx, uid
+/// 1000 (a named USER entry) is explicitly denied all access, GROUP_OBJ/
+/// OTHER get rx, capped (and mirrored into the group mode bits) by an rx
+/// MASK.
+fn build_enforcing_acl(buf: &mut [u8]) -> usize {
+    build_acl(buf, 2, &[
+        (ACL_USER_OBJ,  0o7, ACL_UNDEFINED_ID),
+        (ACL_USER,      0o0, 1000),
+        (ACL_GROUP_OBJ, 0o5, ACL_UNDEFINED_ID),
+        (ACL_MASK,      0o5, ACL_UNDEFINED_ID),
+        (ACL_OTHER,     0o5, ACL_UNDEFINED_ID),
+    ])
+}
+
+/// (1) Basic user.* set/get round-trip on a plain file: exact-size read, a
+/// zero-size length query, and a too-small buffer reporting ERANGE.
+unsafe fn test_xattr_basic(root: &[u8], name: &[u8]) -> bool {
+    let mut pb = [0u8; 96];
+    let path = mkpath(&mut pb, root, b"_basic");
+
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    close(fd);
+
+    if raw_setxattr(path, b"user.test\0".as_ptr(), b"hello".as_ptr(), 5, 0) != 0 {
+        return report(name, false);
+    }
+
+    let mut buf = [0u8; 32];
+    let n = raw_getxattr(path, b"user.test\0".as_ptr(), buf.as_mut_ptr(), buf.len());
+    if n != 5 || &buf[..5] != b"hello" { return report(name, false); }
+
+    let n0 = raw_getxattr(path, b"user.test\0".as_ptr(), core::ptr::null_mut(), 0);
+    if n0 != 5 { return report(name, false); }
+
+    let mut small = [0u8; 2];
+    let ns = raw_getxattr(path, b"user.test\0".as_ptr(), small.as_mut_ptr(), 2);
+    report(name, ns == -1 && get_errno() == ERANGE)
+}
+
+/// (2) Getting a never-set attribute fails ENODATA; setting an attribute in
+/// an unrecognised namespace fails EOPNOTSUPP.
+unsafe fn test_xattr_missing_and_unsupported(root: &[u8], name: &[u8]) -> bool {
+    let mut pb = [0u8; 96];
+    let path = mkpath(&mut pb, root, b"_missing");
+
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    close(fd);
+
+    let mut buf = [0u8; 16];
+    let g = raw_getxattr(path, b"user.missing\0".as_ptr(), buf.as_mut_ptr(), buf.len());
+    if g != -1 || get_errno() != ENODATA { return report(name, false); }
+
+    let s = raw_setxattr(path, b"foo.bar\0".as_ptr(), b"x".as_ptr(), 1, 0);
+    report(name, s == -1 && get_errno() == EOPNOTSUPP)
+}
+
+/// (3) listxattr enumerates every set name (order-insensitive), a size==0
+/// query reports the same total length as a real read, and a freshly
+/// created file lists 0.
+unsafe fn test_xattr_list(root: &[u8], name: &[u8]) -> bool {
+    let mut pb = [0u8; 96];
+    let path = mkpath(&mut pb, root, b"_list");
+
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    close(fd);
+
+    let empty = raw_listxattr(path, core::ptr::null_mut(), 0);
+    if empty != 0 { return report(name, false); }
+
+    if raw_setxattr(path, b"user.a\0".as_ptr(), b"1".as_ptr(), 1, 0) != 0 { return report(name, false); }
+    if raw_setxattr(path, b"user.b\0".as_ptr(), b"22".as_ptr(), 2, 0) != 0 { return report(name, false); }
+
+    let want_len = "user.a\0".len() + "user.b\0".len();
+    let len0 = raw_listxattr(path, core::ptr::null_mut(), 0);
+    if len0 < 0 || len0 as usize != want_len { return report(name, false); }
+
+    let mut buf = [0u8; 64];
+    let len = raw_listxattr(path, buf.as_mut_ptr(), buf.len());
+    if len < 0 || len as usize != want_len { return report(name, false); }
+
+    report(name,
+        contains_name(&buf, len as usize, b"user.a")
+        && contains_name(&buf, len as usize, b"user.b"))
+}
+
+/// (4) XATTR_CREATE refuses an already-existing attribute (EEXIST);
+/// XATTR_REPLACE refuses a missing one (ENODATA).
+unsafe fn test_xattr_create_replace(root: &[u8], name: &[u8]) -> bool {
+    let mut pb = [0u8; 96];
+    let path = mkpath(&mut pb, root, b"_cr");
+
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    close(fd);
+
+    if raw_setxattr(path, b"user.x\0".as_ptr(), b"1".as_ptr(), 1, 0) != 0 { return report(name, false); }
+
+    let create_existing = raw_setxattr(path, b"user.x\0".as_ptr(), b"2".as_ptr(), 1, XATTR_CREATE);
+    if create_existing != -1 || get_errno() != EEXIST { return report(name, false); }
+
+    let replace_missing = raw_setxattr(path, b"user.y\0".as_ptr(), b"1".as_ptr(), 1, XATTR_REPLACE);
+    report(name, replace_missing == -1 && get_errno() == ENODATA)
+}
+
+/// (5) removexattr deletes an attribute: a subsequent get reports ENODATA,
+/// listxattr no longer includes it, and removing it again also fails
+/// ENODATA.
+unsafe fn test_xattr_remove(root: &[u8], name: &[u8]) -> bool {
+    let mut pb = [0u8; 96];
+    let path = mkpath(&mut pb, root, b"_rm");
+
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    close(fd);
+
+    if raw_setxattr(path, b"user.z\0".as_ptr(), b"v\0".as_ptr(), 1, 0) != 0 { return report(name, false); }
+    if raw_removexattr(path, b"user.z\0".as_ptr()) != 0 { return report(name, false); }
+
+    let mut buf = [0u8; 16];
+    if raw_getxattr(path, b"user.z\0".as_ptr(), buf.as_mut_ptr(), buf.len()) != -1
+        || get_errno() != ENODATA { return report(name, false); }
+
+    let mut lbuf = [0u8; 32];
+    let llen = raw_listxattr(path, lbuf.as_mut_ptr(), lbuf.len());
+    if llen < 0 || contains_name(&lbuf, llen as usize, b"user.z") { return report(name, false); }
+
+    report(name, raw_removexattr(path, b"user.z\0".as_ptr()) == -1 && get_errno() == ENODATA)
+}
+
+/// (6) user.* is forbidden on the symlink object itself (lsetxattr → EPERM,
+/// lremovexattr also fails), but plain setxattr through the same path
+/// follows the link and mutates the *target*'s attributes, leaving the link
+/// object itself with none of its own.
+/// `relative_link` picks the symlink-target form each backend can resolve
+/// today: tmpfs follows absolute targets but misresolves relative ones,
+/// f2fs follows relative targets but can't re-anchor absolute ones outside
+/// the volume (both are pre-existing open()-path gaps, not xattr behavior —
+/// see the open-issues notes).
+unsafe fn test_xattr_symlink(root: &[u8], name: &[u8], relative_link: bool) -> bool {
+    let mut tb = [0u8; 96];
+    let target = mkpath(&mut tb, root, b"_symtarget");
+    let mut lb = [0u8; 96];
+    let link = mkpath(&mut lb, root, b"_symlink");
+
+    let fd = open(target, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    close(fd);
+
+    let link_target: *const u8 =
+        if relative_link { b"xa_symtarget\0".as_ptr() } else { target };
+    if raw_symlink(link_target, link) != 0 { return report(name, false); }
+
+    if raw_lsetxattr(link, b"user.a\0".as_ptr(), b"x".as_ptr(), 1, 0) != -1 || get_errno() != EPERM {
+        return report(name, false);
+    }
+    if raw_lremovexattr(link, b"user.a\0".as_ptr()) != -1 { return report(name, false); }
+
+    if raw_setxattr(link, b"user.a\0".as_ptr(), b"ok\0".as_ptr(), 2, 0) != 0 {
+        return report(name, false);
+    }
+
+    let mut buf = [0u8; 8];
+    let n = raw_getxattr(target, b"user.a\0".as_ptr(), buf.as_mut_ptr(), buf.len());
+    if n != 2 || &buf[..2] != b"ok" { return report(name, false); }
+
+    let lg = raw_lgetxattr(link, b"user.a\0".as_ptr(), buf.as_mut_ptr(), buf.len());
+    if lg != -1 || get_errno() != ENODATA { return report(name, false); }
+
+    let mut lbuf = [0u8; 16];
+    let llen = raw_llistxattr(link, lbuf.as_mut_ptr(), lbuf.len());
+    report(name, llen == 0)
+}
+
+/// (7) fsetxattr/fgetxattr/flistxattr/fremovexattr all operate on an
+/// already-open fd, matching the path forms' behavior, on both backends.
+unsafe fn test_xattr_fd(root: &[u8], name: &[u8]) -> bool {
+    let mut pb = [0u8; 96];
+    let path = mkpath(&mut pb, root, b"_fd");
+
+    let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+
+    if raw_fsetxattr(fd, b"user.fd\0".as_ptr(), b"val".as_ptr(), 3, 0) != 0 {
+        close(fd);
+        return report(name, false);
+    }
+
+    let mut buf = [0u8; 8];
+    let n = raw_fgetxattr(fd, b"user.fd\0".as_ptr(), buf.as_mut_ptr(), buf.len());
+    if n != 3 || &buf[..3] != b"val" { close(fd); return report(name, false); }
+
+    let mut lbuf = [0u8; 16];
+    let llen = raw_flistxattr(fd, lbuf.as_mut_ptr(), lbuf.len());
+    if llen < 0 || !contains_name(&lbuf, llen as usize, b"user.fd") {
+        close(fd);
+        return report(name, false);
+    }
+
+    if raw_fremovexattr(fd, b"user.fd\0".as_ptr()) != 0 { close(fd); return report(name, false); }
+    let after = raw_fgetxattr(fd, b"user.fd\0".as_ptr(), buf.as_mut_ptr(), buf.len());
+    close(fd);
+    report(name, after == -1 && get_errno() == ENODATA)
+}
+
+/// (8) A non-trivial ACL (root full access, uid 1000 explicitly denied,
+/// group/other rx via an rx MASK) is accepted, updates the file's group
+/// mode bits to the MASK permissions, shows up in listxattr, and round-trips
+/// byte-for-byte through getxattr.
+unsafe fn test_xattr_acl_basic(root: &[u8], name: &[u8]) -> bool {
+    let mut pb = [0u8; 96];
+    let path = mkpath(&mut pb, root, b"_acl");
+
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o755);
+    if fd < 0 { return report(name, false); }
+    close(fd);
+
+    let mut acl = [0u8; 64];
+    let acl_len = build_enforcing_acl(&mut acl);
+
+    if raw_setxattr(path, b"system.posix_acl_access\0".as_ptr(), acl.as_ptr(), acl_len, 0) != 0 {
+        return report(name, false);
+    }
+
+    let mode = raw_mode(path);
+    if mode < 0 || (mode & 0o070) >> 3 != 0o5 { return report(name, false); }
+
+    let mut lbuf = [0u8; 64];
+    let llen = raw_listxattr(path, lbuf.as_mut_ptr(), lbuf.len());
+    if llen < 0 || !contains_name(&lbuf, llen as usize, b"system.posix_acl_access") {
+        return report(name, false);
+    }
+
+    let mut rbuf = [0u8; 64];
+    let rlen = raw_getxattr(path, b"system.posix_acl_access\0".as_ptr(), rbuf.as_mut_ptr(), rbuf.len());
+    report(name, rlen >= 0 && rlen as usize == acl_len && rbuf[..acl_len] == acl[..acl_len])
+}
+
+/// (9) The ACL from (8) actually gates access: an unprivileged uid named in
+/// the ACL with perm 0 is denied both open(O_RDONLY) and faccessat(R_OK),
+/// while the same uid opens a same-mode file *without* an ACL just fine.
+unsafe fn test_xattr_acl_enforcement(root: &[u8], name: &[u8]) -> bool {
+    let mut ab = [0u8; 96];
+    let acl_path = mkpath(&mut ab, root, b"_aclenf");
+    let mut nb = [0u8; 96];
+    let noacl_path = mkpath(&mut nb, root, b"_noaclenf");
+
+    let fd1 = open(acl_path, O_CREAT | O_WRONLY | O_TRUNC, 0o755);
+    if fd1 < 0 { return report(name, false); }
+    close(fd1);
+    let fd2 = open(noacl_path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd2 < 0 { return report(name, false); }
+    close(fd2);
+
+    let mut acl = [0u8; 64];
+    let acl_len = build_enforcing_acl(&mut acl);
+    if raw_setxattr(acl_path, b"system.posix_acl_access\0".as_ptr(), acl.as_ptr(), acl_len, 0) != 0 {
+        return report(name, false);
+    }
+
+    let pid = fork();
+    if pid == 0 {
+        if setuid(1000) != 0 { exit(1); }
+
+        let denied_open = open(acl_path, O_RDONLY, 0) == -1 && get_errno() == EACCES;
+        let denied_access = raw_faccessat(acl_path, R_OK) == -1 && get_errno() == EACCES;
+
+        let allowed_fd = open(noacl_path, O_RDONLY, 0);
+        let allowed_open = allowed_fd >= 0;
+        if allowed_fd >= 0 { close(allowed_fd); }
+
+        exit(if denied_open && denied_access && allowed_open { 0 } else { 1 });
+    }
+    let mut status: i32 = -1;
+    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    report(name, status == 0)
+}
+
+/// (10) A malformed ACL (bad version, or a named USER entry with no MASK) is
+/// rejected with EINVAL. A trivial ACL (only the three base entries) is
+/// accepted but applied as a plain chmod: it is not stored, so it does not
+/// show up in listxattr, and the mode bits change accordingly.
+unsafe fn test_xattr_acl_malformed_trivial(root: &[u8], name: &[u8]) -> bool {
+    let mut b1 = [0u8; 96];
+    let bad_version_path = mkpath(&mut b1, root, b"_aclbadver");
+    let mut b2 = [0u8; 96];
+    let no_mask_path = mkpath(&mut b2, root, b"_aclnomask");
+    let mut b3 = [0u8; 96];
+    let trivial_path = mkpath(&mut b3, root, b"_acltrivial");
+
+    for p in [bad_version_path, no_mask_path, trivial_path] {
+        let fd = open(p, O_CREAT | O_WRONLY | O_TRUNC, 0o600);
+        if fd < 0 { return report(name, false); }
+        close(fd);
+    }
+
+    let mut bad = [0u8; 64];
+    let bad_len = build_acl(&mut bad, 1, &[
+        (ACL_USER_OBJ,  0o6, ACL_UNDEFINED_ID),
+        (ACL_GROUP_OBJ, 0o4, ACL_UNDEFINED_ID),
+        (ACL_OTHER,     0o4, ACL_UNDEFINED_ID),
+    ]);
+    let bad_ver = raw_setxattr(bad_version_path, b"system.posix_acl_access\0".as_ptr(), bad.as_ptr(), bad_len, 0);
+    if bad_ver != -1 || get_errno() != EINVAL { return report(name, false); }
+
+    let mut nomask = [0u8; 64];
+    let nomask_len = build_acl(&mut nomask, 2, &[
+        (ACL_USER_OBJ,  0o7, ACL_UNDEFINED_ID),
+        (ACL_USER,      0o0, 1000),
+        (ACL_GROUP_OBJ, 0o5, ACL_UNDEFINED_ID),
+        (ACL_OTHER,     0o5, ACL_UNDEFINED_ID),
+    ]);
+    let nomask_r = raw_setxattr(no_mask_path, b"system.posix_acl_access\0".as_ptr(), nomask.as_ptr(), nomask_len, 0);
+    if nomask_r != -1 || get_errno() != EINVAL { return report(name, false); }
+
+    let mut triv = [0u8; 64];
+    let triv_len = build_acl(&mut triv, 2, &[
+        (ACL_USER_OBJ,  0o6, ACL_UNDEFINED_ID),
+        (ACL_GROUP_OBJ, 0o4, ACL_UNDEFINED_ID),
+        (ACL_OTHER,     0o4, ACL_UNDEFINED_ID),
+    ]);
+    if raw_setxattr(trivial_path, b"system.posix_acl_access\0".as_ptr(), triv.as_ptr(), triv_len, 0) != 0 {
+        return report(name, false);
+    }
+
+    let mut lbuf = [0u8; 64];
+    let llen = raw_listxattr(trivial_path, lbuf.as_mut_ptr(), lbuf.len());
+    if llen < 0 || contains_name(&lbuf, llen as usize, b"system.posix_acl_access") {
+        return report(name, false);
+    }
+
+    let mode = raw_mode(trivial_path);
+    report(name, mode >= 0 && (mode & 0o777) == 0o644)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     let mut failures = 0;
@@ -54,6 +560,29 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_permission_enforced() { failures += 1; }
     if !test_f2fs_ownership_enforced() { failures += 1; }
     if !test_chroot_confines_symlink_resolution() { failures += 1; }
+
+    // Extended attributes / POSIX ACLs, each run against both the tmpfs
+    // mount at /tmp and the f2fs mount at /data.
+    if !test_xattr_basic(b"/tmp/xa", b"xattr_basic_tmpfs\0") { failures += 1; }
+    if !test_xattr_basic(b"/data/xa", b"xattr_basic_f2fs\0") { failures += 1; }
+    if !test_xattr_missing_and_unsupported(b"/tmp/xa", b"xattr_missing_unsupported_tmpfs\0") { failures += 1; }
+    if !test_xattr_missing_and_unsupported(b"/data/xa", b"xattr_missing_unsupported_f2fs\0") { failures += 1; }
+    if !test_xattr_list(b"/tmp/xa", b"xattr_list_tmpfs\0") { failures += 1; }
+    if !test_xattr_list(b"/data/xa", b"xattr_list_f2fs\0") { failures += 1; }
+    if !test_xattr_create_replace(b"/tmp/xa", b"xattr_create_replace_tmpfs\0") { failures += 1; }
+    if !test_xattr_create_replace(b"/data/xa", b"xattr_create_replace_f2fs\0") { failures += 1; }
+    if !test_xattr_remove(b"/tmp/xa", b"xattr_remove_tmpfs\0") { failures += 1; }
+    if !test_xattr_remove(b"/data/xa", b"xattr_remove_f2fs\0") { failures += 1; }
+    if !test_xattr_symlink(b"/tmp/xa", b"xattr_symlink_tmpfs\0", false) { failures += 1; }
+    if !test_xattr_symlink(b"/data/xa", b"xattr_symlink_f2fs\0", true) { failures += 1; }
+    if !test_xattr_fd(b"/tmp/xa", b"xattr_fd_tmpfs\0") { failures += 1; }
+    if !test_xattr_fd(b"/data/xa", b"xattr_fd_f2fs\0") { failures += 1; }
+    if !test_xattr_acl_basic(b"/tmp/xa", b"xattr_acl_basic_tmpfs\0") { failures += 1; }
+    if !test_xattr_acl_basic(b"/data/xa", b"xattr_acl_basic_f2fs\0") { failures += 1; }
+    if !test_xattr_acl_enforcement(b"/tmp/xa", b"xattr_acl_enforcement_tmpfs\0") { failures += 1; }
+    if !test_xattr_acl_enforcement(b"/data/xa", b"xattr_acl_enforcement_f2fs\0") { failures += 1; }
+    if !test_xattr_acl_malformed_trivial(b"/tmp/xa", b"xattr_acl_malformed_trivial_tmpfs\0") { failures += 1; }
+    if !test_xattr_acl_malformed_trivial(b"/data/xa", b"xattr_acl_malformed_trivial_f2fs\0") { failures += 1; }
 
     puts(b"--- vfstest done ---\0".as_ptr());
     failures

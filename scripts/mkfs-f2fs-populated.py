@@ -239,7 +239,7 @@ def main():
         "shell", "login", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest",
         "waittest", "sigchldtest",
-        "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping",
+        "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)

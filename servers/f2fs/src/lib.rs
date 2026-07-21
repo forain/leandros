@@ -50,6 +50,23 @@ const VFS_FCHOWN:     u64 = 0x2E;
 const VFS_FSYNC:      u64 = 0x39;
 const VFS_LCHMOD:     u64 = 0x3B;
 const VFS_LCHOWN:     u64 = 0x3C;
+// Extended-attribute / POSIX-ACL ops. Same footgun applies: every one of these
+// names is used in the dispatch `match` below, so an *undefined* upper-case name
+// there would become a catch-all binding and silently swallow the arms after it.
+// All 13 are defined here, in lockstep with servers/vfs/src/lib.rs.
+const VFS_SETXATTR:     u64 = 0x3D;
+const VFS_LSETXATTR:    u64 = 0x3E;
+const VFS_FSETXATTR:    u64 = 0x3F;
+const VFS_GETXATTR:     u64 = 0x40;
+const VFS_LGETXATTR:    u64 = 0x41;
+const VFS_FGETXATTR:    u64 = 0x42;
+const VFS_LISTXATTR:    u64 = 0x43;
+const VFS_LLISTXATTR:   u64 = 0x44;
+const VFS_FLISTXATTR:   u64 = 0x45;
+const VFS_REMOVEXATTR:  u64 = 0x46;
+const VFS_LREMOVEXATTR: u64 = 0x47;
+const VFS_FREMOVEXATTR: u64 = 0x48;
+const VFS_ACCESS:       u64 = 0x49;
 
 const O_WRONLY:  u64 = 1;
 const O_RDWR:    u64 = 2;
@@ -112,6 +129,12 @@ const INO_UID:       usize = 4;
 const INO_GID:       usize = 8;
 const INO_LINKS:     usize = 12;
 const INO_SIZE:      usize = 16;
+// `__le32 i_xattr_nid` — the nid of this inode's dedicated xattr node block, or
+// 0 when it has no extended attributes. Bytes 24..84 are verified never written
+// by scripts/mkfs-f2fs-populated.py (i_size ends at 24, i_pino starts at 84),
+// so every existing on-disk inode reads back 0 here = "no xattrs", and mkfs
+// needs no change. See the xattr node-block layout in the setxattr path.
+const INO_XATTR:     usize = 24;
 const INO_NAMELEN:   usize = 88;
 const INO_NAME:      usize = 92;   // [u8; 255]
 // The union (i_addr / extra-attrs) starts here:
@@ -933,6 +956,17 @@ fn free_inode_data_and_nodes(ms: &mut MountState, ino: u32) {
             }
             free_block(ms, dind_blkaddr);
         }
+    }
+
+    // The dedicated xattr node block, freed the same way as an indirect node:
+    // resolve its nid through the NAT and hand the physical block back to the
+    // allocator. Like every other nid here its NAT entry is left stale (nids are
+    // never recycled without a free list), and the inode block itself — which
+    // still carries INO_XATTR — is discarded by the caller.
+    let xnid = r32(&iblk, INO_XATTR);
+    if xnid != 0 {
+        let xaddr = nat_lookup(ms, xnid);
+        if xaddr != 0 { free_block(ms, xaddr); }
     }
 }
 
@@ -1851,6 +1885,29 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         // lockfile idiom. Checked before O_TRUNC so a losing racer cannot
         // destroy the winner's file on its way to the error.
         if create && flags & O_EXCL != 0 { return err_reply(-17); } // EEXIST
+        // Permission gate for opening an *existing* object. handle_open used to
+        // grant access purely on path resolution — mode bits were recorded but
+        // never enforced, so any file was openable for read or write regardless
+        // of its permissions. Mirror what the VFS does for tmpfs
+        // (`check_access` in servers/vfs): derive want_read/want_write from the
+        // access mode and consult the inode via `xattr::access_check`, which
+        // honours a stored POSIX ACL. Root (euid 0) bypasses, so the boot path
+        // (init/getty/login all run as root before setuid) is unaffected; the
+        // freshly-created branch above is not gated (the creator owns it). The
+        // check precedes O_TRUNC so an unwritable file is never truncated.
+        if euid != 0 {
+            let want_read  = flags & O_WRONLY == 0; // RDONLY/RDWR read; WRONLY does not
+            let want_write = writable;
+            let (meta, xnid) = load_meta_xnid(ms, ino);
+            let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, xnid)) } else { None };
+            let acl = match &xbuf {
+                Some(b) => xattr::find(&b[..xattr::F2FS_XATTR_ARENA], xattr::IDX_ACL_ACCESS, b""),
+                None => None,
+            };
+            if !xattr::access_check(&meta, euid, egid, acl, want_read, want_write, false) {
+                return err_reply(-13); // EACCES
+            }
+        }
         if flags & O_TRUNC != 0 {
             // Truncate to zero: free the data blocks, not just the size field.
             // Opening an existing file O_WRONLY|O_TRUNC is the usual way a
@@ -2399,11 +2456,38 @@ fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32, euid: u32) -> Message {
         let owner = inode_uid(iblk);
         if euid != 0 && euid != owner { return err_reply(-1); } // EPERM
     }
-    let iblk = ms.cache.get_mut(ms.dev, addr as u64);
-    let cur = inode_mode(iblk);
-    let new_mode = (cur & S_IFMT) | (mode as u16 & !S_IFMT);
-    w16(iblk, INO_MODE, new_mode);
+    let new_mode;
+    {
+        let iblk = ms.cache.get_mut(ms.dev, addr as u64);
+        let cur = inode_mode(iblk);
+        new_mode = (cur & S_IFMT) | (mode as u16 & !S_IFMT);
+        w16(iblk, INO_MODE, new_mode);
+    }
     nat_update(ms, ino, addr);
+
+    // Keep a stored access ACL consistent with the new mode (posix_acl_chmod):
+    // USER_OBJ←owner, OTHER←other, MASK-or-GROUP_OBJ←group. Named entries are
+    // untouched. Trivial ACLs are never stored, so this only fires when a real
+    // ACL exists, and the write-back mirrors the setxattr read-modify-write.
+    let xnid = { let iblk = ms.cache.read(ms.dev, addr as u64); r32(iblk, INO_XATTR) };
+    if xnid != 0 {
+        let mut blkbuf = read_xattr_arena(ms, xnid);
+        let mut vbuf = [0u8; xattr::F2FS_XATTR_ARENA];
+        let vlen = {
+            let arena = &blkbuf[..xattr::F2FS_XATTR_ARENA];
+            match xattr::find(arena, xattr::IDX_ACL_ACCESS, b"") {
+                Some(v) => { vbuf[..v.len()].copy_from_slice(v); Some(v.len()) }
+                None => None,
+            }
+        };
+        if let Some(vlen) = vlen {
+            xattr::acl_chmod_rewrite(&mut vbuf[..vlen], new_mode);
+            let arena = &mut blkbuf[..xattr::F2FS_XATTR_ARENA];
+            let _ = xattr::set(arena, xattr::IDX_ACL_ACCESS, b"", &vbuf[..vlen], 0);
+            persist_xattr_block(ms, ino, xnid, &blkbuf);
+        }
+    }
+
     maybe_flush(ms);
     ok_reply()
 }
@@ -2666,6 +2750,329 @@ fn handle_statfs(ms: &mut MountState, buf_ptr: u64) -> Message {
     ok_reply()
 }
 
+// ── Extended attributes + POSIX ACLs ──────────────────────────────────────────
+//
+// Storage: one dedicated node block per inode, allocated lazily on the first
+// setxattr that actually stores something. Bytes [0..F2FS_XATTR_ARENA=4076)
+// hold the packed arena (all-zero == empty); [4076..4096) carry the standard
+// node footer (nid, owner ino) exactly like every other node block. The inode
+// records that node's nid at INO_XATTR (0 == none). The wire format, size caps,
+// namespace gates and the ACL evaluator all live in the `xattr` crate — this
+// module never reimplements them, it only does the read-modify-write against
+// the node block, in the same nat_lookup → mutate → nat_update → maybe_flush
+// idiom as chmod_inode.
+
+/// The inode's owner/mode facts (for the `xattr` gates) plus its xattr nid.
+fn load_meta_xnid(ms: &mut MountState, ino: u32) -> (xattr::FileMeta, u32) {
+    let addr = nat_lookup(ms, ino);
+    let iblk = ms.cache.read(ms.dev, addr as u64);
+    let meta = xattr::FileMeta {
+        mode: inode_mode(iblk), // on-disk i_mode carries the S_IFMT type bits
+        uid:  inode_uid(iblk),
+        gid:  inode_gid(iblk),
+    };
+    (meta, r32(iblk, INO_XATTR))
+}
+
+/// Copy the whole xattr node block (arena + footer) onto the stack. Copying
+/// (rather than holding a `&` into the cache) is mandatory: the write-back path
+/// takes `get_mut` on NAT/SIT blocks through the same 4-slot cache and can evict
+/// the node block being edited.
+fn read_xattr_arena(ms: &mut MountState, xnid: u32) -> [u8; BLOCK_SIZE] {
+    let addr = nat_lookup(ms, xnid);
+    read_block_copy(ms, addr)
+}
+
+/// Write a full xattr node-block image back, allocating the node lazily when the
+/// inode has none yet. `blkbuf` is the 4096-byte block (arena in
+/// [0..F2FS_XATTR_ARENA)); its footer is (re)written here so a freshly
+/// allocated, zero-filled buffer becomes a self-identifying node block. Returns
+/// the effective nid, or 0 if a lazy allocation failed (ENOSPC) — callers treat
+/// 0 as "nothing was stored".
+fn persist_xattr_block(ms: &mut MountState, ino: u32, xnid: u32, blkbuf: &[u8; BLOCK_SIZE]) -> u32 {
+    let xnid = if xnid != 0 {
+        xnid
+    } else {
+        // Allocate the node first and hold no cache borrow across it — the
+        // allocation itself dirties SIT/NAT blocks through the shared cache.
+        let (new_nid, _phys) = match create_node_block(ms, ino) {
+            Some(v) => v,
+            None => return 0, // ENOSPC
+        };
+        // Record the new nid in the inode as a separate, non-straddling step.
+        let iaddr = nat_lookup(ms, ino);
+        {
+            let iblk = ms.cache.get_mut(ms.dev, iaddr as u64);
+            w32(iblk, INO_XATTR, new_nid);
+        }
+        nat_update(ms, ino, iaddr);
+        new_nid
+    };
+    let xaddr = nat_lookup(ms, xnid);
+    let mut out = *blkbuf;
+    w32(&mut out, NODE_FOOTER_OFF,     xnid);
+    w32(&mut out, NODE_FOOTER_OFF + 4, ino);
+    ms.cache.write(ms.dev, xaddr as u64, &out);
+    nat_update(ms, xnid, xaddr);
+    xnid
+}
+
+/// Replace only i_mode's 9 permission bits, keeping type/setuid/setgid/sticky —
+/// the mode<->ACL invariant (`acl_mode_bits`) that setxattr and chmod maintain.
+fn set_inode_perm_bits(ms: &mut MountState, ino: u32, perm: u16) {
+    let addr = nat_lookup(ms, ino);
+    {
+        let iblk = ms.cache.get_mut(ms.dev, addr as u64);
+        let cur = inode_mode(iblk);
+        w16(iblk, INO_MODE, (cur & !0o777) | (perm & 0o777));
+    }
+    nat_update(ms, ino, addr);
+}
+
+/// Copy a NUL-terminated attribute name out of caller space into `buf`.
+/// Returns the length read, capped at `buf.len()`; a name that fills `buf`
+/// without a terminator is over-length and rejected by the caller.
+unsafe fn read_user_name(name_ptr: u64, buf: &mut [u8]) -> usize {
+    let ptr = name_ptr as *const u8;
+    let mut len = 0;
+    while len < buf.len() {
+        let c = *ptr.add(len);
+        if c == 0 { break; }
+        buf[len] = c;
+        len += 1;
+    }
+    len
+}
+
+/// Fill `buf` (must be ≥ XATTR_NAME_MAX+1 bytes) with the caller's attribute
+/// name and validate its length. ERANGE for empty or over-long names.
+unsafe fn load_xattr_name(name_ptr: u64, buf: &mut [u8]) -> Result<usize, i32> {
+    let n = read_user_name(name_ptr, buf);
+    if n == 0 || n > xattr::XATTR_NAME_MAX { return Err(xattr::ERANGE); }
+    Ok(n)
+}
+
+/// Resolve a path-form xattr op to an inode. `follow` distinguishes the
+/// bare form (follow the final symlink) from the l-form (do not).
+fn xattr_path_ino(ms: &mut MountState, path_ptr: u64, follow: bool) -> Result<u32, Message> {
+    let path_bytes = unsafe {
+        let ptr = path_ptr as *const u8;
+        let mut len = 0;
+        while *ptr.add(len) != 0 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    };
+    let rel = match get_relative_path(ms, path_bytes) {
+        Some(r) => r,
+        None => return Err(err_reply(-2)), // ENOENT
+    };
+    let ino = resolve_path_ex(ms, rel, follow);
+    if ino == 0 { return Err(err_reply(-2)); }
+    Ok(ino)
+}
+
+/// Resolve an f-form xattr op to an inode via the open-file table (arg0 is the
+/// mount-local file_id the VFS forwarded), exactly like handle_fchmod.
+fn xattr_fd_ino(ms: &MountState, file_id: u64) -> Result<u32, Message> {
+    let slot = file_id as usize;
+    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use {
+        return Err(err_reply(-9)); // EBADF
+    }
+    Ok(ms.open_files[slot].inode)
+}
+
+fn xattr_get(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u64,
+             euid: u32, egid: u32) -> Message {
+    let mut namebuf = [0u8; xattr::XATTR_NAME_MAX + 1];
+    let nlen = match unsafe { load_xattr_name(name_ptr, &mut namebuf) } {
+        Ok(n) => n,
+        Err(e) => return err_reply(-e),
+    };
+    let (idx, suf) = match xattr::split_name(&namebuf[..nlen]) {
+        Some(v) => v,
+        None => return err_reply(-95), // EOPNOTSUPP
+    };
+    let (meta, xnid) = load_meta_xnid(ms, ino);
+    if xnid == 0 {
+        // Gate still runs (it can return EACCES/EPERM/EOPNOTSUPP), then ENODATA.
+        if let Err(e) = xattr::may_read_xattr(idx, &meta, euid, egid, None) { return err_reply(-e); }
+        return err_reply(-61); // ENODATA
+    }
+    let blkbuf = read_xattr_arena(ms, xnid);
+    let arena = &blkbuf[..xattr::F2FS_XATTR_ARENA];
+    let acl = xattr::find(arena, xattr::IDX_ACL_ACCESS, b"");
+    if let Err(e) = xattr::may_read_xattr(idx, &meta, euid, egid, acl) { return err_reply(-e); }
+    let val = match xattr::find(arena, idx, suf) {
+        Some(v) => v,
+        None => return err_reply(-61), // ENODATA
+    };
+    if size == 0 { return val_reply(val.len() as u64); }
+    if (val.len() as u64) > size { return err_reply(-34); } // ERANGE
+    unsafe { core::ptr::copy_nonoverlapping(val.as_ptr(), val_ptr as *mut u8, val.len()); }
+    val_reply(val.len() as u64)
+}
+
+fn xattr_list(ms: &mut MountState, ino: u32, list_ptr: u64, size: u64, euid: u32) -> Message {
+    let (_meta, xnid) = load_meta_xnid(ms, ino);
+    // ls -l fast path: no xattr node means an empty list, answered without a
+    // block read.
+    if xnid == 0 { return val_reply(0); }
+    let blkbuf = read_xattr_arena(ms, xnid);
+    let arena = &blkbuf[..xattr::F2FS_XATTR_ARENA];
+    let empty: &mut [u8] = &mut [];
+    let out = if size == 0 {
+        empty
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(list_ptr as *mut u8, size as usize) }
+    };
+    match xattr::list(arena, out, euid == 0) {
+        Ok(n) => val_reply(n as u64),
+        Err(e) => err_reply(-e),
+    }
+}
+
+fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u64,
+             flags: u64, euid: u32, egid: u32) -> Message {
+    let mut namebuf = [0u8; xattr::XATTR_NAME_MAX + 1];
+    let nlen = match unsafe { load_xattr_name(name_ptr, &mut namebuf) } {
+        Ok(n) => n,
+        Err(e) => return err_reply(-e),
+    };
+    let (idx, suf) = match xattr::split_name(&namebuf[..nlen]) {
+        Some(v) => v,
+        None => return err_reply(-95), // EOPNOTSUPP
+    };
+    let (meta, xnid) = load_meta_xnid(ms, ino);
+
+    // The current arena (all-zero when no node exists yet) — both the gate and
+    // the read-modify-write operate on it.
+    let mut blkbuf = if xnid != 0 { read_xattr_arena(ms, xnid) } else { [0u8; BLOCK_SIZE] };
+    {
+        let arena = &blkbuf[..xattr::F2FS_XATTR_ARENA];
+        let acl = if xnid != 0 { xattr::find(arena, xattr::IDX_ACL_ACCESS, b"") } else { None };
+        if let Err(e) = xattr::may_write_xattr(idx, &meta, euid, egid, acl) { return err_reply(-e); }
+    }
+
+    // The kernel prefaulted the value; forward the raw span verbatim.
+    let val = unsafe { core::slice::from_raw_parts(val_ptr as *const u8, size as usize) };
+
+    if idx == xattr::IDX_ACL_ACCESS || idx == xattr::IDX_ACL_DEFAULT {
+        // A zero-length value removes the stored attribute; absent is still OK.
+        if size == 0 {
+            if xnid != 0 {
+                {
+                    let arena = &mut blkbuf[..xattr::F2FS_XATTR_ARENA];
+                    let _ = xattr::remove(arena, idx, suf);
+                }
+                persist_xattr_block(ms, ino, xnid, &blkbuf);
+                maybe_flush(ms);
+            }
+            return ok_reply();
+        }
+        let summary = match xattr::acl_validate(val) {
+            Ok(s) => s,
+            Err(_) => return err_reply(-22), // EINVAL
+        };
+        if idx == xattr::IDX_ACL_ACCESS {
+            let perm = xattr::acl_mode_bits(&summary);
+            if xattr::acl_is_trivial(&summary) {
+                // Representable as mode bits alone: fold into i_mode, store
+                // nothing, and drop any previously stored access ACL.
+                set_inode_perm_bits(ms, ino, perm);
+                if xnid != 0 {
+                    {
+                        let arena = &mut blkbuf[..xattr::F2FS_XATTR_ARENA];
+                        let _ = xattr::remove(arena, xattr::IDX_ACL_ACCESS, b"");
+                    }
+                    persist_xattr_block(ms, ino, xnid, &blkbuf);
+                }
+                maybe_flush(ms);
+                return ok_reply();
+            }
+            // Non-trivial: store the ACL, then sync i_mode's perm bits to it.
+            {
+                let arena = &mut blkbuf[..xattr::F2FS_XATTR_ARENA];
+                if let Err(e) = xattr::set(arena, idx, suf, val, flags as u32) { return err_reply(-e); }
+            }
+            if persist_xattr_block(ms, ino, xnid, &blkbuf) == 0 { return err_reply(-28); } // ENOSPC
+            set_inode_perm_bits(ms, ino, perm);
+            maybe_flush(ms);
+            return ok_reply();
+        }
+        // Default ACL: directories only (enforced by the gate), stored verbatim.
+        {
+            let arena = &mut blkbuf[..xattr::F2FS_XATTR_ARENA];
+            if let Err(e) = xattr::set(arena, idx, suf, val, flags as u32) { return err_reply(-e); }
+        }
+        if persist_xattr_block(ms, ino, xnid, &blkbuf) == 0 { return err_reply(-28); }
+        maybe_flush(ms);
+        return ok_reply();
+    }
+
+    // Non-ACL namespace: a plain arena insert/replace.
+    {
+        let arena = &mut blkbuf[..xattr::F2FS_XATTR_ARENA];
+        if let Err(e) = xattr::set(arena, idx, suf, val, flags as u32) { return err_reply(-e); }
+    }
+    if persist_xattr_block(ms, ino, xnid, &blkbuf) == 0 { return err_reply(-28); }
+    maybe_flush(ms);
+    ok_reply()
+}
+
+fn xattr_remove(ms: &mut MountState, ino: u32, name_ptr: u64, euid: u32, egid: u32) -> Message {
+    let mut namebuf = [0u8; xattr::XATTR_NAME_MAX + 1];
+    let nlen = match unsafe { load_xattr_name(name_ptr, &mut namebuf) } {
+        Ok(n) => n,
+        Err(e) => return err_reply(-e),
+    };
+    let (idx, suf) = match xattr::split_name(&namebuf[..nlen]) {
+        Some(v) => v,
+        None => return err_reply(-95), // EOPNOTSUPP
+    };
+    let (meta, xnid) = load_meta_xnid(ms, ino);
+    let mut blkbuf = if xnid != 0 { read_xattr_arena(ms, xnid) } else { [0u8; BLOCK_SIZE] };
+    {
+        let arena = &blkbuf[..xattr::F2FS_XATTR_ARENA];
+        let acl = if xnid != 0 { xattr::find(arena, xattr::IDX_ACL_ACCESS, b"") } else { None };
+        if let Err(e) = xattr::may_write_xattr(idx, &meta, euid, egid, acl) { return err_reply(-e); }
+    }
+    if xnid == 0 { return err_reply(-61); } // ENODATA
+    let removed = {
+        let arena = &mut blkbuf[..xattr::F2FS_XATTR_ARENA];
+        xattr::remove(arena, idx, suf)
+    };
+    match removed {
+        Ok(_) => {
+            // The block stays allocated even when it empties out — nids are
+            // never recycled on this volume, consistent with unlink/truncate.
+            persist_xattr_block(ms, ino, xnid, &blkbuf);
+            maybe_flush(ms);
+            ok_reply()
+        }
+        Err(e) => err_reply(-e), // ENODATA
+    }
+}
+
+/// VFS_ACCESS(path_ptr, amode) — faccessat routed to the owning filesystem so a
+/// stored POSIX ACL is honoured. amode == 0 (F_OK) is pure existence.
+fn xattr_access(ms: &mut MountState, path_ptr: u64, amode: u64, euid: u32, egid: u32) -> Message {
+    let ino = match xattr_path_ino(ms, path_ptr, true) {
+        Ok(i) => i,
+        Err(m) => return m,
+    };
+    if amode == 0 { return ok_reply(); }
+    let (meta, xnid) = load_meta_xnid(ms, ino);
+    let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, xnid)) } else { None };
+    let acl = match &xbuf {
+        Some(b) => xattr::find(&b[..xattr::F2FS_XATTR_ARENA], xattr::IDX_ACL_ACCESS, b""),
+        None => None,
+    };
+    if xattr::access_check(&meta, euid, egid, acl, amode & 4 != 0, amode & 2 != 0, amode & 1 != 0) {
+        ok_reply()
+    } else {
+        err_reply(-13) // EACCES
+    }
+}
+
 // ── IPC dispatch ──────────────────────────────────────────────────────────────
 
 fn f2fs_dispatch(msg: &Message, caller_pid: u32, target_port: u32) -> Message {
@@ -2723,6 +3130,53 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
         VFS_CHOWN      => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, true, euid, egid),
         VFS_LCHOWN     => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, false, euid, egid),
         VFS_FCHOWN     => handle_fchown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, euid, egid),
+
+        // Extended attributes. Path forms carry (path, name, value, size, flags);
+        // f-forms replace path with a mount-local file_id. The l-forms differ
+        // only in not following a final symlink. Args past the third are read
+        // from the same inline payload (Message.data holds 55 u64 words).
+        VFS_SETXATTR | VFS_LSETXATTR =>
+            match xattr_path_ino(ms, arg(msg,0), msg.tag == VFS_SETXATTR) {
+                Ok(ino) => xattr_set(ms, ino, arg(msg,1), arg(msg,2), arg(msg,3), arg(msg,4), euid, egid),
+                Err(m) => m,
+            },
+        VFS_FSETXATTR =>
+            match xattr_fd_ino(ms, arg(msg,0)) {
+                Ok(ino) => xattr_set(ms, ino, arg(msg,1), arg(msg,2), arg(msg,3), arg(msg,4), euid, egid),
+                Err(m) => m,
+            },
+        VFS_GETXATTR | VFS_LGETXATTR =>
+            match xattr_path_ino(ms, arg(msg,0), msg.tag == VFS_GETXATTR) {
+                Ok(ino) => xattr_get(ms, ino, arg(msg,1), arg(msg,2), arg(msg,3), euid, egid),
+                Err(m) => m,
+            },
+        VFS_FGETXATTR =>
+            match xattr_fd_ino(ms, arg(msg,0)) {
+                Ok(ino) => xattr_get(ms, ino, arg(msg,1), arg(msg,2), arg(msg,3), euid, egid),
+                Err(m) => m,
+            },
+        VFS_LISTXATTR | VFS_LLISTXATTR =>
+            match xattr_path_ino(ms, arg(msg,0), msg.tag == VFS_LISTXATTR) {
+                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), euid),
+                Err(m) => m,
+            },
+        VFS_FLISTXATTR =>
+            match xattr_fd_ino(ms, arg(msg,0)) {
+                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), euid),
+                Err(m) => m,
+            },
+        VFS_REMOVEXATTR | VFS_LREMOVEXATTR =>
+            match xattr_path_ino(ms, arg(msg,0), msg.tag == VFS_REMOVEXATTR) {
+                Ok(ino) => xattr_remove(ms, ino, arg(msg,1), euid, egid),
+                Err(m) => m,
+            },
+        VFS_FREMOVEXATTR =>
+            match xattr_fd_ino(ms, arg(msg,0)) {
+                Ok(ino) => xattr_remove(ms, ino, arg(msg,1), euid, egid),
+                Err(m) => m,
+            },
+        VFS_ACCESS     => xattr_access(ms, arg(msg,0), arg(msg,1), euid, egid),
+
         _              => err_reply(-22), // EINVAL
     }
 }

@@ -1,0 +1,6 @@
+[package]
+name = "xattr"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

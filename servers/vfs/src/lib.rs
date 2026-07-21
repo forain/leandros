@@ -122,6 +122,37 @@ pub const VFS_SYNC:            u64 = 0x3A;
 pub const VFS_LCHMOD:          u64 = 0x3B;
 pub const VFS_LCHOWN:          u64 = 0x3C;
 
+/// Extended attributes. All pointers are caller-space and forwarded verbatim
+/// to mount servers, like every other op. l-forms don't follow a final
+/// symlink; f-forms take an fd (rewritten to the mount-local file_id when
+/// proxied). Shared wire format, size caps, permission gates, and the POSIX
+/// ACL evaluator live in the `xattr` crate (servers/xattr) — the kernel,
+/// this server, and f2fs all use that one implementation.
+///
+/// setxattr(path_ptr, name_ptr, value_ptr, size, flags) → 0 or -errno
+pub const VFS_SETXATTR:        u64 = 0x3D;
+pub const VFS_LSETXATTR:       u64 = 0x3E;
+/// fsetxattr(fd, name_ptr, value_ptr, size, flags) → 0 or -errno
+pub const VFS_FSETXATTR:       u64 = 0x3F;
+/// getxattr(path_ptr, name_ptr, value_ptr, size) → value length or -errno.
+/// size==0 is a length query; size too small for the value → -ERANGE.
+pub const VFS_GETXATTR:        u64 = 0x40;
+pub const VFS_LGETXATTR:       u64 = 0x41;
+pub const VFS_FGETXATTR:       u64 = 0x42;
+/// listxattr(path_ptr, list_ptr, size) → total bytes of NUL-joined names or
+/// -errno. size==0 is a length query.
+pub const VFS_LISTXATTR:       u64 = 0x43;
+pub const VFS_LLISTXATTR:      u64 = 0x44;
+pub const VFS_FLISTXATTR:      u64 = 0x45;
+/// removexattr(path_ptr, name_ptr) → 0 or -errno
+pub const VFS_REMOVEXATTR:     u64 = 0x46;
+pub const VFS_LREMOVEXATTR:    u64 = 0x47;
+pub const VFS_FREMOVEXATTR:    u64 = 0x48;
+/// access(path_ptr, mode) → 0 or -errno. mode = R_OK|W_OK|X_OK bits (F_OK=0
+/// is just existence). The owning filesystem answers via xattr::access_check
+/// so stored POSIX ACLs are honored; the kernel's faccessat routes here.
+pub const VFS_ACCESS:          u64 = 0x49;
+
 
 /// Readiness bitmask, numerically identical to Linux's POLLIN/POLLOUT/POLLERR/
 /// POLLHUP (and thus also EPOLLIN/EPOLLOUT/EPOLLERR/EPOLLHUP) so one value
@@ -259,6 +290,11 @@ struct TmpFileEntry {
     /// path. Owned by the fd rather than by a name: invisible to lookup and to
     /// getdents64, and freed on close (see `tmp_release_ephemeral`).
     ephemeral: bool,
+    /// Per-inode extended-attribute arena, shared wire format with f2fs (see
+    /// the `xattr` crate). Belongs to the data-owning slot: every xattr op maps
+    /// through `tmp_owner()` first, so hard links share one set of attributes
+    /// (and one stored POSIX ACL) exactly as they share their bytes.
+    xattr: [u8; xattr::TMP_XATTR_ARENA],
 }
 
 impl TmpFileEntry {
@@ -267,7 +303,8 @@ impl TmpFileEntry {
                data: [0u8; MAX_TMP_SIZE], len: 0,
                in_use: false, is_dir: false, is_fifo: false, is_link: false,
                link_to: usize::MAX,
-               mode: 0, uid: 0, gid: 0, ephemeral: false }
+               mode: 0, uid: 0, gid: 0, ephemeral: false,
+               xattr: [0u8; xattr::TMP_XATTR_ARENA] }
     }
 }
 
@@ -987,6 +1024,13 @@ fn path_args(msg: &Message) -> (Option<(usize, bool)>, Option<(usize, bool)>) {
         // AT_SYMLINK_NOFOLLOW makes the caller mean the link, not its target.
         VFS_LCHMOD | VFS_LCHOWN                                 => (Some((0, false)), None),
         VFS_STAT | VFS_STATFS | VFS_CHMOD | VFS_CHOWN           => (Some((0, true)), None),
+        // xattr/access path forms: the plain and l-prefixed variants differ
+        // only in whether the *final* component is followed, exactly like
+        // stat/lstat above. The f-forms take an fd (arg0) and are absent here.
+        VFS_SETXATTR | VFS_GETXATTR | VFS_LISTXATTR
+        | VFS_REMOVEXATTR | VFS_ACCESS                         => (Some((0, true)), None),
+        VFS_LSETXATTR | VFS_LGETXATTR | VFS_LLISTXATTR
+        | VFS_LREMOVEXATTR                                     => (Some((0, false)), None),
         VFS_UNLINK | VFS_RMDIR | VFS_MKDIR | VFS_MKNOD
         | VFS_LSTAT | VFS_READLINK                              => (Some((0, false)), None),
         VFS_RENAME | VFS_LINK                                   => (Some((0, false)), Some((1, false))),
@@ -1111,6 +1155,31 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
                                                 arg(msg,2) as usize),
         VFS_LINK             => handle_link(arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_LSTAT            => stat_common(arg(msg,0) as usize, arg(msg,1) as usize, false),
+        VFS_SETXATTR | VFS_LSETXATTR
+                             => handle_setxattr(caller_pid, msg.tag, arg(msg,0) as usize,
+                                                arg(msg,1) as usize, arg(msg,2) as usize,
+                                                arg(msg,3) as usize, arg(msg,4) as u32),
+        VFS_FSETXATTR        => handle_fsetxattr(caller_pid, arg(msg,0) as usize,
+                                                 arg(msg,1) as usize, arg(msg,2) as usize,
+                                                 arg(msg,3) as usize, arg(msg,4) as u32),
+        VFS_GETXATTR | VFS_LGETXATTR
+                             => handle_getxattr(caller_pid, msg.tag, arg(msg,0) as usize,
+                                                arg(msg,1) as usize, arg(msg,2) as usize,
+                                                arg(msg,3) as usize),
+        VFS_FGETXATTR        => handle_fgetxattr(caller_pid, arg(msg,0) as usize,
+                                                 arg(msg,1) as usize, arg(msg,2) as usize,
+                                                 arg(msg,3) as usize),
+        VFS_LISTXATTR | VFS_LLISTXATTR
+                             => handle_listxattr(caller_pid, msg.tag, arg(msg,0) as usize,
+                                                 arg(msg,1) as usize, arg(msg,2) as usize),
+        VFS_FLISTXATTR       => handle_flistxattr(caller_pid, arg(msg,0) as usize,
+                                                  arg(msg,1) as usize, arg(msg,2) as usize),
+        VFS_REMOVEXATTR | VFS_LREMOVEXATTR
+                             => handle_removexattr(caller_pid, msg.tag, arg(msg,0) as usize,
+                                                   arg(msg,1) as usize),
+        VFS_FREMOVEXATTR     => handle_fremovexattr(caller_pid, arg(msg,0) as usize,
+                                                    arg(msg,1) as usize),
+        VFS_ACCESS           => handle_access(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         _                    => err_reply(-38), // ENOSYS
     }
 }
@@ -1917,17 +1986,6 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
     None
 }
 
-/// Check requested read/write access against `mode`'s owner/group/other bits.
-/// Root (euid == 0) always passes, matching Unix semantics.
-fn check_access(mode: u32, owner_uid: u32, owner_gid: u32, euid: u32, egid: u32,
-                want_read: bool, want_write: bool) -> bool {
-    if euid == 0 { return true; }
-    let bits = if euid == owner_uid { (mode >> 6) & 0o7 }
-               else if egid == owner_gid { (mode >> 3) & 0o7 }
-               else { mode & 0o7 };
-    (!want_read || bits & 0o4 != 0) && (!want_write || bits & 0o2 != 0)
-}
-
 fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) {
         Some(r) => r,
@@ -2000,8 +2058,13 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             if let Some(idx) = tmp_find(&tmp[..], path).filter(|&i| tmp[i].is_dir) {
                 if excl { return err_reply(-17); } // EEXIST — beats EISDIR, as on Linux
                 if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
-                if !check_access(tmp[idx].mode, tmp[idx].uid, tmp[idx].gid, euid, egid, true, false) {
-                    return err_reply(-13); // EACCES
+                {
+                    let e = &tmp[idx];
+                    let meta = tmp_meta(e);
+                    let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+                    if !xattr::access_check(&meta, euid, egid, acl, true, false, false) {
+                        return err_reply(-13); // EACCES
+                    }
                 }
                 VnodeKind::TmpFile { idx, pos: 0, writable: false }
             } else {
@@ -2016,8 +2079,13 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     // before access permissions so an unreadable file still
                     // reports "already there" rather than leaking EACCES.
                     if excl { return err_reply(-17); } // EEXIST
-                    if !check_access(tmp[idx].mode, tmp[idx].uid, tmp[idx].gid, euid, egid, want_read, want_write) {
-                        return err_reply(-13); // EACCES
+                    {
+                        let e = &tmp[idx];
+                        let meta = tmp_meta(e);
+                        let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+                        if !xattr::access_check(&meta, euid, egid, acl, want_read, want_write, false) {
+                            return err_reply(-13); // EACCES
+                        }
                     }
                     if trunc { tmp[idx].len = 0; }
                     let pos = if writable && trunc { 0 }
@@ -4256,8 +4324,10 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
         let mut tmp = TMP_FILES.lock();
         return match tmp_find(&tmp[..], path) {
             Some(idx) => {
-                if euid != 0 && euid != tmp[idx].uid { return err_reply(-1); } // EPERM
-                tmp[idx].mode = mode & 0o777;
+                let owner = tmp_owner(&tmp[..], idx);
+                if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
+                tmp[owner].mode = mode & 0o777;
+                tmp_acl_chmod_sync(&mut tmp[owner], mode);
                 ok_reply()
             }
             None => err_reply(-2), // ENOENT
@@ -4286,8 +4356,10 @@ fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
             drop(tbls);
             let euid = sched::euid_of(pid);
             let mut tmp = TMP_FILES.lock();
-            if euid != 0 && euid != tmp[idx].uid { return err_reply(-1); } // EPERM
-            tmp[idx].mode = mode & 0o777;
+            let owner = tmp_owner(&tmp[..], idx);
+            if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
+            tmp[owner].mode = mode & 0o777;
+            tmp_acl_chmod_sync(&mut tmp[owner], mode);
             ok_reply()
         }
         VnodeKind::MountedFile { port, file_id } => {
@@ -4363,6 +4435,347 @@ fn apply_chown(e: &mut TmpFileEntry, euid: u32, uid: u32, gid: u32) -> Message {
         e.gid = gid;
     }
     ok_reply()
+}
+
+// ── extended attributes + POSIX ACLs ─────────────────────────────────────────
+//
+// The wire format, size caps, namespace permission gates, and the ACL
+// evaluator all live in the `xattr` crate — this file only stores the per-inode
+// arena (`TmpFileEntry::xattr`) and routes the thirteen ops to it. Every op
+// resolves hard links through `tmp_owner()` first, so aliases share one set of
+// attributes exactly as they share their bytes. Crate errors are POSITIVE
+// errnos; reply with `-(e as i64)`.
+
+/// S_IFMT type bits for a tmpfs entry, synthesised from its flags exactly as
+/// `stat_common` does — the `mode` field itself carries permission bits only.
+fn tmp_ifmt(e: &TmpFileEntry) -> u16 {
+    if e.is_dir { 0o040000 }
+    else if e.is_link { 0o120000 }
+    else if e.is_fifo { 0o010000 }
+    else { 0o100000 }
+}
+
+/// Build the `xattr::FileMeta` the permission gates and ACL evaluator expect:
+/// `mode` carries the S_IFMT type bits together with the stored permission bits.
+fn tmp_meta(e: &TmpFileEntry) -> xattr::FileMeta {
+    xattr::FileMeta {
+        mode: tmp_ifmt(e) | (e.mode as u16 & 0o7777),
+        uid:  e.uid,
+        gid:  e.gid,
+    }
+}
+
+/// posix_acl_chmod: after a mode change, rewrite any stored *access* ACL so its
+/// USER_OBJ / mask-or-GROUP_OBJ / OTHER entries track the new owner/group/other
+/// bits. Absent (or trivial, hence unstored) ACLs make this a no-op.
+fn tmp_acl_chmod_sync(e: &mut TmpFileEntry, new_mode: u32) {
+    let mut buf = [0u8; 256];
+    let len = match xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"") {
+        Some(v) if v.len() <= buf.len() => { buf[..v.len()].copy_from_slice(v); v.len() }
+        _ => return,
+    };
+    xattr::acl_chmod_rewrite(&mut buf[..len], new_mode as u16);
+    let _ = xattr::set(&mut e.xattr, xattr::IDX_ACL_ACCESS, b"", &buf[..len], 0);
+}
+
+/// Build a proxy message forwarding an xattr op to a mount server verbatim.
+/// Unused trailing args are zero — harmless for the shorter ops.
+fn xattr_proxy(port: u32, tag: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> Message {
+    let mut proxy = Message::empty();
+    proxy.tag = tag;
+    proxy.data[0..8].copy_from_slice(&a0.to_le_bytes());
+    proxy.data[8..16].copy_from_slice(&a1.to_le_bytes());
+    proxy.data[16..24].copy_from_slice(&a2.to_le_bytes());
+    proxy.data[24..32].copy_from_slice(&a3.to_le_bytes());
+    proxy.data[32..40].copy_from_slice(&a4.to_le_bytes());
+    call_port(port, proxy)
+}
+
+// ── local tmpfs operations (all inside one TMP_FILES lock) ────────────────────
+
+fn tmp_setxattr_local(e: &mut TmpFileEntry, euid: u32, egid: u32,
+                      name_ptr: usize, val_ptr: usize, size: usize, flags: u32) -> Message {
+    let (nbuf, nlen) = match read_cstr_raw(name_ptr) { Some(r) => r, None => return err_reply(-14) };
+    if nlen == 0 || nlen > xattr::XATTR_NAME_MAX { return err_reply(-xattr::ERANGE); }
+    let (idx, suf) = match xattr::split_name(&nbuf[..nlen]) {
+        Some(v) => v, None => return err_reply(-xattr::EOPNOTSUPP),
+    };
+    let meta = tmp_meta(e);
+    let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+    if let Err(er) = xattr::may_write_xattr(idx, &meta, euid, egid, acl) {
+        return err_reply(-er);
+    }
+    // The ACL namespaces keep the inode mode in lock-step with their permission
+    // bits (posix_acl semantics); user.*/trusted.* are opaque blobs.
+    if idx == xattr::IDX_ACL_ACCESS || idx == xattr::IDX_ACL_DEFAULT {
+        // An empty value clears the ACL (setfacl -b/-k). Absence is not an
+        // error — the requested end state ("no such ACL") already holds.
+        if size == 0 {
+            let _ = xattr::remove(&mut e.xattr, idx, suf);
+            return ok_reply();
+        }
+        let val = unsafe { core::slice::from_raw_parts(val_ptr as *const u8, size) };
+        let summary = match xattr::acl_validate(val) {
+            Ok(s) => s, Err(_) => return err_reply(-xattr::EINVAL),
+        };
+        if idx == xattr::IDX_ACL_ACCESS {
+            let bits = xattr::acl_mode_bits(&summary) as u32 & 0o777;
+            if xattr::acl_is_trivial(&summary) {
+                // Fully representable as mode bits: fold into the mode and store
+                // nothing (Linux drops a trivial access ACL).
+                e.mode = (e.mode & !0o777) | bits;
+                let _ = xattr::remove(&mut e.xattr, xattr::IDX_ACL_ACCESS, b"");
+                return ok_reply();
+            }
+            if let Err(er) = xattr::set(&mut e.xattr, idx, suf, val, flags) {
+                return err_reply(-er);
+            }
+            e.mode = (e.mode & !0o777) | bits;
+            return ok_reply();
+        }
+        // IDX_ACL_DEFAULT: the dir-only guard already ran in may_write_xattr.
+        return match xattr::set(&mut e.xattr, idx, suf, val, flags) {
+            Ok(_) => ok_reply(), Err(er) => err_reply(-er),
+        };
+    }
+    let val: &[u8] = if size == 0 { &[] }
+                     else { unsafe { core::slice::from_raw_parts(val_ptr as *const u8, size) } };
+    match xattr::set(&mut e.xattr, idx, suf, val, flags) {
+        Ok(_) => ok_reply(), Err(er) => err_reply(-er),
+    }
+}
+
+fn tmp_getxattr_local(e: &TmpFileEntry, euid: u32, egid: u32,
+                      name_ptr: usize, val_ptr: usize, size: usize) -> Message {
+    let (nbuf, nlen) = match read_cstr_raw(name_ptr) { Some(r) => r, None => return err_reply(-14) };
+    if nlen == 0 || nlen > xattr::XATTR_NAME_MAX { return err_reply(-xattr::ERANGE); }
+    let (idx, suf) = match xattr::split_name(&nbuf[..nlen]) {
+        Some(v) => v, None => return err_reply(-xattr::EOPNOTSUPP),
+    };
+    let meta = tmp_meta(e);
+    let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+    if let Err(er) = xattr::may_read_xattr(idx, &meta, euid, egid, acl) {
+        return err_reply(-er);
+    }
+    let value = match xattr::find(&e.xattr, idx, suf) {
+        Some(v) => v, None => return err_reply(-xattr::ENODATA),
+    };
+    let len = value.len();
+    if size == 0 { return val_reply(len as u64); }
+    if size < len { return err_reply(-xattr::ERANGE); }
+    unsafe { core::ptr::copy_nonoverlapping(value.as_ptr(), val_ptr as *mut u8, len); }
+    val_reply(len as u64)
+}
+
+fn tmp_listxattr_local(e: &TmpFileEntry, euid: u32, list_ptr: usize, size: usize) -> Message {
+    // O(1) fast path — the `ls -l` stat storm hits this on every entry.
+    if xattr::is_empty(&e.xattr) { return val_reply(0); }
+    let out: &mut [u8] = if size == 0 { &mut [] }
+                         else { unsafe { core::slice::from_raw_parts_mut(list_ptr as *mut u8, size) } };
+    match xattr::list(&e.xattr, out, euid == 0) {
+        Ok(n) => val_reply(n as u64), Err(er) => err_reply(-er),
+    }
+}
+
+fn tmp_removexattr_local(e: &mut TmpFileEntry, euid: u32, egid: u32, name_ptr: usize) -> Message {
+    let (nbuf, nlen) = match read_cstr_raw(name_ptr) { Some(r) => r, None => return err_reply(-14) };
+    if nlen == 0 || nlen > xattr::XATTR_NAME_MAX { return err_reply(-xattr::ERANGE); }
+    let (idx, suf) = match xattr::split_name(&nbuf[..nlen]) {
+        Some(v) => v, None => return err_reply(-xattr::EOPNOTSUPP),
+    };
+    let meta = tmp_meta(e);
+    let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+    if let Err(er) = xattr::may_write_xattr(idx, &meta, euid, egid, acl) {
+        return err_reply(-er);
+    }
+    // ACL removal needs no mode resync — the mode stays as it is (Linux).
+    match xattr::remove(&mut e.xattr, idx, suf) {
+        Ok(_) => ok_reply(), Err(er) => err_reply(-er),
+    }
+}
+
+// ── path forms (arg0 is a path; l-forms already resolved by path_args) ────────
+
+fn handle_setxattr(pid: u32, tag: u64, path_ptr: usize, name_ptr: usize,
+                   val_ptr: usize, size: usize, flags: u32) -> Message {
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let raw = &pbuf[..plen];
+    if let Some(path) = tmpfs_path(raw) {
+        let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
+        let mut tmp = TMP_FILES.lock();
+        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
+        let owner = tmp_owner(&tmp[..], idx);
+        return tmp_setxattr_local(&mut tmp[owner], euid, egid, name_ptr, val_ptr, size, flags);
+    }
+    if let Some(port) = find_mount_port(raw) {
+        return xattr_proxy(port, tag, path_ptr as u64, name_ptr as u64,
+                           val_ptr as u64, size as u64, flags as u64);
+    }
+    err_reply(-95) // EOPNOTSUPP
+}
+
+fn handle_getxattr(pid: u32, tag: u64, path_ptr: usize, name_ptr: usize,
+                   val_ptr: usize, size: usize) -> Message {
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let raw = &pbuf[..plen];
+    if let Some(path) = tmpfs_path(raw) {
+        let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
+        let tmp = TMP_FILES.lock();
+        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
+        let owner = tmp_owner(&tmp[..], idx);
+        return tmp_getxattr_local(&tmp[owner], euid, egid, name_ptr, val_ptr, size);
+    }
+    if let Some(port) = find_mount_port(raw) {
+        return xattr_proxy(port, tag, path_ptr as u64, name_ptr as u64, val_ptr as u64, size as u64, 0);
+    }
+    err_reply(-95)
+}
+
+fn handle_listxattr(pid: u32, tag: u64, path_ptr: usize, list_ptr: usize, size: usize) -> Message {
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let raw = &pbuf[..plen];
+    if let Some(path) = tmpfs_path(raw) {
+        let euid = sched::euid_of(pid);
+        let tmp = TMP_FILES.lock();
+        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
+        let owner = tmp_owner(&tmp[..], idx);
+        return tmp_listxattr_local(&tmp[owner], euid, list_ptr, size);
+    }
+    if let Some(port) = find_mount_port(raw) {
+        return xattr_proxy(port, tag, path_ptr as u64, list_ptr as u64, size as u64, 0, 0);
+    }
+    err_reply(-95)
+}
+
+fn handle_removexattr(pid: u32, tag: u64, path_ptr: usize, name_ptr: usize) -> Message {
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let raw = &pbuf[..plen];
+    if let Some(path) = tmpfs_path(raw) {
+        let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
+        let mut tmp = TMP_FILES.lock();
+        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
+        let owner = tmp_owner(&tmp[..], idx);
+        return tmp_removexattr_local(&mut tmp[owner], euid, egid, name_ptr);
+    }
+    if let Some(port) = find_mount_port(raw) {
+        return xattr_proxy(port, tag, path_ptr as u64, name_ptr as u64, 0, 0, 0);
+    }
+    err_reply(-95)
+}
+
+/// faccessat(2): permission probe honoring any stored access ACL. `amode==0`
+/// (F_OK) is pure existence. A path this server does not own answers -38 so the
+/// kernel's legacy fallback runs.
+fn handle_access(pid: u32, path_ptr: usize, amode: u32) -> Message {
+    let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+    let raw = &pbuf[..plen];
+    if let Some(path) = tmpfs_path(raw) {
+        let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
+        let tmp = TMP_FILES.lock();
+        // Not a pool entry (e.g. "/tmp" itself, a ramfs dir): -38 so the
+        // kernel's stat-based fallback answers, exactly as before VFS_ACCESS
+        // existed. A genuinely missing file still ends up ENOENT there.
+        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-38) };
+        let owner = tmp_owner(&tmp[..], idx);
+        if amode == 0 { return ok_reply(); } // F_OK: existence only
+        let e = &tmp[owner];
+        let meta = tmp_meta(e);
+        let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+        let ok = xattr::access_check(&meta, euid, egid, acl,
+                                     amode & 4 != 0, amode & 2 != 0, amode & 1 != 0);
+        return if ok { ok_reply() } else { err_reply(-13) }; // EACCES
+    }
+    if let Some(port) = find_mount_port(raw) {
+        return xattr_proxy(port, VFS_ACCESS, path_ptr as u64, amode as u64, 0, 0, 0);
+    }
+    err_reply(-38) // ENOSYS — let the kernel's legacy access() fallback run
+}
+
+// ── fd forms (arg0 is an fd; rewritten to the mount-local file_id when proxied) ─
+//
+// Copy the vnode kind out under the FD_TABLES lock and drop it before touching
+// TMP_FILES — the fixed FD_TABLES → TMP_FILES ordering every other handler uses.
+
+fn handle_fsetxattr(pid: u32, fd: usize, name_ptr: usize,
+                    val_ptr: usize, size: usize, flags: u32) -> Message {
+    let kind = {
+        let mut tbls = FD_TABLES.lock();
+        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        tbl.fds[fd].kind
+    };
+    match kind {
+        VnodeKind::TmpFile { idx, .. } => {
+            let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
+            let mut tmp = TMP_FILES.lock();
+            let owner = tmp_owner(&tmp[..], idx);
+            tmp_setxattr_local(&mut tmp[owner], euid, egid, name_ptr, val_ptr, size, flags)
+        }
+        VnodeKind::MountedFile { port, file_id } =>
+            xattr_proxy(port, VFS_FSETXATTR, file_id as u64, name_ptr as u64,
+                        val_ptr as u64, size as u64, flags as u64),
+        _ => err_reply(-95),
+    }
+}
+
+fn handle_fgetxattr(pid: u32, fd: usize, name_ptr: usize, val_ptr: usize, size: usize) -> Message {
+    let kind = {
+        let mut tbls = FD_TABLES.lock();
+        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        tbl.fds[fd].kind
+    };
+    match kind {
+        VnodeKind::TmpFile { idx, .. } => {
+            let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
+            let tmp = TMP_FILES.lock();
+            let owner = tmp_owner(&tmp[..], idx);
+            tmp_getxattr_local(&tmp[owner], euid, egid, name_ptr, val_ptr, size)
+        }
+        VnodeKind::MountedFile { port, file_id } =>
+            xattr_proxy(port, VFS_FGETXATTR, file_id as u64, name_ptr as u64, val_ptr as u64, size as u64, 0),
+        _ => err_reply(-95),
+    }
+}
+
+fn handle_flistxattr(pid: u32, fd: usize, list_ptr: usize, size: usize) -> Message {
+    let kind = {
+        let mut tbls = FD_TABLES.lock();
+        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        tbl.fds[fd].kind
+    };
+    match kind {
+        VnodeKind::TmpFile { idx, .. } => {
+            let euid = sched::euid_of(pid);
+            let tmp = TMP_FILES.lock();
+            let owner = tmp_owner(&tmp[..], idx);
+            tmp_listxattr_local(&tmp[owner], euid, list_ptr, size)
+        }
+        VnodeKind::MountedFile { port, file_id } =>
+            xattr_proxy(port, VFS_FLISTXATTR, file_id as u64, list_ptr as u64, size as u64, 0, 0),
+        _ => err_reply(-95),
+    }
+}
+
+fn handle_fremovexattr(pid: u32, fd: usize, name_ptr: usize) -> Message {
+    let kind = {
+        let mut tbls = FD_TABLES.lock();
+        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        tbl.fds[fd].kind
+    };
+    match kind {
+        VnodeKind::TmpFile { idx, .. } => {
+            let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
+            let mut tmp = TMP_FILES.lock();
+            let owner = tmp_owner(&tmp[..], idx);
+            tmp_removexattr_local(&mut tmp[owner], euid, egid, name_ptr)
+        }
+        VnodeKind::MountedFile { port, file_id } =>
+            xattr_proxy(port, VFS_FREMOVEXATTR, file_id as u64, name_ptr as u64, 0, 0, 0),
+        _ => err_reply(-95),
+    }
 }
 
 // ── stat(2) support ──────────────────────────────────────────────────────────

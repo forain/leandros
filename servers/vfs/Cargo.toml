@@ -7,4 +7,5 @@ edition.workspace = true
 ipc        = { path = "../../ipc" }
 sched      = { path = "../../sched" }
 mm         = { path = "../../mm" }
+xattr      = { path = "../xattr" }
 spin.workspace = true

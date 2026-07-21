@@ -1174,13 +1174,18 @@ fn dispatch_inner(
         PIDFD_OPEN  => -38, // ENOSYS
 
         // ── Extended attributes ───────────────────────────────────────────────
-        // No mounted filesystem stores xattrs, so every file's list is empty.
-        // `ls -l` calls listxattr per entry (ACL `+` / xattr `@` markers);
-        // an empty list — not an error — is what keeps it quiet and correct.
-        LISTXATTR | LLISTXATTR | FLISTXATTR => 0,
-        GETXATTR | LGETXATTR | FGETXATTR => -61,    // ENODATA: no such attribute
-        SETXATTR | LSETXATTR | FSETXATTR
-            | REMOVEXATTR | LREMOVEXATTR | FREMOVEXATTR => -95, // EOPNOTSUPP
+        SETXATTR    => sys_setxattr(a0, a1, a2, a3, a4, false, false),
+        LSETXATTR   => sys_setxattr(a0, a1, a2, a3, a4, false, true),
+        FSETXATTR   => sys_setxattr(a0, a1, a2, a3, a4, true, false),
+        GETXATTR    => sys_getxattr(a0, a1, a2, a3, false, false),
+        LGETXATTR   => sys_getxattr(a0, a1, a2, a3, false, true),
+        FGETXATTR   => sys_getxattr(a0, a1, a2, a3, true, false),
+        LISTXATTR   => sys_listxattr(a0, a1, a2, false, false),
+        LLISTXATTR  => sys_listxattr(a0, a1, a2, false, true),
+        FLISTXATTR  => sys_listxattr(a0, a1, a2, true, false),
+        REMOVEXATTR  => sys_removexattr(a0, a1, false, false),
+        LREMOVEXATTR => sys_removexattr(a0, a1, false, true),
+        FREMOVEXATTR => sys_removexattr(a0, a1, true, false),
 
         // ── Credentials ───────────────────────────────────────────────────────
         GETUID  => sched::current_uid()  as isize,
@@ -4377,6 +4382,141 @@ fn sys_fchmodat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isi
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
+/// setxattr(path, name, value, size, flags) / lsetxattr / fsetxattr.
+///
+/// `target` is a path resolved via `resolve_user_path` for the non-fd forms,
+/// or (for fsetxattr) an already-open fd forwarded to the VFS verbatim, same
+/// as every other f-form syscall in this file. See VFS_SETXATTR /
+/// VFS_LSETXATTR / VFS_FSETXATTR in servers/vfs/src/lib.rs for the wire
+/// layout; size caps and errno values come from the shared `xattr` crate.
+fn sys_setxattr(
+    target: usize,
+    name: usize,
+    val: usize,
+    size: usize,
+    flags: usize,
+    is_fd: bool,
+    nofollow: bool,
+) -> isize {
+    if size > xattr::XATTR_SIZE_MAX { return -7; } // E2BIG
+
+    if !validate_user_buf(name, 1) { return -14; } // EFAULT
+    prefault_user(name, 256);
+
+    if size > 0 {
+        if !validate_user_buf(val, size) { return -14; }
+        prefault_user(val, size);
+    }
+
+    let pid = current_pid();
+    let kp;
+    let arg0 = if is_fd {
+        target as u64
+    } else {
+        kp = match resolve_user_path(target) { Ok(p) => p, Err(e) => return e };
+        kp.ptr() as u64
+    };
+    let tag = if is_fd {
+        vfs::VFS_FSETXATTR
+    } else if nofollow {
+        vfs::VFS_LSETXATTR
+    } else {
+        vfs::VFS_SETXATTR
+    };
+    let msg = make_vfs_msg(tag, &[arg0, name as u64, val as u64, size as u64, flags as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// getxattr(path, name, value, size) / lgetxattr / fgetxattr → value length or
+/// -errno. `size == 0` (with a null or garbage `val`) is a length query, so
+/// the value buffer is only validated/prefaulted when `size > 0`.
+fn sys_getxattr(
+    target: usize,
+    name: usize,
+    val: usize,
+    size: usize,
+    is_fd: bool,
+    nofollow: bool,
+) -> isize {
+    if !validate_user_buf(name, 1) { return -14; } // EFAULT
+    prefault_user(name, 256);
+
+    if size > 0 {
+        if !validate_user_buf(val, size) { return -14; }
+        prefault_user(val, size);
+    }
+
+    let pid = current_pid();
+    let kp;
+    let arg0 = if is_fd {
+        target as u64
+    } else {
+        kp = match resolve_user_path(target) { Ok(p) => p, Err(e) => return e };
+        kp.ptr() as u64
+    };
+    let tag = if is_fd {
+        vfs::VFS_FGETXATTR
+    } else if nofollow {
+        vfs::VFS_LGETXATTR
+    } else {
+        vfs::VFS_GETXATTR
+    };
+    let msg = make_vfs_msg(tag, &[arg0, name as u64, val as u64, size as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// listxattr(path, list, size) / llistxattr / flistxattr → total bytes of
+/// NUL-joined names or -errno. `size == 0` is a length query, same as
+/// getxattr above.
+fn sys_listxattr(target: usize, list: usize, size: usize, is_fd: bool, nofollow: bool) -> isize {
+    if size > 0 {
+        if !validate_user_buf(list, size) { return -14; } // EFAULT
+        prefault_user(list, size);
+    }
+
+    let pid = current_pid();
+    let kp;
+    let arg0 = if is_fd {
+        target as u64
+    } else {
+        kp = match resolve_user_path(target) { Ok(p) => p, Err(e) => return e };
+        kp.ptr() as u64
+    };
+    let tag = if is_fd {
+        vfs::VFS_FLISTXATTR
+    } else if nofollow {
+        vfs::VFS_LLISTXATTR
+    } else {
+        vfs::VFS_LISTXATTR
+    };
+    let msg = make_vfs_msg(tag, &[arg0, list as u64, size as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// removexattr(path, name) / lremovexattr / fremovexattr → 0 or -errno.
+fn sys_removexattr(target: usize, name: usize, is_fd: bool, nofollow: bool) -> isize {
+    if !validate_user_buf(name, 1) { return -14; } // EFAULT
+    prefault_user(name, 256);
+
+    let pid = current_pid();
+    let kp;
+    let arg0 = if is_fd {
+        target as u64
+    } else {
+        kp = match resolve_user_path(target) { Ok(p) => p, Err(e) => return e };
+        kp.ptr() as u64
+    };
+    let tag = if is_fd {
+        vfs::VFS_FREMOVEXATTR
+    } else if nofollow {
+        vfs::VFS_LREMOVEXATTR
+    } else {
+        vfs::VFS_REMOVEXATTR
+    };
+    let msg = make_vfs_msg(tag, &[arg0, name as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
 fn sys_fchown(fd: usize, uid: usize, gid: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_FCHOWN, &[fd as u64, uid as u64, gid as u64]);
@@ -4682,9 +4822,12 @@ fn sys_getresxid(r_ptr: usize, e_ptr: usize, s_ptr: usize, is_gid: bool) -> isiz
 /// binary did not exist. That is the real "command not found" for `cat` and
 /// `hello` alike, independent of the st_mode bug below.
 ///
-/// Route through VFS_STAT instead, which resolves RamFS, tmpfs, devices and
-/// mounted filesystems alike, then answer the R_OK/W_OK/X_OK question from
-/// the real mode bits.
+/// Route through VFS_ACCESS instead, which lets the owning filesystem answer
+/// via `xattr::access_check` so stored POSIX ACLs are honored, not just raw
+/// mode bits. A filesystem that doesn't implement it yet replies -ENOSYS, in
+/// which case fall back to the old VFS_STAT + mode-bit probe below (kept
+/// verbatim, F_OK short-circuit and RamFS/tmpfs fallback included) so nothing
+/// regresses for a mount that predates VFS_ACCESS.
 fn sys_faccessat(dirfd: usize, path_ptr: usize, mode: usize, _flags: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let path_ptr = path.ptr();
@@ -4695,6 +4838,13 @@ fn sys_faccessat(dirfd: usize, path_ptr: usize, mode: usize, _flags: usize) -> i
     const R_OK: usize = 4;
 
     let pid = current_pid();
+
+    let amsg = make_vfs_msg(vfs::VFS_ACCESS, &[path_ptr as u64, mode as u64]);
+    let ar = vfs_reply_val(&vfs::handle(&amsg, pid));
+    if ar != -38 { return ar; } // anything but ENOSYS is the real answer
+
+    // Legacy fallback: VFS_STAT then answer R_OK/W_OK/X_OK from the raw mode
+    // bits, for a filesystem that doesn't implement VFS_ACCESS yet.
     let mut stat_buf = [0u8; STAT_SIZE];
     let msg = make_vfs_msg(vfs::VFS_STAT, &[path_ptr as u64, stat_buf.as_mut_ptr() as u64]);
     if vfs_reply_val(&vfs::handle(&msg, pid)) < 0 {

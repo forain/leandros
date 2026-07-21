@@ -1,0 +1,11 @@
+[package]
+name = "xattr-util"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "xattr"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

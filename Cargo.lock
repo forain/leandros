@@ -166,6 +166,7 @@ dependencies = [
  "sched",
  "spin",
  "vfs-server",
+ "xattr",
 ]
 
 [[package]]
@@ -235,6 +236,7 @@ dependencies = [
  "usb",
  "vfs-server",
  "wifi",
+ "xattr",
 ]
 
 [[package]]
@@ -472,6 +474,7 @@ dependencies = [
  "mm",
  "sched",
  "spin",
+ "xattr",
 ]
 
 [[package]]
@@ -483,3 +486,7 @@ dependencies = [
  "leandros-lib",
  "spin",
 ]
+
+[[package]]
+name = "xattr"
+version = "0.1.0"
