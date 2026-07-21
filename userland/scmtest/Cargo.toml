@@ -1,0 +1,11 @@
+[package]
+name = "scmtest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "scmtest"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }
