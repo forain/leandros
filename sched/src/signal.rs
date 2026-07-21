@@ -305,30 +305,52 @@ pub fn restore_signal_frame(frame_ptr: usize) {
 pub fn sys_sigaction(signum: u32, act_ptr: usize, oldact_ptr: usize) -> isize {
     if signum == 0 || signum > 64 { return -22; }
     let pid = super::current_pid();
-    let mut rq = super::RUN_QUEUE.lock();
-    // Signal actions belong to the thread group — always read/write through leader.
-    let tgid = match rq.find_pid(pid) {
-        Some(t) => t.tgid,
-        None    => return -3,
+    let idx = (signum - 1) as usize;
+    let is_unblockable = UNBLOCKABLE & (1u64 << idx) != 0;
+
+    // Read the incoming action from user memory BEFORE taking RUN_QUEUE — a
+    // fault on act_ptr under the lock self-deadlocks the scheduler (see the
+    // detailed note in sys_sigprocmask). SIGKILL/SIGSTOP can't be installed, so
+    // their act is never dereferenced, matching the original "return EINVAL
+    // without reading act" behavior.
+    let new = if act_ptr != 0 && !is_unblockable {
+        Some(unsafe { core::ptr::read(act_ptr as *const crate::task::SigAction) })
+    } else {
+        None
     };
-    if let Some(leader) = rq.find_pid_mut(tgid) {
-        if oldact_ptr != 0 {
-            let old = leader.signal_actions[(signum - 1) as usize];
-            unsafe { core::ptr::write(oldact_ptr as *mut crate::task::SigAction, old); }
-        }
+
+    // Signal actions belong to the thread group — always read/write through leader.
+    let old;
+    let mut ret = 0isize;
+    {
+        let mut rq = super::RUN_QUEUE.lock();
+        let tgid = match rq.find_pid(pid) {
+            Some(t) => t.tgid,
+            None    => return -3,
+        };
+        let leader = match rq.find_pid_mut(tgid) {
+            Some(l) => l,
+            None    => return -3,
+        };
+        old = leader.signal_actions[idx];
         if act_ptr != 0 {
             // Installing a disposition for SIGKILL/SIGSTOP is EINVAL — they can
             // be neither caught nor ignored. Reported *after* `oldact` is
             // filled, matching Linux: querying the current (always SIG_DFL)
             // action is legal, only changing it is not.
-            if UNBLOCKABLE & (1u64 << (signum - 1)) != 0 { return -22; }
-            let new = unsafe { core::ptr::read(act_ptr as *const crate::task::SigAction) };
-            leader.signal_actions[(signum - 1) as usize] = new;
+            if is_unblockable {
+                ret = -22;
+            } else if let Some(new) = new {
+                leader.signal_actions[idx] = new;
+            }
         }
-        0
-    } else {
-        -3
     }
+    // oldact is written outside the lock (fault-safe) and reports the pre-call
+    // action even on EINVAL, preserving the original ordering.
+    if oldact_ptr != 0 {
+        unsafe { core::ptr::write(oldact_ptr as *mut crate::task::SigAction, old); }
+    }
+    ret
 }
 
 pub fn sys_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
@@ -337,28 +359,50 @@ pub fn sys_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
     const SIG_SETMASK: usize = 2;
 
     let pid = super::current_pid();
-    let mut rq = super::RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        if oldset_ptr != 0 {
-            unsafe { core::ptr::write(oldset_ptr as *mut u64, t.signal_mask); }
-        }
-        if set_ptr != 0 {
+
+    // Touch user memory OUTSIDE the RUN_QUEUE lock. A page fault on set_ptr or
+    // oldset_ptr re-enters the scheduler via handle_page_fault ->
+    // lock_leader_address_space, which re-acquires RUN_QUEUE. Dereferencing a
+    // user pointer while already holding RUN_QUEUE therefore self-deadlocks the
+    // faulting CPU, and every other CPU that then needs the run queue piles up
+    // behind it with interrupts masked — the whole machine (and the global
+    // timer tick) freezes. tokio's multi-thread runtime bootstrap hit this
+    // reliably on x86-64: its signal-driver setup calls rt_sigprocmask with a
+    // mask pointer whose page wasn't yet resident, faulting under the lock.
+    let set = if set_ptr != 0 {
+        Some(unsafe { core::ptr::read(set_ptr as *const u64) })
+    } else {
+        None
+    };
+
+    let old_mask;
+    let mut ret = 0isize;
+    {
+        let mut rq = super::RUN_QUEUE.lock();
+        let t = match rq.find_pid_mut(pid) {
+            Some(t) => t,
+            None    => return -3, // ESRCH
+        };
+        old_mask = t.signal_mask;
+        if let Some(set) = set {
             // Silently drop SIGKILL/SIGSTOP from anything that would *add* to
             // the blocked set, exactly as Linux's `sigprocmask` does — the call
             // still succeeds, those two bits just never take. Unblocking needs
             // no filtering: clearing a bit that can never be set is a no-op.
-            let set = unsafe { core::ptr::read(set_ptr as *const u64) };
             match how {
                 SIG_BLOCK   => t.signal_mask |= set & !UNBLOCKABLE,
                 SIG_UNBLOCK => t.signal_mask &= !set,
                 SIG_SETMASK => t.signal_mask = set & !UNBLOCKABLE,
-                _           => return -22, // EINVAL
+                _           => ret = -22, // EINVAL — mask left unchanged
             }
         }
-        0
-    } else {
-        -3 // ESRCH
     }
+    // oldset is reported with the pre-call mask even on EINVAL, matching the
+    // original ordering (Linux fills oldset before validating `how`).
+    if oldset_ptr != 0 {
+        unsafe { core::ptr::write(oldset_ptr as *mut u64, old_mask); }
+    }
+    ret
 }
 
 /// sys_sigaltstack(ss, oss) — set/get the calling thread's alternate signal
