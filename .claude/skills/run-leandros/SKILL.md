@@ -244,9 +244,23 @@ Build time: ~3–5 minutes clean, ~30s incremental.
   cursor-movement sequences. `driver.py` strips these with `_strip_ansi()` so monitor
   responses are readable.
 
-- **`-device virtio-keyboard-pci` omitted** — The keyboard device caused QEMU 10.x
-  to silently hang on this machine; removed from the driver command. The shell is
-  driven entirely through the serial socket so the keyboard is not needed.
+- **`-device virtio-keyboard-pci` is now a default device (both arches)** — It used
+  to be omitted because it silently hung QEMU on this machine. That was NOT a QEMU
+  bug: it was the same non-volatile-MMIO driver bug fixed in `virtio_gpu.rs` on
+  2026-07-15, present a third time in `drivers/src/virtio_keyboard.rs`'s
+  `init_device()`/`setup_queue()` (the identical wide-store trigger, which QEMU's HVF
+  backend can't decode). With that fixed, the device boots cleanly and delivers real
+  input. Verified 2026-07-21 end-to-end: booted aarch64 (HVF) with the keyboard
+  present (`[KBD] Found VirtIO Input device` / `initialized`), ran
+  `mame captcomm -rompath /` to its "Press any key to continue" info screen, and
+  injected keys via the QEMU monitor (`sendkey ret`/`5`/`1` over the monitor socket —
+  `sendkey` routes through the attached virtio-keyboard as genuine guest input
+  events). MAME advanced past the info screen, registered a coin (CREDIT 1), and
+  reached the PLAYER SELECT screen — i.e. QEMU → virtio-keyboard → LeandrOS evdev
+  input stack → MAME OSD input layer works, distinct keys included. The shell is
+  still driven through the serial socket; the keyboard is what real interactive
+  apps (MAME, doom) consume. To inject a key headlessly: send `sendkey <qcode>` to
+  the monitor socket (e.g. via `driver._monitor_send('sendkey ret')`).
 
 - **x86_64 requires no pflash vars file** — unlike AArch64 which needs `aarch64_vars.fd`
   for UEFI variable storage, x86_64 OVMF works with a single `OVMF_CODE.fd` image.
