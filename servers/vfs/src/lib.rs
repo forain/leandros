@@ -2462,10 +2462,26 @@ fn handle_close(pid: u32, fd: usize) -> Message {
             let _ = call_port(port, close_msg);
         }
         VnodeKind::MountedFile { port, file_id } => {
-            let mut proxy = Message::empty();
-            proxy.tag = VFS_CLOSE;
-            proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
-            let _ = call_port(port, proxy);
+            // A dup'd fd shares this (port, file_id), so the mount server's
+            // open-file slot must survive until the *last* of them is closed.
+            // The just-closed fd was already cleared above, so this scan sees
+            // only the survivors. Without it, closing a dup — e.g. the throwaway
+            // fd `fdopendir` makes to run one `readdir` — freed the slot out from
+            // under the original, and the next fstat/unlink on it came back
+            // EBADF. That is what broke `rm -r`, `du` and every fts-style walk.
+            let still_referenced = {
+                let tbls = FD_TABLES.lock();
+                tbls.iter().any(|t| t.in_use && t.fds.iter().any(|f| {
+                    f.in_use && matches!(f.kind,
+                        VnodeKind::MountedFile { port: p, file_id: i } if p == port && i == file_id)
+                }))
+            };
+            if !still_referenced {
+                let mut proxy = Message::empty();
+                proxy.tag = VFS_CLOSE;
+                proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+                let _ = call_port(port, proxy);
+            }
         }
         VnodeKind::TmpFile { idx, .. } => tmp_release_ephemeral(idx),
         _ => {}
@@ -4625,6 +4641,20 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         tbl.fds[fd].kind
     };
 
+    // A mounted file's real type, size and owner live in the mount server's
+    // inode — only it can tell a directory fd from a regular-file fd. Proxy the
+    // whole stat there. The shared tail below cannot serve this: it hardcoded
+    // S_IFREG, so `fstat` on a directory fd read as a regular file, which is
+    // exactly what made musl `fdopendir` (issued before every `readdir`) return
+    // ENOTDIR and broke fd-based traversal — `rm -r`, `du`, GNU fts.
+    if let VnodeKind::MountedFile { port, file_id } = kind {
+        let mut proxy = Message::empty();
+        proxy.tag = VFS_FSTAT;
+        proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+        proxy.data[8..16].copy_from_slice(&(stat_ptr as u64).to_le_bytes());
+        return call_port(port, proxy);
+    }
+
     // (mode, size, ino)
     let (mode, size, ino): (u32, u64, u64) = match kind {
         VnodeKind::Pipe { ring, .. } => {
@@ -4655,14 +4685,9 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         }
         // eventfd/timerfd are anon-inode files on Linux and report S_IFREG.
         VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. } => (S_IFREG | 0o600, 0, 0),
-        VnodeKind::MountedFile { .. } => {
-            // Size via seek-to-end-and-back, exactly as the kernel used to do.
-            let cur = reply_val(&handle_lseek(pid, fd, 0, 1 /* SEEK_CUR */));
-            if cur < 0 { return err_reply(-9); }
-            let end = reply_val(&handle_lseek(pid, fd, 0, 2 /* SEEK_END */));
-            let _ = handle_lseek(pid, fd, cur, 0 /* SEEK_SET */);
-            (S_IFREG | 0o644, if end >= 0 { end as u64 } else { 0 }, 0)
-        }
+        // Handled by the early return above (proxied to the owning mount);
+        // this arm exists only for match exhaustiveness.
+        VnodeKind::MountedFile { .. } => return err_reply(-9),
         VnodeKind::None => return err_reply(-9),
     };
 

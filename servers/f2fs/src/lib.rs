@@ -34,6 +34,7 @@ const VFS_RMDIR:      u64 = 0x29;
 const VFS_STATFS:     u64 = 0x33;
 const VFS_SYMLINK:    u64 = 0x35;
 const VFS_FD_PATH:    u64 = 0x23;
+const VFS_FSTAT:      u64 = 0x31;
 const VFS_READLINK:   u64 = 0x36;
 const VFS_LINK:       u64 = 0x37;
 const VFS_LSTAT:      u64 = 0x38;
@@ -1946,6 +1947,29 @@ fn handle_stat(ms: &mut MountState, path_ptr: u64, stat_ptr: u64) -> Message {
     stat_common(ms, path_ptr, stat_ptr, true)
 }
 
+/// `VFS_FSTAT(file_id, stat_ptr)` — stat an open fd by its slot rather than by
+/// path. The VFS cannot answer this itself for a mounted file: only the inode
+/// records the real type, size and owner. Without it the VFS reported every
+/// mounted fd as a plain `S_IFREG`, so `fstat` on a *directory* fd — which
+/// musl's `fdopendir` issues before every `readdir` — came back "regular file"
+/// and every fd-based directory walk (`rm -r`, `du`, GNU fts) got ENOTDIR on a
+/// real directory. Fills the buffer exactly like `stat_common`, only starting
+/// from the fd's recorded inode instead of a resolved path.
+fn handle_fstat(ms: &mut MountState, file_id: u64, stat_ptr: u64) -> Message {
+    let slot = file_id as usize;
+    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
+    let ino = ms.open_files[slot].inode;
+    let iblkaddr = nat_lookup(ms, ino);
+    let iblk = ms.cache.read(ms.dev, iblkaddr as u64);
+    let mode  = inode_mode(iblk) as u32;
+    let size  = inode_size(iblk);
+    let links = inode_links(iblk);
+    let uid   = inode_uid(iblk);
+    let gid   = inode_gid(iblk);
+    vfs_server::write_stat_full(stat_ptr as usize, mode, links as u64, size, ino as u64, uid, gid);
+    ok_reply()
+}
+
 /// lstat(2) — final component NOT followed, so a symlink reports S_IFLNK and
 /// the byte length of its target as st_size (which is what `ls -l` prints).
 fn handle_lstat(ms: &mut MountState, path_ptr: u64, stat_ptr: u64) -> Message {
@@ -2679,6 +2703,7 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
         VFS_CLOSE      => handle_close(ms, arg(msg,0)),
         VFS_LSEEK      => handle_lseek(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_STAT       => handle_stat(ms, arg(msg,0), arg(msg,1)),
+        VFS_FSTAT      => handle_fstat(ms, arg(msg,0), arg(msg,1)),
         VFS_GETDENTS64 => handle_getdents(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_MKDIR      => handle_mkdir(ms, arg(msg,0), arg(msg,1), euid, egid),
         VFS_UNLINK     => handle_unlink(ms, arg(msg,0)),
