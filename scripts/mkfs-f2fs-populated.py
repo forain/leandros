@@ -361,6 +361,9 @@ def main():
     # Double the segment count beyond what's needed for the pre-populated content
     # so the image ships with roughly 50% free space — tests (f2fstest et al.)
     # write new files at runtime and would otherwise exhaust a snugly-sized image.
+    # (Measured 2026-07-21: 2x gives ~51-52% free on both arches even after the
+    # coreutils/brush/xattr userland growth — the margin scales with content, so
+    # this constant should not need revisiting as the userland grows.)
     segs = (required_blocks + 511) // 512
     total_segs = max(32, segs * 2)
     total_blocks = total_segs * BLOCKS_PER_SEG

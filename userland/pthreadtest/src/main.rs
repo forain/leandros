@@ -44,6 +44,7 @@ extern "C" {
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     pub fn exit(status: i32) -> !;
+    pub fn usleep(usec: u32) -> i32;
 
     pub fn pthread_create(
         thread: *mut pthread_t,
@@ -124,7 +125,22 @@ core::arch::global_asm!(
 );
 
 #[no_mangle]
-pub unsafe extern "C" fn pthread_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn pthread_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    // Mode `pthreadtest exitkill`: regression coverage for "plain libc exit()
+    // must kill sibling threads". A sibling parks in a long sleep; the main
+    // thread calls libc exit(3). Correct (exit_group) semantics tear the whole
+    // process down with status 3 before the sibling wakes, so its forbidden
+    // marker never prints. If exit() only reaped the calling thread, the
+    // sibling would wake and print SIBLING_ALIVE_AFTER_EXIT, and the process
+    // would exit 0 (the sibling's own return) instead of 3.
+    if argc >= 2 && arg_eq(argv, 1, b"exitkill") {
+        run_exit_kills_siblings();
+        // Reached only if exit(3) failed to terminate the process.
+        let msg = b"EXITKILL: FAIL (exit returned)\n";
+        write(1, msg.as_ptr(), msg.len());
+        return 1;
+    }
+
     let mut failures = 0;
 
     if !test_pthread_create_join() { failures += 1; }
@@ -330,4 +346,60 @@ unsafe fn report(name: &[u8], passed: bool) -> bool {
         write(1, b": FAIL\n".as_ptr(), 7);
     }
     passed
+}
+
+// ── exit()-kills-siblings regression (mode: `pthreadtest exitkill`) ──────────
+
+/// True if `argv[idx]` is exactly the NUL-terminated string `want` (no NUL).
+unsafe fn arg_eq(argv: *mut *mut u8, idx: isize, want: &[u8]) -> bool {
+    let p = *argv.offset(idx);
+    if p.is_null() {
+        return false;
+    }
+    let mut i = 0usize;
+    loop {
+        let c = *p.add(i);
+        if i == want.len() {
+            return c == 0; // matched all of `want`; arg must end here
+        }
+        if c == 0 || c != want[i] {
+            return false;
+        }
+        i += 1;
+    }
+}
+
+/// Sibling thread: park past the moment the main thread calls `exit(3)`. If the
+/// libc `exit()` reaped only its own thread (the bug), this wakes and prints the
+/// forbidden marker; correct exit_group semantics kill it first, so the line
+/// must never appear on the console. `write(2)` is used deliberately (not
+/// buffered stdio) so a genuine survival cannot be hidden in an unflushed
+/// buffer and produce a false PASS.
+extern "C" fn exitkill_sibling(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        usleep(500_000);
+        let msg = b"EXITKILL: SIBLING_ALIVE_AFTER_EXIT\n";
+        write(1, msg.as_ptr(), msg.len());
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn run_exit_kills_siblings() {
+    let mut t: pthread_t = core::ptr::null_mut();
+    let r = pthread_create(&mut t, core::ptr::null(), exitkill_sibling, core::ptr::null_mut());
+    if r != 0 {
+        let msg = b"EXITKILL: FAIL (pthread_create)\n";
+        write(1, msg.as_ptr(), msg.len());
+        return;
+    }
+
+    // Give the sibling time to reach its usleep park before we exit. Absolute
+    // timing does not matter: the sibling is a live thread-group member the
+    // instant pthread_create returns, so exit_group reaps it whether it has
+    // parked, is still starting, or has not yet been scheduled.
+    usleep(100_000);
+
+    let msg = b"EXITKILL: main calling exit(3)\n";
+    write(1, msg.as_ptr(), msg.len());
+    exit(3);
 }
