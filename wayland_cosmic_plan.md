@@ -208,7 +208,31 @@ SO_PEERSEC, cgroups).
 **M0 — Spikes (parallel, ≤1 day each; kill the unknowns first)**
 - S1: static-musl hello + tokio echo server on LeandrOS (proves std/tokio surface;
   eventfd/timerfd expected green — confirm under load).
-  **HOST-BUILD DONE 2026-07-21; on-target run pending.** All 4 binaries (hello-std,
+  **ON-TARGET RUN DONE 2026-07-21 — aarch64 fully green, x86_64 has a
+  tokio-bootstrap hang.** aarch64: hello-std all OK (PROC_SELF_EXE quirk: returns
+  "/bin/init"); tokio-echo-selftest SUMMARY pass=3 fail=0 skip=1 — multi-thread
+  runtime (2 workers), 400 UDS echoes across 4 concurrent clients, timers
+  accurate, mpsc fan-in; TCP SKIP: loopback bind() → EINVAL (real gap, low
+  priority — Wayland/D-Bus need only UDS). x86_64: hello-std identical clean
+  pass, but tokio-echo-selftest prints START then hangs BEFORE "RUNTIME: OK" —
+  QEMU pegged ~307% CPU, no panic/fault on serial, Ctrl-C dead (PID 1 I/O stuck
+  behind it).
+  **RESOLVED (commit 82d0cc3): re-entrant RUN_QUEUE spinlock deadlock** —
+  `sys_sigprocmask`/`sys_sigaction` (`sched/src/signal.rs:340/:308`) dereferenced
+  user pointers while holding RUN_QUEUE; a demand-paging fault on the mask page
+  re-entered the scheduler lock (page_fault → handle_page_fault →
+  lock_leader_address_space), freezing all 4 vCPUs IF=0. Latent SMP bug, not arch
+  logic — aarch64 just happened to have the page resident; tokio's signal-driver
+  setup was merely the first workload to hit the window. Fix: user reads before
+  lock, user writes after release. Verified: tokio selftest pass=3 skip=1 on BOTH
+  arches + sigtest/polltest/vfstest/waittest baselines green.
+  **K1 guardrail derived from this:** never touch user memory under RUN_QUEUE or
+  any IRQ-off spinlock — use the fault-safe validate_user_buf/read_user_buf/
+  write_user_buf paths; grep-gate new syscalls for raw `core::ptr::read/write` on
+  user pointers under locks. Known same-shape hazard to keep clean: epoll_wait
+  holds EPOLL_INSTANCES.lock() across probe_fd_events_seq → vfs/net handlers
+  (`kernel/src/syscall.rs:5887`) — safe today, but K1 leans on it hard.
+  **HOST-BUILD DONE 2026-07-21.** All 4 binaries (hello-std,
   tokio-echo-selftest × both arches) built static ET_EXEC, zero DT_NEEDED/PT_INTERP,
   with rust-lld + rustc self-contained musl CRT alone (no zig/docker/cross-gcc);
   needs `cargo +nightly` (stable lacks musl std here) and **`-C
@@ -225,11 +249,56 @@ SO_PEERSEC, cgroups).
   won't run.
 - S2: SCM_RIGHTS + shared-memfd two-process pixel test (spec for K1; will fail
   today — it's the acceptance test).
+  **DONE 2026-07-21 — test committed (`userland/scmtest`, commit 558310b), all 4
+  subtests FAIL identically on both arches, as designed.** Symptoms: recvmsg
+  returns data but `msg_controllen` untouched / control buffer zeroed (cmsgs
+  dropped both directions — `servers/net/src/lib.rs:1232` reads only
+  iov fields at msghdr offsets 16/24, never 32/40/48); MSG_CTRUNC never set
+  (`msg_flags` never written); memfd pixel test blocked behind fd-pass, parent
+  mapping confirms MAP_SHARED never aliased; F_ADD_SEALS/F_GET_SEALS fake-succeed
+  via VFS fcntl catch-all (`servers/vfs/src/lib.rs:3161`) and post-"seal"
+  ftruncate succeeds. Plain sendmsg/recvmsg data transfer + socketpair +
+  memfd_create + ftruncate plumbing all work — gaps are cleanly scoped. K1 is
+  done when scmtest goes 4/4 PASS both arches with no test changes. (Test nit for
+  later: parent/child printf interleaves byte-wise on shared console — rendezvous
+  before printing if it gets annoying.)
 - S3: Mesa meson cross-compile probe for musl (does kms_swrast+softpipe configure?
   where does dlopen bite?).
+  **DONE 2026-07-21 — verdict: YES, fully builds.** Mesa 25.3.6 + libdrm 2.4.134
+  cross-compile configure→compile→link→install to x86_64-musl on macOS via
+  `zig cc -target x86_64-linux-musl` (zig 0.16.0), surfaceless+drm platforms,
+  softpipe (no `swrast`/`kms_swrast` gallium option anymore — kms_swrast is winsys
+  inside the megadriver). ZERO musl-vs-glibc source issues; 3 host-side fixes only
+  (pip mako/packaging/pyyaml + PYTHONPATH for ninja; brew bison ≥3; zig-cc wrapper
+  merging `-Wl,--version-script <file>` into `=` form — this one will recur).
+  Workdir + reproducible scripts + NOTES.md:
+  `~/.claude-forain/jobs/afde2e74/tmp/s3-mesa-probe/`.
+  Remaining delta: `-Dplatforms=wayland` needs host wayland-scanner + cross
+  libwayland(+libffi) — moderate, scoped, not attempted.
+  **dlopen reality check (≥24.1 architecture):** no per-driver `*_dri.so` —
+  softpipe/kms_swrast live in `libgallium-25.3.6.so` linked as hard DT_NEEDED;
+  the ONLY runtime dlopen is libgbm → `/usr/lib/gbm/dri_gbm.so`
+  (GBM_BACKENDS_PATH). Runtime ship set: libEGL.so.1, libGLESv2.so.2, libgbm.so.1,
+  dri_gbm.so, libgallium, libdrm.so.2, libexpat.so.1, libz.so.1 — and every one
+  NEEDs musl `libc.so`, i.e. the GL stack rides on ld-musl (D1), not relibc.
+  Build strategy: keep building C deps on macOS/zig; stand up an Alpine container
+  (colima/Docker) later as integration/runtime-test box when assembling the full
+  library stack.
 - S4: dynamic musl binary + trivial dlopen under a hand-loaded ld.so → confirms D1
   primary vs fallback.
 - S5: busd + zbus client roundtrip on Linux-musl (host), then on LeandrOS after K1.
+  **BUILD PROBE DONE 2026-07-21 — builds clean + static on both arches, no
+  blockers.** busd 0.5.0 (commit c6f2e91, zbus 5.14.0 git-pinned fork), 100% pure
+  Rust (rustix linux_raw backend — no C toolchain at all), S1 toolchain recipe
+  verbatim, ET_EXEC/0 DT_NEEDED verified. Minimal broker slice already the
+  default (zbus features tokio+bus-impl). CLI: `-a unix:path=...`,
+  `--print-address`, `--ready-fd`; default address `unix:dir=$XDG_RUNTIME_DIR`.
+  Two integration scope-adds: (1) busd unconditionally reads
+  `/usr/share/dbus-1/session.conf` before honoring `-a` — ship a minimal
+  `<busconfig>` on the image (or `--config`); (2) confirmed no dbus-run-session
+  equivalent in-repo → write our own launcher (spawn busd, await
+  --ready-fd/--print-address, export DBUS_SESSION_BUS_ADDRESS, exec child).
+  Runtime zbus roundtrip deferred until a Linux container or post-K1 LeandrOS.
 - S6: brush runs start-cosmic's bashisms.
   **DONE 2026-07-21 — verdict: YES, no gaps.** brush (0.4.0, local-patched tree,
   built as-is) parses (`-n`) and executes `cosmic-session/data/start-cosmic` (115
@@ -255,6 +324,16 @@ SO_PEERSEC, cgroups).
   nested server — verify Mesa swrast advertises it or that the panel tolerates
   its absence (applets that post wl_shm import via ImportMem regardless).
 - Exit: D1/D4 decided; K1 acceptance tests written.
+  **M0 STATUS 2026-07-21: exit criteria met.** D1 confirmed (static musl proven
+  end-to-end on both arches incl. multi-thread tokio; dynamic-path prerequisites
+  precisely scoped — ET_DYN bias + relocs land in K3, S4's runtime portion is
+  blocked on K3 by design). D4 confirmed (busd builds static both arches; scope
+  adds: session.conf + dbus-run-session launcher). K1 acceptance test committed
+  (scmtest, 558310b). Bonus outcomes: Mesa cross-build fully working (ports/mesa/),
+  SMP user-mem-under-spinlock kernel deadlock found + fixed (82d0cc3).
+  Remaining M0 tails: S4 runtime (after K3), S5 zbus roundtrip (Linux container
+  or post-K1). Next: kernel wave K1 (SCM_RIGHTS, shared VMO, AF_UNIX/epoll
+  scale), Mesa track continues with wayland-platform delta + aarch64 build.
 
 **M1 — Wayland transport lights up** (K1 + K2)
 - Exit: S2 passes; a pure-Rust Smithay headless server + wl_shm client exchange a
@@ -298,7 +377,7 @@ transport track — it gates nothing until M4 but is the schedule's long pole.
 
 | Risk | Impact | Mitigation / fallback |
 |---|---|---|
-| **Mesa port** (musl cross, dlopen coupling, DRM assumptions) | Gates M3+; no alternative exists (comp aborts without GLES2) | softpipe-first; S3 probe in M0; pre-map every ioctl Mesa issues against our node; static-megadriver fallback |
+| **Mesa port** (musl cross, dlopen coupling, DRM assumptions) | Gates M3+; no alternative exists (comp aborts without GLES2) | S3 RESOLVED far better than feared: full cross-build works on macOS/zig, zero musl source issues, dlopen surface shrank to libgbm→dri_gbm.so only (megadriver is DT_NEEDED in ≥24.1). Residual risk moves to runtime: ld-musl loader (K3) + our DRM node honoring Mesa's ioctls (K4) |
 | **Shared-VMO mm change** (blocker 2) | Deepest kernel change; everything above wl_shm depends on it | Scope to tmpfs/memfd only; S2 acceptance test gates M1; reuse shared-anon machinery keyed on file object |
 | **Dynamic linker bring-up** | Gates comp/panel/Mesa at runtime | Fallback: static + dlopen-self shim; decide at S4, don't drift |
 | **cosmic-panel client EGL** (fatal-at-spawn component) | Could force early dmabuf work | S7 RESOLVED negative: panel is a nested compositor, client EGL unavoidable → Mesa swrast-over-wl_shm Wayland platform is the committed path; dmabuf only if that fails; check `EGL_WL_bind_wayland_display` on swrast |
