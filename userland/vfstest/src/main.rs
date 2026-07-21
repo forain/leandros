@@ -172,6 +172,19 @@ fn mkpath<'a>(buf: &'a mut [u8; 96], root: &[u8], suffix: &[u8]) -> *const u8 {
     buf.as_ptr()
 }
 
+/// Build the *basename* of `root` concatenated with `suffix`: the relative
+/// symlink body that names the same file `mkpath(root, suffix)` names as an
+/// absolute path (both hang off the same parent directory). For root
+/// "/tmp/xa" and suffix "_symtarget" this is "xa_symtarget".
+fn rel_basename<'a>(buf: &'a mut [u8; 96], root: &[u8], suffix: &[u8]) -> *const u8 {
+    let start = root.iter().rposition(|&b| b == b'/').map(|p| p + 1).unwrap_or(0);
+    let mut i = 0;
+    for &b in &root[start..] { buf[i] = b; i += 1; }
+    for &b in suffix { buf[i] = b; i += 1; }
+    buf[i] = 0;
+    buf.as_ptr()
+}
+
 /// Whether NUL-separated `buf[..len]` (as returned by listxattr) contains
 /// `name` as one of its entries — order-insensitive.
 fn contains_name(buf: &[u8], len: usize, name: &[u8]) -> bool {
@@ -359,12 +372,20 @@ unsafe fn test_xattr_symlink(root: &[u8], name: &[u8], relative_link: bool) -> b
     let mut lb = [0u8; 96];
     let link = mkpath(&mut lb, root, b"_symlink");
 
+    // Idempotent: this runs once per (backend, body-form), so clear any link or
+    // target a prior form left behind or the second symlink() would EEXIST.
+    unlink(link);
+    unlink(target);
+
     let fd = open(target, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
     if fd < 0 { return report(name, false); }
     close(fd);
 
-    let link_target: *const u8 =
-        if relative_link { b"xa_symtarget\0".as_ptr() } else { target };
+    // The relative body is the target's basename (both share the parent dir),
+    // which for these roots is "<root-basename>_symtarget".
+    let mut rb = [0u8; 96];
+    let rel_body = rel_basename(&mut rb, root, b"_symtarget");
+    let link_target: *const u8 = if relative_link { rel_body } else { target };
     if raw_symlink(link_target, link) != 0 { return report(name, false); }
 
     if raw_lsetxattr(link, b"user.a\0".as_ptr(), b"x".as_ptr(), 1, 0) != -1 || get_errno() != EPERM {
@@ -386,6 +407,81 @@ unsafe fn test_xattr_symlink(root: &[u8], name: &[u8], relative_link: bool) -> b
     let mut lbuf = [0u8; 16];
     let llen = raw_llistxattr(link, lbuf.as_mut_ptr(), lbuf.len());
     report(name, llen == 0)
+}
+
+/// Create `link -> body`, open it *following* the link, and check the bytes
+/// read back equal `want`. The caller owns cleanup of `link`.
+///
+/// The read-back is the load-bearing assertion: a symlink that misresolves to
+/// a wrong-but-existing empty node opens fine and returns 0 bytes at rc 0 — a
+/// silent success. Comparing content, not just the open result, catches it.
+unsafe fn symlink_reads_back(body: *const u8, link: *const u8, want: &[u8]) -> bool {
+    if raw_symlink(body, link) != 0 { return false; }
+    let fd = open(link, O_RDONLY, 0);
+    if fd < 0 { return false; }
+    let mut buf = [0u8; 64];
+    let n = read(fd, buf.as_mut_ptr(), buf.len());
+    close(fd);
+    n == want.len() as isize && &buf[..want.len()] == want
+}
+
+/// A symlink must resolve to its target in BOTH body forms, and reading through
+/// it must return the target's bytes:
+///   * relative body — resolved against the link's own directory;
+///   * absolute body — resolved from the process root, back through the mount
+///     point (the f2fs case `ln -s /data/x l` inside /data that used to ENOENT).
+/// Runs on whichever backend `root` names; reports the two forms separately.
+unsafe fn test_symlink_read(root: &[u8], rel_name: &[u8], abs_name: &[u8]) -> bool {
+    let mut tb = [0u8; 96];
+    let target = mkpath(&mut tb, root, b"_rtgt");
+    let mut lb = [0u8; 96];
+    let link = mkpath(&mut lb, root, b"_rlink");
+    let mut rb = [0u8; 96];
+    let rel_body = rel_basename(&mut rb, root, b"_rtgt");
+
+    unlink(link);
+    unlink(target);
+
+    let want = b"symlink-ok\n";
+    let fd = open(target, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    let w = if fd < 0 { -1 } else { let r = write(fd, want.as_ptr(), want.len()); close(fd); r };
+    if w != want.len() as isize {
+        let a = report(rel_name, false);
+        let b = report(abs_name, false);
+        return a && b;
+    }
+
+    let rel_ok = symlink_reads_back(rel_body, link, want);
+    unlink(link);
+    let abs_ok = symlink_reads_back(target, link, want);
+    unlink(link);
+    unlink(target);
+
+    let a = report(rel_name, rel_ok);
+    let b = report(abs_name, abs_ok);
+    a && b
+}
+
+/// A tmpfs symlink whose absolute body names a path on another mount (f2fs at
+/// /data) resolves across the boundary — the VFS re-dispatches the resolved
+/// path. LIMITATION: the reverse is unsupported. An f2fs symlink out to /tmp
+/// resolves within the f2fs volume (its body does not strip to the volume) and
+/// so ENOENTs; f2fs has no re-dispatch hook, so it is deliberately not tested.
+unsafe fn test_symlink_cross_mount(name: &[u8]) -> bool {
+    let target = b"/data/xsl_xtgt\0".as_ptr();
+    let link   = b"/tmp/xsl_xlink\0".as_ptr();
+    unlink(link);
+    unlink(target);
+
+    let want = b"cross-mount\n";
+    let fd = open(target, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    let w = if fd < 0 { -1 } else { let r = write(fd, want.as_ptr(), want.len()); close(fd); r };
+    if w != want.len() as isize { return report(name, false); }
+
+    let ok = symlink_reads_back(target, link, want);
+    unlink(link);
+    unlink(target);
+    report(name, ok)
 }
 
 /// (7) fsetxattr/fgetxattr/flistxattr/fremovexattr all operate on an
@@ -573,8 +669,12 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_xattr_create_replace(b"/data/xa", b"xattr_create_replace_f2fs\0") { failures += 1; }
     if !test_xattr_remove(b"/tmp/xa", b"xattr_remove_tmpfs\0") { failures += 1; }
     if !test_xattr_remove(b"/data/xa", b"xattr_remove_f2fs\0") { failures += 1; }
-    if !test_xattr_symlink(b"/tmp/xa", b"xattr_symlink_tmpfs\0", false) { failures += 1; }
-    if !test_xattr_symlink(b"/data/xa", b"xattr_symlink_f2fs\0", true) { failures += 1; }
+    // Both symlink body forms on both backends (previously only each backend's
+    // then-working form: absolute on tmpfs, relative on f2fs).
+    if !test_xattr_symlink(b"/tmp/xa", b"xattr_symlink_tmpfs_abs\0", false) { failures += 1; }
+    if !test_xattr_symlink(b"/tmp/xa", b"xattr_symlink_tmpfs_rel\0", true) { failures += 1; }
+    if !test_xattr_symlink(b"/data/xa", b"xattr_symlink_f2fs_abs\0", false) { failures += 1; }
+    if !test_xattr_symlink(b"/data/xa", b"xattr_symlink_f2fs_rel\0", true) { failures += 1; }
     if !test_xattr_fd(b"/tmp/xa", b"xattr_fd_tmpfs\0") { failures += 1; }
     if !test_xattr_fd(b"/data/xa", b"xattr_fd_f2fs\0") { failures += 1; }
     if !test_xattr_acl_basic(b"/tmp/xa", b"xattr_acl_basic_tmpfs\0") { failures += 1; }
@@ -583,6 +683,14 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_xattr_acl_enforcement(b"/data/xa", b"xattr_acl_enforcement_f2fs\0") { failures += 1; }
     if !test_xattr_acl_malformed_trivial(b"/tmp/xa", b"xattr_acl_malformed_trivial_tmpfs\0") { failures += 1; }
     if !test_xattr_acl_malformed_trivial(b"/data/xa", b"xattr_acl_malformed_trivial_f2fs\0") { failures += 1; }
+
+    // Symlink target resolution: both body forms on both backends, verified by
+    // reading the target's bytes through the link (a silent-empty misresolve
+    // would pass an open-only check but fail this one), plus a tmpfs->f2fs
+    // cross-mount body.
+    if !test_symlink_read(b"/tmp/xa", b"symlink_read_relative_tmpfs\0", b"symlink_read_absolute_tmpfs\0") { failures += 1; }
+    if !test_symlink_read(b"/data/xa", b"symlink_read_relative_f2fs\0", b"symlink_read_absolute_f2fs\0") { failures += 1; }
+    if !test_symlink_cross_mount(b"symlink_cross_mount_tmpfs_to_f2fs\0") { failures += 1; }
 
     puts(b"--- vfstest done ---\0".as_ptr());
     failures

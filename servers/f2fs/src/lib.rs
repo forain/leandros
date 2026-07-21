@@ -1774,11 +1774,29 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
                     *n += take;
                 };
                 if target[0] == b'/' {
-                    // Absolute target: re-anchor at the jail root so it cannot
-                    // reach volume paths above the jail. Unjailed, jlen == 0 and
-                    // this is the old verbatim behaviour.
-                    if jlen > 1 { push(&jail[..jlen], &mut n); }
-                    push(&target[..tlen], &mut n);
+                    if jlen > 1 {
+                        // Jailed: an absolute body is taken relative to the jail
+                        // root — exactly as the kernel prefixes explicit paths
+                        // for a jailed task — so splice the jail root, then the
+                        // body verbatim. `floor` stops `..` climbing out.
+                        push(&jail[..jlen], &mut n);
+                        push(&target[..tlen], &mut n);
+                    } else {
+                        // Unjailed: the body is a full, mount-prefixed path
+                        // (`/data/x`), but this walk runs in volume-relative
+                        // coordinates. Strip this volume's mount prefix to
+                        // translate it — the same transform `get_relative_path`
+                        // applies to an incoming path — so a link back through
+                        // the mount point (`ln -s /data/x l` inside /data) is
+                        // found instead of walking a phantom `/data/data/x`. A
+                        // body naming another mount fails to strip to this volume
+                        // and resolves within it (ENOENT), never an escape:
+                        // cross-mount targets out of f2fs are the documented
+                        // limitation above.
+                        let rel = get_relative_path(ms, &target[..tlen])
+                            .unwrap_or(&target[..tlen]);
+                        push(rel, &mut n);
+                    }
                 } else {
                     push(&buf[..comp_start], &mut n);
                     push(b"/", &mut n);
