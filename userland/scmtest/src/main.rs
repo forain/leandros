@@ -64,6 +64,19 @@ use leandros_libc::syscall::{nr, syscall2, syscall3, syscall4, syscall6};
 #[cfg(target_arch = "x86_64")]  const SYS_MEMFD_CREATE: usize = 319;
 #[cfg(target_arch = "aarch64")] const SYS_FTRUNCATE:    usize = 46;
 #[cfg(target_arch = "x86_64")]  const SYS_FTRUNCATE:    usize = 77;
+// AF_UNIX socket syscalls (K1-C) + newfstatat, for the socket-node tests.
+#[cfg(target_arch = "aarch64")] const SYS_SOCKET:       usize = 198;
+#[cfg(target_arch = "x86_64")]  const SYS_SOCKET:       usize = 41;
+#[cfg(target_arch = "aarch64")] const SYS_BIND:         usize = 200;
+#[cfg(target_arch = "x86_64")]  const SYS_BIND:         usize = 49;
+#[cfg(target_arch = "aarch64")] const SYS_LISTEN:       usize = 201;
+#[cfg(target_arch = "x86_64")]  const SYS_LISTEN:       usize = 50;
+#[cfg(target_arch = "aarch64")] const SYS_ACCEPT:       usize = 202;
+#[cfg(target_arch = "x86_64")]  const SYS_ACCEPT:       usize = 43;
+#[cfg(target_arch = "aarch64")] const SYS_CONNECT:      usize = 203;
+#[cfg(target_arch = "x86_64")]  const SYS_CONNECT:      usize = 42;
+#[cfg(target_arch = "aarch64")] const SYS_NEWFSTATAT:   usize = 79;
+#[cfg(target_arch = "x86_64")]  const SYS_NEWFSTATAT:   usize = 262;
 
 // ── Wire-format structs (Linux/glibc ABI, 64-bit) ───────────────────────────
 
@@ -163,6 +176,69 @@ unsafe fn raw_recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize {
     xret(syscall6(nr::RECVFROM, fd as usize, buf as usize, len, flags as usize, 0, 0))
 }
 
+// ── AF_UNIX socket wrappers (K1-C) ──────────────────────────────────────────
+
+/// `sockaddr_un`: sun_family(2) + sun_path(108). A pathname address ends at a
+/// NUL and is passed with addrlen = 2 + strlen(path) + 1 (as musl does).
+#[repr(C)]
+struct sockaddr_un { sun_family: u16, sun_path: [u8; 108] }
+
+impl sockaddr_un {
+    /// Build from a NUL-terminated path (the NUL is not part of `name`).
+    unsafe fn from_path(name: &[u8]) -> (sockaddr_un, usize) {
+        let mut a = sockaddr_un { sun_family: AF_UNIX as u16, sun_path: [0u8; 108] };
+        let n = name.len().min(107);
+        a.sun_path[..n].copy_from_slice(&name[..n]);
+        (a, 2 + n + 1)
+    }
+}
+
+unsafe fn raw_socket(domain: i32, kind: i32, proto: i32) -> i32 {
+    xret(syscall3(SYS_SOCKET, domain as usize, kind as usize, proto as usize)) as i32
+}
+unsafe fn raw_bind(fd: i32, addr: *const sockaddr_un, addrlen: usize) -> isize {
+    xret(syscall3(SYS_BIND, fd as usize, addr as usize, addrlen))
+}
+unsafe fn raw_listen(fd: i32, backlog: i32) -> isize {
+    xret(syscall2(SYS_LISTEN, fd as usize, backlog as usize))
+}
+unsafe fn raw_connect(fd: i32, addr: *const sockaddr_un, addrlen: usize) -> isize {
+    xret(syscall3(SYS_CONNECT, fd as usize, addr as usize, addrlen))
+}
+/// accept() with a small bounded retry: accept is non-blocking at the syscall
+/// level and returns EAGAIN until a connect is pending. In these single-process
+/// tests the connect always precedes the accept, so one attempt normally
+/// suffices; the retry only guards against scheduler jitter.
+unsafe fn raw_accept(fd: i32) -> i32 {
+    let mut tries = 0;
+    loop {
+        let r = syscall3(SYS_ACCEPT, fd as usize, 0, 0);
+        if r != -11 { return xret(r) as i32; }
+        tries += 1;
+        if tries > 10000 { return xret(r) as i32; }
+    }
+}
+
+const S_IFMT:  u32 = 0o170000;
+const S_IFSOCK: u32 = 0o140000;
+const S_IFDIR: u32 = 0o040000;
+const ETOOMANYREFS: i32 = 109;
+
+#[repr(C, align(8))]
+struct StatBuf { b: [u8; 144] }
+
+/// stat(path) → (ret, st_mode). Uses newfstatat(AT_FDCWD, path, &st, 0) so the
+/// same call works on both arches (only the st_mode offset differs).
+unsafe fn raw_stat_mode(path: *const u8) -> (isize, u32) {
+    const AT_FDCWD: usize = (-100isize) as usize;
+    let mut sb = StatBuf { b: [0u8; 144] };
+    let r = syscall4(SYS_NEWFSTATAT, AT_FDCWD, path as usize, sb.b.as_mut_ptr() as usize, 0);
+    #[cfg(target_arch = "x86_64")] let off = 24usize;
+    #[cfg(target_arch = "aarch64")] let off = 16usize;
+    let mode = u32::from_ne_bytes(sb.b[off..off + 4].try_into().unwrap());
+    (r, mode)
+}
+
 // ── cmsg build/parse helpers, shared by every subtest ───────────────────────
 
 /// Build a single-fd `SCM_RIGHTS` cmsg into `buf` (must be >= `cmsg_space(4)`
@@ -255,6 +331,15 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_close_while_mapped() { failures += 1; }
     if !test_ftruncate_grow_shrink() { failures += 1; }
     if !test_teardown_loop() { failures += 1; }
+
+    // ── K1-C: AF_UNIX VFS socket nodes, tmpfs mounts, cap raise, fd-cap ──────
+    if !test_socket_node_roundtrip() { failures += 1; }
+    if !test_socket_node_devshm() { failures += 1; }
+    if !test_unlink_rebind() { failures += 1; }
+    if !test_many_socketpairs_and_listeners() { failures += 1; }
+    if !test_tmpfs_mounts_exist() { failures += 1; }
+    if !test_devshm_shared_mmap() { failures += 1; }
+    if !test_queued_fd_cap() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
@@ -764,4 +849,261 @@ unsafe fn test_teardown_loop() -> bool {
     }
     dbg1(b"[td] completed %d iterations\n\0", i as i64);
     report(name, ok && i == 150)
+}
+
+// ── K1-C: AF_UNIX VFS socket nodes, tmpfs mounts, cap raise, queued-fd cap ───
+
+/// Full pathname-socket roundtrip at `name` (NUL-terminated `cpath` names the
+/// same path): bind → stat must report S_IFSOCK → connect → accept →
+/// bidirectional data. Cleans up (close + unlink). Returns true on success.
+unsafe fn socket_roundtrip_at(name: &[u8], cpath: *const u8) -> bool {
+    let ls = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    if ls < 0 { dbg1(b"[node] socket(listen) failed errno=%d\n\0", get_errno() as i64); return false; }
+    let (addr, alen) = sockaddr_un::from_path(name);
+    if raw_bind(ls, &addr, alen) != 0 {
+        dbg1(b"[node] bind failed errno=%d\n\0", get_errno() as i64); close(ls); return false;
+    }
+    if raw_listen(ls, 8) != 0 { dbg0(b"[node] listen failed\n\0"); close(ls); return false; }
+
+    let (sr, mode) = raw_stat_mode(cpath);
+    let sock_ok = sr == 0 && (mode & S_IFMT) == S_IFSOCK;
+    dbg2(b"[node] stat ret=%d mode&IFMT=0%o (want 0140000 S_IFSOCK)\n\0", sr as i64, (mode & S_IFMT) as i64);
+
+    let cs = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    if cs < 0 { close(ls); return false; }
+    if raw_connect(cs, &addr, alen) != 0 {
+        dbg1(b"[node] connect failed errno=%d\n\0", get_errno() as i64); close(ls); close(cs); return false;
+    }
+    let asf = raw_accept(ls);
+    if asf < 0 { dbg1(b"[node] accept failed errno=%d\n\0", get_errno() as i64); close(ls); close(cs); return false; }
+
+    let w1 = raw_send(cs, b"ping".as_ptr(), 4, 0);
+    let mut rb = [0u8; 4];
+    let r1 = raw_recv(asf, rb.as_mut_ptr(), 4, 0);
+    let fwd_ok = w1 == 4 && r1 == 4 && &rb == b"ping";
+    let w2 = raw_send(asf, b"pong".as_ptr(), 4, 0);
+    let mut rb2 = [0u8; 4];
+    let r2 = raw_recv(cs, rb2.as_mut_ptr(), 4, 0);
+    let rev_ok = w2 == 4 && r2 == 4 && &rb2 == b"pong";
+
+    close(cs); close(asf); close(ls);
+    unlink(cpath);
+    sock_ok && fwd_ok && rev_ok
+}
+
+/// bind at a /tmp path → S_IFSOCK node → connect roundtrip.
+unsafe fn test_socket_node_roundtrip() -> bool {
+    report(b"socket_node_roundtrip\0",
+           socket_roundtrip_at(b"/tmp/scmtest_sock", b"/tmp/scmtest_sock\0".as_ptr()))
+}
+
+/// The same roundtrip on a socket bound under the new /dev/shm tmpfs mount.
+unsafe fn test_socket_node_devshm() -> bool {
+    report(b"socket_node_devshm\0",
+           socket_roundtrip_at(b"/dev/shm/scmtest_sock", b"/dev/shm/scmtest_sock\0".as_ptr()))
+}
+
+/// unlink removes the node and makes the address rebindable, while an
+/// already-established connection lives on.
+unsafe fn test_unlink_rebind() -> bool {
+    let name = b"unlink_rebind\0";
+    let path = b"/tmp/scmtest_rebind";
+    let cpath = b"/tmp/scmtest_rebind\0";
+    let (addr, alen) = sockaddr_un::from_path(path);
+
+    let ls = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    if ls < 0 || raw_bind(ls, &addr, alen) != 0 || raw_listen(ls, 8) != 0 {
+        dbg0(b"[rebind] initial bind/listen failed\n\0");
+        if ls >= 0 { close(ls); }
+        return report(name, false);
+    }
+    let cs = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    if raw_connect(cs, &addr, alen) != 0 { dbg0(b"[rebind] connect failed\n\0"); close(ls); close(cs); return report(name, false); }
+    let asf = raw_accept(ls);
+    if asf < 0 { dbg0(b"[rebind] accept failed\n\0"); close(ls); close(cs); return report(name, false); }
+
+    let ur = unlink(cpath.as_ptr());
+    // Connecting to the now-unlinked path must fail.
+    let cs2 = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    let gone_ok = raw_connect(cs2, &addr, alen) != 0;
+    close(cs2);
+
+    // The pre-existing connection still passes data.
+    let w = raw_send(cs, b"live".as_ptr(), 4, 0);
+    let mut rb = [0u8; 4];
+    let r = raw_recv(asf, rb.as_mut_ptr(), 4, 0);
+    let live_ok = w == 4 && r == 4 && &rb == b"live";
+
+    // Rebind a fresh listener to the same path, then a new connect resolves to
+    // it (not the old, still-open listener).
+    let ls2 = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    let br = raw_bind(ls2, &addr, alen);
+    let _ = raw_listen(ls2, 8);
+    let cs3 = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    let cr3 = raw_connect(cs3, &addr, alen);
+    let as3 = if cr3 == 0 { raw_accept(ls2) } else { -1 };
+    let rebind_ok = br == 0 && cr3 == 0 && as3 >= 0;
+
+    dbg2(b"[rebind] unlink=%d rebind=%d\n\0", ur as i64, br as i64);
+    if as3 >= 0 { close(as3); }
+    close(cs3); close(ls2); close(asf); close(cs); close(ls);
+    unlink(cpath.as_ptr());
+    report(name, gone_ok && live_ok && rebind_ok)
+}
+
+/// 64 concurrent socketpairs + 32 concurrent bound listeners, each passing its
+/// own byte — proves the 16→512 socket / 16→512 bound-path / 32→256 conn caps.
+unsafe fn test_many_socketpairs_and_listeners() -> bool {
+    let name = b"many_socketpairs_and_listeners\0";
+    let mut ok = true;
+
+    const NP: usize = 64;
+    let mut sp = [[0i32; 2]; NP];
+    for k in 0..NP {
+        if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sp[k].as_mut_ptr()) != 0 {
+            dbg1(b"[many] socketpair %d failed\n\0", k as i64); ok = false; break;
+        }
+    }
+    if ok {
+        for k in 0..NP {
+            let byte = (k & 0xFF) as u8;
+            let w = raw_send(sp[k][0], &byte, 1, 0);
+            let mut rb = [0u8; 1];
+            let r = raw_recv(sp[k][1], rb.as_mut_ptr(), 1, 0);
+            if w != 1 || r != 1 || rb[0] != byte { dbg1(b"[many] pair %d data mismatch\n\0", k as i64); ok = false; break; }
+        }
+    }
+    // NOTE: the 64 socketpairs stay open across the listener phase below, so at
+    // peak this process holds 64*2 + 32*3 = 224 socket fds and 64+32 = 96 live
+    // connections at once — past the old 16-socket / 32-conn caps in both.
+
+    const NL: usize = 32;
+    let mut ls = [0i32; NL];
+    let mut cs = [0i32; NL];
+    let mut asf = [0i32; NL];
+    let mut path = [[0u8; 32]; NL];
+    if ok {
+        for k in 0..NL {
+            let n = build_name(&mut path[k], b"/tmp/scmL", k);
+            let (addr, alen) = sockaddr_un::from_path(&path[k][..n]);
+            ls[k] = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+            if ls[k] < 0 || raw_bind(ls[k], &addr, alen) != 0 || raw_listen(ls[k], 8) != 0 {
+                dbg1(b"[many] listener %d setup failed\n\0", k as i64); ok = false; break;
+            }
+            cs[k] = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+            if raw_connect(cs[k], &addr, alen) != 0 { dbg1(b"[many] connect %d failed\n\0", k as i64); ok = false; break; }
+            asf[k] = raw_accept(ls[k]);
+            if asf[k] < 0 { dbg1(b"[many] accept %d failed\n\0", k as i64); ok = false; break; }
+        }
+    }
+    if ok {
+        for k in 0..NL {
+            let byte = (0x80 | (k & 0x3F)) as u8;
+            let w = raw_send(cs[k], &byte, 1, 0);
+            let mut rb = [0u8; 1];
+            let r = raw_recv(asf[k], rb.as_mut_ptr(), 1, 0);
+            if w != 1 || r != 1 || rb[0] != byte { dbg1(b"[many] listener %d data mismatch\n\0", k as i64); ok = false; break; }
+        }
+    }
+    for k in 0..NL {
+        if asf[k] > 2 { close(asf[k]); }
+        if cs[k] > 2 { close(cs[k]); }
+        if ls[k] > 2 { close(ls[k]); }
+        let mut cp = [0u8; 32];
+        let _ = build_name(&mut cp, b"/tmp/scmL", k);
+        unlink(cp.as_ptr());
+    }
+    // Now tear down the socketpairs held open across the whole listener phase.
+    for k in 0..NP { if sp[k][0] > 2 { close(sp[k][0]); } if sp[k][1] > 2 { close(sp[k][1]); } }
+    report(name, ok)
+}
+
+/// The K1 tmpfs mounts exist at boot with the right type + modes.
+unsafe fn test_tmpfs_mounts_exist() -> bool {
+    let name = b"tmpfs_mounts_exist\0";
+    let (r1, m1) = raw_stat_mode(b"/dev/shm\0".as_ptr());
+    let shm_ok = r1 == 0 && (m1 & S_IFMT) == S_IFDIR && (m1 & 0o7777) == 0o1777;
+    let (r2, m2) = raw_stat_mode(b"/run/user/0\0".as_ptr());
+    let run_ok = r2 == 0 && (m2 & S_IFMT) == S_IFDIR && (m2 & 0o7777) == 0o700;
+    dbg2(b"[mounts] /dev/shm perms=0%o /run/user/0 perms=0%o\n\0", (m1 & 0o7777) as i64, (m2 & 0o7777) as i64);
+    report(name, shm_ok && run_ok)
+}
+
+/// A MAP_SHARED file under /dev/shm, opened by NAME in two processes, aliases
+/// the same physical pages (the K1-B VMO freebie under the new mount).
+unsafe fn test_devshm_shared_mmap() -> bool {
+    let name = b"devshm_shared_mmap\0";
+    let path = b"/dev/shm/scmtest_shared\0";
+    let pa = |i: usize| -> u8 { (0xA0usize ^ (i & 0xFF)) as u8 };
+    let pb = |i: usize| -> u8 { (0x5Cusize ^ (i & 0xFF)) as u8 };
+
+    let fd = open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 { dbg1(b"[devshm] open failed errno=%d\n\0", get_errno() as i64); return report(name, false); }
+    if raw_ftruncate(fd, 4096) != 0 { dbg0(b"[devshm] ftruncate failed\n\0"); close(fd); unlink(path.as_ptr()); return report(name, false); }
+    let m = mmap(core::ptr::null_mut(), 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if m as usize == MAP_FAILED { dbg0(b"[devshm] mmap failed\n\0"); close(fd); unlink(path.as_ptr()); return report(name, false); }
+    for i in 0..4096usize { *m.add(i) = pa(i); }
+
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 {
+        munmap(m, 4096); close(fd); unlink(path.as_ptr()); return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+
+    let pid = fork();
+    if pid == 0 {
+        close(a);
+        let cfd = open(path.as_ptr(), O_RDWR, 0);
+        if cfd < 0 { raw_send(b, b"K".as_ptr(), 1, 0); exit(2); }
+        let cm = mmap(core::ptr::null_mut(), 4096, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
+        if cm as usize == MAP_FAILED { raw_send(b, b"K".as_ptr(), 1, 0); exit(3); }
+        let mut a_ok = true;
+        for i in 0..4096usize { if *cm.add(i) != pa(i) { a_ok = false; break; } }
+        if !a_ok { raw_send(b, b"K".as_ptr(), 1, 0); exit(4); }
+        for i in 0..4096usize { *cm.add(i) = pb(i); }
+        raw_send(b, b"K".as_ptr(), 1, 0);
+        exit(0);
+    }
+
+    let mut ack = [0u8; 1];
+    let _ = raw_recv(a, ack.as_mut_ptr(), 1, 0);
+    let mut status: i32 = -1;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    let mut b_ok = true;
+    for i in 0..4096usize { if *m.add(i) != pb(i) { b_ok = false; break; } }
+    dbg1(b"[devshm] child status=%d\n\0", status as i64);
+
+    munmap(m, 4096); close(fd); close(a); close(b);
+    unlink(path.as_ptr());
+    report(name, status == 0 && b_ok)
+}
+
+/// The per-connection in-flight SCM_RIGHTS fd cap: repeatedly send an fd
+/// without receiving; the send that would exceed the cap fails with
+/// ETOOMANYREFS rather than growing the queue (or OOMing) without bound.
+unsafe fn test_queued_fd_cap() -> bool {
+    let name = b"queued_fd_cap\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 { return report(name, false); }
+    let (a, b) = (sv[0], sv[1]);
+    let path = b"/tmp/scmtest_capfd\0";
+    let fd = open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 { close(a); close(b); return report(name, false); }
+    write(fd, b"x".as_ptr(), 1);
+
+    let mut sent = 0i64;
+    let mut hit_errno = 0i32;
+    let mut i = 0;
+    while i < 2000 {
+        let r = send_fd_and_byte(a, fd, b'.');
+        if r < 0 { hit_errno = get_errno(); break; }
+        sent += 1;
+        i += 1;
+    }
+    dbg2(b"[cap] sent=%d then errno=%d (want ETOOMANYREFS=109)\n\0", sent, hit_errno as i64);
+    let ok = hit_errno == ETOOMANYREFS && sent >= 512;
+
+    close(fd); close(a); close(b);
+    unlink(path.as_ptr());
+    report(name, ok)
 }
