@@ -14,6 +14,34 @@
 
 extern crate leandros_libc;
 use leandros_libc::*;
+use leandros_libc::syscall::{syscall1, syscall3};
+
+// chroot(2) and symlink(2) are not (yet) wrapped by leandros-libc, so this
+// test makes the raw syscalls directly, matching the style of
+// `userland/libc/src/syscall.rs`'s per-arch `nr` table. Numbers verified
+// against the kernel's own dispatch tables in `kernel/src/syscall.rs`
+// (`nr::CHROOT` / `nr::SYMLINKAT` in the AArch64 and x86-64 `mod nr` blocks),
+// and match the standard Linux syscall ABI these wrappers already assume.
+#[cfg(target_arch = "aarch64")] const SYS_CHROOT: usize = 51;
+#[cfg(target_arch = "x86_64")]  const SYS_CHROOT: usize = 161;
+#[cfg(target_arch = "aarch64")] const SYS_SYMLINKAT: usize = 36;
+#[cfg(target_arch = "x86_64")]  const SYS_SYMLINKAT: usize = 266;
+
+/// Change the process's filesystem root. Irreversible for the calling
+/// process, so callers that need to keep operating outside the jail must
+/// confine the call to a forked child.
+unsafe fn raw_chroot(path: *const u8) -> i32 {
+    let r = syscall1(SYS_CHROOT, path as usize);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Create a symlink at `linkpath` pointing to `target`. Argument order
+/// mirrors `symlinkat(target, dirfd, linkpath)`, as dispatched by the
+/// kernel's `sys_symlinkat`.
+unsafe fn raw_symlink(target: *const u8, linkpath: *const u8) -> i32 {
+    let r = syscall3(SYS_SYMLINKAT, target as usize, AT_FDCWD as usize, linkpath as usize);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
@@ -25,6 +53,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_fcntl_byte_range_conflict() { failures += 1; }
     if !test_permission_enforced() { failures += 1; }
     if !test_f2fs_ownership_enforced() { failures += 1; }
+    if !test_chroot_confines_symlink_resolution() { failures += 1; }
 
     puts(b"--- vfstest done ---\0".as_ptr());
     failures
@@ -226,6 +255,41 @@ unsafe fn test_f2fs_ownership_enforced() -> bool {
     let mut st2: i32 = -1;
     wait4(owner, &mut st2 as *mut i32, 0, core::ptr::null_mut());
     report(name, st2 == 0)
+}
+
+/// chroot() must actually confine tmpfs symlink resolution to the new root:
+/// an absolute symlink target is re-anchored *inside* the jail, not resolved
+/// against the host's real "/". `chroot(2)` is irreversible for the calling
+/// process, so the whole check runs in a forked child — a jail escape here
+/// would otherwise confine the rest of the test suite too.
+///
+/// The jail is `/tmp/jail`, containing a symlink `link -> /etc/passwd`. Under
+/// correct confinement, resolving `/link` after chrooting re-anchors
+/// "/etc/passwd" inside the jail, i.e. host path `/tmp/jail/etc/passwd`,
+/// which does not exist, so `open("/link")` must fail with ENOENT. If it
+/// instead succeeds, the resolver escaped the jail and opened the real
+/// `/etc/passwd`.
+unsafe fn test_chroot_confines_symlink_resolution() -> bool {
+    let name = b"chroot_confines_symlink_resolution\0";
+
+    let pid = fork();
+    if pid == 0 {
+        if mkdir(b"/tmp/jail\0".as_ptr(), 0o755) != 0 { exit(1); }
+        if raw_symlink(b"/etc/passwd\0".as_ptr(), b"/tmp/jail/link\0".as_ptr()) != 0 { exit(1); }
+        if raw_chroot(b"/tmp/jail\0".as_ptr()) != 0 { exit(1); }
+
+        let fd = open(b"/link\0".as_ptr(), O_RDONLY, 0);
+        if fd >= 0 {
+            // Escaped the jail: this opened the real /etc/passwd.
+            close(fd);
+            exit(1);
+        }
+        exit(if get_errno() == ENOENT { 0 } else { 1 });
+    }
+    let mut status: i32 = -1;
+    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    // Leaving /tmp/jail behind is fine: /tmp is volatile tmpfs.
+    report(name, status == 0)
 }
 
 // `struct flock` from leandros_libc::io, aliased for readability.

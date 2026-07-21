@@ -1407,16 +1407,23 @@ const SYMLINK_MAX_HOPS: u32 = 40;
 /// resolving ".." lexically. Needed because splicing a symlink target back
 /// into a path reintroduces both (the kernel normalised the *original* path,
 /// but it never saw the link body).
-fn normalize_abs(src: &[u8], out: &mut [u8; 256]) -> usize {
+/// Lexically normalise an absolute path. `floor` is the byte offset below which
+/// `..` may not climb — 1 (the real root) normally, or the length of a chroot
+/// jail's root when confining a jailed tmpfs symlink, so that an absolute link
+/// target cannot use `..` to escape the jail. For `floor == 1` this is
+/// byte-for-byte the old `normalize_abs`.
+fn normalize_abs_floor(src: &[u8], out: &mut [u8; 256], floor: usize) -> usize {
+    let floor = floor.max(1);
     let mut len = 1usize;
     out[0] = b'/';
     for comp in src.split(|&b| b == b'/') {
         if comp.is_empty() || comp == b"." { continue; }
         if comp == b".." {
-            if len > 1 {
+            if len > floor {
                 let mut last = len - 1;
                 while last > 0 && out[last] != b'/' { last -= 1; }
-                len = if last == 0 { 1 } else { last };
+                let clamped = if last == 0 { 1 } else { last };
+                len = if clamped < floor { floor } else { clamped };
             }
             continue;
         }
@@ -1426,6 +1433,31 @@ fn normalize_abs(src: &[u8], out: &mut [u8; 256]) -> usize {
         len += n;
     }
     len
+}
+
+fn normalize_abs(src: &[u8], out: &mut [u8; 256]) -> usize {
+    normalize_abs_floor(src, out, 1)
+}
+
+/// The calling task's chroot root, but only when it lies on tmpfs — the one
+/// namespace this resolver owns. Returns its length, or 0 when the task is not
+/// chrooted or its jail is rooted on another filesystem (a tmpfs symlink is
+/// then unreachable by construction and needs no re-anchoring here).
+///
+/// tmpfs paths are host-absolute, so — unlike f2fs, which resolves in
+/// volume-relative space — the jail root needs no coordinate translation: it is
+/// already in the same space as the paths this resolver walks. Runs in the
+/// caller's context (synchronous IPC), so `sched::current_root` names the right
+/// task without any protocol change.
+fn caller_jail_tmp(out: &mut [u8; 128]) -> usize {
+    let mut host = [0u8; 256];
+    let n = sched::current_root(host.as_mut_ptr(), 256);
+    if n <= 1 { return 0; }
+    let n = (n as usize).min(255);
+    if !is_tmp_path(&host[..n]) { return 0; }
+    let take = n.min(128);
+    out[..take].copy_from_slice(&host[..take]);
+    take
 }
 
 /// Resolve every symlink in a **tmpfs** path, iteratively.
@@ -1445,8 +1477,16 @@ fn normalize_abs(src: &[u8], out: &mut [u8; 256]) -> usize {
 /// so a tmpfs symlink into f2fs works. Returns `Err(-ELOOP)` on a cycle and
 /// `Err(-ENAMETOOLONG)` if a splice overflows.
 fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> Result<usize, i32> {
+    // Jail root on tmpfs (empty = not confined here). An absolute symlink target
+    // must re-anchor here, not at the tmpfs root, or a link inside a jail rooted
+    // on tmpfs (`chroot /tmp/jail`) can name a path above the jail. Unjailed,
+    // `jlen == 0` and `floor == 1`, so everything below is the old behaviour.
+    let mut jail = [0u8; 128];
+    let jlen = caller_jail_tmp(&mut jail);
+    let floor = if jlen > 1 { jlen } else { 1 };
+
     let mut cur = [0u8; 256];
-    let mut cur_len = normalize_abs(input, &mut cur);
+    let mut cur_len = normalize_abs_floor(input, &mut cur, floor);
     let mut hops = 0u32;
 
     loop {
@@ -1504,6 +1544,10 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
             true
         };
         if tlen > 0 && target[0] == b'/' {
+            // Absolute target: re-anchor at the jail root so it cannot reach
+            // tmpfs paths above the jail. Unjailed, `jlen == 0` and this is the
+            // old verbatim behaviour.
+            if jlen > 1 { if !push(&jail[..jlen], &mut n) { return Err(-36); } }
             if !push(&target[..tlen], &mut n) { return Err(-36); }
         } else {
             if !push(&path[..comp_start], &mut n) { return Err(-36); }
@@ -1512,7 +1556,7 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
         }
         if !push(&path[comp_end..], &mut n) { return Err(-36); }
 
-        cur_len = normalize_abs(&next[..n], &mut cur);
+        cur_len = normalize_abs_floor(&next[..n], &mut cur, floor);
     }
 
     out[..cur_len].copy_from_slice(&cur[..cur_len]);

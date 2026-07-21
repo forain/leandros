@@ -4887,10 +4887,39 @@ fn fd_abs_path(fd: usize, out: &mut [u8; KPATH_MAX]) -> Option<usize> {
                            &[fd as u64, out.as_mut_ptr() as u64, KPATH_MAX as u64]);
     let n = vfs_reply_val(&vfs::handle(&msg, current_pid()));
     if n <= 0 { return None; }
-    let n = n as usize;
+    let mut n = n as usize;
     // Only a real absolute path can serve as a resolution base; the synthetic
     // names ("pipe:[7]", "eventfd", …) must not.
     if n > KPATH_MAX || out[0] != b'/' { return None; }
+
+    // The VFS answers with the *host-absolute* path — the same thing
+    // readlink("/proc/self/fd/N") would report. For a chrooted caller that
+    // path carries the jail-root prefix, and resolve_at_path re-anchors the
+    // base at the jail root, so without stripping it here the base would carry
+    // the prefix twice (a jailed openat(dirfd, "f") would look below
+    // "<root><root>/…" and spuriously ENOENT). Strip it to the caller's
+    // chrooted view, exactly the host-absolute → jail-relative translation
+    // getcwd performs. Non-chrooted callers have `rn <= 1`, so this is a no-op
+    // and the base is byte-for-byte what it always was.
+    let mut root = [0u8; 256];
+    let rn = sched::current_root(root.as_mut_ptr(), 256);
+    if rn > 1 {
+        let rn = (rn as usize).min(255);
+        // The fd was opened by this task, so its path genuinely lies under the
+        // jail root; the boundary check only guards a sibling that shares the
+        // root as a byte prefix ("/a/jail" vs "/a/jailer").
+        let under = out[..n].starts_with(&root[..rn])
+            && (n == rn || out.get(rn) == Some(&b'/'));
+        if under {
+            if n == rn {
+                out[0] = b'/';
+                n = 1;
+            } else {
+                out.copy_within(rn..n, 0);
+                n -= rn;
+            }
+        }
+    }
     Some(n)
 }
 
