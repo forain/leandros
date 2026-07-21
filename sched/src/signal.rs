@@ -30,6 +30,9 @@
 
 
 // ── SA_* flag bits (Linux values, same on AArch64 and x86-64) ────────────────
+// SA_RESTORER only gates x86-64 frame construction; aarch64 always uses the
+// kernel trampoline, so the const is unreferenced there.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 const SA_RESTORER:  u32 = 0x04000000;
 const SA_NODEFER:   u32 = 0x40000000;
 const SA_RESETHAND: u32 = 0x80000000;
@@ -256,18 +259,22 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                 continue;
             }
             handler => {
+                // aarch64: always return through the kernel-provided
+                // rt_sigreturn trampoline, ignoring any userspace
+                // sa_restorer. This mirrors the Linux-aarch64 kernel, which
+                // has no SA_RESTORER — the restorer field still round-trips
+                // through `sigaction(oldact)`, it is just not used to build
+                // the frame. Mapped by execve; a pre-exec task without the
+                // page simply must not return from its handler, as before.
+                #[cfg(target_arch = "aarch64")]
+                let restorer = SIGRET_TRAMPOLINE_VA;
+                // x86_64: honor the userspace-supplied sa_restorer when
+                // SA_RESTORER is set (relibc always sets it), else 0.
+                #[cfg(not(target_arch = "aarch64"))]
                 let restorer = if action.get_flags() & SA_RESTORER != 0 {
                     action.get_restorer()
                 } else {
-                    // No SA_RESTORER: return through the kernel-provided
-                    // rt_sigreturn trampoline (Linux-aarch64 convention;
-                    // musl never sets SA_RESTORER there). Mapped by execve;
-                    // a pre-exec task without the page simply must not
-                    // return from its handler, as before.
-                    #[cfg(target_arch = "aarch64")]
-                    { SIGRET_TRAMPOLINE_VA }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    { 0 }
+                    0
                 };
 
                 if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask, action.get_flags()) {

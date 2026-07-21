@@ -77,41 +77,30 @@ pub struct SigAction {
     /// Handler address: 0 = SIG_DFL, 1 = SIG_IGN, else a user-space fn ptr.
     pub handler:  usize,
 
-    #[cfg(target_arch = "x86_64")]
+    /// `sa_flags`.
     pub flags:    u32,
-    #[cfg(target_arch = "x86_64")]
-    /// `sa_restorer` — user-space trampoline that calls `sys_rt_sigreturn`.
-    /// 0 = use the kernel's built-in trampoline page.
-    pub restorer: usize,
-    #[cfg(target_arch = "x86_64")]
-    /// Signal mask to apply during handler execution.
-    pub mask:     u64,
 
-    #[cfg(target_arch = "aarch64")]
+    /// `sa_restorer` — user-space trampoline that calls `sys_rt_sigreturn`.
+    /// 0 = use the kernel's built-in trampoline page. aarch64 delivery
+    /// ignores this field (the kernel always returns through
+    /// `SIGRET_TRAMPOLINE_VA`, matching Linux-aarch64), but it is preserved
+    /// byte-for-byte so `sigaction(oldact)` round-trips relibc's struct.
+    pub restorer: usize,
+
     /// Signal mask to apply during handler execution.
     pub mask:     u64,
-    #[cfg(target_arch = "aarch64")]
-    pub flags:    u64,
 }
 
-#[cfg(target_arch = "x86_64")]
 pub const DEFAULT_SIGACTION: SigAction =
     SigAction { handler: 0, flags: 0, restorer: 0, mask: 0 };
 
-#[cfg(target_arch = "aarch64")]
-pub const DEFAULT_SIGACTION: SigAction =
-    SigAction { handler: 0, mask: 0, flags: 0 };
-
 impl SigAction {
     pub fn get_flags(&self) -> u32 {
-        self.flags as u32
+        self.flags
     }
 
     pub fn get_restorer(&self) -> usize {
-        #[cfg(target_arch = "x86_64")]
-        { self.restorer }
-        #[cfg(target_arch = "aarch64")]
-        { 0 }
+        self.restorer
     }
 }
 
