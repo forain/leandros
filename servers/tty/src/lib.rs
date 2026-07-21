@@ -7,7 +7,11 @@
 //! vnodes whose read/write handlers delegate here.
 //!
 //! TTY FDs use the same SOCK_FD_BASE offset scheme as the net server but with
-//! a distinct range: TTY_FD_BASE = 0x200.
+//! a distinct range: TTY_FD_BASE = 0x1000. (Kept clear of the AF_UNIX socket
+//! window [0x100, 0x300) — MAX_SOCKS was raised to 512 in K1 — and of the
+//! epoll range at 0x400. This TTY-fd path is currently dormant: nothing routes
+//! TTY_OPEN, so relocating the base is behaviourally inert, but it keeps every
+//! server fd range disjoint.)
 //!
 //! # POSIX timers
 //!
@@ -43,7 +47,7 @@ pub const TIMER_GETOVERRUN: u64 = 0x54;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-pub const TTY_FD_BASE: usize = 0x200;
+pub const TTY_FD_BASE: usize = 0x1000;
 
 const MAX_PROCS:  usize = 64;
 const MAX_TTYS:   usize = 4;   // per process (stdin/stdout/stderr + one pty)

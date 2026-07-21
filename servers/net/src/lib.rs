@@ -71,13 +71,28 @@ pub const SOCK_RAW:    usize = 3;
 pub const IPPROTO_ICMP: usize = 1;
 
 pub const SOCK_FD_BASE: usize = 0x100;
+/// One past the last socket fd. Socket fds occupy [SOCK_FD_BASE, SOCK_FD_END) =
+/// [0x100, 0x300); this stays below EPOLL_FD_BASE (0x400) and — with the dormant
+/// TTY_FD_BASE relocated to 0x1000 — is disjoint from every other fd range.
+pub const SOCK_FD_END: usize = SOCK_FD_BASE + MAX_SOCKS;
 
 const MAX_PROCS:   usize = 64;
-const MAX_SOCKS:   usize = 16;
-const MAX_CONNS:   usize = 32;
-const MAX_BOUND:   usize = 16;
+/// Per-process socket fd cap. Raised 16→512 for a COSMIC-class workload (a
+/// compositor holds a socket per client + the bus + internal socketpairs).
+const MAX_SOCKS:   usize = 512;
+/// Connection-pair pool. Raised 32→256 (K1 acceptance: 64 socketpairs + 32
+/// listener connections concurrently; headroom for the desktop session).
+const MAX_CONNS:   usize = 256;
+/// Bound-address pool (abstract + pathname listeners). Raised 16→512.
+const MAX_BOUND:   usize = 512;
 const RING_SIZE:   usize = 4096;
 const PATH_MAX:    usize = 108;
+/// Per-direction in-flight SCM_RIGHTS fd cap. A sender that would push a
+/// connection's queued-but-undelivered fd count past this fails sendmsg with
+/// ETOOMANYREFS rather than growing the PendingFdBatch queue without bound.
+const QUEUED_FD_CAP: usize = 1024;
+/// ETOOMANYREFS — too many in-flight SCM_RIGHTS references.
+const ETOOMANYREFS: i32 = -109;
 
 // ── Message helpers ───────────────────────────────────────────────────────────
 
@@ -248,6 +263,14 @@ struct BoundPath {
     in_use:     bool,
     path:       [u8; PATH_MAX],
     path_len:   usize,
+    /// Monotonic identity of this bound address, handed to the VFS socket node
+    /// (pathname sockets) so `connect` resolving the node maps back to the
+    /// right listener even after the slot index is reused (ABA-proof). Abstract
+    /// sockets carry one too, so accept-matching is uniform.
+    sock_id:    u64,
+    /// True for a Linux abstract-namespace address (sun_path[0] == 0): matched
+    /// by bytes here, never backed by a VFS node.
+    is_abstract: bool,
     _owner_pid:  u32,
     _owner_sock: usize,
 }
@@ -255,12 +278,20 @@ struct BoundPath {
 impl BoundPath {
     const fn new() -> Self {
         Self { in_use: false, path: [0u8; PATH_MAX], path_len: 0,
+               sock_id: 0, is_abstract: false,
                _owner_pid: 0, _owner_sock: 0 }
     }
 }
 
 static BOUND_PATHS: Mutex<[BoundPath; MAX_BOUND]> =
     Mutex::new([const { BoundPath::new() }; MAX_BOUND]);
+
+/// Source of unique, never-reused `sock_id`s (see `BoundPath::sock_id`).
+static NEXT_SOCK_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+fn alloc_sock_id() -> u64 {
+    NEXT_SOCK_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
 
 // ── Socket kind ───────────────────────────────────────────────────────────────
 
@@ -270,7 +301,8 @@ enum SockState {
     Unbound { domain: u8, sock_type: u8 },
     UnixListening { bound_idx: usize },
     UnixConnected { conn_idx: usize, is_a: bool },
-    UnixPendingAccept { conn_idx: usize },
+    /// A connect() waiting to be paired by the listener bound to `sock_id`.
+    UnixPendingAccept { conn_idx: usize, sock_id: u64 },
     InetBound { domain: u8, sock_type: u8, local_endpoint: IpEndpoint },
     InetListening { socket_handle: SocketHandle },
     InetConnected { socket_handle: SocketHandle, remote_endpoint: Option<IpEndpoint> },
@@ -311,6 +343,15 @@ impl ProcSockTable {
         Self { pid: 0, socks: [const { SockEntry::empty() }; MAX_SOCKS], in_use: false }
     }
 
+    /// Clear in place. At MAX_SOCKS=512 a `*self = ProcSockTable::empty()` would
+    /// materialise a ~24 KB temporary on the kernel stack; resetting field by
+    /// field keeps every clear cheap.
+    fn reset(&mut self) {
+        self.pid = 0;
+        self.in_use = false;
+        for s in self.socks.iter_mut() { *s = SockEntry::empty(); }
+    }
+
     fn alloc(&mut self) -> Option<usize> {
         self.socks.iter().position(|s| !s.in_use)
     }
@@ -330,7 +371,7 @@ fn get_or_create<'a>(pid: u32, tbls: &'a mut [ProcSockTable]) -> Option<&'a mut 
         return Some(&mut tbls[pos]);
     }
     if let Some(pos) = tbls.iter().position(|t| !t.in_use) {
-        tbls[pos] = ProcSockTable::empty();
+        tbls[pos].reset();
         tbls[pos].in_use = true;
         tbls[pos].pid    = pid;
         return Some(&mut tbls[pos]);
@@ -339,7 +380,18 @@ fn get_or_create<'a>(pid: u32, tbls: &'a mut [ProcSockTable]) -> Option<&'a mut 
 }
 
 fn fd_to_slot(fd: usize) -> Option<usize> {
-    if fd >= SOCK_FD_BASE && fd < SOCK_FD_BASE + MAX_SOCKS { Some(fd - SOCK_FD_BASE) } else { None }
+    if fd >= SOCK_FD_BASE && fd < SOCK_FD_END { Some(fd - SOCK_FD_BASE) } else { None }
+}
+
+/// Free the BOUND_PATHS slot a `UnixListening` socket owned. Called when the
+/// listener closes: the address stops resolving to a live listener (a pathname
+/// socket's VFS node lingers per Linux, but connecting to it now yields
+/// ECONNREFUSED), and the slot is reclaimable. Caller must not hold BOUND_PATHS.
+fn free_bound_idx(bound_idx: usize) {
+    let mut bound = BOUND_PATHS.lock();
+    if bound_idx < MAX_BOUND && bound[bound_idx].in_use {
+        bound[bound_idx] = BoundPath::new();
+    }
 }
 
 // ── Smoltcp Integration ───────────────────────────────────────────────────────
@@ -573,12 +625,14 @@ pub fn force_bind_unix(path_str: &str, _port: u32) {
     if let Some(idx) = bound.iter().position(|b| !b.in_use) {
         let mut path = [0u8; PATH_MAX];
         path[..path_len].copy_from_slice(&path_bytes[..path_len]);
-        bound[idx] = BoundPath { 
-            in_use: true, 
-            path, 
+        bound[idx] = BoundPath {
+            in_use: true,
+            path,
             path_len,
-            _owner_pid: 0, 
-            _owner_sock: 0 
+            sock_id: alloc_sock_id(),
+            is_abstract: false,
+            _owner_pid: 0,
+            _owner_sock: 0
         };
     }
 }
@@ -698,28 +752,63 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
             let path_len = addrlen - 2;
             let path_ptr = (addr_ptr + 2) as *const u8;
 
-            let mut bound = BOUND_PATHS.lock();
-            for bp in bound.iter() {
-                if bp.in_use && bp.path_len == path_len &&
-                   bp.path[..path_len] == unsafe {
-                       core::slice::from_raw_parts(path_ptr, path_len)
-                   }[..] {
-                    return err_reply(-98);
+            // Copy sun_path out of user memory into a kernel buffer up front —
+            // no user dereference happens under any lock or inside the VFS.
+            let mut pbytes = [0u8; PATH_MAX];
+            unsafe { core::ptr::copy_nonoverlapping(path_ptr, pbytes.as_mut_ptr(), path_len); }
+            let is_abstract = pbytes[0] == 0;
+            let sock_id = alloc_sock_id();
+
+            // ── Pathname socket: the VFS owns uniqueness via a real S_IFSOCK
+            // node. Bind does not follow a symlink for the final component.
+            if !is_abstract {
+                // sun_path is a C string for pathname sockets; the address ends
+                // at the first NUL (addrlen may or may not include it).
+                let name_end = pbytes[..path_len].iter().position(|&b| b == 0).unwrap_or(path_len);
+                let name = &pbytes[..name_end];
+                if name.is_empty() { return err_reply(-22); }
+                match vfs::unix_bind_node(pid, name, sock_id) {
+                    0   => {}
+                    -17 => return err_reply(-98), // node exists → EADDRINUSE
+                    e   => return make_reply(e as i64), // ENOENT/EACCES/EOPNOTSUPP/ENOSPC
+                }
+            } else {
+                // Abstract namespace: byte-matched here, never a VFS node.
+                let bound = BOUND_PATHS.lock();
+                for bp in bound.iter() {
+                    if bp.in_use && bp.is_abstract && bp.path_len == path_len
+                       && bp.path[..path_len] == pbytes[..path_len] {
+                        return err_reply(-98); // EADDRINUSE
+                    }
                 }
             }
+
+            let mut bound = BOUND_PATHS.lock();
             let idx = match bound.iter().position(|b| !b.in_use) {
-                Some(i) => i, None => return err_reply(-12),
+                Some(i) => i,
+                // Pathname node already created; leave it as a stale socket file
+                // (Linux keeps them too) rather than unwinding the VFS op.
+                None => return err_reply(-12),
             };
-            let mut path = [0u8; PATH_MAX];
-            unsafe { core::ptr::copy_nonoverlapping(path_ptr, path.as_mut_ptr(), path_len); }
-            bound[idx] = BoundPath { in_use: true, path, path_len,
+            bound[idx] = BoundPath { in_use: true, path: pbytes, path_len,
+                                     sock_id, is_abstract,
                                      _owner_pid: pid, _owner_sock: slot };
-            let mut tbls = SOCK_TABLES.lock();
-            let tbl = match find_tbl(pid, &mut *tbls) {
-                Some(t) => t, None => return err_reply(-9),
+            drop(bound);
+
+            // Scope the SOCK_TABLES lock so it is released before any
+            // free_bound_idx (which takes BOUND_PATHS) — the two are never held
+            // nested, keeping BOUND_PATHS strictly a leaf.
+            let ok = {
+                let mut tbls = SOCK_TABLES.lock();
+                match find_tbl(pid, &mut *tbls) {
+                    Some(t) if slot < MAX_SOCKS && t.socks[slot].in_use => {
+                        t.socks[slot].state = SockState::UnixListening { bound_idx: idx };
+                        true
+                    }
+                    _ => false,
+                }
             };
-            if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
-            tbl.socks[slot].state = SockState::UnixListening { bound_idx: idx };
+            if !ok { free_bound_idx(idx); return err_reply(-9); }
             ok_reply()
         }
     }
@@ -821,15 +910,26 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Me
             }
         }
         SockState::UnixListening { bound_idx } => {
-            let _ = bound_idx;
+            // Only pair a pending connect that targeted *this* listener's
+            // address (matched by its unique sock_id), so multiple concurrent
+            // listeners each accept their own connectors.
+            let listen_sock_id = {
+                let bound = BOUND_PATHS.lock();
+                if bound_idx >= MAX_BOUND || !bound[bound_idx].in_use {
+                    return err_reply(-11); // listener's address gone → nothing to accept
+                }
+                bound[bound_idx].sock_id
+            };
             let mut tbls = SOCK_TABLES.lock();
             let mut found = None;
             'outer: for t in tbls.iter() {
                 if !t.in_use { continue; }
                 for s in t.socks.iter() {
-                    if let SockState::UnixPendingAccept { conn_idx } = s.state {
-                        found = Some(conn_idx);
-                        break 'outer;
+                    if let SockState::UnixPendingAccept { conn_idx, sock_id } = s.state {
+                        if sock_id == listen_sock_id {
+                            found = Some(conn_idx);
+                            break 'outer;
+                        }
                     }
                 }
             }
@@ -854,7 +954,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Me
                     for t in tbls.iter_mut() {
                         if !t.in_use { continue; }
                         for s in t.socks.iter_mut() {
-                            if let SockState::UnixPendingAccept { conn_idx: pending_conn } = s.state {
+                            if let SockState::UnixPendingAccept { conn_idx: pending_conn, .. } = s.state {
                                 if pending_conn == conn_idx {
                                     s.state = SockState::UnixConnected { conn_idx, is_a: true };
                                     break;
@@ -947,22 +1047,38 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         if addrlen < 3 || addrlen > 2 + PATH_MAX { return err_reply(-22); }
         let path_len = addrlen - 2;
         let path_ptr = (addr_ptr + 2) as *const u8;
+        let mut pbytes = [0u8; PATH_MAX];
+        unsafe { core::ptr::copy_nonoverlapping(path_ptr, pbytes.as_mut_ptr(), path_len); }
+        let is_abstract = pbytes[0] == 0;
 
-        let bound_idx = {
+        // Resolve the address to the sock_id of a live listener. Abstract
+        // names byte-match here; pathnames resolve through the VFS (symlinks,
+        // the /dev/shm and /run/user/0 tmpfs mounts, S_IFSOCK check).
+        let sock_id = if is_abstract {
             let bound = BOUND_PATHS.lock();
             let mut found = None;
-            for (i, bp) in bound.iter().enumerate() {
-                if bp.in_use && bp.path_len == path_len &&
-                   bp.path[..path_len] == unsafe {
-                       core::slice::from_raw_parts(path_ptr, path_len)
-                   }[..] {
-                    found = Some(i);
+            for bp in bound.iter() {
+                if bp.in_use && bp.is_abstract && bp.path_len == path_len
+                   && bp.path[..path_len] == pbytes[..path_len] {
+                    found = Some(bp.sock_id);
                     break;
                 }
             }
-            match found { Some(i) => i, None => return err_reply(-111) }
+            match found { Some(id) => id, None => return err_reply(-111) } // ECONNREFUSED
+        } else {
+            let name_end = pbytes[..path_len].iter().position(|&b| b == 0).unwrap_or(path_len);
+            let name = &pbytes[..name_end];
+            if name.is_empty() { return err_reply(-22); }
+            let r = vfs::unix_resolve_node(pid, name); // sock_id (>=0) or -errno
+            if r < 0 { return make_reply(r); }
+            let sock_id = r as u64;
+            // The node resolved, but its listener may have since closed (Linux
+            // leaves the socket file behind) — connecting then is ECONNREFUSED.
+            let live = BOUND_PATHS.lock().iter()
+                .any(|bp| bp.in_use && !bp.is_abstract && bp.sock_id == sock_id);
+            if !live { return err_reply(-111); }
+            sock_id
         };
-        let _ = bound_idx;
 
         // The connecting socket becomes end A at accept time; capture its creds.
         let cred = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
@@ -983,7 +1099,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
             Some(t) => t, None => return err_reply(-9),
         };
         if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
-        tbl.socks[slot].state = SockState::UnixPendingAccept { conn_idx };
+        tbl.socks[slot].state = SockState::UnixPendingAccept { conn_idx, sock_id };
         ok_reply()
     }
 }
@@ -1427,6 +1543,19 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
         for tf in batch { vfs::drop_transfer(tf); }
         return err_reply(-32); // EPIPE
     }
+    // Bound the in-flight SCM_RIGHTS fds on this direction. Past the cap the
+    // send fails rather than letting the PendingFdBatch queue grow unbounded
+    // (Linux: ETOOMANYREFS). Closes the K1-A handoff note.
+    let queued: usize = if is_a {
+        conn.fdq_ab.iter().map(|b| b.fds.len()).sum()
+    } else {
+        conn.fdq_ba.iter().map(|b| b.fds.len()).sum()
+    };
+    if queued + nfd > QUEUED_FD_CAP {
+        drop(conns);
+        for tf in batch { vfs::drop_transfer(tf); }
+        return err_reply(ETOOMANYREFS);
+    }
     let seq = if is_a { conn.ring_ab.wtotal } else { conn.ring_ba.wtotal };
     let mut total = 0usize;
     for i in 0..n_iov {
@@ -1689,29 +1818,34 @@ fn unix_peer_cred(pid: u32, fd: usize) -> Ucred {
 /// would double-free them (fork children exec immediately in practice).
 fn handle_fork_dup(parent: u32, child: u32) -> Message {
     let mut tbls = SOCK_TABLES.lock();
-    let parent_socks = match tbls.iter().find(|t| t.in_use && t.pid == parent) {
-        Some(t) => t.socks,
-        None    => return ok_reply(), // parent has no sockets — nothing to do
-    };
-    let child_tbl = match get_or_create(child, &mut *tbls) {
-        Some(t) => t, None => return err_reply(-12),
-    };
-    let mut ends: [Option<(usize, bool)>; MAX_SOCKS] = [None; MAX_SOCKS];
-    for (i, e) in parent_socks.iter().enumerate() {
+    // Work by table index, copying one SockEntry at a time. Snapshotting the
+    // whole `socks` array (as `let x = t.socks`) would put a ~24 KB copy
+    // (MAX_SOCKS * SockEntry) on the kernel stack at every fork.
+    if tbls.iter().position(|t| t.in_use && t.pid == parent).is_none() {
+        return ok_reply(); // parent has no sockets — nothing to do
+    }
+    if get_or_create(child, &mut *tbls).is_none() {
+        return err_reply(-12);
+    }
+    let parent_pos = tbls.iter().position(|t| t.in_use && t.pid == parent).unwrap();
+    let child_pos  = tbls.iter().position(|t| t.in_use && t.pid == child).unwrap();
+
+    let mut ends: alloc::vec::Vec<(usize, bool)> = alloc::vec::Vec::new();
+    for i in 0..MAX_SOCKS {
+        let e = tbls[parent_pos].socks[i];
         if !e.in_use { continue; }
         match e.state {
             SockState::UnixConnected { conn_idx, is_a } => {
-                child_tbl.socks[i] = *e;
-                ends[i] = Some((conn_idx, is_a));
+                tbls[child_pos].socks[i] = e;
+                ends.push((conn_idx, is_a));
             }
-            SockState::Unbound { .. } => { child_tbl.socks[i] = *e; }
+            SockState::Unbound { .. } => { tbls[child_pos].socks[i] = e; }
             _ => {} // inet/listening: skipped (see doc comment)
         }
     }
     drop(tbls);
     let mut conns = UNIX_CONNS.lock();
-    for end in ends.iter().flatten() {
-        let (conn_idx, is_a) = *end;
+    for (conn_idx, is_a) in ends {
         if !conns[conn_idx].in_use { continue; }
         if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
     }
@@ -1839,6 +1973,22 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
                 s.socket_set.remove(socket_handle);
             }
         }
+        SockState::UnixListening { bound_idx } => {
+            tbl.socks[slot] = SockEntry::empty();
+            drop(tbls);
+            // Reclaim the address (its VFS node, if any, lingers per Linux).
+            free_bound_idx(bound_idx);
+        }
+        SockState::UnixPendingAccept { conn_idx, .. } => {
+            tbl.socks[slot] = SockEntry::empty();
+            drop(tbls);
+            // A connect that never got accepted: drop its half-open connection.
+            let mut conns = UNIX_CONNS.lock();
+            if conn_idx < MAX_CONNS && conns[conn_idx].in_use {
+                conns[conn_idx].drain_fds();
+                conns[conn_idx].in_use = false;
+            }
+        }
         _ => { tbl.socks[slot] = SockEntry::empty(); }
     }
     ok_reply()
@@ -1934,43 +2084,50 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
 fn handle_close_all(pid: u32) {
     let mut tbls = SOCK_TABLES.lock();
     if let Some(tbl) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
-        let mut unix_to_close = [usize::MAX; MAX_SOCKS];
-        let mut inet_to_close = [None; MAX_SOCKS];
-        
-        for (i, s) in tbl.socks.iter().enumerate() {
+        // Heap-collected, not MAX_SOCKS-sized stack arrays — at 512 those would
+        // be ~12 KB of stack in a process-teardown path.
+        let mut unix_to_close: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        let mut inet_to_close: alloc::vec::Vec<SocketHandle> = alloc::vec::Vec::new();
+        let mut bound_to_free: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+
+        for s in tbl.socks.iter() {
             match s.state {
-                SockState::UnixConnected { conn_idx, .. } => {
-                    unix_to_close[i] = conn_idx;
+                SockState::UnixConnected { conn_idx, .. }
+                | SockState::UnixPendingAccept { conn_idx, .. } => {
+                    unix_to_close.push(conn_idx);
+                }
+                SockState::UnixListening { bound_idx } => {
+                    bound_to_free.push(bound_idx);
                 }
                 SockState::InetConnected { socket_handle, .. }
                 | SockState::InetListening { socket_handle }
                 | SockState::IcmpBound { socket_handle } => {
-                    inet_to_close[i] = Some(socket_handle);
+                    inet_to_close.push(socket_handle);
                 }
                 _ => {}
             }
         }
         drop(tbls);
-        
+
         let mut conns = UNIX_CONNS.lock();
-        for &ci in &unix_to_close {
-            if ci != usize::MAX { conns[ci].drain_fds(); conns[ci].in_use = false; }
+        for ci in unix_to_close {
+            if ci < MAX_CONNS && conns[ci].in_use { conns[ci].drain_fds(); conns[ci].in_use = false; }
         }
         drop(conns);
 
+        for bi in bound_to_free { free_bound_idx(bi); }
+
         let mut stack = NET_STACK.lock();
         if let Some(ref mut s) = *stack {
-            for &handle_opt in &inet_to_close {
-                if let Some(handle) = handle_opt {
-                    s.socket_set.remove(handle);
-                }
+            for handle in inet_to_close {
+                s.socket_set.remove(handle);
             }
         }
         drop(stack);
 
         let mut tbls = SOCK_TABLES.lock();
         if let Some(tbl) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
-            *tbl = ProcSockTable::empty();
+            tbl.reset();
         }
     }
 }

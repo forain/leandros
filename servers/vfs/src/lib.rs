@@ -273,6 +273,12 @@ struct TmpFileEntry {
     /// time, so a dangling or relative target is stored exactly as given and
     /// only interpreted during lookup (see `tmp_resolve_links`).
     is_link:  bool,
+    /// True for an AF_UNIX bound-socket node (created by `unix_bind_node` when
+    /// a process `bind()`s a pathname socket). Reported as S_IFSOCK by
+    /// stat/fstat/getdents64. `sock_id` links it back to the net server's
+    /// listener so `connect` can resolve the path to the right socket.
+    is_sock:  bool,
+    sock_id:  u64,
     /// Hard-link indirection. `usize::MAX` means "this entry owns its own
     /// bytes"; anything else is the pool index of the entry that does.
     ///
@@ -302,6 +308,7 @@ impl TmpFileEntry {
         Self { path: [0u8; MAX_TMP_PATH], path_len: 0,
                data: [0u8; MAX_TMP_SIZE], len: 0,
                in_use: false, is_dir: false, is_fifo: false, is_link: false,
+               is_sock: false, sock_id: 0,
                link_to: usize::MAX,
                mode: 0, uid: 0, gid: 0, ephemeral: false,
                xattr: [0u8; xattr::TMP_XATTR_ARENA] }
@@ -1120,6 +1127,10 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/proc",
     b"/bin",
     b"/tmp",
+    b"/dev/shm",
+    b"/run",
+    b"/run/user",
+    b"/run/user/0",
     b"/mnt",
     b"/home",
     b"/root",
@@ -1480,6 +1491,10 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
     if path.starts_with(b"/dev/") || path.starts_with(b"/proc/")
        || path.starts_with(b"/tmp/") || path.starts_with(b"/etc/")
        || path == b"/dev" || path == b"/proc" || path == b"/tmp" || path == b"/etc"
+       // The /run/user tmpfs mount (Wayland + D-Bus sockets). /dev/shm rides
+       // the /dev/ prefix above; /tmp rides /tmp/. Intercept /run/user before
+       // the mount table so it lands on tmpfs, not the pivoted F2FS root.
+       || path.starts_with(b"/run/user") || path == b"/run"
     {
         return Some(path);
     }
@@ -1499,9 +1514,41 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
     }
 }
 
-/// Return true if `path` starts with the prefix `/tmp/` or equals `/tmp`.
+/// The tmpfs mount roots. Each is an absolute, normalised path with no trailing
+/// slash; the TMP_FILES pool holds strict descendants of these (files, dirs,
+/// symlinks, and AF_UNIX socket nodes), and each root itself is a pseudo-dir
+/// listed in RAMFS_DIRS. `/tmp` is the original; `/dev/shm` (POSIX shm, wl_shm)
+/// and `/run/user/0` (Wayland + D-Bus sockets) are the K1 additions.
+static TMPFS_ROOTS: &[&[u8]] = &[b"/tmp", b"/dev/shm", b"/run/user/0"];
+
+/// True when `path` names a tmpfs mount root exactly.
+fn is_tmpfs_root(path: &[u8]) -> bool {
+    TMPFS_ROOTS.iter().any(|&r| r == path)
+}
+
+/// The tmpfs root that owns `path` (the root itself, or a descendant under it),
+/// or `None` when no tmpfs mount owns it.
+fn tmpfs_root_of(path: &[u8]) -> Option<&'static [u8]> {
+    TMPFS_ROOTS.iter().copied().find(|&r| {
+        path == r || (path.len() > r.len() && path.starts_with(r) && path[r.len()] == b'/')
+    })
+}
+
+/// Return true if `path` lives under any tmpfs mount root (root or descendant).
 fn is_tmp_path(path: &[u8]) -> bool {
-    path == b"/tmp" || path.starts_with(b"/tmp/")
+    tmpfs_root_of(path).is_some()
+}
+
+/// S_IFDIR mode (type | permission bits) for a RAMFS_DIRS pseudo-directory.
+/// The K1 tmpfs mount roots carry conventional perms: `/dev/shm` is
+/// world-writable + sticky (1777, like a real shm mount), `/run/user/0` is
+/// private to its owner (0700). Everything else keeps the historical 0755.
+fn ramfs_dir_mode(dir: &[u8]) -> u32 {
+    match dir {
+        b"/dev/shm"    => 0o041777,
+        b"/run/user/0" => 0o040700,
+        _              => 0o040755,
+    }
 }
 
 // ── tmpfs path convention ────────────────────────────────────────────────────
@@ -1551,7 +1598,7 @@ fn tmpfs_path(path: &[u8]) -> Option<&[u8]> {
 /// Parent directory of a normalised tmpfs path ("/tmp/d/f" → "/tmp/d").
 /// `None` for "/tmp" itself, which has no tmpfs parent.
 fn tmp_parent(path: &[u8]) -> Option<&[u8]> {
-    if path == b"/tmp" { return None; }
+    if is_tmpfs_root(path) { return None; }
     let i = path.iter().rposition(|&b| b == b'/')?;
     Some(if i == 0 { &path[..1] } else { &path[..i] })
 }
@@ -1567,7 +1614,7 @@ fn tmp_find(tmp: &[TmpFileEntry], path: &[u8]) -> Option<usize> {
 /// True when `path` names an existing directory that entries may be created
 /// under: "/tmp" always, otherwise an in-use `is_dir` pool entry.
 fn tmp_dir_exists(tmp: &[TmpFileEntry], path: &[u8]) -> bool {
-    path == b"/tmp" || tmp_find(tmp, path).map_or(false, |i| tmp[i].is_dir)
+    is_tmpfs_root(path) || tmp_find(tmp, path).map_or(false, |i| tmp[i].is_dir)
 }
 
 /// True when any pool entry (other than `skip`) lives under directory `dir`.
@@ -1785,7 +1832,9 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
         // index of the '/' preceding it, `comp_end` one past its last byte.
         let hit = {
             let tmp = TMP_FILES.lock();
-            let mut comp_start = 4usize; // past "/tmp"
+            // Skip the mount-root prefix ("/tmp", "/dev/shm", "/run/user/0") so
+            // component scanning starts at the first path element under it.
+            let mut comp_start = tmpfs_root_of(path).map(|r| r.len()).unwrap_or(4);
             let mut found = None;
             while comp_start < path.len() {
                 let mut comp_end = comp_start + 1;
@@ -2250,8 +2299,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             VnodeKind::DevStdio { target_fd: 0 }
         } else if lookup_path == b"/dev/fb0" {
             VnodeKind::DevFb { pos: 0 }
-        } else if is_tmp_path(path) && (lookup_path != b"/tmp" && lookup_path != b"tmp") {
-            // ── Writable /tmp file ────────────────────────────────────────────────
+        } else if is_tmp_path(path) && !is_tmpfs_root(path) {
+            // ── Writable tmpfs file (/tmp, /dev/shm, /run/user/0) ─────────────────
             let writable = flags & (O_WRONLY | O_RDWR) != 0;
             let create   = flags & O_CREAT  != 0;
             let trunc    = flags & O_TRUNC  != 0;
@@ -3715,6 +3764,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                 let d_type = if e.is_dir { 4 }
                              else if e.is_fifo { 1 }
                              else if e.is_link { 10 }
+                             else if e.is_sock { 12 } // DT_SOCK
                              else { 8 };
                 if let Some(r) = write_dirent(buf, off, count, 400 + i as u64, name, d_type) {
                     off += r; pos += 1;
@@ -4317,7 +4367,7 @@ fn handle_rename(old_ptr: usize, new_ptr: usize) -> Message {
 /// pool is flat and parentage is encoded in the path bytes alone.
 fn tmpfs_rename(old: &[u8], new: &[u8]) -> Message {
     if old == new { return ok_reply(); }
-    if old == b"/tmp" || new == b"/tmp" { return err_reply(-16); } // EBUSY
+    if is_tmpfs_root(old) || is_tmpfs_root(new) { return err_reply(-16); } // EBUSY — mount root
     if new.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }     // ENAMETOOLONG
 
     let open_fds = tmp_open_fd_mask(); // before TMP_FILES: FD_TABLES → TMP_FILES
@@ -4384,7 +4434,7 @@ fn handle_unlink(path_ptr: usize) -> Message {
     let raw = &pbuf[..plen];
 
     if let Some(path) = tmpfs_path(raw) {
-        if path == b"/tmp" { return err_reply(-21); } // EISDIR
+        if is_tmpfs_root(path) { return err_reply(-21); } // EISDIR — mount root
         let open_fds = tmp_open_fd_mask(); // before TMP_FILES: FD_TABLES → TMP_FILES
         let mut tmp = TMP_FILES.lock();
         return match tmp_find(&tmp[..], path) {
@@ -4411,7 +4461,7 @@ fn handle_mkdir(pid: u32, path_ptr: usize, mode: u32) -> Message {
     let raw = &pbuf[..plen];
 
     if let Some(path) = tmpfs_path(raw) {
-        if path == b"/tmp" { return err_reply(-17); }                  // EEXIST
+        if is_tmpfs_root(path) { return err_reply(-17); }              // EEXIST — mount root
         if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }    // ENAMETOOLONG
         let mut tmp = TMP_FILES.lock();
         if tmp_find(&tmp[..], path).is_some() { return err_reply(-17); }
@@ -4467,7 +4517,7 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
     let raw = &pbuf[..plen];
 
     if let Some(path) = tmpfs_path(raw) {
-        if path == b"/tmp" { return err_reply(-17); }                  // EEXIST
+        if is_tmpfs_root(path) { return err_reply(-17); }              // EEXIST — mount root
         if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }    // ENAMETOOLONG
         let mut tmp = TMP_FILES.lock();
         if tmp_find(&tmp[..], path).is_some() { return err_reply(-17); } // EEXIST
@@ -4493,6 +4543,74 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
     err_reply(-30) // EROFS
 }
 
+// ── AF_UNIX socket nodes (called from the net server) ────────────────────────
+//
+// A pathname AF_UNIX bind creates a real S_IFSOCK node on tmpfs; connect
+// resolves the path through the same lookup machinery (symlinks, the
+// /tmp/-/dev/shm/-/run/user/0 mounts) back to the net server's listener.
+// Abstract-namespace sockets never reach here (net matches those by bytes).
+
+/// bind(): create an S_IFSOCK node at `path`, tagged with the net server's
+/// `sock_id`. Intermediate components are followed through symlinks; the final
+/// component is created literally (bind does not follow a trailing symlink).
+///
+/// 0 on success, else a negative errno: -17 EEXIST (net → EADDRINUSE), -2
+/// ENOENT (missing parent), -36 ENAMETOOLONG, -28 ENOSPC, -95 EOPNOTSUPP (not
+/// a tmpfs path — f2fs socket binds are unsupported).
+pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
+    let mut resolved = [0u8; 256];
+    let rpath = match tmp_resolve_links(path, false, &mut resolved) {
+        Ok(n)  => &resolved[..n],
+        Err(e) => return e,
+    };
+    let tpath = match tmpfs_path(rpath) {
+        Some(p) => p,
+        None    => return -95, // EOPNOTSUPP — sockets only bind on tmpfs
+    };
+    if is_tmpfs_root(tpath) { return -17; }             // EEXIST — the mount root
+    if tpath.len() > MAX_TMP_PATH - 1 { return -36; }   // ENAMETOOLONG
+    let mut tmp = TMP_FILES.lock();
+    if tmp_find(&tmp[..], tpath).is_some() { return -17; } // EEXIST
+    match tmp_parent(tpath) {
+        Some(p) if tmp_dir_exists(&tmp[..], p) => {}
+        _ => return -2, // ENOENT
+    }
+    let idx = match tmp.iter().position(|e| !e.in_use) {
+        Some(i) => i, None => return -28, // ENOSPC
+    };
+    tmp[idx] = TmpFileEntry::empty();
+    tmp[idx].in_use  = true;
+    tmp[idx].is_sock = true;
+    tmp[idx].sock_id = sock_id;
+    tmp[idx].mode = 0o777 & !sched::umask(u32::MAX);
+    tmp[idx].uid  = sched::euid_of(pid);
+    tmp[idx].gid  = sched::egid_of(pid);
+    tmp_set_path(&mut tmp[idx], tpath);
+    0
+}
+
+/// connect(): resolve `path` (following symlinks on every component) to the
+/// `sock_id` of the S_IFSOCK node bound there. Returns the sock_id (>= 0) or a
+/// negative errno: -2 ENOENT (nothing there), -111 ECONNREFUSED (exists but is
+/// not a socket), -95 EOPNOTSUPP (not a tmpfs path).
+pub fn unix_resolve_node(_pid: u32, path: &[u8]) -> i64 {
+    let mut resolved = [0u8; 256];
+    let rpath = match tmp_resolve_links(path, true, &mut resolved) {
+        Ok(n)  => &resolved[..n],
+        Err(e) => return e as i64,
+    };
+    let tpath = match tmpfs_path(rpath) {
+        Some(p) => p,
+        None    => return -95,
+    };
+    let tmp = TMP_FILES.lock();
+    match tmp_find(&tmp[..], tpath) {
+        Some(idx) if tmp[idx].is_sock => tmp[idx].sock_id as i64,
+        Some(_) => -111, // exists, not a socket → ECONNREFUSED
+        None    => -2,   // ENOENT
+    }
+}
+
 /// symlink(target, linkpath) — create a symlink.
 ///
 /// The target is stored verbatim in the entry's data bytes: no normalisation,
@@ -4507,7 +4625,7 @@ fn handle_symlink(pid: u32, target_ptr: usize, link_ptr: usize) -> Message {
     let raw = &lbuf[..llen];
 
     if let Some(path) = tmpfs_path(raw) {
-        if path == b"/tmp" { return err_reply(-17); }               // EEXIST
+        if is_tmpfs_root(path) { return err_reply(-17); }           // EEXIST — mount root
         if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); } // ENAMETOOLONG
         let mut tmp = TMP_FILES.lock();
         if tmp_find(&tmp[..], path).is_some() { return err_reply(-17); } // EEXIST
@@ -4573,7 +4691,7 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
             // canonicalizing the cwd fail before the operand was ever looked
             // at. Answer for the pseudo-directory the same way the RAMFS_DIRS
             // arm below would.
-            None if path == b"/tmp" => err_reply(-22),
+            None if is_tmpfs_root(path) => err_reply(-22),
             None    => err_reply(-2),  // ENOENT
         };
     }
@@ -4630,6 +4748,8 @@ fn handle_link(old_ptr: usize, new_ptr: usize) -> Message {
             tmp[idx].link_to = owner;
             tmp[idx].is_fifo = tmp[owner].is_fifo;
             tmp[idx].is_link = tmp[owner].is_link;
+            tmp[idx].is_sock = tmp[owner].is_sock;
+            tmp[idx].sock_id = tmp[owner].sock_id;
             tmp[idx].mode    = tmp[owner].mode;
             tmp[idx].uid     = tmp[owner].uid;
             tmp[idx].gid     = tmp[owner].gid;
@@ -4660,7 +4780,7 @@ fn handle_rmdir(path_ptr: usize) -> Message {
     let raw = &pbuf[..plen];
 
     if let Some(path) = tmpfs_path(raw) {
-        if path == b"/tmp" { return err_reply(-16); } // EBUSY — mount point
+        if is_tmpfs_root(path) { return err_reply(-16); } // EBUSY — mount root
         let mut tmp = TMP_FILES.lock();
         let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
         if !tmp[idx].is_dir { return err_reply(-20); } // ENOTDIR
@@ -4828,6 +4948,7 @@ fn apply_chown(e: &mut TmpFileEntry, euid: u32, uid: u32, gid: u32) -> Message {
 fn tmp_ifmt(e: &TmpFileEntry) -> u16 {
     if e.is_dir { 0o040000 }
     else if e.is_link { 0o120000 }
+    else if e.is_sock { 0o140000 }
     else if e.is_fifo { 0o010000 }
     else { 0o100000 }
 }
@@ -5466,6 +5587,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
     const S_IFCHR: u32 = 0o020000;
     const S_IFDIR: u32 = 0o040000;
     const S_IFREG: u32 = 0o100000;
+    const S_IFSOCK: u32 = 0o140000;
 
     if stat_ptr == 0 { return err_reply(-14); }
 
@@ -5515,6 +5637,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
             let t = TMP_FILES.lock();
             let e = &t[idx];
             if e.is_dir       { (S_IFDIR | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
+            else if e.is_sock { (S_IFSOCK | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
             else if e.is_fifo { (S_IFIFO | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
             else              { (S_IFREG | (e.mode & 0o7777), e.len as u64, 0x2000_0000 + idx as u64) }
         }
@@ -5558,7 +5681,7 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         // Known static directories.
         for &dir in RAMFS_DIRS {
             if lookup_path == dir {
-                write_stat(stat_ptr, 0o040755, 0, 1 + dir.as_ptr() as u64 & 0xFFFF);
+                write_stat(stat_ptr, ramfs_dir_mode(dir), 0, 1 + dir.as_ptr() as u64 & 0xFFFF);
                 return ok_reply();
             }
         }
@@ -5620,8 +5743,9 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
                 let nlink = tmp_nlink(&tmp[..], idx);
                 let e = &tmp[owner];
                 let size = e.len as u64;
-                // S_IFLNK / S_IFIFO / S_IFREG
+                // S_IFLNK / S_IFSOCK / S_IFIFO / S_IFREG
                 let ifmt: u32 = if !follow && tmp[idx].is_link { 0o120000 }
+                                else if e.is_sock { 0o140000 }
                                 else if e.is_fifo { 0o010000 }
                                 else { 0o100000 };
                 let default_mode = if ifmt == 0o120000 { 0o777 } else { 0o644 };
