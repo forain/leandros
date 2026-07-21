@@ -187,7 +187,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         }
 
         // ── Step 6: gather parent credentials ────────────────────────────────
-        let (heap_start, heap_end, pid, _tgid, pgid, sid, uid, gid, euid, egid, cwd, tls_base,
+        let (heap_start, heap_end, pid, _tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, cwd, tls_base,
              nice, umask, root) = {
             let rq = super::RUN_QUEUE.lock();
             if let Some(t) = rq.find_pid(parent_pid) {
@@ -196,7 +196,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
                     .map(|a| (a.heap_start, a.heap_end))
                     .unwrap_or((0, 0));
                 (hs, he, t.pid, t.tgid, t.pgid, t.sid,
-                 t.uid, t.gid, t.euid, t.egid, (t.cwd.clone(), t.cwd_len), t.tls_base,
+                 t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, (t.cwd.clone(), t.cwd_len), t.tls_base,
                  t.priority, t.umask, (t.root.clone(), t.root_len))
             } else {
                 mm::buddy::free(stack_base_phys, stack_pages);
@@ -251,6 +251,8 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         child.gid           = gid;
         child.euid          = euid;
         child.egid          = egid;
+        child.suid          = suid;
+        child.sgid          = sgid;
         child.heap_start    = heap_start;
         child.heap_end      = heap_end;
         // The cwd is a (bytes, len) pair: `cwd` alone is a fixed 128-byte
@@ -403,7 +405,7 @@ pub fn clone_thread(
         }
 
         // ── Collect parent credentials and page table ─────────────────────────
-        let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, heap_start, heap_end,
+        let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, heap_start, heap_end,
              ctid_phys, cwd, leader_as, nice, umask, root) = {
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid) {
@@ -424,7 +426,7 @@ pub fn clone_thread(
                     // leader's tgid, so lock_leader_address_space's tgid
                     // lookup already resolves to it.
                     (t.page_table, t.tgid, t.pgid, t.sid,
-                     t.uid, t.gid, t.euid, t.egid, hs, he, cp, (t.cwd.clone(), t.cwd_len),
+                     t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, hs, he, cp, (t.cwd.clone(), t.cwd_len),
                      leader.address_space.clone(), t.priority, t.umask, (t.root.clone(), t.root_len))
                 }
                 None => {
@@ -466,6 +468,7 @@ pub fn clone_thread(
         child.sid        = sid;
         child.uid        = uid;  child.gid  = gid;
         child.euid       = euid; child.egid = egid;
+        child.suid       = suid; child.sgid = sgid;
         child.heap_start = heap_start;
         child.heap_end   = heap_end;
         // See fork_current: cwd is (bytes, len); the length must travel too.

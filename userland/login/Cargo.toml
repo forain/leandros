@@ -1,0 +1,11 @@
+[package]
+name = "leandros-login"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "login"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

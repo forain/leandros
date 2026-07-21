@@ -11,8 +11,11 @@ extern crate leandros_libc;
 
 use leandros_libc::{
     write, STDOUT_FILENO, getpid, execve, sched_yield, mount, pivot_root, mkdir,
-    open, read, close, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC
+    open, read, close, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC,
+    fork, wait4, setsid, ioctl, usleep, exit,
 };
+
+const TIOCSCTTY: usize = 0x540E;
 
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
@@ -56,20 +59,45 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // that one since fstab itself lives on the filesystem being mounted).
     mount_from_fstab();
 
-    // 5. Exec shell from F2FS mounted root
-    write_str("Launching shell via execve...\n");
-    let path = b"/bin/shell\0";
+    // 5. Getty loop: fork a fresh session for /bin/login on every iteration
+    // so a login shell that exits (or a crashing login) always gets a new
+    // console session rather than leaving init with no controlling tty.
+    write_str("Starting getty loop...\n");
+    loop {
+        let pid = fork();
+        if pid == 0 {
+            run_session();
+            // run_session only returns if both execve attempts failed.
+            exit(1);
+        } else if pid > 0 {
+            let mut status = 0i32;
+            wait4(pid, &mut status, 0, core::ptr::null_mut());
+            write_str("session ended, restarting login\n");
+        } else {
+            write_str("ERROR: fork failed in getty loop\n");
+        }
+        usleep(1_000_000);
+    }
+}
+
+/// Runs in the forked child: become a session leader, claim the console as
+/// the controlling tty, then exec login (falling back to the raw shell so a
+/// broken image still boots).
+unsafe fn run_session() {
+    setsid();
+    ioctl(0, TIOCSCTTY, 0);
+
+    let path = b"/bin/login\0";
     let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
     let envp: [*const u8; 1] = [core::ptr::null()];
-
     execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
 
-    // If execve returns, it failed
-    write_str("ERROR: execve /bin/shell failed!\n");
+    write_str("ERROR: execve /bin/login failed, falling back to /bin/shell\n");
+    let path = b"/bin/shell\0";
+    let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+    execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
 
-    loop {
-        sched_yield();
-    }
+    write_str("ERROR: execve /bin/shell failed!\n");
 }
 
 /// Read `/etc/fstab` and mount every entry except the root ("/") one, which

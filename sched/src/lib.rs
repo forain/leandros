@@ -657,22 +657,68 @@ pub fn egid_of(pid: Pid) -> u32 {
 
 pub fn current_uid()  -> u32 { RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.uid).unwrap_or(0) }
 pub fn current_euid() -> u32 { euid_of(current_pid()) }
+pub fn current_suid() -> u32 { RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.suid).unwrap_or(0) }
 pub fn current_gid()  -> u32 { RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.gid).unwrap_or(0) }
 pub fn current_egid() -> u32 { egid_of(current_pid()) }
+pub fn current_sgid() -> u32 { RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.sgid).unwrap_or(0) }
 
-/// setuid(2) semantics: a privileged (euid==0) caller sets uid/euid unconditionally;
-/// an unprivileged caller may only set euid to its current real or effective uid.
-/// Returns false (⇒ EPERM) if the unprivileged case is violated.
-pub fn set_current_uid(new_uid: u32) -> bool {
+/// setresuid(2) semantics. Each argument u32::MAX (-1) means "leave unchanged".
+/// A privileged caller (euid==0 on entry) may set each id to any value; an
+/// unprivileged caller may set each id only to one of its current real,
+/// effective or saved uid. All-or-nothing: any EPERM leaves every id intact.
+/// Returns false (⇒ EPERM) on violation.
+pub fn set_current_resuid(ruid: u32, euid: u32, suid: u32) -> bool {
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
     if let Some(t) = rq.find_pid_mut(pid) {
-        if t.euid == 0 {
-            t.uid = new_uid;
-            t.euid = new_uid;
-            return true;
+        let (cur_r, cur_e, cur_s) = (t.uid, t.euid, t.suid);
+        let priv_ = cur_e == 0;
+        let allowed = |v: u32| v == cur_r || v == cur_e || v == cur_s;
+        if !priv_ {
+            if ruid != u32::MAX && !allowed(ruid) { return false; }
+            if euid != u32::MAX && !allowed(euid) { return false; }
+            if suid != u32::MAX && !allowed(suid) { return false; }
         }
-        if new_uid == t.uid || new_uid == t.euid {
+        if ruid != u32::MAX { t.uid  = ruid; }
+        if euid != u32::MAX { t.euid = euid; }
+        if suid != u32::MAX { t.suid = suid; }
+        return true;
+    }
+    false
+}
+
+/// setresgid(2) semantics — mirrors [`set_current_resuid`] for the group identity.
+pub fn set_current_resgid(rgid: u32, egid: u32, sgid: u32) -> bool {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    if let Some(t) = rq.find_pid_mut(pid) {
+        let (cur_r, cur_e, cur_s) = (t.gid, t.egid, t.sgid);
+        let priv_ = t.euid == 0;
+        let allowed = |v: u32| v == cur_r || v == cur_e || v == cur_s;
+        if !priv_ {
+            if rgid != u32::MAX && !allowed(rgid) { return false; }
+            if egid != u32::MAX && !allowed(egid) { return false; }
+            if sgid != u32::MAX && !allowed(sgid) { return false; }
+        }
+        if rgid != u32::MAX { t.gid  = rgid; }
+        if egid != u32::MAX { t.egid = egid; }
+        if sgid != u32::MAX { t.sgid = sgid; }
+        return true;
+    }
+    false
+}
+
+/// setuid(2) semantics: a privileged (euid==0) caller sets real, effective and
+/// saved uid; an unprivileged caller may set only its effective uid, and only
+/// to its current real or saved uid. Returns false (⇒ EPERM) on violation.
+pub fn set_current_uid(new_uid: u32) -> bool {
+    if current_euid() == 0 {
+        return set_current_resuid(new_uid, new_uid, new_uid);
+    }
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    if let Some(t) = rq.find_pid_mut(pid) {
+        if new_uid == t.uid || new_uid == t.suid {
             t.euid = new_uid;
             return true;
         }
@@ -682,15 +728,13 @@ pub fn set_current_uid(new_uid: u32) -> bool {
 
 /// setgid(2) semantics — mirrors [`set_current_uid`] for the group identity.
 pub fn set_current_gid(new_gid: u32) -> bool {
+    if current_euid() == 0 {
+        return set_current_resgid(new_gid, new_gid, new_gid);
+    }
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
     if let Some(t) = rq.find_pid_mut(pid) {
-        if t.euid == 0 {
-            t.gid = new_gid;
-            t.egid = new_gid;
-            return true;
-        }
-        if new_gid == t.gid || new_gid == t.egid {
+        if new_gid == t.gid || new_gid == t.sgid {
             t.egid = new_gid;
             return true;
         }

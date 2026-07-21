@@ -108,3 +108,24 @@ pub unsafe extern "C" fn geteuid() -> u32 {
 pub unsafe extern "C" fn getegid() -> u32 {
     syscall0(nr::GETEGID) as u32
 }
+
+/// Set real, effective and saved user IDs in one call.
+#[no_mangle]
+pub unsafe extern "C" fn setresuid(ruid: u32, euid: u32, suid: u32) -> i32 {
+    let r = syscall3(nr::SETRESUID, ruid as usize, euid as usize, suid as usize);
+    if r < 0 { crate::errno::set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Set real, effective and saved group IDs in one call.
+#[no_mangle]
+pub unsafe extern "C" fn setresgid(rgid: u32, egid: u32, sgid: u32) -> i32 {
+    let r = syscall3(nr::SETRESGID, rgid as usize, egid as usize, sgid as usize);
+    if r < 0 { crate::errno::set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Start a new session, making the caller its session and process group leader.
+#[no_mangle]
+pub unsafe extern "C" fn setsid() -> pid_t {
+    let r = syscall0(nr::SETSID);
+    if r < 0 { crate::errno::set_errno(-r as i32); -1 } else { r as pid_t }
+}

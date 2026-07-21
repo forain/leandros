@@ -976,7 +976,9 @@ fn dispatch_inner(
         GETPGRP     => sched::current_pgid() as isize,
         SETUID => if sched::set_current_uid(a0 as u32) { 0 } else { -1 }, // EPERM
         SETGID => if sched::set_current_gid(a0 as u32) { 0 } else { -1 }, // EPERM
-        SETRESUID | SETRESGID | SETGROUPS => 0, // root: accept
+        SETRESUID => if sched::set_current_resuid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
+        SETRESGID => if sched::set_current_resgid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
+        SETGROUPS => 0, // accept-and-ignore
         GETRESUID   => sys_getresxid(a0, a1, a2, false),
         GETRESGID   => sys_getresxid(a0, a1, a2, true),
         GETGROUPS   => 0,   // 0 supplementary groups
@@ -3140,6 +3142,13 @@ fn read_input_byte() -> Option<u8> {
                     };
                     
                     if ascii != 0 {
+                        // Line-discipline ISIG intercept for hardware-keyboard
+                        // input: ^C/^\/^Z become signals to the foreground
+                        // process group instead of literal bytes. Serial input
+                        // (ev.value == 2) is already intercepted at the UART
+                        // drain and returned above, so it never reaches here —
+                        // no double-interception.
+                        if tty_server::console_intercept_byte(ascii) { continue; }
                         return Some(ascii);
                     }
                 }
@@ -4614,12 +4623,14 @@ fn sys_getpgid(pid_raw: usize) -> isize {
 }
 
 fn sys_getresxid(r_ptr: usize, e_ptr: usize, s_ptr: usize, is_gid: bool) -> isize {
-    // We're always root (uid/gid = 0).
-    let v = 0u32;
-    if r_ptr != 0 && validate_user_buf(r_ptr, 4) { unsafe { core::ptr::write(r_ptr as *mut u32, v); } }
-    if e_ptr != 0 && validate_user_buf(e_ptr, 4) { unsafe { core::ptr::write(e_ptr as *mut u32, v); } }
-    if s_ptr != 0 && validate_user_buf(s_ptr, 4) { unsafe { core::ptr::write(s_ptr as *mut u32, v); } }
-    let _ = is_gid;
+    let (r, e, s) = if is_gid {
+        (sched::current_gid(), sched::current_egid(), sched::current_sgid())
+    } else {
+        (sched::current_uid(), sched::current_euid(), sched::current_suid())
+    };
+    if r_ptr != 0 && validate_user_buf(r_ptr, 4) { unsafe { core::ptr::write(r_ptr as *mut u32, r); } }
+    if e_ptr != 0 && validate_user_buf(e_ptr, 4) { unsafe { core::ptr::write(e_ptr as *mut u32, e); } }
+    if s_ptr != 0 && validate_user_buf(s_ptr, 4) { unsafe { core::ptr::write(s_ptr as *mut u32, s); } }
     0
 }
 

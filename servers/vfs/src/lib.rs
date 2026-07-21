@@ -820,10 +820,11 @@ static RAMFS: &[RamEntry] = &[
     // /etc
     RamEntry { path: b"/etc/motd",
                data: b"Welcome to Leandros!\nType 'help' for available commands.\n" },
-    RamEntry { path: b"/etc/passwd",
-               data: b"root:x:0:0:root:/root:/bin/sh\ndaemon:x:1:1:daemon:/:/bin/false\n" },
-    RamEntry { path: b"/etc/group",
-               data: b"root:x:0:root\ndaemon:x:1:\n" },
+    // /etc/passwd, /etc/group and /etc/shadow deliberately have no entries
+    // here: the real files live on the F2FS root (seeded by
+    // mkfs-f2fs-populated.py) and a static copy would shadow them on every
+    // lookup — login(1) would authenticate against the disk shadow file but
+    // read uid/shell from a stale built-in.
     RamEntry { path: b"/etc/hostname", data: b"leandros\n" },
     RamEntry { path: b"/etc/hosts",
                data: b"127.0.0.1\tlocalhost\n::1\t\tlocalhost\n127.0.0.1\tleandros\n" },

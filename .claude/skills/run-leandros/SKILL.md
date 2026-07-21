@@ -39,6 +39,16 @@ python3 .claude/skills/run-leandros/driver.py start aarch64
 python3 .claude/skills/run-leandros/driver.py start x86_64
 python3 .claude/skills/run-leandros/driver.py start aarch64 uefi-tcg
 
+# 1b. LOG IN — boot lands on a "login: " prompt (getty loop in init), not a
+# shell. Seeded accounts: root/root (uid 0, /root) and leandro/leandro
+# (uid 1000, /home/leandro); shell is /bin/brush for both. Shell exit
+# respawns a fresh login prompt. Run root-expecting tests (vfstest's
+# permission/chroot cases, etc.) as root — as leandro they fail with EPERM
+# by design, and a failed non-root run can leave residue on the persistent
+# image that makes a later root run fail too (regenerate images via
+# scripts/mkfs-f2fs-populated.py if in doubt).
+python3 .claude/skills/run-leandros/driver.py login root root
+
 # 2. Send a shell command, get output. Optional third arg = read-timeout in
 # seconds (default 8) — pass a larger value for long-running commands like mame.
 python3 .claude/skills/run-leandros/driver.py cmd "help"

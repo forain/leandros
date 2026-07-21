@@ -307,10 +307,13 @@ def _connect_with_retry(sock_path, retries=40, delay=0.15):
 
 def _read_serial_until(sentinel, timeout=120):
     """
-    Connect to serial socket and read until sentinel appears or timeout.
-    Returns accumulated text, or None on failure.
+    Connect to serial socket and read until any sentinel appears or timeout.
+    `sentinel` is a str/bytes or a list of them. Returns accumulated text,
+    or None on failure.
     """
-    sentinel_b = sentinel.encode() if isinstance(sentinel, str) else sentinel
+    if not isinstance(sentinel, (list, tuple)):
+        sentinel = [sentinel]
+    sentinels = [s.encode() if isinstance(s, str) else s for s in sentinel]
     s = _connect_with_retry(SERIAL_SOCK)
     if s is None:
         return None
@@ -331,7 +334,7 @@ def _read_serial_until(sentinel, timeout=120):
                     buf += chunk
                     lf.write(chunk)
                     lf.flush()
-                    if sentinel_b in buf:
+                    if any(sb in buf for sb in sentinels):
                         return buf.decode("utf-8", errors="replace")
                 except BlockingIOError:
                     pass
@@ -387,8 +390,8 @@ def cmd_start(arch="aarch64", mode="uefi"):
             sys.exit(f"ERROR: serial socket did not appear.\nQEMU stderr:\n{err}")
         time.sleep(0.1)
 
-    print("Serial socket up. Waiting for shell prompt (up to 120s)...")
-    text = _read_serial_until("> ", timeout=120)
+    print("Serial socket up. Waiting for login/shell prompt (up to 120s)...")
+    text = _read_serial_until(["login: ", "> "], timeout=120)
 
     if text is None:
         # Try to report what QEMU said
@@ -401,7 +404,10 @@ def cmd_start(arch="aarch64", mode="uefi"):
         print(tail, file=sys.stderr)
         sys.exit(1)
 
-    print("Shell ready.")
+    if "login: " in text:
+        print("Login prompt ready (use: driver.py login <user> <password>).")
+    else:
+        print("Shell ready.")
     # Print last 1 KB of boot output so the caller can see the prompt
     try:
         with open(SERIAL_LOG, "rb") as lf:
@@ -409,6 +415,57 @@ def cmd_start(arch="aarch64", mode="uefi"):
             print()
     except Exception:
         pass
+
+
+def cmd_login(user, password, timeout=20):
+    """Answer the login:/Password: prompts, wait for the shell prompt."""
+    s = _connect_with_retry(SERIAL_SOCK)
+    if s is None:
+        sys.exit("ERROR: cannot connect to serial socket")
+    s.setblocking(False)
+
+    def send_line(line):
+        payload = (line + "\n").encode()
+        s.setblocking(True)
+        for i in range(0, len(payload), 8):
+            s.sendall(payload[i:i + 8])
+            time.sleep(0.02)
+        s.setblocking(False)
+
+    def read_until(markers, deadline):
+        buf = b""
+        while time.time() < deadline:
+            if select.select([s], [], [], 0.2)[0]:
+                try:
+                    chunk = s.recv(4096)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    break
+                buf += chunk
+                if b"\x1b[6n" in chunk:
+                    s.setblocking(True)
+                    s.sendall(b"\x1b[24;1R" * chunk.count(b"\x1b[6n"))
+                    s.setblocking(False)
+                try:
+                    with open(SERIAL_LOG, "ab") as lf:
+                        lf.write(chunk)
+                except Exception:
+                    pass
+                if any(m in buf for m in markers):
+                    return buf
+        return buf
+
+    deadline = time.time() + timeout
+    send_line(user)
+    read_until([b"Password: "], deadline)
+    send_line(password)
+    out = read_until([b"> ", b"$ ", b"# ", b"Login incorrect"], deadline)
+    s.close()
+    text = out.decode("utf-8", errors="replace")
+    print(text)
+    if "Login incorrect" in text:
+        sys.exit(1)
 
 
 def _serial_send(command, timeout=8):
@@ -669,6 +726,10 @@ if __name__ == "__main__":
             sys.exit("Usage: driver.py cmd <shell-command> [timeout_seconds]")
         timeout = int(args[2]) if len(args) > 2 else 8
         cmd_cmd(args[1], timeout=timeout)
+    elif sub == "login":
+        if len(args) < 3:
+            sys.exit("Usage: driver.py login <user> <password> [timeout_seconds]")
+        cmd_login(args[1], args[2], timeout=int(args[3]) if len(args) > 3 else 20)
     elif sub == "screenshot":
         cmd_screenshot(args[1] if len(args) > 1 else None)
     elif sub == "stop":

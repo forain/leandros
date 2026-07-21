@@ -3,6 +3,7 @@
 
 Matches the on-disk layout expected by servers/f2fs/src/lib.rs.
 """
+import hashlib
 import struct
 import sys
 import os
@@ -214,6 +215,13 @@ def coreutils_command_names(coreutils_dir):
     return sorted(visited & available)
 
 
+def shadow_hash(salt, password):
+    """Match userland/login's verify_password: $sha256$<salt>$<hex>, where
+    hex is the lowercase SHA-256 hexdigest of (salt bytes ++ password bytes)."""
+    digest = hashlib.sha256(salt.encode('ascii') + password.encode('ascii')).hexdigest()
+    return f"$sha256${salt}${digest}"
+
+
 def main():
     if len(sys.argv) < 3:
         print("Usage: mkfs-f2fs-populated.py <output_img> <arch>")
@@ -228,7 +236,7 @@ def main():
     
     bin_files = []
     bins = [
-        "shell", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
+        "shell", "login", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest",
         "waittest", "sigchldtest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping",
@@ -301,14 +309,24 @@ def main():
     ), 0o100644)]
 
     # /etc/passwd and /etc/group — musl's getpwuid/getgrgid (used by brush via
-    # the uzers crate) read these. Everything runs as uid 0; home is / since
-    # this script's flat directory model has no /root.
+    # the uzers crate) read these; /bin/login also parses passwd directly.
     etc_files.append(("passwd", (
-        b"root:x:0:0:root:/:/bin/brush\n"
+        b"root:x:0:0:root:/root:/bin/brush\n"
+        b"leandro:x:1000:1000:leandro:/home/leandro:/bin/brush\n"
     ), 0o100644))
     etc_files.append(("group", (
         b"root:x:0:\n"
+        b"leandro:x:1000:\n"
     ), 0o100644))
+
+    # /etc/shadow — /bin/login's only source of password hashes. Salts are
+    # fixed per user so this Python hasher and the Rust verifier in
+    # userland/login/src/main.rs (verify_password) agree byte-for-byte.
+    shadow_lines = (
+        f"root:{shadow_hash('lnd0', 'root')}:\n"
+        f"leandro:{shadow_hash('lnd0', 'leandro')}:\n"
+    )
+    etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
         
     # 2. Dynamically calculate required blocks and image size
     # Each meta segment takes 512 blocks. We have 8 meta segments (4096 blocks).
@@ -365,6 +383,26 @@ def main():
         9: ("/etc"),
         10: ("/mnt"),
         11: ("/lib"),
+        12: ("/root"),
+        13: ("/home"),
+        14: ("/home/leandro"),
+    }
+
+    # Per-directory mode/owner overrides; anything not listed here defaults
+    # to 0755 root:root (matching what every directory got before ownership
+    # was tracked at all).
+    dir_owner = {
+        12: (0o040700, 0, 0),        # /root
+        14: (0o040700, 1000, 1000),  # /home/leandro
+    }
+
+    # Subdirectories per parent, used both to emit "name -> child_ino" dentries
+    # below and to compute each parent's link count (every child directory's
+    # ".." entry adds one hardlink to its parent).
+    subdirs = {
+        3: [("bin", 4), ("old_root", 5), ("dev", 6), ("proc", 7), ("tmp", 8),
+            ("etc", 9), ("mnt", 10), ("lib", 11), ("root", 12), ("home", 13)],
+        13: [("leandro", 14)],
     }
     
     inode_blocks = {}
@@ -381,7 +419,7 @@ def main():
         
     # 4. Process regular files, allocate data blocks and inodes
     file_entries = [] # (parent_ino, name, child_ino, file_type)
-    next_nid = 12
+    next_nid = max(dir_nodes) + 1
     packed_by_path = {}  # host path -> (nid, inode block) for hardlinking
     nlink_by_path = {}   # host path -> current link count
     
@@ -569,37 +607,21 @@ def main():
     # 5. Write directory blocks and inodes
     # Build dentry blocks list for each directory
     dentry_entries = {ino: [] for ino in dir_nodes.keys()}
-    
-    # Add . and .. to all directories
-    dentry_entries[3].append((b'.', 3, DT_DIR))
-    dentry_entries[3].append((b'..', 3, DT_DIR))
-    dentry_entries[4].append((b'.', 4, DT_DIR))
-    dentry_entries[4].append((b'..', 3, DT_DIR))
-    dentry_entries[5].append((b'.', 5, DT_DIR))
-    dentry_entries[5].append((b'..', 3, DT_DIR))
-    dentry_entries[6].append((b'.', 6, DT_DIR))
-    dentry_entries[6].append((b'..', 3, DT_DIR))
-    dentry_entries[7].append((b'.', 7, DT_DIR))
-    dentry_entries[7].append((b'..', 3, DT_DIR))
-    dentry_entries[8].append((b'.', 8, DT_DIR))
-    dentry_entries[8].append((b'..', 3, DT_DIR))
-    dentry_entries[9].append((b'.', 9, DT_DIR))
-    dentry_entries[9].append((b'..', 3, DT_DIR))
-    dentry_entries[10].append((b'.', 10, DT_DIR))
-    dentry_entries[10].append((b'..', 3, DT_DIR))
-    dentry_entries[11].append((b'.', 11, DT_DIR))
-    dentry_entries[11].append((b'..', 3, DT_DIR))
-    
-    # Add subdirectories to root /
-    dentry_entries[3].append((b'bin', 4, DT_DIR))
-    dentry_entries[3].append((b'old_root', 5, DT_DIR))
-    dentry_entries[3].append((b'dev', 6, DT_DIR))
-    dentry_entries[3].append((b'proc', 7, DT_DIR))
-    dentry_entries[3].append((b'tmp', 8, DT_DIR))
-    dentry_entries[3].append((b'etc', 9, DT_DIR))
-    dentry_entries[3].append((b'mnt', 10, DT_DIR))
-    dentry_entries[3].append((b'lib', 11, DT_DIR))
-    
+
+    # Add . and .. to all directories (root is its own parent).
+    parent_of = {3: 3}
+    for parent_ino, children in subdirs.items():
+        for _name, child_ino in children:
+            parent_of[child_ino] = parent_ino
+    for ino in dir_nodes.keys():
+        dentry_entries[ino].append((b'.', ino, DT_DIR))
+        dentry_entries[ino].append((b'..', parent_of[ino], DT_DIR))
+
+    # Add subdirectory entries to their parents.
+    for parent_ino, children in subdirs.items():
+        for name, child_ino in children:
+            dentry_entries[parent_ino].append((name.encode('utf-8'), child_ino, DT_DIR))
+
     # Add regular files to their directories
     for parent_ino, name, child_ino, ftype in file_entries:
         dentry_entries[parent_ino].append((name, child_ino, ftype))
@@ -618,17 +640,17 @@ def main():
             image[db_addr * BLOCK_SIZE : (db_addr + 1) * BLOCK_SIZE] = db_bytes
 
         in_addr = inode_blocks[ino]
-        # Inodes point to their data block
-        mode = 0o040755
-        links = 2 if ino != 3 else 2 + 8 # Root has . and .. and 8 subdirs
-        if ino == 3:
-            links = 2 + 8
-        else:
-            links = 2
-            
+        # Inodes point to their data block. Link count is 2 (self + parent's
+        # entry) plus one per child directory (each child's ".." is another
+        # hardlink to this inode).
+        mode, uid, gid = dir_owner.get(ino, (0o040755, 0, 0))
+        links = 2 + len(subdirs.get(ino, []))
+
         inode_bytes = build_inode_block(mode, links, len(db_addrs) * BLOCK_SIZE, db_addrs, ino)
+        w32(inode_bytes, 4, uid)  # i_uid — see servers/f2fs/src/lib.rs INO_UID
+        w32(inode_bytes, 8, gid)  # i_gid — see servers/f2fs/src/lib.rs INO_GID
         image[in_addr * BLOCK_SIZE : (in_addr + 1) * BLOCK_SIZE] = inode_bytes
-        
+
         write_nat_entry(image, ino, in_addr)
         
     # 6. SIT (Segment Info Table) Updates

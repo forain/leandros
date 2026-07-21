@@ -71,6 +71,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "leandros-login"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
+]
+
+[[package]]
 name = "leandros-shell"
 version = "0.1.0"
 dependencies = [

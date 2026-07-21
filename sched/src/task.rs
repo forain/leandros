@@ -172,6 +172,8 @@ pub struct Task {
     pub gid:  u32,
     pub euid: u32,
     pub egid: u32,
+    pub suid: u32,
+    pub sgid: u32,
 
     // ── Signal state ──────────────────────────────────────────────────────────
     /// Bitmask of pending signals (bit N = signal N+1 is pending).
@@ -315,6 +317,8 @@ impl Task {
             gid: 0,
             euid: 0,
             egid: 0,
+            suid: 0,
+            sgid: 0,
             signal_pending: 0,
             signal_mask: 0,
             shared_signal_pending: 0,
@@ -659,6 +663,8 @@ impl Task {
             gid: 0,
             euid: 0,
             egid: 0,
+            suid: 0,
+            sgid: 0,
             signal_pending: 0,
             signal_mask: 0,
             shared_signal_pending: 0,
