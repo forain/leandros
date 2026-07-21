@@ -85,3 +85,75 @@ Produced (all verified x86-64 musl ELF), installed to ./stage:
 - logs/                            (all setup/build logs)
 
 ## VERDICT: surfaceless/GBM Mesa CROSS-COMPILES CLEANLY on macOS via zig cc. 3 host fixes needed (mako/packaging pip, brew bison, wrapper --version-script normalization). Wayland platform = 1 moderate follow-up (libwayland+scanner). No musl-ism blockers hit in Mesa C at all.
+
+================================================================================
+# WAVE 2 — Wayland platform + aarch64 (both arches complete)
+Workdir: /Users/forain/.claude-forain/jobs/afde2e74/tmp/mesa-wave2 (copy of S3 + extensions)
+Versions: wayland 1.23.1, libffi 3.4.6, wayland-protocols 1.41 (mesa wrap), mesa 25.3.6, libdrm 2.4.134.
+
+## RESULT: BOTH GOALS DONE
+- x86_64: libEGL/GLESv2/gbm/gallium megadriver + dri_gbm built with -Dplatforms=wayland (EGL_EXT/KHR_platform_wayland). rc=0.
+- aarch64: full toolchain extended + libdrm+libffi+libwayland+Mesa all cross-built. rc=0. NO aarch64-specific zig/lld issue.
+
+## ports/ recipe (this dir). One-time: run ./instantiate.sh to expand @DIRNAME@ in the *.ini.
+Layout the scripts expect under this dir: src/{mesa,libdrm,wayland,libffi-x86_64,libffi-aarch64},
+  .venv (mako/packaging/pyyaml/pyelftools), host/ (native scanner), sysroot-<arch>/, build/, stage-<arch>/.
+Order:  instantiate.sh -> build-host-scanner.sh -> per arch: build-libdrm.sh / build-libffi.sh /
+  build-libwayland.sh -> build-mesa-wayland.sh.
+NOTE: cross-musl-x86_64.ini sys_root was renamed sysroot -> sysroot-x86_64 (per-arch, to coexist with
+  aarch64). Put libdrm etc. under sysroot-x86_64 for the surfaceless recipe too.
+
+## NEW host fixes (beyond S3's 3)
+4. Wrapper arg-splitting bug (latent in S3): the old `args="$args $1"; exec zig cc $args` rebuild
+   word-splits any arg with a space. expat compiles with -DXMLIMPORT=__attribute__ ((visibility("default")))
+   -> zig sees `((visibility("default")))` as a positional file: "unrecognized file extension". Fixed:
+   rewrite argv in place with `set -- "$@" ...` (toolchain/*-cc,*-c++). Keeps the --version-script=<path>
+   normalization. Backward compatible.
+5. libtool on a darwin BUILD host cannot emit a Linux ELF .so (libffi): it builds objects + static lib,
+   then leaves dangling libffi.so.8 symlinks with no real object. Fix in build-libffi.sh: link the .so
+   from the PIC objects with zig cc after `make`.
+6. Native wayland-scanner for a cross build needs a NATIVE FILE, not env PKG_CONFIG_PATH: meson clears
+   PKG_CONFIG_PATH for native:true deps in a cross build (verified in meson-log). native-host.ini sets
+   [built-in options] pkg_config_path -> host/lib/pkgconfig. Same file satisfies Mesa's wayland-protocols
+   wrap + wayland-scanner.
+7. (not a blocker) wayland-scanner builds NATIVELY on macOS unpatched with -Dlibraries=false -Dscanner=true
+   -Ddtd_validation=false (brew expat only). Gives host/bin/wayland-scanner + wayland-scanner.pc.
+
+## EGL_WL_bind_wayland_display on swrast — ANSWER: NOT exposed (double-gated). Evidence (mesa 25.3.6):
+- COMPILE gate: meson option `legacy-wayland` (array, DEFAULT []). `-DHAVE_BIND_WL_DISPLAY` is added only if
+  it contains 'bind-wayland-display' (src/egl/meson.build:127-132; meson.build:2010 with_wayland_bind_display).
+  Without it, dri2_set_WL_bind_wayland_display() (egl_dri2.h:592) is an #ifdef'd no-op -> extension never
+  advertised, and wayland-drm protocol + libwayland_drm are not built. => plain -Dplatforms=wayland does NOT
+  expose it.
+- RUNTIME gate (even with the option, which our build sets): egl_dri2.h:596 sets
+  WL_bind_wayland_display = dri2_dpy->has_dmabuf_import && has_dmabuf_export. softpipe/kms_swrast has no
+  dma-buf import/export -> FALSE. platform_wayland.c:2721 also needs dri2_dpy->wl_drm + WL_DRM_CAPABILITY_PRIME;
+  swrast compositors expose wl_shm, not wl_drm.
+Our x86_64/aarch64 libEGL were built WITH -Dlegacy-wayland=bind-wayland-display, so the eglBind/Unbind/
+  CreateWaylandBuffer/QueryWaylandBuffer WL entrypoints are PRESENT in .dynsym (compile path proven), but
+  they will return unsupported / the extension string will not be in eglQueryString(EXTENSIONS) on a
+  software display. => cosmic-panel's bind_wl_display on a nested swrast server: expect UNSUPPORTED; the
+  software path uses wl_shm buffers (no bind needed).
+
+## Runtime ship-set per arch (identical layout both arches; ELF verified x86-64 / aarch64)
+Mesa-built (stage-<arch>/usr/lib):
+  libEGL.so.1.0.0, libGLESv2.so.2.0.0, libGLESv1_CM.so.1.1.0, libgbm.so.1.0.0,
+  libgallium-25.3.6.so (megadriver: softpipe+swrast+kms_swrast), gbm/dri_gbm.so,
+  libexpat.so.1.8.10, libz.so.1.3.1   (last two are mesa subprojects)
+External deps to ship (sysroot-<arch>/usr/lib):
+  libdrm.so.2.134.0, libwayland-client.so.0.23.1, libwayland-server.so.0.23.1,
+  libwayland-egl.so.1.23.1, libwayland-cursor.so.0.23.1, libffi.so.8.1.4
+  + musl libc.so + ld-musl-<arch>.so.1 loader (NOT relibc) — every lib NEEDs libc.so.
+
+## NEEDED-graph delta vs S3 surfaceless (both arches)
+  libEGL:   +libwayland-client.so.0  +libwayland-server.so.0   (was: gallium,expat,gbm,drm,libc)
+  dri_gbm:  +libwayland-server.so.0  (pulled by the bind-wayland-display / wl_drm server path)
+  new transitive: libwayland-client/server NEED libffi.so.8; libwayland-cursor NEEDs libwayland-client.
+  (If built WITHOUT -Dlegacy-wayland=bind-wayland-display, libEGL keeps only libwayland-client.so.0 and
+   dri_gbm drops libwayland-server.)
+
+## VERDICT
+Goal 1 (wayland x86_64): DONE. EGL_EXT_platform_wayland present. EGL_WL_bind_wayland_display double-gated
+  off for swrast (compile-opt + runtime dma-buf) — documented above.
+Goal 2 (aarch64): DONE. Toolchain (zig cc -target aarch64-linux-musl) + lld produced clean aarch64 ELF for
+  libdrm, libffi, libwayland, and the whole Mesa tree. No aarch64-specific zig/lld blocker encountered.

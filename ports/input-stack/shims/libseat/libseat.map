@@ -1,0 +1,19 @@
+/* Version script for the libseat shim.
+ * Exports only the public libseat ABI; everything else is local.
+ * Matches upstream seatd's symbol-visibility policy (soname libseat.so.1). */
+LIBSEAT_1 {
+	global:
+		libseat_open_seat;
+		libseat_close_seat;
+		libseat_disable_seat;
+		libseat_open_device;
+		libseat_close_device;
+		libseat_seat_name;
+		libseat_switch_session;
+		libseat_get_fd;
+		libseat_dispatch;
+		libseat_set_log_handler;
+		libseat_set_log_level;
+	local:
+		*;
+};

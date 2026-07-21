@@ -1,16 +1,20 @@
 #!/bin/sh
-args=""
-while [ $# -gt 0 ]; do
-  case "$1" in
+# zig c++ musl cross wrapper (x86_64-linux-musl). Space-safe in-place argv rewrite that also
+# normalizes  -Wl,--version-script <path>  ->  -Wl,--version-script=<path>
+# (zig/lld rejects the bare positional script path, and the unquoted-string
+# rebuild used previously tore apart args containing spaces such as
+# -DXMLIMPORT=__attribute__ ((visibility("default"))) from expat).
+n=$#
+while [ $n -gt 0 ]; do
+  a=$1; shift; n=$((n-1))
+  case $a in
     -Wl,--version-script|-Wl,--dynamic-list)
-      flag="$1"; shift
-      args="$args $flag=$1"
+      b=$1; shift; n=$((n-1))
+      set -- "$@" "$a=$b"
       ;;
     *)
-      args="$args $1"
+      set -- "$@" "$a"
       ;;
   esac
-  shift
 done
-# shellcheck disable=SC2086
-exec zig c++ -target x86_64-linux-musl $args
+exec zig c++ -target x86_64-linux-musl "$@"

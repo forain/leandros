@@ -1,5 +1,5 @@
 #!/bin/sh
-# zig cc musl cross wrapper (x86_64-linux-musl). Space-safe in-place argv rewrite that also
+# zig c++ musl cross wrapper (aarch64-linux-musl). Space-safe in-place argv rewrite that also
 # normalizes  -Wl,--version-script <path>  ->  -Wl,--version-script=<path>
 # (zig/lld rejects the bare positional script path, and the unquoted-string
 # rebuild used previously tore apart args containing spaces such as
@@ -17,4 +17,4 @@ while [ $n -gt 0 ]; do
       ;;
   esac
 done
-exec zig cc -target x86_64-linux-musl "$@"
+exec zig c++ -target aarch64-linux-musl "$@"

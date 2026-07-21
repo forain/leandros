@@ -1,0 +1,11 @@
+/* Version script for the libudev shim.
+ * Exports the full public libudev ABI (soname libudev.so.1); everything else
+ * is local. Symbol node name matches systemd's (LIBUDEV_183 is the historical
+ * base version tag most consumers were built against; libudev never bumped it
+ * for the stable API used here). */
+LIBUDEV_183 {
+	global:
+		udev_*;
+	local:
+		*;
+};

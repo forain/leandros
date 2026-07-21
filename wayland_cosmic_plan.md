@@ -149,7 +149,17 @@ SO_PEERSEC, cgroups).
 
 ## 3. Kernel work list (grouped, roughly ordered)
 
-**Wave K1 — transport (blockers 1, 2, 7):**
+**Wave K1 — transport (blockers 1, 2, 7): COMPLETE 2026-07-21** — K1-A SCM_RIGHTS
++ SO_PEERCRED (de461b9), K1-B shared tmpfs/memfd VMO + real seals (2 commits),
+K1-C AF_UNIX 512 + S_IFSOCK VFS nodes + /dev/shm + /run/user/0 + queued-fd cap
+(233af7f, 3d5ee9a). scmtest grew 4→19 subtests, 19/19 PASS both arches; all
+baselines green. Deviations + K2 handoff notes in memory. K2 design done
+(job tmp k2-epoll-design.md, implementing), K3 design done (k3-elf-design.md,
+queued; musl dynamic corpus + sysroots built host-side). Host lanes complete:
+Mesa full stack both arches incl. wayland platform (ports/mesa/), input stack +
+shims (ports/input-stack/), busd static, musl dynamic world. Panel
+bind_wl_display failure confirmed non-fatal (wl_shm-only nested server);
+applets: force software renderer via env at M6.
 - SCM_RIGHTS: parse/build cmsgs in sendmsg/recvmsg, translate fds across processes,
   MSG_CMSG_CLOEXEC, MSG_CTRUNC semantics, queued-fd lifetime on socket close.
 - SO_PEERCRED (D-Bus EXTERNAL auth).
