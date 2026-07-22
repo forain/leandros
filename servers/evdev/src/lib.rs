@@ -39,8 +39,16 @@ pub struct input_event {
 
 // ── Device State ─────────────────────────────────────────────────────────────
 
-const MAX_EVENTS: usize = 64;
+// A tablet emits X + Y + SYN (and buttons) per motion frame; a fast drag bursts
+// well past 64, so the ring is 256 to avoid dropping frames mid-gesture.
+const MAX_EVENTS: usize = 256;
 const MAX_DEVICES: usize = 4;
+
+// Device classes we surface. Keyboard = event0 (13:64), tablet = event1 (13:65,
+// absolute pointer: ABS_X/ABS_Y + BTN_LEFT, NO INPUT_PROP_DIRECT so libinput
+// classifies it as a pointer, not a touchscreen).
+const DEV_KEYBOARD: usize = 0;
+const DEV_TABLET: usize = 1;
 
 struct EvdevDevice {
     events: [input_event; MAX_EVENTS],
@@ -48,6 +56,13 @@ struct EvdevDevice {
     tail:   usize,
     count:  usize,
     in_use: bool,
+    /// CLOCK id events are stamped with (EVIOCSCLOCKID). 1 = CLOCK_MONOTONIC,
+    /// which is what libinput requests; we always stamp from the monotonic tick
+    /// source, so this is advisory only (kept for a truthful EVIOCGCLOCKID-style
+    /// answer and future REALTIME support).
+    clockid: u32,
+    /// Monotonic push counter — the poll/epoll readiness sequence (edge emu).
+    seq: u64,
 }
 
 impl EvdevDevice {
@@ -61,6 +76,8 @@ impl EvdevDevice {
             tail:   0,
             count:  0,
             in_use: false,
+            clockid: 1, // CLOCK_MONOTONIC
+            seq: 0,
         }
     }
 
@@ -72,6 +89,7 @@ impl EvdevDevice {
         self.events[self.tail] = ev;
         self.tail = (self.tail + 1) % MAX_EVENTS;
         self.count += 1;
+        self.seq = self.seq.wrapping_add(1);
     }
 
     fn pop(&mut self) -> Option<input_event> {
@@ -90,6 +108,89 @@ static DEVICES: Mutex<[EvdevDevice; MAX_DEVICES]> = Mutex::new([const { EvdevDev
 extern "C" {
     fn arch_interrupt_save() -> usize;
     fn arch_interrupt_restore(f: usize);
+}
+
+// ── evdev capability constants (linux/input-event-codes.h) ────────────────────
+
+const BUS_VIRTUAL: u16 = 0x06;
+// EV_SYN=0, EV_KEY=1, EV_ABS=3. Type bitmask: kbd = SYN|KEY = 0x03,
+// tablet = SYN|KEY|ABS = 0x0B.
+const ABS_X: usize = 0;
+const ABS_Y: usize = 1;
+
+// ── User-copy helpers (all go through the caller's address space) ─────────────
+
+fn copy_out(pid: u32, dst: usize, src: &[u8]) -> Message {
+    let n = src.len();
+    let srcp = src.as_ptr() as usize;
+    let ok = sched::with_task_address_space(pid, || {
+        unsafe { core::ptr::copy_nonoverlapping(srcp as *const u8, dst as *mut u8, n); }
+        0i32
+    });
+    match ok { Some(0) => val_reply(n as u64), _ => err_reply(-14) }
+}
+
+fn copy_in(pid: u32, src: usize, dst: &mut [u8]) -> Option<()> {
+    let n = dst.len();
+    let dstp = dst.as_mut_ptr() as usize;
+    sched::with_task_address_space(pid, || {
+        unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dstp as *mut u8, n); }
+        0i32
+    }).map(|_| ())
+}
+
+fn zero_out(pid: u32, dst: usize, len: usize) -> Message {
+    let ok = sched::with_task_address_space(pid, || {
+        unsafe { core::ptr::write_bytes(dst as *mut u8, 0, len); }
+        0i32
+    });
+    match ok { Some(0) => val_reply(len as u64), _ => err_reply(-14) }
+}
+
+/// EVIOCGBIT(ev, len): report the capability bitmask for event type `ev`.
+fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) -> Message {
+    const MAXB: usize = 96; // covers the KEY bitmap up to ~KEY code 0x2FF
+    let mut buf = [0u8; MAXB];
+    let n = core::cmp::min(size, MAXB);
+    match ev {
+        0 => { // supported event types
+            if n >= 1 {
+                buf[0] = if dev_id == DEV_TABLET { 0x0B } else { 0x03 };
+            }
+        }
+        1 => { // EV_KEY
+            if dev_id == DEV_TABLET {
+                // BTN_LEFT/RIGHT/MIDDLE = 0x110/0x111/0x112 → byte 34, bits 0..2.
+                let byte = 0x110 >> 3;
+                if byte < n { buf[byte] = 0x07; }
+            } else {
+                // keyboard advertises the full key range (as before).
+                for b in buf[..n].iter_mut() { *b = 0xFF; }
+            }
+        }
+        3 => { // EV_ABS
+            if dev_id == DEV_TABLET && n >= 1 {
+                buf[0] = 0x03; // ABS_X | ABS_Y
+            }
+        }
+        _ => {} // EV_REL etc → none
+    }
+    copy_out(pid, arg_ptr, &buf[..n])
+}
+
+/// EVIOCGABS(abs): report input_absinfo for an absolute axis (tablet only).
+fn eviocgabs(dev_id: usize, abs: usize, arg_ptr: usize, pid: u32) -> Message {
+    // input_absinfo{ value, min, max, fuzz, flat, resolution } = 6×i32 = 24B.
+    // Both axes: 0..32767, resolution 0 (libinput rejects X-xor-Y and mismatched
+    // resolution).
+    if dev_id == DEV_TABLET && (abs == ABS_X || abs == ABS_Y) {
+        let info: [i32; 6] = [0, 0, 32767, 0, 0, 0];
+        copy_out(pid, arg_ptr, unsafe {
+            core::slice::from_raw_parts(info.as_ptr() as *const u8, 24)
+        })
+    } else {
+        zero_out(pid, arg_ptr, 24)
+    }
 }
 
 // ── Message Dispatch ──────────────────────────────────────────────────────────
@@ -165,65 +266,66 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         vfs_server::VFS_IOCTL => {
             let cmd = arg(msg, 1) as usize;
             let pid = arg(msg, 3) as u32;
+            let arg_ptr = arg(msg, 2) as usize;
 
-            if cmd == 0x541B { // FIONREAD
-                let arg_ptr = arg(msg, 2) as usize;
+            // ioctl request encoding: dir(2) size(14) type(8) nr(8).
+            let nr   = cmd & 0xFF;
+            let typ  = (cmd >> 8) & 0xFF;
+            let size = (cmd >> 16) & 0x3FFF;
+
+            if cmd == 0x541B { // FIONREAD (type 'T', not 'E')
                 let count = (DEVICES.lock()[dev_id].count * core::mem::size_of::<input_event>()) as i32;
-                
-                let res = sched::with_task_address_space(pid, || {
-                    unsafe { (arg_ptr as *mut i32).write(count) };
-                    0
-                });
-                return match res {
-                    Some(0) => val_reply(0),
-                    _ => err_reply(-14),
-                };
+                return copy_out(pid, arg_ptr, &count.to_ne_bytes());
             }
-            if cmd == 0x80044501 { // EVIOCGVERSION
-                return val_reply(0x00010001);
-            }
-            if cmd == 0x80084502 { // EVIOCGID
-                let arg_ptr = arg(msg, 2) as usize;
-                let mut ids = [0u16; 4];
-                ids[0] = 0x0001; // bustype (BUS_USB)
-                ids[1] = 0x1234; // vendor
-                ids[2] = 0x5678; // product
-                ids[3] = 0x0001; // version
-                
-                let res = sched::with_task_address_space(pid, || {
-                    unsafe { core::ptr::copy_nonoverlapping(ids.as_ptr() as *const u8, arg_ptr as *mut u8, 8) };
-                    0
-                });
-                return match res {
-                    Some(0) => val_reply(0),
-                    _ => err_reply(-14),
-                };
-            }
-            
-            // EVIOCGBIT(ev, len) - base is 0x4520 + ev
-            let ioctl_base = cmd & 0xFF;
-            if (0x20..0x40).contains(&ioctl_base) && (cmd >> 8) & 0xFF == 0x45 {
-                let ev_type = ioctl_base - 0x20;
-                let arg_ptr = arg(msg, 2) as usize;
-                let max_len = (cmd >> 16) & 0x3FFF;
+            if typ != 0x45 { return err_reply(-25); } // not an 'E' ioctl → ENOTTY
 
-                if ev_type == 0 { // Supported event types (EV_SYN=0, EV_KEY=1)
-                    let bits: u32 = 0x03;
-                    let n = core::cmp::min(max_len as usize, 4);
-                    let _ = sched::with_task_address_space(pid, || {
-                        unsafe { core::ptr::copy_nonoverlapping(&bits as *const u32 as *const u8, arg_ptr as *mut u8, n) };
-                    });
-                    return val_reply(n as u64);
-                } else if ev_type == 1 { // EV_KEY - supported keys
-                    let n = core::cmp::min(max_len as usize, 64);
-                    let _ = sched::with_task_address_space(pid, || {
-                        unsafe { core::ptr::write_bytes(arg_ptr as *mut u8, 0xFF, n) };
-                    });
-                    return val_reply(n as u64);
+            match nr {
+                0x01 => val_reply(0x00010001), // EVIOCGVERSION
+                0x02 => { // EVIOCGID → input_id{bustype,vendor,product,version} (8B)
+                    let (vendor, product) = if dev_id == DEV_TABLET { (0x0627u16, 0x0001u16) }
+                                            else { (0x0627u16, 0x0002u16) };
+                    let ids: [u16; 4] = [BUS_VIRTUAL, vendor, product, 0x0001];
+                    copy_out(pid, arg_ptr, unsafe {
+                        core::slice::from_raw_parts(ids.as_ptr() as *const u8, 8)
+                    })
                 }
-                return val_reply(0);
+                0x06 => { // EVIOCGNAME(len)
+                    let name: &[u8] = if dev_id == DEV_TABLET { b"QEMU Virtio Tablet\0" }
+                                      else { b"QEMU Virtio Keyboard\0" };
+                    let n = core::cmp::min(size, name.len());
+                    copy_out(pid, arg_ptr, &name[..n])
+                }
+                0x07 | 0x08 => err_reply(-2), // EVIOCGPHYS/UNIQ → ENOENT (empty)
+                0x09 => zero_out(pid, arg_ptr, size), // EVIOCGPROP → all zero (no INPUT_PROP_DIRECT)
+                0x18 | 0x19 | 0x1b => zero_out(pid, arg_ptr, size), // EVIOCGKEY/LED/SW → zeroed
+                0xa0 => { // EVIOCSCLOCKID(int) — store; we already stamp monotonic
+                    let mut clk = [0u8; 4];
+                    if copy_in(pid, arg_ptr, &mut clk).is_none() { return err_reply(-14); }
+                    let f = unsafe { arch_interrupt_save() };
+                    DEVICES.lock()[dev_id].clockid = u32::from_ne_bytes(clk);
+                    unsafe { arch_interrupt_restore(f); }
+                    val_reply(0)
+                }
+                0x90 | 0x91 => val_reply(0), // EVIOCGRAB/EVIOCREVOKE → accept
+                _ if (0x20..0x40).contains(&nr) => // EVIOCGBIT(ev, len)
+                    eviocgbit(dev_id, nr - 0x20, arg_ptr, size, pid),
+                _ if (0x40..0x60).contains(&nr) => // EVIOCGABS(abs)
+                    eviocgabs(dev_id, nr - 0x40, arg_ptr, pid),
+                _ => err_reply(-25), // ENOTTY
             }
-            err_reply(-25) // ENOTTY
+        }
+        vfs_server::VFS_POLL => {
+            // POLLIN when any event is queued for this device (raw evdev fds read
+            // whole input_event records, so a pending SYN is readable too). seq
+            // is the push counter for epoll edge emulation.
+            let f = unsafe { arch_interrupt_save() };
+            let (count, seq) = { let d = &DEVICES.lock()[dev_id]; (d.count, d.seq) };
+            unsafe { arch_interrupt_restore(f); }
+            let revents: u32 = if count > 0 { 0x1 } else { 0 };
+            let mut m = Message::empty();
+            m.data[0..8].copy_from_slice(&(revents as u64).to_le_bytes());
+            m.data[8..16].copy_from_slice(&seq.to_le_bytes());
+            m
         }
         _ => err_reply(-38), // ENOSYS
     }
@@ -305,9 +407,11 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     let port_id = port::create(owner_pid)?;
     {
         let mut devs = DEVICES.lock();
-        devs[0].in_use = true; // event0 (keyboard)
+        devs[DEV_KEYBOARD].in_use = true; // event0 (keyboard)
+        devs[DEV_TABLET].in_use = true;   // event1 (virtio-tablet absolute pointer)
     }
     vfs_server::register_device("/dev/input/event0", port_id, 0, 13, 64);
+    vfs_server::register_device("/dev/input/event1", port_id, 1, 13, 65);
     port::register_handler(port_id, handle);
     Some(port_id)
 }
