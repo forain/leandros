@@ -238,7 +238,7 @@ def main():
     bins = [
         "shell", "login", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest",
-        "waittest", "sigchldtest", "scmtest", "epolltest", "idletest", "drmsmoke",
+        "waittest", "sigchldtest", "scmtest", "epolltest", "idletest", "drmsmoke", "evtest2",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
     ]
     for b in bins:
@@ -366,6 +366,30 @@ def main():
         bin_files.append(("plugin.so", plugin, 0o100755))
         root_files.append(("plugin.so", plugin, 0o100755))
 
+    # ── K4 GL ship set (kmscube, M3) ──────────────────────────────────────────
+    # Runtime libraries for the kms_swrast GBM + GLES2 path, packed under their
+    # SONAMEs into /usr/lib (the loader resolves DT_NEEDED by soname, so no
+    # symlink support is needed — same trick as ld-musl above). The soname paths
+    # in the merged sysroot are symlinks that Python follows to the real
+    # versioned .so, so the content is stored once under the soname name.
+    gl_root = os.path.expanduser("~/.claude-forain/jobs/afde2e74/tmp/m3-gl-stack")
+    gl_lib_dir = f"{gl_root}/sysroot-{arch}/usr/lib"
+    gbm_files = []
+    for so in ("libEGL.so.1", "libGLESv2.so.2", "libgbm.so.1", "libdrm.so.2",
+               "libgallium-25.3.6.so", "libexpat.so.1", "libz.so.1",
+               "libwayland-client.so.0", "libwayland-server.so.0", "libffi.so.8"):
+        p = f"{gl_lib_dir}/{so}"
+        if os.path.exists(p):
+            usr_lib_files.append((so, p, 0o100755))
+    # GBM backend, dlopened by absolute path /usr/lib/gbm/dri_gbm.so.
+    dri = f"{gl_lib_dir}/gbm/dri_gbm.so"
+    if os.path.exists(dri):
+        gbm_files.append(("dri_gbm.so", dri, 0o100755))
+    # kmscube itself (dynamic ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1).
+    kc = f"{gl_root}/out/kmscube-{arch}"
+    if os.path.exists(kc):
+        bin_files.append(("kmscube", kc, 0o100755))
+
     # 2. Dynamically calculate required blocks and image size
     # Each meta segment takes 512 blocks. We have 8 meta segments (4096 blocks).
     # Plus safety margin and blocks for directories.
@@ -377,7 +401,7 @@ def main():
     # sharing a single inode and its data blocks, so charging the image for
     # every name would over-allocate by ~100x once coreutils is installed.
     _sized = set()
-    for name, path, mode in bin_files + lib_files + usr_lib_files + root_files + etc_files:
+    for name, path, mode in bin_files + lib_files + usr_lib_files + gbm_files + root_files + etc_files:
         if not isinstance(path, (bytes, bytearray)):
             if path in _sized:
                 continue
@@ -429,6 +453,7 @@ def main():
         14: ("/home/leandro"),
         15: ("/usr"),
         16: ("/usr/lib"),
+        17: ("/usr/lib/gbm"),
     }
 
     # Per-directory mode/owner overrides; anything not listed here defaults
@@ -448,6 +473,7 @@ def main():
             ("usr", 15)],
         13: [("leandro", 14)],
         15: [("lib", 16)],
+        16: [("gbm", 17)],
     }
     
     inode_blocks = {}
@@ -646,6 +672,8 @@ def main():
     add_files_to_dir(11, lib_files)
     print("Packing libraries into /usr/lib...")
     add_files_to_dir(16, usr_lib_files)
+    print("Packing GBM backends into /usr/lib/gbm...")
+    add_files_to_dir(17, gbm_files)
     print("Packing files into /...")
     add_files_to_dir(3, root_files)
     print("Packing files into /etc...")
