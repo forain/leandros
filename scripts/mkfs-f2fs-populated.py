@@ -390,6 +390,63 @@ def main():
     if os.path.exists(kc):
         bin_files.append(("kmscube", kc, 0o100755))
 
+    # ── M4 input/XKB ship set (anvil compositor) ──────────────────────────────
+    # anvil (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) + the wl_shm/xdg_shell
+    # test client, plus anvil's input stack. Input libraries are packed under
+    # their SONAME into /usr/lib (same soname trick as the GL set: the loader
+    # resolves DT_NEEDED by soname and open() follows the staged soname symlink
+    # to the real versioned file). The XKB keymap data + libinput quirks form a
+    # deep file tree under /usr/share, enumerated here for size accounting and
+    # packed recursively further below.
+    m4_root   = os.path.expanduser(f"~/code/leandros-artifacts/m4-input-ship/{arch}")
+    anvil_bin = os.path.expanduser(f"~/code/leandros-artifacts/m3-gl-stack/out/anvil-{arch}")
+    wlclient  = os.path.expanduser(f"~/code/leandros-artifacts/m4-client/wlclient-{arch}")
+    if os.path.exists(anvil_bin):
+        bin_files.append(("anvil", anvil_bin, 0o100755))
+    if os.path.exists(wlclient):
+        bin_files.append(("wlclient", wlclient, 0o100755))
+    m4_lib_dir = f"{m4_root}/usr/lib"
+    for so in ("libxkbcommon.so.0", "libdisplay-info.so.3", "libseat.so.1",
+               "libudev.so.1", "libinput.so.10", "libpixman-1.so.0",
+               "libmtdev.so.1", "libevdev.so.2"):
+        p = f"{m4_lib_dir}/{so}"
+        if os.path.exists(p):
+            usr_lib_files.append((so, p, 0o100755))
+    # Recursively enumerate the /usr/share data tree. m4_share_files holds
+    # (image_dir_abspath, name, hostpath); m4_share_dirs holds every directory
+    # (and its ancestors down to /usr/share) that must be created. Directory
+    # inodes are registered into dir_nodes/subdirs after those are defined; the
+    # files are packed after the other add_files_to_dir calls. No symlinks exist
+    # in the staged tree (they were dereferenced when staged), so a plain walk
+    # yields only regular files.
+    m4_share_files = []
+    m4_share_dirs  = set()
+    m4_share_src   = f"{m4_root}/usr/share"
+    if os.path.isdir(m4_share_src):
+        for dirpath, _dirnames, filenames in os.walk(m4_share_src):
+            rel = os.path.relpath(dirpath, m4_root)   # e.g. usr/share/X11/xkb/symbols
+            parts = rel.split("/")
+            for i in range(2, len(parts) + 1):        # register usr/share ... down (usr already exists)
+                m4_share_dirs.add("/" + "/".join(parts[:i]))
+            image_dir = "/" + rel
+            for fn in sorted(filenames):
+                hp = os.path.join(dirpath, fn)
+                if os.path.isfile(hp):
+                    m4_share_files.append((image_dir, fn, hp))
+
+    # Synthetic sysfs skeleton for anvil's drm-rs. DrmNode::from_path ->
+    # is_device_drm() stat()s /sys/dev/char/<major>:<minor>/device/drm, and
+    # node_with_type(Primary) read_dir()s that directory looking for a "card0"
+    # entry (whose /dev/dri/card0 must then exist — it does). Provide the empty
+    # directory tree (no files needed); the minor-number range gives the node
+    # type, so the mere existence of the drm dir + a card0 child suffices.
+    if os.path.isdir(m4_share_src) or os.path.exists(anvil_bin):
+        for d in ("/sys", "/sys/dev", "/sys/dev/char",
+                  "/sys/dev/char/226:0", "/sys/dev/char/226:0/device",
+                  "/sys/dev/char/226:0/device/drm",
+                  "/sys/dev/char/226:0/device/drm/card0"):
+            m4_share_dirs.add(d)
+
     # 2. Dynamically calculate required blocks and image size
     # Each meta segment takes 512 blocks. We have 8 meta segments (4096 blocks).
     # Plus safety margin and blocks for directories.
@@ -401,7 +458,8 @@ def main():
     # sharing a single inode and its data blocks, so charging the image for
     # every name would over-allocate by ~100x once coreutils is installed.
     _sized = set()
-    for name, path, mode in bin_files + lib_files + usr_lib_files + gbm_files + root_files + etc_files:
+    for name, path, mode in (bin_files + lib_files + usr_lib_files + gbm_files + root_files + etc_files
+                             + [(n, p, 0) for (_d, n, p) in m4_share_files]):
         if not isinstance(path, (bytes, bytearray)):
             if path in _sized:
                 continue
@@ -475,7 +533,32 @@ def main():
         15: [("lib", 16)],
         16: [("gbm", 17)],
     }
-    
+
+    # ── Register the M4 /usr/share data tree as directory inodes ──────────────
+    # Allocate a fresh ino/nid for every directory under /usr (usr/share,
+    # usr/share/X11, ..., usr/share/X11/xkb/symbols, usr/share/libinput, ...) and
+    # wire each into dir_nodes/subdirs so the standard inode/data-block
+    # allocation and dentry-emit loops below handle them identically to the
+    # static directories. Sorted order guarantees a parent is registered before
+    # its children (a child path is its parent plus "/name", and "/" sorts
+    # before any name char). /usr itself is static (ino 15). Files are attached
+    # to these inos after packing (see m4_tree_files_by_ino below).
+    _path_to_ino  = {p: ino for ino, p in dir_nodes.items()}
+    _next_dir_ino = max(dir_nodes) + 1
+    for d in sorted(m4_share_dirs):
+        if d in _path_to_ino:
+            continue
+        parent_ino = _path_to_ino[os.path.dirname(d)]
+        ino = _next_dir_ino
+        _next_dir_ino += 1
+        dir_nodes[ino] = d
+        _path_to_ino[d] = ino
+        subdirs.setdefault(parent_ino, []).append((os.path.basename(d), ino))
+    m4_tree_files_by_ino = {}
+    for image_dir, name, hostpath in m4_share_files:
+        ino = _path_to_ino[image_dir]
+        m4_tree_files_by_ino.setdefault(ino, []).append((name, hostpath, 0o100644))
+
     inode_blocks = {}
     data_blocks = {}
     
@@ -678,7 +761,11 @@ def main():
     add_files_to_dir(3, root_files)
     print("Packing files into /etc...")
     add_files_to_dir(9, etc_files)
-    
+    if m4_tree_files_by_ino:
+        print("Packing /usr/share data tree (XKB keymaps + libinput quirks)...")
+        for ino in sorted(m4_tree_files_by_ino):
+            add_files_to_dir(ino, m4_tree_files_by_ino[ino])
+
     # 5. Write directory blocks and inodes
     # Build dentry blocks list for each directory
     dentry_entries = {ino: [] for ino in dir_nodes.keys()}
