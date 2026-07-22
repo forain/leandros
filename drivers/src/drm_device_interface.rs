@@ -37,6 +37,15 @@ const DRM_IOCTL_MODE_DIRTYFB: u32 = 0xC01864B1;
 // _IOWR('d', 0xB9, drm_mode_obj_get_properties) — struct is 28 data bytes,
 // padded to 32 by its u64 members, hence size 0x20 in the request code.
 const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC02064B9;
+const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xC01064B5; // _IOWR('d',0xB5, drm_mode_get_plane_res=16)
+const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC02064B6;          // _IOWR('d',0xB6, drm_mode_get_plane=32)
+const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC04064AA;       // _IOWR('d',0xAA, drm_mode_get_property=64)
+// Synthetic KMS object ids for the single primary plane exposed to compositors.
+// crtc/connector/encoder are all id 1; the plane + its "type" property take
+// distinct ids. crtc index 0 => possible_crtcs bit 0.
+const DRM_PLANE_ID: u32 = 30;
+const DRM_PLANE_TYPE_PROP_ID: u32 = 40;
+const DRM_PLANE_TYPE_PRIMARY: u32 = 1; // drm PlaneType: Overlay=0, Primary=1, Cursor=2
 const DRM_IOCTL_PRIME_HANDLE_TO_FD: u32 = 0xC00C642D;
 const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xC00C642E;
 
@@ -495,6 +504,9 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_RMFB => self.std_handle_rmfb(arg),
             DRM_IOCTL_MODE_DIRTYFB => self.std_handle_dirtyfb(arg),
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => self.std_handle_obj_get_properties(arg),
+            DRM_IOCTL_MODE_GETPLANERESOURCES => self.std_handle_get_plane_resources(arg),
+            DRM_IOCTL_MODE_GETPLANE => self.std_handle_get_plane(arg),
+            DRM_IOCTL_MODE_GETPROPERTY => self.std_handle_get_property(arg),
             // No PRIME (single node, render==scanout) — Mesa falls back to software.
             DRM_IOCTL_PRIME_HANDLE_TO_FD | DRM_IOCTL_PRIME_FD_TO_HANDLE => Err(DriverError::Unsupported),
 
@@ -1098,10 +1110,88 @@ impl DrmDeviceInterface {
     /// apply to user-memory access under a spinlock).
     fn std_handle_obj_get_properties(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        // struct drm_mode_obj_get_properties { u64 props_ptr; u64 prop_values_ptr;
-        //   u32 count_props; u32 obj_id; u32 obj_type; } — count_props at offset 16.
-        unsafe { ptr::write_unaligned((arg + 16) as *mut u32, 0); }
+        // struct drm_mode_obj_get_properties { u64 props_ptr@0; u64 prop_values_ptr@8;
+        //   u32 count_props@16; u32 obj_id@20; u32 obj_type@24; }
+        // The single primary plane (obj_id 30) exposes exactly one property, "type"
+        // = PRIMARY, which smithay's planes() requires (plane_type panics on absence).
+        // Every other object (connectors etc.) reports zero properties — enough for
+        // the legacy DPMS reset, which just enumerates and finds nothing to toggle.
+        let obj_id = unsafe { ptr::read_unaligned((arg + 20) as *const u32) };
+        if obj_id == DRM_PLANE_ID {
+            let props_ptr = unsafe { ptr::read_unaligned(arg as *const u64) };
+            let vals_ptr  = unsafe { ptr::read_unaligned((arg + 8) as *const u64) };
+            let cap       = unsafe { ptr::read_unaligned((arg + 16) as *const u32) };
+            if props_ptr != 0 && vals_ptr != 0 && cap >= 1 {
+                unsafe {
+                    ptr::write_unaligned(props_ptr as *mut u32, DRM_PLANE_TYPE_PROP_ID);
+                    ptr::write_unaligned(vals_ptr as *mut u64, DRM_PLANE_TYPE_PRIMARY as u64);
+                }
+            }
+            unsafe { ptr::write_unaligned((arg + 16) as *mut u32, 1); }
+        } else {
+            unsafe { ptr::write_unaligned((arg + 16) as *mut u32, 0); }
+        }
         Ok(0)
+    }
+
+    /// DRM_IOCTL_MODE_GETPLANERESOURCES — expose a single (primary) plane.
+    /// smithay's DrmCompositor needs at least one primary plane bound to the crtc
+    /// to build a scanout surface; without it connector setup bails and nothing is
+    /// ever composited. struct drm_mode_get_plane_res { u64 plane_id_ptr@0; u32 count_planes@8; }.
+    fn std_handle_get_plane_resources(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let ptr_planes = unsafe { ptr::read_unaligned(arg as *const u64) };
+        let cap = unsafe { ptr::read_unaligned((arg + 8) as *const u32) };
+        if ptr_planes != 0 && cap >= 1 {
+            unsafe { ptr::write_unaligned(ptr_planes as *mut u32, DRM_PLANE_ID); }
+        }
+        unsafe { ptr::write_unaligned((arg + 8) as *mut u32, 1); }
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_MODE_GETPLANE — describe the primary plane. It is usable on crtc
+    /// index 0 (possible_crtcs bit 0) and advertises linear XRGB/ARGB8888.
+    /// struct drm_mode_get_plane { u32 plane_id@0; crtc_id@4; fb_id@8; possible_crtcs@12;
+    ///   gamma_size@16; count_format_types@20; u64 format_type_ptr@24; }.
+    fn std_handle_get_plane(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        const FORMATS: [u32; 2] = [0x3432_5258 /* XR24 */, 0x3432_5241 /* AR24 */];
+        unsafe {
+            ptr::write_unaligned((arg + 4) as *mut u32, 0);  // crtc_id: not currently bound
+            ptr::write_unaligned((arg + 8) as *mut u32, 0);  // fb_id
+            ptr::write_unaligned((arg + 12) as *mut u32, 1); // possible_crtcs: crtc index 0
+            ptr::write_unaligned((arg + 16) as *mut u32, 0); // gamma_size
+        }
+        let cap = unsafe { ptr::read_unaligned((arg + 20) as *const u32) };
+        let fmt_ptr = unsafe { ptr::read_unaligned((arg + 24) as *const u64) };
+        if fmt_ptr != 0 && cap as usize >= FORMATS.len() {
+            unsafe { ptr::copy_nonoverlapping(FORMATS.as_ptr(), fmt_ptr as *mut u32, FORMATS.len()); }
+        }
+        unsafe { ptr::write_unaligned((arg + 20) as *mut u32, FORMATS.len() as u32); }
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_MODE_GETPROPERTY — only the plane "type" property is defined.
+    /// smithay's plane_type() reads just the property name; leaving the value/enum
+    /// counts at 0 makes drm-ffi's get_property a single-pass call (no array fetch).
+    /// struct drm_mode_get_property { u64 values_ptr@0; u64 enum_blob_ptr@8; u32 prop_id@16;
+    ///   u32 flags@20; char name[32]@24; u32 count_values@56; u32 count_enum_blobs@60; }.
+    fn std_handle_get_property(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let prop_id = unsafe { ptr::read_unaligned((arg + 16) as *const u32) };
+        if prop_id == DRM_PLANE_TYPE_PROP_ID {
+            const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
+            let name = b"type\0";
+            unsafe {
+                ptr::write_unaligned((arg + 20) as *mut u32, DRM_MODE_PROP_ENUM);
+                ptr::copy_nonoverlapping(name.as_ptr(), (arg + 24) as *mut u8, name.len());
+                ptr::write_unaligned((arg + 56) as *mut u32, 0);
+                ptr::write_unaligned((arg + 60) as *mut u32, 0);
+            }
+            Ok(0)
+        } else {
+            Err(DriverError::Unsupported)
+        }
     }
 
     /// DRM_IOCTL_GET_MAGIC — single-seat stub: return a nonzero magic.
