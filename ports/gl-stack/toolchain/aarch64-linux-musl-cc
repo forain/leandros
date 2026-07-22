@@ -1,0 +1,19 @@
+#!/bin/sh
+# zig cc musl cross wrapper (aarch64-linux-musl). Space-safe in-place argv rewrite that also
+# normalizes  -Wl,--version-script <path>  ->  -Wl,--version-script=<path>
+# (zig/lld rejects the bare positional script path). Uses set -- so arguments
+# containing spaces (e.g. -DXMLIMPORT=__attribute__ ((visibility(...)))) survive.
+n=$#
+while [ $n -gt 0 ]; do
+  a=$1; shift; n=$((n-1))
+  case $a in
+    -Wl,--version-script|-Wl,--dynamic-list)
+      b=$1; shift; n=$((n-1))
+      set -- "$@" "$a=$b"
+      ;;
+    *)
+      set -- "$@" "$a"
+      ;;
+  esac
+done
+exec zig cc -target aarch64-linux-musl "$@"

@@ -146,3 +146,43 @@ No musl-vs-glibc source issues in any of the five C components.
   into the f2fs image. All five `.so`s NEED musl `libc.so` → they ride ld-musl
   (D1), consistent with the Mesa ship-set.
 ```
+
+## Addendum — libevdev / mtdev / libinput (from the M3-GL-STACK lane)
+
+`build-meson-lib.sh` (libevdev, libinput) and `build-mtdev.sh` were staged
+here from the M3-GL-STACK lane (`ports/gl-stack/`) because they complete this
+port's actual input stack rather than the GL/DRM side: libinput is the piece
+this D3 pass had only grepped for its libudev import set, not actually
+cross-built.
+
+- **libevdev 1.13.3** (meson) -> `libevdev.so.2` (NEEDED: `libc.so` only). Both arches.
+- **mtdev 1.1.6**: autotools-only, and darwin libtool can't emit a Linux `.so`,
+  so autotools is bypassed entirely — the 5 core `.c` files (caps, core, iobuf,
+  match, match_four) are compiled with `zig cc -fPIC` and linked with
+  `zig ld.lld -shared -soname libmtdev.so.1`; a `mtdev.pc` is hand-written.
+  `sh build-mtdev.sh <arch>`.
+- **libinput 1.27.1** (meson) -> `libinput.so.10` (NEEDED: `libmtdev.so.1
+  libudev.so.1 libevdev.so.2 libc.so`).
+  Landmines:
+    (a) meson's unconditional `test-build-pedantic` / `-std-gnuc90` header-sanity
+        executables compile public headers under `-std=c99 -pedantic -Werror`;
+        our from-source musl headers trip `-Wundef`/`-Wbitwise-op-parentheses`/
+        `_REDIR_TIME64` under `-Werror`. Fix: strip `-Werror` from those two
+        `executable()` calls in `meson.build` (install:false, not the real lib).
+    (b) aarch64 only: three CLI tools (`libinput-debug-events`/`-tablet`,
+        `libinput-quirks`) fail to link (`ld.lld: improper alignment for
+        relocation R_AARCH64_LDST64_ABS_LO12_NC`, a zig/lld aarch64 bug around
+        1-byte-aligned `.rodata.str1.1`). `libinput.so.10` itself links fine;
+        only the ship-irrelevant tools break. Fix used: build the
+        `libinput.so.10.13.0` target only and install the `.so` + symlinks +
+        header + `.pc` by hand on aarch64.
+
+Reproduce:
+```
+sh build-meson-lib.sh libevdev <arch>
+sh build-mtdev.sh <arch>
+sh build-meson-lib.sh libinput <arch>   # aarch64: tools fail, lib ok -> manual install
+```
+These scripts point at a merged sysroot (`sysroot-<arch>/`) built up across the
+musl-dynamic, mesa-wave2, and d3-input-stack lanes; see `ports/gl-stack/NOTES.md`
+for the full foundation recipe and the merged-sysroot layout they assume.

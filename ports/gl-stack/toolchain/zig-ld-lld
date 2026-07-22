@@ -1,0 +1,4 @@
+#!/bin/sh
+# Raw ELF linker via zig's bundled lld, bypassing zig cc's musl auto-management.
+# Used as rustc's `-C linker=` target with `-C linker-flavor=ld`.
+exec zig ld.lld "$@"

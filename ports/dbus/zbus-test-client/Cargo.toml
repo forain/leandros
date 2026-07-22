@@ -1,0 +1,20 @@
+[package]
+name = "zbus-test-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zbus-test-client"
+path = "src/main.rs"
+
+[dependencies]
+# Same git ref as busd (S5 probe) so wire-level behavior matches exactly.
+zbus = { git = "https://github.com/z-galaxy/zbus", features = [
+    "tokio",
+], default-features = false }
+tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread", "time"] }
+anyhow = "1.0.82"
+
+[profile.release]
+panic = "abort"
+strip = "symbols"

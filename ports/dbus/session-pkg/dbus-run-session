@@ -1,0 +1,131 @@
+#!/bin/sh
+# dbus-run-session equivalent for LeandrOS.
+#
+# There is no reference dbus-daemon and no dbus-run-session binary on
+# LeandrOS; busd (a pure-Rust D-Bus broker) is our only bus implementation
+# and it ships no session-launcher helper of its own. This script fills
+# that gap: start-cosmic (from ../cosmic-epoch) calls `dbus-run-session --
+# cosmic-session ...` and dies without it (S6 finding).
+#
+# Usage:
+#   dbus-run-session [--] COMMAND [ARGS...]
+#
+# Behavior (mirrors the reference tool's contract):
+#   1. Start busd on a private session bus.
+#   2. Wait for busd to signal it is actually listening.
+#   3. Export DBUS_SESSION_BUS_ADDRESS for COMMAND.
+#   4. Run COMMAND as a child, wait for it to finish.
+#   5. Kill busd, clean up, and exit with COMMAND's exit status.
+#
+# Portability: this is plain POSIX sh on purpose — no arrays, no `[[`,
+# no `local`, no coproc, no process substitution, no here-strings. It
+# must run correctly both under brush (LeandrOS's shell) and under a
+# minimal /bin/sh (verified in this package against busybox ash in an
+# Alpine container), since the two are not guaranteed to share every
+# non-POSIX extension.
+#
+# --- Why this doesn't use the "classic" `--ready-fd 3 3>fifo` + blocking
+# --- `read` trick (important if you're tempted to simplify this):
+#
+# On a normal Linux system you'd do:
+#     mkfifo ready.fifo
+#     busd --ready-fd 3 3>ready.fifo &
+#     read -r _ < ready.fifo   # blocks until busd writes+closes fd 3
+#
+# On LeandrOS this is broken in two independent ways:
+#   - There is no `mkfifo` userland binary and no shell builtin that
+#     creates one.
+#   - Even if you `mknod path p`, LeandrOS's tmpfs mknod(S_IFIFO) only
+#     fabricates a dirent that *looks* like a FIFO to stat()/getdents64
+#     (S_IFIFO/DT_FIFO) — VFS_OPEN on it still behaves like a plain tmpfs
+#     file with NO blocking open()/read() rendezvous between reader and
+#     writer (see servers/vfs/src/lib.rs handle_mknod's scope note in the
+#     leandros tree). The reader would just get an immediate EOF instead
+#     of blocking, i.e. exactly the race this trick exists to avoid.
+#
+# There is also no `sleep` binary and no shell `sleep`/coproc builtin on
+# LeandrOS (checked brush's builtin table: only `read -t` exists, and
+# it's unusable here — a bounded wait needs a primitive that doesn't
+# depend on stdin/tty state, but this script itself may be invoked with
+# stdin already redirected from a file/pipe with nothing to read, e.g.
+# when start-cosmic calls it non-interactively).
+#
+# Fix used below: --ready-fd still writes into a REAL regular tmpfs file
+# (not a FIFO) via plain numbered-fd redirection (`3>"$READY_FILE"`,
+# which is plain POSIX sh, not a bashism). Regular-file writes don't need
+# blocking rendezvous to be observed correctly, so we busy-poll the
+# file's size with `test -s`, bounded by an iteration count rather than
+# wall-clock time. This is CPU-noisy for the sub-second startup window
+# but correct everywhere plain POSIX sh runs, including on LeandrOS.
+
+set -u
+
+BUSD_BIN=${BUSD_BIN:-/usr/libexec/busd}
+SESSION_CONF=${SESSION_CONF:-/usr/share/dbus-1/session.conf}
+RUN_DIR=${XDG_RUNTIME_DIR:-/run/user/0}
+BUS_SOCKET="$RUN_DIR/bus"
+READY_FILE="$RUN_DIR/busd-ready.$$"
+# Bound on busy-poll iterations while waiting for busd's readiness write.
+# busd's startup is just "parse a tiny config file + bind one socket", so
+# this is expected to resolve in well under a second; the bound only
+# exists to fail fast (instead of hanging forever) if busd wedges.
+MAX_POLL_ITERS=${DBUS_RUN_SESSION_MAX_POLL_ITERS:-20000000}
+
+usage() {
+    echo "usage: dbus-run-session [--] COMMAND [ARGS...]" >&2
+    exit 64
+}
+
+[ "$#" -ge 1 ] || usage
+if [ "$1" = "--" ]; then
+    shift
+fi
+[ "$#" -ge 1 ] || usage
+
+if [ ! -x "$BUSD_BIN" ]; then
+    echo "dbus-run-session: busd binary not found/executable at $BUSD_BIN" >&2
+    exit 1
+fi
+
+# A leftover socket/ready-file from a previous crashed run makes busd's
+# bind() fail with "address in use" (busd's own cleanup() only removes
+# the socket file on a clean shutdown), so always start from a clean slate.
+rm -f "$BUS_SOCKET" "$READY_FILE"
+
+"$BUSD_BIN" --config "$SESSION_CONF" --address "unix:path=$BUS_SOCKET" \
+    --ready-fd 3 3>"$READY_FILE" &
+BUSD_PID=$!
+
+cleanup() {
+    kill "$BUSD_PID" 2>/dev/null
+    wait "$BUSD_PID" 2>/dev/null
+    rm -f "$BUS_SOCKET" "$READY_FILE"
+}
+trap cleanup EXIT INT TERM
+
+i=0
+while [ "$i" -lt "$MAX_POLL_ITERS" ]; do
+    if [ -s "$READY_FILE" ]; then
+        break
+    fi
+    if ! kill -0 "$BUSD_PID" 2>/dev/null; then
+        echo "dbus-run-session: busd exited before signaling readiness" >&2
+        exit 1
+    fi
+    i=$((i + 1))
+done
+
+if [ ! -s "$READY_FILE" ]; then
+    echo "dbus-run-session: timed out waiting for busd readiness" >&2
+    exit 1
+fi
+
+DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS_SOCKET"
+export DBUS_SESSION_BUS_ADDRESS
+DBUS_SESSION_BUS_PID=$BUSD_PID
+export DBUS_SESSION_BUS_PID
+
+"$@"
+child_status=$?
+
+exit "$child_status"
