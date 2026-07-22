@@ -5444,6 +5444,24 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         let set_msg = make_vfs_msg(vfs::VFS_FCNTL, &[fd as u64, F_SETFL as u64, flags as u64]);
         return vfs_reply_val(&vfs::handle(&set_msg, pid));
     }
+    // FIONBIO on a socket fd — Rust std's UnixListener/UnixStream::set_nonblocking
+    // issues ioctl(FIONBIO) (not fcntl F_SETFL). Route it through the net server's
+    // NET_GETFL/NET_SETFL so it toggles the very same O_NONBLOCK bit that fcntl
+    // F_SETFL and SOCK_NONBLOCK-at-creation use — one flag, not a second. Without
+    // this the wayland-server rs backend's listening socket died at bind time with
+    // ENOTTY. The user int is read (validate + raw read) before any net_server
+    // lock is taken, honoring the no-user-memory-under-spinlock invariant.
+    if cmd == FIONBIO && fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE {
+        if arg == 0 || !validate_user_buf(arg, 4) { return -14; }
+        const O_NONBLOCK: usize = 0x800;
+        let nonblocking = unsafe { (arg as *const i32).read() } != 0;
+        let get_msg = make_vfs_msg(net_server::NET_GETFL, &[fd as u64]);
+        let cur = net_reply_val(&net_server::handle(&get_msg, pid));
+        if cur < 0 { return cur; }
+        let flags = if nonblocking { cur as usize | O_NONBLOCK } else { cur as usize & !O_NONBLOCK };
+        let set_msg = make_vfs_msg(net_server::NET_SETFL, &[fd as u64, flags as u64]);
+        return net_reply_val(&net_server::handle(&set_msg, pid));
+    }
 
     // DRM ioctl commands
     const DRM_IOCTL_GET_MODE: usize = 0x1003;
