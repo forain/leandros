@@ -167,6 +167,11 @@ pub fn on_tick() {
     if cpu == 0 {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
 
+        // Poll VirtIO input devices (keyboard + tablet). The primary x86_64
+        // console keyboard still comes from the UART drain below; this drains
+        // the virtio-tablet's absolute-pointer events into evdev event1.
+        drivers::virtio_keyboard::poll_events();
+
         // Poll UART for keyboard input and push to evdev.
         // NOTE: This consumes bytes that would otherwise go to fd 0 (stdin).
         while let Some(b) = unsafe { super::serial_read_byte() } {

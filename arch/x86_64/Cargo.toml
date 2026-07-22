@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+drivers = { path = "../../drivers" }
 boot    = { path = "../../boot" }
 leandros-lib = { path = "../../lib" }
 mm      = { path = "../../mm" }

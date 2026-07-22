@@ -190,6 +190,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -device virtio-blk-pci,drive=data1,disable-legacy=on \
             -device "$GPU_DEV" \
             -device virtio-keyboard-pci \
+            -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -device virtio-net-pci,netdev=net0,disable-legacy=on -netdev socket,id=net0,fd=3 -no-reboot)
@@ -246,6 +247,7 @@ else
             -device virtio-blk-pci,drive=data1,disable-legacy=on \
             -device "$GPU_DEV" \
             -device virtio-keyboard-pci \
+            -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -net none \
