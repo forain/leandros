@@ -380,6 +380,23 @@ applets: force software renderer via env at M6.
 **M3 — GL on screen, no Wayland** (K4 DRM + Mesa port)
 - Exit: kmscube-class GLES2-over-GBM binary renders animated frames to
   /dev/dri/card0 via kms_swrast; screenshot-verified via run-leandros driver.
+- **K4 KERNEL SIDE COMPLETE 2026-07-22, both arches** (a7754d0 DRM core:
+  st_rdev 226:0/13:64, full legacy-KMS ioctl surface incl. ADDFB2/DIRTYFB/
+  master+magic auth, page-flip event channel throttled ~50 Hz off the tick,
+  card0 pollable; da6a2f0 drmsmoke; 2d017cd evdev event1 tablet + EVIOC
+  rewrite; 2a5a38c multi-instance virtio-input, keyboard=event0 tablet=event1;
+  ea4b658 virtio-tablet-pci attached by default; d2511b4 evtest2; 79135ea GL
+  ship set packed). drmsmoke 17/17 + verified gradient and evtest2 8/8 on both
+  arches; full regression green. Synthetic sysfs (design commit 4) DEFERRED —
+  probe showed no current consumer needs it (kmscube -D bypasses enumeration,
+  Smithay reads none); design section remains execution-ready.
+- **M3 exit NOT yet met**: kmscube loads the full Mesa stack (EGL 1.5 init,
+  GBM device+surface, dumb buffer mmap'd) then hits a deterministic userspace
+  NULL deref inside the Mesa libs (EL0, FAR=0, ELR in libgallium) right after
+  buffer mmap. Kernel DRM contract proven sufficient by drmsmoke writing the
+  same mapping. Next step: symbolize the crash (gallium_base+offset from the
+  fault log) or rebuild Mesa with debug info; fix is expected on the Mesa/
+  userspace side. Blocks the R3/R4/R5 rungs only.
 
 **M4 — Input + seat** (K4 evdev + libinput/libseat/libudev/libxkbcommon)
 - Exit: Smithay's reference compositor (anvil, kms backend) starts via the
