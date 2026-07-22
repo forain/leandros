@@ -238,7 +238,7 @@ def main():
     bins = [
         "shell", "login", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest",
-        "waittest", "sigchldtest", "scmtest", "epolltest", "idletest",
+        "waittest", "sigchldtest", "scmtest", "epolltest", "idletest", "drmsmoke",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
     ]
     for b in bins:

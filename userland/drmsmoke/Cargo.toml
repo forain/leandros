@@ -1,0 +1,12 @@
+[package]
+name = "drmsmoke"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "drmsmoke"
+path = "src/main.rs"
+
+[dependencies]
+# Links directly against librelibc.a (like polltest/epolltest) — it needs real
+# open/ioctl/mmap/fstat through libc, not the minimal leandros-libc.
