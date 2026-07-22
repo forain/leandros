@@ -355,7 +355,9 @@ pub fn extract_binary_from_initrd(name: &str, boot_info: &boot::BootInfo) -> Opt
 fn load_and_spawn_elf(elf_data: &[u8]) -> u32 {
     let root = unsafe { arch_alloc_page_table_root() };
     let mut as_ = mm::vmm::AddressSpace::new(root);
-    let elf_info = elf::load(elf_data, &mut as_).expect("failed to load ELF");
+    // The boot init binary is a static ET_EXEC (relibc); bias 0 keeps the
+    // historical literal-vaddr placement.
+    let elf_info = elf::load(elf_data, &mut as_, 0).expect("failed to load ELF");
     let entry = elf_info.entry;
     
     // ── Map userspace stack ─────────────────────────────────────────────────

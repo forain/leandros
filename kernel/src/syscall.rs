@@ -202,6 +202,19 @@ const USER_STACK_TOP: usize = 0x0000_7fff_ffff_f000;
 /// Size of the initial user stack mapping (256 KiB).
 const USER_STACK_SIZE: usize = 64 * mm::buddy::PAGE_SIZE;
 
+/// ELF `e_type` for a position-independent (dynamic/PIE) object.
+const ET_DYN: u16 = 3;
+/// Load bias for an `ET_DYN` **main** executable (static-PIE or dynamic-PIE).
+/// Placed at 2 MiB — identical to the fixed address `ET_EXEC` images have
+/// always loaded at, so the image + brk heap layout is unchanged and back-
+/// compatibility with the existing static userland is preserved by construction.
+const MAIN_DYN_BASE: usize = 0x0020_0000;
+/// Load bias for the dynamic interpreter (`/lib/ld-musl-<arch>.so.1`).  Sits in
+/// the free window at 768 MiB — above any realistic brk heap growing up from
+/// the ~2 MiB main image, and 256 MiB below the `mmap` bump at 1 GiB where
+/// ld.so's own library mappings land.
+const INTERP_BASE: usize = 0x3000_0000;
+
 /// Validate that `[ptr, ptr+len)` is entirely within user-space.
 fn validate_user_buf(ptr: usize, len: usize) -> bool {
     if ptr == 0 { return false; }
@@ -2621,6 +2634,34 @@ fn open_exec_header(path: &str, pid: u32) -> Option<(usize, alloc::vec::Vec<u8>)
             return None;
         }
     }
+
+    // Ensure the PT_INTERP path string is also in the buffer.  It usually sits
+    // immediately after the program-header table, but that is not guaranteed;
+    // a dynamic binary is only ever loaded through this header, so the kernel
+    // must be able to read the interpreter path out of it (see sys_execve).
+    let mut interp_end = 0usize;
+    for i in 0..phnum {
+        let po = phoff + i * phentsize;
+        if po + 40 > hdr.len() { break; }
+        let p_type = u32::from_le_bytes(hdr[po..po + 4].try_into().unwrap());
+        if p_type == 3 /* PT_INTERP */ {
+            let p_offset = u64::from_le_bytes(hdr[po + 8..po + 16].try_into().unwrap()) as usize;
+            let p_filesz = u64::from_le_bytes(hdr[po + 32..po + 40].try_into().unwrap()) as usize;
+            interp_end = p_offset.saturating_add(p_filesz);
+        }
+    }
+    if interp_end > hdr.len() {
+        if interp_end > EXEC_HEADER_MAX {
+            let _ = sys_close(fd);
+            return None;
+        }
+        hdr = alloc::vec![0u8; interp_end];
+        let _ = sys_lseek(fd, 0, 0);
+        if read_fd_upto(fd, &mut hdr) < interp_end as isize {
+            let _ = sys_close(fd);
+            return None;
+        }
+    }
     Some((fd, hdr))
 }
 
@@ -2797,10 +2838,26 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     }
     let mut new_as = alloc::boxed::Box::new(mm::vmm::AddressSpace::new(pt_root));
 
+    // Header bytes for inspection: the full image (eager) or just the ELF +
+    // program-header + interp-string prefix (demand-paged).
+    let elf_bytes: &[u8] = if exec_cap != 0 {
+        header_data.as_deref().unwrap_or(&[])
+    } else {
+        unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_len) }
+    };
+
+    // ET_DYN images (PIE, static-PIE, dynamic) load at a non-zero bias; ET_EXEC
+    // keeps bias 0, byte-identical to the path the static userland has always
+    // taken (bias collapses every `bias + x` back to `x`).
+    let e_type = if elf_bytes.len() >= 18 {
+        u16::from_le_bytes([elf_bytes[16], elf_bytes[17]])
+    } else { 0 };
+    let bias = if e_type == ET_DYN { MAIN_DYN_BASE } else { 0 };
+
     let elf_info = if exec_cap != 0 {
         // Demand-paged: map PT_LOADs as file-backed lazy VMAs (each takes a
         // reference on exec_cap), no segment data read here.
-        let r = elf::load_lazy(header_data.as_deref().unwrap_or(&[]), &mut new_as, exec_cap);
+        let r = elf::load_lazy(elf_bytes, &mut new_as, exec_cap, bias);
         // Drop the creation reference: the image's lifetime is now carried
         // by the VMAs (dropping new_as on the error paths below releases
         // theirs, letting the refcount reach zero and close the file).
@@ -2810,12 +2867,60 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
             Err(_) => { drop(new_as); return -8; }
         }
     } else {
-        let elf_bytes = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_len) };
-        match elf::load(elf_bytes, &mut new_as) {
+        match elf::load(elf_bytes, &mut new_as, bias) {
             Ok(e)  => e,
             Err(_) => { drop(new_as); return -8; }
         }
     };
+
+    // Heap follows the MAIN image. Capture it now: loading the interpreter
+    // below runs the loader again and would otherwise reset heap_start to sit
+    // after INTERP_BASE (768 MiB) instead of after the ~2 MiB main image.
+    let main_heap = new_as.heap_start;
+
+    // ── Dynamic interpreter (PT_INTERP) ────────────────────────────────────────
+    // A dynamic binary names an interpreter (musl's ld.so, itself ET_DYN). The
+    // kernel maps it at INTERP_BASE alongside the main image and enters at *its*
+    // entry point; ld.so self-relocates (using AT_BASE), then processes the main
+    // program from the auxv and jumps to AT_ENTRY. Static (ET_EXEC) and
+    // static-PIE (ET_DYN, no PT_INTERP) binaries have no interpreter: the kernel
+    // enters their own entry directly and AT_BASE stays 0 (musl's rcrt1
+    // self-relocates from AT_PHDR).
+    let mut entry   = elf_info.entry;   // no-interp default: jump straight in
+    let mut at_base = 0u64;
+    if let Some((ioff, ilen)) = elf_info.interp {
+        if ilen == 0 || ioff.saturating_add(ilen) > elf_bytes.len() {
+            drop(new_as); return -8;
+        }
+        let raw = &elf_bytes[ioff..ioff + ilen];
+        let plen = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        // Copy the path out of the header buffer so nothing borrows it across
+        // the interpreter load below.
+        let mut path_buf = [0u8; 256];
+        if plen == 0 || plen > path_buf.len() { drop(new_as); return -8; }
+        path_buf[..plen].copy_from_slice(&raw[..plen]);
+        let interp_path = match core::str::from_utf8(&path_buf[..plen]) {
+            Ok(s) => s,
+            Err(_) => { drop(new_as); return -8; }
+        };
+
+        match read_file_from_vfs(interp_path) {
+            Some(ibytes) => match elf::load(&ibytes, &mut new_as, INTERP_BASE) {
+                Ok(ii) => { entry = ii.entry; at_base = INTERP_BASE as u64; }
+                Err(_) => { drop(new_as); return -8; }
+            },
+            None => {
+                serial_print_str("[EXEC] dynamic interpreter not found: ");
+                serial_print_str(interp_path);
+                serial_print_str("\n");
+                drop(new_as); return -8;
+            }
+        }
+    }
+    // Pin the heap to the main image regardless of whether the interpreter load
+    // moved it.
+    new_as.heap_start = main_heap;
+    new_as.heap_end   = main_heap;
 
     // The loaders are done with the file bytes (eager: copied into the new
     // address space; lazy: only the header was ever read).  Free the buffers
@@ -2892,8 +2997,11 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 
     // pointer table: argc(1) + argv[argc](argc) + null(1) + envp[envc](envc) + null(1)
     let ptr_words = 1 + argc + 1 + envc + 1;
-    // auxv: PHDR + PHENT + PHNUM + RANDOM + PAGESZ + UID + EUID + GID + EGID + VFS + NET + AUDIO + NULL = 13 pairs
-    let auxv_words = 13 * 2;
+    // auxv pairs: PHDR + PHENT + PHNUM + RANDOM + PAGESZ + UID + EUID + GID +
+    // EGID + VFS + NET + AUDIO + ENTRY + BASE + SECURE + HWCAP + EXECFN + NULL
+    // = 18 pairs. The last five are mandatory for the dynamic (PT_INTERP) path
+    // and harmless standard tags for static binaries.
+    let auxv_words = 18 * 2;
     let total_words = ptr_words + auxv_words;
     let total_ptr_bytes = total_words * W;
     // Align string section to 16 bytes.
@@ -2961,6 +3069,13 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         (AT_LEANDROS_VFS_PORT, VFS_SERVER_PORT.load(Ordering::Relaxed) as u64),
         (AT_LEANDROS_NET_PORT, NET_SERVER_PORT.load(Ordering::Relaxed) as u64),
         (AT_LEANDROS_AUDIO_PORT, AUDIO_SERVER_PORT.load(Ordering::Relaxed) as u64),
+        (9,  elf_info.entry as u64),                // AT_ENTRY — main exe entry (biased)
+        (7,  at_base),                              // AT_BASE  — interpreter load base, 0 if none
+        (23, 0),                                    // AT_SECURE
+        (16, 0),                                    // AT_HWCAP
+        // AT_EXECFN → argv[0] string (musl falls back to argv[0] if absent, so
+        // 0 when there are no args is fine).
+        (31, if argc > 0 { str_base_va as u64 } else { 0 }),
         (0,  0),                                    // AT_NULL
     ];
     for &(k, v) in auxv {
@@ -3008,7 +3123,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // which never returns.
     sched::set_exe_path(fd_owner, kpath.bytes());
 
-    replace_address_space(*new_as, pt_root, heap_start, elf_info.entry, user_sp);
+    replace_address_space(*new_as, pt_root, heap_start, entry, user_sp);
 }
 
 // ── I/O syscalls ──────────────────────────────────────────────────────────────

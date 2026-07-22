@@ -1,10 +1,12 @@
 //! ELF64 loader — parse and map an ELF executable into an `AddressSpace`.
 //!
-//! Only ET_EXEC (statically linked) binaries are supported.  Dynamic linking
-//! requires an interpreter (ld.so), which Phase 3 will wire up via the VFS
-//! server.  PT_INTERP segments are ignored for now (ENOEXEC returned if the
-//! binary has a non-null interpreter path — unless the caller opts out of that
-//! check).
+//! Handles both `ET_EXEC` (fixed-address) and `ET_DYN` (position-independent)
+//! images.  The caller passes a load `bias`: `0` for `ET_EXEC` (so every
+//! `p_vaddr` maps literally, exactly as before), a non-zero base for `ET_DYN`
+//! (PIE main executables and the dynamic interpreter).  musl self-relocates —
+//! the loader applies no relocations; it only maps segments at the bias, and
+//! reports `e_type` and any `PT_INTERP` path so the kernel can load the
+//! interpreter and build the correct auxiliary vector.
 //!
 //! # Usage
 //!
@@ -54,6 +56,7 @@ const ELFDATA2LSB:   u8      = 1;
 const ET_EXEC:       u16     = 2;
 const ET_DYN:        u16     = 3;
 const PT_LOAD:       u32     = 1;
+const PT_INTERP:     u32     = 3;
 
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
@@ -145,14 +148,23 @@ fn parse_phdr(b: &[u8], off: usize) -> Result<Phdr, ElfError> {
 
 /// Information returned by [`load`] that the kernel needs to build the auxv.
 pub struct ElfInfo {
-    /// Virtual entry-point address.
+    /// Virtual entry-point address (already includes the load `bias`).
     pub entry:     usize,
-    /// Virtual address of the program header table in the loaded image.
+    /// Virtual address of the program header table in the loaded image
+    /// (already includes the load `bias`).
     pub phdr_va:   usize,
     /// Size in bytes of one program-header entry (`e_phentsize`).
     pub phentsize: usize,
     /// Number of program-header entries (`e_phnum`).
     pub phnum:     usize,
+    /// ELF `e_type` (`ET_EXEC` = 2 or `ET_DYN` = 3).  The caller uses this to
+    /// pick the load bias and the `AT_BASE`/`AT_ENTRY` auxv values.
+    pub e_type:    u16,
+    /// If the image carries a `PT_INTERP`, the `(file_offset, length)` of the
+    /// interpreter path string within the source bytes (the trailing NUL is
+    /// included in the length).  The caller reads the string, loads that
+    /// interpreter, and enters at *its* entry point.
+    pub interp:    Option<(usize, usize)>,
 }
 
 /// Load an ELF64 executable from `bytes` into `as_`.
@@ -171,7 +183,7 @@ pub struct ElfInfo {
 /// `as_` must be a freshly-created `AddressSpace` for the new process.  The
 /// function writes to physical memory via identity-mapped kernel addresses, so
 /// it must run in kernel mode with interrupts allowed to be off.
-pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<ElfInfo, ElfError> {
+pub fn load(bytes: &[u8], as_: &mut AddressSpace, bias: usize) -> Result<ElfInfo, ElfError> {
     let ehdr       = parse_ehdr(bytes)?;
     let phoff      = ehdr.e_phoff     as usize;
     let phentsize  = ehdr.e_phentsize as usize;
@@ -185,25 +197,31 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<ElfInfo, ElfError> {
 
     let page_size = mm::buddy::PAGE_SIZE;
     let mut highest:   usize = 0;           // highest virtual address loaded (inclusive end)
-    let mut load_base: usize = 0;           // base VA = first PT_LOAD's (p_vaddr - p_offset)
+    let mut load_base: usize = 0;           // base VA = first PT_LOAD's (p_vaddr - p_offset), biased
     let mut first_load = true;
+    let mut interp: Option<(usize, usize)> = None;
 
     for i in 0..phnum {
         let ph_off = phoff + i * phentsize;
         let ph     = parse_phdr(bytes, ph_off)?;
 
+        if ph.p_type == PT_INTERP {
+            interp = Some((ph.p_offset as usize, ph.p_filesz as usize));
+        }
         if ph.p_type != PT_LOAD { continue; }
         if ph.p_memsz == 0      { continue; }
 
-        let vaddr   = ph.p_vaddr  as usize;
+        // ET_DYN images are position-independent: every PT_LOAD is placed at
+        // `bias + p_vaddr`.  `bias` is 0 for ET_EXEC, so this collapses to the
+        // literal-vaddr behaviour those binaries have always used.
+        let vaddr   = (ph.p_vaddr as usize).wrapping_add(bias);
         let memsz   = ph.p_memsz  as usize;
         let filesz  = ph.p_filesz as usize;
         let foffset = ph.p_offset as usize;
 
         if first_load {
-            // load_base is the virtual address that file offset 0 maps to.
-            // For ET_EXEC this equals p_vaddr (since p_offset is always 0 for the
-            // first segment), giving us AT_PHDR = load_base + e_phoff.
+            // load_base is the (biased) virtual address that file offset 0 maps
+            // to.  AT_PHDR = load_base + e_phoff.
             load_base = vaddr.wrapping_sub(foffset);
             first_load = false;
         }
@@ -303,10 +321,12 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<ElfInfo, ElfError> {
     }
 
     Ok(ElfInfo {
-        entry:     ehdr.e_entry as usize,
+        entry:     (ehdr.e_entry as usize).wrapping_add(bias),
         phdr_va:   load_base.wrapping_add(phoff),
         phentsize: ehdr.e_phentsize as usize,
         phnum:     ehdr.e_phnum     as usize,
+        e_type:    ehdr.e_type,
+        interp,
     })
 }
 
@@ -322,6 +342,7 @@ pub fn load_lazy(
     header: &[u8],
     as_: &mut AddressSpace,
     file_cap: usize,
+    bias: usize,
 ) -> Result<ElfInfo, ElfError> {
     let ehdr       = parse_ehdr(header)?;
     let phoff      = ehdr.e_phoff     as usize;
@@ -338,15 +359,19 @@ pub fn load_lazy(
     let mut highest:   usize = 0;
     let mut load_base: usize = 0;
     let mut first_load = true;
+    let mut interp: Option<(usize, usize)> = None;
 
     for i in 0..phnum {
         let ph_off = phoff + i * phentsize;
         let ph     = parse_phdr(header, ph_off)?;
 
+        if ph.p_type == PT_INTERP {
+            interp = Some((ph.p_offset as usize, ph.p_filesz as usize));
+        }
         if ph.p_type != PT_LOAD { continue; }
         if ph.p_memsz == 0      { continue; }
 
-        let vaddr   = ph.p_vaddr  as usize;
+        let vaddr   = (ph.p_vaddr as usize).wrapping_add(bias);
         let memsz   = ph.p_memsz  as usize;
         let filesz  = ph.p_filesz as usize;
         let foffset = ph.p_offset as usize;
@@ -395,9 +420,11 @@ pub fn load_lazy(
     }
 
     Ok(ElfInfo {
-        entry:     ehdr.e_entry as usize,
+        entry:     (ehdr.e_entry as usize).wrapping_add(bias),
         phdr_va:   load_base.wrapping_add(phoff),
         phentsize: ehdr.e_phentsize as usize,
         phnum:     ehdr.e_phnum     as usize,
+        e_type:    ehdr.e_type,
+        interp,
     })
 }
