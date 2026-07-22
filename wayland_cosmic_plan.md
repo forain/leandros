@@ -349,6 +349,18 @@ applets: force software renderer via env at M6.
 - Exit: S2 passes; a pure-Rust Smithay headless server + wl_shm client exchange a
   registry, attach a buffer, and the server reads correct client pixels over our
   socket. Tokio multi-task stress idles at ~0% CPU (epoll actually blocks).
+- **COMPLETE 2026-07-22, both arches.** wltest (job tmp `m1-wltest/`): pure-Rust
+  wayland-server 0.31.13 + wayland-client 0.31.14 (rs backend, rustix raw
+  syscalls, static musl) — registry roundtrip, wl_shm.create_pool via
+  SCM_RIGHTS memfd, 16×16 XRGB8888 buffer attach/commit, server pixel-verifies
+  two client write generations through a live MAP_SHARED alias (not a copy).
+  Same-boot cross-checks: scmtest 19/19, idletest IDLE_CPU_US=0. Two kernel
+  gaps found by the real protocol and fixed surgically: FIONBIO fell to the
+  terminal-ioctl tail → ENOTTY on socket fds (e980eb0; now routes to
+  NET_GETFL/SETFL sharing the one O_NONBLOCK bit), and AF_UNIX accept()
+  returned a malformed peer sockaddr — family AF_UNSPEC, addrlen never
+  written — which std rejects (e76324b; also moved the user-memory stores out
+  from under SOCK_TABLES per the 82d0cc3 invariant).
 
 **M2 — Dynamic linking** (K3)
 - Exit: dynamically-linked musl binary with dlopen runs on both arches.
