@@ -170,7 +170,7 @@ pub fn init() -> Result<u32, i32> {
     }
     state.bound_port = server_port;
 
-    vfs_server::register_device("/dev/pipewire", server_port, 0);
+    vfs_server::register_device("/dev/pipewire", server_port, 0, 0, 0);
     net_server::force_bind_unix(PW_SOCKET_PATH, server_port);
 
     state.initialized = true;

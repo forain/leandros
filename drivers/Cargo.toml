@@ -17,4 +17,5 @@ ipc = { path = "../ipc" }
 mm = { path = "../mm" }
 boot = { path = "../boot" }
 evdev-server = { path = "../servers/evdev" }
+sched = { path = "../sched" }
 spin.workspace = true

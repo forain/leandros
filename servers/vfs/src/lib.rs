@@ -670,23 +670,47 @@ pub struct DynamicDeviceEntry {
     pub path: &'static str,
     pub port: u32,
     pub dev_id: u32,
+    /// Character-device major/minor. libdrm derives /sys/dev/char/226:0 from
+    /// major(st_rdev)=226; libudev likewise keys on the node's rdev. 0/0 for
+    /// nodes with no meaningful device number (e.g. /dev/pipewire).
+    pub major: u32,
+    pub minor: u32,
     pub in_use: bool,
 }
 
 impl DynamicDeviceEntry {
     const fn empty() -> Self {
-        Self { path: "", port: 0, dev_id: 0, in_use: false }
+        Self { path: "", port: 0, dev_id: 0, major: 0, minor: 0, in_use: false }
     }
 }
 
 static DYNAMIC_DEVICES: Mutex<[DynamicDeviceEntry; MAX_DYNAMIC_DEVICES]> =
     Mutex::new([const { DynamicDeviceEntry::empty() }; MAX_DYNAMIC_DEVICES]);
 
-/// Register a dynamic device path to be proxied to a specific IPC port.
-pub fn register_device(path: &'static str, port: u32, dev_id: u32) {
+/// Linux dev_t encoding: major in bits 8..20 + 32.., minor split around bit 8.
+pub fn makedev(major: u32, minor: u32) -> u64 {
+    let (major, minor) = (major as u64, minor as u64);
+    ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12)
+}
+
+/// Look up the rdev (as dev_t) for a registered dynamic device by (port, dev_id).
+/// Returns 0 if the node has no device number registered.
+fn lookup_device_rdev(port: u32, dev_id: u32) -> u64 {
+    let devices = DYNAMIC_DEVICES.lock();
+    for d in devices.iter() {
+        if d.in_use && d.port == port && d.dev_id == dev_id {
+            return makedev(d.major, d.minor);
+        }
+    }
+    0
+}
+
+/// Register a dynamic device path to be proxied to a specific IPC port,
+/// carrying its char-device major/minor (used for st_rdev and synthetic sysfs).
+pub fn register_device(path: &'static str, port: u32, dev_id: u32, major: u32, minor: u32) {
     let mut devices = DYNAMIC_DEVICES.lock();
     if let Some(slot) = devices.iter_mut().find(|d| !d.in_use) {
-        *slot = DynamicDeviceEntry { path, port, dev_id, in_use: true };
+        *slot = DynamicDeviceEntry { path, port, dev_id, major, minor, in_use: true };
     }
 }
 
@@ -1183,6 +1207,8 @@ pub fn init(owner_pid: u32) -> Option<u32> {
                 path: "/dev/input/testdrm",
                 port: 999, // Invalid port - should fail but help us debug
                 dev_id: 888,
+                major: 0,
+                minor: 0,
                 in_use: true
             };
         }
@@ -4366,7 +4392,30 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             drop(tbls);
             (0, 0) // never fires — accepted watches silently produce no events
         }
-        VnodeKind::DevStdio { .. } | VnodeKind::DynamicDevice { .. } | VnodeKind::None => {
+        VnodeKind::DynamicDevice { port, dev_id } => {
+            let port = *port;
+            let dev_id = *dev_id;
+            drop(tbls);
+            // Proxy readiness to the owning device server (DRM card0 events,
+            // evdev eventN). Holds no VFS lock across the IPC round-trip, and the
+            // epoll wait loop already drops EPOLL_INSTANCES before probing, so
+            // this stays clear of the 82d0cc3 lock-under-fault hazard. A server
+            // that does not implement VFS_POLL replies with a negative errno —
+            // treat that as "not ready" (the pre-K4 behaviour).
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_POLL;
+            proxy.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
+            proxy.data[24..32].copy_from_slice(&(pid as u64).to_le_bytes());
+            let reply = call_port(port, proxy);
+            let raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
+            if raw < 0 {
+                (0, 0)
+            } else {
+                let seq = u64::from_le_bytes(reply.data[8..16].try_into().unwrap_or([0u8; 8]));
+                (raw as u32, seq)
+            }
+        }
+        VnodeKind::DevStdio { .. } | VnodeKind::None => {
             drop(tbls);
             (0, 0)
         }
@@ -5513,6 +5562,22 @@ pub fn write_stat_full(
     uid:      u32,
     gid:      u32,
 ) {
+    write_stat_full_rdev(stat_ptr, mode, nlink, size, ino, uid, gid, 0);
+}
+
+/// As `write_stat_full`, but also fills `st_rdev` (device number) for
+/// character/block device nodes. The st_rdev offset is arch-specific
+/// (x86-64: 40, aarch64: 32 — see the layout comment above).
+pub fn write_stat_full_rdev(
+    stat_ptr: usize,
+    mode:     u32,
+    nlink:    u64,
+    size:     u64,
+    ino:      u64,
+    uid:      u32,
+    gid:      u32,
+    rdev:     u64,
+) {
     unsafe {
         let p = stat_ptr as *mut u8;
         core::ptr::write_bytes(p, 0, STAT_SIZE);
@@ -5525,6 +5590,7 @@ pub fn write_stat_full(
             (p.add(24) as *mut u32).write_unaligned(mode);  // st_mode
             (p.add(28) as *mut u32).write_unaligned(uid);   // st_uid
             (p.add(32) as *mut u32).write_unaligned(gid);   // st_gid
+            (p.add(40) as *mut u64).write_unaligned(rdev);  // st_rdev
             (p.add(56) as *mut i64).write_unaligned(4096i64); // st_blksize (long)
         }
         #[cfg(target_arch = "aarch64")]
@@ -5533,6 +5599,7 @@ pub fn write_stat_full(
             (p.add(20) as *mut u32).write_unaligned(nlink as u32); // st_nlink (u32)
             (p.add(24) as *mut u32).write_unaligned(uid);          // st_uid
             (p.add(28) as *mut u32).write_unaligned(gid);          // st_gid
+            (p.add(32) as *mut u64).write_unaligned(rdev);         // st_rdev
             (p.add(56) as *mut i32).write_unaligned(4096i32);      // st_blksize (int)
         }
 
@@ -5762,6 +5829,15 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         return call_port(port, proxy);
     }
 
+    // A dynamic device node (DRM card0, evdev eventN) must report its real
+    // st_rdev — libdrm computes major(st_rdev)==226 to find /sys/dev/char/226:0,
+    // and libudev keys on it. The rdev comes from the registry (port, dev_id).
+    if let VnodeKind::DynamicDevice { port, dev_id } = kind {
+        let rdev = lookup_device_rdev(port, dev_id);
+        write_stat_full_rdev(stat_ptr, S_IFCHR | 0o666, 1, 0, 0, 0, 0, rdev);
+        return ok_reply();
+    }
+
     // (mode, size, ino)
     let (mode, size, ino): (u32, u64, u64) = match kind {
         VnodeKind::Pipe { ring, .. } => {
@@ -5776,8 +5852,10 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         // ttyname() rejects the fd; see CONSOLE_INO.
         VnodeKind::DevStdio { .. } => (S_IFCHR | 0o666, 0, CONSOLE_INO),
         VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom
-        | VnodeKind::DevFb { .. }
-        | VnodeKind::DynamicDevice { .. } => (S_IFCHR | 0o666, 0, 0),
+        | VnodeKind::DevFb { .. } => (S_IFCHR | 0o666, 0, 0),
+        // DynamicDevice is handled by the early return above (it needs st_rdev);
+        // this arm exists only for match exhaustiveness.
+        VnodeKind::DynamicDevice { .. } => return err_reply(-9),
         // A pseudo-directory reports S_IFDIR with size 0. It used to report
         // S_IFREG with `size = data.len()`, i.e. the length of its own path —
         // which is what let memmap2 map `/tmp` as a 4-byte "file".
@@ -5866,13 +5944,16 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
             write_stat(stat_ptr, 0o020666, 0, 3);
             return ok_reply();
         }
-        // Dynamic devices.
-        let dyn_found = {
+        // Dynamic devices. Report the real st_rdev so a path-based stat of
+        // /dev/dri/card0 agrees with fstat (libdrm derives 226:0 from it).
+        let dyn_rdev = {
             let devices = DYNAMIC_DEVICES.lock();
-            devices.iter().any(|d| d.in_use && d.path.as_bytes() == lookup_path)
+            devices.iter()
+                .find(|d| d.in_use && d.path.as_bytes() == lookup_path)
+                .map(|d| makedev(d.major, d.minor))
         };
-        if dyn_found {
-            write_stat(stat_ptr, 0o020666, 0, 4);
+        if let Some(rdev) = dyn_rdev {
+            write_stat_full_rdev(stat_ptr, 0o020666, 1, 0, 4, 0, 0, rdev);
             return ok_reply();
         }
         // Static RamFS files.

@@ -22,6 +22,37 @@ const DRM_IOCTL_MODE_SETCRTC: u32 = 0xC06864A2;
 const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xC01864B0;
 const DRM_IOCTL_VERSION: u32 = 0xC0406400;
 
+// ── K4: Mesa/GBM buffer + Smithay/libdrm KMS surface ─────────────────────────
+const DRM_IOCTL_GET_CAP: u32 = 0xC010640C;
+const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010640D;
+const DRM_IOCTL_SET_MASTER: u32 = 0x0000641E;
+const DRM_IOCTL_DROP_MASTER: u32 = 0x0000641F;
+const DRM_IOCTL_GET_MAGIC: u32 = 0x80046402;
+const DRM_IOCTL_AUTH_MAGIC: u32 = 0x40046411;
+const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086409;
+const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = 0xC00464B4;
+const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC06864B8;
+const DRM_IOCTL_MODE_RMFB: u32 = 0xC00464AF;
+const DRM_IOCTL_MODE_DIRTYFB: u32 = 0xC01864B1;
+const DRM_IOCTL_PRIME_HANDLE_TO_FD: u32 = 0xC00C642D;
+const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xC00C642E;
+
+// DRM capability ids (drm_get_cap.capability)
+const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
+const DRM_CAP_PRIME: u64 = 0x5;
+const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 0x6;
+const DRM_CAP_ASYNC_PAGE_FLIP: u64 = 0x7;
+const DRM_CAP_ADDFB2_MODIFIERS: u64 = 0x10;
+const DRM_CAP_CRTC_IN_VBLANK_EVENT: u64 = 0x12;
+
+// drm_set_client_cap.capability
+const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
+
+// PAGE_FLIP flags / event types
+const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
+
 // Virtio-GPU specific IOCTLs
 // const DRM_IOCTL_VIRTGPU_MAP: u32 = 0xC0106401;
 const DRM_IOCTL_VIRTGPU_EXECBUFFER: u32 = 0x40286402;
@@ -154,6 +185,77 @@ struct drm_mode_crtc_page_flip {
 }
 
 #[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct drm_get_cap {
+    capability: u64,
+    value: u64,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct drm_set_client_cap {
+    capability: u64,
+    value: u64,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct drm_gem_close {
+    handle: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct drm_mode_destroy_dumb {
+    handle: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct drm_auth {
+    magic: u32,
+}
+
+// 104 bytes: repr(C) inserts 4 bytes of pad before `modifier` (u64 alignment).
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct drm_mode_fb_cmd2 {
+    fb_id: u32,
+    width: u32,
+    height: u32,
+    pixel_format: u32,
+    flags: u32,
+    handles: [u32; 4],
+    pitches: [u32; 4],
+    offsets: [u32; 4],
+    modifier: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct drm_mode_fb_dirty_cmd {
+    fb_id: u32,
+    flags: u32,
+    color: u32,
+    num_clips: u32,
+    clips_ptr: u64,
+}
+
+// DRM event blobs delivered by read() on the card fd.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct drm_event_vblank {
+    ev_type: u32,
+    length: u32,
+    user_data: u64,
+    tv_sec: u32,
+    tv_usec: u32,
+    sequence: u32,
+    crtc_id: u32,
+}
+
+#[repr(C)]
 #[derive(Default)]
 struct drm_version {
     version_major: i32,
@@ -205,9 +307,100 @@ struct drm_virtgpu_get_caps {
 }
 
 use alloc::collections::BTreeMap;
+use alloc::collections::VecDeque;
+use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 
-static DUMB_BUFFERS: Mutex<BTreeMap<u32, usize>> = Mutex::new(BTreeMap::new());
+/// A dumb buffer's physical base and buddy allocation order, so DESTROY_DUMB /
+/// GEM_CLOSE can return the exact pages to the allocator (freeing the wrong
+/// order corrupts the buddy allocator).
+#[derive(Clone, Copy)]
+struct DumbBuf {
+    phys: usize,
+    order: usize,
+}
+
+static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new());
+
+// ── DRM page-flip event channel ──────────────────────────────────────────────
+// PAGE_FLIP-with-event completions are NOT delivered instantly: doing so lets a
+// compositor's render loop resubmit with zero delay and peg the CPU (there is no
+// real vblank here). Instead they queue in PENDING_FLIPS and `drm_tick()` — a
+// 100 Hz tick hook — promotes at most one per ~vblank window into READY_EVENTS,
+// which read()/poll() on the card fd drain. This gives Smithay/kmscube a stable
+// frame cadence and keeps idle CPU at zero (idletest guards it).
+static PENDING_FLIPS: Mutex<VecDeque<[u8; 32]>> = Mutex::new(VecDeque::new());
+static READY_EVENTS:  Mutex<VecDeque<[u8; 32]>> = Mutex::new(VecDeque::new());
+static FLIP_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+static LAST_FLIP_DELIVER_TICK: AtomicU64 = AtomicU64::new(0);
+/// Advances each time an event becomes readable — epoll's edge emulation reads
+/// this as the card fd's readiness sequence (see VFS handle_poll seq contract).
+static DELIVERED_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic readiness sequence for the card fd (epoll edge emulation).
+pub fn drm_event_seq() -> u64 {
+    DELIVERED_SEQ.load(Ordering::Relaxed)
+}
+
+/// Queue a FLIP_COMPLETE event for throttled delivery. Called from the PAGE_FLIP
+/// ioctl (syscall context — a normal lock is fine; `drm_tick` uses try_lock).
+fn queue_flip_event(crtc_id: u32, user_data: u64) {
+    let seq = FLIP_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    let now = sched::ticks(); // 100 Hz monotonic
+    let ev = drm_event_vblank {
+        ev_type: DRM_EVENT_FLIP_COMPLETE,
+        length: 32,
+        user_data,
+        tv_sec: (now / 100) as u32,
+        tv_usec: ((now % 100) * 10_000) as u32,
+        sequence: seq,
+        crtc_id,
+    };
+    let mut blob = [0u8; 32];
+    unsafe { ptr::copy_nonoverlapping(&ev as *const _ as *const u8, blob.as_mut_ptr(), 32); }
+    PENDING_FLIPS.lock().push_back(blob);
+}
+
+/// 100 Hz tick hook (IRQ context): promote at most one pending flip to readable,
+/// throttled to ~50 Hz. MUST be non-blocking (try_lock only) and MUST NOT wake
+/// pollers when nothing is delivered — otherwise idle CPU regresses. Registered
+/// by the DRM server at init. Consistent lock order (PENDING then READY) + the
+/// read/flip paths each touching only one of the two means no deadlock.
+pub fn drm_tick() {
+    let now = sched::ticks();
+    let last = LAST_FLIP_DELIVER_TICK.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < 2 { return; } // < 20 ms since last delivery
+
+    let mut pend = match PENDING_FLIPS.try_lock() { Some(g) => g, None => return };
+    if pend.is_empty() { return; }
+    let mut ready = match READY_EVENTS.try_lock() { Some(g) => g, None => return };
+    if let Some(blob) = pend.pop_front() {
+        ready.push_back(blob);
+        drop(ready);
+        drop(pend);
+        LAST_FLIP_DELIVER_TICK.store(now, Ordering::Relaxed);
+        DELIVERED_SEQ.fetch_add(1, Ordering::Relaxed);
+        sched::try_wake_poll();
+    }
+}
+
+/// Drain whole (32-byte) DRM events into `out`. Returns bytes written (0 = EAGAIN).
+pub fn drm_read_events(out: &mut [u8]) -> usize {
+    let mut ready = READY_EVENTS.lock();
+    let mut written = 0;
+    while out.len() - written >= 32 {
+        match ready.pop_front() {
+            Some(ev) => { out[written..written + 32].copy_from_slice(&ev); written += 32; }
+            None => break,
+        }
+    }
+    written
+}
+
+/// Poll readiness for the card fd: true when a DRM event is queued to read.
+pub fn drm_has_events() -> bool {
+    !READY_EVENTS.lock().is_empty()
+}
 
 /// DRM device interface for userspace communication
 pub struct DrmDeviceInterface {
@@ -244,52 +437,59 @@ impl DrmDeviceInterface {
             crate::framebuffer::set_console_disabled(true);
         }
 
-        let device = get_drm_device();
-        crate::pci::rdebug("[DRM-IF] Locking DRM_DEVICE...\n");
-        let mut device_lock = device.lock();
-        crate::pci::rdebug("[DRM-IF] DRM_DEVICE locked\n");
-
+        // The DRM device lock is a spin::Mutex. It must NOT be held across any
+        // dereference of user memory: a demand-paging fault taken under a spinlock
+        // is the 82d0cc3 all-vCPU freeze class (no panic, IF=0 on every vCPU).
+        // We therefore lock PER ARM, only around device-state access. The new K4
+        // arms strictly copy the user struct into a kernel local BEFORE locking
+        // and write results back AFTER dropping the lock. The pre-existing arms
+        // operate on small fixed ioctl structs that the caller filled on its own
+        // always-resident stack immediately before the syscall.
         let res = match cmd {
-            // Mode setting ioctls (Custom LeandrOS)
-            0x1001 => {
-                // Drop the lock here because ModeSet::set_display_mode will acquire it
-                drop(device_lock);
-                self.handle_set_mode(arg)
-            },
-            0x1003 => {
-                crate::pci::rdebug("[DRM-IF] Dropping lock for GET_MODE\n");
-                drop(device_lock);
-                self.handle_get_mode_safe(arg)
-            },
-            0x1002 => self.handle_create_framebuffer(&mut device_lock, arg),
-            0x4600 => self.handle_fbioget_vscreeninfo(&mut device_lock, arg),
-            0x1004 => self.handle_flip_page(&mut device_lock, arg),
-            0x1005 => self.handle_set_plane(&mut device_lock, arg),
-
-            // Capability ioctls (Custom LeandrOS)
+            // ── Mode setting ioctls (Custom LeandrOS / DOOM path) ──
+            0x1001 => self.handle_set_mode(arg),
+            0x1003 => self.handle_get_mode_safe(arg),
+            0x1002 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_create_framebuffer(&mut g, arg) },
+            0x4600 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_fbioget_vscreeninfo(&mut g, arg) },
+            0x1004 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_flip_page(&mut g, arg) },
+            0x1005 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_set_plane(&mut g, arg) },
             0x1006 => self.handle_get_capabilities(arg),
+            0x1007 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_ioctl_mmap(&mut g, arg) },
 
-            // Mmap ioctl - returns physical address for device mapping
-            0x1007 => self.handle_ioctl_mmap(&mut device_lock, arg),
-
-            // Standard Linux DRM IOCTLs
+            // ── Standard Linux DRM IOCTLs (already wired) ──
             DRM_IOCTL_VERSION => self.std_handle_version(arg),
-            DRM_IOCTL_MODE_GETRESOURCES => self.std_handle_get_resources(&mut device_lock, arg),
-            DRM_IOCTL_MODE_GETCONNECTOR => self.std_handle_get_connector(&mut device_lock, arg),
-            DRM_IOCTL_MODE_GETENCODER => self.std_handle_get_encoder(&mut device_lock, arg),
-            DRM_IOCTL_MODE_GETCRTC => self.std_handle_get_crtc(&mut device_lock, arg),
-            DRM_IOCTL_MODE_CREATE_DUMB => self.std_handle_create_dumb(&mut device_lock, arg),
-            DRM_IOCTL_MODE_MAP_DUMB => self.std_handle_map_dumb(&mut device_lock, arg),
-            DRM_IOCTL_MODE_ADDFB => self.std_handle_addfb(&mut device_lock, arg),
-            DRM_IOCTL_MODE_SETCRTC => self.std_handle_set_crtc(&mut device_lock, arg),
-            DRM_IOCTL_MODE_PAGE_FLIP => self.std_handle_page_flip(&mut device_lock, arg),
+            DRM_IOCTL_MODE_GETRESOURCES => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_resources(&mut g, arg) },
+            DRM_IOCTL_MODE_GETCONNECTOR => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_connector(&mut g, arg) },
+            DRM_IOCTL_MODE_GETENCODER => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_encoder(&mut g, arg) },
+            DRM_IOCTL_MODE_GETCRTC => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_crtc(&mut g, arg) },
+            DRM_IOCTL_MODE_CREATE_DUMB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_create_dumb(&mut g, arg) },
+            DRM_IOCTL_MODE_MAP_DUMB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_map_dumb(&mut g, arg) },
+            DRM_IOCTL_MODE_ADDFB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_addfb(&mut g, arg) },
+            DRM_IOCTL_MODE_SETCRTC => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_set_crtc(&mut g, arg) },
+            DRM_IOCTL_MODE_PAGE_FLIP => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_page_flip(&mut g, arg) },
 
-            // Virtio-GPU 3D IOCTLs
+            // ── Virtio-GPU 3D IOCTLs (lock VIRTIO_GPU, not the DRM device) ──
             DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => self.virtgpu_handle_resource_create(arg),
             DRM_IOCTL_VIRTGPU_EXECBUFFER => self.virtgpu_handle_execbuffer(arg),
             DRM_IOCTL_VIRTGPU_GET_CAPS => self.virtgpu_handle_get_caps(arg),
             DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => self.virtgpu_handle_transfer_to_host(arg),
             DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => self.virtgpu_handle_transfer_from_host(arg),
+
+            // ── K4: Mesa/GBM buffer + Smithay/libdrm KMS surface ──
+            DRM_IOCTL_GET_CAP => self.std_handle_get_cap(arg),
+            DRM_IOCTL_SET_CLIENT_CAP => self.std_handle_set_client_cap(arg),
+            // Root single-seat: master is not gated (SETCRTC/PAGE_FLIP never check
+            // it), so accept the transitions unconditionally.
+            DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => Ok(0),
+            DRM_IOCTL_GET_MAGIC => self.std_handle_get_magic(arg),
+            DRM_IOCTL_AUTH_MAGIC => Ok(0),
+            DRM_IOCTL_GEM_CLOSE => self.std_handle_gem_close(arg),
+            DRM_IOCTL_MODE_DESTROY_DUMB => self.std_handle_destroy_dumb(arg),
+            DRM_IOCTL_MODE_ADDFB2 => self.std_handle_addfb2(arg),
+            DRM_IOCTL_MODE_RMFB => self.std_handle_rmfb(arg),
+            DRM_IOCTL_MODE_DIRTYFB => self.std_handle_dirtyfb(arg),
+            // No PRIME (single node, render==scanout) — Mesa falls back to software.
+            DRM_IOCTL_PRIME_HANDLE_TO_FD | DRM_IOCTL_PRIME_FD_TO_HANDLE => Err(DriverError::Unsupported),
 
             _ => Err(DriverError::Unsupported),
         };
@@ -740,8 +940,8 @@ impl DrmDeviceInterface {
 
         // Return the actual physical address associated with the dumb buffer handle
         let buffers = DUMB_BUFFERS.lock();
-        if let Some(&phys_addr) = buffers.get(&map.handle) {
-            map.offset = phys_addr as u64;
+        if let Some(b) = buffers.get(&map.handle) {
+            map.offset = b.phys as u64;
             Ok(0)
         } else {
             Err(DriverError::NotFound)
@@ -760,7 +960,7 @@ impl DrmDeviceInterface {
         );
 
         // Use the physical address associated with the dumb buffer handle
-        let phys_addr = DUMB_BUFFERS.lock().get(&add.handle).copied().unwrap_or(0);
+        let phys_addr = DUMB_BUFFERS.lock().get(&add.handle).map(|b| b.phys).unwrap_or(0);
         fb.physical_addresses[0] = phys_addr as u64;
 
         // If Virtio-GPU is present, create a resource for this framebuffer
@@ -800,9 +1000,148 @@ impl DrmDeviceInterface {
             src_h = fb.height;
         }
 
+        let flags = flip.flags;
+        let user_data = flip.user_data;
+        let crtc_id = flip.crtc_id;
         let flip_args = [flip.fb_id, flip.flags, src_w, src_h];
-        self.handle_flip_page(device, flip_args.as_ptr() as usize)
+        let r = self.handle_flip_page(device, flip_args.as_ptr() as usize);
+        // On success, if the client asked for a completion event, queue one for
+        // throttled delivery (drm_tick). This is what lets a compositor schedule
+        // the next frame.
+        if r.is_ok() && (flags & DRM_MODE_PAGE_FLIP_EVENT != 0) {
+            queue_flip_event(crtc_id, user_data);
+        }
+        r
     }
+
+    // ── K4 IOCTL handlers (copy-in-before-lock; see handle_ioctl note) ─────────
+
+    /// Free a dumb buffer's pages back to the buddy allocator and forget it.
+    fn free_dumb(handle: u32) {
+        if let Some(b) = DUMB_BUFFERS.lock().remove(&handle) {
+            mm::buddy::free(b.phys, b.order);
+        }
+    }
+
+    /// DRM_IOCTL_GET_CAP — Smithay/Mesa best-effort capability probe.
+    fn std_handle_get_cap(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let mut cap = unsafe { ptr::read_unaligned(arg as *const drm_get_cap) };
+        cap.value = match cap.capability {
+            DRM_CAP_DUMB_BUFFER => 1,
+            DRM_CAP_TIMESTAMP_MONOTONIC => 1,
+            DRM_CAP_CRTC_IN_VBLANK_EVENT => 1,
+            DRM_CAP_ADDFB2_MODIFIERS => 0,
+            DRM_CAP_PRIME => 0,
+            DRM_CAP_ASYNC_PAGE_FLIP => 0,
+            // Unknown caps: value 0 + success. Smithay probes many optional caps
+            // and treats an ioctl error differently from "cap == 0".
+            _ => 0,
+        };
+        unsafe { ptr::write_unaligned(arg as *mut drm_get_cap, cap); }
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_SET_CLIENT_CAP — refuse ATOMIC so Smithay selects the legacy
+    /// (non-atomic) KMS path we implement; accept UNIVERSAL_PLANES and others.
+    fn std_handle_set_client_cap(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let cap = unsafe { ptr::read_unaligned(arg as *const drm_set_client_cap) };
+        match cap.capability {
+            DRM_CLIENT_CAP_ATOMIC => Err(DriverError::Unsupported),
+            DRM_CLIENT_CAP_UNIVERSAL_PLANES => Ok(0),
+            _ => Ok(0),
+        }
+    }
+
+    /// DRM_IOCTL_GET_MAGIC — single-seat stub: return a nonzero magic.
+    fn std_handle_get_magic(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let mut a = unsafe { ptr::read_unaligned(arg as *const drm_auth) };
+        a.magic = 1;
+        unsafe { ptr::write_unaligned(arg as *mut drm_auth, a); }
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_GEM_CLOSE — free the handle's backing (Ok even if unknown).
+    fn std_handle_gem_close(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let c = unsafe { ptr::read_unaligned(arg as *const drm_gem_close) };
+        Self::free_dumb(c.handle);
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_MODE_DESTROY_DUMB — free the dumb buffer.
+    fn std_handle_destroy_dumb(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let d = unsafe { ptr::read_unaligned(arg as *const drm_mode_destroy_dumb) };
+        Self::free_dumb(d.handle);
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_MODE_ADDFB2 — LINEAR only, plane 0. Same internal path as ADDFB.
+    fn std_handle_addfb2(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let mut cmd2 = unsafe { ptr::read_unaligned(arg as *const drm_mode_fb_cmd2) };
+
+        let handle = cmd2.handles[0];
+        let width = cmd2.width;
+        let height = cmd2.height;
+        let pitch = if cmd2.pitches[0] != 0 { cmd2.pitches[0] } else { width * 4 };
+        let phys_addr = DUMB_BUFFERS.lock().get(&handle).map(|b| b.phys).unwrap_or(0);
+
+        let mut fb = DrmFramebuffer::new(width, height, DrmFormat::Xrgb8888, handle, pitch);
+        fb.physical_addresses[0] = phys_addr as u64;
+
+        // Bind a virtio-gpu resource so SETCRTC/PAGE_FLIP/DIRTYFB can transfer the
+        // CPU-rendered pixels to the host. (This locks VIRTIO_GPU, not the DRM
+        // device — no user memory is touched here.)
+        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+            let res_id = handle + 10;
+            gpu.create_resource_2d(res_id, width, height);
+            gpu.attach_backing(res_id, phys_addr as u64, width * height * 4);
+            fb.handles[0] = res_id;
+        }
+
+        let fb_id = fb.id().0;
+        {
+            let dev = get_drm_device();
+            let mut g = dev.lock();
+            g.framebuffers.insert(fb.id(), fb);
+        }
+
+        cmd2.fb_id = fb_id;
+        unsafe { ptr::write_unaligned(arg as *mut drm_mode_fb_cmd2, cmd2); }
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_MODE_RMFB — remove a framebuffer (arg is a bare u32 fb_id).
+    fn std_handle_rmfb(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let fb_id = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let dev = get_drm_device();
+        let mut g = dev.lock();
+        let _ = g.remove_framebuffer(DrmObjectId(fb_id));
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_MODE_DIRTYFB — flush a CPU-rendered fb to the host display.
+    fn std_handle_dirtyfb(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let cmd = unsafe { ptr::read_unaligned(arg as *const drm_mode_fb_dirty_cmd) };
+        let flush_args = {
+            let dev = get_drm_device();
+            let g = dev.lock();
+            g.get_framebuffer(DrmObjectId(cmd.fb_id)).map(|fb| (fb.handles[0], fb.width, fb.height))
+        };
+        if let Some((res_id, w, h)) = flush_args {
+            if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+                gpu.flush(res_id, 0, 0, w, h);
+            }
+        }
+        Ok(0)
+    }
+
     /// Handle FBIOGET_VSCREENINFO (0x4600)
     fn handle_fbioget_vscreeninfo(&self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
@@ -844,8 +1183,13 @@ impl DrmDeviceInterface {
             }
             Ok(fb_base as usize)
         } else {
-            // The physical address was passed as the offset to mmap()
-            // We just return it back to the kernel to confirm we support mapping it.
+            // The physical address was passed as the offset to mmap(). Only echo
+            // it back if it names a dumb buffer we actually allocated — otherwise
+            // a caller could map arbitrary physical memory through this device.
+            let known = DUMB_BUFFERS.lock().values().any(|b| b.phys == requested_phys as usize);
+            if !known {
+                return Err(DriverError::InvalidParameter);
+            }
             Ok(requested_phys as usize)
         }
     }
@@ -1065,7 +1409,7 @@ impl DrmDumbBuffer {
         }
 
         let handle = Self::next_handle();
-        DUMB_BUFFERS.lock().insert(handle, phys_addr as usize);
+        DUMB_BUFFERS.lock().insert(handle, DumbBuf { phys: phys_addr as usize, order });
         
         // mmap_offset for userspace will be the physical address
         // The syscall handler will use this to map the device memory

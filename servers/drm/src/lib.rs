@@ -85,7 +85,7 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
  else if msg.tag == 0x12 { // VFS_WRITE
         let count = arg(msg, 2) as usize;
         let buf_ptr = arg(msg, 1) as usize;
-        
+
         if buf_ptr == 0 { return err_reply(-14); } // EFAULT
         let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
 
@@ -93,6 +93,41 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             Ok(n) => val_reply(n as u64),
             Err(_) => err_reply(-5), // EIO
         }
+    } else if msg.tag == vfs_server::VFS_READ {
+        // read() on the card fd returns queued drm_event_vblank blobs (page-flip
+        // completions). Drain into a kernel-local buffer, then copy into the
+        // caller's address space via the safe path (NOT a raw deref — the read
+        // path is not guaranteed to run in the caller's AS). EAGAIN when empty.
+        let buf_ptr = arg(msg, 1) as usize;
+        let count = arg(msg, 2) as usize;
+        let pid = arg(msg, 3) as u32;
+        if buf_ptr == 0 { return err_reply(-14); } // EFAULT
+
+        let mut kbuf = [0u8; 256];
+        let cap = count.min(kbuf.len());
+        let n = drivers::drm_device_interface::drm_read_events(&mut kbuf[..cap]);
+        if n == 0 { return err_reply(-11); } // EAGAIN
+
+        let ok = sched::with_task_address_space(pid, || {
+            unsafe {
+                core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf_ptr as *mut u8, n);
+            }
+            0i32
+        });
+        match ok {
+            Some(0) => val_reply(n as u64),
+            _ => err_reply(-14), // EFAULT
+        }
+    } else if msg.tag == vfs_server::VFS_POLL {
+        // POLLIN when a page-flip event is queued to read.
+        let revents: u32 = if drivers::drm_device_interface::drm_has_events() { 0x1 } else { 0 };
+        // (revents, seq): seq echoes the delivered-flip counter so epoll's
+        // edge emulation re-arms on each new event.
+        let seq = drivers::drm_device_interface::drm_event_seq();
+        let mut m = Message::empty();
+        m.data[0..8].copy_from_slice(&(revents as u64).to_le_bytes());
+        m.data[8..16].copy_from_slice(&(seq as u64).to_le_bytes());
+        m
     } else if msg.tag == vfs_server::VFS_CLOSE || msg.tag == vfs_server::VFS_CLOSE_ALL {
         interface.release();
         ok_reply()
@@ -104,7 +139,10 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
 /// Initialize DRM service
 pub fn init(owner_pid: u32) -> Option<u32> {
     let port_id = port::create(owner_pid)?;
-    vfs_server::register_device("/dev/dri/card0", port_id, 0);
+    vfs_server::register_device("/dev/dri/card0", port_id, 0, 226, 0);
     port::register_handler(port_id, handle);
+    // Throttled page-flip event delivery runs off the 100 Hz tick. This does NOT
+    // displace the audio pump (register_tick_hook fills the next free slot).
+    sched::register_tick_hook(drivers::drm_device_interface::drm_tick);
     Some(port_id)
 }

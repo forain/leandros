@@ -307,7 +307,7 @@ pub fn init(owner_pid: u32) -> Option<u32> {
         let mut devs = DEVICES.lock();
         devs[0].in_use = true; // event0 (keyboard)
     }
-    vfs_server::register_device("/dev/input/event0", port_id, 0);
+    vfs_server::register_device("/dev/input/event0", port_id, 0, 13, 64);
     port::register_handler(port_id, handle);
     Some(port_id)
 }

@@ -124,6 +124,7 @@ dependencies = [
  "ipc",
  "leandros-lib",
  "mm",
+ "sched",
  "spin",
 ]
 
