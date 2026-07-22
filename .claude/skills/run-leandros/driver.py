@@ -488,11 +488,35 @@ def _serial_send(command, timeout=8):
         pass
 
     s.setblocking(True)
+    # Sync on the shell prompt before sending. The brush/reedline line editor
+    # only consumes RX once it is redrawing at its prompt; if we start writing
+    # while it is still busy (right after a long-running command, a screenshot,
+    # or QMP input) the first 8-byte chunk is silently dropped and the command
+    # head is eaten ("export XDG..." -> "DG..."). Send a bare CR, wait until the
+    # prompt "# " comes back, and only then write the real command.
+    try:
+        s.sendall(b"\r")
+        sync = b""
+        sync_deadline = time.time() + 2.0
+        while time.time() < sync_deadline:
+            if select.select([s], [], [], 0.1)[0]:
+                c = s.recv(4096)
+                if not c:
+                    break
+                if b"\x1b[6n" in c:
+                    s.sendall(b"\x1b[24;1R" * c.count(b"\x1b[6n"))
+                sync += c
+                if b"#" in _strip_ansi(sync)[-24:]:
+                    break
+    except Exception:
+        pass
+    time.sleep(0.05)
     # Pace the write: the guest PL011 RX FIFO is 16 bytes and the shell polls
     # it, so a single burst longer than ~16 bytes silently drops the head of
     # the command. 8-byte chunks with a small gap keep long command lines
-    # intact.
-    payload = (command + "\n").encode()
+    # intact. A leading space is insurance: if a head chunk is still dropped it
+    # eats whitespace, not the command (brush ignores leading spaces).
+    payload = ("  " + command + "\n").encode()
     for i in range(0, len(payload), 8):
         s.sendall(payload[i:i + 8])
         time.sleep(0.02)
