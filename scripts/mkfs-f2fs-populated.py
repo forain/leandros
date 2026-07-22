@@ -250,7 +250,7 @@ def main():
     # (tokio-echo-selftest regression + the idle-CPU cross-check).
     musl_target = "aarch64-unknown-linux-musl" if arch == "aarch64" else "x86_64-unknown-linux-musl"
     tokio_dir = os.path.expanduser(
-        f"~/.claude-forain/jobs/afde2e74/tmp/s1-musl-spike/target/{musl_target}/release")
+        f"~/code/leandros-artifacts/s1-musl-spike/target/{musl_target}/release")
     for tb in ("tokio-echo-selftest", "tokioidle"):
         p = os.path.join(tokio_dir, tb)
         if os.path.exists(p):
@@ -345,7 +345,7 @@ def main():
     # hardlinks to one inode and the kernel needs no symlink resolution to load
     # the interpreter. The test ladder binaries are dynamic-PIE ELFs whose
     # PT_INTERP points at /lib/ld-musl-<arch>.so.1.
-    dyn_root = os.path.expanduser("~/.claude-forain/jobs/afde2e74/tmp/musl-dynamic")
+    dyn_root = os.path.expanduser("~/code/leandros-artifacts/musl-dynamic")
     libc_so = f"{dyn_root}/sysroot/{arch}/usr/lib/libc.so"
     usr_lib_files = []
     if os.path.exists(libc_so):
@@ -372,7 +372,7 @@ def main():
     # symlink support is needed — same trick as ld-musl above). The soname paths
     # in the merged sysroot are symlinks that Python follows to the real
     # versioned .so, so the content is stored once under the soname name.
-    gl_root = os.path.expanduser("~/.claude-forain/jobs/afde2e74/tmp/m3-gl-stack")
+    gl_root = os.path.expanduser("~/code/leandros-artifacts/m3-gl-stack")
     gl_lib_dir = f"{gl_root}/sysroot-{arch}/usr/lib"
     gbm_files = []
     for so in ("libEGL.so.1", "libGLESv2.so.2", "libgbm.so.1", "libdrm.so.2",
