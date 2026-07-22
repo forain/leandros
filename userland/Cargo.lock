@@ -25,6 +25,10 @@ name = "epolltest"
 version = "0.1.0"
 
 [[package]]
+name = "evtest2"
+version = "0.1.0"
+
+[[package]]
 name = "f2fstest"
 version = "0.1.0"
 dependencies = [

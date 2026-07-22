@@ -1,0 +1,11 @@
+[package]
+name = "evtest2"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "evtest2"
+path = "src/main.rs"
+
+[dependencies]
+# Links against librelibc.a (like drmsmoke/epolltest) for open/ioctl/read/epoll.

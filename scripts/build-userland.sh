@@ -35,7 +35,7 @@ fi
 # pthread/timer syscalls) rather than the minimal leandros-libc, and so need
 # the custom leandros target JSON + build-std instead of the bare
 # *-unknown-none target the rest of userland uses.
-RELIBC_LINKED=(pthreadtest timertest sigtest polltest forktest racetest ping waittest sigchldtest epolltest idletest drmsmoke)
+RELIBC_LINKED=(pthreadtest timertest sigtest polltest forktest racetest ping waittest sigchldtest epolltest idletest drmsmoke evtest2)
 
 EXCLUDE_ARGS=()
 for prog in "${RELIBC_LINKED[@]}"; do
