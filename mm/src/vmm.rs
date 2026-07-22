@@ -737,81 +737,164 @@ impl AddressSpace {
         }
     }
 
+    /// Split the VMA that *strictly* contains the page-aligned `boundary` into
+    /// two adjacent VMAs `[start, boundary)` (kept in the original slot) and
+    /// `[boundary, end)` (moved to a fresh slot).  Returns `true` if a split
+    /// occurred.
+    ///
+    /// No-op (`false`) when `boundary` coincides with a VMA edge or falls in a
+    /// hole (nothing to split), or when the containing VMA is a device mapping
+    /// (`file_cap == usize::MAX`) — device ranges are mapped and torn down
+    /// whole and are never sub-divided.
+    ///
+    /// The physical↔virtual mapping is untouched; only the VMA bookkeeping is
+    /// repartitioned, so no PTE is rewritten here.  An *eager* (contiguous
+    /// buddy-backed) VMA is first converted to per-page lazy tracking — exactly
+    /// the transformation `mm::cow::clone_as` performs — so the two halves each
+    /// own and free their own pages independently.  The original buddy block is
+    /// reconstructed by the allocator's coalescing as its pages are freed one
+    /// order-0 page at a time.
+    ///
+    /// This is the shared primitive behind `unmap_range`'s middle-punch and
+    /// `mprotect`'s sub-range: the dynamic loader (`ld.so`) relies on both when
+    /// it `MAP_FIXED`-overlays library segments and applies RELRO.
+    pub fn split_at(&mut self, boundary: usize) -> bool {
+        let boundary = boundary & !(PAGE_SIZE - 1);
+
+        // Locate the VMA whose interior the boundary lands in.
+        let idx = match self.regions.iter().position(
+            |slot| matches!(slot, Some(r) if r.start < boundary && boundary < r.end)
+        ) {
+            Some(i) => i,
+            None    => return false,
+        };
+        // Device mappings are never split.
+        if matches!(self.regions[idx], Some(ref r) if r.file_cap == usize::MAX) {
+            return false;
+        }
+
+        // Convert eager → per-page lazy in place, then peel the tail pages off.
+        let (r_end, tail_pages, flags, prot, map_flags,
+             file_cap, right_off, right_len, cow) = {
+            let r = self.regions[idx].as_mut().unwrap();
+            if !r.lazy {
+                let n = (r.end - r.start) / PAGE_SIZE;
+                let mut v = Vec::with_capacity(n);
+                for i in 0..n { v.push(r.phys + i * PAGE_SIZE); }
+                r.lazy = true;
+                r.phys = 0;
+                r.lazy_pages = v;
+                r.lazy_count = n;
+            }
+
+            let split_idx   = (boundary - r.start) / PAGE_SIZE;
+            let split_bytes = (split_idx * PAGE_SIZE) as u64;
+            let orig_len    = r.file_len;
+
+            let tail = if split_idx < r.lazy_pages.len() {
+                r.lazy_pages.split_off(split_idx)
+            } else {
+                Vec::new()
+            };
+            let r_end = r.end;
+
+            // Left half: ends at boundary, keeps its file offset but its file
+            // extent is clipped to what precedes the boundary.
+            r.end = boundary;
+            r.lazy_count = r.lazy_pages.iter().filter(|&&p| p != 0).count();
+            let right_off = r.file_off + split_bytes;
+            let right_len = orig_len.saturating_sub(split_bytes);
+            if is_file_backed(r.file_cap) && r.file_len > split_bytes {
+                r.file_len = split_bytes;
+            }
+
+            (r_end, tail, r.flags, r.prot, r.map_flags,
+             r.file_cap, right_off, right_len, r.cow)
+        };
+
+        // Each surviving VMA holds its own reference on the backing file.
+        if is_file_backed(file_cap) { file_retain(file_cap); }
+
+        let right_count = tail_pages.iter().filter(|&&p| p != 0).count();
+        let new_region = VmaRegion {
+            start: boundary,
+            end:   r_end,
+            phys:  0,
+            flags,
+            lazy:  true,
+            lazy_pages: tail_pages,
+            lazy_count: right_count,
+            prot,
+            map_flags,
+            file_cap,
+            file_off: right_off,
+            file_len: right_len,
+            cow,
+        };
+
+        match self.regions.iter().position(|r| r.is_none()) {
+            Some(i) => self.regions[i] = Some(new_region),
+            None    => self.regions.push(Some(new_region)),
+        }
+        true
+    }
+
     /// Unmap a virtual address range `[virt, virt+len)`, freeing any backing pages.
     ///
-    /// Handles full removal, front-trim, and back-trim for each overlapping VMA.
-    /// Middle splits (where neither end of the unmap aligns with the VMA boundary)
-    /// truncate to the left portion; the right portion is leaked — this is a known
-    /// Phase 6 limitation that Phase 7's VMO refcount migration will resolve.
+    /// Splits any VMA straddling either end of the range (see [`split_at`]) so
+    /// that every overlap becomes a wholly-contained VMA, then removes those
+    /// VMAs in full.  This makes front-, back-, and middle-punches uniform and
+    /// leak-free — including the middle-punch the dynamic loader triggers with
+    /// its `MAP_FIXED` segment overlays.
+    ///
+    /// [`split_at`]: Self::split_at
     pub fn unmap_range(&mut self, virt: usize, len: usize) {
         if len == 0 { return; }
         let virt = virt & !(PAGE_SIZE - 1);
         let len  = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let end  = match virt.checked_add(len) { Some(e) => e, None => return };
 
+        // After splitting at both boundaries, any VMA overlapping [virt,end) is
+        // fully contained within it.
+        self.split_at(virt);
+        self.split_at(end);
+
         let pt = self.page_table_root;
         let mut did_unmap = false;
 
         for slot in self.regions.iter_mut() {
             let region = match slot {
-                Some(r) if r.start < end && r.end > virt => r,
+                Some(r) if r.start >= virt && r.end <= end && r.start < r.end => r,
                 _ => continue,
             };
 
             let r_start = region.start;
             let r_end   = region.end;
-            let clip_s  = virt.max(r_start);
-            let clip_e  = end.min(r_end);
+            let n_pages = (r_end - r_start) / PAGE_SIZE;
 
-            // ── Free physical pages in the clipped range ──────────────────────
             if region.lazy {
-                let pg_first = (clip_s - r_start) / PAGE_SIZE;
-                let pg_last  = (clip_e - r_start + PAGE_SIZE - 1) / PAGE_SIZE;
-                for i in pg_first..pg_last.min(region.lazy_pages.len()) {
-                    if region.lazy_pages[i] != 0 {
+                for i in 0..region.lazy_pages.len() {
+                    let phys = region.lazy_pages[i];
+                    if phys != 0 {
                         unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); }
-                        crate::pageref::unref_or_free(region.lazy_pages[i], 0);
-                        region.lazy_pages[i] = 0;
-                        region.lazy_count = region.lazy_count.saturating_sub(1);
+                        crate::pageref::unref_or_free(phys, 0);
                     }
                 }
+            } else if region.file_cap == usize::MAX {
+                // Device mapping: drop the PTEs but never free the phys range.
+                for i in 0..n_pages { unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); } }
             } else {
-                // Eager VMA: unmap each page in the overlap.
-                let n = (clip_e - clip_s) / PAGE_SIZE;
-                for i in 0..n {
-                    unsafe { unmap_page(pt, clip_s + i * PAGE_SIZE); }
+                // Eager, contiguous buddy-backed block: unmap and free whole.
+                for i in 0..n_pages { unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); } }
+                if region.phys != 0 {
+                    buddy_free(region.phys, pages_to_order(n_pages));
                 }
             }
 
-            // ── Reshape the VMA ───────────────────────────────────────────────
-            if clip_s == r_start && clip_e == r_end {
-                // Whole VMA removed.
-                if !region.lazy && region.phys != 0 && region.file_cap != usize::MAX {
-                    buddy_free(region.phys, pages_to_order((r_end - r_start) / PAGE_SIZE));
-                }
-                if is_file_backed(region.file_cap) {
-                    file_release(region.file_cap);
-                }
-                *slot = None;
-            } else if clip_s == r_start {
-                // Front trim: VMA shrinks to [clip_e, r_end).
-                if region.lazy {
-                    // Drain the entries for the removed prefix so index 0 aligns with the new start.
-                    let shift = (clip_e - r_start) / PAGE_SIZE;
-                    if shift < region.lazy_pages.len() {
-                        region.lazy_pages.drain(0..shift);
-                    } else {
-                        region.lazy_pages.clear();
-                    }
-                } else if region.phys != 0 {
-                    region.phys += clip_e - r_start;
-                }
-                region.start = clip_e;
-            } else {
-                // Back trim (or middle → leave left part, accept right leak for eager).
-                region.end = clip_s;
+            if is_file_backed(region.file_cap) {
+                file_release(region.file_cap);
             }
-
+            *slot = None;
             did_unmap = true;
         }
 
@@ -918,6 +1001,16 @@ impl AddressSpace {
             None    => return false,
         };
 
+        // Split VMAs straddling either boundary so a sub-range mprotect changes
+        // only the pages it names, never the flags recorded for the writable
+        // remainder of the VMA.  This is what makes the dynamic loader's RELRO
+        // pass (`mprotect(relro_start, len, PROT_READ)` over part of the RW LOAD
+        // segment) correct: without the split the whole segment's recorded
+        // flags would flip read-only and a later fault would re-install live
+        // `.data` pages read-only.
+        self.split_at(addr);
+        self.split_at(end);
+
         // Build the new PageFlags from the POSIX prot bits.
         let mut new_flags = PageFlags::PRESENT | PageFlags::USER;
         if prot & PROT_WRITE != 0 { new_flags |= PageFlags::WRITABLE; }
@@ -926,42 +1019,38 @@ impl AddressSpace {
         let mut changed = false;
         for slot in self.regions.iter_mut() {
             let region = match slot.as_mut() {
-                Some(r) if r.start < end && r.end > addr => r,
+                Some(r) if r.start >= addr && r.end <= end && r.start < r.end => r,
                 _ => continue,
             };
 
             region.prot  = prot;
             region.flags = new_flags;
 
-            // Remap pages that are already backed (lazy pages that have been faulted in).
+            // Remap every already-backed page of this now wholly-contained VMA.
             if region.lazy {
                 let is_cow = region.cow;
                 for (i, &phys) in region.lazy_pages.iter().enumerate() {
                     if phys != 0 {
                         let page_va = region.start + i * PAGE_SIZE;
-                        if page_va >= addr && page_va < end {
-                            // A page still shared with another address space
-                            // must stay read-only at the PTE level regardless
-                            // of the requested prot — region.flags (set above)
-                            // already records the real target permission, so
-                            // the CoW-promotion fault handler applies it in
-                            // full once this page is no longer shared.
-                            let install = if is_cow && crate::pageref::get(phys) > 1 {
-                                new_flags & !PageFlags::WRITABLE
-                            } else {
-                                new_flags
-                            };
-                            unsafe { map_page(self.page_table_root, page_va, phys, install); }
-                        }
+                        // A page still shared with another address space must
+                        // stay read-only at the PTE level regardless of the
+                        // requested prot — region.flags (set above) already
+                        // records the real target permission, so the CoW
+                        // promotion fault handler applies it in full once this
+                        // page is no longer shared.
+                        let install = if is_cow && crate::pageref::get(phys) > 1 {
+                            new_flags & !PageFlags::WRITABLE
+                        } else {
+                            new_flags
+                        };
+                        unsafe { map_page(self.page_table_root, page_va, phys, install); }
                     }
                 }
             } else if region.phys != 0 {
                 let n_pages = (region.end - region.start) / PAGE_SIZE;
                 for i in 0..n_pages {
                     let page_va = region.start + i * PAGE_SIZE;
-                    if page_va >= addr && page_va < end {
-                        unsafe { map_page(self.page_table_root, page_va, region.phys + i * PAGE_SIZE, new_flags); }
-                    }
+                    unsafe { map_page(self.page_table_root, page_va, region.phys + i * PAGE_SIZE, new_flags); }
                 }
             }
             changed = true;
