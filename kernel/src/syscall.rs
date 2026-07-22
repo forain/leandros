@@ -5519,6 +5519,15 @@ fn vfs_close_all_for(pid: u32) {
 /// sys_ioctl — try VFS first (FIONREAD on pipes/files), then TTY server.
 fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     let pid = current_pid();
+    // musl's `int ioctl(int fd, int request, ...)` sign-extends the request when
+    // it forwards to the raw syscall, so a request with bit 31 set (every _IOWR
+    // ioctl, e.g. DRM_IOCTL_PRIME_HANDLE_TO_FD = 0xC00C642D) arrives here as
+    // 0xFFFFFFFF_C00C642D. Exact-match dispatch below (PRIME intercept, the DRM
+    // 0x100x constants) would miss it and fall through to the DRM server, which
+    // returns EPERM for PRIME — the whole reason anvil's gbm_bo_get_fd failed
+    // while drmsmoke (Rust libc, c_ulong request, zero-extended) succeeded. Mask
+    // to the 32-bit ioctl request the kernel actually means.
+    let cmd = cmd & 0xFFFF_FFFF;
     const FIONREAD: usize = 0x541B;
     const FBIOGET_VSCREENINFO: usize = 0x4600;
     const ENOTTY: isize = -25;
