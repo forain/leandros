@@ -1,7 +1,7 @@
 //! VirtIO input/keyboard driver (PCI transport, polling mode).
 
 use spin::Mutex;
-use crate::pci::{PciDevice, find_device, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
+use crate::pci::{PciDevice, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
 use mm;
 
 const VIRTIO_PCI_VENDOR: u16 = 0x1af4;
@@ -9,6 +9,15 @@ const VIRTIO_PCI_DEVICE_INPUT: u16 = 0x1052; // modern virtio-input
 
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
 const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+
+// virtio-input device-config selects (virtio 1.1 §5.8.4).
+const VIRTIO_INPUT_CFG_EV_BITS: u8 = 0x11;
+const EV_ABS: u8 = 0x03;
+
+// evdev node indices (must match servers/evdev): keyboard=event0, tablet=event1.
+const EVDEV_KEYBOARD: u32 = 0;
+const EVDEV_TABLET: u32 = 1;
 
 const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
 const VIRTIO_STATUS_DRIVER: u8 = 2;
@@ -89,8 +98,12 @@ pub struct VirtioKeyboardDevice {
     _pci_dev: PciDevice,
     common_cfg: *mut VirtioPciCommonCfg,
     notify_cfg: *mut u32,
+    device_cfg: *mut u8,
     notify_off_multiplier: u32,
-    
+    /// evdev node this instance feeds (0 = keyboard, 1 = tablet), decided by
+    /// probing the device's EV_ABS capability.
+    evdev_index: u32,
+
     queue: Option<VirtioQueue>,
     event_buffer_phys: usize,
 }
@@ -98,12 +111,14 @@ pub struct VirtioKeyboardDevice {
 unsafe impl Send for VirtioKeyboardDevice {}
 unsafe impl Sync for VirtioKeyboardDevice {}
 
-pub static VIRTIO_KEYBOARD: Mutex<Option<VirtioKeyboardDevice>> = Mutex::new(None);
+// QEMU exposes virtio-keyboard-pci and virtio-tablet-pci as two separate
+// virtio-input PCI functions; we bind ALL of them and route each to its evdev
+// node. (Static-init empty Vec — no allocation until init() runs.)
+pub static VIRTIO_INPUTS: Mutex<alloc::vec::Vec<VirtioKeyboardDevice>> = Mutex::new(alloc::vec::Vec::new());
 
 impl VirtioKeyboardDevice {
-    pub fn new() -> Option<Self> {
-        let dev = find_device(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_INPUT)?;
-        crate::pci::serial_debug("[KBD] Found VirtIO Input device\n");
+    pub fn new_from(dev: PciDevice) -> Option<Self> {
+        crate::pci::serial_debug("[INPUT] Found VirtIO Input device\n");
 
         // Enable PCI Memory Space (bit 1) and Bus Master (bit 2)
         unsafe {
@@ -113,6 +128,7 @@ impl VirtioKeyboardDevice {
 
         let mut common_cfg = core::ptr::null_mut();
         let mut notify_cfg = core::ptr::null_mut();
+        let mut device_cfg: *mut u8 = core::ptr::null_mut();
         let mut notify_off_multiplier = 0;
 
         unsafe {
@@ -151,6 +167,9 @@ impl VirtioKeyboardDevice {
                                         notify_off_multiplier = pci_read_config_32(dev.bus, dev.dev, dev.func, cap_ptr + 16);
                                         notify_cfg = virt as *mut u32;
                                     },
+                                    VIRTIO_PCI_CAP_DEVICE_CFG => {
+                                        device_cfg = virt as *mut u8;
+                                    },
                                     _ => {}
                                 }
                             }
@@ -166,11 +185,25 @@ impl VirtioKeyboardDevice {
             return None;
         }
 
+        // Classify by EV_ABS capability BEFORE resetting the device in
+        // init_device: a virtio-tablet reports a non-zero EV_ABS bitmap size,
+        // a keyboard does not. This is order-independent (vs relying on PCI
+        // enumeration order).
+        let evdev_index = if !device_cfg.is_null() && unsafe { device_supports_ev_abs(device_cfg) } {
+            crate::pci::serial_debug("[INPUT] -> tablet (event1)\n");
+            EVDEV_TABLET
+        } else {
+            crate::pci::serial_debug("[INPUT] -> keyboard (event0)\n");
+            EVDEV_KEYBOARD
+        };
+
         let mut kbd = Self {
             _pci_dev: dev,
             common_cfg,
             notify_cfg,
+            device_cfg,
             notify_off_multiplier,
+            evdev_index,
             queue: None,
             event_buffer_phys: 0,
         };
@@ -269,6 +302,7 @@ impl VirtioKeyboardDevice {
     }
 
     pub fn poll(&mut self) {
+        let evdev_index = self.evdev_index;
         let q = match &mut self.queue {
             Some(q) => q,
             None => return,
@@ -295,8 +329,8 @@ impl VirtioKeyboardDevice {
                 let buf_virt = mm::phys_to_virt(self.event_buffer_phys + (desc_id as usize * 64));
                 let ev = (buf_virt as *const VirtioInputEvent).read_volatile();
 
-                // Push to evdev
-                evdev_server::push_event(0, ev.type_, ev.code, ev.value);
+                // Push to this device's evdev node (keyboard=0, tablet=1).
+                evdev_server::push_event(evdev_index, ev.type_, ev.code, ev.value);
 
                 // Recycle descriptor: put it back into avail ring
                 let avail = q.avail;
@@ -320,15 +354,34 @@ impl VirtioKeyboardDevice {
     }
 }
 
+/// Probe the virtio-input device config for EV_ABS support (tablet vs keyboard).
+unsafe fn device_supports_ev_abs(device_cfg: *mut u8) -> bool {
+    // select = EV_BITS, subsel = EV_ABS; `size` (offset 2) is the bitmap length.
+    core::ptr::write_volatile(device_cfg.add(0), VIRTIO_INPUT_CFG_EV_BITS);
+    core::ptr::write_volatile(device_cfg.add(1), EV_ABS);
+    core::ptr::read_volatile(device_cfg.add(2)) != 0
+}
+
 pub fn init() {
-    let mut kbd = VIRTIO_KEYBOARD.lock();
-    if kbd.is_none() {
-        *kbd = VirtioKeyboardDevice::new();
+    let mut inputs = VIRTIO_INPUTS.lock();
+    if !inputs.is_empty() { return; }
+    // Bind every virtio-input PCI function (keyboard + tablet).
+    let found = crate::pci::find_all_devices(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_INPUT);
+    crate::pci::serial_debug("[INPUT] virtio-input functions found=");
+    crate::pci::serial_debug_hex(found.len() as u32);
+    crate::pci::serial_debug("\n");
+    for dev in found {
+        if let Some(d) = VirtioKeyboardDevice::new_from(dev) {
+            inputs.push(d);
+        }
     }
+    crate::pci::serial_debug("[INPUT] bound=");
+    crate::pci::serial_debug_hex(inputs.len() as u32);
+    crate::pci::serial_debug("\n");
 }
 
 pub fn poll_events() {
-    if let Some(kbd) = &mut *VIRTIO_KEYBOARD.lock() {
-        kbd.poll();
+    for d in VIRTIO_INPUTS.lock().iter_mut() {
+        d.poll();
     }
 }
