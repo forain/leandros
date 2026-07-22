@@ -40,6 +40,9 @@ const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xC00C642E;
 // DRM capability ids (drm_get_cap.capability)
 const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
 const DRM_CAP_PRIME: u64 = 0x5;
+// PRIME capability flags returned in drm_get_cap.value for DRM_CAP_PRIME.
+const DRM_PRIME_CAP_IMPORT: u64 = 0x1;
+const DRM_PRIME_CAP_EXPORT: u64 = 0x2;
 const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 0x6;
 const DRM_CAP_ASYNC_PAGE_FLIP: u64 = 0x7;
 const DRM_CAP_ADDFB2_MODIFIERS: u64 = 0x10;
@@ -1032,7 +1035,17 @@ impl DrmDeviceInterface {
             DRM_CAP_TIMESTAMP_MONOTONIC => 1,
             DRM_CAP_CRTC_IN_VBLANK_EVENT => 1,
             DRM_CAP_ADDFB2_MODIFIERS => 0,
-            DRM_CAP_PRIME => 0,
+            // Mesa's softpipe (our only sw rasterizer) gates its dmabuf path on
+            // drmGetCap(DRM_CAP_PRIME): with EXPORT clear, GBM's gbm_bo_create
+            // falls back to create_dumb, which yields a gbm_bo whose ->image is
+            // NULL. dri2_drm_image_get_buffers then hands that NULL back with the
+            // BACK bit set, and dri2_allocate_textures NULL-derefs it. Reporting
+            // EXPORT (matching every real DRM driver, which always returns
+            // IMPORT|EXPORT) routes GBM through the proper DRIimage path where the
+            // bo is backed by a real gallium resource GL can render into. Our dumb
+            // buffers are KMS-scanout-capable; kmscube consumes the KMS handle,
+            // not a PRIME fd, so PRIME_HANDLE_TO_FD need not be implemented here.
+            DRM_CAP_PRIME => DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT,
             DRM_CAP_ASYNC_PAGE_FLIP => 0,
             // Unknown caps: value 0 + success. Smithay probes many optional caps
             // and treats an ioctl error differently from "cap == 0".
