@@ -995,10 +995,25 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Me
                         }
                     }
 
-                    if addr_ptr != 0 {
-                        unsafe { core::ptr::write_bytes(addr_ptr as *mut u8, 0, 2); }
-                    }
                     drop(tbls);
+                    // Report the peer address AFTER releasing SOCK_TABLES: writing
+                    // user memory can demand-page, and faulting under a spinlock is
+                    // the freeze hazard documented in the memory notes. The connector
+                    // has no bound path, so the peer is an unnamed AF_UNIX address:
+                    // sun_family = AF_UNIX, addrlen = sizeof(sa_family_t). std's
+                    // SocketAddr parser rejects a nonzero addrlen whose family is not
+                    // AF_UNIX ("file descriptor did not correspond to a Unix socket"),
+                    // so both fields must be set — previously sun_family was zeroed to
+                    // AF_UNSPEC and addrlen was left untouched.
+                    if addr_ptr != 0 {
+                        unsafe {
+                            core::ptr::write_bytes(addr_ptr as *mut u8, 0, 2);
+                            core::ptr::write(addr_ptr as *mut u16, AF_UNIX as u16);
+                        }
+                    }
+                    if addrlen_ptr != 0 {
+                        unsafe { *(addrlen_ptr as *mut u32) = 2; }
+                    }
                     // Wake the connector parked in poll/connect (K2).
                     sched::wake_poll();
                     val_reply((new_slot + SOCK_FD_BASE) as u64)
