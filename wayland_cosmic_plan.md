@@ -417,11 +417,37 @@ applets: force software renderer via env at M6.
 - Exit: Smithay's reference compositor (anvil, kms backend) starts via the
   shims, composites a wl_shm client, cursor follows the virtio-tablet, keyboard
   types. This is the full "beneath COSMIC" stack proven end-to-end.
+- STATUS 2026-07-22 (K5 wave): anvil driven through 7 blockers to full init
+  (session, wayland-1 socket, XKB, libinput, EGL/GLES2 softpipe on GBM, legacy
+  DRM surface, one primary plane). Kernel **PRIME/dmabuf IMPLEMENTED + verified**
+  (PRIME_HANDLE_TO_FD/FD_TO_HANDLE via borrowed dumb-buffer VMOs; drmsmoke 20/20
+  both arches incl. mmap coherent-alias round-trip; commit 6ce43be). BUT the plan's
+  premise "shm clients don't need dmabuf" (D2) is wrong for smithay: its
+  DrmCompositor unconditionally exports its own scanout swapchain buffers as
+  dmabuf (compositor/mod.rs:1514 buffer.export()) AND binds them as dmabuf-backed
+  EGLImages to render. NEW WALL is USERSPACE, not kernel: `gbm_bo_get_fd` returns
+  -1 without ever issuing the PRIME ioctl (kernel intercept marker count = 0 under
+  a full anvil run). Mesa's kms_dri_sw_winsys HAS the drmPrimeHandleToFD code but
+  it is unreached — the scanout bo is not DRIimage/displaytarget-backed (create_dumb
+  fallback, bo->image==NULL), matching the m3 note "softpipe/kms_swrast path (no
+  dma-buf)". M4 exit needs a **Mesa/libgbm fix** so gbm_bo_get_fd reaches
+  drmPrimeHandleToFD (then kernel PRIME + the borrowed-VMO mmap alias serve it);
+  a smithay-only patch can't route around it (render path needs dmabuf import too).
 
 **M5 — cosmic-comp**
 - Build `--no-default-features`; XKB data + fonts installed.
 - Exit: cosmic-comp runs on kms, renders its UI, accepts a wl_shm client;
   busd running; zbus client owns a name.
+- NOTE (K5 wave): cosmic-comp uses the SAME smithay DrmCompositor, so it hits the
+  IDENTICAL Mesa `gbm_bo_get_fd`-returns-(-1) dmabuf wall as M4 — fixing M4's Mesa
+  gap unblocks M5's scanout too. On the `is_software`/empty-DRM-enum question:
+  smithay only PROVIDES `EGLDevice::is_software()`; the REJECT-software policy and
+  the udev `device_added`/enum-fallback live in the COMPOSITOR's own kms backend
+  source. anvil's copy happens to sit in the smithay repo tree (anvil ships there),
+  which is why the M4 patch edited `anvil/src/udev.rs`. cosmic-comp's copy lives in
+  cosmic-comp source (its `src/backend/kms/`), so M5 needs a cosmic-comp source
+  patch (a policy exception), NOT a smithay `[patch]` — UNLESS cosmic-comp already
+  tolerates software EGL (unverified here; check its kms backend before patching).
 
 **M6 — COSMIC session**
 - start-cosmic → cosmic-session → settings-daemon + panel + notifications (+ bg,
