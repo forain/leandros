@@ -390,13 +390,28 @@ applets: force software renderer via env at M6.
   arches; full regression green. Synthetic sysfs (design commit 4) DEFERRED —
   probe showed no current consumer needs it (kmscube -D bypasses enumeration,
   Smithay reads none); design section remains execution-ready.
-- **M3 exit NOT yet met**: kmscube loads the full Mesa stack (EGL 1.5 init,
-  GBM device+surface, dumb buffer mmap'd) then hits a deterministic userspace
-  NULL deref inside the Mesa libs (EL0, FAR=0, ELR in libgallium) right after
-  buffer mmap. Kernel DRM contract proven sufficient by drmsmoke writing the
-  same mapping. Next step: symbolize the crash (gallium_base+offset from the
-  fault log) or rebuild Mesa with debug info; fix is expected on the Mesa/
-  userspace side. Blocks the R3/R4/R5 rungs only.
+- **M3 EXIT MET 2026-07-22, both arches.** kmscube renders the animated
+  smooth-shaded cube on /dev/dri/card0 via GBM + softpipe; screenshot-verified
+  (two shots ~1-2 s apart, cube rotated) on aarch64 and x86_64 from freshly
+  regenerated f2fs images on a release build.
+- Root cause of the earlier crash (symbolized against the shipped libgallium
+  debug info): the deterministic NULL deref was `dri2_allocate_textures`
+  dereferencing `images.back->texture` with `images.back == NULL`
+  (gallium/frontends/dri/dri2.c). Our only sw rasterizer is **softpipe**, which
+  takes its dmabuf capability straight from `drmGetCap(DRM_CAP_PRIME)`
+  (util/u_screen.c). Our DRM node reported `DRM_CAP_PRIME => 0`, so GBM's
+  `gbm_bo_create` fell back to `create_dumb` — a bo whose `->image` is NULL —
+  and `dri2_drm_image_get_buffers` handed that NULL back with the BACK bit set.
+  drmsmoke never exercised GET_CAP(PRIME), so this arm slipped its net.
+- Fix (kernel/driver, one line + constants): `drivers/src/drm_device_interface.rs`
+  `std_handle_get_cap` now returns `DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT`
+  for `DRM_CAP_PRIME` (matching every real DRM driver). GBM then takes the
+  proper DRIimage path: the bo is backed by a softpipe resource over the kms-dri
+  sw winsys (a real CREATE_DUMB buffer), GL renders into it, and kmscube scans it
+  out via its KMS handle (no PRIME fd needed — `PRIME_HANDLE_TO_FD` stays
+  unimplemented, deferred to M7 linux-dmabuf). Full regression green both arches
+  (drmsmoke 17/17, vfstest 34/34, scmtest 19/19, epolltest 8/8, evtest2 8/8,
+  idletest IDLE_CPU_US 0). Unblocks the R3 rung; R4/R5 (anvil/cosmic) next.
 
 **M4 — Input + seat** (K4 evdev + libinput/libseat/libudev/libxkbcommon)
 - Exit: Smithay's reference compositor (anvil, kms backend) starts via the
