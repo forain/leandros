@@ -364,6 +364,18 @@ applets: force software renderer via env at M6.
 
 **M2 — Dynamic linking** (K3)
 - Exit: dynamically-linked musl binary with dlopen runs on both arches.
+- **COMPLETE 2026-07-22, both arches** (commits 522d891, fbac196, 894b72f).
+  hello-dyn, hello-dyn-rs (Rust std), and dlopen-host + plugin.so all pass on
+  x86_64 and aarch64; full regression green (scmtest 19/19, epolltest 8/8,
+  vfstest 34/34 fresh image, idletest 0, sigtest, polltest, forktest, memtest,
+  waittest, boot-to-login). Loader: ET_DYN bias (MAIN_DYN_BASE 2MiB,
+  INTERP_BASE 768MiB), PT_INTERP hand-off with real entry in AT_ENTRY, auxv
+  13→18 pairs, no kernel relocator (musl self-relocates). VMM: new split_at()
+  — unmap_range/mprotect now split-at-ends then operate whole-VMA, fixing a
+  latent middle-punch leak/wrong-order buddy_free. ld-musl + libc.so + ladder
+  packed into the image (/lib/ld-musl-<arch>.so.1, /usr/lib/libc.so hardlink).
+  No new ld.so syscall gaps (BIND_NOW corpus). Follow-ups documented: eager
+  interp load (~4.8MB/exec), pre-existing buddy-slack leak on eager→lazy split.
 
 **M3 — GL on screen, no Wayland** (K4 DRM + Mesa port)
 - Exit: kmscube-class GLES2-over-GBM binary renders animated frames to
