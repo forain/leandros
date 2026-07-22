@@ -1024,10 +1024,33 @@ impl DrmDeviceInterface {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let set = unsafe { &mut *(arg as *mut drm_mode_crtc) };
         let crtc_id = DrmObjectId(set.crtc_id);
-        let fb_id = Some(DrmObjectId(set.fb_id));
+        let fb_id_val = set.fb_id;
+        let fb_id = Some(DrmObjectId(fb_id_val));
         let mode = Some(DrmModeInfo::new(set.mode.hdisplay, set.mode.vdisplay, set.mode.vrefresh));
-        
+
         device.set_crtc(crtc_id, mode, set.x, set.y, &[], fb_id)?;
+
+        // drmModeSetCrtc semantics require the given framebuffer to be presented
+        // immediately. device.set_crtc only updates internal CRTC/plane state; it
+        // does NOT push pixels to the virtio-gpu scanout (unlike handle_flip_page).
+        // A compositor that mode-sets and then waits for the frame to appear (or
+        // for the vblank of a follow-up page-flip) would otherwise never see its
+        // first frame — the display stays on the stale kernel console. smithay's
+        // legacy surface, for instance, does set_crtc(fb) then a page_flip(fb);
+        // without presenting here the first frame is invisible until (and unless)
+        // that flip lands. Mirror handle_flip_page's software-scale + gpu.flush so
+        // the framebuffer is scanned out now. kmscube's continuous page-flips make
+        // it immune to this gap; anvil/cosmic-comp are not.
+        if fb_id_val != 0 {
+            let mut src_w = set.mode.hdisplay as u32;
+            let mut src_h = set.mode.vdisplay as u32;
+            if let Some(fb) = device.get_framebuffer(DrmObjectId(fb_id_val)) {
+                src_w = fb.width;
+                src_h = fb.height;
+            }
+            let flip_args = [fb_id_val, 0u32, src_w, src_h];
+            let _ = self.handle_flip_page(device, flip_args.as_ptr() as usize);
+        }
         Ok(0)
     }
 
