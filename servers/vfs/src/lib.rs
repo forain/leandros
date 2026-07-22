@@ -362,6 +362,17 @@ struct TmpVmo {
     seals: u32,
     /// Seals are only permitted on memfd inodes; also gates `F_GET_SEALS`.
     is_memfd: bool,
+    /// A **borrowed** VMO aliases physical frames it does not own — currently a
+    /// PRIME/dmabuf export whose pages ARE a DRM dumb buffer's contiguous buddy
+    /// block. Teardown (`vmo_free_slot`) must NOT free these frames: the DRM
+    /// layer owns them and frees the whole order-N block via `buddy::free` on
+    /// GEM_CLOSE/DESTROY_DUMB. Freeing them here would double-free and corrupt
+    /// the buddy allocator (order-0 frees of an order-N block).
+    borrowed: bool,
+    /// For a dmabuf export: the GEM handle this VMO aliases, so PRIME_FD_TO_HANDLE
+    /// resolves fd -> handle without a separate registry (auto-cleans on close).
+    /// 0 = not a dmabuf.
+    dmabuf_handle: u32,
 }
 
 static TMP_VMOS: Mutex<[Option<TmpVmo>; MAX_TMP_FILES]> =
@@ -431,6 +442,12 @@ fn vmo_zero_range(vmo: &mut TmpVmo, from: usize, to: usize) {
 /// a live mapping survives (its `pageref` > 1); the last holder frees it.
 fn vmo_free_slot(owner: usize) {
     if let Some(vmo) = TMP_VMOS.lock()[owner].take() {
+        // Borrowed (dmabuf) VMOs alias frames the DRM layer owns — dropping the
+        // slot must forget the page list WITHOUT freeing; the buddy block is
+        // freed exactly once by free_dumb on GEM_CLOSE/DESTROY_DUMB. Any live
+        // mmap of the fd already balances its own pageref inc/dec (the frames
+        // start untracked so a mapping's unref never reaches the free branch).
+        if vmo.borrowed { return; }
         for phys in vmo.pages {
             if phys != 0 { mm::pageref::unref_or_free(phys, 0); }
         }
@@ -458,7 +475,47 @@ pub fn mark_memfd(pid: u32, fd: usize) {
         Some(vmo) => vmo.is_memfd = true,
         None => vmos[idx] = Some(TmpVmo {
             pages: alloc::vec::Vec::new(), len: 0, seals: 0, is_memfd: true,
+            borrowed: false, dmabuf_handle: 0,
         }),
+    }
+}
+
+/// Promote the tmpfs inode behind `fd` into a **borrowed dmabuf VMO** whose
+/// frames ARE the DRM dumb buffer's contiguous buddy block
+/// (`phys .. phys + (1<<order)*4096`). Called by the PRIME_HANDLE_TO_FD syscall
+/// intercept right after opening an ephemeral `/tmp/dmabuf:<h>` node. A
+/// MAP_SHARED mmap of this fd then aliases the very same physical pages as the
+/// MAP_DUMB device mapping (coherent). The frames are NOT owned here (see
+/// `TmpVmo.borrowed`); `free_dumb` frees the whole order-N block. Returns false
+/// on a bad/non-tmpfs fd. The gem `handle` is stored so PRIME_FD_TO_HANDLE can
+/// resolve fd -> handle. No user memory is touched.
+pub fn install_dmabuf_vmo(pid: u32, fd: usize, phys: usize, order: usize, handle: u32) -> bool {
+    let idx = match tmpfile_owner_of(pid, fd) { Some(i) => i, None => return false };
+    let n_pages = 1usize << order;
+    let capacity = n_pages * 4096;
+    let mut pages = alloc::vec::Vec::with_capacity(n_pages);
+    for i in 0..n_pages { pages.push(phys + i * 4096); }
+    // Lock order FD_TABLES -> TMP_FILES -> TMP_VMOS (FD_TABLES already released
+    // by tmpfile_owner_of). Set the inode length so fstat/lseek report the
+    // buffer size (GBM/EGL fstat the dmabuf to validate it).
+    let mut tmp = TMP_FILES.lock();
+    let mut vmos = TMP_VMOS.lock();
+    tmp[idx].len = capacity;
+    vmos[idx] = Some(TmpVmo {
+        pages, len: capacity, seals: 0, is_memfd: true,
+        borrowed: true, dmabuf_handle: handle,
+    });
+    true
+}
+
+/// Resolve a dmabuf fd back to the GEM handle it was exported from
+/// (PRIME_FD_TO_HANDLE). `None` if the fd is not a borrowed dmabuf VMO.
+pub fn dmabuf_handle_of(pid: u32, fd: usize) -> Option<u32> {
+    let idx = tmpfile_owner_of(pid, fd)?;
+    let vmos = TMP_VMOS.lock();
+    match vmos[idx].as_ref() {
+        Some(vmo) if vmo.borrowed && vmo.dmabuf_handle != 0 => Some(vmo.dmabuf_handle),
+        _ => None,
     }
 }
 
@@ -508,7 +565,8 @@ pub fn vmo_acquire_frames(pid: u32, fd: usize, off: usize, len: usize)
             }
             pages.push(phys);
         }
-        vmos[idx] = Some(TmpVmo { pages, len: cur_len, seals: 0, is_memfd: false });
+        vmos[idx] = Some(TmpVmo { pages, len: cur_len, seals: 0, is_memfd: false,
+            borrowed: false, dmabuf_handle: 0 });
     }
 
     let vmo = vmos[idx].as_mut().unwrap();

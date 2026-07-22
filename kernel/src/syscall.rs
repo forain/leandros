@@ -5591,6 +5591,59 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     let is_evdev = ioctl_type == 0x45;
     let is_drm = ioctl_type == 0x64;
 
+    // ── PRIME / dmabuf export+import (intercepted here, not in the DRM server) ──
+    // The DRM server (drivers crate) has no fd-table access; building a dmabuf fd
+    // is a VFS op. This syscall layer runs in the caller's AS with pid + both the
+    // `drivers` and `vfs` crates in scope, so it is the one place that can turn a
+    // GEM handle into a real fd backed by that dumb buffer's physical pages.
+    // struct drm_prime_handle { u32 handle@0; u32 flags@4; s32 fd@8; } = 12 bytes.
+    const DRM_IOCTL_PRIME_HANDLE_TO_FD: usize = 0xC00C642D;
+    const DRM_IOCTL_PRIME_FD_TO_HANDLE: usize = 0xC00C642E;
+    if cmd == DRM_IOCTL_PRIME_HANDLE_TO_FD {
+        if arg == 0 || !validate_user_buf(arg, 12) { return -14; } // EFAULT
+        let handle = unsafe { (arg as *const u32).read() };
+        let (phys, order) = match drivers::drm_device_interface::dumb_buffer_phys_order(handle) {
+            Some(v) => v,
+            None => return -22, // EINVAL: not a known dumb buffer handle
+        };
+        // Open an ephemeral tmpfs node (same path memfd_create uses) to get a real
+        // fd + owner slot, then promote that slot to a borrowed dmabuf VMO whose
+        // frames ARE the dumb buffer's pages.
+        static DMABUF_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let n = DMABUF_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let mut path = [0u8; 32];
+        let prefix = b"/tmp/dmabuf:";
+        path[..prefix.len()].copy_from_slice(prefix);
+        let mut plen = prefix.len();
+        // append decimal n
+        let mut digits = [0u8; 10]; let mut dn = 0usize; let mut v = n;
+        loop { digits[dn] = b'0' + (v % 10) as u8; dn += 1; v /= 10; if v == 0 { break; } }
+        while dn > 0 { dn -= 1; path[plen] = digits[dn]; plen += 1; }
+        let open_msg = make_vfs_msg(vfs::VFS_OPEN, &[
+            path.as_ptr() as u64,
+            (0x042 | 0x200) as u64, // O_RDWR|O_CREAT|O_TRUNC
+            0o600u64,
+        ]);
+        let newfd = vfs_reply_val(&vfs::handle(&open_msg, pid));
+        if newfd < 0 { return newfd; }
+        if !vfs::install_dmabuf_vmo(pid, newfd as usize, phys, order, handle) {
+            return -12; // ENOMEM / install failed
+        }
+        // Write the fd back into drm_prime_handle.fd (offset 8).
+        unsafe { ((arg + 8) as *mut i32).write(newfd as i32); }
+        return 0;
+    }
+    if cmd == DRM_IOCTL_PRIME_FD_TO_HANDLE {
+        if arg == 0 || !validate_user_buf(arg, 12) { return -14; } // EFAULT
+        let dfd = unsafe { ((arg + 8) as *const i32).read() };
+        let handle = match vfs::dmabuf_handle_of(pid, dfd as usize) {
+            Some(h) => h,
+            None => return -22, // EINVAL
+        };
+        unsafe { (arg as *mut u32).write(handle); }
+        return 0;
+    }
+
     if cmd == FIONREAD || cmd == FBIOGET_VSCREENINFO ||
        cmd == DRM_IOCTL_GET_MODE || cmd == DRM_IOCTL_SET_MODE ||
        cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||

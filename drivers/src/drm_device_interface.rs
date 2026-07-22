@@ -337,6 +337,15 @@ struct DumbBuf {
 
 static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new());
 
+/// Resolve a dumb-buffer GEM handle to its physical base + buddy order, so the
+/// syscall layer can build a PRIME/dmabuf fd whose backing frames ARE this
+/// buffer's contiguous pages (`phys .. phys + (1<<order)*4096`). Returns None
+/// for an unknown handle. Copy-out to user memory happens in the syscall layer,
+/// never here (this only reads the kernel-side registry).
+pub fn dumb_buffer_phys_order(handle: u32) -> Option<(usize, usize)> {
+    DUMB_BUFFERS.lock().get(&handle).map(|b| (b.phys, b.order))
+}
+
 // ── DRM page-flip event channel ──────────────────────────────────────────────
 // PAGE_FLIP-with-event completions are NOT delivered instantly: doing so lets a
 // compositor's render loop resubmit with zero delay and peg the CPU (there is no

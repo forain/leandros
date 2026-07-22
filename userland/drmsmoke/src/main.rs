@@ -39,6 +39,8 @@ const DRM_IOCTL_MODE_SETCRTC: c_ulong = 0xC06864A2;
 const DRM_IOCTL_MODE_DIRTYFB: c_ulong = 0xC01864B1;
 const DRM_IOCTL_MODE_DESTROY_DUMB: c_ulong = 0xC00464B4;
 const DRM_IOCTL_MODE_PAGE_FLIP: c_ulong = 0xC01864B0;
+const DRM_IOCTL_PRIME_HANDLE_TO_FD: c_ulong = 0xC00C642D;
+const DRM_IOCTL_PRIME_FD_TO_HANDLE: c_ulong = 0xC00C642E;
 
 const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
 const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
@@ -195,6 +197,14 @@ struct pollfd {
     fd: c_int,
     events: i16,
     revents: i16,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmPrimeHandle {
+    handle: u32,
+    flags: u32,
+    fd: i32,
 }
 
 #[repr(C)]
@@ -439,6 +449,40 @@ pub unsafe extern "C" fn drm_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut
     let read_ok = rn == 32 && ev.ev_type == DRM_EVENT_FLIP_COMPLETE
         && ev.length == 32 && ev.user_data == magic;
     if !report(b"READ_FLIP_EVENT", read_ok) { failures += 1; }
+
+    // ── PRIME / dmabuf export + import round-trip (K5) ──────────────────────
+    // Export the dumb buffer as a dmabuf fd, mmap that fd, and confirm it
+    // aliases the SAME physical pages as a fresh MAP_DUMB mapping (coherent),
+    // then round-trip the fd back to the original GEM handle.
+    let mut ph = DrmPrimeHandle::default();
+    ph.handle = cd.handle;
+    let export_ok = ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _) == 0 && ph.fd >= 0;
+    if !report(b"PRIME_HANDLE_TO_FD", export_ok) { failures += 1; }
+
+    let mut alias_ok = false;
+    if export_ok && cd.size > 0 {
+        let dp = mmap(core::ptr::null_mut(), cd.size as usize, PROT_READ | PROT_WRITE,
+                      MAP_SHARED, ph.fd, 0);
+        let cp = mmap(core::ptr::null_mut(), cd.size as usize, PROT_READ | PROT_WRITE,
+                      MAP_SHARED, fd, md.offset as i64);
+        if dp as isize > 0 && cp as isize > 0 {
+            let sentinel: u32 = 0xA5C3_1E2F;
+            *(dp as *mut u32) = sentinel;                // write via dmabuf mapping
+            let seen = *(cp as *const u32);              // read via dumb mapping
+            *(dp as *mut u32) = 0x0040_0000;             // restore gradient pixel (0,0)
+            alias_ok = seen == sentinel;
+        }
+    }
+    if !report(b"PRIME_MMAP_ALIAS", alias_ok) { failures += 1; }
+
+    // FD_TO_HANDLE round-trip: the exported fd resolves back to cd.handle.
+    let mut ph2 = DrmPrimeHandle::default();
+    ph2.fd = ph.fd;
+    let import_ok = ioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut ph2 as *mut _) == 0
+        && ph2.handle == cd.handle;
+    if !report(b"PRIME_FD_TO_HANDLE", import_ok) { failures += 1; }
+
+    if export_ok { close(ph.fd); }
 
     // Hold the gradient on-screen so a screenshot can confirm the present path
     // actually reached the host (Risk R5). Re-flush each pass in case the host
