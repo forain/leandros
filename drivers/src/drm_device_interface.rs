@@ -34,6 +34,9 @@ const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = 0xC00464B4;
 const DRM_IOCTL_MODE_ADDFB2: u32 = 0xC06864B8;
 const DRM_IOCTL_MODE_RMFB: u32 = 0xC00464AF;
 const DRM_IOCTL_MODE_DIRTYFB: u32 = 0xC01864B1;
+// _IOWR('d', 0xB9, drm_mode_obj_get_properties) — struct is 28 data bytes,
+// padded to 32 by its u64 members, hence size 0x20 in the request code.
+const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC02064B9;
 const DRM_IOCTL_PRIME_HANDLE_TO_FD: u32 = 0xC00C642D;
 const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xC00C642E;
 
@@ -491,6 +494,7 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_ADDFB2 => self.std_handle_addfb2(arg),
             DRM_IOCTL_MODE_RMFB => self.std_handle_rmfb(arg),
             DRM_IOCTL_MODE_DIRTYFB => self.std_handle_dirtyfb(arg),
+            DRM_IOCTL_MODE_OBJ_GETPROPERTIES => self.std_handle_obj_get_properties(arg),
             // No PRIME (single node, render==scanout) — Mesa falls back to software.
             DRM_IOCTL_PRIME_HANDLE_TO_FD | DRM_IOCTL_PRIME_FD_TO_HANDLE => Err(DriverError::Unsupported),
 
@@ -878,7 +882,21 @@ impl DrmDeviceInterface {
             mode.hdisplay = info.width as u16;
             mode.vdisplay = info.height as u16;
             mode.vrefresh = 60;
-            mode.clock = (info.width * info.height * 60) / 1000;
+            // Populate non-zero blanking/timing. Consumers that derive the refresh
+            // rate from the raw mode (smithay Output: refresh = clock*1e6/(htotal*
+            // vtotal)) divide by htotal/vtotal, so leaving them 0 panics the
+            // compositor. virtio-gpu scanout only uses hdisplay/vdisplay; the sync
+            // fields are otherwise cosmetic. Approximate CVT blanking, with `clock`
+            // (kHz) chosen so the derived refresh is exactly 60 Hz.
+            let htotal = (info.width as u16).saturating_add(160);
+            let vtotal = (info.height as u16).saturating_add(40);
+            mode.hsync_start = (info.width as u16).saturating_add(48);
+            mode.hsync_end   = (info.width as u16).saturating_add(80);
+            mode.htotal      = htotal;
+            mode.vsync_start = (info.height as u16).saturating_add(3);
+            mode.vsync_end   = (info.height as u16).saturating_add(9);
+            mode.vtotal      = vtotal;
+            mode.clock = (htotal as u32 * vtotal as u32 * 60) / 1000;
             let name = b"Native\0";
             mode.name[..name.len()].copy_from_slice(name);
             
@@ -1065,6 +1083,25 @@ impl DrmDeviceInterface {
             DRM_CLIENT_CAP_UNIVERSAL_PLANES => Ok(0),
             _ => Ok(0),
         }
+    }
+
+    /// DRM_IOCTL_MODE_OBJ_GETPROPERTIES — report zero properties on every object.
+    ///
+    /// No KMS object-property model exists yet. The only consumer on the legacy
+    /// path is smithay's LegacyDrmDevice reset (set_connector_state), which
+    /// enumerates a connector's properties solely to find "DPMS" and toggle it;
+    /// an empty set makes that loop a no-op (leaving the connector in its current
+    /// state) and lets LegacyDrmDevice init proceed. The caller passes its buffer
+    /// capacity in count_props (offset 16); overwrite it with the number actually
+    /// written (0). Runs synchronously in the caller's address space and takes no
+    /// device lock, so a plain unaligned write is safe (82d0cc3 concerns only
+    /// apply to user-memory access under a spinlock).
+    fn std_handle_obj_get_properties(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        // struct drm_mode_obj_get_properties { u64 props_ptr; u64 prop_values_ptr;
+        //   u32 count_props; u32 obj_id; u32 obj_type; } — count_props at offset 16.
+        unsafe { ptr::write_unaligned((arg + 16) as *mut u32, 0); }
+        Ok(0)
     }
 
     /// DRM_IOCTL_GET_MAGIC — single-seat stub: return a nonzero magic.
