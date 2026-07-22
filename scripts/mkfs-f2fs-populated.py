@@ -337,7 +337,35 @@ def main():
         f"leandro:{shadow_hash('lnd0', 'leandro')}:\n"
     )
     etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
-        
+
+    # ── K3 dynamic-linking corpus (musl ld.so + test ladder) ──────────────────
+    # Real dynamic musl world built host-side (see the K3 NOTES.md). ld-musl IS
+    # libc.so: the SAME host file is packed at both /lib/ld-musl-<arch>.so.1 and
+    # /usr/lib/libc.so — add_files_to_dir dedupes by host path, so these become
+    # hardlinks to one inode and the kernel needs no symlink resolution to load
+    # the interpreter. The test ladder binaries are dynamic-PIE ELFs whose
+    # PT_INTERP points at /lib/ld-musl-<arch>.so.1.
+    dyn_root = os.path.expanduser("~/.claude-forain/jobs/afde2e74/tmp/musl-dynamic")
+    libc_so = f"{dyn_root}/sysroot/{arch}/usr/lib/libc.so"
+    usr_lib_files = []
+    if os.path.exists(libc_so):
+        lib_files.append((f"ld-musl-{arch}.so.1", libc_so, 0o100755))
+        usr_lib_files.append(("libc.so", libc_so, 0o100755))
+    for name, rel in (
+        ("hello-dyn",    f"test/hello-dyn/hello-dyn-{arch}"),
+        ("hello-dyn-rs", f"test/hello-dyn-rs/hello-dyn-rs-{arch}"),
+        ("dlopen-host",  f"test/dlopen-host/dlopen-host-{arch}"),
+    ):
+        p = f"{dyn_root}/{rel}"
+        if os.path.exists(p):
+            bin_files.append((name, p, 0o100755))
+    # plugin.so is dlopen("./plugin.so")'d by dlopen-host: place it both in /bin
+    # (next to dlopen-host) and in / so a relative open resolves from either cwd.
+    plugin = f"{dyn_root}/test/dlopen-host/plugin-{arch}.so"
+    if os.path.exists(plugin):
+        bin_files.append(("plugin.so", plugin, 0o100755))
+        root_files.append(("plugin.so", plugin, 0o100755))
+
     # 2. Dynamically calculate required blocks and image size
     # Each meta segment takes 512 blocks. We have 8 meta segments (4096 blocks).
     # Plus safety margin and blocks for directories.
@@ -349,7 +377,7 @@ def main():
     # sharing a single inode and its data blocks, so charging the image for
     # every name would over-allocate by ~100x once coreutils is installed.
     _sized = set()
-    for name, path, mode in bin_files + lib_files + root_files + etc_files:
+    for name, path, mode in bin_files + lib_files + usr_lib_files + root_files + etc_files:
         if not isinstance(path, (bytes, bytearray)):
             if path in _sized:
                 continue
@@ -399,6 +427,8 @@ def main():
         12: ("/root"),
         13: ("/home"),
         14: ("/home/leandro"),
+        15: ("/usr"),
+        16: ("/usr/lib"),
     }
 
     # Per-directory mode/owner overrides; anything not listed here defaults
@@ -414,8 +444,10 @@ def main():
     # ".." entry adds one hardlink to its parent).
     subdirs = {
         3: [("bin", 4), ("old_root", 5), ("dev", 6), ("proc", 7), ("tmp", 8),
-            ("etc", 9), ("mnt", 10), ("lib", 11), ("root", 12), ("home", 13)],
+            ("etc", 9), ("mnt", 10), ("lib", 11), ("root", 12), ("home", 13),
+            ("usr", 15)],
         13: [("leandro", 14)],
+        15: [("lib", 16)],
     }
     
     inode_blocks = {}
@@ -612,6 +644,8 @@ def main():
     add_files_to_dir(4, bin_files)
     print("Packing libraries into /lib...")
     add_files_to_dir(11, lib_files)
+    print("Packing libraries into /usr/lib...")
+    add_files_to_dir(16, usr_lib_files)
     print("Packing files into /...")
     add_files_to_dir(3, root_files)
     print("Packing files into /etc...")
