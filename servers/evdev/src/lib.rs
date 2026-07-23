@@ -296,7 +296,20 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     copy_out(pid, arg_ptr, &name[..n])
                 }
                 0x07 | 0x08 => err_reply(-2), // EVIOCGPHYS/UNIQ → ENOENT (empty)
-                0x09 => zero_out(pid, arg_ptr, size), // EVIOCGPROP → all zero (no INPUT_PROP_DIRECT)
+                0x09 => { // EVIOCGPROP → INPUT_PROP_POINTER for the tablet so libinput
+                          // classifies it as an absolute POINTER (not a touchscreen)
+                          // and delivers BTN_LEFT as a pointer button — required for
+                          // click-to-focus (a compositor sets keyboard focus on a
+                          // pointer button press). Keyboard advertises no props.
+                    if dev_id == DEV_TABLET {
+                        let mut buf = [0u8; 8];
+                        buf[0] = 1 << 0; // bit 0 = INPUT_PROP_POINTER
+                        let n = core::cmp::min(size, buf.len());
+                        copy_out(pid, arg_ptr, &buf[..n])
+                    } else {
+                        zero_out(pid, arg_ptr, size)
+                    }
+                }
                 0x18 | 0x19 | 0x1b => zero_out(pid, arg_ptr, size), // EVIOCGKEY/LED/SW → zeroed
                 0xa0 => { // EVIOCSCLOCKID(int) — store; we already stamp monotonic
                     let mut clk = [0u8; 4];
@@ -381,7 +394,7 @@ pub fn has_key_event(dev_id: u32) -> bool {
 
 pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     if dev_id as usize >= MAX_DEVICES { return; }
-    
+
     let now_ticks = sched::ticks();
     let ev = input_event {
         time: timeval {
