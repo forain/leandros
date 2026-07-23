@@ -5675,7 +5675,24 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         ]);
         let newfd = vfs_reply_val(&vfs::handle(&open_msg, pid));
         if newfd < 0 { return newfd; }
-        if !vfs::install_dmabuf_vmo(pid, newfd as usize, phys, order, handle) {
+        // The tmpfs fd table is keyed by TGID: vfs::handle canonicalises caller_pid
+        // via sched::tgid_of, so the fd just opened lives in the *process* table,
+        // not this thread's. install_dmabuf_vmo/dmabuf_handle_of index the table
+        // directly (find_tbl, no remap), so they MUST be handed the same TGID — a
+        // compositor issues PRIME from a render thread whose TID != TGID (this is
+        // exactly why cosmic-comp's first few exports, on the main thread, worked
+        // and every later one on the render thread failed to install). Unlinking
+        // the name still goes through vfs::handle, so it takes the raw pid.
+        let vpid = sched::tgid_of(pid);
+        if !vfs::install_dmabuf_vmo(vpid, newfd as usize, phys, order, handle) {
+            // Never leak the ephemeral node/fd on the failure path: close the fd
+            // (drops the pool slot) and unlink the name. Without this a failed
+            // export would pin a /tmp slot + one of the 64 process fds forever,
+            // and a per-frame compositor would exhaust both within a second.
+            let close_msg = make_vfs_msg(vfs::VFS_CLOSE, &[newfd as u64]);
+            let _ = vfs::handle(&close_msg, pid);
+            let unlink_msg = make_vfs_msg(vfs::VFS_UNLINK, &[path.as_ptr() as u64]);
+            let _ = vfs::handle(&unlink_msg, pid);
             return -12; // ENOMEM / install failed
         }
         // Unlink the /tmp/dmabuf:<n> name immediately: the open fd holds the slot
@@ -5695,7 +5712,9 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     if cmd == DRM_IOCTL_PRIME_FD_TO_HANDLE {
         if arg == 0 || !validate_user_buf(arg, 12) { return -14; } // EFAULT
         let dfd = unsafe { ((arg + 8) as *const i32).read() };
-        let handle = match vfs::dmabuf_handle_of(pid, dfd as usize) {
+        // Same TGID canonicalisation as HANDLE_TO_FD: the dmabuf fd lives in the
+        // process (TGID) table, but dmabuf_handle_of indexes it directly.
+        let handle = match vfs::dmabuf_handle_of(sched::tgid_of(pid), dfd as usize) {
             Some(h) => h,
             None => return -22, // EINVAL
         };
