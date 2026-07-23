@@ -1114,7 +1114,7 @@ fn dispatch_inner(
         TIMER_DELETE  => sys_timer_delete(a0),
         NANOSLEEP       => sys_nanosleep(a0, a1),
         CLOCK_NANOSLEEP => sys_nanosleep(a2, a3), // clock_nanosleep(clk,flags,rqtp,rmtp)
-        TIMERFD_CREATE  => sys_timerfd_create(a0),
+        TIMERFD_CREATE  => sys_timerfd_create(a0, a1),
         TIMERFD_SETTIME => sys_timerfd_settime(a0, a1, a2, a3),
         TIMERFD_GETTIME => sys_timerfd_gettime(a0, a1),
         GETTIMEOFDAY => sys_gettimeofday(a0, a1),
@@ -6392,9 +6392,11 @@ fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>
     (masked, Some(seq))
 }
 
-fn sys_eventfd2(initval: usize, _flags: usize) -> isize {
+fn sys_eventfd2(initval: usize, flags: usize) -> isize {
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_EVENTFD, &[initval as u64]);
+    // EFD_NONBLOCK/EFD_CLOEXEC (== O_NONBLOCK/O_CLOEXEC) must be recorded — see
+    // sys_timerfd_create for why a dropped O_NONBLOCK wedges an event loop.
+    let msg = make_vfs_msg(vfs::VFS_EVENTFD, &[initval as u64, flags as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
@@ -6403,12 +6405,14 @@ fn sys_eventfd2(initval: usize, _flags: usize) -> isize {
 /// masked signal as a 128-byte signalfd_siginfo with ssi_signo populated (the
 /// rest zero — calloop reads only ssi_signo). `ufd == -1` creates a new
 /// signalfd; otherwise the named signalfd's mask is replaced.
-fn sys_signalfd4(ufd: usize, mask_ptr: usize, _sizemask: usize, _flags: usize) -> isize {
+fn sys_signalfd4(ufd: usize, mask_ptr: usize, _sizemask: usize, flags: usize) -> isize {
     if mask_ptr == 0 || !validate_user_buf(mask_ptr, 8) { return -14; } // EFAULT
     let mask = unsafe { core::ptr::read_unaligned(mask_ptr as *const u64) };
     let existing = if ufd as isize == -1 { usize::MAX } else { ufd };
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_SIGNALFD_CREATE, &[existing as u64, mask]);
+    // SFD_NONBLOCK/SFD_CLOEXEC (== O_NONBLOCK/O_CLOEXEC) must be recorded on a
+    // newly-created signalfd — see sys_timerfd_create.
+    let msg = make_vfs_msg(vfs::VFS_SIGNALFD_CREATE, &[existing as u64, mask, flags as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
@@ -6464,9 +6468,16 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
     fd
 }
 
-fn sys_timerfd_create(_clockid: usize) -> isize {
+fn sys_timerfd_create(_clockid: usize, flags: usize) -> isize {
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_TIMERFD_CREATE, &[]);
+    // flags carries TFD_NONBLOCK/TFD_CLOEXEC (== O_NONBLOCK/O_CLOEXEC). It MUST
+    // be recorded on the fd: the `polling` crate (calloop's poller) creates its
+    // timeout timerfd with TFD_NONBLOCK and reads it expecting EAGAIN when it
+    // hasn't fired. If the flag is dropped, fd_nonblock() is false and the
+    // kernel read path yield-spins on EAGAIN, pinning the caller's thread in the
+    // read instead of letting its event loop poll other fds — which is exactly
+    // how a single-threaded compositor stops accepting wayland clients.
+    let msg = make_vfs_msg(vfs::VFS_TIMERFD_CREATE, &[flags as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 

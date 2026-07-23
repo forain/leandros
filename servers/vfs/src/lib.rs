@@ -1012,6 +1012,10 @@ fn timerfd_poll_expirations(slot: usize) -> u64 {
 const MAX_PROCS: usize = 64;
 const MAX_FDS:   usize = 64;
 const O_CLOEXEC: u32   = 0x8_0000;
+/// O_NONBLOCK (== EFD_NONBLOCK/TFD_NONBLOCK/SFD_NONBLOCK). Module-level so the
+/// eventfd/timerfd/signalfd creators can record it on the fd (fd_nonblock reads
+/// FdEntry.flags); a dropped O_NONBLOCK makes the read path yield-spin.
+const O_NONBLOCK_FL: u32 = 0o4000;
 
 #[derive(Clone, Copy)]
 struct FdEntry {
@@ -1452,11 +1456,11 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_RENAME       => handle_rename(arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_FD_PATH      => handle_fd_path(caller_pid, arg(msg,0) as usize,
                                             arg(msg,1) as usize, arg(msg,2) as usize),
-        VFS_EVENTFD          => handle_eventfd(caller_pid, arg(msg,0) as u64),
-        VFS_SIGNALFD_CREATE  => handle_signalfd_create(caller_pid, arg(msg,0) as usize, arg(msg,1) as u64),
+        VFS_EVENTFD          => handle_eventfd(caller_pid, arg(msg,0) as u64, arg(msg,1) as u32),
+        VFS_SIGNALFD_CREATE  => handle_signalfd_create(caller_pid, arg(msg,0) as usize, arg(msg,1) as u64, arg(msg,2) as u32),
         VFS_INOTIFY_CREATE   => handle_inotify_create(caller_pid),
         VFS_INOTIFY_ADD      => handle_inotify_add(caller_pid, arg(msg,0) as usize),
-        VFS_TIMERFD_CREATE   => handle_timerfd_create(caller_pid),
+        VFS_TIMERFD_CREATE   => handle_timerfd_create(caller_pid, arg(msg,0) as u32),
         VFS_TIMERFD_SETTIME  => handle_timerfd_settime(caller_pid, arg(msg,0) as usize,
                                                         arg(msg,1) as u64, arg(msg,2) as u64),
         VFS_TIMERFD_GETTIME  => handle_timerfd_gettime(caller_pid, arg(msg,0) as usize,
@@ -4152,7 +4156,10 @@ fn path_eq(buf: &[u8; 256], len: usize, path: &[u8]) -> bool {
 
 static _SERVER_PORT_ID: atomic::AtomicU32 = atomic::AtomicU32::new(u32::MAX);
 
-fn handle_eventfd(pid: u32, initval: u64) -> Message {
+fn handle_eventfd(pid: u32, initval: u64, flags: u32) -> Message {
+    // Preserve EFD_NONBLOCK/EFD_CLOEXEC (== O_NONBLOCK/O_CLOEXEC): a reader that
+    // asked for a non-blocking eventfd must see EAGAIN, not a kernel yield-spin.
+    let stored = flags & (O_NONBLOCK_FL | O_CLOEXEC);
     let mut counters = EVENTFD_COUNTERS.lock();
     let slot = match counters.iter().position(|&v| v == u64::MAX) {
         Some(s) => s, None => return err_reply(-24),
@@ -4166,7 +4173,7 @@ fn handle_eventfd(pid: u32, initval: u64) -> Message {
     let fd = match tbl.alloc_fd() {
         Some(f) => f, None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; return err_reply(-24); }
     };
-    tbl.fds[fd] = FdEntry { kind: VnodeKind::EventFd { slot }, flags: 0, in_use: true };
+    tbl.fds[fd] = FdEntry { kind: VnodeKind::EventFd { slot }, flags: stored, in_use: true };
     val_reply(fd as u64)
 }
 
@@ -4174,7 +4181,7 @@ fn handle_eventfd(pid: u32, initval: u64) -> Message {
 /// maps the -1 sentinel to this) allocates a new SignalFd vnode; otherwise the
 /// named signalfd's mask is replaced. State lives entirely in the vnode — no
 /// backing pool — so close needs no special teardown.
-fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64) -> Message {
+fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -> Message {
     let mut tbls = FD_TABLES.lock();
     if existing_fd != usize::MAX {
         let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
@@ -4187,9 +4194,11 @@ fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64) -> Message {
             _ => err_reply(-22), // EINVAL — fd is not a signalfd
         }
     } else {
+        // Preserve SFD_NONBLOCK/SFD_CLOEXEC (== O_NONBLOCK/O_CLOEXEC).
+        let stored = flags & (O_NONBLOCK_FL | O_CLOEXEC);
         let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-24) };
         let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
-        tbl.fds[fd] = FdEntry { kind: VnodeKind::SignalFd { mask }, flags: 0, in_use: true };
+        tbl.fds[fd] = FdEntry { kind: VnodeKind::SignalFd { mask }, flags: stored, in_use: true };
         val_reply(fd as u64)
     }
 }
@@ -4220,7 +4229,12 @@ fn handle_inotify_add(pid: u32, fd: usize) -> Message {
     }
 }
 
-fn handle_timerfd_create(pid: u32) -> Message {
+fn handle_timerfd_create(pid: u32, flags: u32) -> Message {
+    // Preserve TFD_NONBLOCK/TFD_CLOEXEC (== O_NONBLOCK/O_CLOEXEC). The polling
+    // crate (calloop's poller) reads its timeout timerfd expecting EAGAIN before
+    // it fires; without the recorded O_NONBLOCK the kernel read yield-spins,
+    // pinning a single-threaded compositor's event loop.
+    let stored = flags & (O_NONBLOCK_FL | O_CLOEXEC);
     let mut pool = TIMERFD_POOL.lock();
     let slot = match pool.iter().position(|e| e.is_free()) {
         Some(s) => s, None => return err_reply(-24),
@@ -4235,7 +4249,7 @@ fn handle_timerfd_create(pid: u32) -> Message {
     let fd = match tbl.alloc_fd() {
         Some(f) => f, None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); return err_reply(-24); }
     };
-    tbl.fds[fd] = FdEntry { kind: VnodeKind::TimerFd { slot }, flags: 0, in_use: true };
+    tbl.fds[fd] = FdEntry { kind: VnodeKind::TimerFd { slot }, flags: stored, in_use: true };
     val_reply(fd as u64)
 }
 
