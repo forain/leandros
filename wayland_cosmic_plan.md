@@ -479,6 +479,56 @@ applets: force software renderer via env at M6.
   reason for the libseat-shim eventfd workaround (0bed5ad) — that shim can be
   simplified later (do NOT do it as part of M5 bring-up; it is inert now that the
   kernel honors EFD_NONBLOCK).
+- STATUS 2026-07-23 (M5a/b/c waves): **enumeration + dmabuf-export blockers RESOLVED;
+  cosmic-comp reaches its render loop and exports every frame successfully — but a
+  SUBSEQUENT render-thread crash still blocks a presented (non-black) frame.**
+  Findings, in order:
+  1. **udev enumeration (libudev shim).** Two real bugs, both fixed (commit 106b845):
+     (a) `udev_enumerate_add_match_{subsystem,sysname,property}` stored the caller's
+     CString pointer; the Rust `udev` crate frees its temporary right after the call
+     → use-after-free → DRM scans ran with EMPTY filters → `device_list()` empty →
+     "Backend initialized without output". Fix: `strdup` the match strings.
+     (b) sysname matched with `strcmp` not a glob → `card[0-9]*` never matched. Fix:
+     `fnmatch`. (This is why anvil needed its ANVIL_DRM_DEVICE binary patch; cosmic-comp
+     has no direct-add path.) The rebuilt shim `.so` lives in the artifacts ship set.
+  2. **is_software → software renderer → degraded EGL.** Our llvmpipe Mesa reports
+     `egl.device.is_software()==true` (device.rs:732), so `determine_primary_gpu`
+     (mod.rs:272) filters card0 out and cosmic-comp falls back to `software_renderer()`
+     — an EGLDisplay on the `EGL_MESA_device_software` device that LACKS
+     `EGL_EXT_image_dma_buf_import` ("Dmabuf import extension not available"). The GBM
+     platform EGL (what anvil uses) HAS the full dma_buf extensions — it is only this
+     software-device EGL that is degraded. With render-node != scanout-node smithay
+     must export the rendered buffer as a dmabuf, which then fails. **Workaround (no
+     source patch): `COSMIC_RENDER_DEVICE=226:0`** (card0's dev id) — mod.rs:234 returns
+     that render node BEFORE the is_software filter, so cosmic-comp builds the GBM
+     GlowRenderer = anvil's working EGL path. MUST be set in the session launch env.
+  3. **PRIME dmabuf export = pid-canonicalisation bug (THE M5 export blocker), fixed
+     (kernel/src/syscall.rs).** `vfs::handle` canonicalises caller_pid→TGID (lib.rs:1453),
+     so the tmpfs fd table is TGID-keyed; but the PRIME_HANDLE_TO_FD/FD_TO_HANDLE
+     intercept passed the RAW pid to `install_dmabuf_vmo`/`dmabuf_handle_of`, which index
+     via `find_tbl` with no remap. cosmic-comp issues PRIME from a RENDER THREAD whose
+     TID≠TGID → `find_tbl(TID)`=None → install fails → `gbm_bo_get_fd_for_plane` returns
+     −1 → "Buffer returned invalid file descriptor" EVERY frame. (The prior wave's
+     "3 OK → 31 INSTALL_FAIL → ENOSPC" signature = the first 3 exports on the main thread
+     TID==TGID succeeded, then the render thread took over; the ENOSPC/EMFILE was the
+     downstream cascade of the failure path leaking the opened fd.) Fix: pass
+     `sched::tgid_of(pid)`; also close+unlink the ephemeral node on the install-fail path
+     so it can't leak. **Verified: export failures 13069 → 0; drmsmoke 20/20 (incl.
+     PRIME_HANDLE_TO_FD / PRIME_MMAP_ALIAS / PRIME_FD_TO_HANDLE) + vfstest all PASS both
+     arches; no regression.** `MAX_FDS` raised 64→128 (compositor is fd-hungry).
+  4. **REMAINING BLOCKER (new, unmasked by fix #3):** once export succeeds, cosmic-comp's
+     render thread crashes ~1 s in — `EL0 Fault FAR=0x10 x0=x1=0` (userspace null-deref),
+     deterministic, after "failed to create signaled syncobj (EPERM)" / "VRR_ENABLED
+     missing", AND cosmic-comp EMFILEs even at 128 fds (≈128 open dmabuf fds burned in
+     ~1 s). Root: our Mesa/gbm has NO modifier support (`gbm_bo_create_with_modifiers2`
+     path → smithay can't build a reusing swapchain → per-frame buffer realloc → the
+     compositor holds a dmabuf fd per frame). `COSMIC_DISABLE_SYNCOBJ` /
+     `COSMIC_DISABLE_DIRECT_SCANOUT` do NOT avoid it. This is the next investigation
+     (fd-lifetime/present-throttle, or Mesa modifier support) — NOT the export path.
+  - Known non-fatal DRM ioctl gaps cosmic-comp tolerates (kernel returns Unsupported):
+    `VRR_ENABLED` property, `CREATEPROPBLOB (0xC01064BD)`, `CURSOR (0xC01C64A3)`, syncobj.
+  - Doc fix: the connector at drm_device_interface.rs comment (was "Virtual") is reported
+    to smithay as connector_type=11 = **HDMI-A** (output name "HDMI-A-1").
 
 **M6 — COSMIC session**
 - start-cosmic → cosmic-session → settings-daemon + panel + notifications (+ bg,
