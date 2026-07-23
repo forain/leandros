@@ -5678,6 +5678,16 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         if !vfs::install_dmabuf_vmo(pid, newfd as usize, phys, order, handle) {
             return -12; // ENOMEM / install failed
         }
+        // Unlink the /tmp/dmabuf:<n> name immediately: the open fd holds the slot
+        // alive (create-then-unlink tempfile idiom, see servers/vfs tmp_nlink), so
+        // it behaves as an anonymous memfd. Without this, every exported frame
+        // leaks a named node whose borrowed-VMO length is charged to the tmpfs
+        // quota — a buffer-churning compositor (cosmic-comp reallocates its
+        // scanout buffer per frame, unlike a fixed swapchain) exhausts /tmp after
+        // a few dozen exports (ENOSPC), so gbm_bo_get_fd_for_plane then fails and
+        // nothing is ever presented. Reclaimed when the client closes the fd.
+        let unlink_msg = make_vfs_msg(vfs::VFS_UNLINK, &[path.as_ptr() as u64]);
+        let _ = vfs::handle(&unlink_msg, pid);
         // Write the fd back into drm_prime_handle.fd (offset 8).
         unsafe { ((arg + 8) as *mut i32).write(newfd as i32); }
         return 0;
