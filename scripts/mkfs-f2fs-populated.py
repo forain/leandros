@@ -447,6 +447,60 @@ def main():
                   "/sys/dev/char/226:0/device/drm/card0"):
             m4_share_dirs.add(d)
 
+    # ── M5 session/compositor ship set (cosmic-comp + D-Bus session + fonts) ──
+    # cosmic-comp (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) reuses the exact
+    # M3 GL + M4 input ship sets already packed above; its DT_NEEDED closure is
+    # fully covered there (verified: m5-session-ship/verify-closure.sh), so no
+    # new libraries are needed — only the compositor binary, the session bus
+    # (busd + its POSIX-sh launcher + config) and the default UI fonts.
+    #
+    # The bus binary must be executable — dbus-run-session gates on `test -x`
+    # $BUSD_BIN and busd is exec'd directly (static ET_EXEC) — so busd and
+    # dbus-run-session are packed 0755 via m5_exec_files (resolved to their
+    # target-dir inode after the /usr tree registration below). session.conf
+    # and the fonts are plain data (0644) and ride the shared /usr tree walk
+    # (m4_share_files/m4_share_dirs, generalized here beyond /usr/share).
+    m5_arch_root = os.path.expanduser(f"~/code/leandros-artifacts/m5-session-ship/{arch}")
+    m5_fonts_src = os.path.expanduser("~/code/leandros-artifacts/m5-session-ship/share/fonts")
+    cosmic_comp  = os.path.expanduser(f"~/code/leandros-artifacts/m3-gl-stack/out/cosmic-comp-{arch}")
+    if os.path.exists(cosmic_comp):
+        bin_files.append(("cosmic-comp", cosmic_comp, 0o100755))
+    # (image_dir_abspath, name, hostpath) packed 0755 after inode registration.
+    m5_exec_files = []
+    if os.path.isdir(m5_arch_root):
+        for dirpath, _dn, filenames in os.walk(m5_arch_root):
+            rel = os.path.relpath(dirpath, m5_arch_root)   # e.g. "usr/libexec"
+            if rel == ".":
+                continue
+            parts = rel.split("/")
+            for i in range(1, len(parts) + 1):             # register /usr, /usr/bin, ...
+                m4_share_dirs.add("/" + "/".join(parts[:i]))
+            image_dir = "/" + rel
+            for fn in sorted(filenames):
+                hp = os.path.join(dirpath, fn)
+                if not os.path.isfile(hp):
+                    continue
+                if fn in ("busd", "dbus-run-session"):     # must be executable
+                    m5_exec_files.append((image_dir, fn, hp))
+                else:                                       # session.conf etc. = data
+                    m4_share_files.append((image_dir, fn, hp))
+    # Default UI fonts -> /usr/share/fonts/<family>/… — the exact scan dir
+    # fontdb's load_no_fontconfig() walks on LeandrOS (no fontconfig config
+    # present). Zero fonts is a soft-fail (blank text, no panic); packing them
+    # makes the compositor UI legible. Plain data (0644).
+    if os.path.isdir(m5_fonts_src):
+        for dirpath, _dn, filenames in os.walk(m5_fonts_src):
+            rel = os.path.relpath(dirpath, m5_fonts_src)   # e.g. "open-sans" or "."
+            sub = "" if rel == "." else "/" + rel
+            image_dir = "/usr/share/fonts" + sub
+            parts = ("usr/share/fonts" + sub).split("/")
+            for i in range(2, len(parts) + 1):
+                m4_share_dirs.add("/" + "/".join(parts[:i]))
+            for fn in sorted(filenames):
+                hp = os.path.join(dirpath, fn)
+                if os.path.isfile(hp):
+                    m4_share_files.append((image_dir, fn, hp))
+
     # 2. Dynamically calculate required blocks and image size
     # Each meta segment takes 512 blocks. We have 8 meta segments (4096 blocks).
     # Plus safety margin and blocks for directories.
@@ -459,7 +513,8 @@ def main():
     # every name would over-allocate by ~100x once coreutils is installed.
     _sized = set()
     for name, path, mode in (bin_files + lib_files + usr_lib_files + gbm_files + root_files + etc_files
-                             + [(n, p, 0) for (_d, n, p) in m4_share_files]):
+                             + [(n, p, 0) for (_d, n, p) in m4_share_files]
+                             + [(n, p, 0) for (_d, n, p) in m5_exec_files]):
         if not isinstance(path, (bytes, bytearray)):
             if path in _sized:
                 continue
@@ -765,6 +820,14 @@ def main():
         print("Packing /usr/share data tree (XKB keymaps + libinput quirks)...")
         for ino in sorted(m4_tree_files_by_ino):
             add_files_to_dir(ino, m4_tree_files_by_ino[ino])
+    if m5_exec_files:
+        print("Packing M5 session executables (busd, dbus-run-session) 0755...")
+        m5_exec_by_ino = {}
+        for image_dir, name, hostpath in m5_exec_files:
+            ino = _path_to_ino[image_dir]
+            m5_exec_by_ino.setdefault(ino, []).append((name, hostpath, 0o100755))
+        for ino in sorted(m5_exec_by_ino):
+            add_files_to_dir(ino, m5_exec_by_ino[ino])
 
     # 5. Write directory blocks and inodes
     # Build dentry blocks list for each directory
