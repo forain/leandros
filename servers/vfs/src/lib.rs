@@ -1010,7 +1010,14 @@ fn timerfd_poll_expirations(slot: usize) -> u64 {
 // ── FD table ─────────────────────────────────────────────────────────────────
 
 const MAX_PROCS: usize = 64;
-const MAX_FDS:   usize = 64;
+// 64 is too tight for a real Wayland compositor: cosmic-comp alone holds its
+// wayland listen socket, epoll, DRM card fd, GBM fds, per-frame dmabuf exports,
+// D-Bus, inotify config watches and per-client sockets, and hit EMFILE ("No file
+// descriptors available") during init at 64. 128 gives a compositor + a handful
+// of clients comfortable headroom. The fd table is a plain bound (`fd >= MAX_FDS`
+// / array index) — no fd bitmask assumes ≤64 (the u128 tmp mask is keyed by the
+// tmpfs slot, not the fd), so this is a pure sizing bump.
+const MAX_FDS:   usize = 128;
 const O_CLOEXEC: u32   = 0x8_0000;
 /// O_NONBLOCK (== EFD_NONBLOCK/TFD_NONBLOCK/SFD_NONBLOCK). Module-level so the
 /// eventfd/timerfd/signalfd creators can record it on the fd (fd_nonblock reads
