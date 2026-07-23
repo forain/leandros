@@ -1796,8 +1796,22 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
             sched::WaitTry::StillRunning => {
                 if options & WNOHANG != 0 { return 0; }
                 if interrupted() { return -4; } // EINTR
-                irq_window();
-                yield_now("wait4");
+                // Block on the poll wait-channel instead of a yield-spin. A
+                // child exit delivers SIGCHLD which calls sched::wake_poll,
+                // waking us to reap; a short poll deadline bounds any missed
+                // edge (check-then-sleep gap) to ~20 ms, never a hang. The old
+                // `yield_now` spin pinned the reaper of a *long-running* child
+                // (e.g. a compositor that runs for the session) at 100 % CPU —
+                // init/shell waiters stayed perpetually runnable, churning the
+                // scheduler run-loop and starving the very child's event loop.
+                sched::block_on_poll_prepare();
+                sched::register_poll_deadline(sched::ticks() + 2);
+                if matches!(sched::wait_peek(sel, caller_tgid), sched::WaitTry::StillRunning)
+                    && !interrupted() {
+                    sched::block_on_poll_commit();
+                } else {
+                    sched::block_on_poll_cancel();
+                }
             }
         }
     }
@@ -1868,8 +1882,24 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
                     return 0;
                 }
                 if interrupted() { return -4; } // EINTR
-                irq_window();
-                yield_now("waitid");
+                // Block on the poll wait-channel rather than a yield-spin —
+                // same fix as sys_wait4: a long-running child (a compositor,
+                // a service) otherwise pins its blocking-waitid reaper at
+                // 100 % CPU. Woken by child-exit SIGCHLD -> wake_poll; the
+                // 2-tick poll deadline bounds a missed edge to ~20 ms.
+                sched::block_on_poll_prepare();
+                sched::register_poll_deadline(sched::ticks() + 2);
+                let peek = sched::wait_peek(sel, caller_tgid);
+                let ready = if reap_exits {
+                    !matches!(peek, sched::WaitTry::StillRunning)
+                } else {
+                    matches!(peek, sched::WaitTry::NoChildren)
+                };
+                if ready || interrupted() {
+                    sched::block_on_poll_cancel();
+                } else {
+                    sched::block_on_poll_commit();
+                }
             }
         }
     }
@@ -2226,10 +2256,20 @@ fn sys_nanosleep(rqtp_ptr: usize, rmtp_ptr: usize) -> isize {
             }
             return -4; // EINTR
         }
-        irq_window();
-
-        yield_now("nanosleep");
         if ticks() >= deadline { break; }
+        // Block on the poll wait-channel until the sleep deadline instead of a
+        // yield_now busy-poll: the old spin pinned a CPU for the whole sleep
+        // (e.g. init's getty-loop `usleep(1s)` — pid 1 churning the scheduler
+        // run-loop at 100 %+ CPU and starving every other task). The deadline
+        // tick wakes us exactly at `deadline`; a spurious early wake (another
+        // waiter's nearer deadline) just re-checks the tick above and re-blocks.
+        sched::block_on_poll_prepare();
+        sched::register_poll_deadline(deadline);
+        if ticks() >= deadline || interrupted() {
+            sched::block_on_poll_cancel();
+        } else {
+            sched::block_on_poll_commit();
+        }
     }
     0
 }

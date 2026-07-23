@@ -637,7 +637,14 @@ pub fn net_daemon() -> ! {
             for &b in b"\r\n" { unsafe { arch_serial_putc(b); } }
         }
 
-        sched::yield_now("net_daemon");
+        // Block until the next tick (~100 Hz poll cadence) instead of a tight
+        // yield_now busy-poll. The old spin pinned this kernel task's CPU at
+        // 100 % from boot — the dominant component of the "compositor is
+        // compute-bound" misread. 100 Hz smoltcp polling is ample here, and an
+        // earlier wake (any wake_poll from socket traffic) re-polls immediately.
+        sched::block_on_poll_prepare();
+        sched::register_poll_deadline(sched::ticks() + 1);
+        sched::block_on_poll_commit();
     }
 }
 
