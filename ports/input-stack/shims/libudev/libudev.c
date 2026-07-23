@@ -52,6 +52,7 @@
 #include "libudev.h"
 
 #include <errno.h>
+#include <fnmatch.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -529,6 +530,14 @@ struct udev_enumerate *udev_enumerate_ref(struct udev_enumerate *e) {
 struct udev_enumerate *udev_enumerate_unref(struct udev_enumerate *e) {
 	if (!e) return NULL;
 	if (--e->refcount > 0) return NULL;
+	/* Free the strdup'd match strings (see add_match_* setters). */
+	for (size_t i = 0; i < e->n_match_subsystem; i++) free((void *)e->match_subsystem[i]);
+	for (size_t i = 0; i < e->n_nomatch_subsystem; i++) free((void *)e->nomatch_subsystem[i]);
+	for (size_t i = 0; i < e->n_match_sysname; i++) free((void *)e->match_sysname[i]);
+	for (size_t i = 0; i < e->n_match_prop; i++) {
+		free((void *)e->match_prop_key[i]);
+		free((void *)e->match_prop_val[i]);
+	}
 	list_free(e->results);
 	udev_unref(e->udev);
 	free(e);
@@ -537,29 +546,48 @@ struct udev_enumerate *udev_enumerate_unref(struct udev_enumerate *e) {
 
 struct udev *udev_enumerate_get_udev(struct udev_enumerate *e) { return e ? e->udev : NULL; }
 
+/* Match-string setters MUST copy: libudev owns the strings past the call, and
+ * callers routinely pass a temporary (e.g. the Rust `udev` crate hands us a
+ * CString that it drops the instant add_match_* returns). Storing the caller's
+ * pointer left us dereferencing freed memory at scan time — the subsystem/
+ * sysname compared as empty/garbage, so a Rust-side `match_subsystem("drm")` +
+ * `match_sysname("card[0-9]*")` matched nothing while a C caller passing string
+ * literals (libinput) worked. strdup here (freed in udev_enumerate_unref). */
 int udev_enumerate_add_match_subsystem(struct udev_enumerate *e, const char *subsystem) {
 	if (!e || !subsystem) return -EINVAL;
-	if (e->n_match_subsystem < MAX_FILTERS)
-		e->match_subsystem[e->n_match_subsystem++] = subsystem;
+	if (e->n_match_subsystem < MAX_FILTERS) {
+		char *c = strdup(subsystem);
+		if (!c) return -ENOMEM;
+		e->match_subsystem[e->n_match_subsystem++] = c;
+	}
 	return 0;
 }
 int udev_enumerate_add_nomatch_subsystem(struct udev_enumerate *e, const char *subsystem) {
 	if (!e || !subsystem) return -EINVAL;
-	if (e->n_nomatch_subsystem < MAX_FILTERS)
-		e->nomatch_subsystem[e->n_nomatch_subsystem++] = subsystem;
+	if (e->n_nomatch_subsystem < MAX_FILTERS) {
+		char *c = strdup(subsystem);
+		if (!c) return -ENOMEM;
+		e->nomatch_subsystem[e->n_nomatch_subsystem++] = c;
+	}
 	return 0;
 }
 int udev_enumerate_add_match_sysname(struct udev_enumerate *e, const char *sysname) {
 	if (!e || !sysname) return -EINVAL;
-	if (e->n_match_sysname < MAX_FILTERS)
-		e->match_sysname[e->n_match_sysname++] = sysname;
+	if (e->n_match_sysname < MAX_FILTERS) {
+		char *c = strdup(sysname);
+		if (!c) return -ENOMEM;
+		e->match_sysname[e->n_match_sysname++] = c;
+	}
 	return 0;
 }
 int udev_enumerate_add_match_property(struct udev_enumerate *e, const char *property, const char *value) {
 	if (!e || !property) return -EINVAL;
 	if (e->n_match_prop < MAX_FILTERS) {
-		e->match_prop_key[e->n_match_prop] = property;
-		e->match_prop_val[e->n_match_prop] = value;
+		char *k = strdup(property);
+		char *v = value ? strdup(value) : NULL;
+		if (!k || (value && !v)) { free(k); free(v); return -ENOMEM; }
+		e->match_prop_key[e->n_match_prop] = k;
+		e->match_prop_val[e->n_match_prop] = v;
 		e->n_match_prop++;
 	}
 	return 0;
@@ -600,11 +628,20 @@ static int enum_matches(struct udev_enumerate *e, const struct dev_desc *d) {
 			if (strcmp(d->subsystem, e->match_subsystem[i]) == 0) { ok = 1; break; }
 		if (!ok) return 0;
 	}
-	/* match sysname (if any specified) */
+	/* match sysname (if any specified). Real libudev matches sysname with
+	 * fnmatch() shell-glob semantics, not a literal compare: smithay's
+	 * gpus_for_seat() enumerates DRM nodes with match_sysname("card[0-9]*"),
+	 * so a strcmp here filtered out card0 and left the udev-backend GPU list
+	 * empty (this is what forced anvil's ANVIL_DRM_DEVICE direct-add patch).
+	 * cosmic-comp has no such direct-add path — only post-enumeration
+	 * ALLOW/BLOCK filters — so proper glob matching here is required for its
+	 * kms backend to discover card0. A pattern with no glob metacharacters
+	 * degrades to an exact match under fnmatch, so existing callers are
+	 * unaffected. */
 	if (e->n_match_sysname) {
 		int ok = 0;
 		for (size_t i = 0; i < e->n_match_sysname; i++)
-			if (strcmp(d->sysname, e->match_sysname[i]) == 0) { ok = 1; break; }
+			if (fnmatch(e->match_sysname[i], d->sysname, 0) == 0) { ok = 1; break; }
 		if (!ok) return 0;
 	}
 	/* match property (if any specified) — all must match */
