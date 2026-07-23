@@ -5801,7 +5801,9 @@ fn sys_accept(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_ACCEPT,
         &[sockfd as u64, addr_ptr as u64, addrlen_ptr as u64]);
-    net_reply_val(&net_server::handle(&msg, pid))
+    let r = net_reply_val(&net_server::handle(&msg, pid));
+    if r >= 0 { uxtrace("ACC", pid, sockfd, r); }
+    r
 }
 
 fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
@@ -5809,7 +5811,9 @@ fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_CONNECT,
         &[sockfd as u64, addr_ptr as u64, addrlen as u64]);
-    net_reply_val(&net_server::handle(&msg, pid))
+    let r = net_reply_val(&net_server::handle(&msg, pid));
+    uxtrace("CON", pid, sockfd, r);
+    r
 }
 
 /// Shared blocking wrapper for the four send/recv syscalls: a blocking
@@ -5825,6 +5829,30 @@ fn net_blocking_op(pid: u32, sockfd: usize, flags: usize, msg: &Message) -> isiz
         irq_window();
         yield_now("net_blocking_op");
     }
+}
+
+/// M4/M5 unix-socket exchange trace. Prints one line per connect/accept and
+/// per data-carrying send/recv to the serial console (the driver.py-captured
+/// port), so a compositor↔client handshake stall can be localized without
+/// touching the net-server crate (which has no serial access). Quiet gate:
+/// flip UXTRACE to false to silence with zero cost. Kept for M5 (cosmic-comp
+/// exercises the identical path). Values print in hex; negatives are shown as
+/// two's-complement (e.g. EAGAIN -11 = ...fffffff5), but data sends/recvs only
+/// trace on v>0 so the stream stays readable.
+const UXTRACE: bool = false;
+
+#[inline]
+fn uxtrace(tag: &str, pid: u32, fd: usize, v: isize) {
+    if !UXTRACE { return; }
+    crate::serial_print_str("UXTR ");
+    crate::serial_print_str(tag);
+    crate::serial_print_str(" pid=");
+    crate::serial_print_hex(pid as usize);
+    crate::serial_print_str(" fd=");
+    crate::serial_print_hex(fd);
+    crate::serial_print_str(" v=");
+    crate::serial_print_hex(v as usize);
+    crate::serial_print_str("\n");
 }
 
 fn sys_sendto(sockfd: usize, buf_ptr: usize, len: usize,
@@ -5852,7 +5880,9 @@ fn sys_sendmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SENDMSG,
         &[sockfd as u64, msghdr_ptr as u64, flags as u64]);
-    net_blocking_op(pid, sockfd, flags, &msg)
+    let r = net_blocking_op(pid, sockfd, flags, &msg);
+    if r > 0 { uxtrace("SND", pid, sockfd, r); }
+    r
 }
 
 fn sys_recvmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
@@ -5860,7 +5890,9 @@ fn sys_recvmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_RECVMSG,
         &[sockfd as u64, msghdr_ptr as u64, flags as u64]);
-    net_blocking_op(pid, sockfd, flags, &msg)
+    let r = net_blocking_op(pid, sockfd, flags, &msg);
+    if r > 0 { uxtrace("RCV", pid, sockfd, r); }
+    r
 }
 
 fn sys_net_shutdown(sockfd: usize, how: usize) -> isize {
