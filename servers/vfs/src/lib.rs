@@ -904,9 +904,16 @@ static PIPE_RINGS: Mutex<[PipeRing; MAX_PIPES]> =
 /// it is duplicated (dup, dup2, fork inheritance). No-op for non-pipe fds.
 /// Caller must NOT hold the FD_TABLES lock (we take PIPE_RINGS here).
 fn pipe_ref_inc(kind: &VnodeKind) {
-    if let VnodeKind::Pipe { ring, is_write } = kind {
-        let mut rings = PIPE_RINGS.lock();
-        if *is_write { rings[*ring].writers += 1; } else { rings[*ring].readers += 1; }
+    match kind {
+        VnodeKind::Pipe { ring, is_write } => {
+            let mut rings = PIPE_RINGS.lock();
+            if *is_write { rings[*ring].writers += 1; } else { rings[*ring].readers += 1; }
+        }
+        // eventfd/timerfd slots are pooled and shared across dup'd fds; bump the
+        // slot refcount so the pool entry survives until the last fd closes.
+        VnodeKind::EventFd { slot } => { EVENTFD_REFS.lock()[*slot] += 1; }
+        VnodeKind::TimerFd { slot } => { TIMERFD_REFS.lock()[*slot] += 1; }
+        _ => {}
     }
 }
 
@@ -932,14 +939,40 @@ fn pipe_drop_ref(rings: &mut [PipeRing; MAX_PIPES], ring: usize, is_write: bool)
 }
 
 fn pipe_ref_dec(kind: &VnodeKind) {
-    if let VnodeKind::Pipe { ring, is_write } = kind {
-        pipe_drop_ref(&mut PIPE_RINGS.lock(), *ring, *is_write);
+    match kind {
+        VnodeKind::Pipe { ring, is_write } => {
+            pipe_drop_ref(&mut PIPE_RINGS.lock(), *ring, *is_write);
+        }
+        // Symmetric with pipe_ref_inc: a dup2/dup3 that overwrites an open
+        // eventfd/timerfd fd releases its slot reference; free the slot only
+        // when the last sharer is gone (see EVENTFD_REFS).
+        VnodeKind::EventFd { slot } => {
+            let mut refs = EVENTFD_REFS.lock();
+            refs[*slot] = refs[*slot].saturating_sub(1);
+            if refs[*slot] == 0 {
+                EVENTFD_COUNTERS.lock()[*slot] = u64::MAX;
+                EVENTFD_SEQ.lock()[*slot] = 0;
+            }
+        }
+        VnodeKind::TimerFd { slot } => {
+            let mut refs = TIMERFD_REFS.lock();
+            refs[*slot] = refs[*slot].saturating_sub(1);
+            if refs[*slot] == 0 { TIMERFD_POOL.lock()[*slot] = TimerFdEntry::free(); }
+        }
+        _ => {}
     }
 }
 
 // ── eventfd counters ──────────────────────────────────────────────────────────
 
-const MAX_EVENTFDS: usize = 16;
+// A real calloop-based Wayland compositor (cosmic-comp) holds many live
+// eventfds at once — calloop's Ping/Channel wakers, smithay worker-thread
+// notifiers, zbus — comfortably more than 16 across the compositor + D-Bus
+// broker + init. With slots now correctly refcounted (freed only when the last
+// dup closes) the pool no longer masks exhaustion by early-freeing, so 16 filled
+// and eventfd()/inotify creation started returning EMFILE mid-init. 64 is a pure
+// sizing bump (small fixed arrays), matching the MAX_FDS 64→128 headroom rationale.
+const MAX_EVENTFDS: usize = 64;
 // u64::MAX = free slot sentinel.
 static EVENTFD_COUNTERS: Mutex<[u64; MAX_EVENTFDS]> = Mutex::new([u64::MAX; MAX_EVENTFDS]);
 /// Per-eventfd monotonic event counter, bumped on every write. mio registers
@@ -947,6 +980,15 @@ static EVENTFD_COUNTERS: Mutex<[u64; MAX_EVENTFDS]> = Mutex::new([u64::MAX; MAX_
 /// POLLIN level stays high forever; the epoll layer compares this seq to
 /// re-fire once per wake() instead of spinning on the stuck level.
 static EVENTFD_SEQ: Mutex<[u64; MAX_EVENTFDS]> = Mutex::new([0u64; MAX_EVENTFDS]);
+/// Per-slot fd refcount. An eventfd can be dup'd (dup/dup2/fork/exec-keep), so
+/// several fds share one counter slot. The slot must survive until the LAST of
+/// them closes — otherwise close(one dup) frees the slot (counter → u64::MAX),
+/// a later eventfd() reuses it, and the two live eventfds alias one counter: a
+/// drain of one reads EAGAIN on the other. That aliasing killed cosmic-comp's
+/// calloop (a ping-eventfd dup shared a slot with a second source's eventfd; the
+/// ping drain emptied it, the source read EAGAIN and calloop treated it fatal).
+/// Mirrors the pipe reader/writer refcount; bumped by pipe_ref_inc on every dup.
+static EVENTFD_REFS: Mutex<[u32; MAX_EVENTFDS]> = Mutex::new([0u32; MAX_EVENTFDS]);
 
 // ── /dev/urandom LFSR ─────────────────────────────────────────────────────────
 
@@ -963,7 +1005,9 @@ fn lfsr_next() -> u8 {
 
 // ── timerfd pool ──────────────────────────────────────────────────────────────
 
-const MAX_TIMERFDS: usize = 16;
+// See MAX_EVENTFDS: calloop arms a timerfd per timer source; 16 is tight for a
+// compositor. 64 gives headroom now that slots are refcounted (freed at last close).
+const MAX_TIMERFDS: usize = 64;
 
 #[derive(Clone, Copy)]
 struct TimerFdEntry {
@@ -982,6 +1026,8 @@ impl TimerFdEntry {
 
 static TIMERFD_POOL: Mutex<[TimerFdEntry; MAX_TIMERFDS]> =
     Mutex::new([const { TimerFdEntry::free() }; MAX_TIMERFDS]);
+/// Per-slot fd refcount for timerfds — same dup-aliasing hazard as EVENTFD_REFS.
+static TIMERFD_REFS: Mutex<[u32; MAX_TIMERFDS]> = Mutex::new([0u32; MAX_TIMERFDS]);
 
 /// Recompute a timerfd's pending-expiration count against the current tick,
 /// folding any missed periods into `expirations` and rearming the deadline —
@@ -3018,10 +3064,21 @@ fn handle_close(pid: u32, fd: usize) -> Message {
             pipe_drop_ref(&mut PIPE_RINGS.lock(), ring, is_write);
         }
         VnodeKind::EventFd { slot } => {
-            EVENTFD_COUNTERS.lock()[slot] = u64::MAX;
+            // Refcounted: an eventfd is dup-able, so free the pool slot only when
+            // the last fd sharing it closes. Freeing early let a later eventfd()
+            // reuse the slot while a surviving dup still read/wrote it — two live
+            // eventfds aliasing one counter, which deadlocked cosmic-comp's loop.
+            let mut refs = EVENTFD_REFS.lock();
+            refs[slot] = refs[slot].saturating_sub(1);
+            if refs[slot] == 0 {
+                EVENTFD_COUNTERS.lock()[slot] = u64::MAX;
+                EVENTFD_SEQ.lock()[slot] = 0;
+            }
         }
         VnodeKind::TimerFd { slot } => {
-            TIMERFD_POOL.lock()[slot] = TimerFdEntry::free();
+            let mut refs = TIMERFD_REFS.lock();
+            refs[slot] = refs[slot].saturating_sub(1);
+            if refs[slot] == 0 { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); }
         }
         VnodeKind::DynamicDevice { port, dev_id } => {
             let mut close_msg = Message::empty();
@@ -3341,8 +3398,22 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
         VnodeKind::Pipe { ring, is_write } => {
             pipe_drop_ref(&mut PIPE_RINGS.lock(), ring, is_write);
         }
-        VnodeKind::EventFd { slot } => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; }
-        VnodeKind::TimerFd { slot } => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); }
+        VnodeKind::EventFd { slot } => {
+            // Only free the slot when the LAST dup of this eventfd closes;
+            // otherwise a surviving dup keeps using a counter a new eventfd
+            // has since been allocated over (the calloop aliasing bug).
+            let mut refs = EVENTFD_REFS.lock();
+            refs[slot] = refs[slot].saturating_sub(1);
+            if refs[slot] == 0 {
+                EVENTFD_COUNTERS.lock()[slot] = u64::MAX;
+                EVENTFD_SEQ.lock()[slot] = 0; // start clean for the next reuse
+            }
+        }
+        VnodeKind::TimerFd { slot } => {
+            let mut refs = TIMERFD_REFS.lock();
+            refs[slot] = refs[slot].saturating_sub(1);
+            if refs[slot] == 0 { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); }
+        }
         VnodeKind::DynamicDevice { port, dev_id } => {
             let mut close_msg = Message::empty();
             close_msg.tag = VFS_CLOSE;
@@ -4173,12 +4244,14 @@ fn handle_eventfd(pid: u32, initval: u64, flags: u32) -> Message {
     };
     counters[slot] = if initval == u64::MAX { u64::MAX - 1 } else { initval };
     drop(counters);
+    EVENTFD_SEQ.lock()[slot] = 0;   // fresh slot: no stale edge from a prior tenant
+    EVENTFD_REFS.lock()[slot] = 1;  // one fd references it until dup'd/closed
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) {
-        Some(t) => t, None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; return err_reply(-24); }
+        Some(t) => t, None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; EVENTFD_REFS.lock()[slot] = 0; return err_reply(-24); }
     };
     let fd = match tbl.alloc_fd() {
-        Some(f) => f, None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; return err_reply(-24); }
+        Some(f) => f, None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; EVENTFD_REFS.lock()[slot] = 0; return err_reply(-24); }
     };
     tbl.fds[fd] = FdEntry { kind: VnodeKind::EventFd { slot }, flags: stored, in_use: true };
     val_reply(fd as u64)
@@ -4249,12 +4322,13 @@ fn handle_timerfd_create(pid: u32, flags: u32) -> Message {
     pool[slot] = TimerFdEntry::free();
     pool[slot].deadline_ticks = 1;
     drop(pool);
+    TIMERFD_REFS.lock()[slot] = 1;
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) {
-        Some(t) => t, None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); return err_reply(-24); }
+        Some(t) => t, None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); TIMERFD_REFS.lock()[slot] = 0; return err_reply(-24); }
     };
     let fd = match tbl.alloc_fd() {
-        Some(f) => f, None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); return err_reply(-24); }
+        Some(f) => f, None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); TIMERFD_REFS.lock()[slot] = 0; return err_reply(-24); }
     };
     tbl.fds[fd] = FdEntry { kind: VnodeKind::TimerFd { slot }, flags: stored, in_use: true };
     val_reply(fd as u64)
