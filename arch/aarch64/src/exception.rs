@@ -224,7 +224,84 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
         serial_print_str(" sp=");
         print_hex((*frame).sp_el0 as usize);
         serial_print_str("\n");
-        
+
+        // ── EL0 fault-time user backtrace (gated diagnostic) ─────────────────
+        // Walks the AArch64 frame-pointer (x29) chain to name an unbounded
+        // userspace recursion whose only clue is a write-fault at sp driven to
+        // the main-stack base. (This cracked W3: a signal_hook_registry handler
+        // chaining to itself in brush after execve failed to reset a caught
+        // disposition — fixed by sched::signal::reset_handlers_on_exec.)
+        // AArch64 prologues save the caller's fp/lr as
+        // `stp x29,x30,[sp,#-N]!` + `add x29,sp,#k`, so at any frame
+        // `*(fp) = caller_fp` and `*(fp+8) = return_addr`. Every read is bounded
+        // to the main thread's eagerly-mapped 8 MiB user stack window (mirrors
+        // kernel/src/syscall.rs USER_STACK_TOP/USER_STACK_SIZE) so a read cannot
+        // fault-in-fault and re-enter this EL1 abort handler → deadlock. A worker
+        // thread's fp (musl mmap stack) falls outside the window ⇒ the walk is a
+        // safe no-op there. Symbolize offline:
+        //   llvm-addr2line -f -i -C -e cosmic-comp-<arch> <ret − 0x200000>
+        const EL0_BACKTRACE: bool = false;
+        if EL0_BACKTRACE {
+            const STACK_TOP: usize = 0x0000_7fff_ffff_f000;
+            const STACK_SIZE: usize = 2048 * 4096; // 8 MiB, USER_STACK_SIZE
+            const STACK_BASE: usize = STACK_TOP - STACK_SIZE;
+            serial_print_str("[BT] base=0x200000 elr=");
+            print_hex(elr as usize);
+            serial_print_str(" fp=");
+            print_hex((*frame).x[29] as usize);
+            serial_print_str(" lr=");
+            print_hex((*frame).x[30] as usize);
+            serial_print_str("\n");
+            let mut fp = (*frame).x[29] as usize;
+            let mut i: u32 = 0;
+            while i < 64 {
+                // Bound every dereference to the mapped main-stack window.
+                if fp < STACK_BASE || fp > STACK_TOP - 16 || (fp & 0x7) != 0 {
+                    break;
+                }
+                let next = core::ptr::read_volatile(fp as *const u64) as usize;
+                let ret = core::ptr::read_volatile((fp + 8) as *const u64) as usize;
+                serial_print_str("[BT] ");
+                print_number(i);
+                serial_print_str(" ret=");
+                print_hex(ret);
+                serial_print_str("\n");
+                // Frames ascend (stack grows down ⇒ caller fp is higher).
+                if next <= fp {
+                    break;
+                }
+                fp = next;
+                i += 1;
+            }
+            serial_print_str("[BT] end\n");
+
+            // Ground-truth the faulting instruction bytes from the live process
+            // image (TTBR0 still active in this EL0 fault handler). Resolves the
+            // base-vs-symbolization paradox: print the runtime instruction word
+            // at ELR, at the return site (x30), and a small window — read only
+            // within the main-image VA range so this cannot fault-in-fault.
+            let dump = |addr: usize| {
+                if (0x0020_0000..0x3000_0000).contains(&addr) && (addr & 0x3) == 0 {
+                    let w = core::ptr::read_volatile(addr as *const u32);
+                    serial_print_str("[BT] insn @");
+                    print_hex(addr);
+                    serial_print_str(" = ");
+                    print_hex(w as usize);
+                    serial_print_str("\n");
+                }
+            };
+            let elr_u = elr as usize;
+            dump(elr_u.wrapping_sub(4));
+            dump(elr_u);
+            dump(elr_u.wrapping_add(4));
+            let lr_u = (*frame).x[30] as usize;
+            dump(lr_u.wrapping_sub(8));
+            dump(lr_u.wrapping_sub(4));
+            dump(lr_u);
+            // Module map: which VMA (base + file offset) contains the faulting PC.
+            sched::dump_user_vma(elr as usize);
+        }
+
         sched::exit(1);
     }
 }

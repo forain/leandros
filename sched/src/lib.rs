@@ -1289,6 +1289,44 @@ pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
     ok
 }
 
+/// Diagnostic (gated by caller): dump the faulting task's file-backed and
+/// executable VMAs so an EL0 fault address can be mapped to its module base +
+/// file offset (identifying which .so a runtime PC lives in). Prints metadata
+/// only (kernel Vec), never touches user memory, under the per-AS `busy` lock.
+pub fn dump_user_vma(fault_addr: usize) {
+    fn print_str(s: &str) {
+        extern "C" { fn arch_serial_putc(c: u8); }
+        for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } }
+    }
+    extern "C" { fn print_hex(n: usize); }
+    let pid = current_pid();
+    if pid == 0 { return; }
+    let as_ptr = match lock_leader_address_space(pid) {
+        Some(p) => p,
+        None => { print_str("[VMA] no address space\n"); return; }
+    };
+    unsafe {
+        for r in (*as_ptr).regions.iter().filter_map(|r| r.as_ref()) {
+            let is_exec = r.prot & 0x4 != 0;
+            let file_backed = r.file_cap != 0 && r.file_cap != usize::MAX;
+            // Only the interesting regions: executable and/or file-backed, plus
+            // whichever region contains the fault address.
+            let contains = fault_addr >= r.start && fault_addr < r.end;
+            if !(is_exec || file_backed || contains) { continue; }
+            print_str(if contains { "[VMA]* " } else { "[VMA]  " });
+            print_str("start="); print_hex(r.start);
+            print_str(" end=");  print_hex(r.end);
+            print_str(" prot="); print_hex(r.prot as usize);
+            print_str(" cap=");  print_hex(r.file_cap);
+            print_str(" foff="); print_hex(r.file_off as usize);
+            print_str(" flen="); print_hex(r.file_len as usize);
+            print_str("\n");
+        }
+    }
+    unsafe { unlock_address_space(as_ptr); }
+    print_str("[VMA] end\n");
+}
+
 pub fn ap_entry() -> ! {
     // Park until the BSP finishes kernel init and calls run().  This keeps
     // the pre-SMP guarantee that no task executes before all servers and
