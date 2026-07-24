@@ -281,10 +281,6 @@ impl Task {
         stack_size: usize,
         page_table: usize,
     ) -> alloc::boxed::Box<Self> {
-        extern "C" { fn arch_serial_putc(b: u8); }
-        let msg_direct = b"Task::new_kernel: using clean Box::new allocation\r\n";
-        for &b in msg_direct { unsafe { arch_serial_putc(b); } }
-
         // Create task struct directly using Box::new for clean, single allocation
         let mut temp_task = Task {
             pid,
@@ -337,9 +333,6 @@ impl Task {
             vfork_pending: false,
         };
         temp_task.cwd[0] = b'/';
-
-        let msg_done = b"Task::new_kernel: task ready with clean allocation\r\n";
-        for &b in msg_done { unsafe { arch_serial_putc(b); } }
 
         // Move to heap using Box::new (clean, single allocation)
         alloc::boxed::Box::new(temp_task)

@@ -1579,16 +1579,6 @@ pub fn exit(code: i32) -> ! {
     // harmless — the second pass finds an empty fd table and does nothing.
     run_exit_teardown(pid);
 
-    unsafe {
-        let msg = b"[EXIT] pid=";
-        serial_print(msg.as_ptr(), msg.len());
-        print_number(pid);
-        let msg2 = b" code=";
-        serial_print(msg2.as_ptr(), msg2.len());
-        print_number(code as u32);
-        serial_print(b"\n".as_ptr(), 1);
-    }
-
     let clear_addr = {
         let rq = RUN_QUEUE.lock();
         rq.find_pid(pid).map(|t| t.clear_child_tid).unwrap_or(0)
