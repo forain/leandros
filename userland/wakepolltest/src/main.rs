@@ -51,6 +51,7 @@ mod nr {
     pub const TIMERFD_CREATE: i64 = 283;
     pub const TIMERFD_SETTIME: i64 = 286;
     pub const SOCKETPAIR: i64 = 53;
+    pub const FUTEX: i64 = 202;
 }
 #[cfg(target_arch = "aarch64")]
 mod nr {
@@ -58,6 +59,7 @@ mod nr {
     pub const TIMERFD_CREATE: i64 = 85;
     pub const TIMERFD_SETTIME: i64 = 86;
     pub const SOCKETPAIR: i64 = 199;
+    pub const FUTEX: i64 = 98;
 }
 
 pub type pthread_t = *mut c_void;
@@ -332,6 +334,54 @@ unsafe fn test_xthread_eventfd_et() -> bool {
     report_x(name, n >= 1 && el < PROMPT_MS, el, n, WROTE_AT)
 }
 
+// ── 2b. cross-thread FUTEX_WAKE of a TIMED futex waiter ────────────────────
+//    The exact shape that stranded busd (M7b): a thread parks in
+//    futex(FUTEX_WAIT) WITH a timeout; another thread issues FUTEX_WAKE WITHOUT
+//    changing the futex word. On Linux FUTEX_WAKE wakes timed and untimed
+//    waiters identically, so the waiter returns promptly. A kernel whose timed
+//    futex_wait yield-loop-polls the word without registering loses the wake
+//    and the waiter sleeps its full timeout (and burns a CPU meanwhile). We use
+//    the same finite-window/elapsed method as the epoll wake tests.
+
+static mut FUTEX_WORD: u32 = 0;
+
+extern "C" fn writer_futex_wake(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        writer_delay();
+        // Pure wake: do NOT change FUTEX_WORD, so only the FUTEX_WAKE (not a
+        // value-change the waiter could poll) can release the waiter.
+        syscall(nr::FUTEX, core::ptr::addr_of!(FUTEX_WORD) as c_long, 1i64, 1i64, 0i64, 0i64, 0i64);
+        WROTE_AT = now_ms();
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_xthread_futex_timed_wake() -> bool {
+    let name = b"xthread_futex_timed_wake";
+    FUTEX_WORD = 0;
+    WROTE_AT = -1;
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(), writer_futex_wake, core::ptr::null_mut()) != 0 {
+        return report(name, false, 0);
+    }
+    // WINDOW_MS timeout, absolute-free relative timespec (as this kernel treats it).
+    let ts = timespec { tv_sec: (WINDOW_MS as i64) / 1000, tv_nsec: 0 };
+    let t0 = now_ms();
+    let r = syscall(
+        nr::FUTEX,
+        core::ptr::addr_of!(FUTEX_WORD) as c_long,
+        0i64,                       // FUTEX_WAIT
+        0i64,                       // expected value (matches FUTEX_WORD)
+        &ts as *const timespec as c_long,
+        0i64, 0i64,
+    );
+    let el = now_ms() - t0;
+    pthread_join(th, core::ptr::null_mut());
+    // Woken by the cross-thread FUTEX_WAKE ⇒ returns 0 well before the window.
+    // A lost wake sleeps to ~WINDOW_MS (returns -ETIMEDOUT = -110).
+    report_x(name, el < PROMPT_MS, el, r as i32, WROTE_AT)
+}
+
 // ── 3. cross-thread pipe wake (level) ──────────────────────────────────────
 
 unsafe fn test_xthread_pipe_level() -> bool {
@@ -540,6 +590,7 @@ pub unsafe extern "C" fn wake_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     // AF_UNIX / timerfd edges arriving while parked are exercised too.
     BUSY_WRITER = false;
     if !test_probe_eventfd() { failures += 1; }
+    if !test_xthread_futex_timed_wake() { failures += 1; }
     if !test_xthread_pipe_level() { failures += 1; }
     if !test_xthread_unix_level() { failures += 1; }
     if !test_timerfd_deadline() { failures += 1; }
@@ -547,7 +598,7 @@ pub unsafe extern "C" fn wake_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
 
     // SUMMARY pass=<P> fail=<F>  (P is informational; the exit code is the
     // failure count — 0 means every wake path is clean.)
-    let total: i32 = 30 + 5;
+    let total: i32 = 30 + 6;
     let mut line = [0u8; 48];
     let mut p = 0;
     macro_rules! put { ($s:expr) => { for &b in $s { line[p] = b; p += 1; } } }

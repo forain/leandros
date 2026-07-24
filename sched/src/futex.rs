@@ -65,22 +65,14 @@ static FUTEX_TABLE: Mutex<[Option<FutexWaiter>; MAX_FUTEX_WAITERS]> =
 /// registered also never appears in `futex_wake`'s counted total, but no
 /// caller in this tree inspects that count.
 pub fn futex_wait(uaddr: usize, expected: u32, deadline: Option<u64>) -> isize {
-    if let Some(deadline) = deadline {
-        loop {
-            let current = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
-            if current != expected { return -11; } // EAGAIN — value already differs
-            if super::ticks() >= deadline { return -110; } // ETIMEDOUT
-            // Bail out on a pending signal, like every other bounded wait here
-            // (`sys_nanosleep`, `sys_epoll_wait`, …). This loop never returns to
-            // user space, so a signal raised during it is otherwise not
-            // delivered until the deadline expires. Reported as a spurious wake
-            // (0) for the same reason as the untimed path below.
-            if super::signal::has_deliverable_signal() { return 0; }
-            super::irq_window();
-            super::yield_now("futex_wait_timed");
-        }
-    }
-
+    // Timed and untimed waiters take the SAME register-and-block path. A timed
+    // waiter records its wake `deadline` in `Task::poll_deadline` so the M7a
+    // poll-deadline tick (`service_poll_deadlines` → `wake_due_poll_deadlines`)
+    // wakes it at timeout, while `FUTEX_TABLE` registration lets a cross-thread
+    // `FUTEX_WAKE` wake it too. The prior timed path yield-looped without
+    // registering, so a `FUTEX_WAKE` that didn't also change `*uaddr` was lost
+    // (Linux wakes timed and untimed waiters identically) and the waiter burned
+    // a CPU spinning — both fixed here.
     unsafe {
         let id  = cpu_id();
         let pid = current_pid();
@@ -159,7 +151,16 @@ pub fn futex_wait(uaddr: usize, expected: u32, deadline: Option<u64>) -> isize {
             if let Some(t) = rq.find_pid_mut(pid) {
                 t.state         = TaskState::Blocked;
                 t.blocked_futex = uaddr;
+                // A timed waiter records its wake deadline so the poll-deadline
+                // tick releases it at timeout even if no FUTEX_WAKE arrives.
+                t.poll_deadline = deadline.unwrap_or(u64::MAX);
             }
+        }
+
+        // Publish the deadline hint (lock-free fetch_min) so poll_deadline_tick's
+        // fast path knows a timed futex waiter is due — mirrors the poll path.
+        if let Some(dl) = deadline {
+            super::register_poll_deadline(dl);
         }
 
         // 2. Yield to scheduler.  A wake racing with this switch only makes
@@ -186,10 +187,17 @@ pub fn futex_wait(uaddr: usize, expected: u32, deadline: Option<u64>) -> isize {
             let mut rq = RUN_QUEUE.lock();
             if let Some(t) = rq.find_pid_mut(pid) {
                 t.blocked_futex = 0;
+                t.poll_deadline = u64::MAX;
             }
         }
     }
 
+    // A timed waiter whose deadline has passed reports ETIMEDOUT; otherwise it
+    // was released by FUTEX_WAKE or signal delivery (both reported as 0, since
+    // every futex caller re-checks its own condition on wake).
+    if let Some(dl) = deadline {
+        if super::ticks() >= dl { return -110; } // ETIMEDOUT
+    }
     0
 }
 
@@ -215,6 +223,7 @@ pub fn futex_wake(uaddr: usize, n: u32) -> u32 {
                 if t.state == TaskState::Blocked {
                     t.state         = TaskState::Ready;
                     t.blocked_futex = 0;
+                    t.poll_deadline = u64::MAX;
                     t.place(min_vr);
                     woken += 1;
                 }
@@ -264,6 +273,7 @@ pub fn futex_requeue(uaddr: usize, uaddr2: usize, val: u32, requeue_limit: u32) 
                 if t.state == TaskState::Blocked {
                     t.state         = TaskState::Ready;
                     t.blocked_futex = 0;
+                    t.poll_deadline = u64::MAX;
                     t.place(min_vr);
                     woken += 1;
                 }

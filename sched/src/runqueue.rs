@@ -205,16 +205,24 @@ impl RunQueue {
         let mut woken = 0;
         for slot in &mut self.tasks {
             if let Some(task) = slot {
-                if task.state == TaskState::Blocked && task.blocked_on == Some(port) {
-                    if timerfd_due || task.poll_deadline <= now {
-                        task.state         = TaskState::Ready;
-                        task.blocked_on    = None;
-                        task.poll_deadline = u64::MAX;
-                        task.place(min_vr);
-                        woken += 1;
-                    } else if task.poll_deadline < new_min {
-                        new_min = task.poll_deadline;
-                    }
+                if task.state != TaskState::Blocked { continue; }
+                let is_poll  = task.blocked_on == Some(port);
+                // Timed futex waiters (see sched::futex_wait) register a
+                // `poll_deadline` and must be released at timeout too — they are
+                // Blocked on `blocked_futex`, not the poll channel. `timerfd_due`
+                // is a poll-channel concept (an expired timerfd every poller must
+                // re-probe) and never mass-wakes futex waiters.
+                let is_futex = task.blocked_futex != 0;
+                if !is_poll && !is_futex { continue; }
+                if (timerfd_due && is_poll) || task.poll_deadline <= now {
+                    task.state         = TaskState::Ready;
+                    if is_poll  { task.blocked_on    = None; }
+                    if is_futex { task.blocked_futex = 0;    }
+                    task.poll_deadline = u64::MAX;
+                    task.place(min_vr);
+                    woken += 1;
+                } else if task.poll_deadline < new_min {
+                    new_min = task.poll_deadline;
                 }
             }
         }
