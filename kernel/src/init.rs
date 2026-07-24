@@ -8,6 +8,12 @@ use crate::serial_print_str;
 use crate::serial_print_hex;
 use mm::paging::PageFlags;
 
+/// Gate the `[CPIO]` initrd-lookup debug prints. `find_in_initrd` runs on every
+/// execve that misses the VFS/RamFS (the initrd only holds `bin/init`), so a
+/// process-spawn-heavy workload floods the serial console with per-file compare
+/// lines. Off by default; flip to `true` when debugging initrd extraction.
+const DBG_CPIO: bool = false;
+
 extern "C" {
     fn arch_alloc_page_table_root() -> usize;
 }
@@ -276,6 +282,7 @@ pub fn extract_binary_from_initrd(name: &str, boot_info: &boot::BootInfo) -> Opt
     }
 
     // Diagnostic
+    if DBG_CPIO {
     serial_print_str("[CPIO] First 16 bytes of initrd: ");
     for i in 0..16 {
         if i < initrd_slice.len() {
@@ -284,13 +291,16 @@ pub fn extract_binary_from_initrd(name: &str, boot_info: &boot::BootInfo) -> Opt
         }
     }
     serial_print_str("\n");
+    }
 
     // ── Simple CPIO (newc) parser ───────────────────────────────────────────
     let mut offset = 0;
     let target_name = name.trim_start_matches('/').trim_start_matches("./");
+    if DBG_CPIO {
     serial_print_str("[CPIO] Looking for file: ");
     serial_print_str(target_name);
     serial_print_str("\n");
+    }
 
     while offset + 110 <= initrd_slice.len() {
         // Check for valid CPIO header
@@ -326,9 +336,11 @@ pub fn extract_binary_from_initrd(name: &str, boot_info: &boot::BootInfo) -> Opt
         let current_entry_name = file_name.trim_start_matches('/').trim_start_matches("./");
         
         // Debug: Print the file name being compared
+        if DBG_CPIO {
         serial_print_str("[CPIO] Comparing with file: ");
         serial_print_str(current_entry_name);
         serial_print_str("\n");
+        }
         
         // Align to 4 bytes
         let file_start = (name_start + namesize + 3) & !3;

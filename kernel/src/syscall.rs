@@ -798,6 +798,12 @@ pub fn dispatch(
 
 
 
+/// Gate the per-mmap `[MMAP]` device-mapping debug prints. These fire on every
+/// device mmap (e.g. DRM buffer maps) and flood the serial console during
+/// GPU-heavy userspace (cosmic-comp DRM/GL init), drowning real output. Off by
+/// default; flip to `true` when bringing up a device-mmap path.
+const DBG_MMAP: bool = false;
+
 /// Log every syscall entry (number + pid) over serial. Extremely verbose —
 /// enable only while bisecting a userland bring-up failure.
 const SYSCALL_TRACE: bool = false;
@@ -1468,9 +1474,11 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     let mut phys_addr: usize = 0;
     
     if let Some(vfs::VnodeKind::DynamicDevice { port, dev_id }) = kind {
+        if DBG_MMAP {
         crate::serial_print_str("[MMAP] DynamicDevice fd, off=");
         crate::serial_print_hex(off);
         crate::serial_print_str("\n");
+        }
         // This is a dynamic device, call its ioctl to get the physical address
         let mut proxy_msg = Message::empty();
         proxy_msg.tag = vfs::VFS_IOCTL as u64;
@@ -1482,13 +1490,15 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
         let reply = vfs::call_port(port, proxy_msg);
         if reply.tag == 0 {
             let res = u64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8])) as usize;
+            if DBG_MMAP {
             crate::serial_print_str("[MMAP] device ioctl returned phys=");
             crate::serial_print_hex(res);
             crate::serial_print_str("\n");
+            }
             if res != 0 {
                 phys_addr = res;
             }
-        } else {
+        } else if DBG_MMAP {
             crate::serial_print_str("[MMAP] device ioctl reply tag non-zero\n");
         }
     }
@@ -1503,11 +1513,13 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
             Some(true)  => virt as isize,
             _           => -12, // ENOMEM
         };
+        if DBG_MMAP {
         crate::serial_print_str("[MMAP] map_device virt=");
         crate::serial_print_hex(virt);
         crate::serial_print_str(" result=");
         crate::serial_print_hex(ret as usize);
         crate::serial_print_str("\n");
+        }
         return ret;
     }
 
