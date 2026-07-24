@@ -1100,7 +1100,8 @@ fn dispatch_inner(
         SOCKET      => sys_socket(a0, a1, a2),
         BIND        => sys_bind(a0, a1, a2),
         LISTEN      => sys_listen(a0, a1),
-        ACCEPT | ACCEPT4 => sys_accept(a0, a1, a2),
+        ACCEPT      => sys_accept(a0, a1, a2, 0),
+        ACCEPT4     => sys_accept(a0, a1, a2, a3),
         CONNECT     => sys_connect(a0, a1, a2),
         SENDTO      => sys_sendto(a0, a1, a2, a3, a4, a5),
         RECVFROM    => sys_recvfrom(a0, a1, a2, a3, a4, a5),
@@ -5837,10 +5838,10 @@ fn sys_listen(sockfd: usize, backlog: usize) -> isize {
     net_reply_val(&net_server::handle(&msg, pid))
 }
 
-fn sys_accept(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
+fn sys_accept(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize, flags: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_ACCEPT,
-        &[sockfd as u64, addr_ptr as u64, addrlen_ptr as u64]);
+        &[sockfd as u64, addr_ptr as u64, addrlen_ptr as u64, flags as u64]);
     let r = net_reply_val(&net_server::handle(&msg, pid));
     if r >= 0 { uxtrace("ACC", pid, sockfd, r); }
     r

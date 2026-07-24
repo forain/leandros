@@ -683,7 +683,8 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                        arg(msg,1) as usize, arg(msg,2) as usize),
         NET_LISTEN      => handle_listen(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         NET_ACCEPT      => handle_accept(caller_pid, arg(msg,0) as usize,
-                                         arg(msg,1) as usize, arg(msg,2) as usize),
+                                         arg(msg,1) as usize, arg(msg,2) as usize,
+                                         arg(msg,3) as usize),
         NET_CONNECT     => handle_connect(caller_pid, arg(msg,0) as usize,
                                           arg(msg,1) as usize, arg(msg,2) as usize),
         NET_SEND        => handle_send(caller_pid, arg(msg,0) as usize,
@@ -875,7 +876,16 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
     }
 }
 
-fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Message {
+fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags: usize) -> Message {
+    // accept4() flags: SOCK_NONBLOCK / SOCK_CLOEXEC apply to the *accepted*
+    // socket, not the listener. Dropping them (the old ACCEPT|ACCEPT4 alias
+    // that forwarded no a3) left every accepted fd blocking — a recv on an
+    // empty ring then hangs forever instead of returning EAGAIN, which is the
+    // W1 tokio/zbus wedge.
+    const SOCK_CLOEXEC:  usize = 0x80000;
+    const SOCK_NONBLOCK: usize = 0x800;
+    let acc_cloexec  = flags & SOCK_CLOEXEC  != 0;
+    let acc_nonblock = flags & SOCK_NONBLOCK != 0;
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
 
     let (state, bound_port, sock_type) = {
@@ -917,8 +927,8 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Me
                     bound_port: 0,
                     domain: AF_INET as u8,
                     sock_type: SOCK_STREAM as u8,
-                    cloexec: false,
-                    nonblock: false,
+                    cloexec: acc_cloexec,
+                    nonblock: acc_nonblock,
                 };
 
                 if addr_ptr != 0 && addrlen_ptr != 0 {
@@ -985,8 +995,8 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Me
                         bound_port: 0,
                         domain:     AF_UNIX as u8,
                         sock_type,
-                        cloexec:    false,
-                        nonblock:   false,
+                        cloexec:    acc_cloexec,
+                        nonblock:   acc_nonblock,
                     };
 
                     for t in tbls.iter_mut() {
