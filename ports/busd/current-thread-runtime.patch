@@ -1,0 +1,19 @@
+--- a/src/bin/busd.rs
++++ b/src/bin/busd.rs
+@@ -47,7 +47,17 @@
+     system: bool,
+ }
+ 
+-#[tokio::main]
++// LeandrOS/W1 (M6h): force a single-threaded (current_thread) runtime.
++// busd's default multi-threaded runtime relies on tokio waking a freshly-
++// spawned task on a *parked* worker thread via an inter-worker unpark. Under
++// LeandrOS/TCG that wakeup is lost, so the per-peer socket_reader task spawned
++// immediately after a client's (coalesced) auth handshake is never polled: the
++// Hello buffered in Authenticated.already_received_bytes is never parsed and
++// the client (cosmic-comp) deadlocks awaiting its unique-name reply. A single-
++// threaded broker has no inter-worker boundary (the reference dbus-daemon is
++// single-threaded too), so the run queue is drained at every await point and
++// the buffered Hello is processed on the socket_reader's first poll.
++#[tokio::main(flavor = "current_thread")]
+ async fn main() -> Result<()> {
