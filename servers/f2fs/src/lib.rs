@@ -686,6 +686,11 @@ fn alloc_node_block(ms: &mut MountState) -> Option<u32> {
 
 fn flush_checkpoint(ms: &mut MountState) {
     ms.cache.flush_all(ms.dev);
+    // Barrier: every data/metadata block flushed above must be on the medium
+    // before the checkpoint block (the commit record) is written. Without this,
+    // a crash inside this function could make the CP durable ahead of the blocks
+    // it commits, yielding a checkpoint that points at not-yet-written data.
+    virtio_blk::flush(ms.dev);
 
     let bps = ms.sb.blocks_per_seg;
     // CP area: two packs of (seg_cnt_ckpt/2 * blocks_per_seg) blocks each
@@ -1897,6 +1902,11 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         if !dir_add_entry(ms, parent_ino, name, new_ino, DT_REG) {
             return err_reply(-28);
         }
+        // Namespace mutation complete (inode + dentry). Checkpoint synchronously
+        // so a hard kill can never expose a torn/half-written new file (the
+        // ?-type crash-consistency gap); the open-file slot set up below is
+        // in-RAM only and needs no persistence.
+        flush_checkpoint(ms);
         new_ino
     } else {
         // O_CREAT|O_EXCL means "fail if it already exists" — the atomic
@@ -2204,6 +2214,12 @@ fn handle_mkdir(ms: &mut MountState, path_ptr: u64, mode: u64,
     // Add "." and ".." entries to the new directory
     dir_add_entry(ms, new_ino, b".", new_ino, DT_DIR);
     dir_add_entry(ms, new_ino, b"..", parent_ino, DT_DIR);
+    // Checkpoint synchronously at the completed operation so a hard kill (the
+    // QEMU/driver workflow never runs a clean unmount) can never expose a torn
+    // directory — the ?--------- crash-consistency gap. The single-threaded
+    // server's in-RAM state is consistent between requests, so a checkpoint here
+    // writes the child inode, both dentry blocks, NAT and next_free_nid together.
+    flush_checkpoint(ms);
     ok_reply()
 }
 
@@ -2257,7 +2273,9 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
         free_inode_data_and_nodes(ms, ino);
         free_block(ms, iblkaddr);
     }
-    maybe_flush(ms);
+    // Synchronous checkpoint at op end — see handle_mkdir. Keeps a hard kill from
+    // tearing the dentry-removal / link-count / reclaim across a stale checkpoint.
+    flush_checkpoint(ms);
     ok_reply()
 }
 
@@ -2322,7 +2340,8 @@ fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64,
     if !dir_add_entry(ms, parent_ino, name, new_ino, DT_LNK) {
         return err_reply(-28);
     }
-    maybe_flush(ms);
+    // Synchronous checkpoint at op end — see handle_mkdir.
+    flush_checkpoint(ms);
     ok_reply()
 }
 
@@ -2422,7 +2441,8 @@ fn handle_link(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
     let iblk = ms.cache.get_mut(ms.dev, addr as u64);
     w32(iblk, INO_LINKS, links + 1);
     nat_update(ms, src_ino, addr);
-    maybe_flush(ms);
+    // Synchronous checkpoint at op end — see handle_mkdir.
+    flush_checkpoint(ms);
     ok_reply()
 }
 
@@ -2635,7 +2655,8 @@ fn handle_rmdir(ms: &mut MountState, path_ptr: u64) -> Message {
         free_inode_data_and_nodes(ms, ino);
         free_block(ms, iblkaddr);
     }
-    maybe_flush(ms);
+    // Synchronous checkpoint at op end — see handle_mkdir.
+    flush_checkpoint(ms);
     ok_reply()
 }
 
@@ -2683,7 +2704,10 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
         dir_remove_entry(ms, ino, b"..");
         dir_add_entry(ms, ino, b"..", new_parent_ino, DT_DIR);
     }
-    maybe_flush(ms);
+    // Synchronous checkpoint at op end — see handle_mkdir. Rename touches two
+    // parent dentry blocks (+ the moved dir's ".."), the exact multi-block tear
+    // the ?-type gap comes from.
+    flush_checkpoint(ms);
     ok_reply()
 }
 
