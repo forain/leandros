@@ -505,6 +505,57 @@ unsafe fn test_timerfd_periodic() -> bool {
     report(name, fired == 4 && el > 700 && el < 3000, el)
 }
 
+// ── 7. SAME-THREAD self-wake RE-ARM (the busd/mio reactor shape) ────────────
+// Every test above is CROSS-thread with a FRESH eventfd written ONCE. busd's
+// tokio runtime is single-threaded: its mio reactor writes its OWN waker
+// eventfd (registered EPOLLET) then the SAME thread parks in epoll_wait, and
+// that waker eventfd is RE-USED (written, reported, drained, written again...).
+// The untested gap is the EPOLLET re-arm edge after a drain, same thread,
+// issued BEFORE the park. On Linux each write after a drain is a fresh 0->1
+// edge that fires; if LeandrOS loses the 2nd..Nth edge, a single-threaded
+// reactor that self-notifies then parks is never woken — the W1 freeze shape.
+//
+// Method: do N rounds of {write efd (same thread); epoll_wait(WINDOW); drain}.
+// Round 1 is the initial ADD edge (known-good, M7a). Rounds 2..N are the RE-ARM
+// edges. Every round must return promptly; a lost re-arm edge sleeps to WINDOW.
+// No second thread and no stimulus delay: the edge is present BEFORE the wait,
+// so a prompt return is ~0ms and a lost edge is ~WINDOW — unambiguous.
+
+const REARM_ROUNDS: usize = 8;
+
+unsafe fn test_self_eventfd_rearm(name: &[u8], et: bool) -> bool {
+    let efd = syscall(nr::EVENTFD2, 0i64, 0i64) as c_int;
+    if efd < 0 { return report(name, false, 0); }
+    let ep = epoll_create1(0);
+    let flags = if et { EPOLLIN | EPOLLET } else { EPOLLIN };
+    let mut ev = epoll_event { events: flags, data: epoll_data { fd: efd } };
+    if epoll_ctl(ep, EPOLL_CTL_ADD, efd, &mut ev) != 0 { return report(name, false, 0); }
+
+    let mut worst: i64 = 0;
+    let mut lost = 0usize;
+    let mut first_lost_round: i64 = -1;
+    let mut out: [epoll_event; 4] = core::mem::zeroed();
+    for r in 0..REARM_ROUNDS {
+        // Same-thread write BEFORE the park (the reactor self-notify).
+        let one: u64 = 1;
+        write(efd, &one as *const u64 as *const u8, 8);
+        let t0 = now_ms();
+        let n = epoll_wait(ep, out.as_mut_ptr(), 4, WINDOW_MS);
+        let el = now_ms() - t0;
+        if el > worst { worst = el; }
+        if !(n >= 1 && el < PROMPT_MS) {
+            lost += 1;
+            if first_lost_round < 0 { first_lost_round = r as i64; }
+        }
+        // Drain to 0 so the next write is a genuine 0->1 re-arm edge.
+        let mut v: u64 = 0;
+        read(efd, &mut v as *mut u64 as *mut u8, 8);
+    }
+    close(efd); close(ep);
+    // Report worst elapsed; annotate first lost round in the n= field.
+    report_x(name, lost == 0, worst, first_lost_round as i32, lost as i64)
+}
+
 // ── stress discriminator: N cross-thread eventfd wakes, sleep vs busy writer ─
 // Small window so a stranded wake is cheap. Returns fails (woke only at window).
 const S_WINDOW_MS: c_int = 1500;
@@ -595,10 +646,13 @@ pub unsafe extern "C" fn wake_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     if !test_xthread_unix_level() { failures += 1; }
     if !test_timerfd_deadline() { failures += 1; }
     if !test_timerfd_periodic() { failures += 1; }
+    // Same-thread self-wake re-arm (busd/mio reactor shape). ET is what mio uses.
+    if !test_self_eventfd_rearm(b"self_eventfd_et_rearm", true) { failures += 1; }
+    if !test_self_eventfd_rearm(b"self_eventfd_level_rearm", false) { failures += 1; }
 
     // SUMMARY pass=<P> fail=<F>  (P is informational; the exit code is the
     // failure count — 0 means every wake path is clean.)
-    let total: i32 = 30 + 6;
+    let total: i32 = 30 + 8;
     let mut line = [0u8; 48];
     let mut p = 0;
     macro_rules! put { ($s:expr) => { for &b in $s { line[p] = b; p += 1; } } }
