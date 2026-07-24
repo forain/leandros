@@ -4,13 +4,49 @@
 `build.sh` builds it static-musl for both arches (see that file for the
 static-PIE landmine and the mandatory `-C relocation-model=static`).
 
-## Status: W1 is a KERNEL async-runtime defect, NOT a busd userspace bug
+## Status (M7e, 2026-07-24): W1 is a USERSPACE tokio-runtime WEDGE — kernel EXONERATED
 
-The "cosmic-comp deadlocks talking to busd" wall (W1) was believed (M6g) to be a
-busd/zbus userspace async bug to be patched here. **M6h disproved that.** The
-busd-level fix in `current-thread-runtime.patch` (and three further attempts) do
-**not** fix W1. Root cause and evidence below; the actual fix belongs in the
-kernel poll/wake path and is tracked as an M7 item.
+**Corrected verdict.** M6h's "W1 is a kernel poll/wake defect" framing is now
+DISPROVEN, and so is M7c's "zbus internal-executor / async_executor" theory
+(with the `tokio` feature, zbus's `async_executor` is `#[cfg(not(feature =
+"tokio"))]` — not compiled; `Executor` is a zero-sized `PhantomData`,
+`Executor::spawn` → `tokio::task::spawn`, and the `internal_executor` thread's
+`while !is_empty` loop body never runs because `is_empty()` ≡ `true`). busd is a
+**single `current_thread` tokio runtime**; the per-peer `socket_reader` is a
+plain `tokio::spawn` from the accept-loop task.
+
+The kernel wake machinery is now comprehensively proven sound (wakepolltest
+38/0, including the new **same-thread EPOLLET/level eventfd re-arm** coverage —
+the exact busd/mio reactor primitive, previously untested; plus cross-thread
+eventfd/pipe/AF_UNIX, timed-futex cross-thread `FUTEX_WAKE`, timerfd
+deadline/periodic). M7a (0a1a9b7 poll-deadline) and M7b (db0cfdb timed-futex)
+closed the only real kernel lost-wake classes.
+
+What W1 actually is (M7e, empirically): the moment busd finishes comp's handshake
+and spawns comp's `socket_reader` (`busd::peer: created`), busd's **entire tokio
+runtime freezes** — while the rest of the system (the shell) stays responsive.
+Proven across FOUR configs, all identical freeze at `peer: created`:
+`current_thread`; `current_thread` + a 100 ms in-runtime `tokio::time::interval`
+keepalive (the interval fires in perfect cadence until the connect, then stops);
+`current_thread` + a foreign-thread `handle.spawn` pacemaker (a *cross-thread*
+unpark — the wake class wakepolltest proves reliable — which also stops firing at
+the connect); and **stock `multi_thread`**. Because a cross-thread unpark (kernel-
+proven) does NOT rescue it, the runtime is **not in a recoverable park** — it is
+wedged (busy-loop or self-deadlock) in the tokio/zbus scheduling path. No
+"wake it up" workaround can land W1.
+
+### Next step (escalated): userspace, needs a Linux (Alpine) diff env
+
+The fix is a vendored tokio/zbus/busd patch, not a kernel change. Decisive next
+move: run **this exact busd 0.5.0 + zbus 5.13.1 + cosmic-comp** on Alpine
+(x86_64/aarch64 docker) to determine whether the wedge is LeandrOS-specific or a
+busd/zbus version bug that also hangs on Linux; and build the minimal
+`current_thread` repro (accept-loop root future → multi-round handshake on the
+peer fd → `tokio::spawn` a reader over a socket with **pre-buffered coalesced
+data** → re-park) traced with the M7b kernel ring-tracer to establish
+parked-vs-deadlocked and local-vs-inject at the wedge. The `current_thread`
+patch below is retained (it is the current shipped flavor) but is neither
+necessary nor sufficient; multi_thread fails identically.
 
 ## What actually happens (byte/marker-exact, M6h)
 
@@ -41,22 +77,30 @@ LeandrOS/QEMU.
   spawn) — still stalls.
 - `tokio::task::yield_now()` after the peer is added — **never returns** (the
   runtime never resumes the yielded task).
-- A 50 ms `tokio::time::interval` keepalive — **busy-spins**: the tokio *time
-  driver* also misbehaves (durations not honored), starving the accept loop.
+- A 50 ms `tokio::time::interval` keepalive — busy-spun at the time (the tokio
+  *time driver* misbehaved). **M7e update: no longer true** — after the M7a
+  poll-deadline (0a1a9b7) and M7b timed-futex (db0cfdb) kernel fixes, a 100 ms
+  interval fires in perfect cadence (verified). It still does not fix W1: the
+  interval keeps ticking cleanly *until* comp connects, then stops together with
+  the whole runtime at `busd::peer: created` (the runtime freezes, not just the
+  reader).
 
-Both the default multi-thread runtime and current_thread fail identically, so
-this is not a runtime-flavor issue. It is the same class as the M4 "client
-roundtrip stalls under TCG" and the kernel's `POLL_SAFETY_WAKE=false` note
-(a pure lost wake hangs).
+**M7e correction to items 2-3 above:** the reactor is NOT merely "parked in
+epoll_wait(INFINITE) with a lost wake." It is WEDGED — a foreign-thread
+cross-thread unpark (kernel-proven reliable) does not rescue it either — so it is
+a busy-loop / self-deadlock, not a recoverable park. And it is not runtime-flavor
+specific: stock `multi_thread` freezes identically at `peer: created`.
 
-## M7 next step (the real fix)
+## M7e next step (escalated — userspace, needs a Linux diff env)
 
-Fix the kernel so that a wake posted against a task blocked in
-`epoll_wait(infinite)` (tokio's reactor waker-eventfd, `sched::wake_poll`) — or a
-freshly-scheduled task — reliably interrupts the park. Then rebuild busd with
-`build.sh` (the current_thread patch is a reasonable belt-and-suspenders but is
-neither necessary nor sufficient on its own) and re-run the W1 validation
-(cosmic-comp → busd → Hello replied → comp reaches serving with the bus).
+The kernel is exonerated (wakepolltest 38/0 incl. the same-thread eventfd re-arm
+primitive; see the Status section). The remaining fix is a vendored
+tokio/zbus/busd patch. Decisive next moves: (1) run this exact busd 0.5.0 + zbus
+5.13.1 + cosmic-comp on **Alpine** to test LeandrOS-specific vs. a busd/zbus
+version bug that hangs on Linux too; (2) build the minimal `current_thread` repro
+(accept-loop root → multi-round handshake on the peer fd → `tokio::spawn` a reader
+over a socket with pre-buffered coalesced data → re-park), trace it with the M7b
+kernel ring-tracer to pin parked-vs-deadlocked and local-vs-inject at the wedge.
 
 ## Build
 
