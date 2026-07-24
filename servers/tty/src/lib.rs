@@ -406,6 +406,10 @@ fn fd_to_slot(fd: usize) -> Option<usize> {
 // ── Public dispatch ───────────────────────────────────────────────────────────
 
 pub fn handle(msg: &Message, caller_pid: u32) -> Message {
+    // Timer/tty tables are per-process (keyed by TGID); any syscall can arrive on
+    // a non-leader thread, so canonicalize at this single IPC choke point (mirrors
+    // vfs::handle / net_server::handle).
+    let caller_pid = sched::tgid_of(caller_pid);
     match msg.tag {
         TTY_OPEN    => handle_open(caller_pid, arg(msg,0) as usize),
         TTY_READ    => handle_read(caller_pid, arg(msg,0) as usize,
@@ -443,6 +447,9 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
 
 /// Check and fire expired POSIX timers for `pid`.  Called on syscall return.
 pub fn check_timers(pid: u32) {
+    let pid = sched::tgid_of(pid); // TIMER_TABLES is per-process; called on every
+    // syscall return under the running thread's raw tid — a worker-thread-armed
+    // timer would otherwise be checked by nobody.
     let now = sched::ticks();
     let mut tbls = TIMER_TABLES.lock();
     let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
@@ -475,6 +482,7 @@ pub fn check_timers(pid: u32) {
 /// of `MAX_TIMERS`) on every call, since it always allocates the first free
 /// slot rather than reusing slot 0.
 pub fn ensure_real_timer(pid: u32, signo: u32) {
+    let pid = sched::tgid_of(pid); // per-process timer table
     let mut tbls = TIMER_TABLES.lock();
     let tbl = match get_or_create_timer_table(pid, &mut *tbls) {
         Some(t) => t, None => return,
@@ -873,6 +881,7 @@ fn get_timer_ticks(pid: u32, timerid: usize) -> Option<(u64, u64)> {
 /// reserved slot-0 timer and returns its previous `(interval_ticks,
 /// remaining_ticks)`, creating the slot on first use.
 pub fn set_real_itimer(pid: u32, interval_ticks: u64, value_ticks: u64) -> (u64, u64) {
+    let pid = sched::tgid_of(pid); // per-process timer table
     ensure_real_timer(pid, 14 /* SIGALRM */);
     set_timer_ticks(pid, 0, interval_ticks, value_ticks).unwrap_or((0, 0))
 }
@@ -880,6 +889,7 @@ pub fn set_real_itimer(pid: u32, interval_ticks: u64, value_ticks: u64) -> (u64,
 /// Direct (non-IPC) API for `getitimer(ITIMER_REAL, ...)` / `alarm()`'s
 /// "previous value" query.
 pub fn get_real_itimer(pid: u32) -> (u64, u64) {
+    let pid = sched::tgid_of(pid); // per-process timer table
     get_timer_ticks(pid, 0).unwrap_or((0, 0))
 }
 

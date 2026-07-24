@@ -2770,7 +2770,11 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let mut header_data: Option<alloc::vec::Vec<u8>> = None;
 
     if let Some((fd, hdr)) = open_exec_header(path, pid) {
-        match vfs::steal_mounted_file(pid, fd) {
+        // fd tables are per-process (TGID): execve from a non-leader thread must
+        // resolve the fd in the process table, matching the cloexec sweep's
+        // sched::tgid_of below (else steal returns None → demand-paging fast path
+        // is silently skipped).
+        match vfs::steal_mounted_file(sched::tgid_of(pid), fd) {
             Some((port, file_id)) => match exec_file_register(port, file_id) {
                 Some(cap) => {
                     exec_cap = cap;
@@ -4572,6 +4576,10 @@ fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
         }
         return match cmd {
             F_GETFL => {
+                // STDIO_FLAGS is per-process (TGID); F_SETFL's set_stdio_flags
+                // canonicalizes but this sibling reader must match it, or a
+                // non-leader thread's query reads flags=0 (looks blocking).
+                let pid = sched::tgid_of(pid);
                 let flags = STDIO_FLAGS.lock().iter()
                     .find(|s| s.in_use && s.pid == pid)
                     .map(|s| s.flags).unwrap_or(0);
