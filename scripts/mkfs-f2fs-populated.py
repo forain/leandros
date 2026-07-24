@@ -501,6 +501,96 @@ def main():
                 if os.path.isfile(hp):
                     m4_share_files.append((image_dir, fn, hp))
 
+    # ── M6 full COSMIC session ship set ───────────────────────────────────────
+    # The desktop session (cosmic-session + its fatal-at-spawn set and tolerant
+    # applets) on top of the M5 compositor/bus/font base. launch-pad spawns every
+    # child by BARE NAME via PATH, so all session binaries install into /bin
+    # (which is on the launcher's PATH) under the EXACT name cosmic-session execs
+    # them by — note cosmic-session spawns "cosmic-app-library" but the built
+    # binary file is named cosmic-applibrary (main.rs:330).
+    #
+    # cosmic-settings-daemon is one of the four fatal-at-spawn children (a missing
+    # binary panics the whole session); it links libpipewire-0.3.so.0, satisfied
+    # by the inert stub staged into /usr/lib. All eight libcosmic binaries reuse
+    # the M3 GL + M4 input closures already packed (Wayland/EGL are dlopen'd, not
+    # DT_NEEDED); only libudev (cosmic-settings) and the pipewire stub are new,
+    # both already present. No source patches — feature flags only (see manifest).
+    m6_out = os.path.expanduser("~/code/leandros-artifacts/m6-session-bins/out")
+    pw_out = os.path.expanduser("~/code/leandros-artifacts/pipewire-gap/out")
+    m6_session_bins = [
+        ("cosmic-session",         f"{m6_out}/cosmic-session-{arch}"),
+        ("cosmic-panel",           f"{m6_out}/cosmic-panel-{arch}"),
+        ("cosmic-notifications",   f"{m6_out}/cosmic-notifications-{arch}"),
+        ("cosmic-bg",              f"{m6_out}/cosmic-bg-{arch}"),
+        ("cosmic-osd",             f"{m6_out}/cosmic-osd-{arch}"),
+        ("cosmic-launcher",        f"{m6_out}/cosmic-launcher-{arch}"),
+        ("cosmic-app-library",     f"{m6_out}/cosmic-applibrary-{arch}"),  # spawn name != file name
+        ("cosmic-settings",        f"{m6_out}/cosmic-settings-{arch}"),
+        ("cosmic-settings-daemon", f"{pw_out}/cosmic-settings-daemon-{arch}"),
+    ]
+    for name, src in m6_session_bins:
+        if os.path.exists(src):
+            bin_files.append((name, src, 0o100755))
+
+    # The session launcher itself (a POSIX-sh script). The kernel execve()s ELF
+    # only (no "#!"-shebang binfmt), so it is run as `sh /bin/start-cosmic-leandros`.
+    m6_launcher = os.path.expanduser(
+        "~/code/leandros-artifacts/m6-session-data/start-cosmic-leandros")
+    if os.path.exists(m6_launcher):
+        bin_files.append(("start-cosmic-leandros", m6_launcher, 0o100755))
+
+    # /bin/sh -> brush (hardlinked; add_files_to_dir dedupes by host path). The
+    # kernel has no shebang binfmt, so shell scripts (start-cosmic-leandros,
+    # dbus-run-session) are executed as `sh <script>`; the proposed
+    # dbus-run-session also uses `sh -c ...`. brush, invoked as sh, interprets the
+    # script argument directly — no shebang or ENOEXEC-fallback dependency.
+    _brush_p = f"../brush/target/{brush_target}/release/brush"
+    if os.path.exists(_brush_p):
+        bin_files.append(("sh", _brush_p, 0o100755))
+
+    # libpipewire-0.3 stub (inert) -> /usr/lib, resolved by soname for the
+    # settings-daemon's DT_NEEDED. Same soname trick as the GL/input libs.
+    m6_pw_lib = os.path.expanduser(f"~/code/leandros-artifacts/pipewire-gap/lib/{arch}")
+    for so in ("libpipewire-0.3.so.0",):
+        sp = f"{m6_pw_lib}/{so}"
+        if os.path.exists(sp):
+            usr_lib_files.append((so, sp, 0o100755))
+
+    # Cosmic icon theme -> /usr/share/icons/Cosmic/… (pruned set) and the default
+    # wallpaper -> the exact hardcoded fallback path cosmic-bg expects
+    # (/usr/share/backgrounds/cosmic/orion_nebula_nasa_heic0601a.jpg). Both are
+    # soft-fail data (blank icons / black background if absent, never a crash);
+    # they ride the shared /usr/share tree walk (m4_share_files/m4_share_dirs).
+    m6_icons_src = os.path.expanduser("~/code/leandros-artifacts/m6-icons-pruned/share")
+    if os.path.isdir(m6_icons_src):
+        for dirpath, _dn, filenames in os.walk(m6_icons_src):
+            rel = os.path.relpath(dirpath, m6_icons_src)   # e.g. "icons/Cosmic/scalable"
+            sub = "" if rel == "." else "/" + rel
+            image_dir = "/usr/share" + sub
+            parts = ("usr/share" + sub).split("/")
+            for i in range(2, len(parts) + 1):
+                m4_share_dirs.add("/" + "/".join(parts[:i]))
+            for fn in sorted(filenames):
+                hp = os.path.join(dirpath, fn)
+                if os.path.isfile(hp):
+                    m4_share_files.append((image_dir, fn, hp))
+    m6_shared_src = os.path.expanduser("~/code/leandros-artifacts/m6-session-data/shared")
+    if os.path.isdir(m6_shared_src):
+        for dirpath, _dn, filenames in os.walk(m6_shared_src):
+            rel = os.path.relpath(dirpath, m6_shared_src)  # e.g. "usr/share/backgrounds/cosmic"
+            if rel == ".":
+                continue
+            parts = rel.split("/")
+            for i in range(2, len(parts) + 1):
+                m4_share_dirs.add("/" + "/".join(parts[:i]))
+            image_dir = "/" + rel
+            for fn in sorted(filenames):
+                if fn.endswith(".orig"):          # keep the placeholder off-image
+                    continue
+                hp = os.path.join(dirpath, fn)
+                if os.path.isfile(hp):
+                    m4_share_files.append((image_dir, fn, hp))
+
     # 2. Dynamically calculate required blocks and image size
     # Each meta segment takes 512 blocks. We have 8 meta segments (4096 blocks).
     # Plus safety margin and blocks for directories.
@@ -567,6 +657,16 @@ def main():
         15: ("/usr"),
         16: ("/usr/lib"),
         17: ("/usr/lib/gbm"),
+        # XDG runtime dir for the COSMIC session — the wayland-N socket (bound by
+        # cosmic-comp) and the D-Bus session socket (bound by busd) both live in
+        # /run/user/0. Pre-created because runtime `mkdir -p /run/user/0` on this
+        # f2fs returns 0 without actually creating the deepest level when multiple
+        # nested levels are new in one call (a second mkdir completes it) — so the
+        # session must not depend on creating it at boot. /run/user/0 is 0700 root
+        # per the XDG spec (libwayland warns otherwise).
+        18: ("/run"),
+        19: ("/run/user"),
+        20: ("/run/user/0"),
     }
 
     # Per-directory mode/owner overrides; anything not listed here defaults
@@ -575,6 +675,7 @@ def main():
     dir_owner = {
         12: (0o040700, 0, 0),        # /root
         14: (0o040700, 1000, 1000),  # /home/leandro
+        20: (0o040700, 0, 0),        # /run/user/0 (XDG runtime dir, 0700 root)
     }
 
     # Subdirectories per parent, used both to emit "name -> child_ino" dentries
@@ -583,10 +684,12 @@ def main():
     subdirs = {
         3: [("bin", 4), ("old_root", 5), ("dev", 6), ("proc", 7), ("tmp", 8),
             ("etc", 9), ("mnt", 10), ("lib", 11), ("root", 12), ("home", 13),
-            ("usr", 15)],
+            ("usr", 15), ("run", 18)],
         13: [("leandro", 14)],
         15: [("lib", 16)],
         16: [("gbm", 17)],
+        18: [("user", 19)],
+        19: [("0", 20)],
     }
 
     # ── Register the M4 /usr/share data tree as directory inodes ──────────────
