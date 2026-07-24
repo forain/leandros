@@ -399,6 +399,7 @@ mod nr {
     pub const TRUNCATE:       usize = 45;
     pub const FTRUNCATE:      usize = 46;
     pub const FACCESSAT:      usize = 48;
+    pub const FACCESSAT2:     usize = 439;
     pub const STATFS:         usize = 43;
     pub const FSTATFS:        usize = 44;
     pub const FSYNC:          usize = 82;
@@ -628,6 +629,7 @@ mod nr {
     pub const FTRUNCATE:      usize = 77;
     pub const ACCESS:         usize = 21;
     pub const FACCESSAT:      usize = 269;
+    pub const FACCESSAT2:     usize = 439;
     pub const STATFS:         usize = 137;
     pub const FSTATFS:        usize = 138;
     pub const FSYNC:          usize = 74;
@@ -1050,6 +1052,12 @@ fn dispatch_inner(
         TRUNCATE    => sys_truncate(a0, a1),
         FTRUNCATE   => sys_ftruncate(a0, a1),
         FACCESSAT   => sys_faccessat(a0, a1, a2, a3),
+        // faccessat2(dirfd, path, mode, flags) — same shape as faccessat plus a
+        // real `flags` arg (AT_EACCESS/AT_SYMLINK_NOFOLLOW). musl/rustix `access`
+        // probe faccessat2 first and only fall back to faccessat if it is NOT
+        // ENOSYS; leaving it unimplemented surfaces an ENOSYS that some callers
+        // propagate as a hard I/O error. Route it through the same handler.
+        FACCESSAT2  => sys_faccessat(a0, a1, a2, a3),
         STATFS  => sys_statfs(a0, a1),
         FSTATFS => sys_fstatfs(a0, a1),
         FSYNC | FDATASYNC | SYNCFS => sys_fsync(a0),
