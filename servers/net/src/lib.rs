@@ -1252,6 +1252,24 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             if n > 0 { sched::wake_poll(); }
             val_reply(n as u64)
         }
+        SockState::UnixPendingAccept { conn_idx, .. } => {
+            // Connector (end A); connection established at connect() time. Linux
+            // buffers writes pre-accept — an early client write (e.g. Wayland
+            // get_registry the instant after connect, before the compositor's
+            // event loop accept()s) must NOT EPIPE. Peer reads it after accept
+            // (which preserves conn_idx + ring_ab). Stream only — connect()/accept
+            // are stream, so no dgram path here.
+            drop(tbls);
+            let mut conns = UNIX_CONNS.lock();
+            let conn = &mut conns[conn_idx];
+            if !conn.in_use { return err_reply(-32); } // EPIPE — conn torn down
+            if conn.closed_b { return err_reply(-32); } // peer (post-accept) gone
+            let n = conn.ring_ab.write(buf_ptr as *const u8, len);
+            if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
+            drop(conns);
+            if n > 0 { sched::wake_poll(); }
+            val_reply(n as u64)
+        }
         SockState::InetConnected { socket_handle, remote_endpoint } => {
             drop(tbls);
             let mut stack = NET_STACK.lock();
@@ -1400,6 +1418,20 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             if n > 0 { sched::wake_poll(); }
             val_reply(n as u64)
         }
+        SockState::UnixPendingAccept { conn_idx, .. } => {
+            // Connector (end A) before the peer accept()s: reads its inbound
+            // direction (ring_ba), which stays empty until the peer accepts and
+            // replies. Empty + peer-not-closed is EAGAIN, never a spurious EOF.
+            let mut conns = UNIX_CONNS.lock();
+            let conn = &mut conns[conn_idx];
+            if !conn.in_use { return val_reply(0); }
+            let n = conn.ring_ba.read(buf_ptr as *mut u8, len);
+            if n == 0 && len > 0 && !conn.closed_b { return err_reply(-11); } // EAGAIN
+            if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
+            drop(conns);
+            if n > 0 { sched::wake_poll(); }
+            val_reply(n as u64)
+        }
         SockState::InetConnected { socket_handle, .. } => {
             let mut stack = NET_STACK.lock();
             if let Some(ref mut s) = *stack {
@@ -1500,6 +1532,12 @@ fn unix_stream_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
     if tbl.socks[slot].sock_type != SOCK_STREAM as u8 { return None; }
     match tbl.socks[slot].state {
         SockState::UnixConnected { conn_idx, is_a } => Some((conn_idx, is_a)),
+        // A connected-but-not-yet-accepted stream socket is end A (the connector).
+        // Linux: post-connect it is ESTABLISHED and writable; data written before
+        // the peer accept()s buffers into the ring and is delivered on the peer's
+        // first recv after accept (accept preserves this conn_idx + ring). Covers
+        // sendmsg/recvmsg with fds (Wayland get_registry right after connect).
+        SockState::UnixPendingAccept { conn_idx, .. } => Some((conn_idx, true)),
         _ => None,
     }
 }
@@ -2108,6 +2146,21 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             if conn.in_use && !peer_closed && write_free > 0 { ev |= POLLOUT; }
             if !conn.in_use || peer_closed { ev |= POLLHUP; }
             // Connected sockets carry the edge-seq so EPOLLET works.
+            (ev, Some(conn.seq))
+        }
+        SockState::UnixPendingAccept { conn_idx, .. } => {
+            // Connector (end A) awaiting accept: established + writable now (Linux),
+            // so a client that waits for POLLOUT before its first write proceeds.
+            // Readable once the peer accepts and replies (ring_ba) or the conn dies.
+            drop(tbls);
+            let conns = UNIX_CONNS.lock();
+            let conn = &conns[conn_idx];
+            let readable   = conn.ring_ba.count;
+            let write_free = RING_SIZE - conn.ring_ab.count;
+            let mut ev = 0;
+            if readable > 0 || !conn.in_use { ev |= POLLIN; }
+            if conn.in_use && !conn.closed_b && write_free > 0 { ev |= POLLOUT; }
+            if !conn.in_use || conn.closed_b { ev |= POLLHUP; }
             (ev, Some(conn.seq))
         }
         SockState::UnixListening { bound_idx } => {
