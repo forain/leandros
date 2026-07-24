@@ -318,6 +318,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     let mut failures = 0;
 
     if !test_fd_pass() { failures += 1; }
+    if !test_fork_child_exit_keeps_socket() { failures += 1; }
     if !test_cmsg_flags() { failures += 1; }
     if !test_shared_memfd_pixels() { failures += 1; }
     if !test_seals() { failures += 1; }
@@ -399,6 +400,49 @@ unsafe fn test_fd_pass() -> bool {
     close(b);
 
     report(name, sret == 1 && status == 0)
+}
+
+// ── 1b. fork-child-exit must NOT tear down the parent's connected socket ────
+//
+// Regression for the W1 root cause: the net server's process-teardown path
+// (handle_close_all) force-freed a connected AF_UNIX connection instead of
+// decrementing its per-end refcount, so a forked child that INHERITED a live
+// socket fd tore the connection down when it exited. cosmic-comp hit this via
+// its failed kiosk-child fork (a copy of comp's session-bus socket was closed
+// on the child's exec-error _exit), giving comp a spurious EOF and killing its
+// zbus socket reader ("Socket reader task has errored out").
+//
+// Repro: parent makes a socketpair, forks a child that inherits both ends and
+// exits without touching them, waits, then must STILL be able to send a→b. On
+// the buggy kernel the parent's write/read fails (EPIPE / spurious EOF).
+unsafe fn test_fork_child_exit_keeps_socket() -> bool {
+    let name = b"fork_child_exit_keeps_socket\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 {
+        dbg0(b"[fork_keep] socketpair failed\n\0");
+        return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+
+    let pid = fork();
+    if pid == 0 {
+        // Inherited a+b (handle_fork_dup bumped refs_a/refs_b). Exit WITHOUT
+        // closing them — process teardown (handle_close_all) must only decrement
+        // the per-end refcount, never force-free a still-parent-held connection.
+        exit(0);
+    }
+    let mut status: i32 = -1;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+
+    // Parent still holds both ends: a→b must carry data, not a spurious EOF.
+    let wrote = write(a, b"PING".as_ptr(), 4);
+    let mut rbuf = [0u8; 4];
+    let got = read(b, rbuf.as_mut_ptr(), 4);
+    dbg2(b"[fork_keep] after child exit: wrote=%d read=%d\n\0", wrote as i64, got as i64);
+    let ok = wrote == 4 && got == 4 && &rbuf == b"PING";
+    close(a);
+    close(b);
+    report(name, ok)
 }
 
 // ── 2. cmsg-flags: MSG_CTRUNC on a too-small buffer, MSG_CMSG_CLOEXEC ───────

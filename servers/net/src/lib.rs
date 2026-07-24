@@ -46,7 +46,9 @@ const POLLHUP: u64 = 0x0010;
 // ── SCM_RIGHTS / cmsg (Linux ABI, 64-bit) ─────────────────────────────────────
 const SOL_SOCKET:       i32   = 1;
 const SCM_RIGHTS:       i32   = 1;
+const SO_ERROR:         usize = 4;
 const SO_PEERCRED:      usize = 17;
+const ENOPROTOOPT:      i32   = 92;
 const MSG_CTRUNC:       i32   = 0x08;
 const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
 /// Linux SCM_MAX_FD: at most this many fds may ride one message.
@@ -1916,15 +1918,25 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         }
         return ok_reply();
     }
-    if level == 1 && optname == 4 {
+    // SO_ERROR: report "no pending error" (0). mio/tokio read this after a
+    // non-blocking connect to detect completion; keep it a success.
+    if level == SOL_SOCKET as usize && optname == SO_ERROR {
         if optval_ptr != 0 {
             unsafe { core::ptr::write(optval_ptr as *mut u32, 0); }
         }
         if optlen_ptr != 0 {
             unsafe { core::ptr::write(optlen_ptr as *mut u32, 4); }
         }
+        return ok_reply();
     }
-    ok_reply()
+    // Any other option is unsupported. Linux returns ENOPROTOOPT; returning a
+    // bogus success (with optval left unwritten) makes callers read garbage —
+    // e.g. zbus's SO_PEERPIDFD probe (connection/socket/unix.rs) treats ret==0
+    // as "kernel supports pidfd" and wraps the zero-initialised buffer as
+    // OwnedFd::from_raw_fd(0), taking ownership of fd 0 and closing it out from
+    // under the process when the credentials drop. Match Linux and fail it so
+    // zbus takes its graceful ENOPROTOOPT fallback.
+    err_reply(-ENOPROTOOPT)
 }
 
 /// The credentials of the peer of `fd` (the other end of the connection), for
@@ -2251,15 +2263,25 @@ fn handle_close_all(pid: u32) {
     if let Some(tbl) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
         // Heap-collected, not MAX_SOCKS-sized stack arrays — at 512 those would
         // be ~12 KB of stack in a process-teardown path.
-        let mut unix_to_close: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        // Connected ends carry a per-end refcount (refs_a/refs_b) because a dup
+        // or a fork copies the fd without a second connection object. Track the
+        // end (is_a) so teardown can decrement that refcount instead of force-
+        // freeing a still-referenced connection.
+        let mut unix_conn_close: alloc::vec::Vec<(usize, bool)> = alloc::vec::Vec::new();
+        // Pending-accept half-open connections are never dup'd/forked (see
+        // handle_fork_dup, which copies only UnixConnected/Unbound), so they are
+        // dropped outright, matching handle_close's PendingAccept arm.
+        let mut unix_pending_close: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
         let mut inet_to_close: alloc::vec::Vec<SocketHandle> = alloc::vec::Vec::new();
         let mut bound_to_free: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
 
         for s in tbl.socks.iter() {
             match s.state {
-                SockState::UnixConnected { conn_idx, .. }
-                | SockState::UnixPendingAccept { conn_idx, .. } => {
-                    unix_to_close.push(conn_idx);
+                SockState::UnixConnected { conn_idx, is_a } => {
+                    unix_conn_close.push((conn_idx, is_a));
+                }
+                SockState::UnixPendingAccept { conn_idx, .. } => {
+                    unix_pending_close.push(conn_idx);
                 }
                 SockState::UnixListening { bound_idx } => {
                     bound_to_free.push(bound_idx);
@@ -2276,7 +2298,29 @@ fn handle_close_all(pid: u32) {
 
         let mut conns = UNIX_CONNS.lock();
         let mut peer_hup = false;
-        for ci in unix_to_close {
+        // Connected ends: decrement the per-end refcount and only mark the end
+        // closed (peer observes EOF/EPIPE) once the LAST alias of this end is
+        // gone — identical to handle_close. Force-freeing the whole connection
+        // here (the old behaviour) tore down a still-referenced connection when
+        // a forked child that inherited the fd exited: cosmic-comp's failed
+        // kiosk-child fork copied comp's live session-bus socket, and the
+        // child's exec-error _exit force-freed the connection, so comp's next
+        // recvmsg saw a spurious EOF and its zbus socket-reader errored out.
+        for (ci, is_a) in unix_conn_close {
+            if ci < MAX_CONNS && conns[ci].in_use {
+                let c = &mut conns[ci];
+                let refs = if is_a { &mut c.refs_a } else { &mut c.refs_b };
+                *refs = refs.saturating_sub(1);
+                if *refs == 0 {
+                    if is_a { c.closed_a = true; } else { c.closed_b = true; }
+                    c.seq = c.seq.wrapping_add(1);
+                    peer_hup = true;
+                    if c.closed_a && c.closed_b { c.drain_fds(); c.in_use = false; }
+                }
+            }
+        }
+        // Pending-accept half-open connections: drop outright.
+        for ci in unix_pending_close {
             if ci < MAX_CONNS && conns[ci].in_use {
                 conns[ci].drain_fds();
                 conns[ci].in_use = false;
