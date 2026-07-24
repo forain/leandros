@@ -708,6 +708,13 @@ pub fn steal_mounted_file(pid: u32, fd: usize) -> Option<(u32, u32)> {
 
 /// Identify the kind of a vnode from a process's FD table.
 pub fn vfs_get_node_kind(pid: u32, fd: usize) -> Option<VnodeKind> {
+    let pid = sched::tgid_of(pid); // fd tables are per-process, not per-thread:
+    // a multithreaded client (cosmic-comp's render thread) may mmap/ioctl a card0
+    // fd its main thread opened, so resolve the fd in the *process* table. Without
+    // this, sys_mmap's DynamicDevice detection misses the DRM fd on a non-main
+    // thread and falls through to the file-backed path, whose lseek on the
+    // non-seekable card0 returns ESPIPE — Mesa's kms_sw scanout mmap then fails
+    // and softpipe faults on the NULL displaytarget map (the W2 crash).
     let mut tbls = FD_TABLES.lock();
     if let Some(tbl) = find_tbl(pid, &mut *tbls) {
         if fd < MAX_FDS {
