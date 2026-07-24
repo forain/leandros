@@ -199,8 +199,15 @@ const USER_SPACE_END: usize = 0x0000_8000_0000_0000;
 
 /// Default user stack top for a freshly exec'd process.
 const USER_STACK_TOP: usize = 0x0000_7fff_ffff_f000;
-/// Size of the initial user stack mapping (256 KiB).
-const USER_STACK_SIZE: usize = 64 * mm::buddy::PAGE_SIZE;
+/// Size of the initial user stack mapping (8 MiB — matches the Linux default
+/// main-thread stack `ulimit -s`). The prior 256 KiB was far too small for real
+/// Rust async runtimes (tokio + zbus): legitimate deep async call chains can
+/// exceed it, faulting exactly one frame below the stack base. The stack is
+/// mapped eagerly; 8 MiB × the handful of concurrent desktop processes is well
+/// within the 2 GiB guest. (Note: a truly *unbounded*-recursion bug still
+/// overflows any finite stack — see the cosmic-comp COSMIC_SESSION_SOCK issue —
+/// so this is a correctness/robustness raise, not a fix for that.)
+const USER_STACK_SIZE: usize = 2048 * mm::buddy::PAGE_SIZE;
 
 /// ELF `e_type` for a position-independent (dynamic/PIE) object.
 const ET_DYN: u16 = 3;
