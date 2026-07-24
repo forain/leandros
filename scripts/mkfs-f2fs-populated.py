@@ -667,6 +667,17 @@ def main():
         18: ("/run"),
         19: ("/run/user"),
         20: ("/run/user/0"),
+        # /root's XDG base dirs, pre-created for the same reason as /run/user/0:
+        # cosmic-comp/cosmic-* call create_dir_all() under $HOME (=/root) at
+        # startup, and this f2fs's runtime mkdir does not reliably materialize a
+        # freshly-created directory (the launcher's `mkdir -p` leaves broken
+        # ?-type inodes — mode --------- — which turn a later create_dir_all into
+        # an ENOTDIR panic). Shipping .config/.cache/.local as real dirs lets the
+        # session's create_dir_all of a one-level-deeper path (e.g. .config/cosmic)
+        # succeed. Root-owned 0700 to match /root.
+        21: ("/root/.config"),
+        22: ("/root/.cache"),
+        23: ("/root/.local"),
     }
 
     # Per-directory mode/owner overrides; anything not listed here defaults
@@ -676,6 +687,9 @@ def main():
         12: (0o040700, 0, 0),        # /root
         14: (0o040700, 1000, 1000),  # /home/leandro
         20: (0o040700, 0, 0),        # /run/user/0 (XDG runtime dir, 0700 root)
+        21: (0o040700, 0, 0),        # /root/.config
+        22: (0o040700, 0, 0),        # /root/.cache
+        23: (0o040700, 0, 0),        # /root/.local
     }
 
     # Subdirectories per parent, used both to emit "name -> child_ino" dentries
@@ -685,6 +699,7 @@ def main():
         3: [("bin", 4), ("old_root", 5), ("dev", 6), ("proc", 7), ("tmp", 8),
             ("etc", 9), ("mnt", 10), ("lib", 11), ("root", 12), ("home", 13),
             ("usr", 15), ("run", 18)],
+        12: [(".config", 21), (".cache", 22), (".local", 23)],
         13: [("leandro", 14)],
         15: [("lib", 16)],
         16: [("gbm", 17)],
