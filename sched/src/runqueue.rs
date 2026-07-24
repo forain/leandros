@@ -151,11 +151,19 @@ impl RunQueue {
 
     /// Block the task with `pid`, recording the port it is waiting on.
     pub fn block_on_port(&mut self, pid: Pid, port: u32) {
+        self.block_on_port_until(pid, port, u64::MAX);
+    }
+
+    /// Block the task with `pid` on `port`, recording its wake deadline
+    /// (absolute ticks; `u64::MAX` = none). Set atomically with `state`/
+    /// `blocked_on` so the poll-deadline tick sees a consistent snapshot.
+    pub fn block_on_port_until(&mut self, pid: Pid, port: u32, deadline: u64) {
         for slot in &mut self.tasks {
             if let Some(task) = slot {
                 if task.pid == pid {
-                    task.state      = TaskState::Blocked;
-                    task.blocked_on = Some(port);
+                    task.state         = TaskState::Blocked;
+                    task.blocked_on    = Some(port);
+                    task.poll_deadline = deadline;
                     return;
                 }
             }
@@ -170,14 +178,47 @@ impl RunQueue {
         for slot in &mut self.tasks {
             if let Some(task) = slot {
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked {
-                    task.state      = TaskState::Ready;
-                    task.blocked_on = None;
+                    task.state         = TaskState::Ready;
+                    task.blocked_on    = None;
+                    task.poll_deadline = u64::MAX;
                     task.place(min_vr);
                     woken += 1;
                 }
             }
         }
         woken
+    }
+
+    /// Poll-deadline tick service: wake every task on `port` whose
+    /// `poll_deadline` is due (`<= now`) or, when `timerfd_due`, all of them
+    /// (a timerfd expired — every parked poller must re-probe it). Returns
+    /// `(earliest_remaining_deadline, woken)` so the caller can republish the
+    /// exact next deadline (no single-global clobber) and kick an idle CPU.
+    /// The whole scan runs under one RUN_QUEUE hold, so a woken task can only
+    /// re-register its next deadline after this returns — the recomputed
+    /// minimum can never be stale-clobbered by a concurrent register.
+    pub fn wake_due_poll_deadlines(&mut self, port: u32, now: u64, timerfd_due: bool)
+        -> (u64, usize)
+    {
+        let min_vr = self.min_vruntime();
+        let mut new_min = u64::MAX;
+        let mut woken = 0;
+        for slot in &mut self.tasks {
+            if let Some(task) = slot {
+                if task.state == TaskState::Blocked && task.blocked_on == Some(port) {
+                    if timerfd_due || task.poll_deadline <= now {
+                        task.state         = TaskState::Ready;
+                        task.blocked_on    = None;
+                        task.poll_deadline = u64::MAX;
+                        task.place(min_vr);
+                        woken += 1;
+                    } else if task.poll_deadline < new_min {
+                        new_min = task.poll_deadline;
+                    }
+                }
+            }
+        }
+        (new_min, woken)
     }
 
     /// Mark a task as Zombie (terminal; will not be scheduled again).

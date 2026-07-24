@@ -642,8 +642,7 @@ pub fn net_daemon() -> ! {
         // 100 % from boot — the dominant component of the "compositor is
         // compute-bound" misread. 100 Hz smoltcp polling is ample here, and an
         // earlier wake (any wake_poll from socket traffic) re-polls immediately.
-        sched::block_on_poll_prepare();
-        sched::register_poll_deadline(sched::ticks() + 1);
+        sched::block_on_poll_prepare_until(sched::ticks() + 1);
         sched::block_on_poll_commit();
     }
 }

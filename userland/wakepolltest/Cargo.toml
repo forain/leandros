@@ -1,0 +1,15 @@
+[package]
+name = "wakepolltest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "wakepolltest"
+path = "src/main.rs"
+
+[dependencies]
+# Links directly against librelibc.a (same as epolltest/pthreadtest): exercises
+# the real epoll_*/eventfd2/timerfd/socketpair/pthread Pal calls. This test
+# covers the WAKE path (an edge arriving while a task is parked in a blocking
+# epoll_wait) which epolltest does not — epolltest always writes BEFORE
+# epoll_wait, hitting only the probe. See the W1 kernel poll/wake hole (M7).

@@ -131,6 +131,14 @@ pub struct Task {
     pub kernel_stack: usize,
     /// IPC port this task is sleeping on (Some when state == Blocked on IPC).
     pub blocked_on:   Option<u32>,
+    /// Absolute tick at which a timed poll/select/epoll_wait/nanosleep waiter
+    /// (blocked_on == POLL_WAIT_CHANNEL) must be woken; `u64::MAX` = no deadline
+    /// (an infinite/edge-only waiter). Set atomically with `state`/`blocked_on`
+    /// when the task parks and cleared on wake, so the 100 Hz poll-deadline tick
+    /// can find the true earliest deadline by scanning the run queue — a
+    /// per-task deadline, not a single global that a concurrent register/reset
+    /// could clobber (M7 lost-wake).
+    pub poll_deadline: u64,
     /// Futex user-space address this task is waiting on (0 = none).
     pub blocked_futex: usize,
     /// Per-process virtual address space (None for kernel tasks).
@@ -294,6 +302,7 @@ impl Task {
             page_table,
             kernel_stack: stack_base,
             blocked_on: None,
+            poll_deadline: u64::MAX,
             blocked_futex: 0,
             address_space: None,
             exit_code: 0,
@@ -640,6 +649,7 @@ impl Task {
 
             kernel_stack: kernel_stack_phys,
             blocked_on: None,
+            poll_deadline: u64::MAX,
             blocked_futex: 0,
             address_space: None,
             exit_code: 0,

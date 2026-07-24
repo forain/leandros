@@ -785,8 +785,9 @@ pub fn block_on_port_prepare(port: u32) {
 pub fn block_on_port_cancel() {
     let pid = current_pid();
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        t.state      = TaskState::Running;
-        t.blocked_on = None;
+        t.state         = TaskState::Running;
+        t.blocked_on    = None;
+        t.poll_deadline = u64::MAX;
     }
 }
 
@@ -806,8 +807,25 @@ pub fn block_on_port_commit() {
 // genuine IPC never touches pollers and `wake_poll` never touches IPC waiters.
 pub const POLL_WAIT_CHANNEL: u32 = 0xFFFF_FF01;
 
-/// Phase 1: publish Blocked-on-poll intent while still executing.
-pub fn block_on_poll_prepare() { block_on_port_prepare(POLL_WAIT_CHANNEL) }
+/// Phase 1: publish Blocked-on-poll intent while still executing. No deadline
+/// (an infinite / edge-only waiter). A timed waiter uses
+/// `block_on_poll_prepare_until` instead so its deadline rides the SAME
+/// RUN_QUEUE hold — no extra lock on the block path, and the deadline lives in
+/// the task, not a clobber-prone global.
+pub fn block_on_poll_prepare() { block_on_poll_prepare_until(u64::MAX) }
+
+/// Phase 1 for a timed waiter: publish Blocked-on-poll AND the absolute-tick
+/// wake deadline atomically (one RUN_QUEUE hold), then fold the deadline into
+/// the global `NEXT_POLL_DEADLINE` hint (lock-free) so the tick's fast path can
+/// skip the run-queue scan while nothing is due. The task field is the
+/// authority; the hint is only an optimisation the tick recomputes exactly.
+pub fn block_on_poll_prepare_until(deadline: u64) {
+    let pid = current_pid();
+    RUN_QUEUE.lock().block_on_port_until(pid, POLL_WAIT_CHANNEL, deadline);
+    if deadline != u64::MAX {
+        NEXT_POLL_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
+    }
+}
 /// Undo a prepared poll-block (the re-probe found readiness or a signal).
 pub fn block_on_poll_cancel()  { block_on_port_cancel() }
 /// Phase 3: yield; woken by `wake_poll`, a signal, or the deadline tick.
@@ -834,14 +852,51 @@ pub fn try_wake_poll() -> bool {
     }
 }
 
+/// Poll-deadline tick service (IRQ/tick context): wake every poll-channel
+/// waiter whose per-task deadline is due (or all, when a timerfd has expired),
+/// then republish `NEXT_POLL_DEADLINE` to the EXACT earliest remaining deadline.
+///
+/// This replaces the old wake-then-`store(u64::MAX)` reset. That reset raced
+/// `register_poll_deadline`'s lock-free `fetch_min`: a deadline published in the
+/// window between the wake and the store was wiped to `u64::MAX`, stranding the
+/// waiter (nanosleep / finite epoll_wait have no edge source) until an unrelated
+/// deadline coincidentally fired the tick — seconds late, or forever (M7). The
+/// per-task deadline is now the authority: the wake and the exact recompute run
+/// under ONE RUN_QUEUE hold, so a woken task can only re-register (again
+/// lock-free, but its authoritative value is its own task field, set under this
+/// same lock next time it parks) after the recompute — nothing to clobber.
+///
+/// Non-blocking (try_lock) for the tick's contract; a contended tick leaves the
+/// hint and retries next tick (≤10 ms defer, within the timeout granularity).
+pub fn service_poll_deadlines(now: u64, timerfd_due: bool) -> bool {
+    match RUN_QUEUE.try_lock() {
+        Some(mut rq) => {
+            let (new_min, woken) =
+                rq.wake_due_poll_deadlines(POLL_WAIT_CHANNEL, now, timerfd_due);
+            NEXT_POLL_DEADLINE.store(new_min, Ordering::Relaxed); // exact, under the lock
+            drop(rq);
+            if woken > 0 { wake_up_an_idle_cpu(); }
+            true
+        }
+        None => false,
+    }
+}
+
 /// Earliest absolute tick at which a timed poll/select/epoll_wait waiter wants
-/// to be re-woken (u64::MAX = no timed waiter). A finite-timeout waiter folds
-/// its deadline in via `register_poll_deadline` (fetch_min) when it blocks; the
-/// poll tick hook wakes all pollers once `ticks()` reaches it.
+/// to be re-woken (u64::MAX = no timed waiter). This is a lock-free HINT that
+/// lets `poll_deadline_tick` skip the run-queue scan while nothing is due; the
+/// authoritative deadlines live in each `Task::poll_deadline`, and the tick
+/// recomputes this hint exactly under RUN_QUEUE in `service_poll_deadlines`. A
+/// waiter folds its deadline in via `block_on_poll_prepare_until` (or
+/// `register_poll_deadline` for a timerfd publish).
 pub static NEXT_POLL_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Publish a timed waiter's wake deadline (absolute ticks). Monotone-minimum so
-/// the earliest of all outstanding timed waiters governs the next tick wake.
+/// Publish a wake deadline into the lock-free hint (monotone-minimum). Used by
+/// the timerfd arm path — a timerfd is not a parked task, so it has no
+/// `Task::poll_deadline`; the hint (and `vfs::earliest_timerfd_deadline`, which
+/// the tick also consults) carry it. Parked timed waiters use
+/// `block_on_poll_prepare_until` instead, which records the deadline in the task
+/// AND folds it into this hint.
 pub fn register_poll_deadline(deadline: u64) {
     NEXT_POLL_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
 }

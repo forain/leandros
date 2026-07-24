@@ -1811,8 +1811,7 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
                 // (e.g. a compositor that runs for the session) at 100 % CPU —
                 // init/shell waiters stayed perpetually runnable, churning the
                 // scheduler run-loop and starving the very child's event loop.
-                sched::block_on_poll_prepare();
-                sched::register_poll_deadline(sched::ticks() + 2);
+                sched::block_on_poll_prepare_until(sched::ticks() + 2);
                 if matches!(sched::wait_peek(sel, caller_tgid), sched::WaitTry::StillRunning)
                     && !interrupted() {
                     sched::block_on_poll_commit();
@@ -1894,8 +1893,7 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
                 // a service) otherwise pins its blocking-waitid reaper at
                 // 100 % CPU. Woken by child-exit SIGCHLD -> wake_poll; the
                 // 2-tick poll deadline bounds a missed edge to ~20 ms.
-                sched::block_on_poll_prepare();
-                sched::register_poll_deadline(sched::ticks() + 2);
+                sched::block_on_poll_prepare_until(sched::ticks() + 2);
                 let peek = sched::wait_peek(sel, caller_tgid);
                 let ready = if reap_exits {
                     !matches!(peek, sched::WaitTry::StillRunning)
@@ -2270,8 +2268,7 @@ fn sys_nanosleep(rqtp_ptr: usize, rmtp_ptr: usize) -> isize {
         // run-loop at 100 %+ CPU and starving every other task). The deadline
         // tick wakes us exactly at `deadline`; a spurious early wake (another
         // waiter's nearer deadline) just re-checks the tick above and re-blocks.
-        sched::block_on_poll_prepare();
-        sched::register_poll_deadline(deadline);
+        sched::block_on_poll_prepare_until(deadline);
         if ticks() >= deadline || interrupted() {
             sched::block_on_poll_cancel();
         } else {
@@ -3574,8 +3571,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                             // tick could never fire. The now+1 deadline wakes us
                             // each tick to retry, which is exactly when the drain
                             // has run.
-                            sched::block_on_poll_prepare();
-                            sched::register_poll_deadline(ticks().wrapping_add(1));
+                            sched::block_on_poll_prepare_until(ticks().wrapping_add(1));
                             if console_input_pending() || evdev_server::has_key_event(0)
                                 || interrupted() {
                                 sched::block_on_poll_cancel();
@@ -6311,8 +6307,7 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
         // re-probe between prepare and commit closes the check-then-sleep
         // lost-wake (an edge landing after the probe above lands as a
         // wake_poll against an already-Blocked task, or shows in the re-probe).
-        sched::block_on_poll_prepare();
-        if !infinite { sched::register_poll_deadline(deadline); }
+        sched::block_on_poll_prepare_until(if infinite { u64::MAX } else { deadline });
         if epoll_any_ready(pid, slot) || interrupted()
             || (!infinite && ticks() >= deadline) {
             sched::block_on_poll_cancel();
@@ -6348,19 +6343,21 @@ fn epoll_any_ready(pid: u32, slot: usize) -> bool {
 /// honors the tick's try-lock-only contract: a contended tick defers ≤10 ms.
 pub fn poll_deadline_tick() {
     use core::sync::atomic::Ordering::Relaxed;
-    let due = core::cmp::min(
-        sched::NEXT_POLL_DEADLINE.load(Relaxed),
-        vfs::earliest_timerfd_deadline(),
-    );
-    if due != u64::MAX && ticks() >= due {
-        if sched::try_wake_poll() {
-            // Only clear the finite-timeout deadline; woken timed waiters that
-            // re-block republish it via fetch_min. Timerfd deadlines are
-            // recomputed from the pool each tick, so nothing to clear there.
-            sched::NEXT_POLL_DEADLINE.store(u64::MAX, Relaxed);
-        }
-        // else: RUN_QUEUE momentarily contended — leave the deadline, retry
-        // next tick (the ≤10 ms defer the design allows).
+    let now = ticks();
+    let tfd = vfs::earliest_timerfd_deadline();
+    // Fast path: the lock-free hint (min of parked timed waiters' deadlines)
+    // and the timerfd pool say nothing is due → no run-queue scan, no wake.
+    let due = core::cmp::min(sched::NEXT_POLL_DEADLINE.load(Relaxed), tfd);
+    if due != u64::MAX && now >= due {
+        // Something is due. Wake the poll-channel waiters whose PER-TASK
+        // deadline has passed (or all, if a timerfd expired), and republish the
+        // hint to the EXACT earliest remaining deadline — all under one
+        // RUN_QUEUE hold. The per-task deadline is the authority, so unlike the
+        // old single-global `store(u64::MAX)` this can't clobber a deadline a
+        // concurrent waiter is registering (M7 lost-wake). Contended tick just
+        // retries next tick (≤10 ms defer).
+        let timerfd_due = tfd != u64::MAX && now >= tfd;
+        sched::service_poll_deadlines(now, timerfd_due);
     }
     // Bring-up safety net (design §1), OFF: a periodic unconditional wake would
     // turn any missed edge site into a ≤100 ms latency blip instead of a hang.
@@ -6375,8 +6372,7 @@ pub fn poll_deadline_tick() {
 /// must not write user memory (that happens at the caller's loop top). The
 /// re-probe between prepare and commit closes the check-then-sleep lost-wake.
 fn poll_block(infinite: bool, deadline: u64, reprobe: impl FnOnce() -> bool) {
-    sched::block_on_poll_prepare();
-    if !infinite { sched::register_poll_deadline(deadline); }
+    sched::block_on_poll_prepare_until(if infinite { u64::MAX } else { deadline });
     if reprobe() || interrupted() || (!infinite && ticks() >= deadline) {
         sched::block_on_poll_cancel();
         return;

@@ -220,6 +220,10 @@ name = "waittest"
 version = "0.1.0"
 
 [[package]]
+name = "wakepolltest"
+version = "0.1.0"
+
+[[package]]
 name = "xattr-util"
 version = "0.1.0"
 dependencies = [
