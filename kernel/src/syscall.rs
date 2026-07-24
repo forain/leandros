@@ -2549,24 +2549,46 @@ impl ExecStrBuf {
 
     /// Read one null-terminated C string from user-space `ptr` into the buffer.
     /// Returns false on overflow or fault.
+    ///
+    /// The user pointer is NEVER raw-dereferenced: each page-bounded chunk is
+    /// first faulted in (`prefault_user`, backing a demand-paged .rodata/.data
+    /// argv literal) and then copied through the address space's fault-checked
+    /// `read_user_buf`.  A bad/unmapped pointer (or one whose backing page can't
+    /// be faulted) fails safely here instead of taking a kernel-mode data abort
+    /// at EL1 — which, if unserviceable, would hang the machine.
     fn push_cstr(&mut self, ptr: usize) -> bool {
         if self.count >= MAX_EXEC_ARGS { return false; }
         if ptr == 0 { return false; }
         let start = self.end;
+        let page = mm::buddy::PAGE_SIZE;
+        let mut buf = [0u8; 128];
         loop {
-            if self.end >= MAX_EXEC_STR - 1 { return false; }
-            let b = unsafe { *(ptr as *const u8).add(self.end - start) };
-            if b == 0 { break; }
-            self.data[self.end] = b;
-            self.end += 1;
+            let room = (MAX_EXEC_STR - 1).saturating_sub(self.end);
+            if room == 0 { self.end = start; return false; } // string too long
+            let read_from = ptr + (self.end - start);
+            let to_page = page - (read_from % page);
+            let chunk = core::cmp::min(core::cmp::min(to_page, room), buf.len());
+            // Back the (possibly demand-paged) source page, then read it via a
+            // fault-checked copy.  Never raw-deref the user pointer.
+            prefault_user(read_from, chunk);
+            let ok = with_current_address_space(|as_| {
+                as_.read_user_buf(read_from, &mut buf[..chunk])
+            }).unwrap_or(false);
+            if !ok { self.end = start; return false; } // fault → fail safely
+            for &b in &buf[..chunk] {
+                if b == 0 {
+                    let len = self.end - start;
+                    self.data[self.end] = 0; // NUL terminator (excl. from lengths)
+                    self.end += 1;
+                    self.offsets[self.count] = start;
+                    self.lengths[self.count] = len;
+                    self.count += 1;
+                    return true;
+                }
+                self.data[self.end] = b;
+                self.end += 1;
+            }
         }
-        let len = self.end - start;
-        self.data[self.end] = 0; // null terminator (not counted in lengths)
-        self.end += 1;
-        self.offsets[self.count] = start;
-        self.lengths[self.count] = len;
-        self.count += 1;
-        true
     }
 
     fn reset(&mut self) { self.end = 0; self.count = 0; }
@@ -2847,10 +2869,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
             }).unwrap_or(false);
             if !ok || str_ptr == 0 { break; }
 
-            // The string may live in a not-yet-faulted page of a
-            // demand-paged image (e.g. argv literals in .rodata); push_cstr
-            // dereferences it raw, so fault it in first.
-            prefault_user(str_ptr, 512);
+            // push_cstr faults in + fault-checks each page of the string itself
+            // (demand-paged argv literals live in .rodata); it never raw-derefs.
             argv.push_cstr(str_ptr);
             i += 1;
         }
@@ -2871,7 +2891,6 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
             }).unwrap_or(false);
             if !ok || str_ptr == 0 { break; }
 
-            prefault_user(str_ptr, 512);
             envp.push_cstr(str_ptr);
             i += 1;
         }

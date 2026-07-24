@@ -135,6 +135,21 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
     serial_print_str(" TCR=");
     print_hex(tcr as usize);
     serial_print_str("\n");
+
+    // A kernel-mode data abort (EC 0x25) on a *user* (TTBR0, FAR[63:48]==0)
+    // address that handle_page_fault could not service means the CURRENT task
+    // handed the kernel a bad/unmapped user pointer inside a syscall (e.g. a
+    // stray argv/envp pointer during execve).  Kill that task — a
+    // SIGSEGV-equivalent exit — instead of hanging the whole machine.  A
+    // genuine kernel bug (a fault on a kernel TTBR1 address, or an instruction
+    // abort at EL1) is not the task's fault and still halts here for triage.
+    if ec == 0x25 && far >> 48 == 0 {
+        serial_print_str("[EXC] killing PID=");
+        print_number(sched::current_pid());
+        serial_print_str(" (unresolvable user-pointer fault in kernel)\n");
+        sched::exit(1);
+    }
+
     loop { core::hint::spin_loop(); }
 }
 
