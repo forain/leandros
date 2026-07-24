@@ -353,6 +353,34 @@ pub fn sys_sigaction(signum: u32, act_ptr: usize, oldact_ptr: usize) -> isize {
     ret
 }
 
+/// POSIX `execve`: signal dispositions that were being *caught* (a real handler
+/// function) revert to `SIG_DFL` in the new process image; `SIG_IGN` and
+/// `SIG_DFL` are preserved, and the signal mask / pending set are left untouched.
+///
+/// Runs at successful exec, before `replace_address_space` hands control to the
+/// new image. Skipping it leaves a stale handler installed across the exec —
+/// and because a program can exec *itself* (LeandrOS ships `/bin/sh` as a
+/// hardlink to the same fixed-base ET_EXEC), the handler can reappear at the
+/// identical address in the new image. A fresh `signal_hook_registry` then reads
+/// that stale handler back as the "previous handler" via `sigaction(oldact)`,
+/// stores it as its own `prev`, and chains to it on the next signal — calling
+/// itself, unboundedly, until the stack faults (the COSMIC launcher's
+/// `exec /bin/sh dbus-run-session …` + SIGCHLD reproduced this exactly).
+///
+/// Dispositions belong to the thread-group leader, so this takes the tgid.
+pub fn reset_handlers_on_exec(tgid: super::task::Pid) {
+    let mut rq = super::RUN_QUEUE.lock();
+    if let Some(leader) = rq.find_pid_mut(tgid) {
+        for act in leader.signal_actions.iter_mut() {
+            // handler encoding: 0 = SIG_DFL, 1 = SIG_IGN, >= 2 = caught fn ptr.
+            // Only caught handlers revert; SIG_IGN and SIG_DFL are preserved.
+            if act.handler >= 2 {
+                *act = crate::task::DEFAULT_SIGACTION;
+            }
+        }
+    }
+}
+
 pub fn sys_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
     const SIG_BLOCK:   usize = 0;
     const SIG_UNBLOCK: usize = 1;

@@ -30,7 +30,7 @@ pub mod signal;
 pub mod task;
 
 pub use clone::{fork_current, clone_thread};
-pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal};
+pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec};
 pub use futex::{futex_wait, futex_wake, futex_requeue};
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};

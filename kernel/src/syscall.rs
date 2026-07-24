@@ -3211,6 +3211,14 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // which never returns.
     sched::set_exe_path(fd_owner, kpath.bytes());
 
+    // POSIX execve: caught signal handlers revert to SIG_DFL in the new image
+    // (SIG_IGN/SIG_DFL and the signal mask are preserved). Omitting this let a
+    // stale handler survive the exec; since /bin/sh is a hardlink to brush (same
+    // fixed-base ET_EXEC), the handler reappeared at the same address and
+    // signal_hook_registry chained to itself on the next signal — an unbounded,
+    // stack-exhausting recursion that blocked the COSMIC session launcher.
+    sched::reset_handlers_on_exec(fd_owner);
+
     replace_address_space(*new_as, pt_root, heap_start, entry, user_sp);
 }
 
