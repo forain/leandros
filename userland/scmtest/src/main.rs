@@ -49,7 +49,7 @@
 
 extern crate leandros_libc;
 use leandros_libc::*;
-use leandros_libc::syscall::{nr, syscall2, syscall3, syscall4, syscall6};
+use leandros_libc::syscall::{nr, syscall1, syscall2, syscall3, syscall4, syscall6};
 
 // Syscall numbers not yet wrapped by leandros-libc. Values match
 // `kernel/src/syscall.rs`'s `mod nr` tables exactly (AArch64 first,
@@ -77,6 +77,28 @@ use leandros_libc::syscall::{nr, syscall2, syscall3, syscall4, syscall6};
 #[cfg(target_arch = "x86_64")]  const SYS_CONNECT:      usize = 42;
 #[cfg(target_arch = "aarch64")] const SYS_NEWFSTATAT:   usize = 79;
 #[cfg(target_arch = "x86_64")]  const SYS_NEWFSTATAT:   usize = 262;
+// M7q TASK 1 (fork+exec+fd-inherit decider): execve + epoll. Numbers match
+// kernel/src/syscall.rs's `mod nr`. AArch64 has no bare EPOLL_WAIT — the kernel
+// routes EPOLL_PWAIT (nr 22) to the same 4-arg sys_epoll_wait, so we use that.
+#[cfg(target_arch = "aarch64")] const SYS_EXECVE:        usize = 221;
+#[cfg(target_arch = "x86_64")]  const SYS_EXECVE:        usize = 59;
+#[cfg(target_arch = "aarch64")] const SYS_EPOLL_CREATE1: usize = 20;
+#[cfg(target_arch = "x86_64")]  const SYS_EPOLL_CREATE1: usize = 291;
+#[cfg(target_arch = "aarch64")] const SYS_EPOLL_CTL:     usize = 21;
+#[cfg(target_arch = "x86_64")]  const SYS_EPOLL_CTL:     usize = 233;
+#[cfg(target_arch = "aarch64")] const SYS_EPOLL_WAIT:    usize = 22;  // EPOLL_PWAIT
+#[cfg(target_arch = "x86_64")]  const SYS_EPOLL_WAIT:    usize = 232;
+
+// epoll_event wire layout must match the kernel's per-arch struct exactly
+// (kernel/src/syscall.rs EPOLL_EVENT_SIZE/EPOLL_EVENT_DATA_OFF): x86_64 uses the
+// packed 12-byte form (data at +4); aarch64 the natural 16-byte form (data at +8).
+#[cfg(target_arch = "x86_64")]  const EPOLL_EVENT_SIZE:     usize = 12;
+#[cfg(target_arch = "x86_64")]  const EPOLL_EVENT_DATA_OFF: usize = 4;
+#[cfg(target_arch = "aarch64")] const EPOLL_EVENT_SIZE:     usize = 16;
+#[cfg(target_arch = "aarch64")] const EPOLL_EVENT_DATA_OFF: usize = 8;
+const EPOLLIN: u32 = 0x0001;
+const EPOLL_CTL_ADD: usize = 1;
+const F_SETFD: i32 = 2;
 
 // ── Wire-format structs (Linux/glibc ABI, 64-bit) ───────────────────────────
 
@@ -313,15 +335,228 @@ unsafe fn report(name: &[u8], passed: bool) -> bool {
     passed
 }
 
+// ── M7q TASK 1: the fork+exec+fd-inherit "decider" ──────────────────────────
+//
+// This mirrors the EXACT mechanism COSMIC's cosmic-session↔cosmic-comp
+// readiness handshake uses, MINUS tokio, to settle empirically whether the
+// stuck handshake is a kernel bug (fork/execve fd-inheritance or write→read
+// wake) or purely a tokio async-read integration gap in userspace:
+//
+//   1. parent socketpair(AF_UNIX, SOCK_STREAM)  -> (A = child end, B = parent end)
+//   2. clear FD_CLOEXEC on A so it survives execve  (cosmic-session does the same
+//      before handing the fd NUMBER to comp via the COSMIC_SESSION_SOCK env var)
+//   3. fork()+execve(self) — the child inherits A by its raw fd number, passed in
+//      the env var SCMTEST_INHERIT_FD=<A> (private name; the kernel mechanism is
+//      identical whatever the string says — this just avoids any real-session
+//      COSMIC_SESSION_SOCK collision)
+//   4. the re-exec'd child, detecting the env var, write()s a length-prefixed
+//      message to the inherited fd and exits  (== comp writing SetEnv{WAYLAND_
+//      DISPLAY} to fd 261)
+//   5. parent epoll_wait's on B, then read()s and asserts byte-exact delivery
+//      (== cosmic-session's tokio reactor waking on its end of the pair)
+//
+// PASS => the kernel fork/execve/fd-inherit + AF_UNIX write→epoll-wake path is
+//         sound; a stuck COSMIC handshake is a userspace/tokio issue.
+// FAIL => a real kernel bug in exactly that path (the handshake root cause).
+
+/// The framed message the helper writes and the parent expects, byte for byte.
+const SCM_INHERIT_MSG: &[u8] = b"WAYLAND_DISPLAY=wayland-1";
+
+/// Scan a NULL-terminated `envp` for `key=`; return the integer that follows, or
+/// None. No allocation, no libc — pure pointer walk (helper mode runs this
+/// before any suite state exists).
+unsafe fn env_int(envp: *const *const u8, key: &[u8]) -> Option<i32> {
+    if envp.is_null() { return None; }
+    let mut pp = envp;
+    while !(*pp).is_null() {
+        let s = *pp;
+        let mut i = 0usize;
+        let mut matched = true;
+        while i < key.len() {
+            if *s.add(i) != key[i] { matched = false; break; }
+            i += 1;
+        }
+        if matched && *s.add(key.len()) == b'=' {
+            let mut j = key.len() + 1;
+            let mut val: i32 = 0;
+            let mut any = false;
+            loop {
+                let c = *s.add(j);
+                if !(b'0'..=b'9').contains(&c) { break; }
+                val = val * 10 + (c - b'0') as i32;
+                any = true;
+                j += 1;
+            }
+            if any { return Some(val); }
+        }
+        pp = pp.add(1);
+    }
+    None
+}
+
+/// Helper mode: write the framed message (4-byte LE length + body) to the
+/// inherited fd, then exit. Reached only when SCMTEST_INHERIT_FD is present in
+/// the environment, i.e. only via this test's own self-execve — never on a
+/// plain `scmtest` invocation.
+unsafe fn scm_inherit_helper(fd: i32) -> ! {
+    let body = SCM_INHERIT_MSG;
+    let mut wire = [0u8; 4 + 64];
+    wire[..4].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    wire[4..4 + body.len()].copy_from_slice(body);
+    let total = 4 + body.len();
+    let w = write(fd, wire.as_ptr(), total);
+    dbg2(b"[fei:helper] inherited fd=%d wrote=%d\n\0", fd as i64, w as i64);
+    exit(if w == total as isize { 0 } else { 7 });
+}
+
+/// The decider test (parent side). See the block comment above.
+unsafe fn test_fork_exec_inherit() -> bool {
+    let name = b"fork_exec_inherit\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 {
+        dbg0(b"[fei] socketpair failed\n\0");
+        return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+
+    // Clear FD_CLOEXEC on A so the child keeps it across execve.
+    raw_fcntl(a, F_SETFD, 0);
+
+    // Build "SCMTEST_INHERIT_FD=<a>\0" before fork so the child's COW copy has it.
+    let mut envbuf = [0u8; 48];
+    build_name(&mut envbuf, b"SCMTEST_INHERIT_FD=", a as usize);
+
+    let pid = fork();
+    if pid == 0 {
+        // Child: re-exec self; the env var flips it into helper mode.
+        close(b);
+        let path = b"/bin/scmtest\0";
+        let av: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let ev: [*const u8; 2] = [envbuf.as_ptr(), core::ptr::null()];
+        syscall3(SYS_EXECVE, path.as_ptr() as usize, av.as_ptr() as usize, ev.as_ptr() as usize);
+        dbg0(b"[fei:child] execve(/bin/scmtest) failed\n\0");
+        exit(9);
+    }
+
+    // Parent = the cosmic-session role. Drop our copy of A so only the child
+    // holds the write end (clean EOF semantics), then epoll_wait on B.
+    close(a);
+    report(name, parent_epoll_read_ok(b, pid))
+}
+
+/// Parent side shared by both fork+exec+inherit deciders: epoll_wait(5s) on `b`,
+/// read the framed message, assert byte-exact, reap the helper. Returns true iff
+/// the message arrived intact AND the helper exited 0. The 5s bounded wait makes
+/// a broken inherit FAIL loudly instead of hanging the suite.
+unsafe fn parent_epoll_read_ok(b: i32, pid: i32) -> bool {
+    let ep = xret(syscall1(SYS_EPOLL_CREATE1, 0)) as i32;
+    if ep < 0 {
+        dbg1(b"[fei] epoll_create1 failed errno=%d\n\0", get_errno() as i64);
+        close(b); reap(pid); return false;
+    }
+    let mut evbuf = [0u8; EPOLL_EVENT_SIZE];
+    evbuf[..4].copy_from_slice(&EPOLLIN.to_le_bytes());
+    evbuf[EPOLL_EVENT_DATA_OFF..EPOLL_EVENT_DATA_OFF + 8]
+        .copy_from_slice(&(b as u64).to_le_bytes());
+    if xret(syscall4(SYS_EPOLL_CTL, ep as usize, EPOLL_CTL_ADD, b as usize, evbuf.as_mut_ptr() as usize)) != 0 {
+        dbg1(b"[fei] epoll_ctl(ADD) failed errno=%d\n\0", get_errno() as i64);
+        close(ep); close(b); reap(pid); return false;
+    }
+
+    let mut out = [0u8; EPOLL_EVENT_SIZE];
+    let nready = xret(syscall4(SYS_EPOLL_WAIT, ep as usize, out.as_mut_ptr() as usize, 1, 5000));
+    dbg1(b"[fei] epoll_wait -> %d (want >=1; 0 == INHERIT BROKEN)\n\0", nready as i64);
+
+    let mut ok = false;
+    if nready >= 1 {
+        let mut lenb = [0u8; 4];
+        let r1 = read(b, lenb.as_mut_ptr(), 4);
+        let mlen = u32::from_le_bytes(lenb) as usize;
+        let mut body = [0u8; 64];
+        let r2 = if mlen <= 64 { read(b, body.as_mut_ptr(), mlen) } else { -1 };
+        ok = r1 == 4 && mlen == SCM_INHERIT_MSG.len() && r2 == mlen as isize
+            && &body[..mlen] == SCM_INHERIT_MSG;
+        dbg2(b"[fei] read len=%d body=%d\n\0", r1 as i64, r2 as i64);
+    }
+
+    close(ep); close(b);
+    let mut status: i32 = -1;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    dbg1(b"[fei] helper exit status=%d\n\0", status as i64);
+    ok && status == 0
+}
+
+/// Variant of the decider that mirrors launch_pad's `with_fds` handoff — the
+/// exact path cosmic-session uses to hand cosmic-panel / cosmic-notifications
+/// their notification socket (PANEL_/DAEMON_NOTIFICATIONS_FD). Unlike
+/// test_fork_exec_inherit (which clears CLOEXEC in the PARENT, like
+/// COSMIC_SESSION_SOCK), here the inherited end is created SOCK_CLOEXEC (as tokio/
+/// std UnixStream::pair does) and FD_CLOEXEC is cleared in the CHILD's post-fork,
+/// pre-execve window. This exercises the kernel's execve cloexec-sweep against a
+/// CHILD-cleared net-socket fd. PASS => the path is sound; FAIL => the child-
+/// cleared fd is wrongly closed at execve (child sees EBADF), which is exactly
+/// the "Bad file descriptor" crash cosmic-notifications/-panel hit.
+unsafe fn test_fork_exec_child_clears_cloexec() -> bool {
+    let name = b"fork_exec_child_clears_cloexec\0";
+    const SOCK_CLOEXEC: i32 = 0x80000;
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv.as_mut_ptr()) != 0 {
+        dbg0(b"[feic] socketpair(SOCK_CLOEXEC) failed\n\0");
+        return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+
+    // Sanity: A must START close-on-exec, else this isn't testing the clear path.
+    let pre = raw_fcntl(a, F_GETFD, 0);
+    if pre & FD_CLOEXEC == 0 {
+        dbg1(b"[feic] warn: A not cloexec at start (fdflags=%d); SOCK_CLOEXEC ignored\n\0", pre as i64);
+    }
+
+    let mut envbuf = [0u8; 48];
+    build_name(&mut envbuf, b"SCMTEST_INHERIT_FD=", a as usize);
+
+    let pid = fork();
+    if pid == 0 {
+        close(b);
+        // The launch_pad pre_exec step: clear FD_CLOEXEC on the inherited fd in
+        // the CHILD, after fork and before execve.
+        raw_fcntl(a, F_SETFD, 0);
+        let path = b"/bin/scmtest\0";
+        let av: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let ev: [*const u8; 2] = [envbuf.as_ptr(), core::ptr::null()];
+        syscall3(SYS_EXECVE, path.as_ptr() as usize, av.as_ptr() as usize, ev.as_ptr() as usize);
+        dbg0(b"[feic:child] execve failed\n\0");
+        exit(9);
+    }
+
+    close(a);
+    report(name, parent_epoll_read_ok(b, pid))
+}
+
+unsafe fn reap(pid: i32) {
+    let mut status: i32 = -1;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
+pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const *const u8) -> i32 {
+    // M7q TASK 1: helper mode is entered ONLY via this test's own self-execve,
+    // which sets SCMTEST_INHERIT_FD. A plain `scmtest` invocation never has it,
+    // so the full suite runs as before.
+    if let Some(fd) = env_int(envp, b"SCMTEST_INHERIT_FD") {
+        scm_inherit_helper(fd);
+    }
+
     let mut failures = 0;
 
     if !test_fd_pass() { failures += 1; }
     if !test_fork_child_exit_keeps_socket() { failures += 1; }
+    if !test_fork_exec_inherit() { failures += 1; }
+    if !test_fork_exec_child_clears_cloexec() { failures += 1; }
     if !test_cmsg_flags() { failures += 1; }
     if !test_shared_memfd_pixels() { failures += 1; }
     if !test_seals() { failures += 1; }
+    if !test_memfd_same_name_distinct() { failures += 1; }
 
     // ── K1-B VMO tests (single-process + fork; no SCM_RIGHTS needed) ─────────
     if !test_double_mmap_alias() { failures += 1; }
@@ -639,6 +874,38 @@ unsafe fn test_seals() -> bool {
 
     close(mfd);
     report(name, add == 0 && seal_reported && shrink_blocked)
+}
+
+/// M7q: two memfd_create calls with the SAME name must yield DISTINCT anonymous
+/// inodes (Linux semantics). Mirrors smithay-client-toolkit, which creates every
+/// wl_shm SlotPool with one fixed name "smithay-client-toolkit" and seals it —
+/// on the buggy kernel the 2nd same-name memfd reopened the 1st's sealed inode
+/// and its implicit O_TRUNC hit F_SEAL_SHRINK → EPERM, panicking every
+/// libcosmic/winit client (cosmic-panel, cosmic-notifications). The fix makes
+/// each memfd a unique inode; here the 2nd create must SUCCEED and carry no seal.
+unsafe fn test_memfd_same_name_distinct() -> bool {
+    let name = b"memfd_same_name_distinct\0";
+    let m1 = raw_memfd_create(b"scm-dupname\0".as_ptr(), 0);
+    if m1 < 0 { dbg0(b"[mfdn] first memfd_create failed\n\0"); return report(name, false); }
+    if raw_ftruncate(m1, 4096) != 0 { close(m1); return report(name, false); }
+    // Seal it exactly as smithay does (SHRINK is what made the reopen EPERM).
+    let add = raw_fcntl(m1, F_ADD_SEALS, F_SEAL_SHRINK as usize);
+    // Second memfd with the IDENTICAL name must be a fresh, unsealed inode.
+    let m2 = raw_memfd_create(b"scm-dupname\0".as_ptr(), 0);
+    if m2 < 0 {
+        dbg1(b"[mfdn] 2nd same-name memfd_create FAILED errno=%d (buggy: reopened sealed inode)\n\0",
+             get_errno() as i64);
+        close(m1); return report(name, false);
+    }
+    // The decisive checks: m2 truncates freely (smithay's set_len) and carries
+    // no seal — proving it is a distinct inode, not the sealed m1.
+    let grow = raw_ftruncate(m2, 2);
+    let seals = raw_fcntl(m2, F_GET_SEALS, 0);
+    dbg2(b"[mfdn] add=%d 2nd ftrunc(2)=%d\n\0", add as i64, grow as i64);
+    dbg1(b"[mfdn] 2nd inode seals=0x%x (want 0)\n\0", seals as i64);
+    let ok = grow == 0 && seals == 0;
+    close(m1); close(m2);
+    report(name, ok)
 }
 
 // ── K1-B: shared-VMO tests that don't require SCM_RIGHTS ─────────────────────
