@@ -3219,6 +3219,17 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // stack-exhausting recursion that blocked the COSMIC session launcher.
     sched::reset_handlers_on_exec(fd_owner);
 
+    // POSIX execve terminates every *other* thread in the caller's group: the
+    // old program image (their code and stacks) is about to be replaced, so any
+    // sibling left running would execute freed/stale mappings. Do this as the
+    // last step before the (non-returning) address-space swap — the point of no
+    // return — so no sibling is reaped on a path that could still fail. Without
+    // it, a COSMIC component that re-exec'd with a live worker thread orphaned
+    // that worker on the old address space; its next fault resolved against the
+    // leader's *new* AS and killed it, and freeing the old AS out from under it
+    // faulted the page-table walk (M7o).
+    sched::dethread_current_group();
+
     replace_address_space(*new_as, pt_root, heap_start, entry, user_sp);
 }
 

@@ -1289,6 +1289,50 @@ pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
     ok
 }
 
+/// Diagnostic: print the faulting task's identity — its pid, tgid, its own
+/// saved page-table root, and the *leader* it resolves to (pid + AS root +
+/// region count + VA span). Reveals whether a worker thread's fault is being
+/// serviced against the correct thread-group address space.
+pub fn dump_task_ident() {
+    fn print_str(s: &str) {
+        extern "C" { fn arch_serial_putc(c: u8); }
+        for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } }
+    }
+    extern "C" { fn print_hex(n: usize); fn print_number(n: u32); }
+    fn ph(n: usize) { unsafe { print_hex(n) } }
+    fn pn(n: u32)  { unsafe { print_number(n) } }
+    let pid = current_pid();
+    let rq = RUN_QUEUE.lock();
+    let (tgid, own_pt) = match rq.find_pid(pid) {
+        Some(t) => (t.tgid, t.page_table),
+        None => { drop(rq); print_str("[IDENT] no task\n"); return; }
+    };
+    print_str("[IDENT] pid="); pn(pid);
+    print_str(" tgid="); pn(tgid);
+    print_str(" own_pt="); ph(own_pt);
+    if let Some(leader) = rq.find_pid(tgid) {
+        print_str(" leader_pt="); ph(leader.page_table);
+        if let Some(as_) = leader.address_space.as_ref() {
+            print_str(" as_root="); ph(as_.root());
+            let mut count = 0usize; let mut lo = usize::MAX; let mut hi = 0usize;
+            for r in as_.regions.iter().filter_map(|r| r.as_ref()) {
+                count += 1;
+                if r.start < lo { lo = r.start; }
+                if r.end   > hi { hi = r.end; }
+            }
+            print_str(" regions="); pn(count as u32);
+            print_str(" lo="); ph(lo);
+            print_str(" hi="); ph(hi);
+        } else {
+            print_str(" leader_as=NONE");
+        }
+    } else {
+        print_str(" leader=NOTFOUND");
+    }
+    print_str("\n");
+    drop(rq);
+}
+
 /// Diagnostic (gated by caller): dump the faulting task's file-backed and
 /// executable VMAs so an EL0 fault address can be mapped to its module base +
 /// file offset (identifying which .so a runtime PC lives in). Prints metadata
@@ -1587,6 +1631,46 @@ pub fn exit_group(code: i32) -> ! {
         }
     }
     exit(code)
+}
+
+/// POSIX `execve` thread-group teardown ("de-thread"): terminate **every other
+/// thread** in the calling thread's group, then make the caller the sole
+/// surviving thread and its own group leader.
+///
+/// When any thread `execve`s, the entire old program image is replaced, so all
+/// sibling threads — which are executing code and standing on stacks that
+/// belong to the image about to vanish — must cease to exist (POSIX
+/// "all threads other than the calling thread are terminated"). LeandrOS
+/// previously skipped this: [`sys_execve`] called `replace_address_space`
+/// directly, giving the *caller* a fresh address space while leaving every
+/// sibling running on the now-orphaned old one. A COSMIC component that spawned
+/// a worker thread and then re-exec'd (leader `execve` with `others > 0`) left
+/// that worker running cosmic-comp code on a stale address space; the worker's
+/// next page fault resolved against the *leader's new* AS
+/// (`lock_leader_address_space` → tgid → leader), never found its stack, and
+/// was killed — and if the orphan owned the old AS, its teardown freed the page
+/// tables under any still-running sibling (an external-abort-on-table-walk).
+///
+/// Reuses [`kill_next_group_member`]'s loop, so the same "every sibling has
+/// actually *stopped* before its address space may change" ordering guarantee
+/// applies. The caller keeps its own kernel stack and identity and continues
+/// into `replace_address_space`; the promotion (`tgid = pid`) only matters for
+/// the non-leader-thread `execve` case (Linux would have the caller take over
+/// the leader's pid — here it simply becomes its own single-thread group, which
+/// is sufficient because the old leader has just been reaped above).
+pub fn dethread_current_group() {
+    loop {
+        match kill_next_group_member(0) {
+            GroupKillStep::Done        => break,
+            GroupKillStep::Reaped(pid) => run_exit_teardown(pid),
+            GroupKillStep::Kicking     => core::hint::spin_loop(),
+        }
+    }
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    if let Some(t) = rq.find_pid_mut(pid) {
+        t.tgid = pid;
+    }
 }
 
 pub fn exit(code: i32) -> ! {
