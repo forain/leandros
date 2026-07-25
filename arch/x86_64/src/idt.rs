@@ -181,7 +181,7 @@ macro_rules! fault_no_err_handler {
                 serial_str(b" CS=0x"); serial_hex64(frame.cs);
                 serial_str(b" RSP=0x"); serial_hex64(frame.sp);
                 serial_str(b": task killed\r\n");
-                sched::exit(1);
+                sched::exit_group(1);
             } else {
                 print_exception(&frame, $vector, 0);
                 loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
@@ -204,7 +204,7 @@ macro_rules! fault_with_err_handler {
                 serial_str(b" RSP=0x"); serial_hex64(frame.sp);
                 serial_str(b" err=0x"); serial_hex64(error_code);
                 serial_str(b": task killed\r\n");
-                sched::exit(1);
+                sched::exit_group(1);
             } else {
                 print_exception(&frame, $vector, error_code);
                 loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
@@ -271,7 +271,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
 
         unsafe { super::paging::debug_walk_pte((cr3 & !0xFFF) as usize, cr2 as usize); }
 
-        sched::exit(1);
+        sched::exit_group(1);
     } else {
         // Kernel-mode fault on a *user* address: kernel/server code
         // dereferenced a user pointer whose page is demand-paged (lazy heap,

@@ -147,7 +147,7 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
         serial_print_str("[EXC] killing PID=");
         print_number(sched::current_pid());
         serial_print_str(" (unresolvable user-pointer fault in kernel)\n");
-        sched::exit(1);
+        sched::exit_group(1);
     }
 
     loop { core::hint::spin_loop(); }
@@ -353,7 +353,7 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
             sched::dump_user_vma(far as usize);
         }
 
-        sched::exit(1);
+        sched::exit_group(1);
     }
 }
 
