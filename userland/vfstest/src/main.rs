@@ -28,6 +28,9 @@ use leandros_libc::syscall::{syscall1, syscall2, syscall3, syscall4, syscall5};
 #[cfg(target_arch = "x86_64")]  const SYS_CHROOT: usize = 161;
 #[cfg(target_arch = "aarch64")] const SYS_SYMLINKAT: usize = 36;
 #[cfg(target_arch = "x86_64")]  const SYS_SYMLINKAT: usize = 266;
+#[cfg(target_arch = "aarch64")] const SYS_RENAMEAT2: usize = 276;
+#[cfg(target_arch = "x86_64")]  const SYS_RENAMEAT2: usize = 316;
+const RENAME_NOREPLACE: usize = 1;
 
 /// Change the process's filesystem root. Irreversible for the calling
 /// process, so callers that need to keep operating outside the jail must
@@ -651,6 +654,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
 
     if !test_rmdir() { failures += 1; }
     if !test_rename() { failures += 1; }
+    if !test_rename_replace(b"/tmp", b"rename_replace_tmpfs\0") { failures += 1; }
+    if !test_rename_replace(b"/data", b"rename_replace_f2fs\0") { failures += 1; }
     if !test_flock_conflict() { failures += 1; }
     if !test_fcntl_byte_range_conflict() { failures += 1; }
     if !test_permission_enforced() { failures += 1; }
@@ -739,6 +744,65 @@ unsafe fn test_rename() -> bool {
     let n = read(fd2, buf.as_mut_ptr(), 5);
     close(fd2);
     report(name, n == 5 && &buf == b"hello")
+}
+
+/// POSIX rename must atomically REPLACE an existing destination, and the
+/// renameat form must resolve relative names against real dirfds. Together
+/// these are the atomic-write idiom every config/state writer uses (tempfile
+/// in an opened directory, then renameat over the live name — cosmic-config,
+/// atomicwrites, dconf, ...). `dir` parameterizes the filesystem: /tmp for
+/// tmpfs, /data for f2fs. RENAME_NOREPLACE must still refuse with EEXIST.
+unsafe fn test_rename_replace(dir: &[u8], name: &[u8]) -> bool {
+    let mut src = [0u8; 64]; let mut dst = [0u8; 64];
+    let dlen = dir.len();
+    src[..dlen].copy_from_slice(dir); src[dlen..dlen + 7].copy_from_slice(b"/renr_s");
+    dst[..dlen].copy_from_slice(dir); dst[dlen..dlen + 7].copy_from_slice(b"/renr_d");
+
+    let fd = open(src.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if fd < 0 { return report(name, false); }
+    write(fd, b"SRC".as_ptr(), 3);
+    close(fd);
+    let fd = open(dst.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if fd < 0 { return report(name, false); }
+    write(fd, b"OLDDATA".as_ptr(), 7);
+    close(fd);
+
+    // Replace an existing destination: must succeed, dest serves src's bytes,
+    // src's name is gone.
+    if rename(src.as_ptr(), dst.as_ptr()) != 0 { return report(name, false); }
+    if open(src.as_ptr(), O_RDONLY, 0) != -1 { return report(name, false); }
+    let fd = open(dst.as_ptr(), O_RDONLY, 0);
+    if fd < 0 { return report(name, false); }
+    let mut buf = [0u8; 8];
+    let n = read(fd, buf.as_mut_ptr(), 8);
+    close(fd);
+    if n != 3 || &buf[..3] != b"SRC" { return report(name, false); }
+
+    // Dirfd-relative renameat2: names resolve against the opened directory,
+    // not the cwd (the shape atomicwrites uses after tempfile_in).
+    let mut dbuf = [0u8; 64];
+    dbuf[..dlen].copy_from_slice(dir); // NUL-terminated by the zeroed buffer
+    let dfd = open(dbuf.as_ptr(), O_RDONLY, 0);
+    if dfd < 0 { return report(name, false); }
+    let r = syscall5(SYS_RENAMEAT2, dfd as usize, b"renr_d\0".as_ptr() as usize,
+                     dfd as usize, b"renr_e\0".as_ptr() as usize, 0);
+    if r < 0 { close(dfd); return report(name, false); }
+    let mut moved = [0u8; 64];
+    moved[..dlen].copy_from_slice(dir); moved[dlen..dlen + 7].copy_from_slice(b"/renr_e");
+    let fd = open(moved.as_ptr(), O_RDONLY, 0);
+    if fd < 0 { close(dfd); return report(name, false); }
+    close(fd);
+
+    // RENAME_NOREPLACE onto an existing name must still refuse with EEXIST.
+    let fd = open(dst.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    close(fd);
+    let r = syscall5(SYS_RENAMEAT2, dfd as usize, b"renr_e\0".as_ptr() as usize,
+                     dfd as usize, b"renr_d\0".as_ptr() as usize, RENAME_NOREPLACE);
+    close(dfd);
+    let noreplace_ok = r == -17; // EEXIST
+    unlink(dst.as_ptr());
+    unlink(moved.as_ptr());
+    report(name, noreplace_ok)
 }
 
 /// An exclusive flock() held by one process must cause a non-blocking

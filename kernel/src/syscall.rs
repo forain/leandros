@@ -1039,7 +1039,11 @@ fn dispatch_inner(
         // ── exec / fork ───────────────────────────────────────────────────────
         EXECVE  => {
             let res = sys_execve(a0, a1, a2);
-            if res < 0 {
+            // ENOENT is a routine PATH-search probe (every Rust/libc PATH
+            // lookup tries /usr/bin before /bin) — the caller reports it.
+            // Linux prints nothing for a failed execve; only surface the
+            // genuinely unusual failures (ENOEXEC, EFAULT, ...).
+            if res < 0 && res != -2 {
                 crate::serial_print_str("  [SYSCALL] sys_execve failed with error: ");
                 crate::serial_print_hex(res as usize);
                 crate::serial_print_str("\n");
@@ -1155,7 +1159,8 @@ fn dispatch_inner(
         // Filesystem operations (writable for /tmp, read-only otherwise)
         MKDIRAT     => sys_mkdirat(a0, a1, a2),
         UNLINKAT    => sys_unlinkat(a0, a1, a2),
-        RENAMEAT | RENAMEAT2 => sys_renameat(a1, a3),
+        RENAMEAT  => sys_renameat(a0, a1, a2, a3, 0),
+        RENAMEAT2 => sys_renameat(a0, a1, a2, a3, a4),
         LINKAT      => sys_linkat(a0, a1, a2, a3, a4),
         SYMLINKAT   => sys_symlinkat(a0, a1, a2),
         FCHMOD      => sys_fchmod(a0, a1),
@@ -1188,7 +1193,7 @@ fn dispatch_inner(
         #[cfg(not(target_arch = "aarch64"))]
         RMDIR  => sys_unlinkat(AT_FDCWD, a0, 0x200),
         #[cfg(not(target_arch = "aarch64"))]
-        RENAME => sys_renameat(a0, a1),
+        RENAME => sys_renameat(AT_FDCWD, a0, AT_FDCWD, a1, 0),
         #[cfg(not(target_arch = "aarch64"))]
         LINK    => sys_linkat(AT_FDCWD, a0, AT_FDCWD, a1, 0),
         #[cfg(not(target_arch = "aarch64"))]
@@ -3026,9 +3031,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         if let Some((ptr, len)) = initrd_data {
             (ptr, len)
         } else {
-            serial_print_str("[EXEC] Failed to find binary in VFS, RamFS, or initrd: ");
-            serial_print_str(path);
-            serial_print_str("\n");
+            // Silent: ENOENT here is normal PATH-probing (see EXECVE dispatch).
             return -2; // ENOENT
         }
     };
@@ -6960,12 +6963,26 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize)
 
 // ── rename / truncate / sendfile / itimer / sigpending / alarm ───────────────
 
-/// sys_renameat(old_path_ptr, new_path_ptr) — rename a /tmp file.
-fn sys_renameat(old_path_ptr: usize, new_path_ptr: usize) -> isize {
-    let old = match resolve_user_path(old_path_ptr) { Ok(p) => p, Err(e) => return e };
-    let new = match resolve_user_path(new_path_ptr) { Ok(p) => p, Err(e) => return e };
+/// sys_renameat(olddirfd, old_path_ptr, newdirfd, new_path_ptr, flags).
+///
+/// Both dirfds are honored (the atomic-write idiom — tempfile in an opened
+/// directory, then `renameat(dirfd, name, ...)` with *relative* names — is
+/// what cosmic-config/atomicwrites does for every state write; ignoring the
+/// dirfds resolved those names against the cwd and answered ENOENT).
+///
+/// RENAMEAT2 flag support: RENAME_NOREPLACE passes through to the filesystem;
+/// RENAME_EXCHANGE / RENAME_WHITEOUT answer EINVAL, which is exactly what
+/// Linux reports for a filesystem without support — callers (rustix,
+/// atomicwrites) treat that as "fall back to plain rename".
+fn sys_renameat(olddirfd: usize, old_path_ptr: usize,
+                newdirfd: usize, new_path_ptr: usize, flags: usize) -> isize {
+    const RENAME_NOREPLACE: usize = 1;
+    if flags & !RENAME_NOREPLACE != 0 { return -22; } // EINVAL
+    let old = match resolve_at_path(olddirfd, old_path_ptr) { Ok(p) => p, Err(e) => return e };
+    let new = match resolve_at_path(newdirfd, new_path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_RENAME, &[old.ptr() as u64, new.ptr() as u64]);
+    let msg = make_vfs_msg(vfs::VFS_RENAME,
+                           &[old.ptr() as u64, new.ptr() as u64, flags as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 

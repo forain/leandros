@@ -2660,7 +2660,8 @@ fn handle_rmdir(ms: &mut MountState, path_ptr: u64) -> Message {
     ok_reply()
 }
 
-fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
+fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) -> Message {
+    const RENAME_NOREPLACE: u64 = 1;
     let old_bytes = unsafe {
         let ptr = old_ptr as *const u8;
         let mut len = 0;
@@ -2694,9 +2695,48 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
     if old_parent_ino == 0 || new_parent_ino == 0 { return err_reply(-2); }
     let ino = dir_lookup(ms, old_parent_ino, old_name);
     if ino == 0 { return err_reply(-2); }
-    if dir_lookup(ms, new_parent_ino, new_name) != 0 { return err_reply(-17); } // EEXIST
     let iblkaddr = nat_lookup(ms, ino);
     let is_dir = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_is_dir(iblk) };
+
+    // POSIX rename atomically replaces an existing destination (the atomic-
+    // write idiom — write tempfile, rename over the real name — depends on
+    // it); only RENAME_NOREPLACE keeps refuse-with-EEXIST. Type rules first,
+    // then the victim is dropped exactly the way unlink/rmdir would drop it.
+    let dst_ino = dir_lookup(ms, new_parent_ino, new_name);
+    if dst_ino != 0 {
+        if flags & RENAME_NOREPLACE != 0 { return err_reply(-17); } // EEXIST
+        if dst_ino == ino { return ok_reply(); } // same file — POSIX no-op
+        let dst_iblkaddr = nat_lookup(ms, dst_ino);
+        let dst_is_dir =
+            { let iblk = ms.cache.read(ms.dev, dst_iblkaddr as u64); inode_is_dir(iblk) };
+        if is_dir && !dst_is_dir { return err_reply(-20); } // ENOTDIR
+        if !is_dir && dst_is_dir { return err_reply(-21); } // EISDIR
+        if dst_is_dir && !dir_is_empty(ms, dst_ino) { return err_reply(-39); } // ENOTEMPTY
+        if !dir_remove_entry(ms, new_parent_ino, new_name) { return err_reply(-2); }
+        if dst_is_dir {
+            // Same shape as rmdir: an empty dir's name is its last reference.
+            if !ino_is_open(ms, dst_ino) {
+                free_inode_data_and_nodes(ms, dst_ino);
+                free_block(ms, dst_iblkaddr);
+            }
+        } else {
+            // Same shape as unlink: honor surviving hard links and open fds.
+            let links =
+                { let iblk = ms.cache.read(ms.dev, dst_iblkaddr as u64); inode_links(iblk) };
+            if links > 1 {
+                let iblk = ms.cache.get_mut(ms.dev, dst_iblkaddr as u64);
+                w32(iblk, INO_LINKS, links - 1);
+                nat_update(ms, dst_ino, dst_iblkaddr);
+            } else if ino_is_open(ms, dst_ino) {
+                let iblk = ms.cache.get_mut(ms.dev, dst_iblkaddr as u64);
+                w32(iblk, INO_LINKS, 0);
+                nat_update(ms, dst_ino, dst_iblkaddr);
+            } else {
+                free_inode_data_and_nodes(ms, dst_ino);
+                free_block(ms, dst_iblkaddr);
+            }
+        }
+    }
     let ftype = if is_dir { DT_DIR } else { DT_REG };
     if !dir_add_entry(ms, new_parent_ino, new_name, ino, ftype) { return err_reply(-28); } // ENOSPC
     dir_remove_entry(ms, old_parent_ino, old_name);
@@ -3157,7 +3197,7 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
         VFS_MKDIR      => handle_mkdir(ms, arg(msg,0), arg(msg,1), euid, egid),
         VFS_UNLINK     => handle_unlink(ms, arg(msg,0)),
         VFS_RMDIR      => handle_rmdir(ms, arg(msg,0)),
-        VFS_RENAME     => handle_rename(ms, arg(msg,0), arg(msg,1)),
+        VFS_RENAME     => handle_rename(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_FTRUNCATE  => handle_ftruncate(ms, arg(msg,0), arg(msg,1)),
         VFS_STATFS     => handle_statfs(ms, arg(msg,1)),
         VFS_LSTAT      => handle_lstat(ms, arg(msg,0), arg(msg,1)),

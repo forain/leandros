@@ -1559,7 +1559,8 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_FTRUNCATE    => handle_ftruncate(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_FSYNC        => handle_fsync(caller_pid, arg(msg,0) as usize),
         VFS_SYNC         => handle_sync(),
-        VFS_RENAME       => handle_rename(arg(msg,0) as usize, arg(msg,1) as usize),
+        VFS_RENAME       => handle_rename(arg(msg,0) as usize, arg(msg,1) as usize,
+                                          arg(msg,2) as usize),
         VFS_FD_PATH      => handle_fd_path(caller_pid, arg(msg,0) as usize,
                                             arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_EVENTFD          => handle_eventfd(caller_pid, arg(msg,0) as u64, arg(msg,1) as u32),
@@ -4744,12 +4745,12 @@ fn handle_sync() -> Message {
 // See the comment on `tmpfs_path` for why the reverse order silently routed
 // all of /tmp's mutating operations at the pivoted-root F2FS mount.
 
-fn handle_rename(old_ptr: usize, new_ptr: usize) -> Message {
+fn handle_rename(old_ptr: usize, new_ptr: usize, flags: usize) -> Message {
     let (obuf, olen) = match read_cstr_raw(old_ptr) { Some(r) => r, None => return err_reply(-14) };
     let (nbuf, nlen) = match read_cstr_raw(new_ptr) { Some(r) => r, None => return err_reply(-14) };
 
     match (tmpfs_path(&obuf[..olen]), tmpfs_path(&nbuf[..nlen])) {
-        (Some(old), Some(new)) => tmpfs_rename(old, new),
+        (Some(old), Some(new)) => tmpfs_rename(old, new, flags),
         // One side in tmpfs, the other not: a real cross-filesystem move,
         // which is EXDEV. Coreutils' `mv` falls back to copy+unlink on this.
         (Some(_), None) | (None, Some(_)) => err_reply(-18),
@@ -4762,6 +4763,7 @@ fn handle_rename(old_ptr: usize, new_ptr: usize) -> Message {
                     proxy.tag = VFS_RENAME;
                     proxy.data[0..8].copy_from_slice(&(old_ptr as u64).to_le_bytes());
                     proxy.data[8..16].copy_from_slice(&(new_ptr as u64).to_le_bytes());
+                    proxy.data[16..24].copy_from_slice(&(flags as u64).to_le_bytes());
                     call_port(op, proxy)
                 }
                 (None, None) => err_reply(-30), // EROFS — RAMFS and friends
@@ -4775,7 +4777,8 @@ fn handle_rename(old_ptr: usize, new_ptr: usize) -> Message {
 ///
 /// Renaming a directory rewrites every descendant's stored path, since the
 /// pool is flat and parentage is encoded in the path bytes alone.
-fn tmpfs_rename(old: &[u8], new: &[u8]) -> Message {
+fn tmpfs_rename(old: &[u8], new: &[u8], flags: usize) -> Message {
+    const RENAME_NOREPLACE: usize = 1;
     if old == new { return ok_reply(); }
     if is_tmpfs_root(old) || is_tmpfs_root(new) { return err_reply(-16); } // EBUSY — mount root
     if new.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }     // ENAMETOOLONG
@@ -4795,6 +4798,7 @@ fn tmpfs_rename(old: &[u8], new: &[u8]) -> Message {
     // Destination handling, POSIX order: type mismatches first, then the
     // implicit removal of an existing target.
     if let Some(didx) = tmp_find(&tmp[..], new) {
+        if flags & RENAME_NOREPLACE != 0 { return err_reply(-17); } // EEXIST
         let dst_is_dir = tmp[didx].is_dir;
         if src_is_dir && !dst_is_dir { return err_reply(-20); }  // ENOTDIR
         if !src_is_dir && dst_is_dir { return err_reply(-21); }  // EISDIR
@@ -5002,7 +5006,14 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
 /// connect(): resolve `path` (following symlinks on every component) to the
 /// `sock_id` of the S_IFSOCK node bound there. Returns the sock_id (>= 0) or a
 /// negative errno: -2 ENOENT (nothing there), -111 ECONNREFUSED (exists but is
-/// not a socket), -95 EOPNOTSUPP (not a tmpfs path).
+/// not a socket).
+///
+/// A non-tmpfs path is ENOENT, not EOPNOTSUPP: sockets can only ever be bound
+/// on tmpfs here, so no socket exists at such a path — and that is exactly
+/// what Linux reports when a client connects to a socket file that isn't
+/// there (e.g. zbus probing /run/dbus/system_bus_socket on a system with no
+/// system bus). EOPNOTSUPP stays reserved for bind, where it correctly says
+/// "this filesystem cannot host a socket node".
 pub fn unix_resolve_node(_pid: u32, path: &[u8]) -> i64 {
     let mut resolved = [0u8; 256];
     let rpath = match tmp_resolve_links(path, true, &mut resolved) {
@@ -5011,7 +5022,7 @@ pub fn unix_resolve_node(_pid: u32, path: &[u8]) -> i64 {
     };
     let tpath = match tmpfs_path(rpath) {
         Some(p) => p,
-        None    => return -95,
+        None    => return -2, // ENOENT — no socket can exist off-tmpfs
     };
     let tmp = TMP_FILES.lock();
     match tmp_find(&tmp[..], tpath) {

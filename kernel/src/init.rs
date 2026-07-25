@@ -357,9 +357,8 @@ pub fn extract_binary_from_initrd(name: &str, boot_info: &boot::BootInfo) -> Opt
         offset = (file_start + filesize + 3) & !3;
     }
 
-    serial_print_str("[CPIO] File not found in initrd: ");
-    serial_print_str(target_name);
-    serial_print_str("\n");
+    // Silent: a miss here is the normal case for every exec PATH probe once
+    // the F2FS root is mounted (binaries live in the VFS, not the initrd).
     None
 }
 
