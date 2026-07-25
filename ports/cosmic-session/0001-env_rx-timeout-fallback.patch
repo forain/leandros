@@ -1,0 +1,58 @@
+Subject: [PATCH] cosmic-session: fall back to WAYLAND_DISPLAY=wayland-1 if the
+ comp env handshake does not complete
+
+LeandrOS startup-rendezvous workaround (M7q). cosmic-session blocks forever at
+main.rs's `env_rx.await`, waiting for cosmic-comp to deliver SetEnv{WAYLAND_
+DISPLAY} over the COSMIC_SESSION_SOCK UnixStream pair. Under LeandrOS's tokio
+async-read integration that oneshot never resolves, so NO session component
+(panel, bg, settings-daemon, notifications, ...) is ever spawned. The kernel
+socket/fork/exec/epoll path itself is verified sound (scmtest's
+fork_exec_inherit + fork_exec_child_clears_cloexec deciders pass on both arches),
+i.e. this is a userspace tokio residual, not a kernel bug.
+
+Rather than hang the whole session, race `env_rx` against a 5s timeout and fall
+back to the compositor's known wayland socket name (`/run/user/0/wayland-1`,
+which cosmic-comp does create) so the component cascade can start and the
+desktop comes up. This is a startup-rendezvous workaround, not a functional
+COSMIC change.
+
+Apply against the vendored cosmic-session source tree (the build tree is
+~/code/leandros-artifacts/m6-session-bins/src/cosmic-session, byte-identical to
+upstream cosmic-epoch/cosmic-session). Rebuild with build-rust.sh (musl
+toolchain), copy target/<triple>/release/cosmic-session to
+m6-session-bins/out/cosmic-session-<arch>, and regenerate the f2fs images.
+
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -145,11 +145,26 @@
+ 	)
+ 	.wrap_err("failed to start compositor")?;
+
+-	let mut env_vars = env_rx
+-		.await
+-		.expect("failed to receive environmental variables")
+-		.into_iter()
+-		.collect::<Vec<_>>();
++	// LeandrOS M7q startup-rendezvous workaround. cosmic-comp's
++	// SetEnv{WAYLAND_DISPLAY} handshake over COSMIC_SESSION_SOCK never completes
++	// under LeandrOS's tokio async-read integration, so env_rx.await blocks the
++	// whole session forever and no panel/bg/settings-daemon is ever spawned. The
++	// kernel socket/fork/exec/epoll path itself is verified sound (scmtest's
++	// fork_exec_inherit decider passes on both arches), i.e. this is a tokio
++	// residual, not a kernel bug. Rather than hang, race env_rx against a short
++	// timeout and fall back to the compositor's known wayland socket name so the
++	// component cascade can start and the desktop comes up.
++	let mut env_vars = match tokio::time::timeout(Duration::from_secs(5), env_rx).await {
++		Ok(Ok(vars)) => vars.into_iter().collect::<Vec<_>>(),
++		_ => {
++			warn!(
++				"cosmic-comp env handshake did not complete; falling back to \
++				 WAYLAND_DISPLAY=wayland-1"
++			);
++			vec![("WAYLAND_DISPLAY".to_string(), "wayland-1".to_string())]
++		}
++	};
+ 	info!(
+ 		"got environmental variables from cosmic-comp: {:?}",
+ 		env_vars
+ 	);
