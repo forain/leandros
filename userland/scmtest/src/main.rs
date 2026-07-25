@@ -88,6 +88,10 @@ use leandros_libc::syscall::{nr, syscall1, syscall2, syscall3, syscall4, syscall
 #[cfg(target_arch = "x86_64")]  const SYS_EPOLL_CTL:     usize = 233;
 #[cfg(target_arch = "aarch64")] const SYS_EPOLL_WAIT:    usize = 22;  // EPOLL_PWAIT
 #[cfg(target_arch = "x86_64")]  const SYS_EPOLL_WAIT:    usize = 232;
+// mincore(2): POSIX residency probe. Numbers match kernel/src/syscall.rs `mod nr`
+// (aarch64 nr module at :279, x86_64 at :489).
+#[cfg(target_arch = "aarch64")] const SYS_MINCORE:       usize = 232;
+#[cfg(target_arch = "x86_64")]  const SYS_MINCORE:       usize = 27;
 
 // epoll_event wire layout must match the kernel's per-arch struct exactly
 // (kernel/src/syscall.rs EPOLL_EVENT_SIZE/EPOLL_EVENT_DATA_OFF): x86_64 uses the
@@ -538,6 +542,46 @@ unsafe fn reap(pid: i32) {
     wait4(pid, &mut status, 0, core::ptr::null_mut());
 }
 
+// ── mincore: POSIX residency probe (the Mesa _eglPointerIsDereferenceable signal) ──
+//
+// The kernel's mincore used to be a bare `=> 0` stub that reported success for
+// ANY address, including the unmapped null page. That made Mesa's
+// `_eglPointerIsDereferenceable((void*)3)` return TRUE, so `get_wayland_surface`
+// misread `wl_egl_window.version==3` as a `wl_surface*` and cosmic-panel's EGL
+// window-surface create faulted (FAR=0x1B). POSIX-correct mincore must:
+//   - ENOMEM (-> raw -12) when the range covers an unmapped page (e.g. page 0),
+//   - 0 with the residency vector filled for a fully-mapped range,
+//   - EINVAL (-> raw -22) for a non-page-aligned addr.
+// Raw syscall returns are inspected directly (no errno wrapper) so the exact
+// error codes are asserted.
+unsafe fn test_mincore() -> bool {
+    let name = b"mincore";
+    let page = 4096usize;
+
+    // (a) A definitely-mapped range: the page holding this stack local.
+    let probe: u64 = 0xA5A5_A5A5;
+    let sp = &probe as *const u64 as usize;
+    let _ = core::ptr::read_volatile(&probe); // ensure the stack page is faulted in
+    let mapped = sp & !(page - 1);
+    let mut vec = [0u8; 1];
+    let r_mapped = syscall3(SYS_MINCORE, mapped, page, vec.as_mut_ptr() as usize);
+    let mapped_ok = r_mapped == 0 && (vec[0] & 1) == 1; // resident, no swap
+
+    // (b) The unmapped null page — exactly Mesa's `(void*)3 & ~0xfff` probe.
+    let r_null = syscall3(SYS_MINCORE, 0usize, page, vec.as_mut_ptr() as usize);
+    let null_ok = r_null == -12; // -ENOMEM
+
+    // (c) A misaligned addr → EINVAL.
+    let r_unalign = syscall3(SYS_MINCORE, mapped + 1, page, vec.as_mut_ptr() as usize);
+    let einval_ok = r_unalign == -22; // -EINVAL
+
+    if !mapped_ok { dbg0(b"[mincore] mapped-range probe wrong\n\0"); }
+    if !null_ok   { dbg0(b"[mincore] null page not ENOMEM\n\0"); }
+    if !einval_ok { dbg0(b"[mincore] unaligned addr not EINVAL\n\0"); }
+
+    report(name, mapped_ok && null_ok && einval_ok)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const *const u8) -> i32 {
     // M7q TASK 1: helper mode is entered ONLY via this test's own self-execve,
@@ -576,6 +620,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_tmpfs_mounts_exist() { failures += 1; }
     if !test_devshm_shared_mmap() { failures += 1; }
     if !test_queued_fd_cap() { failures += 1; }
+
+    // ── M7u: mincore residency probe (Mesa EGL pointer-dereferenceable signal) ──
+    if !test_mincore() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures

@@ -1023,7 +1023,7 @@ fn dispatch_inner(
         MPROTECT => sys_mprotect(a0, a1, a2),
         BRK      => sys_brk(a0),
         MREMAP   => sys_mremap(a0, a1, a2, a3, a4),
-        MINCORE  => 0, // pretend all pages are resident
+        MINCORE  => sys_mincore(a0, a1, a2),
 
         // ── Scheduling ────────────────────────────────────────────────────────
         SCHED_YIELD => { yield_now("syscall_yield"); 0 }
@@ -2654,6 +2654,66 @@ fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 fn sys_brk(new_end: usize) -> isize {
     with_current_address_space_mut(|as_| as_.brk(new_end))
         .unwrap_or(-12) // ENOMEM
+}
+
+/// POSIX `mincore(addr, length, vec)` — report which pages of `[addr, addr+length)`
+/// are resident in core.
+///
+/// LeandrOS has no swap, so every *mapped* page is resident. The load-bearing
+/// part of the contract is the error result, not the bitmap: callers such as
+/// Mesa's `_eglPointerIsDereferenceable` treat a non-negative return purely as
+/// "this address is mapped, so the pointer is real." The previous stub always
+/// returned success, which made that probe wrongly accept `(void*)3` and drove
+/// cosmic-panel's `wl_egl_window.version` into `wl_proxy_create_wrapper((wl_surface*)3)`
+/// (FAR=0x1B). We must return -ENOMEM whenever the range covers an unmapped page.
+///
+/// Semantics (matching Linux):
+///   - `addr` not page-aligned            → -EINVAL
+///   - `length == 0`                       → 0 (nothing to report)
+///   - range wraps the address space       → -ENOMEM
+///   - any page in the range has no VMA    → -ENOMEM
+///   - `vec` unwritable                    → -EFAULT
+///   - otherwise: write one byte per page (bit 0 = resident) and return 0.
+fn sys_mincore(addr: usize, length: usize, vec: usize) -> isize {
+    let page = mm::buddy::PAGE_SIZE;
+    if addr % page != 0 { return -22; } // EINVAL — addr must be page-aligned
+    if length == 0 { return 0; }
+    // Round length up to whole pages; reject a range that wraps the address space.
+    let pages = (length - 1) / page + 1;
+    let end = match pages.checked_mul(page).and_then(|b| addr.checked_add(b)) {
+        Some(e) => e,
+        None => return -12, // ENOMEM
+    };
+
+    with_current_address_space(|as_| {
+        // Pass 1: the whole range must be backed by VMAs — this is the exact
+        // "is this address mapped?" signal callers depend on. Bail before
+        // touching `vec` if any page is unmapped.
+        let mut va = addr;
+        while va < end {
+            if as_.find(va).is_none() { return -12isize; } // ENOMEM
+            va += page;
+        }
+        // Pass 2: emit the residency bitmap through the fault-checked copier so a
+        // bad `vec` fails as EFAULT rather than a kernel-mode data abort. A page
+        // is resident iff it has physical backing (eager, or a faulted-in lazy
+        // page); no swap means "mapped and present" == "resident".
+        const CHUNK: usize = 256;
+        let mut buf = [0u8; CHUNK];
+        let mut done = 0usize;
+        while done < pages {
+            let n = core::cmp::min(CHUNK, pages - done);
+            for i in 0..n {
+                let pva = addr + (done + i) * page;
+                buf[i] = if as_.virt_to_phys(pva).is_some() { 1 } else { 0 };
+            }
+            if !as_.write_user_buf(vec + done, &buf[..n]) {
+                return -14isize; // EFAULT
+            }
+            done += n;
+        }
+        0
+    }).unwrap_or(-12) // no current address space
 }
 
 // ── execve ────────────────────────────────────────────────────────────────────
