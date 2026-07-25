@@ -377,7 +377,14 @@ def main():
     gbm_files = []
     for so in ("libEGL.so.1", "libGLESv2.so.2", "libgbm.so.1", "libdrm.so.2",
                "libgallium-25.3.6.so", "libexpat.so.1", "libz.so.1",
-               "libwayland-client.so.0", "libwayland-server.so.0", "libffi.so.8"):
+               "libwayland-client.so.0", "libwayland-server.so.0",
+               # libwayland-egl.so.1 is dlopen()ed at runtime by wayland-sys
+               # (wayland-egl.rs egl.rs:25 tries "libwayland-egl.so.1" then
+               # ".so") the moment a client creates a WlEglSurface. cosmic-panel
+               # is the first client to use client-side Wayland-EGL; without it
+               # the panel panics ("Library libwayland-egl.so could not be
+               # loaded.") right after "Waiting for configure event".
+               "libwayland-egl.so.1", "libffi.so.8"):
         p = f"{gl_lib_dir}/{so}"
         if os.path.exists(p):
             usr_lib_files.append((so, p, 0o100755))
