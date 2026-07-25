@@ -1265,6 +1265,14 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns); // release UNIX_CONNS before waking pollers (K2 lock order)
             if n > 0 { sched::wake_poll(); }
+            // Full ring on a non-empty send (couldn't place even one byte) while
+            // the peer is still open → EAGAIN, not a bogus "sent 0 bytes".
+            // net_blocking_op only retries on -11; a 0 return reaches libwayland,
+            // which treats it as "flushed 0, tail unadvanced" and busy-loops in
+            // wl_connection_flush. Mirrors the fd-path (handle_sendmsg total==0
+            // → EAGAIN) and handle_recv's EOF-vs-EAGAIN split. (peer_closed is
+            // already false here — checked above — kept explicit per the invariant.)
+            if n == 0 && len > 0 && !peer_closed { return err_reply(-11); }
             val_reply(n as u64)
         }
         SockState::UnixPendingAccept { conn_idx, .. } => {
@@ -1283,6 +1291,10 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns);
             if n > 0 { sched::wake_poll(); }
+            // Full pre-accept buffer on a non-empty send → EAGAIN, not a bogus 0
+            // (same livelock as the UnixConnected branch above; peer_closed/
+            // closed_b already handled above).
+            if n == 0 && len > 0 { return err_reply(-11); }
             val_reply(n as u64)
         }
         SockState::InetConnected { socket_handle, remote_endpoint } => {

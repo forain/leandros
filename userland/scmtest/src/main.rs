@@ -150,6 +150,7 @@ struct CmsgBuf {
 const SOL_SOCKET: i32 = 1;
 const SCM_RIGHTS: i32 = 1;
 const MSG_CTRUNC: i32 = 0x08;
+const MSG_DONTWAIT: i32 = 0x40;
 const MSG_CMSG_CLOEXEC: i32 = 0x40000000;
 
 const AF_UNIX: i32 = 1;
@@ -620,6 +621,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_tmpfs_mounts_exist() { failures += 1; }
     if !test_devshm_shared_mmap() { failures += 1; }
     if !test_queued_fd_cap() { failures += 1; }
+    if !test_full_ring_eagain() { failures += 1; }
 
     // ── M7u: mincore residency probe (Mesa EGL pointer-dereferenceable signal) ──
     if !test_mincore() { failures += 1; }
@@ -1463,5 +1465,46 @@ unsafe fn test_queued_fd_cap() -> bool {
 
     close(fd); close(a); close(b);
     unlink(path.as_ptr());
+    report(name, ok)
+}
+
+/// H3 regression: a saturated stream send ring must answer EAGAIN, not a bogus
+/// "sent 0 bytes". The plain (no-SCM) UnixConnected/UnixPendingAccept send path
+/// used to `val_reply(0)` when the 4096-byte UnixRing was full. `net_blocking_op`
+/// only retries on -11, so a 0 return reached libwayland, which treats it as
+/// "flushed 0, tail unadvanced" and busy-loops in wl_connection_flush — the M4
+/// "slow-vs-stuck" livelock, and a plausible perturbation of the panel's
+/// first-frame window. Fill the ring with MSG_DONTWAIT writes (never draining the
+/// peer) and assert the writer eventually gets -1/EAGAIN and NEVER a 0 for a
+/// len>0 send.
+unsafe fn test_full_ring_eagain() -> bool {
+    let name = b"full_ring_eagain\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 { return report(name, false); }
+    let (a, b) = (sv[0], sv[1]);
+    // Never drain `b`; keep writing to `a` until ring_ab saturates. 256-byte
+    // chunks so the final short write exercises the partial path (len.min(free)).
+    let buf = [b'Z'; 256];
+    let mut total: isize = 0;
+    let mut got_eagain = false;
+    let mut bogus_zero = false;
+    // 4096-byte ring / 256 = 16 full chunks; loop well past that.
+    for _ in 0..256 {
+        let r = raw_send(a, buf.as_ptr(), buf.len(), MSG_DONTWAIT);
+        if r < 0 {
+            if get_errno() == EAGAIN { got_eagain = true; }
+            break;
+        } else if r == 0 {
+            // len>0 send returned 0 → the H3 bug (livelocks a blocking caller).
+            bogus_zero = true;
+            break;
+        } else {
+            total += r;
+        }
+    }
+    dbg2(b"[fre] total=%d eagain=%d (want ~4096 then EAGAIN, never 0)\n\0",
+         total as i64, got_eagain as i64);
+    let ok = got_eagain && !bogus_zero && total > 0 && total <= 4096;
+    close(a); close(b);
     report(name, ok)
 }
