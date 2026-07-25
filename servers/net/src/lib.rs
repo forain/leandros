@@ -38,6 +38,8 @@ pub const NET_FORK_DUP:   u64 = 0x43;
 pub const NET_EXEC_CLOEXEC: u64 = 0x44;
 pub const NET_SETFL:      u64 = 0x45;
 pub const NET_GETFL:      u64 = 0x46;
+pub const NET_SETFD:      u64 = 0x47;
+pub const NET_GETFD:      u64 = 0x48;
 
 const POLLIN:  u64 = 0x0001;
 const POLLOUT: u64 = 0x0004;
@@ -719,6 +721,8 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         NET_EXEC_CLOEXEC => handle_exec_cloexec(arg(msg,0) as u32),
         NET_SETFL       => handle_setfl(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         NET_GETFL       => handle_getfl(caller_pid, arg(msg,0) as usize),
+        NET_SETFD       => handle_setfd(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        NET_GETFD       => handle_getfd(caller_pid, arg(msg,0) as usize),
         _               => err_reply(-38),
     }
 }
@@ -2028,6 +2032,31 @@ fn handle_getfl(pid: u32, sockfd: usize) -> Message {
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
     if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
     val_reply(if tbl.socks[slot].nonblock { 0x800 } else { 0 })
+}
+
+/// fcntl(F_SETFD) for sockets: set/clear the close-on-exec flag. Critical for
+/// programs that inherit a SOCK_CLOEXEC socket and clear FD_CLOEXEC before
+/// execve so the fd survives — e.g. launch_pad's `with_fds`, which hands
+/// cosmic-panel / cosmic-notifications their notification socket by clearing
+/// cloexec in the child's pre_exec. Without this the flag never changed, the
+/// socket stayed cloexec, and the execve cloexec-sweep closed it → the child
+/// saw EBADF ("Bad file descriptor"). Only FD_CLOEXEC (bit 0) is defined.
+fn handle_setfd(pid: u32, sockfd: usize, arg: u32) -> Message {
+    let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
+    let mut tbls = SOCK_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    tbl.socks[slot].cloexec = arg & 1 != 0; // FD_CLOEXEC
+    ok_reply()
+}
+
+/// fcntl(F_GETFD) for sockets: report FD_CLOEXEC.
+fn handle_getfd(pid: u32, sockfd: usize) -> Message {
+    let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
+    let tbls = SOCK_TABLES.lock();
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    val_reply(if tbl.socks[slot].cloexec { 1 } else { 0 })
 }
 
 /// fcntl(F_DUPFD/F_DUPFD_CLOEXEC) on a socket fd: allocate a second slot

@@ -4595,6 +4595,8 @@ fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     }
     if fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE {
         const F_DUPFD: usize = 0;
+        const F_GETFD: usize = 1;
+        const F_SETFD: usize = 2;
         const F_GETFL: usize = 3;
         const F_SETFL: usize = 4;
         const F_DUPFD_CLOEXEC: usize = 1030;
@@ -4612,7 +4614,20 @@ fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 let msg = make_vfs_msg(net_server::NET_GETFL, &[fd as u64]);
                 net_reply_val(&net_server::handle(&msg, pid))
             }
-            _ => 0, // F_GETFD/F_SETFD: cloexec is tracked at creation/dup
+            // F_SETFD/F_GETFD must reach the net server's per-socket cloexec
+            // flag: a program that clears FD_CLOEXEC on an inherited SOCK_CLOEXEC
+            // socket before execve (launch_pad's with_fds → cosmic notification
+            // sockets) relies on it, else the socket stays cloexec and the
+            // execve sweep closes it, leaving the child with EBADF.
+            F_SETFD => {
+                let msg = make_vfs_msg(net_server::NET_SETFD, &[fd as u64, arg as u64]);
+                net_reply_val(&net_server::handle(&msg, pid))
+            }
+            F_GETFD => {
+                let msg = make_vfs_msg(net_server::NET_GETFD, &[fd as u64]);
+                net_reply_val(&net_server::handle(&msg, pid))
+            }
+            _ => 0,
         };
     }
     if fd <= 2 {
@@ -6608,35 +6623,65 @@ fn sys_inotify_rm_watch(_fd: usize, _wd: usize) -> isize { 0 }
 
 /// memfd_create(name_ptr, flags) → writable anonymous fd backed by a TmpFile.
 fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
-    // Build path "/tmp/memfd:<name>" truncated to fit TmpFileEntry::path.
-    let mut path = [0u8; 64];
-    let prefix = b"/tmp/memfd:";
-    path[..prefix.len()].copy_from_slice(prefix);
-    let mut plen = prefix.len();
-    if name_ptr != 0 {
-        for i in 0..48usize {
-            let b = unsafe { *(name_ptr as *const u8).add(i) };
-            if b == 0 { break; }
-            path[plen] = b; plen += 1;
-        }
-    } else {
-        path[plen] = b'0'; let _ = plen;
-    }
+    // A memfd must be a DISTINCT anonymous inode every call, even when two calls
+    // pass identical names (Linux semantics — the name is only a debug label).
+    // We back memfds with named tmpfs nodes "/tmp/memfd:<name>", so a reused name
+    // would otherwise reopen the SAME inode: smithay-client-toolkit creates every
+    // wl_shm SlotPool with the one fixed name "smithay-client-toolkit", and once
+    // the first pool sealed its inode (F_SEAL_SHRINK|F_SEAL_SEAL), the next
+    // memfd_create's O_TRUNC shrank a sealed file → EPERM, which panicked every
+    // libcosmic/winit client (cosmic-panel, cosmic-notifications). Create with
+    // O_EXCL and, on EEXIST, append a monotonic ":<seq>" suffix until the inode
+    // is unique. The suffix is skipped on the first try so the common
+    // unique-name case keeps its clean "/tmp/memfd:<name>" path.
+    static MEMFD_SEQ: AtomicUsize = AtomicUsize::new(1);
+    const O_RDWR:  u64 = 0x2;
+    const O_CREAT: u64 = 0x40; // 0o100
+    const O_EXCL:  u64 = 0x80;
+    const EEXIST:  isize = -17;
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_OPEN, &[
-        path.as_ptr() as u64,
-        (0x042 | 0x200) as u64, // O_RDWR|O_CREAT|O_TRUNC — O_RDWR (not O_WRONLY)
-                                // so the wl_shm compositor-side read() coherence
-                                // path is legal on the same fd (K1).
-        0o600u64,
-    ]);
-    let fd = vfs_reply_val(&vfs::handle(&msg, pid));
-    if fd >= 0 {
-        // Mark the inode as a memfd: creates an empty seal-capable VMO so the
-        // file is genuinely shareable and F_ADD_SEALS/F_GET_SEALS are honored.
-        vfs::mark_memfd(pid, fd as usize);
+    let mut suffix: usize = 0; // 0 => no suffix
+    loop {
+        let mut path = [0u8; 80];
+        let prefix = b"/tmp/memfd:";
+        path[..prefix.len()].copy_from_slice(prefix);
+        let mut plen = prefix.len();
+        if name_ptr != 0 {
+            for i in 0..48usize {
+                let b = unsafe { *(name_ptr as *const u8).add(i) };
+                if b == 0 { break; }
+                if plen < 60 { path[plen] = b; plen += 1; }
+            }
+        } else if plen < 60 {
+            path[plen] = b'0'; plen += 1;
+        }
+        if suffix != 0 {
+            if plen < 62 { path[plen] = b':'; plen += 1; }
+            let mut digits = [0u8; 20]; let mut d = 0; let mut v = suffix;
+            while v > 0 && d < 20 { digits[d] = b'0' + (v % 10) as u8; d += 1; v /= 10; }
+            for i in (0..d).rev() { if plen < 79 { path[plen] = digits[i]; plen += 1; } }
+        }
+        let _ = plen;
+        let msg = make_vfs_msg(vfs::VFS_OPEN, &[
+            path.as_ptr() as u64,
+            O_RDWR | O_CREAT | O_EXCL, // fresh inode; O_EXCL guarantees empty, so
+                                       // no O_TRUNC (which a sealed reopen would
+                                       // reject). O_RDWR keeps the wl_shm
+                                       // read()-coherence path legal (K1).
+            0o600u64,
+        ]);
+        let fd = vfs_reply_val(&vfs::handle(&msg, pid));
+        if fd == EEXIST {
+            suffix = MEMFD_SEQ.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if fd >= 0 {
+            // Mark the inode as a memfd: creates an empty seal-capable VMO so the
+            // file is genuinely shareable and F_ADD_SEALS/F_GET_SEALS are honored.
+            vfs::mark_memfd(pid, fd as usize);
+        }
+        return fd;
     }
-    fd
 }
 
 fn sys_timerfd_create(_clockid: usize, flags: usize) -> isize {
