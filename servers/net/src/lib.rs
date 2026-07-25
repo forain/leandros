@@ -1125,7 +1125,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
 
         // Resolve the address to the sock_id of a live listener. Abstract
         // names byte-match here; pathnames resolve through the VFS (symlinks,
-        // the /dev/shm and /run/user/0 tmpfs mounts, S_IFSOCK check).
+        // the /dev/shm and /run/user tmpfs mounts, S_IFSOCK check).
         let sock_id = if is_abstract {
             let bound = BOUND_PATHS.lock();
             let mut found = None;

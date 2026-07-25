@@ -1301,7 +1301,6 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/dev/shm",
     b"/run",
     b"/run/user",
-    b"/run/user/0",
     b"/mnt",
     b"/home",
     b"/root",
@@ -1319,6 +1318,20 @@ static SERVER_PORT: Mutex<u32> = Mutex::new(u32::MAX);
 pub fn init(owner_pid: u32) -> Option<u32> {
     let port_id = port::create(owner_pid)?;
     *SERVER_PORT.lock() = port_id;
+
+    // Seed root's XDG runtime dir. /run/user/<uid> dirs are ordinary tmpfs
+    // pool directories under the /run/user mount root, normally mkdir'd by
+    // the login session that owns them — but early boot (and scmtest's
+    // tmpfs_mounts_exist) relies on /run/user/0 existing before any login
+    // step has run, so it is created here: uid 0, gid 0, mode 0700.
+    {
+        let mut tmp = TMP_FILES.lock();
+        let e = &mut tmp[0];
+        e.in_use = true;
+        e.is_dir = true;
+        e.mode   = 0o700;
+        tmp_set_path(e, b"/run/user/0");
+    }
     
     // Register IPC handler to respond to PINGs (prevents deadlocks during discovery scans)
     port::register_handler(port_id, |msg, pid, _target| {
@@ -1717,8 +1730,13 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
 /// slash; the TMP_FILES pool holds strict descendants of these (files, dirs,
 /// symlinks, and AF_UNIX socket nodes), and each root itself is a pseudo-dir
 /// listed in RAMFS_DIRS. `/tmp` is the original; `/dev/shm` (POSIX shm, wl_shm)
-/// and `/run/user/0` (Wayland + D-Bus sockets) are the K1 additions.
-static TMPFS_ROOTS: &[&[u8]] = &[b"/tmp", b"/dev/shm", b"/run/user/0"];
+/// and `/run/user` (Wayland + D-Bus sockets) are the K1 additions.
+///
+/// `/run/user` is the root — NOT `/run/user/0` — so every per-uid XDG runtime
+/// dir (`/run/user/<uid>`) is an ordinary pool directory a login session can
+/// `mkdir` with its own uid/gid and 0700 mode. Root's `/run/user/0` is seeded
+/// into the pool by `init()` so it exists from boot.
+static TMPFS_ROOTS: &[&[u8]] = &[b"/tmp", b"/dev/shm", b"/run/user"];
 
 /// True when `path` names a tmpfs mount root exactly.
 fn is_tmpfs_root(path: &[u8]) -> bool {
@@ -1740,13 +1758,13 @@ fn is_tmp_path(path: &[u8]) -> bool {
 
 /// S_IFDIR mode (type | permission bits) for a RAMFS_DIRS pseudo-directory.
 /// The K1 tmpfs mount roots carry conventional perms: `/dev/shm` is
-/// world-writable + sticky (1777, like a real shm mount), `/run/user/0` is
-/// private to its owner (0700). Everything else keeps the historical 0755.
+/// world-writable + sticky (1777, like a real shm mount). Everything else
+/// keeps the historical 0755 (`/run/user` is 0755 root, like Linux; the
+/// per-uid dirs under it are pool entries carrying their own uid + 0700).
 fn ramfs_dir_mode(dir: &[u8]) -> u32 {
     match dir {
-        b"/dev/shm"    => 0o041777,
-        b"/run/user/0" => 0o040700,
-        _              => 0o040755,
+        b"/dev/shm" => 0o041777,
+        _           => 0o040755,
     }
 }
 
@@ -2031,7 +2049,7 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
         // index of the '/' preceding it, `comp_end` one past its last byte.
         let hit = {
             let tmp = TMP_FILES.lock();
-            // Skip the mount-root prefix ("/tmp", "/dev/shm", "/run/user/0") so
+            // Skip the mount-root prefix ("/tmp", "/dev/shm", "/run/user") so
             // component scanning starts at the first path element under it.
             let mut comp_start = tmpfs_root_of(path).map(|r| r.len()).unwrap_or(4);
             let mut found = None;
@@ -2499,7 +2517,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         } else if lookup_path == b"/dev/fb0" {
             VnodeKind::DevFb { pos: 0 }
         } else if is_tmp_path(path) && !is_tmpfs_root(path) {
-            // ── Writable tmpfs file (/tmp, /dev/shm, /run/user/0) ─────────────────
+            // ── Writable tmpfs file (/tmp, /dev/shm, /run/user) ──────────────────
             let writable = flags & (O_WRONLY | O_RDWR) != 0;
             let create   = flags & O_CREAT  != 0;
             let trunc    = flags & O_TRUNC  != 0;
@@ -4939,7 +4957,7 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
 //
 // A pathname AF_UNIX bind creates a real S_IFSOCK node on tmpfs; connect
 // resolves the path through the same lookup machinery (symlinks, the
-// /tmp/-/dev/shm/-/run/user/0 mounts) back to the net server's listener.
+// /tmp/-/dev/shm/-/run/user mounts) back to the net server's listener.
 // Abstract-namespace sockets never reach here (net matches those by bytes).
 
 /// bind(): create an S_IFSOCK node at `path`, tagged with the net server's
