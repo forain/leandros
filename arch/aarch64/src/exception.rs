@@ -242,6 +242,38 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
         //   llvm-addr2line -f -i -C -e cosmic-comp-<arch> <ret − 0x200000>
         const EL0_BACKTRACE: bool = false;
         if EL0_BACKTRACE {
+            // Hardware translation probes (AT S1E0R/W): re-run the stage-1 EL0
+            // walk for the fault addresses without any manual page-table
+            // dereference, so a bad/absent descriptor lands in PAR_EL1 instead
+            // of re-faulting this EL1 handler. PAR_EL1.F(bit0)=1 ⇒ fault, with
+            // the DFSC-style status in bits[6:1]; F=0 ⇒ bits[47:12]=output PA.
+            let at_probe = |va: usize, write: bool| -> u64 {
+                let par: u64;
+                unsafe {
+                    if write {
+                        core::arch::asm!("at s1e0w, {}", "isb", in(reg) va);
+                    } else {
+                        core::arch::asm!("at s1e0r, {}", "isb", in(reg) va);
+                    }
+                    core::arch::asm!("mrs {}, par_el1", out(reg) par);
+                }
+                serial_print_str("[AT] va=");
+                print_hex(va);
+                serial_print_str(if write { " W par=" } else { " R par=" });
+                print_hex(par as usize);
+                serial_print_str("\n");
+                par
+            };
+            // Real user page table active at fault time (saved by the vector),
+            // plus the task/leader identity the fault resolver will consult.
+            serial_print_str("[BT] frame.pt(ttbr0)=");
+            print_hex((*frame).pt as usize);
+            serial_print_str("\n");
+            sched::dump_task_ident();
+            let is_write_bt = ec == 0x24 && ((esr >> 6) & 1) != 0;
+            let far_par = at_probe(far as usize, is_write_bt);
+            let elr_par = at_probe(elr as usize, false);
+            let _ = (far_par, elr_par);
             const STACK_TOP: usize = 0x0000_7fff_ffff_f000;
             const STACK_SIZE: usize = 2048 * 4096; // 8 MiB, USER_STACK_SIZE
             const STACK_BASE: usize = STACK_TOP - STACK_SIZE;
@@ -280,8 +312,24 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
             // base-vs-symbolization paradox: print the runtime instruction word
             // at ELR, at the return site (x30), and a small window — read only
             // within the main-image VA range so this cannot fault-in-fault.
+            // Only read an instruction word after an AT probe shows the page
+            // translates cleanly (PAR_EL1.F==0); otherwise the EL1 read would
+            // hit the same SEA/translation fault and re-enter this handler.
             let dump = |addr: usize| {
                 if (0x0020_0000..0x3000_0000).contains(&addr) && (addr & 0x3) == 0 {
+                    let par: u64;
+                    unsafe {
+                        core::arch::asm!("at s1e0r, {}", "isb", in(reg) addr);
+                        core::arch::asm!("mrs {}, par_el1", out(reg) par);
+                    }
+                    if par & 1 != 0 {
+                        serial_print_str("[BT] insn @");
+                        print_hex(addr);
+                        serial_print_str(" = <notranslate par=");
+                        print_hex(par as usize);
+                        serial_print_str(">\n");
+                        return;
+                    }
                     let w = core::ptr::read_volatile(addr as *const u32);
                     serial_print_str("[BT] insn @");
                     print_hex(addr);
@@ -298,8 +346,11 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
             dump(lr_u.wrapping_sub(8));
             dump(lr_u.wrapping_sub(4));
             dump(lr_u);
-            // Module map: which VMA (base + file offset) contains the faulting PC.
+            // Module map: which VMA (base + file offset) contains the faulting PC
+            // and (separately) the faulting data address — the latter reveals
+            // whether a stack/anon write-fault landed in a registered region.
             sched::dump_user_vma(elr as usize);
+            sched::dump_user_vma(far as usize);
         }
 
         sched::exit(1);
