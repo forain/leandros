@@ -854,7 +854,17 @@ fn find_mount_port(path: &[u8]) -> Option<u32> {
 /// than merely error. See the F_SETPIPE_SZ arm in handle_fcntl, which refuses
 /// requests above this so that case fails cleanly instead of wedging.
 const PIPE_RING_SIZE: usize = 16384;
-const MAX_PIPES:      usize = 16;
+// The full COSMIC desktop session spawns ~14 long-lived components via
+// cosmic-session/launch_pad, each holding 3 stdio pipes (stdin/stdout/stderr)
+// for its whole lifetime so launch_pad can stream on_stdout/on_stderr — plus
+// dbus-run-session/busd and transient restart overlap. At MAX_PIPES=16 the pool
+// exhausted after ~5 spawns and every later component (cosmic-bg, -osd,
+// -workspaces, -launcher, and the panel's own children) failed with ENFILE
+// (-23), triggering a restart storm that corrupted already-connected clients.
+// 128 pipes (2 MiB static, trivial on the 2 GiB guest) covers the whole session
+// simultaneously with generous headroom. PIPE_RING_SIZE stays 16 KiB — here-doc
+// staging and the F_SETPIPE_SZ cap depend on it (see the note above).
+const MAX_PIPES:      usize = 128;
 
 struct PipeRing {
     buf:         [u8; PIPE_RING_SIZE],
