@@ -539,6 +539,20 @@ def main():
         if os.path.exists(src):
             bin_files.append((name, src, 0o100755))
 
+    # leandros-applet — a minimal dependency-free wl_shm xdg_toplevel panel applet.
+    # cosmic-panel refuses to render its bar with no applet content (render()
+    # early-returns while actual_size<=20), and the real cosmic applets pull
+    # tokio+zbus+system services (timedate1/logind/upower) absent on LeandrOS. This
+    # tiny client draws one solid block so the panel has real content and commits
+    # frame 0. It is spawned by cosmic-panel via the desktop file staged into
+    # /usr/share/applications (m6-session-data/shared) whose stem matches the panel
+    # config's center applet name (com.system76.CosmicAppletTime). Pure-Rust wayland
+    # backend => only ld-musl at runtime.
+    m7w_applet = os.path.expanduser(
+        f"~/code/leandros-artifacts/m7w-applet/out/leandros-applet-{arch}")
+    if os.path.exists(m7w_applet):
+        bin_files.append(("leandros-applet", m7w_applet, 0o100755))
+
     # The session launcher itself (a POSIX-sh script). The kernel execve()s ELF
     # only (no "#!"-shebang binfmt), so it is run as `sh /bin/start-cosmic-leandros`.
     m6_launcher = os.path.expanduser(
