@@ -1375,6 +1375,29 @@ pub fn get_file_data(path_ptr: usize) -> Option<(*const u8, usize)> {
     None
 }
 
+/// Debug-only kernel-side read of a tmpfs regular file by absolute normalised
+/// path (e.g. "/tmp/panel.log") into `out`, returning bytes copied. Kernel
+/// buffers only — no user pointers — so it is safe to call from an arbitrary
+/// syscall context (it takes only `TMP_FILES.lock()`, a plain spin mutex).
+///
+/// Backs the gated serial-dump diagnostic (`dbg_serial_dump` in the syscall
+/// crate), which streams guest logs directly out the PL011 TX to bypass the
+/// console/tty entirely — under HVF a Wayland compositor starves the UART RX
+/// FIFO, so driver keystrokes drop and `cat`-of-a-log garbles. Returns `None`
+/// for a missing path, a directory, a symlink, or an ephemeral /proc snapshot.
+pub fn tmpfs_read_all(path: &str, out: &mut [u8]) -> Option<usize> {
+    let p = path.as_bytes();
+    let tmp = TMP_FILES.lock();
+    let idx = tmp_find(&tmp[..], p)?;
+    if tmp[idx].is_dir || tmp[idx].is_link || tmp[idx].is_fifo || tmp[idx].is_sock {
+        return None;
+    }
+    let owner = tmp_owner(&tmp[..], idx);
+    let n = tmp[owner].len.min(out.len());
+    out[..n].copy_from_slice(&tmp[owner].data[..n]);
+    Some(n)
+}
+
 /// Look up a path string in RamFS and return a pointer + length to its data.
 pub fn get_file_data_by_path(path: &str) -> Option<(*const u8, usize)> {
     let bytes = path.as_bytes();

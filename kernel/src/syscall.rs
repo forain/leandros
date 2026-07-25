@@ -8,7 +8,7 @@
 //! Syscall numbers match Linux ABI so that musl libc requires no patching.
 //! Leandros-private syscalls (IPC, spawn) use numbers above 509.
 
-use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicUsize, AtomicU32, AtomicU64, AtomicBool, Ordering};
 use alloc::vec::Vec;
 use crate::{serial_print_str, serial_write_raw, BOOT_INFO_PTR, init};
 use ipc::{Message, port};
@@ -268,6 +268,11 @@ pub const SYS_USBDEV_INFO:  usize = 520;
 /// per-open dynamic content, so this sidesteps that rather than fighting it.
 pub const SYS_MOUNTS_COUNT: usize = 521;
 pub const SYS_MOUNTS_INFO:  usize = 522;
+
+/// Gated debug: emit a short user string straight to the serial TX, framed, so
+/// a userspace checkpoint round-trips even when a compositor owns the console
+/// (PL011 RX starves under HVF but TX is always reliable). See DBG_SERIAL_WRITE.
+pub const SYS_DBG_SERIAL_WRITE: usize = 590;
 
 // ── AArch64 Linux syscall numbers ─────────────────────────────────────────────
 #[cfg(target_arch = "aarch64")]
@@ -736,6 +741,7 @@ pub fn dispatch(
     a3: usize, a4: usize, a5: usize,
     frame_ptr: usize,
 ) -> isize {
+    dbg_serial_dump_maybe();
     let ret = dispatch_inner(number, a0, a1, a2, a3, a4, a5, frame_ptr);
     if SYSCALL_TRACE_EINVAL && ret == -22 && current_pid() >= 3 {
         let _g = TRACE_LOCK.lock();
@@ -832,6 +838,112 @@ const SYSCALL_TRACE_FDS: bool = false;
 /// otherwise interleave their serial output into an unreadable shuffle.
 static TRACE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
+// ── Gated serial-dump diagnostic ──────────────────────────────────────────────
+//
+// Garble-proof guest-log capture. Under HVF, once a Wayland compositor
+// (cosmic-comp) owns the console the PL011 RX FIFO starves: driver keystrokes
+// drop, so `cat /tmp/foo` garbles and >/dev/console mangles argv. The PL011 TX,
+// however, is always reliable (every kernel serial log uses it). This facility
+// streams a fixed set of tmpfs guest files straight out the TX, framed with
+// unique markers, entirely bypassing the console/tty and the driver's RX path.
+//
+// It runs from the top of `dispatch()` in normal syscall context (an arbitrary
+// process's syscall) — NOT from IRQ/scheduler-lock context — so the tmpfs read
+// (a plain spin-mutex) and the serial write are safe. A running session makes
+// thousands of syscalls/sec, so the interval below is effectively precise. The
+// whole frame is emitted under TRACE_LOCK so kernel trace/fault prints can't
+// split it. Gated OFF by default; flip DBG_SERIAL_DUMP to true to periodically
+// snapshot whole guest files. For pinpoint checkpoints prefer SYS_DBG_SERIAL_
+// WRITE (below), which emits on demand with no periodic tmpfs polling or large
+// serial bursts — cheaper and lower-risk under a churning session.
+const DBG_SERIAL_DUMP: bool = false;
+
+/// Gate SYS_DBG_SERIAL_WRITE: a userspace checkpoint syscall that writes a short
+/// string straight to the serial TX (framed `[UCK] ...`). On-demand, bounded to
+/// 256 bytes, no locks beyond TRACE_LOCK, no tmpfs polling. This is the
+/// preferred garble-proof capture for instrumenting a silent userspace failure
+/// (proven: it round-tripped cosmic-panel's layer-shell checkpoints under HVF
+/// after cosmic-comp starved the console RX). Gated OFF by default; flip to true
+/// and rebuild when instrumenting a userspace bring-up, then flip back.
+const DBG_SERIAL_WRITE: bool = false;
+
+/// Handle SYS_DBG_SERIAL_WRITE(ptr, len): copy up to 256 bytes of user text and
+/// emit it framed on the serial TX. No-op (returns 0) unless DBG_SERIAL_WRITE.
+fn sys_dbg_serial_write(ptr: usize, len: usize) -> isize {
+    if !DBG_SERIAL_WRITE { return 0; }
+    let n = len.min(256);
+    if n == 0 || ptr == 0 { return 0; }
+    let mut buf = [0u8; 256];
+    let ok = with_current_address_space(|as_| as_.read_user_buf(ptr, &mut buf[..n]))
+        .unwrap_or(false);
+    if !ok { return -14; } // EFAULT
+    let _g = TRACE_LOCK.lock();
+    crate::serial_print_str("[UCK] ");
+    crate::serial_write_raw(&buf[..n]);
+    crate::serial_print_str("\n");
+    n as isize
+}
+
+/// Files streamed each interval. Missing/empty/non-regular entries are skipped.
+/// Small dedicated checkpoint files (panel.ckpt) beat verbose logs here: the
+/// tmpfs per-file cap is 32 KiB, so a chatty RUST_LOG=debug can overflow before
+/// the point of interest, whereas one-line checkpoint markers never do.
+const DBG_SERIAL_DUMP_PATHS: &[&str] = &[
+    "/tmp/panel.ckpt",
+    "/tmp/panel.panic",
+    "/tmp/comp.ckpt",
+    "/tmp/panel.log",
+];
+
+/// Dump cadence in 100 Hz timer ticks (600 = 6 s).
+const DBG_SERIAL_DUMP_INTERVAL_TICKS: u64 = 600;
+
+static DBG_DUMP_LAST_TICK: AtomicU64 = AtomicU64::new(0);
+static DBG_DUMP_BUSY: AtomicBool = AtomicBool::new(false);
+/// Single 32 KiB staging buffer, exclusive via DBG_DUMP_BUSY (one dumper at a
+/// time). Mutex avoids `static mut` unsafety; it is only ever taken by the sole
+/// CPU that wins the busy CAS.
+static DBG_DUMP_BUF: spin::Mutex<[u8; 32768]> = spin::Mutex::new([0u8; 32768]);
+
+/// Emit the framed contents of the dump path list to the serial TX, at most
+/// once per interval. Cheap early-out on the common (not-yet-due) path.
+fn dbg_serial_dump_maybe() {
+    if !DBG_SERIAL_DUMP { return; }
+    let now = ticks();
+    let last = DBG_DUMP_LAST_TICK.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < DBG_SERIAL_DUMP_INTERVAL_TICKS { return; }
+    // Claim the interval; a losing racer just returns.
+    if DBG_DUMP_BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    DBG_DUMP_LAST_TICK.store(now, Ordering::Relaxed);
+
+    let mut buf = DBG_DUMP_BUF.lock();
+    let _g = TRACE_LOCK.lock();
+    for path in DBG_SERIAL_DUMP_PATHS {
+        if let Some(n) = vfs::tmpfs_read_all(path, &mut buf[..]) {
+            if n == 0 { continue; }
+            crate::serial_print_str("\n===LDUMP<< ");
+            crate::serial_print_str(path);
+            crate::serial_print_str(" len=");
+            crate::serial_print_hex(n);
+            crate::serial_print_str(" tick=");
+            crate::serial_print_hex(now as usize);
+            crate::serial_print_str(" ===\n");
+            crate::serial_write_raw(&buf[..n]);
+            crate::serial_print_str("\n===LDUMP>> ");
+            crate::serial_print_str(path);
+            crate::serial_print_str(" ===\n");
+        }
+    }
+    drop(_g);
+    drop(buf);
+    DBG_DUMP_BUSY.store(false, Ordering::Release);
+}
+
 /// One line of fd trace: `[FD] pid=<p> <what> a=<..> b=<..> c=<..> -> <ret>`.
 fn trace_fd(what: &str, a: usize, b: usize, c: usize, ret: isize) {
     if !SYSCALL_TRACE_FDS { return; }
@@ -901,6 +1013,7 @@ fn dispatch_inner(
         SYS_PCIDEV_INFO  => sys_pcidev_info(a0, a1),
         SYS_USBDEV_COUNT => drivers::usb_hcd::device_count() as isize,
         SYS_USBDEV_INFO  => sys_usbdev_info(a0, a1),
+        SYS_DBG_SERIAL_WRITE => sys_dbg_serial_write(a0, a1),
         SYS_MOUNTS_COUNT => vfs::list_mounts().iter().filter(|e| e.in_use).count() as isize,
         SYS_MOUNTS_INFO  => sys_mounts_info(a0, a1),
 
