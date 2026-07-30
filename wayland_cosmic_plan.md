@@ -11,6 +11,53 @@ below were verified at planning time.
 
 ---
 
+## 0. Current state (2026-07-30) and the next lane
+
+**The desktop runs.** Since M7w (commit `8a76fa2`) a full session — cosmic-session →
+cosmic-comp on KMS/softpipe → busd → cosmic-bg + cosmic-panel — renders the Orion
+Nebula wallpaper plus a full-width panel bar with an embedded Wayland client, verified
+on both arches. What is left is quality, and it has a clear order.
+
+**1. DRM cursor plane — the next thing to build.** The pointer moves at roughly
+**1 fps**. Measured with the `DRM_STATS` instrumentation in
+`drivers/src/drm_device_interface.rs` (left in the tree, default `false`): under 60
+pointer moves/s the compositor submits **0.9 page flips/s**, every submitted flip is
+delivered, `DIRTYFB` is never called, and the kernel's own scale + full-screen transfer
+costs only **1.7 ms/flip**. So neither the 50 Hz `drm_tick` delivery throttle nor our
+flush is the constraint — the compositor is recompositing the entire screen in software
+for every pointer motion, because we expose **no cursor plane**:
+`GETPLANERESOURCES` returns a single `DRM_PLANE_TYPE_PRIMARY` plane, no
+`DRM_IOCTL_MODE_CURSOR`/`CURSOR2` constant exists anywhere in the tree, and
+virtio-gpu's cursor queue is never `setup_queue`d (only queue 0 is).
+
+*Settle this before writing code:* `std_handle_set_client_cap` deliberately refuses
+`DRM_CLIENT_CAP_ATOMIC` so smithay takes the legacy path (and the launcher sets
+`SMITHAY_USE_LEGACY=1`). smithay generally drives cursor planes only on the **atomic**
+path — confirm the legacy backend actually issues `drmModeSetCursor2`/`drmModeMoveCursor`,
+or the plane will go unused. Fallback that works either way: expose the plane but
+composite in-kernel, flushing only `old_rect ∪ new_rect` (~32 KB) instead of 4.1 MB.
+
+**2. Hardware acceleration / Vulkan — needs a Linux host, not code.**
+`virtio-gpu-gl-pci,venus=on` requires libepoxy's EGL dispatch and **macOS has no native
+EGL**; rutabaga is a confirmed dead end for Venus (its device never sets the
+VIRGL/VENUS capset bits, checked v9.2 → master). The M1 kernel/DRM Venus transport is
+already code-complete and boot-verified but has never had a real host round-trip. Start
+this lane by acquiring a Linux box/VM/CI runner, where
+`apt install qemu-system-x86 libvirglrenderer-dev` gives a working device with no source
+builds.
+
+**3. Real panel content — blocked on two kernel gaps.** The bar currently shows a
+placeholder clock frozen at its first frame. `sys_memfd_create` backs each memfd with a
+*named* tmpfs node it never unlinks, so every call permanently burns one of 128
+`MAX_TMP_FILES` slots (a 1 Hz repainter bricks `memfd_create` system-wide after ~100
+frames) — and simply unlinking it is not the fix, because `ftruncate`/`mmap` still
+resolve that inode by name and fail `ENOMEM`, taking the session down. Separately, a
+*persistent* `MAP_SHARED` memfd mapping is not coherent cross-process: content written
+before the peer maps it is visible, later writes are not. See the comment at the
+`sys_memfd_create` call site.
+
+---
+
 ## 1. The shape of the problem
 
 COSMIC's Linux coupling lives almost entirely in **system libraries and build flags**,
