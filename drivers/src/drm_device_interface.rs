@@ -357,6 +357,27 @@ static PENDING_FLIPS: Mutex<VecDeque<[u8; 32]>> = Mutex::new(VecDeque::new());
 static READY_EVENTS:  Mutex<VecDeque<[u8; 32]>> = Mutex::new(VecDeque::new());
 static FLIP_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static LAST_FLIP_DELIVER_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Frame-pipeline instrumentation for cursor-latency triage: one line every
+/// 2 s with page-flips submitted/delivered, DIRTYFB calls, and cumulative time
+/// inside the flip path. Off by default — it writes to the UART straight from
+/// the tick, bypassing CONSOLE_OUT_LOCK. Flip to `true` to re-measure.
+///
+/// What it established (aarch64, 1280x800, softpipe): under 60 pointer moves/s
+/// the compositor submits **0.9 page flips/s**, every submitted flip is
+/// delivered (so the 50 Hz `drm_tick` throttle below is nowhere near binding),
+/// DIRTYFB is never used, and the kernel's own scale+flush costs only ~1.7 ms
+/// per flip. The ~1 fps pointer is therefore the compositor recompositing the
+/// whole screen in software, not anything in this path.
+pub const DRM_STATS: bool = false;
+static FLIPS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
+static DIRTYFB_CALLS: AtomicU64 = AtomicU64::new(0);
+static DIRTYFB_CLIPS: AtomicU64 = AtomicU64::new(0);
+/// Cumulative microseconds spent inside the page-flip path (software scale +
+/// full-screen virtio-gpu transfer). Tells apart "our flush is the bottleneck"
+/// from "the compositor's softpipe recomposite is".
+static FLIP_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static LAST_STAT_TICK: AtomicU64 = AtomicU64::new(0);
 /// Advances each time an event becomes readable — epoll's edge emulation reads
 /// this as the card fd's readiness sequence (see VFS handle_poll seq contract).
 static DELIVERED_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -392,6 +413,25 @@ fn queue_flip_event(crtc_id: u32, user_data: u64) {
 /// read/flip paths each touching only one of the two means no deadlock.
 pub fn drm_tick() {
     let now = sched::ticks();
+    if DRM_STATS {
+        let ls = LAST_STAT_TICK.load(Ordering::Relaxed);
+        if now.wrapping_sub(ls) >= 200 {
+            LAST_STAT_TICK.store(now, Ordering::Relaxed);
+            crate::pci::serial_debug("[DRMSTAT] t=");
+            crate::pci::serial_debug_hex_64(now);
+            crate::pci::serial_debug(" flips_sub=");
+            crate::pci::serial_debug_hex_64(FLIPS_SUBMITTED.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" flips_del=");
+            crate::pci::serial_debug_hex_64(DELIVERED_SEQ.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" dirtyfb=");
+            crate::pci::serial_debug_hex_64(DIRTYFB_CALLS.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" clips=");
+            crate::pci::serial_debug_hex_64(DIRTYFB_CLIPS.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" flip_us=");
+            crate::pci::serial_debug_hex_64(FLIP_US_TOTAL.load(Ordering::Relaxed));
+            crate::pci::serial_debug("\n");
+        }
+    }
     let last = LAST_FLIP_DELIVER_TICK.load(Ordering::Relaxed);
     if now.wrapping_sub(last) < 2 { return; } // < 20 ms since last delivery
 
@@ -1069,10 +1109,15 @@ impl DrmDeviceInterface {
         let user_data = flip.user_data;
         let crtc_id = flip.crtc_id;
         let flip_args = [flip.fb_id, flip.flags, src_w, src_h];
+        let t0 = if DRM_STATS { crate::snd::monotonic_us() } else { 0 };
         let r = self.handle_flip_page(device, flip_args.as_ptr() as usize);
+        if DRM_STATS {
+            FLIP_US_TOTAL.fetch_add(crate::snd::monotonic_us().wrapping_sub(t0), Ordering::Relaxed);
+        }
         // On success, if the client asked for a completion event, queue one for
         // throttled delivery (drm_tick). This is what lets a compositor schedule
         // the next frame.
+        if r.is_ok() { FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed); }
         if r.is_ok() && (flags & DRM_MODE_PAGE_FLIP_EVENT != 0) {
             queue_flip_event(crtc_id, user_data);
         }
@@ -1301,6 +1346,10 @@ impl DrmDeviceInterface {
     fn std_handle_dirtyfb(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let cmd = unsafe { ptr::read_unaligned(arg as *const drm_mode_fb_dirty_cmd) };
+        if DRM_STATS {
+            DIRTYFB_CALLS.fetch_add(1, Ordering::Relaxed);
+            DIRTYFB_CLIPS.fetch_add(cmd.num_clips as u64, Ordering::Relaxed);
+        }
         let flush_args = {
             let dev = get_drm_device();
             let g = dev.lock();

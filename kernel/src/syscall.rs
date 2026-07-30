@@ -3438,6 +3438,8 @@ impl ByteRing {
 
 static PENDING_INPUT: spin::Mutex<ByteRing> = spin::Mutex::new(ByteRing::new());
 
+use crate::CONSOLE_OUT_LOCK;
+
 /// True when synthetic console input is waiting to be read.
 ///
 /// `poll`/`epoll` readiness must account for this: crossterm registers its
@@ -3484,8 +3486,14 @@ fn answer_cursor_position_report() {
 /// Everything else passes through untouched, so the serial log still shows the
 /// full byte stream.  A query split across two `write` calls is not recognised
 /// and falls back to the old behaviour (an attached terminal answers it).
+///
+/// `bytes` MUST already live in kernel memory: the whole call runs under
+/// `CONSOLE_OUT_LOCK`, and touching user memory under a spinlock can take a
+/// demand-page fault that re-enters the scheduler and freezes every vCPU.
 fn console_write_user(bytes: &[u8]) {
     const CPR_QUERY: &[u8] = b"\x1b[6n";
+
+    let _out = CONSOLE_OUT_LOCK.lock();
 
     if bytes.len() < CPR_QUERY.len()
         || !bytes.windows(CPR_QUERY.len()).any(|w| w == CPR_QUERY)
@@ -3938,7 +3946,15 @@ fn sys_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
     let console = (matches!(fd, 1 | 2) && !vfs::fd_redirected(pid, fd))
         || (fd < net_server::SOCK_FD_BASE && vfs::fd_is_console_stdio(pid, fd));
     if console {
+        // Gather every iovec into ONE kernel buffer, then hand the console a
+        // single write. musl's stdio and tracing's fmt layer both emit a log
+        // line as a multi-iovec writev; writing them one iovec at a time let
+        // another vCPU splice its own output between an SGR prefix and the
+        // text it colours, which is how spliced control sequences appeared in
+        // the session log (see CONSOLE_OUT_LOCK). The copy is also what makes
+        // holding that lock safe — the UART loop must never touch user memory.
         let mut total: isize = 0;
+        let mut kbuf: Vec<u8> = Vec::new();
         for i in 0..iovcnt {
             let iov_addr = iov_ptr + i * 16;
             let base = unsafe { core::ptr::read(iov_addr as *const usize) };
@@ -3946,10 +3962,15 @@ fn sys_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
             if len == 0 { continue; }
             if !validate_user_buf(base, len) { return -14; }
             prefault_user(base, len);
-            let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
-            console_write_user(bytes);
+            let off = kbuf.len();
+            kbuf.resize(off + len, 0);
+            let ok = with_current_address_space(|as_| {
+                as_.read_user_buf(base, &mut kbuf[off..])
+            }).unwrap_or(false);
+            if !ok { return -14; }
             total = total.saturating_add(len as isize);
         }
+        if !kbuf.is_empty() { console_write_user(kbuf.as_slice()); }
         return total;
     }
     // Everything else: one sys_write per iovec, which already routes sockets,
@@ -6242,7 +6263,15 @@ fn sys_getsockopt(sockfd: usize, level: usize, optname: usize,
 
 // K2 caps: one instance per {compositor, busd, each client, tokio runtime};
 // the compositor watches every client fd + input + timers on one instance.
-const MAX_EPOLL_INSTANCES: usize = 64;
+// 64→256 (m7z2): GLOBAL, session-wide pool. The `polling` backend couples an
+// epoll instance 1:1 with an eventfd waker + a timerfd (see vfs MAX_EVENTFDS),
+// so #epoll-instances tracks #event-loops across a full ~20-process COSMIC
+// session (~150+ with tokio + calloop + per-notify::Watcher Polls). At 64 it
+// exhausted alongside the eventfd pool. Each EpollInstance is ~16 KB (512
+// interests), so 256 = ~4 MB of zero-init .bss (NOBITS — no ELF/file cost, only
+// runtime RAM, abundant in the guest). MAX_EPOLL_INTERESTS stays 512 (the
+// compositor's single instance watches every client fd + input + timers).
+const MAX_EPOLL_INSTANCES: usize = 256;
 const MAX_EPOLL_INTERESTS: usize = 512;
 
 #[derive(Clone, Copy)]
@@ -6289,9 +6318,11 @@ impl EpollInstance {
 
 /// Epoll fd numbers are an indirection over instance slots so that two fds
 /// can alias one instance (dup semantics). fd = EPOLL_FD_BASE + entry index.
-/// ≥ MAX_EPOLL_INSTANCES to allow dup aliases; the [0x400, 0x480) fd range
+/// ≥ MAX_EPOLL_INSTANCES to allow dup aliases; the [0x400, 0x600) fd range
 /// stays clear of TTY_FD_BASE (0x1000) and the socket range [0x100, 0x300).
-const MAX_EPOLL_FDS: usize = 128;
+/// 128→512 (m7z2): tracks MAX_EPOLL_INSTANCES 64→256 (kept at 2× for dup
+/// aliases); just a 512-byte EPOLL_FDS table. Range top 0x600 < TTY 0x1000.
+const MAX_EPOLL_FDS: usize = 512;
 
 #[derive(Clone, Copy)]
 struct EpollFdEntry { in_use: bool, slot: u8 }
@@ -6599,14 +6630,26 @@ pub fn poll_deadline_tick() {
     // and the timerfd pool say nothing is due → no run-queue scan, no wake.
     let due = core::cmp::min(sched::NEXT_POLL_DEADLINE.load(Relaxed), tfd);
     if due != u64::MAX && now >= due {
-        // Something is due. Wake the poll-channel waiters whose PER-TASK
-        // deadline has passed (or all, if a timerfd expired), and republish the
-        // hint to the EXACT earliest remaining deadline — all under one
-        // RUN_QUEUE hold. The per-task deadline is the authority, so unlike the
-        // old single-global `store(u64::MAX)` this can't clobber a deadline a
-        // concurrent waiter is registering (M7 lost-wake). Contended tick just
-        // retries next tick (≤10 ms defer).
-        let timerfd_due = tfd != u64::MAX && now >= tfd;
+        // Something is due. First FOLD any timerfd that has reached its deadline
+        // into a single expiry edge: a folded one-shot is disarmed here so it
+        // stops being reported by earliest_timerfd_deadline every tick. Without
+        // this, an armed one-shot whose owner is briefly descheduled sits
+        // `armed` with a past deadline forever, `timerfd_due` fires every tick,
+        // and the mass-wake starves that owner so it never runs to consume it —
+        // the idle-desktop wake storm that stopped ext-idle-notify's `Idled`
+        // from ever firing. `timerfd_due` is now "a timerfd expired on THIS
+        // pass", not "a stale deadline is still <= now".
+        let timerfd_due = if tfd != u64::MAX && now >= tfd {
+            vfs::fold_expired_timerfds(now) > 0
+        } else {
+            false
+        };
+        // Wake the poll-channel waiters whose PER-TASK deadline has passed (or
+        // all, if a timerfd expired this pass), and republish the hint to the
+        // EXACT earliest remaining deadline — all under one RUN_QUEUE hold. The
+        // per-task deadline is the authority, so unlike the old single-global
+        // `store(u64::MAX)` this can't clobber a deadline a concurrent waiter is
+        // registering (M7 lost-wake). Contended tick just retries next tick.
         sched::service_poll_deadlines(now, timerfd_due);
     }
     // Bring-up safety net (design §1), OFF: a periodic unconditional wake would
@@ -6780,9 +6823,12 @@ fn sys_signalfd4(ufd: usize, mask_ptr: usize, _sizemask: usize, flags: usize) ->
 
 /// inotify_init1(flags) — a valid fd that accepts watches but never delivers
 /// events (keeps a config-watch source quiet in an event loop; no live reload).
-fn sys_inotify_init1(_flags: usize) -> isize {
+fn sys_inotify_init1(flags: usize) -> isize {
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_INOTIFY_CREATE, &[]);
+    // Forward IN_CLOEXEC/IN_NONBLOCK so the fd is close-on-exec when requested;
+    // dropping IN_CLOEXEC leaked every config-watch inotify fd across execve and
+    // filled late children's fd tables (cosmic-greeter EMFILE crash-loop).
+    let msg = make_vfs_msg(vfs::VFS_INOTIFY_CREATE, &[flags as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
@@ -6855,6 +6901,20 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
             // Mark the inode as a memfd: creates an empty seal-capable VMO so the
             // file is genuinely shareable and F_ADD_SEALS/F_GET_SEALS are honored.
             vfs::mark_memfd(pid, fd as usize);
+            // KNOWN LEAK, deliberately not fixed here. A memfd should be an
+            // ANONYMOUS inode that dies with its last fd; ours keeps its
+            // "/tmp/memfd:<name>[:<seq>]" name forever, so every call burns one
+            // of the 128 MAX_TMP_FILES slots permanently and a client that
+            // allocates a wl_shm pool per frame bricks memfd_create system-wide
+            // after ~100 frames. tmp_release_ephemeral already implements the
+            // right lifetime ("a memfd whose name was unlinked while an fd
+            // stayed open lands here on the final close") — but simply issuing
+            // VFS_UNLINK here is NOT enough: with the name gone, the client's
+            // next ftruncate/mmap of that fd fails ENOMEM ("Failed to create
+            // memory pool") and takes the whole COSMIC session down, because
+            // those paths still resolve the inode by name rather than through
+            // the fd's VnodeKind::TmpFile { idx }. Fixing this means making
+            // ftruncate + the K1 shared-VMO mmap path fd-resolved first.
         }
         return fd;
     }

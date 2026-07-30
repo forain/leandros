@@ -191,6 +191,34 @@ pub extern "C" fn kernel_set_console_enabled(enabled: bool) {
         serial_print_str("\n");
     }
 }
+/// Serialises whole console writes so they reach the UART uninterrupted.
+///
+/// `serial_write_byte` talks to the UART one byte at a time with no interlock,
+/// so two writers on two vCPUs interleave *character by character*. Userspace
+/// log lines are full of SGR escapes, and a splice fabricates control sequences
+/// nobody emitted — a captured log contains a literal `ESC [ 3 i` (ANSI media
+/// copy) built from brush's `ESC[38;5;` prompt colour and the `i` of a kernel
+/// trace's `/bin/brush`, which makes the host terminal open a print dialog.
+pub static CONSOLE_OUT_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+/// Run `f` holding [`CONSOLE_OUT_LOCK`], but never block indefinitely.
+///
+/// Kernel printing happens in interrupt context, where waiting on a lock a
+/// preempted thread holds would wedge the CPU. Past the spin budget we print
+/// anyway: a rare splice is a far better failure than a dead console.
+fn with_console_lock(f: impl FnOnce()) {
+    const SPIN_BUDGET: u32 = 100_000;
+    let mut spins: u32 = 0;
+    let guard = loop {
+        if let Some(g) = CONSOLE_OUT_LOCK.try_lock() { break Some(g); }
+        spins += 1;
+        if spins >= SPIN_BUDGET { break None; }
+        core::hint::spin_loop();
+    };
+    f();
+    drop(guard);
+}
+
 #[no_mangle]
 pub extern "C" fn serial_print(s: *const u8, len: usize) {
     if s.is_null() { return; }
@@ -201,9 +229,11 @@ pub extern "C" fn serial_print(s: *const u8, len: usize) {
         return;
     }
     let bytes = unsafe { core::slice::from_raw_parts(s, len) };
-    for &b in bytes {
-        serial_write_byte(b);
-    }
+    with_console_lock(|| {
+        for &b in bytes {
+            serial_write_byte(b);
+        }
+    });
 }
 
 #[no_mangle]
@@ -212,9 +242,14 @@ pub extern "C" fn serial_print_str_raw(s: *const u8, len: usize) {
 }
 
 pub fn serial_print_str(msg: &str) {
-    for &b in msg.as_bytes() { serial_write_byte(b); }
+    with_console_lock(|| {
+        for &b in msg.as_bytes() { serial_write_byte(b); }
+    });
 }
 
+/// Unlocked primitive. Callers that need atomicity take [`CONSOLE_OUT_LOCK`]
+/// themselves — `console_write_user` does, and must not re-enter it here
+/// (`spin::Mutex` is not reentrant).
 pub fn serial_write_raw(bytes: &[u8]) {
     for &b in bytes { serial_write_byte(b); }
 }
