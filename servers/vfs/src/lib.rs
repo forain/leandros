@@ -989,7 +989,17 @@ fn pipe_ref_dec(kind: &VnodeKind) {
 // dup closes) the pool no longer masks exhaustion by early-freeing, so 16 filled
 // and eventfd()/inotify creation started returning EMFILE mid-init. 64 is a pure
 // sizing bump (small fixed arrays), matching the MAX_FDS 64→128 headroom rationale.
-const MAX_EVENTFDS: usize = 64;
+//
+// 64→256 (m7z2): this is a GLOBAL, session-wide pool. A full COSMIC session runs
+// ~20 processes (comp, busd, panel, dock, bg, greeter, idle, workspaces,
+// notifications, launcher, osd, settings-daemon, app-library, …); each event loop
+// (polling/mio/calloop) allocates an eventfd waker, and every process runs several
+// (tokio runtime + calloop + one per notify::Watcher). At 64 the pool exhausted
+// session-wide — a process holding only 15 fds still got EMFILE on eventfd() —
+// which crash-looped cosmic-panel/cosmic-greeter (calloop Ping / winit loop
+// creation). ~20 procs × ~6-8 eventfds ⇒ ~150; 256 covers that plus restart
+// overlap. Pool arrays are u64/u32 (256 × 20 B ≈ 5 KB), a cheap bump.
+const MAX_EVENTFDS: usize = 256;
 // u64::MAX = free slot sentinel.
 static EVENTFD_COUNTERS: Mutex<[u64; MAX_EVENTFDS]> = Mutex::new([u64::MAX; MAX_EVENTFDS]);
 /// Per-eventfd monotonic event counter, bumped on every write. mio registers
@@ -1024,7 +1034,11 @@ fn lfsr_next() -> u8 {
 
 // See MAX_EVENTFDS: calloop arms a timerfd per timer source; 16 is tight for a
 // compositor. 64 gives headroom now that slots are refcounted (freed at last close).
-const MAX_TIMERFDS: usize = 64;
+// 64→256 (m7z2): GLOBAL pool, same session-wide pressure as MAX_EVENTFDS — the
+// `polling` backend (calloop 0.14) creates one timerfd PER Poll/epoll instance for
+// its wait timeout, so #timerfds tracks #event-loops (~150 in a full session).
+// TimerFdEntry is small (256 × ~36 B ≈ 9 KB).
+const MAX_TIMERFDS: usize = 256;
 
 #[derive(Clone, Copy)]
 struct TimerFdEntry {
@@ -1565,7 +1579,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
                                             arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_EVENTFD          => handle_eventfd(caller_pid, arg(msg,0) as u64, arg(msg,1) as u32),
         VFS_SIGNALFD_CREATE  => handle_signalfd_create(caller_pid, arg(msg,0) as usize, arg(msg,1) as u64, arg(msg,2) as u32),
-        VFS_INOTIFY_CREATE   => handle_inotify_create(caller_pid),
+        VFS_INOTIFY_CREATE   => handle_inotify_create(caller_pid, arg(msg,0) as u32),
         VFS_INOTIFY_ADD      => handle_inotify_add(caller_pid, arg(msg,0) as usize),
         VFS_TIMERFD_CREATE   => handle_timerfd_create(caller_pid, arg(msg,0) as u32),
         VFS_TIMERFD_SETTIME  => handle_timerfd_settime(caller_pid, arg(msg,0) as usize,
@@ -4343,12 +4357,21 @@ fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -
 }
 
 /// inotify_init1(flags) → a valid Inotify fd that accepts watches but never
-/// delivers events.
-fn handle_inotify_create(pid: u32) -> Message {
+/// delivers events. `flags` carries IN_CLOEXEC (== O_CLOEXEC, 0x80000) and
+/// IN_NONBLOCK (== O_NONBLOCK, 0o4000). These MUST be persisted on the fd:
+/// dropping IN_CLOEXEC (the old `flags: 0`) made every inotify instance survive
+/// the execve close-on-exec sweep, so cosmic-config's per-key config watchers —
+/// each an IN_CLOEXEC inotify fd — leaked into every child. A config-heavy
+/// session (cosmic-session + launch_pad) accumulated ~one-per-watch and handed
+/// its whole ~125-deep fd table down; late children like cosmic-greeter opened
+/// their very first fd into a full table and died on EMFILE ("No file
+/// descriptors available"), crash-looping under launch_pad's infinite restart.
+fn handle_inotify_create(pid: u32, flags: u32) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-24) };
     let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
-    tbl.fds[fd] = FdEntry { kind: VnodeKind::Inotify { next_wd: 1 }, flags: 0, in_use: true };
+    let stored = flags & (O_CLOEXEC | O_NONBLOCK_FL);
+    tbl.fds[fd] = FdEntry { kind: VnodeKind::Inotify { next_wd: 1 }, flags: stored, in_use: true };
     val_reply(fd as u64)
 }
 
@@ -4432,6 +4455,43 @@ pub fn earliest_timerfd_deadline() -> u64 {
         }
         None => u64::MAX,
     }
+}
+
+/// Fold every armed timerfd whose deadline has passed, exactly as
+/// `timerfd_poll_expirations` would when its owner polls it — one-shots are
+/// disarmed, periodics are re-armed onto their next future deadline, and the
+/// missed-expiration count is accumulated (never cleared, so a later poll/read
+/// still observes the expiry). Returns the number of timerfds that expired on
+/// this pass. Called from the 100 Hz `poll_deadline_tick`.
+///
+/// Why this exists: an armed one-shot timerfd whose owner does not promptly
+/// consume it (e.g. a compositor briefly descheduled) used to sit `armed` with
+/// an already-past deadline forever. `earliest_timerfd_deadline` then reported
+/// it every tick, so the tick fired `timerfd_due` and mass-woke every poll
+/// waiter 100×/s — a self-reinforcing wake STORM that saturated the CPU and
+/// starved the very process that had to run to consume/re-arm the timerfd (it
+/// never could), so `ext-idle-notify`'s `Idled` never fired on an idle desktop.
+/// Folding here retires each expiry once, turning the perpetual `timerfd_due`
+/// into a single edge per expiration. IRQ-context safe: try_lock only
+/// (82d0cc3 invariant — no user memory touched, no cross-server call).
+pub fn fold_expired_timerfds(now: u64) -> u32 {
+    let mut pool = match TIMERFD_POOL.try_lock() { Some(p) => p, None => return 0 };
+    let mut folded = 0u32;
+    for e in pool.iter_mut() {
+        if e.armed && now >= e.deadline_ticks {
+            let elapsed = now - e.deadline_ticks;
+            if e.interval_ticks > 0 {
+                let extra = elapsed / e.interval_ticks + 1;
+                e.expirations += extra;
+                e.deadline_ticks += extra * e.interval_ticks; // stays armed, next future tick
+            } else {
+                e.expirations += 1;
+                e.armed = false; // one-shot: retire (expiry preserved in `expirations`)
+            }
+            folded += 1;
+        }
+    }
+    folded
 }
 
 fn handle_timerfd_gettime(pid: u32, fd: usize, out_ptr: usize) -> Message {

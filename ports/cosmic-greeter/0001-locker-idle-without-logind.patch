@@ -1,0 +1,63 @@
+Subject: [PATCH] cosmic-greeter/locker: idle at startup without logind instead
+ of locking immediately
+
+LeandrOS has no logind (no org.freedesktop.login1). cosmic-greeter is therefore
+built with `--no-default-features` (the `logind` default feature would make the
+locker subscribe to logind on the zbus system bus and `std::process::exit(1)`
+when the service is absent -> infinite crash-loop under cosmic-session's restart
+supervision).
+
+But the non-logind arm of `locker::init()` is equally unusable as-is: it locks
+the screen IMMEDIATELY at process start, and after a successful unlock the
+`SessionLockEvent::Unlocked` handler calls `process::exit(0)`. cosmic-session
+spawns the greeter/locker in-session with infinite restart + exponential
+backoff, so the sequence becomes: start -> lock -> unlock -> exit(0) -> restart
+-> lock -> ... i.e. the desktop can never stay unlocked.
+
+This patch changes ONLY the non-logind startup arm to mirror the logind arm:
+lock at startup only when recovering a previously-locked session (the lock file
+exists), otherwise `Task::none()` (idle). On LeandrOS nothing triggers a lock
+at boot, so the locker starts idle and stays out of the way; the wallpaper/panel
+session runs normally. A lock can still be requested explicitly (Message::Lock),
+and recovery of a crashed locked session still works via the lock file.
+
+Residual behavior after this patch: because the non-logind `Unlocked` handler
+still `process::exit(0)`s, an actual unlock exits the process; cosmic-session
+restarts it, and it now comes back IDLE (no lock file present) rather than
+re-locking. That is the intended, startup-safe behavior.
+
+This is the only .rs change made to cosmic-greeter for LeandrOS. Apply against
+the vendored source tree (byte-identical to upstream cosmic-epoch/cosmic-greeter
+at rsync time):
+
+    ~/code/leandros-artifacts/m6-session-bins/src/cosmic-greeter
+
+Build with build-rust.sh (musl toolchain) using `--no-default-features` so the
+root `cosmic-greeter` binary is produced; link resolves libpam.so.0 (the
+LeandrOS libpam shim, src/libpam-shim) from the m3 sysroot.
+
+--- a/src/locker.rs
++++ b/src/locker.rs
+@@ -689,11 +689,19 @@
+                 // When logind feature is used, wait for lock signal
+                 Task::none()
+             }
+-        } else {
+-            // When logind feature not used, lock immediately
+-            tracing::info!("locking immediately");
++        } else if already_locked {
++            // LeandrOS: without logind there is no external lock trigger, so
++            // mirror the logind branch — only lock at startup when recovering a
++            // previously-locked session (lock file present).
++            tracing::info!("recovering previous locked state");
+             app.state = State::Locking;
+             lock()
++        } else {
++            // LeandrOS: do NOT lock immediately. Upstream's non-logind arm locks
++            // at boot (and, with the process::exit(0) after unlock plus
++            // cosmic-session's restart, relocks forever). With no logind lock
++            // signal on LeandrOS, a fresh start must idle instead.
++            Task::none()
+         };
+
+         (app, Task::batch([task, common_task]))

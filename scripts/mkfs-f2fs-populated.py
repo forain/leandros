@@ -384,7 +384,11 @@ def main():
                # is the first client to use client-side Wayland-EGL; without it
                # the panel panics ("Library libwayland-egl.so could not be
                # loaded.") right after "Waiting for configure event".
-               "libwayland-egl.so.1", "libffi.so.8"):
+               "libwayland-egl.so.1", "libffi.so.8",
+               # libpam.so.0 is the LeandrOS shadow-auth shim (source:
+               # m6-session-bins/src/libpam-shim), DT_NEEDED by cosmic-greeter's
+               # in-session locker; verifies $sha256$ /etc/shadow like /bin/login.
+               "libpam.so.0"):
         p = f"{gl_lib_dir}/{so}"
         if os.path.exists(p):
             usr_lib_files.append((so, p, 0o100755))
@@ -534,6 +538,17 @@ def main():
         ("cosmic-app-library",     f"{m6_out}/cosmic-applibrary-{arch}"),  # spawn name != file name
         ("cosmic-settings",        f"{m6_out}/cosmic-settings-{arch}"),
         ("cosmic-settings-daemon", f"{pw_out}/cosmic-settings-daemon-{arch}"),
+        # M7z tolerant-children completion: the last four names cosmic-session
+        # spawns (main.rs:335-351). workspaces is built --no-default-features
+        # --features force-shm-screencopy (no wgpu, wl_shm capture only);
+        # files-applet drops the gvfs feature (no glib/gio on the image); idle
+        # is featureless; greeter is --no-default-features + the locker patch
+        # in ports/cosmic-greeter (idles instead of locking at boot — LeandrOS
+        # has no logind lock trigger) and links the libpam shadow-auth shim.
+        ("cosmic-workspaces",      f"{m6_out}/cosmic-workspaces-{arch}"),
+        ("cosmic-greeter",         f"{m6_out}/cosmic-greeter-{arch}"),
+        ("cosmic-files-applet",    f"{m6_out}/cosmic-files-applet-{arch}"),
+        ("cosmic-idle",            f"{m6_out}/cosmic-idle-{arch}"),
     ]
     for name, src in m6_session_bins:
         if os.path.exists(src):
