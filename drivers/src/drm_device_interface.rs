@@ -64,6 +64,195 @@ const DRM_CAP_CRTC_IN_VBLANK_EVENT: u64 = 0x12;
 const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
 const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
 
+// ── Atomic KMS ───────────────────────────────────────────────────────────────
+const DRM_IOCTL_MODE_ATOMIC: u32 = 0xC03864BC;
+const DRM_IOCTL_MODE_CREATEPROPBLOB: u32 = 0xC01064BD;
+const DRM_IOCTL_MODE_DESTROYPROPBLOB: u32 = 0xC00464BE;
+const DRM_IOCTL_MODE_GETPROPBLOB: u32 = 0xC01064AC;
+
+const DRM_CAP_CURSOR_WIDTH: u64 = 0x8;
+const DRM_CAP_CURSOR_HEIGHT: u64 = 0x9;
+
+/// Synthetic plane ids. 30 is the pre-existing primary; 31 is the new cursor
+/// plane. crtc/connector/encoder all keep id 1 (see the note above) — object
+/// *types* are disambiguated in the atomic path by the property id, since our
+/// property-id ranges are disjoint per object class.
+const DRM_CURSOR_PLANE_ID: u32 = 31;
+const DRM_PLANE_TYPE_CURSOR: u32 = 2;
+const DRM_CRTC_ID: u32 = 1;
+const DRM_CONNECTOR_ID: u32 = 1;
+
+// Property ids. Ranges are deliberately disjoint per object class:
+//   40..=51 plane, 60..=61 crtc, 70 connector.
+const PROP_TYPE: u32 = 40; // == DRM_PLANE_TYPE_PROP_ID
+const PROP_PLANE_CRTC_ID: u32 = 41;
+const PROP_FB_ID: u32 = 42;
+const PROP_SRC_X: u32 = 43;
+const PROP_SRC_Y: u32 = 44;
+const PROP_SRC_W: u32 = 45;
+const PROP_SRC_H: u32 = 46;
+const PROP_CRTC_X: u32 = 47;
+const PROP_CRTC_Y: u32 = 48;
+const PROP_CRTC_W: u32 = 49;
+const PROP_CRTC_H: u32 = 50;
+const PROP_FB_DAMAGE_CLIPS: u32 = 51;
+const PROP_ACTIVE: u32 = 60;
+const PROP_MODE_ID: u32 = 61;
+const PROP_CONN_CRTC_ID: u32 = 70;
+
+// drm_mode_object types (used as OBJECT-property value types).
+const DRM_MODE_OBJECT_CRTC: u64 = 0xcccc_cccc;
+const DRM_MODE_OBJECT_FB: u64 = 0xfbfb_fbfb;
+const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
+const DRM_MODE_OBJECT_CRTC_T: u32 = 0xcccc_cccc;
+const DRM_MODE_OBJECT_CONNECTOR_T: u32 = 0xc0c0_c0c0;
+
+// drm_mode_property flags.
+const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
+const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
+const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
+const DRM_MODE_PROP_OBJECT: u32 = 1 << 6; // DRM_MODE_PROP_TYPE(1)
+const DRM_MODE_PROP_SIGNED_RANGE: u32 = 2 << 6; // DRM_MODE_PROP_TYPE(2)
+
+// drm_mode_atomic.flags
+const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
+const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x0400;
+
+/// How a property's value array must be reported. The compositor's drm-rs
+/// indexes `values[0]`/`values[1]` **unchecked** for RANGE, SIGNED_RANGE and
+/// OBJECT properties, so returning `count_values = 0` for any of them panics
+/// cosmic-comp. Every entry below therefore carries a concrete value array.
+#[derive(Clone, Copy, PartialEq)]
+enum PropKind {
+    /// count_values = 2, values = [min, max]
+    Range(u64, u64),
+    /// count_values = 2, values = [min as u64, max as u64]
+    SignedRange(i64, i64),
+    /// count_values = 1, values = [object type]
+    Object(u64),
+    /// count_values = 0 — no array access in drm-rs for blobs.
+    Blob,
+    /// count_values = 0, count_enum_blobs = 0. This is exactly what the legacy
+    /// path already shipped for "type" and what smithay's plane_type() needs
+    /// (it reads the raw property value, never the enum names).
+    Enum,
+}
+
+struct PropDef {
+    id: u32,
+    name: &'static [u8], // NUL-terminated, <= 32 bytes
+    kind: PropKind,
+}
+
+const fn prop(id: u32, name: &'static [u8], kind: PropKind) -> PropDef {
+    PropDef { id, name, kind }
+}
+
+/// The complete property table. `flags` is derived from `kind`.
+static PROPS: &[PropDef] = &[
+    prop(PROP_TYPE, b"type\0", PropKind::Enum),
+    prop(PROP_PLANE_CRTC_ID, b"CRTC_ID\0", PropKind::Object(DRM_MODE_OBJECT_CRTC)),
+    prop(PROP_FB_ID, b"FB_ID\0", PropKind::Object(DRM_MODE_OBJECT_FB)),
+    prop(PROP_SRC_X, b"SRC_X\0", PropKind::Range(0, u32::MAX as u64)),
+    prop(PROP_SRC_Y, b"SRC_Y\0", PropKind::Range(0, u32::MAX as u64)),
+    prop(PROP_SRC_W, b"SRC_W\0", PropKind::Range(0, u32::MAX as u64)),
+    prop(PROP_SRC_H, b"SRC_H\0", PropKind::Range(0, u32::MAX as u64)),
+    prop(PROP_CRTC_X, b"CRTC_X\0", PropKind::SignedRange(i32::MIN as i64, i32::MAX as i64)),
+    prop(PROP_CRTC_Y, b"CRTC_Y\0", PropKind::SignedRange(i32::MIN as i64, i32::MAX as i64)),
+    prop(PROP_CRTC_W, b"CRTC_W\0", PropKind::Range(0, u32::MAX as u64)),
+    prop(PROP_CRTC_H, b"CRTC_H\0", PropKind::Range(0, u32::MAX as u64)),
+    prop(PROP_FB_DAMAGE_CLIPS, b"FB_DAMAGE_CLIPS\0", PropKind::Blob),
+    prop(PROP_ACTIVE, b"ACTIVE\0", PropKind::Range(0, 1)),
+    prop(PROP_MODE_ID, b"MODE_ID\0", PropKind::Blob),
+    prop(PROP_CONN_CRTC_ID, b"CRTC_ID\0", PropKind::Object(DRM_MODE_OBJECT_CRTC)),
+];
+
+fn prop_def(id: u32) -> Option<&'static PropDef> {
+    PROPS.iter().find(|p| p.id == id)
+}
+
+fn prop_flags(kind: PropKind) -> u32 {
+    match kind {
+        PropKind::Range(..) => DRM_MODE_PROP_RANGE,
+        PropKind::SignedRange(..) => DRM_MODE_PROP_SIGNED_RANGE,
+        PropKind::Object(..) => DRM_MODE_PROP_OBJECT,
+        PropKind::Blob => DRM_MODE_PROP_BLOB,
+        PropKind::Enum => DRM_MODE_PROP_ENUM,
+    }
+}
+
+/// The exact value array a property reports. Both GETPROPERTY passes call this,
+/// which is what keeps the two-pass counts identical (drm-ffi does
+/// `Vec::set_len` from the *second* call's count).
+fn prop_values(kind: PropKind) -> [u64; 2] {
+    match kind {
+        PropKind::Range(min, max) => [min, max],
+        PropKind::SignedRange(min, max) => [min as u64, max as u64],
+        PropKind::Object(ty) => [ty, 0],
+        PropKind::Blob | PropKind::Enum => [0, 0],
+    }
+}
+
+fn prop_value_count(kind: PropKind) -> u32 {
+    match kind {
+        PropKind::Range(..) | PropKind::SignedRange(..) => 2,
+        PropKind::Object(..) => 1,
+        PropKind::Blob | PropKind::Enum => 0,
+    }
+}
+
+/// Property ids exposed by each object, in report order, with their current
+/// values. `obj_type` disambiguates crtc (1) from connector (1).
+fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
+    const PLANE_COMMON: &[u32] = &[
+        PROP_TYPE,
+        PROP_PLANE_CRTC_ID,
+        PROP_FB_ID,
+        PROP_SRC_X,
+        PROP_SRC_Y,
+        PROP_SRC_W,
+        PROP_SRC_H,
+        PROP_CRTC_X,
+        PROP_CRTC_Y,
+        PROP_CRTC_W,
+        PROP_CRTC_H,
+        PROP_FB_DAMAGE_CLIPS,
+    ];
+    // The cursor plane omits FB_DAMAGE_CLIPS: it is always uploaded whole.
+    const CURSOR_PLANE: &[u32] = &[
+        PROP_TYPE,
+        PROP_PLANE_CRTC_ID,
+        PROP_FB_ID,
+        PROP_SRC_X,
+        PROP_SRC_Y,
+        PROP_SRC_W,
+        PROP_SRC_H,
+        PROP_CRTC_X,
+        PROP_CRTC_Y,
+        PROP_CRTC_W,
+        PROP_CRTC_H,
+    ];
+    const CRTC: &[u32] = &[PROP_ACTIVE, PROP_MODE_ID];
+    const CONNECTOR: &[u32] = &[PROP_CONN_CRTC_ID];
+
+    match obj_type {
+        DRM_MODE_OBJECT_PLANE => match obj_id {
+            DRM_PLANE_ID => PLANE_COMMON,
+            DRM_CURSOR_PLANE_ID => CURSOR_PLANE,
+            _ => &[],
+        },
+        DRM_MODE_OBJECT_CRTC_T if obj_id == DRM_CRTC_ID => CRTC,
+        DRM_MODE_OBJECT_CONNECTOR_T if obj_id == DRM_CONNECTOR_ID => CONNECTOR,
+        // obj_type 0 (DRM_MODE_OBJECT_ANY) or an unrecognised type: fall back
+        // to the plane ids, which are the only unambiguous ones.
+        _ => match obj_id {
+            DRM_PLANE_ID => PLANE_COMMON,
+            DRM_CURSOR_PLANE_ID => CURSOR_PLANE,
+            _ => &[],
+        },
+    }
+}
+
 // PAGE_FLIP flags / event types
 const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
 const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
@@ -322,8 +511,10 @@ struct drm_virtgpu_get_caps {
 }
 
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use alloc::vec;
 use alloc::collections::VecDeque;
-use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 
 /// A dumb buffer's physical base and buddy allocation order, so DESTROY_DUMB /
@@ -336,6 +527,45 @@ struct DumbBuf {
 }
 
 static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new());
+
+// ── Property blobs ───────────────────────────────────────────────────────────
+// Atomic modesetting passes modes (and damage clips) by blob id rather than by
+// value. Blobs are opaque byte strings the client creates once and references
+// from later commits, so they must outlive the ioctl that created them.
+static BLOBS: Mutex<BTreeMap<u32, Vec<u8>>> = Mutex::new(BTreeMap::new());
+static NEXT_BLOB_ID: AtomicU32 = AtomicU32::new(0x1000);
+
+/// True once a client has taken DRM_CLIENT_CAP_ATOMIC. The legacy handlers stay
+/// live either way; this only records which contract the client is using.
+static ATOMIC_CLIENT: AtomicBool = AtomicBool::new(false);
+
+/// Whether the compositor is driving us through the atomic path.
+pub fn atomic_client() -> bool {
+    ATOMIC_CLIENT.load(Ordering::Relaxed)
+}
+
+// Committed crtc/connector state. Only used to decide whether an incoming
+// atomic request needs ALLOW_MODESET.
+static CRTC_ACTIVE: AtomicU32 = AtomicU32::new(0);
+static CRTC_MODE_BLOB: AtomicU32 = AtomicU32::new(0);
+static CONN_CRTC: AtomicU32 = AtomicU32::new(0);
+
+/// One plane's worth of an atomic request. Every field is `None` when the
+/// commit did not mention that property — "unchanged", not "zero".
+#[derive(Default, Clone, Copy)]
+struct AtomicPlaneReq {
+    crtc_id: Option<u32>,
+    fb_id: Option<u32>,
+    src_x: Option<u32>,
+    src_y: Option<u32>,
+    src_w: Option<u32>,
+    src_h: Option<u32>,
+    crtc_x: Option<i32>,
+    crtc_y: Option<i32>,
+    crtc_w: Option<u32>,
+    crtc_h: Option<u32>,
+    damage_blob: Option<u32>,
+}
 
 /// Resolve a dumb-buffer GEM handle to its physical base + buddy order, so the
 /// syscall layer can build a PRIME/dmabuf fd whose backing frames ARE this
@@ -556,6 +786,12 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_GETPLANERESOURCES => self.std_handle_get_plane_resources(arg),
             DRM_IOCTL_MODE_GETPLANE => self.std_handle_get_plane(arg),
             DRM_IOCTL_MODE_GETPROPERTY => self.std_handle_get_property(arg),
+
+            // ── Atomic KMS ──
+            DRM_IOCTL_MODE_ATOMIC => self.std_handle_atomic(arg),
+            DRM_IOCTL_MODE_CREATEPROPBLOB => self.std_handle_create_blob(arg),
+            DRM_IOCTL_MODE_DESTROYPROPBLOB => self.std_handle_destroy_blob(arg),
+            DRM_IOCTL_MODE_GETPROPBLOB => self.std_handle_get_blob(arg),
             // No PRIME (single node, render==scanout) — Mesa falls back to software.
             DRM_IOCTL_PRIME_HANDLE_TO_FD | DRM_IOCTL_PRIME_FD_TO_HANDLE => Err(DriverError::Unsupported),
 
@@ -1154,6 +1390,11 @@ impl DrmDeviceInterface {
             // not a PRIME fd, so PRIME_HANDLE_TO_FD need not be implemented here.
             DRM_CAP_PRIME => DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT,
             DRM_CAP_ASYNC_PAGE_FLIP => 0,
+            // The host's cursor is fixed at 64x64 and silently drops anything
+            // else, so advertise exactly that. Reporting 0 (the old `_ => 0`)
+            // makes smithay skip the cursor plane entirely.
+            DRM_CAP_CURSOR_WIDTH => 64,
+            DRM_CAP_CURSOR_HEIGHT => 64,
             // Unknown caps: value 0 + success. Smithay probes many optional caps
             // and treats an ioctl error differently from "cap == 0".
             _ => 0,
@@ -1168,7 +1409,10 @@ impl DrmDeviceInterface {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let cap = unsafe { ptr::read_unaligned(arg as *const drm_set_client_cap) };
         match cap.capability {
-            DRM_CLIENT_CAP_ATOMIC => Err(DriverError::Unsupported),
+            DRM_CLIENT_CAP_ATOMIC => {
+                ATOMIC_CLIENT.store(cap.value != 0, Ordering::Relaxed);
+                Ok(0)
+            }
             DRM_CLIENT_CAP_UNIVERSAL_PLANES => Ok(0),
             _ => Ok(0),
         }
@@ -1193,22 +1437,41 @@ impl DrmDeviceInterface {
         // = PRIMARY, which smithay's planes() requires (plane_type panics on absence).
         // Every other object (connectors etc.) reports zero properties — enough for
         // the legacy DPMS reset, which just enumerates and finds nothing to toggle.
-        let obj_id = unsafe { ptr::read_unaligned((arg + 20) as *const u32) };
-        if obj_id == DRM_PLANE_ID {
-            let props_ptr = unsafe { ptr::read_unaligned(arg as *const u64) };
-            let vals_ptr  = unsafe { ptr::read_unaligned((arg + 8) as *const u64) };
-            let cap       = unsafe { ptr::read_unaligned((arg + 16) as *const u32) };
-            if props_ptr != 0 && vals_ptr != 0 && cap >= 1 {
+        let obj_id   = unsafe { ptr::read_unaligned((arg + 20) as *const u32) };
+        let obj_type = unsafe { ptr::read_unaligned((arg + 24) as *const u32) };
+        let ids = object_props(obj_id, obj_type);
+
+        let props_ptr = unsafe { ptr::read_unaligned(arg as *const u64) };
+        let vals_ptr  = unsafe { ptr::read_unaligned((arg + 8) as *const u64) };
+        let cap       = unsafe { ptr::read_unaligned((arg + 16) as *const u32) };
+        if props_ptr != 0 && vals_ptr != 0 && cap as usize >= ids.len() {
+            for (i, &pid) in ids.iter().enumerate() {
                 unsafe {
-                    ptr::write_unaligned(props_ptr as *mut u32, DRM_PLANE_TYPE_PROP_ID);
-                    ptr::write_unaligned(vals_ptr as *mut u64, DRM_PLANE_TYPE_PRIMARY as u64);
+                    ptr::write_unaligned((props_ptr as *mut u32).add(i), pid);
+                    ptr::write_unaligned(
+                        (vals_ptr as *mut u64).add(i),
+                        Self::current_prop_value(obj_id, pid),
+                    );
                 }
             }
-            unsafe { ptr::write_unaligned((arg + 16) as *mut u32, 1); }
-        } else {
-            unsafe { ptr::write_unaligned((arg + 16) as *mut u32, 0); }
         }
+        // The true count goes back on every pass — the caller sizes its arrays
+        // from the first call and re-reads the count on the second.
+        unsafe { ptr::write_unaligned((arg + 16) as *mut u32, ids.len() as u32); }
         Ok(0)
+    }
+
+    /// Current value of `prop_id` on `obj_id`. Only the values a compositor
+    /// actually reads back matter here; the rest report 0, which is the correct
+    /// "unset" state for an unconfigured plane.
+    fn current_prop_value(obj_id: u32, prop_id: u32) -> u64 {
+        match prop_id {
+            PROP_TYPE => match obj_id {
+                DRM_CURSOR_PLANE_ID => DRM_PLANE_TYPE_CURSOR as u64,
+                _ => DRM_PLANE_TYPE_PRIMARY as u64,
+            },
+            _ => 0,
+        }
     }
 
     /// DRM_IOCTL_MODE_GETPLANERESOURCES — expose a single (primary) plane.
@@ -1217,12 +1480,15 @@ impl DrmDeviceInterface {
     /// ever composited. struct drm_mode_get_plane_res { u64 plane_id_ptr@0; u32 count_planes@8; }.
     fn std_handle_get_plane_resources(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
+        const PLANES: [u32; 2] = [DRM_PLANE_ID, DRM_CURSOR_PLANE_ID];
         let ptr_planes = unsafe { ptr::read_unaligned(arg as *const u64) };
         let cap = unsafe { ptr::read_unaligned((arg + 8) as *const u32) };
-        if ptr_planes != 0 && cap >= 1 {
-            unsafe { ptr::write_unaligned(ptr_planes as *mut u32, DRM_PLANE_ID); }
+        if ptr_planes != 0 && cap as usize >= PLANES.len() {
+            unsafe {
+                ptr::copy_nonoverlapping(PLANES.as_ptr(), ptr_planes as *mut u32, PLANES.len());
+            }
         }
-        unsafe { ptr::write_unaligned((arg + 8) as *mut u32, 1); }
+        unsafe { ptr::write_unaligned((arg + 8) as *mut u32, PLANES.len() as u32); }
         Ok(0)
     }
 
@@ -1232,7 +1498,20 @@ impl DrmDeviceInterface {
     ///   gamma_size@16; count_format_types@20; u64 format_type_ptr@24; }.
     fn std_handle_get_plane(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        const FORMATS: [u32; 2] = [0x3432_5258 /* XR24 */, 0x3432_5241 /* AR24 */];
+        const XR24: u32 = 0x3432_5258;
+        const AR24: u32 = 0x3432_5241;
+        const PRIMARY_FORMATS: [u32; 2] = [XR24, AR24];
+        // The cursor plane advertises AR24 only: the host composites it as an
+        // overlay and needs the alpha channel. Offering XR24 invites smithay to
+        // pick a format the host would render fully opaque.
+        const CURSOR_FORMATS: [u32; 1] = [AR24];
+
+        let plane_id = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let formats: &[u32] = match plane_id {
+            DRM_CURSOR_PLANE_ID => &CURSOR_FORMATS,
+            DRM_PLANE_ID => &PRIMARY_FORMATS,
+            _ => return Err(DriverError::NotFound),
+        };
         unsafe {
             ptr::write_unaligned((arg + 4) as *mut u32, 0);  // crtc_id: not currently bound
             ptr::write_unaligned((arg + 8) as *mut u32, 0);  // fb_id
@@ -1241,10 +1520,10 @@ impl DrmDeviceInterface {
         }
         let cap = unsafe { ptr::read_unaligned((arg + 20) as *const u32) };
         let fmt_ptr = unsafe { ptr::read_unaligned((arg + 24) as *const u64) };
-        if fmt_ptr != 0 && cap as usize >= FORMATS.len() {
-            unsafe { ptr::copy_nonoverlapping(FORMATS.as_ptr(), fmt_ptr as *mut u32, FORMATS.len()); }
+        if fmt_ptr != 0 && cap as usize >= formats.len() {
+            unsafe { ptr::copy_nonoverlapping(formats.as_ptr(), fmt_ptr as *mut u32, formats.len()); }
         }
-        unsafe { ptr::write_unaligned((arg + 20) as *mut u32, FORMATS.len() as u32); }
+        unsafe { ptr::write_unaligned((arg + 20) as *mut u32, formats.len() as u32); }
         Ok(0)
     }
 
@@ -1256,19 +1535,275 @@ impl DrmDeviceInterface {
     fn std_handle_get_property(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let prop_id = unsafe { ptr::read_unaligned((arg + 16) as *const u32) };
-        if prop_id == DRM_PLANE_TYPE_PROP_ID {
-            const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
-            let name = b"type\0";
-            unsafe {
-                ptr::write_unaligned((arg + 20) as *mut u32, DRM_MODE_PROP_ENUM);
-                ptr::copy_nonoverlapping(name.as_ptr(), (arg + 24) as *mut u8, name.len());
-                ptr::write_unaligned((arg + 56) as *mut u32, 0);
-                ptr::write_unaligned((arg + 60) as *mut u32, 0);
-            }
-            Ok(0)
-        } else {
-            Err(DriverError::Unsupported)
+        let def = match prop_def(prop_id) {
+            Some(d) => d,
+            None => return Err(DriverError::Unsupported),
+        };
+
+        let count = prop_value_count(def.kind);
+        let values = prop_values(def.kind);
+        let values_ptr = unsafe { ptr::read_unaligned(arg as *const u64) };
+        let in_count = unsafe { ptr::read_unaligned((arg + 56) as *const u32) };
+
+        unsafe {
+            ptr::write_unaligned((arg + 20) as *mut u32, prop_flags(def.kind));
+            // name[32] — zero the field first so a shorter name never inherits
+            // the caller's stack bytes.
+            ptr::write_bytes((arg + 24) as *mut u8, 0, 32);
+            let n = def.name.len().min(32);
+            ptr::copy_nonoverlapping(def.name.as_ptr(), (arg + 24) as *mut u8, n);
         }
+
+        // Fill the value array only when the caller supplied one big enough.
+        // drm-rs indexes values[0] (OBJECT) and values[0..2] (RANGE and
+        // SIGNED_RANGE) without checking the count, so the count reported here
+        // must always be the real one — and identical on both passes, because
+        // drm-ffi does Vec::set_len from the *second* call's count.
+        if values_ptr != 0 && in_count >= count && count > 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(values.as_ptr(), values_ptr as *mut u64, count as usize);
+            }
+        }
+        unsafe {
+            ptr::write_unaligned((arg + 56) as *mut u32, count);
+            ptr::write_unaligned((arg + 60) as *mut u32, 0); // count_enum_blobs
+        }
+        Ok(0)
+    }
+
+    // ── Property blobs ───────────────────────────────────────────────────────
+
+    /// DRM_IOCTL_MODE_CREATEPROPBLOB.
+    /// struct drm_mode_create_blob { u64 data@0; u32 length@8; u32 blob_id@12; }
+    fn std_handle_create_blob(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let data = unsafe { ptr::read_unaligned(arg as *const u64) };
+        let length = unsafe { ptr::read_unaligned((arg + 8) as *const u32) } as usize;
+        if data == 0 || length == 0 || length > 64 * 1024 {
+            return Err(DriverError::InvalidParameter);
+        }
+        let mut buf = vec![0u8; length];
+        unsafe { ptr::copy_nonoverlapping(data as *const u8, buf.as_mut_ptr(), length); }
+
+        let id = NEXT_BLOB_ID.fetch_add(1, Ordering::Relaxed);
+        BLOBS.lock().insert(id, buf);
+        unsafe { ptr::write_unaligned((arg + 12) as *mut u32, id); }
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_MODE_DESTROYPROPBLOB. struct { u32 blob_id@0; }
+    fn std_handle_destroy_blob(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let id = unsafe { ptr::read_unaligned(arg as *const u32) };
+        match BLOBS.lock().remove(&id) {
+            Some(_) => Ok(0),
+            None => Err(DriverError::NotFound),
+        }
+    }
+
+    /// DRM_IOCTL_MODE_GETPROPBLOB — two-pass like GETPROPERTY.
+    /// struct drm_mode_get_blob { u32 blob_id@0; u32 length@4; u64 data@8; }
+    fn std_handle_get_blob(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let id = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let in_len = unsafe { ptr::read_unaligned((arg + 4) as *const u32) } as usize;
+        let data = unsafe { ptr::read_unaligned((arg + 8) as *const u64) };
+
+        // Copy out from under the lock: a demand-paging fault on `data` taken
+        // with BLOBS held is the 82d0cc3 freeze class.
+        let blob = match BLOBS.lock().get(&id) {
+            Some(b) => b.clone(),
+            None => return Err(DriverError::NotFound),
+        };
+        if data != 0 && in_len >= blob.len() {
+            unsafe { ptr::copy_nonoverlapping(blob.as_ptr(), data as *mut u8, blob.len()); }
+        }
+        unsafe { ptr::write_unaligned((arg + 4) as *mut u32, blob.len() as u32); }
+        Ok(0)
+    }
+
+    // ── Atomic modesetting ───────────────────────────────────────────────────
+
+    /// DRM_IOCTL_MODE_ATOMIC.
+    /// struct drm_mode_atomic { u32 flags@0; u32 count_objs@4; u64 objs_ptr@8;
+    ///   u64 count_props_ptr@16; u64 props_ptr@24; u64 prop_values_ptr@32;
+    ///   u64 reserved@40; u64 user_data@48; }
+    ///
+    /// `objs_ptr` carries bare object ids with no type tag. Our synthetic crtc,
+    /// connector and encoder all have id 1, so the type is recovered from the
+    /// property id instead — the property-id ranges are disjoint per object
+    /// class exactly so this is unambiguous.
+    fn std_handle_atomic(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+
+        // Copy the entire request into kernel memory BEFORE taking any lock: a
+        // demand-paging fault under the DRM spinlock is the 82d0cc3 freeze.
+        let flags = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let count_objs = unsafe { ptr::read_unaligned((arg + 4) as *const u32) } as usize;
+        let objs_ptr = unsafe { ptr::read_unaligned((arg + 8) as *const u64) };
+        let counts_ptr = unsafe { ptr::read_unaligned((arg + 16) as *const u64) };
+        let props_ptr = unsafe { ptr::read_unaligned((arg + 24) as *const u64) };
+        let vals_ptr = unsafe { ptr::read_unaligned((arg + 32) as *const u64) };
+        let user_data = unsafe { ptr::read_unaligned((arg + 48) as *const u64) };
+
+        // An empty commit is legal and is a no-op.
+        if count_objs == 0 { return Ok(0); }
+        // We expose 4 objects; anything wildly larger is a malformed request.
+        if count_objs > 64 || objs_ptr == 0 || counts_ptr == 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+
+        let mut objs = vec![0u32; count_objs];
+        let mut counts = vec![0u32; count_objs];
+        unsafe {
+            ptr::copy_nonoverlapping(objs_ptr as *const u32, objs.as_mut_ptr(), count_objs);
+            ptr::copy_nonoverlapping(counts_ptr as *const u32, counts.as_mut_ptr(), count_objs);
+        }
+
+        let mut total = 0usize;
+        for &c in &counts {
+            total = total.saturating_add(c as usize);
+        }
+        if total > 1024 { return Err(DriverError::InvalidParameter); }
+        if total > 0 && (props_ptr == 0 || vals_ptr == 0) {
+            return Err(DriverError::InvalidParameter);
+        }
+        let mut pids = vec![0u32; total];
+        let mut pvals = vec![0u64; total];
+        if total > 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(props_ptr as *const u32, pids.as_mut_ptr(), total);
+                ptr::copy_nonoverlapping(vals_ptr as *const u64, pvals.as_mut_ptr(), total);
+            }
+        }
+
+        // ── Fold the flattened (obj, prop, value) triples into a request ──
+        let mut primary = AtomicPlaneReq::default();
+        let mut cursor = AtomicPlaneReq::default();
+        let mut want_active: Option<u64> = None;
+        let mut want_mode: Option<u64> = None;
+        let mut want_conn_crtc: Option<u64> = None;
+
+        let mut k = 0usize;
+        for (i, &obj) in objs.iter().enumerate() {
+            for _ in 0..counts[i] {
+                let pid = pids[k];
+                let val = pvals[k];
+                k += 1;
+
+                match pid {
+                    // ── crtc ──
+                    PROP_ACTIVE => {
+                        if obj != DRM_CRTC_ID { return Err(DriverError::InvalidParameter); }
+                        want_active = Some(val);
+                    }
+                    PROP_MODE_ID => {
+                        if obj != DRM_CRTC_ID { return Err(DriverError::InvalidParameter); }
+                        want_mode = Some(val);
+                    }
+                    // ── connector ──
+                    PROP_CONN_CRTC_ID => {
+                        if obj != DRM_CONNECTOR_ID { return Err(DriverError::InvalidParameter); }
+                        want_conn_crtc = Some(val);
+                    }
+                    // ── planes ──
+                    _ => {
+                        let p = match obj {
+                            DRM_PLANE_ID => &mut primary,
+                            DRM_CURSOR_PLANE_ID => &mut cursor,
+                            _ => return Err(DriverError::InvalidParameter),
+                        };
+                        match pid {
+                            PROP_TYPE => {} // immutable; ignore writes
+                            PROP_PLANE_CRTC_ID => p.crtc_id = Some(val as u32),
+                            PROP_FB_ID => p.fb_id = Some(val as u32),
+                            // SRC_* are 16.16 fixed point.
+                            PROP_SRC_X => p.src_x = Some((val >> 16) as u32),
+                            PROP_SRC_Y => p.src_y = Some((val >> 16) as u32),
+                            PROP_SRC_W => p.src_w = Some((val >> 16) as u32),
+                            PROP_SRC_H => p.src_h = Some((val >> 16) as u32),
+                            PROP_CRTC_X => p.crtc_x = Some(val as i32),
+                            PROP_CRTC_Y => p.crtc_y = Some(val as i32),
+                            PROP_CRTC_W => p.crtc_w = Some(val as u32),
+                            PROP_CRTC_H => p.crtc_h = Some(val as u32),
+                            PROP_FB_DAMAGE_CLIPS => p.damage_blob = Some(val as u32),
+                            _ => return Err(DriverError::InvalidParameter),
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Modeset gating ──
+        // Without ALLOW_MODESET a request that *changes* ACTIVE, MODE_ID or the
+        // connector's CRTC_ID must be rejected. That rejection is precisely how
+        // smithay discovers it needs a modeset, so getting it wrong either
+        // wedges startup or makes every frame a modeset.
+        let allow_modeset = flags & DRM_MODE_ATOMIC_ALLOW_MODESET != 0;
+        let test_only = flags & DRM_MODE_ATOMIC_TEST_ONLY != 0;
+        let cur_active = CRTC_ACTIVE.load(Ordering::Relaxed) as u64;
+        let cur_mode = CRTC_MODE_BLOB.load(Ordering::Relaxed) as u64;
+        let cur_conn = CONN_CRTC.load(Ordering::Relaxed) as u64;
+        let changes_modeset = want_active.map_or(false, |v| v != cur_active)
+            || want_mode.map_or(false, |v| v != cur_mode)
+            || want_conn_crtc.map_or(false, |v| v != cur_conn);
+        if changes_modeset && !allow_modeset {
+            return Err(DriverError::InvalidParameter);
+        }
+
+        // A MODE_ID blob must exist if one was named.
+        if let Some(mode_blob) = want_mode {
+            if mode_blob != 0 && !BLOBS.lock().contains_key(&(mode_blob as u32)) {
+                return Err(DriverError::InvalidParameter);
+            }
+        }
+
+        // TEST_ONLY: everything above is the validation. Never present.
+        // smithay issues these constantly; a spurious failure here silently
+        // disables the cursor plane rather than producing a visible error.
+        if test_only { return Ok(0); }
+
+        if let Some(v) = want_active { CRTC_ACTIVE.store(v as u32, Ordering::Relaxed); }
+        if let Some(v) = want_mode { CRTC_MODE_BLOB.store(v as u32, Ordering::Relaxed); }
+        if let Some(v) = want_conn_crtc { CONN_CRTC.store(v as u32, Ordering::Relaxed); }
+
+        // ── Present ──
+        let mut presented = false;
+        if let Some(fb_id) = primary.fb_id {
+            if fb_id != 0 {
+                let t0 = if DRM_STATS { crate::snd::monotonic_us() } else { 0 };
+                let r = {
+                    let d = get_drm_device();
+                    let mut g = d.lock();
+                    let (mut src_w, mut src_h) = (320u32, 200u32);
+                    if let Some(fb) = g.get_framebuffer(DrmObjectId(fb_id)) {
+                        src_w = fb.width;
+                        src_h = fb.height;
+                    }
+                    let flip_args = [fb_id, 0u32, src_w, src_h];
+                    self.handle_flip_page(&mut g, flip_args.as_ptr() as usize)
+                };
+                if DRM_STATS {
+                    FLIP_US_TOTAL
+                        .fetch_add(crate::snd::monotonic_us().wrapping_sub(t0), Ordering::Relaxed);
+                }
+                r?;
+                FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed);
+                presented = true;
+            }
+        }
+
+        // The cursor plane is routed to the virtio-gpu cursor queue in Stage 2;
+        // for now record the request so the state stays coherent.
+        let _ = &cursor;
+
+        // A commit that only reconfigured the cursor plane still owes the
+        // client its completion event, otherwise smithay's frame loop stalls.
+        let _ = presented;
+        if flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+            queue_flip_event(DRM_CRTC_ID, user_data);
+        }
+        Ok(0)
     }
 
     /// DRM_IOCTL_GET_MAGIC — single-seat stub: return a nonzero magic.
