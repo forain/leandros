@@ -551,6 +551,13 @@ static CURSOR_UPDATES: AtomicU64 = AtomicU64::new(0);
 static CURSOR_MOVES: AtomicU64 = AtomicU64::new(0);
 /// Atomic commits actually applied (TEST_ONLY validations are not counted).
 static ATOMIC_COMMITS: AtomicU64 = AtomicU64::new(0);
+/// TEST_ONLY validations. smithay issues these constantly while probing which
+/// plane assignments are possible.
+static ATOMIC_TESTS: AtomicU64 = AtomicU64::new(0);
+/// Requests (test or real) that named the cursor plane at all. If this stays
+/// zero the compositor never even tried the cursor plane, which is a very
+/// different problem from the plane being tried and rejected.
+static CURSOR_PLANE_SEEN: AtomicU64 = AtomicU64::new(0);
 
 // Committed crtc/connector state. Only used to decide whether an incoming
 // atomic request needs ALLOW_MODESET.
@@ -676,11 +683,18 @@ pub fn drm_tick() {
             crate::pci::serial_debug_hex_64(CURSOR_MOVES.load(Ordering::Relaxed));
             crate::pci::serial_debug(" atomic=");
             crate::pci::serial_debug_hex_64(ATOMIC_COMMITS.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" atest=");
+            crate::pci::serial_debug_hex_64(ATOMIC_TESTS.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" cplane=");
+            crate::pci::serial_debug_hex_64(CURSOR_PLANE_SEEN.load(Ordering::Relaxed));
             crate::pci::serial_debug("\n");
         }
     }
     let last = LAST_FLIP_DELIVER_TICK.load(Ordering::Relaxed);
-    if now.wrapping_sub(last) < 2 { return; } // < 20 ms since last delivery
+    // One tick (~10 ms) since the last delivery. The throttle exists so an idle
+    // compositor cannot spin — one event per tick still guarantees that, and
+    // idletest guards the property. Do NOT drain the whole queue here.
+    if now.wrapping_sub(last) < 1 { return; }
 
     let mut pend = match PENDING_FLIPS.try_lock() { Some(g) => g, None => return };
     if pend.is_empty() { return; }
@@ -1727,7 +1741,12 @@ impl DrmDeviceInterface {
                     _ => {
                         let p = match obj {
                             DRM_PLANE_ID => &mut primary,
-                            DRM_CURSOR_PLANE_ID => &mut cursor,
+                            DRM_CURSOR_PLANE_ID => {
+                                if DRM_STATS {
+                                    CURSOR_PLANE_SEEN.fetch_add(1, Ordering::Relaxed);
+                                }
+                                &mut cursor
+                            }
                             _ => return Err(DriverError::InvalidParameter),
                         };
                         match pid {
@@ -1778,7 +1797,10 @@ impl DrmDeviceInterface {
         // TEST_ONLY: everything above is the validation. Never present.
         // smithay issues these constantly; a spurious failure here silently
         // disables the cursor plane rather than producing a visible error.
-        if test_only { return Ok(0); }
+        if test_only {
+            if DRM_STATS { ATOMIC_TESTS.fetch_add(1, Ordering::Relaxed); }
+            return Ok(0);
+        }
 
         if let Some(v) = want_active { CRTC_ACTIVE.store(v as u32, Ordering::Relaxed); }
         if let Some(v) = want_mode { CRTC_MODE_BLOB.store(v as u32, Ordering::Relaxed); }
