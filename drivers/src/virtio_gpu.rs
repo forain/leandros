@@ -72,8 +72,19 @@ pub struct VirtioGpuDevice {
     current_resource_id: u32,
     scanout_w: u32,
     scanout_h: u32,
-    
+
     queues: [Option<VirtioQueue>; 2],
+
+    /// Backing store for the 64x64 cursor image (resource `CURSOR_RESOURCE_ID`).
+    /// Physically contiguous — `attach_backing` emits a single mem entry.
+    cursor_phys: u64,
+    cursor_virt: usize,
+    /// Resource created + backed + a first image uploaded.
+    cursor_ready: bool,
+    /// Last position pushed to the host, to suppress redundant MOVE_CURSORs.
+    cursor_pos: (u32, u32),
+    /// `false` once the cursor has been hidden with `resource_id = 0`.
+    cursor_visible: bool,
 }
 
 unsafe impl Send for VirtioGpuDevice {}
@@ -172,6 +183,52 @@ pub enum VirtioGpuCmd {
     GetCapset = 0x0110,
     TransferToHost3d = 0x0111,
     TransferFromHost3d = 0x0112,
+    // Cursor-queue commands (queue 1).  These take no response descriptor.
+    UpdateCursor = 0x0300,
+    MoveCursor = 0x0301,
+}
+
+/// Position payload shared by UPDATE_CURSOR and MOVE_CURSOR (16 bytes).
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct VirtioGpuCursorPos {
+    scanout_id: u32,
+    x: u32,
+    y: u32,
+    padding: u32,
+}
+
+/// `struct virtio_gpu_update_cursor` — 24 + 16 + 16 = 56 bytes.
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct VirtioGpuUpdateCursor {
+    hdr: VirtioGpuCtrlHdr,
+    pos: VirtioGpuCursorPos,
+    resource_id: u32,
+    hot_x: u32,
+    hot_y: u32,
+    padding: u32,
+}
+
+/// The host requires cursor images to be exactly this size; QEMU silently drops
+/// uploads of any other geometry (hw/display/virtio-gpu.c).
+pub const CURSOR_W: u32 = 64;
+pub const CURSOR_H: u32 = 64;
+/// Resource 1 is the scanout framebuffer, so the cursor image lives in 2.
+pub const CURSOR_RESOURCE_ID: u32 = 2;
+
+/// Set to `true` to drive a kernel-owned cursor straight from pointer state, as
+/// a standalone check of the cursor queue and the host overlay path.  Ships
+/// `false`: the compositor owns the cursor via the atomic cursor plane.
+pub const CURSOR_DEBUG: bool = false;
+
+/// Cursor-path tracing.  Goes straight to the UART (not gated on RENDER_DEBUG,
+/// which is compiled out) so the Stage-0 gate is observable in the serial log.
+#[inline(always)]
+fn cdebug(msg: &str) {
+    if CURSOR_DEBUG {
+        crate::pci::serial_debug(msg);
+    }
 }
 
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
@@ -363,6 +420,11 @@ impl VirtioGpuDevice {
             scanout_w: 1280,
             scanout_h: 800,
             queues: [None, None],
+            cursor_phys: 0,
+            cursor_virt: 0,
+            cursor_ready: false,
+            cursor_pos: (0, 0),
+            cursor_visible: false,
         };
 
         gpu.init_device();
@@ -390,8 +452,14 @@ impl VirtioGpuDevice {
             // 5. Set FEATURES_OK status bit
             status.write_volatile(status.read_volatile() | VIRTIO_STATUS_FEATURES_OK);
 
-            // 6. Setup queues
+            // 6. Setup queues: 0 = controlq, 1 = cursorq.  virtio-gpu always
+            //    exposes both, but stay defensive — the cursor path checks for
+            //    `None` and degrades to the software cursor.
             self.queues[0] = self.setup_queue(0);
+            self.queues[1] = self.setup_queue(1);
+            if self.queues[1].is_none() {
+                cdebug("[GPU] no cursor queue; hardware cursor disabled\n");
+            }
 
             // 7. Set DRIVER_OK status bit
             status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER_OK);
@@ -518,6 +586,259 @@ impl VirtioGpuDevice {
 
         Ok(())
     }
+    // ---------------------------------------------------------------------
+    // Cursor queue (queue 1)
+    //
+    // The cursor queue carries only UPDATE_CURSOR and MOVE_CURSOR.  Unlike the
+    // control queue these take a single read-only descriptor and produce no
+    // response: the host consumes the command and completes the chain.  The
+    // request page is therefore reclaimed lazily, from the used ring, on the
+    // next call — never in the submit path, so a command the host has not yet
+    // consumed can never have its buffer freed underneath it.
+    // ---------------------------------------------------------------------
+
+    /// Reclaim descriptors and request pages the host has finished with.
+    fn cursor_reap(&mut self) {
+        let q = match self.queues[1].as_mut() {
+            Some(q) => q,
+            None => return,
+        };
+        unsafe {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            while q.last_used_idx != (*q.used).idx {
+                // The used ring is a flexible array 4 bytes past the header.
+                let ring = (q.used as usize + 4) as *const VirtqUsedElem;
+                let slot = ring.add(q.last_used_idx as usize % q.size as usize);
+                let head = (slot as *const u32).read_volatile() as u16;
+                if head as usize >= q.size as usize {
+                    // Corrupt used entry — resync rather than free a bad page.
+                    q.last_used_idx = (*q.used).idx;
+                    break;
+                }
+                let phys = (*q.desc.add(head as usize)).addr;
+                q.free_chain(head);
+                q.last_used_idx = q.last_used_idx.wrapping_add(1);
+                if phys != 0 {
+                    mm::buddy::free(phys as usize, 0);
+                }
+            }
+        }
+    }
+
+    /// Submit one cursor command.  Returns `false` if the queue is absent or
+    /// has no free descriptor.  Does not wait for completion.
+    fn send_cursor_command(&mut self, cmd: &VirtioGpuUpdateCursor) -> bool {
+        self.cursor_reap();
+
+        let notify_cfg = self.notify_cfg;
+        let mult = self.notify_off_multiplier;
+        let q = match self.queues[1].as_mut() {
+            Some(q) => q,
+            None => return false,
+        };
+        if q.num_free < 1 {
+            return false;
+        }
+
+        let req_phys = match mm::buddy::alloc(0) {
+            Some(p) => p,
+            None => return false,
+        };
+        let req_virt = mm::phys_to_virt(req_phys) as *mut u8;
+        let len = core::mem::size_of::<VirtioGpuUpdateCursor>();
+        unsafe {
+            core::ptr::copy_nonoverlapping(cmd as *const _ as *const u8, req_virt, len);
+
+            // Single read-only descriptor: no NEXT, no WRITE.
+            let head = q.add_desc(req_phys as u64, len as u32, 0);
+            q.submit(head);
+
+            let notify_addr =
+                (notify_cfg as usize + q.notify_off as usize * mult as usize) as *mut u16;
+            notify_addr.write_volatile(0);
+        }
+        true
+    }
+
+    /// Create and back the 64x64 cursor resource.  Idempotent.
+    pub fn cursor_init(&mut self) -> bool {
+        if self.cursor_ready {
+            return true;
+        }
+        if self.queues[1].is_none() {
+            return false;
+        }
+        if self.cursor_phys == 0 {
+            // 64*64*4 = 16 KiB = order 2, physically contiguous as
+            // `attach_backing` emits exactly one mem entry.
+            let phys = match mm::buddy::alloc(2) {
+                Some(p) => p,
+                None => return false,
+            };
+            self.cursor_phys = phys as u64;
+            self.cursor_virt = mm::phys_to_virt(phys);
+            unsafe {
+                core::ptr::write_bytes(
+                    self.cursor_virt as *mut u8,
+                    0,
+                    (CURSOR_W * CURSOR_H * 4) as usize,
+                );
+            }
+        }
+        if !self.create_resource_2d(CURSOR_RESOURCE_ID, CURSOR_W, CURSOR_H) {
+            cdebug("[GPU] cursor create_resource_2d failed\n");
+            return false;
+        }
+        if !self.attach_backing(
+            CURSOR_RESOURCE_ID,
+            self.cursor_phys,
+            CURSOR_W * CURSOR_H * 4,
+        ) {
+            cdebug("[GPU] cursor attach_backing failed\n");
+            return false;
+        }
+        self.cursor_ready = true;
+        cdebug("[GPU] cursor queue + resource ready\n");
+        true
+    }
+
+    /// Copy a 64x64 BGRA image into the cursor resource and hand it to the host
+    /// at `(x, y)` with hotspot `(hot_x, hot_y)`.  `pixels` shorter than
+    /// 64*64*4 bytes is zero-padded; longer is truncated.
+    pub fn cursor_update(
+        &mut self,
+        pixels: &[u8],
+        hot_x: u32,
+        hot_y: u32,
+        x: u32,
+        y: u32,
+    ) -> bool {
+        if !self.cursor_init() {
+            return false;
+        }
+        let bytes = (CURSOR_W * CURSOR_H * 4) as usize;
+        unsafe {
+            let dst = self.cursor_virt as *mut u8;
+            let n = pixels.len().min(bytes);
+            core::ptr::copy_nonoverlapping(pixels.as_ptr(), dst, n);
+            if n < bytes {
+                core::ptr::write_bytes(dst.add(n), 0, bytes - n);
+            }
+        }
+        self.cursor_present(hot_x, hot_y, x, y)
+    }
+
+    /// Publish whatever is already in the cursor backing: transfer it to the
+    /// host and issue UPDATE_CURSOR.  Callers that wrote the backing directly
+    /// use this instead of `cursor_update` to avoid a redundant copy.
+    pub fn cursor_present(&mut self, hot_x: u32, hot_y: u32, x: u32, y: u32) -> bool {
+        if !self.cursor_ready {
+            return false;
+        }
+        // The image upload is a control-queue command; only UPDATE/MOVE_CURSOR
+        // ride the cursor queue.
+        let transfer = VirtioGpuTransferToHost2d {
+            hdr: VirtioGpuCtrlHdr {
+                type_: VirtioGpuCmd::TransferToHost2d as u32,
+                flags: 0,
+                fence_id: 0,
+                ctx_id: 0,
+                padding: 0,
+            },
+            r: VirtioGpuRect { x: 0, y: 0, width: CURSOR_W, height: CURSOR_H },
+            offset: 0,
+            resource_id: CURSOR_RESOURCE_ID,
+            padding: 0,
+        };
+        let data = unsafe {
+            core::slice::from_raw_parts(
+                &transfer as *const _ as *const u8,
+                core::mem::size_of::<VirtioGpuTransferToHost2d>(),
+            )
+        };
+        if self.send_command_raw(data).is_err() {
+            return false;
+        }
+
+        let cmd = VirtioGpuUpdateCursor {
+            hdr: VirtioGpuCtrlHdr {
+                type_: VirtioGpuCmd::UpdateCursor as u32,
+                flags: 0,
+                fence_id: 0,
+                ctx_id: 0,
+                padding: 0,
+            },
+            pos: VirtioGpuCursorPos { scanout_id: 0, x, y, padding: 0 },
+            resource_id: CURSOR_RESOURCE_ID,
+            hot_x,
+            hot_y,
+            padding: 0,
+        };
+        self.cursor_pos = (x, y);
+        self.cursor_visible = true;
+        self.send_cursor_command(&cmd)
+    }
+
+    /// Reposition the cursor.  No pixel traffic at all.
+    pub fn cursor_move(&mut self, x: u32, y: u32) -> bool {
+        if !self.cursor_ready || !self.cursor_visible {
+            return false;
+        }
+        if self.cursor_pos == (x, y) {
+            return true;
+        }
+        self.cursor_pos = (x, y);
+        let cmd = VirtioGpuUpdateCursor {
+            hdr: VirtioGpuCtrlHdr {
+                type_: VirtioGpuCmd::MoveCursor as u32,
+                flags: 0,
+                fence_id: 0,
+                ctx_id: 0,
+                padding: 0,
+            },
+            pos: VirtioGpuCursorPos { scanout_id: 0, x, y, padding: 0 },
+            // Must stay nonzero: resource_id 0 means "hide" to the host.
+            resource_id: CURSOR_RESOURCE_ID,
+            hot_x: 0,
+            hot_y: 0,
+            padding: 0,
+        };
+        self.send_cursor_command(&cmd)
+    }
+
+    /// Hide the hardware cursor (`resource_id = 0`).
+    pub fn cursor_hide(&mut self) -> bool {
+        if !self.cursor_ready || !self.cursor_visible {
+            return false;
+        }
+        self.cursor_visible = false;
+        let cmd = VirtioGpuUpdateCursor {
+            hdr: VirtioGpuCtrlHdr {
+                type_: VirtioGpuCmd::UpdateCursor as u32,
+                flags: 0,
+                fence_id: 0,
+                ctx_id: 0,
+                padding: 0,
+            },
+            pos: VirtioGpuCursorPos { scanout_id: 0, x: 0, y: 0, padding: 0 },
+            resource_id: 0,
+            hot_x: 0,
+            hot_y: 0,
+            padding: 0,
+        };
+        self.send_cursor_command(&cmd)
+    }
+
+    /// Has the host consumed everything we submitted on the cursor queue?
+    /// Used only by the Stage 0 gate check.
+    pub fn cursor_queue_drained(&mut self) -> bool {
+        self.cursor_reap();
+        match self.queues[1].as_ref() {
+            Some(q) => q.num_free == q.size,
+            None => false,
+        }
+    }
+
     pub fn create_resource_2d(&mut self, resource_id: u32, width: u32, height: u32) -> bool {
         let cmd = VirtioGpuResourceCreate2d {
             hdr: VirtioGpuCtrlHdr {
@@ -811,6 +1132,114 @@ pub fn init() {
     }
 }
 
+/// Upload a 64x64 BGRA cursor image and show it at `(x, y)`.
+pub fn cursor_update(pixels: &[u8], hot_x: u32, hot_y: u32, x: u32, y: u32) -> bool {
+    let mut guard = VIRTIO_GPU.lock();
+    match guard.as_mut() {
+        Some(gpu) => gpu.cursor_update(pixels, hot_x, hot_y, x, y),
+        None => false,
+    }
+}
+
+/// Reposition the hardware cursor.  Costs no pixel traffic.
+pub fn cursor_move(x: u32, y: u32) -> bool {
+    let mut guard = VIRTIO_GPU.lock();
+    match guard.as_mut() {
+        Some(gpu) => gpu.cursor_move(x, y),
+        None => false,
+    }
+}
+
+/// Hide the hardware cursor.
+pub fn cursor_hide() -> bool {
+    let mut guard = VIRTIO_GPU.lock();
+    match guard.as_mut() {
+        Some(gpu) => gpu.cursor_hide(),
+        None => false,
+    }
+}
+
+/// Stage-0 gate: prove the cursor queue exists, accepts an UPDATE_CURSOR with a
+/// real image and a MOVE_CURSOR, and that the host consumes both.  Draws a
+/// magenta-bordered arrow-ish block so it is unmistakable on screen.
+///
+/// Reports the outcome on the serial console and returns whether the queue
+/// drained.  Only called when `CURSOR_DEBUG` is set.
+pub fn cursor_selftest() -> bool {
+    // Run once: the console-framebuffer path (AArch64 boot) and KMS/DRM init
+    // (both arches, when a compositor opens the card) both call this.
+    static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if RAN.swap(true, core::sync::atomic::Ordering::SeqCst) {
+        return true;
+    }
+
+    // Build the image straight into the cursor backing — a 16 KiB array would
+    // not fit comfortably on the kernel stack.
+    let mut guard = VIRTIO_GPU.lock();
+    let ok_init = match guard.as_mut() {
+        Some(gpu) => {
+            if gpu.cursor_init() {
+                unsafe {
+                    let p = gpu.cursor_virt as *mut u8;
+                    for row in 0..CURSOR_H as usize {
+                        for col in 0..CURSOR_W as usize {
+                            // Filled right triangle: opaque magenta, else clear.
+                            let inside = col <= row && col < 40 && row < 56;
+                            let i = (row * CURSOR_W as usize + col) * 4;
+                            let px = if inside { [0xFFu8, 0x00, 0xFF, 0xFF] } else { [0; 4] };
+                            core::ptr::copy_nonoverlapping(px.as_ptr(), p.add(i), 4);
+                        }
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        }
+        None => false,
+    };
+    drop(guard);
+    if !ok_init {
+        cdebug("[GPU] cursor selftest init=FAIL\n");
+        return false;
+    }
+
+    // The pattern is already in the backing, so present it in place rather
+    // than copying it through a staging buffer.
+    let ok_update = {
+        let mut guard = VIRTIO_GPU.lock();
+        match guard.as_mut() {
+            Some(gpu) => gpu.cursor_present(0, 0, 200, 200),
+            None => false,
+        }
+    };
+    let ok_move = cursor_move(320, 240);
+
+    let mut guard = VIRTIO_GPU.lock();
+    let drained = match guard.as_mut() {
+        Some(gpu) => {
+            // Give the host a moment to consume the two commands.
+            let mut spins = 2_000_000u32;
+            while !gpu.cursor_queue_drained() && spins > 0 {
+                core::hint::spin_loop();
+                spins -= 1;
+            }
+            gpu.cursor_queue_drained()
+        }
+        None => false,
+    };
+    drop(guard);
+
+    cdebug("[GPU] cursor selftest update=");
+    cdebug(if ok_update { "ok" } else { "FAIL" });
+    cdebug(" move=");
+    cdebug(if ok_move { "ok" } else { "FAIL" });
+    cdebug(" drained=");
+    cdebug(if drained { "ok" } else { "FAIL" });
+    cdebug("\n");
+    ok_update && ok_move && drained
+}
+
 /// Bring up the VirtIO GPU and create a scanout-backed framebuffer in guest RAM.
 ///
 /// Used when the bootloader does not hand the kernel a linear framebuffer.  On
@@ -878,6 +1307,13 @@ pub fn setup_console_framebuffer(default_width: u32, default_height: u32) -> Opt
         return None;
     }
     gpu.flush(1, 0, 0, width, height);
+    drop(guard);
+
+    // Stage-0 gate for the hardware cursor.  Takes the device lock itself, so
+    // it must run after the guard above is released.
+    if CURSOR_DEBUG {
+        cursor_selftest();
+    }
 
     Some((phys as u64, virt, width, height, pitch))
 }

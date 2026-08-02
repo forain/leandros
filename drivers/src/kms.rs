@@ -187,6 +187,13 @@ impl KmsDriver {
             }
         }
 
+        // Stage-0 gate for the hardware cursor: prove the cursor queue exists
+        // and that the host consumes UPDATE_CURSOR/MOVE_CURSOR.  The lock must
+        // already be released — cursor_selftest takes it itself.
+        if crate::virtio_gpu::CURSOR_DEBUG {
+            crate::virtio_gpu::cursor_selftest();
+        }
+
         self.current_mode = Some(mode);
         crate::pci::rdebug("[KMS] detect_and_configure done\n");
         Ok(mode)
