@@ -544,6 +544,14 @@ pub fn atomic_client() -> bool {
     ATOMIC_CLIENT.load(Ordering::Relaxed)
 }
 
+/// Framebuffer id whose pixels are currently loaded into the host cursor
+/// resource. A commit naming this same id needs no upload.
+static LAST_CURSOR_FB: AtomicU32 = AtomicU32::new(0);
+static CURSOR_UPDATES: AtomicU64 = AtomicU64::new(0);
+static CURSOR_MOVES: AtomicU64 = AtomicU64::new(0);
+/// Atomic commits actually applied (TEST_ONLY validations are not counted).
+static ATOMIC_COMMITS: AtomicU64 = AtomicU64::new(0);
+
 // Committed crtc/connector state. Only used to decide whether an incoming
 // atomic request needs ALLOW_MODESET.
 static CRTC_ACTIVE: AtomicU32 = AtomicU32::new(0);
@@ -659,6 +667,15 @@ pub fn drm_tick() {
             crate::pci::serial_debug_hex_64(DIRTYFB_CLIPS.load(Ordering::Relaxed));
             crate::pci::serial_debug(" flip_us=");
             crate::pci::serial_debug_hex_64(FLIP_US_TOTAL.load(Ordering::Relaxed));
+            // Cursor-plane traffic. Once the atomic cursor plane is live,
+            // pointer motion should show up here as `curs_mv` climbing while
+            // `flips_sub` stays flat — that is the whole point of the lane.
+            crate::pci::serial_debug(" curs_up=");
+            crate::pci::serial_debug_hex_64(CURSOR_UPDATES.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" curs_mv=");
+            crate::pci::serial_debug_hex_64(CURSOR_MOVES.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" atomic=");
+            crate::pci::serial_debug_hex_64(ATOMIC_COMMITS.load(Ordering::Relaxed));
             crate::pci::serial_debug("\n");
         }
     }
@@ -1793,9 +1810,8 @@ impl DrmDeviceInterface {
             }
         }
 
-        // The cursor plane is routed to the virtio-gpu cursor queue in Stage 2;
-        // for now record the request so the state stays coherent.
-        let _ = &cursor;
+        Self::commit_cursor_plane(&cursor);
+        if DRM_STATS { ATOMIC_COMMITS.fetch_add(1, Ordering::Relaxed); }
 
         // A commit that only reconfigured the cursor plane still owes the
         // client its completion event, otherwise smithay's frame loop stalls.
@@ -1804,6 +1820,72 @@ impl DrmDeviceInterface {
             queue_flip_event(DRM_CRTC_ID, user_data);
         }
         Ok(0)
+    }
+
+    /// Apply the cursor plane's share of an atomic commit to the virtio-gpu
+    /// cursor queue.
+    ///
+    /// The whole point of the plane is that repositioning is free, so pixels
+    /// move only when the commit actually names a different framebuffer.
+    /// A commit that carries CRTC_X/CRTC_Y and nothing else — smithay's
+    /// "repositioning cursor plane", by far the common case — issues a single
+    /// MOVE_CURSOR and touches no pixel data at all.
+    fn commit_cursor_plane(req: &AtomicPlaneReq) {
+        // Unbinding the plane (either the crtc or the fb going to 0) hides it.
+        let unbound = req.crtc_id == Some(0) || req.fb_id == Some(0);
+        if unbound {
+            LAST_CURSOR_FB.store(0, Ordering::Relaxed);
+            crate::virtio_gpu::cursor_hide();
+            return;
+        }
+
+        // Position: CRTC_X/CRTC_Y already carry the hotspot baked in (smithay
+        // does not send a hotspot property), so the host hotspot stays (0, 0).
+        // Negative coordinates are clamped — the host takes unsigned values.
+        let x = req.crtc_x.unwrap_or(0).max(0) as u32;
+        let y = req.crtc_y.unwrap_or(0).max(0) as u32;
+
+        match req.fb_id {
+            // A framebuffer we have not uploaded yet: copy its pixels into the
+            // cursor resource and publish it.
+            Some(fb_id) if fb_id != LAST_CURSOR_FB.load(Ordering::Relaxed) => {
+                let (phys, w, h) = {
+                    let dev = get_drm_device();
+                    let g = dev.lock();
+                    match g.get_framebuffer(DrmObjectId(fb_id)) {
+                        Some(fb) => (fb.physical_addresses[0], fb.width, fb.height),
+                        None => return,
+                    }
+                };
+                // ADDFB2 falls back to phys 0 for buffers it cannot resolve
+                // (the DRIimage path rather than a dumb buffer). Uploading from
+                // address 0 would push garbage to the host, so refuse loudly
+                // and leave the previous cursor in place.
+                if phys == 0 {
+                    crate::pci::serial_debug("[DRM] cursor fb has no physical backing\n");
+                    return;
+                }
+                let bytes = (w as usize)
+                    .saturating_mul(h as usize)
+                    .saturating_mul(4)
+                    .min((crate::virtio_gpu::CURSOR_W * crate::virtio_gpu::CURSOR_H * 4) as usize);
+                let src = unsafe {
+                    slice::from_raw_parts(mm::phys_to_virt(phys as usize) as *const u8, bytes)
+                };
+                if crate::virtio_gpu::cursor_update(src, 0, 0, x, y) {
+                    LAST_CURSOR_FB.store(fb_id, Ordering::Relaxed);
+                    if DRM_STATS { CURSOR_UPDATES.fetch_add(1, Ordering::Relaxed); }
+                }
+            }
+            // Same framebuffer, or none named: position only. No pixel traffic.
+            _ => {
+                if req.crtc_x.is_some() || req.crtc_y.is_some() {
+                    if crate::virtio_gpu::cursor_move(x, y) {
+                        if DRM_STATS { CURSOR_MOVES.fetch_add(1, Ordering::Relaxed); }
+                    }
+                }
+            }
+        }
     }
 
     /// DRM_IOCTL_GET_MAGIC — single-seat stub: return a nonzero magic.
