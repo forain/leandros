@@ -1,0 +1,12 @@
+[package]
+name = "venustest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "venustest"
+path = "src/main.rs"
+
+[dependencies]
+# Links directly against librelibc.a (like drmsmoke) — it needs real
+# open/ioctl/mmap through libc, not the minimal leandros-libc.

@@ -62,13 +62,48 @@ struct VirtqUsedElem {
     len: u32,
 }
 
+/// A `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` window: a host-owned BAR region that
+/// host-visible blob resources are mapped into by `RESOURCE_MAP_BLOB`.
+///
+/// This is a fundamentally different mechanism from `RESOURCE_ATTACH_BACKING`,
+/// which the rest of this driver uses: attach-backing hands the host guest-RAM
+/// pages the *guest* allocated, whereas a shared-memory region is *host* memory
+/// the guest maps a window onto.  The region is deliberately **not** mapped into
+/// kernel VA at probe time: QEMU's `hostmem=` is routinely gigabytes, and eagerly
+/// mapping it would exhaust the kernel page tables.  Only the sub-ranges that
+/// `RESOURCE_MAP_BLOB` actually hands out get mapped, on demand.
+#[derive(Copy, Clone, Default)]
+pub struct SharedMemRegion {
+    /// Shared-memory region id (`shmid`) — see `VIRTIO_GPU_SHM_ID_*`.
+    pub id: u8,
+    /// Physical base of the window (BAR base + capability offset).
+    pub phys: u64,
+    /// Window length in bytes.
+    pub len: u64,
+}
+
 pub struct VirtioGpuDevice {
     _pci_dev: PciDevice,
     common_cfg: *mut VirtioPciCommonCfg,
     notify_cfg: *mut u32,
     notify_off_multiplier: u32,
     _device_cfg: *mut u8,
-    _features: u32,
+    /// Feature bits actually negotiated with the host (bit N = feature N).
+    /// Bit 32+ live in `features_hi`.
+    features: u32,
+    features_hi: u32,
+    /// The host-visible blob window, if the device exposed one.
+    shmem: Option<SharedMemRegion>,
+    /// Monotonically increasing fence id.  Never reused, never zero: the host
+    /// treats fence_id 0 as "no fence" on some paths.
+    next_fence_id: u64,
+    /// Highest fence id the host has retired (completed the used-ring entry for).
+    last_completed_fence: u64,
+    /// Next 3D context id to hand out.  Context 0 means "no context".
+    next_ctx_id: u32,
+    /// Next resource id for 3D/blob resources.  1 is the console scanout and 2
+    /// is the cursor, so 3D allocation starts above them.
+    next_3d_resource_id: u32,
     current_resource_id: u32,
     scanout_w: u32,
     scanout_h: u32,
@@ -168,8 +203,21 @@ pub struct VirtioGpuCtrlHdr {
     pub padding: u32,
 }
 
-#[derive(Copy, Clone)]
+/// virtio-gpu control commands.
+///
+/// These numbers are the authoritative ones from the Linux uAPI header
+/// `include/uapi/linux/virtio_gpu.h` (byte-identical to QEMU's vendored copy in
+/// `include/standard-headers/linux/virtio_gpu.h`).  The host demultiplexes the
+/// control queue purely on `hdr.type_`, so a value that disagrees with the host
+/// does not fail loudly — it silently executes a *different* command, or is
+/// rejected as unknown.  2D commands live in `0x01xx`, 3D/context commands in
+/// `0x02xx`, cursor commands in `0x03xx`.
+///
+/// Note `ResourceCreateBlob` is `0x010c`, i.e. in the 2D block, not the 3D one —
+/// blob resources are not a 3D-only feature upstream.
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub enum VirtioGpuCmd {
+    // ── 2D commands ──
     GetDisplayInfo = 0x0100,
     ResourceCreate2d = 0x0101,
     ResourceUnref = 0x0102,
@@ -178,15 +226,68 @@ pub enum VirtioGpuCmd {
     TransferToHost2d = 0x0105,
     ResourceAttachBacking = 0x0106,
     ResourceDetachBacking = 0x0107,
-    ResourceCreate3d = 0x0108,
-    Submit3d = 0x0109,
-    GetCapset = 0x0110,
-    TransferToHost3d = 0x0111,
-    TransferFromHost3d = 0x0112,
+    GetCapsetInfo = 0x0108,
+    GetCapset = 0x0109,
+    GetEdid = 0x010a,
+    ResourceAssignUuid = 0x010b,
+    ResourceCreateBlob = 0x010c,
+    SetScanoutBlob = 0x010d,
+
+    // ── 3D / context commands ──
+    CtxCreate = 0x0200,
+    CtxDestroy = 0x0201,
+    CtxAttachResource = 0x0202,
+    CtxDetachResource = 0x0203,
+    ResourceCreate3d = 0x0204,
+    TransferToHost3d = 0x0205,
+    TransferFromHost3d = 0x0206,
+    Submit3d = 0x0207,
+    ResourceMapBlob = 0x0208,
+    ResourceUnmapBlob = 0x0209,
+
     // Cursor-queue commands (queue 1).  These take no response descriptor.
     UpdateCursor = 0x0300,
     MoveCursor = 0x0301,
 }
+
+// ── Response codes (virtio_gpu_ctrl_type) ────────────────────────────────────
+pub const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
+pub const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+pub const VIRTIO_GPU_RESP_OK_CAPSET_INFO: u32 = 0x1102;
+pub const VIRTIO_GPU_RESP_OK_CAPSET: u32 = 0x1103;
+pub const VIRTIO_GPU_RESP_OK_MAP_INFO: u32 = 0x1106;
+
+/// Set in `hdr.flags` to ask the host to signal `hdr.fence_id` on completion.
+pub const VIRTIO_GPU_FLAG_FENCE: u32 = 1 << 0;
+
+// ── Feature bits ─────────────────────────────────────────────────────────────
+pub const VIRTIO_GPU_F_VIRGL: u32 = 0;
+pub const VIRTIO_GPU_F_EDID: u32 = 1;
+pub const VIRTIO_GPU_F_RESOURCE_UUID: u32 = 2;
+pub const VIRTIO_GPU_F_RESOURCE_BLOB: u32 = 3;
+pub const VIRTIO_GPU_F_CONTEXT_INIT: u32 = 4;
+/// Transport feature: bit 32, i.e. bit 0 of feature-select word 1.
+pub const VIRTIO_F_VERSION_1: u32 = 32;
+
+// ── Capset ids (virtio_gpu.h) ────────────────────────────────────────────────
+pub const VIRTIO_GPU_CAPSET_VIRGL: u32 = 1;
+pub const VIRTIO_GPU_CAPSET_VIRGL2: u32 = 2;
+pub const VIRTIO_GPU_CAPSET_VENUS: u32 = 4;
+
+/// `context_init` low byte selects the context type; see
+/// `VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK`.
+pub const VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK: u32 = 0x0000_00ff;
+
+// ── Shared-memory region ids (virtio_gpu.h) ──────────────────────────────────
+pub const VIRTIO_GPU_SHM_ID_UNDEFINED: u8 = 0;
+pub const VIRTIO_GPU_SHM_ID_HOST_VISIBLE: u8 = 1;
+
+// ── Blob memory / flags ──────────────────────────────────────────────────────
+pub const VIRTIO_GPU_BLOB_MEM_GUEST: u32 = 0x0001;
+pub const VIRTIO_GPU_BLOB_MEM_HOST3D: u32 = 0x0002;
+pub const VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
+pub const VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
+pub const VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
 
 /// Position payload shared by UPDATE_CURSOR and MOVE_CURSOR (16 bytes).
 #[repr(C, packed)]
@@ -235,6 +336,9 @@ const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
 const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_ISR_CFG:    u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+/// `struct virtio_pci_cap64` — carries a host-memory window (`shmid` at cap+5,
+/// 64-bit offset/length split across cap+8/+12 and cap+16/+20).
+const VIRTIO_PCI_CAP_SHARED_MEMORY_CFG: u8 = 8;
 
 const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
 const VIRTIO_STATUS_DRIVER:      u8 = 2;
@@ -323,6 +427,17 @@ struct VirtioGpuTransferToHost3d {
     layer_stride: u32,
 }
 
+/// Smallest buddy order whose allocation covers `bytes` (a contiguous run of
+/// `1 << order` pages).  `bytes == 0` still yields one page.
+pub fn order_for_bytes(bytes: usize) -> usize {
+    let pages = ((bytes + 4095) >> 12).max(1);
+    if pages == 1 {
+        0
+    } else {
+        (usize::BITS - (pages - 1).leading_zeros()) as usize
+    }
+}
+
 impl VirtioGpuDevice {
     pub fn new() -> Option<Self> {
         let dev = find_device(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_GPU)?;
@@ -343,6 +458,7 @@ impl VirtioGpuDevice {
         let mut notify_off_multiplier = 0;
         let mut device_cfg = core::ptr::null_mut();
         let mut _isr_cfg = core::ptr::null_mut();
+        let mut shmem: Option<SharedMemRegion> = None;
 
         unsafe {
             let mut cap_ptr = pci_read_config_8(dev.bus, dev.dev, dev.func, 0x34);
@@ -365,7 +481,36 @@ impl VirtioGpuDevice {
                                 (raw_bar & !0xF) as u64
                             };
 
-                            if bar64 != 0 {
+                            if bar64 != 0 && cfg_type == VIRTIO_PCI_CAP_SHARED_MEMORY_CFG {
+                                // Host-visible blob window.  Record it only —
+                                // mapping it here would try to build page tables
+                                // for the whole `hostmem=` region (gigabytes).
+                                let shmid = pci_read_config_8(dev.bus, dev.dev, dev.func, cap_ptr + 5);
+                                let off_hi = pci_read_config_32(dev.bus, dev.dev, dev.func, cap_ptr + 16);
+                                let len_hi = pci_read_config_32(dev.bus, dev.dev, dev.func, cap_ptr + 20);
+                                let off64 = (offset as u64) | ((off_hi as u64) << 32);
+                                let len64 = (length as u64) | ((len_hi as u64) << 32);
+                                crate::pci::serial_debug("[GPU] SHARED_MEMORY_CFG shmid=");
+                                crate::pci::serial_debug_hex(shmid as u32);
+                                crate::pci::serial_debug(" phys=");
+                                crate::pci::serial_debug_hex(((bar64 + off64) >> 32) as u32);
+                                crate::pci::serial_debug_hex((bar64 + off64) as u32);
+                                crate::pci::serial_debug(" len=");
+                                crate::pci::serial_debug_hex((len64 >> 32) as u32);
+                                crate::pci::serial_debug_hex(len64 as u32);
+                                crate::pci::serial_debug("\n");
+                                // virtio_gpu.h: SHM_ID_UNDEFINED = 0,
+                                // SHM_ID_HOST_VISIBLE = 1.  Prefer the
+                                // host-visible region; accept the first seen
+                                // otherwise.
+                                if shmem.is_none() || shmid == VIRTIO_GPU_SHM_ID_HOST_VISIBLE {
+                                    shmem = Some(SharedMemRegion {
+                                        id: shmid,
+                                        phys: bar64 + off64,
+                                        len: len64,
+                                    });
+                                }
+                            } else if bar64 != 0 {
                                 crate::pci::rdebug("[GPU] Mapping BAR ");
                                 crate::pci::rdebug_hex(bar_idx as u32);
                                 crate::pci::rdebug(" at ");
@@ -415,7 +560,13 @@ impl VirtioGpuDevice {
             notify_cfg,
             notify_off_multiplier,
             _device_cfg: device_cfg,
-            _features: 0,
+            features: 0,
+            features_hi: 0,
+            shmem,
+            next_fence_id: 1,
+            last_completed_fence: 0,
+            next_ctx_id: 1,
+            next_3d_resource_id: 16,
             current_resource_id: 0,
             scanout_w: 1280,
             scanout_h: 800,
@@ -443,14 +594,87 @@ impl VirtioGpuDevice {
             // 3. Set DRIVER status bit
             status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER);
 
-            // 4. Negotiate features
-            core::ptr::addr_of_mut!((*cfg).device_feature_select).write_volatile(0);
-            let _f0 = core::ptr::addr_of!((*cfg).device_feature).read_volatile();
-            core::ptr::addr_of_mut!((*cfg).driver_feature_select).write_volatile(0);
-            core::ptr::addr_of_mut!((*cfg).driver_feature).write_volatile(0); // Minimal features for now
+            // 4. Negotiate features.
+            //
+            // Feature bits 0..=31 live in feature-select word 0 and bits 32..=63
+            // in word 1.  The transport bit VIRTIO_F_VERSION_1 is bit 32, so a
+            // driver that only ever touches word 0 — as this one used to, writing
+            // a flat `driver_feature = 0` — never acks VERSION_1 and never gets
+            // VIRGL / RESOURCE_BLOB / CONTEXT_INIT either.  Nothing about that
+            // failure is visible: the 2D console keeps working and every 3D
+            // command is quietly dropped by the host.
+            let fsel = core::ptr::addr_of_mut!((*cfg).device_feature_select);
+            let fval = core::ptr::addr_of!((*cfg).device_feature);
+            fsel.write_volatile(0);
+            let dev_lo = fval.read_volatile();
+            fsel.write_volatile(1);
+            let dev_hi = fval.read_volatile();
 
-            // 5. Set FEATURES_OK status bit
+            crate::pci::serial_debug("[GPU] device features hi=");
+            crate::pci::serial_debug_hex(dev_hi);
+            crate::pci::serial_debug(" lo=");
+            crate::pci::serial_debug_hex(dev_lo);
+            crate::pci::serial_debug("\n");
+
+            // Everything this driver can drive.  Bits the host does not offer are
+            // dropped from the ack — acking an unoffered bit makes the device
+            // refuse FEATURES_OK outright — but each omission is reported.
+            let want_lo: u32 = (1 << VIRTIO_GPU_F_VIRGL)
+                | (1 << VIRTIO_GPU_F_EDID)
+                | (1 << VIRTIO_GPU_F_RESOURCE_UUID)
+                | (1 << VIRTIO_GPU_F_RESOURCE_BLOB)
+                | (1 << VIRTIO_GPU_F_CONTEXT_INIT);
+            let want_hi: u32 = 1 << (VIRTIO_F_VERSION_1 - 32);
+
+            let ack_lo = dev_lo & want_lo;
+            let ack_hi = dev_hi & want_hi;
+
+            // Report every Venus prerequisite the host withheld.  The driver
+            // stays up (the 2D console must keep working on plain `virtio-gpu-pci`,
+            // which offers none of these), but `venus_available()` goes false and
+            // every 3D entry point below refuses with a diagnostic instead of
+            // issuing commands the host will silently drop.
+            let checks: [(u32, &str); 3] = [
+                (VIRTIO_GPU_F_VIRGL, "VIRGL"),
+                (VIRTIO_GPU_F_RESOURCE_BLOB, "RESOURCE_BLOB"),
+                (VIRTIO_GPU_F_CONTEXT_INIT, "CONTEXT_INIT"),
+            ];
+            for &(bit, name) in checks.iter() {
+                if dev_lo & (1 << bit) == 0 {
+                    crate::pci::serial_debug("[GPU] *** host does NOT offer VIRTIO_GPU_F_");
+                    crate::pci::serial_debug(name);
+                    crate::pci::serial_debug(" -- 3D/Venus unavailable ***\n");
+                }
+            }
+            if ack_hi & (1 << (VIRTIO_F_VERSION_1 - 32)) == 0 {
+                crate::pci::serial_debug("[GPU] *** host does NOT offer VIRTIO_F_VERSION_1 ***\n");
+            }
+
+            let dsel = core::ptr::addr_of_mut!((*cfg).driver_feature_select);
+            let dval = core::ptr::addr_of_mut!((*cfg).driver_feature);
+            dsel.write_volatile(0);
+            dval.write_volatile(ack_lo);
+            dsel.write_volatile(1);
+            dval.write_volatile(ack_hi);
+
+            self.features = ack_lo;
+            self.features_hi = ack_hi;
+
+            crate::pci::serial_debug("[GPU] acked features hi=");
+            crate::pci::serial_debug_hex(ack_hi);
+            crate::pci::serial_debug(" lo=");
+            crate::pci::serial_debug_hex(ack_lo);
+            crate::pci::serial_debug("\n");
+
+            // 5. Set FEATURES_OK, then read it back — the device clears the bit
+            //    if it cannot accept the subset we acked, and continuing past
+            //    that point produces undefined behaviour per the spec.
             status.write_volatile(status.read_volatile() | VIRTIO_STATUS_FEATURES_OK);
+            if status.read_volatile() & VIRTIO_STATUS_FEATURES_OK == 0 {
+                crate::pci::serial_debug("[GPU] *** device REJECTED the acked feature set ***\n");
+                self.features = 0;
+                self.features_hi = 0;
+            }
 
             // 6. Setup queues: 0 = controlq, 1 = cursorq.  virtio-gpu always
             //    exposes both, but stay defensive — the cursor path checks for
@@ -530,60 +754,188 @@ impl VirtioGpuDevice {
         })
     }
 
-    fn send_command_raw(&mut self, cmd_data: &[u8]) -> Result<(), ()> {
-        let q = self.queues[0].as_mut().ok_or(())?;
-        if q.num_free < 2 { return Err(()); }
+    /// Submit one control-queue command and block until the host completes it.
+    ///
+    /// `head` is the command struct (always beginning with a `VirtioGpuCtrlHdr`).
+    /// `payload` is optional trailing data that upstream places in a descriptor
+    /// of its own rather than inline — SUBMIT_3D's command stream and
+    /// RESOURCE_CREATE_BLOB's `virtio_gpu_mem_entry` array both work this way.
+    /// `resp_capacity` sizes the device-writable response buffer.
+    ///
+    /// None of the three buffers is capped at one page: each is a physically
+    /// contiguous buddy run sized to its content, so a multi-kilobyte Venus
+    /// command stream or a large capset response rides a single descriptor and
+    /// needs no scatter-gather.  (The previous implementation hardcoded a single
+    /// 4 KiB page for request and response alike and truncated anything longer.)
+    ///
+    /// With `fenced`, VIRTIO_GPU_FLAG_FENCE and a fresh monotonic fence id are
+    /// patched into the *copied* header.  Because this path waits on the used
+    /// ring, the fence has necessarily retired by the time it returns — that is
+    /// what `last_completed_fence` records.
+    fn submit(
+        &mut self,
+        head: &[u8],
+        payload: Option<&[u8]>,
+        resp_capacity: usize,
+        fenced: bool,
+    ) -> Result<Vec<u8>, ()> {
+        const HDR_LEN: usize = core::mem::size_of::<VirtioGpuCtrlHdr>();
+        if head.len() < HDR_LEN {
+            return Err(());
+        }
+        let payload = payload.unwrap_or(&[]);
+        let resp_capacity = resp_capacity.max(HDR_LEN);
+        let need_desc = if payload.is_empty() { 2 } else { 3 };
 
-        let hdr_type = u32::from_le_bytes(cmd_data[0..4].try_into().unwrap_or([0; 4]));
+        // Verify queue capacity before allocating, so no failure path below has
+        // to unwind a partially-built allocation set.
+        match self.queues[0].as_ref() {
+            Some(q) if q.num_free >= need_desc => {}
+            _ => return Err(()),
+        }
 
-        let req_phys = mm::buddy::alloc(0).ok_or(())?;
-        let req_virt = mm::phys_to_virt(req_phys) as *mut u8;
-        unsafe { core::ptr::copy_nonoverlapping(cmd_data.as_ptr(), req_virt, cmd_data.len()); }
+        let hdr_type = u32::from_le_bytes(head[0..4].try_into().unwrap_or([0; 4]));
 
-        let resp_phys = mm::buddy::alloc(0).ok_or(())?;
-        let resp_virt = mm::phys_to_virt(resp_phys) as *mut VirtioGpuCtrlHdr;
-        unsafe { core::ptr::write_bytes(resp_virt as *mut u8, 0, 4096); }
+        let fence_id = if fenced {
+            let f = self.next_fence_id;
+            self.next_fence_id = self.next_fence_id.wrapping_add(1).max(1);
+            f
+        } else {
+            0
+        };
+
+        let req_order = order_for_bytes(head.len());
+        let resp_order = order_for_bytes(resp_capacity);
+        let pay_order = order_for_bytes(payload.len().max(1));
+
+        let req_phys = mm::buddy::alloc(req_order).ok_or(())?;
+        let resp_phys = match mm::buddy::alloc(resp_order) {
+            Some(p) => p,
+            None => {
+                mm::buddy::free(req_phys, req_order);
+                return Err(());
+            }
+        };
+        let pay_phys = if payload.is_empty() {
+            0
+        } else {
+            match mm::buddy::alloc(pay_order) {
+                Some(p) => p,
+                None => {
+                    mm::buddy::free(req_phys, req_order);
+                    mm::buddy::free(resp_phys, resp_order);
+                    return Err(());
+                }
+            }
+        };
+
+        let notify_cfg = self.notify_cfg;
+        let mult = self.notify_off_multiplier;
+        let mut out: Result<Vec<u8>, ()> = Err(());
 
         unsafe {
-            let head = q.add_desc(req_phys as u64, cmd_data.len() as u32, VIRTQ_DESC_F_NEXT);
-            let resp_idx = q.add_desc(resp_phys as u64, 4096, VIRTQ_DESC_F_WRITE);
-            (*q.desc.add(head as usize)).next = resp_idx;
+            let req_virt = mm::phys_to_virt(req_phys) as *mut u8;
+            core::ptr::copy_nonoverlapping(head.as_ptr(), req_virt, head.len());
+            if fenced {
+                // VirtioGpuCtrlHdr: flags @4, fence_id @8.
+                let flags = (req_virt.add(4) as *mut u32).read_unaligned();
+                (req_virt.add(4) as *mut u32).write_unaligned(flags | VIRTIO_GPU_FLAG_FENCE);
+                (req_virt.add(8) as *mut u64).write_unaligned(fence_id);
+            }
+            if !payload.is_empty() {
+                core::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    mm::phys_to_virt(pay_phys) as *mut u8,
+                    payload.len(),
+                );
+            }
+            core::ptr::write_bytes(mm::phys_to_virt(resp_phys) as *mut u8, 0, resp_capacity);
 
-            q.submit(head);
+            let q = self.queues[0].as_mut().ok_or(())?;
 
-            let notify_addr = (self.notify_cfg as usize + q.notify_off as usize * self.notify_off_multiplier as usize) as *mut u16;
+            let head_idx = q.add_desc(req_phys as u64, head.len() as u32, VIRTQ_DESC_F_NEXT);
+            let mut last = head_idx;
+            if !payload.is_empty() {
+                let d = q.add_desc(pay_phys as u64, payload.len() as u32, VIRTQ_DESC_F_NEXT);
+                (*q.desc.add(last as usize)).next = d;
+                last = d;
+            }
+            let resp_idx = q.add_desc(resp_phys as u64, resp_capacity as u32, VIRTQ_DESC_F_WRITE);
+            (*q.desc.add(last as usize)).next = resp_idx;
+
+            q.submit(head_idx);
+
+            let notify_addr =
+                (notify_cfg as usize + q.notify_off as usize * mult as usize) as *mut u16;
             notify_addr.write_volatile(0);
 
-            let mut timeout = 10_000_000;
+            let mut timeout = 100_000_000u64;
             while q.last_used_idx == (*q.used).idx && timeout > 0 {
                 core::hint::spin_loop();
                 timeout -= 1;
             }
 
             if timeout == 0 {
-                crate::pci::rdebug("[GPU] Command ");
-                crate::pci::rdebug_hex(hdr_type);
-                crate::pci::rdebug(" TIMEOUT!\n");
-                return Err(());
-            }
+                crate::pci::serial_debug("[GPU] control-queue TIMEOUT, cmd=");
+                crate::pci::serial_debug_hex(hdr_type);
+                crate::pci::serial_debug("\n");
+                // Deliberately leak the descriptors and the three pages: the
+                // host may still DMA into them at any later point, and handing
+                // them back to the buddy allocator would corrupt whoever gets
+                // them next.  The queue is wedged regardless.
+            } else {
+                q.last_used_idx = q.last_used_idx.wrapping_add(1);
+                let resp_virt = mm::phys_to_virt(resp_phys) as *const u8;
+                out = Ok(core::slice::from_raw_parts(resp_virt, resp_capacity).to_vec());
 
-            q.last_used_idx = q.last_used_idx.wrapping_add(1);
-
-            let resp_hdr = *resp_virt;
-
-            // Cleanup
-            q.free_chain(head);
-            mm::buddy::free(req_phys, 0);
-            mm::buddy::free(resp_phys, 0);
-
-            if resp_hdr.type_ != 0x1100 && resp_hdr.type_ != 0x1101 {
-                crate::pci::rdebug("[GPU] Command failed with resp ");
-                crate::pci::rdebug_hex(resp_hdr.type_);
-                crate::pci::rdebug("\n");
-                return Err(());
+                q.free_chain(head_idx);
+                mm::buddy::free(req_phys, req_order);
+                mm::buddy::free(resp_phys, resp_order);
+                if !payload.is_empty() {
+                    mm::buddy::free(pay_phys, pay_order);
+                }
             }
         }
 
+        if out.is_ok() && fenced {
+            self.last_completed_fence = fence_id;
+        }
+        out
+    }
+
+    /// `submit` + check that the host answered with a success response type.
+    /// Returns the full response bytes so callers can read result payloads.
+    fn submit_checked(
+        &mut self,
+        head: &[u8],
+        payload: Option<&[u8]>,
+        resp_capacity: usize,
+        fenced: bool,
+        expect: u32,
+    ) -> Result<Vec<u8>, ()> {
+        let resp = self.submit(head, payload, resp_capacity, fenced)?;
+        let ty = u32::from_le_bytes(resp.get(0..4).ok_or(())?.try_into().map_err(|_| ())?);
+        if ty != expect && ty != VIRTIO_GPU_RESP_OK_NODATA {
+            let cmd = u32::from_le_bytes(head[0..4].try_into().unwrap_or([0; 4]));
+            crate::pci::serial_debug("[GPU] cmd ");
+            crate::pci::serial_debug_hex(cmd);
+            crate::pci::serial_debug(" failed, resp=");
+            crate::pci::serial_debug_hex(ty);
+            crate::pci::serial_debug("\n");
+            return Err(());
+        }
+        Ok(resp)
+    }
+
+    fn send_command_raw(&mut self, cmd_data: &[u8]) -> Result<(), ()> {
+        let resp = self.submit(cmd_data, None, 4096, false)?;
+        let ty = u32::from_le_bytes(resp.get(0..4).ok_or(())?.try_into().map_err(|_| ())?);
+        if ty != VIRTIO_GPU_RESP_OK_NODATA && ty != VIRTIO_GPU_RESP_OK_DISPLAY_INFO {
+            crate::pci::rdebug("[GPU] Command failed with resp ");
+            crate::pci::rdebug_hex(ty);
+            crate::pci::rdebug("\n");
+            return Err(());
+        }
         Ok(())
     }
     // ---------------------------------------------------------------------
@@ -1021,9 +1373,6 @@ impl VirtioGpuDevice {
     }
 
     pub fn send_command(&mut self, cmd: VirtioGpuCmd, data: &[u8]) -> Result<Vec<u8>, ()> {
-        let q = self.queues[0].as_mut().ok_or(())?;
-        if q.num_free < (if data.is_empty() { 2 } else { 3 }) { return Err(()); }
-        
         let hdr = VirtioGpuCtrlHdr {
             type_: cmd as u32,
             flags: 0,
@@ -1031,59 +1380,414 @@ impl VirtioGpuDevice {
             ctx_id: 0,
             padding: 0,
         };
-        
-        let req_phys = mm::buddy::alloc(0).ok_or(())?;
-        let req_virt = mm::phys_to_virt(req_phys) as *mut VirtioGpuCtrlHdr;
-        unsafe { core::ptr::write(req_virt, hdr); }
-        
-        let resp_phys = mm::buddy::alloc(0).ok_or(())?;
-        let resp_virt = mm::phys_to_virt(resp_phys) as *mut VirtioGpuCtrlHdr;
-        
-        unsafe {
-            let head = q.add_desc(req_phys as u64, core::mem::size_of::<VirtioGpuCtrlHdr>() as u32, VIRTQ_DESC_F_NEXT);
-            
-            let mut last_desc = head;
-            let mut data_phys_opt = None;
-            if !data.is_empty() {
-                 let data_phys = mm::buddy::alloc(0).ok_or(())?;
-                 data_phys_opt = Some(data_phys);
-                 let data_virt = mm::phys_to_virt(data_phys) as *mut u8;
-                 core::ptr::copy_nonoverlapping(data.as_ptr(), data_virt, data.len().min(4096));
-                 let data_desc = q.add_desc(data_phys as u64, data.len().min(4096) as u32, VIRTQ_DESC_F_NEXT);
-                 (*q.desc.add(last_desc as usize)).next = data_desc;
-                 last_desc = data_desc;
-            }
+        let head = unsafe {
+            core::slice::from_raw_parts(
+                &hdr as *const _ as *const u8,
+                core::mem::size_of::<VirtioGpuCtrlHdr>(),
+            )
+        };
+        let payload = if data.is_empty() { None } else { Some(data) };
+        self.submit(head, payload, 4096, false)
+    }
 
-            let resp_desc = q.add_desc(resp_phys as u64, 4096, VIRTQ_DESC_F_WRITE);
-            (*q.desc.add(last_desc as usize)).next = resp_desc;
-            
-            q.submit(head);
-            
-            let notify_addr = (self.notify_cfg as usize + q.notify_off as usize * self.notify_off_multiplier as usize) as *mut u16;
-            notify_addr.write_volatile(0);
+    // ─────────────────────────────────────────────────────────────────────────
+    // 3D / context / blob surface (Venus transport)
+    // ─────────────────────────────────────────────────────────────────────────
 
-            let mut timeout = 100_000_000;
-            while q.last_used_idx == (*q.used).idx && timeout > 0 {
-                core::hint::spin_loop();
-                timeout -= 1;
-            }
+    /// Was feature bit `bit` (0..=31) actually negotiated with the host?
+    pub fn has_feature(&self, bit: u32) -> bool {
+        bit < 32 && self.features & (1 << bit) != 0
+    }
 
-            if timeout == 0 {
-                crate::pci::rdebug("[GPU] Command timeout!\n");
-                return Err(());
-            }
-            q.last_used_idx = q.last_used_idx.wrapping_add(1);
-            
-            let response = core::slice::from_raw_parts(resp_virt as *const u8, 4096).to_vec();
-            
-            // Cleanup
-            q.free_chain(head);
-            mm::buddy::free(req_phys, 0);
-            mm::buddy::free(resp_phys, 0);
-            if let Some(p) = data_phys_opt { mm::buddy::free(p, 0); }
-            
-            Ok(response)
+    /// Every prerequisite for creating a Venus context is present.  This is the
+    /// single gate the 3D entry points check, so a host that did not offer the
+    /// features produces an explicit refusal rather than commands it will drop.
+    pub fn venus_available(&self) -> bool {
+        self.has_feature(VIRTIO_GPU_F_VIRGL)
+            && self.has_feature(VIRTIO_GPU_F_RESOURCE_BLOB)
+            && self.has_feature(VIRTIO_GPU_F_CONTEXT_INIT)
+    }
+
+    pub fn shared_mem_region(&self) -> Option<SharedMemRegion> {
+        self.shmem
+    }
+
+    /// `virtio_gpu_config.num_capsets` (device config offset 12).
+    pub fn num_capsets(&self) -> u32 {
+        if self._device_cfg.is_null() {
+            return 0;
         }
+        unsafe { (self._device_cfg.add(12) as *const u32).read_volatile() }
+    }
+
+    /// Allocate a fresh resource id for 3D/blob use.
+    pub fn alloc_resource_id(&mut self) -> u32 {
+        let id = self.next_3d_resource_id;
+        self.next_3d_resource_id += 1;
+        id
+    }
+
+    /// Has the host retired fence `id`?  Submission is synchronous, so any fence
+    /// this driver ever handed out is retired by the time the submitting call
+    /// returned; the counter exists so VIRTGPU_WAIT can answer truthfully rather
+    /// than unconditionally reporting success.
+    pub fn fence_retired(&self, id: u64) -> bool {
+        id != 0 && id <= self.last_completed_fence
+    }
+
+    fn hdr_for(&self, cmd: VirtioGpuCmd, ctx_id: u32) -> VirtioGpuCtrlHdr {
+        VirtioGpuCtrlHdr {
+            type_: cmd as u32,
+            flags: 0,
+            fence_id: 0,
+            ctx_id,
+            padding: 0,
+        }
+    }
+
+    /// GET_CAPSET_INFO for `capset_index`.  Returns
+    /// `(capset_id, capset_max_version, capset_max_size)`.
+    ///
+    /// This is a *different command* from GET_CAPSET (0x0108 vs 0x0109); the two
+    /// were previously conflated under a single wrong opcode.  The index is a
+    /// slot number in `[0, num_capsets)`, not a capset id — the id is what comes
+    /// back in the response.
+    pub fn get_capset_info(&mut self, capset_index: u32) -> Result<(u32, u32, u32), ()> {
+        #[repr(C, packed)]
+        struct GetCapsetInfo {
+            hdr: VirtioGpuCtrlHdr,
+            capset_index: u32,
+            padding: u32,
+        }
+        let cmd = GetCapsetInfo {
+            hdr: self.hdr_for(VirtioGpuCmd::GetCapsetInfo, 0),
+            capset_index,
+            padding: 0,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<GetCapsetInfo>(),
+            )
+        };
+        // virtio_gpu_resp_capset_info: hdr(24) + id + max_version + max_size + pad.
+        let resp = self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_CAPSET_INFO)?;
+        let rd = |o: usize| -> Result<u32, ()> {
+            Ok(u32::from_le_bytes(
+                resp.get(o..o + 4).ok_or(())?.try_into().map_err(|_| ())?,
+            ))
+        };
+        Ok((rd(24)?, rd(28)?, rd(32)?))
+    }
+
+    /// GET_CAPSET: fetch the host's capability blob for `capset_id`.
+    ///
+    /// The response is `virtio_gpu_resp_capset` — a 24-byte header followed by
+    /// `max_size` bytes of opaque capset data.  `max_size` comes from
+    /// GET_CAPSET_INFO and is routinely far larger than one page, which is why
+    /// the response buffer here is sized rather than fixed.
+    pub fn get_capset(&mut self, capset_id: u32, capset_version: u32, max_size: usize) -> Result<Vec<u8>, ()> {
+        #[repr(C, packed)]
+        struct GetCapset {
+            hdr: VirtioGpuCtrlHdr,
+            capset_id: u32,
+            capset_version: u32,
+        }
+        let cmd = GetCapset {
+            hdr: self.hdr_for(VirtioGpuCmd::GetCapset, 0),
+            capset_id,
+            capset_version,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<GetCapset>(),
+            )
+        };
+        let cap = 24 + max_size;
+        let resp = self.submit_checked(bytes, None, cap, false, VIRTIO_GPU_RESP_OK_CAPSET)?;
+        Ok(resp.get(24..24 + max_size).ok_or(())?.to_vec())
+    }
+
+    /// Walk the host's capset table looking for `capset_id`, returning
+    /// `(max_version, max_size)`.
+    ///
+    /// The table is indexed by slot, not by id, so finding Venus means issuing
+    /// GET_CAPSET_INFO for each of `num_capsets` slots and comparing the id that
+    /// comes back.  A `None` here is itself the answer to "does the host's
+    /// virglrenderer expose Venus at all".
+    pub fn find_capset(&mut self, capset_id: u32) -> Option<(u32, u32)> {
+        let n = self.num_capsets();
+        for i in 0..n.min(16) {
+            if let Ok((id, max_version, max_size)) = self.get_capset_info(i) {
+                if id == capset_id {
+                    return Some((max_version, max_size));
+                }
+            }
+        }
+        None
+    }
+
+    /// CTX_CREATE with an explicit `context_init` (the capset id in its low
+    /// byte) — this is what selects Venus rather than the default virgl context.
+    /// Returns the new context id.
+    pub fn ctx_create(&mut self, capset_id: u32, debug_name: &str) -> Result<u32, ()> {
+        if !self.venus_available() {
+            crate::pci::serial_debug("[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT\n");
+            return Err(());
+        }
+        #[repr(C, packed)]
+        struct CtxCreate {
+            hdr: VirtioGpuCtrlHdr,
+            nlen: u32,
+            context_init: u32,
+            debug_name: [u8; 64],
+        }
+        let ctx_id = self.next_ctx_id;
+        let mut name = [0u8; 64];
+        let n = debug_name.len().min(63);
+        name[..n].copy_from_slice(&debug_name.as_bytes()[..n]);
+
+        let cmd = CtxCreate {
+            hdr: self.hdr_for(VirtioGpuCmd::CtxCreate, ctx_id),
+            nlen: n as u32,
+            context_init: capset_id & VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK,
+            debug_name: name,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<CtxCreate>(),
+            )
+        };
+        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)?;
+        self.next_ctx_id += 1;
+        Ok(ctx_id)
+    }
+
+    pub fn ctx_destroy(&mut self, ctx_id: u32) -> bool {
+        let hdr = self.hdr_for(VirtioGpuCmd::CtxDestroy, ctx_id);
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &hdr as *const _ as *const u8,
+                core::mem::size_of::<VirtioGpuCtrlHdr>(),
+            )
+        };
+        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
+            .is_ok()
+    }
+
+    fn ctx_resource(&mut self, cmd: VirtioGpuCmd, ctx_id: u32, resource_id: u32) -> bool {
+        #[repr(C, packed)]
+        struct CtxResource {
+            hdr: VirtioGpuCtrlHdr,
+            resource_id: u32,
+            padding: u32,
+        }
+        let c = CtxResource {
+            hdr: self.hdr_for(cmd, ctx_id),
+            resource_id,
+            padding: 0,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &c as *const _ as *const u8,
+                core::mem::size_of::<CtxResource>(),
+            )
+        };
+        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
+            .is_ok()
+    }
+
+    pub fn ctx_attach_resource(&mut self, ctx_id: u32, resource_id: u32) -> bool {
+        self.ctx_resource(VirtioGpuCmd::CtxAttachResource, ctx_id, resource_id)
+    }
+
+    pub fn ctx_detach_resource(&mut self, ctx_id: u32, resource_id: u32) -> bool {
+        self.ctx_resource(VirtioGpuCmd::CtxDetachResource, ctx_id, resource_id)
+    }
+
+    /// RESOURCE_CREATE_BLOB.
+    ///
+    /// For `VIRTIO_GPU_BLOB_MEM_GUEST` (and HOST3D_GUEST) the guest supplies the
+    /// backing pages inline as a `virtio_gpu_mem_entry` array appended to the
+    /// command; `guest_backing` is `(phys, len)`.  For `VIRTIO_GPU_BLOB_MEM_HOST3D`
+    /// the storage is host-side and the array is empty — the guest reaches it
+    /// through RESOURCE_MAP_BLOB into the shared-memory BAR window instead.
+    pub fn resource_create_blob(
+        &mut self,
+        ctx_id: u32,
+        resource_id: u32,
+        blob_mem: u32,
+        blob_flags: u32,
+        blob_id: u64,
+        size: u64,
+        guest_backing: Option<(u64, u32)>,
+    ) -> Result<(), ()> {
+        if !self.has_feature(VIRTIO_GPU_F_RESOURCE_BLOB) {
+            crate::pci::serial_debug("[GPU] resource_create_blob refused: no RESOURCE_BLOB\n");
+            return Err(());
+        }
+        #[repr(C, packed)]
+        struct CreateBlob {
+            hdr: VirtioGpuCtrlHdr,
+            resource_id: u32,
+            blob_mem: u32,
+            blob_flags: u32,
+            nr_entries: u32,
+            blob_id: u64,
+            size: u64,
+        }
+        #[repr(C, packed)]
+        struct MemEntry {
+            addr: u64,
+            length: u32,
+            padding: u32,
+        }
+
+        let (nr_entries, entries): (u32, Vec<u8>) = match guest_backing {
+            Some((phys, len)) => {
+                let e = MemEntry { addr: phys, length: len, padding: 0 };
+                let b = unsafe {
+                    core::slice::from_raw_parts(
+                        &e as *const _ as *const u8,
+                        core::mem::size_of::<MemEntry>(),
+                    )
+                }
+                .to_vec();
+                (1, b)
+            }
+            None => (0, Vec::new()),
+        };
+
+        let cmd = CreateBlob {
+            hdr: self.hdr_for(VirtioGpuCmd::ResourceCreateBlob, ctx_id),
+            resource_id,
+            blob_mem,
+            blob_flags,
+            nr_entries,
+            blob_id,
+            size,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<CreateBlob>(),
+            )
+        };
+        let payload = if entries.is_empty() { None } else { Some(&entries[..]) };
+        self.submit_checked(bytes, payload, 64, false, VIRTIO_GPU_RESP_OK_NODATA)?;
+        Ok(())
+    }
+
+    /// RESOURCE_MAP_BLOB: ask the host to expose `resource_id` at `offset` inside
+    /// the shared-memory BAR window.  Returns the response's `map_info` (cache
+    /// type).  Only meaningful for host-side blob memory.
+    pub fn resource_map_blob(&mut self, resource_id: u32, offset: u64) -> Result<u32, ()> {
+        #[repr(C, packed)]
+        struct MapBlob {
+            hdr: VirtioGpuCtrlHdr,
+            resource_id: u32,
+            padding: u32,
+            offset: u64,
+        }
+        let cmd = MapBlob {
+            hdr: self.hdr_for(VirtioGpuCmd::ResourceMapBlob, 0),
+            resource_id,
+            padding: 0,
+            offset,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<MapBlob>(),
+            )
+        };
+        let resp = self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_MAP_INFO)?;
+        Ok(u32::from_le_bytes(
+            resp.get(24..28).ok_or(())?.try_into().map_err(|_| ())?,
+        ))
+    }
+
+    /// RESOURCE_UNREF — drop a host-side resource of any kind.
+    pub fn resource_unref(&mut self, resource_id: u32) -> bool {
+        #[repr(C, packed)]
+        struct Unref {
+            hdr: VirtioGpuCtrlHdr,
+            resource_id: u32,
+            padding: u32,
+        }
+        let cmd = Unref {
+            hdr: self.hdr_for(VirtioGpuCmd::ResourceUnref, 0),
+            resource_id,
+            padding: 0,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<Unref>(),
+            )
+        };
+        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
+            .is_ok()
+    }
+
+    pub fn resource_unmap_blob(&mut self, resource_id: u32) -> bool {
+        #[repr(C, packed)]
+        struct UnmapBlob {
+            hdr: VirtioGpuCtrlHdr,
+            resource_id: u32,
+            padding: u32,
+        }
+        let cmd = UnmapBlob {
+            hdr: self.hdr_for(VirtioGpuCmd::ResourceUnmapBlob, 0),
+            resource_id,
+            padding: 0,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<UnmapBlob>(),
+            )
+        };
+        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
+            .is_ok()
+    }
+
+    /// SUBMIT_3D: hand `cmds` (an opaque, context-type-specific command stream —
+    /// for a Venus context, Venus wire-protocol bytes) to the host.
+    ///
+    /// The stream travels in its own descriptor, so it is bounded by the buddy
+    /// allocator rather than by a page.  Fenced, so the returned fence id can be
+    /// waited on; returns that id.
+    pub fn submit_3d(&mut self, ctx_id: u32, cmds: &[u8]) -> Result<u64, ()> {
+        if !self.venus_available() {
+            crate::pci::serial_debug("[GPU] submit_3d refused: 3D features unavailable\n");
+            return Err(());
+        }
+        if cmds.is_empty() {
+            return Err(());
+        }
+        #[repr(C, packed)]
+        struct CmdSubmit {
+            hdr: VirtioGpuCtrlHdr,
+            size: u32,
+            padding: u32,
+        }
+        let cmd = CmdSubmit {
+            hdr: self.hdr_for(VirtioGpuCmd::Submit3d, ctx_id),
+            size: cmds.len() as u32,
+            padding: 0,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<CmdSubmit>(),
+            )
+        };
+        let fence = self.next_fence_id;
+        self.submit_checked(bytes, Some(cmds), 64, true, VIRTIO_GPU_RESP_OK_NODATA)?;
+        Ok(fence)
     }
 
     /// Query the host for the preferred display mode via GET_DISPLAY_INFO.

@@ -257,17 +257,45 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
 const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
 const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
 
-// Virtio-GPU specific IOCTLs
-// const DRM_IOCTL_VIRTGPU_MAP: u32 = 0xC0106401;
-const DRM_IOCTL_VIRTGPU_EXECBUFFER: u32 = 0x40286402;
-// const DRM_IOCTL_VIRTGPU_GETPARAM: u32 = 0xC0106403;
-const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: u32 = 0xC0286404;
-// const DRM_IOCTL_VIRTGPU_RESOURCE_INFO: u32 = 0xC0186405;
-const DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: u32 = 0xC0186406;
-const DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: u32 = 0xC0186407;
-// const DRM_IOCTL_VIRTGPU_WAIT: u32 = 0x40086408;
-const DRM_IOCTL_VIRTGPU_GET_CAPS: u32 = 0xC0086409;
-// const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB: u32 = 0xC050640a;
+// ── Virtio-GPU (virtgpu_drm.h) IOCTLs ────────────────────────────────────────
+//
+// Every driver-private DRM ioctl number is
+//   DRM_IOWR(DRM_COMMAND_BASE + nr, struct) =
+//   (3 << 30) | (size_of::<struct>() << 16) | ('d' << 8) | (0x40 + nr)
+//
+// The previous constants here were wrong twice over: they omitted the
+// DRM_COMMAND_BASE (0x40) offset entirely — so EXECBUFFER was 0x…6402 where
+// Linux says 0x…6442 — and several encoded stale struct sizes (GET_CAPS carried
+// 0x08 for a 24-byte struct).  A userspace caller using the real
+// virtgpu_drm.h numbers therefore matched no dispatch arm at all and fell
+// through to Unsupported.  These are recomputed field-for-field against
+// /usr/include/drm/virtgpu_drm.h.
+const DRM_IOCTL_VIRTGPU_MAP: u32 = 0xC0106441;                  // drm_virtgpu_map, 16
+const DRM_IOCTL_VIRTGPU_EXECBUFFER: u32 = 0xC0406442;           // drm_virtgpu_execbuffer, 64
+const DRM_IOCTL_VIRTGPU_GETPARAM: u32 = 0xC0106443;             // drm_virtgpu_getparam, 16
+const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: u32 = 0xC0386444;      // 14 * u32 = 56
+const DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: u32 = 0xC02C6446;   // 11 * u32 = 44
+const DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: u32 = 0xC02C6447;     // 11 * u32 = 44
+const DRM_IOCTL_VIRTGPU_WAIT: u32 = 0xC0086448;                 // drm_virtgpu_3d_wait, 8
+const DRM_IOCTL_VIRTGPU_GET_CAPS: u32 = 0xC0186449;             // drm_virtgpu_get_caps, 24
+const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB: u32 = 0xC030644A; // 48
+const DRM_IOCTL_VIRTGPU_CONTEXT_INIT: u32 = 0xC010644B;         // 16
+
+// virtgpu_drm.h GETPARAM ids.
+const VIRTGPU_PARAM_3D_FEATURES: u64 = 1;
+const VIRTGPU_PARAM_CAPSET_QUERY_FIX: u64 = 2;
+const VIRTGPU_PARAM_RESOURCE_BLOB: u64 = 3;
+const VIRTGPU_PARAM_HOST_VISIBLE: u64 = 4;
+const VIRTGPU_PARAM_CROSS_DEVICE: u64 = 5;
+const VIRTGPU_PARAM_CONTEXT_INIT: u64 = 6;
+const VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs: u64 = 7;
+const VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME: u64 = 8;
+
+/// `drm_virtgpu_context_set_param.param` values.
+const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
+const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
+const VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK: u64 = 0x0003;
+const VIRTGPU_CONTEXT_PARAM_DEBUG_NAME: u64 = 0x0004;
 
 
 // ── Standard Linux DRM Structs ───────────────────────────────────────────────
@@ -473,6 +501,11 @@ struct drm_version {
     desc: u64,
 }
 
+// ── virtgpu_drm.h structs, field-for-field ───────────────────────────────────
+// Mesa's venus backend (`vn_renderer_virtgpu.c`) issues these via raw ioctl()
+// with its own vendored copy of the header, so any field that is out of order
+// or missing here is read as a different field's bytes and never diagnosed.
+
 #[repr(C)]
 struct drm_virtgpu_resource_create {
     target: u32,
@@ -485,20 +518,31 @@ struct drm_virtgpu_resource_create {
     last_level: u32,
     nr_samples: u32,
     flags: u32,
-    handle: u32,
-    res_id: u32,
+    bo_handle: u32,
+    res_handle: u32,
+    // These two were missing entirely, which is why the ioctl number encoded a
+    // 48-byte struct where Linux says 56.
+    size: u32,
+    stride: u32,
 }
 
 #[repr(C)]
 struct drm_virtgpu_execbuffer {
-    command: u64,
-    size: u32,
+    // Upstream order is flags-then-size-then-command. The previous definition
+    // led with `command`, so a caller filling the real struct had its `flags`
+    // and `size` words read as the low and high halves of the command pointer.
     flags: u32,
+    size: u32,
+    command: u64,
     bo_handles: u64,
     num_bo_handles: u32,
     fence_fd: i32,
     ring_idx: u32,
-    pad: u32,
+    syncobj_stride: u32,
+    num_in_syncobjs: u32,
+    num_out_syncobjs: u32,
+    in_syncobjs: u64,
+    out_syncobjs: u64,
 }
 
 #[repr(C)]
@@ -508,6 +552,52 @@ struct drm_virtgpu_get_caps {
     addr: u64,
     size: u32,
     pad: u32,
+}
+
+#[repr(C)]
+struct drm_virtgpu_getparam {
+    param: u64,
+    value: u64,
+}
+
+#[repr(C)]
+struct drm_virtgpu_map {
+    offset: u64,
+    handle: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+struct drm_virtgpu_3d_wait {
+    handle: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+struct drm_virtgpu_resource_create_blob {
+    blob_mem: u32,
+    blob_flags: u32,
+    bo_handle: u32,
+    res_handle: u32,
+    size: u64,
+    pad: u32,
+    cmd_size: u32,
+    cmd: u64,
+    blob_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_virtgpu_context_set_param {
+    param: u64,
+    value: u64,
+}
+
+#[repr(C)]
+struct drm_virtgpu_context_init {
+    num_params: u32,
+    pad: u32,
+    ctx_set_params: u64,
 }
 
 use alloc::collections::BTreeMap;
@@ -527,6 +617,27 @@ struct DumbBuf {
 }
 
 static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new());
+
+/// A virtgpu blob buffer object created through DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB.
+/// `phys`/`order` are the guest pages handed to the host as the blob's backing
+/// (zero for host-side blob memory, which the guest never owns pages for);
+/// `res_handle` is the resource id the host knows it by.
+#[derive(Clone, Copy)]
+struct BlobBuf {
+    phys: usize,
+    order: usize,
+    res_handle: u32,
+    size: u64,
+}
+
+static BLOB_BUFFERS: Mutex<BTreeMap<u32, BlobBuf>> = Mutex::new(BTreeMap::new());
+/// GEM handles for blob BOs. Kept well above the dumb-buffer handle space so a
+/// handle is unambiguously one or the other.
+static NEXT_BLOB_HANDLE: AtomicU32 = AtomicU32::new(0x4000);
+/// The 3D context created by DRM_IOCTL_VIRTGPU_CONTEXT_INIT (0 = none yet).
+static VIRTGPU_CTX_ID: AtomicU32 = AtomicU32::new(0);
+/// Fence id produced by the most recent EXECBUFFER, for VIRTGPU_WAIT.
+static LAST_EXEC_FENCE: AtomicU64 = AtomicU64::new(0);
 
 // ── Property blobs ───────────────────────────────────────────────────────────
 // Atomic modesetting passes modes (and damage clips) by blob id rather than by
@@ -799,6 +910,11 @@ impl DrmDeviceInterface {
             DRM_IOCTL_VIRTGPU_GET_CAPS => self.virtgpu_handle_get_caps(arg),
             DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => self.virtgpu_handle_transfer_to_host(arg),
             DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => self.virtgpu_handle_transfer_from_host(arg),
+            DRM_IOCTL_VIRTGPU_GETPARAM => self.virtgpu_handle_getparam(arg),
+            DRM_IOCTL_VIRTGPU_CONTEXT_INIT => self.virtgpu_handle_context_init(arg),
+            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => self.virtgpu_handle_resource_create_blob(arg),
+            DRM_IOCTL_VIRTGPU_MAP => self.virtgpu_handle_map(arg),
+            DRM_IOCTL_VIRTGPU_WAIT => self.virtgpu_handle_wait(arg),
 
             // ── K4: Mesa/GBM buffer + Smithay/libdrm KMS surface ──
             DRM_IOCTL_GET_CAP => self.std_handle_get_cap(arg),
@@ -1924,7 +2040,33 @@ impl DrmDeviceInterface {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let c = unsafe { ptr::read_unaligned(arg as *const drm_gem_close) };
         Self::free_dumb(c.handle);
+        Self::free_blob(c.handle);
         Ok(0)
+    }
+
+    /// Release a blob BO: detach it from the 3D context, drop the host-side
+    /// resource, and return its guest pages. Without this each
+    /// RESOURCE_CREATE_BLOB leaks both a buddy allocation and a host resource
+    /// id for the lifetime of the boot.
+    fn free_blob(handle: u32) {
+        let b = match BLOB_BUFFERS.lock().remove(&handle) {
+            Some(b) => b,
+            None => return,
+        };
+        let ctx = VIRTGPU_CTX_ID.load(Ordering::Relaxed);
+        {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            if let Some(gpu) = guard.as_mut() {
+                if ctx != 0 {
+                    gpu.ctx_detach_resource(ctx, b.res_handle);
+                }
+                gpu.resource_unref(b.res_handle);
+            }
+        }
+        if b.phys != 0 {
+            mm::buddy::free(b.phys, b.order);
+        }
+        let _ = b.size;
     }
 
     /// DRM_IOCTL_MODE_DESTROY_DUMB — free the dumb buffer.
@@ -2046,7 +2188,11 @@ impl DrmDeviceInterface {
             // The physical address was passed as the offset to mmap(). Only echo
             // it back if it names a dumb buffer we actually allocated — otherwise
             // a caller could map arbitrary physical memory through this device.
-            let known = DUMB_BUFFERS.lock().values().any(|b| b.phys == requested_phys as usize);
+            let known = DUMB_BUFFERS.lock().values().any(|b| b.phys == requested_phys as usize)
+                || BLOB_BUFFERS
+                    .lock()
+                    .values()
+                    .any(|b| b.phys != 0 && b.phys == requested_phys as usize);
             if !known {
                 return Err(DriverError::InvalidParameter);
             }
@@ -2127,47 +2273,350 @@ impl DrmDeviceInterface {
 
     fn virtgpu_handle_resource_create(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let create = unsafe { &mut *(arg as *mut drm_virtgpu_resource_create) };
-        
-        
-        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-            // Send ResourceCreate3d command to Virtio-GPU
-            let _res = gpu.send_command(crate::virtio_gpu::VirtioGpuCmd::ResourceCreate3d, &[]);
-            create.handle = 1; // Simplified handle management
-            create.res_id = 1;
-            Ok(0)
-        } else {
-            Err(DriverError::NotFound)
+        // Copy the request out of user memory before taking the device lock.
+        let req = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_resource_create) };
+
+        let res_handle = {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
+            // Allocate a real resource id rather than the fixed 1 the stub used,
+            // and pass the caller's geometry through instead of an empty command
+            // body (which, with the old opcode, was not even RESOURCE_CREATE_3D).
+            let rid = gpu.alloc_resource_id();
+            if !gpu.create_resource_3d(rid, req.width, req.height, req.format) {
+                return Err(DriverError::Io);
+            }
+            rid
+        };
+
+        // bo_handle @40, res_handle @44 in drm_virtgpu_resource_create.
+        unsafe {
+            (arg as *mut u8).add(40).cast::<u32>().write_volatile(res_handle);
+            (arg as *mut u8).add(44).cast::<u32>().write_volatile(res_handle);
         }
+        Ok(0)
     }
 
+    /// DRM_IOCTL_VIRTGPU_EXECBUFFER — forward the real command stream.
+    ///
+    /// The previous implementation bound `_exec` and never touched it, then
+    /// submitted `&[]`: every command stream userspace ever produced was thrown
+    /// away while the ioctl reported success.
     fn virtgpu_handle_execbuffer(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let _exec = unsafe { &mut *(arg as *mut drm_virtgpu_execbuffer) };
-        
-        crate::pci::rdebug("[DRM] Virtio-GPU ExecBuffer\n");
-        
-        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-            // Send Submit3d command to Virtio-GPU
-            let _res = gpu.send_command(crate::virtio_gpu::VirtioGpuCmd::Submit3d, &[]);
-            Ok(0)
-        } else {
-            Err(DriverError::NotFound)
+        // Read the request out of user memory BEFORE any device lock is taken.
+        let exec = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_execbuffer) };
+        if exec.command == 0 || exec.size == 0 {
+            return Err(DriverError::InvalidParameter);
         }
+        const MAX_CMD_BYTES: usize = 4 << 20;
+        let size = exec.size as usize;
+        if size > MAX_CMD_BYTES { return Err(DriverError::InvalidParameter); }
+
+        let ctx = VIRTGPU_CTX_ID.load(Ordering::Relaxed);
+        if ctx == 0 {
+            crate::pci::serial_debug("[DRM] EXECBUFFER before CONTEXT_INIT\n");
+            return Err(DriverError::InvalidParameter);
+        }
+
+        // Copy the stream into kernel memory while no spinlock is held: touching
+        // a user page can demand-fault, and faulting under the device spinlock is
+        // the 82d0cc3 all-vCPU freeze class.
+        let mut cmds = vec![0u8; size];
+        unsafe {
+            ::core::ptr::copy_nonoverlapping(exec.command as *const u8, cmds.as_mut_ptr(), size);
+        }
+
+        let fence = {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
+            gpu.submit_3d(ctx, &cmds).map_err(|_| DriverError::Io)?
+        };
+        LAST_EXEC_FENCE.store(fence, Ordering::Relaxed);
+        Ok(0)
     }
 
+    /// DRM_IOCTL_VIRTGPU_GET_CAPS — copy the host's capset blob back to
+    /// `caps.addr`. The previous implementation issued a (wrongly numbered)
+    /// GET_CAPSET and discarded the response entirely.
     fn virtgpu_handle_get_caps(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let _caps = unsafe { &mut *(arg as *mut drm_virtgpu_get_caps) };
-        
-        crate::pci::rdebug("[DRM] Virtio-GPU Get Caps\n");
-        
-        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-            let _res = gpu.send_command(crate::virtio_gpu::VirtioGpuCmd::GetCapset, &[]);
-            Ok(0)
-        } else {
-            Err(DriverError::NotFound)
+        let caps = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_get_caps) };
+        if caps.addr == 0 || caps.size == 0 {
+            return Err(DriverError::InvalidParameter);
         }
+        const MAX_CAPS_BYTES: usize = 1 << 20;
+        let want = (caps.size as usize).min(MAX_CAPS_BYTES);
+
+        // Fetch into a kernel buffer under the device lock …
+        let blob = {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
+
+            // Like Linux: resolve the capset id against the host's table first.
+            // A capset the host does not expose is EINVAL, not a buffer of
+            // zeros — which is the difference between "Venus is present" and
+            // "the ioctl returned 0".
+            let (max_ver, max_size) = match gpu.find_capset(caps.cap_set_id) {
+                Some(v) => v,
+                None => {
+                    crate::pci::serial_debug("[DRM] GET_CAPS: host exposes no capset id ");
+                    crate::pci::serial_debug_hex(caps.cap_set_id);
+                    crate::pci::serial_debug("\n");
+                    return Err(DriverError::InvalidParameter);
+                }
+            };
+            crate::pci::serial_debug("[DRM] GET_CAPS capset=");
+            crate::pci::serial_debug_hex(caps.cap_set_id);
+            crate::pci::serial_debug(" host max_ver=");
+            crate::pci::serial_debug_hex(max_ver);
+            crate::pci::serial_debug(" max_size=");
+            crate::pci::serial_debug_hex(max_size);
+            crate::pci::serial_debug("\n");
+            if max_size == 0 {
+                return Err(DriverError::InvalidParameter);
+            }
+            let n = want.min(max_size as usize);
+            gpu.get_capset(caps.cap_set_id, caps.cap_set_ver, n)
+                .map_err(|_| DriverError::Io)?
+        };
+        // … and copy it out only after the lock is released.
+        let n = blob.len().min(want);
+        unsafe {
+            ::core::ptr::copy_nonoverlapping(blob.as_ptr(), caps.addr as *mut u8, n);
+        }
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_VIRTGPU_GETPARAM. Mesa's venus backend probes these before it
+    /// will do anything else and refuses to proceed if they read back wrong, so
+    /// each answer is derived from what was actually negotiated rather than
+    /// hardcoded.
+    fn virtgpu_handle_getparam(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let req = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_getparam) };
+
+        let value: u64 = {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
+            use crate::virtio_gpu as vg;
+            match req.param {
+                VIRTGPU_PARAM_3D_FEATURES => gpu.has_feature(vg::VIRTIO_GPU_F_VIRGL) as u64,
+                // We implement GET_CAPSET_INFO as a distinct command with a real
+                // index→id mapping, which is exactly what this "fix" denotes.
+                VIRTGPU_PARAM_CAPSET_QUERY_FIX => 1,
+                VIRTGPU_PARAM_RESOURCE_BLOB => {
+                    gpu.has_feature(vg::VIRTIO_GPU_F_RESOURCE_BLOB) as u64
+                }
+                // Host-visible blob memory needs both the blob feature and an
+                // actual shared-memory BAR window to map it into.
+                VIRTGPU_PARAM_HOST_VISIBLE => {
+                    (gpu.has_feature(vg::VIRTIO_GPU_F_RESOURCE_BLOB)
+                        && gpu.shared_mem_region().is_some()) as u64
+                }
+                // No PRIME / cross-device sharing on this node.
+                VIRTGPU_PARAM_CROSS_DEVICE => 0,
+                VIRTGPU_PARAM_CONTEXT_INIT => {
+                    gpu.has_feature(vg::VIRTIO_GPU_F_CONTEXT_INIT) as u64
+                }
+                VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs => {
+                    let n = gpu.num_capsets().min(16);
+                    let mut mask = 0u64;
+                    for i in 0..n {
+                        if let Ok((id, _ver, _sz)) = gpu.get_capset_info(i) {
+                            if id < 64 { mask |= 1u64 << id; }
+                        }
+                    }
+                    mask
+                }
+                // CTX_CREATE carries a debug_name and we populate it.
+                VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME => 1,
+                _ => return Err(DriverError::InvalidParameter),
+            }
+        };
+
+        // `value` is the second u64 of drm_virtgpu_getparam.
+        unsafe { (arg as *mut u64).add(1).write_volatile(value) };
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_VIRTGPU_CONTEXT_INIT — create the 3D context whose type is
+    /// selected by VIRTGPU_CONTEXT_PARAM_CAPSET_ID (4 = Venus).
+    fn virtgpu_handle_context_init(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let init = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_context_init) };
+        let n = init.num_params as usize;
+        if init.ctx_set_params == 0 || n == 0 || n > 8 {
+            return Err(DriverError::InvalidParameter);
+        }
+        // Linux keys the 3D context off the open file (`drm_file`) and returns
+        // EEXIST for a second init on the same one. This server keeps no per-fd
+        // state, so the context is process-global: a second *process* opening
+        // card0 would otherwise be permanently refused, because the previous
+        // process's context id outlives it. Until per-fd state exists, tear the
+        // old context down and create a fresh one.
+        //
+        // KNOWN LIMITATION (blocks M2): two clients with live contexts at the
+        // same time will stomp each other. Mesa opens one card0 per process, so
+        // this needs per-fd context state before multiple Vulkan apps can run.
+        let prev = VIRTGPU_CTX_ID.swap(0, Ordering::Relaxed);
+        if prev != 0 {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            if let Some(gpu) = guard.as_mut() {
+                gpu.ctx_destroy(prev);
+            }
+        }
+
+        // Copy the whole param array before locking anything.
+        let mut params = [drm_virtgpu_context_set_param { param: 0, value: 0 }; 8];
+        for i in 0..n {
+            params[i] = unsafe {
+                ::core::ptr::read_volatile(
+                    (init.ctx_set_params as *const drm_virtgpu_context_set_param).add(i),
+                )
+            };
+        }
+
+        let mut capset_id: u32 = 0;
+        for p in params[..n].iter() {
+            match p.param {
+                VIRTGPU_CONTEXT_PARAM_CAPSET_ID => capset_id = p.value as u32,
+                // Single ring only; accept and ignore the ring params rather
+                // than failing a request that is satisfiable.
+                VIRTGPU_CONTEXT_PARAM_NUM_RINGS
+                | VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK
+                | VIRTGPU_CONTEXT_PARAM_DEBUG_NAME => {}
+                _ => return Err(DriverError::InvalidParameter),
+            }
+        }
+        if capset_id == 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+
+        let ctx = {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
+            gpu.ctx_create(capset_id, "leandros-venus")
+                .map_err(|_| DriverError::Io)?
+        };
+        VIRTGPU_CTX_ID.store(ctx, Ordering::Relaxed);
+        crate::pci::serial_debug("[DRM] virtgpu context created, capset=");
+        crate::pci::serial_debug_hex(capset_id);
+        crate::pci::serial_debug(" ctx_id=");
+        crate::pci::serial_debug_hex(ctx);
+        crate::pci::serial_debug("\n");
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB.
+    fn virtgpu_handle_resource_create_blob(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let req =
+            unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_resource_create_blob) };
+        const MAX_BLOB_BYTES: u64 = 64 << 20;
+        if req.size == 0 || req.size > MAX_BLOB_BYTES || req.blob_mem == 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+
+        use crate::virtio_gpu as vg;
+        // GUEST and HOST3D_GUEST blobs are backed by guest pages we allocate and
+        // hand over as mem entries; a pure HOST3D blob lives host-side and the
+        // guest owns no pages for it.
+        let guest_backed = req.blob_mem == vg::VIRTIO_GPU_BLOB_MEM_GUEST
+            || req.blob_mem == vg::VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST;
+
+        let size = req.size as usize;
+        let order = vg::order_for_bytes(size);
+        let phys = if guest_backed {
+            let p = mm::buddy::alloc(order).ok_or(DriverError::Io)?;
+            unsafe { ::core::ptr::write_bytes(mm::phys_to_virt(p) as *mut u8, 0, (1usize << order) * 4096) };
+            p
+        } else {
+            0
+        };
+
+        let ctx = VIRTGPU_CTX_ID.load(Ordering::Relaxed);
+        let backing = if guest_backed { Some((phys as u64, size as u32)) } else { None };
+
+        let res_handle = {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let gpu = match guard.as_mut() {
+                Some(g) => g,
+                None => {
+                    if phys != 0 { mm::buddy::free(phys, order); }
+                    return Err(DriverError::NotFound);
+                }
+            };
+            let rid = gpu.alloc_resource_id();
+            match gpu.resource_create_blob(
+                ctx, rid, req.blob_mem, req.blob_flags, req.blob_id, req.size, backing,
+            ) {
+                Ok(()) => rid,
+                Err(()) => {
+                    drop(guard);
+                    if phys != 0 { mm::buddy::free(phys, order); }
+                    return Err(DriverError::Io);
+                }
+            }
+        };
+
+        let handle = NEXT_BLOB_HANDLE.fetch_add(1, Ordering::Relaxed);
+        BLOB_BUFFERS.lock().insert(
+            handle,
+            BlobBuf { phys, order, res_handle, size: req.size },
+        );
+
+        // Write back only bo_handle (offset 8) and res_handle (offset 12) rather
+        // than the whole struct, so nothing the caller set is clobbered.
+        unsafe {
+            (arg as *mut u8).add(8).cast::<u32>().write_volatile(handle);
+            (arg as *mut u8).add(12).cast::<u32>().write_volatile(res_handle);
+        }
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_VIRTGPU_MAP — turn a BO handle into the mmap offset for it.
+    /// Following this driver's established device-fd convention, that offset is
+    /// the buffer's physical base (see `handle_ioctl_mmap`).
+    fn virtgpu_handle_map(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let handle = unsafe { (arg as *const u8).add(8).cast::<u32>().read_volatile() };
+        let phys = BLOB_BUFFERS
+            .lock()
+            .get(&handle)
+            .map(|b| b.phys)
+            .or_else(|| DUMB_BUFFERS.lock().get(&handle).map(|b| b.phys))
+            .ok_or(DriverError::InvalidParameter)?;
+        if phys == 0 {
+            // Host-side blob memory: nothing in guest RAM to map. Reaching it
+            // needs RESOURCE_MAP_BLOB into the shared-memory BAR window.
+            return Err(DriverError::Unsupported);
+        }
+        // `offset` is the first u64 of drm_virtgpu_map.
+        unsafe { (arg as *mut u64).write_volatile(phys as u64) };
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_VIRTGPU_WAIT — block until the work fenced by the most recent
+    /// EXECBUFFER has retired. Submission is synchronous, so by the time
+    /// EXECBUFFER returned the fence was already signalled; this reports that
+    /// truthfully instead of unconditionally succeeding.
+    fn virtgpu_handle_wait(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let w = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_3d_wait) };
+        if w.handle == 0 { return Err(DriverError::InvalidParameter); }
+
+        let fence = LAST_EXEC_FENCE.load(Ordering::Relaxed);
+        if fence == 0 {
+            // Nothing was ever submitted, so nothing is outstanding.
+            return Ok(0);
+        }
+        let retired = {
+            let guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let gpu = guard.as_ref().ok_or(DriverError::NotFound)?;
+            gpu.fence_retired(fence)
+        };
+        if retired { Ok(0) } else { Err(DriverError::Io) }
     }
 
     fn virtgpu_handle_transfer_to_host(&mut self, _arg: usize) -> Result<usize, DriverError> {
