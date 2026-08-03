@@ -39,6 +39,14 @@ echo "🏗️  Architecture(s): $ARCH"
 
 ROOT_DIR="$PWD"
 
+# The sibling repos (brush, coreutils, bottom) are built from their own
+# directories, which rust-toolchain.toml does not reach — it only applies inside
+# this tree. Without an explicit toolchain they fall back to the machine default,
+# which on a fresh box is stable and has no musl std, so they fail with
+# "can't find crate for `core`". Pass the pinned toolchain explicitly, read from
+# the toolchain file so the pin stays in one place.
+PINNED_TOOLCHAIN="+$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT_DIR/rust-toolchain.toml" | head -1)"
+
 # Function to download and cache Limine
 download_limine() {
     local version="$1"
@@ -250,7 +258,7 @@ build_bottom() {
     (
         cd "$bottom_dir" || exit 1
         RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
-        cargo build --target "$target_triple" --release
+        cargo "$PINNED_TOOLCHAIN" build --target "$target_triple" --release
     )
 
 }
@@ -289,7 +297,7 @@ build_coreutils() {
         env "$cc_var=$ROOT_DIR/scripts/cc-$arch-musl.sh" \
             "$ar_var=$ROOT_DIR/scripts/ar-musl.sh" \
         RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
-        cargo build --target "$target_triple" --release \
+        cargo "$PINNED_TOOLCHAIN" build --target "$target_triple" --release \
             --no-default-features --features feat_os_unix_musl
     )
 }
@@ -312,7 +320,7 @@ build_brush() {
     (
         cd "$brush_dir" || exit 1
         RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
-        cargo build -p brush-shell --target "$target_triple" --release
+        cargo "$PINNED_TOOLCHAIN" build -p brush-shell --target "$target_triple" --release
     )
 }
 
