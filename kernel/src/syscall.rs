@@ -1657,13 +1657,33 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     // map them (lock order: never nest the tmpfs locks under AS-busy). f2fs
     // MAP_SHARED still falls through to the eager private-copy path below.
     if flags & MAP_SHARED != 0 {
-        if let Some(vfs::VnodeKind::TmpFile { .. }) = kind {
+        if let Some(vfs::VnodeKind::TmpFile { idx, .. }) = kind {
             match vfs::vmo_acquire_frames(pid, fd, off, len) {
                 Some(frames) => {
+                    // [GAP2] snapshot before the frames are consumed by the map.
+                    let g2_p0 = frames.first().copied().unwrap_or(0);
+                    let g2_n  = frames.len();
                     let mapped = with_current_address_space_mut(|as_| {
                         if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
                         as_.map_shared_frames(virt, &frames, page_flags)
                     });
+                    // Logged OUTSIDE the closure: inside it the address space
+                    // `busy` flag is held.
+                    if mm::gap2::budget_ok() {
+                        mm::gap2::s("[G2MAP] pid="); mm::gap2::h(pid as usize);
+                        mm::gap2::kv(" fd=",   fd);
+                        mm::gap2::kv(" idx=",  idx);
+                        mm::gap2::kv(" off=",  off);
+                        mm::gap2::kv(" len=",  len);
+                        mm::gap2::kv(" prot=", prot);
+                        mm::gap2::kv(" mflg=", flags);
+                        mm::gap2::kv(" virt=", virt);
+                        mm::gap2::kv(" p0=",   g2_p0);
+                        mm::gap2::kv(" n=",    g2_n);
+                        mm::gap2::kv(" rc=",   match mapped {
+                            Some(true) => 1, Some(false) => 0, None => 2 });
+                        mm::gap2::nl();
+                    }
                     return match mapped {
                         // On success the VMA owns the transferred pins.
                         Some(true)  => virt as isize,
@@ -1678,6 +1698,18 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
         }
     }
 
+    // [GAP2] A MAP_SHARED file mapping that did NOT take the K1 aliasing branch
+    // above is about to get an EAGER PRIVATE COPY (the read loop below). If the
+    // Wayland shm-pool fd shows up here, that mapping is frozen at frame 0.
+    if flags & MAP_SHARED != 0 && mm::gap2::budget_ok() {
+        mm::gap2::s("[G2FALL] pid="); mm::gap2::h(pid as usize);
+        mm::gap2::kv(" fd=",   fd);
+        mm::gap2::kv(" kind=", vfs::gap2_kind_tag(&kind));
+        mm::gap2::kv(" off=",  off);
+        mm::gap2::kv(" len=",  len);
+        mm::gap2::kv(" prot=", prot);
+        mm::gap2::nl();
+    }
     // Normal file-backed mmap follows...
     // Step 1: seek the fd to the requested offset.
     //
@@ -6622,8 +6654,40 @@ fn epoll_any_ready(pid: u32, slot: usize) -> bool {
 /// a timerfd, and every finite-timeout waiter, wakes on time with NO per-tick
 /// wake for infinite data-driven waiters (the ~0% idle goal). try_wake_poll
 /// honors the tick's try-lock-only contract: a contended tick defers ≤10 ms.
+/// [GAP2] 0.5 Hz content probe of the watched wl_shm pool.
+///
+/// IRQ CONTEXT (BSP timer tick, via `sched::timer_tick_irq`). It may only:
+/// try_lock, read HHDM (kernel) memory, and write the UART directly. It must
+/// NOT touch user memory, must NOT take RUN_QUEUE, and must NOT wake anything.
+fn gap2_sample_tick() {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !mm::gap2::ON { return; }
+    if !mm::gap2::watch_any() { return; }
+    static LAST: AtomicUsize = AtomicUsize::new(0);
+    let now = ticks() as usize;                  // 100 Hz
+    if now.wrapping_sub(LAST.load(Relaxed)) < 50 { return; }   // 0.5 Hz
+    LAST.store(now, Relaxed);
+    // Every armed pool is sampled in the SAME tick window and stamped with the
+    // same `t=`, so the applet pool and the panel's bar pools sit on one shared
+    // timeline and can be compared sample-for-sample.
+    for s in 0..mm::gap2::WATCH_SLOTS {
+        let idx = mm::gap2::watch_slot(s);
+        if idx == usize::MAX { continue; }
+        if let Some((np, p0, sum, vlen)) = vfs::vmo_debug_probe(idx) {
+            mm::gap2::s("[G2SUM] t="); mm::gap2::h(now);
+            mm::gap2::kv(" idx=",  idx);
+            mm::gap2::kv(" np=",   np);
+            mm::gap2::kv(" p0=",   p0);
+            mm::gap2::kv(" vlen=", vlen);
+            mm::gap2::kv(" sum=",  sum as usize);
+            mm::gap2::nl();
+        }
+    }
+}
+
 pub fn poll_deadline_tick() {
     use core::sync::atomic::Ordering::Relaxed;
+    gap2_sample_tick();
     let now = ticks();
     let tfd = vfs::earliest_timerfd_deadline();
     // Fast path: the lock-free hint (min of parked timed waiters' deadlines)
@@ -6901,6 +6965,23 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
             // Mark the inode as a memfd: creates an empty seal-capable VMO so the
             // file is genuinely shareable and F_ADD_SEALS/F_GET_SEALS are honored.
             vfs::mark_memfd(pid, fd as usize);
+            // [GAP2] Name the memfd, its owner pid and its tmpfs slot, so every
+            // later [G2*] line can be attributed to a process and a pool. Also
+            // arms the [G2SUM] content sampler on the applet's pool.
+            if mm::gap2::ON {
+                let g2_idx = vfs::gap2_tmpfile_idx(pid, fd as usize)
+                    .unwrap_or(usize::MAX);
+                mm::gap2::s("[G2MEMFD] pid="); mm::gap2::h(pid as usize);
+                mm::gap2::kv(" fd=",  fd as usize);
+                mm::gap2::kv(" idx=", g2_idx);
+                mm::gap2::s(" name="); mm::gap2::bytes(&path[..plen]);
+                mm::gap2::nl();
+                if g2_idx != usize::MAX
+                    && path[..plen].starts_with(b"/tmp/memfd:leandros-applet")
+                {
+                    mm::gap2::set_watch_primary(g2_idx);
+                }
+            }
             // KNOWN LEAK, deliberately not fixed here. A memfd should be an
             // ANONYMOUS inode that dies with its last fd; ours keeps its
             // "/tmp/memfd:<name>[:<seq>]" name forever, so every call burns one

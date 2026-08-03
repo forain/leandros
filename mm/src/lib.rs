@@ -10,6 +10,7 @@
 
 pub mod buddy;
 pub mod cow;
+pub mod gap2;
 pub mod pageref;
 pub mod paging;
 pub mod slab;

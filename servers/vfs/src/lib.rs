@@ -466,6 +466,61 @@ fn tmpfile_owner_of(pid: u32, fd: usize) -> Option<usize> {
     }
 }
 
+/// [GAP2] Public wrapper over `tmpfile_owner_of` for the instrumentation.
+pub fn gap2_tmpfile_idx(pid: u32, fd: usize) -> Option<usize> {
+    tmpfile_owner_of(pid, fd)
+}
+
+/// [GAP2] Stable small tag per VnodeKind, for one-line traces.
+pub fn gap2_kind_tag(k: &Option<VnodeKind>) -> usize {
+    match k {
+        None => 0,
+        Some(VnodeKind::None) => 1,
+        Some(VnodeKind::RamFile { .. }) => 2,
+        Some(VnodeKind::TmpFile { .. }) => 3,
+        Some(VnodeKind::MountedFile { .. }) => 4,
+        Some(VnodeKind::Pipe { .. }) => 5,
+        Some(VnodeKind::DynamicDevice { .. }) => 6,
+        Some(_) => 7,
+    }
+}
+
+/// [GAP2] Read-only content probe of a tmpfs/memfd VMO.
+/// Returns `(npages, first_phys, checksum, vmo_len)`.
+///
+/// SAFE FROM IRQ CONTEXT, and only because of two properties:
+///   * `try_lock` ONLY. `TMP_VMOS` is taken from syscall context with interrupts
+///     enabled, so a blocking `lock()` from the timer tick would deadlock
+///     against a holder preempted on this same CPU.
+///   * It reads the frames through `mm::phys_to_virt` — the HHDM identity map,
+///     i.e. kernel memory that is always present. It never touches a user
+///     virtual address, so it cannot demand-page and cannot re-enter the fault
+///     handler (project rule: never touch user memory from IRQ/lock context).
+pub fn vmo_debug_probe(idx: usize) -> Option<(usize, usize, u64, usize)> {
+    if idx >= MAX_TMP_FILES { return None; }
+    let vmos = TMP_VMOS.try_lock()?;
+    let vmo = vmos[idx].as_ref()?;
+    let np = vmo.pages.len();
+    if np == 0 { return Some((0, 0, 0, vmo.len)); }
+    // Checksum the WHOLE buffer. Do not "optimise" this to the first page: the
+    // applet's clock glyphs are vertically centred (rows 5..26 of 32 at an
+    // 880-byte stride), so page 0 is uniform background and a page-0-only
+    // checksum would be constant even while the clock ticks.
+    let total = vmo.len.min(np * 4096);
+    let mut sum: u64 = 0;
+    let mut off = 0usize;
+    while off + 4 <= total {
+        let phys = vmo.pages[off / 4096];
+        if phys != 0 {
+            let p = (mm::phys_to_virt(phys) + (off % 4096)) as *const u32;
+            sum = sum.wrapping_mul(31)
+                     .wrapping_add(unsafe { core::ptr::read_volatile(p) } as u64);
+        }
+        off += 4;
+    }
+    Some((np, vmo.pages[0], sum, vmo.len))
+}
+
 /// Mark the tmpfs inode behind `fd` as a memfd: create an empty seal-capable
 /// VMO on its owner slot. Called by `sys_memfd_create` right after open.
 pub fn mark_memfd(pid: u32, fd: usize) {
@@ -547,6 +602,7 @@ pub fn vmo_acquire_frames(pid: u32, fd: usize, off: usize, len: usize)
     let mut vmos = TMP_VMOS.lock();
 
     // Promote a plain tmpfs file on first MAP_SHARED: migrate inline bytes.
+    let g2_promoted = vmos[idx].is_none();
     if vmos[idx].is_none() {
         let cur_len = tmp[idx].len;
         let cur_pages = (cur_len + 4095) / 4096;
@@ -583,6 +639,37 @@ pub fn vmo_acquire_frames(pid: u32, fd: usize, off: usize, len: usize)
         let phys = vmo.pages[p];
         mm::pageref::inc(phys);
         out.push(phys);
+    }
+    let g2_np = vmo.pages.len();
+    let g2_vlen = vmo.len;
+    let g2_memfd = vmo.is_memfd;
+    let g2_borrow = vmo.borrowed;
+    let g2_p0 = out.first().copied().unwrap_or(0);
+    // Release TMP_VMOS/TMP_FILES *before* the serial write: a ~100-char line on
+    // a polled UART is milliseconds of busy-wait, and these two mutexes gate
+    // every tmpfs operation in the system.
+    drop(vmos);
+    drop(tmp);
+    if mm::gap2::budget_ok() {
+        mm::gap2::s("[G2ACQ] pid="); mm::gap2::h(pid as usize);
+        mm::gap2::kv(" fd=",     fd);
+        mm::gap2::kv(" idx=",    idx);
+        mm::gap2::kv(" off=",    off);
+        mm::gap2::kv(" len=",    len);
+        mm::gap2::kv(" prom=",   g2_promoted as usize);
+        mm::gap2::kv(" memfd=",  g2_memfd as usize);
+        mm::gap2::kv(" borrow=", g2_borrow as usize);
+        mm::gap2::kv(" np=",     g2_np);
+        mm::gap2::kv(" vlen=",   g2_vlen);
+        mm::gap2::kv(" p0=",     g2_p0);
+        mm::gap2::nl();
+    }
+    // [GAP2] Arm the sampler on the panel's OWN bar pools so they are checksummed
+    // on the same cadence as the applet's. 0x28000 = 1280*32*4 is exactly the
+    // full-width 32px panel bar at the aarch64 mode. Deliberately OUTSIDE the
+    // `budget_ok()` block above: arming must not depend on log budget remaining.
+    if mm::gap2::ON && g2_memfd && g2_vlen == 0x28000 {
+        mm::gap2::set_watch(idx);
     }
     Some(out)
 }
@@ -3426,6 +3513,21 @@ pub fn import_fd(pid: u32, tf: TransferFd, cloexec: bool) -> isize {
     let mut flags = tf.flags;
     if cloexec { flags |= O_CLOEXEC; } else { flags &= !O_CLOEXEC; }
     tbl.fds[slot] = FdEntry { kind: tf.kind, flags, in_use: true };
+    drop(tbls);
+    // [GAP2] SCM_RIGHTS hand-off of a tmpfs/memfd fd — this is exactly the
+    // Wayland wl_shm pool arriving in the compositor. If `idx` here does not
+    // match the sender's, or the kind is not TmpFile, the receiver's mmap will
+    // miss the K1 aliasing branch (hypothesis (b)).
+    if let VnodeKind::TmpFile { idx, writable, .. } = tf.kind {
+        if mm::gap2::budget_ok() {
+            mm::gap2::s("[G2IMP] rxpid="); mm::gap2::h(pid as usize);
+            mm::gap2::kv(" fd=",    slot);
+            mm::gap2::kv(" idx=",   idx);
+            mm::gap2::kv(" w=",     writable as usize);
+            mm::gap2::kv(" flags=", flags as usize);
+            mm::gap2::nl();
+        }
+    }
     slot as isize
 }
 
