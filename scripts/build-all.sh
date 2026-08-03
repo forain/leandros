@@ -115,7 +115,7 @@ build_kernel() {
     fi
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_std" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
     RUSTFLAGS="-C link-arg=-T$linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro" \
-    cargo +nightly build -p kernel $features_arg --target "$target_spec" --target-dir "$target_root_std" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
+    cargo build -p kernel $features_arg --target "$target_spec" --target-dir "$target_root_std" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
     
     mkdir -p "target/final-$arch"
     cp "$target_root_std/$target_triple/release/kernel" "target/final-$arch/kernel"
@@ -127,7 +127,7 @@ build_kernel() {
     local direct_linker="$ROOT_DIR/linkers/$arch-direct.ld"
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_dir" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
     RUSTFLAGS="-C link-arg=-T$direct_linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro" \
-    cargo +nightly build -p kernel $features_arg --target "$target_spec" --target-dir "$target_root_dir" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
+    cargo build -p kernel $features_arg --target "$target_spec" --target-dir "$target_root_dir" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
     
     cp "$target_root_dir/$target_triple/release/kernel" "target/final-$arch/kernel-direct"
     
@@ -250,7 +250,7 @@ build_bottom() {
     (
         cd "$bottom_dir" || exit 1
         RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
-        cargo +nightly build --target "$target_triple" --release
+        cargo build --target "$target_triple" --release
     )
 
 }
@@ -289,7 +289,7 @@ build_coreutils() {
         env "$cc_var=$ROOT_DIR/scripts/cc-$arch-musl.sh" \
             "$ar_var=$ROOT_DIR/scripts/ar-musl.sh" \
         RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
-        cargo +nightly build --target "$target_triple" --release \
+        cargo build --target "$target_triple" --release \
             --no-default-features --features feat_os_unix_musl
     )
 }
@@ -312,7 +312,7 @@ build_brush() {
     (
         cd "$brush_dir" || exit 1
         RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
-        cargo +nightly build -p brush-shell --target "$target_triple" --release
+        cargo build -p brush-shell --target "$target_triple" --release
     )
 }
 

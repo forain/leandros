@@ -55,7 +55,7 @@ if $CHECK; then
     cargo check "${CARGO_ARGS[@]}" "${EXCLUDE_ARGS[@]}"
 
     for prog in "${RELIBC_LINKED[@]}"; do
-        cargo +nightly check --manifest-path userland/Cargo.toml -p "$prog" --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec
+        cargo check --manifest-path userland/Cargo.toml -p "$prog" --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec
     done
 
     echo "[userland] OK — type-check passed"
@@ -72,7 +72,7 @@ mkdir -p "$OUT"
 for prog in "${RELIBC_LINKED[@]}"; do
     echo "[userland] Building $prog..."
     RUSTFLAGS="-C link-arg=--entry=_start -C link-arg=-static -C linker=rust-lld -C relocation-model=static" \
-    cargo +nightly build --manifest-path userland/Cargo.toml -p "$prog" --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec --release
+    cargo build --manifest-path userland/Cargo.toml -p "$prog" --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec --release
     cp "userland/target/${LEANDROS_TARGET_NAME}/release/$prog" "${OUT}/$prog"
 done
 
