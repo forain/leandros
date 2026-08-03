@@ -13,11 +13,31 @@ ARCH="x86_64"
 # (fixed 2026-07-15, see drivers/src/virtio_gpu.rs's volatile-MMIO fix). Force
 # override with --tcg (software emulation, e.g. for comparison/debugging) or
 # --hvf (force HVF even off Apple Silicon, where it will fail to launch).
-HVF=""
+ACCEL=""
 QEMU_EXTRA_ARGS=()
 
-X86_64_FW_PATHS=("/usr/share/ovmf/OVMF.fd" "/usr/share/OVMF/OVMF_CODE.fd" "/opt/homebrew/share/qemu/edk2-x86_64-code.fd" "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd")
-AARCH64_FW_PATHS=("/usr/share/AAVMF/AAVMF_CODE.fd" "/opt/homebrew/share/qemu/edk2-aarch64-code.fd" "/usr/share/edk2-armvirt/aarch64/QEMU_EFI-pflash.raw")
+# Hardware acceleration only applies when the guest architecture matches the
+# host's — a hypervisor virtualises, it does not translate. Map uname's arch
+# spelling onto ours so "arm64" (macOS) and "aarch64" (Linux) compare equal.
+host_arch_normalized() {
+    case "$1" in
+        arm64|aarch64) echo "aarch64" ;;
+        x86_64|amd64)  echo "x86_64" ;;
+        *)             echo "$1" ;;
+    esac
+}
+HOST_ARCH_N=$(host_arch_normalized "$HOST_ARCH")
+
+# Firmware search paths. Ordered most-specific first; the first hit wins.
+# Arch/EndeavourOS keeps edk2 under /usr/share/edk2/<arch>/ with a 4 MB split
+# CODE/VARS pair, which is why the plain OVMF.fd names below do not match there.
+X86_64_FW_PATHS=("/usr/share/ovmf/OVMF.fd" "/usr/share/OVMF/OVMF_CODE.fd" "/opt/homebrew/share/qemu/edk2-x86_64-code.fd" "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd" "/usr/share/edk2/x64/OVMF_CODE.4m.fd" "/usr/share/edk2/x64/OVMF_CODE.fd")
+AARCH64_FW_PATHS=("/usr/share/AAVMF/AAVMF_CODE.fd" "/opt/homebrew/share/qemu/edk2-aarch64-code.fd" "/usr/share/edk2-armvirt/aarch64/QEMU_EFI-pflash.raw" "/usr/share/edk2/aarch64/QEMU_CODE.4m.fd" "/usr/share/edk2/aarch64/QEMU_CODE.fd")
+
+# Matching writable VARS templates, same ordering convention. A split firmware
+# build needs its own VARS pflash; a combined image (OVMF.fd) does not.
+X86_64_VARS_PATHS=("/opt/homebrew/share/qemu/edk2-i386-vars.fd" "/usr/share/edk2/x64/OVMF_VARS.4m.fd" "/usr/share/edk2/x64/OVMF_VARS.fd" "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd" "/usr/share/OVMF/OVMF_VARS.fd")
+AARCH64_VARS_PATHS=("/opt/homebrew/share/qemu/edk2-arm-vars.fd" "/usr/share/edk2/aarch64/QEMU_VARS.4m.fd" "/usr/share/edk2/aarch64/QEMU_VARS.fd" "/usr/share/edk2-armvirt/aarch64/vars-template-pflash.raw" "/usr/share/AAVMF/AAVMF_VARS.fd")
 
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -28,25 +48,52 @@ while [[ "$#" -gt 0 ]]; do
         # driver (drivers/src/sdhci.rs); aarch64-only, no PCI bus, no
         # GPU/sound/keyboard devices. Not a hardware target.
         --raspi4b) BOOT_MODE="raspi4b"; ARCH="aarch64"; shift ;;
-        --hvf) HVF=1; shift ;;
-        --tcg) HVF=0; shift ;;
+        --hvf) ACCEL="hvf"; shift ;;
+        --kvm) ACCEL="kvm"; shift ;;
+        --tcg) ACCEL="tcg"; shift ;;
         -d) QEMU_EXTRA_ARGS+=("$2"); shift 2 ;;
         *) QEMU_EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
 
-if [ -z "$HVF" ]; then
-    # Default: HVF on an Apple Silicon host for the one boot path that
-    # supports it, TCG everywhere else.
-    if [ "$OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$ARCH" = "aarch64" ] && [ "$BOOT_MODE" = "uefi" ]; then
-        HVF=1
+if [ -z "$ACCEL" ]; then
+    # Pick the fastest accelerator this host can actually provide for this
+    # guest. Requires arch match; anything else falls back to TCG emulation.
+    if [ "$HOST_ARCH_N" != "$ARCH" ]; then
+        ACCEL="tcg"
+    elif [ "$OS" = "Darwin" ]; then
+        # HVF is only wired up for the aarch64 UEFI/Limine path; direct boot
+        # hangs on an upstream PL011/HVF timer-starvation bug.
+        if [ "$ARCH" = "aarch64" ] && [ "$BOOT_MODE" = "uefi" ]; then
+            ACCEL="hvf"
+        else
+            ACCEL="tcg"
+        fi
+    elif [ "$OS" = "Linux" ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        ACCEL="kvm"
     else
-        HVF=0
+        ACCEL="tcg"
     fi
-elif [ "$HVF" = "1" ] && { [ "$ARCH" != "aarch64" ] || [ "$BOOT_MODE" != "uefi" ]; }; then
-    echo "❌ --hvf only works with aarch64 --uefi (the default boot mode for that arch)"
-    exit 1
 fi
+
+# Validate an explicit request rather than letting QEMU fail obscurely later.
+case "$ACCEL" in
+    hvf)
+        if [ "$OS" != "Darwin" ]; then echo "❌ --hvf requires a macOS host"; exit 1; fi
+        if [ "$ARCH" != "aarch64" ] || [ "$BOOT_MODE" != "uefi" ]; then
+            echo "❌ --hvf only works with aarch64 --uefi (the default boot mode for that arch)"; exit 1
+        fi ;;
+    kvm)
+        if [ "$OS" != "Linux" ]; then echo "❌ --kvm requires a Linux host"; exit 1; fi
+        if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            echo "❌ --kvm requested but /dev/kvm is not readable/writable (add your user to the 'kvm' group)"; exit 1
+        fi
+        if [ "$HOST_ARCH_N" != "$ARCH" ]; then
+            echo "❌ --kvm cannot run a $ARCH guest on a $HOST_ARCH_N host"; exit 1
+        fi ;;
+esac
+
+echo "⚡ Accelerator: $ACCEL (host ${OS}/${HOST_ARCH_N}, guest ${ARCH})"
 
 if [ "$BOOT_MODE" = "raspi4b" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
@@ -58,20 +105,23 @@ elif [ "$ARCH" = "aarch64" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
     # -smp 4: SMP bringup via PSCI CPU_ON (GICv2 supports up to 8 CPUs).
     MACHINE_ARGS="-machine virt,gic-version=2 -m 2G -smp 4"
-    if [ "$HVF" = "1" ]; then
-        # -cpu host: real Apple Silicon ID registers, required by HVF passthrough
-        # (vs. -cpu max's synthesized model, which is TCG-only).
-        CPU_ARGS="-cpu host -accel hvf"
-    else
-        CPU_ARGS="-cpu max"
-    fi
+    # -cpu host: real host ID registers, required by HVF/KVM passthrough
+    # (vs. -cpu max's synthesized model, which is TCG-only).
+    case "$ACCEL" in
+        hvf) CPU_ARGS="-cpu host -accel hvf" ;;
+        kvm) CPU_ARGS="-cpu host -accel kvm" ;;
+        *)   CPU_ARGS="-cpu max -accel tcg" ;;
+    esac
     DISK_IMAGE="leandros-limine-aarch64.img"
 else
     QEMU_SYSTEM="qemu-system-x86_64"
     # 2 cores × 2 threads: exercises the scheduler's SMT-aware idle-CPU
     # selection (CPUID leaf 0xB reports the hyperthread topology).
     MACHINE_ARGS="-machine q35 -smp 4,sockets=1,cores=2,threads=2"
-    CPU_ARGS="-cpu max"
+    case "$ACCEL" in
+        kvm) CPU_ARGS="-cpu host -accel kvm" ;;
+        *)   CPU_ARGS="-cpu max -accel tcg" ;;
+    esac
     DISK_IMAGE="leandros-limine-x86_64.img"
 fi
 
@@ -97,6 +147,21 @@ else
         GL_ARGS=("-display" "default,gl=on")
     else
         GPU_DEV="virtio-gpu-pci"
+    fi
+fi
+
+# Select display. Without X or Wayland, QEMU's default GTK/SDL backend cannot
+# open and the run dies at startup — so a headless host (an SSH session on a
+# build box) must be told explicitly. egl-headless keeps the guest's virtio-gpu
+# GL-capable, which venus needs; it just renders offscreen. Applies to every
+# boot mode, so it lives before the boot-mode dispatch below.
+if [ "$OS" != "Darwin" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    if [ "${#GL_ARGS[@]}" -gt 0 ] && $QEMU_SYSTEM -display help 2>/dev/null | grep -q egl-headless; then
+        GL_ARGS=("-display" "egl-headless")
+        echo "🖥️  Headless host: using egl-headless (GL preserved)"
+    else
+        GL_ARGS=("-display" "none")
+        echo "🖥️  Headless host: using -display none"
     fi
 fi
 
@@ -158,18 +223,37 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
     for path in "${FW_PATHS[@]}"; do if [ -f "$path" ]; then UEFI_FIRMWARE="$path"; break; fi; done
     if [ -z "$UEFI_FIRMWARE" ]; then echo "❌ UEFI firmware not found"; exit 1; fi
     
-    # Select audio backend
+    # Locate a writable VARS template matching the firmware we picked.
+    VARS_TEMPLATE=""
+    VARS_PATHS=("${X86_64_VARS_PATHS[@]}")
+    if [ "$ARCH" = "aarch64" ]; then VARS_PATHS=("${AARCH64_VARS_PATHS[@]}"); fi
+    for path in "${VARS_PATHS[@]}"; do if [ -f "$path" ]; then VARS_TEMPLATE="$path"; break; fi; done
+
+    # Select audio backend. PulseAudio is not a safe default on Linux: a
+    # headless/SSH box usually has no sound daemon, and QEMU aborts at startup
+    # if the backend cannot open. Probe what this QEMU actually supports.
     if [[ "$OS" == "Darwin" ]]; then
         AUDIO_ARGS="-audiodev coreaudio,id=snd0"
     else
-        AUDIO_ARGS="-audiodev pa,id=snd0"
+        AUDIO_BACKENDS=$($QEMU_SYSTEM -audiodev help 2>/dev/null || true)
+        if [ -n "${PULSE_SERVER:-}" ] || [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/pulse/native" ]; then
+            AUDIO_ARGS="-audiodev pa,id=snd0"
+        elif grep -q '\bpipewire\b' <<<"$AUDIO_BACKENDS"; then
+            AUDIO_ARGS="-audiodev pipewire,id=snd0"
+        elif grep -q '\balsa\b' <<<"$AUDIO_BACKENDS"; then
+            AUDIO_ARGS="-audiodev alsa,id=snd0"
+        else
+            AUDIO_ARGS="-audiodev none,id=snd0"
+        fi
     fi
+
 
     if [ "$ARCH" = "aarch64" ]; then
         VARS_FILE="aarch64_vars.fd"
         if [ ! -f "$VARS_FILE" ]; then
-            # Create a local copy of vars if not present
-            cp /opt/homebrew/share/qemu/edk2-arm-vars.fd "$VARS_FILE" 2>/dev/null || dd if=/dev/zero of="$VARS_FILE" bs=1M count=64
+            # Copy the host's VARS template; fall back to a blank 64 MB region
+            # (edk2 will initialise it on first boot).
+            cp "$VARS_TEMPLATE" "$VARS_FILE" 2>/dev/null || dd if=/dev/zero of="$VARS_FILE" bs=1M count=64
         fi
 
         # disable-legacy=on forces non-transitional (modern) VirtIO for block
@@ -195,8 +279,18 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -device virtio-net-pci,netdev=net0,disable-legacy=on -netdev socket,id=net0,fd=3 -no-reboot)
     else
+        # A split firmware (OVMF_CODE*) is read-only and needs its writable VARS
+        # half as a second pflash unit; a combined image (OVMF.fd) does not.
+        # Arch ships only the split pair, which is why this is not optional.
+        X86_VARS_ARGS=()
+        if [[ "$(basename "$UEFI_FIRMWARE")" == *CODE* ]] && [ -n "$VARS_TEMPLATE" ]; then
+            X86_VARS_FILE="x86_64_vars.fd"
+            if [ ! -f "$X86_VARS_FILE" ]; then cp "$VARS_TEMPLATE" "$X86_VARS_FILE"; fi
+            X86_VARS_ARGS=(-drive "if=pflash,unit=1,format=raw,file=$X86_VARS_FILE")
+        fi
         QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 2G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
+            "${X86_VARS_ARGS[@]}" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
             -device virtio-blk-pci,drive=drive0,bootindex=0 \
             -drive if=none,id=data0,format=raw,file="$DATA0_IMG" \

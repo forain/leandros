@@ -26,6 +26,7 @@ import os
 import re
 import select
 import platform
+import shutil
 
 SERIAL_SOCK  = "/tmp/leandros-serial.sock"
 MONITOR_SOCK = "/tmp/leandros-monitor.sock"
@@ -41,12 +42,70 @@ AARCH64_FW_PATHS = [
     "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
     "/usr/share/AAVMF/AAVMF_CODE.fd",
     "/usr/share/edk2-armvirt/aarch64/QEMU_EFI-pflash.raw",
+    # Arch/EndeavourOS layout
+    "/usr/share/edk2/aarch64/QEMU_CODE.4m.fd",
+    "/usr/share/edk2/aarch64/QEMU_CODE.fd",
 ]
 X86_64_FW_PATHS = [
     "/opt/homebrew/share/qemu/edk2-x86_64-code.fd",
     "/usr/share/ovmf/OVMF.fd",
     "/usr/share/OVMF/OVMF_CODE.fd",
+    "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
+    # Arch/EndeavourOS layout
+    "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+    "/usr/share/edk2/x64/OVMF_CODE.fd",
 ]
+# Writable VARS templates matching the split CODE firmwares above. A combined
+# image (OVMF.fd) carries its own vars and needs none of these.
+AARCH64_VARS_PATHS = [
+    "/opt/homebrew/share/qemu/edk2-arm-vars.fd",
+    "/usr/share/edk2/aarch64/QEMU_VARS.4m.fd",
+    "/usr/share/edk2/aarch64/QEMU_VARS.fd",
+    "/usr/share/edk2-armvirt/aarch64/vars-template-pflash.raw",
+    "/usr/share/AAVMF/AAVMF_VARS.fd",
+]
+X86_64_VARS_PATHS = [
+    "/opt/homebrew/share/qemu/edk2-i386-vars.fd",
+    "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+    "/usr/share/edk2/x64/OVMF_VARS.fd",
+    "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd",
+    "/usr/share/OVMF/OVMF_VARS.fd",
+]
+
+
+def _host_arch():
+    """uname -m spelling normalised so arm64/aarch64 and x86_64/amd64 compare."""
+    m = platform.machine().lower()
+    if m in ("arm64", "aarch64"):
+        return "aarch64"
+    if m in ("x86_64", "amd64"):
+        return "x86_64"
+    return m
+
+
+def _kvm_usable(guest_arch: str) -> bool:
+    """KVM virtualises, it does not translate — the guest arch must match the
+    host's, and /dev/kvm must be usable by this user."""
+    return (
+        platform.system() == "Linux"
+        and _host_arch() == guest_arch
+        and os.access("/dev/kvm", os.R_OK | os.W_OK)
+    )
+
+
+def _accel_flags(guest_arch: str, mode: str):
+    """Best available accelerator for this host/guest pair.
+
+    -cpu host is required for hypervisor passthrough (real host ID registers);
+    -cpu max is a synthesised model that only TCG can implement.
+    """
+    if mode == "uefi-tcg":
+        return ["-cpu", "max", "-accel", "tcg"]
+    if mode == "uefi-hvf" or (guest_arch == "aarch64" and _is_apple_silicon()):
+        return ["-cpu", "host", "-accel", "hvf"]
+    if _kvm_usable(guest_arch):
+        return ["-cpu", "host", "-accel", "kvm"]
+    return ["-cpu", "max", "-accel", "tcg"]
 
 # VT100/ANSI escape sequence pattern — strips monitor line-editing noise
 _ANSI_RE = re.compile(rb"\x1b\[[^a-zA-Z]*[a-zA-Z]|[\x08]|\x1b=|\x1b>")
@@ -122,13 +181,7 @@ def _build_cmd(arch, mode="uefi"):
         # even on a non-Apple-Silicon host, where it will simply fail to launch.
         # The direct-kernel-boot path stays TCG-only regardless — it hits a
         # separate, still-unfixed QEMU PL011-timer hang under HVF.
-        if mode == "uefi-tcg":
-            use_hvf = False
-        elif mode == "uefi-hvf":
-            use_hvf = True
-        else:
-            use_hvf = _is_apple_silicon()
-        cpu_flags = ["-cpu", "host", "-accel", "hvf"] if use_hvf else ["-cpu", "max"]
+        cpu_flags = _accel_flags("aarch64", mode)
         vars_fd = os.path.join(REPO_ROOT, "aarch64_vars.fd")
         disk    = os.path.join(REPO_ROOT, "leandros-limine-aarch64.img")
         data0   = os.path.join(REPO_ROOT, "f2fs-data0-aarch64.img")
@@ -168,11 +221,23 @@ def _build_cmd(arch, mode="uefi"):
         disk  = os.path.join(REPO_ROOT, "leandros-limine-x86_64.img")
         data0 = os.path.join(REPO_ROOT, "f2fs-data0-x86_64.img")
         data1 = os.path.join(REPO_ROOT, "f2fs-data1-x86_64.img")
+        cpu_flags = _accel_flags("x86_64", mode)
+        # A split firmware (OVMF_CODE*) is read-only and needs its writable VARS
+        # half as a second pflash unit; a combined OVMF.fd carries its own.
+        vars_args = []
+        if "CODE" in os.path.basename(fw):
+            vars_tpl = _find_fw(X86_64_VARS_PATHS)
+            if vars_tpl:
+                vars_fd = os.path.join(REPO_ROOT, "x86_64_vars.fd")
+                if not os.path.exists(vars_fd):
+                    shutil.copyfile(vars_tpl, vars_fd)
+                vars_args = ["-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}"]
         return [
             "qemu-system-x86_64",
-            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", "-cpu", "max", "-m", "2G",
+            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", *cpu_flags, "-m", "2G",
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
+            *vars_args,
             "-drive", f"if=none,id=drive0,format=raw,file={disk}",
             "-device", "virtio-blk-pci,drive=drive0,bootindex=0",
             "-drive", f"if=none,id=data0,format=raw,file={data0}",
