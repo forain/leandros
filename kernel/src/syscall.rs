@@ -1599,7 +1599,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     let kind = vfs::vfs_get_node_kind(pid, fd);
     let mut phys_addr: usize = 0;
     
-    if let Some(vfs::VnodeKind::DynamicDevice { port, dev_id }) = kind {
+    if let Some(vfs::VnodeKind::DynamicDevice { port, dev_id, open_id }) = kind {
         if DBG_MMAP {
         crate::serial_print_str("[MMAP] DynamicDevice fd, off=");
         crate::serial_print_hex(off);
@@ -1612,6 +1612,9 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
         proxy_msg.data[8..16].copy_from_slice(&(0x1007u64).to_le_bytes()); // DRM_IOCTL_MMAP
         proxy_msg.data[16..24].copy_from_slice(&(off as u64).to_le_bytes()); // Pass requested physical address
         proxy_msg.data[24..32].copy_from_slice(&(pid as u64).to_le_bytes()); // PID
+        // Slot 4: the per-open identity, same as the VFS ioctl proxy sends, so
+        // a device server sees one consistent open across ioctl and mmap.
+        proxy_msg.data[32..40].copy_from_slice(&(open_id as u64).to_le_bytes());
 
         let reply = vfs::call_port(port, proxy_msg);
         if reply.tag == 0 {

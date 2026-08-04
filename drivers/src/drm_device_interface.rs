@@ -291,6 +291,21 @@ const VIRTGPU_PARAM_CONTEXT_INIT: u64 = 6;
 const VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs: u64 = 7;
 const VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME: u64 = 8;
 
+/// LeandrOS-PRIVATE debug param — NOT upstream ABI, and deliberately not in the
+/// upstream numbering. Reads back the virtgpu 3D context id bound to the
+/// *calling open* (0 = that open has no context yet).
+///
+/// Upstream virtgpu params are 1..=8 and Mesa only ever queries those, so a
+/// value this far above the range cannot collide with a param upstream might
+/// add later; a Mesa that has never heard of it simply never asks.
+///
+/// It exists because per-open context ownership is otherwise unobservable from
+/// userspace: with one global context slot, a submission on fd A still returns
+/// 0 while executing in fd B's context, so `ioctl(...) == 0` cannot tell a
+/// correct kernel from a broken one. `userland/venustest` phase 2 asserts on
+/// this value instead of on liveness.
+const VIRTGPU_PARAM_LEANDROS_CTX_ID: u64 = 0x1000_0001;
+
 /// `drm_virtgpu_context_set_param.param` values.
 const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
 const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
@@ -628,14 +643,102 @@ struct BlobBuf {
     order: usize,
     res_handle: u32,
     size: u64,
+    /// The 3D context this blob was attached to at creation (0 = none). Kept
+    /// per-blob because the context is now per-open: freeing the blob must
+    /// detach it from *its* context, not from whichever one happens to be
+    /// current.
+    ctx: u32,
 }
 
 static BLOB_BUFFERS: Mutex<BTreeMap<u32, BlobBuf>> = Mutex::new(BTreeMap::new());
 /// GEM handles for blob BOs. Kept well above the dumb-buffer handle space so a
 /// handle is unambiguously one or the other.
 static NEXT_BLOB_HANDLE: AtomicU32 = AtomicU32::new(0x4000);
-/// The 3D context created by DRM_IOCTL_VIRTGPU_CONTEXT_INIT (0 = none yet).
-static VIRTGPU_CTX_ID: AtomicU32 = AtomicU32::new(0);
+// ── Per-open 3D contexts ─────────────────────────────────────────────────────
+//
+// Linux keys the virtgpu 3D context off the open file (`struct drm_file`), so
+// two processes each holding card0 open get independent contexts. This table is
+// that keying: `open_id` is the VFS's opaque per-open cookie, delivered in ioctl
+// slot 4. It replaces a single global context id, which two Vulkan clients
+// would stomp on each other.
+//
+// LOCK ORDER: VIRTGPU_CTXS is a leaf. Never hold it across `VIRTIO_GPU.lock()`
+// and never across a user-memory access — a demand fault taken under a spinlock
+// is the 82d0cc3 all-vCPU freeze class.
+const MAX_GPU_CTXS: usize = 16;
+
+#[derive(Clone, Copy)]
+struct GpuCtx {
+    /// VFS open cookie; 0 marks a free slot.
+    open_id: u32,
+    /// Host context id from `ctx_create`.
+    ctx_id: u32,
+    /// VIRTGPU_CONTEXT_PARAM_CAPSET_ID the context was created with.
+    capset: u32,
+}
+
+impl GpuCtx {
+    const fn empty() -> Self { Self { open_id: 0, ctx_id: 0, capset: 0 } }
+}
+
+static VIRTGPU_CTXS: Mutex<[GpuCtx; MAX_GPU_CTXS]> =
+    Mutex::new([GpuCtx::empty(); MAX_GPU_CTXS]);
+
+/// The whole binding for `open_id`, or None if it has no context. open_id 0
+/// (an untracked caller — the legacy `Driver::handle` path) never has one.
+fn ctx_lookup_entry(open_id: u32) -> Option<GpuCtx> {
+    if open_id == 0 { return None; }
+    let t = VIRTGPU_CTXS.lock();
+    t.iter().find(|c| c.open_id == open_id).copied()
+}
+
+/// Host 3D context id bound to `open_id`, or 0 if it has none.
+fn ctx_lookup(open_id: u32) -> u32 {
+    ctx_lookup_entry(open_id).map(|c| c.ctx_id).unwrap_or(0)
+}
+
+/// `ctx_bind` failure. The value distinguishes the two cases:
+///   * 0                — no slot left in VIRTGPU_CTXS (or `open_id` was 0,
+///                        which can never own a context). Fatal for the ioctl.
+///   * any other value  — a concurrent CONTEXT_INIT on the SAME open won the
+///                        race; the value is the ctx_id it bound. The caller
+///                        must destroy the context it just created and report
+///                        success, because the open does now have a context.
+const CTX_BIND_NO_SLOT: u32 = 0;
+
+fn ctx_bind(open_id: u32, ctx_id: u32, capset: u32) -> Result<(), u32> {
+    if open_id == 0 { return Err(CTX_BIND_NO_SLOT); }
+    let mut t = VIRTGPU_CTXS.lock();
+    if let Some(c) = t.iter().find(|c| c.open_id == open_id) {
+        // Non-zero by construction: only a successful ctx_create gets bound.
+        return Err(c.ctx_id);
+    }
+    match t.iter_mut().find(|c| c.open_id == 0) {
+        Some(slot) => { *slot = GpuCtx { open_id, ctx_id, capset }; Ok(()) }
+        None => Err(CTX_BIND_NO_SLOT),
+    }
+}
+
+/// The last fd on a card0 open closed: tear down that open's 3D context.
+/// Called from the DRM server's VFS_CLOSE arm.
+pub fn drm_release_open(open_id: u32) {
+    if open_id == 0 { return; }
+    // Take the slot and DROP the guard before touching the device — see the
+    // lock-order note above.
+    let ctx = {
+        let mut t = VIRTGPU_CTXS.lock();
+        match t.iter_mut().find(|c| c.open_id == open_id) {
+            Some(c) => { let id = c.ctx_id; *c = GpuCtx::empty(); id }
+            None => 0,
+        }
+    };
+    if ctx == 0 { return; }
+    let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+    if let Some(gpu) = guard.as_mut() {
+        gpu.ctx_destroy(ctx);
+    }
+}
+
 /// Fence id produced by the most recent EXECBUFFER, for VIRTGPU_WAIT.
 static LAST_EXEC_FENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -861,8 +964,14 @@ impl DrmDeviceInterface {
         }
     }
 
-    /// Handle incoming IPC messages
-    pub fn handle_ioctl(&mut self, cmd: u32, arg: usize) -> Result<usize, DriverError> {
+    /// Handle incoming IPC messages.
+    ///
+    /// `open_id` identifies which *open* of card0 this ioctl arrived on (the
+    /// VFS's per-open cookie, ioctl slot 4). It is a parameter, not state on
+    /// `self`, because port handlers run synchronously on the caller's thread:
+    /// this method is re-entrant across clients and faults on user memory.
+    /// 0 means "no open identity" — the 3D arms refuse it.
+    pub fn handle_ioctl(&mut self, cmd: u32, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         crate::pci::rdebug("[DRM-IF] handle_ioctl cmd=");
         crate::pci::rdebug_hex(cmd);
         crate::pci::rdebug("\n");
@@ -906,13 +1015,13 @@ impl DrmDeviceInterface {
 
             // ── Virtio-GPU 3D IOCTLs (lock VIRTIO_GPU, not the DRM device) ──
             DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => self.virtgpu_handle_resource_create(arg),
-            DRM_IOCTL_VIRTGPU_EXECBUFFER => self.virtgpu_handle_execbuffer(arg),
+            DRM_IOCTL_VIRTGPU_EXECBUFFER => self.virtgpu_handle_execbuffer(arg, open_id),
             DRM_IOCTL_VIRTGPU_GET_CAPS => self.virtgpu_handle_get_caps(arg),
             DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => self.virtgpu_handle_transfer_to_host(arg),
             DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => self.virtgpu_handle_transfer_from_host(arg),
-            DRM_IOCTL_VIRTGPU_GETPARAM => self.virtgpu_handle_getparam(arg),
-            DRM_IOCTL_VIRTGPU_CONTEXT_INIT => self.virtgpu_handle_context_init(arg),
-            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => self.virtgpu_handle_resource_create_blob(arg),
+            DRM_IOCTL_VIRTGPU_GETPARAM => self.virtgpu_handle_getparam(arg, open_id),
+            DRM_IOCTL_VIRTGPU_CONTEXT_INIT => self.virtgpu_handle_context_init(arg, open_id),
+            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => self.virtgpu_handle_resource_create_blob(arg, open_id),
             DRM_IOCTL_VIRTGPU_MAP => self.virtgpu_handle_map(arg),
             DRM_IOCTL_VIRTGPU_WAIT => self.virtgpu_handle_wait(arg),
 
@@ -2053,7 +2162,10 @@ impl DrmDeviceInterface {
             Some(b) => b,
             None => return,
         };
-        let ctx = VIRTGPU_CTX_ID.load(Ordering::Relaxed);
+        // The context this blob was actually attached to. GEM_CLOSE carries no
+        // open identity (it is a plain handle op, and the handle space is
+        // global), so the binding has to be remembered on the blob itself.
+        let ctx = b.ctx;
         {
             let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
             if let Some(gpu) = guard.as_mut() {
@@ -2302,7 +2414,7 @@ impl DrmDeviceInterface {
     /// The previous implementation bound `_exec` and never touched it, then
     /// submitted `&[]`: every command stream userspace ever produced was thrown
     /// away while the ioctl reported success.
-    fn virtgpu_handle_execbuffer(&mut self, arg: usize) -> Result<usize, DriverError> {
+    fn virtgpu_handle_execbuffer(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         // Read the request out of user memory BEFORE any device lock is taken.
         let exec = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_execbuffer) };
@@ -2313,7 +2425,7 @@ impl DrmDeviceInterface {
         let size = exec.size as usize;
         if size > MAX_CMD_BYTES { return Err(DriverError::InvalidParameter); }
 
-        let ctx = VIRTGPU_CTX_ID.load(Ordering::Relaxed);
+        let ctx = ctx_lookup(open_id);
         if ctx == 0 {
             crate::pci::serial_debug("[DRM] EXECBUFFER before CONTEXT_INIT\n");
             return Err(DriverError::InvalidParameter);
@@ -2392,9 +2504,24 @@ impl DrmDeviceInterface {
     /// will do anything else and refuses to proceed if they read back wrong, so
     /// each answer is derived from what was actually negotiated rather than
     /// hardcoded.
-    fn virtgpu_handle_getparam(&mut self, arg: usize) -> Result<usize, DriverError> {
+    ///
+    /// `open_id` is threaded in the same way EXECBUFFER / CONTEXT_INIT /
+    /// RESOURCE_CREATE_BLOB already take it, and for the same reason: one param
+    /// (`VIRTGPU_PARAM_LEANDROS_CTX_ID`) answers about the calling open rather
+    /// than about the device.
+    fn virtgpu_handle_getparam(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let req = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_getparam) };
+
+        // Answered before any device lock is taken. It is pure per-open
+        // bookkeeping (no device round-trip), and taking VIRTGPU_CTXS
+        // underneath VIRTIO_GPU would invert the lock order documented on
+        // VIRTGPU_CTXS. It also stays answerable when the GPU is absent.
+        if req.param == VIRTGPU_PARAM_LEANDROS_CTX_ID {
+            let ctx = ctx_lookup(open_id) as u64;
+            unsafe { (arg as *mut u64).add(1).write_volatile(ctx) };
+            return Ok(0);
+        }
 
         let value: u64 = {
             let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
@@ -2442,29 +2569,12 @@ impl DrmDeviceInterface {
 
     /// DRM_IOCTL_VIRTGPU_CONTEXT_INIT — create the 3D context whose type is
     /// selected by VIRTGPU_CONTEXT_PARAM_CAPSET_ID (4 = Venus).
-    fn virtgpu_handle_context_init(&mut self, arg: usize) -> Result<usize, DriverError> {
+    fn virtgpu_handle_context_init(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let init = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_context_init) };
         let n = init.num_params as usize;
         if init.ctx_set_params == 0 || n == 0 || n > 8 {
             return Err(DriverError::InvalidParameter);
-        }
-        // Linux keys the 3D context off the open file (`drm_file`) and returns
-        // EEXIST for a second init on the same one. This server keeps no per-fd
-        // state, so the context is process-global: a second *process* opening
-        // card0 would otherwise be permanently refused, because the previous
-        // process's context id outlives it. Until per-fd state exists, tear the
-        // old context down and create a fresh one.
-        //
-        // KNOWN LIMITATION (blocks M2): two clients with live contexts at the
-        // same time will stomp each other. Mesa opens one card0 per process, so
-        // this needs per-fd context state before multiple Vulkan apps can run.
-        let prev = VIRTGPU_CTX_ID.swap(0, Ordering::Relaxed);
-        if prev != 0 {
-            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
-            if let Some(gpu) = guard.as_mut() {
-                gpu.ctx_destroy(prev);
-            }
         }
 
         // Copy the whole param array before locking anything.
@@ -2493,13 +2603,43 @@ impl DrmDeviceInterface {
             return Err(DriverError::InvalidParameter);
         }
 
+        // Second CONTEXT_INIT on the SAME open. Linux answers EEXIST here.
+        //
+        // TODO(errno): we answer Ok(0) instead, and that is a deliberate
+        // deviation — servers/drm/src/lib.rs collapses every Err from this
+        // function to err_reply(-1) (EPERM), so EEXIST is simply not
+        // expressible without plumbing real errnos through
+        // Result<usize, DriverError>. Reporting success for a re-init with the
+        // capset the open already has is the harmless reading; a re-init asking
+        // for a *different* capset is genuinely wrong, so that still fails.
+        if let Some(existing) = ctx_lookup_entry(open_id) {
+            return if existing.capset == capset_id {
+                Ok(0)
+            } else {
+                Err(DriverError::InvalidParameter)
+            };
+        }
+
         let ctx = {
             let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
             let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
             gpu.ctx_create(capset_id, "leandros-venus")
                 .map_err(|_| DriverError::Io)?
         };
-        VIRTGPU_CTX_ID.store(ctx, Ordering::Relaxed);
+        if let Err(winner) = ctx_bind(open_id, ctx, capset_id) {
+            // Nothing else may reach this context, so drop it either way.
+            {
+                let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+                if let Some(gpu) = guard.as_mut() { gpu.ctx_destroy(ctx); }
+            }
+            if winner != CTX_BIND_NO_SLOT {
+                // A concurrent init on this same open got there first; the open
+                // has a context, which is all the caller asked for.
+                return Ok(0);
+            }
+            crate::pci::serial_debug("[DRM] CONTEXT_INIT: no free per-open context slot\n");
+            return Err(DriverError::Io);
+        }
         crate::pci::serial_debug("[DRM] virtgpu context created, capset=");
         crate::pci::serial_debug_hex(capset_id);
         crate::pci::serial_debug(" ctx_id=");
@@ -2509,7 +2649,7 @@ impl DrmDeviceInterface {
     }
 
     /// DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB.
-    fn virtgpu_handle_resource_create_blob(&mut self, arg: usize) -> Result<usize, DriverError> {
+    fn virtgpu_handle_resource_create_blob(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let req =
             unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_resource_create_blob) };
@@ -2535,7 +2675,7 @@ impl DrmDeviceInterface {
             0
         };
 
-        let ctx = VIRTGPU_CTX_ID.load(Ordering::Relaxed);
+        let ctx = ctx_lookup(open_id);
         let backing = if guest_backed { Some((phys as u64, size as u32)) } else { None };
 
         let res_handle = {
@@ -2563,7 +2703,7 @@ impl DrmDeviceInterface {
         let handle = NEXT_BLOB_HANDLE.fetch_add(1, Ordering::Relaxed);
         BLOB_BUFFERS.lock().insert(
             handle,
-            BlobBuf { phys, order, res_handle, size: req.size },
+            BlobBuf { phys, order, res_handle, size: req.size, ctx },
         );
 
         // Write back only bo_handle (offset 8) and res_handle (offset 12) rather
@@ -2656,7 +2796,12 @@ impl Driver for DrmDeviceInterface {
             0
         };
 
-        match self.handle_ioctl(cmd, arg) {
+        // open_id 0: this legacy path is a raw port message with no VFS fd
+        // behind it, so it carries no open identity. The 3D arms (CONTEXT_INIT,
+        // EXECBUFFER, RESOURCE_CREATE_BLOB) therefore fail here by design.
+        // Nothing routes real traffic through it — /dev/dri/card0 goes via
+        // VFS_IOCTL in servers/drm.
+        match self.handle_ioctl(cmd, arg, 0) {
             Ok(result) => {
                 let mut response = ipc::Message::empty();
                 response.tag = 0; // Success

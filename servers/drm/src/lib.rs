@@ -67,6 +67,11 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
     if msg.tag == 0x28 { // VFS_IOCTL
         let cmd = arg(msg, 1) as u32;
         let arg_val = arg(msg, 2) as usize;
+        // Slot 4 is the VFS's per-open cookie (see VnodeKind::DynamicDevice).
+        // It has to be a parameter rather than state on INTERFACE: port
+        // handlers run synchronously on the calling thread, so this handler is
+        // re-entrant across clients.
+        let open_id = arg(msg, 4) as u32;
 
         serial_debug("[DRM-SRV] handle VFS_IOCTL cmd=");
         serial_debug_hex(cmd);
@@ -74,7 +79,7 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
 
         // Since we are called via a direct handler, we are in the caller's address space.
         // No need to switch address space.
-        let res = match interface.handle_ioctl(cmd, arg_val) {
+        let res = match interface.handle_ioctl(cmd, arg_val, open_id) {
             Ok(result) => val_reply(result as u64),
             Err(_) => err_reply(-1),
         };
@@ -128,7 +133,16 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         m.data[0..8].copy_from_slice(&(revents as u64).to_le_bytes());
         m.data[8..16].copy_from_slice(&(seq as u64).to_le_bytes());
         m
-    } else if msg.tag == vfs_server::VFS_CLOSE || msg.tag == vfs_server::VFS_CLOSE_ALL {
+    } else if msg.tag == vfs_server::VFS_CLOSE {
+        // The VFS sends this once the LAST fd on this open is gone, with the
+        // open cookie in slot 1. Retire whatever that open owned (its virtgpu
+        // 3D context) before the generic release.
+        drivers::drm_device_interface::drm_release_open(arg(msg, 1) as u32);
+        interface.release();
+        ok_reply()
+    } else if msg.tag == vfs_server::VFS_CLOSE_ALL {
+        // Dead code today — the VFS retires fds one at a time through
+        // release_vnode, so card0 never sees this. No open identity to key on.
         interface.release();
         ok_reply()
     } else {

@@ -719,7 +719,13 @@ pub enum VnodeKind {
     /// /dev/fb0 — linear framebuffer.
     DevFb { pos: usize },
     /// Dynamically registered device proxy.
-    DynamicDevice { port: u32, dev_id: u32 },
+    ///
+    /// `open_id` is an opaque per-*open* cookie (see `DEVICE_OPEN_REFS`), the
+    /// VFS-side stand-in for Linux's `struct file`. Two `open("/dev/dri/card0")`
+    /// calls get two different `open_id`s; dup/fork/SCM_RIGHTS copies of one fd
+    /// all carry the same one. Device servers use it to key per-open state
+    /// (the virtgpu 3D context) instead of keeping one global.
+    DynamicDevice { port: u32, dev_id: u32, open_id: u32 },
     /// File or directory on a mounted filesystem (F2FS, etc.).
     MountedFile { port: u32, file_id: u32 },
     /// signalfd: POLLIN iff a signal in `mask` is pending for the caller;
@@ -730,6 +736,13 @@ pub enum VnodeKind {
     /// `next_wd` hands out monotonic watch descriptors (≥1).
     Inotify { next_wd: u32 },
 }
+
+// `VnodeKind` is embedded in `FdEntry`, and the fd tables are a static
+// `[[FdEntry; MAX_FDS]; MAX_PROCS]` — every byte added here costs 8K of BSS.
+// 32 is the size before `DynamicDevice` grew its `open_id` (the `RamFile`
+// variant, a 16-byte slice plus a usize, sets the floor), and it must stay
+// that size: adding the u32 has to land in padding, not widen the enum.
+const _: () = assert!(::core::mem::size_of::<VnodeKind>() <= 32);
 
 /// True if `fd` was opened with (or fcntl'd to) O_NONBLOCK. The kernel's
 /// sys_read EAGAIN retry loop consults this: blocking fds yield-and-retry,
@@ -1017,6 +1030,11 @@ fn pipe_ref_inc(kind: &VnodeKind) {
         // slot refcount so the pool entry survives until the last fd closes.
         VnodeKind::EventFd { slot } => { EVENTFD_REFS.lock()[*slot] += 1; }
         VnodeKind::TimerFd { slot } => { TIMERFD_REFS.lock()[*slot] += 1; }
+        // A dynamic-device open is shared by every duplicate of its fd, so the
+        // device server must not be told "closed" until the last one goes. This
+        // one arm covers dup/dup2/dup3, fcntl(F_DUPFD{,_CLOEXEC}), fork
+        // inheritance and SCM_RIGHTS export — they all funnel through here.
+        VnodeKind::DynamicDevice { open_id, .. } => device_open_inc(*open_id),
         _ => {}
     }
 }
@@ -1062,6 +1080,12 @@ fn pipe_ref_dec(kind: &VnodeKind) {
             let mut refs = TIMERFD_REFS.lock();
             refs[*slot] = refs[*slot].saturating_sub(1);
             if refs[*slot] == 0 { TIMERFD_POOL.lock()[*slot] = TimerFdEntry::free(); }
+        }
+        // Symmetric with pipe_ref_inc. This also closes a pre-existing leak:
+        // the dup2/dup3 overwrite path retired a dynamic-device fd without ever
+        // sending VFS_CLOSE, so the server kept the open alive forever.
+        VnodeKind::DynamicDevice { port, dev_id, open_id } => {
+            device_close(*port, *dev_id, *open_id);
         }
         _ => {}
     }
@@ -1227,6 +1251,86 @@ impl ProcFdTable {
 
 static FD_TABLES: Mutex<[ProcFdTable; MAX_PROCS]> =
     Mutex::new([const { ProcFdTable::empty() }; MAX_PROCS]);
+
+// ── Dynamic-device open identities ───────────────────────────────────────────
+//
+// A device server needs to distinguish "a second fd on the same open" (dup,
+// fork, SCM_RIGHTS) from "a second, independent open of the device". The fd
+// tables cannot answer that on their own, and a refcount recovered by scanning
+// FD_TABLES is wrong besides: `export_fd` lifts an entry OUT of every table
+// into an in-flight `TransferFd`, so a scan sees zero references during the
+// window an SCM_RIGHTS descriptor is queued.
+//
+// So each open of a dynamic device takes a slot here, and the slot id travels
+// inside the `VnodeKind` — copied for free by every path that copies an fd
+// entry, refcounted by the same `pipe_ref_inc`/`pipe_ref_dec` pair that already
+// refcounts pipe endpoints and eventfd/timerfd pool slots.
+// Sized for a full desktop session, not just the GPU: this pool is shared by
+// every dynamic device, so a COSMIC session's evdev/console/pipewire opens draw
+// from it too, and exhaustion surfaces as ENFILE on open() rather than anything
+// diagnosable. 4 KiB of BSS is the cheaper side of that trade.
+const MAX_DEVICE_OPENS: usize = 1024;
+
+/// Parked value for a slot whose VFS_CLOSE is still in flight to the server.
+/// The allocator only takes slots reading 0, so this keeps a concurrent open
+/// from reusing (and thereby aliasing) an identity the server is still tearing
+/// down.
+const DEVICE_OPEN_CLOSING: u32 = u32::MAX;
+
+static DEVICE_OPEN_REFS: Mutex<[u32; MAX_DEVICE_OPENS]> =
+    Mutex::new([0u32; MAX_DEVICE_OPENS]);
+
+/// Claim a fresh open identity, returning `slot + 1` so that 0 is an
+/// unambiguous "this vnode carries no open id". 0 is also returned when the
+/// table is full (caller answers ENFILE).
+fn device_open_alloc() -> u32 {
+    let mut refs = DEVICE_OPEN_REFS.lock();
+    match refs.iter().position(|&r| r == 0) {
+        Some(i) => { refs[i] = 1; (i + 1) as u32 }
+        None    => 0,
+    }
+}
+
+/// Index of a live open id, or None for the untracked id 0 / an out-of-range id.
+fn device_open_idx(open_id: u32) -> Option<usize> {
+    if open_id == 0 { return None; }
+    let i = (open_id - 1) as usize;
+    if i < MAX_DEVICE_OPENS { Some(i) } else { None }
+}
+
+/// One more fd now refers to this open (dup/dup2/dup3/F_DUPFD, fork
+/// inheritance, or an SCM_RIGHTS descriptor in flight).
+fn device_open_inc(open_id: u32) {
+    if let Some(i) = device_open_idx(open_id) {
+        let mut refs = DEVICE_OPEN_REFS.lock();
+        if refs[i] != DEVICE_OPEN_CLOSING { refs[i] = refs[i].saturating_add(1); }
+    }
+}
+
+/// Drop one fd's reference to a dynamic-device open. The server is told
+/// (VFS_CLOSE) only when the LAST fd goes away — previously every close of a
+/// duplicate sent one, and the dup2-overwrite path sent none at all.
+///
+/// Caller must NOT hold FD_TABLES: this makes an IPC round-trip to the device
+/// server, which re-enters the VFS.
+fn device_close(port: u32, dev_id: u32, open_id: u32) {
+    let idx = device_open_idx(open_id);
+    if let Some(i) = idx {
+        let mut refs = DEVICE_OPEN_REFS.lock();
+        if refs[i] == DEVICE_OPEN_CLOSING { return; }
+        refs[i] = refs[i].saturating_sub(1);
+        if refs[i] != 0 { return; }
+        refs[i] = DEVICE_OPEN_CLOSING;
+    }
+    let mut close_msg = Message::empty();
+    close_msg.tag = VFS_CLOSE;
+    close_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
+    close_msg.data[8..16].copy_from_slice(&(open_id as u64).to_le_bytes());
+    let _ = call_port(port, close_msg);
+    // Free the slot only after the close has been delivered — the server drops
+    // state keyed by this open_id inside that call.
+    if let Some(i) = idx { DEVICE_OPEN_REFS.lock()[i] = 0; }
+}
 
 static INITRD_BASE: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
 static INITRD_SIZE: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
@@ -2736,8 +2840,17 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 let devices = DYNAMIC_DEVICES.lock();
                 devices.iter()
                     .find(|d| d.in_use && d.path.as_bytes() == lookup_path)
-                    .map(|d| VnodeKind::DynamicDevice { port: d.port, dev_id: d.dev_id })
+                    .map(|d| VnodeKind::DynamicDevice {
+                        port: d.port, dev_id: d.dev_id, open_id: 0,
+                    })
             };
+            // Claim the open identity out here, NOT inside the `.map()` above:
+            // that closure runs while the DYNAMIC_DEVICES guard is still held,
+            // and device_open_alloc takes another lock.
+            if let Some(VnodeKind::DynamicDevice { open_id, .. }) = &mut found {
+                *open_id = device_open_alloc();
+                if *open_id == 0 { return err_reply(-23); } // ENFILE
+            }
             if found.is_none() {
                 for entry in RAMFS {
                     if lookup_path == entry.path {
@@ -2822,14 +2935,27 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
     }
 
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match get_or_create(pid, &mut *tbls) {
-        Some(t) => t,
-        None    => return err_reply(-12),
+    let installed = {
+        let mut tbls = FD_TABLES.lock();
+        match get_or_create(pid, &mut *tbls) {
+            None => Err(-12),
+            Some(tbl) => match tbl.alloc_fd() {
+                None     => Err(-24),
+                Some(fd) => { tbl.fds[fd] = FdEntry { kind, flags, in_use: true }; Ok(fd) }
+            },
+        }
     };
-    let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
-    tbl.fds[fd] = FdEntry { kind, flags, in_use: true };
-    val_reply(fd as u64)
+    match installed {
+        Ok(fd) => val_reply(fd as u64),
+        Err(e) => {
+            // The open identity claimed above has no fd to own it; release it
+            // (and tell the server) rather than leaking the slot.
+            if let VnodeKind::DynamicDevice { port, dev_id, open_id } = kind {
+                device_close(port, dev_id, open_id);
+            }
+            err_reply(e)
+        }
+    }
 }
 
 fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
@@ -2886,7 +3012,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             *pos = cur + n;
             val_reply(n as u64)
         }
-        VnodeKind::DynamicDevice { port, dev_id } => {
+        VnodeKind::DynamicDevice { port, dev_id, .. } => {
             let port = *port;
             let dev_id = *dev_id;
             drop(tbls);
@@ -3180,7 +3306,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             
             val_reply(n as u64)
         }
-        VnodeKind::DynamicDevice { port, dev_id } => {
+        VnodeKind::DynamicDevice { port, dev_id, .. } => {
             let port = *port;
             let dev_id = *dev_id;
             drop(tbls);
@@ -3240,11 +3366,8 @@ fn handle_close(pid: u32, fd: usize) -> Message {
             refs[slot] = refs[slot].saturating_sub(1);
             if refs[slot] == 0 { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); }
         }
-        VnodeKind::DynamicDevice { port, dev_id } => {
-            let mut close_msg = Message::empty();
-            close_msg.tag = VFS_CLOSE;
-            close_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
-            let _ = call_port(port, close_msg);
+        VnodeKind::DynamicDevice { port, dev_id, open_id } => {
+            device_close(port, dev_id, open_id);
         }
         VnodeKind::MountedFile { port, file_id } => {
             // A dup'd fd shares this (port, file_id), so the mount server's
@@ -3589,11 +3712,8 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
             refs[slot] = refs[slot].saturating_sub(1);
             if refs[slot] == 0 { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); }
         }
-        VnodeKind::DynamicDevice { port, dev_id } => {
-            let mut close_msg = Message::empty();
-            close_msg.tag = VFS_CLOSE;
-            close_msg.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
-            let _ = call_port(port, close_msg);
+        VnodeKind::DynamicDevice { port, dev_id, open_id } => {
+            device_close(port, dev_id, open_id);
         }
         VnodeKind::TmpFile { idx, .. } => tmp_release_ephemeral(idx),
         _ => {}
@@ -4629,9 +4749,10 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
 
 
-    if let VnodeKind::DynamicDevice { port, dev_id } = &tbl.fds[fd].kind {
+    if let VnodeKind::DynamicDevice { port, dev_id, open_id } = &tbl.fds[fd].kind {
         let port = *port;
         let dev_id = *dev_id;
+        let open_id = *open_id;
         drop(tbls);
 
         let mut proxy_msg = Message::empty();
@@ -4640,6 +4761,10 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
         proxy_msg.data[8..16].copy_from_slice(&(cmd as u64).to_le_bytes());
         proxy_msg.data[16..24].copy_from_slice(&(arg as u64).to_le_bytes());
         proxy_msg.data[24..32].copy_from_slice(&(pid as u64).to_le_bytes());
+        // Slot 4: which *open* of the device this ioctl is on. Device servers
+        // key per-open state off it (virtgpu's 3D context); servers that don't
+        // care simply never read it.
+        proxy_msg.data[32..40].copy_from_slice(&(open_id as u64).to_le_bytes());
 
         let reply = call_port(port, proxy_msg);
         return reply;
@@ -4766,7 +4891,7 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             drop(tbls);
             (0, 0) // never fires — accepted watches silently produce no events
         }
-        VnodeKind::DynamicDevice { port, dev_id } => {
+        VnodeKind::DynamicDevice { port, dev_id, .. } => {
             let port = *port;
             let dev_id = *dev_id;
             drop(tbls);
@@ -6216,7 +6341,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
     // A dynamic device node (DRM card0, evdev eventN) must report its real
     // st_rdev — libdrm computes major(st_rdev)==226 to find /sys/dev/char/226:0,
     // and libudev keys on it. The rdev comes from the registry (port, dev_id).
-    if let VnodeKind::DynamicDevice { port, dev_id } = kind {
+    if let VnodeKind::DynamicDevice { port, dev_id, .. } = kind {
         let rdev = lookup_device_rdev(port, dev_id);
         write_stat_full_rdev(stat_ptr, S_IFCHR | 0o666, 1, 0, 0, 0, 0, rdev);
         return ok_reply();

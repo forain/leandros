@@ -14,6 +14,23 @@
 //! GET_CAPS + non-zero assertion; RESOURCE_CREATE_BLOB + MAP + mmap
 //! write/readback; EXECBUFFER + WAIT.
 //!
+//! Phase 2 is the regression for per-open-file 3D contexts, and it asserts on
+//! context IDENTITY, not on liveness. That distinction is the whole point:
+//! `ioctl(...) == 0` cannot see this bug. With one process-global context slot,
+//! fd B's CONTEXT_INIT leaves a *live, valid* context in the global, so a
+//! submission on fd A still returns 0 — while executing in fd B's context. So
+//! phase 2 reads the context id bound to each open back out of the kernel
+//! (`VIRTGPU_PARAM_LEANDROS_CTX_ID`, a LeandrOS-private GETPARAM that answers
+//! for the CALLING open) and asserts that two opens get different ids and that
+//! one open's id is unperturbed by anything the other open does — a second
+//! independent open, a same-fd re-init, a close of the *other* fd, a dup(), and
+//! a fork(). The liveness EXECBUFFER checks are kept alongside; they are cheap,
+//! but they are not what catches the regression.
+//!
+//! Phase 3 exhausts the per-open context table (MAX_GPU_CTXS = 16 slots): 16
+//! opens must get 16 distinct contexts, the 17th must be refused cleanly rather
+//! than panic or alias, and closing them all must return the slots.
+//!
 //! Prints "<name>: PASS"/"<name>: FAIL"; exit code is the failure count.
 
 #![no_std]
@@ -32,6 +49,7 @@ const O_RDWR: c_int = 0o2;
 const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x1;
+const MAP_ANONYMOUS: c_int = 0x20;
 
 // ── virtgpu_drm.h ioctl codes ────────────────────────────────────────────────
 // DRM_IOWR(DRM_COMMAND_BASE + nr, struct):
@@ -50,6 +68,9 @@ const VIRTGPU_PARAM_RESOURCE_BLOB: u64 = 3;
 const VIRTGPU_PARAM_HOST_VISIBLE: u64 = 4;
 const VIRTGPU_PARAM_CONTEXT_INIT: u64 = 6;
 const VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs: u64 = 7;
+/// LeandrOS-private (NOT upstream): the 3D context id bound to the calling
+/// open, 0 if that open has none. See drivers/src/drm_device_interface.rs.
+const VIRTGPU_PARAM_LEANDROS_CTX_ID: u64 = 0x1000_0001;
 
 const VIRTGPU_DRM_CAPSET_VENUS: u32 = 4;
 
@@ -138,6 +159,8 @@ struct DrmVirtgpu3dWait {
     flags: u32,
 }
 
+type pid_t = i32;
+
 extern "C" {
     pub fn relibc_start_v1(
         sp: *const c_void,
@@ -151,7 +174,19 @@ extern "C" {
     pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     pub fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int,
                 fd: c_int, offset: i64) -> *mut c_void;
+
+    // Used only by phase 2 (multi-fd context isolation); same relibc-linked
+    // idiom as forktest/polltest (fork/waitpid, dup) rather than raw syscalls.
+    pub fn dup(fildes: c_int) -> c_int;
+    pub fn fork() -> pid_t;
+    pub fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_int) -> pid_t;
+    pub fn _exit(status: c_int) -> !;
 }
+
+// WEXITSTATUS / WIFEXITED on the musl/Linux wait-status encoding (same as
+// forktest): a normal exit is `(code & 0xff) << 8`, low 7 bits = signal.
+fn wifexited(status: c_int) -> bool { (status & 0x7f) == 0 }
+fn wexitstatus(status: c_int) -> c_int { (status >> 8) & 0xff }
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
@@ -232,6 +267,119 @@ unsafe fn getparam(fd: c_int, param: u64, name: &[u8]) -> u64 {
     out_hex(gp.value);
     out(b")\n");
     gp.value
+}
+
+/// Returned by `ctx_id` when the readback ioctl itself failed. Distinct from a
+/// legitimate 0 ("this open has no context"), and never equal to a real id.
+const CTX_UNKNOWN: u64 = u64::MAX;
+
+/// The 3D context id the kernel has bound to *this fd's open*. This is the one
+/// observation that distinguishes per-open contexts from a global one: on a
+/// kernel with a single global slot every fd reports the same (most recently
+/// created) id, no matter which fd asks.
+unsafe fn ctx_id(fd: c_int) -> u64 {
+    let mut gp = DrmVirtgpuGetparam {
+        param: VIRTGPU_PARAM_LEANDROS_CTX_ID,
+        value: 0,
+    };
+    if ioctl(fd, DRM_IOCTL_VIRTGPU_GETPARAM, &mut gp as *mut _) != 0 {
+        return CTX_UNKNOWN;
+    }
+    gp.value
+}
+
+fn out_ctx(v: u64) {
+    if v == CTX_UNKNOWN {
+        out(b"<readback ioctl failed>");
+    } else {
+        out_u64(v);
+    }
+}
+
+/// Identity assertion: the context id `actual` must be exactly `expected`.
+///
+/// An `expected` of 0 or CTX_UNKNOWN can never satisfy this — otherwise a
+/// kernel that failed every readback would "match" itself and PASS. Both values
+/// are printed on failure so a FAIL says which id was seen instead.
+fn report_ctx_eq(name: &[u8], expected: u64, actual: u64) -> bool {
+    let ok = expected != 0 && expected != CTX_UNKNOWN && actual == expected;
+    if !ok {
+        out(b"  expected ctx_id = ");
+        out_ctx(expected);
+        out(b", actual ctx_id = ");
+        out_ctx(actual);
+        out(b"\n");
+    }
+    report(name, ok)
+}
+
+/// The open must own a real context: a readback of 0 (none) or a failed
+/// readback is a failure.
+fn report_ctx_real(name: &[u8], actual: u64) -> bool {
+    let ok = actual != 0 && actual != CTX_UNKNOWN;
+    if !ok {
+        out(b"  expected a non-zero ctx_id, got ");
+        out_ctx(actual);
+        out(b"\n");
+    }
+    report(name, ok)
+}
+
+/// Two opens must not share a context: `actual` must be a real id AND differ
+/// from `other`.
+fn report_ctx_ne(name: &[u8], other: u64, actual: u64) -> bool {
+    let ok = actual != 0 && actual != CTX_UNKNOWN && actual != other;
+    if !ok {
+        out(b"  ctx_id must differ from ");
+        out_ctx(other);
+        out(b", got ");
+        out_ctx(actual);
+        out(b"\n");
+    }
+    report(name, ok)
+}
+
+/// Same CONTEXT_INIT(capset=Venus) call as the single-fd phase, factored out
+/// so phase 2 can issue it against several fds.
+unsafe fn ctx_init_venus(fd: c_int) -> bool {
+    let params = [
+        DrmVirtgpuContextSetParam {
+            param: VIRTGPU_CONTEXT_PARAM_CAPSET_ID,
+            value: VIRTGPU_DRM_CAPSET_VENUS as u64,
+        },
+        DrmVirtgpuContextSetParam {
+            param: VIRTGPU_CONTEXT_PARAM_NUM_RINGS,
+            value: 1,
+        },
+    ];
+    let mut init = DrmVirtgpuContextInit {
+        num_params: 2,
+        pad: 0,
+        ctx_set_params: params.as_ptr() as u64,
+    };
+    ioctl(fd, DRM_IOCTL_VIRTGPU_CONTEXT_INIT, &mut init as *mut _) == 0
+}
+
+/// Same not-a-real-Venus-stream EXECBUFFER payload as the single-fd phase.
+/// The only assertion is "the guest-side ioctl returned 0" — the host may
+/// reject the stream content, that risk belongs to M2, not here.
+unsafe fn exec_noop(fd: c_int) -> bool {
+    let cmd_stream: [u32; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+    let mut exec = DrmVirtgpuExecbuffer {
+        flags: 0,
+        size: (cmd_stream.len() * 4) as u32,
+        command: cmd_stream.as_ptr() as u64,
+        bo_handles: 0,
+        num_bo_handles: 0,
+        fence_fd: -1,
+        ring_idx: 0,
+        syncobj_stride: 0,
+        num_in_syncobjs: 0,
+        num_out_syncobjs: 0,
+        in_syncobjs: 0,
+        out_syncobjs: 0,
+    };
+    ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut exec as *mut _) == 0
 }
 
 #[no_mangle]
@@ -467,6 +615,270 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     }
 
     close(fd);
+
+    // ── Phase 2: per-open-file context isolation ─────────────────────────────
+    // Each open file description must own its own 3D context. This regressed
+    // when VIRTGPU_CTX_ID was a single process-global slot: a second
+    // CONTEXT_INIT (on a second fd) tore down the first client's context and
+    // installed its own, so fdA's submissions silently began executing in
+    // fdB's context.
+    //
+    // Note what that means for the assertions below: with the global slot the
+    // ioctls all keep returning 0 — fdB's context is live and valid, it just
+    // isn't fdA's — so a liveness check proves nothing. Every check that can
+    // actually catch the regression compares the *id* the kernel reports for a
+    // given open against the id that open was given at CONTEXT_INIT time.
+    out(b"--- phase 2: per-open-file context isolation ---\n");
+
+    let fd_a = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    if fd_a < 0 {
+        report(b"phase2_open_fdA", false);
+        out(b"--- venustest done, failures = ");
+        out_u64((failures + 1) as u64);
+        out(b" ---\n");
+        return failures + 1;
+    }
+
+    // 1. CONTEXT_INIT(capset=Venus) on fdA, and remember the id it was given.
+    // Everything after this is measured against `ctx_a`.
+    if !report(b"phase2_context_init_fdA", ctx_init_venus(fd_a)) { failures += 1; }
+    let ctx_a = ctx_id(fd_a);
+    out(b"  fdA ctx_id = ");
+    out_ctx(ctx_a);
+    out(b"\n");
+    if !report_ctx_real(b"phase2_ctxid_fdA_nonzero", ctx_a) { failures += 1; }
+
+    let fd_b = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    if fd_b < 0 {
+        report(b"phase2_open_fdB", false);
+        close(fd_a);
+        out(b"--- venustest done, failures = ");
+        out_u64((failures + 1) as u64);
+        out(b" ---\n");
+        return failures + 1;
+    }
+
+    // 2. CONTEXT_INIT(capset=Venus) on fdB — a second, independent open file.
+    if !report(b"phase2_context_init_fdB", ctx_init_venus(fd_b)) { failures += 1; }
+    let ctx_b = ctx_id(fd_b);
+    out(b"  fdB ctx_id = ");
+    out_ctx(ctx_b);
+    out(b"\n");
+    if !report_ctx_real(b"phase2_ctxid_fdB_nonzero", ctx_b) { failures += 1; }
+
+    // 3. Two independent opens must not share a context. With one global slot
+    // there is only one id in existence, so fdB reports what fdA reports.
+    if !report_ctx_ne(b"phase2_ctxid_fdB_differs_from_fdA", ctx_a, ctx_b) { failures += 1; }
+
+    // 4. ★ THE regression check. fdA's context id must be untouched by fdB's
+    // CONTEXT_INIT. A global slot now holds fdB's id, so asking fdA reports
+    // fdB's context — which is exactly the defect, and exactly what an
+    // "ioctl returned 0" check cannot see, because fdB's context is live.
+    if !report_ctx_eq(b"phase2_ctxid_fdA_survives_fdB_init", ctx_a, ctx_id(fd_a)) {
+        failures += 1;
+    }
+
+    // 5. Liveness alongside identity: submitting on fdA must still work.
+    if !report(b"phase2_execbuffer_fdA_after_fdB_init", exec_noop(fd_a)) { failures += 1; }
+
+    // 6. fdB's own context must independently still work too.
+    if !report(b"phase2_execbuffer_fdB", exec_noop(fd_b)) { failures += 1; }
+
+    // 7. Re-running CONTEXT_INIT on fdA with the same capset must be
+    // idempotent (re-init of one's own context, not an error).
+    if !report(b"phase2_context_init_fdA_idempotent", ctx_init_venus(fd_a)) { failures += 1; }
+
+    // 8. ★ And idempotent means the SAME context, not a fresh one. The global
+    // implementation tore down whatever context was current and created a new
+    // one on every CONTEXT_INIT, so fdA's id changes here.
+    if !report_ctx_eq(b"phase2_ctxid_fdA_unchanged_by_reinit", ctx_a, ctx_id(fd_a)) {
+        failures += 1;
+    }
+
+    // 9. Closing fdB must destroy only fdB's context — fdA keeps its own id…
+    close(fd_b);
+    if !report_ctx_eq(b"phase2_ctxid_fdA_after_close_fdB", ctx_a, ctx_id(fd_a)) {
+        failures += 1;
+    }
+
+    // 10. …and keeps working.
+    if !report(b"phase2_execbuffer_fdA_after_close_fdB", exec_noop(fd_a)) { failures += 1; }
+
+    // 11. A dup() shares the open file description, and therefore the context:
+    // fdC must report fdA's id, not a new one.
+    let fd_c = dup(fd_a);
+    let dup_ok = fd_c >= 0;
+    let ctx_c = if dup_ok { ctx_id(fd_c) } else { CTX_UNKNOWN };
+    if !report_ctx_eq(b"phase2_ctxid_fdC_dup_shares_fdA", ctx_a, ctx_c) { failures += 1; }
+
+    // 12. Closing the original fd number must not tear down the context the
+    // dup still refers to — the open outlives the fd.
+    close(fd_a);
+    let ctx_c_after = if dup_ok { ctx_id(fd_c) } else { CTX_UNKNOWN };
+    if !report_ctx_eq(b"phase2_ctxid_fdC_after_close_fdA", ctx_a, ctx_c_after) {
+        failures += 1;
+    }
+
+    // 13. Liveness on the surviving dup.
+    let exec_c_ok = dup_ok && exec_noop(fd_c);
+    if !report(b"phase2_execbuffer_fdC_dup_after_close_fdA", exec_c_ok) {
+        failures += 1;
+    }
+
+    // 14-16. fork() shares the open file description across processes too: the
+    // child must see the SAME context on the inherited fd, and the child's exit
+    // must not retire the context the parent still uses on that very fd.
+    {
+        let n_ctx_child = b"phase2_ctxid_fork_child_inherits";
+        let n_ctx_after = b"phase2_ctxid_fdC_survives_child_exit";
+        let n_exec = b"phase2_execbuffer_fork_child_and_parent";
+        // A shared page is the only channel: the child reads the id in its own
+        // address space, and the parent must see the value, not a COW copy.
+        let sh = if dup_ok {
+            mmap(
+                core::ptr::null_mut(),
+                4096,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        } else {
+            -1isize as *mut c_void
+        };
+        if !dup_ok || sh as isize == -1 {
+            if !report(n_ctx_child, false) { failures += 1; }
+            if !report(n_ctx_after, false) { failures += 1; }
+            if !report(n_exec, false) { failures += 1; }
+        } else {
+            let ctx_slot = sh as *mut u64;
+            let flag = (sh as *mut u8).add(8);
+            *ctx_slot = 0;
+            *flag = 0;
+
+            let r = fork();
+            if r == 0 {
+                *ctx_slot = ctx_id(fd_c);
+                *flag = if exec_noop(fd_c) { 1 } else { 0 };
+                _exit(0);
+            }
+            if r < 0 {
+                if !report(n_ctx_child, false) { failures += 1; }
+                if !report(n_ctx_after, false) { failures += 1; }
+                if !report(n_exec, false) { failures += 1; }
+            } else {
+                let mut status: c_int = 0;
+                waitpid(r, &mut status, 0);
+                let reaped = wifexited(status) && wexitstatus(status) == 0;
+
+                // The inherited fd is the same open, so the same context id.
+                if !report_ctx_eq(n_ctx_child, ctx_a, if reaped { *ctx_slot } else { CTX_UNKNOWN }) {
+                    failures += 1;
+                }
+                // The child exiting closed its copy of the fd; the parent's
+                // open must be untouched by that.
+                if !report_ctx_eq(n_ctx_after, ctx_a, ctx_id(fd_c)) { failures += 1; }
+
+                let child_ok = reaped && *flag == 1;
+                let parent_exec_ok = exec_noop(fd_c);
+                if !report(n_exec, child_ok && parent_exec_ok) { failures += 1; }
+            }
+        }
+    }
+
+    close(fd_c);
+
+    // ── Phase 3: per-open context slot exhaustion ────────────────────────────
+    // MAX_GPU_CTXS in drivers/src/drm_device_interface.rs is 16, and running
+    // out of slots is new, otherwise-untested code. Requirements: 16 opens get
+    // 16 DISTINCT contexts (not one aliased one), the 17th is refused cleanly
+    // rather than panicking or silently handing back somebody else's context,
+    // and closing them all returns the slots.
+    //
+    // Assumes venustest is the only client holding 3D contexts, which is true
+    // when it is run from the shell; a live compositor would hold one and shift
+    // the boundary by one.
+    out(b"--- phase 3: per-open context slot exhaustion ---\n");
+    {
+        const N_CTX: usize = 16; // MAX_GPU_CTXS
+        const N_TRY: usize = N_CTX + 1;
+        let mut fds = [-1i32; N_TRY];
+        let mut ids = [0u64; N_TRY];
+        let mut init_ok = [false; N_TRY];
+
+        let mut opened = 0usize;
+        for i in 0..N_TRY {
+            fds[i] = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+            if fds[i] < 0 { break; }
+            opened += 1;
+        }
+        if !report(b"phase3_open_17_fds", opened == N_TRY) { failures += 1; }
+
+        for i in 0..opened {
+            init_ok[i] = ctx_init_venus(fds[i]);
+        }
+        // Read the ids only once EVERY init has run, never right after each
+        // one. Read eagerly, each fd would report the context that had just
+        // been created — which a single global slot also satisfies. Read at the
+        // end, 16 distinct ids can only come from 16 separate bindings.
+        for i in 0..opened {
+            ids[i] = ctx_id(fds[i]);
+        }
+
+        // The first 16 must each have succeeded with a real, unique id.
+        let mut distinct_ok = opened >= N_CTX;
+        for i in 0..N_CTX.min(opened) {
+            if !init_ok[i] || ids[i] == 0 || ids[i] == CTX_UNKNOWN {
+                distinct_ok = false;
+            }
+            for j in 0..i {
+                if ids[j] == ids[i] { distinct_ok = false; }
+            }
+        }
+        out(b"  ctx ids:");
+        for i in 0..opened {
+            out(b" ");
+            out_ctx(ids[i]);
+            if !init_ok[i] { out(b"(init-failed)"); }
+        }
+        out(b"\n");
+        if !report(b"phase3_16_contexts_distinct", distinct_ok) { failures += 1; }
+
+        // The 17th must fail the ioctl outright…
+        let refused = opened == N_TRY && !init_ok[N_CTX];
+        if !report(b"phase3_17th_context_init_refused", refused) { failures += 1; }
+
+        // …and must not have been left holding anyone's context.
+        let orphan_ok = opened == N_TRY && ids[N_CTX] == 0;
+        if !orphan_ok && opened == N_TRY {
+            out(b"  17th open ctx_id = ");
+            out_ctx(ids[N_CTX]);
+            out(b" (expected 0)\n");
+        }
+        if !report(b"phase3_17th_has_no_context", orphan_ok) { failures += 1; }
+
+        for i in 0..opened {
+            close(fds[i]);
+        }
+
+        // Slots must have come back: a fresh open still gets a context. (If the
+        // kernel leaked them, this fails while everything above still passes.)
+        let fd_fresh = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let mut reclaimed = false;
+        if fd_fresh >= 0 {
+            if ctx_init_venus(fd_fresh) {
+                let id = ctx_id(fd_fresh);
+                reclaimed = id != 0 && id != CTX_UNKNOWN;
+                if !reclaimed {
+                    out(b"  fresh open ctx_id = ");
+                    out_ctx(id);
+                    out(b"\n");
+                }
+            }
+            close(fd_fresh);
+        }
+        if !report(b"phase3_slots_reclaimed_after_close", reclaimed) { failures += 1; }
+    }
 
     out(b"--- venustest done, failures = ");
     out_u64(failures as u64);
