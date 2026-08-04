@@ -1253,7 +1253,7 @@ fn dispatch_inner(
         TIMER_GETOVERRUN => sys_timer_getoverrun(a0),
         TIMER_DELETE  => sys_timer_delete(a0),
         NANOSLEEP       => sys_nanosleep(a0, a1),
-        CLOCK_NANOSLEEP => sys_nanosleep(a2, a3), // clock_nanosleep(clk,flags,rqtp,rmtp)
+        CLOCK_NANOSLEEP => sys_clock_nanosleep(a0, a1, a2, a3),
         TIMERFD_CREATE  => sys_timerfd_create(a0, a1),
         TIMERFD_SETTIME => sys_timerfd_settime(a0, a1, a2, a3),
         TIMERFD_GETTIME => sys_timerfd_gettime(a0, a1),
@@ -2412,10 +2412,28 @@ fn sys_nanosleep(rqtp_ptr: usize, rmtp_ptr: usize) -> isize {
     let tv_sec  = unsafe { core::ptr::read(rqtp_ptr         as *const i64) };
     let tv_nsec = unsafe { core::ptr::read((rqtp_ptr + 8)   as *const i64) };
     if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 { return -22; } // EINVAL
-    // Convert to ticks (~100 Hz).
-    let ticks_needed = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
+    // Convert to ticks (~100 Hz), rounding UP. POSIX requires nanosleep to
+    // suspend for *at least* the requested interval, so truncating is not a
+    // rounding nicety: it made every sleep shorter than one tick return
+    // immediately. Mesa's ring backoff (vn_relax) sleeps 160/320/640/1280 us,
+    // all under a tick, so all of them became no-ops and its 4096-iteration
+    // budget -- which upstream asserts takes 3.48 s -- elapsed in 17 ms. Its
+    // ring-alive watchdog then fired ~200x early and abort()ed the process,
+    // while the host renderer was still on its normal 3 s re-stamp cycle.
+    // Sleeping a whole tick for a 160 us request is coarse but correct; the
+    // fix for the coarseness is a finer tick or a one-shot timer, not this.
+    let total_ns = (tv_sec as u128) * 1_000_000_000 + (tv_nsec as u128);
+    let ticks_needed = total_ns.div_ceil(10_000_000) as u64;
     if ticks_needed == 0 { return 0; }
-    let start = ticks();
+    sleep_ticks_from(ticks(), ticks_needed, rmtp_ptr)
+}
+
+/// Shared sleep body for the relative and absolute paths.
+///
+/// `start` is the tick the sleep is measured from, so the absolute path can
+/// pass the same `ticks()` reading it used to compute `ticks_needed` and not
+/// re-round a second time. `rmtp_ptr` may be 0 (nothing to report back).
+fn sleep_ticks_from(start: u64, ticks_needed: u64, rmtp_ptr: usize) -> isize {
     let deadline = start.wrapping_add(ticks_needed);
     loop {
         if interrupted() {
@@ -2450,6 +2468,40 @@ fn sys_nanosleep(rqtp_ptr: usize, rmtp_ptr: usize) -> isize {
         }
     }
     0
+}
+
+/// `TIMER_ABSTIME` — clock_nanosleep's absolute-deadline mode.
+const TIMER_ABSTIME: usize = 1;
+
+/// sys_clock_nanosleep(clockid, flags, rqtp, rmtp).
+///
+/// Every clock here is the same 10 ms tick counter (see `sys_clock_gettime`),
+/// so the clockid is not load-bearing — but the flags are. This used to
+/// dispatch straight to `sys_nanosleep(a2, a3)`, discarding them, which turned
+/// "wait until this absolute timestamp" into "sleep FOR that timestamp": a
+/// deadline a few seconds into the future became a sleep of however long the
+/// machine has been up plus a few seconds, and a wall-clock deadline became
+/// decades. Nothing in the current userland passes TIMER_ABSTIME, so it never
+/// fired — it was a landmine, not a live bug.
+fn sys_clock_nanosleep(_clkid: usize, flags: usize, rqtp_ptr: usize, rmtp_ptr: usize) -> isize {
+    if flags & TIMER_ABSTIME == 0 {
+        return sys_nanosleep(rqtp_ptr, rmtp_ptr);
+    }
+    if rqtp_ptr == 0 { return 0; }
+    if !validate_user_buf(rqtp_ptr, 16) { return -14; }
+    let tv_sec  = unsafe { core::ptr::read(rqtp_ptr       as *const i64) };
+    let tv_nsec = unsafe { core::ptr::read((rqtp_ptr + 8) as *const i64) };
+    if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 { return -22; } // EINVAL
+    // Round the deadline up, for the same reason the relative path does.
+    let target = ((tv_sec as u128) * 1_000_000_000 + tv_nsec as u128)
+        .div_ceil(10_000_000) as u64;
+    let now = ticks();
+    // A deadline already in the past is not an error; it is a completed sleep.
+    if target <= now { return 0; }
+    let ticks_needed = target - now;
+    // Absolute sleeps have nothing to report in rmtp on EINTR (the caller
+    // simply re-issues with the same deadline), so pass 0 for it.
+    sleep_ticks_from(now, ticks_needed, 0)
 }
 
 /// sys_gettimeofday(tv_ptr, tz_ptr) — fill `struct timeval` with wall-clock time.
