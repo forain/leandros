@@ -257,8 +257,18 @@ pub const VIRTIO_GPU_RESP_OK_CAPSET_INFO: u32 = 0x1102;
 pub const VIRTIO_GPU_RESP_OK_CAPSET: u32 = 0x1103;
 pub const VIRTIO_GPU_RESP_OK_MAP_INFO: u32 = 0x1106;
 
+/// Set once the first SUBMIT_3D reply is seen not to echo the fence we asked
+/// for, so the diagnosis is stated once instead of once per frame.
+static SUBMIT3D_FENCE_ECHO_WARNED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Set in `hdr.flags` to ask the host to signal `hdr.fence_id` on completion.
 pub const VIRTIO_GPU_FLAG_FENCE: u32 = 1 << 0;
+/// Set in `hdr.flags` to declare that `hdr.ring_idx` (the first byte of what
+/// this driver calls `padding`, matching `struct virtio_gpu_ctrl_hdr`) names the
+/// per-context ring the fence belongs to. Without it the host creates a plain
+/// context-wide fence, which is what every submission got before ring plumbing.
+pub const VIRTIO_GPU_FLAG_INFO_RING_IDX: u32 = 1 << 1;
 
 // ── Feature bits ─────────────────────────────────────────────────────────────
 pub const VIRTIO_GPU_F_VIRGL: u32 = 0;
@@ -1807,8 +1817,38 @@ impl VirtioGpuDevice {
     ///
     /// The stream travels in its own descriptor, so it is bounded by the buddy
     /// allocator rather than by a page.  Fenced, so the returned fence id can be
-    /// waited on; returns that id.
-    pub fn submit_3d(&mut self, ctx_id: u32, cmds: &[u8]) -> Result<u64, ()> {
+    /// waited on; returns that id.  `ring_idx` names the per-context ring the
+    /// completion fence belongs to, or `None` for an unringed submission.
+    ///
+    /// ── WHAT "Ok" DOES AND DOES NOT MEAN ────────────────────────────────────
+    ///
+    /// It does NOT mean the host executed the command stream. QEMU's
+    /// `virgl_cmd_submit_3d()` calls `virgl_renderer_submit_cmd()` and then
+    /// **discards its return value**; whatever the renderer thought of the
+    /// stream — malformed, rejected, or dropped because the render worker is
+    /// dead — never reaches the wire. The guest's only answer is the generic
+    /// success the device sends anyway. This is a limitation of the host we run
+    /// against, not something this driver can fix, and it is the reason a dead
+    /// renderer once looked like a working one for a whole session.
+    ///
+    /// What we CAN check, and now do, is narrower but real. A fenced command is
+    /// answered by QEMU's *fence* path, not by its inline reply path: the reply
+    /// is written only when the renderer retires the fence we asked for, and it
+    /// echoes our `fence_id` back with VIRTIO_GPU_FLAG_FENCE set. So:
+    ///   * a reply whose fence_id matches proves the renderer was alive enough
+    ///     to reach and retire this fence — it says nothing about whether the
+    ///     commands inside were accepted;
+    ///   * a reply that does NOT echo the fence means the response came from
+    ///     somewhere other than the fence path (a non-3D device answering
+    ///     inline, or a host that never armed the fence) and the submission was
+    ///     almost certainly not executed at all;
+    ///   * a renderer that is truly wedged never retires the fence, so the
+    ///     control queue times out and `submit` reports that loudly instead of
+    ///     returning a fake success.
+    /// The mismatch is reported, not turned into an error: it is a diagnosis of
+    /// the host, and failing the ioctl on it would break clients on hosts that
+    /// answer differently but work.
+    pub fn submit_3d(&mut self, ctx_id: u32, cmds: &[u8], ring_idx: Option<u8>) -> Result<u64, ()> {
         if !self.venus_available() {
             crate::pci::serial_debug("[GPU] submit_3d refused: 3D features unavailable\n");
             return Err(());
@@ -1822,8 +1862,16 @@ impl VirtioGpuDevice {
             size: u32,
             padding: u32,
         }
+        let mut hdr = self.hdr_for(VirtioGpuCmd::Submit3d, ctx_id);
+        if let Some(r) = ring_idx {
+            // `virtio_gpu_ctrl_hdr` ends in `u8 ring_idx; u8 padding[3]`, which
+            // this driver models as one little-endian `u32 padding` — so the
+            // ring index is its low byte on both target arches.
+            hdr.flags |= VIRTIO_GPU_FLAG_INFO_RING_IDX;
+            hdr.padding = r as u32;
+        }
         let cmd = CmdSubmit {
-            hdr: self.hdr_for(VirtioGpuCmd::Submit3d, ctx_id),
+            hdr,
             size: cmds.len() as u32,
             padding: 0,
         };
@@ -1834,7 +1882,29 @@ impl VirtioGpuDevice {
             )
         };
         let fence = self.next_fence_id;
-        self.submit_checked(bytes, Some(cmds), 64, true, VIRTIO_GPU_RESP_OK_NODATA)?;
+        let resp = self.submit_checked(bytes, Some(cmds), 64, true, VIRTIO_GPU_RESP_OK_NODATA)?;
+
+        // The one independent liveness signal available here — see the header
+        // comment. Reported once per boot: EXECBUFFER runs per frame, and a
+        // host that answers this way answers it every time.
+        let rflags = u32::from_le_bytes(resp.get(4..8).ok_or(())?.try_into().map_err(|_| ())?);
+        let rfence = u64::from_le_bytes(resp.get(8..16).ok_or(())?.try_into().map_err(|_| ())?);
+        if (rflags & VIRTIO_GPU_FLAG_FENCE) == 0 || rfence != fence {
+            if !SUBMIT3D_FENCE_ECHO_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                crate::pci::serial_debug("[GPU] SUBMIT_3D reply did not echo our fence: sent=");
+                crate::pci::serial_debug_hex_64(fence);
+                crate::pci::serial_debug(" got=");
+                crate::pci::serial_debug_hex_64(rfence);
+                crate::pci::serial_debug(" flags=");
+                crate::pci::serial_debug_hex(rflags);
+                crate::pci::serial_debug(
+                    " — the host did NOT answer from its fence path, so this stream was\
+                     \n      very likely never executed. Note the host discards the renderer's\
+                     \n      own verdict either way, so a matching fence is not proof of\
+                     \n      execution. (reported once per boot)\n",
+                );
+            }
+        }
         Ok(fence)
     }
 

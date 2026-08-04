@@ -331,6 +331,77 @@ const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
 const VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK: u64 = 0x0003;
 const VIRTGPU_CONTEXT_PARAM_DEBUG_NAME: u64 = 0x0004;
 
+/// `drm_virtgpu_execbuffer.flags` (virtgpu_drm.h).
+const VIRTGPU_EXECBUF_FENCE_FD_IN: u32 = 0x01;
+const VIRTGPU_EXECBUF_FENCE_FD_OUT: u32 = 0x02;
+const VIRTGPU_EXECBUF_RING_IDX: u32 = 0x04;
+/// Every flag upstream defines. Anything outside this is a flag from a kernel
+/// newer than the one this driver was written against.
+const VIRTGPU_EXECBUF_FLAGS_KNOWN: u32 =
+    VIRTGPU_EXECBUF_FENCE_FD_IN | VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX;
+
+// ── 3D-path tracing ──────────────────────────────────────────────────────────
+//
+// Same pattern, and the same reason, as `pci::RENDER_DEBUG`: these sites sit on
+// the per-frame EXECBUFFER/ioctl path, where a per-byte serial write per call is
+// measurable. Flip to `true` locally to get the full per-call trace back — it is
+// what made the M2 execbuffer work tractable, so it is kept rather than deleted.
+//
+// Note this covers only the HOT traces. Rare, genuinely-unexpected events
+// (an unknown ioctl, a field we were asked to honour and did not) log
+// unconditionally through `serial_debug`, deduplicated so they cannot flood.
+pub const GPU3D_DEBUG: bool = false;
+
+#[inline(always)]
+fn gdbg(msg: &str) {
+    if GPU3D_DEBUG { crate::pci::serial_debug(msg); }
+}
+#[inline(always)]
+fn gdbg_hex(v: u32) {
+    if GPU3D_DEBUG { crate::pci::serial_debug_hex(v); }
+}
+#[inline(always)]
+fn gdbg_hex_64(v: u64) {
+    if GPU3D_DEBUG { crate::pci::serial_debug_hex_64(v); }
+}
+
+// ── One-shot diagnostics ─────────────────────────────────────────────────────
+//
+// Both blind spots these close sit on paths a client can drive thousands of
+// times a second (an unknown ioctl in a retry loop; EXECBUFFER once per frame),
+// so an unconditional log would drown the serial console and change the timing
+// of the very thing being diagnosed. Each distinct *shape* is therefore reported
+// exactly once per boot: the first occurrence is never lost, and the millionth
+// costs one compare.
+//
+// LOCK ORDER: both are leaf `spin::Mutex`es holding plain integers. Neither is
+// ever taken while another lock is held, and no user memory is touched under
+// them (the 82d0cc3 freeze class).
+const MAX_NOTED: usize = 32;
+
+struct NoteSet {
+    seen: [u32; MAX_NOTED],
+    n: usize,
+}
+
+impl NoteSet {
+    const fn new() -> Self { Self { seen: [0; MAX_NOTED], n: 0 } }
+    /// True the first time `key` is offered (and then never again). Returns
+    /// true once the table is full, too — better a repeated line than a
+    /// silently dropped one.
+    fn first(&mut self, key: u32) -> bool {
+        if self.seen[..self.n].contains(&key) { return false; }
+        if self.n < MAX_NOTED { self.seen[self.n] = key; self.n += 1; }
+        true
+    }
+}
+
+/// ioctl numbers that reached the dispatch default arm.
+static UNKNOWN_IOCTLS: Mutex<NoteSet> = Mutex::new(NoteSet::new());
+/// EXECBUFFER requests carrying fields we do not act on, keyed by the shape of
+/// the divergence rather than by the call.
+static EXEC_DIVERGENCE: Mutex<NoteSet> = Mutex::new(NoteSet::new());
+
 
 // ── Standard Linux DRM Structs ───────────────────────────────────────────────
 
@@ -808,10 +879,15 @@ struct GpuCtx {
     ctx_id: u32,
     /// VIRTGPU_CONTEXT_PARAM_CAPSET_ID the context was created with.
     capset: u32,
+    /// VIRTGPU_CONTEXT_PARAM_NUM_RINGS the context was created with, clamped to
+    /// at least 1. Upstream keeps this per `drm_file` for exactly one purpose:
+    /// bounds-checking `drm_virtgpu_execbuffer.ring_idx`. A context that never
+    /// set the param has one ring, ring 0.
+    num_rings: u32,
 }
 
 impl GpuCtx {
-    const fn empty() -> Self { Self { open_id: 0, ctx_id: 0, capset: 0 } }
+    const fn empty() -> Self { Self { open_id: 0, ctx_id: 0, capset: 0, num_rings: 1 } }
 }
 
 static VIRTGPU_CTXS: Mutex<[GpuCtx; MAX_GPU_CTXS]> =
@@ -839,7 +915,7 @@ fn ctx_lookup(open_id: u32) -> u32 {
 ///                        success, because the open does now have a context.
 const CTX_BIND_NO_SLOT: u32 = 0;
 
-fn ctx_bind(open_id: u32, ctx_id: u32, capset: u32) -> Result<(), u32> {
+fn ctx_bind(open_id: u32, ctx_id: u32, capset: u32, num_rings: u32) -> Result<(), u32> {
     if open_id == 0 { return Err(CTX_BIND_NO_SLOT); }
     let mut t = VIRTGPU_CTXS.lock();
     if let Some(c) = t.iter().find(|c| c.open_id == open_id) {
@@ -847,7 +923,10 @@ fn ctx_bind(open_id: u32, ctx_id: u32, capset: u32) -> Result<(), u32> {
         return Err(c.ctx_id);
     }
     match t.iter_mut().find(|c| c.open_id == 0) {
-        Some(slot) => { *slot = GpuCtx { open_id, ctx_id, capset }; Ok(()) }
+        Some(slot) => {
+            *slot = GpuCtx { open_id, ctx_id, capset, num_rings: num_rings.max(1) };
+            Ok(())
+        }
         None => Err(CTX_BIND_NO_SLOT),
     }
 }
@@ -1203,7 +1282,31 @@ impl DrmDeviceInterface {
             // No PRIME (single node, render==scanout) — Mesa falls back to software.
             DRM_IOCTL_PRIME_HANDLE_TO_FD | DRM_IOCTL_PRIME_FD_TO_HANDLE => Err(DriverError::Unsupported),
 
-            _ => Err(DriverError::Unsupported),
+            // An ioctl this driver does not implement. Historically this arm was
+            // a silent `Err(Unsupported)`, which is indistinguishable — from the
+            // outside and from the serial log — from an ioctl that ran and
+            // failed. A missing arm then looks like a broken one, and costs a
+            // session to find. Report the number so the gap names itself.
+            //
+            // `nr` and `size` are the identifying halves of the encoded request
+            // (`_IOC(dir, type, nr, size)`): `nr` is what to look up in
+            // `drm.h`/`virtgpu_drm.h`, and a matching `nr` with the wrong `size`
+            // is the other failure this makes visible — a struct whose layout
+            // drifted from the caller's.
+            _ => {
+                if UNKNOWN_IOCTLS.lock().first(cmd) {
+                    crate::pci::serial_debug("[DRM] unimplemented ioctl cmd=");
+                    crate::pci::serial_debug_hex(cmd);
+                    crate::pci::serial_debug(" nr=");
+                    crate::pci::serial_debug_hex(cmd & 0xFF);
+                    crate::pci::serial_debug(" type=");
+                    crate::pci::serial_debug_hex((cmd >> 8) & 0xFF);
+                    crate::pci::serial_debug(" size=");
+                    crate::pci::serial_debug_hex((cmd >> 16) & 0x3FFF);
+                    crate::pci::serial_debug(" (reported once per boot)\n");
+                }
+                Err(DriverError::Unsupported)
+            }
         };
 
         crate::pci::rdebug("[DRM-IF] handle_ioctl finished, returning Result\n");
@@ -2598,6 +2701,30 @@ impl DrmDeviceInterface {
     /// The previous implementation bound `_exec` and never touched it, then
     /// submitted `&[]`: every command stream userspace ever produced was thrown
     /// away while the ioctl reported success.
+    ///
+    /// WHAT OF THE REQUEST IS HONOURED, AND WHAT IS NOT.
+    ///
+    /// Honoured: `command`/`size` (the stream itself) and, since this change,
+    /// `ring_idx` when the caller sets VIRTGPU_EXECBUF_RING_IDX — it travels in
+    /// `hdr.ring_idx` with VIRTIO_GPU_FLAG_INFO_RING_IDX, the upstream encoding,
+    /// so the host creates the completion fence on the ring Mesa asked for
+    /// instead of always on ring 0.
+    ///
+    /// NOT honoured, and reported once per distinct shape rather than dropped in
+    /// silence:
+    ///   * `bo_handles` / `num_bo_handles` — upstream resolves these to a GEM
+    ///     object array and attaches the submission's fence to each BO, which is
+    ///     what makes a later `TRANSFER_FROM_HOST` or a `WAIT` on that BO block
+    ///     until this submission retires. This driver has no per-BO fence state
+    ///     to attach anything to, and inventing one that reports the wrong
+    ///     answer would be worse than reporting none.
+    ///   * `fence_fd` with FENCE_FD_IN/OUT — sync_file import/export needs a
+    ///     syncobj/fd fence infrastructure that does not exist here.
+    ///   * `in_syncobjs` / `out_syncobjs` / `syncobj_stride` — same.
+    ///   * any flag outside VIRTGPU_EXECBUF_FLAGS_KNOWN. Upstream answers EINVAL
+    ///     for those; we deliberately do not, because refusing a flag from a
+    ///     newer uAPI would turn a client that works today into one that fails
+    ///     outright. It is logged instead.
     fn virtgpu_handle_execbuffer(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         // Read the request out of user memory BEFORE any device lock is taken.
@@ -2609,10 +2736,88 @@ impl DrmDeviceInterface {
         let size = exec.size as usize;
         if size > MAX_CMD_BYTES { return Err(DriverError::InvalidParameter); }
 
-        let ctx = ctx_lookup(open_id);
+        let entry = ctx_lookup_entry(open_id);
+        let ctx = entry.map(|c| c.ctx_id).unwrap_or(0);
         if ctx == 0 {
             crate::pci::serial_debug("[DRM] EXECBUFFER before CONTEXT_INIT\n");
             return Err(DriverError::InvalidParameter);
+        }
+
+        gdbg("[EXECDBG] ctx=");
+        gdbg_hex(ctx);
+        gdbg(" size=");
+        gdbg_hex(exec.size);
+        gdbg(" flags=");
+        gdbg_hex(exec.flags);
+        gdbg(" ring=");
+        gdbg_hex(exec.ring_idx);
+        gdbg(" nbo=");
+        gdbg_hex(exec.num_bo_handles);
+        gdbg(" cmd=");
+        gdbg_hex_64(exec.command);
+        gdbg("\n");
+
+        // ── Ring selection (implemented) ────────────────────────────────────
+        // Upstream reads `ring_idx` only when the caller opted in with the
+        // flag, and rejects an index at or past the ring count the context was
+        // created with. Without the flag the submission is unringed, which is
+        // what every caller before this change effectively got.
+        let ring_idx: Option<u8> = if exec.flags & VIRTGPU_EXECBUF_RING_IDX != 0 {
+            let num_rings = entry.map(|c| c.num_rings).unwrap_or(1);
+            if exec.ring_idx >= num_rings {
+                crate::pci::serial_debug("[DRM] EXECBUFFER ring_idx=");
+                crate::pci::serial_debug_hex(exec.ring_idx);
+                crate::pci::serial_debug(" >= context num_rings=");
+                crate::pci::serial_debug_hex(num_rings);
+                crate::pci::serial_debug("\n");
+                return Err(DriverError::InvalidParameter);
+            }
+            Some(exec.ring_idx as u8)
+        } else {
+            None
+        };
+
+        // ── Divergence report (logged only) ─────────────────────────────────
+        // Keyed by the shape of what was asked for, not by the call, so a
+        // per-frame submission logs its first frame and nothing after. The key
+        // packs: which unhandled fields were non-zero, and which flag bits were
+        // set, so two different divergences never collapse into one report.
+        let unknown_flags = exec.flags & !VIRTGPU_EXECBUF_FLAGS_KNOWN;
+        let ignored_bo = exec.num_bo_handles != 0 || exec.bo_handles != 0;
+        let ignored_fence_fd = exec.flags & (VIRTGPU_EXECBUF_FENCE_FD_IN | VIRTGPU_EXECBUF_FENCE_FD_OUT) != 0
+            || exec.fence_fd != 0;
+        let ignored_syncobj = exec.num_in_syncobjs != 0 || exec.num_out_syncobjs != 0
+            || exec.in_syncobjs != 0 || exec.out_syncobjs != 0;
+        if ignored_bo || ignored_fence_fd || ignored_syncobj || unknown_flags != 0 {
+            let key = (exec.flags & 0xFFFF)
+                | (ignored_bo as u32) << 16
+                | (ignored_fence_fd as u32) << 17
+                | (ignored_syncobj as u32) << 18;
+            if EXEC_DIVERGENCE.lock().first(key) {
+                crate::pci::serial_debug("[DRM] EXECBUFFER: fields asked for but NOT honoured —");
+                if ignored_bo {
+                    crate::pci::serial_debug(" bo_handles(n=");
+                    crate::pci::serial_debug_hex(exec.num_bo_handles);
+                    crate::pci::serial_debug(")");
+                }
+                if ignored_fence_fd {
+                    crate::pci::serial_debug(" fence_fd");
+                }
+                if ignored_syncobj {
+                    crate::pci::serial_debug(" syncobjs(in=");
+                    crate::pci::serial_debug_hex(exec.num_in_syncobjs);
+                    crate::pci::serial_debug(" out=");
+                    crate::pci::serial_debug_hex(exec.num_out_syncobjs);
+                    crate::pci::serial_debug(")");
+                }
+                if unknown_flags != 0 {
+                    crate::pci::serial_debug(" unknown_flags=");
+                    crate::pci::serial_debug_hex(unknown_flags);
+                }
+                crate::pci::serial_debug(" flags=");
+                crate::pci::serial_debug_hex(exec.flags);
+                crate::pci::serial_debug(" (reported once per shape)\n");
+            }
         }
 
         // Copy the stream into kernel memory while no spinlock is held: touching
@@ -2626,7 +2831,7 @@ impl DrmDeviceInterface {
         let fence = {
             let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
             let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
-            gpu.submit_3d(ctx, &cmds).map_err(|_| DriverError::Io)?
+            gpu.submit_3d(ctx, &cmds, ring_idx).map_err(|_| DriverError::Io)?
         };
         LAST_EXEC_FENCE.store(fence, Ordering::Relaxed);
         Ok(0)
@@ -2792,13 +2997,21 @@ impl DrmDeviceInterface {
         }
 
         let mut capset_id: u32 = 0;
+        // Upstream's cap. `num_rings` only ever gates `execbuffer.ring_idx`, so
+        // recording it costs nothing and turns a ring index we would otherwise
+        // forward blind into a bounds-checked one.
+        const MAX_RINGS: u32 = 64;
+        let mut num_rings: u32 = 1;
         for p in params[..n].iter() {
             match p.param {
                 VIRTGPU_CONTEXT_PARAM_CAPSET_ID => capset_id = p.value as u32,
-                // Single ring only; accept and ignore the ring params rather
-                // than failing a request that is satisfiable.
-                VIRTGPU_CONTEXT_PARAM_NUM_RINGS
-                | VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK
+                VIRTGPU_CONTEXT_PARAM_NUM_RINGS => {
+                    if p.value > MAX_RINGS as u64 { return Err(DriverError::InvalidParameter); }
+                    num_rings = (p.value as u32).max(1);
+                }
+                // Accepted and ignored: nothing here polls rings, and the debug
+                // name is already supplied by `ctx_create`.
+                VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK
                 | VIRTGPU_CONTEXT_PARAM_DEBUG_NAME => {}
                 _ => return Err(DriverError::InvalidParameter),
             }
@@ -2830,7 +3043,7 @@ impl DrmDeviceInterface {
             gpu.ctx_create(capset_id, "leandros-venus")
                 .map_err(|_| DriverError::Io)?
         };
-        if let Err(winner) = ctx_bind(open_id, ctx, capset_id) {
+        if let Err(winner) = ctx_bind(open_id, ctx, capset_id, num_rings) {
             // Nothing else may reach this context, so drop it either way.
             {
                 let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
@@ -2895,7 +3108,32 @@ impl DrmDeviceInterface {
             match gpu.resource_create_blob(
                 ctx, rid, req.blob_mem, req.blob_flags, req.blob_id, req.size, backing,
             ) {
-                Ok(()) => rid,
+                Ok(()) => {
+                    // Upstream parity. `virtio_gpu_gem_object_open()` sends
+                    // CTX_ATTACH_RESOURCE for every GEM object opened on a 3D
+                    // `drm_file`, which is how the host learns that this
+                    // resource belongs to this context; without it the host's
+                    // per-context resource table stays empty and a renderer is
+                    // entitled to reject any command stream referring to the
+                    // resource. `free_blob` has always sent the matching
+                    // CTX_DETACH_RESOURCE, so until now the pair was
+                    // half-written: a detach for an attach that never happened.
+                    //
+                    // Failure is logged, not propagated — exactly as upstream,
+                    // where the attach is issued for effect and
+                    // `virtio_gpu_gem_object_open` returns 0 regardless. A host
+                    // that refuses the attach still gave us a valid resource,
+                    // and turning that into a failed ioctl would break blob
+                    // creation on hosts where it works today.
+                    if ctx != 0 && !gpu.ctx_attach_resource(ctx, rid) {
+                        crate::pci::serial_debug("[DRM] CTX_ATTACH_RESOURCE refused ctx=");
+                        crate::pci::serial_debug_hex(ctx);
+                        crate::pci::serial_debug(" res=");
+                        crate::pci::serial_debug_hex(rid);
+                        crate::pci::serial_debug("\n");
+                    }
+                    rid
+                }
                 Err(()) => {
                     drop(guard);
                     if phys != 0 { mm::buddy::free(phys, order); }
