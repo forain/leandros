@@ -73,6 +73,12 @@ const VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs: u64 = 7;
 /// LeandrOS-private (NOT upstream): the 3D context id bound to the calling
 /// open, 0 if that open has none. See drivers/src/drm_device_interface.rs.
 const VIRTGPU_PARAM_LEANDROS_CTX_ID: u64 = 0x1000_0001;
+/// LeandrOS-private: live host-visible window reservations. The only way to see
+/// whether the kernel gives back the shared-memory window space a HOST3D blob
+/// took — see section 4c.
+const VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS: u64 = 0x1000_0002;
+/// LeandrOS-private: host-visible window length in MiB (0 = no window).
+const VIRTGPU_PARAM_LEANDROS_HOSTVIS_MIB: u64 = 0x1000_0003;
 
 const VIRTGPU_DRM_CAPSET_VENUS: u32 = 4;
 
@@ -80,6 +86,11 @@ const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
 const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
 
 const VIRTGPU_BLOB_MEM_GUEST: u32 = 0x0001;
+/// Host-side blob memory. The storage lives in the host, not in guest RAM; the
+/// guest reaches it only through RESOURCE_MAP_BLOB into the virtio-gpu
+/// shared-memory BAR window. This is what Mesa's Venus ICD allocates its command
+/// ring as, so this is the allocation whose map gates `vkCreateInstance`.
+const VIRTGPU_BLOB_MEM_HOST3D: u32 = 0x0002;
 const VIRTGPU_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 
 // ── virtgpu_drm.h structs (fixed width; identical on x86_64 and aarch64) ─────
@@ -283,6 +294,40 @@ unsafe fn getparam(fd: c_int, param: u64, name: &[u8]) -> u64 {
     gp.value
 }
 
+/// A GETPARAM probe that prints nothing. Same contract as `getparam`:
+/// `u64::MAX` means the ioctl itself failed.
+unsafe fn getparam_quiet(fd: c_int, param: u64) -> u64 {
+    let mut val: u64 = 0;
+    let mut gp = DrmVirtgpuGetparam { param, value: &mut val as *mut u64 as u64 };
+    if ioctl(fd, DRM_IOCTL_VIRTGPU_GETPARAM, &mut gp as *mut _) != 0 {
+        return u64::MAX;
+    }
+    val
+}
+
+/// `struct drm_gem_close { u32 handle; u32 pad; }` — DRM_IOW('d', 0x09, …).
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmGemClose {
+    handle: u32,
+    pad: u32,
+}
+const DRM_IOCTL_GEM_CLOSE: c_ulong = 0x40086409;
+
+unsafe fn gem_close(fd: c_int, handle: u32) -> c_int {
+    let mut gc = DrmGemClose { handle, pad: 0 };
+    ioctl(fd, DRM_IOCTL_GEM_CLOSE, &mut gc as *mut _)
+}
+
+/// Print a GETPARAM readback, distinguishing "the ioctl failed" from a value.
+fn out_param(v: u64) {
+    if v == u64::MAX {
+        out(b"<readback ioctl failed>");
+    } else {
+        out_u64(v);
+    }
+}
+
 /// Returned by `ctx_id` when the readback ioctl itself failed. Distinct from a
 /// legitimate 0 ("this open has no context"), and never equal to a real id.
 const CTX_UNKNOWN: u64 = u64::MAX;
@@ -304,11 +349,7 @@ unsafe fn ctx_id(fd: c_int) -> u64 {
 }
 
 fn out_ctx(v: u64) {
-    if v == CTX_UNKNOWN {
-        out(b"<readback ioctl failed>");
-    } else {
-        out_u64(v);
-    }
+    out_param(v);
 }
 
 /// Identity assertion: the context id `actual` must be exactly `expected`.
@@ -419,7 +460,7 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     let p_hv = getparam(fd, VIRTGPU_PARAM_HOST_VISIBLE, b"HOST_VISIBLE");
     let p_ctx = getparam(fd, VIRTGPU_PARAM_CONTEXT_INIT, b"CONTEXT_INIT");
     let p_caps = getparam(fd, VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs, b"SUPPORTED_CAPSET_IDs");
-    let _ = p_hv;
+    // p_hv is asserted in section 4c, against the window geometry it claims.
 
     if !report(b"getparam_3d_features", p_3d == 1) { failures += 1; }
     if !report(b"getparam_capset_query_fix", p_fix == 1) { failures += 1; }
@@ -656,6 +697,201 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
         if !report(b"resource_info_bad_handle_refused", refused) { failures += 1; }
     }
 
+    // ── 4c. Host-side (HOST3D) blob: RESOURCE_MAP_BLOB into the shmem window ─
+    //
+    // WHAT THIS COVERS. A VIRTIO_GPU_BLOB_MEM_HOST3D blob has no guest pages at
+    // all; the guest reaches it by asking the host (RESOURCE_MAP_BLOB) to place
+    // the resource at a guest-chosen offset inside the virtio-gpu shared-memory
+    // BAR window, then mmap()ing the guest-physical range that offset resolves
+    // to. Mesa's Venus ICD allocates its command ring exactly this way — 132 KiB,
+    // HOST3D, USE_MAPPABLE — and every vkCreateInstance returns
+    // VK_ERROR_OUT_OF_HOST_MEMORY if the map is refused. That refusal is what
+    // this section exists to keep from coming back.
+    //
+    // WHAT IT DELIBERATELY DOES NOT CLAIM. venustest cannot manufacture a
+    // *valid* HOST3D blob: the `blob_id` naming host storage is minted by the
+    // host renderer in response to Venus protocol traffic, which encoding is
+    // Mesa's job, not this test's. So on a real 3D host the create below may
+    // legitimately be refused for an unknown blob_id, and on a host with no 3D
+    // at all it is refused at the feature gate. Neither outcome is a failure.
+    // What IS asserted, on every host:
+    //   * every outcome is an explicit, self-consistent rc — a refusal never
+    //     leaves a handle or an offset written back, and a success never yields
+    //     an unusable token (this is what turns a hang or a silent zero into a
+    //     FAIL);
+    //   * the shared-memory window space is fully returned across a burst of
+    //     create/map/close cycles, which is otherwise invisible from userspace
+    //     and is the one thing a ~20-blob Vulkan app would expose;
+    //   * with no window advertised, nothing is ever reported as mapped.
+    // Where a host DOES accept the blob, the mmap + write/readback and the
+    // offset-reuse check below become real coverage of the whole path.
+    out(b"--- 4c: host-visible (HOST3D) blob map path ---\n");
+    {
+        /// The size Mesa's Venus ring asks for.
+        const RING_SIZE: usize = 132 * 1024;
+        /// Enough create/destroy cycles that a per-blob window leak shows up as
+        /// a rising span count, and the same order of magnitude a real Vulkan
+        /// app does.
+        const CYCLES: usize = 20;
+
+        let win_mib_raw = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_HOSTVIS_MIB);
+        let win_mib = if win_mib_raw == u64::MAX { 0 } else { win_mib_raw };
+        let spans_before = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS);
+        out(b"  host-visible window = ");
+        out_u64(win_mib);
+        out(b" MiB, live window spans before = ");
+        out_param(spans_before);
+        out(b"\n");
+
+        // VIRTGPU_PARAM_HOST_VISIBLE is upstream's "host-visible blob memory
+        // works here" claim, and Mesa refuses the device outright without it
+        // (`one of required kernel params (4 or 9) is missing`). It is only
+        // honest if a window really is advertised, so the two must agree.
+        let hv_agrees = (p_hv == 1) == (win_mib > 0);
+        if !hv_agrees {
+            out(b"  HOST_VISIBLE param = ");
+            out_param(p_hv);
+            out(b" but window = ");
+            out_u64(win_mib);
+            out(b" MiB\n");
+        }
+        if !report(b"host_visible_param_matches_window", hv_agrees) { failures += 1; }
+
+        // Every outcome was definite and self-consistent (see the list above).
+        let mut explicit = true;
+        let mut created = 0usize;
+        let mut mapped = 0usize;
+        let mut readback_ok = 0usize;
+        // First-fit means a released window slot is handed straight back out, so
+        // every cycle of an otherwise idle system must land on the same offset.
+        let mut first_offset = 0u64;
+        let mut offsets_reused = true;
+
+        for _ in 0..CYCLES {
+            let mut hb = DrmVirtgpuResourceCreateBlob {
+                blob_mem: VIRTGPU_BLOB_MEM_HOST3D,
+                blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+                bo_handle: 0,
+                res_handle: 0,
+                size: RING_SIZE as u64,
+                pad: 0,
+                cmd_size: 0,
+                cmd: 0,
+                blob_id: 0,
+            };
+            let crc = ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, &mut hb as *mut _);
+            if crc != 0 {
+                // A refusal must be clean: no handle written back, nothing to
+                // close, nothing reserved.
+                if hb.bo_handle != 0 { explicit = false; }
+                continue;
+            }
+            created += 1;
+
+            let mut m = DrmVirtgpuMap { offset: 0, handle: hb.bo_handle, pad: 0 };
+            let mrc = ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &mut m as *mut _);
+            if mrc != 0 {
+                // Refused (e.g. no window): the offset field must be untouched,
+                // otherwise a caller would mmap() a token nobody vouches for.
+                if m.offset != 0 { explicit = false; }
+            } else if m.offset == 0 || (m.offset & 0xFFF) != 0 {
+                // "Succeeded" with an unusable token is the failure mode this
+                // whole section is watching for.
+                explicit = false;
+            } else {
+                mapped += 1;
+                if first_offset == 0 {
+                    first_offset = m.offset;
+                    out(b"  first host-visible mmap token = ");
+                    out_hex(m.offset);
+                    out(b"\n");
+                } else if m.offset != first_offset {
+                    offsets_reused = false;
+                }
+                let p = mmap(
+                    core::ptr::null_mut(),
+                    RING_SIZE,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED,
+                    fd,
+                    m.offset as i64,
+                );
+                if p as isize <= 0 {
+                    explicit = false;
+                } else {
+                    // Touch the first and last 64 bytes only. This is host memory
+                    // reached across a PCI BAR; a full 132 KiB byte loop buys
+                    // nothing over covering both ends of the range and is
+                    // painfully slow under TCG.
+                    let b = p as *mut u8;
+                    let mut good = true;
+                    for k in 0..2usize {
+                        let base = if k == 0 { 0 } else { RING_SIZE - 64 };
+                        for j in 0..64usize {
+                            *b.add(base + j) = ((j as u8) ^ 0xC3).wrapping_add(k as u8);
+                        }
+                    }
+                    for k in 0..2usize {
+                        let base = if k == 0 { 0 } else { RING_SIZE - 64 };
+                        for j in 0..64usize {
+                            if *b.add(base + j) != ((j as u8) ^ 0xC3).wrapping_add(k as u8) {
+                                good = false;
+                            }
+                        }
+                    }
+                    if good { readback_ok += 1; } else { explicit = false; }
+                }
+            }
+
+            // Closing must release the host resource, the window reservation and
+            // the handle — that is what `spans_after` below measures.
+            if gem_close(fd, hb.bo_handle) != 0 { explicit = false; }
+        }
+
+        let spans_after = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS);
+        out(b"  cycles = ");
+        out_u64(CYCLES as u64);
+        out(b", created = ");
+        out_u64(created as u64);
+        out(b", mapped = ");
+        out_u64(mapped as u64);
+        out(b", readback ok = ");
+        out_u64(readback_ok as u64);
+        out(b"\n  live window spans after = ");
+        out_param(spans_after);
+        out(b"\n");
+
+        if !report(b"host3d_blob_outcomes_explicit", explicit) { failures += 1; }
+
+        // THE leak assertion. Also asserts the readback param exists at all: a
+        // failed readback is u64::MAX on both sides and must not "match".
+        let released = spans_before != u64::MAX && spans_after == spans_before;
+        if !released {
+            out(b"  window spans must return to ");
+            out_param(spans_before);
+            out(b", got ");
+            out_param(spans_after);
+            out(b"\n");
+        }
+        if !report(b"host3d_window_spans_released", released) { failures += 1; }
+
+        if win_mib == 0 {
+            // No window advertised (this Mac's plain virtio-gpu-pci, or any host
+            // without blob support): nothing may be reported as mapped, and the
+            // refusal must have been explicit — which `explicit` already covers.
+            if !report(b"host3d_map_refused_without_window", mapped == 0) { failures += 1; }
+        } else {
+            out(b"  host-visible window present; map path exercised for real\n");
+            if mapped >= 2 {
+                // Only meaningful once two cycles have actually mapped: with the
+                // window otherwise idle, first-fit must hand the same offset back
+                // every time. A bump allocator passes every other check here and
+                // fails this one.
+                if !report(b"host3d_window_offset_reused", offsets_reused) { failures += 1; }
+            }
+        }
+    }
+
     // ── 5. EXECBUFFER + WAIT ─────────────────────────────────────────────────
     // The payload is NOT a valid Venus command stream (encoding those is M2's
     // job) — this only proves the bytes reach the host and a fence retires.
@@ -692,15 +928,7 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     // catching leaks, and a blob BO holds both a buddy allocation and a host
     // resource id until it is closed.
     if blob.bo_handle != 0 {
-        #[repr(C)]
-        #[derive(Default, Clone, Copy)]
-        struct DrmGemClose {
-            handle: u32,
-            pad: u32,
-        }
-        const DRM_IOCTL_GEM_CLOSE: c_ulong = 0x40086409;
-        let mut gc = DrmGemClose { handle: blob.bo_handle, pad: 0 };
-        let rc = ioctl(fd, DRM_IOCTL_GEM_CLOSE, &mut gc as *mut _);
+        let rc = gem_close(fd, blob.bo_handle);
         if !report(b"gem_close_blob", rc == 0) { failures += 1; }
     }
 

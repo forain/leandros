@@ -289,6 +289,14 @@ pub const VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
 pub const VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 pub const VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
 
+// ── RESOURCE_MAP_BLOB `map_info` (cache type the host wants the guest to use) ─
+// virtio_gpu.h: VIRTIO_GPU_MAP_CACHE_*.  The low nibble is the cache type.
+pub const VIRTIO_GPU_MAP_CACHE_MASK: u32 = 0x0f;
+pub const VIRTIO_GPU_MAP_CACHE_NONE: u32 = 0x00;
+pub const VIRTIO_GPU_MAP_CACHE_CACHED: u32 = 0x01;
+pub const VIRTIO_GPU_MAP_CACHE_UNCACHED: u32 = 0x02;
+pub const VIRTIO_GPU_MAP_CACHE_WC: u32 = 0x03;
+
 /// Position payload shared by UPDATE_CURSOR and MOVE_CURSOR (16 bytes).
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
@@ -1682,8 +1690,35 @@ impl VirtioGpuDevice {
 
     /// RESOURCE_MAP_BLOB: ask the host to expose `resource_id` at `offset` inside
     /// the shared-memory BAR window.  Returns the response's `map_info` (cache
-    /// type).  Only meaningful for host-side blob memory.
+    /// type, `VIRTIO_GPU_MAP_CACHE_*`).  Only meaningful for host-side blob
+    /// memory.
+    ///
+    /// `struct virtio_gpu_resource_map_blob { hdr; le32 resource_id; le32 padding;
+    /// le64 offset; }` and `struct virtio_gpu_resp_map_info { hdr; le32 map_info;
+    /// le32 padding; }` — the header carries no context id (upstream's
+    /// `virtio_gpu_cmd_map` leaves it zero), so the resource is named globally.
+    ///
+    /// The response type is checked STRICTLY against OK_MAP_INFO rather than
+    /// through `submit_checked` alone: that helper also accepts OK_NODATA (many
+    /// commands legitimately answer with it), and an OK_NODATA here would leave
+    /// `map_info` reading the response buffer's zero fill — i.e. a host that
+    /// answered the wrong shape would look like a successful map with cache type
+    /// NONE.  This is the one command whose entire value is in its payload.
     pub fn resource_map_blob(&mut self, resource_id: u32, offset: u64) -> Result<u32, ()> {
+        // A map has nowhere to land without the window the host advertises it in.
+        let window = match self.shmem {
+            Some(r) if r.len != 0 => r,
+            _ => {
+                crate::pci::serial_debug(
+                    "[GPU] resource_map_blob refused: no host-visible shmem region\n",
+                );
+                return Err(());
+            }
+        };
+        if offset >= window.len {
+            crate::pci::serial_debug("[GPU] resource_map_blob refused: offset past window\n");
+            return Err(());
+        }
         #[repr(C, packed)]
         struct MapBlob {
             hdr: VirtioGpuCtrlHdr,
@@ -1704,6 +1739,13 @@ impl VirtioGpuDevice {
             )
         };
         let resp = self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_MAP_INFO)?;
+        let ty = u32::from_le_bytes(resp.get(0..4).ok_or(())?.try_into().map_err(|_| ())?);
+        if ty != VIRTIO_GPU_RESP_OK_MAP_INFO {
+            crate::pci::serial_debug("[GPU] MAP_BLOB: wrong response type resp=");
+            crate::pci::serial_debug_hex(ty);
+            crate::pci::serial_debug("\n");
+            return Err(());
+        }
         Ok(u32::from_le_bytes(
             resp.get(24..28).ok_or(())?.try_into().map_err(|_| ())?,
         ))
@@ -1732,6 +1774,12 @@ impl VirtioGpuDevice {
             .is_ok()
     }
 
+    /// RESOURCE_UNMAP_BLOB — retract a host-visible blob from the shared-memory
+    /// window.  `struct virtio_gpu_resource_unmap_blob { hdr; le32 resource_id;
+    /// le32 padding; }`, answered with a plain OK_NODATA.  Must precede
+    /// RESOURCE_UNREF for a mapped blob, and must precede any re-map of the same
+    /// resource: the host tracks one window sub-region per resource and refuses a
+    /// second map of an already-mapped one.
     pub fn resource_unmap_blob(&mut self, resource_id: u32) -> bool {
         #[repr(C, packed)]
         struct UnmapBlob {

@@ -307,6 +307,24 @@ const VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME: u64 = 8;
 /// this value instead of on liveness.
 const VIRTGPU_PARAM_LEANDROS_CTX_ID: u64 = 0x1000_0001;
 
+/// LeandrOS-private GETPARAM (see the note above for why the numbering is safe):
+/// how many host-visible window reservations are live right now.
+///
+/// Same justification as CTX_ID — it makes an otherwise invisible kernel
+/// invariant assertable. Whether `RESOURCE_UNMAP_BLOB` + `hostvis_free` actually
+/// return the window space a HOST3D blob took cannot be seen through any
+/// upstream interface: a leaking kernel keeps returning success on every
+/// create/map/close cycle and only fails once the window is exhausted, which is
+/// tens of thousands of cycles away. `userland/venustest` reads this before and
+/// after a burst of cycles and requires it to come back to where it started.
+const VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS: u64 = 0x1000_0002;
+
+/// LeandrOS-private GETPARAM: the host-visible window's length in MiB, 0 if the
+/// device exposed no such window. MiB rather than bytes because GETPARAM writes
+/// a 32-bit int through the user pointer (upstream's `copy_to_user(..., &value,
+/// sizeof(int))`) and the window is routinely 4 GiB.
+const VIRTGPU_PARAM_LEANDROS_HOSTVIS_MIB: u64 = 0x1000_0003;
+
 /// `drm_virtgpu_context_set_param.param` values.
 const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
 const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
@@ -687,12 +705,88 @@ struct BlobBuf {
     /// detach it from *its* context, not from whichever one happens to be
     /// current.
     ctx: u32,
+    /// Host-visible window bookkeeping, both zero until RESOURCE_MAP_BLOB has
+    /// succeeded for this blob (and zero forever for a guest-backed one):
+    ///   * `win_off`  — byte offset of the reservation inside the shared-memory
+    ///                  window, the value handed to RESOURCE_MAP_BLOB and the key
+    ///                  `hostvis_free` releases.
+    ///   * `map_phys` — the guest-physical address that offset resolves to
+    ///                  (`window.phys + win_off`), which IS the mmap token
+    ///                  VIRTGPU_MAP reports. Non-zero is the "is mapped" flag:
+    ///                  the window base is a PCI BAR address and can never be 0.
+    win_off: u64,
+    map_phys: u64,
+    /// `map_info` the host answered RESOURCE_MAP_BLOB with (VIRTIO_GPU_MAP_CACHE_*),
+    /// recorded for diagnostics — see the cacheability note on `virtgpu_handle_map`.
+    map_info: u32,
 }
 
 static BLOB_BUFFERS: Mutex<BTreeMap<u32, BlobBuf>> = Mutex::new(BTreeMap::new());
 /// GEM handles for blob BOs. Kept well above the dumb-buffer handle space so a
 /// handle is unambiguously one or the other.
 static NEXT_BLOB_HANDLE: AtomicU32 = AtomicU32::new(0x4000);
+
+// ── Host-visible blob window allocator ───────────────────────────────────────
+//
+// A VIRTIO_GPU_BLOB_MEM_HOST3D resource lives in HOST memory. The guest reaches
+// it by asking the host, via RESOURCE_MAP_BLOB, to place it at a guest-chosen
+// byte offset inside the device's shared-memory region (the
+// VIRTIO_PCI_CAP_SHARED_MEMORY_CFG window, shmid = SHM_ID_HOST_VISIBLE), and
+// then mapping the resulting guest-physical range. Choosing those offsets is
+// entirely the guest's job — the host only refuses overlaps — so this is a real
+// allocator, not a counter.
+//
+// POLICY: first-fit over the live spans, ascending, with 64 KiB granularity.
+//   * First-fit over an ordered map (rather than a bump pointer) is what makes
+//     the space actually recyclable: a Vulkan app that creates and destroys ~20
+//     blobs must reuse the same low offsets, not walk the window.
+//   * 64 KiB granularity keeps every reservation aligned for any host page size
+//     we might meet (4 KiB on the x86-64 Linux box, 16 KiB on Apple silicon,
+//     64 KiB on a large-page arm64 host) — QEMU adds the mapped resource as a
+//     RAM-device subregion at this offset, and an unaligned subregion cannot be
+//     handed to a hardware memory slot. It also bounds fragmentation.
+// BOUNDS: total handed out is capped by the window the device advertised
+//   (`window.len`, 4 GiB as configured today) and each request by
+//   MAX_BLOB_BYTES (64 MiB); the number of live spans is capped by
+//   MAX_HOSTVIS_SPANS so a runaway client cannot grow the map without limit.
+//   Every span is released by `hostvis_free`, from exactly three places, which
+//   between them cover every way one can stop being needed: `free_blob` (the
+//   normal GEM_CLOSE / open-release teardown), and the two rollback paths in
+//   `hostvis_map_blob` — a RESOURCE_MAP_BLOB the host refused, and a blob whose
+//   record disappeared before the result could be stored.
+//
+// LOCK ORDER: HOSTVIS_SPANS is a leaf, like VIRTGPU_CTXS. It is never held
+// across `VIRTIO_GPU.lock()`, across `BLOB_BUFFERS.lock()`, or across any
+// access to user memory (the 82d0cc3 freeze class).
+const HOSTVIS_GRAIN: u64 = 64 * 1024;
+const MAX_HOSTVIS_SPANS: usize = 256;
+
+/// Live reservations: offset → length, both multiples of `HOSTVIS_GRAIN`.
+static HOSTVIS_SPANS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+/// Reserve `bytes` of window space in a `window_len`-byte window. Returns the
+/// byte offset, or None if the window is full (or the span table is).
+fn hostvis_alloc(bytes: u64, window_len: u64) -> Option<u64> {
+    if bytes == 0 || window_len == 0 { return None; }
+    let need = bytes.checked_add(HOSTVIS_GRAIN - 1)? & !(HOSTVIS_GRAIN - 1);
+    let mut spans = HOSTVIS_SPANS.lock();
+    if spans.len() >= MAX_HOSTVIS_SPANS { return None; }
+    // First fit: walk the live spans in ascending order and take the first gap
+    // that is big enough; `cursor` is the end of the last span considered.
+    let mut cursor: u64 = 0;
+    for (&off, &len) in spans.iter() {
+        if off.saturating_sub(cursor) >= need { break; }
+        cursor = cursor.max(off.checked_add(len)?);
+    }
+    if cursor.checked_add(need)? > window_len { return None; }
+    spans.insert(cursor, need);
+    Some(cursor)
+}
+
+/// Release a reservation previously returned by `hostvis_alloc`.
+fn hostvis_free(off: u64) {
+    HOSTVIS_SPANS.lock().remove(&off);
+}
 // ── Per-open 3D contexts ─────────────────────────────────────────────────────
 //
 // Linux keys the virtgpu 3D context off the open file (`struct drm_file`), so
@@ -772,6 +866,24 @@ pub fn drm_release_open(open_id: u32) {
         }
     };
     if ctx == 0 { return; }
+
+    // Blobs this open created and never closed. A Vulkan client that exits
+    // (or crashes) without GEM_CLOSE would otherwise hold its host resources —
+    // and, for host-side blobs, its slice of the shared-memory window — until
+    // reboot. Contexts are per-open and a context id is never reused while live,
+    // so `ctx` identifies this open's blobs exactly; blobs created with no
+    // context (ctx == 0) belong to no open and are left alone.
+    //
+    // Collect under the lock, free after dropping it: `free_blob` locks
+    // BLOB_BUFFERS itself and then talks to the device.
+    let orphans: Vec<u32> = {
+        let map = BLOB_BUFFERS.lock();
+        map.iter().filter(|(_, b)| b.ctx == ctx).map(|(h, _)| *h).collect()
+    };
+    for h in orphans {
+        DrmDeviceInterface::free_blob(h);
+    }
+
     let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
     if let Some(gpu) = guard.as_mut() {
         gpu.ctx_destroy(ctx);
@@ -2193,10 +2305,11 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
-    /// Release a blob BO: detach it from the 3D context, drop the host-side
-    /// resource, and return its guest pages. Without this each
-    /// RESOURCE_CREATE_BLOB leaks both a buddy allocation and a host resource
-    /// id for the lifetime of the boot.
+    /// Release a blob BO: retract any host-visible mapping, detach it from the
+    /// 3D context, drop the host-side resource, and return its guest pages.
+    /// Without this each RESOURCE_CREATE_BLOB leaks a buddy allocation, a host
+    /// resource id and — for a host-side blob — a slice of the shared-memory
+    /// window, for the lifetime of the boot.
     fn free_blob(handle: u32) {
         let b = match BLOB_BUFFERS.lock().remove(&handle) {
             Some(b) => b,
@@ -2209,11 +2322,28 @@ impl DrmDeviceInterface {
         {
             let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
             if let Some(gpu) = guard.as_mut() {
+                // UNMAP before UNREF: the host holds the window sub-region on
+                // behalf of a live resource, and unreferencing it first leaves
+                // the subregion attached to a resource that no longer exists.
+                if b.map_phys != 0 {
+                    gpu.resource_unmap_blob(b.res_handle);
+                }
                 if ctx != 0 {
                     gpu.ctx_detach_resource(ctx, b.res_handle);
                 }
                 gpu.resource_unref(b.res_handle);
             }
+        }
+        // Return the window space unconditionally once the record is gone —
+        // including when UNMAP_BLOB failed or the device had vanished. The
+        // record is what `hostvis_free` is reachable from, so holding the
+        // reservation back would leak it for the rest of the boot with nothing
+        // left able to release it. Reusing an offset the host (wrongly) still
+        // believes in fails closed rather than corrupts: the host refuses to map
+        // a second resource over a live sub-region, so the next
+        // RESOURCE_MAP_BLOB at that offset is rejected and rolls itself back.
+        if b.map_phys != 0 {
+            hostvis_free(b.win_off);
         }
         if b.phys != 0 {
             mm::buddy::free(b.phys, b.order);
@@ -2337,14 +2467,28 @@ impl DrmDeviceInterface {
             }
             Ok(fb_base as usize)
         } else {
-            // The physical address was passed as the offset to mmap(). Only echo
-            // it back if it names a dumb buffer we actually allocated — otherwise
-            // a caller could map arbitrary physical memory through this device.
+            // The mmap token was passed as the offset to mmap(). Under this
+            // driver's scheme (see `virtgpu_handle_map`) the token IS a
+            // guest-physical address, so the answer is the token itself — but
+            // only for a token this device actually handed out, otherwise a
+            // caller could map arbitrary physical memory through this device.
+            //
+            // Three token spaces resolve here:
+            //   1. dumb buffers      — buddy base;
+            //   2. guest-backed blobs — buddy base;
+            //   3. host-visible blobs — `window.phys + win_off`, which is NOT
+            //      guest RAM at all but a range of the virtio-gpu shared-memory
+            //      BAR. Accepted anywhere inside the blob's own reservation so a
+            //      partial map of a large blob works; `map_phys` is non-zero only
+            //      after RESOURCE_MAP_BLOB succeeded, so an unmapped blob's
+            //      window space is never reachable.
             let known = DUMB_BUFFERS.lock().values().any(|b| b.phys == requested_phys as usize)
-                || BLOB_BUFFERS
-                    .lock()
-                    .values()
-                    .any(|b| b.phys != 0 && b.phys == requested_phys as usize);
+                || BLOB_BUFFERS.lock().values().any(|b| {
+                    (b.phys != 0 && b.phys == requested_phys as usize)
+                        || (b.map_phys != 0
+                            && requested_phys >= b.map_phys
+                            && requested_phys - b.map_phys < b.size)
+                });
             if !known {
                 return Err(DriverError::InvalidParameter);
             }
@@ -2563,6 +2707,15 @@ impl DrmDeviceInterface {
             unsafe { (req.value as *mut u32).write_volatile(ctx as u32) };
             return Ok(0);
         }
+        // Same treatment, same reason: a leaf lock, no device round-trip, and
+        // the count is read out of the guard into a local BEFORE the user
+        // pointer is touched (never write user memory under a spinlock).
+        if req.param == VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS {
+            let n = HOSTVIS_SPANS.lock().len() as u32;
+            if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            unsafe { (req.value as *mut u32).write_volatile(n) };
+            return Ok(0);
+        }
 
         let value: u64 = {
             let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
@@ -2599,6 +2752,10 @@ impl DrmDeviceInterface {
                 }
                 // CTX_CREATE carries a debug_name and we populate it.
                 VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME => 1,
+                // LeandrOS-private: host-visible window geometry, in MiB.
+                VIRTGPU_PARAM_LEANDROS_HOSTVIS_MIB => {
+                    gpu.shared_mem_region().map(|r| r.len >> 20).unwrap_or(0)
+                }
                 _ => return Err(DriverError::InvalidParameter),
             }
         };
@@ -2750,7 +2907,18 @@ impl DrmDeviceInterface {
         let handle = NEXT_BLOB_HANDLE.fetch_add(1, Ordering::Relaxed);
         BLOB_BUFFERS.lock().insert(
             handle,
-            BlobBuf { phys, order, res_handle, size: req.size, blob_mem: req.blob_mem, ctx },
+            BlobBuf {
+                phys,
+                order,
+                res_handle,
+                size: req.size,
+                blob_mem: req.blob_mem,
+                ctx,
+                // Host-visible mapping is established lazily, by VIRTGPU_MAP.
+                win_off: 0,
+                map_phys: 0,
+                map_info: 0,
+            },
         );
 
         // Write back only bo_handle (offset 8) and res_handle (offset 12) rather
@@ -2763,25 +2931,178 @@ impl DrmDeviceInterface {
     }
 
     /// DRM_IOCTL_VIRTGPU_MAP — turn a BO handle into the mmap offset for it.
-    /// Following this driver's established device-fd convention, that offset is
-    /// the buffer's physical base (see `handle_ioctl_mmap`).
+    ///
+    /// MMAP TOKEN SCHEME. This driver's device-fd convention is that the offset
+    /// passed to `mmap()` IS the guest-physical address of the memory to map;
+    /// `handle_ioctl_mmap` validates it against the buffers it handed out and the
+    /// kernel then maps that physical range (see kernel/src/syscall.rs, the
+    /// DynamicDevice arm of `sys_mmap`). Both blob kinds produce a token under
+    /// that one scheme, so userspace never has to know which kind it holds:
+    ///   * guest-backed (BLOB_MEM_GUEST / HOST3D_GUEST, and dumb buffers) —
+    ///     the token is the buddy allocation's physical base;
+    ///   * host-side (BLOB_MEM_HOST3D) — the token is
+    ///     `shmem_window.phys + win_off`, the guest-physical address the host
+    ///     places the resource at inside the shared-memory BAR window. Nothing
+    ///     backs it in guest RAM; the BAR does.
+    ///
+    /// The host-side path is the one Mesa's Venus ICD needs: it allocates its
+    /// command ring as a HOST3D + USE_MAPPABLE blob and maps it here, and every
+    /// `vkCreateInstance` fails with VK_ERROR_OUT_OF_HOST_MEMORY if this refuses.
+    ///
+    /// The mapping is established lazily and exactly once per blob: the window
+    /// reservation and the RESOURCE_MAP_BLOB round-trip happen on the first MAP,
+    /// and a repeat MAP of the same handle re-reports the same token rather than
+    /// asking the host to map an already-mapped resource (which it refuses).
+    ///
+    /// CACHEABILITY: the token carries no cache type, so the resulting user
+    /// mapping gets the address space's normal cacheable attributes. That is
+    /// correct for the Venus ring, which the host reports as
+    /// VIRTIO_GPU_MAP_CACHE_CACHED; a host asking for WC or UNCACHED is honoured
+    /// only in the log, and the divergence is called out there rather than
+    /// silently ignored (`handle_ioctl_mmap` has no channel to pass a cache type
+    /// back to `sys_mmap`).
+    ///
+    /// LOCKING: user memory is read before any lock is taken and written after
+    /// every lock is dropped, and no two of BLOB_BUFFERS / HOSTVIS_SPANS /
+    /// VIRTIO_GPU are ever held at the same time — the 82d0cc3 discipline.
     fn virtgpu_handle_map(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
+        // `struct drm_virtgpu_map { u64 offset; u32 handle; u32 pad; }`.
         let handle = unsafe { (arg as *const u8).add(8).cast::<u32>().read_volatile() };
-        let phys = BLOB_BUFFERS
-            .lock()
-            .get(&handle)
-            .map(|b| b.phys)
-            .or_else(|| DUMB_BUFFERS.lock().get(&handle).map(|b| b.phys))
-            .ok_or(DriverError::InvalidParameter)?;
-        if phys == 0 {
-            // Host-side blob memory: nothing in guest RAM to map. Reaching it
-            // needs RESOURCE_MAP_BLOB into the shared-memory BAR window.
-            return Err(DriverError::Unsupported);
-        }
-        // `offset` is the first u64 of drm_virtgpu_map.
-        unsafe { (arg as *mut u64).write_volatile(phys as u64) };
+
+        // Copy the blob record out; hold nothing.
+        let blob = BLOB_BUFFERS.lock().get(&handle).copied();
+
+        let token: u64 = match blob {
+            // ── Host-side blob memory ────────────────────────────────────────
+            Some(b) if b.blob_mem == crate::virtio_gpu::VIRTIO_GPU_BLOB_MEM_HOST3D => {
+                if b.map_phys != 0 {
+                    b.map_phys // already mapped — idempotent
+                } else {
+                    self.hostvis_map_blob(handle, b)?
+                }
+            }
+            // ── Guest-backed blob ────────────────────────────────────────────
+            Some(b) if b.phys != 0 => b.phys as u64,
+            Some(_) => {
+                // A guest-backed blob with no pages cannot happen (creation
+                // allocates or fails), so this is a HOST3D_GUEST/GUEST record
+                // whose backing went missing. Refuse rather than hand out 0.
+                crate::pci::serial_debug("[DRM] VIRTGPU_MAP: blob has no backing\n");
+                return Err(DriverError::Unsupported);
+            }
+            None => {
+                let phys = DUMB_BUFFERS
+                    .lock()
+                    .get(&handle)
+                    .map(|b| b.phys)
+                    .ok_or(DriverError::InvalidParameter)?;
+                if phys == 0 { return Err(DriverError::Unsupported); }
+                phys as u64
+            }
+        };
+
+        // `offset` is the first u64 of drm_virtgpu_map. Written with no lock held.
+        unsafe { (arg as *mut u64).write_volatile(token) };
         Ok(0)
+    }
+
+    /// First MAP of a HOST3D blob: reserve window space, ask the host to place
+    /// the resource there, and record the resulting token. Returns the token.
+    ///
+    /// Split out of `virtgpu_handle_map` so the lock discipline is visible in one
+    /// place: HOSTVIS_SPANS is taken and released inside `hostvis_alloc`,
+    /// VIRTIO_GPU is taken and released on its own, and BLOB_BUFFERS is taken
+    /// last to record the result. Never two at once, never any across the device
+    /// round-trip's busy-spin.
+    fn hostvis_map_blob(&mut self, handle: u32, b: BlobBuf) -> Result<u64, DriverError> {
+        // The window the device advertised at probe time. Deliberately NOT mapped
+        // anywhere yet — it is gigabytes wide; only the sub-range this blob lands
+        // in ever becomes a mapping, and only in the calling process.
+        let window = {
+            let guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            match guard.as_ref().and_then(|g| g.shared_mem_region()) {
+                Some(r) if r.phys != 0 && r.len != 0 => r,
+                _ => {
+                    crate::pci::serial_debug(
+                        "[DRM] VIRTGPU_MAP: host-visible blob but no shared-memory window\n",
+                    );
+                    return Err(DriverError::Unsupported);
+                }
+            }
+        };
+
+        let off = match hostvis_alloc(b.size, window.len) {
+            Some(o) => o,
+            None => {
+                crate::pci::serial_debug("[DRM] VIRTGPU_MAP: host-visible window full, size=");
+                crate::pci::serial_debug_hex(b.size as u32);
+                crate::pci::serial_debug("\n");
+                return Err(DriverError::Io);
+            }
+        };
+
+        let map_info = {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            match guard.as_mut() {
+                Some(gpu) => gpu.resource_map_blob(b.res_handle, off),
+                None => Err(()),
+            }
+        };
+        let map_info = match map_info {
+            Ok(mi) => mi,
+            Err(()) => {
+                // The host kept nothing, so neither do we.
+                hostvis_free(off);
+                crate::pci::serial_debug("[DRM] VIRTGPU_MAP: RESOURCE_MAP_BLOB refused res=");
+                crate::pci::serial_debug_hex(b.res_handle);
+                crate::pci::serial_debug("\n");
+                return Err(DriverError::Io);
+            }
+        };
+
+        let token = window.phys + off;
+
+        // Record it. If the handle vanished (a concurrent GEM_CLOSE on another
+        // thread), undo the map instead of leaking the window space — free_blob
+        // could not have seen a reservation that did not exist yet.
+        let recorded = {
+            let mut map = BLOB_BUFFERS.lock();
+            match map.get_mut(&handle) {
+                Some(e) => { e.win_off = off; e.map_phys = token; e.map_info = map_info; true }
+                None => false,
+            }
+        };
+        if !recorded {
+            {
+                let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+                if let Some(gpu) = guard.as_mut() { gpu.resource_unmap_blob(b.res_handle); }
+            }
+            hostvis_free(off);
+            return Err(DriverError::InvalidParameter);
+        }
+
+        crate::pci::serial_debug("[DRM] host-visible blob mapped: res=");
+        crate::pci::serial_debug_hex(b.res_handle);
+        crate::pci::serial_debug(" win_off=");
+        crate::pci::serial_debug_hex(off as u32);
+        crate::pci::serial_debug(" phys_hi=");
+        crate::pci::serial_debug_hex((token >> 32) as u32);
+        crate::pci::serial_debug(" phys_lo=");
+        crate::pci::serial_debug_hex(token as u32);
+        crate::pci::serial_debug(" map_info=");
+        crate::pci::serial_debug_hex(map_info);
+        crate::pci::serial_debug("\n");
+        if map_info & crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_MASK
+            > crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_CACHED
+        {
+            // WC (3) or UNCACHED (2). The mapping below will still be cacheable;
+            // say so rather than let a coherency surprise look like a Vulkan bug.
+            crate::pci::serial_debug(
+                "[DRM] WARNING: host asked for non-cached blob mapping; mapping cacheable anyway\n",
+            );
+        }
+        Ok(token)
     }
 
     /// DRM_IOCTL_VIRTGPU_RESOURCE_INFO — describe the resource behind a BO
