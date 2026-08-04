@@ -49,6 +49,90 @@ fn val_reply(v: u64) -> Message { make_reply(v as i64) }
 /// Global DRM interface instance (initialized on first use)
 static mut INTERFACE: Option<DrmDeviceInterface> = None;
 
+// ── Device nodes ─────────────────────────────────────────────────────────────
+//
+// One port, one `DrmDeviceInterface`, one GPU — two nodes. `dev_id` (ioctl slot
+// 0) says which node a request arrived on; it is orthogonal to `open_id`
+// (slot 4), which says which *open* of that node it arrived on and is what the
+// per-open virtgpu 3D context is keyed by. Two opens of renderD128 get two
+// open_ids and therefore two contexts, exactly as two opens of card0 do.
+const DEV_ID_CARD: u32 = 0;
+const DEV_ID_RENDER: u32 = 1;
+
+/// Linux's DRM char major, and the two minors. Render minors start at 128.
+const DRM_MAJOR: u32 = 226;
+const CARD_MINOR: u32 = 0;
+const RENDER_MINOR: u32 = 128;
+
+const DRM_IOCTL_VERSION: u32 = 0xC0406400;
+
+/// `struct drm_version` — mirrored here (it is also defined privately in
+/// `drivers::drm_device_interface`) because the render node has to answer
+/// DRM_IOCTL_VERSION with a *different* identity than card0 does, and that
+/// decision belongs to the node, not to the shared device interface.
+///
+/// 64 bytes: three i32 then 4 bytes of padding before the first `usize`, which
+/// is what the 0x0040 size field of the ioctl request code encodes.
+#[repr(C)]
+struct drm_version {
+    version_major: i32,
+    version_minor: i32,
+    version_patchlevel: i32,
+    name_len: usize,
+    name: u64,
+    date_len: usize,
+    date: u64,
+    desc_len: usize,
+    desc: u64,
+}
+
+/// DRM_IOCTL_VERSION on the RENDER node.
+///
+/// Mesa's Venus ICD refuses any render node whose driver is not literally
+/// `virtio_gpu` at major version 0 (`vn_renderer_virtgpu.c`, virtgpu_open_device:
+/// `strcmp(version->name, "virtio_gpu") || version->version_major != 0`), so the
+/// render node reports the upstream virtio-gpu identity — which is the truth
+/// about it: everything reachable through it is the virtgpu 3D command stream.
+///
+/// card0 deliberately keeps reporting `leandros-drm` 1.6.0. Mesa's DRI loader
+/// picks a driver .so by exactly this string (`loader_get_driver_for_fd`), and
+/// card0 is the fd the whole COSMIC/GBM/softpipe path runs on: naming it
+/// `virtio_gpu` would send that loader looking for `virtio_gpu_dri.so` instead
+/// of falling through to the software backend it uses today. Per-node identities
+/// keep that path untouched.
+///
+/// Runs in the caller's address space (direct port handler), same as the
+/// card0 version handler it shadows.
+fn render_node_version(arg: usize) -> Message {
+    if arg == 0 { return err_reply(-22); } // EINVAL
+    let v = unsafe { &mut *(arg as *mut drm_version) };
+    // Upstream virtio_gpu's DRIVER_MAJOR/MINOR/PATCHLEVEL.
+    v.version_major = 0;
+    v.version_minor = 1;
+    v.version_patchlevel = 0;
+
+    let name = "virtio_gpu\0";
+    let date = "0\0";
+    let desc = "virtio GPU\0";
+
+    // Two-pass contract: the caller first asks with null pointers to learn the
+    // lengths, then again with buffers. Always report the lengths; only fill a
+    // buffer that exists and is big enough.
+    if v.name != 0 && v.name_len >= name.len() {
+        unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), v.name as *mut u8, name.len()); }
+    }
+    v.name_len = name.len();
+    if v.date != 0 && v.date_len >= date.len() {
+        unsafe { core::ptr::copy_nonoverlapping(date.as_ptr(), v.date as *mut u8, date.len()); }
+    }
+    v.date_len = date.len();
+    if v.desc != 0 && v.desc_len >= desc.len() {
+        unsafe { core::ptr::copy_nonoverlapping(desc.as_ptr(), v.desc as *mut u8, desc.len()); }
+    }
+    v.desc_len = desc.len();
+    ok_reply()
+}
+
 /// Handle DRM device requests
 fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
     let interface = unsafe {
@@ -65,6 +149,7 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
 
     // Handle VFS ioctl messages
     if msg.tag == 0x28 { // VFS_IOCTL
+        let dev_id = arg(msg, 0) as u32;
         let cmd = arg(msg, 1) as u32;
         let arg_val = arg(msg, 2) as usize;
         // Slot 4 is the VFS's per-open cookie (see VnodeKind::DynamicDevice).
@@ -76,6 +161,13 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         serial_debug("[DRM-SRV] handle VFS_IOCTL cmd=");
         serial_debug_hex(cmd);
         serial_debug("\n");
+
+        // The only ioctl whose answer depends on WHICH node it arrived on.
+        // Everything else — including every virtgpu 3D ioctl — is identical on
+        // both nodes and keeps routing purely by open_id.
+        if dev_id == DEV_ID_RENDER && cmd == DRM_IOCTL_VERSION {
+            return render_node_version(arg_val);
+        }
 
         // Since we are called via a direct handler, we are in the caller's address space.
         // No need to switch address space.
@@ -135,10 +227,16 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         m
     } else if msg.tag == vfs_server::VFS_CLOSE {
         // The VFS sends this once the LAST fd on this open is gone, with the
-        // open cookie in slot 1. Retire whatever that open owned (its virtgpu
-        // 3D context) before the generic release.
+        // node in slot 0 and the open cookie in slot 1. Retire whatever that
+        // open owned (its virtgpu 3D context) before the generic release.
         drivers::drm_device_interface::drm_release_open(arg(msg, 1) as u32);
-        interface.release();
+        // `release()` re-enables the framebuffer console, which is only ever
+        // right for the node that could have taken it away. A render node has
+        // no KMS relationship at all, so closing one MUST NOT resurrect the
+        // console underneath a compositor still scanning out on card0.
+        if arg(msg, 0) as u32 == DEV_ID_CARD {
+            interface.release();
+        }
         ok_reply()
     } else if msg.tag == vfs_server::VFS_CLOSE_ALL {
         // Dead code today — the VFS retires fds one at a time through
@@ -153,7 +251,16 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
 /// Initialize DRM service
 pub fn init(owner_pid: u32) -> Option<u32> {
     let port_id = port::create(owner_pid)?;
-    vfs_server::register_device("/dev/dri/card0", port_id, 0, 226, 0);
+    vfs_server::register_device("/dev/dri/card0", port_id, DEV_ID_CARD, DRM_MAJOR, CARD_MINOR);
+    // The render node. Same port, same DrmDeviceInterface, same GPU — a second
+    // dev_id is all it takes, exactly as evdev registers event0/event1 (see
+    // servers/evdev/src/lib.rs:426). It exists because Mesa's Venus ICD never
+    // looks at card0: virtgpu_open() enumerates with drmGetDevices2() and
+    // requires `available_nodes & (1 << DRM_NODE_RENDER)`, then opens
+    // `nodes[DRM_NODE_RENDER]`. The matching sysfs attributes that let
+    // drmGetDevices2() classify the device at all are built into the image by
+    // scripts/mkfs-f2fs-populated.py.
+    vfs_server::register_device("/dev/dri/renderD128", port_id, DEV_ID_RENDER, DRM_MAJOR, RENDER_MINOR);
     port::register_handler(port_id, handle);
     // Throttled page-flip event delivery runs off the 100 Hz tick. This does NOT
     // displace the audio pump (register_tick_hook fills the next free slot).

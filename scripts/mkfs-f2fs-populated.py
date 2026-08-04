@@ -49,6 +49,17 @@ DENTRY_ENTRY_SIZE  = 11
 
 DT_DIR = 4
 DT_REG = 8
+# Symlink. The f2fs server stores the Linux d_type byte in the dentry rather
+# than the F2FS_FT_* enum (servers/f2fs/src/lib.rs:169-174), and its path walker
+# follows a component iff that byte is DT_LNK (resolve_path_ex, :1766). A
+# symlink inode is otherwise an ordinary file inode whose mode is S_IFLNK|0777
+# and whose data is the target path — exactly what handle_symlink writes
+# (:2333-2341) — so add_files_to_dir needs no new machinery beyond emitting the
+# right ftype for a link mode.
+DT_LNK = 10
+
+S_IFMT  = 0o170000
+S_IFLNK = 0o120000
 
 def w8 (b, o, v): b[o] = v & 0xFF
 def w16(b, o, v): struct.pack_into('<H', b, o, v & 0xFFFF)
@@ -445,18 +456,170 @@ def main():
                 if os.path.isfile(hp):
                     m4_share_files.append((image_dir, fn, hp))
 
-    # Synthetic sysfs skeleton for anvil's drm-rs. DrmNode::from_path ->
-    # is_device_drm() stat()s /sys/dev/char/<major>:<minor>/device/drm, and
-    # node_with_type(Primary) read_dir()s that directory looking for a "card0"
-    # entry (whose /dev/dri/card0 must then exist — it does). Provide the empty
-    # directory tree (no files needed); the minor-number range gives the node
-    # type, so the mere existence of the drm dir + a card0 child suffices.
-    if os.path.isdir(m4_share_src) or os.path.exists(anvil_bin):
-        for d in ("/sys", "/sys/dev", "/sys/dev/char",
-                  "/sys/dev/char/226:0", "/sys/dev/char/226:0/device",
-                  "/sys/dev/char/226:0/device/drm",
-                  "/sys/dev/char/226:0/device/drm/card0"):
+    # ── Synthetic sysfs for the DRM nodes ────────────────────────────────────
+    #
+    # This tree used to be four empty directories, enough only for anvil's
+    # drm-rs (DrmNode::from_path -> is_device_drm() stat()s
+    # /sys/dev/char/<maj>:<min>/device/drm, and node_with_type(Primary)
+    # read_dir()s it for a "card0" entry). Mesa's Venus Vulkan ICD needs much
+    # more: virtgpu_open() (mesa/src/virtio/vulkan/vn_renderer_virtgpu.c:1677)
+    # calls drmGetDevices2(), which classifies a node ENTIRELY from sysfs and
+    # drops any node it cannot classify. The exact contract, read off libdrm
+    # 2.4.134's xf86drm.c (the version ports/mesa/build-libdrm.sh builds), for
+    # each /dev/dri/<name> that readdir(3) turns up:
+    #
+    #   1. stat("/sys/dev/char/<maj>:<min>/device/drm")            [drmNodeIsDRM, :3324]
+    #      must succeed, or process_device() rejects the node outright.
+    #   2. readlink("/sys/dev/char/<maj>:<min>/device/subsystem")  [get_subsystem_type, :3577]
+    #      must succeed; libdrm takes strrchr(target,'/') and matches it against
+    #      "/pci", "/usb", "/platform", "/virtio", ... A failed readlink yields a
+    #      negative subsystem type, which process_device()'s switch (:4558) sends
+    #      to `default: return -1`. THIS IS THE ONE HARD SYMLINK REQUIREMENT —
+    #      no regular file will do. The target is never resolved, only string-
+    #      matched, so it may dangle (we point it at a real dir anyway).
+    #   3. realpath("/sys/dev/char/<maj>:<min>/device") -> pci_path             [get_pci_path, :3651]
+    #      then, if pci_path's last component starts with "/virtio", strip it.
+    #      Because `device` here is a real directory rather than Linux's symlink
+    #      into /sys/devices/..., realpath() returns the path unchanged and the
+    #      "/virtio" strip is a no-op — i.e. we present the shape of a plain PCI
+    #      GPU, which is libdrm's primary path and needs no virtio parent walk.
+    #      (musl 1.2.5's realpath is a pure userspace readlink loop and treats a
+    #      non-symlink component's EINVAL as "not a link", which is exactly what
+    #      the f2fs server returns — servers/f2fs/src/lib.rs:2387.)
+    #   4. fopen(pci_path + "/uevent") and find a "PCI_SLOT_NAME=" line, parsed
+    #      with "%04x:%02x:%02x.%1u".        [sysfs_uevent_get :3536, drmParsePciBusInfo :3725]
+    #   5. fopen(pci_path + "/{vendor,device,subsystem_vendor,subsystem_device}"),
+    #      each read with fscanf("%x"); "revision" is read first only when the
+    #      caller passes DRM_DEVICE_GET_PCI_REVISION.   [parse_separate_sysfs_files :3836]
+    #      If that whole step fails, libdrm falls back to reading 64 raw bytes
+    #      from pci_path + "/config".                   [parse_config_sysfs_file :3876]
+    #
+    # Venus calls drmGetDevices2(0, ...) — no revision flag — and then requires
+    # vendor_id==0x1af4 && device_id==0x1050 and available_nodes & (1<<
+    # DRM_NODE_RENDER) (vn_renderer_virtgpu.c:1598-1611). The render bit is why
+    # both 226:0 and 226:128 get a full attribute set with IDENTICAL contents:
+    # drmFoldDuplicatedDevices (:4589) merges two nodes into one device iff
+    # their drmPciBusInfo compare equal, and only then does the surviving device
+    # carry both the primary and the render node.
+    DRM_MAJOR = 226
+    # The virtio-gpu PCI identity. vendor/device/class are what the guest's own
+    # scan reports (drivers/src/pci.rs::scan prints 0x1AF4:0x1050; class_rev's
+    # top byte is 0x03 = display, subclass 0x80 = other) and are fixed
+    # properties of QEMU's virtio-gpu-pci / virtio-gpu-gl-pci — the two differ
+    # only in whether virgl is enabled, never in PCI ids.
+    PCI_VENDOR      = 0x1af4
+    PCI_DEVICE      = 0x1050   # 0x1040 + 16 (VIRTIO_ID_GPU), i.e. modern virtio
+    PCI_REVISION    = 0x01     # QEMU stamps revision 1 on every modern-only virtio device
+    PCI_SUBVENDOR   = 0x1af4
+    PCI_SUBDEVICE   = 0x1100   # PCI_SUBDEVICE_ID_QEMU
+    PCI_CLASS       = 0x038000 # display / other / prog-if 0
+    # Bus address. The image is built before the guest enumerates anything, so
+    # this has to be baked; it is the slot QEMU actually assigns, with the GPU
+    # the 4th -device on the bus after drive0/data0/data1 (scripts/run-qemu.sh
+    # and .claude/skills/run-leandros/driver.py agree on that order for both
+    # machines: aarch64 "virt" puts the host bridge at 00:00.0, q35 puts the MCH
+    # there and its ICH9 functions at 00:1f.x, so either way the four -device
+    # entries land on slots 1..4). Nothing in this stack makes a decision from
+    # the value — libdrm only parses it into drmPciBusInfo, and its one load-
+    # bearing property is that BOTH nodes report the same string so
+    # drmFoldDuplicatedDevices merges them.
+    PCI_SLOT_NAME = "0000:00:04.0"
+
+    # sysfs_files carries (image_dir, name, content_bytes, mode); it is folded
+    # into the same per-inode packing table as the /usr/share tree below. The
+    # content is inline bytes rather than a host path, which add_files_to_dir
+    # already understands (it skips the hardlink dedup for those).
+    sysfs_files = []
+
+    def _sysfs_attr(image_dir, name, content, mode=0o100444):
+        data = content.encode('ascii') if isinstance(content, str) else content
+        sysfs_files.append((image_dir, name, data, mode))
+
+    # A 64-byte slice of PCI configuration space, laid out per the PCI spec at
+    # exactly the offsets libdrm's parse_config_sysfs_file reads: vendor 0x00,
+    # device 0x02, revision 0x08, class triple 0x09..0x0b, subsystem 0x2c/0x2e.
+    # Only reached if the individual attribute files above ever fail to open.
+    _cfg = bytearray(64)
+    struct.pack_into('<HH', _cfg, 0x00, PCI_VENDOR, PCI_DEVICE)
+    _cfg[0x08] = PCI_REVISION
+    _cfg[0x09] = PCI_CLASS & 0xFF          # prog-if
+    _cfg[0x0a] = (PCI_CLASS >> 8) & 0xFF   # subclass
+    _cfg[0x0b] = (PCI_CLASS >> 16) & 0xFF  # base class
+    struct.pack_into('<HH', _cfg, 0x2c, PCI_SUBVENDOR, PCI_SUBDEVICE)
+
+    _uevent = (
+        "DRIVER=virtio-pci\n"
+        f"PCI_CLASS={PCI_CLASS:X}\n"
+        f"PCI_ID={PCI_VENDOR:04X}:{PCI_DEVICE:04X}\n"
+        f"PCI_SUBSYS_ID={PCI_SUBVENDOR:04X}:{PCI_SUBDEVICE:04X}\n"
+        f"PCI_SLOT_NAME={PCI_SLOT_NAME}\n"
+        f"MODALIAS=pci:v{PCI_VENDOR:08X}d{PCI_DEVICE:08X}"
+        f"sv{PCI_SUBVENDOR:08X}sd{PCI_SUBDEVICE:08X}"
+        f"bc{(PCI_CLASS >> 16) & 0xFF:02X}sc{(PCI_CLASS >> 8) & 0xFF:02X}"
+        f"i{PCI_CLASS & 0xFF:02X}\n"
+    )
+
+    # The bus directory the "subsystem" links point at. Only its name matters to
+    # libdrm (it string-matches the final component), but a link that resolves
+    # is cheaper to reason about than one that dangles.
+    for d in ("/sys", "/sys/bus", "/sys/bus/pci", "/sys/bus/pci/devices"):
+        m4_share_dirs.add(d)
+
+    for _minor, _node in ((0, "card0"), (128, "renderD128")):
+        _base = f"/sys/dev/char/{DRM_MAJOR}:{_minor}"
+        _dev  = _base + "/device"
+        # `device/drm/<node>` holds only THIS node's directory. Linux would list
+        # both siblings there, but drm-rs's node_with_type() enumerates that
+        # directory to find a peer node, and the compositor path that uses it is
+        # the most fragile thing in the tree — listing only the node that owns
+        # the char device keeps card0's discovery byte-identical to before.
+        for d in ("/sys/dev", "/sys/dev/char", _base, _dev,
+                  _dev + "/drm", _dev + "/drm/" + _node):
             m4_share_dirs.add(d)
+        # `../../../../bus/pci`: from /sys/dev/char/<maj>:<min>/device, four
+        # levels up is /sys. Only the trailing "/pci" is ever inspected.
+        _sysfs_attr(_dev, "subsystem", "../../../../bus/pci", 0o120777)
+        _sysfs_attr(_dev, "uevent",           _uevent)
+        _sysfs_attr(_dev, "vendor",           f"0x{PCI_VENDOR:04x}\n")
+        _sysfs_attr(_dev, "device",           f"0x{PCI_DEVICE:04x}\n")
+        _sysfs_attr(_dev, "subsystem_vendor", f"0x{PCI_SUBVENDOR:04x}\n")
+        _sysfs_attr(_dev, "subsystem_device", f"0x{PCI_SUBDEVICE:04x}\n")
+        _sysfs_attr(_dev, "revision",         f"0x{PCI_REVISION:02x}\n")
+        _sysfs_attr(_dev, "class",            f"0x{PCI_CLASS:06x}\n")
+        _sysfs_attr(_dev, "config",           bytes(_cfg))
+
+    # ── M2 Venus ship set (Mesa's virtio Vulkan ICD + the vktest smoke test) ──
+    # Sourced from the venus-lane stage dir directly rather than by copying into
+    # the m3-gl-stack sysroot. Every ship set above already reads from the stage
+    # dir of the lane that produced it (m3-gl-stack, m4-input-ship, m4-client,
+    # m5-session-*), so a venus_root of its own is the established shape; folding
+    # these into another lane's sysroot would mutate an artifact tree this script
+    # does not own and lose the file whenever that sysroot is rebuilt.
+    #
+    # libvulkan_virtio.so's DT_NEEDED closure is libz.so.1, libdrm.so.2,
+    # libwayland-client.so.0, libexpat.so.1 (all in the GL loop above),
+    # libdisplay-info.so.3 (the M4 input loop) and libc.so — i.e. nothing new to
+    # stage. There is deliberately NO Khronos loader on LeandrOS, so the ICD is
+    # never resolved through DT_NEEDED; vktest dlopen()s it by absolute path and
+    # the JSON below exists so anything that does read an ICD manifest finds the
+    # same library_path.
+    venus_root = os.path.expanduser(f"~/code/leandros-artifacts/venus-lane/stage-{arch}")
+    _icd_so = f"{venus_root}/usr/lib/libvulkan_virtio.so"
+    if os.path.exists(_icd_so):
+        usr_lib_files.append(("libvulkan_virtio.so", _icd_so, 0o100755))
+    _vktest = f"{venus_root}/usr/bin/vktest"
+    if os.path.exists(_vktest):
+        bin_files.append(("vktest", _vktest, 0o100755))
+    # The ICD manifest rides the shared /usr/share tree machinery. EVERY ancestor
+    # has to be in m4_share_dirs — /usr is static (ino 15) but /usr/share only
+    # exists because the M4 walk happens to create it, which is not a dependency
+    # worth having.
+    _icd_json = f"{venus_root}/usr/share/vulkan/icd.d/virtio_icd.{arch}.json"
+    if os.path.exists(_icd_json):
+        for d in ("/usr/share", "/usr/share/vulkan", "/usr/share/vulkan/icd.d"):
+            m4_share_dirs.add(d)
+        m4_share_files.append(("/usr/share/vulkan/icd.d",
+                               f"virtio_icd.{arch}.json", _icd_json))
 
     # ── M5 session/compositor ship set (cosmic-comp + D-Bus session + fonts) ──
     # cosmic-comp (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) reuses the exact
@@ -640,7 +803,8 @@ def main():
     _sized = set()
     for name, path, mode in (bin_files + lib_files + usr_lib_files + gbm_files + root_files + etc_files
                              + [(n, p, 0) for (_d, n, p) in m4_share_files]
-                             + [(n, p, 0) for (_d, n, p) in m5_exec_files]):
+                             + [(n, p, 0) for (_d, n, p) in m5_exec_files]
+                             + [(n, c, 0) for (_d, n, c, _m) in sysfs_files]):
         if not isinstance(path, (bytes, bytearray)):
             if path in _sized:
                 continue
@@ -767,6 +931,12 @@ def main():
     for image_dir, name, hostpath in m4_share_files:
         ino = _path_to_ino[image_dir]
         m4_tree_files_by_ino.setdefault(ino, []).append((name, hostpath, 0o100644))
+    # The synthetic sysfs attributes ride the same packing table; they carry
+    # their own mode because one of them (the "subsystem" link) is S_IFLNK and
+    # the rest are 0444 like real sysfs.
+    for image_dir, name, content, mode in sysfs_files:
+        ino = _path_to_ino[image_dir]
+        m4_tree_files_by_ino.setdefault(ino, []).append((name, content, mode))
 
     inode_blocks = {}
     data_blocks = {}
@@ -789,6 +959,12 @@ def main():
     def add_files_to_dir(parent_ino, files):
         nonlocal next_nid, next_blk
         for name, path, mode in files:
+            # A file whose mode says S_IFLNK gets a DT_LNK dentry; everything
+            # else is DT_REG. The inode itself is built identically either way
+            # (mode goes straight into i_mode below, and the target path is just
+            # the file's data), which is what makes symlinks a three-line
+            # addition here rather than a new code path.
+            entry_ftype = DT_LNK if (mode & S_IFMT) == S_IFLNK else DT_REG
             # Hardlink: a host path already packed gets a second directory
             # entry pointing at the same nid rather than a second copy of the
             # content. This is what makes uutils/coreutils viable — its ~100
@@ -804,7 +980,7 @@ def main():
                 shared_nid, shared_inode_blk = packed_by_path[key]
                 nlink_by_path[key] += 1
                 w32(image, shared_inode_blk * BLOCK_SIZE + 12, nlink_by_path[key])
-                file_entries.append((parent_ino, name.encode('utf-8'), shared_nid, DT_REG))
+                file_entries.append((parent_ino, name.encode('utf-8'), shared_nid, entry_ftype))
                 print(f"  Linked {name} -> nid {shared_nid} (hardlink, no extra content)")
                 continue
 
@@ -955,7 +1131,7 @@ def main():
                 packed_by_path[key] = (file_nid, file_inode_blk)
                 nlink_by_path[key] = 1
 
-            file_entries.append((parent_ino, name.encode('utf-8'), file_nid, DT_REG))
+            file_entries.append((parent_ino, name.encode('utf-8'), file_nid, entry_ftype))
             print(f"  Packed {name} (size: {size} bytes, inode blk: {file_inode_blk}, nid: {file_nid})")
             
     print("Packing binaries into /bin...")

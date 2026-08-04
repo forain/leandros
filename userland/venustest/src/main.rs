@@ -12,7 +12,8 @@
 //!
 //! Steps: open card0; GETPARAM probes; CONTEXT_INIT(capset=Venus);
 //! GET_CAPS + non-zero assertion; RESOURCE_CREATE_BLOB + MAP + mmap
-//! write/readback; EXECBUFFER + WAIT.
+//! write/readback; RESOURCE_INFO (fields checked against what was requested,
+//! plus a never-allocated handle that must be refused); EXECBUFFER + WAIT.
 //!
 //! Phase 2 is the regression for per-open-file 3D contexts, and it asserts on
 //! context IDENTITY, not on liveness. That distinction is the whole point:
@@ -57,6 +58,7 @@ const MAP_ANONYMOUS: c_int = 0x20;
 const DRM_IOCTL_VIRTGPU_MAP: c_ulong = 0xC0106441;
 const DRM_IOCTL_VIRTGPU_EXECBUFFER: c_ulong = 0xC0406442;
 const DRM_IOCTL_VIRTGPU_GETPARAM: c_ulong = 0xC0106443;
+const DRM_IOCTL_VIRTGPU_RESOURCE_INFO: c_ulong = 0xC0106445;
 const DRM_IOCTL_VIRTGPU_WAIT: c_ulong = 0xC0086448;
 const DRM_IOCTL_VIRTGPU_GET_CAPS: c_ulong = 0xC0186449;
 const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB: c_ulong = 0xC030644A;
@@ -125,6 +127,16 @@ struct DrmVirtgpuResourceCreateBlob {
     cmd_size: u32,
     cmd: u64,
     blob_id: u64,
+}
+
+/// `struct drm_virtgpu_resource_info` — bo_handle in, the other three out.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmVirtgpuResourceInfo {
+    bo_handle: u32,
+    res_handle: u32,
+    size: u32,
+    blob_mem: u32,
 }
 
 #[repr(C)]
@@ -565,6 +577,81 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
         }
     }
     let _ = mapped_ok;
+
+    // ── 4b. RESOURCE_INFO ────────────────────────────────────────────────────
+    // The last virtgpu ioctl Mesa's Venus ICD needs. Its two callers in
+    // vn_renderer_virtgpu.c reject an import whose blob_mem is not the type they
+    // allocate with, and take `size` as the mmap size for the blob — so as with
+    // get_caps, "the ioctl returned 0" proves nothing and the values are checked
+    // against what RESOURCE_CREATE_BLOB was actually asked for.
+    if blob_ok {
+        let mut info = DrmVirtgpuResourceInfo {
+            bo_handle: blob.bo_handle,
+            ..Default::default()
+        };
+        let rc = ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &mut info as *mut _);
+        if !report(b"resource_info", rc == 0) { failures += 1; }
+        if rc == 0 {
+            out(b"  info res_handle = ");
+            out_u64(info.res_handle as u64);
+            out(b" size = ");
+            out_u64(info.size as u64);
+            out(b" blob_mem = ");
+            out_u64(info.blob_mem as u64);
+            out(b"\n");
+            // bo_handle is an input: the kernel must leave it alone.
+            // size is the page-aligned allocation, so >= what we asked for.
+            let fields_ok = info.bo_handle == blob.bo_handle
+                && info.res_handle == blob.res_handle
+                && info.size as usize >= BLOB_SIZE
+                && info.blob_mem == VIRTGPU_BLOB_MEM_GUEST;
+            if !fields_ok {
+                out(b"  expected res_handle = ");
+                out_u64(blob.res_handle as u64);
+                out(b", size >= ");
+                out_u64(BLOB_SIZE as u64);
+                out(b", blob_mem = ");
+                out_u64(VIRTGPU_BLOB_MEM_GUEST as u64);
+                out(b", bo_handle = ");
+                out_u64(blob.bo_handle as u64);
+                out(b"\n");
+            }
+            if !report(b"resource_info_fields_match", fields_ok) { failures += 1; }
+        }
+    }
+
+    // A handle that was never allocated must be refused outright. This runs
+    // unconditionally — including on a host with no 3D support, where blob
+    // creation above was refused and nothing else in this section executes — so
+    // that the "resource does not exist" path is always covered and is seen to
+    // return an error rather than hang or fault.
+    //
+    // CAVEAT: this check alone cannot prove the ioctl is IMPLEMENTED. The DRM
+    // server collapses every DriverError to a single -1, so "refused: no such
+    // handle" and "refused: unknown ioctl" are indistinguishable from userspace;
+    // a kernel missing the dispatch arm entirely would also PASS here. What
+    // separates them is the kernel's serial line
+    // `[DRM] RESOURCE_INFO: unknown bo_handle=…`, and `resource_info_fields_match`
+    // above — which only runs where a blob can actually be created.
+    {
+        const NO_SUCH_HANDLE: u32 = 0x7FFF_FFFF;
+        let mut info = DrmVirtgpuResourceInfo {
+            bo_handle: NO_SUCH_HANDLE,
+            ..Default::default()
+        };
+        let rc = ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &mut info as *mut _);
+        // Refused AND nothing written back: a kernel that "failed" but still
+        // filled the struct would feed Mesa a bogus resource id.
+        let refused = rc != 0 && info.res_handle == 0 && info.size == 0 && info.blob_mem == 0;
+        if !refused {
+            out(b"  expected refusal for bo_handle ");
+            out_u64(NO_SUCH_HANDLE as u64);
+            out(b", got rc = ");
+            out_hex(rc as u32 as u64);
+            out(b"\n");
+        }
+        if !report(b"resource_info_bad_handle_refused", refused) { failures += 1; }
+    }
 
     // ── 5. EXECBUFFER + WAIT ─────────────────────────────────────────────────
     // The payload is NOT a valid Venus command stream (encoding those is M2's

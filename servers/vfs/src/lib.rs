@@ -1504,6 +1504,17 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/bin",
     b"/tmp",
     b"/dev/shm",
+    // The DRM node directory. Its *contents* have always been synthesised from
+    // the dynamic-device registry (see the getdents pass below), but the
+    // directory itself was not openable, and libdrm's drmGetDevices2() opens
+    // with `opendir(DRM_DIR_NAME)` and bails out with -errno the moment that
+    // fails (xf86drm.c:4855) — so every DRM node was invisible to it no matter
+    // what /sys said. Listing it here is what makes open/stat/getdents agree on
+    // it. Deliberately NOT done for /dev/input: making that directory
+    // enumerable would newly expose event0/event1 to libinput's own scan, which
+    // is a live behavioural change in the compositor input path and no part of
+    // this.
+    b"/dev/dri",
     b"/run",
     b"/run/user",
     b"/mnt",
@@ -4315,7 +4326,16 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                     if let Some(slash_pos) = name.find('/') {
                         // This is a directory (e.g., "dri" in "/dev/dri/card0" when listing "/dev")
                         let dir_name = &name[..slash_pos];
-                        
+
+                        // ...unless the RAMFS_DIRS pass above already emitted
+                        // it. /dev/dri is listed there now (so that opendir and
+                        // stat work on it), and without this guard `ls /dev`
+                        // would show it twice — once from each pass. The index
+                        // bookkeeping stays right because that pass already
+                        // consumed a virtual_idx for it.
+                        let full = &device.path.as_bytes()[..dir_len + 1 + slash_pos];
+                        if RAMFS_DIRS.iter().any(|&d| d == full) { continue; }
+
                         // Check if we already added this directory
                         if !seen_dirs.iter().any(|&d| d == Some(dir_name)) {
                             if virtual_idx >= pos {

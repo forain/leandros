@@ -274,6 +274,7 @@ const DRM_IOCTL_VIRTGPU_MAP: u32 = 0xC0106441;                  // drm_virtgpu_m
 const DRM_IOCTL_VIRTGPU_EXECBUFFER: u32 = 0xC0406442;           // drm_virtgpu_execbuffer, 64
 const DRM_IOCTL_VIRTGPU_GETPARAM: u32 = 0xC0106443;             // drm_virtgpu_getparam, 16
 const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: u32 = 0xC0386444;      // 14 * u32 = 56
+const DRM_IOCTL_VIRTGPU_RESOURCE_INFO: u32 = 0xC0106445;        // 4 * u32 = 16
 const DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: u32 = 0xC02C6446;   // 11 * u32 = 44
 const DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: u32 = 0xC02C6447;     // 11 * u32 = 44
 const DRM_IOCTL_VIRTGPU_WAIT: u32 = 0xC0086448;                 // drm_virtgpu_3d_wait, 8
@@ -588,6 +589,39 @@ struct drm_virtgpu_3d_wait {
     flags: u32,
 }
 
+/// `struct drm_virtgpu_resource_info` — four u32s, 16 bytes.
+///
+/// `bo_handle` is in; `res_handle`, `size` and `blob_mem` are out. Verbatim from
+/// Mesa's vendored copy of the kernel uAPI
+/// (`mesa/include/drm-uapi/virtgpu_drm.h`), which is the header the Venus ICD is
+/// compiled against, and byte-identical to libdrm's and the kernel's own.
+///
+/// NOTE the ioctl number: DRM_IOWR over a 16-byte struct is 0xC010_6445. A
+/// 0xC01C_6445 (0x1C = 28-byte) encoding is sometimes quoted for this ioctl and
+/// is wrong — no revision of this struct has ever been 28 bytes. (0x1C is
+/// DRM_IOCTL_MODE_ADDFB's payload size, a few lines above.)
+#[repr(C)]
+struct drm_virtgpu_resource_info {
+    bo_handle: u32,
+    res_handle: u32,
+    size: u32,
+    blob_mem: u32,
+}
+
+/// The ioctl number embeds the struct's size, so a field added to the struct
+/// without updating the constant (or vice versa) is a silent ABI break that
+/// only shows up as "Mesa's ioctl matched no dispatch arm". Tie the two
+/// together at compile time instead — see the DRM_IOWR formula above.
+const _: () = assert!(
+    DRM_IOCTL_VIRTGPU_RESOURCE_INFO
+        == (3u32 << 30)
+            | ((::core::mem::size_of::<drm_virtgpu_resource_info>() as u32) << 16)
+            | (0x64u32 << 8)
+            | (DRM_COMMAND_BASE + 0x05)
+);
+/// `DRM_COMMAND_BASE` from drm.h: driver-private ioctl nrs start at 0x40.
+const DRM_COMMAND_BASE: u32 = 0x40;
+
 #[repr(C)]
 struct drm_virtgpu_resource_create_blob {
     blob_mem: u32,
@@ -643,6 +677,11 @@ struct BlobBuf {
     order: usize,
     res_handle: u32,
     size: u64,
+    /// `blob_mem` the blob was created with (VIRTIO_GPU_BLOB_MEM_*). Never 0:
+    /// RESOURCE_CREATE_BLOB rejects blob_mem == 0, so every entry in this map is
+    /// a real blob. RESOURCE_INFO reports it, and Mesa's Venus backend refuses
+    /// an imported BO whose blob_mem is not the one it allocates with.
+    blob_mem: u32,
     /// The 3D context this blob was attached to at creation (0 = none). Kept
     /// per-blob because the context is now per-open: freeing the blob must
     /// detach it from *its* context, not from whichever one happens to be
@@ -1023,6 +1062,7 @@ impl DrmDeviceInterface {
             DRM_IOCTL_VIRTGPU_CONTEXT_INIT => self.virtgpu_handle_context_init(arg, open_id),
             DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => self.virtgpu_handle_resource_create_blob(arg, open_id),
             DRM_IOCTL_VIRTGPU_MAP => self.virtgpu_handle_map(arg),
+            DRM_IOCTL_VIRTGPU_RESOURCE_INFO => self.virtgpu_handle_resource_info(arg),
             DRM_IOCTL_VIRTGPU_WAIT => self.virtgpu_handle_wait(arg),
 
             // ── K4: Mesa/GBM buffer + Smithay/libdrm KMS surface ──
@@ -2703,7 +2743,7 @@ impl DrmDeviceInterface {
         let handle = NEXT_BLOB_HANDLE.fetch_add(1, Ordering::Relaxed);
         BLOB_BUFFERS.lock().insert(
             handle,
-            BlobBuf { phys, order, res_handle, size: req.size, ctx },
+            BlobBuf { phys, order, res_handle, size: req.size, blob_mem: req.blob_mem, ctx },
         );
 
         // Write back only bo_handle (offset 8) and res_handle (offset 12) rather
@@ -2734,6 +2774,75 @@ impl DrmDeviceInterface {
         }
         // `offset` is the first u64 of drm_virtgpu_map.
         unsafe { (arg as *mut u64).write_volatile(phys as u64) };
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_VIRTGPU_RESOURCE_INFO — describe the resource behind a BO
+    /// handle. This is the last virtgpu ioctl Mesa's Venus ICD needs from us.
+    ///
+    /// Mirrors upstream `virtio_gpu_resource_info_ioctl`: look the GEM object up
+    /// by `bo_handle`, then report
+    ///   * `res_handle` — the host's resource id,
+    ///   * `size`       — the GEM object's size, i.e. the PAGE-ALIGNED creation
+    ///                    size (upstream reads `qobj->base.base.size`, and
+    ///                    `virtio_gpu_object_create` rounds the request up to a
+    ///                    page). Deliberately NOT the buddy allocation, which is
+    ///                    rounded further to a power of two: Mesa takes this
+    ///                    value as the mmap size for the blob, so over-reporting
+    ///                    would hand it a window past the resource.
+    ///   * `blob_mem`   — the blob memory type, which upstream leaves at the
+    ///                    caller's zero for a non-blob resource.
+    /// `bo_handle` is an input and is left exactly as the caller set it.
+    ///
+    /// Mesa's two callers (`virtgpu_bo_create_from_dma_buf`,
+    /// `virtgpu_bo_create_from_device_memory` in vn_renderer_virtgpu.c) both
+    /// require `blob_mem` to equal the type they allocate with and `size` to be
+    /// at least the size they asked for, so all three outputs are load-bearing —
+    /// returning 0 here would fail the import rather than degrade it.
+    ///
+    /// NOT open-scoped, and it takes no `open_id`. Upstream resolves the handle
+    /// through the per-`drm_file` GEM table, but this driver's BO handle space is
+    /// process-global (`NEXT_BLOB_HANDLE` / `BLOB_BUFFERS`), and so are the two
+    /// ioctls that already consume a handle — VIRTGPU_MAP and GEM_CLOSE. Scoping
+    /// only the query would be strictly incoherent (a handle another open could
+    /// still map and close, but not describe) and would amount to inventing half
+    /// a new isolation model; per-open handle tables are a whole separate change.
+    /// It costs Mesa nothing either way: it creates and queries on the same fd.
+    ///
+    /// Only blob BOs are known here. A dumb-buffer handle has no `res_handle`
+    /// recorded (DumbBuf carries only phys/order), and Venus never creates dumb
+    /// buffers, so an unknown handle is refused with NotFound — upstream's
+    /// -ENOENT for a handle lookup miss.
+    fn virtgpu_handle_resource_info(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        // Read the input BEFORE taking any lock, and write the outputs back
+        // AFTER dropping it: a demand fault taken under a spinlock is the
+        // 82d0cc3 all-vCPU freeze class. No device round-trip is needed — this
+        // is pure guest-side bookkeeping — so VIRTIO_GPU is never locked at all.
+        let req = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_resource_info) };
+
+        let blob = match BLOB_BUFFERS.lock().get(&req.bo_handle) {
+            Some(b) => *b,
+            None => {
+                crate::pci::serial_debug("[DRM] RESOURCE_INFO: unknown bo_handle=");
+                crate::pci::serial_debug_hex(req.bo_handle);
+                crate::pci::serial_debug("\n");
+                return Err(DriverError::NotFound);
+            }
+        };
+
+        // Page-align, as the GEM object size is. The cast cannot truncate:
+        // RESOURCE_CREATE_BLOB caps `size` at MAX_BLOB_BYTES (64 MiB).
+        let size = ((blob.size + 0xFFF) & !0xFFFu64) as u32;
+
+        // Write the three output fields individually (offsets 4/8/12), leaving
+        // the caller's `bo_handle` at offset 0 untouched — same discipline as
+        // RESOURCE_CREATE_BLOB's write-back.
+        unsafe {
+            (arg as *mut u8).add(4).cast::<u32>().write_volatile(blob.res_handle);
+            (arg as *mut u8).add(8).cast::<u32>().write_volatile(size);
+            (arg as *mut u8).add(12).cast::<u32>().write_volatile(blob.blob_mem);
+        }
         Ok(0)
     }
 
