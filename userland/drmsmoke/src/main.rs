@@ -26,6 +26,7 @@ const O_RDWR: c_int = 0o2;
 const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x1;
+const MAP_ANONYMOUS: c_int = 0x20;
 
 // ── DRM ioctl request codes (64-bit, authoritative) ──────────────────────────
 const DRM_IOCTL_VERSION: c_ulong = 0xC0406400;
@@ -231,6 +232,11 @@ extern "C" {
 
     pub fn open(path: *const u8, oflag: c_int, ...) -> c_int;
     pub fn close(fd: c_int) -> c_int;
+    // Used only by the fork-with-a-device-mapping check; same relibc-linked
+    // idiom as forktest.
+    pub fn fork() -> i32;
+    pub fn waitpid(pid: i32, stat_loc: *mut c_int, options: c_int) -> i32;
+    pub fn _exit(status: c_int) -> !;
     pub fn usleep(usec: c_uint) -> c_int;
     pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     pub fn fstat(fildes: c_int, buf: *mut u8) -> c_int;
@@ -483,6 +489,97 @@ pub unsafe extern "C" fn drm_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut
     if !report(b"PRIME_FD_TO_HANDLE", import_ok) { failures += 1; }
 
     if export_ok { close(ph.fd); }
+
+    // ── fork() with a device mapping live ────────────────────────────────────
+    //
+    // A dumb buffer's mmap is a DEVICE VMA: the kernel records the physical
+    // range with the `file_cap == usize::MAX` sentinel and, unlike ordinary
+    // memory, does not own those pages — teardown drops the PTEs and frees
+    // nothing (mm/src/vmm.rs). fork used to duplicate such a VMA by COPYING it
+    // into a fresh buddy allocation, which is wrong in two different ways:
+    //
+    //   * the child was handed a private snapshot instead of the device, so its
+    //     writes went nowhere and the parent's writes were invisible to it;
+    //   * where the physical range is not RAM at all — a host-visible virtio-gpu
+    //     blob lives in the shared-memory BAR — the copy's source address is
+    //     outside the kernel's direct map and the memcpy took the whole machine
+    //     down (`Vector=0x0E RIP=memcpy+0xe`).
+    //
+    // This runs on EVERY host, including one with no 3D and no blob support: a
+    // dumb buffer needs neither. The second assertion is what catches the
+    // copying fork here — a machine whose device ranges are all RAM-backed
+    // cannot reproduce the panic, but it can absolutely prove the mapping is
+    // shared rather than copied. (venustest carries the same check over a
+    // host-visible blob, for hosts that can make one.)
+    //
+    // Its own small buffer, so the on-screen gradient below is untouched.
+    {
+        let mut fd_cd = DrmModeCreateDumb::default();
+        fd_cd.width = 64;
+        fd_cd.height = 64;
+        fd_cd.bpp = 32;
+        let fk_create = ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut fd_cd as *mut _) == 0
+            && fd_cd.handle != 0 && fd_cd.size > 0;
+        let mut fk_md = DrmModeMapDumb::default();
+        fk_md.handle = fd_cd.handle;
+        let fk_map = fk_create && ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut fk_md as *mut _) == 0;
+        let mut dev: *mut u8 = core::ptr::null_mut();
+        if fk_map {
+            let p = mmap(core::ptr::null_mut(), fd_cd.size as usize,
+                         PROT_READ | PROT_WRITE, MAP_SHARED, fd, fk_md.offset as i64);
+            if p as isize > 0 { dev = p as *mut u8; }
+        }
+        // The child's only way to answer. Ordinary MAP_SHARED anonymous memory
+        // — deliberately, since that is the fork path the whole Wayland stack
+        // depends on, so it doubles as a check that it still works.
+        let sh = mmap(core::ptr::null_mut(), 4096, PROT_READ | PROT_WRITE,
+                      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if dev.is_null() || sh as isize <= 0 {
+            if !report(b"FORK_DEVMAP_CHILD_SEES_IT", false) { failures += 1; }
+            if !report(b"FORK_DEVMAP_SHARED_NOT_COPIED", false) { failures += 1; }
+        } else {
+            const HEAD: u8 = 0xA7;
+            const TAIL: u8 = 0x5C;
+            const CHILD: u8 = 0x3E;
+            let last = fd_cd.size as usize - 1;
+            let verdict = sh as *mut u8;
+            *verdict = 0;
+            *dev.add(0) = HEAD;
+            *dev.add(last) = TAIL;
+
+            let r = fork();
+            if r == 0 {
+                // Every access here is through a mapping that exists only
+                // because fork built it.
+                let seen = *dev.add(0) == HEAD && *dev.add(last) == TAIL;
+                *verdict = if seen { 1 } else { 2 };
+                *dev.add(0) = CHILD;
+                _exit(0);
+            }
+            if r < 0 {
+                if !report(b"FORK_DEVMAP_CHILD_SEES_IT", false) { failures += 1; }
+                if !report(b"FORK_DEVMAP_SHARED_NOT_COPIED", false) { failures += 1; }
+            } else {
+                let mut status: c_int = 0;
+                waitpid(r, &mut status, 0);
+                // A child that faulted on the mapping does not exit 0 — and a
+                // kernel that faulted *building* it never gets here at all.
+                let reaped = (status & 0x7f) == 0 && ((status >> 8) & 0xff) == 0;
+                if !report(b"FORK_DEVMAP_CHILD_SEES_IT", reaped && *verdict == 1) {
+                    failures += 1;
+                }
+                // The child is gone and its address space was torn down; for a
+                // device VMA that must drop PTEs and free nothing, so the
+                // parent's mapping is both intact and carrying the child's store.
+                let shared = reaped && *dev.add(0) == CHILD && *dev.add(last) == TAIL;
+                if !report(b"FORK_DEVMAP_SHARED_NOT_COPIED", shared) { failures += 1; }
+            }
+        }
+        if fd_cd.handle != 0 {
+            let mut h = fd_cd.handle;
+            ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut h as *mut u32);
+        }
+    }
 
     // Hold the gradient on-screen so a screenshot can confirm the present path
     // actually reached the host (Risk R5). Re-flush each pass in case the host

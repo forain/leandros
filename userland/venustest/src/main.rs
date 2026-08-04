@@ -274,6 +274,114 @@ fn report(name: &[u8], ok: bool) -> bool {
     ok
 }
 
+/// fork() while `map` (a live *device* mapping of `len` bytes, obtained by
+/// mmap()ing a VIRTGPU_MAP token) is in the address space, and check both
+/// things fork owes such a mapping. Returns the number of FAILs.
+///
+/// WHY THIS EXISTS. A device VMA is the one mapping class whose pages the
+/// kernel does not own: `map_device` records the physical range with the
+/// `file_cap == usize::MAX` sentinel, and both teardown paths deliberately drop
+/// the PTEs without freeing the frames. fork used to duplicate such a VMA by
+/// *copying* it into a fresh buddy allocation, which is wrong twice over:
+///
+///   1. It cannot work at all when the range is not RAM. For a host-visible
+///      (HOST3D) blob the physical base is a PCI BAR address inside the
+///      virtio-gpu shared-memory window; the kernel's phys→virt of it lands
+///      outside the HHDM, and the copy took the whole machine down in memcpy
+///      (`Vector=0x0E RIP=memcpy+0xe CR2=<HHDM base + window offset>`).
+///   2. Even where the copy succeeded — a dumb buffer, a guest-backed blob —
+///      it silently disconnected the child from the device, handing it a
+///      private snapshot of the pixels/ring instead of the thing itself.
+///
+/// So the two assertions are "the child survived and can read it" and "it is
+/// the same memory on both sides". Note only the *second* would have caught the
+/// bug on a machine whose device mappings are all RAM-backed; the first needs a
+/// range outside RAM, i.e. a host that offers 3D.
+unsafe fn check_fork_with_device_mapping(
+    map: *mut u8,
+    len: usize,
+    n_survive: &[u8],
+    n_shared: &[u8],
+) -> i32 {
+    let mut failures = 0i32;
+    // The child's only way to report back. Ordinary MAP_SHARED anonymous
+    // memory, deliberately: it is also the fork path COSMIC depends on, so it
+    // doubles as a check that this change did not disturb it.
+    let sh = mmap(
+        core::ptr::null_mut(),
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if sh as isize == -1 || sh.is_null() {
+        if !report(n_survive, false) { failures += 1; }
+        if !report(n_shared, false) { failures += 1; }
+        return failures;
+    }
+    let verdict = sh as *mut u8;
+    *verdict = 0;
+
+    // Stamp both ends of the range before forking, so the child's read covers
+    // the first and last page rather than one lucky page.
+    const PARENT_HEAD: u8 = 0xA7;
+    const PARENT_TAIL: u8 = 0x5C;
+    const CHILD_MARK: u8 = 0x3E;
+    let tail = len - 1;
+    *map.add(0) = PARENT_HEAD;
+    *map.add(tail) = PARENT_TAIL;
+
+    let r = fork();
+    if r == 0 {
+        // Child. Every load and store below is through a mapping that only
+        // exists because fork built it.
+        let seen = *map.add(0) == PARENT_HEAD && *map.add(tail) == PARENT_TAIL;
+        *verdict = if seen { 1 } else { 2 };
+        *map.add(0) = CHILD_MARK;
+        _exit(0);
+    }
+    if r < 0 {
+        if !report(n_survive, false) { failures += 1; }
+        if !report(n_shared, false) { failures += 1; }
+        return failures;
+    }
+
+    let mut status: c_int = 0;
+    waitpid(r, &mut status, 0);
+    // A child that faulted on the mapping does not exit 0 — and a kernel that
+    // faulted *building* it never gets here at all.
+    let reaped = wifexited(status) && wexitstatus(status) == 0;
+    if !reaped || *verdict != 1 {
+        out(b"  child exit ok = ");
+        out_u64(reaped as u64);
+        out(b", child read verdict = ");
+        out_u64(*verdict as u64);
+        out(b" (1 = saw the parent's stamps)\n");
+    }
+    if !report(n_survive, reaped && *verdict == 1) { failures += 1; }
+
+    // The child is gone: its address space was torn down, which for a device
+    // VMA must drop PTEs and free nothing. The parent's mapping therefore has
+    // to be both intact and carrying the child's store.
+    let head_now = *map.add(0);
+    let tail_now = *map.add(tail);
+    let shared = reaped && head_now == CHILD_MARK && tail_now == PARENT_TAIL;
+    if !shared {
+        out(b"  after child exit head = ");
+        out_hex(head_now as u64);
+        out(b" (want ");
+        out_hex(CHILD_MARK as u64);
+        out(b"), tail = ");
+        out_hex(tail_now as u64);
+        out(b" (want ");
+        out_hex(PARENT_TAIL as u64);
+        out(b")\n");
+    }
+    if !report(n_shared, shared) { failures += 1; }
+    failures
+}
+
 /// A GETPARAM probe: prints the value and returns it (u64::MAX on ioctl error).
 unsafe fn getparam(fd: c_int, param: u64, name: &[u8]) -> u64 {
     let mut val: u64 = 0;
@@ -889,6 +997,131 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
                 // fails this one.
                 if !report(b"host3d_window_offset_reused", offsets_reused) { failures += 1; }
             }
+        }
+    }
+
+    // ── 4d. fork() with a device mapping live ────────────────────────────────
+    //
+    // Two halves, and they run on different machines ON PURPOSE:
+    //
+    //   * GUEST-BACKED half — runs everywhere, including a plain virtio-gpu-pci
+    //     host with no 3D at all. The mapping is a device VMA whose physical
+    //     range happens to be guest RAM, so the child inherits it and the
+    //     SHARED assertion is what carries the weight: a fork that copies the
+    //     VMA passes "child survived" and fails "same memory".
+    //   * HOST-VISIBLE half — needs a host that grants RESOURCE_MAP_BLOB, so it
+    //     is skipped (loudly) on any host without a shared-memory window. There
+    //     the physical range is a PCI BAR, outside RAM entirely, and it is the
+    //     SURVIVED assertion that carries the weight: the old copying fork
+    //     never returned from this at all, it panicked the kernel in memcpy.
+    //
+    // A skip prints a line rather than a PASS. Nothing here is asserted to have
+    // been exercised that was not.
+    out(b"--- 4d: fork() with a device mapping live ---\n");
+    {
+        // Guest-backed: its own blob, closed at the end, so this section does
+        // not depend on what section 4 left behind.
+        const FORK_BLOB_SIZE: usize = 64 * 1024;
+        let mut fb = DrmVirtgpuResourceCreateBlob {
+            blob_mem: VIRTGPU_BLOB_MEM_GUEST,
+            blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+            bo_handle: 0,
+            res_handle: 0,
+            size: FORK_BLOB_SIZE as u64,
+            pad: 0,
+            cmd_size: 0,
+            cmd: 0,
+            blob_id: 0,
+        };
+        let crc = ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, &mut fb as *mut _);
+        let mut mapped: *mut u8 = core::ptr::null_mut();
+        if crc == 0 && fb.bo_handle != 0 {
+            let mut m = DrmVirtgpuMap { offset: 0, handle: fb.bo_handle, pad: 0 };
+            if ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &mut m as *mut _) == 0 && m.offset != 0 {
+                let p = mmap(
+                    core::ptr::null_mut(),
+                    FORK_BLOB_SIZE,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED,
+                    fd,
+                    m.offset as i64,
+                );
+                if p as isize > 0 { mapped = p as *mut u8; }
+            }
+        }
+        if mapped.is_null() {
+            // A guest-BACKED blob still needs the host to offer
+            // VIRTIO_GPU_F_RESOURCE_BLOB — the guest supplying the pages does not
+            // make the command work on a host that does not implement it. On a
+            // plain virtio-gpu-pci host every blob path is refused, so this is a
+            // skip, not a failure. The device-VMA fork path is covered there by
+            // drmsmoke's FORK_DEVMAP_* version of this same test, which needs no
+            // 3D and no blob support at all.
+            out(b"  SKIPPED guest half: host refuses RESOURCE_CREATE_BLOB (no blob support)\n");
+            out(b"  (drmsmoke's FORK_DEVMAP_* covers the device-VMA fork path here)\n");
+        } else {
+            failures += check_fork_with_device_mapping(
+                mapped,
+                FORK_BLOB_SIZE,
+                b"fork_with_device_map_guest_survives",
+                b"fork_with_device_map_guest_shared",
+            );
+        }
+        if fb.bo_handle != 0 { gem_close(fd, fb.bo_handle); }
+
+        // Host-visible: only where the device advertises a window.
+        let win_mib_raw = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_HOSTVIS_MIB);
+        let win_mib = if win_mib_raw == u64::MAX { 0 } else { win_mib_raw };
+        let mut hv_mapped: *mut u8 = core::ptr::null_mut();
+        let mut hv_handle: u32 = 0;
+        if win_mib > 0 {
+            const RING_SIZE: usize = 132 * 1024;
+            let mut hb = DrmVirtgpuResourceCreateBlob {
+                blob_mem: VIRTGPU_BLOB_MEM_HOST3D,
+                blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+                bo_handle: 0,
+                res_handle: 0,
+                size: RING_SIZE as u64,
+                pad: 0,
+                cmd_size: 0,
+                cmd: 0,
+                blob_id: 0,
+            };
+            if ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, &mut hb as *mut _) == 0
+                && hb.bo_handle != 0
+            {
+                hv_handle = hb.bo_handle;
+                let mut m = DrmVirtgpuMap { offset: 0, handle: hb.bo_handle, pad: 0 };
+                if ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &mut m as *mut _) == 0 && m.offset != 0 {
+                    let p = mmap(
+                        core::ptr::null_mut(),
+                        RING_SIZE,
+                        PROT_READ | PROT_WRITE,
+                        MAP_SHARED,
+                        fd,
+                        m.offset as i64,
+                    );
+                    if p as isize > 0 { hv_mapped = p as *mut u8; }
+                }
+            }
+            if !hv_mapped.is_null() {
+                failures += check_fork_with_device_mapping(
+                    hv_mapped,
+                    RING_SIZE,
+                    b"fork_with_device_map_hostvis_survives",
+                    b"fork_with_device_map_hostvis_shared",
+                );
+            } else {
+                // A window exists but this host would not give us a mappable
+                // HOST3D blob (see 4c: only Mesa can mint a valid blob_id).
+                // Still not a failure — but say so, so the skip is never read
+                // as coverage.
+                out(b"  SKIPPED hostvis half: window present but no mappable HOST3D blob\n");
+            }
+            if hv_handle != 0 { gem_close(fd, hv_handle); }
+        } else {
+            out(b"  SKIPPED hostvis half: no host-visible window on this host\n");
+            out(b"  (the outside-RAM device VMA that panicked the kernel needs a 3D host)\n");
         }
     }
 

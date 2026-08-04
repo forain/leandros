@@ -12,10 +12,10 @@
 //! refcounted only so teardown frees the frame exactly once.
 //!
 //! Device (MMIO) mappings — identified by the `file_cap == usize::MAX`
-//! sentinel `map_device` uses — are duplicated into fresh private RAM rather
-//! than shared, preserving the pre-CoW behavior; sharing a live device
-//! physical range across two address spaces via this path isn't a case this
-//! phase changes.
+//! sentinel `map_device` uses — are *aliased* into the child: the same
+//! physical range is mapped a second time, with the original permissions, and
+//! nothing is copied or refcounted. See the branch below for why that is the
+//! only correct answer for this VMA class.
 //!
 //! Pages that were never faulted in before the fork are left as absent on
 //! both sides; the first touch by either sibling afterward demand-pages
@@ -64,24 +64,55 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
         let is_device = region.file_cap == usize::MAX;
 
         if !region.lazy && is_device {
-            // Device (MMIO) mapping: duplicate into fresh RAM rather than
-            // sharing the physical device range (unchanged pre-CoW behavior).
+            // ── Device (MMIO) mapping: ALIAS, never copy ─────────────────────
+            //
+            // The discriminator is deliberately `file_cap == usize::MAX` — "is
+            // this a device VMA" — and not "is this MAP_SHARED" or "does this
+            // physical range fall outside RAM":
+            //
+            //   * MAP_SHARED is far too broad. Shared tmpfs/memfd VMOs and
+            //     shared anonymous memory are also MAP_SHARED, but they own
+            //     real, refcounted RAM frames and must keep going through the
+            //     `pageref` path below — that is the machinery the whole
+            //     Wayland stack runs on.
+            //   * "outside RAM" is too narrow, and untestable besides. It would
+            //     leave the copy in place for a dumb buffer or a guest-backed
+            //     blob, where copying is just as wrong (a child that inherits
+            //     the scanout must write to *the* scanout, not to a snapshot of
+            //     it), and it would make fork behavior depend on where the host
+            //     happened to place a BAR — a distinction no test on a machine
+            //     without a host-visible window can ever exercise.
+            //
+            // `file_cap == usize::MAX` is set in exactly one place,
+            // `AddressSpace::map_device`, and it already means "this range is
+            // not ours to own": both teardown paths (`Drop for AddressSpace`
+            // and `unmap_range`) drop the PTEs and deliberately never free the
+            // frames, and `split_at` refuses to subdivide such a VMA. Every
+            // such VMA is created MAP_SHARED and eager, so aliasing preserves
+            // the ownership rules already in force rather than inventing new
+            // ones: no `pageref` entry is needed (nobody frees these pages), no
+            // permission is downgraded (a device mapping must never take a CoW
+            // fault — promoting a BAR page to a private RAM copy would silently
+            // disconnect the child from the hardware), and the parent is left
+            // untouched.
+            //
+            // The copy this replaces was a live panic, not just a semantic
+            // wart. For a host-visible virtio-gpu blob `region.phys` is a PCI
+            // BAR address, and `phys_to_virt` on it yields an HHDM address the
+            // HHDM does not map, so the `copy_nonoverlapping` faulted in
+            // kernel context (`memcpy+0xe`, CR2 = HHDM base + the shared-memory
+            // window offset) and took the boot down. It also leaked: the fresh
+            // buddy block handed to the child carried `file_cap == usize::MAX`,
+            // so neither teardown path would ever free it.
             let n_pages = (region.end - region.start) / PAGE_SIZE;
-            let order   = pages_to_order(n_pages);
-            let dst_phys = buddy_alloc(order)?;
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    crate::phys_to_virt(region.phys) as *const u8,
-                    crate::phys_to_virt(dst_phys)    as *mut u8,
-                    n_pages * PAGE_SIZE,
-                );
                 for i in 0..n_pages {
                     map_page(new_page_table_root, region.start + i * PAGE_SIZE,
-                             dst_phys + i * PAGE_SIZE, region.flags);
+                             region.phys + i * PAGE_SIZE, region.flags);
                 }
             }
             *dst_slot = Some(VmaRegion {
-                start: region.start, end: region.end, phys: dst_phys,
+                start: region.start, end: region.end, phys: region.phys,
                 flags: region.flags, lazy: false, lazy_pages: Vec::new(), lazy_count: 0,
                 prot: region.prot, map_flags: region.map_flags,
                 file_cap: region.file_cap, file_off: region.file_off,
@@ -238,12 +269,4 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
     tlb_shootdown_all();
 
     Some(dst)
-}
-
-/// Minimal buddy-order calculation: smallest order such that `2^order ≥ pages`.
-fn pages_to_order(pages: usize) -> usize {
-    let mut order = 0;
-    let mut cap   = 1usize;
-    while cap < pages { cap <<= 1; order += 1; }
-    order
 }
