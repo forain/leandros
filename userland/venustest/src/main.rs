@@ -265,8 +265,10 @@ fn report(name: &[u8], ok: bool) -> bool {
 
 /// A GETPARAM probe: prints the value and returns it (u64::MAX on ioctl error).
 unsafe fn getparam(fd: c_int, param: u64, name: &[u8]) -> u64 {
-    let mut gp = DrmVirtgpuGetparam { param, value: 0 };
+    let mut val: u64 = 0;
+    let mut gp = DrmVirtgpuGetparam { param, value: &mut val as *mut u64 as u64 };
     let rc = ioctl(fd, DRM_IOCTL_VIRTGPU_GETPARAM, &mut gp as *mut _);
+    gp.value = val;
     out(b"  param ");
     out(name);
     out(b" = ");
@@ -290,14 +292,15 @@ const CTX_UNKNOWN: u64 = u64::MAX;
 /// kernel with a single global slot every fd reports the same (most recently
 /// created) id, no matter which fd asks.
 unsafe fn ctx_id(fd: c_int) -> u64 {
+    let mut val: u64 = 0;
     let mut gp = DrmVirtgpuGetparam {
         param: VIRTGPU_PARAM_LEANDROS_CTX_ID,
-        value: 0,
+        value: &mut val as *mut u64 as u64,
     };
     if ioctl(fd, DRM_IOCTL_VIRTGPU_GETPARAM, &mut gp as *mut _) != 0 {
         return CTX_UNKNOWN;
     }
-    gp.value
+    val
 }
 
 fn out_ctx(v: u64) {

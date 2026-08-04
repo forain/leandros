@@ -2559,7 +2559,8 @@ impl DrmDeviceInterface {
         // VIRTGPU_CTXS. It also stays answerable when the GPU is absent.
         if req.param == VIRTGPU_PARAM_LEANDROS_CTX_ID {
             let ctx = ctx_lookup(open_id) as u64;
-            unsafe { (arg as *mut u64).add(1).write_volatile(ctx) };
+            if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            unsafe { (req.value as *mut u32).write_volatile(ctx as u32) };
             return Ok(0);
         }
 
@@ -2602,8 +2603,14 @@ impl DrmDeviceInterface {
             }
         };
 
-        // `value` is the second u64 of drm_virtgpu_getparam.
-        unsafe { (arg as *mut u64).add(1).write_volatile(value) };
+        // `value` is a USER POINTER (u64_to_user_ptr), not an out-field.
+        // Upstream virtio_gpu_getparam_ioctl does
+        //     copy_to_user(u64_to_user_ptr(param->value), &value, sizeof(int))
+        // i.e. it writes a 32-bit int THROUGH the pointer. Mesa's Venus ICD
+        // reads back that pointee, not the struct field, so writing the value
+        // in place made every param read as 0 for Mesa.
+        if req.value == 0 { return Err(DriverError::InvalidParameter); }
+        unsafe { (req.value as *mut u32).write_volatile(value as u32) };
         Ok(0)
     }
 
