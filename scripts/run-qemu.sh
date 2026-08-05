@@ -28,6 +28,32 @@ host_arch_normalized() {
 }
 HOST_ARCH_N=$(host_arch_normalized "$HOST_ARCH")
 
+# Pick an audio backend that can actually open on this host, and echo the
+# -audiodev argument for it. PulseAudio is not a safe default on Linux: a
+# headless/SSH build box usually has no sound daemon, and QEMU ABORTS AT STARTUP
+# when the backend cannot open — so guessing wrong costs the whole run, not just
+# the sound. Probe what this QEMU build actually supports rather than assuming.
+# Reads $QEMU_SYSTEM, so it must be called after the boot-mode dispatch sets it.
+select_audio_args() {
+    if [ "$OS" = "Darwin" ]; then
+        echo "-audiodev coreaudio,id=snd0"
+        return
+    fi
+    local backends
+    backends=$($QEMU_SYSTEM -audiodev help 2>/dev/null || true)
+    # A live PulseAudio/PipeWire-pulse session is the only positive evidence
+    # that `pa` will connect; presence in -audiodev help only means it compiled.
+    if [ -n "${PULSE_SERVER:-}" ] || [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/pulse/native" ]; then
+        echo "-audiodev pa,id=snd0"
+    elif grep -q '\bpipewire\b' <<<"$backends"; then
+        echo "-audiodev pipewire,id=snd0"
+    elif grep -q '\balsa\b' <<<"$backends"; then
+        echo "-audiodev alsa,id=snd0"
+    else
+        echo "-audiodev none,id=snd0"
+    fi
+}
+
 # Firmware search paths. Ordered most-specific first; the first hit wins.
 # Arch/EndeavourOS keeps edk2 under /usr/share/edk2/<arch>/ with a 4 MB split
 # CODE/VARS pair, which is why the plain OVMF.fd names below do not match there.
@@ -166,6 +192,56 @@ if [ "$OS" != "Darwin" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}"
 fi
 
 
+# ── Network backend ─────────────────────────────────────────────────────────
+#
+# Two mutually exclusive backends, and the choice changes the QEMU command line
+# in TWO places (the -netdev argument, and whether QEMU is exec'd directly or
+# through a wrapper), so it is decided once, here.
+#
+#   * vmnet, via socket_vmnet — macOS only. vmnet.framework requires root, and
+#     socket_vmnet is the signed/notarized helper daemon that holds that
+#     privilege so QEMU need not (see github.com/lima-vm/socket_vmnet). Its
+#     client wrapper connects to the daemon's unix socket and hands QEMU the
+#     resulting fd as fd 3 — which is the ONLY reason `-netdev socket,fd=3`
+#     works. Start the daemon once with `sudo brew services start socket_vmnet`.
+#     Guest gets a routable 192.168.105.2 by DHCP.
+#
+#   * user-mode (SLIRP) — everywhere else: Linux, and a Mac where socket_vmnet
+#     is not installed or its daemon is not running. Needs no privilege and no
+#     wrapper. Guest gets 10.0.2.15 behind QEMU's NAT, gateway/DNS 10.0.2.2.
+#
+# Either way the guest configures itself by DHCP (servers/net's smoltcp dhcpv4
+# client), so nothing in the guest has to know which one it got. Only inbound
+# connections differ: vmnet is reachable from the host, SLIRP needs -netdev
+# user,hostfwd=... to expose a port.
+#
+# Before this, the socket_vmnet wrapper was exec'd unconditionally, so every
+# UEFI run on Linux died with a not-found on the hardcoded Homebrew path.
+SOCKET_VMNET_CLIENT=""
+SOCKET_VMNET_SOCK=""
+if [ "$OS" = "Darwin" ]; then
+    HOMEBREW_PREFIX=$(brew --prefix 2>/dev/null || echo /opt/homebrew)
+    _svc="$HOMEBREW_PREFIX/opt/socket_vmnet/bin/socket_vmnet_client"
+    _svs="$HOMEBREW_PREFIX/var/run/socket_vmnet"
+    if [ -x "$_svc" ] && [ -S "$_svs" ]; then
+        SOCKET_VMNET_CLIENT="$_svc"
+        SOCKET_VMNET_SOCK="$_svs"
+    elif [ -x "$_svc" ]; then
+        # Installed but not running: the wrapper would fail to connect and take
+        # the whole run down with it. Say why, then fall back.
+        echo "⚠️  socket_vmnet installed but its daemon is not running ($_svs missing)"
+        echo "    → falling back to user-mode networking; start it with: sudo brew services start socket_vmnet"
+    fi
+fi
+
+if [ -n "$SOCKET_VMNET_CLIENT" ]; then
+    NETDEV_ARGS=(-netdev socket,id=net0,fd=3)
+    NET_DESC="vmnet (via socket_vmnet), guest gets 192.168.105.2 via DHCP, host gateway 192.168.105.1"
+else
+    NETDEV_ARGS=(-netdev user,id=net0)
+    NET_DESC="user-mode/SLIRP, guest gets 10.0.2.15 via DHCP, gateway+DNS 10.0.2.2"
+fi
+
 # ── F2FS data disks (created once, reused across runs) ──────────────────────
 DATA0_IMG="f2fs-data0-${ARCH}.img"
 DATA1_IMG="f2fs-data1-${ARCH}.img"
@@ -187,7 +263,7 @@ done
 echo "🚀 Starting LeandrOS ($ARCH) in $BOOT_MODE mode"
 echo "=========================================="
 if [ "$BOOT_MODE" = "uefi" ]; then
-    echo "🌐 Network: vmnet (via socket_vmnet), guest gets 192.168.105.2 via DHCP, host gateway 192.168.105.1"
+    echo "🌐 Network: $NET_DESC"
 fi
 
 if [ "$BOOT_MODE" = "raspi4b" ]; then
@@ -229,24 +305,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
     if [ "$ARCH" = "aarch64" ]; then VARS_PATHS=("${AARCH64_VARS_PATHS[@]}"); fi
     for path in "${VARS_PATHS[@]}"; do if [ -f "$path" ]; then VARS_TEMPLATE="$path"; break; fi; done
 
-    # Select audio backend. PulseAudio is not a safe default on Linux: a
-    # headless/SSH box usually has no sound daemon, and QEMU aborts at startup
-    # if the backend cannot open. Probe what this QEMU actually supports.
-    if [[ "$OS" == "Darwin" ]]; then
-        AUDIO_ARGS="-audiodev coreaudio,id=snd0"
-    else
-        AUDIO_BACKENDS=$($QEMU_SYSTEM -audiodev help 2>/dev/null || true)
-        if [ -n "${PULSE_SERVER:-}" ] || [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/pulse/native" ]; then
-            AUDIO_ARGS="-audiodev pa,id=snd0"
-        elif grep -q '\bpipewire\b' <<<"$AUDIO_BACKENDS"; then
-            AUDIO_ARGS="-audiodev pipewire,id=snd0"
-        elif grep -q '\balsa\b' <<<"$AUDIO_BACKENDS"; then
-            AUDIO_ARGS="-audiodev alsa,id=snd0"
-        else
-            AUDIO_ARGS="-audiodev none,id=snd0"
-        fi
-    fi
-
+    AUDIO_ARGS=$(select_audio_args)
 
     if [ "$ARCH" = "aarch64" ]; then
         VARS_FILE="aarch64_vars.fd"
@@ -277,7 +336,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
-            -device virtio-net-pci,netdev=net0,disable-legacy=on -netdev socket,id=net0,fd=3 -no-reboot)
+            -device virtio-net-pci,netdev=net0,disable-legacy=on "${NETDEV_ARGS[@]}" -no-reboot)
     else
         # A split firmware (OVMF_CODE*) is read-only and needs its writable VARS
         # half as a second pflash unit; a combined image (OVMF.fd) does not.
@@ -300,26 +359,21 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -vga none -device "$GPU_DEV" \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
-            -device virtio-net-pci,netdev=net0 -netdev socket,id=net0,fd=3 -no-reboot)
+            -device virtio-net-pci,netdev=net0 "${NETDEV_ARGS[@]}" -no-reboot)
 
     fi
-    # -netdev socket,...,fd=3 above needs an already-connected fd 3, which only
-    # exists when launched through socket_vmnet's client wrapper (vmnet.framework
-    # networking requires root, and socket_vmnet is the properly signed/notarized
-    # helper daemon that holds that privilege so QEMU itself doesn't have to —
-    # see README at github.com/lima-vm/socket_vmnet). Start the daemon once via
-    # `sudo brew services start socket_vmnet` before running this.
-    HOMEBREW_PREFIX=$(brew --prefix 2>/dev/null || echo /opt/homebrew)
-    exec "$HOMEBREW_PREFIX/opt/socket_vmnet/bin/socket_vmnet_client" \
-        "$HOMEBREW_PREFIX/var/run/socket_vmnet" \
-        $QEMU_SYSTEM "${QEMU_ARGS[@]}" "${QEMU_EXTRA_ARGS[@]}"
-else
-    # Select audio backend for direct boot as well
-    if [[ "$OS" == "Darwin" ]]; then
-        AUDIO_ARGS="-audiodev coreaudio,id=snd0"
+    # The vmnet backend selected above is `-netdev socket,fd=3`, and that fd only
+    # exists when QEMU is launched *through* socket_vmnet's client wrapper — so
+    # the wrapper is part of the netdev choice, not an unconditional prefix. The
+    # SLIRP backend needs no wrapper and no privilege, so it execs QEMU directly.
+    if [ -n "$SOCKET_VMNET_CLIENT" ]; then
+        exec "$SOCKET_VMNET_CLIENT" "$SOCKET_VMNET_SOCK" \
+            $QEMU_SYSTEM "${QEMU_ARGS[@]}" "${QEMU_EXTRA_ARGS[@]}"
     else
-        AUDIO_ARGS="-audiodev pa,id=snd0"
+        exec $QEMU_SYSTEM "${QEMU_ARGS[@]}" "${QEMU_EXTRA_ARGS[@]}"
     fi
+else
+    AUDIO_ARGS=$(select_audio_args)
 
     if [ "$ARCH" = "aarch64" ]; then
         # Use ELF for AArch64
