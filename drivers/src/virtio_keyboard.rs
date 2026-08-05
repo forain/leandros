@@ -363,17 +363,36 @@ unsafe fn device_supports_ev_abs(device_cfg: *mut u8) -> bool {
 }
 
 pub fn init() {
-    let mut inputs = VIRTIO_INPUTS.lock();
-    if !inputs.is_empty() { return; }
+    // Probe with the lock RELEASED. new_from() walks the PCI capability list,
+    // maps each BAR (page-table work) and does MMIO config reads, and IRQs are
+    // already unmasked by the time init() runs. The timer tick handler calls
+    // poll_events(), which takes this same lock — so holding it across the
+    // probe let any tick landing inside that window spin forever on a lock held
+    // by the code it had just interrupted, deadlocking CPU 0 inside handle_irq.
+    //
+    // It only ever reproduced off the Apple Silicon host: under HVF the probe
+    // fits comfortably between 10 ms ticks, while under cross-arch TCG
+    // (aarch64 guest on an x86_64 box) it spans many emulated ticks and the
+    // collision is near-certain. The window was always there.
+    if !VIRTIO_INPUTS.lock().is_empty() { return; }
+
     // Bind every virtio-input PCI function (keyboard + tablet).
     let found = crate::pci::find_all_devices(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_INPUT);
     crate::pci::serial_debug("[INPUT] virtio-input functions found=");
     crate::pci::serial_debug_hex(found.len() as u32);
     crate::pci::serial_debug("\n");
+    let mut probed = alloc::vec::Vec::new();
     for dev in found {
         if let Some(d) = VirtioKeyboardDevice::new_from(dev) {
-            inputs.push(d);
+            probed.push(d);
         }
+    }
+
+    // Install in one shot. Re-check under the lock: a concurrent init() would
+    // otherwise double-bind the same devices.
+    let mut inputs = VIRTIO_INPUTS.lock();
+    if inputs.is_empty() {
+        *inputs = probed;
     }
     crate::pci::serial_debug("[INPUT] bound=");
     crate::pci::serial_debug_hex(inputs.len() as u32);
@@ -381,7 +400,13 @@ pub fn init() {
 }
 
 pub fn poll_events() {
-    for d in VIRTIO_INPUTS.lock().iter_mut() {
-        d.poll();
+    // try_lock, never lock: this runs in IRQ context off the timer tick, so
+    // blocking on a lock held by the task context we interrupted would wedge
+    // the CPU (see init()). Missing one poll is harmless — the devices are
+    // level-driven and the next tick, 10 ms later, drains them.
+    if let Some(mut inputs) = VIRTIO_INPUTS.try_lock() {
+        for d in inputs.iter_mut() {
+            d.poll();
+        }
     }
 }
