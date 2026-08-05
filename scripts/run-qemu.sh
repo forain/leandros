@@ -58,7 +58,7 @@ select_audio_args() {
 # Arch/EndeavourOS keeps edk2 under /usr/share/edk2/<arch>/ with a 4 MB split
 # CODE/VARS pair, which is why the plain OVMF.fd names below do not match there.
 X86_64_FW_PATHS=("/usr/share/ovmf/OVMF.fd" "/usr/share/OVMF/OVMF_CODE.fd" "/opt/homebrew/share/qemu/edk2-x86_64-code.fd" "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd" "/usr/share/edk2/x64/OVMF_CODE.4m.fd" "/usr/share/edk2/x64/OVMF_CODE.fd")
-AARCH64_FW_PATHS=("/usr/share/AAVMF/AAVMF_CODE.fd" "/opt/homebrew/share/qemu/edk2-aarch64-code.fd" "/usr/share/edk2-armvirt/aarch64/QEMU_EFI-pflash.raw" "/usr/share/edk2/aarch64/QEMU_CODE.4m.fd" "/usr/share/edk2/aarch64/QEMU_CODE.fd")
+AARCH64_FW_PATHS=("/usr/share/AAVMF/AAVMF_CODE.fd" "/opt/homebrew/share/qemu/edk2-aarch64-code.fd" "/usr/share/edk2-armvirt/aarch64/QEMU_EFI-pflash.raw" "/usr/share/edk2/aarch64/QEMU_CODE.4m.fd" "/usr/share/edk2/aarch64/QEMU_CODE.fd" "/usr/share/edk2/aarch64/QEMU_EFI.fd")
 
 # Matching writable VARS templates, same ordering convention. A split firmware
 # build needs its own VARS pflash; a combined image (OVMF.fd) does not.
@@ -133,10 +133,15 @@ elif [ "$ARCH" = "aarch64" ]; then
     MACHINE_ARGS="-machine virt,gic-version=2 -m 2G -smp 4"
     # -cpu host: real host ID registers, required by HVF/KVM passthrough
     # (vs. -cpu max's synthesized model, which is TCG-only).
+    #
+    # lpa2=off on the TCG model: `max` otherwise advertises FEAT_LPA2 (52-bit
+    # physical addresses) and Limine 11.4.1 wedges on it during its final
+    # handoff — spinning forever on one instruction with the kernel entry
+    # already in x0, so the kernel never prints. Nothing here uses 52-bit PAs.
     case "$ACCEL" in
         hvf) CPU_ARGS="-cpu host -accel hvf" ;;
         kvm) CPU_ARGS="-cpu host -accel kvm" ;;
-        *)   CPU_ARGS="-cpu max -accel tcg" ;;
+        *)   CPU_ARGS="-cpu max,lpa2=off -accel tcg" ;;
     esac
     DISK_IMAGE="leandros-limine-aarch64.img"
 else

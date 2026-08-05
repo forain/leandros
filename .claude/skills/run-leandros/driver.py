@@ -42,9 +42,12 @@ AARCH64_FW_PATHS = [
     "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
     "/usr/share/AAVMF/AAVMF_CODE.fd",
     "/usr/share/edk2-armvirt/aarch64/QEMU_EFI-pflash.raw",
-    # Arch/EndeavourOS layout
+    # Arch/EndeavourOS layout. edk2-armvirt renamed the firmware to QEMU_CODE
+    # only recently; older packages still ship it as QEMU_EFI.fd, already padded
+    # to the 64 MiB pflash size (unlike the same name on some other distros).
     "/usr/share/edk2/aarch64/QEMU_CODE.4m.fd",
     "/usr/share/edk2/aarch64/QEMU_CODE.fd",
+    "/usr/share/edk2/aarch64/QEMU_EFI.fd",
 ]
 X86_64_FW_PATHS = [
     "/opt/homebrew/share/qemu/edk2-x86_64-code.fd",
@@ -99,13 +102,21 @@ def _accel_flags(guest_arch: str, mode: str):
     -cpu host is required for hypervisor passthrough (real host ID registers);
     -cpu max is a synthesised model that only TCG can implement.
     """
+    # lpa2=off on the aarch64 TCG model: `max` otherwise advertises FEAT_LPA2
+    # (52-bit physical addresses), and Limine 11.4.1 wedges on it during its
+    # final handoff — it spins forever on a single instruction in its
+    # higher-half map with our kernel's entry already in x0, so the kernel
+    # never prints a byte and the hang looks like a kernel fault. Nothing in
+    # LeandrOS uses 52-bit PAs. Only reproduces where TCG is the accelerator
+    # for an aarch64 guest (i.e. off Apple Silicon).
+    tcg_cpu = "max,lpa2=off" if guest_arch == "aarch64" else "max"
     if mode == "uefi-tcg":
-        return ["-cpu", "max", "-accel", "tcg"]
+        return ["-cpu", tcg_cpu, "-accel", "tcg"]
     if mode == "uefi-hvf" or (guest_arch == "aarch64" and _is_apple_silicon()):
         return ["-cpu", "host", "-accel", "hvf"]
     if _kvm_usable(guest_arch):
         return ["-cpu", "host", "-accel", "kvm"]
-    return ["-cpu", "max", "-accel", "tcg"]
+    return ["-cpu", tcg_cpu, "-accel", "tcg"]
 
 # VT100/ANSI escape sequence pattern — strips monitor line-editing noise
 _ANSI_RE = re.compile(rb"\x1b\[[^a-zA-Z]*[a-zA-Z]|[\x08]|\x1b=|\x1b>")
@@ -128,16 +139,30 @@ SOCKET_VMNET_PREFIXES = ["/opt/homebrew", "/usr/local"]
 
 
 def _socket_vmnet_prefix():
-    """Find socket_vmnet_client + its daemon socket (see run-qemu.sh's matching
-    comment for why the uefi path's -netdev socket,...,fd=3 needs this wrapper:
-    vmnet.framework networking requires root, and socket_vmnet is the properly
-    signed/notarized helper that holds that privilege so QEMU doesn't have to).
-    Daemon must already be running (`sudo brew services start socket_vmnet`)."""
+    """Find socket_vmnet_client + its daemon socket, or None (see run-qemu.sh's
+    matching comment for why the uefi path's -netdev socket,...,fd=3 needs this
+    wrapper: vmnet.framework networking requires root, and socket_vmnet is the
+    properly signed/notarized helper that holds that privilege so QEMU doesn't
+    have to). Both the client AND a live daemon socket are required — the fd=3
+    backend only exists when QEMU is exec'd *through* the client.
+
+    socket_vmnet is macOS-only, so returning None is the normal case on Linux
+    (and on a Mac whose daemon isn't running); the caller falls back to
+    user-mode SLIRP, exactly as run-qemu.sh does."""
     for prefix in SOCKET_VMNET_PREFIXES:
         client = os.path.join(prefix, "opt/socket_vmnet/bin/socket_vmnet_client")
-        if os.path.exists(client):
-            return client, os.path.join(prefix, "var/run/socket_vmnet")
-    sys.exit("ERROR: socket_vmnet_client not found (brew install socket_vmnet)")
+        sock = os.path.join(prefix, "var/run/socket_vmnet")
+        if os.path.exists(client) and os.path.exists(sock):
+            return client, sock
+    return None
+
+
+def _netdev_args():
+    """The -netdev backend matching whatever _socket_vmnet_prefix() found.
+    vmnet is reachable from the host; SLIRP needs -netdev user hostfwd for
+    inbound connections, but outbound guest traffic works either way."""
+    return (["-netdev", "socket,id=net0,fd=3"] if _socket_vmnet_prefix()
+            else ["-netdev", "user,id=net0"])
 
 
 def _cleanup_socks():
@@ -204,7 +229,7 @@ def _build_cmd(arch, mode="uefi"):
             *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-device", "virtio-net-pci,netdev=net0,disable-legacy=on",
-            "-netdev", "socket,id=net0,fd=3",
+            *_netdev_args(),
             "-no-reboot", "-parallel", "none",
             "-display", "none",
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
@@ -250,7 +275,7 @@ def _build_cmd(arch, mode="uefi"):
             *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-device", "virtio-net-pci,netdev=net0",
-            "-netdev", "socket,id=net0,fd=3",
+            *_netdev_args(),
             "-no-reboot", "-parallel", "none",
             "-display", "none",
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
@@ -433,8 +458,10 @@ def cmd_start(arch="aarch64", mode="uefi"):
         import shlex
         qemu_cmd += shlex.split(extra)
     if mode in ("uefi", "uefi-hvf", "uefi-tcg"):
-        client, sock = _socket_vmnet_prefix()
-        qemu_cmd = [client, sock] + qemu_cmd
+        vmnet = _socket_vmnet_prefix()
+        if vmnet:
+            client, sock = vmnet
+            qemu_cmd = [client, sock] + qemu_cmd
     # stderr goes to a file, not a pipe: the pipe's read end vanishes when
     # this process exits, so a chatty QEMU (audio warnings, tracing) would
     # eventually block on a full pipe. The file also survives for post-mortem.
