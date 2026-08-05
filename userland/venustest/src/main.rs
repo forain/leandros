@@ -32,6 +32,16 @@
 //! opens must get 16 distinct contexts, the 17th must be refused cleanly rather
 //! than panic or alias, and closing them all must return the slots.
 //!
+//! Phase 4 covers BO handles: that a submission's `bo_handles` are resolved
+//! (a handle naming nothing fails the whole EXECBUFFER) and fenced, that
+//! VIRTGPU_WAIT answers about the BO its handle names rather than about some
+//! global, that a BO belonging to one open is unreachable from another through
+//! all four handle-consuming ioctls, and that the "most recent submission"
+//! fence is per-open. As in phase 2, identity is what is asserted: submission
+//! is synchronous, so every WAIT succeeds either way and only the REFUSALS and
+//! the cross-open comparisons can distinguish a correct kernel from the
+//! process-global one that preceded it.
+//!
 //! Prints "<name>: PASS"/"<name>: FAIL"; exit code is the failure count.
 
 #![no_std]
@@ -79,6 +89,14 @@ const VIRTGPU_PARAM_LEANDROS_CTX_ID: u64 = 0x1000_0001;
 const VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS: u64 = 0x1000_0002;
 /// LeandrOS-private: host-visible window length in MiB (0 = no window).
 const VIRTGPU_PARAM_LEANDROS_HOSTVIS_MIB: u64 = 0x1000_0003;
+/// Low 32 bits of the fence id of the most recent EXECBUFFER *on this open*.
+/// Exists so the de-globalization of that fence is assertable — see phase 3.
+const VIRTGPU_PARAM_LEANDROS_LAST_FENCE: u64 = 0x1000_0004;
+
+/// A BO handle no allocator here ever hands out: blob handles start at 0x4000
+/// and dumb handles far below that. Every "must be refused" assertion uses this
+/// one value so they are all testing the same premise.
+const NO_SUCH_HANDLE: u32 = 0x7FFF_FFFF;
 
 const VIRTGPU_DRM_CAPSET_VENUS: u32 = 4;
 
@@ -546,6 +564,54 @@ unsafe fn exec_noop(fd: c_int) -> bool {
     ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut exec as *mut _) == 0
 }
 
+/// EXECBUFFER naming `handles` in `bo_handles`. Returns the raw ioctl result so
+/// callers can assert on refusal as well as on success.
+///
+/// Upstream resolves the whole array to GEM objects before submitting and fails
+/// the ioctl with -ENOENT if any handle names nothing, so both outcomes are part
+/// of the contract and both are tested below.
+unsafe fn exec_with_bos(fd: c_int, handles: &[u32]) -> c_int {
+    let cmd_stream: [u32; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+    let mut exec = DrmVirtgpuExecbuffer {
+        flags: 0,
+        size: (cmd_stream.len() * 4) as u32,
+        command: cmd_stream.as_ptr() as u64,
+        bo_handles: if handles.is_empty() { 0 } else { handles.as_ptr() as u64 },
+        num_bo_handles: handles.len() as u32,
+        fence_fd: -1,
+        ring_idx: 0,
+        syncobj_stride: 0,
+        num_in_syncobjs: 0,
+        num_out_syncobjs: 0,
+        in_syncobjs: 0,
+        out_syncobjs: 0,
+    };
+    ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut exec as *mut _)
+}
+
+/// VIRTGPU_WAIT on one BO handle, raw result.
+unsafe fn wait_bo(fd: c_int, handle: u32) -> c_int {
+    let mut w = DrmVirtgpu3dWait { handle, flags: 0 };
+    ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &mut w as *mut _)
+}
+
+/// RESOURCE_INFO on one BO handle, raw result.
+unsafe fn resource_info_rc(fd: c_int, handle: u32) -> c_int {
+    let mut info = DrmVirtgpuResourceInfo {
+        bo_handle: handle,
+        res_handle: 0,
+        size: 0,
+        blob_mem: 0,
+    };
+    ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &mut info as *mut _)
+}
+
+/// VIRTGPU_MAP on one BO handle, raw result.
+unsafe fn map_bo_rc(fd: c_int, handle: u32) -> c_int {
+    let mut m = DrmVirtgpuMap { offset: 0, handle, pad: 0 };
+    ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &mut m as *mut _)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0i32;
@@ -786,7 +852,6 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     // `[DRM] RESOURCE_INFO: unknown bo_handle=…`, and `resource_info_fields_match`
     // above — which only runs where a blob can actually be created.
     {
-        const NO_SUCH_HANDLE: u32 = 0x7FFF_FFFF;
         let mut info = DrmVirtgpuResourceInfo {
             bo_handle: NO_SUCH_HANDLE,
             ..Default::default()
@@ -1154,6 +1219,45 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
         };
         let rc = ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &mut w as *mut _);
         if !report(b"virtgpu_wait_fence", rc == 0) { failures += 1; }
+
+        // ── bo_handles + per-BO fences ───────────────────────────────────────
+        // WAIT takes a BO handle, and until the per-BO fence landed it threw
+        // that handle away and answered from one process-global fence. These
+        // assert the upstream contract that replaced it. Note what they can and
+        // cannot prove: submission is a synchronous busy-spin, so every fence is
+        // already retired and every *successful* wait would also have succeeded
+        // under the old code. The refusals are the load-bearing half — they are
+        // only possible once handles are resolved rather than ignored.
+        if blob.bo_handle != 0 {
+            // A submission that names a real BO is accepted, and the BO can
+            // then be waited on.
+            let rc = exec_with_bos(fd, &[blob.bo_handle]);
+            if !report(b"execbuffer_with_bo_handles", rc == 0) { failures += 1; }
+            if !report(b"virtgpu_wait_after_bo_exec", wait_bo(fd, blob.bo_handle) == 0) {
+                failures += 1;
+            }
+        }
+
+        // A submission naming a handle that was never allocated must be refused
+        // outright (upstream -ENOENT from virtio_gpu_array_from_handles), not
+        // executed with the bad handle quietly skipped. NO_SUCH_HANDLE is the
+        // same never-allocated value the RESOURCE_INFO refusal test uses.
+        let rc = exec_with_bos(fd, &[NO_SUCH_HANDLE]);
+        if !report(b"execbuffer_bad_bo_handle_refused", rc != 0) { failures += 1; }
+
+        // …and a real handle alongside a bad one fails the whole submission,
+        // rather than partially honouring it.
+        if blob.bo_handle != 0 {
+            let rc = exec_with_bos(fd, &[blob.bo_handle, NO_SUCH_HANDLE]);
+            if !report(b"execbuffer_mixed_bo_handles_refused", rc != 0) { failures += 1; }
+        }
+
+        // WAIT on a handle that names nothing is likewise refused. This is the
+        // single clearest signal that the handle is being looked up at all: the
+        // old code returned 0 here, because it never consulted the handle.
+        if !report(b"virtgpu_wait_bad_handle_refused", wait_bo(fd, NO_SUCH_HANDLE) != 0) {
+            failures += 1;
+        }
     }
 
     // ── 6. Release the blob ──────────────────────────────────────────────────
@@ -1429,6 +1533,116 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
             close(fd_fresh);
         }
         if !report(b"phase3_slots_reclaimed_after_close", reclaimed) { failures += 1; }
+    }
+
+    // ── Phase 4: per-open BO ownership, and the per-open fence ───────────────
+    // The BO handle space is process-global here (upstream gives each drm_file
+    // its own handle table), so isolation is enforced by an owner tag instead:
+    // a handle belonging to another open must read as a handle that does not
+    // exist. Four ioctls consume a handle and all four must agree — MAP,
+    // RESOURCE_INFO, WAIT and GEM_CLOSE — because scoping only some of them
+    // would leave a BO that one open can close but not describe.
+    //
+    // GEM_CLOSE is the one that matters most and is the hardest to observe: it
+    // reports success either way (a handle you do not own names nothing, and
+    // closing a nonexistent handle has always been success). It is tested
+    // indirectly — fdB closes fdA's handle, then fdA must still be able to use
+    // it, which is only true if fdB's close was correctly a no-op.
+    out(b"--- phase 4: per-open BO ownership + per-open fence ---\n");
+    {
+        let fd_a = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let fd_b = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if fd_a < 0 || fd_b < 0 {
+            if !report(b"phase4_open_two_fds", false) { failures += 1; }
+        } else {
+            report(b"phase4_open_two_fds", true);
+            let a_ctx = ctx_init_venus(fd_a);
+            let b_ctx = ctx_init_venus(fd_b);
+            if !report(b"phase4_context_init_both", a_ctx && b_ctx) { failures += 1; }
+
+            // fdA creates a blob. fdB never learns the handle through any legal
+            // channel — the test hands it over precisely to prove the kernel
+            // refuses it anyway.
+            const P4_BLOB_SIZE: u64 = 64 * 1024;
+            let mut blob = DrmVirtgpuResourceCreateBlob {
+                blob_mem: VIRTGPU_BLOB_MEM_GUEST,
+                blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+                size: P4_BLOB_SIZE,
+                ..Default::default()
+            };
+            let rc = ioctl(fd_a, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, &mut blob as *mut _);
+            let have = rc == 0 && blob.bo_handle != 0;
+            if !report(b"phase4_blob_created_on_fdA", have) { failures += 1; }
+
+            if have {
+                let h = blob.bo_handle;
+
+                // The owner can reach its own BO through every one of them.
+                let own_ok = map_bo_rc(fd_a, h) == 0
+                    && resource_info_rc(fd_a, h) == 0
+                    && wait_bo(fd_a, h) == 0
+                    && exec_with_bos(fd_a, &[h]) == 0;
+                if !report(b"phase4_owner_can_use_own_bo", own_ok) { failures += 1; }
+
+                // …and the other open cannot reach it through any of them.
+                if !report(b"phase4_other_open_map_refused", map_bo_rc(fd_b, h) != 0) {
+                    failures += 1;
+                }
+                if !report(b"phase4_other_open_info_refused", resource_info_rc(fd_b, h) != 0) {
+                    failures += 1;
+                }
+                if !report(b"phase4_other_open_wait_refused", wait_bo(fd_b, h) != 0) {
+                    failures += 1;
+                }
+                if !report(b"phase4_other_open_exec_refused", exec_with_bos(fd_b, &[h]) != 0) {
+                    failures += 1;
+                }
+
+                // fdB closing fdA's handle must be a no-op, not a teardown of
+                // fdA's resource. Reported success either way, so the proof is
+                // that fdA still works afterwards.
+                let _ = gem_close(fd_b, h);
+                let survived = resource_info_rc(fd_a, h) == 0 && wait_bo(fd_a, h) == 0;
+                if !report(b"phase4_bo_survives_close_by_other_open", survived) {
+                    failures += 1;
+                }
+
+                // ── The per-open fence ───────────────────────────────────────
+                // While the submitting fence was one process-global atomic, an
+                // open that had never submitted still reported whichever open
+                // submitted last. fdB has submitted nothing that succeeded, so
+                // its fence must be 0 while fdA's is not.
+                let fence_a = getparam_quiet(fd_a, VIRTGPU_PARAM_LEANDROS_LAST_FENCE);
+                let fence_b = getparam_quiet(fd_b, VIRTGPU_PARAM_LEANDROS_LAST_FENCE);
+                out(b"  fdA last_fence = ");
+                out_u64(fence_a);
+                out(b", fdB last_fence = ");
+                out_u64(fence_b);
+                out(b"\n");
+                if !report(b"phase4_fence_fdA_nonzero", fence_a != 0 && fence_a != u64::MAX) {
+                    failures += 1;
+                }
+                if !report(b"phase4_fence_fdB_zero_until_it_submits", fence_b == 0) {
+                    failures += 1;
+                }
+
+                // Once fdB does submit, its fence advances and — the actual
+                // regression check — fdA's does NOT move with it.
+                let submitted = exec_with_bos(fd_b, &[]) == 0;
+                let fence_b2 = getparam_quiet(fd_b, VIRTGPU_PARAM_LEANDROS_LAST_FENCE);
+                let fence_a2 = getparam_quiet(fd_a, VIRTGPU_PARAM_LEANDROS_LAST_FENCE);
+                if !report(b"phase4_fence_fdB_advances_on_submit", submitted && fence_b2 != 0) {
+                    failures += 1;
+                }
+                if !report(b"phase4_fence_fdA_unmoved_by_fdB_submit", fence_a2 == fence_a) {
+                    failures += 1;
+                }
+
+                if !report(b"phase4_owner_gem_close", gem_close(fd_a, h) == 0) { failures += 1; }
+            }
+        }
+        if fd_a >= 0 { close(fd_a); }
+        if fd_b >= 0 { close(fd_b); }
     }
 
     out(b"--- venustest done, failures = ");

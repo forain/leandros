@@ -325,6 +325,19 @@ const VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS: u64 = 0x1000_0002;
 /// sizeof(int))`) and the window is routinely 4 GiB.
 const VIRTGPU_PARAM_LEANDROS_HOSTVIS_MIB: u64 = 0x1000_0003;
 
+/// LeandrOS-private GETPARAM: the low 32 bits of the fence id produced by the
+/// most recent EXECBUFFER **on the calling open**, 0 if that open has never
+/// submitted.
+///
+/// Same justification as CTX_ID, for the sibling process-global. While the
+/// submitting fence lived in one `LAST_EXEC_FENCE` atomic, an open that had
+/// never submitted anything still observed whichever open submitted last — and
+/// that was invisible from userspace, because every WAIT returned 0 either way
+/// (submission is synchronous, so every fence is already retired). Reading this
+/// on two opens is what makes "the fence is per-open" assertable rather than
+/// merely believed. Truncated to 32 bits because GETPARAM writes an `int`.
+const VIRTGPU_PARAM_LEANDROS_LAST_FENCE: u64 = 0x1000_0004;
+
 /// `drm_virtgpu_context_set_param.param` values.
 const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
 const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
@@ -752,6 +765,16 @@ use spin::Mutex;
 struct DumbBuf {
     phys: usize,
     order: usize,
+    /// Fence of the most recent EXECBUFFER that named this BO in `bo_handles`
+    /// (0 = never named). See "THE FENCE MODEL" on `BlobBuf`.
+    ///
+    /// A dumb buffer is a 2D scanout target and no 3D client has any reason to
+    /// name one in a submission — but `bo_handles` is a plain handle array and
+    /// nothing stops it, so the field exists rather than leaving one BO kind
+    /// silently unfenceable. That would make VIRTGPU_WAIT answer "nothing
+    /// outstanding" for a buffer a submission had genuinely touched, which is
+    /// exactly the class of wrong answer the per-BO fence exists to remove.
+    last_fence: u64,
 }
 
 static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new());
@@ -760,12 +783,49 @@ static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new())
 /// `phys`/`order` are the guest pages handed to the host as the blob's backing
 /// (zero for host-side blob memory, which the guest never owns pages for);
 /// `res_handle` is the resource id the host knows it by.
+///
+/// THE FENCE MODEL. Upstream attaches a submission's fence to every GEM object
+/// the submission named in `drm_virtgpu_execbuffer.bo_handles`, and
+/// `virtio_gpu_wait_ioctl` then waits on the fence of the ONE object its
+/// `handle` names. That is why WAIT takes a BO handle at all. This driver
+/// previously had no per-BO fence state, so `bo_handles` was discarded and WAIT
+/// ignored its handle and consulted a single process-global `LAST_EXEC_FENCE` —
+/// meaning a WAIT on open A's buffer was answered from open B's submission.
+///
+/// `last_fence` is that missing state. Note what it does and does not change
+/// TODAY: submission is a synchronous busy-spin, so every fence this driver
+/// hands out is already retired by the time EXECBUFFER returns, and both the
+/// old and new code therefore answer every WAIT with success. The value is that
+/// the *contract* is now the upstream one — an unknown handle is refused, a
+/// handle is answered about itself, and no open can observe another's fence —
+/// so when submission becomes asynchronous (the unwired ISR) the semantics are
+/// already right rather than needing to be re-derived under a live client.
 #[derive(Clone, Copy)]
 struct BlobBuf {
     phys: usize,
     order: usize,
     res_handle: u32,
     size: u64,
+    /// The `open_id` that created this BO — the per-open GEM handle table,
+    /// flattened into an owner tag on a shared map rather than a map per open.
+    ///
+    /// Upstream gives each `drm_file` its own handle→object table, so handle 5
+    /// on two opens is two different objects and one open simply cannot name
+    /// the other's. Here the handle space stays global (handles are unique
+    /// process-wide, allocated from `NEXT_BLOB_HANDLE`) and the isolation is
+    /// enforced by comparing this field instead. That yields the property that
+    /// matters — no open can map, describe, wait on, or close a BO belonging to
+    /// another — without renumbering a handle space that `dumb_buffer_phys_order`
+    /// and the PRIME/dmabuf path already resolve globally.
+    ///
+    /// 0 means "created without an open identity" (the legacy `Driver::handle`
+    /// path, which passes open_id 0). Such a BO is unowned and reachable from
+    /// anywhere, and an open_id-0 caller may reach anything — there is no
+    /// identity to check in either direction. See `blob_lookup`.
+    owner: u32,
+    /// Fence of the most recent EXECBUFFER that named this BO in `bo_handles`;
+    /// 0 = never named in any submission, i.e. nothing is outstanding for it.
+    last_fence: u64,
     /// `blob_mem` the blob was created with (VIRTIO_GPU_BLOB_MEM_*). Never 0:
     /// RESOURCE_CREATE_BLOB rejects blob_mem == 0, so every entry in this map is
     /// a real blob. RESOURCE_INFO reports it, and Mesa's Venus backend refuses
@@ -884,10 +944,24 @@ struct GpuCtx {
     /// bounds-checking `drm_virtgpu_execbuffer.ring_idx`. A context that never
     /// set the param has one ring, ring 0.
     num_rings: u32,
+    /// Fence id of the most recent EXECBUFFER on this open, 0 if it has never
+    /// submitted. Replaces the process-global `LAST_EXEC_FENCE`.
+    ///
+    /// Deliberately NOT a fallback for VIRTGPU_WAIT. WAIT names a BO, and a BO
+    /// that was never named in a submission has nothing outstanding — answering
+    /// it from the open's last submission instead would re-create, one scope
+    /// down, exactly the wrong-fence coupling that removing the global fixed.
+    /// It exists so the per-open fence is observable from userspace (via
+    /// `VIRTGPU_PARAM_LEANDROS_LAST_FENCE`, which is how venustest asserts the
+    /// de-globalization) and so a submission naming no BOs is still accounted
+    /// for somewhere rather than dropped.
+    last_fence: u64,
 }
 
 impl GpuCtx {
-    const fn empty() -> Self { Self { open_id: 0, ctx_id: 0, capset: 0, num_rings: 1 } }
+    const fn empty() -> Self {
+        Self { open_id: 0, ctx_id: 0, capset: 0, num_rings: 1, last_fence: 0 }
+    }
 }
 
 static VIRTGPU_CTXS: Mutex<[GpuCtx; MAX_GPU_CTXS]> =
@@ -924,7 +998,13 @@ fn ctx_bind(open_id: u32, ctx_id: u32, capset: u32, num_rings: u32) -> Result<()
     }
     match t.iter_mut().find(|c| c.open_id == 0) {
         Some(slot) => {
-            *slot = GpuCtx { open_id, ctx_id, capset, num_rings: num_rings.max(1) };
+            *slot = GpuCtx {
+                open_id,
+                ctx_id,
+                capset,
+                num_rings: num_rings.max(1),
+                last_fence: 0,
+            };
             Ok(())
         }
         None => Err(CTX_BIND_NO_SLOT),
@@ -944,24 +1024,32 @@ pub fn drm_release_open(open_id: u32) {
             None => 0,
         }
     };
-    if ctx == 0 { return; }
 
-    // Blobs this open created and never closed. A Vulkan client that exits
-    // (or crashes) without GEM_CLOSE would otherwise hold its host resources —
-    // and, for host-side blobs, its slice of the shared-memory window — until
-    // reboot. Contexts are per-open and a context id is never reused while live,
-    // so `ctx` identifies this open's blobs exactly; blobs created with no
-    // context (ctx == 0) belong to no open and are left alone.
+    // Blobs this open created and never closed. A Vulkan client that exits (or
+    // crashes) without GEM_CLOSE would otherwise hold its host resources — and,
+    // for host-side blobs, its slice of the shared-memory window — until reboot.
+    //
+    // Keyed on `owner`, the open that created the BO. This used to be keyed on
+    // the host context id instead, because that was the only per-open thing a
+    // blob recorded — which meant a blob created BEFORE this open's
+    // CONTEXT_INIT (ctx == 0) matched nothing and was leaked for the rest of the
+    // boot, and an open that never called CONTEXT_INIT at all had its blobs
+    // skipped wholesale. Owner-keying reaches both, and is the exact set
+    // upstream frees when a `drm_file` is released.
     //
     // Collect under the lock, free after dropping it: `free_blob` locks
     // BLOB_BUFFERS itself and then talks to the device.
     let orphans: Vec<u32> = {
         let map = BLOB_BUFFERS.lock();
-        map.iter().filter(|(_, b)| b.ctx == ctx).map(|(h, _)| *h).collect()
+        map.iter().filter(|(_, b)| b.owner == open_id).map(|(h, _)| *h).collect()
     };
     for h in orphans {
         DrmDeviceInterface::free_blob(h);
     }
+
+    // Nothing further to do for an open that never created a context — but its
+    // blobs, above, still had to be reclaimed.
+    if ctx == 0 { return; }
 
     let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
     if let Some(gpu) = guard.as_mut() {
@@ -969,8 +1057,89 @@ pub fn drm_release_open(open_id: u32) {
     }
 }
 
-/// Fence id produced by the most recent EXECBUFFER, for VIRTGPU_WAIT.
-static LAST_EXEC_FENCE: AtomicU64 = AtomicU64::new(0);
+/// Record `fence` as the most recent submission on `open_id`. Silently does
+/// nothing for an open with no context, which cannot have submitted anything.
+fn ctx_record_fence(open_id: u32, fence: u64) {
+    if open_id == 0 { return; }
+    let mut t = VIRTGPU_CTXS.lock();
+    if let Some(c) = t.iter_mut().find(|c| c.open_id == open_id) {
+        c.last_fence = fence;
+    }
+}
+
+// ── BO handle resolution, scoped to the calling open ─────────────────────────
+//
+// Every ioctl that consumes a BO handle — MAP, RESOURCE_INFO, WAIT, GEM_CLOSE,
+// and EXECBUFFER's `bo_handles` — goes through these two helpers rather than
+// indexing BLOB_BUFFERS / DUMB_BUFFERS directly, so the ownership rule is
+// stated once and cannot drift between them.
+//
+// THE RULE (see `BlobBuf::owner`): a caller may reach a BO if it owns it, if
+// the BO is unowned (owner 0), or if the caller itself has no identity
+// (open_id 0 — the legacy `Driver::handle` path, which cannot be checked).
+// Everything else is a miss, indistinguishable from a handle that was never
+// allocated: refusing with "not yours" would leak the existence of another
+// client's buffers, and upstream's per-`drm_file` tables make the two cases
+// literally identical anyway.
+//
+// DUMB BUFFERS ARE NOT SCOPED, on purpose. A dumb handle is consumed by
+// ADDFB/ADDFB2 and the framebuffer/console path, which have no open identity to
+// carry, and `dumb_buffer_phys_order` resolves one globally for PRIME/dmabuf
+// export. Scoping them would break the compositor for no gain: the isolation
+// gap that mattered is the Vulkan client's blob BOs, which are created and
+// consumed on one fd by one process.
+fn open_may_reach(caller: u32, owner: u32) -> bool {
+    caller == 0 || owner == 0 || caller == owner
+}
+
+/// Resolve a blob BO handle for `open_id`, or None if it does not exist or
+/// belongs to another open.
+fn blob_lookup(handle: u32, open_id: u32) -> Option<BlobBuf> {
+    let b = *BLOB_BUFFERS.lock().get(&handle)?;
+    if open_may_reach(open_id, b.owner) { Some(b) } else { None }
+}
+
+/// Does `handle` name a BO this open may reach, of either kind? Upstream's
+/// `drm_gem_object_lookup` miss, which EXECBUFFER answers -ENOENT to.
+///
+/// The two maps are locked one at a time, never nested: they are leaves and
+/// keeping them independent is what makes that true by construction.
+fn bo_exists(handle: u32, open_id: u32) -> bool {
+    if blob_lookup(handle, open_id).is_some() {
+        return true;
+    }
+    DUMB_BUFFERS.lock().contains_key(&handle)
+}
+
+/// The fence of the work most recently submitted against `handle`, or None if
+/// the handle names no BO this open may reach. `Some(0)` is the meaningful
+/// answer "this BO exists and nothing has ever been submitted against it".
+fn bo_fence(handle: u32, open_id: u32) -> Option<u64> {
+    if let Some(b) = blob_lookup(handle, open_id) {
+        return Some(b.last_fence);
+    }
+    DUMB_BUFFERS.lock().get(&handle).map(|b| b.last_fence)
+}
+
+/// Attach `fence` to `handle`. False if the BO went away between validation and
+/// submission (a concurrent GEM_CLOSE), which is benign — a closed BO is one
+/// nothing can wait on.
+fn bo_attach_fence(handle: u32, open_id: u32, fence: u64) -> bool {
+    {
+        let mut blobs = BLOB_BUFFERS.lock();
+        if let Some(b) = blobs.get_mut(&handle) {
+            if !open_may_reach(open_id, b.owner) {
+                return false;
+            }
+            b.last_fence = fence;
+            return true;
+        }
+    } // drop before touching the other map — never two BO locks at once
+    match DUMB_BUFFERS.lock().get_mut(&handle) {
+        Some(b) => { b.last_fence = fence; true }
+        None => false,
+    }
+}
 
 // ── Property blobs ───────────────────────────────────────────────────────────
 // Atomic modesetting passes modes (and damage clips) by blob id rather than by
@@ -1252,9 +1421,9 @@ impl DrmDeviceInterface {
             DRM_IOCTL_VIRTGPU_GETPARAM => self.virtgpu_handle_getparam(arg, open_id),
             DRM_IOCTL_VIRTGPU_CONTEXT_INIT => self.virtgpu_handle_context_init(arg, open_id),
             DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => self.virtgpu_handle_resource_create_blob(arg, open_id),
-            DRM_IOCTL_VIRTGPU_MAP => self.virtgpu_handle_map(arg),
-            DRM_IOCTL_VIRTGPU_RESOURCE_INFO => self.virtgpu_handle_resource_info(arg),
-            DRM_IOCTL_VIRTGPU_WAIT => self.virtgpu_handle_wait(arg),
+            DRM_IOCTL_VIRTGPU_MAP => self.virtgpu_handle_map(arg, open_id),
+            DRM_IOCTL_VIRTGPU_RESOURCE_INFO => self.virtgpu_handle_resource_info(arg, open_id),
+            DRM_IOCTL_VIRTGPU_WAIT => self.virtgpu_handle_wait(arg, open_id),
 
             // ── K4: Mesa/GBM buffer + Smithay/libdrm KMS surface ──
             DRM_IOCTL_GET_CAP => self.std_handle_get_cap(arg),
@@ -1264,7 +1433,7 @@ impl DrmDeviceInterface {
             DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => Ok(0),
             DRM_IOCTL_GET_MAGIC => self.std_handle_get_magic(arg),
             DRM_IOCTL_AUTH_MAGIC => Ok(0),
-            DRM_IOCTL_GEM_CLOSE => self.std_handle_gem_close(arg),
+            DRM_IOCTL_GEM_CLOSE => self.std_handle_gem_close(arg, open_id),
             DRM_IOCTL_MODE_DESTROY_DUMB => self.std_handle_destroy_dumb(arg),
             DRM_IOCTL_MODE_ADDFB2 => self.std_handle_addfb2(arg),
             DRM_IOCTL_MODE_RMFB => self.std_handle_rmfb(arg),
@@ -2400,11 +2569,17 @@ impl DrmDeviceInterface {
     }
 
     /// DRM_IOCTL_GEM_CLOSE — free the handle's backing (Ok even if unknown).
-    fn std_handle_gem_close(&mut self, arg: usize) -> Result<usize, DriverError> {
+    ///
+    /// Open-scoped for blob BOs: a handle belonging to another open is left
+    /// alone, and the call still reports success, because from this open's point
+    /// of view the handle simply names nothing — which is the same answer it
+    /// already gave for a handle that was never allocated. Dumb buffers are not
+    /// scoped (see `open_may_reach`).
+    fn std_handle_gem_close(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let c = unsafe { ptr::read_unaligned(arg as *const drm_gem_close) };
         Self::free_dumb(c.handle);
-        Self::free_blob(c.handle);
+        Self::free_blob_owned(c.handle, open_id);
         Ok(0)
     }
 
@@ -2414,13 +2589,37 @@ impl DrmDeviceInterface {
     /// resource id and — for a host-side blob — a slice of the shared-memory
     /// window, for the lifetime of the boot.
     fn free_blob(handle: u32) {
-        let b = match BLOB_BUFFERS.lock().remove(&handle) {
-            Some(b) => b,
-            None => return,
+        if let Some(b) = BLOB_BUFFERS.lock().remove(&handle) {
+            Self::release_blob(b);
+        }
+    }
+
+    /// GEM_CLOSE's entry point: free `handle` only if `open_id` may reach it.
+    /// The ownership test and the removal happen under one acquisition of
+    /// BLOB_BUFFERS, so two opens racing to close the same handle cannot both
+    /// pass the test and both tear the resource down.
+    fn free_blob_owned(handle: u32, open_id: u32) {
+        let taken = {
+            let mut map = BLOB_BUFFERS.lock();
+            let may = match map.get(&handle) {
+                Some(b) => open_may_reach(open_id, b.owner),
+                None => false,
+            };
+            if may { map.remove(&handle) } else { None }
         };
-        // The context this blob was actually attached to. GEM_CLOSE carries no
-        // open identity (it is a plain handle op, and the handle space is
-        // global), so the binding has to be remembered on the blob itself.
+        if let Some(b) = taken {
+            Self::release_blob(b);
+        }
+    }
+
+    /// Tear down a blob record already removed from BLOB_BUFFERS. Split from the
+    /// lookup so the owned and unowned entry points cannot drift apart in what
+    /// they release.
+    fn release_blob(b: BlobBuf) {
+        // The context this blob was actually attached to. GEM_CLOSE carries a
+        // caller identity but not a context, and the blob may well outlive the
+        // CONTEXT_INIT that was current when it was made, so the binding is
+        // remembered on the blob itself.
         let ctx = b.ctx;
         {
             let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
@@ -2710,16 +2909,21 @@ impl DrmDeviceInterface {
     /// so the host creates the completion fence on the ring Mesa asked for
     /// instead of always on ring 0.
     ///
+    /// Also honoured, since the per-BO fence landed: `bo_handles` /
+    /// `num_bo_handles`. Upstream resolves the array to GEM objects BEFORE
+    /// touching the device (a handle that names nothing fails the whole ioctl
+    /// with -ENOENT) and attaches the submission's fence to each object, which
+    /// is what makes a later WAIT on one of those BOs report on THIS submission.
+    /// Both halves are done here now — see "THE FENCE MODEL" on `BlobBuf` for
+    /// what that does and does not change while submission is synchronous.
+    ///
     /// NOT honoured, and reported once per distinct shape rather than dropped in
     /// silence:
-    ///   * `bo_handles` / `num_bo_handles` — upstream resolves these to a GEM
-    ///     object array and attaches the submission's fence to each BO, which is
-    ///     what makes a later `TRANSFER_FROM_HOST` or a `WAIT` on that BO block
-    ///     until this submission retires. This driver has no per-BO fence state
-    ///     to attach anything to, and inventing one that reports the wrong
-    ///     answer would be worse than reporting none.
-    ///   * `fence_fd` with FENCE_FD_IN/OUT — sync_file import/export needs a
-    ///     syncobj/fd fence infrastructure that does not exist here.
+    ///   * `fence_fd` with FENCE_FD_IN/OUT — sync_file import/export needs an
+    ///     fd-backed fence object, which means a new fd kind allocated by the
+    ///     VFS and handed back through the ioctl; the driver layer has no
+    ///     channel to create one. Unlike `bo_handles`, this is not blocked on
+    ///     fence state — it is blocked on fd plumbing.
     ///   * `in_syncobjs` / `out_syncobjs` / `syncobj_stride` — same.
     ///   * any flag outside VIRTGPU_EXECBUF_FLAGS_KNOWN. Upstream answers EINVAL
     ///     for those; we deliberately do not, because refusing a flag from a
@@ -2735,6 +2939,13 @@ impl DrmDeviceInterface {
         const MAX_CMD_BYTES: usize = 4 << 20;
         let size = exec.size as usize;
         if size > MAX_CMD_BYTES { return Err(DriverError::InvalidParameter); }
+        // Upstream bounds `num_bo_handles` only by what `kvmalloc_array` will
+        // serve. A tighter bound belongs here because the value is caller-
+        // controlled and decides a kernel allocation: 1024 is orders of
+        // magnitude above what Mesa's Venus backend submits (a handful of BOs
+        // per command stream) and far below anything that could pressure the
+        // allocator.
+        const MAX_BO_HANDLES: u32 = 1024;
 
         let entry = ctx_lookup_entry(open_id);
         let ctx = entry.map(|c| c.ctx_id).unwrap_or(0);
@@ -2777,29 +2988,57 @@ impl DrmDeviceInterface {
             None
         };
 
+        // ── bo_handles (implemented) ────────────────────────────────────────
+        // Copied out of user memory here, with every other user read, and
+        // BEFORE any lock is taken. `num_bo_handles == 0` with a non-null
+        // pointer is not an error — upstream gates entirely on the count.
+        let bo_handles: Vec<u32> = if exec.num_bo_handles != 0 {
+            if exec.bo_handles == 0 || exec.num_bo_handles > MAX_BO_HANDLES {
+                crate::pci::serial_debug("[DRM] EXECBUFFER: bad bo_handles array, n=");
+                crate::pci::serial_debug_hex(exec.num_bo_handles);
+                crate::pci::serial_debug("\n");
+                return Err(DriverError::InvalidParameter);
+            }
+            let n = exec.num_bo_handles as usize;
+            let mut v = vec![0u32; n];
+            unsafe {
+                ::core::ptr::copy_nonoverlapping(exec.bo_handles as *const u32, v.as_mut_ptr(), n);
+            }
+            v
+        } else {
+            Vec::new()
+        };
+
+        // Resolve the whole array before the device is touched, exactly as
+        // `virtio_gpu_array_from_handles` does: a submission that names a BO
+        // that does not exist is rejected outright rather than executed with
+        // the bad handle quietly skipped. Nothing has been submitted at this
+        // point, so returning here leaves no half-done work behind.
+        for &h in bo_handles.iter() {
+            if !bo_exists(h, open_id) {
+                crate::pci::serial_debug("[DRM] EXECBUFFER: unknown bo_handle=");
+                crate::pci::serial_debug_hex(h);
+                crate::pci::serial_debug("\n");
+                return Err(DriverError::NotFound);
+            }
+        }
+
         // ── Divergence report (logged only) ─────────────────────────────────
         // Keyed by the shape of what was asked for, not by the call, so a
         // per-frame submission logs its first frame and nothing after. The key
         // packs: which unhandled fields were non-zero, and which flag bits were
         // set, so two different divergences never collapse into one report.
         let unknown_flags = exec.flags & !VIRTGPU_EXECBUF_FLAGS_KNOWN;
-        let ignored_bo = exec.num_bo_handles != 0 || exec.bo_handles != 0;
         let ignored_fence_fd = exec.flags & (VIRTGPU_EXECBUF_FENCE_FD_IN | VIRTGPU_EXECBUF_FENCE_FD_OUT) != 0
             || exec.fence_fd != 0;
         let ignored_syncobj = exec.num_in_syncobjs != 0 || exec.num_out_syncobjs != 0
             || exec.in_syncobjs != 0 || exec.out_syncobjs != 0;
-        if ignored_bo || ignored_fence_fd || ignored_syncobj || unknown_flags != 0 {
+        if ignored_fence_fd || ignored_syncobj || unknown_flags != 0 {
             let key = (exec.flags & 0xFFFF)
-                | (ignored_bo as u32) << 16
                 | (ignored_fence_fd as u32) << 17
                 | (ignored_syncobj as u32) << 18;
             if EXEC_DIVERGENCE.lock().first(key) {
                 crate::pci::serial_debug("[DRM] EXECBUFFER: fields asked for but NOT honoured —");
-                if ignored_bo {
-                    crate::pci::serial_debug(" bo_handles(n=");
-                    crate::pci::serial_debug_hex(exec.num_bo_handles);
-                    crate::pci::serial_debug(")");
-                }
                 if ignored_fence_fd {
                     crate::pci::serial_debug(" fence_fd");
                 }
@@ -2833,7 +3072,15 @@ impl DrmDeviceInterface {
             let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
             gpu.submit_3d(ctx, &cmds, ring_idx).map_err(|_| DriverError::Io)?
         };
-        LAST_EXEC_FENCE.store(fence, Ordering::Relaxed);
+
+        // Attach the fence to every BO the submission named, and record it as
+        // this open's most recent — the two replacements for the single global
+        // `LAST_EXEC_FENCE`. A BO that vanished since validation (concurrent
+        // GEM_CLOSE) is skipped: it is gone, so nothing can wait on it.
+        for &h in bo_handles.iter() {
+            let _ = bo_attach_fence(h, open_id, fence);
+        }
+        ctx_record_fence(open_id, fence);
         Ok(0)
     }
 
@@ -2910,6 +3157,14 @@ impl DrmDeviceInterface {
             let ctx = ctx_lookup(open_id) as u64;
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
             unsafe { (req.value as *mut u32).write_volatile(ctx as u32) };
+            return Ok(0);
+        }
+        // Same treatment, same reason as CTX_ID: per-open bookkeeping behind a
+        // leaf lock, read into a local before the user pointer is touched.
+        if req.param == VIRTGPU_PARAM_LEANDROS_LAST_FENCE {
+            let f = ctx_lookup_entry(open_id).map(|c| c.last_fence).unwrap_or(0);
+            if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            unsafe { (req.value as *mut u32).write_volatile(f as u32) };
             return Ok(0);
         }
         // Same treatment, same reason: a leaf lock, no device round-trip, and
@@ -3152,6 +3407,10 @@ impl DrmDeviceInterface {
                 size: req.size,
                 blob_mem: req.blob_mem,
                 ctx,
+                // The creating open owns it, whether or not it has a context.
+                owner: open_id,
+                // Nothing has been submitted against a brand-new BO.
+                last_fence: 0,
                 // Host-visible mapping is established lazily, by VIRTGPU_MAP.
                 win_off: 0,
                 map_phys: 0,
@@ -3203,13 +3462,15 @@ impl DrmDeviceInterface {
     /// LOCKING: user memory is read before any lock is taken and written after
     /// every lock is dropped, and no two of BLOB_BUFFERS / HOSTVIS_SPANS /
     /// VIRTIO_GPU are ever held at the same time — the 82d0cc3 discipline.
-    fn virtgpu_handle_map(&mut self, arg: usize) -> Result<usize, DriverError> {
+    fn virtgpu_handle_map(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         // `struct drm_virtgpu_map { u64 offset; u32 handle; u32 pad; }`.
         let handle = unsafe { (arg as *const u8).add(8).cast::<u32>().read_volatile() };
 
-        // Copy the blob record out; hold nothing.
-        let blob = BLOB_BUFFERS.lock().get(&handle).copied();
+        // Copy the blob record out; hold nothing. Scoped to the calling open:
+        // another client's blob reads as a handle that does not exist, so this
+        // cannot be used to obtain an mmap token for it.
+        let blob = blob_lookup(handle, open_id);
 
         let token: u64 = match blob {
             // ── Host-side blob memory ────────────────────────────────────────
@@ -3366,20 +3627,20 @@ impl DrmDeviceInterface {
     /// at least the size they asked for, so all three outputs are load-bearing —
     /// returning 0 here would fail the import rather than degrade it.
     ///
-    /// NOT open-scoped, and it takes no `open_id`. Upstream resolves the handle
-    /// through the per-`drm_file` GEM table, but this driver's BO handle space is
-    /// process-global (`NEXT_BLOB_HANDLE` / `BLOB_BUFFERS`), and so are the two
-    /// ioctls that already consume a handle — VIRTGPU_MAP and GEM_CLOSE. Scoping
-    /// only the query would be strictly incoherent (a handle another open could
-    /// still map and close, but not describe) and would amount to inventing half
-    /// a new isolation model; per-open handle tables are a whole separate change.
-    /// It costs Mesa nothing either way: it creates and queries on the same fd.
+    /// Open-scoped, like the other handle-consuming ioctls. The note that used
+    /// to sit here said this was deliberately NOT scoped because MAP and
+    /// GEM_CLOSE were not either, and that scoping only the query would be
+    /// incoherent — a handle another open could still map and close, but not
+    /// describe. That reasoning was right, and the fix was to scope all three
+    /// together rather than to leave all three global: `BlobBuf::owner` now
+    /// carries the ownership that upstream's per-`drm_file` GEM table carries.
+    /// It costs Mesa nothing: it creates and queries on the same fd.
     ///
     /// Only blob BOs are known here. A dumb-buffer handle has no `res_handle`
-    /// recorded (DumbBuf carries only phys/order), and Venus never creates dumb
-    /// buffers, so an unknown handle is refused with NotFound — upstream's
+    /// recorded (DumbBuf carries no host resource id), and Venus never creates
+    /// dumb buffers, so an unknown handle is refused with NotFound — upstream's
     /// -ENOENT for a handle lookup miss.
-    fn virtgpu_handle_resource_info(&mut self, arg: usize) -> Result<usize, DriverError> {
+    fn virtgpu_handle_resource_info(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         // Read the input BEFORE taking any lock, and write the outputs back
         // AFTER dropping it: a demand fault taken under a spinlock is the
@@ -3387,8 +3648,8 @@ impl DrmDeviceInterface {
         // is pure guest-side bookkeeping — so VIRTIO_GPU is never locked at all.
         let req = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_resource_info) };
 
-        let blob = match BLOB_BUFFERS.lock().get(&req.bo_handle) {
-            Some(b) => *b,
+        let blob = match blob_lookup(req.bo_handle, open_id) {
+            Some(b) => b,
             None => {
                 crate::pci::serial_debug("[DRM] RESOURCE_INFO: unknown bo_handle=");
                 crate::pci::serial_debug_hex(req.bo_handle);
@@ -3412,18 +3673,38 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
-    /// DRM_IOCTL_VIRTGPU_WAIT — block until the work fenced by the most recent
-    /// EXECBUFFER has retired. Submission is synchronous, so by the time
-    /// EXECBUFFER returned the fence was already signalled; this reports that
-    /// truthfully instead of unconditionally succeeding.
-    fn virtgpu_handle_wait(&mut self, arg: usize) -> Result<usize, DriverError> {
+    /// DRM_IOCTL_VIRTGPU_WAIT — block until the work submitted against the BO
+    /// named by `handle` has retired.
+    ///
+    /// `handle` is a BO handle and is now used as one. Upstream
+    /// (`virtio_gpu_wait_ioctl`) looks the GEM object up and waits on ITS fence,
+    /// answering -ENOENT for a handle that names nothing. This used to ignore
+    /// the handle entirely and consult the process-global `LAST_EXEC_FENCE`, so
+    /// a wait on one open's buffer was answered from another open's submission.
+    ///
+    /// Three outcomes, all of them meaning something distinct:
+    ///   * handle names no BO this open may reach → refused (upstream -ENOENT);
+    ///   * BO exists, `last_fence == 0` → it was never named in any submission,
+    ///     so nothing is outstanding for it: success, with no device round-trip;
+    ///   * BO has a fence → ask the device whether it retired.
+    /// Submission is a synchronous busy-spin, so the third case is always
+    /// already retired today; it is asked rather than assumed so that the answer
+    /// stays correct when that stops being true.
+    fn virtgpu_handle_wait(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let w = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_3d_wait) };
         if w.handle == 0 { return Err(DriverError::InvalidParameter); }
 
-        let fence = LAST_EXEC_FENCE.load(Ordering::Relaxed);
+        let fence = match bo_fence(w.handle, open_id) {
+            Some(f) => f,
+            None => {
+                crate::pci::serial_debug("[DRM] VIRTGPU_WAIT: unknown bo_handle=");
+                crate::pci::serial_debug_hex(w.handle);
+                crate::pci::serial_debug("\n");
+                return Err(DriverError::NotFound);
+            }
+        };
         if fence == 0 {
-            // Nothing was ever submitted, so nothing is outstanding.
             return Ok(0);
         }
         let retired = {
@@ -3538,7 +3819,9 @@ impl DrmDumbBuffer {
         }
 
         let handle = Self::next_handle();
-        DUMB_BUFFERS.lock().insert(handle, DumbBuf { phys: phys_addr as usize, order });
+        DUMB_BUFFERS
+            .lock()
+            .insert(handle, DumbBuf { phys: phys_addr as usize, order, last_fence: 0 });
         
         // mmap_offset for userspace will be the physical address
         // The syscall handler will use this to map the device memory
