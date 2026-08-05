@@ -334,11 +334,21 @@ build_relibc() {
         echo "⚠️  relibc source not found at $relibc_dir, skipping"
         return 0
     fi
+    # relibc's C sources go through the cc crate, which with no CC set falls
+    # back to the HOST compiler. That only works by accident on an aarch64 host:
+    # relibc passes -mno-outline-atomics, an aarch64-only flag that x86_64 gcc
+    # rejects outright ("unrecognized command-line option"), so an aarch64 build
+    # dies on an x86_64 box. Point the cc crate at the same zig wrapper the rest
+    # of the cross-build uses, keyed by the custom target's name, so the result
+    # does not depend on which machine ran the build.
+    local target_name="$arch-unknown-leandros"
     (
         cd "$relibc_dir" || exit 1
         # Build relibc using cargo
+        env "CC_$target_name=$ROOT_DIR/scripts/cc-$arch-musl.sh" \
+            "AR_$target_name=$ROOT_DIR/scripts/ar-musl.sh" \
         cargo build --target "$target_spec" --release -Z build-std=core,alloc,compiler_builtins
-        
+
         # Also build ld_so and crt if they are part of the workspace and needed
         # (Already handled by workspace if configured correctly, but relibc's Makefile 
         # is the traditional way to get the full sysroot. For now we use cargo to get libc.a)
