@@ -1341,7 +1341,7 @@ static LAST_FLIP_DELIVER_TICK: AtomicU64 = AtomicU64::new(0);
 /// DIRTYFB is never used, and the kernel's own scale+flush costs only ~1.7 ms
 /// per flip. The ~1 fps pointer is therefore the compositor recompositing the
 /// whole screen in software, not anything in this path.
-pub const DRM_STATS: bool = true;
+pub const DRM_STATS: bool = false;
 static FLIPS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
 static DIRTYFB_CALLS: AtomicU64 = AtomicU64::new(0);
 static DIRTYFB_CLIPS: AtomicU64 = AtomicU64::new(0);
