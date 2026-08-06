@@ -3,119 +3,86 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-06** (`97a979e`); item 4 and the item 10
-Mesa-modifier bullet updated the same day with a source-analysis wave over smithay
-`efeb597` and the kernel DRM property/blob path. Same day, a second wave: item 2
-(memfd tmpfs-slot leak) got a completed source-analysis pass and a prepared-but-unbuilt
-patch, and a new item 3 was split out for the TGID defect the audit found along the way.
-Same day, a third wave retired the former item 7 (Doom hang): measured on the Linux box
-at `295136c` with fresh images, Doom runs on both arches, including the literal
-`-mb 16` case — see the softfloat note in Standing context and the allocator note in
-item 10 for what it leaves behind. Same day, a fourth wave covers this reconciliation:
-items 5-7 (`listen()` twice, the `handle_close` warning, and the dead `init-server`
-crate) got a combined, verified-applicable patch at
-`~/code/leandros-artifacts/notes/m9-small-fixes/small_fixes.patch`, confirmed to stack
-cleanly in both orders with the item 2 and item 4 patches; two new items, 8 and 9,
-were split out for AF_UNIX `listen()` laxness and the missing TIME_WAIT state found
-along the way. Same day, a fifth wave closed two more: the former item 4
-(`wl_display error 0 "Unknown id: 636"`) does not reproduce — a fresh aarch64/HVF
-release build and fresh images ran a 200 s COSMIC session with a 30 s pointer-motion
-window and hit zero `Unknown id`, `Broken pipe`, `PANEL MAIN ERR` or `wl_display#1:
-error` occurrences, confirming the item's own hypothesis (an FP/SIMD-clobber artifact
-— see the tally in Standing context) and clearing the AF_UNIX SCM_RIGHTS path it had
-implicated (`scmtest` 26/0 both arches); and the former item 6 (evdev monotonic
-timestamps) landed as `05bb0fe`, verified by `evtest2` 8/0 (`motion_ts_monotonic`,
-`motion_ts_subtick`) and the cursor gate (8.50 flips/s, 8.50 cursor mv/s, 0.00 cursor
-uploads/s) against a legacy-path control confirmed genuinely legacy (`atomic=0
-atest=0 cplane=0`). `05bb0fe` also added the `evpush` guest-side evdev-event counter
-to the `[DRMSTAT]` diagnostics (see the table below). Same day, a sixth wave closed out
-a design pass on item 1 (Venus/virgl): the 68/68 `venustest` and 0-failure `vktest`
-results stand, but `vktest` stops at `vkCreateDevice` — no GPU work has ever actually
-been submitted from LeandrOS — so item 1 is rewritten around a full M3 design at
-`~/code/leandros-artifacts/notes/m9-m3-vulkan/m3-vulkan-design.md`, scoping M3 as an
-offscreen `vkrender` with CPU readback rather than `vkcube`, and preparing (not
-building) a `run-qemu.sh --venus` patch. Two new items were split out of the design's
-kernel-gap findings: item 2 (`PRIME_HANDLE_TO_FD` refuses Venus blob handles, paired
-with the `SIMULATE_SYNCOBJ` zero-size-execbuffer gap) and item 3 (`driver.py` has no GL
-path, so the `run-leandros` skill cannot reach Venus at all). Former items 2-9 shifted
-down to 4-11 and the former item 10 (deferred work) is now item 12. Same day, a seventh
-wave closed the former items 4 and 5 (the memfd tmpfs-slot leak and the
-`tmpfile_owner_of` TGID canonicalisation), both landed together in `77f170d` and
-verified on both arches: `memfd_anonymous_reclaim` 300/300, `memfd_inflight_close`
-passing (only after a flaw in the test itself was fixed — see the guard-test lesson in
-Standing context), `scmtest` 26/0 → 28/0, and a clean aarch64 A/B against pristine
-`420adf7` showing the `smithay-clipboard` OutOfMemory panic present on the old kernel
-and absent on the new one. A new item was split out of that verification for a
-pre-existing, unrelated defect the double-release audit surfaced: `import_fd`
-double-releases on EMFILE. Former items 6-12 shifted down to 5-11. Same day, an eighth
-wave escalated the former item 4: a source-analysis pass over both EMFILE arms and
-`release_vnode`'s five fd kinds found the double release is not cosmetic — it lands on
-a live reference every time (the sender's fd is never revoked by `export_fd`) and
-three of five kinds free live kernel state out from under an open fd
-(`DynamicDevice` open-id reuse, `EventFd`/`TimerFd` free-slot-sentinel aliasing),
-making it use-after-free class rather than a leak. Retitled, given a prepared fix and
-regression subtest (`~/code/leandros-artifacts/notes/m9-import-fd-emfile/import_fd_emfile.patch`,
-`scmtest` 28/0 → 29/0), and promoted to item 1 ahead of the Venus items. Former items
-1-3 shifted down to 2-4; items 5-11 unchanged. Same day, a ninth wave landed the M3
-`vkrender` milestone at `b2260b4`: `vkrender` executes real GPU work for the first
-time — fill-buffer, compute and graphics subtests all pass, with `s2_checksum =
-0x02C0FDC5` pinned identically across x86_64/KVM, x86_64/TCG and aarch64/TCG — and
-`run-qemu.sh --venus` landed and reproduces `venustest` 68/68 and `vktest` 0 failures on
-both arches. The former item 2 (Venus/M3) is rewritten and retitled around the
-milestone. The former item 4 (`driver.py` has no GL path) is resolved and deleted: QMP
-`screendump` under `-display egl-headless` works in its bare form (no `device=`), so a
-`driver.py` Venus mode is unblocked; the finding is folded into the Venus item since it
-also gates M3's presentation step. Chasing an `x86_64/KVM`-only `vkrender` `s0_submit`
-timeout (TCG passes on both arches) found a real kernel defect — blob mappings ignore
-the host's requested cacheability, forcing write-back on memory Mesa's fence-feedback
-path asked to be write-combined — split out as a new item at position 2, right after
-`import_fd`. Former items 2-3 shifted down to 3-4; former item 4 deleted; items 5-11
-unchanged. Same day, a tenth wave completed the analysis on item 2: `git log -S` on the
-warning string traced the cacheable override to a deliberate deferred-scope decision
-recorded in `0dfc362`, not a workaround, and both reasons given there are now dead. A
-source pass over both arches found the fix needs a new, arch-neutral `WRITECOMBINE`
-flag rather than reusing `NOCACHE` — x86_64 has the attribute (PCD, no PAT needed since
-there is no PAT setup to make UC anything but the reset state) but aarch64's
-`ATTR_NOCACHE` produces Device memory, not Normal-NC, because neither Limine nor our
-direct-boot path programs MAIR attributes 2..7. Item 2 is rewritten around the completed
-analysis and a prepared patch, confirmed to stack with the in-flight primary-plane work
-in both orders. Two new items were split out of what the pass uncovered along the way:
-item 3 (the `ATTR_NOCACHE`/MAIR gap is live independent of the blob work — it also means
-the framebuffer has silently been Device memory all along) and item 4 (x86_64 has no PAT
-or MTRR setup, so true write-combining is unreachable there either, a separate ceiling
-worth recording). Former items 3-11 shifted down to 5-13. Same day, an eleventh wave
-completed the analysis on item 6 (`PRIME_HANDLE_TO_FD` rejects Venus blob handles): a
-source pass over the kernel's blob/dumb-buffer registries, the borrowed-VMO lifecycle,
-and Mesa's WSI import paths (`wsi_common_drm.c`, `vn_renderer_virtgpu.c`) produced a
-prepared patch and a retitle to match. Three new items were split out of what the pass
-uncovered along the way: a `SIMULATE_SYNCOBJ` gap where a rejected zero-size execbuffer
-leaves `fence_fd` unwritten and Mesa then `close()`s stdin; the borrowed-VMO
-grow/leak/truncate hazards audited while designing the export, closed by one stated
-invariant the patch enforces; and the cross-open dmabuf gap that PRIME export alone does
-not close, needed for `VK_KHR_display` and Wayland but not for headless WSI. Former
-items 7-13 shifted down to 10-16. Same day, a twelfth wave landed two more fixes and
-closed this reconciliation: `import_fd` double-releasing on EMFILE (the former item 1)
-landed as `9be954f`, verified by an A/B on both arches using one binary, one image and a
-kernel-only rebuild — pristine reads `[emfile] post ret=0` (the phantom EOF) and FAILs,
-patched reads `-1/EAGAIN` and PASSes, with the pre-read control at `-1/EAGAIN` on both
-sides proving the assertion discriminates rather than passing vacuously. `listen()`
-twice (former item 11), the dead `port` variable in `handle_close` (former item 12) and
-the unreachable `init-server` crate (former item 13) landed together as `07d461c`,
-verified both arches: pristine reads `second listen rc=-1 errno=22` and FAILs, patched
-reads `rc=0` and PASSes; both arches link and boot with the crate gone, and the serial
-log to the login prompt is character-identical either side (only the nondeterministic
-4-vCPU interleave of `[SCHED] CPU ID` against `[NET] DHCP configured` differs — same
-bytes, different order, present on both sides); `grep -rn "init_server\|init-server"`
-now matches only this file. Former items 2-10 and 14-16 shifted down to 1-9 and 10-12.
+Last reconciled against `main` on **2026-08-06** (`c27557f`), after a five-lane wave that
+landed two commits here and four on the Linux box, closed three items by measurement,
+**corrected three claims the previous reconciliation had recorded wrongly**, and found one
+memory-safety bug that is now the first item in the file.
 
-Eleven commits landed this session in total: `05f7279` (aarch64 softfloat), `531f21e`
+**Landed on this Mac.** `fe411ff` closes the former TIME_WAIT item: a closed TCP port is
+now held for 60 s, `SO_REUSEADDR` became real in the same patch, and the landing is
+*provably* live rather than merely staged — a single-variable A/B (same `/bin/scmtest`,
+two kernels, `md5 f2fs-data0-aarch64.img = 0c1e090c…` identical on both sides) moved
+**exactly** assertion (b), `rc=-1 errno=98` patched against `rc=0 errno=22` with only
+`time_wait_add` removed, `scmtest` 31/0 against 30/1. `c27557f` compiles `DRM_STATS` back
+out; it had been left `true` by `c5abb8d` against the flag's own doc comment, while
+`CURSOR_DEBUG` and `mm::gap2::ON` were already `false`. **`c5abb8d`'s outstanding
+`drmsmoke` gate is cleared**, 22/0 on both arches with `idletest` 2/0, run twice — once
+with diagnostics on and once in the shipping configuration after the flag flip, which is
+the run that counts. `drmsmoke` cannot be moved by that commit's counter redefinition by
+construction (`userland/drmsmoke/src/main.rs` never reads `FLIPS_SUBMITTED` or
+`[DRMSTAT]`), so any movement would have been a real regression; there was none, and no
+revert is warranted. Suite baselines move to **`scmtest` 31/0**, `vfstest` 36/0.
+
+**Landed on the Linux box only,** whose `main` is at `a0325c6`: `0df1810`, `e083202`,
+`eccc4e9`, `a0325c6`. `origin/main` is untouched at `6a0eb0c` and nothing has been pushed
+from either machine. **The sync onto this Mac is deliberately on hold** — `e083202`
+widens the item 1 use-after-free from dumb buffers to blobs, so bringing it over before
+the fix trades a bug reachable through one path for the same bug reachable through two.
+That is item 2, and it is a decision, not housekeeping.
+
+**The former `SIMULATE_SYNCOBJ` item is closed**, landed on the box as `a0325c6`, with
+`venustest` at **91 PASS / 0 FAIL on both arches**. The four subtests that had failed were
+re-specified — but *the recorded reason for their failure was wrong in both the previous
+report and the item text, and it is corrected here because `git log` cannot be edited*.
+It is **not** `RING_IDX` against a virgin context: a `GPU3D_DEBUG` `(size, flags, ring)`
+histogram over one boot shows Mesa's own **first** submit of a renderer lifetime
+(`size=0x8C flags=0x04 ring=0`) and its `vn_ring_destroy` teardown submit
+(`size=0x10 flags=0x06 ring=0`) both **complete**, on a context where no host ring has
+ever been created — ring 0 is the CPU ring and needs no creation. The variable is the
+**stream**: venustest's 32 zero bytes are not dispatchable (`vkr: vn_dispatch_command
+failed`), and with `RING_IDX` the completion fence routes through the renderer context
+instead of the global timeline, so a context whose dispatch failed never retires it. Real
+Mesa cannot reach this; it needs a host-side dispatch failure. What survives is a
+robustness note, item 3, at the strength the evidence supports.
+
+**`vkrender --present` ran**, 10/10 subtests, `vkrender` 0 failures overall,
+and it needed **zero code** — it was unrun, not unfinished. The host wire trace shows the
+whole handover: `RESOURCE_CREATE_2D 0xb (1920x1080)` → `ATTACH_BACKING` → **`SET_SCANOUT
+id 0, res 0xb`** → `TRANSFER_TO_HOST_2D` → full-frame `RESOURCE_FLUSH`, with the console
+driver reclaiming the scanout on exit. That run also corrected the item's `screendump`
+account: the failure was `DeviceNotFound`, because QMP resolves `device=` as a qdev id and
+`--venus`'s device line carried no `id=`. With `id=venusgpu` it works *before* the present
+and fails `"no surface"` *during* it, because a virgl-backed scanout has no
+`DisplaySurface`. The remaining half of item 6 is a Vulkan-free present tool on the
+non-Venus path.
+
+**The former cross-open dmabuf item is resolved as an M4 blocker, by measurement rather
+than by argument.** In a live COSMIC session cosmic-comp advertises **54 globals** and
+`zwp_linux_dmabuf_v1` is **absent**, as are `wl_drm` and `wp_drm_lease_device_v1` — all
+three behind the same `!is_software` gate. M4 therefore goes via `MESA_VK_WSI_DEBUG=sw`:
+1–2 days, all userspace, zero kernel days, and the shipped `libvulkan_virtio.so` already
+has both WSI branches compiled in, so no Mesa rebuild. Stages 3–5 of that design are
+**killed as an M4 unblocker**; Stages 1–2 remain due, because they are item 1.
+
+**Two lanes were still running when this was written**, and neither result may be assumed:
+one validating item 9 (AF_UNIX `listen()` strictness) with a dirty-image COSMIC double-run
+on the Linux box, one implementing the item 1 fix. What each outcome means is written into
+its item.
+
+Earlier waves this session, compressed: `05f7279` (aarch64 kernel softfloat — six separate
+items trace back to that clobber, directly or as the cause that retired them), `531f21e`
 (harness prompt detection), `4085b7f` (nested epoll), `75b32e3` (sub-tick
-`CLOCK_MONOTONIC`), `26eebf0` (AF_INET loopback), `05bb0fe` (evdev timestamps),
-`77f170d` (memfd + TGID), `b2260b4` (`--venus` + vkrender staging), `9be954f`,
-`07d461c`, `97a979e`. The item count did not fall much across the session because
-analysis kept finding pre-existing defects that were always there and simply
-unmeasured, not because work ran out. Six separate items trace back to the FP/SIMD
-clobber fixed in `05f7279`, directly or as the cause that retired them.
+`CLOCK_MONOTONIC`), `26eebf0` (AF_INET loopback), `05bb0fe` (evdev monotonic timestamps),
+`77f170d` (memfd tmpfs-slot leak + TGID canonicalisation), `b2260b4` (`run-qemu.sh
+--venus` + `vkrender` staging — the first GPU work ever submitted from LeandrOS),
+`9be954f` (`import_fd` EMFILE double-release, use-after-free class), `07d461c` (repeat
+`listen()`, dead `init-server` crate), `97a979e` (subtest comments stop citing TODO item
+numbers), `c5abb8d` (`FB_DAMAGE_CLIPS`), `18a7a9f` (blob cacheability), plus this wave's
+`fe411ff` and `c27557f`. **Fifteen code commits on this Mac (TODO-only commits aside);
+four on the box.** The item count
+does not fall much across the session because analysis kept finding pre-existing defects
+that were always there and simply unmeasured, not because work ran out — item 1 is the
+sharpest example.
 
 ---
 
@@ -126,43 +93,114 @@ Facts that future work depends on and should not have to re-derive.
 **Goal.** Run the COSMIC desktop environment *unmodified* (source: `../cosmic-epoch`)
 on both x86_64 and aarch64 under QEMU. No COSMIC source patches; build-configuration
 flags (`--no-default-features`) are allowed. Everything beneath COSMIC — kernel, libc,
-system libraries, daemons — is ours.
+system libraries, daemons — is ours. **This constraint is load-bearing twice over**: the
+primary-plane over-damage is inside `OutputDamageTracker`/`DamageShaper` (item 8), and
+the missing dmabuf global is behind cosmic-comp's `!is_software` gate (item 7). In both
+cases the reachable outcome is a measurement or an upstream reproducer, not a patch.
 
 **Where it stands.** The desktop runs on both arches: cosmic-session → cosmic-comp on
 KMS/softpipe → busd → cosmic-bg + cosmic-panel renders a wallpaper plus a full-width
-panel bar with an embedded Wayland client. The panel clock ticks on both arches
-(`4085b7f`: `poll_fd_state` had no epoll-fd case, so a nested epoll fd fell into the
-socket branch and reported `POLLNVAL` as readiness on every pass, starving the frame
-callback that reopens cosmic-panel's `has_frame` gate). Remaining work is quality and
-performance, not bring-up. The full suite is green on freshly-built release binaries
-and fresh images, both arches, as of `26eebf0`: vfstest 36/0, drmsmoke 22/0, scmtest
-28/0 (the 26th subtest, `inet_loopback_tcp`, added in `26eebf0`; the 27th and 28th,
-`memfd_anonymous_reclaim` and `memfd_inflight_close`, added in `77f170d`), wakepolltest
-10/0, forktest 3/0, epolltest 9/0 (the 9th subtest, `nested_epoll`, added in `4085b7f`),
-polltest 6/0, sigtest 6/0, timertest 6/0 (the 6th subtest, `clock_monotonic_subtick`,
-added in `75b32e3`), memtest 4/0, waittest 5/0 — all on x86_64. On aarch64, waittest
-also came out 5/0 in this run rather than the previously recorded 3/2; the
-`wait_on_process_group` flake simply did not fire this time, so treat either result as
-acceptable. This wave (`05bb0fe`) also ran `idletest` 2/0 and `evtest2` 8/0 green on
-both arches; neither was previously listed in this baseline. **Also as of `b2260b4`:**
-`vkrender` passes 3/3 subtests with 0 failures and 0 skips on x86_64/TCG and
-aarch64/TCG, with `s2_checksum = 0x02C0FDC5`; under x86_64/KVM it needs
-`VN_PERF=no_fence_feedback` until the blob-cacheability item (item 1) is fixed.
-**Refined 2026-08-06
-(`77f170d`):** the flake is not aarch64-specific — an A/B on a pristine `420adf7` kernel
-gave 5/0, 3/2, 5/0 across three runs, and the patched kernel gave 5/0 x3 and 3/2 x8
-across 11 runs, both on aarch64. It is a pure timing race in `fork` -> child
-`setpgid(0,0)` + `_exit` -> parent `waitpid(-pid)`, with no tmpfs, memfd or SCM
-involvement; either result is acceptable on either arch. **Refined again 2026-08-06
-(`97a979e`):** with the EMFILE and `listen()`/`init-server` fixes landed, `scmtest` is
-**30/0** on both arches (29/0 from the EMFILE subtest, 30/0 from `inet_listen_twice`);
-everything else holds at baseline on fresh images with vfstest run once: vfstest 36/0,
-drmsmoke 22/0, wakepolltest 10/0, forktest 3/0, epolltest 9/0, polltest 6/0, sigtest
-6/0, timertest 6/0, memtest 4/0, idletest 2/0, evtest2 8/0; `waittest` is 5/0 or 3/2 on
-either arch, the same pre-existing `wait_on_process_group` flake measured on pristine
-kernels too. Venus re-checked after these patches: `venustest` 68/68 and `vkrender` 51
-PASS / 0 FAIL under `VN_PERF=no_fence_feedback` on x86_64/KVM, with `s2_checksum =
-0x02C0FDC5` holding.
+panel bar with an embedded Wayland client, clock ticking. Remaining desktop work is
+quality and performance, not bring-up. Vulkan runs **and presents**: `vkrender` executes
+fill-buffer, compute and graphics work, `vkswap` drives a headless-surface swapchain to
+`vkQueuePresentKHR -> VK_SUCCESS`, and `vkrender --present` puts a rendered image on a
+real DRM scanout.
+
+**Suite baselines.** On fresh images with `vfstest` run exactly once per image, both
+arches: vfstest **36/0**, scmtest **31/0**, drmsmoke **22/0**, wakepolltest 10/0,
+forktest 3/0, epolltest 9/0, polltest 6/0, sigtest 6/0, timertest 6/0, memtest 4/0,
+idletest 2/0 (`IDLE_CPU_US 0`), evtest2 8/0. `waittest` is **5/0 or 3/2 on either arch**
+— a pure timing race in `fork` → child `setpgid(0,0)`+`_exit` → parent `waitpid(-pid)`,
+measured on pristine kernels too; either result is acceptable on either arch, and the
+x86_64-vs-aarch64 asymmetry seen in any single wave is noise (this wave: aarch64 3/2,
+x86_64 5/0). On a **Venus host** (the Linux box, `--venus`), at the box's `a0325c6`:
+`venustest` **91/0 both arches**, `vktest` 14/0, `vkrender` **51/0** with
+`s2_checksum = 0x02C0FDC5` pinned across x86_64/KVM, x86_64/TCG and aarch64/TCG, `vkswap`
+**21/0** (x86_64). `vkrender` under KVM **no longer needs** `VN_PERF=no_fence_feedback` —
+that dependency died with `18a7a9f`/`0df1810`.
+
+**A Mac `venustest` run is worth nothing, in either direction.** QEMU 11.0.2 on macOS has
+**no blob-capable virtio-gpu device at all**: `virtio-gpu-pci,blob=on` is refused with
+*"need rutabaga or udmabuf for blob resources"*, and neither `virtio-gpu-gl-pci` nor any
+rutabaga variant is compiled in. `VIRTIO_GPU_F_RESOURCE_BLOB` is never advertised, so no
+blob BO can be created and nothing downstream of one can be exercised. A Mac `venustest`
+reports **42 lines, 11 PASS / 31 FAIL**, byte-identical on patched and unpatched kernels.
+Do not compare that against the box's numbers and conclude anything. Everything blob-,
+HOST3D- or Venus-shaped goes to the box.
+
+**cosmic-comp offers no dmabuf to clients here — measured, not inferred.** A live aarch64
+session at `c27557f` advertises 54 globals on `/run/user/0/wayland-1`, identical across
+three passes 30 s apart; `zwp_linux_dmabuf_v1`, `wl_drm` and `wp_drm_lease_device_v1` are
+all absent, and no `wayland-1-card0` socket exists, so `create_socket`
+(`cosmic-comp/kms/socket.rs:31`) was never called and `is_software` is true. **Scope:**
+absent *in this configuration* — software EGL, forced because the macOS host has no EGL,
+so `virtio-gpu-gl,venus=on` is unusable and the guest has no hardware GL. It would flip
+only if the guest gained a non-software EGL device. Full report and controls:
+`~/code/leandros-artifacts/notes/m9-crossopen-dmabuf/stage0a-wl-globals.md`.
+
+**Instrument reliability — read this before trusting a number.** **Nine** separate
+instruments have now produced believable wrong numbers, or would have:
+
+1. A parser keyed on field *position*: `m8_cursor.py`'s regex ran from `flip_us` onward,
+   and `c5abb8d` inserted five `dmg_*` fields between `flip_us` and `curs_up`, so every
+   field after the insertion point silently read **0** on a patched kernel. Parse
+   `key=0xHEX` pairs order-independently (`m9_analyze.py` does).
+2. A guard test that passed with its guard removed: `memfd_inflight_close` as first
+   written could not fail, because the hazard window never opened. The same trap was
+   walked into and *avoided* later — a `close(0)`-consequence check would have been
+   vacuous, since `sys_fcntl` short-circuits `fd <= 2` and answers `F_GETFD` with a
+   hardcoded `0` without consulting the fd table.
+3. A serial `expect()` that searched backwards over an accumulated buffer and re-matched
+   the *previous* command's end sentinel: every command after the first reported `rc=0`
+   **without ever running**. Caught only because a log claiming `venustest` passed
+   contained no `venustest` output. Take the buffer mark *before* sending, and number the
+   sentinel per command.
+4. `driver.py cmd`'s shell-prompt heuristic swallowing error lines on TCG x86_64, where
+   the guest is slow enough for the heuristic to break early.
+5. A count delta that looked perfect: `virtio_gpu_cmd_ctx_submit` events per renderer
+   lifetime came out 6 on HEAD and 7 patched — a clean +1. The same binary three times in
+   one HEAD boot gave **6, 6, 7**. Venus notifies its ring opportunistically; the count
+   floats and the +1 was noise.
+6. **`grep` over a serial log sharing a pty with QEMU's trace stream.** With
+   `-trace virtio_gpu_cmd_*` and no `-D`, every guest character triggers a console flush,
+   so trace lines land *between* the guest's bytes: `present_addfb2: PASS` arrived as
+   twenty single characters. `grep -a "present_"` found **2 of the 10** present subtests
+   and reported nothing wrong — the eight missing ones looked exactly like eight subtests
+   that had never run. The same shredding broke the harness's own sentinel, so a `rc=0`
+   run was reported as a harness failure. Fix: `-D <file>`, so the trace stream never
+   touches the pty.
+7. **The Stage 0a instrument that was caught before it lied.** The natural build — extend
+   `leandros-applet` to dump the registry — would have enumerated **cosmic-panel's
+   embedded server**, because the panel hands each applet an inherited `WAYLAND_SOCKET` fd
+   and `connect_to_env()` follows it. That server advertises `wl_compositor`, `wl_shm` and
+   `xdg_wm_base` and no dmabuf: **indistinguishable from the true negative being hunted,
+   and it passes the "the other globals prove the dump worked" sanity check**. The lesson
+   worth keeping is general — *a sanity check can be satisfied by the very failure it was
+   meant to exclude*, so an instrument must establish **which thing it measured**, not
+   merely that it measured something. `wl-globals` does: it ignores the environment,
+   globs `wayland-*` in `$XDG_RUNTIME_DIR`, connects by explicit path, and the identity of
+   the socket is pinned by cosmic-session's own
+   `got environmental variables from cosmic-comp: [("WAYLAND_DISPLAY", "wayland-1")]`.
+8. A positive control that came back showing **only the prompt**, because the read window
+   raced login settle. Re-running it passed — which is itself the argument for running a
+   control rather than assuming one would have passed.
+9. **Commands sent to a shell ~180 s after a COSMIC session launch do not execute** (or do
+   not echo): the console is saturated by session output. A probe that types its
+   measurement later returns nothing. Any session-probing design must **background its
+   work early**, while the console is still responsive — the Stage 0a dumper was launched
+   as the third command and slept 100 s inside its own process, which is the only reason
+   that measurement exists.
+
+Two rules follow, and both are cheap. **Run a positive control** — send a known-failing
+command (`nosuchbinary_xyz42`) as the first command of every boot and confirm the harness
+reports it failing; that single step catches 1, 3, 4 and 8. **Prefer a structurally
+distinctive observable over a count delta**: replacing a submit *count* with a
+`(payload size, flag word, ring index)` histogram settled the syncobj question
+unambiguously — 16 bytes occurs zero times in 72 submits across five HEAD lifetimes and
+exactly once per lifetime patched, always last before `ctx_destroy` — where the count had
+hidden the event entirely. Cross-foot every number against a second, independent source:
+the test binary's own `failures = N` trailer caught a `^\S+: PASS$` extractor that
+reported `PASS=0` because the serial console emits CRLF.
 
 **vmnet gotcha.** On a Mac with `socket_vmnet` installed, `driver.py` uses vmnet rather
 than slirp, so the guest gets a `192.168.105.x` lease and `10.0.2.x` does not exist —
@@ -205,64 +243,84 @@ reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print i
   **Trap for next time** (`26eebf0`, `handle_send`): `read_user_buf` alone does not
   fault a lazy page in — it resolves through `virt_to_phys`, which returns `None`
   instead of faulting, and `sys_sendto` never calls `prefault_user`, only
-  `validate_user_buf`. Swapping in `read_user_buf` on its own would have been a
-  regression (first-touch send buffers would EFAULT). Either pair it with
-  `prefault_user` (private to the syscall crate) or hoist the copy above the lock so
-  the fault happens with nothing held — the fix actually used, matching the idiom the
-  `IcmpUnbound` arm already uses.
+  `validate_user_buf`. Either pair it with `prefault_user` (private to the syscall
+  crate) or hoist the copy above the lock so the fault happens with nothing held.
 - **The kernel is softfloat on both arches and must stay that way.** The EL0 trap
   frame saves no vector state, so any kernel code LLVM lowers through a vector
   register lands on the interrupted thread's. Both kernel target JSONs disable the
   vector units; `cpu_switch_to` is the single deliberate exception and scopes the
-  extension with `.arch armv8-a+fp+simd` … `.arch armv8-a`.
-  **Inferred, not bisected:** this is also most likely what retired the former item 7
-  (Doom hang in `malloc(16 MB)` on aarch64, deleted 2026-08-06 — it now runs both
-  arches on fresh images). Doom is compiled `clang --target=aarch64-unknown-none -O2`,
-  a **hardfloat** target, so clang freely lowers inlined `memcpy`/`memset`/struct
-  copies through `q` registers; `Z_Init`/`W_Init` is the phase of maximum cold-page
-  exposure in a 1.45 MB static binary, and a demand-paging fault there under the old
-  `+neon` kernel clobbering a `q` register holding a loop bound or pointer is exactly
-  the "hangs with no output, no fault" shape that was observed. `75b32e3` (sub-tick
-  `CLOCK_MONOTONIC`) is a weaker secondary candidate. Also retired by it, not by work
-  aimed at it: the former item 4 (`wl_display error 0 "Unknown id: 636"`, deleted
-  2026-08-06 — a 200 s COSMIC session with a 30 s pointer-motion window showed zero
-  recurrences on the fixed kernel). The suspicion recorded against that item's AF_UNIX
-  `SCM_RIGHTS` path was never borne out — `scmtest` covers that path at 26/0 on both
-  arches. Doom is the fifth and id 636 the sixth thing this session traced to this
-  clobber, directly or as the retiring cause.
+  extension with `.arch armv8-a+fp+simd` … `.arch armv8-a`. Six items across this
+  session trace back to this clobber, directly or as the cause that retired them.
+- **A borrowed VMO's page list is immutable.** Stated and enforced by the PRIME export
+  commit (`e083202`, box-only — item 2). It closes three hazards measured *live* on this
+  Mac, not theoretical ones: an unpatched kernel returned a valid mapped address for a
+  page past the frames the DRM layer lent it, accepted an 8-byte `write()` into it, and
+  *succeeded* at shrinking a borrowed frame list — order-0 frees out of an order-N buddy
+  block. Until that commit reaches this Mac, the Mac tree still has all three.
+  **The converse invariant does not exist yet and is item 1**: nothing makes the DRM
+  object outlive an exported dmabuf fd.
 - Release builds only — debug builds crash early. Test **both** arches in QEMU after
   every change. Minimum Limine revision is **6**, never downgrade.
 - Regression images must be freshly regenerated — run vfstest **exactly once** per
-  freshly generated image. A dirty f2fs image produces phantom failures: an A/B
-  control (identical signature with and without an unrelated kernel change) showed a
-  second vfstest run on the same image fails three subtests —
-  `chroot_confines_symlink_resolution`, `xattr_list_tmpfs` and `xattr_list_f2fs`.
+  freshly generated image. A dirty f2fs image produces phantom failures
+  (`chroot_confines_symlink_resolution`, `xattr_list_tmpfs`, `xattr_list_f2fs`). The
+  historical aarch64 `xattr_list_f2fs` red has not appeared anywhere this session, on
+  either machine, consistent with it being that artifact and not an arch bug.
 - **A guard test must be shown to fail with its guard removed, or it is certifying a
-  hazard it never checked.** `memfd_inflight_close` (`77f170d`) as first written could
-  not fail: with `tmp_inflight_inc` removed from `export_fd` it still passed, because
-  the parent created the memfd and `fork()`ed before closing it, so the child inherited
-  a copy and the parent's `close()` was never the last fd-table reference — the
-  hazard window never opened. Fixed by having the child close its copy before blocking
-  on the sync byte, after which removing the guard fails deterministically (`child
-  status=256`, pattern mismatch). Verify every guard test this way before trusting it.
+  hazard it never checked.** See the instrument-reliability entry above; a test that
+  cannot fail and an instrument that cannot report failure are the same defect.
 - **Subtest comments must not cite TODO item numbers.** Six did, and this file gets
   renumbered as items land — every citation had drifted within one day. Point to the
-  defect or the commit instead; those don't move.
+  defect or the commit instead; those don't move. **Three violations are outstanding**,
+  found by `grep -rn "TODO.md item\|TODO item [0-9]"` at reconciliation time: the prepared
+  `driverpy_venus.patch` cites "see TODO.md item 4/12" twice (patch lines 24 and 101) and
+  must be edited before it lands; and `userland/vfstest/src/main.rs:1` ("item #4") and
+  `userland/f2fstest/src/main.rs:1` ("item #5") survived the `97a979e` sweep — both now
+  point at items that have not existed for months. Two one-line comment fixes, deliberately
+  not folded into this reconciliation commit.
 
-**Diagnostics in-tree, all compiled out by default** — flip to `true`, measure,
-flip back before committing:
+**Memory attributes, measured rather than assumed.**
+
+- *aarch64.* `MAIR_EL1` arrives as a flat **`0x00000000000000ff`** under Limine 11.4.1 —
+  attribute 0 is `0xFF` (Normal WB/WA) and **attributes 1..7 are all zero**, i.e.
+  Device-nGnRnE. `18a7a9f` installs **index 2 = `0x44`** (Normal Inner/Outer
+  Non-cacheable) with a read-modify-write in `mmu::enable_identity`, before `arch::init`
+  maps anything and before `smp_init` snapshots MAIR for the APs, and prints
+  `[ARCH] MAIR_EL1 before=… after=…` (`arch/aarch64/src/lib.rs:84`) so the inherited
+  value stays visible. Index 3 (`ATTR_NOCACHE`) is Device-nGnRnE and always was; index 1
+  (`ATTR_DEV`) is too — item 5. The aarch64 framebuffer is therefore Device memory and is
+  **deliberately left that way**; it works only because `pitch = width*4` keeps every
+  access aligned.
+- *x86_64.* Limine 11.4.1 **does** program `IA32_PAT`, to `0x0000_0105_0007_0406`
+  (PA0 WB, PA1 WT, PA2 UC-, PA3 UC, **PA4 WP**, **PA5 WC**, PA6 UC, PA7 UC), decoded from
+  a `mov ecx,0x277` / `wrmsr` site in `BOOTX64.EFI+0x42f34` guarded by
+  `CPUID.01H:EDX.PAT`. `BOOTAA64.EFI` has zero such sites. Only our direct-boot path
+  (`kernel/src/entry_x86_64.s`, which writes EFER and nothing else) leaves the reset PAT.
+  `18a7a9f`'s commit message says the reset PAT applies; that is wrong on the Limine
+  path, though it reaches the right conclusion anyway because PA2 is UC- in both tables.
+  This is a static decode of a binary and has **not** been confirmed by a runtime read —
+  item 4 adds the print that would.
+
+**Diagnostics in-tree, all `false` at HEAD** — flip to `true`, measure, flip back before
+committing. `c5abb8d` shipped with `DRM_STATS` on and `c27557f` had to undo it; the rule
+is not decorative.
 
 | Flag | File | Measures |
 |---|---|---|
-| `DRM_STATS` | `drivers/src/drm_device_interface.rs:1230` | flips, cursor up/mv, atomic, atest, cplane |
+| `DRM_STATS` | `drivers/src/drm_device_interface.rs:1344` | flips, cursor up/mv, atomic, atest, cplane, `dmg_{full,rect,skip,px}`, `blobs`, `evpush` |
 | `CURSOR_DEBUG` | `drivers/src/virtio_gpu.rs:342` | cursor queue setup + selftest |
 | `mm::gap2::ON` | `mm/src/gap2.rs:17` | memfd/MAP_SHARED path + frame checksum sampler |
-| `evpush` (within `DRM_STATS`) | `drivers/src/drm_device_interface.rs` (`[DRMSTAT]` line) + `servers/evdev::events_pushed()` | guest-side evdev events pushed — distinguishes "the compositor ignored the moves" from "the moves never reached the guest ring" |
+| `pci::RENDER_DEBUG` | `drivers/src/pci.rs:99` | per-frame DRM/FB/GPU/KMS/SND serial tracing |
+
+The one diagnostic that is **not** behind a flag is `[DRM-SRV] mmap …` — item 11.
 
 **`RUST_LOG=trace` cannot read smithay's own damage-tracking decisions.**
 `cosmic-comp/Cargo.toml:61-62` sets `release_max_level_info` on `tracing`, so `trace!`
 calls are compiled out of the release build and the feature ceiling cannot be raised
-additively. Kernel-side counters are the only instrument.
+additively. Kernel-side counters are the only instrument, and the `FB_DAMAGE_CLIPS` blob
+is the damage tracker's **verbatim** output (`PlaneDamageClips::from_damage`, smithay
+`backend/drm/surface/mod.rs:68-100`, is a 1:1 `map` with no splitting or merging), which
+is what makes the kernel-side decode a real measurement of a client-side decision.
 
 **Evidence lives outside this repo.** Run logs, screenshots, research notes and test
 harnesses are in `~/code/leandros-artifacts/notes/`. Design docs that are still
@@ -278,513 +336,631 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 
 | # | Item | Category | Blocked on |
 |---|---|---|---|
-| 1 | Blob mappings ignore the host's requested cacheability — fix prepared | Bug — kernel | — |
-| 2 | `ATTR_NOCACHE` on aarch64 is Device memory, not Normal-NC | Bug — kernel | — |
-| 3 | x86_64 has no PAT or MTRR setup | Bug | — |
-| 4 | Vulkan renders on LeandrOS; next is presenting it | Feature | — |
-| 5 | PRIME export for blob handles — fix prepared (headless WSI unblocked) | Bug — kernel | — |
-| 6 | `SIMULATE_SYNCOBJ`: we reject the probe, and Mesa then closes stdin | Bug — kernel | — |
-| 7 | Borrowed VMOs can be grown, leaked and truncated | Bug — kernel | — |
-| 8 | Cross-open dmabuf import is refused by design | Feature | — |
-| 9 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
-| 10 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
-| 11 | No TIME_WAIT — ports are instantly reusable | Bug | — |
-| 12 | Deferred / known limitations | Mixed | — |
+| 1 | An exported dmabuf fd does not keep its buffer alive — use-after-free | **Bug — memory safety** | fix in flight |
+| 2 | This Mac and the Linux box have diverged — four commits, sync held | Housekeeping — blocking | item 1 |
+| 3 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — kernel/host | — |
+| 4 | x86_64 `IA32_PAT`: the BSP and the APs disagree — fix prepared | Bug — kernel | — |
+| 5 | aarch64 `ATTR_DEV` is Device-nGnRnE, and a landed comment implies otherwise | Bug — comment | — |
+| 6 | Vulkan presents headless and to a scanout; M4 goes via `MESA_VK_WSI_DEBUG=sw` | Feature | — |
+| 7 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | — |
+| 8 | Primary-plane over-damage is upstream; only a measurement remains | Perf | — |
+| 9 | AF_UNIX `listen()` is lax in the opposite direction — fix prepared | Bug | validation in flight |
+| 10 | `kms_swrast` destroys imported handles with `MODE_DESTROY_DUMB` | Bug — kernel | — |
+| 11 | The `[DRM-SRV] mmap` trace is unconditional and floods a session | Bug — diagnostics | — |
+| 12 | Deferred work and known limitations | Mixed | — |
 
 ---
 
 ## Prepared but not landed
 
-Three patches are written, verified-applicable and cross-checked to stack with each
-other and with everything already in the tree in **any** order — but none has been
-built or run.
+All five patches below were re-checked `git apply --check`-clean **against this Mac's
+`c27557f`** at reconciliation time, not inherited from an older base.
 
-1. `~/code/leandros-artifacts/notes/m9-blob-cacheability/blob_cacheability.patch` — 373
-   lines, 7 files. Honours the host's requested blob cacheability via a new
-   `WRITECOMBINE` flag and a newly-installed aarch64 MAIR index 2. Decisive test:
-   `vkrender` `s0_submit` under x86_64/**KVM** *without* `VN_PERF=no_fence_feedback`,
-   which times out 2/2 today. Do the cheap local check first — a one-line `MAIR_EL1`
-   boot print under aarch64/HVF, since the whole aarch64 half rests on static
-   disassembly rather than a runtime read. See item 1.
-2. `~/code/leandros-artifacts/notes/m9-prime-export/prime_handle_to_fd.patch` — 4 files,
-   +308/−31. Makes `PRIME_HANDLE_TO_FD` resolve blob handles, unblocking headless
-   Vulkan WSI. `venustest` 68 → 77; `drmsmoke` must stay 22/0, which is the one part
-   checkable locally on the Mac. See item 5.
-3. `~/code/leandros-artifacts/notes/m9-fb-damage-clips/fb_damage_clips.patch` — 357
-   lines, `drivers/` only. Decodes `FB_DAMAGE_CLIPS` as an instrument, to answer
-   whether the primary-plane blocker is client-side. **Its diagnostic run was still in
-   progress when this session ended, so its result is unknown** — check for a report
-   before assuming anything about it. See item 9.
+1. `~/code/leandros-artifacts/notes/m9-prime-export/prime_handle_to_fd_built_20260806.patch`
+   — 4 files, +349/−27. Already **committed on the box** as `e083202` and verified there;
+   this file is the route onto the Mac. **Held** — it widens item 1. See item 2.
+2. `~/code/leandros-artifacts/notes/m9-simulate-syncobj/simulate_syncobj_respec_20260806.patch`
+   — the re-specified syncobj change, **committed on the box** as `a0325c6`,
+   `venustest` 91/0 both arches. The superseded `simulate_syncobj.patch` is left alongside
+   it, unmodified; do not apply that one. See item 2. (Sequencing note: each of these two
+   applies cleanly on its own at `c27557f`; their composition is known-good because the
+   box carries them as consecutive commits.)
+3. `~/code/leandros-artifacts/notes/m9-x86-pat/pat_bringup.patch` — 331 lines, 3 files,
+   all under `arch/x86_64/src/`. Builds all four kernel variants. **Never run.** Touches
+   nothing any other lane owns. See item 4.
+4. `~/code/leandros-artifacts/notes/m9-afunix-timewait/afunix_listen_strict.patch` — 230
+   lines, `servers/net/` + `userland/scmtest/`. Correct but deliberately held pending a
+   live-session validation that is in flight. See item 9.
+5. `~/code/leandros-artifacts/notes/m9-damage-rootcause/damage_rect_dump.patch` — 132
+   lines, one file, `drivers/` only, entirely inside the `DRM_STATS` gate, **built** for
+   both targets. Prints the decoded damage rect list. Optional; see item 8 for what it
+   would and would not settle.
+
+Also prepared, not a kernel patch:
+`~/code/leandros-artifacts/notes/m9-driverpy-venus/driverpy_venus.patch` — teaches
+`.claude/skills/run-leandros/driver.py` a `--venus` mode with the exact device line
+`run-qemu.sh --venus` uses, refusing `--venus` on non-UEFI boot modes and on macOS rather
+than degrading. Applies clean. **Two edits before it lands:** remove the TODO-item
+citations (standing rule), and correct the docstring's `screendump` account — the reason
+`device=` failed was `DeviceNotFound` from a missing `id=`, not `"no surface"` (item 6).
 
 ---
 
-### 1. Blob mappings ignore the host's requested cacheability — fix prepared
+### 1. An exported dmabuf fd does not keep its buffer alive — use-after-free
 
-`drivers/src/drm_device_interface.rs:3740-3748` logs `"[DRM] WARNING: host asked for
-non-cached blob mapping; mapping cacheable anyway"` and overrides the request.
-`vkrender`'s `s0_submit` **times out under x86_64/KVM** (2/2 runs) while passing under
-x86_64/TCG and aarch64/TCG, and passing under KVM with `VN_PERF=no_fence_feedback`.
-Measured, not guessed: host tracing showed 20 submits total, all `size 24`, every one
-fence-responded, and **zero submits during the 20 s wait** — the guest was spinning on
-memory, not on an ioctl. Mesa explains why: with fence feedback (the default)
-`vn_GetFenceStatus` reads `*slot->status`, a plain memory read that never touches the
-ring (`vn_queue.c:1694`, `vn_feedback.h:103`), and `vn_feedback_buffer_create` picks the
-**first** `HOST_COHERENT` memory type (`vn_feedback.c:76`) — memtype 2, which lacks
-`HOST_CACHED` — so the host requests a non-cached mapping on exactly that resource
-(`map_info=0x03`, WC). Subtest 0's own readback buffer is memtype 5 (`HOST_CACHED`,
-`map_info=0x01`), mapped correctly, and reads back perfectly.
+**Reachable from one unprivileged process, no cross-open work, no second process.**
+`release_blob` (`drivers/src/drm_device_interface.rs:2794`) and `free_dumb` (`:2178`) end
+in an unconditional `mm::buddy::free(phys, order)` and consult no reference count.
+`vmo_free_slot` (`servers/vfs/src/lib.rs:443`) returns early for a borrowed VMO *without*
+freeing, on the stated grounds that the DRM layer frees the block exactly once. That
+reasoning is sound in one direction and silent in the other: **nothing makes the DRM
+object outlive the fd.**
 
-**The override was deferred scope, not a workaround.** `git log -S` on the warning
-string gives one commit, `0dfc362`, whose message says so outright: mappings are
-cacheable regardless of `map_info`, which was right for the Venus ring (the renderer
-reports `CACHE_CACHED`), and honouring anything else would need a cache type plumbed
-through the mmap reply. Both reasons are now dead — the 0x1007 reply carried one `u64`
-and slot 1 was free (`VFS_POLL` already uses slot 1 for `seq`, so there is precedent),
-and "no blob asks for anything else" stopped being true the moment Mesa's
-fence-feedback buffers appeared. `0dfc362` also records that `RESOURCE_MAP_BLOB` had
-never been sent on the wire at that point, so nothing was measured. Nothing is being
-worked around; there is no reason to keep it.
+```
+h  = CREATE_DUMB / RESOURCE_CREATE_BLOB(GUEST)   // real guest pages
+fd = PRIME_HANDLE_TO_FD(h)                       // borrowed VMO aliases them
+DESTROY_DUMB(h) / GEM_CLOSE(h)                   // buddy::free(phys, order)
+read(fd, buf, N)                                 // walks the freed frames via the HHDM
+mmap(fd, MAP_SHARED); *p = …                     // writes into them
+```
 
-**The arches are not symmetric, and that set the shape of the fix.**
-- *x86_64: the attribute exists.* `PageFlags::NOCACHE` maps to PCD
-  (`arch/x86_64/src/paging.rs:387`). There is **no PAT and no MTRR code anywhere in
-  `arch/x86_64/`**, so the reset `IA32_PAT` applies and PCD alone selects UC. Real WC is
-  not reachable without `IA32_PAT` bring-up, which we deliberately do not do — UC is a
-  strictly stronger substitute with the same coherence guarantee and worse write
-  throughput, and UC/WC aliases of one page are compatible where UC/WB and WC/WB are the
-  SDM-undefined combinations.
-- *aarch64: the attribute does not exist, and the code claims it does.*
-  `arch/aarch64/src/paging.rs:21` declares `ATTR_NOCACHE = 3 << 2; // index 3 (normal
-  NC)`. **That comment is false in practice.** The kernel never programs MAIR on the
-  Limine path, and disassembly of the shipped `BOOTAA64.EFI` (Limine 11.4.1) shows MAIR
-  built as `0xFF | (dev_attr << 8)` at file offset `0x209ec`-`0x209f0`, with a second
-  path setting `0xFF` flat — **attributes 2..7 are zero on both**. Our own direct-boot
-  path (`kernel/src/entry_aarch64.s:171`) writes `MAIR = 0x04FF`, likewise zero above
-  index 1. A zero MAIR attribute byte is **Device-nGnRnE**, so `PageFlags::NOCACHE` on
-  aarch64 produces Device memory, which forbids unaligned access — unusable for a buffer
-  Mesa memcpys through, and it would have turned the KVM hang into an alignment fault.
+The `read` returns whatever now occupies those frames — page tables, slab pages, another
+process's anonymous memory — and the `MAP_SHARED` write is arbitrary kernel memory
+corruption from an unprivileged process. `drmsmoke`'s `PRIME_HANDLE_TO_FD`,
+`PRIME_MMAP_ALIAS` and `DESTROY_DUMB` all exercise the pieces; nothing exercises the
+ordering.
 
-**The fix** adds an arch-neutral `PageFlags::WRITECOMBINE` (bit 6), deliberately
-**separate** from `NOCACHE`, mapping to PCD on x86_64 and to a newly-installed **MAIR
-index 2 = `0x44`** (Normal Inner/Outer Non-cacheable, Linux's `MT_NORMAL_NC`) on
-aarch64. Index 2 is the safe slot: its flag `ATTR_STRICT` had **zero users** in the
-tree, so no live translation is reinterpreted. The MAIR write is a read-modify-write in
-`mmu::enable_identity` preserving attrs 0 and 1, placed before `arch::init` maps
-anything and before `smp_init` snapshots MAIR for the APs.
+**Where each half is live.** The **dumb** path is pre-existing and is reachable **on this
+Mac at `c27557f` today** — verified in source, not inferred. The **blob** half arrives
+with `e083202`, which is why item 2 holds the sync: bringing the box's commits over before
+this fix trades one reachable path for two. Cross-process it is worse and is exactly the
+shape M4 would have hit: `drm_release_open` (`:1018`) reclaims every blob owned by a
+closing open, leaving a peer holding an fd that names a freed object — recycled host
+resource ids, a `hostvis_free`'d window span that the next `RESOURCE_MAP_BLOB` re-uses
+(silent cross-client pixel disclosure), and a buddy block back in circulation under a live
+mapping.
 
-Scoping is by `map_info`, and only host-visible blobs have one — `blob_map_cache_type`
-matches only entries with `map_phys != 0`, so dumb buffers and guest-backed blobs are
-untouched. That matters, because the kernel *does* memcpy through those via
-`phys_to_virt`. The Venus command ring reports `CACHE_CACHED` and stays write-back, as
-does subtest 0's readback buffer (memtype 5, `map_info=0x01`), so `s2_checksum` has no
-reason to move. Nothing is refused: refusing a non-cached MAP would break Venus outright
-on both arches, a regression rather than an honest refusal.
+**The rule.** A BO is destroyed when its reference count reaches zero, and references are
+held by (1) each handle in the per-open handle map and (2) each **exporting `TmpVmo`
+slot**. Granularity 2 is per *slot*, not per fd, deliberately: `TMP_VMOS` is keyed by the
+data-owning slot, so `dup`, `fork` and `SCM_RIGHTS` copies of one dmabuf fd already share
+one slot (`servers/vfs/src/lib.rs:334-336`) and the slot is destroyed exactly once. One
+ref per slot is both sufficient and impossible to double-drop. `release_blob`/`free_dumb`
+move behind an unref that runs only on the 1→0 transition, with the test-and-remove under
+a single acquisition of the map — the shape `free_blob_owned` already uses.
 
-**Patch prepared** at
-`~/code/leandros-artifacts/notes/m9-blob-cacheability/blob_cacheability.patch` (373
-lines, 7 files, +211/−21), `git apply --check`-clean and round-trip verified at
-`1c5c708`, and confirmed to stack with the in-flight primary-plane work in **both**
-orders (verified empirically by reconstructing that tree, not by inspection — their
-hunks end at HEAD line 2487, mine are at 850, 1142, 3459 and 3601).
+**The failure mode in the other direction is the one to fear.** A double release is two
+`resource_unref`s and a double `mm::buddy::free` of an order-N block: allocator
+corruption, not a leak. This project hit that class twice this week (`9be954f`).
 
-**Verify in this order.** First, the cheap local one: a one-line boot print of
-`MAIR_EL1` either side of the new read-modify-write under aarch64/HVF. The "attrs 2..7
-are zero" claim is static disassembly, not a runtime read, and **the entire aarch64
-half rests on it**. Then, on the Linux box (the Mac has no EGL), the decisive test:
-`run-qemu.sh --venus` x86_64 under **KVM** with `vkrender` and **without**
-`VN_PERF=no_fence_feedback` — `s0_submit` must pass where it currently times out 2/2;
-run it at least three times. Serial must show the non-cached mapping honoured for the
-feedback blob (`map_info=0x03`) and **not** for the ring (`0x01`) — that line proves the
-scoping, not merely that the hang went away. Non-regression: `s2_checksum` stays
-`0x02C0FDC5` on all three configurations, `venustest` 68/68, `vktest` 0 failures, full
-suite at baseline on fresh images.
+**Layering, and the lock hazard to avoid.** `vmo_free_slot` lives in `vfs-server`, which
+does **not** depend on `drivers`, and it runs with `TMP_FILES` held; `release_blob` takes
+`VIRTIO_GPU.lock()` and busy-spins on a device round-trip. Calling straight through would
+hold a tmpfs lock across a device round-trip and introduce a second lock order
+(`TMP_FILES` → `VIRTIO_GPU`) into a codebase that has one. The design's §2.5 gives the
+shape that avoids both.
 
-**Residual risk worth naming, and its discriminator.** The root cause — a guest
-write-back alias of a host WC mapping, with TCG modelling no guest cache and therefore
-passing — is well supported, but one link is host-side and unverifiable from this repo:
-KVM's EPT memory type for the `ram_device` memslot QEMU creates for a mapped blob. If
-KVM sets `IPAT` with WB, the guest PTE is ignored and **no guest-side change can fix
-it**. Discriminator: if `s0_submit` still hangs with the patch applied *and* the new
-serial line confirms the feedback blob took the uncached path, the answer is host-side
-and the next step is QEMU/KVM, not more kernel work. Note also that aarch64/HVF
-**cannot** corroborate the "TCG masks it" hypothesis — that needs a host-visible
-virtio-gpu blob under hardware virtualization, which needs EGL, which macOS lacks. The
-aarch64 half is a latent-bug fix with no reachable failing test today; its evidence is
-the MAIR read.
+**Guard tests, and the mutations that must break them.** `export_fd_keeps_blob_alive`:
+create, write a known pattern, export, close the handle, `read(fd)` and assert the pattern
+plus a live-object count of 1; `close(fd)` and assert 0. *Mutation:* delete the ref taken
+in `install_dmabuf_vmo` — the read returns recycled memory and the count reads 0 early.
+This test **fails at HEAD by construction**, which is the strongest form of the project's
+guard-test rule. Second guard: no double release — after the count reaches 0, a subsequent
+create must succeed and no underflow line may appear. **Compositor gate, a genuinely new
+risk:** keeping a *dumb* buffer alive until its export fd closes changes cosmic-comp's
+steady state, since it exports a dmabuf per frame. Run a 60 s aarch64 session with
+`DRM_STATS` on and assert the live-object counters are **bounded**, not climbing. If they
+climb, Mesa is holding fds whose buffers we were previously freeing underneath it — which
+is information worth having, not a reason to revert.
 
-### 2. `ATTR_NOCACHE` on aarch64 is Device memory, not Normal-NC
+**A lane is implementing this now.** Full analysis, including the exact refcount shape and
+the vfs hook:
+`~/code/leandros-artifacts/notes/m9-crossopen-dmabuf/crossopen_design.md` §2.4, §2.5 and
+Stages 1–2. (That document's line numbers are the box's tree; the ones quoted above are
+this Mac's `c27557f`.)
 
-`arch/aarch64/src/paging.rs:21` names MAIR index 3 "normal NC", but neither Limine nor
-our direct-boot path programs attributes 2..7, so index 3 is zero = **Device-nGnRnE**.
-Consequences beyond the blob work: **the framebuffer (`arch/aarch64/src/lib.rs:116`)
-has silently been Device memory all along**, working only because `pitch = width*4`
-keeps every access aligned — an unaligned framebuffer access would fault, and any future
-code doing one would look like a mysterious alignment bug. `drivers/src/snd.rs:244`
-maps an MMIO BAR with the same flag and *correctly wants* Device, which is exactly why
-the blob fix introduces a separate `WRITECOMBINE` flag rather than redefining
-`NOCACHE`. The comment must be corrected whether or not the blob patch lands, and the
-framebuffer's attribute should be reconsidered deliberately rather than by accident.
+### 2. This Mac and the Linux box have diverged — four commits, sync held
 
-### 3. x86_64 has no PAT or MTRR setup
+Two `main`s, and **neither is a fast-forward of the other**:
 
-Grepping `arch/x86_64/` finds `wrmsr` only for APIC, EFER, STAR, LSTAR and GSBASE — no
-`IA32_PAT`, no MTRR. The reset PAT therefore applies, so `PageFlags::NOCACHE` (PCD)
-selects UC and **true write-combining is unreachable**. Not currently a problem — UC is
-strictly stronger and correct wherever we use it — but it is a real ceiling on
-framebuffer and blob write throughput, and anything that eventually wants WC
-performance needs `IA32_PAT` bring-up first.
+| | this Mac (`c27557f`) | the Linux box (`a0325c6`, `forain@172.16.158.150:/home/forain/Projects/leandros`) |
+|---|---|---|
+| | `c27557f` drm: compile out `DRM_STATS` again | `a0325c6` drm: mint an out-fence fd for EXECBUFFER's `FENCE_FD_OUT` |
+| | `fe411ff` net: hold a closed TCP port in TIME_WAIT | `eccc4e9` mkfs: stage `vkswap` when the venus artifact tree provides it |
+| | `18a7a9f` drm: honour the host's requested blob cacheability | `e083202` drm: export Venus blob handles through `PRIME_HANDLE_TO_FD` |
+| | `c5abb8d` drm: decode `FB_DAMAGE_CLIPS` … | `0df1810` drm: honour the host's requested blob cacheability |
+| | `a0f2c46` | `a0f2c46` |
 
-### 4. Vulkan renders on LeandrOS; next is presenting it
+`18a7a9f` and `0df1810` are the **same change committed twice**, so a merge or rebase will
+see the blob-cacheability hunks from both sides. `origin` is at `6a0eb0c`; nothing has
+been pushed to it from either machine.
 
-**GPU work now executes.** `vkrender` was built, staged (`b2260b4`) and run: subtest 0
-(shaderless `vkCmdFillBuffer`) passes with `fence signalled after 86 ms` and `all 65536
-words == 0xdeadbeef` — **the first GPU work ever submitted from LeandrOS**. Subtest 1
-(compute) passes with all 4096 words matching `(i*2654435761)^0x9E3779B9`. Subtest 2
-(graphics) rasterizes a triangle: all 13 named pixel coordinates correct,
-`s2_coverage: triangle=18432 clear=47104 other=0` — **exactly the analytic area** of a
-192x192 right triangle — and `s2_no_intermediate_pixels` passes. Shaders compiled on
-both arches; no SKIPs. `--- vkrender done, failures = 0, skipped = 0 ---`.
+**The sync is deliberately held, and the reason is item 1, not scheduling.** `e083202`
+widens the exported-dmabuf use-after-free from dumb buffers to blobs. Landing it here
+before the refcount fix would double the reachable surface of a memory-safety bug in
+exchange for a feature nothing on this Mac can exercise (macOS has no blob-capable
+virtio-gpu device at all). **Order to take once item 1 lands:** refcount fix first, then
+`e083202` + `a0325c6` + `eccc4e9`, then re-gate `drmsmoke` 22/0 and `scmtest` 31/0 here
+and `venustest` 91/0 on the box.
 
-**`s2_checksum = 0x02C0FDC5` is byte-identical across x86_64/KVM, x86_64/TCG and
-aarch64/TCG**, so it is now a pinned regression value — set
-`VKRENDER_EXPECT_CHECKSUM=0x02C0FDC5`.
+What each machine is missing:
 
-`run-qemu.sh --venus` landed in `b2260b4` and reproduces the bespoke wave scripts:
-`venustest` 68/68 and `vktest` 0 failures on both arches, through the in-tree script.
-OVMF still gets its GOP (post-login screendump 1920x1080 at 1.96% non-zero, against
-1.97% on the default path), and the default path is unchanged on both arches.
+- **This Mac lacks `e083202`.** Beyond the feature, it carries the borrowed-VMO
+  immutability invariant, whose three hazards were measured live *on this machine*. It
+  also takes `venustest` 68 → 80 subtests, 12 of which need a Venus host.
+- **This Mac lacks `a0325c6`** (`FENCE_FD_OUT` out-fence fd), which takes `venustest` to
+  91 on the box. Unexercisable here for the same reason.
+- **This Mac lacks `eccc4e9`** (4 lines in `scripts/mkfs-f2fs-populated.py`, mirroring the
+  existing `vkrender` block). Harmless without the binary, and there is **no aarch64
+  `vkswap` binary anywhere**: the box has no arm64 binfmt handler, so the Alpine container
+  cannot cross-build it. `zig cc -target aarch64-linux-musl` via
+  `scripts/cc-aarch64-musl.sh` is the route if it is wanted.
+- **The box lacks `c5abb8d`, `fe411ff` and `c27557f`.** No Venus work depends on any of
+  them, but the box is where a damage measurement under KVM would run, and where item 9's
+  dirty-image COSMIC validation is running.
 
-**`driver.py`'s GL gate is answered, and the finding gates presentation too.** Measured
-with the exact `--venus` device line: QMP `screendump` **does** work under `-display
-egl-headless`, but only in its **bare** form (no arguments) — that captures the primary
-console, q35's implicit std-VGA, giving a valid non-blank 1280x800 PPM. Passing
-`device=<gl-dev-id>` fails with `"no surface"`, with or without `head=0`, because the GL
-device has no surface. So a `driver.py` Venus mode is unblocked — it simply must not
-pass `device=` — and the same constraint is why `--present` (below) blits to a real
-scanout surface rather than relying on `screendump` of the GL device.
+Also outside git: `vkswap.c` and `build-vkswap-alpine.sh` are at
+`~/code/leandros-artifacts/notes/m9-vkswap/`; raw logs for the Venus wave are in
+`m9-lane-i-logs.tgz` there and in `notes/m9-present/m9-lane-m-logs.tgz`, and under
+`/tmp/m9lane/` on the box. Both pre-existing box stashes are still present and were never
+popped — **`stash@{0}` must not be blind-popped** (it would revert `4085b7f`).
 
-**Still true, kept from the earlier design pass.** The Linux-box environment
-(`forain@172.16.158.150`, EndeavourOS, virglrenderer 1.3.0, QEMU 11.0.1 — already
-installed, nothing to add; it is **Arch, not Debian**). macOS has no EGL, so
-venustest's ~29 failures there are a host artifact, not a code defect. The loader stays
-unshipped: the ICD exports only `vk_icdGetInstanceProcAddr`,
-`vk_icdNegotiateLoaderICDInterfaceVersion` and `vk_icdGetPhysicalDeviceProcAddr` — no
-`vkGetInstanceProcAddr` — so it can never stand in for `libvulkan.so.1`; `vkrender`
-bootstraps the way `vktest` does and resolves device entry points via
-`vkGetDeviceProcAddr`.
+### 3. A host-refused `RING_IDX` submit costs a full control-queue timeout
 
-**Build findings, load-bearing for anyone rebuilding it.** `vkrender.c` needed **zero**
-source changes, but the recipe needed three. `-std=c11` does **not** compile against
-musl — strict ISO hides `clock_gettime`, `nanosleep` and `CLOCK_MONOTONIC`; use
-`-std=gnu11` (the Mac's `-fsyntax-only` used laxer headers and missed this). Vulkan
-headers need `/usr/include/vk_video` as well as `/usr/include/vulkan`
-(`vulkan_core.h:9744` includes it), copied to a private dir — do not point `-I` at
-`/usr/include`, it shadows the target libc's headers. And the container recipe
-**cannot build aarch64 on that box**: no docker, and podman pulls arm64 images but
-cannot execute them (no `binfmt_misc` aarch64 handler, only the dynamic
-`qemu-aarch64`); cross-compiling with the artifacts repo's `zig cc` +
-`musl-dyn-link.sh` works, with two gotchas — zig cc enables UBSan by default (link
-fails on `__ubsan_handle_*`, needs `-fno-sanitize=undefined`) and its driver silently
-produces a **static** binary, which cannot `dlopen` the ICD. Corrected recipes are at
-`~/code/leandros-artifacts/notes/m9-m3-vulkan/build-vkrender-alpine-fixed.sh` and
-`build-vkrender-aarch64-zig.sh`.
+A `RING_IDX`-routed `SUBMIT_3D` whose **command stream the host refuses to dispatch** is
+never completed: QEMU defers the control-queue response to a fence it routes through the
+renderer context (`virgl_renderer_context_create_fence`), that context never retires it,
+and the caller pays `VirtioGpu::submit`'s full 100 M-iteration busy-spin
+(`drivers/src/virtio_gpu.rs:890`) instead of receiving an error —
+`[GPU] control-queue TIMEOUT, cmd=0x00000207`. Unringed submissions land on the global
+timeline and retire regardless of what the host made of the bytes, which is why every
+other synthetic submission in `venustest` has always passed.
 
-**Next is presentation.** `--present` (a dumb-buffer blit reusing `drmsmoke`'s
-`ADDFB2`/`SETCRTC` sequence) is written and staged but unrun; it needs COSMIC stopped,
-since we never gate `SETCRTC` on DRM master. After that, M4 is a Wayland client, still
-blocked on the `PRIME_HANDLE_TO_FD` gap (item 5).
+**Stated at the strength the evidence supports.** It is *not* "a ring the guest never
+created": ring 0 is the CPU ring, needs no creation, and Mesa's first submit of every
+renderer lifetime carries `RING_IDX` on it and completes. A genuinely **nonexistent** ring
+index was not tested — our driver bounds-checks `ring_idx` against the context's
+`num_rings` before it could get that far. Also **not separated, and not claimed either
+way**: whether the non-retiring fence is a property of *that* submission's failed dispatch
+or of a context already poisoned by an earlier one; venustest's failing case always ran on
+a context that had already had a stream rejected. Both readings give the same answer to
+the question that mattered.
 
-**Linux-box tree state (trap).** That checkout is on a **detached HEAD** with two
-stashes, and **`stash@{0}` must not be blind-popped**. It holds 6 files but only 3 are
-wanted (the AF_INET work, which has since landed as `26eebf0`); its `arch/*/src/timer.rs`
-are now identical to what landed, and its `kernel/src/syscall.rs` is **older** than
-current HEAD — popping it would revert `4085b7f` (nested-epoll readiness). Re-land from
-`~/code/leandros-artifacts/notes/m9-af-inet-loopback/af_inet_loopback_verified.patch`
-instead. A raw copy of that stash also exists at
-`/home/forain/linux-tree-preexisting.patch` on the box.
+**Real Mesa cannot reach this** — its streams are valid Venus protocol, and `vktest`,
+`vkrender` and `vkswap` issue dozens of `RING_IDX` submits per boot with zero timeouts. So
+this blocks nothing. It is recorded because it is a denial-of-service shape available to
+any future client that submits a malformed stream with `RING_IDX` — which is every Mesa
+submission — and because a caller cannot tell it apart from a dead host. Whether the right
+answer is a guest-side precondition, a shorter timeout with a distinct error, or nothing
+at all is **undecided; this is a finding, not a plan.** Do **not** "fix" it by refusing or
+rewriting `RING_IDX` kernel-side: Mesa sets it on every submit.
 
-### 5. PRIME export for blob handles — fix prepared (headless WSI unblocked)
+### 4. x86_64 `IA32_PAT`: the BSP and the APs disagree — fix prepared
 
-**Why it rejects.** `kernel/src/syscall.rs:6052` calls `dumb_buffer_phys_order(handle)`,
-whose entire body (`drivers/src/drm_device_interface.rs:1286-1288`) is
-`DUMB_BUFFERS.lock().get(&handle)`. Blob BOs live in a **separate** map,
-`BLOB_BUFFERS` (`:855`), with handles from `NEXT_BLOB_HANDLE` starting at `0x4000`
-(`:858`) precisely so the two spaces cannot collide — so the lookup always misses and
-`:6054` returns `-22`.
+**The item this replaces had a false premise.** "There is no `IA32_PAT` bring-up in
+`arch/x86_64/`, therefore the reset PAT applies" — the first clause is true, the second is
+false on the boot path we actually use. Limine 11.4.1 programs `IA32_PAT` and already puts
+**WC at PA5** (decode in Standing context). WC has been one PTE bit away the whole time.
 
-**Fixing only the lookup would have been worse than the EINVAL.** `install_dmabuf_vmo`
-(`servers/vfs/src/lib.rs:560`) unconditionally built `1<<order` frames from `phys`, and a
-`BLOB_MEM_HOST3D` blob has `phys == 0` (`drivers/src/drm_device_interface.rs:3487-3493`).
-A successful lookup would have handed out **physical page 0 onward**.
+**The reason to act is a live cross-CPU divergence on `main` today, not throughput.**
+`IA32_PAT` is per-logical-processor and an AP leaves INIT/SIPI with the **reset** PAT. So
+on the Limine path the BSP runs `PA4=WP, PA5=WC, PA6=UC` while every AP runs
+`PA4=WB, PA5=WT, PA6=UC-`. Limine's framebuffer mapping selects PA5. `arch::init` tries to
+re-map the framebuffer `NO_CACHE`, but does so with `map_4k`, which returns `false` the
+moment it meets one of Limine's huge pages — the loop says so in a comment and then
+ignores the result. The console writes through Limine's HHDM mapping
+(`drivers/src/framebuffer.rs:653`). If that re-map fails, **the console is WC on the BSP
+and WT on every AP** — one set of physical lines under two memory types on two processors,
+which the SDM leaves undefined. It has not bitten us because WT is coherent and the
+console is idempotent, but it is the shape of bug that appears as rare corruption rather
+than a fault. **Inferred, not yet observed:** the "if that re-map fails" step is a code
+reading, and check (b) below settles it in one boot.
 
-**The export is plumbing; cross-open dmabuf is a subsystem, and the line is clean.**
-Measured in Mesa 25.3.6: `wsi_create_native_image_mem` → `wsi_init_image_dmabuf_fd`
-(`wsi_common_drm.c:726-739`) issues `GetMemoryFdKHR` for **every** swapchain image on
-every `WSI_IMAGE_TYPE_DRM` path and propagates its error, and it is also a bare feature
-probe on a 4 KiB device-local allocation (`:122-147`) — so the export must work for a
-blob with neither guest pages nor a host-visible mapping. There is no escape hatch:
-Venus is never `wsi_device->sw` (`wsi_common.c:87`), so the wl_shm branch is unreachable
-for us. **Nobody mmaps the exported fd** — Venus maps BOs via `VIRTGPU_MAP` +
-`mmap(gpu->fd, offset)`, and even kms_swrast's importer does `drmPrimeFDToHandle` +
-`lseek(SEEK_END)` for the size, then `MODE_MAP_DUMB` on the *imported handle*.
+**The prepared fix** (`pat_bringup.patch`, 331 lines, 3 files, builds all four kernel
+variants, **never run**) makes every CPU agree: the BSP publishes its whole 64-bit PAT and
+each AP writes it verbatim. `init_pat_bsp()` is the first statement of `arch::init`, ahead
+of the GDT and of everything it maps; `init_pat_ap()` is the first statement of
+`smp::sched_ap_entry`, at which point the AP has touched only its stack and parameter
+block, both WB through PA0, a slot nothing changes. The slot is **PA5**, chosen so the
+write is provably inert on the primary path: under Limine PA5 is already `0x01`, so the
+read-modify-write of byte 5 is value-identical and cannot reinterpret a live translation
+(including Limine's own PAT-bit framebuffer mapping); on the direct-boot path PA5 goes
+WT → WC and provably has no users, since reaching PA4..PA7 requires the PAT bit and the
+2 MiB PDEs `entry_x86_64.s:133` builds are `0x83` with bit 12 clear. PA1 (Linux's slot)
+was rejected because it is selected by PWT alone and we inherit Limine's page tables
+wholesale — we cannot grep a binary's PTEs for an inherited WT mapping.
 
-What each consumer needs: `VK_EXT_headless_surface` — a valid fd, nothing more; Venus
-self-import — `PRIME_FD_TO_HANDLE` + `RESOURCE_INFO` on the **same** open;
-`VK_KHR_display` and Wayland dmabuf — import into a **different** DRM open, and for
-Wayland a different process. That second tier needs cross-open BO reachability (our
-`open_may_reach`, `drivers/src/drm_device_interface.rs:1091`, refuses **by design**),
-host-resource refcounting across opens (`free_blob` today unconditionally unrefs and
-releases the window span), `CTX_ATTACH_RESOURCE` for the importer's context, `MAP_DUMB`
-and `ADDFB2` accepting blob handles, and for real scanout `SET_SCANOUT_BLOB`, which does
-not exist here — plus the connector's missing `DPMS` property. Several days; deliberately
-not speculated into a patch.
+**Verify in this order.** (a) The boot print `[ARCH] IA32_PAT before=… after=… wc=1`, the
+direct analogue of the `MAIR_EL1` print, which converts the static decode into a runtime
+read. Expected `before=0x0000010500070406` unchanged on the Limine path,
+`0x0007040600070406 → 0x0007010600070406` on direct boot; **any other `before` means the
+safety-case split must be re-checked before landing**, and `wc=0` means the CPU or
+hypervisor refused the write and we fell back to PCD/UC-, which is `18a7a9f`'s behaviour
+and not a failure. (b) `paging::debug_walk_pte(cr3, mm::phys_to_virt(fb_base))` — a 2 MiB
+leaf with bit 12 set means the divergence above was live; a `PT[...]` entry with `0x10`
+set means `arch::init`'s re-map succeeded and it never was. Either answer is worth
+recording. (c) The only check that measures a *win*: time a ~1 MiB `memcpy` into a mapped
+host-visible blob with and without `PAT_WC_READY` forced false. UC should be roughly
+20-50× slower; within noise means guest PAT is not reaching the hardware and the patch is
+inert — a finding, not a bug.
 
-**The design.** `prime_export_backing(handle, open_id)` resolves blobs through the
-owner-scoped `blob_lookup` (`b80ab5a`'s rule) and falls through to the
-deliberately-global `dumb_buffer_phys_order`, reusing each registry's existing rule
-rather than inventing a third. It returns `{phys, order, len}` — `len` is the *resource*
-size for a blob, since Mesa's importer takes `lseek(SEEK_END)` verbatim, and the buddy
-block for a dumb buffer, byte-identical to today because GBM/EGL fstat it. A HOST3D
-blob's backing is `map_phys = window.phys + win_off`, a PCI BAR range **never in the
-HHDM** and often not even reserved at export time, so the fd is a **token**: correct
-`len`, correct `dmabuf_handle`, an **empty page list**, and mmap failing cleanly.
+**MTRRs cannot defeat this on the hardware we verify on.** The blob lives in a 64-bit
+prefetchable BAR above top-of-RAM, where firmware leaves `MTRRdefType = UC`, and
+(MTRR=UC, PAT=WC) is WC. Corroborated twice, because a recalled SDM table row is not
+evidence: Linux's `arch_phys_wc_add()` adds no MTRR when `pat_enabled()`, so every DRM WC
+framebuffer on Linux gets WC from PAT alone over an MTRR-UC range; and `pat_x_mtrr_type()`
+consults MTRRs only for WB requests. The verification host is a Ryzen (SVM/NPT, no
+memory-type field in nested paging, guest PAT used directly). The one configuration that
+could defeat it — an old-KVM Intel host with EPT `IPAT=1` — would equally defeat the
+already-landed UC mapping in `18a7a9f`, which demonstrably works.
 
-**That last part is what made it more than three lines,** and auditing it found three
-pre-existing hazards on the dumb path. `vmo_acquire_frames`
-(`servers/vfs/src/lib.rs:644-647`) grows *any* VMO on demand with
-`vmo_alloc_zeroed_frame()`, so a page-less export would have silently satisfied an mmap
-with zeroed anonymous memory — a coherence bug presenting as a Vulkan bug. On the dumb
-path that growth is leaked outright (`vmo_free_slot:450` returns early for `borrowed`
-without freeing); the write path grows the same way (`:3303-3305`); and
-`handle_ftruncate` (`:5039`) would either leak on grow or, on shrink, `unref_or_free`
-DRM-owned frames — order-0 frees out of an order-N buddy block, i.e. allocator
-corruption. All three are closed by one stated rule: **a borrowed VMO's page list is
-immutable.**
+Note that WC is **weakly ordered where UC was not**. That moves us toward the reference
+behaviour rather than away from it (the host explicitly asked for `VIRTIO_GPU_MAP_CACHE_WC`,
+so Mesa's Venus path is written against WC semantics on native Linux, and its ring
+submission goes through a locked atomic that drains the WC buffers), but it is worth
+knowing if a blob ever gets a new consumer.
 
-**Cacheability is avoided by construction, not luck.** The only mmap-able exports this
-creates are guest RAM, which the queued `blob_map_cache_type` deliberately does not
-match (`map_phys != 0`) and which is coherent write-back anyway. Host-visible blobs get
-**no mmap-able export at all**, so no second code path can disagree with the host's
-`map_info`. The constraint is written into the new doc comments.
+### 5. aarch64 `ATTR_DEV` is Device-nGnRnE, and a landed comment implies otherwise
 
-**Patch prepared** at
-`~/code/leandros-artifacts/notes/m9-prime-export/prime_handle_to_fd.patch` (4 files,
-+308/−31, of which 150 lines are the regression subtest and most of the rest is
-comment), `git apply --check`-clean and round-trip verified at `9d27ae0`, all four files
-`rustfmt`-parse, **not built**. It stacks with all four other queued patches in **both**
-orders with identical resulting trees, and also applies over the uncommitted in-flight
-`drivers/` work. Worth recording: the first draft *deleted* `dumb_buffer_phys_order`,
-whose doc comment `fb_damage_clips.patch` uses as trailing context, and conflicted in
-both orders — keeping the function and calling it from `prime_export_backing` is better
-design anyway.
+The runtime `MAIR_EL1` read shows a flat `0x00000000000000ff`: Limine took the path that
+writes `0xFF` flat, not the `0xFF | (dev_attr << 8)` one, so **attribute 1 is zero too**.
+`PageDescFlags::ATTR_DEV` therefore selects Device-**nGnRnE**, not the Device-nGnRE the
+flag has always been described as. Behaviourally harmless — nGnRnE is strictly stronger
+and MMIO works — but two comments landed in `18a7a9f` are now known to be imprecise:
+`arch/aarch64/src/paging.rs:19` still says "device; whatever the loader left" where the
+value is now measured, and the `ATTR_NOCACHE` doc block at `:24-32` repeats the
+pre-measurement claim that Limine writes `0xFF | (dev << 8)`. Correct both to what the
+register actually contains. A comment fix with no code change, listed separately because
+the same class of wrong comment (`ATTR_NOCACHE`, "index 3 (normal NC)") cost a full
+analysis pass to discover and would have produced an alignment fault had the blob work
+reused it.
 
-**Verification.** `venustest` **68/0 → 77/0** (9 new reports). `drmsmoke` stays **22/0**
-— `PRIME_HANDLE_TO_FD`, `PRIME_MMAP_ALIAS` and `PRIME_FD_TO_HANDLE` remaining PASS is
-the dumb-path non-regression gate, and the one thing checkable **locally on the Mac**.
-`scmtest` and `vkrender` (`s2_checksum = 0x02C0FDC5`) must not move. Everything HOST3D
-needs the Linux box. Guard-test discipline is satisfied: HEAD is the backed-out state
-for the two export subtests, so they must FAIL against an unpatched kernel; reverting
-the `len` change must make the size subtest report `0x4000` instead of `0x3000`; and
-`phase5_host3d_export_is_not_mappable` **must** be demonstrated to fail with its guard
-line deleted, since it carries the whole safety argument. The decisive downstream test
-is a `VK_EXT_headless_surface` swapchain — reachable with this patch alone, unlike
-Wayland or display.
+### 6. Vulkan presents headless and to a scanout; M4 goes via `MESA_VK_WSI_DEBUG=sw`
 
-### 6. `SIMULATE_SYNCOBJ`: we reject the probe, and Mesa then closes stdin
+**A Vulkan swapchain exists on LeandrOS.** `vkswap` — a ~450-line dependency-free C
+program in `vkrender`'s idiom (no Khronos loader; `dlopen("/usr/lib/libvulkan_virtio.so")`,
+bootstrap from `vk_icdGetInstanceProcAddr`, device entry points via `vkGetDeviceProcAddr`)
+— goes surface → present-capable queue family → caps/formats/present modes → device with
+`VK_KHR_swapchain` → swapchain (256x256, 5 images) → acquire against a real fence → a
+genuine `UNDEFINED → PRESENT_SRC_KHR` barrier submitted on the queue and fence-waited →
+`vkQueuePresentKHR -> VK_SUCCESS`. **21 PASS / 0 FAIL** on the box. The layout transition
+is deliberate: presenting an `UNDEFINED` image is undefined behaviour, and a present that
+skipped it would be a spec violation that happens to return `VK_SUCCESS`. Attribution is
+the cleanest in the wave — the same binary on a kernel with the PRIME commit reverted
+gives 16/1, and the single failure is `create_swapchain` (`VkResult(-10)`).
 
-`sim_syncobj_create` (`vn_renderer_virtgpu.c:145-190`) lazily submits an execbuffer with
-`size=0, command=0` plus `FENCE_FD_OUT` and requires `args.fence_fd >= 0`; we reject at
-`drivers/src/drm_device_interface.rs:3081` (`exec.command == 0 || exec.size == 0`) and
-never write `fence_fd` back (`:3177-3190` logs it as ignored). **New and worse:**
-`sim_submit` (`vn_renderer_virtgpu.c:531-557`) sets `FENCE_FD_OUT` whenever
-`batch->sync_count != 0` and then calls `close(args.fence_fd)` — with `fence_fd` left at
-its zero-initialised value that is **`close(0)`, closing stdin**. Whatever fix lands
-must write `fence_fd` before that path is reachable. A signalled `eventfd2(1)` is the
-right shape (~40 lines), correct because `submit_3d` is synchronous and Mesa only
-`poll(POLLIN)`s the fd. Mesa 25.3.6 defines `SIMULATE_SYNCOBJ`/`SIMULATE_SUBMIT`
-unconditionally, so this is not opt-in.
+**`--present` ran, and the blit reaches the scanout.** 10/10 `present_*` subtests,
+`vkrender` `rc=0`, `failures = 0`, and **zero code changes** — it was unrun, not
+unfinished. The QEMU wire trace shows the complete device-level handover:
+`RESOURCE_CREATE_2D res 0xb, 1920x1080` → `RESOURCE_ATTACH_BACKING` → **`SET_SCANOUT id 0,
+res 0xb`** → `TRANSFER_TO_HOST_2D` → full-frame `RESOURCE_FLUSH`, with the console driver
+reclaiming scanout 0 (`res 0x1`) when `vkrender` exits — a second, independent
+confirmation that the scanout really had been handed over. There is nothing left between
+that and photons except the host display backend.
 
-### 7. Borrowed VMOs can be grown, leaked and truncated
+**What is still missing, and the `screendump` account corrected.** The last hop — that the
+bytes in the presented resource are the rendered triangle rather than garbage — is
+unproven, because **this host cannot photograph it**. Bare `screendump` works and returns
+a valid 1920x1080 PPM, but its content is the text console: three colours (`#000000`,
+`#ffffff`, brush's `#cd0000`) and **not one `0x181818` pixel**, where `--present` paints a
+`0x181818` field with the 256x256 render centred. The earlier "`device=` fails with no
+surface" note is **only half right**: the first failure was `DeviceNotFound`, because QMP
+resolves `device=` as a **qdev id** and `--venus`'s device line carried no `id=`. With
+`,id=venusgpu` added, `device=` **works before the present** (capturing Limine's stale
+1280x800 boot surface) and fails `"no surface"` only *after* the guest sets a scanout,
+because a virgl-backed scanout is a GL scanout with no `DisplaySurface`. That is a
+host-tooling limit, not a LeandrOS defect. **The remaining half of this item** is a
+standalone, **Vulkan-free** dumb-buffer present tool run on the **default (non-Venus)**
+`run-qemu.sh` path, where the GPU is a plain virtio device with a real `DisplaySurface`;
+bare `screendump` then captures it and a `0x181818` field plus a known pattern is trivially
+checkable. That separates "does the DRM present path put pixels on a scanout" (answered:
+yes) from "does this Venus host have a photographable display" (answered: no).
 
-`vmo_acquire_frames` (`servers/vfs/src/lib.rs:644-647`) grows any VMO on demand with
-`vmo_alloc_zeroed_frame()`, including borrowed ones backing DRM buffers; the growth is
-then leaked, since `vmo_free_slot` (`:450`) returns early for `borrowed` without
-freeing. The write path grows the same way (`:3303-3305`). Worst, `handle_ftruncate`
-(`:5039`) on shrink would `unref_or_free` DRM-owned frames — order-0 frees out of an
-order-N buddy block, i.e. **allocator corruption**. The rule that closes all three: a
-borrowed VMO's page list is immutable. The queued PRIME patch (item 5) states and
-enforces it; if that patch does not land, these remain open independently.
+**M4 goes via `MESA_VK_WSI_DEBUG=sw`, not via cross-open dmabuf.** cosmic-comp does not
+advertise `zwp_linux_dmabuf_v1` here (Standing context; item 7), and Mesa's WSI binds
+`wl_shm` *only* in the `sw` case and `zwp_linux_dmabuf_v1` *only* in the non-`sw` case —
+mutually exclusive (`wsi_common_wayland.c:1406-1421`), so a non-`sw` Venus on this
+compositor returns `VK_ERROR_SURFACE_LOST_KHR`. The `sw` route is **1–2 days, all
+userspace, zero kernel risk**, and it needs no Mesa rebuild: the shipped
+`venus-lane/stage-aarch64/usr/lib/libvulkan_virtio.so` was built
+`-Dplatforms=wayland -Dvulkan-drivers=virtio`, contains the `MESA_VK_WSI_DEBUG` string and
+its flag table, and has **both** WSI branches compiled in (`wsi_wl` ×30, `wl_shm` ×4,
+`wl_shm_pool` ×2, `zwp_linux_dmabuf` ×8). Not yet run end-to-end — that is the next step,
+not a finding. It is also the correct bisection point if the dmabuf route is ever
+attempted: it proves the client, the protocol, the compositor wiring and the Vulkan
+rendering independently, leaving the kernel as the only new variable.
 
-### 8. Cross-open dmabuf import is refused by design
+`vkrender` still passes 3/3 subtests with `s2_checksum = 0x02C0FDC5` pinned byte-identically
+across x86_64/KVM, x86_64/TCG and aarch64/TCG — set `VKRENDER_EXPECT_CHECKSUM=0x02C0FDC5`,
+because the value is **printed but not asserted** unless that variable is exported, and
+every comparison so far has been done by hand.
 
-`open_may_reach` (`drivers/src/drm_device_interface.rs:1091`) deliberately scopes BOs to
+**Environment, still true.** The box is `forain@172.16.158.150`,
+`/home/forain/Projects/leandros`, EndeavourOS (**Arch, not Debian**), virglrenderer 1.3.0,
+QEMU 11.0.1, Mesa 26.1.3, host GPU a Ryzen 9 7950X iGPU (RADV RAPHAEL_MENDOCINO). aarch64
+there needs `-cpu max,lpa2=off` (the Limine 11.4.1 FEAT_LPA2 wedge). macOS has no EGL and
+no blob-capable device at all — see Standing context. The loader stays unshipped: the ICD
+exports only `vk_icdGetInstanceProcAddr`, `vk_icdNegotiateLoaderICDInterfaceVersion` and
+`vk_icdGetPhysicalDeviceProcAddr`, so it can never stand in for `libvulkan.so.1`.
+
+**Build findings, load-bearing for anyone rebuilding these binaries.** `-std=c11` does
+**not** compile against musl — strict ISO hides `clock_gettime`, `nanosleep` and
+`CLOCK_MONOTONIC`; use `-std=gnu11`. Vulkan headers need `/usr/include/vk_video` as well
+as `/usr/include/vulkan`, copied to a private dir — do not point `-I` at `/usr/include`,
+it shadows the target libc's headers. The container recipe **cannot build aarch64 on the
+box**: no docker, and podman pulls arm64 images but cannot execute them. Cross-compiling
+with `zig cc` + `musl-dyn-link.sh` works, with two gotchas — zig cc enables UBSan by
+default (link fails on `__ubsan_handle_*`, needs `-fno-sanitize=undefined`) and its driver
+silently produces a **static** binary, which cannot `dlopen` the ICD. Corrected recipes:
+`~/code/leandros-artifacts/notes/m9-m3-vulkan/build-vkrender-alpine-fixed.sh`,
+`build-vkrender-aarch64-zig.sh`, and `m9-vkswap/build-vkswap-alpine.sh`.
+
+### 7. Cross-open dmabuf import — dead as an M4 route, alive for other reasons
+
+`open_may_reach` (`drivers/src/drm_device_interface.rs:1093`) deliberately scopes BOs to
 their owning DRM open, which is correct for `b80ab5a`'s ownership model but blocks
-`VK_KHR_display` and Wayland dmabuf, both of which import into a different open (and for
-Wayland, a different process). Supporting them needs cross-open reachability with
-host-resource refcounting across opens, `CTX_ATTACH_RESOURCE`, `MAP_DUMB`/`ADDFB2`
-accepting blob handles, `SET_SCANOUT_BLOB` (absent), and the connector's missing `DPMS`.
-Several days. This is the M4 gate; headless WSI does not need it.
+`VK_KHR_display` and Wayland dmabuf, both of which import into a different open (and, for
+Wayland, a different process).
 
-### 9. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
+**Stages 3–5 of the design are killed as an M4 unblocker, by measurement.** cosmic-comp
+advertises no `zwp_linux_dmabuf_v1` on a software renderer here (Standing context, with
+the scope caveat), so no amount of kernel work reaches a Wayland Vulkan client in this
+configuration — the missing global is upstream of the kernel entirely. M4 goes via
+`MESA_VK_WSI_DEBUG=sw` (item 6). **Stages 1–2 were never about M4 and remain due: they are
+item 1.**
 
-**What we already have, measured.** The property is fully plumbed, not merely
-advertised: `PROP_FB_DAMAGE_CLIPS = 51` as `PropKind::Blob` in `PROPS`
-(`drivers/src/drm_device_interface.rs:164`) and `PLANE_COMMON` (`:219`), correctly
-omitted from `CURSOR_PLANE`; `CREATEPROPBLOB` (`:2258`), `DESTROYPROPBLOB` (`:2275`) and
-`GETPROPBLOB` (`:2286`) are all implemented over a `BLOBS` map (`:1148`); and the atomic
-path already reads the value into `AtomicPlaneReq::damage_blob` (`:2414`). We simply
-never act on it — the present path calls `handle_flip_page` unconditionally, doing a
-full-surface scale plus a full-screen `gpu.flush`.
+What remains worth doing here, once M4 is off it, and none of it is scheduled:
 
-**The item's premise was not established by its own evidence.** `flips/s == atomic/s ==
-cursor_mv/s` is a **tautology of our kernel's counter**, not an observation about
-smithay. smithay keeps a skipped plane in the request (`compositor/mod.rs:804`,
-`!state.skip || state.config.is_some()`) and the skip branch clones the previous frame's
-config verbatim, so `FB_ID` is re-sent either way; our handler counts a flip for any
-commit naming a nonzero primary `FB_ID`. The counter reads identically whether smithay
-skipped or repainted.
+- **Venus importing a foreign dmabuf** — Vulkan-to-Vulkan buffer sharing between two guest
+  processes (`vn_device_memory.c:110-124`, `vn_get_memory_dma_buf_properties`). This is
+  the one consumer whose value does not depend on the compositor being accelerated, and it
+  is fully served by Stages 1–3 without Stage 4. Note Mesa's importer **refuses** a BO
+  whose `info.blob_mem` differs from its own (`vn_renderer_virtgpu.c:1181-1184`), so
+  `RESOURCE_INFO` through an imported handle must report the *original* `blob_mem` — an
+  assertion, not an obvious invariant.
+- **A zero-copy client→compositor path** instead of §6.2's per-frame `memcpy` — real, but
+  worth nothing while the compositor is softpipe and reads every pixel with the CPU.
+- **`VK_KHR_display`**, which needs the whole deferred list on top (`SET_SCANOUT_BLOB`,
+  absent; `MAP_DUMB`/`ADDFB2` accepting blob handles; the connector's missing `DPMS`) and
+  is not a committed milestone.
 
-**Kernel-side `FB_DAMAGE_CLIPS` cannot make smithay skip.** The decision is made
-entirely inside `OutputDamageTracker` at `compositor/mod.rs:2306-2320`, *before* the
-property is written to the kernel at `surface/atomic.rs:1278-1284`, and there is no
-feedback path from the driver back into the damage tracker (smithay pin `efeb597`, per
-`cosmic-comp/Cargo.lock:4816`). Two other candidate causes are also ruled out from
-source: a missing plane capability or fallback path is excluded because `cursor_mv =
-6.0/s` with one total cursor upload proves `try_assign_cursor_plane` succeeded, which
-already requires ATOMIC, universal planes, size caps, gbm and a passing `TEST_ONLY`; and
-cursor-overlaps-primary is excluded because a cursor element assigned to the cursor
-plane is never pushed into `primary_plane_elements`.
+Design, staging and per-stage guard tests with their falsifying mutations:
+`~/code/leandros-artifacts/notes/m9-crossopen-dmabuf/crossopen_design.md`.
 
-To reach the skip, all of: the primary buffer is a swapchain slot; no direct scanout
-last frame; and `render_output` returned `skipped()`, which needs both no element
-instance/commit/z-order change **and** `age > 0 && last_state.old_damage.len() >= age` —
-otherwise smithay clears the damage and pushes the whole output geometry
-(`renderer/damage/mod.rs:741-759`). **Inferred, well-supported:** we fail that third
-condition. 6.0 frames/s at 1280x800 on softpipe is ~160 ms/frame, the cost signature of
-a real full-screen recomposite; a skipped primary costs nothing and the loop would run
-near the flip-delivery ceiling.
+### 8. Primary-plane over-damage is upstream; only a measurement remains
 
-**Why the work is still worth doing, for a different reason than this item used to
-state.** The blob smithay hands us *is* the damage tracker's output, so decoding it
-turns an unanswerable client-side question into a kernel-side measurement with no COSMIC
-rebuild. And there is a real kernel defect underneath: **when smithay does skip the
-primary, we currently do a full-screen scale plus full-screen `TRANSFER_TO_HOST` and
-`RESOURCE_FLUSH` anyway** — which would cancel the win even once the client side is
-fixed. Direct perf value of the property alone is small (~1.7 ms/flip x 6 flips/s, about
-1% CPU).
+**The kernel side is done and landed** (`c5abb8d`): `DrmDevice::present_damaged`
+(`drivers/src/drm/device.rs:411`) copies just the sub-rectangles a `FB_DAMAGE_CLIPS` blob
+names instead of scaling and flushing the whole surface, with rects clamped and degenerate
+ones dropped rather than the commit rejected — a bad clip list is a hint we are free to
+ignore, and failing there would stall the compositor. It also added `DAMAGE_{FULL,RECT,
+SKIP,PX}` and `BLOBS_CREATED` to `[DRMSTAT]`. Judge it on the kernel-side defect it fixes
+— that a skipped primary still cost a full-screen scale plus full-screen `TRANSFER_TO_HOST`
+and `RESOURCE_FLUSH` — and **not** on flips/s, because there is no perf headroom to
+recover. **Its `drmsmoke` gate is now closed**: 22/0 on both arches at the merged HEAD, and
+again at `c27557f` in the shipping configuration with `DRM_STATS` off. No revert warranted.
 
-**A prepared patch** (357 lines, **unbuilt**, `drivers/` only) is at
-`~/code/leandros-artifacts/notes/m9-fb-damage-clips/fb_damage_clips.patch`, verified to
-`git apply --check` cleanly at `a9621b0`. It adds `DrmDevice::present_damaged` (clamped
-rects mapped with the same nearest-neighbour arithmetic `perform_software_scaling` uses,
-one flush over the bounding union), `DAMAGE_{FULL,RECT,SKIP,PX}` and `BLOBS_CREATED`
-counters on the `DRMSTAT` line, a `damage_rects` blob decoder that returns `None` (=
-assume full damage) for any unusable blob rather than erroring — rejecting a commit over
-a hint would stall the compositor — and a Skip/Rects/Full dispatch where Skip fires only
-on smithay's verbatim-config replay. **Two behaviour changes to know about:**
-`FLIPS_SUBMITTED` will count presents that moved pixels rather than atomic commits, so
-any harness asserting `flips == atomic` will now "fail" by design; and `present_damaged`
-updates only `plane.fb_id`, relying on a preceding full present for geometry, which is
-guaranteed since modesets always take the Full path.
+**Two claims in `c5abb8d`'s commit message and in the diagnostic that produced it are
+wrong, and are corrected here because `git log` cannot be edited.**
 
-**Verification is diagnostic-first.** Gate on aarch64 (HVF, the recorded 6.0 baseline is
-aarch64 at 1280x800), 60 pointer moves/s, >=60 s of motion, `DRM_STATS` on. Sanity check:
-`dmg_full + dmg_rect + dmg_skip` must equal `atomic`. Then read `dmg_px / dmg_rect`
-against 1280x800 = 1,024,000 px (`0xFA000`, counters print in hex): near-full means the
-compositor damages the whole output every frame and **the blocker is client-side — stop,
-no further kernel work moves flips/s**; under ~5% means damage tracking works and the
-perf pass criterion is `flips/s <= 2.0` while `cursor_mv/s >= 6.0`. Three controls are
-mandatory: an `evpush` guest-side counter climbing at ~60/s (QMP accepting a move does
-not prove it reached the guest ring), `cursor_mv/s` must not fall relative to pre-patch
-(`flips/s -> 0` with `cursor_mv/s -> 0` is a dead pointer, not a win — revert on that
-signature), and a stale-pixel check, since damage-bounded present makes a tracking error
-show up as stale pixels rather than a crash: let the panel clock run >=60 s, take two
-screendumps >=2 s apart and confirm the digits differ, then force one full present and
-confirm it is pixel-identical. Note the cursor will not appear in `screendump` now that
-it is on the hardware plane. Plus `drmsmoke` 22/0 both arches and `idletest`.
+- The report said `dmg_skip = 0` "directly confirms" that we fail smithay's third skip
+  condition (`age > 0 && last_state.old_damage.len() >= age`). **It does not follow.**
+  `dmg_skip = 0` means the tracker never returned *empty* damage; that is independent of
+  `age`.
+- The headline "~7,800× over-damage" is a cumulative-window artifact and misleads. The
+  per-interval data shows **damage tracking demonstrably works when idle**: exactly
+  **40,960 px per present = 1280x32 = the panel bar**, for 86 continuous seconds. The
+  age-0 fallback fires **twice, at bring-up (t ≈ 4 s), producing exactly 1,024,000 px** —
+  its unmistakable fingerprint, since all three of smithay's "damage everything" branches
+  push one rect equal to `output_geo` — and **never again in 176 s**.
 
-### 10. AF_UNIX `listen()` is lax in the opposite direction
+**The age hypothesis is refuted on two independent lines.** From source:
+`Swapchain::acquire` (`allocator/swapchain.rs:154-181`) calls `create_buffer` only inside
+`if free_slot.buffer.is_none()` and no path drops a buffer on the way out; cosmic-comp
+holds at most two slots (`QueueState::WaitingForVBlank` gates the next render), so the
+steady state is a two-slot rotation with `age = 2` and `old_damage` at 2-3 entries against
+`MAX_AGE = 4` — the condition is *satisfied*. The only resets are error arms that `bail!`
+and produce no flip. From data: the burst value is **992,000 px, not 1,024,000**, and no
+fallback branch can emit that number.
 
-The AF_UNIX arm of `handle_listen` is an unconditional `ok_reply()` — a repeat listen
-already succeeds, but so does `listen()` on an unbound or already-connected AF_UNIX
-socket, where Linux answers EINVAL. Found while fixing the AF_INET side (landed as
-`07d461c`) and deliberately **not** changed there: tightening it alters behaviour for
-every AF_UNIX server on the system (cosmic-comp, busd, tokio) and could not be validated in a
-read-only session. Needs a live COSMIC session to land safely.
+**What actually happens is `DamageShaper`, and the arithmetic is exact.** For a full-output
+bbox at 1280x800 the shaper's tile grid is 4 x 8 = **32 tiles of 320x100**.
+`992,000 = 31 x 32,000` — 31 of 32 tiles. `981,760 = 992,000 − 10,240`, and
+`10,240 = 320 x 32` — one tile short by 32 rows at the tile column width. Equivalently:
+full width and 767-775 of 800 rows. The idle rect (1280x32) is a `len() == 1` passthrough
+with no shaping at all, which is why idle reads clean. The inflation is therefore
+**specific to pointer motion**, and the mechanism is the shaper, not buffer age.
 
-### 11. No TIME_WAIT — ports are instantly reusable
+**It is not fixable from our side.** Every decision is inside `OutputDamageTracker` and
+`DamageShaper`, in the compositor's address space, before a byte reaches the DRM interface;
+there is no feedback path from the driver into the damage tracker, and the shaper is
+unconditional (`damage/mod.rs:774`), not feature-gated, so `--no-default-features` does not
+reach it. A real fix is a COSMIC/smithay source change, which the standing goal forbids.
 
-`handle_close` calls `socket_set.remove()` immediately, so a closed TCP port can be
-rebound at once where Linux would hold it in TIME_WAIT. A divergence, not a leak, and
-low priority — but it is the kind of thing that makes a server restart behave
-differently here than on Linux.
+**What is on the primary plane, established rather than assumed.** Two elements: the panel
+layer surface and the wallpaper layer surface (no windows, per the screendump). The cursor
+is **not** among them — smithay puts a cursor-plane assignment in a separate slot and only
+`overlay_plane_elements` are fed back as fake elements; the one path that could push it
+onto the primary is the failed-`test_state_complete` reset, and `atest = 0` for the entire
+burst (6 over the whole 176 s), so no test ever failed. `curs_up = 1` and
+`curs_mv = 680 ≈ atomic = 684` confirm the plane is live.
+
+**The one thing left worth knowing** is whether the pre-shaper damage set is genuinely
+large or a handful of rects inflated into a million pixels. `damage_rect_dump.patch`
+(built, unrun) prints `dmg_nrects` plus a bounded rect list and answers it in one run:
+`n = 1` full-width at height 767-775 means the bbox shortcut (`shaper.rs:81-88`) and a
+pre-shaper set of ≥2 rects one of which is ≥ 892,800 px; `n` in 4…32 with 320 px-wide
+strips means the tiled path. If it turns out to be a few small rects inflated to 31 tiles,
+that is an **upstream smithay bug report with a reproducer** — a real outcome even under a
+no-patch policy. Ceiling: the dump gives the shaper's *output*; the *input* is not visible
+from the kernel at all and stays inferred, because `release_max_level_info` compiles out
+the `trace!` calls that would show it.
+
+**If that run happens, its own instrument must be checked first.** Assert that parsed `r=`
+tuples equal `n` and that the `[/DMGRECTS]` sentinel is present; abort on mismatch. Use the
+idle invariant already measured as the built-in positive control — over any 20 s window
+with `evpush` delta 0, `dmg_nrects − dmg_rect` must be 0 and `dmg_px / dmg_rect` exactly
+40,960. If idle does not reproduce, the instrument is wrong and the motion numbers must be
+thrown away. Cross-foot `dmg_nrects >= dmg_rect`; `dmg_nrects == 0` with `dmg_rect > 0` is
+a never-wired counter, a hard error rather than a zero. A one-line `fbs_added` (`ADDFB2`
+count) additionally kills the age hypothesis by observation rather than inference: ≤ ~8 for
+a whole run confirms buffer reuse; climbing at the flip rate would mean per-frame
+reallocation is real after all.
+
+**Reference numbers from the landed run** (aarch64/HVF, 1280x800, 88 samples over 176 s,
+70 s continuous motion at 60 injected moves/s): burst `flips/s = 8.16`,
+`cursor_mv/s = 8.16`, `evpush/s = 174.63` (evdev emits `EV_REL` X, `EV_REL` Y and `EV_SYN`
+per motion event, so 174.63/3 = 58.2 moves/s — the moves genuinely reached the guest ring),
+damage 0 full / 571 rect / 0 skip. The sanity identity
+`dmg_full + dmg_rect + dmg_skip == atomic` was exact in every window. No stale pixels:
+consecutive screendumps differ by 126, 108 and 288 px, every one inside a ~15x21 px box in
+the panel bar — the clock digits. Single run.
+
+### 9. AF_UNIX `listen()` is lax in the opposite direction — fix prepared
+
+The AF_UNIX arm of `handle_listen` (`servers/net/src/lib.rs:1210`) is an unconditional
+`ok_reply()`. Linux's `unix_listen()` has three gates, **in this order**: type not
+STREAM/SEQPACKET → **EOPNOTSUPP (95)**, checked *before* the address; `u->addr == NULL` →
+EINVAL; `sk_state` neither `TCP_CLOSE` nor `TCP_LISTEN` → EINVAL. Note the asymmetry with
+`inet_listen()`, which answers EINVAL for a DGRAM listen — the two must **not** be made
+symmetric, and the AF_INET arm (`07d461c`) is left alone. There is no persistent "connect
+in progress" state on Linux, so our `UnixPendingAccept` maps onto ESTABLISHED and is EINVAL
+like `UnixConnected`; there is no fifth answer to give.
+
+The prepared patch adds a subtest with **eight** assertions of which **five** must fail
+against an unpatched kernel (unbound listen, socketpair end, connector, accepted socket,
+DGRAM); the other three pass at HEAD and are explicitly **not** counted as evidence — they
+exist so that "make AF_UNIX `listen()` always fail" and "re-arm the address on every
+`listen()`" cannot pass. One falsifying mutation is worth naming because it is subtle:
+moving the type gate *below* the state match makes the DGRAM case report errno 22 instead
+of 95, which is exactly what a plausible-looking fix gets wrong.
+
+**Held deliberately, and the reason is not the code.** The patch is a no-op for every
+healthy server — a working AF_UNIX server is `UnixListening` at `listen()` time and that
+arm still answers 0, idempotently — and every in-tree caller binds first and checks. But
+the in-tree audit is not the population at risk. The risk is an out-of-tree component
+(cosmic-comp, cosmic-panel, busd, tokio/zbus) whose `bind()` fails on a **dirty** image — a
+stale `S_IFSOCK` under `/run/user/N` is not hypothetical here, `/data` survives reboots —
+which today limps on as a zombie listener and after the patch exits at `listen()` and gets
+restarted by `launch_pad` in a loop. That reads exactly like the crash-loop signatures this
+project has spent whole waves chasing.
+
+**Validation is in flight** on the Linux box: a COSMIC session on each arch, **then a
+second session against the image the first run left behind**, which is the run that would
+expose a component relying on the zombie behaviour. A fresh-image-only validation would
+miss it. **What the outcomes mean:** a clean dirty-image second session on both arches
+(no new `listen` EINVAL/EOPNOTSUPP lines, no `launch_pad` churn) plus `scmtest` 32/0 on
+fresh images means land it as-is. New EINVALs with a restart loop means the strictness is
+correct but some component depends on the laxity — that identifies the component, and the
+decision then is whether to fix the component or scope the gate, **not** to weaken the
+errno mapping. A crash with no `listen` line at all means something other than this patch,
+and the patch should be re-run in isolation before anything is concluded.
+
+### 10. `kms_swrast` destroys imported handles with `MODE_DESTROY_DUMB`
+
+Gallium's kms-dri winsys releases *every* `pipe_resource` it imported through
+`DRM_IOCTL_MODE_DESTROY_DUMB` (`src/gallium/winsys/sw/kms-dri/kms_dri_sw_winsys.c:288-296`),
+not through `GEM_CLOSE` — that is upstream's shape, not a bug in Mesa. Our
+`std_handle_destroy_dumb` (`drivers/src/drm_device_interface.rs:2833`) takes **no
+`open_id`** and consults `DUMB_BUFFERS` only, so a handle that was minted by an import is
+not found and is never released. cosmic-comp imports as a matter of course, once per
+composited frame, so this **leaks one object per frame** for the whole life of a session.
+
+Today the leak is bounded by the fact that imports do not mint handles at all (item 7's
+Stage 3 is not implemented), so the current cost is the lookup miss rather than unbounded
+growth — but the fix belongs with the item 1 refcount work, because that is what makes
+"release a handle" mean something: `DESTROY_DUMB` must gain `open_id` and route to the
+same per-open unref path as `GEM_CLOSE`, dropping exactly one reference regardless of which
+registry minted the handle. A counter on `[DRMSTAT]` (live objects, bounded over a 60 s
+session) is the cheapest detector, and it is the same counter item 1's compositor gate
+needs.
+
+### 11. The `[DRM-SRV] mmap` trace is unconditional and floods a session
+
+`servers/drm/src/lib.rs:211-219` prints `[DRM-SRV] mmap token=… map_info=0x0N -> {uncached,
+writeback}` on **every** resolved mmap token, outside `pci::RENDER_DEBUG`, with a source
+comment saying the unconditional print is deliberate — it was the only evidence that
+`18a7a9f`'s cacheability scoping is by cache type rather than blanket. That evidence has
+been collected. The line now costs a per-byte UART write on a path COSMIC takes
+continuously: **146 lines in a ~7 minute session**, on the same console that shreds guest
+output when it interleaves (instrument-reliability entry 6). Gate it — either behind
+`RENDER_DEBUG` or behind a first-N-per-cache-type one-shot, which keeps the evidence
+property at bounded cost. Cheap, and it makes every future session log more trustworthy.
 
 ### 12. Deferred work and known limitations
 
 - **Doom does not link relibc.** `../doomgeneric/Makefile.leandros` links
   `userland/target/<arch>-unknown-none/release/libleandros_libc.a`, whose allocator is
   `userland/libc/src/mem.rs` — a ~20-line **bump allocator over `brk(2)`** with no free
-  list, no dlmalloc and no `mmap` path. The retired malloc-hang item (deleted
-  2026-08-06 — Doom now runs both arches on fresh images) had blamed "relibc's
-  dlmalloc or its `brk`/`mmap` glue" and nominated `04c80cd` ("give relibc's C sources
-  a cross compiler") as the likely fix; **neither could ever have been right**, since
-  Doom never touches relibc. Worth stating plainly so the next person debugging a Doom
-  allocation does not start in relibc.
-- **doomgeneric's zone default is 4 MiB, not 16.** `DEFAULT_RAM 4`; the 16 MiB case is
-  reachable only via `-mb 16` (and that forced case also passes: `zone memory:
-  0x33e008, 1000000 allocated for zone`).
-- **Mesa modifier support — needs re-verification.** The claim that our GBM lacking
-  `gbm_bo_create_with_modifiers2` means smithay cannot build a reusing swapchain and
-  reallocates per frame was **not confirmed against smithay's source**, and may be
-  wrong: at the pinned revision, `allocator/swapchain.rs:158-178` caches slots and only
-  allocates when `buffer.is_none()`, and `allocator/gbm.rs:204-219` has a documented
-  fallback for Invalid/Linear modifiers in `create_buffer_object`. The per-frame-
-  reallocation conclusion is unverified; the 128-dmabuf-fd burn in ~1 s and the
-  `MAX_FDS` 64→128 raise are separately observed facts and still stand. Revisit with
-  PRIME/linux-dmabuf.
-- **llvmpipe** — the TCG-performance lever, staged but not landed. softpipe was chosen
-  for correctness (portable C, no per-arch LLVM codegen bring-up ×2).
-- **Synthetic sysfs** — the read-only `/sys/dev/char`, `/sys/class/drm`,
-  `/sys/class/input` design in `docs/design/k4-drm-design.md` is execution-ready but
-  deferred; no current consumer needs the enumeration. (The PCI attributes the Venus
-  render node needs were added separately.)
+  list, no dlmalloc and no `mmap` path. The retired malloc-hang item had blamed relibc; it
+  could never have been right. Worth stating plainly so the next person debugging a Doom
+  allocation does not start there. doomgeneric's zone default is 4 MiB (`DEFAULT_RAM 4`);
+  the 16 MiB case is reachable only via `-mb 16` and also passes.
+- **Mesa modifier support.** The claim that our GBM lacking `gbm_bo_create_with_modifiers2`
+  makes smithay reallocate the swapchain per frame is **refuted**:
+  `allocator/swapchain.rs:154-181` caches slots and allocates only when `buffer.is_none()`,
+  `allocator/gbm.rs:200-238` has a documented Invalid/Linear fallback, and an allocation
+  failure would surface as `FrameError::Allocator` — no flip at all, not a degraded one.
+  The idle counters in item 8 confirm it from data. The separately-observed 128-dmabuf-fd
+  burn in ~1 s and the `MAX_FDS` 64→128 raise are untouched by this and still stand.
+- **llvmpipe** — the TCG-performance lever, staged but not landed. softpipe was chosen for
+  correctness (portable C, no per-arch LLVM codegen bring-up ×2).
+- **Synthetic sysfs** — the read-only `/sys/dev/char`, `/sys/class/drm`, `/sys/class/input`
+  design in `docs/design/k4-drm-design.md` is execution-ready but deferred; no current
+  consumer needs the enumeration.
 - **DRM ioctl gaps cosmic-comp tolerates** (kernel returns Unsupported): `VRR_ENABLED`
   property, syncobj. Nothing optional is advertised in the property table on purpose —
   smithay guards each and degrades cleanly.
+- **`FENCE_FD_IN`** (sync-file import) still needs the reverse plumbing and has no
+  signalled-by-construction shortcut, unlike `FENCE_FD_OUT` (`a0325c6`). Real
+  `DRM_IOCTL_SYNCOBJ_*` are not on the critical path — Mesa 25.3.6 compiles the SIMULATE
+  path unconditionally. **A dependency to remember:** `a0325c6`'s out-fence eventfd is
+  signalled at creation, which is correct **only while `VirtioGpu::submit` is a synchronous
+  busy-spin**. If the ISR work ever makes submission asynchronous, that becomes a lie and
+  must become a real waitable fence. The dependency is on `submit`, not on the syncobj
+  code, and the source comment says so.
 - **ELF loader follow-ups from the dynamic-linking wave**: interp is eagerly loaded
-  (~4.8 MB per exec), and there is a pre-existing buddy-slack leak on the eager→lazy
-  split.
+  (~4.8 MB per exec), and there is a pre-existing buddy-slack leak on the eager→lazy split.
 - **`/proc/self/exe` returns `/bin/init`** regardless of the caller.
 - **libseat shim eventfd workaround** (`0bed5ad`) is inert now that the kernel honours
   `EFD_NONBLOCK`, and can be simplified.
 - **DRM page-flip event timestamps** (`drivers/src/drm_device_interface.rs:394,398-400`)
   are still built from the 100 Hz tick scheme, and smithay reads them for presentation
   feedback — worth moving to the interpolated clock in the same sweep.
-- **Harness gotcha: `~/code/leandros-artifacts/m8_cursor.py` picks its "busiest
-  window" by `curs_mv` delta.** That is identically 0 on the legacy KMS path (no cursor
-  plane exists to move), so it silently prints a degenerate `1.00 flips/s` for a
-  legacy-path control instead of erroring. Key the window on `evpush` (see the
-  diagnostics table in Standing context) instead — it is nonzero on both paths whenever
-  pointer motion actually reached the guest ring.
-- **Build gotcha, cost two QEMU cycles during the `77f170d` verification:** building a
-  userland test binary with a bare `cargo build` instead of `scripts/build-userland.sh`
-  omits `-C relocation-model=static`, producing a PIE whose `.data.rel.ro` our loader
-  never relocates. It then faults at `__libc_start_main+0x44` with `CR2=0`, before
-  `main` — a distinctive signature whose cause is not obvious from the fault alone.
-  Always build userland through `scripts/build-userland.sh`.
-- **`driver.py` still has no Venus/GL mode.** Unblocked (item 4): QMP `screendump`
-  works under `-display egl-headless` in its bare form, without `device=`. The mode
-  itself — teaching `.claude/skills/run-leandros/driver.py:_build_cmd` to build the
-  `--venus` device line and call `screendump` bare — still needs writing.
+- **Harness gotchas in `~/code/leandros-artifacts/m8_cursor.py`.** Two, both silent: it
+  picks its "busiest window" by `curs_mv` delta, which is identically 0 on the legacy KMS
+  path, so a legacy-path control prints a degenerate `1.00 flips/s` instead of erroring
+  (key the window on `evpush` instead); and its positional regex zeroes every `[DRMSTAT]`
+  field after `flip_us` now that `c5abb8d` inserted five `dmg_*` fields there. Prefer
+  `m9-fb-damage-clips/m9_analyze.py`, which parses `key=0xHEX` pairs order-independently.
+- **Build gotcha:** building a userland test binary with a bare `cargo build` instead of
+  `scripts/build-userland.sh` omits `-C relocation-model=static`, producing a PIE whose
+  `.data.rel.ro` our loader never relocates. It then faults at `__libc_start_main+0x44`
+  with `CR2=0`, before `main` — a distinctive signature whose cause is not obvious from the
+  fault alone. Always build userland through `scripts/build-userland.sh`.
 
 ---
 
 ## Housekeeping
 
-- Untracked disk-image backups at the repo root
-  (`f2fs-data0-aarch64.img.12h15-orig`, `.full-rebuild`, `.m7z2-orig-backup`,
-  `f2fs-data0-x86_64.img.m7z2bak`) and `ports/busd/.work/` are now gitignored
-  (`f2fs-data0-*.img.*`, `ports/*/.work/`); delete them by hand when no longer needed.
+- **Fresh-worktree gotcha: the guest boots with no shell.** `build-all.sh` and
+  `mkfs-f2fs-populated.py` resolve the sibling repos as `$ROOT_DIR/../<repo>`, and an agent
+  worktree's parent is `.claude/worktrees/`, not `~/code/`. The build **exits 0** and only
+  prints `⚠️ brush source not found … skipping`; the failure appears at runtime as
+  `login: exec failed` / `session ended, restarting login`, i.e. `/bin/login` execve()ing a
+  shell that is not in the image. `brush`, `coreutils` and `bottom-leandros` symlinks were
+  added under `.claude/worktrees/` alongside the pre-existing `doomgeneric`, `mame` and
+  `relibc`, and are left there deliberately.
+- **`/bin/wl-globals` is staged when the host binary exists** —
+  `~/code/leandros-artifacts/m9-wlglobals/out/wl-globals-<arch>`, same conditional pattern
+  as `leandros-applet`. It is a Stage 0 measurement instrument (it enumerates the
+  `wl_registry` of every `wayland-*` socket in `$XDG_RUNTIME_DIR` and exits); nothing in
+  the session depends on it. **Only aarch64 has been built** — x86_64 was never staged.
 - Run regression harnesses with `python3 -u` and **no pipe**: buffering makes a healthy
-  background run look like a crash, and piping through `tail` gets the run reaped at
-  exit 144.
+  background run look like a crash, and piping through `tail` gets the run reaped at exit
+  144. Prefer `scripts/scmrun.py` (one process per command, explicit pre-send drain, fixed
+  read window, no `expect()`) over `driver.py cmd` for anything whose number will be
+  quoted, and open every boot with a positive control.
+- When host tracing is on, always pass `-D <file>`. A trace stream sharing the guest's pty
+  interleaves per character and silently destroys both `grep` results and harness sentinels
+  (instrument-reliability entry 6).
