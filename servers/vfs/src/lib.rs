@@ -456,7 +456,20 @@ fn vmo_free_slot(owner: usize) {
 
 /// Resolve `(pid, fd)` to the owning tmpfs slot index, or `None` if the fd is
 /// not an open `TmpFile`.
+///
+/// `pid` is canonicalised to the TGID for the same reason `vfs_get_node_kind`
+/// does it: fd tables are per-process, not per-thread. Without this, every
+/// caller that hands us a bare `current_pid()` — `mark_memfd` and, fatally,
+/// `vmo_acquire_frames` — found no table at all on a non-leader thread.
+/// `sys_mmap` turns that `None` into ENOMEM, which is exactly the
+/// `Failed to create memory pool.: Create(Os { code: 12, kind: OutOfMemory })`
+/// that kills the `smithay-clipboard` thread in every COSMIC session: a spawned
+/// thread's `MultiPool::new` reaches `MmapMut::map_mut` on a memfd it created
+/// itself. `install_dmabuf_vmo` and `dmabuf_handle_of` already pass a TGID
+/// explicitly (the same lesson, learnt once in 36f62d0); `tgid_of` is
+/// idempotent, so they are unaffected.
 fn tmpfile_owner_of(pid: u32, fd: usize) -> Option<usize> {
+    let pid = sched::tgid_of(pid);
     let mut tbls = FD_TABLES.lock();
     let tbl = find_tbl(pid, &mut *tbls)?;
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
@@ -2144,6 +2157,59 @@ fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: u128) {
     }
 }
 
+// ── In-flight SCM_RIGHTS references on tmpfs slots ─────────────────────────────
+//
+// A tmpfs/memfd inode's lifetime is *table-scan driven*: it dies once no fd
+// table entry names its slot (`tmp_release_ephemeral`). A descriptor queued on
+// an AF_UNIX stream is in neither table — `export_fd` lifted it out of the
+// sender's and `import_fd` has not yet put it in the receiver's — so for the
+// length of that queue it is invisible to the scan.
+//
+// That was harmless while every memfd kept its name: a named inode is not
+// `ephemeral`, and `tmp_release_ephemeral` refuses to collect it. Now that
+// `sys_memfd_create` unlinks, the window is a genuine use-after-free — Mesa's
+// swrast path does `wl_shm_create_pool(fd)` then `close(fd)` immediately, so
+// the sender's last descriptor is gone well before cosmic-comp's recvmsg, and
+// the slot would be freed and handed to an unrelated file before the receiver's
+// `TmpFile { idx }` ever resolved.
+//
+// One counter per slot, incremented by `export_fd`, decremented by
+// `import_fd`/`drop_transfer`. Leaf lock: taken and released on its own, or
+// nested only under FD_TABLES — never while TMP_FILES is held.
+static TMP_INFLIGHT: Mutex<[u16; MAX_TMP_FILES]> = Mutex::new([0u16; MAX_TMP_FILES]);
+
+/// Take an in-flight reference if `kind` is a tmpfs fd. No-op otherwise.
+fn tmp_inflight_inc(kind: &VnodeKind) {
+    if let VnodeKind::TmpFile { idx, .. } = *kind {
+        if idx < MAX_TMP_FILES {
+            let mut f = TMP_INFLIGHT.lock();
+            f[idx] = f[idx].saturating_add(1);
+        }
+    }
+}
+
+/// Drop an in-flight reference taken by `tmp_inflight_inc`. In `import_fd` this
+/// must run *after* the descriptor is installed in the receiver's table, so the
+/// slot is never unreferenced for even an instant.
+fn tmp_inflight_dec(kind: &VnodeKind) {
+    if let VnodeKind::TmpFile { idx, .. } = *kind {
+        if idx < MAX_TMP_FILES {
+            let mut f = TMP_INFLIGHT.lock();
+            f[idx] = f[idx].saturating_sub(1);
+        }
+    }
+}
+
+/// Bitmask of tmpfs slots held by a queued SCM_RIGHTS descriptor.
+fn tmp_inflight_mask() -> u128 {
+    let f = TMP_INFLIGHT.lock();
+    let mut mask: u128 = 0;
+    for (i, &n) in f.iter().enumerate() {
+        if n > 0 { mask |= 1u128 << i; }
+    }
+    mask
+}
+
 /// Bitmask of tmpfs pool slots still referenced by an open descriptor.
 ///
 /// Lock order is the established FD_TABLES → TMP_FILES, so callers must invoke
@@ -2158,7 +2224,9 @@ fn tmp_open_fd_mask() -> u128 {
             }
         }
     }
-    mask
+    // A queued SCM_RIGHTS descriptor counts as a reference too: unlinking a slot
+    // that is only held in flight must mark it ephemeral, not free it.
+    mask | tmp_inflight_mask()
 }
 
 // ── Symlinks ─────────────────────────────────────────────────────────────────
@@ -2345,11 +2413,18 @@ fn tmp_release_ephemeral(idx: usize) {
             f.in_use && matches!(f.kind, VnodeKind::TmpFile { idx: i, .. } if i == idx)
         })
     });
+    // A descriptor queued on an AF_UNIX stream is in no fd table at all, so the
+    // scan above cannot see it. Read the in-flight count with FD_TABLES STILL
+    // HELD — releasing it first would let an `import_fd` land in between and be
+    // seen by neither check. Nesting stays FD_TABLES → TMP_INFLIGHT → TMP_FILES;
+    // the guard dies on this line, so TMP_INFLIGHT is never held across the
+    // TMP_FILES acquisition below.
+    let in_flight = idx < MAX_TMP_FILES && TMP_INFLIGHT.lock()[idx] > 0;
     let mut tmp = TMP_FILES.lock();
     // `ephemeral` also marks a hard-linked inode whose own name was unlinked
     // while other names survive. Those are still reachable through an alias,
     // so an fd going away must not collect them.
-    if !still_referenced && tmp[idx].in_use && tmp[idx].ephemeral
+    if !still_referenced && !in_flight && tmp[idx].in_use && tmp[idx].ephemeral
         && tmp_alias_count(&tmp[..], idx) == 0
     {
         // A memfd whose name was unlinked while an fd stayed open lands here on
@@ -3625,9 +3700,14 @@ pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
     };
     // Second reference held by the queued descriptor: a pipe endpoint must not
     // reach EOF/EPIPE just because the sender closed its fd before the peer
-    // recv'd. No-op for every non-pipe kind (their lifetime is table-scan
-    // driven — see `tmp_release_ephemeral`).
+    // recv'd.
     pipe_ref_inc(&kind);
+    // Same reason for a tmpfs/memfd fd, and the reason this is no longer a
+    // no-op: its lifetime IS table-scan driven (`tmp_release_ephemeral`) and a
+    // queued descriptor is in no table, so without this the sender closing a
+    // now-anonymous memfd right after `wl_shm_create_pool` frees the slot before
+    // the receiver ever imports it.
+    tmp_inflight_inc(&kind);
     Some(TransferFd { kind, flags })
 }
 
@@ -3639,15 +3719,19 @@ pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
 pub fn import_fd(pid: u32, tf: TransferFd, cloexec: bool) -> isize {
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => {
-        drop(tbls); release_vnode(tf.kind, pid); return -24;
+        drop(tbls); tmp_inflight_dec(&tf.kind); release_vnode(tf.kind, pid); return -24;
     }};
     let slot = match tbl.alloc_fd() { Some(s) => s, None => {
-        drop(tbls); release_vnode(tf.kind, pid); return -24; // EMFILE
+        drop(tbls); tmp_inflight_dec(&tf.kind); release_vnode(tf.kind, pid); return -24; // EMFILE
     }};
     let mut flags = tf.flags;
     if cloexec { flags |= O_CLOEXEC; } else { flags &= !O_CLOEXEC; }
     tbl.fds[slot] = FdEntry { kind: tf.kind, flags, in_use: true };
     drop(tbls);
+    // Strictly after the install: the table entry is now the reference, so the
+    // slot is never momentarily unreferenced. Over-counting is safe here,
+    // under-counting frees the inode out from under the receiver.
+    tmp_inflight_dec(&tf.kind);
     // [GAP2] SCM_RIGHTS hand-off of a tmpfs/memfd fd — this is exactly the
     // Wayland wl_shm pool arriving in the compositor. If `idx` here does not
     // match the sender's, or the kind is not TmpFile, the receiver's mmap will
@@ -3670,6 +3754,7 @@ pub fn import_fd(pid: u32, tf: TransferFd, cloexec: bool) -> isize {
 /// exactly as a close would. Linux closes SCM_RIGHTS fds that don't fit the
 /// receiver's control buffer, and drops queued fds when the socket dies.
 pub fn drop_transfer(tf: TransferFd) {
+    tmp_inflight_dec(&tf.kind);
     release_vnode(tf.kind, 0);
 }
 

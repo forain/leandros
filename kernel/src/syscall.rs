@@ -7130,20 +7130,29 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
                     mm::gap2::set_watch_primary(g2_idx);
                 }
             }
-            // KNOWN LEAK, deliberately not fixed here. A memfd should be an
-            // ANONYMOUS inode that dies with its last fd; ours keeps its
-            // "/tmp/memfd:<name>[:<seq>]" name forever, so every call burns one
-            // of the 128 MAX_TMP_FILES slots permanently and a client that
-            // allocates a wl_shm pool per frame bricks memfd_create system-wide
-            // after ~100 frames. tmp_release_ephemeral already implements the
-            // right lifetime ("a memfd whose name was unlinked while an fd
-            // stayed open lands here on the final close") — but simply issuing
-            // VFS_UNLINK here is NOT enough: with the name gone, the client's
-            // next ftruncate/mmap of that fd fails ENOMEM ("Failed to create
-            // memory pool") and takes the whole COSMIC session down, because
-            // those paths still resolve the inode by name rather than through
-            // the fd's VnodeKind::TmpFile { idx }. Fixing this means making
-            // ftruncate + the K1 shared-VMO mmap path fd-resolved first.
+            // Drop the name immediately, exactly as the PRIME export node does
+            // (36f62d0): a memfd is an ANONYMOUS inode that dies with its last
+            // fd. The open fd holds the slot — tmp_drop_name sees it in
+            // tmp_open_fd_mask and marks the inode `ephemeral` rather than
+            // freeing it, and tmp_release_ephemeral collects it (and its VMO
+            // frames) on the final close. Without this every call burnt one of
+            // the 128 MAX_TMP_FILES slots forever and a client that allocates a
+            // wl_shm pool per frame bricked memfd_create system-wide (ENOSPC)
+            // after ~100 frames, across /tmp, /dev/shm and /run/user alike.
+            //
+            // The comment this replaces claimed the fd's later ftruncate/mmap
+            // still resolved the inode BY NAME and so would break. They do not:
+            // every fd-side operation keys off VnodeKind::TmpFile { idx } —
+            // handle_ftruncate, vmo_acquire_frames (via tmpfile_owner_of),
+            // read/write/lseek/fstat/fchmod/fchown, F_ADD_SEALS/F_GET_SEALS and
+            // the f*xattr family. The only by-name site is handle_open, and
+            // nothing ever reopens a memfd by name (tmp_find skips `ephemeral`,
+            // which is precisely the invisibility Linux gives a memfd). What
+            // that comment was really seeing was the ENOMEM from
+            // tmpfile_owner_of missing a non-leader thread's fd table — fixed
+            // in servers/vfs alongside this.
+            let unlink_msg = make_vfs_msg(vfs::VFS_UNLINK, &[path.as_ptr() as u64]);
+            let _ = vfs::handle(&unlink_msg, pid);
         }
         return fd;
     }

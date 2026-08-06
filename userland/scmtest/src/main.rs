@@ -652,6 +652,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_close_while_mapped() { failures += 1; }
     if !test_ftruncate_grow_shrink() { failures += 1; }
     if !test_teardown_loop() { failures += 1; }
+    if !test_memfd_anonymous_reclaim() { failures += 1; }
+    if !test_memfd_inflight_close() { failures += 1; }
 
     // ── K1-C: AF_UNIX VFS socket nodes, tmpfs mounts, cap raise, fd-cap ──────
     if !test_socket_node_roundtrip() { failures += 1; }
@@ -1252,6 +1254,156 @@ unsafe fn test_teardown_loop() -> bool {
     }
     dbg1(b"[td] completed %d iterations\n\0", i as i64);
     report(name, ok && i == 150)
+}
+
+/// TODO item 2: a memfd must be an ANONYMOUS inode. Three claims, one loop.
+///
+/// (a) The "/tmp/memfd:<name>" node is unlinked at creation, so it is invisible
+///     to stat/lookup — Linux semantics, and what `sys_memfd_create`'s old
+///     comment claimed would break everything.
+/// (b) ftruncate and MAP_SHARED still work on the now-nameless fd. That is the
+///     exact failure that comment predicted, so this is the assertion retiring
+///     it.
+/// (c) The pool slot is RECLAIMED on the final close. Before the fix each call
+///     burnt one of the 128 MAX_TMP_FILES slots forever and this loop died with
+///     ENOSPC well short of 300. `teardown_loop` above cannot catch that: it
+///     unlinks every node by hand, which is exactly what userspace does not do
+///     and cannot do for an fd it received over SCM_RIGHTS.
+unsafe fn test_memfd_anonymous_reclaim() -> bool {
+    let name = b"memfd_anonymous_reclaim\0";
+    const ROUNDS: usize = 300; // > 2 * MAX_TMP_FILES
+
+    // (a) the backing name must not resolve while the fd is open.
+    let probe = raw_memfd_create(b"anonprobe\0".as_ptr(), 0);
+    if probe < 0 { dbg0(b"[anon] probe memfd_create failed\n\0"); return report(name, false); }
+    let (st, _mode) = raw_stat_mode(b"/tmp/memfd:anonprobe\0".as_ptr());
+    let nameless = st < 0;
+    dbg1(b"[anon] stat(/tmp/memfd:anonprobe) = %d (want < 0)\n\0", st as i64);
+    close(probe);
+
+    let mut ok = nameless;
+    let mut i = 0usize;
+    while ok && i < ROUNDS {
+        let mut nm = [0u8; 32];
+        build_name(&mut nm, b"anon", i);
+        let mfd = raw_memfd_create(nm.as_ptr(), 0);
+        if mfd < 0 {
+            dbg2(b"[anon] memfd_create FAILED at i=%d errno=%d (slot leak)\n\0",
+                 i as i64, get_errno() as i64);
+            ok = false;
+            break;
+        }
+        // (b) both of these resolve the inode through VnodeKind::TmpFile { idx },
+        // never by name — a nameless inode must serve them unchanged.
+        if raw_ftruncate(mfd, 8192) != 0 {
+            dbg2(b"[anon] ftruncate FAILED at i=%d errno=%d\n\0", i as i64, get_errno() as i64);
+            close(mfd);
+            ok = false;
+            break;
+        }
+        let m = mmap(core::ptr::null_mut(), 8192, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+        if m as usize == MAP_FAILED {
+            dbg2(b"[anon] mmap FAILED at i=%d errno=%d\n\0", i as i64, get_errno() as i64);
+            close(mfd);
+            ok = false;
+            break;
+        }
+        let tag = (i & 0xFF) as u8;
+        *m = tag;
+        *m.add(8191) = !tag;
+        if *m != tag || *m.add(8191) != !tag {
+            dbg1(b"[anon] content mismatch at i=%d\n\0", i as i64);
+            munmap(m, 8192);
+            close(mfd);
+            ok = false;
+            break;
+        }
+        munmap(m, 8192);
+        close(mfd); // (c) no unlink — the kernel already dropped the name
+        i += 1;
+    }
+    dbg1(b"[anon] completed %d iterations\n\0", i as i64);
+    report(name, ok && i == ROUNDS)
+}
+
+/// The sender may close its memfd the instant it has been handed to SCM_RIGHTS:
+/// Mesa's swrast path does exactly `wl_shm_create_pool(fd); close(fd);`. Once
+/// the inode is nameless, the ONLY thing keeping the pool slot alive between
+/// `sendmsg` and the peer's `recvmsg` is the in-flight reference `export_fd`
+/// takes — a queued TmpFile is in no fd table, so the table scan in
+/// `tmp_release_ephemeral` cannot see it.
+///
+/// The second socketpair makes the ordering deterministic instead of hoping the
+/// scheduler produces it: the child does not enter `recvmsg` until the parent
+/// has already closed its last descriptor.
+unsafe fn test_memfd_inflight_close() -> bool {
+    let name = b"memfd_inflight_close\0";
+    let mut sp = [0i32; 2];
+    let mut sync = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sp.as_mut_ptr()) != 0 {
+        dbg0(b"[inflight] socketpair failed\n\0");
+        return report(name, false);
+    }
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sync.as_mut_ptr()) != 0 {
+        dbg0(b"[inflight] sync socketpair failed\n\0");
+        close(sp[0]); close(sp[1]);
+        return report(name, false);
+    }
+    let (a, b) = (sp[0], sp[1]);
+    let (sa, sb) = (sync[0], sync[1]);
+
+    let mfd = raw_memfd_create(b"scm-inflight\0".as_ptr(), 0);
+    if mfd < 0 || raw_ftruncate(mfd, 4096) != 0 {
+        dbg0(b"[inflight] memfd setup failed\n\0");
+        close(a); close(b); close(sa); close(sb);
+        return report(name, false);
+    }
+    // Stamp the pattern and drop the mapping: after this only the fd refers to
+    // the inode, so the close below really is the last reference.
+    let pm = mmap(core::ptr::null_mut(), 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    if pm as usize == MAP_FAILED {
+        dbg0(b"[inflight] parent mmap failed\n\0");
+        close(mfd); close(a); close(b); close(sa); close(sb);
+        return report(name, false);
+    }
+    for j in 0..4096usize { *pm.add(j) = 0xA5u8 ^ (j & 0xFF) as u8; }
+    munmap(pm, 4096);
+
+    let pid = fork();
+    if pid == 0 {
+        close(a); close(sa);
+        // Drop the copy of `mfd` this child inherited across fork, BEFORE the
+        // parent is allowed to proceed. Without it the parent's close is not
+        // the last fd-table reference: `tmp_release_ephemeral`'s table scan
+        // still sees this entry, refuses to collect the slot, and the hazard
+        // window never opens — the subtest then passes even with the in-flight
+        // refcount removed (measured: it did).
+        close(mfd);
+        let mut go = [0u8; 1];
+        if read(sb, go.as_mut_ptr(), 1) != 1 { exit(3); } // parent has closed mfd
+        let (_n, _f, rfd, _cl) = recv_fd_and_byte(b, 32, 0);
+        if rfd < 0 { dbg0(b"[inflight:child] no SCM_RIGHTS fd\n\0"); exit(2); }
+        let cm = mmap(core::ptr::null_mut(), 4096, PROT_READ | PROT_WRITE, MAP_SHARED, rfd, 0);
+        if cm as usize == MAP_FAILED { dbg0(b"[inflight:child] mmap failed\n\0"); exit(4); }
+        let mut good = true;
+        for j in (0..4096usize).step_by(97) {
+            if *cm.add(j) != 0xA5u8 ^ (j & 0xFF) as u8 { good = false; break; }
+        }
+        munmap(cm, 4096);
+        close(rfd);
+        exit(if good { 0 } else { 1 });
+    }
+
+    close(b); close(sb);
+    let sret = send_fd_and_byte(a, mfd, b'I');
+    close(mfd);                  // last reference gone; only in-flight left
+    write(sa, b"g".as_ptr(), 1); // only now may the child recv
+    let mut status: i32 = -1;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    dbg2(b"[inflight] sendmsg=%d child status=%d (0 = pattern survived)\n\0",
+         sret as i64, status as i64);
+    close(a); close(sa);
+    report(name, sret > 0 && status == 0)
 }
 
 // ── K1-C: AF_UNIX VFS socket nodes, tmpfs mounts, cap raise, queued-fd cap ───
