@@ -98,7 +98,7 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 4 | memfd burns a tmpfs slot per call | Bug — latent DoS | — |
 | 5 | `wl_display error 0 "Unknown id: 636"` | Bug | re-measure post-fix |
 | 6 | `FB_DAMAGE_CLIPS` / primary-plane recomposite | Perf | — |
-| 7 | evdev monotonic timestamps (reverted) | Bug | needs a different time source |
+| 7 | evdev monotonic timestamps — recorded cause refuted, ready to re-land | Bug | — |
 | 8 | Doom hangs in `malloc(16 MB)` on aarch64 | Bug | re-verify first |
 | 9 | AF_INET loopback needs a real loopback interface | Bug | — |
 | 10 | Deferred / known limitations | Mixed | — |
@@ -255,14 +255,81 @@ flips the **primary** plane on every cursor frame. The end state
 This is the remaining pointer-latency win, and it is on the primary plane, not the
 cursor. `FB_DAMAGE_CLIPS` is already advertised in the plane property table.
 
-### 7. evdev monotonic timestamps — reverted, do not re-land naively
+### 7. evdev monotonic timestamps — recorded cause refuted, ready to re-land
 
-Timestamping `push_event` from an inlined `monotonic_us()` **broke pointer input
-entirely**: three runs with the change (atomic path, and a legacy-path control on the
-identical build) all showed zero compositor response to 1000+ delivered pointer moves;
-reverting it restored input. libinput evidently rejects the `cntvct`-derived
-timestamps. A re-land needs a time source libinput accepts, verified against 60
-moves/s with `DRM_STATS` on.
+The recorded cause — "libinput rejects the `cntvct`-derived timestamps" — is **wrong**,
+refuted by reading libinput 1.27.1 (on disk, matching the shipped `libinput.so.10.13.0`).
+Our pointer is the virtio-tablet, an **absolute** pointer (`servers/evdev/src/lib.rs:46-48`,
+commit `e92f22b`), and `evdev-fallback.c:207-221` passes `time` straight through to
+`pointer_notify_motion_absolute` without ever using it. There is no dt, no filter and no
+acceleration on the absolute path — those are reached only from
+`fallback_flush_relative_motion` (`:169-198`). **The zero-dt division hazard that
+motivated the change does not apply to the device we actually have.** Every other
+consumer of `input_event.time` was checked and is non-fatal: `evdev_note_time_delay`
+(`evdev.c:1109-1133`) is a pure log that returns early when the event time is in the
+future; the out-of-order-timestamp check (`libinput.c:2309-2320`) is inside `#if 0`; the
+timer sanity checks (`timer.c:94-112`) are `#ifndef NDEBUG` and verifiably absent from
+the shipped `.so`; a wrong epoch only mis-arms button/scroll/debounce timers, which
+motion never passes through; and cosmic-comp's `PointerMotionAbsolute` handler
+(`input/mod.rs:675-707`) gates nothing on the timestamp. No value of `input_event.time`
+— wrong units, wrong epoch, coarse or duplicated — can suppress absolute-pointer motion
+in this stack.
+
+The likely real cause, **inferred but well-supported**: the aarch64 FP/SIMD clobber
+fixed in `05f7279`, root-caused three days *after* those runs. The change inlined a
+copy of `drivers::snd::monotonic_us()` into evdev, putting 128-bit arithmetic (`cnt as
+u128 * 1e6 / frq as u128`, lowered to `__udivti3`) into **IRQ context** — `push_event`
+is called from `arch/aarch64/src/timer.rs:80` and `exception.rs:72`, both inside the
+interrupt — at a time when the kernel was built `+neon,+fp-armv8` with no vector state
+in the EL0 trap frame. This explains the detail that "libinput is picky" never could:
+the same `monotonic_us()` was already running in that build under `DRM_STATS` and was
+harmless, because on the SVC path AAPCS64 permits a call to clobber v0-v7/v16-v31,
+whereas an interrupt has no such licence and lands on the interrupted thread's live
+vector state at an arbitrary instruction. The observed signature — total,
+path-independent failure of a float-heavy compositor on the atomic path **and** on a
+legacy control — is what ~120 vector corruptions/s looks like.
+
+Also on the record: the original experiment was **confounded**. Run s4 changed two
+variables at once (the evdev revert *and* `COSMIC_DISABLE_DIRECT_SCANOUT` →
+`COSMIC_DISABLE_OVERLAY_SCANOUT`), so the evdev change was never isolated by a
+single-variable A/B.
+
+Verdict: **re-land it** — but note that what unblocks it is the softfloat kernel
+(`05f7279`), which makes an IRQ-context vector clobber structurally impossible, **not**
+the new interpolated clock. Resolution was never the cause. The new `monotonic_ns()` is
+nonetheless the correct source to use, for three independent reasons: it shares the
+tick counter's epoch and therefore `sys_clock_gettime`'s, which is the only thing
+libinput's `EVIOCSCLOCKID(CLOCK_MONOTONIC)` contract actually requires; it is
+non-decreasing by construction (`fetch_max`); and it has sub-tick resolution. The raw
+`monotonic_us()` had none of the three — its epoch is counter-zero rather than
+tick-zero, and on x86_64 it hardcodes a 1 GHz TSC. **Do not re-land using
+`monotonic_us()`.**
+
+Honest scope: the user-visible benefit today is modest — better `wl_pointer` stamps for
+client-side timing, and fewer "event processing lagging behind" warnings from
+`evdev.c:1128` (20 ms threshold, which gets closer once `clock_gettime` is finer while
+evdev stays 10 ms-quantized and one tick behind). The large win, accelerated dt, only
+materialises if a **relative** pointer is ever attached.
+
+A prepared patch (138 lines, **unbuilt**) is at
+`~/code/leandros-artifacts/notes/m9-evdev-timestamps/evdev_timestamps.patch`; it sits on
+top of the two m9 clock patches. It exports `arch_monotonic_ns()` from both arch
+crates, declares it in evdev's existing `extern "C"` block (evdev cannot reach `drivers`
+or `arch` directly — a dependency cycle, which is why the original inlined a copy), and
+stamps `push_event` from it, reading the counter **before** `arch_interrupt_save()` and
+before `DEVICES.lock()` so no lock is held and no user memory is touched.
+
+Verification, given this item's history of a change that looked fine and silently
+killed input: pre-flight with `userland/evtest2` on aarch64, which already reports
+`motion_ts_monotonic` — pass requires that subtest green **and** `tv_usec` values not
+all multiples of 10000, which proves units, monotonicity and resolution for almost no
+cost. Main gate on aarch64 with `DRM_STATS` on
+(`drivers/src/drm_device_interface.rs:1230`) at 60 moves/s: pass reproduces the s4
+numbers (≈6.0 flips/s, ≈6.0 cursor mv/s, 0.00 cursor uploads/s), fail is the reverted
+signature (`flips_sub` frozen, `curs_mv=0` across 1000+ delivered moves). Run the
+legacy-path control on a build differing **only** by this patch, and add a guest-side
+event counter — every previous run only proved QMP accepted the moves, never that they
+reached the guest ring.
 
 ### 8. Doom hangs in `malloc(16 MB)` on aarch64
 
@@ -351,6 +418,9 @@ then show `[NET] Loopback interface 127.0.0.1/8 up`.
 - **`/proc/self/exe` returns `/bin/init`** regardless of the caller.
 - **libseat shim eventfd workaround** (`0bed5ad`) is inert now that the kernel honours
   `EFD_NONBLOCK`, and can be simplified.
+- **DRM page-flip event timestamps** (`drivers/src/drm_device_interface.rs:394,398-400`)
+  are still built from the 100 Hz tick scheme, and smithay reads them for presentation
+  feedback — worth moving to the interpolated clock in the same sweep.
 
 ---
 
