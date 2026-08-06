@@ -98,6 +98,65 @@ const QUEUED_FD_CAP: usize = 1024;
 /// ETOOMANYREFS — too many in-flight SCM_RIGHTS references.
 const ETOOMANYREFS: i32 = -109;
 
+// ── TIME_WAIT ────────────────────────────────────────────────────────────────
+//
+// `handle_close` used to hand a TCP port straight back, so a server could be
+// restarted onto the same port instantly where Linux answers EADDRINUSE. What
+// is modelled here is the *port reservation* only, not the protocol state: the
+// smoltcp socket is still torn down at close (see the note in `handle_close`),
+// so nothing lingers to absorb a late segment or to re-ACK a retransmitted FIN.
+//
+/// Linux's `TCP_TIMEWAIT_LEN` is a fixed 60 s (2*MSL with MSL = 30 s) and is not
+/// tunable there either. `sched::ticks()` runs at 100 Hz (sched/src/lib.rs).
+const TIME_WAIT_TICKS: u64 = 60 * 100;
+/// Reservation slots. A full table is handled by *not* recording the newest
+/// reservation, so the failure mode under pressure is the old behaviour (a port
+/// that is instantly reusable) rather than a bind that cannot be satisfied.
+const MAX_TIME_WAIT: usize = 64;
+
+#[derive(Clone, Copy)]
+struct TimeWait { in_use: bool, port: u16, expires: u64 }
+
+/// Leaf lock: never taken while SOCK_TABLES, UNIX_CONNS, BOUND_PATHS or either
+/// stack lock is held. Every caller snapshots it first and then locks the rest.
+static TIME_WAIT: Mutex<[TimeWait; MAX_TIME_WAIT]> =
+    Mutex::new([TimeWait { in_use: false, port: 0, expires: 0 }; MAX_TIME_WAIT]);
+
+/// Park `port` for 2*MSL. Re-parking a port that is already parked refreshes it
+/// rather than consuming a second slot.
+fn time_wait_add(port: u16) {
+    if port == 0 { return; }
+    let now = sched::ticks();
+    let deadline = now.saturating_add(TIME_WAIT_TICKS);
+    let mut tw = TIME_WAIT.lock();
+    for e in tw.iter_mut() {
+        if e.in_use && e.expires > now && e.port == port { e.expires = deadline; return; }
+    }
+    for e in tw.iter_mut() {
+        if !e.in_use || e.expires <= now {
+            *e = TimeWait { in_use: true, port, expires: deadline };
+            return;
+        }
+    }
+    // Table full of live reservations — fail open, as documented above.
+}
+
+/// Copy the still-live reservations into `out`, returning how many. Taken
+/// before any other server lock so TIME_WAIT stays a leaf; the answer is a
+/// snapshot, which is all a bind decision needs.
+fn time_wait_snapshot(out: &mut [u16; MAX_TIME_WAIT]) -> usize {
+    let now = sched::ticks();
+    let mut tw = TIME_WAIT.lock();
+    let mut n = 0;
+    for e in tw.iter_mut() {
+        if !e.in_use { continue; }
+        if e.expires <= now { e.in_use = false; continue; } // lazily reaped
+        out[n] = e.port;
+        n += 1;
+    }
+    n
+}
+
 // ── Message helpers ───────────────────────────────────────────────────────────
 
 #[inline]
@@ -359,12 +418,17 @@ struct SockEntry {
     /// SOCK_NONBLOCK / fcntl(F_SETFL, O_NONBLOCK): empty/full rings return
     /// EAGAIN to the caller instead of the kernel read/write loop blocking.
     nonblock:   bool,
+    /// SO_REUSEADDR. The one thing it is consulted for here is whether bind()
+    /// may take a port still parked in TIME_WAIT — which is the reason a real
+    /// server sets it at all. It is recorded per socket and must be set before
+    /// bind(), as on Linux.
+    reuseaddr:  bool,
 }
 
 impl SockEntry {
     const fn empty() -> Self {
         Self { state: SockState::None, in_use: false, bound_port: 0, domain: 0,
-               sock_type: 0, cloexec: false, nonblock: false }
+               sock_type: 0, cloexec: false, nonblock: false, reuseaddr: false }
     }
 }
 
@@ -439,13 +503,17 @@ fn is_loopback_addr(addr: IpAddress) -> bool {
 /// or a `connect()` from an unbound socket. "Free" means no socket in any
 /// process table claims it. Caller holds SOCK_TABLES; this only reads it, so it
 /// must run before the caller borrows its own table mutably.
-fn alloc_ephemeral_port(tbls: &[ProcSockTable]) -> Option<u16> {
+/// `reserved` is a `time_wait_snapshot` taken by the caller before it locked
+/// SOCK_TABLES: an automatic port must skip a port still in TIME_WAIT, and the
+/// snapshot is what keeps TIME_WAIT from being locked underneath SOCK_TABLES.
+fn alloc_ephemeral_port(tbls: &[ProcSockTable], reserved: &[u16]) -> Option<u16> {
     const EPHEMERAL_LO: u32 = 32768;
     const EPHEMERAL_HI: u32 = 60999;
     let span  = EPHEMERAL_HI - EPHEMERAL_LO + 1;
     let start = (sched::ticks() as u32) % span;
     for i in 0..span {
         let p = (EPHEMERAL_LO + (start + i) % span) as u16;
+        if reserved.contains(&p) { continue; }
         let taken = tbls.iter().any(|t| t.in_use
             && t.socks.iter().any(|s| s.in_use && s.bound_port == p));
         if !taken { return Some(p); }
@@ -938,7 +1006,9 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         NET_SOCKETPAIR  => handle_socketpair(caller_pid, arg(msg,0) as usize,
                                              arg(msg,1) as usize, arg(msg,2) as usize,
                                              arg(msg,3) as usize),
-        NET_SETSOCKOPT  => ok_reply(),
+        NET_SETSOCKOPT  => handle_setsockopt(caller_pid, arg(msg,0) as usize,
+                                             arg(msg,1) as usize, arg(msg,2) as usize,
+                                             arg(msg,3) as usize, arg(msg,4) as usize),
         NET_GETSOCKOPT  => handle_getsockopt(caller_pid, arg(msg,0) as usize,
                                              arg(msg,1) as usize, arg(msg,2) as usize,
                                              arg(msg,3) as usize, arg(msg,4) as usize),
@@ -981,6 +1051,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         sock_type:  sock_type as u8,
         cloexec:    sock_type & 0x80000 != 0, // SOCK_CLOEXEC
         nonblock:   sock_type & 0x800 != 0,    // SOCK_NONBLOCK
+        reuseaddr:  false,                     // set by setsockopt, before bind
     };
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
@@ -1017,7 +1088,27 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
                 if !held { return err_reply(-99); } // EADDRNOTAVAIL
             }
 
+            // TIME_WAIT is a leaf lock, so its snapshot is taken before
+            // SOCK_TABLES and never underneath it.
+            let mut resv = [0u16; MAX_TIME_WAIT];
+            let nresv = time_wait_snapshot(&mut resv);
+
             let mut tbls = SOCK_TABLES.lock();
+            // SO_REUSEADDR is read through a shared borrow, before the mutable
+            // one below.
+            let reuseaddr = tbls.iter()
+                .find(|t| t.in_use && t.pid == pid)
+                .map(|t| slot < MAX_SOCKS && t.socks[slot].in_use && t.socks[slot].reuseaddr)
+                .unwrap_or(false);
+            // An explicit port whose last connection closed less than 2*MSL ago
+            // is EADDRINUSE unless the caller asked for SO_REUSEADDR — the
+            // Linux answer, and the reason every server sets that option.
+            // Note this deliberately does NOT add a conflict check against
+            // *live* bound ports: bind() has never had one, and giving it one
+            // is a much larger behaviour change than the TIME_WAIT divergence.
+            if port != 0 && !reuseaddr && resv[..nresv].contains(&port) {
+                return err_reply(-98); // EADDRINUSE
+            }
             // Port 0 means "any free port". Assigning it *here* rather than at
             // listen() is what makes bind("127.0.0.1:0") — i.e. every
             // mio/tokio TcpListener::bind — work: listen() rejects a still-zero
@@ -1027,7 +1118,9 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
             let port = if port != 0 {
                 port
             } else {
-                match alloc_ephemeral_port(&*tbls) {
+                // An automatic port skips TIME_WAIT regardless of SO_REUSEADDR:
+                // the caller asked for "any free port", not for that one.
+                match alloc_ephemeral_port(&*tbls, &resv[..nresv]) {
                     Some(p) => p,
                     None    => return err_reply(-98), // EADDRINUSE: range exhausted
                 }
@@ -1221,6 +1314,9 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     sock_type: SOCK_STREAM as u8,
                     cloexec: acc_cloexec,
                     nonblock: acc_nonblock,
+                    // An accepted socket is never bind()ed, so the flag has no
+                    // consumer on it.
+                    reuseaddr: false,
                 };
                 new_slot
             };
@@ -1286,6 +1382,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                         sock_type,
                         cloexec:    acc_cloexec,
                         nonblock:   acc_nonblock,
+                        reuseaddr:  false,
                     };
 
                     for t in tbls.iter_mut() {
@@ -1349,10 +1446,14 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         // later send/recv/poll/close looks in the same socket set.
         let lo = is_loopback_addr(remote_ip);
 
+        // TIME_WAIT snapshot before SOCK_TABLES — the leaf-lock rule again.
+        let mut resv = [0u16; MAX_TIME_WAIT];
+        let nresv = time_wait_snapshot(&mut resv);
+
         let mut tbls = SOCK_TABLES.lock();
         // Source port for a socket that never bound. Picked before this
         // process's table is borrowed mutably, since it reads every table.
-        let ephemeral = alloc_ephemeral_port(&*tbls);
+        let ephemeral = alloc_ephemeral_port(&*tbls, &resv[..nresv]);
         let tbl = match find_tbl(pid, &mut *tbls) {
             Some(t) => t, None => return err_reply(-9),
         };
@@ -1508,7 +1609,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_a] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: true },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
-        cloexec, nonblock,
+        cloexec, nonblock, reuseaddr: false,
     };
     let slot_b = match tbl.alloc() { Some(s) => s, None => {
         tbl.socks[slot_a] = SockEntry::empty(); return err_reply(-24);
@@ -1516,7 +1617,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_b] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: false },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
-        cloexec, nonblock,
+        cloexec, nonblock, reuseaddr: false,
     };
     unsafe {
         core::ptr::write(sv_ptr as *mut u32, (slot_a + SOCK_FD_BASE) as u32);
@@ -2252,6 +2353,38 @@ fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
     ok_reply()
 }
 
+/// setsockopt was a bare `ok_reply()` for every option, and stays that way for
+/// every option but one: SO_REUSEADDR now has to be recorded, because bind()
+/// consults it to decide whether a port still in TIME_WAIT may be taken.
+/// Without that, adding TIME_WAIT would *break* the very restart it models —
+/// Linux lets a server with SO_REUSEADDR rebind its port immediately.
+///
+/// Everything else keeps answering success. Unlike getsockopt (where a bogus
+/// success makes the caller read an unwritten buffer — the zbus SO_PEERPIDFD
+/// trap), a setsockopt that quietly ignores an option it does not implement
+/// only loses a tuning knob, and turning those into ENOPROTOOPT would be an
+/// unrelated behaviour change.
+fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
+                     optval_ptr: usize, optlen: usize) -> Message {
+    const SO_REUSEADDR: usize = 2;
+    if level == SOL_SOCKET as usize && optname == SO_REUSEADDR {
+        // The int is read out of user memory before any server lock is taken:
+        // a demand-paging fault under SOCK_TABLES would re-enter the scheduler
+        // with a server lock held.
+        let on = optval_ptr != 0 && optlen >= 4
+            && unsafe { (optval_ptr as *const u32).read_unaligned() } != 0;
+        let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
+        let mut tbls = SOCK_TABLES.lock();
+        let tbl = match find_tbl(pid, &mut *tbls) {
+            Some(t) => t, None => return err_reply(-9),
+        };
+        if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+        tbl.socks[slot].reuseaddr = on;
+        return ok_reply();
+    }
+    ok_reply()
+}
+
 fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                      optval_ptr: usize, optlen_ptr: usize) -> Message {
     // SO_PEERCRED: report the peer end's captured {pid,uid,gid} (struct ucred).
@@ -2478,12 +2611,43 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
             if end_closed { sched::wake_poll(); }
         }
         SockState::InetConnected { socket_handle, lo, .. } => {
+            let sock_type = tbl.socks[slot].sock_type;
             tbl.socks[slot] = SockEntry::empty();
             drop(tbls);
-            let mut stack = stack_for(lo);
-            if let Some(ref mut s) = *stack {
-                s.socket_set.remove(socket_handle);
+            // The port to park, decided under the stack lock and acted on after
+            // it: TIME_WAIT is a leaf lock.
+            let mut park = None;
+            {
+                let mut stack = stack_for(lo);
+                if let Some(ref mut s) = *stack {
+                    // Only a TCP socket has a `tcp::Socket` behind the handle —
+                    // `get` on the wrong socket type panics, and a connected
+                    // UDP socket lands in this same arm.
+                    if sock_type == SOCK_STREAM as u8 {
+                        let sk = s.socket_set.get::<tcp::Socket>(socket_handle);
+                        // Only the side that closes an established connection
+                        // *first* goes through TIME_WAIT. CloseWait/LastAck mean
+                        // the peer's FIN already arrived, so this is the passive
+                        // close and Linux goes straight to CLOSED. Closed/Listen/
+                        // SynSent/SynReceived never established.
+                        let active_close = matches!(sk.state(),
+                            tcp::State::Established | tcp::State::FinWait1
+                            | tcp::State::FinWait2  | tcp::State::Closing
+                            | tcp::State::TimeWait);
+                        // The local port is read from smoltcp rather than from
+                        // `bound_port`, which `handle_accept` leaves at 0 on an
+                        // accepted socket — and an accepted socket sharing the
+                        // listener's port is exactly what makes a restarted
+                        // server hit EADDRINUSE on Linux.
+                        if active_close { park = sk.local_endpoint().map(|e| e.port); }
+                    }
+                    // The socket is still torn down here rather than being left
+                    // to run smoltcp's own TIME-WAIT: what is modelled is the
+                    // port reservation, not the protocol state.
+                    s.socket_set.remove(socket_handle);
+                }
             }
+            if let Some(p) = park { time_wait_add(p); }
         }
         SockState::InetListening { main, lo, .. } => {
             tbl.socks[slot] = SockEntry::empty();

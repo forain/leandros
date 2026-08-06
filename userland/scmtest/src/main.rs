@@ -96,6 +96,10 @@ use leandros_libc::syscall::{nr, syscall1, syscall2, syscall3, syscall4, syscall
 // Numbers match kernel/src/syscall.rs `mod nr`.
 #[cfg(target_arch = "aarch64")] const SYS_GETSOCKNAME:   usize = 204;
 #[cfg(target_arch = "x86_64")]  const SYS_GETSOCKNAME:   usize = 51;
+// setsockopt(2): SO_REUSEADDR is what lets a bind take a port still in
+// TIME_WAIT. Numbers match kernel/src/syscall.rs `mod nr`.
+#[cfg(target_arch = "aarch64")] const SYS_SETSOCKOPT:    usize = 208;
+#[cfg(target_arch = "x86_64")]  const SYS_SETSOCKOPT:    usize = 54;
 
 // epoll_event wire layout must match the kernel's per-arch struct exactly
 // (kernel/src/syscall.rs EPOLL_EVENT_SIZE/EPOLL_EVENT_DATA_OFF): x86_64 uses the
@@ -291,6 +295,17 @@ const S_IFSOCK: u32 = 0o140000;
 const S_IFDIR: u32 = 0o040000;
 const ETOOMANYREFS: i32 = 109;
 const EMFILE: i32 = 24;
+const EADDRINUSE: i32 = 98;
+/// setsockopt level/option for SO_REUSEADDR (Linux, both arches).
+const SOL_SOCKET_OPT: i32 = 1;
+const SO_REUSEADDR: i32 = 2;
+
+/// setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &1, 4).
+unsafe fn set_reuseaddr(fd: i32) -> isize {
+    let on: u32 = 1;
+    xret(syscall6(SYS_SETSOCKOPT, fd as usize, SOL_SOCKET_OPT as usize,
+                  SO_REUSEADDR as usize, &on as *const u32 as usize, 4, 0))
+}
 
 #[repr(C, align(8))]
 struct StatBuf { b: [u8; 144] }
@@ -673,6 +688,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     // ── AF_INET TCP over the loopback interface ────────────────
     if !test_inet_loopback_tcp() { failures += 1; }
     if !test_inet_listen_twice() { failures += 1; }
+    if !test_tcp_time_wait() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
@@ -1981,5 +1997,145 @@ unsafe fn test_scm_import_emfile_single_release() -> bool {
         && post == -1 && post_errno == EAGAIN;
 
     close(a); close(b); close(rd); close(wr);
+    report(name, ok)
+}
+
+/// A closed TCP connection must hold its port in TIME_WAIT.
+///
+/// `handle_close` used to `socket_set.remove()` the socket and clear the fd
+/// slot, and nothing anywhere remembered the port — so a server could be
+/// restarted onto the port it had just been serving on, instantly, where Linux
+/// answers EADDRINUSE for 2*MSL (`TCP_TIMEWAIT_LEN`, a fixed 60 s). What is
+/// modelled is the port reservation, not the protocol state; nothing lingers to
+/// absorb a late segment.
+///
+/// The port that matters is the *accepted* socket's, not the listener's: an
+/// accepted socket shares the listener's local port, and it is that reservation
+/// which makes a restarted server fail to rebind on Linux. Closing the listener
+/// reserves nothing.
+///
+/// Five assertions. Exactly ONE of them, (b), reads differently against an
+/// unpatched kernel — there the rebind returns 0 instead of -1/EADDRINUSE.
+/// Delete the `if let Some(p) = park { time_wait_add(p); }` line at the end of
+/// the `InetConnected` arm of `handle_close` and (b) flips back to 0. The other
+/// four are shape guards that pass at HEAD too and are deliberately NOT counted
+/// as evidence the fix is live:
+///   (c) SO_REUSEADDR must lift the reservation — otherwise adding TIME_WAIT
+///       would break the restart it models, since a real server sets that
+///       option precisely so it *can* rebind.
+///   (d) an unrelated bind-to-zero still gets a port, so the fix cannot be
+///       "refuse binds".
+///   (e) a listener that never carried a connection frees its port at once; a
+///       fix that parked every closed port would fail here while still
+///       passing (b).
+unsafe fn test_tcp_time_wait() -> bool {
+    let name = b"tcp_time_wait\0";
+
+    // (a) Set up and complete one real connection over 127.0.0.1.
+    let srv = raw_socket(AF_INET, SOCK_STREAM, 0);
+    if srv < 0 { return report(name, false); }
+    let ba = sockaddr_in::new([127, 0, 0, 1], 0);
+    if raw_bind_in(srv, &ba) != 0 {
+        dbg1(b"[tw] bind failed errno=%d\n\0", get_errno() as i64);
+        close(srv);
+        return report(name, false);
+    }
+    let mut sa = sockaddr_in::new([0, 0, 0, 0], 0);
+    let mut slen: u32 = 16;
+    if raw_getsockname(srv, &mut sa, &mut slen) != 0 { close(srv); return report(name, false); }
+    let port = u16::from_be(sa.sin_port);
+    if port == 0 || raw_listen(srv, 8) != 0 { close(srv); return report(name, false); }
+
+    let cli = raw_socket(AF_INET, SOCK_STREAM, 0);
+    if cli < 0 { close(srv); return report(name, false); }
+    let ca = sockaddr_in::new([127, 0, 0, 1], port);
+    if raw_connect_in(cli, &ca) != 0 {
+        dbg1(b"[tw] connect failed errno=%d\n\0", get_errno() as i64);
+        close(srv); close(cli);
+        return report(name, false);
+    }
+    // accept() only succeeds once smoltcp reports Established, so reaching here
+    // is what proves the connection this test then closes was a real one.
+    let mut acc = -1;
+    let mut tries = 0;
+    while tries < 100 {
+        sleep_ms(20);
+        acc = xret(syscall3(SYS_ACCEPT, srv as usize, 0, 0)) as i32;
+        if acc >= 0 || get_errno() != EAGAIN { break; }
+        tries += 1;
+    }
+    if acc < 0 {
+        dbg2(b"[tw] accept failed after %d tries errno=%d\n\0", tries as i64, get_errno() as i64);
+        close(srv); close(cli);
+        return report(name, false);
+    }
+
+    // The server side closes first — the active close, the only side that goes
+    // through TIME_WAIT. Its local port is `port`.
+    close(acc);
+    close(cli);
+    close(srv);
+
+    // (b) THE assertion: the port is reserved, so a plain rebind is refused.
+    let rb = raw_socket(AF_INET, SOCK_STREAM, 0);
+    if rb < 0 { return report(name, false); }
+    let pa = sockaddr_in::new([127, 0, 0, 1], port);
+    let b_rc = raw_bind_in(rb, &pa);
+    let b_errno = get_errno();
+    close(rb);
+    dbg2(b"[tw] (b) rebind rc=%d errno=%d (want -1 98; 0 = NO TIME_WAIT)\n\0",
+         b_rc as i64, b_errno as i64);
+
+    // (c) …but SO_REUSEADDR takes it anyway, as it does on Linux.
+    let ru = raw_socket(AF_INET, SOCK_STREAM, 0);
+    if ru < 0 { return report(name, false); }
+    let so = set_reuseaddr(ru);
+    let c_rc = raw_bind_in(ru, &pa);
+    let c_errno = get_errno();
+    close(ru);
+    dbg2(b"[tw] (c) setsockopt=%d reuse-rebind rc=%d (want 0 0)\n\0",
+         so as i64, c_rc as i64);
+    if c_rc != 0 { dbg1(b"[tw] (c) errno=%d\n\0", c_errno as i64); }
+
+    // (d) An unrelated automatic bind still works and does not collide.
+    let other = raw_socket(AF_INET, SOCK_STREAM, 0);
+    if other < 0 { return report(name, false); }
+    let d_rc = raw_bind_in(other, &ba);
+    let mut sa2 = sockaddr_in::new([0, 0, 0, 0], 0);
+    let mut slen2: u32 = 16;
+    let d_gs = raw_getsockname(other, &mut sa2, &mut slen2);
+    let other_port = u16::from_be(sa2.sin_port);
+    close(other);
+    dbg2(b"[tw] (d) fresh bind rc=%d port=%d (want 0 and != reserved)\n\0",
+         d_rc as i64, other_port as i64);
+
+    // (e) A listener that never carried a connection reserves nothing.
+    let ls = raw_socket(AF_INET, SOCK_STREAM, 0);
+    if ls < 0 { return report(name, false); }
+    let mut e_ok = false;
+    let mut sa3 = sockaddr_in::new([0, 0, 0, 0], 0);
+    let mut slen3: u32 = 16;
+    if raw_bind_in(ls, &ba) == 0
+       && raw_getsockname(ls, &mut sa3, &mut slen3) == 0
+       && raw_listen(ls, 8) == 0 {
+        let lport = u16::from_be(sa3.sin_port);
+        close(ls);
+        let ls2 = raw_socket(AF_INET, SOCK_STREAM, 0);
+        if ls2 >= 0 {
+            let la = sockaddr_in::new([127, 0, 0, 1], lport);
+            let e_rc = raw_bind_in(ls2, &la);
+            dbg2(b"[tw] (e) idle-listener port=%d rebind rc=%d (want 0)\n\0",
+                 lport as i64, e_rc as i64);
+            e_ok = e_rc == 0;
+            close(ls2);
+        }
+    } else {
+        close(ls);
+    }
+
+    let ok = b_rc == -1 && b_errno == EADDRINUSE
+        && so == 0 && c_rc == 0
+        && d_rc == 0 && d_gs == 0 && other_port != 0 && other_port != port
+        && e_ok;
     report(name, ok)
 }
