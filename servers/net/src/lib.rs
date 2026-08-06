@@ -71,6 +71,11 @@ pub const AF_INET:    usize = 2;
 pub const SOCK_STREAM: usize = 1;
 pub const SOCK_DGRAM:  usize = 2;
 pub const SOCK_RAW:    usize = 3;
+pub const SOCK_SEQPACKET: usize = 5;
+/// EOPNOTSUPP. `unix_listen` answers this — not EINVAL — for a socket type that
+/// cannot accept, and it checks the type *before* the address, so even a bound
+/// AF_UNIX SOCK_DGRAM socket gets EOPNOTSUPP.
+const EOPNOTSUPP: i32 = 95;
 
 pub const IPPROTO_ICMP: usize = 1;
 
@@ -1248,14 +1253,49 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
         tbl.socks[slot].state = SockState::InetListening { main, lo, local };
         ok_reply()
     } else {
-        // AF_UNIX: `handle_bind` is what marks the socket UnixListening, so
-        // listen() here is a pure acknowledgement and is already idempotent —
-        // a repeat listen() answers success, as Linux does. It is also laxer
-        // than Linux in the other direction: listen() on an unbound or
-        // already-connected AF_UNIX socket returns success where Linux
-        // answers EINVAL. Tightening that is a behaviour change for every
-        // AF_UNIX server on the system and is deliberately not bundled here.
-        ok_reply()
+        // AF_UNIX. `unix_listen` (net/unix/af_unix.c) gates in this order:
+        //
+        //   1. sock->type is neither SOCK_STREAM nor SOCK_SEQPACKET
+        //                                        -> EOPNOTSUPP (not EINVAL)
+        //   2. u->addr is NULL (never bound)      -> EINVAL
+        //   3. sk_state is neither TCP_CLOSE nor TCP_LISTEN
+        //                                        -> EINVAL
+        //
+        // `sock_type` is stored as `sock_type as u8`, and both SOCK_CLOEXEC
+        // (0x80000) and SOCK_NONBLOCK (0x800) live above bit 7, so the
+        // truncation already leaves the bare type here.
+        let ty = tbl.socks[slot].sock_type;
+        if ty != SOCK_STREAM as u8 && ty != SOCK_SEQPACKET as u8 {
+            return err_reply(-EOPNOTSUPP);
+        }
+        match tbl.socks[slot].state {
+            // `handle_bind` is what marks an AF_UNIX socket UnixListening, so
+            // this server has one state where Linux has two: "bound, still
+            // TCP_CLOSE" and "already TCP_LISTEN". Linux answers 0 to both —
+            // a repeat listen() only updates sk_max_ack_backlog — so
+            // collapsing them onto one success arm is faithful, and listen()
+            // stays idempotent. Nothing is re-armed: bind() already published
+            // the address, and re-running any of it would be the same
+            // orphaned-listener bug `07d461c` avoided on the AF_INET side.
+            SockState::UnixListening { .. } => ok_reply(),
+            // Everything else is EINVAL:
+            //   Unbound            — never bound, Linux's `!u->addr` gate.
+            //   UnixConnected      — a socketpair end, an accepted socket, or
+            //                        a connector the listener has paired:
+            //                        TCP_ESTABLISHED on Linux.
+            //   UnixPendingAccept  — our connect() has *already* returned 0,
+            //                        and `unix_stream_connect` sets
+            //                        TCP_ESTABLISHED before it returns 0, so
+            //                        this is TCP_ESTABLISHED too. AF_UNIX
+            //                        stream connect never reports EINPROGRESS,
+            //                        so there is no separate "connecting"
+            //                        state to answer differently.
+            //   Inet*/Icmp*/None   — unreachable for an AF_UNIX socket, but a
+            //                        bind() handed a sockaddr_in on an AF_UNIX
+            //                        fd can leave InetBound here; EINVAL is
+            //                        the right answer for that too.
+            _ => err_reply(-22),
+        }
     }
 }
 

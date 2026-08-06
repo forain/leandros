@@ -164,6 +164,10 @@ const MSG_CMSG_CLOEXEC: i32 = 0x40000000;
 const AF_UNIX: i32 = 1;
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
+const SOCK_DGRAM: i32 = 2;
+/// `unix_listen` answers EOPNOTSUPP — not EINVAL — for a socket type that
+/// cannot accept, and it checks the type before the address.
+const EOPNOTSUPP: i32 = 95;
 
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
@@ -675,6 +679,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_socket_node_roundtrip() { failures += 1; }
     if !test_socket_node_devshm() { failures += 1; }
     if !test_unlink_rebind() { failures += 1; }
+    if !test_unix_listen_strict() { failures += 1; }
     if !test_many_socketpairs_and_listeners() { failures += 1; }
     if !test_tmpfs_mounts_exist() { failures += 1; }
     if !test_devshm_shared_mmap() { failures += 1; }
@@ -1523,6 +1528,132 @@ unsafe fn test_unlink_rebind() -> bool {
     close(cs3); close(ls2); close(asf); close(cs); close(ls);
     unlink(cpath.as_ptr());
     report(name, gone_ok && live_ok && rebind_ok)
+}
+
+/// `listen()` on AF_UNIX must refuse exactly the states Linux refuses.
+///
+/// The AF_UNIX arm of `handle_listen` used to be an unconditional
+/// `ok_reply()`, which made the *repeat* listen right by accident and
+/// everything else wrong. `unix_listen` (net/unix/af_unix.c) gates in a fixed
+/// order: a type that cannot accept is EOPNOTSUPP *before* the address is even
+/// looked at, a socket that never bound is EINVAL, and a socket whose
+/// `sk_state` is neither TCP_CLOSE nor TCP_LISTEN — i.e. any connected socket —
+/// is EINVAL.
+///
+/// Eight assertions. Five of them (a, d, e, f, g) return 0 against an
+/// unpatched kernel: with the AF_UNIX arm back to a bare `ok_reply()` every one
+/// of them reads rc=0 where it wants rc=-1. Three (b, c, h) pass both before
+/// and after — they are here so that "make AF_UNIX listen() always fail" or
+/// "re-arm the address on every listen()" cannot pass this test, and they are
+/// deliberately NOT counted as evidence the fix is live.
+///
+/// (g) is also what pins the gate *order*: an unbound SOCK_DGRAM socket is
+/// unbound as well as untyped, so a fix that ran the state match before the
+/// type check would answer 22 there instead of 95.
+unsafe fn test_unix_listen_strict() -> bool {
+    let name = b"unix_listen_strict\0";
+    let path = b"/tmp/scmtest_listen_strict";
+    let cpath = b"/tmp/scmtest_listen_strict\0";
+    // A node left by an earlier run would make bind() EADDRINUSE on a dirty
+    // image; the socket file outlives its listener on Linux and here.
+    unlink(cpath.as_ptr());
+    let (addr, alen) = sockaddr_un::from_path(path);
+
+    // (a) Never bound. Linux: `!u->addr` → EINVAL.
+    let ub = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    if ub < 0 { return report(name, false); }
+    let a_rc = raw_listen(ub, 8);
+    let a_errno = get_errno();
+    close(ub);
+    dbg2(b"[uls] (a) unbound listen rc=%d errno=%d (want -1 22)\n\0",
+         a_rc as i64, a_errno as i64);
+
+    // (g) Unbound SOCK_DGRAM. Linux checks the type first, so this is
+    // EOPNOTSUPP and not the EINVAL an unbound STREAM socket gets.
+    let dg = raw_socket(AF_UNIX, SOCK_DGRAM, 0);
+    if dg < 0 { return report(name, false); }
+    let g_rc = raw_listen(dg, 8);
+    let g_errno = get_errno();
+    close(dg);
+    dbg2(b"[uls] (g) dgram listen rc=%d errno=%d (want -1 95)\n\0",
+         g_rc as i64, g_errno as i64);
+
+    // (b) The ordinary server sequence still works.
+    let ls = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    if ls < 0 { unlink(cpath.as_ptr()); return report(name, false); }
+    if raw_bind(ls, &addr, alen) != 0 {
+        dbg1(b"[uls] bind failed errno=%d\n\0", get_errno() as i64);
+        close(ls); unlink(cpath.as_ptr());
+        return report(name, false);
+    }
+    let b_rc = raw_listen(ls, 8);
+    // (c) …and is still idempotent, with a different backlog.
+    let c_rc = raw_listen(ls, 16);
+    dbg2(b"[uls] (b,c) listen rc=%d repeat rc=%d (want 0 0)\n\0",
+         b_rc as i64, c_rc as i64);
+
+    // (d) A socketpair end is connected and unbound: EINVAL either way on
+    // Linux, and the state arm is what produces it here.
+    let mut sv = [0i32; 2];
+    let d_ok = if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) == 0 {
+        let rc = raw_listen(sv[0], 8);
+        let e = get_errno();
+        dbg2(b"[uls] (d) socketpair listen rc=%d errno=%d (want -1 22)\n\0",
+             rc as i64, e as i64);
+        close(sv[0]); close(sv[1]);
+        rc == -1 && e == EINVAL
+    } else {
+        dbg0(b"[uls] socketpair failed\n\0");
+        false
+    };
+
+    // (e) A connector whose connect() has returned but which the listener has
+    // not accepted yet — `UnixPendingAccept`. `unix_stream_connect` sets
+    // TCP_ESTABLISHED before returning 0, so Linux is EINVAL here too.
+    let cs = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    if cs < 0 { close(ls); unlink(cpath.as_ptr()); return report(name, false); }
+    if raw_connect(cs, &addr, alen) != 0 {
+        dbg1(b"[uls] connect failed errno=%d\n\0", get_errno() as i64);
+        close(cs); close(ls); unlink(cpath.as_ptr());
+        return report(name, false);
+    }
+    let e_rc = raw_listen(cs, 8);
+    let e_errno = get_errno();
+    dbg2(b"[uls] (e) pending-accept listen rc=%d errno=%d (want -1 22)\n\0",
+         e_rc as i64, e_errno as i64);
+
+    // (f) The accepted socket — `UnixConnected`, TCP_ESTABLISHED.
+    let asf = raw_accept(ls);
+    if asf < 0 {
+        dbg1(b"[uls] accept failed errno=%d\n\0", get_errno() as i64);
+        close(cs); close(ls); unlink(cpath.as_ptr());
+        return report(name, false);
+    }
+    let f_rc = raw_listen(asf, 8);
+    let f_errno = get_errno();
+    dbg2(b"[uls] (f) accepted-socket listen rc=%d errno=%d (want -1 22)\n\0",
+         f_rc as i64, f_errno as i64);
+
+    // (h) The listener is untouched by all of the above and still accepts.
+    let cs2 = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    let h_conn = if cs2 >= 0 { raw_connect(cs2, &addr, alen) } else { -1 };
+    let as2 = if h_conn == 0 { raw_accept(ls) } else { -1 };
+    dbg2(b"[uls] (h) second connect=%d accept=%d (want 0 and >=0)\n\0",
+         h_conn as i64, as2 as i64);
+
+    let ok = a_rc == -1 && a_errno == EINVAL
+        && g_rc == -1 && g_errno == EOPNOTSUPP
+        && b_rc == 0 && c_rc == 0
+        && d_ok
+        && e_rc == -1 && e_errno == EINVAL
+        && f_rc == -1 && f_errno == EINVAL
+        && h_conn == 0 && as2 >= 0;
+
+    if as2 >= 0 { close(as2); }
+    if cs2 >= 0 { close(cs2); }
+    close(asf); close(cs); close(ls);
+    unlink(cpath.as_ptr());
+    report(name, ok)
 }
 
 /// 64 concurrent socketpairs + 32 concurrent bound listeners, each passing its
