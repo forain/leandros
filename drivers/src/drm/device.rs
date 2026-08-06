@@ -389,6 +389,129 @@ impl DrmDevice {
         Ok(())
     }
 
+    /// Present `fb_id` copying only the damaged sub-rectangles of it.
+    ///
+    /// `rects` are half-open `(x1, y1, x2, y2)` in **framebuffer** (source)
+    /// coordinates — exactly the `struct drm_mode_rect` array an
+    /// FB_DAMAGE_CLIPS blob carries, and the space smithay emits them in
+    /// (`backend/drm/surface/mod.rs`, `PlaneDamageClips::from_damage`).
+    ///
+    /// The contract this relies on is the one FB_DAMAGE_CLIPS defines: outside
+    /// the clip list the scanout is already correct. That holds here because we
+    /// always composite into the same persistent resource 1, so "the scanout"
+    /// is literally the previous frame's image. If a client's damage tracking
+    /// were wrong the result is stale pixels on screen, not a crash — which is
+    /// why the verification plan for this includes a screenshot, not just
+    /// counters.
+    ///
+    /// One `gpu.flush` over the bounding union rather than one per rect:
+    /// `send_command_raw` costs two virtio commands plus two buddy alloc/frees
+    /// and a bounded spin per call, so a handful of small rects are cheaper to
+    /// flush together than separately.
+    pub fn present_damaged(
+        &mut self,
+        fb_id: DrmObjectId,
+        rects: &[(i32, i32, i32, i32)],
+    ) -> Result<(), DriverError> {
+        if !self.fb_integration { return Ok(()); }
+
+        let drm_fb = self.framebuffers.get(&fb_id).ok_or(DriverError::NotFound)?;
+        let (hw_base, hw_width, hw_height, hw_pitch) =
+            crate::framebuffer::get_hardware_fb_info().ok_or(DriverError::NotFound)?;
+
+        let src_phys = drm_fb.physical_addresses[0];
+        if src_phys == 0 { return Ok(()); } // No buffer bound
+
+        let src_w = drm_fb.width as usize;
+        let src_h = drm_fb.height as usize;
+        let dst_w = hw_width as usize;
+        let dst_h = hw_height as usize;
+        if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+
+        let src_ptr = mm::phys_to_virt(src_phys as usize) as *const u32;
+        let dst_ptr = mm::phys_to_virt(hw_base as usize) as *mut u32;
+        let dst_stride = (hw_pitch as usize) / 4;
+
+        // Bounding union, in destination coordinates, for the single flush.
+        let (mut ux0, mut uy0, mut ux1, mut uy1) = (dst_w, dst_h, 0usize, 0usize);
+
+        for &(x1, y1, x2, y2) in rects {
+            // Clamp into the source surface and drop degenerate/inverted rects
+            // rather than rejecting the commit: a bad clip list is a hint we
+            // are free to ignore, and failing here would stall the compositor.
+            let sx0 = x1.max(0) as usize;
+            let sy0 = y1.max(0) as usize;
+            let sx1 = (x2.max(0) as usize).min(src_w);
+            let sy1 = (y2.max(0) as usize).min(src_h);
+            if sx0 >= sx1 || sy0 >= sy1 { continue; }
+
+            // Map forward into destination space, rounding the far edge up so
+            // integer division can never shave off the last column or row.
+            let dx0 = sx0 * dst_w / src_w;
+            let dy0 = sy0 * dst_h / src_h;
+            let dx1 = ((sx1 * dst_w) + src_w - 1) / src_w;
+            let dy1 = ((sy1 * dst_h) + src_h - 1) / src_h;
+            let dx1 = dx1.min(dst_w);
+            let dy1 = dy1.min(dst_h);
+            if dx0 >= dx1 || dy0 >= dy1 { continue; }
+
+            if src_w == dst_w && src_h == dst_h {
+                for y in dy0..dy1 {
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            src_ptr.add(y * src_w + dx0),
+                            dst_ptr.add(y * dst_stride + dx0),
+                            dx1 - dx0,
+                        );
+                    }
+                }
+            } else {
+                // Same nearest-neighbour mapping perform_software_scaling uses,
+                // restricted to the damaged rows/columns. The two must agree
+                // pixel for pixel or a damaged present and a full present would
+                // produce different images.
+                for dy in dy0..dy1 {
+                    let sy = (dy * src_h) / dst_h;
+                    unsafe {
+                        let src_row = src_ptr.add(sy * src_w);
+                        let dst_row = dst_ptr.add(dy * dst_stride);
+                        for dx in dx0..dx1 {
+                            let sx = (dx * src_w) / dst_w;
+                            *dst_row.add(dx) = *src_row.add(sx);
+                        }
+                    }
+                }
+            }
+
+            if dx0 < ux0 { ux0 = dx0; }
+            if dy0 < uy0 { uy0 = dy0; }
+            if dx1 > ux1 { ux1 = dx1; }
+            if dy1 > uy1 { uy1 = dy1; }
+        }
+
+        if ux0 >= ux1 || uy0 >= uy1 {
+            // Every rect was empty after clamping: nothing to show the host.
+            return Ok(());
+        }
+
+        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+            if !gpu.flush(1, ux0 as u32, uy0 as u32, (ux1 - ux0) as u32, (uy1 - uy0) as u32) {
+                crate::pci::rdebug("[DRM] damaged gpu.flush FAILED\n");
+            }
+        } else {
+            crate::pci::rdebug("[DRM] no VirtIO GPU available for damaged flush\n");
+        }
+
+        // Only the bound framebuffer changes on a damaged present; geometry and
+        // crtc binding were set by the full present that preceded it.
+        if let Some(plane) = self.planes.first_mut() {
+            plane.fb_id = Some(fb_id);
+        }
+        Ok(())
+    }
+
     /// Enable integration with existing KMS driver
     pub fn enable_kms_integration(&mut self) -> Result<(), DriverError> {
         // Try to detect and configure through existing KMS

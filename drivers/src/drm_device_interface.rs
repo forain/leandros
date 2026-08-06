@@ -1172,6 +1172,47 @@ static ATOMIC_TESTS: AtomicU64 = AtomicU64::new(0);
 /// different problem from the plane being tried and rejected.
 static CURSOR_PLANE_SEEN: AtomicU64 = AtomicU64::new(0);
 
+/// FB_DAMAGE_CLIPS accounting, all behind `DRM_STATS`.
+///
+/// These exist to settle a question no counter we had could answer. smithay
+/// keeps a skipped plane *in* the atomic request (`build_planes` filters on
+/// `!state.skip || state.config.is_some()`, and the skip branch clones the
+/// previous config verbatim), so "smithay decided the primary has no damage"
+/// and "smithay re-rendered the whole screen" arrive here as the same shaped
+/// ioctl. What tells them apart is the clip list:
+///
+/// * `dmg_full` climbing at the commit rate, `dmg_px` ~ W*H per present ⇒ the
+///   compositor is damaging the entire output every frame. The blocker is in
+///   its own damage tracker (buffer age / element history), not in us.
+/// * `dmg_rect` climbing with a small `dmg_px` ⇒ damage tracking works and this
+///   change is doing its job.
+/// * `dmg_skip` climbing ⇒ smithay is already skipping the primary plane and
+///   the recorded premise ("smithay still flips the primary every cursor
+///   frame") was an artefact of counting one flip per atomic commit.
+static DAMAGE_FULL: AtomicU64 = AtomicU64::new(0);
+static DAMAGE_RECT: AtomicU64 = AtomicU64::new(0);
+static DAMAGE_SKIP: AtomicU64 = AtomicU64::new(0);
+static DAMAGE_PX: AtomicU64 = AtomicU64::new(0);
+static BLOBS_CREATED: AtomicU64 = AtomicU64::new(0);
+
+/// Primary-plane state of the last commit we actually presented.
+///
+/// When smithay's damage tracker reports nothing to draw it sets
+/// `plane_state.skip` and copies the *previous* frame's plane config over the
+/// new one (`compositor/mod.rs:2320-2324`). The clip list lives behind an `Arc`
+/// on its side, so the copy keeps the same blob id. An incoming commit whose
+/// FB_ID **and** clip-blob id both match the last one we presented is therefore
+/// that exact case, and there is nothing new in the framebuffer to copy.
+///
+/// Blob id 0 means "no clip list", which is not a fingerprint — never skip on
+/// it.
+static LAST_PRIMARY_FB: AtomicU32 = AtomicU32::new(0);
+static LAST_PRIMARY_DAMAGE: AtomicU32 = AtomicU32::new(0);
+
+/// Past this many clips the per-rect bookkeeping and the widening union cost
+/// more than the full-surface copy they exist to avoid, so fall back to full.
+const MAX_DAMAGE_RECTS: usize = 64;
+
 // Committed crtc/connector state. Only used to decide whether an incoming
 // atomic request needs ALLOW_MODESET.
 static CRTC_ACTIVE: AtomicU32 = AtomicU32::new(0);
@@ -1193,6 +1234,48 @@ struct AtomicPlaneReq {
     crtc_w: Option<u32>,
     crtc_h: Option<u32>,
     damage_blob: Option<u32>,
+}
+
+/// Decode an FB_DAMAGE_CLIPS blob into half-open source rects.
+///
+/// The blob is an array of `struct drm_mode_rect { __s32 x1, y1, x2, y2; }` in
+/// framebuffer coordinates. `None` means "treat the whole surface as damaged" —
+/// the upstream meaning of an absent clip list and the only safe answer to a
+/// blob we cannot use. It is deliberately never an error: FB_DAMAGE_CLIPS is a
+/// hint, and rejecting the commit over one would stall the compositor.
+///
+/// Takes BLOBS and nothing else, touches no user memory, and must be called
+/// with the DRM device lock NOT held — the two are never nested in either
+/// direction.
+fn damage_rects(blob_id: u32) -> Option<Vec<(i32, i32, i32, i32)>> {
+    if blob_id == 0 { return None; }
+    let bytes = {
+        let blobs = BLOBS.lock();
+        let b = blobs.get(&blob_id)?;
+        if b.is_empty() || b.len() % 16 != 0 || b.len() > MAX_DAMAGE_RECTS * 16 {
+            return None;
+        }
+        b.clone()
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 16);
+    for c in bytes.chunks_exact(16) {
+        let rd = |o: usize| i32::from_ne_bytes([c[o], c[o + 1], c[o + 2], c[o + 3]]);
+        out.push((rd(0), rd(4), rd(8), rd(12)));
+    }
+    Some(out)
+}
+
+/// Total area of a clip list, saturating. Only used for the `DRM_STATS` line —
+/// it is what says "the compositor damaged 3 000 pixels" versus "it damaged the
+/// whole 1 024 000-pixel output and the clip list is decoration".
+fn damage_area(rects: &[(i32, i32, i32, i32)]) -> u64 {
+    let mut total = 0u64;
+    for &(x1, y1, x2, y2) in rects {
+        let w = (x2 as i64 - x1 as i64).max(0) as u64;
+        let h = (y2 as i64 - y1 as i64).max(0) as u64;
+        total = total.saturating_add(w.saturating_mul(h));
+    }
+    total
 }
 
 /// Resolve a dumb-buffer GEM handle to its physical base + buddy order, so the
@@ -1227,7 +1310,7 @@ static LAST_FLIP_DELIVER_TICK: AtomicU64 = AtomicU64::new(0);
 /// DIRTYFB is never used, and the kernel's own scale+flush costs only ~1.7 ms
 /// per flip. The ~1 fps pointer is therefore the compositor recompositing the
 /// whole screen in software, not anything in this path.
-pub const DRM_STATS: bool = false;
+pub const DRM_STATS: bool = true;
 static FLIPS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
 static DIRTYFB_CALLS: AtomicU64 = AtomicU64::new(0);
 static DIRTYFB_CLIPS: AtomicU64 = AtomicU64::new(0);
@@ -1287,6 +1370,18 @@ pub fn drm_tick() {
             crate::pci::serial_debug_hex_64(DIRTYFB_CLIPS.load(Ordering::Relaxed));
             crate::pci::serial_debug(" flip_us=");
             crate::pci::serial_debug_hex_64(FLIP_US_TOTAL.load(Ordering::Relaxed));
+            // Primary-plane damage. `flips_sub` now counts only presents that
+            // moved pixels, so `flips_sub < atomic` is the win this measures.
+            crate::pci::serial_debug(" dmg_full=");
+            crate::pci::serial_debug_hex_64(DAMAGE_FULL.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" dmg_rect=");
+            crate::pci::serial_debug_hex_64(DAMAGE_RECT.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" dmg_skip=");
+            crate::pci::serial_debug_hex_64(DAMAGE_SKIP.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" dmg_px=");
+            crate::pci::serial_debug_hex_64(DAMAGE_PX.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" blobs=");
+            crate::pci::serial_debug_hex_64(BLOBS_CREATED.load(Ordering::Relaxed));
             // Cursor-plane traffic. Once the atomic cursor plane is live,
             // pointer motion should show up here as `curs_mv` climbing while
             // `flips_sub` stays flat — that is the whole point of the lane.
@@ -2268,11 +2363,15 @@ impl DrmDeviceInterface {
         if data == 0 || length == 0 || length > 64 * 1024 {
             return Err(DriverError::InvalidParameter);
         }
+        // Copy the user array in BEFORE taking BLOBS: a demand-paging fault on
+        // `data` with that lock held is the 82d0cc3 freeze class. This ordering
+        // is the whole reason the copy is not folded into the insert below.
         let mut buf = vec![0u8; length];
         unsafe { ptr::copy_nonoverlapping(data as *const u8, buf.as_mut_ptr(), length); }
 
         let id = NEXT_BLOB_ID.fetch_add(1, Ordering::Relaxed);
         BLOBS.lock().insert(id, buf);
+        if DRM_STATS { BLOBS_CREATED.fetch_add(1, Ordering::Relaxed); }
         unsafe { ptr::write_unaligned((arg + 12) as *mut u32, id); }
         Ok(0)
     }
@@ -2462,28 +2561,68 @@ impl DrmDeviceInterface {
         if let Some(v) = want_conn_crtc { CONN_CRTC.store(v as u32, Ordering::Relaxed); }
 
         // ── Present ──
+        //
+        // FB_DAMAGE_CLIPS bounds the pixel work. Resolve the blob to rects here,
+        // BEFORE the DRM device lock is taken: BLOBS and that mutex must never
+        // be nested, in either order.
         let mut presented = false;
         if let Some(fb_id) = primary.fb_id {
             if fb_id != 0 {
-                let t0 = if DRM_STATS { crate::snd::monotonic_us() } else { 0 };
-                let r = {
-                    let d = get_drm_device();
-                    let mut g = d.lock();
-                    let (mut src_w, mut src_h) = (320u32, 200u32);
-                    if let Some(fb) = g.get_framebuffer(DrmObjectId(fb_id)) {
-                        src_w = fb.width;
-                        src_h = fb.height;
+                let blob = primary.damage_blob.unwrap_or(0);
+                // A modeset repaints unconditionally — a clip list describes the
+                // surface as it was under the previous mode and means nothing
+                // after it. Same for the first present of a framebuffer.
+                let full_repaint = changes_modeset || want_mode.is_some();
+                let unchanged = !full_repaint
+                    && blob != 0
+                    && fb_id == LAST_PRIMARY_FB.load(Ordering::Relaxed)
+                    && blob == LAST_PRIMARY_DAMAGE.load(Ordering::Relaxed);
+                let rects = if full_repaint { None } else { damage_rects(blob) };
+
+                if unchanged {
+                    // smithay re-sent the previous plane config byte for byte:
+                    // its damage tracker found nothing to draw. Present nothing;
+                    // the completion event below is still owed and still sent.
+                    if DRM_STATS { DAMAGE_SKIP.fetch_add(1, Ordering::Relaxed); }
+                } else {
+                    let t0 = if DRM_STATS { crate::snd::monotonic_us() } else { 0 };
+                    let r = {
+                        let d = get_drm_device();
+                        let mut g = d.lock();
+                        match rects.as_deref() {
+                            Some(clips) => {
+                                if DRM_STATS {
+                                    DAMAGE_RECT.fetch_add(1, Ordering::Relaxed);
+                                    DAMAGE_PX.fetch_add(damage_area(clips), Ordering::Relaxed);
+                                }
+                                g.present_damaged(DrmObjectId(fb_id), clips).map(|_| 0usize)
+                            }
+                            None => {
+                                if DRM_STATS { DAMAGE_FULL.fetch_add(1, Ordering::Relaxed); }
+                                let (mut src_w, mut src_h) = (320u32, 200u32);
+                                if let Some(fb) = g.get_framebuffer(DrmObjectId(fb_id)) {
+                                    src_w = fb.width;
+                                    src_h = fb.height;
+                                }
+                                let flip_args = [fb_id, 0u32, src_w, src_h];
+                                self.handle_flip_page(&mut g, flip_args.as_ptr() as usize)
+                            }
+                        }
+                    };
+                    if DRM_STATS {
+                        FLIP_US_TOTAL
+                            .fetch_add(crate::snd::monotonic_us().wrapping_sub(t0), Ordering::Relaxed);
                     }
-                    let flip_args = [fb_id, 0u32, src_w, src_h];
-                    self.handle_flip_page(&mut g, flip_args.as_ptr() as usize)
-                };
-                if DRM_STATS {
-                    FLIP_US_TOTAL
-                        .fetch_add(crate::snd::monotonic_us().wrapping_sub(t0), Ordering::Relaxed);
+                    r?;
+                    // Counts presents that moved pixels, not atomic commits. It
+                    // used to be the same number by construction, which is what
+                    // made "smithay flips the primary every frame" unfalsifiable.
+                    FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed);
+                    presented = true;
                 }
-                r?;
-                FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed);
-                presented = true;
+
+                LAST_PRIMARY_FB.store(fb_id, Ordering::Relaxed);
+                LAST_PRIMARY_DAMAGE.store(blob, Ordering::Relaxed);
             }
         }
 
