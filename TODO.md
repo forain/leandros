@@ -3,7 +3,7 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-06** (`26eebf0`); item 5 and the item 12
+Last reconciled against `main` on **2026-08-06** (`05bb0fe`); item 4 and the item 10
 Mesa-modifier bullet updated the same day with a source-analysis wave over smithay
 `efeb597` and the kernel DRM property/blob path. Same day, a second wave: item 2
 (memfd tmpfs-slot leak) got a completed source-analysis pass and a prepared-but-unbuilt
@@ -11,13 +11,24 @@ patch, and a new item 3 was split out for the TGID defect the audit found along 
 Same day, a third wave retired the former item 7 (Doom hang): measured on the Linux box
 at `295136c` with fresh images, Doom runs on both arches, including the literal
 `-mb 16` case — see the softfloat note in Standing context and the allocator note in
-item 12 for what it leaves behind. Same day, a fourth wave covers this reconciliation:
-items 7-9 (`listen()` twice, the `handle_close` warning, and the dead `init-server`
+item 10 for what it leaves behind. Same day, a fourth wave covers this reconciliation:
+items 5-7 (`listen()` twice, the `handle_close` warning, and the dead `init-server`
 crate) got a combined, verified-applicable patch at
 `~/code/leandros-artifacts/notes/m9-small-fixes/small_fixes.patch`, confirmed to stack
-cleanly in both orders with the item 2 and item 5 patches; two new items, 10 and 11,
+cleanly in both orders with the item 2 and item 4 patches; two new items, 8 and 9,
 were split out for AF_UNIX `listen()` laxness and the missing TIME_WAIT state found
-along the way.
+along the way. Same day, a fifth wave closed two more: the former item 4
+(`wl_display error 0 "Unknown id: 636"`) does not reproduce — a fresh aarch64/HVF
+release build and fresh images ran a 200 s COSMIC session with a 30 s pointer-motion
+window and hit zero `Unknown id`, `Broken pipe`, `PANEL MAIN ERR` or `wl_display#1:
+error` occurrences, confirming the item's own hypothesis (an FP/SIMD-clobber artifact
+— see the tally in Standing context) and clearing the AF_UNIX SCM_RIGHTS path it had
+implicated (`scmtest` 26/0 both arches); and the former item 6 (evdev monotonic
+timestamps) landed as `05bb0fe`, verified by `evtest2` 8/0 (`motion_ts_monotonic`,
+`motion_ts_subtick`) and the cursor gate (8.50 flips/s, 8.50 cursor mv/s, 0.00 cursor
+uploads/s) against a legacy-path control confirmed genuinely legacy (`atomic=0
+atest=0 cplane=0`). `05bb0fe` also added the `evpush` guest-side evdev-event counter
+to the `[DRMSTAT]` diagnostics (see the table below).
 
 ---
 
@@ -44,7 +55,8 @@ polltest 6/0, sigtest 6/0, timertest 6/0 (the 6th subtest, `clock_monotonic_subt
 added in `75b32e3`), memtest 4/0, waittest 5/0 — all on x86_64. On aarch64, waittest
 also came out 5/0 in this run rather than the previously recorded 3/2; the
 `wait_on_process_group` flake simply did not fire this time, so treat either result as
-acceptable.
+acceptable. This wave (`05bb0fe`) also ran `idletest` 2/0 and `evtest2` 8/0 green on
+both arches; neither was previously listed in this baseline.
 
 **vmnet gotcha.** On a Mac with `socket_vmnet` installed, `driver.py` uses vmnet rather
 than slirp, so the guest gets a `192.168.105.x` lease and `10.0.2.x` does not exist —
@@ -105,8 +117,13 @@ reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print i
   exposure in a 1.45 MB static binary, and a demand-paging fault there under the old
   `+neon` kernel clobbering a `q` register holding a loop bound or pointer is exactly
   the "hangs with no output, no fault" shape that was observed. `75b32e3` (sub-tick
-  `CLOCK_MONOTONIC`) is a weaker secondary candidate. Doom is the fifth thing this
-  session traced to this clobber, directly or as the retiring cause.
+  `CLOCK_MONOTONIC`) is a weaker secondary candidate. Also retired by it, not by work
+  aimed at it: the former item 4 (`wl_display error 0 "Unknown id: 636"`, deleted
+  2026-08-06 — a 200 s COSMIC session with a 30 s pointer-motion window showed zero
+  recurrences on the fixed kernel). The suspicion recorded against that item's AF_UNIX
+  `SCM_RIGHTS` path was never borne out — `scmtest` covers that path at 26/0 on both
+  arches. Doom is the fifth and id 636 the sixth thing this session traced to this
+  clobber, directly or as the retiring cause.
 - Release builds only — debug builds crash early. Test **both** arches in QEMU after
   every change. Minimum Limine revision is **6**, never downgrade.
 - Regression images must be freshly regenerated — run vfstest **exactly once** per
@@ -123,6 +140,7 @@ flip back before committing:
 | `DRM_STATS` | `drivers/src/drm_device_interface.rs:1230` | flips, cursor up/mv, atomic, atest, cplane |
 | `CURSOR_DEBUG` | `drivers/src/virtio_gpu.rs:342` | cursor queue setup + selftest |
 | `mm::gap2::ON` | `mm/src/gap2.rs:17` | memfd/MAP_SHARED path + frame checksum sampler |
+| `evpush` (within `DRM_STATS`) | `drivers/src/drm_device_interface.rs` (`[DRMSTAT]` line) + `servers/evdev::events_pushed()` | guest-side evdev events pushed — distinguishes "the compositor ignored the moves" from "the moves never reached the guest ring" |
 
 **`RUST_LOG=trace` cannot read smithay's own damage-tracking decisions.**
 `cosmic-comp/Cargo.toml:61-62` sets `release_max_level_info` on `tracing`, so `trace!`
@@ -146,15 +164,13 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 1 | Venus/virgl — working on both arches; vkcube is the next milestone | Feature | — |
 | 2 | memfd burns a tmpfs slot per call — fix prepared, needs an in-flight refcount | Bug — latent DoS | — |
 | 3 | `tmpfile_owner_of` does not canonicalise pid to TGID | Bug — kernel | — |
-| 4 | `wl_display error 0 "Unknown id: 636"` | Bug | re-measure post-fix |
-| 5 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
-| 6 | evdev monotonic timestamps — recorded cause refuted, ready to re-land | Bug | — |
-| 7 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
-| 8 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
-| 9 | Delete the unreachable `init-server` crate | Cleanup | — |
-| 10 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
-| 11 | No TIME_WAIT — ports are instantly reusable | Bug | — |
-| 12 | Deferred / known limitations | Mixed | — |
+| 4 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
+| 5 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
+| 6 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
+| 7 | Delete the unreachable `init-server` crate | Cleanup | — |
+| 8 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
+| 9 | No TIME_WAIT — ports are instantly reusable | Bug | — |
+| 10 | Deferred / known limitations | Mixed | — |
 
 ---
 
@@ -286,25 +302,7 @@ already fixed the same class of bug for the dmabuf path, by passing
 item is included in the item 2 patch above, but it is an independent defect worth its
 own line — it breaks threaded memfd users generally, not just this one.
 
-### 4. `wl_display error 0 "Unknown id: 636"` — panel↔comp desync
-
-Signature reads as one whole message dropped on a boundary. Id 636 is high and
-client-allocated, created after globals + layer-surface + the whole EGL/GLES bring-up —
-most likely a Mesa swrast `wl_shm_pool` created by the fd-carrying
-`wl_shm.create_pool`, or its `wl_buffer`/`wl_callback` neighbour. That makes the
-**SCM_RIGHTS branch** of `handle_sendmsg`/`handle_recvmsg` the suspect path, not the
-plain-data branch. Full analysis: `notes/wl-id636-analysis.md`.
-
-Observed on aarch64 with the FP/SIMD clobber live — "one whole message dropped
-on a boundary" is also what silently corrupted userspace arithmetic looks like. Confirm
-it still reproduces on the fixed kernel before spending time in the AF_UNIX path. The
-scmtest hang turned out to be a host-side capture artifact, so the inference that this
-is the same bug is void. On the current kernel, scmtest's `fd_pass`, `cmsg_flags`,
-`shared_memfd_pixels`, `queued_fd_cap` and `full_ring_eagain` subtests all PASS on both
-arches — evidence *for* the AF_UNIX SCM_RIGHTS path being healthy, so if 636 still
-reproduces, look elsewhere first.
-
-### 5. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
+### 4. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
 
 **What we already have, measured.** The property is fully plumbed, not merely
 advertised: `PROP_FB_DAMAGE_CLIPS = 51` as `PropKind::Blob` in `PROPS`
@@ -382,83 +380,7 @@ screendumps >=2 s apart and confirm the digits differ, then force one full prese
 confirm it is pixel-identical. Note the cursor will not appear in `screendump` now that
 it is on the hardware plane. Plus `drmsmoke` 22/0 both arches and `idletest`.
 
-### 6. evdev monotonic timestamps — recorded cause refuted, ready to re-land
-
-The recorded cause — "libinput rejects the `cntvct`-derived timestamps" — is **wrong**,
-refuted by reading libinput 1.27.1 (on disk, matching the shipped `libinput.so.10.13.0`).
-Our pointer is the virtio-tablet, an **absolute** pointer (`servers/evdev/src/lib.rs:46-48`,
-commit `e92f22b`), and `evdev-fallback.c:207-221` passes `time` straight through to
-`pointer_notify_motion_absolute` without ever using it. There is no dt, no filter and no
-acceleration on the absolute path — those are reached only from
-`fallback_flush_relative_motion` (`:169-198`). **The zero-dt division hazard that
-motivated the change does not apply to the device we actually have.** Every other
-consumer of `input_event.time` was checked and is non-fatal: `evdev_note_time_delay`
-(`evdev.c:1109-1133`) is a pure log that returns early when the event time is in the
-future; the out-of-order-timestamp check (`libinput.c:2309-2320`) is inside `#if 0`; the
-timer sanity checks (`timer.c:94-112`) are `#ifndef NDEBUG` and verifiably absent from
-the shipped `.so`; a wrong epoch only mis-arms button/scroll/debounce timers, which
-motion never passes through; and cosmic-comp's `PointerMotionAbsolute` handler
-(`input/mod.rs:675-707`) gates nothing on the timestamp. No value of `input_event.time`
-— wrong units, wrong epoch, coarse or duplicated — can suppress absolute-pointer motion
-in this stack.
-
-The likely real cause, **inferred but well-supported**: the aarch64 FP/SIMD clobber
-fixed in `05f7279`, root-caused three days *after* those runs. The change inlined a
-copy of `drivers::snd::monotonic_us()` into evdev, putting 128-bit arithmetic (`cnt as
-u128 * 1e6 / frq as u128`, lowered to `__udivti3`) into **IRQ context** — `push_event`
-is called from `arch/aarch64/src/timer.rs:80` and `exception.rs:72`, both inside the
-interrupt — at a time when the kernel was built `+neon,+fp-armv8` with no vector state
-in the EL0 trap frame. This explains the detail that "libinput is picky" never could:
-the same `monotonic_us()` was already running in that build under `DRM_STATS` and was
-harmless, because on the SVC path AAPCS64 permits a call to clobber v0-v7/v16-v31,
-whereas an interrupt has no such licence and lands on the interrupted thread's live
-vector state at an arbitrary instruction. The observed signature — total,
-path-independent failure of a float-heavy compositor on the atomic path **and** on a
-legacy control — is what ~120 vector corruptions/s looks like.
-
-Also on the record: the original experiment was **confounded**. Run s4 changed two
-variables at once (the evdev revert *and* `COSMIC_DISABLE_DIRECT_SCANOUT` →
-`COSMIC_DISABLE_OVERLAY_SCANOUT`), so the evdev change was never isolated by a
-single-variable A/B.
-
-Verdict: **re-land it** — but note that what unblocks it is the softfloat kernel
-(`05f7279`), which makes an IRQ-context vector clobber structurally impossible, **not**
-the new interpolated clock. Resolution was never the cause. The new `monotonic_ns()` is
-nonetheless the correct source to use, for three independent reasons: it shares the
-tick counter's epoch and therefore `sys_clock_gettime`'s, which is the only thing
-libinput's `EVIOCSCLOCKID(CLOCK_MONOTONIC)` contract actually requires; it is
-non-decreasing by construction (`fetch_max`); and it has sub-tick resolution. The raw
-`monotonic_us()` had none of the three — its epoch is counter-zero rather than
-tick-zero, and on x86_64 it hardcodes a 1 GHz TSC. **Do not re-land using
-`monotonic_us()`.**
-
-Honest scope: the user-visible benefit today is modest — better `wl_pointer` stamps for
-client-side timing, and fewer "event processing lagging behind" warnings from
-`evdev.c:1128` (20 ms threshold, which gets closer once `clock_gettime` is finer while
-evdev stays 10 ms-quantized and one tick behind). The large win, accelerated dt, only
-materialises if a **relative** pointer is ever attached.
-
-A prepared patch (138 lines, **unbuilt**) is at
-`~/code/leandros-artifacts/notes/m9-evdev-timestamps/evdev_timestamps.patch`; it sits on
-top of the two m9 clock patches. It exports `arch_monotonic_ns()` from both arch
-crates, declares it in evdev's existing `extern "C"` block (evdev cannot reach `drivers`
-or `arch` directly — a dependency cycle, which is why the original inlined a copy), and
-stamps `push_event` from it, reading the counter **before** `arch_interrupt_save()` and
-before `DEVICES.lock()` so no lock is held and no user memory is touched.
-
-Verification, given this item's history of a change that looked fine and silently
-killed input: pre-flight with `userland/evtest2` on aarch64, which already reports
-`motion_ts_monotonic` — pass requires that subtest green **and** `tv_usec` values not
-all multiples of 10000, which proves units, monotonicity and resolution for almost no
-cost. Main gate on aarch64 with `DRM_STATS` on
-(`drivers/src/drm_device_interface.rs:1230`) at 60 moves/s: pass reproduces the s4
-numbers (≈6.0 flips/s, ≈6.0 cursor mv/s, 0.00 cursor uploads/s), fail is the reverted
-signature (`flips_sub` frozen, `curs_mv=0` across 1000+ delivered moves). Run the
-legacy-path control on a build differing **only** by this patch, and add a guest-side
-event counter — every previous run only proved QMP accepted the moves, never that they
-reached the guest ring.
-
-### 7. `listen()` twice returns EINVAL — fix prepared
+### 5. `listen()` twice returns EINVAL — fix prepared
 
 `handle_listen` matched only `SockState::InetBound`, so a repeat call fell to
 `_ => err_reply(-22)`. The fix adds one arm, `SockState::InetListening { .. } => return
@@ -481,7 +403,7 @@ repeat `listen(srv,16)` returns 0, and that connect+accept still complete on the
 listener afterwards — the last is what catches a fix that re-arms and orphans handles.
 **`scmtest` 26/0 → 27/0**, or **→ 29/0** if the memfd patch's two subtests land first.
 
-### 8. `unused variable: port` in `handle_close` — not a leak, fix prepared
+### 6. `unused variable: port` in `handle_close` — not a leak, fix prepared
 
 **Measured, it is a warning and not a port leak.** `alloc_ephemeral_port`
 (`servers/net/src/lib.rs:442`) is the only allocator and derives "free" purely from live
@@ -494,7 +416,7 @@ renaming it to `_port` (a dead read invites someone to re-add it) and leaves a c
 recording why no release is needed. Verification is just that the warning is gone with
 no new ones, and `scmtest` unchanged.
 
-### 9. Delete the unreachable `init-server` crate
+### 7. Delete the unreachable `init-server` crate
 
 The scope is larger than this item previously stated. **`init-server` is a real
 dependency in `kernel/Cargo.toml:34`, so all 2653 lines compile into every kernel
@@ -525,23 +447,23 @@ both arches link with the crate gone, `grep -rn init_server .` is empty, serial 
 is **unchanged** to the login prompt (nothing in the crate ever printed), and the full
 suite is at baseline on fresh images.
 
-### 10. AF_UNIX `listen()` is lax in the opposite direction
+### 8. AF_UNIX `listen()` is lax in the opposite direction
 
 The AF_UNIX arm of `handle_listen` is an unconditional `ok_reply()` — a repeat listen
 already succeeds, but so does `listen()` on an unbound or already-connected AF_UNIX
-socket, where Linux answers EINVAL. Found while fixing the AF_INET side (item 7) and
+socket, where Linux answers EINVAL. Found while fixing the AF_INET side (item 5) and
 deliberately **not** changed there: tightening it alters behaviour for every AF_UNIX
 server on the system (cosmic-comp, busd, tokio) and could not be validated in a
 read-only session. Needs a live COSMIC session to land safely.
 
-### 11. No TIME_WAIT — ports are instantly reusable
+### 9. No TIME_WAIT — ports are instantly reusable
 
 `handle_close` calls `socket_set.remove()` immediately, so a closed TCP port can be
 rebound at once where Linux would hold it in TIME_WAIT. A divergence, not a leak, and
 low priority — but it is the kind of thing that makes a server restart behave
 differently here than on Linux.
 
-### 12. Deferred work and known limitations
+### 10. Deferred work and known limitations
 
 - **Doom does not link relibc.** `../doomgeneric/Makefile.leandros` links
   `userland/target/<arch>-unknown-none/release/libleandros_libc.a`, whose allocator is
@@ -582,6 +504,12 @@ differently here than on Linux.
 - **DRM page-flip event timestamps** (`drivers/src/drm_device_interface.rs:394,398-400`)
   are still built from the 100 Hz tick scheme, and smithay reads them for presentation
   feedback — worth moving to the interpolated clock in the same sweep.
+- **Harness gotcha: `~/code/leandros-artifacts/m8_cursor.py` picks its "busiest
+  window" by `curs_mv` delta.** That is identically 0 on the legacy KMS path (no cursor
+  plane exists to move), so it silently prints a degenerate `1.00 flips/s` for a
+  legacy-path control instead of erroring. Key the window on `evpush` (see the
+  diagnostics table in Standing context) instead — it is nonzero on both paths whenever
+  pointer motion actually reached the guest ring.
 
 ---
 
