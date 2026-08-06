@@ -1,4 +1,4 @@
-//! f2fstest — regression coverage for TODO.md item #5 (F2FS server)
+//! f2fstest — regression coverage for the F2FS server
 //!
 //! Verifies basic F2FS read/write, direct, indirect, and double-indirect block pointer
 //! writes/reads via sparse files, directory operations, and unmounting.

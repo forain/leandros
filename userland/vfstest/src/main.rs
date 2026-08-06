@@ -1,4 +1,4 @@
-//! vfstest — regression coverage for TODO.md item #4 (VFS server): rmdir,
+//! vfstest — regression coverage for the VFS server: rmdir,
 //! cross-mount-capable rename, advisory locking (flock + fcntl byte-range),
 //! real file permissions/ownership (including setuid privilege drop), and
 //! extended attributes / POSIX ACLs (setxattr/getxattr/listxattr/removexattr
