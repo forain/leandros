@@ -548,29 +548,57 @@ pub fn mark_memfd(pid: u32, fd: usize) {
     }
 }
 
-/// Promote the tmpfs inode behind `fd` into a **borrowed dmabuf VMO** whose
-/// frames ARE the DRM dumb buffer's contiguous buddy block
-/// (`phys .. phys + (1<<order)*4096`). Called by the PRIME_HANDLE_TO_FD syscall
-/// intercept right after opening an ephemeral `/tmp/dmabuf:<h>` node. A
-/// MAP_SHARED mmap of this fd then aliases the very same physical pages as the
-/// MAP_DUMB device mapping (coherent). The frames are NOT owned here (see
-/// `TmpVmo.borrowed`); `free_dumb` frees the whole order-N block. Returns false
-/// on a bad/non-tmpfs fd. The gem `handle` is stored so PRIME_FD_TO_HANDLE can
+/// Promote the tmpfs inode behind `fd` into a **borrowed dmabuf VMO** for the
+/// GEM object `handle`. Called by the PRIME_HANDLE_TO_FD syscall intercept
+/// right after opening an ephemeral `/tmp/dmabuf:<n>` node. Returns false on a
+/// bad/non-tmpfs fd. The gem `handle` is stored so PRIME_FD_TO_HANDLE can
 /// resolve fd -> handle. No user memory is touched.
-pub fn install_dmabuf_vmo(pid: u32, fd: usize, phys: usize, order: usize, handle: u32) -> bool {
+///
+/// TWO SHAPES, one entry point:
+///
+///   * `phys != 0` — the export aliases the BO's contiguous buddy block
+///     (`phys .. phys + (1<<order)*4096`), so a MAP_SHARED mmap of this fd hits
+///     the very same physical pages as the MAP_DUMB / VIRTGPU_MAP device
+///     mapping (coherent). This is the dumb-buffer and guest-backed-blob case.
+///   * `phys == 0` — the BO has NO guest pages: a pure host-side Venus blob.
+///     The export still has to succeed, because Mesa calls `vkGetMemoryFdKHR`
+///     for every swapchain image and fails swapchain creation outright if it
+///     errors, and the fd's real job is to be a token that PRIME_FD_TO_HANDLE
+///     turns back into a GEM handle. The page list is left EMPTY, and what
+///     makes that safe rather than silently wrong is that a borrowed VMO's page
+///     list is immutable: `vmo_acquire_frames`, the write path and
+///     `handle_ftruncate` all refuse to grow it. Without those guards an mmap
+///     would have been satisfied with freshly allocated zeroed anonymous
+///     frames that have nothing to do with the host resource — a coherence bug
+///     that reads as a Vulkan bug.
+///
+/// `len` is what fstat/lseek report. It is the resource's own size for a blob
+/// and the whole buddy block for a dumb buffer (see `prime_export_backing`);
+/// it never exceeds the frames listed, so the clamp in the read path and the
+/// bound in `vmo_acquire_frames` are both satisfiable.
+///
+/// The frames are NOT owned here (see `TmpVmo.borrowed`); `free_dumb` /
+/// `free_blob` free the whole order-N block.
+pub fn install_dmabuf_vmo(pid: u32, fd: usize, phys: usize, order: usize, len: usize,
+                          handle: u32) -> bool {
     let idx = match tmpfile_owner_of(pid, fd) { Some(i) => i, None => return false };
-    let n_pages = 1usize << order;
-    let capacity = n_pages * 4096;
-    let mut pages = alloc::vec::Vec::with_capacity(n_pages);
-    for i in 0..n_pages { pages.push(phys + i * 4096); }
+    let pages = if phys == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        let n_pages = 1usize << order;
+        let mut v = alloc::vec::Vec::with_capacity(n_pages);
+        for i in 0..n_pages { v.push(phys + i * 4096); }
+        v
+    };
     // Lock order FD_TABLES -> TMP_FILES -> TMP_VMOS (FD_TABLES already released
     // by tmpfile_owner_of). Set the inode length so fstat/lseek report the
-    // buffer size (GBM/EGL fstat the dmabuf to validate it).
+    // buffer size (GBM/EGL fstat the dmabuf to validate it; Mesa's kms_swrast
+    // PRIME importer lseeks to SEEK_END and gives up if that fails).
     let mut tmp = TMP_FILES.lock();
     let mut vmos = TMP_VMOS.lock();
-    tmp[idx].len = capacity;
+    tmp[idx].len = len;
     vmos[idx] = Some(TmpVmo {
-        pages, len: capacity, seals: 0, is_memfd: true,
+        pages, len, seals: 0, is_memfd: true,
         borrowed: true, dmabuf_handle: handle,
     });
     true
@@ -639,6 +667,17 @@ pub fn vmo_acquire_frames(pid: u32, fd: usize, off: usize, len: usize)
     }
 
     let vmo = vmos[idx].as_mut().unwrap();
+    // A borrowed (dmabuf) VMO's page list is IMMUTABLE. Two reasons, and the
+    // first one is a pre-existing leak this closes:
+    //   * its frames belong to the DRM layer, and `vmo_free_slot` returns early
+    //     for a borrowed VMO without freeing anything — so any frame appended
+    //     here would be leaked for the lifetime of the system;
+    //   * for a host-backed export (no guest pages at all) growing would
+    //     satisfy the mmap with zeroed anonymous memory in place of the host
+    //     resource, which is a coherence bug that presents as a Vulkan bug.
+    // Refuse instead: sys_mmap turns None into ENOMEM, which is what "this fd
+    // is a shareable token, not a mapping" looks like from userspace.
+    if vmo.borrowed && need_pages > vmo.pages.len() { return None; }
     // Grow frame capacity to cover the mapped range. This does NOT move EOF
     // (`vmo.len`) — a mapping past end-of-file gets zero-filled frames.
     while vmo.pages.len() < need_pages {
@@ -3156,12 +3195,20 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // `entry.len` mirrors `vmo.len` for a promoted file, so the EOF
             // bound is the same whether or not a VMO backs this inode.
             let remaining = tmp[idx].len.saturating_sub(cur);
-            let n = count.min(remaining).min(4096);
+            let mut n = count.min(remaining).min(4096);
             if n == 0 { return val_reply(0); }
             // Promoted (memfd / MAP_SHARED-mapped) files read from their VMO
             // frames — the pages ARE the file, so read()↔mmap coherence is free.
             let vmos = TMP_VMOS.lock();
             if let Some(vmo) = vmos[idx].as_ref() {
+                // Never read past the frames that actually exist. For every
+                // ordinary VMO `pages` already covers `len`, so this clamp is a
+                // no-op; it is here for a borrowed dmabuf export of a host-side
+                // BO, whose `len` is the resource size while `pages` is empty —
+                // `vmo_copy_out` would index an empty list and panic in the
+                // kernel.
+                n = n.min((vmo.pages.len() * 4096).saturating_sub(cur));
+                if n == 0 { return val_reply(0); }
                 unsafe { vmo_copy_out(vmo, cur, buf, n); }
             } else {
                 unsafe { core::ptr::copy_nonoverlapping(tmp[idx].data.as_ptr().add(cur), buf, n); }
@@ -3300,8 +3347,13 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 // out of scope — not enforced here).
                 let end = cur + count;
                 let need_pages = (end + 4095) / 4096;
-                while vmo.pages.len() < need_pages {
-                    match vmo_alloc_zeroed_frame() { Some(f) => vmo.pages.push(f), None => break }
+                // Borrowed (dmabuf) VMOs never grow — see vmo_acquire_frames.
+                // A write past the frames the DRM layer lent us then falls out
+                // as ENOSPC below rather than as a leaked frame.
+                if !vmo.borrowed {
+                    while vmo.pages.len() < need_pages {
+                        match vmo_alloc_zeroed_frame() { Some(f) => vmo.pages.push(f), None => break }
+                    }
                 }
                 let cap_bytes = vmo.pages.len() * 4096;
                 let n = count.min(cap_bytes.saturating_sub(cur));
@@ -5055,6 +5107,13 @@ fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
             let mut tmp = TMP_FILES.lock();
             let mut vmos = TMP_VMOS.lock();
             if let Some(vmo) = vmos[idx].as_mut() {
+                // A borrowed dmabuf export is not resizable, in either
+                // direction. Growing would append frames `vmo_free_slot` never
+                // frees; shrinking would `unref_or_free` frames the DRM layer
+                // owns — order-0 frees out of an order-N buddy block, i.e.
+                // allocator corruption. Linux does not let you ftruncate a
+                // dmabuf either.
+                if vmo.borrowed { return err_reply(-1); } // EPERM
                 // Enforce F_SEAL_SHRINK; grow/shrink the frame list. Frames a
                 // live mapping still holds survive shrink (unref_or_free), so
                 // there is no use-after-free (Linux would SIGBUS — out of scope).

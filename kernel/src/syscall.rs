@@ -6070,16 +6070,29 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     // The DRM server (drivers crate) has no fd-table access; building a dmabuf fd
     // is a VFS op. This syscall layer runs in the caller's AS with pid + both the
     // `drivers` and `vfs` crates in scope, so it is the one place that can turn a
-    // GEM handle into a real fd backed by that dumb buffer's physical pages.
+    // GEM handle into a real fd. Both BO kinds resolve here: a dumb buffer or a
+    // guest-backed blob exports an fd whose frames ARE its pages, while a pure
+    // host-side Venus blob exports a token fd with no pages (see
+    // `prime_export_backing` and `install_dmabuf_vmo`).
     // struct drm_prime_handle { u32 handle@0; u32 flags@4; s32 fd@8; } = 12 bytes.
     const DRM_IOCTL_PRIME_HANDLE_TO_FD: usize = 0xC00C642D;
     const DRM_IOCTL_PRIME_FD_TO_HANDLE: usize = 0xC00C642E;
     if cmd == DRM_IOCTL_PRIME_HANDLE_TO_FD {
         if arg == 0 || !validate_user_buf(arg, 12) { return -14; } // EFAULT
         let handle = unsafe { (arg as *const u32).read() };
-        let (phys, order) = match drivers::drm_device_interface::dumb_buffer_phys_order(handle) {
+        // Scope the lookup to the calling open, exactly as every other
+        // handle-consuming virtgpu ioctl does (b80ab5a). A card/render fd
+        // carries a per-open identity; anything else resolves to 0, which
+        // `blob_lookup` treats as "no identity to check in either direction" —
+        // the same rule the legacy Driver::handle path already relies on. Dumb
+        // buffers are unscoped either way, by the note on `open_may_reach`.
+        let open_id = match vfs::vfs_get_node_kind(pid, fd) {
+            Some(vfs::VnodeKind::DynamicDevice { open_id, .. }) => open_id,
+            _ => 0,
+        };
+        let backing = match drivers::drm_device_interface::prime_export_backing(handle, open_id) {
             Some(v) => v,
-            None => return -22, // EINVAL: not a known dumb buffer handle
+            None => return -22, // EINVAL: no BO this open may reach
         };
         // Open an ephemeral tmpfs node (same path memfd_create uses) to get a real
         // fd + owner slot, then promote that slot to a borrowed dmabuf VMO whose
@@ -6110,7 +6123,8 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         // and every later one on the render thread failed to install). Unlinking
         // the name still goes through vfs::handle, so it takes the raw pid.
         let vpid = sched::tgid_of(pid);
-        if !vfs::install_dmabuf_vmo(vpid, newfd as usize, phys, order, handle) {
+        if !vfs::install_dmabuf_vmo(vpid, newfd as usize, backing.phys, backing.order,
+                                    backing.len, handle) {
             // Never leak the ephemeral node/fd on the failure path: close the fd
             // (drops the pool slot) and unlink the name. Without this a failed
             // export would pin a /tmp slot + one of the 64 process fds forever,

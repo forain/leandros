@@ -212,6 +212,9 @@ extern "C" {
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> isize;
     pub fn open(path: *const u8, oflag: c_int, ...) -> c_int;
     pub fn close(fd: c_int) -> c_int;
+    pub fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
+    pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> isize;
+    pub fn ftruncate(fd: c_int, length: i64) -> c_int;
     pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     pub fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int,
                 fd: c_int, offset: i64) -> *mut c_void;
@@ -444,6 +447,18 @@ unsafe fn gem_close(fd: c_int, handle: u32) -> c_int {
     let mut gc = DrmGemClose { handle, pad: 0 };
     ioctl(fd, DRM_IOCTL_GEM_CLOSE, &mut gc as *mut _)
 }
+
+/// `struct drm_prime_handle { __u32 handle; __u32 flags; __s32 fd; }`.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmPrimeHandle {
+    handle: u32,
+    flags: u32,
+    fd: i32,
+}
+const DRM_IOCTL_PRIME_HANDLE_TO_FD: c_ulong = 0xC00C642D;
+const DRM_IOCTL_PRIME_FD_TO_HANDLE: c_ulong = 0xC00C642E;
+const SEEK_END: c_int = 2;
 
 /// Print a GETPARAM readback, distinguishing "the ioctl failed" from a value.
 fn out_param(v: u64) {
@@ -1639,6 +1654,186 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
                 }
 
                 if !report(b"phase4_owner_gem_close", gem_close(fd_a, h) == 0) { failures += 1; }
+            }
+        }
+        if fd_a >= 0 { close(fd_a); }
+        if fd_b >= 0 { close(fd_b); }
+    }
+
+    // ── phase 5: PRIME/dmabuf export of blob BOs ─────────────────────────────
+    //
+    // WHY THIS EXISTS. `PRIME_HANDLE_TO_FD` used to resolve handles only through
+    // the dumb-buffer registry, so it answered EINVAL for every blob. That is
+    // the single gate on `vkGetMemoryFdKHR`, which Mesa's WSI calls for every
+    // swapchain image on every DRM-image path — headless, display and Wayland
+    // dmabuf alike — which is exactly why offscreen rendering worked while no
+    // WSI surface could be created at all.
+    //
+    // The two shapes are asserted separately because they are backed
+    // differently and only one of them is mappable:
+    //   * a GUEST blob owns contiguous guest pages, so its exported fd must
+    //     alias them, coherently, the way a dumb buffer's does;
+    //   * a HOST3D blob owns NO guest pages. Its export must still SUCCEED —
+    //     Mesa exports device-local memory during
+    //     `wsi_drm_check_dma_buf_sync_file_import_export` — but mmap of that fd
+    //     must FAIL. Handing out zeroed anonymous frames instead would be a
+    //     silent coherence bug presenting as a Vulkan bug, and that is what a
+    //     growable page list would have produced.
+    //
+    // The size assertion uses a deliberately NON-power-of-two blob: the buddy
+    // allocation rounds 0x3000 up to 0x4000, so an fd reporting 0x4000 would
+    // prove the export is describing the allocator rather than the resource.
+    // Mesa's kms_swrast PRIME importer takes `lseek(fd, 0, SEEK_END)` verbatim
+    // as the buffer size.
+    out(b"--- phase 5: PRIME export of blob BOs ---\n");
+    {
+        let fd_a = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let fd_b = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if fd_a < 0 || fd_b < 0 {
+            if !report(b"phase5_open_two_fds", false) { failures += 1; }
+        } else {
+            let a_ctx = ctx_init_venus(fd_a);
+            let b_ctx = ctx_init_venus(fd_b);
+            if !report(b"phase5_context_init_both", a_ctx && b_ctx) { failures += 1; }
+
+            const P5_BLOB_SIZE: u64 = 0x3000;
+            let mut blob = DrmVirtgpuResourceCreateBlob {
+                blob_mem: VIRTGPU_BLOB_MEM_GUEST,
+                blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+                size: P5_BLOB_SIZE,
+                ..Default::default()
+            };
+            let rc = ioctl(fd_a, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, &mut blob as *mut _);
+            let have = rc == 0 && blob.bo_handle != 0;
+            if !report(b"phase5_guest_blob_created", have) { failures += 1; }
+
+            if have {
+                let h = blob.bo_handle;
+
+                let mut ph = DrmPrimeHandle { handle: h, flags: 0, fd: -1 };
+                let exported =
+                    ioctl(fd_a, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _) == 0
+                        && ph.fd >= 0;
+                if !report(b"phase5_prime_export_guest_blob", exported) { failures += 1; }
+
+                if exported {
+                    let sz = lseek(ph.fd, 0, SEEK_END);
+                    if sz != P5_BLOB_SIZE as i64 {
+                        out(b"  expected size ");
+                        out_u64(P5_BLOB_SIZE);
+                        out(b", got ");
+                        out_u64(sz as u64);
+                        out(b"\n");
+                    }
+                    if !report(b"phase5_prime_export_reports_resource_size",
+                               sz == P5_BLOB_SIZE as i64) { failures += 1; }
+
+                    let mut ph2 = DrmPrimeHandle { handle: 0, flags: 0, fd: ph.fd };
+                    let rt = ioctl(fd_a, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut ph2 as *mut _) == 0
+                        && ph2.handle == h;
+                    if !report(b"phase5_prime_roundtrip_guest_blob", rt) { failures += 1; }
+
+                    // The exported fd aliases the very pages VIRTGPU_MAP hands
+                    // out — the same coherence drmsmoke asserts for a dumb
+                    // buffer, and the only assertion here that can tell a real
+                    // export from an fd over unrelated memory.
+                    let mut map = DrmVirtgpuMap { offset: 0, handle: h, pad: 0 };
+                    let mut alias_ok = false;
+                    if ioctl(fd_a, DRM_IOCTL_VIRTGPU_MAP, &mut map as *mut _) == 0 {
+                        let dp = mmap(core::ptr::null_mut(), P5_BLOB_SIZE as size_t,
+                                      PROT_READ | PROT_WRITE, MAP_SHARED, ph.fd, 0);
+                        let cp = mmap(core::ptr::null_mut(), P5_BLOB_SIZE as size_t,
+                                      PROT_READ | PROT_WRITE, MAP_SHARED,
+                                      fd_a, map.offset as i64);
+                        if dp as isize > 0 && cp as isize > 0 {
+                            *(dp as *mut u32) = 0x5EED_1234;
+                            alias_ok = *(cp as *const u32) == 0x5EED_1234;
+                        }
+                    }
+                    if !report(b"phase5_prime_mmap_alias_guest_blob", alias_ok) { failures += 1; }
+
+                    // A borrowed dmabuf export is not resizable, and SHRINK is
+                    // the dangerous direction: the frame list is the DRM
+                    // layer's order-N buddy block, so dropping entries off the
+                    // end calls unref_or_free(frame, 0) on the tail of it —
+                    // order-0 frees out of an order-2 allocation, which is
+                    // allocator corruption rather than a leak. This blob is
+                    // 0x3000 backed by 4 frames, so truncating to 0x1000 would
+                    // free 3 of them individually. Must be refused outright.
+                    let shrink_refused = ftruncate(ph.fd, 0x1000) != 0;
+                    if !report(b"phase5_dmabuf_export_not_truncatable", shrink_refused) {
+                        failures += 1;
+                    }
+
+                    close(ph.fd);
+                }
+
+                // Scoping survives the new resolver: an open that cannot MAP,
+                // describe or wait on a BO must not be able to export it either.
+                let mut phb = DrmPrimeHandle { handle: h, flags: 0, fd: -1 };
+                let refused =
+                    ioctl(fd_b, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut phb as *mut _) != 0;
+                if !report(b"phase5_other_open_export_refused", refused) { failures += 1; }
+
+                let _ = gem_close(fd_a, h);
+            }
+
+            // Host-side blob: export must succeed, mmap must not.
+            let mut hblob = DrmVirtgpuResourceCreateBlob {
+                blob_mem: VIRTGPU_BLOB_MEM_HOST3D,
+                blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+                size: 0x1000,
+                ..Default::default()
+            };
+            let hrc = ioctl(fd_a, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB,
+                            &mut hblob as *mut _);
+            if hrc == 0 && hblob.bo_handle != 0 {
+                let hh = hblob.bo_handle;
+                let mut ph = DrmPrimeHandle { handle: hh, flags: 0, fd: -1 };
+                let ok = ioctl(fd_a, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _) == 0
+                    && ph.fd >= 0;
+                if !report(b"phase5_prime_export_host3d_blob", ok) { failures += 1; }
+                if ok {
+                    let p = mmap(core::ptr::null_mut(), 0x1000, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, ph.fd, 0);
+                    if !report(b"phase5_host3d_export_is_not_mappable", p as isize <= 0) {
+                        failures += 1;
+                    }
+
+                    // mmap is not the only way into the frame list. A token fd
+                    // reports len = the resource size but owns NO frames, so
+                    // read() and write() must both stop at the frames that
+                    // actually exist rather than at EOF.
+                    //
+                    // READ: the clamp this asserts is not politeness. Without
+                    // it, `n` is bounded only by `len`, and vmo_copy_out
+                    // indexes pages[0] of an EMPTY Vec — an out-of-bounds panic
+                    // in kernel context. So the failing form of this assertion
+                    // is a KERNEL PANIC, not a wrong return value; see the
+                    // report. A short read of 0 is the correct answer: there
+                    // are no bytes here, only a handle.
+                    let mut rbuf = [0u8; 8];
+                    let nread = read(ph.fd, rbuf.as_mut_ptr() as *mut c_void, 8);
+                    if !report(b"phase5_host3d_export_reads_short", nread == 0) {
+                        failures += 1;
+                    }
+
+                    // WRITE: growing here would append a zeroed anonymous frame
+                    // that vmo_free_slot never frees (it returns early for a
+                    // borrowed VMO), so the write would both leak and pretend
+                    // to have stored bytes into a host resource it never
+                    // touched. ENOSPC is the honest answer.
+                    let wbuf = [0xA5u8; 8];
+                    let nwrote = write(ph.fd, wbuf.as_ptr() as *const c_void, 8);
+                    if !report(b"phase5_host3d_export_refuses_write", nwrote < 0) {
+                        failures += 1;
+                    }
+
+                    close(ph.fd);
+                }
+                let _ = gem_close(fd_a, hh);
+            } else {
+                out(b"  (no host3d blob on this host - skipping host-side export checks)\n");
             }
         }
         if fd_a >= 0 { close(fd_a); }

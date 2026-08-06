@@ -814,9 +814,10 @@ struct BlobBuf {
     /// the other's. Here the handle space stays global (handles are unique
     /// process-wide, allocated from `NEXT_BLOB_HANDLE`) and the isolation is
     /// enforced by comparing this field instead. That yields the property that
-    /// matters — no open can map, describe, wait on, or close a BO belonging to
-    /// another — without renumbering a handle space that `dumb_buffer_phys_order`
-    /// and the PRIME/dmabuf path already resolve globally.
+    /// matters — no open can map, describe, wait on, EXPORT over PRIME, or
+    /// close a BO belonging to another — without renumbering a handle space
+    /// that `dumb_buffer_phys_order` and the framebuffer path still resolve
+    /// globally.
     ///
     /// 0 means "created without an open identity" (the legacy `Driver::handle`
     /// path, which passes open_id 0). Such a BO is unowned and reachable from
@@ -1087,7 +1088,9 @@ fn ctx_record_fence(open_id: u32, fence: u64) {
 // DUMB BUFFERS ARE NOT SCOPED, on purpose. A dumb handle is consumed by
 // ADDFB/ADDFB2 and the framebuffer/console path, which have no open identity to
 // carry, and `dumb_buffer_phys_order` resolves one globally for PRIME/dmabuf
-// export. Scoping them would break the compositor for no gain: the isolation
+// export (`prime_export_backing` scopes only the blob half, which is the half a
+// Vulkan client owns). Scoping them would break the compositor for no gain: the
+// isolation
 // gap that mattered is the Vulkan client's blob BOs, which are created and
 // consumed on one fd by one process.
 fn open_may_reach(caller: u32, owner: u32) -> bool {
@@ -1316,6 +1319,57 @@ fn damage_area(rects: &[(i32, i32, i32, i32)]) -> u64 {
 /// never here (this only reads the kernel-side registry).
 pub fn dumb_buffer_phys_order(handle: u32) -> Option<(usize, usize)> {
     DUMB_BUFFERS.lock().get(&handle).map(|b| (b.phys, b.order))
+}
+
+/// What backs a GEM handle for PRIME/dmabuf export.
+///
+/// `phys == 0` is a real and expected state, not an error: a pure
+/// `BLOB_MEM_HOST3D` blob lives in HOST memory and the guest owns no pages for
+/// it at all. It reaches that memory, if it ever does, through the virtio-gpu
+/// shared-memory BAR window after RESOURCE_MAP_BLOB — deliberately never
+/// through the direct map. An fd exported for such a BO is therefore a
+/// shareable token, not a mapping; see `install_dmabuf_vmo`.
+#[derive(Clone, Copy)]
+pub struct PrimeExport {
+    /// Physical base of the contiguous buddy block backing the BO, or 0 when
+    /// there are no guest pages.
+    pub phys: usize,
+    /// Buddy order of that block. Meaningless when `phys == 0`.
+    pub order: usize,
+    /// Bytes the exported fd reports through fstat/lseek. Mesa's kms_swrast
+    /// PRIME importer takes `lseek(fd, 0, SEEK_END)` as the buffer size and
+    /// gives up entirely if it fails, so for a blob this is the resource's own
+    /// size rather than the buddy allocation's power-of-two rounding.
+    pub len: usize,
+}
+
+/// Resolve a GEM handle for PRIME/dmabuf export, of EITHER BO kind.
+///
+/// The PRIME intercept used to call `dumb_buffer_phys_order` directly, so it
+/// answered EINVAL for every Venus blob. That one gap gated `vkGetMemoryFdKHR`,
+/// which Mesa's WSI calls for EVERY swapchain image on every DRM-image path
+/// (`wsi_create_native_image_mem` -> `wsi_init_image_dmabuf_fd`) and once more
+/// as a feature probe (`wsi_drm_check_dma_buf_sync_file_import_export`, on a
+/// 4 KiB device-local allocation) — which is why offscreen rendering works
+/// today while no WSI surface can be created at all.
+///
+/// SCOPING follows the two registries' existing rules rather than inventing a
+/// third: a blob is reachable only by the open that created it (`blob_lookup` /
+/// `open_may_reach`), and a dumb buffer stays deliberately global. `None` means
+/// "no BO this open may reach", indistinguishable from a handle that was never
+/// allocated — the same answer upstream's per-`drm_file` table gives.
+///
+/// Copy-out to user memory happens in the syscall layer, never here; this only
+/// reads the kernel-side registries, and never holds both at once.
+pub fn prime_export_backing(handle: u32, open_id: u32) -> Option<PrimeExport> {
+    if let Some(b) = blob_lookup(handle, open_id) {
+        return Some(PrimeExport { phys: b.phys, order: b.order, len: b.size as usize });
+    }
+    // Dumb exports keep reporting the buddy allocation, byte-for-byte what they
+    // reported before this function existed: GBM/EGL fstat the exported fd and
+    // the compositor has been running against that number since 36f62d0.
+    let (phys, order) = dumb_buffer_phys_order(handle)?;
+    Some(PrimeExport { phys, order, len: (1usize << order) * 4096 })
 }
 
 // ── DRM page-flip event channel ──────────────────────────────────────────────
