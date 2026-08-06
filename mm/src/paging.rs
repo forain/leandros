@@ -15,6 +15,19 @@ bitflags! {
         const EXECUTE   = 1 << 3;
         const NOCACHE   = 1 << 4;
         const MMIO      = 1 << 5;
+        /// Non-cached, but still ordinary memory: unaligned access, ordinary
+        /// loads and stores, no device semantics. Normal Inner/Outer
+        /// Non-cacheable on AArch64 (MAIR index 2); the PCD bit on x86-64,
+        /// which with the reset PAT means UC.
+        ///
+        /// Deliberately NOT merged with `NOCACHE`. On AArch64 `NOCACHE` selects
+        /// MAIR index 3, which is Device-nGnRnE on every boot path we have —
+        /// right for the framebuffer and for MMIO BARs, wrong for anything
+        /// userspace memcpys through, because Device memory faults on the first
+        /// unaligned access. Keeping the two apart is what lets a virtio-gpu
+        /// blob be non-cached without turning the sound card's registers into
+        /// speculatively-readable Normal memory.
+        const WRITECOMBINE = 1 << 6;
     }
 }
 

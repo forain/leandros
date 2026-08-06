@@ -16,9 +16,21 @@ bitflags! {
         const TABLE     = 1 << 1;
         /// Memory attributes index (MAIR_EL1).
         const ATTR_NORM    = 0 << 2; // index 0 (normal WB/WA)
-        const ATTR_DEV     = 1 << 2; // index 1 (device nGnRE)
-        const ATTR_STRICT  = 2 << 2; // index 2 (device nGnRnE)
-        const ATTR_NOCACHE = 3 << 2; // index 3 (normal NC)
+        const ATTR_DEV     = 1 << 2; // index 1 (device; whatever the loader left)
+        /// Index 2 — Normal memory, Inner and Outer Non-cacheable (attribute
+        /// 0x44). The one MAIR attribute this kernel programs for itself, in
+        /// `mmu::enable_identity`; claiming index 2 is safe precisely because
+        /// the slot it replaces (the old `ATTR_STRICT`) had no users at all.
+        const ATTR_NORMAL_NC = 2 << 2;
+        /// Index 3. Named for what it was believed to be, kept for what it
+        /// actually is: neither boot path defines MAIR attribute 3, and an
+        /// undefined attribute byte is 0x00 = Device-nGnRnE, not Normal-NC.
+        /// Limine 11.4.1's BOOTAA64.EFI writes MAIR_EL1 = 0xFF | (dev << 8), and
+        /// our own direct-boot path (kernel/src/entry_aarch64.s) writes 0x04FF;
+        /// attributes 2..7 are zero in both. The framebuffer has therefore
+        /// always been Device memory — it works, and it is left alone. Use
+        /// ATTR_NORMAL_NC for anything that needs non-cached *Normal* memory.
+        const ATTR_NOCACHE = 3 << 2;
         /// Non-secure access.
         const NS        = 1 << 5;
         /// User (EL0) access allowed.
@@ -187,6 +199,11 @@ fn translate_flags(bits: u64) -> PageDescFlags {
     if !src.contains(PageFlags::EXECUTE) { f |= PageDescFlags::NO_EXEC; }
     if src.contains(PageFlags::MMIO)     { f |= PageDescFlags::ATTR_DEV; }     // MAIR index 1
     else if src.contains(PageFlags::NOCACHE) { f |= PageDescFlags::ATTR_NOCACHE; } // MAIR index 3
+    // Non-cached but still Normal: unaligned access and plain memcpy are legal,
+    // which Device-nGnRnE (index 3, above) does not allow. This is arm64's
+    // write-combining mapping; the attribute is installed by
+    // `mmu::enable_identity` before anything can use it.
+    else if src.contains(PageFlags::WRITECOMBINE) { f |= PageDescFlags::ATTR_NORMAL_NC; } // MAIR index 2
 
     f
 }

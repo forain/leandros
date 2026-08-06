@@ -66,6 +66,15 @@ const RENDER_MINOR: u32 = 128;
 
 const DRM_IOCTL_VERSION: u32 = 0xC0406400;
 
+/// Not a Linux ioctl number: the kernel's `sys_mmap` sends this to a
+/// DynamicDevice to resolve an mmap offset to a guest-physical token
+/// (kernel/src/syscall.rs, `sys_mmap`).
+const DRM_IOCTL_MMAP: u32 = 0x1007;
+
+/// Slot-1 mapping hint in a 0x1007 reply: "do not map this range write-back".
+/// Mirrored in kernel/src/syscall.rs — the two must agree.
+const MMAP_HINT_UNCACHED: u64 = 1;
+
 /// `struct drm_version` — mirrored here (it is also defined privately in
 /// `drivers::drm_device_interface`) because the render node has to answer
 /// DRM_IOCTL_VERSION with a *different* identity than card0 does, and that
@@ -172,7 +181,44 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         // Since we are called via a direct handler, we are in the caller's address space.
         // No need to switch address space.
         let res = match interface.handle_ioctl(cmd, arg_val, open_id) {
-            Ok(result) => val_reply(result as u64),
+            Ok(result) => {
+                let mut m = val_reply(result as u64);
+                // Slot 0 is the physical token. Slot 1 tells `sys_mmap` how to
+                // map it: a host-visible virtio-gpu blob the host asked to be WC
+                // or UNCACHED must NOT come out write-back, or the guest reads
+                // its own stale cache lines instead of the host's writes.
+                // Everything else — dumb buffers, guest-backed blobs, the
+                // framebuffer — answers CACHED and leaves the hint at zero.
+                //
+                // Asked here rather than inside `handle_ioctl_mmap` so the
+                // lookup happens with no BO lock held.
+                if cmd == DRM_IOCTL_MMAP {
+                    let cache = drivers::drm_device_interface::blob_map_cache_type(result as u64);
+                    let uncached = cache == drivers::virtio_gpu::VIRTIO_GPU_MAP_CACHE_UNCACHED
+                        || cache == drivers::virtio_gpu::VIRTIO_GPU_MAP_CACHE_WC;
+                    if uncached {
+                        m.data[8..16].copy_from_slice(&MMAP_HINT_UNCACHED.to_le_bytes());
+                    }
+                    // The scoping is the point, so it is traced either way: one
+                    // line per resolved mmap token saying which cache type the
+                    // host asked for and which mapping it therefore gets. A
+                    // Venus session must show `map_info=0x01 -> writeback` for
+                    // the command ring and `map_info=0x03 -> uncached` for
+                    // Mesa's fence-feedback buffer.
+                    // Unconditional: `serial_debug` here is gated on
+                    // RENDER_DEBUG, and this line is the only evidence that the
+                    // scoping is by cache type rather than blanket.
+                    drivers::pci::serial_debug("[DRM-SRV] mmap token=");
+                    drivers::pci::serial_debug_hex_64(result as u64);
+                    drivers::pci::serial_debug(" map_info=0x0");
+                    drivers::pci::serial_debug(match cache {
+                        0 => "0", 1 => "1", 2 => "2", 3 => "3", _ => "?",
+                    });
+                    drivers::pci::serial_debug(
+                        if uncached { " -> uncached\n" } else { " -> writeback\n" });
+                }
+                m
+            }
             Err(_) => err_reply(-1),
         };
 

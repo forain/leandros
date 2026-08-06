@@ -1531,6 +1531,10 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     const MAP_SHARED:    usize = 0x01;
     const MAP_FIXED:     usize = 0x10;
     const MAP_ANONYMOUS: usize = 0x20;
+    // Slot-1 mapping hint a device server may set in its 0x1007 reply: the
+    // range it just handed back must not be mapped write-back. Mirrored in
+    // servers/drm/src/lib.rs — the two must agree.
+    const MMAP_HINT_UNCACHED: u64 = 1;
 
     if len == 0 { return -22; } // EINVAL
 
@@ -1598,6 +1602,8 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     // Step 1: Check if the fd is a device supporting direct mmap via ioctl 0x1007
     let kind = vfs::vfs_get_node_kind(pid, fd);
     let mut phys_addr: usize = 0;
+    // Set from slot 1 of the device's 0x1007 reply; see MMAP_HINT_UNCACHED.
+    let mut dev_uncached = false;
     
     if let Some(vfs::VnodeKind::DynamicDevice { port, dev_id, open_id }) = kind {
         if DBG_MMAP {
@@ -1626,6 +1632,17 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
             }
             if res != 0 {
                 phys_addr = res;
+                // Slot 1 is the device server's mapping hint. MMAP_HINT_UNCACHED
+                // means "this physical range is not cache-coherent with whoever
+                // else writes it — do not map it write-back". Only the DRM
+                // server sets it today, and only for a virtio-gpu host-visible
+                // blob the host asked to be WC or UNCACHED (see
+                // `blob_map_cache_type` in drivers/src/drm_device_interface.rs);
+                // every other device leaves the slot zero and is mapped exactly
+                // as before.
+                let hint = u64::from_le_bytes(
+                    reply.data[8..16].try_into().unwrap_or([0u8; 8]));
+                dev_uncached = hint == MMAP_HINT_UNCACHED;
             }
         } else if DBG_MMAP {
             crate::serial_print_str("[MMAP] device ioctl reply tag non-zero\n");
@@ -1634,9 +1651,20 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
 
     if phys_addr != 0 {
         // This is a device mapping — map the physical address directly.
+        //
+        // WRITECOMBINE rather than NOCACHE: on AArch64 NOCACHE means Device
+        // memory (MAIR index 3), which forbids unaligned access and is wrong for
+        // a buffer userspace memcpys through. WRITECOMBINE is Normal
+        // Non-cacheable there and PCD (UC) on x86-64 — non-cached on both, and
+        // still ordinary memory on both.
+        let dev_flags = if dev_uncached {
+            page_flags | PageFlags::WRITECOMBINE
+        } else {
+            page_flags
+        };
         let mapped = with_current_address_space_mut(|as_| {
             if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
-            as_.map_device(virt, phys_addr, len, page_flags)
+            as_.map_device(virt, phys_addr, len, dev_flags)
         });
         let ret = match mapped {
             Some(true)  => virt as isize,

@@ -847,8 +847,10 @@ struct BlobBuf {
     ///                  the window base is a PCI BAR address and can never be 0.
     win_off: u64,
     map_phys: u64,
-    /// `map_info` the host answered RESOURCE_MAP_BLOB with (VIRTIO_GPU_MAP_CACHE_*),
-    /// recorded for diagnostics — see the cacheability note on `virtgpu_handle_map`.
+    /// `map_info` the host answered RESOURCE_MAP_BLOB with (VIRTIO_GPU_MAP_CACHE_*).
+    /// Load-bearing, not diagnostic: `blob_map_cache_type` reports it to
+    /// `sys_mmap`, which maps the blob non-cached when the host asked for
+    /// UNCACHED or WC. See the cacheability note on `virtgpu_handle_map`.
     map_info: u32,
 }
 
@@ -1139,6 +1141,35 @@ fn bo_attach_fence(handle: u32, open_id: u32, fence: u64) -> bool {
         Some(b) => { b.last_fence = fence; true }
         None => false,
     }
+}
+
+/// Cache type the host asked us to use for the host-visible blob whose mmap
+/// token covers `phys` (VIRTIO_GPU_MAP_CACHE_*), or VIRTIO_GPU_MAP_CACHE_CACHED
+/// when `phys` is not inside one.
+///
+/// `sys_mmap`'s DynamicDevice arm asks this AFTER `handle_ioctl_mmap` has
+/// validated the token, so an address this device never handed out cannot reach
+/// here; answering CACHED for one is the conservative reading anyway, and is
+/// exactly right for the two token spaces that carry no `map_info` at all —
+/// dumb buffers and guest-backed blobs, which are guest RAM and coherent by
+/// construction.
+///
+/// Containment, not equality, deliberately: `handle_ioctl_mmap` accepts any
+/// address inside a blob's reservation so that a partial map of a large blob
+/// works, and the cache type has to follow the same rule or a partial map would
+/// silently come out with the wrong attributes.
+///
+/// LOCKING: takes BLOB_BUFFERS and nothing else, touches no user memory, and is
+/// called with no other lock held — the 82d0cc3 discipline.
+pub fn blob_map_cache_type(phys: u64) -> u32 {
+    if phys == 0 { return crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_CACHED; }
+    let blobs = BLOB_BUFFERS.lock();
+    for b in blobs.values() {
+        if b.map_phys != 0 && phys >= b.map_phys && phys - b.map_phys < b.size {
+            return b.map_info & crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_MASK;
+        }
+    }
+    crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_CACHED
 }
 
 // ── Property blobs ───────────────────────────────────────────────────────────
@@ -3596,13 +3627,22 @@ impl DrmDeviceInterface {
     /// and a repeat MAP of the same handle re-reports the same token rather than
     /// asking the host to map an already-mapped resource (which it refuses).
     ///
-    /// CACHEABILITY: the token carries no cache type, so the resulting user
-    /// mapping gets the address space's normal cacheable attributes. That is
-    /// correct for the Venus ring, which the host reports as
-    /// VIRTIO_GPU_MAP_CACHE_CACHED; a host asking for WC or UNCACHED is honoured
-    /// only in the log, and the divergence is called out there rather than
-    /// silently ignored (`handle_ioctl_mmap` has no channel to pass a cache type
-    /// back to `sys_mmap`).
+    /// CACHEABILITY: the token still carries no cache type, but the blob record
+    /// does. `sys_mmap`'s DynamicDevice arm asks `blob_map_cache_type` about the
+    /// token it just validated and maps the range non-cached when the host
+    /// answered VIRTIO_GPU_MAP_CACHE_UNCACHED or _WC. Only those two change
+    /// anything: _CACHED — which is what the host reports for the Venus command
+    /// ring — and the two guest-RAM token spaces stay write-back exactly as
+    /// they were.
+    ///
+    /// This is not a nicety. A blob the host maps write-combining is host memory
+    /// we have no cache coherence with, so a write-back guest mapping may serve
+    /// a stale cache line indefinitely. That is what stalled `vkrender`'s
+    /// `s0_submit` under x86_64/KVM while both TCG runs passed: Mesa's
+    /// fence-feedback slot lands in the first HOST_COHERENT memory type, which
+    /// is not HOST_CACHED, so the host asks for map_info = 0x03 (WC) — and
+    /// `vn_GetFenceStatus` polls it with a plain load that never touches the
+    /// ring. TCG hides it on both arches because TCG models no guest cache.
     ///
     /// LOCKING: user memory is read before any lock is taken and written after
     /// every lock is dropped, and no two of BLOB_BUFFERS / HOSTVIS_SPANS /
@@ -3740,10 +3780,12 @@ impl DrmDeviceInterface {
         if map_info & crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_MASK
             > crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_CACHED
         {
-            // WC (3) or UNCACHED (2). The mapping below will still be cacheable;
-            // say so rather than let a coherency surprise look like a Vulkan bug.
+            // WC (3) or UNCACHED (2). Recorded above and honoured by sys_mmap
+            // through `blob_map_cache_type`; still logged, because a non-cached
+            // mapping is a throughput cliff worth seeing in a trace — no longer
+            // because it is a divergence.
             crate::pci::serial_debug(
-                "[DRM] WARNING: host asked for non-cached blob mapping; mapping cacheable anyway\n",
+                "[DRM] non-cached blob mapping honoured (uncached)\n",
             );
         }
         Ok(token)

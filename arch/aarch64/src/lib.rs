@@ -80,6 +80,13 @@ pub fn init(boot_info: &boot::BootInfo) {
         uart::set_base(uart_virt);
         uart::reinit(uart_virt);
 
+        // First point at which the MAIR read-modify-write above can be shown.
+        uart::serial_print_str("[ARCH] MAIR_EL1 before=0x");
+        uart::print_hex(mmu::MAIR_BEFORE as usize);
+        uart::serial_print_str(" after=0x");
+        uart::print_hex(mmu::MAIR_AFTER as usize);
+        uart::serial_print_str("\n");
+
         // Map GIC Distributor and CPU interface to their HHDM addresses
         let gicd_phys = gic::GICD_BASE;
         let gicc_phys = gic::GICC_BASE;

@@ -384,8 +384,21 @@ fn translate_flags(bits: u64) -> PageTableFlags {
     if src.contains(PageFlags::PRESENT)  { f |= PageTableFlags::PRESENT; }
     if src.contains(PageFlags::WRITABLE) { f |= PageTableFlags::WRITABLE; }
     if src.contains(PageFlags::USER)     { f |= PageTableFlags::USER; }
-    if src.contains(PageFlags::NOCACHE) || src.contains(PageFlags::MMIO) { 
-        f |= PageTableFlags::NO_CACHE; 
+    // NO_CACHE is PCD. This kernel programs neither IA32_PAT nor the MTRRs, so
+    // the reset PAT applies and PCD alone (PWT=0, PAT=0) selects PA2 = UC-.
+    //
+    // WRITECOMBINE lands here too, deliberately. There is no WC entry in the
+    // reset PAT, so honouring WC exactly would mean bringing up IA32_PAT; UC is
+    // a strictly stronger substitute — the same coherence guarantee, worse
+    // write throughput — and UC/WC aliases of one physical page are compatible,
+    // where UC/WB and WC/WB are the combinations the SDM leaves undefined. The
+    // buffers that ask for it are small polled ones (Mesa's fence feedback), so
+    // the throughput does not matter; add a real PAT entry if that changes.
+    if src.contains(PageFlags::NOCACHE)
+        || src.contains(PageFlags::MMIO)
+        || src.contains(PageFlags::WRITECOMBINE)
+    {
+        f |= PageTableFlags::NO_CACHE;
     }
     // NO_EXECUTE if EXECUTE is NOT requested.
     if !src.contains(PageFlags::EXECUTE) { f |= PageTableFlags::NO_EXECUTE; }
