@@ -3,7 +3,7 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-06** (`26eebf0`); item 5 and the item 10
+Last reconciled against `main` on **2026-08-06** (`26eebf0`); item 5 and the item 12
 Mesa-modifier bullet updated the same day with a source-analysis wave over smithay
 `efeb597` and the kernel DRM property/blob path. Same day, a second wave: item 2
 (memfd tmpfs-slot leak) got a completed source-analysis pass and a prepared-but-unbuilt
@@ -11,7 +11,13 @@ patch, and a new item 3 was split out for the TGID defect the audit found along 
 Same day, a third wave retired the former item 7 (Doom hang): measured on the Linux box
 at `295136c` with fresh images, Doom runs on both arches, including the literal
 `-mb 16` case — see the softfloat note in Standing context and the allocator note in
-item 10 for what it leaves behind.
+item 12 for what it leaves behind. Same day, a fourth wave covers this reconciliation:
+items 7-9 (`listen()` twice, the `handle_close` warning, and the dead `init-server`
+crate) got a combined, verified-applicable patch at
+`~/code/leandros-artifacts/notes/m9-small-fixes/small_fixes.patch`, confirmed to stack
+cleanly in both orders with the item 2 and item 5 patches; two new items, 10 and 11,
+were split out for AF_UNIX `listen()` laxness and the missing TIME_WAIT state found
+along the way.
 
 ---
 
@@ -143,10 +149,12 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 4 | `wl_display error 0 "Unknown id: 636"` | Bug | re-measure post-fix |
 | 5 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
 | 6 | evdev monotonic timestamps — recorded cause refuted, ready to re-land | Bug | — |
-| 7 | `listen()` twice returns EINVAL, deviating from Linux | Bug | — |
-| 8 | `unused variable: port` warning in `handle_close` | Cleanup | — |
-| 9 | Dead `init_main` / unreachable POSIX smoke tests | Cleanup | — |
-| 10 | Deferred / known limitations | Mixed | — |
+| 7 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
+| 8 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
+| 9 | Delete the unreachable `init-server` crate | Cleanup | — |
+| 10 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
+| 11 | No TIME_WAIT — ports are instantly reusable | Bug | — |
+| 12 | Deferred / known limitations | Mixed | — |
 
 ---
 
@@ -450,32 +458,90 @@ legacy-path control on a build differing **only** by this patch, and add a guest
 event counter — every previous run only proved QMP accepted the moves, never that they
 reached the guest ring.
 
-### 7. `listen()` twice returns EINVAL, deviating from Linux
+### 7. `listen()` twice returns EINVAL — fix prepared
 
-`handle_listen` (`servers/net/src/lib.rs`) matches only `SockState::InetBound`, so a
-second `listen()` on an already-listening socket falls through to `_ => err_reply(-22)`.
-On Linux a second `listen()` succeeds and simply updates the backlog. Confirmed by
-measurement (`second_errno=22`). Low priority, but a real POSIX deviation that a server
-framework could trip on. Discovered during AF_INET loopback verification (`26eebf0`).
+`handle_listen` matched only `SockState::InetBound`, so a repeat call fell to
+`_ => err_reply(-22)`. The fix adds one arm, `SockState::InetListening { .. } => return
+ok_reply()`, before the fallthrough. **An early return, not a re-run of the path** —
+falling through to `listen_on()` would add a second pair of smoltcp sockets on the same
+port and orphan the handles the first listen stored, silently dropping any half-open
+connection: it would return 0 and then never accept.
 
-### 8. `unused variable: port` warning in `handle_close`
+**No backlog is stored, deliberately.** `SockEntry` has no backlog field and the
+parameter is already `_backlog`, ignored on the *first* listen too, because smoltcp has
+no accept queue — `accept_on` takes the listening socket over and arms a replacement,
+so the effective depth is 1 regardless. Storing a number nothing reads would fake a
+knob; returning success matches Linux's observable behaviour for any program that
+cannot read the state back, and we expose nothing `SO_ACCEPTCONN`-adjacent.
 
-`servers/net/src/lib.rs:2423`, in `handle_close`: the `InetListening`/`InetBound`
-rework in `26eebf0` stopped using `bound_port` there. Cosmetic; a one-character `_port`
-fixes it. Left as-is deliberately so that patch could land and be reviewed verbatim.
+Verification: a new `scmtest` subtest `inet_listen_twice` is in the patch, registered
+after `test_inet_loopback_tcp` in the same idiom. It asserts listen-before-bind still
+gives `rc=-1 errno=22` (so the fix cannot degenerate into "always succeed"), that a
+repeat `listen(srv,16)` returns 0, and that connect+accept still complete on the same
+listener afterwards — the last is what catches a fix that re-arms and orphans handles.
+**`scmtest` 26/0 → 27/0**, or **→ 29/0** if the memfd patch's two subtests land first.
 
-### 9. Dead `init_main` / unreachable POSIX smoke tests
+### 8. `unused variable: port` in `handle_close` — not a leak, fix prepared
 
-`init_server::init_main()` (`servers/init/src/lib.rs:2651`) is referenced nowhere in
-the kernel; the only mention outside its own file is a stale doc comment at
-`kernel/src/init.rs:4`. Everything it calls — including `run_posix_tests()` and the
-`t_af_inet_loopback` self-test — is unreachable, and "POSIX smoke tests" appears in no
-serial log. Either wire it back into the boot path or delete it, but do not leave a
-self-test that reads as coverage and provides none. **Discovered because the AF_INET
-loopback work (`26eebf0`) cited that self-test as evidence** — a dead test is worse
-than no test, because it gets cited.
+**Measured, it is a warning and not a port leak.** `alloc_ephemeral_port`
+(`servers/net/src/lib.rs:442`) is the only allocator and derives "free" purely from live
+table state (`t.socks.iter().any(|s| s.in_use && s.bound_port == p)`); there is no port
+bitmap or pool. Every arm of `handle_close`, including the `_` catch-all and the
+`UnixConnected` relookup path, stores `SockEntry::empty()`, which zeroes `bound_port`
+and clears `in_use` — so **clearing the slot is the release**, and exhaustion is
+impossible by construction. The patch therefore *removes* the dead binding rather than
+renaming it to `_port` (a dead read invites someone to re-add it) and leaves a comment
+recording why no release is needed. Verification is just that the warning is gone with
+no new ones, and `scmtest` unchanged.
 
-### 10. Deferred work and known limitations
+### 9. Delete the unreachable `init-server` crate
+
+The scope is larger than this item previously stated. **`init-server` is a real
+dependency in `kernel/Cargo.toml:34`, so all 2653 lines compile into every kernel
+build**, while `init_server::` appears in no Rust code anywhere — the only external
+mentions are the stale doc comment at `kernel/src/init.rs:4`, the workspace member
+list, that Cargo line, `Cargo.lock`, and a README row describing it as "PID-1: server
+bring-up, mounts, getty loop", **which is false** (that is `kernel/src/init.rs` plus
+userland `/bin/init`). `init_main` is the crate's only public entry point, so the whole
+crate is unreachable — an in-kernel shell, ~40 coreutils and the smoke tests, not just
+`run_posix_tests()`.
+
+**Wiring it in is not an option as written:** `init_main` is `-> !` and ends in
+`run_shell()`, an in-kernel serial shell that never returns, so calling it would
+*replace* the real boot path (initrd → `/bin/init` → getty → login → `start-cosmic`),
+not augment it.
+
+**Nothing is worth salvaging**, checked rather than assumed: the `t_*` tests call
+`net::handle()` and `vfs_*` directly with kernel-space pointers, bypassing the syscall
+ABI entirely, so they structurally cannot cover what the userland binaries cover.
+`t_af_inet_loopback` is strictly weaker than the `inet_loopback_tcp` landed in
+`26eebf0` (fixed port 9999, no `getsockname`, no reverse direction); the rest
+duplicates vfstest/scmtest/memtest; and the only kernel-internal candidates,
+`t_buddy_alloc` and `t_heap_end`, are one-line smoke checks of paths every boot
+exercises. The patch removes the crate, the workspace member, the kernel dependency,
+both `Cargo.lock` entries and the README row, and rewrites the stale doc comment.
+Recoverable at any time via `git show 905148f:servers/init/src/lib.rs`. Verification:
+both arches link with the crate gone, `grep -rn init_server .` is empty, serial output
+is **unchanged** to the login prompt (nothing in the crate ever printed), and the full
+suite is at baseline on fresh images.
+
+### 10. AF_UNIX `listen()` is lax in the opposite direction
+
+The AF_UNIX arm of `handle_listen` is an unconditional `ok_reply()` — a repeat listen
+already succeeds, but so does `listen()` on an unbound or already-connected AF_UNIX
+socket, where Linux answers EINVAL. Found while fixing the AF_INET side (item 7) and
+deliberately **not** changed there: tightening it alters behaviour for every AF_UNIX
+server on the system (cosmic-comp, busd, tokio) and could not be validated in a
+read-only session. Needs a live COSMIC session to land safely.
+
+### 11. No TIME_WAIT — ports are instantly reusable
+
+`handle_close` calls `socket_set.remove()` immediately, so a closed TCP port can be
+rebound at once where Linux would hold it in TIME_WAIT. A divergence, not a leak, and
+low priority — but it is the kind of thing that makes a server restart behave
+differently here than on Linux.
+
+### 12. Deferred work and known limitations
 
 - **Doom does not link relibc.** `../doomgeneric/Makefile.leandros` links
   `userland/target/<arch>-unknown-none/release/libleandros_libc.a`, whose allocator is
