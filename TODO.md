@@ -3,11 +3,15 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-06** (`26eebf0`); item 5 and the item 11
+Last reconciled against `main` on **2026-08-06** (`26eebf0`); item 5 and the item 10
 Mesa-modifier bullet updated the same day with a source-analysis wave over smithay
 `efeb597` and the kernel DRM property/blob path. Same day, a second wave: item 2
 (memfd tmpfs-slot leak) got a completed source-analysis pass and a prepared-but-unbuilt
 patch, and a new item 3 was split out for the TGID defect the audit found along the way.
+Same day, a third wave retired the former item 7 (Doom hang): measured on the Linux box
+at `295136c` with fresh images, Doom runs on both arches, including the literal
+`-mb 16` case — see the softfloat note in Standing context and the allocator note in
+item 10 for what it leaves behind.
 
 ---
 
@@ -87,6 +91,16 @@ reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print i
   register lands on the interrupted thread's. Both kernel target JSONs disable the
   vector units; `cpu_switch_to` is the single deliberate exception and scopes the
   extension with `.arch armv8-a+fp+simd` … `.arch armv8-a`.
+  **Inferred, not bisected:** this is also most likely what retired the former item 7
+  (Doom hang in `malloc(16 MB)` on aarch64, deleted 2026-08-06 — it now runs both
+  arches on fresh images). Doom is compiled `clang --target=aarch64-unknown-none -O2`,
+  a **hardfloat** target, so clang freely lowers inlined `memcpy`/`memset`/struct
+  copies through `q` registers; `Z_Init`/`W_Init` is the phase of maximum cold-page
+  exposure in a 1.45 MB static binary, and a demand-paging fault there under the old
+  `+neon` kernel clobbering a `q` register holding a loop bound or pointer is exactly
+  the "hangs with no output, no fault" shape that was observed. `75b32e3` (sub-tick
+  `CLOCK_MONOTONIC`) is a weaker secondary candidate. Doom is the fifth thing this
+  session traced to this clobber, directly or as the retiring cause.
 - Release builds only — debug builds crash early. Test **both** arches in QEMU after
   every change. Minimum Limine revision is **6**, never downgrade.
 - Regression images must be freshly regenerated — run vfstest **exactly once** per
@@ -129,11 +143,10 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 4 | `wl_display error 0 "Unknown id: 636"` | Bug | re-measure post-fix |
 | 5 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
 | 6 | evdev monotonic timestamps — recorded cause refuted, ready to re-land | Bug | — |
-| 7 | Doom hangs in `malloc(16 MB)` on aarch64 | Bug | re-verify first |
-| 8 | `listen()` twice returns EINVAL, deviating from Linux | Bug | — |
-| 9 | `unused variable: port` warning in `handle_close` | Cleanup | — |
-| 10 | Dead `init_main` / unreachable POSIX smoke tests | Cleanup | — |
-| 11 | Deferred / known limitations | Mixed | — |
+| 7 | `listen()` twice returns EINVAL, deviating from Linux | Bug | — |
+| 8 | `unused variable: port` warning in `handle_close` | Cleanup | — |
+| 9 | Dead `init_main` / unreachable POSIX smoke tests | Cleanup | — |
+| 10 | Deferred / known limitations | Mixed | — |
 
 ---
 
@@ -169,6 +182,15 @@ precisely to bypass the loader and `dlopen` the ICD directly), and no WSI has be
 chosen among the ICD's `VK_KHR_wayland_surface` / `VK_KHR_display` /
 `VK_EXT_headless_surface` / `VK_EXT_acquire_drm_display`. That is the M3 rendering
 milestone.
+
+**Linux-box tree state (trap).** That checkout is on a **detached HEAD** with two
+stashes, and **`stash@{0}` must not be blind-popped**. It holds 6 files but only 3 are
+wanted (the AF_INET work, which has since landed as `26eebf0`); its `arch/*/src/timer.rs`
+are now identical to what landed, and its `kernel/src/syscall.rs` is **older** than
+current HEAD — popping it would revert `4085b7f` (nested-epoll readiness). Re-land from
+`~/code/leandros-artifacts/notes/m9-af-inet-loopback/af_inet_loopback_verified.patch`
+instead. A raw copy of that stash also exists at
+`/home/forain/linux-tree-preexisting.patch` on the box.
 
 ### 2. memfd burns a tmpfs slot per call — fix prepared, needs an in-flight refcount
 
@@ -428,23 +450,7 @@ legacy-path control on a build differing **only** by this patch, and add a guest
 event counter — every previous run only proved QMP accepted the moves, never that they
 reached the guest ring.
 
-### 7. Doom hangs in `malloc(16 MB)` on aarch64
-
-Doom runs through `DG_Init`, DRM init, a successful GPU flush and into the engine, then
-hangs in the first `malloc(16 MB)` (`Z_Init` → `I_ZoneBase` → `AutoAllocMemory` in
-`doomgeneric/i_system.c`). The `"zone memory: ... allocated"` print never appears.
-x86_64 renders 1580 frames fine.
-
-Diagnosed 2026-06-29: not a page-fault loop (<256 demand faults total, none while
-hung — the 16 MB is never touched), and the kernel's `sys_mmap` anonymous path uses
-`map_lazy` so it returns quickly. The hang is in relibc's dlmalloc or its `brk`/`mmap`
-syscall glue.
-
-**Re-verify before investigating.** That diagnosis predates `04c80cd` ("give relibc's C
-sources a cross compiler, not the host one"), which touches exactly the layer blamed
-here — this may already be fixed.
-
-### 8. `listen()` twice returns EINVAL, deviating from Linux
+### 7. `listen()` twice returns EINVAL, deviating from Linux
 
 `handle_listen` (`servers/net/src/lib.rs`) matches only `SockState::InetBound`, so a
 second `listen()` on an already-listening socket falls through to `_ => err_reply(-22)`.
@@ -452,13 +458,13 @@ On Linux a second `listen()` succeeds and simply updates the backlog. Confirmed 
 measurement (`second_errno=22`). Low priority, but a real POSIX deviation that a server
 framework could trip on. Discovered during AF_INET loopback verification (`26eebf0`).
 
-### 9. `unused variable: port` warning in `handle_close`
+### 8. `unused variable: port` warning in `handle_close`
 
 `servers/net/src/lib.rs:2423`, in `handle_close`: the `InetListening`/`InetBound`
 rework in `26eebf0` stopped using `bound_port` there. Cosmetic; a one-character `_port`
 fixes it. Left as-is deliberately so that patch could land and be reviewed verbatim.
 
-### 10. Dead `init_main` / unreachable POSIX smoke tests
+### 9. Dead `init_main` / unreachable POSIX smoke tests
 
 `init_server::init_main()` (`servers/init/src/lib.rs:2651`) is referenced nowhere in
 the kernel; the only mention outside its own file is a stale doc comment at
@@ -469,8 +475,20 @@ self-test that reads as coverage and provides none. **Discovered because the AF_
 loopback work (`26eebf0`) cited that self-test as evidence** — a dead test is worse
 than no test, because it gets cited.
 
-### 11. Deferred work and known limitations
+### 10. Deferred work and known limitations
 
+- **Doom does not link relibc.** `../doomgeneric/Makefile.leandros` links
+  `userland/target/<arch>-unknown-none/release/libleandros_libc.a`, whose allocator is
+  `userland/libc/src/mem.rs` — a ~20-line **bump allocator over `brk(2)`** with no free
+  list, no dlmalloc and no `mmap` path. The retired malloc-hang item (deleted
+  2026-08-06 — Doom now runs both arches on fresh images) had blamed "relibc's
+  dlmalloc or its `brk`/`mmap` glue" and nominated `04c80cd` ("give relibc's C sources
+  a cross compiler") as the likely fix; **neither could ever have been right**, since
+  Doom never touches relibc. Worth stating plainly so the next person debugging a Doom
+  allocation does not start in relibc.
+- **doomgeneric's zone default is 4 MiB, not 16.** `DEFAULT_RAM 4`; the 16 MiB case is
+  reachable only via `-mb 16` (and that forced case also passes: `zone memory:
+  0x33e008, 1000000 allocated for zone`).
 - **Mesa modifier support — needs re-verification.** The claim that our GBM lacking
   `gbm_bo_create_with_modifiers2` means smithay cannot build a reusing swapchain and
   reallocates per frame was **not confirmed against smithay's source**, and may be
