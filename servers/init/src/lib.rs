@@ -448,6 +448,19 @@ fn t_af_unix() {
     }
 }
 
+/// Give `net_daemon` a chance to run one smoltcp poll. TCP over 127.0.0.1 is
+/// still real TCP: connect() only queues a SYN, and the daemon carries the
+/// whole ARP + three-way handshake on its next poll (Interface::poll loops
+/// until neither ingress nor egress makes progress). One tick is normally
+/// enough — `handle_connect` wakes the daemon — but wait a few to stay clear
+/// of scheduler jitter.
+fn net_settle(ticks: u64) {
+    let start = sched::ticks();
+    while sched::ticks().wrapping_sub(start) < ticks {
+        sched::yield_now("init_idle");
+    }
+}
+
 /// Test AF_INET loopback: bind+listen on port 9999, connect, accept, send/recv.
 fn t_af_inet_loopback() {
     let pid = sched::current_pid();
@@ -498,24 +511,32 @@ fn t_af_inet_loopback() {
         if r != 0 { fail("inet connect", "connect() failed"); vfs_close(srv); vfs_close(cli); return; }
     }
 
-    // 5. Accept the connection.
-    let acc = {
+    // 5. Accept the connection, once the handshake has had a poll to complete.
+    //    accept() is non-blocking at this layer and answers EAGAIN until then.
+    let mut acc = -11;
+    for _ in 0..20 {
+        net_settle(2);
         let m = make_msg(net::NET_ACCEPT, &[srv as u64, 0, 0]);
-        reply_i64(&net::handle(&m, pid)) as i32
-    };
+        acc = reply_i64(&net::handle(&m, pid)) as i32;
+        if acc != -11 { break; }
+    }
     if acc < 0 { fail("inet accept", "accept() failed"); vfs_close(srv); vfs_close(cli); return; }
 
     // 6. Send "hello" from client → accepted socket, receive on server side.
+    //    The segment leaves on the next poll, so recv retries the same way.
     let send_msg = b"hello-inet";
     {
         let m = make_msg(net::NET_SEND, &[cli as u64, send_msg.as_ptr() as u64, send_msg.len() as u64, 0]);
         let _ = net::handle(&m, pid);
     }
     let mut rbuf = [0u8; 16];
-    let rn = {
+    let mut rn: isize = -11;
+    for _ in 0..20 {
+        net_settle(2);
         let m = make_msg(net::NET_RECV, &[acc as u64, rbuf.as_mut_ptr() as u64, rbuf.len() as u64, 0]);
-        reply_i64(&net::handle(&m, pid)) as isize
-    };
+        rn = reply_i64(&net::handle(&m, pid)) as isize;
+        if rn != -11 { break; }
+    }
 
     vfs_close(srv); vfs_close(cli); vfs_close(acc);
 

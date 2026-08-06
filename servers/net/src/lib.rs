@@ -334,8 +334,15 @@ enum SockState {
     /// A connect() waiting to be paired by the listener bound to `sock_id`.
     UnixPendingAccept { conn_idx: usize, sock_id: u64 },
     InetBound { domain: u8, sock_type: u8, local_endpoint: IpEndpoint },
-    InetListening { socket_handle: SocketHandle },
-    InetConnected { socket_handle: SocketHandle, remote_endpoint: Option<IpEndpoint> },
+    /// A listening TCP socket, one smoltcp handle per stack it listens on:
+    /// `main` on the NIC's interface, `lo` on the loopback one. A bind to
+    /// INADDR_ANY listens on both (as Linux does), a bind to an explicit
+    /// address on exactly one, so at least one of the two is always `Some`.
+    /// `local` is the bound endpoint, kept for getsockname and for re-arming a
+    /// listener after accept.
+    InetListening { main: Option<SocketHandle>, lo: Option<SocketHandle>, local: IpEndpoint },
+    /// `lo` says which stack owns `socket_handle` — see `stack_for`.
+    InetConnected { socket_handle: SocketHandle, remote_endpoint: Option<IpEndpoint>, lo: bool },
     IcmpUnbound,
     IcmpBound { socket_handle: SocketHandle },
 }
@@ -413,6 +420,150 @@ fn fd_to_slot(fd: usize) -> Option<usize> {
     if fd >= SOCK_FD_BASE && fd < SOCK_FD_END { Some(fd - SOCK_FD_BASE) } else { None }
 }
 
+/// The stack that owns a socket's smoltcp handle. Both statics have the same
+/// type, so a site that used to say `NET_STACK.lock()` now says `stack_for(lo)`.
+/// The two are never locked at the same time — every caller takes one, finishes
+/// with it, and only then takes the other.
+#[inline]
+fn stack_for(lo: bool) -> spin::MutexGuard<'static, Option<NetStack>> {
+    if lo { LO_STACK.lock() } else { NET_STACK.lock() }
+}
+
+/// True for an address the loopback stack owns (127.0.0.0/8).
+#[inline]
+fn is_loopback_addr(addr: IpAddress) -> bool {
+    matches!(addr, IpAddress::Ipv4(v4) if v4.is_loopback())
+}
+
+/// Pick a free local port from Linux's ephemeral range for a `bind()` to port 0
+/// or a `connect()` from an unbound socket. "Free" means no socket in any
+/// process table claims it. Caller holds SOCK_TABLES; this only reads it, so it
+/// must run before the caller borrows its own table mutably.
+fn alloc_ephemeral_port(tbls: &[ProcSockTable]) -> Option<u16> {
+    const EPHEMERAL_LO: u32 = 32768;
+    const EPHEMERAL_HI: u32 = 60999;
+    let span  = EPHEMERAL_HI - EPHEMERAL_LO + 1;
+    let start = (sched::ticks() as u32) % span;
+    for i in 0..span {
+        let p = (EPHEMERAL_LO + (start + i) % span) as u16;
+        let taken = tbls.iter().any(|t| t.in_use
+            && t.socks.iter().any(|s| s.in_use && s.bound_port == p));
+        if !taken { return Some(p); }
+    }
+    None
+}
+
+/// Write a `sockaddr_in` (Linux ABI: sa_family(2) + sin_port BE(2) + sin_addr
+/// BE(4) + 8 pad) and its length. `addrlen_ptr` is in/out, as on Linux: its
+/// incoming value caps how much of the caller's buffer may be written, and it
+/// always reports the full address length back. The caller must hold NO server
+/// lock — this touches user memory, which can demand-page and re-enter the
+/// scheduler.
+unsafe fn write_sockaddr_in(addr_ptr: usize, addrlen_ptr: usize, endpoint: IpEndpoint) {
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+    sa[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
+    if let IpAddress::Ipv4(ipv4) = endpoint.addr {
+        sa[4..8].copy_from_slice(&ipv4.0); // already network order
+    }
+    let cap = ((addrlen_ptr as *const u32).read_unaligned() as usize).min(sa.len());
+    core::ptr::copy_nonoverlapping(sa.as_ptr(), addr_ptr as *mut u8, cap);
+    (addrlen_ptr as *mut u32).write_unaligned(sa.len() as u32);
+}
+
+/// Add a fresh listening TCP socket for `port` to one stack. `None` when that
+/// stack does not exist (no virtio-net device) or the port is unusable. Takes
+/// exactly one stack lock.
+fn listen_on(lo: bool, port: u16) -> Option<SocketHandle> {
+    let mut stack = stack_for(lo);
+    let s = stack.as_mut()?;
+    let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
+    let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
+    let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
+    socket.listen(port).ok()?;
+    Some(s.socket_set.add(socket))
+}
+
+/// If this stack's listening socket has completed a handshake, hand its handle
+/// back together with a replacement listener on the same port. smoltcp has no
+/// accept queue: the listening socket *becomes* the connection, so accepting it
+/// means taking it over and arming a new one in its place. Takes exactly one
+/// stack lock.
+fn accept_on(lo: bool, handle: Option<SocketHandle>, port: u16)
+    -> Option<(SocketHandle, SocketHandle)>
+{
+    let handle = handle?;
+    let mut stack = stack_for(lo);
+    let s = stack.as_mut()?;
+    {
+        let socket = s.socket_set.get_mut::<tcp::Socket>(handle);
+        if !(socket.is_active() && socket.state() == tcp::State::Established) {
+            return None;
+        }
+    }
+    let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
+    let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
+    let mut replacement = tcp::Socket::new(rx_buffer, tx_buffer);
+    replacement.listen(port).ok()?;
+    Some((handle, s.socket_set.add(replacement)))
+}
+
+/// The local endpoint of an AF_INET socket, for getsockname. `None` for
+/// anything that is not an inet socket (the AF_UNIX answer is written by the
+/// caller). Takes SOCK_TABLES and then at most one stack lock, never nested
+/// the other way round.
+fn inet_local_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
+    let (state, sock_type, bound_port) = inet_sock_info(pid, fd)?;
+    match state {
+        SockState::InetBound { local_endpoint, .. }  => Some(local_endpoint),
+        SockState::InetListening { local, .. }       => Some(local),
+        // Only a TCP socket may be fetched as a tcp::Socket — `SocketSet::get_mut`
+        // panics on a type mismatch, so a connected UDP socket answers from the
+        // fd table instead.
+        SockState::InetConnected { socket_handle, lo, .. }
+            if sock_type == SOCK_STREAM as u8 =>
+        {
+            let mut stack = stack_for(lo);
+            let s = stack.as_mut()?;
+            s.socket_set.get_mut::<tcp::Socket>(socket_handle).local_endpoint()
+        }
+        SockState::InetConnected { .. } =>
+            Some(IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), bound_port)),
+        _ => None,
+    }
+}
+
+/// The remote endpoint of a connected AF_INET socket, for getpeername.
+fn inet_remote_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
+    let (state, sock_type, _) = inet_sock_info(pid, fd)?;
+    match state {
+        SockState::InetConnected { socket_handle, remote_endpoint, lo }
+            if sock_type == SOCK_STREAM as u8 =>
+        {
+            let mut stack = stack_for(lo);
+            match stack.as_mut() {
+                Some(s) => s.socket_set.get_mut::<tcp::Socket>(socket_handle)
+                            .remote_endpoint().or(remote_endpoint),
+                None => remote_endpoint,
+            }
+        }
+        // A connected UDP socket has no smoltcp-side peer: report the endpoint
+        // connect() recorded.
+        SockState::InetConnected { remote_endpoint, .. } => remote_endpoint,
+        _ => None,
+    }
+}
+
+/// `(state, sock_type, bound_port)` of one fd, read under SOCK_TABLES and with
+/// the lock released before the caller touches any stack.
+fn inet_sock_info(pid: u32, fd: usize) -> Option<(SockState, u8, u16)> {
+    let slot = fd_to_slot(fd)?;
+    let tbls = SOCK_TABLES.lock();
+    let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return None; }
+    Some((tbl.socks[slot].state, tbl.socks[slot].sock_type, tbl.socks[slot].bound_port))
+}
+
 /// Free the BOUND_PATHS slot a `UnixListening` socket owned. Called when the
 /// listener closes: the address stops resolving to a live listener (a pathname
 /// socket's VFS node lingers per Linux, but connecting to it now yields
@@ -429,10 +580,25 @@ fn free_bound_idx(bound_idx: usize) {
 pub struct NetStack {
     pub interface: Interface,
     pub socket_set: SocketSet<'static>,
-    pub dhcp_handle: SocketHandle,
+    /// `Some` only on the NIC's stack. The loopback stack runs no DHCP client:
+    /// a dhcpv4 socket there would broadcast DISCOVERs into its own queue and
+    /// then receive them back forever.
+    pub dhcp_handle: Option<SocketHandle>,
+    /// `Some` only on the loopback stack. `phy::Loopback` owns the queue that
+    /// carries a frame from transmit back to receive, so it has to persist
+    /// across polls; the virtio wrapper is a stateless `dev_idx` and is rebuilt
+    /// at every poll instead.
+    pub loopback_dev: Option<smoltcp::phy::Loopback>,
 }
 
 pub static NET_STACK: Mutex<Option<NetStack>> = Mutex::new(None);
+/// The loopback stack (127.0.0.0/8). Deliberately a *second* `Interface` with
+/// its own `SocketSet`, not a second address on the NIC's interface: two
+/// interfaces sharing one socket set would let whichever polls first claim a
+/// socket's pending segment, so a loopback SYN could be emitted onto the wire
+/// and never delivered. Separate sets make the choice explicit and make it
+/// once, at bind/connect time.
+pub static LO_STACK: Mutex<Option<NetStack>> = Mutex::new(None);
 pub static NFTABLES: Mutex<nftables::NftablesEngine> = Mutex::new(nftables::NftablesEngine::new());
 
 pub struct VirtioNetDeviceWrapper {
@@ -561,6 +727,7 @@ impl smoltcp::phy::TxToken for TxToken {
 }
 
 pub fn init() {
+    init_loopback();
     if drivers::virtio_net::device_count() > 0 {
         if let Some(mac) = drivers::virtio_net::get_mac_address(0) {
             let mut device = VirtioNetDeviceWrapper { dev_idx: 0 };
@@ -582,7 +749,8 @@ pub fn init() {
             let stack = NetStack {
                 interface,
                 socket_set,
-                dhcp_handle,
+                dhcp_handle: Some(dhcp_handle),
+                loopback_dev: None,
             };
             *NET_STACK.lock() = Some(stack);
 
@@ -593,27 +761,82 @@ pub fn init() {
     }
 }
 
+/// Stand up the loopback stack. Unconditional, unlike the NIC's: 127.0.0.1 has
+/// to work on a guest with no virtio-net device at all, which is exactly the
+/// configuration `init` skips above.
+fn init_loopback() {
+    let mut device = smoltcp::phy::Loopback::new(smoltcp::phy::Medium::Ethernet);
+    // A locally-administered MAC, distinct from the NIC's. It is never seen off
+    // the box; smoltcp needs one only so the interface can answer its own ARP
+    // request for 127.0.0.1. Ethernet medium (rather than Medium::Ip) keeps this
+    // interface on the same code path as the NIC's, and is what smoltcp's own
+    // loopback example uses.
+    let hardware_addr = HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 1]));
+    let mut config = Config::new(hardware_addr);
+    config.random_seed = sched::ticks();
+
+    let mut interface = Interface::new(config, &mut device,
+        Instant::from_millis((sched::ticks() * 10) as i64));
+    interface.update_ip_addrs(|addrs| {
+        addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
+    });
+    // No default route on purpose: 127.0.0.0/8 is on-link here, and nothing
+    // else may ever leave through this interface.
+
+    *LO_STACK.lock() = Some(NetStack {
+        interface,
+        socket_set: SocketSet::new(alloc::vec![]),
+        dhcp_handle: None,
+        loopback_dev: Some(device),
+    });
+
+    extern "C" { fn arch_serial_putc(b: u8); }
+    let msg = b"[NET] Loopback interface 127.0.0.1/8 up\r\n";
+    for &b in msg { unsafe { arch_serial_putc(b); } }
+}
+
 pub fn net_daemon() -> ! {
     loop {
         let timestamp = Instant::from_millis((sched::ticks() * 10) as i64);
         let mut device = VirtioNetDeviceWrapper { dev_idx: 0 };
         
+        let mut readiness_changed = false;
         let dhcp_status = {
             let mut stack = NET_STACK.lock();
             if let Some(ref mut s) = *stack {
-                s.interface.poll(timestamp, &mut device, &mut s.socket_set);
+                readiness_changed |= s.interface.poll(timestamp, &mut device, &mut s.socket_set);
 
-                let dhcp_socket = s.socket_set.get_mut::<smoltcp::socket::dhcpv4::Socket>(s.dhcp_handle);
-                match dhcp_socket.poll() {
-                    Some(smoltcp::socket::dhcpv4::Event::Configured(config)) => {
-                        Some((config.address, config.router, config.dns_servers))
+                match s.dhcp_handle {
+                    Some(h) => {
+                        let dhcp_socket =
+                            s.socket_set.get_mut::<smoltcp::socket::dhcpv4::Socket>(h);
+                        match dhcp_socket.poll() {
+                            Some(smoltcp::socket::dhcpv4::Event::Configured(config)) => {
+                                Some((config.address, config.router, config.dns_servers))
+                            }
+                            _ => None,
+                        }
                     }
-                    _ => None,
+                    None => None,
                 }
             } else {
                 None
             }
         };
+
+        // The loopback stack is independent of the NIC and exists even when no
+        // NIC does. One poll carries a whole 127.0.0.1 exchange — ARP, SYN,
+        // SYN-ACK, ACK — because Interface::poll loops until neither ingress
+        // nor egress made progress, and the Loopback phy feeds every frame it
+        // transmits straight back into its own receive queue.
+        {
+            let mut lo = LO_STACK.lock();
+            if let Some(ref mut s) = *lo {
+                if let Some(ref mut dev) = s.loopback_dev {
+                    readiness_changed |= s.interface.poll(timestamp, dev, &mut s.socket_set);
+                }
+            }
+        }
 
         if let Some((addr, router, _dns)) = dhcp_status {
             let mut stack = NET_STACK.lock();
@@ -640,6 +863,12 @@ pub fn net_daemon() -> ! {
             }
             for &b in b"\r\n" { unsafe { arch_serial_putc(b); } }
         }
+
+        // AF_INET sockets are level-triggered through NET_POLL, so a task
+        // parked in poll/epoll_wait only re-reads them when someone publishes a
+        // readiness edge. smoltcp just told us whether one may have happened;
+        // publish it with every stack lock released.
+        if readiness_changed { sched::wake_poll(); }
 
         // Block until the next tick (~100 Hz poll cadence) instead of a tight
         // yield_now busy-poll. The old spin pinned this kernel task's CPU at
@@ -765,19 +994,51 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
     match sa_family {
         AF_INET => {
             if addrlen < 8 { return err_reply(-22); }
+            // sockaddr_in is read out of user memory here, before any lock is
+            // taken: a demand-paging fault under SOCK_TABLES would re-enter the
+            // scheduler with a server lock held.
             let port_be = unsafe { ((addr_ptr + 2) as *const u16).read_unaligned() };
             let port = u16::from_be(port_be);
             let sin_addr = unsafe { ((addr_ptr + 4) as *const u32).read_unaligned() };
-            
+            let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+
+            // An address no interface owns is EADDRNOTAVAIL on Linux. INADDR_ANY
+            // and 127.0.0.0/8 always bind; anything else must be an address the
+            // NIC currently holds. Without this a bind to a bogus address
+            // "succeeded" and then silently never received anything.
+            if !ip.is_unspecified() && !is_loopback_addr(ip) {
+                let held = {
+                    let stack = NET_STACK.lock();
+                    match *stack {
+                        Some(ref s) => s.interface.ip_addrs().iter().any(|c| c.address() == ip),
+                        None        => false,
+                    }
+                };
+                if !held { return err_reply(-99); } // EADDRNOTAVAIL
+            }
+
             let mut tbls = SOCK_TABLES.lock();
+            // Port 0 means "any free port". Assigning it *here* rather than at
+            // listen() is what makes bind("127.0.0.1:0") — i.e. every
+            // mio/tokio TcpListener::bind — work: listen() rejects a still-zero
+            // bound_port with EINVAL, which surfaced to the caller as
+            // "bind failed: Invalid argument". Picking the port reads every
+            // table, so it happens before this process's is borrowed mutably.
+            let port = if port != 0 {
+                port
+            } else {
+                match alloc_ephemeral_port(&*tbls) {
+                    Some(p) => p,
+                    None    => return err_reply(-98), // EADDRINUSE: range exhausted
+                }
+            };
             let tbl = match find_tbl(pid, &mut *tbls) {
                 Some(t) => t, None => return err_reply(-9),
             };
             if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
-            
-            let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+
             let local_endpoint = IpEndpoint::new(ip, port);
-            
+
             tbl.socks[slot].state = SockState::InetBound {
                 domain: AF_INET as u8,
                 sock_type: tbl.socks[slot].sock_type,
@@ -862,21 +1123,24 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
     if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
 
     if tbl.socks[slot].domain == AF_INET as u8 {
-        let bound_port = tbl.socks[slot].bound_port;
-        if bound_port == 0 { return err_reply(-22); }
-        
-        let mut stack = NET_STACK.lock();
-        if let Some(ref mut s) = *stack {
-            let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
-            let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
-            let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
-            socket.listen(bound_port).unwrap();
-            let handle = s.socket_set.add(socket);
-            tbl.socks[slot].state = SockState::InetListening { socket_handle: handle };
-            ok_reply()
-        } else {
-            err_reply(-100)
-        }
+        // bind() is what assigns the port (including the ephemeral one for a
+        // bind to :0), so a socket that never bound has no InetBound state and
+        // gets EINVAL — the same answer the old zero-bound_port check gave.
+        let local = match tbl.socks[slot].state {
+            SockState::InetBound { local_endpoint, .. } => local_endpoint,
+            _ => return err_reply(-22),
+        };
+        if local.port == 0 { return err_reply(-22); }
+
+        // INADDR_ANY listens on both stacks, as it does on Linux; an explicit
+        // address on exactly the one that owns it.
+        let any = local.addr.is_unspecified();
+        let main = if any || !is_loopback_addr(local.addr) { listen_on(false, local.port) } else { None };
+        let lo   = if any ||  is_loopback_addr(local.addr) { listen_on(true,  local.port) } else { None };
+        if main.is_none() && lo.is_none() { return err_reply(-100); } // ENETDOWN
+
+        tbl.socks[slot].state = SockState::InetListening { main, lo, local };
+        ok_reply()
     } else {
         ok_reply()
     }
@@ -894,7 +1158,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
     let acc_nonblock = flags & SOCK_NONBLOCK != 0;
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
 
-    let (state, bound_port, sock_type) = {
+    let (state, _bound_port, sock_type) = {
         let tbls = SOCK_TABLES.lock();
         let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
             Some(t) => t, None => return err_reply(-9),
@@ -904,31 +1168,33 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
     };
 
     match state {
-        SockState::InetListening { socket_handle } => {
-            let mut stack = NET_STACK.lock();
-            if let Some(ref mut s) = *stack {
-                let is_connected = {
-                    let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
-                    socket.is_active() && socket.state() == tcp::State::Established
+        SockState::InetListening { main, lo, local } => {
+            // Try the NIC's stack, then loopback. `accept_on` holds one stack
+            // lock at a time and hands back the established handle plus the
+            // replacement listener it armed in its place.
+            let (from_lo, established, replacement) =
+                if let Some((e, r)) = accept_on(false, main, local.port) {
+                    (false, e, r)
+                } else if let Some((e, r)) = accept_on(true, lo, local.port) {
+                    (true, e, r)
+                } else {
+                    return err_reply(-11); // EAGAIN: no completed handshake yet
                 };
-                
-                if !is_connected {
-                    return err_reply(-11);
-                }
 
-                let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
-                let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
-                let mut new_listening_socket = tcp::Socket::new(rx_buffer, tx_buffer);
-                new_listening_socket.listen(bound_port).unwrap();
-                let new_handle = s.socket_set.add(new_listening_socket);
-
+            let new_slot = {
                 let mut tbls = SOCK_TABLES.lock();
-                let tbl = find_tbl(pid, &mut *tbls).unwrap();
-                tbl.socks[slot].state = SockState::InetListening { socket_handle: new_handle };
-
+                let tbl = match find_tbl(pid, &mut *tbls) {
+                    Some(t) => t, None => return err_reply(-9),
+                };
+                tbl.socks[slot].state = if from_lo {
+                    SockState::InetListening { main, lo: Some(replacement), local }
+                } else {
+                    SockState::InetListening { main: Some(replacement), lo, local }
+                };
                 let new_slot = match tbl.alloc() { Some(sn) => sn, None => return err_reply(-24) };
                 tbl.socks[new_slot] = SockEntry {
-                    state: SockState::InetConnected { socket_handle, remote_endpoint: None },
+                    state: SockState::InetConnected {
+                        socket_handle: established, remote_endpoint: None, lo: from_lo },
                     in_use: true,
                     bound_port: 0,
                     domain: AF_INET as u8,
@@ -936,26 +1202,23 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     cloexec: acc_cloexec,
                     nonblock: acc_nonblock,
                 };
+                new_slot
+            };
 
-                if addr_ptr != 0 && addrlen_ptr != 0 {
-                    let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
-                    if let Some(endpoint) = socket.remote_endpoint() {
-                        unsafe {
-                            core::ptr::write_bytes(addr_ptr as *mut u8, 0, 16);
-                            core::ptr::write(addr_ptr as *mut u16, AF_INET as u16);
-                            core::ptr::write((addr_ptr + 2) as *mut u16, endpoint.port.to_be());
-                            if let IpAddress::Ipv4(ipv4) = endpoint.addr {
-                                core::ptr::write((addr_ptr + 4) as *mut u32, u32::from_ne_bytes(ipv4.0));
-                            }
-                            *(addrlen_ptr as *mut u32) = 16;
-                        }
-                    }
+            if addr_ptr != 0 && addrlen_ptr != 0 {
+                // Read the peer endpoint under the stack lock, write it into
+                // user memory only after that lock is gone.
+                let peer = {
+                    let mut stack = stack_for(from_lo);
+                    stack.as_mut().and_then(|s|
+                        s.socket_set.get_mut::<tcp::Socket>(established).remote_endpoint())
+                };
+                if let Some(endpoint) = peer {
+                    unsafe { write_sockaddr_in(addr_ptr, addrlen_ptr, endpoint); }
                 }
-
-                val_reply((new_slot + SOCK_FD_BASE) as u64)
-            } else {
-                err_reply(-100)
             }
+
+            val_reply((new_slot + SOCK_FD_BASE) as u64)
         }
         SockState::UnixListening { bound_idx } => {
             // Only pair a pending connect that targeted *this* listener's
@@ -1058,35 +1321,49 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         let port_be  = unsafe { ((addr_ptr + 2) as *const u16).read_unaligned() };
         let port     = u16::from_be(port_be);
         let sin_addr = unsafe { ((addr_ptr + 4) as *const u32).read_unaligned() };
-        
+
+        let remote_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+        let remote_endpoint = IpEndpoint::new(remote_ip, port);
+        // 127.0.0.0/8 is served by the loopback stack, everything else by the
+        // NIC's. Decided once, here, and recorded in the socket state so every
+        // later send/recv/poll/close looks in the same socket set.
+        let lo = is_loopback_addr(remote_ip);
+
         let mut tbls = SOCK_TABLES.lock();
+        // Source port for a socket that never bound. Picked before this
+        // process's table is borrowed mutably, since it reads every table.
+        let ephemeral = alloc_ephemeral_port(&*tbls);
         let tbl = match find_tbl(pid, &mut *tbls) {
             Some(t) => t, None => return err_reply(-9),
         };
         if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
 
         let sock_type = tbl.socks[slot].sock_type;
-        let mut stack = NET_STACK.lock();
+        let local_port = if tbl.socks[slot].bound_port != 0 {
+            tbl.socks[slot].bound_port
+        } else {
+            match ephemeral {
+                Some(p) => { tbl.socks[slot].bound_port = p; p }
+                None    => return err_reply(-98), // EADDRINUSE: range exhausted
+            }
+        };
+
+        let reply = {
+        let mut stack = stack_for(lo);
         if let Some(ref mut s) = *stack {
-            let remote_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
-            let remote_endpoint = IpEndpoint::new(remote_ip, port);
-            
             if sock_type == SOCK_STREAM as u8 {
                 let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
                 let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
                 let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
-                
-                let local_port = if tbl.socks[slot].bound_port != 0 {
-                    tbl.socks[slot].bound_port
-                } else {
-                    let p = 49152 + (sched::ticks() % 16384) as u16;
-                    tbl.socks[slot].bound_port = p;
-                    p
-                };
-                
-                socket.connect(s.interface.context(), remote_endpoint, local_port).unwrap();
+
+                // A caller-supplied address must never panic the kernel: an
+                // unroutable or malformed endpoint is EINVAL, not unwrap().
+                if socket.connect(s.interface.context(), remote_endpoint, local_port).is_err() {
+                    return err_reply(-22);
+                }
                 let handle = s.socket_set.add(socket);
-                tbl.socks[slot].state = SockState::InetConnected { socket_handle: handle, remote_endpoint: Some(remote_endpoint) };
+                tbl.socks[slot].state = SockState::InetConnected {
+                    socket_handle: handle, remote_endpoint: Some(remote_endpoint), lo };
                 ok_reply()
             } else {
                 // UDP Connect: just store remote endpoint for send/recv filtering
@@ -1099,21 +1376,21 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
                     alloc::vec![0; 65536],
                 );
                 let mut socket = udp::Socket::new(rx_buffer, tx_buffer);
-                let local_port = if tbl.socks[slot].bound_port != 0 {
-                    tbl.socks[slot].bound_port
-                } else {
-                    let p = 49152 + (sched::ticks() % 16384) as u16;
-                    tbl.socks[slot].bound_port = p;
-                    p
-                };
-                socket.bind(local_port).unwrap();
+                if socket.bind(local_port).is_err() { return err_reply(-22); }
                 let handle = s.socket_set.add(socket);
-                tbl.socks[slot].state = SockState::InetConnected { socket_handle: handle, remote_endpoint: Some(remote_endpoint) };
+                tbl.socks[slot].state = SockState::InetConnected {
+                    socket_handle: handle, remote_endpoint: Some(remote_endpoint), lo };
                 ok_reply()
             }
         } else {
             err_reply(-100)
         }
+        };
+        // Every server lock is released before the wake: the SYN only leaves on
+        // the next daemon poll, and wake_poll must never run under one.
+        drop(tbls);
+        sched::wake_poll();
+        reply
     } else {
         // AF_UNIX Connect
         if addrlen < 3 || addrlen > 2 + PATH_MAX { return err_reply(-22); }
@@ -1297,18 +1574,43 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             if n == 0 && len > 0 { return err_reply(-11); }
             val_reply(n as u64)
         }
-        SockState::InetConnected { socket_handle, remote_endpoint } => {
+        SockState::InetConnected { socket_handle, remote_endpoint, lo } => {
             drop(tbls);
-            let mut stack = NET_STACK.lock();
+            // Touch user memory ONLY with every lock released. `buf_ptr`/`addr_ptr`
+            // are demand-paged, so reading them can take a page fault, and a fault
+            // taken under the stack spinlock re-enters the scheduler while holding
+            // it — the hazard shape that once froze all four vCPUs (fixed 82d0cc3).
+            // read_user_buf is deliberately NOT used here: it does not fault a page
+            // in, and sys_sendto only validates the range, so a first-touch .rodata
+            // send buffer would spuriously EFAULT. Same idiom as the ICMP arm below.
+            let mut data = alloc::vec![0u8; len];
+            if len > 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(buf_ptr as *const u8, data.as_mut_ptr(), len);
+                }
+            }
+            // Destination sockaddr, likewise read before locking. Datagram-only:
+            // the stream path never dereferenced `addr_ptr` and sys_sendto does not
+            // validate it, so it must stay untouched there. Kept as an Option so the
+            // EDESTADDRREQ/ENETDOWN precedence stays exactly as it was.
+            let dest = if sock_type == SOCK_STREAM as u8 {
+                None
+            } else if addr_ptr != 0 && addrlen >= 8 {
+                let port_be = unsafe { ((addr_ptr + 2) as *const u16).read_unaligned() };
+                let port = u16::from_be(port_be);
+                let sin_addr = unsafe { ((addr_ptr + 4) as *const u32).read_unaligned() };
+                let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+                Some(IpEndpoint::new(ip, port))
+            } else {
+                remote_endpoint
+            };
+
+            let mut stack = stack_for(lo);
             if let Some(ref mut s) = *stack {
                 if sock_type == SOCK_STREAM as u8 {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
                     if !socket.can_send() {
                         return err_reply(-11);
-                    }
-                    let mut data = alloc::vec![0u8; len];
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(buf_ptr as *const u8, data.as_mut_ptr(), len);
                     }
                     match socket.send_slice(&data) {
                         Ok(n) => val_reply(n as u64),
@@ -1316,22 +1618,10 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                     }
                 } else {
                     let socket = s.socket_set.get_mut::<udp::Socket>(socket_handle);
-                    let endpoint = if addr_ptr != 0 && addrlen >= 8 {
-                        let port_be = unsafe { ((addr_ptr + 2) as *const u16).read_unaligned() };
-                        let port = u16::from_be(port_be);
-                        let sin_addr = unsafe { ((addr_ptr + 4) as *const u32).read_unaligned() };
-                        let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
-                        IpEndpoint::new(ip, port)
-                    } else if let Some(ep) = remote_endpoint {
-                        ep
-                    } else {
-                        return err_reply(-89);
+                    let endpoint = match dest {
+                        Some(ep) => ep,
+                        None => return err_reply(-89),
                     };
-
-                    let mut data = alloc::vec![0u8; len];
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(buf_ptr as *const u8, data.as_mut_ptr(), len);
-                    }
                     match socket.send_slice(&data, endpoint) {
                         Ok(()) => val_reply(len as u64),
                         Err(_) => err_reply(-12),
@@ -1459,8 +1749,8 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             if n > 0 { sched::wake_poll(); }
             val_reply(n as u64)
         }
-        SockState::InetConnected { socket_handle, .. } => {
-            let mut stack = NET_STACK.lock();
+        SockState::InetConnected { socket_handle, lo, .. } => {
+            let mut stack = stack_for(lo);
             if let Some(ref mut s) = *stack {
                 if sock_type == SOCK_STREAM as u8 {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
@@ -1904,17 +2194,37 @@ fn handle_shutdown(pid: u32, fd: usize, _how: usize) -> Message {
     ok_reply()
 }
 
-fn handle_getsockname(_pid: u32, _fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Message {
+/// getsockname(2). An AF_INET socket reports its real bound endpoint: the
+/// ephemeral port a `bind(":0")` was handed is discoverable *only* here, and
+/// every mio/tokio `TcpListener` asks for it straight after binding. Anything
+/// else keeps the historical minimal answer (sa_family only, zeroed) — nothing
+/// on LeandrOS reads a unix socket's own address back, and Linux reports an
+/// unnamed unix socket exactly that way.
+fn handle_getsockname(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Message {
     if addr_ptr == 0 || addrlen_ptr == 0 { return err_reply(-14); }
-    unsafe {
-        core::ptr::write_bytes(addr_ptr as *mut u8, 0, 2);
-        core::ptr::write(addrlen_ptr as *mut u32, 2);
+    // Endpoint resolved first; user memory is written with no lock held.
+    let endpoint = inet_local_endpoint(pid, fd);
+    match endpoint {
+        Some(ep) => unsafe { write_sockaddr_in(addr_ptr, addrlen_ptr, ep); },
+        None => unsafe {
+            core::ptr::write_bytes(addr_ptr as *mut u8, 0, 2);
+            core::ptr::write(addrlen_ptr as *mut u32, 2);
+        },
     }
     ok_reply()
 }
 
 fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Message {
-    handle_getsockname(pid, fd, addr_ptr, addrlen_ptr)
+    if addr_ptr == 0 || addrlen_ptr == 0 { return err_reply(-14); }
+    let endpoint = inet_remote_endpoint(pid, fd);
+    match endpoint {
+        Some(ep) => unsafe { write_sockaddr_in(addr_ptr, addrlen_ptr, ep); },
+        None => unsafe {
+            core::ptr::write_bytes(addr_ptr as *mut u8, 0, 2);
+            core::ptr::write(addrlen_ptr as *mut u32, 2);
+        },
+    }
+    ok_reply()
 }
 
 fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
@@ -2138,20 +2448,26 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
             // Peer sees POLLHUP/POLLIN (EOF) once this end really closed.
             if end_closed { sched::wake_poll(); }
         }
-        SockState::InetConnected { socket_handle, .. } => {
+        SockState::InetConnected { socket_handle, lo, .. } => {
             tbl.socks[slot] = SockEntry::empty();
             drop(tbls);
-            let mut stack = NET_STACK.lock();
+            let mut stack = stack_for(lo);
             if let Some(ref mut s) = *stack {
                 s.socket_set.remove(socket_handle);
             }
         }
-        SockState::InetListening { socket_handle } => {
+        SockState::InetListening { main, lo, .. } => {
             tbl.socks[slot] = SockEntry::empty();
             drop(tbls);
-            let mut stack = NET_STACK.lock();
-            if let Some(ref mut s) = *stack {
-                s.socket_set.remove(socket_handle);
+            // An INADDR_ANY listener holds a socket on each stack; drop both,
+            // one stack lock at a time.
+            if let Some(h) = main {
+                let mut stack = stack_for(false);
+                if let Some(ref mut s) = *stack { s.socket_set.remove(h); }
+            }
+            if let Some(h) = lo {
+                let mut stack = stack_for(true);
+                if let Some(ref mut s) = *stack { s.socket_set.remove(h); }
             }
         }
         SockState::IcmpBound { socket_handle } => {
@@ -2242,9 +2558,9 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
                     SockState::UnixPendingAccept { sock_id, .. } if sock_id == listen_sock_id)));
             (if pending { POLLIN } else { 0 }, None)
         }
-        SockState::InetConnected { socket_handle, .. } => {
+        SockState::InetConnected { socket_handle, lo, .. } => {
             drop(tbls);
-            let mut stack = NET_STACK.lock();
+            let mut stack = stack_for(lo);
             let ev = if let Some(ref mut s) = *stack {
                 if sock_type == SOCK_STREAM as u8 {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
@@ -2265,19 +2581,22 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             };
             (ev, None)
         }
-        SockState::InetListening { socket_handle } => {
+        SockState::InetListening { main, lo, .. } => {
             drop(tbls);
-            let mut stack = NET_STACK.lock();
-            let ev = if let Some(ref mut s) = *stack {
-                let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
-                if socket.is_active() && socket.state() == tcp::State::Established {
-                    POLLIN
-                } else {
-                    0
+            // Readable as soon as either stack's listener has an established
+            // connection waiting to be accepted. One stack lock at a time.
+            let ready = |on_lo: bool, handle: Option<SocketHandle>| -> bool {
+                let handle = match handle { Some(h) => h, None => return false };
+                let mut stack = stack_for(on_lo);
+                match stack.as_mut() {
+                    Some(s) => {
+                        let socket = s.socket_set.get_mut::<tcp::Socket>(handle);
+                        socket.is_active() && socket.state() == tcp::State::Established
+                    }
+                    None => false,
                 }
-            } else {
-                0
             };
+            let ev = if ready(false, main) || ready(true, lo) { POLLIN } else { 0 };
             (ev, None)
         }
         SockState::IcmpBound { socket_handle } => {
@@ -2313,7 +2632,8 @@ fn handle_close_all(pid: u32) {
         // handle_fork_dup, which copies only UnixConnected/Unbound), so they are
         // dropped outright, matching handle_close's PendingAccept arm.
         let mut unix_pending_close: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-        let mut inet_to_close: alloc::vec::Vec<SocketHandle> = alloc::vec::Vec::new();
+        // (on_loopback, handle) — an INADDR_ANY listener contributes one of each.
+        let mut inet_to_close: alloc::vec::Vec<(bool, SocketHandle)> = alloc::vec::Vec::new();
         let mut bound_to_free: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
 
         for s in tbl.socks.iter() {
@@ -2327,10 +2647,15 @@ fn handle_close_all(pid: u32) {
                 SockState::UnixListening { bound_idx } => {
                     bound_to_free.push(bound_idx);
                 }
-                SockState::InetConnected { socket_handle, .. }
-                | SockState::InetListening { socket_handle }
-                | SockState::IcmpBound { socket_handle } => {
-                    inet_to_close.push(socket_handle);
+                SockState::InetConnected { socket_handle, lo, .. } => {
+                    inet_to_close.push((lo, socket_handle));
+                }
+                SockState::InetListening { main, lo, .. } => {
+                    if let Some(h) = main { inet_to_close.push((false, h)); }
+                    if let Some(h) = lo   { inet_to_close.push((true,  h)); }
+                }
+                SockState::IcmpBound { socket_handle } => {
+                    inet_to_close.push((false, socket_handle));
                 }
                 _ => {}
             }
@@ -2373,13 +2698,15 @@ fn handle_close_all(pid: u32) {
 
         for bi in bound_to_free { free_bound_idx(bi); }
 
-        let mut stack = NET_STACK.lock();
-        if let Some(ref mut s) = *stack {
-            for handle in inet_to_close {
-                s.socket_set.remove(handle);
+        // Each stack in turn; the two locks are never held together.
+        for on_lo in [false, true] {
+            let mut stack = stack_for(on_lo);
+            if let Some(ref mut s) = *stack {
+                for (h_lo, handle) in inet_to_close.iter() {
+                    if *h_lo == on_lo { s.socket_set.remove(*handle); }
+                }
             }
         }
-        drop(stack);
 
         let mut tbls = SOCK_TABLES.lock();
         if let Some(tbl) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {

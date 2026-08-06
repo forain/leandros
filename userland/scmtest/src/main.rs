@@ -92,6 +92,10 @@ use leandros_libc::syscall::{nr, syscall1, syscall2, syscall3, syscall4, syscall
 // (aarch64 nr module at :279, x86_64 at :489).
 #[cfg(target_arch = "aarch64")] const SYS_MINCORE:       usize = 232;
 #[cfg(target_arch = "x86_64")]  const SYS_MINCORE:       usize = 27;
+// getsockname(2): the only way to learn the port a bind-to-zero was handed.
+// Numbers match kernel/src/syscall.rs `mod nr`.
+#[cfg(target_arch = "aarch64")] const SYS_GETSOCKNAME:   usize = 204;
+#[cfg(target_arch = "x86_64")]  const SYS_GETSOCKNAME:   usize = 51;
 
 // epoll_event wire layout must match the kernel's per-arch struct exactly
 // (kernel/src/syscall.rs EPOLL_EVENT_SIZE/EPOLL_EVENT_DATA_OFF): x86_64 uses the
@@ -154,6 +158,7 @@ const MSG_DONTWAIT: i32 = 0x40;
 const MSG_CMSG_CLOEXEC: i32 = 0x40000000;
 
 const AF_UNIX: i32 = 1;
+const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
 
 const PROT_READ: i32 = 1;
@@ -244,6 +249,41 @@ unsafe fn raw_accept(fd: i32) -> i32 {
         tries += 1;
         if tries > 10000 { return xret(r) as i32; }
     }
+}
+
+// ── AF_INET socket wrappers (TODO item 9) ───────────────────────────────────
+
+/// `sockaddr_in`, Linux ABI: sin_family(2) + sin_port(2, network order) +
+/// sin_addr(4, network order) + 8 bytes of padding = 16 bytes, which is the
+/// addrlen every call below passes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct sockaddr_in { sin_family: u16, sin_port: u16, sin_addr: [u8; 4], sin_zero: [u8; 8] }
+
+impl sockaddr_in {
+    /// `addr` in dotted-quad order, `port` in host order.
+    fn new(addr: [u8; 4], port: u16) -> sockaddr_in {
+        sockaddr_in { sin_family: AF_INET as u16, sin_port: port.to_be(),
+                      sin_addr: addr, sin_zero: [0u8; 8] }
+    }
+}
+
+unsafe fn raw_bind_in(fd: i32, addr: *const sockaddr_in) -> isize {
+    xret(syscall3(SYS_BIND, fd as usize, addr as usize, 16))
+}
+unsafe fn raw_connect_in(fd: i32, addr: *const sockaddr_in) -> isize {
+    xret(syscall3(SYS_CONNECT, fd as usize, addr as usize, 16))
+}
+unsafe fn raw_getsockname(fd: i32, addr: *mut sockaddr_in, len: *mut u32) -> isize {
+    xret(syscall3(SYS_GETSOCKNAME, fd as usize, addr as usize, len as usize))
+}
+
+/// Sleep `ms` milliseconds. TCP over 127.0.0.1 is still real TCP, and its
+/// packets only move when the kernel's net daemon runs its 100 Hz smoltcp poll,
+/// so the inet test waits in real time rather than spinning on syscalls.
+unsafe fn sleep_ms(ms: i64) {
+    let ts: [i64; 2] = [ms / 1000, (ms % 1000) * 1_000_000]; // struct timespec
+    let _ = syscall2(nr::NANOSLEEP, ts.as_ptr() as usize, 0);
 }
 
 const S_IFMT:  u32 = 0o170000;
@@ -625,6 +665,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
 
     // ── M7u: mincore residency probe (Mesa EGL pointer-dereferenceable signal) ──
     if !test_mincore() { failures += 1; }
+
+    // ── TODO item 9: AF_INET TCP over the loopback interface ────────────────
+    if !test_inet_loopback_tcp() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
@@ -1507,4 +1550,112 @@ unsafe fn test_full_ring_eagain() -> bool {
     let ok = got_eagain && !bogus_zero && total > 0 && total <= 4096;
     close(a); close(b);
     report(name, ok)
+}
+
+/// TODO item 9 regression: a full AF_INET TCP round-trip over 127.0.0.1.
+///
+/// `bind("127.0.0.1:0")` was the whole reported bug. bind() stored a zero port,
+/// and listen() rejected a zero `bound_port` with EINVAL — which mio/tokio
+/// report as "bind failed: Invalid argument", because `TcpListener::bind` is
+/// socket + setsockopt + bind + listen in one call. Underneath that, the
+/// smoltcp integration had no loopback interface at all: the only interface was
+/// the virtio NIC on 10.0.2.15/24, so nothing could ever carry a 127.0.0.1
+/// packet even once the ports were right.
+///
+/// This walks the sequence by hand so a failure says which half broke: bind to
+/// the ephemeral port, read it back with getsockname (the only way to learn
+/// it), connect a second socket to 127.0.0.1:<that port>, accept, then pass a
+/// payload in each direction.
+unsafe fn test_inet_loopback_tcp() -> bool {
+    let name = b"inet_loopback_tcp\0";
+    let srv = raw_socket(AF_INET, SOCK_STREAM, 0);
+    if srv < 0 {
+        dbg1(b"[inet] socket(AF_INET) failed errno=%d\n\0", get_errno() as i64);
+        return report(name, false);
+    }
+
+    let ba = sockaddr_in::new([127, 0, 0, 1], 0);
+    if raw_bind_in(srv, &ba) != 0 {
+        dbg1(b"[inet] bind 127.0.0.1:0 failed errno=%d (want 0)\n\0", get_errno() as i64);
+        close(srv);
+        return report(name, false);
+    }
+
+    // getsockname must report AF_INET, 127.0.0.1 and the assigned, non-zero port.
+    let mut sa = sockaddr_in::new([0, 0, 0, 0], 0);
+    let mut slen: u32 = 16;
+    if raw_getsockname(srv, &mut sa, &mut slen) != 0 {
+        dbg1(b"[inet] getsockname failed errno=%d\n\0", get_errno() as i64);
+        close(srv);
+        return report(name, false);
+    }
+    let port = u16::from_be(sa.sin_port);
+    let addr_ok = sa.sin_family == AF_INET as u16 && sa.sin_addr == [127, 0, 0, 1];
+    dbg2(b"[inet] getsockname port=%d addr_ok=%d (want port!=0 and 1)\n\0",
+         port as i64, addr_ok as i64);
+    if port == 0 || !addr_ok { close(srv); return report(name, false); }
+
+    if raw_listen(srv, 8) != 0 {
+        dbg1(b"[inet] listen failed errno=%d (this was the EINVAL)\n\0", get_errno() as i64);
+        close(srv);
+        return report(name, false);
+    }
+
+    let cli = raw_socket(AF_INET, SOCK_STREAM, 0);
+    if cli < 0 { close(srv); return report(name, false); }
+    let ca = sockaddr_in::new([127, 0, 0, 1], port);
+    if raw_connect_in(cli, &ca) != 0 {
+        dbg1(b"[inet] connect failed errno=%d\n\0", get_errno() as i64);
+        close(srv); close(cli);
+        return report(name, false);
+    }
+
+    // connect() only queues a SYN; the handshake completes on the net daemon's
+    // next poll, so accept answers EAGAIN until then.
+    let mut acc = -1;
+    let mut tries = 0;
+    while tries < 100 {
+        sleep_ms(20);
+        acc = xret(syscall3(SYS_ACCEPT, srv as usize, 0, 0)) as i32;
+        if acc >= 0 || get_errno() != EAGAIN { break; }
+        tries += 1;
+    }
+    if acc < 0 {
+        dbg2(b"[inet] accept failed after %d tries errno=%d\n\0", tries as i64, get_errno() as i64);
+        close(srv); close(cli);
+        return report(name, false);
+    }
+
+    // client → server
+    let msg = b"hello-inet";
+    let sn = raw_send(cli, msg.as_ptr(), msg.len(), 0);
+    let mut rbuf = [0u8; 32];
+    let rn = inet_recv_retry(acc, rbuf.as_mut_ptr(), rbuf.len());
+    let c2s_ok = sn == msg.len() as isize && rn == msg.len() as isize
+                 && &rbuf[..msg.len()] == &msg[..];
+
+    // server → client, so the reverse direction is proven too
+    let reply = b"ack-inet";
+    let sn2 = raw_send(acc, reply.as_ptr(), reply.len(), 0);
+    let mut rbuf2 = [0u8; 32];
+    let rn2 = inet_recv_retry(cli, rbuf2.as_mut_ptr(), rbuf2.len());
+    let s2c_ok = sn2 == reply.len() as isize && rn2 == reply.len() as isize
+                 && &rbuf2[..reply.len()] == &reply[..];
+
+    dbg2(b"[inet] c2s=%d s2c=%d (want 1 1)\n\0", c2s_ok as i64, s2c_ok as i64);
+    close(srv); close(cli); close(acc);
+    report(name, c2s_ok && s2c_ok)
+}
+
+/// recv with the same poll-cadence-aware retry the accept loop uses: a segment
+/// sent into a smoltcp socket only leaves on the daemon's next poll.
+unsafe fn inet_recv_retry(fd: i32, buf: *mut u8, len: usize) -> isize {
+    let mut tries = 0;
+    while tries < 100 {
+        sleep_ms(20);
+        let r = raw_recv(fd, buf, len, MSG_DONTWAIT);
+        if r >= 0 || get_errno() != EAGAIN { return r; }
+        tries += 1;
+    }
+    -1
 }
