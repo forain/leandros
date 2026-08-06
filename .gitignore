@@ -22,3 +22,9 @@ x86_64_vars.fd
 # Python bytecode caches from the build/test helper scripts
 __pycache__/
 *.pyc
+
+# Ad-hoc f2fs image backups made by hand during debugging sessions, not source.
+f2fs-data0-*.img.*
+
+# Port build scratch directories.
+ports/*/.work/
