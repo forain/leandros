@@ -672,6 +672,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
 
     // ── TODO item 9: AF_INET TCP over the loopback interface ────────────────
     if !test_inet_loopback_tcp() { failures += 1; }
+    if !test_inet_listen_twice() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
@@ -1799,6 +1800,83 @@ unsafe fn test_inet_loopback_tcp() -> bool {
     dbg2(b"[inet] c2s=%d s2c=%d (want 1 1)\n\0", c2s_ok as i64, s2c_ok as i64);
     close(srv); close(cli); close(acc);
     report(name, c2s_ok && s2c_ok)
+}
+
+/// TODO item 8: `listen()` on an already-listening socket must succeed.
+///
+/// Linux's `inet_listen` accepts a repeat listen and only updates the backlog.
+/// Ours matched `SockState::InetBound` alone, so the second call fell through
+/// to `_ => err_reply(-22)` — measured `second_errno=22` — which any framework
+/// that re-arms its listener trips on.
+///
+/// Three assertions, ordered so that a wrong fix fails a specific one:
+///   (a) listen() before bind() is *still* EINVAL, so the fix cannot be "make
+///       listen() always succeed".
+///   (b) the repeat listen() returns 0.
+///   (c) the listener still accepts afterwards. This is the assertion that
+///       catches the careless fix: re-running the listen path on the repeat
+///       call would add a second pair of smoltcp sockets on the same port and
+///       orphan the handles the first listen() stored — which returns 0 and
+///       then never completes a handshake.
+unsafe fn test_inet_listen_twice() -> bool {
+    let name = b"inet_listen_twice\0";
+
+    // (a) A socket that never bound has no port, so listen() is EINVAL.
+    let nb = raw_socket(AF_INET, SOCK_STREAM, 0);
+    if nb < 0 { return report(name, false); }
+    let nb_rc = raw_listen(nb, 8);
+    let nb_errno = get_errno();
+    close(nb);
+    dbg2(b"[l2] listen-before-bind rc=%d errno=%d (want -1 22)\n\0",
+         nb_rc as i64, nb_errno as i64);
+    if nb_rc != -1 || nb_errno != EINVAL { return report(name, false); }
+
+    let srv = raw_socket(AF_INET, SOCK_STREAM, 0);
+    if srv < 0 { return report(name, false); }
+    let ba = sockaddr_in::new([127, 0, 0, 1], 0);
+    if raw_bind_in(srv, &ba) != 0 {
+        dbg1(b"[l2] bind failed errno=%d\n\0", get_errno() as i64);
+        close(srv);
+        return report(name, false);
+    }
+    // The ephemeral port is discoverable only through getsockname.
+    let mut sa = sockaddr_in::new([0, 0, 0, 0], 0);
+    let mut slen: u32 = 16;
+    if raw_getsockname(srv, &mut sa, &mut slen) != 0 { close(srv); return report(name, false); }
+    let port = u16::from_be(sa.sin_port);
+    if port == 0 { close(srv); return report(name, false); }
+
+    if raw_listen(srv, 8) != 0 {
+        dbg1(b"[l2] first listen failed errno=%d\n\0", get_errno() as i64);
+        close(srv);
+        return report(name, false);
+    }
+
+    // (b) The repeat listen, with a different backlog — this was the EINVAL.
+    let second = raw_listen(srv, 16);
+    let second_errno = get_errno();
+    dbg2(b"[l2] second listen rc=%d errno=%d (want 0)\n\0",
+         second as i64, second_errno as i64);
+
+    // (c) The socket the first listen() armed must still be the live listener.
+    let cli = raw_socket(AF_INET, SOCK_STREAM, 0);
+    if cli < 0 { close(srv); return report(name, false); }
+    let ca = sockaddr_in::new([127, 0, 0, 1], port);
+    let conn = raw_connect_in(cli, &ca);
+    let mut acc = -1;
+    let mut tries = 0;
+    while tries < 100 {
+        sleep_ms(20);
+        acc = xret(syscall3(SYS_ACCEPT, srv as usize, 0, 0)) as i32;
+        if acc >= 0 || get_errno() != EAGAIN { break; }
+        tries += 1;
+    }
+    dbg2(b"[l2] connect=%d accept=%d (want 0 and >=0)\n\0", conn as i64, acc as i64);
+
+    let ok = second == 0 && conn == 0 && acc >= 0;
+    close(srv); close(cli);
+    if acc >= 0 { close(acc); }
+    report(name, ok)
 }
 
 /// recv with the same poll-cadence-aware retry the accept loop uses: a segment

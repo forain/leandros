@@ -1128,6 +1128,19 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
         // gets EINVAL — the same answer the old zero-bound_port check gave.
         let local = match tbl.socks[slot].state {
             SockState::InetBound { local_endpoint, .. } => local_endpoint,
+            // A second listen() on an already-listening socket is legal on
+            // Linux — `inet_listen` only updates sk_max_ack_backlog and
+            // returns 0 — and matching `InetBound` alone answered EINVAL.
+            // Answer success and change nothing: falling through to the
+            // listen_on() calls below would be actively wrong, adding a second
+            // pair of smoltcp sockets on the same port and orphaning the
+            // handles the first listen() stored (dropping any half-open
+            // connection with them). No backlog is recorded because nothing
+            // would read it: smoltcp has no accept queue — `accept_on` takes
+            // the listening socket over and arms a replacement — so
+            // `_backlog` is already ignored on the first listen(), and storing
+            // a number no code honours would only fake a knob.
+            SockState::InetListening { .. } => return ok_reply(),
             _ => return err_reply(-22),
         };
         if local.port == 0 { return err_reply(-22); }
@@ -1142,6 +1155,13 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
         tbl.socks[slot].state = SockState::InetListening { main, lo, local };
         ok_reply()
     } else {
+        // AF_UNIX: `handle_bind` is what marks the socket UnixListening, so
+        // listen() here is a pure acknowledgement and is already idempotent —
+        // a repeat listen() answers success, as Linux does. It is also laxer
+        // than Linux in the other direction: listen() on an unbound or
+        // already-connected AF_UNIX socket returns success where Linux
+        // answers EINVAL. Tightening that is a behaviour change for every
+        // AF_UNIX server on the system and is deliberately not bundled here.
         ok_reply()
     }
 }
@@ -2424,8 +2444,12 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
         None    => return err_reply(-9),
     };
     if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
-    let state  = tbl.socks[slot].state;
-    let port   = tbl.socks[slot].bound_port;
+    let state = tbl.socks[slot].state;
+    // There is no port to release here, which is why `bound_port` is not read:
+    // `alloc_ephemeral_port` derives "free" from the live tables (any socket
+    // with `in_use && bound_port == p`), and every arm below stores
+    // `SockEntry::empty()`, which zeroes `bound_port`. Clearing the slot *is*
+    // the release; there is no separate pool to hand the port back to.
     match state {
         SockState::UnixConnected { conn_idx, is_a } => {
             drop(tbls);

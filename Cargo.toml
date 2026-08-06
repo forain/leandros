@@ -12,7 +12,6 @@ members = [
     "servers/net",
     "servers/tty",
     "servers/libc-shim",
-    "servers/init",
     "servers/drm",
     "servers/pipewire",
     "servers/f2fs",

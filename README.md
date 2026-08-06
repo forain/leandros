@@ -82,7 +82,6 @@ On top of that microkernel core sits a **Linux-compatible syscall personality**:
 | `servers/tty` | TTY server, job control, POSIX timers |
 | `servers/net` | Network server — smoltcp TCP/IP plus a full AF_UNIX implementation |
 | `servers/proc` | `/proc` filesystem |
-| `servers/init` | PID-1: server bring-up, mounts, getty loop |
 | `servers/libc-shim` | In-kernel glue backing the userspace libc |
 | `userland` | User-space programs and regression suites (leandros-libc / relibc / musl) |
 | `ports` | Build recipes for third-party software: Mesa, D-Bus/busd, COSMIC, input shims |

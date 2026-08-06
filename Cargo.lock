@@ -191,18 +191,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "init-server"
-version = "0.1.0"
-dependencies = [
- "ipc",
- "mm",
- "net-server",
- "sched",
- "spin",
- "vfs-server",
-]
-
-[[package]]
 name = "ipc"
 version = "0.1.0"
 dependencies = [
@@ -224,7 +212,6 @@ dependencies = [
  "elf",
  "evdev-server",
  "f2fs-server",
- "init-server",
  "ipc",
  "leandros-lib",
  "limine",

@@ -1,8 +1,8 @@
 //! PID-1 init task — first process after the kernel bootstraps.
 //!
 //! Sets up the in-kernel servers (VFS, net, TTY), probes hardware drivers,
-//! then hands off to `init_server::init_main()` which runs the POSIX smoke
-//! tests and eventually spawns the shell.
+//! then extracts `bin/init` from the initrd and spawns it as the first user
+//! process — everything after that (getty, login, the shell) is userland.
 
 use crate::serial_print_str;
 use crate::serial_print_hex;
