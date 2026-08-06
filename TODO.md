@@ -83,7 +83,17 @@ in both orders. Two new items were split out of what the pass uncovered along th
 item 3 (the `ATTR_NOCACHE`/MAIR gap is live independent of the blob work — it also means
 the framebuffer has silently been Device memory all along) and item 4 (x86_64 has no PAT
 or MTRR setup, so true write-combining is unreachable there either, a separate ceiling
-worth recording). Former items 3-11 shifted down to 5-13.
+worth recording). Former items 3-11 shifted down to 5-13. Same day, an eleventh wave
+completed the analysis on item 6 (`PRIME_HANDLE_TO_FD` rejects Venus blob handles): a
+source pass over the kernel's blob/dumb-buffer registries, the borrowed-VMO lifecycle,
+and Mesa's WSI import paths (`wsi_common_drm.c`, `vn_renderer_virtgpu.c`) produced a
+prepared patch and a retitle to match. Three new items were split out of what the pass
+uncovered along the way: a `SIMULATE_SYNCOBJ` gap where a rejected zero-size execbuffer
+leaves `fence_fd` unwritten and Mesa then `close()`s stdin; the borrowed-VMO
+grow/leak/truncate hazards audited while designing the export, closed by one stated
+invariant the patch enforces; and the cross-open dmabuf gap that PRIME export alone does
+not close, needed for `VK_KHR_display` and Wayland but not for headless WSI. Former
+items 7-13 shifted down to 10-16.
 
 ---
 
@@ -239,14 +249,17 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 3 | `ATTR_NOCACHE` on aarch64 is Device memory, not Normal-NC | Bug — kernel | — |
 | 4 | x86_64 has no PAT or MTRR setup | Bug | — |
 | 5 | Vulkan renders on LeandrOS; next is presenting it | Feature | — |
-| 6 | `PRIME_HANDLE_TO_FD` rejects Venus blob handles | Bug | — |
-| 7 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
-| 8 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
-| 9 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
-| 10 | Delete the unreachable `init-server` crate | Cleanup | — |
-| 11 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
-| 12 | No TIME_WAIT — ports are instantly reusable | Bug | — |
-| 13 | Deferred / known limitations | Mixed | — |
+| 6 | PRIME export for blob handles — fix prepared (headless WSI unblocked) | Bug — kernel | — |
+| 7 | `SIMULATE_SYNCOBJ`: we reject the probe, and Mesa then closes stdin | Bug — kernel | — |
+| 8 | Borrowed VMOs can be grown, leaked and truncated | Bug — kernel | — |
+| 9 | Cross-open dmabuf import is refused by design | Feature | — |
+| 10 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
+| 11 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
+| 12 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
+| 13 | Delete the unreachable `init-server` crate | Cleanup | — |
+| 14 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
+| 15 | No TIME_WAIT — ports are instantly reusable | Bug | — |
+| 16 | Deferred / known limitations | Mixed | — |
 
 ---
 
@@ -521,19 +534,129 @@ current HEAD — popping it would revert `4085b7f` (nested-epoll readiness). Re-
 instead. A raw copy of that stash also exists at
 `/home/forain/linux-tree-preexisting.patch` on the box.
 
-### 6. `PRIME_HANDLE_TO_FD` rejects Venus blob handles
+### 6. PRIME export for blob handles — fix prepared (headless WSI unblocked)
 
-`kernel/src/syscall.rs:6049` resolves handles only through `dumb_buffer_phys_order`,
-returning EINVAL for any Venus blob, which blocks `vkGetMemoryFdKHR` and therefore
-every Vulkan WSI path. Pair it with the `SIMULATE_SYNCOBJ` gap: Mesa's
-`sim_syncobj_create` submits a zero-size execbuffer with `FENCE_FD_OUT`, rejected at
-`drivers/src/drm_device_interface.rs:2941` and `drivers/src/virtio_gpu.rs:1856`, with
-`fence_fd` never written back. Both are needed before any WSI; neither blocks offscreen
-rendering. Also note the connector's missing `DPMS` property, which fails
-`VK_KHR_display` enumeration outright, and that `AUTH_MAGIC` returning `Ok(0)` with no
-master gating on `SETCRTC` lets a direct-KMS client fight cosmic-comp for the CRTC.
+**Why it rejects.** `kernel/src/syscall.rs:6052` calls `dumb_buffer_phys_order(handle)`,
+whose entire body (`drivers/src/drm_device_interface.rs:1286-1288`) is
+`DUMB_BUFFERS.lock().get(&handle)`. Blob BOs live in a **separate** map,
+`BLOB_BUFFERS` (`:855`), with handles from `NEXT_BLOB_HANDLE` starting at `0x4000`
+(`:858`) precisely so the two spaces cannot collide — so the lookup always misses and
+`:6054` returns `-22`.
 
-### 7. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
+**Fixing only the lookup would have been worse than the EINVAL.** `install_dmabuf_vmo`
+(`servers/vfs/src/lib.rs:560`) unconditionally built `1<<order` frames from `phys`, and a
+`BLOB_MEM_HOST3D` blob has `phys == 0` (`drivers/src/drm_device_interface.rs:3487-3493`).
+A successful lookup would have handed out **physical page 0 onward**.
+
+**The export is plumbing; cross-open dmabuf is a subsystem, and the line is clean.**
+Measured in Mesa 25.3.6: `wsi_create_native_image_mem` → `wsi_init_image_dmabuf_fd`
+(`wsi_common_drm.c:726-739`) issues `GetMemoryFdKHR` for **every** swapchain image on
+every `WSI_IMAGE_TYPE_DRM` path and propagates its error, and it is also a bare feature
+probe on a 4 KiB device-local allocation (`:122-147`) — so the export must work for a
+blob with neither guest pages nor a host-visible mapping. There is no escape hatch:
+Venus is never `wsi_device->sw` (`wsi_common.c:87`), so the wl_shm branch is unreachable
+for us. **Nobody mmaps the exported fd** — Venus maps BOs via `VIRTGPU_MAP` +
+`mmap(gpu->fd, offset)`, and even kms_swrast's importer does `drmPrimeFDToHandle` +
+`lseek(SEEK_END)` for the size, then `MODE_MAP_DUMB` on the *imported handle*.
+
+What each consumer needs: `VK_EXT_headless_surface` — a valid fd, nothing more; Venus
+self-import — `PRIME_FD_TO_HANDLE` + `RESOURCE_INFO` on the **same** open;
+`VK_KHR_display` and Wayland dmabuf — import into a **different** DRM open, and for
+Wayland a different process. That second tier needs cross-open BO reachability (our
+`open_may_reach`, `drivers/src/drm_device_interface.rs:1091`, refuses **by design**),
+host-resource refcounting across opens (`free_blob` today unconditionally unrefs and
+releases the window span), `CTX_ATTACH_RESOURCE` for the importer's context, `MAP_DUMB`
+and `ADDFB2` accepting blob handles, and for real scanout `SET_SCANOUT_BLOB`, which does
+not exist here — plus the connector's missing `DPMS` property. Several days; deliberately
+not speculated into a patch.
+
+**The design.** `prime_export_backing(handle, open_id)` resolves blobs through the
+owner-scoped `blob_lookup` (`b80ab5a`'s rule) and falls through to the
+deliberately-global `dumb_buffer_phys_order`, reusing each registry's existing rule
+rather than inventing a third. It returns `{phys, order, len}` — `len` is the *resource*
+size for a blob, since Mesa's importer takes `lseek(SEEK_END)` verbatim, and the buddy
+block for a dumb buffer, byte-identical to today because GBM/EGL fstat it. A HOST3D
+blob's backing is `map_phys = window.phys + win_off`, a PCI BAR range **never in the
+HHDM** and often not even reserved at export time, so the fd is a **token**: correct
+`len`, correct `dmabuf_handle`, an **empty page list**, and mmap failing cleanly.
+
+**That last part is what made it more than three lines,** and auditing it found three
+pre-existing hazards on the dumb path. `vmo_acquire_frames`
+(`servers/vfs/src/lib.rs:644-647`) grows *any* VMO on demand with
+`vmo_alloc_zeroed_frame()`, so a page-less export would have silently satisfied an mmap
+with zeroed anonymous memory — a coherence bug presenting as a Vulkan bug. On the dumb
+path that growth is leaked outright (`vmo_free_slot:450` returns early for `borrowed`
+without freeing); the write path grows the same way (`:3303-3305`); and
+`handle_ftruncate` (`:5039`) would either leak on grow or, on shrink, `unref_or_free`
+DRM-owned frames — order-0 frees out of an order-N buddy block, i.e. allocator
+corruption. All three are closed by one stated rule: **a borrowed VMO's page list is
+immutable.**
+
+**Cacheability is avoided by construction, not luck.** The only mmap-able exports this
+creates are guest RAM, which the queued `blob_map_cache_type` deliberately does not
+match (`map_phys != 0`) and which is coherent write-back anyway. Host-visible blobs get
+**no mmap-able export at all**, so no second code path can disagree with the host's
+`map_info`. The constraint is written into the new doc comments.
+
+**Patch prepared** at
+`~/code/leandros-artifacts/notes/m9-prime-export/prime_handle_to_fd.patch` (4 files,
++308/−31, of which 150 lines are the regression subtest and most of the rest is
+comment), `git apply --check`-clean and round-trip verified at `9d27ae0`, all four files
+`rustfmt`-parse, **not built**. It stacks with all four other queued patches in **both**
+orders with identical resulting trees, and also applies over the uncommitted in-flight
+`drivers/` work. Worth recording: the first draft *deleted* `dumb_buffer_phys_order`,
+whose doc comment `fb_damage_clips.patch` uses as trailing context, and conflicted in
+both orders — keeping the function and calling it from `prime_export_backing` is better
+design anyway.
+
+**Verification.** `venustest` **68/0 → 77/0** (9 new reports). `drmsmoke` stays **22/0**
+— `PRIME_HANDLE_TO_FD`, `PRIME_MMAP_ALIAS` and `PRIME_FD_TO_HANDLE` remaining PASS is
+the dumb-path non-regression gate, and the one thing checkable **locally on the Mac**.
+`scmtest` and `vkrender` (`s2_checksum = 0x02C0FDC5`) must not move. Everything HOST3D
+needs the Linux box. Guard-test discipline is satisfied: HEAD is the backed-out state
+for the two export subtests, so they must FAIL against an unpatched kernel; reverting
+the `len` change must make the size subtest report `0x4000` instead of `0x3000`; and
+`phase5_host3d_export_is_not_mappable` **must** be demonstrated to fail with its guard
+line deleted, since it carries the whole safety argument. The decisive downstream test
+is a `VK_EXT_headless_surface` swapchain — reachable with this patch alone, unlike
+Wayland or display.
+
+### 7. `SIMULATE_SYNCOBJ`: we reject the probe, and Mesa then closes stdin
+
+`sim_syncobj_create` (`vn_renderer_virtgpu.c:145-190`) lazily submits an execbuffer with
+`size=0, command=0` plus `FENCE_FD_OUT` and requires `args.fence_fd >= 0`; we reject at
+`drivers/src/drm_device_interface.rs:3081` (`exec.command == 0 || exec.size == 0`) and
+never write `fence_fd` back (`:3177-3190` logs it as ignored). **New and worse:**
+`sim_submit` (`vn_renderer_virtgpu.c:531-557`) sets `FENCE_FD_OUT` whenever
+`batch->sync_count != 0` and then calls `close(args.fence_fd)` — with `fence_fd` left at
+its zero-initialised value that is **`close(0)`, closing stdin**. Whatever fix lands
+must write `fence_fd` before that path is reachable. A signalled `eventfd2(1)` is the
+right shape (~40 lines), correct because `submit_3d` is synchronous and Mesa only
+`poll(POLLIN)`s the fd. Mesa 25.3.6 defines `SIMULATE_SYNCOBJ`/`SIMULATE_SUBMIT`
+unconditionally, so this is not opt-in.
+
+### 8. Borrowed VMOs can be grown, leaked and truncated
+
+`vmo_acquire_frames` (`servers/vfs/src/lib.rs:644-647`) grows any VMO on demand with
+`vmo_alloc_zeroed_frame()`, including borrowed ones backing DRM buffers; the growth is
+then leaked, since `vmo_free_slot` (`:450`) returns early for `borrowed` without
+freeing. The write path grows the same way (`:3303-3305`). Worst, `handle_ftruncate`
+(`:5039`) on shrink would `unref_or_free` DRM-owned frames — order-0 frees out of an
+order-N buddy block, i.e. **allocator corruption**. The rule that closes all three: a
+borrowed VMO's page list is immutable. The queued PRIME patch (item 6) states and
+enforces it; if that patch does not land, these remain open independently.
+
+### 9. Cross-open dmabuf import is refused by design
+
+`open_may_reach` (`drivers/src/drm_device_interface.rs:1091`) deliberately scopes BOs to
+their owning DRM open, which is correct for `b80ab5a`'s ownership model but blocks
+`VK_KHR_display` and Wayland dmabuf, both of which import into a different open (and for
+Wayland, a different process). Supporting them needs cross-open reachability with
+host-resource refcounting across opens, `CTX_ATTACH_RESOURCE`, `MAP_DUMB`/`ADDFB2`
+accepting blob handles, `SET_SCANOUT_BLOB` (absent), and the connector's missing `DPMS`.
+Several days. This is the M4 gate; headless WSI does not need it.
+
+### 10. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
 
 **What we already have, measured.** The property is fully plumbed, not merely
 advertised: `PROP_FB_DAMAGE_CLIPS = 51` as `PropKind::Blob` in `PROPS`
@@ -611,7 +734,7 @@ screendumps >=2 s apart and confirm the digits differ, then force one full prese
 confirm it is pixel-identical. Note the cursor will not appear in `screendump` now that
 it is on the hardware plane. Plus `drmsmoke` 22/0 both arches and `idletest`.
 
-### 8. `listen()` twice returns EINVAL — fix prepared
+### 11. `listen()` twice returns EINVAL — fix prepared
 
 `handle_listen` matched only `SockState::InetBound`, so a repeat call fell to
 `_ => err_reply(-22)`. The fix adds one arm, `SockState::InetListening { .. } => return
@@ -635,7 +758,7 @@ listener afterwards — the last is what catches a fix that re-arms and orphans 
 **`scmtest` 28/0 → 29/0** — the memfd/TGID patch's two subtests already landed in
 `77f170d` and are part of the 28/0 baseline.
 
-### 9. `unused variable: port` in `handle_close` — not a leak, fix prepared
+### 12. `unused variable: port` in `handle_close` — not a leak, fix prepared
 
 **Measured, it is a warning and not a port leak.** `alloc_ephemeral_port`
 (`servers/net/src/lib.rs:442`) is the only allocator and derives "free" purely from live
@@ -648,7 +771,7 @@ renaming it to `_port` (a dead read invites someone to re-add it) and leaves a c
 recording why no release is needed. Verification is just that the warning is gone with
 no new ones, and `scmtest` unchanged.
 
-### 10. Delete the unreachable `init-server` crate
+### 13. Delete the unreachable `init-server` crate
 
 The scope is larger than this item previously stated. **`init-server` is a real
 dependency in `kernel/Cargo.toml:34`, so all 2653 lines compile into every kernel
@@ -679,23 +802,23 @@ both arches link with the crate gone, `grep -rn init_server .` is empty, serial 
 is **unchanged** to the login prompt (nothing in the crate ever printed), and the full
 suite is at baseline on fresh images.
 
-### 11. AF_UNIX `listen()` is lax in the opposite direction
+### 14. AF_UNIX `listen()` is lax in the opposite direction
 
 The AF_UNIX arm of `handle_listen` is an unconditional `ok_reply()` — a repeat listen
 already succeeds, but so does `listen()` on an unbound or already-connected AF_UNIX
-socket, where Linux answers EINVAL. Found while fixing the AF_INET side (item 8) and
+socket, where Linux answers EINVAL. Found while fixing the AF_INET side (item 11) and
 deliberately **not** changed there: tightening it alters behaviour for every AF_UNIX
 server on the system (cosmic-comp, busd, tokio) and could not be validated in a
 read-only session. Needs a live COSMIC session to land safely.
 
-### 12. No TIME_WAIT — ports are instantly reusable
+### 15. No TIME_WAIT — ports are instantly reusable
 
 `handle_close` calls `socket_set.remove()` immediately, so a closed TCP port can be
 rebound at once where Linux would hold it in TIME_WAIT. A divergence, not a leak, and
 low priority — but it is the kind of thing that makes a server restart behave
 differently here than on Linux.
 
-### 13. Deferred work and known limitations
+### 16. Deferred work and known limitations
 
 - **Doom does not link relibc.** `../doomgeneric/Makefile.leandros` links
   `userland/target/<arch>-unknown-none/release/libleandros_libc.a`, whose allocator is
