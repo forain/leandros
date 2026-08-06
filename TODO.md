@@ -28,7 +28,17 @@ timestamps) landed as `05bb0fe`, verified by `evtest2` 8/0 (`motion_ts_monotonic
 `motion_ts_subtick`) and the cursor gate (8.50 flips/s, 8.50 cursor mv/s, 0.00 cursor
 uploads/s) against a legacy-path control confirmed genuinely legacy (`atomic=0
 atest=0 cplane=0`). `05bb0fe` also added the `evpush` guest-side evdev-event counter
-to the `[DRMSTAT]` diagnostics (see the table below).
+to the `[DRMSTAT]` diagnostics (see the table below). Same day, a sixth wave closed out
+a design pass on item 1 (Venus/virgl): the 68/68 `venustest` and 0-failure `vktest`
+results stand, but `vktest` stops at `vkCreateDevice` — no GPU work has ever actually
+been submitted from LeandrOS — so item 1 is rewritten around a full M3 design at
+`~/code/leandros-artifacts/notes/m9-m3-vulkan/m3-vulkan-design.md`, scoping M3 as an
+offscreen `vkrender` with CPU readback rather than `vkcube`, and preparing (not
+building) a `run-qemu.sh --venus` patch. Two new items were split out of the design's
+kernel-gap findings: item 2 (`PRIME_HANDLE_TO_FD` refuses Venus blob handles, paired
+with the `SIMULATE_SYNCOBJ` zero-size-execbuffer gap) and item 3 (`driver.py` has no GL
+path, so the `run-leandros` skill cannot reach Venus at all). Former items 2-9 shifted
+down to 4-11 and the former item 10 (deferred work) is now item 12.
 
 ---
 
@@ -161,51 +171,107 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 
 | # | Item | Category | Blocked on |
 |---|---|---|---|
-| 1 | Venus/virgl — working on both arches; vkcube is the next milestone | Feature | — |
-| 2 | memfd burns a tmpfs slot per call — fix prepared, needs an in-flight refcount | Bug — latent DoS | — |
-| 3 | `tmpfile_owner_of` does not canonicalise pid to TGID | Bug — kernel | — |
-| 4 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
-| 5 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
-| 6 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
-| 7 | Delete the unreachable `init-server` crate | Cleanup | — |
-| 8 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
-| 9 | No TIME_WAIT — ports are instantly reusable | Bug | — |
-| 10 | Deferred / known limitations | Mixed | — |
+| 1 | Venus works; M3 is a render + readback test, not vkcube | Feature | — |
+| 2 | `PRIME_HANDLE_TO_FD` rejects Venus blob handles | Bug | — |
+| 3 | `driver.py` has no GL path at all | Bug | confirming screendump under egl-headless |
+| 4 | memfd burns a tmpfs slot per call — fix prepared, needs an in-flight refcount | Bug — latent DoS | — |
+| 5 | `tmpfile_owner_of` does not canonicalise pid to TGID | Bug — kernel | — |
+| 6 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
+| 7 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
+| 8 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
+| 9 | Delete the unreachable `init-server` crate | Cleanup | — |
+| 10 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
+| 11 | No TIME_WAIT — ports are instantly reusable | Bug | — |
+| 12 | Deferred / known limitations | Mixed | — |
 
 ---
 
-### 1. Venus/virgl — working on both arches; vkcube is the next milestone
+### 1. Venus works; M3 is a render + readback test, not vkcube
 
-The round-trip works and the TCG hang is fixed. On the Linux box
-(`forain@172.16.158.150`, EndeavourOS, virglrenderer 1.3.0, QEMU 11.0.1 — already
-installed, nothing to add; it is **Arch, not Debian**, so the old `apt install` line
-was wrong), on softfloat HEAD with fresh images: `venustest` is **68/68** and `vktest`
-is **0 failures** on x86_64/KVM, x86_64/TCG **and** aarch64/TCG — the first-ever
-aarch64 Vulkan pass, opening a real GPU through Mesa's Venus ICD (`Virtio-GPU Venus
-(AMD Ryzen 9 7950X (RADV RAPHAEL_MENDOCINO))`, `vkCreateDevice` VK_SUCCESS).
+**Measured**, on the Linux box (`forain@172.16.158.150`, EndeavourOS, virglrenderer
+1.3.0, QEMU 11.0.1 — already installed, nothing to add; it is **Arch, not Debian**, so
+the old `apt install` line was wrong), on softfloat HEAD with fresh images: `venustest`
+is **68/68** and `vktest` is **0 failures** on x86_64/KVM, x86_64/TCG **and**
+aarch64/TCG, opening a real GPU through Mesa's Venus ICD (`Virtio-GPU Venus (AMD Ryzen 9
+7950X (RADV RAPHAEL_MENDOCINO))`, `vkCreateDevice` VK_SUCCESS). The old "`venustest`
+fails 29 / `host lacks VIRGL/BLOB/CONTEXT_INIT`" line was a **macOS-host** artifact (no
+EGL) — not a code defect, and not the state on Linux.
 
-The TCG hang at `vkEnumeratePhysicalDevices` was **not** a GPU bug: `CLOCK_MONOTONIC`
-was advancing in 10 ms steps, which starved Mesa's Venus ring notify throttle. Fixed
-in `75b32e3` ("time: give CLOCK_MONOTONIC sub-tick resolution").
+**The decisive finding: no GPU work has ever been submitted from LeandrOS.** `vktest`
+stops at `vkCreateDevice` — everything proven so far is device *discovery*, not
+rendering. A full design is at
+`~/code/leandros-artifacts/notes/m9-m3-vulkan/m3-vulkan-design.md` (582 lines).
 
-Venus needs the device line `-device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G
--display egl-headless`. `scripts/run-qemu.sh` does **not** pass these, and on x86_64 it
-selects `virtio-vga` (no GL at all), so the in-tree harness cannot exercise Venus — only
-bespoke wave scripts can. Worth fixing. Reminder: `-nographic` silently overrides
-`-display`.
+**M3 is `vkrender`, not `vkcube`:** an offscreen render with CPU readback and pixel
+assertions, then a blit to a DRM dumb buffer for scanout. Subtests escalate —
+shaderless `vkCmdFillBuffer`, then compute, then a triangle into an offscreen colour
+attachment copied back through `HOST_VISIBLE|HOST_COHERENT` memory. It needs **no WSI
+and no loader**, and the scanout step reuses the exact `ADDFB2`/`SETCRTC` sequence
+`userland/drmsmoke/src/main.rs:362-425` already proves.
 
-The old "`venustest` fails 29 / `host lacks VIRGL/BLOB/CONTEXT_INIT`" line was a
-**macOS-host** artifact (no EGL) — not a code defect, and not the state on Linux.
-macOS-has-no-EGL and rutabaga-is-a-dead-end both remain accurate.
+**The loader stays unshipped.** Measured: the ICD exports only
+`vk_icdGetInstanceProcAddr`, `vk_icdNegotiateLoaderICDInterfaceVersion` and
+`vk_icdGetPhysicalDeviceProcAddr` — no `vkGetInstanceProcAddr` — so it can never stand
+in for `libvulkan.so.1`. `vkrender` bootstraps the way `vktest` does and resolves
+device entry points via `vkGetDeviceProcAddr`. When stock binaries eventually matter,
+build the real Khronos loader (Alpine packages it; the ICD manifest is already staged
+at `/usr/share/vulkan/icd.d`) rather than a forwarding shim, which gets the
+dispatchable-handle magic subtly wrong.
 
-`vkcube` is **not** yet a runnable follow-on: it has never been built for LeandrOS (no
-binary or source in the repo or in `leandros-artifacts`;
-`scripts/mkfs-f2fs-populated.py` stages only `vktest` + `libvulkan_virtio.so`), it links
-the Khronos `libvulkan.so.1` loader that we deliberately do not ship (`vktest` exists
-precisely to bypass the loader and `dlopen` the ICD directly), and no WSI has been
-chosen among the ICD's `VK_KHR_wayland_surface` / `VK_KHR_display` /
-`VK_EXT_headless_surface` / `VK_EXT_acquire_drm_display`. That is the M3 rendering
-milestone.
+**Every WSI path is blocked on one kernel gap.** `vkGetMemoryFdKHR` →
+`virtgpu_ioctl_prime_handle_to_fd` → our intercept at `kernel/src/syscall.rs:6049`,
+which resolves handles only via `dumb_buffer_phys_order` and so returns **EINVAL for
+any Venus blob**. That kills `VK_KHR_display`, `VK_EXT_headless_surface` and the
+Wayland dmabuf path alike — and is precisely why offscreen rendering can work while WSI
+cannot. A second blocker: Mesa 25.3.6 defines `SIMULATE_SYNCOBJ`/`SIMULATE_SUBMIT`
+unconditionally, and `sim_syncobj_create` mints its signalled fd via an execbuffer with
+`size=0, command=0` plus `FENCE_FD_OUT`, which we reject at two layers
+(`drivers/src/drm_device_interface.rs:2941`, `drivers/src/virtio_gpu.rs:1856`) and
+never write `fence_fd` back. Ordinary `vkQueueSubmit` avoids this by riding the ring
+with `ring_seqno`.
+
+For `VK_KHR_display` specifically, our atomic property model is nearly sufficient —
+plane 30 has all ten required properties and CRTC 1 has `MODE_ID` and `ACTIVE` — but
+the connector lacks **`DPMS`**, and `find_properties` fails the whole enumeration on
+it. Note also that we return `Ok(0)` for `AUTH_MAGIC` and never gate `SETCRTC` on DRM
+master, so a Vulkan client would silently fight cosmic-comp over the single CRTC; any
+direct-KMS demo must run with COSMIC stopped.
+
+**Ordered plan:** (1) `run-qemu.sh --venus` — patch ready, see below; (2) `vkrender`
+subtests with readback assertions, ~600 lines C built like `vktest`; (3) stage it in
+`scripts/mkfs-f2fs-populated.py`, two lines; (4) a `--present` dumb-buffer blit, ~80
+lines; (5) a wave harness and archived proof. Then, as a **separate** wave:
+`PRIME_HANDLE_TO_FD` for blob handles, zero-size execbuffer with `FENCE_FD_OUT`
+returning a signalled `eventfd2(1)` (~40 lines, correct because `submit_3d` is
+synchronous and Mesa only `poll(POLLIN)`s the fd), and an M4 Wayland client. **Riskiest
+step is (2), at subtest 0** — the first `vkQueueSubmit` and wait, in Mesa's `vn_ring`
+relax loop. This lane has been bitten there twice already (`75b32e3` clock
+granularity, `fb398c7` nanosleep truncation), both only under sustained ring traffic;
+subtest 0 is deliberately shaderless so the ring is the only suspect.
+
+**Step 1's patch is prepared and verified** at
+`~/code/leandros-artifacts/notes/m9-m3-vulkan/run_qemu_venus.patch` (52 insertions, 1
+deletion; `git apply --check`-clean at `e4a53c2`, round-trip verified, and confirmed to
+stack with the memfd and small-fixes patches in any order). It adds a `--venus` flag
+plus `LEANDROS_VENUS=1`, setting `virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G` with
+`-display egl-headless` on both arches, with `exit 1` guards and reasons for macOS,
+`--raspi4b` (that branch attaches no GPU at all), a missing `virtio-gpu-gl-pci`, and
+`-nographic` in `QEMU_EXTRA_ARGS` — turning the documented silent `-display` override
+into a diagnosable error. **`-vga none` is dropped only under `--venus`, not
+unconditionally**: the design proposed an unconditional drop, but our default x86_64
+path uses `virtio-vga`, which *is* a VGA device, so dropping it there would leave two
+VGA devices contending for the legacy ports — the archived working run had
+`virtio-gpu-gl-pci`, a non-VGA device, making q35's implicit std-VGA the only one. The
+second `-vga none` at the direct-boot branch is deliberately left alone.
+Default-path-unchanged was proven locally without launching QEMU, by stubbing
+`qemu-system-*` to answer only the `help` probes and diffing base-vs-patched output
+across both arches and both boot modes, on macOS and under a faked-Linux environment:
+4/4 identical in both.
+
+**Still to verify** on the Linux box: that `run-qemu.sh --venus` reproduces venustest
+68/68 and vktest 0 failures on both arches; that OVMF still gets a GOP from the default
+std-VGA under `--venus` (the one assumption the `-vga none` decision rests on and
+cannot be checked on the Mac); and a default-path regression run of both suites.
 
 **Linux-box tree state (trap).** That checkout is on a **detached HEAD** with two
 stashes, and **`stash@{0}` must not be blind-popped**. It holds 6 files but only 3 are
@@ -216,7 +282,30 @@ current HEAD — popping it would revert `4085b7f` (nested-epoll readiness). Re-
 instead. A raw copy of that stash also exists at
 `/home/forain/linux-tree-preexisting.patch` on the box.
 
-### 2. memfd burns a tmpfs slot per call — fix prepared, needs an in-flight refcount
+### 2. `PRIME_HANDLE_TO_FD` rejects Venus blob handles
+
+`kernel/src/syscall.rs:6049` resolves handles only through `dumb_buffer_phys_order`,
+returning EINVAL for any Venus blob, which blocks `vkGetMemoryFdKHR` and therefore
+every Vulkan WSI path. Pair it with the `SIMULATE_SYNCOBJ` gap: Mesa's
+`sim_syncobj_create` submits a zero-size execbuffer with `FENCE_FD_OUT`, rejected at
+`drivers/src/drm_device_interface.rs:2941` and `drivers/src/virtio_gpu.rs:1856`, with
+`fence_fd` never written back. Both are needed before any WSI; neither blocks offscreen
+rendering. Also note the connector's missing `DPMS` property, which fails
+`VK_KHR_display` enumeration outright, and that `AUTH_MAGIC` returning `Ok(0)` with no
+master gating on `SETCRTC` lets a direct-KMS client fight cosmic-comp for the CRTC.
+
+### 3. `driver.py` has no GL path at all
+
+`.claude/skills/run-leandros/driver.py:_build_cmd` hardcodes its own QEMU command line
+and never calls `run-qemu.sh`: plain `-device virtio-gpu-pci` on aarch64 (not even
+`-gl`), `-vga none -device virtio-vga` on x86_64, and `-display none` on both. So the
+`run-leandros` skill cannot exercise GL, let alone Venus, and the `--venus` flag does
+not reach it. Adding a `venus=True` mode is strictly larger than the flag —
+`-display none` must become `egl-headless`, and it is unknown whether the monitor
+`screendump` capture the whole skill depends on still works under `egl-headless`. That
+one question gates both this and M3's scanout step.
+
+### 4. memfd burns a tmpfs slot per call — fix prepared, needs an in-flight refcount
 
 **How it actually works, measured.** `MAX_TMP_FILES = 128` (`servers/vfs/src/lib.rs:264`)
 bounds one flat `TMP_FILES` array (`:326`) shared by `/tmp`, `/dev/shm` **and**
@@ -287,7 +376,7 @@ live COSMIC session: `thread 'smithay-clipboard' panicked … Create(Os { code: 
 must be **absent** from the serial log — it is present in every one of ~10 archived
 runs, so its disappearance is a clean signal.
 
-### 3. `tmpfile_owner_of` does not canonicalise pid to TGID
+### 5. `tmpfile_owner_of` does not canonicalise pid to TGID
 
 `tmpfile_owner_of` (`servers/vfs/src/lib.rs:459-461`) keys on the raw pid while
 `vfs_get_node_kind` (`:810`) canonicalises to the TGID, so any memfd `mmap` from a
@@ -299,10 +388,10 @@ spawned **thread** (as opposed to the process's main thread) returns ENOMEM
 session survives it, but it is a real correctness bug, not a benign symptom. `36f62d0`
 already fixed the same class of bug for the dmabuf path, by passing
 `sched::tgid_of(pid)` explicitly at the two dmabuf-side call sites. The fix for this
-item is included in the item 2 patch above, but it is an independent defect worth its
+item is included in the item 4 patch above, but it is an independent defect worth its
 own line — it breaks threaded memfd users generally, not just this one.
 
-### 4. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
+### 6. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
 
 **What we already have, measured.** The property is fully plumbed, not merely
 advertised: `PROP_FB_DAMAGE_CLIPS = 51` as `PropKind::Blob` in `PROPS`
@@ -380,7 +469,7 @@ screendumps >=2 s apart and confirm the digits differ, then force one full prese
 confirm it is pixel-identical. Note the cursor will not appear in `screendump` now that
 it is on the hardware plane. Plus `drmsmoke` 22/0 both arches and `idletest`.
 
-### 5. `listen()` twice returns EINVAL — fix prepared
+### 7. `listen()` twice returns EINVAL — fix prepared
 
 `handle_listen` matched only `SockState::InetBound`, so a repeat call fell to
 `_ => err_reply(-22)`. The fix adds one arm, `SockState::InetListening { .. } => return
@@ -403,7 +492,7 @@ repeat `listen(srv,16)` returns 0, and that connect+accept still complete on the
 listener afterwards — the last is what catches a fix that re-arms and orphans handles.
 **`scmtest` 26/0 → 27/0**, or **→ 29/0** if the memfd patch's two subtests land first.
 
-### 6. `unused variable: port` in `handle_close` — not a leak, fix prepared
+### 8. `unused variable: port` in `handle_close` — not a leak, fix prepared
 
 **Measured, it is a warning and not a port leak.** `alloc_ephemeral_port`
 (`servers/net/src/lib.rs:442`) is the only allocator and derives "free" purely from live
@@ -416,7 +505,7 @@ renaming it to `_port` (a dead read invites someone to re-add it) and leaves a c
 recording why no release is needed. Verification is just that the warning is gone with
 no new ones, and `scmtest` unchanged.
 
-### 7. Delete the unreachable `init-server` crate
+### 9. Delete the unreachable `init-server` crate
 
 The scope is larger than this item previously stated. **`init-server` is a real
 dependency in `kernel/Cargo.toml:34`, so all 2653 lines compile into every kernel
@@ -447,23 +536,23 @@ both arches link with the crate gone, `grep -rn init_server .` is empty, serial 
 is **unchanged** to the login prompt (nothing in the crate ever printed), and the full
 suite is at baseline on fresh images.
 
-### 8. AF_UNIX `listen()` is lax in the opposite direction
+### 10. AF_UNIX `listen()` is lax in the opposite direction
 
 The AF_UNIX arm of `handle_listen` is an unconditional `ok_reply()` — a repeat listen
 already succeeds, but so does `listen()` on an unbound or already-connected AF_UNIX
-socket, where Linux answers EINVAL. Found while fixing the AF_INET side (item 5) and
+socket, where Linux answers EINVAL. Found while fixing the AF_INET side (item 7) and
 deliberately **not** changed there: tightening it alters behaviour for every AF_UNIX
 server on the system (cosmic-comp, busd, tokio) and could not be validated in a
 read-only session. Needs a live COSMIC session to land safely.
 
-### 9. No TIME_WAIT — ports are instantly reusable
+### 11. No TIME_WAIT — ports are instantly reusable
 
 `handle_close` calls `socket_set.remove()` immediately, so a closed TCP port can be
 rebound at once where Linux would hold it in TIME_WAIT. A divergence, not a leak, and
 low priority — but it is the kind of thing that makes a server restart behave
 differently here than on Linux.
 
-### 10. Deferred work and known limitations
+### 12. Deferred work and known limitations
 
 - **Doom does not link relibc.** `../doomgeneric/Makefile.leandros` links
   `userland/target/<arch>-unknown-none/release/libleandros_libc.a`, whose allocator is
