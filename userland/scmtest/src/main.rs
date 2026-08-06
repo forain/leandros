@@ -251,7 +251,7 @@ unsafe fn raw_accept(fd: i32) -> i32 {
     }
 }
 
-// ── AF_INET socket wrappers (TODO item 9) ───────────────────────────────────
+// ── AF_INET socket wrappers ───────────────────────────────────
 
 /// `sockaddr_in`, Linux ABI: sin_family(2) + sin_port(2, network order) +
 /// sin_addr(4, network order) + 8 bytes of padding = 16 bytes, which is the
@@ -670,7 +670,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     // ── M7u: mincore residency probe (Mesa EGL pointer-dereferenceable signal) ──
     if !test_mincore() { failures += 1; }
 
-    // ── TODO item 9: AF_INET TCP over the loopback interface ────────────────
+    // ── AF_INET TCP over the loopback interface ────────────────
     if !test_inet_loopback_tcp() { failures += 1; }
     if !test_inet_listen_twice() { failures += 1; }
 
@@ -1259,7 +1259,7 @@ unsafe fn test_teardown_loop() -> bool {
     report(name, ok && i == 150)
 }
 
-/// TODO item 2: a memfd must be an ANONYMOUS inode. Three claims, one loop.
+/// A memfd must be an ANONYMOUS inode. Three claims, one loop.
 ///
 /// (a) The "/tmp/memfd:<name>" node is unlinked at creation, so it is invisible
 ///     to stat/lookup — Linux semantics, and what `sys_memfd_create`'s old
@@ -1707,7 +1707,7 @@ unsafe fn test_full_ring_eagain() -> bool {
     report(name, ok)
 }
 
-/// TODO item 9 regression: a full AF_INET TCP round-trip over 127.0.0.1.
+/// A full AF_INET TCP round-trip over 127.0.0.1.
 ///
 /// `bind("127.0.0.1:0")` was the whole reported bug. bind() stored a zero port,
 /// and listen() rejected a zero `bound_port` with EINVAL — which mio/tokio
@@ -1802,7 +1802,7 @@ unsafe fn test_inet_loopback_tcp() -> bool {
     report(name, c2s_ok && s2c_ok)
 }
 
-/// TODO item 8: `listen()` on an already-listening socket must succeed.
+/// `listen()` on an already-listening socket must succeed, as on Linux.
 ///
 /// Linux's `inet_listen` accepts a repeat listen and only updates the backlog.
 /// Ours matched `SockState::InetBound` alone, so the second call fell through
@@ -1892,7 +1892,7 @@ unsafe fn inet_recv_retry(fd: i32, buf: *mut u8, len: usize) -> isize {
     -1
 }
 
-/// TODO item 4 regression: an SCM_RIGHTS import that fails with EMFILE must
+/// An SCM_RIGHTS import that fails with EMFILE must
 /// release the descriptor EXACTLY once.
 ///
 /// `import_fd` used to release the transfer's reference itself before returning
