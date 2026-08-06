@@ -29,6 +29,64 @@ static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 /// off the same clock anyway.
 static TICKS_PER_IRQ: AtomicU32 = AtomicU32::new(0);
 
+/// TSC cycles in one 10 ms tick, measured in the same PIT window that
+/// calibrates the APIC timer; the TSC sampled at the most recent BSP tick; and
+/// the highest value `monotonic_ns` has ever returned. See `monotonic_ns`.
+static TSC_PER_TICK:  AtomicU64 = AtomicU64::new(0);
+static LAST_TICK_TSC: AtomicU64 = AtomicU64::new(0);
+static MONO_LAST_NS:  AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn rdtsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Monotonic nanoseconds since boot, interpolated *inside* the current tick.
+///
+/// A 100 Hz tick counter alone answers `clock_gettime` in 10 ms steps, which is
+/// not merely coarse — it is wrong in a way userspace acts on. Mesa's venus ring
+/// throttles the "wake the idle renderer" notification to one per 1 ms, and
+/// decides using this clock; with a 10 ms clock two submissions up to 10 ms
+/// apart read the *same* timestamp, the second notification is suppressed, and
+/// virglrenderer's ring thread — which re-idles after 1 ms and only ever waits
+/// on an explicit notify — sleeps forever. That is the whole `vktest`-under-TCG
+/// hang.
+///
+/// The scale comes from the PIT window that already calibrates the APIC timer,
+/// so it is measured, not assumed: a real host TSC (~4 GHz) and TCG's virtual
+/// one (~1 GHz) both come out right with no per-accelerator special case.
+///
+/// The tick and its TSC anchor are published from `on_tick` one after the other,
+/// so a reader can catch them mid-update; the anchor is re-read to detect that,
+/// the fraction is clamped below one tick, and the result is passed through a
+/// `fetch_max` so the clock can never step backwards.
+pub fn monotonic_ns() -> u64 {
+    let per = TSC_PER_TICK.load(Ordering::Relaxed);
+    let ns = loop {
+        let a = LAST_TICK_TSC.load(Ordering::Acquire);
+        let t = TICK_COUNT.load(Ordering::Acquire);
+        let b = LAST_TICK_TSC.load(Ordering::Acquire);
+        if a != b { continue; }
+        let base = t.wrapping_mul(10_000_000);
+        if a == 0 || per == 0 { break base; }
+        let d = rdtsc().wrapping_sub(a);
+        let frac = ((d as u128) * 10_000_000u128 / per as u128) as u64;
+        break base + frac.min(9_999_999);
+    };
+    let prev = MONO_LAST_NS.fetch_max(ns, Ordering::Relaxed);
+    if prev > ns { prev } else { ns }
+}
+
+/// Resolution of `monotonic_ns` in nanoseconds: the period of the TSC the
+/// sub-tick fraction is interpolated from, floored at 1 ns. Falls back to a
+/// whole tick if the PIT window never established the scale, so the answer is
+/// never better than what the clock can actually deliver.
+pub fn resolution_ns() -> u64 {
+    let per = TSC_PER_TICK.load(Ordering::Relaxed);
+    if per == 0 { return 10_000_000; }
+    (10_000_000u64 / per).max(1)
+}
+
 /// Return the number of scheduler ticks since boot.
 #[inline]
 pub fn ticks() -> u64 {
@@ -90,6 +148,10 @@ unsafe fn calibrate_apic_ticks_10ms() -> u32 {
     apic::write(apic::LAPIC_TIMER_INIT, 0xFFFF_FFFF);
 
     let start = apic::read(apic::LAPIC_TIMER_CURR);
+    // The PIT window is exactly one 100 Hz tick, so the TSC delta across it is
+    // TSC-cycles-per-tick — the scale `monotonic_ns` needs, measured on the same
+    // reference the APIC timer is calibrated against.
+    let tsc_start = rdtsc();
 
     // ── Wait for PIT ch2 output (bit 5 of port 0x61 goes high when done) ─────
     loop {
@@ -97,6 +159,10 @@ unsafe fn calibrate_apic_ticks_10ms() -> u32 {
     }
 
     let end = apic::read(apic::LAPIC_TIMER_CURR);
+    let tsc_elapsed = rdtsc().wrapping_sub(tsc_start);
+    if tsc_elapsed != 0 {
+        TSC_PER_TICK.store(tsc_elapsed, Ordering::Release);
+    }
 
     // Mask the APIC timer again; we are not yet in periodic mode.
     apic::write(apic::LAPIC_LVT_TIMER, (1 << 16) | 0xFF);
@@ -165,6 +231,11 @@ pub unsafe fn init_local_timer() {
 pub fn on_tick() {
     let cpu = unsafe { super::smp::arch_cpu_id() };
     if cpu == 0 {
+        // Anchor the sub-tick interpolation BEFORE publishing the new tick, so a
+        // concurrent reader can only ever see an anchor that is at most one tick
+        // stale (bounded by the clamp in `monotonic_ns`), never one from the
+        // future.
+        LAST_TICK_TSC.store(rdtsc(), Ordering::Release);
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
 
         // Poll VirtIO input devices (keyboard + tablet). The primary x86_64

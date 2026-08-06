@@ -14,6 +14,53 @@ const TICK_HZ: u64 = 100;
 /// Global tick counter — incremented on every timer interrupt.
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// CNTVCT_EL0 sampled at the instant of the most recent BSP tick, and the
+/// highest value `monotonic_ns` has ever returned. Together they give
+/// CLOCK_MONOTONIC sub-tick resolution: see `monotonic_ns`.
+static LAST_TICK_CNT: AtomicU64 = AtomicU64::new(0);
+static MONO_LAST_NS:  AtomicU64 = AtomicU64::new(0);
+
+/// Read the always-on virtual counter.
+#[inline]
+fn cntvct() -> u64 {
+    let c: u64;
+    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) c, options(nomem, nostack)); }
+    c
+}
+
+/// Monotonic nanoseconds since boot, interpolated *inside* the current tick.
+///
+/// A 100 Hz tick counter alone answers `clock_gettime` in 10 ms steps, which is
+/// not merely coarse — it is wrong in a way userspace acts on. Mesa's venus ring
+/// throttles the "wake the idle renderer" notification to one per 1 ms, and
+/// decides using this clock; with a 10 ms clock two submissions up to 10 ms
+/// apart read the *same* timestamp, the second notification is suppressed, and
+/// virglrenderer's ring thread — which re-idles after 1 ms and only ever waits
+/// on an explicit notify — sleeps forever. That is the whole `vktest`-under-TCG
+/// hang. The generic timer is free-running, per-architecture exact (CNTFRQ_EL0),
+/// and readable at EL0 cost, so the fraction is real, not estimated.
+///
+/// The tick and its counter anchor are published from `on_tick` one after the
+/// other, so a reader can catch them mid-update; the anchor is re-read to detect
+/// that, the fraction is clamped below one tick, and the result is passed
+/// through a `fetch_max` so the clock can never step backwards.
+pub fn monotonic_ns() -> u64 {
+    let f = freq();
+    let ns = loop {
+        let a = LAST_TICK_CNT.load(Ordering::Acquire);
+        let t = TICK_COUNT.load(Ordering::Acquire);
+        let b = LAST_TICK_CNT.load(Ordering::Acquire);
+        if a != b { continue; }
+        let base = t.wrapping_mul(10_000_000);
+        if a == 0 || f == 0 { break base; }
+        let d = cntvct().wrapping_sub(a);
+        let frac = ((d as u128) * 1_000_000_000u128 / f as u128) as u64;
+        break base + frac.min(9_999_999);
+    };
+    let prev = MONO_LAST_NS.fetch_max(ns, Ordering::Relaxed);
+    if prev > ns { prev } else { ns }
+}
+
 /// Return the number of timer ticks since boot.
 #[inline]
 pub fn ticks() -> u64 {
@@ -27,6 +74,16 @@ pub fn freq() -> u64 {
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack));
     }
     f
+}
+
+/// Resolution of `monotonic_ns` in nanoseconds: the period of the generic
+/// timer the sub-tick fraction is interpolated from, floored at 1 ns. Falls
+/// back to a whole tick if CNTFRQ_EL0 reads zero, so the answer is never better
+/// than what the clock can actually deliver.
+pub fn resolution_ns() -> u64 {
+    let f = freq();
+    if f == 0 { return 10_000_000; }
+    (1_000_000_000u64 / f).max(1)
 }
 
 /// Compute the reload value for one tick interval.
@@ -66,6 +123,11 @@ pub fn on_tick() {
 
     let cpu = unsafe { super::smp::arch_cpu_id() };
     if cpu == 0 {
+        // Anchor the sub-tick interpolation BEFORE publishing the new tick, so a
+        // concurrent reader can only ever see an anchor that is at most one tick
+        // stale (bounded by the clamp in `monotonic_ns`), never one from the
+        // future.
+        LAST_TICK_CNT.store(cntvct(), Ordering::Release);
         let _count = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
 
         // Poll VirtIO Keyboard

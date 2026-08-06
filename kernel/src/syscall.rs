@@ -2150,17 +2150,34 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
     }
 }
 
-/// sys_clock_gettime(clkid, tp_ptr) — write monotonic tick counter to user memory.
+/// Monotonic nanoseconds since boot, with sub-tick resolution.
 ///
-/// `clkid` is ignored (all clocks return the same monotonic tick counter).
+/// The 100 Hz tick counter alone is a 10 ms-granular clock, and userspace acts
+/// on the difference rather than just reading it: Mesa's venus ring suppresses
+/// its "wake the idle renderer" notification whenever this clock says less than
+/// 1 ms has passed since the last one, so a 10 ms clock silently withholds a
+/// wake-up for up to 10 ms — while virglrenderer's ring thread re-idles after
+/// 1 ms and, once idle, waits only on that notification and never re-checks the
+/// ring. That is the whole `vktest`-under-TCG hang.
+#[inline]
+fn monotonic_ns() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    { arch_x86_64::timer::monotonic_ns() }
+    #[cfg(target_arch = "aarch64")]
+    { arch_aarch64::timer::monotonic_ns() }
+}
+
+/// sys_clock_gettime(clkid, tp_ptr) — write the monotonic clock to user memory.
+///
+/// `clkid` is ignored (all clocks return the same monotonic reading).
 /// Writes a `struct timespec { tv_sec: i64, tv_nsec: i64 }` at `tp_ptr`.
-/// Tick frequency is ~100 Hz (10 ms per tick).
+/// The 100 Hz tick supplies the whole ticks; `monotonic_ns` interpolates
+/// inside the current one from the architecture's free-running counter.
 fn sys_clock_gettime(_clkid: usize, tp_ptr: usize) -> isize {
     if !validate_user_ptr_aligned(tp_ptr, 16, 8) { return -14; }
-    let ticks = ticks();
-    // Treat each tick as 10 ms.
-    let tv_sec  = (ticks / 100) as i64;
-    let tv_nsec = ((ticks % 100) * 10_000_000) as i64;
+    let ns = monotonic_ns();
+    let tv_sec  = (ns / 1_000_000_000) as i64;
+    let tv_nsec = (ns % 1_000_000_000) as i64;
     unsafe {
         core::ptr::write(tp_ptr as *mut i64, tv_sec);
         core::ptr::write((tp_ptr + 8) as *mut i64, tv_nsec);
@@ -2212,16 +2229,28 @@ fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> 
     }
 }
 
+/// Resolution of the clock `sys_clock_gettime` reports, in nanoseconds.
+#[inline]
+fn clock_resolution_ns() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    { arch_x86_64::timer::resolution_ns() }
+    #[cfg(target_arch = "aarch64")]
+    { arch_aarch64::timer::resolution_ns() }
+}
+
 /// sys_clock_getres(clkid, res_ptr) — return the resolution of a clock.
 ///
-/// All clocks report 10 ms resolution (100 Hz tick counter).
+/// This must track `sys_clock_gettime`, not the tick rate: reporting 10 ms
+/// while the clock interpolates to the counter period tells callers that
+/// timestamps closer together than 10 ms are indistinguishable, which is
+/// exactly the false belief that stalled Mesa's ring notification.
+/// Always under a second, so the seconds field is zero by construction.
 fn sys_clock_getres(_clkid: usize, res_ptr: usize) -> isize {
     if res_ptr != 0 {
         if !validate_user_buf(res_ptr, 16) { return -14; }
-        // struct timespec { tv_sec=0, tv_nsec=10_000_000 (10 ms) }
         unsafe {
-            core::ptr::write(res_ptr          as *mut i64, 0i64);
-            core::ptr::write((res_ptr + 8)    as *mut i64, 10_000_000i64);
+            core::ptr::write(res_ptr       as *mut i64, 0i64);
+            core::ptr::write((res_ptr + 8) as *mut i64, clock_resolution_ns() as i64);
         }
     }
     0

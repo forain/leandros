@@ -81,6 +81,8 @@ pub struct sigaction {
 const SIGEV_SIGNAL: c_int = 0;
 const SIGALRM: c_int = 14;
 const CLOCK_REALTIME: clockid_t = 0;
+const CLOCK_MONOTONIC: clockid_t = 1;
+const TICK_NS: i64 = 10_000_000; // one 100 Hz scheduler tick
 const ITIMER_REAL: c_int = 0;
 const EAGAIN: c_int = 11;
 const MAX_TIMERS: usize = 8;
@@ -97,6 +99,8 @@ extern "C" {
     pub fn __errno_location() -> *mut c_int;
 
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
+    pub fn clock_gettime(clockid: clockid_t, tp: *mut timespec) -> c_int;
+    pub fn clock_getres(clockid: clockid_t, res: *mut timespec) -> c_int;
     pub fn sigaction(sig: c_int, act: *const sigaction, oact: *mut sigaction) -> c_int;
 
     pub fn timer_create(clockid: clockid_t, evp: *mut sigevent, timerid: *mut timer_t) -> c_int;
@@ -154,6 +158,7 @@ pub unsafe extern "C" fn timer_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_timer_periodic_overrun() { failures += 1; }
     if !test_timer_max_and_eagain() { failures += 1; }
     if !test_alarm_and_setitimer_no_leak() { failures += 1; }
+    if !test_clock_monotonic_subtick() { failures += 1; }
 
     puts(b"--- timertest done ---\n\0".as_ptr());
     failures
@@ -377,7 +382,102 @@ unsafe fn test_alarm_and_setitimer_no_leak() -> bool {
     report(name, rearm_reported_remaining && setitimer_ok && shared_slot && getitimer_ok && no_leak)
 }
 
-// ── Helper ──────────────────────────────────────────────────────────────────
+// ── 6. CLOCK_MONOTONIC advances *inside* a scheduler tick ───────────────────
+//
+// sys_clock_gettime used to derive the answer from the 100 Hz tick counter
+// alone, so CLOCK_MONOTONIC moved in 10 ms steps and clock_getres claimed
+// 10 ms.  Nothing above catches that: every check here is a *duration* test
+// with milliseconds of slack, and a 10 ms-granular clock satisfies all of
+// them.  Userspace nevertheless acts on the difference between two closely
+// spaced readings — Mesa's venus ring suppresses its "wake the idle
+// renderer" notify whenever this clock says under 1 ms has elapsed since the
+// last one, and a clock that cannot resolve 1 ms withholds that notify for a
+// whole tick, ten times the renderer's idle timeout.  So assert the property
+// directly rather than a duration: sample in a tight loop and require the
+// clock to land strictly between tick boundaries and to advance by less than
+// a tick, while never stepping backwards.
+
+unsafe fn test_clock_monotonic_subtick() -> bool {
+    let name = b"clock_monotonic_subtick\0";
+
+    // Resolution must not claim the whole tick, and must be a real duration.
+    let mut res = core::mem::zeroed::<timespec>();
+    if clock_getres(CLOCK_MONOTONIC, &mut res) != 0 { return report(name, false); }
+    let res_ns = res.tv_sec * 1_000_000_000 + res.tv_nsec;
+    let res_ok = res_ns > 0 && res_ns < TICK_NS;
+
+    let mut prev: i64 = -1;
+    let mut monotonic = true;      // never steps backwards
+    let mut off_boundary = false;  // some reading is not a whole tick
+    let mut subtick_step = false;  // some advance is smaller than a tick
+    let mut min_step: i64 = i64::MAX;
+    let mut first: i64 = 0;
+    let mut last: i64 = 0;
+
+    // ~4000 back-to-back readings; even under TCG this spans several ticks,
+    // so a tick-granular clock would still show its steps here.
+    for i in 0..4000 {
+        let mut ts = core::mem::zeroed::<timespec>();
+        if clock_gettime(CLOCK_MONOTONIC, &mut ts) != 0 { return report(name, false); }
+        let ns = ts.tv_sec * 1_000_000_000 + ts.tv_nsec;
+        if i == 0 { first = ns; }
+        last = ns;
+        if ns % TICK_NS != 0 { off_boundary = true; }
+        if prev >= 0 {
+            let d = ns - prev;
+            if d < 0 { monotonic = false; }
+            if d > 0 && d < TICK_NS {
+                subtick_step = true;
+                if d < min_step { min_step = d; }
+            }
+        }
+        prev = ns;
+    }
+
+    // The loop must actually have taken time; otherwise "no backward step"
+    // is vacuous.
+    let advanced = last > first;
+
+    // Sanity-check the scale as well as the granularity: the interpolated
+    // fraction is clamped below one tick, so it can never make the clock
+    // drift, but a wildly wrong anchor would show up as an elapsed time that
+    // does not resemble the sleep.
+    let mut a = core::mem::zeroed::<timespec>();
+    let mut b = core::mem::zeroed::<timespec>();
+    clock_gettime(CLOCK_MONOTONIC, &mut a);
+    sleep_ms(200);
+    clock_gettime(CLOCK_MONOTONIC, &mut b);
+    let slept = (b.tv_sec * 1_000_000_000 + b.tv_nsec) - (a.tv_sec * 1_000_000_000 + a.tv_nsec);
+    let sleep_plausible = slept >= 150_000_000 && slept <= 2_000_000_000;
+
+    print_kv(b"  clock_getres_ns=\0", res_ns as u64);
+    print_kv(b"  sleep200ms_measured_ns=\0", slept.max(0) as u64);
+    print_kv(b"  min_subtick_step_ns=\0", if min_step == i64::MAX { 0 } else { min_step as u64 });
+    print_kv(b"  loop_span_ns=\0", (last - first).max(0) as u64);
+
+    report(name, res_ok && monotonic && off_boundary && subtick_step && advanced && sleep_plausible)
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Print `label` followed by `v` in decimal and a newline — no libc formatting
+/// available in this no_std binary.
+unsafe fn print_kv(label: &[u8], v: u64) {
+    write(1, label.as_ptr(), label.len() - 1);
+    let mut buf = [0u8; 20];
+    let mut n = 0;
+    let mut x = v;
+    loop {
+        buf[n] = b'0' + (x % 10) as u8;
+        n += 1;
+        x /= 10;
+        if x == 0 { break; }
+    }
+    let mut out = [0u8; 20];
+    for i in 0..n { out[i] = buf[n - 1 - i]; }
+    write(1, out.as_ptr(), n);
+    write(1, b"\n".as_ptr(), 1);
+}
 
 unsafe fn report(name: &[u8], passed: bool) -> bool {
     write(1, name.as_ptr(), name.len() - 1);
