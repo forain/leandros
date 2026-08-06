@@ -3,7 +3,7 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-06** (`c27557f`), after a five-lane wave that
+Last reconciled against `main` on **2026-08-06** (`49399f9`), after a five-lane wave that
 landed two commits here and four on the Linux box, closed three items by measurement,
 **corrected three claims the previous reconciliation had recorded wrongly**, and found one
 memory-safety bug that is now the first item in the file.
@@ -65,8 +65,10 @@ has both WSI branches compiled in, so no Mesa rebuild. Stages 3–5 of that desi
 **killed as an M4 unblocker**; Stages 1–2 remain due, because they are item 1.
 
 **Two lanes were still running when this was written**, and neither result may be assumed:
-one validating item 9 (AF_UNIX `listen()` strictness) with a dirty-image COSMIC double-run
-on the Linux box, one implementing the item 1 fix. What each outcome means is written into
+one validating AF_UNIX `listen()` strictness with a dirty-image COSMIC double-run on the
+Linux box, one implementing the dmabuf-lifetime fix. **Both have since reported — see the
+final-wave paragraph below; the numbers cited in this paragraph are the numbering of that
+moment, not of this file.** What each outcome means is written into
 its item.
 
 Earlier waves this session, compressed: `05f7279` (aarch64 kernel softfloat — six separate
@@ -83,6 +85,40 @@ four on the box.** The item count
 does not fall much across the session because analysis kept finding pre-existing defects
 that were always there and simply unmeasured, not because work ran out — item 1 is the
 sharpest example.
+
+**Final wave of 2026-08-06, and the state this file now describes.** Two further lanes
+closed and the two trees were reconciled. The AF_UNIX `listen()` strictness patch
+**landed** (`055745f`) after the validation it had been held for: eight COSMIC session
+boots — control double-run and patched double-run, both arches — showed no restart loop,
+12 `launch_pad` starts with max 1 per name, identical control against patched, and zero
+`Unknown id`, `PANEL MAIN ERR`, `panicked` or `restarting process` in any run. The
+negative control is what makes it evidence rather than absence: an unpatched kernel
+running the *same* patched `scmtest` gives 30 PASS / 1 FAIL on `unix_listen_strict`, its
+diagnostics naming all five must-fail assertions reading `rc=0`. **Carry this caveat
+forward:** `XDG_RUNTIME_DIR=/run/user/0` is a `TMPFS_ROOTS` entry and is verifiably empty
+at every boot, so a reboot cannot carry a stale `S_IFSOCK` into the next session — the
+double-run tested a dirty `$HOME` (proven by a marker file and run 1's full
+`com.system76.Cosmic*` tree), **not** dirty sockets. The specific route to a failing
+`bind()` that this patch was feared to escalate is unreachable across a reboot on this
+system; the same-boot route was exercised for 240 s / 600 s per run with nothing dying.
+
+The use-after-free is **fixed and landed** (`49399f9`), and the two trees are **no longer
+divergent**: `e083202`, `eccc4e9`, `a0325c6` and `3532c7b` were cherry-picked from the box
+(as `3dbba0c`, `3d4c980`, `09def61`, `055745f`), and `0df1810` was **skipped** because its
+patch-id is byte-identical to this Mac's `18a7a9f` — the same change had reached the two
+trees by different routes, and only `git patch-id` says so, since the SHAs differ. The
+lifetime fix needed one hand-written integration edit on top: `blob_map_cache_type`, which
+arrived with blob cacheability, iterated `BLOB_BUFFERS` reading `map_phys`/`size`/
+`map_info`, and those fields now live on the object. It iterates `BLOB_OBJS` instead,
+because they describe the host mapping — which belongs to the buffer, not to any one
+handle naming it, and once import mints a second handle a per-handle scan could disagree
+with itself.
+
+**A tenth instrument lied, and it was a shell pipeline.** `git apply --check … | head -10
+&& echo OK` reports success whenever `head` succeeds, because a pipeline's status is the
+*last* command's — so a patch that failed printed `APPLIES CLEAN` two lines below its own
+error text. Branch on the command itself (`if git apply --check …; then`) rather than
+piping it. This is the same shape as the other nine: it failed toward looking successful.
 
 ---
 
@@ -312,7 +348,7 @@ is not decorative.
 | `mm::gap2::ON` | `mm/src/gap2.rs:17` | memfd/MAP_SHARED path + frame checksum sampler |
 | `pci::RENDER_DEBUG` | `drivers/src/pci.rs:99` | per-frame DRM/FB/GPU/KMS/SND serial tracing |
 
-The one diagnostic that is **not** behind a flag is `[DRM-SRV] mmap …` — item 11.
+The one diagnostic that is **not** behind a flag is `[DRM-SRV] mmap …` — item 10.
 
 **`RUST_LOG=trace` cannot read smithay's own damage-tracking decisions.**
 `cosmic-comp/Cargo.toml:61-62` sets `release_max_level_info` on `tracing`, so `trace!`
@@ -336,45 +372,35 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 
 | # | Item | Category | Blocked on |
 |---|---|---|---|
-| 1 | An exported dmabuf fd does not keep its buffer alive — use-after-free | **Bug — memory safety** | fix in flight |
-| 2 | This Mac and the Linux box have diverged — four commits, sync held | Housekeeping — blocking | item 1 |
+| 1 | The blob half of the dmabuf lifetime fix is unexercised | Verification | a Venus host |
+| 2 | `driver.py` fakes a clean run when `aarch64_vars.fd` is missing | Bug — harness | — |
 | 3 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — kernel/host | — |
 | 4 | x86_64 `IA32_PAT`: the BSP and the APs disagree — fix prepared | Bug — kernel | — |
 | 5 | aarch64 `ATTR_DEV` is Device-nGnRnE, and a landed comment implies otherwise | Bug — comment | — |
 | 6 | Vulkan presents headless and to a scanout; M4 goes via `MESA_VK_WSI_DEBUG=sw` | Feature | — |
 | 7 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | — |
 | 8 | Primary-plane over-damage is upstream; only a measurement remains | Perf | — |
-| 9 | AF_UNIX `listen()` is lax in the opposite direction — fix prepared | Bug | validation in flight |
-| 10 | `kms_swrast` destroys imported handles with `MODE_DESTROY_DUMB` | Bug — kernel | — |
-| 11 | The `[DRM-SRV] mmap` trace is unconditional and floods a session | Bug — diagnostics | — |
-| 12 | Deferred work and known limitations | Mixed | — |
+| 9 | `kms_swrast` destroys imported handles with `MODE_DESTROY_DUMB` | Bug — kernel | — |
+| 10 | The `[DRM-SRV] mmap` trace is unconditional and floods a session | Bug — diagnostics | — |
+| 11 | Deferred work and known limitations | Mixed | — |
 
 ---
 
 ## Prepared but not landed
 
-All five patches below were re-checked `git apply --check`-clean **against this Mac's
-`c27557f`** at reconciliation time, not inherited from an older base.
+Three patches remain. All were re-checked `git apply --check`-clean against this Mac's
+`c27557f`; the two that have since landed are gone from this list, not marked done.
 
-1. `~/code/leandros-artifacts/notes/m9-prime-export/prime_handle_to_fd_built_20260806.patch`
-   — 4 files, +349/−27. Already **committed on the box** as `e083202` and verified there;
-   this file is the route onto the Mac. **Held** — it widens item 1. See item 2.
-2. `~/code/leandros-artifacts/notes/m9-simulate-syncobj/simulate_syncobj_respec_20260806.patch`
-   — the re-specified syncobj change, **committed on the box** as `a0325c6`,
-   `venustest` 91/0 both arches. The superseded `simulate_syncobj.patch` is left alongside
-   it, unmodified; do not apply that one. See item 2. (Sequencing note: each of these two
-   applies cleanly on its own at `c27557f`; their composition is known-good because the
-   box carries them as consecutive commits.)
-3. `~/code/leandros-artifacts/notes/m9-x86-pat/pat_bringup.patch` — 331 lines, 3 files,
+1. `~/code/leandros-artifacts/notes/m9-x86-pat/pat_bringup.patch` — 331 lines, 3 files,
    all under `arch/x86_64/src/`. Builds all four kernel variants. **Never run.** Touches
    nothing any other lane owns. See item 4.
-4. `~/code/leandros-artifacts/notes/m9-afunix-timewait/afunix_listen_strict.patch` — 230
-   lines, `servers/net/` + `userland/scmtest/`. Correct but deliberately held pending a
-   live-session validation that is in flight. See item 9.
-5. `~/code/leandros-artifacts/notes/m9-damage-rootcause/damage_rect_dump.patch` — 132
+2. `~/code/leandros-artifacts/notes/m9-damage-rootcause/damage_rect_dump.patch` — 132
    lines, one file, `drivers/` only, entirely inside the `DRM_STATS` gate, **built** for
    both targets. Prints the decoded damage rect list. Optional; see item 8 for what it
    would and would not settle.
+3. `~/code/leandros-artifacts/notes/m9-dmabuf-lifetime/dmabuf_lifetime.patch` — superseded
+   as a patch (landed as `49399f9`), kept only because its companion `dmabuf_lifetime.md`
+   is the reference for the refcount model. Do **not** re-apply it.
 
 Also prepared, not a kernel patch:
 `~/code/leandros-artifacts/notes/m9-driverpy-venus/driverpy_venus.patch` — teaches
@@ -386,124 +412,58 @@ citations (standing rule), and correct the docstring's `screendump` account — 
 
 ---
 
-### 1. An exported dmabuf fd does not keep its buffer alive — use-after-free
+### 1. The blob half of the dmabuf lifetime fix is unexercised
 
-**Reachable from one unprivileged process, no cross-open work, no second process.**
-`release_blob` (`drivers/src/drm_device_interface.rs:2794`) and `free_dumb` (`:2178`) end
-in an unconditional `mm::buddy::free(phys, order)` and consult no reference count.
-`vmo_free_slot` (`servers/vfs/src/lib.rs:443`) returns early for a borrowed VMO *without*
-freeing, on the stated grounds that the DRM layer frees the block exactly once. That
-reasoning is sound in one direction and silent in the other: **nothing makes the DRM
-object outlive the fd.**
+The use-after-free itself is **fixed and landed** (`49399f9`): an exported dmabuf fd now
+holds a reference, one per gem handle and one per exporting `TmpVmo` slot. What remains
+is that half of its regression coverage has never run.
 
-```
-h  = CREATE_DUMB / RESOURCE_CREATE_BLOB(GUEST)   // real guest pages
-fd = PRIME_HANDLE_TO_FD(h)                       // borrowed VMO aliases them
-DESTROY_DUMB(h) / GEM_CLOSE(h)                   // buddy::free(phys, order)
-read(fd, buf, N)                                 // walks the freed frames via the HHDM
-mmap(fd, MAP_SHARED); *p = …                     // writes into them
-```
+`venustest` phase 6's nine **blob** assertions emit nothing on a host without blob
+support, and this Mac's QEMU refuses `blob=on` outright (`need rutabaga or udmabuf for
+blob resources`; udmabuf is Linux-only, rutabaga is not compiled in, and there is no
+`virtio-gpu-gl-pci`). The `mmap(MAP_SHARED)` half of the hazard — writing *into* recycled
+memory, as opposed to reading it — is blob-only and is therefore covered nowhere in any
+run to date.
 
-The `read` returns whatever now occupies those frames — page tables, slab pages, another
-process's anonymous memory — and the `MAP_SHARED` write is arbitrary kernel memory
-corruption from an unprivileged process. `drmsmoke`'s `PRIME_HANDLE_TO_FD`,
-`PRIME_MMAP_ALIAS` and `DESTROY_DUMB` all exercise the pieces; nothing exercises the
-ordering.
+What **is** proven, on aarch64, by mutation: removing the dumb arm's
+`b.refs = b.refs.saturating_add(1);` makes `phase6_dumb_payload_survives_destroy` fail
+with `dumb payload lost at offset 0`, `close(fd)` emit `[DRM] bo refcount underflow
+obj=0x00000001`, and the retire path stop firing — three independent signals from one
+line, on a byte-identical image (`f2fs-data0` `3dfc0004…`, `venustest` ELF `c002f94e…`
+across a kernel-only rebuild). Failures present as **wrong values, not panics**: the
+frames stay HHDM-mapped and merely belong to someone else, so a panic there means
+something else is wrong.
 
-**Where each half is live.** The **dumb** path is pre-existing and is reachable **on this
-Mac at `c27557f` today** — verified in source, not inferred. The **blob** half arrives
-with `e083202`, which is why item 2 holds the sync: bringing the box's commits over before
-this fix trades one reachable path for two. Cross-process it is worse and is exactly the
-shape M4 would have hit: `drm_release_open` (`:1018`) reclaims every blob owned by a
-closing open, leaving a peer holding an fd that names a freed object — recycled host
-resource ids, a `hostvis_free`'d window span that the next `RESOURCE_MAP_BLOB` re-uses
-(silent cross-client pixel disclosure), and a buddy block back in circulation under a live
-mapping.
+The churn loop is load-bearing and was measured rather than argued: `buddy::free` does
+not scrub, so a bare `read()` after `GEM_CLOSE` would often return the original pattern
+and the test would pass against its own bug. In the mutated arm, churn allocation #1
+received `0xB82D2000` — the exact page freed one event earlier — and zeroed it.
 
-**The rule.** A BO is destroyed when its reference count reaches zero, and references are
-held by (1) each handle in the per-open handle map and (2) each **exporting `TmpVmo`
-slot**. Granularity 2 is per *slot*, not per fd, deliberately: `TMP_VMOS` is keyed by the
-data-owning slot, so `dup`, `fork` and `SCM_RIGHTS` copies of one dmabuf fd already share
-one slot (`servers/vfs/src/lib.rs:334-336`) and the slot is destroyed exactly once. One
-ref per slot is both sufficient and impossible to double-drop. `release_blob`/`free_dumb`
-move behind an unref that runs only on the 1→0 transition, with the test-and-remove under
-a single acquisition of the map — the shape `free_blob_owned` already uses.
+**To close:** run `venustest` phase 6 on the Linux box, where `blob=on` works. Expect the
+nine blob assertions to emit and pass, and the blob arm's own refcount mutation
+(`o.refs` in `prime_export_acquire`) to produce the same three signals.
 
-**The failure mode in the other direction is the one to fear.** A double release is two
-`resource_unref`s and a double `mm::buddy::free` of an order-N block: allocator
-corruption, not a leak. This project hit that class twice this week (`9be954f`).
+**Also unstress-tested:** the leak watch found retained-but-fd-pinned dumb records at
+**0** and live dumb buffers at **4**, frozen over 38 census samples across 185 s of live
+COSMIC with a running clock — but cosmic-comp exports dumb buffers **per allocation, not
+per frame**, so the retention path was never entered. The change is inert in that
+workload rather than proven under it. Note the failure direction: this change can only
+make buffers live *longer*, so its failure mode is a leak where the previous failure mode
+was memory corruption.
 
-**Layering, and the lock hazard to avoid.** `vmo_free_slot` lives in `vfs-server`, which
-does **not** depend on `drivers`, and it runs with `TMP_FILES` held; `release_blob` takes
-`VIRTIO_GPU.lock()` and busy-spins on a device round-trip. Calling straight through would
-hold a tmpfs lock across a device round-trip and introduce a second lock order
-(`TMP_FILES` → `VIRTIO_GPU`) into a codebase that has one. The design's §2.5 gives the
-shape that avoids both.
+### 2. `driver.py` silently fakes a clean run when `aarch64_vars.fd` is missing
 
-**Guard tests, and the mutations that must break them.** `export_fd_keeps_blob_alive`:
-create, write a known pattern, export, close the handle, `read(fd)` and assert the pattern
-plus a live-object count of 1; `close(fd)` and assert 0. *Mutation:* delete the ref taken
-in `install_dmabuf_vmo` — the read returns recycled memory and the count reads 0 early.
-This test **fails at HEAD by construction**, which is the strongest form of the project's
-guard-test rule. Second guard: no double release — after the count reaches 0, a subsequent
-create must succeed and no underflow line may appear. **Compositor gate, a genuinely new
-risk:** keeping a *dumb* buffer alive until its export fd closes changes cosmic-comp's
-steady state, since it exports a dmabuf per frame. Run a 60 s aarch64 session with
-`DRM_STATS` on and assert the live-object counters are **bounded**, not climbing. If they
-climb, Mesa is holding fds whose buffers we were previously freeing underneath it — which
-is information worth having, not a reason to revert.
+`driver.py` auto-creates `x86_64_vars.fd` but **not** `aarch64_vars.fd`. Without that
+file QEMU exits instantly, `driver.py start` still prints `QEMU started`, and the serial
+log is 0 bytes — so every subsequent test reads as *absent* rather than *failed*, which
+in a suite that greps for PASS lines is indistinguishable from a run where nothing was
+asserted. It bit a fresh worktree during the dmabuf verification and was caught only by
+the positive control (`nosuchbinary_xyz42` → `ConnectionRefusedError`); without it, four
+empty result files would have been read as a clean sweep.
 
-**A lane is implementing this now.** Full analysis, including the exact refcount shape and
-the vfs hook:
-`~/code/leandros-artifacts/notes/m9-crossopen-dmabuf/crossopen_design.md` §2.4, §2.5 and
-Stages 1–2. (That document's line numbers are the box's tree; the ones quoted above are
-this Mac's `c27557f`.)
-
-### 2. This Mac and the Linux box have diverged — four commits, sync held
-
-Two `main`s, and **neither is a fast-forward of the other**:
-
-| | this Mac (`c27557f`) | the Linux box (`a0325c6`, `forain@172.16.158.150:/home/forain/Projects/leandros`) |
-|---|---|---|
-| | `c27557f` drm: compile out `DRM_STATS` again | `a0325c6` drm: mint an out-fence fd for EXECBUFFER's `FENCE_FD_OUT` |
-| | `fe411ff` net: hold a closed TCP port in TIME_WAIT | `eccc4e9` mkfs: stage `vkswap` when the venus artifact tree provides it |
-| | `18a7a9f` drm: honour the host's requested blob cacheability | `e083202` drm: export Venus blob handles through `PRIME_HANDLE_TO_FD` |
-| | `c5abb8d` drm: decode `FB_DAMAGE_CLIPS` … | `0df1810` drm: honour the host's requested blob cacheability |
-| | `a0f2c46` | `a0f2c46` |
-
-`18a7a9f` and `0df1810` are the **same change committed twice**, so a merge or rebase will
-see the blob-cacheability hunks from both sides. `origin` is at `6a0eb0c`; nothing has
-been pushed to it from either machine.
-
-**The sync is deliberately held, and the reason is item 1, not scheduling.** `e083202`
-widens the exported-dmabuf use-after-free from dumb buffers to blobs. Landing it here
-before the refcount fix would double the reachable surface of a memory-safety bug in
-exchange for a feature nothing on this Mac can exercise (macOS has no blob-capable
-virtio-gpu device at all). **Order to take once item 1 lands:** refcount fix first, then
-`e083202` + `a0325c6` + `eccc4e9`, then re-gate `drmsmoke` 22/0 and `scmtest` 31/0 here
-and `venustest` 91/0 on the box.
-
-What each machine is missing:
-
-- **This Mac lacks `e083202`.** Beyond the feature, it carries the borrowed-VMO
-  immutability invariant, whose three hazards were measured live *on this machine*. It
-  also takes `venustest` 68 → 80 subtests, 12 of which need a Venus host.
-- **This Mac lacks `a0325c6`** (`FENCE_FD_OUT` out-fence fd), which takes `venustest` to
-  91 on the box. Unexercisable here for the same reason.
-- **This Mac lacks `eccc4e9`** (4 lines in `scripts/mkfs-f2fs-populated.py`, mirroring the
-  existing `vkrender` block). Harmless without the binary, and there is **no aarch64
-  `vkswap` binary anywhere**: the box has no arm64 binfmt handler, so the Alpine container
-  cannot cross-build it. `zig cc -target aarch64-linux-musl` via
-  `scripts/cc-aarch64-musl.sh` is the route if it is wanted.
-- **The box lacks `c5abb8d`, `fe411ff` and `c27557f`.** No Venus work depends on any of
-  them, but the box is where a damage measurement under KVM would run, and where item 9's
-  dirty-image COSMIC validation is running.
-
-Also outside git: `vkswap.c` and `build-vkswap-alpine.sh` are at
-`~/code/leandros-artifacts/notes/m9-vkswap/`; raw logs for the Venus wave are in
-`m9-lane-i-logs.tgz` there and in `notes/m9-present/m9-lane-m-logs.tgz`, and under
-`/tmp/m9lane/` on the box. Both pre-existing box stashes are still present and were never
-popped — **`stash@{0}` must not be blind-popped** (it would revert `4085b7f`).
+Workaround in place: `cp /opt/homebrew/share/qemu/edk2-arm-vars.fd aarch64_vars.fd`.
+The fix is to make `driver.py` create it the same way it creates the x86_64 one, and to
+fail loudly when the serial socket never opens rather than reporting a started guest.
 
 ### 3. A host-refused `RING_IDX` submit costs a full control-queue timeout
 
@@ -816,47 +776,7 @@ damage 0 full / 571 rect / 0 skip. The sanity identity
 consecutive screendumps differ by 126, 108 and 288 px, every one inside a ~15x21 px box in
 the panel bar — the clock digits. Single run.
 
-### 9. AF_UNIX `listen()` is lax in the opposite direction — fix prepared
-
-The AF_UNIX arm of `handle_listen` (`servers/net/src/lib.rs:1210`) is an unconditional
-`ok_reply()`. Linux's `unix_listen()` has three gates, **in this order**: type not
-STREAM/SEQPACKET → **EOPNOTSUPP (95)**, checked *before* the address; `u->addr == NULL` →
-EINVAL; `sk_state` neither `TCP_CLOSE` nor `TCP_LISTEN` → EINVAL. Note the asymmetry with
-`inet_listen()`, which answers EINVAL for a DGRAM listen — the two must **not** be made
-symmetric, and the AF_INET arm (`07d461c`) is left alone. There is no persistent "connect
-in progress" state on Linux, so our `UnixPendingAccept` maps onto ESTABLISHED and is EINVAL
-like `UnixConnected`; there is no fifth answer to give.
-
-The prepared patch adds a subtest with **eight** assertions of which **five** must fail
-against an unpatched kernel (unbound listen, socketpair end, connector, accepted socket,
-DGRAM); the other three pass at HEAD and are explicitly **not** counted as evidence — they
-exist so that "make AF_UNIX `listen()` always fail" and "re-arm the address on every
-`listen()`" cannot pass. One falsifying mutation is worth naming because it is subtle:
-moving the type gate *below* the state match makes the DGRAM case report errno 22 instead
-of 95, which is exactly what a plausible-looking fix gets wrong.
-
-**Held deliberately, and the reason is not the code.** The patch is a no-op for every
-healthy server — a working AF_UNIX server is `UnixListening` at `listen()` time and that
-arm still answers 0, idempotently — and every in-tree caller binds first and checks. But
-the in-tree audit is not the population at risk. The risk is an out-of-tree component
-(cosmic-comp, cosmic-panel, busd, tokio/zbus) whose `bind()` fails on a **dirty** image — a
-stale `S_IFSOCK` under `/run/user/N` is not hypothetical here, `/data` survives reboots —
-which today limps on as a zombie listener and after the patch exits at `listen()` and gets
-restarted by `launch_pad` in a loop. That reads exactly like the crash-loop signatures this
-project has spent whole waves chasing.
-
-**Validation is in flight** on the Linux box: a COSMIC session on each arch, **then a
-second session against the image the first run left behind**, which is the run that would
-expose a component relying on the zombie behaviour. A fresh-image-only validation would
-miss it. **What the outcomes mean:** a clean dirty-image second session on both arches
-(no new `listen` EINVAL/EOPNOTSUPP lines, no `launch_pad` churn) plus `scmtest` 32/0 on
-fresh images means land it as-is. New EINVALs with a restart loop means the strictness is
-correct but some component depends on the laxity — that identifies the component, and the
-decision then is whether to fix the component or scope the gate, **not** to weaken the
-errno mapping. A crash with no `listen` line at all means something other than this patch,
-and the patch should be re-run in isolation before anything is concluded.
-
-### 10. `kms_swrast` destroys imported handles with `MODE_DESTROY_DUMB`
+### 9. `kms_swrast` destroys imported handles with `MODE_DESTROY_DUMB`
 
 Gallium's kms-dri winsys releases *every* `pipe_resource` it imported through
 `DRM_IOCTL_MODE_DESTROY_DUMB` (`src/gallium/winsys/sw/kms-dri/kms_dri_sw_winsys.c:288-296`),
@@ -875,7 +795,7 @@ registry minted the handle. A counter on `[DRMSTAT]` (live objects, bounded over
 session) is the cheapest detector, and it is the same counter item 1's compositor gate
 needs.
 
-### 11. The `[DRM-SRV] mmap` trace is unconditional and floods a session
+### 10. The `[DRM-SRV] mmap` trace is unconditional and floods a session
 
 `servers/drm/src/lib.rs:211-219` prints `[DRM-SRV] mmap token=… map_info=0x0N -> {uncached,
 writeback}` on **every** resolved mmap token, outside `pci::RENDER_DEBUG`, with a source
@@ -887,7 +807,7 @@ output when it interleaves (instrument-reliability entry 6). Gate it — either 
 `RENDER_DEBUG` or behind a first-N-per-cache-type one-shot, which keeps the evidence
 property at bounded cost. Cheap, and it makes every future session log more trustworthy.
 
-### 12. Deferred work and known limitations
+### 11. Deferred work and known limitations
 
 - **Doom does not link relibc.** `../doomgeneric/Makefile.leandros` links
   `userland/target/<arch>-unknown-none/release/libleandros_libc.a`, whose allocator is
