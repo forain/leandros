@@ -233,6 +233,14 @@ pub fn current_tls_base() -> u64 {
 
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(r#"
+// The kernel itself is built with -neon,-fp-armv8 (targets/
+// aarch64-unknown-kernel.json) so that no kernel code can ever lower through a
+// q register and land on the interrupted thread's vector state. This routine is
+// the one deliberate exception: it *saves and restores* userspace FP/SIMD, so it
+// needs those instructions. Enable the extension for this block only and drop
+// back to the plain baseline at the end, so the relaxation cannot leak into any
+// assembly emitted after it.
+.arch armv8-a+fp+simd
 .global cpu_switch_to
 .type   cpu_switch_to, @function
 cpu_switch_to:
@@ -305,6 +313,7 @@ cpu_switch_to:
 
     ret
 .size cpu_switch_to, .-cpu_switch_to
+.arch armv8-a
 "#);
 
 #[cfg(target_arch = "x86_64")]
