@@ -613,6 +613,11 @@ def main():
     _vkrender = f"{venus_root}/usr/bin/vkrender"
     if os.path.exists(_vkrender):
         bin_files.append(("vkrender", _vkrender, 0o100755))
+    # vkswap — the VK_EXT_headless_surface swapchain test. Same staging shape
+    # as vkrender; absent from the artifact tree it is simply not packed.
+    _vkswap = f"{venus_root}/usr/bin/vkswap"
+    if os.path.exists(_vkswap):
+        bin_files.append(("vkswap", _vkswap, 0o100755))
     # The ICD manifest rides the shared /usr/share tree machinery. EVERY ancestor
     # has to be in m4_share_dirs — /usr is static (ino 15) but /usr/share only
     # exists because the M4 walk happens to create it, which is not a dependency
