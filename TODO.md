@@ -3,7 +3,7 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-06** (`b2260b4`); item 4 and the item 10
+Last reconciled against `main` on **2026-08-06** (`97a979e`); item 4 and the item 10
 Mesa-modifier bullet updated the same day with a source-analysis wave over smithay
 `efeb597` and the kernel DRM property/blob path. Same day, a second wave: item 2
 (memfd tmpfs-slot leak) got a completed source-analysis pass and a prepared-but-unbuilt
@@ -93,7 +93,29 @@ leaves `fence_fd` unwritten and Mesa then `close()`s stdin; the borrowed-VMO
 grow/leak/truncate hazards audited while designing the export, closed by one stated
 invariant the patch enforces; and the cross-open dmabuf gap that PRIME export alone does
 not close, needed for `VK_KHR_display` and Wayland but not for headless WSI. Former
-items 7-13 shifted down to 10-16.
+items 7-13 shifted down to 10-16. Same day, a twelfth wave landed two more fixes and
+closed this reconciliation: `import_fd` double-releasing on EMFILE (the former item 1)
+landed as `9be954f`, verified by an A/B on both arches using one binary, one image and a
+kernel-only rebuild — pristine reads `[emfile] post ret=0` (the phantom EOF) and FAILs,
+patched reads `-1/EAGAIN` and PASSes, with the pre-read control at `-1/EAGAIN` on both
+sides proving the assertion discriminates rather than passing vacuously. `listen()`
+twice (former item 11), the dead `port` variable in `handle_close` (former item 12) and
+the unreachable `init-server` crate (former item 13) landed together as `07d461c`,
+verified both arches: pristine reads `second listen rc=-1 errno=22` and FAILs, patched
+reads `rc=0` and PASSes; both arches link and boot with the crate gone, and the serial
+log to the login prompt is character-identical either side (only the nondeterministic
+4-vCPU interleave of `[SCHED] CPU ID` against `[NET] DHCP configured` differs — same
+bytes, different order, present on both sides); `grep -rn "init_server\|init-server"`
+now matches only this file. Former items 2-10 and 14-16 shifted down to 1-9 and 10-12.
+
+Eleven commits landed this session in total: `05f7279` (aarch64 softfloat), `531f21e`
+(harness prompt detection), `4085b7f` (nested epoll), `75b32e3` (sub-tick
+`CLOCK_MONOTONIC`), `26eebf0` (AF_INET loopback), `05bb0fe` (evdev timestamps),
+`77f170d` (memfd + TGID), `b2260b4` (`--venus` + vkrender staging), `9be954f`,
+`07d461c`, `97a979e`. The item count did not fall much across the session because
+analysis kept finding pre-existing defects that were always there and simply
+unmeasured, not because work ran out. Six separate items trace back to the FP/SIMD
+clobber fixed in `05f7279`, directly or as the cause that retired them.
 
 ---
 
@@ -125,13 +147,22 @@ acceptable. This wave (`05bb0fe`) also ran `idletest` 2/0 and `evtest2` 8/0 gree
 both arches; neither was previously listed in this baseline. **Also as of `b2260b4`:**
 `vkrender` passes 3/3 subtests with 0 failures and 0 skips on x86_64/TCG and
 aarch64/TCG, with `s2_checksum = 0x02C0FDC5`; under x86_64/KVM it needs
-`VN_PERF=no_fence_feedback` until the blob-cacheability item (item 2) is fixed.
+`VN_PERF=no_fence_feedback` until the blob-cacheability item (item 1) is fixed.
 **Refined 2026-08-06
 (`77f170d`):** the flake is not aarch64-specific — an A/B on a pristine `420adf7` kernel
 gave 5/0, 3/2, 5/0 across three runs, and the patched kernel gave 5/0 x3 and 3/2 x8
 across 11 runs, both on aarch64. It is a pure timing race in `fork` -> child
 `setpgid(0,0)` + `_exit` -> parent `waitpid(-pid)`, with no tmpfs, memfd or SCM
-involvement; either result is acceptable on either arch.
+involvement; either result is acceptable on either arch. **Refined again 2026-08-06
+(`97a979e`):** with the EMFILE and `listen()`/`init-server` fixes landed, `scmtest` is
+**30/0** on both arches (29/0 from the EMFILE subtest, 30/0 from `inet_listen_twice`);
+everything else holds at baseline on fresh images with vfstest run once: vfstest 36/0,
+drmsmoke 22/0, wakepolltest 10/0, forktest 3/0, epolltest 9/0, polltest 6/0, sigtest
+6/0, timertest 6/0, memtest 4/0, idletest 2/0, evtest2 8/0; `waittest` is 5/0 or 3/2 on
+either arch, the same pre-existing `wait_on_process_group` flake measured on pristine
+kernels too. Venus re-checked after these patches: `venustest` 68/68 and `vkrender` 51
+PASS / 0 FAIL under `VN_PERF=no_fence_feedback` on x86_64/KVM, with `s2_checksum =
+0x02C0FDC5` holding.
 
 **vmnet gotcha.** On a Mac with `socket_vmnet` installed, `driver.py` uses vmnet rather
 than slirp, so the guest gets a `192.168.105.x` lease and `10.0.2.x` does not exist —
@@ -214,6 +245,9 @@ reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print i
   hazard window never opened. Fixed by having the child close its copy before blocking
   on the sync byte, after which removing the guard fails deterministically (`child
   status=256`, pattern mismatch). Verify every guard test this way before trusting it.
+- **Subtest comments must not cite TODO item numbers.** Six did, and this file gets
+  renumbered as items land — every citation had drifted within one day. Point to the
+  defect or the commit instead; those don't move.
 
 **Diagnostics in-tree, all compiled out by default** — flip to `true`, measure,
 flip back before committing:
@@ -244,112 +278,47 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 
 | # | Item | Category | Blocked on |
 |---|---|---|---|
-| 1 | `import_fd` double-releases on EMFILE — use-after-free class | Bug — kernel | — |
-| 2 | Blob mappings ignore the host's requested cacheability — fix prepared | Bug — kernel | — |
-| 3 | `ATTR_NOCACHE` on aarch64 is Device memory, not Normal-NC | Bug — kernel | — |
-| 4 | x86_64 has no PAT or MTRR setup | Bug | — |
-| 5 | Vulkan renders on LeandrOS; next is presenting it | Feature | — |
-| 6 | PRIME export for blob handles — fix prepared (headless WSI unblocked) | Bug — kernel | — |
-| 7 | `SIMULATE_SYNCOBJ`: we reject the probe, and Mesa then closes stdin | Bug — kernel | — |
-| 8 | Borrowed VMOs can be grown, leaked and truncated | Bug — kernel | — |
-| 9 | Cross-open dmabuf import is refused by design | Feature | — |
-| 10 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
-| 11 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
-| 12 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
-| 13 | Delete the unreachable `init-server` crate | Cleanup | — |
-| 14 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
-| 15 | No TIME_WAIT — ports are instantly reusable | Bug | — |
-| 16 | Deferred / known limitations | Mixed | — |
+| 1 | Blob mappings ignore the host's requested cacheability — fix prepared | Bug — kernel | — |
+| 2 | `ATTR_NOCACHE` on aarch64 is Device memory, not Normal-NC | Bug — kernel | — |
+| 3 | x86_64 has no PAT or MTRR setup | Bug | — |
+| 4 | Vulkan renders on LeandrOS; next is presenting it | Feature | — |
+| 5 | PRIME export for blob handles — fix prepared (headless WSI unblocked) | Bug — kernel | — |
+| 6 | `SIMULATE_SYNCOBJ`: we reject the probe, and Mesa then closes stdin | Bug — kernel | — |
+| 7 | Borrowed VMOs can be grown, leaked and truncated | Bug — kernel | — |
+| 8 | Cross-open dmabuf import is refused by design | Feature | — |
+| 9 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
+| 10 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
+| 11 | No TIME_WAIT — ports are instantly reusable | Bug | — |
+| 12 | Deferred / known limitations | Mixed | — |
 
 ---
 
-### 1. `import_fd` double-releases on EMFILE — use-after-free class
+## Prepared but not landed
 
-**Confirmed at the source.** Both EMFILE arms of `import_fd`
-(`servers/vfs/src/lib.rs:3722` and `:3725`) run `tmp_inflight_dec(&kind);
-release_vnode(kind, pid); return -24;` — byte-for-byte what `drop_transfer` does
-(`:3757-3758`). Meanwhile `servers/net/src/lib.rs:2144` sets `fit = i` (not `i+1`), so
-the overflow loop at `:2151` re-drops `fds[i]`. One `export_fd` (`:3704`
-`pipe_ref_inc`, `:3710` `tmp_inflight_inc`) is balanced by **two** releases.
-`import_fd` has exactly one caller repo-wide.
+Three patches are written, verified-applicable and cross-checked to stack with each
+other and with everything already in the tree in **any** order — but none has been
+built or run.
 
-**Two corrections to the earlier description.** `export_fd` does *not* lift the entry
-out of the sender's table (`:3694-3711` only copies `kind`/`flags`), so the sender
-keeps its fd open and **the extra release always lands on a live reference**. And it
-needs no large batch: with `nfds == 1`, `fit` is 1, the import fails at `i = 0`, and
-`for j in 0..1` re-drops that one descriptor.
+1. `~/code/leandros-artifacts/notes/m9-blob-cacheability/blob_cacheability.patch` — 373
+   lines, 7 files. Honours the host's requested blob cacheability via a new
+   `WRITECOMBINE` flag and a newly-installed aarch64 MAIR index 2. Decisive test:
+   `vkrender` `s0_submit` under x86_64/**KVM** *without* `VN_PERF=no_fence_feedback`,
+   which times out 2/2 today. Do the cheap local check first — a one-line `MAIR_EL1`
+   boot print under aarch64/HVF, since the whole aarch64 half rests on static
+   disassembly rather than a runtime read. See item 1.
+2. `~/code/leandros-artifacts/notes/m9-prime-export/prime_handle_to_fd.patch` — 4 files,
+   +308/−31. Makes `PRIME_HANDLE_TO_FD` resolve blob handles, unblocking headless
+   Vulkan WSI. `venustest` 68 → 77; `drmsmoke` must stay 22/0, which is the one part
+   checkable locally on the Mac. See item 5.
+3. `~/code/leandros-artifacts/notes/m9-fb-damage-clips/fb_damage_clips.patch` — 357
+   lines, `drivers/` only. Decodes `FB_DAMAGE_CLIPS` as an instrument, to answer
+   whether the primary-plane blocker is client-side. **Its diagnostic run was still in
+   progress when this session ended, so its result is unknown** — check for a report
+   before assuming anything about it. See item 9.
 
-**Severity, inferred from the release paths: three of five kinds are use-after-free
-class.** `release_vnode` (`:3789-3817`) is not saturating in any way that helps — only
-the counters saturate, and saturating at 0 is the corruption.
-- **`DynamicDevice` — worst.** `device_close` twice takes refs 2→1→0, sets
-  `DEVICE_OPEN_CLOSING`, sends `VFS_CLOSE` to the device server and frees the slot
-  (`:1329-1346`). The sender's still-open fd then names an `open_id` whose server-side
-  state is destroyed, and `device_open_alloc` (`:1299`) hands that id to the next open
-  of *any* dynamic device — cross-process open-id aliasing, with the stale fd's ioctls
-  landing on someone else's open. This is the DRM render node / dmabuf / evdev path,
-  exactly what a Wayland session passes.
-- **`EventFd` — severe.** refs 2→1→0 sets `EVENTFD_COUNTERS[slot] = u64::MAX`
-  (`:3799-3804`), which **is the free-slot sentinel**: `handle_eventfd:4642` allocates
-  via `position(|&v| v == u64::MAX)`, so with lower slots in use it deterministically
-  re-hands out this one. Two unrelated processes then share a counter — verbatim the
-  calloop aliasing bug the comment at `:3796-3798` exists to prevent.
-- **`TimerFd` — severe**, same shape (`:3806-3809`).
-- **`Pipe` — severe.** `writers`/`readers` saturating_sub twice (`:1060-1074`) drops
-  the count to 0 under a live fd, so the peer sees spurious EOF/POLLHUP/EPIPE; if both
-  sides reach 0 the ring resets and `handle_pipe:3576` reallocates the slot, after
-  which the surviving fd's close decrements an unrelated pipe.
-- **`TmpFile` — moderate, conditional.** The second `tmp_release_ephemeral` no-ops on
-  its `in_use` guard, but the second `tmp_inflight_dec` does not: with another SCM
-  transfer of the same slot in flight, `TMP_INFLIGHT[idx]` goes 2→0 and that other
-  transfer loses its protection, reopening the use-after-free `77f170d` just closed.
-- `MountedFile` and the rest: only `release_locks`; cosmetic.
+---
 
-**Collateral defect in the same two lines:** `release_vnode(tf.kind, pid)` passes the
-**receiver's** pid, so `release_locks` (`:3920`) drops advisory locks the receiver
-holds on that vnode through unrelated fds of its own — for a descriptor it never took
-delivery of. `drop_transfer` correctly passes 0. The fix removes this for free.
-
-**Reachable in normal operation.** `MAX_FDS = 128` with `alloc_fd` skipping 0-2 gives
-125 usable, and the trigger is only "the receiver's table is full at the instant any
-SCM_RIGHTS fd arrives" — one fd suffices. The deferred-limitations item already
-records **128 dmabuf fds burned in ~1 s**, which is cosmic-comp at the ceiling while
-Mesa and clients keep passing fds; the kind arriving in that window is
-`DynamicDevice` or `TmpFile`, the two worst rows. It is not triggerable on demand
-today only because nothing measures it. **`scmtest`'s `queued_fd_cap` does not and
-cannot cover this** — it is purely sender-side (`userland/scmtest/src/main.rs:1639-1664`),
-loops `send_fd_and_byte` and never calls `recvmsg`, so `import_fd` is never reached.
-
-**Fix prepared** at
-`~/code/leandros-artifacts/notes/m9-import-fd-emfile/import_fd_emfile.patch` (122
-insertions, 5 deletions, 3 files; `git apply --check`-clean and round-trip verified at
-`b7fb326`, and confirmed to stack with `m9-small-fixes/small_fixes.patch` in **either**
-order with identical resulting trees). **`import_fd` now releases nothing on
-failure**, making the caller sole owner of cleanup, so the rule states in one
-sentence: *a `TransferFd` is consumed only on success; exactly one of `import_fd`
-returning an fd or `drop_transfer` balances each `export_fd`, and on a negative return
-the descriptor is still the caller's to retire.* That rule is written into
-`import_fd`'s doc comment, with a matching note at `servers/net/src/lib.rs:2144`
-explaining that `fit = i` is deliberate and must not be "corrected" to `i + 1`. The
-alternative — having the caller skip index *i* — was rejected because it leaves "who
-owns the failed one" a fact you must read two files to learn. Code delta is 2 lines;
-the rest is comments and the subtest.
-
-**Regression subtest** `scm_import_emfile_single_release`, single process, no fork:
-`pipe2(O_NONBLOCK)`, read the empty ring as a control (must be `-1/EAGAIN`, proving
-the final assertion can discriminate at all), send the *write* end over a socketpair
-so `writers = 2`, `dup()` until EMFILE, `recvmsg`, close the dups, then re-read the
-still-empty pipe. The process never closed `wr`, so it must still be `-1/EAGAIN`; the
-double release drives `writers` to 0 and it reads `0` (EOF). Socket fds live above
-`SOCK_FD_BASE` and are not in the fd table, so the socketpair survives exhaustion.
-**Proving it fails without the fix is free — HEAD is the backed-out state**, so
-building `scmtest` from the patch against an unpatched kernel must FAIL and against
-the patched kernel must PASS. Failing signature: `[emfile] post ret=0 errno=0` where
-`pre` read `-1/11`; if *both* read `0/0` the test is broken rather than the kernel.
-**`scmtest` 28/0 → 29/0** (30/0 if the small-fixes patch also lands; the two are
-additive).
-
-### 2. Blob mappings ignore the host's requested cacheability — fix prepared
+### 1. Blob mappings ignore the host's requested cacheability — fix prepared
 
 `drivers/src/drm_device_interface.rs:3740-3748` logs `"[DRM] WARNING: host asked for
 non-cached blob mapping; mapping cacheable anyway"` and overrides the request.
@@ -443,7 +412,7 @@ virtio-gpu blob under hardware virtualization, which needs EGL, which macOS lack
 aarch64 half is a latent-bug fix with no reachable failing test today; its evidence is
 the MAIR read.
 
-### 3. `ATTR_NOCACHE` on aarch64 is Device memory, not Normal-NC
+### 2. `ATTR_NOCACHE` on aarch64 is Device memory, not Normal-NC
 
 `arch/aarch64/src/paging.rs:21` names MAIR index 3 "normal NC", but neither Limine nor
 our direct-boot path programs attributes 2..7, so index 3 is zero = **Device-nGnRnE**.
@@ -456,7 +425,7 @@ the blob fix introduces a separate `WRITECOMBINE` flag rather than redefining
 `NOCACHE`. The comment must be corrected whether or not the blob patch lands, and the
 framebuffer's attribute should be reconsidered deliberately rather than by accident.
 
-### 4. x86_64 has no PAT or MTRR setup
+### 3. x86_64 has no PAT or MTRR setup
 
 Grepping `arch/x86_64/` finds `wrmsr` only for APIC, EFER, STAR, LSTAR and GSBASE — no
 `IA32_PAT`, no MTRR. The reset PAT therefore applies, so `PageFlags::NOCACHE` (PCD)
@@ -465,7 +434,7 @@ strictly stronger and correct wherever we use it — but it is a real ceiling on
 framebuffer and blob write throughput, and anything that eventually wants WC
 performance needs `IA32_PAT` bring-up first.
 
-### 5. Vulkan renders on LeandrOS; next is presenting it
+### 4. Vulkan renders on LeandrOS; next is presenting it
 
 **GPU work now executes.** `vkrender` was built, staged (`b2260b4`) and run: subtest 0
 (shaderless `vkCmdFillBuffer`) passes with `fence signalled after 86 ms` and `all 65536
@@ -523,7 +492,7 @@ produces a **static** binary, which cannot `dlopen` the ICD. Corrected recipes a
 **Next is presentation.** `--present` (a dumb-buffer blit reusing `drmsmoke`'s
 `ADDFB2`/`SETCRTC` sequence) is written and staged but unrun; it needs COSMIC stopped,
 since we never gate `SETCRTC` on DRM master. After that, M4 is a Wayland client, still
-blocked on the `PRIME_HANDLE_TO_FD` gap (item 6).
+blocked on the `PRIME_HANDLE_TO_FD` gap (item 5).
 
 **Linux-box tree state (trap).** That checkout is on a **detached HEAD** with two
 stashes, and **`stash@{0}` must not be blind-popped**. It holds 6 files but only 3 are
@@ -534,7 +503,7 @@ current HEAD — popping it would revert `4085b7f` (nested-epoll readiness). Re-
 instead. A raw copy of that stash also exists at
 `/home/forain/linux-tree-preexisting.patch` on the box.
 
-### 6. PRIME export for blob handles — fix prepared (headless WSI unblocked)
+### 5. PRIME export for blob handles — fix prepared (headless WSI unblocked)
 
 **Why it rejects.** `kernel/src/syscall.rs:6052` calls `dumb_buffer_phys_order(handle)`,
 whose entire body (`drivers/src/drm_device_interface.rs:1286-1288`) is
@@ -621,7 +590,7 @@ line deleted, since it carries the whole safety argument. The decisive downstrea
 is a `VK_EXT_headless_surface` swapchain — reachable with this patch alone, unlike
 Wayland or display.
 
-### 7. `SIMULATE_SYNCOBJ`: we reject the probe, and Mesa then closes stdin
+### 6. `SIMULATE_SYNCOBJ`: we reject the probe, and Mesa then closes stdin
 
 `sim_syncobj_create` (`vn_renderer_virtgpu.c:145-190`) lazily submits an execbuffer with
 `size=0, command=0` plus `FENCE_FD_OUT` and requires `args.fence_fd >= 0`; we reject at
@@ -635,7 +604,7 @@ right shape (~40 lines), correct because `submit_3d` is synchronous and Mesa onl
 `poll(POLLIN)`s the fd. Mesa 25.3.6 defines `SIMULATE_SYNCOBJ`/`SIMULATE_SUBMIT`
 unconditionally, so this is not opt-in.
 
-### 8. Borrowed VMOs can be grown, leaked and truncated
+### 7. Borrowed VMOs can be grown, leaked and truncated
 
 `vmo_acquire_frames` (`servers/vfs/src/lib.rs:644-647`) grows any VMO on demand with
 `vmo_alloc_zeroed_frame()`, including borrowed ones backing DRM buffers; the growth is
@@ -643,10 +612,10 @@ then leaked, since `vmo_free_slot` (`:450`) returns early for `borrowed` without
 freeing. The write path grows the same way (`:3303-3305`). Worst, `handle_ftruncate`
 (`:5039`) on shrink would `unref_or_free` DRM-owned frames — order-0 frees out of an
 order-N buddy block, i.e. **allocator corruption**. The rule that closes all three: a
-borrowed VMO's page list is immutable. The queued PRIME patch (item 6) states and
+borrowed VMO's page list is immutable. The queued PRIME patch (item 5) states and
 enforces it; if that patch does not land, these remain open independently.
 
-### 9. Cross-open dmabuf import is refused by design
+### 8. Cross-open dmabuf import is refused by design
 
 `open_may_reach` (`drivers/src/drm_device_interface.rs:1091`) deliberately scopes BOs to
 their owning DRM open, which is correct for `b80ab5a`'s ownership model but blocks
@@ -656,7 +625,7 @@ host-resource refcounting across opens, `CTX_ATTACH_RESOURCE`, `MAP_DUMB`/`ADDFB
 accepting blob handles, `SET_SCANOUT_BLOB` (absent), and the connector's missing `DPMS`.
 Several days. This is the M4 gate; headless WSI does not need it.
 
-### 10. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
+### 9. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
 
 **What we already have, measured.** The property is fully plumbed, not merely
 advertised: `PROP_FB_DAMAGE_CLIPS = 51` as `PropKind::Blob` in `PROPS`
@@ -734,91 +703,23 @@ screendumps >=2 s apart and confirm the digits differ, then force one full prese
 confirm it is pixel-identical. Note the cursor will not appear in `screendump` now that
 it is on the hardware plane. Plus `drmsmoke` 22/0 both arches and `idletest`.
 
-### 11. `listen()` twice returns EINVAL — fix prepared
-
-`handle_listen` matched only `SockState::InetBound`, so a repeat call fell to
-`_ => err_reply(-22)`. The fix adds one arm, `SockState::InetListening { .. } => return
-ok_reply()`, before the fallthrough. **An early return, not a re-run of the path** —
-falling through to `listen_on()` would add a second pair of smoltcp sockets on the same
-port and orphan the handles the first listen stored, silently dropping any half-open
-connection: it would return 0 and then never accept.
-
-**No backlog is stored, deliberately.** `SockEntry` has no backlog field and the
-parameter is already `_backlog`, ignored on the *first* listen too, because smoltcp has
-no accept queue — `accept_on` takes the listening socket over and arms a replacement,
-so the effective depth is 1 regardless. Storing a number nothing reads would fake a
-knob; returning success matches Linux's observable behaviour for any program that
-cannot read the state back, and we expose nothing `SO_ACCEPTCONN`-adjacent.
-
-Verification: a new `scmtest` subtest `inet_listen_twice` is in the patch, registered
-after `test_inet_loopback_tcp` in the same idiom. It asserts listen-before-bind still
-gives `rc=-1 errno=22` (so the fix cannot degenerate into "always succeed"), that a
-repeat `listen(srv,16)` returns 0, and that connect+accept still complete on the same
-listener afterwards — the last is what catches a fix that re-arms and orphans handles.
-**`scmtest` 28/0 → 29/0** — the memfd/TGID patch's two subtests already landed in
-`77f170d` and are part of the 28/0 baseline.
-
-### 12. `unused variable: port` in `handle_close` — not a leak, fix prepared
-
-**Measured, it is a warning and not a port leak.** `alloc_ephemeral_port`
-(`servers/net/src/lib.rs:442`) is the only allocator and derives "free" purely from live
-table state (`t.socks.iter().any(|s| s.in_use && s.bound_port == p)`); there is no port
-bitmap or pool. Every arm of `handle_close`, including the `_` catch-all and the
-`UnixConnected` relookup path, stores `SockEntry::empty()`, which zeroes `bound_port`
-and clears `in_use` — so **clearing the slot is the release**, and exhaustion is
-impossible by construction. The patch therefore *removes* the dead binding rather than
-renaming it to `_port` (a dead read invites someone to re-add it) and leaves a comment
-recording why no release is needed. Verification is just that the warning is gone with
-no new ones, and `scmtest` unchanged.
-
-### 13. Delete the unreachable `init-server` crate
-
-The scope is larger than this item previously stated. **`init-server` is a real
-dependency in `kernel/Cargo.toml:34`, so all 2653 lines compile into every kernel
-build**, while `init_server::` appears in no Rust code anywhere — the only external
-mentions are the stale doc comment at `kernel/src/init.rs:4`, the workspace member
-list, that Cargo line, `Cargo.lock`, and a README row describing it as "PID-1: server
-bring-up, mounts, getty loop", **which is false** (that is `kernel/src/init.rs` plus
-userland `/bin/init`). `init_main` is the crate's only public entry point, so the whole
-crate is unreachable — an in-kernel shell, ~40 coreutils and the smoke tests, not just
-`run_posix_tests()`.
-
-**Wiring it in is not an option as written:** `init_main` is `-> !` and ends in
-`run_shell()`, an in-kernel serial shell that never returns, so calling it would
-*replace* the real boot path (initrd → `/bin/init` → getty → login → `start-cosmic`),
-not augment it.
-
-**Nothing is worth salvaging**, checked rather than assumed: the `t_*` tests call
-`net::handle()` and `vfs_*` directly with kernel-space pointers, bypassing the syscall
-ABI entirely, so they structurally cannot cover what the userland binaries cover.
-`t_af_inet_loopback` is strictly weaker than the `inet_loopback_tcp` landed in
-`26eebf0` (fixed port 9999, no `getsockname`, no reverse direction); the rest
-duplicates vfstest/scmtest/memtest; and the only kernel-internal candidates,
-`t_buddy_alloc` and `t_heap_end`, are one-line smoke checks of paths every boot
-exercises. The patch removes the crate, the workspace member, the kernel dependency,
-both `Cargo.lock` entries and the README row, and rewrites the stale doc comment.
-Recoverable at any time via `git show 905148f:servers/init/src/lib.rs`. Verification:
-both arches link with the crate gone, `grep -rn init_server .` is empty, serial output
-is **unchanged** to the login prompt (nothing in the crate ever printed), and the full
-suite is at baseline on fresh images.
-
-### 14. AF_UNIX `listen()` is lax in the opposite direction
+### 10. AF_UNIX `listen()` is lax in the opposite direction
 
 The AF_UNIX arm of `handle_listen` is an unconditional `ok_reply()` — a repeat listen
 already succeeds, but so does `listen()` on an unbound or already-connected AF_UNIX
-socket, where Linux answers EINVAL. Found while fixing the AF_INET side (item 11) and
-deliberately **not** changed there: tightening it alters behaviour for every AF_UNIX
-server on the system (cosmic-comp, busd, tokio) and could not be validated in a
+socket, where Linux answers EINVAL. Found while fixing the AF_INET side (landed as
+`07d461c`) and deliberately **not** changed there: tightening it alters behaviour for
+every AF_UNIX server on the system (cosmic-comp, busd, tokio) and could not be validated in a
 read-only session. Needs a live COSMIC session to land safely.
 
-### 15. No TIME_WAIT — ports are instantly reusable
+### 11. No TIME_WAIT — ports are instantly reusable
 
 `handle_close` calls `socket_set.remove()` immediately, so a closed TCP port can be
 rebound at once where Linux would hold it in TIME_WAIT. A divergence, not a leak, and
 low priority — but it is the kind of thing that makes a server restart behave
 differently here than on Linux.
 
-### 16. Deferred work and known limitations
+### 12. Deferred work and known limitations
 
 - **Doom does not link relibc.** `../doomgeneric/Makefile.leandros` links
   `userland/target/<arch>-unknown-none/release/libleandros_libc.a`, whose allocator is
@@ -871,7 +772,7 @@ differently here than on Linux.
   never relocates. It then faults at `__libc_start_main+0x44` with `CR2=0`, before
   `main` — a distinctive signature whose cause is not obvious from the fault alone.
   Always build userland through `scripts/build-userland.sh`.
-- **`driver.py` still has no Venus/GL mode.** Unblocked (item 5): QMP `screendump`
+- **`driver.py` still has no Venus/GL mode.** Unblocked (item 4): QMP `screendump`
   works under `-display egl-headless` in its bare form, without `device=`. The mode
   itself — teaching `.claude/skills/run-leandros/driver.py:_build_cmd` to build the
   `--venus` device line and call `screendump` bare — still needs writing.
