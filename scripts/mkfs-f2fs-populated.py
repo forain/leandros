@@ -734,6 +734,16 @@ def main():
     if os.path.exists(m7w_applet):
         bin_files.append(("leandros-applet", m7w_applet, 0o100755))
 
+    # wl-globals — M9 Stage 0a instrument. Dumps the wl_registry of EVERY
+    # wayland-* socket in $XDG_RUNTIME_DIR and exits, ignoring the environment
+    # (so it reaches cosmic-comp, not the panel's embedded server that
+    # leandros-applet is handed via WAYLAND_SOCKET). Measurement only; nothing
+    # in the session depends on it.
+    m9_wlglobals = os.path.expanduser(
+        f"~/code/leandros-artifacts/m9-wlglobals/out/wl-globals-{arch}")
+    if os.path.exists(m9_wlglobals):
+        bin_files.append(("wl-globals", m9_wlglobals, 0o100755))
+
     # The session launcher itself (a POSIX-sh script). The kernel execve()s ELF
     # only (no "#!"-shebang binfmt), so it is run as `sh /bin/start-cosmic-leandros`.
     m6_launcher = os.path.expanduser(
