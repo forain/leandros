@@ -290,6 +290,7 @@ const S_IFMT:  u32 = 0o170000;
 const S_IFSOCK: u32 = 0o140000;
 const S_IFDIR: u32 = 0o040000;
 const ETOOMANYREFS: i32 = 109;
+const EMFILE: i32 = 24;
 
 #[repr(C, align(8))]
 struct StatBuf { b: [u8; 144] }
@@ -663,6 +664,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_tmpfs_mounts_exist() { failures += 1; }
     if !test_devshm_shared_mmap() { failures += 1; }
     if !test_queued_fd_cap() { failures += 1; }
+    if !test_scm_import_emfile_single_release() { failures += 1; }
     if !test_full_ring_eagain() { failures += 1; }
 
     // ── M7u: mincore residency probe (Mesa EGL pointer-dereferenceable signal) ──
@@ -1810,4 +1812,96 @@ unsafe fn inet_recv_retry(fd: i32, buf: *mut u8, len: usize) -> isize {
         tries += 1;
     }
     -1
+}
+
+/// TODO item 4 regression: an SCM_RIGHTS import that fails with EMFILE must
+/// release the descriptor EXACTLY once.
+///
+/// `import_fd` used to release the transfer's reference itself before returning
+/// -EMFILE, while `handle_recvmsg` set `fit = i` and its overflow loop then
+/// `drop_transfer`ed `fds[i]` a second time — two `release_vnode` calls for one
+/// `export_fd`. The extra one is taken out of a *live* holder's reference.
+///
+/// A pipe makes that observable with no second process. The read end of a pipe
+/// whose write end is still open must answer EAGAIN on an empty ring, never 0
+/// (`handle_read`: `if r.writers > 0 { -11 } else { 0 }`). The double release
+/// drives `writers` 2 -> 1 -> 0 while this process still holds the write fd, so
+/// the read end reports a phantom EOF. Steps:
+///   1. pipe2(O_NONBLOCK); read the empty ring — EAGAIN. This control proves
+///      the final assertion can distinguish the two outcomes at all.
+///   2. Send the write end over a socketpair: writers = 2 (export_fd's ref).
+///   3. dup() until the fd table is full, so the import must fail with EMFILE.
+///      Socket fds live above SOCK_FD_BASE and are not in that table, so the
+///      socketpair survives the exhaustion.
+///   4. recvmsg. The fd is dropped and MSG_CTRUNC is set either way — that is
+///      correct behaviour, not the thing under test.
+///   5. Free the table and re-read the still-empty pipe. MUST be EAGAIN.
+///
+/// One fd is enough: `fit` is 1, the import fails at i = 0, and `for j in 0..1`
+/// re-drops that single descriptor. A batch larger than the free capacity is
+/// not needed to reach the bug.
+unsafe fn test_scm_import_emfile_single_release() -> bool {
+    let name = b"scm_import_emfile_single_release\0";
+    let mut p = [0i32; 2];
+    if pipe2(p.as_mut_ptr(), O_NONBLOCK) != 0 {
+        dbg0(b"[emfile] pipe2 failed\n\0");
+        return report(name, false);
+    }
+    let (rd, wr) = (p[0], p[1]);
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 {
+        dbg0(b"[emfile] socketpair failed\n\0");
+        close(rd); close(wr);
+        return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+
+    // Control: empty ring, write end open → EAGAIN, not EOF.
+    let mut byte = [0u8; 1];
+    let pre = read(rd, byte.as_mut_ptr(), 1);
+    let pre_errno = get_errno();
+
+    let sret = send_fd_and_byte(a, wr, b'E');
+
+    // Saturate the fd table. `alloc_fd` never hands out 0-2, so this stops at
+    // MAX_FDS - 3 entries; 256 only bounds the loop.
+    let mut hogs = [-1i32; 256];
+    let mut nhogs = 0usize;
+    let mut hog_errno = 0i32;
+    while nhogs < 256 {
+        let d = dup(rd);
+        if d < 0 { hog_errno = get_errno(); break; }
+        hogs[nhogs] = d;
+        nhogs += 1;
+    }
+
+    // The import must fail (table full); no fd is delivered and the cmsg
+    // truncates. Both are true with and without the fix.
+    let (n, mflags, rfd, _clen) = recv_fd_and_byte(b, 32, 0);
+    if rfd >= 0 { close(rfd); }
+    let ctrunc = (mflags & MSG_CTRUNC) != 0;
+
+    let mut j = 0usize;
+    while j < nhogs { close(hogs[j]); j += 1; }
+
+    // THE assertion. This process never closed `wr`, so the ring still has a
+    // writer and an empty read must be EAGAIN.
+    let post = read(rd, byte.as_mut_ptr(), 1);
+    let post_errno = get_errno();
+
+    dbg2(b"[emfile] send=%d hogs=%d (want >0, >0 then EMFILE)\n\0", sret as i64, nhogs as i64);
+    dbg2(b"[emfile] dup errno=%d recv n=%d (want 24, 1)\n\0", hog_errno as i64, n as i64);
+    dbg2(b"[emfile] rfd=%d ctrunc=%d (want -1, 1)\n\0", rfd as i64, ctrunc as i64);
+    dbg2(b"[emfile] pre  ret=%d errno=%d (want -1, 11 EAGAIN)\n\0", pre as i64, pre_errno as i64);
+    dbg2(b"[emfile] post ret=%d errno=%d (want -1, 11; 0/0 = DOUBLE RELEASE)\n\0",
+         post as i64, post_errno as i64);
+
+    let ok = sret > 0
+        && nhogs > 0 && hog_errno == EMFILE
+        && n == 1 && rfd < 0 && ctrunc
+        && pre == -1 && pre_errno == EAGAIN
+        && post == -1 && post_errno == EAGAIN;
+
+    close(a); close(b); close(rd); close(wr);
+    report(name, ok)
 }

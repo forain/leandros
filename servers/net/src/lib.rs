@@ -2140,6 +2140,10 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
             let newfd = vfs::import_fd(pid, fds[i], cloexec);
             if newfd < 0 {
                 // Receiver's fd table is full: everything from here truncates.
+                // `import_fd` consumes a descriptor only when it returns an fd,
+                // so `fds[i]` is still ours — `fit = i` deliberately puts it
+                // back in the drop loop below. Do NOT "fix" this to `i + 1`:
+                // that leaks the reference instead.
                 ctrunc = true;
                 fit = i;
                 break;
@@ -2147,7 +2151,8 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
             installed[i] = newfd as i32;
             i += 1;
         }
-        // Close every fd that didn't fit (Linux drops the overflow).
+        // Close every fd that didn't fit — including the one whose import just
+        // failed (Linux drops the overflow).
         for j in fit..nfds { vfs::drop_transfer(fds[j]); }
         if fit > 0 {
             unsafe {

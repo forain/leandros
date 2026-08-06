@@ -3714,15 +3714,33 @@ pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
 /// Install a queued `TransferFd` as a fresh fd in `pid`'s table, consuming the
 /// in-flight reference `export_fd` took (the installed fd now owns it — so no
 /// extra ref bump). `cloexec` sets FD_CLOEXEC per MSG_CMSG_CLOEXEC. Returns the
-/// new fd, or -EMFILE if the table is full (in which case the reference is
-/// released, matching a close of the undelivered fd).
+/// new fd, or -EMFILE if the table is full.
+///
+/// **Ownership rule: a `TransferFd` is consumed only on success.** Exactly one
+/// of `import_fd`-returning-a-fd or `drop_transfer` balances each `export_fd`.
+/// A negative return leaves the descriptor owned by the caller, which must
+/// retire it with `drop_transfer` like any other one that did not fit.
+///
+/// This used to release the reference here as well, which made the EMFILE path
+/// a double release: `handle_recvmsg` sets `fit = i` on the failure, and its
+/// `for j in fit..nfds` overflow loop then `drop_transfer`s the very descriptor
+/// this call had already released. The second `release_vnode` comes out of some
+/// *other* holder's reference — for a pipe it drives `writers`/`readers` to
+/// zero under a live fd (spurious EOF/EPIPE, and a ring the allocator will
+/// re-hand out), for an eventfd/timerfd it frees the pool slot under a live fd,
+/// and for a `DynamicDevice` it sends VFS_CLOSE and recycles the open id.
+///
+/// Releasing here was wrong on its own terms too: it passed the *receiver's*
+/// pid to `release_vnode`, so `release_locks` dropped whatever advisory locks
+/// the receiver happened to hold on that vnode through an unrelated fd of its
+/// own — for a descriptor the receiver never even took delivery of.
 pub fn import_fd(pid: u32, tf: TransferFd, cloexec: bool) -> isize {
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => {
-        drop(tbls); tmp_inflight_dec(&tf.kind); release_vnode(tf.kind, pid); return -24;
+        drop(tbls); return -24; // EMFILE; `tf` is still the caller's to drop
     }};
     let slot = match tbl.alloc_fd() { Some(s) => s, None => {
-        drop(tbls); tmp_inflight_dec(&tf.kind); release_vnode(tf.kind, pid); return -24; // EMFILE
+        drop(tbls); return -24; // EMFILE; `tf` is still the caller's to drop
     }};
     let mut flags = tf.flags;
     if cloexec { flags |= O_CLOEXEC; } else { flags &= !O_CLOEXEC; }
