@@ -1300,6 +1300,12 @@ pub fn drm_tick() {
             crate::pci::serial_debug_hex_64(ATOMIC_TESTS.load(Ordering::Relaxed));
             crate::pci::serial_debug(" cplane=");
             crate::pci::serial_debug_hex_64(CURSOR_PLANE_SEEN.load(Ordering::Relaxed));
+            // Guest-side witness that injected input reached the kernel ring at
+            // all. Without it, "pointer moves produced no cursor traffic" cannot
+            // be told apart from "the moves never arrived" — QMP accepting
+            // input-send-event only proves the host queued them.
+            crate::pci::serial_debug(" evpush=");
+            crate::pci::serial_debug_hex_64(evdev_server::events_pushed());
             crate::pci::serial_debug("\n");
         }
     }

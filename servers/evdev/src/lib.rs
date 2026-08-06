@@ -57,9 +57,10 @@ struct EvdevDevice {
     count:  usize,
     in_use: bool,
     /// CLOCK id events are stamped with (EVIOCSCLOCKID). 1 = CLOCK_MONOTONIC,
-    /// which is what libinput requests; we always stamp from the monotonic tick
-    /// source, so this is advisory only (kept for a truthful EVIOCGCLOCKID-style
-    /// answer and future REALTIME support).
+    /// which is what libinput requests; we always stamp from the same monotonic
+    /// clock `clock_gettime(CLOCK_MONOTONIC)` reports, so this is advisory only
+    /// (kept for a truthful EVIOCGCLOCKID-style answer and future REALTIME
+    /// support).
     clockid: u32,
     /// Monotonic push counter — the poll/epoll readiness sequence (edge emu).
     seq: u64,
@@ -108,6 +109,19 @@ static DEVICES: Mutex<[EvdevDevice; MAX_DEVICES]> = Mutex::new([const { EvdevDev
 extern "C" {
     fn arch_interrupt_save() -> usize;
     fn arch_interrupt_restore(f: usize);
+    /// Monotonic nanoseconds since boot, sub-tick resolution, never decreasing —
+    /// the same clock `clock_gettime(CLOCK_MONOTONIC)` reports to userspace.
+    fn arch_monotonic_ns() -> u64;
+}
+
+/// Total events ever handed to `push_event`, across every device. A guest-side
+/// witness that host-injected input actually reached the kernel ring: QMP
+/// accepting `input-send-event` only proves the host queued it.
+static EVENTS_PUSHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// See `EVENTS_PUSHED`.
+pub fn events_pushed() -> u64 {
+    EVENTS_PUSHED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 // ── evdev capability constants (linux/input-event-codes.h) ────────────────────
@@ -395,11 +409,21 @@ pub fn has_key_event(dev_id: u32) -> bool {
 pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     if dev_id as usize >= MAX_DEVICES { return; }
 
-    let now_ticks = sched::ticks();
+    // Stamp from the same monotonic clock userspace reads, at its full
+    // resolution. libinput asks for CLOCK_MONOTONIC and compares event times
+    // against its own clock_gettime(); everything downstream of it measures the
+    // interval between events. A whole-tick stamp gave every event drained in
+    // one 10 ms tick an identical timeval and a tv_usec that was always a
+    // multiple of 10 000. Read it before masking interrupts and before taking
+    // the device lock: push_event runs in IRQ context and this is two atomic
+    // loads and a counter read — no locks and no user memory — but there is
+    // still no reason to hold anything across it.
+    let now_us = unsafe { arch_monotonic_ns() } / 1_000;
+    EVENTS_PUSHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let ev = input_event {
         time: timeval {
-            tv_sec: (now_ticks / 100) as i64,
-            tv_usec: ((now_ticks % 100) * 10000) as i64,
+            tv_sec: (now_us / 1_000_000) as i64,
+            tv_usec: (now_us % 1_000_000) as i64,
         },
         type_,
         code,

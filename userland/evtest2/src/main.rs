@@ -120,6 +120,27 @@ core::arch::global_asm!(
     "   and sp, x0, #-16", "   bl relibc_start_v1", "   brk #0"
 );
 
+/// `name=<decimal>` on one line. Used to publish the raw timestamp-resolution
+/// counts alongside the PASS/FAIL lines, so a run that fails the sub-tick check
+/// says by how much rather than just "false".
+fn report_num(name: &[u8], v: u64) {
+    let mut buf = [0u8; 24];
+    let mut i = buf.len();
+    let mut n = v;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 { break; }
+    }
+    unsafe {
+        write(1, name.as_ptr() as *const c_void, name.len());
+        write(1, b"=".as_ptr() as *const c_void, 1);
+        write(1, buf.as_ptr().add(i) as *const c_void, buf.len() - i);
+        write(1, b"\n".as_ptr() as *const c_void, 1);
+    }
+}
+
 fn report(name: &[u8], ok: bool) -> bool {
     unsafe {
         write(1, name.as_ptr() as *const c_void, name.len());
@@ -195,8 +216,16 @@ pub unsafe extern "C" fn ev_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut 
     let mut saw_syn = false;
     let mut last_ts: i64 = -1;
     let mut ts_monotonic = true;
+    // Timestamp *resolution*: with a whole-tick stamp every tv_usec is a
+    // multiple of 10 000 and every event drained in one tick shares a timeval.
+    // Counting both tells a finer clock from a coarse one without a second run.
+    let mut n_events: u64 = 0;
+    let mut n_subtick: u64 = 0;
+    let mut n_distinct: u64 = 0;
     let mut waited = 0;
-    while waited < 6000 && !(saw_abs && saw_syn) {
+    // Collect a real sample before stopping: exiting on the first ABS+SYN pair
+    // leaves too few timestamps to say anything about resolution.
+    while waited < 6000 && !(saw_abs && saw_syn && n_events >= 32) {
         let rc = epoll_wait(epfd, evs.as_mut_ptr(), 8, 500);
         waited += 500;
         if rc <= 0 { continue; }
@@ -208,6 +237,9 @@ pub unsafe extern "C" fn ev_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut 
             let e = core::ptr::read_unaligned(buf.as_ptr().add(i * 24) as *const input_event);
             let ts = e.tv_sec * 1_000_000 + e.tv_usec;
             if last_ts >= 0 && ts < last_ts { ts_monotonic = false; }
+            if last_ts != ts { n_distinct += 1; }
+            if e.tv_usec % 10_000 != 0 { n_subtick += 1; }
+            n_events += 1;
             last_ts = ts;
             if e.type_ == EV_ABS && (e.code == ABS_X || e.code == ABS_Y) { saw_abs = true; }
             if e.type_ == EV_SYN && e.code == SYN_REPORT { saw_syn = true; }
@@ -216,6 +248,11 @@ pub unsafe extern "C" fn ev_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut 
     if saw_abs || saw_syn {
         report(b"motion_abs_frame", saw_abs && saw_syn);
         report(b"motion_ts_monotonic", ts_monotonic);
+        report_num(b"motion_events", n_events);
+        report_num(b"motion_ts_subtick_usec", n_subtick);
+        report_num(b"motion_ts_distinct", n_distinct);
+        // Informational, like the two above: only meaningful under injection.
+        report(b"motion_ts_subtick", n_subtick > 0);
     } else {
         puts(b"motion: none observed (no injection) - capability checks above are the gate\n\0".as_ptr());
     }

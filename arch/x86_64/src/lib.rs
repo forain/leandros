@@ -170,6 +170,18 @@ pub extern "C" fn arch_interrupt_restore(flags: usize) {
     }
 }
 
+/// Monotonic nanoseconds since boot, for kernel crates that sit below this one
+/// in the dependency graph and so cannot call `timer::monotonic_ns` directly —
+/// `evdev-server` stamps input events with it. Same contract as the function it
+/// forwards to: whole ticks plus a TSC fraction scaled by the PIT-measured
+/// cycles-per-tick, never decreasing, and callable from IRQ context (two atomic
+/// loads and an `rdtsc`, no locks, no user memory).
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub extern "C" fn arch_monotonic_ns() -> u64 {
+    timer::monotonic_ns()
+}
+
 /// x86_64 serial input.
 ///
 /// Returns Some(byte) if a character is available in the UART RX FIFO.

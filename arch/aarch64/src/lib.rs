@@ -38,6 +38,17 @@ pub extern "C" fn arch_interrupt_restore(flags: usize) {
     }
 }
 
+/// Monotonic nanoseconds since boot, for kernel crates that sit below this one
+/// in the dependency graph and so cannot call `timer::monotonic_ns` directly —
+/// `evdev-server` stamps input events with it. Same contract as the function it
+/// forwards to: whole ticks plus a CNTVCT_EL0 fraction, never decreasing, and
+/// callable from IRQ context (two atomic loads and an `mrs`, no locks, no user
+/// memory).
+#[no_mangle]
+pub extern "C" fn arch_monotonic_ns() -> u64 {
+    timer::monotonic_ns()
+}
+
 pub fn init(boot_info: &boot::BootInfo) {
     unsafe {
         // Initialize MMU features and memory attributes (MAIR_EL1)
