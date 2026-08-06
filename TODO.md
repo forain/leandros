@@ -79,7 +79,8 @@ flip back before committing:
 
 **Evidence lives outside this repo.** Run logs, screenshots, research notes and test
 harnesses are in `~/code/leandros-artifacts/notes/`. Design docs that are still
-execution-ready are in `docs/design/`.
+execution-ready are in `docs/design/`. `notes/m9-af-inet-loopback/` holds an unverified
+ready-to-apply patch for item 9.
 
 **Explicitly out of scope** (all degrade gracefully or are non-fatal): XWayland,
 PipeWire/audio for COSMIC, NetworkManager, UPower, accountsservice, greetd +
@@ -99,7 +100,7 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 6 | `FB_DAMAGE_CLIPS` / primary-plane recomposite | Perf | — |
 | 7 | evdev monotonic timestamps (reverted) | Bug | needs a different time source |
 | 8 | Doom hangs in `malloc(16 MB)` on aarch64 | Bug | re-verify first |
-| 9 | AF_INET loopback `bind()` → EINVAL | Bug | — |
+| 9 | AF_INET loopback needs a real loopback interface | Bug | — |
 | 10 | Deferred / known limitations | Mixed | — |
 
 ---
@@ -279,11 +280,55 @@ syscall glue.
 sources a cross compiler, not the host one"), which touches exactly the layer blamed
 here — this may already be fixed.
 
-### 9. AF_INET loopback `bind()` → EINVAL
+### 9. AF_INET loopback needs a real loopback interface
 
-Found by the tokio spike: TCP loopback bind fails, so the tokio TCP subtest is skipped
-while UDS passes. Low priority — Wayland and D-Bus need only UDS — but it is a real gap
-in the smoltcp integration.
+The reported symptom was mislabelled. It is **not** `bind()`: `handle_bind`'s `AF_INET`
+arm (`servers/net/src/lib.rs:766`) validates nothing beyond `addrlen >= 8`, stores the
+endpoint and returns 0 — byte order and length handling are correct. The EINVAL comes
+from `handle_listen` at `servers/net/src/lib.rs:866`, which rejects `bound_port == 0`.
+The tokio spike binds **port 0**, and mio's `TcpListener::bind` is socket +
+`SO_REUSEADDR` + bind + `listen(1024)` in one call, wrapped by the spike in a
+`"loopback bind failed"` message — so an error naming the wrong syscall propagated into
+this item. (`NET_SETSOCKOPT` is a blanket `ok_reply()`, so `SO_REUSEADDR` is not
+involved.) A second EINVAL sits right behind it: `handle_getsockname` (`:1907`) is a
+stub writing `sa_family = 0, addrlen = 2`, so a bind-to-zero listener can never learn
+its port, and std/tokio turn an unknown family into `InvalidInput`.
+
+The deeper finding: **there is no loopback interface at all.** `net_server::init()`
+(`:563`) is guarded by `if drivers::virtio_net::device_count() > 0` and builds exactly
+one `Interface`, over `VirtioNetDeviceWrapper`, at `10.0.2.15/24` with a default route
+to `10.0.2.2`. Nothing configures `127.0.0.0/8`, and `NET_STACK` is a single
+`Option<NetStack>`. So fixing the port-0 check alone would make `bind` succeed and then
+route a SYN for 127.0.0.1 out the NIC via the default route, never to return; on a guest
+with no virtio-net device the whole stack is `None`. This is a **feature, not a
+validation tweak**. Inferred from source: the in-tree self-test `t_af_inet_loopback`
+(`servers/init/src/lib.rs:452`, which runs at every boot) cannot be passing today.
+
+The honest fix stands up a second smoltcp `Interface` on `phy::Loopback` at
+`127.0.0.1/8` with **its own `SocketSet`**, polls it in `net_daemon`, and tags every
+inet socket with the stack that owns its handle. Separate socket sets are not optional
+— two interfaces sharing one set let whichever polls first claim a socket's pending
+segment, so a loopback SYN could be emitted onto the wire and silently lost. About
+**440 added lines** across three files; no `Cargo.toml` change, since
+`smoltcp::phy::Loopback` is gated on `feature = "alloc"` which is already enabled.
+
+A complete patch is written and preserved at
+`~/code/leandros-artifacts/notes/m9-af-inet-loopback/af_inet_loopback.patch` (1064
+lines; verified to `git apply --check` cleanly against `ac604bd`). It is **unverified**
+— it has never been compiled, only `rustfmt`-parsed, so expect the first build to
+surface a borrow or type nit, most plausibly around the `stack_for` guard in
+`accept_on`/`listen_on`. Beyond the loopback interface it also assigns an ephemeral
+port on `sin_port == 0` (Linux's 32768–60999, collision-checked), implements real
+`getsockname`/`getpeername` for inet sockets, makes INADDR_ANY listen on both stacks as
+Linux does, and fixes a **pre-existing lock-order inversion** in `handle_accept` (it
+held `NET_STACK` then took `SOCK_TABLES`, the reverse of every other site) while no
+longer writing the peer `sockaddr` into user memory under a server lock.
+
+Known residuals if it lands: `ping 127.0.0.1` still goes out the NIC (ICMP deliberately
+left on one stack); a second `listen()` on an already-listening socket returns EINVAL;
+inet `send` latency is up to one 10 ms daemon tick. **Landing it moves the `scmtest`
+baseline 25 → 26 subtests** (it adds `inet_loopback_tcp`), and the boot serial should
+then show `[NET] Loopback interface 127.0.0.1/8 up`.
 
 ### 10. Deferred work and known limitations
 
