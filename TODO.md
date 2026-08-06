@@ -3,7 +3,7 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-06** (`05bb0fe`); item 4 and the item 10
+Last reconciled against `main` on **2026-08-06** (`77f170d`); item 4 and the item 10
 Mesa-modifier bullet updated the same day with a source-analysis wave over smithay
 `efeb597` and the kernel DRM property/blob path. Same day, a second wave: item 2
 (memfd tmpfs-slot leak) got a completed source-analysis pass and a prepared-but-unbuilt
@@ -38,7 +38,16 @@ building) a `run-qemu.sh --venus` patch. Two new items were split out of the des
 kernel-gap findings: item 2 (`PRIME_HANDLE_TO_FD` refuses Venus blob handles, paired
 with the `SIMULATE_SYNCOBJ` zero-size-execbuffer gap) and item 3 (`driver.py` has no GL
 path, so the `run-leandros` skill cannot reach Venus at all). Former items 2-9 shifted
-down to 4-11 and the former item 10 (deferred work) is now item 12.
+down to 4-11 and the former item 10 (deferred work) is now item 12. Same day, a seventh
+wave closed the former items 4 and 5 (the memfd tmpfs-slot leak and the
+`tmpfile_owner_of` TGID canonicalisation), both landed together in `77f170d` and
+verified on both arches: `memfd_anonymous_reclaim` 300/300, `memfd_inflight_close`
+passing (only after a flaw in the test itself was fixed — see the guard-test lesson in
+Standing context), `scmtest` 26/0 → 28/0, and a clean aarch64 A/B against pristine
+`420adf7` showing the `smithay-clipboard` OutOfMemory panic present on the old kernel
+and absent on the new one. A new item was split out of that verification for a
+pre-existing, unrelated defect the double-release audit surfaced: `import_fd`
+double-releases on EMFILE. Former items 6-12 shifted down to 5-11.
 
 ---
 
@@ -59,14 +68,20 @@ socket branch and reported `POLLNVAL` as readiness on every pass, starving the f
 callback that reopens cosmic-panel's `has_frame` gate). Remaining work is quality and
 performance, not bring-up. The full suite is green on freshly-built release binaries
 and fresh images, both arches, as of `26eebf0`: vfstest 36/0, drmsmoke 22/0, scmtest
-26/0 (the 26th subtest, `inet_loopback_tcp`, added in `26eebf0`), wakepolltest 10/0,
-forktest 3/0, epolltest 9/0 (the 9th subtest, `nested_epoll`, added in `4085b7f`),
+28/0 (the 26th subtest, `inet_loopback_tcp`, added in `26eebf0`; the 27th and 28th,
+`memfd_anonymous_reclaim` and `memfd_inflight_close`, added in `77f170d`), wakepolltest
+10/0, forktest 3/0, epolltest 9/0 (the 9th subtest, `nested_epoll`, added in `4085b7f`),
 polltest 6/0, sigtest 6/0, timertest 6/0 (the 6th subtest, `clock_monotonic_subtick`,
 added in `75b32e3`), memtest 4/0, waittest 5/0 — all on x86_64. On aarch64, waittest
 also came out 5/0 in this run rather than the previously recorded 3/2; the
 `wait_on_process_group` flake simply did not fire this time, so treat either result as
 acceptable. This wave (`05bb0fe`) also ran `idletest` 2/0 and `evtest2` 8/0 green on
-both arches; neither was previously listed in this baseline.
+both arches; neither was previously listed in this baseline. **Refined 2026-08-06
+(`77f170d`):** the flake is not aarch64-specific — an A/B on a pristine `420adf7` kernel
+gave 5/0, 3/2, 5/0 across three runs, and the patched kernel gave 5/0 x3 and 3/2 x8
+across 11 runs, both on aarch64. It is a pure timing race in `fork` -> child
+`setpgid(0,0)` + `_exit` -> parent `waitpid(-pid)`, with no tmpfs, memfd or SCM
+involvement; either result is acceptable on either arch.
 
 **vmnet gotcha.** On a Mac with `socket_vmnet` installed, `driver.py` uses vmnet rather
 than slirp, so the guest gets a `192.168.105.x` lease and `10.0.2.x` does not exist —
@@ -141,6 +156,14 @@ reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print i
   control (identical signature with and without an unrelated kernel change) showed a
   second vfstest run on the same image fails three subtests —
   `chroot_confines_symlink_resolution`, `xattr_list_tmpfs` and `xattr_list_f2fs`.
+- **A guard test must be shown to fail with its guard removed, or it is certifying a
+  hazard it never checked.** `memfd_inflight_close` (`77f170d`) as first written could
+  not fail: with `tmp_inflight_inc` removed from `export_fd` it still passed, because
+  the parent created the memfd and `fork()`ed before closing it, so the child inherited
+  a copy and the parent's `close()` was never the last fd-table reference — the
+  hazard window never opened. Fixed by having the child close its copy before blocking
+  on the sync byte, after which removing the guard fails deterministically (`child
+  status=256`, pattern mismatch). Verify every guard test this way before trusting it.
 
 **Diagnostics in-tree, all compiled out by default** — flip to `true`, measure,
 flip back before committing:
@@ -174,15 +197,14 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 1 | Venus works; M3 is a render + readback test, not vkcube | Feature | — |
 | 2 | `PRIME_HANDLE_TO_FD` rejects Venus blob handles | Bug | — |
 | 3 | `driver.py` has no GL path at all | Bug | confirming screendump under egl-headless |
-| 4 | memfd burns a tmpfs slot per call — fix prepared, needs an in-flight refcount | Bug — latent DoS | — |
-| 5 | `tmpfile_owner_of` does not canonicalise pid to TGID | Bug — kernel | — |
-| 6 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
-| 7 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
-| 8 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
-| 9 | Delete the unreachable `init-server` crate | Cleanup | — |
-| 10 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
-| 11 | No TIME_WAIT — ports are instantly reusable | Bug | — |
-| 12 | Deferred / known limitations | Mixed | — |
+| 4 | `import_fd` double-releases on EMFILE | Bug — kernel | — |
+| 5 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
+| 6 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
+| 7 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
+| 8 | Delete the unreachable `init-server` crate | Cleanup | — |
+| 9 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
+| 10 | No TIME_WAIT — ports are instantly reusable | Bug | — |
+| 11 | Deferred / known limitations | Mixed | — |
 
 ---
 
@@ -305,93 +327,20 @@ not reach it. Adding a `venus=True` mode is strictly larger than the flag —
 `screendump` capture the whole skill depends on still works under `egl-headless`. That
 one question gates both this and M3's scanout step.
 
-### 4. memfd burns a tmpfs slot per call — fix prepared, needs an in-flight refcount
+### 4. `import_fd` double-releases on EMFILE
 
-**How it actually works, measured.** `MAX_TMP_FILES = 128` (`servers/vfs/src/lib.rs:264`)
-bounds one flat `TMP_FILES` array (`:326`) shared by `/tmp`, `/dev/shm` **and**
-`/run/user`, with a parallel `TMP_VMOS` (`:378`); allocation is a linear free-slot scan
-and exhaustion returns **ENOSPC (-28)** (`:2808`, `:2819`). The reclamation machinery is
-complete and correct — `tmp_drop_name` (`:2125`) frees the slot on unlink or marks it
-`ephemeral` if an open fd still names it, and `tmp_release_ephemeral` (`:2341`) collects
-the slot and its VMO frames on last close, called from `handle_close`, `release_vnode`
-and the exit sweep. It is simply never triggered for memfd: because `sys_memfd_create`
-never unlinks, `ephemeral` is never set, so a memfd slot is **never** reclaimed by any
-path and closing the last fd frees nothing. One leak, at the name.
+Found during the memfd/TGID verification (`77f170d`, formerly items 4 and 5),
+pre-existing and untouched by that commit. `servers/net/src/lib.rs:2140-2151`: when
+`import_fd` hits EMFILE at index *i*, it has already released `fds[i]` internally
+before returning the error, but the caller's overflow loop `for j in fit..nfds` then
+`drop_transfer`s `fds[i]` a second time — a double `release_vnode` on the same vnode.
+`77f170d`'s `saturating_sub` on `TMP_INFLIGHT` keeps this from underflowing that
+counter, so it is not made worse, but it is not fixed either. Deliberately left out of
+`77f170d` to keep that commit scoped to the memfd/TGID fix. No repro harness yet — needs
+an SCM_RIGHTS transfer sized to exceed the receiver's remaining fd-table capacity by
+more than one fd.
 
-**The in-code comment's mechanism is refuted; its conclusion is right for a reason it
-never named.** Every fd-side memfd operation destructures `VnodeKind::TmpFile { idx }` —
-`handle_ftruncate` (`:4950`), the K1 mmap path via `tmpfile_owner_of` (`:459`, from
-`vmo_acquire_frames` `:597`), `mark_memfd` (`:526`), read/write/lseek (`:3076`/`:3208`/
-`:3447`), `handle_fstat` (`:6393`), seals (`:4068`, `:4079`), and the `f*` xattr and
-mode/owner calls. The only name-keyed site is `handle_open` (`:2792` via `tmp_find`),
-which nothing uses to reopen a memfd, and `tmp_find` (`:2042`) skips `ephemeral` anyway
-— exactly the Linux invisibility we want. `scmtest::test_teardown_loop` already runs 150
-rounds of create → ftruncate → mmap → unlink-then-close and passes.
-
-**But unlink-alone would be an immediate hard regression.** `export_fd` (`:3630`)
-deliberately takes no reference for a `TmpFile` ("lifetime is table-scan driven"), so an
-SCM_RIGHTS fd between `sendmsg` and the peer's `recvmsg` is in **no** fd table. Today
-the name pins the inode; once the node is nameless, `close(fd)` immediately after
-`wl_shm_create_pool` — the standard libwayland/Mesa swrast idiom — frees the slot and
-its VMO before `import_fd` installs it, and the next `memfd_create` recycles that idx
-under the compositor. So the fix needs an in-flight refcount alongside the unlink.
-
-**The `smithay-clipboard` OutOfMemory lead is NOT this bug** — and chasing it found a
-separate real defect. Three disqualifiers: the panic carries **ENOMEM (12)** while slot
-exhaustion returns **ENOSPC (28)**; it fires at t≈8.5 s with only ~6 memfds ever
-created; and `MultiPool::new` runs once per process, so nothing accumulates. The actual
-cause is that **`tmpfile_owner_of` (`servers/vfs/src/lib.rs:459-461`) does not
-canonicalise `pid` to the TGID**, while `vfs_get_node_kind` (`:810`) does. On a spawned
-thread the kind resolves as `TmpFile`, `sys_mmap` takes the K1 branch,
-`vmo_acquire_frames(pid=TID)` → `find_tbl(TID)` → `None`, and
-`kernel/src/syscall.rs:1699` returns ENOMEM. The panicking thread is literally named
-`smithay-clipboard`. `mark_memfd` (`syscall.rs:7115`) silently no-ops for the same
-reason. This is the identical lesson `36f62d0` already learned for
-`install_dmabuf_vmo`/`dmabuf_handle_of`, which pass `sched::tgid_of(pid)` explicitly.
-**The TGID fix is required for this item anyway** — without a VMO the memfd falls back
-to the 32 KiB inline data path.
-
-**Prepared patch** (397 lines, **unbuilt**, verified to `git apply --check` cleanly at
-`aa2329c`) at `~/code/leandros-artifacts/notes/m9-memfd-tgid/memfd_unlink.patch`,
-touching `kernel/src/syscall.rs`, `servers/vfs/src/lib.rs` and
-`userland/scmtest/src/main.rs`. It canonicalises `tmpfile_owner_of` to the TGID; adds
-`TMP_INFLIGHT` with inc/dec/mask helpers so `tmp_open_fd_mask` and
-`tmp_release_ephemeral` both honour in-flight fds (lock nesting stays FD_TABLES →
-TMP_INFLIGHT → TMP_FILES); takes an in-flight reference in `export_fd` and drops it in
-`import_fd` after the table install and on both EMFILE paths, and in `drop_transfer`;
-and replaces the KNOWN-LEAK comment in `sys_memfd_create` with a `VFS_UNLINK`, matching
-`36f62d0` in shape.
-
-**Verification.** `scmtest` **26/0 → 28/0**. `memfd_anonymous_reclaim` is the pass
-criterion for the item: `stat("/tmp/memfd:anonprobe")` must fail while the fd is open,
-then 300 rounds (>2×128) of create → ftruncate → MAP_SHARED mmap → write/verify →
-munmap → close with **no manual unlink**, passing 300/300; today it dies with ENOSPC
-around round 120, and `test_teardown_loop` cannot catch it because it unlinks by hand.
-`memfd_inflight_close` guards the new hazard: the parent stamps a pattern, munmaps,
-`sendmsg`s the fd, closes it, and only then releases the child, which must `recvmsg`,
-mmap and see the pattern — this fails deterministically without the `TMP_INFLIGHT`
-half. No other baseline moves (`test_teardown_loop`'s `unlink` calls will return ENOENT
-but the test discards the return). For the TGID half the on-target criterion is the
-live COSMIC session: `thread 'smithay-clipboard' panicked … Create(Os { code: 12 })`
-must be **absent** from the serial log — it is present in every one of ~10 archived
-runs, so its disappearance is a clean signal.
-
-### 5. `tmpfile_owner_of` does not canonicalise pid to TGID
-
-`tmpfile_owner_of` (`servers/vfs/src/lib.rs:459-461`) keys on the raw pid while
-`vfs_get_node_kind` (`:810`) canonicalises to the TGID, so any memfd `mmap` from a
-spawned **thread** (as opposed to the process's main thread) returns ENOMEM
-(`kernel/src/syscall.rs:1699`) instead of resolving the shared VMO, and `mark_memfd`
-(`syscall.rs:7115`) silently no-ops for the same reason. Observed as the
-`smithay-clipboard` thread panicking with `Failed to create memory pool … OutOfMemory`
-(`Os { code: 12 }`) in `cosmic-files-applet` during COSMIC sessions — pre-existing,
-session survives it, but it is a real correctness bug, not a benign symptom. `36f62d0`
-already fixed the same class of bug for the dmabuf path, by passing
-`sched::tgid_of(pid)` explicitly at the two dmabuf-side call sites. The fix for this
-item is included in the item 4 patch above, but it is an independent defect worth its
-own line — it breaks threaded memfd users generally, not just this one.
-
-### 6. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
+### 5. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
 
 **What we already have, measured.** The property is fully plumbed, not merely
 advertised: `PROP_FB_DAMAGE_CLIPS = 51` as `PropKind::Blob` in `PROPS`
@@ -469,7 +418,7 @@ screendumps >=2 s apart and confirm the digits differ, then force one full prese
 confirm it is pixel-identical. Note the cursor will not appear in `screendump` now that
 it is on the hardware plane. Plus `drmsmoke` 22/0 both arches and `idletest`.
 
-### 7. `listen()` twice returns EINVAL — fix prepared
+### 6. `listen()` twice returns EINVAL — fix prepared
 
 `handle_listen` matched only `SockState::InetBound`, so a repeat call fell to
 `_ => err_reply(-22)`. The fix adds one arm, `SockState::InetListening { .. } => return
@@ -490,9 +439,10 @@ after `test_inet_loopback_tcp` in the same idiom. It asserts listen-before-bind 
 gives `rc=-1 errno=22` (so the fix cannot degenerate into "always succeed"), that a
 repeat `listen(srv,16)` returns 0, and that connect+accept still complete on the same
 listener afterwards — the last is what catches a fix that re-arms and orphans handles.
-**`scmtest` 26/0 → 27/0**, or **→ 29/0** if the memfd patch's two subtests land first.
+**`scmtest` 28/0 → 29/0** — the memfd/TGID patch's two subtests already landed in
+`77f170d` and are part of the 28/0 baseline.
 
-### 8. `unused variable: port` in `handle_close` — not a leak, fix prepared
+### 7. `unused variable: port` in `handle_close` — not a leak, fix prepared
 
 **Measured, it is a warning and not a port leak.** `alloc_ephemeral_port`
 (`servers/net/src/lib.rs:442`) is the only allocator and derives "free" purely from live
@@ -505,7 +455,7 @@ renaming it to `_port` (a dead read invites someone to re-add it) and leaves a c
 recording why no release is needed. Verification is just that the warning is gone with
 no new ones, and `scmtest` unchanged.
 
-### 9. Delete the unreachable `init-server` crate
+### 8. Delete the unreachable `init-server` crate
 
 The scope is larger than this item previously stated. **`init-server` is a real
 dependency in `kernel/Cargo.toml:34`, so all 2653 lines compile into every kernel
@@ -536,23 +486,23 @@ both arches link with the crate gone, `grep -rn init_server .` is empty, serial 
 is **unchanged** to the login prompt (nothing in the crate ever printed), and the full
 suite is at baseline on fresh images.
 
-### 10. AF_UNIX `listen()` is lax in the opposite direction
+### 9. AF_UNIX `listen()` is lax in the opposite direction
 
 The AF_UNIX arm of `handle_listen` is an unconditional `ok_reply()` — a repeat listen
 already succeeds, but so does `listen()` on an unbound or already-connected AF_UNIX
-socket, where Linux answers EINVAL. Found while fixing the AF_INET side (item 7) and
+socket, where Linux answers EINVAL. Found while fixing the AF_INET side (item 6) and
 deliberately **not** changed there: tightening it alters behaviour for every AF_UNIX
 server on the system (cosmic-comp, busd, tokio) and could not be validated in a
 read-only session. Needs a live COSMIC session to land safely.
 
-### 11. No TIME_WAIT — ports are instantly reusable
+### 10. No TIME_WAIT — ports are instantly reusable
 
 `handle_close` calls `socket_set.remove()` immediately, so a closed TCP port can be
 rebound at once where Linux would hold it in TIME_WAIT. A divergence, not a leak, and
 low priority — but it is the kind of thing that makes a server restart behave
 differently here than on Linux.
 
-### 12. Deferred work and known limitations
+### 11. Deferred work and known limitations
 
 - **Doom does not link relibc.** `../doomgeneric/Makefile.leandros` links
   `userland/target/<arch>-unknown-none/release/libleandros_libc.a`, whose allocator is
@@ -599,6 +549,12 @@ differently here than on Linux.
   legacy-path control instead of erroring. Key the window on `evpush` (see the
   diagnostics table in Standing context) instead — it is nonzero on both paths whenever
   pointer motion actually reached the guest ring.
+- **Build gotcha, cost two QEMU cycles during the `77f170d` verification:** building a
+  userland test binary with a bare `cargo build` instead of `scripts/build-userland.sh`
+  omits `-C relocation-model=static`, producing a PIE whose `.data.rel.ro` our loader
+  never relocates. It then faults at `__libc_start_main+0x44` with `CR2=0`, before
+  `main` — a distinctive signature whose cause is not obvious from the fault alone.
+  Always build userland through `scripts/build-userland.sh`.
 
 ---
 
