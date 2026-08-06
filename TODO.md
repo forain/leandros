@@ -3,7 +3,7 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-06** (`d2addcc`).
+Last reconciled against `main` on **2026-08-06** (`531f21e`).
 
 ---
 
@@ -19,7 +19,12 @@ system libraries, daemons — is ours.
 **Where it stands.** The desktop runs on both arches: cosmic-session → cosmic-comp on
 KMS/softpipe → busd → cosmic-bg + cosmic-panel renders a wallpaper plus a full-width
 panel bar with an embedded Wayland client. Remaining work is quality and performance,
-not bring-up.
+not bring-up. The full suite is green on freshly-built release binaries and fresh
+images, both arches, as of 2026-08-06: scmtest 25/0, vfstest 36/0, drmsmoke 22/0,
+wakepoll/fork/epoll/poll/sig/timer/mem all FAIL=0, waittest aarch64 3/2 (the known
+`wait_on_process_group` failure, byte-identical to the 2026-08-05 baseline) and x86_64
+5/0; `xattr_list_f2fs` was absent on aarch64 on a fresh image, confirming the
+dirty-image theory.
 
 **Committed architecture** (settled; revisit only with a reason):
 
@@ -85,49 +90,62 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 
 | # | Item | Category | Blocked on |
 |---|---|---|---|
-| 1 | `scmtest` hangs after ~2 subtests | Bug — regression | — |
-| 2 | Venus/virgl host round-trip | Feature | a Linux host with virglrenderer |
-| 3 | cosmic-panel bar frozen at first frame | Bug — compositor-side | re-measure post-fix |
-| 4 | memfd burns a tmpfs slot per call | Bug — latent DoS | — |
-| 5 | `wl_display error 0 "Unknown id: 636"` | Bug | re-measure post-fix |
-| 6 | `FB_DAMAGE_CLIPS` / primary-plane recomposite | Perf | — |
-| 7 | evdev monotonic timestamps (reverted) | Bug | needs a different time source |
-| 8 | Doom hangs in `malloc(16 MB)` on aarch64 | Bug | re-verify first |
-| 9 | AF_INET loopback `bind()` → EINVAL | Bug | — |
-| 10 | Deferred / known limitations | Mixed | — |
+| 1 | Venus/virgl — round-trip done on x86_64; vktest hangs under TCG | Feature | — |
+| 2 | cosmic-panel bar frozen at first frame | Bug — compositor-side | re-measure post-fix |
+| 3 | memfd burns a tmpfs slot per call | Bug — latent DoS | — |
+| 4 | `wl_display error 0 "Unknown id: 636"` | Bug | re-measure post-fix |
+| 5 | `FB_DAMAGE_CLIPS` / primary-plane recomposite | Perf | — |
+| 6 | evdev monotonic timestamps (reverted) | Bug | needs a different time source |
+| 7 | Doom hangs in `malloc(16 MB)` on aarch64 | Bug | re-verify first |
+| 8 | AF_INET loopback `bind()` → EINVAL | Bug | — |
+| 9 | Deferred / known limitations | Mixed | — |
 
 ---
 
-### 1. `scmtest` hangs after ~2 subtests
+### 1. Venus/virgl — round-trip done on x86_64; vktest hangs under TCG
 
-`scmtest` stops after `fd_pass: PASS` and never reaches the prompt; the recorded
-baseline is 25/25. Reproduced on a fresh image, and **identically on a kernel built
-before the aarch64 FP/SIMD fix**, so it is pre-existing and not caused by that change —
-but it is a real regression against the recorded baseline and nothing else in the suite
-shows it (vfstest 36/36, everything else matches baseline).
+The host round-trip works. On the Linux box (`forain@172.16.158.150`, EndeavourOS,
+virglrenderer 1.3.0, QEMU 11.0.1 — already installed, nothing to add; note it is
+**Arch, not Debian**, so the old `apt install` line was wrong), on softfloat HEAD with
+fresh images: x86_64/KVM gives `venustest` **68/68** and `vktest` **0 failures**,
+opening a real GPU through Mesa's Venus ICD (`Virtio-GPU Venus (AMD Ryzen 9 7950X (RADV
+RAPHAEL_MENDOCINO))`, `vkCreateDevice` VK_SUCCESS); aarch64/TCG gives `venustest`
+**68/68**, `drmsmoke` 22/22, `vfstest` 36/36 — the first-ever aarch64 Venus run,
+transport layer fully green.
 
-Bisect against the commits since the last green scmtest run; `servers/net`'s AF_UNIX
-SCM_RIGHTS path is the obvious first suspect given what the test covers, and it is the
-same code implicated in item 5.
+Venus needs the device line `-device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G
+-display egl-headless`. `scripts/run-qemu.sh` does **not** pass these, and on x86_64 it
+selects `virtio-vga` (no GL at all), so the in-tree harness cannot exercise Venus — only
+bespoke wave scripts can. Worth fixing. Reminder: `-nographic` silently overrides
+`-display`.
 
-### 2. Venus/virgl host round-trip
+**Open:** `vktest` hangs at `vkEnumeratePhysicalDevices` (after `vkCreateInstance`
+succeeds) under **TCG on both arches**. x86_64/KVM passes; x86_64 under `-accel tcg`
+reproduces the hang identically with the same `[DRM]` trace — so it is neither
+arch-specific nor softfloat-related. The guest stays healthy: Ctrl-C returns to the
+shell, all vCPUs idle in the kernel, QEMU ~4.6% CPU, no host renderer error — a thread
+blocked in a wait, not spinning or crashed. Leading hypothesis: the GPU has no ISR, so
+completions are polled; under KVM the poll wins the race, under TCG the reply is never
+observed. Next diagnostic: instrument the ring-reply/fence wait path and check whether
+the host renderer was ever notified for that submission.
 
-The kernel and DRM side is code-complete: the M1 transport (`04bde83`), the render node
-plus the sysfs PCI attributes libdrm actually reads (`d5410ee`), the wire-protocol
-corrections (`3598e80`, `bdab516`, `0dfc362`), and per-open/per-BO fences with scoped
-GEM handles (`b80ab5a`).
+Because an aarch64 guest on an x86_64 host is TCG-only, **aarch64 Vulkan remains
+unvalidated — untested, not broken.** It needs this hang fixed, or an ARM host.
 
-It has never had a real host round-trip. Today's `venustest` run (aarch64) fails 29
-subtests, all of them `[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT` —
-a host-capability wall, not a code defect. `virtio-gpu-gl-pci,venus=on` needs libepoxy's
-EGL dispatch, and **macOS has no native EGL**; rutabaga is a confirmed dead end (its
-device never sets the VIRGL/VENUS capset bits, checked v9.2 → master).
+The old "`venustest` fails 29 / `host lacks VIRGL/BLOB/CONTEXT_INIT`" line was a
+**macOS-host** artifact (no EGL) — not a code defect, and not the state on Linux.
+macOS-has-no-EGL and rutabaga-is-a-dead-end both remain accurate.
 
-`5cf1cb8` made the QEMU harness run on a Linux x86_64 host, so the remaining gate is
-environmental: on Linux, `apt install qemu-system-x86 libvirglrenderer-dev` gives a
-working device with no source builds. Then re-run `venustest`, and after that `vkcube`.
+`vkcube` is **not** a runnable follow-on: it has never been built for LeandrOS (no
+binary or source in the repo or in `leandros-artifacts`;
+`scripts/mkfs-f2fs-populated.py` stages only `vktest` + `libvulkan_virtio.so`), it links
+the Khronos `libvulkan.so.1` loader that we deliberately do not ship (`vktest` exists
+precisely to bypass the loader and `dlopen` the ICD directly), and no WSI has been
+chosen among the ICD's `VK_KHR_wayland_surface` / `VK_KHR_display` /
+`VK_EXT_headless_surface` / `VK_EXT_acquire_drm_display`. That is the M3 rendering
+milestone.
 
-### 3. cosmic-panel bar frozen at first frame
+### 2. cosmic-panel bar frozen at first frame
 
 The panel renders a bar, but its clock is frozen at the first frame.
 
@@ -153,7 +171,7 @@ If it does survive, the bug is compositor-side. Remaining candidates:
 2. The compositor mapping the pool at a size/offset that does not track the client's.
 3. `wl_shm_pool.create_buffer` offset handling.
 
-### 4. memfd burns a tmpfs slot per call
+### 3. memfd burns a tmpfs slot per call
 
 `sys_memfd_create` backs each memfd with a *named* `/tmp/memfd:<name>` tmpfs node it
 never unlinks, so every call permanently consumes one of 128 `MAX_TMP_FILES` slots. A
@@ -171,7 +189,7 @@ Either the comment is stale or there is a runtime-only hazard the read-only audi
 cannot see. Next: instrumented runtime re-test of unlink-after-create, then delete the
 comment or record the real root cause.
 
-### 5. `wl_display error 0 "Unknown id: 636"` — panel↔comp desync
+### 4. `wl_display error 0 "Unknown id: 636"` — panel↔comp desync
 
 Signature reads as one whole message dropped on a boundary. Id 636 is high and
 client-allocated, created after globals + layer-surface + the whole EGL/GLES bring-up —
@@ -182,10 +200,14 @@ plain-data branch. Full analysis: `notes/wl-id636-analysis.md`.
 
 Observed on aarch64 with the FP/SIMD clobber live — "one whole message dropped
 on a boundary" is also what silently corrupted userspace arithmetic looks like. Confirm
-it still reproduces on the fixed kernel before spending time in the AF_UNIX path. If it
-does, item 1 is probably the same bug and they should be chased together.
+it still reproduces on the fixed kernel before spending time in the AF_UNIX path. The
+scmtest hang turned out to be a host-side capture artifact, so the inference that this
+is the same bug is void. On the current kernel, scmtest's `fd_pass`, `cmsg_flags`,
+`shared_memfd_pixels`, `queued_fd_cap` and `full_ring_eagain` subtests all PASS on both
+arches — evidence *for* the AF_UNIX SCM_RIGHTS path being healthy, so if 636 still
+reproduces, look elsewhere first.
 
-### 6. `FB_DAMAGE_CLIPS` / primary-plane recomposite
+### 5. `FB_DAMAGE_CLIPS` / primary-plane recomposite
 
 The cursor plane landed and moved pointer motion from **0.9 → 6.0 page flips/s**, with
 the cursor image uploaded exactly once and zero pixel traffic per move. But the honest
@@ -196,7 +218,7 @@ flips the **primary** plane on every cursor frame. The end state
 This is the remaining pointer-latency win, and it is on the primary plane, not the
 cursor. `FB_DAMAGE_CLIPS` is already advertised in the plane property table.
 
-### 7. evdev monotonic timestamps — reverted, do not re-land naively
+### 6. evdev monotonic timestamps — reverted, do not re-land naively
 
 Timestamping `push_event` from an inlined `monotonic_us()` **broke pointer input
 entirely**: three runs with the change (atomic path, and a legacy-path control on the
@@ -205,7 +227,7 @@ reverting it restored input. libinput evidently rejects the `cntvct`-derived
 timestamps. A re-land needs a time source libinput accepts, verified against 60
 moves/s with `DRM_STATS` on.
 
-### 8. Doom hangs in `malloc(16 MB)` on aarch64
+### 7. Doom hangs in `malloc(16 MB)` on aarch64
 
 Doom runs through `DG_Init`, DRM init, a successful GPU flush and into the engine, then
 hangs in the first `malloc(16 MB)` (`Z_Init` → `I_ZoneBase` → `AutoAllocMemory` in
@@ -221,13 +243,13 @@ syscall glue.
 sources a cross compiler, not the host one"), which touches exactly the layer blamed
 here — this may already be fixed.
 
-### 9. AF_INET loopback `bind()` → EINVAL
+### 8. AF_INET loopback `bind()` → EINVAL
 
 Found by the tokio spike: TCP loopback bind fails, so the tokio TCP subtest is skipped
 while UDS passes. Low priority — Wayland and D-Bus need only UDS — but it is a real gap
 in the smoltcp integration.
 
-### 10. Deferred work and known limitations
+### 9. Deferred work and known limitations
 
 - **Mesa modifier support.** Our GBM has no `gbm_bo_create_with_modifiers2` path, so
   smithay cannot build a reusing swapchain and reallocates per frame; this once burned
