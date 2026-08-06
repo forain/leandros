@@ -3,7 +3,7 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-06** (`75b32e3`).
+Last reconciled against `main` on **2026-08-06** (`26eebf0`).
 
 ---
 
@@ -23,14 +23,21 @@ panel bar with an embedded Wayland client. The panel clock ticks on both arches
 socket branch and reported `POLLNVAL` as readiness on every pass, starving the frame
 callback that reopens cosmic-panel's `has_frame` gate). Remaining work is quality and
 performance, not bring-up. The full suite is green on freshly-built release binaries
-and fresh images, both arches, as of `75b32e3`: vfstest 36/0, drmsmoke 22/0, scmtest
-25/0, wakepolltest 10/0, forktest 3/0, epolltest 9/0 (the 9th subtest, `nested_epoll`,
-added in `4085b7f`), polltest 6/0, sigtest 6/0, timertest 6/0 (the 6th subtest,
-`clock_monotonic_subtick`, added in `75b32e3`), memtest 4/0, waittest 5/0 — all on
-x86_64. On aarch64, waittest also came out 5/0 in that run rather than the previously
-recorded 3/2; the `wait_on_process_group` flake simply did not fire this time, so
-treat either result as acceptable. Landing the AF_INET loopback patch (item 7) will
-move scmtest 25 → 26.
+and fresh images, both arches, as of `26eebf0`: vfstest 36/0, drmsmoke 22/0, scmtest
+26/0 (the 26th subtest, `inet_loopback_tcp`, added in `26eebf0`), wakepolltest 10/0,
+forktest 3/0, epolltest 9/0 (the 9th subtest, `nested_epoll`, added in `4085b7f`),
+polltest 6/0, sigtest 6/0, timertest 6/0 (the 6th subtest, `clock_monotonic_subtick`,
+added in `75b32e3`), memtest 4/0, waittest 5/0 — all on x86_64. On aarch64, waittest
+also came out 5/0 in this run rather than the previously recorded 3/2; the
+`wait_on_process_group` flake simply did not fire this time, so treat either result as
+acceptable.
+
+**vmnet gotcha.** On a Mac with `socket_vmnet` installed, `driver.py` uses vmnet rather
+than slirp, so the guest gets a `192.168.105.x` lease and `10.0.2.x` does not exist —
+pings to `10.0.2.2` will silently see nothing. Force `-netdev user` to reproduce the
+documented slirp configuration. Also, proven by an A/B control against a pre-patch
+kernel: on slirp, aarch64 never prints the `[NET] DHCP configured` line, though it does
+reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print it.
 
 **Committed architecture** (settled; revisit only with a reason):
 
@@ -63,6 +70,14 @@ move scmtest 25 → 26.
 - Never touch user memory under `RUN_QUEUE` or any IRQ-off spinlock. Use
   `validate_user_buf`/`read_user_buf`/`write_user_buf`. A re-entrant `RUN_QUEUE`
   deadlock from exactly this froze all four vCPUs once (fixed in `82d0cc3`).
+  **Trap for next time** (`26eebf0`, `handle_send`): `read_user_buf` alone does not
+  fault a lazy page in — it resolves through `virt_to_phys`, which returns `None`
+  instead of faulting, and `sys_sendto` never calls `prefault_user`, only
+  `validate_user_buf`. Swapping in `read_user_buf` on its own would have been a
+  regression (first-touch send buffers would EFAULT). Either pair it with
+  `prefault_user` (private to the syscall crate) or hoist the copy above the lock so
+  the fault happens with nothing held — the fix actually used, matching the idiom the
+  `IcmpUnbound` arm already uses.
 - **The kernel is softfloat on both arches and must stay that way.** The EL0 trap
   frame saves no vector state, so any kernel code LLVM lowers through a vector
   register lands on the interrupted thread's. Both kernel target JSONs disable the
@@ -87,8 +102,7 @@ flip back before committing:
 
 **Evidence lives outside this repo.** Run logs, screenshots, research notes and test
 harnesses are in `~/code/leandros-artifacts/notes/`. Design docs that are still
-execution-ready are in `docs/design/`. `notes/m9-af-inet-loopback/` holds the
-verified, ready-to-land patch for item 7.
+execution-ready are in `docs/design/`.
 
 **Explicitly out of scope** (all degrade gracefully or are non-fatal): XWayland,
 PipeWire/audio for COSMIC, NetworkManager, UPower, accountsservice, greetd +
@@ -106,8 +120,8 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 4 | `FB_DAMAGE_CLIPS` / primary-plane recomposite | Perf | — |
 | 5 | evdev monotonic timestamps — recorded cause refuted, ready to re-land | Bug | — |
 | 6 | Doom hangs in `malloc(16 MB)` on aarch64 | Bug | re-verify first |
-| 7 | AF_INET loopback — patch verified on both arches, ready to land | Bug | — |
-| 8 | `handle_send` copies user memory under the stack lock | Bug — kernel | — |
+| 7 | `listen()` twice returns EINVAL, deviating from Linux | Bug | — |
+| 8 | `unused variable: port` warning in `handle_close` | Cleanup | — |
 | 9 | Dead `init_main` / unreachable POSIX smoke tests | Cleanup | — |
 | 10 | Deferred / known limitations | Mixed | — |
 
@@ -290,71 +304,19 @@ syscall glue.
 sources a cross compiler, not the host one"), which touches exactly the layer blamed
 here — this may already be fixed.
 
-### 7. AF_INET loopback — patch verified on both arches, ready to land
+### 7. `listen()` twice returns EINVAL, deviating from Linux
 
-The patch is built and verified. It **compiled clean on the first release build** — no
-type or borrow errors, including the `stack_for` guard in `accept_on`/`listen_on` its
-author expected to break. One correction was needed: `write_sockaddr_in` used aligned
-`core::ptr::read`/`write` on the user-supplied `addrlen` pointer, which is UB if the
-caller passes an odd address; it now uses `read_unaligned`/`write_unaligned`, matching
-the idiom the rest of the file already uses for every user pointer. That two-line
-change is the entire delta from the original patch.
+`handle_listen` (`servers/net/src/lib.rs`) matches only `SockState::InetBound`, so a
+second `listen()` on an already-listening socket falls through to `_ => err_reply(-22)`.
+On Linux a second `listen()` succeeds and simply updates the backlog. Confirmed by
+measurement (`second_errno=22`). Low priority, but a real POSIX deviation that a server
+framework could trip on. Discovered during AF_INET loopback verification (`26eebf0`).
 
-The verified patch is at
-`~/code/leandros-artifacts/notes/m9-af-inet-loopback/af_inet_loopback_verified.patch`
-(1065 lines, `git apply --check` clean against `d4e3746`). Verified on the Linux box,
-both arches, fresh f2fs images, vfstest first, counts parsed from each test's own
-`--- <name> done ---` markers rather than the harness's line-attribution counters:
+### 8. `unused variable: port` warning in `handle_close`
 
-- `[NET] Loopback interface 127.0.0.1/8 up` on both arches.
-- `inet_loopback_tcp: PASS` on both, with `[inet] getsockname port=34709 addr_ok=1` and
-  `[inet] c2s=1 s2c=1`. **`scmtest` moves 25 → 26 subtests** — update the baseline when
-  this lands.
-- Everything else identical pre- and post-patch on both arches; the single aarch64
-  `waittest` failure is the documented `wait_on_process_group` flake (re-run five
-  times: 4 PASS, 1 FAIL).
-- Two extra branch-coverage subtests were added temporarily and then reverted:
-  `inet_inaddr_any` passed (INADDR_ANY arms a listener on **both** stacks; `accept`
-  tries the NIC stack first, finds nothing, falls through to loopback) and
-  `inet_double_listen` passed (`second_errno=22`).
-- **Unplanned but valuable**: the x86_64 harness passes no `-netdev`, and q35's default
-  NIC is e1000 which our driver ignores — so x86_64 ran with **no NIC at all**,
-  `NET_STACK` was `None`, and `inet_loopback_tcp` still passed. That is the hardest
-  case the patch was designed for, covered for free.
-
-Two corrections to what this item previously said. First, **the boot-time self-test is
-dead code, not failing**: `t_af_inet_loopback` lives in `run_posix_tests()`, called
-only from `init_server::init_main()` (`servers/init/src/lib.rs:2651`), and `init_main`
-is referenced nowhere in the kernel — the only hit outside its own file is a stale doc
-comment at `kernel/src/init.rs:4`. The real boot path loads the userspace init ELF from
-initrd, and the string "POSIX smoke tests" appears **zero** times in any serial log
-including pre-patch baselines. The patch's `servers/init` changes are therefore
-unreachable code. Second, the residual `ping 127.0.0.1` behaviour is **worse than
-described**: on a NIC-equipped guest it returns 4/4 replies, because slirp forwards the
-echo to the *host's* loopback and the host answers — so it looks like guest loopback
-ICMP works when it does not. Proven on x86_64, which has no NIC: there the same command
-gives `ping: sendto failed` ×4 while `inet_loopback_tcp` passes in the same boot.
-Off-box networking is intact (aarch64 `[NET] DHCP configured, address: 10.0.2.15`,
-`ping 10.0.2.2` 4/4).
-
-Remaining known gap: `getsockname` on an AF_INET socket that has never bound still
-returns `sa_family = 0, addrlen = 2`, because a fresh socket is `SockState::Unbound`
-which `inet_local_endpoint` does not match. Not on the tokio path.
-
-### 8. `handle_send` copies user memory under the stack lock
-
-`handle_send`'s `InetConnected` arm calls `core::ptr::copy_nonoverlapping` from user
-memory **while holding the stack spinlock**, violating the standing invariant that the
-kernel must never touch user memory under a server lock or any IRQ-off spinlock (the
-same hazard shape that once froze all four vCPUs, fixed in `82d0cc3`). This is
-**pre-existing**, not introduced by the loopback work — but the loopback patch
-rewrites that exact line (`NET_STACK.lock()` → `stack_for(lo)`) without hoisting the
-copy out, so it survives into the new code and should be fixed in the same area.
-Everything the loopback patch *adds* respects the invariant correctly:
-`write_sockaddr_in` is called only after every guard is dropped at all three call
-sites, which is itself an improvement over the old `handle_accept`, which wrote the
-peer `sockaddr` while holding `NET_STACK`. The fix is to read the user buffer into a
-kernel-side buffer before acquiring the lock, using `read_user_buf`.
+`servers/net/src/lib.rs:2423`, in `handle_close`: the `InetListening`/`InetBound`
+rework in `26eebf0` stopped using `bound_port` there. Cosmetic; a one-character `_port`
+fixes it. Left as-is deliberately so that patch could land and be reviewed verbatim.
 
 ### 9. Dead `init_main` / unreachable POSIX smoke tests
 
@@ -363,9 +325,9 @@ the kernel; the only mention outside its own file is a stale doc comment at
 `kernel/src/init.rs:4`. Everything it calls — including `run_posix_tests()` and the
 `t_af_inet_loopback` self-test — is unreachable, and "POSIX smoke tests" appears in no
 serial log. Either wire it back into the boot path or delete it, but do not leave a
-self-test that reads as coverage and provides none. **Discovered because TODO item 7
-cited that self-test as evidence** — a dead test is worse than no test, because it gets
-cited.
+self-test that reads as coverage and provides none. **Discovered because the AF_INET
+loopback work (`26eebf0`) cited that self-test as evidence** — a dead test is worse
+than no test, because it gets cited.
 
 ### 10. Deferred work and known limitations
 
