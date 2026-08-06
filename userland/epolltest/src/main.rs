@@ -174,8 +174,9 @@ pub unsafe extern "C" fn epoll_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_signalfd_signo() { failures += 1; }
     if !test_inotify_never_fires() { failures += 1; }
     if !test_proc_self_exe() { failures += 1; }
+    if !test_nested_epoll() { failures += 1; }
 
-    write_summary(8, failures);
+    write_summary(9, failures);
     puts(b"--- epolltest done ---\n\0".as_ptr());
     failures
 }
@@ -426,6 +427,84 @@ unsafe fn test_proc_self_exe() -> bool {
     write(1, b"\n".as_ptr(), 1);
 
     report(name, ok)
+}
+
+// ── 9. A nested epoll fd is readable only when its OWN interest list has a
+//    ready event ────────────────────────────────────────────────────────────
+//
+// An epoll fd registered inside another epoll is how every calloop/libevent
+// -style event loop composes reactors: wayland-backend's server `poll_fd()`
+// IS an epoll fd, and calloop puts it in its own epoll. If the outer
+// epoll_wait reports the inner one ready unconditionally, the loop returns
+// instantly forever with nothing to dispatch — a pure busy-spin that no
+// correctness test notices (the COSMIC panel spun at ~4600 dispatches/s).
+//
+// Three phases, because only the middle one passes by accident:
+//   idle  → outer must BLOCK for the full timeout and report nothing;
+//   armed → a write to the inner pipe must surface on the outer wait;
+//   drained → readiness must go away again.
+
+unsafe fn test_nested_epoll() -> bool {
+    let name = b"nested_epoll\0";
+    let mut fds = [0i32; 2];
+    if pipe2(fds.as_mut_ptr(), O_NONBLOCK) != 0 { return report(name, false); }
+    let (rfd, wfd) = (fds[0], fds[1]);
+
+    let inner = epoll_create1(0);
+    let outer = epoll_create1(0);
+    if inner < 0 || outer < 0 { return report(name, false); }
+
+    let mut ev_in = epoll_event { events: EPOLLIN, data: epoll_data { fd: rfd } };
+    let mut ev_out = epoll_event { events: EPOLLIN, data: epoll_data { fd: inner } };
+    if epoll_ctl(inner, EPOLL_CTL_ADD, rfd, &mut ev_in) != 0
+        || epoll_ctl(outer, EPOLL_CTL_ADD, inner, &mut ev_out) != 0
+    {
+        close(rfd); close(wfd); close(inner); close(outer);
+        return report(name, false);
+    }
+
+    let mut out: [epoll_event; 4] = core::mem::zeroed();
+
+    // Idle: nothing written yet, so the inner set has no ready event and the
+    // outer wait must sit out its whole timeout. The elapsed check is the
+    // point of the test — an `n == 0` that returned instantly would still be
+    // a spin.
+    let mut start: timespec = core::mem::zeroed();
+    clock_gettime(CLOCK_MONOTONIC, &mut start);
+    let n_idle = epoll_wait(outer, out.as_mut_ptr(), 4, 200);
+    let mut end: timespec = core::mem::zeroed();
+    clock_gettime(CLOCK_MONOTONIC, &mut end);
+    let idle_ms = (end.tv_sec - start.tv_sec) * 1000
+        + (end.tv_nsec - start.tv_nsec) / 1_000_000;
+    let idle_ok = n_idle == 0 && idle_ms >= 150;
+
+    // Armed: a byte on the pipe makes the inner set ready, which must make
+    // the inner epoll fd itself readable to the outer one.
+    write(wfd, b"x".as_ptr(), 1);
+    let n_armed = epoll_wait(outer, out.as_mut_ptr(), 4, 200);
+    let armed_ok = n_armed == 1
+        && out[0].events & EPOLLIN != 0
+        && { let d = out[0].data; d.fd == inner };
+
+    // Drained: readiness is recomputed from the inner list, not latched.
+    let mut drain = [0u8; 1];
+    read(rfd, drain.as_mut_ptr(), 1);
+    let n_drained = epoll_wait(outer, out.as_mut_ptr(), 4, 100);
+    let drained_ok = n_drained == 0;
+
+    close(rfd); close(wfd); close(inner); close(outer);
+
+    write(1, b"nested_epoll: idle_n=".as_ptr(), 21);
+    write_i64(1, n_idle as i64);
+    write(1, b" idle_ms=".as_ptr(), 9);
+    write_i64(1, idle_ms);
+    write(1, b" armed_n=".as_ptr(), 9);
+    write_i64(1, n_armed as i64);
+    write(1, b" drained_n=".as_ptr(), 11);
+    write_i64(1, n_drained as i64);
+    write(1, b"\n".as_ptr(), 1);
+
+    report(name, idle_ok && armed_ok && drained_ok)
 }
 
 fn ends_with(haystack: &[u8], suffix: &[u8]) -> bool {

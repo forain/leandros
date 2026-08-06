@@ -6455,6 +6455,13 @@ fn epoll_fcntl(epfd: usize, cmd: usize) -> isize {
 /// FD base for epoll instances — must not overlap VFS/TTY/net ranges.
 const EPOLL_FD_BASE: usize = 0x400;
 
+/// Maximum epoll fds traversed while computing readiness for a nested epoll
+/// (Linux's `EP_MAX_NESTS`). Bounds the recursion in `poll_fd_state_nested`,
+/// which is otherwise unbounded if an instance transitively watches itself —
+/// nothing stops `epoll_ctl(ep, ADD, ep)` here. At the limit the fd reports
+/// not-ready, which can delay an event but can never busy-spin.
+const EPOLL_MAX_NEST: u32 = 4;
+
 /// epoll_event.events flag bits (high bits, above the POLL* revent bits).
 const EPOLLET:       u32 = 0x8000_0000; // edge-triggered
 const EPOLLONESHOT:  u32 = 0x4000_0000; // fire once, then disarm until MOD
@@ -6688,11 +6695,17 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
 /// Read-only readiness check for the block-loop re-probe: like the epoll_wait
 /// probe but mutates no `last_seq` and writes no user memory, so cancelling the
 /// block and looping re-delivers the edge instead of consuming it silently.
-fn epoll_any_ready(pid: u32, slot: usize) -> bool {
+fn epoll_any_ready(pid: u32, slot: usize) -> bool { epoll_any_ready_nested(pid, slot, 0) }
+
+/// `epoll_any_ready` with the nested-epoll recursion depth threaded through.
+/// Also the readiness definition for an epoll fd watched by an OUTER epoll or
+/// poll/select (see `poll_fd_state_nested`).
+fn epoll_any_ready_nested(pid: u32, slot: usize, depth: u32) -> bool {
     for i in 0..MAX_EPOLL_INTERESTS {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
         if !interest.in_use || !interest.armed { continue; }
-        let (cur, seq) = probe_fd_events_seq(pid, interest.fd as usize, interest.events);
+        let (cur, seq) =
+            probe_fd_events_seq_nested(pid, interest.fd as usize, interest.events, depth);
         let et = interest.events & EPOLLET != 0;
         let fire = cur != 0 && (!et || match seq {
             Some(s) => s != interest.last_seq,
@@ -6827,7 +6840,12 @@ fn select_any_ready(pid: u32, nfds: usize, rfds: usize, wfds: usize,
 /// (VFS for fd < `net_server::SOCK_FD_BASE`, net otherwise) or, for fd 0-2,
 /// the same evdev/serial/always-writable checks the console already used.
 /// Returns the fd's true POLLIN/POLLOUT/POLLERR/POLLHUP/POLLNVAL state.
-fn poll_fd_state(pid: u32, fd: usize) -> u32 {
+fn poll_fd_state(pid: u32, fd: usize) -> u32 { poll_fd_state_nested(pid, fd, 0) }
+
+/// `poll_fd_state` with the nested-epoll recursion depth threaded through.
+/// `depth` is 0 for a poll/select/epoll_wait interest named directly by
+/// userspace, and one higher for each epoll fd traversed to reach it.
+fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
     const POLLIN:   u32 = 0x0001;
     const POLLOUT:  u32 = 0x0004;
     const POLLNVAL: u32 = 0x0020;
@@ -6851,6 +6869,33 @@ fn poll_fd_state(pid: u32, fd: usize) -> u32 {
             POLLOUT
         };
     }
+    // A nested epoll fd is itself pollable, and Linux reports it readable
+    // exactly when its OWN interest list has at least one ready event (never
+    // writable). Without this case the fd falls through to the socket branch
+    // below — EPOLL_FD_BASE (0x400) is above SOCK_FD_BASE (0x100) — NET_POLL
+    // rejects it as not-a-socket, and probe_fd_events passes the resulting
+    // POLLNVAL through unconditionally, so the interest fires on EVERY pass.
+    // Any event loop that nests one reactor inside another then busy-spins
+    // with nothing to do: calloop wrapping wayland-backend's own epoll (its
+    // `poll_fd()` IS an epoll fd) returned from `dispatch(100ms)` ~4600×/s in
+    // the COSMIC panel.
+    if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&fd) {
+        let slot = match epoll_slot_of(fd) { Some(s) => s, None => return POLLNVAL };
+        {
+            // Scoped: the lock must be dropped before the recursive probe —
+            // epoll_any_ready_nested re-takes it per interest (invariant
+            // 82d0cc3: never hold a spinlock across a server call).
+            let ep = EPOLL_INSTANCES.lock();
+            if !ep[slot].in_use || sched::tgid_of(ep[slot].owner_pid) != sched::tgid_of(pid) {
+                return POLLNVAL;
+            }
+        }
+        // Depth-bounded like Linux's EP_MAX_NESTS: an epoll instance that
+        // (transitively) watches itself would otherwise recurse forever.
+        // Reporting not-ready at the limit can only delay an event, never spin.
+        if depth >= EPOLL_MAX_NEST { return 0; }
+        return if epoll_any_ready_nested(pid, slot, depth + 1) { POLLIN } else { 0 };
+    }
     if fd >= net_server::SOCK_FD_BASE {
         let msg = make_vfs_msg(net_server::NET_POLL, &[fd as u64]);
         let r = net_reply_val(&net_server::handle(&msg, pid));
@@ -6866,10 +6911,15 @@ fn poll_fd_state(pid: u32, fd: usize) -> u32 {
 /// `epoll_wait(2)` report those unconditionally regardless of the requested
 /// event mask.
 fn probe_fd_events(pid: u32, fd: usize, requested: u32) -> u32 {
+    probe_fd_events_nested(pid, fd, requested, 0)
+}
+
+/// `probe_fd_events` with the nested-epoll recursion depth threaded through.
+fn probe_fd_events_nested(pid: u32, fd: usize, requested: u32, depth: u32) -> u32 {
     const POLLERR:  u32 = 0x0008;
     const POLLHUP:  u32 = 0x0010;
     const POLLNVAL: u32 = 0x0020;
-    let state = poll_fd_state(pid, fd);
+    let state = poll_fd_state_nested(pid, fd, depth);
     (state & requested) | (state & (POLLERR | POLLHUP | POLLNVAL))
 }
 
@@ -6880,10 +6930,24 @@ fn probe_fd_events(pid: u32, fd: usize, requested: u32) -> u32 {
 /// 0-2), so the caller must treat it level-triggered. The revents masking
 /// matches `probe_fd_events` exactly.
 fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>) {
+    probe_fd_events_seq_nested(pid, fd, requested, 0)
+}
+
+/// `probe_fd_events_seq` with the nested-epoll recursion depth threaded through.
+fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
+    -> (u32, Option<u64>)
+{
     const POLLERR:  u32 = 0x0008;
     const POLLHUP:  u32 = 0x0010;
     const POLLNVAL: u32 = 0x0020;
 
+    // A nested epoll fd has no edge source of its own, so it stays
+    // level-triggered (None) — its readiness is recomputed from its interest
+    // list on every probe. Checked before the console/socket routing below
+    // because EPOLL_FD_BASE sits inside the "not a VFS fd" range.
+    if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&fd) {
+        return (probe_fd_events_nested(pid, fd, requested, depth), None);
+    }
     // fd 0-2 and console stdio proxies (/dev/tty, dup'd stdin — VFS DevStdio
     // vnodes) have no edge source and stay level-triggered (None): VFS
     // handle_poll reports DevStdio never-ready, so routing them to VFS_POLL
