@@ -3,7 +3,9 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-06** (`26eebf0`).
+Last reconciled against `main` on **2026-08-06** (`26eebf0`); item 4 and the item 10
+Mesa-modifier bullet updated the same day with a source-analysis wave over smithay
+`efeb597` and the kernel DRM property/blob path.
 
 ---
 
@@ -100,6 +102,11 @@ flip back before committing:
 | `CURSOR_DEBUG` | `drivers/src/virtio_gpu.rs:342` | cursor queue setup + selftest |
 | `mm::gap2::ON` | `mm/src/gap2.rs:17` | memfd/MAP_SHARED path + frame checksum sampler |
 
+**`RUST_LOG=trace` cannot read smithay's own damage-tracking decisions.**
+`cosmic-comp/Cargo.toml:61-62` sets `release_max_level_info` on `tracing`, so `trace!`
+calls are compiled out of the release build and the feature ceiling cannot be raised
+additively. Kernel-side counters are the only instrument.
+
 **Evidence lives outside this repo.** Run logs, screenshots, research notes and test
 harnesses are in `~/code/leandros-artifacts/notes/`. Design docs that are still
 execution-ready are in `docs/design/`.
@@ -117,7 +124,7 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 1 | Venus/virgl — working on both arches; vkcube is the next milestone | Feature | — |
 | 2 | memfd burns a tmpfs slot per call | Bug — latent DoS | — |
 | 3 | `wl_display error 0 "Unknown id: 636"` | Bug | re-measure post-fix |
-| 4 | `FB_DAMAGE_CLIPS` / primary-plane recomposite | Perf | — |
+| 4 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
 | 5 | evdev monotonic timestamps — recorded cause refuted, ready to re-land | Bug | — |
 | 6 | Doom hangs in `malloc(16 MB)` on aarch64 | Bug | re-verify first |
 | 7 | `listen()` twice returns EINVAL, deviating from Linux | Bug | — |
@@ -201,16 +208,83 @@ is the same bug is void. On the current kernel, scmtest's `fd_pass`, `cmsg_flags
 arches — evidence *for* the AF_UNIX SCM_RIGHTS path being healthy, so if 636 still
 reproduces, look elsewhere first.
 
-### 4. `FB_DAMAGE_CLIPS` / primary-plane recomposite
+### 4. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
 
-The cursor plane landed and moved pointer motion from **0.9 → 6.0 page flips/s**, with
-the cursor image uploaded exactly once and zero pixel traffic per move. But the honest
-caveat from that measurement is `flips/s == atomic/s == cursor_mv/s`: smithay still
-flips the **primary** plane on every cursor frame. The end state
-(`compositor/mod.rs:2318` "skipping primary plane, no damage") was not reached.
+**What we already have, measured.** The property is fully plumbed, not merely
+advertised: `PROP_FB_DAMAGE_CLIPS = 51` as `PropKind::Blob` in `PROPS`
+(`drivers/src/drm_device_interface.rs:164`) and `PLANE_COMMON` (`:219`), correctly
+omitted from `CURSOR_PLANE`; `CREATEPROPBLOB` (`:2258`), `DESTROYPROPBLOB` (`:2275`) and
+`GETPROPBLOB` (`:2286`) are all implemented over a `BLOBS` map (`:1148`); and the atomic
+path already reads the value into `AtomicPlaneReq::damage_blob` (`:2414`). We simply
+never act on it — the present path calls `handle_flip_page` unconditionally, doing a
+full-surface scale plus a full-screen `gpu.flush`.
 
-This is the remaining pointer-latency win, and it is on the primary plane, not the
-cursor. `FB_DAMAGE_CLIPS` is already advertised in the plane property table.
+**The item's premise was not established by its own evidence.** `flips/s == atomic/s ==
+cursor_mv/s` is a **tautology of our kernel's counter**, not an observation about
+smithay. smithay keeps a skipped plane in the request (`compositor/mod.rs:804`,
+`!state.skip || state.config.is_some()`) and the skip branch clones the previous frame's
+config verbatim, so `FB_ID` is re-sent either way; our handler counts a flip for any
+commit naming a nonzero primary `FB_ID`. The counter reads identically whether smithay
+skipped or repainted.
+
+**Kernel-side `FB_DAMAGE_CLIPS` cannot make smithay skip.** The decision is made
+entirely inside `OutputDamageTracker` at `compositor/mod.rs:2306-2320`, *before* the
+property is written to the kernel at `surface/atomic.rs:1278-1284`, and there is no
+feedback path from the driver back into the damage tracker (smithay pin `efeb597`, per
+`cosmic-comp/Cargo.lock:4816`). Two other candidate causes are also ruled out from
+source: a missing plane capability or fallback path is excluded because `cursor_mv =
+6.0/s` with one total cursor upload proves `try_assign_cursor_plane` succeeded, which
+already requires ATOMIC, universal planes, size caps, gbm and a passing `TEST_ONLY`; and
+cursor-overlaps-primary is excluded because a cursor element assigned to the cursor
+plane is never pushed into `primary_plane_elements`.
+
+To reach the skip, all of: the primary buffer is a swapchain slot; no direct scanout
+last frame; and `render_output` returned `skipped()`, which needs both no element
+instance/commit/z-order change **and** `age > 0 && last_state.old_damage.len() >= age` —
+otherwise smithay clears the damage and pushes the whole output geometry
+(`renderer/damage/mod.rs:741-759`). **Inferred, well-supported:** we fail that third
+condition. 6.0 frames/s at 1280x800 on softpipe is ~160 ms/frame, the cost signature of
+a real full-screen recomposite; a skipped primary costs nothing and the loop would run
+near the flip-delivery ceiling.
+
+**Why the work is still worth doing, for a different reason than this item used to
+state.** The blob smithay hands us *is* the damage tracker's output, so decoding it
+turns an unanswerable client-side question into a kernel-side measurement with no COSMIC
+rebuild. And there is a real kernel defect underneath: **when smithay does skip the
+primary, we currently do a full-screen scale plus full-screen `TRANSFER_TO_HOST` and
+`RESOURCE_FLUSH` anyway** — which would cancel the win even once the client side is
+fixed. Direct perf value of the property alone is small (~1.7 ms/flip x 6 flips/s, about
+1% CPU).
+
+**A prepared patch** (357 lines, **unbuilt**, `drivers/` only) is at
+`~/code/leandros-artifacts/notes/m9-fb-damage-clips/fb_damage_clips.patch`, verified to
+`git apply --check` cleanly at `a9621b0`. It adds `DrmDevice::present_damaged` (clamped
+rects mapped with the same nearest-neighbour arithmetic `perform_software_scaling` uses,
+one flush over the bounding union), `DAMAGE_{FULL,RECT,SKIP,PX}` and `BLOBS_CREATED`
+counters on the `DRMSTAT` line, a `damage_rects` blob decoder that returns `None` (=
+assume full damage) for any unusable blob rather than erroring — rejecting a commit over
+a hint would stall the compositor — and a Skip/Rects/Full dispatch where Skip fires only
+on smithay's verbatim-config replay. **Two behaviour changes to know about:**
+`FLIPS_SUBMITTED` will count presents that moved pixels rather than atomic commits, so
+any harness asserting `flips == atomic` will now "fail" by design; and `present_damaged`
+updates only `plane.fb_id`, relying on a preceding full present for geometry, which is
+guaranteed since modesets always take the Full path.
+
+**Verification is diagnostic-first.** Gate on aarch64 (HVF, the recorded 6.0 baseline is
+aarch64 at 1280x800), 60 pointer moves/s, >=60 s of motion, `DRM_STATS` on. Sanity check:
+`dmg_full + dmg_rect + dmg_skip` must equal `atomic`. Then read `dmg_px / dmg_rect`
+against 1280x800 = 1,024,000 px (`0xFA000`, counters print in hex): near-full means the
+compositor damages the whole output every frame and **the blocker is client-side — stop,
+no further kernel work moves flips/s**; under ~5% means damage tracking works and the
+perf pass criterion is `flips/s <= 2.0` while `cursor_mv/s >= 6.0`. Three controls are
+mandatory: an `evpush` guest-side counter climbing at ~60/s (QMP accepting a move does
+not prove it reached the guest ring), `cursor_mv/s` must not fall relative to pre-patch
+(`flips/s -> 0` with `cursor_mv/s -> 0` is a dead pointer, not a win — revert on that
+signature), and a stale-pixel check, since damage-bounded present makes a tracking error
+show up as stale pixels rather than a crash: let the panel clock run >=60 s, take two
+screendumps >=2 s apart and confirm the digits differ, then force one full present and
+confirm it is pixel-identical. Note the cursor will not appear in `screendump` now that
+it is on the hardware plane. Plus `drmsmoke` 22/0 both arches and `idletest`.
 
 ### 5. evdev monotonic timestamps — recorded cause refuted, ready to re-land
 
@@ -331,9 +405,14 @@ than no test, because it gets cited.
 
 ### 10. Deferred work and known limitations
 
-- **Mesa modifier support.** Our GBM has no `gbm_bo_create_with_modifiers2` path, so
-  smithay cannot build a reusing swapchain and reallocates per frame; this once burned
-  128 dmabuf fds in ~1 s. `MAX_FDS` was raised 64→128 to absorb it. Revisit with
+- **Mesa modifier support — needs re-verification.** The claim that our GBM lacking
+  `gbm_bo_create_with_modifiers2` means smithay cannot build a reusing swapchain and
+  reallocates per frame was **not confirmed against smithay's source**, and may be
+  wrong: at the pinned revision, `allocator/swapchain.rs:158-178` caches slots and only
+  allocates when `buffer.is_none()`, and `allocator/gbm.rs:204-219` has a documented
+  fallback for Invalid/Linear modifiers in `create_buffer_object`. The per-frame-
+  reallocation conclusion is unverified; the 128-dmabuf-fd burn in ~1 s and the
+  `MAX_FDS` 64→128 raise are separately observed facts and still stand. Revisit with
   PRIME/linux-dmabuf.
 - **llvmpipe** — the TCG-performance lever, staged but not landed. softpipe was chosen
   for correctness (portable C, no per-arch LLVM codegen bring-up ×2).
