@@ -47,7 +47,16 @@ Standing context), `scmtest` 26/0 → 28/0, and a clean aarch64 A/B against pris
 `420adf7` showing the `smithay-clipboard` OutOfMemory panic present on the old kernel
 and absent on the new one. A new item was split out of that verification for a
 pre-existing, unrelated defect the double-release audit surfaced: `import_fd`
-double-releases on EMFILE. Former items 6-12 shifted down to 5-11.
+double-releases on EMFILE. Former items 6-12 shifted down to 5-11. Same day, an eighth
+wave escalated the former item 4: a source-analysis pass over both EMFILE arms and
+`release_vnode`'s five fd kinds found the double release is not cosmetic — it lands on
+a live reference every time (the sender's fd is never revoked by `export_fd`) and
+three of five kinds free live kernel state out from under an open fd
+(`DynamicDevice` open-id reuse, `EventFd`/`TimerFd` free-slot-sentinel aliasing),
+making it use-after-free class rather than a leak. Retitled, given a prepared fix and
+regression subtest (`~/code/leandros-artifacts/notes/m9-import-fd-emfile/import_fd_emfile.patch`,
+`scmtest` 28/0 → 29/0), and promoted to item 1 ahead of the Venus items. Former items
+1-3 shifted down to 2-4; items 5-11 unchanged.
 
 ---
 
@@ -194,10 +203,10 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 
 | # | Item | Category | Blocked on |
 |---|---|---|---|
-| 1 | Venus works; M3 is a render + readback test, not vkcube | Feature | — |
-| 2 | `PRIME_HANDLE_TO_FD` rejects Venus blob handles | Bug | — |
-| 3 | `driver.py` has no GL path at all | Bug | confirming screendump under egl-headless |
-| 4 | `import_fd` double-releases on EMFILE | Bug — kernel | — |
+| 1 | `import_fd` double-releases on EMFILE — use-after-free class | Bug — kernel | — |
+| 2 | Venus works; M3 is a render + readback test, not vkcube | Feature | — |
+| 3 | `PRIME_HANDLE_TO_FD` rejects Venus blob handles | Bug | — |
+| 4 | `driver.py` has no GL path at all | Bug | confirming screendump under egl-headless |
 | 5 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
 | 6 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
 | 7 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
@@ -208,7 +217,93 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 
 ---
 
-### 1. Venus works; M3 is a render + readback test, not vkcube
+### 1. `import_fd` double-releases on EMFILE — use-after-free class
+
+**Confirmed at the source.** Both EMFILE arms of `import_fd`
+(`servers/vfs/src/lib.rs:3722` and `:3725`) run `tmp_inflight_dec(&kind);
+release_vnode(kind, pid); return -24;` — byte-for-byte what `drop_transfer` does
+(`:3757-3758`). Meanwhile `servers/net/src/lib.rs:2144` sets `fit = i` (not `i+1`), so
+the overflow loop at `:2151` re-drops `fds[i]`. One `export_fd` (`:3704`
+`pipe_ref_inc`, `:3710` `tmp_inflight_inc`) is balanced by **two** releases.
+`import_fd` has exactly one caller repo-wide.
+
+**Two corrections to the earlier description.** `export_fd` does *not* lift the entry
+out of the sender's table (`:3694-3711` only copies `kind`/`flags`), so the sender
+keeps its fd open and **the extra release always lands on a live reference**. And it
+needs no large batch: with `nfds == 1`, `fit` is 1, the import fails at `i = 0`, and
+`for j in 0..1` re-drops that one descriptor.
+
+**Severity, inferred from the release paths: three of five kinds are use-after-free
+class.** `release_vnode` (`:3789-3817`) is not saturating in any way that helps — only
+the counters saturate, and saturating at 0 is the corruption.
+- **`DynamicDevice` — worst.** `device_close` twice takes refs 2→1→0, sets
+  `DEVICE_OPEN_CLOSING`, sends `VFS_CLOSE` to the device server and frees the slot
+  (`:1329-1346`). The sender's still-open fd then names an `open_id` whose server-side
+  state is destroyed, and `device_open_alloc` (`:1299`) hands that id to the next open
+  of *any* dynamic device — cross-process open-id aliasing, with the stale fd's ioctls
+  landing on someone else's open. This is the DRM render node / dmabuf / evdev path,
+  exactly what a Wayland session passes.
+- **`EventFd` — severe.** refs 2→1→0 sets `EVENTFD_COUNTERS[slot] = u64::MAX`
+  (`:3799-3804`), which **is the free-slot sentinel**: `handle_eventfd:4642` allocates
+  via `position(|&v| v == u64::MAX)`, so with lower slots in use it deterministically
+  re-hands out this one. Two unrelated processes then share a counter — verbatim the
+  calloop aliasing bug the comment at `:3796-3798` exists to prevent.
+- **`TimerFd` — severe**, same shape (`:3806-3809`).
+- **`Pipe` — severe.** `writers`/`readers` saturating_sub twice (`:1060-1074`) drops
+  the count to 0 under a live fd, so the peer sees spurious EOF/POLLHUP/EPIPE; if both
+  sides reach 0 the ring resets and `handle_pipe:3576` reallocates the slot, after
+  which the surviving fd's close decrements an unrelated pipe.
+- **`TmpFile` — moderate, conditional.** The second `tmp_release_ephemeral` no-ops on
+  its `in_use` guard, but the second `tmp_inflight_dec` does not: with another SCM
+  transfer of the same slot in flight, `TMP_INFLIGHT[idx]` goes 2→0 and that other
+  transfer loses its protection, reopening the use-after-free `77f170d` just closed.
+- `MountedFile` and the rest: only `release_locks`; cosmetic.
+
+**Collateral defect in the same two lines:** `release_vnode(tf.kind, pid)` passes the
+**receiver's** pid, so `release_locks` (`:3920`) drops advisory locks the receiver
+holds on that vnode through unrelated fds of its own — for a descriptor it never took
+delivery of. `drop_transfer` correctly passes 0. The fix removes this for free.
+
+**Reachable in normal operation.** `MAX_FDS = 128` with `alloc_fd` skipping 0-2 gives
+125 usable, and the trigger is only "the receiver's table is full at the instant any
+SCM_RIGHTS fd arrives" — one fd suffices. The deferred-limitations item already
+records **128 dmabuf fds burned in ~1 s**, which is cosmic-comp at the ceiling while
+Mesa and clients keep passing fds; the kind arriving in that window is
+`DynamicDevice` or `TmpFile`, the two worst rows. It is not triggerable on demand
+today only because nothing measures it. **`scmtest`'s `queued_fd_cap` does not and
+cannot cover this** — it is purely sender-side (`userland/scmtest/src/main.rs:1639-1664`),
+loops `send_fd_and_byte` and never calls `recvmsg`, so `import_fd` is never reached.
+
+**Fix prepared** at
+`~/code/leandros-artifacts/notes/m9-import-fd-emfile/import_fd_emfile.patch` (122
+insertions, 5 deletions, 3 files; `git apply --check`-clean and round-trip verified at
+`b7fb326`, and confirmed to stack with `m9-small-fixes/small_fixes.patch` in **either**
+order with identical resulting trees). **`import_fd` now releases nothing on
+failure**, making the caller sole owner of cleanup, so the rule states in one
+sentence: *a `TransferFd` is consumed only on success; exactly one of `import_fd`
+returning an fd or `drop_transfer` balances each `export_fd`, and on a negative return
+the descriptor is still the caller's to retire.* That rule is written into
+`import_fd`'s doc comment, with a matching note at `servers/net/src/lib.rs:2144`
+explaining that `fit = i` is deliberate and must not be "corrected" to `i + 1`. The
+alternative — having the caller skip index *i* — was rejected because it leaves "who
+owns the failed one" a fact you must read two files to learn. Code delta is 2 lines;
+the rest is comments and the subtest.
+
+**Regression subtest** `scm_import_emfile_single_release`, single process, no fork:
+`pipe2(O_NONBLOCK)`, read the empty ring as a control (must be `-1/EAGAIN`, proving
+the final assertion can discriminate at all), send the *write* end over a socketpair
+so `writers = 2`, `dup()` until EMFILE, `recvmsg`, close the dups, then re-read the
+still-empty pipe. The process never closed `wr`, so it must still be `-1/EAGAIN`; the
+double release drives `writers` to 0 and it reads `0` (EOF). Socket fds live above
+`SOCK_FD_BASE` and are not in the fd table, so the socketpair survives exhaustion.
+**Proving it fails without the fix is free — HEAD is the backed-out state**, so
+building `scmtest` from the patch against an unpatched kernel must FAIL and against
+the patched kernel must PASS. Failing signature: `[emfile] post ret=0 errno=0` where
+`pre` read `-1/11`; if *both* read `0/0` the test is broken rather than the kernel.
+**`scmtest` 28/0 → 29/0** (30/0 if the small-fixes patch also lands; the two are
+additive).
+
+### 2. Venus works; M3 is a render + readback test, not vkcube
 
 **Measured**, on the Linux box (`forain@172.16.158.150`, EndeavourOS, virglrenderer
 1.3.0, QEMU 11.0.1 — already installed, nothing to add; it is **Arch, not Debian**, so
@@ -304,7 +399,7 @@ current HEAD — popping it would revert `4085b7f` (nested-epoll readiness). Re-
 instead. A raw copy of that stash also exists at
 `/home/forain/linux-tree-preexisting.patch` on the box.
 
-### 2. `PRIME_HANDLE_TO_FD` rejects Venus blob handles
+### 3. `PRIME_HANDLE_TO_FD` rejects Venus blob handles
 
 `kernel/src/syscall.rs:6049` resolves handles only through `dumb_buffer_phys_order`,
 returning EINVAL for any Venus blob, which blocks `vkGetMemoryFdKHR` and therefore
@@ -316,7 +411,7 @@ rendering. Also note the connector's missing `DPMS` property, which fails
 `VK_KHR_display` enumeration outright, and that `AUTH_MAGIC` returning `Ok(0)` with no
 master gating on `SETCRTC` lets a direct-KMS client fight cosmic-comp for the CRTC.
 
-### 3. `driver.py` has no GL path at all
+### 4. `driver.py` has no GL path at all
 
 `.claude/skills/run-leandros/driver.py:_build_cmd` hardcodes its own QEMU command line
 and never calls `run-qemu.sh`: plain `-device virtio-gpu-pci` on aarch64 (not even
@@ -326,19 +421,6 @@ not reach it. Adding a `venus=True` mode is strictly larger than the flag —
 `-display none` must become `egl-headless`, and it is unknown whether the monitor
 `screendump` capture the whole skill depends on still works under `egl-headless`. That
 one question gates both this and M3's scanout step.
-
-### 4. `import_fd` double-releases on EMFILE
-
-Found during the memfd/TGID verification (`77f170d`, formerly items 4 and 5),
-pre-existing and untouched by that commit. `servers/net/src/lib.rs:2140-2151`: when
-`import_fd` hits EMFILE at index *i*, it has already released `fds[i]` internally
-before returning the error, but the caller's overflow loop `for j in fit..nfds` then
-`drop_transfer`s `fds[i]` a second time — a double `release_vnode` on the same vnode.
-`77f170d`'s `saturating_sub` on `TMP_INFLIGHT` keeps this from underflowing that
-counter, so it is not made worse, but it is not fixed either. Deliberately left out of
-`77f170d` to keep that commit scoped to the memfd/TGID fix. No repro harness yet — needs
-an SCM_RIGHTS transfer sized to exceed the receiver's remaining fd-table capacity by
-more than one fd.
 
 ### 5. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
 
