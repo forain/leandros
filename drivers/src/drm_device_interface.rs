@@ -3147,13 +3147,22 @@ impl DrmDeviceInterface {
     /// Both halves are done here now — see "THE FENCE MODEL" on `BlobBuf` for
     /// what that does and does not change while submission is synchronous.
     ///
+    /// Also honoured, since the SIMULATE_SYNCOBJ fix: a **fence-only** request,
+    /// i.e. `command == 0 && size == 0`. See the block comment on the check
+    /// below for why that is a legitimate request and not a malformed one.
+    ///
+    /// `fence_fd` with FENCE_FD_OUT is honoured too, but NOT here — the out-fence
+    /// fd is minted by `kernel/src/syscall.rs::sys_ioctl`, which is the only
+    /// layer that has the caller's fd table (same split as PRIME_HANDLE_TO_FD).
+    /// This function is deliberately unaware of it; all it has to guarantee is
+    /// that a fence-only request is *not* refused.
+    ///
     /// NOT honoured, and reported once per distinct shape rather than dropped in
     /// silence:
-    ///   * `fence_fd` with FENCE_FD_IN/OUT — sync_file import/export needs an
-    ///     fd-backed fence object, which means a new fd kind allocated by the
-    ///     VFS and handed back through the ioctl; the driver layer has no
-    ///     channel to create one. Unlike `bo_handles`, this is not blocked on
-    ///     fence state — it is blocked on fd plumbing.
+    ///   * `fence_fd` with FENCE_FD_IN — sync_file *import* needs the fd to be
+    ///     resolved back to a fence object and waited on before submission. The
+    ///     driver layer has no channel to read the caller's fd table, and unlike
+    ///     the OUT direction there is no signalled-by-construction shortcut.
     ///   * `in_syncobjs` / `out_syncobjs` / `syncobj_stride` — same.
     ///   * any flag outside VIRTGPU_EXECBUF_FLAGS_KNOWN. Upstream answers EINVAL
     ///     for those; we deliberately do not, because refusing a flag from a
@@ -3163,7 +3172,25 @@ impl DrmDeviceInterface {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         // Read the request out of user memory BEFORE any device lock is taken.
         let exec = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_execbuffer) };
-        if exec.command == 0 || exec.size == 0 {
+        // A FENCE-ONLY submission: no command stream, just "give me a fence for
+        // everything submitted so far". Mesa's venus backend issues exactly this
+        // once per process from `sim_syncobj_create` (vn_renderer_virtgpu.c:145),
+        // with `flags = RING_IDX | FENCE_FD_OUT` and every other field zero, and
+        // treats a failure as "syncobj simulation unavailable" — which disables
+        // every `vn_renderer_sync`, and with it the ring-teardown submit in
+        // `vn_ring_destroy`. Refusing it is therefore not a safe conservative
+        // choice; it silently leaks a host-side ring per Venus instance.
+        //
+        // It is also exactly answerable here: `submit` busy-spins on the used
+        // ring (virtio_gpu.rs), so every earlier submission on this open is
+        // already retired by the time any ioctl returns. A fence over an empty
+        // stream is a no-op whose result is "already signalled", which is the
+        // truth rather than an approximation.
+        //
+        // Only BOTH-zero is a fence-only request. `size` without `command`, or
+        // `command` without `size`, stays malformed and stays refused.
+        let fence_only = exec.command == 0 && exec.size == 0;
+        if !fence_only && (exec.command == 0 || exec.size == 0) {
             return Err(DriverError::InvalidParameter);
         }
         const MAX_CMD_BYTES: usize = 4 << 20;
@@ -3259,8 +3286,13 @@ impl DrmDeviceInterface {
         // packs: which unhandled fields were non-zero, and which flag bits were
         // set, so two different divergences never collapse into one report.
         let unknown_flags = exec.flags & !VIRTGPU_EXECBUF_FLAGS_KNOWN;
-        let ignored_fence_fd = exec.flags & (VIRTGPU_EXECBUF_FENCE_FD_IN | VIRTGPU_EXECBUF_FENCE_FD_OUT) != 0
-            || exec.fence_fd != 0;
+        // FENCE_FD_OUT is no longer in this list: `sys_ioctl` mints a signalled
+        // eventfd and writes it into `fence_fd` on the way back out, so claiming
+        // it is unhonoured would be a false report. FENCE_FD_IN is still ignored,
+        // and so is a non-zero incoming `fence_fd` that nothing asked us to
+        // consume — both mean the caller expected an in-fence wait we do not do.
+        let ignored_fence_fd = exec.flags & VIRTGPU_EXECBUF_FENCE_FD_IN != 0
+            || (exec.flags & VIRTGPU_EXECBUF_FENCE_FD_OUT == 0 && exec.fence_fd != 0);
         let ignored_syncobj = exec.num_in_syncobjs != 0 || exec.num_out_syncobjs != 0
             || exec.in_syncobjs != 0 || exec.out_syncobjs != 0;
         if ignored_fence_fd || ignored_syncobj || unknown_flags != 0 {
@@ -3287,6 +3319,18 @@ impl DrmDeviceInterface {
                 crate::pci::serial_debug_hex(exec.flags);
                 crate::pci::serial_debug(" (reported once per shape)\n");
             }
+        }
+
+        // A fence-only request submits nothing. Returning here — rather than
+        // handing `submit_3d` an empty slice, which it refuses — is the point:
+        // there is no stream to execute and no new fence to mint, because every
+        // earlier submission on this open has already retired. Deliberately NOT
+        // touching `ctx_record_fence`: recording a fence id that was never sent
+        // to the host would make a later WAIT report on a submission that does
+        // not exist. `bo_handles` was still validated above, so a fence-only
+        // request naming a bogus BO is still refused, exactly as a real one is.
+        if fence_only {
+            return Ok(0);
         }
 
         // Copy the stream into kernel memory while no spinlock is held: touching

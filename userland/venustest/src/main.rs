@@ -202,6 +202,17 @@ struct DrmVirtgpu3dWait {
 
 type pid_t = i32;
 
+/// `struct pollfd`.
+#[repr(C)]
+pub struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
+
+const POLLIN: i16 = 0x0001;
+const F_DUPFD_CLOEXEC: c_int = 1030;
+
 extern "C" {
     pub fn relibc_start_v1(
         sp: *const c_void,
@@ -218,6 +229,13 @@ extern "C" {
     pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     pub fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int,
                 fd: c_int, offset: i64) -> *mut c_void;
+
+    // Phase 7 (SIMULATE_SYNCOBJ) only. `poll` and `fcntl(F_DUPFD_CLOEXEC)` are
+    // there because they are *exactly* what Mesa does with an out-fence fd
+    // (`sim_syncobj_poll`, `os_dupfd_cloexec`) — the subtests assert the fd is
+    // usable the way its only consumer uses it, not merely that it is a number.
+    pub fn poll(fds: *mut PollFd, nfds: u64, timeout: c_int) -> c_int;
+    pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
 
     // Used only by phase 2 (multi-fd context isolation); same relibc-linked
     // idiom as forktest/polltest (fork/waitpid, dup) rather than raw syscalls.
@@ -602,6 +620,276 @@ unsafe fn exec_with_bos(fd: c_int, handles: &[u32]) -> c_int {
         out_syncobjs: 0,
     };
     ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut exec as *mut _)
+}
+
+// ── Phase 7 helpers: SIMULATE_SYNCOBJ / out-fence fd ─────────────────────────
+
+const EXECBUF_FENCE_FD_OUT: u32 = 0x02;
+const EXECBUF_RING_IDX: u32 = 0x04;
+
+/// A sentinel no kernel can legitimately write into `fence_fd`, used to prove
+/// "the kernel touched this field" as distinct from "the field happened to hold
+/// an acceptable value".
+const FENCE_FD_SENTINEL: i32 = -424_242;
+
+/// An execbuffer request with everything at Mesa's designated-initialiser zero
+/// except what the caller names. `fence_fd` starts at `fence_fd_seed` — the whole
+/// point of several subtests is what that field holds on the way back out.
+unsafe fn exec_req(
+    flags: u32,
+    cmd: &[u32],
+    bos: &[u32],
+    fence_fd_seed: i32,
+) -> DrmVirtgpuExecbuffer {
+    DrmVirtgpuExecbuffer {
+        flags,
+        size: (cmd.len() * 4) as u32,
+        command: if cmd.is_empty() { 0 } else { cmd.as_ptr() as u64 },
+        bo_handles: if bos.is_empty() { 0 } else { bos.as_ptr() as u64 },
+        num_bo_handles: bos.len() as u32,
+        fence_fd: fence_fd_seed,
+        ring_idx: 0,
+        syncobj_stride: 0,
+        num_in_syncobjs: 0,
+        num_out_syncobjs: 0,
+        in_syncobjs: 0,
+        out_syncobjs: 0,
+    }
+}
+
+/// Is `fd` readable right now, without blocking? This is *precisely*
+/// `sim_syncobj_poll` (vn_renderer_virtgpu.c:218): `poll(POLLIN)`, nothing else.
+/// Mesa never `read`s a fence fd, so "signalled" means exactly this.
+unsafe fn poll_in_ready(fd: c_int) -> bool {
+    let mut p = PollFd { fd, events: POLLIN, revents: 0 };
+    poll(&mut p as *mut PollFd, 1, 0) == 1 && (p.revents & POLLIN) != 0
+}
+
+/// SIMULATE_SYNCOBJ: the out-fence fd Mesa's venus backend demands.
+///
+/// WHY THIS PHASE EXISTS, AND WHAT EACH SUBTEST WOULD CATCH.
+///
+/// Mesa 25.3.6 compiles SIMULATE_SYNCOBJ/SIMULATE_SUBMIT unconditionally. Two
+/// code paths matter and they are coupled:
+///
+///   * `sim_syncobj_create` (:145) probes once per process with a zero-size,
+///     zero-command execbuffer carrying FENCE_FD_OUT, and requires `ret == 0 &&
+///     fence_fd >= 0`. A kernel that refuses it disables every
+///     `vn_renderer_sync`, which is how `vn_ring_destroy`'s ring-teardown
+///     submit gets skipped — a host-side ring leaked per Venus instance.
+///   * `sim_submit` (:517) sets FENCE_FD_OUT whenever `batch->sync_count != 0`
+///     and then unconditionally `close(args.fence_fd)`. `args` is a designated
+///     initialiser, so an unwritten `fence_fd` is **0**: `close(0)` — the
+///     process's stdin. That path is reachable only once the probe succeeds, so
+///     the two halves must be right together or not at all.
+///
+/// EVERY SUBTEST BELOW IS ONE OF TWO KINDS, AND THEY ARE LABELLED:
+///
+///   [GUARD]      fails against a kernel without this fix. The hazard window is
+///                open on such a kernel — it refuses the probe outright and
+///                never writes `fence_fd` on any path — so these cannot pass
+///                vacuously.
+///   [NON-REGR]   passes on both. Present to pin behaviour the fix must NOT
+///                change (no fd when none was asked for; malformed requests
+///                still refused). Not a guard, and not counted as one.
+///
+/// WHY THE REAL-SUBMIT SUBTESTS BELOW DO NOT SET `VIRTGPU_EXECBUF_RING_IDX`.
+///
+/// `sim_submit` sets it on every batch, so copying Mesa's flag word verbatim is
+/// the obvious thing to do. It hangs, and the reason is about the STREAM, not
+/// the flag. This file's command stream is 32 zero bytes — not a dispatchable
+/// Venus stream; the host says so out loud (`vkr: submit_cmd:
+/// vn_dispatch_command failed` / `failed to dispatch context op 5`). With
+/// RING_IDX the guest sets `VIRTIO_GPU_FLAG_INFO_RING_IDX`, which makes the host
+/// retire the completion fence through the *renderer context*
+/// (`virgl_renderer_context_create_fence`) instead of the global timeline
+/// (`virgl_renderer_create_fence`). A context whose dispatch just failed never
+/// retires it, the SUBMIT_3D descriptor is never returned, and
+/// `VirtioGpu::submit` spins out to `[GPU] control-queue TIMEOUT, cmd=0x207`.
+/// Unringed, the fence lands on the global timeline and retires whatever the
+/// host made of the bytes — which is why every other synthetic submission in
+/// this file (phases 3 and 5) is unringed too.
+///
+/// Ring 0 is NOT the variable, and this is not a hole in the coverage of Mesa's
+/// real flag word: `vn_renderer_submit_simple_sync` (vn_renderer_util.c:24)
+/// submits with `ring_idx = 0 /* CPU ring */` AND `sync_count = 1` — i.e.
+/// literally `RING_IDX | FENCE_FD_OUT` over a real stream — on every
+/// `vkDestroyInstance`, and that submission completes with no timeout. `vktest`,
+/// `vkrender` and `vkswap` in the same suite are the coverage for the ringed
+/// variant. What is asserted below is the *fd contract*, which `sys_ioctl`
+/// decides from FENCE_FD_OUT alone; it never reads `ring_idx`, so dropping the
+/// flag removes nothing from the must-fail-unpatched argument (the unpatched
+/// kernel writes offset 28 on no path at all, ringed or not).
+///
+/// Submissions that are REFUSED BEFORE REACHING THE HOST keep the flag, because
+/// there it is free and pins that the refusal is flag-independent: the probe
+/// (answered by the fence-only early return and never submitted), the
+/// bad-BO-handle submissions (refused at `bo_handles` validation) and the
+/// half-zero shapes.
+///
+/// Deliberately NOT tested: the literal `close(args.fence_fd)` consequence, by
+/// closing fd 0 and probing it. `sys_fcntl` answers F_GETFD for fd <= 2 from a
+/// constant without consulting the fd table (kernel/src/syscall.rs), so that
+/// probe would report "stdin fine" either way — a guard that cannot fail. The
+/// property is asserted directly instead: `fence_fd >= 3` on success and `== -1`
+/// on failure means `close(fence_fd)` can never name a stdio descriptor.
+unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
+    let mut failures = 0i32;
+    out(b"-- phase 7: SIMULATE_SYNCOBJ out-fence fd --\n");
+
+    // Not a valid Venus stream; as everywhere else in this file, the assertion
+    // is about the guest-side ioctl contract, not about host execution.
+    let stream: [u32; 8] = [0; 8];
+
+    // ── 1. The probe, byte-for-byte as sim_syncobj_create issues it ──────────
+    // [GUARD] An unpatched kernel returns EINVAL from
+    // `exec.command == 0 || exec.size == 0` and leaves fence_fd at the seed.
+    let mut probe = exec_req(EXECBUF_RING_IDX | EXECBUF_FENCE_FD_OUT, &[], &[], 0);
+    let rc = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut probe as *mut _);
+    if !report(b"phase7_syncobj_probe_accepted", rc == 0) { failures += 1; }
+
+    // [GUARD] The seed is 0 — Mesa's own initial value — so this fails on an
+    // unpatched kernel *and* states the safety property: never a stdio fd.
+    let probe_fd = probe.fence_fd;
+    if !report(b"phase7_syncobj_probe_fence_fd_written", probe_fd >= 3) { failures += 1; }
+
+    // [GUARD] Guarded on `probe_fd >= 3` so an unpatched kernel fails here
+    // without this test ever polling fd 0.
+    let signalled = probe_fd >= 3 && poll_in_ready(probe_fd);
+    if !report(b"phase7_syncobj_probe_fd_signalled", signalled) { failures += 1; }
+
+    // [GUARD] `sim_syncobj_submit`/`sim_syncobj_export` reach the fd only
+    // through `os_dupfd_cloexec`, and the dup must alias the same signalled
+    // object — otherwise every wait on a simulated syncobj would hang.
+    let mut dup_ok = false;
+    if probe_fd >= 3 {
+        let d = fcntl(probe_fd, F_DUPFD_CLOEXEC, 3 as c_int);
+        dup_ok = d >= 3 && d != probe_fd && poll_in_ready(d);
+        if d >= 3 { close(d); }
+    }
+    if !report(b"phase7_syncobj_probe_fd_dupable", dup_ok) { failures += 1; }
+    if probe_fd >= 3 { close(probe_fd); }
+
+    // ── 2. The sim_submit shape: a REAL stream plus FENCE_FD_OUT ─────────────
+    // [GUARD] This is the subtest that denies `close(0)`. An unpatched kernel
+    // ACCEPTS this ioctl (the stream is non-empty, so nothing refuses it) and
+    // still leaves fence_fd at the 0 it came in with — which is exactly the
+    // value Mesa then passes to close(). rc == 0 with fence_fd >= 3 is the only
+    // combination under which `sim_submit` is safe.
+    //
+    // Unringed on purpose: this submission has to reach the host and complete,
+    // and our stream is not dispatchable. See the RING_IDX paragraph above.
+    let mut sub = exec_req(EXECBUF_FENCE_FD_OUT, &stream, &[], 0);
+    let rc = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut sub as *mut _);
+    let sub_ok = rc == 0 && sub.fence_fd >= 3;
+    if !report(b"phase7_submit_fence_fd_out_written", sub_ok) { failures += 1; }
+    let first_fd = sub.fence_fd;
+    if first_fd >= 3 {
+        if !report(b"phase7_submit_fence_fd_signalled", poll_in_ready(first_fd)) {
+            failures += 1;
+        }
+        close(first_fd);
+    } else if !report(b"phase7_submit_fence_fd_signalled", false) {
+        failures += 1;
+    }
+
+    // ── 3. Lifetime: 64 submits must consume no fds on net ───────────────────
+    // [GUARD] Fails on an unpatched kernel because `first_fd` is 0, not >= 3.
+    // Fails on a LEAKING fix because lowest-free-fd allocation (`alloc_fd`,
+    // servers/vfs) hands back the same number every iteration only if each
+    // close really released it; a fix that leaked would make the numbers climb
+    // and would exhaust the 256-entry eventfd pool within a few frames of real
+    // compositing. Nothing else in this loop opens an fd, so `last == first` is
+    // the exact expectation, not an approximation.
+    let mut loop_ok = first_fd >= 3;
+    let mut last_fd = first_fd;
+    if loop_ok {
+        for _ in 0..64 {
+            let mut e = exec_req(EXECBUF_FENCE_FD_OUT, &stream, &[], 0);
+            if ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e as *mut _) != 0 || e.fence_fd < 3 {
+                loop_ok = false;
+                break;
+            }
+            last_fd = e.fence_fd;
+            close(e.fence_fd);
+        }
+    }
+    if !report(b"phase7_fence_fd_recycled_over_64_submits", loop_ok && last_fd == first_fd) {
+        failures += 1;
+    }
+
+    // ── 4. The failure path must release the reservation and write -1 ────────
+    // [GUARD] A submission naming a handle that was never allocated is refused
+    // (phase 5 already pins that). An unpatched kernel refuses it too — but
+    // leaves fence_fd at 0, so a caller that ignores the return code (or any
+    // future one that does not) still closes stdin. -1 is the only value that
+    // makes `close(fence_fd)` harmless on a failed submission.
+    let mut bad = exec_req(
+        EXECBUF_RING_IDX | EXECBUF_FENCE_FD_OUT,
+        &stream,
+        &[NO_SUCH_HANDLE],
+        0,
+    );
+    let rc = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut bad as *mut _);
+    if !report(b"phase7_failed_submit_writes_minus_one", rc != 0 && bad.fence_fd == -1) {
+        failures += 1;
+    }
+
+    // [GUARD] …and the fd reserved for that failed submission must have been
+    // released, not leaked: the next successful submit gets the same lowest-free
+    // number the first one did. Guarded on `first_fd >= 3`, so an unpatched
+    // kernel fails rather than comparing 0 against 0.
+    let mut reclaim_ok = false;
+    if first_fd >= 3 {
+        for _ in 0..8 {
+            let mut e = exec_req(
+                EXECBUF_RING_IDX | EXECBUF_FENCE_FD_OUT,
+                &stream,
+                &[NO_SUCH_HANDLE],
+                0,
+            );
+            let _ = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e as *mut _);
+        }
+        // The eight above are refused at `bo_handles` validation and never reach
+        // the host, so they keep RING_IDX. This one must complete, so it does
+        // not — same reason as subtest 2.
+        let mut e = exec_req(EXECBUF_FENCE_FD_OUT, &stream, &[], 0);
+        if ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e as *mut _) == 0 {
+            reclaim_ok = e.fence_fd == first_fd;
+            if e.fence_fd >= 3 { close(e.fence_fd); }
+        }
+    }
+    if !report(b"phase7_failed_submit_releases_fence_fd", reclaim_ok) { failures += 1; }
+
+    // ── 5. What must NOT change ──────────────────────────────────────────────
+    // [NON-REGR] No FENCE_FD_OUT, no fd. Handing one out unasked would leak an
+    // eventfd per submission for every existing caller, none of which close it.
+    // This passes on an unpatched kernel by construction — it guards the fix
+    // against over-allocating, not the kernel against the old bug.
+    let mut plain = exec_req(0, &stream, &[], FENCE_FD_SENTINEL);
+    let rc = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut plain as *mut _);
+    if !report(b"phase7_no_fence_fd_when_not_requested",
+               rc == 0 && plain.fence_fd == FENCE_FD_SENTINEL) {
+        failures += 1;
+    }
+
+    // [NON-REGR] Only BOTH-zero is a fence-only request. A size with no command,
+    // or a command with no size, stays malformed and stays refused — the accept
+    // must not have widened into "any zero field is fine".
+    let mut half_a = exec_req(EXECBUF_RING_IDX | EXECBUF_FENCE_FD_OUT, &[], &[], 0);
+    half_a.size = 32; // command still 0
+    let rc_a = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut half_a as *mut _);
+    let mut half_b = exec_req(EXECBUF_RING_IDX | EXECBUF_FENCE_FD_OUT, &stream, &[], 0);
+    half_b.size = 0; // command still non-NULL
+    let rc_b = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut half_b as *mut _);
+    if !report(b"phase7_half_zero_execbuffer_still_refused", rc_a != 0 && rc_b != 0) {
+        failures += 1;
+    }
+    // Both were refused, so both must carry -1 rather than the incoming 0.
+    if half_a.fence_fd >= 3 { close(half_a.fence_fd); }
+    if half_b.fence_fd >= 3 { close(half_b.fence_fd); }
+
+    failures
 }
 
 /// VIRTGPU_WAIT on one BO handle, raw result.
@@ -1273,6 +1561,11 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
         if !report(b"virtgpu_wait_bad_handle_refused", wait_bo(fd, NO_SUCH_HANDLE) != 0) {
             failures += 1;
         }
+
+        // SIMULATE_SYNCOBJ's out-fence fd. Same `ctx_ok` gate as the rest of
+        // phase 5: EXECBUFFER is refused before CONTEXT_INIT, so without a
+        // context none of this is reachable.
+        failures += phase7_simulate_syncobj(fd);
     }
 
     // ── 6. Release the blob ──────────────────────────────────────────────────

@@ -6162,6 +6162,84 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         return 0;
     }
 
+    // ── VIRTGPU_EXECBUFFER's out-fence fd (intercepted here for the same reason
+    //    PRIME is: the DRM server has no fd table) ──────────────────────────────
+    //
+    // `struct drm_virtgpu_execbuffer` (64 bytes, which is what the 0x0040 size
+    // field of the request code encodes):
+    //     flags u32 @0 | size u32 @4 | command u64 @8 | bo_handles u64 @16
+    //     num_bo_handles u32 @24 | fence_fd s32 @28 | ring_idx u32 @32 | …
+    //
+    // WHY THIS EXISTS. Mesa's venus backend compiles SIMULATE_SYNCOBJ/
+    // SIMULATE_SUBMIT unconditionally (Mesa 25.3.6, vn_renderer_virtgpu.c). Two
+    // things follow, and they must land together:
+    //
+    //   1. `sim_syncobj_create` probes once per process with a zero-size, zero-
+    //      command execbuffer carrying FENCE_FD_OUT, and requires both `ret == 0`
+    //      and `fence_fd >= 0`. Failing it disables every `vn_renderer_sync`,
+    //      which is how `vn_ring_destroy`'s ring-teardown submit gets skipped.
+    //   2. `sim_submit` sets FENCE_FD_OUT whenever `batch->sync_count != 0` and
+    //      then unconditionally `close(args.fence_fd)`. `args` is a designated
+    //      initialiser, so an unwritten `fence_fd` is **0** — i.e. `close(0)`,
+    //      closing the process's stdin. Path (2) is reachable only once (1)
+    //      succeeds, so accepting the probe without also writing `fence_fd` would
+    //      ARM that, on every vkDestroyInstance. Hence: one change, and the write
+    //      lives here, above the accept, where nothing can bypass it.
+    //
+    // WHY AN EVENTFD, AND WHY PRE-SIGNALLED. Mesa's entire use of this fd is
+    // `poll(POLLIN)` (`sim_syncobj_poll`), `fcntl(F_DUPFD_CLOEXEC)` and `close`.
+    // It never `read`s it, so an eventfd created with counter 1 stays readable
+    // forever. That is not an optimistic lie: `VirtioGpu::submit` busy-spins on
+    // the used ring, so the work a submission describes is already retired by the
+    // time this ioctl returns. There is no window in which the fd is signalled
+    // and the work is not done.
+    //
+    // ORDERING follows upstream `virtio_gpu_execbuffer_ioctl`: reserve the out
+    // fence BEFORE submitting, so a submission is never charged for an fd-table
+    // failure, and release it if the submission itself fails.
+    //
+    // INVARIANT, stated because the whole defect is the negation of it: whenever
+    // the caller set FENCE_FD_OUT, `fence_fd` is written before we return —
+    // with a real fd on success, and with **-1** on every failure path. It is
+    // never left holding the caller's incoming value.
+    const DRM_IOCTL_VIRTGPU_EXECBUFFER: usize = 0xC0406442;
+    if cmd == DRM_IOCTL_VIRTGPU_EXECBUFFER {
+        const EXECBUF_FENCE_FD_OUT: u32 = 0x02;
+        const FENCE_FD_OFF: usize = 28;
+        const EFD_CLOEXEC: u64 = 0x8_0000;
+        if arg == 0 || !validate_user_buf(arg, 64) { return -14; } // EFAULT
+        let flags = unsafe { (arg as *const u32).read() };
+        if flags & EXECBUF_FENCE_FD_OUT == 0 {
+            // Nothing to mint. Forward verbatim — byte-for-byte the pre-change
+            // path, so every existing caller (`flags = 0`) is untouched.
+            let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
+            return vfs_reply_val(&vfs::handle(&msg, pid));
+        }
+        // Reserve the out fence first. EFD_CLOEXEC matches upstream's
+        // `get_unused_fd_flags(O_CLOEXEC)` and Mesa's own `os_dupfd_cloexec`:
+        // a fence fd must not survive into an exec'd child.
+        let efd_msg = make_vfs_msg(vfs::VFS_EVENTFD, &[1u64, EFD_CLOEXEC]);
+        let efd = vfs_reply_val(&vfs::handle(&efd_msg, pid));
+        if efd < 0 {
+            unsafe { ((arg + FENCE_FD_OFF) as *mut i32).write(-1); }
+            return efd; // EMFILE/ENOMEM — reported, never as a silent fence_fd 0
+        }
+        let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
+        let rc = vfs_reply_val(&vfs::handle(&msg, pid));
+        if rc < 0 {
+            // The submission failed, so the fence describes nothing. Release it
+            // rather than handing back an fd Mesa will not close (it checks
+            // `ret` before touching `fence_fd`), and write -1 so a caller that
+            // ignores the return code still cannot close fd 0.
+            let close_msg = make_vfs_msg(vfs::VFS_CLOSE, &[efd as u64]);
+            let _ = vfs::handle(&close_msg, pid);
+            unsafe { ((arg + FENCE_FD_OFF) as *mut i32).write(-1); }
+            return rc;
+        }
+        unsafe { ((arg + FENCE_FD_OFF) as *mut i32).write(efd as i32); }
+        return rc;
+    }
+
     if cmd == FIONREAD || cmd == FBIOGET_VSCREENINFO ||
        cmd == DRM_IOCTL_GET_MODE || cmd == DRM_IOCTL_SET_MODE ||
        cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||
