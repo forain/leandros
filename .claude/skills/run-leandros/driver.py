@@ -128,6 +128,29 @@ def _strip_ansi(data: bytes) -> bytes:
     return _ANSI_RE.sub(b"", data)
 
 
+# A shell prompt sitting at the very END of what we have received so far: a
+# line of its own, a run of non-space characters, then "#", "$" or ">" and one
+# space. brush's is "brush-0.5# ".
+#
+# Do NOT go back to "'> ' appears anywhere in the stream". Test programs print
+# "-> " diagnostics by the dozen (scmtest emits one per subtest, e.g.
+# "read via received fd -> 5 bytes"), so that heuristic cut a 25-subtest run
+# off after the first one and the truncation read as a hang.
+_PROMPT_TAIL_RE = re.compile(r"\n\S*[#$>] \Z")
+
+
+def _at_prompt(buf: bytes) -> bool:
+    """True iff `buf` ends at an interactive shell prompt."""
+    # Only the tail can match, and this runs per received chunk, so never
+    # rescan a megabyte of `mame` output to answer it.
+    text = _strip_ansi(buf[-512:]).decode("utf-8", errors="replace")
+    # reedline's cursor save/restore (ESC 7 / ESC 8) and keypad-mode toggles
+    # sit between the prompt and end-of-buffer; _strip_ansi drops the CSI body
+    # but leaves the ESC that introduced it, so clear both before matching.
+    text = re.sub(r"\x1b[=>78]", "", text).replace("\x1b", "")
+    return bool(_PROMPT_TAIL_RE.search(text))
+
+
 def _find_fw(paths):
     for p in paths:
         if os.path.exists(p):
@@ -399,10 +422,11 @@ def _connect_with_retry(sock_path, retries=40, delay=0.15):
     return None
 
 
-def _read_serial_until(sentinel, timeout=120):
+def _read_serial_until(sentinel, timeout=120, at_prompt=False):
     """
     Connect to serial socket and read until any sentinel appears or timeout.
-    `sentinel` is a str/bytes or a list of them. Returns accumulated text,
+    `sentinel` is a str/bytes or a list of them. With `at_prompt`, a shell
+    prompt ending the stream also ends the read. Returns accumulated text,
     or None on failure.
     """
     if not isinstance(sentinel, (list, tuple)):
@@ -429,6 +453,8 @@ def _read_serial_until(sentinel, timeout=120):
                     lf.write(chunk)
                     lf.flush()
                     if any(sb in buf for sb in sentinels):
+                        return buf.decode("utf-8", errors="replace")
+                    if at_prompt and _at_prompt(buf):
                         return buf.decode("utf-8", errors="replace")
                 except BlockingIOError:
                     pass
@@ -487,7 +513,10 @@ def cmd_start(arch="aarch64", mode="uefi"):
         time.sleep(0.1)
 
     print("Serial socket up. Waiting for login/shell prompt (up to 120s)...")
-    text = _read_serial_until(["login: ", "> "], timeout=120)
+    # "> " used to be a sentinel here; it matched the boot log's own
+    # "[INPUT] -> keyboard (event0)" and declared the guest ready ~40 s into a
+    # boot that had not yet mounted its root. Only a real prompt counts now.
+    text = _read_serial_until(["login: "], timeout=120, at_prompt=True)
 
     if text is None:
         # Try to report what QEMU said
@@ -639,9 +668,9 @@ def _serial_send(command, timeout=8):
                         lf.write(chunk)
                 except Exception:
                     pass
-                # Stop at prompt: anything that ends a line with "> "
-                decoded = buf.decode("utf-8", errors="replace")
-                if "> " in decoded[len(command):]:
+                # Stop once the shell is back at its prompt — and only at the
+                # END of the stream, never on a "-> " in the middle of a line.
+                if _at_prompt(buf[len(command):]):
                     break
             except BlockingIOError:
                 pass
