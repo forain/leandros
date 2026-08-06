@@ -4,6 +4,10 @@ A `no_std` bare-metal microkernel written in Rust, targeting **x86-64** (UEFI/QE
 
 Leandros follows the classic microkernel design: the kernel itself provides only scheduling, IPC, and memory management. Everything else — drivers, file systems, network stacks — runs as isolated user-space tasks that communicate via typed message passing.
 
+On top of that microkernel core sits a **Linux-compatible syscall personality**: the dispatcher implements the real Linux syscall numbers, so unmodified `*-unknown-linux-musl` binaries — a shell, coreutils, Mesa, a Wayland compositor — run without a source patch or a shim ABI.
+
+**Current state** — Leandros boots to a login prompt on both architectures and runs the **COSMIC desktop environment** unmodified: `cosmic-session` → `cosmic-comp` on KMS/softpipe → `busd` (D-Bus) → `cosmic-bg` + `cosmic-panel`, rendering a wallpaper plus a full-width panel bar with an embedded Wayland client. Vulkan reaches real host GPU hardware through Mesa's **Venus** ICD over virtio-gpu.
+
 ---
 
 ## Architecture at a glance
@@ -12,15 +16,22 @@ Leandros follows the classic microkernel design: the kernel itself provides only
 ┌──────────────────────────────────────────────────────────┐
 │                     User Space (EL0 / Ring 3)            │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
-│  │   init   │  │  shell   │  │  aplay   │  │  other   │  │
-│  │ (PID-1)  │  │   CLI    │  │ WAV/MIDI │  │  tasks   │  │
+│  │  COSMIC  │  │  brush   │  │  aplay   │  │  other   │  │
+│  │ desktop  │  │  shell   │  │ WAV/MIDI │  │  tasks   │  │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  │
+│  ┌────┴─────────────┴─────────────┴─────────────┴─────┐  │
+│  │  Mesa (softpipe / Venus) · libinput · relibc/musl  │  │
+│  └────┬─────────────┬─────────────┬─────────────┬─────┘  │
 │       │   SYSCALL   │             │             │        │
 ├───────┼─────────────┼─────────────┼─────────────┼────────┤
 │                 Server Layer (EL0 / Ring 3)              │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
 │  │   VFS    │  │   DRM    │  │ PipeWire │  │  evdev   │  │
 │  │  server  │  │  server  │  │  server  │  │  server  │  │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │   F2FS   │  │   net    │  │   tty    │  │  xattr   │  │
+│  │  server  │  │ (smoltcp)│  │  server  │  │ + ACLs   │  │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │
 └──────────────────────────────────────────────────────────┘
         ↓        Kernel Space (EL1 / Ring 0)
@@ -54,19 +65,27 @@ Leandros follows the classic microkernel design: the kernel itself provides only
 | `mm` | Buddy allocator, slab allocator, VMM, page-table interface, ELF mapping |
 | `sched` | Cooperative/preemptive scheduler, context switch, IPC blocking, ELF loading |
 | `ipc` | Port table, message types, `Channel` abstraction |
+| `capability` | Capability handle types passed in message slots |
+| `elf` | ELF64 parser and loader; `ET_EXEC` + `ET_DYN`-at-a-bias, `PT_INTERP` |
 | `boot` | Multiboot2, Limine, and Device Tree (FDT) parsers → `BootInfo` |
 | `arch/x86_64` | GDT/TSS, IDT, APIC, PIC, SYSCALL entry, SMP, timer |
 | `arch/aarch64` | MMU, exception vectors, GICv2, generic timer, UART, SMP/PSCI, debug utils |
-| `drivers` | KMS, DRM subsystem, VirtIO GPU, VirtIO Sound, framebuffer, serial, PCI |
+| `drivers` | KMS, DRM subsystem, VirtIO GPU/Sound/Block/Net/Input, framebuffer, serial, PCI, SDHCI |
 | `drivers/usb` | xHCI host controller |
 | `drivers/wifi` | mac80211 + virtio-wifi |
-| `servers/vfs` | Virtual filesystem server |
+| `servers/vfs` | Virtual filesystem server: fd tables, tmpfs, mounts, pipes, eventfd/timerfd/signalfd/inotify |
+| `servers/f2fs` | F2FS filesystem server — real persistent storage on virtio-blk |
+| `servers/xattr` | Shared xattr + POSIX ACL contract (codec, namespace gates, ACL evaluator) |
 | `servers/drm` | DRM server (hardware-accelerated graphics IPC) |
 | `servers/evdev` | Linux-compatible input event server |
 | `servers/pipewire` | PipeWire-compatible audio server |
-| `servers/tty` | TTY server |
-| `servers/net` | Network server |
-| `userland` | User-space programs (init, shell, aplay) with leandros-libc / relibc |
+| `servers/tty` | TTY server, job control, POSIX timers |
+| `servers/net` | Network server — smoltcp TCP/IP plus a full AF_UNIX implementation |
+| `servers/proc` | `/proc` filesystem |
+| `servers/init` | PID-1: server bring-up, mounts, getty loop |
+| `servers/libc-shim` | In-kernel glue backing the userspace libc |
+| `userland` | User-space programs and regression suites (leandros-libc / relibc / musl) |
+| `ports` | Build recipes for third-party software: Mesa, D-Bus/busd, COSMIC, input shims |
 | `lib` | `align_up` / `align_down` utilities shared across crates |
 
 ---
@@ -76,8 +95,23 @@ Leandros follows the classic microkernel design: the kernel itself provides only
 | Target | Boot protocol | Status |
 |---|---|---|
 | x86-64 (QEMU q35) | Limine UEFI | Working |
-| AArch64 (QEMU virt) | Device Tree (DTB via `-kernel`) | Working |
+| AArch64 (QEMU virt) | Limine UEFI (default), or DTB via `-kernel` (`--direct`) | Working |
+| AArch64 (QEMU raspi4b) | BCM2711 board model, `--raspi4b` | SDHCI driver test path only |
 | Raspberry Pi 5 | RPi firmware ELF load + BCM2712 DTB | Boot-ready |
+
+Every change must be tested on **both** architectures — cross-platform parity is a project invariant, not a nice-to-have.
+
+### Host platforms
+
+Both macOS and Linux hosts build and boot the full system. `run-qemu.sh` picks the fastest accelerator the host can actually provide for the requested guest:
+
+| Host | Guest | Accelerator |
+|---|---|---|
+| macOS (Apple Silicon) | aarch64, UEFI boot | HVF |
+| Linux, `/dev/kvm` writable | matching arch | KVM |
+| anything else (incl. cross-arch) | any | TCG software emulation |
+
+A hypervisor virtualises, it does not translate — so a mismatched host/guest arch always falls back to TCG, which is *much* slower (a COSMIC session on TCG needs several minutes to settle). Override with `--hvf`, `--kvm`, or `--tcg`.
 
 ---
 
@@ -117,6 +151,21 @@ sudo pacman -S qemu-system-aarch64   # Arch
 sudo apt install lld    # ld.lld is used for both targets
 ```
 
+### Sibling repositories
+
+Some large dependencies live *outside* this tree, as siblings of the repo root, and are built by `scripts/build-all.sh`:
+
+| Path | Purpose |
+|---|---|
+| `../relibc` | The C standard library shipped as the userspace libc |
+| `../doomgeneric` | Doom port |
+| `../cosmic-epoch` | COSMIC desktop sources (built unmodified) |
+| `../brush` | The `brush` shell |
+
+### musl cross toolchain
+
+Third-party userspace (Mesa, COSMIC, brush, coreutils) is built for `{x86_64,aarch64}-unknown-linux-musl` and dynamically linked against a real `ld-musl`. The `scripts/cc-*-musl.sh`, `linker-*-musl.sh`, and `ar-musl.sh` wrappers drive that cross-build; the build scripts pass the pinned nightly toolchain (`rust-toolchain.toml`) through to sibling-repo builds so every crate compiles against one compiler version.
+
 ---
 
 ## Building
@@ -124,7 +173,10 @@ sudo apt install lld    # ld.lld is used for both targets
 Use the top-level build script to compile all targets:
 
 ```sh
-./scripts/build-all.sh
+./scripts/build-all.sh                       # both architectures
+./scripts/build-all.sh --arch aarch64        # one architecture
+./scripts/build-all.sh --arch aarch64 --rpi5 # Raspberry Pi 5 features
+./scripts/build-all.sh --raspi4b             # QEMU raspi4b / SDHCI test path
 ```
 
 ⚠️ **Important**: Always use release builds — debug builds may hang during early boot due to large stack requirements and symbol desync issues.
@@ -137,9 +189,31 @@ Use the top-level build script to compile all targets:
 # Test both architectures
 ./scripts/run-qemu.sh aarch64
 ./scripts/run-qemu.sh x86_64
+
+# Boot-mode and accelerator overrides
+./scripts/run-qemu.sh aarch64 --direct    # DTB via -kernel, no bootloader
+./scripts/run-qemu.sh aarch64 --tcg       # force software emulation
+./scripts/run-qemu.sh --raspi4b           # BCM2711 board model (aarch64 only)
 ```
 
-The AArch64 runner boots the ELF directly with `-kernel`, passing the virt machine's built-in DTB in `x0`. The x86-64 runner builds a fresh FAT32 disk image containing Limine (rev ≥ 6) and the kernel ELF, then launches QEMU with OVMF.
+Both architectures boot via **Limine UEFI** by default: the runner builds a fresh FAT32 disk image containing Limine (rev ≥ 6) and the kernel ELF, then launches QEMU with OVMF/AAVMF. `--direct` on AArch64 instead boots the ELF with `-kernel`, passing the virt machine's built-in DTB in `x0`.
+
+The runner also handles the host environment for you:
+
+- **F2FS data disks** — `f2fs-data{0,1}-<arch>.img` (64 MB each) are created once on first run and reused. Disk 0 is populated by `scripts/mkfs-f2fs-populated.py` with the full userland: shell, coreutils, test binaries, Mesa, and the COSMIC session set. Delete an image to force a clean rebuild.
+- **Networking** — `socket_vmnet` on macOS when its daemon is running (routable guest at `192.168.105.2`), otherwise user-mode SLIRP (`10.0.2.15` behind NAT). Either way the guest configures itself over DHCP via `servers/net`'s smoltcp client, so nothing in the guest needs to know which it got.
+- **Display and audio** — a headless host (an SSH build box with no `$DISPLAY`/`$WAYLAND_DISPLAY`) gets `egl-headless`, preserving GL for Venus, or `-display none` if GL is unavailable. The audio backend is probed rather than assumed, because QEMU *aborts at startup* if the requested backend cannot open.
+
+### Logging in
+
+Boot lands on a login prompt served by a getty loop in PID-1. Two accounts are provisioned in `/etc/shadow` (SHA-256 crypt):
+
+| User | Password |
+|---|---|
+| `root` | `root` |
+| `leandro` | `leandro` |
+
+Non-root sessions are fully supported, including a COSMIC desktop session with per-uid `/run/user/<uid>` runtime directories.
 
 ---
 
@@ -189,8 +263,11 @@ sudo ./scripts/deploy-rpi5.sh \
 - Context switch saves/restores all callee-saved integer registers **and** FPU/SIMD state (Q0–Q31 on AArch64; XMM0–XMM15 + MXCSR on x86-64) on every switch.
 - **ELF loading** — direct userspace program loading with proper memory mapping and entry point setup.
 - Tasks block on IPC ports (`block_on(port)`) and are unblocked by `send` or port close.
-- SMP: up to 8 CPUs. BSP runs `sched::run()`; APs are started via PSCI `CPU_ON` (AArch64) and SIPI (x86-64), then enter `sched::ap_entry()`.
+- SMP: up to 8 CPUs. BSP runs `sched::run()`; APs are started via PSCI `CPU_ON` (AArch64) and SIPI (x86-64), then enter `sched::ap_entry()`. Idle-CPU selection is SMT-aware on x86-64 (hyperthread topology from CPUID leaf 0xB).
 - `wait_pid` uses an exit-log side-table to avoid the race where the scheduler reaps a zombie before the waiter resumes.
+- **Threads** — `clone` with `CLONE_VM` spawns a true OS thread sharing the caller's address space; `futex` (`FUTEX_WAIT`/`FUTEX_WAIT_BITSET`/`FUTEX_WAKE`) is the only other thread primitive in the kernel. Timed futex waiters are woken by a cross-thread `FUTEX_WAKE`, not left to time out.
+- **A global poll wait-channel with a deadline tick** lets blocking waiters sleep instead of spinning; servers publish readiness edges onto it.
+- User stacks are 8 MB, matching the Linux default.
 - **Auxv-based service discovery** — the kernel stamps server port numbers into the auxiliary vector at task creation. Userspace reads port IDs for audio, DRM, VFS, and other services from `AT_*` entries without a name-service round-trip.
 
 ### IPC (`ipc`)
@@ -220,7 +297,13 @@ Register mapping follows the Linux convention on each architecture:
 - **AArch64**: syscall number in `x8`, args in `x0`–`x2`, return value in `x0`. Entry via `svc #0`.
 - **x86-64**: syscall number in `rax`, args in `rdi`/`rsi`/`rdx`, return value in `rax`. Entry via `syscall` instruction (STAR/LSTAR MSRs).
 
-The table above is the original minimal IPC/memory surface; the dispatcher (`kernel/src/syscall.rs`) has since grown to cover the real Linux syscall numbers relibc expects — `clone`, `futex`, `rt_sigaction`, the `mmap` family, VFS, and networking calls all reuse their actual Linux numbers rather than a custom scheme, so relibc's `platform::linux` Pal implementation works unmodified against this kernel.
+The table above is only the original minimal IPC/memory surface. The dispatcher (`kernel/src/syscall.rs`, ~7.5k lines) has since grown into a **Linux syscall personality**: `clone`, `futex`, `rt_sigaction`, the `mmap` family, the full VFS surface, sockets, `epoll`, xattrs, `chroot`, `setresuid`, `faccessat2`, `mincore`, and the timer calls all use their *actual Linux numbers* rather than a custom scheme. Consequences:
+
+- relibc's `platform::linux` Pal implementation works unmodified.
+- So does a stock musl binary cross-compiled for `*-unknown-linux-musl` — which is how Mesa, D-Bus, and COSMIC run here without source patches.
+- The two architectures have genuinely different syscall numbers for the same call (e.g. `mincore` is 232 on AArch64 and 27 on x86-64); the tables are per-arch, and getting one backwards is a class of bug this project has paid for more than once.
+
+Beyond the syscall surface, the kernel also stamps server port IDs into the ELF auxiliary vector, so a task discovers the audio/DRM/VFS servers in O(1) without a name-service round-trip.
 
 ### Signal handling
 
@@ -249,6 +332,45 @@ Full POSIX-style signal delivery is implemented on **both** architectures:
 - **Honoured timeouts** — `ppoll`, `epoll_wait`, and `select` are cooperative retry loops that read the caller's deadline (`NULL` = block forever, `{0,0}` = single poll), yield between probes, and return `0` on true expiry.
 - **`epoll_event` layout** — matches Linux exactly: 12-byte `#[repr(C, packed)]` (data at offset 4) on x86-64 only (`glibc EPOLL_PACKED`), natural 16-byte layout elsewhere. The kernel reads/writes the data word with arch-conditional offsets via `read_unaligned`/`write_unaligned`, so libc and kernel agree on both architectures.
 - **Pipe endpoints are reference-counted** — a pipe read/write end held by several fds (via `dup`/`dup2` or inherited across `fork`) only signals EOF/`POLLHUP`/`EPIPE` once the *last* fd on that end closes, so `poll`/`select`/`epoll` stay correct for pipes shared across a `fork` (shell pipelines).
+- **Blocking, not spinning** — waiters park on a global poll wait-channel with a deadline tick; servers publish readiness *edges* onto that channel. `wait4`/`waitid`/`nanosleep` and the net daemon block rather than busy-polling, so an idle system is genuinely idle.
+- `signalfd4`, `inotify`, and `eventfd`/`timerfd` honour `O_NONBLOCK` and `*_CLOEXEC` at creation; pool slots are refcounted so `dup`'d fds do not alias each other.
+
+### Processes, users, and sessions
+
+The process model is POSIX-shaped rather than task-shaped, which is what allows a real shell and a real desktop session to run:
+
+- **Thread groups** — a process is a TGID with threads under it. A fatal signal or a fatal user fault terminates the **whole thread group**, not the one thread that took it; `execve` de-threads (terminates siblings) and resets caught signal dispositions, both per POSIX. Per-process tables are keyed by TGID, never by the raw pid of whichever thread happened to call.
+- **Login sessions** — real `setresuid`/`setresgid`, a `$sha256$`-hashed `/etc/shadow`, `/bin/login`, and a getty loop in PID-1. Sessions run as an unprivileged user with correct ownership throughout.
+- **Job control** — `servers/tty` implements the job-control ioctls and line-discipline signal generation (`SIGINT`/`SIGTSTP`/`SIGTTOU`), so shell job control behaves.
+- **`chroot(2)`** — real confinement: symlink resolution and fd-to-path resolution are both confined to the jail rather than escaping through the mount table.
+- **Priorities** — `setpriority`/`getpriority` back `nice(1)`.
+- **Process state** — `/proc` via `servers/proc`, including `/proc/self/exe`.
+
+### Filesystems and storage
+
+| Filesystem | Where | Backing |
+|---|---|---|
+| `f2fs` | `/`, `/data` | virtio-blk, real persistent storage |
+| `tmpfs` | `/tmp`, `/run`, `/run/user/<uid>` | Anonymous memory, page-shared across processes |
+| `procfs` | `/proc` | Synthesized |
+| devices | `/dev/*` | Server-backed nodes |
+
+**F2FS** (`servers/f2fs`) is a real read-write implementation, not a stub: direct/indirect/double-indirect block pointers, multi-block directories, hardlinks and symlinks, ownership and mode persistence with enforced `chmod`/`chown`, block reclamation on `unlink`/`rmdir`/truncate, `statfs` computed from live SIT state, synchronous checkpointing of namespace mutations, and POSIX `rename` that atomically replaces its destination. `fsync`/`sync` actually flush to the device.
+
+**Extended attributes and POSIX ACLs** are enforced end to end. `servers/xattr` is the single source of truth — the size caps, namespace indices, packed entry codec, namespace permission gates, and the POSIX 1003.1e ACL evaluator are shared verbatim by the kernel syscall layer, tmpfs, and f2fs, so an xattr blob written by one is interpretable by the other. The on-disk arena uses the Linux `f2fs_xattr_entry` layout.
+
+**Shared memory** — tmpfs and memfd pages are shared across processes via frame-backed promotion, with `memfd` seal lifecycle honoured. This is load-bearing for Wayland: `wl_shm` pools *are* shared memfd mappings.
+
+Other VFS behaviour worth knowing: per-process fd tables (limit 128), one identity for the console so `isatty` stops lying, arch-correct `stat`, `O_NOFOLLOW`/`O_DIRECTORY`/`AT_SYMLINK_NOFOLLOW`, `mount`/`umount`/`fstab`, and `fstat` proxied to the owning mount with refcounted dup'd mounted fds.
+
+### Networking
+
+`servers/net` provides two largely separate stacks:
+
+- **TCP/IP over virtio-net**, via smoltcp, with a DHCPv4 client. Host↔VM networking works in both directions on both accelerators; `ping` is in the userland.
+- **AF_UNIX**, implemented in full — because every Wayland and D-Bus connection in the system rides on it. `SCM_RIGHTS` fd passing, cmsg flags, `SO_PEERCRED`, socket nodes bound to real VFS pathnames, `accept4()` honouring `SOCK_NONBLOCK`/`SOCK_CLOEXEC`, `F_SETFD` cloexec on socket fds, `FIONBIO`, well-formed peer sockaddrs from `accept()`, writes buffered on connected-but-not-yet-accepted stream sockets, connections kept alive until the last fd reference closes, and a full send ring correctly returning `EAGAIN` rather than a bogus `0`.
+
+That last one is worth calling out: a stream `send` that returns `0` instead of `EAGAIN` is indistinguishable from a zero-length write to a client, and it desynchronised cosmic-panel's Wayland object stream — a bug that presented as an inexplicable `Unknown id` protocol error many layers above the actual fault.
 
 ### Boot flow
 
@@ -280,6 +402,18 @@ Firmware → _start (MMU off, x0 = DTB physical address)
          → spawn init task → sched::run()
 ```
 
+**Userspace hand-off** (both architectures)
+
+```
+init (PID 1) → start servers (vfs, f2fs, net, tty, drm, evdev, pipewire, proc)
+             → mount / and /data from virtio-blk
+             → getty loop → /bin/login → authenticate against /etc/shadow
+             → setresuid/setresgid → brush
+             → (optionally) start-cosmic → cosmic-session → COSMIC desktop
+```
+
+**Boot protocol invariant** — the minimum Limine revision is **6**. Do not lower it.
+
 ---
 
 ## Graphics stack
@@ -292,15 +426,20 @@ The KMS driver (`drivers/kms`) autodetects native display resolution via **EDID*
 
 The DRM subsystem (`drivers/drm`, `servers/drm`) implements the Linux Direct Rendering Manager interface:
 
-- **Device management** — CRTC, connector, encoder, and plane objects with full property trees.
+- **Device management** — CRTC, connector, encoder, and plane objects with full property trees, `OBJ_GETPROPERTIES`, and valid connector-mode timings.
 - **Dumb buffer API** — `DRM_IOCTL_MODE_CREATE_DUMB` / `DRM_IOCTL_MODE_MAP_DUMB` for allocating and mapping scanout buffers from userspace.
-- **Mode setting** — `DRM_IOCTL_MODE_SETCRTC` and `DRM_IOCTL_MODE_PAGE_FLIP` for display configuration and double-buffering.
+- **Legacy mode setting** — `DRM_IOCTL_MODE_SETCRTC` and `DRM_IOCTL_MODE_PAGE_FLIP` for display configuration and double-buffering. `SETCRTC` presents the framebuffer immediately, so a mode-setting compositor's frame 0 actually appears.
+- **Atomic KMS** — `DRM_CLIENT_CAP_ATOMIC` and `DRM_IOCTL_MODE_ATOMIC`, including `TEST_ONLY` and `ALLOW_MODESET`, with the legacy handlers still live for clients that do not opt in. This is the preferred path; the legacy path cannot drive a cursor plane.
+- **Planes** — a primary plane plus a real **cursor plane**, driven from the virtio-gpu cursor queue. Before the cursor plane existed, every pointer movement forced a full-screen software recomposite; moving the pointer now costs a cursor-queue update instead of a repaint.
 - **Framebuffer objects** — `DRM_IOCTL_MODE_ADDFB` / `DRM_IOCTL_MODE_RMFB` for userspace-owned scanout surfaces.
+- **PRIME / dmabuf** — `PRIME_HANDLE_TO_FD` / `FD_TO_HANDLE` via borrowed dumb-buffer VMOs, with `DRM_CAP_PRIME` reported so GBM's softpipe backend takes the DRIimage path. Correct for multithreaded clients, and the ephemeral export node is unlinked so it cannot leak the tmpfs pool.
 - **Authentication** — DRM master tokens for secure multi-client access.
-- **VirtIO-GPU IOCTLs** — `VIRTGPU_MAP`, `VIRTGPU_RESOURCE_CREATE`, `VIRTGPU_TRANSFER_TO_HOST`, `VIRTGPU_GET_CAPS`, and related operations for hardware-accelerated rendering via the VirtIO GPU protocol.
+- **VirtIO-GPU IOCTLs** — `VIRTGPU_MAP`, `VIRTGPU_RESOURCE_CREATE`, `VIRTGPU_TRANSFER_TO_HOST`, `VIRTGPU_GET_CAPS`, `VIRTGPU_EXECBUFFER`, and related operations.
 - **mmap** — `DRM_IOCTL_VIRTGPU_MAP` backed by `map_kernel_device` allows userspace to memory-map the hardware framebuffer directly, bypassing the VFS write path for maximum throughput.
 
-The DRM server runs as a dedicated user-space task and exposes the device via the VFS as `/dev/dri/card0`. Userspace opens the device, authenticates, and then drives the display pipeline through standard Linux DRM ioctls, making it possible to run unmodified DRM client code.
+The DRM server runs as a dedicated user-space task and exposes the device via the VFS as `/dev/dri/card0`, plus a **render node** at `/dev/dri/renderD128`. Userspace opens the device, authenticates, and then drives the display pipeline through standard Linux DRM ioctls, making it possible to run unmodified DRM client code — `kmscube` renders animated frames on both architectures, and `cosmic-comp` drives the display through this path.
+
+State that upstream scopes per open-file is scoped per open-file here too: the virtio-gpu 3D context, GEM handle ownership, and fences are keyed off the open file description rather than the process, which is what allows a multithreaded compositor and a Vulkan client to hold the device at the same time without stepping on each other.
 
 ### VirtIO GPU driver
 
@@ -317,7 +456,42 @@ The DRM subsystem implements **software scaling** (`drivers/drm`) allowing appli
 
 ### Framebuffer console
 
-The framebuffer console now renders text using a **Fira Code vector font** (`drivers/vector_font`). The driver parses TrueType/OpenType glyph outlines, rasterizes them at the requested point size, and caches rendered glyphs in a slab-backed glyph cache. The result is crisp, sub-pixel-positioned text in the kernel console at any resolution.
+The framebuffer console renders text using a **Fira Code vector font** (`drivers/vector_font`). The driver parses TrueType/OpenType glyph outlines, rasterizes them at the requested point size, and caches rendered glyphs in a slab-backed glyph cache. The result is crisp, sub-pixel-positioned text in the kernel console at any resolution.
+
+The console is a real **VT emulator**, not a print sink: it answers cursor-position reports (`ESC[6n`), reports the true console geometry through `TIOCGWINSZ`, and delivers multi-byte ANSI escape sequences to a reader in one `read` rather than splitting them. The framebuffer is the authoritative console — it wins geometry ties against the serial port.
+
+Console writes are **atomic**. They were not always: a kernel trace interleaved mid-sequence with the shell's `ESC[38;5;` prompt colour once spliced together into a literal `ESC[3i` — ANSI *media copy* — which opened a print dialog on the host terminal. The CSI final-byte alphabet is now restricted to what the console actually implements.
+
+---
+
+## GPU acceleration — Vulkan via Venus
+
+`vktest` running inside LeandrOS enumerates and opens a **real host GPU** through Mesa's Venus ICD, on a stock host with no custom virglrenderer:
+
+```
+vkEnumeratePhysicalDevices count=1
+  "Virtio-GPU Venus (AMD Ryzen 9 7950X (RADV RAPHAEL_MENDOCINO))"
+vkCreateDevice VK_SUCCESS
+```
+
+The path is: guest Vulkan client → Mesa Venus ICD → `VIRTGPU_EXECBUFFER` on our render node → virtio-gpu virtqueue → host virglrenderer's `vkr` decoder → host GPU driver.
+
+The kernel-side pieces that make this work:
+
+- A host-populated **Venus capset** returned from `VIRTGPU_GET_CAPS`.
+- A **render node** (`/dev/dri/renderD128`) that is discoverable — `opendir("/dev/dri")` enumerates it and `drmGetVersion` passes Mesa's identity check.
+- Correct 3D wire protocol: `CTX_ATTACH_RESOURCE`, honoured `ring_idx`, and hard failures instead of silent ones.
+- **HOST3D blob mapping** through the host-visible window, which is how Mesa's command ring is shared with the host.
+- `GETPARAM` writing *through* the user pointer, as upstream does — the value field is a pointer, not a scalar.
+- Device VMAs **aliased across `fork`** rather than copied.
+
+Required QEMU device line (the runner selects this automatically when available):
+
+```
+-device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G -display egl-headless
+```
+
+⚠️ `-nographic` silently overrides `-display`, and this needs a host EGL implementation — so the Venus path requires a **Linux host**; macOS has no EGL.
 
 ---
 
@@ -360,11 +534,49 @@ The evdev server (`servers/evdev`) exposes keyboard and pointer hardware using t
 
 - Implements the `struct input_event { timeval, type, code, value }` layout from `linux/input.h`.
 - Per-device event ring buffers (64 events × 4 devices).
-- Supports `EV_KEY`, `EV_SYN`, and `EV_REL` event types.
+- Supports `EV_KEY`, `EV_SYN`, `EV_REL`, and `EV_ABS` event types.
 - Devices are registered as VFS nodes (`/dev/input/event0`, etc.) and clients read events via standard `read` ioctls.
+- **virtio-keyboard** (`event0`) and **virtio-tablet** (`event1`, an absolute-position pointer reporting `INPUT_PROP_POINTER`) are attached by default on both architectures, with the full `EVIOC*` ioctl surface libinput queries during device probe.
+- Every virtio-input function on the bus is bound and routed to evdev, rather than only the first.
 - Full Linux scan-code mapping (`KEY_*` constants) so that existing input libraries can be used without modification.
 - Key down/up events are delivered separately with no synthetic repeat injection; repeat is left to the application layer.
 - Shift-key state tracking and full printable character mapping including special symbols.
+
+### Seat and device discovery
+
+Real **libinput** and **libxkbcommon** are ported and run unmodified. The two pieces of Linux plumbing beneath them that assume a daemon we do not have — `libseat` (seatd) and `libudev` (udevd) — are replaced by **shims** in `ports/input-stack`, backed by a synthetic sysfs skeleton. There is no seatd, no udevd, and no VT switching.
+
+---
+
+## Desktop stack — Wayland and COSMIC
+
+The **COSMIC desktop environment runs unmodified** on both architectures: no source patches, only build-configuration flags. Everything beneath it is ours.
+
+```
+cosmic-session
+  ├─ busd                D-Bus broker (pure Rust, from the zbus authors)
+  ├─ cosmic-comp         Wayland compositor, on KMS via Mesa softpipe
+  ├─ cosmic-bg           wallpaper
+  └─ cosmic-panel        panel bar + embedded Wayland applet clients
+```
+
+**Committed architecture.** COSMIC is built for `*-unknown-linux-musl` and **dynamically linked** against a real `ld-musl` — `dlopen` sits on the critical path in three separate places (cosmic-comp's EGL loading, Mesa's GBM/DRI loader, cosmic-panel's `use_system_lib`), so static linking was never an option. Graphics go through Mesa **softpipe** via gallium `kms_swrast` over dumb buffers, on the atomic KMS path. The session launches from a login shell: login → `start-cosmic` under `brush`.
+
+Supporting this required the ELF loader to grow real dynamic-linking support — `ET_DYN` loaded at a bias, `PT_INTERP` honoured — plus VMA splitting at range boundaries for `munmap`/`mprotect`, an 8 MB user stack matching the Linux default, and shared tmpfs/memfd pages for `wl_shm` pools.
+
+Most of the kernel work in this area was not "add a feature" but "match Linux exactly": a full multithreaded GPU desktop is an extremely effective probe for compatibility gaps that no test suite had surfaced. Roughly thirty real kernel bugs were found and fixed this way — among them the `execve` signal-reset/de-thread trio, TGID-keying of per-process tables, dropped `eventfd`/`accept4`/`socketpair`/`F_SETFD` flags, a poll-deadline lost-wake, a cross-thread timed-futex wake race, `AF_UNIX` refcounting and full-ring `EAGAIN`, and a `mincore` stub that returned success for unmapped pages (which made Mesa's `_eglPointerIsDereferenceable` accept `(void*)3` and fault the panel deep inside `eglCreatePlatformWindowSurfaceEXT`).
+
+### Ports
+
+`ports/` holds the build recipes for third-party software, each with the exact toolchain invocation that produces a working binary:
+
+| Port | Contents |
+|---|---|
+| `mesa` | softpipe / `kms_swrast` GL stack, and the Venus Vulkan ICD |
+| `gl-stack` | GL support libraries and test clients (`kmscube`) |
+| `input-stack` | libinput, libxkbcommon, and the libseat / libudev shims |
+| `dbus`, `busd` | Reference `dbus-daemon`, and the `busd` broker actually used |
+| `cosmic-session`, `cosmic-greeter` | Session and greeter build configuration |
 
 ---
 
@@ -385,6 +597,12 @@ LeandrOS ships **relibc** (external sibling checkout at `../relibc`, built by `s
 
 The thin `leandros-libc` (`userland/libc`) provides Rust-callable wrappers around the LeandrOS syscall ABI: `open`, `read`, `write`, `close`, `mmap`, `ipc_call`, `get_audio_port`, and port-discovery helpers exported with C linkage so that relibc and native Rust userland can share the same interface.
 
+### musl
+
+Ported third-party software — Mesa, D-Bus/busd, COSMIC, brush, coreutils — is built for `*-unknown-linux-musl` and **dynamically linked** against a real `ld-musl`, which is shipped in the image. This is not a second-class path: it is how the desktop runs, and it works precisely because the kernel implements the real Linux syscall numbers rather than a translation layer. Nothing in those projects is patched to know it is running on LeandrOS.
+
+One toolchain caveat worth recording: musl static binaries must be built with `-C relocation-model=static`. Left to its own devices, `x86_64` defaults to static-PIE, which the loader maps at vaddr 0.
+
 ### Threading (pthreads)
 
 Full pthread support — `pthread_create`/`join`, mutexes, condition variables, thread-local storage, and cleanup handlers — is verified working on both architectures.
@@ -403,15 +621,16 @@ All drivers that need userspace access are fronted by **server tasks** that acce
 
 | Server | VFS path | Protocol |
 |---|---|---|
-| `vfs` | — | File descriptor table, `open`/`read`/`write`/`close`/`ioctl` routing |
-| `drm` | `/dev/dri/card0` | Linux DRM ioctls over VFS ioctl messages |
+| `vfs` | — | File descriptor table, `open`/`read`/`write`/`close`/`ioctl` routing, tmpfs, mounts |
+| `f2fs` | `/`, `/data` | On-disk filesystem over virtio-blk |
+| `drm` | `/dev/dri/card0`, `/dev/dri/renderD128` | Linux DRM ioctls over VFS ioctl messages |
 | `evdev` | `/dev/input/eventN` | Linux `input_event` reads |
 | `pipewire` | `/run/pipewire/pipewire-0` | PCM write, IOCTL control |
-| `tty` | `/dev/tty0` | Terminal line discipline |
+| `tty` | `/dev/tty0` | Terminal line discipline, job control, POSIX timers |
 | `proc` | `/proc` | Process information |
-| `net` | `/dev/net/tun` | Network I/O |
+| `net` | AF_UNIX socket nodes, `/dev/net/tun` | Sockets, TCP/IP, AF_UNIX |
 
-VFS resource lifecycle (open/close notifications) ensures that server-side handles are cleaned up when a client task exits or closes a descriptor.
+VFS resource lifecycle (open/close notifications) ensures that server-side handles are cleaned up when a client task exits or closes a descriptor — on *every* path out of a task, including a fatal signal, not just a clean `exit`.
 
 ---
 
@@ -437,25 +656,64 @@ VFS resource lifecycle (open/close notifications) ensures that server-side handl
 
 **Exit-log side-table** — `sched::run()` reaps zombie tasks immediately after they exit, but records their exit code in a 256-slot `EXIT_LOG` table keyed by PID. `wait_pid` falls back to this table when `find_pid` returns `None`, eliminating the race between the reaper and the waiter.
 
+**Never touch user memory under a scheduler spinlock** — a demand-paging fault taken while holding `RUN_QUEUE` with interrupts off re-enters the scheduler lock and freezes every vCPU with no panic and no output. All cross-boundary copies in the scheduler and the in-kernel servers go through `AddressSpace::read_user_buf`/`write_user_buf` outside the lock, for `sigprocmask`/`sigaction`, `wait`/`waitid`/`flock`, and the timer tables alike.
+
+**One resolver for every path syscall** — path resolution, symlink following, `AT_*` dirfd handling, and chroot confinement live in a single resolver rather than being reimplemented per syscall. `renameat` honouring its dirfds, not just its paths, was the difference between a clean desktop session log and a storm of `ENOENT`s from atomic state writes.
+
+**Debug output is gated and off by default** — render and audio hot paths, task lifecycle, `[MMAP]`/`[CPIO]` tracing, EL0 fault backtraces, and the unix-socket exchange trace are all behind consts defaulting to off. Unconditional serial writes on a hot path do not merely slow the system down; they change its timing enough to hide the race being investigated.
+
+**Round up, never truncate, when converting time** — `nanosleep` truncating every sub-tick sleep to zero passed every correctness test in the tree and was invisible for months, until Mesa's watchdog fired 200× early and `abort()`ed. `nanosleep` rounds up and `clock_nanosleep` honours `TIMER_ABSTIME`.
+
 ---
 
 ## Userland programs
 
+### Programs
+
 | Program | Description |
 |---|---|
-| `init` | PID-1 process; spawns servers and user tasks from the initrd |
-| `shell` | Interactive CLI with Unix-style commands and VFS integration |
+| `init` | PID-1 process; brings up servers, mounts filesystems, runs the getty loop |
+| `login` | Authenticates against `/etc/shadow`, drops privilege via `setresuid`/`setresgid` |
+| `shell` | Built-in CLI with Unix-style commands and VFS integration |
+| `brush` | Ported POSIX shell — the interactive default, with working job control |
 | `aplay` | Command-line audio player (WAV, MIDI, test tone) |
+| `mount` / `umount` / `fstab` | Filesystem mount management |
+| `lsblk` / `lspci` / `lsusb` | Device enumeration with real block-device capacity |
+| `ping` | ICMP echo over the smoltcp stack |
+| `xattr-util` | Get/set/list extended attributes and POSIX ACLs |
+| `tput` | Terminal capability query |
 | `hello` | Minimal "Hello, world!" demonstration |
-| `memtest` | Regression suite: fork/CoW isolation, `mremap`, buddy allocator churn, `MAP_SHARED` |
-| `vfstest` | Regression suite: `rmdir`, cross-mount `rename`, `flock`/`fcntl` locking, permissions |
-| `f2fstest` | Regression suite: F2FS direct/indirect/double-indirect block pointers, directories |
-| `pthreadtest` | Regression suite: `pthread_create`/`join`, mutex, condvar, TSD, cleanup handlers |
-| `timertest` | Regression suite: POSIX timers, `alarm`/`setitimer`, real `SIGALRM` delivery |
-| `sigtest` | Regression suite: `sigaction` struct layout, signal delivery/return, `sigprocmask`/`sigpending`, `SIG_IGN`, `raise()` |
-| `polltest` | Regression suite: `poll`/`select`/`epoll` real fd readiness, `epoll_wait` timeout, pipe `POLLHUP` writer refcount across `dup` |
 
-Programs are linked against **relibc** for full POSIX compatibility, or against the lighter `leandros-libc` shim for `no_std` Rust programs. Binaries are embedded in the initrd image and extracted at boot. `pthreadtest`, `timertest`, `sigtest`, and `polltest` link `librelibc.a` directly rather than `leandros-libc`, since they need TLS bring-up (`relibc_start_v1`) for real `pthread`/`errno`/`sigaction`/`epoll` support.
+A ported **coreutils** provides the usual file and text utilities.
+
+### Regression suites
+
+| Suite | Coverage |
+|---|---|
+| `memtest` | fork/CoW isolation, `mremap`, buddy allocator churn, `MAP_SHARED` |
+| `vfstest` | `rmdir`, cross-mount `rename` (incl. POSIX replace), `flock`/`fcntl` locking, permissions, xattrs |
+| `f2fstest` | Direct/indirect/double-indirect block pointers, directories |
+| `pthreadtest` | `pthread_create`/`join`, mutex, condvar, TSD, cleanup handlers |
+| `timertest` | POSIX timers, `alarm`/`setitimer`, real `SIGALRM` delivery |
+| `sigtest` | `sigaction` struct layout, signal delivery/return, `sigprocmask`/`sigpending`, `SIG_IGN`, `raise()` |
+| `polltest` | `poll`/`select`/`epoll` real fd readiness, `epoll_wait` timeout, pipe `POLLHUP` writer refcount across `dup` |
+| `epolltest` / `wakepolltest` | epoll edge cases; same-thread `EPOLLET`/level eventfd re-arm |
+| `scmtest` | `SCM_RIGHTS` fd passing, shared mmap, memfd seals and collisions, AF_UNIX socket nodes, tmpfs mounts, `mincore`, fork+exec fd inheritance |
+| `forktest` / `waittest` / `sigchldtest` / `racetest` | Process lifecycle, `wait4`/`waitid`, `SIGCHLD`, concurrency races |
+| `idletest` | Verifies the system genuinely idles rather than busy-polling |
+| `drmsmoke` | Raw-ioctl DRM smoke test against `/dev/dri/card0` |
+| `evtest2` | evdev virtio-tablet capability and poll test |
+| `venustest` | Venus/virtio-gpu 3D **transport** conformance — asserts a non-empty host-populated capset, since "the ioctl returned 0" proves nothing when the risk is a silently wrong wire protocol |
+
+`vktest` (a staged external binary, built from the Mesa port) is the end-to-end Vulkan check: it `dlopen`s the Venus ICD, enumerates physical devices, and creates a logical device on the real host GPU.
+
+Programs link against **relibc** for full POSIX compatibility, against the lighter `leandros-libc` shim for `no_std` Rust programs, or against **musl** for ported third-party software. Test binaries needing TLS bring-up (`relibc_start_v1`) for real `pthread`/`errno`/`sigaction`/`epoll` support link `librelibc.a` directly.
+
+### Running the suites
+
+`scripts/scmrun.py` drives a QEMU boot over a serial socket and collects results — a persistent serial reader is necessary, because QEMU drops output when nothing is attached and a long test run then looks like a hang.
+
+Run the suites against a **fresh disk image** when the result matters. Images persist across boots, and a suite that has already run against one can leave state that changes the next run's outcome — `O_TRUNC` clears a file's data but not its xattrs, which is exactly the sort of thing that manufactures a phantom architecture-specific failure.
 
 ---
 
