@@ -70,7 +70,20 @@ timeout (TCG passes on both arches) found a real kernel defect — blob mappings
 the host's requested cacheability, forcing write-back on memory Mesa's fence-feedback
 path asked to be write-combined — split out as a new item at position 2, right after
 `import_fd`. Former items 2-3 shifted down to 3-4; former item 4 deleted; items 5-11
-unchanged.
+unchanged. Same day, a tenth wave completed the analysis on item 2: `git log -S` on the
+warning string traced the cacheable override to a deliberate deferred-scope decision
+recorded in `0dfc362`, not a workaround, and both reasons given there are now dead. A
+source pass over both arches found the fix needs a new, arch-neutral `WRITECOMBINE`
+flag rather than reusing `NOCACHE` — x86_64 has the attribute (PCD, no PAT needed since
+there is no PAT setup to make UC anything but the reset state) but aarch64's
+`ATTR_NOCACHE` produces Device memory, not Normal-NC, because neither Limine nor our
+direct-boot path programs MAIR attributes 2..7. Item 2 is rewritten around the completed
+analysis and a prepared patch, confirmed to stack with the in-flight primary-plane work
+in both orders. Two new items were split out of what the pass uncovered along the way:
+item 3 (the `ATTR_NOCACHE`/MAIR gap is live independent of the blob work — it also means
+the framebuffer has silently been Device memory all along) and item 4 (x86_64 has no PAT
+or MTRR setup, so true write-combining is unreachable there either, a separate ceiling
+worth recording). Former items 3-11 shifted down to 5-13.
 
 ---
 
@@ -222,16 +235,18 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | # | Item | Category | Blocked on |
 |---|---|---|---|
 | 1 | `import_fd` double-releases on EMFILE — use-after-free class | Bug — kernel | — |
-| 2 | Blob mappings ignore the host's requested cacheability | Bug — kernel | — |
-| 3 | Vulkan renders on LeandrOS; next is presenting it | Feature | — |
-| 4 | `PRIME_HANDLE_TO_FD` rejects Venus blob handles | Bug | — |
-| 5 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
-| 6 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
-| 7 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
-| 8 | Delete the unreachable `init-server` crate | Cleanup | — |
-| 9 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
-| 10 | No TIME_WAIT — ports are instantly reusable | Bug | — |
-| 11 | Deferred / known limitations | Mixed | — |
+| 2 | Blob mappings ignore the host's requested cacheability — fix prepared | Bug — kernel | — |
+| 3 | `ATTR_NOCACHE` on aarch64 is Device memory, not Normal-NC | Bug — kernel | — |
+| 4 | x86_64 has no PAT or MTRR setup | Bug | — |
+| 5 | Vulkan renders on LeandrOS; next is presenting it | Feature | — |
+| 6 | `PRIME_HANDLE_TO_FD` rejects Venus blob handles | Bug | — |
+| 7 | Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix) | Perf | — |
+| 8 | `listen()` twice returns EINVAL — fix prepared | Bug | — |
+| 9 | `unused variable: port` in `handle_close` — not a leak, fix prepared | Cleanup | — |
+| 10 | Delete the unreachable `init-server` crate | Cleanup | — |
+| 11 | AF_UNIX `listen()` is lax in the opposite direction | Bug | — |
+| 12 | No TIME_WAIT — ports are instantly reusable | Bug | — |
+| 13 | Deferred / known limitations | Mixed | — |
 
 ---
 
@@ -321,32 +336,123 @@ the patched kernel must PASS. Failing signature: `[emfile] post ret=0 errno=0` w
 **`scmtest` 28/0 → 29/0** (30/0 if the small-fixes patch also lands; the two are
 additive).
 
-### 2. Blob mappings ignore the host's requested cacheability
+### 2. Blob mappings ignore the host's requested cacheability — fix prepared
 
 `drivers/src/drm_device_interface.rs:3740-3748` logs `"[DRM] WARNING: host asked for
-non-cached blob mapping; mapping cacheable anyway"` and overrides the request. **This
-wave is the first time it has bitten.** `vkrender`'s `s0_submit` **times out under
-x86_64/KVM** (2/2 runs) while passing under x86_64/TCG and aarch64/TCG, and passing
-under KVM with `VN_PERF=no_fence_feedback`. Measured, not guessed: host tracing showed
-20 submits total, all `size 24`, every one fence-responded, and **zero submits during
-the 20 s wait** — the guest was spinning on memory, not on an ioctl. Mesa explains why:
-with fence feedback (the default) `vn_GetFenceStatus` reads `*slot->status`, a plain
-memory read that never touches the ring (`vn_queue.c:1694`, `vn_feedback.h:103`), and
-`vn_feedback_buffer_create` picks the **first** `HOST_COHERENT` memory type
-(`vn_feedback.c:76`) — memtype 2, which lacks `HOST_CACHED` — so the host requests a
-non-cached mapping on exactly that resource (`map_info=0x03`, WC). Subtest 0's own
-readback buffer is memtype 5 (`HOST_CACHED`, `map_info=0x01`), mapped correctly, and
-reads back perfectly.
+non-cached blob mapping; mapping cacheable anyway"` and overrides the request.
+`vkrender`'s `s0_submit` **times out under x86_64/KVM** (2/2 runs) while passing under
+x86_64/TCG and aarch64/TCG, and passing under KVM with `VN_PERF=no_fence_feedback`.
+Measured, not guessed: host tracing showed 20 submits total, all `size 24`, every one
+fence-responded, and **zero submits during the 20 s wait** — the guest was spinning on
+memory, not on an ioctl. Mesa explains why: with fence feedback (the default)
+`vn_GetFenceStatus` reads `*slot->status`, a plain memory read that never touches the
+ring (`vn_queue.c:1694`, `vn_feedback.h:103`), and `vn_feedback_buffer_create` picks the
+**first** `HOST_COHERENT` memory type (`vn_feedback.c:76`) — memtype 2, which lacks
+`HOST_CACHED` — so the host requests a non-cached mapping on exactly that resource
+(`map_info=0x03`, WC). Subtest 0's own readback buffer is memtype 5 (`HOST_CACHED`,
+`map_info=0x01`), mapped correctly, and reads back perfectly.
 
-Inferred but well-supported: forcing write-back on a blob the host asked to be WC is
-only observable under hardware virtualization, which is why TCG masks it on both arches
-— **aarch64 passing does not exonerate this**, since aarch64 ran TCG only on an x86
-host; under HVF it would likely bite too. Fix: honour `VIRTIO_GPU_MAP_CACHE_WC`/
-`UNCACHED` in the blob mapping instead of overriding to cacheable. It is a latent
-correctness bug for every host-visible blob, not just fence feedback, and fixing it is
-predicted to turn x86_64/KVM green on the default path.
+**The override was deferred scope, not a workaround.** `git log -S` on the warning
+string gives one commit, `0dfc362`, whose message says so outright: mappings are
+cacheable regardless of `map_info`, which was right for the Venus ring (the renderer
+reports `CACHE_CACHED`), and honouring anything else would need a cache type plumbed
+through the mmap reply. Both reasons are now dead — the 0x1007 reply carried one `u64`
+and slot 1 was free (`VFS_POLL` already uses slot 1 for `seq`, so there is precedent),
+and "no blob asks for anything else" stopped being true the moment Mesa's
+fence-feedback buffers appeared. `0dfc362` also records that `RESOURCE_MAP_BLOB` had
+never been sent on the wire at that point, so nothing was measured. Nothing is being
+worked around; there is no reason to keep it.
 
-### 3. Vulkan renders on LeandrOS; next is presenting it
+**The arches are not symmetric, and that set the shape of the fix.**
+- *x86_64: the attribute exists.* `PageFlags::NOCACHE` maps to PCD
+  (`arch/x86_64/src/paging.rs:387`). There is **no PAT and no MTRR code anywhere in
+  `arch/x86_64/`**, so the reset `IA32_PAT` applies and PCD alone selects UC. Real WC is
+  not reachable without `IA32_PAT` bring-up, which we deliberately do not do — UC is a
+  strictly stronger substitute with the same coherence guarantee and worse write
+  throughput, and UC/WC aliases of one page are compatible where UC/WB and WC/WB are the
+  SDM-undefined combinations.
+- *aarch64: the attribute does not exist, and the code claims it does.*
+  `arch/aarch64/src/paging.rs:21` declares `ATTR_NOCACHE = 3 << 2; // index 3 (normal
+  NC)`. **That comment is false in practice.** The kernel never programs MAIR on the
+  Limine path, and disassembly of the shipped `BOOTAA64.EFI` (Limine 11.4.1) shows MAIR
+  built as `0xFF | (dev_attr << 8)` at file offset `0x209ec`-`0x209f0`, with a second
+  path setting `0xFF` flat — **attributes 2..7 are zero on both**. Our own direct-boot
+  path (`kernel/src/entry_aarch64.s:171`) writes `MAIR = 0x04FF`, likewise zero above
+  index 1. A zero MAIR attribute byte is **Device-nGnRnE**, so `PageFlags::NOCACHE` on
+  aarch64 produces Device memory, which forbids unaligned access — unusable for a buffer
+  Mesa memcpys through, and it would have turned the KVM hang into an alignment fault.
+
+**The fix** adds an arch-neutral `PageFlags::WRITECOMBINE` (bit 6), deliberately
+**separate** from `NOCACHE`, mapping to PCD on x86_64 and to a newly-installed **MAIR
+index 2 = `0x44`** (Normal Inner/Outer Non-cacheable, Linux's `MT_NORMAL_NC`) on
+aarch64. Index 2 is the safe slot: its flag `ATTR_STRICT` had **zero users** in the
+tree, so no live translation is reinterpreted. The MAIR write is a read-modify-write in
+`mmu::enable_identity` preserving attrs 0 and 1, placed before `arch::init` maps
+anything and before `smp_init` snapshots MAIR for the APs.
+
+Scoping is by `map_info`, and only host-visible blobs have one — `blob_map_cache_type`
+matches only entries with `map_phys != 0`, so dumb buffers and guest-backed blobs are
+untouched. That matters, because the kernel *does* memcpy through those via
+`phys_to_virt`. The Venus command ring reports `CACHE_CACHED` and stays write-back, as
+does subtest 0's readback buffer (memtype 5, `map_info=0x01`), so `s2_checksum` has no
+reason to move. Nothing is refused: refusing a non-cached MAP would break Venus outright
+on both arches, a regression rather than an honest refusal.
+
+**Patch prepared** at
+`~/code/leandros-artifacts/notes/m9-blob-cacheability/blob_cacheability.patch` (373
+lines, 7 files, +211/−21), `git apply --check`-clean and round-trip verified at
+`1c5c708`, and confirmed to stack with the in-flight primary-plane work in **both**
+orders (verified empirically by reconstructing that tree, not by inspection — their
+hunks end at HEAD line 2487, mine are at 850, 1142, 3459 and 3601).
+
+**Verify in this order.** First, the cheap local one: a one-line boot print of
+`MAIR_EL1` either side of the new read-modify-write under aarch64/HVF. The "attrs 2..7
+are zero" claim is static disassembly, not a runtime read, and **the entire aarch64
+half rests on it**. Then, on the Linux box (the Mac has no EGL), the decisive test:
+`run-qemu.sh --venus` x86_64 under **KVM** with `vkrender` and **without**
+`VN_PERF=no_fence_feedback` — `s0_submit` must pass where it currently times out 2/2;
+run it at least three times. Serial must show the non-cached mapping honoured for the
+feedback blob (`map_info=0x03`) and **not** for the ring (`0x01`) — that line proves the
+scoping, not merely that the hang went away. Non-regression: `s2_checksum` stays
+`0x02C0FDC5` on all three configurations, `venustest` 68/68, `vktest` 0 failures, full
+suite at baseline on fresh images.
+
+**Residual risk worth naming, and its discriminator.** The root cause — a guest
+write-back alias of a host WC mapping, with TCG modelling no guest cache and therefore
+passing — is well supported, but one link is host-side and unverifiable from this repo:
+KVM's EPT memory type for the `ram_device` memslot QEMU creates for a mapped blob. If
+KVM sets `IPAT` with WB, the guest PTE is ignored and **no guest-side change can fix
+it**. Discriminator: if `s0_submit` still hangs with the patch applied *and* the new
+serial line confirms the feedback blob took the uncached path, the answer is host-side
+and the next step is QEMU/KVM, not more kernel work. Note also that aarch64/HVF
+**cannot** corroborate the "TCG masks it" hypothesis — that needs a host-visible
+virtio-gpu blob under hardware virtualization, which needs EGL, which macOS lacks. The
+aarch64 half is a latent-bug fix with no reachable failing test today; its evidence is
+the MAIR read.
+
+### 3. `ATTR_NOCACHE` on aarch64 is Device memory, not Normal-NC
+
+`arch/aarch64/src/paging.rs:21` names MAIR index 3 "normal NC", but neither Limine nor
+our direct-boot path programs attributes 2..7, so index 3 is zero = **Device-nGnRnE**.
+Consequences beyond the blob work: **the framebuffer (`arch/aarch64/src/lib.rs:116`)
+has silently been Device memory all along**, working only because `pitch = width*4`
+keeps every access aligned — an unaligned framebuffer access would fault, and any future
+code doing one would look like a mysterious alignment bug. `drivers/src/snd.rs:244`
+maps an MMIO BAR with the same flag and *correctly wants* Device, which is exactly why
+the blob fix introduces a separate `WRITECOMBINE` flag rather than redefining
+`NOCACHE`. The comment must be corrected whether or not the blob patch lands, and the
+framebuffer's attribute should be reconsidered deliberately rather than by accident.
+
+### 4. x86_64 has no PAT or MTRR setup
+
+Grepping `arch/x86_64/` finds `wrmsr` only for APIC, EFER, STAR, LSTAR and GSBASE — no
+`IA32_PAT`, no MTRR. The reset PAT therefore applies, so `PageFlags::NOCACHE` (PCD)
+selects UC and **true write-combining is unreachable**. Not currently a problem — UC is
+strictly stronger and correct wherever we use it — but it is a real ceiling on
+framebuffer and blob write throughput, and anything that eventually wants WC
+performance needs `IA32_PAT` bring-up first.
+
+### 5. Vulkan renders on LeandrOS; next is presenting it
 
 **GPU work now executes.** `vkrender` was built, staged (`b2260b4`) and run: subtest 0
 (shaderless `vkCmdFillBuffer`) passes with `fence signalled after 86 ms` and `all 65536
@@ -404,7 +510,7 @@ produces a **static** binary, which cannot `dlopen` the ICD. Corrected recipes a
 **Next is presentation.** `--present` (a dumb-buffer blit reusing `drmsmoke`'s
 `ADDFB2`/`SETCRTC` sequence) is written and staged but unrun; it needs COSMIC stopped,
 since we never gate `SETCRTC` on DRM master. After that, M4 is a Wayland client, still
-blocked on the `PRIME_HANDLE_TO_FD` gap (item 4).
+blocked on the `PRIME_HANDLE_TO_FD` gap (item 6).
 
 **Linux-box tree state (trap).** That checkout is on a **detached HEAD** with two
 stashes, and **`stash@{0}` must not be blind-popped**. It holds 6 files but only 3 are
@@ -415,7 +521,7 @@ current HEAD — popping it would revert `4085b7f` (nested-epoll readiness). Re-
 instead. A raw copy of that stash also exists at
 `/home/forain/linux-tree-preexisting.patch` on the box.
 
-### 4. `PRIME_HANDLE_TO_FD` rejects Venus blob handles
+### 6. `PRIME_HANDLE_TO_FD` rejects Venus blob handles
 
 `kernel/src/syscall.rs:6049` resolves handles only through `dumb_buffer_phys_order`,
 returning EINVAL for any Venus blob, which blocks `vkGetMemoryFdKHR` and therefore
@@ -427,7 +533,7 @@ rendering. Also note the connector's missing `DPMS` property, which fails
 `VK_KHR_display` enumeration outright, and that `AUTH_MAGIC` returning `Ok(0)` with no
 master gating on `SETCRTC` lets a direct-KMS client fight cosmic-comp for the CRTC.
 
-### 5. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
+### 7. Primary-plane recomposite (FB_DAMAGE_CLIPS is the instrument, not the fix)
 
 **What we already have, measured.** The property is fully plumbed, not merely
 advertised: `PROP_FB_DAMAGE_CLIPS = 51` as `PropKind::Blob` in `PROPS`
@@ -505,7 +611,7 @@ screendumps >=2 s apart and confirm the digits differ, then force one full prese
 confirm it is pixel-identical. Note the cursor will not appear in `screendump` now that
 it is on the hardware plane. Plus `drmsmoke` 22/0 both arches and `idletest`.
 
-### 6. `listen()` twice returns EINVAL — fix prepared
+### 8. `listen()` twice returns EINVAL — fix prepared
 
 `handle_listen` matched only `SockState::InetBound`, so a repeat call fell to
 `_ => err_reply(-22)`. The fix adds one arm, `SockState::InetListening { .. } => return
@@ -529,7 +635,7 @@ listener afterwards — the last is what catches a fix that re-arms and orphans 
 **`scmtest` 28/0 → 29/0** — the memfd/TGID patch's two subtests already landed in
 `77f170d` and are part of the 28/0 baseline.
 
-### 7. `unused variable: port` in `handle_close` — not a leak, fix prepared
+### 9. `unused variable: port` in `handle_close` — not a leak, fix prepared
 
 **Measured, it is a warning and not a port leak.** `alloc_ephemeral_port`
 (`servers/net/src/lib.rs:442`) is the only allocator and derives "free" purely from live
@@ -542,7 +648,7 @@ renaming it to `_port` (a dead read invites someone to re-add it) and leaves a c
 recording why no release is needed. Verification is just that the warning is gone with
 no new ones, and `scmtest` unchanged.
 
-### 8. Delete the unreachable `init-server` crate
+### 10. Delete the unreachable `init-server` crate
 
 The scope is larger than this item previously stated. **`init-server` is a real
 dependency in `kernel/Cargo.toml:34`, so all 2653 lines compile into every kernel
@@ -573,23 +679,23 @@ both arches link with the crate gone, `grep -rn init_server .` is empty, serial 
 is **unchanged** to the login prompt (nothing in the crate ever printed), and the full
 suite is at baseline on fresh images.
 
-### 9. AF_UNIX `listen()` is lax in the opposite direction
+### 11. AF_UNIX `listen()` is lax in the opposite direction
 
 The AF_UNIX arm of `handle_listen` is an unconditional `ok_reply()` — a repeat listen
 already succeeds, but so does `listen()` on an unbound or already-connected AF_UNIX
-socket, where Linux answers EINVAL. Found while fixing the AF_INET side (item 6) and
+socket, where Linux answers EINVAL. Found while fixing the AF_INET side (item 8) and
 deliberately **not** changed there: tightening it alters behaviour for every AF_UNIX
 server on the system (cosmic-comp, busd, tokio) and could not be validated in a
 read-only session. Needs a live COSMIC session to land safely.
 
-### 10. No TIME_WAIT — ports are instantly reusable
+### 12. No TIME_WAIT — ports are instantly reusable
 
 `handle_close` calls `socket_set.remove()` immediately, so a closed TCP port can be
 rebound at once where Linux would hold it in TIME_WAIT. A divergence, not a leak, and
 low priority — but it is the kind of thing that makes a server restart behave
 differently here than on Linux.
 
-### 11. Deferred work and known limitations
+### 13. Deferred work and known limitations
 
 - **Doom does not link relibc.** `../doomgeneric/Makefile.leandros` links
   `userland/target/<arch>-unknown-none/release/libleandros_libc.a`, whose allocator is
@@ -642,7 +748,7 @@ differently here than on Linux.
   never relocates. It then faults at `__libc_start_main+0x44` with `CR2=0`, before
   `main` — a distinctive signature whose cause is not obvious from the fault alone.
   Always build userland through `scripts/build-userland.sh`.
-- **`driver.py` still has no Venus/GL mode.** Unblocked (item 3): QMP `screendump`
+- **`driver.py` still has no Venus/GL mode.** Unblocked (item 5): QMP `screendump`
   works under `-display egl-headless` in its bare form, without `device=`. The mode
   itself — teaching `.claude/skills/run-leandros/driver.py:_build_cmd` to build the
   `--venus` device line and call `screendump` bare — still needs writing.
