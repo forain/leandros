@@ -308,6 +308,18 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     // scripts/mkfs-f2fs-populated.py.
     vfs_server::register_device("/dev/dri/renderD128", port_id, DEV_ID_RENDER, DRM_MAJOR, RENDER_MINOR);
     port::register_handler(port_id, handle);
+    // Teach the VFS how to drop the DRM reference an exported dmabuf fd holds.
+    //
+    // This crate is the one place that already depends on BOTH `vfs_server` and
+    // `drivers`, so the edge lives here and `vfs-server` keeps its dependency
+    // list unchanged — it must not gain `drivers`. Registering here also means
+    // a build with no DRM device never registers at all, and the VFS's null
+    // check makes that a no-op, which is correct: nothing can have exported.
+    //
+    // The callee is invoked from tmpfs inode teardown with every VFS guard
+    // already dropped (see `DMABUF_RELEASE` in servers/vfs), because it takes
+    // VIRTIO_GPU and busy-spins on a device round-trip.
+    vfs_server::set_dmabuf_release(drivers::drm_device_interface::bo_release_exported);
     // Throttled page-flip event delivery runs off the 100 Hz tick. This does NOT
     // displace the audio pump (register_tick_hook fills the next free slot).
     sched::register_tick_hook(drivers::drm_device_interface::drm_tick);

@@ -338,6 +338,18 @@ const VIRTGPU_PARAM_LEANDROS_HOSTVIS_MIB: u64 = 0x1000_0003;
 /// merely believed. Truncated to 32 bits because GETPARAM writes an `int`.
 const VIRTGPU_PARAM_LEANDROS_LAST_FENCE: u64 = 0x1000_0004;
 
+/// LeandrOS-private GETPARAM: how many blob **objects** are live right now —
+/// not handles, not fds. Same justification as CTX_ID and HOSTVIS_SPANS: it
+/// makes an otherwise invisible kernel invariant assertable.
+///
+/// Specifically, it is the only way userspace can tell "the exported fd kept
+/// the buffer alive" from "the buffer was freed and the read happened to find
+/// plausible bytes". A count of handles would answer neither question, because
+/// the whole point of `BO LIFETIME` is that a handle and an object stop being
+/// the same thing. `userland/venustest` phase 6 asserts on it across a
+/// GEM_CLOSE-then-close(fd) sequence.
+const VIRTGPU_PARAM_LEANDROS_BLOB_OBJS: u64 = 0x1000_0005;
+
 /// `drm_virtgpu_context_set_param.param` values.
 const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
 const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
@@ -766,7 +778,7 @@ struct DumbBuf {
     phys: usize,
     order: usize,
     /// Fence of the most recent EXECBUFFER that named this BO in `bo_handles`
-    /// (0 = never named). See "THE FENCE MODEL" on `BlobBuf`.
+    /// (0 = never named). See "THE FENCE MODEL" on `BlobObj`.
     ///
     /// A dumb buffer is a 2D scanout target and no 3D client has any reason to
     /// name one in a submission — but `bo_handles` is a plain handle array and
@@ -775,9 +787,78 @@ struct DumbBuf {
     /// outstanding" for a buffer a submission had genuinely touched, which is
     /// exactly the class of wrong answer the per-BO fence exists to remove.
     last_fence: u64,
+    /// Lifetime identity, from the same `NEXT_BO_OBJ` space blob objects use.
+    /// It is what an exported dmabuf fd remembers, because a *gem handle* must
+    /// not be what keeps a buffer alive: handles are retired by DESTROY_DUMB /
+    /// GEM_CLOSE while the fd is still open, and (for blobs) they are per-open.
+    /// See `BO LIFETIME` below.
+    obj: u32,
+    /// Live references. One for the gem handle itself while `handle_live`, plus
+    /// one for **each exporting `TmpVmo` slot** (per slot, not per fd — dup,
+    /// fork and SCM_RIGHTS copies of one dmabuf fd already share one slot).
+    refs: u32,
+    /// False once DESTROY_DUMB / GEM_CLOSE has retired the gem handle. The
+    /// record then survives only to keep exporting fds valid, and every handle
+    /// resolution path treats it as absent, so the handle number is as dead as
+    /// it was before this refcount existed.
+    handle_live: bool,
 }
 
 static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new());
+
+// ── BO LIFETIME ──────────────────────────────────────────────────────────────
+//
+// THE BUG THIS EXISTS TO CLOSE. `release_blob`/`free_dumb` used to call
+// `mm::buddy::free(phys, order)` the moment the gem handle went away, and
+// `vmo_free_slot` (servers/vfs) returns early for a borrowed VMO on the stated
+// grounds that the DRM layer frees the block exactly once. Nothing anywhere
+// made the DRM object outlive an exported dmabuf fd, so from ONE unprivileged
+// process, with no cross-open work at all:
+//
+//     h  = RESOURCE_CREATE_BLOB(blob_mem = GUEST, size = N)
+//     fd = PRIME_HANDLE_TO_FD(h)          // borrowed VMO aliases those frames
+//     GEM_CLOSE(h)                        // buddy::free(phys, order)
+//     read(fd, buf, N)                    // walks the FREED frames via the HHDM
+//
+// The read succeeded and returned whatever the buddy allocator had since handed
+// those frames to — page tables, slab pages, another process's anonymous memory
+// — and `mmap(fd, MAP_SHARED)` was the same hazard with writes. Pre-existing on
+// the dumb path since PRIME export existed; widened to blobs by the export.
+//
+// THE RULE. A BO object is destroyed when its reference count reaches zero.
+// References are held by:
+//   1. each gem handle naming it (a `BlobHandle` in `BLOB_BUFFERS`, or a live
+//      `DUMB_BUFFERS` entry), and
+//   2. each **exporting `TmpVmo` slot** in the VFS.
+// Granularity 2 is per slot and not per fd on purpose: `TMP_VMOS` is keyed by
+// the data-owning slot, so dup/fork/SCM_RIGHTS copies of one dmabuf fd share
+// one slot and that slot is destroyed exactly once, by `vmo_free_slot`. One ref
+// per slot is therefore both sufficient and impossible to double-drop.
+//
+// THE OPPOSITE FAILURE — double release — is the class this project hit in
+// `9be954f` (the `import_fd` EMFILE double-release): two `resource_unref`s for
+// one resource and a double `mm::buddy::free` of an order-N block, which is
+// allocator corruption rather than a leak. Two structural guards:
+//   * every decrement is a test-and-remove under ONE acquisition of the object
+//     map, so two racing droppers cannot both observe zero;
+//   * the teardown body lives INSIDE `blob_unref`'s / `dumb_unref_by_obj`'s
+//     zero arm, on the record those functions removed. There is no
+//     `release_blob(record)` entry point any more, so there is nothing a caller
+//     that "knows" the count could call.
+// An unref of an object that is already gone logs `[DRM] bo refcount underflow`
+// and returns without freeing anything.
+//
+// LOCK ORDER. `BLOB_BUFFERS` (handles) and `BLOB_OBJS` (objects) are separate
+// leaf locks and are taken ONE AT A TIME, never nested, exactly as
+// `BLOB_BUFFERS`/`DUMB_BUFFERS` already were. Resolving a handle therefore
+// reads the handle map, drops it, then reads the object map; if the object
+// vanished in between the answer is None, which is the correct "this handle
+// names nothing" and is indistinguishable from the handle having been closed a
+// microsecond earlier. `VIRTIO_GPU` is taken with NO BO map held, ever.
+
+/// Lifetime identity for a BO of either kind. Never reused within a boot, so a
+/// stale id resolves to nothing rather than to a different buffer.
+static NEXT_BO_OBJ: AtomicU32 = AtomicU32::new(1);
 
 /// A virtgpu blob buffer object created through DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB.
 /// `phys`/`order` are the guest pages handed to the host as the blob's backing
@@ -801,12 +882,51 @@ static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new())
 /// so when submission becomes asynchronous (the unwired ISR) the semantics are
 /// already right rather than needing to be re-derived under a live client.
 #[derive(Clone, Copy)]
-struct BlobBuf {
+struct BlobObj {
     phys: usize,
     order: usize,
     res_handle: u32,
     size: u64,
-    /// The `open_id` that created this BO — the per-open GEM handle table,
+    /// Fence of the most recent EXECBUFFER that named this BO in `bo_handles`;
+    /// 0 = never named in any submission, i.e. nothing is outstanding for it.
+    /// On the OBJECT rather than the handle: upstream attaches the fence to the
+    /// `virtio_gpu_object`, and two handles naming one buffer must not disagree
+    /// about whether work against it has retired.
+    last_fence: u64,
+    /// `blob_mem` the blob was created with (VIRTIO_GPU_BLOB_MEM_*). Never 0:
+    /// RESOURCE_CREATE_BLOB rejects blob_mem == 0, so every entry in this map is
+    /// a real blob. RESOURCE_INFO reports it, and Mesa's Venus backend refuses
+    /// an imported BO whose blob_mem is not the one it allocates with.
+    blob_mem: u32,
+    /// Host-visible window bookkeeping, both zero until RESOURCE_MAP_BLOB has
+    /// succeeded for this blob (and zero forever for a guest-backed one). Per
+    /// RESOURCE and not per open: the placement is a property of the host
+    /// resource, so a second handle on the same object sees the same token.
+    ///   * `win_off`  — byte offset of the reservation inside the shared-memory
+    ///                  window, the value handed to RESOURCE_MAP_BLOB and the key
+    ///                  `hostvis_free` releases.
+    ///   * `map_phys` — the guest-physical address that offset resolves to
+    ///                  (`window.phys + win_off`), which IS the mmap token
+    ///                  VIRTGPU_MAP reports. Non-zero is the "is mapped" flag:
+    ///                  the window base is a PCI BAR address and can never be 0.
+    win_off: u64,
+    map_phys: u64,
+    /// `map_info` the host answered RESOURCE_MAP_BLOB with (VIRTIO_GPU_MAP_CACHE_*).
+    /// Load-bearing, not diagnostic: `blob_map_cache_type` reports it to
+    /// `sys_mmap`, which maps the blob non-cached when the host asked for
+    /// UNCACHED or WC. See the cacheability note on `virtgpu_handle_map`.
+    map_info: u32,
+    /// Live references: one per `BlobHandle` naming this object, plus one per
+    /// exporting `TmpVmo` slot. See `BO LIFETIME`.
+    refs: u32,
+}
+
+/// One gem handle naming a `BlobObj`. **The handle IS one reference.**
+#[derive(Clone, Copy)]
+struct BlobHandle {
+    /// Key into `BLOB_OBJS`.
+    obj: u32,
+    /// The `open_id` that may use this handle — the per-open GEM handle table,
     /// flattened into an owner tag on a shared map rather than a map per open.
     ///
     /// Upstream gives each `drm_file` its own handle→object table, so handle 5
@@ -824,41 +944,56 @@ struct BlobBuf {
     /// anywhere, and an open_id-0 caller may reach anything — there is no
     /// identity to check in either direction. See `blob_lookup`.
     owner: u32,
-    /// Fence of the most recent EXECBUFFER that named this BO in `bo_handles`;
-    /// 0 = never named in any submission, i.e. nothing is outstanding for it.
-    last_fence: u64,
-    /// `blob_mem` the blob was created with (VIRTIO_GPU_BLOB_MEM_*). Never 0:
-    /// RESOURCE_CREATE_BLOB rejects blob_mem == 0, so every entry in this map is
-    /// a real blob. RESOURCE_INFO reports it, and Mesa's Venus backend refuses
-    /// an imported BO whose blob_mem is not the one it allocates with.
-    blob_mem: u32,
-    /// The 3D context this blob was attached to at creation (0 = none). Kept
-    /// per-blob because the context is now per-open: freeing the blob must
-    /// detach it from *its* context, not from whichever one happens to be
-    /// current.
+    /// The 3D context THIS handle's open attached the resource to (0 = none).
+    /// Per HANDLE rather than per object because attachment is per-open: the
+    /// handle that goes away detaches its own context binding and only its own.
+    /// A blob may well outlive the CONTEXT_INIT that was current when it was
+    /// made, which is why the binding is remembered here at all.
     ctx: u32,
-    /// Host-visible window bookkeeping, both zero until RESOURCE_MAP_BLOB has
-    /// succeeded for this blob (and zero forever for a guest-backed one):
-    ///   * `win_off`  — byte offset of the reservation inside the shared-memory
-    ///                  window, the value handed to RESOURCE_MAP_BLOB and the key
-    ///                  `hostvis_free` releases.
-    ///   * `map_phys` — the guest-physical address that offset resolves to
-    ///                  (`window.phys + win_off`), which IS the mmap token
-    ///                  VIRTGPU_MAP reports. Non-zero is the "is mapped" flag:
-    ///                  the window base is a PCI BAR address and can never be 0.
-    win_off: u64,
-    map_phys: u64,
-    /// `map_info` the host answered RESOURCE_MAP_BLOB with (VIRTIO_GPU_MAP_CACHE_*).
-    /// Load-bearing, not diagnostic: `blob_map_cache_type` reports it to
-    /// `sys_mmap`, which maps the blob non-cached when the host asked for
-    /// UNCACHED or WC. See the cacheability note on `virtgpu_handle_map`.
-    map_info: u32,
 }
 
-static BLOB_BUFFERS: Mutex<BTreeMap<u32, BlobBuf>> = Mutex::new(BTreeMap::new());
+/// Objects. Keyed by `NEXT_BO_OBJ` id; nothing outside this module names one.
+static BLOB_OBJS: Mutex<BTreeMap<u32, BlobObj>> = Mutex::new(BTreeMap::new());
+/// Handles. Unchanged key space (`NEXT_BLOB_HANDLE`), new value.
+static BLOB_BUFFERS: Mutex<BTreeMap<u32, BlobHandle>> = Mutex::new(BTreeMap::new());
 /// GEM handles for blob BOs. Kept well above the dumb-buffer handle space so a
 /// handle is unambiguously one or the other.
 static NEXT_BLOB_HANDLE: AtomicU32 = AtomicU32::new(0x4000);
+
+/// A handle joined to its object — what `blob_lookup` answers with, so every
+/// consumer keeps reading one flat record and the split stays invisible to
+/// them. A snapshot: holding one implies nothing about the BO still existing,
+/// exactly as the old by-value `BlobBuf` copy did.
+///
+/// Carries only what a *consumer* of a handle needs. `owner` is deliberately
+/// absent — `blob_lookup` has already applied `open_may_reach` and re-exposing
+/// the tag would invite a second, divergent copy of that test. So is `ctx`: the
+/// only thing that acts on a context binding is the teardown of the handle that
+/// made it, and that reads `BlobHandle` directly.
+#[derive(Clone, Copy)]
+struct BlobView {
+    obj: u32,
+    phys: usize,
+    res_handle: u32,
+    size: u64,
+    last_fence: u64,
+    blob_mem: u32,
+    map_phys: u64,
+}
+
+impl BlobView {
+    fn join(obj: u32, o: BlobObj) -> Self {
+        Self {
+            obj,
+            phys: o.phys,
+            res_handle: o.res_handle,
+            size: o.size,
+            last_fence: o.last_fence,
+            blob_mem: o.blob_mem,
+            map_phys: o.map_phys,
+        }
+    }
+}
 
 // ── Host-visible blob window allocator ───────────────────────────────────────
 //
@@ -1040,11 +1175,18 @@ pub fn drm_release_open(open_id: u32) {
     // skipped wholesale. Owner-keying reaches both, and is the exact set
     // upstream frees when a `drm_file` is released.
     //
+    // Note what this reclaims now that a BO is refcounted: the open's HANDLES,
+    // and with them the references those handles held. An object one of them
+    // named survives if — and only if — something else still holds a reference,
+    // which today means an exported dmabuf fd. That is the point: a client that
+    // sends a dmabuf over Wayland and then exits must not pull the buffer out
+    // from under the compositor, and before this it did.
+    //
     // Collect under the lock, free after dropping it: `free_blob` locks
     // BLOB_BUFFERS itself and then talks to the device.
     let orphans: Vec<u32> = {
         let map = BLOB_BUFFERS.lock();
-        map.iter().filter(|(_, b)| b.owner == open_id).map(|(h, _)| *h).collect()
+        map.iter().filter(|(_, h)| h.owner == open_id).map(|(h, _)| *h).collect()
     };
     for h in orphans {
         DrmDeviceInterface::free_blob(h);
@@ -1077,7 +1219,7 @@ fn ctx_record_fence(open_id: u32, fence: u64) {
 // indexing BLOB_BUFFERS / DUMB_BUFFERS directly, so the ownership rule is
 // stated once and cannot drift between them.
 //
-// THE RULE (see `BlobBuf::owner`): a caller may reach a BO if it owns it, if
+// THE RULE (see `BlobHandle::owner`): a caller may reach a BO if it owns it, if
 // the BO is unowned (owner 0), or if the caller itself has no identity
 // (open_id 0 — the legacy `Driver::handle` path, which cannot be checked).
 // Everything else is a miss, indistinguishable from a handle that was never
@@ -1088,32 +1230,47 @@ fn ctx_record_fence(open_id: u32, fence: u64) {
 // DUMB BUFFERS ARE NOT SCOPED, on purpose. A dumb handle is consumed by
 // ADDFB/ADDFB2 and the framebuffer/console path, which have no open identity to
 // carry, and `dumb_buffer_phys_order` resolves one globally for PRIME/dmabuf
-// export (`prime_export_backing` scopes only the blob half, which is the half a
+// export (`prime_export_acquire` scopes only the blob half, which is the half a
 // Vulkan client owns). Scoping them would break the compositor for no gain: the
-// isolation
-// gap that mattered is the Vulkan client's blob BOs, which are created and
-// consumed on one fd by one process.
+// isolation gap that mattered is the Vulkan client's blob BOs, which are
+// created and consumed on one fd by one process.
 fn open_may_reach(caller: u32, owner: u32) -> bool {
     caller == 0 || owner == 0 || caller == owner
 }
 
 /// Resolve a blob BO handle for `open_id`, or None if it does not exist or
 /// belongs to another open.
-fn blob_lookup(handle: u32, open_id: u32) -> Option<BlobBuf> {
-    let b = *BLOB_BUFFERS.lock().get(&handle)?;
-    if open_may_reach(open_id, b.owner) { Some(b) } else { None }
+///
+/// Two maps, taken ONE AT A TIME (see `BO LIFETIME`): the handle map answers
+/// which object and whether this open may reach it, the object map answers what
+/// the object is. A concurrent close between the two reads makes the object
+/// lookup miss, which is reported as None — the same answer a handle closed one
+/// instruction earlier gives.
+fn blob_lookup(handle: u32, open_id: u32) -> Option<BlobView> {
+    let h = *BLOB_BUFFERS.lock().get(&handle)?;
+    if !open_may_reach(open_id, h.owner) { return None; }
+    let o = *BLOB_OBJS.lock().get(&h.obj)?;
+    Some(BlobView::join(h.obj, o))
+}
+
+/// Resolve a **live** dumb-buffer handle. A record whose `handle_live` is false
+/// has had its gem handle retired by DESTROY_DUMB/GEM_CLOSE and survives only
+/// to keep an exported dmabuf fd valid; it must resolve nowhere, so the handle
+/// number is exactly as dead as it was before the refcount existed.
+fn dumb_lookup(handle: u32) -> Option<DumbBuf> {
+    DUMB_BUFFERS.lock().get(&handle).filter(|b| b.handle_live).copied()
 }
 
 /// Does `handle` name a BO this open may reach, of either kind? Upstream's
 /// `drm_gem_object_lookup` miss, which EXECBUFFER answers -ENOENT to.
 ///
-/// The two maps are locked one at a time, never nested: they are leaves and
+/// The maps are locked one at a time, never nested: they are leaves and
 /// keeping them independent is what makes that true by construction.
 fn bo_exists(handle: u32, open_id: u32) -> bool {
     if blob_lookup(handle, open_id).is_some() {
         return true;
     }
-    DUMB_BUFFERS.lock().contains_key(&handle)
+    dumb_lookup(handle).is_some()
 }
 
 /// The fence of the work most recently submitted against `handle`, or None if
@@ -1123,27 +1280,164 @@ fn bo_fence(handle: u32, open_id: u32) -> Option<u64> {
     if let Some(b) = blob_lookup(handle, open_id) {
         return Some(b.last_fence);
     }
-    DUMB_BUFFERS.lock().get(&handle).map(|b| b.last_fence)
+    dumb_lookup(handle).map(|b| b.last_fence)
 }
 
 /// Attach `fence` to `handle`. False if the BO went away between validation and
 /// submission (a concurrent GEM_CLOSE), which is benign — a closed BO is one
 /// nothing can wait on.
 fn bo_attach_fence(handle: u32, open_id: u32, fence: u64) -> bool {
-    {
-        let mut blobs = BLOB_BUFFERS.lock();
-        if let Some(b) = blobs.get_mut(&handle) {
-            if !open_may_reach(open_id, b.owner) {
-                return false;
-            }
-            b.last_fence = fence;
-            return true;
+    // Resolve handle → object under the handle map, then write the fence under
+    // the object map. Never both at once (see `BO LIFETIME`). The fence lives on
+    // the object because a submission fences the buffer, not the name for it.
+    let obj = {
+        let blobs = BLOB_BUFFERS.lock();
+        match blobs.get(&handle) {
+            Some(h) if open_may_reach(open_id, h.owner) => Some(h.obj),
+            Some(_) => return false, // exists, but not this open's
+            None => None,
         }
-    } // drop before touching the other map — never two BO locks at once
-    match DUMB_BUFFERS.lock().get_mut(&handle) {
-        Some(b) => { b.last_fence = fence; true }
-        None => false,
+    };
+    if let Some(obj) = obj {
+        return match BLOB_OBJS.lock().get_mut(&obj) {
+            Some(o) => { o.last_fence = fence; true }
+            None => false,
+        };
     }
+    match DUMB_BUFFERS.lock().get_mut(&handle) {
+        Some(b) if b.handle_live => { b.last_fence = fence; true }
+        _ => false,
+    }
+}
+
+// ── Reference counting (see `BO LIFETIME`) ───────────────────────────────────
+
+/// Drop one reference on blob object `obj`, and detach `detach_ctx` from the
+/// host resource on the way out — that is the dropping HANDLE's own context
+/// binding, and 0 for a dmabuf-fd reference, which has no context.
+///
+/// Returns false if `obj` names no blob object, which lets the shared entry
+/// point (`bo_release_exported`) try the dumb registry before deciding an id is
+/// bogus. The decrement and the removal happen under ONE acquisition of
+/// `BLOB_OBJS`, so two droppers racing cannot both observe zero and both tear
+/// the resource down — a double `resource_unref` plus a double
+/// `mm::buddy::free` of an order-N block is allocator corruption, which is the
+/// `9be954f` class.
+fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
+    let mut m = BLOB_OBJS.lock();
+    let (res_handle, zero) = match m.get_mut(&obj) {
+        Some(o) => {
+            o.refs = o.refs.saturating_sub(1);
+            (o.res_handle, o.refs == 0)
+        }
+        None => return false,
+    };
+    let dead = if zero { m.remove(&obj) } else { None };
+    drop(m); // never hold a BO map across the device round-trip
+
+    // Nothing to say to the device: an fd reference (`detach_ctx == 0`) going
+    // away while other references remain is pure bookkeeping. Skipping the lock
+    // matters because this is now the compositor's per-frame dmabuf-close path.
+    if detach_ctx != 0 || dead.is_some() {
+        let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+        if let Some(gpu) = guard.as_mut() {
+            // UNMAP before UNREF: the host holds the window sub-region on behalf
+            // of a live resource, and unreferencing it first leaves the
+            // subregion attached to a resource that no longer exists. The
+            // detach sits between them, exactly where it sat before the object
+            // and the handle were separated.
+            if let Some(o) = dead.as_ref() {
+                if o.map_phys != 0 {
+                    gpu.resource_unmap_blob(o.res_handle);
+                }
+            }
+            if detach_ctx != 0 {
+                gpu.ctx_detach_resource(detach_ctx, res_handle);
+            }
+            if dead.is_some() {
+                gpu.resource_unref(res_handle);
+            }
+        }
+    }
+
+    if let Some(o) = dead {
+        // Return the window space unconditionally once the record is gone —
+        // including when UNMAP_BLOB failed or the device had vanished. The
+        // record is what `hostvis_free` is reachable from, so holding the
+        // reservation back would leak it for the rest of the boot with nothing
+        // left able to release it. Reusing an offset the host (wrongly) still
+        // believes in fails closed rather than corrupts: the host refuses to map
+        // a second resource over a live sub-region, so the next
+        // RESOURCE_MAP_BLOB at that offset is rejected and rolls itself back.
+        if o.map_phys != 0 {
+            hostvis_free(o.win_off);
+        }
+        if o.phys != 0 {
+            mm::buddy::free(o.phys, o.order);
+        }
+        let _ = o.size;
+    }
+    true
+}
+
+/// Drop one reference on the dumb BO carrying object id `obj`. Returns false if
+/// no dumb record carries it. The scan is over a map that holds a handful of
+/// entries (one per live scanout buffer), and it runs only on dmabuf-fd
+/// release, never on a per-frame path.
+fn dumb_unref_by_obj(obj: u32) -> bool {
+    let mut m = DUMB_BUFFERS.lock();
+    let handle = match m.iter().find(|(_, b)| b.obj == obj) {
+        Some((h, _)) => *h,
+        None => return false,
+    };
+    let zero = match m.get_mut(&handle) {
+        Some(b) => {
+            b.refs = b.refs.saturating_sub(1);
+            b.refs == 0
+        }
+        None => return false,
+    };
+    let dead = if zero { m.remove(&handle) } else { None };
+    drop(m);
+    if let Some(b) = dead {
+        mm::buddy::free(b.phys, b.order);
+    }
+    true
+}
+
+/// **The VFS release hook.** One exporting `TmpVmo` slot has gone away; drop the
+/// reference it held on BO object `obj`.
+///
+/// Registered as a function pointer from `servers/drm`'s `init` rather than
+/// called directly, because `vfs-server` does not depend on `drivers` and must
+/// not start to. It is invoked with **no tmpfs lock held** — see the lock-order
+/// note on `vfs_server::set_dmabuf_release`. A null registration (headless
+/// build, no DRM device) is a no-op, which is correct: nothing can have
+/// exported.
+///
+/// Reaching neither registry is the underflow signal: an id was released twice,
+/// or an id was invented. It is logged rather than ignored because the guard
+/// test asserts on the absence of this line.
+pub fn bo_release_exported(obj: u32) {
+    if obj == 0 {
+        return;
+    }
+    if blob_unref(obj, 0) {
+        return;
+    }
+    if dumb_unref_by_obj(obj) {
+        return;
+    }
+    crate::pci::serial_debug("[DRM] bo refcount underflow obj=");
+    crate::pci::serial_debug_hex(obj);
+    crate::pci::serial_debug("\n");
+}
+
+/// How many blob objects are live right now. Backs
+/// `VIRTGPU_PARAM_LEANDROS_BLOB_OBJS`, which is what makes the refcount
+/// assertable from userspace at all.
+fn blob_obj_count() -> u32 {
+    BLOB_OBJS.lock().len() as u32
 }
 
 /// Cache type the host asked us to use for the host-visible blob whose mmap
@@ -1166,7 +1460,11 @@ fn bo_attach_fence(handle: u32, open_id: u32, fence: u64) -> bool {
 /// called with no other lock held — the 82d0cc3 discipline.
 pub fn blob_map_cache_type(phys: u64) -> u32 {
     if phys == 0 { return crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_CACHED; }
-    let blobs = BLOB_BUFFERS.lock();
+    // Over the OBJECTS, not the handles: `map_phys`/`size`/`map_info` describe
+    // the host mapping, which belongs to the buffer rather than to any one gem
+    // handle naming it. Iterating handles would visit a shared object once per
+    // handle and, once import mints a second handle, could disagree with itself.
+    let blobs = BLOB_OBJS.lock();
     for b in blobs.values() {
         if b.map_phys != 0 && phys >= b.map_phys && phys - b.map_phys < b.size {
             return b.map_info & crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_MASK;
@@ -1318,7 +1616,7 @@ fn damage_area(rects: &[(i32, i32, i32, i32)]) -> u64 {
 /// for an unknown handle. Copy-out to user memory happens in the syscall layer,
 /// never here (this only reads the kernel-side registry).
 pub fn dumb_buffer_phys_order(handle: u32) -> Option<(usize, usize)> {
-    DUMB_BUFFERS.lock().get(&handle).map(|b| (b.phys, b.order))
+    dumb_lookup(handle).map(|b| (b.phys, b.order))
 }
 
 /// What backs a GEM handle for PRIME/dmabuf export.
@@ -1341,9 +1639,17 @@ pub struct PrimeExport {
     /// gives up entirely if it fails, so for a blob this is the resource's own
     /// size rather than the buddy allocation's power-of-two rounding.
     pub len: usize,
+    /// **Lifetime identity of the BO, and the reference this call took on it.**
+    /// The fd must remember THIS and never a gem handle: a gem handle is
+    /// retired by DESTROY_DUMB/GEM_CLOSE while the fd is still open, and for a
+    /// blob it is per-open, so it cannot be what keeps a buffer alive. Hand it
+    /// to `vfs::install_dmabuf_vmo`; if the export fails after this point, hand
+    /// it to `bo_release_exported` instead. Never 0 on a successful call.
+    pub obj: u32,
 }
 
-/// Resolve a GEM handle for PRIME/dmabuf export, of EITHER BO kind.
+/// Resolve a GEM handle for PRIME/dmabuf export, of EITHER BO kind, **and take
+/// one reference on the object** for the fd that is about to be built.
 ///
 /// The PRIME intercept used to call `dumb_buffer_phys_order` directly, so it
 /// answered EINVAL for every Venus blob. That one gap gated `vkGetMemoryFdKHR`,
@@ -1353,23 +1659,53 @@ pub struct PrimeExport {
 /// 4 KiB device-local allocation) — which is why offscreen rendering works
 /// today while no WSI surface can be created at all.
 ///
+/// THE REFERENCE IS TAKEN HERE, not in the VFS, because here is the only place
+/// that holds the object map and can do it atomically with the resolution. The
+/// caller owns it from the moment this returns `Some` and **must** either hand
+/// it to `install_dmabuf_vmo` (which transfers it to the `TmpVmo` slot) or
+/// release it with `bo_release_exported`. That is why the name says `acquire`:
+/// the old `prime_export_backing` was a pure query and this is not.
+///
 /// SCOPING follows the two registries' existing rules rather than inventing a
 /// third: a blob is reachable only by the open that created it (`blob_lookup` /
 /// `open_may_reach`), and a dumb buffer stays deliberately global. `None` means
 /// "no BO this open may reach", indistinguishable from a handle that was never
-/// allocated — the same answer upstream's per-`drm_file` table gives.
+/// allocated — the same answer upstream's per-`drm_file` table gives, and it
+/// also covers the object having been torn down between the handle read and the
+/// object read.
 ///
 /// Copy-out to user memory happens in the syscall layer, never here; this only
-/// reads the kernel-side registries, and never holds both at once.
-pub fn prime_export_backing(handle: u32, open_id: u32) -> Option<PrimeExport> {
-    if let Some(b) = blob_lookup(handle, open_id) {
-        return Some(PrimeExport { phys: b.phys, order: b.order, len: b.size as usize });
+/// touches the kernel-side registries, and never holds two at once.
+pub fn prime_export_acquire(handle: u32, open_id: u32) -> Option<PrimeExport> {
+    let obj = {
+        let map = BLOB_BUFFERS.lock();
+        match map.get(&handle) {
+            Some(h) if open_may_reach(open_id, h.owner) => Some(h.obj),
+            // A blob handle this open may not reach is a refusal outright, not
+            // a fall-through to the dumb registry: the two handle spaces are
+            // disjoint, so falling through could only ever mis-resolve.
+            Some(_) => return None,
+            None => None,
+        }
+    };
+    if let Some(obj) = obj {
+        let mut objs = BLOB_OBJS.lock();
+        let o = objs.get_mut(&obj)?;
+        o.refs = o.refs.saturating_add(1);
+        return Some(PrimeExport { phys: o.phys, order: o.order, len: o.size as usize, obj });
     }
     // Dumb exports keep reporting the buddy allocation, byte-for-byte what they
     // reported before this function existed: GBM/EGL fstat the exported fd and
     // the compositor has been running against that number since 36f62d0.
-    let (phys, order) = dumb_buffer_phys_order(handle)?;
-    Some(PrimeExport { phys, order, len: (1usize << order) * 4096 })
+    let mut dumb = DUMB_BUFFERS.lock();
+    let b = dumb.get_mut(&handle).filter(|b| b.handle_live)?;
+    b.refs = b.refs.saturating_add(1);
+    Some(PrimeExport {
+        phys: b.phys,
+        order: b.order,
+        len: (1usize << b.order) * 4096,
+        obj: b.obj,
+    })
 }
 
 // ── DRM page-flip event channel ──────────────────────────────────────────────
@@ -2123,12 +2459,9 @@ impl DrmDeviceInterface {
         let map = unsafe { &mut *(arg as *mut drm_mode_map_dumb) };
 
         // Return the actual physical address associated with the dumb buffer handle
-        let buffers = DUMB_BUFFERS.lock();
-        if let Some(b) = buffers.get(&map.handle) {
-            map.offset = b.phys as u64;
-            Ok(0)
-        } else {
-            Err(DriverError::NotFound)
+        match dumb_lookup(map.handle) {
+            Some(b) => { map.offset = b.phys as u64; Ok(0) }
+            None => Err(DriverError::NotFound),
         }
     }
     fn std_handle_addfb(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
@@ -2144,7 +2477,7 @@ impl DrmDeviceInterface {
         );
 
         // Use the physical address associated with the dumb buffer handle
-        let phys_addr = DUMB_BUFFERS.lock().get(&add.handle).map(|b| b.phys).unwrap_or(0);
+        let phys_addr = dumb_lookup(add.handle).map(|b| b.phys).unwrap_or(0);
         fb.physical_addresses[0] = phys_addr as u64;
 
         // If Virtio-GPU is present, create a resource for this framebuffer
@@ -2228,9 +2561,33 @@ impl DrmDeviceInterface {
 
     // ── K4 IOCTL handlers (copy-in-before-lock; see handle_ioctl note) ─────────
 
-    /// Free a dumb buffer's pages back to the buddy allocator and forget it.
+    /// Retire a dumb buffer's gem handle and drop the reference it held.
+    ///
+    /// The pages go back to the buddy allocator only once the LAST reference is
+    /// gone, which for an exported buffer is when the dmabuf fd's tmpfs slot
+    /// dies. Freeing them here unconditionally — what this used to do — is the
+    /// pre-existing half of the use-after-free described under `BO LIFETIME`:
+    /// `read()` on a still-open exported fd walked frames the allocator had
+    /// already handed to someone else.
+    ///
+    /// Idempotent. GEM_CLOSE calls this for every handle it is given (the two
+    /// handle spaces are disjoint but the call is unconditional), and a client
+    /// may legitimately issue both DESTROY_DUMB and GEM_CLOSE; `handle_live`
+    /// makes the handle's single reference droppable exactly once.
     fn free_dumb(handle: u32) {
-        if let Some(b) = DUMB_BUFFERS.lock().remove(&handle) {
+        let mut map = DUMB_BUFFERS.lock();
+        let zero = match map.get_mut(&handle) {
+            Some(b) if !b.handle_live => return, // already retired
+            Some(b) => {
+                b.handle_live = false;
+                b.refs = b.refs.saturating_sub(1);
+                b.refs == 0
+            }
+            None => return,
+        };
+        let dead = if zero { map.remove(&handle) } else { None };
+        drop(map);
+        if let Some(b) = dead {
             mm::buddy::free(b.phys, b.order);
         }
     }
@@ -2813,77 +3170,51 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
-    /// Release a blob BO: retract any host-visible mapping, detach it from the
-    /// 3D context, drop the host-side resource, and return its guest pages.
-    /// Without this each RESOURCE_CREATE_BLOB leaks a buddy allocation, a host
-    /// resource id and — for a host-side blob — a slice of the shared-memory
-    /// window, for the lifetime of the boot.
+    /// Retire a blob gem handle unconditionally and drop the reference it held.
+    /// The object — host resource, window reservation, guest pages — survives
+    /// until the last reference goes, which may be an exported dmabuf fd's.
+    ///
+    /// The removal is a statement of its own so the `BLOB_BUFFERS` guard is
+    /// DEAD before `blob_unref` takes `VIRTIO_GPU` and busy-spins on a device
+    /// round-trip. Written as `if let Some(..) = LOCK.remove(..)` it was not:
+    /// the temporary guard in an `if let` scrutinee lives to the end of the
+    /// whole `if let`, so the old body ran the entire teardown with the handle
+    /// map held. `free_blob_owned` was already written this way for exactly
+    /// that reason; this is the same shape.
     fn free_blob(handle: u32) {
-        if let Some(b) = BLOB_BUFFERS.lock().remove(&handle) {
-            Self::release_blob(b);
+        let taken = BLOB_BUFFERS.lock().remove(&handle);
+        if let Some(h) = taken {
+            blob_unref(h.obj, h.ctx);
         }
     }
 
     /// GEM_CLOSE's entry point: free `handle` only if `open_id` may reach it.
     /// The ownership test and the removal happen under one acquisition of
     /// BLOB_BUFFERS, so two opens racing to close the same handle cannot both
-    /// pass the test and both tear the resource down.
+    /// pass the test and both drop the object's reference.
     fn free_blob_owned(handle: u32, open_id: u32) {
         let taken = {
             let mut map = BLOB_BUFFERS.lock();
             let may = match map.get(&handle) {
-                Some(b) => open_may_reach(open_id, b.owner),
+                Some(h) => open_may_reach(open_id, h.owner),
                 None => false,
             };
             if may { map.remove(&handle) } else { None }
         };
-        if let Some(b) = taken {
-            Self::release_blob(b);
+        if let Some(h) = taken {
+            blob_unref(h.obj, h.ctx);
         }
     }
 
-    /// Tear down a blob record already removed from BLOB_BUFFERS. Split from the
-    /// lookup so the owned and unowned entry points cannot drift apart in what
-    /// they release.
-    fn release_blob(b: BlobBuf) {
-        // The context this blob was actually attached to. GEM_CLOSE carries a
-        // caller identity but not a context, and the blob may well outlive the
-        // CONTEXT_INIT that was current when it was made, so the binding is
-        // remembered on the blob itself.
-        let ctx = b.ctx;
-        {
-            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
-            if let Some(gpu) = guard.as_mut() {
-                // UNMAP before UNREF: the host holds the window sub-region on
-                // behalf of a live resource, and unreferencing it first leaves
-                // the subregion attached to a resource that no longer exists.
-                if b.map_phys != 0 {
-                    gpu.resource_unmap_blob(b.res_handle);
-                }
-                if ctx != 0 {
-                    gpu.ctx_detach_resource(ctx, b.res_handle);
-                }
-                gpu.resource_unref(b.res_handle);
-            }
-        }
-        // Return the window space unconditionally once the record is gone —
-        // including when UNMAP_BLOB failed or the device had vanished. The
-        // record is what `hostvis_free` is reachable from, so holding the
-        // reservation back would leak it for the rest of the boot with nothing
-        // left able to release it. Reusing an offset the host (wrongly) still
-        // believes in fails closed rather than corrupts: the host refuses to map
-        // a second resource over a live sub-region, so the next
-        // RESOURCE_MAP_BLOB at that offset is rejected and rolls itself back.
-        if b.map_phys != 0 {
-            hostvis_free(b.win_off);
-        }
-        if b.phys != 0 {
-            mm::buddy::free(b.phys, b.order);
-        }
-        let _ = b.size;
-    }
-
-    /// DRM_IOCTL_MODE_DESTROY_DUMB — free the dumb buffer.
+    /// DRM_IOCTL_MODE_DESTROY_DUMB — retire the dumb buffer's gem handle.
+    ///
+    /// Takes no `open_id` and consults no blob registry, so an *imported* blob
+    /// handle destroyed this way leaks its object. That matters — Mesa's
+    /// kms_swrast importer destroys imported handles with DESTROY_DUMB and not
+    /// GEM_CLOSE (`kms_dri_sw_winsys.c:288-296`) — but only once
+    /// PRIME_FD_TO_HANDLE mints importer handles at all, which it does not yet.
+    /// Deliberately left for that change rather than fixed speculatively here;
+    /// see the report's "MODE_DESTROY_DUMB" section.
     fn std_handle_destroy_dumb(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let d = unsafe { ptr::read_unaligned(arg as *const drm_mode_destroy_dumb) };
@@ -2900,7 +3231,7 @@ impl DrmDeviceInterface {
         let width = cmd2.width;
         let height = cmd2.height;
         let pitch = if cmd2.pitches[0] != 0 { cmd2.pitches[0] } else { width * 4 };
-        let phys_addr = DUMB_BUFFERS.lock().get(&handle).map(|b| b.phys).unwrap_or(0);
+        let phys_addr = dumb_lookup(handle).map(|b| b.phys).unwrap_or(0);
 
         let mut fb = DrmFramebuffer::new(width, height, DrmFormat::Xrgb8888, handle, pitch);
         fb.physical_addresses[0] = phys_addr as u64;
@@ -3014,14 +3345,26 @@ impl DrmDeviceInterface {
             //      partial map of a large blob works; `map_phys` is non-zero only
             //      after RESOURCE_MAP_BLOB succeeded, so an unmapped blob's
             //      window space is never reachable.
-            let known = DUMB_BUFFERS.lock().values().any(|b| b.phys == requested_phys as usize)
-                || BLOB_BUFFERS.lock().values().any(|b| {
+            //
+            // The two scans are separate statements so only one map is ever
+            // locked at a time (`||` in one expression keeps both temporaries
+            // alive to the end of the statement). A dumb record whose gem
+            // handle has been retired is skipped: it survives only to keep an
+            // exported fd's frames alive, and that fd maps through its own
+            // tmpfs VMO, never through this device token.
+            let known_dumb = DUMB_BUFFERS
+                .lock()
+                .values()
+                .any(|b| b.handle_live && b.phys == requested_phys as usize);
+            let known_blob = || {
+                BLOB_OBJS.lock().values().any(|b| {
                     (b.phys != 0 && b.phys == requested_phys as usize)
                         || (b.map_phys != 0
                             && requested_phys >= b.map_phys
                             && requested_phys - b.map_phys < b.size)
-                });
-            if !known {
+                })
+            };
+            if !known_dumb && !known_blob() {
                 return Err(DriverError::InvalidParameter);
             }
             Ok(requested_phys as usize)
@@ -3144,7 +3487,7 @@ impl DrmDeviceInterface {
     /// touching the device (a handle that names nothing fails the whole ioctl
     /// with -ENOENT) and attaches the submission's fence to each object, which
     /// is what makes a later WAIT on one of those BOs report on THIS submission.
-    /// Both halves are done here now — see "THE FENCE MODEL" on `BlobBuf` for
+    /// Both halves are done here now — see "THE FENCE MODEL" on `BlobObj` for
     /// what that does and does not change while submission is synchronous.
     ///
     /// Also honoured, since the SIMULATE_SYNCOBJ fix: a **fence-only** request,
@@ -3450,6 +3793,14 @@ impl DrmDeviceInterface {
             unsafe { (req.value as *mut u32).write_volatile(n) };
             return Ok(0);
         }
+        // Likewise: BLOB_OBJS is a leaf, the count is copied out of the guard
+        // into a local, and the user pointer is written with no lock held.
+        if req.param == VIRTGPU_PARAM_LEANDROS_BLOB_OBJS {
+            let n = blob_obj_count();
+            if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            unsafe { (req.value as *mut u32).write_volatile(n) };
+            return Ok(0);
+        }
 
         let value: u64 = {
             let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
@@ -3671,24 +4022,35 @@ impl DrmDeviceInterface {
             }
         };
 
-        let handle = NEXT_BLOB_HANDLE.fetch_add(1, Ordering::Relaxed);
-        BLOB_BUFFERS.lock().insert(
-            handle,
-            BlobBuf {
+        // The object, then the handle that names it. The handle IS the object's
+        // one initial reference (`BO LIFETIME`); an exported dmabuf fd later
+        // takes a second, which is what makes the buffer outlive GEM_CLOSE.
+        let obj = NEXT_BO_OBJ.fetch_add(1, Ordering::Relaxed);
+        BLOB_OBJS.lock().insert(
+            obj,
+            BlobObj {
                 phys,
                 order,
                 res_handle,
                 size: req.size,
                 blob_mem: req.blob_mem,
-                ctx,
-                // The creating open owns it, whether or not it has a context.
-                owner: open_id,
                 // Nothing has been submitted against a brand-new BO.
                 last_fence: 0,
                 // Host-visible mapping is established lazily, by VIRTGPU_MAP.
                 win_off: 0,
                 map_phys: 0,
                 map_info: 0,
+                refs: 1,
+            },
+        );
+        let handle = NEXT_BLOB_HANDLE.fetch_add(1, Ordering::Relaxed);
+        BLOB_BUFFERS.lock().insert(
+            handle,
+            BlobHandle {
+                obj,
+                // The creating open owns it, whether or not it has a context.
+                owner: open_id,
+                ctx,
             },
         );
 
@@ -3761,7 +4123,7 @@ impl DrmDeviceInterface {
                 if b.map_phys != 0 {
                     b.map_phys // already mapped — idempotent
                 } else {
-                    self.hostvis_map_blob(handle, b)?
+                    self.hostvis_map_blob(b)?
                 }
             }
             // ── Guest-backed blob ────────────────────────────────────────────
@@ -3774,9 +4136,7 @@ impl DrmDeviceInterface {
                 return Err(DriverError::Unsupported);
             }
             None => {
-                let phys = DUMB_BUFFERS
-                    .lock()
-                    .get(&handle)
+                let phys = dumb_lookup(handle)
                     .map(|b| b.phys)
                     .ok_or(DriverError::InvalidParameter)?;
                 if phys == 0 { return Err(DriverError::Unsupported); }
@@ -3794,10 +4154,10 @@ impl DrmDeviceInterface {
     ///
     /// Split out of `virtgpu_handle_map` so the lock discipline is visible in one
     /// place: HOSTVIS_SPANS is taken and released inside `hostvis_alloc`,
-    /// VIRTIO_GPU is taken and released on its own, and BLOB_BUFFERS is taken
-    /// last to record the result. Never two at once, never any across the device
+    /// VIRTIO_GPU is taken and released on its own, and BLOB_OBJS is taken last
+    /// to record the result. Never two at once, never any across the device
     /// round-trip's busy-spin.
-    fn hostvis_map_blob(&mut self, handle: u32, b: BlobBuf) -> Result<u64, DriverError> {
+    fn hostvis_map_blob(&mut self, b: BlobView) -> Result<u64, DriverError> {
         // The window the device advertised at probe time. Deliberately NOT mapped
         // anywhere yet — it is gigabytes wide; only the sub-range this blob lands
         // in ever becomes a mapping, and only in the calling process.
@@ -3845,12 +4205,23 @@ impl DrmDeviceInterface {
 
         let token = window.phys + off;
 
-        // Record it. If the handle vanished (a concurrent GEM_CLOSE on another
-        // thread), undo the map instead of leaking the window space — free_blob
-        // could not have seen a reservation that did not exist yet.
+        // Record it on the OBJECT, not on the handle: the placement is a
+        // property of the host resource, and a second handle on the same object
+        // must see the same token rather than ask the host to map an
+        // already-mapped resource (which it refuses).
+        //
+        // Keying the rollback on the object is also what keeps it correct now
+        // that a BO can have more than one handle. If the check were still
+        // "did the HANDLE vanish", a concurrent GEM_CLOSE of one handle while
+        // another still held the object would undo a map the surviving handle
+        // is entitled to — and, worse, `hostvis_free` a span the object's own
+        // teardown would later free again. The rollback fires only when the
+        // OBJECT is gone, in which case nothing else can be holding the span
+        // and `blob_unref` could not have seen a reservation that did not exist
+        // yet.
         let recorded = {
-            let mut map = BLOB_BUFFERS.lock();
-            match map.get_mut(&handle) {
+            let mut map = BLOB_OBJS.lock();
+            match map.get_mut(&b.obj) {
                 Some(e) => { e.win_off = off; e.map_phys = token; e.map_info = map_info; true }
                 None => false,
             }
@@ -3917,7 +4288,7 @@ impl DrmDeviceInterface {
     /// GEM_CLOSE were not either, and that scoping only the query would be
     /// incoherent — a handle another open could still map and close, but not
     /// describe. That reasoning was right, and the fix was to scope all three
-    /// together rather than to leave all three global: `BlobBuf::owner` now
+    /// together rather than to leave all three global: `BlobHandle::owner` now
     /// carries the ownership that upstream's per-`drm_file` GEM table carries.
     /// It costs Mesa nothing: it creates and queries on the same fd.
     ///
@@ -4104,9 +4475,21 @@ impl DrmDumbBuffer {
         }
 
         let handle = Self::next_handle();
-        DUMB_BUFFERS
-            .lock()
-            .insert(handle, DumbBuf { phys: phys_addr as usize, order, last_fence: 0 });
+        // `refs: 1` is the gem handle itself; an exported dmabuf fd takes a
+        // second (`BO LIFETIME`). `obj` is the lifetime identity the fd
+        // remembers — never `handle`, which DESTROY_DUMB retires while the fd
+        // is still open.
+        DUMB_BUFFERS.lock().insert(
+            handle,
+            DumbBuf {
+                phys: phys_addr as usize,
+                order,
+                last_fence: 0,
+                obj: NEXT_BO_OBJ.fetch_add(1, Ordering::Relaxed),
+                refs: 1,
+                handle_live: true,
+            },
+        );
         
         // mmap_offset for userspace will be the physical address
         // The syscall handler will use this to map the device memory

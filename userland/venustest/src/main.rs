@@ -229,6 +229,10 @@ extern "C" {
     pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     pub fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int,
                 fd: c_int, offset: i64) -> *mut c_void;
+    /// Phase 6 needs this: it closes the exported fd and then asserts the
+    /// buffer was released, so it must not still hold a MAP_SHARED view of the
+    /// frames when they go back to the allocator.
+    pub fn munmap(addr: *mut c_void, len: size_t) -> c_int;
 
     // Phase 7 (SIMULATE_SYNCOBJ) only. `poll` and `fcntl(F_DUPFD_CLOEXEC)` are
     // there because they are *exactly* what Mesa does with an out-fence fd
@@ -477,6 +481,48 @@ struct DrmPrimeHandle {
 const DRM_IOCTL_PRIME_HANDLE_TO_FD: c_ulong = 0xC00C642D;
 const DRM_IOCTL_PRIME_FD_TO_HANDLE: c_ulong = 0xC00C642E;
 const SEEK_END: c_int = 2;
+const SEEK_SET: c_int = 0;
+
+// ── Dumb buffers, for the phase-6 dumb half ──────────────────────────────────
+/// `struct drm_mode_create_dumb { u32 height, width, bpp, flags; u32 handle;
+///                                u32 pitch; u64 size; }`
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmModeCreateDumb {
+    height: u32,
+    width: u32,
+    bpp: u32,
+    flags: u32,
+    handle: u32,
+    pitch: u32,
+    size: u64,
+}
+/// `struct drm_mode_map_dumb { u32 handle; u32 pad; u64 offset; }`
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmModeMapDumb {
+    handle: u32,
+    pad: u32,
+    offset: u64,
+}
+const DRM_IOCTL_MODE_CREATE_DUMB: c_ulong = 0xC02064B2;
+const DRM_IOCTL_MODE_MAP_DUMB: c_ulong = 0xC01064B3;
+const DRM_IOCTL_MODE_DESTROY_DUMB: c_ulong = 0xC00464B4;
+
+/// LeandrOS-private GETPARAM: live blob **objects** (not handles, not fds).
+/// See the note on `VIRTGPU_PARAM_LEANDROS_BLOB_OBJS` in the driver.
+const VIRTGPU_PARAM_LEANDROS_BLOB_OBJS: u64 = 0x1000_0005;
+
+/// The byte a dmabuf export of `size` bytes should hold at offset `i`.
+///
+/// Position-dependent on purpose. A constant fill would be satisfied by any
+/// buffer that happened to hold that constant — including, on a freshly zeroed
+/// recycled block, by a fill of zero if the constant were zero. The stride also
+/// catches a buffer that is the right memory but at the wrong offset, which is
+/// what a partially-recycled or re-split buddy block would look like.
+fn pat_byte(i: usize) -> u8 {
+    ((i.wrapping_mul(7) ^ 0x5A) & 0xFF) as u8
+}
 
 /// Print a GETPARAM readback, distinguishing "the ioctl failed" from a value.
 fn out_param(v: u64) {
@@ -2131,6 +2177,357 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
         }
         if fd_a >= 0 { close(fd_a); }
         if fd_b >= 0 { close(fd_b); }
+    }
+
+    // ── phase 6: an exported dmabuf fd keeps its buffer alive ────────────────
+    //
+    // WHY THIS EXISTS. `release_blob` / `free_dumb` used to call
+    // `mm::buddy::free(phys, order)` the instant the gem handle went away, and
+    // `vmo_free_slot` returns early for a borrowed VMO without freeing on the
+    // stated grounds that the DRM layer frees the block exactly once. Nothing
+    // made the DRM object outlive the exported fd, so this sequence —
+    //
+    //     h  = RESOURCE_CREATE_BLOB(GUEST, N)
+    //     fd = PRIME_HANDLE_TO_FD(h)
+    //     GEM_CLOSE(h)
+    //     read(fd, buf, N)
+    //
+    // — read out of frames the buddy allocator had already handed to someone
+    // else, and `mmap(fd, MAP_SHARED)` WROTE to them. One unprivileged process,
+    // no cross-open work at all. Pre-existing on the dumb path; widened to
+    // blobs by the PRIME export.
+    //
+    // WHY THE CHURN LOOP IS NOT PADDING. `mm::buddy::free` does not scrub, so a
+    // `read()` straight after GEM_CLOSE would very often return the pattern
+    // anyway and this test would pass against the very bug it exists to catch —
+    // exactly the "failed for the wrong reason" trap. The churn allocates
+    // same-order blobs, and `virtgpu_handle_resource_create_blob` ZEROES the
+    // whole buddy block it is handed, so the moment the freed block comes back
+    // round the pattern is destroyed. The allocator's own free-list links are a
+    // second, independent destroyer: `push_front` writes next/prev into the
+    // first 16 bytes of the block it pushes.
+    //
+    // WHAT FAILURE LOOKS LIKE, so a red line can be triaged:
+    //   * `..._objs_survive_close` FAILs as a WRONG VALUE (0 where 1 was
+    //     expected). No error, no crash — the object is simply gone.
+    //   * `..._payload_survives_close` FAILs as a WRONG VALUE: `read()` returns
+    //     the full count and the bytes are wrong (zeros, or free-list
+    //     pointers). It cannot fail as an error code, and it must not panic:
+    //     the frames are still mapped in the HHDM, they merely belong to
+    //     someone else now.
+    //   * `..._objs_zero_after_fd_close` FAILing means the OPPOSITE bug — the
+    //     reference is never dropped and every export leaks a buffer.
+    //   * `..._alloc_after_release` FAILing means a DOUBLE free reached the
+    //     buddy allocator, which is corruption rather than a leak; the next
+    //     allocation is the cheapest detector we have. Check the serial log for
+    //     `[DRM] bo refcount underflow` at the same time.
+    out(b"--- phase 6: exported dmabuf keeps the buffer alive ---\n");
+    {
+        let fd = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if fd < 0 {
+            if !report(b"phase6_open_card0", false) { failures += 1; }
+        } else {
+            const P6_SIZE: usize = 0x3000; // deliberately not a power of two
+            // The counter is a LeandrOS-private param. A kernel that does not
+            // have it is exactly the kernel this test is a regression for, so
+            // its absence must NOT skip the payload assertions — those are the
+            // ones that read the recycled memory, and they are what makes this
+            // fail on an unfixed kernel by construction rather than by
+            // agreement. Only the counter assertions are gated.
+            let objs0 = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_BLOB_OBJS);
+            let have_objs = objs0 != u64::MAX;
+            if !have_objs {
+                out(b"  (no BLOB_OBJS getparam - counter assertions skipped,\n");
+                out(b"   payload assertions still run and are the real gate)\n");
+            }
+            {
+                let mut blob = DrmVirtgpuResourceCreateBlob {
+                    blob_mem: VIRTGPU_BLOB_MEM_GUEST,
+                    blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+                    size: P6_SIZE as u64,
+                    ..Default::default()
+                };
+                let made = ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB,
+                                 &mut blob as *mut _) == 0
+                    && blob.bo_handle != 0;
+                if !report(b"phase6_guest_blob_created", made) { failures += 1; }
+
+                if made {
+                    let h = blob.bo_handle;
+                    let objs1 = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_BLOB_OBJS);
+                    if have_objs
+                        && !report(b"phase6_create_adds_one_object", objs1 == objs0 + 1)
+                    {
+                        failures += 1;
+                    }
+
+                    // Stamp the pattern through the device mapping — the same
+                    // memory the export will alias.
+                    let mut m = DrmVirtgpuMap { offset: 0, handle: h, pad: 0 };
+                    let mut stamped = false;
+                    if ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &mut m as *mut _) == 0 {
+                        let p = mmap(core::ptr::null_mut(), P6_SIZE,
+                                     PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                                     m.offset as i64);
+                        if p as isize > 0 {
+                            let b = p as *mut u8;
+                            for i in 0..P6_SIZE { *b.add(i) = pat_byte(i); }
+                            stamped = true;
+                        }
+                    }
+                    if !report(b"phase6_pattern_stamped", stamped) { failures += 1; }
+
+                    let mut ph = DrmPrimeHandle { handle: h, flags: 0, fd: -1 };
+                    let exported =
+                        ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _) == 0
+                            && ph.fd >= 0;
+                    if !report(b"phase6_exported", exported) { failures += 1; }
+
+                    // Exporting must not mint a second OBJECT. It takes a
+                    // reference on the one that exists; a fresh object here
+                    // would mean the fd aliases memory nothing else knows about.
+                    let objs2 = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_BLOB_OBJS);
+                    if have_objs && !report(b"phase6_export_adds_no_object", objs2 == objs1) {
+                        failures += 1;
+                    }
+
+                    if exported && stamped {
+                        // ── the sequence ────────────────────────────────────
+                        let _ = gem_close(fd, h);
+
+                        let objs3 = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_BLOB_OBJS);
+                        if have_objs && objs3 != objs1 {
+                            out(b"  after GEM_CLOSE: expected ");
+                            out_u64(objs1);
+                            out(b" live objects, got ");
+                            out_param(objs3);
+                            out(b"\n");
+                        }
+                        if have_objs && !report(b"phase6_objs_survive_close", objs3 == objs1) {
+                            failures += 1;
+                        }
+
+                        // Force the freed frames back into circulation. Each
+                        // create zeroes its whole buddy block, so if GEM_CLOSE
+                        // really returned ours, this destroys the pattern.
+                        const CHURN: usize = 8;
+                        let mut churn = [0u32; CHURN];
+                        for slot in churn.iter_mut() {
+                            let mut z = DrmVirtgpuResourceCreateBlob {
+                                blob_mem: VIRTGPU_BLOB_MEM_GUEST,
+                                blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+                                size: P6_SIZE as u64,
+                                ..Default::default()
+                            };
+                            if ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB,
+                                     &mut z as *mut _) == 0
+                            {
+                                *slot = z.bo_handle;
+                            }
+                        }
+
+                        // THE HAZARD ASSERTION. Read the exported fd and
+                        // require every byte of the pattern back.
+                        let mut intact = lseek(ph.fd, 0, SEEK_SET) == 0;
+                        let mut rbuf = [0u8; 256];
+                        let mut off = 0usize;
+                        let mut bad_at = usize::MAX;
+                        while intact && off < P6_SIZE {
+                            let want = rbuf.len().min(P6_SIZE - off);
+                            let got = read(ph.fd, rbuf.as_mut_ptr() as *mut c_void, want);
+                            if got <= 0 { intact = false; break; }
+                            for (i, &b) in rbuf.iter().take(got as usize).enumerate() {
+                                if b != pat_byte(off + i) {
+                                    bad_at = off + i;
+                                    intact = false;
+                                    break;
+                                }
+                            }
+                            off += got as usize;
+                        }
+                        if !intact {
+                            out(b"  payload lost at offset ");
+                            if bad_at == usize::MAX {
+                                out(b"<short read at ");
+                                out_u64(off as u64);
+                                out(b">");
+                            } else {
+                                out_u64(bad_at as u64);
+                            }
+                            out(b" - the fd read RECYCLED memory\n");
+                        }
+                        if !report(b"phase6_payload_survives_close", intact) {
+                            failures += 1;
+                        }
+
+                        // The same memory through a MAP_SHARED mapping of the
+                        // fd, which is the write-capable half of the hazard.
+                        let mp = mmap(core::ptr::null_mut(), P6_SIZE,
+                                      PROT_READ | PROT_WRITE, MAP_SHARED, ph.fd, 0);
+                        let mut mapped_ok = mp as isize > 0;
+                        if mapped_ok {
+                            let b = mp as *const u8;
+                            for i in 0..P6_SIZE {
+                                if *b.add(i) != pat_byte(i) { mapped_ok = false; break; }
+                            }
+                        }
+                        if !report(b"phase6_mmap_of_fd_still_coherent", mapped_ok) {
+                            failures += 1;
+                        }
+                        // Drop the view BEFORE the fd, so nothing in this
+                        // process still points at frames the next assertion
+                        // requires to be back in the allocator. (`buddy::free`
+                        // does not consult `mm::pageref` — a recorded, separate
+                        // hazard — so a surviving mapping would be exactly the
+                        // dangling one this whole change exists to prevent.)
+                        if mp as isize > 0 { munmap(mp, P6_SIZE); }
+
+                        for &z in churn.iter() {
+                            if z != 0 { let _ = gem_close(fd, z); }
+                        }
+
+                        // Closing the fd is what finally releases it. If this
+                        // FAILs the fix leaks instead of corrupting, which is
+                        // the opposite error and is just as much a bug.
+                        close(ph.fd);
+                        let objs4 = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_BLOB_OBJS);
+                        if have_objs
+                            && !report(b"phase6_objs_zero_after_fd_close", objs4 == objs0)
+                        {
+                            failures += 1;
+                        }
+
+                        // A double `mm::buddy::free` of an order-N block is
+                        // allocator corruption, not a leak, and the next
+                        // allocation is the cheapest detector available.
+                        let mut after = DrmVirtgpuResourceCreateBlob {
+                            blob_mem: VIRTGPU_BLOB_MEM_GUEST,
+                            blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+                            size: P6_SIZE as u64,
+                            ..Default::default()
+                        };
+                        let ok_after = ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB,
+                                             &mut after as *mut _) == 0
+                            && after.bo_handle != 0;
+                        if !report(b"phase6_alloc_after_release", ok_after) { failures += 1; }
+                        if ok_after { let _ = gem_close(fd, after.bo_handle); }
+                    } else if exported {
+                        close(ph.fd);
+                        let _ = gem_close(fd, h);
+                    } else {
+                        let _ = gem_close(fd, h);
+                    }
+                }
+            }
+
+            // ── the dumb half, which is the PRE-EXISTING one ────────────────
+            // Same sequence with CREATE_DUMB / DESTROY_DUMB. There is no object
+            // counter for dumb buffers, so this asserts on the payload only —
+            // which is the assertion that matters anyway, since it is the one
+            // that reads the recycled memory.
+            {
+                let mut cd = DrmModeCreateDumb {
+                    width: 64, height: 16, bpp: 32, ..Default::default()
+                };
+                let made = ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut cd as *mut _) == 0
+                    && cd.handle != 0
+                    && cd.size >= 4096;
+                if !report(b"phase6_dumb_created", made) { failures += 1; }
+                if made {
+                    let dsize = cd.size as usize;
+                    let mut md = DrmModeMapDumb { handle: cd.handle, pad: 0, offset: 0 };
+                    let mut stamped = false;
+                    if ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut md as *mut _) == 0 {
+                        let p = mmap(core::ptr::null_mut(), dsize,
+                                     PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                                     md.offset as i64);
+                        if p as isize > 0 {
+                            let b = p as *mut u8;
+                            for i in 0..dsize { *b.add(i) = pat_byte(i); }
+                            stamped = true;
+                        }
+                    }
+                    if !report(b"phase6_dumb_pattern_stamped", stamped) { failures += 1; }
+
+                    let mut ph = DrmPrimeHandle { handle: cd.handle, flags: 0, fd: -1 };
+                    let exported =
+                        ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _) == 0
+                            && ph.fd >= 0;
+                    if !report(b"phase6_dumb_exported", exported) { failures += 1; }
+
+                    if exported && stamped {
+                        let mut dd = cd.handle;
+                        ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut dd as *mut _);
+
+                        // Churn, same reasoning as the blob half: a dumb create
+                        // zeroes its whole allocation (`DrmDumbBuffer::create`).
+                        let mut churn = [0u32; 8];
+                        for slot in churn.iter_mut() {
+                            let mut z = DrmModeCreateDumb {
+                                width: 64, height: 16, bpp: 32, ..Default::default()
+                            };
+                            if ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut z as *mut _) == 0 {
+                                *slot = z.handle;
+                            }
+                        }
+
+                        let mut intact = lseek(ph.fd, 0, SEEK_SET) == 0;
+                        let mut rbuf = [0u8; 256];
+                        let mut off = 0usize;
+                        let mut bad_at = usize::MAX;
+                        while intact && off < dsize {
+                            let want = rbuf.len().min(dsize - off);
+                            let got = read(ph.fd, rbuf.as_mut_ptr() as *mut c_void, want);
+                            if got <= 0 { intact = false; break; }
+                            for (i, &b) in rbuf.iter().take(got as usize).enumerate() {
+                                if b != pat_byte(off + i) {
+                                    bad_at = off + i;
+                                    intact = false;
+                                    break;
+                                }
+                            }
+                            off += got as usize;
+                        }
+                        if !intact {
+                            out(b"  dumb payload lost at offset ");
+                            if bad_at == usize::MAX { out(b"<short read>"); }
+                            else { out_u64(bad_at as u64); }
+                            out(b"\n");
+                        }
+                        if !report(b"phase6_dumb_payload_survives_destroy", intact) {
+                            failures += 1;
+                        }
+
+                        for &z in churn.iter() {
+                            if z != 0 {
+                                let mut zz = z;
+                                ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut zz as *mut _);
+                            }
+                        }
+                        close(ph.fd);
+
+                        let mut cd2 = DrmModeCreateDumb {
+                            width: 64, height: 16, bpp: 32, ..Default::default()
+                        };
+                        let ok_after =
+                            ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut cd2 as *mut _) == 0
+                                && cd2.handle != 0;
+                        if !report(b"phase6_dumb_alloc_after_release", ok_after) {
+                            failures += 1;
+                        }
+                        if ok_after {
+                            let mut h2 = cd2.handle;
+                            ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut h2 as *mut _);
+                        }
+                    } else {
+                        if exported { close(ph.fd); }
+                        let mut dd = cd.handle;
+                        ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut dd as *mut _);
+                    }
+                }
+            }
+            close(fd);
+        }
     }
 
     out(b"--- venustest done, failures = ");

@@ -372,7 +372,28 @@ struct TmpVmo {
     /// For a dmabuf export: the GEM handle this VMO aliases, so PRIME_FD_TO_HANDLE
     /// resolves fd -> handle without a separate registry (auto-cleans on close).
     /// 0 = not a dmabuf.
+    ///
+    /// This is a *round-trip convenience only* and emphatically **not** what
+    /// keeps the buffer alive — see `dmabuf_obj`. It will be replaced the day
+    /// PRIME_FD_TO_HANDLE mints a handle for the *importing* open instead of
+    /// echoing the exporter's, at which point a gem handle stops being
+    /// meaningful across an fd at all.
     dmabuf_handle: u32,
+    /// For a dmabuf export: the **BO object id** this VMO holds a reference on,
+    /// as returned by `drivers::drm_device_interface::prime_export_acquire`.
+    /// 0 = not a dmabuf export.
+    ///
+    /// The reference is held **per slot, not per fd**, which is why it lives
+    /// here: `TMP_VMOS` is keyed by the data-owning slot, so dup, fork and
+    /// SCM_RIGHTS copies of one dmabuf fd already share one slot, and that slot
+    /// is destroyed exactly once, by `vmo_free_slot`. One reference per slot is
+    /// therefore both sufficient and impossible to double-drop.
+    ///
+    /// An object id and never a gem handle, on purpose: a gem handle is retired
+    /// by GEM_CLOSE/DESTROY_DUMB while this fd is still open — that retirement
+    /// is the exact sequence the reference exists to survive — and for a blob
+    /// it is per-open besides.
+    dmabuf_obj: u32,
 }
 
 static TMP_VMOS: Mutex<[Option<TmpVmo>; MAX_TMP_FILES]> =
@@ -436,22 +457,79 @@ fn vmo_zero_range(vmo: &mut TmpVmo, from: usize, to: usize) {
     }
 }
 
+// ── The DRM dmabuf release hook ───────────────────────────────────────────────
+//
+// WHY A FUNCTION POINTER. `vfs-server` depends on `ipc`, `sched`, `mm`, `xattr`
+// and `spin` — **not** on `drivers`, and it must not start to: the VFS is below
+// the device layer and an edge the other way would be a cycle in spirit if not
+// in cargo. So the DRM layer registers itself, once, at boot
+// (`servers/drm/src/lib.rs::init`, which already depends on both). A null
+// registration means "no DRM device on this build", and doing nothing is then
+// exactly right, because nothing can have exported a dmabuf.
+//
+// WHY IT IS CALLED WITH NO LOCK HELD. `vmo_free_slot` runs from inode-teardown
+// sites that hold `TMP_FILES`, and the hook lands in `blob_unref`, which takes
+// `VIRTIO_GPU` and busy-spins on a device round-trip. Calling straight through
+// would (a) hold a tmpfs lock across a device round-trip and (b) introduce a
+// second lock order, TMP_FILES → VIRTIO_GPU, into a codebase that has one
+// already. This project froze all four vCPUs once by taking a device/fault path
+// under a held lock (82d0cc3) and has a standing invariant against the shape.
+//
+// So the plumbing is: `vmo_free_slot` RETURNS the object id it just dropped and
+// calls nothing; each caller lets its `TMP_FILES` guard die and only then
+// invokes `dmabuf_release`. The hook itself touches no user memory and takes no
+// VFS lock, so the reverse order cannot arise either.
+static DMABUF_RELEASE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Register the DRM layer's BO-release entry point. Called once, from
+/// `drm::init`, with `drivers::drm_device_interface::bo_release_exported`.
+///
+/// The callee MUST be safe to call with no VFS lock held and MUST NOT re-enter
+/// the VFS — see the note above. Idempotent; the last registration wins.
+pub fn set_dmabuf_release(f: fn(u32)) {
+    DMABUF_RELEASE.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Drop the DRM-side reference an exporting VMO slot held. **Call only after
+/// every VFS guard has been dropped.** `obj == 0` (not a dmabuf) is a no-op, as
+/// is an unregistered hook.
+fn dmabuf_release(obj: u32) {
+    if obj == 0 { return; }
+    let f = DMABUF_RELEASE.load(core::sync::atomic::Ordering::Acquire);
+    if f == 0 { return; }
+    let f: fn(u32) = unsafe { core::mem::transmute::<usize, fn(u32)>(f) };
+    f(obj);
+}
+
 /// Release a VMO slot's implicit references and clear it. Called from every
 /// inode-free site (`tmp_drop_name`, `tmp_release_ephemeral`) with `TMP_FILES`
 /// already held — the lock order is TMP_FILES → TMP_VMOS. A frame still held by
 /// a live mapping survives (its `pageref` > 1); the last holder frees it.
-fn vmo_free_slot(owner: usize) {
+///
+/// **Returns the dmabuf object id this slot held a reference on**, or `None`
+/// for every ordinary slot. It does not drop that reference itself, because it
+/// cannot: it runs under `TMP_FILES` and the drop reaches the device. Every
+/// caller must pass the value to `dmabuf_release` *after* releasing its guard.
+/// Returning it — rather than taking a new lock here — is what keeps this
+/// function lock-order-neutral.
+#[must_use = "the dmabuf reference must be dropped, with TMP_FILES released"]
+fn vmo_free_slot(owner: usize) -> Option<u32> {
     if let Some(vmo) = TMP_VMOS.lock()[owner].take() {
         // Borrowed (dmabuf) VMOs alias frames the DRM layer owns — dropping the
         // slot must forget the page list WITHOUT freeing; the buddy block is
-        // freed exactly once by free_dumb on GEM_CLOSE/DESTROY_DUMB. Any live
-        // mmap of the fd already balances its own pageref inc/dec (the frames
-        // start untracked so a mapping's unref never reaches the free branch).
-        if vmo.borrowed { return; }
+        // freed by the DRM layer once the LAST reference goes, and this slot
+        // was one of them. Any live mmap of the fd already balances its own
+        // pageref inc/dec (the frames start untracked so a mapping's unref
+        // never reaches the free branch).
+        if vmo.borrowed {
+            return if vmo.dmabuf_obj != 0 { Some(vmo.dmabuf_obj) } else { None };
+        }
         for phys in vmo.pages {
             if phys != 0 { mm::pageref::unref_or_free(phys, 0); }
         }
     }
+    None
 }
 
 /// Resolve `(pid, fd)` to the owning tmpfs slot index, or `None` if the fd is
@@ -543,7 +621,7 @@ pub fn mark_memfd(pid: u32, fd: usize) {
         Some(vmo) => vmo.is_memfd = true,
         None => vmos[idx] = Some(TmpVmo {
             pages: alloc::vec::Vec::new(), len: 0, seals: 0, is_memfd: true,
-            borrowed: false, dmabuf_handle: 0,
+            borrowed: false, dmabuf_handle: 0, dmabuf_obj: 0,
         }),
     }
 }
@@ -573,14 +651,20 @@ pub fn mark_memfd(pid: u32, fd: usize) {
 ///     that reads as a Vulkan bug.
 ///
 /// `len` is what fstat/lseek report. It is the resource's own size for a blob
-/// and the whole buddy block for a dumb buffer (see `prime_export_backing`);
+/// and the whole buddy block for a dumb buffer (see `prime_export_acquire`);
 /// it never exceeds the frames listed, so the clamp in the read path and the
 /// bound in `vmo_acquire_frames` are both satisfiable.
 ///
-/// The frames are NOT owned here (see `TmpVmo.borrowed`); `free_dumb` /
-/// `free_blob` free the whole order-N block.
+/// The frames are NOT owned here (see `TmpVmo.borrowed`); the DRM layer frees
+/// the whole order-N block once the last reference goes.
+///
+/// **`obj` transfers ownership of one DRM reference into this slot.** The
+/// caller took it in `prime_export_acquire`; on success it is the slot's, and
+/// `vmo_free_slot` hands it back for release. **On failure (`false`) the caller
+/// still owns it** and must release it with `bo_release_exported`, or the
+/// buffer leaks for the rest of the boot.
 pub fn install_dmabuf_vmo(pid: u32, fd: usize, phys: usize, order: usize, len: usize,
-                          handle: u32) -> bool {
+                          obj: u32, handle: u32) -> bool {
     let idx = match tmpfile_owner_of(pid, fd) { Some(i) => i, None => return false };
     let pages = if phys == 0 {
         alloc::vec::Vec::new()
@@ -596,10 +680,18 @@ pub fn install_dmabuf_vmo(pid: u32, fd: usize, phys: usize, order: usize, len: u
     // PRIME importer lseeks to SEEK_END and gives up if that fails).
     let mut tmp = TMP_FILES.lock();
     let mut vmos = TMP_VMOS.lock();
+    // Never overwrite a live VMO. The slot belongs to an ephemeral node the
+    // caller opened one instruction ago, so this cannot fire today — but if it
+    // ever did, the displaced slot's DRM reference would be dropped on the
+    // floor and its buffer pinned for the rest of the boot. Refusing hands the
+    // caller back a failure it already knows how to unwind.
+    if vmos[idx].is_some() {
+        return false;
+    }
     tmp[idx].len = len;
     vmos[idx] = Some(TmpVmo {
         pages, len, seals: 0, is_memfd: true,
-        borrowed: true, dmabuf_handle: handle,
+        borrowed: true, dmabuf_handle: handle, dmabuf_obj: obj,
     });
     true
 }
@@ -663,7 +755,7 @@ pub fn vmo_acquire_frames(pid: u32, fd: usize, off: usize, len: usize)
             pages.push(phys);
         }
         vmos[idx] = Some(TmpVmo { pages, len: cur_len, seals: 0, is_memfd: false,
-            borrowed: false, dmabuf_handle: 0 });
+            borrowed: false, dmabuf_handle: 0, dmabuf_obj: 0 });
     }
 
     let vmo = vmos[idx].as_mut().unwrap();
@@ -2174,7 +2266,13 @@ fn tmp_nlink(tmp: &[TmpFileEntry], idx: usize) -> u64 {
 /// That is precisely the create-then-unlink idiom tempfile(3) uses for
 /// anonymous temporaries, so it is on the hot path for `tac`, `sort -o` and
 /// every other tool that buffers through a temp file.
-fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: u128) {
+///
+/// **Returns any dmabuf object reference the collected inode held**, because it
+/// runs with the caller's `TMP_FILES` guard alive and must not drop a DRM
+/// reference from under it (see `DMABUF_RELEASE`). Every caller passes the
+/// value to `dmabuf_release` after its guard has died.
+#[must_use = "the dmabuf reference must be dropped, with TMP_FILES released"]
+fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: u128) -> Option<u32> {
     let referenced = |i: usize| i < MAX_TMP_FILES && open_fds & (1u128 << i) != 0;
     let owner = tmp_owner(tmp, idx);
     if owner != idx {
@@ -2183,16 +2281,19 @@ fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: u128) {
         // owner had already lost its own.
         tmp[idx] = TmpFileEntry::empty();
         if tmp[owner].ephemeral && tmp_alias_count(tmp, owner) == 0 && !referenced(owner) {
-            vmo_free_slot(owner); // release the inode's VMO frames (K1)
+            let obj = vmo_free_slot(owner); // release the inode's VMO frames (K1)
             tmp[owner] = TmpFileEntry::empty();
+            return obj;
         }
-        return;
+        return None;
     }
     if tmp_alias_count(tmp, idx) > 0 || referenced(idx) {
         tmp[idx].ephemeral = true;
+        None
     } else {
-        vmo_free_slot(idx); // release the inode's VMO frames (K1)
+        let obj = vmo_free_slot(idx); // release the inode's VMO frames (K1)
         tmp[idx] = TmpFileEntry::empty();
+        obj
     }
 }
 
@@ -2445,6 +2546,12 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
 /// unexplained ENOSPC from creat()/mkdir().
 ///
 /// Lock order is the established FD_TABLES → TMP_FILES.
+///
+/// A dmabuf export's slot dies HERE, on the last close of the exported fd: the
+/// PRIME intercept unlinks `/tmp/dmabuf:<n>` immediately, so the node is
+/// nameless and this is the only site that can collect it. The DRM reference is
+/// therefore dropped after the `TMP_FILES` guard, at the bottom of this
+/// function — never inside it (see `DMABUF_RELEASE`).
 fn tmp_release_ephemeral(idx: usize) {
     let tbls = FD_TABLES.lock();
     let still_referenced = tbls.iter().any(|t| {
@@ -2463,14 +2570,21 @@ fn tmp_release_ephemeral(idx: usize) {
     // `ephemeral` also marks a hard-linked inode whose own name was unlinked
     // while other names survive. Those are still reachable through an alias,
     // so an fd going away must not collect them.
+    let mut freed_obj = None;
     if !still_referenced && !in_flight && tmp[idx].in_use && tmp[idx].ephemeral
         && tmp_alias_count(&tmp[..], idx) == 0
     {
         // A memfd whose name was unlinked while an fd stayed open lands here on
         // the final close — release its VMO frames before freeing the slot (K1).
-        vmo_free_slot(idx);
+        freed_obj = vmo_free_slot(idx);
         tmp[idx] = TmpFileEntry::empty();
     }
+    // Both guards die on these two lines, BEFORE the device is touched. The
+    // order matters: `dmabuf_release` reaches `blob_unref`, which takes
+    // VIRTIO_GPU and busy-spins on a round-trip.
+    drop(tmp);
+    drop(tbls);
+    dmabuf_release(freed_obj.unwrap_or(0));
 }
 
 
@@ -5253,6 +5367,9 @@ fn tmpfs_rename(old: &[u8], new: &[u8], flags: usize) -> Message {
     if new.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }     // ENAMETOOLONG
 
     let open_fds = tmp_open_fd_mask(); // before TMP_FILES: FD_TABLES → TMP_FILES
+    // A DRM reference released from a clobbered destination inode, held until
+    // the TMP_FILES guard is gone (see `DMABUF_RELEASE`).
+    let mut clobbered_obj: Option<u32> = None;
     let mut tmp = TMP_FILES.lock();
     let idx = match tmp_find(&tmp[..], old) { Some(i) => i, None => return err_reply(-2) };
     let src_is_dir = tmp[idx].is_dir;
@@ -5276,24 +5393,39 @@ fn tmpfs_rename(old: &[u8], new: &[u8], flags: usize) -> Message {
         }
         // Clobbering the destination drops one name, not necessarily the file:
         // if the victim was hard-linked elsewhere its bytes must survive.
-        tmp_drop_name(&mut tmp[..], didx, open_fds);
+        // A dmabuf export cannot land here — the PRIME intercept unlinks its
+        // node immediately, so it is nameless and `tmp_find` never sees it —
+        // but the reference is threaded out regardless rather than relying on
+        // that, and it is released only once TMP_FILES is gone.
+        clobbered_obj = tmp_drop_name(&mut tmp[..], didx, open_fds);
     }
 
     if !src_is_dir {
         tmp_set_path(&mut tmp[idx], new);
+        drop(tmp);
+        dmabuf_release(clobbered_obj.unwrap_or(0));
         return ok_reply();
     }
 
     // Directory: check every descendant fits under the new prefix *before*
     // mutating anything, so a failure leaves the pool untouched.
     let grow = new.len() as isize - old.len() as isize;
-    for (i, e) in tmp.iter().enumerate() {
-        if i == idx || !e.in_use || e.ephemeral { continue; }
-        if e.path_len > old.len() && &e.path[..old.len()] == old && e.path[old.len()] == b'/' {
-            if (e.path_len as isize + grow) as usize > MAX_TMP_PATH - 1 {
-                return err_reply(-36); // ENAMETOOLONG
-            }
-        }
+    // Phrased as `any` rather than an early `return` inside `for ... in
+    // tmp.iter()`: the guard has to be dropped before `dmabuf_release`, and it
+    // cannot be while an iterator is borrowing it.
+    let too_long = tmp.iter().enumerate().any(|(i, e)| {
+        i != idx
+            && e.in_use
+            && !e.ephemeral
+            && e.path_len > old.len()
+            && &e.path[..old.len()] == old
+            && e.path[old.len()] == b'/'
+            && (e.path_len as isize + grow) as usize > MAX_TMP_PATH - 1
+    });
+    if too_long {
+        drop(tmp);
+        dmabuf_release(clobbered_obj.unwrap_or(0));
+        return err_reply(-36); // ENAMETOOLONG
     }
     let mut buf = [0u8; MAX_TMP_PATH];
     for i in 0..MAX_TMP_FILES {
@@ -5309,6 +5441,8 @@ fn tmpfs_rename(old: &[u8], new: &[u8], flags: usize) -> Message {
         tmp_set_path(&mut tmp[i], &buf[..total]);
     }
     tmp_set_path(&mut tmp[idx], new);
+    drop(tmp);
+    dmabuf_release(clobbered_obj.unwrap_or(0));
     ok_reply()
 }
 
@@ -5320,15 +5454,25 @@ fn handle_unlink(path_ptr: usize) -> Message {
         if is_tmpfs_root(path) { return err_reply(-21); } // EISDIR — mount root
         let open_fds = tmp_open_fd_mask(); // before TMP_FILES: FD_TABLES → TMP_FILES
         let mut tmp = TMP_FILES.lock();
-        return match tmp_find(&tmp[..], path) {
-            Some(idx) if tmp[idx].is_dir => err_reply(-21), // EISDIR — use rmdir()
+        let (reply, freed_obj) = match tmp_find(&tmp[..], path) {
+            Some(idx) if tmp[idx].is_dir => (err_reply(-21), None), // EISDIR — use rmdir()
             // Drops the *name*. The bytes go only when the last name does —
             // see tmp_drop_name. A symlink lands here too (the choke point
             // deliberately did not follow the final component), so `rm l`
             // removes the link and never the file it points at.
-            Some(idx) => { tmp_drop_name(&mut tmp[..], idx, open_fds); ok_reply() }
-            None      => err_reply(-2),
+            //
+            // This is the path an `unlink("/tmp/dmabuf:<n>")` takes while the
+            // exported fd is still open: the inode is only marked ephemeral,
+            // so nothing is released here and `freed_obj` is None. It becomes
+            // Some only if the name outlived every fd, which the PRIME
+            // intercept's immediate unlink makes impossible in practice.
+            Some(idx) => (ok_reply(), tmp_drop_name(&mut tmp[..], idx, open_fds)),
+            None      => (err_reply(-2), None),
         };
+        // TMP_FILES gone before the device is touched (see `DMABUF_RELEASE`).
+        drop(tmp);
+        dmabuf_release(freed_obj.unwrap_or(0));
+        return reply;
     }
     if let Some(port) = find_mount_port(raw) {
         let mut proxy = Message::empty();

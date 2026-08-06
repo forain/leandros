@@ -6073,7 +6073,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     // GEM handle into a real fd. Both BO kinds resolve here: a dumb buffer or a
     // guest-backed blob exports an fd whose frames ARE its pages, while a pure
     // host-side Venus blob exports a token fd with no pages (see
-    // `prime_export_backing` and `install_dmabuf_vmo`).
+    // `prime_export_acquire` and `install_dmabuf_vmo`).
     // struct drm_prime_handle { u32 handle@0; u32 flags@4; s32 fd@8; } = 12 bytes.
     const DRM_IOCTL_PRIME_HANDLE_TO_FD: usize = 0xC00C642D;
     const DRM_IOCTL_PRIME_FD_TO_HANDLE: usize = 0xC00C642E;
@@ -6090,7 +6090,13 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
             Some(vfs::VnodeKind::DynamicDevice { open_id, .. }) => open_id,
             _ => 0,
         };
-        let backing = match drivers::drm_device_interface::prime_export_backing(handle, open_id) {
+        // Takes ONE reference on the BO object, which this syscall now owns and
+        // must dispose of on every path: `install_dmabuf_vmo` accepts it on
+        // success, `bo_release_exported` takes it back on failure. That
+        // reference is what makes the exported fd keep the buffer alive across
+        // GEM_CLOSE — without it, `read(fd)` after a close walked frames the
+        // buddy allocator had already handed to someone else.
+        let backing = match drivers::drm_device_interface::prime_export_acquire(handle, open_id) {
             Some(v) => v,
             None => return -22, // EINVAL: no BO this open may reach
         };
@@ -6113,7 +6119,11 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
             0o600u64,
         ]);
         let newfd = vfs_reply_val(&vfs::handle(&open_msg, pid));
-        if newfd < 0 { return newfd; }
+        if newfd < 0 {
+            // The BO reference is ours and there is now nothing to give it to.
+            drivers::drm_device_interface::bo_release_exported(backing.obj);
+            return newfd;
+        }
         // The tmpfs fd table is keyed by TGID: vfs::handle canonicalises caller_pid
         // via sched::tgid_of, so the fd just opened lives in the *process* table,
         // not this thread's. install_dmabuf_vmo/dmabuf_handle_of index the table
@@ -6124,7 +6134,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         // the name still goes through vfs::handle, so it takes the raw pid.
         let vpid = sched::tgid_of(pid);
         if !vfs::install_dmabuf_vmo(vpid, newfd as usize, backing.phys, backing.order,
-                                    backing.len, handle) {
+                                    backing.len, backing.obj, handle) {
             // Never leak the ephemeral node/fd on the failure path: close the fd
             // (drops the pool slot) and unlink the name. Without this a failed
             // export would pin a /tmp slot + one of the 64 process fds forever,
@@ -6133,6 +6143,12 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
             let _ = vfs::handle(&close_msg, pid);
             let unlink_msg = make_vfs_msg(vfs::VFS_UNLINK, &[path.as_ptr() as u64]);
             let _ = vfs::handle(&unlink_msg, pid);
+            // The slot never took the reference (that is what `false` means),
+            // so it is still ours. Released AFTER the close/unlink, not before,
+            // so the two dispositions cannot interleave: on this path the slot
+            // holds no `dmabuf_obj`, the close releases nothing, and this is
+            // the one and only drop.
+            drivers::drm_device_interface::bo_release_exported(backing.obj);
             return -12; // ENOMEM / install failed
         }
         // Unlink the /tmp/dmabuf:<n> name immediately: the open fd holds the slot
