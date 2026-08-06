@@ -3,7 +3,8 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-06** (`531f21e`).
+Last reconciled against `main` on **2026-08-06** (`531f21e`), now also covering the
+m9 panel-gate re-measurement wave.
 
 ---
 
@@ -91,14 +92,15 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | # | Item | Category | Blocked on |
 |---|---|---|---|
 | 1 | Venus/virgl — round-trip done on x86_64; vktest hangs under TCG | Feature | — |
-| 2 | cosmic-panel bar frozen at first frame | Bug — compositor-side | re-measure post-fix |
-| 3 | memfd burns a tmpfs slot per call | Bug — latent DoS | — |
-| 4 | `wl_display error 0 "Unknown id: 636"` | Bug | re-measure post-fix |
-| 5 | `FB_DAMAGE_CLIPS` / primary-plane recomposite | Perf | — |
-| 6 | evdev monotonic timestamps (reverted) | Bug | needs a different time source |
-| 7 | Doom hangs in `malloc(16 MB)` on aarch64 | Bug | re-verify first |
-| 8 | AF_INET loopback `bind()` → EINVAL | Bug | — |
-| 9 | Deferred / known limitations | Mixed | — |
+| 2 | cosmic-panel bar frozen at first frame | Bug — compositor-side | — |
+| 3 | Nested epoll fd may report readable unconditionally | Bug — kernel | — |
+| 4 | memfd burns a tmpfs slot per call | Bug — latent DoS | — |
+| 5 | `wl_display error 0 "Unknown id: 636"` | Bug | re-measure post-fix |
+| 6 | `FB_DAMAGE_CLIPS` / primary-plane recomposite | Perf | — |
+| 7 | evdev monotonic timestamps (reverted) | Bug | needs a different time source |
+| 8 | Doom hangs in `malloc(16 MB)` on aarch64 | Bug | re-verify first |
+| 9 | AF_INET loopback `bind()` → EINVAL | Bug | — |
+| 10 | Deferred / known limitations | Mixed | — |
 
 ---
 
@@ -147,31 +149,65 @@ milestone.
 
 ### 2. cosmic-panel bar frozen at first frame
 
-The panel renders a bar, but its clock is frozen at the first frame.
+The re-measurement on the fixed softfloat kernel is done. **The clock is still
+frozen** — `05f7279` did not fix it. Three independent runs on aarch64/HVF with fresh
+release builds and fresh images: clock reads `00:00:08` at t=70 s and t=175 s with the
+bar strip byte-identical, `00:00:10` at t=100/118/170 s across 542 pointer moves, and
+`00:00:08` at t=65 s and t=190 s across 631 pointer moves. Evidence in
+`~/code/leandros-artifacts/notes/m9-panelgate/` (`clock-m9a-t70.png`,
+`clock-m9a-t175.png`, `clock-m9g-t65.png`, `clock-m9g-t190.png`).
 
-The kernel is exonerated. The gated GAP2 instrumentation (`345b84b`) showed the
-applet's shared pool contents change once per second while the panel's own bar pools
-stay byte-constant and the screen stays byte-identical over 105 s. Four hypotheses were
-falsified by source reading before that measurement: the memfd MAP_SHARED path is
-coherent cross-process (proven by `scmtest`'s pattern-B check), the applet's
-attach/damage/commit ordering is correct, `time()` advances on aarch64 so the repaint
-gate fires, and a read-only compositor mapping still takes the aliasing path.
+The GAP2 observation survives re-taking on the fixed kernel, so the kernel is
+genuinely exonerated this time: 887 samples over ~205 s show the applet pool
+(`idx=0x14`, `/tmp/memfd:leandros-applet`, 220x32x4) advancing continuously with 150
+transitions, while the panel's own bar pool (`idx=0x18`, 1280x32x4) is
+**byte-constant across all 295 samples**. Log:
+`notes/m9-panelgate/m9g-aarch64-g2lines.txt`.
 
-**Re-measure before acting on any of this.** Every measurement above was taken on
-aarch64 with the FP/SIMD clobber live, which silently corrupted userspace
-computation in proportion to cold pages — exactly the conditions a freshly-started
-compositor and panel run under. The conclusion may survive; the evidence has to be
-re-taken first.
+The three candidates this item previously listed — smithay caching the imported SHM
+texture, the compositor mapping the pool at a mismatched size/offset, and
+`wl_shm_pool.create_buffer` offset handling — are all **ruled out**. The panel never
+reaches the import path.
 
-If it does survive, the bug is compositor-side. Remaining candidates:
+Root cause, measured: cosmic-panel's own **size gate** at
+`cosmic-panel-bin/src/space/render.rs:104-109` (`actual_size.w/h <= 20 ||
+dimensions.h <= 20`). Instrumented telemetry over ~789,000 `render()` calls in ~170 s
+reported `actual_size=8x8 dims=1280x8 is_dirty=true has_frame=true` on every single
+sample — both the dirty gate and the frame-callback gate are **open**, and the size
+gate early-returns forever. Frame callbacks from cosmic-comp are therefore not the
+problem, and applet commits are being delivered. 8x8 is padding-only, meaning **no
+applet window is mapped in that space**, even though the applet process is alive and
+painting (its pool advances ~1/s). This is the same gate that caused the M7w bring-up
+failure, when `actual_size` was `(0,0)`.
 
-1. smithay/cosmic-comp caching the imported SHM texture across frames despite a fresh
-   `wl_buffer` and full-surface damage — check smithay's shm import and renderer
-   texture-cache keying.
-2. The compositor mapping the pool at a size/offset that does not track the client's.
-3. `wl_shm_pool.create_buffer` offset handling.
+Two caveats, **inferred not measured**, both being chased now. First, the telemetry
+counter was per-site, not per-space; cosmic-panel runs several `PanelSpace`s in one
+process and one of them spins fast enough to drown the others out of the sample, so
+this proves *a* space is permanently gated at 8x8 but not yet that the **bar-owning**
+space is. Second, `event_loop.dispatch(100 ms)` returning ~4,600 times per second
+means calloop always finds a ready source and something is never drained — see the
+new item on nested epoll readiness.
 
-### 3. memfd burns a tmpfs slot per call
+Diagnostic tooling, currently reverted but re-appliable:
+`~/code/leandros-artifacts/m9_apply_panel_diag.py [--revert]` patches the shipped
+build tree `~/code/leandros-artifacts/m6-session-bins/src/cosmic-panel` — **never**
+`~/code/cosmic-epoch`, since no COSMIC source patch may ship. Harnesses
+`m9_panelgate.py`, `m9_gap2.py`, `m9_uck.py` alongside it.
+
+### 3. Nested epoll fd may report readable unconditionally
+
+cosmic-panel's `event_loop.dispatch(100 ms)` returns ~4,600 times per second, so
+calloop always finds a ready source and something is never drained. The structural
+suspect is that the embedded wayland-server's `poll_fd()` is itself an **epoll fd
+nested inside calloop's epoll** (`wayland-backend-0.3.x/src/rs/server_impl/common_poll.rs:37`).
+On Linux an epoll fd is readable only when its own interest list has at least one
+ready event; if our kernel reports a nested epoll fd as unconditionally readable,
+then any calloop- or libevent-style consumer that nests epoll will busy-spin. Not yet
+confirmed against our epoll implementation — measured symptom, inferred cause. If
+confirmed it is a real kernel bug well beyond this panel, and wants a regression
+subtest in `epolltest`.
+
+### 4. memfd burns a tmpfs slot per call
 
 `sys_memfd_create` backs each memfd with a *named* `/tmp/memfd:<name>` tmpfs node it
 never unlinks, so every call permanently consumes one of 128 `MAX_TMP_FILES` slots. A
@@ -189,7 +225,7 @@ Either the comment is stale or there is a runtime-only hazard the read-only audi
 cannot see. Next: instrumented runtime re-test of unlink-after-create, then delete the
 comment or record the real root cause.
 
-### 4. `wl_display error 0 "Unknown id: 636"` — panel↔comp desync
+### 5. `wl_display error 0 "Unknown id: 636"` — panel↔comp desync
 
 Signature reads as one whole message dropped on a boundary. Id 636 is high and
 client-allocated, created after globals + layer-surface + the whole EGL/GLES bring-up —
@@ -207,7 +243,7 @@ is the same bug is void. On the current kernel, scmtest's `fd_pass`, `cmsg_flags
 arches — evidence *for* the AF_UNIX SCM_RIGHTS path being healthy, so if 636 still
 reproduces, look elsewhere first.
 
-### 5. `FB_DAMAGE_CLIPS` / primary-plane recomposite
+### 6. `FB_DAMAGE_CLIPS` / primary-plane recomposite
 
 The cursor plane landed and moved pointer motion from **0.9 → 6.0 page flips/s**, with
 the cursor image uploaded exactly once and zero pixel traffic per move. But the honest
@@ -218,7 +254,7 @@ flips the **primary** plane on every cursor frame. The end state
 This is the remaining pointer-latency win, and it is on the primary plane, not the
 cursor. `FB_DAMAGE_CLIPS` is already advertised in the plane property table.
 
-### 6. evdev monotonic timestamps — reverted, do not re-land naively
+### 7. evdev monotonic timestamps — reverted, do not re-land naively
 
 Timestamping `push_event` from an inlined `monotonic_us()` **broke pointer input
 entirely**: three runs with the change (atomic path, and a legacy-path control on the
@@ -227,7 +263,7 @@ reverting it restored input. libinput evidently rejects the `cntvct`-derived
 timestamps. A re-land needs a time source libinput accepts, verified against 60
 moves/s with `DRM_STATS` on.
 
-### 7. Doom hangs in `malloc(16 MB)` on aarch64
+### 8. Doom hangs in `malloc(16 MB)` on aarch64
 
 Doom runs through `DG_Init`, DRM init, a successful GPU flush and into the engine, then
 hangs in the first `malloc(16 MB)` (`Z_Init` → `I_ZoneBase` → `AutoAllocMemory` in
@@ -243,13 +279,13 @@ syscall glue.
 sources a cross compiler, not the host one"), which touches exactly the layer blamed
 here — this may already be fixed.
 
-### 8. AF_INET loopback `bind()` → EINVAL
+### 9. AF_INET loopback `bind()` → EINVAL
 
 Found by the tokio spike: TCP loopback bind fails, so the tokio TCP subtest is skipped
 while UDS passes. Low priority — Wayland and D-Bus need only UDS — but it is a real gap
 in the smoltcp integration.
 
-### 9. Deferred work and known limitations
+### 10. Deferred work and known limitations
 
 - **Mesa modifier support.** Our GBM has no `gbm_bo_create_with_modifiers2` path, so
   smithay cannot build a reusing swapchain and reallocates per frame; this once burned
