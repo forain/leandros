@@ -842,6 +842,94 @@ def main():
                 if os.path.isfile(hp):
                     m4_share_files.append((image_dir, fn, hp))
 
+    # COSMIC system-default config tree -> /usr/share/cosmic/<component>/v<N>/<key>
+    #
+    # cosmic-config resolves a component's system defaults as
+    #     system_path = xdg::BaseDirectories::with_prefix("cosmic")
+    #                       .find_data_file("<name>/v<version>")
+    # (libcosmic cosmic-config/src/lib.rs:203,236). find_data_file walks
+    # XDG_DATA_HOME then XDG_DATA_DIRS and returns the first path that EXISTS,
+    # so what it is really testing for is the DIRECTORY
+    # /usr/share/cosmic/<name>/v<N>/. Each config key inside it is a BARE,
+    # EXTENSIONLESS FILE whose entire content is one RON value: get_system_default
+    # is `system_path.join(key)` -> read_to_string -> ron::from_str (:481-487).
+    # If the directory is missing, system_path is None and EVERY key lookup
+    # returns Error::NoConfigDirectory — which Error::is_err() reports as *not*
+    # an error (:120-123), so callers swallow it quietly.
+    #
+    # Two of those quiet swallows are why the desktop had no working keyboard:
+    #   * `defaults` (from cosmic-comp/data/keybindings.ron) IS the entire
+    #     keybinding table. shortcuts::shortcuts() falls back to
+    #     Shortcuts::default(), an EMPTY HashMap (cosmic-settings-daemon/config/
+    #     src/shortcuts/mod.rs:35-38), so without this file cosmic-comp has no
+    #     key bindings at all — not merely no system actions.
+    #   * `system_actions` maps Action::System(..) to a command line. Handling is
+    #     `if let Some(command) = ...system_actions.get(&system)` (cosmic-comp/
+    #     src/input/actions.rs:1016-1021), so an empty map makes every system
+    #     binding a silent no-op. cosmic-launcher, cosmic-app-library and
+    #     cosmic-workspaces are all staged and spawned every boot, and the only
+    #     thing that can raise them is such an action.
+    # cosmic-panel's "Panel Entry Error: NoConfigDirectory" is the same cause on
+    # com.system76.CosmicPanel{,.Panel,.Dock}: container_config.rs:116 reads the
+    # `entries` key, then one Config per entry, then one get() per struct field.
+    #
+    # Sourced from the checked-out ../cosmic-epoch sibling (submodules pinned at
+    # epoch-1.3.0), reproducing exactly what upstream's own install rules place
+    # under $prefix/share/cosmic — better provenance than the unversioned
+    # ~/code/leandros-artifacts staging dirs the rest of the session ship uses.
+    cosmic_epoch = os.path.expanduser("~/code/cosmic-epoch")
+
+    def _stage_cosmic_default(rel, hostpath):
+        """rel is "<component>/v<N>/<key>"; register every ancestor directory."""
+        image_dir = "/usr/share/cosmic/" + os.path.dirname(rel)
+        parts = image_dir.lstrip("/").split("/")
+        for i in range(2, len(parts) + 1):     # /usr is static (ino 15)
+            m4_share_dirs.add("/" + "/".join(parts[:i]))
+        m4_share_files.append((image_dir, os.path.basename(rel), hostpath))
+
+    # Recursive installs. These source trees are already laid out as
+    # <component>/v<N>/<key>, and upstream copies them wholesale
+    # (`find ... -exec install -Dm0644`), so no renaming is involved.
+    #   cosmic-panel/justfile:47-49            45 files (Panel + Dock + entries)
+    #   cosmic-applets/justfile:16,40-41        2 files (CosmicAppList)
+    #   cosmic-settings/justfile:8,36         211 files (themes + CosmicComp)
+    #   cosmic-bg/data/justfile:4-7             2 files, under its own APPID
+    for _src, _prefix in (
+        (f"{cosmic_epoch}/cosmic-panel/data/default_schema", ""),
+        (f"{cosmic_epoch}/cosmic-applets/cosmic-app-list/data/default_schema", ""),
+        (f"{cosmic_epoch}/cosmic-settings/resources/default_schema", ""),
+        (f"{cosmic_epoch}/cosmic-bg/data/v1", "com.system76.CosmicBackground/v1"),
+    ):
+        if not os.path.isdir(_src):
+            continue
+        for dirpath, _dn, filenames in os.walk(_src):
+            _sub = os.path.relpath(dirpath, _src)
+            if _sub == ".":
+                _base = _prefix
+            elif _prefix:
+                _base = _prefix + "/" + _sub
+            else:
+                _base = _sub
+            for fn in sorted(filenames):
+                hp = os.path.join(dirpath, fn)
+                if os.path.isfile(hp) and _base:
+                    _stage_cosmic_default(f"{_base}/{fn}", hp)
+
+    # The three files upstream installs one at a time, each RENAMED: the ".ron"
+    # suffix is stripped, and keybindings.ron additionally becomes "defaults".
+    #   cosmic-comp/Makefile:26-27,55-57
+    #   cosmic-settings-daemon/Makefile:22,36
+    for _src, _rel in (
+        (f"{cosmic_epoch}/cosmic-comp/data/keybindings.ron",
+         "com.system76.CosmicSettings.Shortcuts/v1/defaults"),
+        (f"{cosmic_epoch}/cosmic-settings-daemon/data/system_actions.ron",
+         "com.system76.CosmicSettings.Shortcuts/v1/system_actions"),
+        (f"{cosmic_epoch}/cosmic-comp/data/tiling-exceptions.ron",
+         "com.system76.CosmicSettings.WindowRules/v1/tiling_exception_defaults"),
+    ):
+        if os.path.isfile(_src):
+            _stage_cosmic_default(_rel, _src)
+
     # 2. Dynamically calculate required blocks and image size
     # Each meta segment takes 512 blocks. We have 8 meta segments (4096 blocks).
     # Plus safety margin and blocks for directories.
