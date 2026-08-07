@@ -594,10 +594,18 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 
 ## Prepared but not landed
 
-**Nothing.** `driverpy_venus.patch` landed as `cc82924` — it applied clean, and its device
-line was verified character-for-character against `run-qemu.sh` rather than trusted. This
-section is now empty for the first time; keep it that way by landing prepared patches in the
-wave that prepares them, since both patches that sat here needed a rebase before they applied.
+`driverpy_venus.patch` landed as `cc82924` — it applied clean, and its device line was
+verified character-for-character against `run-qemu.sh` rather than trusted. This section was
+briefly empty for the first time; land prepared patches in the wave that prepares them, since
+both patches that have sat here needed a rebase before they applied.
+
+One patch, and it is **on the Linux box, not here**:
+`~/code/leandros-artifacts/notes/m9-vkwl/mkfs-vkwl.patch` adds `vkwl` and `m4-vkwl` staging
+blocks to `scripts/mkfs-f2fs-populated.py`, conditional on the host binary existing (the same
+pattern as `leandros-applet` and `wl-globals`). It is uncommitted in the box's tree at
+`20525aa`; the copy here is a mirror. It is harmless to land on this Mac — the conditional
+simply never fires without the binaries — but it is not landed, because the Mac has no built
+`vkwl` and landing staging for a file that cannot exist would be noise.
 
 ---
 
@@ -856,6 +864,17 @@ Design, staging and per-stage guard tests with their falsifying mutations:
   The landmine is about Rust's self-relocating *static*-PIE, which is a different recipe.
   Applying it here would break a working build. Both arches verified to have identical ELF
   shape (DYN, 11 program headers, same order).
+- **`vkwl` is the project's first Vulkan Wayland client, and it exists only as loose files.**
+  `~/code/leandros-artifacts/venus-lane/vkwl.c` (~600 lines, 33 KB) plus `build-vkwl.sh` and
+  the guest-side runner `m6-session-data/m4-vkwl`, mirrored from the box and verified
+  byte-identical. It was written because `vkswap`, `vkrender` and `vktest` are **all**
+  `VK_EXT_headless_surface` and none of them touches Wayland — see item 2.
+  **The real exposure is broader than this one file:** `~/code/leandros-artifacts` is **not a
+  git repository**, so `vktest.c`, `ssp_guard.c`, every `build-*.sh` and now `vkwl.c` have no
+  history and nothing to recover them from. That has been true for the whole Vulkan arc and
+  has simply not bitten yet. Worth deciding deliberately — either put these instruments in
+  the repo proper, or `git init` the artifacts tree — rather than continuing to rely on the
+  files not being deleted.
 - **Two spent instruments, kept but not pending.**
   `~/code/leandros-artifacts/notes/m9-damage-rootcause/damage_rect_dump.patch` (132 lines,
   one file, entirely inside the `DRM_STATS` gate) was applied on the box, produced the
