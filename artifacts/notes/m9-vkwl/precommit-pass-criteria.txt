@@ -1,0 +1,39 @@
+Pre-committed pass criteria for the M4 pixel capture (written BEFORE any capture).
+
+Subject: vkwl, MESA_VK_WSI_DEBUG=sw, 304 frames, holding on each of the last
+two, presenting into cosmic-comp inside LeandrOS on x86_64/KVM with --venus.
+
+vkwl clears its swapchain to a 6-colour cycle. Frame f uses cols[f % 6]:
+    0 (0.90,0.15,0.15)  1 (0.15,0.85,0.30)  2 (0.15,0.40,0.95)
+    3 (0.95,0.80,0.10)  4 (0.70,0.25,0.85)  5 (0.10,0.85,0.85)
+304 frames therefore end on f=302 (index 2) and f=303 (index 3), and 304 was
+chosen for exactly that: index 2 and index 3 are the two whose 8-bit UNORM
+conversions are least ambiguous.
+
+    phase B  seq=302  predicted 0x2666f2   (38,102,242)
+    phase C  seq=303  predicted 0xf2cc1a   (242,204,26)
+
+vkwl prints its own prediction in the HOLD READY sentinel, so the harness does
+not guess Vulkan UNORM rounding; tolerance is +-2 per channel.
+
+PASS requires ALL of the following, for BOTH phases:
+  1. >= 90% of the swapchain extent area (vkwl reports the extent) is within
+     +-2 of that phase's predicted colour.
+  2. Those pixels form a solid axis-aligned rectangle: bounding-box fill >= 0.95.
+  3. That colour appears ZERO times in capture A, the control taken from the
+     same boot with the desktop up and vkwl not yet started.
+  4. The frame is not byte-identical to the control.
+  5. The capture is complete (0 uncovered pixels).
+
+FAIL / NEGATIVE FINDINGS, each reportable and each different:
+  * No HOLD READY sentinel        -> the client never got that far; not a pixel
+                                     question at all.
+  * Predicted colour absent, and  -> the compositor is drawing, but the client
+    B differs from A                 buffer is not reaching the scanout.
+  * B byte-identical to A         -> nothing recomposited; the scanout is stale.
+  * Byte-swapped colour present   -> the pixels arrive but a channel order is
+    instead of the predicted one     wrong somewhere in the chain.
+  * Colour present but bbox fill  -> partial/torn present, or the capture
+    low or count much below extent   straddled two frames.
+
+A census dominated by "looks like a desktop" is explicitly NOT a pass.
