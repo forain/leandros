@@ -1,0 +1,116 @@
+# m12c-input — attribute the input gap to a layer, and read the registry.
+#
+# Run it as:  brush /bin/m12c-input     (no shebang binfmt; always via a shell)
+# Host half:  artifacts/m12c_input.py
+#
+# WHAT m12-caps LEFT OPEN. That run measured, on a live COSMIC session: injected
+# pointer motion raised the kernel's evdev counter by 868 while the compositor's
+# page-flip rate stayed at exactly its idle 1.00/s, and not one pixel outside the
+# panel clock ever changed — under pointer motion, three click targets and three
+# keybindings. It could not say WHY, because cosmic-comp's own log never reaches
+# the session log file at RUST_LOG=info: the 148-line cosmic.log contains lines
+# from every child EXCEPT the compositor, and nothing anywhere mentions libinput,
+# a seat, or an input device. So "the compositor ignored it" and "the compositor
+# was never told" were still the same silence.
+#
+# Three cuts, in order of how far down the stack they sit:
+#
+#   1. `ls /dev/input` + `ls /sys/class/input` — what the kernel EXPOSES, against
+#      what the libudev shim CLAIMS. The shim serves a hardcoded table of
+#      event0=keyboard and event1=tablet (ports/input-stack/shims/libudev/
+#      libudev.c:107-143); a shim describing nodes the kernel does not have would
+#      fail in exactly the shape observed.
+#
+#   2. `evtest2` — opens /dev/input/event1 directly, epolls it, and reports
+#      ABS_X/ABS_Y + SYN_REPORT frames. There is NO libinput, no libudev and no
+#      libseat anywhere in that path, so it isolates kernel-ring -> userspace-read
+#      from everything above it. Read its `failures = N` trailer, not a grep for
+#      ': PASS' — a harness scored waittest 5/0 against a four-subtest source
+#      exactly that way.
+#
+#   3. the same COSMIC session, but with RUST_LOG turned up on the three smithay
+#      backends that would name a device if one were ever opened. Targeted, not
+#      `debug` globally: a global debug log buries the answer and takes minutes
+#      to cat back over the console.
+#
+# And, incidentally, the question m12-caps could not answer at all: `wl-globals`
+# was absent from that image (`/bin/wl-globals: command not found`), so nothing
+# is yet known about what cosmic-comp advertises. It is built and staged now. It
+# ignores the environment and connects by explicit path to every wayland-* socket
+# it finds, which is what keeps cosmic-comp's registry apart from cosmic-panel's
+# embedded server — the latter advertises a plausible subset and would be a
+# convincing wrong answer.
+
+R=/run/user/0
+L=/run/user/0/m12c
+
+mkdir -p "$R"
+chmod 0700 "$R"
+mkdir -p "$L"
+
+echo "M12C: BEGIN"
+
+# ---- cut 1: what the kernel exposes -----------------------------------------
+echo "M12C: ==== BEGIN devinput ===="
+ls -l /dev/input
+echo "M12C: ==== END devinput ===="
+
+echo "M12C: ==== BEGIN sysclassinput ===="
+ls -l /sys/class/input
+echo "M12C: ==== END sysclassinput ===="
+
+# ---- cut 2: raw evdev, nothing above it -------------------------------------
+# The host injects motion across this whole window rather than waiting for
+# evtest2's own "waiting up to 6s" line, which is inside the redirect and
+# therefore invisible to it. A window several times longer than the tool's
+# internal wait makes the overlap certain without a handshake.
+echo "M12C: MARK EVTEST 45"
+/bin/evtest2 > "$L/evtest2.log" 2>&1
+echo "M12C: ENDMARK EVTEST"
+
+# ---- cut 3: the session, with the input backends made to speak --------------
+RUST_LOG="warn,cosmic_comp=debug,smithay::backend::libinput=debug,smithay::backend::udev=debug,smithay::backend::session=debug,smithay::backend::input=debug"
+export RUST_LOG
+
+sh /bin/start-cosmic-leandros > "$L/cosmic.log" 2>&1 &
+
+i=0
+while [ "$i" -lt 180 ]; do
+	if [ -e "$R/wayland-1" ]; then
+		break
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+echo "M12C: wayland-1 after ${i}s"
+sleep 30
+
+XDG_RUNTIME_DIR="$R"
+WAYLAND_DISPLAY=wayland-1
+export XDG_RUNTIME_DIR
+export WAYLAND_DISPLAY
+
+# ---- the registry -----------------------------------------------------------
+/bin/wl-globals > "$L/globals.log" 2>&1
+echo "M12C: globals captured"
+
+# ---- provoke, with the compositor listening out loud ------------------------
+echo "M12C: MARK POINTER2 70"
+sleep 70
+echo "M12C: ENDMARK POINTER2"
+
+echo "M12C: CAPTURES DONE"
+
+echo "M12C: ==== BEGIN evtest2.log ===="
+cat "$L/evtest2.log"
+echo "M12C: ==== END evtest2.log ===="
+
+echo "M12C: ==== BEGIN globals.log ===="
+cat "$L/globals.log"
+echo "M12C: ==== END globals.log ===="
+
+echo "M12C: ==== BEGIN cosmic.log ===="
+cat "$L/cosmic.log"
+echo "M12C: ==== END cosmic.log ===="
+
+echo "M12C: DONE"

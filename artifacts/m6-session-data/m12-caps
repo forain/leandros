@@ -1,0 +1,247 @@
+# m12-caps — empirical capability probe of the COSMIC desktop as it actually runs.
+#
+# Run it as:  brush /bin/m12-caps
+# LeandrOS has no shebang/binfmt, so this file is only ever handed to a shell.
+#
+# WHAT THIS IS FOR. "Does COSMIC boot" is settled. What is not settled is what a
+# user can DO: whether the pointer and keyboard reach anything, whether a client
+# can open a window and be focused/moved/closed, which applets render, and which
+# of the twelve COSMIC binaries on the image are alive after settle. Those
+# questions need input injected from the host and pixels read back from the host,
+# interleaved with guest-side actions — so this script is one half of a pair. It
+# owns the guest side (start the session, open clients, run instruments) and
+# announces each window in which the host may act; artifacts/m12_caps.py owns the
+# host side (QMP input, RFB capture) and keys off those announcements.
+#
+# WHY A SCRIPT AND NOT N SERIAL COMMANDS. Same reason as m4-vkwl: the launcher
+# ends in `exec cosmic-session`, so typing it at the getty shell leaves nothing
+# to run clients from; and commands sent to the shell well into a live session do
+# not execute. Everything the guest will ever need to do is therefore committed
+# up front, in one process, before the console is under load.
+#
+# THE PROTOCOL. Exactly two line shapes are load-bearing:
+#
+#     M12: MARK <NAME> <SECS>     the host may act for the next <SECS> seconds
+#     M12: ENDMARK <NAME>         that window is closed
+#
+# The host never writes to the guest after launch — there is no back-channel —
+# so every window is a fixed sleep, not a handshake. Sleeps are deliberately
+# generous: a capture that lands after its window has closed photographs the
+# NEXT phase and is indistinguishable from a confident wrong answer.
+#
+# WHY THE CLOCK IS THE CONTROL. The panel clock repaints once a second, so a
+# capture pair taken seconds apart must differ SOMEWHERE even when nothing this
+# script did had any effect. That gives every later "pressing X changed nothing"
+# a matching "...and the frame was not stale, because the clock advanced". The
+# IDLE phase exists to measure that region before anything else is provoked.
+#
+# CONSOLE SAFETY. Printing during a live session used to scroll the compositor's
+# scanout out from under it (the framebuffer console and the scanout are the same
+# surface). edad115 makes the console yield to whichever DRM open presented, so
+# these MARK lines are serial-only now. They are still kept to a handful of short
+# lines per phase, and every probe's own output goes to a file under $L which is
+# dumped only after the last capture window has closed.
+
+R=/run/user/0
+L=/run/user/0/m12
+
+mkdir -p "$R"
+chmod 0700 "$R"
+mkdir -p "$L"
+
+echo "M12: BEGIN"
+
+# ---- the session ------------------------------------------------------------
+# Backgrounded with its log redirected: `exec cosmic-session` would replace this
+# shell, and an un-redirected RUST_LOG=info stream saturates the console.
+sh /bin/start-cosmic-leandros > "$L/cosmic.log" 2>&1 &
+
+# cosmic-comp hands WAYLAND_DISPLAY=wayland-1 back to cosmic-session, so
+# wayland-1 is the name to wait on, not wayland-0.
+i=0
+while [ "$i" -lt 180 ]; do
+	if [ -e "$R/wayland-1" ]; then
+		break
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+echo "M12: wayland-1 after ${i}s"
+
+# The socket existing does not mean outputs are probed, the panel has spawned,
+# or the wallpaper has been painted. Settle before photographing anything.
+sleep 30
+
+XDG_RUNTIME_DIR="$R"
+WAYLAND_DISPLAY=wayland-1
+export XDG_RUNTIME_DIR
+export WAYLAND_DISPLAY
+
+# ---- 1. idle desktop --------------------------------------------------------
+# Host: three captures spaced across the window. Establishes the baseline frame
+# AND the "liveness region" (the clock) that every later null result is read
+# against.
+echo "M12: MARK IDLE 50"
+sleep 50
+echo "M12: ENDMARK IDLE"
+
+# ---- 2. pointer -------------------------------------------------------------
+# Host: sustained motion bursts, then the pointer parked at three widely
+# separated points with a capture at each. The kernel's own evdev counter
+# (evpush in [DRMSTAT]) says whether the events reached the guest ring at all,
+# so "the compositor ignored the pointer" and "the pointer never arrived" stay
+# distinguishable.
+echo "M12: MARK POINTER 95"
+sleep 95
+echo "M12: ENDMARK POINTER"
+
+# ---- 3. click on the panel --------------------------------------------------
+# Host: click the panel bar where the applet is, then elsewhere. The only applet
+# with content is leandros-applet, which has no menu of its own — so a change
+# here is the panel or the compositor reacting, not the applet.
+echo "M12: MARK CLICK 50"
+sleep 50
+echo "M12: ENDMARK CLICK"
+
+# ---- 4-6. keybindings -------------------------------------------------------
+# Host: tap the binding, capture, press Escape, capture. cosmic-launcher and
+# cosmic-app-library are already running as session children; the keybinding is
+# the intended way to make either draw, and it exercises compositor shortcut
+# handling -> D-Bus -> the daemon -> a layer surface, in one shot.
+echo "M12: MARK KEY_SUPER 55"
+sleep 55
+echo "M12: ENDMARK KEY_SUPER"
+
+echo "M12: MARK KEY_SLASH 55"
+sleep 55
+echo "M12: ENDMARK KEY_SLASH"
+
+echo "M12: MARK KEY_A 55"
+sleep 55
+echo "M12: ENDMARK KEY_A"
+
+# ---- 7. what the compositor advertises --------------------------------------
+# wl-globals ignores the environment and connects by explicit path to EVERY
+# wayland-* socket, so it reaches cosmic-comp rather than cosmic-panel's
+# embedded server (which advertises a plausible-looking subset and would be a
+# convincing wrong answer). Quiet: straight to a file.
+/bin/wl-globals > "$L/globals.log" 2>&1
+echo "M12: MARK GLOBALS 5"
+sleep 5
+echo "M12: ENDMARK GLOBALS"
+
+# ---- 8. one toplevel window -------------------------------------------------
+# wlclient is a wl_shm + xdg_shell client that cycles its base colour on every
+# key press and prints the keycode, and unmaps on xdg_toplevel.close. That makes
+# it a witness for three separate things at once: a window exists (pixels), it
+# has keyboard focus (its own log), and keys reach it (colour change + keycode).
+/bin/wlclient > "$L/win1.log" 2>&1 &
+sleep 10
+echo "M12: MARK WIN1 75"
+sleep 75
+echo "M12: ENDMARK WIN1"
+
+# ---- 9. two toplevel windows ------------------------------------------------
+# Host: click each in turn. COSMIC draws a 1 px active-window border, so focus
+# moving between the two is visible in the frame as well as in the two logs.
+/bin/wlclient > "$L/win2.log" 2>&1 &
+sleep 10
+echo "M12: MARK WIN2 75"
+sleep 75
+echo "M12: ENDMARK WIN2"
+
+# ---- 10. move / resize / close ----------------------------------------------
+# Host: Super+left-drag to move, Super+right-drag to resize, Super+Q to close.
+# Whichever of the three does nothing is a separate finding from the others.
+echo "M12: MARK WM 95"
+sleep 95
+echo "M12: ENDMARK WM"
+
+# ---- 11. a real application -------------------------------------------------
+# cosmic-settings is the one shipped libcosmic/iced APPLICATION (the rest are
+# daemons or applets). Run directly rather than through a launcher, so "no way
+# to start an app" and "apps do not run" are told apart.
+/bin/cosmic-settings > "$L/settings.log" 2>&1 &
+sleep 10
+echo "M12: MARK SETTINGS 85"
+sleep 85
+echo "M12: ENDMARK SETTINGS"
+
+echo "M12: CAPTURES DONE"
+
+# ---- 12. exfiltration -------------------------------------------------------
+# Only now, with every capture window closed, is it safe to be loud. Everything
+# goes out verbatim: filtering in-guest costs a shell that has no grep and has
+# wedged before on exactly that pattern, and the host has the whole serial log
+# in a file anyway.
+echo "M12: ==== BEGIN bin ===="
+ls /bin
+echo "M12: ==== END bin ===="
+
+echo "M12: ==== BEGIN applications ===="
+ls /usr/share/applications
+echo "M12: ==== END applications ===="
+
+echo "M12: ==== BEGIN proc ===="
+ls /proc
+echo "M12: ==== END proc ===="
+
+# Process census. There is no procfs to enumerate: /proc is a hardcoded table in
+# the VFS server with no per-pid directories, so `ls /proc` above lists five
+# static names and btm's process pane is empty by construction. The ONE facility
+# that maps an arbitrary pid to an identity is the kernel's readlink intercept
+# (kernel/src/syscall.rs:5524), which handles /proc/<pid>/exe for any pid and
+# returns ENOENT for a dead one. Pids are allocated monotonically from 1 and
+# MAX_TASKS is 256, so scanning 1..320 is exhaustive rather than a sample.
+#
+# Read the output with three caveats it cannot express itself:
+#   * threads alias their leader (readlink maps pid->tgid), so N lines with the
+#     same path are N threads of one process, not N processes;
+#   * an unreaped zombie is still in the runqueue but its exe record is cleared
+#     at leader exit, so it shows up as the /bin/init fallback — "alive but
+#     reports /bin/init" is the zombie signature, not a real init;
+#   * the exe side table holds 64 entries and silently drops records past that,
+#     so late arrivals can also degrade to /bin/init.
+# This runs only here, after the last capture window: 300 command substitutions
+# is exactly the shape that wedged the guest shell for 20 minutes when it was
+# used as a polling loop next to a live client.
+echo "M12: ==== BEGIN pidcensus ===="
+p=1
+while [ "$p" -le 320 ]; do
+	e=$(readlink /proc/$p/exe 2>/dev/null)
+	if [ -n "$e" ]; then
+		echo "PID $p $e"
+	fi
+	p=$((p + 1))
+done
+echo "M12: ==== END pidcensus ===="
+
+echo "M12: ==== BEGIN runtime ===="
+ls -l "$R"
+echo "M12: ==== END runtime ===="
+
+echo "M12: ==== BEGIN globals.log ===="
+cat "$L/globals.log"
+echo "M12: ==== END globals.log ===="
+
+echo "M12: ==== BEGIN win1.log ===="
+cat "$L/win1.log"
+echo "M12: ==== END win1.log ===="
+
+echo "M12: ==== BEGIN win2.log ===="
+cat "$L/win2.log"
+echo "M12: ==== END win2.log ===="
+
+echo "M12: ==== BEGIN settings.log ===="
+cat "$L/settings.log"
+echo "M12: ==== END settings.log ===="
+
+echo "M12: ==== BEGIN cosmic.log wc ===="
+wc -l "$L/cosmic.log"
+echo "M12: ==== END cosmic.log wc ===="
+
+echo "M12: ==== BEGIN cosmic.log ===="
+cat "$L/cosmic.log"
+echo "M12: ==== END cosmic.log ===="
+
+echo "M12: DONE"

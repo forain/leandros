@@ -1,0 +1,200 @@
+
+================ WHAT THE KERNEL SAW ================
+phase            dt      evpush   flips_sub   flips_del     curs_up     curs_mv      atomic
+IDLE           48.0s           0          48          48           0          48          48
+POINTER        92.0s         868         111         112           0         112         112
+CLICK          48.0s          24          57          57           0          57          57
+KEY_SUPER      54.0s           8          62          62           0          62          62
+KEY_SLASH      52.0s          12          58          58           0          58          58
+KEY_A          54.0s          12          61          61           0          61          61
+GLOBALS         2.0s           0           2           2           0           2           2
+WIN1           74.0s          32          80          80           0          80          80
+WIN2           72.0s          28          75          75           0          75          75
+WM             94.0s         164         101         101           0         101         101
+SETTINGS       82.0s           8          84          83           0          84          84
+
+phase            dt  rates per second
+IDLE           48.0s  evpush     0.00/s   flips   1.00/s   atomic   1.00/s   curs_mv   1.00/s   curs_up  0.00/s
+POINTER        92.0s  evpush     9.43/s   flips   1.21/s   atomic   1.22/s   curs_mv   1.22/s   curs_up  0.00/s
+CLICK          48.0s  evpush     0.50/s   flips   1.19/s   atomic   1.19/s   curs_mv   1.19/s   curs_up  0.00/s
+KEY_SUPER      54.0s  evpush     0.15/s   flips   1.15/s   atomic   1.15/s   curs_mv   1.15/s   curs_up  0.00/s
+KEY_SLASH      52.0s  evpush     0.23/s   flips   1.12/s   atomic   1.12/s   curs_mv   1.12/s   curs_up  0.00/s
+KEY_A          54.0s  evpush     0.22/s   flips   1.13/s   atomic   1.13/s   curs_mv   1.13/s   curs_up  0.00/s
+GLOBALS         2.0s  evpush     0.00/s   flips   1.00/s   atomic   1.00/s   curs_mv   1.00/s   curs_up  0.00/s
+WIN1           74.0s  evpush     0.43/s   flips   1.08/s   atomic   1.08/s   curs_mv   1.08/s   curs_up  0.00/s
+WIN2           72.0s  evpush     0.39/s   flips   1.04/s   atomic   1.04/s   curs_mv   1.04/s   curs_up  0.00/s
+WM             94.0s  evpush     1.74/s   flips   1.07/s   atomic   1.07/s   curs_mv   1.07/s   curs_up  0.00/s
+SETTINGS       82.0s  evpush     0.10/s   flips   1.02/s   atomic   1.02/s   curs_mv   1.02/s   curs_up  0.00/s
+
+================ WHAT THE SCREEN DID ================
+liveness region (self-repainting, subtracted below): x=961..1029 y=5..25 [69x21]
+
+compositor is alive at all                   IDENTICAL   (raw incl. clock: 216 px)
+...and still alive 18 s later                IDENTICAL   (raw incl. clock: 459 px)
+pointer parked top-left vs bottom-right      IDENTICAL   (raw incl. clock: 279 px)
+pointer parked centre, twice                 IDENTICAL   (raw incl. clock: 171 px)
+click on the panel applet                    IDENTICAL   (raw incl. clock: 468 px)
+click far end of the panel                   IDENTICAL   (raw incl. clock: 315 px)
+click the desktop                            IDENTICAL   (raw incl. clock: 225 px)
+Super (launcher)                             IDENTICAL   (raw incl. clock: 432 px)
+Super, 12 s later                            IDENTICAL   (raw incl. clock: 513 px)
+Super+/ (launcher)                           IDENTICAL   (raw incl. clock: 378 px)
+Super+A (app library)                        IDENTICAL   (raw incl. clock: 162 px)
+ONE wlclient toplevel mapped                    208563 px (10.058%)  x=685..1233 y=133..521  [549x389]   (raw incl. clock: 209004 px)
+click on that window                         IDENTICAL   (raw incl. clock: 369 px)
+keys 'abc' to the window                     IDENTICAL   (raw incl. clock: 288 px)
+keys 'def' to the window                     IDENTICAL   (raw incl. clock: 225 px)
+SECOND wlclient toplevel mapped                 231996 px (11.188%)  x=685..1281 y=133..570  [597x438]   (raw incl. clock: 232356 px)
+click window 1                               IDENTICAL   (raw incl. clock: 279 px)
+click window 2                               IDENTICAL   (raw incl. clock: 261 px)
+keys 'xyz' to the focused window             IDENTICAL   (raw incl. clock: 414 px)
+Super+drag to move                           IDENTICAL   (raw incl. clock: 324 px)
+Super+right-drag to resize                         171 px ( 0.008%)  x=943..957 y=5..22  [15x18]   (raw incl. clock: 567 px)
+Super+Q to close                             IDENTICAL   (raw incl. clock: 261 px)
+Super+Q again                                IDENTICAL   (raw incl. clock: 243 px)
+cosmic-settings, 6 s after launch            IDENTICAL   (raw incl. clock: 441 px)
+cosmic-settings, 26 s after launch           IDENTICAL   (raw incl. clock: 351 px)
+cosmic-settings, 74 s after launch           IDENTICAL   (raw incl. clock: 351 px)
+
+================ WHAT THE GUEST SAID ================
+sections captured: bin, applications, proc, pidcensus, runtime, globals.log, win1.log, win2.log, settings.log, cosmic.log wc
+
+---------------- globals.log ----------------
+error: command not found: /bin/wl-globals
+
+---------------- win1.log ----------------
+[wlclient] connected to display
+[wlclient] roundtrip: requesting globals...
+[wlclient] roundtrip done: compositor=0x1278c8b70 shm=0x1278c8a90 wm_base=0x206830 seat=0x2068a0
+[wlclient] shm buffer created (480x320 ARGB8888)
+[wlclient] toplevel committed, waiting for configure...
+[wlclient] seat has keyboard
+[wlclient] configured -> painted (color 0)
+[wlclient] configured -> painted (color 0)
+[wlclient] configured -> painted (color 0)
+[wlclient] configured -> painted (color 0)
+
+---------------- win2.log ----------------
+[wlclient] connected to display
+[wlclient] roundtrip: requesting globals...
+[wlclient] roundtrip done: compositor=0x13fae1b70 shm=0x13fae1a90 wm_base=0x206830 seat=0x2068a0
+[wlclient] shm buffer created (480x320 ARGB8888)
+[wlclient] toplevel committed, waiting for configure...
+[wlclient] seat has keyboard
+[wlclient] configured -> painted (color 0)
+[wlclient] configured -> painted (color 0)
+[wlclient] configured -> painted (color 0)
+
+---------------- settings.log ----------------
+
+
+---------------- pidcensus ----------------
+PID 1 /bin/init
+PID 2 /bin/init
+PID 3 /bin/brush
+PID 4 /bin/brush
+PID 5 /bin/brush
+PID 6 /bin/brush
+PID 10 /bin/sh
+[DRMSTAT] t=0x0000000000012818 flips_sub=0x000000000000033A flips_del=0x0000000000000337 dirtyfb=0x0000000000000000 clips=0x0000000000000000 flip_us=0x00000000011F9693 dmg_full=0x0000000000000003 dmg_rect=0x0000000000000337 dmg_skip=0x0000000000000001 dmg_px=0x000000000EA7AB80 blobs=0x000000000000033B curs_up=0x0000000000000001 curs_mv=0x0000000000000337 atomic=0x000000000000033B atest=0x0000000000000006 cplane=0x0000000000002080 evpush=0x00000000000004E6 bo_dumb=0x0000000000000004 bo_dumbret=0x0000000000000000 bo_blob=0x0000000000000000 bo_bhnd=0x0000000000000000
+PID 16 /bin/sh
+PID 18 /usr/libexec/busd
+PID 21 /bin/cosmic-session
+PID 23 /bin/cosmic-comp
+PID 24 /bin/cosmic-comp
+PID 25 /bin/cosmic-comp
+PID 26 /bin/cosmic-comp
+PID 27 /bin/cosmic-comp
+PID 29 /bin/cosmic-comp
+PID 30 /bin/cosmic-comp
+PID 32 /bin/cosmic-comp
+PID 33 /bin/cosmic-comp
+PID 35 /bin/cosmic-comp
+PID 36 /bin/cosmic-comp
+PID 37 /bin/cosmic-comp
+PID 39 /bin/cosmic-settings-daemon
+PID 41 /bin/cosmic-notifications
+PID 42 /bin/cosmic-panel
+PID 43 /bin/cosmic-settings-daemon
+PID 46 /bin/cosmic-settings-daemon
+PID 47 /bin/cosmic-app-library
+PID 48 /bin/cosmic-settings-daemon
+PID 49 /bin/cosmic-notifications
+PID 50 /bin/cosmic-app-library
+PID 53 /bin/cosmic-settings-daemon
+PID 54 /bin/cosmic-notifications
+PID 55 /bin/cosmic-settings-daemon
+PID 58 /bin/cosmic-launcher
+PID 59 /bin/cosmic-workspaces
+PID 60 /bin/cosmic-osd
+PID 61 /bin/cosmic-bg
+PID 62 /bin/cosmic-greeter
+PID 63 /bin/cosmic-files-applet
+PID 64 /bin/cosmic-launcher
+PID 66 /bin/cosmic-idle
+PID 67 /bin/cosmic-workspaces
+PID 69 /bin/cosmic-files-applet
+PID 70 /bin/cosmic-files-applet
+PID 71 /bin/cosmic-bg
+PID 72 /bin/cosmic-osd
+PID 74 /bin/cosmic-idle
+PID 77 /bin/cosmic-idle
+PID 78 /bin/cosmic-idle
+PID 79 /bin/cosmic-idle
+PID 81 /bin/cosmic-files-applet
+PID 82 /bin/cosmic-files-applet
+PID 83 /bin/cosmic-files-applet
+PID 84 /bin/cosmic-greeter
+PID 86 /bin/cosmic-panel
+PID 88 /bin/cosmic-greeter
+PID 89 /bin/cosmic-greeter
+PID 90 /bin/cosmic-greeter
+PID 91 /bin/cosmic-panel
+PID 92 /bin/cosmic-panel
+PID 93 /bin/cosmic-panel
+PID 94 /bin/cosmic-panel
+PID 95 /bin/cosmic-panel
+PID 96 /bin/cosmic-panel
+PID 97 /bin/cosmic-panel
+PID 98 /bin/leandros-applet
+PID 99 /bin/cosmic-files-applet
+PID 100 /bin/cosmic-files-applet
+PID 101 /bin/cosmic-files-applet
+PID 102 /bin/cosmic-files-applet
+PID 103 /bin/cosmic-files-applet
+PID 104 /bin/cosmic-files-applet
+PID 105 /bin/cosmic-files-applet
+PID 106 /bin/cosmic-files-applet
+PID 107 /bin/cosmic-files-applet
+PID 109 /bin/cosmic-files-applet
+PID 110 /bin/cosmic-files-applet
+PID 111 /bin/cosmic-files-applet
+PID 112 /bin/cosmic-files-applet
+PID 113 /bin/cosmic-comp
+[DRMSTAT] t=0x00000000000128E0 flips_sub=0x000000000000033C flips_del=0x0000000000000339 dirtyfb=0x0000000000000000 clips=0x0000000000000000 flip_us=0x00000000012028CF dmg_full=0x0000000000000003 dmg_rect=0x0000000000000339 dmg_skip=0x0000000000000001 dmg_px=0x000000000EA98B80 blobs=0x000000000000033D curs_up=0x0000000000000001 curs_mv=0x0000000000000339 atomic=0x000000000000033D atest=0x0000000000000006 cplane=0x0000000000002094 evpush=0x00000000000004E6 bo_dumb=0x0000000000000004 bo_dumbret=0x0000000000000000 bo_blob=0x0000000000000000 bo_bhnd=0x0000000000000000
+PID 123 /bin/wlclient
+PID 126 /bin/wlclient
+PID 130 /bin/cosmic-settings
+PID 131 /bin/cosmic-settings
+PID 132 /bin/cosmic-settings
+PID 133 /usr/libexec/busd
+[DRMSTAT] t=0x00000000000129A8 flips_sub=0x000000000000033D flips_del=0x000000000000033B dirtyfb=0x0000000000000000 clips=0x0000000000000000 flip_us=0x000000000120B3F4 dmg_full=0x0000000000000003 dmg_rect=0x000000000000033B dmg_skip=0x0000000000000001 dmg_px=0x000000000EAB6B80 blobs=0x000000000000033F curs_up=0x0000000000000001 curs_mv=0x000000000000033B atomic=0x000000000000033F atest=0x0000000000000006 cplane=0x00000000000020A8 evpush=0x00000000000004E6 bo_dumb=0x0000000000000004 bo_dumbret=0x0000000000000000 bo_blob=0x0000000000000000 bo_bhnd=0x0000000000000000
+
+---------------- applications ----------------
+com.system76.CosmicAppletTime.desktop
+
+---------------- proc ----------------
+cpuinfo	 filesystems  net  sys	version
+
+---------------- runtime ----------------
+total 0
+srwxr-xr-x 1 root root 0 Jan  1 00:00 bus
+-rw-r--r-- 1 root root 3 Jan  1 00:00 busd-pid.10
+-rw-r--r-- 1 root root 8 Jan  1 00:00 busd-ready.10
+srwxr-xr-x 1 root root 0 Jan  1 00:00 com.system76.CosmicSettings
+drwxr-xr-x 1 root root 0 Jan  1 00:00 m12
+srwxr-xr-x 1 root root 0 Jan  1 00:00 wayland-1
+-rw-r----- 1 root root 0 Jan  1 00:00 wayland-1.lock
+
+---------------- /bin (175 names) ----------------
+anvil  aplay  arch  b2sum  base32  base64  basename  basenc  bottom  brush  btm  cat  chgrp  chmod  chown  chroot  cksum  comm  coreutils  cosmic-app-library  cosmic-bg  cosmic-comp  cosmic-files-applet  cosmic-greeter  cosmic-idle  cosmic-launcher  cosmic-notifications  cosmic-osd  cosmic-panel  cosmic-session  cosmic-settings  cosmic-settings-daemon  cosmic-workspaces  cp  csplit  cut  date  dd  df  dir  dircolors  dirname  dlopen-host  doom  doom1.wad  drmsmoke  du  echo  env  epolltest  evtest2  expand  expr  f2fstest  factor  false  fmt  fold  forktest  fstab  groups  head  hello  hello-dyn  hello-dyn-rs  hostid  hostname  id  idletest  install  join  kill  kmscube  leandros-applet  link  ln  login  logname  ls  lsblk  lspci  lsusb  m12-caps  m4-vkwl  m4-vkwl-a64  mame  md5sum  memtest  mkdir  mkfifo  mknod  mktemp  more  mount  mv  nice  nl  nohup  nproc  numfmt  od  paste  pathchk  ping  pinky  plugin.so  polltest  pr  printenv  printf  pthreadtest  ptx  pwd  racetest  readlink  realpath  rm  rmdir  scmtest  seq  sh  sha1sum  sha224sum  sha256sum  sha384sum  sha512sum  shell  shred  shuf  sigchldtest  sigtest  sleep  sort  split  start-cosmic-leandros  stat  stty  sum  sync  tac  tail  tee  test  timeout  timertest  tokio-echo-selftest  touch  tput  tr  true  truncate  tsort  tty  umount  uname  unexpand  uniq  unlink  uptime  users  vdir  venustest  vfstest  vkrender  vkswap  vktest  vkwl  waittest  wakepolltest  wc  who  whoami  wlclient  xattr  yes
