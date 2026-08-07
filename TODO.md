@@ -840,6 +840,23 @@ Design, staging and per-stage guard tests with their falsifying mutations:
 - **`/proc/self/exe` returns `/bin/init`** regardless of the caller.
 - **libseat shim eventfd workaround** (`0bed5ad`) is inert now that the kernel honours
   `EFD_NONBLOCK`, and can be simplified.
+- **The interpolated clock CLAMPS, and every clamped timestamp ends in `9999`.** Both
+  `arch/x86_64/src/timer.rs` and `arch/aarch64/src/timer.rs` end `monotonic_ns` with
+  `break base + frac.min(9_999_999);`. A saturated stamp is therefore
+  `t*10_000_000 + 9_999_999` ns, so **the entire saturated `tv_usec` alphabet is
+  `{9999, 19999, …, 999999}`** — `999999` is not a near-max coincidence, it is just the
+  once-per-second member. The clamp engages when the **timer IRQ is late**: real elapsed
+  already exceeds one tick period while `TICK_COUNT` has not yet incremented. Measured
+  **10/48 samples (20.8%) on x86_64/TCG and 0/40 on aarch64/HVF**, because IRQ latency is
+  milliseconds under TCG and microseconds under HVF.
+  **It is benign** — a clamped stamp is emitted only after real time has passed the tick
+  end, so it is *behind* truth, never ahead; `MONO_LAST_NS.fetch_max` keeps the sequence
+  non-decreasing; staleness is bounded by IRQ lateness; and `tv_sec`/`tv_usec` come from a
+  single `now_ns` read so they cannot disagree. Strictly better than the old clock, which
+  was *always* a full tick stale. The one behavioural note: two flips in the same clamped
+  tick get **identical** timestamps, so a consumer differencing them can see 0 ms.
+  Tick calibration is *not* implicated — guest monotonic time tracked host wall clock to
+  <0.3% over two 145 s intervals.
 - ~~**DRM page-flip event timestamps**~~ — **done** (`b8ff2f6`), verified by mutation.
   `queue_flip_event` now stamps from `arch_monotonic_ns()`. The layering problem is worth
   remembering: `drivers` has **no Cargo edge** to the arch crates, and the tree's existing
