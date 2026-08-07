@@ -381,6 +381,28 @@ unsafe fn print_dec(label: &[u8], v: u64) {
     write(1, b"\n".as_ptr() as *const c_void, 1);
 }
 
+// Sink for spin_delay's accumulator, written with a volatile store so a
+// release build cannot prove the busy-loop is dead and elide it.
+static mut SPIN_SINK: u64 = 0;
+
+// Pure CPU busy-work — NOT a sleep. FLIP_TS_SUBTICK uses this instead of
+// usleep() to shift the real-time offset at which each flip ioctl is issued:
+// usleep()/nanosleep() round every nonzero request UP to a whole tick (see
+// sys_nanosleep in kernel/src/syscall.rs), so a sleep between samples just
+// resyncs to the next tick boundary — it cannot break a tick-phase lock, it
+// reinforces one. A plain instruction-counted spin runs at wall-clock speed
+// instead, so varying `iters` across samples varies the wall-clock phase at
+// which the next ioctl lands within its tick.
+unsafe fn spin_delay(iters: u64) {
+    let mut acc: u64 = 0;
+    let mut n = 0u64;
+    while n < iters {
+        acc = acc.wrapping_add(n ^ 0x9E37_79B9);
+        n += 1;
+    }
+    core::ptr::write_volatile(core::ptr::addr_of_mut!(SPIN_SINK), acc);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0i32;
@@ -574,20 +596,58 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     // 10_000 — by construction. Under the NEW sub-tick code it should land on
     // arbitrary microsecond values instead.
     //
-    // STATISTICAL CAVEAT (do not invert this logic): a genuine sub-tick
-    // timestamp CAN legitimately land on an exact multiple of 10_000 by pure
-    // chance (~1 in 10_000 per sample). A single non-multiple sample proves
-    // liveness; a single multiple sample proves nothing either way. That is
-    // why this drives several flips and passes on ANY non-multiple sample
-    // rather than requiring ALL samples to be non-multiples: with 8+
-    // independent samples, an ALL-multiples result is overwhelming evidence
-    // the old tick-derived code is still what's running, not bad luck
-    // (chance of that happening under genuinely live sub-tick timestamps is
-    // roughly 1 in 10_000^8).
-    const FLIP_TS_SAMPLES: usize = 8;
+    // CLAMP ALPHABET (do not invert this logic either): arch_monotonic_ns()'s
+    // sub-tick interpolation is clamped in arch/{x86_64,aarch64}/src/timer.rs
+    // — `break base + frac.min(9_999_999);` — so a stamp taken while the
+    // fractional part has already overrun the tick (timer IRQ running late)
+    // saturates at exactly base_ns + 9_999_999, i.e. tv_usec = (t % 100) *
+    // 10_000 + 9_999. Every value in that clamped alphabet {9999, 19999,
+    // 29999, ..., 999999} ends in "9999". Measured 10/48 samples saturated on
+    // x86_64/TCG (20.8%), 0/40 on aarch64/HVF, and one run of six was 8/8
+    // saturated on identical clamped constants.
+    //
+    // A saturated sample is NOT "no signal" — it is positive evidence, and
+    // this is the one place it is easy to get backwards. The OLD code computed
+    // tv_usec = (ticks % 100) * 10_000, which is ALWAYS congruent to 0 mod
+    // 10_000, so it could never produce a value ending in 9999. Reaching the
+    // clamp at all means base + frac.min(9_999_999) executed, i.e. the
+    // interpolated path ran. Saturation says "the timer IRQ was late", not
+    // "the timestamp math regressed" — those are different claims.
+    //
+    // Every sample is classified into exactly one of three buckets:
+    //   - tick-multiple:   tv_usec % 10_000 == 0      (old coarse clock)
+    //   - saturated:       tv_usec % 10_000 == 9_999  (clamp engaged, IRQ late)
+    //   - genuine sub-tick: anything else
+    // PASS requires at least one NON-tick-multiple sample, so both genuine and
+    // saturated count. FAIL therefore means every sample was a tick-multiple —
+    // which is exactly, and only, the old clock's signature. Requiring a
+    // *genuine* sample instead would be flaky rather than strict: a measured
+    // x86_64/TCG run came in at 15 saturated / 1 genuine, one sample away from
+    // a spurious failure that would have indicated nothing about the math.
+    //
+    // PHASE-ALIGNMENT / FLAKE FIX: the 8/8-saturated run above happened
+    // because consecutive flips were spaced exactly one tick apart, so every
+    // ioctl landed at the same far edge of its tick, sample after sample.
+    // usleep()/nanosleep() cannot break that: sys_nanosleep rounds ANY
+    // nonzero request UP to a whole number of ticks (ticks_needed =
+    // total_ns.div_ceil(10_000_000) in kernel/src/syscall.rs), so a sleep
+    // between flips just resyncs us to the next tick boundary — reinforcing
+    // the phase-lock, not breaking it. Instead, spin_delay() below is a pure
+    // CPU busy-loop (no syscall) whose iteration count is stepped by a large,
+    // non-round increment every sample, so consecutive flips are issued at
+    // different real-time offsets within their tick and cannot all pin to
+    // the same edge. The sample count is also raised from 8 to 16 so more
+    // independent phases are swept.
+    const FLIP_TS_SAMPLES: usize = 16;
+    const FLIP_TS_SPIN_BASE: u64 = 5_000;
+    const FLIP_TS_SPIN_STEP: u64 = 47_777; // deliberately not a round number
     let mut subtick_all_read_ok = true;
-    let mut subtick_seen = false;
+    let mut n_tick_multiple = 0u32;
+    let mut n_saturated = 0u32;
+    let mut n_genuine = 0u32;
     for i in 0..FLIP_TS_SAMPLES {
+        spin_delay(FLIP_TS_SPIN_BASE + (i as u64) * FLIP_TS_SPIN_STEP);
+
         let mut sflip = DrmModeCrtcPageFlip::default();
         sflip.crtc_id = 1;
         sflip.fb_id = fb.fb_id;
@@ -611,11 +671,33 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
 
         print_dec(b"  FLIP_TS_SUBTICK tv_sec=", sev.tv_sec as u64);
         print_dec(b"  FLIP_TS_SUBTICK tv_usec=", sev.tv_usec as u64);
-        if sev.tv_usec % 10_000 != 0 {
-            subtick_seen = true;
+        let rem = sev.tv_usec % 10_000;
+        if rem == 0 {
+            n_tick_multiple += 1;
+            puts(b"  FLIP_TS_SUBTICK bucket=tick-multiple\n\0".as_ptr());
+        } else if rem == 9_999 {
+            n_saturated += 1;
+            puts(b"  FLIP_TS_SUBTICK bucket=saturated\n\0".as_ptr());
+        } else {
+            n_genuine += 1;
+            puts(b"  FLIP_TS_SUBTICK bucket=genuine-sub-tick\n\0".as_ptr());
         }
     }
-    let subtick_ok = subtick_all_read_ok && subtick_seen;
+    print_dec(b"  FLIP_TS_SUBTICK n_tick_multiple=", n_tick_multiple as u64);
+    print_dec(b"  FLIP_TS_SUBTICK n_saturated=", n_saturated as u64);
+    print_dec(b"  FLIP_TS_SUBTICK n_genuine=", n_genuine as u64);
+    // Both genuine and saturated samples prove the interpolated path ran; only
+    // an all-tick-multiple result is the old clock's signature.
+    let subtick_ok = subtick_all_read_ok && (n_genuine + n_saturated) > 0;
+    if !subtick_ok && subtick_all_read_ok {
+        puts(b"  FLIP_TS_SUBTICK: FAIL every sample was an exact multiple of 10_000 -- timestamp math regressed to the coarse 100 Hz clock\n\0".as_ptr());
+    }
+    // Not a failure, but worth saying out loud: an all-saturated run still
+    // passes (the clamp cannot be reached from the coarse clock), yet it means
+    // the timer IRQ was late on every sample, which is worth knowing on its own.
+    if subtick_all_read_ok && n_genuine == 0 && n_saturated > 0 {
+        puts(b"  FLIP_TS_SUBTICK: note - every sample hit the clamp; interpolation is live but the timer IRQ ran late throughout\n\0".as_ptr());
+    }
     if !report(b"FLIP_TS_SUBTICK", subtick_ok) { failures += 1; }
 
     // ── PRIME / dmabuf export + import round-trip (K5) ──────────────────────
