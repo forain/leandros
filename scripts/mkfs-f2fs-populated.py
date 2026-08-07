@@ -767,6 +767,16 @@ def main():
     if os.path.exists(m9_wlglobals):
         bin_files.append(("wl-globals", m9_wlglobals, 0o100755))
 
+    # liprobe: runs libinput directly, with its log priority raised to DEBUG, so
+    # the input path can be observed without patching COSMIC. It is what showed
+    # libinput itself produces events (motion_abs, key, dispatch_err=0) while the
+    # compositor acts on none of them, narrowing the break to smithay's drain or
+    # cosmic-comp's routing. Source is in-repo at artifacts/m13-liprobe/.
+    m13_liprobe = os.path.expanduser(
+        f"~/code/leandros-artifacts/m13-liprobe/out/liprobe-{arch}")
+    if os.path.exists(m13_liprobe):
+        bin_files.append(("liprobe", m13_liprobe, 0o100755))
+
     # The session launcher itself (a POSIX-sh script). The kernel execve()s ELF
     # only (no "#!"-shebang binfmt), so it is run as `sh /bin/start-cosmic-leandros`.
     m6_launcher = os.path.expanduser(
