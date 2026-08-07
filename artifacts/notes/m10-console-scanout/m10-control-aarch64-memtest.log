@@ -1,0 +1,7 @@
+brush-0.5# memtestbrush-0.5# memtest
+fork_cow_isolation: PASS
+mremap_preserves_data: PASS
+buddy_survives_churn: PASS
+map_shared_fork_visibility: PASS
+--- memtest done ---
+brush-0.5# 

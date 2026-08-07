@@ -1,0 +1,24 @@
+brush-0.5# epolltest
+ld_so::init tp=0x0000000000000000
+PH type=0x0000000000000006
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000007
+et_fires_once: PASS
+level_refires: PASS
+et_refires_after_edge: PASS
+timeout_accuracy: PASS
+oneshot: PASS
+signalfd_signo: PASS
+inotify_never_fires: PASS
+proc_self_exe: got /bin/epolltest
+proc_self_exe: PASS
+proc_pid_exe: path= /proc/30/exe got /bin/epolltest
+proc_pid_exe: PASS
+nested_epoll: idle_n=0 idle_ms=195 armed_n=1 drained_n=0
+nested_epoll: PASS
+SUMMARY pass=10 fail=0
+--- epolltest done ---
+
+brush-0.5# 

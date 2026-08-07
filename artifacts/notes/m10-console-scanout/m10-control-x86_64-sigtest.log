@@ -1,0 +1,16 @@
+brush-0.5# sigtest
+ld_so::init tp=0x0000000000000000
+PH type=0x0000000000000006
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000007
+sigaction_struct_roundtrip: PASS
+signal_delivery_and_return: PASS
+two_signals_distinct_handlers: PASS
+sigprocmask_blocks_and_defers: PASS
+sig_ign_default_disposition: PASS
+raise_delivers_signal: PASS
+--- sigtest done ---
+
+brush-0.5# 
