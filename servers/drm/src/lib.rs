@@ -5,12 +5,21 @@
 
 #![no_std]
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::{Message, port};
 use drivers::drm_device_interface::DrmDeviceInterface;
 use drivers::Driver;
 use vfs_server;
 
 extern "C" { fn arch_serial_putc(c: u8); }
+
+// First-N-per-cache-type one-shot counters for the `[DRM-SRV] mmap` trace
+// below (indices 0..3 match VIRTIO_GPU_MAP_CACHE_*). Bounds the evidence the
+// trace exists to collect to a handful of lines per session instead of one
+// per resolved mmap token.
+static MMAP_TRACE_SEEN: [AtomicU32; 4] =
+    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+const MMAP_TRACE_LIMIT: u32 = 2;
 
 fn serial_debug(msg: &str) {
     if !drivers::pci::RENDER_DEBUG { return; }
@@ -199,23 +208,29 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     if uncached {
                         m.data[8..16].copy_from_slice(&MMAP_HINT_UNCACHED.to_le_bytes());
                     }
-                    // The scoping is the point, so it is traced either way: one
-                    // line per resolved mmap token saying which cache type the
-                    // host asked for and which mapping it therefore gets. A
-                    // Venus session must show `map_info=0x01 -> writeback` for
-                    // the command ring and `map_info=0x03 -> uncached` for
-                    // Mesa's fence-feedback buffer.
-                    // Unconditional: `serial_debug` here is gated on
-                    // RENDER_DEBUG, and this line is the only evidence that the
-                    // scoping is by cache type rather than blanket.
-                    drivers::pci::serial_debug("[DRM-SRV] mmap token=");
-                    drivers::pci::serial_debug_hex_64(result as u64);
-                    drivers::pci::serial_debug(" map_info=0x0");
-                    drivers::pci::serial_debug(match cache {
-                        0 => "0", 1 => "1", 2 => "2", 3 => "3", _ => "?",
-                    });
-                    drivers::pci::serial_debug(
-                        if uncached { " -> uncached\n" } else { " -> writeback\n" });
+                    // The scoping is the point, so it is traced — but only the
+                    // first couple of tokens per cache type, one-shot, via
+                    // static atomics below. A Venus session must show
+                    // `map_info=0x01 -> writeback` for the command ring and
+                    // `map_info=0x03 -> uncached` for Mesa's fence-feedback
+                    // buffer at least once; that's the whole evidence property,
+                    // so printing it forever (146 lines in a ~7 min COSMIC
+                    // session, unconditionally, on a console that shreds other
+                    // output when it interleaves) buys nothing. Gated here
+                    // rather than behind RENDER_DEBUG so the evidence still
+                    // shows up in a plain run without flipping a flag.
+                    let cache_idx = cache.min(3) as usize;
+                    let seen = MMAP_TRACE_SEEN[cache_idx].fetch_add(1, Ordering::Relaxed);
+                    if seen < MMAP_TRACE_LIMIT {
+                        drivers::pci::serial_debug("[DRM-SRV] mmap token=");
+                        drivers::pci::serial_debug_hex_64(result as u64);
+                        drivers::pci::serial_debug(" map_info=0x0");
+                        drivers::pci::serial_debug(match cache {
+                            0 => "0", 1 => "1", 2 => "2", 3 => "3", _ => "?",
+                        });
+                        drivers::pci::serial_debug(
+                            if uncached { " -> uncached\n" } else { " -> writeback\n" });
+                    }
                 }
                 m
             }
