@@ -16,19 +16,24 @@ bitflags! {
         const TABLE     = 1 << 1;
         /// Memory attributes index (MAIR_EL1).
         const ATTR_NORM    = 0 << 2; // index 0 (normal WB/WA)
-        const ATTR_DEV     = 1 << 2; // index 1 (device; whatever the loader left)
+        const ATTR_DEV     = 1 << 2; // index 1 (measured: MAIR_EL1 attribute 1 is 0x00 = Device-nGnRnE, not Device-nGnRE — see the ATTR_NOCACHE doc below)
         /// Index 2 — Normal memory, Inner and Outer Non-cacheable (attribute
         /// 0x44). The one MAIR attribute this kernel programs for itself, in
         /// `mmu::enable_identity`; claiming index 2 is safe precisely because
         /// the slot it replaces (the old `ATTR_STRICT`) had no users at all.
         const ATTR_NORMAL_NC = 2 << 2;
         /// Index 3. Named for what it was believed to be, kept for what it
-        /// actually is: neither boot path defines MAIR attribute 3, and an
-        /// undefined attribute byte is 0x00 = Device-nGnRnE, not Normal-NC.
-        /// Limine 11.4.1's BOOTAA64.EFI writes MAIR_EL1 = 0xFF | (dev << 8), and
-        /// our own direct-boot path (kernel/src/entry_aarch64.s) writes 0x04FF;
-        /// attributes 2..7 are zero in both. The framebuffer has therefore
-        /// always been Device memory — it works, and it is left alone. Use
+        /// actually is: `arch/aarch64/src/lib.rs:84`'s runtime `MAIR_EL1`
+        /// read shows Limine hands the kernel a flat `0x00000000000000ff` —
+        /// attribute 0 is 0xFF (Normal WB/WA) and attributes 1..7 are all
+        /// zero. An undefined attribute byte of 0x00 is Device-nGnRnE, so
+        /// both ATTR_NOCACHE (index 3) and ATTR_DEV (index 1, above) select
+        /// Device-nGnRnE, not Normal-NC and not Device-nGnRE respectively.
+        /// The framebuffer has therefore always been Device memory — it
+        /// works, and it is left alone. `mmu::enable_identity` installs the
+        /// only attribute this kernel actually defines, index 2 = 0x44
+        /// (Normal Inner/Outer Non-cacheable), via a read-modify-write over
+        /// this same flat MAIR_EL1 before `arch::init` maps anything. Use
         /// ATTR_NORMAL_NC for anything that needs non-cached *Normal* memory.
         const ATTR_NOCACHE = 3 << 2;
         /// Non-secure access.
