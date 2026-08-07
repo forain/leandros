@@ -9,6 +9,16 @@
 //! Prints "<name>: PASS"/"<name>: FAIL" per step; returns the failure count as
 //! the exit code. On success the screen shows a full-screen gradient (the
 //! screenshot accept criterion).
+//!
+//! `--hold` mode skips the PAGE_FLIP/PRIME/fork-with-a-device-mapping checks
+//! and, once SETCRTC lands, paints a deterministic, screendump-checkable
+//! image and holds it forever (never DESTROY_DUMB, never closes the fd,
+//! never exits): the whole framebuffer is filled with the flat field colour
+//! **0x181818**, then a **256x256 solid 0xFF0000 (pure red)** block is
+//! painted with its top-left corner at pixel **(64, 64)**. Once that content
+//! is flushed to the host it prints the sentinel line `DRMSMOKE: HOLD READY`
+//! to stdout and sleeps in >=1s chunks forever, so a QEMU `screendump` can be
+//! pixel-checked against those exact colours/coordinates.
 
 #![no_std]
 #![no_main]
@@ -280,6 +290,61 @@ const ST_RDEV_OFF: usize = 40;
 #[cfg(target_arch = "aarch64")]
 const ST_RDEV_OFF: usize = 32;
 
+// Matches argv[i] (a NUL-terminated C string) against a Rust byte-string
+// literal (no embedded NUL needed in `s`).
+fn arg_is(p: *const u8, s: &[u8]) -> bool {
+    if p.is_null() { return false; }
+    unsafe {
+        let mut i = 0usize;
+        loop {
+            let c = *p.add(i);
+            let want = if i < s.len() { s[i] } else { 0 };
+            if c != want { return false; }
+            if c == 0 { return true; }
+            i += 1;
+        }
+    }
+}
+
+// Fills the whole [0,w)x[0,h) framebuffer with the flat field colour
+// 0x181818, then overpaints a 256x256 pure-red (0xFF0000) block whose
+// top-left corner sits at (64, 64) — clamped so it never runs past the
+// buffer on a smaller-than-expected mode. XRGB8888 byte order matches the
+// gradient fill above: byte0=B, byte1=G, byte2=R, byte3=pad.
+unsafe fn paint_field_and_block(base: *mut u8, pitch: usize, w: usize, h: usize) {
+    let mut y = 0usize;
+    while y < h {
+        let mut x = 0usize;
+        while x < w {
+            let off = y * pitch + x * 4;
+            *base.add(off) = 0x18;     // B
+            *base.add(off + 1) = 0x18; // G
+            *base.add(off + 2) = 0x18; // R
+            *base.add(off + 3) = 0;    // X
+            x += 1;
+        }
+        y += 1;
+    }
+
+    let bx0 = 64usize;
+    let by0 = 64usize;
+    let bw = 256usize.min(w.saturating_sub(bx0));
+    let bh = 256usize.min(h.saturating_sub(by0));
+    let mut y = 0usize;
+    while y < bh {
+        let mut x = 0usize;
+        while x < bw {
+            let off = (by0 + y) * pitch + (bx0 + x) * 4;
+            *base.add(off) = 0x00;     // B
+            *base.add(off + 1) = 0x00; // G
+            *base.add(off + 2) = 0xFF; // R
+            *base.add(off + 3) = 0;    // X
+            x += 1;
+        }
+        y += 1;
+    }
+}
+
 fn report(name: &[u8], ok: bool) -> bool {
     unsafe {
         write(1, name.as_ptr() as *const c_void, name.len());
@@ -293,8 +358,10 @@ fn report(name: &[u8], ok: bool) -> bool {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn drm_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0i32;
+
+    let hold_mode = argc > 1 && arg_is(*argv.add(1) as *const u8, b"--hold");
 
     let fd = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
     if fd < 0 {
@@ -375,12 +442,14 @@ pub unsafe extern "C" fn drm_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut
 
     // mmap + fill gradient
     let mut mmap_ok = false;
+    let mut fb_ptr: *mut u8 = core::ptr::null_mut();
     if map_ok && cd.size > 0 {
         let p = mmap(core::ptr::null_mut(), cd.size as usize, PROT_READ | PROT_WRITE,
                      MAP_SHARED, fd, md.offset as i64);
         if p as isize > 0 {
             let pitch = cd.pitch as usize;
             let base = p as *mut u8;
+            fb_ptr = base;
             let mut y = 0usize;
             while y < h as usize {
                 let mut x = 0usize;
@@ -423,6 +492,20 @@ pub unsafe extern "C" fn drm_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut
     set.mode_valid = 1;
     let setcrtc_ok = ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &mut set as *mut _) == 0;
     if !report(b"SETCRTC", setcrtc_ok) { failures += 1; }
+
+    if hold_mode {
+        if setcrtc_ok && !fb_ptr.is_null() {
+            paint_field_and_block(fb_ptr, cd.pitch as usize, w as usize, h as usize);
+        }
+        let mut hold_dirty = DrmModeFbDirtyCmd::default();
+        hold_dirty.fb_id = fb.fb_id;
+        ioctl(fd, DRM_IOCTL_MODE_DIRTYFB, &mut hold_dirty as *mut _);
+        puts(b"DRMSMOKE: HOLD READY\n\0".as_ptr());
+        loop {
+            usleep(1_000_000);
+            ioctl(fd, DRM_IOCTL_MODE_DIRTYFB, &mut hold_dirty as *mut _);
+        }
+    }
 
     // DIRTYFB — flush CPU render to host
     let mut dirty = DrmModeFbDirtyCmd::default();
