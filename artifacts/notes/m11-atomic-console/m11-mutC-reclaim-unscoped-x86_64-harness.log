@@ -1,0 +1,75 @@
+==== m11 atomic console-yield x86_64 tag=mutC-reclaim-unscoped mode=quick Fri Aug  7 14:59:04 2026 ====
+  [src md5] 6762a83101c41df88c2a7ff65c35a07d  drivers/src/drm_device_interface.rs
+  [src md5] 8354042fed062c61f7f005987d695cca  drivers/src/framebuffer.rs
+  [src md5] 71e9e7696595649218eae632c0707dda  userland/drmsmoke/src/main.rs
+#### BOOT 1 ####
+  [POSITIVE CONTROL] harness reports failure = True
+  [boot] 1920x1080 md5=7ded514f180501a4745450abb469dd3c distinct_colours=3 total=2073600
+      #000000 = 2028809
+      #ffffff = 44648
+      #cd0000 = 143
+      0xff0000=0  0x181818=0
+      | ATOMIC_TEST_ONLY_NO_PRESENT: PASS
+      | ATOMIC_COMMIT: PASS
+      | ATOMIC fnv_test_only=12873414503588650501
+      | ATOMIC fnv_after_commit=1505488377492965669
+      | ATOMIC_PRESENTS_PIXELS: PASS
+      | CONSOLE_YIELDS_TO_ATOMIC bytes_before=8294400
+      | CONSOLE_YIELDS_TO_ATOMIC bytes_after=8294400
+      | CONSOLE_YIELDS_TO_ATOMIC fnv_before=1505488377492965669
+      | CONSOLE_YIELDS_TO_ATOMIC fnv_after=16756505720239424604
+      | CONSOLE_YIELDS_TO_ATOMIC: FAIL the scanout changed after an ATOMIC-only present -- the console was never claimed from the atomic path, or an unrelated card0 close handed it back
+      | CONSOLE_YIELDS_TO_ATOMIC: FAIL
+      | SETCRTC: PASS
+      | FB0_SHOWS_SCANOUT: PASS
+      | CONSOLE_YIELDS bytes_before=8294400
+      | CONSOLE_YIELDS bytes_after=8294400
+      | CONSOLE_YIELDS fnv_before=617618239335486853
+      | CONSOLE_YIELDS fnv_after=16756505720239424604
+      | CONSOLE_YIELDS_TO_SCANOUT: FAIL the scanout changed while a DRM master held it -- the fb console painted or scrolled over it
+      | CONSOLE_YIELDS_TO_SCANOUT: FAIL
+      | --- drmsmoke done ---
+  [drmsmoke] PASS=27 FAIL=4
+  [guards]   ATOMIC_TEST_ONLY_NO_PRESENT=PASS  ATOMIC_COMMIT=PASS  ATOMIC_PRESENTS_PIXELS=PASS  CONSOLE_YIELDS_TO_ATOMIC=FAIL  FB0_SHOWS_SCANOUT=PASS  CONSOLE_YIELDS_TO_SCANOUT=FAIL
+  [after-drmsmoke] 1920x1080 md5=ff004561506ac85ed6a733bacb04bd26 distinct_colours=2 total=2073600
+      #000000 = 2072339
+      #ffffff = 1261
+      0xff0000=0  0x181818=0
+      | ATOMIC_TEST_ONLY_NO_PRESENT: PASS
+      | ATOMIC_COMMIT: PASS
+      | ATOMIC fnv_test_only=10780424934145413580
+      | ATOMIC fnv_after_commit=1505488377492965669
+      | ATOMIC_PRESENTS_PIXELS: PASS
+      | CONSOLE_YIELDS_TO_ATOMIC bytes_before=8294400
+      | CONSOLE_YIELDS_TO_ATOMIC bytes_after=8294400
+      | CONSOLE_YIELDS_TO_ATOMIC fnv_before=1505488377492965669
+      | CONSOLE_YIELDS_TO_ATOMIC fnv_after=16756505720239424604
+      | CONSOLE_YIELDS_TO_ATOMIC: FAIL the scanout changed after an ATOMIC-only present -- the console was never claimed from the atomic path, or an unrelated card0 close handed it back
+      | CONSOLE_YIELDS_TO_ATOMIC: FAIL
+      | FB0_SHOWS_SCANOUT: PASS
+      | CONSOLE_YIELDS bytes_before=8294400
+      | CONSOLE_YIELDS bytes_after=8294400
+      | CONSOLE_YIELDS fnv_before=617618239335486853
+      | CONSOLE_YIELDS fnv_after=16756505720239424604
+      | CONSOLE_YIELDS_TO_SCANOUT: FAIL the scanout changed while a DRM master held it -- the fb console painted or scrolled over it
+      | CONSOLE_YIELDS_TO_SCANOUT: FAIL
+      | DRMSMOKE: HOLD READY
+  [hold guards] ATOMIC_TEST_ONLY_NO_PRESENT=PASS  ATOMIC_COMMIT=PASS  ATOMIC_PRESENTS_PIXELS=PASS  CONSOLE_YIELDS_TO_ATOMIC=FAIL  FB0_SHOWS_SCANOUT=PASS  CONSOLE_YIELDS_TO_SCANOUT=FAIL
+  [hold] 1920x1080 md5=ee06ccaab693b6631112fd2716c623f3 distinct_colours=2 total=2073600
+      #181818 = 2008064
+      #ff0000 = 65536
+      0xff0000=65536  0x181818=2008064
+==== SUMMARY ====
+  tag=mutC-reclaim-unscoped arch=x86_64
+  src md5 6762a83101c41df88c2a7ff65c35a07d  drivers/src/drm_device_interface.rs
+  src md5 8354042fed062c61f7f005987d695cca  drivers/src/framebuffer.rs
+  src md5 71e9e7696595649218eae632c0707dda  userland/drmsmoke/src/main.rs
+  positive control reported failing: True
+  guard ATOMIC_TEST_ONLY_NO_PRESENT    = PASS
+  guard ATOMIC_COMMIT                  = PASS
+  guard ATOMIC_PRESENTS_PIXELS         = PASS
+  guard CONSOLE_YIELDS_TO_ATOMIC       = FAIL
+  guard FB0_SHOWS_SCANOUT              = PASS
+  guard CONSOLE_YIELDS_TO_SCANOUT      = FAIL
+  hold screendump md5 = ee06ccaab693b6631112fd2716c623f3
+==== m11 DONE ====

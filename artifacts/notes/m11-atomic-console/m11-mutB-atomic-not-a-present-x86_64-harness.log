@@ -1,0 +1,73 @@
+==== m11 atomic console-yield x86_64 tag=mutB-atomic-not-a-present mode=quick Fri Aug  7 14:55:57 2026 ====
+  [src md5] ec4776b0fa733a9aea7ce691f75c0c1b  drivers/src/drm_device_interface.rs
+  [src md5] 697831b53773780bcd9c21937612ef0c  drivers/src/framebuffer.rs
+  [src md5] 71e9e7696595649218eae632c0707dda  userland/drmsmoke/src/main.rs
+#### BOOT 1 ####
+  [POSITIVE CONTROL] harness reports failure = True
+  [boot] 1920x1080 md5=c1f298df4c4446440eaa3864bbd0bbc2 distinct_colours=3 total=2073600
+      #000000 = 2029282
+      #ffffff = 44175
+      #cd0000 = 143
+      0xff0000=0  0x181818=0
+      | ATOMIC_TEST_ONLY_NO_PRESENT: PASS
+      | ATOMIC_COMMIT: PASS
+      | ATOMIC fnv_test_only=12873414503588650501
+      | ATOMIC fnv_after_commit=2671094825822367380
+      | ATOMIC_PRESENTS_PIXELS: PASS
+      | CONSOLE_YIELDS_TO_ATOMIC bytes_before=8294400
+      | CONSOLE_YIELDS_TO_ATOMIC bytes_after=8294400
+      | CONSOLE_YIELDS_TO_ATOMIC fnv_before=2671094825822367380
+      | CONSOLE_YIELDS_TO_ATOMIC fnv_after=16756505720239424604
+      | CONSOLE_YIELDS_TO_ATOMIC: FAIL the scanout changed after an ATOMIC-only present -- the console was never claimed from the atomic path, or an unrelated card0 close handed it back
+      | CONSOLE_YIELDS_TO_ATOMIC: FAIL
+      | SETCRTC: PASS
+      | FB0_SHOWS_SCANOUT: PASS
+      | CONSOLE_YIELDS bytes_before=8294400
+      | CONSOLE_YIELDS bytes_after=8294400
+      | CONSOLE_YIELDS fnv_before=617618239335486853
+      | CONSOLE_YIELDS fnv_after=617618239335486853
+      | CONSOLE_YIELDS_TO_SCANOUT: PASS
+      | --- drmsmoke done ---
+  [drmsmoke] PASS=28 FAIL=2
+  [guards]   ATOMIC_TEST_ONLY_NO_PRESENT=PASS  ATOMIC_COMMIT=PASS  ATOMIC_PRESENTS_PIXELS=PASS  CONSOLE_YIELDS_TO_ATOMIC=FAIL  FB0_SHOWS_SCANOUT=PASS  CONSOLE_YIELDS_TO_SCANOUT=PASS
+  [after-drmsmoke] 1920x1080 md5=ff004561506ac85ed6a733bacb04bd26 distinct_colours=2 total=2073600
+      #000000 = 2072339
+      #ffffff = 1261
+      0xff0000=0  0x181818=0
+      | ATOMIC_TEST_ONLY_NO_PRESENT: PASS
+      | ATOMIC_COMMIT: PASS
+      | ATOMIC fnv_test_only=10780424934145413580
+      | ATOMIC fnv_after_commit=10814161335567022740
+      | ATOMIC_PRESENTS_PIXELS: PASS
+      | CONSOLE_YIELDS_TO_ATOMIC bytes_before=8294400
+      | CONSOLE_YIELDS_TO_ATOMIC bytes_after=8294400
+      | CONSOLE_YIELDS_TO_ATOMIC fnv_before=10814161335567022740
+      | CONSOLE_YIELDS_TO_ATOMIC fnv_after=16756505720239424604
+      | CONSOLE_YIELDS_TO_ATOMIC: FAIL the scanout changed after an ATOMIC-only present -- the console was never claimed from the atomic path, or an unrelated card0 close handed it back
+      | CONSOLE_YIELDS_TO_ATOMIC: FAIL
+      | FB0_SHOWS_SCANOUT: PASS
+      | CONSOLE_YIELDS bytes_before=8294400
+      | CONSOLE_YIELDS bytes_after=8294400
+      | CONSOLE_YIELDS fnv_before=617618239335486853
+      | CONSOLE_YIELDS fnv_after=617618239335486853
+      | CONSOLE_YIELDS_TO_SCANOUT: PASS
+      | DRMSMOKE: HOLD READY
+  [hold guards] ATOMIC_TEST_ONLY_NO_PRESENT=PASS  ATOMIC_COMMIT=PASS  ATOMIC_PRESENTS_PIXELS=PASS  CONSOLE_YIELDS_TO_ATOMIC=FAIL  FB0_SHOWS_SCANOUT=PASS  CONSOLE_YIELDS_TO_SCANOUT=PASS
+  [hold] 1920x1080 md5=ee06ccaab693b6631112fd2716c623f3 distinct_colours=2 total=2073600
+      #181818 = 2008064
+      #ff0000 = 65536
+      0xff0000=65536  0x181818=2008064
+==== SUMMARY ====
+  tag=mutB-atomic-not-a-present arch=x86_64
+  src md5 ec4776b0fa733a9aea7ce691f75c0c1b  drivers/src/drm_device_interface.rs
+  src md5 697831b53773780bcd9c21937612ef0c  drivers/src/framebuffer.rs
+  src md5 71e9e7696595649218eae632c0707dda  userland/drmsmoke/src/main.rs
+  positive control reported failing: True
+  guard ATOMIC_TEST_ONLY_NO_PRESENT    = PASS
+  guard ATOMIC_COMMIT                  = PASS
+  guard ATOMIC_PRESENTS_PIXELS         = PASS
+  guard CONSOLE_YIELDS_TO_ATOMIC       = FAIL
+  guard FB0_SHOWS_SCANOUT              = PASS
+  guard CONSOLE_YIELDS_TO_SCANOUT      = PASS
+  hold screendump md5 = ee06ccaab693b6631112fd2716c623f3
+==== m11 DONE ====

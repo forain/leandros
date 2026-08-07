@@ -1,0 +1,449 @@
+brush-0.5# drmsmokebrush-0.5# drmsmoke
+ld_so::init tp=0x0000000000000000
+PH type=0x0000000000000006
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000007
+open_card0: PASS
+st_rdev_226_0: PASS
+[GPU] device features hi=0x00000101 lo=0x30000002
+[GPU] *** host does NOT offer VIRTIO_GPU_F_VIRGL -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_RESOURCE_BLOB -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_CONTEXT_INIT -- 3D/Venus unavailable ***
+[GPU] acked features hi=0x00000001 lo=0x00000002
+VERSION: PASS
+GET_CAP_DUMB_BUFFER: PASS
+GET_CAP_TIMESTAMP_MONOTONIC: PASS
+GETRESOURCES: PASS
+GETCONNECTOR: PASS
+CREATE_DUMB: PASS
+MAP_DUMB: PASS
+[DRM-SRV] mmap token=0x0000000077000000 map_info=0x01 -> writeback
+MMAP_FILL: PASS
+ADDFB2: PASS
+[DRM-SRV] mmap token=0x0000000001800000 map_info=0x01 -> writeback
+ATOMIC_TEST_ONLY_NO_PRESENT: PASS
+ATOMIC_COMMIT: PASS
+  ATOMIC fnv_test_only=12873414503588650501
+  ATOMIC fnv_after_commit=1505488377492965669
+ATOMIC_PRESENTS_PIXELS: PASS
+  drmsmoke console noise 0
+  drmsmoke console noise 1
+  drmsmoke console noise 2
+  drmsmoke console noise 3
+  drmsmoke console noise 4
+  drmsmoke console noise 5
+  drmsmoke console noise 6
+  drmsmoke console noise 7
+  drmsmoke console noise 8
+  drmsmoke console noise 9
+  drmsmoke console noise 10
+  drmsmoke console noise 11
+  drmsmoke console noise 12
+  drmsmoke console noise 13
+  drmsmoke console noise 14
+  drmsmoke console noise 15
+  drmsmoke console noise 16
+  drmsmoke console noise 17
+  drmsmoke console noise 18
+  drmsmoke console noise 19
+  drmsmoke console noise 20
+  drmsmoke console noise 21
+  drmsmoke console noise 22
+  drmsmoke console noise 23
+  drmsmoke console noise 24
+  drmsmoke console noise 25
+  drmsmoke console noise 26
+  drmsmoke console noise 27
+  drmsmoke console noise 28
+  drmsmoke console noise 29
+  drmsmoke console noise 30
+  drmsmoke console noise 31
+  drmsmoke console noise 32
+  drmsmoke console noise 33
+  drmsmoke console noise 34
+  drmsmoke console noise 35
+  drmsmoke console noise 36
+  drmsmoke console noise 37
+  drmsmoke console noise 38
+  drmsmoke console noise 39
+  drmsmoke console noise 40
+  drmsmoke console noise 41
+  drmsmoke console noise 42
+  drmsmoke console noise 43
+  drmsmoke console noise 44
+  drmsmoke console noise 45
+  drmsmoke console noise 46
+  drmsmoke console noise 47
+  drmsmoke console noise 48
+  drmsmoke console noise 49
+  drmsmoke console noise 50
+  drmsmoke console noise 51
+  drmsmoke console noise 52
+  drmsmoke console noise 53
+  drmsmoke console noise 54
+  drmsmoke console noise 55
+  drmsmoke console noise 56
+  drmsmoke console noise 57
+  drmsmoke console noise 58
+  drmsmoke console noise 59
+  drmsmoke console noise 60
+  drmsmoke console noise 61
+  drmsmoke console noise 62
+  drmsmoke console noise 63
+  drmsmoke console noise 64
+  drmsmoke console noise 65
+  drmsmoke console noise 66
+  drmsmoke console noise 67
+  drmsmoke console noise 68
+  drmsmoke console noise 69
+  drmsmoke console noise 70
+  drmsmoke console noise 71
+  drmsmoke console noise 72
+  drmsmoke console noise 73
+  drmsmoke console noise 74
+  drmsmoke console noise 75
+  drmsmoke console noise 76
+  drmsmoke console noise 77
+  drmsmoke console noise 78
+  drmsmoke console noise 79
+  drmsmoke console noise 80
+  drmsmoke console noise 81
+  drmsmoke console noise 82
+  drmsmoke console noise 83
+  drmsmoke console noise 84
+  drmsmoke console noise 85
+  drmsmoke console noise 86
+  drmsmoke console noise 87
+  drmsmoke console noise 88
+  drmsmoke console noise 89
+  drmsmoke console noise 90
+  drmsmoke console noise 91
+  drmsmoke console noise 92
+  drmsmoke console noise 93
+  drmsmoke console noise 94
+  drmsmoke console noise 95
+  drmsmoke console noise 96
+  drmsmoke console noise 97
+  drmsmoke console noise 98
+  drmsmoke console noise 99
+  drmsmoke console noise 100
+  drmsmoke console noise 101
+  drmsmoke console noise 102
+  drmsmoke console noise 103
+  drmsmoke console noise 104
+  drmsmoke console noise 105
+  drmsmoke console noise 106
+  drmsmoke console noise 107
+  drmsmoke console noise 108
+  drmsmoke console noise 109
+  drmsmoke console noise 110
+  drmsmoke console noise 111
+  drmsmoke console noise 112
+  drmsmoke console noise 113
+  drmsmoke console noise 114
+  drmsmoke console noise 115
+  drmsmoke console noise 116
+  drmsmoke console noise 117
+  drmsmoke console noise 118
+  drmsmoke console noise 119
+  drmsmoke console noise 120
+  drmsmoke console noise 121
+  drmsmoke console noise 122
+  drmsmoke console noise 123
+  drmsmoke console noise 124
+  drmsmoke console noise 125
+  drmsmoke console noise 126
+  drmsmoke console noise 127
+  drmsmoke console noise 128
+  drmsmoke console noise 129
+  drmsmoke console noise 130
+  drmsmoke console noise 131
+  drmsmoke console noise 132
+  drmsmoke console noise 133
+  drmsmoke console noise 134
+  drmsmoke console noise 135
+  drmsmoke console noise 136
+  drmsmoke console noise 137
+  drmsmoke console noise 138
+  drmsmoke console noise 139
+  drmsmoke console noise 140
+  drmsmoke console noise 141
+  drmsmoke console noise 142
+  drmsmoke console noise 143
+  drmsmoke console noise 144
+  drmsmoke console noise 145
+  drmsmoke console noise 146
+  drmsmoke console noise 147
+  drmsmoke console noise 148
+  drmsmoke console noise 149
+  drmsmoke console noise 150
+  drmsmoke console noise 151
+  drmsmoke console noise 152
+  drmsmoke console noise 153
+  drmsmoke console noise 154
+  drmsmoke console noise 155
+  drmsmoke console noise 156
+  drmsmoke console noise 157
+  drmsmoke console noise 158
+  drmsmoke console noise 159
+  CONSOLE_YIELDS_TO_ATOMIC bytes_before=8294400
+  CONSOLE_YIELDS_TO_ATOMIC bytes_after=8294400
+  CONSOLE_YIELDS_TO_ATOMIC fnv_before=1505488377492965669
+  CONSOLE_YIELDS_TO_ATOMIC fnv_after=16756505720239424604
+  CONSOLE_YIELDS_TO_ATOMIC: FAIL the scanout changed after an ATOMIC-only present -- the console was never claimed from the atomic path, or an unrelated card0 close handed it back
+
+CONSOLE_YIELDS_TO_ATOMIC: FAIL
+SETCRTC: PASS
+FB0_SHOWS_SCANOUT: PASS
+  drmsmoke console noise 0
+  drmsmoke console noise 1
+  drmsmoke console noise 2
+  drmsmoke console noise 3
+  drmsmoke console noise 4
+  drmsmoke console noise 5
+  drmsmoke console noise 6
+  drmsmoke console noise 7
+  drmsmoke console noise 8
+  drmsmoke console noise 9
+  drmsmoke console noise 10
+  drmsmoke console noise 11
+  drmsmoke console noise 12
+  drmsmoke console noise 13
+  drmsmoke console noise 14
+  drmsmoke console noise 15
+  drmsmoke console noise 16
+  drmsmoke console noise 17
+  drmsmoke console noise 18
+  drmsmoke console noise 19
+  drmsmoke console noise 20
+  drmsmoke console noise 21
+  drmsmoke console noise 22
+  drmsmoke console noise 23
+  drmsmoke console noise 24
+  drmsmoke console noise 25
+  drmsmoke console noise 26
+  drmsmoke console noise 27
+  drmsmoke console noise 28
+  drmsmoke console noise 29
+  drmsmoke console noise 30
+  drmsmoke console noise 31
+  drmsmoke console noise 32
+  drmsmoke console noise 33
+  drmsmoke console noise 34
+  drmsmoke console noise 35
+  drmsmoke console noise 36
+  drmsmoke console noise 37
+  drmsmoke console noise 38
+  drmsmoke console noise 39
+  drmsmoke console noise 40
+  drmsmoke console noise 41
+  drmsmoke console noise 42
+  drmsmoke console noise 43
+  drmsmoke console noise 44
+  drmsmoke console noise 45
+  drmsmoke console noise 46
+  drmsmoke console noise 47
+  drmsmoke console noise 48
+  drmsmoke console noise 49
+  drmsmoke console noise 50
+  drmsmoke console noise 51
+  drmsmoke console noise 52
+  drmsmoke console noise 53
+  drmsmoke console noise 54
+  drmsmoke console noise 55
+  drmsmoke console noise 56
+  drmsmoke console noise 57
+  drmsmoke console noise 58
+  drmsmoke console noise 59
+  drmsmoke console noise 60
+  drmsmoke console noise 61
+  drmsmoke console noise 62
+  drmsmoke console noise 63
+  drmsmoke console noise 64
+  drmsmoke console noise 65
+  drmsmoke console noise 66
+  drmsmoke console noise 67
+  drmsmoke console noise 68
+  drmsmoke console noise 69
+  drmsmoke console noise 70
+  drmsmoke console noise 71
+  drmsmoke console noise 72
+  drmsmoke console noise 73
+  drmsmoke console noise 74
+  drmsmoke console noise 75
+  drmsmoke console noise 76
+  drmsmoke console noise 77
+  drmsmoke console noise 78
+  drmsmoke console noise 79
+  drmsmoke console noise 80
+  drmsmoke console noise 81
+  drmsmoke console noise 82
+  drmsmoke console noise 83
+  drmsmoke console noise 84
+  drmsmoke console noise 85
+  drmsmoke console noise 86
+  drmsmoke console noise 87
+  drmsmoke console noise 88
+  drmsmoke console noise 89
+  drmsmoke console noise 90
+  drmsmoke console noise 91
+  drmsmoke console noise 92
+  drmsmoke console noise 93
+  drmsmoke console noise 94
+  drmsmoke console noise 95
+  drmsmoke console noise 96
+  drmsmoke console noise 97
+  drmsmoke console noise 98
+  drmsmoke console noise 99
+  drmsmoke console noise 100
+  drmsmoke console noise 101
+  drmsmoke console noise 102
+  drmsmoke console noise 103
+  drmsmoke console noise 104
+  drmsmoke console noise 105
+  drmsmoke console noise 106
+  drmsmoke console noise 107
+  drmsmoke console noise 108
+  drmsmoke console noise 109
+  drmsmoke console noise 110
+  drmsmoke console noise 111
+  drmsmoke console noise 112
+  drmsmoke console noise 113
+  drmsmoke console noise 114
+  drmsmoke console noise 115
+  drmsmoke console noise 116
+  drmsmoke console noise 117
+  drmsmoke console noise 118
+  drmsmoke console noise 119
+  drmsmoke console noise 120
+  drmsmoke console noise 121
+  drmsmoke console noise 122
+  drmsmoke console noise 123
+  drmsmoke console noise 124
+  drmsmoke console noise 125
+  drmsmoke console noise 126
+  drmsmoke console noise 127
+  drmsmoke console noise 128
+  drmsmoke console noise 129
+  drmsmoke console noise 130
+  drmsmoke console noise 131
+  drmsmoke console noise 132
+  drmsmoke console noise 133
+  drmsmoke console noise 134
+  drmsmoke console noise 135
+  drmsmoke console noise 136
+  drmsmoke console noise 137
+  drmsmoke console noise 138
+  drmsmoke console noise 139
+  drmsmoke console noise 140
+  drmsmoke console noise 141
+  drmsmoke console noise 142
+  drmsmoke console noise 143
+  drmsmoke console noise 144
+  drmsmoke console noise 145
+  drmsmoke console noise 146
+  drmsmoke console noise 147
+  drmsmoke console noise 148
+  drmsmoke console noise 149
+  drmsmoke console noise 150
+  drmsmoke console noise 151
+  drmsmoke console noise 152
+  drmsmoke console noise 153
+  drmsmoke console noise 154
+  drmsmoke console noise 155
+  drmsmoke console noise 156
+  drmsmoke console noise 157
+  drmsmoke console noise 158
+  drmsmoke console noise 159
+  CONSOLE_YIELDS bytes_before=8294400
+  CONSOLE_YIELDS bytes_after=8294400
+  CONSOLE_YIELDS fnv_before=617618239335486853
+  CONSOLE_YIELDS fnv_after=16756505720239424604
+  CONSOLE_YIELDS_TO_SCANOUT: FAIL the scanout changed while a DRM master held it -- the fb console painted or scrolled over it
+
+CONSOLE_YIELDS_TO_SCANOUT: FAIL
+DIRTYFB: PASS
+PAGE_FLIP_EVENT: PASS
+POLL_CARD0_READABLE: PASS
+READ_FLIP_EVENT: PASS
+  FLIP_TS_SUBTICK tv_sec=25
+  FLIP_TS_SUBTICK tv_usec=440046
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=25
+  FLIP_TS_SUBTICK tv_usec=610050
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=25
+  FLIP_TS_SUBTICK tv_usec=782163
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=25
+  FLIP_TS_SUBTICK tv_usec=951019
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=26
+  FLIP_TS_SUBTICK tv_usec=120263
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=26
+  FLIP_TS_SUBTICK tv_usec=290577
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=26
+  FLIP_TS_SUBTICK tv_usec=462129
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=26
+  FLIP_TS_SUBTICK tv_usec=630049
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=26
+  FLIP_TS_SUBTICK tv_usec=800281
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=26
+  FLIP_TS_SUBTICK tv_usec=968925
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=27
+  FLIP_TS_SUBTICK tv_usec=134310
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=27
+  FLIP_TS_SUBTICK tv_usec=302832
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=27
+  FLIP_TS_SUBTICK tv_usec=470546
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=27
+  FLIP_TS_SUBTICK tv_usec=642567
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=27
+  FLIP_TS_SUBTICK tv_usec=810224
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=27
+  FLIP_TS_SUBTICK tv_usec=977523
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK n_tick_multiple=0
+  FLIP_TS_SUBTICK n_saturated=0
+  FLIP_TS_SUBTICK n_genuine=16
+FLIP_TS_SUBTICK: PASS
+PRIME_HANDLE_TO_FD: PASS
+PRIME_MMAP_ALIAS: PASS
+PRIME_FD_TO_HANDLE: PASS
+FORK_DEVMAP_CHILD_SEES_IT: PASS
+FORK_DEVMAP_SHARED_NOT_COPIED: PASS
+drmsmoke: holding gradient for screenshot...
+
+DESTROY_DUMB: PASS
+--- drmsmoke done ---
+
+brush-0.5# 

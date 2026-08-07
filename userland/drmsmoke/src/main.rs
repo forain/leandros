@@ -6,6 +6,11 @@
 //!   GETRESOURCES; GETCONNECTOR (connected, >=1 mode); CREATE_DUMB; MAP_DUMB;
 //!   mmap + fill gradient; ADDFB2; SETCRTC; DIRTYFB; DESTROY_DUMB.
 //!
+//! It also drives a real plane-only DRM_IOCTL_MODE_ATOMIC commit — hand-built
+//! (obj, prop, value) triples, no libdrm — and checks both that its pixels
+//! reach the scanout and that it claims the framebuffer console, which the
+//! legacy-KMS path alone cannot prove.
+//!
 //! Prints "<name>: PASS"/"<name>: FAIL" per step; returns the failure count as
 //! the exit code. On success the screen shows a full-screen gradient (the
 //! screenshot accept criterion).
@@ -51,11 +56,34 @@ const DRM_IOCTL_MODE_SETCRTC: c_ulong = 0xC06864A2;
 const DRM_IOCTL_MODE_DIRTYFB: c_ulong = 0xC01864B1;
 const DRM_IOCTL_MODE_DESTROY_DUMB: c_ulong = 0xC00464B4;
 const DRM_IOCTL_MODE_PAGE_FLIP: c_ulong = 0xC01864B0;
+const DRM_IOCTL_MODE_ATOMIC: c_ulong = 0xC03864BC;
 const DRM_IOCTL_PRIME_HANDLE_TO_FD: c_ulong = 0xC00C642D;
 const DRM_IOCTL_PRIME_FD_TO_HANDLE: c_ulong = 0xC00C642E;
 
 const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
 const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
+
+// Atomic-commit flags. ALLOW_MODESET is deliberately never set below: the
+// plane-only request names no ACTIVE / MODE_ID / connector CRTC_ID, so it does
+// not change the modeset and the driver must accept it without one.
+const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
+
+// Object and property ids of the atomic pipeline, as the driver hardcodes them
+// (`DRM_PLANE_ID` / `PROP_*` in drivers/src/drm_device_interface.rs). There is
+// no GETPROPERTY-by-name lookup here on purpose: the point of this test is to
+// drive the same numbers the driver folds the request with.
+const DRM_OBJ_PRIMARY_PLANE: u32 = 30;
+const DRM_OBJ_CRTC: u32 = 1;
+const PROP_PLANE_CRTC_ID: u32 = 41;
+const PROP_FB_ID: u32 = 42;
+const PROP_SRC_X: u32 = 43;
+const PROP_SRC_Y: u32 = 44;
+const PROP_SRC_W: u32 = 45;
+const PROP_SRC_H: u32 = 46;
+const PROP_CRTC_X: u32 = 47;
+const PROP_CRTC_Y: u32 = 48;
+const PROP_CRTC_W: u32 = 49;
+const PROP_CRTC_H: u32 = 50;
 
 const POLLIN: i16 = 0x001;
 
@@ -219,6 +247,24 @@ struct DrmPrimeHandle {
     fd: i32,
 }
 
+/// `struct drm_mode_atomic`, byte for byte as the driver reads it:
+///   u32 flags@0, u32 count_objs@4, u64 objs_ptr@8, u64 count_props_ptr@16,
+///   u64 props_ptr@24, u64 prop_values_ptr@32, u64 reserved@40, u64 user_data@48.
+/// `objs_ptr` carries bare object ids with no type tag — the driver recovers
+/// the object class from the property id, whose ranges are disjoint per class.
+#[repr(C)]
+#[derive(Default)]
+struct DrmModeAtomic {
+    flags: u32,
+    count_objs: u32,
+    objs_ptr: u64,
+    count_props_ptr: u64,
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    reserved: u64,
+    user_data: u64,
+}
+
 #[repr(C)]
 #[derive(Default)]
 struct DrmModeFbDirtyCmd {
@@ -346,6 +392,66 @@ unsafe fn paint_field_and_block(base: *mut u8, pitch: usize, w: usize, h: usize)
     }
 }
 
+/// Fills a buffer with the ATOMIC-lane pattern: red pinned at `ATOMIC_ROW_R`,
+/// green flat, blue ramping left to right. Same shape as the SETCRTC gradient
+/// but a different constant red, which is what lets `fb0_census` say WHICH of
+/// the two is currently on the scanout rather than merely "something is".
+unsafe fn paint_atomic_pattern(base: *mut u8, pitch: usize, w: usize, h: usize) {
+    let mut y = 0usize;
+    while y < h {
+        let mut x = 0usize;
+        while x < w {
+            let off = y * pitch + x * 4;
+            *base.add(off) = (x * 255 / w) as u8; // B — ramps, same as the gradient
+            *base.add(off + 1) = 0x20;            // G
+            *base.add(off + 2) = ATOMIC_ROW_R;    // R — the discriminator
+            *base.add(off + 3) = 0;               // X
+            x += 1;
+        }
+        y += 1;
+    }
+}
+
+/// Issue one plane-only atomic commit for `fb_id` on the primary plane.
+///
+/// The request is built by hand from the flattened (obj, prop, value) triples
+/// `std_handle_atomic` folds — one object (the primary plane), ten properties,
+/// no CRTC or connector object at all. Naming no ACTIVE / MODE_ID / connector
+/// CRTC_ID is what makes it a non-modeset commit, so it is legal without
+/// ALLOW_MODESET; that is exactly the shape a compositor's steady-state frame
+/// has. SRC_* are 16.16 fixed point (the driver shifts them right by 16),
+/// CRTC_* are plain integers.
+unsafe fn atomic_plane_commit(fd: c_int, fb_id: u32, w: u32, h: u32, flags: u32) -> c_int {
+    let objs: [u32; 1] = [DRM_OBJ_PRIMARY_PLANE];
+    let counts: [u32; 1] = [10];
+    let props: [u32; 10] = [
+        PROP_PLANE_CRTC_ID, PROP_FB_ID,
+        PROP_SRC_X, PROP_SRC_Y, PROP_SRC_W, PROP_SRC_H,
+        PROP_CRTC_X, PROP_CRTC_Y, PROP_CRTC_W, PROP_CRTC_H,
+    ];
+    let vals: [u64; 10] = [
+        DRM_OBJ_CRTC as u64,
+        fb_id as u64,
+        0,
+        0,
+        (w as u64) << 16,
+        (h as u64) << 16,
+        0,
+        0,
+        w as u64,
+        h as u64,
+    ];
+
+    let mut req = DrmModeAtomic::default();
+    req.flags = flags;
+    req.count_objs = objs.len() as u32;
+    req.objs_ptr = objs.as_ptr() as u64;
+    req.count_props_ptr = counts.as_ptr() as u64;
+    req.props_ptr = props.as_ptr() as u64;
+    req.prop_values_ptr = vals.as_ptr() as u64;
+    ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &mut req as *mut _)
+}
+
 fn report(name: &[u8], ok: bool) -> bool {
     unsafe {
         write(1, name.as_ptr() as *const c_void, name.len());
@@ -394,13 +500,23 @@ unsafe fn print_dec(label: &[u8], v: u64) {
 const FB_CHUNK: usize = 8192;
 static mut FB_BUF: [u8; FB_CHUNK] = [0u8; FB_CHUNK];
 
+/// Constant red channel of the SETCRTC gradient, and of the ATOMIC-lane
+/// pattern. Two patterns that differ ONLY in this byte let one row check
+/// answer "which of the two presents landed", so neither lane can pass on the
+/// other's pixels: the atomic guard demands 0x80 on screen at a point where
+/// SETCRTC has not run yet, and FB0_SHOWS_SCANOUT afterwards demands 0x40,
+/// which the atomic present cannot supply.
+const GRADIENT_ROW_R: u8 = 0x40;
+const ATOMIC_ROW_R: u8 = 0x80;
+
 /// FNV-1a 64 over every byte /dev/fb0 will hand us, plus the byte count.
 /// Returns (hash, bytes, first_row_ok) where `first_row_ok` is the plumbing
-/// self-check: the first chunk must look like the gradient this test just
-/// scanned out (XRGB8888, R fixed at 0x40, B ramping with x). If that is false
-/// the census is reading something other than the scanout and every later
-/// verdict is meaningless.
-unsafe fn fb0_census(width: usize) -> (u64, u64, bool) {
+/// self-check: the first chunk must look like the pattern the caller expects to
+/// be scanned out right now (XRGB8888, R fixed at `want_r`, B ramping with x).
+/// If that is false the census is reading something other than the scanout —
+/// or the present under test never landed — and every later verdict built on
+/// this read is meaningless.
+unsafe fn fb0_census(width: usize, want_r: u8) -> (u64, u64, bool) {
     let fd = open(b"/dev/fb0\0".as_ptr(), O_RDONLY);
     if fd < 0 { return (0, 0, false); }
 
@@ -423,7 +539,7 @@ unsafe fn fb0_census(width: usize) -> (u64, u64, bool) {
                 let r_right = FB_BUF[row_bytes - 2];
                 let b_left = FB_BUF[0];
                 let b_right = FB_BUF[row_bytes - 4];
-                row_ok = r_left == 0x40 && r_right == 0x40 && b_right > b_left;
+                row_ok = r_left == want_r && r_right == want_r && b_right > b_left;
             }
         }
         let mut i = 0usize;
@@ -578,7 +694,7 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
                     // XRGB8888: gradient (blue by x, green by y)
                     *base.add(off) = (x * 255 / w as usize) as u8;       // B
                     *base.add(off + 1) = (y * 255 / h as usize) as u8;   // G
-                    *base.add(off + 2) = 0x40;                           // R
+                    *base.add(off + 2) = GRADIENT_ROW_R;                 // R
                     *base.add(off + 3) = 0;                              // X
                     x += 1;
                 }
@@ -598,6 +714,101 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     fb.pitches[0] = cd.pitch;
     let addfb_ok = ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &mut fb as *mut _) == 0 && fb.fb_id != 0;
     if !report(b"ADDFB2", addfb_ok) { failures += 1; }
+
+    // ── Atomic KMS: present, and the console yield that present must produce ──
+    //
+    // This runs BEFORE SETCRTC, and that ordering is the whole point.
+    //
+    // The console gate used to be a hardcoded list of "console-killing" ioctl
+    // numbers — two custom codes, SETCRTC and PAGE_FLIP — and
+    // DRM_IOCTL_MODE_ATOMIC was never on it. So when the compositor moved to
+    // the atomic path the gate silently stopped firing and the fb console
+    // scrolled a live session's pixels away. A console-yield check placed
+    // AFTER SETCRTC cannot see any of that: SETCRTC has already claimed the
+    // scanout, so the console is silent before the atomic commit is even
+    // issued and a missing ATOMIC arm costs nothing. Run it here and nothing
+    // has presented yet, so the atomic commit is the only thing that can
+    // silence the console — an implementation that does not treat it as a
+    // present fails, which is precisely the regression that got shipped.
+    //
+    // Its own framebuffer, painted with a DIFFERENT constant red than the
+    // SETCRTC gradient, so the two lanes cannot pass on each other's pixels:
+    // the check below demands ATOMIC_ROW_R on screen while SETCRTC has not
+    // run, and FB0_SHOWS_SCANOUT afterwards demands GRADIENT_ROW_R, which the
+    // atomic present cannot supply.
+    let mut acd = DrmModeCreateDumb::default();
+    acd.width = w;
+    acd.height = h;
+    acd.bpp = 32;
+    let mut afb = DrmModeFbCmd2::default();
+    let mut atomic_setup_ok = false;
+    if ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut acd as *mut _) == 0 && acd.handle != 0 {
+        let mut amd = DrmModeMapDumb::default();
+        amd.handle = acd.handle;
+        if ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut amd as *mut _) == 0 && acd.size > 0 {
+            let p = mmap(core::ptr::null_mut(), acd.size as usize, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, amd.offset as i64);
+            if p as isize > 0 {
+                paint_atomic_pattern(p as *mut u8, acd.pitch as usize, w as usize, h as usize);
+                afb.width = w;
+                afb.height = h;
+                afb.pixel_format = DRM_FORMAT_XRGB8888;
+                afb.handles[0] = acd.handle;
+                afb.pitches[0] = acd.pitch;
+                atomic_setup_ok = ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &mut afb as *mut _) == 0
+                    && afb.fb_id != 0;
+            }
+        }
+    }
+
+    if atomic_setup_ok {
+        // TEST_ONLY is validation only and must present nothing — smithay
+        // issues these constantly, and one that presents would make every
+        // probe a frame. Proven positively: the pattern must still be absent
+        // from the scanout afterwards. (Byte-identity is deliberately NOT the
+        // criterion here — the console is still live at this point and its own
+        // output would move the hash. `row_ok` is a content fingerprint and is
+        // immune to that.)
+        let test_rc = atomic_plane_commit(fd, afb.fb_id, w, h, DRM_MODE_ATOMIC_TEST_ONLY);
+        let (hash_t, bytes_t, row_t) = fb0_census(w as usize, ATOMIC_ROW_R);
+        let test_only_ok = test_rc == 0 && bytes_t > 0 && !row_t;
+        if !report(b"ATOMIC_TEST_ONLY_NO_PRESENT", test_only_ok) { failures += 1; }
+
+        // The real thing: one plane-only commit, no modeset, no event.
+        let commit_rc = atomic_plane_commit(fd, afb.fb_id, w, h, 0);
+        if !report(b"ATOMIC_COMMIT", commit_rc == 0) { failures += 1; }
+
+        let (hash_a, bytes_a, row_a) = fb0_census(w as usize, ATOMIC_ROW_R);
+        print_dec(b"  ATOMIC fnv_test_only=", hash_t);
+        print_dec(b"  ATOMIC fnv_after_commit=", hash_a);
+        let px_ok = commit_rc == 0 && bytes_a > 0 && bytes_a == bytes_t && row_a;
+        if !px_ok {
+            puts(b"  ATOMIC_PRESENTS_PIXELS: FAIL the atomic commit returned but its pixels are not on the scanout\n\0".as_ptr());
+        }
+        if !report(b"ATOMIC_PRESENTS_PIXELS", px_ok) { failures += 1; }
+
+        // ── CONSOLE_YIELDS_TO_ATOMIC ─────────────────────────────────────────
+        // An atomic-only present must claim the console exactly as SETCRTC
+        // does. Same provocation and same byte-identity verdict as
+        // CONSOLE_YIELDS_TO_SCANOUT below, but reached without any legacy
+        // KMS ioctl ever having been issued on this fd.
+        provoke_console(fd);
+        let (hash_b, bytes_b, _) = fb0_census(w as usize, ATOMIC_ROW_R);
+        print_dec(b"  CONSOLE_YIELDS_TO_ATOMIC bytes_before=", bytes_a);
+        print_dec(b"  CONSOLE_YIELDS_TO_ATOMIC bytes_after=", bytes_b);
+        print_dec(b"  CONSOLE_YIELDS_TO_ATOMIC fnv_before=", hash_a);
+        print_dec(b"  CONSOLE_YIELDS_TO_ATOMIC fnv_after=", hash_b);
+        let held = px_ok && bytes_a == bytes_b && hash_a == hash_b;
+        if !held {
+            puts(b"  CONSOLE_YIELDS_TO_ATOMIC: FAIL the scanout changed after an ATOMIC-only present -- the console was never claimed from the atomic path, or an unrelated card0 close handed it back\n\0".as_ptr());
+        }
+        if !report(b"CONSOLE_YIELDS_TO_ATOMIC", held) { failures += 1; }
+    } else {
+        if !report(b"ATOMIC_TEST_ONLY_NO_PRESENT", false) { failures += 1; }
+        if !report(b"ATOMIC_COMMIT", false) { failures += 1; }
+        if !report(b"ATOMIC_PRESENTS_PIXELS", false) { failures += 1; }
+        if !report(b"CONSOLE_YIELDS_TO_ATOMIC", false) { failures += 1; }
+    }
 
     // SETCRTC — scan out the fb on crtc 1 with the connector's mode
     let mut set = core::mem::zeroed::<DrmModeCrtc>();
@@ -623,23 +834,29 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     // COSMIC session as 334503 distinct colours collapsing to 177 with 79% of
     // the screen left black.
     //
-    // Two ways in, and this exercises both:
-    //   * the console was never silenced in the first place — the old gate was
-    //     a hardcoded list of ioctl numbers that missed DRM_IOCTL_MODE_ATOMIC,
-    //     which is the path a real compositor drives;
-    //   * it was silenced and then handed back by an unrelated card0 close,
-    //     which additionally CLEARS the screen and prints a banner.
+    // This is the LEGACY-KMS half of the pair. Its counterpart above reaches
+    // the same invariant through DRM_IOCTL_MODE_ATOMIC and nothing else; the
+    // two together are what separate "the console was never silenced" from
+    // "it was silenced and then handed back by an unrelated card0 close",
+    // which additionally CLEARS the screen and prints a banner. A gate that
+    // knows only about the legacy ioctl numbers passes here and fails there.
     //
     // The verdict is byte-identity of the scanout across the provocation, which
     // needs no per-arch pixel constants. Anything that repaints the surface
     // between the two reads — including the kernel's own log output — fails it.
     if setcrtc_ok {
-        let (hash_a, bytes_a, row_ok) = fb0_census(w as usize);
+        // GRADIENT_ROW_R, not ATOMIC_ROW_R: the surface currently holds the
+        // atomic lane's pattern, so this row check only passes if SETCRTC's
+        // own present replaced it. That keeps FB0_SHOWS_SCANOUT a real
+        // plumbing self-check — it is what caught /dev/fb0 reading a stale
+        // buffer on x86_64, where both builds otherwise returned identical
+        // fingerprints and the census certified a vacuous pass.
+        let (hash_a, bytes_a, row_ok) = fb0_census(w as usize, GRADIENT_ROW_R);
         if !report(b"FB0_SHOWS_SCANOUT", row_ok && bytes_a > 0) { failures += 1; }
 
         provoke_console(fd);
 
-        let (hash_b, bytes_b, _) = fb0_census(w as usize);
+        let (hash_b, bytes_b, _) = fb0_census(w as usize, GRADIENT_ROW_R);
         print_dec(b"  CONSOLE_YIELDS bytes_before=", bytes_a);
         print_dec(b"  CONSOLE_YIELDS bytes_after=", bytes_b);
         print_dec(b"  CONSOLE_YIELDS fnv_before=", hash_a);

@@ -1,0 +1,88 @@
+==== m11 atomic console-yield aarch64 tag=control mode=full Fri Aug  7 14:43:43 2026 ====
+  [src md5] 6762a83101c41df88c2a7ff65c35a07d  drivers/src/drm_device_interface.rs
+  [src md5] 697831b53773780bcd9c21937612ef0c  drivers/src/framebuffer.rs
+  [src md5] 71e9e7696595649218eae632c0707dda  userland/drmsmoke/src/main.rs
+#### BOOT 1 ####
+  [POSITIVE CONTROL] harness reports failure = True
+  [boot] 1280x800 md5=0f10f4174d22ac2a85a7d2ce828c2287 distinct_colours=3 total=1024000
+      #000000 = 983788
+      #ffffff = 40069
+      #cd0000 = 143
+      0xff0000=0  0x181818=0
+  [vfstest] PASS=36 FAIL=0
+      | ATOMIC_TEST_ONLY_NO_PRESENT: PASS
+      | ATOMIC_COMMIT: PASS
+      | ATOMIC fnv_test_only=9871565877698472972
+      | ATOMIC fnv_after_commit=6277992429985415973
+      | ATOMIC_PRESENTS_PIXELS: PASS
+      | CONSOLE_YIELDS_TO_ATOMIC bytes_before=4096000
+      | CONSOLE_YIELDS_TO_ATOMIC bytes_after=4096000
+      | CONSOLE_YIELDS_TO_ATOMIC fnv_before=6277992429985415973
+      | CONSOLE_YIELDS_TO_ATOMIC fnv_after=6277992429985415973
+      | CONSOLE_YIELDS_TO_ATOMIC: PASS
+      | SETCRTC: PASS
+      | FB0_SHOWS_SCANOUT: PASS
+      | CONSOLE_YIELDS bytes_before=4096000
+      | CONSOLE_YIELDS bytes_after=4096000
+      | CONSOLE_YIELDS fnv_before=12209877486060206593
+      | CONSOLE_YIELDS fnv_after=12209877486060206593
+      | CONSOLE_YIELDS_TO_SCANOUT: PASS
+      | --- drmsmoke done ---
+  [drmsmoke] PASS=29 FAIL=0
+  [guards]   ATOMIC_TEST_ONLY_NO_PRESENT=PASS  ATOMIC_COMMIT=PASS  ATOMIC_PRESENTS_PIXELS=PASS  CONSOLE_YIELDS_TO_ATOMIC=PASS  FB0_SHOWS_SCANOUT=PASS  CONSOLE_YIELDS_TO_SCANOUT=PASS
+  [after-drmsmoke] 1280x800 md5=675b077353f4e4985d2aa52873401574 distinct_colours=2 total=1024000
+      #000000 = 1022739
+      #ffffff = 1261
+      0xff0000=0  0x181818=0
+  [scmtest] PASS=32 FAIL=0
+  [forktest] PASS=3 FAIL=0
+  [epolltest] PASS=10 FAIL=0
+  [polltest] PASS=6 FAIL=0
+  [waittest] PASS=3 FAIL=2
+  [sigtest] PASS=6 FAIL=0
+  [timertest] PASS=6 FAIL=0
+  [memtest] PASS=4 FAIL=0
+      | ATOMIC_TEST_ONLY_NO_PRESENT: PASS
+      | ATOMIC_COMMIT: PASS
+      | ATOMIC fnv_test_only=1186514131417507292
+      | ATOMIC fnv_after_commit=6277992429985415973
+      | ATOMIC_PRESENTS_PIXELS: PASS
+      | CONSOLE_YIELDS_TO_ATOMIC bytes_before=4096000
+      | CONSOLE_YIELDS_TO_ATOMIC bytes_after=4096000
+      | CONSOLE_YIELDS_TO_ATOMIC fnv_before=6277992429985415973
+      | CONSOLE_YIELDS_TO_ATOMIC fnv_after=6277992429985415973
+      | CONSOLE_YIELDS_TO_ATOMIC: PASS
+      | FB0_SHOWS_SCANOUT: PASS
+      | CONSOLE_YIELDS bytes_before=4096000
+      | CONSOLE_YIELDS bytes_after=4096000
+      | CONSOLE_YIELDS fnv_before=12209877486060206593
+      | CONSOLE_YIELDS fnv_after=12209877486060206593
+      | CONSOLE_YIELDS_TO_SCANOUT: PASS
+      | DRMSMOKE: HOLD READY
+  [hold guards] ATOMIC_TEST_ONLY_NO_PRESENT=PASS  ATOMIC_COMMIT=PASS  ATOMIC_PRESENTS_PIXELS=PASS  CONSOLE_YIELDS_TO_ATOMIC=PASS  FB0_SHOWS_SCANOUT=PASS  CONSOLE_YIELDS_TO_SCANOUT=PASS
+  [hold] 1280x800 md5=df39bf91f37d92164997f4992b7eb9b7 distinct_colours=2 total=1024000
+      #181818 = 958464
+      #ff0000 = 65536
+      0xff0000=65536  0x181818=958464
+==== SUMMARY ====
+  tag=control arch=aarch64
+  src md5 6762a83101c41df88c2a7ff65c35a07d  drivers/src/drm_device_interface.rs
+  src md5 697831b53773780bcd9c21937612ef0c  drivers/src/framebuffer.rs
+  src md5 71e9e7696595649218eae632c0707dda  userland/drmsmoke/src/main.rs
+  positive control reported failing: True
+  guard ATOMIC_TEST_ONLY_NO_PRESENT    = PASS
+  guard ATOMIC_COMMIT                  = PASS
+  guard ATOMIC_PRESENTS_PIXELS         = PASS
+  guard CONSOLE_YIELDS_TO_ATOMIC       = PASS
+  guard FB0_SHOWS_SCANOUT              = PASS
+  guard CONSOLE_YIELDS_TO_SCANOUT      = PASS
+  hold screendump md5 = df39bf91f37d92164997f4992b7eb9b7
+  scmtest        PASS= 32 FAIL=  0
+  forktest       PASS=  3 FAIL=  0
+  epolltest      PASS= 10 FAIL=  0
+  polltest       PASS=  6 FAIL=  0
+  waittest       PASS=  3 FAIL=  2
+  sigtest        PASS=  6 FAIL=  0
+  timertest      PASS=  6 FAIL=  0
+  memtest        PASS=  4 FAIL=  0
+==== m11 DONE ====
