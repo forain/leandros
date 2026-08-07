@@ -1,0 +1,111 @@
+Pre-committed pass criteria for the M4 aarch64 pixel capture.
+
+WRITTEN BEFORE ANY CAPTURE WAS TAKEN. Committed before the first run.
+
+Subject: vkwl, MESA_VK_WSI_DEBUG=sw, presenting into cosmic-comp inside
+LeandrOS on **aarch64 under TCG** on the Linux box, with --venus
+(virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G) and -cpu max,lpa2=off.
+
+This is the x86_64 criteria file (artifacts/notes/m9-vkwl/) transposed to
+aarch64, with the frame count reduced for TCG and with the compositor
+configuration made an explicit, pre-declared variable. Nothing else changed.
+
+
+-------------------------------------------------------------------- colours
+vkwl clears its swapchain to a 6-colour cycle; frame f uses cols[f % 6]:
+    0 (0.90,0.15,0.15)  1 (0.15,0.85,0.30)  2 (0.15,0.40,0.95)
+    3 (0.95,0.80,0.10)  4 (0.70,0.25,0.85)  5 (0.10,0.85,0.85)
+
+The last two frames of an N-frame run are N-2 and N-1, so any N == 4 (mod 6)
+ends on cols[2] then cols[3] — the same two the x86_64 capture used, chosen
+there because their 8-bit UNORM conversions are the least ambiguous. x86_64
+used N=304. **aarch64/TCG uses N=28**: 28 mod 6 == 4, so the held colours are
+IDENTICAL to the x86_64 run and the two censuses are directly comparable,
+while the frame loop is ~11x cheaper. The frame count is the only knob turned
+for TCG; it is turned before any capture, not after seeing one.
+
+    phase B  seq=26  predicted 0x2666f2  (38,102,242)
+    phase C  seq=27  predicted 0xf2cc1a  (242,204,26)
+
+vkwl prints its own prediction in its `VKWL: HOLD READY seq=... extent=...
+rgb=...` sentinel, so the harness never guesses Vulkan's UNORM rounding.
+Tolerance +-2 per channel (x86_64 measured 0xf2cc19 against a round-half-up
+0xf2cc1a — one LSB on blue).
+
+
+------------------------------------------------------------- the two runs
+Declared here, in this order, before either was attempted:
+
+  R1  cosmic-comp STANDALONE (no cosmic-session, no panel, no cosmic-bg, no
+      applets). Strictly a subset of R2's process set, so it is the cheaper
+      test of the same chain: Venus -> Mesa WSI -> wl_shm -> cosmic-comp ->
+      DRM scanout. Run first precisely because TCG cost is the open question.
+  R2  the FULL COSMIC session (`sh /bin/start-cosmic-leandros`), byte-for-byte
+      the x86_64 M4 configuration.
+
+R1 passing and R2 not reaching a usable state is a REAL and reportable
+outcome: it would say the WSI chain works on aarch64 and the blocker is
+COSMIC session startup cost, not Vulkan. R1 is not a substitute for R2 and
+will not be reported as one.
+
+
+---------------------------------------------------------------- PASS
+PASS requires ALL of the following, for BOTH phases, in ONE boot:
+
+  1. >= 90% of the swapchain extent area (read from vkwl's own sentinel, not
+     assumed) is within +-2 of that phase's predicted colour.
+  2. Those pixels form a solid axis-aligned rectangle: bbox fill >= 0.95.
+  3. That colour appears ZERO times in capture A — the same-boot control,
+     taken with the compositor up and vkwl not yet started.
+  4. The frame is not byte-identical to control A.
+  5. The capture is complete (0 uncovered pixels).
+
+And, across the two phases:
+
+  6. B and C are not byte-identical to each other, and each phase's predicted
+     colour lands in the SAME bounding box as the other's.
+
+Criterion 6 is called out because R1's control is expected to be a near-empty
+compositor background rather than a wallpapered desktop, which makes
+criterion 3 easy to satisfy by accident. One coloured rectangle on a plain
+background could be many things; the SAME rectangle taking two independently
+pre-declared colours cannot.
+
+
+---------------------------------------------- FAIL / NEGATIVE FINDINGS
+Each is a different, separately reportable result — none is "inconclusive":
+
+  * No `VKWL: HOLD READY` sentinel, but the frame loop logged presents
+        -> reached vkQueuePresentKHR; the hold path or the harness is at fault.
+  * vkCreateSwapchainKHR fails
+        -> aarch64 WSI does not work; the M4 client half does not exist here.
+        This is the specific outcome the aarch64 half was left open on.
+  * Presents succeed, predicted colour absent, B differs from A
+        -> the compositor composites but the client buffer never reaches the
+        scanout.
+  * B byte-identical to A
+        -> nothing recomposited; the scanout is stale.
+  * Byte-swapped colour present instead of the predicted one
+        -> pixels arrive, a channel order is wrong somewhere in the chain.
+        (aarch64 is little-endian here too, so this would be a real finding,
+        not an endianness excuse.)
+  * Colour present, bbox fill low or count far below the extent
+        -> partial/torn present, or the capture straddled two frames.
+  * The compositor never binds its wayland socket within the time box
+        -> report WHERE it stalled with the elapsed seconds, not "too slow".
+
+A census that merely "looks like a desktop" is explicitly NOT a pass.
+An absence of error lines in the log is explicitly NOT a pass.
+
+
+-------------------------------------------------------------- discipline
+  * Every boot opens with a positive control: `nosuchbinary_xyz42` must be
+    seen to FAIL on the serial console before anything else is believed.
+    If the harness cannot distinguish failure from absence, it aborts.
+  * Capture A is taken in the same boot as B and C. A control from another
+    boot is not a control.
+  * vkwl runs `quiet`. The framebuffer is the primary console on LeandrOS;
+    edad115 makes the console yield the scanout to a presenting DRM open, but
+    that fix is being relied on, not re-proven, here.
+  * Timings are taken host-side, from serial sentinel arrival, so a blocked
+    guest cannot fake progress.

@@ -780,6 +780,15 @@ def main():
         "~/code/leandros-artifacts/m6-session-data/m4-vkwl")
     if os.path.exists(m4_drv):
         bin_files.append(("m4-vkwl", m4_drv, 0o100755))
+    # m4-vkwl-a64 — the same driver with the compositor choice and every wait
+    # made an argument, for aarch64 under TCG where "the session never came up"
+    # and "the WSI chain does not work here" have to be told apart and a silent
+    # timeout tells you neither. Staged exactly like m4-vkwl above; absent from
+    # the artifact tree it is simply not packed.
+    m4_drv_a64 = os.path.expanduser(
+        "~/code/leandros-artifacts/m6-session-data/m4-vkwl-a64")
+    if os.path.exists(m4_drv_a64):
+        bin_files.append(("m4-vkwl-a64", m4_drv_a64, 0o100755))
 
     # /bin/sh -> brush (hardlinked; add_files_to_dir dedupes by host path). The
     # kernel has no shebang binfmt, so shell scripts (start-cosmic-leandros,
