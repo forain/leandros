@@ -207,11 +207,10 @@ fill-buffer, compute and graphics work, `vkswap` drives a headless-surface swapc
 real DRM scanout.
 
 **Suite baselines.** On fresh images with `vfstest` run exactly once per image, both
-arches: vfstest **36/0**, scmtest **32/0**, drmsmoke **25/0** (was 22/0 — `CONSOLE_YIELDS_TO_SCANOUT`, `FB0_SHOWS_SCANOUT` and companion added with `edad115`), wakepolltest 10/0,
+arches: vfstest **36/0**, scmtest **32/0**, drmsmoke **29/0** (22 → 25 with `edad115`'s console guards, → 29 with `c8cbbc1`'s atomic lane), wakepolltest 10/0,
 forktest 3/0, epolltest **10/0** (was 9/0 — `proc_pid_exe` added with the
 `/proc/<pid>/exe` fix), polltest 6/0, sigtest 6/0, timertest 6/0, memtest 4/0,
-idletest 2/0 (`IDLE_CPU_US 0`), evtest2 8/0. `waittest` has **4** subtests and is **4/0 or
-3/1 on either arch** — a pure timing race in `fork` → child `setpgid(0,0)`+`_exit` →
+idletest 2/0 (`IDLE_CPU_US 0`), evtest2 8/0. `waittest` has **4** subtests and is **4/0 or 3/1 on either arch** (a harness reporting 5/0 is miscounting the summary line — see instrument entry 11) — a pure timing race in `fork` → child `setpgid(0,0)`+`_exit` →
 parent `waitpid(-pid)`, measured on pristine kernels too; either result is acceptable on
 either arch and the arch asymmetry in any single wave is noise. Note that `waittest` also
 emits a trailing `WAITTEST: PASS` summary line, which a `grep -c ': PASS'` will miscount as
@@ -539,6 +538,15 @@ generalises; the specifics are what make each one actionable.
 11. `waittest`'s trailing `WAITTEST: PASS` summary line, counted as a fifth subtest by a
     naive `grep -c ': PASS'`, is the whole reason its baseline was recorded as "5/0 or 3/2"
     against a source file with four cases.
+    **It recurred on 2026-08-07 in a harness written that same day** (`m11_atomic_console.py`),
+    which reported `waittest 5/0` on both arches. The committed log shows exactly four
+    subtests — `wnohang_poll_until_exit`, `blocking_wait_for_exit`, `echild_no_children`,
+    `wait_on_process_group`, all PASS — plus the summary line, and `grep -c ': PASS'` on it
+    returns 5. The true result was a clean **4/0**. **Documenting a trap does not stop the next
+    harness walking into it**, because each new harness re-implements the extractor from
+    scratch. The durable fix is to stop counting lines and read the binary's own
+    `failures = N` trailer, which every one of these test binaries prints and which cannot be
+    inflated by a summary line.
 12. **`grep` over a serial log sharing a pty with QEMU's trace stream.** With
     `-trace virtio_gpu_cmd_*` and no `-D`, every guest character triggers a console flush, so
     trace lines land *between* the guest's bytes: `present_addfb2: PASS` arrived as twenty
@@ -659,7 +667,7 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 1 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — **no action** | Recorded on purpose; fix undecided |
 | 2 | M4 — **COMPLETE, photographed on BOTH arches** | Feature — **DONE** | `132d4df` x86_64, `d91edbf` aarch64 |
 | 3 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | Nothing scheduled |
-| 4 | fb console scrolled the scanout out from under cosmic-comp | Bug — **FIXED** `edad115` | Follow-up: drmsmoke drives no real atomic commit |
+| 4 | fb console scrolled the scanout out from under cosmic-comp | Bug — **FIXED + GUARDED** | `edad115` fix, `c8cbbc1` closes the guard gap |
 | 5 | Deferred work and known limitations | Mixed | Backlog |
 
 ### Next steps, in the order they are worth doing
@@ -874,13 +882,46 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
    may hold `KERNEL_FB`) — **argued from construction, not exercised**, as there was no way to
    panic on demand. It is nonetheless strictly better than before, when a panic during a DRM
    session reached serial only.
-   **The guard's honest limit, and the obvious next step.** With the whole gate removed it
-   fails on both arches, but its *trigger* is the reclaim-scoping half: a hypothetical fix that
-   only added `ATOMIC` to the old allow-list would still fail it, while one that only scoped
-   reclaim would **pass**. `drmsmoke` never drives a real atomic commit. `std_handle_atomic`
-   takes a hand-built request with compile-time property ids (plane 30, `FB_ID` 42, `CRTC_ID`
-   41, `SRC_*` 43-46, `CRTC_*` 47-50) and no modeset, so a plane-only commit is ~30 lines in
-   `drmsmoke` and would close the gap.
+   **The guard's limit is CLOSED (`c8cbbc1`), and the three-way mutation proves it separates
+   the halves.** `drmsmoke` now drives a real plane-only `DRM_IOCTL_MODE_ATOMIC` commit —
+   `ATOMIC_TEST_ONLY_NO_PRESENT`, `ATOMIC_COMMIT`, `ATOMIC_PRESENTS_PIXELS`,
+   `CONSOLE_YIELDS_TO_ATOMIC`, taking the suite 25 → **29/0** both arches.
+   **The design choice that makes it discriminate:** the block runs **before `SETCRTC`**, on
+   its **own** framebuffer painted a different red. A guard placed *after* `SETCRTC` cannot
+   discriminate at all, because `SETCRTC` is on the old allow-list — the console is already
+   silent by then, so the atomic commit proves nothing. `fb0_census` now takes the red it
+   expects, so the later `FB0_SHOWS_SCANOUT` still demands the gradient's `0x40`, which the
+   atomic present's `0x80` cannot supply; it stays a real self-check rather than being
+   satisfied by the earlier present.
+   **All ten runs (5 builds × 2 arches) matched the prediction:**
+
+   | build | `…TO_ATOMIC` | `…TO_SCANOUT` |
+   |---|---|---|
+   | control | PASS | PASS |
+   | A — whole gate removed | **FAIL** | **FAIL** |
+   | B — allow-list restored, reclaim scoped | **FAIL** | **PASS** |
+   | C — `ATOMIC` counted, reclaim unscoped | **FAIL** | **FAIL** |
+   | restore | PASS | PASS |
+
+   **Row B is the new coverage**: it passed the old suite and fails now, *while the legacy
+   guard still passes* — so the failure names **which half** broke. aarch64 atomic lane held at
+   `6277992429985415973` and collapsed to `2373313276106322956` under all three mutations,
+   which is the same value the console-scrolled surface took in `edad115`'s own falsification.
+   Restore byte-identical to control on both driver files.
+   **Layout facts, read from `std_handle_atomic` (`drivers/src/drm_device_interface.rs:2969`)
+   and worth not re-deriving.** `objs_ptr` holds bare object ids with **no type tag** — the
+   class is recovered from the property id, whose ranges are disjoint per class.
+   `SRC_X/Y/W/H` (43-46) are **16.16 fixed point** (the driver does `val >> 16`); `CRTC_*`
+   (47-50) are plain. **`ALLOW_MODESET` is not needed**: `changes_modeset` is true only if the
+   request *names* `ACTIVE`/`MODE_ID`/connector `CRTC_ID`, so a plane-only commit is legal
+   bare — and it works **before any `SETCRTC`**, because `crtcs`/`planes` are populated in
+   `DrmDevice::new()` and `handle_flip_page` falls back to `vfs_get_framebuffer_info` when
+   `crtc.mode` is `None`. With `damage_blob == 0` the `unchanged` short-circuit cannot fire, so
+   every such commit presents.
+   **`scripts/scmrun.py` gained an optional third arg**, a completion marker: it returns as
+   soon as the marker appears, treating the duration as a ceiling rather than a fixed wait
+   (backwards compatible). Six full-surface censuses per run would otherwise have imposed a
+   worst-case x86_64/TCG budget on every fast run; a full x86_64 run is now ~6 minutes.
 
 ---
 
