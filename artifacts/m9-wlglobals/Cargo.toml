@@ -1,0 +1,20 @@
+[package]
+name = "leandros-applet"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately keeps the m7w-applet package name/version so the copied
+# Cargo.lock resolves without a network fetch. The produced binary is
+# wl-globals; nothing here is staged as leandros-applet.
+[[bin]]
+name = "wl-globals"
+path = "src/main.rs"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+opt-level = 2

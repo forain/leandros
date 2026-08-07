@@ -1,0 +1,69 @@
+# m4-vkwl — bring up the COSMIC session, then run vkwl against its compositor.
+#
+# Run it as:  brush /bin/m4-vkwl [frames] [slow]
+# LeandrOS has no shebang/binfmt, so this file is only ever handed to a shell.
+#
+# WHY A SCRIPT AND NOT THREE SERIAL COMMANDS. start-cosmic-leandros ends in
+# `exec cosmic-session`, so typing it at the getty shell replaces that shell and
+# there is nothing left to run the client from. It also writes a continuous
+# RUST_LOG=info stream, which saturates the serial console and makes every later
+# command look like it never executed. Both problems go away by backgrounding
+# the session with its output redirected to a file, which only a script can do
+# reliably over an 8-byte-at-a-time serial link.
+#
+# Every progress line is prefixed M4: so a harness can find them in the middle
+# of whatever else lands on the console.
+
+R=/run/user/0
+FRAMES="${1:-5}"
+SLOW="${2:-}"
+
+mkdir -p "$R"
+chmod 0700 "$R"
+
+echo "M4: starting cosmic session (log -> $R/cosmic.log)"
+sh /bin/start-cosmic-leandros > "$R/cosmic.log" 2>&1 &
+
+# Wait for the compositor to bind its socket. cosmic-comp hands
+# WAYLAND_DISPLAY=wayland-1 back to cosmic-session, so wayland-1 is the name to
+# wait on, not wayland-0.
+i=0
+while [ "$i" -lt 180 ]; do
+	if [ -e "$R/wayland-1" ]; then
+		break
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+echo "M4: wayland-1 present after ${i}s"
+ls -l "$R"
+
+# Even once the socket exists the compositor has not necessarily finished
+# probing outputs; a client that connects too early gets a surface with no
+# output and never a usable configure.
+sleep 20
+
+XDG_RUNTIME_DIR="$R"
+WAYLAND_DISPLAY=wayland-1
+export XDG_RUNTIME_DIR
+export WAYLAND_DISPLAY
+
+# Three routes, one boot, because a boot is the expensive part.
+#   swnoshm  the route that is expected to work: wl_shm + a CPU copy, needing
+#            nothing of the driver (WSI_WL_BUFFER_SHM_MEMCPY)
+#   sw       the same wl_shm route but via host-pointer import
+#            (WSI_WL_BUFFER_GPU_SHM); measured to fail on RADV with
+#            VK_ERROR_INVALID_EXTERNAL_HANDLE, so it tells us whether Venus
+#            differs
+#   nosw     the dmabuf route, as a negative control: cosmic-comp here does not
+#            advertise zwp_linux_dmabuf_v1, so this is expected to fail
+for route in swnoshm sw nosw; do
+	echo "M4: === vkwl $route BEGIN ==="
+	/bin/vkwl "$route" "$FRAMES" $SLOW
+	echo "M4: vkwl $route exit=$?"
+	echo "M4: === vkwl $route END ==="
+done
+
+echo "M4: --- cosmic.log tail ---"
+tail -60 "$R/cosmic.log"
+echo "M4: DONE"

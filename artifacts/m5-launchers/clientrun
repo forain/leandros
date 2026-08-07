@@ -1,0 +1,5 @@
+export XDG_RUNTIME_DIR=/run/user/0
+export WAYLAND_DISPLAY=wayland-1
+echo CLIENTRUN-START
+wlclient >/tmp/wl.log 2>&1 &
+echo CLIENTRUN-BG-PID $!

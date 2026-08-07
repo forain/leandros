@@ -1,0 +1,132 @@
+drm: dump the FB_DAMAGE_CLIPS rect list, not just its area
+
+Follow-on diagnostic for TODO item 9. `dmg_px` alone cannot distinguish
+smithay's three "damage everything" fallbacks — each of which emits exactly
+ONE rect equal to the output geometry — from its `DamageShaper` inflating a
+real, scattered damage set into many rects. `PlaneDamageClips::from_damage`
+(smithay efeb597, backend/drm/surface/mod.rs:68-100) copies the shaper's
+output into the blob one rect for one rect, so the rect count and the rect
+list read here are the damage tracker's verbatim output.
+
+Adds `dmg_nrects=` to the `[DRMSTAT]` line and, for the first 12 presents
+that damage more than 512x512 px, one self-delimiting `[DMGRECTS]` line
+carrying the whole clip list.
+
+APPLY ON TOP OF: notes/m9-fb-damage-clips/fb_damage_worktree_20260806.patch
+(this patch does not apply to a clean tree; it needs that one first).
+Touches drivers/src/drm_device_interface.rs only, entirely behind DRM_STATS.
+Builds clean: cargo build --release -p drivers --target aarch64-unknown-none.
+
+How to read the result:
+  n=1, rect = (0,0,1280,800)      -> a genuine full-output fallback; reopen
+                                     the buffer-age question
+  n=1, full width, height 767-775 -> shaper bbox shortcut (shaper.rs:81-88);
+                                     pre-shaper set is >=2 rects, one huge
+  n=4..32, rects 320 px wide      -> tiled shaper (shaper.rs:186-249); read
+                                     the rect list for the real regions
+
+Mandatory analyser assertions (this instrument must fail loudly, not
+plausibly):
+  1. parsed `r=` tuples == n, and the `[/DMGRECTS]` sentinel is present;
+     abort otherwise (a truncated serial line must not under-report)
+  2. positive control: over any window with zero `evpush` delta,
+     dmg_nrects - dmg_rect == 0 and dmg_px / dmg_rect == 40960 exactly.
+     If idle does not reproduce, discard the motion numbers
+  3. dmg_nrects >= dmg_rect always; dmg_nrects == 0 with dmg_rect > 0 means
+     the counter was never wired -- hard error, not a zero
+
+---
+--- a/drivers/src/drm_device_interface.rs
++++ b/drivers/src/drm_device_interface.rs
+@@ -1194,6 +1194,23 @@
+ static DAMAGE_SKIP: AtomicU64 = AtomicU64::new(0);
+ static DAMAGE_PX: AtomicU64 = AtomicU64::new(0);
+ static BLOBS_CREATED: AtomicU64 = AtomicU64::new(0);
++
++/// Total number of clip rects across every rect-path present, and how many
++/// presents we have already dumped in full.
++///
++/// `dmg_px` alone cannot tell smithay's three "damage everything" fallbacks
++/// (each of which emits exactly ONE rect equal to the output) from its
++/// `DamageShaper` inflating a real, scattered damage set (which emits many).
++/// `PlaneDamageClips::from_damage` copies the shaper's output into the blob
++/// one rect for one rect, so the rect COUNT read here is the damage tracker's
++/// verbatim output — the one datum that separates the two.
++static DAMAGE_NRECTS: AtomicU64 = AtomicU64::new(0);
++static DAMAGE_DUMPED: AtomicU64 = AtomicU64::new(0);
++
++/// How many large-damage presents to print in full. Bounded on purpose: the
++/// dump is a few hundred bytes of serial per present and the compositor is
++/// already the bottleneck.
++const DAMAGE_DUMP_LIMIT: u64 = 12;
+ 
+ /// Primary-plane state of the last commit we actually presented.
+ ///
+@@ -1276,6 +1293,31 @@
+         total = total.saturating_add(w.saturating_mul(h));
+     }
+     total
++}
++
++/// Print a clip list verbatim, once, for a present that damaged a lot.
++///
++/// Format is deliberately self-checking: `n=` comes FIRST, the rects follow,
++/// and the line is terminated by a fixed sentinel. An analyser MUST assert
++/// that it parsed exactly `n` rects AND saw the sentinel, so a truncated or
++/// interleaved serial line fails loudly instead of silently under-reporting —
++/// which is precisely how three harnesses lied during the 2026-08-06 wave.
++///
++/// Called with no locks held (`damage_rects` has already released `BLOBS`).
++fn damage_dump(rects: &[(i32, i32, i32, i32)]) {
++    crate::pci::serial_debug("[DMGRECTS] n=");
++    crate::pci::serial_debug_hex_64(rects.len() as u64);
++    for &(x1, y1, x2, y2) in rects {
++        crate::pci::serial_debug(" r=");
++        crate::pci::serial_debug_hex_64(x1 as i64 as u64);
++        crate::pci::serial_debug(",");
++        crate::pci::serial_debug_hex_64(y1 as i64 as u64);
++        crate::pci::serial_debug(",");
++        crate::pci::serial_debug_hex_64(x2 as i64 as u64);
++        crate::pci::serial_debug(",");
++        crate::pci::serial_debug_hex_64(y2 as i64 as u64);
++    }
++    crate::pci::serial_debug(" [/DMGRECTS]\n");
+ }
+ 
+ /// Resolve a dumb-buffer GEM handle to its physical base + buddy order, so the
+@@ -1380,6 +1422,8 @@
+             crate::pci::serial_debug_hex_64(DAMAGE_SKIP.load(Ordering::Relaxed));
+             crate::pci::serial_debug(" dmg_px=");
+             crate::pci::serial_debug_hex_64(DAMAGE_PX.load(Ordering::Relaxed));
++            crate::pci::serial_debug(" dmg_nrects=");
++            crate::pci::serial_debug_hex_64(DAMAGE_NRECTS.load(Ordering::Relaxed));
+             crate::pci::serial_debug(" blobs=");
+             crate::pci::serial_debug_hex_64(BLOBS_CREATED.load(Ordering::Relaxed));
+             // Cursor-plane traffic. Once the atomic cursor plane is live,
+@@ -2579,6 +2623,26 @@
+                     && blob == LAST_PRIMARY_DAMAGE.load(Ordering::Relaxed);
+                 let rects = if full_repaint { None } else { damage_rects(blob) };
+ 
++                // Rect accounting, deliberately OUTSIDE the DRM device lock —
++                // the dump writes to serial and the two must not be nested.
++                if DRM_STATS && !unchanged {
++                    if let Some(clips) = rects.as_deref() {
++                        DAMAGE_NRECTS.fetch_add(clips.len() as u64, Ordering::Relaxed);
++                        // 512x512 px: comfortably above the ~40 960 px the idle
++                        // panel-clock present costs and far below the ~992 000 px
++                        // the pointer-motion presents cost, and independent of the
++                        // mode. Idle presents therefore never reach the log, which
++                        // is exactly why the analyser must ALSO assert the idle
++                        // invariant (dmg_nrects - dmg_rect == 0 over a window with
++                        // no evpush delta) as its positive control.
++                        if damage_area(clips) > 512 * 512
++                            && DAMAGE_DUMPED.fetch_add(1, Ordering::Relaxed) < DAMAGE_DUMP_LIMIT
++                        {
++                            damage_dump(clips);
++                        }
++                    }
++                }
++
+                 if unchanged {
+                     // smithay re-sent the previous plane config byte for byte:
+                     // its damage tracker found nothing to draw. Present nothing;

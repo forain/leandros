@@ -1,0 +1,16 @@
+#!/bin/sh
+# zig cc musl cross wrapper for aarch64-linux-musl. Same arg-normalization as the
+# x86_64 wrapper (drops cc-rs --target/-target, -m*, normalizes version-script).
+n=$#
+while [ $n -gt 0 ]; do
+  a=$1; shift; n=$((n-1))
+  case $a in
+    --target=*) : ;;
+    -target) shift; n=$((n-1)) ;;
+    -m64|-m32) : ;;
+    -Wl,--version-script|-Wl,--dynamic-list)
+      b=$1; shift; n=$((n-1)); set -- "$@" "$a=$b" ;;
+    *) set -- "$@" "$a" ;;
+  esac
+done
+exec zig cc -target aarch64-linux-musl "$@"

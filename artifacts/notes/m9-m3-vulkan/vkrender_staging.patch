@@ -1,0 +1,14 @@
+diff --git a/scripts/mkfs-f2fs-populated.py b/scripts/mkfs-f2fs-populated.py
+index 02a508a..f590ca4 100644
+--- a/scripts/mkfs-f2fs-populated.py
++++ b/scripts/mkfs-f2fs-populated.py
+@@ -610,6 +610,9 @@ def main():
+     _vktest = f"{venus_root}/usr/bin/vktest"
+     if os.path.exists(_vktest):
+         bin_files.append(("vktest", _vktest, 0o100755))
++    _vkrender = f"{venus_root}/usr/bin/vkrender"
++    if os.path.exists(_vkrender):
++        bin_files.append(("vkrender", _vkrender, 0o100755))
+     # The ICD manifest rides the shared /usr/share tree machinery. EVERY ancestor
+     # has to be in m4_share_dirs — /usr is static (ino 15) but /usr/share only
+     # exists because the M4 walk happens to create it, which is not a dependency

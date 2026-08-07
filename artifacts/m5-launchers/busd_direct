@@ -1,0 +1,12 @@
+mkdir -p /run/user/0
+export XDG_RUNTIME_DIR=/run/user/0
+rm -f /run/user/0/bus
+echo BUSD-DIRECT-START
+/usr/libexec/busd --config /usr/share/dbus-1/session.conf --address unix:path=/run/user/0/bus >/tmp/busd.log 2>&1 &
+echo BUSD-PID $!
+sleep 3
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
+echo DBUS_ADDR $DBUS_SESSION_BUS_ADDRESS
+echo ===BUSD-LOG===
+tail -n 12 /tmp/busd.log | cut -c1-115
+echo ===BUSD-LOG-END===

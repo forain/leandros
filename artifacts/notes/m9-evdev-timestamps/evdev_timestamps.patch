@@ -1,0 +1,138 @@
+From: Leandro Forain <forain@gmail.com>
+Subject: [PATCH] evdev: stamp input events from the monotonic clock, not the raw tick
+
+Every event drained in one 100 Hz tick carried an identical timeval, and
+tv_usec was always a multiple of 10 000. libinput asks the kernel for
+CLOCK_MONOTONIC stamps (EVIOCSCLOCKID) and compares them against its own
+clock_gettime(CLOCK_MONOTONIC) — a comparison that only means anything if
+both come off the same clock — and everything downstream of it measures
+intervals between events: libinput's relative-pointer acceleration divides
+by the interval, its debounce/scroll/middle-button timers are armed from
+event time, and toolkit clients time double-clicks off the wl_pointer stamp
+we forward.
+
+Now that clock_gettime interpolates inside the tick, take the input stamp
+from the same source, so the two agree to the counter period instead of to
+10 ms. The tick counter still supplies the whole ticks, so the epoch does
+not move and the stamps stay non-decreasing by construction (monotonic_ns
+passes its result through a fetch_max).
+
+evdev-server sits below drivers in the dependency graph and cannot reach
+arch's timer module directly, so the arch crates export it the same way
+they already export arch_interrupt_save/restore, which this file calls.
+
+The read happens before interrupts are masked and before the device lock is
+taken: push_event runs in IRQ context (the 100 Hz tick drain and the aarch64
+UART IRQ), and monotonic_ns is two atomic loads plus a counter read — no
+locks, no user memory, nothing that can re-enter RUN_QUEUE.
+
+NOTE: applies on top of notes/m9-clock-monotonic/{arch-timers,clock-gettime}.patch,
+which add timer::monotonic_ns() to both arches. It touches arch/*/src/lib.rs
+and servers/evdev/src/lib.rs only, so it does not overlap those hunks.
+
+---
+ arch/aarch64/src/lib.rs   | 11 +++++++++++
+ arch/x86_64/src/lib.rs    | 12 ++++++++++++
+ servers/evdev/src/lib.rs  | 24 +++++++++++++++++++-----
+ 3 files changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/arch/aarch64/src/lib.rs b/arch/aarch64/src/lib.rs
+--- a/arch/aarch64/src/lib.rs
++++ b/arch/aarch64/src/lib.rs
+@@ -34,8 +34,19 @@
+ #[no_mangle]
+ pub extern "C" fn arch_interrupt_restore(flags: usize) {
+     unsafe {
+         core::arch::asm!("msr daif, {}", in(reg) flags);
+     }
+ }
+
++/// Monotonic nanoseconds since boot, for kernel crates that sit below this one
++/// in the dependency graph and so cannot call `timer::monotonic_ns` directly —
++/// `evdev-server` stamps input events with it. Same contract as the function it
++/// forwards to: whole ticks plus a CNTVCT_EL0 fraction, never decreasing, and
++/// callable from IRQ context (two atomic loads and an `mrs`, no locks, no user
++/// memory).
++#[no_mangle]
++pub extern "C" fn arch_monotonic_ns() -> u64 {
++    timer::monotonic_ns()
++}
++
+ pub fn init(boot_info: &boot::BootInfo) {
+     unsafe {
+diff --git a/arch/x86_64/src/lib.rs b/arch/x86_64/src/lib.rs
+--- a/arch/x86_64/src/lib.rs
++++ b/arch/x86_64/src/lib.rs
+@@ -166,8 +166,20 @@
+ #[no_mangle]
+ pub extern "C" fn arch_interrupt_restore(flags: usize) {
+     if flags & (1 << 9) != 0 {
+         unsafe { core::arch::asm!("sti"); }
+     }
+ }
+
++/// Monotonic nanoseconds since boot, for kernel crates that sit below this one
++/// in the dependency graph and so cannot call `timer::monotonic_ns` directly —
++/// `evdev-server` stamps input events with it. Same contract as the function it
++/// forwards to: whole ticks plus a TSC fraction scaled by the PIT-measured
++/// cycles-per-tick, never decreasing, and callable from IRQ context (two atomic
++/// loads and an `rdtsc`, no locks, no user memory).
++#[cfg(target_arch = "x86_64")]
++#[no_mangle]
++pub extern "C" fn arch_monotonic_ns() -> u64 {
++    timer::monotonic_ns()
++}
++
+ /// x86_64 serial input.
+ ///
+diff --git a/servers/evdev/src/lib.rs b/servers/evdev/src/lib.rs
+--- a/servers/evdev/src/lib.rs
++++ b/servers/evdev/src/lib.rs
+@@ -58,7 +58,8 @@
+     in_use: bool,
+     /// CLOCK id events are stamped with (EVIOCSCLOCKID). 1 = CLOCK_MONOTONIC,
+-    /// which is what libinput requests; we always stamp from the monotonic tick
+-    /// source, so this is advisory only (kept for a truthful EVIOCGCLOCKID-style
+-    /// answer and future REALTIME support).
++    /// which is what libinput requests; we always stamp from the same monotonic
++    /// clock `clock_gettime(CLOCK_MONOTONIC)` reports, so this is advisory only
++    /// (kept for a truthful EVIOCGCLOCKID-style answer and future REALTIME
++    /// support).
+     clockid: u32,
+     /// Monotonic push counter — the poll/epoll readiness sequence (edge emu).
+     seq: u64,
+@@ -108,4 +108,7 @@
+ extern "C" {
+     fn arch_interrupt_save() -> usize;
+     fn arch_interrupt_restore(f: usize);
++    /// Monotonic nanoseconds since boot, sub-tick resolution, never decreasing —
++    /// the same clock `clock_gettime(CLOCK_MONOTONIC)` reports to userspace.
++    fn arch_monotonic_ns() -> u64;
+ }
+@@ -395,14 +395,22 @@
+ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
+     if dev_id as usize >= MAX_DEVICES { return; }
+
+-    let now_ticks = sched::ticks();
++    // Stamp from the same monotonic clock userspace reads, at its full
++    // resolution. libinput asks for CLOCK_MONOTONIC and compares event times
++    // against its own clock_gettime(); everything downstream of it measures the
++    // interval between events. A whole-tick stamp gave every event drained in
++    // one 10 ms tick an identical timeval and a tv_usec that was always a
++    // multiple of 10 000. Read it before masking interrupts and before taking
++    // the device lock: push_event runs in IRQ context and this is two atomic
++    // loads and a counter read — no locks and no user memory — but there is
++    // still no reason to hold anything across it.
++    let now_us = unsafe { arch_monotonic_ns() } / 1_000;
+     let ev = input_event {
+         time: timeval {
+-            tv_sec: (now_ticks / 100) as i64,
+-            tv_usec: ((now_ticks % 100) * 10000) as i64,
++            tv_sec:  (now_us / 1_000_000) as i64,
++            tv_usec: (now_us % 1_000_000) as i64,
+         },
+         type_,
+         code,
+         value,
+     };
+     let f = unsafe { arch_interrupt_save() };

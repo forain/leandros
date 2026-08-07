@@ -1,0 +1,53 @@
+--- a/ports/input-stack/shims/libudev/libudev.c
++++ b/ports/input-stack/shims/libudev/libudev.c
+@@ -10,8 +10,17 @@
+  *     /dev/dri/card0        subsystem=drm    (GPU scanout node)
+  *     /dev/dri/renderD128   subsystem=drm    (render node)
+  *     /dev/input/event0     subsystem=input  ID_INPUT_KEYBOARD
+- *     /dev/input/event1     subsystem=input  ID_INPUT_MOUSE
+- *     /dev/input/event2     subsystem=input  ID_INPUT_TOUCHSCREEN
++ *     /dev/input/event1     subsystem=input  ID_INPUT_MOUSE   (virtio-tablet:
++ *                                              absolute ABS 0..32767 + BTN_LEFT,
++ *                                              no INPUT_PROP_DIRECT -> a pointer,
++ *                                              not a touchscreen; see evtest2)
++ *
++ * M4 note: the kernel's fixed device set is event0=keyboard, event1=virtio-
++ * tablet only (no third input node). An earlier iteration of this table also
++ * modeled a synthetic event2 touchscreen; that entry has been removed since
++ * it no longer corresponds to any device the kernel actually exposes -- a
++ * libinput udev enumeration that included it would try (and fail) to open a
++ * nonexistent /dev/input/event2.
+  *
+  * Enumeration returns the entries whose subsystem/sysname/property filters
+  * match; devices are looked up by syspath / devnum / (subsystem,sysname).
+@@ -105,13 +114,6 @@
+ 	{ "ID_INPUT_MOUSE", "1" },
+ 	{ "ID_SEAT", "seat0" },
+ };
+-static const struct prop props_touch[] = {
+-	{ "DEVNAME", "/dev/input/event2" },
+-	{ "ID_INPUT", "1" },
+-	{ "ID_INPUT_TOUCHSCREEN", "1" },
+-	{ "ID_SEAT", "seat0" },
+-};
+-
+ #define NPROPS(a) (sizeof(a) / sizeof((a)[0]))
+ 
+ /*
+@@ -133,16 +135,12 @@
+ 	  0, 0, 0, 1, NULL, NULL, 0 },
+ 	{ "/sys/class/input/input1", "input1", "1", "input", NULL, NULL, NULL,
+ 	  0, 0, 0, 1, NULL, NULL, 0 },
+-	{ "/sys/class/input/input2", "input2", "2", "input", NULL, NULL, NULL,
+-	  0, 0, 0, 1, NULL, NULL, 0 },
+ 
+ 	/* --- input: evdev nodes --- */
+ 	{ "/sys/class/input/event0", "event0", "0", "input", NULL, "/dev/input/event0", NULL,
+ 	  'c', 13, 64, 1, "/sys/class/input/input0", props_kbd, NPROPS(props_kbd) },
+ 	{ "/sys/class/input/event1", "event1", "1", "input", NULL, "/dev/input/event1", NULL,
+ 	  'c', 13, 65, 1, "/sys/class/input/input1", props_mouse, NPROPS(props_mouse) },
+-	{ "/sys/class/input/event2", "event2", "2", "input", NULL, "/dev/input/event2", NULL,
+-	  'c', 13, 66, 1, "/sys/class/input/input2", props_touch, NPROPS(props_touch) },
+ };
+ static const size_t g_ndevices = sizeof(g_devices) / sizeof(g_devices[0]);
+ 

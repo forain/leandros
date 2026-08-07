@@ -1,0 +1,13 @@
+mkdir -p /run/user/0
+export XDG_RUNTIME_DIR=/run/user/0
+export COSMIC_BACKEND=kms
+export COSMIC_RENDER_DEVICE=226:0
+export SMITHAY_USE_LEGACY=1
+export ICED_BACKEND=tiny-skia
+export RUST_LOG=info,smithay::xwayland=error
+export RUST_BACKTRACE=1
+unset DISPLAY
+unset WAYLAND_DISPLAY
+echo COMPFG-START
+cosmic-comp
+echo COMPFG-END-RC $?

@@ -1,0 +1,10 @@
+mkdir -p /run/user/0
+export XDG_RUNTIME_DIR=/run/user/0
+export RUST_LOG=info
+export RUST_BACKTRACE=1
+echo BUSRUN-START
+brush /usr/bin/dbus-run-session -- brush -c 'echo DBUS-CHILD-RAN; echo ADDR=$DBUS_SESSION_BUS_ADDRESS; echo PID=$DBUS_SESSION_BUS_PID' >/tmp/bus.log 2>&1
+echo BUSRUN-RC $?
+echo ===BUSLOG===
+cut -c1-110 /tmp/bus.log | tail -30
+echo ===BUSLOG-END===

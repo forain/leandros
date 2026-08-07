@@ -1,0 +1,11 @@
+[package]
+name = "hello-dyn-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hello-dyn-rs"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"

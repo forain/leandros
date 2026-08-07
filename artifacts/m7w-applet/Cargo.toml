@@ -1,0 +1,17 @@
+[package]
+name = "leandros-applet"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "leandros-applet"
+path = "src/main.rs"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+opt-level = 2

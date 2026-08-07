@@ -1,0 +1,61 @@
+# This tree holds authored sources, notes and harnesses only:
+# design docs, patches, build/run scripts, and the Rust code we wrote for
+# each experimentation lane. Vendored upstream trees (Mesa, musl, PipeWire,
+# COSMIC components, cargo-extracted crates, etc.) and build products
+# (binaries, sysroots, toolchains, staged images) are deliberately excluded
+# from this import and must be rebuilt from the recorded recipes (the
+# build-*.sh / *.md notes alongside them), not committed here.
+#
+# leandros is a Rust-only repo: C/C++ sources are out of scope here by
+# design and continue to live only in the untracked artifacts source tree
+# (~/code/leandros-artifacts) — don't reintroduce them via a future drop-in.
+*.c
+*.h
+*.cc
+*.cpp
+*.o
+*.a
+*.so
+*.so.*
+*.rlib
+
+# Build output / vendored / regenerable directories
+build/
+builddir/
+out/
+target/
+deps-*/
+sysroot/
+sysroot-*/
+stage-*/
+toolchain/
+logs/
+__pycache__/
+node_modules/
+vendor/
+rootfs/
+
+# Binary / image / archive / disk-image formats
+*.img
+*.iso
+*.fd
+*.tar
+*.tar.*
+*.tgz
+*.zip
+*.ppm
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bin
+*.log
+*.crate
+
+# Editor / OS temp files
+*.swp
+*.swo
+.DS_Store
+*~
+*.tmp
+*.bak

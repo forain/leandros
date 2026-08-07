@@ -1,0 +1,6 @@
+echo ===COSMIC-LOG-TAIL===
+tail -n 140 /tmp/cosmic.log | cut -c1-115
+echo ===COSMIC-LOG-END===
+echo ===WL-LOG===
+tail -n 25 /tmp/wl.log | cut -c1-115
+echo ===WL-LOG-END===

@@ -1,0 +1,53 @@
+#!/bin/sh
+# M7q isolated cosmic-panel probe: start cosmic-comp, then run cosmic-panel in
+# the FOREGROUND so its stderr (panic/backtrace) lands on the serial console
+# instead of being swallowed by launch_pad's captured pipe. Run as: sh /bin/probe-panel
+export XDG_RUNTIME_DIR=/run/user/0
+# Re-exec under a real D-Bus session (busd) if none is present, so cosmic-panel's
+# dbus proxies (workspaces, etc.) have a bus — matching the real launcher.
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+	exec /bin/sh /usr/bin/dbus-run-session -- /bin/sh /bin/probe-panel
+fi
+mkdir -p /run/user/0
+chmod 0700 /run/user/0 2>/dev/null || true
+export HOME=/root
+export XDG_CONFIG_HOME=/root/.config
+export XDG_CACHE_HOME=/root/.cache
+export XDG_DATA_HOME=/root/.local/share
+export XDG_DATA_DIRS=/usr/local/share:/usr/share
+export XDG_CONFIG_DIRS=/etc/xdg
+mkdir -p /root/.config /root/.cache /root/.local/share 2>/dev/null || true
+export PATH=/usr/bin:/bin
+export XDG_CURRENT_DESKTOP=COSMIC
+export XDG_SESSION_DESKTOP=COSMIC
+export XDG_SESSION_TYPE=wayland
+export COSMIC_BACKEND=kms
+export COSMIC_RENDER_DEVICE=226:0
+export GBM_ALWAYS_SOFTWARE=1
+export SMITHAY_USE_LEGACY=1
+export COSMIC_DISABLE_SYNCOBJ=1
+export COSMIC_DISABLE_DIRECT_SCANOUT=1
+export ICED_BACKEND=tiny-skia
+export XCURSOR_THEME=default
+export XCURSOR_SIZE=24
+export RUST_BACKTRACE=full
+export RUST_LOG=warn
+echo PROBE: starting cosmic-comp
+/bin/cosmic-comp --no-xwayland >/tmp/comp.log 2>&1 &
+# Wait (bounded busy-poll; no sleep binary) for the wayland socket to appear.
+i=0
+while [ ! -e /run/user/0/wayland-1 ]; do
+	i=$((i + 1))
+	if [ "$i" -gt 4000000 ]; then
+		echo PROBE: wayland-1 never appeared
+		break
+	fi
+done
+echo PROBE: wayland-1 present after $i
+# Extra settle so comp finishes advertising globals.
+j=0
+while [ "$j" -lt 3000000 ]; do j=$((j + 1)); done
+export WAYLAND_DISPLAY=wayland-1
+echo PROBE: launching cosmic-panel foreground
+/bin/cosmic-panel
+echo PROBE: cosmic-panel exited code $?

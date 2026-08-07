@@ -1,0 +1,19 @@
+#!/bin/sh
+# zig cc musl cross wrapper for x86_64-linux-musl.
+# Drops cc-rs's injected --target=... / "-target <t>" (zig rejects the 4-field
+# rust triple), drops -m64/-m32 (zig infers from -target), and normalizes
+# -Wl,--version-script <path> -> -Wl,--version-script=<path>. set -- keeps args
+# with spaces intact.
+n=$#
+while [ $n -gt 0 ]; do
+  a=$1; shift; n=$((n-1))
+  case $a in
+    --target=*) : ;;
+    -target) shift; n=$((n-1)) ;;
+    -m64|-m32) : ;;
+    -Wl,--version-script|-Wl,--dynamic-list)
+      b=$1; shift; n=$((n-1)); set -- "$@" "$a=$b" ;;
+    *) set -- "$@" "$a" ;;
+  esac
+done
+exec zig cc -target x86_64-linux-musl "$@"

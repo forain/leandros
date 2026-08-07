@@ -1,0 +1,13 @@
+mkdir -p /run/user/0
+export XDG_RUNTIME_DIR=/run/user/0
+export COSMIC_BACKEND=kms
+export SMITHAY_USE_LEGACY=1
+export ICED_BACKEND=tiny-skia
+export RUST_LOG=info,zbus=info,smithay=info
+export RUST_BACKTRACE=1
+unset DISPLAY
+unset WAYLAND_DISPLAY
+echo COMPRUN2-START
+cosmic-comp >/tmp/cosmic.log 2>&1 &
+echo COMPRUN2-BG-PID $!
+wait

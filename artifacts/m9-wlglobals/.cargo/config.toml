@@ -1,0 +1,21 @@
+# Dynamic musl link config for LeandrOS (m6-session-bins). Same recipe as
+# m3-gl-stack (zig ld.lld against merged sysroot; -crt-static + -pie => ET_DYN + PT_INTERP).
+[target.x86_64-unknown-linux-musl]
+linker = "/Users/forain/code/leandros-artifacts/m6-session-bins/toolchain/zig-ld-lld"
+rustflags = [
+  "-C", "linker-flavor=ld",
+  "-C", "target-feature=-crt-static",
+  "-C", "relocation-model=pic",
+  "-C", "link-self-contained=no",
+  "-C", "link-args=--sysroot=/Users/forain/code/leandros-artifacts/m3-gl-stack/sysroot-x86_64 --entry _start --build-id=none --eh-frame-hdr -znow -m elf_x86_64 --dynamic-linker /lib/ld-musl-x86_64.so.1 -pie -L/Users/forain/code/leandros-artifacts/m3-gl-stack/sysroot-x86_64/usr/lib /Users/forain/code/leandros-artifacts/m3-gl-stack/sysroot-x86_64/usr/lib/Scrt1.o /Users/forain/code/leandros-artifacts/m3-gl-stack/sysroot-x86_64/usr/lib/crti.o /Users/forain/code/leandros-artifacts/m3-gl-stack/sysroot-x86_64/usr/lib/crtn.o -lc",
+]
+
+[target.aarch64-unknown-linux-musl]
+linker = "/Users/forain/code/leandros-artifacts/m6-session-bins/toolchain/zig-ld-lld"
+rustflags = [
+  "-C", "linker-flavor=ld",
+  "-C", "target-feature=-crt-static",
+  "-C", "relocation-model=pic",
+  "-C", "link-self-contained=no",
+  "-C", "link-args=--sysroot=/Users/forain/code/leandros-artifacts/m3-gl-stack/sysroot-aarch64 --entry _start --build-id=none --eh-frame-hdr -znow -m aarch64linux --dynamic-linker /lib/ld-musl-aarch64.so.1 -pie -L/Users/forain/code/leandros-artifacts/m3-gl-stack/sysroot-aarch64/usr/lib /Users/forain/code/leandros-artifacts/m3-gl-stack/sysroot-aarch64/usr/lib/Scrt1.o /Users/forain/code/leandros-artifacts/m3-gl-stack/sysroot-aarch64/usr/lib/crti.o /Users/forain/code/leandros-artifacts/m3-gl-stack/sysroot-aarch64/usr/lib/crtn.o -lc",
+]

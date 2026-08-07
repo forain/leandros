@@ -1,0 +1,417 @@
+memfd: make the inode anonymous so the tmpfs slot is reclaimed
+
+TODO item 2. Three independent defects, one lane:
+
+  A. sys_memfd_create never unlinks its "/tmp/memfd:<name>" node, so every call
+     burns one of 128 MAX_TMP_FILES slots forever (shared across /tmp, /dev/shm
+     and /run/user). A wl_shm-pool-per-frame client bricks memfd_create
+     system-wide with ENOSPC after ~100 frames. MEASURED with the unlink backed
+     out: memfd_create returns ENOSPC (-28) at round 113 of 300, and the pool
+     exhaustion then takes down four later scmtest subtests as collateral.
+
+  B. tmpfile_owner_of() looks the fd up under the RAW pid while every other
+     fd-table entry point canonicalises to the TGID, so a memfd created or
+     mmap'd on a non-leader thread resolves to no slot at all. sys_mmap turns
+     that into ENOMEM -- the "Failed to create memory pool.: Create(Os { code:
+     12, kind: OutOfMemory })" panic of the smithay-clipboard thread in every
+     COSMIC session. Separate defect from (A); the errno rules out slot
+     exhaustion (that is ENOSPC 28), but (A) cannot land without it because an
+     unmarked memfd has no VMO and falls back to the 32 KiB inline path.
+
+  C. export_fd() takes no reference for a TmpFile in flight over SCM_RIGHTS.
+     Harmless while the name pins the inode; a use-after-free the moment (A)
+     makes the inode nameless, because Mesa's swrast path does
+     wl_shm_create_pool(fd) then close(fd) immediately, so the sender's last
+     descriptor is gone before the compositor's recvmsg installs it. MEASURED
+     with only the export_fd reference backed out: the receiver's mmap of the
+     imported fd reads a recycled slot and memfd_inflight_close fails.
+
+scmtest gains two subtests (26/0 -> 28/0): memfd_anonymous_reclaim proves the
+slot is really reclaimed (300 rounds > 2 * MAX_TMP_FILES, no manual unlink) and
+that ftruncate/mmap still work on a nameless fd; memfd_inflight_close pins the
+(C) window open deterministically with a second socketpair -- the child must
+close its fork-inherited copy of the memfd first, or the parent's close is not
+the last fd-table reference and tmp_release_ephemeral's table scan keeps the
+slot alive, which makes the subtest pass even without (C).
+
+diff --git a/kernel/src/syscall.rs b/kernel/src/syscall.rs
+index e1ea737..b6b537d 100644
+--- a/kernel/src/syscall.rs
++++ b/kernel/src/syscall.rs
+@@ -7130,20 +7130,29 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
+                     mm::gap2::set_watch_primary(g2_idx);
+                 }
+             }
+-            // KNOWN LEAK, deliberately not fixed here. A memfd should be an
+-            // ANONYMOUS inode that dies with its last fd; ours keeps its
+-            // "/tmp/memfd:<name>[:<seq>]" name forever, so every call burns one
+-            // of the 128 MAX_TMP_FILES slots permanently and a client that
+-            // allocates a wl_shm pool per frame bricks memfd_create system-wide
+-            // after ~100 frames. tmp_release_ephemeral already implements the
+-            // right lifetime ("a memfd whose name was unlinked while an fd
+-            // stayed open lands here on the final close") — but simply issuing
+-            // VFS_UNLINK here is NOT enough: with the name gone, the client's
+-            // next ftruncate/mmap of that fd fails ENOMEM ("Failed to create
+-            // memory pool") and takes the whole COSMIC session down, because
+-            // those paths still resolve the inode by name rather than through
+-            // the fd's VnodeKind::TmpFile { idx }. Fixing this means making
+-            // ftruncate + the K1 shared-VMO mmap path fd-resolved first.
++            // Drop the name immediately, exactly as the PRIME export node does
++            // (36f62d0): a memfd is an ANONYMOUS inode that dies with its last
++            // fd. The open fd holds the slot — tmp_drop_name sees it in
++            // tmp_open_fd_mask and marks the inode `ephemeral` rather than
++            // freeing it, and tmp_release_ephemeral collects it (and its VMO
++            // frames) on the final close. Without this every call burnt one of
++            // the 128 MAX_TMP_FILES slots forever and a client that allocates a
++            // wl_shm pool per frame bricked memfd_create system-wide (ENOSPC)
++            // after ~100 frames, across /tmp, /dev/shm and /run/user alike.
++            //
++            // The comment this replaces claimed the fd's later ftruncate/mmap
++            // still resolved the inode BY NAME and so would break. They do not:
++            // every fd-side operation keys off VnodeKind::TmpFile { idx } —
++            // handle_ftruncate, vmo_acquire_frames (via tmpfile_owner_of),
++            // read/write/lseek/fstat/fchmod/fchown, F_ADD_SEALS/F_GET_SEALS and
++            // the f*xattr family. The only by-name site is handle_open, and
++            // nothing ever reopens a memfd by name (tmp_find skips `ephemeral`,
++            // which is precisely the invisibility Linux gives a memfd). What
++            // that comment was really seeing was the ENOMEM from
++            // tmpfile_owner_of missing a non-leader thread's fd table — fixed
++            // in servers/vfs alongside this.
++            let unlink_msg = make_vfs_msg(vfs::VFS_UNLINK, &[path.as_ptr() as u64]);
++            let _ = vfs::handle(&unlink_msg, pid);
+         }
+         return fd;
+     }
+diff --git a/servers/vfs/src/lib.rs b/servers/vfs/src/lib.rs
+index be55a95..4622c0a 100644
+--- a/servers/vfs/src/lib.rs
++++ b/servers/vfs/src/lib.rs
+@@ -456,7 +456,20 @@ fn vmo_free_slot(owner: usize) {
+ 
+ /// Resolve `(pid, fd)` to the owning tmpfs slot index, or `None` if the fd is
+ /// not an open `TmpFile`.
++///
++/// `pid` is canonicalised to the TGID for the same reason `vfs_get_node_kind`
++/// does it: fd tables are per-process, not per-thread. Without this, every
++/// caller that hands us a bare `current_pid()` — `mark_memfd` and, fatally,
++/// `vmo_acquire_frames` — found no table at all on a non-leader thread.
++/// `sys_mmap` turns that `None` into ENOMEM, which is exactly the
++/// `Failed to create memory pool.: Create(Os { code: 12, kind: OutOfMemory })`
++/// that kills the `smithay-clipboard` thread in every COSMIC session: a spawned
++/// thread's `MultiPool::new` reaches `MmapMut::map_mut` on a memfd it created
++/// itself. `install_dmabuf_vmo` and `dmabuf_handle_of` already pass a TGID
++/// explicitly (the same lesson, learnt once in 36f62d0); `tgid_of` is
++/// idempotent, so they are unaffected.
+ fn tmpfile_owner_of(pid: u32, fd: usize) -> Option<usize> {
++    let pid = sched::tgid_of(pid);
+     let mut tbls = FD_TABLES.lock();
+     let tbl = find_tbl(pid, &mut *tbls)?;
+     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
+@@ -2144,6 +2157,59 @@ fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: u128) {
+     }
+ }
+ 
++// ── In-flight SCM_RIGHTS references on tmpfs slots ─────────────────────────────
++//
++// A tmpfs/memfd inode's lifetime is *table-scan driven*: it dies once no fd
++// table entry names its slot (`tmp_release_ephemeral`). A descriptor queued on
++// an AF_UNIX stream is in neither table — `export_fd` lifted it out of the
++// sender's and `import_fd` has not yet put it in the receiver's — so for the
++// length of that queue it is invisible to the scan.
++//
++// That was harmless while every memfd kept its name: a named inode is not
++// `ephemeral`, and `tmp_release_ephemeral` refuses to collect it. Now that
++// `sys_memfd_create` unlinks, the window is a genuine use-after-free — Mesa's
++// swrast path does `wl_shm_create_pool(fd)` then `close(fd)` immediately, so
++// the sender's last descriptor is gone well before cosmic-comp's recvmsg, and
++// the slot would be freed and handed to an unrelated file before the receiver's
++// `TmpFile { idx }` ever resolved.
++//
++// One counter per slot, incremented by `export_fd`, decremented by
++// `import_fd`/`drop_transfer`. Leaf lock: taken and released on its own, or
++// nested only under FD_TABLES — never while TMP_FILES is held.
++static TMP_INFLIGHT: Mutex<[u16; MAX_TMP_FILES]> = Mutex::new([0u16; MAX_TMP_FILES]);
++
++/// Take an in-flight reference if `kind` is a tmpfs fd. No-op otherwise.
++fn tmp_inflight_inc(kind: &VnodeKind) {
++    if let VnodeKind::TmpFile { idx, .. } = *kind {
++        if idx < MAX_TMP_FILES {
++            let mut f = TMP_INFLIGHT.lock();
++            f[idx] = f[idx].saturating_add(1);
++        }
++    }
++}
++
++/// Drop an in-flight reference taken by `tmp_inflight_inc`. In `import_fd` this
++/// must run *after* the descriptor is installed in the receiver's table, so the
++/// slot is never unreferenced for even an instant.
++fn tmp_inflight_dec(kind: &VnodeKind) {
++    if let VnodeKind::TmpFile { idx, .. } = *kind {
++        if idx < MAX_TMP_FILES {
++            let mut f = TMP_INFLIGHT.lock();
++            f[idx] = f[idx].saturating_sub(1);
++        }
++    }
++}
++
++/// Bitmask of tmpfs slots held by a queued SCM_RIGHTS descriptor.
++fn tmp_inflight_mask() -> u128 {
++    let f = TMP_INFLIGHT.lock();
++    let mut mask: u128 = 0;
++    for (i, &n) in f.iter().enumerate() {
++        if n > 0 { mask |= 1u128 << i; }
++    }
++    mask
++}
++
+ /// Bitmask of tmpfs pool slots still referenced by an open descriptor.
+ ///
+ /// Lock order is the established FD_TABLES → TMP_FILES, so callers must invoke
+@@ -2158,7 +2224,9 @@ fn tmp_open_fd_mask() -> u128 {
+             }
+         }
+     }
+-    mask
++    // A queued SCM_RIGHTS descriptor counts as a reference too: unlinking a slot
++    // that is only held in flight must mark it ephemeral, not free it.
++    mask | tmp_inflight_mask()
+ }
+ 
+ // ── Symlinks ─────────────────────────────────────────────────────────────────
+@@ -2345,11 +2413,18 @@ fn tmp_release_ephemeral(idx: usize) {
+             f.in_use && matches!(f.kind, VnodeKind::TmpFile { idx: i, .. } if i == idx)
+         })
+     });
++    // A descriptor queued on an AF_UNIX stream is in no fd table at all, so the
++    // scan above cannot see it. Read the in-flight count with FD_TABLES STILL
++    // HELD — releasing it first would let an `import_fd` land in between and be
++    // seen by neither check. Nesting stays FD_TABLES → TMP_INFLIGHT → TMP_FILES;
++    // the guard dies on this line, so TMP_INFLIGHT is never held across the
++    // TMP_FILES acquisition below.
++    let in_flight = idx < MAX_TMP_FILES && TMP_INFLIGHT.lock()[idx] > 0;
+     let mut tmp = TMP_FILES.lock();
+     // `ephemeral` also marks a hard-linked inode whose own name was unlinked
+     // while other names survive. Those are still reachable through an alias,
+     // so an fd going away must not collect them.
+-    if !still_referenced && tmp[idx].in_use && tmp[idx].ephemeral
++    if !still_referenced && !in_flight && tmp[idx].in_use && tmp[idx].ephemeral
+         && tmp_alias_count(&tmp[..], idx) == 0
+     {
+         // A memfd whose name was unlinked while an fd stayed open lands here on
+@@ -3625,9 +3700,14 @@ pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
+     };
+     // Second reference held by the queued descriptor: a pipe endpoint must not
+     // reach EOF/EPIPE just because the sender closed its fd before the peer
+-    // recv'd. No-op for every non-pipe kind (their lifetime is table-scan
+-    // driven — see `tmp_release_ephemeral`).
++    // recv'd.
+     pipe_ref_inc(&kind);
++    // Same reason for a tmpfs/memfd fd, and the reason this is no longer a
++    // no-op: its lifetime IS table-scan driven (`tmp_release_ephemeral`) and a
++    // queued descriptor is in no table, so without this the sender closing a
++    // now-anonymous memfd right after `wl_shm_create_pool` frees the slot before
++    // the receiver ever imports it.
++    tmp_inflight_inc(&kind);
+     Some(TransferFd { kind, flags })
+ }
+ 
+@@ -3639,15 +3719,19 @@ pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
+ pub fn import_fd(pid: u32, tf: TransferFd, cloexec: bool) -> isize {
+     let mut tbls = FD_TABLES.lock();
+     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => {
+-        drop(tbls); release_vnode(tf.kind, pid); return -24;
++        drop(tbls); tmp_inflight_dec(&tf.kind); release_vnode(tf.kind, pid); return -24;
+     }};
+     let slot = match tbl.alloc_fd() { Some(s) => s, None => {
+-        drop(tbls); release_vnode(tf.kind, pid); return -24; // EMFILE
++        drop(tbls); tmp_inflight_dec(&tf.kind); release_vnode(tf.kind, pid); return -24; // EMFILE
+     }};
+     let mut flags = tf.flags;
+     if cloexec { flags |= O_CLOEXEC; } else { flags &= !O_CLOEXEC; }
+     tbl.fds[slot] = FdEntry { kind: tf.kind, flags, in_use: true };
+     drop(tbls);
++    // Strictly after the install: the table entry is now the reference, so the
++    // slot is never momentarily unreferenced. Over-counting is safe here,
++    // under-counting frees the inode out from under the receiver.
++    tmp_inflight_dec(&tf.kind);
+     // [GAP2] SCM_RIGHTS hand-off of a tmpfs/memfd fd — this is exactly the
+     // Wayland wl_shm pool arriving in the compositor. If `idx` here does not
+     // match the sender's, or the kind is not TmpFile, the receiver's mmap will
+@@ -3670,6 +3754,7 @@ pub fn import_fd(pid: u32, tf: TransferFd, cloexec: bool) -> isize {
+ /// exactly as a close would. Linux closes SCM_RIGHTS fds that don't fit the
+ /// receiver's control buffer, and drops queued fds when the socket dies.
+ pub fn drop_transfer(tf: TransferFd) {
++    tmp_inflight_dec(&tf.kind);
+     release_vnode(tf.kind, 0);
+ }
+ 
+diff --git a/userland/scmtest/src/main.rs b/userland/scmtest/src/main.rs
+index 628ab4b..d0ed877 100644
+--- a/userland/scmtest/src/main.rs
++++ b/userland/scmtest/src/main.rs
+@@ -652,6 +652,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const
+     if !test_close_while_mapped() { failures += 1; }
+     if !test_ftruncate_grow_shrink() { failures += 1; }
+     if !test_teardown_loop() { failures += 1; }
++    if !test_memfd_anonymous_reclaim() { failures += 1; }
++    if !test_memfd_inflight_close() { failures += 1; }
+ 
+     // ── K1-C: AF_UNIX VFS socket nodes, tmpfs mounts, cap raise, fd-cap ──────
+     if !test_socket_node_roundtrip() { failures += 1; }
+@@ -1254,6 +1256,156 @@ unsafe fn test_teardown_loop() -> bool {
+     report(name, ok && i == 150)
+ }
+ 
++/// TODO item 2: a memfd must be an ANONYMOUS inode. Three claims, one loop.
++///
++/// (a) The "/tmp/memfd:<name>" node is unlinked at creation, so it is invisible
++///     to stat/lookup — Linux semantics, and what `sys_memfd_create`'s old
++///     comment claimed would break everything.
++/// (b) ftruncate and MAP_SHARED still work on the now-nameless fd. That is the
++///     exact failure that comment predicted, so this is the assertion retiring
++///     it.
++/// (c) The pool slot is RECLAIMED on the final close. Before the fix each call
++///     burnt one of the 128 MAX_TMP_FILES slots forever and this loop died with
++///     ENOSPC well short of 300. `teardown_loop` above cannot catch that: it
++///     unlinks every node by hand, which is exactly what userspace does not do
++///     and cannot do for an fd it received over SCM_RIGHTS.
++unsafe fn test_memfd_anonymous_reclaim() -> bool {
++    let name = b"memfd_anonymous_reclaim\0";
++    const ROUNDS: usize = 300; // > 2 * MAX_TMP_FILES
++
++    // (a) the backing name must not resolve while the fd is open.
++    let probe = raw_memfd_create(b"anonprobe\0".as_ptr(), 0);
++    if probe < 0 { dbg0(b"[anon] probe memfd_create failed\n\0"); return report(name, false); }
++    let (st, _mode) = raw_stat_mode(b"/tmp/memfd:anonprobe\0".as_ptr());
++    let nameless = st < 0;
++    dbg1(b"[anon] stat(/tmp/memfd:anonprobe) = %d (want < 0)\n\0", st as i64);
++    close(probe);
++
++    let mut ok = nameless;
++    let mut i = 0usize;
++    while ok && i < ROUNDS {
++        let mut nm = [0u8; 32];
++        build_name(&mut nm, b"anon", i);
++        let mfd = raw_memfd_create(nm.as_ptr(), 0);
++        if mfd < 0 {
++            dbg2(b"[anon] memfd_create FAILED at i=%d errno=%d (slot leak)\n\0",
++                 i as i64, get_errno() as i64);
++            ok = false;
++            break;
++        }
++        // (b) both of these resolve the inode through VnodeKind::TmpFile { idx },
++        // never by name — a nameless inode must serve them unchanged.
++        if raw_ftruncate(mfd, 8192) != 0 {
++            dbg2(b"[anon] ftruncate FAILED at i=%d errno=%d\n\0", i as i64, get_errno() as i64);
++            close(mfd);
++            ok = false;
++            break;
++        }
++        let m = mmap(core::ptr::null_mut(), 8192, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
++        if m as usize == MAP_FAILED {
++            dbg2(b"[anon] mmap FAILED at i=%d errno=%d\n\0", i as i64, get_errno() as i64);
++            close(mfd);
++            ok = false;
++            break;
++        }
++        let tag = (i & 0xFF) as u8;
++        *m = tag;
++        *m.add(8191) = !tag;
++        if *m != tag || *m.add(8191) != !tag {
++            dbg1(b"[anon] content mismatch at i=%d\n\0", i as i64);
++            munmap(m, 8192);
++            close(mfd);
++            ok = false;
++            break;
++        }
++        munmap(m, 8192);
++        close(mfd); // (c) no unlink — the kernel already dropped the name
++        i += 1;
++    }
++    dbg1(b"[anon] completed %d iterations\n\0", i as i64);
++    report(name, ok && i == ROUNDS)
++}
++
++/// The sender may close its memfd the instant it has been handed to SCM_RIGHTS:
++/// Mesa's swrast path does exactly `wl_shm_create_pool(fd); close(fd);`. Once
++/// the inode is nameless, the ONLY thing keeping the pool slot alive between
++/// `sendmsg` and the peer's `recvmsg` is the in-flight reference `export_fd`
++/// takes — a queued TmpFile is in no fd table, so the table scan in
++/// `tmp_release_ephemeral` cannot see it.
++///
++/// The second socketpair makes the ordering deterministic instead of hoping the
++/// scheduler produces it: the child does not enter `recvmsg` until the parent
++/// has already closed its last descriptor.
++unsafe fn test_memfd_inflight_close() -> bool {
++    let name = b"memfd_inflight_close\0";
++    let mut sp = [0i32; 2];
++    let mut sync = [0i32; 2];
++    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sp.as_mut_ptr()) != 0 {
++        dbg0(b"[inflight] socketpair failed\n\0");
++        return report(name, false);
++    }
++    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sync.as_mut_ptr()) != 0 {
++        dbg0(b"[inflight] sync socketpair failed\n\0");
++        close(sp[0]); close(sp[1]);
++        return report(name, false);
++    }
++    let (a, b) = (sp[0], sp[1]);
++    let (sa, sb) = (sync[0], sync[1]);
++
++    let mfd = raw_memfd_create(b"scm-inflight\0".as_ptr(), 0);
++    if mfd < 0 || raw_ftruncate(mfd, 4096) != 0 {
++        dbg0(b"[inflight] memfd setup failed\n\0");
++        close(a); close(b); close(sa); close(sb);
++        return report(name, false);
++    }
++    // Stamp the pattern and drop the mapping: after this only the fd refers to
++    // the inode, so the close below really is the last reference.
++    let pm = mmap(core::ptr::null_mut(), 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
++    if pm as usize == MAP_FAILED {
++        dbg0(b"[inflight] parent mmap failed\n\0");
++        close(mfd); close(a); close(b); close(sa); close(sb);
++        return report(name, false);
++    }
++    for j in 0..4096usize { *pm.add(j) = 0xA5u8 ^ (j & 0xFF) as u8; }
++    munmap(pm, 4096);
++
++    let pid = fork();
++    if pid == 0 {
++        close(a); close(sa);
++        // Drop the copy of `mfd` this child inherited across fork, BEFORE the
++        // parent is allowed to proceed. Without it the parent's close is not
++        // the last fd-table reference: `tmp_release_ephemeral`'s table scan
++        // still sees this entry, refuses to collect the slot, and the hazard
++        // window never opens — the subtest then passes even with the in-flight
++        // refcount removed (measured: it did).
++        close(mfd);
++        let mut go = [0u8; 1];
++        if read(sb, go.as_mut_ptr(), 1) != 1 { exit(3); } // parent has closed mfd
++        let (_n, _f, rfd, _cl) = recv_fd_and_byte(b, 32, 0);
++        if rfd < 0 { dbg0(b"[inflight:child] no SCM_RIGHTS fd\n\0"); exit(2); }
++        let cm = mmap(core::ptr::null_mut(), 4096, PROT_READ | PROT_WRITE, MAP_SHARED, rfd, 0);
++        if cm as usize == MAP_FAILED { dbg0(b"[inflight:child] mmap failed\n\0"); exit(4); }
++        let mut good = true;
++        for j in (0..4096usize).step_by(97) {
++            if *cm.add(j) != 0xA5u8 ^ (j & 0xFF) as u8 { good = false; break; }
++        }
++        munmap(cm, 4096);
++        close(rfd);
++        exit(if good { 0 } else { 1 });
++    }
++
++    close(b); close(sb);
++    let sret = send_fd_and_byte(a, mfd, b'I');
++    close(mfd);                  // last reference gone; only in-flight left
++    write(sa, b"g".as_ptr(), 1); // only now may the child recv
++    let mut status: i32 = -1;
++    wait4(pid, &mut status, 0, core::ptr::null_mut());
++    dbg2(b"[inflight] sendmsg=%d child status=%d (0 = pattern survived)\n\0",
++         sret as i64, status as i64);
++    close(a); close(sa);
++    report(name, sret > 0 && status == 0)
++}
++
+ // ── K1-C: AF_UNIX VFS socket nodes, tmpfs mounts, cap raise, queued-fd cap ───
+ 
+ /// Full pathname-socket roundtrip at `name` (NUL-terminated `cpath` names the

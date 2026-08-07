@@ -1,0 +1,12 @@
+[package]
+name = "hashprobe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hashprobe"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = 2

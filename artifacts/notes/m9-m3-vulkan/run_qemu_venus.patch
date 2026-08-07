@@ -1,0 +1,85 @@
+diff --git a/scripts/run-qemu.sh b/scripts/run-qemu.sh
+index 666f98c..dc1f950 100755
+--- a/scripts/run-qemu.sh
++++ b/scripts/run-qemu.sh
+@@ -15,6 +15,11 @@ ARCH="x86_64"
+ # --hvf (force HVF even off Apple Silicon, where it will fail to launch).
+ ACCEL=""
+ QEMU_EXTRA_ARGS=()
++# Venus (Vulkan over virtio-gpu) mode. Opt-in only, via --venus below or
++# LEANDROS_VENUS=1 for harnesses that cannot pass a flag. See the --venus block
++# after the display selection for what it changes and why it never autodetects.
++VENUS=0
++if [ "${LEANDROS_VENUS:-0}" = "1" ]; then VENUS=1; fi
+ 
+ # Hardware acceleration only applies when the guest architecture matches the
+ # host's — a hypervisor virtualises, it does not translate. Map uname's arch
+@@ -77,6 +82,7 @@ while [[ "$#" -gt 0 ]]; do
+         --hvf) ACCEL="hvf"; shift ;;
+         --kvm) ACCEL="kvm"; shift ;;
+         --tcg) ACCEL="tcg"; shift ;;
++        --venus) VENUS=1; shift ;;
+         -d) QEMU_EXTRA_ARGS+=("$2"); shift 2 ;;
+         *) QEMU_EXTRA_ARGS+=("$1"); shift ;;
+     esac
+@@ -196,6 +202,51 @@ if [ "$OS" != "Darwin" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}"
+     fi
+ fi
+ 
++# q35 adds a default std-VGA adapter that would become the primary display, so
++# the x86_64 UEFI path suppresses it and lets virtio-vga be the sole device.
++# Venus is the one case that wants it back (see below); nothing else changes it.
++X86_UEFI_VGA_ARGS=(-vga none)
++
++# Venus needs one specific device line, and every way of getting it wrong fails
++# silently rather than loudly — a non-GL device, a -display that gets overridden,
++# a QEMU built without virglrenderer, and a macOS host all produce a guest that
++# merely reports "no Venus capset". So --venus never autodetects and never
++# degrades: it either produces the proven line or refuses with the reason.
++if [ "$VENUS" = "1" ]; then
++    if [ "$OS" = "Darwin" ]; then
++        echo "❌ --venus needs a host EGL implementation; macOS has none, so"
++        echo "   virtio-gpu-gl-pci,venus=on cannot initialise. Use the Linux box."
++        exit 1
++    fi
++    if [ "$BOOT_MODE" = "raspi4b" ]; then
++        echo "❌ --venus is meaningless with --raspi4b: that board has no PCI bus and"
++        echo "   the raspi4b command line attaches no GPU device at all."
++        exit 1
++    fi
++    if ! $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-gpu-gl-pci; then
++        echo "❌ --venus needs virtio-gpu-gl-pci, which this $QEMU_SYSTEM does not"
++        echo "   provide (a QEMU built without virglrenderer). Fix the host QEMU."
++        exit 1
++    fi
++    # -nographic implies -display none and silently wins over any -display
++    # earlier on the command line, killing Venus with no diagnostic whatsoever.
++    case " ${QEMU_EXTRA_ARGS[*]} " in
++        *" -nographic "*)
++            echo "❌ --venus is incompatible with -nographic: it implies -display none and"
++            echo "   silently overrides -display egl-headless. Drop it — this script already"
++            echo "   uses -serial mon:stdio."
++            exit 1 ;;
++    esac
++    # hostmem= backs the host-visible blob window Mesa's Venus ring maps.
++    GPU_DEV="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G"
++    GL_ARGS=("-display" "egl-headless")
++    # On x86_64/UEFI, let q35's default std-VGA back in: it gives OVMF/Limine a
++    # GOP while the GL device rides alongside as the Venus device. That is the
++    # archived, proven-to-boot layout. Only this path drops `-vga none`.
++    X86_UEFI_VGA_ARGS=()
++    echo "🌋 Venus: -device $GPU_DEV -display egl-headless"
++fi
++
+ 
+ # ── Network backend ─────────────────────────────────────────────────────────
+ #
+@@ -361,7 +412,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
+             -device virtio-blk-pci,drive=data0 \
+             -drive if=none,id=data1,format=raw,file="$DATA1_IMG" \
+             -device virtio-blk-pci,drive=data1 \
+-            -vga none -device "$GPU_DEV" \
++            "${X86_UEFI_VGA_ARGS[@]}" -device "$GPU_DEV" \
+             "${GL_ARGS[@]}" \
+             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
+             -device virtio-net-pci,netdev=net0 "${NETDEV_ARGS[@]}" -no-reboot)

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Leandros Applet
+Comment=Minimal wl_shm panel applet (LeandrOS milestone stand-in)
+Type=Application
+Exec=/bin/leandros-applet
+Icon=application-default-icon
+Terminal=false
+Categories=COSMIC;
+X-CosmicApplet=true
+NoDisplay=true

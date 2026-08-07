@@ -1,0 +1,16 @@
+[package]
+name = "m7repro"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "m7repro"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+panic = "abort"

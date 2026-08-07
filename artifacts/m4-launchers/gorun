@@ -1,0 +1,5 @@
+mkdir -p /run/user/0
+export ANVIL_DRM_DEVICE=/dev/dri/card0
+export SMITHAY_USE_LEGACY=1
+export XDG_RUNTIME_DIR=/run/user/0
+anvil --tty-udev >/tmp/anvil.log 2>&1

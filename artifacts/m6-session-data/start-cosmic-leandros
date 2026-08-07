@@ -1,0 +1,157 @@
+#!/bin/sh
+# start-cosmic-leandros — LeandrOS launcher for the COSMIC session (M6 DRAFT).
+#
+# Replaces cosmic-epoch/cosmic-session/data/start-cosmic. The upstream script is
+# bash and assumes systemd/systemctl, a login-shell re-exec, and gnome-keyring;
+# none of those exist on LeandrOS. This is a stripped POSIX-sh equivalent that is
+# brush-safe: no bashisms, no `sleep`, no `mkfifo`/FIFO, no login-shell recursion.
+#
+# Readiness is NOT handled here. cosmic-session blocks internally on a socketpair
+# rendezvous with cosmic-comp (COSMIC_SESSION_SOCK -> SetEnv{WAYLAND_DISPLAY});
+# dbus-run-session blocks on busd via busy-poll-on-a-regular-file. Neither needs
+# a sleep binary or a FIFO.
+#
+# Run as root after login (getty -> login -> this). All values below are
+# overridable from the environment; the defaults target a single-GPU QEMU guest.
+set -eu
+
+# ---- runtime dir (wayland socket + dbus socket live here) -------------------
+# cosmic-comp creates $XDG_RUNTIME_DIR/wayland-N; dbus-run-session puts its
+# socket here too. Must be a writable 0700 tmpfs owned by the session uid.
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR
+if [ ! -d "$XDG_RUNTIME_DIR" ]; then
+	mkdir -p "$XDG_RUNTIME_DIR"
+fi
+chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+
+# ---- HOME / XDG dirs --------------------------------------------------------
+# cosmic-config does fs::create_dir_all($XDG_CONFIG_HOME/cosmic/...) at startup;
+# it FAILS (NoConfigDirectory) if neither HOME nor XDG_CONFIG_HOME is set. Most
+# components then fall back to compiled defaults, but persisting state (bg,
+# panel, workspaces) needs a writable config dir. Give it one.
+: "${HOME:=/root}"
+export HOME
+: "${XDG_CONFIG_HOME:=$HOME/.config}"
+: "${XDG_CACHE_HOME:=$HOME/.cache}"
+: "${XDG_DATA_HOME:=$HOME/.local/share}"
+# cosmic-bg persists per-output wallpaper state via cosmic-config's *state*
+# helper, which resolves against XDG_STATE_HOME — without the directory every
+# save_state() logs "No such file or directory (os error 2)".
+: "${XDG_STATE_HOME:=$HOME/.local/state}"
+# System data/config search paths: icon themes, /usr/share/backgrounds, .desktop
+# files, and cosmic-config *system defaults* (/usr/share/cosmic/<name>/vN/<key>)
+# are all resolved from these.
+: "${XDG_DATA_DIRS:=/usr/local/share:/usr/share}"
+: "${XDG_CONFIG_DIRS:=/etc/xdg}"
+export XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_DATA_DIRS XDG_CONFIG_DIRS
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" 2>/dev/null || true
+
+# ---- PATH -------------------------------------------------------------------
+# cosmic-session spawns its children (cosmic-panel, cosmic-settings-daemon,
+# cosmic-bg, …) by BARE NAME via its own ProcessManager, which does a Rust
+# std::process PATH lookup that DOES fall through every ':'-separated entry. The
+# session binaries live in /bin, so PATH MUST cover /bin (not just /usr/bin) for
+# those internal spawns to resolve. (brush's own exec PATH-search does NOT fall
+# through /usr/bin→/bin — that is why this launcher hands brush FULL PATHS below
+# and relies on PATH only for cosmic-session's internal spawns.)
+: "${PATH:=/usr/bin:/bin}"
+case ":$PATH:" in *:/usr/bin:*) : ;; *) PATH="/usr/bin:$PATH" ;; esac
+case ":$PATH:" in *:/bin:*)     : ;; *) PATH="$PATH:/bin"     ;; esac
+export PATH
+
+# ---- system D-Bus alias -----------------------------------------------------
+# LeandrOS runs no system D-Bus broker (no systemd, no logind/locale1/upower).
+# Alias the system bus to the session bus so zbus Connection::system() gets a
+# working connection: the system *services* are still absent, and every COSMIC
+# component degrades per-name (a warn, a never-firing signal stream) — the
+# graceful path they already implement for minimal distros. Without this,
+# Connection::system() fails at connect() and cosmic-settings-daemon's theme
+# watcher errors out and retries in a loop (it needs watch_time_changes(),
+# which opens a system-bus connection). The session busd listens on the fixed
+# path $XDG_RUNTIME_DIR/bus (see /usr/share/dbus-1/session.conf).
+export DBUS_SYSTEM_BUS_ADDRESS="${DBUS_SYSTEM_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+# ---- desktop identity -------------------------------------------------------
+export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-COSMIC}"
+export XDG_SESSION_DESKTOP="${XDG_SESSION_DESKTOP:-COSMIC}"
+export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
+
+# ---- compositor backend selection -------------------------------------------
+# cosmic-comp's auto-detect picks x11/winit when DISPLAY or WAYLAND_DISPLAY is
+# set. On bare KMS both MUST be unset, and we force kms explicitly so a leaked
+# var can't send it down the nested path.
+unset DISPLAY || true
+unset WAYLAND_DISPLAY || true
+export COSMIC_BACKEND="${COSMIC_BACKEND:-kms}"
+# Primary DRM render node (major:minor). virtio-gpu's card0 is 226:0 on the
+# QEMU guest; cosmic-comp opens it directly. This exact value is what the M5f
+# bring-up used when the compositor first presented on both arches.
+export COSMIC_RENDER_DEVICE="${COSMIC_RENDER_DEVICE:-226:0}"
+
+# ---- renderer: force software (no GPU GL for the toolkit + scanout) ---------
+# There is no hardware GL on the QEMU guest, so every rendering path must be
+# CPU/software: GBM must hand out software buffers, smithay must use the legacy
+# (non-atomic) KMS path, and the syncobj / direct-scanout fast paths (which need
+# real DRM features we don't emulate) must be disabled. These five together are
+# the proven-good M5f compositor configuration that presented on both arches.
+export GBM_ALWAYS_SOFTWARE="${GBM_ALWAYS_SOFTWARE:-1}"
+# The card now implements atomic KMS, and atomic is the ONLY smithay path
+# that can program a cursor plane (the legacy backend clears the cursor and
+# overlay plane lists outright), so leave it unset by default. Export
+# SMITHAY_USE_LEGACY=1 before starting the session to fall back to the
+# known-good legacy path while debugging.
+if [ -n "${SMITHAY_USE_LEGACY:-}" ]; then
+	export SMITHAY_USE_LEGACY
+fi
+export COSMIC_DISABLE_SYNCOBJ="${COSMIC_DISABLE_SYNCOBJ:-1}"
+# NOT COSMIC_DISABLE_DIRECT_SCANOUT: in smithay that clears FrameFlags::
+# ALLOW_SCANOUT, which is a union INCLUDING ALLOW_CURSOR_PLANE_SCANOUT, so it
+# silently disables the cursor plane as well as overlays (cosmic-comp
+# backend/kms/surface/mod.rs:716 -> smithay drm/compositor/mod.rs:1038,3038).
+# Disable only the overlay planes, which is what we actually need off.
+export COSMIC_DISABLE_OVERLAY_SCANOUT="${COSMIC_DISABLE_OVERLAY_SCANOUT:-1}"
+if [ -n "${COSMIC_DISABLE_DIRECT_SCANOUT:-}" ]; then
+	export COSMIC_DISABLE_DIRECT_SCANOUT
+fi
+# libcosmic/iced applets (panel, notifications, launcher, osd, app-library) must
+# use the tiny-skia CPU backend on LeandrOS.
+export ICED_BACKEND="${ICED_BACKEND:-tiny-skia}"
+
+# ---- cursor (optional; embedded fallback cursor renders even with no theme) --
+export XCURSOR_THEME="${XCURSOR_THEME:-default}"
+export XCURSOR_SIZE="${XCURSOR_SIZE:-24}"
+
+# ---- logging (verbose for bring-up; lower to info/warn once stable) ---------
+export RUST_LOG="${RUST_LOG:-info}"
+export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
+
+# ---- launch -----------------------------------------------------------------
+# cosmic-session owns the session bus name com.system76.CosmicSession, so it
+# needs a session bus. If one is already provided, use it; otherwise spin up busd
+# via dbus-run-session (which exports DBUS_SESSION_BUS_ADDRESS for all children).
+#
+# cosmic-session takes "[COMPOSITOR] [ARGS...]" as its own argv (main.rs:123-126)
+# and passes ARGS straight through to the compositor. We spawn cosmic-comp with
+# --no-xwayland: Xwayland is not shipped and /tmp/.X11-unix is absent by design,
+# and smithay's Xwayland-socket bind-error path leaks fds -> EMFILE -> a softpipe
+# NULL-transfer crash at first scanout (root-caused in M5f). --no-xwayland avoids
+# that path entirely.
+#
+# dbus-run-session and this launcher are POSIX-sh SCRIPTS. The LeandrOS kernel
+# execve()s ELF only -- it has NO "#!"-shebang binfmt -- so a script can never be
+# exec'd directly; it must be handed to the shell as an argument. brush is
+# installed as /bin/sh, so we invoke dbus-run-session as `sh <script>` rather
+# than relying on shebang interpretation. (This launcher itself is likewise run
+# as `sh /bin/start-cosmic-leandros`.)
+# FULL PATHS for every binary brush itself exec's: brush's exec PATH-search does
+# NOT fall through /usr/bin→/bin, so a bare `cosmic-session` fails even though it
+# is on PATH. cosmic-session (/bin) and cosmic-comp (/bin) are addressed by
+# absolute path; cosmic-session then spawns cosmic-comp via its own PATH-aware
+# ProcessManager, but the absolute path is accepted there too. dbus-run-session
+# lives at /usr/bin and is a script, so it is handed to `sh` explicitly.
+if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+	exec /bin/cosmic-session /bin/cosmic-comp --no-xwayland
+else
+	exec /bin/sh /usr/bin/dbus-run-session -- /bin/cosmic-session /bin/cosmic-comp --no-xwayland
+fi
