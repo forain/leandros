@@ -451,7 +451,7 @@ the panel still connecting to the notifications daemon). It does not reproduce t
 does not contradict it. The bounded-not-climbing property rests on the `drmsmoke` cycles,
 which did exercise the path.
 
-**Instrument reliability — read this before trusting a number.** **Twenty-two** separate
+**Instrument reliability — read this before trusting a number.** **Twenty-three** separate
 instruments have now produced believable wrong numbers, or would have. They are grouped by
 failure class rather than listed in order of discovery, because the class is what
 generalises; the specifics are what make each one actionable.
@@ -577,6 +577,22 @@ generalises; the specifics are what make each one actionable.
     **background its work early**, while the console is still responsive.
 18. `driver.py cmd`'s shell-prompt heuristic swallowing error lines on TCG x86_64, where the
     guest is slow enough for the heuristic to break early.
+23. **A single sample cannot tell "the pixels never arrive" from "the pixels had not arrived
+    yet" — and it produced a confident, geometrically perfect FALSE FAILURE.** The aarch64 M4
+    run 1 sampled each hold once, at +6 s, and **failed** phase B — having caught a solid
+    rectangle of `vkwl`'s *previous* frame colour at **exactly** the right geometry: 151,868 px,
+    478x318, fill 0.9991. Every structural check passed; only the colour was a frame stale, so
+    the failure looked like a real one. The cause is a sentinel meaning less than it appears:
+    **`HOLD READY seq=N` means the client returned from `vkQueuePresentKHR`, not that the
+    compositor composited and flipped.** The client bursts its frames in seconds while the
+    compositor is still draining. Fixed by sampling a *series* rather than a point, which
+    converts the ambiguity into a number: in run 2 the window is **absent from the screen
+    entirely** at +6 s and correct at +26 s. Run 1 is committed unedited, because a
+    well-formed false failure is worth more in the record than a quiet re-run.
+    **Open, ~1 line:** that harness's `HOLD_RE` can match a line only *partly* arrived over the
+    8-byte-at-a-time serial link — it matched `secs=1` in run 2 phase C and zeroed that hold's
+    sampling budget. It passed on sample #1 anyway, but it would otherwise have scored a hold
+    it never sampled. Anchor the regex on a line end.
 22. **`git add` skips ignored paths silently, so a commit can look complete while dropping
     exactly the evidence it exists to preserve.** `artifacts/.gitignore` excluded `*.png` and
     `*.log` to keep build output out and swept up every capture with it. `dc013c0` committed
@@ -641,7 +657,7 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | # | Item | Category | State |
 |---|---|---|---|
 | 1 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — **no action** | Recorded on purpose; fix undecided |
-| 2 | M4 — **pixels PROVEN on x86_64**; aarch64 has Vulkan-to-scanout but not WSI | Feature — **x86_64 DONE** | Photographed (`132d4df`, `dc013c0`); aarch64 WSI left |
+| 2 | M4 — **COMPLETE, photographed on BOTH arches** | Feature — **DONE** | `132d4df` x86_64, `d91edbf` aarch64 |
 | 3 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | Nothing scheduled |
 | 4 | fb console scrolled the scanout out from under cosmic-comp | Bug — **FIXED** `edad115` | Follow-up: drmsmoke drives no real atomic commit |
 | 5 | Deferred work and known limitations | Mixed | Backlog |
@@ -733,8 +749,27 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
    x86_64's M4. `vkwl` on aarch64 remains unrun, and **n = 1** — one boot, not repeated.
    Also unverified: the box did not rebuild its kernel, so this ran against a kernel predating
    `883e33d`; immaterial here (that commit only touched `readlinkat`) but stated rather than
-   assumed. **What is left for M4 on aarch64 is the WSI half**, and its cost is now known to
-   be COSMIC's, not Vulkan's.
+   assumed.
+
+   **★ AND THE WSI HALF IS NOW DONE TOO — M4 IS COMPLETE ON BOTH ARCHES** (`991151f`,
+   `d91edbf`). `vkwl` reaches `vkQueuePresentKHR` on aarch64 inside a **full COSMIC session**
+   and its pixels are photographed. `vkCreateSwapchainKHR` → `VK_SUCCESS`, 480x320, 5 images,
+   `requested=28 acquired=28 presented=28`, exit 0. 28 frames was chosen because
+   `28 ≡ 4 mod 6`, putting the last two on `cols[2]`/`cols[3]` — **the same two colours
+   x86_64 used**, so the censuses compare directly. Criteria were committed *before* the first
+   capture (`artifacts/notes/m9-vkwl-aarch64/precommit-pass-criteria.txt`) and added one
+   x86_64 did not have: both colours must land in the **same** bbox.
+   Result: control **0 / 0**; seq 26 **151,868** `0x2666f2`; seq 27 **151,868** `0xf2cc19`;
+   bbox 401..878 × 128..445 = 478x318, fill **0.9991**, 98.87% of extent, 0 byte-swapped, 0
+   uncovered. **Every comparable number is identical to x86_64's**, and aarch64's seq 27 is
+   *cleaner* — zero residue of `cols[2]` where x86_64 had 14,750. Re-censused here
+   independently. Cross-feet: all six cycle colours zero in the control, and the panel clock
+   reads 00:00:47 / 00:02:40 / 00:05:14 across the three captures, so they are three distinct
+   live frames.
+   **The "impractically slow" blocker was wrong by three orders of magnitude, and had never
+   been measured at all.** Host-side, from sentinel arrival: launch → `wayland-1` bound is
+   **1 s** standalone and **2 s** for the full session; `vkwl` start → 28th present ~3-6 s.
+   The whole cost is the compositor *settling*, 6-26 s from present sentinel to pixels.
 3. **If a permanent Vulkan-Wayland test is wanted, write it in Rust — but NOT the way this
    file previously prescribed, because that recipe cannot work.** `vkwl.c` stays outside the
    repo, at `~/code/leandros-artifacts/venus-lane/vkwl.c` on the host (and on the box), and is
