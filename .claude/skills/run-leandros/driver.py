@@ -2,7 +2,7 @@
 """LeandrOS QEMU driver for agent interaction.
 
 Usage:
-  driver.py start [aarch64|x86_64] [mode]   Launch QEMU, wait for shell prompt
+  driver.py start [aarch64|x86_64] [mode] [--venus]   Launch QEMU, wait for shell prompt
   driver.py cmd "<command>"           Send shell command, print output
   driver.py screenshot [out.ppm]      Capture GPU framebuffer via monitor
   driver.py stop                      Quit QEMU cleanly
@@ -14,6 +14,20 @@ boots with HVF acceleration automatically (fixed 2026-07-15). Pass "uefi-tcg"
 to force software emulation instead, or "uefi-hvf" to force HVF even on a
 non-Apple-Silicon host (where it will fail to launch). "direct" and
 "raspi4b" remain TCG-only regardless of host.
+
+`--venus` (any position after `start`): boots the exact
+`virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G` device line proven by
+`scripts/run-qemu.sh --venus` (landed b2260b4), under `-display egl-headless`
+instead of the default `-display none`. UEFI boot modes only — refused on
+"direct"/"raspi4b" and on macOS (no host EGL; verify on the Linux box).
+`cmd_screenshot`'s bare `screendump` (no `device=`) already works unchanged in
+this mode and returns a valid PPM. Passing `device=` was tried and initially
+failed with `DeviceNotFound` — QMP resolves `device=` as a qdev id, and the
+device line above carries no `id=`. Adding `,id=venusgpu` makes `device=`
+resolve, but only before a frame is presented; once one is, it fails with
+`"no surface"` instead, because a virgl-backed scanout has no `DisplaySurface`
+for QMP to dump. Bare `screendump` sidesteps both failure modes, which is why
+`cmd_screenshot` stays unchanged here.
 
 All paths relative to the repo root (three levels up from this file).
 """
@@ -74,6 +88,13 @@ X86_64_VARS_PATHS = [
     "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd",
     "/usr/share/OVMF/OVMF_VARS.fd",
 ]
+
+# Venus (Vulkan over virtio-gpu) device line. Must stay byte-identical to
+# run-qemu.sh's --venus block (landed b2260b4) — that is the exact line
+# measured to work (venustest 68/68, vktest 0 failures, both arches), and any
+# drift here would silently break it. hostmem= backs the host-visible blob
+# window Mesa's Venus ring maps.
+VENUS_GPU_DEV = "virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G"
 
 
 def _host_arch():
@@ -211,7 +232,18 @@ def _audiodev_args():
     return ["-audiodev", "none,id=snd0"]
 
 
-def _build_cmd(arch, mode="uefi"):
+def _build_cmd(arch, mode="uefi", venus=False):
+    if venus:
+        # Mirrors run-qemu.sh's --venus guards: it never autodetects and never
+        # degrades, because every way of getting this wrong (wrong boot mode,
+        # wrong host) fails silently rather than loudly downstream (a guest
+        # that merely reports "no Venus capset", or a screendump that comes
+        # back blank).
+        if mode not in ("uefi", "uefi-hvf", "uefi-tcg"):
+            sys.exit(f"ERROR: --venus only supports UEFI boot modes (got mode={mode!r})")
+        if sys.platform == "darwin":
+            sys.exit("ERROR: --venus needs a host EGL implementation; macOS has none, so "
+                      "virtio-gpu-gl-pci,venus=on cannot initialise. Use the Linux box.")
     if mode == "direct":
         return _build_direct_cmd(arch)
     if mode == "raspi4b":
@@ -246,6 +278,10 @@ def _build_cmd(arch, mode="uefi"):
         disk    = os.path.join(REPO_ROOT, "leandros-limine-aarch64.img")
         data0   = os.path.join(REPO_ROOT, "f2fs-data0-aarch64.img")
         data1   = os.path.join(REPO_ROOT, "f2fs-data1-aarch64.img")
+        # venus=False (the default) is byte-identical to the pre-venus command:
+        # virtio-gpu-pci under -display none.
+        gpu_dev = VENUS_GPU_DEV if venus else "virtio-gpu-pci"
+        display_arg = "egl-headless" if venus else "none"
         return [
             "qemu-system-aarch64",
             "-machine", "virt,gic-version=2", "-smp", "4", *cpu_flags, "-m", "2G",
@@ -258,7 +294,7 @@ def _build_cmd(arch, mode="uefi"):
             "-device", "virtio-blk-pci,drive=data0,disable-legacy=on",
             "-drive", f"if=none,id=data1,format=raw,file={data1}",
             "-device", "virtio-blk-pci,drive=data1,disable-legacy=on",
-            "-device", "virtio-gpu-pci",
+            "-device", gpu_dev,
             "-device", "virtio-keyboard-pci",
             "-device", "virtio-tablet-pci",
             *_audiodev_args(),
@@ -266,7 +302,7 @@ def _build_cmd(arch, mode="uefi"):
             "-device", "virtio-net-pci,netdev=net0,disable-legacy=on",
             *_netdev_args(),
             "-no-reboot", "-parallel", "none",
-            "-display", "none",
+            "-display", display_arg,
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
             "-serial", "chardev:serial0",
             "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
@@ -292,6 +328,16 @@ def _build_cmd(arch, mode="uefi"):
                 if not os.path.exists(vars_fd):
                     shutil.copyfile(vars_tpl, vars_fd)
                 vars_args = ["-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}"]
+        # venus=False (the default) is byte-identical to the pre-venus command:
+        # -vga none + virtio-vga under -display none. In venus mode, drop -vga
+        # none and let q35's implicit std-VGA back in — screendump's bare form
+        # (no device=) captures THAT surface, since the GL device has none of
+        # its own to dump (see VENUS_GPU_DEV above, and the module docstring's
+        # `--venus` section for why `device=` isn't used instead). Matches
+        # run-qemu.sh's --venus resetting X86_UEFI_VGA_ARGS to empty.
+        vga_args = [] if venus else ["-vga", "none"]
+        gpu_args = ["-device", VENUS_GPU_DEV] if venus else ["-device", "virtio-vga"]
+        display_arg = "egl-headless" if venus else "none"
         return [
             "qemu-system-x86_64",
             "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", *cpu_flags, "-m", "2G",
@@ -304,7 +350,7 @@ def _build_cmd(arch, mode="uefi"):
             "-device", "virtio-blk-pci,drive=data0",
             "-drive", f"if=none,id=data1,format=raw,file={data1}",
             "-device", "virtio-blk-pci,drive=data1",
-            "-vga", "none", "-device", "virtio-vga",
+            *vga_args, *gpu_args,
             "-device", "virtio-keyboard-pci",
             "-device", "virtio-tablet-pci",
             *_audiodev_args(),
@@ -312,7 +358,7 @@ def _build_cmd(arch, mode="uefi"):
             "-device", "virtio-net-pci,netdev=net0",
             *_netdev_args(),
             "-no-reboot", "-parallel", "none",
-            "-display", "none",
+            "-display", display_arg,
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
             "-serial", "chardev:serial0",
             "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
@@ -480,7 +526,7 @@ def _read_serial_until(sentinel, timeout=120, at_prompt=False):
     return None
 
 
-def cmd_start(arch="aarch64", mode="uefi"):
+def cmd_start(arch="aarch64", mode="uefi", venus=False):
     if _qemu_pid() is not None:
         print("QEMU already running. Run 'stop' first.")
         sys.exit(1)
@@ -488,7 +534,7 @@ def cmd_start(arch="aarch64", mode="uefi"):
     _cleanup_socks()
     open(SERIAL_LOG, "wb").close()
 
-    qemu_cmd = _build_cmd(arch, mode)
+    qemu_cmd = _build_cmd(arch, mode, venus=venus)
     # Debug escape hatch: extra QEMU args, e.g.
     #   LEANDROS_QEMU_EXTRA='-trace enable=virtio_snd_*,file=/tmp/t.log'
     extra = os.environ.get("LEANDROS_QEMU_EXTRA")
@@ -513,7 +559,7 @@ def cmd_start(arch="aarch64", mode="uefi"):
     with open(PID_FILE, "w") as f:
         f.write(str(proc.pid))
 
-    print(f"Launching QEMU (PID {proc.pid}, arch={arch})...")
+    print(f"Launching QEMU (PID {proc.pid}, arch={arch}{', venus' if venus else ''})...")
 
     # Wait for socket file. Report failure loudly rather than a started
     # guest: a missing/broken pflash file (the aarch64_vars.fd gap this fixes)
@@ -544,7 +590,7 @@ def cmd_start(arch="aarch64", mode="uefi"):
         time.sleep(0.1)
 
     # Only now is it true that a guest actually started.
-    print(f"QEMU started (PID {proc.pid}, arch={arch})")
+    print(f"QEMU started (PID {proc.pid}, arch={arch}{', venus' if venus else ''})")
     print("Serial socket up. Waiting for login/shell prompt (up to 120s)...")
     # "> " used to be a sentinel here; it matched the boot log's own
     # "[INPUT] -> keyboard (event0)" and declared the guest ready ~40 s into a
@@ -777,6 +823,13 @@ def cmd_screenshot(outfile=None):
         sys.exit("ERROR: QEMU not running.")
     if outfile is None:
         outfile = "/tmp/leandros-screen.ppm"
+    # Deliberately bare (no device=): under a --venus session this captures
+    # the primary console (q35's implicit std-VGA, since venus mode drops -vga
+    # none) and gives a valid non-blank PPM. Passing device=<gl-dev-id> fails
+    # too — DeviceNotFound without an id= on the device line, "no surface"
+    # once a frame is presented if one is added — see the module docstring's
+    # `--venus` section. This is already correct for the non-venus default
+    # path too, so no branching here.
     _monitor_send(f"screendump {outfile}", timeout=15)
     if os.path.exists(outfile):
         sz = os.path.getsize(outfile)
@@ -900,9 +953,14 @@ if __name__ == "__main__":
 
     sub = args[0]
     if sub == "start":
-        arch = args[1] if len(args) > 1 else "aarch64"
-        mode = args[2] if len(args) > 2 else "uefi"
-        cmd_start(arch, mode)
+        # --venus is a flag, not positional, so it can land anywhere after
+        # "start" (e.g. "start x86_64 --venus" or "start --venus x86_64
+        # uefi-tcg") without disturbing the arch/mode positions.
+        venus = "--venus" in args[1:]
+        positional = [a for a in args[1:] if not a.startswith("--")]
+        arch = positional[0] if len(positional) > 0 else "aarch64"
+        mode = positional[1] if len(positional) > 1 else "uefi"
+        cmd_start(arch, mode, venus=venus)
     elif sub == "cmd":
         if len(args) < 2:
             sys.exit("Usage: driver.py cmd <shell-command> [timeout_seconds]")
