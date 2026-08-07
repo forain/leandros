@@ -16,18 +16,18 @@ non-Apple-Silicon host (where it will fail to launch). "direct" and
 "raspi4b" remain TCG-only regardless of host.
 
 `--venus` (any position after `start`): boots the exact
-`virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G` device line proven by
-`scripts/run-qemu.sh --venus` (landed b2260b4), under `-display egl-headless`
-instead of the default `-display none`. UEFI boot modes only — refused on
-"direct"/"raspi4b" and on macOS (no host EGL; verify on the Linux box).
-`cmd_screenshot`'s bare `screendump` (no `device=`) already works unchanged in
-this mode and returns a valid PPM. Passing `device=` was tried and initially
-failed with `DeviceNotFound` — QMP resolves `device=` as a qdev id, and the
-device line above carries no `id=`. Adding `,id=venusgpu` makes `device=`
-resolve, but only before a frame is presented; once one is, it fails with
-`"no surface"` instead, because a virgl-backed scanout has no `DisplaySurface`
-for QMP to dump. Bare `screendump` sidesteps both failure modes, which is why
-`cmd_screenshot` stays unchanged here.
+`virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,id=venusgpu` device line proven
+by `scripts/run-qemu.sh --venus` (landed b2260b4), under `-display
+egl-headless` instead of the default `-display none`. UEFI boot modes only —
+refused on "direct"/"raspi4b" and on macOS (no host EGL; verify on the Linux
+box). `cmd_screenshot`'s bare `screendump` (no `device=`) already works
+unchanged in this mode and returns a valid PPM. Passing `device=venusgpu` now
+resolves — the device line used to carry no `id=`, and QMP resolves `device=`
+as a qdev id, so it failed with `DeviceNotFound` outright — but only before a
+frame is presented; once one is, it fails with `"no surface"` instead,
+because a virgl-backed scanout has no `DisplaySurface` for QMP to dump. That
+remaining failure mode is why `cmd_screenshot` stays on bare `screendump`
+here rather than targeting `device=venusgpu`.
 
 All paths relative to the repo root (three levels up from this file).
 """
@@ -94,7 +94,7 @@ X86_64_VARS_PATHS = [
 # measured to work (venustest 68/68, vktest 0 failures, both arches), and any
 # drift here would silently break it. hostmem= backs the host-visible blob
 # window Mesa's Venus ring maps.
-VENUS_GPU_DEV = "virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G"
+VENUS_GPU_DEV = "virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,id=venusgpu"
 
 
 def _host_arch():
@@ -825,11 +825,12 @@ def cmd_screenshot(outfile=None):
         outfile = "/tmp/leandros-screen.ppm"
     # Deliberately bare (no device=): under a --venus session this captures
     # the primary console (q35's implicit std-VGA, since venus mode drops -vga
-    # none) and gives a valid non-blank PPM. Passing device=<gl-dev-id> fails
-    # too — DeviceNotFound without an id= on the device line, "no surface"
-    # once a frame is presented if one is added — see the module docstring's
-    # `--venus` section. This is already correct for the non-venus default
-    # path too, so no branching here.
+    # none) and gives a valid non-blank PPM. Passing device=venusgpu now
+    # resolves (the device line carries id=venusgpu), but still fails once a
+    # frame is presented — "no surface", because a virgl-backed scanout has
+    # no DisplaySurface for QMP to dump — see the module docstring's `--venus`
+    # section. This is already correct for the non-venus default path too, so
+    # no branching here.
     _monitor_send(f"screendump {outfile}", timeout=15)
     if os.path.exists(outfile):
         sz = os.path.getsize(outfile)

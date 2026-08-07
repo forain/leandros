@@ -238,7 +238,7 @@ if [ "$VENUS" = "1" ]; then
             exit 1 ;;
     esac
     # hostmem= backs the host-visible blob window Mesa's Venus ring maps.
-    GPU_DEV="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G"
+    GPU_DEV="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,id=venusgpu"
     GL_ARGS=("-display" "egl-headless")
     # On x86_64/UEFI, let q35's default std-VGA back in: it gives OVMF/Limine a
     # GOP while the GL device rides alongside as the Venus device. That is the
