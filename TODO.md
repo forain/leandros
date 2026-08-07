@@ -207,7 +207,7 @@ fill-buffer, compute and graphics work, `vkswap` drives a headless-surface swapc
 real DRM scanout.
 
 **Suite baselines.** On fresh images with `vfstest` run exactly once per image, both
-arches: vfstest **36/0**, scmtest **32/0**, drmsmoke **22/0**, wakepolltest 10/0,
+arches: vfstest **36/0**, scmtest **32/0**, drmsmoke **25/0** (was 22/0 — `CONSOLE_YIELDS_TO_SCANOUT`, `FB0_SHOWS_SCANOUT` and companion added with `edad115`), wakepolltest 10/0,
 forktest 3/0, epolltest **10/0** (was 9/0 — `proc_pid_exe` added with the
 `/proc/<pid>/exe` fix), polltest 6/0, sigtest 6/0, timertest 6/0, memtest 4/0,
 idletest 2/0 (`IDLE_CPU_US 0`), evtest2 8/0. `waittest` has **4** subtests and is **4/0 or
@@ -643,7 +643,7 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 1 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — **no action** | Recorded on purpose; fix undecided |
 | 2 | M4 — **pixels PROVEN on x86_64**; aarch64 has Vulkan-to-scanout but not WSI | Feature — **x86_64 DONE** | Photographed (`132d4df`, `dc013c0`); aarch64 WSI left |
 | 3 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | Nothing scheduled |
-| 4 | **fb console scrolls the scanout out from under cosmic-comp** | Bug — **actionable** | Measured; fix belongs in the kernel |
+| 4 | fb console scrolled the scanout out from under cosmic-comp | Bug — **FIXED** `edad115` | Follow-up: drmsmoke drives no real atomic commit |
 | 5 | Deferred work and known limitations | Mixed | Backlog |
 
 ### Next steps, in the order they are worth doing
@@ -799,9 +799,53 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
    the client `quiet` would restore the wallpaper, push fill ≥ 0.95 and drop the held count
    toward the extent was **confirmed on all three counts**, and the single 31 px residue band
    left in capture C is exactly the two console lines legible at the bottom of that frame.
-   **The fix belongs in the kernel** — stop painting the fb console once a DRM master owns the
-   scanout — **not in silencing clients.** Any guest program that writes to the console during
-   a session currently corrupts the display.
+   **FIXED (`edad115`), and the root cause was deeper than this item described.**
+   The fb console and the DRM scanout **are the same buffer**: `drivers/src/kms.rs:163-169`
+   points `BOOT_FB`/`KERNEL_FB` at the RAM surface backing virtio-gpu resource 1, and both
+   present paths resolve their destination from that same `get_hardware_fb_info()`. So
+   `scroll_vector` (`drivers/src/framebuffer.rs:621`) memmoves the compositor's scanout.
+   **A gate already existed and failed two independent ways.** It fired on a *hardcoded ioctl
+   list* — `cmd == 0x1001 || 0x1004 || 0xC06864A2 || 0xC01864B0` — which **never included
+   `DRM_IOCTL_MODE_ATOMIC` (`0xC03864BC`)**. Since `6edc295` made COSMIC take the atomic path,
+   an atomic compositor scanned out with the console **fully live**: that is the reported bug,
+   and it was a gap in an allow-list rather than a missing feature. Separately,
+   `interface.release()` fired on *any* card0 close and reclaim does `fb.clear(0)` plus a
+   banner, so a short-lived second open of card0 wiped a live compositor.
+   **The fix claims the console from the present itself, not from an ioctl number.**
+   `SCANOUT_WRITES` (`drivers/src/drm/device.rs:11`, bumped at `:363` and `:437` — exactly
+   where a client writes the shared surface) is sampled across each dispatch by `handle_ioctl`
+   (`drivers/src/drm_device_interface.rs:2008`, `:2098`), which then calls
+   `drm_scanout_claim(open_id)`; ownership lives in `framebuffer.rs:674-762`. **A present path
+   added later is covered without being listed anywhere** — which is precisely the failure mode
+   of the list it replaces. Known cost, documented in the commit: two card0 opens issuing
+   ioctls concurrently on two vCPUs can misattribute a present, costing the console one early
+   close; a KMS master is single here, and threading `open_id` through would remove even that
+   at ~9 signatures.
+   **A second, unrelated bug fell out:** `/dev/fb0` read the *wrong buffer* on x86_64. KMS
+   repoints `BOOT_FB`/`KERNEL_FB` to a RAM surface (virtio-gpu cannot DMA from OVMF's VGA VRAM
+   BAR) but never told the VFS, so reads returned a frozen snapshot of the boot console
+   (`servers/vfs/src/lib.rs:1524`, `drivers/src/kms.rs:170`).
+   **Falsified by mutation, both arches**, via new `drmsmoke` subtest
+   `CONSOLE_YIELDS_TO_SCANOUT` — take the scanout, fingerprint through `/dev/fb0`, open+close
+   a second card0 fd, print 160 lines, fingerprint again, require byte-identity. Same test
+   binary both builds; only the kernel gate differs. Gate removed: aarch64
+   `12209877486060206593 → 2373313276106322956` FAIL, x86_64
+   `617618239335486853 → 16756505720239424604` FAIL. Gate present: identical, PASS. The
+   `before` values match across builds, so the divergence is the provocation and not drift.
+   **What still works, checked:** boot messages (owner is 0 until a client presents; console
+   text visible at login on both arches); console reclaim on session exit (**byte-identical**
+   control↔fixed, aarch64 md5 `675b0773…`, x86_64 `ff004561…`). Panics force-reclaim before
+   printing (`kernel/src/main.rs:655`, two atomic stores, no locks, since the panicking thread
+   may hold `KERNEL_FB`) — **argued from construction, not exercised**, as there was no way to
+   panic on demand. It is nonetheless strictly better than before, when a panic during a DRM
+   session reached serial only.
+   **The guard's honest limit, and the obvious next step.** With the whole gate removed it
+   fails on both arches, but its *trigger* is the reclaim-scoping half: a hypothetical fix that
+   only added `ATOMIC` to the old allow-list would still fail it, while one that only scoped
+   reclaim would **pass**. `drmsmoke` never drives a real atomic commit. `std_handle_atomic`
+   takes a hand-built request with compile-time property ids (plane 30, `FB_ID` 42, `CRTC_ID`
+   41, `SRC_*` 43-46, `CRTC_*` 47-50) and no modeset, so a plane-only commit is ~30 lines in
+   `drmsmoke` and would close the gap.
 
 ---
 
@@ -1006,14 +1050,31 @@ that work is done; the `bo_dumb`/`bo_bhnd` census fields are the detector.
 Design, staging and per-stage guard tests with their falsifying mutations:
 `artifacts/notes/m9-crossopen-dmabuf/crossopen_design.md`.
 
-### 4. The fb console scrolls the scanout out from under cosmic-comp
+### 4. The fb console scrolled the scanout out from under cosmic-comp — FIXED
 
-Full measurement, prediction and confirmation are in **next-step 4** above; this heading
-exists so the item has a home in the numbered list. One line for anyone scanning: **any guest
-program that writes to the console during a live COSMIC session corrupts the display**,
-because the fb console scrolls the entire framebuffer — including the region the compositor
-is scanning out — and the compositor only repaints damage. Fix in the kernel: stop painting
-the fb console once a DRM master owns the scanout.
+Root cause, fix, mutation evidence and the guard's limit are all in **next-step 4** above.
+One paragraph for anyone scanning: the fb console and the DRM scanout **are the same buffer**,
+so console scrolling memmoved the compositor's pixels and the compositor — repainting only
+damage — never restored them. A gate existed but keyed on a **hardcoded ioctl allow-list that
+omitted `DRM_IOCTL_MODE_ATOMIC`**, so it stopped working the moment `6edc295` moved COSMIC to
+the atomic path; reclaim was also unscoped, letting any second card0 close wipe a live
+session. `edad115` claims the console from *the present itself* (a `SCANOUT_WRITES` counter
+sampled across each dispatch) rather than from an ioctl number, so future present paths are
+covered without being enumerated.
+
+**Two instrument facts worth carrying forward, both counter-intuitive.** First, **`screendump`
+cannot see this bug at all**: `DIRTYFB` points the virtio scanout at the client's own resource
+(`Virtio::flush` switches scanout on id change), so corruption of resource 1 stays off-camera.
+The in-guest `/dev/fb0` census is the only instrument that can see it — a case where the
+*better* camera is blind and the crude one is not. Second, the plumbing self-check
+`FB0_SHOWS_SCANOUT` **reported FAIL on x86_64 on its first run** and caught the census reading
+a stale buffer; without it, x86_64 would have returned a **vacuous PASS in both builds** —
+identical fingerprints because nothing was being read, indistinguishable from the fix working.
+That self-check is what forced the `/dev/fb0` fix, and it is the reason the x86_64 number can
+be quoted at all.
+
+**Still open:** `drmsmoke` drives no real atomic commit, so the new guard cannot distinguish a
+fix that only scoped reclaim from the full one. ~30 lines closes it; details in next-step 4.
 
 ### 5. Deferred work and known limitations
 
