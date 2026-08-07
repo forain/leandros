@@ -190,15 +190,29 @@ inferred is that the input held a rect of ≥ 1,809,216 px.
 
 Facts that future work depends on and should not have to re-derive.
 
-**Goal.** Run the COSMIC desktop environment *essentially unmodified* (source:
+**Goal.** Run the COSMIC desktop environment **totally unmodified** (source:
 `../cosmic-epoch`) on both x86_64 and aarch64 under QEMU; build-configuration flags
-(`--no-default-features`) are allowed. **"No COSMIC source patches" was stated as an absolute
-and is not true of the tree** — `ports/cosmic-session/0001-env_rx-timeout-fallback.patch` and
-`ports/cosmic-greeter/0001-locker-idle-without-logind.patch` both exist and are applied, and
-the session one fires every boot. The intent — do not fork COSMIC to make it work — still
-holds and is worth holding; state it as **two patches, both recorded in `ports/`, each needing
-a justification**, rather than as zero. An absolute that a `ls` refutes gets discarded
-wholesale by the next reader. Everything beneath COSMIC — kernel, libc,
+(`--no-default-features`) are allowed.
+
+**The policy, stated exactly, because the previous wording was an absolute that the tree
+refuted.** *Temporary* edits to COSMIC source **are allowed, for investigation and discovery
+only** — prints, counters, panics, anything that localises a fault. They **must be reverted**
+before the work lands, and the revert must be **proven, not asserted**:
+`git -C ../cosmic-epoch status --porcelain` empty, submodules likewise (pinned at
+`epoch-1.3.0`). A reverted tree with an instrumented binary still staged in the image is worse
+than either, so rebuild from clean source before shipping. **Record what the instrumentation
+taught you in `artifacts/notes/`** — a finding whose only evidence was a deleted `eprintln!`
+is a finding nobody can re-check. **Any permanent fix belongs on the LeandrOS side** — kernel,
+shims, or our own launcher — never in COSMIC.
+
+**Two PERMANENT patches currently violate this and need resolving**, rather than being quietly
+tolerated: `ports/cosmic-session/0001-env_rx-timeout-fallback.patch` and
+`ports/cosmic-greeter/0001-locker-idle-without-logind.patch`. (`ports/busd/current-thread-runtime.patch`
+is fine — busd is ours.) The session one **fires every boot** — `handshake did not complete`,
+so every session runs on a 5 s fallback and no child receives cosmic-comp's exported
+environment — and its recorded root cause, "a tokio-integration residual", is **asserted, not
+demonstrated**. Under this policy that patch is a standing debt with an unproven
+justification: root-cause it and fix it on our side, or demonstrate why it cannot be. Everything beneath COSMIC — kernel, libc,
 system libraries, daemons — is ours. **This constraint stays load-bearing**: the missing
 dmabuf global is behind cosmic-comp's `!is_software` gate (item 3), and the reachable
 outcome there is a measurement, not a patch. The one place it looked like it would force an
@@ -677,6 +691,7 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 8 | Nothing to launch, and no way to ask for it | Feature — **config DONE** `52665aa` | Keybinding table staged; still no terminal to launch |
 | 9 | **9 panel applets have no scoped-out dependency and are simply unbuilt** | Feature — cheap | Build recipe exists; spawn path proven |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
+| 11 | **Two PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — **actionable** | `env_rx` fires every boot; cause asserted, not shown |
 | 1 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — **no action** | Recorded on purpose; fix undecided |
 | 2 | M4 — **COMPLETE, photographed on BOTH arches** | Feature — **DONE** | `132d4df` x86_64, `d91edbf` aarch64 |
 | 3 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | Nothing scheduled |
@@ -917,6 +932,34 @@ feature gate); unlike the daemon, the portal actually *uses* the streams, so the
 stub would not suffice. The committed architecture already names reference `dbus-daemon` as
 the fallback if busd proves immature — **this is the decision point that would trigger it.**
 
+### 11. Two permanent COSMIC source patches — the goal is totally unmodified
+
+Policy is in *Goal* (Standing context): **temporary debug edits to COSMIC are allowed and
+encouraged**; permanent ones are not, and every permanent fix belongs on the LeandrOS side.
+These two are permanent and must be retired or justified.
+
+**`ports/cosmic-session/0001-env_rx-timeout-fallback.patch` — the real one.** It races
+`env_rx` against a 5 s timeout and falls back to `WAYLAND_DISPLAY=wayland-1`. It **fires every
+boot** (`handshake did not complete`), so **no child process ever receives the environment
+cosmic-comp exports** — every one launches with only `WAYLAND_DISPLAY=wayland-1
+XDG_SESSION_TYPE=wayland`. That is a live functional difference on every session, not a
+cosmetic patch, and its recorded cause — "a tokio-integration residual" — is **asserted, never
+demonstrated**. **Root-cause it on our side.** The handshake is a socket exchange over
+`COSMIC_SESSION_SOCK`; the plausible failure surfaces are our `SCM_RIGHTS`/`AF_UNIX`
+implementation, `socketpair` semantics, or fd inheritance across `execve` — all ours, all
+testable in `scmtest` (currently **32/0**), which is where a guard for it would live.
+**Worth suspecting a shared cause with item 6:** a session whose env handshake never completes
+and a compositor that ignores input are both "cosmic-comp is running but not talking to
+anything", and it would be a mistake to assume they are unrelated before checking.
+
+**`ports/cosmic-greeter/0001-locker-idle-without-logind.patch` — the cheap one.** Makes the
+greeter idle instead of locking at boot, in the absence of logind. greetd + cosmic-greeter are
+**explicitly out of scope**, so the honest resolution is probably to stop shipping
+cosmic-greeter at all rather than to carry a patch for a component we do not want — which
+would also remove one of the 12 launched processes. Check what else expects it first.
+
+(`ports/busd/current-thread-runtime.patch` is **not** in scope here — busd is ours.)
+
 ### Ordering, and why
 
 1. **Item 6 (input)** first, unconditionally. Windows already map, composite, stack and draw a
@@ -940,6 +983,13 @@ the fallback if busd proves immature — **this is the decision point that would
   residual") is asserted, not demonstrated. The *intent* — don't fork COSMIC to make it work —
   is clearly still honoured; the claim of zero patches is what is false. **Second absolute rule
   in one day that a two-command check refutes** (the first was "the repo is Rust-only").
+  **Resolved as policy, not by dropping the rule** (see *Goal* in Standing context): temporary
+  debug edits to COSMIC are **allowed and encouraged** for investigation, and must be reverted
+  with the revert *proven* by a clean `git -C ../cosmic-epoch status --porcelain`. The end
+  state is totally unmodified COSMIC. That makes these two patches a **standing debt with a
+  deadline rather than a grey area** — the greeter one is scoped-out territory and cheap to
+  argue, but the session one is load-bearing, fires every boot, and has an unproven cause. It
+  becomes **item 11**.
 - **`cosmic-session` is built `--no-default-features`, which switches off `autostart`** as well
   as systemd/logind. The XDG autostart scan is compiled out, not merely inert.
 - **The deferred-list entry claiming synthetic sysfs has "no current consumer"** is at best
