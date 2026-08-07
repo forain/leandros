@@ -1749,17 +1749,30 @@ pub fn drm_event_seq() -> u64 {
     DELIVERED_SEQ.load(Ordering::Relaxed)
 }
 
+extern "C" {
+    /// Monotonic nanoseconds since boot, sub-tick resolution, never decreasing —
+    /// forwarded from the arch crate (`drivers` sits below it in the dependency
+    /// graph and cannot call `timer::monotonic_ns` directly; same symbol
+    /// `evdev-server` uses for input event timestamps).
+    fn arch_monotonic_ns() -> u64;
+}
+
 /// Queue a FLIP_COMPLETE event for throttled delivery. Called from the PAGE_FLIP
 /// ioctl (syscall context — a normal lock is fine; `drm_tick` uses try_lock).
 fn queue_flip_event(crtc_id: u32, user_data: u64) {
     let seq = FLIP_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-    let now = sched::ticks(); // 100 Hz monotonic
+    // Sub-tick-resolution timestamp (interpolated inside the current 100 Hz
+    // tick from the arch's free-running counter) rather than the raw tick
+    // count — smithay reads this for presentation feedback, and a 10 ms-
+    // granular clock reports an identical time for every flip in the same
+    // tick.
+    let now_ns = unsafe { arch_monotonic_ns() };
     let ev = drm_event_vblank {
         ev_type: DRM_EVENT_FLIP_COMPLETE,
         length: 32,
         user_data,
-        tv_sec: (now / 100) as u32,
-        tv_usec: ((now % 100) * 10_000) as u32,
+        tv_sec: (now_ns / 1_000_000_000) as u32,
+        tv_usec: ((now_ns / 1_000) % 1_000_000) as u32,
         sequence: seq,
         crtc_id,
     };

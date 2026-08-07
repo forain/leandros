@@ -357,6 +357,30 @@ fn report(name: &[u8], ok: bool) -> bool {
     ok
 }
 
+// Prints "<label><v>\n" in decimal — used by FLIP_TS_SUBTICK to put the raw
+// observed tv_sec/tv_usec values in the serial log so a human can see the
+// actual numbers, not just PASS/FAIL.
+unsafe fn print_dec(label: &[u8], v: u64) {
+    write(1, label.as_ptr() as *const c_void, label.len());
+    let mut buf = [0u8; 20];
+    let mut n = 0usize;
+    let mut x = v;
+    if x == 0 {
+        buf[0] = b'0';
+        n = 1;
+    } else {
+        while x > 0 {
+            buf[n] = b'0' + (x % 10) as u8;
+            n += 1;
+            x /= 10;
+        }
+    }
+    let mut out = [0u8; 20];
+    for i in 0..n { out[i] = buf[n - 1 - i]; }
+    write(1, out.as_ptr() as *const c_void, n);
+    write(1, b"\n".as_ptr() as *const c_void, 1);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0i32;
@@ -538,6 +562,61 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     let read_ok = rn == 32 && ev.ev_type == DRM_EVENT_FLIP_COMPLETE
         && ev.length == 32 && ev.user_data == magic;
     if !report(b"READ_FLIP_EVENT", read_ok) { failures += 1; }
+
+    // FLIP_TS_SUBTICK — proves the flip-event timestamp is actually being
+    // built from the interpolated arch_monotonic_ns() clock (queue_flip_event
+    // in drivers/src/drm_device_interface.rs) and not the old coarse 100 Hz
+    // tick. Reuses the PAGE_FLIP_EVENT -> POLL_CARD0_READABLE -> READ_FLIP_EVENT
+    // machinery above, just driven several times in a row.
+    //
+    // The discriminator: under the OLD code, tv_usec = (ticks % 100) * 10_000,
+    // so it could only ever land on one of 100 values — an EXACT multiple of
+    // 10_000 — by construction. Under the NEW sub-tick code it should land on
+    // arbitrary microsecond values instead.
+    //
+    // STATISTICAL CAVEAT (do not invert this logic): a genuine sub-tick
+    // timestamp CAN legitimately land on an exact multiple of 10_000 by pure
+    // chance (~1 in 10_000 per sample). A single non-multiple sample proves
+    // liveness; a single multiple sample proves nothing either way. That is
+    // why this drives several flips and passes on ANY non-multiple sample
+    // rather than requiring ALL samples to be non-multiples: with 8+
+    // independent samples, an ALL-multiples result is overwhelming evidence
+    // the old tick-derived code is still what's running, not bad luck
+    // (chance of that happening under genuinely live sub-tick timestamps is
+    // roughly 1 in 10_000^8).
+    const FLIP_TS_SAMPLES: usize = 8;
+    let mut subtick_all_read_ok = true;
+    let mut subtick_seen = false;
+    for i in 0..FLIP_TS_SAMPLES {
+        let mut sflip = DrmModeCrtcPageFlip::default();
+        sflip.crtc_id = 1;
+        sflip.fb_id = fb.fb_id;
+        sflip.flags = DRM_MODE_PAGE_FLIP_EVENT;
+        sflip.user_data = magic.wrapping_add(i as u64 + 1);
+        let sflip_ok = ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &mut sflip as *mut _) == 0;
+
+        let mut spfd = pollfd { fd, events: POLLIN, revents: 0 };
+        let spoll_rc = poll(&mut spfd as *mut _, 1, 500);
+        let spoll_ok = spoll_rc == 1 && (spfd.revents & POLLIN) != 0;
+
+        let mut sev = DrmEventVblank::default();
+        let srn = read(fd, &mut sev as *mut _ as *mut c_void, core::mem::size_of::<DrmEventVblank>());
+        let sread_ok = srn == 32 && sev.ev_type == DRM_EVENT_FLIP_COMPLETE
+            && sev.length == 32 && sev.user_data == sflip.user_data;
+
+        if !sflip_ok || !spoll_ok || !sread_ok {
+            subtick_all_read_ok = false;
+            continue;
+        }
+
+        print_dec(b"  FLIP_TS_SUBTICK tv_sec=", sev.tv_sec as u64);
+        print_dec(b"  FLIP_TS_SUBTICK tv_usec=", sev.tv_usec as u64);
+        if sev.tv_usec % 10_000 != 0 {
+            subtick_seen = true;
+        }
+    }
+    let subtick_ok = subtick_all_read_ok && subtick_seen;
+    if !report(b"FLIP_TS_SUBTICK", subtick_ok) { failures += 1; }
 
     // ── PRIME / dmabuf export + import round-trip (K5) ──────────────────────
     // Export the dumb buffer as a dmabuf fd, mmap that fd, and confirm it
