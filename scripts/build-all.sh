@@ -324,6 +324,18 @@ build_brush() {
     )
 }
 
+# Function to build the input-stack ABI shims (libseat, libudev). These are
+# tracked C source (ports/input-stack/shims) that the image previously packed
+# as a prebuilt blob from ~/code/leandros-artifacts/m4-input-ship because
+# nothing in build-all.sh ever invoked the build script; wiring it in here
+# closes that drift hole. Builds both arches in one call; degrades to a
+# warning (not a failure) if zig is unavailable, matching the other
+# out-of-repo build dependencies below.
+build_input_stack_shims() {
+    echo "🔌 Building input-stack shims (libseat, libudev)..."
+    ./ports/input-stack/build-shims.sh
+}
+
 # Function to build relibc
 build_relibc() {
     local arch="$1"
@@ -358,6 +370,8 @@ build_relibc() {
 # Main
 download_limine "$LIMINE_VERSION"
 LIMINE_DIR="$LIMINE_CACHE_DIR/limine-$LIMINE_VERSION-binary"
+
+build_input_stack_shims
 
 # Determine architectures to build
 if [[ "$ARCH" == "both" ]]; then

@@ -428,10 +428,20 @@ def main():
     if os.path.exists(wlclient):
         bin_files.append(("wlclient", wlclient, 0o100755))
     m4_lib_dir = f"{m4_root}/usr/lib"
+    # libseat.so.1 / libudev.so.1 are the two shims whose C source is tracked
+    # (ports/input-stack/shims) and built by ports/input-stack/build-shims.sh,
+    # wired into the normal build via scripts/build-all.sh. Prefer that fresh
+    # output over the m4-input-ship blob so a tracked-source edit can never
+    # again be silently absent from the image; fall back to the blob if the
+    # shim wasn't rebuilt this run (e.g. zig unavailable). The other libraries
+    # here (libxkbcommon, libinput, ...) are upstream C, not built from this
+    # repo, and always come from the blob.
+    shim_build_dir = f"target/input-stack-sysroot/{arch}/usr/lib"
     for so in ("libxkbcommon.so.0", "libdisplay-info.so.3", "libseat.so.1",
                "libudev.so.1", "libinput.so.10", "libpixman-1.so.0",
                "libmtdev.so.1", "libevdev.so.2"):
-        p = f"{m4_lib_dir}/{so}"
+        built = f"{shim_build_dir}/{so}"
+        p = built if os.path.exists(built) else f"{m4_lib_dir}/{so}"
         if os.path.exists(p):
             usr_lib_files.append((so, p, 0o100755))
     # Recursively enumerate the /usr/share data tree. m4_share_files holds
