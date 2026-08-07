@@ -674,7 +674,7 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 |---|---|---|---|
 | 6 | **No input of any kind reaches the compositor** | Bug — **TOP PRIORITY** | Measured; break is above evdev, below Wayland |
 | 7 | **Only a raw `wl_shm` client renders — no libcosmic/iced app draws** | Bug — **actionable** | `cosmic-settings` alive, healthy, 0 px in 74 s |
-| 8 | **Nothing to launch, and no way to ask for it** | Feature — **actionable** | `system_actions` unstaged; no terminal in the image |
+| 8 | Nothing to launch, and no way to ask for it | Feature — **config DONE** `52665aa` | Keybinding table staged; still no terminal to launch |
 | 9 | **9 panel applets have no scoped-out dependency and are simply unbuilt** | Feature — cheap | Build recipe exists; spawn path proven |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
 | 1 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — **no action** | Recorded on purpose; fix undecided |
@@ -737,10 +737,23 @@ returns the fd as the device id.
 **So the break is above raw evdev and below the Wayland protocol** — inside libinput,
 smithay's libinput backend, or how cosmic-comp wires a seat to it.
 
-**The path is currently unobservable, which is the first thing to fix.**
+**The path is currently unobservable, and the reason is probably not the one first recorded.**
 `RUST_LOG=smithay::backend::libinput=debug` is rejected because DEBUG is compiled out
 (`release_max_level_info`, `cosmic-comp/Cargo.toml:61-62`, not raisable additively), and
 **148 lines of session log mention libinput, a seat or an input device exactly zero times.**
+**But cosmic-comp's stderr is DISCARDED**: `cosmic-session` spawns it through `launch_pad`
+with stderr piped and registers **no `on_stderr` handler**
+(`../cosmic-epoch/cosmic-session/src/comp.rs:122-134`). So the compositor's own diagnostics go
+nowhere, and the only cosmic-comp output ever seen in a session log is what leaks out through
+*other* processes — an error line expected from cosmic-comp was observed surfacing via
+**cosmic-idle**. **The silence is very likely nobody reading the pipe, not smithay having
+nothing to say**, which would mean the existing INFO-level logging is sufficient and no new
+instrument is needed. Get at it *without* patching COSMIC: run `cosmic-comp` standalone with
+stderr redirected, or redirect in `start-cosmic-leandros`, which is our own script.
+**Two adjacent facts worth not rediscovering:** the guest has **no `grep`** (filter host-side
+after pulling logs), and console writes repaint the framebuffer *which is the scanout*, so a
+single capture can photograph console text — `edad115` gates this while a DRM master owns the
+scanout, but sample a series and treat the first frame as suspect.
 The cheapest datum that splits the space is **`wl_seat`'s advertised capabilities**, which no
 shipped tool prints: `0` means libinput never found or was never given the devices (bug below
 smithay's event loop); pointer+keyboard present means they were found and events are being
@@ -781,8 +794,34 @@ cosmic-panel.
 `cosmic-workspaces` are **built, staged, and successfully launched every single boot** — 12
 `launch_pad` starts, max 1 per name, **zero restarts**, four boots, both arches — and all
 three are permanently invisible, purely because the only thing that can raise them resolves to
-nothing. Stage from `../cosmic-epoch`, a real checked-out sibling, not from the unversioned
-artifacts tree.
+nothing.
+
+**The config half is DONE (`52665aa`), and the item as written was wrong by one file — the
+more important one.** `system_actions` was never the whole story: `defaults`
+(`cosmic-comp/data/keybindings.ron`, 6,925 B) **is the entire keybinding table**, and
+`shortcuts::shortcuts()` falls back to `Shortcuts::default()` — an **empty HashMap**
+(`cosmic-settings-daemon/config/src/shortcuts/mod.rs:35-38`). Without it cosmic-comp has **no
+bindings at all**, so `system_actions` could never have been reached even had it been staged.
+*Two* missing files, and the one this item named was the second of them.
+**What landed:** all **263 files / 13 components / 101,353 B** that upstream's own install
+rules place under `share/cosmic`, sourced from `../cosmic-epoch` (submodules at
+`epoch-1.3.0`) — four recursive trees plus three hand-installed *renamed* files (`.ron`
+stripped; `keybindings.ron` → `defaults`). Resolution is
+`find_data_file("<name>/v<N>")`, so it tests for the **directory**, and each key is a **bare,
+extensionless** file holding one RON value (libcosmic `cosmic-config/src/lib.rs:203,236,481-487`).
+**Absent directory ⇒ `system_path: None` ⇒ every lookup returns `NoConfigDirectory`, which
+`Error::is_err()` classifies as NOT an error (`:120-123`) — which is exactly why this cost
+nothing to miss and produced no failure anywhere.**
+**Measured, fresh images, both arches:** `system_path: None` **3 → 0**;
+`system_path: Some("/usr/share/cosmic/…")` **0 → 3**; the shortcuts `NoConfigDirectory` **1 →
+0**; `Panel Entry Error: NoConfigDirectory` **1 → 0**. The four panel errors that remain are a
+*different class* — `GetKey("padding_overlap")`, `GetKey("keep_style_on_maximize")` — because
+upstream ships 22 keys for a 24-field struct, so they appear on a correct install too.
+**Keybindings still do not fire, and that residual is cleanly attributed rather than guessed.**
+The lane built a **control**: `Super+F9` bound in the *user* config to `touch /tmp/kb-f9`,
+which needs **nothing** from `/usr/share/cosmic`. It fails too. So the remaining failure is
+**item 6**, not the staging — and that control is what makes this a completed fix with a known
+blocker downstream rather than an inconclusive one.
 
 **And then there is still nothing to run.** No terminal exists among 175 `/bin` names, and the
 image contains **exactly one** `.desktop` file — our own applet stub. `cosmic-term`,
