@@ -711,31 +711,54 @@ shipped `venus-lane/stage-aarch64/usr/lib/libvulkan_virtio.so` was built
 its flag table, and has **both** WSI branches compiled in (`wsi_wl` ×30, `wl_shm` ×4,
 `wl_shm_pool` ×2, `zwp_linux_dmabuf` ×8).
 
-**Two corrections to this plan, both measured, both of which would have cost a session.**
+**★ M4's client half is ACHIEVED: a Vulkan client presents into cosmic-comp inside
+LeandrOS, through Venus, on a real host GPU.** x86_64, KVM, `--venus`, fresh images.
+`vkCreateSwapchainKHR` → `VK_SUCCESS` with 5 images, `vkQueuePresentKHR` → `VK_SUCCESS`,
+**300/300 presents on a sustained rerun, 0 failures**, against device
+`"Virtio-GPU Venus (AMD Ryzen 9 7950X (RADV RAPHAEL_MENDOCINO))"`, api 1.4.307.
 
-1. **Bare `sw` does not work; it needs `sw,noshm`.** Measured on the Linux box's *host*
-   (RADV, Mesa 26.1.4, KWin): `MESA_VK_WSI_DEBUG=sw` alone fails `vkCreateSwapchainKHR`
-   with `VK_ERROR_INVALID_EXTERNAL_HANDLE`. Root cause read out of Mesa 25.3.6
-   `wsi_common_wayland.c:3548-3556` — the sw path has **two** variants. Plain `sw` selects
-   `WSI_WL_BUFFER_GPU_SHM`, which imports the `wl_shm` mapping as *device memory* and so
-   requires `VK_EXT_external_memory_host` to be importable for the image's memory types.
-   Adding `noshm` selects `WSI_WL_BUFFER_SHM_MEMCPY` — the same `wl_shm` buffer, filled by
-   a CPU copy, requiring nothing of the driver. With `sw,noshm`: **5/5
-   `vkQueuePresentKHR → VK_SUCCESS`**.
-2. **`vkswap` is not a Wayland client and never was.** It, `vkrender` and `vktest` are all
-   `VK_EXT_headless_surface` — none of them touches Wayland. **No Vulkan Wayland client
-   existed in this project**, so the plan above named a vehicle that could not carry it.
-   One was written (`vkwl`, built against the same musl toolchain that produced `wlclient`,
-   so its `DT_NEEDED` closure — `libc.so`, `libwayland-client.so.0` — was already staged).
-   It is validated **on the host first**, presenting 5/5 on the sw path *and* 5/5 on the
-   dmabuf path, which is the right bisection: a guest-side failure can no longer be blamed
-   on the client.
+**The mutual-exclusivity premise is confirmed on the target, not merely inferred.** `vkwl`
+bound **54 globals, `wl_shm` = YES, `zwp_linux_dmabuf_v1` = no**, identically in all three
+runs. The `nosw` control fails, as predicted — but **earlier than the plan said, and the
+plan's failure mode is wrong**: not `VK_ERROR_SURFACE_LOST_KHR` at swapchain creation, but
+at `vkGetPhysicalDeviceSurfaceCapabilitiesKHR`, which returns all zeros
+(`minImageCount=0 currentExtent=0x0 supportedUsage=0x0`) and aborts the run there. That
+call's `VkResult` was not logged, so the zeroed caps are measured and the **code is not
+known** — route reasoning confirmed, specific failure mode corrected.
 
-The route remains all userspace and zero kernel risk, and is still the correct bisection
-point if the dmabuf route is ever attempted — it proves the client, the protocol, the
-compositor wiring and the Vulkan rendering independently, leaving the kernel as the only new
-variable. **Guest-side result against cosmic-comp is still outstanding**, as is aarch64; the
-numbers above are host-side.
+**Correction, and it reverses what this file said one commit earlier (`77268de`): `noshm` is
+NOT required on Venus.** Venus reports `VK_EXT_external_memory_host = no` (RADV reports
+yes), and per `wsi_common_wayland.c:3548-3556` a false `has_import_memory_host` makes Mesa
+select `WSI_WL_BUFFER_SHM_MEMCPY` **on its own**. So plain `MESA_VK_WSI_DEBUG=sw` is
+sufficient *and correct* for Venus, and both routes pass in the guest. `noshm` is a
+workaround for drivers that **do** advertise `external_memory_host` — which is exactly why
+bare `sw` failed on the RADV host and passes in the guest. **The host measurement was real
+but did not transfer, and was briefly recorded here as though it did.** Different driver,
+different Mesa (26.1.4 vs 25.3.6): a host control is a client sanity check, not a guest
+prediction.
+
+**`vkswap` is not a Wayland client and never was.** It, `vkrender` and `vktest` are all
+`VK_EXT_headless_surface`. **No Vulkan Wayland client existed in this project**, so the plan
+named a vehicle that could not carry it. `vkwl` was written for this (musl toolchain,
+`DT_NEEDED` = `libc.so` + `libwayland-client.so.0`, already staged) and validated host-side
+first, which is why a guest failure could never have been blamed on the client.
+
+**Pixels remain UNPROVEN, and that is the honest boundary of this result.** cosmic-comp
+logged **no** new-surface/toplevel line naming `vkwl`. The screendump captured **console 0**,
+which is the std-VGA that `--venus` deliberately keeps for OVMF/Limine's GOP — it holds the
+text console, and the capture legibly confirms the run (`M4: wayland-1 present after 1s`,
+`MESA_VK_WSI_DEBUG=sw,noshm frames=300`) but **is not the scanout**. Targeting the right
+device failed because `screendump` resolves `device=` as a qdev **id** and `GPU_DEV` is
+`peripheral-anon`. That is the *same* missing-`id=` defect already recorded above, now hit
+from a second direction. **This does not show COSMIC failed to display — it shows the
+capture missed a different QEMU device.** Adding `id=` to `GPU_DEV` is the one-line fix, but
+note the earlier finding still applies afterwards: a virgl-backed scanout has no
+`DisplaySurface`, so `device=` is expected to then fail `"no surface"` once a frame is
+presented. **Client-side present success is measured and strong; visual confirmation is not
+available on this host by this route.**
+
+**aarch64 is entirely untested** — no baseline, no M4 run. The aarch64 `vkwl` is built and
+staged (218,768 B) but never executed. Every number in this item is x86_64.
 
 ### 3. Cross-open dmabuf import — dead as an M4 route, alive for other reasons
 
