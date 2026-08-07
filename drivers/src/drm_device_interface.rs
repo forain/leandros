@@ -1783,8 +1783,12 @@ fn queue_flip_event(crtc_id: u32, user_data: u64) {
 ///     their handles because an exported dmabuf fd still pins them.
 ///   * `bo_dumbret` climbing monotonically is the **retention leak**: dumb
 ///     records retired as handles but never dropped by their last exporting fd.
-///   * `bo_dumb` must be bounded over a session. Unbounded growth there is the
-///     item 9 per-frame handle leak becoming real.
+///   * `bo_dumb` must be bounded over a session. Unbounded growth there means
+///     handles minted by an import path are outliving their release — the
+///     defect `65fb20c` fixed, reappearing. Note the expected magnitude is
+///     per *exported buffer*, not per composited frame: a 185 s census of a
+///     live session recorded 5 dumb creates, 5 PRIME exports and 1 free, then
+///     froze, because cosmic-comp exports at allocation and not per frame.
 ///
 /// LOCKING — the whole reason this is a separate function. `drm_tick` runs in
 /// **IRQ context at 100 Hz**. A blocking `.lock()` here deadlocks the instant
