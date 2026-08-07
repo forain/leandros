@@ -20,14 +20,25 @@ non-Apple-Silicon host (where it will fail to launch). "direct" and
 by `scripts/run-qemu.sh --venus` (landed b2260b4), under `-display
 egl-headless` instead of the default `-display none`. UEFI boot modes only —
 refused on "direct"/"raspi4b" and on macOS (no host EGL; verify on the Linux
-box). `cmd_screenshot`'s bare `screendump` (no `device=`) already works
-unchanged in this mode and returns a valid PPM. Passing `device=venusgpu` now
-resolves — the device line used to carry no `id=`, and QMP resolves `device=`
-as a qdev id, so it failed with `DeviceNotFound` outright — but only before a
-frame is presented; once one is, it fails with `"no surface"` instead,
-because a virgl-backed scanout has no `DisplaySurface` for QMP to dump. That
-remaining failure mode is why `cmd_screenshot` stays on bare `screendump`
-here rather than targeting `device=venusgpu`.
+box). `cmd_screenshot`'s bare `screendump` (no `device=`) captures the q35
+std-VGA *text console*, NOT the GL scanout — do not read it as a picture of
+what the guest presented.
+
+Passing `device=venusgpu` resolves (the device line carries `id=venusgpu`) but
+still fails `"no surface"` once a frame is presented. The reason is NOT that a
+virgl scanout has no DisplaySurface — it has one, correctly sized, and
+egl-headless fills it with real pixels. `virgl_cmd_set_scanout()` calls
+`qemu_console_resize()` (allocating that surface) and then
+`dpy_gl_scanout_texture()`, which sets `console->scanout.kind =
+SCANOUT_TEXTURE`; `qemu_console_surface()` returns NULL for any kind other
+than SCANOUT_SURFACE, so screendump refuses pixels that are in fact present.
+`screendump` therefore cannot photograph a Venus session at all, on any
+device= argument.
+
+The GL scanout is photographed instead through the VNC listener this driver
+now attaches in venus mode (see VENUS_VNC_ADDR): egl-headless reads the GL
+framebuffer back into that same console surface and calls dpy_gfx_update(),
+and a 2D listener is what turns that into pixels a client can fetch.
 
 All paths relative to the repo root (three levels up from this file).
 """
@@ -95,6 +106,36 @@ X86_64_VARS_PATHS = [
 # drift here would silently break it. hostmem= backs the host-visible blob
 # window Mesa's Venus ring maps.
 VENUS_GPU_DEV = "virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,id=venusgpu"
+
+# egl-headless is NOT a pixel sink on its own: its dpy_gl_update handler
+# (ui/egl-headless.c:egl_scanout_flush) does the GL->CPU readback with
+# `egl_fb_read(edpy->ds, &edpy->blit_fb)`, i.e. it blits the guest's GL scanout
+# into the *2D console surface* and then calls dpy_gfx_update() so that a
+# paired 2D DisplayChangeListener can consume it. Its own
+# egl_is_compatible_dcl() says so outright ("egl-headless is compatible with
+# all 2d listeners, as it blits the GL updates on the 2d console surface").
+# With no 2D listener attached nothing ever reads that surface back out, which
+# is why a --venus session used to be unphotographable.
+#
+# QMP/HMP `screendump` cannot be that consumer: qemu_console_surface()
+# (ui/console.c) returns NULL unless console->scanout.kind == SCANOUT_SURFACE,
+# and virgl_cmd_set_scanout() (hw/display/virtio-gpu-virgl.c) calls
+# qemu_console_resize() — which creates a correctly sized surface — and then
+# immediately dpy_gl_scanout_texture(), which flips the kind to
+# SCANOUT_TEXTURE. So the pixels really are in con->surface, but screendump's
+# accessor refuses to hand them over and reports "no surface".
+#
+# A VNC listener bound to the venusgpu console is that missing 2D consumer, and
+# it reads the same con->surface the readback fills. Loopback-only; port 5909.
+VENUS_VNC_ADDR = "127.0.0.1:9"
+VENUS_VNC_PORT = 5909
+
+
+def _venus_vnc_args(venus):
+    """Pair -display egl-headless with a 2D pixel consumer on the GL console."""
+    if not venus:
+        return []
+    return ["-vnc", f"{VENUS_VNC_ADDR},display=venusgpu"]
 
 
 def _host_arch():
@@ -303,6 +344,7 @@ def _build_cmd(arch, mode="uefi", venus=False):
             *_netdev_args(),
             "-no-reboot", "-parallel", "none",
             "-display", display_arg,
+            *_venus_vnc_args(venus),
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
             "-serial", "chardev:serial0",
             "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
@@ -359,6 +401,7 @@ def _build_cmd(arch, mode="uefi", venus=False):
             *_netdev_args(),
             "-no-reboot", "-parallel", "none",
             "-display", display_arg,
+            *_venus_vnc_args(venus),
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
             "-serial", "chardev:serial0",
             "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
