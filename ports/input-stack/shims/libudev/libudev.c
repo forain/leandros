@@ -53,6 +53,8 @@
 
 #include <errno.h>
 #include <fnmatch.h>
+#include <stdarg.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +65,112 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+
+/* ===================================================================== */
+/* Self-tracing (LEANDROS_INPUT_TRACE)                                    */
+/*                                                                         */
+/* Every traced call is tagged "[UDEVSHIM] pid=<pid> ..." so that the      */
+/* interleaved stderr of cosmic-comp/cosmic-panel/cosmic-settings-daemon/  */
+/* Mesa (all of which load this shim) can be attributed line by line.     */
+/* Disabled unless LEANDROS_INPUT_TRACE is set to something other than    */
+/* "" or "0"; the getenv() result is cached so it is read exactly once.   */
+/* Hard-capped at TRACE_BUDGET lines total so a runaway consumer (e.g. a  */
+/* monitor-receive poll loop) cannot flood the guest console.             */
+/* trc() saves/restores errno around its own work so tracing is provably  */
+/* invisible to callers that inspect errno after a shim call.             */
+/* Mirrored to LEANDROS_INPUT_TRACE_DIR/udevshim.<pid>.log (if set) since */
+/* stderr alone is not reliable: cosmic-session may repoint fd 2 out from */
+/* under a child it launches; see trace_file() below.                    */
+/* ===================================================================== */
+
+#define TRACE_BUDGET 600
+
+static int trace_on(void) {
+	static int cached = -1;
+	if (cached < 0) {
+		const char *v = getenv("LEANDROS_INPUT_TRACE");
+		cached = (v != NULL && v[0] != '\0' && strcmp(v, "0") != 0) ? 1 : 0;
+	}
+	return cached;
+}
+
+#define TRACE_FILE_FAILED ((FILE *)-1)
+
+/* Second sink: LEANDROS_INPUT_TRACE_DIR, if set to a non-empty directory
+ * path, gets a per-process file "<dir>/udevshim.<pid>.log" in addition to
+ * stderr. Opened lazily on the first traced line; on open failure we fall
+ * back to stderr-only and never retry -- TRACE_FILE_FAILED is the sentinel
+ * that makes that permanent without re-calling fopen() on every line. */
+static FILE *trace_file(void) {
+	static FILE *f = NULL;
+	if (f == TRACE_FILE_FAILED) return NULL;
+	if (f != NULL) return f;
+
+	const char *dir = getenv("LEANDROS_INPUT_TRACE_DIR");
+	if (dir == NULL || dir[0] == '\0') {
+		f = TRACE_FILE_FAILED;
+		return NULL;
+	}
+
+	char path[PATH_MAX];
+	int n = snprintf(path, sizeof(path), "%s/udevshim.%d.log", dir, (int)getpid());
+	if (n < 0 || (size_t)n >= sizeof(path)) {
+		f = TRACE_FILE_FAILED;
+		return NULL;
+	}
+
+	FILE *fp = fopen(path, "ae"); /* 'e' -> O_CLOEXEC, no fd leak across exec */
+	if (fp == NULL) {
+		f = TRACE_FILE_FAILED;
+		return NULL;
+	}
+	setvbuf(fp, NULL, _IOLBF, 0);
+	f = fp;
+	return f;
+}
+
+static void trc(const char *fmt, ...) {
+	static unsigned long n_lines = 0;
+	if (!trace_on()) return;
+	int saved_errno = errno;
+	if (n_lines >= TRACE_BUDGET) {
+		errno = saved_errno;
+		return;
+	}
+	n_lines++;
+
+	char msg[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, ap);
+	va_end(ap);
+
+	char line[1024 + 64];
+	snprintf(line, sizeof(line), "[UDEVSHIM] pid=%d %s\n", (int)getpid(), msg);
+
+	fputs(line, stderr);
+	fflush(stderr);
+	FILE *tf = trace_file();
+	if (tf != NULL) {
+		fputs(line, tf);
+		fflush(tf);
+	}
+
+	if (n_lines == TRACE_BUDGET) {
+		char exhausted[128];
+		snprintf(exhausted, sizeof(exhausted),
+		         "[UDEVSHIM] pid=%d TRACE BUDGET EXHAUSTED after %d lines\n",
+		         (int)getpid(), TRACE_BUDGET);
+		fputs(exhausted, stderr);
+		fflush(stderr);
+		if (tf != NULL) {
+			fputs(exhausted, tf);
+			fflush(tf);
+		}
+	}
+
+	errno = saved_errno;
+}
 
 /* ===================================================================== */
 /* Static device model                                                    */
@@ -252,6 +360,7 @@ struct udev *udev_new(void) {
 	}
 	u->refcount = 1;
 	u->log_priority = 3; /* LOG_ERR */
+	trc("udev_new ctx=%p", (void *)u);
 	return u;
 }
 
@@ -341,29 +450,40 @@ struct udev *udev_device_get_udev(struct udev_device *d) {
 
 struct udev_device *udev_device_new_from_syspath(struct udev *udev, const char *syspath) {
 	const struct dev_desc *desc = desc_by_syspath(syspath);
+	struct udev_device *d = NULL;
 	if (!desc) {
 		errno = ENODEV;
-		return NULL;
+	} else {
+		d = device_wrap(udev, desc);
 	}
-	return device_wrap(udev, desc);
+	trc("dev_from_syspath path=%s -> dev=%p", syspath ? syspath : "(null)", (void *)d);
+	return d;
 }
 
 struct udev_device *udev_device_new_from_devnum(struct udev *udev, char type, dev_t devnum) {
 	const struct dev_desc *desc = desc_by_devnum(type, devnum);
+	struct udev_device *d = NULL;
 	if (!desc) {
 		errno = ENODEV;
-		return NULL;
+	} else {
+		d = device_wrap(udev, desc);
 	}
-	return device_wrap(udev, desc);
+	trc("dev_from_devnum type=%c major=%u minor=%u -> dev=%p",
+	    type, (unsigned)major(devnum), (unsigned)minor(devnum), (void *)d);
+	return d;
 }
 
 struct udev_device *udev_device_new_from_subsystem_sysname(struct udev *udev, const char *subsystem, const char *sysname) {
 	const struct dev_desc *desc = desc_by_subsystem_sysname(subsystem, sysname);
+	struct udev_device *d = NULL;
 	if (!desc) {
 		errno = ENODEV;
-		return NULL;
+	} else {
+		d = device_wrap(udev, desc);
 	}
-	return device_wrap(udev, desc);
+	trc("dev_from_subsystem_sysname sub=%s name=%s -> dev=%p",
+	    subsystem ? subsystem : "(null)", sysname ? sysname : "(null)", (void *)d);
+	return d;
 }
 
 struct udev_device *udev_device_new_from_device_id(struct udev *udev, const char *id) {
@@ -371,15 +491,19 @@ struct udev_device *udev_device_new_from_device_id(struct udev *udev, const char
 	 * char/block numeric form used in practice; others -> ENODEV. */
 	if (!id || (id[0] != 'c' && id[0] != 'b')) {
 		errno = EINVAL;
+		trc("dev_from_device_id id=%s -> dev=(nil)", id ? id : "(null)");
 		return NULL;
 	}
 	char kind = id[0];
 	unsigned ma = 0, mi = 0;
 	if (sscanf(id + 1, "%u:%u", &ma, &mi) != 2) {
 		errno = EINVAL;
+		trc("dev_from_device_id id=%s -> dev=(nil)", id);
 		return NULL;
 	}
-	return udev_device_new_from_devnum(udev, kind, makedev(ma, mi));
+	struct udev_device *d = udev_device_new_from_devnum(udev, kind, makedev(ma, mi));
+	trc("dev_from_device_id id=%s -> dev=%p", id, (void *)d);
+	return d;
 }
 
 struct udev_device *udev_device_new_from_environment(struct udev *udev) {
@@ -390,12 +514,19 @@ struct udev_device *udev_device_new_from_environment(struct udev *udev) {
 
 struct udev_device *udev_device_get_parent(struct udev_device *d) {
 	if (!d) return NULL;
-	if (d->parent) return d->parent;
-	if (!d->desc->parent_syspath) return NULL;
-	const struct dev_desc *pd = desc_by_syspath(d->desc->parent_syspath);
-	if (!pd) return NULL;
-	d->parent = device_wrap(d->udev, pd);
-	return d->parent; /* owned by child, not an extra ref for the caller */
+	struct udev_device *result;
+	if (d->parent) {
+		result = d->parent;
+	} else if (!d->desc->parent_syspath) {
+		result = NULL;
+	} else {
+		const struct dev_desc *pd = desc_by_syspath(d->desc->parent_syspath);
+		result = pd ? device_wrap(d->udev, pd) : NULL;
+		d->parent = result; /* owned by child, not an extra ref for the caller */
+	}
+	trc("dev_parent syspath=%s sub=%s devtype=%s -> %s",
+	    d->desc->syspath, "-", "-", result ? result->desc->syspath : "(null)");
+	return result;
 }
 
 struct udev_device *udev_device_get_parent_with_subsystem_devtype(struct udev_device *d,
@@ -407,10 +538,18 @@ struct udev_device *udev_device_get_parent_with_subsystem_devtype(struct udev_de
 		const char *pdt = p->desc->devtype;
 		int sub_ok = (!subsystem) || (psub && strcmp(psub, subsystem) == 0);
 		int dt_ok = (!devtype) || (pdt && strcmp(pdt, devtype) == 0);
-		if (sub_ok && dt_ok)
+		if (sub_ok && dt_ok) {
+			trc("dev_parent syspath=%s sub=%s devtype=%s -> %s",
+			    d ? d->desc->syspath : "(null)",
+			    subsystem ? subsystem : "(null)", devtype ? devtype : "(null)",
+			    p->desc->syspath);
 			return p;
+		}
 		p = udev_device_get_parent(p);
 	}
+	trc("dev_parent syspath=%s sub=%s devtype=%s -> %s",
+	    d ? d->desc->syspath : "(null)",
+	    subsystem ? subsystem : "(null)", devtype ? devtype : "(null)", "(null)");
 	return NULL;
 }
 
@@ -426,11 +565,20 @@ const char *udev_device_get_devtype(struct udev_device *d) { return d ? d->desc-
 const char *udev_device_get_syspath(struct udev_device *d) { return d ? d->desc->syspath : NULL; }
 const char *udev_device_get_sysname(struct udev_device *d) { return d ? d->desc->sysname : NULL; }
 const char *udev_device_get_sysnum(struct udev_device *d) { return d ? d->desc->sysnum : NULL; }
-const char *udev_device_get_devnode(struct udev_device *d) { return d ? d->desc->devnode : NULL; }
+const char *udev_device_get_devnode(struct udev_device *d) {
+	const char *node = d ? d->desc->devnode : NULL;
+	trc("dev_devnode dev=%p syspath=%s -> %s",
+	    (void *)d, d ? d->desc->syspath : "(null)", node ? node : "(null)");
+	return node;
+}
 const char *udev_device_get_driver(struct udev_device *d) { return d ? d->desc->driver : NULL; }
 const char *udev_device_get_action(struct udev_device *d) { (void)d; return NULL; /* not from a uevent */ }
 
-int udev_device_get_is_initialized(struct udev_device *d) { return d ? d->desc->is_initialized : 0; }
+int udev_device_get_is_initialized(struct udev_device *d) {
+	int r = d ? d->desc->is_initialized : 0;
+	trc("dev_is_init syspath=%s -> %d", d ? d->desc->syspath : "(null)", r);
+	return r;
+}
 
 dev_t udev_device_get_devnum(struct udev_device *d) {
 	if (!d || d->desc->dev_kind == 0) return makedev(0, 0);
@@ -448,17 +596,30 @@ static void device_build_properties(struct udev_device *d) {
 }
 
 struct udev_list_entry *udev_device_get_properties_list_entry(struct udev_device *d) {
-	if (!d) return NULL;
+	if (!d) {
+		trc("dev_properties_list dev=(nil) syspath=(null) head=(nil)");
+		return NULL;
+	}
 	device_build_properties(d);
+	trc("dev_properties_list dev=%p syspath=%s head=%p",
+	    (void *)d, d->desc->syspath, (void *)d->properties);
 	return d->properties;
 }
 
 const char *udev_device_get_property_value(struct udev_device *d, const char *key) {
-	if (!d || !key) return NULL;
+	if (!d || !key) {
+		trc("dev_prop syspath=%s key=%s -> %s",
+		    d ? d->desc->syspath : "(null)", key ? key : "(null)", "(null)");
+		return NULL;
+	}
+	const char *val = NULL;
 	for (size_t i = 0; i < d->desc->nprops; i++)
-		if (strcmp(d->desc->props[i].key, key) == 0)
-			return d->desc->props[i].val;
-	return NULL;
+		if (strcmp(d->desc->props[i].key, key) == 0) {
+			val = d->desc->props[i].val;
+			break;
+		}
+	trc("dev_prop syspath=%s key=%s -> %s", d->desc->syspath, key, val ? val : "(null)");
+	return val;
 }
 
 struct udev_list_entry *udev_device_get_devlinks_list_entry(struct udev_device *d) {
@@ -471,8 +632,8 @@ struct udev_list_entry *udev_device_get_current_tags_list_entry(struct udev_devi
 struct udev_list_entry *udev_device_get_sysattr_list_entry(struct udev_device *d) { (void)d; return NULL; }
 
 const char *udev_device_get_sysattr_value(struct udev_device *d, const char *sysattr) {
-	(void)d;
-	(void)sysattr;
+	trc("dev_sysattr syspath=%s attr=%s -> %s",
+	    d ? d->desc->syspath : "(null)", sysattr ? sysattr : "(null)", "(null)");
 	return NULL; /* sysattrs served later off synthetic sysfs */
 }
 
@@ -519,6 +680,7 @@ struct udev_enumerate *udev_enumerate_new(struct udev *udev) {
 	}
 	e->refcount = 1;
 	e->udev = udev_ref(udev);
+	trc("enum_new e=%p", (void *)e);
 	return e;
 }
 
@@ -555,6 +717,7 @@ struct udev *udev_enumerate_get_udev(struct udev_enumerate *e) { return e ? e->u
  * literals (libinput) worked. strdup here (freed in udev_enumerate_unref). */
 int udev_enumerate_add_match_subsystem(struct udev_enumerate *e, const char *subsystem) {
 	if (!e || !subsystem) return -EINVAL;
+	trc("enum_match_subsystem e=%p sub=%s", (void *)e, subsystem);
 	if (e->n_match_subsystem < MAX_FILTERS) {
 		char *c = strdup(subsystem);
 		if (!c) return -ENOMEM;
@@ -564,6 +727,10 @@ int udev_enumerate_add_match_subsystem(struct udev_enumerate *e, const char *sub
 }
 int udev_enumerate_add_nomatch_subsystem(struct udev_enumerate *e, const char *subsystem) {
 	if (!e || !subsystem) return -EINVAL;
+	/* NOTE: distinct tag from add_match_subsystem so a log reader can tell
+	 * match from nomatch apart; the task spec bundled both under one line
+	 * shape, but a shared tag would make the two indistinguishable. */
+	trc("enum_nomatch_subsystem e=%p sub=%s", (void *)e, subsystem);
 	if (e->n_nomatch_subsystem < MAX_FILTERS) {
 		char *c = strdup(subsystem);
 		if (!c) return -ENOMEM;
@@ -573,6 +740,7 @@ int udev_enumerate_add_nomatch_subsystem(struct udev_enumerate *e, const char *s
 }
 int udev_enumerate_add_match_sysname(struct udev_enumerate *e, const char *sysname) {
 	if (!e || !sysname) return -EINVAL;
+	trc("enum_match_sysname e=%p name=%s", (void *)e, sysname);
 	if (e->n_match_sysname < MAX_FILTERS) {
 		char *c = strdup(sysname);
 		if (!c) return -ENOMEM;
@@ -582,6 +750,7 @@ int udev_enumerate_add_match_sysname(struct udev_enumerate *e, const char *sysna
 }
 int udev_enumerate_add_match_property(struct udev_enumerate *e, const char *property, const char *value) {
 	if (!e || !property) return -EINVAL;
+	trc("enum_match_property e=%p key=%s val=%s", (void *)e, property, value ? value : "(null)");
 	if (e->n_match_prop < MAX_FILTERS) {
 		char *k = strdup(property);
 		char *v = value ? strdup(value) : NULL;
@@ -601,17 +770,24 @@ int udev_enumerate_add_nomatch_sysattr(struct udev_enumerate *e, const char *sys
 	(void)e; (void)sysattr; (void)value; return 0;
 }
 int udev_enumerate_add_match_tag(struct udev_enumerate *e, const char *tag) {
-	(void)e; (void)tag; return 0;
+	trc("enum_match_tag e=%p tag=%s", (void *)e, tag ? tag : "(null)");
+	return 0;
 }
 int udev_enumerate_add_match_parent(struct udev_enumerate *e, struct udev_device *parent) {
-	(void)e; (void)parent; return 0;
+	trc("enum_match_parent e=%p parent=%p", (void *)e, (void *)parent);
+	return 0;
 }
 int udev_enumerate_add_match_is_initialized(struct udev_enumerate *e) {
-	(void)e; return 0; /* everything is initialized */
+	trc("enum_match_is_initialized e=%p", (void *)e);
+	return 0; /* everything is initialized */
 }
+/* Not in the requested list, but clearly on the enumeration path (an
+ * explicit-syspath seed) so it is traced too. */
 int udev_enumerate_add_syspath(struct udev_enumerate *e, const char *syspath) {
 	if (!e || !syspath) return -EINVAL;
-	if (desc_by_syspath(syspath))
+	int hit = desc_by_syspath(syspath) != NULL;
+	trc("enum_add_syspath e=%p syspath=%s hit=%d", (void *)e, syspath, hit);
+	if (hit)
 		list_append(&e->results, syspath, NULL);
 	return 0;
 }
@@ -668,6 +844,11 @@ int udev_enumerate_scan_devices(struct udev_enumerate *e) {
 		if (enum_matches(e, d))
 			list_append(&e->results, d->syspath, NULL);
 	}
+	size_t n = 0;
+	for (struct udev_list_entry *le = e->results; le; le = le->next) n++;
+	trc("enum_scan e=%p rc=%d n=%zu", (void *)e, 0, n);
+	for (struct udev_list_entry *le = e->results; le; le = le->next)
+		trc("enum_entry e=%p syspath=%s", (void *)e, le->name);
 	return 0;
 }
 
@@ -680,7 +861,9 @@ int udev_enumerate_scan_subsystems(struct udev_enumerate *e) {
 }
 
 struct udev_list_entry *udev_enumerate_get_list_entry(struct udev_enumerate *e) {
-	return e ? e->results : NULL;
+	struct udev_list_entry *head = e ? e->results : NULL;
+	trc("enum_get_list e=%p head=%p", (void *)e, (void *)head);
+	return head;
 }
 
 /* ===================================================================== */
@@ -696,10 +879,10 @@ struct udev_monitor {
 };
 
 struct udev_monitor *udev_monitor_new_from_netlink(struct udev *udev, const char *name) {
-	(void)name;
 	struct udev_monitor *m = calloc(1, sizeof(*m));
 	if (!m) {
 		errno = ENOMEM;
+		trc("mon_new src=%s mon=(nil)", name ? name : "(null)");
 		return NULL;
 	}
 	int sv[2];
@@ -707,12 +890,14 @@ struct udev_monitor *udev_monitor_new_from_netlink(struct udev *udev, const char
 		int err = errno;
 		free(m);
 		errno = err;
+		trc("mon_new src=%s mon=(nil)", name ? name : "(null)");
 		return NULL;
 	}
 	m->refcount = 1;
 	m->udev = udev_ref(udev);
 	m->fd = sv[0];
 	m->peer_fd = sv[1];
+	trc("mon_new src=%s mon=%p", name ? name : "(null)", (void *)m);
 	return m;
 }
 
@@ -734,8 +919,12 @@ struct udev_monitor *udev_monitor_unref(struct udev_monitor *m) {
 struct udev *udev_monitor_get_udev(struct udev_monitor *m) { return m ? m->udev : NULL; }
 
 int udev_monitor_enable_receiving(struct udev_monitor *m) {
-	if (!m) return -EINVAL;
+	if (!m) {
+		trc("mon_enable mon=(nil) rc=%d", -EINVAL);
+		return -EINVAL;
+	}
 	m->enabled = 1;
+	trc("mon_enable mon=%p rc=%d", (void *)m, 0);
 	return 0;
 }
 
@@ -745,20 +934,23 @@ int udev_monitor_set_receive_buffer_size(struct udev_monitor *m, int size) {
 }
 
 int udev_monitor_get_fd(struct udev_monitor *m) {
-	return m ? m->fd : -EINVAL;
+	int fd = m ? m->fd : -EINVAL;
+	trc("mon_fd mon=%p fd=%d", (void *)m, fd);
+	return fd;
 }
 
 struct udev_device *udev_monitor_receive_device(struct udev_monitor *m) {
 	/* The fd never becomes readable, but a defensive caller may still poll
-	 * spuriously and call here — report "no event pending". */
-	(void)m;
+	 * spuriously and call here — report "no event pending". This may be
+	 * called in a tight poll loop; it is safely inside the trace budget. */
 	errno = EAGAIN;
+	trc("mon_recv mon=%p -> %p", (void *)m, (void *)NULL);
 	return NULL;
 }
 
 int udev_monitor_filter_add_match_subsystem_devtype(struct udev_monitor *m, const char *subsystem, const char *devtype) {
-	(void)subsystem;
-	(void)devtype;
+	trc("mon_filter mon=%p sub=%s devtype=%s",
+	    (void *)m, subsystem ? subsystem : "(null)", devtype ? devtype : "(null)");
 	return m ? 0 : -EINVAL;
 }
 int udev_monitor_filter_add_match_tag(struct udev_monitor *m, const char *tag) {

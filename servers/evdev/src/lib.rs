@@ -124,6 +124,100 @@ pub fn events_pushed() -> u64 {
     EVENTS_PUSHED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+// ── Per-device I/O census ────────────────────────────────────────────────────
+//
+// `EVENTS_PUSHED` proves host-injected input reached the ring. It cannot say
+// whether anything in userspace ever DRAINS that ring, and those two failures
+// look identical from outside: a compositor that opened `/dev/input/event1` and
+// never reads, and one that never opened it at all, both leave the ring filling
+// and then overwriting. These counters split them — `reads`/`polls`/`ioctls`
+// are nonzero only if some process is actually talking to the node.
+//
+// Every field is a relaxed atomic so the 0.5 Hz sampler can run from the timer
+// IRQ without taking a lock. The one field that needs the device lock is the
+// live ring depth; it is sampled with `try_lock` and reports `u64::MAX` when
+// the sample was MISSED, never 0 — a missed sample and an empty ring must not
+// print the same, which is the whole point of measuring the depth.
+macro_rules! ev_counters {
+    ($($name:ident),* $(,)?) => {
+        $(static $name: [core::sync::atomic::AtomicU64; MAX_DEVICES] =
+            [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DEVICES];)*
+    };
+}
+ev_counters!(
+    C_PUSHED,   // events handed to push_event for this device
+    C_DROPPED,  // pushes that overwrote an unread event (ring was full)
+    C_READS,    // VFS_READ calls
+    C_EAGAIN,   // VFS_READ calls that found the ring empty
+    C_DELIV,    // input_event records actually copied out by read()
+    C_POLLS,    // VFS_POLL calls
+    C_POLLIN,   // VFS_POLL calls that answered POLLIN
+    C_IOCTLS,   // VFS_IOCTL calls
+    C_ENOTTY,   // VFS_IOCTL calls answered ENOTTY (unimplemented request)
+    C_LASTNR,   // ioctl nr of the most recent ENOTTY, so it can be identified
+    C_CONSPOP,  // events consumed by the in-kernel console via pop_event()
+    C_RPID,     // pid of the most recent reader
+    C_IPID,     // pid of the most recent ioctl caller
+);
+
+fn bump(c: &[core::sync::atomic::AtomicU64; MAX_DEVICES], dev: usize) {
+    if dev < MAX_DEVICES { c[dev].fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+}
+fn setv(c: &[core::sync::atomic::AtomicU64; MAX_DEVICES], dev: usize, v: u64) {
+    if dev < MAX_DEVICES { c[dev].store(v, core::sync::atomic::Ordering::Relaxed); }
+}
+
+/// One device's I/O census. `depth == u64::MAX` means the ring lock was busy
+/// and the depth was NOT sampled (see the module note above).
+#[derive(Clone, Copy)]
+pub struct EvCensus {
+    pub pushed:  u64,
+    pub dropped: u64,
+    pub depth:   u64,
+    pub reads:   u64,
+    pub eagain:  u64,
+    pub deliv:   u64,
+    pub polls:   u64,
+    pub pollin:  u64,
+    pub ioctls:  u64,
+    pub enotty:  u64,
+    pub lastnr:  u64,
+    pub conspop: u64,
+    pub rpid:    u64,
+    pub ipid:    u64,
+}
+
+/// Sample `dev`'s census. Safe from IRQ context: relaxed atomic loads plus one
+/// `try_lock` for the ring depth.
+pub fn census(dev: usize) -> EvCensus {
+    use core::sync::atomic::Ordering::Relaxed;
+    if dev >= MAX_DEVICES {
+        return EvCensus { pushed: 0, dropped: 0, depth: 0, reads: 0, eagain: 0,
+                          deliv: 0, polls: 0, pollin: 0, ioctls: 0, enotty: 0,
+                          lastnr: 0, conspop: 0, rpid: 0, ipid: 0 };
+    }
+    let depth = match DEVICES.try_lock() {
+        Some(d) => d[dev].count as u64,
+        None => u64::MAX,
+    };
+    EvCensus {
+        pushed:  C_PUSHED[dev].load(Relaxed),
+        dropped: C_DROPPED[dev].load(Relaxed),
+        depth,
+        reads:   C_READS[dev].load(Relaxed),
+        eagain:  C_EAGAIN[dev].load(Relaxed),
+        deliv:   C_DELIV[dev].load(Relaxed),
+        polls:   C_POLLS[dev].load(Relaxed),
+        pollin:  C_POLLIN[dev].load(Relaxed),
+        ioctls:  C_IOCTLS[dev].load(Relaxed),
+        enotty:  C_ENOTTY[dev].load(Relaxed),
+        lastnr:  C_LASTNR[dev].load(Relaxed),
+        conspop: C_CONSPOP[dev].load(Relaxed),
+        rpid:    C_RPID[dev].load(Relaxed),
+        ipid:    C_IPID[dev].load(Relaxed),
+    }
+}
+
 // ── evdev capability constants (linux/input-event-codes.h) ────────────────────
 
 const BUS_VIRTUAL: u16 = 0x06;
@@ -219,7 +313,9 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         vfs_server::VFS_READ => {
             let buf_ptr = arg(msg, 1) as usize;
             let count = arg(msg, 2) as usize;
-            
+            bump(&C_READS, dev_id);
+            setv(&C_RPID, dev_id, arg(msg, 3));
+
             let f = unsafe { arch_interrupt_save() };
             let mut devs = DEVICES.lock();
             let dev = &mut devs[dev_id];
@@ -227,6 +323,7 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             if dev.count == 0 {
                 drop(devs);
                 unsafe { arch_interrupt_restore(f); }
+                bump(&C_EAGAIN, dev_id);
                 return err_reply(-11); // EAGAIN
             }
             
@@ -271,6 +368,11 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             }
             drop(devs);
             unsafe { arch_interrupt_restore(f); }
+            if dev_id < MAX_DEVICES {
+                C_DELIV[dev_id].fetch_add(
+                    (total_copied / core::mem::size_of::<input_event>()) as u64,
+                    core::sync::atomic::Ordering::Relaxed);
+            }
             val_reply(total_copied as u64)
         }
         vfs_server::VFS_WRITE => {
@@ -287,11 +389,18 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             let typ  = (cmd >> 8) & 0xFF;
             let size = (cmd >> 16) & 0x3FFF;
 
+            bump(&C_IOCTLS, dev_id);
+            setv(&C_IPID, dev_id, pid as u64);
+
             if cmd == 0x541B { // FIONREAD (type 'T', not 'E')
                 let count = (DEVICES.lock()[dev_id].count * core::mem::size_of::<input_event>()) as i32;
                 return copy_out(pid, arg_ptr, &count.to_ne_bytes());
             }
-            if typ != 0x45 { return err_reply(-25); } // not an 'E' ioctl → ENOTTY
+            if typ != 0x45 { // not an 'E' ioctl → ENOTTY
+                bump(&C_ENOTTY, dev_id);
+                setv(&C_LASTNR, dev_id, cmd as u64);
+                return err_reply(-25);
+            }
 
             match nr {
                 0x01 => val_reply(0x00010001), // EVIOCGVERSION
@@ -338,7 +447,13 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     eviocgbit(dev_id, nr - 0x20, arg_ptr, size, pid),
                 _ if (0x40..0x60).contains(&nr) => // EVIOCGABS(abs)
                     eviocgabs(dev_id, nr - 0x40, arg_ptr, pid),
-                _ => err_reply(-25), // ENOTTY
+                _ => { // ENOTTY — an 'E' request we do not implement. Recorded
+                       // with its nr because libinput/libevdev probe a long
+                       // list of them and exactly one fatal gap is enough.
+                    bump(&C_ENOTTY, dev_id);
+                    setv(&C_LASTNR, dev_id, nr as u64);
+                    err_reply(-25)
+                }
             }
         }
         vfs_server::VFS_POLL => {
@@ -349,6 +464,8 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             let (count, seq) = { let d = &DEVICES.lock()[dev_id]; (d.count, d.seq) };
             unsafe { arch_interrupt_restore(f); }
             let revents: u32 = if count > 0 { 0x1 } else { 0 };
+            bump(&C_POLLS, dev_id);
+            if revents != 0 { bump(&C_POLLIN, dev_id); }
             let mut m = Message::empty();
             m.data[0..8].copy_from_slice(&(revents as u64).to_le_bytes());
             m.data[8..16].copy_from_slice(&seq.to_le_bytes());
@@ -365,6 +482,11 @@ pub fn pop_event(dev_id: u32) -> Option<input_event> {
     let ev = devs[dev_id as usize].pop();
     drop(devs);
     unsafe { arch_interrupt_restore(f); }
+    // An event consumed here is consumed by the in-kernel console, NOT by a
+    // userspace reader of /dev/input/eventN — the console and a compositor are
+    // competing consumers of the same ring, and only a separate counter can
+    // tell whose read drained it.
+    if ev.is_some() { bump(&C_CONSPOP, dev_id as usize); }
     ev
 }
 
@@ -431,8 +553,14 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     };
     let f = unsafe { arch_interrupt_save() };
     let mut devs = DEVICES.lock();
+    // Sampled BEFORE the push: `push` silently drops the oldest entry when the
+    // ring is full, and a ring that overwrites is the signature of a node
+    // nobody is reading.
+    let full = devs[dev_id as usize].count >= MAX_EVENTS;
     devs[dev_id as usize].push(ev);
     drop(devs);
+    bump(&C_PUSHED, dev_id as usize);
+    if full { bump(&C_DROPPED, dev_id as usize); }
     // A key event is a POLLIN edge for a console reader / evdev poller parked on
     // the poll wait-channel. try_wake (non-blocking) honors IRQ context; the
     // 100 Hz console-read tick is the backstop if RUN_QUEUE is momentarily busy.

@@ -27,12 +27,25 @@
 //        the matcher were broken, `wl_compositor=0` and `wl_shm=0` would say so.
 //    A run with sockets but no `G` lines, or with `G` lines but no `END`, is a
 //    broken run and must not be read as a negative.
+//
+//  * SEAT PROBE (added after the registry dump): binds `wl_seat` and reports
+//    what capabilities/name the compositor advertises, then — if a pointer or
+//    keyboard capability is present — binds the matching object and reports
+//    whether a keymap fd arrived. `got_caps=0`/`got_name=0` mean "no event
+//    arrived within the roundtrip budget", which is NOT the same thing as the
+//    bitmask/name being empty. Conflating "absent" with "zero" is exactly the
+//    kind of bug this instrument exists to catch, so the two are always kept
+//    in separate fields.
 
+use std::os::unix::io::OwnedFd;
 use std::os::unix::net::UnixStream;
 
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
+use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
-use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_client::protocol::wl_seat::{self, WlSeat};
+use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
 
 const TAG: &str = "[WLG]";
 
@@ -56,7 +69,23 @@ const PROBES: &[&str] = &[
     "wl_drm",
 ];
 
-struct S;
+/// Per-connection dispatch state. Holds nothing across sockets — a fresh `S`
+/// is created for every socket so one compositor's seat data can never leak
+/// into another socket's summary line.
+#[derive(Default)]
+struct S {
+    // wl_seat.capabilities / wl_seat.name
+    got_caps: bool,
+    caps: u32,
+    got_name: bool,
+    name: Option<String>,
+    // wl_seat.get_pointer / get_keyboard
+    pointer_obj: bool,
+    keyboard_obj: bool,
+    // wl_keyboard.keymap
+    keymap_fd: Option<OwnedFd>,
+    keymap_size: u32,
+}
 
 impl Dispatch<WlRegistry, GlobalListContents> for S {
     fn event(
@@ -67,6 +96,63 @@ impl Dispatch<WlRegistry, GlobalListContents> for S {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<WlSeat, ()> for S {
+    fn event(
+        state: &mut Self,
+        _: &WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_seat::Event::Capabilities { capabilities } => {
+                state.got_caps = true;
+                state.caps = match capabilities {
+                    WEnum::Value(c) => c.bits(),
+                    WEnum::Unknown(v) => v,
+                };
+            }
+            wl_seat::Event::Name { name } => {
+                state.got_name = true;
+                state.name = Some(name);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlPointer, ()> for S {
+    fn event(
+        _: &mut Self,
+        _: &WlPointer,
+        _: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // We only care that the object exists and that binding it didn't
+        // wedge the queue; the individual motion/button/frame events carry
+        // nothing this instrument reports on.
+    }
+}
+
+impl Dispatch<WlKeyboard, ()> for S {
+    fn event(
+        state: &mut Self,
+        _: &WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_keyboard::Event::Keymap { fd, size, .. } = event {
+            state.keymap_fd = Some(fd);
+            state.keymap_size = size;
+        }
     }
 }
 
@@ -85,8 +171,82 @@ fn wayland_sockets(dir: &str) -> Vec<String> {
     v
 }
 
-/// Connect to one socket, dump its registry. Returns the number of globals, or
-/// None if the socket could not be brought up.
+/// Bind `wl_seat`, roundtrip for its capabilities/name, and — if a pointer or
+/// keyboard capability showed up — bind that object too and roundtrip once
+/// more for `wl_keyboard.keymap`. Never panics: every fallible step prints a
+/// `SEATFAIL` line and returns instead of unwrapping.
+fn probe_seat(
+    sock: &str,
+    globals: &wayland_client::globals::GlobalList,
+    queue: &mut wayland_client::EventQueue<S>,
+    seat_version: u32,
+) {
+    let qh = queue.handle();
+    let bind_ver = seat_version.min(9);
+
+    let seat: WlSeat = match globals.bind(&qh, bind_ver..=bind_ver, ()) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("{TAG} SEATFAIL sock={sock} stage=bind_seat err={e}");
+            return;
+        }
+    };
+
+    let mut state = S::default();
+
+    for _ in 0..2 {
+        if let Err(e) = queue.roundtrip(&mut state) {
+            println!("{TAG} SEATFAIL sock={sock} stage=roundtrip err={e}");
+            return;
+        }
+    }
+
+    let caps = state.caps;
+    let pointer_bit = caps & 1 != 0;
+    let keyboard_bit = caps & 2 != 0;
+    let touch_bit = caps & 4 != 0;
+
+    println!(
+        "{TAG} SEAT sock={sock} got_caps={} caps=0x{:x} pointer={} keyboard={} touch={} got_name={} name={} ver={}",
+        state.got_caps as u8,
+        caps,
+        pointer_bit as u8,
+        keyboard_bit as u8,
+        touch_bit as u8,
+        state.got_name as u8,
+        state.name.as_deref().unwrap_or("(none)"),
+        bind_ver,
+    );
+
+    if pointer_bit {
+        let _pointer: WlPointer = seat.get_pointer(&qh, ());
+        state.pointer_obj = true;
+    }
+    if keyboard_bit {
+        let _keyboard: WlKeyboard = seat.get_keyboard(&qh, ());
+        state.keyboard_obj = true;
+    }
+
+    if let Err(e) = queue.roundtrip(&mut state) {
+        println!("{TAG} SEATFAIL sock={sock} stage=roundtrip_obj err={e}");
+        return;
+    }
+
+    // keymap_fd is dropped (closed) at the end of this function's scope —
+    // never mmap'd, never leaked into a later socket's state.
+    let (keymap_fd_flag, keymap_size) = match &state.keymap_fd {
+        Some(_) => (1u8, state.keymap_size),
+        None => (0u8, 0u32),
+    };
+
+    println!(
+        "{TAG} SEATOBJ sock={sock} pointer_obj={} keyboard_obj={} keymap_fd={} keymap_size={}",
+        state.pointer_obj as u8, state.keyboard_obj as u8, keymap_fd_flag, keymap_size,
+    );
+}
+
+/// Connect to one socket, dump its registry, then probe wl_seat. Returns the
+/// number of globals, or None if the socket could not be brought up.
 fn dump(dir: &str, sock: &str) -> Option<usize> {
     let path = format!("{dir}/{sock}");
     println!("{TAG} TRY sock={sock} path={path}");
@@ -105,7 +265,7 @@ fn dump(dir: &str, sock: &str) -> Option<usize> {
             return None;
         }
     };
-    let (globals, _queue) = match registry_queue_init::<S>(&conn) {
+    let (globals, mut queue) = match registry_queue_init::<S>(&conn) {
         Ok(v) => v,
         Err(e) => {
             println!("{TAG} FAIL sock={sock} stage=registry_init err={e}");
@@ -132,6 +292,11 @@ fn dump(dir: &str, sock: &str) -> Option<usize> {
         flags.push_str(&format!(" {p}={}", if present { 1 } else { 0 }));
     }
     println!("{TAG} MATCH sock={sock}{flags}");
+
+    match list.iter().find(|g| g.interface == "wl_seat") {
+        Some(g) => probe_seat(sock, &globals, &mut queue, g.version),
+        None => println!("{TAG} SEAT sock={sock} absent=1"),
+    }
 
     Some(list.len())
 }
