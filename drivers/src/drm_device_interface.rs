@@ -1768,6 +1768,56 @@ fn queue_flip_event(crtc_id: u32, user_data: u64) {
     PENDING_FLIPS.lock().push_back(blob);
 }
 
+/// Live-object census for the `[DRMSTAT]` line: `(dumb, dumb_retired, blob_objs,
+/// blob_handles)`.
+///
+/// DERIVED, NOT MAINTAINED. The maps *are* the census, so the numbers come from
+/// `.len()` (and one filtered count) rather than from increment/decrement sites.
+/// A hand-kept counter can only drift from the maps it claims to describe; this
+/// one cannot.
+///
+/// READING IT:
+///   * `bo_bhnd` sustained above `bo_blob` — more gem handles than objects —
+///     is a **handle leak**: handles are being minted and never retired.
+///   * `bo_blob` above `bo_bhnd` is the healthy converse: objects outliving
+///     their handles because an exported dmabuf fd still pins them.
+///   * `bo_dumbret` climbing monotonically is the **retention leak**: dumb
+///     records retired as handles but never dropped by their last exporting fd.
+///   * `bo_dumb` must be bounded over a session. Unbounded growth there is the
+///     item 9 per-frame handle leak becoming real.
+///
+/// LOCKING — the whole reason this is a separate function. `drm_tick` runs in
+/// **IRQ context at 100 Hz**. A blocking `.lock()` here deadlocks the instant
+/// the tick interrupts a thread on the same CPU that already holds one of these
+/// mutexes from an ioctl — the `RUN_QUEUE` freeze shape, which wedges every CPU
+/// with no panic. So: `try_lock()` only, never `.lock()`, and specifically NOT
+/// `blob_obj_count()`, which blocks and is for syscall context.
+///
+/// A field that could not be sampled reads `u64::MAX`, not 0, so a missed
+/// sample is legible as *missed*. Zero would be indistinguishable from "every
+/// object was freed", which is exactly the conclusion this instrument exists to
+/// support or refute. Occasional `u64::MAX` under load is expected; a field
+/// stuck there means the lock is never free and the sample is worthless.
+fn bo_census() -> (u64, u64, u64, u64) {
+    const MISSED: u64 = u64::MAX;
+    let (dumb, dumb_retired) = match DUMB_BUFFERS.try_lock() {
+        Some(m) => (
+            m.len() as u64,
+            m.values().filter(|b| !b.handle_live).count() as u64,
+        ),
+        None => (MISSED, MISSED),
+    };
+    let blob_objs = match BLOB_OBJS.try_lock() {
+        Some(m) => m.len() as u64,
+        None => MISSED,
+    };
+    let blob_handles = match BLOB_BUFFERS.try_lock() {
+        Some(m) => m.len() as u64,
+        None => MISSED,
+    };
+    (dumb, dumb_retired, blob_objs, blob_handles)
+}
+
 /// 100 Hz tick hook (IRQ context): promote at most one pending flip to readable,
 /// throttled to ~50 Hz. MUST be non-blocking (try_lock only) and MUST NOT wake
 /// pollers when nothing is delivered — otherwise idle CPU regresses. Registered
@@ -1822,6 +1872,21 @@ pub fn drm_tick() {
             // input-send-event only proves the host queued them.
             crate::pci::serial_debug(" evpush=");
             crate::pci::serial_debug_hex_64(evdev_server::events_pushed());
+            // Live-object census, DERIVED from the maps (see `bo_census`). New
+            // fields go at the END of the line, never in the middle: `c5abb8d`
+            // inserted five `dmg_*` fields mid-line and every position-keyed
+            // parser downstream silently reported zero for everything after
+            // them. `0xffffffffffffffff` in any of these four means the sample
+            // was skipped on lock contention, NOT that the map is empty.
+            let (bo_dumb, bo_dumbret, bo_blob, bo_bhnd) = bo_census();
+            crate::pci::serial_debug(" bo_dumb=");
+            crate::pci::serial_debug_hex_64(bo_dumb);
+            crate::pci::serial_debug(" bo_dumbret=");
+            crate::pci::serial_debug_hex_64(bo_dumbret);
+            crate::pci::serial_debug(" bo_blob=");
+            crate::pci::serial_debug_hex_64(bo_blob);
+            crate::pci::serial_debug(" bo_bhnd=");
+            crate::pci::serial_debug_hex_64(bo_bhnd);
             crate::pci::serial_debug("\n");
         }
     }
