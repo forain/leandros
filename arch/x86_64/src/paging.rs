@@ -15,8 +15,234 @@ bitflags! {
         const ACCESSED      = 1 << 5;
         const DIRTY         = 1 << 6;
         const HUGE          = 1 << 7;
+        /// Bit 7 again, under the name it has in a **leaf 4 KiB PTE**: the PAT
+        /// bit, the high bit of the 3-bit index (PAT:PCD:PWT) into IA32_PAT.
+        ///
+        /// It is the same bit as `HUGE` because the two never coexist: bit 7 is
+        /// PS in a PDPTE/PDE and PAT in a PT entry, and this kernel writes leaf
+        /// entries only at the PT level (`map_4k` is the only function that
+        /// writes a mapping, and `ensure_table` masks intermediate entries down
+        /// to PRESENT|WRITABLE|USER before storing them, so this bit can never
+        /// reach a level where it would mean "huge page"). On a 2 MiB PDE the
+        /// PAT bit is bit **12**, not bit 7 — if a 2 MiB mapping path is ever
+        /// added it needs its own constant, not this one.
+        const PAT_4K        = 1 << 7;
         const NO_EXECUTE    = 1 << 63;
     }
+}
+
+// ── IA32_PAT (MSR 0x277) ──────────────────────────────────────────────────────
+
+/// Page Attribute Table MSR.
+#[cfg(target_arch = "x86_64")]
+const IA32_PAT: u32 = 0x277;
+
+/// PAT entry encodings (SDM Vol 3A, Table 11-10).
+#[cfg(target_arch = "x86_64")]
+const PAT_TYPE_WC: u64 = 0x01;
+
+/// Which IA32_PAT entry this kernel guarantees is Write Combining.
+///
+/// PA5 is selected by a leaf PTE with PAT=1, PCD=0, PWT=1 (index 0b101).
+///
+/// The choice is not arbitrary and not merely "an unused slot" — it is the slot
+/// for which the write is provably harmless on *both* of our boot paths:
+///
+///   * Under Limine 11.4.1, PA5 is **already** WC. Both of the bootloader's
+///     `wrmsr 0x277` sites (one guarded by `test edx, 0x10000`, the CPUID.01H
+///     PAT feature bit) write EDX:EAX = 0x00000105:0x00070406, i.e.
+///     PA0=WB PA1=WT PA2=UC- PA3=UC PA4=WP PA5=WC PA6=UC PA7=UC. Writing WC to
+///     PA5 there is a value-identical store: it cannot reinterpret a single
+///     existing translation, including whichever of Limine's own mappings set
+///     the PAT bit to get WC (the framebuffer).
+///
+///   * Under our direct-boot path (`kernel/src/entry_x86_64.s`), which writes
+///     only EFER and never touches IA32_PAT, the reset PAT applies and PA5 is
+///     WT. There the write does change the slot — but nothing can be selecting
+///     it: a PTE only reaches PA4..PA7 by setting the PAT bit, and setting that
+///     bit without having programmed IA32_PAT is exactly what Limine's CPUID
+///     guard exists to avoid. Our own mappings have never set it (this constant
+///     is its first user), and the direct-boot page tables are 2 MiB PDEs whose
+///     PAT bit (bit 12) is clear.
+///
+/// So on the loader path the value is unchanged, and on the direct-boot path
+/// the slot has no users. Both branches leave every live translation meaning
+/// exactly what it meant before.
+#[cfg(target_arch = "x86_64")]
+const PAT_IDX_WC: u32 = 5;
+
+/// IA32_PAT as the BSP left it, for every AP to adopt verbatim.
+///
+/// The *inherited* value is not kept in a static, only printed: it is the
+/// evidence for everything `PAT_IDX_WC` claims — and the one thing static
+/// analysis of a binary bootloader cannot settle on its own — but nothing in
+/// the kernel consumes it, and a static no code reads is a static the optimiser
+/// is free to stop writing. Expect `before=0x0000010500070406
+/// after=0x0000010500070406` on the Limine path (unchanged, as argued above)
+/// and `before=0x0007040600070406 after=0x0007010600070406` on direct boot.
+#[cfg(target_arch = "x86_64")]
+pub static PAT_AFTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Set once the BSP has installed and read back a PAT with WC at `PAT_IDX_WC`.
+///
+/// Until it is true, `translate_flags` must not set the PAT bit in any PTE:
+/// on a processor without PAT support that bit is reserved in a 4 KiB PTE and
+/// setting it raises a reserved-bit #PF.
+#[cfg(target_arch = "x86_64")]
+static PAT_WC_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn pat_wc_ready() -> bool {
+    PAT_WC_READY.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn pat_wc_ready() -> bool { false }
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn rdmsr(msr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+    core::arch::asm!(
+        "rdmsr",
+        in("ecx")  msr,
+        out("eax") lo,
+        out("edx") hi,
+        options(nomem, nostack, preserves_flags)
+    );
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Install `value` in IA32_PAT on the calling CPU.
+///
+/// SDM Vol 3A §11.12.4 defers to §11.11.8 (the MTRR change protocol) for
+/// changing a PAT entry. The full protocol also enters no-fill cache mode
+/// (CR0.CD=1, NW=0) around the change and synchronises every processor at a
+/// rendezvous point. Both are omitted here, deliberately:
+///
+///   * **No-fill mode.** Its purpose is to stop *this* processor filling lines
+///     under a memory type that is mid-change. That hazard requires the CPU to
+///     hold cached data under a slot whose type is changing. On the BSP under
+///     Limine no slot changes at all (the store is value-identical). On the
+///     direct-boot path and on every AP, the slots that change have no PTE
+///     selecting them at the moment of the change — see `PAT_IDX_WC` and
+///     `init_pat_ap`. The `wbinvd` pair below covers the residual. CR0.CD=1 is
+///     also not free under virtualisation: KVM treats it as an MMU-wide
+///     memory-type event, so paying for it here would add risk, not remove it.
+///
+///   * **The MP rendezvous.** It exists so no two processors run with different
+///     PAT values while a shared mapping is live. We get that ordering
+///     structurally instead: the BSP installs its PAT at the top of
+///     `arch::init`, long before `smp_init` starts any AP, and each AP installs
+///     the identical value as the first thing it executes in Rust. The first
+///     mapping that can select a reprogrammed slot is created by `sys_mmap` for
+///     a DRM blob, which cannot happen until user space runs — by which point
+///     every online CPU has the same PAT.
+///
+/// CR4.PGE is cleared across the CR3 reload because a `mov cr3, cr3` does not
+/// invalidate global pages, and the loader may well have marked its own
+/// mappings global.
+#[cfg(target_arch = "x86_64")]
+unsafe fn write_pat(value: u64) {
+    use core::arch::asm;
+
+    let flags = crate::arch_interrupt_save(); // reads RFLAGS, then CLI
+
+    let cr4: u64;
+    asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    let pge = cr4 & (1 << 7);
+    if pge != 0 {
+        asm!("mov cr4, {}", in(reg) cr4 & !(1u64 << 7), options(nostack));
+    }
+
+    asm!("wbinvd", options(nostack));
+    asm!(
+        "wrmsr",
+        in("ecx")  IA32_PAT,
+        in("eax")  value as u32,
+        in("edx")  (value >> 32) as u32,
+        options(nomem, nostack, preserves_flags)
+    );
+    asm!("wbinvd", options(nostack));
+    asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack));
+
+    if pge != 0 {
+        asm!("mov cr4, {}", in(reg) cr4, options(nostack));
+    }
+
+    crate::arch_interrupt_restore(flags);
+}
+
+/// Install a PAT with Write Combining at `PAT_IDX_WC` on the BSP, and publish
+/// the exact value so every AP can adopt it verbatim.
+///
+/// Must run before anything creates a `PageFlags::WRITECOMBINE` mapping and
+/// before `smp::smp_init`; `arch::init` calls it first, ahead of even the GDT,
+/// because it needs nothing but `rdmsr`/`wrmsr` and the I/O-port UART.
+///
+/// A processor without CPUID.01H:EDX.PAT[16] leaves `PAT_WC_READY` false and
+/// `translate_flags` falls back to PCD (UC-) — exactly the behaviour that
+/// shipped before this existed.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn init_pat_bsp() {
+    use core::sync::atomic::Ordering;
+
+    let feat = core::arch::x86_64::__cpuid(1);
+    if feat.edx & (1 << 16) == 0 {
+        pat_print(0, 0, false);
+        return;
+    }
+
+    let before = rdmsr(IA32_PAT);
+    let shift = PAT_IDX_WC * 8;
+    let want = (before & !(0xFFu64 << shift)) | (PAT_TYPE_WC << shift);
+    write_pat(want);
+
+    let after = rdmsr(IA32_PAT);
+    PAT_AFTER.store(after, Ordering::Relaxed);
+
+    // Only claim WC once the CPU has actually confirmed it. A hypervisor that
+    // silently discards the write leaves us on the PCD/UC- path rather than
+    // handing user space a mapping we believe is WC and is not.
+    let ok = (after >> shift) & 0xFF == PAT_TYPE_WC;
+    PAT_WC_READY.store(ok, Ordering::Release);
+    pat_print(before, after, ok);
+}
+
+/// Adopt the BSP's PAT on an Application Processor.
+///
+/// An AP leaves INIT/SIPI with the *reset* PAT, so without this it disagrees
+/// with the BSP about every slot the loader changed — under Limine that is
+/// PA4, PA5 and PA6, and PA5 is the slot Limine's own WC mappings select. Two
+/// processors with different memory types for one physical page is the failure
+/// mode that shows up as rare corruption rather than a fault, so this copies
+/// the BSP's whole 64-bit value rather than just patching PA5.
+///
+/// Called as the first statement of `smp::sched_ap_entry`: at that point the AP
+/// has executed only the trampoline, touching nothing but its stack and the
+/// parameter block, both write-back through PA0 — a slot that is WB in the
+/// reset PAT and in the loader's, and which this never changes.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn init_pat_ap() {
+    use core::sync::atomic::Ordering;
+    if !PAT_WC_READY.load(Ordering::Acquire) { return; }
+    write_pat(PAT_AFTER.load(Ordering::Relaxed));
+}
+
+/// One line of boot evidence for the whole flag: what the loader left in
+/// IA32_PAT, what we left, and whether WC is live.
+#[cfg(target_arch = "x86_64")]
+unsafe fn pat_print(before: u64, after: u64, ok: bool) {
+    for b in b"[ARCH] IA32_PAT before=0x" { crate::arch_serial_putc(*b); }
+    pt_print_hex64(before);
+    for b in b" after=0x" { crate::arch_serial_putc(*b); }
+    pt_print_hex64(after);
+    for b in b" wc=" { crate::arch_serial_putc(*b); }
+    crate::arch_serial_putc(if ok { b'1' } else { b'0' });
+    crate::arch_serial_putc(b'\n');
 }
 
 pub const PAGE_SIZE: usize = 4096;
@@ -384,21 +610,33 @@ fn translate_flags(bits: u64) -> PageTableFlags {
     if src.contains(PageFlags::PRESENT)  { f |= PageTableFlags::PRESENT; }
     if src.contains(PageFlags::WRITABLE) { f |= PageTableFlags::WRITABLE; }
     if src.contains(PageFlags::USER)     { f |= PageTableFlags::USER; }
-    // NO_CACHE is PCD. This kernel programs neither IA32_PAT nor the MTRRs, so
-    // the reset PAT applies and PCD alone (PWT=0, PAT=0) selects PA2 = UC-.
+    // Cacheability. The PTE carries a 3-bit index (PAT:PCD:PWT) into IA32_PAT;
+    // this kernel uses exactly two of the eight entries.
     //
-    // WRITECOMBINE lands here too, deliberately. There is no WC entry in the
-    // reset PAT, so honouring WC exactly would mean bringing up IA32_PAT; UC is
-    // a strictly stronger substitute — the same coherence guarantee, worse
-    // write throughput — and UC/WC aliases of one physical page are compatible,
-    // where UC/WB and WC/WB are the combinations the SDM leaves undefined. The
-    // buffers that ask for it are small polled ones (Mesa's fence feedback), so
-    // the throughput does not matter; add a real PAT entry if that changes.
-    if src.contains(PageFlags::NOCACHE)
-        || src.contains(PageFlags::MMIO)
-        || src.contains(PageFlags::WRITECOMBINE)
-    {
+    // MMIO and NOCACHE take PCD alone (index 0b010 = PA2 = UC-), unchanged, and
+    // deliberately first: a device BAR must stay strongly ordered even if a
+    // caller also passes WRITECOMBINE. The precedence matches AArch64's.
+    //
+    // WRITECOMBINE takes PAT|PWT (index 0b101 = PA5), which `init_pat_bsp` has
+    // guaranteed is Write Combining — real write combining, not the UC- that
+    // stood in for it before there was any IA32_PAT setup here. That matters
+    // because WC is what the *host* asked for: a host-visible virtio-gpu blob
+    // is memory Mesa streams uploads through, and UC turns every store into its
+    // own bus transaction where WC coalesces them into full-line bursts.
+    //
+    // If PAT could not be programmed (no CPUID.01H:EDX.PAT, or the write did
+    // not stick) `pat_wc_ready` is false and this falls back to PCD/UC- — the
+    // previous behaviour, which is strictly stronger and was verified correct.
+    // The fallback must never be "leave both bits clear": that is PA0 = WB, a
+    // cached alias of host memory, which is the bug this all exists to prevent.
+    if src.contains(PageFlags::NOCACHE) || src.contains(PageFlags::MMIO) {
         f |= PageTableFlags::NO_CACHE;
+    } else if src.contains(PageFlags::WRITECOMBINE) {
+        if pat_wc_ready() {
+            f |= PageTableFlags::PAT_4K | PageTableFlags::WRITE_THROUGH;
+        } else {
+            f |= PageTableFlags::NO_CACHE;
+        }
     }
     // NO_EXECUTE if EXECUTE is NOT requested.
     if !src.contains(PageFlags::EXECUTE) { f |= PageTableFlags::NO_EXECUTE; }

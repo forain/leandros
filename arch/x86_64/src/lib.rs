@@ -34,7 +34,15 @@ pub unsafe extern "C" fn arch_flush_cache_range(_addr: usize, _len: usize) {
 ///   4. APIC — masks 8259 PIC, enables LAPIC; must precede timer init.
 ///   5. Timer — programs APIC timer (calibration uses PIT ch2 briefly).
 ///   6. SYSCALL — LSTAR/STAR/SFMASK, independent of interrupt routing.
+///
+/// IA32_PAT comes before all of it: it needs nothing but `rdmsr`/`wrmsr` and
+/// the I/O-port UART, and everything after it — the LAPIC and framebuffer
+/// mappings below, and every AP `smp_init` starts at the end — must already see
+/// the finished value.
 pub fn init(info: &boot::BootInfo) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe { paging::init_pat_bsp(); }
+
     gdt::init();
     idt::init();
     #[cfg(target_arch = "x86_64")]

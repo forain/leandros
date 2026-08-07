@@ -263,9 +263,18 @@ pub unsafe extern "C" fn arch_cpu_id() -> usize {
 ///   4. IDT — `lidt` is a per-CPU register.
 ///   5. SYSCALL MSRs — EFER.SCE/STAR/LSTAR/FMASK are all per-CPU.
 ///   6. Local APIC timer — 100 Hz preemption ticks from BSP calibration.
+///
+/// IA32_PAT is step 0, before any of them. It is per-logical-processor like the
+/// SYSCALL MSRs, but unlike them a divergence is silent: an AP that keeps its
+/// reset PAT gives a different memory type to the same physical page than the
+/// BSP does, which the SDM leaves undefined and which shows up as occasional
+/// corruption rather than a fault. Doing it first also keeps the claim in
+/// `paging::init_pat_ap` true — that this AP has touched nothing but write-back
+/// memory when the value changes.
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub unsafe extern "C" fn sched_ap_entry() -> ! {
+    super::paging::init_pat_ap();
     apic::init();
     super::enable_sse();
     super::gdt::init_cpu(arch_cpu_id());
