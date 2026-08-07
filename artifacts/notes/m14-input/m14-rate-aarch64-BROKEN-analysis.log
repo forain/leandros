@@ -1,0 +1,30 @@
+=== BOOT aarch64 (TCG) ===
+QEMU started (PID 1619677, arch=aarch64)
+Serial socket up. Waiting for login/shell prompt (up to 120s)...
+Login prompt ready (use: driver.py login <user> <password>).
+
+=== LOGIN ===
+
+[?2004h[0m[?25l[41;1H[J[39mbrush-0.5# 
+=== RATE LADDER ===
+=== POSITIVE CONTROL (must FAIL) ===
+>>> CONTROL OK ('command not found')
+
+[qmp] send failed: timed out
+  rung 2/s: 3 moves in 61.1s (qmp 4 sent / 0 rejected)  evdev push 0 -> 10
+  rung 10/s: 100 moves in 10.0s (qmp 0 sent / 0 rejected)  evdev push 10 -> 10
+  rung 30/s: 300 moves in 10.0s (qmp 0 sent / 0 rejected)  evdev push 10 -> 10
+  rung 60/s: 600 moves in 10.0s (qmp 0 sent / 0 rejected)  evdev push 10 -> 10
+
+  IDLE tail: evdev push 10 -> 10 (must be flat)
+
+================ RATE LADDER ================
+ rate/s   moves  qmp_ok  qmp_rej  evdev_ev  ev/move  delivered%
+      2       3       4        0        10     3.33       83.3%
+     10     100       0        0         0     0.00        0.0%
+     30     300       0        0         0     0.00        0.0%
+     60     600       0        0         0     0.00        0.0%
+
+  ev/move at 4.00 = nothing lost. A column that FALLS as rate rises is buffer exhaustion, not a filter.
+>>> serial log: /tmp/m14-rate-aarch64/serial.log
+RUN_RC=0

@@ -1,0 +1,22 @@
+phases in stream order: ['IDLE', 'POINTER', 'CLICKKEY', 'IDLE2']
+
+-- IDLE --
+  [EVSTAT] dev=0 dt=18.0s push+0  drop+0  reads+0  eagain+0  deliv+0  pollin+0  rpid=37
+  [EVSTAT] dev=1 dt=18.0s push+0  drop+0  reads+0  eagain+0  deliv+0  pollin+0  rpid=37
+  [WLI]    no CENSUS inside this window
+
+-- POINTER --
+  [EVSTAT] dev=0 dt=44.0s push+0  drop+0  reads+0  eagain+0  deliv+0  pollin+0  rpid=37
+  [EVSTAT] dev=1 dt=44.0s push+32  drop+0  reads+2  eagain+1  deliv+32  pollin+2  rpid=37
+  [WLI]    no CENSUS inside this window
+
+-- CLICKKEY --
+  [EVSTAT] dev=0 dt=38.0s push+24  drop+0  reads+2  eagain+1  deliv+24  pollin+3  rpid=37
+  [EVSTAT] dev=1 dt=38.0s push+32  drop+0  reads+2  eagain+1  deliv+32  pollin+1  rpid=37
+  [WLI]    no CENSUS inside this window
+
+-- IDLE2 --
+  [EVSTAT] dev=0 dt=18.0s push+0  drop+0  reads+0  eagain+0  deliv+0  pollin+0  rpid=37
+  [EVSTAT] dev=1 dt=18.0s push+0  drop+0  reads+0  eagain+0  deliv+0  pollin+0  rpid=37
+  [WLI]    no CENSUS inside this window
+
