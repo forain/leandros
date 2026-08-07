@@ -3,12 +3,32 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-07** (`73258ea`), after a wave that landed six
-commits, **closed seven of the eleven open items**, and corrected eight recorded claims —
-five test-count or severity claims, three stale source pointers. The item count falls from
-eleven to four. That is not a change of pace: this wave was almost entirely *verification*
-of things the previous wave had built and assumed, and verification is the step that
-retires items.
+Last reconciled against `main` on **2026-08-07** (`b8ff2f6`), after a second same-day wave
+that landed three commits, **closed the present half of item 2 with an actual photograph**,
+emptied "Prepared but not landed" for the first time, cleared three deferred-list entries,
+and corrected two more recorded claims.
+
+**Landed in this wave.** `9d73b43` adds `drmsmoke --hold`, which paints a deterministic
+two-colour frame and keeps it on the scanout; it is what finally photographed the DRM
+present path on both arches. `cc82924` lands the long-prepared `driver.py --venus` mode.
+`b8ff2f6` moves DRM page-flip event timestamps off the 100 Hz tick onto the interpolated
+`arch_monotonic_ns()` clock, with `drmsmoke`'s new `FLIP_TS_SUBTICK` as the permanent
+detector, verified by mutation (control `cd51110d`, mutant `f19b6a35`, restore `cd51110d`
+byte-identical).
+
+**The lesson of this wave is that two of four "open" items were never work.** Item 1 is
+explicitly a finding whose own text says the fix is undecided and warns against fixing it
+kernel-side; item 3 is killed as an M4 route by measurement with nothing scheduled. Acting
+on either would have been inventing scope. The real remaining work was one item's first half
+plus a prepared patch and a handful of deferred-list entries — **read what an item says it
+is before scheduling it**, because a four-row table implies four tasks and this one held two.
+
+**A sizing correction that generalises.** Item 2 asked for "a standalone, Vulkan-free
+dumb-buffer present tool". No new tool was needed: `drmsmoke` already walked the whole path,
+and the two genuinely missing pieces were about the *photograph* (a checkable pattern, and
+not tearing down before capture), not the present. The item had been written as if from
+scratch. **Before sizing a task here, check whether an existing test binary already covers
+the path** — this file has now over-sized work at least once by not looking.
 
 **Landed on this Mac,** in order. `a85e209` corrects the aarch64 `ATTR_DEV`/`ATTR_NOCACHE`
 comments to the measured flat `MAIR_EL1 = 0xFF` — comments only, no code. `f43a79a` bounds
@@ -574,16 +594,10 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 
 ## Prepared but not landed
 
-One patch. `pat_bringup.patch` landed as `5ce8af2` and is gone from this list, not marked
-done.
-
-`~/code/leandros-artifacts/notes/m9-driverpy-venus/driverpy_venus.patch` — teaches
-`.claude/skills/run-leandros/driver.py` a `--venus` mode with the exact device line
-`run-qemu.sh --venus` uses, refusing `--venus` on non-UEFI boot modes and on macOS rather
-than degrading. Rebased onto the `cec0a04` `driver.py`, with its two TODO-item citations
-removed and its `screendump` docstring corrected (the failure was `DeviceNotFound` from a
-missing `id=`, not `"no surface"` — item 2). Re-checked `git apply --check`-clean against
-`73258ea`.
+**Nothing.** `driverpy_venus.patch` landed as `cc82924` — it applied clean, and its device
+line was verified character-for-character against `run-qemu.sh` rather than trusted. This
+section is now empty for the first time; keep it that way by landing prepared patches in the
+wave that prepares them, since both patches that sat here needed a rebase before they applied.
 
 ---
 
@@ -639,23 +653,45 @@ be a spec violation returning `VK_SUCCESS`. Attribution there is the cleanest in
 Vulkan arc: the same binary on a kernel with the PRIME commit reverted gives 16/1, and the
 single failure is `create_swapchain` (`VkResult(-10)`).
 
-**What is missing is a photograph, and this host cannot take one.** Bare `screendump` works
-and returns a valid 1920x1080 PPM, but its content is the text console: three colours
-(`#000000`, `#ffffff`, brush's `#cd0000`) and **not one `0x181818` pixel**, where
-`--present` paints a `0x181818` field with the 256x256 render centred. The `device=` route
-fails for two different reasons in sequence: first `DeviceNotFound`, because QMP resolves
+**The photograph now exists, on both arches, and the present half of this item is
+CLOSED** (`9d73b43`). The Venus host still cannot take one, and that diagnosis was correct
+and is unchanged: bare `screendump` there returns a valid PPM of the *text console*, and
+the `device=` route fails twice over — first `DeviceNotFound`, because QMP resolves
 `device=` as a **qdev id** and `--venus`'s device line carried no `id=`; then, with
-`,id=venusgpu` added, it **works before the present** (capturing Limine's stale 1280x800
-boot surface) and fails `"no surface"` only *after* the guest sets a scanout, because a
-virgl-backed scanout is a GL scanout with no `DisplaySurface`. That is a host-tooling limit,
-not a LeandrOS defect.
+`,id=venusgpu` added, it works *before* the present (capturing Limine's stale 1280x800 boot
+surface) and fails `"no surface"` only *after* the guest sets a scanout, because a
+virgl-backed scanout is a GL scanout with no `DisplaySurface`. Host-tooling limit, not a
+LeandrOS defect. The answer was to stop trying to photograph the Venus host at all.
 
-**The work is a standalone, Vulkan-free dumb-buffer present tool run on the default
-(non-Venus) `run-qemu.sh` path**, where the GPU is a plain virtio device with a real
-`DisplaySurface`. Bare `screendump` then captures it, and a `0x181818` field plus a known
-pattern is trivially checkable. That separates "does the DRM present path put pixels on a
-scanout" (answered: yes) from "does this Venus host have a photographable display"
-(answered: no) — and it is the only remaining hop between the wire trace and photons.
+**What closed it was `drmsmoke --hold`, not a new tool.** The item called for "a standalone,
+Vulkan-free dumb-buffer present tool"; `drmsmoke` already walked the entire path
+(GETRESOURCES → GETCONNECTOR → CREATE_DUMB → MAP_DUMB → mmap → ADDFB2 → SETCRTC → DIRTYFB).
+Only two things were actually missing, and both were about the *photograph*, not the
+present: it painted a gradient (awkward to verify) and it tore down and exited, after which
+the console driver reclaimed the scanout. `--hold` paints `0x181818` with a 256x256
+`0xFF0000` block at (64,64) and never exits. **A whole new tool would have been wasted
+work** — worth remembering the next time this file sizes a task, because the item was
+written as if from scratch.
+
+**Result, on the default non-Venus path where the GPU has a real `DisplaySurface`.**
+aarch64 1280x800: exactly **65,536** `0xff0000` pixels and **958,464** `0x181818`,
+accounting for all 1,024,000. x86_64 1920x1080: **65,536** and **2,008,064**, all
+2,073,600. Block corners exact at (64,64)–(319,319); the pixel just outside each edge is
+field. **No third colour exists anywhere in either frame** — the text console is entirely
+gone, which is the part that shows the guest owns the scanout rather than merely having
+drawn somewhere. `SETCRTC: PASS` is cross-footed against the sentinel, because `--hold`
+prints its sentinel even when painting was skipped; the sentinel alone is not proof.
+
+So "does the DRM present path put pixels on a scanout" is now answered **by photograph**,
+not only by wire trace, and it is separated cleanly from "does this Venus host have a
+photographable display" (still no). Two notes for whoever runs this next. `--hold`
+deliberately **diverges** rather than falling through — the default path's PRIME round-trip
+overwrites pixel (0,0) and would corrupt the image being measured. And on x86_64 a
+backgrounded `drmsmoke --hold &` produced **no serial output at all** while the identical
+invocation on aarch64 did, with foreground on x86_64 passing every subtest; run it in the
+foreground there and capture via the QMP monitor, which is a separate channel. That is an
+output-routing difference in shell job control — **mechanism not established, recorded as an
+observation only.**
 
 **M4 goes via `MESA_VK_WSI_DEBUG=sw`, not via cross-open dmabuf.** cosmic-comp does not
 advertise `zwp_linux_dmabuf_v1` here (Standing context; item 3), and Mesa's WSI binds
@@ -751,16 +787,21 @@ Design, staging and per-stage guard tests with their falsifying mutations:
 - **`/proc/self/exe` returns `/bin/init`** regardless of the caller.
 - **libseat shim eventfd workaround** (`0bed5ad`) is inert now that the kernel honours
   `EFD_NONBLOCK`, and can be simplified.
-- **DRM page-flip event timestamps** (`drivers/src/drm_device_interface.rs:1761-1762`) are
-  still built from the 100 Hz tick scheme (`tv_sec = now/100`, `tv_usec = (now%100)*10_000`),
-  and smithay reads them for presentation feedback — worth moving to the interpolated clock
-  in the same sweep.
-- **Harness gotchas in `~/code/leandros-artifacts/m8_cursor.py`.** Two, both silent: it
-  picks its "busiest window" by `curs_mv` delta, which is identically 0 on the legacy KMS
-  path, so a legacy-path control prints a degenerate `1.00 flips/s` instead of erroring
-  (key the window on `evpush` instead); and its positional regex zeroes every `[DRMSTAT]`
-  field after `flip_us` now that `c5abb8d` inserted five `dmg_*` fields there. Prefer
-  `m9-fb-damage-clips/m9_analyze.py`, which parses `key=0xHEX` pairs order-independently.
+- ~~**DRM page-flip event timestamps**~~ — **done** (`b8ff2f6`), verified by mutation.
+  `queue_flip_event` now stamps from `arch_monotonic_ns()`. The layering problem is worth
+  remembering: `drivers` has **no Cargo edge** to the arch crates, and the tree's existing
+  answer is a `#[no_mangle] extern "C"` symbol resolved at link time (`servers/evdev`
+  already does this for input timestamps) — reach for that before adding a dependency edge.
+  `drmsmoke`'s new `FLIP_TS_SUBTICK` is the permanent detector.
+- ~~**Harness gotchas in `m8_cursor.py`**~~ — **both fixed** (artifacts repo, not under git).
+  **Correction: the recorded mechanism for the first one was stale.** The file already keyed
+  its busiest window on `evpush`; the surviving bug was that the no-activity branch fell
+  through to `return 0` instead of erroring, so a legacy-path control still printed a
+  degenerate `1.00 flips/s` — symptom recorded correctly, cause not. It now exits non-zero
+  with a message. The positional-regex shear was real and is replaced by the
+  order-independent `key=0xHEX` parser from `m9-fb-damage-clips/m9_analyze.py`, verified
+  against a real capture carrying the `dmg_*` insertion **and** against a synthetic line
+  with a field inserted mid-stream, so it tolerates the next insertion too.
 - **Build gotcha:** building a userland test binary with a bare `cargo build` instead of
   `scripts/build-userland.sh` omits `-C relocation-model=static`, producing a PIE whose
   `.data.rel.ro` our loader never relocates. It then faults at `__libc_start_main+0x44`
@@ -783,7 +824,16 @@ Design, staging and per-stage guard tests with their falsifying mutations:
   `~/code/leandros-artifacts/m9-wlglobals/out/wl-globals-<arch>`, same conditional pattern
   as `leandros-applet`. It is a measurement instrument (it enumerates the `wl_registry` of
   every `wayland-*` socket in `$XDG_RUNTIME_DIR` and exits); nothing in the session depends
-  on it. **Only aarch64 has been built** — x86_64 was never staged.
+  on it. **Both arches are now built and staged**; the crate's `.cargo/config.toml` already
+  carried the x86_64 target section, it had simply never been exercised. Needs
+  `cargo +nightly` — the default stable toolchain has no Linux musl targets installed.
+  **Correction worth keeping:** the `-C relocation-model=static` landmine below does **not**
+  apply to this binary. `wl-globals`, like `leandros-applet`, is a genuine *dynamically
+  linked* PIE with a real `PT_INTERP` (`/lib/ld-musl-<arch>.so.1`), built with
+  `-C target-feature=-crt-static -C relocation-model=pic` against `m3-gl-stack/sysroot-<arch>`.
+  The landmine is about Rust's self-relocating *static*-PIE, which is a different recipe.
+  Applying it here would break a working build. Both arches verified to have identical ELF
+  shape (DYN, 11 program headers, same order).
 - **Two spent instruments, kept but not pending.**
   `~/code/leandros-artifacts/notes/m9-damage-rootcause/damage_rect_dump.patch` (132 lines,
   one file, entirely inside the `DRM_STATS` gate) was applied on the box, produced the
