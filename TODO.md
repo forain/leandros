@@ -160,13 +160,23 @@ inferred is that the input held a rect of ≥ 1,809,216 px.
    `:2833` was also stale — that offset is `std_handle_get_blob` — and the function has
    moved again since. **Verify every line number against the tree before writing it here;
    this file has now shipped stale ones twice.**
-6. **Only two TODO-citation violations existed, not three.**
+6. **Zero TODO-citation violations existed, not three and not one.**
    `userland/vfstest/src/main.rs:1` and `userland/f2fstest/src/main.rs:1` had already been
    fixed by `033f3d0`, an ancestor of HEAD. The `driverpy_venus.patch` citations were real
-   and are now removed. **One new violation exists**, introduced by `73258ea`:
-   `drivers/src/drm_device_interface.rs:1787` cites "item 9", and it repeats the per-frame
-   severity claim that correction 4 refutes. Two wrongs in one comment line; it is a
-   one-line fix, deliberately not folded into this documentation commit.
+   and are now removed. The "one new violation" recorded here — `73258ea`'s `bo_dumb`
+   doc comment citing "item 9" and repeating the refuted per-frame severity claim — **was
+   already fixed by `20525aa`**, also an ancestor of HEAD, which dropped the citation *and*
+   corrected the magnitude to per-exported-buffer in the same commit. `git grep` for
+   `TODO\.md item\|TODO item [0-9]` over `drivers/ servers/ userland/ kernel/ mm/ arch/
+   scripts/` at HEAD returns **nothing**; the only hits anywhere are dated reports under
+   `artifacts/notes/`, which are historical records and out of the rule's scope.
+   **The sharper lesson, and it is about this file rather than about the code: the entry
+   claimed it was "found by `grep …` at reconciliation time", and that grep cannot have
+   been run — the pre-`20525aa` text would have matched it and the post-`20525aa` text does
+   not.** A recorded provenance is not evidence that the command was run. This is now the
+   *second* citation entry in one wave that reported a violation an ancestor had already
+   cleared, and both would have been caught by actually running the one-line grep against
+   HEAD. Run it; do not narrate it.
 7. **The two trees were never divergent as recorded.** The box was already at `a1568ec`
    when this wave began, not at `a0325c6`, with `git patch-id --stable` matching on both
    machines; it has since been synced forward. The standing lesson survives the correction
@@ -198,7 +208,8 @@ real DRM scanout.
 
 **Suite baselines.** On fresh images with `vfstest` run exactly once per image, both
 arches: vfstest **36/0**, scmtest **32/0**, drmsmoke **22/0**, wakepolltest 10/0,
-forktest 3/0, epolltest 9/0, polltest 6/0, sigtest 6/0, timertest 6/0, memtest 4/0,
+forktest 3/0, epolltest **10/0** (was 9/0 — `proc_pid_exe` added with the
+`/proc/<pid>/exe` fix), polltest 6/0, sigtest 6/0, timertest 6/0, memtest 4/0,
 idletest 2/0 (`IDLE_CPU_US 0`), evtest2 8/0. `waittest` has **4** subtests and is **4/0 or
 3/1 on either arch** — a pure timing race in `fork` → child `setpgid(0,0)`+`_exit` →
 parent `waitpid(-pid)`, measured on pristine kernels too; either result is acceptable on
@@ -350,11 +361,14 @@ reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print i
   same defect.
 - **Subtest comments and source comments must not cite TODO item numbers.** This file gets
   renumbered as items land — every citation has drifted within a day, every time. Point to
-  the defect or the commit instead; those do not move. **One violation is outstanding**,
-  found by `grep -rn 'TODO\.md item\|TODO item [0-9]'` at reconciliation time:
-  `drivers/src/drm_device_interface.rs:1787`. It also states the refuted per-frame severity.
-  (`userland/vfstest/src/main.rs:51` names an item by *topic*, "extended attributes", not by
-  number, and is fine — the rule is about numbers, which move.)
+  the defect or the commit instead; those do not move. **No violation is outstanding.**
+  `git grep -n 'TODO\.md item\|TODO item [0-9]'` over the source trees returns nothing at
+  HEAD; hits under `artifacts/notes/` are dated reports, which are historical records and
+  deliberately out of scope. (`userland/vfstest/src/main.rs:51` names an item by *topic*,
+  "extended attributes", not by number, and is fine — the rule is about numbers, which
+  move.) **Re-run that grep at reconciliation time and paste what it returns.** Twice now
+  this file has recorded a violation that an ancestor of HEAD had already fixed, the second
+  time while asserting the grep had been run.
 
 **Memory attributes, measured rather than assumed.**
 
@@ -437,7 +451,7 @@ the panel still connecting to the notifications daemon). It does not reproduce t
 does not contradict it. The bounded-not-climbing property rests on the `drmsmoke` cycles,
 which did exercise the path.
 
-**Instrument reliability — read this before trusting a number.** **Nineteen** separate
+**Instrument reliability — read this before trusting a number.** **Twenty-one** separate
 instruments have now produced believable wrong numbers, or would have. They are grouped by
 failure class rather than listed in order of discovery, because the class is what
 generalises; the specifics are what make each one actionable.
@@ -453,7 +467,12 @@ generalises; the specifics are what make each one actionable.
 2. `git apply --check … | head -10 && echo OK` reports success whenever `head` succeeds,
    because a pipeline's status is the *last* command's — so a patch that failed printed
    `APPLIES CLEAN` two lines below its own error text. Branch on the command itself
-   (`if git apply --check …; then`).
+   (`if git apply --check …; then`). **Hit a second time, live, while reconciling this very
+   file:** `pgrep -fl 'build-all.sh' | head -5 || echo "(no build running)"` printed
+   *neither* a process list nor the fallback, because `head` exited 0 and swallowed `pgrep`'s
+   "no match" status. The `||` branch is just as status-blind as the `&&` branch. Use
+   `if pgrep -f …; then … else … fi`. Two independent instances now; this is the most
+   frequently re-walked trap in the list.
 3. `driver.py start` printed `QEMU started` over a guest that had already exited, because
    `aarch64_vars.fd` was missing. The serial log was 0 bytes, so every test read as *absent*
    rather than *failed* — in a suite that greps for PASS lines, indistinguishable from a run
@@ -468,6 +487,21 @@ generalises; the specifics are what make each one actionable.
    run. Caught only because the positive control went silent on x86_64 after firing on
    aarch64 minutes earlier. Fix: hold one connection for the whole command, which
    `scripts/scmrun.py` does.
+20. **A truncated build log is uninformative in BOTH directions, and it misled in the
+    unexpected one.** A delegated lane's `tee`-redirected copy of `build-all.sh` desynced and
+    stopped mid-run at `Output: mame-aarch64 (372M)` — 22 KB, **zero** `error`/`failed` lines.
+    `grep -ciE '^error|error\[|failed'` returns **0**, *identical* to a clean build and the
+    same shape as entry 4's `grep -c ': FAIL'` on a truncated capture. That is the expected
+    trap. **What actually happened was the mirror image: the build had SUCCEEDED, and the
+    truncated log plus an absent process led the coordinator to record it as killed.** The
+    lesson is therefore stronger than "a truncated log can fake success" — a truncated log
+    supports *whatever* you already suspect, and "no process running" is equally consistent
+    with finished and with dead.
+    **Cross-foot against the build's products, not its log.** One `ls` settled it:
+    `f2fs-data0-aarch64.img` was written at **09:38:05**, two minutes *after* the log's last
+    line at 09:36. Products have timestamps; a log only has content, and content is what
+    truncation destroys. Corollary for delegation: require the success sentinel
+    (`🎉 Build Complete!`) *or* a product mtime — never infer either outcome from silence.
 
 *Class B — the instrument measured something, but not the thing.*
 
@@ -543,6 +577,13 @@ generalises; the specifics are what make each one actionable.
     **background its work early**, while the console is still responsive.
 18. `driver.py cmd`'s shell-prompt heuristic swallowing error lines on TCG x86_64, where the
     guest is slow enough for the heuristic to break early.
+21. **An in-guest polling loop wedged the guest shell outright.** Relaying a test binary's
+    sentinels by redirecting its output to a file and polling with `$(grep … | tail …)` in a
+    loop produced **20 minutes of total console silence** — no sentinel, no `M4: DONE`, not
+    even the `cat` that followed the loop. Not root-caused; the working shape was to run the
+    binary in the foreground and **cut the output at the source** (`vkwl` gained a `quiet`
+    mode) rather than filter it downstream. Recorded as a landmine, not a diagnosis: if you
+    need a long guest run to be quiet, make the *program* quiet.
 19. A shared-scratchpad collision: a stale foreign results directory predating the run by
     ~40 minutes, with the wrong filenames, sitting exactly where a lane's output would be
     read from. Namespace scratch output per run, and stat the mtime before reading it.
@@ -588,53 +629,142 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | # | Item | Category | State |
 |---|---|---|---|
 | 1 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — **no action** | Recorded on purpose; fix undecided |
-| 2 | M4 — pixels unproven, aarch64 unmeasured | Feature — **in progress** | Client half achieved; see next steps |
+| 2 | M4 — **pixels PROVEN on x86_64**; aarch64 still unmeasured | Feature — **x86_64 DONE** | Photographed (`132d4df`); only aarch64 left |
 | 3 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | Nothing scheduled |
-| 4 | Deferred work and known limitations | Mixed | Backlog |
+| 4 | **fb console scrolls the scanout out from under cosmic-comp** | Bug — **actionable** | Measured; fix belongs in the kernel |
+| 5 | Deferred work and known limitations | Mixed | Backlog |
 
 ### Next steps, in the order they are worth doing
 
-1. **Prove M4's pixels.** Everything client-side is measured (300/300 presents); only the
-   photograph is missing. `id=venusgpu` (`a2f9fb6`) removed the `DeviceNotFound` half of the
-   problem, so `screendump device=venusgpu` now *resolves*. **Already tried, do not repeat:**
-   bare `screendump` captures **console 0**, the std-VGA that `--venus` deliberately keeps for
-   OVMF/Limine's GOP — it holds the text console, not the scanout, and this has now fooled two
-   separate measurements. Expect `device=venusgpu` to fail `"no surface"` *after* a frame is
-   presented, because a virgl-backed scanout is a GL scanout with no `DisplaySurface`. So the
-   remaining routes are: capture from the *host* side (virglrenderer/EGL), or add a
-   compositor-side readback, or accept the client-side evidence as sufficient and say so.
-   **This is a host-tooling problem, not a LeandrOS defect** — do not go looking in the kernel.
+1. **The Venus host CAN photograph a scanout — SOLVED (`f1bf200`), and what is left is
+   narrower than this item used to say.** The blocker was never a QEMU limitation:
+   `egl-headless` is a *converter, not a pixel sink*. Its `egl_scanout_flush`
+   (`ui/egl-headless.c`) ends in `egl_fb_read(edpy->ds, &edpy->blit_fb)` + `dpy_gfx_update()`
+   — a real GL→CPU readback into the 2D console surface, done so a paired 2D listener can
+   consume it, as `egl_is_compatible_dcl()` states outright. Nothing was attached to consume
+   it. Attach one:
+
+   `-display egl-headless -vnc 127.0.0.1:9,display=venusgpu`
+
+   with the device line otherwise unchanged. **The frame comes over RFB, not `screendump`.**
+   Instrument: `python3 -u artifacts/venuscap.py <arch> <out.ppm>`, which runs the positive
+   control, then `drmsmoke --hold`, waits for `DRMSMOKE: HOLD READY`, captures, and censuses —
+   all on one held serial connection, never touching QMP.
+   **Measured, and it is an exact match on both arches**, cross-footed by an independent
+   re-census of the PPMs rather than by re-running the capture script: x86_64/KVM 1920x1080 →
+   `0xff0000` **65,536**, `0x181818` **2,008,064**, **2 distinct colours**; aarch64/TCG
+   1280x800 → **65,536** / **958,464**, **2 distinct colours**. Both boots opened with
+   `nosuchbinary_xyz42` confirmed *failing*.
+
+   **Two recorded facts were wrong, and both were mine to correct.**
+   (a) *"A virgl-backed scanout is a GL scanout with no `DisplaySurface`"* — **false.** It has
+   one, correctly sized and full of real pixels: `virgl_cmd_set_scanout()`
+   (`hw/display/virtio-gpu-virgl.c:584`) calls `qemu_console_resize()` **first**, then
+   `dpy_gl_scanout_texture()`, which sets `console->scanout.kind = SCANOUT_TEXTURE`. The gate
+   is `qemu_console_surface()` (`ui/console.c:1488-1496`), which returns `NULL` for every kind
+   except `SCANOUT_SURFACE`. So **`screendump` can never photograph a Venus session under any
+   `device=` argument** — it refuses pixels that are physically present. That is *structural*,
+   not a missing surface, and it means `a2f9fb6`'s `id=venusgpu` did not open the door it
+   looked like it opened. Verified in QEMU 11.0.1 source, both hunks read directly.
+   (b) *"`--venus` deliberately keeps std-VGA for OVMF/Limine's GOP"* — **x86_64 only.** On
+   aarch64 `virt` there is no implicit VGA at all (the guest logs
+   `Framebuffer console resolution: 0x0 pitch=0`) and venusgpu is the only console, so the
+   console-0 trap that fooled two measurements **cannot arise there**.
+
+   **★ AND THE VULKAN CLIENT IS NOW PHOTOGRAPHED TOO — M4 IS COMPLETE ON x86_64**
+   (`aabab88`, `132d4df`). The carry-over was an inference when the paragraph above was
+   written; it is now a measurement. `drmsmoke` reaches the scanout via dumb-BO/2D, `vkwl`
+   via cosmic-comp compositing a `wl_shm` buffer Mesa filled by memcpy (plain `sw` — Venus
+   reports no `VK_EXT_external_memory_host`), and the *same unmodified* `egl-headless` + VNC
+   route photographed both.
+   **The discriminator was designed before the capture** and is recorded in
+   `artifacts/notes/m9-vkwl/precommit-pass-criteria.txt`. `vkwl` cycles 6 clear colours, so
+   the run was set to 304 frames because frames 302/303 land on the two whose 8-bit UNORM
+   conversions are least ambiguous — **predicted `0x2666f2` and `0xf2cc1a` in advance**.
+   Result, three captures in one boot at 1920x1080: control (desktop up, `vkwl` not started)
+   **0 and 0**; seq 302 **151,868 px of `0x2666f2`, 0 of the other**; seq 303 **151,868 px of
+   `0xf2cc19`**. Bbox `(721,163)-(1198,480)` = 478x318, fill **0.9991**, 98.87% of the 480x320
+   swapchain extent; the 1.13% is COSMIC's rounded corners plus its 1 px active-window border.
+   `0xf2cc19` vs the predicted `…1a` is one LSB of UNORM rounding, inside the stated ±2.
+   **Two independently predicted colours landing in the same rectangle, each absent from a
+   same-boot control, is what makes this evidence rather than "it looks like a desktop."**
+   Independently re-censused from the PNGs with a separate decoder: counts scale exactly 4:1
+   at half resolution (37,967 × 4 = 151,868), control zero for both.
+   Reproduce with `python3 -u artifacts/m9_vkcap.py /tmp/m9vk 304 150 90`.
+   **Still open:** aarch64 (step 2), and the `SET_SCANOUT_BLOB`/`SCANOUT_DMABUF` path, which
+   remains untested by the same reasoning that used to apply to Vulkan.
 2. **Run M4 on aarch64.** Entirely unmeasured — no baseline, no run. The aarch64 `vkwl` is
    built and staged (218,768 B) but has never executed. The box is x86_64, so an aarch64 guest
    falls to TCG and a COSMIC session on softpipe under TCG is impractically slow; this
    realistically needs the Mac, which has no EGL and therefore no Venus. **State the blocker
    plainly rather than half-running it.**
-3. **If a permanent Vulkan-Wayland test is wanted, write it in Rust as a `userland/` crate.**
-   **This repo is Rust; C does not come in.** `vkwl.c` therefore stays outside the repo, at
-   `~/code/leandros-artifacts/venus-lane/vkwl.c` on the host (and on the box), and is **not
-   versioned** — that is an accepted consequence of the Rust-only rule, not an oversight.
-   Treat it as a **throwaway probe that has already delivered its finding** (M4's client half,
-   300/300 presents): if the capability is worth keeping, it gets rewritten as a `no_std` Rust
-   crate built by `scripts/build-userland.sh`, alongside the other `userland/*test` binaries,
-   which satisfies both standing rules at once. Do not teach the build system a C path.
-   The same applies to the other host-side C probes (`vktest.c`, `ssp_guard.c`,
-   `caps_probe.c`, `wlclient.c`) — they are scaffolding, and they stay out.
-4. **Land the `mkfs` staging patch for `vkwl`/`m4-vkwl`** (`artifacts/notes/m9-vkwl/mkfs-vkwl.patch`),
-   once step 3 decides where `vkwl` lives. It is uncommitted on the box.
+3. **If a permanent Vulkan-Wayland test is wanted, write it in Rust — but NOT the way this
+   file previously prescribed, because that recipe cannot work.** `vkwl.c` stays outside the
+   repo, at `~/code/leandros-artifacts/venus-lane/vkwl.c` on the host (and on the box), and is
+   **not versioned** — an accepted consequence of the Rust-only rule, not an oversight. Treat
+   it as a **throwaway probe that has already delivered its finding** (M4's client half). The
+   same applies to the other host-side C probes (`vktest.c`, `ssp_guard.c`, `caps_probe.c`,
+   `wlclient.c`) — scaffolding, and they stay out. **Do not teach the build system a C path.**
 
----
+   **The recorded recipe — "a `no_std` Rust crate built by `scripts/build-userland.sh`,
+   alongside the other `userland/*test` binaries" — is unachievable, and the reason is
+   structural rather than a detail to work around.** `build-userland.sh` emits only *static*
+   binaries (`-C link-arg=-static -C relocation-model=static`, lines 66-67 and 76-78), and a
+   static binary **cannot `dlopen`**: relibc's `dlopen` returns `NULL` with
+   `"dlfcn not supported"` whenever `Tcb::current()` is `None` or `tcb.linker_ptr` is null
+   (`../relibc/src/header/dlfcn/mod.rs:95-106`), which is exactly the static case. `vkwl`
+   exists *because* it `dlopen`s the ICD — the Vulkan loader is deliberately unshipped and the
+   ICD can never stand in for `libvulkan.so.1`. So the prescription contradicts the binary's
+   whole reason for existing. **A plan can be rule-compliant and still impossible; this one
+   satisfied both standing rules and could never have produced a working binary.**
 
-## Prepared but not landed
+   The recipe that *does* work is `wl-globals`/`leandros-applet`'s: a dynamically linked musl
+   PIE with a real `PT_INTERP`, `-C target-feature=-crt-static -C relocation-model=pic`,
+   against `m3-gl-stack/sysroot-<arch>`. **Neither of those crates is in this repo** — both
+   live in `~/code/leandros-artifacts/` (`m9-wlglobals/`, `m7w-applet/`) and the repo only
+   *stages their prebuilt binaries*, conditionally, at
+   `scripts/mkfs-f2fs-populated.py:728-750`. So "write it as a `userland/` crate" has **no
+   in-tree precedent to copy**: either `build-userland.sh` grows a third, dynamic-musl mode,
+   or the crate sits in `userland/` deliberately excluded from the workspace with its own
+   `.cargo/config.toml`. Both are new shapes. Cost that honestly before scheduling it.
 
-Land prepared patches in the wave that prepares them — every patch that has sat in this
-section needed a rebase before it applied.
+   **Two further constraints, both new and neither obvious.** (a) The pure-Rust
+   `wayland-client` backend that `wl-globals` and `leandros-applet` use **will not do**:
+   `vkCreateWaylandSurfaceKHR` needs a real libwayland `wl_display*`/`wl_surface*` because
+   Mesa's `wsi_wl` marshals on it with `wl_proxy_*`. `vkwl` would be the first client here to
+   need `wayland-client`'s `system` feature, which links `libwayland-client` through a `cc`
+   build script — the most likely place a cross-compile breaks, and unexercised in this
+   project. (b) `ash` can take the ICD entry point directly via
+   `Entry::from_static_fn(StaticFn { get_instance_proc_addr })`, so no loader is needed; it
+   requires `std`, which is fine on musl and impossible on `*-unknown-none`. Estimated
+   **~450-650 lines with `ash`**, ~1300-1800 hand-rolling the FFI.
 
-One patch, now versioned at `artifacts/notes/m9-vkwl/mkfs-vkwl.patch`: it adds `vkwl` and
-`m4-vkwl` staging blocks to `scripts/mkfs-f2fs-populated.py`, conditional on the host binary
-existing (the same pattern as `leandros-applet` and `wl-globals`). It is uncommitted in the
-box's tree at `20525aa`. It is harmless to land here — the conditional
-simply never fires without the binaries — but it is not landed, because the Mac has no built
-`vkwl` and landing staging for a file that cannot exist would be noise.
+   **What `vkwl.c` actually is, since this file has described it loosely.** 763 lines. It
+   binds exactly **two** globals — `wl_compositor` and `xdg_wm_base` — and merely *observes*
+   `wl_shm`/`zwp_linux_dmabuf_v1` as flags; **Mesa's WSI binds those itself inside the ICD**.
+   The "54 globals" figure is a run *observation*, not a constant, and **"300 frames" is a
+   command-line argument — the default is 5.** Load-bearing details a rewrite would silently
+   drop: the up-to-40-roundtrip wait for the first `xdg_surface.configure` (without it a FIFO
+   swapchain deadlocks on the second acquire), the per-frame `wl_display_roundtrip`, the
+   `xdg_wm_base` pong (a missed pong gets the client killed), setting `MESA_VK_WSI_DEBUG`
+   *before* `vkCreateInstance`, and the `VKWL_ICD` escape hatch that lets the same binary run
+   against RADV on the host.
+4. **Fix the framebuffer console scrolling the scanout out from under cosmic-comp** — a real
+   bug, found while photographing M4, and the most valuable thing that lane produced besides
+   the photograph. The fb console scrolls the **whole** framebuffer on every line, including
+   the region cosmic-comp is scanning out. The compositor repaints only damaged regions, so
+   anything static is scrolled away and never redrawn.
+   **Measured, with a prediction made first.** With `vkwl` logging one line per frame,
+   distinct colours collapsed **334,503 → 177**, **79% of the screen went pure black** (the
+   wallpaper was simply gone), and the client's four previous frame colours were smeared into
+   bands above the current one, each an exact multiple of the 15 px text row. The panel bar
+   survived — its clock ticks, so it damages itself every second. The prediction that running
+   the client `quiet` would restore the wallpaper, push fill ≥ 0.95 and drop the held count
+   toward the extent was **confirmed on all three counts**, and the single 31 px residue band
+   left in capture C is exactly the two console lines legible at the bottom of that frame.
+   **The fix belongs in the kernel** — stop painting the fb console once a DRM master owns the
+   scanout — **not in silencing clients.** Any guest program that writes to the console during
+   a session currently corrupts the display.
 
 ---
 
@@ -691,14 +821,19 @@ Vulkan arc: the same binary on a kernel with the PRIME commit reverted gives 16/
 single failure is `create_swapchain` (`VkResult(-10)`).
 
 **The photograph now exists, on both arches, and the present half of this item is
-CLOSED** (`9d73b43`). The Venus host still cannot take one, and that diagnosis was correct
-and is unchanged: bare `screendump` there returns a valid PPM of the *text console*, and
-the `device=` route fails twice over — first `DeviceNotFound`, because QMP resolves
-`device=` as a **qdev id** and `--venus`'s device line carried no `id=`; then, with
-`,id=venusgpu` added, it works *before* the present (capturing Limine's stale 1280x800 boot
-surface) and fails `"no surface"` only *after* the guest sets a scanout, because a
-virgl-backed scanout is a GL scanout with no `DisplaySurface`. Host-tooling limit, not a
-LeandrOS defect. The answer was to stop trying to photograph the Venus host at all.
+CLOSED** (`9d73b43`). **The follow-on claim that "the Venus host still cannot take one" is
+now REFUTED** (`f1bf200`) — see next-step 1 for the working invocation and the exact-match
+census on both arches. What survives of the original diagnosis is only the `screendump`
+half, and even that had the wrong mechanism: bare `screendump` does return a PPM of the
+*text console* on x86_64, and `device=` did fail `DeviceNotFound` before `a2f9fb6` added
+`id=`. But `"no surface"` afterwards is **not** because the surface is missing — it exists
+and holds real pixels; `qemu_console_surface()` refuses it because `scanout.kind` is
+`SCANOUT_TEXTURE`. So `screendump` is *structurally* incapable here, and the fix was never
+going to be a better `device=` argument.
+**The reasoning error worth keeping:** "`screendump` cannot photograph it" was generalised
+to "the host cannot photograph it", and the search stopped at the failing tool instead of
+asking what `egl-headless` does with the pixels it demonstrably reads back. One tool's
+structural limit is not the platform's.
 
 **What closed it was `drmsmoke --hold`, not a new tool.** The item called for "a standalone,
 Vulkan-free dumb-buffer present tool"; `drmsmoke` already walked the entire path
@@ -780,11 +915,17 @@ text console, and the capture legibly confirms the run (`M4: wayland-1 present a
 device failed because `screendump` resolves `device=` as a qdev **id** and `GPU_DEV` is
 `peripheral-anon`. That is the *same* missing-`id=` defect already recorded above, now hit
 from a second direction. **This does not show COSMIC failed to display — it shows the
-capture missed a different QEMU device.** Adding `id=` to `GPU_DEV` is the one-line fix, but
-note the earlier finding still applies afterwards: a virgl-backed scanout has no
-`DisplaySurface`, so `device=` is expected to then fail `"no surface"` once a frame is
-presented. **Client-side present success is measured and strong; visual confirmation is not
-available on this host by this route.**
+capture missed a different QEMU device.**
+**Superseded on the route, not on the result** (`f1bf200`). Adding `id=` was *not* the fix:
+`screendump` is structurally incapable of photographing a Venus scanout at any
+`device=` (`qemu_console_surface()` returns `NULL` unless `scanout.kind == SCANOUT_SURFACE`,
+and virgl sets `SCANOUT_TEXTURE`). The host **can** be photographed — pair `egl-headless`
+with a VNC consumer and fetch over RFB, exact-match verified on both arches with
+`drmsmoke --hold`. So "visual confirmation is not available on this host" is **false as
+stated**; what is true is that **`vkwl` itself has still not been photographed**, because
+the capture route was proven with a DRM client rather than a Vulkan one. Client-side present
+success remains measured and strong. The outstanding step is small and specific: run `vkwl`
+under a COSMIC session with `venuscap.py` attached.
 
 **aarch64 is entirely untested** — no baseline, no M4 run. The aarch64 `vkwl` is built and
 staged (218,768 B) but never executed. Every number in this item is x86_64.
@@ -828,7 +969,16 @@ that work is done; the `bo_dumb`/`bo_bhnd` census fields are the detector.
 Design, staging and per-stage guard tests with their falsifying mutations:
 `artifacts/notes/m9-crossopen-dmabuf/crossopen_design.md`.
 
-### 4. Deferred work and known limitations
+### 4. The fb console scrolls the scanout out from under cosmic-comp
+
+Full measurement, prediction and confirmation are in **next-step 4** above; this heading
+exists so the item has a home in the numbered list. One line for anyone scanning: **any guest
+program that writes to the console during a live COSMIC session corrupts the display**,
+because the fb console scrolls the entire framebuffer — including the region the compositor
+is scanning out — and the compositor only repaints damage. Fix in the kernel: stop painting
+the fb console once a DRM master owns the scanout.
+
+### 5. Deferred work and known limitations
 
 - **No shebang or binfmt support.** `execve` on a script fails with `Exec format error`, so
   `start-cosmic-leandros` — a shell script — must be launched as
@@ -866,9 +1016,85 @@ Design, staging and per-stage guard tests with their falsifying mutations:
   source comment says so.
 - **ELF loader follow-ups from the dynamic-linking wave**: interp is eagerly loaded
   (~4.8 MB per exec), and there is a pre-existing buddy-slack leak on the eager→lazy split.
-- **`/proc/self/exe` returns `/bin/init`** regardless of the caller.
-- **libseat shim eventfd workaround** (`0bed5ad`) is inert now that the kernel honours
-  `EFD_NONBLOCK`, and can be simplified.
+- **`/proc/self/exe` returns `/bin/init` regardless of the caller — WRONG AS RECORDED, and
+  the real defect was next door.** `/proc/self/exe` has worked correctly since `0aefc36`
+  (2026-07-21) added the tgid-keyed side table (`sched/src/lib.rs:921-956`), which
+  `sys_execve` populates. The item was stale by a fortnight. **What was actually broken:
+  `/proc/<pid>/exe` for a *numeric* pid had no handling at all** — it fell through to the
+  generic `VFS_READLINK`, found no such file and returned `-ENOENT`. So a caller naming a
+  process by pid (including itself) got an error, not a wrong path. Fixed in the working tree
+  by generalising the branch at `kernel/src/syscall.rs:5524`: parse `/proc/<digits>/exe`,
+  reject a pid naming no live task with `-ENOENT` (`exists_probe` returns 0 when live), map
+  pid → tgid, and reuse the lookup `self` already used. **No new kernel state** — the existing
+  table had everything, and fork/clone inheritance plus leader-exit cleanup were already
+  correct.
+  **Falsified by mutation, which is what makes the new subtest worth having.** With the kernel
+  hunk stashed and the *same* `epolltest` binary: `proc_pid_exe: path= /proc/5/exe got -1` →
+  FAIL, `pass=9 fail=1`, while `proc_self_exe` still **passed** — that control is what proves
+  the new subtest is testing the gap rather than some unrelated breakage. Restored:
+  `got /bin/epolltest`, `pass=10 fail=0`. Both arches 10/10, `vfstest` 36/36 both arches on
+  fresh images, `forktest` 3/3.
+  **The lesson is the one this file keeps re-learning:** a one-line deferred item stated a
+  symptom nobody re-checked, and the symptom had been fixed while the *adjacent* defect stayed
+  open. Re-derive a deferred item's premise before scheduling it — reading it is not enough.
+- **libseat shim eventfd workaround** (`0bed5ad`): the *premise* holds, the *conclusion*
+  overstated what was available, and chasing it exposed something worse.
+  **Premise, verified three ways:** the kernel does honour `EFD_NONBLOCK` now —
+  `handle_eventfd` stores `flags & (O_NONBLOCK_FL | O_CLOEXEC)`
+  (`servers/vfs/src/lib.rs:4821`, `O_NONBLOCK_FL = 0o4000` at `:1357`), `fd_nonblock` reads it
+  back (`:896`), and `sys_read_impl` returns on `-11` instead of yield-spinning when it is set
+  (`kernel/src/syscall.rs:4062-4067`). So the hang `0bed5ad` dodged is gone.
+  **But "can be simplified" was wrong.** What `0bed5ad` changed was *removing a `read()`*, and
+  not reading stays correct regardless: nothing anywhere writes that eventfd (no seatd/logind
+  backend exists), so `libseat_dispatch` has no messages to drain either way. The kernel fix
+  changes what a hypothetical read would *do*, not whether to do one. **Only the comment was
+  stale**, and it is now corrected in the working tree. A fix landing upstream of a workaround
+  does not automatically make the workaround removable — check whether the workaround's code
+  was ever load-bearing on the bug, or merely contemporaneous with it.
+- **The input-stack shims were unbuildable and unwired — FIXED in the working tree, and the
+  binaries were never actually drifted.** Before: `build-all.sh` never compiled
+  `ports/input-stack/shims/` (`grep -iE 'libseat|input-stack|build-shims' scripts/*.sh`
+  returned nothing), the image packed a prebuilt unversioned blob from
+  `~/code/leandros-artifacts/m4-input-ship/<arch>/usr/lib/`, and the only build script
+  hardcoded `D=/Users/forain/.claude-forain/jobs/afde2e74/tmp/d3-input-stack` — a one-off job
+  temp directory, unrunnable as checked in. Editing the tracked sources changed nothing.
+  Now: `build-shims.sh` is repo-relative (`SCRIPT_DIR`/`ROOT_DIR`, the `build-all.sh` idiom),
+  builds through `scripts/linker-<arch>-musl.sh` — the zig-cc wrapper already used for
+  coreutils/brush/bottom/relibc, rather than a new one — into
+  `target/input-stack-sysroot/<arch>/usr/lib/`, and `build-all.sh` calls it. `mkfs` **prefers**
+  the fresh build for `libseat.so.1`/`libudev.so.1` and falls back to the blob. Output stays
+  under `target/` deliberately: `~/code/leandros-artifacts` is not a git repo and mixes
+  built-from-source with hand-staged blobs for six other libraries, so writing there would
+  blur exactly the distinction this fix exists to make.
+  **The drift question is answered: there was none.** Rebuilt vs shipped, both arches, both
+  shims — identical `SONAME`, identical `llvm-nm -D --defined-only` **and**
+  `--undefined-only` symbol sets, every allocatable section matching; only `.debug_line`/
+  `.debug_str` differ, because the embedded source path shortened when the build left the job
+  temp dir. The blobs really were built from the tracked source. **The hazard was structural
+  — unreproducible and unwired — not an actual mismatch.**
+  **Verified positively rather than by absence.** Build sentinel `🎉 Build Complete!` present
+  once in a 2,646-line log; both arches boot to a login prompt with the `nosuchbinary_xyz42`
+  positive control confirmed failing; `anvil --help` reaches its own argument parser on both
+  arches, which is a real consumer dynamically linking the rebuilt shims rather than merely
+  finding them on disk. **The cross-foot that proves the preference logic actually fired in
+  the pipeline** (not just in isolation): `mkfs` packed 11552/64056 on aarch64 and
+  10928/63320 on x86_64 — the *fresh* sizes; the blob's are 11704/64136 and 11072/63408, all
+  four different. Both follow-ups were tested, not reasoned about: moving
+  `target/input-stack-sysroot` aside makes `mkfs` pack the blob's sizes (fallback genuinely
+  fires), and stripping `zig` from `PATH` prints
+  `⚠️ zig not found on PATH; skipping input-stack shim build` and exits 0.
+  **One hazard remains, flagged rather than fixed.** On a machine with **neither** `zig`
+  **nor** the `m4-input-ship` blob cache, the image builds successfully and **silently ships
+  with no `libseat.so.1`/`libudev.so.1` at all** — `usr_lib_files` simply omits them, and a
+  COSMIC session then fails at runtime with nothing in the build saying why. This is *not*
+  new: it is the pre-existing shape of every `os.path.exists()`-guarded blob in
+  `mkfs-f2fs-populated.py`. It is recorded because it is the "absence looks like success"
+  pattern that this file already tracks in five separate instrument entries, sitting in the
+  packaging step rather than in a measurement.
+  **A small trap met on the way:** `libseat.so.1` is a **16-byte symlink** to
+  `libseat.so.1.0.0`. An `ls -l` on it reports the symlink's size and mtime, not the
+  library's — which is how a "the blob predates its commit by 4h49m" reading got started
+  before symbol comparison replaced it. Stat the target, not the link.
 - **The interpolated clock CLAMPS, and every clamped timestamp ends in `9999`.** Both
   `arch/x86_64/src/timer.rs` and `arch/aarch64/src/timer.rs` end `monotonic_ns` with
   `break base + frac.min(9_999_999);`. A saturated stamp is therefore
@@ -927,6 +1153,13 @@ Design, staging and per-stage guard tests with their falsifying mutations:
   on it. **Both arches are now built and staged**; the crate's `.cargo/config.toml` already
   carried the x86_64 target section, it had simply never been exercised. Needs
   `cargo +nightly` — the default stable toolchain has no Linux musl targets installed.
+  **Why, precisely, and it flips the day the crate moves in-tree:** this repo's
+  `rust-toolchain.toml` already pins `nightly-2026-04-16` *and lists both musl targets*, so
+  a crate **inside** the repo needs no `+nightly` at all. `wl-globals` and `leandros-applet`
+  live in `~/code/leandros-artifacts/`, outside that file's scope, and neither carries a
+  `rust-toolchain.toml` of its own — verified, not assumed — so they fall back to the
+  default toolchain and the `+nightly` is genuinely required *there*. A toolchain pin is
+  directory-scoped; do not carry a caveat across a directory boundary without re-checking it.
   **Correction worth keeping:** the `-C relocation-model=static` landmine below does **not**
   apply to this binary. `wl-globals`, like `leandros-applet`, is a genuine *dynamically
   linked* PIE with a real `PT_INTERP` (`/lib/ld-musl-<arch>.so.1`), built with
@@ -943,12 +1176,24 @@ Design, staging and per-stage guard tests with their falsifying mutations:
   and must be rebuilt from their recorded recipes; `artifacts/.gitignore` keeps them out.
   **The original directory still exists and was not deleted** — it remains the place where
   builds actually run.
-  **`artifacts/` is Rust-only, like the rest of the repo: no `*.c` or `*.h` is imported**, and
-  `artifacts/.gitignore` blocks them so they cannot be reintroduced by a careless drop. The
-  host-side C probes (`vkwl.c`, `vktest.c`, `ssp_guard.c`, `caps_probe.c`, `wlclient.c`) stay
-  outside the repo and stay unversioned. That is deliberate — they are scaffolding that has
-  already yielded its findings, and the standing rule is that a capability worth keeping gets
-  **rewritten as a Rust `userland/` crate**, not imported as C.
+  **`artifacts/` imports no `*.c` or `*.h`**, and `artifacts/.gitignore` blocks them so they
+  cannot be reintroduced by a careless drop. The host-side C probes (`vkwl.c`, `vktest.c`,
+  `ssp_guard.c`, `caps_probe.c`, `wlclient.c`) stay outside the repo and stay unversioned.
+  That is deliberate — they are scaffolding that has already yielded its findings, and the
+  standing rule is that a capability worth keeping gets **rewritten in Rust**, not imported
+  as C.
+
+  **State that rule accurately, because "the repo is Rust-only" is false and a grep refutes
+  it in one command.** `git ls-files '*.c' '*.h'` returns **seven** files at HEAD: two
+  vendored (`.limine-cache/…/limine.c`, `limine-bios-hdd.h`), one stray
+  (`userland/libc/src/test_mmap.c`), and **four hand-written and actively maintained** —
+  `ports/input-stack/shims/{libseat,libudev}/*.{c,h}`, with real commit history such as
+  `0bed5ad`. The rule that actually holds, and that the shims satisfy rather than violate:
+  **new capability code is Rust; C exists only where the artifact *is* a C ABI.** A shim
+  whose entire job is to impersonate `libseat`'s symbol table has to be C — you cannot
+  provide a C library's ABI without writing the C ABI. `vkwl` is not that: it is a client
+  *of* an ABI, so nothing about it requires C. **Fixing the premise strengthens the rule.**
+  Stated as an absolute, the first person to run that grep concludes the rule is dead.
 - **Two spent instruments, kept but not pending.**
   `artifacts/notes/m9-damage-rootcause/damage_rect_dump.patch` (132 lines,
   one file, entirely inside the `DRM_STATS` gate) was applied on the box, produced the
