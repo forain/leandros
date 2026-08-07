@@ -1961,6 +1961,22 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
                     failures += 1;
                 }
 
+                // MODE_DESTROY_DUMB retires handles through the same path as
+                // GEM_CLOSE (upstream's drm_gem_handle_delete is literally
+                // shared between the two ioctls), so it inherits the per-open
+                // ownership test commit 49399f9 landed. fdB destroying fdA's
+                // handle must therefore be the same no-op the GEM_CLOSE above
+                // is, and the proof is again that fdA still works afterwards.
+                // Mesa reaches this: its kms-dri winsys releases every handle
+                // it owns with DESTROY_DUMB and never with GEM_CLOSE
+                // (kms_dri_sw_winsys.c:295, return value discarded).
+                let mut dd_b = h;
+                ioctl(fd_b, DRM_IOCTL_MODE_DESTROY_DUMB, &mut dd_b as *mut _);
+                let survived_dd = resource_info_rc(fd_a, h) == 0 && wait_bo(fd_a, h) == 0;
+                if !report(b"phase4_other_open_destroy_dumb_refused", survived_dd) {
+                    failures += 1;
+                }
+
                 // ── The per-open fence ───────────────────────────────────────
                 // While the submitting fence was one process-global atomic, an
                 // open that had never submitted still reported whichever open
@@ -2289,6 +2305,59 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
                     let objs2 = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_BLOB_OBJS);
                     if have_objs && !report(b"phase6_export_adds_no_object", objs2 == objs1) {
                         failures += 1;
+                    }
+
+                    // MODE_DESTROY_DUMB must release a BLOB handle, not only a
+                    // dumb one. Mesa's kms-dri winsys frees every handle it
+                    // owns — the ones it minted with CREATE_DUMB and the ones
+                    // it minted with drmPrimeFDToHandle alike — through
+                    // DESTROY_DUMB, and GEM_CLOSE appears nowhere in that file
+                    // (kms_dri_sw_winsys.c:295, return value discarded). A
+                    // DESTROY_DUMB that consults only the dumb registry
+                    // therefore leaks one object per import, once imports mint
+                    // handles at all. Uses a blob of its own so the export
+                    // sequence under test above is left untouched. Gated on the
+                    // object counter like the other counter assertions, and
+                    // BLOB_BUFFERS entries only exist on a host with blob
+                    // support, so this is unrunnable rather than green on a
+                    // host that refuses blob=on.
+                    if have_objs {
+                        let base = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_BLOB_OBJS);
+                        let mut g = DrmVirtgpuResourceCreateBlob {
+                            blob_mem: VIRTGPU_BLOB_MEM_GUEST,
+                            blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+                            size: P6_SIZE as u64,
+                            ..Default::default()
+                        };
+                        let g_made =
+                            ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB,
+                                  &mut g as *mut _) == 0
+                                && g.bo_handle != 0;
+                        let after_create =
+                            getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_BLOB_OBJS);
+                        if g_made {
+                            let mut dd = g.bo_handle;
+                            ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut dd as *mut _);
+                        }
+                        let after_destroy =
+                            getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_BLOB_OBJS);
+
+                        let created_one = g_made && after_create == base + 1;
+                        let released = created_one && after_destroy == base;
+                        if !released {
+                            out(b"  DESTROY_DUMB on a blob handle: live objects ");
+                            out_u64(base);
+                            out(b" -> ");
+                            out_param(after_create);
+                            out(b" -> ");
+                            out_param(after_destroy);
+                            out(b" (want back to ");
+                            out_u64(base);
+                            out(b")\n");
+                        }
+                        if !report(b"phase6_destroy_dumb_releases_blob_handle", released) {
+                            failures += 1;
+                        }
                     }
 
                     if exported && stamped {

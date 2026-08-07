@@ -1956,7 +1956,7 @@ impl DrmDeviceInterface {
             DRM_IOCTL_GET_MAGIC => self.std_handle_get_magic(arg),
             DRM_IOCTL_AUTH_MAGIC => Ok(0),
             DRM_IOCTL_GEM_CLOSE => self.std_handle_gem_close(arg, open_id),
-            DRM_IOCTL_MODE_DESTROY_DUMB => self.std_handle_destroy_dumb(arg),
+            DRM_IOCTL_MODE_DESTROY_DUMB => self.std_handle_destroy_dumb(arg, open_id),
             DRM_IOCTL_MODE_ADDFB2 => self.std_handle_addfb2(arg),
             DRM_IOCTL_MODE_RMFB => self.std_handle_rmfb(arg),
             DRM_IOCTL_MODE_DIRTYFB => self.std_handle_dirtyfb(arg),
@@ -3165,8 +3165,7 @@ impl DrmDeviceInterface {
     fn std_handle_gem_close(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let c = unsafe { ptr::read_unaligned(arg as *const drm_gem_close) };
-        Self::free_dumb(c.handle);
-        Self::free_blob_owned(c.handle, open_id);
+        Self::gem_handle_delete(c.handle, open_id);
         Ok(0)
     }
 
@@ -3206,19 +3205,43 @@ impl DrmDeviceInterface {
         }
     }
 
-    /// DRM_IOCTL_MODE_DESTROY_DUMB — retire the dumb buffer's gem handle.
+    /// The one handle-retirement path. Upstream, GEM_CLOSE and MODE_DESTROY_DUMB
+    /// are literally the same operation (both land in drm_gem_handle_delete, and
+    /// DESTROY_DUMB does NOT check that the handle names a dumb buffer). They are
+    /// the same operation here too, so the two ioctls cannot drift apart again.
     ///
-    /// Takes no `open_id` and consults no blob registry, so an *imported* blob
-    /// handle destroyed this way leaks its object. That matters — Mesa's
-    /// kms_swrast importer destroys imported handles with DESTROY_DUMB and not
-    /// GEM_CLOSE (`kms_dri_sw_winsys.c:288-296`) — but only once
-    /// PRIME_FD_TO_HANDLE mints importer handles at all, which it does not yet.
-    /// Deliberately left for that change rather than fixed speculatively here;
-    /// see the report's "MODE_DESTROY_DUMB" section.
-    fn std_handle_destroy_dumb(&mut self, arg: usize) -> Result<usize, DriverError> {
+    /// Exactly one reference is dropped, from whichever registry minted the
+    /// handle: `free_dumb` is idempotent on an already-retired dumb handle, and
+    /// `free_blob_owned` tests ownership and removes under a single
+    /// `BLOB_BUFFERS` acquisition, so two opens racing here cannot both unref.
+    /// The two handle spaces are disjoint, so calling both is not a double drop.
+    fn gem_handle_delete(handle: u32, open_id: u32) {
+        Self::free_dumb(handle);
+        Self::free_blob_owned(handle, open_id);
+    }
+
+    /// DRM_IOCTL_MODE_DESTROY_DUMB — retire the handle's gem handle.
+    ///
+    /// Not dumb-only, despite the name. Mesa's kms-dri winsys releases *every*
+    /// handle it owns this way — the ones it minted with CREATE_DUMB and the
+    /// ones it minted with drmPrimeFDToHandle alike — and `GEM_CLOSE` appears
+    /// nowhere in that file (`kms_dri_sw_winsys.c:295`, return value discarded).
+    /// Routing through `gem_handle_delete` matches upstream, where DESTROY_DUMB
+    /// does not check that the handle names a dumb buffer either.
+    ///
+    /// An unknown handle is `Ok(0)`, not `-ENOENT`, for three reasons.
+    /// `servers/drm/src/lib.rs:237` collapses every `DriverError` to
+    /// `err_reply(-1)`, which the VFS reports as EPERM, so `-ENOENT` is not even
+    /// expressible without first plumbing real errnos through the port protocol.
+    /// Mesa discards the return value at the call site above, so the distinction
+    /// would reach no caller. And an error here would contradict the idempotence
+    /// invariant landed in `49399f9` (see `free_dumb`), under which issuing both
+    /// DESTROY_DUMB and GEM_CLOSE on one handle is legitimate and drops one
+    /// reference in total — the second call must succeed and do nothing.
+    fn std_handle_destroy_dumb(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let d = unsafe { ptr::read_unaligned(arg as *const drm_mode_destroy_dumb) };
-        Self::free_dumb(d.handle);
+        Self::gem_handle_delete(d.handle, open_id);
         Ok(0)
     }
 
