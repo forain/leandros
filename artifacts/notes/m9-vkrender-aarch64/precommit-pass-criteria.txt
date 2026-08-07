@@ -1,0 +1,118 @@
+Pre-committed pass criteria for the aarch64 vkrender --present pixel capture.
+WRITTEN BEFORE ANY CAPTURE. Author: deep-reasoner lane, 2026-08-07.
+
+Subject: `vkrender --present --present-hold-ms=N` on aarch64/TCG under
+`--venus` (virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G -display egl-headless
+-vnc 127.0.0.1:9,display=venusgpu), frame fetched over RFB. No compositor.
+
+--------------------------------------------------------------------------
+WHAT THE PROGRAM PAINTS  (derived from source, not from any run)
+--------------------------------------------------------------------------
+venus-lane/vkrender.c:
+
+  #define IMG_W 256, IMG_H 256, IMG_BPP 4
+  CLEAR_RGBA[4] = { 0x00, 0x00, 0xFF, 0xFF }        (blue, R8G8B8A8_UNORM)
+  TRI_RGBA[4]   = { 0xFF, 0x00, 0x00, 0xFF }        (red)
+  TRI_AREA_PX = 18432, TRI_AREA_TOL = 600
+  subtest s2 renders into a 256x256 R8G8B8A8_UNORM attachment: clear to blue,
+  one triangle apex (128,32), base (32,224)-(224,224), then
+  vkCmdCopyImageToBuffer into the host-visible buffer g_host_ptr.
+  s2_no_intermediate_pixels asserts EVERY one of the 65536 source pixels is
+  exactly FF0000FF or 0000FFFF -- no blending, 1 sample, so no third value.
+
+do_present() (vkrender.c:1453-1560) then:
+  * SETCRTC's connector 1 / CRTC 1 at the connector's mode w x h
+  * fills the whole dumb BO with bytes 18 18 18 00
+  * centres the 256x256 render at ox = (w-256)/2, oy = (h-256)/2
+  * swaps channels on the way in: d[0]=s[2] (B), d[1]=s[1] (G), d[2]=s[0] (R),
+    d[3]=0, because DRM_FORMAT_XRGB8888 is little-endian B,G,R,X.
+
+The RFB client requests 32bpp true colour with shifts R=16 G=8 B=0, so each
+captured pixel reads back with '<I' as 0x00RRGGBB. Therefore:
+
+    source blue  (R=00,G=00,B=FF) -> captured 0x0000FF
+    source red   (R=FF,G=00,B=00) -> captured 0xFF0000
+    background                    -> captured 0x181818
+
+On the aarch64 mode already measured by drmsmoke --hold on this box
+(1280x800): ox = 512, oy = 272, so the render occupies exactly
+    x = 512..767 , y = 272..527.
+The triangle's screen-space extremes are apex (640,304) and base
+(544,496)-(736,496).
+
+--------------------------------------------------------------------------
+PASS CRITERIA -- all must hold on capture B (vkrender holding)
+--------------------------------------------------------------------------
+ P1  Resolution is the connector mode vkrender itself prints in
+     "[INFO] present: mode WxH". Expected 1280x800.
+ P2  Exactly THREE distinct colours in the whole frame:
+     0x181818, 0x0000FF, 0xFF0000. Not four, not two.
+ P3  count(0x181818) == W*H - 65536 exactly  (958464 at 1280x800).
+     This number involves no rounding anywhere in the chain; an off-by-one
+     blit, a wrong pitch or a wrong offset all break it.
+ P4  count(0xFF0000) + count(0x0000FF) == 65536 exactly.
+ P5  The union of the non-0x181818 pixels has bounding box exactly
+     x=ox..ox+255, y=oy..oy+255 (512..767, 272..527) and bbox fill == 1.0.
+ P6  count(0xFF0000) is within 18432 +/- 600 -- the analytic area of the
+     triangle, computed from geometry, independent of any run.
+ P7  EXACT AGREEMENT WITH THE GUEST'S OWN COUNT. The same run prints
+     "[INFO] s2_coverage: triangle=T clear=C other=K (total 65536)" from the
+     CPU-side readback of the rendered image, before any of it touches DRM.
+     Require, exactly:
+         count(0xFF0000) == T
+         count(0x0000FF) == C
+         K == 0
+     This is the load-bearing criterion. T and C are whatever the GPU's fill
+     rule produced; the claim is that the number of pixels on the SCANOUT
+     equals the number of pixels the CLIENT rendered, to the pixel. Nothing
+     that is not this image can satisfy it.
+ P8  The run prints "[INFO] s2_checksum: FNV-1a over 262144 bytes =
+     0x02C0FDC5" -- the value pinned across x86_64/KVM, x86_64/TCG and
+     aarch64/TCG. This ties the photographed bytes to the already-verified
+     render, so "it drew something" and "it drew THE image" are separable.
+ P9  present_setcrtc: PASS and present_addfb2: PASS in the same run.
+ P10 Capture B is complete: 0 uncovered pixels.
+
+--------------------------------------------------------------------------
+SAME-BOOT CONTROLS -- both required
+--------------------------------------------------------------------------
+ A  BEFORE control, captured in the same boot with NO DRM client having run.
+    Requires: count(0x0000FF) in A == 0, and capture B is not byte-identical
+    to A. If A already contains 0x0000FF anywhere, P7/P2 are downgraded to
+    provisional and that is reported.
+ C  AFTER reference: `drmsmoke --hold` in the SAME boot, after vkrender has
+    exited. Its frame is already pinned on this box for aarch64:
+    1280x800, exactly 2 distinct colours, 65536 x 0xFF0000, 958464 x 0x181818.
+    C is what proves the capture path was working during this boot at all --
+    so "B looks wrong" and "the camera was broken" are distinguishable.
+    Note C paints NO blue: count(0x0000FF) in C must be 0, which makes the
+    blue in B unattributable to drmsmoke or to the capture route.
+ Ordering is deliberate: A and B both precede C, so C cannot contaminate B,
+ and drmsmoke's 0xFF0000/0x181818 palette cannot be mistaken for vkrender's.
+
+ Harness control: every boot opens with `nosuchbinary_xyz42` and the harness
+ must SEE it fail. If the failure text does not arrive, the run aborts --
+ absence and failure are not distinguishable on that console.
+
+--------------------------------------------------------------------------
+NAMED FAILURE MODES -- each is a different, reportable finding
+--------------------------------------------------------------------------
+ * No "--- vkrender done" and no present_* lines -> the client never got that
+   far on aarch64/TCG; a Vulkan/ring problem, not a scanout problem.
+ * present_setcrtc: FAIL -> kernel DRM modeset path, nothing to do with Venus.
+ * B byte-identical to A -> SETCRTC returned 0 but the scanout never changed.
+ * Frame is 2 colours 0x181818 + 0xFF0000 with a 256x256 block at (64,64)
+   -> we photographed drmsmoke's frame, i.e. the capture is stale.
+ * 0x0000FF present but 0xFF0000 absent -> the clear reached the scanout and
+   the draw did not: Venus graphics pipeline, not presentation.
+ * 0x00FF00-ish or blue<->red exchanged (0xFF0000 where 0x0000FF predicted)
+   -> channel order wrong in the XRGB swap or in the virgl blit.
+ * Right colours, count(0xFF0000) != T -> the image was resampled/scaled or
+   the capture straddled a partial blit.
+ * C fails its pinned census -> the capture path itself is broken this boot
+   and NOTHING about B is admissible.
+ * Guest never reaches a shell / TCG too slow -> report as a cost blocker
+   with the elapsed time, not as a Vulkan finding.
+
+"It looks like a blue square with a red triangle" is explicitly NOT a pass.
+P7 is.
