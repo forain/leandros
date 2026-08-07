@@ -451,7 +451,7 @@ the panel still connecting to the notifications daemon). It does not reproduce t
 does not contradict it. The bounded-not-climbing property rests on the `drmsmoke` cycles,
 which did exercise the path.
 
-**Instrument reliability — read this before trusting a number.** **Twenty-one** separate
+**Instrument reliability — read this before trusting a number.** **Twenty-two** separate
 instruments have now produced believable wrong numbers, or would have. They are grouped by
 failure class rather than listed in order of discovery, because the class is what
 generalises; the specifics are what make each one actionable.
@@ -577,6 +577,18 @@ generalises; the specifics are what make each one actionable.
     **background its work early**, while the console is still responsive.
 18. `driver.py cmd`'s shell-prompt heuristic swallowing error lines on TCG x86_64, where the
     guest is slow enough for the heuristic to break early.
+22. **`git add` skips ignored paths silently, so a commit can look complete while dropping
+    exactly the evidence it exists to preserve.** `artifacts/.gitignore` excluded `*.png` and
+    `*.log` to keep build output out and swept up every capture with it. `dc013c0` committed
+    the aarch64 vkrender `results.md` and `precommit-pass-criteria.txt`; the three frames and
+    both logs were dropped **without an error, without a warning, and with a clean
+    `git status` afterwards** — the lane reported them as landed in good faith. Caught only
+    because the next step was to re-census the PNGs and they were not there. Fixed by
+    `!notes/**/*.png` / `!notes/**/*.log` (`03ee4ee`). **The general shape: an exclusion rule
+    written for one category will silently capture anything that shares its file extension,
+    and `git add <dir>` reports nothing.** After committing evidence, `git show --stat` and
+    count the files. Every other entry in this list is about a measurement that lied; this one
+    is about the measurement surviving at all.
 21. **An in-guest polling loop wedged the guest shell outright.** Relaying a test binary's
     sentinels by redirecting its output to a file and polling with `$(grep … | tail …)` in a
     loop produced **20 minutes of total console silence** — no sentinel, no `M4: DONE`, not
@@ -629,7 +641,7 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | # | Item | Category | State |
 |---|---|---|---|
 | 1 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — **no action** | Recorded on purpose; fix undecided |
-| 2 | M4 — **pixels PROVEN on x86_64**; aarch64 still unmeasured | Feature — **x86_64 DONE** | Photographed (`132d4df`); only aarch64 left |
+| 2 | M4 — **pixels PROVEN on x86_64**; aarch64 has Vulkan-to-scanout but not WSI | Feature — **x86_64 DONE** | Photographed (`132d4df`, `dc013c0`); aarch64 WSI left |
 | 3 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | Nothing scheduled |
 | 4 | **fb console scrolls the scanout out from under cosmic-comp** | Bug — **actionable** | Measured; fix belongs in the kernel |
 | 5 | Deferred work and known limitations | Mixed | Backlog |
@@ -693,11 +705,36 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
    Reproduce with `python3 -u artifacts/m9_vkcap.py /tmp/m9vk 304 150 90`.
    **Still open:** aarch64 (step 2), and the `SET_SCANOUT_BLOB`/`SCANOUT_DMABUF` path, which
    remains untested by the same reasoning that used to apply to Vulkan.
-2. **Run M4 on aarch64.** Entirely unmeasured — no baseline, no run. The aarch64 `vkwl` is
-   built and staged (218,768 B) but has never executed. The box is x86_64, so an aarch64 guest
-   falls to TCG and a COSMIC session on softpipe under TCG is impractically slow; this
-   realistically needs the Mac, which has no EGL and therefore no Venus. **State the blocker
-   plainly rather than half-running it.**
+2. **aarch64: Vulkan-to-scanout is now PROVEN (`8634425`, `dc013c0`); M4 proper is still
+   open.** The recorded blocker — "a COSMIC session on softpipe under TCG is impractically
+   slow" — was true of the *COSMIC route* and was never checked against any other. It should
+   have been: `drmsmoke --hold` had **already** been photographed on aarch64 under `--venus`,
+   so the aarch64 capture path was proven, and `vkrender --present` drives Vulkan straight to
+   a scanout with **no compositor at all**. Composing two facts already in this file gives an
+   aarch64 Vulkan photograph without ever starting COSMIC. **The expensive part was the
+   compositor, not aarch64 Vulkan** — and the measurement says so outright: the full
+   51-subtest run reached its present hold **7.1 s** after the command was sent, on TCG.
+   **Result, one boot, three captures, all 1280x800, all fully accounted.** Control (no DRM
+   client had run): 3 colours, `0x000000` 985,722 / `0xffffff` 38,135 / `0xcd0000` 143 — a
+   text console holding **none** of the client's colours. `vkrender --present`: `0x181818`
+   **958,464**, `0x0000ff` **47,104**, `0xff0000` **18,432**, non-background bbox exactly
+   512..767 × 272..527 at fill **1.0000**. `drmsmoke --hold` in the *same boot* afterwards
+   reproduced its pinned 65,536/958,464 frame, which is what shows the camera was working.
+   **The criterion that makes this unfalsifiable-by-luck was pre-committed** in
+   `artifacts/notes/m9-vkrender-aarch64/precommit-pass-criteria.txt`, and it is the best
+   discriminator this project has used: the same run prints
+   `s2_coverage: triangle=18432 clear=47104 other=0` from a **CPU-side readback of the
+   rendered image, before any of it touches DRM**, and P7 required the scanout census to equal
+   that triple *exactly*. It does. 18,432 + 47,104 = 65,536 = the whole 256x256 image, and
+   `s2_checksum` came out at the pinned `0x02C0FDC5`. Re-censused here independently.
+   **Scope, stated plainly because it is easy to overclaim.** This route is
+   `vkCmdCopyImageToBuffer` → host-visible memory → dumb BO → `SETCRTC`. **No swapchain, no
+   WSI, no `vkQueuePresentKHR`, no dmabuf, no compositor.** It does **not** substitute for
+   x86_64's M4. `vkwl` on aarch64 remains unrun, and **n = 1** — one boot, not repeated.
+   Also unverified: the box did not rebuild its kernel, so this ran against a kernel predating
+   `883e33d`; immaterial here (that commit only touched `readlinkat`) but stated rather than
+   assumed. **What is left for M4 on aarch64 is the WSI half**, and its cost is now known to
+   be COSMIC's, not Vulkan's.
 3. **If a permanent Vulkan-Wayland test is wanted, write it in Rust — but NOT the way this
    file previously prescribed, because that recipe cannot work.** `vkwl.c` stays outside the
    repo, at `~/code/leandros-artifacts/venus-lane/vkwl.c` on the host (and on the box), and is
