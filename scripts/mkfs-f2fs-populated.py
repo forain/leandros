@@ -780,6 +780,24 @@ def main():
         "~/code/leandros-artifacts/m6-session-data/m4-vkwl")
     if os.path.exists(m4_drv):
         bin_files.append(("m4-vkwl", m4_drv, 0o100755))
+    # m12-caps — the capability probe: brings the session up the same way and
+    # then runs a fixed choreography (idle, pointer, click, three keybindings,
+    # wl-globals, one window, two windows, move/resize/close, an application)
+    # announcing each window as "M12: MARK <name> <secs>" so artifacts/
+    # m12_caps.py can inject QMP input and photograph the scanout inside it.
+    # Same no-shebang rule: run as `brush /bin/m12-caps`.
+    m12_drv = os.path.expanduser(
+        "~/code/leandros-artifacts/m6-session-data/m12-caps")
+    if os.path.exists(m12_drv):
+        bin_files.append(("m12-caps", m12_drv, 0o100755))
+    # m12c-input — the follow-up that attributes m12-caps input null result to
+    # a layer: /dev/input and /sys/class/input against what the libudev shim
+    # claims, then evtest2 (raw evdev, no libinput in the path), then the same
+    # session with RUST_LOG turned up on the smithay input backends.
+    m12c_drv = os.path.expanduser(
+        "~/code/leandros-artifacts/m6-session-data/m12c-input")
+    if os.path.exists(m12c_drv):
+        bin_files.append(("m12c-input", m12c_drv, 0o100755))
     # m4-vkwl-a64 — the same driver with the compositor choice and every wait
     # made an argument, for aarch64 under TCG where "the session never came up"
     # and "the WSI chain does not work here" have to be told apart and a silent
