@@ -734,8 +734,68 @@ the devices. **The libseat shim's open path looks correct** — `libseat_open_de
 (`ports/input-stack/shims/libseat/libseat.c:132`) opens `O_RDWR|O_NONBLOCK|O_CLOEXEC` and
 returns the fd as the device id.
 
-**So the break is above raw evdev and below the Wayland protocol** — inside libinput,
-smithay's libinput backend, or how cosmic-comp wires a seat to it.
+**The break is now bracketed much more tightly: everything below AND INCLUDING libinput is
+exonerated by measurement** (`a4885ed`). libudev shim — both devices enumerated, `ID_SEAT →
+seat0`, `ID_INPUT_KEYBOARD → 1`, and `dev_from_devnum type=c major=13 minor=64` **resolves**
+(libinput drops a device *silently* if that round-trip fails, `evdev.c:2116-2147`). libseat
+shim — `open_device /dev/input/event0 → fd=26 errno=0`, `event1 → fd=27 errno=0`. Kernel evdev
+— `ioctls=21 enotty=0`, and under provocation `push+476 reads+234 eagain+117 deliv+476
+drop+0 pollin+265`. calloop — **265 POLLINs against 234 reads**, and since `libinput_dispatch`
+runs *only* from smithay's `process_events` (`smithay backend/libinput/mod.rs:714-722`), the
+reads prove the source is being dispatched and nested epoll works. **And libinput itself
+produces events**: `event1 - QEMU Virtio Tablet: is tagged by udev as: Mouse`, `device is a
+pointer`, `DEVICE_ADDED` ×2 with correct caps, **`motion_abs=62 key=8 dispatch_err=0`**.
+**libinput produces events and the compositor acts on none of them.** So the break is *above*
+libinput's queue: smithay's `for event in &mut self.context` drain, or cosmic-comp's
+`process_input_event` / seat routing / absolute-motion→output mapping.
+
+**Two dead ends, both recorded so they are not repeated.** (a) **`wl_seat` capabilities are a
+null result by construction** — measured `caps=0x7 pointer=1 keyboard=1 touch=1`, but
+cosmic-comp calls `add_keyboard()`/`add_pointer()`/`add_touch()` **unconditionally** at seat
+creation (`cosmic-comp/src/shell/seats.rs:190-243`), with an upstream comment explaining that
+clients would otherwise race the compositor. `libinput_udev_assign_seat` returning `Ok` is
+equally vacuous — it succeeds with zero devices. **This was my suggested discriminator and it
+was wrong**; a capability that is always advertised cannot distinguish anything. (b) The log
+route is dead **twice over**: `cosmic-comp/src/logger/mod.rs` pins `smithay=warn` in release
+via `add_directive`, which `RUST_LOG` **cannot** override, *and* its `fmt::layer()` writes to
+**stdout**, not stderr. So the discarded-stderr finding above is real but insufficient — fixing
+it alone would still yield nothing.
+
+**Three suspects remain, cheapest first.**
+1. **`~/.config/cosmic/com.system76.CosmicComp/v1/input_devices` with `state: Disabled`**
+   produces exactly this symptom. Nearly free to check.
+2. **Our own libseat shim may never activate the session.** It fires `enable_seat`
+   *synchronously from inside* `libseat_open_seat`, and `libseat_get_fd` returns an eventfd
+   that **never signals**. If smithay's `LibSeatSession` never emits
+   `SessionEvent::ActivateSession`, cosmic-comp may treat the session as inactive and discard
+   input. **This is in our code.**
+   **And it directly contradicts a conclusion recorded earlier the same day** in item 5's
+   libseat entry, which reasoned that not reading `conn_fd` "remains correct independently of
+   the kernel fix, because nothing ever writes that eventfd". *Nothing writing it* is precisely
+   the suspicion now. That entry was sound about the `read()`; it did not ask whether the fd
+   was supposed to be **written**. **A component can be correct as a consumer and broken as a
+   producer, and checking only the half you touched will miss it.**
+3. cosmic-comp's absolute-motion → output mapping — virtio-tablet is an *absolute* pointer.
+
+**The decisive next test is neither of those**: run a Wayland client with a mapped
+`xdg_toplevel` that binds `wl_pointer`/`wl_keyboard` and logs `enter`/`motion`/`key`. Receives
+events ⇒ cosmic-comp's input path is fine and the failure is cursor/render-side. Receives
+nothing ⇒ cosmic-comp drops them. That halves the remaining space before any suspect is
+touched.
+
+**Three further defects the census exposed, none of which is the cause.**
+- **~91% of injected pointer motion is lost between QEMU and the guest ring**: 4632 QMP events
+  accepted, **0 rejected**, → **412** evdev pushes (a session run: 3618 → 552). Even a fixed
+  compositor would get a badly decimated pointer.
+- **The in-kernel console steals keyboard events**: `dev=0 push=128 conspop=112 deliv=16`.
+  `read_input_byte` pops from evdev device 0, and our evdev has **one ring per device**, not a
+  per-open client queue as Linux has — so **two readers rob each other**.
+- `servers/evdev/src/lib.rs` answers `EVIOCGVERSION` by returning the version as the syscall
+  *value* instead of writing it to the user pointer. libevdev only checks `rc < 0`, so it is
+  not fatal, but `driver_version` is left uninitialised.
+- Unresolved and explicitly *not* concluded: `poll(2)` on a nested epoll fd reported readable
+  1 time in 284 while `epoll(7)` on the same fd demonstrably works — confounded by the probe's
+  own console-print stalls. Needs a clean two-level epoll test.
 
 **The path is currently unobservable, and the reason is probably not the one first recorded.**
 `RUST_LOG=smithay::backend::libinput=debug` is rejected because DEBUG is compiled out
@@ -1451,6 +1511,15 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
   stale**, and it is now corrected in the working tree. A fix landing upstream of a workaround
   does not automatically make the workaround removable — check whether the workaround's code
   was ever load-bearing on the bug, or merely contemporaneous with it.
+  **⚠ REOPENED the same day, as input suspect #2.** Everything above is still correct about
+  the `read()`. But it treated "nothing ever writes that eventfd" as *the reason the code is
+  fine*, and that is now a leading suspect for item 6: `libseat_get_fd` hands smithay an
+  eventfd that **never signals**, and `enable_seat` fires **synchronously from inside**
+  `libseat_open_seat`, so `LibSeatSession` may never emit `SessionEvent::ActivateSession` and
+  cosmic-comp may treat the session as inactive and discard input. **The entry asked whether
+  the fd needed *reading*; it never asked whether it needed *writing*.** A component can be
+  correct as a consumer and broken as a producer, and examining only the half you touched will
+  miss it. Under test — see item 6.
 - **The input-stack shims were unbuildable and unwired — FIXED in the working tree, and the
   binaries were never actually drifted.** Before: `build-all.sh` never compiled
   `ports/input-stack/shims/` (`grep -iE 'libseat|input-stack|build-shims' scripts/*.sh`
