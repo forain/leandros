@@ -5521,12 +5521,32 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
     let pl = kpath.len;
     let path = kpath.bytes();
 
-    // /proc/self/exe → the real path this process was execve'd from (stored in
-    // sched's tgid-keyed side table). Falls back to "/bin/init" only when unset
-    // — correct for the boot-loaded PID1, which never goes through sys_execve.
-    if path == b"/proc/self/exe" {
+    // /proc/self/exe and /proc/<pid>/exe → the real path that process was
+    // execve'd from (sched's tgid-keyed side table). "self" is the caller's
+    // own tgid; a numeric pid is translated to its tgid so a thread named by
+    // any of its siblings' pids still hits the one shared entry. Falls back
+    // to "/bin/init" only when the pid is live but unset — correct for the
+    // boot-loaded PID1, which never goes through sys_execve. A pid naming no
+    // live task is -ENOENT: unlike "self", "<pid>" can name garbage.
+    let exe_tgid: Option<sched::task::Pid> = if path == b"/proc/self/exe" {
+        Some(sched::current_tgid())
+    } else if pl >= 11 && &pb[..6] == b"/proc/" && &pb[pl - 4..pl] == b"/exe" {
+        let digits = &pb[6..pl - 4];
+        let mut pid: sched::task::Pid = 0;
+        let mut valid = !digits.is_empty();
+        for &d in digits {
+            if d < b'0' || d > b'9' { valid = false; break; }
+            pid = pid.wrapping_mul(10).wrapping_add((d - b'0') as sched::task::Pid);
+        }
+        if !valid { None }
+        else if sched::exists_probe(pid) != 0 { return -2; } // ESRCH-shaped: no such pid
+        else { Some(sched::tgid_of(pid)) }
+    } else {
+        None
+    };
+    if let Some(tgid) = exe_tgid {
         let mut kb = [0u8; 256];
-        let bytes: &[u8] = match sched::exe_path(sched::current_tgid(), &mut kb) {
+        let bytes: &[u8] = match sched::exe_path(tgid, &mut kb) {
             Some(len) => &kb[..len],
             None      => b"/bin/init",
         };

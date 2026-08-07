@@ -126,6 +126,7 @@ extern "C" {
 
     pub fn clock_gettime(clockid: clockid_t, tp: *mut timespec) -> c_int;
     pub fn readlink(path: *const u8, buf: *mut u8, bufsize: size_t) -> ssize_t;
+    pub fn getpid() -> c_int;
 
     // eventfd2/signalfd4/inotify_init1/inotify_add_watch have no relibc C
     // wrapper — go straight through the raw syscall entry point.
@@ -174,9 +175,10 @@ pub unsafe extern "C" fn epoll_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_signalfd_signo() { failures += 1; }
     if !test_inotify_never_fires() { failures += 1; }
     if !test_proc_self_exe() { failures += 1; }
+    if !test_proc_pid_exe() { failures += 1; }
     if !test_nested_epoll() { failures += 1; }
 
-    write_summary(9, failures);
+    write_summary(10, failures);
     puts(b"--- epolltest done ---\n\0".as_ptr());
     failures
 }
@@ -429,7 +431,50 @@ unsafe fn test_proc_self_exe() -> bool {
     report(name, ok)
 }
 
-// ── 9. A nested epoll fd is readable only when its OWN interest list has a
+// ── 9. /proc/<pid>/exe (numeric, not the "self" alias) resolves the same way ─
+//
+// The kernel keys the executable-path side table by tgid, and "self" was the
+// only spelling that ever exercised the lookup — a caller naming itself by
+// its own numeric pid (as e.g. a `/proc/<pid>/exe` symlink reader outside the
+// process would) took a completely different, unimplemented code path.
+// Building the path from a real getpid() and comparing it against the
+// "self" answer proves the numeric form is wired to the same table, not
+// just present.
+
+unsafe fn test_proc_pid_exe() -> bool {
+    let name = b"proc_pid_exe\0";
+
+    let pid = getpid();
+    let mut path = [0u8; 32];
+    let mut i = 0usize;
+    for &b in b"/proc/" { path[i] = b; i += 1; }
+    // Format pid in decimal (pid is always positive).
+    let mut digits = [0u8; 10];
+    let mut nd = 0usize;
+    let mut v = pid as u32;
+    if v == 0 { digits[0] = b'0'; nd = 1; }
+    while v > 0 { digits[nd] = b'0' + (v % 10) as u8; v /= 10; nd += 1; }
+    while nd > 0 { nd -= 1; path[i] = digits[nd]; i += 1; }
+    for &b in b"/exe\0" { path[i] = b; i += 1; }
+
+    let mut buf = [0u8; 256];
+    let n = readlink(path.as_ptr(), buf.as_mut_ptr(), 255);
+
+    let ok = n > 0 && {
+        let got = &buf[0..n as usize];
+        ends_with(got, b"epolltest") && got != &b"/bin/init"[..]
+    };
+
+    write(1, b"proc_pid_exe: path=".as_ptr(), 20);
+    write(1, path.as_ptr(), i - 1); // exclude the trailing NUL
+    write(1, b" got ".as_ptr(), 5);
+    if n > 0 { write(1, buf.as_ptr(), n as usize); } else { write_i64(1, n as i64); }
+    write(1, b"\n".as_ptr(), 1);
+
+    report(name, ok)
+}
+
+// ── 10. A nested epoll fd is readable only when its OWN interest list has a
 //    ready event ────────────────────────────────────────────────────────────
 //
 // An epoll fd registered inside another epoll is how every calloop/libevent
