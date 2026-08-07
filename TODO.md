@@ -686,7 +686,7 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 
 | # | Item | Category | State |
 |---|---|---|---|
-| 6 | **No input of any kind reaches the compositor** | Bug — **TOP PRIORITY** | Measured; break is above evdev, below Wayland |
+| 6 | Input **does** reach clients; the virtqueue starves under load | Bug — **REFRAMED** | Delivery falls 57% by rate; cosmic-comp innocent |
 | 7 | **Only a raw `wl_shm` client renders — no libcosmic/iced app draws** | Bug — **actionable** | `cosmic-settings` alive, healthy, 0 px in 74 s |
 | 8 | Nothing to launch, and no way to ask for it | Feature — **config DONE** `52665aa` | Keybinding table staged; still no terminal to launch |
 | 9 | **9 panel applets have no scoped-out dependency and are simply unbuilt** | Feature — cheap | Build recipe exists; spawn path proven |
@@ -725,18 +725,81 @@ been misled once by conflating the last two — the panel was recorded as "froze
 frame" and the measurement eventually exonerated both the kernel and cosmic-comp. Every row
 below states which it is.
 
-### 6. No input of any kind reaches the compositor — **TOP PRIORITY**
+### 6. Input DOES reach clients — the item as filed was WRONG, and the real defect is throughput
 
-Not "laggy", not "partial": **zero**. 868 injected events reach the kernel's evdev ring while
-flips stay at the panel clock's rate — POINTER **1.21 flips/s on 868 events** against CLICK
-**1.19/s on 24 events**, i.e. 36× the input for 0.02/s more flips. **0 px** change outside the
-clock rectangle, every phase, every run. No cursor is ever visible (`curs_up = 0` per phase,
-one upload ever, at startup).
+**REFUTED and rewritten (`b22364d`, `ada294f`).** The original claim — "no input of any kind
+reaches the compositor, not laggy, not partial: zero" — is false. A purpose-built Wayland
+client, `/bin/wlinput` (`artifacts/m14-wlinput/`), mapped an `xdg_toplevel` against **stock,
+unmodified** cosmic-comp and received everything:
 
-**That "0 px" is a real measurement rather than an ambiguity, and the reason is worth
-keeping:** the panel clock repaints once a second, so a byte-identical capture proves a
-*stale frame*, not a quiet desktop. The same route later showed 208,563 px appearing when a
-client mapped, so the camera was demonstrably live.
+```
+ptr_enter=2  ptr_motion=31  ptr_button=3  ptr_frame=37  kbd_key=12  kbd_mods=3
+keyboard.key 30/48/35/23/1/125, press+release each, in order
+keyboard.modifiers depressed=64 (Super);  pointer.button b=272
+```
+
+Six keycodes, exactly the six injected, in order. Controls green *first* — `BOUND globals=54`,
+`SEATCAP caps=0x7`, `CONFIGURE ×3`, `MAPPED 640x480` — so a zero would have meant something.
+The capture shows the window on the wallpaper wearing cosmic-comp's **cyan focus border**.
+
+**And delivery above evdev is not merely working but exact:** keyboard `evdev push +24` = 12
+key events → client `kbd_key = 12`; pointer `push +68` = 17 motion frames → client
+`ptr_motion = 17`. **Lossless, not "most".** libinput, smithay's drain, `process_input_event`,
+seat lookup, abs→output mapping and focus routing are **all correct**. cosmic-comp is innocent.
+
+**All three suspects eliminated.** (1) `input_devices: Disabled` — absent; both user and system
+config trees dumped, nothing there, and independently impossible since `SEND_EVENTS_DISABLED`
+closes the device fd while cosmic-comp demonstrably read `event1` all run (`rpid=37` on every
+`[EVSTAT]`). (2) **libseat activation — the earlier benign reading was CORRECT**, and for a
+better reason than the one recorded: `smithay/src/backend/session/libseat.rs:88-91` calls
+`seat.dispatch(0)` then `rx.try_recv()` **specifically** to catch an enable delivered
+synchronously from inside `libseat_open_seat` — our shim's contract is the exact case that code
+was written for, so `active` is true from construction. Moreover **nothing on the input path
+reads it**: `process_input_event` and the libinput calloop closure never call `is_active()`;
+its only readers are KMS paths like `apply_config_for_outputs`, which early-return when
+inactive and would have left every output unmodeset. The desktop renders, so it is active.
+**No shim edit was needed or made.** (3) abs→output mapping — `pointer.enter x=319.9 y=378.0`,
+inside a 640x480 toplevel, not clamped.
+
+**What the original measurement actually saw.** The "0 px outside the clock rectangle" was
+real, and the reasoning that made it readable was sound — the panel clock repaints once a
+second, so a byte-identical capture proves a *stale frame* rather than a quiet desktop, and the
+same route later showed 208,563 px when a client mapped. What was wrong was the **inference**:
+"nothing changed on screen" was read as "no input arrived", when input was arriving and nothing
+was *drawing a response* — no cursor is ever rendered (`curs_up = 0` per phase, one upload
+ever, at startup), and the COSMIC apps that would have reacted are the ones item 7 shows render
+nothing at all. **A null observation at the end of a long chain does not locate the break in it**,
+and this cost two lanes. Instrument at the *destination* — a client that counts what it is
+sent — before instrumenting the path.
+
+**THE REAL DEFECT, promoted from a record-only footnote: the virtqueue handoff starves under
+load.** Measured on an idle guest with **no compositor running**, x86_64/KVM
+(`artifacts/m14_rate.py`):
+
+| rate/s | moves | qmp_ok | qmp_rej | evdev_ev | ev/move | delivered |
+|---|---|---|---|---|---|---|
+| 2 | 20 | 40 | **0** | 40 | **2.00** | 50.0% |
+| 10 | 100 | 200 | **0** | 112 | 1.12 | 28.0% |
+| 30 | 300 | 600 | **0** | 272 | 0.91 | 22.7% |
+| 60 | 600 | 1200 | **0** | 512 | **0.85** | 21.3% |
+
+**A column that falls as rate rises is buffer exhaustion, not a filter.** Delivery drops **57%
+from the 2/s rung, monotonically**, with **zero** QMP rejections — the host queued everything —
+and `drop+0` on every evdev sample, which exonerates the ring. **So the loss is in the
+virtqueue handoff, before `push_event`.** Under a live COSMIC session it is ~22× worse again
+(1,787 moves → 68 events). *Stated precisely:* the absolute per-batch expectation is
+unverified, so this is a **relative** decline, not a loss percentage.
+
+**The precise next question:** why does a 32-descriptor eventq drained every 10 ms starve at
+240 events/s? `drivers/src/virtio_keyboard.rs:304-354` is drained only from `poll_events()` on
+the 100 Hz tick (`arch/x86_64/src/timer.rs:244`), and QEMU drops a whole frame when
+`virtqueue_pop` finds no buffer. Two candidates, both inside those 40 lines: the drain simply
+is not keeping up, and — **visible by inspection and a real defect regardless** — `(*used).idx`
+is read and `(*avail).idx` read-modify-written **non-volatilely, with no fences**. A per-tick
+drained/skipped counter separates them in one boot.
+
+**Still open on the render side, and now the more interesting half:** input arrives and nothing
+draws. No cursor is ever composited. That is likely one investigation with item 7.
 
 **Ruled out, with evidence — do not re-measure.** QEMU → virtio-tablet → kernel ring →
 userspace read is **completely fine**: `evtest2` reads `/dev/input/event1` with no libinput in
@@ -1561,15 +1624,17 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
   stale**, and it is now corrected in the working tree. A fix landing upstream of a workaround
   does not automatically make the workaround removable — check whether the workaround's code
   was ever load-bearing on the bug, or merely contemporaneous with it.
-  **⚠ REOPENED the same day, as input suspect #2.** Everything above is still correct about
-  the `read()`. But it treated "nothing ever writes that eventfd" as *the reason the code is
-  fine*, and that is now a leading suspect for item 6: `libseat_get_fd` hands smithay an
-  eventfd that **never signals**, and `enable_seat` fires **synchronously from inside**
-  `libseat_open_seat`, so `LibSeatSession` may never emit `SessionEvent::ActivateSession` and
-  cosmic-comp may treat the session as inactive and discard input. **The entry asked whether
-  the fd needed *reading*; it never asked whether it needed *writing*.** A component can be
-  correct as a consumer and broken as a producer, and examining only the half you touched will
-  miss it. Under test — see item 6.
+  **Reopened as input suspect #2, then CLEARED — and the clearing is stronger than the original
+  reasoning.** The worry was that `libseat_get_fd` hands smithay an eventfd that never signals
+  while `enable_seat` fires synchronously inside `libseat_open_seat`, so `LibSeatSession` might
+  never emit `SessionEvent::ActivateSession`. It does not matter:
+  `smithay/src/backend/session/libseat.rs:88-91` calls `seat.dispatch(0)` then `rx.try_recv()`
+  **specifically to catch a synchronous enable** — our shim's contract is the exact case that
+  code was written for, so `active` is true from construction. And **nothing on the input path
+  reads it anyway**: `process_input_event` and the libinput calloop closure never call
+  `is_active()`; its only readers are KMS paths that early-return when inactive and would have
+  left every output unmodeset. The desktop renders, so it is active. **No shim edit was made.**
+  The original entry's conclusion stands; the reason it gave was weaker than the real one.
 - **The input-stack shims were unbuildable and unwired — FIXED in the working tree, and the
   binaries were never actually drifted.** Before: `build-all.sh` never compiled
   `ports/input-stack/shims/` (`grep -iE 'libseat|input-stack|build-shims' scripts/*.sh`
