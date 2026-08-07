@@ -857,6 +857,17 @@ Design, staging and per-stage guard tests with their falsifying mutations:
   tick get **identical** timestamps, so a consumer differencing them can see 0 ms.
   Tick calibration is *not* implicated — guest monotonic time tracked host wall clock to
   <0.3% over two 145 s intervals.
+  **The trap, and it is easy to get backwards:** a clamped sample looks like "no signal" but
+  is **positive evidence**. The old clock computed `(ticks % 100) * 10_000`, always ≡ 0 mod
+  10,000, so it could never emit a value ending in `9999` — reaching the clamp at all proves
+  the interpolated path ran. `FLIP_TS_SUBTICK` (`b04b48d`) therefore fails only on
+  *all-tick-multiples*, the old clock's exact signature, and counts saturated samples as
+  passing with a printed note. Requiring a *genuine* sub-tick sample would be flaky, not
+  strict: a measured x86_64/TCG run came in at **15 saturated / 1 genuine**, one sample from
+  a spurious failure that would have indicated nothing about the math.
+  **Do not space such samples with `usleep`/`nanosleep`:** `sys_nanosleep` rounds any nonzero
+  request **up** to whole ticks, so sleeping between flips resyncs to the tick edge and
+  *reinforces* the phase alignment that produces all-saturated runs. Use busy-work.
 - ~~**DRM page-flip event timestamps**~~ — **done** (`b8ff2f6`), verified by mutation.
   `queue_flip_event` now stamps from `arch_monotonic_ns()`. The layering problem is worth
   remembering: `drivers` has **no Cargo edge** to the arch crates, and the tree's existing
