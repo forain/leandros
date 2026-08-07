@@ -1,0 +1,173 @@
+[t+    0.5s] === POSITIVE CONTROL (must FAIL) ===
+[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbi78[?25h[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz78[?25h[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz4278[?25h
+[?2004l[31merror:[39m command not found
+[t+    0.6s] >>> CONTROL OK: the harness sees a bogus command fail ('command not found')
+[t+    0.6s] === LAUNCH: brush /bin/m4-vkwl-a64 comp sw 28 180 60 30 1800 ===
+[t+    2.8s] >>> compositor socket: PRESENT after 1s (host-measured 2s since launch)
+[t+   35.4s] >>> compositor ready; capturing CONTROL A
+[t+   40.6s]     capture A: 1280x800 name='QEMU' rects=1 uncovered=0
+er_v3          v1
+[INFO] wl global: zwp_virtual_keyboard_manager_v1    v1
+[INFO] wl global: wp_alpha_modifier_v1               v1
+[INFO] wl global: wp_single_pixel_buffer_manager_v1  v1
+[INFO] wl global: wl_fixes                           v1
+[INFO] wl global: zcosmic_keyboard_layout_manager_v1 v1
+[INFO] wl global: ext_background_effect_manager_v1   v1
+[INFO] wl global: ext_idle_notifier_v1               v2
+[INFO] wl global: zwp_idle_inhibit_manager_v1        v1
+[INFO] wl global: ext_data_control_manager_v1        v1
+[INFO] wl global: zwlr_data_control_manager_v1       v2
+[INFO] wl global: zwlr_layer_shell_v1                v5
+[INFO] wl global: xdg_wm_base                        v7
+[INFO] wl global: xdg_activation_v1                  v1
+[INFO] wl global: zxdg_exporter_v2                   v1
+[INFO] wl global: zxdg_importer_v2                   v1
+[INFO] wl global: zcosmic_toplevel_info_v1           v3
+[INFO] wl global: ext_foreign_toplevel_list_v1       v1
+[INFO] wl global: zcosmic_toplevel_manager_v1        v4
+[INFO] wl global: ext_workspace_manager_v1           v1
+[INFO] wl global: zcosmic_workspace_manager_v2       v2
+[INFO] wl global: cosmic_a11y_manager_v1             v2
+[INFO] wl global: zwp_relative_pointer_manager_v1    v1
+[INFO] wl global: wl_output                          v4
+[INFO] wl global: wl_seat                            v9
+[INFO] registry: 54 globals, wl_shm=YES zwp_linux_dmabuf_v1=no
+wl_registry_has_compositor_and_xdg_shell: PASS
+[INFO] xdg_surface configure received=1, toplevel size=0x0
+xdg_surface_configured: PASS
+[INFO] ICD: /usr/lib/libvulkan_virtio.so
+icd_dlopen: PASS
+icd_gipa: PASS
+[INFO] instanceExtensionCount=19  VK_KHR_surface=yes  VK_KHR_wayland_surface=yes
+instance_advertises_wayland_surface: PASS
+[DRM] GET_CAPS capset=0x00000004 host max_ver=0x00000000 max_size=0x000000A0
+[DRM] virtgpu context created, capset=0x00000004 ctx_id=0x00000001
+[DRM] host-visible blob mapped: res=0x00000010 win_off=0x00000000 phys_hi=0x00000080 phys_lo=0x00000000 map_info=0x00000001
+[DRM] host-visible blob mapped: res=0x00000011 win_off=0x00030000 phys_hi=0x00000080 phys_lo=0x00030000 map_info=0x00000001
+create_instance_with_wayland_wsi: PASS
+resolve_instance_wsi_funcs: PASS
+[INFO] device: "Virtio-GPU Venus (AMD Ryzen 9 7950X 16-Core Processor (RADV RAPHAEL_MENDOCINO))" api=1.4.307
+enumerate_physical_devices: PASS
+wsi_route_shm_available: PASS
+create_wayland_surface: PASS
+[INFO] queueFamily[0] flags=0xf count=1 surfaceSupport=yes wlPresentSupport=yes
+[INFO] queueFamily[1] flags=0xe count=4 surfaceSupport=yes wlPresentSupport=yes
+[INFO] queueFamily[2] flags=0x20 count=1 surfaceSupport=no wlPresentSupport=no
+[INFO] queueFamily[3] flags=0x40 count=1 surfaceSupport=no wlPresentSupport=no
+queue_family_supports_wayland_present: PASS
+[INFO] surface caps: minImageCount=4 maxImageCount=0 currentExtent=4294967295x4294967295 supportedUsage=0x8009f
+surface_capabilities: PASS
+[INFO] surface format[0] format=43 colorSpace=0
+[INFO] surface format[1] format=37 colorSpace=0
+[INFO] surface format[2] format=50 colorSpace=0
+[INFO] surface format[3] format=44 colorSpace=0
+[INFO] surface format[4] format=43 colorSpace=1000104013
+[INFO] surface format[5] format=37 colorSpace=1000104013
+[INFO] surface format[6] format=50 colorSpace=1000104013
+[INFO] surface format[7] format=44 colorSpace=1000104013
+[INFO] vkGetPhysicalDeviceSurfaceFormatsKHR -> VK_SUCCESS, count=8
+surface_formats_nonempty: PASS
+[INFO] chosen surface format=37 colorSpace=0
+[INFO] present mode[0] = 1
+[INFO] present mode[1] = 2
+surface_present_modes_include_fifo: PASS
+[INFO] deviceExtensionCount=170 VK_KHR_swapchain=yes VK_EXT_external_memory_host=no
+device_advertises_swapchain: PASS
+create_device_with_swapchain: PASS
+resolve_device_wsi_funcs: PASS
+[INFO] vkCreateSwapchainKHR: 480x320 minImageCount=5 format=37 usage=0x12 mode=1
+[DRM] host-visible blob mapped: res=0x00000012 win_off=0x00130000 phys_hi=0x00000080 phys_lo=0x00130000 map_info=0x00000001
+[DRM] host-visible blob mapped: res=0x00000013 win_off=0x001D0000 phys_hi=0x00000080 phys_lo=0x001D0000 map_info=0x00000001
+[DRM] host-visible blob mapped: res=0x00000014 win_off=0x009D0000 phys_hi=0x00000080 phys_lo=0x009D0000 map_info=0x00000001
+[DRM] host-visible blob mapped: res=0x00000015 win_off=0x00A70000 phys_hi=0x00000080 phys_lo=0x00A70000 map_info=0x00000001
+[DRM] host-visible blob mapped: res=0x00000016 win_off=0x00B10000 phys_hi=0x00000080 phys_lo=0x00B10000 map_info=0x00000001
+[DRM] host-visible blob mapped: res=0x00000017 win_off=0x00BB0000 phys_hi=0x00000080 phys_lo=0x00BB0000 map_info=0x00000001
+create_swapchain: PASS
+[INFO] swapchain image count = 5
+swapchain_images_nonzero: PASS
+create_command_pool: PASS
+[DRM] host-visible blob mapped: res=0x00000018 win_off=0x00C50000 phys_hi=0x00000080 phys_lo=0x00C50000 map_info=0x00000003
+[DRM] non-cached blob mapping honoured (uncached)
+[DRM-SRV] mmap token=0x0000008000C50000 map_info=0x03 -> uncached
+VKWL: HOLD READY seq=26 extent=480x320 rgb=2666f2 secs=180
+[t+   99.0s] >>> HOLD B: seq=26 extent=480x320 predicted rgb=0x2666f2 for 180s; capturing
+[t+  105.1s]     capture B: 1280x800 rects=1 uncovered=0
+VKWL: HOLD END seq=26
+VKWL: HOLD READY seq=27 extent=480x320 rgb=f2cc1a secs=18
+[t+  280.4s] >>> HOLD C: seq=27 extent=480x320 predicted rgb=0xf2cc1a for 18s; capturing
+[t+  286.5s]     capture C: 1280x800 rects=1 uncovered=0
+
+
+================ ANALYSIS ================
+mode=comp frames=28 hold=180 presleep=60 settle=30 maxwait=1800
+capture A uncovered pixels: 0
+--- census A / control (compositor up, no vkwl) ---
+  resolution      : 1280x800 (1024000 px)
+  distinct colours: 1
+  top 8:
+      0x27292a    1024000  (100.00%)
+
+capture B uncovered pixels: 0
+--- census B / vkwl seq=26 ---
+  resolution      : 1280x800 (1024000 px)
+  distinct colours: 89
+  top 8:
+      0x27292a     824950  (80.56%)
+      0x26d94c     151868  (14.83%)
+      0x262829      10374  ( 1.01%)
+      0x252728       5172  ( 0.51%)
+      0x63d0df       4684  ( 0.46%)
+      0x242627       3416  ( 0.33%)
+      0x232526       2348  ( 0.23%)
+      0x222425       1742  ( 0.17%)
+  vkwl swapchain extent 480x320 = 153600 px
+  colour 0x2666f2 +-2: 0 px (exact 0)
+      vs swapchain: 0/153600 = 0.00% of the extent vkwl reported
+  same colour in CONTROL A: 0 px
+  byte-swapped 0xf26626 (channel-order check): 0 px
+  byte-identical to control A: False
+
+capture C uncovered pixels: 0
+--- census C / vkwl seq=27 ---
+  resolution      : 1280x800 (1024000 px)
+  distinct colours: 86
+  top 8:
+      0x27292a     824950  (80.56%)
+      0xf2cc19     151868  (14.83%)
+      0x262829      10374  ( 1.01%)
+      0x252728       5172  ( 0.51%)
+      0x63d0df       4684  ( 0.46%)
+      0x242627       3416  ( 0.33%)
+      0x232526       2348  ( 0.23%)
+      0x222425       1742  ( 0.17%)
+  vkwl swapchain extent 480x320 = 153600 px
+  colour 0xf2cc1a +-2: 151868 px (exact 0)
+      bbox        : x=401..878 y=101..418  478x318
+      bbox fill   : 0.9991  (1.0 = a solid rectangle)
+      vs swapchain: 151868/153600 = 98.87% of the extent vkwl reported
+  same colour in CONTROL A: 0 px
+  byte-swapped 0x1accf2 (channel-order check): 0 px
+  byte-identical to control A: False
+
+B and C byte-identical to each other: False
+B and C held colours share one bounding box: False (None vs (401, 101, 878, 418))
+
+---------------- VERDICT ----------------
+
+phase B (seq=26, predicted 0x2666f2):
+    [FAIL] coverage >= 90% of swapchain extent
+    [FAIL] region is a solid rectangle (bbox fill >= 0.95)
+    [PASS] colour absent from the no-vkwl control
+    [PASS] frame differs from the no-vkwl control
+    [PASS] capture complete
+
+phase C (seq=27, predicted 0xf2cc1a):
+    [PASS] coverage >= 90% of swapchain extent
+    [PASS] region is a solid rectangle (bbox fill >= 0.95)
+    [PASS] colour absent from the no-vkwl control
+    [PASS] frame differs from the no-vkwl control
+    [PASS] capture complete
+
+    [FAIL] both predicted colours land in the SAME bounding box
+
+OVERALL: FAIL

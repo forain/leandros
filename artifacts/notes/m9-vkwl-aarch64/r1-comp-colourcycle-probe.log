@@ -1,0 +1,24 @@
+
+=== /tmp/m9vk-a64-r1/capA-control.ppm  1280x800 ===
+  cols[0] 0xe62626:       0 px
+  cols[1] 0x26d94d:       0 px
+  cols[2] 0x2666f2:       0 px
+  cols[3] 0xf2cc1a:       0 px
+  cols[4] 0xb340d9:       0 px
+  cols[5] 0x1ad9d9:       0 px
+
+=== /tmp/m9vk-a64-r1/capB-seq26.ppm  1280x800 ===
+  cols[0] 0xe62626:       0 px
+  cols[1] 0x26d94d:  151868 px  bbox x=401..878 y=101..418 478x318 fill=0.9991
+  cols[2] 0x2666f2:       0 px
+  cols[3] 0xf2cc1a:       0 px
+  cols[4] 0xb340d9:       0 px
+  cols[5] 0x1ad9d9:       0 px
+
+=== /tmp/m9vk-a64-r1/capC-seq27.ppm  1280x800 ===
+  cols[0] 0xe62626:       0 px
+  cols[1] 0x26d94d:       0 px
+  cols[2] 0x2666f2:       0 px
+  cols[3] 0xf2cc1a:  151868 px  bbox x=401..878 y=101..418 478x318 fill=0.9991
+  cols[4] 0xb340d9:       0 px
+  cols[5] 0x1ad9d9:       0 px

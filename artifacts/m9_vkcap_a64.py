@@ -313,6 +313,46 @@ def report_colour(w, h, px, target, expect_area):
     return n, exact, bbox, fill
 
 
+# ------------------------------------------------------------ hold sample ----
+def sample_hold(phase, rgb, first, every, budget):
+    """Capture repeatedly during one hold until the client's own predicted
+    colour is on the scanout, and time how long that took.
+
+    Run 1 sampled each hold exactly once, six seconds after the sentinel, and
+    that is not enough. `VKWL: HOLD READY seq=N` means the CLIENT has returned
+    from vkQueuePresentKHR for frame N; it does not mean the compositor has
+    composited that buffer and the scanout has been flipped to it. In run 1 the
+    seq=26 sample caught vkwl's OWN PREVIOUS frame — cols[1], 151868 px, in the
+    identical 478x318 bounding box at identical 0.9991 fill — while the seq=27
+    sample, taken after 180 s of idle, was current. One sample cannot tell
+    "the pixels never arrive" from "the pixels had not arrived YET", and those
+    are opposite conclusions.
+
+    So the sample becomes a series and the answer becomes a number: the delay
+    from the sentinel to the first frame carrying the predicted colour. The
+    first sample is kept and reported whatever it shows — this is a wider
+    aperture, not a retry until the answer is nice.
+    """
+    t_ready = time.time()
+    time.sleep(first)
+    samples = []
+    while True:
+        cap = vnc_capture()
+        dt = time.time() - t_ready
+        w, h, _, fb, miss, rects = cap
+        n, _, _ = find_colour(w, h, pixels(w, h, fb), rgb)
+        samples.append((dt, cap, n))
+        say(f"    sample {phase}#{len(samples)} at +{dt:5.1f}s: {w}x{h} "
+            f"rects={rects} uncovered={miss} predicted 0x{rgb:06x} -> {n} px")
+        if n:
+            return samples, len(samples) - 1
+        if time.time() - t_ready > budget:
+            say(f"    >>> {phase}: predicted colour never appeared within "
+                f"{budget}s of the sentinel; keeping the first sample")
+            return samples, 0
+        time.sleep(every)
+
+
 # ----------------------------------------------------------------- main ----
 HOLD_RE = re.compile(
     r"VKWL: HOLD READY seq=(\d+) extent=(\d+)x(\d+) rgb=([0-9a-f]{6}) secs=(\d+)")
@@ -393,12 +433,9 @@ def main():
                                   int(m.group(3)), int(m.group(4), 16),
                                   int(m.group(5)))
         say(f">>> HOLD {phase}: seq={seq} extent={ew}x{eh} "
-            f"predicted rgb=0x{rgb:06x} for {secs}s; capturing")
-        time.sleep(6)
-        cap = vnc_capture()
-        say(f"    capture {phase}: {cap[0]}x{cap[1]} rects={cap[5]} "
-            f"uncovered={cap[4]}")
-        holds.append((phase, seq, ew, eh, rgb, cap))
+            f"predicted rgb=0x{rgb:06x} for {secs}s; sampling")
+        samples, chosen = sample_hold(phase, rgb, 6, 20, max(0, secs - 40))
+        holds.append((phase, seq, ew, eh, rgb, samples, chosen))
 
     # 4. Analysis.
     print("\n\n================ ANALYSIS ================", flush=True)
@@ -411,7 +448,24 @@ def main():
     census("A / control (compositor up, no vkwl)", wA, hA, pxA)
 
     verdicts = []
-    for phase, seq, ew, eh, rgb, cap in holds:
+    for phase, seq, ew, eh, rgb, samples, chosen in holds:
+        print(f"\n--- hold {phase} sample series (delay from the "
+              f"VKWL: HOLD READY seq={seq} sentinel) ---")
+        for k, (dt, cap_k, n_k) in enumerate(samples):
+            mark = " <- scored" if k == chosen else ""
+            print(f"    #{k + 1} at +{dt:6.1f}s: predicted 0x{rgb:06x} "
+                  f"-> {n_k} px{mark}")
+        dt, cap, _ = samples[chosen]
+        print(f"    scanout carried the predicted colour {dt:.1f}s after the "
+              f"sentinel" if samples[chosen][2] else
+              "    predicted colour never observed during this hold")
+        # Every sample is written out, not just the scored one: a series that
+        # starts wrong and ends right is itself the evidence for the latency,
+        # and discarding the early frames would hide it.
+        for k, (dt_k, cap_k, _) in enumerate(samples):
+            write_ppm(os.path.join(
+                outdir, f"cap{phase}-seq{seq}-s{k + 1}-t{dt_k:.0f}s.ppm"),
+                cap_k[0], cap_k[1], cap_k[3])
         w, h, _, fb, miss, _ = cap
         write_ppm(os.path.join(outdir, f"cap{phase}-seq{seq}.ppm"), w, h, fb)
         px = pixels(w, h, fb)
@@ -432,7 +486,8 @@ def main():
 
     same_bbox = None
     if len(holds) == 2:
-        fbB, fbC = holds[0][5][3], holds[1][5][3]
+        fbB = holds[0][5][holds[0][6]][1][3]
+        fbC = holds[1][5][holds[1][6]][1][3]
         print(f"\nB and C byte-identical to each other: {fbB == fbC}")
         same_bbox = (verdicts[0]["bbox"] is not None
                      and verdicts[0]["bbox"] == verdicts[1]["bbox"])

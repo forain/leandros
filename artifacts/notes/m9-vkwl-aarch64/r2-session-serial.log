@@ -1,0 +1,200 @@
+[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbi78[?25h[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz78[?25h[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz4278[?25h
+[?2004l[31merror:[39m command not found: nosuchbinary_xyz42
+[?2004h[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m4-vkwl-a64 session sw 28 180 90 30 180078[?25h
+[?2004lM4A: mode=session route=sw frames=28 hold=180 presleep=90 settle=30 maxwait=1800
+M4A: COMP LAUNCH (session)
+M4A: WAYLAND-1 PRESENT after 2s
+M4A: SETTLE 30s
+[DRM] unimplemented ioctl cmd=0xC00864BF nr=0x000000BF type=0x00000064 size=0x00000008 (reported once per boot)
+[DRM-SRV] mmap token=0x00000000A9C00000 map_info=0x01 -> writeback
+[DRM-SRV] mmap token=0x00000000AAC00000 map_info=0x01 -> writeback
+M4A: SESSION READY — compositor is up and vkwl has NOT started
+M4A: control window opens now for 90s
+M4A: === vkwl sw frames=28 hold=180 BEGIN ===
+=== vkwl: Vulkan swapchain on a Wayland surface (LeandrOS M4) ===
+MESA_VK_WSI_DEBUG=sw  frames=28
+
+wl_display_connect: PASS
+[INFO] wl global: wl_compositor                      v5
+[INFO] wl global: wl_subcompositor                   v1
+[INFO] wl global: cosmic_corner_radius_manager_v1    v2
+[INFO] wl global: wl_data_device_manager             v3
+[INFO] wl global: wp_fractional_scale_manager_v1     v1
+[INFO] wl global: zwp_keyboard_shortcuts_inhibit_manager_v1 v1
+[INFO] wl global: zxdg_output_manager_v1             v3
+[INFO] wl global: zwlr_output_manager_v1             v4
+[INFO] wl global: zcosmic_output_manager_v1          v3
+[INFO] wl global: zwlr_output_power_manager_v1       v1
+[INFO] wl global: zcosmic_overlap_notify_v1          v1
+[INFO] wl global: wp_presentation                    v2
+[INFO] wl global: zwp_primary_selection_device_manager_v1 v1
+[INFO] wl global: zcosmic_workspace_image_capture_source_manager_v1 v1
+[INFO] wl global: ext_output_image_capture_source_manager_v1 v1
+[INFO] wl global: ext_foreign_toplevel_image_capture_source_manager_v1 v1
+[INFO] wl global: ext_image_copy_capture_manager_v1  v1
+[INFO] wl global: wl_shm                             v2
+[INFO] wl global: wp_cursor_shape_manager_v1         v2
+[INFO] wl global: wp_viewporter                      v1
+[INFO] wl global: org_kde_kwin_server_decoration_manager v1
+[INFO] wl global: zxdg_decoration_manager_v1         v1
+[INFO] wl global: ext_session_lock_manager_v1        v1
+[INFO] wl global: zwp_pointer_constraints_v1         v1
+[INFO] wl global: wp_pointer_warp_v1                 v1
+[INFO] wl global: zwp_pointer_gestures_v1            v3
+[INFO] wl global: zwp_tablet_manager_v2              v1
+[INFO] wl global: wp_security_context_manager_v1     v1
+[INFO] wl global: zwp_input_method_manager_v2        v1
+[INFO] wl global: zwp_text_input_manager_v3          v1
+[INFO] wl global: zwp_virtual_keyboard_manager_v1    v1
+[INFO] wl global: wp_alpha_modifier_v1               v1
+[INFO] wl global: wp_single_pixel_buffer_manager_v1  v1
+[INFO] wl global: wl_fixes                           v1
+[INFO] wl global: zcosmic_keyboard_layout_manager_v1 v1
+[INFO] wl global: ext_background_effect_manager_v1   v1
+[INFO] wl global: ext_idle_notifier_v1               v2
+[INFO] wl global: zwp_idle_inhibit_manager_v1        v1
+[INFO] wl global: ext_data_control_manager_v1        v1
+[INFO] wl global: zwlr_data_control_manager_v1       v2
+[INFO] wl global: zwlr_layer_shell_v1                v5
+[INFO] wl global: xdg_wm_base                        v7
+[INFO] wl global: xdg_activation_v1                  v1
+[INFO] wl global: zxdg_exporter_v2                   v1
+[INFO] wl global: zxdg_importer_v2                   v1
+[INFO] wl global: zcosmic_toplevel_info_v1           v3
+[INFO] wl global: ext_foreign_toplevel_list_v1       v1
+[INFO] wl global: zcosmic_toplevel_manager_v1        v4
+[INFO] wl global: ext_workspace_manager_v1           v1
+[INFO] wl global: zcosmic_workspace_manager_v2       v2
+[INFO] wl global: cosmic_a11y_manager_v1             v2
+[INFO] wl global: zwp_relative_pointer_manager_v1    v1
+[INFO] wl global: wl_output                          v4
+[INFO] wl global: wl_seat                            v9
+[INFO] registry: 54 globals, wl_shm=YES zwp_linux_dmabuf_v1=no
+wl_registry_has_compositor_and_xdg_shell: PASS
+[INFO] xdg_surface configure received=1, toplevel size=0x0
+xdg_surface_configured: PASS
+[INFO] ICD: /usr/lib/libvulkan_virtio.so
+icd_dlopen: PASS
+icd_gipa: PASS
+[INFO] instanceExtensionCount=19  VK_KHR_surface=yes  VK_KHR_wayland_surface=yes
+instance_advertises_wayland_surface: PASS
+[DRM] GET_CAPS capset=0x00000004 host max_ver=0x00000000 max_size=0x000000A0
+[DRM] virtgpu context created, capset=0x00000004 ctx_id=0x00000001
+[DRM] host-visible blob mapped: res=0x00000010 win_off=0x00000000 phys_hi=0x00000080 phys_lo=0x00000000 map_info=0x00000001
+[DRM] host-visible blob mapped: res=0x00000011 win_off=0x00030000 phys_hi=0x00000080 phys_lo=0x00030000 map_info=0x00000001
+create_instance_with_wayland_wsi: PASS
+resolve_instance_wsi_funcs: PASS
+[INFO] device: "Virtio-GPU Venus (AMD Ryzen 9 7950X 16-Core Processor (RADV RAPHAEL_MENDOCINO))" api=1.4.307
+enumerate_physical_devices: PASS
+wsi_route_shm_available: PASS
+create_wayland_surface: PASS
+[INFO] queueFamily[0] flags=0xf count=1 surfaceSupport=yes wlPresentSupport=yes
+[INFO] queueFamily[1] flags=0xe count=4 surfaceSupport=yes wlPresentSupport=yes
+[INFO] queueFamily[2] flags=0x20 count=1 surfaceSupport=no wlPresentSupport=no
+[INFO] queueFamily[3] flags=0x40 count=1 surfaceSupport=no wlPresentSupport=no
+queue_family_supports_wayland_present: PASS
+[INFO] surface caps: minImageCount=4 maxImageCount=0 currentExtent=4294967295x4294967295 supportedUsage=0x8009f
+surface_capabilities: PASS
+[INFO] surface format[0] format=50 colorSpace=0
+[INFO] surface format[1] format=44 colorSpace=0
+[INFO] surface format[2] format=43 colorSpace=0
+[INFO] surface format[3] format=37 colorSpace=0
+[INFO] surface format[4] format=50 colorSpace=1000104013
+[INFO] surface format[5] format=44 colorSpace=1000104013
+[INFO] surface format[6] format=43 colorSpace=1000104013
+[INFO] surface format[7] format=37 colorSpace=1000104013
+[INFO] vkGetPhysicalDeviceSurfaceFormatsKHR -> VK_SUCCESS, count=8
+surface_formats_nonempty: PASS
+[INFO] chosen surface format=44 colorSpace=0
+[INFO] present mode[0] = 1
+[INFO] present mode[1] = 2
+surface_present_modes_include_fifo: PASS
+[INFO] deviceExtensionCount=170 VK_KHR_swapchain=yes VK_EXT_external_memory_host=no
+device_advertises_swapchain: PASS
+create_device_with_swapchain: PASS
+resolve_device_wsi_funcs: PASS
+[INFO] vkCreateSwapchainKHR: 480x320 minImageCount=5 format=44 usage=0x12 mode=1
+[DRM] host-visible blob mapped: res=0x00000012 win_off=0x00130000 phys_hi=0x00000080 phys_lo=0x00130000 map_info=0x00000001
+[DRM] host-visible blob mapped: res=0x00000013 win_off=0x001D0000 phys_hi=0x00000080 phys_lo=0x001D0000 map_info=0x00000001
+[DRM] host-visible blob mapped: res=0x00000014 win_off=0x009D0000 phys_hi=0x00000080 phys_lo=0x009D0000 map_info=0x00000001
+[DRM] host-visible blob mapped: res=0x00000015 win_off=0x00A70000 phys_hi=0x00000080 phys_lo=0x00A70000 map_info=0x00000001
+[DRM] host-visible blob mapped: res=0x00000016 win_off=0x00B10000 phys_hi=0x00000080 phys_lo=0x00B10000 map_info=0x00000001
+[DRM] host-visible blob mapped: res=0x00000017 win_off=0x00BB0000 phys_hi=0x00000080 phys_lo=0x00BB0000 map_info=0x00000001
+create_swapchain: PASS
+[INFO] swapchain image count = 5
+swapchain_images_nonzero: PASS
+create_command_pool: PASS
+[DRM] host-visible blob mapped: res=0x00000018 win_off=0x00C50000 phys_hi=0x00000080 phys_lo=0x00C50000 map_info=0x00000003
+[DRM] non-cached blob mapping honoured (uncached)
+[DRM-SRV] mmap token=0x0000008000C50000 map_info=0x03 -> uncached
+VKWL: HOLD READY seq=26 extent=480x320 rgb=2666f2 secs=180
+VKWL: HOLD END seq=26
+VKWL: HOLD READY seq=27 extent=480x320 rgb=f2cc1a secs=180
+VKWL: HOLD END seq=27
+[INFO] frames requested=28 acquired=28 presented=28
+acquire_next_image_all_frames: PASS
+queue_present_all_frames: PASS
+clear_color_visible: PASS
+--- vkwl done, failures = 0, skipped = 0 ---
+M4A: vkwl sw exit=0
+M4A: --- cosmic.log tail ---
+[2m1970-01-01T00:00:20.462584Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:20.461826Z\x1b[0m \x1b[32m INFO\x1b[0m Connecting to notifications daemon
+[2m1970-01-01T00:00:21.232430Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z ERROR cosmic_settings_config::shortcuts] failed to read system shortcuts config 'system_actions': NoConfigDirectory
+[2m1970-01-01T00:00:21.232579Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z ERROR cosmic_settings_config::shortcuts] failed to read local shortcuts config 'system_actions': NoConfigDirectory
+[2m1970-01-01T00:00:21.299796Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:21.269265Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1minput_seat\x1b[0m\x1b[1m{\x1b[0m\x1b[3mname\x1b[0m\x1b[2m=\x1b[0m"seat-0"\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1madd_keyboard_with_context_flags\x1b[0m\x1b[1m{\x1b[0m\x1b[3mxkb_config\x1b[0m\x1b[2m=\x1b[0mXkbConfig { rules: "", model: "", layout: "", variant: "", options: None } \x1b[3mrepeat_delay\x1b[0m\x1b[2m=\x1b[0m200 \x1b[3mrepeat_rate\x1b[0m\x1b[2m=\x1b[0m20 \x1b[3mcontext_flags\x1b[0m\x1b[2m=\x1b[0m0\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1minput_keyboard\x1b[0m\x1b[2m:\x1b[0m Initializing a xkbcommon handler with keymap query
+[2m1970-01-01T00:00:21.299976Z[0m [33m WARN[0m [1mcosmic-greeter[0m[2m:[0m [2mcosmic_session[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:21.306454Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:21.384969Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] perform;
+[2m1970-01-01T00:00:21.385467Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] authenticate;
+[2m1970-01-01T00:00:21.386558Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection::handshake::common] write_command; command=Auth(Some(External), Some([48]))
+[2m1970-01-01T00:00:21.386995Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection::handshake::common] write_commands; commands=[Auth(Some(External), Some([48]))] extra_bytes=None
+[2m1970-01-01T00:00:21.389791Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_command;
+[2m1970-01-01T00:00:21.390277Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection::handshake::common] read_commands; n_commands=1
+[2m1970-01-01T00:00:21.393561Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] perform;
+[2m1970-01-01T00:00:21.393656Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] authenticate;
+[2m1970-01-01T00:00:21.393747Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection::handshake::common] write_command; command=Auth(Some(External), Some([48]))
+[2m1970-01-01T00:00:21.393821Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection::handshake::common] write_commands; commands=[Auth(Some(External), Some([48]))] extra_bytes=None
+[2m1970-01-01T00:00:21.393899Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_command;
+[2m1970-01-01T00:00:21.393980Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection::handshake::common] read_commands; n_commands=1
+[2m1970-01-01T00:00:21.421983Z[0m [33m WARN[0m [1mcosmic-notifications[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:21.461717Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] send_secondary_commands;
+[2m1970-01-01T00:00:21.547026Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection::handshake::common] write_commands; commands=[NegotiateUnixFD, Begin] extra_bytes=Some([108, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 109, 0, 0, 0, 1, 1, 111, 0, 21, 0, 0, 0, 47, 111, 114, 103, 47, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 47, 68, 66, 117, 115, 0, 0, 0, 2, 1, 115, 0, 20, 0, 0, 0, 111, 114, 103, 46, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 46, 68, 66, 117, 115, 0, 0, 0, 0, 3, 1, 115, 0, 5, 0, 0, 0, 72, 101, 108, 108, 111, 0, 0, 0, 6, 1, 115, 0, 20, 0, 0, 0, 111, 114, 103, 46, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 46, 68, 66, 117, 115, 0, 0, 0, 0])
+[2m1970-01-01T00:00:21.547201Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection::handshake::client] receive_secondary_responses; expected_n_responses=1
+[2m1970-01-01T00:00:21.547279Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection::handshake::common] read_commands; n_commands=1
+[2m1970-01-01T00:00:21.547364Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] send_secondary_commands;
+[2m1970-01-01T00:00:21.547439Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection::handshake::common] write_commands; commands=[NegotiateUnixFD, Begin] extra_bytes=Some([108, 1, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0, 109, 0, 0, 0, 1, 1, 111, 0, 21, 0, 0, 0, 47, 111, 114, 103, 47, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 47, 68, 66, 117, 115, 0, 0, 0, 2, 1, 115, 0, 20, 0, 0, 0, 111, 114, 103, 46, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 46, 68, 66, 117, 115, 0, 0, 0, 0, 3, 1, 115, 0, 5, 0, 0, 0, 72, 101, 108, 108, 111, 0, 0, 0, 6, 1, 115, 0, 20, 0, 0, 0, 111, 114, 103, 46, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 46, 68, 66, 117, 115, 0, 0, 0, 0])
+[2m1970-01-01T00:00:21.547544Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection::handshake::client] receive_secondary_responses; expected_n_responses=1
+[2m1970-01-01T00:00:21.547623Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection::handshake::common] read_commands; n_commands=1
+[2m1970-01-01T00:00:21.694924Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] new;
+[2m1970-01-01T00:00:21.695062Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::proxy] {}; task_name="org.freedesktop.UPower proxy caching"
+[2m1970-01-01T00:00:21.695143Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] socket reader;
+[2m1970-01-01T00:00:21.695216Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:21.695286Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:21.695357Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection] start_object_server; started_event=Some(Event { listeners_notified: 0, listeners_total: 1 })
+[2m1970-01-01T00:00:21.695430Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] obj_server_task;
+[2m1970-01-01T00:00:21.702569Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:21.727987Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:21.772136Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:21.762279Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1minput_seat\x1b[0m\x1b[1m{\x1b[0m\x1b[3mname\x1b[0m\x1b[2m=\x1b[0m"seat-0"\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1madd_keyboard_with_context_flags\x1b[0m\x1b[1m{\x1b[0m\x1b[3mxkb_config\x1b[0m\x1b[2m=\x1b[0mXkbConfig { rules: "", model: "", layout: "", variant: "", options: None } \x1b[3mrepeat_delay\x1b[0m\x1b[2m=\x1b[0m200 \x1b[3mrepeat_rate\x1b[0m\x1b[2m=\x1b[0m20 \x1b[3mcontext_flags\x1b[0m\x1b[2m=\x1b[0m0\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1minput_keyboard\x1b[0m\x1b[2m:\x1b[0m Loaded Keymap \x1b[3mname\x1b[0m\x1b[2m=\x1b[0m"English (US)"
+[2m1970-01-01T00:00:21.772323Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] socket reader;
+[2m1970-01-01T00:00:21.772430Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:21.772511Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:21.772589Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:21.850780Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:21.850915Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:21.855960Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:21.856536Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:21.909580Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  zbus::connection] monitor_name_lost; name=org.freedesktop.ScreenSaver
+[2m1970-01-01T00:00:21.909720Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:21Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:21.912559Z[0m [32m INFO[0m [1mcosmic-notifications[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:21.911973Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2miced_winit\x1b[0m\x1b[2m:\x1b[0m System theme: None
+[2m1970-01-01T00:00:21.915855Z[0m [32m INFO[0m [1mcosmic-notifications[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:21.914066Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mcosmic_notifications::subscriptions::applet\x1b[0m\x1b[2m:\x1b[0m Connecting to daemon on fd 262
+[2m1970-01-01T00:00:22.012989Z[0m [33m WARN[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:22.018531Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:22Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:22.038688Z[0m [32m INFO[0m [1mcosmic-notifications[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:22.036267Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2miced_winit::platform_specific::wayland::event_loop\x1b[0m\x1b[2m:\x1b[0m SCTK setup complete.
+[2m1970-01-01T00:00:22.072724Z[0m [33m WARN[0m [1mcosmic-notifications[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:22.110382Z[0m [33m WARN[0m [1mcosmic-notifications[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:22.110526Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:22.054755Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1mnew\x1b[0m\x1b[1m{\x1b[0m\x1b[3mname\x1b[0m\x1b[2m=\x1b[0m"HDMI-A-1" \x1b[3mphysical\x1b[0m\x1b[2m=\x1b[0mPhysicalProperties { size: Size<smithay::utils::geometry::Raw> { w: 320, h: 200 }, subpixel: Unknown, make: "Unknown", model: "Unknown", serial_number: "Unknown" }\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m Creating new Output \x1b[3mname\x1b[0m\x1b[2m=\x1b[0m"HDMI-A-1"
+[2m1970-01-01T00:00:22.110621Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:22.057580Z\x1b[0m \x1b[32m INFO\x1b[0m Creating new wl_output \x1b[3moutput\x1b[0m\x1b[2m=\x1b[0m"HDMI-A-1"
+[2m1970-01-01T00:00:22.111182Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:22.097515Z\x1b[0m \x1b[32m INFO\x1b[0m Made socket connection
+[2m1970-01-01T00:00:22.111302Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:22.097788Z\x1b[0m \x1b[32m INFO\x1b[0m Connected to notifications
+[2m1970-01-01T00:00:22.163456Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:22.126500Z\x1b[0m \x1b[32m INFO\x1b[0m Spawning applets
+[2m1970-01-01T00:00:22.164424Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:22.150392Z\x1b[0m \x1b[32m INFO\x1b[0m [(PanelClient { name: "com.system76.CosmicPanelWorkspacesButton", path: None, client: Some(Client { id: InnerClientId { ptr: 0x8d2d19e0, alive: true }, data: ClientData { .. } }), stream: Some(UnixStream { fd: FileDesc(OwnedFd { fd: 265 }) }), security_ctx: None, exec: None, minimize_priority: None, requests_wayland_display: None, is_notification_applet: None, shrink_priority: None, shrink_min_size: None, padding_shrinkable: false, auto_popup_hover_press: None }, Mutex { data: "<locked>", poisoned: false, .. }, WingStart), (PanelClient { name: "com.system76.CosmicPanelAppButton", path: None, client: Some(Client { id: InnerClientId { ptr: 0x8d2d1ad0, alive: true }, data: ClientData { .. } }), strM4A: DONE
