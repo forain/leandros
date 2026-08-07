@@ -6938,9 +6938,60 @@ fn gap2_sample_tick() {
     }
 }
 
+/// Master gate for the `[EVSTAT]` evdev I/O census (`evstat_tick`). Same shape
+/// as `DRM_STATS`: a const so the whole sampler compiles out when off.
+pub const EV_STATS: bool = true;
+
+/// 0.5 Hz `[EVSTAT]` census of every evdev node, one line per device.
+///
+/// WHY IT EXISTS. `evpush` on the `[DRMSTAT]` line already witnesses that
+/// host-injected input reaches the kernel ring. It cannot distinguish the two
+/// ways a compositor can then ignore it: never opening `/dev/input/eventN`, and
+/// opening it but never reading. `reads`/`polls`/`ioctls` are nonzero only if
+/// some process is actually talking to the node, `deliv` only if events left
+/// the kernel, and `drop` climbing with `deliv` flat is a ring nobody drains.
+/// `conspop` is broken out separately because the in-kernel console pops
+/// event0 for its own keyboard input — the console and a compositor are
+/// competing consumers of the same keyboard ring.
+///
+/// IRQ CONTEXT (BSP timer tick, via `poll_deadline_tick`). Relaxed atomic loads
+/// plus one `try_lock` for the ring depth, and direct UART writes. It takes no
+/// blocking lock, touches no user memory and never takes `RUN_QUEUE`. A depth
+/// of `0xffffffffffffffff` means the depth sample was MISSED on lock
+/// contention, not that the ring is empty.
+fn evstat_tick() {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !EV_STATS { return; }
+    static LAST: AtomicUsize = AtomicUsize::new(0);
+    let now = ticks() as usize;                        // 100 Hz
+    if now.wrapping_sub(LAST.load(Relaxed)) < 200 { return; }   // 0.5 Hz
+    LAST.store(now, Relaxed);
+    for dev in 0..2usize {
+        let c = evdev_server::census(dev);
+        mm::gap2::s("[EVSTAT] t=");   mm::gap2::h(now);
+        mm::gap2::kv(" dev=",     dev);
+        mm::gap2::kv(" push=",    c.pushed  as usize);
+        mm::gap2::kv(" drop=",    c.dropped as usize);
+        mm::gap2::kv(" depth=",   c.depth   as usize);
+        mm::gap2::kv(" reads=",   c.reads   as usize);
+        mm::gap2::kv(" eagain=",  c.eagain  as usize);
+        mm::gap2::kv(" deliv=",   c.deliv   as usize);
+        mm::gap2::kv(" polls=",   c.polls   as usize);
+        mm::gap2::kv(" pollin=",  c.pollin  as usize);
+        mm::gap2::kv(" ioctls=",  c.ioctls  as usize);
+        mm::gap2::kv(" enotty=",  c.enotty  as usize);
+        mm::gap2::kv(" lastnr=",  c.lastnr  as usize);
+        mm::gap2::kv(" conspop=", c.conspop as usize);
+        mm::gap2::kv(" rpid=",    c.rpid    as usize);
+        mm::gap2::kv(" ipid=",    c.ipid    as usize);
+        mm::gap2::nl();
+    }
+}
+
 pub fn poll_deadline_tick() {
     use core::sync::atomic::Ordering::Relaxed;
     gap2_sample_tick();
+    evstat_tick();
     let now = ticks();
     let tfd = vfs::earliest_timerfd_deadline();
     // Fast path: the lock-free hint (min of parked timed waiters' deadlines)
