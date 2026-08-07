@@ -1,0 +1,253 @@
+=== POSITIVE CONTROL (must FAIL) ===
+[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbi78[?25h[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz78[?25h[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz4278[?25h
+[?2004l[31merror:[39m command not found
+>>> CONTROL OK ('command not found')
+
+[t+    0.1s] === CAPTURE A (control, no DRM client) ===
+    A: 1280x800 name='QEMU' rects=1 uncovered=0
+
+[t+    0.2s] === LAUNCH: vkrender --present --present-hold-ms=240000 ===
+ ms; present = ON
+
+[ENV ] VN_DEBUG=(unset)
+[ENV ] MESA_VK_WSI_DEBUG=(unset)
+[ENV ] LD_LIBRARY_PATH=(unset)
+
+icd_dlopen: PASS
+[INFO] vk_icdNegotiateLoaderICDInterfaceVersion -> VK_SUCCESS, version=5
+icd_negotiate: PASS
+icd_gipa: PASS
+resolve_vkCreateInstance: PASS
+[DRM] GET_CAPS capset=0x00000004 host max_ver=0x00000000 max_size=0x000000A0
+[DRM] virtgpu context created, capset=0x00000004 ctx_id=0x00000001
+[DRM] host-visible blob mapped: res=0x00000010 win_off=0x00000000 phys_hi=0x00000080 phys_lo=0x00000000 map_info=0x00000001
+[DRM-SRV] mmap token=0x0000008000000000 map_info=0x01 -> writeback
+[DRM] host-visible blob mapped: res=0x00000011 win_off=0x00030000 phys_hi=0x00000080 phys_lo=0x00030000 map_info=0x00000001
+[DRM-SRV] mmap token=0x0000008000030000 map_info=0x01 -> writeback
+vkCreateInstance: PASS
+resolve_instance_funcs: PASS
+enumerate_physical_devices: PASS
+[INFO] device: "Virtio-GPU Venus (AMD Ryzen 9 7950X 16-Core Processor (RADV RAPHAEL_MENDOCINO))" type=INTEGRATED_GPU vendorID=0x1002 deviceID=0x164e api=1.4.307
+[INFO] memoryHeapCount=2 memoryTypeCount=11
+[INFO]   heap[0] size=16898920448 flags=0x0
+[INFO]   heap[1] size=33797840896 flags=0x1
+[INFO]   memtype[0] heap=1 flags=0x1 [DEVICE_LOCAL ]
+[INFO]   memtype[1] heap=1 flags=0x1 [DEVICE_LOCAL ]
+[INFO]   memtype[2] heap=0 flags=0x6 [HOST_VISIBLE HOST_COHERENT ]
+[INFO]   memtype[3] heap=1 flags=0x7 [DEVICE_LOCAL HOST_VISIBLE HOST_COHERENT ]
+[INFO]   memtype[4] heap=1 flags=0x7 [DEVICE_LOCAL HOST_VISIBLE HOST_COHERENT ]
+[INFO]   memtype[5] heap=0 flags=0xe [HOST_VISIBLE HOST_COHERENT HOST_CACHED ]
+[INFO]   memtype[6] heap=0 flags=0xe [HOST_VISIBLE HOST_COHERENT HOST_CACHED ]
+[INFO]   memtype[7] heap=1 flags=0xc1 [DEVICE_LOCAL ]
+[INFO]   memtype[8] heap=0 flags=0xc6 [HOST_VISIBLE HOST_COHERENT ]
+[INFO]   memtype[9] heap=1 flags=0xc7 [DEVICE_LOCAL HOST_VISIBLE HOST_COHERENT ]
+[INFO]   memtype[10] heap=0 flags=0xce [HOST_VISIBLE HOST_COHERENT HOST_CACHED ]
+[INFO] deviceExtensionCount=170
+[INFO] VK_KHR_swapchain advertised: YES  (design Q6: the renderer_sync_fd.semaphore_importable gate)
+[INFO] VK_EXT_external_memory_host advertised: no  (design Q5: zero-copy wl_shm on the M4 WSI path)
+[INFO] R8G8B8A8_UNORM optimalTilingFeatures=0x1dd83 (COLOR_ATTACHMENT=yes TRANSFER_SRC=yes)
+[INFO] queueFamily[0] flags=0xf count=1
+[INFO] queueFamily[1] flags=0xe count=4
+[INFO] queueFamily[2] flags=0x20 count=1
+[INFO] queueFamily[3] flags=0x40 count=1
+[INFO] using queue family 0 (graphics=yes)
+queue_family_found: PASS
+vkCreateDevice: PASS
+resolve_device_funcs: PASS
+vkGetDeviceQueue: PASS
+vkCreateCommandPool: PASS
+vkAllocateCommandBuffers: PASS
+[DRM] host-visible blob mapped: res=0x00000012 win_off=0x00130000 phys_hi=0x00000080 phys_lo=0x00130000 map_info=0x00000003
+[DRM] non-cached blob mapping honoured (uncached)
+[DRM-SRV] mmap token=0x0000008000130000 map_info=0x03 -> uncached
+[DRM] host-visible blob mapped: res=0x00000013 win_off=0x00140000 phys_hi=0x00000080 phys_lo=0x00140000 map_info=0x00000001
+vkCreateFence: PASS
+create_device_buffer: PASS
+[INFO] device buffer: size=262144 align=16 memoryTypeBits=0x000007ad
+[INFO] device_buffer: chose memory type 0 (heap 1) flags=0x1 [DEVICE_LOCAL ] (pass 0)
+alloc_device_memory: PASS
+bind_device_buffer: PASS
+create_host_buffer: PASS
+[INFO] host buffer: size=262144 align=16 memoryTypeBits=0x000007ad
+[INFO] host_buffer: chose memory type 5 (heap 0) flags=0xe [HOST_VISIBLE HOST_COHERENT HOST_CACHED ] (pass 0)
+alloc_host_memory: PASS
+bind_host_buffer: PASS
+[DRM] host-visible blob mapped: res=0x00000014 win_off=0x00940000 phys_hi=0x00000080 phys_lo=0x00940000 map_info=0x00000001
+[INFO] vkMapMemory took 0 ms -> 0x41234000
+vkMapMemory_host: PASS
+host_mapping_rw: PASS
+
+[STEP] subtest 0 — shaderless vkCmdFillBuffer + copy + readback
+s0_record: PASS
+[INFO] s0: vkQueueSubmit returned in 1 ms
+[INFO] s0: fence signalled after 49 ms (submit+wait = 50 ms)
+s0_submit: PASS
+[INFO] s0_verify: all 65536 words == 0xdeadbeef
+s0_verify: PASS
+
+[STEP] subtest 1 — compute dispatch into a storage buffer
+s1_shader_module: PASS
+s1_descriptor_layout: PASS
+s1_descriptor_pool: PASS
+s1_descriptor_set: PASS
+s1_pipeline_layout: PASS
+[INFO] s1: vkCreateComputePipelines took 1 ms
+s1_compute_pipeline: PASS
+s1_record: PASS
+[INFO] s1: vkQueueSubmit returned in 0 ms
+[INFO] s1: fence signalled after 49 ms (submit+wait = 49 ms)
+s1_submit: PASS
+[INFO] s1_verify: all 4096 words match (i*2654435761)^0x9E3779B9 — these values cannot come from a memset
+s1_verify: PASS
+
+[STEP] subtest 2 — clear + triangle into an OPTIMAL-tiled image, copy to host, assert pixels
+s2_create_image: PASS
+[INFO] s2 image: size=262144 align=65536 memoryTypeBits=0x000007ad
+[INFO] s2_image: chose memory type 0 (heap 1) flags=0x1 [DEVICE_LOCAL ] (pass 0)
+s2_image_memory: PASS
+s2_bind_image: PASS
+s2_image_view: PASS
+s2_render_pass: PASS
+s2_framebuffer: PASS
+s2_vert_module: PASS
+s2_frag_module: PASS
+s2_pipeline_layout: PASS
+[INFO] s2: vkCreateGraphicsPipelines took 1 ms
+s2_graphics_pipeline: PASS
+s2_record: PASS
+[INFO] s2: vkQueueSubmit returned in 0 ms
+[INFO] s2: fence signalled after 51 ms (submit+wait = 51 ms)
+s2_submit: PASS
+[INFO] s2_pixels: all 13 named coordinates match (4 corners + 5 outside + 4 inside)
+s2_pixels: PASS
+[INFO] s2_coverage: triangle=18432 clear=47104 other=0 (total 65536)
+s2_coverage: PASS
+s2_no_intermediate_pixels: PASS
+[INFO] s2_checksum: FNV-1a over 262144 bytes = 0x02C0FDC5
+[INFO] s2_checksum: not pinned (set VKRENDER_EXPECT_CHECKSUM=0x02C0FDC5 to make it a regression assertion)
+
+[STEP] --present — blit the rendered image to a DRM dumb buffer and SETCRTC it
+[INFO] present: this drives CRTC 1 / connector 1 with no master arbitration; COSMIC must not be running
+present_open_card0: PASS
+present_getresources: PASS
+present_getconnector: PASS
+[INFO] present: mode 1280x800
+present_create_dumb: PASS
+present_map_dumb: PASS
+present_mmap: PASS
+present_blit: PASS
+present_addfb2: PASS
+present_setcrtc: PASS
+present_dirtyfb: PASS
+[INFO] present: holding the image for 240000 ms
+
+[t+    7.1s] >>> holding for 240000 ms; capturing B
+
+    B: 1280x800 rects=1 uncovered=0
+— take the QMP screendump now
+vkDestroyDevice: PASS
+vkDestroyInstance: PASS
+
+--- vkrender done, failures = 0, skipped = 0 ---
+
+[t+  248.1s] === REFERENCE: drmsmoke --hold ===
+[?2004h[0m[?25l[7;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h[0m[?25l[7;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mdrmsmoke --hold78[?25h
+[?2004lld_so::init tp=0x0000000000000000
+PH type=0x0000000000000006
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000007
+open_card0: PASS
+st_rdev_226_0: PASS
+VERSION: PASS
+GET_CAP_DUMB_BUFFER: PASS
+GET_CAP_TIMESTAMP_MONOTONIC: PASS
+GETRESOURCES: PASS
+GETCONNECTOR: PASS
+CREATE_DUMB: PASS
+MAP_DUMB: PASS
+MMAP_FILL: PASS
+ADDFB2: PASS
+SETCRTC: PASS
+DRMSMOKE: HOLD READY
+    C: 1280x800 rects=1 uncovered=0
+
+
+================ ANALYSIS ================
+serial-reported mode      : 1280x800
+serial s2_coverage        : (18432, 47104, 0, 65536)
+serial s2_checksum        : 0x02C0FDC5
+serial vkrender done      : failures=0 skipped=0
+serial present_*/s2_* lines:
+    s2_create_image: PASS
+    s2_image_memory: PASS
+    s2_bind_image: PASS
+    s2_image_view: PASS
+    s2_render_pass: PASS
+    s2_framebuffer: PASS
+    s2_vert_module: PASS
+    s2_frag_module: PASS
+    s2_pipeline_layout: PASS
+    s2_graphics_pipeline: PASS
+    s2_record: PASS
+    s2_submit: PASS
+    s2_pixels: PASS
+    s2_coverage: PASS
+    s2_no_intermediate_pixels: PASS
+    present_open_card0: PASS
+    present_getresources: PASS
+    present_getconnector: PASS
+    present_create_dumb: PASS
+    present_map_dumb: PASS
+    present_mmap: PASS
+    present_blit: PASS
+    present_addfb2: PASS
+    present_setcrtc: PASS
+    present_dirtyfb: PASS
+
+  --- census: A / control (no DRM client) ---
+  resolution      : 1280x800  (1024000 px)
+  distinct colours: 3
+      0x000000     985722  (96.262%)
+      0xffffff      38135  ( 3.724%)
+      0xcd0000        143  ( 0.014%)
+
+  --- census: B / vkrender --present ---
+  resolution      : 1280x800  (1024000 px)
+  distinct colours: 3
+      0x181818     958464  (93.600%)
+      0x0000ff      47104  ( 4.600%)
+      0xff0000      18432  ( 1.800%)
+
+  --- census: C / drmsmoke --hold (pinned reference) ---
+  resolution      : 1280x800  (1024000 px)
+  distinct colours: 2
+      0x181818     958464  (93.600%)
+      0xff0000      65536  ( 6.400%)
+
+  --- geometry of B ---
+  non-background (expect 256x256 at ox,oy): 65536 px  bbox x=512..767 y=272..527  256x256  fill=1.0000
+  0xff0000 triangle: 18432 px  bbox x=544..735 y=305..495  192x191  fill=0.5026
+  0x0000ff clear: 47104 px  bbox x=512..767 y=272..527  256x256  fill=0.7188
+  predicted centring: ox=512 oy=272 -> x=512..767 y=272..527
+
+---------------- VERDICT ----------------
+  [PASS] P1 resolution == the mode vkrender printed
+  [PASS] P2 exactly 3 distinct colours {181818, 0000ff, ff0000}
+  [PASS] P3 count(0x181818) == W*H - 65536
+  [PASS] P4 count(ff0000)+count(0000ff) == 65536
+  [PASS] P5 non-background bbox is exactly 256x256 at (ox,oy), fill 1.0
+  [PASS] P6 count(ff0000) within 18432 +/- 600
+  [PASS] P7 census == the guest's own s2_coverage triple, exactly
+  [PASS] P8 s2_checksum == pinned 0x02C0FDC5
+  [PASS] P9 present_setcrtc and present_addfb2 both PASS
+  [PASS] P10 capture B complete (0 uncovered)
+  [PASS] A control: 0x0000ff absent before any DRM client
+  [PASS] A control: B is not byte-identical to A
+  [PASS] C reference: drmsmoke census matches its pinned aarch64 frame
+  [PASS] C reference: 0x0000ff absent from drmsmoke's frame
+  [PASS] C reference: B differs from C
+
+VERDICT: aarch64 VULKAN-TO-SCANOUT CONFIRMED
+ppm files in /tmp/vkrcap

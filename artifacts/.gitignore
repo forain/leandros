@@ -52,6 +52,24 @@ rootfs/
 *.log
 *.crate
 
+# ...but EVIDENCE IS NOT BUILD OUTPUT, and the rules above swept it up.
+#
+# Every "photographed" claim this project makes rests on a capture, and every
+# capture was silently excluded by *.png / *.log above: `git add` skips ignored
+# paths without erroring, so a lane can commit its results.md and believe the
+# frames went with it. The aarch64 vkrender captures were lost exactly that way
+# and had to be re-copied off the box by hand. A result whose evidence lives on
+# one machine's /tmp is a result nobody can re-check.
+#
+# So: captures and run logs under notes/ are part of the authored record and
+# are kept. Elsewhere in this tree they are still build output and still go.
+!notes/**/*.png
+!notes/**/*.log
+#
+# *.ppm stays excluded deliberately: it is the raw capture format and a single
+# 1920x1080 frame is ~6 MB, against ~1 MB for the same frame as PNG. Convert to
+# PNG and commit that; keep the PPM on the machine that took it.
+
 # Editor / OS temp files
 *.swp
 *.swo
