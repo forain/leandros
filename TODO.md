@@ -3,32 +3,34 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-07** (`b8ff2f6`), after a second same-day wave
-that landed three commits, **closed the present half of item 2 with an actual photograph**,
-emptied "Prepared but not landed" for the first time, cleared three deferred-list entries,
-and corrected two more recorded claims.
+Last reconciled against `main` on **2026-08-07**, after a wave that landed eleven commits,
+**closed the present half of item 2 with an actual photograph**, **achieved M4's client
+half**, emptied "Prepared but not landed", cleared four deferred-list entries, and corrected
+**seven** recorded claims — two of which this file had itself introduced hours earlier.
 
-**Landed in this wave.** `9d73b43` adds `drmsmoke --hold`, which paints a deterministic
-two-colour frame and keeps it on the scanout; it is what finally photographed the DRM
-present path on both arches. `cc82924` lands the long-prepared `driver.py --venus` mode.
-`b8ff2f6` moves DRM page-flip event timestamps off the 100 Hz tick onto the interpolated
-`arch_monotonic_ns()` clock, with `drmsmoke`'s new `FLIP_TS_SUBTICK` as the permanent
-detector, verified by mutation (control `cd51110d`, mutant `f19b6a35`, restore `cd51110d`
-byte-identical).
+The whole artifacts tree was also imported into `artifacts/` in this repo, because it had
+been carrying the entire Vulkan arc's instruments with no version control at all.
 
-**The lesson of this wave is that two of four "open" items were never work.** Item 1 is
-explicitly a finding whose own text says the fix is undecided and warns against fixing it
-kernel-side; item 3 is killed as an M4 route by measurement with nothing scheduled. Acting
-on either would have been inventing scope. The real remaining work was one item's first half
-plus a prepared patch and a handful of deferred-list entries — **read what an item says it
-is before scheduling it**, because a four-row table implies four tasks and this one held two.
+**Two lessons from this wave that generalise, both about sizing rather than engineering.**
 
-**A sizing correction that generalises.** Item 2 asked for "a standalone, Vulkan-free
-dumb-buffer present tool". No new tool was needed: `drmsmoke` already walked the whole path,
-and the two genuinely missing pieces were about the *photograph* (a checkable pattern, and
-not tearing down before capture), not the present. The item had been written as if from
-scratch. **Before sizing a task here, check whether an existing test binary already covers
-the path** — this file has now over-sized work at least once by not looking.
+1. **Two of the four "open" items were never work.** Item 1 is a finding whose own text says
+   the fix is undecided and warns against implementing one; item 3 is dead by measurement
+   with nothing scheduled. A four-row table implies four tasks and this one held two.
+   **Read what an item says it is before scheduling it.**
+2. **Item 2 was over-sized.** It asked for "a standalone, Vulkan-free dumb-buffer present
+   tool". No new tool was needed — `drmsmoke` already walked the whole path, and the two
+   genuinely missing pieces were about the *photograph* (a checkable pattern, and not tearing
+   down before capture), not the present. ~85 lines instead of a new binary. **Check whether
+   an existing test binary already covers the path before sizing from scratch.**
+
+**A third, sharper lesson: a control on the wrong machine is not a prediction.** The
+`MESA_VK_WSI_DEBUG=sw,noshm` requirement was measured correctly on the RADV host and recorded
+here as though it held generally. The guest measurement **reversed it** — Venus reports
+`VK_EXT_external_memory_host = no`, so Mesa already selects the memcpy path and plain `sw` is
+correct. A host control is a *client sanity check*, not a guest prediction. The same shape
+recurred with the interpolated clock: a clamped `tv_usec` was recorded as "no signal" when it
+is in fact **positive evidence**, because the old clock could never emit a value ending in
+`9999`. Both were caught within the wave; both would have misled the next reader.
 
 **Landed on this Mac,** in order. `a85e209` corrects the aarch64 `ATTR_DEV`/`ATTR_NOCACHE`
 comments to the measured flat `MAIR_EL1 = 0xFF` — comments only, no code. `f43a79a` bounds
@@ -146,7 +148,7 @@ inferred is that the input held a rect of ≥ 1,809,216 px.
    in use elsewhere.
 4. **The handle-retirement item's severity claim was wrong.** It was not one leaked object
    per composited frame. cosmic-comp exports **per buffer at allocation, not per frame**,
-   measured in `~/code/leandros-artifacts/notes/m9-dmabuf-lifetime/mac-verify.md` §5.3-5.5:
+   measured in `artifacts/notes/m9-dmabuf-lifetime/mac-verify.md` §5.3-5.5:
    38 samples over 185 s showed 5 dumb creates, 5 PRIME exports, 1 free, then frozen, with
    the panel clock still ticking. Projected post-Stage-3 leak is ~5 objects per session, not
    thousands. A measurement sitting in the same artifacts directory already contradicted the
@@ -233,7 +235,7 @@ never called and `is_software` is true. **Scope:** absent *in this configuration
 software EGL, forced because the macOS host has no EGL, so `virtio-gpu-gl,venus=on` is
 unusable and the guest has no hardware GL. It would flip only if the guest gained a
 non-software EGL device. Full report and controls:
-`~/code/leandros-artifacts/notes/m9-crossopen-dmabuf/stage0a-wl-globals.md`.
+`artifacts/notes/m9-crossopen-dmabuf/stage0a-wl-globals.md`.
 
 **The primary plane's over-damage is upstream-correct behaviour, not a defect.** Closed by
 measurement this wave (see the header). What survives for future work: damage tracking
@@ -279,7 +281,7 @@ reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print i
 - `start-cosmic` runs under **brush**; boot path is login → root → `start-cosmic`.
 
 **Load-bearing session env** (in the launcher at
-`~/code/leandros-artifacts/m6-session-data/start-cosmic-leandros`, not in this repo):
+`artifacts/m6-session-data/start-cosmic-leandros`):
 
 - `COSMIC_RENDER_DEVICE=226:0` — card0's dev id. Without it, cosmic-comp's
   `determine_primary_gpu` filters our software device out and falls back to an EGL
@@ -563,7 +565,7 @@ no docker, and podman pulls arm64 images but cannot execute them. Cross-compilin
 `zig cc` + `musl-dyn-link.sh` works, with two gotchas — `zig cc` enables UBSan by default
 (link fails on `__ubsan_handle_*`, needs `-fno-sanitize=undefined`) and its driver silently
 produces a **static** binary, which cannot `dlopen` the ICD. Corrected recipes:
-`~/code/leandros-artifacts/notes/m9-m3-vulkan/build-vkrender-alpine-fixed.sh`,
+`artifacts/notes/m9-m3-vulkan/build-vkrender-alpine-fixed.sh`,
 `build-vkrender-aarch64-zig.sh`, and `m9-vkswap/build-vkswap-alpine.sh`. The Vulkan loader
 stays unshipped: the ICD exports only `vk_icdGetInstanceProcAddr`,
 `vk_icdNegotiateLoaderICDInterfaceVersion` and `vk_icdGetPhysicalDeviceProcAddr`, so it can
@@ -572,7 +574,7 @@ asserted** unless `VKRENDER_EXPECT_CHECKSUM=0x02C0FDC5` is exported; every compa
 has been done by hand.
 
 **Evidence lives outside this repo.** Run logs, screenshots, research notes and test
-harnesses are in `~/code/leandros-artifacts/notes/`. Design docs that are still
+harnesses are in `artifacts/notes/`. Design docs that are still
 execution-ready are in `docs/design/`.
 
 **Explicitly out of scope** (all degrade gracefully or are non-fatal): XWayland,
@@ -583,27 +585,54 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 
 ## Open work
 
-| # | Item | Category | Blocked on |
+| # | Item | Category | State |
 |---|---|---|---|
-| 1 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — kernel/host | — |
-| 2 | The last unproven hop is a Vulkan-free present on the non-Venus path | Feature | — |
-| 3 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | — |
-| 4 | Deferred work and known limitations | Mixed | — |
+| 1 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — **no action** | Recorded on purpose; fix undecided |
+| 2 | M4 — pixels unproven, aarch64 unmeasured | Feature — **in progress** | Client half achieved; see next steps |
+| 3 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | Nothing scheduled |
+| 4 | Deferred work and known limitations | Mixed | Backlog |
+
+### Next steps, in the order they are worth doing
+
+1. **Prove M4's pixels.** Everything client-side is measured (300/300 presents); only the
+   photograph is missing. `id=venusgpu` (`a2f9fb6`) removed the `DeviceNotFound` half of the
+   problem, so `screendump device=venusgpu` now *resolves*. **Already tried, do not repeat:**
+   bare `screendump` captures **console 0**, the std-VGA that `--venus` deliberately keeps for
+   OVMF/Limine's GOP — it holds the text console, not the scanout, and this has now fooled two
+   separate measurements. Expect `device=venusgpu` to fail `"no surface"` *after* a frame is
+   presented, because a virgl-backed scanout is a GL scanout with no `DisplaySurface`. So the
+   remaining routes are: capture from the *host* side (virglrenderer/EGL), or add a
+   compositor-side readback, or accept the client-side evidence as sufficient and say so.
+   **This is a host-tooling problem, not a LeandrOS defect** — do not go looking in the kernel.
+2. **Run M4 on aarch64.** Entirely unmeasured — no baseline, no run. The aarch64 `vkwl` is
+   built and staged (218,768 B) but has never executed. The box is x86_64, so an aarch64 guest
+   falls to TCG and a COSMIC session on softpipe under TCG is impractically slow; this
+   realistically needs the Mac, which has no EGL and therefore no Venus. **State the blocker
+   plainly rather than half-running it.**
+3. **If a permanent Vulkan-Wayland test is wanted, write it in Rust as a `userland/` crate.**
+   **This repo is Rust; C does not come in.** `vkwl.c` therefore stays outside the repo, at
+   `~/code/leandros-artifacts/venus-lane/vkwl.c` on the host (and on the box), and is **not
+   versioned** — that is an accepted consequence of the Rust-only rule, not an oversight.
+   Treat it as a **throwaway probe that has already delivered its finding** (M4's client half,
+   300/300 presents): if the capability is worth keeping, it gets rewritten as a `no_std` Rust
+   crate built by `scripts/build-userland.sh`, alongside the other `userland/*test` binaries,
+   which satisfies both standing rules at once. Do not teach the build system a C path.
+   The same applies to the other host-side C probes (`vktest.c`, `ssp_guard.c`,
+   `caps_probe.c`, `wlclient.c`) — they are scaffolding, and they stay out.
+4. **Land the `mkfs` staging patch for `vkwl`/`m4-vkwl`** (`artifacts/notes/m9-vkwl/mkfs-vkwl.patch`),
+   once step 3 decides where `vkwl` lives. It is uncommitted on the box.
 
 ---
 
 ## Prepared but not landed
 
-`driverpy_venus.patch` landed as `cc82924` — it applied clean, and its device line was
-verified character-for-character against `run-qemu.sh` rather than trusted. This section was
-briefly empty for the first time; land prepared patches in the wave that prepares them, since
-both patches that have sat here needed a rebase before they applied.
+Land prepared patches in the wave that prepares them — every patch that has sat in this
+section needed a rebase before it applied.
 
-One patch, and it is **on the Linux box, not here**:
-`~/code/leandros-artifacts/notes/m9-vkwl/mkfs-vkwl.patch` adds `vkwl` and `m4-vkwl` staging
-blocks to `scripts/mkfs-f2fs-populated.py`, conditional on the host binary existing (the same
-pattern as `leandros-applet` and `wl-globals`). It is uncommitted in the box's tree at
-`20525aa`; the copy here is a mirror. It is harmless to land on this Mac — the conditional
+One patch, now versioned at `artifacts/notes/m9-vkwl/mkfs-vkwl.patch`: it adds `vkwl` and
+`m4-vkwl` staging blocks to `scripts/mkfs-f2fs-populated.py`, conditional on the host binary
+existing (the same pattern as `leandros-applet` and `wl-globals`). It is uncommitted in the
+box's tree at `20525aa`. It is harmless to land here — the conditional
 simply never fires without the binaries — but it is not landed, because the Mac has no built
 `vkwl` and landing staging for a file that cannot exist would be noise.
 
@@ -645,7 +674,7 @@ answer is a guest-side precondition, a shorter timeout with a distinct error, or
 at all is **undecided; this is a finding, not a plan.** Do **not** "fix" it by refusing or
 rewriting `RING_IDX` kernel-side: Mesa sets it on every submit.
 
-### 2. The last unproven hop is a Vulkan-free present on the non-Venus path
+### 2. M4 — the client half is achieved; pixels and aarch64 remain
 
 Everything up to the scanout is proven. `vkrender --present` scores 10/10 `present_*`
 subtests with `failures = 0` and needed **zero code** — it was unrun, not unfinished — and
@@ -797,7 +826,7 @@ the projection is ~5 objects per session, not thousands. `gem_handle_delete` alr
 that work is done; the `bo_dumb`/`bo_bhnd` census fields are the detector.
 
 Design, staging and per-stage guard tests with their falsifying mutations:
-`~/code/leandros-artifacts/notes/m9-crossopen-dmabuf/crossopen_design.md`.
+`artifacts/notes/m9-crossopen-dmabuf/crossopen_design.md`.
 
 ### 4. Deferred work and known limitations
 
@@ -868,21 +897,10 @@ Design, staging and per-stage guard tests with their falsifying mutations:
   **Do not space such samples with `usleep`/`nanosleep`:** `sys_nanosleep` rounds any nonzero
   request **up** to whole ticks, so sleeping between flips resyncs to the tick edge and
   *reinforces* the phase alignment that produces all-saturated runs. Use busy-work.
-- ~~**DRM page-flip event timestamps**~~ — **done** (`b8ff2f6`), verified by mutation.
-  `queue_flip_event` now stamps from `arch_monotonic_ns()`. The layering problem is worth
-  remembering: `drivers` has **no Cargo edge** to the arch crates, and the tree's existing
-  answer is a `#[no_mangle] extern "C"` symbol resolved at link time (`servers/evdev`
-  already does this for input timestamps) — reach for that before adding a dependency edge.
-  `drmsmoke`'s new `FLIP_TS_SUBTICK` is the permanent detector.
-- ~~**Harness gotchas in `m8_cursor.py`**~~ — **both fixed** (artifacts repo, not under git).
-  **Correction: the recorded mechanism for the first one was stale.** The file already keyed
-  its busiest window on `evpush`; the surviving bug was that the no-activity branch fell
-  through to `return 0` instead of erroring, so a legacy-path control still printed a
-  degenerate `1.00 flips/s` — symptom recorded correctly, cause not. It now exits non-zero
-  with a message. The positional-regex shear was real and is replaced by the
-  order-independent `key=0xHEX` parser from `m9-fb-damage-clips/m9_analyze.py`, verified
-  against a real capture carrying the `dmg_*` insertion **and** against a synthetic line
-  with a field inserted mid-stream, so it tolerates the next insertion too.
+- **Crate layering, worth remembering because it will recur:** `drivers` has **no Cargo edge**
+  to the arch crates. The tree's existing answer is a `#[no_mangle] extern "C"` symbol resolved
+  at link time — `arch_monotonic_ns`, which `servers/evdev` already uses for input timestamps.
+  Reach for that before adding a dependency edge and inverting the layering.
 - **Build gotcha:** building a userland test binary with a bare `cargo build` instead of
   `scripts/build-userland.sh` omits `-C relocation-model=static`, producing a PIE whose
   `.data.rel.ro` our loader never relocates. It then faults at `__libc_start_main+0x44`
@@ -902,7 +920,8 @@ Design, staging and per-stage guard tests with their falsifying mutations:
   added under `.claude/worktrees/` alongside the pre-existing `doomgeneric`, `mame` and
   `relibc`, and are left there deliberately.
 - **`/bin/wl-globals` is staged when the host binary exists** —
-  `~/code/leandros-artifacts/m9-wlglobals/out/wl-globals-<arch>`, same conditional pattern
+  `~/code/leandros-artifacts/m9-wlglobals/out/wl-globals-<arch>` — a HOST path, not the
+  in-repo copy: `out/` holds built binaries and is gitignored. Same conditional pattern
   as `leandros-applet`. It is a measurement instrument (it enumerates the `wl_registry` of
   every `wayland-*` socket in `$XDG_RUNTIME_DIR` and exits); nothing in the session depends
   on it. **Both arches are now built and staged**; the crate's `.cargo/config.toml` already
@@ -915,19 +934,23 @@ Design, staging and per-stage guard tests with their falsifying mutations:
   The landmine is about Rust's self-relocating *static*-PIE, which is a different recipe.
   Applying it here would break a working build. Both arches verified to have identical ELF
   shape (DYN, 11 program headers, same order).
-- **`vkwl` is the project's first Vulkan Wayland client, and it exists only as loose files.**
-  `~/code/leandros-artifacts/venus-lane/vkwl.c` (~600 lines, 33 KB) plus `build-vkwl.sh` and
-  the guest-side runner `m6-session-data/m4-vkwl`, mirrored from the box and verified
-  byte-identical. It was written because `vkswap`, `vkrender` and `vktest` are **all**
-  `VK_EXT_headless_surface` and none of them touches Wayland — see item 2.
-  **The real exposure is broader than this one file:** `~/code/leandros-artifacts` is **not a
-  git repository**, so `vktest.c`, `ssp_guard.c`, every `build-*.sh` and now `vkwl.c` have no
-  history and nothing to recover them from. That has been true for the whole Vulkan arc and
-  has simply not bitten yet. Worth deciding deliberately — either put these instruments in
-  the repo proper, or `git init` the artifacts tree — rather than continuing to rely on the
-  files not being deleted.
+- **The artifacts tree is now versioned, in `artifacts/`.** It previously had **no version
+  control at all** — `~/code/leandros-artifacts` is not a git repo, so `vkwl.c`, `vktest.c`,
+  `ssp_guard.c` and every `build-*.sh` had no history and nothing to recover them from for the
+  whole Vulkan arc. **Only authored material was imported**: sources, notes, patches and
+  harnesses. The 41 GB / 131,505-file original holds vendored upstream trees (Mesa under
+  `llvmpipe-lane/deps-*`, pipewire, musl) and build output, which are deliberately excluded
+  and must be rebuilt from their recorded recipes; `artifacts/.gitignore` keeps them out.
+  **The original directory still exists and was not deleted** — it remains the place where
+  builds actually run.
+  **`artifacts/` is Rust-only, like the rest of the repo: no `*.c` or `*.h` is imported**, and
+  `artifacts/.gitignore` blocks them so they cannot be reintroduced by a careless drop. The
+  host-side C probes (`vkwl.c`, `vktest.c`, `ssp_guard.c`, `caps_probe.c`, `wlclient.c`) stay
+  outside the repo and stay unversioned. That is deliberate — they are scaffolding that has
+  already yielded its findings, and the standing rule is that a capability worth keeping gets
+  **rewritten as a Rust `userland/` crate**, not imported as C.
 - **Two spent instruments, kept but not pending.**
-  `~/code/leandros-artifacts/notes/m9-damage-rootcause/damage_rect_dump.patch` (132 lines,
+  `artifacts/notes/m9-damage-rootcause/damage_rect_dump.patch` (132 lines,
   one file, entirely inside the `DRM_STATS` gate) was applied on the box, produced the
   damage answer, and was reverted; it still applies clean and remains a usable clip-list
   dumper, but the question it was built for is closed, so it is not prepared work.
