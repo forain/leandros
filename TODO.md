@@ -190,9 +190,15 @@ inferred is that the input held a rect of ≥ 1,809,216 px.
 
 Facts that future work depends on and should not have to re-derive.
 
-**Goal.** Run the COSMIC desktop environment *unmodified* (source: `../cosmic-epoch`)
-on both x86_64 and aarch64 under QEMU. No COSMIC source patches; build-configuration
-flags (`--no-default-features`) are allowed. Everything beneath COSMIC — kernel, libc,
+**Goal.** Run the COSMIC desktop environment *essentially unmodified* (source:
+`../cosmic-epoch`) on both x86_64 and aarch64 under QEMU; build-configuration flags
+(`--no-default-features`) are allowed. **"No COSMIC source patches" was stated as an absolute
+and is not true of the tree** — `ports/cosmic-session/0001-env_rx-timeout-fallback.patch` and
+`ports/cosmic-greeter/0001-locker-idle-without-logind.patch` both exist and are applied, and
+the session one fires every boot. The intent — do not fork COSMIC to make it work — still
+holds and is worth holding; state it as **two patches, both recorded in `ports/`, each needing
+a justification**, rather than as zero. An absolute that a `ls` refutes gets discarded
+wholesale by the next reader. Everything beneath COSMIC — kernel, libc,
 system libraries, daemons — is ours. **This constraint stays load-bearing**: the missing
 dmabuf global is behind cosmic-comp's `!is_software` gate (item 3), and the reachable
 outcome there is a measurement, not a patch. The one place it looked like it would force an
@@ -200,8 +206,10 @@ upstream bug report — the primary-plane damage — turned out to have no upstr
 
 **Where it stands.** The desktop runs on both arches: cosmic-session → cosmic-comp on
 KMS/softpipe → busd → cosmic-bg + cosmic-panel renders a wallpaper plus a full-width
-panel bar with an embedded Wayland client, clock ticking. Remaining desktop work is
-quality and performance, not bring-up. Vulkan runs **and presents**: `vkrender` executes
+panel bar with an embedded Wayland client, clock ticking. **"Remaining desktop work is
+quality and performance, not bring-up" was wrong** and is corrected by the survey in *Road to
+a complete COSMIC desktop* below: **no input of any kind reaches the compositor**, and no
+libcosmic/iced application renders at all. Both are bring-up, not polish. Vulkan runs **and presents**: `vkrender` executes
 fill-buffer, compute and graphics work, `vkswap` drives a headless-surface swapchain to
 `vkQueuePresentKHR -> VK_SUCCESS`, and `vkrender --present` puts a rendered image on a
 real DRM scanout.
@@ -664,11 +672,190 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 
 | # | Item | Category | State |
 |---|---|---|---|
+| 6 | **No input of any kind reaches the compositor** | Bug — **TOP PRIORITY** | Measured; break is above evdev, below Wayland |
+| 7 | **Only a raw `wl_shm` client renders — no libcosmic/iced app draws** | Bug — **actionable** | `cosmic-settings` alive, healthy, 0 px in 74 s |
+| 8 | **Nothing to launch, and no way to ask for it** | Feature — **actionable** | `system_actions` unstaged; no terminal in the image |
+| 9 | **9 panel applets have no scoped-out dependency and are simply unbuilt** | Feature — cheap | Build recipe exists; spawn path proven |
+| 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
 | 1 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — **no action** | Recorded on purpose; fix undecided |
 | 2 | M4 — **COMPLETE, photographed on BOTH arches** | Feature — **DONE** | `132d4df` x86_64, `d91edbf` aarch64 |
 | 3 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | Nothing scheduled |
 | 4 | fb console scrolled the scanout out from under cosmic-comp | Bug — **FIXED + GUARDED** | `edad115` fix, `c8cbbc1` closes the guard gap |
 | 5 | Deferred work and known limitations | Mixed | Backlog |
+
+---
+
+## Road to a complete COSMIC desktop
+
+Written 2026-08-07 from **two evidence-gathering lanes, not from a wishlist**: a source
+inventory crossing `cosmic-session`'s spawn list against what `mkfs` actually stages, and a
+live capability probe on x86_64/KVM over two runs and 13 minutes. Everything below is
+measured or read from source; where a cause is unknown it says so.
+
+**Where the desktop genuinely is.** Better than the old summary implied. It composites; the
+panel renders and its clock ticks; **a client opens a toplevel** (208,563 px at
+`x=685..1233 y=133..521`); **two toplevels cascade, stack, and get a 1 px focus ring on
+exactly one**; the compositor advertises **54 globals** including `wl_seat` **v9**,
+`xdg_wm_base` v7, `zwlr_layer_shell_v1` v5, `ext_session_lock`, `ext_workspace_manager_v1`
+and `zwp_virtual_keyboard_manager_v1`; and **all 12 COSMIC components plus busd stay alive
+with zero crashes over 13 minutes**. `zwp_linux_dmabuf_v1`/`wl_drm` are the only notable
+absences and are expected (`is_software`).
+
+**The one thing that turns most of that into a desktop is input, and there is none.**
+
+**Read the taxonomy before reading the list.** These four states look identical on a blank
+screen and imply completely different work: **absent from the image**, **staged but never
+launched**, **launched but crashes**, **runs but renders nothing**. This project has already
+been misled once by conflating the last two — the panel was recorded as "frozen at its first
+frame" and the measurement eventually exonerated both the kernel and cosmic-comp. Every row
+below states which it is.
+
+### 6. No input of any kind reaches the compositor — **TOP PRIORITY**
+
+Not "laggy", not "partial": **zero**. 868 injected events reach the kernel's evdev ring while
+flips stay at the panel clock's rate — POINTER **1.21 flips/s on 868 events** against CLICK
+**1.19/s on 24 events**, i.e. 36× the input for 0.02/s more flips. **0 px** change outside the
+clock rectangle, every phase, every run. No cursor is ever visible (`curs_up = 0` per phase,
+one upload ever, at startup).
+
+**That "0 px" is a real measurement rather than an ambiguity, and the reason is worth
+keeping:** the panel clock repaints once a second, so a byte-identical capture proves a
+*stale frame*, not a quiet desktop. The same route later showed 208,563 px appearing when a
+client mapped, so the camera was demonstrably live.
+
+**Ruled out, with evidence — do not re-measure.** QEMU → virtio-tablet → kernel ring →
+userspace read is **completely fine**: `evtest2` reads `/dev/input/event1` with no libinput in
+the path and passes everything including `motion_abs_frame`, 32 events, monotonic timestamps.
+The **libudev shim is not the break** — it enumerates from a *static table*
+(`ports/input-stack/shims/libudev/libudev.c`) already containing `event0`
+(`ID_INPUT_KEYBOARD`) and `event1` (`ID_INPUT_MOUSE`) with `/sys/class/input/inputN` parents,
+so the non-listable `/dev/input` and absent `/sys/class/input` do **not** by themselves hide
+the devices. **The libseat shim's open path looks correct** — `libseat_open_device`
+(`ports/input-stack/shims/libseat/libseat.c:132`) opens `O_RDWR|O_NONBLOCK|O_CLOEXEC` and
+returns the fd as the device id.
+
+**So the break is above raw evdev and below the Wayland protocol** — inside libinput,
+smithay's libinput backend, or how cosmic-comp wires a seat to it.
+
+**The path is currently unobservable, which is the first thing to fix.**
+`RUST_LOG=smithay::backend::libinput=debug` is rejected because DEBUG is compiled out
+(`release_max_level_info`, `cosmic-comp/Cargo.toml:61-62`, not raisable additively), and
+**148 lines of session log mention libinput, a seat or an input device exactly zero times.**
+The cheapest datum that splits the space is **`wl_seat`'s advertised capabilities**, which no
+shipped tool prints: `0` means libinput never found or was never given the devices (bug below
+smithay's event loop); pointer+keyboard present means they were found and events are being
+dropped or never dispatched (bug in the pump). ~20 Rust lines added to `wl-globals`.
+
+**Also relevant, and not yet excluded:** our libudev entries must carry a seat assignment
+matching whatever `libinput_udev_assign_seat` is called with (`seat0`), or libinput skips
+them. **Input to a compositor has never once been demonstrated in this project** — M4's
+original mission was exactly this and it died at PRIME/dmabuf before any client saw an event.
+
+### 7. Only a raw `wl_shm` client renders — no libcosmic/iced app draws
+
+**"Runs but renders nothing", and the contrast is the evidence.** `wlclient` — no toolkit,
+raw `wl_shm` — draws **instantly** through this compositor. `cosmic-settings` is **staged,
+launched, alive with 3 pids, owns its D-Bus name, logs nothing, and paints 0 px at +6 s,
++26 s and +74 s.** Same compositor, same protocol, same machine. That localises the gap to
+**libcosmic/iced + `tiny-skia`**, not to Wayland and not to the kernel.
+
+This is the **same shape already recorded for cosmic-panel** — presenting fresh buffers while
+rendering nothing into them, with the kernel and cosmic-comp exonerated by measurement. Treat
+those two as **one investigation**, because they probably are.
+
+### 8. Nothing to launch, and no way to ask for it
+
+**One 2,867-byte data file disables every system keybinding in the desktop.**
+`Action::System(system)` is handled as
+`if let Some(command) = self.common.config.system_actions.get(&system) { … }`
+(`cosmic-comp/src/input/actions.rs:1016-1021`) — an **empty map is a silent no-op**, no error,
+no log line. The map comes from `com.system76.CosmicSettings.Shortcuts/v1/system_actions`,
+whose upstream default is `../cosmic-epoch/cosmic-settings-daemon/data/system_actions.ron`
+defining **26 actions** including `Launcher`, `AppLibrary`, `Terminal`, `WorkspaceOverview`,
+`Screenshot`, `WindowSwitcher`, `LockScreen`, `LogOut`. **`mkfs` stages no `/usr/share/cosmic/`
+tree at all** — verified, `grep` for `system_actions` and `share/cosmic` both return nothing.
+The symptom is already in the logs as `NoConfigDirectory`, from both the shortcuts config and
+cosmic-panel.
+
+**Why this is the highest-leverage cheap row:** `cosmic-launcher`, `cosmic-app-library` and
+`cosmic-workspaces` are **built, staged, and successfully launched every single boot** — 12
+`launch_pad` starts, max 1 per name, **zero restarts**, four boots, both arches — and all
+three are permanently invisible, purely because the only thing that can raise them resolves to
+nothing. Stage from `../cosmic-epoch`, a real checked-out sibling, not from the unversioned
+artifacts tree.
+
+**And then there is still nothing to run.** No terminal exists among 175 `/bin` names, and the
+image contains **exactly one** `.desktop` file — our own applet stub. `cosmic-term`,
+`cosmic-files`, `cosmic-edit`, `cosmic-store` are all in `../cosmic-epoch` and **none is
+built**. Even with input and shortcuts fixed, `Super` would open a launcher over an empty
+index. **Item 8 is therefore two pieces of work, and the config file is only the first.**
+
+### 9. Nine panel applets have no scoped-out dependency and are simply unbuilt
+
+`cosmic-panel`'s default config names **16 unique applets**; **one** is present, and it is our
+~230-line stand-in (`leandros-applet`, `wl_shm` + `xdg_toplevel`, ticking clock) wired in by
+the single staged `.desktop`. The other 15 resolve to `exec: None` and are never spawned
+(`wrapper_space.rs:460-520`).
+
+Five of the fifteen — Audio, Bluetooth, Network, Battery, Power — need PipeWire/NM/UPower/
+logind and are **correctly out of scope; do not count them as gaps.** The remaining nine have
+**no scoped-out dependency**: `CosmicPanelWorkspacesButton`, `CosmicPanelAppButton`,
+`CosmicPanelLauncherButton`, `CosmicAppletTiling`, `CosmicAppletMinimize`, `CosmicAppList`,
+`CosmicAppletTime` (the real one), `CosmicAppletInputSources`, `CosmicAppletStatusArea`.
+The build recipe already exists (`m6-session-bins/build-rust.sh`) and the panel's spawn path is
+**proven end-to-end** by the stand-in. **Cost is build time, not design** — but note they are
+libcosmic/iced apps, so **item 7 gates whether they would render**, and the three buttons are
+also the natural triggers item 8 is missing. These three items interlock.
+
+### 10. busd has no D-Bus activation — structural
+
+`<servicedir>` is **deliberately omitted** from busd's `session.conf`, so **nothing is
+activatable**: every name must already be owned by a running process. This is what makes
+`xdg-desktop-portal-cosmic` — and therefore **screenshots, file choosers and screencast** —
+not a "build it" problem. Compounding it, the portal's PipeWire dependency is **non-optional**
+in exactly the way already documented for the settings daemon (63 external `pw_*` symbols, no
+feature gate); unlike the daemon, the portal actually *uses* the streams, so the existing inert
+stub would not suffice. The committed architecture already names reference `dbus-daemon` as
+the fallback if busd proves immature — **this is the decision point that would trigger it.**
+
+### Ordering, and why
+
+1. **Item 6 (input)** first, unconditionally. Windows already map, composite, stack and draw a
+   focus ring; every one of those becomes *usable* the moment input lands, and several rows
+   below cannot even be tested without it.
+2. **Item 8's config file** next — one `mkfs` entry, and it is what makes three
+   already-running components reachable.
+3. **Item 7 (iced renders nothing)**, jointly with the panel gap, because it decides whether
+   items 9 and the rest of the suite are worth building at all.
+4. **Item 9's nine applets**, once 7 says they will draw.
+5. **Item 10** only when a portal-shaped capability is actually wanted.
+
+### Corrections this survey forces
+
+- **"Run COSMIC *unmodified*… No COSMIC source patches" is not true of the tree.** Three
+  patches exist under `ports/`: `cosmic-session/0001-env_rx-timeout-fallback.patch`,
+  `cosmic-greeter/0001-locker-idle-without-logind.patch`, and `busd/current-thread-runtime.patch`
+  (busd is ours, so that one is fine). **The session patch is still firing every boot** —
+  `handshake did not complete` — so every session runs on a 5 s fallback and **no child ever
+  receives cosmic-comp's exported environment**; its recorded root cause ("a tokio-integration
+  residual") is asserted, not demonstrated. The *intent* — don't fork COSMIC to make it work —
+  is clearly still honoured; the claim of zero patches is what is false. **Second absolute rule
+  in one day that a two-command check refutes** (the first was "the repo is Rust-only").
+- **`cosmic-session` is built `--no-default-features`, which switches off `autostart`** as well
+  as systemd/logind. The XDG autostart scan is compiled out, not merely inert.
+- **The deferred-list entry claiming synthetic sysfs has "no current consumer"** is at best
+  unproven now that input is the top item. The libudev shim's static table means sysfs is
+  *not* the immediate cause, but the entry's justification should not outlive the measurement.
+- `cosmic-idle`'s pure-idle fade was root-caused above the kernel (cosmic-comp recomputes
+  `is_inhibited` only on repaint, so a static desktop never re-arms the timer). **The recorded
+  mitigation was for our applet to commit ~1 fps — it now ticks at 1 Hz, and whether the fade
+  works post-clock is recorded nowhere.** Cheap to re-check.
+- Two live defects have observations but **no root cause**: `cosmic-files-applet`'s
+  `smithay-clipboard` thread panicking on `Failed to create memory pool: OutOfMemory (12)`
+  (process survives), and `cosmic-notifications`' intermittent
+  `Failed to setup panel dbus server … Broken pipe`, present on control kernels too.
+
+---
 
 ### Next steps, in the order they are worth doing
 
