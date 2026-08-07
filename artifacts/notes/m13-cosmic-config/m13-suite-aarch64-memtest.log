@@ -1,0 +1,19 @@
+timer_periodic_overrun: PASS
+timer_max_and_eagain: PASS
+alarm_and_setitimer_no_leak: PASS
+  clock_getres_ns=41
+  sleep200ms_measured_ns=190820375
+  min_subtick_step_ns=1041
+  loop_span_ns=4888750
+clock_monotonic_subtick: PASS
+--- timertest done ---
+
+M13RC=0
+brush-0.5# 78brush-0.5# memtest; echo M13RC=$?78
+fork_cow_isolation: PASS
+mremap_preserves_data: PASS
+buddy_survives_churn: PASS
+map_shared_fork_visibility: PASS
+--- memtest done ---
+M13RC=0
+brush-0.5# 78

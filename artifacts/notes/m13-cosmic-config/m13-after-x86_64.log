@@ -1,0 +1,215 @@
+===== M13 after x86_64 =====  2026-08-07 17:33:46
+[boot] up on attempt 1
+[NET] DHCP configured, address: 192.168.105.2
+[?2004h[0m[?25l[48;1H[J[39mbrush-0.5# [38;
+
+[control] `nosuchbinary_xyz42` rc=127
+          error: command not found: nosuchbinary_xyz42
+[control] OK — the console executes and reports failure correctly.
+
+$ ls /usr/share/cosmic 2>&1 | head -20
+com.system76.CosmicAppList
+com.system76.CosmicBackground
+com.system76.CosmicComp
+com.system76.CosmicPanel
+com.system76.CosmicPanel.Dock
+com.system76.CosmicPanel.Panel
+com.system76.CosmicSettings.Shortcuts
+com.system76.CosmicSettings.WindowRules
+com.system76.CosmicTheme.Dark
+com.system76.CosmicTheme.Dark.Builder
+com.system76.CosmicTheme.Light
+com.system76.CosmicTheme.Light.Builder
+com.system76.CosmicTheme.Mode
+
+$ ls /usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1 2>&1
+defaults  system_actions
+
+$ ls /usr/share/cosmic/com.system76.CosmicPanel.Panel/v1 2>&1 | head -8
+anchor
+anchor_gap
+autohide
+autohide_behavior
+autohover_delay_ms
+background
+border_radius
+exclusive_zone
+
+[pathprobe] /bin/sh -c 'uname -s' rc=0: Leandros
+
+[pathprobe] /bin/sh -c 'command -v cosmic-launcher' rc=0: /bin/cosmic-launcher
+
+[pathprobe] /bin/sh -c 'command -v cosmic-app-library' rc=0: /bin/cosmic-app-library
+
+[pathprobe] ls -l /bin/cosmic-launcher /bin/cosmic-app-library 2>&1 rc=0: -rwxr-xr-x 1 root root 46585432 Jan  1 00:00 /bin/cosmic-app-library
+-rwxr-xr-x 1 root root 37695600 Jan  1 00:00 /bin/cosmic-launcher
+
+[usercfg] rc=0
+{(modifiers: [Super], key: "F9"): System(Terminal)}
+{Terminal: "touch /tmp/kb-f9", WebBrowser: "touch /tmp/kb-b"}
+
+[stage] writing the guest choreography /tmp/g
+  [stage] /tmp/g verified, 31 lines match exactly
+[qmp] connected
+
+[session] launching choreography (single typed command)
+[session] wayland-1 appeared after 2 x2s polls; socket present
+
+----- idle capture series (quiet console) -----
+  [i0-idle-3s] 1920x1080 md5=f1d1567a285a6d374387a14f551fece3 distinct_colours=334503 total=2073600
+      #1b1b1b =     60552  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+  [i1-idle-8s] 1920x1080 md5=1a753dd025a1ef361742d3e8235615c2 distinct_colours=334503 total=2073600
+      #1b1b1b =     60525  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+  [i2-idle-15s] 1920x1080 md5=a200293b3ae1861d40caecf50a45b601 distinct_colours=334503 total=2073600
+      #1b1b1b =     60543  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+  [i3-idle-25s] 1920x1080 md5=50dee53b30d578093a46f8e3ee9c5ae3 distinct_colours=334503 total=2073600
+      #1b1b1b =     60516  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+  [i4-idle-35s] 1920x1080 md5=18a7be4c46b75228f5074d79192e6b07 distinct_colours=334503 total=2073600
+      #1b1b1b =     60534  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+[qmp] geometry from screendump: 1920x1080
+
+[CONTROL Super+F9] injected 4 commands, 0 rejected
+[CONTROL Super+F9] witness /tmp/kb-f9 count=0
+
+[TREAT Super+b] injected 4 commands, 0 rejected
+[TREAT Super+b] witness /tmp/kb-b count=0
+
+[TREAT Super+slash] injected 4 commands, 0 rejected
+  [t1-slash-1s] 1920x1080 md5=85c207de2e5b4c2eca96b4fa3691212b distinct_colours=334503 total=2073600
+      #1b1b1b =     60543  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+  [t2-slash-4s] 1920x1080 md5=85c207de2e5b4c2eca96b4fa3691212b distinct_colours=334503 total=2073600
+      #1b1b1b =     60543  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+  [t3-slash-8s] 1920x1080 md5=85c207de2e5b4c2eca96b4fa3691212b distinct_colours=334503 total=2073600
+      #1b1b1b =     60543  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+  [t4-slash-16s] 1920x1080 md5=85c207de2e5b4c2eca96b4fa3691212b distinct_colours=334503 total=2073600
+      #1b1b1b =     60543  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+
+[TREAT Super+a] injected 4 commands, 0 rejected
+  [t5-applib-2s] 1920x1080 md5=85c207de2e5b4c2eca96b4fa3691212b distinct_colours=334503 total=2073600
+      #1b1b1b =     60543  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+  [t6-applib-6s] 1920x1080 md5=85c207de2e5b4c2eca96b4fa3691212b distinct_colours=334503 total=2073600
+      #1b1b1b =     60543  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+  [t7-applib-14s] 1920x1080 md5=85c207de2e5b4c2eca96b4fa3691212b distinct_colours=334503 total=2073600
+      #1b1b1b =     60543  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+
+[pointer] injected 8 commands, 0 rejected total
+  [t8-pointer] 1920x1080 md5=85c207de2e5b4c2eca96b4fa3691212b distinct_colours=334503 total=2073600
+      #1b1b1b =     60543  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+  [t9-pointer-later] 1920x1080 md5=85c207de2e5b4c2eca96b4fa3691212b distinct_colours=334503 total=2073600
+      #1b1b1b =     60543  ( 2.92%)
+      #15131e =      2503  ( 0.12%)
+      #16141f =      2477  ( 0.12%)
+      #14121d =      2355  ( 0.11%)
+      #13111c =      2300  ( 0.11%)
+      #16171c =      1962  ( 0.09%)
+
+----- error census (27063 chars of session log captured) -----
+  log bytes at end         = 32768
+  loglines                 = 123
+  witness files present    = 0 of 2
+  system_path_none         = 0
+  system_path_some         = 3
+  system_actions_err       = 0
+  shortcuts_defaults_err   = 0
+  panel_entry_err          = 4
+  panel_noconfigdir        = 0
+  noconfigdirectory_any    = 0
+
+  --- system_path_some ---
+    1970-01-01T00:01:08.600938Z  INFO cosmic-panel: cosmic_session::notifications: \x1b[2m1970-01-01T00:01:08.584046Z\x1b[0m \x1b[32m INFO\x1b[0m Watching panel config entries for changes Config { system_path: Some("/usr/share/cosmic/
+    1970-01-01T00:01:08.702616Z  INFO cosmic-panel: cosmic_session::notifications: \x1b[2m1970-01-01T00:01:08.700150Z\x1b[0m \x1b[32m INFO\x1b[0m Watching panel config entry: Config { system_path: Some("/usr/share/cosmic/com.system76.
+    1970-01-01T00:01:08.749865Z  INFO cosmic-panel: cosmic_session::notifications: \x1b[2m1970-01-01T00:01:08.749331Z\x1b[0m \x1b[32m INFO\x1b[0m Watching panel config entry: Config { system_path: Some("/usr/share/cosmic/com.system76.
+
+  --- panel_entry_err ---
+    1970-01-01T00:01:05.379999Z  INFO cosmic-panel: cosmic_session::notifications: \x1b[2m1970-01-01T00:01:04.928782Z\x1b[0m \x1b[31mERROR\x1b[0m Panel Entry Error: GetKey("padding_overlap", Os { code: 2, kind: NotFound, message: "No 
+    1970-01-01T00:01:05.379999Z  INFO cosmic-panel: cosmic_session::notifications: \x1b[2m1970-01-01T00:01:04.934265Z\x1b[0m \x1b[31mERROR\x1b[0m Panel Entry Error: GetKey("keep_style_on_maximize", Os { code: 2, kind: NotFound, messag
+    1970-01-01T00:01:05.379999Z  INFO cosmic-panel: cosmic_session::notifications: \x1b[2m1970-01-01T00:01:04.934341Z\x1b[0m \x1b[31mERROR\x1b[0m Panel Entry Error: GetKey("padding_overlap", Os { code: 2, kind: NotFound, message: "No 
+  tail count 'launcher'         = 7
+  tail count 'app-library'      = 12
+  tail count 'Failed to spawn'  = 0
+  tail count 'No such file'     = 36
+  tail count 'panic'            = 0
+  tail count 'Terminal'         = 1
+  tail count 'WebBrowser'       = 1
+
+===== RESULT =====
+  qmp commands sent = 24, rejected = 0
+  CONTROL Super+F9       -> no-op        (/tmp/kb-f9)
+  TREAT Super+b          -> no-op        (/tmp/kb-b)
+  wayland_wait_loops       = 2
+  log_bytes_after_injection = 32768
+  loglines                 = 123
+  witness_files_present    = 0
+  system_path_none         = 0
+  system_path_some         = 3
+  system_actions_err       = 0
+  shortcuts_defaults_err   = 0
+  panel_entry_err          = 4
+  panel_noconfigdir        = 0
+  noconfigdirectory_any    = 0
+done.

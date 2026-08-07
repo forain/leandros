@@ -1,0 +1,13 @@
+===== M13 suite aarch64 ===== 2026-08-07 17:48:23
+[boot] up on attempt 1
+[control] nosuchbinary_xyz42 -> M13RC=127
+  drmsmoke       exit(failures)=None  named FAIL=0 []  (PASS lines=28)
+  wakepolltest   exit(failures)=0  named FAIL=0 []  (PASS lines=1)
+  timertest      exit(failures)=0  named FAIL=0 []  (PASS lines=11)
+
+===== SUMMARY =====
+  drmsmoke       NO EXIT STATUS READ BACK — unproven
+  wakepolltest   clean
+  timertest      clean
+
+  reds: ['drmsmoke']

@@ -1,0 +1,10 @@
+brush-0.5# wakepoll78brush-0.5# wakepolltest; echo M13RC=$?78
+ld_so::init tp=0x0000000000000000
+PH type=0x0000000000000006
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000007
+--- wakepolltest start ---
+

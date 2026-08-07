@@ -1,0 +1,147 @@
+  FLIP_TS_SUBTICK tv_sec=2
+  FLIP_TS_SUBTICK tv_usec=279999
+  FLIP_TS_SUBTICK bucket=saturated
+
+  FLIP_TS_SUBTICK tv_sec=2
+  FLIP_TS_SUBTICK tv_usec=443003
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=2
+  FLIP_TS_SUBTICK tv_usec=610054
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=2
+  FLIP_TS_SUBTICK tv_usec=783124
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=2
+  FLIP_TS_SUBTICK tv_usec=953494
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=3
+  FLIP_TS_SUBTICK tv_usec=120076
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=3
+  FLIP_TS_SUBTICK tv_usec=297383
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=3
+  FLIP_TS_SUBTICK tv_usec=462348
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=3
+  FLIP_TS_SUBTICK tv_usec=630066
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=3
+  FLIP_TS_SUBTICK tv_usec=800067
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=3
+  FLIP_TS_SUBTICK tv_usec=970458
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=4
+  FLIP_TS_SUBTICK tv_usec=140051
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK tv_sec=4
+  FLIP_TS_SUBTICK tv_usec=312131
+  FLIP_TS_SUBTICK bucket=genuine-sub-tick
+
+  FLIP_TS_SUBTICK n_tick_multiple=0
+  FLIP_TS_SUBTICK n_saturated=4
+  FLIP_TS_SUBTICK n_genuine=12
+FLIP_TS_SUBTICK: PASS
+PRIME_HANDLE_TO_FD: PASS
+PRIME_MMAP_ALIAS: PASS
+PRIME_FD_TO_HANDLE: PASS
+FORK_DEVMAP_CHILD_SEES_IT: PASS
+FORK_DEVMAP_SHARED_NOT_COPIED: PASS
+drmsmoke: holding gradient for screenshot...
+
+DESTROY_DUMB: PASS
+--- drmsmoke done ---
+
+M13RC=0
+brush-0.5# 78brush-0.5# scmtest; echo M13RC=$?78
+[fd[f_dp_apsass:sp:acrheinltd]]  seexntdrmascgt erde tfudr=ned4  1f
+rom cmsg
+[fd_pass:child] read via received fd -> 5 bytes
+fd_pass: PASS
+[fork_keep] after child exit: wrote=4 read=4
+fork_child_exit_keeps_socket: PASS
+[[ffeeii]: heeploplelr_]w aiinhte r-i>t e1d  (fwda=nt 256> =w1r;o t0e ==29=
+ INHERIT BROKEN)
+[fei] read len=4 body=25
+[fei] helper exit status=0
+fork_exec_inherit: PASS
+[[ffeeii]: heeploplelr_]w aiinth e-r>i t1e d( wfadn=t >256= 1w;r o0t e===29 
+INHERIT BROKEN)
+[fei] read len=4 body=25
+[fei] helper exit status=0
+fork_exec_child_clears_cloexec: PASS
+[[ccmmssgg__ffllaaggss::pcahrielndt]]  rsoeunnddmAs(gs mraoluln dbAu=f1)  rno=u1n dcBo=n1t
+rollen=0
+[cmsg_flags:child] roundA: msg_flags=0x8 (want MSG_CTRUNC=0x8 set)
+[cmsg_flags:child] roundB(CMSG_CLOEXEC) n=1 controllen=20
+[cmsg_flags:child] roundB: fd=4 fcntl(F_GETFD) -> 1
+cmsg_flags: PASS
+[[sshhaarreedd__mmeemmffdd::pcahrielndt]]  rseecnedimvsegd( mfedm=f4d,)  mraeptpuirnnge dM A1P
+_SHARED
+[shared_memfd:child] pattern A visible through child mapping: 1
+[shared_memfd:parent] ack recv returned 1
+[shared_memfd:parent] child exit status=0, pattern B visible through parent's own (pre-existing) mapping: 1
+shared_memfd_pixels: PASS
+[seals] F_ADD_SEALS(F_SEAL_SHRINK) returned 0
+[seals] F_GET_SEALS returned 0x2
+[seals] ftruncate(10) after F_SEAL_SHRINK returned -1, errno=1 (want -1/EPERM)
+seals: PASS
+[mfdn] add=0 2nd ftrunc(2)=0
+[mfdn] 2nd inode seals=0x0 (want 0)
+memfd_same_name_distinct: PASS
+[dbl] alias coherent: 1
+double_mmap_alias: PASS
+[rwcoh] read-after-mmap-store got=256
+[rwcoh] write(fd) wrote=128
+read_mmap_coherence: PASS
+[big] read@40000 got=16
+big_memfd: PASS
+[fork] child status=0
+fork_visibility: PASS
+[pm] read got=16
+partial_munmap: PASS
+[cwm] mapping usable after close: 1
+close_while_mapped: PASS
+[ft] grow=0 shrink=0
+ftruncate_grow_shrink: PASS
+[td] completed 150 iterations
+teardown_loop: PASS
+[anon] stat(/tmp/memfd:anonprobe) = -2 (want < 0)
+[anon] completed 300 iterations
+memfd_anonymous_reclaim: PASS
+[inflight] sendmsg=1 child status=0 (0 = pattern survived)
+memfd_inflight_close: PASS
+[node] stat ret=0 mode&IFMT=0%o (want 0140000 S_IFSOCK)
+socket_node_roundtrip: PASS
+[node] stat ret=0 mode&IFMT=0%o (want 0140000 S_IFSOCK)
+socket_node_devshm: PASS
+[rebind] unlink=0 rebind=0
+unlink_rebind: PASS
+[uls] (a) unbound listen rc=-1 errno=22 (want -1 22)
+[uls] (g) dgram listen rc=-1 errno=95 (want -1 95)
+[uls] (b,c) listen rc=0 repeat rc=0 (want 0 0)
+[uls] (d) socketpair listen rc=-1 errno=22 (want -1 22)
+[uls] (e) pending-accept listen rc=-1 errno=22 (want -1 22)
+[uls] (f) accepted-socket listen rc=-1 errno=22 (want -1 22)
+[uls] (h) second connect=0 accept=260 (want 0 and >=0)
+unix_listen_strict: PASS
+many_socketpairs_and_listeners: PASS
+[mounts] /dev/shm perms=0%o /run/user/0 perms=0%o
+tmpfs_mounts_exist: PASS
+[devshm] child status=0
+devshm_shared_mmap: PASS
+[cap] sent=1024 then errno=109 (want ETOOMANYREFS=109)
+queued_fd_cap: PASS
+[emfile] send=1 hogs=123 (want >0, >0

@@ -1,0 +1,41 @@
+STRESS BUSY  [...............] fails=0/15 worst=0ms
+
+STRESS SLEEP [...............] fails=0/15 worst=0ms
+
+--- stress done ---
+
+probe_eventfd_ready: PASS el=0 n=1 wrote=12780
+
+xthread_futex_timed_wake: PASS el=995 n=0 wrote=13780
+
+xthread_pipe_level: PASS el=995 n=1 wrote=14780
+
+xthread_unix_level: PASS el=996 n=1 wrote=15780
+
+timerfd_deadline: PASS (996ms)
+
+timerfd_periodic: PASS (997ms)
+
+self_eventfd_et_rearm: PASS el=0 n=-1 wrote=0
+
+self_eventfd_level_rearm: PASS el=0 n=-1 wrote=0
+
+accept4_nonblock_eagain: PASS el=0 n=-11 wrote=-11
+
+accept_noflags_blocking: PASS el=990 n=1 wrote=1
+
+SUMMARY pass=40 fail=0
+
+--- wakepolltest done ---
+
+M13RC=0
+brush-0.5# 78brush-0.5# epolltest; echo M13RC=$?78
+ld_so::init tp=0x0000000000000000
+PH type=0x0000000000000006
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000007
+et_fires_once: PASS
+level_refires: PASS
+et_refires_after_edge: PASS

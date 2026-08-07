@@ -1,0 +1,184 @@
+===== M13 before aarch64 =====  2026-08-07 17:10:41
+[boot] up on attempt 1
+[?2004h[0m[?25l[44;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h
+
+[control] `nosuchbinary_xyz42` rc=127
+          error: command not found: nosuchbinary_xyz42
+[control] OK — the console executes and reports failure correctly.
+
+$ ls /usr/share/cosmic 2>&1 | head -20
+ls: cannot access '/usr/share/cosmic': No such file or directory
+
+$ ls /usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1 2>&1
+ls: cannot access '/usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1': No such file or directory
+
+$ ls /usr/share/cosmic/com.system76.CosmicPanel.Panel/v1 2>&1 | head -8
+ls: cannot access '/usr/share/cosmic/com.system76.CosmicPanel.Panel/v1': No such file or directory
+
+[pathprobe] /bin/sh -c 'uname -s' rc=0: Leandros
+
+[pathprobe] /bin/sh -c 'command -v cosmic-launcher' rc=0: /bin/cosmic-launcher
+
+[pathprobe] /bin/sh -c 'command -v cosmic-app-library' rc=0: /bin/cosmic-app-library
+
+[pathprobe] ls -l /bin/cosmic-launcher /bin/cosmic-app-library 2>&1 rc=0: -rwxr-xr-x 1 root root 47483424 Jan  1 00:00 /bin/cosmic-app-library
+-rwxr-xr-x 1 root root 38875568 Jan  1 00:00 /bin/cosmic-launcher
+
+[usercfg] rc=0
+{(modifiers: [Super], key: "F9"): System(Terminal)}
+{Terminal: "touch /tmp/kb-f9", WebBrowser: "touch /tmp/kb-b"}
+
+[stage] writing the guest choreography /tmp/g
+  [stage] /tmp/g verified, 31 lines match exactly
+[qmp] connected
+
+[session] launching choreography (single typed command)
+[session] wayland-1 appeared after 1 x2s polls; socket present
+
+----- idle capture series (quiet console) -----
+  [i0-idle-3s] 1280x800 md5=d7209a09aa759c854b860d98340ddcaf distinct_colours=2 total=1024000
+      #000000 =    990476  (96.73%)
+      #ffffff =     33524  ( 3.27%)
+  [i1-idle-8s] 1280x800 md5=d7209a09aa759c854b860d98340ddcaf distinct_colours=2 total=1024000
+      #000000 =    990476  (96.73%)
+      #ffffff =     33524  ( 3.27%)
+  [i2-idle-15s] 1280x800 md5=d7209a09aa759c854b860d98340ddcaf distinct_colours=2 total=1024000
+      #000000 =    990476  (96.73%)
+      #ffffff =     33524  ( 3.27%)
+  [i3-idle-25s] 1280x800 md5=1667dbe1b79ebe19b51572c247613c81 distinct_colours=252681 total=1024000
+      #1b1b1b =     40033  ( 3.91%)
+      #e6e6e6 =       927  ( 0.09%)
+      #212026 =       617  ( 0.06%)
+      #201f25 =       562  ( 0.05%)
+      #14111c =       444  ( 0.04%)
+      #222127 =       443  ( 0.04%)
+  [i4-idle-35s] 1280x800 md5=1be879e8b9d05fc2df95757ab16822b1 distinct_colours=252681 total=1024000
+      #1b1b1b =     40033  ( 3.91%)
+      #e6e6e6 =       927  ( 0.09%)
+      #212026 =       617  ( 0.06%)
+      #201f25 =       562  ( 0.05%)
+      #14111c =       444  ( 0.04%)
+      #222127 =       443  ( 0.04%)
+[qmp] geometry from screendump: 1280x800
+
+[CONTROL Super+F9] injected 4 commands, 0 rejected
+[CONTROL Super+F9] witness /tmp/kb-f9 count=0
+
+[TREAT Super+b] injected 4 commands, 0 rejected
+[TREAT Super+b] witness /tmp/kb-b count=0
+
+[TREAT Super+slash] injected 4 commands, 0 rejected
+  [t1-slash-1s] 1280x800 md5=54d17e22909fdd5e3caf7a2e54c9b579 distinct_colours=252681 total=1024000
+      #1b1b1b =     39997  ( 3.91%)
+      #e6e6e6 =       963  ( 0.09%)
+      #212026 =       617  ( 0.06%)
+      #201f25 =       562  ( 0.05%)
+      #14111c =       444  ( 0.04%)
+      #222127 =       443  ( 0.04%)
+  [t2-slash-4s] 1280x800 md5=54d17e22909fdd5e3caf7a2e54c9b579 distinct_colours=252681 total=1024000
+      #1b1b1b =     39997  ( 3.91%)
+      #e6e6e6 =       963  ( 0.09%)
+      #212026 =       617  ( 0.06%)
+      #201f25 =       562  ( 0.05%)
+      #14111c =       444  ( 0.04%)
+      #222127 =       443  ( 0.04%)
+  [t3-slash-8s] 1280x800 md5=54d17e22909fdd5e3caf7a2e54c9b579 distinct_colours=252681 total=1024000
+      #1b1b1b =     39997  ( 3.91%)
+      #e6e6e6 =       963  ( 0.09%)
+      #212026 =       617  ( 0.06%)
+      #201f25 =       562  ( 0.05%)
+      #14111c =       444  ( 0.04%)
+      #222127 =       443  ( 0.04%)
+  [t4-slash-16s] 1280x800 md5=54d17e22909fdd5e3caf7a2e54c9b579 distinct_colours=252681 total=1024000
+      #1b1b1b =     39997  ( 3.91%)
+      #e6e6e6 =       963  ( 0.09%)
+      #212026 =       617  ( 0.06%)
+      #201f25 =       562  ( 0.05%)
+      #14111c =       444  ( 0.04%)
+      #222127 =       443  ( 0.04%)
+
+[TREAT Super+a] injected 4 commands, 0 rejected
+  [t5-applib-2s] 1280x800 md5=54d17e22909fdd5e3caf7a2e54c9b579 distinct_colours=252681 total=1024000
+      #1b1b1b =     39997  ( 3.91%)
+      #e6e6e6 =       963  ( 0.09%)
+      #212026 =       617  ( 0.06%)
+      #201f25 =       562  ( 0.05%)
+      #14111c =       444  ( 0.04%)
+      #222127 =       443  ( 0.04%)
+  [t6-applib-6s] 1280x800 md5=54d17e22909fdd5e3caf7a2e54c9b579 distinct_colours=252681 total=1024000
+      #1b1b1b =     39997  ( 3.91%)
+      #e6e6e6 =       963  ( 0.09%)
+      #212026 =       617  ( 0.06%)
+      #201f25 =       562  ( 0.05%)
+      #14111c =       444  ( 0.04%)
+      #222127 =       443  ( 0.04%)
+  [t7-applib-14s] 1280x800 md5=54d17e22909fdd5e3caf7a2e54c9b579 distinct_colours=252681 total=1024000
+      #1b1b1b =     39997  ( 3.91%)
+      #e6e6e6 =       963  ( 0.09%)
+      #212026 =       617  ( 0.06%)
+      #201f25 =       562  ( 0.05%)
+      #14111c =       444  ( 0.04%)
+      #222127 =       443  ( 0.04%)
+
+[pointer] injected 8 commands, 0 rejected total
+  [t8-pointer] 1280x800 md5=54d17e22909fdd5e3caf7a2e54c9b579 distinct_colours=252681 total=1024000
+      #1b1b1b =     39997  ( 3.91%)
+      #e6e6e6 =       963  ( 0.09%)
+      #212026 =       617  ( 0.06%)
+      #201f25 =       562  ( 0.05%)
+      #14111c =       444  ( 0.04%)
+      #222127 =       443  ( 0.04%)
+  [t9-pointer-later] 1280x800 md5=54d17e22909fdd5e3caf7a2e54c9b579 distinct_colours=252681 total=1024000
+      #1b1b1b =     39997  ( 3.91%)
+      #e6e6e6 =       963  ( 0.09%)
+      #212026 =       617  ( 0.06%)
+      #201f25 =       562  ( 0.05%)
+      #14111c =       444  ( 0.04%)
+      #222127 =       443  ( 0.04%)
+
+----- error census (27896 chars of session log captured) -----
+  log bytes at end         = 32768
+  loglines                 = 106
+  witness files present    = 0 of 2
+  system_path_none         = 3
+  system_path_some         = 0
+  system_actions_err       = 1
+  shortcuts_defaults_err   = 0
+  panel_entry_err          = 0
+  panel_noconfigdir        = 0
+  noconfigdirectory_any    = 1
+
+  --- system_path_none ---
+    1970-01-01T00:00:49.840134Z  INFO cosmic-panel: cosmic_session::notifications: \x1b[2m1970-01-01T00:00:49.655269Z\x1b[0m \x1b[32m INFO\x1b[0m Watching panel config entries for changes Config { system_path: None, user_path: Some("/
+    1970-01-01T00:00:49.840147Z  INFO cosmic-panel: cosmic_session::notifications: \x1b[2m1970-01-01T00:00:49.709430Z\x1b[0m \x1b[32m INFO\x1b[0m Watching panel config entry: Config { system_path: None, user_path: Some("/root/.config/
+    1970-01-01T00:00:49.840541Z  INFO cosmic-panel: cosmic_session::notifications: \x1b[2m1970-01-01T00:00:49.783555Z\x1b[0m \x1b[32m INFO\x1b[0m Watching panel config entry: Config { system_path: None, user_path: Some("/root/.config/
+
+  --- system_actions_err ---
+    1970-01-01T00:01:28.530541Z  WARN cosmic-idle: cosmic_session: [1970-01-01T00:01:28Z ERROR cosmic_settings_config::shortcuts] failed to read system shortcuts config 'system_actions': NoConfigDirectory
+
+  --- noconfigdirectory_any ---
+    1970-01-01T00:01:28.530541Z  WARN cosmic-idle: cosmic_session: [1970-01-01T00:01:28Z ERROR cosmic_settings_config::shortcuts] failed to read system shortcuts config 'system_actions': NoConfigDirectory
+  tail count 'launcher'         = 7
+  tail count 'app-library'      = 11
+  tail count 'Failed to spawn'  = 0
+  tail count 'No such file'     = 1
+  tail count 'panic'            = 0
+  tail count 'Terminal'         = 0
+  tail count 'WebBrowser'       = 0
+
+===== RESULT =====
+  qmp commands sent = 24, rejected = 0
+  CONTROL Super+F9       -> no-op        (/tmp/kb-f9)
+  TREAT Super+b          -> no-op        (/tmp/kb-b)
+  wayland_wait_loops       = 1
+  log_bytes_after_injection = 32768
+  loglines                 = 106
+  witness_files_present    = 0
+  system_path_none         = 3
+  system_path_some         = 0
+  system_actions_err       = 1
+  shortcuts_defaults_err   = 0
+  panel_entry_err          = 0
+  panel_noconfigdir        = 0
+  noconfigdirectory_any    = 1
+done.

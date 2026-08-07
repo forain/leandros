@@ -1,0 +1,48 @@
+brush-0.5# scmtest; echo M13RC=$?78
+[fd[_fpda_spsa:spsa:rcehnitl]d ]s eenxdtmrsagc treedt ufrdn=ed 41 
+from cmsg
+[fd_pass:child] read via received fd -> 5 bytes
+fd_pass: PASS
+[fork_keep] after child exit: wrote=4 read=4
+fork_child_exit_keeps_socket: PASS
+[[ffeeii]: heeploplelr_]w aiinth e-r>i t1e d( wfda=nt 256> =w1r;o t0e ==29=
+ INHERIT BROKEN)
+[fei] read len=4 body=25
+[fei] helper exit status=0
+fork_exec_inherit: PASS
+[[ffeeii]: heeploplelr_]w aiinth e-r>i t1e d( wfadn=t >256= 1w;r o0t e===29 
+INHERIT BROKEN)
+[fei] read len=4 body=25
+[fei] helper exit status=0
+fork_exec_child_clears_cloexec: PASS
+[[cmcsmgs_gf_lfalgasg:sp:acrheinltd]]  sreonudnmdsAg( srmoaulnld Ab=u1f )r onu=n1d Bc=o1n
+trollen=0
+[cmsg_flags:child] roundA: msg_flags=0x8 (want MSG_CTRUNC=0x8 set)
+[cmsg_flags:child] roundB(CMSG_CLOEXEC) n=1 controllen=20
+[cmsg_flags:child] roundB: fd=4 fcntl(F_GETFD) -> 1
+cmsg_flags: PASS
+[[sshhaarreedd__mmeemmffdd::pcahrielndt]]  rseecnedimvsegd( mfedm=f4d,)  mraeptpuirnnge dM A1P
+_SHARED
+[shared_memfd:child] pattern A visible through child mapping: 1
+[shared_memfd:parent] ack recv returned 1
+[shared_memfd:parent] child exit status=0, pattern B visible through parent's own (pre-existing) mapping: 1
+shared_memfd_pixels: PASS
+[seals] F_ADD_SEALS(F_SEAL_SHRINK) returned 0
+[seals] F_GET_SEALS returned 0x2
+[seals] ftruncate(10) after F_SEAL_SHRINK returned -1, errno=1 (want -1/EPERM)
+seals: PASS
+[mfdn] add=0 2nd ftrunc(2)=0
+[mfdn] 2nd inode seals=0x0 (want 0)
+memfd_same_name_distinct: PASS
+[dbl] alias coherent: 1
+double_mmap_alias: PASS
+[rwcoh] read-after-mmap-store got=256
+[rwcoh] write(fd) wrote=128
+read_mmap_coherence: PASS
+[big] read@40000 got=16
+big_memfd: PASS
+[fork] child status=0
+fork_visibility: PASS
+[pm] read got=16
+partial_munmap: PASS
+[

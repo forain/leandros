@@ -1,0 +1,33 @@
+===== M13 suite x86_64 ===== 2026-08-07 17:44:56
+[boot] up on attempt 1
+[control] nosuchbinary_xyz42 -> M13RC=127
+  vfstest        exit(failures)=0  named FAIL=0 []  (PASS lines=36)
+  drmsmoke       exit(failures)=None  named FAIL=0 []  (PASS lines=22)
+  venustest      exit(failures)=0  named FAIL=32 ['getparam_3d_features', 'getparam_resource_blob', 'getparam_context_init', 'host_advertises_venus_capset', 'context_init_venus', 'get_caps_venus']  (PASS lines=23)
+  scmtest        exit(failures)=None  named FAIL=0 []  (PASS lines=13)
+  wakepolltest   exit(failures)=None  named FAIL=0 []  (PASS lines=0)
+  forktest       exit(failures)=0  named FAIL=0 []  (PASS lines=13)
+  epolltest      exit(failures)=None  named FAIL=0 []  (PASS lines=3)
+  polltest       exit(failures)=0  named FAIL=0 []  (PASS lines=7)
+  waittest       exit(failures)=None  named FAIL=0 []  (PASS lines=1)
+  sigtest        exit(failures)=0  named FAIL=0 []  (PASS lines=6)
+  timertest      exit(failures)=None  named FAIL=0 []  (PASS lines=1)
+  memtest        exit(failures)=0  named FAIL=0 []  (PASS lines=5)
+  f2fstest       exit(failures)=None  named FAIL=0 []  (PASS lines=5)
+
+===== SUMMARY =====
+  vfstest        clean
+  drmsmoke       NO EXIT STATUS READ BACK — unproven
+  venustest      clean
+  scmtest        NO EXIT STATUS READ BACK — unproven
+  wakepolltest   NO EXIT STATUS READ BACK — unproven
+  forktest       clean
+  epolltest      NO EXIT STATUS READ BACK — unproven
+  polltest       clean
+  waittest       NO EXIT STATUS READ BACK — unproven
+  sigtest        clean
+  timertest      NO EXIT STATUS READ BACK — unproven
+  memtest        clean
+  f2fstest       NO EXIT STATUS READ BACK — unproven
+
+  reds: ['drmsmoke', 'scmtest', 'wakepolltest', 'epolltest', 'waittest', 'timertest', 'f2fstest']

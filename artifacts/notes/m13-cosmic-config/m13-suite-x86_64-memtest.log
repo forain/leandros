@@ -1,0 +1,16 @@
+  clock_getres_ns=1
+  sleep200ms_measured_ns=195209671
+  min_subtick_step_ns=1003
+  loop_span_ns=4270666
+clock_monotonic_subtick: PASS
+--- timertest done ---
+
+M13RC=0
+brush-0.5# 78brush-0.5# memtest; echo M13RC=$?78
+fork_cow_isolation: PASS
+mremap_preserves_data: PASS
+buddy_survives_churn: PASS
+map_shared_fork_visibility: PASS
+--- memtest done ---
+M13RC=0
+brush-0.5# 78
