@@ -693,19 +693,41 @@ foreground there and capture via the QMP monitor, which is a separate channel. T
 output-routing difference in shell job control — **mechanism not established, recorded as an
 observation only.**
 
-**M4 goes via `MESA_VK_WSI_DEBUG=sw`, not via cross-open dmabuf.** cosmic-comp does not
-advertise `zwp_linux_dmabuf_v1` here (Standing context; item 3), and Mesa's WSI binds
-`wl_shm` *only* in the `sw` case and `zwp_linux_dmabuf_v1` *only* in the non-`sw` case —
-mutually exclusive (`wsi_common_wayland.c:1406-1421`), so a non-`sw` Venus on this
-compositor returns `VK_ERROR_SURFACE_LOST_KHR`. The `sw` route is **1–2 days, all
-userspace, zero kernel risk**, and needs no Mesa rebuild: the shipped
-`venus-lane/stage-aarch64/usr/lib/libvulkan_virtio.so` was built
+**M4 goes via `MESA_VK_WSI_DEBUG=sw,noshm` — not bare `sw`, and not cross-open dmabuf.**
+cosmic-comp does not advertise `zwp_linux_dmabuf_v1` here (Standing context; item 3), and
+Mesa's WSI binds `wl_shm` *only* in the `sw` case and `zwp_linux_dmabuf_v1` *only* in the
+non-`sw` case — mutually exclusive (`wsi_common_wayland.c:1406-1421`), so a non-`sw` Venus
+on this compositor returns `VK_ERROR_SURFACE_LOST_KHR`. No Mesa rebuild is needed: the
+shipped `venus-lane/stage-aarch64/usr/lib/libvulkan_virtio.so` was built
 `-Dplatforms=wayland -Dvulkan-drivers=virtio`, contains the `MESA_VK_WSI_DEBUG` string and
 its flag table, and has **both** WSI branches compiled in (`wsi_wl` ×30, `wl_shm` ×4,
-`wl_shm_pool` ×2, `zwp_linux_dmabuf` ×8). Not yet run end-to-end — that is the next step,
-not a finding. It is also the correct bisection point if the dmabuf route is ever
-attempted: it proves the client, the protocol, the compositor wiring and the Vulkan
-rendering independently, leaving the kernel as the only new variable.
+`wl_shm_pool` ×2, `zwp_linux_dmabuf` ×8).
+
+**Two corrections to this plan, both measured, both of which would have cost a session.**
+
+1. **Bare `sw` does not work; it needs `sw,noshm`.** Measured on the Linux box's *host*
+   (RADV, Mesa 26.1.4, KWin): `MESA_VK_WSI_DEBUG=sw` alone fails `vkCreateSwapchainKHR`
+   with `VK_ERROR_INVALID_EXTERNAL_HANDLE`. Root cause read out of Mesa 25.3.6
+   `wsi_common_wayland.c:3548-3556` — the sw path has **two** variants. Plain `sw` selects
+   `WSI_WL_BUFFER_GPU_SHM`, which imports the `wl_shm` mapping as *device memory* and so
+   requires `VK_EXT_external_memory_host` to be importable for the image's memory types.
+   Adding `noshm` selects `WSI_WL_BUFFER_SHM_MEMCPY` — the same `wl_shm` buffer, filled by
+   a CPU copy, requiring nothing of the driver. With `sw,noshm`: **5/5
+   `vkQueuePresentKHR → VK_SUCCESS`**.
+2. **`vkswap` is not a Wayland client and never was.** It, `vkrender` and `vktest` are all
+   `VK_EXT_headless_surface` — none of them touches Wayland. **No Vulkan Wayland client
+   existed in this project**, so the plan above named a vehicle that could not carry it.
+   One was written (`vkwl`, built against the same musl toolchain that produced `wlclient`,
+   so its `DT_NEEDED` closure — `libc.so`, `libwayland-client.so.0` — was already staged).
+   It is validated **on the host first**, presenting 5/5 on the sw path *and* 5/5 on the
+   dmabuf path, which is the right bisection: a guest-side failure can no longer be blamed
+   on the client.
+
+The route remains all userspace and zero kernel risk, and is still the correct bisection
+point if the dmabuf route is ever attempted — it proves the client, the protocol, the
+compositor wiring and the Vulkan rendering independently, leaving the kernel as the only new
+variable. **Guest-side result against cosmic-comp is still outstanding**, as is aarch64; the
+numbers above are host-side.
 
 ### 3. Cross-open dmabuf import — dead as an M4 route, alive for other reasons
 
