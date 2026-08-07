@@ -182,17 +182,11 @@ int libseat_get_fd(struct libseat *seat) {
 int libseat_dispatch(struct libseat *seat, int timeout) {
 	/* No backend messages ever arrive (no seatd/logind connection), so there
 	 * is nothing to process: report "0 messages processed" (success) without
-	 * touching conn_fd.
-	 *
-	 * We must NOT read(conn_fd) here. conn_fd is created with EFD_NONBLOCK,
-	 * but the kernel's eventfd2 currently ignores the flag (kernel/src/
-	 * syscall.rs sys_eventfd2 drops it), so the fd is effectively blocking.
-	 * The eventfd counter is always 0 (nothing ever writes it), and the VFS
-	 * eventfd read returns EAGAIN on a 0 counter, which sys_read then turns
-	 * into an infinite yield-retry loop for a blocking fd — hanging any
-	 * caller (e.g. smithay's LibSeatSession::new -> seat.dispatch(0)) forever.
-	 * Callers that poll get_fd() correctly see it stay unreadable (counter 0),
-	 * so skipping the drain loses nothing. */
+	 * touching conn_fd. Nothing ever writes the eventfd counter, so a
+	 * read(conn_fd) here would just return EAGAIN on the EFD_NONBLOCK fd
+	 * (the kernel honours the flag — see fd_nonblock in servers/vfs) rather
+	 * than block; skipping it is a no-op either way. Callers that poll
+	 * get_fd() correctly see it stay unreadable (counter always 0). */
 	(void)timeout;
 	if (seat == NULL) {
 		errno = EINVAL;
