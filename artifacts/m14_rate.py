@@ -85,6 +85,21 @@ def main():
     if q.f is None:
         print(">>> NO QMP: nothing can be injected. Aborting.", flush=True)
         sys.exit(3)
+    # Qmp's constructor sets a 5 s socket timeout, which is fine under KVM and
+    # far too tight under aarch64/TCG: the first run there timed out after four
+    # commands, self.f went None, and every later _send() returned False without
+    # raising -- 0 injected, no traceback, and four rungs of zeros that look
+    # exactly like a real negative. Widen it, and keep asserting q.sent.
+    #
+    # WIDENING IS NOT ENOUGH, and the aarch64 evidence in artifacts/notes/
+    # m14-input says so: at 60 s the same run got 4 commands through in
+    # 61.1 s, i.e. ~15 s PER input-send-event. QEMU's main loop is starved
+    # by the TCG vCPU, so injected input cannot be rate-controlled on
+    # aarch64 at all on this host. aarch64 needs an ARM host with KVM;
+    # until then any aarch64 input rate reported from here measures QEMU,
+    # not LeandrOS, and this harness prints q.sent beside every rung so
+    # that stays visible instead of becoming a false negative.
+    q.s.settimeout(int(os.environ.get("M14_QMP_TIMEOUT", "60")))
 
     # The census prints twice a second, but read_until() returns the instant its
     # regex matches, so the tee can hold less than one tick's worth of console
