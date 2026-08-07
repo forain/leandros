@@ -230,7 +230,19 @@ def _build_cmd(arch, mode="uefi"):
         # The direct-kernel-boot path stays TCG-only regardless — it hits a
         # separate, still-unfixed QEMU PL011-timer hang under HVF.
         cpu_flags = _accel_flags("aarch64", mode)
+        # Auto-create the writable VARS pflash the same way the x86_64 branch
+        # below does. Without this file QEMU fails to open the pflash drive
+        # and exits within the first second, before the serial chardev socket
+        # ever binds — which used to make `start` report a launched guest
+        # against a 0-byte serial log instead of failing (see cmd_start's
+        # poll() check).
         vars_fd = os.path.join(REPO_ROOT, "aarch64_vars.fd")
+        if not os.path.exists(vars_fd):
+            vars_tpl = _find_fw(AARCH64_VARS_PATHS)
+            if not vars_tpl:
+                sys.exit("ERROR: AArch64 UEFI vars template not found "
+                          "(and aarch64_vars.fd missing)")
+            shutil.copyfile(vars_tpl, vars_fd)
         disk    = os.path.join(REPO_ROOT, "leandros-limine-aarch64.img")
         data0   = os.path.join(REPO_ROOT, "f2fs-data0-aarch64.img")
         data1   = os.path.join(REPO_ROOT, "f2fs-data1-aarch64.img")
@@ -501,17 +513,38 @@ def cmd_start(arch="aarch64", mode="uefi"):
     with open(PID_FILE, "w") as f:
         f.write(str(proc.pid))
 
-    print(f"QEMU started (PID {proc.pid}, arch={arch})")
+    print(f"Launching QEMU (PID {proc.pid}, arch={arch})...")
 
-    # Wait for socket file
+    # Wait for socket file. Report failure loudly rather than a started
+    # guest: a missing/broken pflash file (the aarch64_vars.fd gap this fixes)
+    # makes QEMU exit within the first second, before the serial chardev ever
+    # binds its socket. Poll the process too, so that case is caught
+    # immediately with QEMU's own exit code and stderr instead of silently
+    # waiting out the full 15 s timeout and only then failing.
     deadline = time.time() + 15
     while not os.path.exists(SERIAL_SOCK):
+        ret = proc.poll()
+        if ret is not None:
+            with open(QEMU_STDERR_LOG, "rb") as ef:
+                err = ef.read(4096).decode(errors="replace")
+            try:
+                os.unlink(PID_FILE)
+            except FileNotFoundError:
+                pass
+            sys.exit(f"ERROR: QEMU exited immediately (code {ret}) before the "
+                      f"serial socket appeared.\nQEMU stderr:\n{err}")
         if time.time() > deadline:
             with open(QEMU_STDERR_LOG, "rb") as ef:
                 err = ef.read(2048).decode(errors="replace")
+            try:
+                os.unlink(PID_FILE)
+            except FileNotFoundError:
+                pass
             sys.exit(f"ERROR: serial socket did not appear.\nQEMU stderr:\n{err}")
         time.sleep(0.1)
 
+    # Only now is it true that a guest actually started.
+    print(f"QEMU started (PID {proc.pid}, arch={arch})")
     print("Serial socket up. Waiting for login/shell prompt (up to 120s)...")
     # "> " used to be a sentinel here; it matched the boot log's own
     # "[INPUT] -> keyboard (event0)" and declared the guest ready ~40 s into a
