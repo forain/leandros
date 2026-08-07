@@ -777,6 +777,17 @@ def main():
     if os.path.exists(m13_liprobe):
         bin_files.append(("liprobe", m13_liprobe, 0o100755))
 
+    # wlinput: a Wayland client that maps a real xdg_toplevel and counts every
+    # wl_pointer / wl_keyboard / wl_touch event the compositor sends it. liprobe
+    # instruments the layer BELOW cosmic-comp; this one instruments the layer
+    # ABOVE it, so between them the compositor is bracketed and "cosmic-comp
+    # never received input" and "cosmic-comp received it and routed it nowhere"
+    # stop looking the same. Source is in-repo at artifacts/m14-wlinput/.
+    m14_wlinput = os.path.expanduser(
+        f"~/code/leandros-artifacts/m14-wlinput/out/wlinput-{arch}")
+    if os.path.exists(m14_wlinput):
+        bin_files.append(("wlinput", m14_wlinput, 0o100755))
+
     # The session launcher itself (a POSIX-sh script). The kernel execve()s ELF
     # only (no "#!"-shebang binfmt), so it is run as `sh /bin/start-cosmic-leandros`.
     m6_launcher = os.path.expanduser(
@@ -808,6 +819,16 @@ def main():
         "~/code/leandros-artifacts/m6-session-data/m12c-input")
     if os.path.exists(m12c_drv):
         bin_files.append(("m12c-input", m12c_drv, 0o100755))
+    # m14-input — the guest half of artifacts/m14_input.py: brings the session
+    # up, dumps the COSMIC input config (an `input_devices` entry with
+    # `state: Disabled` produces exactly the observed symptom), then runs
+    # /bin/wlinput against cosmic-comp's socket so the same injection can be
+    # counted BELOW the compositor ([EVSTAT]) and ABOVE it ([WLI]) in one run.
+    # Same no-shebang rule: run as `brush /bin/m14-input`.
+    m14_drv = os.path.expanduser(
+        "~/code/leandros-artifacts/m6-session-data/m14-input")
+    if os.path.exists(m14_drv):
+        bin_files.append(("m14-input", m14_drv, 0o100755))
     # m4-vkwl-a64 — the same driver with the compositor choice and every wait
     # made an argument, for aarch64 under TCG where "the session never came up"
     # and "the WSI chain does not work here" have to be told apart and a silent

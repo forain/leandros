@@ -1,0 +1,150 @@
+# m14-input — put an instrument on the OTHER side of the compositor.
+#
+# Run it as:  brush /bin/m14-input     (no shebang binfmt; always via a shell)
+# Host half:  artifacts/m14_input.py
+#
+# WHAT M13 LEFT. liprobe exonerated the entire stack below and including
+# libinput, in-process, by measurement: the libudev shim enumerates both devices
+# and resolves dev_from_devnum; the libseat shim opens event0 and event1; the
+# kernel's evdev census shows reads, POLLINs and deliveries; and libinput itself
+# produced motion_abs=62 key=8 with dispatch_err=0. Everything below the
+# compositor works and the compositor acts on none of it.
+#
+# That leaves two halves and no way to tell them apart from below:
+#
+#   A. cosmic-comp receives the events and routes them nowhere (seat lookup,
+#      focus, absolute-motion -> output mapping), or
+#   B. cosmic-comp receives them and routes them correctly, and the failure is
+#      cursor/render-side — nothing on screen moves, but clients are being told.
+#
+# /bin/wlinput decides it. It is a Wayland client: it maps a real xdg_toplevel
+# and counts every wl_pointer / wl_keyboard / wl_touch event cosmic-comp sends
+# it. Events at the client => B. No events at the client => A.
+#
+# WHY liprobe IS NOT RUN HERE, and this is not an oversight. Our evdev has ONE
+# ring per device, not a per-open client queue as Linux does, so two readers of
+# the same node rob each other — the same defect that has the in-kernel console
+# eating 112 of 128 keyboard pushes (dev=0 push=128 conspop=112 deliv=16).
+# Running liprobe alongside the compositor would decimate exactly the stream
+# under test and make a true negative indistinguishable from theft.
+#
+# CONTROLS. wlinput prints CONFIGURE and MAPPED before any input window opens.
+# CONFIGURE proves cosmic-comp processed one of our requests and answered it;
+# MAPPED proves a buffer is attached and committed, i.e. we are a surface it
+# could route a pointer into. A run without both is a broken run, and zero
+# pointer events in it says nothing about input.
+
+R=/run/user/0
+L=$R/m14
+T=$R/m14/trace
+
+mkdir -p "$R"
+chmod 0700 "$R"
+mkdir -p "$L"
+mkdir -p "$T"
+
+echo "M14: BEGIN"
+
+# ---- SUSPECT 1, and it costs nothing: an input_devices config with
+# `state: Disabled` produces exactly this symptom, and cosmic-comp reads it in
+# the DeviceAdded arm (config.read_device -> input_config::update_device) before
+# process_input_event ever sees the device. Both the user tree and the system
+# tree are dumped, because get_device_config consults input_devices, then
+# input_default / input_touchpad, and a default that disables is as fatal as a
+# per-device one. Printed whether present or absent: "no such file" is the
+# result, and it has to be legible as one.
+echo "M14: ==== BEGIN inputconfig ===="
+for d in /root/.config/cosmic/com.system76.CosmicComp/v1 \
+         /usr/share/cosmic/com.system76.CosmicComp/v1; do
+	echo "M14: dir $d"
+	ls -la "$d"
+	for k in input_devices input_default input_touchpad input_touchpad_override; do
+		echo "M14: --- $d/$k"
+		cat "$d/$k"
+	done
+done
+echo "M14: ==== END inputconfig ===="
+
+# ---- provenance: the shims that will load are the instrumented ones ---------
+echo "M14: ==== BEGIN shims ===="
+ls -l /usr/lib/libudev.so.1.0.0
+ls -l /usr/lib/libseat.so.1.0.0
+ls -l /bin/wlinput
+echo "M14: ==== END shims ===="
+
+LEANDROS_INPUT_TRACE=1
+LEANDROS_INPUT_TRACE_DIR=$T
+export LEANDROS_INPUT_TRACE
+export LEANDROS_INPUT_TRACE_DIR
+
+RUST_LOG="warn,cosmic_comp=info"
+export RUST_LOG
+
+sh /bin/start-cosmic-leandros > "$L/cosmic.log" 2>&1 &
+
+i=0
+while [ "$i" -lt 180 ]; do
+	if [ -e "$R/wayland-1" ]; then
+		break
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+echo "M14: wayland-1 after ${i}s"
+sleep 25
+
+XDG_RUNTIME_DIR=$R
+WAYLAND_DISPLAY=wayland-1
+export XDG_RUNTIME_DIR
+export WAYLAND_DISPLAY
+
+# ---- the client under test ---------------------------------------------------
+# Explicit socket name, never the environment: cosmic-panel hands its applets a
+# WAYLAND_SOCKET fd for its OWN embedded server, whose seat would never carry
+# compositor input and would look exactly like the negative being hunted.
+/bin/wlinput wayland-1 200 5 > "$L/wlinput.log" 2>&1 &
+
+sleep 12
+echo "M14: ==== BEGIN wlinput bringup ===="
+cat "$L/wlinput.log"
+echo "M14: ==== END wlinput bringup ===="
+
+# ---- four windows: idle at both ends, so a counter that climbs for reasons
+# other than the injection is visible as such.
+echo "M14: MARK IDLE 20"
+sleep 20
+echo "M14: ENDMARK IDLE"
+
+echo "M14: MARK POINTER 45"
+sleep 45
+echo "M14: ENDMARK POINTER"
+
+echo "M14: MARK CLICKKEY 40"
+sleep 40
+echo "M14: ENDMARK CLICKKEY"
+
+echo "M14: MARK IDLE2 20"
+sleep 20
+echo "M14: ENDMARK IDLE2"
+
+echo "M14: CAPTURES DONE"
+
+sleep 25
+
+echo "M14: ==== BEGIN wlinput.log ===="
+cat "$L/wlinput.log"
+echo "M14: ==== END wlinput.log ===="
+
+for f in "$T"/seatshim.*; do
+	if [ -e "$f" ]; then
+		echo "M14: ==== BEGIN $f ===="
+		cat "$f"
+		echo "M14: ==== END $f ===="
+	fi
+done
+
+echo "M14: ==== BEGIN cosmic.log ===="
+cat "$L/cosmic.log"
+echo "M14: ==== END cosmic.log ===="
+
+echo "M14: DONE"
