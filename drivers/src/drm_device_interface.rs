@@ -1979,12 +1979,6 @@ impl DrmDeviceInterface {
         crate::pci::rdebug_hex(cmd);
         crate::pci::rdebug("\n");
 
-        // If this is a mode-setting or flip call, disable the kernel console
-        if cmd == 0x1001 || cmd == 0x1004 || cmd == 0xC06864A2 || cmd == 0xC01864B0 {
-            crate::pci::rdebug("[DRM-IF] Disabling console\n");
-            crate::framebuffer::set_console_disabled(true);
-        }
-
         // The DRM device lock is a spin::Mutex. It must NOT be held across any
         // dereference of user memory: a demand-paging fault taken under a spinlock
         // is the 82d0cc3 all-vCPU freeze class (no panic, IF=0 on every vCPU).
@@ -1993,6 +1987,25 @@ impl DrmDeviceInterface {
         // and write results back AFTER dropping the lock. The pre-existing arms
         // operate on small fixed ioctl structs that the caller filled on its own
         // always-resident stack immediately before the syscall.
+        //
+        // SCANOUT CLAIM: whichever open just moved pixels into the hardware
+        // surface owns it, and the framebuffer console must stop painting over
+        // it — the console draws into that same buffer, and its scroll memmoves
+        // the whole thing (see `drm_scanout_claim` in
+        // drivers/src/framebuffer.rs). Sampling the present counter across the
+        // dispatch is what replaces the old hardcoded list of "console-killing"
+        // ioctl numbers: that list named SETCRTC and PAGE_FLIP and two custom
+        // codes, and missed DRM_IOCTL_MODE_ATOMIC entirely, so an atomic
+        // compositor scanned out with the console still live underneath it.
+        // Deriving the claim from the present itself covers every path,
+        // including ones added later.
+        //
+        // Two card0 opens issuing ioctls on two vCPUs in the same instant can
+        // misattribute a present to the wrong open. The cost is the console
+        // returning one close early rather than late, and a KMS master is
+        // single here — where it was not, this would need the open id threaded
+        // down to the composite instead.
+        let presents_before = crate::drm::device::SCANOUT_WRITES.load(Ordering::Relaxed);
         let res = match cmd {
             // ── Mode setting ioctls (Custom LeandrOS / DOOM path) ──
             0x1001 => self.handle_set_mode(arg),
@@ -2081,6 +2094,10 @@ impl DrmDeviceInterface {
                 Err(DriverError::Unsupported)
             }
         };
+
+        if crate::drm::device::SCANOUT_WRITES.load(Ordering::Relaxed) != presents_before {
+            crate::framebuffer::drm_scanout_claim(open_id);
+        }
 
         crate::pci::rdebug("[DRM-IF] handle_ioctl finished, returning Result\n");
         res
@@ -2175,9 +2192,16 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
-    /// Release DRM resources and re-enable kernel console
-    pub fn release(&mut self) {
-        crate::framebuffer::set_console_disabled(false);
+    /// A card0 open closed: give the framebuffer console the scanout back, but
+    /// only if this is the open that took it.
+    ///
+    /// It used to hand the console back on every card0 close, which meant a
+    /// second, short-lived open of the node — a probe, a libseat handshake —
+    /// wiped a live compositor's display, because reclaim clears the screen and
+    /// prints a banner. `open_id` 0 means "no open identity" and releases
+    /// unconditionally.
+    pub fn release(&mut self, open_id: u32) {
+        crate::framebuffer::drm_scanout_release(open_id);
     }
 
     /// Handle DRM_IOCTL_CREATE_FB

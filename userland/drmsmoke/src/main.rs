@@ -31,6 +31,7 @@ type c_uint = u32;
 type c_ulong = u64;
 type size_t = usize;
 
+const O_RDONLY: c_int = 0o0;
 const O_RDWR: c_int = 0o2;
 
 const PROT_READ: c_int = 0x1;
@@ -381,6 +382,79 @@ unsafe fn print_dec(label: &[u8], v: u64) {
     write(1, b"\n".as_ptr() as *const c_void, 1);
 }
 
+// ── Console-vs-scanout census ────────────────────────────────────────────────
+//
+// /dev/fb0 reads the live hardware framebuffer — the SAME surface the DRM
+// present path composites into and the SAME surface the kernel's framebuffer
+// console draws and scrolls. That makes the whole check possible in-guest: take
+// the scanout, fingerprint the surface, provoke the console, fingerprint again.
+// Byte-identity is the invariant, so it needs no per-arch pixel constants and
+// does not care what the pitch is.
+
+const FB_CHUNK: usize = 8192;
+static mut FB_BUF: [u8; FB_CHUNK] = [0u8; FB_CHUNK];
+
+/// FNV-1a 64 over every byte /dev/fb0 will hand us, plus the byte count.
+/// Returns (hash, bytes, first_row_ok) where `first_row_ok` is the plumbing
+/// self-check: the first chunk must look like the gradient this test just
+/// scanned out (XRGB8888, R fixed at 0x40, B ramping with x). If that is false
+/// the census is reading something other than the scanout and every later
+/// verdict is meaningless.
+unsafe fn fb0_census(width: usize) -> (u64, u64, bool) {
+    let fd = open(b"/dev/fb0\0".as_ptr(), O_RDONLY);
+    if fd < 0 { return (0, 0, false); }
+
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut total: u64 = 0;
+    let mut first = true;
+    let mut row_ok = false;
+
+    loop {
+        let n = read(fd, FB_BUF.as_mut_ptr() as *mut c_void, FB_CHUNK);
+        if n <= 0 { break; }
+        let n = n as usize;
+        if first {
+            first = false;
+            // The whole first row fits in one chunk for every mode we run
+            // (1280*4 and 1920*4 are both under 8 KiB).
+            let row_bytes = width * 4;
+            if row_bytes >= 8 && row_bytes <= n {
+                let r_left = FB_BUF[2];
+                let r_right = FB_BUF[row_bytes - 2];
+                let b_left = FB_BUF[0];
+                let b_right = FB_BUF[row_bytes - 4];
+                row_ok = r_left == 0x40 && r_right == 0x40 && b_right > b_left;
+            }
+        }
+        let mut i = 0usize;
+        while i < n {
+            hash ^= FB_BUF[i] as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            i += 1;
+        }
+        total += n as u64;
+    }
+    close(fd);
+    (hash, total, row_ok)
+}
+
+/// Everything a guest program does that used to walk over a live display:
+/// a short-lived second open of card0 (its close used to hand the console
+/// back — and reclaim CLEARS the screen), then enough console output to scroll
+/// the framebuffer well past a full screen.
+unsafe fn provoke_console(fd_hold: c_int) {
+    let probe = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    if probe >= 0 && probe != fd_hold { close(probe); }
+
+    // 1280x800 is 50 text rows and 1920x1080 is 67; 160 lines scrolls the
+    // whole surface off at least twice on either.
+    let mut i = 0u64;
+    while i < 160 {
+        print_dec(b"  drmsmoke console noise ", i);
+        i += 1;
+    }
+}
+
 // Sink for spin_delay's accumulator, written with a volatile store so a
 // release build cannot prove the busy-loop is dead and elide it.
 static mut SPIN_SINK: u64 = 0;
@@ -538,6 +612,47 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     set.mode_valid = 1;
     let setcrtc_ok = ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &mut set as *mut _) == 0;
     if !report(b"SETCRTC", setcrtc_ok) { failures += 1; }
+
+    // ── CONSOLE_YIELDS_TO_SCANOUT ────────────────────────────────────────────
+    //
+    // The framebuffer console and the DRM scanout are one buffer, so a guest
+    // program that merely prints while a master is scanning out used to destroy
+    // the display: `scroll_vector` memmoves the entire surface up one text row
+    // on every line, and a compositor only repaints what it damaged, so
+    // whatever was static is scrolled away and never redrawn. Measured on a
+    // COSMIC session as 334503 distinct colours collapsing to 177 with 79% of
+    // the screen left black.
+    //
+    // Two ways in, and this exercises both:
+    //   * the console was never silenced in the first place — the old gate was
+    //     a hardcoded list of ioctl numbers that missed DRM_IOCTL_MODE_ATOMIC,
+    //     which is the path a real compositor drives;
+    //   * it was silenced and then handed back by an unrelated card0 close,
+    //     which additionally CLEARS the screen and prints a banner.
+    //
+    // The verdict is byte-identity of the scanout across the provocation, which
+    // needs no per-arch pixel constants. Anything that repaints the surface
+    // between the two reads — including the kernel's own log output — fails it.
+    if setcrtc_ok {
+        let (hash_a, bytes_a, row_ok) = fb0_census(w as usize);
+        if !report(b"FB0_SHOWS_SCANOUT", row_ok && bytes_a > 0) { failures += 1; }
+
+        provoke_console(fd);
+
+        let (hash_b, bytes_b, _) = fb0_census(w as usize);
+        print_dec(b"  CONSOLE_YIELDS bytes_before=", bytes_a);
+        print_dec(b"  CONSOLE_YIELDS bytes_after=", bytes_b);
+        print_dec(b"  CONSOLE_YIELDS fnv_before=", hash_a);
+        print_dec(b"  CONSOLE_YIELDS fnv_after=", hash_b);
+        let held = bytes_a > 0 && bytes_a == bytes_b && hash_a == hash_b;
+        if !held {
+            puts(b"  CONSOLE_YIELDS_TO_SCANOUT: FAIL the scanout changed while a DRM master held it -- the fb console painted or scrolled over it\n\0".as_ptr());
+        }
+        if !report(b"CONSOLE_YIELDS_TO_SCANOUT", held) { failures += 1; }
+    } else {
+        if !report(b"FB0_SHOWS_SCANOUT", false) { failures += 1; }
+        if !report(b"CONSOLE_YIELDS_TO_SCANOUT", false) { failures += 1; }
+    }
 
     if hold_mode {
         if setcrtc_ok && !fb_ptr.is_null() {

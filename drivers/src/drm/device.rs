@@ -1,12 +1,22 @@
 //! DRM device management and resource tracking
 
 use ::core::ptr;
+use ::core::sync::atomic::{AtomicU64, Ordering};
 use alloc::{vec::Vec, collections::BTreeMap};
 use spin::Mutex;
 use super::core::*;
 use super::auth::*;
 use super::framebuffer::*;
 use super::super::DriverError;
+
+/// Presents that actually moved pixels into the shared hardware surface — the
+/// same buffer the framebuffer console draws into.
+///
+/// `handle_ioctl` samples this across a dispatch to learn whether that ioctl
+/// took the scanout, which is how the console knows to stop painting without
+/// anyone maintaining a list of which ioctl numbers present. See
+/// `drm_scanout_claim` in drivers/src/framebuffer.rs.
+pub static SCANOUT_WRITES: AtomicU64 = AtomicU64::new(0);
 
 /// DRM device capabilities
 pub struct DrmDeviceCaps {
@@ -355,6 +365,10 @@ impl DrmDevice {
         let src_phys = drm_fb.physical_addresses[0];
         if src_phys == 0 { return Ok(()); } // No buffer bound
 
+        // Past this point the destination is written unconditionally, so this
+        // is where a DRM client takes the surface away from the console.
+        SCANOUT_WRITES.fetch_add(1, Ordering::Relaxed);
+
         // Map physical addresses to kernel virtual space
         let src_ptr = mm::phys_to_virt(src_phys as usize) as *const u32;
         let dst_ptr = mm::phys_to_virt(hw_base as usize) as *mut u32;
@@ -421,6 +435,11 @@ impl DrmDevice {
 
         let src_phys = drm_fb.physical_addresses[0];
         if src_phys == 0 { return Ok(()); } // No buffer bound
+
+        // Counted even for a clip list that turns out to be empty: a commit
+        // naming a framebuffer means a DRM client owns the display, whether or
+        // not this particular frame had anything to redraw.
+        SCANOUT_WRITES.fetch_add(1, Ordering::Relaxed);
 
         let src_w = drm_fb.width as usize;
         let src_h = drm_fb.height as usize;

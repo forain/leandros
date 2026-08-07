@@ -652,6 +652,12 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Take the framebuffer back before printing anything. The console yields
+    // the scanout to a DRM master (drivers/src/framebuffer.rs), and nothing is
+    // going to give it back, so a panic during a graphical session would reach
+    // the serial line and nothing else. Two atomic stores, no locks — the
+    // panicking thread may already hold KERNEL_FB.
+    drivers::framebuffer::console_force_reclaim();
     serial_print_str("\n--- KERNEL PANIC ---\n");
     if let Some(msg) = info.message().as_str() {
         serial_print_str(msg);

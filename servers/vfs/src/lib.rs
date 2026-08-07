@@ -1519,6 +1519,21 @@ pub extern "C" fn vfs_get_framebuffer_info(info: &mut FramebufferInfo) {
     info.pitch = if pitch < width * 4 { width * 4 } else { pitch };
 }
 
+/// Re-point /dev/fb0 at a new console surface.
+///
+/// KMS moves the console off the bootloader's framebuffer when that memory is
+/// not DMA-able — with virtio-vga, OVMF's GOP lives in the VGA VRAM BAR and
+/// virtio-gpu cannot back a resource with it, so `kms::detect_and_configure`
+/// allocates a RAM surface, copies the boot console into it and redirects
+/// BOOT_FB/KERNEL_FB there. It did not redirect this, so on x86_64 /dev/fb0
+/// went on reporting the VRAM address: reads returned a frozen copy of the
+/// screen as it looked at handoff, while both the console and every DRM present
+/// wrote somewhere else entirely.
+#[no_mangle]
+pub extern "C" fn vfs_set_framebuffer(base: u64, width: u32, height: u32, pitch: u32) {
+    set_framebuffer(base, width, height, pitch);
+}
+
 /// Get framebuffer base address for DRM mmap
 #[no_mangle]
 pub extern "C" fn vfs_get_framebuffer_base() -> u64 {

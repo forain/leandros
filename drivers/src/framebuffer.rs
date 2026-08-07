@@ -671,6 +671,99 @@ impl Driver for Framebuffer {
 
 static KERNEL_FB: Mutex<Framebuffer> = Mutex::new(Framebuffer::new());
 
+// ── Scanout ownership ─────────────────────────────────────────────────────────
+//
+// The framebuffer console and the DRM scanout are the SAME surface. `kms.rs`
+// points BOOT_FB and KERNEL_FB at the RAM buffer that backs virtio-gpu resource
+// 1, and every DRM present composites into whatever `get_hardware_fb_info()`
+// reports — see `perform_software_scaling` and `present_damaged` in
+// `drivers/src/drm/device.rs`, which resolve their destination from exactly
+// that call.
+//
+// So a console write during a live session is not an overlay that a repaint
+// will cover: a single '\n' past the last text row runs `scroll_vector`, which
+// memmoves the WHOLE surface up one row and blacks the bottom one. A
+// compositor repaints only what it damaged, so everything static is scrolled
+// off and never redrawn. Measured on a COSMIC session with a client logging one
+// line per frame: 334503 distinct colours collapsed to 177, 79% of the screen
+// went pure black, and the client's four previous frames were left smeared into
+// bands an exact multiple of the text row apart. Running the same client quiet
+// restored the wallpaper.
+//
+// The predicate that gates the console is therefore not "did a particular ioctl
+// arrive". That is what this replaces: a hardcoded list of SETCRTC / PAGE_FLIP
+// / two custom numbers, which missed DRM_IOCTL_MODE_ATOMIC — the path
+// cosmic-comp actually drives — so an atomic compositor never turned the
+// console off at all. The predicate is "has a DRM client composited into this
+// surface and not yet given it back", claimed from the present path itself
+// (`handle_ioctl` in drivers/src/drm_device_interface.rs), so a present path
+// added later is covered without being listed anywhere.
+//
+// Ownership is per card0 *open*, not a global flag, because the other half of
+// the same defect was that ANY card0 close handed the console back — and
+// reclaim CLEARS the screen, so a short-lived second open of the node wiped a
+// live compositor's display outright.
+
+/// Nobody holds the scanout; the console owns it and paints normally.
+const SCANOUT_UNOWNED: u32 = 0;
+/// Claimed by a caller with no open identity (the legacy `Driver::handle`
+/// path, which has no per-open cookie to key on). Any card0 close releases it,
+/// which is what that path effectively did before ownership existed.
+const SCANOUT_ANON: u32 = u32::MAX;
+
+static SCANOUT_OWNER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(SCANOUT_UNOWNED);
+
+/// The card0 open currently scanning out, or [`SCANOUT_UNOWNED`].
+pub fn scanout_owner() -> u32 {
+    SCANOUT_OWNER.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// A DRM present just composited into the shared surface on behalf of
+/// `open_id`. Silences the console until that open gives the scanout back.
+///
+/// Called on every present, so it must stay cheap: one RMW and, only on the
+/// first claim, the flag flip that stops `serial_write_byte` reaching
+/// `fb_putc`.
+pub fn drm_scanout_claim(open_id: u32) {
+    let owner = if open_id == 0 { SCANOUT_ANON } else { open_id };
+    if SCANOUT_OWNER.swap(owner, core::sync::atomic::Ordering::SeqCst) == SCANOUT_UNOWNED {
+        set_console_disabled(true);
+    }
+}
+
+/// A card0 open closed. Give the console back iff that open was the one
+/// scanning out — closing some other open of the node must not resurrect the
+/// console under a live master, because reclaim clears the screen.
+///
+/// `open_id` 0 means "no open identity" and releases unconditionally: it is
+/// what the VFS_CLOSE_ALL path passes, and an anonymous claim has nothing
+/// better to match against.
+pub fn drm_scanout_release(open_id: u32) {
+    let owner = SCANOUT_OWNER.load(core::sync::atomic::Ordering::SeqCst);
+    if owner == SCANOUT_UNOWNED { return; }
+    if open_id != 0 && owner != SCANOUT_ANON && owner != open_id { return; }
+    if SCANOUT_OWNER.swap(SCANOUT_UNOWNED, core::sync::atomic::Ordering::SeqCst)
+        != SCANOUT_UNOWNED
+    {
+        set_console_disabled(false);
+    }
+}
+
+/// Take the scanout back for a kernel panic, unconditionally.
+///
+/// A panic during a live session would otherwise be invisible on screen — the
+/// console has yielded, and nothing is ever going to give it back. Deliberately
+/// two atomic stores and no locks and no repaint: the panicking thread may
+/// already hold `KERNEL_FB`, and a panic handler that blocks on it prints
+/// nothing at all. The panic text simply overwrites the compositor's last
+/// frame, which is the right outcome for a panic.
+pub fn console_force_reclaim() {
+    SCANOUT_OWNER.store(SCANOUT_UNOWNED, core::sync::atomic::Ordering::SeqCst);
+    extern "C" { fn kernel_set_console_enabled(enabled: bool); }
+    unsafe { kernel_set_console_enabled(true); }
+}
+
 /// Disable or enable kernel console output to prevent blinking during DRM operations.
 pub fn set_console_disabled(disabled: bool) {
     extern "C" { fn kernel_set_console_enabled(enabled: bool); }

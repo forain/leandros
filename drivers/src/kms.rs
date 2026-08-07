@@ -167,6 +167,14 @@ impl KmsDriver {
                             ram_virt as *mut u32,
                             width as usize, height as usize, (width * 4) as usize);
                     }
+                    // And the VFS with it, or /dev/fb0 and the DRM mmap token keep
+                    // naming the bootloader's framebuffer — the surface nothing
+                    // writes to any more. On x86_64 that made reads of /dev/fb0
+                    // return a frozen snapshot of the boot console forever.
+                    extern "C" {
+                        fn vfs_set_framebuffer(base: u64, width: u32, height: u32, pitch: u32);
+                    }
+                    unsafe { vfs_set_framebuffer(ram_phys as u64, width, height, width * 4); }
 
                     mode.width  = width;
                     mode.height = height;

@@ -295,14 +295,18 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         // right for the node that could have taken it away. A render node has
         // no KMS relationship at all, so closing one MUST NOT resurrect the
         // console underneath a compositor still scanning out on card0.
+        //
+        // Being a card0 close is necessary but not sufficient: the open cookie
+        // goes with it so that closing an open which never scanned out leaves a
+        // live master alone.
         if arg(msg, 0) as u32 == DEV_ID_CARD {
-            interface.release();
+            interface.release(arg(msg, 1) as u32);
         }
         ok_reply()
     } else if msg.tag == vfs_server::VFS_CLOSE_ALL {
         // Dead code today — the VFS retires fds one at a time through
         // release_vnode, so card0 never sees this. No open identity to key on.
-        interface.release();
+        interface.release(0);
         ok_reply()
     } else {
         interface.handle(msg.clone())
