@@ -378,7 +378,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
         # cannot run while inside the MMIO write handler.  Modern non-
         # transitional devices use a different notification path that doesn't
         # have this issue.
-        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 2G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
+        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m ${LEANDROS_QEMU_MEM:-2G} -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             -drive if=pflash,unit=1,format=raw,file="$VARS_FILE" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
@@ -403,7 +403,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             if [ ! -f "$X86_VARS_FILE" ]; then cp "$VARS_TEMPLATE" "$X86_VARS_FILE"; fi
             X86_VARS_ARGS=(-drive "if=pflash,unit=1,format=raw,file=$X86_VARS_FILE")
         fi
-        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 2G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
+        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m ${LEANDROS_QEMU_MEM:-2G} -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             "${X86_VARS_ARGS[@]}" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \

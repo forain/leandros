@@ -273,6 +273,20 @@ def _audiodev_args():
     return ["-audiodev", "none,id=snd0"]
 
 
+def _guest_mem():
+    """Guest RAM, overridable with LEANDROS_QEMU_MEM (the name run-qemu.sh uses too).
+
+    2G is not a neutral default. A COSMIC session runs a softpipe compositor and
+    five iced applications inside it, and an allocation failure there does not
+    surface as an allocation failure: libxkbcommon's xkb_context_new returns
+    NULL on a failed calloc, the xkbcommon crate wraps the pointer without
+    checking it, and the process dies on a null dereference at the next
+    wl_keyboard bind. Being able to raise this from outside the guest is what
+    makes that attributable rather than merely plausible.
+    """
+    return os.environ.get("LEANDROS_QEMU_MEM", "2G")
+
+
 def _build_cmd(arch, mode="uefi", venus=False):
     if venus:
         # Mirrors run-qemu.sh's --venus guards: it never autodetects and never
@@ -325,7 +339,7 @@ def _build_cmd(arch, mode="uefi", venus=False):
         display_arg = "egl-headless" if venus else "none"
         return [
             "qemu-system-aarch64",
-            "-machine", "virt,gic-version=2", "-smp", "4", *cpu_flags, "-m", "2G",
+            "-machine", "virt,gic-version=2", "-smp", "4", *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             "-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}",
@@ -382,7 +396,7 @@ def _build_cmd(arch, mode="uefi", venus=False):
         display_arg = "egl-headless" if venus else "none"
         return [
             "qemu-system-x86_64",
-            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", *cpu_flags, "-m", "2G",
+            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             *vars_args,
@@ -425,7 +439,7 @@ def _build_direct_cmd(arch):
             sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
         return [
             "qemu-system-aarch64",
-            "-machine", "virt,gic-version=2", "-smp", "4", "-cpu", "max", "-m", "2G", "-accel", "tcg",
+            "-machine", "virt,gic-version=2", "-smp", "4", "-cpu", "max", "-m", _guest_mem(), "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
             "-drive", f"if=none,id=data0,format=raw,file={data0}",
@@ -450,7 +464,7 @@ def _build_direct_cmd(arch):
             sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
         return [
             "qemu-system-x86_64",
-            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", "-cpu", "max", "-m", "2G", "-accel", "tcg",
+            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", "-cpu", "max", "-m", _guest_mem(), "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x10000000,force-raw=on",
             "-drive", f"if=none,id=data0,format=raw,file={data0}",
