@@ -307,10 +307,15 @@ reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print i
   KMS path is live and preferred; the legacy path still works but cannot drive a
   cursor plane.
 - Seat/input: **shim** libseat and libudev; **port** real libinput and libxkbcommon.
-  No seatd, no udevd, no VT switching.
+  No seatd, no udevd. **VT switching is now IN SCOPE** (items 12-14) — it was
+  previously listed as out of scope, and the whole greeter design was built to route
+  around it. That routing stays correct as an interim, but it is no longer the end state.
 - D-Bus: **busd** (pure Rust, from the zbus authors). Reference `dbus-daemon` is the
   fallback if it proves immature.
-- `start-cosmic` runs under **brush**; boot path is login → root → `start-cosmic`.
+- `start-cosmic` runs under **brush**; the boot path is login → root → `start-cosmic`
+  **today**, and the committed target is a **graphical login**: `greetd` (upstream
+  `kennylevinsen/greetd`, pure Rust, ported under `ports/`) → `cosmic-greeter` →
+  session. See items 12-14 and the greeter section below.
 
 **Load-bearing session env** (in the launcher at
 `artifacts/m6-session-data/start-cosmic-leandros`):
@@ -677,8 +682,19 @@ harnesses are in `artifacts/notes/`. Design docs that are still
 execution-ready are in `docs/design/`.
 
 **Explicitly out of scope** (all degrade gracefully or are non-fatal): XWayland,
-PipeWire/audio for COSMIC, NetworkManager, UPower, accountsservice, greetd +
-cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
+PipeWire/audio for COSMIC, NetworkManager, UPower, accountsservice,
+cosmic-workspaces' wgpu path, hotplug, multi-seat.
+
+**Four things left this list on 2026-08-08, by decision rather than by measurement, and
+the list is worse than wrong about them — it was load-bearing.** `greetd` and
+`cosmic-greeter` are now the **committed default graphical login**; **PAM**, **utmpx**
+and **VT switching** are all to be supported (items 12-14). Every one of those was cited
+as a reason *not* to do something: the greeter was scoped out, which is why item 11
+argued the honest fix for its permanent patch was to stop shipping it; and PAM/utmpx/VT
+were the three couplings cited when recommending against porting upstream greetd. **All
+of that reasoning is void.** The measurements underneath it survive and are still
+useful — what expired is every conclusion that rested on the scope. Read any older
+paragraph that leans on "out of scope" with that in mind.
 
 ---
 
@@ -691,7 +707,10 @@ cosmic-greeter, cosmic-workspaces' wgpu path, hotplug, VT switching, multi-seat.
 | 8 | Nothing to launch, and no way to ask for it | Feature — **config DONE** `52665aa` | Keybinding table staged; still no terminal to launch |
 | 9 | **9 panel applets have no scoped-out dependency and are simply unbuilt** | Feature — cheap | Build recipe exists; spawn path proven |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
-| 11 | **Two PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — **actionable** | `env_rx` fires every boot; cause asserted, not shown |
+| 11 | **Two PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — **actionable** | `env_rx` root-caused: `shutdown(2)` destroys the fd |
+| 12 | **PAM — real support, replacing the C shim** | Feature — **NEW, in scope** | Shim authenticates for real but is C, untracked, coverage unverified |
+| 13 | **utmpx — session accounting, currently absent** | Feature — **NEW, in scope** | Nothing in tree; need is unmeasured |
+| 14 | **VT switching — was out of scope, now required** | Feature — **NEW, in scope** | No VTs at all; greeter design routes around it |
 | 1 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — **no action** | Recorded on purpose; fix undecided |
 | 2 | M4 — **COMPLETE, photographed on BOTH arches** | Feature — **DONE** | `132d4df` x86_64, `d91edbf` aarch64 |
 | 3 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | Nothing scheduled |
@@ -1080,6 +1099,105 @@ cosmic-greeter at all rather than to carry a patch for a component we do not wan
 would also remove one of the 12 launched processes. Check what else expects it first.
 
 (`ports/busd/current-thread-runtime.patch` is **not** in scope here — busd is ours.)
+
+### 12. PAM — real support, replacing the C shim
+
+**In scope as of 2026-08-08.** The image ships `libpam.so.0`, and it is **not inert** —
+`leandros-artifacts/m6-session-bins/src/libpam-shim/pam_shim.c` implements SHA-256,
+parses `$sha256$<salt>$<hex>` from `/etc/shadow`, compares in constant time, and drives
+the caller's conversation callback. Same scheme `/bin/login` already validates
+(`userland/login/src/main.rs:238`). So authentication demonstrably works today for the
+one caller that uses it.
+
+**Three things are wrong with that, in increasing order of importance.**
+
+1. **It is C, in a sibling tree that is not a git repository.** The repo is Rust-only,
+   and this file has already recorded that rule being enforced against `vkwl.c`. While
+   the greeter was out of scope the shim was expedient scaffolding; it is now permanent
+   infrastructure on the boot path, and infrastructure does not get to live untracked.
+   Rewriting it as a `no_std` Rust cdylib under `userland/` is roughly 450 C lines →
+   ~400 Rust — but note that **no in-tree `userland/` crate is dynamic today**
+   (`scripts/build-userland.sh` emits static binaries with
+   `-C link-arg=-static -C relocation-model=static`), so a shared object is a **new
+   build shape**, not a new crate. Cost that honestly; the same mis-sizing killed a
+   previously recorded plan to write `vkwl` as a `userland/` crate.
+2. **Coverage against real callers is UNVERIFIED.** `grep pam` finds **27 hits in
+   `cosmic-greeter`'s `locker.rs` and zero in `greeter.rs`**, so in the *login* role the
+   greeter does not use PAM at all — authentication crosses greetd IPC instead. What
+   matters is therefore **which PAM entry points upstream greetd calls**
+   (`pam_start`, `pam_authenticate`, `pam_acct_mgmt`, `pam_open_session`, `pam_setcred`,
+   `pam_getenvlist`, `pam_end`, …) against what the shim implements.
+   **`pam_open_session`/`pam_setcred` are the ones most likely missing and most likely
+   to matter.** This is being measured; do not assume either answer.
+3. **A shim that answers "yes" is indistinguishable from one that authenticates**, and
+   only one of those is a login screen. Any replacement needs a guard that is falsified
+   by mutation — a wrong password must be *shown* to be rejected, not assumed to be.
+
+**Decision still open:** extend/rewrite the shim, or port real Linux-PAM. Real PAM
+`dlopen`s its modules, which interacts directly with the static-vs-dynamic question
+above. The shim path is strongly preferred on size; state the reason if you pick the
+other.
+
+### 13. utmpx — session accounting, currently absent
+
+**In scope as of 2026-08-08, and the least-understood of the three.** Nothing in the
+tree implements utmpx. Unlike items 12 and 14, **there is no measurement here at all** —
+not of what needs it, not of what breaks without it, not of how much of the interface
+real consumers touch.
+
+**So the first task is not to implement it.** It is to establish, from source: does
+upstream greetd write utmpx on the mandatory path or behind a feature/config? Does
+anything else we ship read it (`who`, `w`, `last` — do those even exist among the 175
+`/bin` names)? Is the requirement the **file format** (`/var/run/utmp`,
+`/var/log/wtmp`) or the **libc interface** (`setutxent`/`getutxent`/`pututxline`/
+`endutxent`), and does our libc expose the latter at all?
+
+**The trap this item exists to avoid** is the one item 8 walked into twice: sizing a
+feature from its name. utmpx could be a fixed-size record appended to two files — a day
+— or a session-tracking subsystem the kernel has no concept of. **Do not schedule
+implementation work against this item until that question is answered**, and record the
+answer here rather than in a lane report.
+
+### 14. VT switching — was out of scope, now required
+
+**In scope as of 2026-08-08, reversing a committed architectural decision.** There are
+no VTs of any kind: no `/dev/tty[0-9]`, no `VT_ACTIVATE`/`VT_WAITACTIVE`/`VT_GETSTATE`,
+no `KDSETMODE`/`KDGKBMODE`, no VT-switch signal handshake. This was deliberate — the
+seat/input architecture shims libseat and libudev precisely so that nothing needs a
+session manager to arbitrate device access.
+
+**What that decision is currently holding up, stated plainly so the cost of reversing it
+is visible in both directions.** The greeter design (below) runs **cosmic-comp as root**
+with only the greeter *client* unprivileged, specifically to avoid needing seatd or a VT
+handoff. That is a legitimate interim and should ship as-is; it is **not** a substitute
+for this item, because a single-VT system cannot switch away from a wedged compositor,
+cannot put a text console behind the graphical login, and cannot hand the DRM master
+between the greeter's compositor and the session's.
+
+**Three pieces, and only the first is small.**
+1. **The console side.** The framebuffer console already owns the scanout and already
+   yields it correctly — `SCANOUT_WRITES` + `drm_scanout_claim` (`edad115`, `c8cbbc1`)
+   claims the console from the *present itself* rather than from an ioctl allow-list,
+   falsified by mutation on both arches. **That mechanism is the right foundation** and
+   should be extended rather than replaced; a VT is close to "which of N consoles owns
+   the scanout", which it already answers for N=1.
+2. **The device-arbitration side.** DRM master handoff plus reopening `/dev/input/*` on
+   switch. Note the already-measured hazard: our evdev has **one ring per device, not a
+   per-open client queue as Linux has**, so two readers rob each other — measured as
+   `dev=0 push=128 conspop=112 deliv=16`. **VT switching makes that defect load-bearing**
+   rather than cosmetic, because the whole point is two consumers of one device.
+3. **The libseat shim.** It currently reports a session that is active from
+   construction and never emits `SessionEvent::ActivateSession`/`Deactivate`. Real VT
+   switching means those events must fire and be correct. `smithay`'s KMS paths
+   (`apply_config_for_outputs` and friends) **do** read `is_active()` and early-return
+   when inactive — that was established while exonerating the shim on the input path,
+   where nothing reads it. **A component can be correct as a consumer and broken as a
+   producer**, and this shim is about to be asked to be the producer.
+
+**Sequencing.** This is the largest of the three and the least urgent for a *first*
+graphical login, which the root-compositor design reaches without it. Do items 12 and 13
+first, ship a working greeter, then take this on with a real session behind it — the
+same argument that put an intermediate step in the greeter route.
 
 ### Ordering, and why
 
