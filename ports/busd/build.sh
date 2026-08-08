@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build the LeandrOS busd (D-Bus broker) — static musl, both arches.
 #
-# busd 0.5.0 (crates.io) with a single one-line LeandrOS patch:
-# current-thread-runtime.patch (see that file / README.md for the W1 rationale).
+# busd 0.5.0 (crates.io) with every *.patch in this directory applied in name
+# order. Each patch carries its own rationale in its header; see README.md.
 #
 # Toolchain: cargo +nightly + rust-lld self-contained musl CRT on macOS.
 # The `-C relocation-model=static` rustflag is MANDATORY (musl x86_64 otherwise
@@ -23,8 +23,18 @@ if [ ! -d "$SRC" ]; then
   curl -sSL -o "$WORK/busd-$VERSION.crate" \
     "https://static.crates.io/crates/busd/busd-$VERSION.crate"
   tar -C "$WORK" -xzf "$WORK/busd-$VERSION.crate"
-  # apply the LeandrOS patch
-  patch -p1 -d "$SRC" < "$(dirname "$0")/current-thread-runtime.patch"
+  # Apply every LeandrOS patch, in name order.
+  for p in "$(cd "$(dirname "$0")" && pwd)"/*.patch; do
+    echo "applying $(basename "$p")"
+    patch -p1 -d "$SRC" < "$p"
+  done
+  # ports/ lives inside the repo, and the repo root is a cargo workspace that
+  # does not list this tree as a member. Cargo refuses to build a package that
+  # "believes it's in a workspace when it's not" rather than ignoring the outer
+  # manifest, so the extracted crate is declared its own workspace root. (This
+  # is invisible on a host where the crate is unpacked outside the repo, which
+  # is why it only appeared when the build first ran on the Linux box.)
+  printf '\n[workspace]\n' >> "$SRC/Cargo.toml"
 fi
 
 mkdir -p "$SRC/.cargo"

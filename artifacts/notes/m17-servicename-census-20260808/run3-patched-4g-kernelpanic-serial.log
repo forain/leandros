@@ -1,0 +1,27 @@
+[0m[?25l[48;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz4278[?25h
+[?2004l[31merror:[39m command not found: nosuchbinary_xyz42
+[?2004h[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m17-census78[?25h
+[?2004lM17: BEGIN
+MEMINFO boot total=4212252672 free=4173496320 used=38756352 usedpct=0 procs=5 uptime=1
+M17: busd ready after 1s
+M17: wayland-1 after 1s
+MEMINFO wayland1 total=4212252672 free=4123082752 used=89169920 usedpct=2 procs=8 uptime=3
+M17: MARK SETTLE1 45
+[GPU] device features hi=0x00000101 lo=0x30000002
+[GPU] *** host does NOT offer VIRTIO_GPU_F_VIRGL -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_RESOURCE_BLOB -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_CONTEXT_INIT -- 3D/Venus unavailable ***
+[GPU] acked features hi=0x00000001 lo=0x00000002
+[DRM] unimplemented ioctl cmd=0xC00864BF nr=0x000000BF type=0x00000064 size=0x00000008 (reported once per boot)
+[DRM-SRV] mmap token=0x000000000E800000 map_info=0x01 -> writeback
+[DRM-SRV] mmap token=0x000000000F000000 map_info=0x01 -> writeback
+
+*** KERNEL EXCEPTION ***
+Vector=0x000000000000000E
+ErrCode=0x0000000000000000
+RIP=0xFFFFFFFF8014043A
+CS=0x0000000000000008
+RFLAGS=0x0000000000010087
+RSP=0xFFFF8000683EFE30
+SS=0x0000000000000010
+CR2=0xFFFF80000EAC8000

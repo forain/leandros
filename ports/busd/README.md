@@ -107,3 +107,40 @@ kernel ring-tracer to pin parked-vs-deadlocked and local-vs-inject at the wedge.
 `./build.sh` — needs `cargo +nightly` with the musl targets. Produces ET_EXEC
 static binaries staged to
 `~/code/leandros-artifacts/m5-session-ship/<arch>/usr/libexec/busd`.
+
+## `proposed/` — patches that are correct and NOT applied
+
+`build.sh` applies every `*.patch` in **this** directory, in name order.
+`proposed/` is deliberately outside that glob: what lives there is a patch whose
+mechanism is proven and whose consequences are not yet acceptable. Nothing is
+built from it until it is moved up a level.
+
+### `proposed/service-unknown-reply.patch`
+
+Replies `org.freedesktop.DBus.Error.ServiceUnknown` to a method call addressed to
+a well-known name nobody owns, instead of dropping it. Rationale, gating and
+measurements are in the patch header and in
+`artifacts/notes/m17-servicename-census-20260808/`.
+
+**It does what it was written to do.** With it staged, a hand-started second
+`cosmic-launcher` reports `Another instance is running` and exits 0 — which is
+only reachable if the autostarted copy got through the same probe, owns
+`com.system76.CosmicLauncher` and is serving `DbusActivation`. It fixes a whole
+class: a stock session addresses **ten** distinct unowned names in its first ten
+seconds, only four of which are single-instance probes.
+
+**It is not landable yet, and the reason is not in busd.** Unblocking those
+components makes them run, and they then die on a null dereference at
+`CR2=0x880` — `xkb_context_new` returning NULL on a failed allocation, wrapped
+without a null check by the `xkbcommon` crate and handed straight through by
+SCTK. Measured on x86_64/KVM with the busd binary as the only image delta and
+everything else held constant, including the kernel:
+
+| busd | panel bar + clock | `CR2=0x880` deaths |
+|---|---|---|
+| stock | present | 0 |
+| this patch | **gone** | 2-4 per boot |
+
+The allocation is not failing for want of RAM: the guest reports **1.2 GiB
+free** throughout, and the deaths persist unchanged at `-m 4G`. Finding which
+`mmap`/`brk` ENOMEM return fires is the work that has to land before this does.

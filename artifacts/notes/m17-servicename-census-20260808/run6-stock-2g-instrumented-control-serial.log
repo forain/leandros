@@ -1,0 +1,166 @@
+[0m[?25l[48;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbi78[?25h[0m[?25l[48;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz4278[?25h
+[?2004l[31merror:[39m command not found: nosuchbinary_xyz42
+[?2004h[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /b78[?25h[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m17-census78[?25h
+[?2004lM17: BEGIN
+MEMINFO boot total=2064769024 free=2026008576 used=38760448 usedpct=1 procs=5 uptime=1
+M17: busd ready after 1s
+M17: wayland-1 after 1s
+MEMINFO wayland1 total=2064769024 free=1975615488 used=89153536 usedpct=4 procs=8 uptime=3
+M17: MARK SETTLE1 45
+[GPU] device features hi=0x00000101 lo=0x30000002
+[GPU] *** host does NOT offer VIRTIO_GPU_F_VIRGL -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_RESOURCE_BLOB -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_CONTEXT_INIT -- 3D/Venus unavailable ***
+[GPU] acked features hi=0x00000001 lo=0x00000002
+[DRM] unimplemented ioctl cmd=0xC00864BF nr=0x000000BF type=0x00000064 size=0x00000008 (reported once per boot)
+[DRM-SRV] mmap token=0x000000000E800000 map_info=0x01 -> writeback
+[DRM-SRV] mmap token=0x000000000F000000 map_info=0x01 -> writeback
+MEMINFO settle1 total=2064769024 free=1196986368 used=867782656 usedpct=42 procs=20 uptime=48
+M17: ENDMARK SETTLE1
+M17: MARK SETTLE2 45
+MEMINFO settle2 total=2064769024 free=1196212224 used=868556800 usedpct=42 procs=20 uptime=93
+M17: ENDMARK SETTLE2
+M17: MARK SETTLE3 45
+MEMINFO settle3 total=2064769024 free=1195450368 used=869318656 usedpct=42 procs=20 uptime=138
+M17: ENDMARK SETTLE3
+M17: ==== BEGIN busd.log ====
+[2m1970-01-01T00:00:01.441821Z[0m [32m INFO[0m [2mbusd[0m[2m:[0m reading configuration file /usr/share/dbus-1/session.conf ...
+[2m1970-01-01T00:00:01.442569Z[0m [32m INFO[0m [2mbusd::bus[0m[2m:[0m Listening on UNIX socket file `/run/user/0/bus`.
+[2m1970-01-01T00:00:07.839134Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.a11y.Bus
+[2m1970-01-01T00:00:07.909999Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.PowerDaemon
+[2m1970-01-01T00:00:08.015926Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicWorkspaces
+[2m1970-01-01T00:00:08.027987Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicAppLibrary
+[2m1970-01-01T00:00:08.375702Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicLauncher
+[2m1970-01-01T00:00:08.377645Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicOnScreenDisplay
+[2m1970-01-01T00:00:08.450921Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.UPower
+[2m1970-01-01T00:00:08.659999Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.locale1
+[2m1970-01-01T00:00:10.127169Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.timedate1
+M17: ==== END busd.log ====
+MEMINFO precensus total=2064769024 free=1195188224 used=869580800 usedpct=42 procs=20 uptime=138
+M17: CENSUS DONE
+M17: MARK PROBE 90
+MEMINFO probe total=2064769024 free=1118531584 used=946237440 usedpct=45 procs=24 uptime=228
+M17: ENDMARK PROBE
+M17: CAPTURES DONE
+M17: ---- probe launcher
+140 /data/m17/p-launcher.log
+1970-01-01T00:02:18.662865Z  INFO cosmic-launcher (com.system76.CosmicLauncher)
+1970-01-01T00:02:18.665537Z  INFO Version: 1.0.12 (release)
+
+M17: ---- end probe launcher
+M17: ---- probe applibrary
+1317 /data/m17/p-applibrary.log
+ INFO  cosmic_app_library > Cosmic App Library (com.system76.CosmicAppLibrary)
+ INFO  cosmic_app_library > Version: 0.1.0
+ INFO  i18n_embed::requester > Current Locale: []
+ INFO  i18n_embed            > Selecting translations for domain "cosmic_app_library"
+ INFO  zbus::connection::handshake::common > write_command; command=Auth(Some(External), Some([48]))
+ INFO  zbus::connection::handshake::common > write_commands; commands=[Auth(Some(External), Some([48]))] extra_bytes=None
+ INFO  tracing::span                       > read_command;
+ INFO  zbus::connection::handshake::common > read_commands; n_commands=1
+ INFO  zbus::connection::handshake::common > write_commands; commands=[NegotiateUnixFD, Begin] extra_bytes=Some([108, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 109, 0, 0, 0, 1, 1, 111, 0, 21, 0, 0, 0, 47, 111, 114, 103, 47, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 47, 68, 66, 117, 
+M17: ---- end probe applibrary
+M17: ---- probe workspaces
+1321 /data/m17/p-workspaces.log
+[1970-01-01T00:02:18Z INFO  i18n_embed::requester] Current Locale: []
+[1970-01-01T00:02:18Z INFO  i18n_embed] Selecting translations for domain "cosmic_workspaces"
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_command; command=Auth(Some(External), Some([48]))
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_commands; commands=[Auth(Some(External), Some([48]))] extra_bytes=None
+[1970-01-01T00:02:18Z INFO  tracing::span] read_command;
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] read_commands; n_commands=1
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_commands; commands=[NegotiateUnixFD, Begin] extra_bytes=Some([108, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 109, 0, 0, 0, 1, 1, 111, 0, 21, 0, 0, 0, 47, 111, 114, 103, 47, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 47, 68, 66, 117, 115, 0, 0, 0, 2,
+M17: ---- end probe workspaces
+M17: ---- probe osd
+1157 /data/m17/p-osd.log
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_command; command=Auth(Some(External), Some([48]))
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_commands; commands=[Auth(Some(External), Some([48]))] extra_bytes=None
+[1970-01-01T00:02:18Z INFO  tracing::span] read_command;
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] read_commands; n_commands=1
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_commands; commands=[NegotiateUnixFD, Begin] extra_bytes=Some([108, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 109, 0, 0, 0, 1, 1, 111, 0, 21, 0, 0, 0, 47, 111, 114, 103, 47, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 47, 68, 66, 117, 115, 0, 0, 0, 2, 1, 115, 0, 20, 0, 0, 0, 111, 114, 103, 46, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 46, 68, 66, 117, 115, 0, 0, 0, 0, 3, 1, 115, 0, 5, 0, 0, 0, 72, 1
+M17: ---- end probe osd
+MEMINFO final total=2064769024 free=1117175808 used=947593216 usedpct=45 procs=24 uptime=228
+M17: ==== BEGIN cosmic.log (tail) ====
+ity_ctx: None, exec: None, minimize_priority: None, requests_wayland_display: None, is_notification_applet: None, shrink_priority: None, shrink_min_size: None, padding_shrinkable: false, auto_popup_hover_press: None }, Mutex { data: "<locked>", poisoned: false, .. }, Center)]
+[2m1970-01-01T00:00:10.685885Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.684852Z\x1b[0m \x1b[32m INFO\x1b[0m Done spawning applets
+[2m1970-01-01T00:00:10.721750Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.719969Z\x1b[0m \x1b[32m INFO\x1b[0m Scale factor changed 1 for as surface in space "Panel" on HDMI-A-1
+[2m1970-01-01T00:00:10.782096Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.781685Z\x1b[0m \x1b[32m INFO\x1b[0m Successfully selected EGL platform: PLATFORM_WAYLAND_KHR
+[2m1970-01-01T00:00:10.826402Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.826133Z\x1b[0m \x1b[32m INFO\x1b[0m EGL Initialized
+[2m1970-01-01T00:00:10.829453Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.826154Z\x1b[0m \x1b[32m INFO\x1b[0m EGL Version: (1, 5)
+[2m1970-01-01T00:00:10.833449Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.826187Z\x1b[0m \x1b[32m INFO\x1b[0m Supported EGL display extensions: EGLExtensions { extensions: ["EGL_EXT_buffer_age", "EGL_EXT_config_select_group", "EGL_EXT_present_opaque", "EGL_EXT_surface_compression", "EGL_EXT_swap_buffers_with_damage", "EGL_KHR_cl_event2", "EGL_KHR_config_attribs", "EGL_KHR_context_flush_control", "EGL_KHR_create_context", "EGL_KHR_create_context_no_error", "EGL_KHR_fence_sync", "EGL_KHR_get_all_proc_addresses", "EGL_KHR_gl_colorspace", "EGL_KHR_gl_renderbuffer_image", "EGL_KHR_gl_texture_2D_image", "EGL_KHR_gl_texture_3D_image", "EGL_KHR_gl_texture_cubemap_image", "EGL_KHR_image_base", "EGL_KHR_no_config_context", "EGL_KHR_reusable_sync", "EGL_KHR_surfaceless_context", "EGL_KHR_swap_buffers_with_damage", "EGL_EXT_pixel_format_float", "EGL_KHR_wait_sync", "EGL_MESA_configless_context", "EGL_MESA_gl_interop", "EGL_MESA_query_driver", "EGL_MESA_x11_native_visual_id", ""], has_fences: true, has_native_fences: false, has_image_base: true, has_import_dmabuf: false, has_import_dmabuf_modifiers: false, has_export_dmabuf: false }
+[2m1970-01-01T00:00:10.835259Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.826370Z\x1b[0m \x1b[33m WARN\x1b[0m Dmabuf import extension not available
+[2m1970-01-01T00:00:10.836866Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.826943Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1megl\x1b[0m\x1b[1m{\x1b[0m\x1b[3mplatform\x1b[0m\x1b[2m=\x1b[0m"PLATFORM_WAYLAND_KHR" \x1b[3mversion\x1b[0m\x1b[2m=\x1b[0m(1, 5)\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1megl_context\x1b[0m\x1b[2m:\x1b[0m Selected color format: PixelFormat { hardware_accelerated: true, color_bits: 24, alpha_bits: 8, depth_bits: 24, stencil_bits: 8, stereoscopy: false, multisampling: None, srgb: false }
+[2m1970-01-01T00:00:10.949227Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.949023Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1megl\x1b[0m\x1b[1m{\x1b[0m\x1b[3mplatform\x1b[0m\x1b[2m=\x1b[0m"PLATFORM_WAYLAND_KHR" \x1b[3mversion\x1b[0m\x1b[2m=\x1b[0m(1, 5)\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1megl_context\x1b[0m\x1b[1m{\x1b[0m\x1b[3mptr\x1b[0m\x1b[2m=\x1b[0m2498823632\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m EGL context created \x1b[3mpriority\x1b[0m\x1b[2m=\x1b[0mNone
+[2m1970-01-01T00:00:10.951130Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.950461Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1megl\x1b[0m\x1b[1m{\x1b[0m\x1b[3mplatform\x1b[0m\x1b[2m=\x1b[0m"PLATFORM_WAYLAND_KHR" \x1b[3mversion\x1b[0m\x1b[2m=\x1b[0m(1, 5)\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1megl_context\x1b[0m\x1b[1m{\x1b[0m\x1b[3mptr\x1b[0m\x1b[2m=\x1b[0m2498823632\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1mrenderer_gles2\x1b[0m\x1b[2m:\x1b[0m Initializing OpenGL ES Renderer
+[2m1970-01-01T00:00:10.952952Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.950484Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1megl\x1b[0m\x1b[1m{\x1b[0m\x1b[3mplatform\x1b[0m\x1b[2m=\x1b[0m"PLATFORM_WAYLAND_KHR" \x1b[3mversion\x1b[0m\x1b[2m=\x1b[0m(1, 5)\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1megl_context\x1b[0m\x1b[1m{\x1b[0m\x1b[3mptr\x1b[0m\x1b[2m=\x1b[0m2498823632\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1mrenderer_gles2\x1b[0m\x1b[2m:\x1b[0m GL Version: "OpenGL ES 3.1 Mesa 25.3.6"
+[2m1970-01-01T00:00:10.956449Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.950503Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1megl\x1b[0m\x1b[1m{\x1b[0m\x1b[3mplatform\x1b[0m\x1b[2m=\x1b[0m"PLATFORM_WAYLAND_KHR" \x1b[3mversion\x1b[0m\x1b[2m=\x1b[0m(1, 5)\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1megl_context\x1b[0m\x1b[1m{\x1b[0m\x1b[3mptr\x1b[0m\x1b[2m=\x1b[0m2498823632\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1mrenderer_gles2\x1b[0m\x1b[2m:\x1b[0m GL Vendor: "Mesa"
+[2m1970-01-01T00:00:10.959999Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.950519Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1megl\x1b[0m\x1b[1m{\x1b[0m\x1b[3mplatform\x1b[0m\x1b[2m=\x1b[0m"PLATFORM_WAYLAND_KHR" \x1b[3mversion\x1b[0m\x1b[2m=\x1b[0m(1, 5)\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1megl_context\x1b[0m\x1b[1m{\x1b[0m\x1b[3mptr\x1b[0m\x1b[2m=\x1b[0m2498823632\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1mrenderer_gles2\x1b[0m\x1b[2m:\x1b[0m GL Renderer: "softpipe"
+[2m1970-01-01T00:00:10.961490Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:10.950536Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1megl\x1b[0m\x1b[1m{\x1b[0m\x1b[3mplatform\x1b[0m\x1b[2m=\x1b[0m"PLATFORM_WAYLAND_KHR" \x1b[3mversion\x1b[0m\x1b[2m=\x1b[0m(1, 5)\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1megl_context\x1b[0m\x1b[1m{\x1b[0m\x1b[3mptr\x1b[0m\x1b[2m=\x1b[0m2498823632\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1mrenderer_gles2\x1b[0m\x1b[2m:\x1b[0m Supported GL Extensions: ["GL_EXT_blend_minmax", "GL_EXT_multi_draw_arrays", "GL_EXT_texture_filter_anisotropic", "GL_EXT_texture_compression_s3tc", "GL_EXT_texture_compression_dxt1", "GL_EXT_texture_compression_rgtc", "GL_EXT_texture_format_BGRA8888", "GL_OES_compressed_ETC1_RGB8_texture", "GL_OES_depth24", "GL_OES_element_index_uint", "GL_OES_fbo_render_mipmap", "GL_OES_mapbuffer", "GL_OES_rgb8_rgba8", "GL_OES_standard_derivatives", "GL_OES_stencil8", "GL_OES_texture_3D", "GL_OES_texture_float", "GL_OES_texture_float_linear", "GL_OES_texture_half_float", "GL_OES_texture_half_float_linear", "GL_OES_texture_npot", "GL_OES_vertex_half_float", "GL_EXT_draw_instanced", "GL_EXT_texture_sRGB_decode", "GL_OES_EGL_image", "GL_OES_depth_texture", "GL_OES_packed_depth_stencil", "GL_EXT_texture_type_2_10_10_10_REV", "GL_NV_conditional_render", "GL_OES_get_program_binary", "GL_APPLE_texture_max_level", "GL_EXT_discard_framebuffer", "GL_EXT_read_format_bgra", "GL_EXT_texture_storage", "GL_NV_pack_subimage", "GL_EXT_frag_depth", "GL_NV_fbo_color_attachments", "GL_OES_EGL_image_external", "GL_OES_EGL_sync", "GL_OES_vertex_array_object", "GL_OES_viewport_array", "GL_ANGLE_pack_reverse_row_order", "GL_ANGLE_texture_compression_dxt3", "GL_ANGLE_texture_compression_dxt5", "GL_EXT_occlusion_query_boolean", "GL_EXT_sRGB", "GL_EXT_texture_rg", "GL_EXT_unpack_subimage", "GL_NV_draw_buffers", "GL_NV_read_buffer", "GL_NV_read_depth", "GL_NV_read_depth_stencil", "GL_NV_read_stencil", "GL_APPLE_sync", "GL_EXT_draw_buffers", "GL_EXT_instanced_arrays", "GL_EXT_map_buffer_range", "GL_EXT_shadow_samplers", "GL_KHR_debug", "GL_KHR_texture_compression_astc_ldr", "GL_NV_generate_mipmap_sRGB", "GL_NV_pixel_buffer_object", "GL_OES_depth_texture_cube_map", "GL_OES_required_internalformat", "GL_OES_surfaceless_context", "GL_EXT_color_buffer_float", "GL_EXT_debug_label", "GL_EXT_sRGB_write_control", "GL_EXT_separate_shader_objects", "GL_EXT_shader_implicit_conversions", "GL_EXT_shader_integer_mix", "GL_EXT_base_instance", "GL_EXT_compressed_ETC1_RGB8_sub_texture", "GL_EXT_copy_image", "GL_EXT_draw_buffers_indexed", "GL_EXT_draw_elements_base_vertex", "GL_EXT_gpu_shader5", "GL_EXT_multi_draw_indirect", "GL_EXT_primitive_bounding_box", "GL_EXT_render_snorm", "GL_EXT_shader_io_blocks", "GL_EXT_texture_border_clamp", "GL_EXT_texture_buffer", "GL_EXT_texture_cube_map_array", "GL_EXT_texture_norm16", "GL_EXT_texture_view", "GL_KHR_context_flush_control", "GL_NV_image_formats", "GL_NV_shader_noperspective_interpolation", "GL_OES_copy_image", "GL_OES_draw_buffers_indexed", "GL_OES_draw_elements_base_vertex", "GL_OES_gpu_shader5", "GL_OES_primitive_bounding_box", "GL_OES_shader_io_blocks", "GL_OES_texture_border_clamp", "GL_OES_texture_buffer", "GL_OES_texture_cube_map_array", "GL_OES_texture_stencil8", "GL_OES_texture_storage_multisample_2d_array", "GL_OES_texture_view", "GL_EXT_blend_func_extended", "GL_EXT_buffer_storage", "GL_EXT_float_blend", "GL_EXT_geometry_point_size", "GL_EXT_geometry_shader", "GL_EXT_texture_sRGB_R8", "GL_EXT_texture_sRGB_RG8", "GL_KHR_no_error", "GL_KHR_texture_compression_astc_sliced_3d", "GL_OES_EGL_image_external_essl3", "GL_OES_geometry_point_size", "GL_OES_geometry_shader", "GL_OES_shader_image_atomic", "GL_EXT_clear_texture", "GL_EXT_clip_cull_distance", "GL_EXT_conservative_depth", "GL_EXT_disjoint_timer_query", "GL_EXT_texture_compression_s3tc_srgb", "GL_MESA_shader_integer_functions", "GL_EXT_clip_control", "GL_EXT_color_buffer_half_float", "GL_EXT_texture_compression_bptc", "GL_EXT_texture_mirror_clamp_to_edge", "GL_KHR_parallel_shader_compile", "GL_EXT_EGL_image_storage", "GL_MESA_framebuffer_flip_y", "GL_EXT_depth_clamp", "GL_EXT_texture_query_lod", "GL_MESA_sampler_objects", "GL_EXT_EGL_image_storage_compression", "GL_EXT_texture_storage_compression", "GL_MESA_bgra", ""]
+[2m1970-01-01T00:00:11.142255Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:11.141961Z\x1b[0m \x1b[32m INFO\x1b[0m Scale factor changed 1 for as surface in space "Dock" on HDMI-A-1
+[2m1970-01-01T00:00:11.143424Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:11.142048Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1megl\x1b[0m\x1b[1m{\x1b[0m\x1b[3mplatform\x1b[0m\x1b[2m=\x1b[0m"PLATFORM_WAYLAND_KHR" \x1b[3mversion\x1b[0m\x1b[2m=\x1b[0m(1, 5)\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1megl_context\x1b[0m\x1b[2m:\x1b[0m Selected color format: PixelFormat { hardware_accelerated: true, color_bits: 24, alpha_bits: 8, depth_bits: 24, stencil_bits: 8, stereoscopy: false, multisampling: None, srgb: false }
+[2m1970-01-01T00:00:11.280942Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:11.280747Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1megl\x1b[0m\x1b[1m{\x1b[0m\x1b[3mplatform\x1b[0m\x1b[2m=\x1b[0m"PLATFORM_WAYLAND_KHR" \x1b[3mversion\x1b[0m\x1b[2m=\x1b[0m(1, 5)\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1megl_context\x1b[0m\x1b[1m{\x1b[0m\x1b[3mptr\x1b[0m\x1b[2m=\x1b[0m2498859808\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m EGL context created \x1b[3mpriority\x1b[0m\x1b[2m=\x1b[0mNone
+[2m1970-01-01T00:00:11.493151Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mNo valid locale found in environment, using fallback\x1b[0m
+[2m1970-01-01T00:00:11.504179Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/localize.rs:69 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:11.505779Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:11.511244Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mrescan_tab Entity(1v1) Desktop("/root/Desktop", "", DesktopConfig { grid_spacing: 100, icon_size: 100, show_content: true, show_mounted_drives: false, show_trash: false }) None\x1b[0m
+[2m1970-01-01T00:00:11.512939Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/app.rs:1512 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:11.515196Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:11.520832Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to read directory /root/Desktop: No such file or directory (os error 2)\x1b[0m
+[2m1970-01-01T00:00:11.524067Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/tab.rs:1086 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:11.526270Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:11.528241Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to get item for /root/Desktop: failed to read metadata for /root/Desktop: No such file or directory (os error 2)\x1b[0m
+[2m1970-01-01T00:00:11.530026Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/tab.rs:1611 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:11.536088Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:11.546038Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mSystem theme: None\x1b[0m
+[2m1970-01-01T00:00:11.546575Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/iced/winit/src/lib.rs:843 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:11.546633Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:11.555210Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mSCTK setup complete.\x1b[0m
+[2m1970-01-01T00:00:11.555291Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/iced/winit/src/platform_specific/wayland/event_loop/mod.rs:465 \x1b[2;3mon\x1b[0m 
+[2m1970-01-01T00:00:11.555381Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:11.571777Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:11.576585Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:11.592516Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mcould not find any valid trash bins to watch: Unknown { description: "The 'home trash' either does not exist or is not a directory (or a link pointing to a dir)" }\x1b[0m
+[2m1970-01-01T00:00:11.592552Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/app.rs:6864 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:11.592576Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:11.690248Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:11.689689Z\x1b[0m \x1b[32m INFO\x1b[0m Cell { value: None }
+[2m1970-01-01T00:00:11.690639Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:11.689720Z\x1b[0m \x1b[32m INFO\x1b[0m Cell { value: None }
+[2m1970-01-01T00:00:11.692154Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:11.692036Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[1mstderr\x1b[0m\x1b[1m{\x1b[0m\x1b[3mclient\x1b[0m\x1b[2m=\x1b[0mInnerClientId { ptr: 0x94f14bb0, alive: true }\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m com.system76.CosmicAppletTime: leandros-applet: entering event loop
+[2m1970-01-01T00:00:11.692182Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:11.692059Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[1mstderr\x1b[0m\x1b[1m{\x1b[0m\x1b[3mclient\x1b[0m\x1b[2m=\x1b[0mInnerClientId { ptr: 0x94f14bb0, alive: true }\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m com.system76.CosmicAppletTime: leandros-applet: tick: 1000ms
+[2m1970-01-01T00:00:11.710976Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:11.710109Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[1mstderr\x1b[0m\x1b[1m{\x1b[0m\x1b[3mclient\x1b[0m\x1b[2m=\x1b[0mInnerClientId { ptr: 0x94f14bb0, alive: true }\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m com.system76.CosmicAppletTime: leandros-applet: committed 220x32 clock
+[2m1970-01-01T00:00:11.715285Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:11.713346Z\x1b[0m \x1b[32m INFO\x1b[0m Requires relayout: resizing list
+[2m1970-01-01T00:00:11.715486Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m 
+[2m1970-01-01T00:00:11.715679Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m Stack backtrace:
+[2m1970-01-01T00:00:11.715704Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    0: <unknown>
+[2m1970-01-01T00:00:11.715803Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    1: <unknown>
+[2m1970-01-01T00:00:11.715886Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    2: <unknown>
+[2m1970-01-01T00:00:11.716019Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    3: <unknown>
+[2m1970-01-01T00:00:11.716138Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    4: <unknown>
+[2m1970-01-01T00:00:11.716368Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    5: <unknown>
+[2m1970-01-01T00:00:11.716651Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    6: <unknown>
+[2m1970-01-01T00:00:11.716943Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    7: <unknown>
+[2m1970-01-01T00:00:11.717282Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:11.715304Z\x1b[0m \x1b[32m INFO\x1b[0m Cell { value: None }
+[2m1970-01-01T00:00:11.777203Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32moutput wl_output@39: created\x1b[0m
+[2m1970-01-01T00:00:11.777240Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/app.rs:5258 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:11.777316Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:11.780619Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to locate desktop directory, falling back to /root/Desktop\x1b[0m
+[2m1970-01-01T00:00:11.780642Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/lib.rs:50 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:11.780723Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:11.781774Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mrescan_tab Entity(2v1) Desktop("/root/Desktop", "HDMI-A-1", DesktopConfig { grid_spacing: 100, icon_size: 100, show_content: true, show_mounted_drives: false, show_trash: false }) None\x1b[0m
+[2m1970-01-01T00:00:11.781803Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/app.rs:1512 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:11.781827Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:11.783016Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to read directory /root/Desktop: No such file or directory (os error 2)\x1b[0m
+[2m1970-01-01T00:00:11.785071Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/tab.rs:1086 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:11.786770Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:11.788459Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to get item for /root/Desktop: failed to read metadata for /root/Desktop: No such file or directory (os error 2)\x1b[0m
+[2m1970-01-01T00:00:11.790020Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/tab.rs:1611 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:11.791535Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:11.793449Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[31mERROR\x1b[0m  \x1b[31mOverlap notify subscription cannot be created for surface. No matching layer surface found.\x1b[0m
+[2m1970-01-01T00:00:11.795019Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/iced/winit/src/platform_specific/wayland/event_loop/state.rs:1678 \x1b[2;3mon\x1b[0m 
+[2m1970-01-01T00:00:11.796649Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:02:18.752867Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:02:18.821016Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:02:18.823190Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:02:18.826414Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+
+M17: ==== END cosmic.log ====
+M17: DONE
+[?2004h[0m[?25l[1;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h
