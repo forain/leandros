@@ -65,6 +65,7 @@ high-water mark — at most `LIVE_BUCKETS` lines, because the mark only rises.
 | B | ServiceUnknown | 64 | 64/64 during startup | **1** | **1, then the session wedged** | absent |
 | C | ServiceUnknown | 512 | **84/512** | 0 | **0** | present, clock ticking |
 | D (final, flags `false`) | ServiceUnknown | 512 | not traced | 0 | **0** | present in all 9 shots |
+| E (the committed build, byte for byte) | ServiceUnknown | 512 | not traced | 0 | **0** | present, and a component draws a window |
 
 **A stock session was already living three ports from the ceiling.** That is the
 whole finding. Unblocking four more multithreaded iced components — which is exactly
@@ -145,6 +146,12 @@ and its ticking clock across all nine screenshots, takes **0** faults, **0**
 `Out of memory (os error 12)`, and still prints `Another instance is running` /
 `Successfully activated another instance` — so single-instance behaviour is preserved
 and the four components own their APP_IDs.
+
+Run E is run D repeated against the exact source that was committed, because D was
+taken before a tidying pass moved the occupancy scan behind `PORT_STATS`. Same
+result, and at `probe-t45` non-background coverage drops 0.971 -> 0.469 with a
+66,320-pixel change and **stays there** through `probe-t84` — a hand-started
+component drawing a window and keeping it.
 
 The session also reaches names it never used to: `org.freedesktop.portal.Desktop` x6
 and `org.freedesktop.login1` appear in the census only with the patch, and at
