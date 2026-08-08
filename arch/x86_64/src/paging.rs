@@ -102,6 +102,31 @@ fn pat_wc_ready() -> bool {
 #[inline]
 fn pat_wc_ready() -> bool { false }
 
+/// Cacheability bits for a leaf 4 KiB PTE over a large surface the CPU only
+/// ever writes in bulk — the framebuffer.
+///
+/// Returns Write Combining (PAT|PWT, index 0b101 = PA5) once `init_pat_bsp` has
+/// confirmed PA5 really is WC, and PCD/UC- otherwise. Both are uncached, so the
+/// surface stays coherent with the scanout with no cache maintenance; the
+/// difference is that WC lets the CPU merge adjacent stores into burst writes,
+/// and UC- forbids it. That matters because the console's cost is bulk pixel
+/// movement, not individual pixels: a full-screen scroll copies the entire
+/// surface, and under UC- every 4 bytes of it is a separate bus transaction.
+///
+/// WC is weakly ordered, so a caller that publishes the surface to a device
+/// must fence first — `framebuffer::fb_flush` does.
+///
+/// This is deliberately not `translate_flags`: that takes `mm::PageFlags` and
+/// serves the general mapping path, while `arch::init` builds the framebuffer
+/// mapping from raw `PageTableFlags` before that machinery is available.
+pub fn fb_cacheability_flags() -> PageTableFlags {
+    if pat_wc_ready() {
+        PageTableFlags::PAT_4K | PageTableFlags::WRITE_THROUGH
+    } else {
+        PageTableFlags::NO_CACHE
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 unsafe fn rdmsr(msr: u32) -> u64 {
     let lo: u32;

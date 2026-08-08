@@ -29,12 +29,19 @@ bitflags! {
         /// zero. An undefined attribute byte of 0x00 is Device-nGnRnE, so
         /// both ATTR_NOCACHE (index 3) and ATTR_DEV (index 1, above) select
         /// Device-nGnRnE, not Normal-NC and not Device-nGnRE respectively.
-        /// The framebuffer has therefore always been Device memory — it
-        /// works, and it is left alone. `mmu::enable_identity` installs the
-        /// only attribute this kernel actually defines, index 2 = 0x44
-        /// (Normal Inner/Outer Non-cacheable), via a read-modify-write over
-        /// this same flat MAIR_EL1 before `arch::init` maps anything. Use
-        /// ATTR_NORMAL_NC for anything that needs non-cached *Normal* memory.
+        /// `mmu::enable_identity` installs the only attribute this kernel
+        /// actually defines, index 2 = 0x44 (Normal Inner/Outer Non-cacheable),
+        /// via a read-modify-write over this same flat MAIR_EL1 before
+        /// `arch::init` maps anything. Use ATTR_NORMAL_NC for anything that
+        /// needs non-cached *Normal* memory.
+        ///
+        /// The framebuffer used to be mapped with this and was therefore Device
+        /// memory, which is correct-but-ruinous for a surface whose cost is bulk
+        /// pixel movement — Device-nGnRnE forbids the CPU from merging even two
+        /// adjacent pixel stores. It is ATTR_NORMAL_NC now; see `lib.rs`'s
+        /// framebuffer mapping. Nothing else selects index 3 any more, so this
+        /// constant is retained for the MAIR archaeology above rather than for
+        /// any caller.
         const ATTR_NOCACHE = 3 << 2;
         /// Non-secure access.
         const NS        = 1 << 5;

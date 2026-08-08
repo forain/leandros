@@ -83,6 +83,34 @@ enum EscState {
 
 pub struct Framebuffer {
     base:   *mut u32,
+    /// Write-back copy of the surface that all drawing goes to, blitted to
+    /// `base` a dirty rectangle at a time by [`fb_flush`]. Null before
+    /// [`Framebuffer::alloc_shadow`] succeeds (or if it cannot), in which case
+    /// drawing falls back to `base` directly.
+    ///
+    /// The framebuffer is uncached — necessarily, since the scanout reads it
+    /// without participating in cache coherency. Uncached *stores* can at least
+    /// be made to burst (that is what the Write Combining / Normal-NC mapping in
+    /// each `arch::init` buys). Uncached *loads* cannot: no line fill, no
+    /// prefetch, one transaction per access. And the console's dominant
+    /// operation reads the surface — `scroll_px` copies it onto itself.
+    ///
+    /// Measured on x86_64/KVM at 1920x1080x4 (8.29 MB): `ls -l /bin` took ~40 s
+    /// with the copy running on the framebuffer, and scaling `SCROLL_ROWS` from
+    /// 8 to 32 cut it to ~6.9 s — i.e. cost tracked scroll count almost exactly,
+    /// so the scroll was essentially the whole bill. Making the mapping WC moved
+    /// it only 40 s → 38.7 s, because that only accelerated the copy's write
+    /// half.
+    ///
+    /// With the shadow, that copy is an ordinary cached memmove and the surface
+    /// is never read at all — only written, sequentially, in the mode the
+    /// mapping is now good at.
+    shadow: *mut u32,
+    /// Buddy allocation backing `shadow`, kept for the free that never happens
+    /// (the console lives for the life of the kernel) but which a future
+    /// mode-set path will need.
+    shadow_phys: usize,
+    shadow_order: usize,
     width:  usize,
     height: usize,
     pitch:  usize, // bytes per row
@@ -121,6 +149,9 @@ impl Framebuffer {
     pub const fn new() -> Self {
         Self {
             base:   core::ptr::null_mut(),
+            shadow: core::ptr::null_mut(),
+            shadow_phys: 0,
+            shadow_order: 0,
             width:  0,
             height: 0,
             pitch:  0,
@@ -135,6 +166,64 @@ impl Framebuffer {
             fg: 0xFFFFFF,
             saved_cursor: (0, 0),
             dirty: None,
+        }
+    }
+
+    /// Where drawing goes: the write-back shadow when there is one, the raw
+    /// framebuffer otherwise. Every pixel write in this file must go through
+    /// this — writing `base` directly bypasses the shadow and the next blit
+    /// overwrites it.
+    #[inline]
+    fn surface(&self) -> *mut u32 {
+        if self.shadow.is_null() { self.base } else { self.shadow }
+    }
+
+    /// Back this console with a write-back shadow sized to the current mode.
+    ///
+    /// Best-effort: if the buddy allocator cannot satisfy it (or has not been
+    /// brought up yet), the console keeps drawing straight to the framebuffer,
+    /// which is exactly the behaviour that shipped before the shadow existed.
+    /// Never allocates twice for the same geometry.
+    fn alloc_shadow(&mut self) {
+        let bytes = self.pitch * self.height;
+        if bytes == 0 || self.base.is_null() { return; }
+        if !self.shadow.is_null() {
+            if (1usize << self.shadow_order) * 4096 >= bytes { return; }
+            mm::buddy::free(self.shadow_phys, self.shadow_order);
+            self.shadow = core::ptr::null_mut();
+        }
+        let pages = (bytes + 4095) / 4096;
+        let mut order = 0;
+        while (1usize << order) < pages { order += 1; }
+        if let Some(phys) = mm::buddy::alloc(order) {
+            self.shadow_phys = phys;
+            self.shadow_order = order;
+            self.shadow = mm::phys_to_virt(phys) as *mut u32;
+            // Start from the surface's current contents rather than black, so
+            // enabling the shadow mid-session does not blank what boot already
+            // painted. This is the one read of the framebuffer that remains, and
+            // it happens once.
+            unsafe { core::ptr::copy_nonoverlapping(self.base, self.shadow, bytes / 4); }
+        }
+    }
+
+    /// Copy one dirty rectangle from the shadow into the real framebuffer.
+    ///
+    /// No-op when there is no shadow — drawing already went straight to `base`.
+    /// Row by row rather than one call, because the rectangle is a sub-span of
+    /// each row and the rows are `pitch` apart.
+    fn blit_to_framebuffer(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        if self.shadow.is_null() || self.base.is_null() { return; }
+        let stride = self.pitch / 4;
+        for row in y..(y + h).min(self.height) {
+            let off = row * stride + x;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.shadow.add(off),
+                    self.base.add(off),
+                    w.min(self.width.saturating_sub(x)),
+                );
+            }
         }
     }
 
@@ -168,9 +257,10 @@ impl Framebuffer {
 
     pub fn set_pixel(&mut self, x: usize, y: usize, color: u32) {
         if x < self.width && y < self.height {
+            let dst = self.surface();
             unsafe {
                 let offset = y * (self.pitch / 4) + x;
-                self.base.add(offset).write_volatile(color);
+                dst.add(offset).write_volatile(color);
             }
             self.mark_dirty(x, y, 1, 1);
         }
@@ -179,14 +269,15 @@ impl Framebuffer {
     pub fn clear(&mut self, color: u32) {
         if self.base.is_null() { return; }
         let total_words = self.height * (self.pitch / 4);
+        let dst = self.surface();
         if color == 0 {
             unsafe {
-                core::ptr::write_bytes(self.base, 0, total_words);
+                core::ptr::write_bytes(dst, 0, total_words);
             }
         } else {
             unsafe {
                 for i in 0..total_words {
-                    self.base.add(i).write_volatile(color);
+                    dst.add(i).write_volatile(color);
                 }
             }
         }
@@ -369,9 +460,10 @@ impl Framebuffer {
         let y1 = (y + h).min(self.height);
         if x >= x1 || y >= y1 { return; }
         let stride = self.pitch / 4;
+        let dst = self.surface();
         unsafe {
             for yy in y..y1 {
-                let row = self.base.add(yy * stride);
+                let row = dst.add(yy * stride);
                 for xx in x..x1 { row.add(xx).write_volatile(color); }
             }
         }
@@ -615,24 +707,28 @@ impl Framebuffer {
     /// Shift the surface up by `shift_px` pixel rows and blank what that
     /// exposes at the bottom.
     ///
-    /// This is the console's whole cost. The copy reads and writes the entire
-    /// surface through the framebuffer mapping, and `mark_dirty` over the whole
-    /// screen then makes the next character re-transmit all of it to the host,
-    /// so its price is paid per scroll and is independent of how much text
-    /// caused it. Scrolling by more than one row at a time is what makes it
-    /// affordable — see [`SCROLL_ROWS`].
+    /// This used to be the console's whole cost, because the copy both read and
+    /// wrote the surface through the uncached framebuffer mapping. It now runs
+    /// against the write-back shadow (see [`Framebuffer::shadow`]), so it is an
+    /// ordinary cached memmove; what reaches the framebuffer is the blit in
+    /// [`fb_flush`], which only ever writes.
+    ///
+    /// It still dirties the whole screen — every pixel really did move — so a
+    /// scroll still costs one full-surface blit and one full-surface transfer.
+    /// That is why [`SCROLL_ROWS`] still advances several rows at a time.
     fn scroll_px(&mut self, shift_px: usize) {
         if self.base.is_null() || shift_px == 0 || shift_px >= self.height { return; }
         let words_per_row = self.pitch / 4;
         let rows_to_copy = self.height - shift_px;
+        let dst = self.surface();
         unsafe {
             core::ptr::copy(
-                self.base.add(shift_px * words_per_row),
-                self.base,
+                dst.add(shift_px * words_per_row),
+                dst,
                 rows_to_copy * words_per_row,
             );
             core::ptr::write_bytes(
-                self.base.add(rows_to_copy * words_per_row),
+                dst.add(rows_to_copy * words_per_row),
                 0,
                 shift_px * words_per_row,
             );
@@ -826,25 +922,97 @@ pub fn fb_console_size() -> Option<(usize, usize)> {
     Some((fb.cols(), fb.rows()))
 }
 
+/// Nesting depth of [`FlushBatch`]. Non-zero means "a caller is mid-burst;
+/// accumulate into the dirty box and transfer once at the end".
+static FLUSH_DEFER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Suppresses [`fb_flush`] for the lifetime of the guard, then flushes once.
+///
+/// Each flush is two *synchronous* virtqueue round-trips — TRANSFER_TO_HOST_2D
+/// then RESOURCE_FLUSH, each allocating and freeing buddy pages, ringing the
+/// notify register (a VM exit) and spinning until the host posts a used-ring
+/// entry. `serial_write_byte` pays that per byte, so an 80-column line of `ls`
+/// output cost 160 round-trips to deliver 80 characters.
+///
+/// The dirty region is a bounding box that already accumulates across
+/// characters, so deferring changes nothing about what gets transferred for a
+/// left-to-right run of text — the box after 80 characters is the same box, one
+/// text row tall. It only stops re-transferring the growing prefix 80 times.
+///
+/// Hold this around a whole `write()` worth of output, not longer: the point at
+/// which it drops is the point at which the user sees the text.
+pub struct FlushBatch(());
+
+impl FlushBatch {
+    /// Begin deferring. Nests, so an inner batch does not flush early.
+    pub fn new() -> Self {
+        FLUSH_DEFER.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        FlushBatch(())
+    }
+}
+
+impl Drop for FlushBatch {
+    fn drop(&mut self) {
+        // Drop-based so an early return or a panic mid-burst cannot strand the
+        // counter above zero and silence the console permanently.
+        if FLUSH_DEFER.fetch_sub(1, core::sync::atomic::Ordering::SeqCst) == 1 {
+            fb_flush();
+        }
+    }
+}
+
 /// Flush the kernel framebuffer to the GPU if present.
 ///
 /// Drops the KERNEL_FB lock before acquiring VIRTIO_GPU to avoid lock-order
 /// inversions.  Skips the call if dimensions are still zero (framebuffer not
 /// yet initialised) so that set_scanout(1, 0, 0) is never sent to the host.
+///
+/// A no-op while a [`FlushBatch`] is live; that guard flushes on drop.
 #[no_mangle]
 pub fn fb_flush() {
+    if FLUSH_DEFER.load(core::sync::atomic::Ordering::SeqCst) != 0 { return; }
     // Pull (and clear) the changed region under the KERNEL_FB lock, then release
     // it before taking the VIRTIO_GPU lock to preserve lock ordering.
     let rect = {
         let mut fb = KERNEL_FB.lock();
         if fb.width == 0 || fb.height == 0 { return; }
-        fb.take_dirty()
+        let rect = fb.take_dirty();
+        // Push the changed rows out of the shadow while still holding the lock,
+        // so a concurrent writer cannot alter them between the blit and the
+        // transfer below. Pure sequential stores into the framebuffer — the one
+        // access pattern an uncached-but-write-combining mapping is good at, and
+        // the reason `scroll_px` no longer touches it at all.
+        if let Some((x, y, w, h)) = rect {
+            fb.blit_to_framebuffer(x, y, w, h);
+        }
+        rect
     };
     if let Some((x, y, w, h)) = rect {
+        publish_pixels();
         if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
             gpu.flush(1, x as u32, y as u32, w as u32, h as u32);
         }
     }
+}
+
+/// Order every pixel store issued so far ahead of the doorbell that tells the
+/// device to go read them.
+///
+/// The framebuffer is mapped Write Combining on x86_64 and Normal
+/// Inner/Outer Non-cacheable on AArch64 (see each `arch::init`). Both are
+/// uncached — no cache maintenance is needed and none is done here — but unlike
+/// the strongly-ordered Device/UC- mappings they replaced, both are *weakly
+/// ordered*: stores may sit in a write-combining buffer and may be observed out
+/// of order. Without this fence the `TRANSFER_TO_HOST_2D` below can race the
+/// pixels it is meant to transfer, and the host reads a partially written
+/// surface — which shows up as torn or stale rectangles, not as a hang.
+#[inline]
+fn publish_pixels() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::asm!("sfence", options(nostack, nomem, preserves_flags)); }
+    #[cfg(target_arch = "aarch64")]
+    unsafe { core::arch::asm!("dsb sy", options(nostack, nomem, preserves_flags)); }
 }
 
 /// Initialize the kernel-space framebuffer console.
@@ -855,7 +1023,12 @@ pub unsafe fn init_kernel_fb(base: *mut u32, width: usize, height: usize, pitch:
     fb.height = height;
     fb.pitch = pitch;
     fb.init_vector_font(); // Initialize vector font
+    fb.alloc_shadow();
     fb.clear(0);
+    // `clear` only painted the shadow; put those pixels on screen now rather
+    // than leaving whatever the bootloader left there until the first write.
+    let (w, h) = (fb.width, fb.height);
+    fb.blit_to_framebuffer(0, 0, w, h);
 }
 
 /// Initialize the kernel-space framebuffer console without clearing screen.
@@ -866,7 +1039,9 @@ pub unsafe fn update_kernel_fb(base: *mut u32, width: usize, height: usize, pitc
     fb.height = height;
     fb.pitch = pitch;
     fb.init_vector_font(); // Initialize vector font
-    // Don't clear - preserve existing content
+    // Don't clear - preserve existing content. `alloc_shadow` seeds itself from
+    // the current surface, so the existing content survives into the shadow too.
+    fb.alloc_shadow();
 }
 
 /// Text rows the console advances per scroll, rather than one.

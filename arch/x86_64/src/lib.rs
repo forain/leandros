@@ -66,15 +66,25 @@ pub fn init(info: &boot::BootInfo) {
             paging::PageTableFlags::PRESENT | paging::PageTableFlags::WRITABLE | paging::PageTableFlags::NO_CACHE);
 
         // Also map the framebuffer if present, as Limine might not have mapped it in HHDM.
+        //
+        // Write Combining rather than the NO_CACHE (PCD/UC-) this used to use.
+        // Both are uncached and equally coherent with the scanout, but UC-
+        // forbids merging stores, and the console moves pixels in bulk: a
+        // full-screen scroll copies the whole surface, so at 1920x1080x4 that is
+        // ~2.07M writes that under UC- cannot combine with their neighbours.
+        // `init_pat_bsp` ran at the top of this function and falls back to UC-
+        // on a CPU that will not confirm WC, so this is never worse.
         if info.framebuffer_base != 0 {
             let fb_size = info.framebuffer_pitch as usize * info.framebuffer_height as usize;
             let num_pages = (fb_size + 4095) / 4096;
+            let fb_flags = paging::PageTableFlags::PRESENT
+                | paging::PageTableFlags::WRITABLE
+                | paging::fb_cacheability_flags();
             for i in 0..num_pages {
                 let offset = i * 4096;
                 let virt = info.framebuffer_base as usize + info.hhdm_offset as usize + offset;
                 let phys = info.framebuffer_base as usize + offset;
-                if !paging::map_4k(root, virt, phys,
-                    paging::PageTableFlags::PRESENT | paging::PageTableFlags::WRITABLE | paging::PageTableFlags::NO_CACHE) {
+                if !paging::map_4k(root, virt, phys, fb_flags) {
                     // This might happen if we hit a huge page that we can't split yet.
                 }
             }

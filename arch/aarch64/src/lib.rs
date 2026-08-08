@@ -120,8 +120,29 @@ pub fn init(boot_info: &boot::BootInfo) {
             let fb_size = effective_pitch * boot_info.framebuffer_height as usize;
             let fb_end_phys = (boot_info.framebuffer_base as usize + fb_size + 4095) & !4095;
             let num_pages = (fb_end_phys - fb_start_phys) / 4096;
-            let fb_flags = paging::PageDescFlags::VALID | paging::PageDescFlags::AF | paging::PageDescFlags::INNER_SHR | paging::PageDescFlags::ATTR_NOCACHE;
-            
+            // ATTR_NORMAL_NC, not ATTR_NOCACHE. The latter selects MAIR index 3,
+            // which on both boot paths is an undefined (0x00) attribute byte —
+            // i.e. Device-nGnRnE, the strictest type the architecture has: no
+            // Gathering, no Reordering, no Early write acknowledgement. Under it
+            // every 4-byte pixel store is an individual non-posted bus
+            // transaction the CPU may not merge with its neighbour, and the
+            // console's whole cost is bulk pixel movement: a full-screen scroll
+            // `core::ptr::copy`s the surface through this mapping, so at
+            // 1920x1080x4 it pays ~2.07M reads plus ~2.07M writes that cannot
+            // combine, and a single glyph cell pays ~150 more.
+            //
+            // Index 2 is Normal Inner/Outer Non-cacheable (0x44), installed by
+            // `mmu::enable_identity` — which runs at the top of `init`, before
+            // this maps anything. Normal-NC is still uncached, so the surface
+            // stays coherent with the host/scanout with no cache maintenance,
+            // but it permits gathering and reordering, which lets those same
+            // copies issue as wide combined bursts.
+            //
+            // Normal memory is buffered, so writes are no longer implicitly
+            // ordered against the virtio-gpu doorbell that publishes them; the
+            // transfer path takes a `dsb` for that (see `framebuffer::fb_flush`).
+            let fb_flags = paging::PageDescFlags::VALID | paging::PageDescFlags::AF | paging::PageDescFlags::INNER_SHR | paging::PageDescFlags::ATTR_NORMAL_NC;
+
             crate::uart::serial_print_str("[ARCH] Mapping framebuffer 0x");
             crate::uart::print_hex(boot_info.framebuffer_base as usize);
             crate::uart::serial_print_str(" size=0x");

@@ -122,10 +122,14 @@ pub extern "C" fn serial_write_byte(b: u8) {
     
     if !IN_WRITE.swap(true, core::sync::atomic::Ordering::SeqCst) {
         drivers::framebuffer::fb_putc(b);
-        // fb_flush only transfers the dirty region (typically a single character
-        // cell), so flushing per character is cheap and keeps the shell prompt
-        // and typed input visible.  On x86 the framebuffer is a host-visible
-        // linear surface and fb_flush is a no-op.
+        // Flushing here is what keeps a lone character — a shell prompt, a
+        // keystroke echo — visible without waiting for a newline. It is NOT
+        // cheap: each call is two synchronous virtqueue round-trips to the host.
+        // Callers that already hold a whole buffer take a
+        // `framebuffer::FlushBatch` so this collapses to one flush per write()
+        // instead of one per byte; see `serial_print` and `serial_write_raw`.
+        // On x86 the framebuffer is a host-visible linear surface and fb_flush
+        // is a no-op.
         drivers::framebuffer::fb_flush();
         IN_WRITE.store(false, core::sync::atomic::Ordering::SeqCst);
     }
@@ -230,6 +234,7 @@ pub extern "C" fn serial_print(s: *const u8, len: usize) {
     }
     let bytes = unsafe { core::slice::from_raw_parts(s, len) };
     with_console_lock(|| {
+        let _batch = drivers::framebuffer::FlushBatch::new();
         for &b in bytes {
             serial_write_byte(b);
         }
@@ -243,6 +248,7 @@ pub extern "C" fn serial_print_str_raw(s: *const u8, len: usize) {
 
 pub fn serial_print_str(msg: &str) {
     with_console_lock(|| {
+        let _batch = drivers::framebuffer::FlushBatch::new();
         for &b in msg.as_bytes() { serial_write_byte(b); }
     });
 }
@@ -251,6 +257,7 @@ pub fn serial_print_str(msg: &str) {
 /// themselves — `console_write_user` does, and must not re-enter it here
 /// (`spin::Mutex` is not reentrant).
 pub fn serial_write_raw(bytes: &[u8]) {
+    let _batch = drivers::framebuffer::FlushBatch::new();
     for &b in bytes { serial_write_byte(b); }
 }
 
