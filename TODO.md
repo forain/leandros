@@ -1001,7 +1001,7 @@ matching whatever `libinput_udev_assign_seat` is called with (`seat0`), or libin
 them. **Input to a compositor has never once been demonstrated in this project** — M4's
 original mission was exactly this and it died at PRIME/dmabuf before any client saw an event.
 
-### 7. Every libcosmic app blocks in a D-Bus call before it ever renders
+### 7. Every libcosmic app blocks in a D-Bus call before it ever renders -- FIXED, patch landed
 
 **ROOT-CAUSED AND PHOTOGRAPHED, aarch64, 2026-08-08. The toolkit was never the problem, and
 the item as written was wrong in every clause but the pixel count.** Evidence, raw logs and
@@ -1057,58 +1057,95 @@ so `2>` alone captures nothing; and `EnvFilter::from_default_env()` with `RUST_L
 enables **ERROR only**, so the `warn!` is invisible unless `RUST_LOG` is exported *before* busd
 starts.
 
-**THE SERVICEUNKNOWN PATCH IS CORRECT, WORKS, AND IS STILL NOT LANDABLE.** It is preserved,
-unapplied, at `ports/busd/proposed/service-unknown-reply.patch` (`build.sh` globs `*.patch` in
-`ports/busd` only, so `proposed/` is deliberately outside it). It does exactly what it was
-written to do, and the proof is an exit status rather than a log line: with it staged, a
-hand-started second `cosmic-launcher` prints `Successfully activated another instance` /
-`Another instance is running` and **exits 0**, which is reachable only if the *autostarted*
-copy got through the same probe, owns `com.system76.CosmicLauncher` and is serving
-`DbusActivation`. Single-instance behaviour is preserved, which is the thing
-`COSMIC_SINGLE_INSTANCE=false` would throw away. The census corroborates it from the other
-side: the patched session reaches names the stock one never reaches
-(`org.freedesktop.portal.Desktop` x6, `org.freedesktop.login1`).
+**THE SERVICEUNKNOWN PATCH IS LANDED, 2026-08-08, x86_64/KVM.** It now lives at
+`ports/busd/service-unknown-reply.patch`, inside `build.sh`'s `*.patch` glob. Evidence:
+`artifacts/notes/m18-enomem-port-table-20260808/` (`artifacts/m18_regress.py`,
+`artifacts/m18_repro.py`, plus the inherited `artifacts/m17_census.py`).
 
-**What blocks it is downstream of busd and is now attributed by a control.** With the patch the
-panel bar and its ticking clock disappear and 2-4 processes per boot die on a null dereference
-at `CR2=0x880` — the *exact* aarch64 signature (`xkb_context_new` returning NULL on a failed
-allocation, wrapped without a null check by the `xkbcommon` crate, handed straight through by
-SCTK at `wl_keyboard` bind), now reproduced on x86_64. `cosmic-files-applet` is one of the
-dying processes by name; `launch_pad` restarts it. Held constant across the pair **including
-the kernel**, with the busd binary as the only image delta:
+The patch was always correct and the proof was always an exit status rather than a log
+line: with it applied a hand-started second `cosmic-launcher` prints `Successfully
+activated another instance` / `Another instance is running` and **exits 0**, reachable
+only if the *autostarted* copy got through the same probe, owns
+`com.system76.CosmicLauncher` and is serving `DbusActivation`. Single-instance behaviour
+is preserved — the thing `COSMIC_SINGLE_INSTANCE=false` throws away. The census
+corroborates it: the patched session reaches `org.freedesktop.portal.Desktop` x6 and
+`org.freedesktop.login1`, names the stock one never reaches, and at `probe-t45` a
+**16,509-pixel** region changes with non-background coverage moving 0.971 → 0.859 — a
+hand-started component drawing a window.
 
-| busd | panel bar + clock | `CR2=0x880` deaths |
-|---|---|---|
-| stock | present, ticking | **0** |
-| ServiceUnknown | **gone** | **2-4** |
+**WHAT WAS BLOCKING IT WAS 64 IPC PORTS, AND THE RECORDED PROXIMATE CAUSE WAS WRONG.**
+`ipc::port::LIVE_BUCKETS` was 64 — the real ceiling on live ports for the whole system,
+since `MAX_PORTS` (65536) only bounds the ID namespace. Every task that reaches a server
+through `servers::vfs::call_port` takes one bucket as its reply port and holds it until
+the task exits, and `call_port` is on the path of **every** operation on a mounted
+filesystem: `open`, `stat`, `getdents64`, and the `execve` that opens the binary. The
+consumers are **threads**, not processes, which is why `procs=20` looked like headroom.
 
-**The recorded memory hypothesis is REFUTED, and that is the durable finding.** The story was
-"four extra iced apps exhaust a 2 GiB guest". `/bin/meminfo` (new; reads `sysinfo(2)`, which
-`sys_sysinfo` has always filled from the buddy allocator and which nothing had ever called)
-reports **1186-1243 MiB free** across the whole of the run that contains the four deaths, and
-**1234 MiB free** at the moment three `exec`s fail with `Out of memory (os error 12)`. At
-**`-m 4G`** (now `LEANDROS_QEMU_MEM`) the `CR2=0x880` deaths are **still there**. Doubling
-physical memory does not satisfy whatever allocation is failing.
-**"Out of memory" on this system does not mean "out of RAM"** — `fork`/`clone` return ENOMEM
-the moment `runqueue::MAX_TASKS` is reached and `sys_mmap` has a dozen ENOMEM returns of its
-own, all indistinguishable in userspace. The kernel now names one of them out loud
-(`[SCHED] task table FULL: n/256 ... this is runqueue::MAX_TASKS, not RAM`); **it never fired**,
-so the task table is not the ceiling and the suspects are all in `mmap`/`brk`.
+`ipc::port::PORT_STATS` (new, committed `false`) prints one line per new occupancy
+high-water mark:
 
-**Next step, and it is cheap:** a gated print at every ENOMEM return in `sys_mmap`/`sys_brk`
-naming the site; one instrumented boot with the patched busd then says which one, and the fix
-follows from the answer instead of from a guess. The `xkbcommon` crate's missing null check is
-the proximate cause and is upstream's, but a correct `mmap` is ours.
-**Do NOT reach for `COSMIC_SINGLE_INSTANCE=false` as the safe alternative** — it is inherited
-by every child of `cosmic-session`, unblocks the same four components and therefore carries the
-same crash, while additionally giving up the APP_ID ownership the patch preserves.
+| busd | `LIVE_BUCKETS` | port high water | `port table FULL` | `CR2=0x880` | panel bar |
+|---|---|---|---|---|---|
+| stock | 64 | **61/64** at settle, **64/64** at t+228 s | 0 | 0 | present, ticking |
+| ServiceUnknown | 64 | over the top during startup | **1** | **1, then wedged** | gone |
+| ServiceUnknown | **512** | **84/512** | 0 | **0** | present, ticking |
+
+**A stock desktop was living three ports from the ceiling.** Unblocking four more
+multithreaded iced components takes it over. Free RAM was 1078-1197 MiB at every sample,
+which is why `-m 4G` never helped.
+
+The chain is now on one console, in order, ten lines apart:
+`[IPC] port table FULL: 64/64 live buckets` → `[VFS] ENOMEM: no reply port for this
+task` → `user page fault ... CR2=0x0000000000000880 ... task killed`. The middle of it
+is a **`stat`**, not a `calloc`: `xkb_context_new` also returns NULL when
+`xkb_context_include_path_append_default` fails, that function `stat`s
+`/usr/share/X11/xkb`, and the session log says `failed to add default include path` in
+as many words. `ls /usr/share/X11/xkb` prints six real entries seconds earlier. The
+`xkbcommon` crate's missing null check is still upstream's bug, but nothing allocated
+and no memory ran out.
+
+**The mmap/brk suspects are excluded by measurement, not by argument.** `DBG_ENOMEM`
+(new, committed `false`) names every ENOMEM return in the memory, address-space and exec
+paths, and `mm::vmm::last_map_fail()` says *why* a mapping refused (`vma-overlap`,
+`buddy-order-unavailable`, `va-overflow`, `pte-install`). Across two fully instrumented
+COSMIC sessions **not one `mmap` site fired**. The only memory-path site that fires at
+all is `brk/refused reason=vma-overlap`, ~10 lines per boot — and `brk` has no errno, so
+musl compares the returned break, falls back to `mmap`, and nothing fails. It is the
+loudest non-event in the log and it is only visible because `sys_brk` now reports a
+refusal the ABI otherwise hides completely.
+
+**Falsified by mutation in both directions.** Back at 64 with the same patched busd
+binary and the kernel as the only delta, every symptom returns. At 24, twenty background
+`sleep`s make a plain `ls /usr/share/X11/xkb` answer `Out of memory (os error 12)` with
+no compositor, no Wayland and no D-Bus — `artifacts/m18_repro.py`. That reproducer needs
+a scaled-down constant because at 512 brush runs out of its **own** descriptors
+(`No file descriptors available (os error 24)`) at ~40 background jobs, long before the
+kernel runs out of ports; a load generator that is not the shell would reproduce it at
+the shipped constant and is not written.
+
+**Regression, one fresh image, `vfstest` exactly once, read by trailers not by counting
+passes:** `vfstest`, `scmtest`, `wakepolltest`, `forktest`, `epolltest`, `polltest`,
+`waittest`, `sigtest`, `timertest`, `memtest` all 0 FAIL, and
+`--- venustest done, failures = 0 ---`. An earlier boot of the same build showed the
+recorded `wait_on_process_group` flake once. `venustest` scored `failures = 32` on the
+first attempt purely because that boot had no `--venus` and the `virtio-gpu-gl` device
+was absent — an invocation artifact that arrives in exactly the shape of a regression.
+
+**Still open here.** aarch64 is unconfirmed: everything above is x86_64/KVM on the Linux
+box. `ports/busd/build.sh` only applies patches when it first extracts the crate, so
+`rm -rf ports/busd/.work` and a rebuild of the staged binaries is required before the
+landed patch takes effect anywhere; only the x86_64 binary was rebuilt. And the four
+components still draw nothing on their own — they are activation-gated, and
+`cosmic-launcher` spawns `pop-launcher` by bare name via `PATH`, a binary that is
+neither built nor staged. That is item 8's remaining half, not this one's.
 
 **A 4 GiB guest is separately not usable.** One 4G boot died with a kernel page fault in
 `mm::buddy::free` — `Vector=0xE`, `ErrCode=0` (kernel-mode *read* of a not-present page),
 `RIP=0xFFFFFFFF8014043A`, `CR2=0xFFFF80000EAC8000`, symbolised against
-`target/final-x86_64/kernel`. The buddy's free lists are intrusive (`next` at byte 0, `prev` at
-byte 8 of the free block, read through the HHDM), so that is a corrupted or out-of-range link
-rather than exhaustion. It did not recur on the second 4G boot and has never been seen at 2G.
+`target/final-x86_64/kernel`. The buddy's free lists are intrusive (`next` at byte 0,
+`prev` at byte 8 of the free block, read through the HHDM), so that is a corrupted or
+out-of-range link rather than exhaustion. It did not recur on the second 4G boot and has
+never been seen at 2G. **Untouched — it is a different bug and was never this one.**
 
 **This is NOT the cosmic-panel bug, and the recorded instruction to treat them as one
 investigation is withdrawn.** The panel rasterises its bar with `iced_tiny_skia` into a
