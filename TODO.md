@@ -846,23 +846,33 @@ handoff, before `push_event`” — the handoff is lossless at every rate tested
 re-measured** and should be assumed to have had the same cause until it is: that harness also
 held the serial socket.
 
-**Found on the way out, x86_64-only and PRE-EXISTING: console output has no flow control at
-all, and it is very likely why the x86_64 suite harness has never been trustworthy on the
-box.** `drivers/src/serial.rs::write_byte` — the path userspace console writes take — is an
-unconditional `out dx, al` into the 16550's transmit holding register with **no `LSR.THRE`
-check**; the `#[cfg(not(x86_64))]` arm goes through `arch_serial_putc`, which waits, so aarch64
-does not have this. Printing 300 numbered lines through a continuously draining reader returns
-**19 of 300** — lines 0–18 and then nothing until the trailing marker — and the number is
-**identical** on a kernel with the new `putc` deadline and on one with it removed, so it is not
-this lane's doing. It explains the `m13_suite.py` shape on x86_64 exactly: vfstest's 36
-subtests arrive 16 in its own window and 20 in the next, every later row then reads the
-previous row's exit status, and **widening every budget to 700 s reproduces it identically**
-because nothing is timing out — the bytes are never sent. The 2026-08-07 run recorded in
-`artifacts/notes/m13-cosmic-config/` already shows the same shape. The fix is to make
-`write_byte` wait the way `arch::putc` now does (safe now that `putc` carries a deadline), but
-it gives every console byte an extra VM exit and needs its own suite run, so it is deliberately
-**not** bundled with an input-path change. Measurement and md5s:
-`artifacts/notes/m15-serial-stall-20260808/console-loss-preexisting.md`.
+**CORRECTED 2026-08-08 — the console was never dropping output, and `drivers/src/serial.rs`
+is not the console path.** The paragraph that used to sit here read `write_byte`'s bare
+`out dx, al` as a console with no flow control. Nothing constructs `Serial`, so that function
+has never executed: userspace console output goes `sys_write` → `console_write_user` →
+`serial_write_raw` → `serial_write_byte` → `arch_x86_64::putc`, which has always checked
+`LSR.THRE`. Two separate defects were behind the evidence, and neither is loss.
+
+**(a) The instrument.** `scripts/scmrun.py` stops reading at its completion marker, and the tty
+echoes what it is sent, so a marker spelled literally in the command matched the **echo of the
+command itself**. `m13_suite.py` sent `<test>; echo M13RC=$?` with marker `M13RC=`, so every
+window closed ~1 s after the command was typed — which is why widening budgets to 700 s changed
+nothing, and why the 300-line probe returned 19: it returned **16 of 300 in 0.9 s of a 240 s
+budget** when reproduced here. The same 300 lines with no marker at all arrive **contiguous and
+complete**. The marker is now built by the shell (`echo "M13""RC=$?"`, printed as `M13RC=`,
+never typed) and scmrun refuses an echoable marker outright.
+
+**(b) The real console defect: it is slow, not lossy — ~0.6 lines/s.** Every `\n` scrolls the
+framebuffer console, and `Framebuffer::scroll_vector` copies the WHOLE 1920×1080×4 = 8.29 MB
+surface through its uncached (PAT UC-) mapping and then marks the whole surface dirty so the
+next character re-transmits all of it. Measured: 100 lines × 41 chars = 157.9 s (1.579 s/line),
+220 lines × 1 char = 400.6 s (1.821 s/line) — 24× the bytes for the same cost **per line**, and
+`RIP` sampling put 12/12 samples in `memcpy`. A scroll costs the same for eight rows as for
+one, so it now advances `SCROLL_ROWS = 8`: **157.9 s → 19.0 s, 100/100 lines, 300/300 on the
+long probe.** Still the same scroll amortised; removing it needs a write-back shadow *and* a
+write-combining mapping, and `arch/x86_64/src/paging.rs` is explicit that a cached alias of
+host-visible memory is a bug — a separate lane. Full write-up:
+`artifacts/notes/m16-console-throughput-20260808/`.
 
 **The general lesson, and it has now cost three lanes: an instrument that has to print cannot
 measure anything that printing can stall.** Prefer a host-side witness. Full write-up, the

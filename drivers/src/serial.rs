@@ -10,14 +10,15 @@ const COM1: u16 = 0x3F8;
 
 // ── Architecture-specific serial output ──────────────────────────────────────
 
-#[cfg(target_arch = "x86_64")]
-extern "C" {}  // nothing extra needed; all ops are inline asm below
-
-#[cfg(not(target_arch = "x86_64"))]
 extern "C" {
-    /// Initialise the PL011 UART — provided by arch-aarch64::uart.
+    /// Initialise the UART — arch-aarch64::uart on aarch64; unused on x86_64,
+    /// where `probe` programs the 16550 directly.
+    #[cfg(not(target_arch = "x86_64"))]
     fn arch_serial_init();
-    /// Write one byte to the PL011 TX FIFO — provided by arch-aarch64::uart.
+    /// Write one byte to the UART, waiting for the transmitter against a
+    /// deadline. `kernel::arch_serial_putc` on both arches, which is
+    /// `arch::putc`; the same symbol every other module in this crate uses
+    /// (see pci.rs, virtio_net.rs).
     fn arch_serial_putc(c: u8);
 }
 
@@ -30,19 +31,20 @@ pub struct Serial {
 impl Serial {
     pub const fn new() -> Self { Self { base: COM1 } }
 
+    /// Write one byte through the arch UART primitive.
+    ///
+    /// NOT THE CONSOLE PATH, on either arch. Nothing constructs `Serial`, so
+    /// neither this nor `probe` below has ever run. Console output goes
+    ///   sys_write -> console_write_user -> serial_write_raw
+    ///             -> kernel::serial_write_byte -> arch::putc
+    /// and `arch::putc` is where the transmitter handshake and its deadline
+    /// live. This is recorded because the x86_64 arm used to be a bare
+    /// `out dx, al` with no `LSR.THRE` check, which reads exactly like a
+    /// console with no flow control and was diagnosed as the cause of lost
+    /// output that turned out not to be lost at all. Routing it through the
+    /// same bounded primitive as every other caller in this crate leaves
+    /// nothing here to misread.
     pub fn write_byte(&self, b: u8) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            unsafe {
-                core::arch::asm!(
-                    "out dx, al",
-                    in("dx") self.base,
-                    in("al") b,
-                    options(nomem, nostack)
-                );
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
         unsafe { arch_serial_putc(b); }
     }
 

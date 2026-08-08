@@ -1,0 +1,33 @@
+===== M13 suite x86_64 ===== 2026-08-08 09:32:52
+[boot] up on attempt 1
+[control] nosuchbinary_xyz42 -> M13RC=127
+  vfstest        exit(failures)=0  named FAIL=0 []  (PASS lines=36)
+  drmsmoke       exit(failures)=0  named FAIL=0 []  (PASS lines=29)
+  venustest      exit(failures)=32  named FAIL=32 ['getparam_3d_features', 'getparam_resource_blob', 'getparam_context_init', 'host_advertises_venus_capset', 'context_init_venus', 'get_caps_venus']  (PASS lines=16)
+  scmtest        exit(failures)=0  named FAIL=0 []  (PASS lines=32)
+  wakepolltest   exit(failures)=0  named FAIL=0 []  (PASS lines=10)
+  forktest       exit(failures)=0  named FAIL=0 []  (PASS lines=3)
+  epolltest      exit(failures)=0  named FAIL=0 []  (PASS lines=10)
+  polltest       exit(failures)=0  named FAIL=0 []  (PASS lines=6)
+  waittest       exit(failures)=0  named FAIL=0 []  (PASS lines=5)
+  sigtest        exit(failures)=0  named FAIL=0 []  (PASS lines=6)
+  timertest      exit(failures)=0  named FAIL=0 []  (PASS lines=6)
+  memtest        exit(failures)=0  named FAIL=0 []  (PASS lines=4)
+  f2fstest       exit(failures)=0  named FAIL=0 []  (PASS lines=5)
+
+===== SUMMARY =====
+  vfstest        clean
+  drmsmoke       clean
+  venustest      FAILURES=32 ['getparam_3d_features', 'getparam_resource_blob', 'getparam_context_init', 'host_advertises_venus_capset', 'context_init_venus', 'get_caps_venus', 'resource_create_blob', 'phase2_context_init_fdA', 'phase2_ctxid_fdA_nonzero', 'phase2_context_init_fdB', 'phase2_ctxid_fdB_nonzero', 'phase2_ctxid_fdB_differs_from_fdA', 'phase2_ctxid_fdA_survives_fdB_init', 'phase2_execbuffer_fdA_after_fdB_init', 'phase2_execbuffer_fdB', 'phase2_context_init_fdA_idempotent', 'phase2_ctxid_fdA_unchanged_by_reinit', 'phase2_ctxid_fdA_after_close_fdB', 'phase2_execbuffer_fdA_after_close_fdB', 'phase2_ctxid_fdC_dup_shares_fdA', 'phase2_ctxid_fdC_after_close_fdA', 'phase2_execbuffer_fdC_dup_after_close_fdA', 'phase2_ctxid_fork_child_inherits', 'phase2_ctxid_fdC_survives_child_exit', 'phase2_execbuffer_fork_child_and_parent', 'phase3_16_contexts_distinct', 'phase3_slots_reclaimed_after_close', 'phase4_context_init_both', 'phase4_blob_created_on_fdA', 'phase5_context_init_both', 'phase5_guest_blob_created', 'phase6_guest_blob_created']
+  scmtest        clean
+  wakepolltest   clean
+  forktest       clean
+  epolltest      clean
+  polltest       clean
+  waittest       clean
+  sigtest        clean
+  timertest      clean
+  memtest        clean
+  f2fstest       clean
+
+  reds: ['venustest']

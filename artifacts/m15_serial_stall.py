@@ -20,6 +20,12 @@ output — an instrument that had to print would be throttled by the very stall
 it is measuring, which is how this defect stayed hidden behind a rate ladder for
 two lanes.
 
+REQUIRES `EV_STATS = true` (kernel/src/syscall.rs), which is now committed off.
+The guard works by having the timer IRQ print: with the census off nothing
+reaches `putc` from IRQ context, so a parked serial reader has nothing to
+back-pressure and PARKED reads 100% on a broken kernel too. Turn it on before
+running this, and off again before committing.
+
 THREE PHASES, one boot, identical 60 moves/s injection, differing only in who is
 draining the serial chardev:
 

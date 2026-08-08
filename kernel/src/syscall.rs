@@ -6940,7 +6940,15 @@ fn gap2_sample_tick() {
 
 /// Master gate for the `[EVSTAT]` evdev I/O census (`evstat_tick`). Same shape
 /// as `DRM_STATS`: a const so the whole sampler compiles out when off.
-pub const EV_STATS: bool = true;
+///
+/// OFF. On at 0.5 Hz this writes ~366 bytes of two census lines into every
+/// captured log forever — it accounted for 28,900 of the 30,934 console bytes
+/// of a 100-line measurement — which buries the output under test and inflates
+/// any count taken over a log. Turn it on to investigate; it is not a shipping
+/// diagnostic. Note that `artifacts/m15_serial_stall.py` needs it on: its guard
+/// works by having the timer IRQ print, and with the census off nothing reaches
+/// `putc` from IRQ context for a parked serial reader to back-pressure.
+pub const EV_STATS: bool = false;
 
 /// 0.5 Hz `[EVSTAT]` census of every evdev node, one line per device.
 ///

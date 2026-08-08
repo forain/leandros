@@ -1,0 +1,6 @@
+MUTANT  = pre-fix scmrun, marker spelled in the typed command
+CONTROL = fixed scmrun, marker assembled by the shell
+[MUTANT  ] elapsed=   0.6s  M13RC=none  PASS lines=  1  bytes=231
+[CONTROL ] elapsed=  21.5s  M13RC=0     PASS lines= 33  bytes=4025
+
+VERDICT: falsified as required — mutant truncates, control completes

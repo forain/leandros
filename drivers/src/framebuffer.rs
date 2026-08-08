@@ -599,18 +599,45 @@ impl Framebuffer {
 
     #[allow(dead_code)]
     fn scroll(&mut self) {
-        let rows_to_copy = self.height - 8; // fallback char height
+        let shift = self.scroll_shift_px(8); // fallback char height
+        self.scroll_px(shift);
+    }
+
+    /// Pixel rows one scroll advances by, for a console whose text rows are
+    /// `char_h` pixels tall: [`SCROLL_ROWS`] of them, clamped so at least one
+    /// text row of surface is left above the cursor.
+    fn scroll_shift_px(&self, char_h: usize) -> usize {
+        if char_h == 0 || self.height <= char_h { return 0; }
+        let usable_rows = (self.height / char_h).saturating_sub(1).max(1);
+        char_h * SCROLL_ROWS.min(usable_rows)
+    }
+
+    /// Shift the surface up by `shift_px` pixel rows and blank what that
+    /// exposes at the bottom.
+    ///
+    /// This is the console's whole cost. The copy reads and writes the entire
+    /// surface through the framebuffer mapping, and `mark_dirty` over the whole
+    /// screen then makes the next character re-transmit all of it to the host,
+    /// so its price is paid per scroll and is independent of how much text
+    /// caused it. Scrolling by more than one row at a time is what makes it
+    /// affordable — see [`SCROLL_ROWS`].
+    fn scroll_px(&mut self, shift_px: usize) {
+        if self.base.is_null() || shift_px == 0 || shift_px >= self.height { return; }
+        let words_per_row = self.pitch / 4;
+        let rows_to_copy = self.height - shift_px;
         unsafe {
             core::ptr::copy(
-                self.base.add(8 * (self.pitch / 4)),
+                self.base.add(shift_px * words_per_row),
                 self.base,
-                rows_to_copy * (self.pitch / 4)
+                rows_to_copy * words_per_row,
             );
-            // Clear bottom line
-            let bottom_start = rows_to_copy * (self.pitch / 4);
-            core::ptr::write_bytes(self.base.add(bottom_start), 0, 8 * (self.pitch / 4));
+            core::ptr::write_bytes(
+                self.base.add(rows_to_copy * words_per_row),
+                0,
+                shift_px * words_per_row,
+            );
         }
-        self.cursor_y -= 8;
+        self.cursor_y = self.cursor_y.saturating_sub(shift_px);
         // The scroll rewrote the whole surface via raw memory ops (bypassing
         // set_pixel), so the entire screen must be re-transmitted.
         let (w, h) = (self.width, self.height);
@@ -619,21 +646,8 @@ impl Framebuffer {
 
     /// Scroll screen for vector font
     fn scroll_vector(&mut self) {
-        let rows_to_copy = self.height - self.char_height;
-        unsafe {
-            core::ptr::copy(
-                self.base.add(self.char_height * (self.pitch / 4)),
-                self.base,
-                rows_to_copy * (self.pitch / 4)
-            );
-            // Clear bottom lines
-            let bottom_start = rows_to_copy * (self.pitch / 4);
-            core::ptr::write_bytes(self.base.add(bottom_start), 0, self.char_height * (self.pitch / 4));
-        }
-        self.cursor_y -= self.char_height;
-        // Whole surface rewritten via raw memory ops — mark it all dirty.
-        let (w, h) = (self.width, self.height);
-        self.mark_dirty(0, 0, w, h);
+        let shift = self.scroll_shift_px(self.char_height);
+        self.scroll_px(shift);
     }
 }
 
@@ -854,6 +868,28 @@ pub unsafe fn update_kernel_fb(base: *mut u32, width: usize, height: usize, pitc
     fb.init_vector_font(); // Initialize vector font
     // Don't clear - preserve existing content
 }
+
+/// Text rows the console advances per scroll, rather than one.
+///
+/// A scroll copies the WHOLE surface and then marks the whole surface dirty, so
+/// it costs the same whether it advances one row or many — and because a full
+/// screen scrolls on every newline, that cost was the console's throughput
+/// ceiling. Measured on x86_64/KVM at 1920x1080x4 (8.29 MB, mapped uncached —
+/// PAT UC-, see arch/x86_64/src/lib.rs): 100 lines of 41 characters took
+/// 157.9 s and 220 lines of 1 character took 400.6 s. That is 1.58 s and 1.82 s
+/// PER LINE for a 24x difference in bytes, which is what identifies the scroll
+/// rather than the UART as the ceiling: the console was not dropping output, it
+/// was delivering it at ~0.6 lines/s. Long test output therefore looked
+/// truncated, and a harness reading it looked like it had lost bytes.
+///
+/// Advancing N rows per scroll divides that rate by N. The price is that the
+/// console jumps N rows and leaves N blank rows under the cursor — the trade
+/// fbcon makes when it has no panning. Removing the cost rather than dividing
+/// it means never reading the surface back (a write-back shadow) AND giving it
+/// a write-combining mapping; arch/x86_64/src/paging.rs is explicit that a
+/// cached alias of host-visible memory is a bug, so that belongs to a lane that
+/// can verify the memory type end to end.
+const SCROLL_ROWS: usize = 8;
 
 // ── Bitmap Font ───────────────────────────────────────────────────────────────
 
