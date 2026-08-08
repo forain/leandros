@@ -1121,14 +1121,27 @@ one caller that uses it.
    `-C link-arg=-static -C relocation-model=static`), so a shared object is a **new
    build shape**, not a new crate. Cost that honestly; the same mis-sizing killed a
    previously recorded plan to write `vkwl` as a `userland/` crate.
-2. **Coverage against real callers is UNVERIFIED.** `grep pam` finds **27 hits in
-   `cosmic-greeter`'s `locker.rs` and zero in `greeter.rs`**, so in the *login* role the
-   greeter does not use PAM at all — authentication crosses greetd IPC instead. What
-   matters is therefore **which PAM entry points upstream greetd calls**
-   (`pam_start`, `pam_authenticate`, `pam_acct_mgmt`, `pam_open_session`, `pam_setcred`,
-   `pam_getenvlist`, `pam_end`, …) against what the shim implements.
-   **`pam_open_session`/`pam_setcred` are the ones most likely missing and most likely
-   to matter.** This is being measured; do not assume either answer.
+2. **Coverage is now MEASURED, and the gap was not where it was predicted.**
+   `grep pam` finds **27 hits in `cosmic-greeter`'s `locker.rs` and zero in
+   `greeter.rs`** — in the *login* role the greeter does not use PAM at all;
+   authentication crosses greetd IPC. Against upstream greetd:
+   `pam_start`/`end`/`authenticate`/`acct_mgmt`/`setcred`/`chauthtok`/`open_session`/
+   `close_session`/`set_item` are all present and fine, and **`open_session`/`setcred`
+   being stubs is *correct* here** — the exact two predicted as "most likely missing and
+   most likely to matter" were neither. The real gaps are `pam_get_user` (absent),
+   `pam_misc_drop_env` (absent — it lives in `libpam_misc`, a **second** library
+   `pam-sys`'s build script links), and the **environment table**.
+   **The env table is the whole ballgame, and it is the biggest obstacle in the greeter
+   lane.** greetd builds a session's *entire* environment through PAM — `pam_putenv` in,
+   `pam_getenvlist` out, and that list **is** the `execve` envp; nothing of greetd's own
+   environment is inherited. The shim's `pam_putenv` is a no-op and its `pam_getenvlist`
+   returns empty, so a session would start with a **completely empty environment**,
+   including no `GREETD_SOCK` — which cosmic-greeter `.expect()`s. **Silent, total, and
+   it looks nothing like a PAM fault.** All four gaps are implemented in
+   `ports/greetd/pam-leandros` (Rust, rlib not staticlib — a Rust `staticlib` embeds its
+   own `std` and duplicates every symbol), 5/5 host tests, one of which asserts root's
+   shadow field is byte-identical to what `mkfs-f2fs-populated.py`'s `shadow_hash`
+   writes.
 3. **A shim that answers "yes" is indistinguishable from one that authenticates**, and
    only one of those is a login screen. Any replacement needs a guard that is falsified
    by mutation — a wrong password must be *shown* to be rejected, not assumed to be.
@@ -1145,12 +1158,18 @@ tree implements utmpx. Unlike items 12 and 14, **there is no measurement here at
 not of what needs it, not of what breaks without it, not of how much of the interface
 real consumers touch.
 
+**The assumed driver for this item is gone. `utmpx` does not exist in upstream greetd
+at all** — measured while porting it, and it contradicts the scoping lane that listed
+utmpx as a greetd coupling. So nothing on the greeter path needs it, and the item
+survives only because it was asked for directly, not because anything is blocked on it.
+
 **So the first task is not to implement it.** It is to establish, from source: does
-upstream greetd write utmpx on the mandatory path or behind a feature/config? Does
-anything else we ship read it (`who`, `w`, `last` — do those even exist among the 175
-`/bin` names)? Is the requirement the **file format** (`/var/run/utmp`,
-`/var/log/wtmp`) or the **libc interface** (`setutxent`/`getutxent`/`pututxline`/
-`endutxent`), and does our libc expose the latter at all?
+anything we ship read it (`who`, `w`, `last` — do those even exist among the 175 `/bin`
+names)? Is the requirement the **file format** (`/var/run/utmp`, `/var/log/wtmp`) or the
+**libc interface** (`setutxent`/`getutxent`/`pututxline`/`endutxent`), and does our libc
+expose the latter at all? Without a consumer, an implementation is unfalsifiable — it
+would be a write-only file nothing reads, which is the "test that cannot fail" shape in
+another costume.
 
 **The trap this item exists to avoid** is the one item 8 walked into twice: sizing a
 feature from its name. utmpx could be a fixed-size record appended to two files — a day
@@ -1193,6 +1212,12 @@ between the greeter's compositor and the session's.
    when inactive — that was established while exonerating the shim on the input path,
    where nothing reads it. **A component can be correct as a consumer and broken as a
    producer**, and this shim is about to be asked to be the producer.
+
+**greetd does not force the issue, measured while porting it.** `vt = "none"` selects
+`TerminalMode::Stdin`, and every VT call sits behind a match arm that Stdin skips — so
+the port needs nothing from this item. That is a reason the greeter can ship first, and
+**not** a reason to think the item is cheap: what greetd avoids is *using* VTs, not the
+absence of them.
 
 **Sequencing.** This is the largest of the three and the least urgent for a *first*
 graphical login, which the root-compositor design reaches without it. Do items 12 and 13
