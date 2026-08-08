@@ -205,10 +205,11 @@ taught you in `artifacts/notes/`** — a finding whose only evidence was a delet
 is a finding nobody can re-check. **Any permanent fix belongs on the LeandrOS side** — kernel,
 shims, or our own launcher — never in COSMIC.
 
-**Two PERMANENT patches currently violate this and need resolving**, rather than being quietly
-tolerated: `ports/cosmic-session/0001-env_rx-timeout-fallback.patch` and
-`ports/cosmic-greeter/0001-locker-idle-without-logind.patch`. (`ports/busd/current-thread-runtime.patch`
-is fine — busd is ours.) The session one **fires every boot** — `handshake did not complete`,
+**ONE PERMANENT patch now violates this**, down from two:
+`ports/cosmic-session/0001-env_rx-timeout-fallback.patch`.
+(`ports/busd/current-thread-runtime.patch` is fine — busd is ours.) The greeter's
+`0001-locker-idle-without-logind.patch` is **RETIRED, not merely justified** — deleted, with
+the behaviour it patched around removed by a staging decision instead. See item 11. The session one **fires every boot** — `handshake did not complete`,
 so every session runs on a 5 s fallback and no child receives cosmic-comp's exported
 environment — and its recorded root cause, "a tokio-integration residual", is **asserted, not
 demonstrated**. Under this policy that patch is a standing debt with an unproven
@@ -737,7 +738,7 @@ paragraph that leans on "out of scope" with that in mind.
 | 8 | Nothing to launch, and no way to ask for it | Feature — **config DONE** `52665aa` | Keybinding table staged; still no terminal to launch |
 | 9 | **9 panel applets have no scoped-out dependency and are simply unbuilt** | Feature — cheap | Build recipe exists; spawn path proven |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
-| 11 | **Two PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — **cause FIXED** `2d9f0c8` | Handshake completes: 5.022 s → 2.186 s; retirement now justified |
+| 11 | **PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — greeter one **RETIRED**; session one **cause FIXED** `2d9f0c8` | One patch left; handshake completes 5.022 s → 2.186 s |
 | 12 | **PAM — real support, replacing the C shim** | Feature — **NEW, in scope** | Shim authenticates for real but is C, untracked, coverage unverified |
 | 13 | **utmpx — session accounting, currently absent** | Feature — **NEW, in scope** | Nothing in tree; need is unmeasured |
 | 14 | **VT switching — was out of scope, now required** | Feature — **NEW, in scope** | No VTs at all; greeter design routes around it |
@@ -1102,11 +1103,12 @@ feature gate); unlike the daemon, the portal actually *uses* the streams, so the
 stub would not suffice. The committed architecture already names reference `dbus-daemon` as
 the fallback if busd proves immature — **this is the decision point that would trigger it.**
 
-### 11. Two permanent COSMIC source patches — the goal is totally unmodified
+### 11. Permanent COSMIC source patches — the goal is totally unmodified
 
 Policy is in *Goal* (Standing context): **temporary debug edits to COSMIC are allowed and
 encouraged**; permanent ones are not, and every permanent fix belongs on the LeandrOS side.
-These two are permanent and must be retired or justified.
+**One of the two is now gone outright** (the greeter's); what is left is the session's, whose
+cause is fixed and whose deletion is therefore justified but not yet done.
 
 **ROOT-CAUSED AND FIXED (`2d9f0c8`). The cause was a kernel `shutdown(2)` bug, and the
 recorded "tokio-integration residual" was never demonstrated because it was never true.**
@@ -1160,11 +1162,31 @@ testable in `scmtest` (currently **32/0**), which is where a guard for it would 
 and a compositor that ignores input are both "cosmic-comp is running but not talking to
 anything", and it would be a mistake to assume they are unrelated before checking.
 
-**`ports/cosmic-greeter/0001-locker-idle-without-logind.patch` — the cheap one.** Makes the
-greeter idle instead of locking at boot, in the absence of logind. greetd + cosmic-greeter are
-**explicitly out of scope**, so the honest resolution is probably to stop shipping
-cosmic-greeter at all rather than to carry a patch for a component we do not want — which
-would also remove one of the 12 launched processes. Check what else expects it first.
+**`ports/cosmic-greeter/0001-locker-idle-without-logind.patch` — RETIRED, and the way it went
+is worth copying.** The old recommendation here ("stop shipping cosmic-greeter at all") died
+with the scope change: the greeter is now the committed default login screen and must ship.
+The patch went anyway, with **no COSMIC source change and no loss of function**, because it was
+never about the binary's contents.
+
+That binary is both the login screen and the in-session lock screen, and it picks between them
+from the invoking **username** alone — `greeter::main()` when `getpwuid(getuid())` is named
+`cosmic-greeter`, `locker::main()` otherwise (`cosmic-greeter/src/main.rs`). The patch existed
+only because `cosmic-session` spawns it **by bare name** in-session, where it therefore always
+took the locker arm and looped `lock → unlock → exit(0) → restart → lock`. So the fix is to
+stage the file under a name `cosmic-session` does not spawn: **`/bin/cosmic-greeter-login`**.
+`start_component("cosmic-greeter")` then fails at `Command::spawn`, and `launch_pad`'s
+`ProcessManager::start` returns that error **before** it spawns the supervising `process_loop`
+— one error line per boot, **no restart storm**. The lock screen is never started, which is
+both what the patch wanted and one fewer process in the session.
+
+Two things this does **not** do, stated because both are easy to get wrong:
+`libpam.so.0` **stays staged** (it is `DT_NEEDED` by the same ELF regardless of which role runs,
+so unstaging it is a load failure, not a cleanup); and the file name has **no** bearing on the
+role — only the account does, which is why the login path runs under a real `cosmic-greeter`
+account rather than under a differently-named binary.
+
+**The general shape is reusable:** when a patch exists to stop a component from being *reached*
+rather than to change what it *does*, the retirement is a packaging change, not a code change.
 
 (`ports/busd/current-thread-runtime.patch` is **not** in scope here — busd is ours.)
 
@@ -1307,9 +1329,9 @@ same argument that put an intermediate step in the greeter route.
 ### Corrections this survey forces
 
 - **"Run COSMIC *unmodified*… No COSMIC source patches" is not true of the tree.** Three
-  patches exist under `ports/`: `cosmic-session/0001-env_rx-timeout-fallback.patch`,
-  `cosmic-greeter/0001-locker-idle-without-logind.patch`, and `busd/current-thread-runtime.patch`
-  (busd is ours, so that one is fine). **The session patch is still firing every boot** —
+  patches existed under `ports/` when this was written: `cosmic-session/0001-env_rx-timeout-fallback.patch`,
+  `cosmic-greeter/0001-locker-idle-without-logind.patch` (**since retired — see item 11**), and
+  `busd/current-thread-runtime.patch` (busd is ours, so that one is fine). **The session patch is still firing every boot** —
   `handshake did not complete` — so every session runs on a 5 s fallback and **no child ever
   receives cosmic-comp's exported environment**; its recorded root cause ("a tokio-integration
   residual") is asserted, not demonstrated. The *intent* — don't fork COSMIC to make it work —
@@ -1318,10 +1340,11 @@ same argument that put an intermediate step in the greeter route.
   **Resolved as policy, not by dropping the rule** (see *Goal* in Standing context): temporary
   debug edits to COSMIC are **allowed and encouraged** for investigation, and must be reverted
   with the revert *proven* by a clean `git -C ../cosmic-epoch status --porcelain`. The end
-  state is totally unmodified COSMIC. That makes these two patches a **standing debt with a
-  deadline rather than a grey area** — the greeter one is scoped-out territory and cheap to
-  argue, but the session one is load-bearing, fires every boot, and has an unproven cause. It
-  becomes **item 11**.
+  state is totally unmodified COSMIC. That makes the remaining patch a **standing debt with a
+  deadline rather than a grey area**: the session one is load-bearing and fires every boot. It
+  becomes **item 11**. (The greeter one was retired outright — the argument that it was "cheap
+  to argue because the greeter is scoped out" expired when the greeter became the default login
+  screen, and it went by a packaging change instead.)
 - **`cosmic-session` is built `--no-default-features`, which switches off `autostart`** as well
   as systemd/logind. The XDG autostart scan is compiled out, not merely inert.
 - **The deferred-list entry claiming synthetic sysfs has "no current consumer"** is at best

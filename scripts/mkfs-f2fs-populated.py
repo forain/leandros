@@ -420,8 +420,14 @@ def main():
                # loaded.") right after "Waiting for configure event".
                "libwayland-egl.so.1", "libffi.so.8",
                # libpam.so.0 is the LeandrOS shadow-auth shim (source:
-               # m6-session-bins/src/libpam-shim), DT_NEEDED by cosmic-greeter's
-               # in-session locker; verifies $sha256$ /etc/shadow like /bin/login.
+               # m6-session-bins/src/libpam-shim); verifies $sha256$ /etc/shadow
+               # like /bin/login. It is DT_NEEDED by the cosmic-greeter ELF
+               # itself — pam-sys is an unconditional dependency of that build —
+               # so the dynamic loader resolves it on EVERY launch regardless of
+               # which role the binary takes. The login role makes no PAM call at
+               # all (greeter.rs has none; authentication crosses greetd IPC),
+               # but the library still has to be present or the greeter fails to
+               # load. Do not unstage it on the grounds that nothing calls it.
                "libpam.so.0"):
         p = f"{gl_lib_dir}/{so}"
         if os.path.exists(p):
@@ -750,17 +756,38 @@ def main():
         ("cosmic-app-library",     f"{m6_out}/cosmic-applibrary-{arch}"),  # spawn name != file name
         ("cosmic-settings",        f"{m6_out}/cosmic-settings-{arch}"),
         ("cosmic-settings-daemon", f"{pw_out}/cosmic-settings-daemon-{arch}"),
-        # M7z tolerant-children completion: the last four names cosmic-session
-        # spawns (main.rs:335-351). workspaces is built --no-default-features
-        # --features force-shm-screencopy (no wgpu, wl_shm capture only);
-        # files-applet drops the gvfs feature (no glib/gio on the image); idle
-        # is featureless; greeter is --no-default-features + the locker patch
-        # in ports/cosmic-greeter (idles instead of locking at boot — LeandrOS
-        # has no logind lock trigger) and links the libpam shadow-auth shim.
+        # M7z tolerant-children completion: the names cosmic-session spawns.
+        # workspaces is built --no-default-features --features
+        # force-shm-screencopy (no wgpu, wl_shm capture only); files-applet drops
+        # the gvfs feature (no glib/gio on the image); idle is featureless.
         ("cosmic-workspaces",      f"{m6_out}/cosmic-workspaces-{arch}"),
-        ("cosmic-greeter",         f"{m6_out}/cosmic-greeter-{arch}"),
         ("cosmic-files-applet",    f"{m6_out}/cosmic-files-applet-{arch}"),
         ("cosmic-idle",            f"{m6_out}/cosmic-idle-{arch}"),
+        # The greeter, DELIBERATELY NOT staged as "cosmic-greeter".
+        #
+        # This one binary is both the login screen and the in-session lock
+        # screen, and it chooses between them from the invoking username alone:
+        # greeter::main() when getpwuid(getuid()) is named "cosmic-greeter",
+        # locker::main() otherwise (cosmic-greeter/src/main.rs). cosmic-session
+        # spawns it in-session by bare name, where it therefore always takes the
+        # LOCKER arm — and upstream's non-logind locker locks immediately at
+        # start, then process::exit(0)s on unlock, which under cosmic-session's
+        # restart supervision is an unbreakable lock/unlock/restart loop. That
+        # loop is the entire reason a permanent COSMIC source patch used to exist
+        # here.
+        #
+        # Staging the file under a name cosmic-session does not spawn retires
+        # that patch with no COSMIC change at all: start_component
+        # ("cosmic-greeter") now fails at Command::spawn, and launch_pad's
+        # ProcessManager::start returns that error BEFORE it spawns the
+        # supervising process_loop — so the cost is one error line per boot and
+        # there is no restart storm. The lock screen is simply never started.
+        #
+        # The login role is reached the other way round: /bin/greeter-launch
+        # drops to the real cosmic-greeter account and execve()s this path, so
+        # getpwuid returns the name the greeter arm matches on. The file name is
+        # irrelevant to the role — only the account is.
+        ("cosmic-greeter-login",   f"{m6_out}/cosmic-greeter-{arch}"),
     ]
     for name, src in m6_session_bins:
         if os.path.exists(src):

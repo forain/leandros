@@ -40,7 +40,10 @@ cd "$XDG_RUNTIME_DIR"
 # "--no-xwayland" and dies with ENOENT, while `cosmic-comp <exec> --no-xwayland`
 # both disables Xwayland and spawns <exec>. The flag is then also handed to
 # cosmic-greeter, whose own argument loop ignores what it does not recognise.
+# The greeter is staged as cosmic-greeter-login so that cosmic-session cannot
+# spawn the same binary in its lock-screen role; the login role comes from the
+# invoking account, not from the file name.
 # --no-xwayland is not optional: smithay's Xwayland-socket bind-error path leaks
 # fds -> EMFILE -> a softpipe NULL-transfer crash at first scanout.
 echo "GREETER-FAKE: launching fakegreet in $XDG_RUNTIME_DIR"
-exec /bin/fakegreet "/bin/cosmic-comp /bin/cosmic-greeter --no-xwayland"
+exec /bin/fakegreet "/bin/cosmic-comp /bin/cosmic-greeter-login --no-xwayland"

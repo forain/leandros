@@ -198,7 +198,7 @@ runtime dir the greeter user can open.
 |---|---|
 | `/bin/greetd`, `/bin/fakegreet` | the two binaries |
 | `/bin/greeter-env` | the shared render environment, sourced by both launchers |
-| `/bin/greeter-fake` | fakegreet + cosmic-comp + cosmic-greeter |
+| `/bin/greeter-fake` | fakegreet + cosmic-comp + cosmic-greeter-login |
 | `/bin/greeter-real` | the daemon |
 | `/etc/greetd/greetd.conf`, `/etc/pam.d/greetd`, `/etc/profile` | config |
 | `/etc/passwd.greeter`, `/etc/passwd.system` | the role switch and its undo |
