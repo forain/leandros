@@ -233,6 +233,31 @@ def shadow_hash(salt, password):
     return f"$sha256${salt}${digest}"
 
 
+def session_data(name):
+    """Resolve one m6-session-data entry, artifacts tree first, repo second.
+
+    These guest-side driver scripts live in ~/code/leandros-artifacts, which is
+    NOT the repo and which a `git merge` therefore does not populate. Several of
+    them are also committed under artifacts/m6-session-data/, and every caller
+    gates on os.path.exists — so a script that arrived in a merge but not in the
+    artifacts tree was skipped SILENTLY, and the only symptom was the guest
+    answering `failed to source file: /bin/<name>` much later.
+
+    The artifacts tree keeps precedence, because at least one entry (m4-vkwl)
+    legitimately differs per machine and the local copy is the one that should
+    win. The repo copy is a fallback for absence only, never an override.
+    """
+    tree = os.path.expanduser(f"~/code/leandros-artifacts/m6-session-data/{name}")
+    if os.path.exists(tree):
+        return tree
+    repo = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "artifacts", "m6-session-data", name))
+    # Returning `tree` when neither exists keeps the callers' os.path.exists
+    # gate meaningful and their error messages pointing at the intended source.
+    return repo if os.path.exists(repo) else tree
+
+
 def main():
     if len(sys.argv) < 3:
         print("Usage: mkfs-f2fs-populated.py <output_img> <arch>")
@@ -950,15 +975,13 @@ def main():
 
     # The session launcher itself (a POSIX-sh script). The kernel execve()s ELF
     # only (no "#!"-shebang binfmt), so it is run as `sh /bin/start-cosmic-leandros`.
-    m6_launcher = os.path.expanduser(
-        "~/code/leandros-artifacts/m6-session-data/start-cosmic-leandros")
+    m6_launcher = session_data("start-cosmic-leandros")
     if os.path.exists(m6_launcher):
         bin_files.append(("start-cosmic-leandros", m6_launcher, 0o100755))
     # m4-vkwl — the M4 driver: backgrounds start-cosmic-leandros with its log
     # redirected to a file, waits for the wayland-1 socket, then runs vkwl
     # against it. Same no-shebang rule: run as `brush /bin/m4-vkwl`.
-    m4_drv = os.path.expanduser(
-        "~/code/leandros-artifacts/m6-session-data/m4-vkwl")
+    m4_drv = session_data("m4-vkwl")
     if os.path.exists(m4_drv):
         bin_files.append(("m4-vkwl", m4_drv, 0o100755))
     # m12-caps — the capability probe: brings the session up the same way and
@@ -967,16 +990,14 @@ def main():
     # announcing each window as "M12: MARK <name> <secs>" so artifacts/
     # m12_caps.py can inject QMP input and photograph the scanout inside it.
     # Same no-shebang rule: run as `brush /bin/m12-caps`.
-    m12_drv = os.path.expanduser(
-        "~/code/leandros-artifacts/m6-session-data/m12-caps")
+    m12_drv = session_data("m12-caps")
     if os.path.exists(m12_drv):
         bin_files.append(("m12-caps", m12_drv, 0o100755))
     # m12c-input — the follow-up that attributes m12-caps input null result to
     # a layer: /dev/input and /sys/class/input against what the libudev shim
     # claims, then evtest2 (raw evdev, no libinput in the path), then the same
     # session with RUST_LOG turned up on the smithay input backends.
-    m12c_drv = os.path.expanduser(
-        "~/code/leandros-artifacts/m6-session-data/m12c-input")
+    m12c_drv = session_data("m12c-input")
     if os.path.exists(m12c_drv):
         bin_files.append(("m12c-input", m12c_drv, 0o100755))
     # m14-input — the guest half of artifacts/m14_input.py: brings the session
@@ -985,8 +1006,7 @@ def main():
     # /bin/wlinput against cosmic-comp's socket so the same injection can be
     # counted BELOW the compositor ([EVSTAT]) and ABOVE it ([WLI]) in one run.
     # Same no-shebang rule: run as `brush /bin/m14-input`.
-    m14_drv = os.path.expanduser(
-        "~/code/leandros-artifacts/m6-session-data/m14-input")
+    m14_drv = session_data("m14-input")
     if os.path.exists(m14_drv):
         bin_files.append(("m14-input", m14_drv, 0o100755))
     # m15-iced — the guest half of artifacts/m15_iced.py. Brings the session up
@@ -996,16 +1016,14 @@ def main():
     # on_stderr handler, cosmic-session/src/comp.rs:122-134) and WAYLAND_DEBUG
     # can say whether it never commits or commits blank buffers.
     # Same no-shebang rule: run as `brush /bin/m15-iced`.
-    m15_drv = os.path.expanduser(
-        "~/code/leandros-artifacts/m6-session-data/m15-iced")
+    m15_drv = session_data("m15-iced")
     if os.path.exists(m15_drv):
         bin_files.append(("m15-iced", m15_drv, 0o100755))
     # m15b-iced — the discriminator m15-iced pointed at: the same cosmic-settings
     # binary run twice one environment variable apart, COSMIC_SINGLE_INSTANCE
     # unset then =false, to separate "blocked in libcosmic's blocking D-Bus
     # single-instance probe" from "reaches iced and renders nothing".
-    m15b_drv = os.path.expanduser(
-        "~/code/leandros-artifacts/m6-session-data/m15b-iced")
+    m15b_drv = session_data("m15b-iced")
     if os.path.exists(m15b_drv):
         bin_files.append(("m15b-iced", m15b_drv, 0o100755))
     # m17-census — the guest half of artifacts/m17_census.py. Brings the session
@@ -1016,8 +1034,7 @@ def main():
     # overwrite each other. Then re-runs each autostarted single-instance
     # component by hand, each with its own stderr, because the stderr byte count
     # separates "blocked in the D-Bus probe" from "ran".
-    m17_drv = os.path.expanduser(
-        "~/code/leandros-artifacts/m6-session-data/m17-census")
+    m17_drv = session_data("m17-census")
     if os.path.exists(m17_drv):
         bin_files.append(("m17-census", m17_drv, 0o100755))
 
@@ -1026,8 +1043,7 @@ def main():
     # and "the WSI chain does not work here" have to be told apart and a silent
     # timeout tells you neither. Staged exactly like m4-vkwl above; absent from
     # the artifact tree it is simply not packed.
-    m4_drv_a64 = os.path.expanduser(
-        "~/code/leandros-artifacts/m6-session-data/m4-vkwl-a64")
+    m4_drv_a64 = session_data("m4-vkwl-a64")
     if os.path.exists(m4_drv_a64):
         bin_files.append(("m4-vkwl-a64", m4_drv_a64, 0o100755))
 
@@ -1066,7 +1082,7 @@ def main():
                 hp = os.path.join(dirpath, fn)
                 if os.path.isfile(hp):
                     m4_share_files.append((image_dir, fn, hp))
-    m6_shared_src = os.path.expanduser("~/code/leandros-artifacts/m6-session-data/shared")
+    m6_shared_src = session_data("shared")
     if os.path.isdir(m6_shared_src):
         for dirpath, _dn, filenames in os.walk(m6_shared_src):
             rel = os.path.relpath(dirpath, m6_shared_src)  # e.g. "usr/share/backgrounds/cosmic"

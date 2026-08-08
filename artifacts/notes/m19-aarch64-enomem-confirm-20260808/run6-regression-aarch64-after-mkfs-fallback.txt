@@ -1,0 +1,38 @@
+D] CPU ID: [SCHED] CPU 
+2InIiDt:  1PID: 
+2
+
+Mounting F2FS disk /dev/vdb to /mnt...
+F2FS mounted successfully at /mnt!
+Pivoting root to /mnt (old root at /mnt/old_root)...
+pivot_root successful! Root is now F2FS.
+Mounting /dev/vdc at /data (f2fs)...
+Starting getty loop...
+
+LeandrOS
+
+login: Launching QEMU (PID 33931, arch=aarch64)...
+QEMU started (PID 33931, arch=aarch64)
+Serial socket up. Waiting for login/shell prompt (up to 120s)...
+Login prompt ready (use: driver.py login <user> <password>).
+
+
+[NET] 
+DHCP configured, address: 192.168.105.2
+[?2004h[0m[?25l[44;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h
+
+>>> CONTROL OK (nosuchbinary_xyz42 reported failing)
+
+  vfstest        trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=1094
+  scmtest        trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=4566
+  wakepolltest   trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=948
+  forktest       trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=333
+  epolltest      trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=620
+  polltest       trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=499
+  waittest       trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=369
+  sigtest        trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=421
+  timertest      trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=541
+  memtest        trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=164
+  venustest      trailer=  32  ':FAIL' lines= 32  saw-done=False  bytes=7153
+
+=== M18 REPRODUCER against the FIXED kernel (its own control) ===

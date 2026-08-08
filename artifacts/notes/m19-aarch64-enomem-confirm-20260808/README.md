@@ -219,6 +219,24 @@ the same 60-job burst stops at brush's descriptor limit
 names **no** ceiling — `port table FULL`, `fd-table pool FULL`, `task table FULL`
 and `no reply port for this task` are all 0.
 
+### Re-run after the staging fallback landed
+
+Making `session_data()` fall back to the committed copy changes what this machine
+puts in the image: `m12-caps` and `m12c-input` were in the repo but not in the
+artifacts tree, so they are now staged where before they were silently skipped.
+That is additive — two guest driver scripts in `/bin`, no existing file changed —
+but it is still a change to the image builder made *after* the numbers above were
+taken, so the aarch64 suite was run again on a freshly generated image
+(`run6-regression-aarch64-after-mkfs-fallback.txt`). All eleven binaries read back
+identically: 0 FAIL each with its own `done` marker, `venustest` 32 for the same
+absent-device reason. **The reproducer tail of that re-run was still executing when
+the session was wound down, so it is the one thing here not read back**; the same
+reproducer against the same kernel had already answered errno 24 twice.
+
+The fallback itself was verified directly, by hiding
+`~/code/leandros-artifacts/m6-session-data/m17-census` and confirming the image
+still reports `Packed m17-census (size: 6145 bytes)` from the repo copy.
+
 ## What is x86_64-only, and what is not
 
 Nothing load-bearing is x86_64-only. The list of things that differ:
