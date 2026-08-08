@@ -1,0 +1,401 @@
+=== boot (x86_64, -m 2G) ===
+k::new_userspace: creating userspace task
+Task::new_userspace: userspace task created successfully
+[INIT] load_and_spawn_elf: entry=0x00000000002016A0 sp=0x000000000FFFFFC0
+[INIT] Userspace init spawned with PID: 2
+[INIT] Starting scheduler loop...
+[SCHED] scheduler_run_loop started...
+[SCHED] scheduler_run_loop started...
+[SCHED] scheduler_run_loop started...
+[SCHED] CPU ID: [3SCHED] scheduler_run_loop started...
+[SCHED] CPU ID: 2[SCHED] CPU ID: [0SCHED] CPU ID: 1
+
+
+[
+NLEeTa]n dDrHOCSP  Icnonifti g(uPrIeDd ,1 )a dsdtraerstsi:n g1.0...0
+.I2n.i1t5 
+P
+ID: 2
+Mounting F2FS disk /dev/vdb to /mnt...
+[IPC] ports live=5/512 new high water, pid=2
+F2FS mounted successfully at /mnt!
+[IPC] ports live=6/512 new high water, pid=2
+Pivoting root to /mnt (old root at /mnt/old_root)...
+pivot_root successful! Root is now F2FS.
+Mounting /dev/vdc at /data (f2fs)...
+[IPC] ports live=7/512 new high water, pid=2
+Starting getty loop...
+[IPC] ports live=8/512 new high water, pid=3
+
+LeandrOS
+
+login: Launching QEMU (PID 1868568, arch=x86_64)...
+QEMU started (PID 1868568, arch=x86_64)
+Serial socket up. Waiting for login/shell prompt (up to 120s)...
+Login prompt ready (use: driver.py login <user> <password>).
+
+ 
+
+[?2004h[0m[?25l[48;1H[J[39mbrush-0.5# 
+
+
+=== POSITIVE CONTROL (must FAIL) ===
+[0m[?25l[48;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbi78[?25h[0m[?25l[48;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz4278[?25h
+[?2004l[31merror:[39m command not found
+>>> CONTROL OK
+
+[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /b78[?25h[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m17-census78[?25h
+[?2004l[IPC] ports live=9/512 new high water, pid=5
+[IPC] ports live=10/512 new high water, pid=7
+M17: BEGIN
+MEMINFO boot total=2061295616 free=2022535168 used=38760448 usedpct=1 procs=5 uptime=1
+[IPC] ports live=11/512 new high water, pid=13
+[IPC] ports live=12/512 new high water, pid=14
+M17: busd ready after 1s
+[IPC] ports live=13/512 new high water, pid=18
+[IPC] ports live=14/512 new high water, pid=20
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000012
+[IPC] ports live=15/512 new high water, pid=23
+[IPC] ports live=16/512 new high water, pid=24
+[IPC] ports live=17/512 new high water, pid=25
+[IPC] ports live=18/512 new high water, pid=26
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x000000000000001A
+[IPC] ports live=19/512 new high water, pid=27
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x000000000000000D
+M17: wayland-1 after 1s
+MEMINFO wayland1 total=2061295616 free=1972121600 used=89174016 usedpct=4 procs=8 uptime=3
+M17: MARK SETTLE1 45
+
+===== PHASE SETTLE1 (45s) =====
+  [shot settle1-t4] 1920x1080 colours=1 bg=#000000 non-bg=0.000 diff_vs_prev=None
+  [shot settle1-t22] 1920x1080 colours=35944 bg=#1b1b1b non-bg=0.971 diff_vs_prev=(0, 0, 1916, 1076, 129600)
+  [shot settle1-t39] 1920x1080 colours=35944 bg=#1b1b1b non-bg=0.971 diff_vs_prev=(1000, 8, 1028, 24, 20)
+[GPU] device features hi=0x00000101 lo=0x30000002
+[GPU] *** host does NOT offer VIRTIO_GPU_F_VIRGL -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_RESOURCE_BLOB -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_CONTEXT_INIT -- 3D/Venus unavailable ***
+[GPU] acked features hi=0x00000001 lo=0x00000002
+[IPC] ports live=20/512 new high water, pid=34
+[DRM] unimplemented ioctl cmd=0xC00864BF nr=0x000000BF type=0x00000064 size=0x00000008 (reported once per boot)
+[DRM-SRV] mmap token=0x000000000E800000 map_info=0x01 -> writeback
+[DRM-SRV] mmap token=0x000000000F800000 map_info=0x01 -> writeback
+[IPC] ports live=21/512 new high water, pid=35
+[IPC] ports live=22/512 new high water, pid=38
+[IPC] ports live=23/512 new high water, pid=40
+[IPC] ports live=24/512 new high water, pid=41
+[IPC] ports live=25/512 new high water, pid=42
+[IPC] ports live=26/512 new high water, pid=43
+[IPC] ports live=27/512 new high water, pid=44
+[IPC] ports live=28/512 new high water, pid=4[IPC] ports live=32/512 new high water, pid=55
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000037
+[IPC] ports live=33/512 new high water, pid=62
+[IPC] ports live=34/512 new high water, pid=63
+[IPC] ports live=35/512 new high water, pid=64
+[IPC] ports live=36/512 new high water, pid=67
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000027
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x000000000000002A
+[IPC] ports live=37/512 new high water, pid=71
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000033
+[IPC] ports live=38/512 new high water, pid=76
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000036
+[IPC] ports live=39/512 new high water, pid=75
+[IPC] ports live=40/512 new high water, pid=69
+[IPC] ports live=41/512 new high water, pid=81
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x000000000000002C
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x000000000000002B
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000029
+[IPC] ports live=42/512 new high water, pid=79
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000031
+[IPC] ports live=43/512 new high water, pid=87
+[IPC] ports live=44/512 new high water, pid=84
+[IPC] ports live=45/512 new high water, pid=93
+[IPC] ports live=46/512 new high water, pid=94
+[IPC] ports live=47/512 new high water, pid=96
+[IPC] ports live=48/512 new high water, pid=99
+[IPC] ports live=49/512 new high water, pid=100
+[IPC] ports live=50/512 new high water, pid=101
+[IPC] ports live=51/512 new high water, pid=91
+[IPC] ports live=52/512 new high water, pid=105
+[IPC] ports live=53/512 new high water, pid=85
+[IPC] ports live=54/512 new high water, pid=104
+[IPC] ports live=55/512 new high water, pid=106
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000032
+[IPC] ports live=56/512 new high water, pid=114
+[IPC] ports live=57/512 new high water, pid=116
+[IPC] ports live=58/512 new high water, pid=118
+[IPC] ports live=59/512 new high water, pid=119
+[IPC] ports live=60/512 new high water, pid=109
+[IPC] ports live=61/512 new high water, pid=121
+[IPC] ports live=62/512 new high water, pid=122
+[IPC] ports live=63/512 new high water, pid=120
+[IPC] ports live=64/512 new high water, pid=125
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000028
+[IPC] ports live=65/512 new high water, pid=126
+[IPC] ports live=66/512 new high water, pid=127
+[IPC] ports live=67/512 new high water, pid=128
+[IPC] ports live=68/512 new high water, pid=129
+[IPC] ports live=69/512 new high water, pid=130
+[IPC] ports live=70/512 new high water, pid=132
+[IPC] ports live=71/512 new high water, pid=133
+[IPC] ports live=72/512 new high water, pid=102
+[IPC] ports live=73/512 new high water, pid=135
+[IPC] ports live=74/512 new high water, pid=134
+[IPC] ports live=75/512 new high water, pid=136
+[IPC] ports live=76/512 new high water, pid=140
+[IPC] ports live=77/512 new high water, pid=143
+[IPC] ports live=78/512 new high water, pid=144
+[IPC] ports live=79/512 new high water, pid=145
+[IPC] ports live=80/512 new high water, pid=138
+MEMINFO settle1 total=2061295616 free=1132654592 used=928641024 usedpct=45 procs=20 uptime=48
+M17: ENDMARK SETTLE1
+M17: MARK SETTLE2 45
+
+===== PHASE SETTLE2 (45s) =====
+  [shot settle2-t4] 1920x1080 colours=35944 bg=#1b1b1b non-bg=0.971 diff_vs_prev=(1000, 8, 1028, 24, 16)
+  [shot settle2-t22] 1920x1080 colours=35944 bg=#1b1b1b non-bg=0.971 diff_vs_prev=(964, 8, 1028, 20, 16)
+  [shot settle2-t39] 1920x1080 colours=35944 bg=#1b1b1b non-bg=0.971 diff_vs_prev=(1000, 8, 1028, 20, 16)
+MEMINFO settle2 total=2061295616 free=1131876352 used=929419264 usedpct=45 procs=20 uptime=93
+M17: ENDMARK SETTLE2
+M17: MARK SETTLE3 45
+
+===== PHASE SETTLE3 (45s) =====
+  [shot settle3-t4] 1920x1080 colours=35944 bg=#1b1b1b non-bg=0.971 diff_vs_prev=(1000, 8, 1008, 20, 3)
+  [shot settle3-t22] 1920x1080 colours=35944 bg=#1b1b1b non-bg=0.971 diff_vs_prev=(1000, 8, 1028, 16, 9)
+  [shot settle3-t39] 1920x1080 colours=35944 bg=#1b1b1b non-bg=0.971 diff_vs_prev=(964, 8, 1024, 20, 18)
+MEMINFO settle3 total=2061295616 free=1131122688 used=930172928 usedpct=45 procs=20 uptime=138
+M17: ENDMARK SETTLE3
+M17: ==== BEGIN busd.log ====
+[2m1970-01-01T00:00:01.459645Z[0m [32m INFO[0m [2mbusd[0m[2m:[0m reading configuration file /usr/share/dbus-1/session.conf ...
+[2m1970-01-01T00:00:01.460405Z[0m [32m INFO[0m [2mbusd::bus[0m[2m:[0m Listening on UNIX socket file `/run/user/0/bus`.
+[2m1970-01-01T00:00:08.061298Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.a11y.Bus
+[2m1970-01-01T00:00:08.061507Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicLauncher
+[2m1970-01-01T00:00:08.201761Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.PowerDaemon
+[2m1970-01-01T00:00:08.290299Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicAppLibrary
+[2m1970-01-01T00:00:08.290427Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicWorkspaces
+[2m1970-01-01T00:00:08.355043Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicOnScreenDisplay
+[2m1970-01-01T00:00:08.769999Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:08.770581Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:08.791056Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.UPower
+[2m1970-01-01T00:00:08.834407Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:08.908102Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:08.910055Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:08.911678Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:08.913356Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:08.915033Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:09.381623Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.portal.Desktop
+[2m1970-01-01T00:00:09.382014Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.a11y.Bus
+[2m1970-01-01T00:00:09.382450Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.portal.Desktop
+[2m1970-01-01T00:00:09.386725Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.portal.Desktop
+[2m1970-01-01T00:00:09.640426Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.UPower
+[2m1970-01-01T00:00:09.710270Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.locale1
+[2m1970-01-01T00:00:09.825565Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.portal.Desktop
+[2m1970-01-01T00:00:09.875584Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.portal.Desktop
+[2m1970-01-01T00:00:09.901916Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.portal.Desktop
+[2m1970-01-01T00:00:09.930627Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.a11y.Bus
+[2m1970-01-01T00:00:10.035023Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.login1
+[2m1970-01-01T00:00:10.767316Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.timedate1
+M17: ==== END busd.log ====
+MEMINFO precensus total=2061295616 free=1130856448 used=930439168 usedpct=45 procs=20 uptime=138
+M17: CENSUS DONE
+M17: MARK PROBE 90
+
+===== PHASE PROBE (90s) =====
+  [shot probe-t4] 1920x1080 colours=35944 bg=#1b1b1b non-bg=0.971 diff_vs_prev=(1016, 8, 1028, 24, 11)
+  [shot probe-t45] 1920x1080 colours=17957 bg=#1b1b1b non-bg=0.469 diff_vs_prev=(8, 8, 1556, 1068, 68406)
+  [shot probe-t84] 1920x1080 colours=17957 bg=#1b1b1b non-bg=0.469 diff_vs_prev=(808, 8, 1028, 104, 22)
+[IPC] ports live=81/512 new high water, pid=158
+[IPC] ports live=82/512 new high water, pid=159
+[IPC] ports live=83/512 new high water, pid=163
+[IPC] ports live=84/512 new high water, pid=169
+MEMINFO probe total=2061295616 free=1020379136 used=1040916480 usedpct=50 procs=20 uptime=228
+M17: ENDMARK PROBE
+M17: CAPTURES DONE
+
+>>> guest reports CAPTURES DONE
+>>> draining guest dump...
+
+M17: ---- probe launcher
+276 /data/m17/p-launcher.log
+1970-01-01T00:02:18.730896Z  INFO cosmic-launcher (com.system76.CosmicLauncher)
+1970-01-01T00:02:18.731774Z  INFO Version: 1.0.12 (release)
+1970-01-01T00:02:18.901980Z  INFO Successfully activated another instance
+1970-01-01T00:02:18.904259Z  INFO Another instance is running
+
+M17: ---- end probe launcher
+M17: ---- probe applibrary
+1475 /data/m17/p-applibrary.log
+ INFO  cosmic_app_library > Cosmic App Library (com.system76.CosmicAppLibrary)
+ INFO  cosmic_app_library > Version: 0.1.0
+ INFO  i18n_embed::requester > Current Locale: []
+ INFO  i18n_embed            > Selecting translations for domain "cosmic_app_library"
+ INFO  zbus::connection::handshake::common > write_command; command=Auth(Some(External), Some([48]))
+ INFO  zbus::connection::handshake::common > write_commands; commands=[Auth(Some(External), Some([48]))] extra_bytes=None
+ INFO  tracing::span                       > read_command;
+ INFO  zbus::connection::handshake::common > read_commands; n_commands=1
+ INFO  zbus::connection::handshake::common > write_commands; commands=[NegotiateUnixFD, Begin] extra_bytes=Some([108, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 109, 0, 0, 0, 1, 1, 111, 0, 21, 0, 0, 0, 47, 111, 114, 103, 47, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 47, 68, 66, 117, 
+M17: ---- end probe applibrary
+M17: ---- probe workspaces
+1471 /data/m17/p-workspaces.log
+[1970-01-01T00:02:18Z INFO  i18n_embed::requester] Current Locale: []
+[1970-01-01T00:02:18Z INFO  i18n_embed] Selecting translations for domain "cosmic_workspaces"
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_command; command=Auth(Some(External), Some([48]))
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_commands; commands=[Auth(Some(External), Some([48]))] extra_bytes=None
+[1970-01-01T00:02:18Z INFO  tracing::span] read_command;
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] read_commands; n_commands=1
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_commands; commands=[NegotiateUnixFD, Begin] extra_bytes=Some([108, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 109, 0, 0, 0, 1, 1, 111, 0, 21, 0, 0, 0, 47, 111, 114, 103, 47, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 47, 68, 66, 117, 115, 0, 0, 0, 2,
+M17: ---- end probe workspaces
+M17: ---- probe osd
+1307 /data/m17/p-osd.log
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_command; command=Auth(Some(External), Some([48]))
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_commands; commands=[Auth(Some(External), Some([48]))] extra_bytes=None
+[1970-01-01T00:02:18Z INFO  tracing::span] read_command;
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] read_commands; n_commands=1
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_commands; commands=[NegotiateUnixFD, Begin] extra_bytes=Some([108, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 109, 0, 0, 0, 1, 1, 111, 0, 21, 0, 0, 0, 47, 111, 114, 103, 47, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 47, 68, 66, 117, 115, 0, 0, 0, 2, 1, 115, 0, 20, 0, 0, 0, 111, 114, 103, 46, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 46, 68, 66, 117, 115, 0, 0, 0, 0, 3, 1, 115, 0, 5, 0, 0, 0, 72, 1
+M17: ---- end probe osd
+MEMINFO final total=2061295616 free=1007083520 used=1054212096 usedpct=51 procs=20 uptime=228
+M17: ==== BEGIN cosmic.log (tail) ====
+ge_external", "GL_OES_EGL_sync", "GL_OES_vertex_array_object", "GL_OES_viewport_array", "GL_ANGLE_pack_reverse_row_order", "GL_ANGLE_texture_compression_dxt3", "GL_ANGLE_texture_compression_dxt5", "GL_EXT_occlusion_query_boolean", "GL_EXT_sRGB", "GL_EXT_texture_rg", "GL_EXT_unpack_subimage", "GL_NV_draw_buffers", "GL_NV_read_buffer", "GL_NV_read_depth", "GL_NV_read_depth_stencil", "GL_NV_read_stencil", "GL_APPLE_sync", "GL_EXT_draw_buffers", "GL_EXT_instanced_arrays", "GL_EXT_map_buffer_range", "GL_EXT_shadow_samplers", "GL_KHR_debug", "GL_KHR_texture_compression_astc_ldr", "GL_NV_generate_mipmap_sRGB", "GL_NV_pixel_buffer_object", "GL_OES_depth_texture_cube_map", "GL_OES_required_internalformat", "GL_OES_surfaceless_context", "GL_EXT_color_buffer_float", "GL_EXT_debug_label", "GL_EXT_sRGB_write_control", "GL_EXT_separate_shader_objects", "GL_EXT_shader_implicit_conversions", "GL_EXT_shader_integer_mix", "GL_EXT_base_instance", "GL_EXT_compressed_ETC1_RGB8_sub_texture", "GL_EXT_copy_image", "GL_EXT_draw_buffers_indexed", "GL_EXT_draw_elements_base_vertex", "GL_EXT_gpu_shader5", "GL_EXT_multi_draw_indirect", "GL_EXT_primitive_bounding_box", "GL_EXT_render_snorm", "GL_EXT_shader_io_blocks", "GL_EXT_texture_border_clamp", "GL_EXT_texture_buffer", "GL_EXT_texture_cube_map_array", "GL_EXT_texture_norm16", "GL_EXT_texture_view", "GL_KHR_context_flush_control", "GL_NV_image_formats", "GL_NV_shader_noperspective_interpolation", "GL_OES_copy_image", "GL_OES_draw_buffers_indexed", "GL_OES_draw_elements_base_vertex", "GL_OES_gpu_shader5", "GL_OES_primitive_bounding_box", "GL_OES_shader_io_blocks", "GL_OES_texture_border_clamp", "GL_OES_texture_buffer", "GL_OES_texture_cube_map_array", "GL_OES_texture_stencil8", "GL_OES_texture_storage_multisample_2d_array", "GL_OES_texture_view", "GL_EXT_blend_func_extended", "GL_EXT_buffer_storage", "GL_EXT_float_blend", "GL_EXT_geometry_point_size", "GL_EXT_geometry_shader", "GL_EXT_texture_sRGB_R8", "GL_EXT_texture_sRGB_RG8", "GL_KHR_no_error", "GL_KHR_texture_compression_astc_sliced_3d", "GL_OES_EGL_image_external_essl3", "GL_OES_geometry_point_size", "GL_OES_geometry_shader", "GL_OES_shader_image_atomic", "GL_EXT_clear_texture", "GL_EXT_clip_cull_distance", "GL_EXT_conservative_depth", "GL_EXT_disjoint_timer_query", "GL_EXT_texture_compression_s3tc_srgb", "GL_MESA_shader_integer_functions", "GL_EXT_clip_control", "GL_EXT_color_buffer_half_float", "GL_EXT_texture_compression_bptc", "GL_EXT_texture_mirror_clamp_to_edge", "GL_KHR_parallel_shader_compile", "GL_EXT_EGL_image_storage", "GL_MESA_framebuffer_flip_y", "GL_EXT_depth_clamp", "GL_EXT_texture_query_lod", "GL_MESA_sampler_objects", "GL_EXT_EGL_image_storage_compression", "GL_EXT_texture_storage_compression", "GL_MESA_bgra", ""]
+[2m1970-01-01T00:00:12.693946Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:12.693506Z\x1b[0m \x1b[32m INFO\x1b[0m Scale factor changed 1 for as surface in space "Dock" on HDMI-A-1
+[2m1970-01-01T00:00:12.700036Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:12.693590Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1megl\x1b[0m\x1b[1m{\x1b[0m\x1b[3mplatform\x1b[0m\x1b[2m=\x1b[0m"PLATFORM_WAYLAND_KHR" \x1b[3mversion\x1b[0m\x1b[2m=\x1b[0m(1, 5)\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1megl_context\x1b[0m\x1b[2m:\x1b[0m Selected color format: PixelFormat { hardware_accelerated: true, color_bits: 24, alpha_bits: 8, depth_bits: 24, stencil_bits: 8, stereoscopy: false, multisampling: None, srgb: false }
+[2m1970-01-01T00:00:12.829999Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:12.829720Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1megl\x1b[0m\x1b[1m{\x1b[0m\x1b[3mplatform\x1b[0m\x1b[2m=\x1b[0m"PLATFORM_WAYLAND_KHR" \x1b[3mversion\x1b[0m\x1b[2m=\x1b[0m(1, 5)\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m\x1b[1megl_context\x1b[0m\x1b[1m{\x1b[0m\x1b[3mptr\x1b[0m\x1b[2m=\x1b[0m2634799872\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m EGL context created \x1b[3mpriority\x1b[0m\x1b[2m=\x1b[0mNone
+[2m1970-01-01T00:00:12.854744Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mNo valid locale found in environment, using fallback\x1b[0m
+[2m1970-01-01T00:00:12.856930Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/localize.rs:69 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:12.858491Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:12.862267Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mrescan_tab Entity(1v1) Desktop("/root/Desktop", "", DesktopConfig { grid_spacing: 100, icon_size: 100, show_content: true, show_mounted_drives: false, show_trash: false }) None\x1b[0m
+[2m1970-01-01T00:00:12.865070Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/app.rs:1512 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:12.866700Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:12.872088Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to read directory /root/Desktop: No such file or directory (os error 2)\x1b[0m
+[2m1970-01-01T00:00:12.873640Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/tab.rs:1086 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:12.875326Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:12.878667Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to get item for /root/Desktop: failed to read metadata for /root/Desktop: No such file or directory (os error 2)\x1b[0m
+[2m1970-01-01T00:00:12.879999Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/tab.rs:1611 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:12.879999Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:12.893764Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mSCTK setup complete.\x1b[0m
+[2m1970-01-01T00:00:12.893841Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/iced/winit/src/platform_specific/wayland/event_loop/mod.rs:465 \x1b[2;3mon\x1b[0m 
+[2m1970-01-01T00:00:12.893876Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:12.896675Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mSystem theme: None\x1b[0m
+[2m1970-01-01T00:00:12.897094Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/iced/winit/src/lib.rs:843 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:12.897120Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:12.906970Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:12.907921Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:12.939188Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mcould not find any valid trash bins to watch: Unknown { description: "The 'home trash' either does not exist or is not a directory (or a link pointing to a dir)" }\x1b[0m
+[2m1970-01-01T00:00:12.939999Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/app.rs:6864 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:12.941987Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:13.108624Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32moutput wl_output@39: created\x1b[0m
+[2m1970-01-01T00:00:13.110033Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/app.rs:5258 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:13.111629Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:13.117128Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to locate desktop directory, falling back to /root/Desktop\x1b[0m
+[2m1970-01-01T00:00:13.117230Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/lib.rs:50 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:13.117329Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:13.117568Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mrescan_tab Entity(2v1) Desktop("/root/Desktop", "HDMI-A-1", DesktopConfig { grid_spacing: 100, icon_size: 100, show_content: true, show_mounted_drives: false, show_trash: false }) None\x1b[0m
+[2m1970-01-01T00:00:13.117597Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/app.rs:1512 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:13.117623Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:13.117647Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to read directory /root/Desktop: No such file or directory (os error 2)\x1b[0m
+[2m1970-01-01T00:00:13.117674Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/tab.rs:1086 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:13.117702Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:13.117729Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to get item for /root/Desktop: failed to read metadata for /root/Desktop: No such file or directory (os error 2)\x1b[0m
+[2m1970-01-01T00:00:13.117754Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/tab.rs:1611 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:13.117780Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:13.124673Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[31mERROR\x1b[0m  \x1b[31mOverlap notify subscription cannot be created for surface. No matching layer surface found.\x1b[0m
+[2m1970-01-01T00:00:13.124707Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/iced/winit/src/platform_specific/wayland/event_loop/state.rs:1678 \x1b[2;3mon\x1b[0m 
+[2m1970-01-01T00:00:13.125713Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:13.154429Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:13.147485Z\x1b[0m \x1b[32m INFO\x1b[0m Cell { value: None }
+[2m1970-01-01T00:00:13.160054Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:13.147758Z\x1b[0m \x1b[32m INFO\x1b[0m Cell { value: None }
+[2m1970-01-01T00:00:13.160232Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:13.152619Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[1mstderr\x1b[0m\x1b[1m{\x1b[0m\x1b[3mclient\x1b[0m\x1b[2m=\x1b[0mInnerClientId { ptr: 0x9c565410, alive: true }\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m com.system76.CosmicAppletTime: leandros-applet: entering event loop
+[2m1970-01-01T00:00:13.160260Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:13.152646Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[1mstderr\x1b[0m\x1b[1m{\x1b[0m\x1b[3mclient\x1b[0m\x1b[2m=\x1b[0mInnerClientId { ptr: 0x9c565410, alive: true }\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m com.system76.CosmicAppletTime: leandros-applet: tick: 1000ms
+[2m1970-01-01T00:00:13.168644Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:13.168437Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[1mstderr\x1b[0m\x1b[1m{\x1b[0m\x1b[3mclient\x1b[0m\x1b[2m=\x1b[0mInnerClientId { ptr: 0x9c565410, alive: true }\x1b[1m}\x1b[0m\x1b[2m:\x1b[0m com.system76.CosmicAppletTime: leandros-applet: committed 220x32 clock
+[2m1970-01-01T00:00:13.173126Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:13.171543Z\x1b[0m \x1b[32m INFO\x1b[0m Requires relayout: resizing list
+[2m1970-01-01T00:00:13.173155Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m 
+[2m1970-01-01T00:00:13.173180Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m Stack backtrace:
+[2m1970-01-01T00:00:13.173204Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    0: <unknown>
+[2m1970-01-01T00:00:13.173227Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    1: <unknown>
+[2m1970-01-01T00:00:13.173251Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    2: <unknown>
+[2m1970-01-01T00:00:13.173276Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    3: <unknown>
+[2m1970-01-01T00:00:13.173300Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    4: <unknown>
+[2m1970-01-01T00:00:13.173324Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    5: <unknown>
+[2m1970-01-01T00:00:13.173348Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    6: <unknown>
+[2m1970-01-01T00:00:13.173372Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m    7: <unknown>
+[2m1970-01-01T00:00:13.173396Z[0m [32m INFO[0m [1mcosmic-panel[0m[2m:[0m [2mcosmic_session::notifications[0m[2m:[0m \x1b[2m1970-01-01T00:00:13.172936Z\x1b[0m \x1b[32m INFO\x1b[0m Cell { value: None }
+[2m1970-01-01T00:00:13.288094Z[0m [33m WARN[0m [1mcosmic-app-library[0m[2m:[0m [2mcosmic_session[0m[2m:[0m  INFO  iced_winit::platform_specific::wayland::event_loop::state > Failed to find surface for blur action
+[2m1970-01-01T00:00:13.288129Z[0m [33m WARN[0m [1mcosmic-app-library[0m[2m:[0m [2mcosmic_session[0m[2m:[0m  INFO  iced_winit::platform_specific::wayland::event_loop::state > Failed to find surface for blur action
+[2m1970-01-01T00:02:18.875793Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:02:18.877114Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:02:18.877169Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:02:18.901713Z[0m [33m WARN[0m [1mcosmic-app-library[0m[2m:[0m [2mcosmic_session[0m[2m:[0m  INFO  zbus::object_server                                       > dispatch_call; msg=Msg { type: MethodCall, serial: 2, sender: UniqueName(":busd.44"), path: ObjectPath("/com/system76/CosmicAppLibrary"), iface: InterfaceName("org.freedesktop.DbusActivation"), member: MemberName("Activate"), body: Dict { key: Dynamic { child: Str }, value: Dynamic { child: Variant } }, fds: [] } hdr=Header { primary: PrimaryHeader { endian_sig: Little, msg_type: MethodCall, flags: BitFlags<Flags>(0b0), protocol_version: 1, body_len: 8, serial_num: 2 }, fields: Fields { path: Some(ObjectPath("/com/system76/CosmicAppLibrary")), interface: Some(InterfaceName("org.freedesktop.DbusActivation")), member: Some(MemberName("Activate")), error_name: None, reply_serial: None, destination: Some(BusName::WellKnown("com.system76.CosmicAppLibrary")), sender: Some(UniqueName(":busd.44")), signature: Dict { key: Dynamic { child: Str }, value: Dynamic { child: Variant } }, unix_fds: None } }
+[2m1970-01-01T00:02:18.901750Z[0m [33m WARN[0m [1mcosmic-workspaces[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  zbus::object_server] dispatch_call; msg=Msg { type: MethodCall, serial: 2, sender: UniqueName(":busd.45"), path: ObjectPath("/com/system76/CosmicWorkspaces"), iface: InterfaceName("org.freedesktop.DbusActivation"), member: MemberName("Activate"), body: Dict { key: Dynamic { child: Str }, value: Dynamic { child: Variant } }, fds: [] } hdr=Header { primary: PrimaryHeader { endian_sig: Little, msg_type: MethodCall, flags: BitFlags<Flags>(0b0), protocol_version: 1, body_len: 8, serial_num: 2 }, fields: Fields { path: Some(ObjectPath("/com/system76/CosmicWorkspaces")), interface: Some(InterfaceName("org.freedesktop.DbusActivation")), member: Some(MemberName("Activate")), error_name: None, reply_serial: None, destination: Some(BusName::WellKnown("com.system76.CosmicWorkspaces")), sender: Some(UniqueName(":busd.45")), signature: Dict { key: Dynamic { child: Str }, value: Dynamic { child: Variant } }, unix_fds: None } }
+[2m1970-01-01T00:02:18.901778Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:02:18.907583Z[0m [32m INFO[0m [1mcosmic-launcher[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 1970-01-01T00:02:18.906884Z ERROR pop-launcher failed to start: No such file or directory (os error 2)
+[2m1970-01-01T00:02:18.907642Z[0m [33m WARN[0m [1mcosmic-workspaces[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  iced_winit::platform_specific::wayland::event_loop::state] Failed to find surface for blur action
+[2m1970-01-01T00:02:18.925432Z[0m [33m WARN[0m [1mcosmic-app-library[0m[2m:[0m [2mcosmic_session[0m[2m:[0m  INFO  zbus::connection::handshake::common                       > write_command; command=Auth(Some(External), Some([48]))
+[2m1970-01-01T00:02:18.925466Z[0m [33m WARN[0m [1mcosmic-app-library[0m[2m:[0m [2mcosmic_session[0m[2m:[0m  INFO  zbus::connection::handshake::common                       > write_commands; commands=[Auth(Some(External), Some([48]))] extra_bytes=None
+[2m1970-01-01T00:02:18.925496Z[0m [33m WARN[0m [1mcosmic-app-library[0m[2m:[0m [2mcosmic_session[0m[2m:[0m  INFO  tracing::span                                             > read_command;
+[2m1970-01-01T00:02:18.925521Z[0m [33m WARN[0m [1mcosmic-app-library[0m[2m:[0m [2mcosmic_session[0m[2m:[0m  INFO  zbus::connection::handshake::common                       > read_commands; n_commands=1
+[2m1970-01-01T00:02:18.938958Z[0m [33m WARN[0m [1mcosmic-app-library[0m[2m:[0m [2mcosmic_session[0m[2m:[0m  INFO  zbus::connection::handshake::common                       > write_commands; commands=[NegotiateUnixFD, Begin] extra_bytes=Some([108, 1, 0, 1, 0, 0, 0, 0, 46, 0, 0, 0, 109, 0, 0, 0, 1, 1, 111, 0, 21, 0, 0, 0, 47, 111, 114, 103, 47, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 47, 68, 66, 117, 115, 0, 0, 0, 2, 1, 115, 0, 20, 0, 0, 0, 111, 114, 103, 46, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 46, 68, 66, 117, 115, 0, 0, 0, 0, 3, 1, 115, 0, 5, 0, 0, 0, 72, 101, 108, 108, 111, 0, 0, 0, 6, 1, 115, 0, 20, 0, 0, 0, 111, 114, 103, 46, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 46, 68, 66, 117, 115, 0, 0, 0, 0])
+[2m1970-01-01T00:02:18.939642Z[0m [33m WARN[0m [1mcosmic-app-library[0m[2m:[0m [2mcosmic_session[0m[2m:[0m  INFO  zbus::connection::handshake::common                       > read_commands; n_commands=1
+[2m1970-01-01T00:02:18.939668Z[0m [33m WARN[0m [1mcosmic-app-library[0m[2m:[0m [2mcosmic_session[0m[2m:[0m  INFO  zbus::proxy                                               > {}; task_name="net.hadess.SwitcherooControl proxy caching"
+[2m1970-01-01T00:02:18.939694Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:02:18.939718Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:02:18.960747Z[0m [33m WARN[0m [1mcosmic-osd[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  zbus::object_server] dispatch_call; msg=Msg { type: MethodCall, serial: 2, sender: UniqueName(":busd.46"), path: ObjectPath("/com/system76/CosmicOnScreenDisplay"), iface: InterfaceName("org.freedesktop.DbusActivation"), member: MemberName("Activate"), body: Dict { key: Dynamic { child: Str }, value: Dynamic { child: Variant } }, fds: [] } hdr=Header { primary: PrimaryHeader { endian_sig: Little, msg_type: MethodCall, flags: BitFlags<Flags>(0b0), protocol_version: 1, body_len: 8, serial_num: 2 }, fields: Fields { path: Some(ObjectPath("/com/system76/CosmicOnScreenDisplay")), interface: Some(InterfaceName("org.freedesktop.DbusActivation")), member: Some(MemberName("Activate")), error_name: None, reply_serial: None, destination: Some(BusName::WellKnown("com.system76.CosmicOnScreenDisplay")), sender: Some(UniqueName(":busd.46")), signature: Dict { key: Dynamic { child: Str }, value: Dynamic { child: Variant } }, unix_fds: None } }
+[2m1970-01-01T00:02:18.962594Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:02:18.962773Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:02:18.969999Z[0m [33m WARN[0m [1mcosmic-app-library[0m[2m:[0m [2mcosmic_session[0m[2m:[0m  WARN  zbus::proxy                                               > Failed to populate properties cache via GetAll: org.freedesktop.DBus.Error.ServiceUnknown: The name net.hadess.SwitcherooControl was not provided by any .service files. Property change streams will not produce values.
+[2m1970-01-01T00:02:18.970000Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:02:18.980506Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:02:18Z INFO  tracing::span] read_socket;
+
+M17: ==== END cosmic.log ====
+M17: DONE
+>>> serial log: /tmp/m18-patched-512/serial.log
+
+========================================================================
+CENSUS — `busd::peers: unknown destination:` by name
+========================================================================
+    8  com.system76.CosmicSettingsDaemon
+    6  org.freedesktop.portal.Desktop
+    3  org.a11y.Bus
+    2  org.freedesktop.UPower
+    1  com.system76.CosmicAppLibrary
+    1  com.system76.CosmicLauncher
+    1  com.system76.CosmicOnScreenDisplay
+    1  com.system76.CosmicWorkspaces
+    1  com.system76.PowerDaemon
+    1  org.freedesktop.locale1
+    1  org.freedesktop.login1
+    1  org.freedesktop.timedate1
+  total lines: 27   distinct names: 12
+
+  prediction (the four autostarted single-instance components):
+    HIT  com.system76.CosmicLauncher  (as com.system76.CosmicLauncher, x1)
+    HIT  com.system76.CosmicOnScreenDisplay  (as com.system76.CosmicOnScreenDisplay, x1)
+    HIT  com.system76.CosmicWorkspaces  (as com.system76.CosmicWorkspaces, x1)
+    HIT  com.system76.CosmicAppLibrary  (as com.system76.CosmicAppLibrary, x1)
+
+========================================================================
+FAULTS
+========================================================================
+  x86_64 `user page fault ... task killed` : 0
+  aarch64 `[EXC] EL0 Fault!`               : 0
+
+========================================================================
+MEMORY (sysinfo(2), i.e. the buddy allocator's own view)
+========================================================================
+  boot         total=  1965.8 MiB  free=  1928.8 MiB  used=    37.0 MiB  (1%)  procs=5
+  wayland1     total=  1965.8 MiB  free=  1880.8 MiB  used=    85.0 MiB  (4%)  procs=8
+  settle1      total=  1965.8 MiB  free=  1080.2 MiB  used=   885.6 MiB  (45%)  procs=20
+  settle2      total=  1965.8 MiB  free=  1079.4 MiB  used=   886.4 MiB  (45%)  procs=20
+  settle3      total=  1965.8 MiB  free=  1078.7 MiB  used=   887.1 MiB  (45%)  procs=20
+  precensus    total=  1965.8 MiB  free=  1078.5 MiB  used=   887.3 MiB  (45%)  procs=20
+  probe        total=  1965.8 MiB  free=   973.1 MiB  used=   992.7 MiB  (50%)  procs=20
+  final        total=  1965.8 MiB  free=   960.4 MiB  used=  1005.4 MiB  (51%)  procs=20
+  trough: final with 960.4 MiB free
+  `[SCHED] task table FULL`                : 0
+  userspace `Out of memory (os error 12)`  : 0
+
+========================================================================
+PROBE — hand-started second copies, stderr byte counts
+========================================================================
+  launcher         276 B
+  applibrary      1475 B
+  workspaces      1471 B
+  osd             1307 B
+    1x  "Another instance is running"  — an autostarted copy OWNS the name -> it got through the probe
+    1x  "Successfully activated another instance"  — activation round-tripped

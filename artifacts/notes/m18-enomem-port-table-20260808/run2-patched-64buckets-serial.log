@@ -1,0 +1,107 @@
+[0m[?25l[48;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbi78[?25h[0m[?25l[48;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz4278[?25h
+[?2004l[31merror:[39m command not found: nosuchbinary_xyz42
+[?2004h[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /b78[?25h[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m17-census78[?25h
+[?2004l[IPC] ports live=9/64 new high water, pid=5
+[IPC] ports live=10/64 new high water, pid=7
+M17: BEGIN
+MEMINFO boot total=2064760832 free=2026000384 used=38760448 usedpct=1 procs=5 uptime=1
+[IPC] ports live=11/64 new high water, pid=13
+[IPC] ports live=12/64 new high water, pid=14
+M17: busd ready after 1s
+[IPC] ports live=13/64 new high water, pid=18
+[IPC] ports live=14/64 new high water, pid=20
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000012
+[IPC] ports live=15/64 new high water, pid=23
+[IPC] ports live=16/64 new high water, pid=24
+[IPC] ports live=17/64 new high water, pid=25
+[IPC] ports live=18/64 new high water, pid=26
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x000000000000001A
+[IPC] ports live=19/64 new high water, pid=27
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x000000000000000D
+M17: wayland-1 after 1s
+MEMINFO wayland1 total=2064760832 free=1975586816 used=89174016 usedpct=4 procs=8 uptime=3
+M17: MARK SETTLE1 45
+[GPU] device features hi=0x00000101 lo=0x30000002
+[GPU] *** host does NOT offer VIRTIO_GPU_F_VIRGL -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_RESOURCE_BLOB -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_CONTEXT_INIT -- 3D/Venus unavailable ***
+[GPU] acked features hi=0x00000001 lo=0x00000002
+[IPC] ports live=20/64 new high water, pid=34
+[DRM] unimplemented ioctl cmd=0xC00864BF nr=0x000000BF type=0x00000064 size=0x00000008 (reported once per boot)
+[DRM-SRV] mmap token=0x000000000E800000 map_info=0x01 -> writeback
+[DRM-SRV] mmap token=0x000000000F000000 map_info=0x01 -> writeback
+[IPC] ports live=21/64 new high water, pid=35
+[IPC] ports live=22/64 new high water, pid=38
+[IPC] ports live=23/64 new high water, pid=40
+[IPC] ports live=24/64 new high water, pid=44
+[IPC] ports live=25/64 new high water, pid=45
+[IPC] ports live=26/64 new high water, pid=46
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused p[IPC] ports live=27/64 new high water, pid=47
+[IPC] ports live=28/64 new high water, pid=48
+[IPC] ports live=29/64 new high water, pid=49
+[IPC] ports live=30/64 new high water, pid=50
+[IPC] ports live=31/64 new high water, pid=52
+[IPC] ports live=32/64 new high water, pid=53
+[IPC] ports live=33/64 new high water, pid=55
+[IPC] ports live=34/64 new high water, pid=54
+[IPC] ports live=35/64 new high water, pid=56
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000027
+[IPC] ports live=36/64 new high water, pid=66
+[IPC] ports live=37/64 new high water, pid=59
+[IPC] ports live=38/64 new high water, pid=71
+[IPC] ports live=39/64 new high water, pid=61
+[IPC] ports live=40/64 new high water, pid=75
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000034
+[IPC] ports live=41/64 new high water, pid=78
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000037
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x000000000000002C
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused[ENOMEM] reason= pid=v0mxa0-0o0v0e0rl00ap00 0[0E0N0O02MEEM] brk/refused pid=
+0x0000000000000030
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000031
+[IPC] ports live=42/64 new high water, pid=87
+[IPC] ports live=43/64 new high water, pid=81
+[IPC] ports live=44/64 new high water, pid=85
+[IPC] ports live=45/64 new high water, pid=89
+[IPC] ports live=46/64 new high water, pid=88
+[IPC] ports live=47/64 new high water, pid=90
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x000000000000002F
+[IPC] ports live=48/64 new high water, pid=92
+[IPC] ports live=49/64 new high water, pid=101
+[IPC] ports live=50/64 new high water, pid=102
+[IPC] ports live=51/64 new high water, pid=103
+[IPC] ports live=52/64 new high water, pid=106
+[IPC] ports live=53/64 new high water, pid=107
+[IPC] ports live=54/64 new high wa[tEeNrO,M EpMi]d =r1e0a8s
+on=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000032
+[IPC] ports live=55/64 new high water, pid=110
+[IPC] ports live=56/64 new high water, pid=112
+[IPC] ports live=57/64 new high water, pid=114
+[IPC] ports live=58/64 new high water, pid=116
+[IPC] ports live=59/64 new high water, pid=117
+[IPC] ports live=60/64 new high water, pid=109
+[IPC] ports live=61/64 new high water, pid=119
+[IPC] ports live=62/64 new high water, pid=118
+[IPC] ports live=63/64 new high water, pid=120
+[IPC] ports live=64/64 new high water, pid=123
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000028
+
+[IPC] port table FULL: 64/64 live buckets -- port::create now fails, and every caller
+[IPC] turns that into ENOMEM; this is ipc::port::LIVE_BUCKETS, not RAM
+
+[VFS] ENOMEM: no reply port for this task -- every call to a mounted
+[VFS] filesystem (open/stat/getdents64/exec) now returns errno 12. Not RAM.
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x000000000000007D
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000086
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000087
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x0000000000000090
+[PF] handle_user_page_fault returned false
+user page fault RIP=0x000000008ADE5174 CR2=0x0000000000000880 CR3=0x0000000061B28000 err=0x0000000000000004: task killed
+  PML4[0000000000000000]=0x000000006171f027
+  PDPT[0000000000000000]=0x00000000616d0027
+  PD[0000000000000000]=0x0000000000000000
+[PF] no address space for faulting task
+user page fault RIP=0x0000000000B3AFFD CR2=0x00000000000F4166 CR3=0x0000000061320000 err=0x0000000000000006: task killed
+  PML4[0000000000000000]=0x000000006d5a1027
+  PDPT[0000000000000000]=0x000000006d5ae027
+  PD[0000000000000000]=0x0000000000000000
+[ENOMEM] reason=vma-overlap [ENOMEM] brk/refused pid=0x00000000000000A0
