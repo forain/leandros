@@ -144,17 +144,95 @@ pub extern "C" fn cpu_id() -> usize {
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn putc(c: u8) {
     use core::arch::asm;
+    use core::sync::atomic::Ordering::Relaxed;
 
-    // Wait for transmit holding register to be empty (bit 5 of LSR)
-    loop {
+    // Wait for the transmit holding register to be empty (LSR bit 5) — with a
+    // DEADLINE, and it has to keep one.
+    //
+    // `putc` runs in IRQ context: the timer tick's 0.5 Hz diagnostics census,
+    // panic paths and `pci::serial_debug` all reach it. QEMU's 16550 withholds
+    // LSR.THRE for exactly as long as its chardev back end refuses the byte
+    // (`hw/char/serial.c:serial_xmit` installs a G_IO_OUT watch on EAGAIN and
+    // returns without setting THRE), so a serial consumer that stops reading
+    // used to park this loop *forever* inside the timer IRQ handler — freezing
+    // TICK_COUNT, the scheduler tick and `virtio_keyboard::poll_events` on this
+    // CPU. Measured cost of that wedge: 1086 of 1200 injected pointer frames
+    // dropped by the host for want of a posted eventq buffer, which is the loss
+    // a rate ladder had previously read as the input path starving under load.
+    //
+    // It takes no load at all to provoke: a host that merely holds the serial
+    // socket open and stops reading is enough. Measured on one boot, 60
+    // pointer moves/s, three phases differing in nothing else -- consumer
+    // parked 9.5% of frames delivered, consumer reading 100%, no consumer
+    // attached 100% (QEMU discards output when nobody is connected, so it never
+    // back-pressures). artifacts/m15_serial_stall.py is that measurement.
+    //
+    // THE CONTRACT IS: console output may be lost, an interrupt handler may not
+    // be stalled. Two parts to keeping it cheap —
+    //   * the wait is bounded by the cycle counter, not by an iteration count,
+    //     because one `in al, dx` costs ~1 us against a real UART and a full
+    //     exit to host userspace (~10 us) against an emulated one; an iteration
+    //     bound safe for the first is a ~100 ms stall in the second.
+    //   * once the wait expires, TX_WEDGED latches, and while it is set each
+    //     later byte costs a single LSR probe instead of a whole deadline. The
+    //     first probe that finds THRE clears it. So a back-pressured console
+    //     costs one deadline per episode, not one per byte.
+    if TX_WEDGED.load(Relaxed) {
         let lsr: u8;
         asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
-        if lsr & 0x20 != 0 { break; }
+        if lsr & 0x20 == 0 {
+            UART_TX_DROPPED.fetch_add(1, Relaxed);
+            return;
+        }
+        TX_WEDGED.store(false, Relaxed);
+    } else {
+        let deadline = rdtsc_raw().wrapping_add(UART_TX_WAIT_CYCLES);
+        loop {
+            let lsr: u8;
+            asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
+            if lsr & 0x20 != 0 { break; }
+            if rdtsc_raw().wrapping_sub(deadline) < (1u64 << 63) {
+                TX_WEDGED.store(true, Relaxed);
+                UART_TX_DROPPED.fetch_add(1, Relaxed);
+                return;
+            }
+            core::hint::spin_loop();
+        }
     }
 
     // Send the character
     asm!("out dx, al", in("dx") 0x3F8u16, in("al") c, options(nomem, nostack));
 }
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn rdtsc_raw() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                     options(nomem, nostack, preserves_flags));
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// How long `putc` will wait for the UART transmitter before giving the byte
+/// up, in TSC cycles. Deliberately a raw cycle count and not a calibrated
+/// interval: this runs before (and independently of) timer calibration. ~7 ms
+/// at 3 GHz, ~20 ms on a 1 GHz part — either way orders of magnitude above the
+/// ~87 us a real 16550 needs at 115200 baud, and short enough that a wedged
+/// host back end cannot eat a scheduling quantum's worth of ticks.
+pub const UART_TX_WAIT_CYCLES: u64 = 20_000_000;
+
+/// Latched when a `putc` wait expires; cleared by the first later probe that
+/// finds the transmitter free. Keeps a back-pressured console at one probe per
+/// byte instead of one full deadline per byte.
+static TX_WEDGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Console bytes dropped because the UART transmitter never reported itself
+/// empty in time. Non-zero means console output was traded away to keep this
+/// CPU's interrupt handler making progress.
+pub static UART_TX_DROPPED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Compatibility wrapper for serial output.
 pub fn arch_serial_putc(c: u8) {

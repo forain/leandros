@@ -6986,6 +6986,20 @@ fn evstat_tick() {
         mm::gap2::kv(" ipid=",    c.ipid    as usize);
         mm::gap2::nl();
     }
+    if drivers::virtio_keyboard::VQ_STATS {
+        let v = drivers::virtio_keyboard::vq_census();
+        mm::gap2::s("[VQSTAT] t=");   mm::gap2::h(now);
+        mm::gap2::kv(" polls=",   v.polls   as usize);
+        mm::gap2::kv(" skips=",   v.skips   as usize);
+        mm::gap2::kv(" drained=", v.drained as usize);
+        mm::gap2::kv(" maxb=",    v.maxb    as usize);
+        mm::gap2::kv(" minfree=", v.minfree as usize);
+        mm::gap2::kv(" starve=",  v.starve  as usize);
+        mm::gap2::kv(" aidx=",    v.aidx    as usize);
+        mm::gap2::kv(" uidx=",    v.uidx    as usize);
+        mm::gap2::kv(" notify=",  v.notify  as usize);
+        mm::gap2::nl();
+    }
 }
 
 pub fn poll_deadline_tick() {
