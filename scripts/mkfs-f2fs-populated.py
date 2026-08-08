@@ -940,11 +940,17 @@ def main():
     # something greetd or the .desktop file can steer.
     #
     # Its absence is invisible at every layer, which is why it cost a lane a
-    # day: brush's `exec` of a missing ABSOLUTE path prints nothing (measured
-    # on target — a bare name does print "command not found", an absolute one
-    # does not), and greetd throws a session's exit status away
-    # (session/worker.rs: `waitpid(child, None)` -> `Ok(_) => break`). The only
-    # symptom is the greeter reappearing a second after a correct password.
+    # day. brush reports a missing command only on its INTERACTIVE path; the
+    # non-interactive `sh -c 'exec <missing>'` form — which is exactly the form
+    # greetd's source_profile wrapper uses — prints nothing at all and exits
+    # 127. Measured on target, both arms in one boot: `sh -c 'exec
+    # /usr/bin/nosuchabs'` and `sh -c 'exec nosuchbare'` each produced no
+    # output and rc=127, while a bare name typed at the prompt did print
+    # "command not found". So the path form is NOT the discriminator, the
+    # interactive/non-interactive split is. greetd then throws the session's
+    # exit status away (session/worker.rs: `waitpid(child, None)` ->
+    # `Ok(_) => break`), so the 127 is discarded too. The only symptom is the
+    # greeter reappearing a second after a correct password.
     #
     # A second directory entry costs no content: add_files_to_dir dedupes by
     # host path and hardlinks, exactly as the ~100 names in /bin already do.
