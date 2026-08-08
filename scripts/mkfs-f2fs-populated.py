@@ -251,6 +251,7 @@ def main():
         "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest",
         "waittest", "sigchldtest", "scmtest", "epolltest", "wakepolltest", "idletest", "drmsmoke", "evtest2", "venustest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
+        "meminfo",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -848,6 +849,19 @@ def main():
         "~/code/leandros-artifacts/m6-session-data/m15b-iced")
     if os.path.exists(m15b_drv):
         bin_files.append(("m15b-iced", m15b_drv, 0o100755))
+    # m17-census — the guest half of artifacts/m17_census.py. Brings the session
+    # up the normal way but starts busd ITSELF, so that busd's stderr is a file
+    # of its own: `busd::peers: unknown destination: <name>` is the census, and
+    # dbus-run-session would otherwise hand busd the same fd every other
+    # component writes to, where two writers keep independent offsets and
+    # overwrite each other. Then re-runs each autostarted single-instance
+    # component by hand, each with its own stderr, because the stderr byte count
+    # separates "blocked in the D-Bus probe" from "ran".
+    m17_drv = os.path.expanduser(
+        "~/code/leandros-artifacts/m6-session-data/m17-census")
+    if os.path.exists(m17_drv):
+        bin_files.append(("m17-census", m17_drv, 0o100755))
+
     # m4-vkwl-a64 — the same driver with the compositor choice and every wait
     # made an argument, for aarch64 under TCG where "the session never came up"
     # and "the WSI chain does not work here" have to be told apart and a silent

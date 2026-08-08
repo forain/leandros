@@ -2624,6 +2624,10 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
     let free_pages = mm::buddy::free_pages();
     let total_pages = mm::buddy::total_pages();
     let page_size = mm::buddy::PAGE_SIZE as u64;
+    // Read the run queue BEFORE any user memory is touched below: taking the
+    // RUN_QUEUE lock around a write that can demand-page re-enters the
+    // scheduler under its own lock.
+    let procs = sched::process_count().min(u16::MAX as usize) as u16;
 
     unsafe {
         // uptime (i64 at offset 0)
@@ -2633,8 +2637,8 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
         core::ptr::write((info_ptr + 32) as *mut u64, total_pages as u64 * page_size);
         // freeram (u64 at offset 40)
         core::ptr::write((info_ptr + 40) as *mut u64, free_pages as u64 * page_size);
-        // procs (u16 at offset 80) — 1 process
-        core::ptr::write((info_ptr + 80) as *mut u16, 1u16);
+        // procs (u16 at offset 80)
+        core::ptr::write((info_ptr + 80) as *mut u16, procs);
         // mem_unit (u32 at offset 104) — 1 byte
         core::ptr::write((info_ptr + 104) as *mut u32, 1u32);
     }
