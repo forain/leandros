@@ -707,7 +707,7 @@ paragraph that leans on "out of scope" with that in mind.
 | 8 | Nothing to launch, and no way to ask for it | Feature — **config DONE** `52665aa` | Keybinding table staged; still no terminal to launch |
 | 9 | **9 panel applets have no scoped-out dependency and are simply unbuilt** | Feature — cheap | Build recipe exists; spawn path proven |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
-| 11 | **Two PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — **actionable** | `env_rx` root-caused: `shutdown(2)` destroys the fd |
+| 11 | **Two PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — **cause FIXED** `2d9f0c8` | Handshake completes: 5.022 s → 2.186 s; retirement now justified |
 | 12 | **PAM — real support, replacing the C shim** | Feature — **NEW, in scope** | Shim authenticates for real but is C, untracked, coverage unverified |
 | 13 | **utmpx — session accounting, currently absent** | Feature — **NEW, in scope** | Nothing in tree; need is unmeasured |
 | 14 | **VT switching — was out of scope, now required** | Feature — **NEW, in scope** | No VTs at all; greeter design routes around it |
@@ -1077,6 +1077,44 @@ the fallback if busd proves immature — **this is the decision point that would
 Policy is in *Goal* (Standing context): **temporary debug edits to COSMIC are allowed and
 encouraged**; permanent ones are not, and every permanent fix belongs on the LeandrOS side.
 These two are permanent and must be retired or justified.
+
+**ROOT-CAUSED AND FIXED (`2d9f0c8`). The cause was a kernel `shutdown(2)` bug, and the
+recorded "tokio-integration residual" was never demonstrated because it was never true.**
+`handle_shutdown` (`servers/net/src/lib.rs`) took `_how` and never read it: for a
+`UnixConnected` socket it set the *end-is-fully-gone* flag that `handle_close` only sets
+once the refcount hits 0, then emptied the caller's fd-table slot. **`shutdown(fd, SHUT_WR)`
+was therefore strictly more destructive than `close(fd)`** — it ignored the dup refcount
+*and* destroyed the fd. `cosmic-session` does `let (mut session_rx, _session_tx) =
+session.into_split();` (`../cosmic-epoch/cosmic-session/src/comp.rs:110`) and tokio's
+`OwnedWriteHalf::drop` issues exactly that call, **before cosmic-comp is even spawned**.
+`scmtest` goes 32 → **35**, and the three new guards were run against the unpatched kernel
+first: **35/3, matching a pre-committed prediction file line for line**, with the
+unchanged `fork_exec_inherit` PASSing immediately above its shutdown variant — the
+PASS/FAIL pair is what localises the defect to `shutdown(2)` rather than to socket
+inheritance. Kernel md5s `4e9847e6…` (defect) / `6d124ccf…` (fixed), each reproduced
+byte-identically by revert-and-rebuild and re-apply-and-rebuild, so the ledger closes in
+both directions.
+**Why the exoneration that blamed tokio was wrong:** `scmtest`'s `fork_exec_inherit`
+reproduced socketpair → `F_SETFD` → fork+execve → framed write → parent epoll+read, and
+passed — but it does `close()` on the parent's copy and **never `shutdown(SHUT_WR)`**,
+the one syscall tokio adds. The decider never entered the failing path, and the blame
+then travelled from an unrelated busd investigation. **A passing test bounds only what it
+executed.**
+**The payoff is proven by TIMING, not by string match, and that distinction is
+deliberate.** The component cascade starts **5.022 s** after `Starting cosmic-session` on
+the defect kernel — the 5 s `env_rx` timeout expiring, to within 22 ms — and **2.186 s**
+with the fix, i.e. `env_rx` resolving on its own. The literal `handshake did not complete`
+line is *unrecoverable*: `cosmic-session` and `busd` inherit one redirected fd with
+independent file offsets and overwrite each other by offset, and cosmic-session's line is
+visibly clobbered mid-line in **both** runs. Do not read its absence as evidence.
+**Retiring the patch is now justified and is the next step, not yet taken.** It is applied
+*in place* in `~/code/leandros-artifacts/m6-session-bins/src/cosmic-session/src/main.rs`,
+so removing it needs a clean musl rebuild plus a re-staged image — and shipping a reverted
+tree with a patched binary still in the image is worse than either.
+**Two risks the fix leaves open, stated because nothing in-tree covers them:**
+`tcp_time_wait` passes but never calls `shutdown`, so the `tcp::Socket::close()` path is
+**still unexercised**; and the new `ENOTCONN` on listeners/unconnected sockets — POSIX-
+correct, previously a silent success — is untested by anything we ship.
 
 **`ports/cosmic-session/0001-env_rx-timeout-fallback.patch` — the real one.** It races
 `env_rx` against a 5 s timeout and falls back to `WAYLAND_DISPLAY=wayland-1`. It **fires every
