@@ -116,6 +116,63 @@ unsafe impl Sync for VirtioKeyboardDevice {}
 // node. (Static-init empty Vec — no allocation until init() runs.)
 pub static VIRTIO_INPUTS: Mutex<alloc::vec::Vec<VirtioKeyboardDevice>> = Mutex::new(alloc::vec::Vec::new());
 
+// ── eventq census ───────────────────────────────────────────────────────────
+//
+// Master gate, same shape as `syscall::EV_STATS`: a `const`, so every counter
+// and the whole sampler compile out when it is off. IT MUST BE `false` IN A
+// COMMITTED TREE — c5abb8d shipped a diagnostic switched on and had to be
+// reverted.
+//
+// WHAT EACH NUMBER SETTLES. `polls` is the number of times the 100 Hz tick
+// reached the drain at all; against wall time it says whether the drain really
+// runs at 100 Hz. `skips` is the try_lock contention that was previously
+// INVISIBLE — a poll that never happened used to be indistinguishable from a
+// poll that found nothing. `minfree` is the low-water mark of
+// `avail.idx - used.idx`, i.e. how many buffers the device still owned at the
+// moment we looked: a minimum that reaches 0 IS ring exhaustion, and a minimum
+// that stays near the queue size refutes the capacity story outright.
+pub const VQ_STATS: bool = false;
+
+static VQ_POLLS:   core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static VQ_SKIPS:   core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static VQ_DRAINED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static VQ_MAXB:    core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static VQ_MINFREE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static VQ_STARVE:  core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static VQ_AIDX:    core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static VQ_UIDX:    core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static VQ_NOTIFY:  core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub struct VqCensus {
+    pub polls: u32,
+    pub skips: u32,
+    pub drained: u32,
+    pub maxb: u32,
+    pub minfree: u32,
+    pub starve: u32,
+    pub aidx: u32,
+    pub uidx: u32,
+    pub notify: u32,
+}
+
+/// Snapshot of the eventq counters. Relaxed loads only — safe from IRQ context,
+/// takes no lock. `minfree` reads `0xffffffff` when no poll has looked yet;
+/// that is "never sampled", not "no buffers".
+pub fn vq_census() -> VqCensus {
+    use core::sync::atomic::Ordering::Relaxed;
+    VqCensus {
+        polls:   VQ_POLLS.load(Relaxed),
+        skips:   VQ_SKIPS.load(Relaxed),
+        drained: VQ_DRAINED.load(Relaxed),
+        maxb:    VQ_MAXB.load(Relaxed),
+        minfree: VQ_MINFREE.load(Relaxed),
+        starve:  VQ_STARVE.load(Relaxed),
+        aidx:    VQ_AIDX.load(Relaxed),
+        uidx:    VQ_UIDX.load(Relaxed),
+        notify:  VQ_NOTIFY.load(Relaxed),
+    }
+}
+
 impl VirtioKeyboardDevice {
     pub fn new_from(dev: PciDevice) -> Option<Self> {
         crate::pci::serial_debug("[INPUT] Found VirtIO Input device\n");
@@ -279,8 +336,11 @@ impl VirtioKeyboardDevice {
             ring_ptr.add(i as usize).write_volatile(i);
         }
 
-        (*avail).idx = size;
-        (*avail).flags = 0; // Request interrupts (though we will poll)
+        core::ptr::addr_of_mut!((*avail).flags).write_volatile(0); // interrupts on
+        // The ring slots above must be visible before the index that publishes
+        // them. Same shape as virtio_gpu.rs:189-191.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        core::ptr::addr_of_mut!((*avail).idx).write_volatile(size);
 
         core::ptr::addr_of_mut!((*cfg).queue_desc).write_volatile(desc_phys as u64);
         core::ptr::addr_of_mut!((*cfg).queue_driver).write_volatile(avail_phys as u64);
@@ -311,7 +371,28 @@ impl VirtioKeyboardDevice {
         unsafe {
             let used = q.used;
             let last_used = q.last_used_idx;
-            let current_used = (*used).idx;
+
+            // Sampled BEFORE the drain: `avail.idx - used.idx` is how many
+            // buffers the device still owns and can pop into. Zero here means
+            // the host had nothing left to write the next event frame into,
+            // which is the only shape in which the queue depth is the defect.
+            if VQ_STATS {
+                use core::sync::atomic::Ordering::Relaxed;
+                let a = core::ptr::addr_of!((*q.avail).idx).read_volatile();
+                let u = core::ptr::addr_of!((*used).idx).read_volatile();
+                VQ_AIDX.store(a as u32, Relaxed);
+                VQ_UIDX.store(u as u32, Relaxed);
+                let free = a.wrapping_sub(u) as u32;
+                VQ_MINFREE.fetch_min(free, Relaxed);
+                if free == 0 { VQ_STARVE.fetch_add(1, Relaxed); }
+            }
+
+            // Volatile: the device writes this behind the compiler's back, so a
+            // plain load may be hoisted or reused. The barrier after it is the
+            // virtio read barrier — `used.idx` must be observed before the ring
+            // entries it publishes.
+            let current_used = core::ptr::addr_of!((*used).idx).read_volatile();
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
             if last_used == current_used {
                 return;
@@ -332,12 +413,23 @@ impl VirtioKeyboardDevice {
                 // Push to this device's evdev node (keyboard=0, tablet=1).
                 evdev_server::push_event(evdev_index, ev.type_, ev.code, ev.value);
 
-                // Recycle descriptor: put it back into avail ring
+                // Recycle descriptor: put it back into avail ring. The slot has
+                // to be visible to the device before the index that publishes
+                // it, so the write barrier between them is load-bearing, not
+                // decoration — x86 store ordering hides its absence, aarch64
+                // does not. Both accesses are volatile for the same reason the
+                // slot write always was.
                 let avail = q.avail;
-                let avail_idx = (*avail).idx as usize % q.size as usize;
+                let avail_idx =
+                    core::ptr::addr_of!((*avail).idx).read_volatile() as usize
+                        % q.size as usize;
                 let ring_ptr = (avail as usize + 4) as *mut u16;
                 ring_ptr.add(avail_idx).write_volatile(desc_id);
-                (*avail).idx = (*avail).idx.wrapping_add(1);
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                let next = core::ptr::addr_of!((*avail).idx)
+                    .read_volatile()
+                    .wrapping_add(1);
+                core::ptr::addr_of_mut!((*avail).idx).write_volatile(next);
 
                 count += 1;
                 idx = idx.wrapping_add(1);
@@ -345,7 +437,14 @@ impl VirtioKeyboardDevice {
 
             q.last_used_idx = current_used;
 
+            if VQ_STATS {
+                use core::sync::atomic::Ordering::Relaxed;
+                VQ_DRAINED.fetch_add(count as u32, Relaxed);
+                VQ_MAXB.fetch_max(count as u32, Relaxed);
+            }
+
             if count > 0 {
+                if VQ_STATS { VQ_NOTIFY.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
                 // Notify the device
                 let notify_ptr = (self.notify_cfg as usize + q.notify_off as usize * self.notify_off_multiplier as usize) as *mut u16;
                 notify_ptr.write_volatile(0); // Queue 0
@@ -404,9 +503,14 @@ pub fn poll_events() {
     // blocking on a lock held by the task context we interrupted would wedge
     // the CPU (see init()). Missing one poll is harmless — the devices are
     // level-driven and the next tick, 10 ms later, drains them.
+    if VQ_STATS { VQ_POLLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
     if let Some(mut inputs) = VIRTIO_INPUTS.try_lock() {
         for d in inputs.iter_mut() {
             d.poll();
         }
+    } else if VQ_STATS {
+        // A poll that never happened must not read as a poll that found
+        // nothing: report the missed sample as missed.
+        VQ_SKIPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }

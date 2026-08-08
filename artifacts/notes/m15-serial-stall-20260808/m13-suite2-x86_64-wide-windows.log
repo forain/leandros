@@ -1,0 +1,33 @@
+=== fresh images ===
+aaf1d14090a30ccb80bd32df3bd54327  target/final-x86_64/kernel
+-rw-r--r-- 1 forain forain 2097152000 08:47 f2fs-data0-x86_64.img
+-rw-r--r-- 1 forain forain 2097152000 08:47 f2fs-data1-x86_64.img
+
+=== control ===
+[?2004l[31merror:[39m command not found: nosuchbinary_xyz42
+M13RC=127
+[?2004h[0m[?25l[51;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h=== vfstest ===
+  vfstest  M13RC=  passlines=16  namedfails=[]
+=== drmsmoke ===
+  drmsmoke  M13RC=0  passlines=20  namedfails=[]
+=== scmtest ===
+  scmtest  M13RC=  passlines=0  namedfails=[]
+=== wakepolltest ===
+  wakepolltest  M13RC=  passlines=29  namedfails=[]
+=== forktest ===
+  forktest  M13RC=0  passlines=13  namedfails=[]
+=== epolltest ===
+  epolltest  M13RC=  passlines=9  namedfails=[]
+=== polltest ===
+  polltest  M13RC=0  passlines=6  namedfails=[]
+=== waittest ===
+  waittest  M13RC=1  passlines=3  namedfails=[WAITTEST: FAIL wait_on_process_group: FAIL ]
+=== sigtest ===
+  sigtest  M13RC=0  passlines=6  namedfails=[]
+=== timertest ===
+  timertest  M13RC=  passlines=1  namedfails=[]
+=== memtest ===
+  memtest  M13RC=0  passlines=5  namedfails=[]
+=== f2fstest ===
+  f2fstest  M13RC=  passlines=5  namedfails=[]
+=== SUITE2 DONE ===

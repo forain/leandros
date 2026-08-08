@@ -206,6 +206,56 @@ fn poll_reply(revents: u32, seq: u64) -> Message {
 
 // ── IPC Call helper ──────────────────────────────────────────────────────────
 
+// ── ENOMEM attribution ───────────────────────────────────────────────────────
+//
+// Three of this server's error paths return -12, and userspace sees errno 12
+// and nothing else from all three. "Out of memory" from LeandrOS has already
+// sent two investigations looking for a leak that was not there, so each site
+// names the table it actually ran out of. Once per boot per site: these tables
+// stay full once they fill, and the console costs ~0.19 s per line.
+
+extern "C" { fn arch_serial_putc(c: u8); }
+
+fn dbg_str(msg: &str) {
+    for &b in msg.as_bytes() { unsafe { arch_serial_putc(b) }; }
+}
+
+fn dbg_dec(mut v: usize) {
+    if v == 0 { unsafe { arch_serial_putc(b'0') }; return; }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while v > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+    for &b in &buf[i..] { unsafe { arch_serial_putc(b) }; }
+}
+
+/// The caller has no reply port and the IPC table could not give it one, so
+/// every operation on a mounted filesystem now fails. `ipc::port` prints the
+/// occupancy; this line names the consequence, which is the half that explains
+/// an errno 12 out of `open`, `stat` or `getdents64`.
+fn report_no_reply_port() {
+    static REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+    if REPORTED.swap(true, atomic::Ordering::Relaxed) { return; }
+    dbg_str("\n[VFS] ENOMEM: no reply port for this task -- every call to a mounted\n");
+    dbg_str("[VFS] filesystem (open/stat/getdents64/exec) now returns errno 12. Not RAM.\n");
+}
+
+/// A send onto a live server port failed: the port is gone, or its 16-deep
+/// queue is full. Distinct from having no reply port at all.
+fn report_send_failed() {
+    static REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+    if REPORTED.swap(true, atomic::Ordering::Relaxed) { return; }
+    dbg_str("\n[VFS] ENOMEM: port::send failed (port closed, or its queue is full).\n");
+}
+
+/// `FD_TABLES` has no slot left for a new pid. `MAX_PROCS`, not RAM.
+fn report_fd_tables_full() {
+    static REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+    if REPORTED.swap(true, atomic::Ordering::Relaxed) { return; }
+    dbg_str("\n[VFS] ENOMEM: fd-table pool FULL at ");
+    dbg_dec(MAX_PROCS);
+    dbg_str(" processes -- this is vfs::MAX_PROCS, not RAM\n");
+}
+
 /// Synchronously call another server via its IPC port.
 /// Blocks the current task until a reply is received on its reply port.
 pub fn call_port(port_id: u32, mut msg: Message) -> Message {
@@ -225,13 +275,14 @@ pub fn call_port(port_id: u32, mut msg: Message) -> Message {
                 // phantom success (e.g. an empty file) rather than a visible
                 // error. Callers like handle_open's MountedFile path only
                 // check `< 0`, so this must be a real negative errno.
-                None    => return err_reply(-12), // ENOMEM
+                None    => { report_no_reply_port(); return err_reply(-12); } // ENOMEM
             }
         }
     };
 
     msg.reply_port = reply_port;
     if port::send(port_id, msg).is_err() {
+        report_send_failed();
         return err_reply(-12); // ENOMEM
     }
 
@@ -4813,6 +4864,7 @@ fn get_or_create<'a>(pid: u32, tbls: &'a mut [ProcFdTable]) -> Option<&'a mut Pr
         tbls[pos].pid    = pid;
         return Some(&mut tbls[pos]);
     }
+    report_fd_tables_full();
     None
 }
 

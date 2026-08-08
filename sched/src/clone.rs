@@ -22,6 +22,36 @@
 
 use crate::task::{self, DEFAULT_SIGACTION};
 
+/// Report a full task table once per boot. `fork`/`clone` return ENOMEM here
+/// with any amount of physical memory free, and userspace only ever sees the
+/// errno — brush prints "Out of memory (os error 12)" and nothing else, which
+/// has already sent one investigation looking for a memory leak that was not
+/// there. Once is enough: the table stays full, so an ungated print would be
+/// one line per failed spawn on a console that costs ~0.19 s per line.
+fn report_task_table_full() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    extern "C" {
+        fn arch_serial_putc(c: u8);
+        fn print_number(n: u32);
+    }
+    let (len, cap) = super::task_census();
+    for &b in b"\n[SCHED] task table FULL: " {
+        unsafe { arch_serial_putc(b) };
+    }
+    unsafe { print_number(len as u32) };
+    for &b in b"/" {
+        unsafe { arch_serial_putc(b) };
+    }
+    unsafe { print_number(cap as u32) };
+    for &b in b" tasks -- fork/clone now return ENOMEM; this is runqueue::MAX_TASKS, not RAM\n" {
+        unsafe { arch_serial_putc(b) };
+    }
+}
+
 /// Perform a POSIX `fork()`.
 ///
 /// `frame_ptr` — virtual address of the `UserFrame` saved on the parent's
@@ -286,6 +316,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         before_enqueue(child_pid);
 
         if !super::RUN_QUEUE.lock().enqueue(child) {
+            report_task_table_full();
             mm::buddy::free(stack_base_phys, stack_pages);
             mm::buddy::free(child_pt, 0);
             return -12;
@@ -504,6 +535,7 @@ pub fn clone_thread(
         before_enqueue(child_pid);
 
         if !super::RUN_QUEUE.lock().enqueue(child) {
+            report_task_table_full();
             mm::buddy::free(stack_base_phys, stack_pages);
             return -12;
         }

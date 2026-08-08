@@ -1,0 +1,93 @@
+[0m[?25l[48;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbi78[?25h[0m[?25l[48;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz4278[?25h
+[?2004l[31merror:[39m command not found: nosuchbinary_xyz42
+[?2004h[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /b78[?25h[0m[?25l[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m17-census78[?25h
+[?2004lM17: BEGIN
+MEMINFO boot total=2064769024 free=2026024960 used=38744064 usedpct=1 uptime=1
+[2m1970-01-01T00:00:01.464981Z[0m [32m INFO[0m [2mbusd[0m[2m:[0m reading configuration file /usr/share/dbus-1/session.conf ...
+[2m1970-01-01T00:00:01.469139Z[0m [32m INFO[0m [2mbusd::bus[0m[2m:[0m Listening on UNIX socket file `/run/user/0/bus`.
+M17: busd ready after 1s
+M17: wayland-1 after 1s
+MEMINFO wayland1 total=2064769024 free=1975623680 used=89145344 usedpct=4 uptime=3
+M17: MARK SETTLE1 45
+[GPU] device features hi=0x00000101 lo=0x30000002
+[GPU] *** host does NOT offer VIRTIO_GPU_F_VIRGL -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_RESOURCE_BLOB -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_CONTEXT_INIT -- 3D/Venus unavailable ***
+[GPU] acked features hi=0x00000001 lo=0x00000002
+[DRM] unimplemented ioctl cmd=0xC00864BF nr=0x000000BF type=0x00000064 size=0x00000008 (reported once per boot)
+[DRM-SRV] mmap token=0x000000000E800000 map_info=0x01 -> writeback
+[DRM-SRV] mmap token=0x000000000F000000 map_info=0x01 -> writeback
+[2m1970-01-01T00:00:08.074447Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.PowerDaemon
+[2m1970-01-01T00:00:08.228820Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.a11y.Bus
+[2m1970-01-01T00:00:08.434601Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicLauncher
+[2m1970-01-01T00:00:08.436377Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicOnScreenDisplay
+[2m1970-01-01T00:00:08.454188Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicWorkspaces
+[2m1970-01-01T00:00:08.635248Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicAppLibrary
+[2m1970-01-01T00:00:08.669202Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:08.671925Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:08.745838Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:08.774414Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.UPower
+[2m1970-01-01T00:00:08.794117Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:08.833024Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:08.835595Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettingsDaemon
+[2m1970-01-01T00:00:09.223696Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.locale1
+[2m1970-01-01T00:00:10.060276Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.timedate1
+MEMINFO settle1 total=2064769024 free=1197981696 used=866787328 usedpct=41 uptime=48
+M17: ENDMARK SETTLE1
+M17: MARK SETTLE2 45
+MEMINFO settle2 total=2064769024 free=1197211648 used=867557376 usedpct=42 uptime=93
+M17: ENDMARK SETTLE2
+M17: MARK SETTLE3 45
+MEMINFO settle3 total=2064769024 free=1196470272 used=868298752 usedpct=42 uptime=138
+M17: ENDMARK SETTLE3
+M17: ==== BEGIN busd.log ====
+M17: ==== END busd.log ====
+MEMINFO precensus total=2064769024 free=1196204032 used=868564992 usedpct=42 uptime=138
+M17: CENSUS DONE
+M17: MARK PROBE 90
+[2m1970-01-01T00:02:19.086966Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicWorkspaces
+[2m1970-01-01T00:02:19.089627Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicLauncher
+[2m1970-01-01T00:02:19.091721Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicOnScreenDisplay
+[2m1970-01-01T00:02:19.093799Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicAppLibrary
+MEMINFO probe total=2064769024 free=1119612928 used=945156096 usedpct=45 uptime=228
+M17: ENDMARK PROBE
+M17: CAPTURES DONE
+M17: ---- probe launcher
+140 /data/m17/p-launcher.log
+1970-01-01T00:02:18.719514Z  INFO cosmic-launcher (com.system76.CosmicLauncher)
+1970-01-01T00:02:18.719999Z  INFO Version: 1.0.12 (release)
+
+M17: ---- end probe launcher
+M17: ---- probe applibrary
+1317 /data/m17/p-applibrary.log
+ INFO  cosmic_app_library > Cosmic App Library (com.system76.CosmicAppLibrary)
+ INFO  cosmic_app_library > Version: 0.1.0
+ INFO  i18n_embed::requester > Current Locale: []
+ INFO  i18n_embed            > Selecting translations for domain "cosmic_app_library"
+ INFO  zbus::connection::handshake::common > write_command; command=Auth(Some(External), Some([48]))
+ INFO  zbus::connection::handshake::common > write_commands; commands=[Auth(Some(External), Some([48]))] extra_bytes=None
+ INFO  tracing::span                       > read_command;
+ INFO  zbus::connection::handshake::common > read_commands; n_commands=1
+ INFO  zbus::connection::handshake::common > write_commands; commands=[NegotiateUnixFD, Begin] extra_bytes=Some([108, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 109, 0, 0, 0, 1, 1, 111, 0, 21, 0, 0, 0, 47, 111, 114, 103, 47, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 47, 68, 66, 117, 
+M17: ---- end probe applibrary
+M17: ---- probe workspaces
+1321 /data/m17/p-workspaces.log
+[1970-01-01T00:02:18Z INFO  i18n_embed::requester] Current Locale: []
+[1970-01-01T00:02:18Z INFO  i18n_embed] Selecting translations for domain "cosmic_workspaces"
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_command; command=Auth(Some(External), Some([48]))
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_commands; commands=[Auth(Some(External), Some([48]))] extra_bytes=None
+[1970-01-01T00:02:19Z INFO  tracing::span] read_command;
+[1970-01-01T00:02:19Z INFO  zbus::connection::handshake::common] read_commands; n_commands=1
+[1970-01-01T00:02:19Z INFO  zbus::connection::handshake::common] write_commands; commands=[NegotiateUnixFD, Begin] extra_bytes=Some([108, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 109, 0, 0, 0, 1, 1, 111, 0, 21, 0, 0, 0, 47, 111, 114, 103, 47, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 47, 68, 66, 117, 115, 0, 0, 0, 2,
+M17: ---- end probe workspaces
+M17: ---- probe osd
+1157 /data/m17/p-osd.log
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_command; command=Auth(Some(External), Some([48]))
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_commands; commands=[Auth(Some(External), Some([48]))] extra_bytes=None
+[1970-01-01T00:02:18Z INFO  tracing::span] read_command;
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] read_commands; n_commands=1
+[1970-01-01T00:02:18Z INFO  zbus::connection::handshake::common] write_commands; commands=[NegotiateUnixFD, Begin] extra_bytes=Some([108, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 109, 0, 0, 0, 1, 1, 111, 0, 21, 0, 0, 0, 47, 111, 114, 103, 47, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 47, 68, 66, 117, 115, 0, 0, 0, 2, 1, 115, 0, 20, 0, 0, 0, 111, 114, 103, 46, 102, 114, 101, 101, 100, 101, 115, 107, 116, 111, 112, 46, 68, 66, 117, 115, 0, 0, 0, 0, 3, 1, 115, 0, 5, 0, 0, 0, 72, 1
+M17: ---- end probe osd
+MEMINFO final total=2064769024 free=1118294016 used=946475008 usedpct=45 uptime=228
+M17: DONE
+[?2004h[0m[?25l[1;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h

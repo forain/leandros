@@ -832,31 +832,111 @@ nothing at all. **A null observation at the end of a long chain does not locate 
 and this cost two lanes. Instrument at the *destination* — a client that counts what it is
 sent — before instrumenting the path.
 
-**THE REAL DEFECT, promoted from a record-only footnote: the virtqueue handoff starves under
-load.** Measured on an idle guest with **no compositor running**, x86_64/KVM
-(`artifacts/m14_rate.py`):
+**RESOLVED 2026-08-08. The handoff never starved — `arch::putc` did, and it took the timer
+tick with it.** The ladder below reproduces byte-for-byte, and the decline in it is real, but
+it is not buffer exhaustion under load: it is this harness measuring its own back-pressure.
+Measured on an idle guest with **no compositor running**, x86_64/KVM (`artifacts/m14_rate.py`),
+before and after the fix, with the harness **unmodified**:
 
-| rate/s | moves | qmp_ok | qmp_rej | evdev_ev | ev/move | delivered |
-|---|---|---|---|---|---|---|
-| 2 | 20 | 40 | **0** | 40 | **2.00** | 50.0% |
-| 10 | 100 | 200 | **0** | 112 | 1.12 | 28.0% |
-| 30 | 300 | 600 | **0** | 272 | 0.91 | 22.7% |
-| 60 | 600 | 1200 | **0** | 512 | **0.85** | 21.3% |
+| rate/s | moves | qmp_ok | qmp_rej | before ev/move | after ev/move |
+|---|---|---|---|---|---|
+| 2 | 20 | 40 | **0** | 2.00 | **4.00** |
+| 10 | 100 | 200 | **0** | 1.12 | **4.00** |
+| 30 | 300 | 600 | **0** | 0.91 | **4.00** |
+| 60 | 600 | 1200 | **0** | 0.85 | **4.00** |
 
-**A column that falls as rate rises is buffer exhaustion, not a filter.** Delivery drops **57%
-from the 2/s rung, monotonically**, with **zero** QMP rejections — the host queued everything —
-and `drop+0` on every evdev sample, which exonerates the ring. **So the loss is in the
-virtqueue handoff, before `push_event`.** Under a live COSMIC session it is ~22× worse again
-(1,787 moves → 68 events). *Stated precisely:* the absolute per-batch expectation is
-unverified, so this is a **relative** decline, not a loss percentage.
+Host-side `virtio_input_queue_full` across the whole ladder: **1572 → 0**. 4.00 ev/move is
+lossless — each move is two QMP commands and QEMU syncs per command, so a delivered move is
+`ABS_X, SYN, ABS_Y, SYN`.
 
-**The precise next question:** why does a 32-descriptor eventq drained every 10 ms starve at
-240 events/s? `drivers/src/virtio_keyboard.rs:304-354` is drained only from `poll_events()` on
-the 100 Hz tick (`arch/x86_64/src/timer.rs:244`), and QEMU drops a whole frame when
-`virtqueue_pop` finds no buffer. Two candidates, both inside those 40 lines: the drain simply
-is not keeping up, and — **visible by inspection and a real defect regardless** — `(*used).idx`
-is read and `(*avail).idx` read-modify-written **non-volatilely, with no fences**. A per-tick
-drained/skipped counter separates them in one boot.
+**What decided it — three phases in ONE boot at a fixed 60 moves/s, differing only in who is
+draining QEMU's serial chardev** (`artifacts/m15_serial_stall.py`; loss counted host-side from
+QEMU's own `virtio_input_queue_full` trace, so the instrument cannot be throttled by the stall
+it is looking for):
+
+| serial consumer | frames | queue_full | delivered |
+|---|---|---|---|
+| connected, never reads | 1200 | 1086 | **9.5%** |
+| connected, reads throughout | 1200 | 0 | **100.0%** |
+| not connected at all | 1200 | 0 | **100.0%** |
+
+**The eventq delivers 100% at 60 moves/s — 240 events/s against 32 descriptors — whenever the
+console is not back-pressured.** There is no load-dependent loss to explain.
+
+**Mechanism.** `putc` polled the UART transmitter with **no bound** (`arch/x86_64/src/lib.rs`,
+LSR bit 5; `arch/aarch64/src/uart.rs`, PL011 `FR.TXFF`), and QEMU's 16550 withholds `LSR.THRE`
+for exactly as long as its chardev back end refuses the byte — `hw/char/serial.c:serial_xmit`
+installs a `G_IO_OUT` watch on `EAGAIN` and returns *without* setting THRE. A socket chardev
+with **no** client returns `len` and never blocks (the already-recorded “QEMU serial drops
+output w/o client”); a client that is **connected and not reading** blocks. `putc` is reached
+from **IRQ context** — the 0.5 Hz `[EVSTAT]` census runs off the timer tick via
+`poll_deadline_tick` — so a parked reader wedged CPU 0 inside the timer IRQ handler:
+`TICK_COUNT` froze, `sched::timer_tick_irq` never ran, and `poll_events()` never ran. Every
+shape in the ladder falls out of that — ~2 s of live guest per rung, a constant **+32** flush
+(exactly the ring) on unwedge, and a fraction that falls only because the denominator rises.
+**The delivered COUNT per rung was flat; only the delivered FRACTION fell.**
+
+**Fixed**: `putc` on both arches now waits against a **cycle-counter deadline**, not an
+iteration count, and latches `TX_WEDGED` so a back-pressured console costs one probe per byte
+instead of one deadline per byte. Console output may be lost; an interrupt handler may not be
+stalled. An *iteration* bound is not enough and the intermediate measurement proves it: 10 000
+LSR reads is ~10 ms against a real UART but ~100 ms against an emulated one (each `in al, dx`
+is an exit to host userspace), and that version moved the parked case only from 9.5% to 27.3%.
+
+**Both original suspects were wrong, and the counters say so.** A gated `[VQSTAT]` census
+(`drivers/src/virtio_keyboard.rs`, `VQ_STATS`, committed **off**) recorded **`skips = 0` for
+the entire run** — `try_lock` contention on `VIRTIO_INPUTS` cannot happen anyway, since
+`poll_events()` is called only from the `cpu == 0` arm of `on_tick` on **both** arches — and
+`maxb = 32` with `notify` advancing by exactly +1 per burst, which is a drain that stops and
+restarts, not one falling behind. The missing volatile accesses and barriers **were** fixed
+(`used.idx` read, `avail.idx` publish, matching `virtio_gpu.rs:189-191`) but were **not** the
+cause: the x86_64 disassembly of the old code is faithful and correctly ordered under TSO
+(`mov %cx,0x4(%r12,%rax,2)` immediately followed by `incw 0x2(%r12)`). They are a real latent
+defect on **aarch64**, where nothing orders those two stores.
+
+**Two things this item previously recorded as fact are false.** (a) “`drop+0` on every evdev
+sample, which exonerates the ring” — `drop` reaches **680** in the very serial log that
+sentence was written from. `MAX_EVENTS = 256` (`servers/evdev/src/lib.rs:44`), depth pins at
+256 from the 30/s rung onward because nothing is reading the node, and it overwrites from
+there. It does not change the ladder's arithmetic (`push` is counted before the ring is
+consulted), but the ring was **saturated, not exonerated**. (b) “the loss is in the virtqueue
+handoff, before `push_event`” — the handoff is lossless at every rate tested.
+
+**Under a live COSMIC session the ~22×-worse figure (1,787 moves → 68 events) has not been
+re-measured** and should be assumed to have had the same cause until it is: that harness also
+held the serial socket.
+
+**CORRECTED 2026-08-08 — the console was never dropping output, and `drivers/src/serial.rs`
+is not the console path.** The paragraph that used to sit here read `write_byte`'s bare
+`out dx, al` as a console with no flow control. Nothing constructs `Serial`, so that function
+has never executed: userspace console output goes `sys_write` → `console_write_user` →
+`serial_write_raw` → `serial_write_byte` → `arch_x86_64::putc`, which has always checked
+`LSR.THRE`. Two separate defects were behind the evidence, and neither is loss.
+
+**(a) The instrument.** `scripts/scmrun.py` stops reading at its completion marker, and the tty
+echoes what it is sent, so a marker spelled literally in the command matched the **echo of the
+command itself**. `m13_suite.py` sent `<test>; echo M13RC=$?` with marker `M13RC=`, so every
+window closed ~1 s after the command was typed — which is why widening budgets to 700 s changed
+nothing, and why the 300-line probe returned 19: it returned **16 of 300 in 0.9 s of a 240 s
+budget** when reproduced here. The same 300 lines with no marker at all arrive **contiguous and
+complete**. The marker is now built by the shell (`echo "M13""RC=$?"`, printed as `M13RC=`,
+never typed) and scmrun refuses an echoable marker outright.
+
+**(b) The real console defect: it is slow, not lossy — ~0.6 lines/s.** Every `\n` scrolls the
+framebuffer console, and `Framebuffer::scroll_vector` copies the WHOLE 1920×1080×4 = 8.29 MB
+surface through its uncached (PAT UC-) mapping and then marks the whole surface dirty so the
+next character re-transmits all of it. Measured: 100 lines × 41 chars = 157.9 s (1.579 s/line),
+220 lines × 1 char = 400.6 s (1.821 s/line) — 24× the bytes for the same cost **per line**, and
+`RIP` sampling put 12/12 samples in `memcpy`. A scroll costs the same for eight rows as for
+one, so it now advances `SCROLL_ROWS = 8`: **157.9 s → 19.0 s, 100/100 lines, 300/300 on the
+long probe.** Still the same scroll amortised; removing it needs a write-back shadow *and* a
+write-combining mapping, and `arch/x86_64/src/paging.rs` is explicit that a cached alias of
+host-visible memory is a bug — a separate lane. Full write-up:
+`artifacts/notes/m16-console-throughput-20260808/`.
+
+**The general lesson, and it has now cost three lanes: an instrument that has to print cannot
+measure anything that printing can stall.** Prefer a host-side witness. Full write-up, the
+`[VQSTAT]` series and raw logs: `artifacts/notes/m15-serial-stall-20260808/`.
 
 **Still open on the render side, and now the more interesting half:** input arrives and nothing
 draws. No cursor is ever composited. That is likely one investigation with item 7.
@@ -962,7 +1042,7 @@ matching whatever `libinput_udev_assign_seat` is called with (`seat0`), or libin
 them. **Input to a compositor has never once been demonstrated in this project** — M4's
 original mission was exactly this and it died at PRIME/dmabuf before any client saw an event.
 
-### 7. Every libcosmic app blocks in a D-Bus call before it ever renders
+### 7. Every libcosmic app blocks in a D-Bus call before it ever renders -- FIXED, patch landed
 
 **ROOT-CAUSED AND PHOTOGRAPHED, aarch64, 2026-08-08. The toolkit was never the problem, and
 the item as written was wrong in every clause but the pixel count.** Evidence, raw logs and
@@ -1002,17 +1082,111 @@ iced + `tiny-skia` work correctly on LeandrOS/aarch64.**
 **The compositor was never a suspect and now there is a photograph.** The same boot shows
 wallpaper, panel bar, a legible ticking clock and `wlclient`'s window composited together.
 
-**THE OBVIOUS FIX REGRESSES THE SESSION — do not re-derive it and land it.** A patch making
-busd reply `ServiceUnknown` to an undeliverable `MethodCall` compiles clean and was staged for
-both arches; the resulting image **crash-loops** — 9 `[EXC] EL0 Fault!` records, mostly a null
-deref at `FAR=0x880`, `x0=0`, same code offset in rising PIDs, session dead after
-`wayland-1 after 1s`. Runs 1, 2 and 4 have **zero**. busd was the only image delta. busd is back
-to stock and the patch is not in the tree. **Two candidate repairs remain, both LeandrOS-side:**
-(a) work out what the error reply breaks and land a correct busd patch (`ports/busd` already
-carries `current-thread-runtime.patch`, so the mechanism exists); (b) export
-`COSMIC_SINGLE_INSTANCE=false` from `start-cosmic-leandros`, which is our own launcher — a
-one-line unblock that leaves the underlying "any blocking call to an unowned name hangs
-forever" defect in place for everything else.
+**THE CENSUS IS DONE, x86_64/KVM, 2026-08-08** — six boots, fresh images each, evidence in
+`artifacts/notes/m17-servicename-census-20260808/` (`artifacts/m17_census.py` +
+`artifacts/m6-session-data/m17-census`). A complete session log, with busd given a file of its
+own to write it into, holds **ten distinct unowned names in the first ten seconds** and
+**all four autostarted single-instance components appear exactly once each**, inside 200 ms of
+one another: `CosmicLauncher` t+8.434, `CosmicOnScreenDisplay` t+8.436, `CosmicWorkspaces`
+t+8.454, `CosmicAppLibrary` t+8.635. Item 8's "blamed wholly on a missing keybinding" is
+superseded: those three have been parked in this probe at startup, every boot, since they were
+staged. Six of the ten names are not single-instance probes at all
+(`CosmicSettingsDaemon` x6 in one run and x0 in another — that one is a race,
+the four are not), so this is a **class**, not one app's bug.
+Two instrument facts that cost time: `tracing_subscriber`'s `fmt` layer writes to **stdout**,
+so `2>` alone captures nothing; and `EnvFilter::from_default_env()` with `RUST_LOG` unset
+enables **ERROR only**, so the `warn!` is invisible unless `RUST_LOG` is exported *before* busd
+starts.
+
+**THE SERVICEUNKNOWN PATCH IS LANDED, 2026-08-08, x86_64/KVM.** It now lives at
+`ports/busd/service-unknown-reply.patch`, inside `build.sh`'s `*.patch` glob. Evidence:
+`artifacts/notes/m18-enomem-port-table-20260808/` (`artifacts/m18_regress.py`,
+`artifacts/m18_repro.py`, plus the inherited `artifacts/m17_census.py`).
+
+The patch was always correct and the proof was always an exit status rather than a log
+line: with it applied a hand-started second `cosmic-launcher` prints `Successfully
+activated another instance` / `Another instance is running` and **exits 0**, reachable
+only if the *autostarted* copy got through the same probe, owns
+`com.system76.CosmicLauncher` and is serving `DbusActivation`. Single-instance behaviour
+is preserved — the thing `COSMIC_SINGLE_INSTANCE=false` throws away. The census
+corroborates it: the patched session reaches `org.freedesktop.portal.Desktop` x6 and
+`org.freedesktop.login1`, names the stock one never reaches, and at `probe-t45` a
+**16,509-pixel** region changes with non-background coverage moving 0.971 → 0.859 — a
+hand-started component drawing a window.
+
+**WHAT WAS BLOCKING IT WAS 64 IPC PORTS, AND THE RECORDED PROXIMATE CAUSE WAS WRONG.**
+`ipc::port::LIVE_BUCKETS` was 64 — the real ceiling on live ports for the whole system,
+since `MAX_PORTS` (65536) only bounds the ID namespace. Every task that reaches a server
+through `servers::vfs::call_port` takes one bucket as its reply port and holds it until
+the task exits, and `call_port` is on the path of **every** operation on a mounted
+filesystem: `open`, `stat`, `getdents64`, and the `execve` that opens the binary. The
+consumers are **threads**, not processes, which is why `procs=20` looked like headroom.
+
+`ipc::port::PORT_STATS` (new, committed `false`) prints one line per new occupancy
+high-water mark:
+
+| busd | `LIVE_BUCKETS` | port high water | `port table FULL` | `CR2=0x880` | panel bar |
+|---|---|---|---|---|---|
+| stock | 64 | **61/64** at settle, **64/64** at t+228 s | 0 | 0 | present, ticking |
+| ServiceUnknown | 64 | over the top during startup | **1** | **1, then wedged** | gone |
+| ServiceUnknown | **512** | **84/512** | 0 | **0** | present, ticking |
+
+**A stock desktop was living three ports from the ceiling.** Unblocking four more
+multithreaded iced components takes it over. Free RAM was 1078-1197 MiB at every sample,
+which is why `-m 4G` never helped.
+
+The chain is now on one console, in order, ten lines apart:
+`[IPC] port table FULL: 64/64 live buckets` → `[VFS] ENOMEM: no reply port for this
+task` → `user page fault ... CR2=0x0000000000000880 ... task killed`. The middle of it
+is a **`stat`**, not a `calloc`: `xkb_context_new` also returns NULL when
+`xkb_context_include_path_append_default` fails, that function `stat`s
+`/usr/share/X11/xkb`, and the session log says `failed to add default include path` in
+as many words. `ls /usr/share/X11/xkb` prints six real entries seconds earlier. The
+`xkbcommon` crate's missing null check is still upstream's bug, but nothing allocated
+and no memory ran out.
+
+**The mmap/brk suspects are excluded by measurement, not by argument.** `DBG_ENOMEM`
+(new, committed `false`) names every ENOMEM return in the memory, address-space and exec
+paths, and `mm::vmm::last_map_fail()` says *why* a mapping refused (`vma-overlap`,
+`buddy-order-unavailable`, `va-overflow`, `pte-install`). Across two fully instrumented
+COSMIC sessions **not one `mmap` site fired**. The only memory-path site that fires at
+all is `brk/refused reason=vma-overlap`, ~10 lines per boot — and `brk` has no errno, so
+musl compares the returned break, falls back to `mmap`, and nothing fails. It is the
+loudest non-event in the log and it is only visible because `sys_brk` now reports a
+refusal the ABI otherwise hides completely.
+
+**Falsified by mutation in both directions.** Back at 64 with the same patched busd
+binary and the kernel as the only delta, every symptom returns. At 24, twenty background
+`sleep`s make a plain `ls /usr/share/X11/xkb` answer `Out of memory (os error 12)` with
+no compositor, no Wayland and no D-Bus — `artifacts/m18_repro.py`. That reproducer needs
+a scaled-down constant because at 512 brush runs out of its **own** descriptors
+(`No file descriptors available (os error 24)`) at ~40 background jobs, long before the
+kernel runs out of ports; a load generator that is not the shell would reproduce it at
+the shipped constant and is not written.
+
+**Regression, one fresh image, `vfstest` exactly once, read by trailers not by counting
+passes:** `vfstest`, `scmtest`, `wakepolltest`, `forktest`, `epolltest`, `polltest`,
+`waittest`, `sigtest`, `timertest`, `memtest` all 0 FAIL, and
+`--- venustest done, failures = 0 ---`. An earlier boot of the same build showed the
+recorded `wait_on_process_group` flake once. `venustest` scored `failures = 32` on the
+first attempt purely because that boot had no `--venus` and the `virtio-gpu-gl` device
+was absent — an invocation artifact that arrives in exactly the shape of a regression.
+
+**Still open here.** aarch64 is unconfirmed: everything above is x86_64/KVM on the Linux
+box. `ports/busd/build.sh` only applies patches when it first extracts the crate, so
+`rm -rf ports/busd/.work` and a rebuild of the staged binaries is required before the
+landed patch takes effect anywhere; only the x86_64 binary was rebuilt. And the four
+components still draw nothing on their own — they are activation-gated, and
+`cosmic-launcher` spawns `pop-launcher` by bare name via `PATH`, a binary that is
+neither built nor staged. That is item 8's remaining half, not this one's.
+
+**A 4 GiB guest is separately not usable.** One 4G boot died with a kernel page fault in
+`mm::buddy::free` — `Vector=0xE`, `ErrCode=0` (kernel-mode *read* of a not-present page),
+`RIP=0xFFFFFFFF8014043A`, `CR2=0xFFFF80000EAC8000`, symbolised against
+`target/final-x86_64/kernel`. The buddy's free lists are intrusive (`next` at byte 0,
+`prev` at byte 8 of the free block, read through the HHDM), so that is a corrupted or
+out-of-range link rather than exhaustion. It did not recur on the second 4G boot and has
+never been seen at 2G. **Untouched — it is a different bug and was never this one.**
 
 **This is NOT the cosmic-panel bug, and the recorded instruction to treat them as one
 investigation is withdrawn.** The panel rasterises its bar with `iced_tiny_skia` into a
@@ -1049,8 +1223,13 @@ cosmic-panel.
 **Why this is the highest-leverage cheap row:** `cosmic-launcher`, `cosmic-app-library` and
 `cosmic-workspaces` are **built, staged, and successfully launched every single boot** — 12
 `launch_pad` starts, max 1 per name, **zero restarts**, four boots, both arches — and all
-three are permanently invisible, purely because the only thing that can raise them resolves to
-nothing.
+three are permanently invisible.
+**"purely because the only thing that can raise them resolves to nothing" is WITHDRAWN.**
+The census (item 7) shows each of the three addressing its own APP_ID once, in the first nine
+seconds of every boot, and blocking there forever. They were launched and they were never
+running. A keybinding could not have raised a process parked in a D-Bus call, so the two causes
+are sequential, not alternative: the probe has to be unblocked before the keybinding question
+can even be asked.
 
 **The config half is DONE (`52665aa`), and the item as written was wrong by one file — the
 more important one.** `system_actions` was never the whole story: `defaults`

@@ -1,0 +1,33 @@
+brush-0.5# i=0; whi78brush-0.5# i=0; while [ $i -lt 20 ]; do sleep 300 & i=$((i+1)); done; echo BURST_DONE78
+[1]+	<pid unknown>
+[2]+	<pid unknown>
+[3]+	<pid unknown>
+[4]+	<pid unknown>
+[5]+	<pid unknown>
+[6]+	<pid unknown>
+[7]+	<pid unknown>
+[8]+	<pid unknown>
+[9]+	<pid unknown>
+[10]+	<pid unknown>
+[11]+	<pid unknown>
+[12]+	<pid unknown>
+[13]+	<pid unknown>
+[14]+	<pid unknown>
+[15]+	<pid unknown>
+[16]+	<pid unknown>
+[17]+	<pid unknown>
+[18]+	<pid unknown>
+[19]+	<pid unknown>
+[20]+	<pid unknown>
+BURST_DONE
+brush-0.5# 78
+[IPC] port table FULL: 24/24 live buckets -- port::create now fails, and every caller
+[IPC] turns that into ENOMEM; this is ipc::port::LIVE_BUCKETS, not RAM
+
+[VFS] ENOMEM: no reply port for this task -- every call to a mounted
+[VFS] filesystem (open/stat/getdents64/exec) now returns errno 12. Not RAM.
+error: failed to execute command 'sleep': Out of memory (os error 12)
+error: failed to execute command 'sleep': Out of memory (os error 12)
+error: failed to execute command 'sleep': Out of memory (os error 12)
+error: failed to execute command 'sleep': Out of memory (os error 12)
+error: failed to execute command 'sleep': Out of memory (os error 12)

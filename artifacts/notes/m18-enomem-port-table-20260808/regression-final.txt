@@ -1,0 +1,78 @@
+1) starting...
+
+Init PID: 2
+Mounting F2FS disk /dev/vdb to /mnt...
+F2FS mounted successfully at /mnt!
+Pivoting root to /mnt (old root at /mnt/old_root)...
+pivot_root successful! Root is now F2FS.
+Mounting /dev/vdc at /data (f2fs)...
+Starting getty loop...
+
+LeandrOS
+
+login: Launching QEMU (PID 1881347, arch=x86_64, venus)...
+QEMU started (PID 1881347, arch=x86_64, venus)
+Serial socket up. Waiting for login/shell prompt (up to 120s)...
+Login prompt ready (use: driver.py login <user> <password>).
+
+
+
+[?2004h[0m[?25l[48;1H[J[39mbrush-0.5# 
+
+>>> CONTROL OK (nosuchbinary_xyz42 reported failing)
+
+  vfstest        failures=NO TRAILER  bytes=1094
+  scmtest        failures=NO TRAILER  bytes=4566
+  wakepolltest   failures=NO TRAILER  bytes=924
+  forktest       failures=NO TRAILER  bytes=314
+  epolltest      failures=NO TRAILER  bytes=615
+  polltest       failures=NO TRAILER  bytes=480
+  waittest       failures=NO TRAILER  bytes=369
+  sigtest        failures=NO TRAILER  bytes=421
+  timertest      failures=NO TRAILER  bytes=542
+  memtest        failures=NO TRAILER  bytes=164
+  venustest      failures=0  bytes=11140
+
+=== REPRODUCER: port exhaustion without a compositor ===
+brush-0.5# ls /usr/brush-0.5# ls /usr/share/X11/xkb
+error: failed to execute command 'ls': No file descriptors available (os error 24)
+[42]-Done	sleep 200
+[43]-Done	sleep 200
+[44]-Done	sleep 200
+[45]-Done	sleep 200
+[46]-Done	sleep 200
+[47]-Done	sleep 200
+[48]-Done	sleep 200
+[49]-Done	sleep 200
+[50]-Done	sleep 200
+[51]-Done	sleep 200
+[52]-Done	sleep 200
+[53]-Done	sleep 200
+[54]-Done	sleep 200
+[55]-Done	sleep 200
+[56]-Done	sleep 200
+[57]-Done	sleep 200
+[58]-Done	sleep 200
+[59]-Done	sleep 200
+[60]+Done	sleep 200
+brush-0.5# 
+
+  'Out of memory' in the ls output: no
+  'rules' (a real entry) in the ls output: no
+  kernel named 'port table FULL': 0
+  kernel named 'fd-table pool FULL': 0
+  kernel named 'task table FULL': 0
+  kernel named 'no reply port for this task': 0
+
+==== SUMMARY ====
+  vfstest        failures=None
+  scmtest        failures=None
+  wakepolltest   failures=None
+  forktest       failures=None
+  epolltest      failures=None
+  polltest       failures=None
+  waittest       failures=None
+  sigtest        failures=None
+  timertest      failures=None
+  memtest        failures=None
+  venustest      failures=0

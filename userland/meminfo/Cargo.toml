@@ -1,0 +1,11 @@
+[package]
+name = "meminfo"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "meminfo"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

@@ -1,0 +1,74 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+brush-0.5# ls /usr/share/X11/xkb78
+error: failed to execute command 'ls': Out of memory (os error 12)
+[16]-Done	sleep 300
+[17]-Done	sleep 300
+[18]-Done	sleep 300
+[19]-Done	sleep 300
+[20]+Done	sleep 300
+brush-0.5# 78

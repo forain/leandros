@@ -1,0 +1,57 @@
+== EVSTAT dev=1 ==
+t=   4.00 push=     0 d=    0 drop=    0 depth=   0  (0 ev/s tickclock)
+t=   6.00 push=     0 d=    0 drop=    0 depth=   0  (0 ev/s tickclock)
+t=   8.00 push=     0 d=    0 drop=    0 depth=   0  (0 ev/s tickclock)
+t=  10.00 push=     0 d=    0 drop=    0 depth=   0  (0 ev/s tickclock)
+t=  12.00 push=     8 d=    8 drop=    0 depth=   8  (4 ev/s tickclock)
+t=  14.00 push=    40 d=   32 drop=    0 depth=  40  (16 ev/s tickclock)
+t=  16.00 push=    40 d=    0 drop=    0 depth=  40  (0 ev/s tickclock)
+t=  18.00 push=    40 d=    0 drop=    0 depth=  40  (0 ev/s tickclock)
+t=  20.00 push=    40 d=    0 drop=    0 depth=  40  (0 ev/s tickclock)
+t=  22.00 push=   120 d=   80 drop=    0 depth= 120  (40 ev/s tickclock)
+t=  24.00 push=   152 d=   32 drop=    0 depth= 152  (16 ev/s tickclock)
+t=  26.00 push=   152 d=    0 drop=    0 depth= 152  (0 ev/s tickclock)
+t=  28.00 push=   152 d=    0 drop=    0 depth= 152  (0 ev/s tickclock)
+t=  30.00 push=   152 d=    0 drop=    0 depth= 152  (0 ev/s tickclock)
+t=  32.00 push=   392 d=  240 drop=  136 depth= 256  (120 ev/s tickclock)
+t=  34.00 push=   424 d=   32 drop=  168 depth= 256  (16 ev/s tickclock)
+t=  36.00 push=   424 d=    0 drop=  168 depth= 256  (0 ev/s tickclock)
+t=  38.00 push=   424 d=    0 drop=  168 depth= 256  (0 ev/s tickclock)
+t=  40.00 push=   424 d=    0 drop=  168 depth= 256  (0 ev/s tickclock)
+t=  42.00 push=   904 d=  480 drop=  648 depth= 256  (240 ev/s tickclock)
+t=  44.00 push=   936 d=   32 drop=  680 depth= 256  (16 ev/s tickclock)
+t=  46.00 push=   936 d=    0 drop=  680 depth= 256  (0 ev/s tickclock)
+t=  48.00 push=   936 d=    0 drop=  680 depth= 256  (0 ev/s tickclock)
+t=  50.00 push=   936 d=    0 drop=  680 depth= 256  (0 ev/s tickclock)
+t=  52.00 push=   936 d=    0 drop=  680 depth= 256  (0 ev/s tickclock)
+t=  54.00 push=   936 d=    0 drop=  680 depth= 256  (0 ev/s tickclock)
+t=  56.00 push=   936 d=    0 drop=  680 depth= 256  (0 ev/s tickclock)
+
+== VQSTAT ==
+t=   4.00 polls=    400(+   0     0Hz) skips=0(+0) drained=     0(+    0) maxb=  0 minfree=32 starve=0 aidx=   32 uidx=    0 free= 32 notify=0
+t=   6.00 polls=    600(+ 200   100Hz) skips=0(+0) drained=     0(+    0) maxb=  0 minfree=32 starve=0 aidx=   32 uidx=    0 free= 32 notify=0
+t=   8.00 polls=    800(+ 200   100Hz) skips=0(+0) drained=     0(+    0) maxb=  0 minfree=32 starve=0 aidx=   32 uidx=    0 free= 32 notify=0
+t=  10.00 polls=   1000(+ 200   100Hz) skips=0(+0) drained=     0(+    0) maxb=  0 minfree=32 starve=0 aidx=   32 uidx=    0 free= 32 notify=0
+t=  12.00 polls=   1200(+ 200   100Hz) skips=0(+0) drained=     8(+    8) maxb=  4 minfree=28 starve=0 aidx=   40 uidx=    8 free= 32 notify=2
+t=  14.00 polls=   1400(+ 200   100Hz) skips=0(+0) drained=    40(+   32) maxb= 32 minfree=0 starve=1 aidx=   72 uidx=   40 free= 32 notify=3
+t=  16.00 polls=   1600(+ 200   100Hz) skips=0(+0) drained=    40(+    0) maxb= 32 minfree=0 starve=1 aidx=   72 uidx=   40 free= 32 notify=3
+t=  18.00 polls=   1800(+ 200   100Hz) skips=0(+0) drained=    40(+    0) maxb= 32 minfree=0 starve=1 aidx=   72 uidx=   40 free= 32 notify=3
+t=  20.00 polls=   2000(+ 200   100Hz) skips=0(+0) drained=    40(+    0) maxb= 32 minfree=0 starve=1 aidx=   72 uidx=   40 free= 32 notify=3
+t=  22.00 polls=   2200(+ 200   100Hz) skips=0(+0) drained=   120(+   80) maxb= 32 minfree=0 starve=1 aidx=  152 uidx=  120 free= 32 notify=23
+t=  24.00 polls=   2400(+ 200   100Hz) skips=0(+0) drained=   152(+   32) maxb= 32 minfree=0 starve=2 aidx=  184 uidx=  152 free= 32 notify=24
+t=  26.00 polls=   2600(+ 200   100Hz) skips=0(+0) drained=   152(+    0) maxb= 32 minfree=0 starve=2 aidx=  184 uidx=  152 free= 32 notify=24
+t=  28.00 polls=   2800(+ 200   100Hz) skips=0(+0) drained=   152(+    0) maxb= 32 minfree=0 starve=2 aidx=  184 uidx=  152 free= 32 notify=24
+t=  30.00 polls=   3000(+ 200   100Hz) skips=0(+0) drained=   152(+    0) maxb= 32 minfree=0 starve=2 aidx=  184 uidx=  152 free= 32 notify=24
+t=  32.00 polls=   3200(+ 200   100Hz) skips=0(+0) drained=   392(+  240) maxb= 32 minfree=0 starve=2 aidx=  424 uidx=  392 free= 32 notify=84
+t=  34.00 polls=   3400(+ 200   100Hz) skips=0(+0) drained=   424(+   32) maxb= 32 minfree=0 starve=3 aidx=  456 uidx=  424 free= 32 notify=85
+t=  36.00 polls=   3600(+ 200   100Hz) skips=0(+0) drained=   424(+    0) maxb= 32 minfree=0 starve=3 aidx=  456 uidx=  424 free= 32 notify=85
+t=  38.00 polls=   3800(+ 200   100Hz) skips=0(+0) drained=   424(+    0) maxb= 32 minfree=0 starve=3 aidx=  456 uidx=  424 free= 32 notify=85
+t=  40.00 polls=   4000(+ 200   100Hz) skips=0(+0) drained=   424(+    0) maxb= 32 minfree=0 starve=3 aidx=  456 uidx=  424 free= 32 notify=85
+t=  42.00 polls=   4200(+ 200   100Hz) skips=0(+0) drained=   904(+  480) maxb= 32 minfree=0 starve=3 aidx=  932 uidx=  904 free= 28 notify=205
+t=  44.00 polls=   4400(+ 200   100Hz) skips=0(+0) drained=   936(+   32) maxb= 32 minfree=0 starve=4 aidx=  968 uidx=  936 free= 32 notify=206
+t=  46.00 polls=   4600(+ 200   100Hz) skips=0(+0) drained=   936(+    0) maxb= 32 minfree=0 starve=4 aidx=  968 uidx=  936 free= 32 notify=206
+t=  48.00 polls=   4800(+ 200   100Hz) skips=0(+0) drained=   936(+    0) maxb= 32 minfree=0 starve=4 aidx=  968 uidx=  936 free= 32 notify=206
+t=  50.00 polls=   5000(+ 200   100Hz) skips=0(+0) drained=   936(+    0) maxb= 32 minfree=0 starve=4 aidx=  968 uidx=  936 free= 32 notify=206
+t=  52.00 polls=   5200(+ 200   100Hz) skips=0(+0) drained=   936(+    0) maxb= 32 minfree=0 starve=4 aidx=  968 uidx=  936 free= 32 notify=206
+t=  54.00 polls=   5400(+ 200   100Hz) skips=0(+0) drained=   936(+    0) maxb= 32 minfree=0 starve=4 aidx=  968 uidx=  936 free= 32 notify=206
+t=  56.00 polls=   5600(+ 200   100Hz) skips=0(+0) drained=   936(+    0) maxb= 32 minfree=0 starve=4 aidx=  968 uidx=  936 free= 32 notify=206

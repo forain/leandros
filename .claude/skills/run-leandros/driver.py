@@ -53,12 +53,6 @@ import select
 import platform
 import shutil
 
-# Guest RAM. 2G is the historical default and what every non-graphical test was
-# measured against. Raise it with LEANDROS_MEM (e.g. "4G") for compositor work:
-# under memory pressure xkb_context_new's calloc(1, 2184) fails, the xkbcommon
-# crate does not null-check it, and SCTK hands the NULL to
-# xkb_compose_table_new_from_locale -> EL0 fault with FAR=0x880.
-GUEST_MEM    = os.environ.get("LEANDROS_MEM", "2G")
 SERIAL_SOCK  = "/tmp/leandros-serial.sock"
 MONITOR_SOCK = "/tmp/leandros-monitor.sock"
 PID_FILE     = "/tmp/leandros-qemu.pid"
@@ -279,6 +273,20 @@ def _audiodev_args():
     return ["-audiodev", "none,id=snd0"]
 
 
+def _guest_mem():
+    """Guest RAM, overridable with LEANDROS_QEMU_MEM (the name run-qemu.sh uses too).
+
+    2G is not a neutral default. A COSMIC session runs a softpipe compositor and
+    five iced applications inside it, and an allocation failure there does not
+    surface as an allocation failure: libxkbcommon's xkb_context_new returns
+    NULL on a failed calloc, the xkbcommon crate wraps the pointer without
+    checking it, and the process dies on a null dereference at the next
+    wl_keyboard bind. Being able to raise this from outside the guest is what
+    makes that attributable rather than merely plausible.
+    """
+    return os.environ.get("LEANDROS_QEMU_MEM", "2G")
+
+
 def _build_cmd(arch, mode="uefi", venus=False):
     if venus:
         # Mirrors run-qemu.sh's --venus guards: it never autodetects and never
@@ -331,7 +339,7 @@ def _build_cmd(arch, mode="uefi", venus=False):
         display_arg = "egl-headless" if venus else "none"
         return [
             "qemu-system-aarch64",
-            "-machine", "virt,gic-version=2", "-smp", "4", *cpu_flags, "-m", GUEST_MEM,
+            "-machine", "virt,gic-version=2", "-smp", "4", *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             "-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}",
@@ -388,7 +396,7 @@ def _build_cmd(arch, mode="uefi", venus=False):
         display_arg = "egl-headless" if venus else "none"
         return [
             "qemu-system-x86_64",
-            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", *cpu_flags, "-m", GUEST_MEM,
+            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             *vars_args,
@@ -431,7 +439,7 @@ def _build_direct_cmd(arch):
             sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
         return [
             "qemu-system-aarch64",
-            "-machine", "virt,gic-version=2", "-smp", "4", "-cpu", "max", "-m", GUEST_MEM, "-accel", "tcg",
+            "-machine", "virt,gic-version=2", "-smp", "4", "-cpu", "max", "-m", _guest_mem(), "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
             "-drive", f"if=none,id=data0,format=raw,file={data0}",
@@ -456,7 +464,7 @@ def _build_direct_cmd(arch):
             sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
         return [
             "qemu-system-x86_64",
-            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", "-cpu", "max", "-m", GUEST_MEM, "-accel", "tcg",
+            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", "-cpu", "max", "-m", _guest_mem(), "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x10000000,force-raw=on",
             "-drive", f"if=none,id=data0,format=raw,file={data0}",
@@ -494,7 +502,7 @@ def _build_raspi4b_cmd():
                   "(build with: ./scripts/build-all.sh --arch aarch64 --raspi4b)")
     return [
         "qemu-system-aarch64",
-        "-machine", "raspi4b", "-m", GUEST_MEM, "-smp", "4", "-accel", "tcg",
+        "-machine", "raspi4b", "-m", "2G", "-smp", "4", "-accel", "tcg",
         "-kernel", kernel,
         "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
         "-drive", f"if=sd,format=raw,file={data0}",

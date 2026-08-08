@@ -13,6 +13,18 @@ named `: FAIL` lines so the two can be cross-footed against each other.
 vfstest runs FIRST and exactly once per image: it leaves xattrs behind that
 make a second run on the same image report a false xattr_list_f2fs failure
 (O_TRUNC clears data but not xattrs, and /data survives reboots).
+
+The completion marker is emitted as `echo "M13""RC=$?"`, which the shell prints
+as M13RC=0 but which is typed as M13""RC=. That is not cosmetic. scmrun stops
+reading at the first sight of the marker, the tty echoes every character it is
+sent, and a marker spelled literally in the command therefore matched the echo
+of the command itself -- closing every window about a second after the command
+was typed, no matter how large the budget. The result was not an empty log but
+a short one: vfstest's 36 subtests split 16 into its own window and 20 into the
+next, each following row read the PREVIOUS row's exit status, and four tests
+reported none at all. A suite that shifts exit statuses across test boundaries
+can report a pass for a test that never ran, so the marker must be something
+the echo cannot contain. scmrun now refuses an echoable marker outright.
 """
 import os
 import re
@@ -29,7 +41,8 @@ OUT = sys.argv[2] if len(sys.argv) > 2 else f"/tmp/m13/suite-{ARCH}"
 os.makedirs(OUT, exist_ok=True)
 LOGF = open(f"{OUT}/m13-suite-{ARCH}.log", "w", buffering=1)
 
-# (command, read-seconds, completion marker or None)
+# (command, read-seconds). Every command gets the same `echo "M13""RC=$?"`
+# marker appended, so there is no per-test marker to get wrong.
 #
 # Budgets are deliberately generous. A first pass at half these numbers came
 # back with five "NO EXIT STATUS READ BACK" rows on aarch64 and seven on
@@ -40,19 +53,24 @@ LOGF = open(f"{OUT}/m13-suite-{ARCH}.log", "w", buffering=1)
 # and the reader stops on that marker, so the ceiling only costs time when
 # something really is stuck.
 TESTS = [
-    ("vfstest", 240, "--- vfstest done ---"),
-    ("drmsmoke", 240, None),
-    ("venustest", 200, None),
-    ("scmtest", 240, None),
-    ("wakepolltest", 240, None),
-    ("forktest", 150, None),
-    ("epolltest", 180, None),
-    ("polltest", 180, None),
-    ("waittest", 240, "--- waittest done ---"),
-    ("sigtest", 150, None),
-    ("timertest", 200, None),
-    ("memtest", 150, None),
-    ("f2fstest", 240, None),
+    ("vfstest", 300),
+    ("drmsmoke", 300),
+    # Expected RED here: venustest needs `driver.py start x86_64 --venus`
+    # (virtio-gpu-gl-pci,venus=on) and this suite boots plain uefi, so the
+    # capset it probes is absent and it reports ~32 failures against a 108/0
+    # baseline. Kept in the list rather than dropped, because before the marker
+    # fix this row read "NO EXIT STATUS READ BACK" and the red was invisible.
+    ("venustest", 240),
+    ("scmtest", 300),
+    ("wakepolltest", 240),
+    ("forktest", 180),
+    ("epolltest", 240),
+    ("polltest", 240),
+    ("waittest", 300),
+    ("sigtest", 180),
+    ("timertest", 240),
+    ("memtest", 180),
+    ("f2fstest", 300),
 ]
 
 # Optional argv[3]: comma-separated subset, for re-running only the rows whose
@@ -62,6 +80,11 @@ TESTS = [
 if len(sys.argv) > 3 and sys.argv[3]:
     want = set(sys.argv[3].split(","))
     TESTS = [t for t in TESTS if t[0] in want]
+
+# The marker is printed by the shell but never typed, so the tty echo of the
+# command cannot contain it. See the module docstring.
+RC_CMD = '; echo "M13""RC=$?"'
+RC_MARK = "M13RC="
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b[()][B0]")
 
@@ -120,7 +143,7 @@ def main():
 
     # Positive control: a binary that must NOT exist, confirmed failing, so a
     # clean-looking suite cannot come from a console that runs nothing.
-    ctl = scm("nosuchbinary_xyz42; echo M13RC=$?", 25, "M13RC=")
+    ctl = scm("nosuchbinary_xyz42" + RC_CMD, 25, RC_MARK)
     m = re.search(r"M13RC=(\d+)", ctl)
     log(f"[control] nosuchbinary_xyz42 -> M13RC={m.group(1) if m else '??'}")
     if not m or m.group(1) == "0":
@@ -129,8 +152,8 @@ def main():
         sys.exit(3)
 
     results = {}
-    for cmd, dur, marker in TESTS:
-        txt = scm(f"{cmd}; echo M13RC=$?", dur, "M13RC=")
+    for cmd, dur in TESTS:
+        txt = scm(cmd + RC_CMD, dur, RC_MARK)
         open(f"{OUT}/{cmd}.log", "w").write(txt)
         rc = re.search(r"M13RC=(\d+)", txt)
         fails = re.findall(r"^\s*([A-Za-z0-9_./-]+):\s*FAIL", txt, re.M)

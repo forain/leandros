@@ -1,0 +1,8 @@
+Login prompt ready (use: driver.py login <user> <password>).
+
+[?2004h[0m[?25l[48;1H[J[39mbrush-0.5# 
+PARKED   moves=600 frames=1200 queue_full=1086  delivered=114 (9.5%)  serial_bytes_read=0
+DRAINED  moves=600 frames=1200 queue_full=0  delivered=1200 (100.0%)  serial_bytes_read=3247
+ABSENT   moves=600 frames=1200 queue_full=0  delivered=1200 (100.0%)  serial_bytes_read=-1
+
+RESULT: [('PARKED', 1086), ('DRAINED', 0), ('ABSENT', 0)]

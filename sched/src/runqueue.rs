@@ -35,6 +35,14 @@ impl RunQueue {
         self.len
     }
 
+    /// Occupied slots as a fraction of the table. `enqueue` fails — and both
+    /// `fork()` and `clone()` then return ENOMEM — the moment this reaches
+    /// `MAX_TASKS`, with plenty of physical memory still free, so a plain
+    /// "out of memory" from userspace can mean this and nothing about RAM.
+    pub fn capacity(&self) -> usize {
+        MAX_TASKS
+    }
+
     /// Minimum `vruntime` over all runnable (Ready or Running) tasks.
     ///
     /// Used to place newly enqueued or freshly woken tasks so they compete

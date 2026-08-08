@@ -1,0 +1,169 @@
+# m17-census — which well-known names does a normal COSMIC session address that
+# nobody owns, and what happens to the components that ask.
+#
+# Run it as:  brush /bin/m17-census     (no shebang binfmt; always via a shell)
+# Host half:  artifacts/m17_census.py
+#
+# WHY busd IS STARTED HERE AND NOT BY dbus-run-session. The question is a
+# census, and the answer is busd's own `warn!` on busd's stderr.
+# dbus-run-session hands busd the very fd every other component writes to, and
+# two LeandrOS processes sharing one redirected fd keep INDEPENDENT file
+# offsets and overwrite each other — so a name MISSING from that shared log
+# would prove nothing at all. busd gets a file of its own here. Everything else
+# about the launch is what dbus-run-session does: same binary, same config,
+# same address, same --ready-fd rendezvous. start-cosmic-leandros then takes
+# its "DBUS_SESSION_BUS_ADDRESS is already set" branch and execs cosmic-session
+# directly, exactly as it would have underneath dbus-run-session.
+#
+# RUST_LOG IS LOAD-BEARING. busd initialises tracing with
+# EnvFilter::from_default_env(); with RUST_LOG unset that enables ERROR only,
+# and `unknown destination` is a `warn!`. start-cosmic-leandros exports
+# RUST_LOG=info, which is the only reason the line was ever seen — but busd is
+# started before that script runs, so it has to be exported here.
+#
+# BOTH streams are redirected, not just stderr. tracing_subscriber's `fmt`
+# layer writes to STDOUT by default, so `2>` alone captures nothing and every
+# busd line lands on the console instead — where it costs ~0.19 s per newline
+# and busd blocks on each one, which is a perturbation of the very process
+# under measurement.
+#
+# THE SECOND MEASUREMENT, and why it is a re-run rather than a log. Each of the
+# four autostarted single-instance components is started a SECOND time by hand
+# after the session has settled, each with its own stderr file. cosmic-session
+# pipes its children's stderr and registers no on_stderr handler
+# (cosmic-session/src/comp.rs:122-134), so the autostarted copies' diagnostics
+# go nowhere and cannot be read at all; a hand-started copy's can. The stderr
+# BYTE COUNT is the discriminator, with three distinguishable outcomes:
+#
+#   * a few hundred bytes, stopping at libcosmic's theme error, and the process
+#     never exits            -> blocked in the blocking D-Bus single-instance probe
+#   * "Another instance is running", and it exits
+#                            -> NOT blocked, and the autostarted copy owns the
+#                               name, which can only be true if that copy got
+#                               through the same probe
+#   * "Failed to activate another instance", and it runs on
+#                            -> not blocked, but nobody owns the name
+#
+# Only the first is reachable while a method call to an unowned name is dropped.
+#
+# MEMORY IS SAMPLED AS A SERIES. `meminfo` reads sysinfo(2), which the kernel
+# fills from the buddy allocator. A single reading cannot tell "the guest is
+# nearly out" from "the guest was nearly out for a moment", and an allocation
+# failure is a question about the trough, so it is read at every boundary.
+
+R=/run/user/0
+L=/data/m17
+
+mkdir -p "$R"
+chmod 0700 "$R"
+mkdir -p "$L"
+
+echo "M17: BEGIN"
+
+/bin/meminfo boot
+
+RUST_LOG=info
+RUST_BACKTRACE=1
+XDG_RUNTIME_DIR=$R
+export RUST_LOG
+export RUST_BACKTRACE
+export XDG_RUNTIME_DIR
+
+# A leftover socket makes busd's bind() fail with "address in use".
+rm -f "$R/bus"
+rm -f "$R/busd-ready"
+
+/bin/sh -c 'exec /usr/libexec/busd --config /usr/share/dbus-1/session.conf --address unix:path=/run/user/0/bus --ready-fd 3' 3>"$R/busd-ready" > "$L/busd.log" 2>&1 &
+
+i=0
+while [ "$i" -lt 60 ]; do
+	if [ -s "$R/busd-ready" ]; then
+		break
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+echo "M17: busd ready after ${i}s"
+
+DBUS_SESSION_BUS_ADDRESS="unix:path=$R/bus"
+export DBUS_SESSION_BUS_ADDRESS
+
+sh /bin/start-cosmic-leandros > "$L/cosmic.log" 2>&1 &
+
+i=0
+while [ "$i" -lt 180 ]; do
+	if [ -e "$R/wayland-1" ]; then
+		break
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+echo "M17: wayland-1 after ${i}s"
+
+/bin/meminfo wayland1
+
+# Three settle windows before anything is added to the session. The compositor
+# takes 6-26 s to settle after a client's first present, and any fault that
+# belongs to the autostarted components has to be attributable to them alone —
+# so this whole stretch happens before the hand-started probes exist.
+echo "M17: MARK SETTLE1 45"
+sleep 45
+/bin/meminfo settle1
+echo "M17: ENDMARK SETTLE1"
+
+echo "M17: MARK SETTLE2 45"
+sleep 45
+/bin/meminfo settle2
+echo "M17: ENDMARK SETTLE2"
+
+echo "M17: MARK SETTLE3 45"
+sleep 45
+/bin/meminfo settle3
+echo "M17: ENDMARK SETTLE3"
+
+# The census is complete at this point: every component cosmic-session starts
+# has had well over two minutes to make its startup D-Bus calls.
+echo "M17: ==== BEGIN busd.log ===="
+cat "$L/busd.log"
+echo "M17: ==== END busd.log ===="
+
+/bin/meminfo precensus
+
+echo "M17: CENSUS DONE"
+
+# ---- the second measurement --------------------------------------------------
+WAYLAND_DISPLAY=wayland-1
+export WAYLAND_DISPLAY
+
+echo "M17: MARK PROBE 90"
+/bin/cosmic-launcher    > "$L/p-launcher.log"    2>&1 &
+/bin/cosmic-app-library > "$L/p-applibrary.log"  2>&1 &
+/bin/cosmic-workspaces  > "$L/p-workspaces.log"  2>&1 &
+/bin/cosmic-osd         > "$L/p-osd.log"         2>&1 &
+sleep 90
+/bin/meminfo probe
+echo "M17: ENDMARK PROBE"
+
+echo "M17: CAPTURES DONE"
+
+for n in launcher applibrary workspaces osd; do
+	echo "M17: ---- probe $n"
+	wc -c "$L/p-$n.log"
+	head -c 900 "$L/p-$n.log"
+	echo ""
+	echo "M17: ---- end probe $n"
+done
+
+/bin/meminfo final
+
+# cosmic-session's own log. This one file IS trustworthy despite the shared-fd
+# hazard: cosmic-session pipes every child's stdout and stderr into launch_pad
+# and reads them nowhere, so it is the only writer here. What it does record is
+# every `launch_pad` start and restart — which is the difference between "the
+# component exited" and "the component is running and drawing nothing".
+echo "M17: ==== BEGIN cosmic.log (tail) ===="
+tail -c 24000 "$L/cosmic.log"
+echo ""
+echo "M17: ==== END cosmic.log ===="
+
+echo "M17: DONE"

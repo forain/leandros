@@ -1386,6 +1386,31 @@ pub fn unblock_port(port: u32) {
     if woken > 0 { wake_up_an_idle_cpu(); }
 }
 
+/// Live tasks, and the fixed table size they are competing for.
+///
+/// A LeandrOS thread is a task, so this counts threads, not processes: it is
+/// the number that binds against `runqueue::MAX_TASKS`. `fork`/`clone` return
+/// ENOMEM when the two are equal, however much physical memory is free.
+pub fn task_census() -> (usize, usize) {
+    let rq = RUN_QUEUE.lock();
+    (rq.len(), rq.capacity())
+}
+
+/// Live processes: distinct thread-group ids among the tasks in the table.
+pub fn process_count() -> usize {
+    let rq = RUN_QUEUE.lock();
+    let mut n = 0usize;
+    for i in 0..runqueue::MAX_TASKS {
+        if let Some(t) = rq.get(i) {
+            // Count each thread group once, at its leader.
+            if t.tgid == t.pid {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 pub fn spawn(entry: fn() -> !, _flags: usize) -> Option<Pid> {
     let pid = alloc_pid();
 

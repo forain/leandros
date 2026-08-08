@@ -1,0 +1,142 @@
+Reply ServiceUnknown instead of dropping an undeliverable method call.
+
+busd 0.5.0 answers a method call addressed to a well-known name that nobody
+owns by discarding it: `send_msg` bails, `serve_peer` turns that into a `warn!`
+and moves on. Nothing goes back to the caller. busd has no server-side reply
+timeout the way the reference dbus-daemon does, and zbus imposes no client-side
+one, so a BLOCKING caller waits forever.
+
+That is not one application's problem, it is a whole class. A stock session on
+x86_64 addresses eleven distinct unowned names in its first ten seconds --
+com.system76.PowerDaemon, org.a11y.Bus, org.freedesktop.UPower,
+org.freedesktop.locale1, org.freedesktop.timedate1,
+com.system76.CosmicSettingsDaemon (six calls), and the APP_ID of each of the
+four autostarted single-instance components. libcosmic's `run_single_instance`
+is simply the caller that blocks on it, which is why no libcosmic application
+had ever rendered.
+
+The reply is gated three ways, all of them load-bearing:
+
+  * only `Type::MethodCall` gets a reply. A `MethodReturn`/`Error` addressed to
+    a name that has since gone away must be dropped silently, or the bus would
+    answer its own errors; signals never reach here at all, since `serve_peer`
+    routes them to `broadcast_msg` before this match.
+  * `NO_REPLY_EXPECTED` suppresses it, per the D-Bus specification. Replying to
+    a call that asked for no reply leaves an unmatched serial in the caller.
+  * a message with no `sender` is dropped, since there is nowhere to address the
+    error. `peer::Stream` sets the sender on every message it admits, so this is
+    belt and braces.
+
+`Message::error(&header, name)` copies the incoming serial into `reply_serial`
+and the incoming sender into `destination` by itself; only the sender field has
+to be set, and it must be the bus's own well-known name, `fdo::BUS_NAME`.
+
+The caller is left better off, not merely unblocked: libcosmic treats the `Err`
+as "no other instance" and falls through to `run::<App>()` with
+`core.single_instance = true`, so the application then owns its APP_ID and
+serves `DbusActivation` itself. Single-instance behaviour is preserved, which
+is the difference between this and setting COSMIC_SINGLE_INSTANCE=false.
+
+--- a/src/peers.rs
++++ b/src/peers.rs
+@@ -14,7 +14,7 @@
+ use zbus::{
+     connection::socket::BoxedSplit,
+     message,
+-    names::{BusName, OwnedUniqueName, UniqueName},
++    names::{BusName, OwnedUniqueName, UniqueName, WellKnownName},
+     zvariant::Optional,
+     AuthMechanism, Message, OwnedGuid,
+ };
+@@ -264,15 +264,89 @@
+         match destination {
+             BusName::Unique(dest) => self.send_msg_to_unique_name(msg, dest.clone()).await,
+             BusName::WellKnown(name) => {
+-                let dest = match self.name_registry().await.lookup(name.clone()) {
++                // The lookup gets a statement of its own so that the
++                // `NameRegistry` read guard is released before anything below
++                // awaits. A temporary created in a `let` initialiser lives to
++                // the end of the whole `let` statement, so writing this as
++                // `match self.name_registry().await.lookup(..)` would hold a
++                // read lock across the reply's own `peers`/`name_registry`
++                // acquisitions -- and tokio's `RwLock` is fair, so one queued
++                // writer turns that recursive read into a deadlock of the
++                // single-threaded broker.
++                let owner = self.name_registry().await.lookup(name.clone());
++                let dest = match owner {
+                     Some(dest) => dest,
+-                    None => bail!("unknown destination: {}", name),
++                    None => {
++                        self.reply_service_unknown(&msg, &name).await;
++                        bail!("unknown destination: {}", name);
++                    }
+                 };
+                 self.send_msg_to_unique_name(msg, (&*dest).into()).await
+             }
+         }
+     }
+ 
++    /// Tell the caller of an undeliverable method call that the service is not
++    /// there, instead of dropping the call and leaving the caller blocked.
++    ///
++    /// Without this, a method call addressed to a well-known name that nobody
++    /// owns is simply discarded: `send_msg` bails and `serve_peer` turns that
++    /// into a `warn!`. Nothing goes back to the caller, and there is no
++    /// server-side reply timeout here the way the reference dbus-daemon has
++    /// one, nor a client-side one in zbus, so a blocking caller waits forever.
++    ///
++    /// The reply is gated three ways, all load-bearing:
++    ///
++    ///   * only a `MethodCall` is answered. A reply or an error addressed to a
++    ///     name that has since gone away must be dropped silently, or the bus
++    ///     would answer its own errors; signals never reach here at all, since
++    ///     `serve_peer` routes them to `broadcast_msg` first.
++    ///   * `NO_REPLY_EXPECTED` suppresses it, per the D-Bus specification.
++    ///     Replying to a call that asked for no reply leaves an unmatched
++    ///     serial in the caller.
++    ///   * a message with no `sender` is dropped, because there is nowhere to
++    ///     address the error. `peer::Stream` sets the sender on everything it
++    ///     admits, so this is belt and braces.
++    async fn reply_service_unknown(&self, msg: &Message, name: &WellKnownName<'_>) {
++        let header = msg.header();
++
++        if msg.message_type() != message::Type::MethodCall {
++            return;
++        }
++        if header
++            .primary()
++            .flags()
++            .contains(message::Flags::NoReplyExpected)
++        {
++            return;
++        }
++        let Some(sender) = header.sender().cloned() else {
++            return;
++        };
++
++        // `Message::error` copies the incoming serial into `reply_serial` and
++        // the incoming sender into `destination` by itself; only the sender
++        // field has to be filled in, and it has to be the bus's own name.
++        let reply = match Message::error(&header, "org.freedesktop.DBus.Error.ServiceUnknown")
++            .and_then(|b| b.sender(fdo::BUS_NAME))
++            .and_then(|b| {
++                b.build(&(format!(
++                    "The name {name} was not provided by any .service files"
++                ),))
++            }) {
++            Ok(reply) => reply,
++            Err(e) => {
++                warn!("Couldn't build a ServiceUnknown reply for `{name}`: {e}");
++
++                return;
++            }
++        };
++
++        if let Err(e) = self.send_msg_to_unique_name(reply, sender).await {
++            warn!("Couldn't deliver the ServiceUnknown reply for `{name}`: {e}");
++        }
++    }
++
+     async fn send_msg_to_unique_name(
+         &self,
+         msg: Message,

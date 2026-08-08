@@ -17,6 +17,23 @@ cmd = sys.argv[1] if len(sys.argv) > 1 else "scmtest"
 dur = float(sys.argv[2]) if len(sys.argv) > 2 else 40.0
 marker = sys.argv[3].encode() if len(sys.argv) > 3 and sys.argv[3] else None
 
+# A marker that occurs in the command is not a completion marker. The tty
+# echoes what it is sent, so the marker comes back as part of the echoed
+# command line and the read ends before the command has printed anything --
+# and what is left looks like a clean short run, not a truncated one, so it
+# greps clean. artifacts/m13_suite.py sent `<test>; echo M13RC=$?` with marker
+# "M13RC=" and every window therefore closed ~1 s after the command was typed:
+# vfstest's 36 subtests arrived 16 in its own window and 20 in the next, every
+# later row read the previous row's exit status, and four tests reported no
+# exit status at all. Widening the budgets could not help, because nothing was
+# timing out. Build the marker out of something the shell assembles instead:
+#   <test>; echo "M13""RC=$?"      typed as M13""RC=, printed as M13RC=
+if marker is not None and marker in (cmd + "\n").encode():
+    sys.exit("scmrun: marker %r occurs in the command it is typed with, so the "
+             "tty echo would end the read immediately. Emit it from something "
+             "the shell assembles, e.g. echo \"M13\"\"RC=$?\"."
+             % marker.decode(errors="replace"))
+
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.connect(SOCK)
 s.setblocking(False)

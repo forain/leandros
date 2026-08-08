@@ -812,6 +812,55 @@ pub fn dispatch(
 /// default; flip to `true` when bringing up a device-mmap path.
 const DBG_MMAP: bool = false;
 
+/// Name every ENOMEM this file can return from the memory, address-space and
+/// exec paths.
+///
+/// "Out of memory (os error 12)" from LeandrOS means one of about a dozen
+/// unrelated things, only two of which are about RAM, and userspace sees the
+/// errno and nothing else. Two investigations have now started from that errno
+/// and gone looking for a leak that was not there. With this on, one boot says
+/// which return fired.
+///
+/// Committed `false`: the sites are on hot paths and the console costs ~0.19 s
+/// per newline. `ENOMEM_BUDGET` bounds a run that leaves it on.
+///
+/// `sys_mincore` is deliberately not instrumented. Its ENOMEM means "this range
+/// is not mapped" and is a normal answer to a pointer probe, not a failure.
+const DBG_ENOMEM: bool = false;
+
+/// Line budget shared by every `enomem_site` call.
+static ENOMEM_BUDGET: AtomicUsize = AtomicUsize::new(64);
+
+/// Print `site` and return -12, so a call site reads `return enomem_site("...")`
+/// and the errno cannot drift away from its explanation.
+fn enomem_site(site: &str) -> isize {
+    if DBG_ENOMEM
+        && ENOMEM_BUDGET
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+                          |v| if v == 0 { None } else { Some(v - 1) })
+            .is_ok()
+    {
+        crate::serial_print_str("[ENOMEM] ");
+        crate::serial_print_str(site);
+        crate::serial_print_str(" pid=");
+        crate::serial_print_hex(current_pid() as usize);
+        crate::serial_print_str("\n");
+    }
+    -12
+}
+
+/// As `enomem_site`, plus the reason `mm::vmm` recorded for the mapping call
+/// that just failed -- a VMA overlap and an exhausted buddy order are the same
+/// errno and completely different bugs.
+fn enomem_map_site(site: &str) -> isize {
+    if DBG_ENOMEM {
+        crate::serial_print_str("[ENOMEM] reason=");
+        crate::serial_print_str(mm::vmm::last_map_fail());
+        crate::serial_print_str(" ");
+    }
+    enomem_site(site)
+}
+
 /// Log every syscall entry (number + pid) over serial. Extremely verbose —
 /// enable only while bisecting a userland bring-up failure.
 const SYSCALL_TRACE: bool = false;
@@ -1003,7 +1052,7 @@ fn dispatch_inner(
         SYS_IPC_CALL => sys_call(a0, a1, a2),
         SYS_PORT_CREATE => match port::create(current_pid()) {
             Some(p) => p as isize,
-            None    => -12, // ENOMEM — port table full
+            None    => enomem_site("port_create/table-full"),
         },
 
         // ── Device enumeration (lsblk/lspci/lsusb) ──────────────────────────────
@@ -1480,7 +1529,7 @@ fn sys_call(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
             let caller = current_pid();
             match port::create(caller) {
                 Some(p) => { set_current_reply_port(p); p }
-                None    => return -12, // ENOMEM — port table full
+                None    => return enomem_site("sys_call/no-reply-port"),
             }
         }
     };
@@ -1578,8 +1627,11 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
                 if flags & MAP_FIXED == 0 && addr != 0 {
                     let bump = MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed);
                     let m2 = with_current_address_space_mut(|as_| as_.map_lazy(bump, len, page_flags, is_shared));
-                    match m2 { Some(true) => bump as isize, _ => -12 }
-                } else { -12 }
+                    match m2 {
+                        Some(true) => bump as isize,
+                        _ => enomem_map_site(("mmap/anon/bump-retry")),
+                    }
+                } else { enomem_map_site(("mmap/anon")) }
             }
             None => -1,
         };
@@ -1668,7 +1720,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
         });
         let ret = match mapped {
             Some(true)  => virt as isize,
-            _           => -12, // ENOMEM
+            _           => enomem_map_site(("mmap/device")),
         };
         if DBG_MMAP {
         crate::serial_print_str("[MMAP] map_device virt=");
@@ -1719,12 +1771,12 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
                         // On success the VMA owns the transferred pins.
                         Some(true)  => virt as isize,
                         // map_shared_frames released the pins itself on failure.
-                        Some(false) => -12, // ENOMEM
+                        Some(false) => enomem_map_site(("mmap/shared-vmo")),
                         // No current address space: release the pins ourselves.
-                        None => { vfs::vmo_release_frames(&frames); -12 }
+                        None => { vfs::vmo_release_frames(&frames); enomem_site("mmap/shared-vmo/no-address-space") }
                     };
                 }
-                None => return -12, // ENOMEM — promotion/allocation failed
+                None => return enomem_site("mmap/shared-vmo/acquire-frames")
             }
         }
     }
@@ -1777,7 +1829,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     // mapped_phys : Option<Option<usize>> — outer None = no address space
     let phys = match mapped_phys {
         Some(Some(p)) => p,
-        _             => return -12, // ENOMEM or no address space
+        _             => return enomem_map_site(("mmap/file-backed")),
     };
 
     // Step 3: read file data into the physical pages.
@@ -1884,7 +1936,7 @@ fn sys_mremap(
     });
     if copied != Some(true) {
         with_current_address_space_mut(|as_| as_.unmap(new_va, new_size));
-        return -12; // ENOMEM
+        return enomem_site("mremap/copy");
     }
 
     // Unmap the old region.
@@ -1912,7 +1964,7 @@ fn sys_spawn(entry_va: usize, stack_va: usize, priority_raw: usize) -> isize {
     let priority = priority_raw as i8;
     match spawn_user(entry_va, stack_va, priority) {
         Some(pid) => pid as isize,
-        None      => -12, // ENOMEM
+        None      => enomem_site("spawn/run-queue-or-oom"),
     }
 }
 
@@ -2624,6 +2676,10 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
     let free_pages = mm::buddy::free_pages();
     let total_pages = mm::buddy::total_pages();
     let page_size = mm::buddy::PAGE_SIZE as u64;
+    // Read the run queue BEFORE any user memory is touched below: taking the
+    // RUN_QUEUE lock around a write that can demand-page re-enters the
+    // scheduler under its own lock.
+    let procs = sched::process_count().min(u16::MAX as usize) as u16;
 
     unsafe {
         // uptime (i64 at offset 0)
@@ -2633,8 +2689,8 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
         core::ptr::write((info_ptr + 32) as *mut u64, total_pages as u64 * page_size);
         // freeram (u64 at offset 40)
         core::ptr::write((info_ptr + 40) as *mut u64, free_pages as u64 * page_size);
-        // procs (u16 at offset 80) — 1 process
-        core::ptr::write((info_ptr + 80) as *mut u16, 1u16);
+        // procs (u16 at offset 80)
+        core::ptr::write((info_ptr + 80) as *mut u16, procs);
         // mem_unit (u32 at offset 104) — 1 byte
         core::ptr::write((info_ptr + 104) as *mut u32, 1u32);
     }
@@ -2800,9 +2856,17 @@ fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     }
 }
 
+/// `brk(2)` has no errno. Failure is "the returned break is not the one you
+/// asked for", which musl detects by comparing the two and turns into a NULL
+/// from `malloc` — so a heap that cannot grow is invisible on the way out.
+/// `DBG_ENOMEM` makes it visible.
 fn sys_brk(new_end: usize) -> isize {
-    with_current_address_space_mut(|as_| as_.brk(new_end))
-        .unwrap_or(-12) // ENOMEM
+    let r = with_current_address_space_mut(|as_| as_.brk(new_end))
+        .unwrap_or_else(|| enomem_site("brk/no-address-space"));
+    if new_end != 0 && r >= 0 && (r as usize) < new_end {
+        let _ = enomem_map_site(("brk/refused"));
+    }
+    r
 }
 
 /// POSIX `mincore(addr, length, vec)` — report which pages of `[addr, addr+length)`
@@ -3242,7 +3306,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let pt_root = unsafe { arch_alloc_page_table_root() };
     if pt_root == 0 {
         if exec_cap != 0 { exec_file_release(exec_cap); }
-        return -12;
+        return enomem_site("execve/page-table-root");
     }
     let mut new_as = alloc::boxed::Box::new(mm::vmm::AddressSpace::new(pt_root));
 
@@ -3341,7 +3405,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // Map user stack (read+write, eager so virt_to_phys works immediately).
     let stack_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE;
     if !new_as.map(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, stack_flags) {
-        drop(new_as); return -12;
+        let r = enomem_map_site("execve/user-stack");
+        drop(new_as); return r;
     }
 
     // Map the sigreturn trampoline page (read+exec) and fill in the
@@ -3429,7 +3494,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 
     // Get physical address of the start of the stack frame.
     let phys_base = match new_as.virt_to_phys(user_sp) {
-        Some(p) => p, None => { drop(new_as); return -12; }
+        Some(p) => p, None => { drop(new_as); return enomem_site("execve/stack-not-backed"); }
     };
     let virt_base = mm::phys_to_virt(phys_base);
 
@@ -6940,7 +7005,15 @@ fn gap2_sample_tick() {
 
 /// Master gate for the `[EVSTAT]` evdev I/O census (`evstat_tick`). Same shape
 /// as `DRM_STATS`: a const so the whole sampler compiles out when off.
-pub const EV_STATS: bool = true;
+///
+/// OFF. On at 0.5 Hz this writes ~366 bytes of two census lines into every
+/// captured log forever — it accounted for 28,900 of the 30,934 console bytes
+/// of a 100-line measurement — which buries the output under test and inflates
+/// any count taken over a log. Turn it on to investigate; it is not a shipping
+/// diagnostic. Note that `artifacts/m15_serial_stall.py` needs it on: its guard
+/// works by having the timer IRQ print, and with the census off nothing reaches
+/// `putc` from IRQ context for a parked serial reader to back-pressure.
+pub const EV_STATS: bool = false;
 
 /// 0.5 Hz `[EVSTAT]` census of every evdev node, one line per device.
 ///
@@ -6984,6 +7057,20 @@ fn evstat_tick() {
         mm::gap2::kv(" conspop=", c.conspop as usize);
         mm::gap2::kv(" rpid=",    c.rpid    as usize);
         mm::gap2::kv(" ipid=",    c.ipid    as usize);
+        mm::gap2::nl();
+    }
+    if drivers::virtio_keyboard::VQ_STATS {
+        let v = drivers::virtio_keyboard::vq_census();
+        mm::gap2::s("[VQSTAT] t=");   mm::gap2::h(now);
+        mm::gap2::kv(" polls=",   v.polls   as usize);
+        mm::gap2::kv(" skips=",   v.skips   as usize);
+        mm::gap2::kv(" drained=", v.drained as usize);
+        mm::gap2::kv(" maxb=",    v.maxb    as usize);
+        mm::gap2::kv(" minfree=", v.minfree as usize);
+        mm::gap2::kv(" starve=",  v.starve  as usize);
+        mm::gap2::kv(" aidx=",    v.aidx    as usize);
+        mm::gap2::kv(" uidx=",    v.uidx    as usize);
+        mm::gap2::kv(" notify=",  v.notify  as usize);
         mm::gap2::nl();
     }
 }

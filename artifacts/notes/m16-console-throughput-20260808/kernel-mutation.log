@@ -1,0 +1,13 @@
+=== CONTROL kernel (SCROLL_ROWS = 8) ===
+892:const SCROLL_ROWS: usize = 8;
+772fbbd53da3a4175e698baaf0ac6cdb  target/final-x86_64/kernel
+=== MUTANT: SCROLL_ROWS = 1 ===
+892:const SCROLL_ROWS: usize = 1;
+b1df2bf381d62488863651856753801a  target/final-x86_64/kernel
+[control] rc=['127'] notfound=True
+[mutant] V1 elapsed=145.2s lines=100/100 marker=True => 1.452 s/line
+=== RESTORE: SCROLL_ROWS = 8 ===
+892:const SCROLL_ROWS: usize = 8;
+772fbbd53da3a4175e698baaf0ac6cdb  target/final-x86_64/kernel
+=== git diff must be clean for framebuffer.rs SCROLL_ROWS ===
+1

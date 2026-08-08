@@ -188,7 +188,7 @@ impl AddressSpace {
     ///
     /// Returns `true` on success, `false` if OOM or the VMA table is full.
     pub fn map(&mut self, virt: usize, size: usize, flags: PageFlags) -> bool {
-        if size == 0 { return false; }
+        if size == 0 { return note_fail(FAIL_ZERO_SIZE); }
 
         // Find a free VMA slot.
         let slot = match self.regions.iter().position(|r| r.is_none()) {
@@ -204,18 +204,18 @@ impl AddressSpace {
         let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
         let end   = match virt.checked_add(pages * PAGE_SIZE) {
             Some(e) => e,
-            None    => return false, // overflow → reject
+            None    => return note_fail(FAIL_VA_OVERFLOW),
         };
 
         // Reject if the new range overlaps any existing VMA.
         for r in self.regions.iter().filter_map(|r| r.as_ref()) {
-            if virt < r.end && end > r.start { return false; }
+            if virt < r.end && end > r.start { return note_fail(FAIL_VMA_OVERLAP); }
         }
         let order = pages_to_order(pages);
 
         let phys = match buddy_alloc(order) {
             Some(p) => p,
-            None    => return false,
+            None    => return note_fail(FAIL_BUDDY),
         };
 
         // Zero the backing memory via HHDM virtual address.
@@ -239,7 +239,7 @@ impl AddressSpace {
                     unsafe { unmap_page(self.page_table_root, virt + j * PAGE_SIZE); }
                 }
                 buddy_free(phys, order);
-                return false;
+                return note_fail(FAIL_PTE_INSTALL);
             }
         }
 
@@ -267,7 +267,7 @@ impl AddressSpace {
         ///
         /// Returns `true` on success, `false` if the VMA table is full or mapping fails.
         pub fn map_device(&mut self, virt: usize, phys: usize, size: usize, flags: PageFlags) -> bool {
-        if size == 0 { return false; }
+        if size == 0 { return note_fail(FAIL_ZERO_SIZE); }
 
         // Find a free VMA slot.
         let slot = match self.regions.iter().position(|r| r.is_none()) {
@@ -284,12 +284,12 @@ impl AddressSpace {
         let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
         let end   = match virt.checked_add(pages * PAGE_SIZE) {
             Some(e) => e,
-            None    => return false, // overflow → reject
+            None    => return note_fail(FAIL_VA_OVERFLOW), // overflow → reject
         };
 
         // Reject if the new range overlaps any existing VMA.
         for r in self.regions.iter().filter_map(|r| r.as_ref()) {
-            if virt < r.end && end > r.start { return false; }
+            if virt < r.end && end > r.start { return note_fail(FAIL_VMA_OVERLAP); }
         }
 
         // Map each page to the specified physical address.
@@ -301,7 +301,7 @@ impl AddressSpace {
                     for j in 0..i {
                         crate::paging::unmap_page(self.page_table_root, virt + j * PAGE_SIZE);
                     }
-                    return false;
+                    return note_fail(FAIL_PTE_INSTALL);
                 }
             }
         }
@@ -338,7 +338,7 @@ impl AddressSpace {
     /// Returns `true` on success, `false` if the VMA table is full or the range
     /// overlaps an existing VMA.
     pub fn map_lazy(&mut self, virt: usize, size: usize, flags: PageFlags, is_shared: bool) -> bool {
-        if size == 0 { return false; }
+        if size == 0 { return note_fail(FAIL_ZERO_SIZE); }
 
         let slot = match self.regions.iter().position(|r| r.is_none()) {
             Some(i) => i,
@@ -352,12 +352,12 @@ impl AddressSpace {
         let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
         let end   = match virt.checked_add(pages * PAGE_SIZE) {
             Some(e) => e,
-            None    => return false,
+            None    => return note_fail(FAIL_VA_OVERFLOW),
         };
 
         for r in self.regions.iter().filter_map(|r| r.as_ref()) {
             if virt < r.end && end > r.start {
-                return false;
+                return note_fail(FAIL_VMA_OVERLAP);
             }
         }
 
@@ -398,7 +398,7 @@ impl AddressSpace {
     /// **all** passed frames (dropping the caller's pins), returning `false`.
     pub fn map_shared_frames(&mut self, virt: usize, frames: &[usize], flags: PageFlags) -> bool {
         if frames.is_empty() {
-            return false;
+            return note_fail(FAIL_ZERO_SIZE);
         }
 
         let release_all = || {
@@ -419,11 +419,11 @@ impl AddressSpace {
         let pages = frames.len();
         let end = match virt.checked_add(pages * PAGE_SIZE) {
             Some(e) => e,
-            None    => { release_all(); return false; }
+            None    => { release_all(); return note_fail(FAIL_VA_OVERFLOW); }
         };
 
         for r in self.regions.iter().filter_map(|r| r.as_ref()) {
-            if virt < r.end && end > r.start { release_all(); return false; }
+            if virt < r.end && end > r.start { release_all(); return note_fail(FAIL_VMA_OVERLAP); }
         }
 
         // Install a PTE for each frame. On failure, roll back the PTEs already
@@ -437,7 +437,7 @@ impl AddressSpace {
                     unsafe { unmap_page(self.page_table_root, virt + j * PAGE_SIZE); }
                 }
                 release_all();
-                return false;
+                return note_fail(FAIL_PTE_INSTALL);
             }
         }
 
@@ -483,7 +483,8 @@ impl AddressSpace {
         file_off: u64,
         file_len: u64,
     ) -> bool {
-        if size == 0 || !is_file_backed(file_cap) { return false; }
+        if size == 0 { return note_fail(FAIL_ZERO_SIZE); }
+        if !is_file_backed(file_cap) { return note_fail(FAIL_BAD_FILECAP); }
 
         let slot = match self.regions.iter().position(|r| r.is_none()) {
             Some(i) => i,
@@ -497,12 +498,12 @@ impl AddressSpace {
         let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
         let end   = match virt.checked_add(pages * PAGE_SIZE) {
             Some(e) => e,
-            None    => return false,
+            None    => return note_fail(FAIL_VA_OVERFLOW),
         };
 
         for r in self.regions.iter().filter_map(|r| r.as_ref()) {
             if virt < r.end && end > r.start {
-                return false;
+                return note_fail(FAIL_VMA_OVERLAP);
             }
         }
 
@@ -1082,7 +1083,10 @@ impl AddressSpace {
         // Query: return the current break without any modification.
         if new_end == 0 { return current_break as isize; }
 
-        if self.heap_start == 0 { return current_break as isize; } // kernel task, no heap
+        if self.heap_start == 0 {
+            note_fail(FAIL_NO_HEAP);
+            return current_break as isize; // kernel task, no heap
+        }
         let new_end = (new_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
         // Find the heap VMA (lazily created on first brk call after execve).
@@ -1114,6 +1118,7 @@ impl AddressSpace {
                 if i == idx { continue; }
                 if let Some(r) = slot {
                     if r.start < new_end && r.end > old_end {
+                        note_fail(FAIL_VMA_OVERLAP);
                         return current_break as isize; // overlap: return unchanged
                     }
                 }
@@ -1143,6 +1148,51 @@ impl AddressSpace {
 
         self.heap_end = new_end;
         new_end as isize
+    }
+}
+
+// ── Why the last mapping call refused ────────────────────────────────────────
+//
+// `map`, `map_lazy`, `map_device`, `map_shared_frames`, `map_lazy_file` and
+// `brk` all answer `false` (or an unchanged break), and every caller turns that
+// into the single errno 12. A VMA overlap, an address-space overflow and an
+// exhausted buddy order are three different bugs wearing one number. This cell
+// keeps the last reason so the syscall layer can name it; it is advisory
+// diagnostics only -- nothing branches on it.
+
+static LAST_MAP_FAIL: AtomicUsize = AtomicUsize::new(0);
+
+const FAIL_NONE:        usize = 0;
+const FAIL_ZERO_SIZE:   usize = 1;
+const FAIL_VMA_OVERLAP: usize = 2;
+const FAIL_VA_OVERFLOW: usize = 3;
+const FAIL_BUDDY:       usize = 4;
+const FAIL_PTE_INSTALL: usize = 5;
+const FAIL_NO_HEAP:     usize = 6;
+const FAIL_BAD_FILECAP: usize = 7;
+
+fn note_fail(code: usize) -> bool {
+    LAST_MAP_FAIL.store(code, Ordering::Relaxed);
+    false
+}
+
+/// Reason for the most recent mapping refusal, as a stable short token.
+///
+/// `buddy-order-unavailable` is the one that looks like "out of RAM" and is
+/// not: `map` and `map_device` ask the buddy allocator for `2^order`
+/// *physically contiguous* pages, which a fragmented heap can refuse with
+/// gigabytes free.
+pub fn last_map_fail() -> &'static str {
+    match LAST_MAP_FAIL.load(Ordering::Relaxed) {
+        FAIL_NONE        => "none-recorded",
+        FAIL_ZERO_SIZE   => "zero-size",
+        FAIL_VMA_OVERLAP => "vma-overlap",
+        FAIL_VA_OVERFLOW => "va-overflow",
+        FAIL_BUDDY       => "buddy-order-unavailable",
+        FAIL_PTE_INSTALL => "pte-install",
+        FAIL_NO_HEAP     => "no-heap-vma",
+        FAIL_BAD_FILECAP => "bad-file-cap",
+        _                => "unrecorded",
     }
 }
 
