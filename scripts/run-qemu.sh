@@ -131,12 +131,12 @@ if [ "$BOOT_MODE" = "raspi4b" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
     # No gic-version=/-cpu override: raspi4b is a fixed-SoC board (4x
     # cortex-a72, GIC-400), unlike the generic `virt` machine.
-    MACHINE_ARGS="-machine raspi4b -m 2G -smp 4"
+    MACHINE_ARGS="-machine raspi4b -m "${LEANDROS_MEM:-2G}" -smp 4"
     DISK_IMAGE="leandros-limine-aarch64.img" # unused in raspi4b mode
 elif [ "$ARCH" = "aarch64" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
     # -smp 4: SMP bringup via PSCI CPU_ON (GICv2 supports up to 8 CPUs).
-    MACHINE_ARGS="-machine virt,gic-version=2 -m 2G -smp 4"
+    MACHINE_ARGS="-machine virt,gic-version=2 -m "${LEANDROS_MEM:-2G}" -smp 4"
     # -cpu host: real host ID registers, required by HVF/KVM passthrough
     # (vs. -cpu max's synthesized model, which is TCG-only).
     #
@@ -378,7 +378,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
         # cannot run while inside the MMIO write handler.  Modern non-
         # transitional devices use a different notification path that doesn't
         # have this issue.
-        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 2G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
+        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m "${LEANDROS_MEM:-2G}" -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             -drive if=pflash,unit=1,format=raw,file="$VARS_FILE" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
@@ -403,7 +403,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             if [ ! -f "$X86_VARS_FILE" ]; then cp "$VARS_TEMPLATE" "$X86_VARS_FILE"; fi
             X86_VARS_ARGS=(-drive "if=pflash,unit=1,format=raw,file=$X86_VARS_FILE")
         fi
-        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m 2G -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
+        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m "${LEANDROS_MEM:-2G}" -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             "${X86_VARS_ARGS[@]}" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
@@ -477,7 +477,7 @@ else
         # the primary display (showing only SeaBIOS), leaving the kernel's
         # VirtIO-GPU console on a secondary, unseen head.  Disabling it makes
         # VirtIO-GPU the sole display — matching the UEFI path above.
-        exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg -m 2G \
+        exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg -m "${LEANDROS_MEM:-2G}" \
             -kernel "$KERNEL_ELF" \
             -device loader,file=initrd-x86_64.cpio,addr=0x10000000,force-raw=on \
             -drive if=none,id=data0,format=raw,file="$DATA0_IMG" \
