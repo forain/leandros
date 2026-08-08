@@ -3,13 +3,61 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-07**, after a wave that landed eleven commits,
-**closed the present half of item 2 with an actual photograph**, **achieved M4's client
-half**, emptied "Prepared but not landed", cleared four deferred-list entries, and corrected
-**seven** recorded claims — two of which this file had itself introduced hours earlier.
+Last reconciled against `main` on **2026-08-08**. **LeandrOS now boots to a graphical
+login**: upstream `kennylevinsen/greetd` drives `cosmic-greeter`, which runs unprivileged at
+uid 990, authenticates against `/etc/shadow`, and hands off to a COSMIC desktop —
+photographed on **both** arches, on freshly generated images. Scope changed under this wave
+by decision, not by measurement: the greeter, **PAM**, **utmpx** and **VT switching** all
+left *Explicitly out of scope* (items 12-14), and every conclusion that rested on them being
+out of scope is void.
 
-The whole artifacts tree was also imported into `artifacts/` in this repo, because it had
-been carrying the entire Vulkan arc's instruments with no version control at all.
+**The wave's defining pattern was refutation, and it is worth stating before the results
+because it is the reason to distrust the rest of this file.** Four separate items were
+investigated and **four recorded causes turned out to be wrong** — not incomplete, wrong —
+and in three of the four the *instrument or the harness was the defect*:
+
+1. **Item 6's "the virtqueue starves under load" was the measuring apparatus.** Delivery is
+   **100%** at 60 moves/s. `arch::putc` polled the UART with no bound, and since it runs in
+   IRQ context a parked serial reader wedged CPU 0 inside the timer handler so `poll_events()`
+   never ran. `m14_rate.py` sleeps while holding the socket open, so **the harness caused what
+   it measured**. Three sweeps in one boot, differing only in who drained the chardev:
+   9.5% / 100% / 100%.
+2. **Item 7's "libcosmic/iced cannot render" was false** — the toolkit is proven working by
+   photograph. Apps block forever in a **D-Bus probe**: busd drops a call to an unowned name
+   with a `warn!` and never replies `ServiceUnknown`, and neither side has a timeout.
+3. **The `env_rx` "tokio-integration residual" was a kernel `shutdown(2)` bug**, asserted for
+   weeks and never demonstrated. `handle_shutdown` ignored `how` and emptied the fd-table
+   slot, making `shutdown(fd, SHUT_WR)` **strictly more destructive than `close(fd)`**.
+4. **The "out of memory" killing COSMIC sessions was never memory.** It was
+   `ipc::port::LIVE_BUCKETS = 64` — a **64-entry IPC port table** for the whole system, spent
+   by *threads*, on the path of every filesystem operation. A stock desktop sat at **61/64**
+   with 1.1 GiB free.
+
+**Read that list as a warning about method, not a victory lap.** Each wrong cause was
+recorded here in good faith with evidence beside it. What separated them from the truth was
+never more reasoning — it was **instrumenting at the destination**, **a control that varied
+one thing**, and **a test that was shown to fail before it was trusted**.
+
+**Five landmines this wave paid for, each of which cost at least one boot.** They are listed
+here rather than only in the instrument list because every one of them is *silent*:
+`/usr/bin/env`'s absence produces **no output at all** from a non-interactive `sh -c`, and
+greetd throws a session's exit status away — the only symptom is the greeter reappearing.
+**The guest has no `grep`**, so a probe reporting "no matches" was `command not found`.
+**Two processes sharing one redirected fd have independent file offsets** and overwrite each
+other, which destroyed the one log line an investigation most needed. **A completion marker
+that appears inside the command you send** is matched from the tty's own echo, truncating a
+read to ~1 s and leaving a short log that greps clean. And **`cosmic-comp` takes its kiosk
+child from `env::args().skip(1).next()`** — the first argument, whatever it is — while its
+flag parser ignores unknowns, so a misordered flag leaves a healthy compositor on a cleared
+screen.
+
+**A sizing correction that matters more than any single fix.** `servers/tty/src/lib.rs` is
+957 lines whose header advertises "termios line discipline **and PTY pairs**", with
+`TtyKind::PtsMaster/PtsSlave` and a `PTS_PAIRS` table. **It is entirely unreachable** — the
+kernel only ever sends `TTY_IOCTL`, and five of six handlers are dead. Sizing from that
+header gives "~80% done"; the truth is ~0%, with maybe 100 lines of salvage. **`cosmic-term`
+is therefore a 2-3 week kernel feature wearing a build task's clothes**, and item 8's second
+half is two pieces of very different size presented as one.
 
 **Two lessons from this wave that generalise, both about sizing rather than engineering.**
 
@@ -743,9 +791,9 @@ paragraph that leans on "out of scope" with that in mind.
 
 | # | Item | Category | State |
 |---|---|---|---|
-| 6 | Input **does** reach clients; the virtqueue starves under load | Bug — **REFRAMED** | Delivery falls 57% by rate; cosmic-comp innocent |
-| 7 | **Only a raw `wl_shm` client renders — no libcosmic/iced app draws** | Bug — **actionable** | `cosmic-settings` alive, healthy, 0 px in 74 s |
-| 8 | Nothing to launch, and no way to ask for it | Feature — **config DONE** `52665aa` | Keybinding table staged; still no terminal to launch |
+| 6 | Input reaches clients **losslessly**; the "starvation" was the harness | Bug — **CLOSED** `af9f076` | 100% at 60 moves/s; a parked serial reader wedged the tick |
+| 7 | libcosmic apps **block in a D-Bus probe**; they render fine | Bug — **FIXED** `85f2f4c`+`daa2815` | busd answers `ServiceUnknown`; 4 parked components alive, both arches |
+| 8 | Nothing to launch, and no way to ask for it | Feature — **config DONE**; rest **MIS-SIZED** | `cosmic-term` needs a PTY layer (2-3 wks), not a build |
 | 9 | **9 panel applets have no scoped-out dependency and are simply unbuilt** | Feature — cheap | Build recipe exists; spawn path proven |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
 | 11 | **PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — greeter one **RETIRED**; session one **cause FIXED** `2d9f0c8` | One patch left; handshake completes 5.022 s → 2.186 s |
