@@ -45,6 +45,17 @@ const POLLIN:  u64 = 0x0001;
 const POLLOUT: u64 = 0x0004;
 const POLLHUP: u64 = 0x0010;
 
+// ── shutdown(2) `how` ─────────────────────────────────────────────────────────
+/// Retire the read direction: later recvs report EOF, and the peer's sends
+/// raise EPIPE.
+const SHUT_RD:   usize = 0;
+/// Retire the write direction: later sends raise EPIPE, and the peer's recvs
+/// report EOF once the ring drains. This is the one tokio issues from
+/// `OwnedWriteHalf::drop`.
+const SHUT_WR:   usize = 1;
+/// Both of the above. Still not a close: the fd stays valid.
+const SHUT_RDWR: usize = 2;
+
 // ── SCM_RIGHTS / cmsg (Linux ABI, 64-bit) ─────────────────────────────────────
 const SOL_SOCKET:       i32   = 1;
 const SCM_RIGHTS:       i32   = 1;
@@ -298,6 +309,21 @@ struct UnixConn {
     ring_ba: UnixRing,
     closed_a: bool,
     closed_b: bool,
+    /// Per-end, per-direction half-close (shutdown(2)), deliberately kept
+    /// distinct from `closed_a`/`closed_b`. Those mean "this end is gone,
+    /// every alias included" and are only ever set once `refs_*` hits 0. A
+    /// shutdown retires one *direction* of a still-open end: the fd stays a
+    /// valid socket, the other aliases stay usable, and the peer sees EOF on
+    /// reads rather than an error. Conflating the two made
+    /// `shutdown(fd, SHUT_WR)` strictly more destructive than `close(fd)` —
+    /// it ignored the dup refcount and destroyed the caller's fd — which is
+    /// what wedged cosmic-session's readiness handshake, since tokio's
+    /// `OwnedWriteHalf::drop` issues exactly that call on the half it is not
+    /// keeping.
+    shut_rd_a: bool,
+    shut_wr_a: bool,
+    shut_rd_b: bool,
+    shut_wr_b: bool,
     /// Per-end fd alias counts. dup (fcntl F_DUPFD*) creates a second fd for
     /// the same end; the end only really closes when its last alias does.
     refs_a: u32,
@@ -330,6 +356,10 @@ impl UnixConn {
             ring_ba: UnixRing::new(),
             closed_a: false,
             closed_b: false,
+            shut_rd_a: false,
+            shut_wr_a: false,
+            shut_rd_b: false,
+            shut_wr_b: false,
             refs_a: 1,
             refs_b: 1,
             fdq_ab: alloc::vec::Vec::new(),
@@ -337,6 +367,33 @@ impl UnixConn {
             cred_a: Ucred::zero(),
             cred_b: Ucred::zero(),
             seq: 0,
+        }
+    }
+
+    /// True when the `is_a` end's write direction has been retired by a
+    /// shutdown. Pass `!is_a` to ask the same about the peer.
+    fn wr_shut(&self, is_a: bool) -> bool {
+        if is_a { self.shut_wr_a } else { self.shut_wr_b }
+    }
+
+    /// True when the `is_a` end's read direction has been retired by a
+    /// shutdown. Pass `!is_a` to ask the same about the peer.
+    fn rd_shut(&self, is_a: bool) -> bool {
+        if is_a { self.shut_rd_a } else { self.shut_rd_b }
+    }
+
+    /// Apply one shutdown(2) `how` to one end. One-way and idempotent: a
+    /// direction never comes back, and neither `closed_*` nor `refs_*` is
+    /// touched — shutdown is not close.
+    fn shutdown_end(&mut self, is_a: bool, how: usize) {
+        let rd = how == SHUT_RD || how == SHUT_RDWR;
+        let wr = how == SHUT_WR || how == SHUT_RDWR;
+        if is_a {
+            self.shut_rd_a |= rd;
+            self.shut_wr_a |= wr;
+        } else {
+            self.shut_rd_b |= rd;
+            self.shut_wr_b |= wr;
         }
     }
 
@@ -1686,6 +1743,13 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // Peer end closed (all its aliases gone): writes raise EPIPE.
             let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
             if peer_closed { return err_reply(-32); } // EPIPE
+            // Half-close, per direction: our own write direction retired, or
+            // the peer's read direction retired, is EPIPE as well. The peer
+            // retiring its *write* direction is deliberately not — that only
+            // makes our recvs see EOF, and treating it as a broken pipe is the
+            // whole defect (the first send after the peer's OwnedWriteHalf
+            // dropped got EPIPE instead of going through).
+            if conn.wr_shut(is_a) || conn.rd_shut(!is_a) { return err_reply(-32); } // EPIPE
             let n = if sock_type == SOCK_STREAM as u8 {
                 if is_a {
                     conn.ring_ab.write(buf_ptr as *const u8, len)
@@ -1725,6 +1789,9 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return err_reply(-32); } // EPIPE — conn torn down
             if conn.closed_b { return err_reply(-32); } // peer (post-accept) gone
+            // Pre-accept the connector is end A, so its own half-close counts
+            // here too (accept preserves conn_idx, so the flag carries over).
+            if conn.wr_shut(true) { return err_reply(-32); } // EPIPE
             let n = conn.ring_ab.write(buf_ptr as *const u8, len);
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns);
@@ -1869,6 +1936,9 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             let mut conns = UNIX_CONNS.lock();
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return val_reply(0); }
+            // Our own read direction retired (shutdown(fd, SHUT_RD)): EOF at
+            // once, queued bytes included — Linux discards them.
+            if conn.rd_shut(is_a) { return val_reply(0); }
             let n = if sock_type == SOCK_STREAM as u8 {
                 if is_a {
                     conn.ring_ba.read(buf_ptr as *mut u8, len)
@@ -1883,12 +1953,14 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                 }
             };
             // POSIX stream semantics: 0 bytes means EOF, and EOF only exists
-            // once the peer end has closed. An empty ring with a live peer is
-            // EAGAIN — returning 0 here made tokio's signal driver see "EOF
-            // on self-pipe" on its very first empty poll and panic.
+            // once the peer will never write again. An empty ring with a live
+            // peer is EAGAIN — returning 0 here made tokio's signal driver see
+            // "EOF on self-pipe" on its very first empty poll and panic. The
+            // peer having retired just its write direction ends the stream the
+            // same way a full close does, and must read as EOF, not an error.
             if n == 0 && len > 0 {
                 let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
-                if !peer_closed { return err_reply(-11); } // EAGAIN
+                if !peer_closed && !conn.wr_shut(!is_a) { return err_reply(-11); } // EAGAIN
             }
             // Draining bytes frees ring space → a POLLOUT edge for the peer.
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
@@ -1903,6 +1975,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             let mut conns = UNIX_CONNS.lock();
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return val_reply(0); }
+            if conn.rd_shut(true) { return val_reply(0); } // own read half retired
             let n = conn.ring_ba.read(buf_ptr as *mut u8, len);
             if n == 0 && len > 0 && !conn.closed_b { return err_reply(-11); } // EAGAIN
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
@@ -2128,6 +2201,13 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
         for tf in batch { vfs::drop_transfer(tf); }
         return err_reply(-32); // EPIPE
     }
+    // Half-close, same rule as handle_send: our write direction or the peer's
+    // read direction retired is EPIPE; the peer's write direction is not.
+    if conn.wr_shut(is_a) || conn.rd_shut(!is_a) {
+        drop(conns);
+        for tf in batch { vfs::drop_transfer(tf); }
+        return err_reply(-32); // EPIPE
+    }
     // Bound the in-flight SCM_RIGHTS fds on this direction. Past the cap the
     // send fails rather than letting the PendingFdBatch queue grow unbounded
     // (Linux: ETOOMANYREFS). Closes the K1-A handoff note.
@@ -2258,10 +2338,11 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     }
 
     if nread == 0 {
-        // Empty ring: EOF only if the peer end has closed, else EAGAIN. Mirrors
-        // handle_recv — tokio's self-pipe must not see a spurious EOF.
+        // Empty ring: EOF only if the peer end has closed or retired its write
+        // direction, or we retired our own read direction — else EAGAIN.
+        // Mirrors handle_recv — tokio's self-pipe must not see a spurious EOF.
         let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
-        if !peer_closed && conn.in_use {
+        if !peer_closed && conn.in_use && !conn.wr_shut(!is_a) && !conn.rd_shut(is_a) {
             drop(conns);
             return err_reply(-11); // EAGAIN — blocking wrapper retries
         }
@@ -2333,31 +2414,79 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     val_reply(nread as u64)
 }
 
-fn handle_shutdown(pid: u32, fd: usize, _how: usize) -> Message {
+/// shutdown(2). Half-closes one *direction* of a connected socket. The fd stays
+/// a perfectly valid socket, every other alias of the same end keeps working,
+/// and the peer observes EOF on reads rather than an error.
+///
+/// This used to ignore `how` entirely and answer every call by setting the
+/// end's `closed_*` flag — the "this end is fully gone" flag `handle_close`
+/// only sets once `refs_*` reaches 0 — and then storing `SockEntry::empty()`
+/// over the caller's slot. That made `shutdown(fd, SHUT_WR)` strictly more
+/// destructive than `close(fd)`: it bypassed the dup refcount and it destroyed
+/// the fd, so the caller's next recv answered EBADF and its epoll interest
+/// answered POLLNVAL (which mio decodes as an empty readiness set, i.e. a hang,
+/// not an error). An `InetConnected` socket fell through to the same slot
+/// clearing with no smoltcp teardown at all, leaking the handle and the port
+/// `handle_close` is careful to park.
+fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
+    if how != SHUT_RD && how != SHUT_WR && how != SHUT_RDWR { return err_reply(-22); } // EINVAL
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
-    let mut tbls = SOCK_TABLES.lock();
-    let mut do_wake = false;
-    if let Some(tbl) = find_tbl(pid, &mut *tbls) {
-        if slot < MAX_SOCKS && tbl.socks[slot].in_use {
-            if let SockState::UnixConnected { conn_idx, is_a } = tbl.socks[slot].state {
-                let mut conns = UNIX_CONNS.lock();
-                if is_a { conns[conn_idx].closed_a = true; }
-                else    { conns[conn_idx].closed_b = true; }
-                conns[conn_idx].seq = conns[conn_idx].seq.wrapping_add(1);
-                if conns[conn_idx].closed_a && conns[conn_idx].closed_b {
-                    conns[conn_idx].drain_fds();
-                    conns[conn_idx].in_use = false;
-                }
-                drop(conns);
-                do_wake = true;
-            }
-            tbl.socks[slot] = SockEntry::empty();
-        }
+    // State is copied out and every table lock released before UNIX_CONNS or a
+    // stack lock is taken (K2 lock order), exactly as handle_recv does.
+    let (state, sock_type) = {
+        let tbls = SOCK_TABLES.lock();
+        let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+            Some(t) => t, None => return err_reply(-9),
+        };
+        if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+        (tbl.socks[slot].state, tbl.socks[slot].sock_type)
+    };
+
+    let unix_end = match state {
+        SockState::UnixConnected { conn_idx, is_a } => Some((conn_idx, is_a)),
+        // A connect() not yet accepted is end A of its connection, and accept
+        // preserves conn_idx and both rings, so the half-close carries over.
+        SockState::UnixPendingAccept { conn_idx, .. } => Some((conn_idx, true)),
+        _ => None,
+    };
+    if let Some((conn_idx, is_a)) = unix_end {
+        {
+            let mut conns = UNIX_CONNS.lock();
+            let conn = &mut conns[conn_idx];
+            if !conn.in_use { return err_reply(-107); } // ENOTCONN
+            conn.shutdown_end(is_a, how);
+            // A half-close is a poll-visible edge — the peer becomes
+            // readable-at-EOF — so it bumps the same per-connection edge-seq
+            // every other readiness change bumps. Without it an EPOLLET
+            // registration (tokio's) never re-arms and the waiter sleeps
+            // through the EOF it was waiting for.
+            conn.seq = conn.seq.wrapping_add(1);
+        } // release UNIX_CONNS before waking pollers (K2 lock order)
+        sched::wake_poll();
+        return ok_reply();
     }
-    drop(tbls);
-    // Peer sees POLLHUP/POLLIN (EOF) — wake after releasing all server locks.
-    if do_wake { sched::wake_poll(); }
-    ok_reply()
+
+    if let SockState::InetConnected { socket_handle, lo, .. } = state {
+        // Retiring the write direction on TCP is the FIN and nothing else: the
+        // fd, the smoltcp handle and the port stay this socket's until
+        // handle_close tears them down (and parks the port in TIME_WAIT).
+        // SHUT_RD has no wire effect, and a connected UDP socket has no
+        // half-close at all — both are accepted and do nothing, as on Linux.
+        // Only a stream socket has a `tcp::Socket` behind the handle; `get_mut`
+        // on the wrong socket type panics.
+        if sock_type == SOCK_STREAM as u8 && (how == SHUT_WR || how == SHUT_RDWR) {
+            let mut stack = stack_for(lo);
+            if let Some(ref mut s) = *stack {
+                s.socket_set.get_mut::<tcp::Socket>(socket_handle).close();
+            }
+        }
+        return ok_reply();
+    }
+
+    // Everything else — unbound, listening, ICMP — is not connected, and Linux
+    // answers ENOTCONN. What it must never do, and what this did, is silently
+    // retire the caller's fd out from under it.
+    err_reply(-107) // ENOTCONN
 }
 
 /// getsockname(2). An AF_INET socket reports its real bound endpoint: the
@@ -2753,8 +2882,18 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             let mut ev = 0;
             // Peer-closed asserts readable: the pending EOF must wake
             // poll/epoll waiters (level-triggered "read will not block").
-            if readable > 0 || peer_closed || !conn.in_use { ev |= POLLIN; }
-            if conn.in_use && !peer_closed && write_free > 0 { ev |= POLLOUT; }
+            // A half-close asserts the same thing, but only for the direction
+            // it retired: a recv that will return 0 does not block and must be
+            // advertised readable, while a send that will raise EPIPE must not
+            // be advertised writable.
+            let read_eof   = peer_closed || conn.wr_shut(!is_a) || conn.rd_shut(is_a);
+            let write_dead = peer_closed || conn.wr_shut(is_a)  || conn.rd_shut(!is_a);
+            if readable > 0 || read_eof || !conn.in_use { ev |= POLLIN; }
+            if conn.in_use && !write_dead && write_free > 0 { ev |= POLLOUT; }
+            // POLLHUP stays reserved for a whole-connection teardown. Linux
+            // reports a half-close as readable-at-EOF (POLLRDHUP), never as a
+            // hangup, and asserting POLLHUP here would make an epoll client
+            // discard a socket that is still writable in the other direction.
             if !conn.in_use || peer_closed { ev |= POLLHUP; }
             // Connected sockets carry the edge-seq so EPOLLET works.
             (ev, Some(conn.seq))
@@ -2769,8 +2908,10 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             let readable   = conn.ring_ba.count;
             let write_free = RING_SIZE - conn.ring_ab.count;
             let mut ev = 0;
-            if readable > 0 || !conn.in_use { ev |= POLLIN; }
-            if conn.in_use && !conn.closed_b && write_free > 0 { ev |= POLLOUT; }
+            // Pre-accept the connector is end A, so its own half-close applies
+            // here the same way it does once the connection is established.
+            if readable > 0 || !conn.in_use || conn.rd_shut(true) { ev |= POLLIN; }
+            if conn.in_use && !conn.closed_b && !conn.wr_shut(true) && write_free > 0 { ev |= POLLOUT; }
             if !conn.in_use || conn.closed_b { ev |= POLLHUP; }
             (ev, Some(conn.seq))
         }

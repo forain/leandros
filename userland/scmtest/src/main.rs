@@ -100,6 +100,11 @@ use leandros_libc::syscall::{nr, syscall1, syscall2, syscall3, syscall4, syscall
 // TIME_WAIT. Numbers match kernel/src/syscall.rs `mod nr`.
 #[cfg(target_arch = "aarch64")] const SYS_SETSOCKOPT:    usize = 208;
 #[cfg(target_arch = "x86_64")]  const SYS_SETSOCKOPT:    usize = 54;
+// shutdown(2): the one syscall tokio adds that the existing fork+exec+inherit
+// decider omits — `OwnedWriteHalf::drop` half-closes the write direction of the
+// half it is not keeping. Numbers match kernel/src/syscall.rs `mod nr`.
+#[cfg(target_arch = "aarch64")] const SYS_SHUTDOWN:      usize = 210;
+#[cfg(target_arch = "x86_64")]  const SYS_SHUTDOWN:      usize = 48;
 
 // epoll_event wire layout must match the kernel's per-arch struct exactly
 // (kernel/src/syscall.rs EPOLL_EVENT_SIZE/EPOLL_EVENT_DATA_OFF): x86_64 uses the
@@ -109,8 +114,16 @@ use leandros_libc::syscall::{nr, syscall1, syscall2, syscall3, syscall4, syscall
 #[cfg(target_arch = "aarch64")] const EPOLL_EVENT_SIZE:     usize = 16;
 #[cfg(target_arch = "aarch64")] const EPOLL_EVENT_DATA_OFF: usize = 8;
 const EPOLLIN: u32 = 0x0001;
+const EPOLLOUT: u32 = 0x0004;
+/// POLLNVAL. kernel/src/syscall.rs reports it for any socket fd the net server
+/// answers EBADF for, with no edge-seq attached; mio decodes it as an empty
+/// readiness set, so an epoll waiter sleeps on it forever instead of erroring.
+/// No live socket may ever report it.
+const POLLNVAL: u32 = 0x0020;
 const EPOLL_CTL_ADD: usize = 1;
 const F_SETFD: i32 = 2;
+// shutdown(2) `how`.
+const SHUT_WR: i32 = 1;
 
 // ── Wire-format structs (Linux/glibc ABI, 64-bit) ───────────────────────────
 
@@ -284,6 +297,9 @@ unsafe fn raw_connect_in(fd: i32, addr: *const sockaddr_in) -> isize {
 }
 unsafe fn raw_getsockname(fd: i32, addr: *mut sockaddr_in, len: *mut u32) -> isize {
     xret(syscall3(SYS_GETSOCKNAME, fd as usize, addr as usize, len as usize))
+}
+unsafe fn raw_shutdown(fd: i32, how: i32) -> isize {
+    xret(syscall2(SYS_SHUTDOWN, fd as usize, how as usize))
 }
 
 /// Sleep `ms` milliseconds. TCP over 127.0.0.1 is still real TCP, and its
@@ -509,7 +525,57 @@ unsafe fn test_fork_exec_inherit() -> bool {
     report(name, parent_epoll_read_ok(b, pid))
 }
 
-/// Parent side shared by both fork+exec+inherit deciders: epoll_wait(5s) on `b`,
+/// The same decider, plus the one syscall tokio adds — and that is the whole
+/// point. `test_fork_exec_inherit` above passes, and that PASS was used to
+/// exonerate the kernel and blame tokio for the stuck cosmic-session handshake.
+/// It omits `shutdown(2)`: `cosmic-session` does
+/// `let (mut session_rx, _session_tx) = session.into_split();` and lets the
+/// write half drop at the end of a non-async function, and tokio's
+/// `OwnedWriteHalf::drop` is `shutdown(fd, Shutdown::Write)`. Everything else
+/// here is byte-for-byte the test above, so a FAIL here beside a PASS there
+/// localises the defect to shutdown(2) and to nothing else.
+///
+/// The parent never writes on this socket, so retiring its write direction must
+/// cost it nothing: the child's message still has to arrive and the epoll
+/// registration on `b` still has to fire.
+unsafe fn test_fork_exec_inherit_after_shutdown_wr() -> bool {
+    let name = b"fork_exec_inherit_after_shutdown_wr\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 {
+        dbg0(b"[feis] socketpair failed\n\0");
+        return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+
+    // Clear FD_CLOEXEC on A so the child keeps it across execve.
+    raw_fcntl(a, F_SETFD, 0);
+
+    // Build "SCMTEST_INHERIT_FD=<a>\0" before fork so the child's COW copy has it.
+    let mut envbuf = [0u8; 48];
+    build_name(&mut envbuf, b"SCMTEST_INHERIT_FD=", a as usize);
+
+    let pid = fork();
+    if pid == 0 {
+        // Child: re-exec self; the env var flips it into helper mode.
+        close(b);
+        let path = b"/bin/scmtest\0";
+        let av: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let ev: [*const u8; 2] = [envbuf.as_ptr(), core::ptr::null()];
+        syscall3(SYS_EXECVE, path.as_ptr() as usize, av.as_ptr() as usize, ev.as_ptr() as usize);
+        dbg0(b"[feis:child] execve(/bin/scmtest) failed\n\0");
+        exit(9);
+    }
+
+    close(a);
+    let sh = raw_shutdown(b, SHUT_WR);
+    dbg2(b"[feis] shutdown(b, SHUT_WR) -> %d errno=%d\n\0", sh as i64, get_errno() as i64);
+    // Run the read half unconditionally even if the shutdown reported an
+    // error, so the helper is always reaped and the verdict is never a hang.
+    let read_ok = parent_epoll_read_ok(b, pid);
+    report(name, sh == 0 && read_ok)
+}
+
+/// Parent side shared by the fork+exec+inherit deciders: epoll_wait(5s) on `b`,
 /// read the framed message, assert byte-exact, reap the helper. Returns true iff
 /// the message arrived intact AND the helper exited 0. The 5s bounded wait makes
 /// a broken inherit FAIL loudly instead of hanging the suite.
@@ -657,6 +723,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_fd_pass() { failures += 1; }
     if !test_fork_child_exit_keeps_socket() { failures += 1; }
     if !test_fork_exec_inherit() { failures += 1; }
+    if !test_fork_exec_inherit_after_shutdown_wr() { failures += 1; }
     if !test_fork_exec_child_clears_cloexec() { failures += 1; }
     if !test_cmsg_flags() { failures += 1; }
     if !test_shared_memfd_pixels() { failures += 1; }
@@ -686,6 +753,10 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_queued_fd_cap() { failures += 1; }
     if !test_scm_import_emfile_single_release() { failures += 1; }
     if !test_full_ring_eagain() { failures += 1; }
+
+    // ── shutdown(2) is a per-direction half-close, not a close ──────────────
+    if !test_socketpair_shutdown_wr_half_close() { failures += 1; }
+    if !test_shutdown_wr_keeps_fd_pollable() { failures += 1; }
 
     // ── M7u: mincore residency probe (Mesa EGL pointer-dereferenceable signal) ──
     if !test_mincore() { failures += 1; }
@@ -1851,6 +1922,106 @@ unsafe fn test_full_ring_eagain() -> bool {
          total as i64, got_eagain as i64);
     let ok = got_eagain && !bogus_zero && total > 0 && total <= 4096;
     close(a); close(b);
+    report(name, ok)
+}
+
+/// The pure decider for the half-close defect, with no fork, no exec and no
+/// epoll in the way.
+///
+/// `handle_shutdown` in servers/net/src/lib.rs took `how` and never read it: for
+/// a connected AF_UNIX socket it set the end's "this end is fully gone" flag —
+/// the one close(2) only sets once the last dup'd alias is released — and then
+/// stored an empty SockEntry over the caller's fd slot. That made
+/// `shutdown(fd, SHUT_WR)` strictly more destructive than `close(fd)`. Linux
+/// half-closes one *direction* of the connection: the fd stays a valid socket,
+/// the peer's two directions are untouched, and the peer reads EOF rather than
+/// an error.
+unsafe fn test_socketpair_shutdown_wr_half_close() -> bool {
+    let name = b"socketpair_shutdown_wr_half_close\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 {
+        dbg0(b"[shwr] socketpair failed\n\0");
+        return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+
+    // Exactly what tokio's OwnedWriteHalf::drop does.
+    let sh = raw_shutdown(a, SHUT_WR);
+    dbg2(b"[shwr] shutdown(a, SHUT_WR)=%d errno=%d (want 0)\n\0", sh as i64, get_errno() as i64);
+
+    // The peer's write direction is untouched.
+    let wb = write(b, b"hi".as_ptr(), 2);
+    dbg2(b"[shwr] write(b)=%d errno=%d (want 2)\n\0", wb as i64, get_errno() as i64);
+
+    // ...and so is our read direction: the peer's bytes still arrive.
+    let mut buf = [0u8; 8];
+    let ra = read(a, buf.as_mut_ptr(), 2);
+    dbg2(b"[shwr] read(a)=%d errno=%d (want 2)\n\0", ra as i64, get_errno() as i64);
+
+    // Our write direction is the one that is gone — EPIPE, never EBADF.
+    let wa = write(a, b"x".as_ptr(), 1);
+    let wa_errno = get_errno();
+    dbg2(b"[shwr] write(a)=%d errno=%d (want -1 / EPIPE 32)\n\0", wa as i64, wa_errno as i64);
+
+    // The peer sees end-of-stream, not an error.
+    let rb = read(b, buf.as_mut_ptr().add(4), 1);
+    dbg2(b"[shwr] read(b)=%d errno=%d (want 0, EOF)\n\0", rb as i64, get_errno() as i64);
+
+    let ok = sh == 0
+        && wb == 2
+        && ra == 2 && &buf[..2] == &b"hi"[..]
+        && wa == -1 && wa_errno == EPIPE
+        && rb == 0;
+    close(a); close(b);
+    report(name, ok)
+}
+
+/// A half-closed fd is still a socket, and epoll has to keep saying so.
+///
+/// When shutdown emptied the caller's fd slot, NET_POLL answered EBADF,
+/// kernel/src/syscall.rs turned that into POLLNVAL (0x20) with no edge-seq, and
+/// mio decodes POLLNVAL as an empty readiness set — so no waker ever fires and
+/// the awaiting task hangs instead of erroring. A hang is exactly the symptom
+/// the cosmic-session handshake shows, which is why POLLNVAL is asserted
+/// against explicitly here rather than only asserting that POLLIN arrives.
+unsafe fn test_shutdown_wr_keeps_fd_pollable() -> bool {
+    let name = b"shutdown_wr_keeps_fd_pollable\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 {
+        dbg0(b"[shpo] socketpair failed\n\0");
+        return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+    let sh = raw_shutdown(a, SHUT_WR);
+
+    let ep = xret(syscall1(SYS_EPOLL_CREATE1, 0)) as i32;
+    if ep < 0 {
+        dbg1(b"[shpo] epoll_create1 failed errno=%d\n\0", get_errno() as i64);
+        close(a); close(b);
+        return report(name, false);
+    }
+    let mut evbuf = [0u8; EPOLL_EVENT_SIZE];
+    evbuf[..4].copy_from_slice(&(EPOLLIN | EPOLLOUT).to_le_bytes());
+    evbuf[EPOLL_EVENT_DATA_OFF..EPOLL_EVENT_DATA_OFF + 8]
+        .copy_from_slice(&(a as u64).to_le_bytes());
+    let ctl = xret(syscall4(SYS_EPOLL_CTL, ep as usize, EPOLL_CTL_ADD, a as usize,
+                            evbuf.as_mut_ptr() as usize));
+
+    // The peer writes, so the half-closed end must come back readable.
+    let wb = write(b, b"hi".as_ptr(), 2);
+
+    let mut out = [0u8; EPOLL_EVENT_SIZE];
+    let nready = xret(syscall4(SYS_EPOLL_WAIT, ep as usize, out.as_mut_ptr() as usize, 1, 2000));
+    let revents = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+
+    dbg2(b"[shpo] shutdown=%d epoll_ctl=%d\n\0", sh as i64, ctl as i64);
+    dbg2(b"[shpo] write(b)=%d epoll_wait=%d (want 2 and 1)\n\0", wb as i64, nready as i64);
+    dbg1(b"[shpo] revents=0x%x (POLLIN 0x1 wanted; POLLNVAL 0x20 is the defect)\n\0",
+         revents as i64);
+
+    let ok = sh == 0 && ctl == 0 && wb == 2 && nready == 1
+        && (revents & EPOLLIN) != 0 && (revents & POLLNVAL) == 0;
+    close(ep); close(a); close(b);
     report(name, ok)
 }
 
