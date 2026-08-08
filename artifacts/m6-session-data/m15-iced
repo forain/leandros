@@ -1,0 +1,160 @@
+# m15-iced — why does a libcosmic/iced app paint nothing when a raw wl_shm
+# client paints instantly through the same compositor?
+#
+# Run it as:  brush /bin/m15-iced      (no shebang binfmt; always via a shell)
+# Host half:  artifacts/m15_iced.py
+#
+# WHAT IS ALREADY KNOWN, AND WHY IT IS NOT ENOUGH. `wlclient` (no toolkit, raw
+# wl_shm) draws immediately. `cosmic-settings` is staged, launched, alive, owns
+# its D-Bus name, logs nothing and paints 0 px at +6 s, +26 s and +74 s. Those
+# two facts localise the gap to the toolkit, but they cannot say WHICH of the
+# four states the process is in, because every diagnostic it emits is thrown
+# away: cosmic-session spawns its children through launch_pad with stderr piped
+# and registers no on_stderr handler (cosmic-session/src/comp.rs:122-134), so a
+# child's stderr goes nowhere at all. Nothing here patches COSMIC; it simply
+# does not launch the subject through cosmic-session.
+#
+# THE INSTRUMENT IS WAYLAND_DEBUG, NOT A PRINT. The question that decides the
+# next month of work is "never commits" vs "commits blank", and those two are
+# indistinguishable from the outside — both are a healthy process and a black
+# screen. The client-side protocol log names them apart with no source change on
+# either side:
+#
+#   no wl_compositor.create_surface   -> the app never reached windowing
+#   surface but no xdg_surface ack    -> stuck in the configure handshake
+#   ack + attach + commit, repeating  -> it PRESENTS; the rasteriser is at fault
+#   attach + commit exactly once      -> one frame then a stalled redraw gate
+#
+# Only the last two implicate tiny-skia/iced; the first two implicate winit,
+# sctk or our libc, which are different repairs entirely.
+#
+# THE CONTROL IS INSIDE THE RUN, NOT REMEMBERED FROM AN EARLIER ONE. wlclient is
+# started first, in this same session, with this same environment, and left
+# running for the whole capture. A screenshot that shows wlclient's window and
+# not cosmic-settings' is a statement about the toolkit; a screenshot that shows
+# neither is a statement about the boot, and must not be read as a finding about
+# iced. (A host-side positive control -- an unrunnable binary name that MUST be
+# reported as failing -- is the harness's job; see the host half.)
+#
+# THE SESSION IS MADE QUIET ON PURPOSE. Its stdout+stderr go to a file, not the
+# console. Commands sent to a saturated console ~180 s after a session launch do
+# not execute, and every arm of this script is later than that.
+#
+# LOGS LIVE ON /data, NOT ON TMPFS. WAYLAND_DEBUG on a client that spins would
+# fill a tmpfs and OOM a 2 GiB guest; /dev/vdc is a 2 GiB f2fs volume and cannot.
+
+R=/run/user/0
+L=/data/m15
+
+mkdir -p "$R"
+chmod 0700 "$R"
+rm -rf "$L"
+mkdir -p "$L"
+
+echo "M15: BEGIN"
+
+# ---- the session, silenced ---------------------------------------------------
+sh /bin/start-cosmic-leandros > "$L/cosmic.log" 2>&1 &
+
+i=0
+while [ "$i" -lt 180 ]; do
+	if [ -e "$R/wayland-1" ]; then
+		break
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+echo "M15: wayland-1 after ${i}s"
+# The compositor takes 6-26 s to settle after its first present; every arm below
+# starts after that, so "not yet" cannot masquerade as "never".
+sleep 25
+
+# ---- the environment cosmic-session's children get, reconstructed ------------
+# cosmic-session is started by dbus-run-session, so its children inherit
+# DBUS_SESSION_BUS_ADDRESS; a shell started from the console does not. busd
+# listens on a FIXED path (see /usr/share/dbus-1/session.conf), so it can be
+# named here. Without it libcosmic's single-instance guard takes its
+# no-D-Bus fallback path and the subject would not be the same program.
+XDG_RUNTIME_DIR="$R"
+WAYLAND_DISPLAY=wayland-1
+DBUS_SESSION_BUS_ADDRESS="unix:path=$R/bus"
+DBUS_SYSTEM_BUS_ADDRESS="unix:path=$R/bus"
+HOME=/root
+XDG_CONFIG_HOME=/root/.config
+XDG_CACHE_HOME=/root/.cache
+XDG_DATA_HOME=/root/.local/share
+XDG_STATE_HOME=/root/.local/state
+XDG_DATA_DIRS=/usr/local/share:/usr/share
+XDG_CONFIG_DIRS=/etc/xdg
+XDG_CURRENT_DESKTOP=COSMIC
+XDG_SESSION_DESKTOP=COSMIC
+XDG_SESSION_TYPE=wayland
+ICED_BACKEND=tiny-skia
+XCURSOR_THEME=default
+XCURSOR_SIZE=24
+RUST_BACKTRACE=full
+export XDG_RUNTIME_DIR WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS DBUS_SYSTEM_BUS_ADDRESS
+export HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME
+export XDG_DATA_DIRS XDG_CONFIG_DIRS XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP
+export XDG_SESSION_TYPE ICED_BACKEND XCURSOR_THEME XCURSOR_SIZE RUST_BACKTRACE
+
+echo "M15: ==== BEGIN env-witness ===="
+echo "runtime=$R"
+ls -l "$R"
+echo "M15: ==== END env-witness ===="
+
+# ---- arm A: the control, same session, no toolkit ---------------------------
+RUST_LOG=info
+export RUST_LOG
+echo "M15: MARK WLCLIENT 25"
+/bin/wlclient > "$L/wlclient.log" 2>&1 &
+wlpid=$!
+sleep 25
+echo "M15: wlclient pid=$wlpid"
+ls -d "/proc/$wlpid"
+echo "M15: ENDMARK WLCLIENT"
+
+# ---- arm B: the subject, with the protocol made visible ---------------------
+# Targeted RUST_LOG, not a global debug: a global debug log buries the answer
+# and takes minutes to cat back over the console.
+RUST_LOG="info,cosmic=debug,iced_winit=debug,iced_renderer=debug,iced_graphics=debug,iced_tiny_skia=debug,winit=debug,sctk=debug,smithay_client_toolkit=debug"
+WAYLAND_DEBUG=1
+export RUST_LOG WAYLAND_DEBUG
+echo "M15: MARK SETTINGS 75"
+/bin/cosmic-settings > "$L/settings.log" 2>&1 &
+setpid=$!
+sleep 75
+echo "M15: cosmic-settings pid=$setpid"
+ls -d "/proc/$setpid"
+echo "M15: ENDMARK SETTINGS"
+
+echo "M15: CAPTURES DONE"
+
+# ---- exfiltration, bounded ---------------------------------------------------
+# Sizes first: they say whether the head/tail below are the whole log or a
+# window into a much larger one, which changes how a quiet tail reads.
+echo "M15: ==== BEGIN sizes ===="
+wc -c "$L/settings.log" "$L/wlclient.log" "$L/cosmic.log"
+echo "M15: ==== END sizes ===="
+
+echo "M15: ==== BEGIN wlclient.log ===="
+head -c 8000 "$L/wlclient.log"
+echo ""
+echo "M15: ==== END wlclient.log ===="
+
+echo "M15: ==== BEGIN settings-head ===="
+head -c 32000 "$L/settings.log"
+echo ""
+echo "M15: ==== END settings-head ===="
+
+echo "M15: ==== BEGIN settings-tail ===="
+tail -c 16000 "$L/settings.log"
+echo ""
+echo "M15: ==== END settings-tail ===="
+
+echo "M15: ==== BEGIN cosmic-tail ===="
+tail -c 16000 "$L/cosmic.log"
+echo ""
+echo "M15: ==== END cosmic-tail ===="
+
+echo "M15: DONE"

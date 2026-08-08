@@ -1,0 +1,138 @@
+# m15b-iced — falsify the single-instance stall.
+#
+# Run it as:  brush /bin/m15b-iced      (no shebang binfmt; always via a shell)
+# Host half:  artifacts/m15b_iced.py
+#
+# WHAT m15-iced FOUND. Run standalone with its own stderr preserved,
+# cosmic-settings emits exactly four log records -- locale, translations, and
+# libcosmic's "error loading system dark theme" -- and then goes silent for 75 s.
+# WAYLAND_DEBUG=1 was set for that whole window and produced NOT ONE LINE, so the
+# process never opened a Wayland connection at all: no registry, no surface, no
+# buffer. It is not a rasteriser that draws nothing. It never reaches a renderer.
+# The same boot's screendump shows the wallpaper, the panel bar, a ticking clock
+# and a raw wl_shm client window all composited correctly, so the compositor is
+# not a suspect either.
+#
+# THE SUSPECT, AND WHY IT IS OURS. libcosmic's run_single_instance
+# (libcosmic/src/app/mod.rs:214-252) makes a BLOCKING zbus method call to its own
+# APP_ID to find out whether another instance is already running, and only builds
+# the iced application in the else-branch. busd 0.5.0 -- which we ship -- answers
+# a method call addressed to an unowned well-known name by dropping it with a
+# `warn!` (busd src/peers.rs:265-270, `bail!("unknown destination: {}", name)`);
+# it never replies org.freedesktop.DBus.Error.ServiceUnknown the way a reference
+# dbus-daemon does, and it has no reply timeout. A blocking caller therefore waits
+# forever. The session log carries the matching line at the right moment:
+# `busd::peers: unknown destination: com.system76.CosmicSettings`.
+#
+# THE DISCRIMINATOR NEEDS NO PATCH ANYWHERE. run_single_instance honours
+# COSMIC_SINGLE_INSTANCE=false and returns run::<App>() before it ever touches
+# D-Bus (mod.rs:207-212). So the same binary, in the same session, one
+# environment variable apart, splits the hypothesis cleanly:
+#
+#   CTRL (default env)      -> stalls after the theme line, no protocol traffic
+#   FIX  (single-instance   -> reaches SCTK, creates a surface, commits buffers,
+#         disabled)            and pixels appear
+#
+# If FIX also stalls, the D-Bus story is wrong and the fault is further in.
+#
+# ORDER IS LOAD-BEARING. CTRL runs FIRST. If FIX ran first it would own
+# com.system76.CosmicSettings, and CTRL's probe would then SUCCEED, exit 0, and
+# look like a pass for the wrong reason.
+#
+# ALIVENESS IS MEASURED, NOT ASSUMED. "launched but crashes" and "runs but
+# renders nothing" have already been conflated once in this project. /proc is
+# listed before and after CTRL: entries that appear and stay are a live process,
+# and a stalled process that is alive is a different repair from one that died.
+
+R=/run/user/0
+L=/data/m15b
+
+mkdir -p "$R"
+chmod 0700 "$R"
+rm -rf "$L"
+mkdir -p "$L"
+
+echo "M15B: BEGIN"
+
+sh /bin/start-cosmic-leandros > "$L/cosmic.log" 2>&1 &
+
+i=0
+while [ "$i" -lt 180 ]; do
+	if [ -e "$R/wayland-1" ]; then
+		break
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+echo "M15B: wayland-1 after ${i}s"
+sleep 25
+
+XDG_RUNTIME_DIR="$R"
+WAYLAND_DISPLAY=wayland-1
+DBUS_SESSION_BUS_ADDRESS="unix:path=$R/bus"
+DBUS_SYSTEM_BUS_ADDRESS="unix:path=$R/bus"
+HOME=/root
+XDG_CONFIG_HOME=/root/.config
+XDG_CACHE_HOME=/root/.cache
+XDG_DATA_HOME=/root/.local/share
+XDG_STATE_HOME=/root/.local/state
+XDG_DATA_DIRS=/usr/local/share:/usr/share
+XDG_CONFIG_DIRS=/etc/xdg
+XDG_CURRENT_DESKTOP=COSMIC
+XDG_SESSION_DESKTOP=COSMIC
+XDG_SESSION_TYPE=wayland
+ICED_BACKEND=tiny-skia
+XCURSOR_THEME=default
+XCURSOR_SIZE=24
+RUST_BACKTRACE=full
+RUST_LOG=info
+export XDG_RUNTIME_DIR WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS DBUS_SYSTEM_BUS_ADDRESS
+export HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME
+export XDG_DATA_DIRS XDG_CONFIG_DIRS XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP
+export XDG_SESSION_TYPE ICED_BACKEND XCURSOR_THEME XCURSOR_SIZE RUST_BACKTRACE RUST_LOG
+
+echo "M15B: ==== BEGIN proc-before ===="
+ls /proc
+echo "M15B: ==== END proc-before ===="
+
+# ---- arm CTRL: the stall, reproduced in this boot ---------------------------
+echo "M15B: MARK CTRL 35"
+/bin/cosmic-settings > "$L/ctrl.log" 2>&1 &
+sleep 35
+echo "M15B: ENDMARK CTRL"
+
+echo "M15B: ==== BEGIN proc-after-ctrl ===="
+ls /proc
+echo "M15B: ==== END proc-after-ctrl ===="
+
+# ---- arm FIX: the same binary with the D-Bus probe skipped ------------------
+COSMIC_SINGLE_INSTANCE=false
+WAYLAND_DEBUG=1
+export COSMIC_SINGLE_INSTANCE WAYLAND_DEBUG
+echo "M15B: MARK FIX 80"
+/bin/cosmic-settings > "$L/fix.log" 2>&1 &
+sleep 80
+echo "M15B: ENDMARK FIX"
+
+echo "M15B: CAPTURES DONE"
+
+echo "M15B: ==== BEGIN sizes ===="
+wc -c "$L/ctrl.log" "$L/fix.log" "$L/cosmic.log"
+echo "M15B: ==== END sizes ===="
+
+echo "M15B: ==== BEGIN ctrl.log ===="
+head -c 6000 "$L/ctrl.log"
+echo ""
+echo "M15B: ==== END ctrl.log ===="
+
+echo "M15B: ==== BEGIN fix-head ===="
+head -c 24000 "$L/fix.log"
+echo ""
+echo "M15B: ==== END fix-head ===="
+
+echo "M15B: ==== BEGIN fix-tail ===="
+tail -c 12000 "$L/fix.log"
+echo ""
+echo "M15B: ==== END fix-tail ===="
+
+echo "M15B: DONE"

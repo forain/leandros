@@ -902,17 +902,75 @@ matching whatever `libinput_udev_assign_seat` is called with (`seat0`), or libin
 them. **Input to a compositor has never once been demonstrated in this project** — M4's
 original mission was exactly this and it died at PRIME/dmabuf before any client saw an event.
 
-### 7. Only a raw `wl_shm` client renders — no libcosmic/iced app draws
+### 7. Every libcosmic app blocks in a D-Bus call before it ever renders
 
-**"Runs but renders nothing", and the contrast is the evidence.** `wlclient` — no toolkit,
-raw `wl_shm` — draws **instantly** through this compositor. `cosmic-settings` is **staged,
-launched, alive with 3 pids, owns its D-Bus name, logs nothing, and paints 0 px at +6 s,
-+26 s and +74 s.** Same compositor, same protocol, same machine. That localises the gap to
-**libcosmic/iced + `tiny-skia`**, not to Wayland and not to the kernel.
+**ROOT-CAUSED AND PHOTOGRAPHED, aarch64, 2026-08-08. The toolkit was never the problem, and
+the item as written was wrong in every clause but the pixel count.** Evidence, raw logs and
+the harnesses' own reasoning: `artifacts/notes/m15-libcosmic-single-instance/`
+(`artifacts/m15_iced.py` + `m15b_iced.py`, guest halves in `artifacts/m6-session-data/`).
+**No COSMIC source was modified at any point** — `git -C ../cosmic-epoch status --porcelain`
+stayed empty, so there was nothing to revert.
 
-This is the **same shape already recorded for cosmic-panel** — presenting fresh buffers while
-rendering nothing into them, with the kernel and cosmic-comp exonerated by measurement. Treat
-those two as **one investigation**, because they probably are.
+**The state was "alive and blocked", not "runs but renders nothing".** Run standalone with its
+own stderr preserved — `cosmic-session` pipes child stderr and reads it nowhere
+(`cosmic-session/src/comp.rs:122-134`), which is the whole reason this was invisible —
+`cosmic-settings` writes **1775 B** and stops at libcosmic's `error loading system dark theme`.
+`WAYLAND_DEBUG=1` was on for the whole 75 s window and produced **not one protocol line**: no
+`get_registry`, no surface, no buffer, no commit. **It never opens a Wayland connection at
+all**, so no rasteriser is reached and `tiny-skia` cannot be the suspect.
+
+**The mechanism is ours.** `main()` calls `cosmic::app::run_single_instance`
+(`cosmic-settings/src/main.rs:216-221`), which makes a **blocking** zbus call to its own
+`APP_ID` to ask whether another instance exists and builds the iced application only in the
+else-branch (`libcosmic/96a8204/src/app/mod.rs:214-252`). **busd 0.5.0 answers a method call to
+an unowned well-known name by dropping it with a `warn!`** (`busd-0.5.0/src/peers.rs:265-270`,
+`bail!("unknown destination: {}", name)`, swallowed at `:222-227`) — no
+`org.freedesktop.DBus.Error.ServiceUnknown`, and **no server-side reply timeout** the way
+`dbus-daemon` has; zbus has no client-side one either. The caller waits forever. The session log
+carries `busd::peers: unknown destination: com.system76.CosmicSettings` at the exact second the
+app started.
+
+**The discriminator is one environment variable and it is decisive, replicated on two boots.**
+`run_single_instance` honours `COSMIC_SINGLE_INSTANCE=false` and skips D-Bus entirely
+(`mod.rs:207-212`). Same binary, same session, CTRL first so the working arm cannot own the name
+and make CTRL "pass" for the wrong reason: CTRL 704 B of stderr and nothing on screen across
+3 shots in 35 s; FIX 38923 B, through `cosmic-text`/`fontdb` into
+`-> wl_display#1.get_registry`, **and a fully rendered settings window at t+36 s** — sidebar,
+icons, text, list rows, scrollbar, theming (`fix-single-instance-off-t74.png`). **libcosmic +
+iced + `tiny-skia` work correctly on LeandrOS/aarch64.**
+
+**The compositor was never a suspect and now there is a photograph.** The same boot shows
+wallpaper, panel bar, a legible ticking clock and `wlclient`'s window composited together.
+
+**THE OBVIOUS FIX REGRESSES THE SESSION — do not re-derive it and land it.** A patch making
+busd reply `ServiceUnknown` to an undeliverable `MethodCall` compiles clean and was staged for
+both arches; the resulting image **crash-loops** — 9 `[EXC] EL0 Fault!` records, mostly a null
+deref at `FAR=0x880`, `x0=0`, same code offset in rising PIDs, session dead after
+`wayland-1 after 1s`. Runs 1, 2 and 4 have **zero**. busd was the only image delta. busd is back
+to stock and the patch is not in the tree. **Two candidate repairs remain, both LeandrOS-side:**
+(a) work out what the error reply breaks and land a correct busd patch (`ports/busd` already
+carries `current-thread-runtime.patch`, so the mechanism exists); (b) export
+`COSMIC_SINGLE_INSTANCE=false` from `start-cosmic-leandros`, which is our own launcher — a
+one-line unblock that leaves the underlying "any blocking call to an unowned name hangs
+forever" defect in place for everything else.
+
+**This is NOT the cosmic-panel bug, and the recorded instruction to treat them as one
+investigation is withdrawn.** The panel rasterises its bar with `iced_tiny_skia` into a
+`MemoryRenderBuffer` and composites it through smithay's `GlesRenderer` over EGL
+(`cosmic-panel-bin/src/space/panel_space.rs:1397-1434`, `src/space/render.rs:280-308`) — the
+`mesa-shared:*` memfds `mm::gap2` watched are Mesa's swrast WSI, not a toolkit allocation —
+while libcosmic apps reach `wl_shm` through `softbuffer`. The only shared code is
+`iced_tiny_skia::Renderer::draw`, and this run photographs that code drawing a complete window.
+The panel **reaches** its render path; `cosmic-settings` never did.
+
+**It also puts item 8's attribution in doubt.** `COSMIC_SINGLE_INSTANCE` is present in exactly
+five staged binaries — `cosmic-settings`, `cosmic-launcher`, `cosmic-app-library`,
+`cosmic-workspaces`, `cosmic-osd` — and three of those are the components item 8 records as
+launched every boot with zero restarts and permanently invisible, blamed wholly on the missing
+keybinding. **The cheapest next measurement is a census, not an experiment:** capture a FULL
+session log (not a tail) and count `busd::peers: unknown destination:` by name. One
+`com.system76.Cosmic*` line per single-instance component confirms they have been blocked at
+startup every boot; their absence refutes it and leaves item 8's attribution intact.
 
 ### 8. Nothing to launch, and no way to ask for it
 
