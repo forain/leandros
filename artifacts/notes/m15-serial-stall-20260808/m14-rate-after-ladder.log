@@ -1,0 +1,45 @@
+=== KERNEL md5 ===
+d72de2061d8efb62855f54a77b618f84  /home/forain/Projects/leandros/target/final-x86_64/kernel
+=== BOOT ===
+Serial socket up. Waiting for login/shell prompt (up to 120s)...
+Login prompt ready (use: driver.py login <user> <password>).
+
+=== LOGIN ===
+
+[?2004h[0m[?25l[48;1H[J[39mbrush-0.5# 
+=== GUARD: m15_serial_stall ===
+=== POSITIVE CONTROL (must FAIL) ===
+>>> CONTROL OK ('command not found')
+
+  PARKED   moves= 600 qmp=1200/0 frames= 1200 queue_full=    0 delivered=100.0%  serial_read=0
+  DRAINED  moves= 600 qmp=1200/0 frames= 1200 queue_full=    0 delivered=100.0%  serial_read=2800
+  ABSENT   moves= 600 qmp=1200/0 frames= 1200 queue_full=    0 delivered=100.0%  serial_read=-1
+
+============== SERIAL-STALL GUARD ==============
+  PARKED 100.0%  (controls DRAINED 100.0% ABSENT 100.0%)
+  serial_stall_input_loss: PASS (threshold 90%)
+failures = 0
+M15_RC=0
+=== RATE LADDER (m14_rate) ===
+=== POSITIVE CONTROL (must FAIL) ===
+>>> CONTROL OK ('command not found')
+
+  rung 2/s: 20 moves in 10.0s (qmp 40 sent / 0 rejected)  evdev push 7200 -> 7280
+  rung 10/s: 100 moves in 10.0s (qmp 200 sent / 0 rejected)  evdev push 7280 -> 7680
+  rung 30/s: 300 moves in 10.0s (qmp 600 sent / 0 rejected)  evdev push 7680 -> 8880
+  rung 60/s: 600 moves in 10.0s (qmp 1200 sent / 0 rejected)  evdev push 8880 -> 11280
+
+  IDLE tail: evdev push 11280 -> 11280 (must be flat)
+
+================ RATE LADDER ================
+ rate/s   moves  qmp_ok  qmp_rej  evdev_ev  ev/move  delivered%
+      2      20      40        0        80     4.00      100.0%
+     10     100     200        0       400     4.00      100.0%
+     30     300     600        0      1200     4.00      100.0%
+     60     600    1200        0      2400     4.00      100.0%
+
+  ev/move at 4.00 = nothing lost. A column that FALLS as rate rises is buffer exhaustion, not a filter.
+>>> serial log: /tmp/vqrate-after2/serial.log
+RUN_RC=0
+=== ladder queue_full = 0 ===
+=== DONE OUT=/tmp/vqrate-after2 ===

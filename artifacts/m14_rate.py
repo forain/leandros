@@ -23,6 +23,24 @@ blamed for what the counter shows.
                                 empty — and that is OUR bug to fix, on our
                                 side, not COSMIC's.
 
+IT WAS THE SECOND, AND THE BUFFER RAN OUT FOR A REASON THIS LADDER CANNOT SEE.
+The first run of this script produced 2.00 / 1.12 / 0.91 / 0.85 ev/move, and
+that decline was real -- but the eventq emptied because the drain STOPPED, not
+because it could not keep up. `sweep_at` sleeps between injections while this
+script holds the serial socket open; the guest's console then back-pressures,
+and `arch::putc` waited for a transmitter QEMU will not empty until the host
+reads again -- inside the timer IRQ handler, which is what calls
+`virtio_keyboard::poll_events`. Each rung therefore got ~2 s of a live guest and
+then a frozen one, so the delivered FRACTION fell as the rung's move count rose
+while the delivered COUNT stayed flat. Bounding that wait
+(arch/x86_64/src/lib.rs::putc, arch/aarch64/src/uart.rs::putc) takes every rung
+of this ladder to a flat 4.00 with zero host-side frame drops.
+
+`sweep_at` deliberately still sleeps: on a fixed kernel it is a standing stress
+case for exactly that regression. The dedicated guard -- which measures loss
+host-side from QEMU's own virtio_input_queue_full trace, and so cannot be
+throttled by the stall it is looking for -- is artifacts/m15_serial_stall.py.
+
 CONTROLS. Every rung is bracketed by an idle window; a counter that climbs
 while nothing is being injected invalidates the rung next to it. The QMP
 accept/reject count is asserted per rung, so "the host refused to send it" can

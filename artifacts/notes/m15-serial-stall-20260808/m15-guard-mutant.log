@@ -1,0 +1,15 @@
+MUTANT BUILD RC=0
+4b96738d695bd988a3ef1d45886a5720  target/final-x86_64/kernel
+
+=== POSITIVE CONTROL (must FAIL) ===
+>>> CONTROL OK ('command not found')
+
+  PARKED   moves= 600 qmp=1200/0 frames= 1200 queue_full= 1082 delivered=  9.8%  serial_read=0
+  DRAINED  moves= 600 qmp=1200/0 frames= 1200 queue_full=    0 delivered=100.0%  serial_read=2404
+  ABSENT   moves= 600 qmp=1200/0 frames= 1200 queue_full=    0 delivered=100.0%  serial_read=-1
+
+============== SERIAL-STALL GUARD ==============
+  PARKED 9.8%  (controls DRAINED 100.0% ABSENT 100.0%)
+  serial_stall_input_loss: FAIL (threshold 90%)
+failures = 1
+MUTANT_GUARD_RC=1

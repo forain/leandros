@@ -772,31 +772,101 @@ nothing at all. **A null observation at the end of a long chain does not locate 
 and this cost two lanes. Instrument at the *destination* — a client that counts what it is
 sent — before instrumenting the path.
 
-**THE REAL DEFECT, promoted from a record-only footnote: the virtqueue handoff starves under
-load.** Measured on an idle guest with **no compositor running**, x86_64/KVM
-(`artifacts/m14_rate.py`):
+**RESOLVED 2026-08-08. The handoff never starved — `arch::putc` did, and it took the timer
+tick with it.** The ladder below reproduces byte-for-byte, and the decline in it is real, but
+it is not buffer exhaustion under load: it is this harness measuring its own back-pressure.
+Measured on an idle guest with **no compositor running**, x86_64/KVM (`artifacts/m14_rate.py`),
+before and after the fix, with the harness **unmodified**:
 
-| rate/s | moves | qmp_ok | qmp_rej | evdev_ev | ev/move | delivered |
-|---|---|---|---|---|---|---|
-| 2 | 20 | 40 | **0** | 40 | **2.00** | 50.0% |
-| 10 | 100 | 200 | **0** | 112 | 1.12 | 28.0% |
-| 30 | 300 | 600 | **0** | 272 | 0.91 | 22.7% |
-| 60 | 600 | 1200 | **0** | 512 | **0.85** | 21.3% |
+| rate/s | moves | qmp_ok | qmp_rej | before ev/move | after ev/move |
+|---|---|---|---|---|---|
+| 2 | 20 | 40 | **0** | 2.00 | **4.00** |
+| 10 | 100 | 200 | **0** | 1.12 | **4.00** |
+| 30 | 300 | 600 | **0** | 0.91 | **4.00** |
+| 60 | 600 | 1200 | **0** | 0.85 | **4.00** |
 
-**A column that falls as rate rises is buffer exhaustion, not a filter.** Delivery drops **57%
-from the 2/s rung, monotonically**, with **zero** QMP rejections — the host queued everything —
-and `drop+0` on every evdev sample, which exonerates the ring. **So the loss is in the
-virtqueue handoff, before `push_event`.** Under a live COSMIC session it is ~22× worse again
-(1,787 moves → 68 events). *Stated precisely:* the absolute per-batch expectation is
-unverified, so this is a **relative** decline, not a loss percentage.
+Host-side `virtio_input_queue_full` across the whole ladder: **1572 → 0**. 4.00 ev/move is
+lossless — each move is two QMP commands and QEMU syncs per command, so a delivered move is
+`ABS_X, SYN, ABS_Y, SYN`.
 
-**The precise next question:** why does a 32-descriptor eventq drained every 10 ms starve at
-240 events/s? `drivers/src/virtio_keyboard.rs:304-354` is drained only from `poll_events()` on
-the 100 Hz tick (`arch/x86_64/src/timer.rs:244`), and QEMU drops a whole frame when
-`virtqueue_pop` finds no buffer. Two candidates, both inside those 40 lines: the drain simply
-is not keeping up, and — **visible by inspection and a real defect regardless** — `(*used).idx`
-is read and `(*avail).idx` read-modify-written **non-volatilely, with no fences**. A per-tick
-drained/skipped counter separates them in one boot.
+**What decided it — three phases in ONE boot at a fixed 60 moves/s, differing only in who is
+draining QEMU's serial chardev** (`artifacts/m15_serial_stall.py`; loss counted host-side from
+QEMU's own `virtio_input_queue_full` trace, so the instrument cannot be throttled by the stall
+it is looking for):
+
+| serial consumer | frames | queue_full | delivered |
+|---|---|---|---|
+| connected, never reads | 1200 | 1086 | **9.5%** |
+| connected, reads throughout | 1200 | 0 | **100.0%** |
+| not connected at all | 1200 | 0 | **100.0%** |
+
+**The eventq delivers 100% at 60 moves/s — 240 events/s against 32 descriptors — whenever the
+console is not back-pressured.** There is no load-dependent loss to explain.
+
+**Mechanism.** `putc` polled the UART transmitter with **no bound** (`arch/x86_64/src/lib.rs`,
+LSR bit 5; `arch/aarch64/src/uart.rs`, PL011 `FR.TXFF`), and QEMU's 16550 withholds `LSR.THRE`
+for exactly as long as its chardev back end refuses the byte — `hw/char/serial.c:serial_xmit`
+installs a `G_IO_OUT` watch on `EAGAIN` and returns *without* setting THRE. A socket chardev
+with **no** client returns `len` and never blocks (the already-recorded “QEMU serial drops
+output w/o client”); a client that is **connected and not reading** blocks. `putc` is reached
+from **IRQ context** — the 0.5 Hz `[EVSTAT]` census runs off the timer tick via
+`poll_deadline_tick` — so a parked reader wedged CPU 0 inside the timer IRQ handler:
+`TICK_COUNT` froze, `sched::timer_tick_irq` never ran, and `poll_events()` never ran. Every
+shape in the ladder falls out of that — ~2 s of live guest per rung, a constant **+32** flush
+(exactly the ring) on unwedge, and a fraction that falls only because the denominator rises.
+**The delivered COUNT per rung was flat; only the delivered FRACTION fell.**
+
+**Fixed**: `putc` on both arches now waits against a **cycle-counter deadline**, not an
+iteration count, and latches `TX_WEDGED` so a back-pressured console costs one probe per byte
+instead of one deadline per byte. Console output may be lost; an interrupt handler may not be
+stalled. An *iteration* bound is not enough and the intermediate measurement proves it: 10 000
+LSR reads is ~10 ms against a real UART but ~100 ms against an emulated one (each `in al, dx`
+is an exit to host userspace), and that version moved the parked case only from 9.5% to 27.3%.
+
+**Both original suspects were wrong, and the counters say so.** A gated `[VQSTAT]` census
+(`drivers/src/virtio_keyboard.rs`, `VQ_STATS`, committed **off**) recorded **`skips = 0` for
+the entire run** — `try_lock` contention on `VIRTIO_INPUTS` cannot happen anyway, since
+`poll_events()` is called only from the `cpu == 0` arm of `on_tick` on **both** arches — and
+`maxb = 32` with `notify` advancing by exactly +1 per burst, which is a drain that stops and
+restarts, not one falling behind. The missing volatile accesses and barriers **were** fixed
+(`used.idx` read, `avail.idx` publish, matching `virtio_gpu.rs:189-191`) but were **not** the
+cause: the x86_64 disassembly of the old code is faithful and correctly ordered under TSO
+(`mov %cx,0x4(%r12,%rax,2)` immediately followed by `incw 0x2(%r12)`). They are a real latent
+defect on **aarch64**, where nothing orders those two stores.
+
+**Two things this item previously recorded as fact are false.** (a) “`drop+0` on every evdev
+sample, which exonerates the ring” — `drop` reaches **680** in the very serial log that
+sentence was written from. `MAX_EVENTS = 256` (`servers/evdev/src/lib.rs:44`), depth pins at
+256 from the 30/s rung onward because nothing is reading the node, and it overwrites from
+there. It does not change the ladder's arithmetic (`push` is counted before the ring is
+consulted), but the ring was **saturated, not exonerated**. (b) “the loss is in the virtqueue
+handoff, before `push_event`” — the handoff is lossless at every rate tested.
+
+**Under a live COSMIC session the ~22×-worse figure (1,787 moves → 68 events) has not been
+re-measured** and should be assumed to have had the same cause until it is: that harness also
+held the serial socket.
+
+**Found on the way out, x86_64-only and PRE-EXISTING: console output has no flow control at
+all, and it is very likely why the x86_64 suite harness has never been trustworthy on the
+box.** `drivers/src/serial.rs::write_byte` — the path userspace console writes take — is an
+unconditional `out dx, al` into the 16550's transmit holding register with **no `LSR.THRE`
+check**; the `#[cfg(not(x86_64))]` arm goes through `arch_serial_putc`, which waits, so aarch64
+does not have this. Printing 300 numbered lines through a continuously draining reader returns
+**19 of 300** — lines 0–18 and then nothing until the trailing marker — and the number is
+**identical** on a kernel with the new `putc` deadline and on one with it removed, so it is not
+this lane's doing. It explains the `m13_suite.py` shape on x86_64 exactly: vfstest's 36
+subtests arrive 16 in its own window and 20 in the next, every later row then reads the
+previous row's exit status, and **widening every budget to 700 s reproduces it identically**
+because nothing is timing out — the bytes are never sent. The 2026-08-07 run recorded in
+`artifacts/notes/m13-cosmic-config/` already shows the same shape. The fix is to make
+`write_byte` wait the way `arch::putc` now does (safe now that `putc` carries a deadline), but
+it gives every console byte an extra VM exit and needs its own suite run, so it is deliberately
+**not** bundled with an input-path change. Measurement and md5s:
+`artifacts/notes/m15-serial-stall-20260808/console-loss-preexisting.md`.
+
+**The general lesson, and it has now cost three lanes: an instrument that has to print cannot
+measure anything that printing can stall.** Prefer a host-side witness. Full write-up, the
+`[VQSTAT]` series and raw logs: `artifacts/notes/m15-serial-stall-20260808/`.
 
 **Still open on the render side, and now the more interesting half:** input arrives and nothing
 draws. No cursor is ever composited. That is likely one investigation with item 7.

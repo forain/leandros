@@ -1,0 +1,48 @@
+=== BOOT ===
+
+[[SNCEHTE]D ]D HCCPP Uc oInDf:i g2u[rSedC,H EaDd]d rCePssU:  I1D0:. 01
+.
+2L.1e5a
+ndrOS Init (PID 1) starting...
+Init PID: 2
+Mounting F2FS disk /dev/vdb to /mnt...
+F2FS mounted successfully at /mnt!
+Pivoting root to /mnt (old root at /mnt/old_root)...
+pivot_root successful! Root is now F2FS.
+Mounting /dev/vdc at /data (f2fs)...
+Starting getty loop...
+
+LeandrOS
+
+login: Launching QEMU (PID 1743623, arch=x86_64, venus)...
+QEMU started (PID 1743623, arch=x86_64, venus)
+Serial socket up. Waiting for login/shell prompt (up to 120s)...
+Login prompt ready (use: driver.py login <user> <password>).
+
+=== LOGIN ===
+
+[?2004h[0m[?25l[48;1H[J[39mbrush-0.5# 
+=== RATE LADDER ===
+=== POSITIVE CONTROL (must FAIL) ===
+>>> CONTROL OK ('command not found')
+
+  rung 2/s: 20 moves in 10.0s (qmp 40 sent / 0 rejected)  evdev push 0 -> 40
+  rung 10/s: 100 moves in 10.0s (qmp 200 sent / 0 rejected)  evdev push 40 -> 152
+  rung 30/s: 300 moves in 10.0s (qmp 600 sent / 0 rejected)  evdev push 152 -> 424
+  rung 60/s: 600 moves in 10.0s (qmp 1200 sent / 0 rejected)  evdev push 424 -> 936
+
+  IDLE tail: evdev push 936 -> 936 (must be flat)
+
+================ RATE LADDER ================
+ rate/s   moves  qmp_ok  qmp_rej  evdev_ev  ev/move  delivered%
+      2      20      40        0        40     2.00       50.0%
+     10     100     200        0       112     1.12       28.0%
+     30     300     600        0       272     0.91       22.7%
+     60     600    1200        0       512     0.85       21.3%
+
+  ev/move at 4.00 = nothing lost. A column that FALLS as rate rises is buffer exhaustion, not a filter.
+>>> serial log: /tmp/vqrate-before/serial.log
+RUN_RC=0
+=== QEMU queue_full trace: 1572 lines ===
+=== QEMU stderr virtio errors ===
+=== OUT=/tmp/vqrate-before ===
