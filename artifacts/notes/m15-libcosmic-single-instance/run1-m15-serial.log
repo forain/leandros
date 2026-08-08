@@ -1,0 +1,302 @@
+[0m[?25l[42;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuc78[?25h[0m[?25l[42;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbi78[?25h[0m[?25l[42;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz78[?25h[0m[?25l[42;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz4278[?25h
+[?2004l[31merror:[39m command not found: nosuchbinary_xyz42
+[?2004h[0m[?25l[44;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h[0m[?25l[44;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /b78[?25h[0m[?25l[44;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m15-i78[?25h[0m[?25l[44;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m15-ice78[?25h[0m[?25l[44;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m15-iced78[?25h
+[?2004lM15: BEGIN
+M15: wayland-1 after 1s
+[EVSTAT] t=0xc8 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x0 eagain=0x0 deliv=0x0 polls=0x0 pollin=0x0 ioctls=0x0 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x0 ipid=0x0
+[EVSTAT] t=0xc8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x0 eagain=0x0 deliv=0x0 polls=0x0 pollin=0x0 ioctls=0x0 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x0 ipid=0x0
+[DRM] unimplemented ioctl cmd=0xC00864BF nr=0x000000BF type=0x00000064 size=0x00000008 (reported once per boot)
+[DRM-SRV] mmap token=0x000000004E400000 map_info=0x01 -> writeback
+[DRM-SRV] mmap token=0x000000004EC00000 map_info=0x01 -> writeback
+[EVSTAT] t=0x190 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x48f3 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x190 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x48f3 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x258 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x123aa pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x258 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x123b2 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x320 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1dd0f pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x320 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1dd13 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3e8 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x24a3d pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3e8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x24a41 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x4b0 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x30097 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x4b0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x3009e pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x578 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x3cf9a pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x578 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x3cf9a pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x640 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x48a73 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x640 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x48a7a pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x708 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x5467a pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x708 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x54686 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x7d0 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x61931 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x7d0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x6193d pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x898 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x6eef1 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x898 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x6eef8 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x960 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x7c1f0 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x960 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x7c1f8 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xa28 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x88308 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xa28 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x88308 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+M15: ==== BEGIN env-witness ====
+runtime=/run/user/0
+total 0
+srwxr-xr-x 1 root root 0 Jan  1 00:00 bus
+-rw-r--r-- 1 root root 3 Jan  1 00:00 busd-pid.11
+-rw-r--r-- 1 root root 8 Jan  1 00:00 busd-ready.11
+srwxr-xr-x 1 root root 0 Jan  1 00:00 com.system76.CosmicSettings
+srwxr-xr-x 1 root root 0 Jan  1 00:00 wayland-1
+-rw-r----- 1 root root 0 Jan  1 00:00 wayland-1.lock
+M15: ==== END env-witness ====
+M15: MARK WLCLIENT 25
+[EVSTAT] t=0xaf0 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x8e585 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xaf0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x8e591 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xbb8 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x998c8 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xbb8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x998cf pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xc80 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xa5956 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xc80 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xa5956 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xd48 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xb1df5 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xd48 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xb1dfd pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xe10 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xbe922 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xe10 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xbe922 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xed8 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xcbb26 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xed8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xcbb26 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xfa0 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xd7aa5 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xfa0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xd7ab0 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1068 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xe455c pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1068 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xe4564 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1130 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xef843 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1130 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xef843 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x11f8 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xfb9e8 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x11f8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xfb9f0 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x12c0 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1072ba pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x12c0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1072ba pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1388 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x11334f pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1388 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x11334f pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1450 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1201c7 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1450 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1201d0 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+M15: wlclient pid=
+/proc/
+M15: ENDMARK WLCLIENT
+M15: MARK SETTINGS 75
+[EVSTAT] t=0x1518 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x12c5b4 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1518 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x12c5bb pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x15e0 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x138d57 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x15e0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x138d5f pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x16a8 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x145f72 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x16a8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x145f7a pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1770 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x152094 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1770 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x152094 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1838 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x15dacf pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1838 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x15dad6 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1900 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x169332 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1900 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x16933a pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x19c8 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x174ff6 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x19c8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x174fff pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1a90 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x181aa4 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1a90 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x181aa4 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1b58 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x18ccd0 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1b58 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x18ccd0 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1c20 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x19969f pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1c20 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x19969f pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1ce8 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1a5a35 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1ce8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1a5a41 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1db0 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1b1964 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1db0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1b196c pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1e78 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1be55a pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1e78 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1be55a pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1f40 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1ca8b9 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1f40 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1ca8c1 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2008 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1d771a pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2008 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1d7721 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x20d0 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1e3ecd pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x20d0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1e3ed6 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2198 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1f1a57 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2198 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1f1a5f pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2260 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1fdef6 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2260 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1fdefe pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2328 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x20951d pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2328 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x209524 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x23f0 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x215323 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x23f0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x215323 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x24b8 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2225c0 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x24b8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2225c0 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2580 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x22f40d pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2580 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x22f415 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2648 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x23b08b pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2648 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x23b08f pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2710 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x246fab pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2710 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x246fb3 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x27d8 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x253ed8 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x27d8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x253ed8 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x28a0 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x26099c pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x28a0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2609a4 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2968 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x26c2ca pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2968 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x26c2d3 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2a30 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x278f3b pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2a30 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x278f43 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2af8 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x28550f pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2af8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x28550f pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2bc0 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x292c6f pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2bc0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x292c75 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2c88 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x29ed43 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2c88 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x29ed43 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2d50 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2ab5d8 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2d50 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2ab5d8 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2e18 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2b7af4 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2e18 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2b7afc pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2ee0 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2c4970 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2ee0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2c4978 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2fa8 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2d1102 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2fa8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2d1102 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3070 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2dc0ae pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3070 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2dc0ae pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3138 dev=0x0 push=0x62 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2e9375 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x62 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3138 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2e9375 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+M15: cosmic-settings pid=
+/proc/
+M15: ENDMARK SETTINGS
+M15: CAPTURES DONE
+M15: ==== BEGIN sizes ====
+ 1775 /data/m15/settings.log
+  434 /data/m15/wlclient.log
+88628 /data/m15/cosmic.log
+90837 total
+M15: ==== END sizes ====
+M15: ==== BEGIN wlclient.log ====
+[wlclient] connected to display
+[wlclient] roundtrip: requesting globals...
+[wlclient] roundtrip done: compositor=0x233ea0 shm=0x233dc0 wm_base=0xb949ea20 seat=0xb949ea90
+[wlclient] shm buffer created (480x320 ARGB8888)
+[wlclient] toplevel committed, waiting for configure...
+[wlclient] seat has keyboard
+[wlclient] configured -> painted (color 0)
+[wlclient] configured -> painted (color 0)
+[wlclient] configured -> painted (color 0)
+
+M15: ==== END wlclient.log ====
+M15: ==== BEGIN settings-head ====
+[1;33mwarning[0m[1m:[0m [1msome trace filter directives would enable traces that are disabled statically[0m
+ [1;38;5;21m|[0m `cosmic=debug` would enable the DEBUG level for the `cosmic` target
+ [1;38;5;21m|[0m `iced_winit=debug` would enable the DEBUG level for the `iced_winit` target
+ [1;38;5;21m|[0m `iced_renderer=debug` would enable the DEBUG level for the `iced_renderer` target
+ [1;38;5;21m|[0m `iced_graphics=debug` would enable the DEBUG level for the `iced_graphics` target
+ [1;38;5;21m|[0m `iced_tiny_skia=debug` would enable the DEBUG level for the `iced_tiny_skia` target
+ [1;38;5;21m|[0m `winit=debug` would enable the DEBUG level for the `winit` target
+ [1;38;5;21m|[0m `sctk=debug` would enable the DEBUG level for the `sctk` target
+ [1;38;5;21m|[0m `smithay_client_toolkit=debug` would enable the DEBUG level for the `smithay_client_toolkit` target
+ [1;38;5;21m=[0m [1mnote:[0m the static max level is `info`
+ [1;38;5;21m=[0m [1mhelp:[0m to enable DEBUG logging, remove the `max_level_info` feature from the `tracing` crate
+  [32m INFO[0m  [32mCurrent Locale: [][0m
+    [2;3mat[0m /Users/forain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/i18n-embed-0.16.0/src/requester.rs:299 [2;3mon[0m main
+
+  [32m INFO[0m  [32mSelecting translations for domain "cosmic_settings"[0m
+    [2;3mat[0m /Users/forain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/i18n-embed-0.16.0/src/lib.rs:602 [2;3mon[0m main
+
+  [31mERROR[0m  [31merror loading system dark theme, [1;31merror[0m[31m: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/src/theme/mod.rs:95 [2;3mon[0m main
+
+
+M15: ==== END settings-head ====
+M15: ==== BEGIN settings-tail ====
+[1;33mwarning[0m[1m:[0m [1msome trace filter directives would enable traces that are disabled statically[0m
+ [1;38;5;21m|[0m `cosmic=debug` would enable the DEBUG level for the `cosmic` target
+ [1;38;5;21m|[0m `iced_winit=debug` would enable the DEBUG level for the `iced_winit` target
+ [1;38;5;21m|[0m `iced_renderer=debug` would enable the DEBUG level for the `iced_renderer` target
+ [1;38;5;21m|[0m `iced_graphics=debug` would enable the DEBUG level for the `iced_graphics` target
+ [1;38;5;21m|[0m `iced_tiny_skia=debug` would enable the DEBUG level for the `iced_tiny_skia` target
+ [1;38;5;21m|[0m `winit=debug` would enable the DEBUG level for the `winit` target
+ [1;38;5;21m|[0m `sctk=debug` would enable the DEBUG level for the `sctk` target
+ [1;38;5;21m|[0m `smithay_client_toolkit=debug` would enable the DEBUG level for the `smithay_client_toolkit` target
+ [1;38;5;21m=[0m [1mnote:[0m the static max level is `info`
+ [1;38;5;21m=[0m [1mhelp:[0m to enable DEBUG logging, remove the `max_level_info` feature from the `tracing` crate
+  [32m INFO[0m  [32mCurrent Locale: [][0m
+    [2;3mat[0m /Users/forain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/i18n-embed-0.16.0/src/requester.rs:299 [2;3mon[0m main
+
+  [32m INFO[0m  [32mSelecting translations for domain "cosmic_settings"[0m
+    [2;3mat[0m /Users/forain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/i18n-embed-0.16.0/src/lib.rs:602 [2;3mon[0m main
+
+  [31mERROR[0m  [31merror loading system dark theme, [1;31merror[0m[31m: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/src/theme/mod.rs:95 [2;3mon[0m main
+
+
+M15: ==== END settings-tail ====
+M15: ==== BEGIN cosmic-tail ====
+m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:07.862226Z[0m [33m WARN[0m [1mcosmic-greeter[0m[2m:[0m [2mcosmic_session[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:07.868275Z[0m [32m INFO[0m [1mcosmic-greeter[0m[2m:[0m [2mcosmic_session[0m[2m:[0m \x1b[2m1970-01-01T00:00:07.868171Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mcosmic_greeter::locker\x1b[0m\x1b[2m:\x1b[0m output wl_output@39: created
+[2m1970-01-01T00:00:07.868290Z[0m [32m INFO[0m [1mcosmic-greeter[0m[2m:[0m [2mcosmic_session[0m[2m:[0m \x1b[2m1970-01-01T00:00:07.868184Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mcosmic_greeter::common\x1b[0m\x1b[2m:\x1b[0m updating wallpaper for "HDMI-A-1"
+[2m1970-01-01T00:00:07.869988Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:07Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:07.875172Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: org.freedesktop.timedate1
+[2m1970-01-01T00:00:07.883991Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:07Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:07.885118Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:07Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:07.885454Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:07Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:07.885663Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:07Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:07.885874Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:07Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:07.886081Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:07Z INFO  tracing::span] read_socket;
+[2m1970-01-01T00:00:08.182384Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mdetected desktop entry, \x1b[1;32mid\x1b[0m\x1b[32m: "com.system76.CosmicAppletTime"\x1b[0m
+[2m1970-01-01T00:00:08.182611Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/mime_app.rs:359 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:08.183047Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:08.184511Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mloaded mime app cache in 31.276958ms\x1b[0m
+[2m1970-01-01T00:00:08.184588Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/mime_app.rs:501 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:08.186815Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:08.247980Z[0m [32m INFO[0m [1mcosmic-greeter[0m[2m:[0m [2mcosmic_session[0m[2m:[0m \x1b[2m1970-01-01T00:00:08.247875Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcosmic::theme\x1b[0m\x1b[2m:\x1b[0m error loading system dark theme \x1b[3merror\x1b[0m\x1b[2m=\x1b[0mGetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })
+[2m1970-01-01T00:00:09.426580Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[31mERROR\x1b[0m  \x1b[31merror loading system dark theme, \x1b[1;31merror\x1b[0m\x1b[31m: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })\x1b[0m
+[2m1970-01-01T00:00:09.426598Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/src/theme/mod.rs:95 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:09.426608Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.428675Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mNo valid locale found in environment, using fallback\x1b[0m
+[2m1970-01-01T00:00:09.429358Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/localize.rs:69 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:09.429473Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.430695Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mrescan_tab Entity(1v1) Desktop("/root/Desktop", "", DesktopConfig { grid_spacing: 100, icon_size: 100, show_content: true, show_mounted_drives: false, show_trash: false }) None\x1b[0m
+[2m1970-01-01T00:00:09.430726Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/app.rs:1512 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:09.430926Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.433489Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to read directory /root/Desktop: No such file or directory (os error 2)\x1b[0m
+[2m1970-01-01T00:00:09.433857Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/tab.rs:1086 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:09.434188Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.434476Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to get item for /root/Desktop: failed to read metadata for /root/Desktop: No such file or directory (os error 2)\x1b[0m
+[2m1970-01-01T00:00:09.434613Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/tab.rs:1611 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:09.434842Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.436064Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mSystem theme: None\x1b[0m
+[2m1970-01-01T00:00:09.436332Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/iced/winit/src/lib.rs:843 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:09.436512Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.444579Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mSCTK setup complete.\x1b[0m
+[2m1970-01-01T00:00:09.444785Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/iced/winit/src/platform_specific/wayland/event_loop/mod.rs:465 \x1b[2;3mon\x1b[0m 
+[2m1970-01-01T00:00:09.445212Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.448664Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:09.449324Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[2m1970-01-01T00:00:09.462592Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mcould not find any valid trash bins to watch: Unknown { description: "The 'home trash' either does not exist or is not a directory (or a link pointing to a dir)" }\x1b[0m
+[2m1970-01-01T00:00:09.462671Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/app.rs:6864 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:09.462700Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.562991Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[31mERROR\x1b[0m  \x1b[31mcosmic theme config update error, \x1b[1;31mwhy\x1b[0m\x1b[31m: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })\x1b[0m
+[2m1970-01-01T00:00:09.563009Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/src/app/cosmic.rs:658 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:09.563503Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.631375Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[31mERROR\x1b[0m  \x1b[31merror loading system dark theme, \x1b[1;31merror\x1b[0m\x1b[31m: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })\x1b[0m
+[2m1970-01-01T00:00:09.631911Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/src/theme/mod.rs:95 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:09.632153Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.709408Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[31mERROR\x1b[0m  \x1b[31merror loading system dark theme, \x1b[1;31merror\x1b[0m\x1b[31m: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })\x1b[0m
+[2m1970-01-01T00:00:09.709903Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/src/theme/mod.rs:95 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:09.710268Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.780651Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[31mERROR\x1b[0m  \x1b[31merror loading system dark theme, \x1b[1;31merror\x1b[0m\x1b[31m: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })\x1b[0m
+[2m1970-01-01T00:00:09.781651Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/src/theme/mod.rs:95 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:09.781763Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.855811Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[31mERROR\x1b[0m  \x1b[31merror loading system dark theme, \x1b[1;31merror\x1b[0m\x1b[31m: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })\x1b[0m
+[2m1970-01-01T00:00:09.855954Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/src/theme/mod.rs:95 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:09.855967Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.856047Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32moutput wl_output@39: created\x1b[0m
+[2m1970-01-01T00:00:09.856081Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/app.rs:5258 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:09.856187Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.856550Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to locate desktop directory, falling back to /root/Desktop\x1b[0m
+[2m1970-01-01T00:00:09.856596Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/lib.rs:50 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:09.856705Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.856975Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[32m INFO\x1b[0m  \x1b[32mrescan_tab Entity(2v1) Desktop("/root/Desktop", "HDMI-A-1", DesktopConfig { grid_spacing: 100, icon_size: 100, show_content: true, show_mounted_drives: false, show_trash: false }) None\x1b[0m
+[2m1970-01-01T00:00:09.857448Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/app.rs:1512 \x1b[2;3mon\x1b[0m main
+[2m1970-01-01T00:00:09.857672Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.858334Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to read directory /root/Desktop: No such file or directory (os error 2)\x1b[0m
+[2m1970-01-01T00:00:09.858565Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/tab.rs:1086 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:09.859070Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.859330Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[33m WARN\x1b[0m  \x1b[33mfailed to get item for /root/Desktop: failed to read metadata for /root/Desktop: No such file or directory (os error 2)\x1b[0m
+[2m1970-01-01T00:00:09.859354Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m src/tab.rs:1611 \x1b[2;3mon\x1b[0m tokio-rt-worker
+[2m1970-01-01T00:00:09.859430Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:09.859666Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m   \x1b[31mERROR\x1b[0m  \x1b[31mOverlap notify subscription cannot be created for surface. No matching layer surface found.\x1b[0m
+[2m1970-01-01T00:00:09.859710Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m     \x1b[2;3mat\x1b[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/iced/winit/src/platform_specific/wayland/event_loop/state.rs:1678 \x1b[2;3mon\x1b[0m 
+[2m1970-01-01T00:00:09.859789Z[0m [33m WARN[0m [1mcosmic-files-applet[0m[2m:[0m [2mcosmic_session[0m[2m:[0m 
+[2m1970-01-01T00:00:52.156409Z[0m [33m WARN[0m [2mbusd::peers[0m[2m:[0m unknown destination: com.system76.CosmicSettings
+[2m1970-01-01T00:00:52.157371Z[0m [33m WARN[0m [1mcosmic-idle[0m[2m:[0m [2mcosmic_session[0m[2m:[0m [1970-01-01T00:00:52Z INFO  tracing::span] read_socket;
+
+M15: ==== END cosmic-tail ====
+M15: DONE
+[?2004h[0m[?25l[47;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h

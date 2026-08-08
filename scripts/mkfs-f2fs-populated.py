@@ -829,6 +829,25 @@ def main():
         "~/code/leandros-artifacts/m6-session-data/m14-input")
     if os.path.exists(m14_drv):
         bin_files.append(("m14-input", m14_drv, 0o100755))
+    # m15-iced — the guest half of artifacts/m15_iced.py. Brings the session up
+    # with its output silenced to a file, then launches a raw wl_shm control and
+    # cosmic-settings SIDE BY SIDE outside cosmic-session, so the toolkit app's
+    # own stderr survives (launch_pad pipes child stderr and registers no
+    # on_stderr handler, cosmic-session/src/comp.rs:122-134) and WAYLAND_DEBUG
+    # can say whether it never commits or commits blank buffers.
+    # Same no-shebang rule: run as `brush /bin/m15-iced`.
+    m15_drv = os.path.expanduser(
+        "~/code/leandros-artifacts/m6-session-data/m15-iced")
+    if os.path.exists(m15_drv):
+        bin_files.append(("m15-iced", m15_drv, 0o100755))
+    # m15b-iced — the discriminator m15-iced pointed at: the same cosmic-settings
+    # binary run twice one environment variable apart, COSMIC_SINGLE_INSTANCE
+    # unset then =false, to separate "blocked in libcosmic's blocking D-Bus
+    # single-instance probe" from "reaches iced and renders nothing".
+    m15b_drv = os.path.expanduser(
+        "~/code/leandros-artifacts/m6-session-data/m15b-iced")
+    if os.path.exists(m15b_drv):
+        bin_files.append(("m15b-iced", m15b_drv, 0o100755))
     # m4-vkwl-a64 — the same driver with the compositor choice and every wait
     # made an argument, for aarch64 under TCG where "the session never came up"
     # and "the WSI chain does not work here" have to be told apart and a silent

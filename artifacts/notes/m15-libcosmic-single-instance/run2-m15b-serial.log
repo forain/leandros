@@ -1,0 +1,721 @@
+[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbi78[?25h[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz78[?25h[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz4278[?25h
+[?2004l[31merror:[39m command not found: nosuchbinary_xyz42
+[?2004h[0m[?25l[45;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h[0m[?25l[45;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /b78[?25h[0m[?25l[45;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m15b-78[?25h[0m[?25l[45;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m15b-iced78[?25h
+[?2004lM15B: BEGIN
+M15B: wayland-1 after 1s
+[EVSTAT] t=0xc8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x0 eagain=0x0 deliv=0x0 polls=0x0 pollin=0x0 ioctls=0x0 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x0 ipid=0x0
+[EVSTAT] t=0xc8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x0 eagain=0x0 deliv=0x0 polls=0x0 pollin=0x0 ioctls=0x0 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x0 ipid=0x0
+[DRM] unimplemented ioctl cmd=0xC00864BF nr=0x000000BF type=0x00000064 size=0x00000008 (reported once per boot)
+[DRM-SRV] mmap token=0x000000004E400000 map_info=0x01 -> writeback
+[DRM-SRV] mmap token=0x000000004EC00000 map_info=0x01 -> writeback
+[EVSTAT] t=0x190 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x3cf4 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x190 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x3cf4 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x258 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x11eb6 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x258 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x11ebf pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x320 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1c9d0 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x320 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1c9d0 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3e8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x22e97 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3e8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x22e97 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x4b0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2e766 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x4b0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2e76e pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x578 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x3bcec pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x578 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x3bcec pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x640 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x47f16 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x640 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x47f1e pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x708 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x53a57 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x708 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x53a5f pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x7d0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x60fee pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x7d0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x60fee pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x898 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x6cd48 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x898 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x6cd48 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x960 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x79154 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x960 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x7915c pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xa28 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x850ce pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xa28 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x850d3 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+M15B: ==== BEGIN proc-before ====
+cpuinfo	 filesystems  net  sys	version
+M15B: ==== END proc-before ====
+M15B: MARK CTRL 35
+[EVSTAT] t=0xaf0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x91845 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xaf0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x9184c pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xbb8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x9c90a pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xbb8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x9c90a pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xc80 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xa87ec pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xc80 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xa87ec pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xd48 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xb4a5b pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xd48 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xb4a63 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xe10 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xc0db4 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xe10 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xc0db8 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xed8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xcd6cf pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xed8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xcd6d8 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xfa0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xda33d pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0xfa0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xda344 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1068 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xe59b8 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1068 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xe59b8 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1130 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xf192c pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1130 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xf1936 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x11f8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xfd070 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x11f8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0xfd070 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x12c0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x109193 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x12c0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x109193 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1388 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1144e1 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1388 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1144e8 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1450 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x121c05 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1450 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x121c05 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1518 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x12e5c3 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1518 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x12e5c3 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x15e0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x13b1ab pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x15e0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x13b1b3 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x16a8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x147373 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x16a8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x147373 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1770 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x152498 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1770 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1524a0 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+M15B: ENDMARK CTRL
+M15B: ==== BEGIN proc-after-ctrl ====
+[EVSTAT] t=0x1838 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x15e597 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1838 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x15e597 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+cpuinfo	 filesystems  net  sys	version
+M15B: ==== END proc-after-ctrl ====
+M15B: MARK FIX 80
+[EVSTAT] t=0x1900 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1655ae pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1900 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1655c3 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x19c8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x16c62a pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x19c8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x16c648 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1a90 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x172b08 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1a90 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x172b08 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1b58 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x179cb2 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1b58 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x179cba pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1c20 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x184f31 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1c20 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x184f39 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1ce8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x18f8f2 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1ce8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x18f8f2 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1db0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x19bdb0 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1db0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x19bdb0 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1e78 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1a86c1 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1e78 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1a86cd pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1f40 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1b3b21 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x1f40 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1b3b2a pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2008 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1be887 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2008 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1be893 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x20d0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1cad8a pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x20d0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1cad92 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2198 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1d8244 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2198 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1d8244 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2260 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1e5ebe pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2260 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1e5ec6 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2328 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1f26ab pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2328 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1f26b3 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x23f0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1fee77 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x23f0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x1fee7f pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x24b8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x20c670 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x24b8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x20c678 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2580 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x219942 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2580 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x21994e pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2648 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x22682d pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2648 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x22682d pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2710 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x232e12 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2710 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x232e1a pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x27d8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x23ea42 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x27d8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x23ea49 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x28a0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x24bc62 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x28a0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x24bc6a pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2968 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x258670 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2968 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x258678 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2a30 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x264ddd pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2a30 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x264ddd pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2af8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x27123e pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2af8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x27123e pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2bc0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x27e1bc pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2bc0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x27e1bc pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2c88 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x289d26 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2c88 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x289d26 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2d50 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x295e00 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2d50 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x295e00 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2e18 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2a2162 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2e18 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2a216a pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2ee0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2ae9d8 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2ee0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2ae9df pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2fa8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2bad55 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x2fa8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2bad5d pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3070 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2c81fd pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3070 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2c8205 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3138 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2d5298 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3138 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2d52a0 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3200 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2e27d8 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3200 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2e27d8 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x32c8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2f0025 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x32c8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2f002c pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3390 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2fb884 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3390 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x2fb884 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3458 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x308ae5 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3458 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x308aee pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3520 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x316bad pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3520 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x316bad pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x35e8 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x322b14 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x35e8 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x322b1c pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x36b0 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x32e989 pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x36b0 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x32e991 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3778 dev=0x0 push=0x64 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x33b99b pollin=0x0 ioctls=0x13 enotty=0x0 lastnr=0x0 conspop=0x64 rpid=0x18 ipid=0x18
+[EVSTAT] t=0x3778 dev=0x1 push=0x0 drop=0x0 depth=0x0 reads=0x1 eagain=0x1 deliv=0x0 polls=0x33b9a3 pollin=0x0 ioctls=0x15 enotty=0x0 lastnr=0x0 conspop=0x0 rpid=0x18 ipid=0x18
+M15B: ENDMARK FIX
+M15B: CAPTURES DONE
+M15B: ==== BEGIN sizes ====
+   704 /data/m15b/ctrl.log
+ 38923 /data/m15b/fix.log
+ 93166 /data/m15b/cosmic.log
+132793 total
+M15B: ==== END sizes ====
+M15B: ==== BEGIN ctrl.log ====
+  [32m INFO[0m  [32mCurrent Locale: [][0m
+    [2;3mat[0m /Users/forain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/i18n-embed-0.16.0/src/requester.rs:299 [2;3mon[0m main
+
+  [32m INFO[0m  [32mSelecting translations for domain "cosmic_settings"[0m
+    [2;3mat[0m /Users/forain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/i18n-embed-0.16.0/src/lib.rs:602 [2;3mon[0m main
+
+  [31mERROR[0m  [31merror loading system dark theme, [1;31merror[0m[31m: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/src/theme/mod.rs:95 [2;3mon[0m main
+
+
+M15B: ==== END ctrl.log ====
+M15B: ==== BEGIN fix-head ====
+  [32m INFO[0m  [32mCurrent Locale: [][0m
+    [2;3mat[0m /Users/forain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/i18n-embed-0.16.0/src/requester.rs:299 [2;3mon[0m main
+
+  [32m INFO[0m  [32mSelecting translations for domain "cosmic_settings"[0m
+    [2;3mat[0m /Users/forain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/i18n-embed-0.16.0/src/lib.rs:602 [2;3mon[0m main
+
+  [31mERROR[0m  [31merror loading system dark theme, [1;31merror[0m[31m: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/src/theme/mod.rs:95 [2;3mon[0m main
+
+  [33m WARN[0m  [33mfailed to get system locale, falling back to en-US[0m
+    [2;3mat[0m /Users/forain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cosmic-text-0.19.0/src/font/system.rs:423 [2;3mon[0m main
+
+  [33m WARN[0m  [33mFallback to loading from known font dir paths.[0m
+    [2;3mat[0m /Users/forain/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fontdb-0.23.0/src/lib.rs:466 [2;3mon[0m main
+
+[  62151.441]  -> wl_display#1.get_registry(new id wl_registry#2)
+[  62151.453]  -> wl_display#1.sync(new id wl_callback#3)
+[  62153.001] {Display Queue} wl_display#1.delete_id(3)
+[  62153.012] wl_registry#2.global(1, "wl_compositor", 5)
+[  62153.111] wl_registry#2.global(2, "wl_subcompositor", 1)
+[  62153.122] wl_registry#2.global(3, "cosmic_corner_radius_manager_v1", 2)
+[  62153.133] wl_registry#2.global(4, "wl_data_device_manager", 3)
+[  62153.143] wl_registry#2.global(5, "wp_fractional_scale_manager_v1", 1)
+[  62153.159] wl_registry#2.global(6, "zwp_keyboard_shortcuts_inhibit_manager_v1", 1)
+[  62153.170] wl_registry#2.global(7, "zxdg_output_manager_v1", 3)
+[  62153.181] wl_registry#2.global(8, "zwlr_output_manager_v1", 4)
+[  62154.278] wl_registry#2.global(9, "zcosmic_output_manager_v1", 3)
+[  62154.294] wl_registry#2.global(10, "zwlr_output_power_manager_v1", 1)
+[  62154.304] wl_registry#2.global(11, "zcosmic_overlap_notify_v1", 1)
+[  62154.313] wl_registry#2.global(12, "wp_presentation", 2)
+[  62154.324] wl_registry#2.global(13, "zwp_primary_selection_device_manager_v1", 1)
+[  62154.333] wl_registry#2.global(14, "zcosmic_workspace_image_capture_source_manager_v1", 1)
+[  62154.344] wl_registry#2.global(15, "ext_output_image_capture_source_manager_v1", 1)
+[  62154.358] wl_registry#2.global(16, "ext_foreign_toplevel_image_capture_source_manager_v1", 1)
+[  62154.369] wl_registry#2.global(17, "ext_image_copy_capture_manager_v1", 1)
+[  62154.379] wl_registry#2.global(18, "wl_shm", 2)
+[  62154.388] wl_registry#2.global(19, "wp_cursor_shape_manager_v1", 2)
+[  62154.400] wl_registry#2.global(20, "wp_viewporter", 1)
+[  62154.413] wl_registry#2.global(21, "org_kde_kwin_server_decoration_manager", 1)
+[  62154.423] wl_registry#2.global(22, "zxdg_decoration_manager_v1", 1)
+[  62154.434] wl_registry#2.global(23, "ext_session_lock_manager_v1", 1)
+[  62154.444] wl_registry#2.global(26, "zwp_pointer_constraints_v1", 1)
+[  62154.654] wl_registry#2.global(27, "wp_pointer_warp_v1", 1)
+[  62154.666] wl_registry#2.global(28, "zwp_pointer_gestures_v1", 3)
+[  62154.676] wl_registry#2.global(29, "zwp_tablet_manager_v2", 1)
+[  62154.686] wl_registry#2.global(30, "wp_security_context_manager_v1", 1)
+[  62154.696] wl_registry#2.global(31, "zwp_input_method_manager_v2", 1)
+[  62154.707] wl_registry#2.global(32, "zwp_text_input_manager_v3", 1)
+[  62154.717] wl_registry#2.global(33, "zwp_virtual_keyboard_manager_v1", 1)
+[  62154.728] wl_registry#2.global(34, "wp_alpha_modifier_v1", 1)
+[  62154.738] wl_registry#2.global(35, "wp_single_pixel_buffer_manager_v1", 1)
+[  62154.749] wl_registry#2.global(36, "wl_fixes", 1)
+[  62154.798]  -> wl_registry#2.bind(36, "wl_fixes", 1, new id [unknown]#4)
+[  62154.809] wl_registry#2.global(37, "zcosmic_keyboard_layout_manager_v1", 1)
+[  62154.819] wl_registry#2.global(38, "ext_background_effect_manager_v1", 1)
+[  62154.829] wl_registry#2.global(39, "ext_idle_notifier_v1", 2)
+[  62154.840] wl_registry#2.global(40, "zwp_idle_inhibit_manager_v1", 1)
+[  62154.958] wl_registry#2.global(41, "ext_data_control_manager_v1", 1)
+[  62155.302] wl_registry#2.global(42, "zwlr_data_control_manager_v1", 2)
+[  62155.328] wl_registry#2.global(43, "zwlr_layer_shell_v1", 5)
+[  62155.339] wl_registry#2.global(44, "xdg_wm_base", 7)
+[  62155.348] wl_registry#2.global(45, "xdg_activation_v1", 1)
+[  62155.358] wl_registry#2.global(46, "zxdg_exporter_v2", 1)
+[  62155.368] wl_registry#2.global(47, "zxdg_importer_v2", 1)
+[  62155.379] wl_registry#2.global(48, "zcosmic_toplevel_info_v1", 3)
+[  62155.388] wl_registry#2.global(49, "ext_foreign_toplevel_list_v1", 1)
+[  62155.399] wl_registry#2.global(50, "zcosmic_toplevel_manager_v1", 4)
+[  62155.408] wl_registry#2.global(51, "ext_workspace_manager_v1", 1)
+[  62155.418] wl_registry#2.global(52, "zcosmic_workspace_manager_v2", 2)
+[  62155.428] wl_registry#2.global(53, "cosmic_a11y_manager_v1", 2)
+[  62155.439] wl_registry#2.global(54, "zwp_relative_pointer_manager_v1", 1)
+[  62155.449] wl_registry#2.global(55, "wl_output", 4)
+[  62155.459] wl_registry#2.global(56, "wl_seat", 9)
+[  62155.470] wl_callback#3.done(0)
+[  62156.178]  -> wl_registry#2.bind(1, "wl_compositor", 5, new id [unknown]#3)
+[  62156.278]  -> wl_registry#2.bind(2, "wl_subcompositor", 1, new id [unknown]#5)
+[  62156.289]  -> wl_registry#2.bind(55, "wl_output", 4, new id [unknown]#6)
+[  62156.299]  -> wl_registry#2.bind(7, "zxdg_output_manager_v1", 3, new id [unknown]#7)
+[  62156.485]  -> zxdg_output_manager_v1#7.get_xdg_output(new id zxdg_output_v1#8, wl_output#6)
+[  62156.542]  -> wl_registry#2.bind(56, "wl_seat", 9, new id [unknown]#9)
+[  62156.669]  -> wl_registry#2.bind(5, "wp_fractional_scale_manager_v1", 1, new id [unknown]#10)
+[  62156.680]  -> wl_registry#2.bind(20, "wp_viewporter", 1, new id [unknown]#11)
+[  62156.690]  -> wl_registry#2.bind(18, "wl_shm", 1, new id [unknown]#12)
+[  62156.735]  -> wl_shm#12.create_pool(new id wl_shm_pool#13, fd 6, 2)
+[  62156.752]  -> wl_registry#2.bind(44, "xdg_wm_base", 6, new id [unknown]#14)
+[  62156.763]  -> wl_registry#2.bind(22, "zxdg_decoration_manager_v1", 1, new id [unknown]#15)
+[  62156.773]  -> wl_registry#2.bind(45, "xdg_activation_v1", 1, new id [unknown]#16)
+[  62156.784]  -> wl_registry#2.bind(38, "ext_background_effect_manager_v1", 1, new id [unknown]#17)
+[  62156.796]  -> wl_registry#2.bind(32, "zwp_text_input_manager_v3", 1, new id [unknown]#18)
+[  62156.807]  -> wl_registry#2.bind(54, "zwp_relative_pointer_manager_v1", 1, new id [unknown]#19)
+[  62157.000]  -> wl_registry#2.bind(29, "zwp_tablet_manager_v2", 1, new id [unknown]#20)
+[  62157.012]  -> wl_registry#2.bind(26, "zwp_pointer_constraints_v1", 1, new id [unknown]#21)
+[  62157.023]  -> wl_registry#2.bind(28, "zwp_pointer_gestures_v1", 1, new id [unknown]#22)
+[  62157.033]  -> wl_display#1.sync(new id wl_callback#23)
+[  62158.785] {Display Queue} wl_display#1.delete_id(23)
+[  62158.797] wl_output#6.geometry(0, 0, 320, 200, 0, "Unknown", "Unknown", 0)
+[  62158.807] wl_output#6.mode(3, 1280, 800, 60000)
+[  62158.818] wl_output#6.name("HDMI-A-1")
+[  62158.828] wl_output#6.description("Unknown - Unknown - HDMI-A-1")
+[  62158.837] wl_output#6.scale(1)
+[  62158.853] wl_output#6.done()
+[  62158.862] zxdg_output_v1#8.logical_position(0, 0)
+[  62158.872] zxdg_output_v1#8.logical_size(1280, 800)
+[  62158.883] zxdg_output_v1#8.name("HDMI-A-1")
+[  62158.898] zxdg_output_v1#8.description("Unknown - Unknown - HDMI-A-1")
+[  62158.909] wl_output#6.done()
+[  62159.283] wl_seat#9.name("seat-0")
+[  62159.298] wl_seat#9.capabilities(7)
+[  62159.309] wl_shm#12.format(875708993)
+[  62159.323] wl_shm#12.format(0)
+[  62159.334] wl_shm#12.format(875709016)
+[  62159.347] wl_shm#12.format(1)
+[  62159.375] ext_background_effect_manager_v1#17.capabilities(1)
+[  62159.388] wl_callback#23.done(0)
+[  62159.569]  -> wl_seat#9.get_keyboard(new id wl_keyboard#23)
+xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+[  62161.089]  -> zwp_text_input_manager_v3#18.get_text_input(new id zwp_text_input_v3#24, wl_seat#9)
+[  62161.101]  -> zwp_tablet_manager_v2#20.get_tablet_seat(new id zwp_tablet_seat_v2#25, wl_seat#9)
+[  62161.222]  -> wl_compositor#3.create_surface(new id wl_surface#26)
+[  62161.343]  -> wp_viewporter#11.get_viewport(new id wp_viewport#27, wl_surface#26)
+[  62161.457]  -> wl_seat#9.get_pointer(new id wl_pointer#28)
+[  62161.792]  -> wl_registry#2.bind(19, "wp_cursor_shape_manager_v1", 2, new id [unknown]#29)
+[  62161.951]  -> wp_cursor_shape_manager_v1#29.get_pointer(new id wp_cursor_shape_device_v1#30, wl_pointer#28)
+[  62162.000]  -> zwp_relative_pointer_manager_v1#19.get_relative_pointer(new id zwp_relative_pointer_v1#31, wl_pointer#28)
+[  62162.011]  -> zwp_pointer_gestures_v1#22.get_pinch_gesture(new id zwp_pointer_gesture_pinch_v1#32, wl_pointer#28)
+[  62162.024]  -> wl_seat#9.get_touch(new id wl_touch#33)
+  [33m WARN[0m  [33mFailed to detect service manager: Could not detect a running service manager. Checked for: systemd (/run/systemd/system). None of these service managers appear to be running on this system.. Service management features will not be available.[0m
+    [2;3mat[0m cosmic-settings/src/service_manager.rs:345 [2;3mon[0m main
+
+  [33m WARN[0m  [33mUsing no-op service manager for 'bluetooth'. Service status will always report as enabled/active, but operations will not actually execute.[0m
+    [2;3mat[0m cosmic-settings/src/service_manager.rs:349 [2;3mon[0m main
+
+  [31mERROR[0m  [31mFailed to read config 'accessibility_zoom', [1;31merr[0m[31m: GetKey("accessibility_zoom", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/accessibility/magnifier.rs:55 [2;3mon[0m main
+
+  [31mERROR[0m  [31mshortcuts custom config error: GetKey("custom", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m /Users/forain/.cargo/git/checkouts/cosmic-settings-daemon-8c237d6ae6a8c1ec/1af414f/config/src/shortcuts/mod.rs:43 [2;3mon[0m main
+
+  [33m WARN[0m  [33mError while loading theme: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/appearance/theme_manager.rs:52 [2;3mon[0m main
+
+  [33m WARN[0m  [33mError while loading theme: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/appearance/theme_manager.rs:52 [2;3mon[0m main
+
+  [31mERROR[0m  [31m1:1: Expected identifier[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/appearance/theme_manager.rs:62 [2;3mon[0m main
+
+  [31mERROR[0m  [31mFailed to load Panel system config., [1;31merr[0m[31m: GetKey("padding_overlap", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/panel/mod.rs:91 [2;3mon[0m main
+
+  [31mERROR[0m  [31mError when loading Panel container config., [1;31merr[0m[31m: GetKey("padding_overlap", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/panel/inner.rs:68 [2;3mon[0m main
+
+  [31mERROR[0m  [31mError when loading Panel container config., [1;31merr[0m[31m: GetKey("padding_overlap", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/panel/inner.rs:68 [2;3mon[0m main
+
+  [31mERROR[0m  [31mFailed to load Dock system config., [1;31merr[0m[31m: GetKey("padding_overlap", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/dock/mod.rs:135 [2;3mon[0m main
+
+  [31mERROR[0m  [31mError when loading Panel container config., [1;31merr[0m[31m: GetKey("padding_overlap", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/panel/inner.rs:68 [2;3mon[0m main
+
+  [31mERROR[0m  [31mError when loading Panel container config., [1;31merr[0m[31m: GetKey("padding_overlap", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/panel/inner.rs:68 [2;3mon[0m main
+
+  [31mERROR[0m  [31mFailed to read config 'focus_follows_cursor', [1;31merr[0m[31m: GetKey("focus_follows_cursor", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/window_management.rs:49 [2;3mon[0m main
+
+  [31mERROR[0m  [31mFailed to read config 'cursor_follows_focus', [1;31merr[0m[31m: GetKey("cursor_follows_focus", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/window_management.rs:57 [2;3mon[0m main
+
+  [31mERROR[0m  [31mFailed to read config 'focus_follows_cursor_delay', [1;31merr[0m[31m: GetKey("focus_follows_cursor_delay", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/window_management.rs:66 [2;3mon[0m main
+
+  [31mERROR[0m  [31mFailed to read config 'active_hint', [1;31merr[0m[31m: GetKey("active_hint", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/window_management.rs:75 [2;3mon[0m main
+
+  [31mERROR[0m  [31mFailed to read config 'edge_snap_threshold', [1;31merr[0m[31m: GetKey("edge_snap_threshold", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/window_management.rs:84 [2;3mon[0m main
+
+  [31mERROR[0m  [31mshortcuts custom config error: GetKey("custom", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m /Users/forain/.cargo/git/checkouts/cosmic-settings-daemon-8c237d6ae6a8c1ec/1af414f/config/src/shortcuts/mod.rs:43 [2;3mon[0m main
+
+  [31mERROR[0m  [31mFailed to read config 'workspaces', [1;31merr[0m[31m: GetKey("workspaces", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/desktop/workspaces.rs:40 [2;3mon[0m main
+
+  [31mERROR[0m  [31mFailed to read config 'input_default', [1;31mwhy[0m[31m: GetKey("input_default", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/input/mod.rs:51 [2;3mon[0m main
+
+  [31mERROR[0m  [31mFailed to read config 'descale_xwayland', [1;31merr[0m[31m: GetKey("descale_xwayland", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/applications/legacy_applications.rs:53 [2;3mon[0m main
+
+  [31mERROR[0m  [31mFailed to read config 'xwayland_eavesdropping', [1;31merr[0m[31m: GetKey("xwayland_eavesdropping", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m cosmic-settings/src/pages/applications/legacy_applications.rs:62 [2;3mon[0m main
+
+  [31mERROR[0m  [31merror loading system dark theme, [1;31merror[0m[31m: GetKey("list_button", Os { code: 2, kind: NotFound, message: "No such file or directory" })[0m
+    [2;3mat[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/src/theme/mod.rs:95 [2;3mon[0m main
+
+  [32m INFO[0m  [32mSystem theme: None[0m
+    [2;3mat[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/iced/winit/src/lib.rs:843 [2;3mon[0m main
+
+[  66300.901]  -> wl_display#1.get_registry(new id wl_registry#34)
+  [32m INFO[0m  [32mWindow attributes for id `Id(
+    1,
+)`: WindowAttributes {
+    surface_size: Some(
+        Logical(
+            LogicalSize {
+                width: 1024.0,
+                height: 768.0,
+            },
+        ),
+    ),
+    min_surface_size: Some(
+        Logical(
+            LogicalSize {
+                width: 360.0,
+                height: 300.0,
+            },
+        ),
+    ),
+    max_surface_size: None,
+    surface_resize_increments: None,
+    position: None,
+    resizable: true,
+    enabled_buttons: WindowButtons(
+        CLOSE | MINIMIZE | MAXIMIZE,
+    ),
+    title: "",
+    maximized: false,
+    visible: false,
+    transparent: true,
+    blur: false,
+    decorations: false,
+    window_icon: None,
+    preferred_theme: None,
+    content_protected: false,
+    window_level: Normal,
+    active: true,
+    cursor: Icon(
+        Default,
+    ),
+    parent_window: None,
+    fullscreen: None,
+    platform: Some(
+        WindowAttributesWayland {
+            name: Some(
+                ApplicationName {
+                    general: "com.system76.CosmicSettings",
+                    instance: "com.system76.CosmicSettings",
+                },
+            ),
+            activation_token: None,
+            prefer_csd: false,
+        },
+    ),
+}[0m
+    [2;3mat[0m /Users/forain/.cargo/git/checkouts/libcosmic-41009aea1d72760b/96a8204/iced/winit/src/lib.rs:433 [2;3mon[0m main
+
+[  66301.617]  -> wl_display#1.sync(new id wl_callback#35)
+[  66303.368] {Display Queue} wl_display#1.delete_id(35)
+[  66303.496] wl_registry#34.global(1, "wl_compositor", 5)
+[  66303.758] wl_registry#34.global(2, "wl_subcompositor", 1)
+[  66303.884] wl_registry#34.global(3, "cosmic_corner_radius_manager_v1", 2)
+[  66304.005] wl_registry#34.global(4, "wl_data_device_manager", 3)
+[  66304.126] wl_registry#34.global(5, "wp_fractional_scale_manager_v1", 1)
+[  66304.245] wl_registry#34.global(6, "zwp_keyboard_shortcuts_inhibit_manager_v1", 1)
+[  66304.363] wl_registry#34.global(7, "zxdg_output_manager_v1", 3)
+[  66304.481] wl_registry#34.global(8, "zwlr_output_manager_v1", 4)
+[  66304.595] wl_registry#34.global(9, "zcosmic_output_manager_v1", 3)
+[  66304.710] wl_registry#34.global(10, "zwlr_output_power_manager_v1", 1)
+[  66304.831] wl_registry#34.global(11, "zcosmic_overlap_notify_v1", 1)
+[  66304.949] wl_registry#34.global(12, "wp_presentation", 2)
+[  66305.064] wl_registry#34.global(13, "zwp_primary_selection_device_manager_v1", 1)
+[  66305.392] wl_registry#34.global(14, "zcosmic_workspace_image_capture_source_manager_v1", 1)
+[  66305.430] wl_registry#34.global(15, "ext_output_image_capture_source_manager_v1", 1)
+[  66305.443] wl_registry#34.global(16, "ext_foreign_toplevel_image_capture_source_manager_v1", 1)
+[  66305.457] wl_registry#34.global(17, "ext_image_copy_capture_manager_v1", 1)
+[  66305.470] wl_registry#34.global(18, "wl_shm", 2)
+[  66305.482] wl_registry#34.global(19, "wp_cursor_shape_manager_v1", 2)
+[  66305.497] wl_registry#34.global(20, "wp_viewporter", 1)
+[  66305.510] wl_registry#34.global(21, "org_kde_kwin_server_decoration_manager", 1)
+[  66305.522] wl_registry#34.global(22, "zxdg_decoration_manager_v1", 1)
+[  66305.546] wl_registry#34.global(23, "ext_session_lock_manager_v1", 1)
+[  66305.558] wl_registry#34.global(26, "zwp_pointer_constraints_v1", 1)
+[  66305.572] wl_registry#34.global(27, "wp_pointer_warp_v1", 1)
+[  66305.584] wl_registry#34.global(28, "zwp_pointer_gestures_v1", 3)
+[  66305.598] wl_registry#34.global(29, "zwp_tablet_manager_v2", 1)
+[  66305.610] wl_registry#34.global(30, "wp_security_context_manager_v1", 1)
+[  66305.627] wl_registry#34.global(31, "zwp_input_method_manager_v2", 1)
+[  66305.808] wl_registry#34.global(32, "zwp_text_input_manager_v3", 1)
+[  66305.822] wl_registry#34.global(33, "zwp_virtual_keyboard_manager_v1", 1)
+[  66305.835] wl_registry#34.global(34, "wp_alpha_modifier_v1", 1)
+[  66306.792] wl_registry#34.global(35, "wp_single_pixel_buffer_manager_v1", 1)
+[  66306.805] wl_registry#34.global(36, "wl_fixes", 1)
+[  66306.921]  -> wl_registry#34.bind(36, "wl_fixes", 1, new id [unknown]#36)
+[  66307.008] wl_registry#34.global(37, "zcosmic_keyboard_layout_manager_v1", 1)
+[  66307.019] wl_registry#34.global(38, "ext_background_effect_manager_v1", 1)
+[  66307.035] wl_registry#34.global(39, "ext_idle_notifier_v1", 2)
+[  66307.051] wl_registry#34.global(40, "zwp_idle_inhibit_manager_v1", 1)
+[  66307.067] wl_registry#34.global(41, "ext_data_control_manager_v1", 1)
+[  66307.080] wl_registry#34.global(42, "zwlr_data_control_manager_v1", 2)
+[  66307.092] wl_registry#34.global(43, "zwlr_layer_shell_v1", 5)
+[  66307.104] wl_registry#34.global(44, "xdg_wm_base", 7)
+[  66307.230] wl_registry#34.global(45, "xdg_activation_v1", 1)
+[  66307.347] wl_registry#34.global(46, "zxdg_exporter_v2", 1)
+[  66307.669] wl_registry#34.global(47, "zxdg_importer_v2", 1)
+[  66307.699] wl_registry#34.global(48, "zcosmic_toplevel_info_v1", 3)
+[  66307.717] wl_registry#34.global(49, "ext_foreign_toplevel_list_v1", 1)
+[  66307.730] wl_registry#34.global(50, "zcosmic_toplevel_manager_v1", 4)
+[  66307.742] wl_registry#34.global(51, "ext_workspace_manager_v1", 1)
+[  66307.756] wl_registry#34.global(52, "zcosmic_workspace_manager_v2", 2)
+[  66307.770] wl_registry#34.global(53, "cosmic_a11y_manager_v1", 2)
+[  66307.788] wl_registry#34.global(54, "zwp_relative_pointer_manager_v1", 1)
+[  66307.801] wl_registry#34.global(55, "wl_output", 4)
+[  66307.823] wl_registry#34.global(56, "wl_seat", 9)
+[  66307.841] wl_callback#35.done(0)
+[  66307.994]  -> wl_registry#34.bind(5, "wp_fractional_scale_manager_v1", 1, new id [unknown]#35)
+[  66308.052]  -> wl_registry#34.bind(20, "wp_viewporter", 1, new id [unknown]#37)
+[  66308.121]  -> wl_registry#34.bind(56, "wl_seat", 9, new id [unknown]#38)
+[  66308.302]  -> wl_registry#34.bind(55, "wl_output", 4, new id [unknown]#39)
+[  66308.333]  -> wl_registry#34.bind(7, "zxdg_output_manager_v1", 3, new id [unknown]#40)
+[  66308.556]  -> zxdg_output_manager_v1#40.get_xdg_output(new id zxdg_output_v1#41, wl_output#39)
+[  66308.618]  -> wl_registry#34.bind(1, "wl_compositor", 5, new id [unknown]#42)
+[  66308.642]  -> wl_registry#34.bind(18, "wl_shm", 1, new id [unknown]#43)
+[  66309.999]  -> wl_registry#34.bind(44, "xdg_wm_base", 6, new id [unknown]#44)
+[  66309.999]  -> wl_registry#34.bind(22, "zxdg_decoration_manager_v1", 1, new id [unknown]#45)
+[  66309.999]  -> wl_compositor#3.create_surface(new id wl_surface#46)
+[  66309.999]  -> xdg_wm_base#14.get_xdg_surface(new id xdg_surface#47, wl_surface#46)
+[  66309.999]  -> xdg_surface#47.get_toplevel(new id xdg_toplevel#48)
+[  66310.002]  -> zxdg_decoration_manager_v1#15.get_toplevel_decoration(new id zxdg_toplevel_decoration_v1#49, xdg_toplevel#48)
+[  66310.036]  -> zxdg_toplevel_decoration_v1#49.set_mode(1)
+[  66310.585]  -> wp_viewporter#11.get_viewport(new id wp_viewport#50, wl_surface#46)
+[  66311.007]  -> wp_fractional_scale_manager_v1#10.get_fractional_scale(new id wp_fractional_scale_v1#51, wl_surface#46)
+  [33m WARN[0m  [33m`xdg_toplevel_icon_manager_v1` is not supported[0m
+    [2;3mat[0m /Users/forain/.cargo/git/checkouts/winit-d03127a0b2faf55d/71ce08c/winit-wayland/src/window/state.rs:1134 [2;3mon[0m main
+
+[  66312.906]  -> wl_surface#46.set_opaque_region(nil)
+[  66312.928]  -> xdg_toplevel#48.set_app_id("com.system76.CosmicSettings")
+[  66313.416]  -> xdg_toplevel#48.set_title("")
+[  66314.383]  -> xdg_toplevel#48.set_min_size(360, 300)
+[  66315.347]  -> xdg_toplevel#48.set_max_size(0, 0)
+[  66316.305]  -> wl_surface#46.commit()
+[  66316.934]  -> wl_display#1.sync(new id wl_callback#52)
+[  66317.911] wl_keyboard#23.keymap(1, fd 12, 65528)
+[  66318.878] wl_keyboard#23.repeat_info(25, 600)
+[  66320.010]  -> wl_registry#34.bind(43, "zwlr_layer_shell_v1", 4, new id [unknown]#53)
+[  66320.083]  -> wl_registry#34.bind(45, "xdg_activation_v1", 1, new id [unknown]#54)
+[  66320.157]  -> wl_registry#34.bind(23, "ext_session_lock_manager_v1", 1, new id [unknown]#55)
+[  66320.254]  -> wl_registry#34.bind(11, "zcosmic_overlap_notify_v1", 1, new id [unknown]#56)
+[  66320.376]  -> wl_registry#34.bind(49, "ext_foreign_t
+M15B: ==== END fix-head ====
+M15B: ==== BEGIN fix-tail ====
+ale_v1#51.preferred_scale(120)
+[  66350.182] zxdg_toplevel_decoration_v1#49.configure(1)
+[  66350.322] xdg_toplevel#48.configure_bounds(0, 0)
+[  66350.478] xdg_toplevel#48.wm_capabilities(array[16])
+[  66350.846] xdg_toplevel#48.configure(0, 0, array[0])
+[  66350.892] xdg_surface#47.configure(13)
+[  66350.918]  -> wl_registry#34.bind(19, "wp_cursor_shape_manager_v1", 2, new id [unknown]#73)
+[  66350.960] wl_callback#52.done(0)
+[  66350.997]  -> wp_cursor_shape_manager_v1#73.get_pointer(new id wp_cursor_shape_device_v1#52, wl_pointer#72)
+[  66351.037]  -> wl_seat#38.get_touch(new id wl_touch#74)
+[  66351.069]  -> xdg_surface#47.ack_configure(13)
+[  66352.950] wl_keyboard#69.keymap(1, fd 21, 65528)
+[  66352.962] wl_keyboard#69.repeat_info(25, 600)
+[  66355.321]  -> wl_shm#12.create_pool(new id wl_shm_pool#75, fd 15, 1)
+[  66355.340]  -> wl_compositor#3.create_surface(new id wl_surface#76)
+[  66355.357]  -> wl_subcompositor#5.get_subsurface(new id wl_subsurface#77, wl_surface#76, wl_surface#46)
+[  66355.368]  -> wl_subsurface#77.set_sync()
+[  66355.378]  -> wl_compositor#3.create_surface(new id wl_surface#78)
+[  66355.389]  -> wl_subcompositor#5.get_subsurface(new id wl_subsurface#79, wl_surface#78, wl_surface#46)
+[  66355.400]  -> wl_subsurface#79.set_sync()
+[  66355.607]  -> wl_compositor#3.create_surface(new id wl_surface#80)
+[  66355.617]  -> wl_subcompositor#5.get_subsurface(new id wl_subsurface#81, wl_surface#80, wl_surface#46)
+[  66355.628]  -> wl_subsurface#81.set_sync()
+[  66355.641]  -> wl_compositor#3.create_surface(new id wl_surface#82)
+[  66355.651]  -> wl_subcompositor#5.get_subsurface(new id wl_subsurface#83, wl_surface#82, wl_surface#46)
+[  66355.661]  -> wl_subsurface#83.set_sync()
+[  66355.678]  -> wl_compositor#3.create_surface(new id wl_surface#84)
+[  66355.806]  -> wl_subcompositor#5.get_subsurface(new id wl_subsurface#85, wl_surface#84, wl_surface#46)
+[  66355.921]  -> wl_subsurface#85.set_sync()
+[  66368.182]  -> wl_subsurface#77.destroy()
+[  66368.331]  -> wl_surface#76.destroy()
+[  66368.457]  -> wl_subsurface#79.destroy()
+[  66368.571]  -> wl_surface#78.destroy()
+[  66368.685]  -> wl_subsurface#81.destroy()
+[  66368.801]  -> wl_surface#80.destroy()
+[  66368.924]  -> wl_subsurface#83.destroy()
+[  66369.249]  -> wl_surface#82.destroy()
+[  66369.276]  -> wl_subsurface#85.destroy()
+[  66369.288]  -> wl_surface#84.destroy()
+[  66369.304]  -> wl_surface#46.set_opaque_region(nil)
+[  66369.316]  -> xdg_surface#47.set_window_geometry(0, 0, 1024, 768)
+[  66369.362]  -> wp_viewport#50.set_destination(1024, 768)
+[  66372.879] {Display Queue} wl_display#1.delete_id(77)
+[  66372.944] {Display Queue} wl_display#1.delete_id(76)
+[  66372.975] {Display Queue} wl_display#1.delete_id(79)
+[  66373.006] {Display Queue} wl_display#1.delete_id(78)
+[  66373.094] {Display Queue} wl_display#1.delete_id(81)
+[  66373.207] {Display Queue} wl_display#1.delete_id(80)
+[  66373.260] {Display Queue} wl_display#1.delete_id(83)
+[  66373.330] {Display Queue} wl_display#1.delete_id(82)
+[  66373.355] {Display Queue} wl_display#1.delete_id(85)
+[  66373.403] {Display Queue} wl_display#1.delete_id(84)
+[  66381.288]  -> wl_display#1.get_registry(new id wl_registry#84)
+[  66381.437]  -> wl_display#1.sync(new id wl_callback#85)
+[  66383.347] {Display Queue} wl_display#1.delete_id(85)
+[  66383.486] wl_registry#84.global(1, "wl_compositor", 5)
+[  66383.627] wl_registry#84.global(2, "wl_subcompositor", 1)
+[  66383.745] wl_registry#84.global(3, "cosmic_corner_radius_manager_v1", 2)
+[  66384.691] wl_registry#84.global(4, "wl_data_device_manager", 3)
+[  66384.844] wl_registry#84.global(5, "wp_fractional_scale_manager_v1", 1)
+[  66384.991] wl_registry#84.global(6, "zwp_keyboard_shortcuts_inhibit_manager_v1", 1)
+[  66385.146] wl_registry#84.global(7, "zxdg_output_manager_v1", 3)
+[  66385.286] wl_registry#84.global(8, "zwlr_output_manager_v1", 4)
+[  66385.426] wl_registry#84.global(9, "zcosmic_output_manager_v1", 3)
+[  66385.614] wl_registry#84.global(10, "zwlr_output_power_manager_v1", 1)
+[  66385.749] wl_registry#84.global(11, "zcosmic_overlap_notify_v1", 1)
+[  66386.111] wl_registry#84.global(12, "wp_presentation", 2)
+[  66386.162] wl_registry#84.global(13, "zwp_primary_selection_device_manager_v1", 1)
+[  66386.187] wl_registry#84.global(14, "zcosmic_workspace_image_capture_source_manager_v1", 1)
+[  66386.217] wl_registry#84.global(15, "ext_output_image_capture_source_manager_v1", 1)
+[  66386.245] wl_registry#84.global(16, "ext_foreign_toplevel_image_capture_source_manager_v1", 1)
+[  66386.275] wl_registry#84.global(17, "ext_image_copy_capture_manager_v1", 1)
+[  66386.312] wl_registry#84.global(18, "wl_shm", 2)
+[  66386.323] wl_registry#84.global(19, "wp_cursor_shape_manager_v1", 2)
+[  66386.334] wl_registry#84.global(20, "wp_viewporter", 1)
+[  66386.347] wl_registry#84.global(21, "org_kde_kwin_server_decoration_manager", 1)
+[  66386.357] wl_registry#84.global(22, "zxdg_decoration_manager_v1", 1)
+[  66386.367] wl_registry#84.global(23, "ext_session_lock_manager_v1", 1)
+[  66386.377] wl_registry#84.global(26, "zwp_pointer_constraints_v1", 1)
+[  66386.391] wl_registry#84.global(27, "wp_pointer_warp_v1", 1)
+[  66386.402] wl_registry#84.global(28, "zwp_pointer_gestures_v1", 3)
+[  66386.415] wl_registry#84.global(29, "zwp_tablet_manager_v2", 1)
+[  66386.613] wl_registry#84.global(30, "wp_security_context_manager_v1", 1)
+[  66386.624] wl_registry#84.global(31, "zwp_input_method_manager_v2", 1)
+[  66386.634] wl_registry#84.global(32, "zwp_text_input_manager_v3", 1)
+[  66386.646] wl_registry#84.global(33, "zwp_virtual_keyboard_manager_v1", 1)
+[  66386.658] wl_registry#84.global(34, "wp_alpha_modifier_v1", 1)
+[  66386.670] wl_registry#84.global(35, "wp_single_pixel_buffer_manager_v1", 1)
+[  66386.688] wl_registry#84.global(36, "wl_fixes", 1)
+[  66386.701]  -> wl_registry#84.bind(36, "wl_fixes", 1, new id [unknown]#82)
+[  66386.879] wl_registry#84.global(37, "zcosmic_keyboard_layout_manager_v1", 1)
+[  66387.004] wl_registry#84.global(38, "ext_background_effect_manager_v1", 1)
+[  66387.118] wl_registry#84.global(39, "ext_idle_notifier_v1", 2)
+[  66387.232] wl_registry#84.global(40, "zwp_idle_inhibit_manager_v1", 1)
+[  66387.347] wl_registry#84.global(41, "ext_data_control_manager_v1", 1)
+[  66387.460] wl_registry#84.global(42, "zwlr_data_control_manager_v1", 2)
+[  66387.577] wl_registry#84.global(43, "zwlr_layer_shell_v1", 5)
+[  66387.695] wl_registry#84.global(44, "xdg_wm_base", 7)
+[  66388.027] wl_registry#84.global(45, "xdg_activation_v1", 1)
+[  66388.052] wl_registry#84.global(46, "zxdg_exporter_v2", 1)
+[  66388.062] wl_registry#84.global(47, "zxdg_importer_v2", 1)
+[  66388.073] wl_registry#84.global(48, "zcosmic_toplevel_info_v1", 3)
+[  66388.083] wl_registry#84.global(49, "ext_foreign_toplevel_list_v1", 1)
+[  66388.095] wl_registry#84.global(50, "zcosmic_toplevel_manager_v1", 4)
+[  66388.107] wl_registry#84.global(51, "ext_workspace_manager_v1", 1)
+[  66388.116] wl_registry#84.global(52, "zcosmic_workspace_manager_v2", 2)
+[  66388.126] wl_registry#84.global(53, "cosmic_a11y_manager_v1", 2)
+[  66388.135] wl_registry#84.global(54, "zwp_relative_pointer_manager_v1", 1)
+[  66388.146] wl_registry#84.global(55, "wl_output", 4)
+[  66388.162] wl_registry#84.global(56, "wl_seat", 9)
+[  66388.172] wl_callback#85.done(0)
+[  66388.242]  -> wl_registry#84.bind(18, "wl_shm", 1, new id [unknown]#85)
+[  67852.624]  -> xdg_toplevel#48.set_title("Desktop - COSMIC Settings")
+[  67863.532]  -> cosmic_corner_radius_manager_v1#59.get_corner_radius_surface(new id cosmic_corner_radius_toplevel_v1#90, xdg_surface#47)
+[  67863.779]  -> cosmic_corner_radius_toplevel_v1#90.set_radius(12, 12, 12, 12)
+[  67888.802]  -> wl_shm#85.create_pool(new id wl_shm_pool#95, fd 21, 4194304)
+[  67888.915]  -> wl_shm_pool#95.create_buffer(new id wl_buffer#96, 0, 1024, 768, 4096, 0)
+[  67890.450]  -> wl_shm#85.create_pool(new id wl_shm_pool#97, fd 23, 4194304)
+[  67890.464]  -> wl_shm_pool#97.create_buffer(new id wl_buffer#98, 0, 1024, 768, 4096, 0)
+[  67899.767]  -> wl_surface#46.frame(new id wl_callback#99)
+[  67899.783] wl_shm#85.format(875708993)
+[  67899.794] wl_shm#85.format(0)
+[  67899.806] wl_shm#85.format(875709016)
+[  67899.816] wl_shm#85.format(1)
+[  67899.829]  -> wl_surface#46.attach(wl_buffer#98, 0, 0)
+[  67899.841]  -> wl_surface#46.damage_buffer(0, 0, 1024, 768)
+[  67899.851]  -> wl_surface#46.commit()
+[  67906.918]  -> wl_surface#46.attach(wl_buffer#96, 0, 0)
+[  67907.117]  -> wl_surface#46.damage_buffer(0, 0, 1024, 768)
+[  67907.391]  -> wl_surface#46.commit()
+[  68723.773] ext_foreign_toplevel_list_v1#57.toplevel(new id ext_foreign_toplevel_handle_v1#4278190080)
+[  68723.794] ext_foreign_toplevel_handle_v1#4278190080.identifier("xcsQTgwR7fkt5N5iNpQkEO9hKZOFGKiZ")
+[  68723.809] ext_foreign_toplevel_handle_v1#4278190080.title("Desktop - COSMIC Settings")
+[  68723.825] ext_foreign_toplevel_handle_v1#4278190080.app_id("com.system76.CosmicSettings")
+[  68723.841] ext_foreign_toplevel_handle_v1#4278190080.done()
+[  68723.856] wl_keyboard#69.enter(15, wl_surface#46, array[0])
+[  68723.870] wl_keyboard#69.modifiers(15, 0, 0, 0, 0)
+[  68723.909]  -> zcosmic_toplevel_info_v1#58.get_cosmic_toplevel(new id zcosmic_toplevel_handle_v1#100, ext_foreign_toplevel_handle_v1#4278190080)
+[  68725.078] xdg_toplevel#48.configure_bounds(1280, 752)
+[  68725.091] xdg_toplevel#48.configure(852, 500, array[16])
+[  68725.106] xdg_surface#47.configure(14)
+[  68725.120] wl_surface#46.enter(wl_output#6)
+[  68725.132] wl_surface#46.enter(wl_output#39)
+[  68725.143] wl_surface#46.enter(wl_output#76)
+[  68725.155] wl_keyboard#23.enter(15, wl_surface#46, array[0])
+[  68725.169] wl_keyboard#23.modifiers(15, 0, 0, 0, 0)
+[  68725.615] xdg_toplevel#48.configure(852, 500, array[20])
+[  68725.628] xdg_surface#47.configure(16)
+[  68725.644]  -> xdg_surface#47.ack_configure(14)
+[  68725.658]  -> wl_surface#46.set_opaque_region(nil)
+[  68725.670]  -> xdg_surface#47.set_window_geometry(0, 0, 852, 500)
+[  68725.886]  -> wp_viewport#50.set_destination(852, 500)
+[  68726.199]  -> xdg_surface#47.ack_configure(16)
+[  68729.484]  -> cosmic_corner_radius_toplevel_v1#90.set_radius(0, 0, 0, 0)
+[  68882.139] ext_foreign_toplevel_handle_v1#4278190080.done()
+[  68882.649] ext_foreign_toplevel_handle_v1#4278190080.done()
+[  68882.859] ext_foreign_toplevel_handle_v1#4278190080.done()
+[  68883.067] ext_foreign_toplevel_handle_v1#4278190080.done()
+[  68883.282] zcosmic_toplevel_handle_v1#100.state(array[4])
+[  68883.570] zcosmic_toplevel_handle_v1#100.output_enter(wl_output#6)
+[  68883.785] zcosmic_toplevel_handle_v1#100.geometry(wl_output#6, 214, 126, 852, 500)
+[  68883.998] zcosmic_toplevel_handle_v1#100.output_enter(wl_output#39)
+[  68884.645] zcosmic_toplevel_handle_v1#100.geometry(wl_output#39, 214, 126, 852, 500)
+[  68884.688] zcosmic_toplevel_handle_v1#100.output_enter(wl_output#76)
+[  68884.700] zcosmic_toplevel_handle_v1#100.geometry(wl_output#76, 214, 126, 852, 500)
+[  68884.713] ext_foreign_toplevel_handle_v1#4278190080.done()
+[  69042.097] zcosmic_toplevel_info_v1#58.done()
+[  70049.276] wl_callback#99.done(70047)
+[  70049.607] wl_buffer#98.release()
+[  70049.620]  -> wl_buffer#98.destroy()
+[  70049.634]  -> wl_shm_pool#97.create_buffer(new id wl_buffer#99, 0, 852, 500, 3408, 0)
+[  70052.678]  -> wl_surface#46.frame(new id wl_callback#101)
+[  70052.700]  -> wl_surface#46.attach(wl_buffer#99, 0, 0)
+[  70052.720]  -> wl_surface#46.damage_buffer(0, 0, 852, 500)
+[  70052.740]  -> wl_surface#46.commit()
+[  70053.626] {Display Queue} wl_display#1.delete_id(98)
+[  71422.747] {Display Queue} wl_display#1.delete_id(101)
+[  71422.776] wl_buffer#96.release()
+[  71423.559]  -> wl_buffer#96.destroy()
+[  71423.591]  -> wl_shm_pool#95.create_buffer(new id wl_buffer#98, 0, 852, 500, 3408, 0)
+[  71426.125]  -> wl_surface#46.attach(wl_buffer#98, 0, 0)
+[  71426.138]  -> wl_surface#46.damage_buffer(0, 0, 852, 500)
+[  71426.150]  -> wl_surface#46.commit()
+[  71426.238] wl_callback#101.done(71421)
+
+M15B: ==== END fix-tail ====
+M15B: DONE
+[?2004h[0m[?25l[48;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h
