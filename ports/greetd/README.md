@@ -183,14 +183,19 @@ Guest RAM made no difference: the screen is byte-identical at `-m 2G` and
 cosmic-greeter has no flag and no environment variable for its role: it runs
 `greeter::main()` when `getpwuid(getuid())` is named `cosmic-greeter` and
 `locker::main()` otherwise (`cosmic-greeter/src/main.rs`). The greeter client is
-still uid 0 here — `/run/user/0`, where cosmic-comp binds `wayland-1`, is
-`0700 root`, and nothing drops privileges yet — so the name is supplied instead
-by `/etc/passwd.greeter`, the same accounts with a uid-0 `cosmic-greeter` entry
-ahead of `root` (musl's `getpwuid` returns the first uid match). Lookups by name
-are unaffected, which is all `/bin/login` uses. `/etc/passwd.system` is the
-pristine file to copy back. This is scaffolding for the first photograph, not
-the shipping arrangement: the real fix is the privilege-dropping launcher plus a
-runtime dir the greeter user can open.
+still uid 0 on the path this README first measured — the name was supplied by
+`/etc/passwd.greeter`, the same accounts with a uid-0 `cosmic-greeter` entry
+ahead of `root` (musl's `getpwuid` returns the first uid match), with
+`/etc/passwd.system` as the undo. That is scaffolding for the first photograph,
+not the shipping arrangement.
+
+**The image now also carries the real account**: `cosmic-greeter:x:990:990`
+with home `/home/cosmic-greeter` and shell `/bin/false`. The uid is below 1000
+because cosmic-greeter's own `UserFilter` defaults to `UID_MIN 1000` with no
+`/etc/login.defs` present, and it would otherwise offer the greeter's own account
+as a login choice; the `/bin/false` shell excludes it a second, independent way.
+Delete `passwd.greeter`/`passwd.system` and the `cp` in the launchers once the
+launcher path has been photographed.
 
 ### Guest files
 

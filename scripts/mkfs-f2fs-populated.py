@@ -334,24 +334,46 @@ def main():
 
     # /etc/passwd and /etc/group — musl's getpwuid/getgrgid (used by brush via
     # the uzers crate) read these; /bin/login also parses passwd directly.
+    # cosmic-greeter is a real system account, not decoration. The greeter
+    # binary has no flag and no environment variable that selects its role: it
+    # runs greeter::main() only when getpwuid(getuid()) comes back named
+    # "cosmic-greeter", and locker::main() for every other name
+    # (cosmic-greeter/src/main.rs). So the account IS the role selector, and
+    # /bin/greeter-launch exists to become it.
+    #
+    # The uid must be BELOW 1000. cosmic-greeter's own UserFilter defaults to
+    # UID_MIN 1000 / UID_MAX 65000 when there is no /etc/login.defs — and there
+    # is none here — and it offers every account inside that window as a login
+    # choice. A greeter at uid >= 1000 would list itself on its own login
+    # screen. 990 sits in the conventional system band (1..999), clear of 0 and
+    # far enough below 1000 to leave room for hand-assigned low ids.
+    #
+    # The shell is /bin/false for the same reason twice over: UserFilter also
+    # skips any account whose shell file name is "false" or "nologin", so the
+    # account stays off the login list even if UID_MIN is ever raised. Nothing
+    # executes it — greeter-launch execve()s the greeter directly.
     passwd_bytes = (
         b"root:x:0:0:root:/root:/bin/brush\n"
+        b"cosmic-greeter:x:990:990:COSMIC Greeter:/home/cosmic-greeter:/bin/false\n"
         b"leandro:x:1000:1000:leandro:/home/leandro:/bin/brush\n"
     )
     etc_files.append(("passwd", passwd_bytes, 0o100644))
     # Two alternate passwd files for greeter bring-up, neither of them in use
     # until something copies one over /etc/passwd.
     #
-    # cosmic-greeter has no flag and no environment variable for its role: it
-    # runs greeter::main() when getpwuid(getuid()) is named "cosmic-greeter" and
-    # locker::main() otherwise (cosmic-greeter/src/main.rs). Until the greeter
-    # client drops privileges — it cannot yet, /run/user/0 where cosmic-comp
-    # binds wayland-1 is 0700 root — the only way to reach the greeter role is
-    # to make that name answer for uid 0, which passwd.greeter does by putting a
-    # uid-0 "cosmic-greeter" entry ahead of root (musl's getpwuid returns the
-    # first uid match). Lookups by NAME are unaffected, which is all /bin/login
-    # does. passwd.system is the pristine file to copy back afterwards; the root
-    # filesystem is writable and persists across boots.
+    # These are the BRING-UP SCAFFOLD, superseded by the real cosmic-greeter
+    # account above and by /bin/greeter-launch. passwd.greeter reaches the
+    # greeter role without dropping privileges, by putting a second, uid-0
+    # "cosmic-greeter" entry ahead of root so getpwuid(0) answers with that name
+    # (musl returns the first uid match). Lookups by NAME are unaffected, which
+    # is all /bin/login does; passwd.system is the pristine file to copy back
+    # afterwards, and the copy persists because the root filesystem is writable.
+    #
+    # The cost of the scaffold is why it is scaffolding: getpwuid(0) answers
+    # "cosmic-greeter" for EVERY caller in the image, not just the greeter, and
+    # it needs a file copied over /etc/passwd at boot and undone by hand. Delete
+    # both files, and the passwd-greeter data file, once the launcher has been
+    # photographed reaching the login screen at uid 990.
     _pw_greeter = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "..", "ports", "greetd", "data", "passwd-greeter")
     if os.path.exists(_pw_greeter):
@@ -360,6 +382,7 @@ def main():
         etc_files.append(("passwd.system", passwd_bytes, 0o100644))
     etc_files.append(("group", (
         b"root:x:0:\n"
+        b"cosmic-greeter:x:990:\n"
         b"leandro:x:1000:\n"
     ), 0o100644))
 
@@ -1230,6 +1253,16 @@ def main():
         21: ("/root/.config"),
         22: ("/root/.cache"),
         23: ("/root/.local"),
+        # The cosmic-greeter account's home and XDG base dirs. Pre-created for
+        # exactly the reason /root's are: cosmic-config create_dir_all()s under
+        # $XDG_CONFIG_HOME at startup (CosmicGreeterConfig::load goes through
+        # it), and this f2fs does not reliably materialise several new levels in
+        # one runtime mkdir. Owned by the greeter so the account can write them
+        # after /bin/greeter-launch has dropped to it.
+        24: ("/home/cosmic-greeter"),
+        25: ("/home/cosmic-greeter/.config"),
+        26: ("/home/cosmic-greeter/.cache"),
+        27: ("/home/cosmic-greeter/.local"),
     }
 
     # Per-directory mode/owner overrides; anything not listed here defaults
@@ -1242,6 +1275,10 @@ def main():
         21: (0o040700, 0, 0),        # /root/.config
         22: (0o040700, 0, 0),        # /root/.cache
         23: (0o040700, 0, 0),        # /root/.local
+        24: (0o040700, 990, 990),    # /home/cosmic-greeter
+        25: (0o040700, 990, 990),    # /home/cosmic-greeter/.config
+        26: (0o040700, 990, 990),    # /home/cosmic-greeter/.cache
+        27: (0o040700, 990, 990),    # /home/cosmic-greeter/.local
     }
 
     # Subdirectories per parent, used both to emit "name -> child_ino" dentries
@@ -1252,7 +1289,8 @@ def main():
             ("etc", 9), ("mnt", 10), ("lib", 11), ("root", 12), ("home", 13),
             ("usr", 15), ("run", 18)],
         12: [(".config", 21), (".cache", 22), (".local", 23)],
-        13: [("leandro", 14)],
+        13: [("leandro", 14), ("cosmic-greeter", 24)],
+        24: [(".config", 25), (".cache", 26), (".local", 27)],
         15: [("lib", 16)],
         16: [("gbm", 17)],
         18: [("user", 19)],
