@@ -1,0 +1,39 @@
+# greeter-real — bring the greeter up behind the real greetd daemon.
+#
+# Run as:  sh /bin/greeter-real        (the kernel has no shebang binfmt)
+#
+# Step 2 of the port: everything fakegreet skips is now in frame — PAM through
+# ports/greetd/pam-leandros, the session worker re-exec of /proc/self/exe, the
+# socketpair between daemon and worker, tokio's four signal streams, mlockall,
+# and the privilege handling. The VT layer is configured away with vt = "none"
+# in /etc/greetd/greetd.conf (TerminalMode::Stdin), which is the only value that
+# keeps greetd off /dev/tty0 entirely.
+#
+# greetd builds a session's environment ENTIRELY from its PAM env table and
+# inherits nothing of its own, so the render environment reaches the greeter
+# through /etc/profile and `source_profile = true`, not through this script.
+# What this script exports is what *greetd itself* runs with.
+set -u
+
+. /bin/greeter-env
+
+# Same role switch as greeter-fake — see the comment there. greetd's
+# default_session.user is "root", so the greeter client is still uid 0.
+/bin/cp /etc/passwd.greeter /etc/passwd
+echo "GREETER-REAL: passwd role switch done"
+
+# greetd binds its control socket at <dir>/greetd-<pid>.sock, and upstream
+# hardcodes <dir> = /run because on Linux /run is a tmpfs. On LeandrOS /run is
+# an ordinary f2fs directory and f2fs has no S_IFSOCK support, so that bind
+# fails with EOPNOTSUPP ("unable to open listener: Not supported (os error 95)")
+# before the greeter is ever spawned. The socket-capable mounts are /tmp,
+# /dev/shm and /run/user (servers/vfs TMPFS_ROOTS), so point greetd at the
+# runtime dir. GREETD_SOCK_DIR is ports/greetd/patches/0003; unset, greetd
+# behaves exactly as upstream.
+GREETD_SOCK_DIR=$XDG_RUNTIME_DIR
+export GREETD_SOCK_DIR
+
+cd "$XDG_RUNTIME_DIR"
+
+echo "GREETER-REAL: launching greetd"
+exec /bin/greetd

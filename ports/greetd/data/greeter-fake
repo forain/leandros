@@ -1,0 +1,46 @@
+# greeter-fake — bring the greeter half up behind upstream greetd's `fakegreet`.
+#
+# Run as:  sh /bin/greeter-fake        (the kernel has no shebang binfmt)
+#
+# fakegreet is upstream greetd's protocol test harness: it speaks the full
+# greetd IPC on a socket it binds in its own cwd, it sets GREETD_SOCK itself,
+# and it answers start_session with Success WITHOUT starting anything. It has no
+# PAM, no VT, no session worker, no fork, no /proc/self/exe and no mlockall. So
+# it isolates the greeter half — the render environment, DRM, the socket and the
+# DBUS_SYSTEM_BUS_ADDRESS trap — with none of the daemon's risk surface. If the
+# greeter cannot render behind fakegreet, nothing downstream matters.
+#
+# Its hardcoded credentials are user "user" / password "password" / "7 + 2:" ->
+# "9", and it never matches the username cosmic-greeter sends. That is
+# deliberate and left alone: an accepted login makes cosmic-greeter exit, which
+# makes cosmic-comp exit with it (kiosk mode), which takes the login screen off
+# the screen. A rejected login keeps the screen up to be photographed.
+set -u
+
+. /bin/greeter-env
+
+# cosmic-greeter picks its role purely by the name getpwuid(getuid()) returns:
+# "cosmic-greeter" -> greeter::main(), anything else -> locker::main()
+# (cosmic-greeter/src/main.rs). This milestone keeps the greeter client at uid 0
+# (root compositor, no privilege drop yet, and /run/user/0 is 0700 root), so the
+# name has to come from the passwd file instead: passwd-greeter is the same
+# three accounts with a uid-0 "cosmic-greeter" entry FIRST, and musl's getpwuid
+# returns the first uid match. root is still reachable by name, which is all
+# /bin/login uses. Restore with:  /bin/cp /etc/passwd.system /etc/passwd
+/bin/cp /etc/passwd.greeter /etc/passwd
+echo "GREETER-FAKE: passwd role switch done"
+
+cd "$XDG_RUNTIME_DIR"
+/bin/rm -f greetd.sock 2>/dev/null || true
+
+# ARGUMENT ORDER IS LOAD-BEARING. cosmic-comp takes its kiosk child from
+# env::args().skip(1).next() — the FIRST argument, whatever it is — while its
+# flag parser scans every argument and ignores the ones it does not know
+# (cosmic-comp/src/lib.rs). So `cosmic-comp --no-xwayland <exec>` spawns
+# "--no-xwayland" and dies with ENOENT, while `cosmic-comp <exec> --no-xwayland`
+# both disables Xwayland and spawns <exec>. The flag is then also handed to
+# cosmic-greeter, whose own argument loop ignores what it does not recognise.
+# --no-xwayland is not optional: smithay's Xwayland-socket bind-error path leaks
+# fds -> EMFILE -> a softpipe NULL-transfer crash at first scanout.
+echo "GREETER-FAKE: launching fakegreet in $XDG_RUNTIME_DIR"
+exec /bin/fakegreet "/bin/cosmic-comp /bin/cosmic-greeter --no-xwayland"

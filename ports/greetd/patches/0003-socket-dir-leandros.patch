@@ -1,0 +1,21 @@
+diff --git a/greetd/src/server.rs b/greetd/src/server.rs
+index 84cb54f..336b866 100644
+--- a/greetd/src/server.rs
++++ b/greetd/src/server.rs
+@@ -180,7 +180,15 @@ struct Listener(UnixListener);
+ 
+ impl Listener {
+     fn create(uid: Uid, gid: Gid) -> Result<(String, Listener), Error> {
+-        let path = format!("/run/greetd-{}.sock", getpid().as_raw());
++        // The directory the control socket is bound in. Upstream hardcodes
++        // /run, which on Linux is a tmpfs. On LeandrOS /run is an ordinary f2fs
++        // directory and f2fs has no S_IFSOCK support, so binding there fails
++        // with EOPNOTSUPP ("unable to open listener: Not supported (os error
++        // 95)") before greetd ever reaches the greeter. Only /tmp, /dev/shm and
++        // /run/user are socket-capable tmpfs mounts, so the path has to be
++        // steerable. Unset, this is byte-for-byte upstream's behaviour.
++        let dir = std::env::var("GREETD_SOCK_DIR").unwrap_or_else(|_| "/run".to_string());
++        let path = format!("{}/greetd-{}.sock", dir.trim_end_matches('/'), getpid().as_raw());
+         let _ = std::fs::remove_file(&path);
+         let listener =
+             UnixListener::bind(&path).map_err(|e| format!("unable to open listener: {e}"))?;

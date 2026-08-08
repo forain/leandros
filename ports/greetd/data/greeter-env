@@ -1,0 +1,88 @@
+# greeter-env — the environment every greeter launch needs, in one place.
+# Sourced (`. /bin/greeter-env`) by /bin/greeter-fake and /bin/greeter-real so
+# the two launches cannot drift apart. POSIX sh only: /bin/sh is brush.
+#
+# This is the render environment from m6-session-data/start-cosmic-leandros
+# minus everything that belongs to a full cosmic-session, plus the one thing a
+# greeter needs that a session must NOT have: DBUS_SYSTEM_BUS_ADDRESS unset.
+
+# ---- search path ------------------------------------------------------------
+# Rust's std::process PATH lookup (cosmic-comp spawning its kiosk child,
+# fakegreet spawning `sh`) does fall through every ':' entry. brush's own exec
+# search does not, which is why every binary this file's callers run is named by
+# absolute path.
+PATH=/usr/bin:/bin
+export PATH
+
+# ---- runtime dir ------------------------------------------------------------
+# cosmic-comp binds $XDG_RUNTIME_DIR/wayland-1 here and fakegreet binds
+# greetd.sock in its cwd, which the callers set to this same directory. Seeded
+# 0700 root by the VFS at boot.
+XDG_RUNTIME_DIR=/run/user/0
+export XDG_RUNTIME_DIR
+
+# ---- HOME / XDG dirs --------------------------------------------------------
+# cosmic-config create_dir_all()s $XDG_CONFIG_HOME/cosmic/... at startup and
+# returns NoConfigDirectory if neither HOME nor XDG_CONFIG_HOME is set;
+# CosmicGreeterConfig::load() goes through it.
+HOME=/root
+XDG_CONFIG_HOME=$HOME/.config
+XDG_CACHE_HOME=$HOME/.cache
+XDG_DATA_HOME=$HOME/.local/share
+XDG_STATE_HOME=$HOME/.local/state
+XDG_DATA_DIRS=/usr/local/share:/usr/share
+XDG_CONFIG_DIRS=/etc/xdg
+export HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME
+export XDG_DATA_DIRS XDG_CONFIG_DIRS
+/bin/mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" 2>/dev/null || true
+
+# ---- desktop identity -------------------------------------------------------
+XDG_CURRENT_DESKTOP=COSMIC
+XDG_SESSION_DESKTOP=COSMIC
+XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE
+
+# ---- system D-Bus: MUST STAY UNSET ------------------------------------------
+# cosmic-greeter's greeter::main calls user_data_dbus() BEFORE it builds any
+# window, against com.system76.CosmicGreeter — a name owned only by
+# cosmic-greeter-daemon, which is neither built nor staged. busd drops a call to
+# an unowned name with a warn and never replies, and neither side has a timeout,
+# so the greeter would hang forever on a blank screen. Unset, Connection::system()
+# fails fast and greeter::main falls through to user_data_fallback(), which reads
+# /etc/passwd. start-cosmic-leandros deliberately sets this for a full session;
+# a greeter is the one launch that must not inherit it.
+unset DBUS_SYSTEM_BUS_ADDRESS || true
+
+# ---- compositor backend -----------------------------------------------------
+# cosmic-comp's auto-detect picks x11/winit when DISPLAY or WAYLAND_DISPLAY is
+# set; on bare KMS both must be unset.
+unset DISPLAY || true
+unset WAYLAND_DISPLAY || true
+COSMIC_BACKEND=kms
+COSMIC_RENDER_DEVICE=226:0
+export COSMIC_BACKEND COSMIC_RENDER_DEVICE
+
+# ---- renderer: software everywhere ------------------------------------------
+GBM_ALWAYS_SOFTWARE=1
+COSMIC_DISABLE_SYNCOBJ=1
+ICED_BACKEND=tiny-skia
+export GBM_ALWAYS_SOFTWARE COSMIC_DISABLE_SYNCOBJ ICED_BACKEND
+
+# NOT COSMIC_DISABLE_DIRECT_SCANOUT: in smithay that clears FrameFlags::
+# ALLOW_SCANOUT, a union that INCLUDES ALLOW_CURSOR_PLANE_SCANOUT, so it
+# silently disables the cursor plane as well as the overlays.
+COSMIC_DISABLE_OVERLAY_SCANOUT=1
+export COSMIC_DISABLE_OVERLAY_SCANOUT
+
+# SMITHAY_USE_LEGACY is deliberately NOT set: atomic is the only smithay path
+# that can program a cursor plane.
+
+# ---- cursor -----------------------------------------------------------------
+XCURSOR_THEME=default
+XCURSOR_SIZE=24
+export XCURSOR_THEME XCURSOR_SIZE
+
+# ---- logging ----------------------------------------------------------------
+RUST_LOG=info
+RUST_BACKTRACE=1
+export RUST_LOG RUST_BACKTRACE

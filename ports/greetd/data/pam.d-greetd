@@ -1,0 +1,16 @@
+# /etc/pam.d/greetd — an existence marker, not a policy.
+#
+# greetd refuses to start unless /etc/pam.d/<service> or /usr/lib/pam.d/<service>
+# exists for its configured service name (greetd/src/server.rs pam_service_exists,
+# a plain Path::exists on both prefixes). The check is the only thing that reads
+# this path: LeandrOS has no PAM module stack, and authentication is implemented
+# directly against /etc/shadow by ports/greetd/pam-leandros, which never opens
+# /etc/pam.d at all.
+#
+# So the content below is documentation. Editing it changes nothing; deleting the
+# file stops greetd from starting.
+#
+# For reference, the stack this shim stands in for on a real distribution:
+#   auth       required   pam_unix.so
+#   account    required   pam_unix.so
+#   session    required   pam_unix.so

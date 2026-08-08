@@ -1,0 +1,22 @@
+diff --git a/fakegreet/src/main.rs b/fakegreet/src/main.rs
+index 5f237bb..10dfa8a 100644
+--- a/fakegreet/src/main.rs
++++ b/fakegreet/src/main.rs
+@@ -155,10 +155,13 @@ async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
+ pub async fn server() -> Result<(), Error> {
+     let mut path = env::current_dir()?;
+     let current_dir = path.clone();
+-    let current_sock = format!(
+-        "{}/greetd.sock",
+-        std::fs::canonicalize(&path).unwrap().to_str().unwrap(),
+-    );
++    // LeandrOS: std::fs::canonicalize is musl's realpath(3), which resolves a
++    // path by open(O_PATH) followed by readlink("/proc/self/fd/N"). The socket
++    // is bound in a tmpfs runtime dir and neither of those is exercised there.
++    // env::current_dir() is getcwd(3) and is already absolute, so joining it
++    // directly is the same answer with none of that surface — and the .unwrap()
++    // on the canonicalize result was a panic rather than a returned error.
++    let current_sock = format!("{}/greetd.sock", path.display());
+     path.push("greetd.sock");
+ 
+     std::env::set_var("GREETD_SOCK", &current_sock);

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=COSMIC
+Comment=COSMIC on LeandrOS
+Exec=/bin/sh /bin/start-cosmic-leandros
+TryExec=/bin/start-cosmic-leandros
+Type=Application
+DesktopNames=COSMIC
+Keywords=cosmic;

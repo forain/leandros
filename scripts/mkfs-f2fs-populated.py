@@ -331,10 +331,30 @@ def main():
 
     # /etc/passwd and /etc/group — musl's getpwuid/getgrgid (used by brush via
     # the uzers crate) read these; /bin/login also parses passwd directly.
-    etc_files.append(("passwd", (
+    passwd_bytes = (
         b"root:x:0:0:root:/root:/bin/brush\n"
         b"leandro:x:1000:1000:leandro:/home/leandro:/bin/brush\n"
-    ), 0o100644))
+    )
+    etc_files.append(("passwd", passwd_bytes, 0o100644))
+    # Two alternate passwd files for greeter bring-up, neither of them in use
+    # until something copies one over /etc/passwd.
+    #
+    # cosmic-greeter has no flag and no environment variable for its role: it
+    # runs greeter::main() when getpwuid(getuid()) is named "cosmic-greeter" and
+    # locker::main() otherwise (cosmic-greeter/src/main.rs). Until the greeter
+    # client drops privileges — it cannot yet, /run/user/0 where cosmic-comp
+    # binds wayland-1 is 0700 root — the only way to reach the greeter role is
+    # to make that name answer for uid 0, which passwd.greeter does by putting a
+    # uid-0 "cosmic-greeter" entry ahead of root (musl's getpwuid returns the
+    # first uid match). Lookups by NAME are unaffected, which is all /bin/login
+    # does. passwd.system is the pristine file to copy back afterwards; the root
+    # filesystem is writable and persists across boots.
+    _pw_greeter = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "ports", "greetd", "data", "passwd-greeter")
+    if os.path.exists(_pw_greeter):
+        with open(_pw_greeter, "rb") as f:
+            etc_files.append(("passwd.greeter", f.read(), 0o100644))
+        etc_files.append(("passwd.system", passwd_bytes, 0o100644))
     etc_files.append(("group", (
         b"root:x:0:\n"
         b"leandro:x:1000:\n"
@@ -787,6 +807,76 @@ def main():
         f"~/code/leandros-artifacts/m14-wlinput/out/wlinput-{arch}")
     if os.path.exists(m14_wlinput):
         bin_files.append(("wlinput", m14_wlinput, 0o100755))
+
+    # greetd — the greeter IPC daemon behind cosmic-greeter. Upstream
+    # kennylevinsen/greetd built static musl by ports/greetd/build.sh (ET_EXEC,
+    # no PT_INTERP, first PT_LOAD @ 0x200000 — the shape the loader needs), so
+    # it is packed straight into /bin like any other static binary. Its config,
+    # its PAM service marker and the /etc/profile that carries the session
+    # environment ride the /etc directory registration further down.
+    greetd_bin = os.path.expanduser(
+        f"~/code/leandros-artifacts/greetd-lane/{arch}/greetd")
+    if os.path.exists(greetd_bin):
+        bin_files.append(("greetd", greetd_bin, 0o100755))
+
+    # fakegreet — upstream greetd's protocol test harness, built alongside the
+    # daemon by the same ports/greetd/build.sh. No PAM, no VT, no session
+    # worker, no fork, no /proc/self/exe, no mlockall: it binds the greetd IPC
+    # socket, sets GREETD_SOCK itself and answers start_session with Success
+    # without starting anything. It is how the greeter half (render environment,
+    # DRM, socket, the DBUS_SYSTEM_BUS_ADDRESS trap) gets proven with none of
+    # the daemon's risk surface in frame.
+    fakegreet_bin = os.path.expanduser(
+        f"~/code/leandros-artifacts/greetd-lane/{arch}/fakegreet")
+    if os.path.exists(fakegreet_bin):
+        bin_files.append(("fakegreet", fakegreet_bin, 0o100755))
+
+    # The two greeter launchers and the environment they share, POSIX-sh
+    # scripts run as `sh /bin/<name>` (no shebang binfmt in the kernel). Staged
+    # into /bin next to start-cosmic-leandros for the same reason that one is:
+    # committing the whole launch up front keeps the typed command short, and
+    # serial RX drops characters once a session is live.
+    _greetd_scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "..", "ports", "greetd", "data")
+    for _s in ("greeter-env", "greeter-fake", "greeter-real"):
+        _p = os.path.normpath(os.path.join(_greetd_scripts, _s))
+        if os.path.exists(_p):
+            bin_files.append((_s, _p, 0o100755))
+
+    # greetd's data files. These need two directories that do not exist in the
+    # image yet, so they ride the m4_share_dirs/m4_share_files tables rather
+    # than the static dir_nodes list: that machinery allocates an inode per new
+    # directory and wires it into dir_nodes/subdirs, and its only requirement is
+    # that the PARENT already exists — /etc does (ino 9). Despite the "m4_share"
+    # name it is not limited to /usr/share; the M5 ship set already uses it for
+    # arbitrary paths. Files packed through it are 0644, which is right for all
+    # three.
+    #
+    #   /etc/greetd/greetd.conf  the config greetd reads with no arguments
+    #   /etc/pam.d/greetd        an existence marker; greetd refuses to start
+    #                            without it (server.rs pam_service_exists) and
+    #                            nothing ever reads the contents
+    #   /etc/profile             the session environment, sourced by greetd's
+    #                            source_profile wrapper — greetd passes NOTHING
+    #                            of its own environment to a session
+    _greetd_data = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "ports", "greetd", "data")
+    #   /usr/share/wayland-sessions/cosmic.desktop
+    #                            the session list the greeter offers. Its Exec
+    #                            is what greetd runs after a successful login;
+    #                            with none of these the greeter still renders,
+    #                            with an empty session dropdown
+    for _dirpath, _name, _srcname in (("/etc/greetd", "greetd.conf", "greetd.conf"),
+                                      ("/etc/pam.d",  "greetd",      "pam.d-greetd"),
+                                      ("/etc",        "profile",     "profile"),
+                                      ("/usr/share/wayland-sessions",
+                                       "cosmic.desktop", "cosmic.desktop")):
+        _src = os.path.normpath(os.path.join(_greetd_data, _srcname))
+        if not os.path.exists(_src):
+            continue
+        if _dirpath != "/etc":
+            m4_share_dirs.add(_dirpath)
+        m4_share_files.append((_dirpath, _name, _src))
 
     # The session launcher itself (a POSIX-sh script). The kernel execve()s ELF
     # only (no "#!"-shebang binfmt), so it is run as `sh /bin/start-cosmic-leandros`.

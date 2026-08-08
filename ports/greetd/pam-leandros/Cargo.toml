@@ -1,0 +1,23 @@
+# Deliberately its own workspace root: this crate is built by the greetd port
+# against a musl std target, not by the repo-root workspace (kernel/servers) or
+# by userland/ (no_std, leandros-libc). Without this it would be pulled into
+# whichever workspace happens to contain it.
+[workspace]
+
+[package]
+name = "pam-leandros"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "libpam application ABI for LeandrOS, backed by /etc/shadow"
+
+# An rlib on purpose, not a staticlib: a Rust staticlib carries its own copy of
+# std, and linking one into greetd (also std) duplicates every std symbol.
+# greetd depends on this crate directly and the linker resolves pam-sys's
+# undefined pam_* references from it. See src/lib.rs.
+[lib]
+name = "pam_leandros"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"

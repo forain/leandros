@@ -1,0 +1,89 @@
+# /etc/profile — environment for sessions started by greetd.
+#
+# greetd builds a session's environment ENTIRELY from its PAM env table: the
+# worker pam_putenv's GREETD_SOCK, XDG_SEAT, XDG_SESSION_CLASS, USER, LOGNAME,
+# HOME, SHELL, TERM and whatever the greeter sent in start_session{env}, then
+# reads the table back with pam_getenvlist and passes THAT to execve as the
+# whole environment (greetd/src/session/worker.rs). Nothing is inherited from
+# greetd's own environment. So without this file a session starts with no PATH,
+# no XDG_RUNTIME_DIR and none of the render settings the compositor needs.
+#
+# greetd sources this via `source_profile = true`, which wraps the session
+# command in `sh -c '[ -f /etc/profile ] && . /etc/profile; ... exec <cmd>'`.
+# It applies to the greeter session and to the user session alike, which is
+# correct — both are COSMIC on the same software-rendered GPU.
+#
+# POSIX sh only: /bin/sh is brush. No bashisms.
+
+# ---- search path -----------------------------------------------------------
+# cosmic-comp and cosmic-session spawn their children by BARE NAME through a
+# Rust std PATH lookup, and the session binaries live in /bin.
+PATH=/usr/bin:/bin
+export PATH
+
+# ---- XDG runtime dir -------------------------------------------------------
+# The wayland-N socket and the D-Bus session socket both live here. /run/user/0
+# is pre-created 0700 root in the image (runtime `mkdir -p` of several new
+# levels at once does not reliably materialise the deepest one on this f2fs).
+XDG_RUNTIME_DIR=/run/user/0
+export XDG_RUNTIME_DIR
+
+# ---- desktop identity ------------------------------------------------------
+XDG_CURRENT_DESKTOP=COSMIC
+XDG_SESSION_DESKTOP=COSMIC
+XDG_SESSION_TYPE=wayland
+XDG_DATA_DIRS=/usr/local/share:/usr/share
+XDG_CONFIG_DIRS=/etc/xdg
+export XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE XDG_DATA_DIRS XDG_CONFIG_DIRS
+
+# ---- system D-Bus: MUST STAY UNSET for the greeter -------------------------
+# cosmic-greeter calls user_data_dbus() before it builds any window, against
+# com.system76.CosmicGreeter — a name owned only by cosmic-greeter-daemon,
+# which is neither built nor staged. busd drops a call to an unowned name with
+# a warn and never replies, and neither side has a timeout, so the greeter
+# hangs forever on a blank screen. With DBUS_SYSTEM_BUS_ADDRESS unset,
+# Connection::system() fails fast and the greeter falls through to
+# user_data_fallback(), which reads /etc/passwd.
+#
+# greetd never sets it (nothing is inherited), so this is belt-and-braces
+# against something else in the chain exporting it.
+unset DBUS_SYSTEM_BUS_ADDRESS
+
+# ---- compositor backend ----------------------------------------------------
+# cosmic-comp's auto-detect picks x11/winit when DISPLAY or WAYLAND_DISPLAY is
+# set. On bare KMS both must be unset.
+unset DISPLAY
+unset WAYLAND_DISPLAY
+COSMIC_BACKEND=kms
+# virtio-gpu's card0 is 226:0 on the QEMU guest.
+COSMIC_RENDER_DEVICE=226:0
+export COSMIC_BACKEND COSMIC_RENDER_DEVICE
+
+# ---- renderer: software everywhere -----------------------------------------
+# No hardware GL on the guest: GBM hands out software buffers and the toolkit
+# uses the CPU rasteriser.
+GBM_ALWAYS_SOFTWARE=1
+COSMIC_DISABLE_SYNCOBJ=1
+ICED_BACKEND=tiny-skia
+export GBM_ALWAYS_SOFTWARE COSMIC_DISABLE_SYNCOBJ ICED_BACKEND
+
+# NOT COSMIC_DISABLE_DIRECT_SCANOUT: in smithay that clears FrameFlags::
+# ALLOW_SCANOUT, a union that INCLUDES ALLOW_CURSOR_PLANE_SCANOUT, so it
+# silently disables the cursor plane as well as the overlays. Disable only the
+# overlay planes, which is what we actually need off.
+COSMIC_DISABLE_OVERLAY_SCANOUT=1
+export COSMIC_DISABLE_OVERLAY_SCANOUT
+
+# SMITHAY_USE_LEGACY is deliberately NOT set: the legacy backend clears the
+# cursor and overlay plane lists outright, and atomic is the only smithay path
+# that can program a cursor plane.
+
+# ---- cursor ----------------------------------------------------------------
+XCURSOR_THEME=default
+XCURSOR_SIZE=24
+export XCURSOR_THEME XCURSOR_SIZE
+
+# ---- logging ---------------------------------------------------------------
+RUST_LOG=info
+RUST_BACKTRACE=1
+export RUST_LOG RUST_BACKTRACE
