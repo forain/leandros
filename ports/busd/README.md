@@ -108,39 +108,41 @@ kernel ring-tracer to pin parked-vs-deadlocked and local-vs-inject at the wedge.
 static binaries staged to
 `~/code/leandros-artifacts/m5-session-ship/<arch>/usr/libexec/busd`.
 
-## `proposed/` — patches that are correct and NOT applied
-
-`build.sh` applies every `*.patch` in **this** directory, in name order.
-`proposed/` is deliberately outside that glob: what lives there is a patch whose
-mechanism is proven and whose consequences are not yet acceptable. Nothing is
-built from it until it is moved up a level.
-
-### `proposed/service-unknown-reply.patch`
+## `service-unknown-reply.patch`
 
 Replies `org.freedesktop.DBus.Error.ServiceUnknown` to a method call addressed to
-a well-known name nobody owns, instead of dropping it. Rationale, gating and
-measurements are in the patch header and in
-`artifacts/notes/m17-servicename-census-20260808/`.
+a well-known name nobody owns, instead of dropping it. Rationale and gating are
+in the patch header; the measurements are in
+`artifacts/notes/m17-servicename-census-20260808/` and
+`artifacts/notes/m18-enomem-port-table-20260808/`.
 
-**It does what it was written to do.** With it staged, a hand-started second
+**It does what it was written to do.** With it applied, a hand-started second
 `cosmic-launcher` reports `Another instance is running` and exits 0 — which is
 only reachable if the autostarted copy got through the same probe, owns
 `com.system76.CosmicLauncher` and is serving `DbusActivation`. It fixes a whole
 class: a stock session addresses **ten** distinct unowned names in its first ten
 seconds, only four of which are single-instance probes.
 
-**It is not landable yet, and the reason is not in busd.** Unblocking those
-components makes them run, and they then die on a null dereference at
-`CR2=0x880` — `xkb_context_new` returning NULL on a failed allocation, wrapped
-without a null check by the `xkbcommon` crate and handed straight through by
-SCTK. Measured on x86_64/KVM with the busd binary as the only image delta and
-everything else held constant, including the kernel:
+**It spent a wave unapplied, and the reason was never in busd.** Unblocking
+those components made them run, and they then died on a null dereference at
+`CR2=0x880`. That was recorded as `xkb_context_new` returning NULL on a failed
+`calloc`, and it was not: `xkb_context_new` also returns NULL when
+`xkb_context_include_path_append_default` fails, which happens when its `stat`
+of `/usr/share/X11/xkb` fails, and that `stat` was failing with errno 12 because
+the IPC port table had run out of buckets. Four more running components was
+exactly the load that took a 64-bucket table over. Fixed by
+`ipc::port::LIVE_BUCKETS` 64 → 512.
 
-| busd | panel bar + clock | `CR2=0x880` deaths |
+Landed on the strength of a control with the busd binary held constant and the
+kernel as the only delta:
+
+| kernel | panel bar + clock | `CR2=0x880` deaths |
 |---|---|---|
-| stock | present | 0 |
-| this patch | **gone** | 2-4 per boot |
+| `LIVE_BUCKETS = 64` | gone | 1, then the session wedged |
+| `LIVE_BUCKETS = 512` | **present, clock ticking, all 9 shots** | **0** |
 
-The allocation is not failing for want of RAM: the guest reports **1.2 GiB
-free** throughout, and the deaths persist unchanged at `-m 4G`. Finding which
-`mmap`/`brk` ENOMEM return fires is the work that has to land before this does.
+**After changing anything here, `rm -rf ports/busd/.work`.** `build.sh` applies
+patches only when it first extracts the crate, so an edited or newly added patch
+is silently ignored against a cached tree. The staged binaries under
+`~/code/leandros-artifacts/m5-session-ship/<arch>/usr/libexec/busd` then have to
+be rebuilt for the image to pick it up.
