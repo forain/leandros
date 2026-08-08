@@ -22,11 +22,36 @@ PATH=/usr/bin:/bin
 export PATH
 
 # ---- XDG runtime dir -------------------------------------------------------
-# The wayland-N socket and the D-Bus session socket both live here. /run/user/0
-# is pre-created 0700 root in the image (runtime `mkdir -p` of several new
-# levels at once does not reliably materialise the deepest one on this f2fs).
-XDG_RUNTIME_DIR=/run/user/0
+# The wayland-N socket and the D-Bus session socket both live here.
+#
+# PER-UID, NOT /run/user/0. This file is sourced by greetd's source_profile
+# wrapper for BOTH sessions it starts: the greeter session, which is root, and
+# the user session, which is whoever just logged in. A hardcoded /run/user/0
+# therefore puts a uid-1000 login session's wayland-N and session-bus sockets
+# inside root's runtime directory, sharing one socket namespace between two
+# sessions that are supposed to be independent.
+#
+# WHAT THIS IS NOT: it is not a permission fix, and the 0700 on that directory
+# is not what would stop anyone. Measured in servers/vfs and servers/f2fs:
+# path traversal reads no mode/uid/gid on any component; creating an entry
+# inside a directory (open O_CREAT, mkdir, mknod, symlink, AF_UNIX bind) checks
+# only that the parent EXISTS; and AF_UNIX connect discards the caller
+# entirely (`unix_resolve_node(_pid, path)`). The single enforced case is
+# open(2) of an inode that already exists. So a uid-1000 session can today
+# create its sockets inside a 0700 root directory unimpeded — every 0700 in
+# this image is documentation, not enforcement. This change is the XDG
+# contract and the arrangement that keeps working if the VFS ever grows real
+# enforcement; it is not load-bearing for the login today.
+#
+# /run/user is a tmpfs MOUNT ROOT (servers/vfs TMPFS_ROOTS), which is what
+# makes AF_UNIX binds work under it at all — an f2fs /run has no S_IFSOCK.
+# /run/user/0 is seeded at boot for root. `id` is addressed by absolute path:
+# /bin/sh is brush, and brush's exec search does not fall through
+# /usr/bin -> /bin.
+XDG_RUNTIME_DIR=/run/user/$(/bin/id -u)
 export XDG_RUNTIME_DIR
+/bin/mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+/bin/chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
 # ---- desktop identity ------------------------------------------------------
 XDG_CURRENT_DESKTOP=COSMIC
@@ -87,3 +112,14 @@ export XCURSOR_THEME XCURSOR_SIZE
 RUST_LOG=info
 RUST_BACKTRACE=1
 export RUST_LOG RUST_BACKTRACE
+
+# ---- the one line that says a session started ------------------------------
+# greetd is silent about sessions. It logs nothing when it starts one, and it
+# discards the exit status of the one it started (session/worker.rs waits with
+# `waitpid(child, None)` and matches `Ok(_) => break`). A session that dies
+# instantly is therefore indistinguishable from one that was never scheduled:
+# both look like "the greeter came back". Since this file is sourced by the
+# wrapper greetd `exec`s the session command from, it is the last point that
+# can say so — and the marker landing followed by nothing else localises the
+# failure to the exec itself.
+echo "profile: session starting, uid=$(/bin/id -u) XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >&2
