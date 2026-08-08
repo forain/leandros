@@ -1,0 +1,39 @@
+brush-0.5# vfstestbrush-0.5# vfstest
+rmdir: PASS
+rename: PASS
+rename_replace_tmpfs: PASS
+rename_replace_f2fs: PASS
+flock_conflict: PASS
+fcntl_byte_range_conflict: PASS
+permission_enforced: PASS
+f2fs_ownership_enforced: PASS
+chroot_confines_symlink_resolution: PASS
+xattr_basic_tmpfs: PASS
+xattr_basic_f2fs: PASS
+xattr_missing_unsupported_tmpfs: PASS
+xattr_missing_unsupported_f2fs: PASS
+xattr_list_tmpfs: PASS
+xattr_list_f2fs: PASS
+xattr_create_replace_tmpfs: PASS
+xattr_create_replace_f2fs: PASS
+xattr_remove_tmpfs: PASS
+xattr_remove_f2fs: PASS
+xattr_symlink_tmpfs_abs: PASS
+xattr_symlink_tmpfs_rel: PASS
+xattr_symlink_f2fs_abs: PASS
+xattr_symlink_f2fs_rel: PASS
+xattr_fd_tmpfs: PASS
+xattr_fd_f2fs: PASS
+xattr_acl_basic_tmpfs: PASS
+xattr_acl_basic_f2fs: PASS
+xattr_acl_enforcement_tmpfs: PASS
+xattr_acl_enforcement_f2fs: PASS
+xattr_acl_malformed_trivial_tmpfs: PASS
+xattr_acl_malformed_trivial_f2fs: PASS
+symlink_read_relative_tmpfs: PASS
+symlink_read_absolute_tmpfs: PASS
+symlink_read_relative_f2fs: PASS
+symlink_read_absolute_f2fs: PASS
+symlink_cross_mount_tmpfs_to_f2fs: PASS
+--- vfstest done ---
+brush-0.5# 

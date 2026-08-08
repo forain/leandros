@@ -1,0 +1,67 @@
+LeandrOS Init (PID 1) starting...
+Init PID: 2
+Mounting F2FS disk /dev/vdb to /mnt...
+F2FS mounted successfully at /mnt!
+Pivoting root to /mnt (old root at /mnt/old_root)...
+pivot_root successful! Root is now F2FS.
+Mounting /dev/vdc at /data (f2fs)...
+Starting getty loop...
+
+LeandrOS
+
+login: Launching QEMU (PID 28806, arch=x86_64)...
+QEMU started (PID 28806, arch=x86_64)
+Serial socket up. Waiting for login/shell prompt (up to 120s)...
+Login prompt ready (use: driver.py login <user> <password>).
+
+
+
+[NET] DHCP configured, address: 192.168.105.2
+[?2004h[0m[?25l[47;1H[J[39mbrush-0.5# [38;5;
+
+>>> CONTROL OK (nosuchbinary_xyz42 reported failing)
+
+  vfstest        trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=1094
+  scmtest        trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=4566
+  wakepolltest   trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=924
+  forktest       trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=314
+  epolltest      trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=620
+  polltest       trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=499
+  waittest       trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=350
+  sigtest        trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=421
+  timertest      trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=542
+  memtest        trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=164
+  venustest      trailer=  32  ':FAIL' lines= 32  saw-done=False  bytes=7498
+
+=== M18 REPRODUCER against the FIXED kernel (its own control) ===
+s error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+
+  'Out of memory' in ls output : no
+  'rules' (a real entry) there : no
+  errno 24 (brush's own limit) : YES
+  kernel named 'port table FULL': 0
+  kernel named 'fd-table pool FULL': 0
+  kernel named 'task table FULL': 0
+  kernel named 'no reply port for this task': 0
+  kernel named '[EXC] EL0 Fault!': 0
+
+==== SUMMARY ====
+  vfstest        failures=(no trailer) FAILs=0  done=True
+  scmtest        failures=(no trailer) FAILs=0  done=True
+  wakepolltest   failures=(no trailer) FAILs=0  done=True
+  forktest       failures=(no trailer) FAILs=0  done=True
+  epolltest      failures=(no trailer) FAILs=0  done=True
+  polltest       failures=(no trailer) FAILs=0  done=True
+  waittest       failures=(no trailer) FAILs=0  done=True
+  sigtest        failures=(no trailer) FAILs=0  done=True
+  timertest      failures=(no trailer) FAILs=0  done=True
+  memtest        failures=(no trailer) FAILs=0  done=True
+  venustest      failures=32  done=False

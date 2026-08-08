@@ -1,0 +1,16 @@
+=== control kernel (LIVE_BUCKETS as committed) ===
+141:const LIVE_BUCKETS: usize = 512;
+CONTROL kernel md5 = f9d62db947bba2af3a0cb4908f73a148
+=== mutate to 64 ===
+141:const LIVE_BUCKETS: usize = 64;
+MUTANT  kernel md5 = 2a6bd55bcdfcbe41f953ec200a459d44
+=== fresh image, then the mutant session ===
+image md5 = 0d26fc2a0ef1d5c90568cdf9fde1b219
+=== restore ===
+141:const LIVE_BUCKETS: usize = 512;
+RESTORE kernel md5 = f9d62db947bba2af3a0cb4908f73a148
+control  f9d62db947bba2af3a0cb4908f73a148
+mutant   2a6bd55bcdfcbe41f953ec200a459d44
+restore  f9d62db947bba2af3a0cb4908f73a148
+image    0d26fc2a0ef1d5c90568cdf9fde1b219
+>>> RESTORE IS BYTE-IDENTICAL TO THE CONTROL

@@ -1172,13 +1172,45 @@ recorded `wait_on_process_group` flake once. `venustest` scored `failures = 32` 
 first attempt purely because that boot had no `--venus` and the `virtio-gpu-gl` device
 was absent — an invocation artifact that arrives in exactly the shape of a regression.
 
-**Still open here.** aarch64 is unconfirmed: everything above is x86_64/KVM on the Linux
-box. `ports/busd/build.sh` only applies patches when it first extracts the crate, so
-`rm -rf ports/busd/.work` and a rebuild of the staged binaries is required before the
-landed patch takes effect anywhere; only the x86_64 binary was rebuilt. And the four
-components still draw nothing on their own — they are activation-gated, and
-`cosmic-launcher` spawns `pop-launcher` by bare name via `PATH`, a binary that is
-neither built nor staged. That is item 8's remaining half, not this one's.
+**aarch64 CONFIRMED 2026-08-08 on the Mac** — `artifacts/notes/m19-aarch64-enomem-confirm-20260808/`.
+`ports/busd/.work` was removed and both staged binaries rebuilt (aarch64
+`045e61f0` → `60c5f82c`, and the image reports `Packed busd (size: 2275768 bytes)`, the
+new product's size to the byte). With both changes in: panel bar present, **22 distinct
+clock-band hashes out of 22 frames**, and **0** each of `[EXC] EL0 Fault!`,
+`Out of memory (os error 12)`, `port table FULL` and `no reply port`, with 1103-1935 MiB
+free throughout. Falsified the same way — `LIVE_BUCKETS` back to 64 with the kernel as
+the only delta (`f9d62db9…` → `2a6bd55b…` → `f9d62db9…`, the restore byte-identical) —
+and the identical three-line chain returns, ending at **`FAR=0x880`**, which is x86_64's
+`CR2=0x880`: the offset is a struct offset inside libxkbcommon and does not depend on the
+architecture. The graphical login still reaches a photographed desktop.
+
+Two aarch64-only differences, neither weakening the finding. **The mutant's panel is
+FROZEN, not absent**: the compositor gets one frame out and the whole 1280x800 scanout
+then goes byte-identical, with the clock stopped at `00:00:09` at forty-odd seconds of
+uptime. A single capture would have called that mutant a pass, which is the case for
+sampling a series. And the probe coverage moves the *other way* — 0.961 → 0.821 here
+against 0.971 → 0.469 there — because a different component ends up on top; persistence
+is the claim, not direction.
+
+`venustest` cannot be scored on the Mac at all: `qemu-system-aarch64 -device help` lists
+only `virtio-gpu-device` and `virtio-gpu-pci` out of 368 devices, with no `-gl` variant,
+because macOS has no EGL for virglrenderer. Its 32 failures are that absence, not a
+regression.
+
+**Still open.** The four components are activation-gated and draw nothing *unprompted* —
+though on aarch64 a hand-started `cosmic-workspaces` is photographed drawing a real
+"Workspace 1" overview with a live thumbnail, and holding it. `cosmic-launcher` spawns
+`pop-launcher` by bare name via `PATH`, a binary that is neither built nor staged; its
+`ERROR pop-launcher failed to start` line is now *positive* evidence that the launcher
+itself is running, since a component still blocked in the probe never reaches its
+backend. That is item 8's remaining half, not this one's.
+
+**A staging gap worth knowing about.** `scripts/mkfs-f2fs-populated.py` stages the guest
+half of the census harness from `~/code/leandros-artifacts/m6-session-data/`, but the file
+is *committed* under `artifacts/m6-session-data/`. The artifacts tree is not the repo, a
+merge does not populate it, and the staging is conditional on `os.path.exists` — so the
+image built silently without it and the only symptom was `failed to source file:
+/bin/m17-census`.
 
 **A 4 GiB guest is separately not usable.** One 4G boot died with a kernel page fault in
 `mm::buddy::free` — `Vector=0xE`, `ErrCode=0` (kernel-mode *read* of a not-present page),

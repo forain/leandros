@@ -1,0 +1,38 @@
+[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbi78[?25h[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz78[?25h[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz4278[?25h
+[?2004l[31merror:[39m command not found: nosuchbinary_xyz42
+[?2004h[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /b78[?25h[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m17-c78[?25h[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m17-census78[?25h
+[?2004lM17: BEGIN
+MEMINFO boot total=2074726400 free=2032685056 used=42041344 usedpct=2 procs=5 uptime=1
+M17: busd ready after 1s
+M17: wayland-1 after 1s
+MEMINFO wayland1 total=2074726400 free=1979682816 used=95043584 usedpct=4 procs=8 uptime=3
+M17: MARK SETTLE1 45
+[DRM] unimplemented ioctl cmd=0xC00864BF nr=0x000000BF type=0x00000064 size=0x00000008 (reported once per boot)
+[DRM-SRV] mmap token=0x000000004D800000 map_info=0x01 -> writeback
+[DRM-SRV] mmap token=0x000000004E000000 map_info=0x01 -> writeback
+
+[IPC] port table FULL: 64/64 live buckets -- port::create now fails, and every caller
+[IPC] turns that into ENOMEM; this is ipc::port::LIVE_BUCKETS, not RAM
+
+[VFS] ENOMEM: no reply port for this task -- every call to a mounted
+[VFS] filesystem (open/stat/getdents64/exec) now returns errno 12. Not RAM.
+[PF] handle_user_page_fault returned false
+[FAULT] far=0000000000000880 dfsc=0000000000000006 elr=0000000090724548
+
+[EXC] EL0 Fault! PID=126 ESR=0000000092000006 FAR=0000000000000880 EC=0000000000000024 DFSC=0000000000000006 ELR=0000000090724548
+[EXC] x0=0000000000000000 x1=00000000906DC529 sp=00000000BA51DDF0
+[PF] no address space for faulting task
+[FAULT] far=00000000011F2890 dfsc=0000000000000007 elr=00000000011F2890
+
+[EXC] EL0 Fault! PID=120 ESR=0000000082000007 FAR=00000000011F2890 EC=0000000000000020 DFSC=0000000000000007 ELR=00000000011F2890
+[EXC] x0=000000009B335B68 x1=00000[P000F]00 0n0o0 00ad8d resp=s00s0 0s0pac0e0 0fo9B53D4E0
+r faulting task
+[FAULT] far=0000000001F99818 dfsc=0000000000000007 elr=0000000001F99818
+
+[EXC] EL0 Fault! PID=133 ESR=0000000082000007 FAR=0000000001F99818 EC=0000000000000020 DFSC=0000000000000007 ELR=0000000001F99818
+[EXC] x0=00000000BB423290 x1=00000000BA78E2E0 sp=00000000BB422A40
+[PF] no address space for faulting task
+[FAULT] far=00000000300A800C dfsc=0000000000000004 elr=00000000300A800C
+
+[EXC] EL0 Fault! PID=128 ESR=0000000082000004 FAR=00000000300A800C EC=0000000000000020 DFSC=0000000000000004 ELR=00000000300A800C
+[EXC] x0=0000000000000000 x1=0000000000000000 sp=00000000BA99C340

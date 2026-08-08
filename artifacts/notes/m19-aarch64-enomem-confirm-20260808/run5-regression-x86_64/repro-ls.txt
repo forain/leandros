@@ -1,0 +1,103 @@
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+brush-0.5# ls /usr/share/X11/xkb
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'ls': No file descriptors available (os error 24)
+[32]-Done	sleep 200
+[33]-Done	sleep 200
+[34]-Done	sleep 200
+[35]-Done	sleep 200
+[36]-Done	sleep 200
+[37]-Done	sleep 200
+[38]-Done	sleep 200
+brush-0.5# error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)
+error: failed to execute command 'sleep': No file descriptors available (os error 24)

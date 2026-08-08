@@ -1,0 +1,92 @@
+CCEDHH]
+EDE] sDLe sc]ahcedhun dlseercrhd_eruundO_Sl uoloelpI rsn_triter u(PIan__lorroDpute 1dn_)l.oop . . 
+ssttaarrtesttedda.....r.tin
+g.
+..
+[SCHED] CPU ID: [SC3[HEDS]CH ED] CCPU PUI D: 1IID: n2it PID: 
+
+
+2
+Mounting F2FS disk /dev/vdb to /mnt...
+F2FS mounted successfully at /mnt!
+Pivoting root to /mnt (old root at /mnt/old_root)...
+pivot_root successful! Root is now F2FS.
+Mounting /dev/vdc at /data (f2fs)...
+Starting getty loop...
+[NET] DHCP configur
+Led, eaddarenss:d 1r92O.1S68.
+
+10l5.2o
+gin: 
+
+
+[?2004h[0m[?25l[45;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h
+
+>>> CONTROL OK (nosuchbinary_xyz42 reported failing)
+
+  vfstest        trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=1112
+  scmtest        trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=4566
+  wakepolltest   trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=926
+  forktest       trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=333
+  epolltest      trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=638
+  polltest       trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=499
+  waittest       trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=369
+  sigtest        trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=421
+  timertest      trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=541
+  memtest        trailer=   -  ':FAIL' lines=  0  saw-done=True  bytes=181
+  venustest      trailer=  32  ':FAIL' lines= 32  saw-done=False  bytes=7153
+
+=== M18 REPRODUCER against the FIXED kernel (its own control) ===
+.5# ls /usr/share/X11/xkb
+error: failed to execute command 'ls': No file descriptors available (os error 24)
+[32]-Done	sleep 200
+[33]-Done	sleep 200
+[34]-Done	sleep 200
+[35]-Done	sleep 200
+[36]-Done	sleep 200
+[37]-Done	sleep 200
+[38]-Done	sleep 200
+[39]-Done	sleep 200
+[40]-Done	sleep 200
+[41]-Done	sleep 200
+[42]-Done	sleep 200
+[43]-Done	sleep 200
+[44]-Done	sleep 200
+[45]-Done	sleep 200
+[46]-Done	sleep 200
+[47]-Done	sleep 200
+[48]-Done	sleep 200
+[49]-Done	sleep 200
+[50]-Done	sleep 200
+[51]-Done	sleep 200
+[52]-Done	sleep 200
+[53]-Done	sleep 200
+[54]-Done	sleep 200
+[55]-Done	sleep 200
+[56]-Done	sleep 200
+[57]-Done	sleep 200
+[58]-Done	sleep 200
+[59]-Done	sleep 200
+[60]+Done	sleep 200
+brush-0.5# 
+  'Out of memory' in ls output : no
+  'rules' (a real entry) there : no
+  errno 24 (brush's own limit) : YES
+  kernel named 'port table FULL': 0
+  kernel named 'fd-table pool FULL': 0
+  kernel named 'task table FULL': 0
+  kernel named 'no reply port for this task': 0
+  kernel named '[EXC] EL0 Fault!': 0
+
+==== SUMMARY ====
+  vfstest        failures=(no trailer) FAILs=0  done=True
+  scmtest        failures=(no trailer) FAILs=0  done=True
+  wakepolltest   failures=(no trailer) FAILs=0  done=True
+  forktest       failures=(no trailer) FAILs=0  done=True
+  epolltest      failures=(no trailer) FAILs=0  done=True
+  polltest       failures=(no trailer) FAILs=0  done=True
+  waittest       failures=(no trailer) FAILs=0  done=True
+  sigtest        failures=(no trailer) FAILs=0  done=True
+  timertest      failures=(no trailer) FAILs=0  done=True
+  memtest        failures=(no trailer) FAILs=0  done=True
+  venustest      failures=32  done=False

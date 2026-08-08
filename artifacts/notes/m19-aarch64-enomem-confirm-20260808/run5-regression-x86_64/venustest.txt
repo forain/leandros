@@ -1,0 +1,159 @@
+brush-0.5# venustesbrush-0.5# venustest
+ld_so::init tp=0x0000000000000000
+PH type=0x0000000000000006
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000007
+--- venustest: virtio-gpu Venus transport (M1) ---
+open_card0: PASS
+[GPU] device features hi=0x00000101 lo=0x30000002
+[GPU] *** host does NOT offer VIRTIO_GPU_F_VIRGL -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_RESOURCE_BLOB -- 3D/Venus unavailable ***
+[GPU] *** host does NOT offer VIRTIO_GPU_F_CONTEXT_INIT -- 3D/Venus unavailable ***
+[GPU] acked features hi=0x00000001 lo=0x00000002
+  param 3D_FEATURES = 0 (0x0000000000000000)
+  param CAPSET_QUERY_FIX = 1 (0x0000000000000001)
+  param RESOURCE_BLOB = 0 (0x0000000000000000)
+  param HOST_VISIBLE = 0 (0x0000000000000000)
+  param CONTEXT_INIT = 0 (0x0000000000000000)
+  param SUPPORTED_CAPSET_IDs = 0 (0x0000000000000000)
+getparam_3d_features: FAIL
+getparam_capset_query_fix: PASS
+getparam_resource_blob: FAIL
+getparam_context_init: FAIL
+host_advertises_venus_capset: FAIL
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+context_init_venus: FAIL
+[DRM] GET_CAPS: host exposes no capset id 0x00000004
+  GET_CAPS ioctl failed
+get_caps_venus: FAIL
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+resource_create_blob: FAIL
+[DRM] RESOURCE_INFO: unknown bo_handle=0x7FFFFFFF
+resource_info_bad_handle_refused: PASS
+--- 4c: host-visible (HOST3D) blob map path ---
+  host-visible window = 0 MiB, live window spans before = 0
+host_visible_param_matches_window: PASS
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+  cycles = 20, created = 0, mapped = 0, readback ok = 0
+  live window spans after = 0
+host3d_blob_outcomes_explicit: PASS
+host3d_window_spans_released: PASS
+host3d_map_refused_without_window: PASS
+--- 4d: fork() with a device mapping live ---
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+  SKIPPED guest half: host refuses RESOURCE_CREATE_BLOB (no blob support)
+  (drmsmoke's FORK_DEVMAP_* covers the device-VMA fork path here)
+  SKIPPED hostvis half: no host-visible window on this host
+  (the outside-RAM device VMA that panicked the kernel needs a 3D host)
+--- phase 2: per-open-file context isolation ---
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+phase2_context_init_fdA: FAIL
+  fdA ctx_id = 0
+  expected a non-zero ctx_id, got 0
+phase2_ctxid_fdA_nonzero: FAIL
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+phase2_context_init_fdB: FAIL
+  fdB ctx_id = 0
+  expected a non-zero ctx_id, got 0
+phase2_ctxid_fdB_nonzero: FAIL
+  ctx_id must differ from 0, got 0
+phase2_ctxid_fdB_differs_from_fdA: FAIL
+  expected ctx_id = 0, actual ctx_id = 0
+phase2_ctxid_fdA_survives_fdB_init: FAIL
+[DRM] EXECBUFFER before CONTEXT_INIT
+phase2_execbuffer_fdA_after_fdB_init: FAIL
+[DRM] EXECBUFFER before CONTEXT_INIT
+phase2_execbuffer_fdB: FAIL
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+phase2_context_init_fdA_idempotent: FAIL
+  expected ctx_id = 0, actual ctx_id = 0
+phase2_ctxid_fdA_unchanged_by_reinit: FAIL
+  expected ctx_id = 0, actual ctx_id = 0
+phase2_ctxid_fdA_after_close_fdB: FAIL
+[DRM] EXECBUFFER before CONTEXT_INIT
+phase2_execbuffer_fdA_after_close_fdB: FAIL
+  expected ctx_id = 0, actual ctx_id = 0
+phase2_ctxid_fdC_dup_shares_fdA: FAIL
+  expected ctx_id = 0, actual ctx_id = 0
+phase2_ctxid_fdC_after_close_fdA: FAIL
+[DRM] EXECBUFFER before CONTEXT_INIT
+phase2_execbuffer_fdC_dup_after_close_fdA: FAIL
+[DRM] EXECBUFFER before CONTEXT_INIT
+  expected ctx_id = 0, actual ctx_id = 0
+phase2_ctxid_fork_child_inherits: FAIL
+  expected ctx_id = 0, actual ctx_id = 0
+phase2_ctxid_fdC_survives_child_exit: FAIL
+[DRM] EXECBUFFER before CONTEXT_INIT
+phase2_execbuffer_fork_child_and_parent: FAIL
+--- phase 3: per-open context slot exhaustion ---
+phase3_open_17_fds: PASS
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+  ctx ids: 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed) 0(init-failed)
+phase3_16_contexts_distinct: FAIL
+phase3_17th_context_init_refused: PASS
+phase3_17th_has_no_context: PASS
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+phase3_slots_reclaimed_after_close: FAIL
+--- phase 4: per-open BO ownership + per-open fence ---
+phase4_open_two_fds: PASS
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+phase4_context_init_both: FAIL
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+phase4_blob_created_on_fdA: FAIL
+--- phase 5: PRIME export of blob BOs ---
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT
+phase5_context_init_both: FAIL
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+phase5_guest_blob_created: FAIL
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+  (no host3d blob on this host - skipping host-side export checks)
+--- phase 6: exported dmabuf keeps the buffer alive ---
+[GPU] resource_create_blob refused: no RESOURCE_BLOB
+phase6_guest_blob_created: FAIL
+phase6_dumb_created: PASS
+[DRM-SRV] mmap token=0x000000007C3D5000 map_info=0x01 -> writeback
+phase6_dumb_pattern_stamped: PASS
+phase6_dumb_exported: PASS
+phase6_dumb_payload_survives_destroy: PASS
+phase6_dumb_alloc_after_release: PASS
+--- venustest done, failures = 32 ---
+brush-0.5# 

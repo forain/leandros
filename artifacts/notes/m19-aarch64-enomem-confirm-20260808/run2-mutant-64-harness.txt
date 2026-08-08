@@ -1,0 +1,143 @@
+=== M19 mutant (aarch64) ===
+rune_r un1__l)o roslutonapo_rl sttairpot osentd..p s.tarag.tr
+ete.d..
+.d.
+[SCH...E
+D] CPU ID: 3[SCHED] CPU ID: 1
+Init PID: [SCHED] CPU ID: 22
+
+Mounting F2FS disk /dev/vdb to /mnt...
+
+F2FS mounted successfully at /mnt!
+Pivoting root to /mnt (old root at /mnt/old_root)...
+pivot_root successful! Root is now F2FS.
+Mounting /dev/vdc at /data (f2fs)...
+Starting getty loop...
+
+LeandrOS
+
+login: Launching QEMU (PID 13565, arch=aarch64)...
+QEMU started (PID 13565, arch=aarch64)
+Serial socket up. Waiting for login/shell prompt (up to 120s)...
+Login prompt ready (use: driver.py login <user> <password>).
+
+ 
+
+[?2004h[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h[NET] DHCP configured, address: 192.168.105.2
+
+
+
+=== POSITIVE CONTROL (must FAIL) ===
+[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbi78[?25h[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz78[?25h[0m[?25l[41;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mnosuchbinary_xyz4278[?25h
+[?2004l[31merror:[39m command not found
+>>> CONTROL OK
+
+[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /b78[?25h[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m17-c78[?25h[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0mbrush /bin/m17-census78[?25h
+[?2004lM17: BEGIN
+MEMINFO boot total=2074726400 free=2032685056 used=42041344 usedpct=2 procs=5 uptime=1
+M17: busd ready after 1s
+M17: wayland-1 after 1s
+MEMINFO wayland1 total=2074726400 free=1979682816 used=95043584 usedpct=4 procs=8 uptime=3
+M17: MARK SETTLE1 45
+
+===== PHASE SETTLE1 (45s) =====
+  [shot settle1-t4] 1280x800 colours=1 bg=#27292a non-bg=0.000 band=c13d5026f94c diff_vs_prev=None
+  [shot settle1-t22] 1280x800 colours=21465 bg=#1b1b1b non-bg=0.961 band=9c32005e65b8 diff_vs_prev=(0, 0, 1276, 796, 64000)
+  [shot settle1-t39] 1280x800 colours=21465 bg=#1b1b1b non-bg=0.961 band=9c32005e65b8 diff_vs_prev=None
+[DRM] unimplemented ioctl cmd=0xC00864BF nr=0x000000BF type=0x00000064 size=0x00000008 (reported once per boot)
+[DRM-SRV] mmap token=0x000000004D800000 map_info=0x01 -> writeback
+[DRM-SRV] mmap token=0x000000004E000000 map_info=0x01 -> writeback
+
+[IPC] port table FULL: 64/64 live buckets -- port::create now fails, and every caller
+[IPC] turns that into ENOMEM; this is ipc::port::LIVE_BUCKETS, not RAM
+
+[VFS] ENOMEM: no reply port for this task -- every call to a mounted
+[VFS] filesystem (open/stat/getdents64/exec) now returns errno 12. Not RAM.
+[PF] handle_user_page_fault returned false
+[FAULT] far=0000000000000880 dfsc=0000000000000006 elr=0000000090724548
+
+[EXC] EL0 Fault! PID=126 ESR=0000000092000006 FAR=0000000000000880 EC=0000000000000024 DFSC=0000000000000006 ELR=0000000090724548
+[EXC] x0=0000000000000000 x1=00000000906DC529 sp=00000000BA51DDF0
+[PF] no address space for faulting task
+[FAULT] far=00000000011F2890 dfsc=0000000000000007 elr=00000000011F2890
+
+[EXC] EL0 Fault! PID=120 ESR=0000000082000007 FAR=00000000011F2890 EC=0000000000000020 DFSC=0000000000000007 ELR=00000000011F2890
+[EXC] x0=000000009B335B68 x1=00000[P000F]00 0n0o0 00ad8d resp=s00s0 0s0pac0e0 0fo9B53D4E0
+r faulting task
+[FAULT] far=0000000001F99818 dfsc=0000000000000007 elr=0000000001F99818
+
+[EXC] EL0 Fault! PID=133 ESR=0000000082000007 FAR=0000000001F99818 EC=0000000000000020 DFSC=0000000000000007 ELR=0000000001F99818
+[EXC] x0=00000000BB423290 x1=00000000BA78E2E0 sp=00000000BB422A40
+[PF] no address space for faulting task
+[FAULT] far=00000000300A800C dfsc=0000000000000004 elr=00000000300A800C
+
+[EXC] EL0 Fault! PID=128 ESR=0000000082000004 FAR=00000000300A800C EC=0000000000000020 DFSC=0000000000000004 ELR=00000000300A800C
+[EXC] x0=0000000000000000 x1=0000000000000000 sp=00000000BA99C340
+>>> TIMEOUT waiting for a MARK; the guest stopped early.
+>>> draining guest dump...
+
+[DRM] unimplemented ioctl cmd=0xC00864BF nr=0x000000BF type=0x00000064 size=0x00000008 (reported once per boot)
+[DRM-SRV] mmap token=0x000000004D800000 map_info=0x01 -> writeback
+[DRM-SRV] mmap token=0x000000004E000000 map_info=0x01 -> writeback
+
+[IPC] port table FULL: 64/64 live buckets -- port::create now fails, and every caller
+[IPC] turns that into ENOMEM; this is ipc::port::LIVE_BUCKETS, not RAM
+
+[VFS] ENOMEM: no reply port for this task -- every call to a mounted
+[VFS] filesystem (open/stat/getdents64/exec) now returns errno 12. Not RAM.
+[PF] handle_user_page_fault returned false
+[FAULT] far=0000000000000880 dfsc=0000000000000006 elr=0000000090724548
+
+[EXC] EL0 Fault! PID=126 ESR=0000000092000006 FAR=0000000000000880 EC=0000000000000024 DFSC=0000000000000006 ELR=0000000090724548
+[EXC] x0=0000000000000000 x1=00000000906DC529 sp=00000000BA51DDF0
+[PF] no address space for faulting task
+[FAULT] far=00000000011F2890 dfsc=0000000000000007 elr=00000000011F2890
+
+[EXC] EL0 Fault! PID=120 ESR=0000000082000007 FAR=00000000011F2890 EC=0000000000000020 DFSC=0000000000000007 ELR=00000000011F2890
+[EXC] x0=000000009B335B68 x1=00000[P000F]00 0n0o0 00ad8d resp=s00s0 0s0pac0e0 0fo9B53D4E0
+r faulting task
+[FAULT] far=0000000001F99818 dfsc=0000000000000007 elr=0000000001F99818
+
+[EXC] EL0 Fault! PID=133 ESR=0000000082000007 FAR=0000000001F99818 EC=0000000000000020 DFSC=0000000000000007 ELR=0000000001F99818
+[EXC] x0=00000000BB423290 x1=00000000BA78E2E0 sp=00000000BB422A40
+[PF] no address space for faulting task
+[FAULT] far=00000000300A800C dfsc=0000000000000004 elr=00000000300A800C
+
+[EXC] EL0 Fault! PID=128 ESR=0000000082000004 FAR=00000000300A800C EC=0000000000000020 DFSC=0000000000000004 ELR=00000000300A800C
+[EXC] x0=0000000000000000 x1=0000000000000000 sp=00000000BA99C340
+
+
+========================================================================
+CENSUS — `busd::peers: unknown destination:` by name
+========================================================================
+  (none seen — check that RUST_LOG reached busd; the line is a warn!)
+  total lines: 0   distinct names: 0
+
+  prediction (the four autostarted single-instance components):
+    MISS com.system76.CosmicLauncher
+    MISS com.system76.CosmicOnScreenDisplay
+    MISS com.system76.CosmicWorkspaces
+    MISS com.system76.CosmicAppLibrary
+
+========================================================================
+FAULTS
+========================================================================
+  x86_64 `user page fault ... task killed` : 0
+  aarch64 `[EXC] EL0 Fault!`               : 4
+        1  FAR=0000000000000880
+        1  FAR=00000000011F2890
+        1  FAR=0000000001F99818
+        1  FAR=00000000300A800C
+
+========================================================================
+MEMORY (sysinfo(2), i.e. the buddy allocator's own view)
+========================================================================
+  boot         total=  1978.6 MiB  free=  1938.5 MiB  used=    40.1 MiB  (2%)  procs=5
+  wayland1     total=  1978.6 MiB  free=  1888.0 MiB  used=    90.6 MiB  (4%)  procs=8
+  trough: wayland1 with 1888.0 MiB free
+  `[SCHED] task table FULL`                : 0
+  userspace `Out of memory (os error 12)`  : 0
+
+========================================================================
+PROBE — hand-started second copies, stderr byte counts
+========================================================================
