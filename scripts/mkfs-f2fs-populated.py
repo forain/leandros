@@ -293,7 +293,10 @@ def main():
     # that dispatches on argv[0], so every name below is a hardlink to the same
     # inode (add_files_to_dir dedupes by host path); the content is stored once.
     coreutils_target = "aarch64-unknown-linux-musl" if arch == "aarch64" else "x86_64-unknown-linux-musl"
-    p = f"../coreutils/target/{coreutils_target}/release/coreutils"
+    # Kept in its own name because /usr/bin/env is staged from it further down,
+    # long after the loop below has reused `p`.
+    coreutils_bin = f"../coreutils/target/{coreutils_target}/release/coreutils"
+    p = coreutils_bin
     if os.path.exists(p):
         bin_files.append(("coreutils", p, 0o100755))
         for util in coreutils_command_names("../coreutils"):
@@ -877,6 +880,30 @@ def main():
         if _dirpath != "/etc":
             m4_share_dirs.add(_dirpath)
         m4_share_files.append((_dirpath, _name, _src))
+
+    # /usr/bin/env — the POSIX path, as a second name for the coreutils
+    # multicall. It is what makes an authenticated login actually reach a
+    # session: cosmic-greeter builds EVERY session command as
+    #   ["/usr/bin/env", "K=V", ..., <the .desktop Exec words>]
+    # ("Session exec may contain environmental variables",
+    # cosmic-greeter/src/greeter.rs), so the path is not optional and is not
+    # something greetd or the .desktop file can steer.
+    #
+    # Its absence is invisible at every layer, which is why it cost a lane a
+    # day: brush's `exec` of a missing ABSOLUTE path prints nothing (measured
+    # on target — a bare name does print "command not found", an absolute one
+    # does not), and greetd throws a session's exit status away
+    # (session/worker.rs: `waitpid(child, None)` -> `Ok(_) => break`). The only
+    # symptom is the greeter reappearing a second after a correct password.
+    #
+    # A second directory entry costs no content: add_files_to_dir dedupes by
+    # host path and hardlinks, exactly as the ~100 names in /bin already do.
+    # Dispatch is safe — the musl build of uutils takes its util name from
+    # Path::file_stem(argv[0]) (src/common/validation.rs `binary_path`, the
+    # `target_env = "musl"` arm), so "/usr/bin/env" selects `env`.
+    if os.path.exists(coreutils_bin):
+        m4_share_dirs.add("/usr/bin")
+        m5_exec_files.append(("/usr/bin", "env", coreutils_bin))
 
     # The session launcher itself (a POSIX-sh script). The kernel execve()s ELF
     # only (no "#!"-shebang binfmt), so it is run as `sh /bin/start-cosmic-leandros`.
