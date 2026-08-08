@@ -334,6 +334,36 @@ reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print i
 
 **Kernel invariants.**
 
+- **Filesystem permissions are enforced on ONE operation only: `open(2)` of an inode that
+  already exists.** Measured 2026-08-08 by enumerating every `xattr::access_check` call
+  site in the tree; there are five outside the xattr crate's own gates, and **each takes a
+  fully-resolved existing inode as its subject — not one takes a parent directory**:
+  `servers/vfs/src/lib.rs:3010` (opendir of a tmpfs directory, read bit on that directory),
+  `servers/vfs/src/lib.rs:3031` (open of an existing tmpfs file),
+  `servers/vfs/src/lib.rs:6231` (`access(2)` on a tmpfs pool entry),
+  `servers/f2fs/src/lib.rs:1935` (open of an existing f2fs inode), and
+  `servers/f2fs/src/lib.rs:3151` (`access(2)` on an f2fs inode). The two in
+  `servers/xattr/src/lib.rs:298,329` are the getxattr/setxattr gates on the target inode,
+  also not parent checks. **Therefore, for any uid:** path traversal reads no `mode`/`uid`/
+  `gid` on any component (`tmp_resolve_links`, `resolve_path_ex`); **creating** an entry
+  inside a directory — `open` with `O_CREAT`, `mkdir`, `mknod`, `symlink`, `rename`,
+  `unlink`, AF_UNIX `bind` — checks only that the parent *exists*; and AF_UNIX `connect`
+  discards the caller outright (`servers/vfs/src/lib.rs:5645` is literally
+  `unix_resolve_node(_pid: u32, path: &[u8])`). **Every `0700` in the image is
+  documentation, not enforcement.** A uid-1000 process can create files and sockets inside
+  a `0700 root` directory and connect to a root-owned socket unimpeded.
+  **Temperature: correctness debt, not a vulnerability report** — this is a hobby OS under
+  QEMU with no untrusted users, and nothing here is reachable by an attacker who is not
+  already running code. It becomes real the moment "multi-user" means anything, which is
+  closer than it was: the image now has a login screen and a second account. **Two live
+  arrangements silently depend on this gap** and both break in the same instant if the VFS
+  grows correct enforcement: the greeter reaching `wayland-1` under `0700`-root
+  `/run/user/0`, and the greeter reaching greetd's root-owned control socket. The recorded
+  end state for both is `WAYLAND_SOCKET` fd inheritance plus a greeter-owned socket
+  directory (`GREETD_SOCK_DIR`).
+  **This supersedes the weaker version** stated in `ports/greetd`'s launcher work, which
+  established that traversal and `connect` were unenforced but did not establish the
+  boundary, and so left "can a dropped greeter *create* anything?" open. It can.
 - Never touch user memory under `RUN_QUEUE` or any IRQ-off spinlock. Use
   `validate_user_buf`/`read_user_buf`/`write_user_buf`. A re-entrant `RUN_QUEUE`
   deadlock from exactly this froze all four vCPUs once (fixed in `82d0cc3`).
