@@ -109,14 +109,43 @@ impl PortEntry {
 // a kernel.
 //
 // Pragmatic solution: keep MAX_PORTS at 65536 for the port-ID namespace, but
-// the backing array holds only BUCKET_COUNT = 4096 buckets.  Port IDs are
-// assigned within [0, MAX_PORTS) but stored at index (id % BUCKET_COUNT).
-// Collision chains are resolved by linear probing up to PROBE_LIMIT steps.
-//
-// This gives a compact static (4096 × sizeof(PortEntry)) while still allowing
-// port IDs up to 65535.
-const LIVE_BUCKETS: usize = 64;
+// back it with LIVE_BUCKETS buckets.  Port IDs are assigned within
+// [0, MAX_PORTS) and stored at index (id % LIVE_BUCKETS); collision chains are
+// resolved by linear probing up to PROBE_LIMIT steps.  That keeps the static
+// affordable while still allowing port IDs up to 65535.
+/// Number of message queues the table can hold **at once**.
+///
+/// This -- not `MAX_PORTS`, which only bounds the ID namespace -- is the
+/// system-wide ceiling on live ports. Every task that reaches a server through
+/// `servers::vfs::call_port` holds one of these as its reply port from its
+/// first call until it exits, so the consumers are threads rather than
+/// processes and a session of multithreaded clients spends them fast. Running
+/// out is reported to userspace as ENOMEM and nothing else, which is
+/// indistinguishable from being out of RAM unless the kernel says so: see
+/// `report_table_full`.
+///
+/// It was 64, and that was the ceiling a COSMIC session was living against.
+/// Measured on x86_64/KVM with `PORT_STATS`: a stock session climbs to 61/64
+/// by the time the desktop settles and touches 64/64 once four more components
+/// are started by hand, all with 1.2 GiB of RAM free. With the busd
+/// `ServiceUnknown` reply staged -- which lets four autostarted components run
+/// instead of parking in a D-Bus probe -- it goes over during startup, and the
+/// resulting errno 12 out of `stat("/usr/share/X11/xkb")` makes
+/// `xkb_context_new` return NULL, which SCTK dereferences.
+///
+/// A bucket carries a 16-deep queue of 440-byte inline messages, so it is
+/// ~7.5 KiB and the table is a static: 64 cost ~0.5 MiB, 512 costs ~3.8 MiB.
+/// That buys 8x the measured peak, in a kernel that already spends 4.2 MiB of
+/// BSS on the tmpfs pool. `report_table_full` stays, so the next time this is
+/// the ceiling it says so in one line instead of costing an investigation.
+const LIVE_BUCKETS: usize = 512;
 const PROBE_LIMIT:  usize = 16;
+
+/// Trace every new high-water mark in live-bucket occupancy. Committed
+/// `false`; flip to `true`, rebuild release, and the boot prints at most
+/// `LIVE_BUCKETS` lines showing how close the table came to full and which
+/// task pushed it there.
+pub const PORT_STATS: bool = false;
 
 struct PortTable {
     buckets: [PortEntry; LIVE_BUCKETS],
@@ -157,6 +186,12 @@ impl PortTable {
         None
     }
 
+    /// Live (neither free nor tombstoned) buckets. A linear scan of the whole
+    /// table, so callers on the success path must gate it on `PORT_STATS`.
+    fn occupancy(&self) -> usize {
+        self.buckets.iter().filter(|b| !b.is_available()).count()
+    }
+
     /// Allocate an empty bucket for a new port owned by `owner_pid`.
     /// Returns `(port_id, bucket_index)` on success, `None` if full.
     /// Tombstone slots may be reused.
@@ -181,8 +216,43 @@ impl PortTable {
                 }
             }
         }
+        report_table_full(self.occupancy());
         None
     }
+}
+
+/// Report an exhausted port table once per boot.
+///
+/// Every caller of `create` turns `None` into ENOMEM -- `servers::vfs::call_port`
+/// does it for every operation on a mounted filesystem -- so userspace sees
+/// errno 12 and nothing else, with any amount of physical memory free. Once is
+/// enough: the table stays full, and an ungated print would be one line per
+/// failed call on a console that costs ~0.19 s per line.
+fn report_table_full(live: usize) {
+    use core::sync::atomic::AtomicBool;
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if REPORTED.swap(true, Ordering::Relaxed) { return; }
+    port_serial_debug("\n[IPC] port table FULL: ");
+    port_serial_dec(live);
+    port_serial_debug("/");
+    port_serial_dec(LIVE_BUCKETS);
+    port_serial_debug(" live buckets -- port::create now fails, and every caller\n");
+    port_serial_debug("[IPC] turns that into ENOMEM; this is ipc::port::LIVE_BUCKETS, not RAM\n");
+}
+
+/// Trace a new occupancy high-water mark. Gated on `PORT_STATS`; at most
+/// `LIVE_BUCKETS` lines per boot, because the mark only ever rises.
+fn note_high_water(live: usize, owner_pid: u32) {
+    if !PORT_STATS { return; }
+    static HIGH: AtomicUsize = AtomicUsize::new(0);
+    if HIGH.fetch_max(live, Ordering::Relaxed) >= live { return; }
+    port_serial_debug("[IPC] ports live=");
+    port_serial_dec(live);
+    port_serial_debug("/");
+    port_serial_dec(LIVE_BUCKETS);
+    port_serial_debug(" new high water, pid=");
+    port_serial_dec(owner_pid as usize);
+    port_serial_debug("\n");
 }
 
 static PORT_TABLE: Mutex<PortTable> = Mutex::new(PortTable::new());
@@ -191,6 +261,14 @@ extern "C" { fn arch_serial_putc(c: u8); }
 
 fn port_serial_debug(msg: &str) {
     for &b in msg.as_bytes() { unsafe { arch_serial_putc(b); } }
+}
+
+fn port_serial_dec(mut v: usize) {
+    if v == 0 { unsafe { arch_serial_putc(b'0') }; return; }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while v > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+    for &b in &buf[i..] { unsafe { arch_serial_putc(b) }; }
 }
 
 fn port_serial_hex(v: u32) {
@@ -206,28 +284,35 @@ pub fn init() {}
 
 /// Close all ports owned by `pid`.
 pub fn release_by_owner(pid: u32) {
-    let mut closed: [Option<Port>; 64] = [None; 64];
-    let mut n_closed = 0usize;
+    // The batch is a stack buffer, so it is bounded; the outer loop is what
+    // keeps that bound from becoming a silent cap. Tombstoning happens under
+    // the table lock and waking happens outside it, so a task owning more
+    // ports than one batch used to have the surplus closed but never woken.
+    const BATCH: usize = 64;
+    loop {
+        let mut closed: [Option<Port>; BATCH] = [None; BATCH];
+        let mut n_closed = 0usize;
 
-    {
-        let mut table = PORT_TABLE.lock();
-        for bucket in table.buckets.iter_mut() {
-            if !bucket.is_free() && !bucket.is_tombstone() && bucket.owner_pid == pid {
-                let id = bucket.id;
-                // Use tombstone to preserve the probe chain for other ports.
-                *bucket = PortEntry::tombstone();
-                if n_closed < closed.len() {
+        {
+            let mut table = PORT_TABLE.lock();
+            for bucket in table.buckets.iter_mut() {
+                if n_closed == BATCH { break; }
+                if !bucket.is_free() && !bucket.is_tombstone() && bucket.owner_pid == pid {
+                    let id = bucket.id;
+                    // Use tombstone to preserve the probe chain for other ports.
+                    *bucket = PortEntry::tombstone();
                     closed[n_closed] = Some(id);
                     n_closed += 1;
                 }
             }
         }
-    }
 
-    for i in 0..n_closed {
-        if let Some(port) = closed[i] {
-            sched::unblock_port(port);
+        for slot in closed.iter().take(n_closed) {
+            if let Some(port) = *slot {
+                sched::unblock_port(port);
+            }
         }
+        if n_closed < BATCH { return; }
     }
 }
 
@@ -243,7 +328,20 @@ pub fn close(port: Port) {
 /// Allocate a new port owned by `pid`.  Returns the port number.
 pub fn create(pid: u32) -> Option<Port> {
     let mut table = PORT_TABLE.lock();
-    table.alloc(pid).map(|(id, _)| id)
+    let r = table.alloc(pid);
+    // The occupancy scan is O(LIVE_BUCKETS) and this is the hot path, so it is
+    // behind the flag rather than merely reported behind it.
+    if PORT_STATS && r.is_some() {
+        let live = table.occupancy();
+        note_high_water(live, pid);
+    }
+    r.map(|(id, _)| id)
+}
+
+/// Live buckets and the table's capacity, so a caller can report the pressure
+/// rather than only its failure.
+pub fn census() -> (usize, usize) {
+    (PORT_TABLE.lock().occupancy(), LIVE_BUCKETS)
 }
 
 /// Enqueue `msg` on `port`.
