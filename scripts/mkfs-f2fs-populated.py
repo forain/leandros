@@ -247,7 +247,7 @@ def main():
     
     bin_files = []
     bins = [
-        "shell", "login", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
+        "shell", "login", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest",
         "waittest", "sigchldtest", "scmtest", "epolltest", "wakepolltest", "idletest", "drmsmoke", "evtest2", "venustest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
@@ -358,28 +358,14 @@ def main():
         b"leandro:x:1000:1000:leandro:/home/leandro:/bin/brush\n"
     )
     etc_files.append(("passwd", passwd_bytes, 0o100644))
-    # Two alternate passwd files for greeter bring-up, neither of them in use
-    # until something copies one over /etc/passwd.
-    #
-    # These are the BRING-UP SCAFFOLD, superseded by the real cosmic-greeter
-    # account above and by /bin/greeter-launch. passwd.greeter reaches the
-    # greeter role without dropping privileges, by putting a second, uid-0
-    # "cosmic-greeter" entry ahead of root so getpwuid(0) answers with that name
-    # (musl returns the first uid match). Lookups by NAME are unaffected, which
-    # is all /bin/login does; passwd.system is the pristine file to copy back
-    # afterwards, and the copy persists because the root filesystem is writable.
-    #
-    # The cost of the scaffold is why it is scaffolding: getpwuid(0) answers
-    # "cosmic-greeter" for EVERY caller in the image, not just the greeter, and
-    # it needs a file copied over /etc/passwd at boot and undone by hand. Delete
-    # both files, and the passwd-greeter data file, once the launcher has been
-    # photographed reaching the login screen at uid 990.
-    _pw_greeter = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "..", "ports", "greetd", "data", "passwd-greeter")
-    if os.path.exists(_pw_greeter):
-        with open(_pw_greeter, "rb") as f:
-            etc_files.append(("passwd.greeter", f.read(), 0o100644))
-        etc_files.append(("passwd.system", passwd_bytes, 0o100644))
+    # There is deliberately no /etc/passwd.greeter here any more. The bring-up
+    # scaffold reached the greeter role by adding a SECOND, uid-0
+    # "cosmic-greeter" entry ahead of root and copying that file over
+    # /etc/passwd at boot, so getpwuid(0) answered with the greeter's name. It
+    # worked, and its cost was that getpwuid(0) then answered "cosmic-greeter"
+    # for every caller in the image and the change persisted across boots on a
+    # writable root. /bin/greeter-launch replaces it by becoming the account for
+    # real, so /etc/passwd is left alone.
     etc_files.append(("group", (
         b"root:x:0:\n"
         b"cosmic-greeter:x:990:\n"

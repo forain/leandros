@@ -21,14 +21,10 @@ set -u
 
 # cosmic-greeter picks its role purely by the name getpwuid(getuid()) returns:
 # "cosmic-greeter" -> greeter::main(), anything else -> locker::main()
-# (cosmic-greeter/src/main.rs). This milestone keeps the greeter client at uid 0
-# (root compositor, no privilege drop yet, and /run/user/0 is 0700 root), so the
-# name has to come from the passwd file instead: passwd-greeter is the same
-# three accounts with a uid-0 "cosmic-greeter" entry FIRST, and musl's getpwuid
-# returns the first uid match. root is still reachable by name, which is all
-# /bin/login uses. Restore with:  /bin/cp /etc/passwd.system /etc/passwd
-/bin/cp /etc/passwd.greeter /etc/passwd
-echo "GREETER-FAKE: passwd role switch done"
+# (cosmic-greeter/src/main.rs). Nothing is copied over /etc/passwd for that any
+# more: cosmic-comp's kiosk child is /bin/greeter-launch, which drops to the
+# real cosmic-greeter account (uid 990) before exec'ing the greeter, so
+# getpwuid returns the name because the process genuinely is that account.
 
 cd "$XDG_RUNTIME_DIR"
 /bin/rm -f greetd.sock 2>/dev/null || true
@@ -40,10 +36,11 @@ cd "$XDG_RUNTIME_DIR"
 # "--no-xwayland" and dies with ENOENT, while `cosmic-comp <exec> --no-xwayland`
 # both disables Xwayland and spawns <exec>. The flag is then also handed to
 # cosmic-greeter, whose own argument loop ignores what it does not recognise.
-# The greeter is staged as cosmic-greeter-login so that cosmic-session cannot
-# spawn the same binary in its lock-screen role; the login role comes from the
-# invoking account, not from the file name.
+# greeter-launch passes those leftover arguments straight through to the
+# greeter. The greeter is staged as cosmic-greeter-login so cosmic-session
+# cannot spawn the same binary in its lock-screen role; the login role comes
+# from the invoking account, not from the file name.
 # --no-xwayland is not optional: smithay's Xwayland-socket bind-error path leaks
 # fds -> EMFILE -> a softpipe NULL-transfer crash at first scanout.
 echo "GREETER-FAKE: launching fakegreet in $XDG_RUNTIME_DIR"
-exec /bin/fakegreet "/bin/cosmic-comp /bin/cosmic-greeter-login --no-xwayland"
+exec /bin/fakegreet "/bin/cosmic-comp /bin/greeter-launch --no-xwayland"

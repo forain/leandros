@@ -299,6 +299,16 @@ documented slirp configuration. Also, proven by an A/B control against a pre-pat
 kernel: on slirp, aarch64 never prints the `[NET] DHCP configured` line, though it does
 reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print it.
 
+**The permission gap the greeter's privilege drop depends on is stated in full under *Kernel
+invariants*** — "Filesystem permissions are enforced on ONE operation only: `open(2)` of an
+inode that already exists". That entry supersedes the narrower version written while
+designing the drop, which established that path-walk and `AF_UNIX` connect were unenforced
+but stopped there and so left open whether a dropped greeter could *create* anything. It
+can: entry creation checks only that the parent exists. Both of this launcher's live
+dependencies — reaching `wayland-1` under `0700`-root `/run/user/0`, and reaching greetd's
+root-owned control socket — are named there as the two arrangements that break together if
+the gap is ever closed.
+
 **Committed architecture** (settled; revisit only with a reason):
 
 - COSMIC builds for `*-unknown-linux-musl`, **dynamically linked** against a real

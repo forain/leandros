@@ -17,10 +17,9 @@ set -u
 
 . /bin/greeter-env
 
-# Same role switch as greeter-fake — see the comment there. greetd's
-# default_session.user is "root", so the greeter client is still uid 0.
-/bin/cp /etc/passwd.greeter /etc/passwd
-echo "GREETER-REAL: passwd role switch done"
+# No passwd role switch — see greeter-fake. greetd's default_session.user stays
+# "root" so cosmic-comp keeps its privileges; /bin/greeter-launch, the kiosk
+# child named in greetd.conf, is what drops to uid 990.
 
 # greetd binds its control socket at <dir>/greetd-<pid>.sock, and upstream
 # hardcodes <dir> = /run because on Linux /run is a tmpfs. On LeandrOS /run is

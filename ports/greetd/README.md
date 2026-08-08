@@ -183,19 +183,35 @@ Guest RAM made no difference: the screen is byte-identical at `-m 2G` and
 cosmic-greeter has no flag and no environment variable for its role: it runs
 `greeter::main()` when `getpwuid(getuid())` is named `cosmic-greeter` and
 `locker::main()` otherwise (`cosmic-greeter/src/main.rs`). The greeter client is
-still uid 0 on the path this README first measured — the name was supplied by
-`/etc/passwd.greeter`, the same accounts with a uid-0 `cosmic-greeter` entry
-ahead of `root` (musl's `getpwuid` returns the first uid match), with
-`/etc/passwd.system` as the undo. That is scaffolding for the first photograph,
-not the shipping arrangement.
+uid 0 on the path this README first measured, with the name supplied by copying
+a uid-0 `cosmic-greeter` entry over `/etc/passwd`. **That scaffold is gone.**
 
-**The image now also carries the real account**: `cosmic-greeter:x:990:990`
-with home `/home/cosmic-greeter` and shell `/bin/false`. The uid is below 1000
-because cosmic-greeter's own `UserFilter` defaults to `UID_MIN 1000` with no
-`/etc/login.defs` present, and it would otherwise offer the greeter's own account
-as a login choice; the `/bin/false` shell excludes it a second, independent way.
-Delete `passwd.greeter`/`passwd.system` and the `cp` in the launchers once the
-launcher path has been photographed.
+The image carries a real account — `cosmic-greeter:x:990:990`, home
+`/home/cosmic-greeter`, shell `/bin/false` — and cosmic-comp's kiosk child is
+`/bin/greeter-launch`, which looks that account up, `setresgid`/`setresuid`s to
+it, reads its uid back to prove the drop happened, and `execve`s
+`/bin/cosmic-greeter-login`. The uid is below 1000 because cosmic-greeter's own
+`UserFilter` defaults to `UID_MIN 1000` with no `/etc/login.defs` present and
+would otherwise offer the greeter's account as a login choice; the `/bin/false`
+shell excludes it a second, independent way.
+
+**What still runs as root, and why:** cosmic-comp. libseat is a shim with no
+seatd behind it, there is no VT layer, and the `/dev/dri` and `/dev/input` node
+modes are unverified, so the compositor cannot yet be unprivileged. greetd's
+`default_session.user` cannot express this — it applies to the whole session
+command — which is why the boundary is a separate binary rather than a config
+line.
+
+**What makes the drop survivable, stated because it is a kernel gap and not a
+design:** the greeter reaches both the compositor's `wayland-1` under the
+`0700 root` `/run/user/0` and greetd's own control socket, because this kernel
+checks neither. Path resolution applies no search-permission test on any
+component (`servers/vfs` `tmp_resolve_links`, `servers/f2fs` `resolve_path_ex`),
+and `AF_UNIX` connect discards the caller entirely — `servers/vfs`
+`unix_resolve_node` takes a pid and never uses it, so a socket's owner and mode
+are never consulted. If path-walk permission is ever enforced, the greeter loses
+both sockets at once; the fix then is `WAYLAND_SOCKET` fd inheritance for the
+compositor half and a socket directory the greeter account owns for greetd's.
 
 ### Guest files
 
@@ -203,8 +219,8 @@ launcher path has been photographed.
 |---|---|
 | `/bin/greetd`, `/bin/fakegreet` | the two binaries |
 | `/bin/greeter-env` | the shared render environment, sourced by both launchers |
-| `/bin/greeter-fake` | fakegreet + cosmic-comp + cosmic-greeter-login |
+| `/bin/greeter-launch` | drops to the cosmic-greeter account, execs the greeter |
+| `/bin/greeter-fake` | fakegreet + cosmic-comp + greeter-launch |
 | `/bin/greeter-real` | the daemon |
 | `/etc/greetd/greetd.conf`, `/etc/pam.d/greetd`, `/etc/profile` | config |
-| `/etc/passwd.greeter`, `/etc/passwd.system` | the role switch and its undo |
 | `/usr/share/wayland-sessions/cosmic.desktop` | the session the greeter offers |

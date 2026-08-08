@@ -66,6 +66,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "leandros-greeter-launch"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
+]
+
+[[package]]
 name = "leandros-init"
 version = "0.1.0"
 dependencies = [
