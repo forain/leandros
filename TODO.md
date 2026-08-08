@@ -1041,17 +1041,74 @@ iced + `tiny-skia` work correctly on LeandrOS/aarch64.**
 **The compositor was never a suspect and now there is a photograph.** The same boot shows
 wallpaper, panel bar, a legible ticking clock and `wlclient`'s window composited together.
 
-**THE OBVIOUS FIX REGRESSES THE SESSION — do not re-derive it and land it.** A patch making
-busd reply `ServiceUnknown` to an undeliverable `MethodCall` compiles clean and was staged for
-both arches; the resulting image **crash-loops** — 9 `[EXC] EL0 Fault!` records, mostly a null
-deref at `FAR=0x880`, `x0=0`, same code offset in rising PIDs, session dead after
-`wayland-1 after 1s`. Runs 1, 2 and 4 have **zero**. busd was the only image delta. busd is back
-to stock and the patch is not in the tree. **Two candidate repairs remain, both LeandrOS-side:**
-(a) work out what the error reply breaks and land a correct busd patch (`ports/busd` already
-carries `current-thread-runtime.patch`, so the mechanism exists); (b) export
-`COSMIC_SINGLE_INSTANCE=false` from `start-cosmic-leandros`, which is our own launcher — a
-one-line unblock that leaves the underlying "any blocking call to an unowned name hangs
-forever" defect in place for everything else.
+**THE CENSUS IS DONE, x86_64/KVM, 2026-08-08** — six boots, fresh images each, evidence in
+`artifacts/notes/m17-servicename-census-20260808/` (`artifacts/m17_census.py` +
+`artifacts/m6-session-data/m17-census`). A complete session log, with busd given a file of its
+own to write it into, holds **ten distinct unowned names in the first ten seconds** and
+**all four autostarted single-instance components appear exactly once each**, inside 200 ms of
+one another: `CosmicLauncher` t+8.434, `CosmicOnScreenDisplay` t+8.436, `CosmicWorkspaces`
+t+8.454, `CosmicAppLibrary` t+8.635. Item 8's "blamed wholly on a missing keybinding" is
+superseded: those three have been parked in this probe at startup, every boot, since they were
+staged. Six of the ten names are not single-instance probes at all
+(`CosmicSettingsDaemon` x6 in one run and x0 in another — that one is a race,
+the four are not), so this is a **class**, not one app's bug.
+Two instrument facts that cost time: `tracing_subscriber`'s `fmt` layer writes to **stdout**,
+so `2>` alone captures nothing; and `EnvFilter::from_default_env()` with `RUST_LOG` unset
+enables **ERROR only**, so the `warn!` is invisible unless `RUST_LOG` is exported *before* busd
+starts.
+
+**THE SERVICEUNKNOWN PATCH IS CORRECT, WORKS, AND IS STILL NOT LANDABLE.** It is preserved,
+unapplied, at `ports/busd/proposed/service-unknown-reply.patch` (`build.sh` globs `*.patch` in
+`ports/busd` only, so `proposed/` is deliberately outside it). It does exactly what it was
+written to do, and the proof is an exit status rather than a log line: with it staged, a
+hand-started second `cosmic-launcher` prints `Successfully activated another instance` /
+`Another instance is running` and **exits 0**, which is reachable only if the *autostarted*
+copy got through the same probe, owns `com.system76.CosmicLauncher` and is serving
+`DbusActivation`. Single-instance behaviour is preserved, which is the thing
+`COSMIC_SINGLE_INSTANCE=false` would throw away. The census corroborates it from the other
+side: the patched session reaches names the stock one never reaches
+(`org.freedesktop.portal.Desktop` x6, `org.freedesktop.login1`).
+
+**What blocks it is downstream of busd and is now attributed by a control.** With the patch the
+panel bar and its ticking clock disappear and 2-4 processes per boot die on a null dereference
+at `CR2=0x880` — the *exact* aarch64 signature (`xkb_context_new` returning NULL on a failed
+allocation, wrapped without a null check by the `xkbcommon` crate, handed straight through by
+SCTK at `wl_keyboard` bind), now reproduced on x86_64. `cosmic-files-applet` is one of the
+dying processes by name; `launch_pad` restarts it. Held constant across the pair **including
+the kernel**, with the busd binary as the only image delta:
+
+| busd | panel bar + clock | `CR2=0x880` deaths |
+|---|---|---|
+| stock | present, ticking | **0** |
+| ServiceUnknown | **gone** | **2-4** |
+
+**The recorded memory hypothesis is REFUTED, and that is the durable finding.** The story was
+"four extra iced apps exhaust a 2 GiB guest". `/bin/meminfo` (new; reads `sysinfo(2)`, which
+`sys_sysinfo` has always filled from the buddy allocator and which nothing had ever called)
+reports **1186-1243 MiB free** across the whole of the run that contains the four deaths, and
+**1234 MiB free** at the moment three `exec`s fail with `Out of memory (os error 12)`. At
+**`-m 4G`** (now `LEANDROS_QEMU_MEM`) the `CR2=0x880` deaths are **still there**. Doubling
+physical memory does not satisfy whatever allocation is failing.
+**"Out of memory" on this system does not mean "out of RAM"** — `fork`/`clone` return ENOMEM
+the moment `runqueue::MAX_TASKS` is reached and `sys_mmap` has a dozen ENOMEM returns of its
+own, all indistinguishable in userspace. The kernel now names one of them out loud
+(`[SCHED] task table FULL: n/256 ... this is runqueue::MAX_TASKS, not RAM`); **it never fired**,
+so the task table is not the ceiling and the suspects are all in `mmap`/`brk`.
+
+**Next step, and it is cheap:** a gated print at every ENOMEM return in `sys_mmap`/`sys_brk`
+naming the site; one instrumented boot with the patched busd then says which one, and the fix
+follows from the answer instead of from a guess. The `xkbcommon` crate's missing null check is
+the proximate cause and is upstream's, but a correct `mmap` is ours.
+**Do NOT reach for `COSMIC_SINGLE_INSTANCE=false` as the safe alternative** — it is inherited
+by every child of `cosmic-session`, unblocks the same four components and therefore carries the
+same crash, while additionally giving up the APP_ID ownership the patch preserves.
+
+**A 4 GiB guest is separately not usable.** One 4G boot died with a kernel page fault in
+`mm::buddy::free` — `Vector=0xE`, `ErrCode=0` (kernel-mode *read* of a not-present page),
+`RIP=0xFFFFFFFF8014043A`, `CR2=0xFFFF80000EAC8000`, symbolised against
+`target/final-x86_64/kernel`. The buddy's free lists are intrusive (`next` at byte 0, `prev` at
+byte 8 of the free block, read through the HHDM), so that is a corrupted or out-of-range link
+rather than exhaustion. It did not recur on the second 4G boot and has never been seen at 2G.
 
 **This is NOT the cosmic-panel bug, and the recorded instruction to treat them as one
 investigation is withdrawn.** The panel rasterises its bar with `iced_tiny_skia` into a
@@ -1088,8 +1145,13 @@ cosmic-panel.
 **Why this is the highest-leverage cheap row:** `cosmic-launcher`, `cosmic-app-library` and
 `cosmic-workspaces` are **built, staged, and successfully launched every single boot** — 12
 `launch_pad` starts, max 1 per name, **zero restarts**, four boots, both arches — and all
-three are permanently invisible, purely because the only thing that can raise them resolves to
-nothing.
+three are permanently invisible.
+**"purely because the only thing that can raise them resolves to nothing" is WITHDRAWN.**
+The census (item 7) shows each of the three addressing its own APP_ID once, in the first nine
+seconds of every boot, and blocking there forever. They were launched and they were never
+running. A keybinding could not have raised a process parked in a D-Bus call, so the two causes
+are sequential, not alternative: the probe has to be unblocked before the keybinding question
+can even be asked.
 
 **The config half is DONE (`52665aa`), and the item as written was wrong by one file — the
 more important one.** `system_actions` was never the whole story: `defaults`

@@ -100,6 +100,15 @@ processes blocked in the D-Bus probe.
 Orion wallpaper, with a panel bar and a legible ticking clock in run 1 and
 nothing at all in run 2.
 
+**The lost panel and the null dereferences are two regressions, not one.** Run 2
+has the panel gone and **zero** `CR2=0x880` deaths, and its panel was already
+gone at t+22 s, long before its three `exec` ENOMEMs at t+138 s. So the bar is
+not merely collateral from a crashing applet. `cosmic-panel`'s own chatter in the
+session log falls from **34 lines (stock) to 5 (patched)** while the four
+previously-silent components start appearing, which points at cosmic-panel now
+taking an error return on a call it used to hang on. That is its own
+investigation and it is not started here.
+
 The deaths are the **exact aarch64 signature**, now reproduced on x86_64:
 `CR2=0x0000000000000880`, `err=0x4` (user-mode read of a not-present page), the
 same low bits of `RIP` (`...174`) at four different library load addresses, and
@@ -144,7 +153,27 @@ byte 0 and `prev` at byte 8 of the free block itself, read through the HHDM — 
 a read fault there is a corrupted or out-of-range link, not exhaustion. It did
 not recur in run 5, so it is intermittent; it has never been seen at 2G.
 
-## 6. What this leaves
+## 6. What the four components do once unblocked
+
+Session-log lines per component, same harness, busd the only delta:
+
+| component | stock busd | ServiceUnknown |
+|---|---|---|
+| `cosmic-launcher` | 0 | 1 |
+| `cosmic-app-library` | 0 | 11 |
+| `cosmic-workspaces` | 0 | 2 |
+| `cosmic-osd` | 0 | 1 |
+| `cosmic-panel` | 34 | 5 |
+
+With stock busd all four are **completely silent** — launched, alive, and parked.
+With the reply they start talking, and `cosmic-app-library` gets as far as its
+iced event loop and window management (`No popup to destroy`, `Failed to find
+surface for blur action`). None of them draws anything, which is expected and not
+a failure of the fix: they are activation-gated, nothing raises them, and the
+launcher additionally spawns `pop-launcher` by bare name via PATH — a binary that
+is neither built nor staged — so it would return zero results even when running.
+
+## 7. What this leaves
 
 The proximate cause is not in dispute and is not ours: the `xkbcommon` crate
 wraps `xkb_context_new` without a null check and SCTK hands the result straight
