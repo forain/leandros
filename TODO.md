@@ -977,10 +977,46 @@ next character re-transmits all of it. Measured: 100 lines × 41 chars = 157.9 s
 220 lines × 1 char = 400.6 s (1.821 s/line) — 24× the bytes for the same cost **per line**, and
 `RIP` sampling put 12/12 samples in `memcpy`. A scroll costs the same for eight rows as for
 one, so it now advances `SCROLL_ROWS = 8`: **157.9 s → 19.0 s, 100/100 lines, 300/300 on the
-long probe.** Still the same scroll amortised; removing it needs a write-back shadow *and* a
-write-combining mapping, and `arch/x86_64/src/paging.rs` is explicit that a cached alias of
-host-visible memory is a bug — a separate lane. Full write-up:
-`artifacts/notes/m16-console-throughput-20260808/`.
+long probe.** Full write-up: `artifacts/notes/m16-console-throughput-20260808/`.
+
+**(b′) That deferred lane is now done, and the amortisation is no longer what carries it.**
+The write-up above predicted the real fix exactly — "a write-back shadow *and* a
+write-combining mapping" — and the two halves turned out to be **complementary, not
+redundant**: the shadow removes the *reads*, WC makes the remaining *writes* burst. Landed
+both. `ls -l /bin` on x86_64/KVM at 1920x1080: **~40 s → 0.70 s (57×)**, `SCROLL_ROWS` left
+at 8. vfstest 36/36 on fresh images on both arches.
+
+**Which half did the work, because the split is counter-intuitive and one of them is nearly
+inert.** WC *alone* moved 40 s → 38.7 s — about 3%. `scroll_px` called `core::ptr::copy`
+with the framebuffer as **both source and destination**, and WC accelerates only stores:
+reads from WC memory are uncached exactly like UC-, one transaction per access, no line
+fill, no prefetch. So the mapping change fixed the copy's cheap half. The shadow — an
+8.29 MB write-back copy that all drawing goes to, blitted out a dirty rect at a time — is
+what removed the reads, and it is the whole 57×. **A control confirmed the mechanism before
+the fix was written:** scaling `SCROLL_ROWS` 8 → 32 gave 38.7 s → 6.9 s, i.e. cost tracked
+scroll *count* almost exactly, so the scroll was the entire bill.
+
+**The WC half is additionally bounded by a gap this file already documents.** Under
+*Standing context*, `arch::init`'s re-map fails on **1536 of 2025 pages** because `map_4k`
+cannot split Limine's huge pages, and Limine's own 2 MiB leaves already select PA5 (WC). So
+on x86_64 that loop was mostly *pessimising* the ~489 pages it did reach into UC-, and
+switching it to WC mainly stops doing that. **Do not size the WC change from the 107 %
+blob-copy number** — it is a different mapping with a different owner. The split gap is the
+thing to fix if the blit ever needs to go faster.
+
+**A second, arch-shaped finding worth more than the fix.** The per-character `fb_flush` cost
+**two synchronous virtqueue round-trips per byte**; batching them per `write()` took `ls -l
+/bin` from **10,129 RESOURCE_FLUSH commands to 7** (counted host-side with QEMU's
+`virtio_gpu_cmd_res_flush` tracer). That is an aarch64-only win — x86_64 issues **zero**
+flushes, because Limine hands it a host-visible linear surface QEMU scans out directly.
+**The two halves of this lane each fix exactly one arch, and neither shows on the other.**
+
+**The methodological point, and it is the same one this file keeps re-learning: the Mac
+cannot measure this.** x86_64 there runs under TCG, which does not model memory types at
+all — every mapping is just host RAM. Identical binary, identical command: **1.2 s on the
+Mac, 40 s on the Linux box.** The Mac's numbers were not noisy, they were *structurally
+blind*, and reading them as "x86_64 is fine" would have closed the lane on a measurement
+that could not have failed. **Uncached-memory costs must be measured under KVM.**
 
 **The general lesson, and it has now cost three lanes: an instrument that has to print cannot
 measure anything that printing can stall.** Prefer a host-side witness. Full write-up, the
