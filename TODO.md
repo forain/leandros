@@ -797,7 +797,7 @@ paragraph that leans on "out of scope" with that in mind.
 | 8 | Nothing to launch, and no way to ask for it | Feature — **config DONE**; rest **MIS-SIZED** | `cosmic-term` needs a PTY layer (2-3 wks), not a build |
 | 9 | **5 real applets now ship and run; 2 of them paint nothing** | Feature — panel-death **FIXED**; rendering **OPEN** | 8 processes, 0 exits; tiling + minimize draw zero pixels |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
-| 15 | **~386 KB of extra `.data` stopped the Linux box booting, and nobody knows why** | Bug — **trigger removed, cause OPEN** | Bisected to `MAX_OPEN_FILES` 32→256; `F2FS_MOUNTS` now heap-backed so it cannot recur, but the cliff itself is unexplained |
+| 15 | ~~386 KB of extra `.data` stopped the Linux box booting~~ — it was a **kernel stack overflow** | Bug — **CLOSED** | Not image size and not host-specific: a 155,880 B frame on a 64 KiB stack. Stacks now 128 KiB, frames gated at build time, canary on syscall return |
 | 11 | **PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — greeter one **RETIRED**; session one **cause FIXED** `2d9f0c8` | One patch left; handshake completes 5.022 s → 2.186 s |
 | 12 | **PAM — real support, replacing the C shim** | Feature — **NEW, in scope** | Shim authenticates for real but is C, untracked, coverage unverified |
 | 13 | **utmpx — session accounting, currently absent** | Feature — **NEW, in scope** | Nothing in tree; need is unmeasured |
@@ -1712,41 +1712,66 @@ feature from its name. utmpx could be a fixed-size record appended to two files 
 implementation work against this item until that question is answered**, and record the
 answer here rather than in a lane report.
 
-### 15. ~386 KB of extra `.data` stopped the Linux box booting, and the cause is open
+### 15. The `.data` cliff was a kernel stack overflow — CLOSED 2026-08-09
 
-**Trigger removed 2026-08-09; the underlying fragility is NOT explained.**
+**Root-caused and fixed.** Neither half of how this item was originally written
+survives measurement: the image growth was not the cause, and the Mac was not
+unaffected. The real defect is that `f2fs::mount` compiled to a **155,880 B
+stack frame** and ran on init's **64 KiB kernel stack**, which has no guard
+page. It overwrote ~90 KB of the buddy allocation underneath it.
 
-`0f56aab` raised `MAX_OPEN_FILES` 32 → 256. `F2FS_MOUNTS` held `MountState`
-inline behind a `Mutex`, so rustc emitted it initialised: the table went from
-188,936 B to 574,976 B **of `.data`**, growing the kernel image ~386 KB. That
-alone stopped the x86_64 Linux box booting — on *both* architectures — with init
-page-faulting on its own stack during the f2fs mount. The same kernel booted
-fine on the Mac.
+`MAX_OPEN_FILES` 32 → 256 was a correct bisection to the wrong quantity. It
+moved two things at once — `.data` by 386 KB *and* `size_of::<MountState>()`
+from 23,617 B to 71,872 B — and only the second one mattered. `MountState` is
+assembled as a stack temporary before being moved into the table, so the
+constant that sizes the struct is the constant that sizes the frame.
 
-Ruled out along the way, each by measurement rather than argument: host packages
-(qemu 11.0.1 installed May 30, no pacman transaction since Jul 28), a full root
-disk, KVM vs TCG, guest RAM, SMP (`-smp 1` still fails, with a *different* wild
-fault), the box's own build (the Mac's kernel image faults there too), and
-framebuffer geometry (1920x1080 on both). The one measured difference between
-the hosts is firmware placement — initrd at `0x7C00D000` on the Mac vs
-`0x7E037000` on the box.
+Four measurements, each falsifying part of the original account:
 
-**Fixed by removing the lever, not the cause.** `F2FS_MOUNTS` is now
-`[Option<Box<MountState>>; MAX_MOUNTS]` — one null-pointer-optimised word per
-slot, so all-`None` is all-zero and the static is 72 B in `.bss`. The kernel
-went 14,860,768 → 14,281,632 B, *smaller* than it was at 32 slots, and
-`MAX_OPEN_FILES` no longer touches the image at all.
+| Experiment | Result |
+|---|---|
+| 386 KB of inert `.data` padding, fixed f2fs, on the box | **boots** |
+| 600 KB of padding — a *larger* `.data` than the broken build ever had | **boots** |
+| Pre-fix f2fs (`fe0befb`), unmodified, on the **Mac** | `[PF] no address space for faulting task` + a kernel exception at `RIP=0`; reaches a login prompt anyway |
+| Pre-fix f2fs, unmodified, box, kernel stack 64 KiB → 512 KiB | **boots, zero faults**, from the byte-identical 14,862,432 B image that faults at 64 KiB |
 
-Landmine for whoever builds on this: `Box::new(MountState { .. })` is the
-obvious spelling and is wrong here. rustc materialises the ~72 KB struct as a
-stack temporary first — measured `sub rsp, 0x260E8`, a 155,880 B frame against
-the 128 KB boot stack in `kernel/src/x86_64_start.rs:17`. The mount path builds
-the value in place through `Box::new_uninit()` instead, which takes the frame to
-12,392 B. Verified 36/36 vfstest on fresh volumes, both arches, both machines.
+So image size never mattered, and the host asymmetry was survivability, not
+susceptibility: both hosts corrupt, and what the ~90 KB lands on depends on
+buddy allocation order, which follows the firmware memory map. The Mac limps
+past it — which is why it read as "works on the Mac" for a day. The memory maps
+themselves were dumped and compared entry by entry: structurally identical,
+nothing overlapping, kernel and initrd exactly where Limine says.
 
-**Still open**: *why* ~386 KB of image growth is fatal on one host and free on
-another. Until that is understood, any future kernel growth can resurrect this,
-and the next occurrence will not have a one-line constant to bisect to.
+**What changed.**
+
+- Kernel stacks are 128 KiB, not 64 KiB (`sched::KERNEL_STACK_ORDER`), and the
+  size lives in **one** place instead of the five bare `4`/`PAGE_SIZE * 16`
+  literals — an allocation, a top-of-stack calculation and two frees that all
+  had to agree and that nothing checked. Even after the f2fs fix the largest
+  legitimate frame in the tree is 33,824 B: 53 % of a 64 KiB stack, spent by a
+  single frame, with the whole call chain below it still to pay for.
+- `scripts/check-stack-frames.py` reads the `.stack_sizes` section that
+  `-Zemit-stack-sizes` puts in the linked ELF and **fails the build** if any
+  frame exceeds 48 KiB. Wired into both `build-all.sh` and
+  `m7z2-kernel-only.sh`. Pure stdlib, no llvm tools, no disassembly heuristics
+  — exact backend numbers. Against the pre-fix tree it names
+  `f2fs_server::mount` at 155,928 B *and* `syscall::sys_umount2` at 72,200 B,
+  a second overflow of the old 64 KiB stack that nobody had noticed.
+- A canary in the lowest word of every kernel stack, verified on syscall
+  return: one mask and one compare, no lock and no task lookup, because the
+  buddy allocator hands out naturally-aligned blocks so the stack base is just
+  the stack pointer with the low bits cleared. Against the pre-fix tree it
+  prints `*** KERNEL STACK OVERFLOW *** pid=2 syscall=0xA5` — the mount
+  syscall, named, at the moment it happens.
+
+**The landmine still stands and is now enforced rather than remembered.**
+`Box::new(MountState { .. })` materialises the struct on the stack before
+moving it into the allocation; `mount()` builds it in place through
+`Box::new_uninit()` (frame: 12,440 B). What is new is that getting this wrong
+no longer produces a passing build.
+
+Verified: both arches × both machines boot with zero faults, and the full
+regression suite on freshly generated f2fs volumes.
 
 ### 14. VT switching — was out of scope, now required
 
