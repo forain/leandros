@@ -6,7 +6,7 @@ Leandros follows the classic microkernel design: the kernel itself provides only
 
 On top of that microkernel core sits a **Linux-compatible syscall personality**: the dispatcher implements the real Linux syscall numbers, so unmodified `*-unknown-linux-musl` binaries — a shell, coreutils, Mesa, a Wayland compositor — run without a source patch or a shim ABI.
 
-**Current state** — Leandros boots to a login prompt on both architectures and runs the **COSMIC desktop environment** unmodified: `cosmic-session` → `cosmic-comp` on KMS/softpipe → `busd` (D-Bus) → `cosmic-bg` + `cosmic-panel`, rendering a wallpaper plus a full-width panel bar with an embedded Wayland client. Vulkan reaches real host GPU hardware through Mesa's **Venus** ICD over virtio-gpu.
+**Current state** — Leandros boots to a **graphical login** on both architectures. Upstream `kennylevinsen/greetd` drives **`cosmic-greeter`**, which runs unprivileged (uid 990), authenticates against `/etc/shadow`, and hands off to a full **COSMIC desktop**: `cosmic-session` → `cosmic-comp` on KMS/softpipe → `busd` (D-Bus) → `cosmic-bg` + `cosmic-panel`, with a wallpaper, a full-width panel bar, and eight applet processes across the Panel and Dock spaces. COSMIC itself is unmodified. Vulkan reaches real host GPU hardware through Mesa's **Venus** ICD over virtio-gpu, and a Vulkan client presents into the compositor — photographed on both architectures.
 
 ---
 
@@ -84,7 +84,8 @@ On top of that microkernel core sits a **Linux-compatible syscall personality**:
 | `servers/proc` | `/proc` filesystem |
 | `servers/libc-shim` | In-kernel glue backing the userspace libc |
 | `userland` | User-space programs and regression suites (leandros-libc / relibc / musl) |
-| `ports` | Build recipes for third-party software: Mesa, D-Bus/busd, COSMIC, input shims |
+| `ports` | Build recipes for third-party software: Mesa, D-Bus/busd, COSMIC, greetd, input shims |
+| `artifacts` | Versioned investigation instruments — session drivers, capture harnesses, and the notes each measured claim rests on |
 | `lib` | `align_up` / `align_down` utilities shared across crates |
 
 ---
@@ -193,6 +194,9 @@ Use the top-level build script to compile all targets:
 ./scripts/run-qemu.sh aarch64 --direct    # DTB via -kernel, no bootloader
 ./scripts/run-qemu.sh aarch64 --tcg       # force software emulation
 ./scripts/run-qemu.sh --raspi4b           # BCM2711 board model (aarch64 only)
+
+# Guest RAM (default 2G) — compositor work wants headroom
+LEANDROS_QEMU_MEM=4G ./scripts/run-qemu.sh aarch64
 ```
 
 Both architectures boot via **Limine UEFI** by default: the runner builds a fresh FAT32 disk image containing Limine (rev ≥ 6) and the kernel ELF, then launches QEMU with OVMF/AAVMF. `--direct` on AArch64 instead boots the ELF with `-kernel`, passing the virt machine's built-in DTB in `x0`.
@@ -205,7 +209,7 @@ The runner also handles the host environment for you:
 
 ### Logging in
 
-Boot lands on a login prompt served by a getty loop in PID-1. Two accounts are provisioned in `/etc/shadow` (SHA-256 crypt):
+Boot lands on a text login prompt served by a getty loop in PID-1. Two accounts are provisioned in `/etc/shadow` (SHA-256 crypt):
 
 | User | Password |
 |---|---|
@@ -213,6 +217,20 @@ Boot lands on a login prompt served by a getty loop in PID-1. Two accounts are p
 | `leandro` | `leandro` |
 
 Non-root sessions are fully supported, including a COSMIC desktop session with per-uid `/run/user/<uid>` runtime directories.
+
+#### Graphical login
+
+`sh /bin/greeter-real` from that prompt starts **greetd**, which brings up `cosmic-comp` in kiosk mode with `cosmic-greeter` as its child; a correct password starts the COSMIC session, a wrong one leaves the greeter up. `sh /bin/greeter-fake` runs the same greeter against upstream's `fakegreet` protocol harness, with no daemon, no PAM, and no session worker in the way — the smaller thing to reach for when the greeter itself is what's under test.
+
+Three constraints shape that arrangement, and all three are properties of this kernel rather than of greetd:
+
+- **The greeter's role comes from its account, not its filename.** `cosmic-greeter` runs `greeter::main()` only when `getpwuid(getuid())` names it `cosmic-greeter`, and `locker::main()` otherwise. `cosmic-greeter` is therefore a real system account (uid 990, below `UID_MIN` so it does not list itself on its own login screen), and `/bin/greeter-launch` exists to *become* it: it looks the account up by name, `setresgid`/`setresuid`s, **reads `getuid()` back**, and `execve`s the greeter. A launcher that reports a drop it did not perform produces a login screen indistinguishable from a correct one.
+- **`vt = "none"` is the only workable terminal mode.** There is no VT layer here at all, and every other value opens `/dev/tty0` during startup, so greetd exits before it binds its socket.
+- **greetd's control socket cannot live in `/run`.** `/run` is ordinary f2fs, and f2fs has no `S_IFSOCK`, so upstream's hardcoded path fails to bind with `EOPNOTSUPP`. `GREETD_SOCK_DIR` points it at the runtime dir instead; the socket-capable mounts are `/tmp`, `/dev/shm`, and `/run/user`.
+
+There is no PAM stack in the system, so `ports/greetd/pam-leandros` supplies the libpam application ABI `pam-sys` binds to, backed by the same `$sha256$` `/etc/shadow` scheme `/bin/login` validates. Its `pam_putenv`/`pam_getenvlist` do real work, because greetd builds a session's entire environment out of that table and inherits nothing of its own — which is why the COSMIC render environment reaches the session through `/etc/profile` and `source_profile = true`.
+
+`cosmic-comp` itself still runs as root: `libseat` is a shim with no seatd behind it, and the `/dev/dri` and `/dev/input` node modes are unverified. Only the greeter client is unprivileged.
 
 ---
 
@@ -272,6 +290,7 @@ sudo ./scripts/deploy-rpi5.sh \
 ### IPC (`ipc`)
 
 - **Ports** — bounded FIFO queues (16 messages each). Created with `port::create(owner_pid)`; only the owner may `recv`. Any task may `send` to any port it holds the ID of.
+- **Two different limits, and only one of them is the real ceiling.** `MAX_PORTS` (65536) bounds the *ID namespace*; `LIVE_BUCKETS` (512) bounds how many ports can be **live at once**. It was 64, which is a number a COSMIC session lives against: every task that reaches a server through `servers::vfs::call_port` lazily takes a bucket as its reply port and holds it until the task exits, and `call_port` is on the path of *every* operation on a mounted filesystem — `open`, `stat`, `getdents64`, and the `execve` that opens the binary. The consumers are threads, not processes, so a twenty-process desktop sat at 61/64 with 1.1 GiB free and userspace saw nothing but `ENOMEM`. `PORT_STATS` now prints one line per occupancy high-water mark.
 - **Messages** — 64-byte inline payload (`MESSAGE_INLINE_BYTES = 48`), a `tag` word, a `reply_port` field (for `sys_call`), and one capability slot (`Option<usize>`). `reply_port` defaults to `u32::MAX` to prevent accidental recursive loops.
 - **`sys_call`** — send-and-wait idiom. The kernel lazily allocates a private *reply port* per task (cached in `Task::reply_port`), stamps it into the outgoing message, and blocks the caller on that port. Servers reply by sending to `msg.reply_port`.
 - **`Channel`** — convenience wrapper pairing a client port and a server port; used by drivers that need a bidirectional rendezvous.
@@ -343,7 +362,7 @@ The process model is POSIX-shaped rather than task-shaped, which is what allows 
 - **Job control** — `servers/tty` implements the job-control ioctls and line-discipline signal generation (`SIGINT`/`SIGTSTP`/`SIGTTOU`), so shell job control behaves.
 - **`chroot(2)`** — real confinement: symlink resolution and fd-to-path resolution are both confined to the jail rather than escaping through the mount table.
 - **Priorities** — `setpriority`/`getpriority` back `nice(1)`.
-- **Process state** — `/proc` via `servers/proc`, including `/proc/self/exe`.
+- **Process state** — `/proc` via `servers/proc`, including `/proc/<pid>/exe` for any pid, not just the `self` alias. It resolves inside `readlink(2)` only — nothing `open`s or `execve`s that path, which is why greetd's session worker has to call `std::env::current_exe()` before it forks rather than handing the magic path to `execv`.
 
 ### Filesystems and storage
 
@@ -360,16 +379,21 @@ The process model is POSIX-shaped rather than task-shaped, which is what allows 
 
 **Shared memory** — tmpfs and memfd pages are shared across processes via frame-backed promotion, with `memfd` seal lifecycle honoured. This is load-bearing for Wayland: `wl_shm` pools *are* shared memfd mappings.
 
-Other VFS behaviour worth knowing: per-process fd tables (limit 128), one identity for the console so `isatty` stops lying, arch-correct `stat`, `O_NOFOLLOW`/`O_DIRECTORY`/`AT_SYMLINK_NOFOLLOW`, `mount`/`umount`/`fstab`, and `fstat` proxied to the owning mount with refcounted dup'd mounted fds.
+**Sockets need a tmpfs.** f2fs has no `S_IFSOCK`, so an AF_UNIX socket cannot be bound anywhere under `/` or `/data`. The socket-capable mounts are `/tmp`, `/dev/shm`, and `/run/user` — worth knowing before pointing a daemon that hardcodes `/run` at this system.
+
+Other VFS behaviour worth knowing: per-process fd tables (limit 128), a per-mount f2fs open-file pool of 256 (directories take a slot too, so an icon-theme walk used to starve a 32-slot pool and hand ten processes `EMFILE` inside three seconds), one identity for the console so `isatty` stops lying, arch-correct `stat`, `O_NOFOLLOW`/`O_DIRECTORY`/`AT_SYMLINK_NOFOLLOW`, `mount`/`umount`/`fstab`, and `fstat` proxied to the owning mount with refcounted dup'd mounted fds.
 
 ### Networking
 
 `servers/net` provides two largely separate stacks:
 
-- **TCP/IP over virtio-net**, via smoltcp, with a DHCPv4 client. Host↔VM networking works in both directions on both accelerators; `ping` is in the userland.
-- **AF_UNIX**, implemented in full — because every Wayland and D-Bus connection in the system rides on it. `SCM_RIGHTS` fd passing, cmsg flags, `SO_PEERCRED`, socket nodes bound to real VFS pathnames, `accept4()` honouring `SOCK_NONBLOCK`/`SOCK_CLOEXEC`, `F_SETFD` cloexec on socket fds, `FIONBIO`, well-formed peer sockaddrs from `accept()`, writes buffered on connected-but-not-yet-accepted stream sockets, connections kept alive until the last fd reference closes, and a full send ring correctly returning `EAGAIN` rather than a bogus `0`.
+- **TCP/IP over virtio-net**, via smoltcp, with a DHCPv4 client. Host↔VM networking works in both directions on both accelerators; `ping` is in the userland. A closed connection's port is held in `TIME_WAIT` rather than being reused immediately.
+- **AF_UNIX**, implemented in full — because every Wayland and D-Bus connection in the system rides on it. `SCM_RIGHTS` fd passing, cmsg flags, `SO_PEERCRED`, socket nodes bound to real VFS pathnames, `listen()` under Linux's own gates, `accept4()` honouring `SOCK_NONBLOCK`/`SOCK_CLOEXEC`, `F_SETFD` cloexec on socket fds, `FIONBIO`, well-formed peer sockaddrs from `accept()`, writes buffered on connected-but-not-yet-accepted stream sockets, connections kept alive until the last fd reference closes, and a full send ring correctly returning `EAGAIN` rather than a bogus `0`.
+- **`shutdown(2)` is a per-direction half-close**, not a socket teardown. It previously ignored `how` and emptied the fd-table slot, which made `shutdown(fd, SHUT_WR)` *strictly more destructive than `close(fd)`* — a defect asserted for weeks as a "tokio integration residual" before anyone demonstrated it.
+- **A listening socket can be `dup`'d and passed.** Bound addresses are refcounted, so a second fd may name one, and `SCM_RIGHTS` can carry a socket fd at all: VFS descriptors and lifted socket entries travel through one `XferFd` transfer type. Both gaps sat on the same path — `wp_security_context_v1.create_listener`, which cosmic-panel calls for any applet carrying `X-HostWaylandDisplay=true`, marshals a *listening* AF_UNIX socket, and libwayland dups every fd it marshals.
+- **Pending connections survive `fork`** and are refcounted on close, which is what an applet's privileged socket is at the moment `launch-pad` forks.
 
-That last one is worth calling out: a stream `send` that returns `0` instead of `EAGAIN` is indistinguishable from a zero-length write to a client, and it desynchronised cosmic-panel's Wayland object stream — a bug that presented as an inexplicable `Unknown id` protocol error many layers above the actual fault.
+Two of those are worth calling out for how they presented. A stream `send` that returns `0` instead of `EAGAIN` is indistinguishable from a zero-length write to a client, and it desynchronised cosmic-panel's Wayland object stream — surfacing as an inexplicable `Unknown id` protocol error many layers above the actual fault. And a marshalling failure poisons libwayland's *whole* connection, so a failed `dup` propagated out of `event_loop.dispatch()` and killed cosmic-panel with exit 1: the bar vanished entirely, which reads as "the applets did not render" and is nothing of the kind.
 
 ### Boot flow
 
@@ -409,6 +433,8 @@ init (PID 1) → start servers (vfs, f2fs, net, tty, drm, evdev, pipewire, proc)
              → getty loop → /bin/login → authenticate against /etc/shadow
              → setresuid/setresgid → brush
              → (optionally) start-cosmic → cosmic-session → COSMIC desktop
+             → or greeter-real → greetd → cosmic-comp (kiosk) → greeter-launch
+                                        → cosmic-greeter → cosmic-session
 ```
 
 **Boot protocol invariant** — the minimum Limine revision is **6**. Do not lower it.
@@ -430,8 +456,10 @@ The DRM subsystem (`drivers/drm`, `servers/drm`) implements the Linux Direct Ren
 - **Legacy mode setting** — `DRM_IOCTL_MODE_SETCRTC` and `DRM_IOCTL_MODE_PAGE_FLIP` for display configuration and double-buffering. `SETCRTC` presents the framebuffer immediately, so a mode-setting compositor's frame 0 actually appears.
 - **Atomic KMS** — `DRM_CLIENT_CAP_ATOMIC` and `DRM_IOCTL_MODE_ATOMIC`, including `TEST_ONLY` and `ALLOW_MODESET`, with the legacy handlers still live for clients that do not opt in. This is the preferred path; the legacy path cannot drive a cursor plane.
 - **Planes** — a primary plane plus a real **cursor plane**, driven from the virtio-gpu cursor queue. Before the cursor plane existed, every pointer movement forced a full-screen software recomposite; moving the pointer now costs a cursor-queue update instead of a repaint.
+- **Damage-aware presents** — `FB_DAMAGE_CLIPS` blobs are decoded and only the named sub-rectangles are copied, with one flush over their bounding union. Clips are clamped and degenerate ones dropped rather than rejecting the commit: a bad clip list is a hint we are free to ignore, and failing there would stall the compositor. (Measured honestly, the win is small today — smithay damages ~97% of the output on every present and never once skips the primary plane. The `[DRMSTAT]` damage counters exist to say so.)
 - **Framebuffer objects** — `DRM_IOCTL_MODE_ADDFB` / `DRM_IOCTL_MODE_RMFB` for userspace-owned scanout surfaces.
-- **PRIME / dmabuf** — `PRIME_HANDLE_TO_FD` / `FD_TO_HANDLE` via borrowed dumb-buffer VMOs, with `DRM_CAP_PRIME` reported so GBM's softpipe backend takes the DRIimage path. Correct for multithreaded clients, and the ephemeral export node is unlinked so it cannot leak the tmpfs pool.
+- **PRIME / dmabuf** — `PRIME_HANDLE_TO_FD` / `FD_TO_HANDLE` via borrowed dumb-buffer VMOs, with `DRM_CAP_PRIME` reported so GBM's softpipe backend takes the DRIimage path. Correct for multithreaded clients, and the ephemeral export node is unlinked so it cannot leak the tmpfs pool. Venus **blob** handles export through the same path, and a buffer object stays alive while an exported dmabuf fd still names it — without that refcount the fd read recycled memory and returned wrong values with no panic, because the frames stay HHDM-mapped and merely belong to someone else.
+- **Fences** — `EXECBUFFER` mints a real out-fence fd for `FENCE_FD_OUT`, and handle retirement runs through one path whether `GEM_CLOSE` or `MODE_DESTROY_DUMB` asks.
 - **Authentication** — DRM master tokens for secure multi-client access.
 - **VirtIO-GPU IOCTLs** — `VIRTGPU_MAP`, `VIRTGPU_RESOURCE_CREATE`, `VIRTGPU_TRANSFER_TO_HOST`, `VIRTGPU_GET_CAPS`, `VIRTGPU_EXECBUFFER`, and related operations.
 - **mmap** — `DRM_IOCTL_VIRTGPU_MAP` backed by `map_kernel_device` allows userspace to memory-map the hardware framebuffer directly, bypassing the VFS write path for maximum throughput.
@@ -439,6 +467,8 @@ The DRM subsystem (`drivers/drm`, `servers/drm`) implements the Linux Direct Ren
 The DRM server runs as a dedicated user-space task and exposes the device via the VFS as `/dev/dri/card0`, plus a **render node** at `/dev/dri/renderD128`. Userspace opens the device, authenticates, and then drives the display pipeline through standard Linux DRM ioctls, making it possible to run unmodified DRM client code — `kmscube` renders animated frames on both architectures, and `cosmic-comp` drives the display through this path.
 
 State that upstream scopes per open-file is scoped per open-file here too: the virtio-gpu 3D context, GEM handle ownership, and fences are keyed off the open file description rather than the process, which is what allows a multithreaded compositor and a Vulkan client to hold the device at the same time without stepping on each other.
+
+**The console and the scanout are the same surface**, and they arbitrate for it. `BOOT_FB`/`KERNEL_FB` point at the RAM buffer backing virtio-gpu resource 1, so a program that merely *printed* during a live session destroyed the display: one `\n` past the last text row memmoves the whole surface up a row, and a compositor repaints only what it damaged, so everything static scrolled off and was never redrawn (334,503 distinct colours collapsed to 177; 79% of the screen went black). The framebuffer console now yields the scanout to whichever open last presented into it. The gate was previously a hardcoded list of ioctl numbers that never included `DRM_IOCTL_MODE_ATOMIC` — the one path a real compositor drives.
 
 ### VirtIO GPU driver
 
@@ -460,6 +490,10 @@ The framebuffer console renders text using a **Fira Code vector font** (`drivers
 The console is a real **VT emulator**, not a print sink: it answers cursor-position reports (`ESC[6n`), reports the true console geometry through `TIOCGWINSZ`, and delivers multi-byte ANSI escape sequences to a reader in one `read` rather than splitting them. The framebuffer is the authoritative console — it wins geometry ties against the serial port.
 
 Console writes are **atomic**. They were not always: a kernel trace interleaved mid-sequence with the shell's `ESC[38;5;` prompt colour once spliced together into a literal `ESC[3i` — ANSI *media copy* — which opened a print dialog on the host terminal. The CSI final-byte alphabet is now restricted to what the console actually implements.
+
+The console also **never reads the surface it draws on**. Scrolling used to `copy` the framebuffer to itself, pulling 8.29 MB back out of an uncached mapping on every newline; `ls -l /bin` took ~40 s on x86-64/KVM at 1920×1080. Drawing now goes to a write-back shadow and `fb_flush` blits only the dirty rectangle out, so the framebuffer is read exactly once — when the shadow is seeded — and thereafter only ever written, sequentially. That is 40 s → 0.70 s, a 57× improvement, with the scroll granularity left unchanged. If the buddy allocator cannot satisfy the shadow allocation, drawing falls back to the old direct path.
+
+Two supporting corrections came out of the same measurement. Both architectures had programmed a burst-capable uncached attribute and then used it only for the userspace `/dev/fb` mmap — aarch64 mapped the console Device-nGnRnE, which may not merge even two adjacent pixel stores — and both now select the write-combining attribute. And `IA32_PAT` is per-logical-processor: an AP leaves INIT/SIPI holding the reset PAT, so the console was write-combining on the BSP and write-through on every AP, one set of physical lines under two memory types. The BSP now publishes its whole PAT and each AP adopts it verbatim as the first statement of `sched_ap_entry`.
 
 ---
 
@@ -491,6 +525,17 @@ Required QEMU device line (the runner selects this automatically when available)
 ```
 
 ⚠️ `-nographic` silently overrides `-display`, and this needs a host EGL implementation — so the Venus path requires a **Linux host**; macOS has no EGL.
+
+### Presenting
+
+Enumerating a device is not the same as putting a pixel on a screen, so both ends of the path are checked separately and by photograph rather than by return code:
+
+- **`vkrender`** draws with Vulkan straight to the scanout with no compositor in the way.
+- **`vkwl`** is a Vulkan Wayland client that reaches `vkQueuePresentKHR → VK_SUCCESS` against `cosmic-comp` running inside the guest.
+
+Both are photographed on **both** architectures, against pass criteria committed *before* the first capture. That ordering is deliberate: a criterion written after seeing the image is a description, not a test.
+
+One recorded requirement did not survive contact with the guest. `MESA_VK_WSI_DEBUG=sw,noshm` was measured correctly on the RADV *host* and written down as though it held generally; inside the guest, Venus reports `VK_EXT_external_memory_host = no`, so Mesa already selects the memcpy path and plain `sw` is right. A host control is a client sanity check, never a guest prediction.
 
 ---
 
@@ -543,27 +588,49 @@ The evdev server (`servers/evdev`) exposes keyboard and pointer hardware using t
 
 ### Seat and device discovery
 
-Real **libinput** and **libxkbcommon** are ported and run unmodified. The two pieces of Linux plumbing beneath them that assume a daemon we do not have — `libseat` (seatd) and `libudev` (udevd) — are replaced by **shims** in `ports/input-stack`, backed by a synthetic sysfs skeleton. There is no seatd, no udevd, and no VT switching.
+Real **libinput** and **libxkbcommon** are ported and run unmodified. The two pieces of Linux plumbing beneath them that assume a daemon we do not have — `libseat` (seatd) and `libudev` (udevd) — are replaced by **shims** in `ports/input-stack`, backed by a synthetic sysfs skeleton and built from tracked sources rather than shipped as a blob. There is no seatd, no udevd, and no VT switching.
+
+### Delivery is lossless, and the instrument said otherwise
+
+Input reaching Wayland clients was recorded for a long time as lossy under load — an evdev event ring that starved at high pointer rates, with a rate ladder of measurements behind the claim. The ladder reproduces byte-for-byte and **the cause was the measuring apparatus**. `putc` polled the UART transmitter with no bound on either architecture, and QEMU's 16550 withholds `LSR.THRE` for exactly as long as its chardev back end refuses the byte. `putc` is reached from IRQ context — the periodic event census runs off the timer tick — so a serial consumer that stopped reading parked CPU 0 inside the timer handler: the tick froze, and `poll_events()` never drained the eventq.
+
+Three 60 moves/s sweeps in one boot, differing only in who drained QEMU's serial chardev, settle it: **9.5% delivered with the consumer parked, 100% with it reading, 100% with nothing attached at all.** The harness caused what it measured, because it slept while holding the socket open. A regression guard now covers the console-stall shape.
 
 ---
 
 ## Desktop stack — Wayland and COSMIC
 
-The **COSMIC desktop environment runs unmodified** on both architectures: no source patches, only build-configuration flags. Everything beneath it is ours.
+The **COSMIC desktop environment runs on both architectures**, from a graphical login, essentially unmodified — build-configuration flags rather than source changes. Everything beneath it is ours.
 
 ```
+greetd
+  └─ cosmic-comp (kiosk)  → greeter-launch → cosmic-greeter      [login screen, uid 990]
+                                                  ↓ authenticates
 cosmic-session
   ├─ busd                D-Bus broker (pure Rust, from the zbus authors)
   ├─ cosmic-comp         Wayland compositor, on KMS via Mesa softpipe
   ├─ cosmic-bg           wallpaper
-  └─ cosmic-panel        panel bar + embedded Wayland applet clients
+  └─ cosmic-panel        panel bar + Dock, 8 applet processes over 5 real applets
 ```
+
+**"Unmodified" is one patch short of true, and the shortfall is worth stating.** The project rule is that temporary debug edits to COSMIC are fine and permanent ones are not — every permanent fix belongs on the LeandrOS side. Two permanent patches once existed. The greeter's is gone. The session's (`ports/cosmic-session/0001-env_rx-timeout-fallback.patch`) is still applied to the staged build even though the kernel bug behind it — `shutdown(2)` ignoring `how` — is fixed; retiring it needs a clean musl rebuild and a re-staged image, and shipping a reverted tree with a patched binary still in the image would be worse than either. Measured payoff of the kernel fix: the component cascade starts 5.022 s after `Starting cosmic-session` on the defective kernel (the 5 s `env_rx` timeout expiring, to within 22 ms) and 2.186 s with it fixed.
+
+The applet set is the other thing that recently became real: five applets ship (`CosmicPanel{Launcher,App,Workspaces}Button`, `CosmicAppletTiling`, `CosmicAppletMinimize`) plus the stub clock, and eight processes run — because `entries` is `["Panel", "Dock"]`, the two spaces resolve their plugin lists independently, and two applets appear in both. A name is not a process, and reasoning about "how many applets" as a count is what made an earlier descriptor-exhaustion diagnosis wrong.
 
 **Committed architecture.** COSMIC is built for `*-unknown-linux-musl` and **dynamically linked** against a real `ld-musl` — `dlopen` sits on the critical path in three separate places (cosmic-comp's EGL loading, Mesa's GBM/DRI loader, cosmic-panel's `use_system_lib`), so static linking was never an option. Graphics go through Mesa **softpipe** via gallium `kms_swrast` over dumb buffers, on the atomic KMS path. The session launches from a login shell: login → `start-cosmic` under `brush`.
 
 Supporting this required the ELF loader to grow real dynamic-linking support — `ET_DYN` loaded at a bias, `PT_INTERP` honoured — plus VMA splitting at range boundaries for `munmap`/`mprotect`, an 8 MB user stack matching the Linux default, and shared tmpfs/memfd pages for `wl_shm` pools.
 
+**`busd` answers `ServiceUnknown`.** A D-Bus call to a name nobody owns used to be dropped with a `warn!` and no reply, and neither side has a timeout — so every libcosmic app blocked forever in a D-Bus probe before it ever drew, which was recorded for a long time as "libcosmic/iced cannot render". The toolkit was fine. Unblocking four autostarted components then took the 64-bucket IPC port table over its ceiling, and the resulting `ENOMEM` from a `stat` of `/usr/share/X11/xkb` made `xkb_context_new` return `NULL`, which SCTK dereferenced at `0x880`. Holding the busd binary constant and moving only `LIVE_BUCKETS` is the control that separates the two: at 64 the panel bar is gone and the session wedges, at 512 the bar and its ticking clock are present in all nine screenshots with zero faults.
+
 Most of the kernel work in this area was not "add a feature" but "match Linux exactly": a full multithreaded GPU desktop is an extremely effective probe for compatibility gaps that no test suite had surfaced. Roughly thirty real kernel bugs were found and fixed this way — among them the `execve` signal-reset/de-thread trio, TGID-keying of per-process tables, dropped `eventfd`/`accept4`/`socketpair`/`F_SETFD` flags, a poll-deadline lost-wake, a cross-thread timed-futex wake race, `AF_UNIX` refcounting and full-ring `EAGAIN`, and a `mincore` stub that returned success for unmapped pages (which made Mesa's `_eglPointerIsDereferenceable` accept `(void*)3` and fault the panel deep inside `eglCreatePlatformWindowSurfaceEXT`).
+
+### What the desktop still cannot do
+
+- **No terminal emulator.** `servers/tty` advertises "termios line discipline and PTY pairs" in its header and has a `PTS_PAIRS` table, but that half is entirely unreachable — the kernel only ever sends `TTY_IOCTL`. `cosmic-term` is a multi-week kernel feature wearing a build task's clothes.
+- **No D-Bus activation.** `busd` deliberately omits `<servicedir>`, so nothing starts on demand: no portal, and therefore no screenshot, no file chooser.
+- **No VT switching, no PAM stack, no utmpx.** All three were once out of scope and are now in it, because the greeter routes around all three rather than needing none of them.
+- **The privilege boundary is thinner than it looks.** The greeter reaches the compositor's `wayland-1` under a `0700` root-owned `/run/user/0`, and greetd's root-owned control socket, because path resolution applies no search-permission test to any component and AF_UNIX `connect` discards the caller identity outright. That is a recorded gap, not a design.
 
 ### Ports
 
@@ -575,6 +642,7 @@ Most of the kernel work in this area was not "add a feature" but "match Linux ex
 | `gl-stack` | GL support libraries and test clients (`kmscube`) |
 | `input-stack` | libinput, libxkbcommon, and the libseat / libudev shims |
 | `dbus`, `busd` | Reference `dbus-daemon`, and the `busd` broker actually used |
+| `greetd` | Upstream greetd, its config, its launchers, and `pam-leandros` — the libpam application ABI `pam-sys` binds to, backed by `/etc/shadow` |
 | `cosmic-session`, `cosmic-greeter` | Session and greeter build configuration |
 
 ---
@@ -661,6 +729,10 @@ VFS resource lifecycle (open/close notifications) ensures that server-side handl
 
 **Debug output is gated and off by default** — render and audio hot paths, task lifecycle, `[MMAP]`/`[CPIO]` tracing, EL0 fault backtraces, and the unix-socket exchange trace are all behind consts defaulting to off. Unconditional serial writes on a hot path do not merely slow the system down; they change its timing enough to hide the race being investigated.
 
+**An errno must name its own cause** — `ENOMEM` from this kernel meant about a dozen unrelated things, only two of which were about RAM, and userspace saw the number and nothing else. Two separate investigations started from that number and went hunting for a leak while the guest reported over a gigabyte free; the real answer was a 64-entry IPC port table. Every `ENOMEM` in the memory, address-space, and exec paths now routes through `enomem_site()` (behind a gated, budgeted trace) so the errno cannot drift away from its explanation. `sys_brk` is included even though `brk(2)` has no errno — a heap that cannot grow used to be invisible on the way out, because musl detects it by comparing the returned break and turns it into a `NULL` from `malloc`. `sys_mincore` is deliberately left alone: its `ENOMEM` means "this range is not mapped" and is a normal answer to a pointer probe.
+
+**Measure at the destination, and prove the instrument first** — four separate defects in this tree were recorded with the wrong cause and evidence beside them, and in three of the four *the instrument or the harness was the defect*: a serial reader that wedged the timer tick and then reported input loss, a completion marker matched from the tty's own echo, a probe that reported "no matches" because the guest has no `grep`. What separated the recorded cause from the truth was never more reasoning — it was instrumenting at the destination, a control that varied exactly one thing, and a test shown to fail before it was trusted.
+
 **Round up, never truncate, when converting time** — `nanosleep` truncating every sub-tick sleep to zero passed every correctness test in the tree and was invisible for months, until Mesa's watchdog fired 200× early and `abort()`ed. `nanosleep` rounds up and `clock_nanosleep` honours `TIMER_ABSTIME`.
 
 ---
@@ -673,6 +745,8 @@ VFS resource lifecycle (open/close notifications) ensures that server-side handl
 |---|---|
 | `init` | PID-1 process; brings up servers, mounts filesystems, runs the getty loop |
 | `login` | Authenticates against `/etc/shadow`, drops privilege via `setresuid`/`setresgid` |
+| `greeter-launch` | `cosmic-comp`'s kiosk child: becomes the `cosmic-greeter` account, verifies the drop by reading `getuid()` back, execs the greeter |
+| `meminfo` | One-line `sysinfo` sample of buddy-allocator total/free, so a session script can read a series rather than a point |
 | `shell` | Built-in CLI with Unix-style commands and VFS integration |
 | `brush` | Ported POSIX shell — the interactive default, with working job control |
 | `aplay` | Command-line audio player (WAV, MIDI, test tone) |
@@ -700,9 +774,9 @@ A ported **coreutils** provides the usual file and text utilities.
 | `scmtest` | `SCM_RIGHTS` fd passing, shared mmap, memfd seals and collisions, AF_UNIX socket nodes, tmpfs mounts, `mincore`, fork+exec fd inheritance |
 | `forktest` / `waittest` / `sigchldtest` / `racetest` | Process lifecycle, `wait4`/`waitid`, `SIGCHLD`, concurrency races |
 | `idletest` | Verifies the system genuinely idles rather than busy-polling |
-| `drmsmoke` | Raw-ioctl DRM smoke test against `/dev/dri/card0` |
+| `drmsmoke` | Raw-ioctl DRM smoke test against `/dev/dri/card0`: drives a real atomic commit, guards the console/scanout handoff it must cause, classifies page-flip timestamps, and `--hold` paints a checkable frame and leaves it on the scanout for capture |
 | `evtest2` | evdev virtio-tablet capability and poll test |
-| `venustest` | Venus/virtio-gpu 3D **transport** conformance — asserts a non-empty host-populated capset, since "the ioctl returned 0" proves nothing when the risk is a silently wrong wire protocol |
+| `venustest` | Venus/virtio-gpu 3D **transport** conformance, 108 subtests — a non-empty host-populated capset, per-open GEM ownership, and dmabuf/blob lifetime across `close`. "The ioctl returned 0" proves nothing when the risk is a silently wrong wire protocol, so the blob phase also carries a gate asserting its own assertions ran, which is what distinguishes "passed" from "silently skipped" |
 
 `vktest` (a staged external binary, built from the Mesa port) is the end-to-end Vulkan check: it `dlopen`s the Venus ICD, enumerates physical devices, and creates a logical device on the real host GPU.
 
@@ -713,6 +787,8 @@ Programs link against **relibc** for full POSIX compatibility, against the light
 `scripts/scmrun.py` drives a QEMU boot over a serial socket and collects results — a persistent serial reader is necessary, because QEMU drops output when nothing is attached and a long test run then looks like a hang.
 
 Run the suites against a **fresh disk image** when the result matters. Images persist across boots, and a suite that has already run against one can leave state that changes the next run's outcome — `O_TRUNC` clears a file's data but not its xattrs, which is exactly the sort of thing that manufactures a phantom architecture-specific failure.
+
+**Show a new guard failing before you trust it passing.** Every recent guard in this tree was run against the unfixed kernel first, against a prediction written down in advance, and several were falsified afterwards by mutating the fix back out and checking that the *predicted* subtests failed with the *predicted* messages. That matters because the most common way to ship a useless test here is for it to pass by not running: a passing test bounds only what it executed, and `scmtest`'s `fork_exec_inherit` passed for months while never once calling the `shutdown(2)` that was broken.
 
 ---
 
