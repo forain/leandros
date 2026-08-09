@@ -743,6 +743,15 @@ pub fn dispatch(
 ) -> isize {
     dbg_serial_dump_maybe();
     let ret = dispatch_inner(number, a0, a1, a2, a3, a4, a5, frame_ptr);
+    // The syscall is the deepest the kernel stack ever gets — every filesystem
+    // and network server runs in kernel context off the back of one. Checking
+    // here costs a mask and a compare, and it is the difference between an
+    // overflow being named at the syscall that caused it and it being a page
+    // fault somewhere else, minutes later, on a different task (TODO.md #15).
+    if !sched::check_kernel_stack() {
+        sched::report_stack_overflow(current_pid(), number);
+        sched::exit_group(-1);
+    }
     if SYSCALL_TRACE_EINVAL && ret == -22 && current_pid() >= 3 {
         let _g = TRACE_LOCK.lock();
         #[cfg(target_arch = "aarch64")]

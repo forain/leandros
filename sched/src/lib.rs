@@ -110,6 +110,89 @@ pub fn get_exit_code(pid: Pid) -> Option<i32> {
     None
 }
 
+// ── Kernel stacks ─────────────────────────────────────────────────────────────
+
+/// Buddy order of a task's kernel stack: 2^5 = 32 pages = 128 KiB.
+///
+/// This lives in one place because it used to live in five, as a bare `4` next
+/// to a bare `PAGE_SIZE * 16` — an allocation, a top-of-stack calculation and
+/// two frees that all had to agree and that nothing checked.
+///
+/// 128 KiB rather than the 64 KiB it was through 2026-08-09. The stack has no
+/// guard page: it is buddy-allocated physical memory reached through the HHDM,
+/// so the frames underneath belong to other allocations and a frame that
+/// outgrows the stack overwrites them without faulting. `f2fs::mount` did
+/// exactly that with a 155,880 B frame — see TODO.md item 15 — and even after
+/// that was fixed the largest legitimate frame in the kernel was 33,824 B,
+/// i.e. 53 % of a 64 KiB stack consumed by a single frame with the whole call
+/// chain below it still to pay for. `scripts/check-stack-frames.py` enforces
+/// the ceiling that keeps this headroom real.
+pub const KERNEL_STACK_ORDER: usize = 5;
+/// Size of a task's kernel stack in bytes. Also its alignment: the buddy
+/// allocator hands out naturally-aligned blocks, which is what lets
+/// [`check_kernel_stack`] find the stack base from the stack pointer alone.
+pub const KERNEL_STACK_SIZE: usize = mm::buddy::PAGE_SIZE << KERNEL_STACK_ORDER;
+
+/// Written to the lowest word of every kernel stack at allocation and verified
+/// on syscall return. An overflow walks down through it on its way into the
+/// neighbouring allocation, so a mismatch means this task's frames went past
+/// the bottom of its stack and corrupted memory that belongs to someone else.
+const STACK_CANARY: u64 = 0x5354_4143_4B5F_4F4B; // "STACK_OK"
+
+/// Stamp the canary into a freshly allocated kernel stack.
+pub fn arm_kernel_stack(stack_base_phys: usize) {
+    unsafe { (mm::phys_to_virt(stack_base_phys) as *mut u64).write(STACK_CANARY); }
+}
+
+/// Verify the canary of the kernel stack this call is running on.
+///
+/// Cheap enough for the syscall return path: one mask and one compare. The
+/// mask is what makes it cheap — a naturally-aligned stack means the base is
+/// just the stack pointer with the low bits cleared, so this needs no task
+/// lookup and takes no lock. Returns `false` if the stack has been overrun.
+///
+/// Answers `true` when not running on a task kernel stack at all. The boot
+/// stack is a `.bss` static in the kernel image — linked in the top-of-address
+/// -space window, not the HHDM — with neither this alignment nor this canary,
+/// so masking its stack pointer would read an unrelated word and report a
+/// phantom overflow. The HHDM-window test is what distinguishes the two.
+#[inline]
+pub fn check_kernel_stack() -> bool {
+    let probe = 0u64;
+    let sp = &probe as *const u64 as usize;
+    let hhdm = mm::phys_to_virt(0);
+    // Task stacks are buddy frames reached through the HHDM, so they sit
+    // within a physical-memory-sized window above its base. 1 TiB is far more
+    // RAM than this kernel supports and far less than the ~128 TiB gap to the
+    // kernel image, so it separates the two without needing the real size.
+    if sp < hhdm || sp - hhdm >= (1usize << 40) { return true; }
+    let base = sp & !(KERNEL_STACK_SIZE - 1);
+    unsafe { (base as *const u64).read_volatile() == STACK_CANARY }
+}
+
+/// Report a blown kernel stack and kill the task that blew it.
+///
+/// Reported rather than ignored because the alternative is what item 15 cost:
+/// the overflow lands in unrelated memory, and the failure surfaces later as
+/// something with no visible connection to the stack — a page fault on a
+/// different task, a corrupt page table, a boot that works on one host and not
+/// another.
+pub fn report_stack_overflow(pid: u32, syscall_no: usize) {
+    extern "C" {
+        fn arch_serial_putc(c: u8);
+        fn print_hex(n: usize);
+        fn print_number(n: u32);
+    }
+    fn s(msg: &str) { for &b in msg.as_bytes() { unsafe { arch_serial_putc(b) } } }
+    s("\n*** KERNEL STACK OVERFLOW *** pid=");
+    unsafe { print_number(pid) };
+    s(" syscall=");
+    unsafe { print_hex(syscall_no) };
+    s("\n  A frame ran past the bottom of this task's ");
+    unsafe { print_hex(KERNEL_STACK_SIZE) };
+    s(" B kernel stack and\n  overwrote the allocation below it. Memory is already corrupt; the\n  task is being killed so the damage stops here. Run\n  scripts/check-stack-frames.py on the kernel to find the frame.\n");
+}
+
 // ── Context switching ─────────────────────────────────────────────────────────
 
 pub const MAX_CPUS: usize = 8;
@@ -1414,9 +1497,9 @@ pub fn process_count() -> usize {
 pub fn spawn(entry: fn() -> !, _flags: usize) -> Option<Pid> {
     let pid = alloc_pid();
 
-    // Allocate stack for the kernel task (64KB)
-    let stack_base = mm::buddy::alloc(4)?; 
-    let stack_size = mm::buddy::PAGE_SIZE * 16;
+    let stack_base = mm::buddy::alloc(KERNEL_STACK_ORDER)?;
+    let stack_size = KERNEL_STACK_SIZE;
+    arm_kernel_stack(stack_base);
 
     let task = Task::new_kernel(pid, entry as usize, stack_base, stack_size, 0);
     let ok = RUN_QUEUE.lock().enqueue(task);
@@ -1424,7 +1507,7 @@ pub fn spawn(entry: fn() -> !, _flags: usize) -> Option<Pid> {
         wake_up_an_idle_cpu();
         Some(pid)
     } else {
-        mm::buddy::free(stack_base, 4);
+        mm::buddy::free(stack_base, KERNEL_STACK_ORDER);
         None
     }
 }
@@ -1451,9 +1534,10 @@ pub fn spawn_user_with_address_space(entry_point: usize, sp: usize, as_: mm::vmm
         let msg = b"[SCHED] Allocating kernel stack...\n";
         serial_print(msg.as_ptr(), msg.len());
     }
-    let stack_phys = mm::buddy::alloc(4)?; // 64KB kernel stack
+    let stack_phys = mm::buddy::alloc(KERNEL_STACK_ORDER)?;
     let _stack_virt = mm::phys_to_virt(stack_phys);
-    let stack_size = mm::buddy::PAGE_SIZE * 16;
+    let stack_size = KERNEL_STACK_SIZE;
+    arm_kernel_stack(stack_phys);
     let page_table = as_.page_table_root;
 
     unsafe {
@@ -1472,7 +1556,7 @@ pub fn spawn_user_with_address_space(entry_point: usize, sp: usize, as_: mm::vmm
         wake_up_an_idle_cpu();
         Some(pid)
     } else {
-        mm::buddy::free(stack_phys, 4);
+        mm::buddy::free(stack_phys, KERNEL_STACK_ORDER);
         None
     }
 }
@@ -1520,7 +1604,7 @@ fn scheduler_run_loop() -> ! {
                     let t = rq.get_mut(idx).unwrap();
                     t.on_cpu = Some(id);
                     t.state  = TaskState::Running;
-                    let kst = mm::phys_to_virt(t.kernel_stack) + mm::buddy::PAGE_SIZE * 16;
+                    let kst = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
                     Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table))
                 }
                 None => None,
@@ -1602,7 +1686,7 @@ fn scheduler_run_loop() -> ! {
                     let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
                     hook(t.pid);
                 }
-                mm::buddy::free(t.kernel_stack, 4);
+                mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
             }
         } else {
             unsafe {
@@ -1858,7 +1942,7 @@ pub fn kill_next_group_member(exit_code: i32) -> GroupKillStep {
             let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
             hook(t.pid);
         }
-        mm::buddy::free(t.kernel_stack, 4);
+        mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
     }
     GroupKillStep::Reaped(tpid)
 }

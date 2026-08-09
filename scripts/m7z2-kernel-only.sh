@@ -18,12 +18,17 @@ LINKER="$ROOT_DIR/linkers/$ARCH.ld"
 STD="target/build-$ARCH-standard"
 
 echo "=== [m7z2] building standard kernel for $ARCH ==="
-RUSTFLAGS="-C link-arg=-T$LINKER -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro" \
+# -Zemit-stack-sizes + check-stack-frames.py: same gate build-all.sh applies.
+# This script is the one used to iterate on kernel changes, so it is the one
+# that has to catch an oversized frame — see TODO.md item 15.
+RUSTFLAGS="-C link-arg=-T$LINKER -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro -Z emit-stack-sizes" \
 cargo build -p kernel --target "$SPEC" --target-dir "$STD" --release \
     -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
 
 mkdir -p "target/final-$ARCH"
 cp "$STD/$TT/release/kernel" "target/final-$ARCH/kernel"
+
+python3 "$ROOT_DIR/scripts/check-stack-frames.py" "target/final-$ARCH/kernel" --budget 49152
 
 echo "=== [m7z2] recreating boot image leandros-limine-$ARCH.img ==="
 IMG="leandros-limine-$ARCH.img"

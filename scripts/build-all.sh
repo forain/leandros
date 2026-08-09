@@ -47,6 +47,26 @@ ROOT_DIR="$PWD"
 # the toolchain file so the pin stays in one place.
 PINNED_TOOLCHAIN="+$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT_DIR/rust-toolchain.toml" | head -1)"
 
+# Emit `.stack_sizes` (exact per-function frame sizes, straight from the
+# backend) into the linked kernel, and refuse to ship one whose frames threaten
+# the kernel stack. A frame larger than the 128 KiB stack does not fault — the
+# stack has no guard page — it overwrites the neighbouring buddy allocation, and
+# the resulting corruption surfaces somewhere else entirely. That is how
+# TODO.md item 15 spent a day looking like a host-dependent boot failure.
+# The section is non-alloc: ~10 KB of file, nothing at runtime.
+STACK_SIZES_FLAG="-Z emit-stack-sizes"
+# Ceiling for a single frame. The largest legitimate frame in the tree is
+# ~34 KB (`vfs_close_all_for`, inflated by LTO inlining the VFS/net/epoll
+# teardown into it), so this leaves real headroom while still catching the
+# 72 KB and 156 KB frames that caused item 15.
+STACK_FRAME_BUDGET=49152
+
+check_stack_frames() {
+    local kernel="$1" label="$2"
+    echo "  🪜 Checking $label kernel stack frames..."
+    python3 "$ROOT_DIR/scripts/check-stack-frames.py" "$kernel" --budget "$STACK_FRAME_BUDGET"
+}
+
 # Function to download and cache Limine
 download_limine() {
     local version="$1"
@@ -122,11 +142,13 @@ build_kernel() {
         features_arg="--features raspi4b"
     fi
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_std" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
-    RUSTFLAGS="-C link-arg=-T$linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro" \
+    RUSTFLAGS="-C link-arg=-T$linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro $STACK_SIZES_FLAG" \
     cargo build -p kernel $features_arg --target "$target_spec" --target-dir "$target_root_std" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
-    
+
     mkdir -p "target/final-$arch"
     cp "$target_root_std/$target_triple/release/kernel" "target/final-$arch/kernel"
+
+    check_stack_frames "target/final-$arch/kernel" "$arch standard"
 
     # 2. Direct boot kernel
     echo "  Building direct-boot kernel..."
@@ -134,10 +156,12 @@ build_kernel() {
     mkdir -p "$target_root_dir"
     local direct_linker="$ROOT_DIR/linkers/$arch-direct.ld"
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_dir" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
-    RUSTFLAGS="-C link-arg=-T$direct_linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro" \
+    RUSTFLAGS="-C link-arg=-T$direct_linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro $STACK_SIZES_FLAG" \
     cargo build -p kernel $features_arg --target "$target_spec" --target-dir "$target_root_dir" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
-    
+
     cp "$target_root_dir/$target_triple/release/kernel" "target/final-$arch/kernel-direct"
+
+    check_stack_frames "target/final-$arch/kernel-direct" "$arch direct"
     
     # Generate flat binary and 32-bit ELF for direct boot
     local sysroot

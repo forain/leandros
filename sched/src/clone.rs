@@ -84,14 +84,15 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         if parent_pid == 0 { return -38; }
 
         // ── Step 1: allocate child kernel stack ───────────────────────────────
-        let stack_pages = 4; // 64 KiB
+        let stack_pages = super::KERNEL_STACK_ORDER;
         let stack_base_phys = match mm::buddy::alloc(stack_pages) {
             Some(a) => a,
             None    => return -12, // ENOMEM
         };
-        let stack_size = mm::buddy::PAGE_SIZE * (1 << stack_pages);
+        let stack_size = super::KERNEL_STACK_SIZE;
         let stack_base_virt = mm::phys_to_virt(stack_base_phys);
         unsafe { (stack_base_virt as *mut u8).write_bytes(0, stack_size); }
+        super::arm_kernel_stack(stack_base_phys);
 
         // ── Step 2: allocate child page-table root ────────────────────────────
         let child_pt = unsafe { super::arch_alloc_page_table_root() };
@@ -366,14 +367,15 @@ pub fn clone_thread(
         if parent_pid == 0 { return -38; }
 
         // ── Allocate child kernel stack ───────────────────────────────────────
-        let stack_pages = 4; // 64 KiB
+        let stack_pages = super::KERNEL_STACK_ORDER;
         let stack_base_phys = match mm::buddy::alloc(stack_pages) {
             Some(a) => a,
             None    => return -12,
         };
-        let stack_size = mm::buddy::PAGE_SIZE * (1 << stack_pages);
+        let stack_size = super::KERNEL_STACK_SIZE;
         let stack_base_virt = mm::phys_to_virt(stack_base_phys);
         unsafe { (stack_base_virt as *mut u8).write_bytes(0, stack_size); }
+        super::arm_kernel_stack(stack_base_phys);
 
         // ── Copy parent's UserFrame to top of child kernel stack ──────────────
         // Round up to keep the child's kernel SP 16-byte aligned — see the

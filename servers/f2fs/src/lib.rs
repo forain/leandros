@@ -453,15 +453,15 @@ impl CpInfo {
 /// is 216 B (dominated by `path: [u8; MAX_OPEN_PATH]`) and, at 256 slots,
 /// `size_of::<Option<MountState>>()` is 71,872 B against 23,617 B at 32.
 ///
-/// That per-mount growth **no longer reaches the kernel image**, and the
-/// history of why is worth keeping: while `F2FS_MOUNTS` held `MountState`
-/// inline it multiplied this constant by `MAX_MOUNTS` = 8 into `.data` (the
-/// array is behind a `Mutex`, so rustc emits it initialised), so 32 -> 256 grew
-/// the image ~386 KB — and that growth alone stopped the x86_64 Linux box
-/// booting, on both architectures, while the identical kernel booted on the
-/// Mac. `F2FS_MOUNTS` now holds `Option<Box<MountState>>`, so this constant
-/// costs heap at mount time and nothing at all in the image. Raising it again
-/// is cheap; it was only ever expensive by accident of where the table lived.
+/// What made 32 -> 256 dangerous was never those bytes in the image, though it
+/// looked that way for a day (TODO.md item 15). This constant sizes
+/// `MountState`, `MountState` was assembled as a *stack temporary* before being
+/// moved into the table, and a 71,872 B struct compiled to a 155,880 B frame on
+/// what was then a 64 KiB kernel stack — so raising the constant silently
+/// overran the stack by ~90 KB and corrupted the allocation underneath.
+/// `F2FS_MOUNTS` now holds `Option<Box<MountState>>` and `mount()` builds the
+/// value in place, so the constant costs heap at mount time and neither image
+/// bytes nor stack. Raising it again is cheap.
 ///
 /// Neither `MAX_MOUNTS` nor `MAX_OPEN_PATH` was cut to fund it. Shrinking
 /// `MAX_OPEN_PATH` to 128 would silently stop `/proc/self/fd/N` resolving
@@ -518,23 +518,25 @@ const MAX_MOUNTS: usize = 8;
 /// The mount table holds *pointers*, not inline `MountState`s, and that is a
 /// correctness requirement rather than a tidiness one.
 ///
-/// Inline, this static was `MAX_MOUNTS` whole `MountState`s — and because the
-/// array sits behind a `Mutex`, rustc emits it **initialised**, so it landed in
-/// `.data` and cost kernel *image* bytes, not just RAM. `nm` put it at
-/// 0x2DE08 = 188,936 B with `MAX_OPEN_FILES` at 32; raising that constant to
-/// 256 took it to 574,976 B, grew the image ~386 KB, and **stopped the x86_64
-/// Linux box booting on both architectures** — init faulted on its own stack
-/// during the very mount this table serves, while the same kernel booted fine
-/// on the Mac. The size was never the bug's *point*; it was the trigger, and
-/// the underlying layout fragility is still unexplained (see the note in
-/// TODO.md). A table that does not grow with `MAX_OPEN_FILES` cannot pull that
-/// trigger again.
+/// Inline, an entry of this array was a whole `MountState`, so filling a slot
+/// meant constructing 71,872 B — and rustc builds that on the **stack** before
+/// moving it in. `f2fs::mount` compiled to a 155,880 B frame against a 64 KiB
+/// kernel stack with no guard page, and **stopped the x86_64 Linux box booting
+/// on both architectures**: init faulted on its own stack during the very mount
+/// this table serves, because the mount had already overwritten ~90 KB of the
+/// buddy allocation below its stack. It looked host-specific only because the
+/// Mac happened to survive the same corruption. Full account, and the four
+/// experiments that separated frame size from image size, in TODO.md item 15.
 ///
-/// `Option<Box<MountState>>` is one null-pointer-optimised word, so all-`None`
-/// is all-zero bytes and the whole static is 64 B in `.bss`. The per-mount cost
-/// moves to the kernel heap and is paid only by volumes actually mounted —
-/// two of eight in a normal boot — so this is also a ~440 KB RAM saving over
-/// the inline table, on top of removing the image cost entirely.
+/// Holding pointers is what breaks that link: a slot is one word, so no code
+/// path constructs a `MountState` anywhere except in place. It is also cheaper
+/// twice over — `Option<Box<..>>` is null-pointer-optimised, so all-`None` is
+/// all-zero and the static is 64 B in `.bss` instead of 574,976 B in `.data`,
+/// and the per-mount cost is now paid only by volumes actually mounted, two of
+/// eight in a normal boot.
+///
+/// `scripts/check-stack-frames.py` fails the build if any frame gets near the
+/// stack again; it is not left to whoever next edits `mount()` to remember.
 static F2FS_MOUNTS: Mutex<[Option<Box<MountState>>; MAX_MOUNTS]> =
     Mutex::new([const { None }; MAX_MOUNTS]);
 
@@ -3400,12 +3402,14 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
     //
     // `Box::new(MountState { .. })` is the obvious spelling and is a trap here:
     // rustc materialises the ~72 KB struct as a stack temporary and memcpys it
-    // in, which measured at `sub rsp, 0x260E8` — a 155,880 B frame, larger than
-    // the whole 128 KB boot stack (`kernel/src/x86_64_start.rs:17`) that the
-    // boot-time mount runs on. That would have reproduced the very class of
-    // early-boot fault this change exists to remove. The two big fields are
-    // filled element-wise for the same reason: `BlockCache::new()` alone is a
-    // ~16 KB temporary and `[OpenFile::empty(); MAX_OPEN_FILES]` is ~55 KB.
+    // in, which measured at `sub rsp, 0x260E8` — a 155,880 B frame. `mount` runs
+    // in a syscall on the caller's kernel stack (`sched::KERNEL_STACK_SIZE`),
+    // which is 128 KiB and was 64 KiB when this was written, so that frame
+    // overran the stack outright. It is the exact defect of TODO.md item 15,
+    // reintroduced by the obvious spelling of the fix for it. The two big
+    // fields are filled element-wise for the same reason: `BlockCache::new()`
+    // alone is a ~16 KB temporary and `[OpenFile::empty(); MAX_OPEN_FILES]`
+    // is ~55 KB.
     let mut uninit: Box<core::mem::MaybeUninit<MountState>> = Box::new_uninit();
     let state: Box<MountState> = unsafe {
         let p = uninit.as_mut_ptr();
