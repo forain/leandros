@@ -828,6 +828,114 @@ def main():
         if os.path.exists(src):
             bin_files.append((name, src, 0o100755))
 
+    # Real COSMIC panel applets. cosmic-panel resolves each name in its
+    # plugins_wings/plugins_center config to a .desktop under
+    # /usr/share/applications and spawns its Exec; a name with no desktop file
+    # resolves to exec: None and is silently never spawned
+    # (cosmic-panel-bin wrapper_space.rs:460-520), so the binary and the
+    # desktop file must be staged together or the applet is invisible with no
+    # error anywhere.
+    #
+    # cosmic-panel-button backs THREE config names from ONE binary — it takes
+    # the target's app id as argv[1] (LauncherButton/AppButton/
+    # WorkspacesButton -> CosmicLauncher/CosmicAppLibrary/CosmicWorkspaces).
+    # Two consequences worth knowing before touching this:
+    #
+    #   * It resolves that argument to a FILE, not a D-Bus name:
+    #     run() (cosmic-panel-button/src/lib.rs:215-244) walks
+    #     fde::default_paths() for "<id>.desktop" and PANICS with
+    #     "Failed to find valid desktop file" if none matches. So the three
+    #     LAUNCH TARGETS' desktop files are staged alongside the applets' own
+    #     (see m6-session-data/shared) even though nothing in the panel config
+    #     names them. Missing target => the applet dies at startup, not at press.
+    #   * A PANEL BUTTON WEARS ITS TARGET'S ICON, NOT ITS OWN. run()
+    #     (cosmic-panel-button/src/lib.rs:215-244) parses the TARGET's desktop
+    #     file and keeps that file's Name and Icon; the button's own desktop
+    #     file contributes nothing but the panel-config name and the Exec line.
+    #     So the icons that must exist in the theme are
+    #     com.system76.Cosmic{Launcher,AppLibrary,Workspaces} -- NOT
+    #     com.system76.CosmicPanel*Button, which nothing ever looks up.
+    #     Proven in-guest with a temporary probe printing Named::path():
+    #         LEANDROS_ICON_PROBE name=com.system76.CosmicAppLibrary path=None
+    #     A miss is SILENT AND SHAPED LIKE SUCCESS: libcosmic's bundle::get is
+    #     `None` on unix (widget/icon/bundle.rs:7-10), so Named::handle() falls
+    #     back to Svg::from_memory(&[]) -- an EMPTY svg. The widget still takes
+    #     its explicit width/height, so the applet lays out at full size, the
+    #     dock sizes itself correctly around it, and exactly zero pixels are
+    #     painted. It looks identical to "the applet never started".
+    #     The three target icons are staged into m6-icons-pruned for this reason;
+    #     the CosmicPanel*Button icons are kept only because the panel's own
+    #     .desktop metadata references them.
+    #   * Pressing it does Command::new("sh").arg("-c").arg("exec <Exec>")
+    #     (:126-130) — NOT D-Bus activation. busd's omitted <servicedir> is
+    #     therefore not on this path at all. The Exec strings are bare names
+    #     (cosmic-launcher, cosmic-app-library, cosmic-workspaces), all three
+    #     already staged into /bin above under exactly those names, and /bin/sh
+    #     is brush.
+    #
+    # All three binaries are dynamic musl PIEs whose DT_NEEDED closure is
+    # libxkbcommon.so.0 + libc.so — both already packed for the other libcosmic
+    # binaries, so these add no new libraries.
+    #
+    # ── THERE IS NO APPLET-COUNT CEILING — root-caused 2026-08-09 ──
+    # All five .desktop files ship, and all eight applet processes now run.
+    #
+    # The recorded hypothesis here was "more than ~4 concurrent applets kills
+    # the panel", with descriptor exhaustion as the leading suspect and a count
+    # bisect as the next step. Both were wrong, and the count framing is what
+    # made them wrong: a name in the panel config is not a process. `entries` is
+    # ["Panel","Dock"], the two spaces resolve their plugin lists independently,
+    # and WorkspacesButton/AppButton appear in BOTH — so "stub + 3 buttons" is
+    # six processes, not four, and adding two .desktop files takes it to eight.
+    # Nothing about that crosses a resource limit; the working and failing sets
+    # differ QUALITATIVELY, not by count:
+    #
+    #   CosmicAppletTiling and CosmicAppletMinimize are exactly the applets
+    #   carrying X-HostWaylandDisplay=true, and that flag — and only that flag —
+    #   makes cosmic-panel call wp_security_context_v1.create_listener to hand
+    #   the applet a privileged socket to the real compositor
+    #   (wrapper_space.rs:562-588).
+    #
+    # That request marshals a LISTENING AF_UNIX socket, and libwayland dups
+    # every fd it marshals. Two LeandrOS gaps sat on that path, both now fixed
+    # in servers/net (see handle_dup and xfer_export):
+    #   1. dup() of a listening socket returned EINVAL — bound addresses were
+    #      not refcounted, so a second fd could not be allowed to name one.
+    #   2. SCM_RIGHTS could not carry a socket fd at all: vfs::export_fd rejects
+    #      anything >= its MAX_FDS of 128, and socket fds start at 0x100.
+    #
+    # The exit 1 was the FIRST of those, and it is worth remembering why it was
+    # fatal rather than degrading: a marshalling failure poisons libwayland's
+    # whole connection, so the panel's next event_loop.dispatch()? propagated an
+    # Err out of run() and `fn main() -> Result<()>`
+    # (cosmic-panel-bin/src/main.rs:72) turned it into exit 1. That is also why
+    # the bar vanished entirely — nothing rendered because the process was gone,
+    # which reads as "the applets did not render" and is not that at all.
+    #
+    # Verified both arches 2026-08-09, fresh images, full session:
+    #   before  7 x `dup failed: Invalid argument` -> 7 x exit 1 (restart loop)
+    #   after   0 dup failures, 0 marshalling errors, 0 exits; 8 applets spawn
+    #           once each; desktop alive at t+3 min (aarch64) / t+8 min (x86_64)
+    # scmtest 35/35 and vfstest 36/36 on both arches.
+    #
+    # STILL OPEN, and deliberately not conflated with the above: neither
+    # cosmic-applet-tiling nor cosmic-applet-minimize paints any pixels yet.
+    # Both start, stay up, and take their privileged socket without error, but
+    # the top bar's content extent is byte-identical to a run without them. An
+    # empty minimize applet is correct with no windows open; tiling is not, and
+    # is the same class of "lays out, paints nothing" gap noted for the icons
+    # above. That is a rendering question, not this one.
+    m6_applets = [
+        ("cosmic-panel-button",     f"{m6_out}/cosmic-panel-button-{arch}"),
+        ("cosmic-applet-minimize",  f"{m6_out}/cosmic-applet-minimize-{arch}"),
+        ("cosmic-applet-tiling",    f"{m6_out}/cosmic-applet-tiling-{arch}"),
+    ]
+    for name, src in m6_applets:
+        if os.path.exists(src):
+            bin_files.append((name, src, 0o100755))
+        else:
+            print(f"  WARNING: applet binary absent, panel entry will be dead: {src}")
+
     # leandros-applet — a minimal dependency-free wl_shm xdg_toplevel panel applet.
     # cosmic-panel refuses to render its bar with no applet content (render()
     # early-returns while actual_size<=20), and the real cosmic applets pull
@@ -1186,6 +1294,41 @@ def main():
     ):
         if os.path.isfile(_src):
             _stage_cosmic_default(_rel, _src)
+
+    # v2 theme schema is missing `list_button`, and that ONE absent file makes the
+    # whole system theme fail to load in EVERY libcosmic process.
+    #
+    # libcosmic (the applets' pin, 511384f) declares cosmic-theme's `Theme` as
+    # `#[version = 2]` and its struct still carries a `list_button` field, so
+    # cosmic-config reads `com.system76.CosmicTheme.<Dark|Light>/v2/list_button`.
+    # Upstream's epoch-1.3.0 schema ships 30 keys in v1 (list_button among them)
+    # and 37 in v2 (list_button NOT among them -- v2 adds alpha_map, frosted*,
+    # transparent*, and drops list_button/is_frosted). The read therefore returns
+    # ENOENT and `Theme::get_entry` fails the whole entry, which every libcosmic
+    # app reports once per start as
+    #     ERROR cosmic::theme: error loading system dark theme
+    #     error=GetKey("list_button", Os { code: 2, kind: NotFound, ... })
+    # It is a version skew between the applets' libcosmic pin and the epoch-1.3.0
+    # data, not a staging mistake -- the file is correctly absent upstream.
+    #
+    # Fix on our side (packaging only, no COSMIC source change): carry v1's value
+    # forward into v2. Verified on aarch64 -- the `list_button` error goes 1 -> 0
+    # per libcosmic process and `error loading system dark theme` disappears
+    # entirely from a full session log.
+    #
+    # SCOPE, stated because it is easy to over-read: this fixes the THEME LOAD.
+    # It was tested against the blank Dock applet icons and did NOT fix them --
+    # the Dock is still empty with the theme loading cleanly, so that is a
+    # separate defect and this comment is not evidence about it.
+    for _theme in ("com.system76.CosmicTheme.Dark", "com.system76.CosmicTheme.Light"):
+        _v1 = f"{cosmic_epoch}/cosmic-settings/resources/default_schema/{_theme}/v1/list_button"
+        _v2_dir = f"{cosmic_epoch}/cosmic-settings/resources/default_schema/{_theme}/v2"
+        if os.path.isfile(_v1) and os.path.isdir(_v2_dir):
+            if os.path.exists(os.path.join(_v2_dir, "list_button")):
+                print(f"  NOTE: {_theme}/v2/list_button now exists upstream; "
+                      f"the compatibility copy in mkfs is redundant and can go")
+            else:
+                _stage_cosmic_default(f"{_theme}/v2/list_button", _v1)
 
     # 2. Dynamically calculate required blocks and image size
     # Each meta segment takes 512 blocks. We have 8 meta segments (4096 blocks).

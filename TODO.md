@@ -794,7 +794,7 @@ paragraph that leans on "out of scope" with that in mind.
 | 6 | Input reaches clients **losslessly**; the "starvation" was the harness | Bug — **CLOSED** `af9f076` | 100% at 60 moves/s; a parked serial reader wedged the tick |
 | 7 | libcosmic apps **block in a D-Bus probe**; they render fine | Bug — **FIXED** `85f2f4c`+`daa2815` | busd answers `ServiceUnknown`; 4 parked components alive, both arches |
 | 8 | Nothing to launch, and no way to ask for it | Feature — **config DONE**; rest **MIS-SIZED** | `cosmic-term` needs a PTY layer (2-3 wks), not a build |
-| 9 | **9 panel applets have no scoped-out dependency and are simply unbuilt** | Feature — cheap | Build recipe exists; spawn path proven |
+| 9 | **5 real applets now ship and run; 2 of them paint nothing** | Feature — panel-death **FIXED**; rendering **OPEN** | 8 processes, 0 exits; tiling + minimize draw zero pixels |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
 | 11 | **PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — greeter one **RETIRED**; session one **cause FIXED** `2d9f0c8` | One patch left; handshake completes 5.022 s → 2.186 s |
 | 12 | **PAM — real support, replacing the C shim** | Feature — **NEW, in scope** | Shim authenticates for real but is C, untracked, coverage unverified |
@@ -1380,7 +1380,112 @@ image contains **exactly one** `.desktop` file — our own applet stub. `cosmic-
 built**. Even with input and shortcuts fixed, `Super` would open a launcher over an empty
 index. **Item 8 is therefore two pieces of work, and the config file is only the first.**
 
-### 9. Nine panel applets have no scoped-out dependency and are simply unbuilt
+### 9. Five real applets ship and run — two of them paint nothing (2026-08-09)
+
+**Superseded in part.** The survey below described a tree with one staged `.desktop`. Five
+now ship (`CosmicPanel{Launcher,App,Workspaces}Button`, `CosmicAppletTiling`,
+`CosmicAppletMinimize`) plus the stub clock, and **eight applet processes run**, because a
+name is not a process: `entries` is `["Panel","Dock"]`, the two spaces resolve their plugin
+lists independently, and `WorkspacesButton`/`AppButton` are in **both**.
+
+#### 9a. The "applet-count ceiling" did not exist — `dup` of a listening socket did
+
+The recorded finding was *"more than ~4 concurrent applets kills the panel (exit 1), leading
+suspect descriptor exhaustion, next step a 4-vs-5 count bisect"*. **All three claims were
+wrong**, and the count framing is what made them wrong — "stub + 3 buttons" was already six
+processes, and the failing set was eight. Nothing there approaches a limit.
+
+The working and failing sets differ **qualitatively**: `CosmicAppletTiling` and
+`CosmicAppletMinimize` are exactly the two applets carrying `X-HostWaylandDisplay=true`, and
+that flag alone makes cosmic-panel call `wp_security_context_v1.create_listener`
+(`wrapper_space.rs:562-588`) to hand the applet a privileged socket to the *real* compositor.
+That request marshals a **listening AF_UNIX socket**, and libwayland dups every fd it
+marshals. Two LeandrOS gaps sat on that path:
+
+1. `dup()` of a listening socket returned **EINVAL** (`servers/net` `handle_dup`) — bound
+   addresses were not refcounted, so a second fd could not be allowed to name one.
+2. **SCM_RIGHTS could not carry a socket fd at all**: `vfs::export_fd` rejects anything
+   `>= MAX_FDS` (128) and socket fds start at `0x100`.
+
+Both fixed: `BoundPath` gains a refcount, `handle_dup` refcounts `UnixListening`, and a new
+`XferFd` enum lets a batch carry either a VFS descriptor or a lifted `SockEntry`
+(`xfer_export`/`xfer_import`/`xfer_drop`). `drain_fds` became `take_fds` because it used to
+release transfers while holding `UNIX_CONNS`, which self-deadlocks once a queued fd can
+reference a connection.
+
+Why it was fatal rather than degrading, which is the reusable lesson: **a marshalling failure
+poisons libwayland's whole connection**, so the panel's next `event_loop.dispatch()?`
+propagated an `Err` out of `run()` and `fn main() -> Result<()>`
+(`cosmic-panel-bin/src/main.rs:72`) turned it into exit 1. The bar then vanished entirely —
+which reads as "the applets did not render" and is nothing of the kind.
+
+Measured both arches, fresh images, full session:
+
+| | before | after |
+|---|---|---|
+| `dup failed: Invalid argument` | 7 | **0** |
+| `Error marshalling request` | 7 | **0** |
+| `cosmic-panel … failed with code 1` | 7 | **0** |
+| applet spawns | restart loop | **8, once each** |
+
+Desktop alive at t+3 min (aarch64) and t+8 min (x86_64), clock ticking. `scmtest` **35/35**
+both arches, `vfstest` **36/36** aarch64 on a fresh image, `epolltest` 10/10, `polltest` green.
+(The 3 vfstest reds seen mid-lane were dirty-image residue — clean on regeneration. The one
+panic in the logs, `src/comp.rs:37`, is present on the pre-fix control too.)
+
+#### 9b. OPEN: tiling and minimize draw zero pixels
+
+Both start, stay up (no exits, no restarts, no `Failed to create a listener`) and take their
+privileged socket — and neither paints. The top bar's content extent is **byte-identical**
+(x = 12..709, the clock) to a run without them.
+
+**Already eliminated — do not re-test these:**
+
+- *"No state to show."* `cosmic-applet-tiling`'s `view()` (`window.rs:245-251`) is
+  unconditional: `icon_button(if self.autotiled { ON } else { OFF })`. It draws an icon
+  whatever the compositor says.
+- *"Icon not staged."* It asks for `com.system76.CosmicAppletTiling.{On,Off}`, and both SVGs
+  are packed into `icons/Cosmic/scalable/apps/` — **the same directory** as
+  `com.system76.CosmicAppLibrary.svg`, which visibly renders in the dock. Lookup in that exact
+  directory is therefore proven by a rendering sibling.
+- *"The applet died."* No exit, no restart, no stderr of its own in a full session.
+- *"Overflow/shrink machinery."* Minimize sits in the Dock's `plugins_center` **alongside the
+  three buttons that do draw**, so the list is not the discriminator.
+
+**The one thing that is unique to these two, and the place to start:** they are the only
+applets that open a **second Wayland connection** — `cosmic-applet-tiling/src/wayland.rs:44`
+reads `X_PRIVILEGED_WAYLAND_SOCKET` and connects to the real compositor rather than to the
+panel's embedded server. That code path **had never executed once on LeandrOS before
+2026-08-09**, because `create_listener` always failed; it is brand-new surface with zero
+coverage. An iced applet whose subscription wedges on that connection stays alive and never
+commits a first frame — which is exactly the observed shape.
+
+**Next, in order:**
+
+1. Prove whether cosmic-comp ever **accepts** on the imported listener. It receives the
+   listener fd over SCM_RIGHTS and `accept()`s it into a new client; a serial print at that
+   accept (or a client-count check) separates "the socket never carried a connection" from
+   "the applet has one and still does not draw". This is the fork in the road — everything
+   below depends on which way it goes.
+2. If the accept never happens: the panel connects to its own abstract address
+   (`UnixStream::connect_addr`) *before* handing the fd over, so the pending connect must
+   survive the transfer and match by `sock_id` — check `handle_accept`'s `UnixListening` arm
+   against an imported `bound_idx`.
+3. If the accept does happen: the applet has a live privileged connection and the failure is
+   downstream in iced/libcosmic. Re-use the recorded icon probe (a temporary `Named::path()`
+   print, `LEANDROS_ICON_PROBE name=… path=…`) on `com.system76.CosmicAppletTiling.On` — a
+   miss is **silent and shaped like success** (`bundle::get` is `None` on unix, so
+   `Named::handle()` falls back to `Svg::from_memory(&[])`: full-size layout, zero pixels).
+4. Only then ask whether the panel allocates the applet space at all — the top Panel is
+   full-width, so bar extents cannot answer that; measure the **dock** width with and without
+   minimize instead, which auto-sizes.
+
+An empty **minimize** applet with no windows open is correct upstream behaviour, so tiling is
+the one that must be made to draw; minimize should be judged only once a window exists.
+
+---
+
+*(Original survey, retained for the parts still true:)*
 
 `cosmic-panel`'s default config names **16 unique applets**; **one** is present, and it is our
 ~230-line stand-in (`leandros-applet`, `wl_shm` + `xdg_toplevel`, ticking clock) wired in by
@@ -1628,7 +1733,9 @@ same argument that put an intermediate step in the greeter route.
    already-running components reachable.
 3. **Item 7 (iced renders nothing)**, jointly with the panel gap, because it decides whether
    items 9 and the rest of the suite are worth building at all.
-4. **Item 9's nine applets**, once 7 says they will draw.
+4. **Item 9's applets** — no longer gated on 7, and no longer a build task. Five ship and
+   eight processes run (9a); what is left is **9b: tiling paints zero pixels**, and the
+   first step there is proving whether cosmic-comp accepts on the imported listener.
 5. **Item 10** only when a portal-shaped capability is actually wanted.
 
 ### Corrections this survey forces

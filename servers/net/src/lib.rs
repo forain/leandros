@@ -293,6 +293,31 @@ impl Ucred {
     const fn zero() -> Self { Self { pid: 0, uid: 0, gid: 0 } }
 }
 
+/// One descriptor in flight over SCM_RIGHTS.
+///
+/// A descriptor number tells you which table owns it: the VFS's per-process
+/// table below `SOCK_FD_BASE`, this server's `SOCK_TABLES` above it. Only the
+/// first kind used to be transferable, because `vfs::export_fd` rejects
+/// anything `>= MAX_FDS` — so passing a SOCKET over SCM_RIGHTS returned EBADF.
+///
+/// That is not a corner case: `wp_security_context_v1.create_listener` passes a
+/// *listening* AF_UNIX socket, and it is how COSMIC hands the compositor a
+/// private per-applet listener. With the socket arm missing, every
+/// `X-HostWaylandDisplay=true` applet took cosmic-panel's Wayland connection
+/// down with it (see `handle_dup`, which is the other half of the same bug).
+///
+/// `Copy` like the `vfs::TransferFd` it wraps, and for the same reason: the
+/// reference it carries is released by an explicit `xfer_drop`, never by going
+/// out of scope, so the queued batch can be indexed rather than moved out of.
+#[derive(Clone, Copy)]
+enum XferFd {
+    Vfs(vfs::TransferFd),
+    /// A lifted `SockEntry`. The in-flight reference it holds on the underlying
+    /// object is taken by `xfer_export` and released by exactly one of
+    /// `xfer_import` (handing it to the receiver) or `xfer_drop`.
+    Sock(SockEntry),
+}
+
 /// One SCM_RIGHTS fd batch queued on a stream direction. `seq_byte` is the
 /// absolute stream offset (UnixRing::wtotal) of the first data byte these fds
 /// accompany; the recv that consumes that byte delivers them (Linux: fds ride
@@ -300,7 +325,7 @@ impl Ucred {
 /// within a direction, since sends append in order.
 struct PendingFdBatch {
     seq_byte: u64,
-    fds:      alloc::vec::Vec<vfs::TransferFd>,
+    fds:      alloc::vec::Vec<XferFd>,
 }
 
 struct UnixConn {
@@ -397,11 +422,20 @@ impl UnixConn {
         }
     }
 
-    /// Release every queued-but-undelivered fd on both directions (socket torn
-    /// down). Linux closes in-flight SCM_RIGHTS fds when the socket dies.
-    fn drain_fds(&mut self) {
-        for b in self.fdq_ab.drain(..) { for tf in b.fds { vfs::drop_transfer(tf); } }
-        for b in self.fdq_ba.drain(..) { for tf in b.fds { vfs::drop_transfer(tf); } }
+    /// Lift every queued-but-undelivered fd off both directions (socket torn
+    /// down). Linux closes in-flight SCM_RIGHTS fds when the socket dies, and
+    /// the caller does exactly that by passing the result to `xfer_drop`.
+    ///
+    /// The releasing is deliberately NOT done here: an in-flight fd may itself
+    /// be a socket referencing a `UnixConn` (see `XferFd::Sock`), so dropping
+    /// one takes UNIX_CONNS — which every caller of this already holds. Handing
+    /// the orphans back keeps that release outside the lock.
+    #[must_use = "the lifted descriptors must be passed to xfer_drop"]
+    fn take_fds(&mut self) -> alloc::vec::Vec<XferFd> {
+        let mut out = alloc::vec::Vec::new();
+        for b in self.fdq_ab.drain(..) { out.extend(b.fds); }
+        for b in self.fdq_ba.drain(..) { out.extend(b.fds); }
+        out
     }
 }
 
@@ -422,6 +456,17 @@ struct BoundPath {
     /// True for a Linux abstract-namespace address (sun_path[0] == 0): matched
     /// by bytes here, never backed by a VFS node.
     is_abstract: bool,
+    /// How many things still hold this bound address: one per `UnixListening`
+    /// fd naming it, plus one per in-flight SCM_RIGHTS copy. The address stops
+    /// resolving only when the LAST of them goes away.
+    ///
+    /// It was implicitly 1 — the slot was freed by whichever fd closed first —
+    /// which is why `dup()` of a listener had to be refused outright, and that
+    /// refusal is what killed cosmic-panel: libwayland dups every fd it
+    /// marshals, so `wp_security_context_v1.create_listener` (the request
+    /// behind every `X-HostWaylandDisplay=true` applet) failed to marshal and
+    /// poisoned the panel's whole Wayland connection. See `handle_dup`.
+    refs:       u32,
     _owner_pid:  u32,
     _owner_sock: usize,
 }
@@ -429,7 +474,7 @@ struct BoundPath {
 impl BoundPath {
     const fn new() -> Self {
         Self { in_use: false, path: [0u8; PATH_MAX], path_len: 0,
-               sock_id: 0, is_abstract: false,
+               sock_id: 0, is_abstract: false, refs: 0,
                _owner_pid: 0, _owner_sock: 0 }
     }
 }
@@ -694,14 +739,99 @@ fn inet_sock_info(pid: u32, fd: usize) -> Option<(SockState, u8, u16)> {
     Some((tbl.socks[slot].state, tbl.socks[slot].sock_type, tbl.socks[slot].bound_port))
 }
 
-/// Free the BOUND_PATHS slot a `UnixListening` socket owned. Called when the
-/// listener closes: the address stops resolving to a live listener (a pathname
-/// socket's VFS node lingers per Linux, but connecting to it now yields
-/// ECONNREFUSED), and the slot is reclaimable. Caller must not hold BOUND_PATHS.
+/// Release ONE reference to the BOUND_PATHS slot a `UnixListening` socket
+/// names. Called once per owner going away — a listener fd closing, a process
+/// exiting, an in-flight SCM_RIGHTS copy being dropped undelivered.
+///
+/// The slot is reclaimed on the last release: only then does the address stop
+/// resolving to a live listener (a pathname socket's VFS node lingers per
+/// Linux, but connecting to it now yields ECONNREFUSED). Every caller
+/// corresponds to exactly one reference taken by `bind`, `handle_dup`, or
+/// `xfer_export`, so callers need no refcount awareness of their own.
+///
+/// Caller must not hold BOUND_PATHS.
 fn free_bound_idx(bound_idx: usize) {
     let mut bound = BOUND_PATHS.lock();
     if bound_idx < MAX_BOUND && bound[bound_idx].in_use {
-        bound[bound_idx] = BoundPath::new();
+        bound[bound_idx].refs = bound[bound_idx].refs.saturating_sub(1);
+        if bound[bound_idx].refs == 0 {
+            bound[bound_idx] = BoundPath::new();
+        }
+    }
+}
+
+/// Take one extra reference to a bound address (`handle_dup`, `xfer_export`).
+/// Caller must not hold BOUND_PATHS.
+fn bound_ref_inc(bound_idx: usize) {
+    let mut bound = BOUND_PATHS.lock();
+    if bound_idx < MAX_BOUND && bound[bound_idx].in_use {
+        bound[bound_idx].refs = bound[bound_idx].refs.saturating_add(1);
+    }
+}
+
+// ── SCM_RIGHTS descriptor transfer ────────────────────────────────────────────
+//
+// `xfer_export` / `xfer_import` / `xfer_drop` are the three sides of one
+// ownership rule, the same one `vfs::export_fd` documents: an exported
+// descriptor carries a reference, and that reference is consumed by exactly
+// one successful `xfer_import` or one `xfer_drop`. Never both, never neither.
+
+/// Lift `fd` out of `pid`'s table into an in-flight descriptor, taking a
+/// reference on whatever it names. `None` (→ EBADF) for a descriptor that
+/// cannot be transferred.
+fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
+    let Some(slot) = fd_to_slot(fd) else {
+        // Ordinary VFS descriptor (memfd, pipe, file).
+        return vfs::export_fd(pid, fd).map(XferFd::Vfs);
+    };
+    let entry = {
+        let tbls = SOCK_TABLES.lock();
+        let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+        if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return None; }
+        tbl.socks[slot]
+    };
+    match entry.state {
+        // The case this exists for: handing a peer a listening socket.
+        SockState::UnixListening { bound_idx } => bound_ref_inc(bound_idx),
+        // Nothing underneath yet — the entry itself is the whole state.
+        SockState::Unbound { .. } => {}
+        // A connected end could be refcounted the same way `handle_dup` does,
+        // but nothing in the session passes one and doing it here would make a
+        // queued fd able to reference the very connection it is queued on.
+        // Refused explicitly rather than silently mis-refcounted.
+        _ => return None,
+    }
+    Some(XferFd::Sock(entry))
+}
+
+/// Install an in-flight descriptor into `pid`'s table, consuming its reference.
+/// Returns the new fd, or a negative errno **without consuming** it — the
+/// caller still owns it and must `xfer_drop` it (see the recvmsg overflow path).
+fn xfer_import(pid: u32, x: XferFd, cloexec: bool) -> isize {
+    match x {
+        XferFd::Vfs(tf) => vfs::import_fd(pid, tf, cloexec),
+        XferFd::Sock(entry) => {
+            let mut tbls = SOCK_TABLES.lock();
+            let Some(tbl) = get_or_create(pid, &mut *tbls) else { return -12 }; // ENOMEM
+            let Some(slot) = tbl.alloc() else { return -24 };                   // EMFILE
+            let mut e = entry;
+            e.cloexec = cloexec;
+            tbl.socks[slot] = e;
+            (slot + SOCK_FD_BASE) as isize
+        }
+    }
+}
+
+/// Release an in-flight descriptor that never reached a receiver.
+/// Caller must hold neither UNIX_CONNS nor BOUND_PATHS.
+fn xfer_drop(x: XferFd) {
+    match x {
+        XferFd::Vfs(tf) => vfs::drop_transfer(tf),
+        XferFd::Sock(entry) => match entry.state {
+            SockState::UnixListening { bound_idx } => free_bound_idx(bound_idx),
+            // `xfer_export` admits no other reference-holding state.
+            _ => {}
+        },
     }
 }
 
@@ -1026,6 +1156,9 @@ pub fn force_bind_unix(path_str: &str, _port: u32) {
             path_len,
             sock_id: alloc_sock_id(),
             is_abstract: false,
+            // No fd names this one — it is bound on behalf of the system, and
+            // the single reference is what keeps it alive for good.
+            refs: 1,
             _owner_pid: 0,
             _owner_sock: 0
         };
@@ -1246,7 +1379,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
                 None => return err_reply(-12),
             };
             bound[idx] = BoundPath { in_use: true, path: pbytes, path_len,
-                                     sock_id, is_abstract,
+                                     sock_id, is_abstract, refs: 1,
                                      _owner_pid: pid, _owner_sock: slot };
             drop(bound);
 
@@ -1649,17 +1782,18 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
 
         // The connecting socket becomes end A at accept time; capture its creds.
         let cred = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
-        let conn_idx = {
+        let (conn_idx, orphans) = {
             let mut conns = UNIX_CONNS.lock();
             let idx = match conns.iter().position(|c| !c.in_use) {
                 Some(i) => i, None => return err_reply(-12),
             };
-            conns[idx].drain_fds();
+            let orphans = conns[idx].take_fds();
             conns[idx] = UnixConn::new();
             conns[idx].in_use = true;
             conns[idx].cred_a = cred;
-            idx
+            (idx, orphans)
         };
+        for x in orphans { xfer_drop(x); }
 
         let mut tbls = SOCK_TABLES.lock();
         let tbl = match find_tbl(pid, &mut *tbls) {
@@ -1681,18 +1815,19 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
 
     // Both ends belong to the creating process — SO_PEERCRED on either reports it.
     let cred = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
-    let conn_idx = {
+    let (conn_idx, orphans) = {
         let mut conns = UNIX_CONNS.lock();
         let idx = match conns.iter().position(|c| !c.in_use) {
             Some(i) => i, None => return err_reply(-12),
         };
-        conns[idx].drain_fds();
+        let orphans = conns[idx].take_fds();
         conns[idx] = UnixConn::new();
         conns[idx].in_use = true;
         conns[idx].cred_a = cred;
         conns[idx].cred_b = cred;
-        idx
+        (idx, orphans)
     };
+    for x in orphans { xfer_drop(x); }
 
     let mut tbls = SOCK_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) {
@@ -2161,11 +2296,11 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     // Have fds. Export them out of the sender's fd table (locks FD_TABLES —
     // done BEFORE taking UNIX_CONNS so the two locks are never nested here).
     let (conn_idx, is_a) = unix_end.unwrap();
-    let mut batch: alloc::vec::Vec<vfs::TransferFd> = alloc::vec::Vec::new();
+    let mut batch: alloc::vec::Vec<XferFd> = alloc::vec::Vec::new();
     for i in 0..nfd {
-        match vfs::export_fd(pid, fd_nums[i] as usize) {
+        match xfer_export(pid, fd_nums[i] as usize) {
             Some(tf) => batch.push(tf),
-            None => { for tf in batch { vfs::drop_transfer(tf); } return err_reply(-9); } // EBADF
+            None => { for tf in batch { xfer_drop(tf); } return err_reply(-9); } // EBADF
         }
     }
 
@@ -2182,7 +2317,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     // requested there is no byte to ride and no EAGAIN retry could ever place
     // one — drop the batch (Linux does not queue fds for a zero-length send).
     if requested == 0 {
-        for tf in batch { vfs::drop_transfer(tf); }
+        for tf in batch { xfer_drop(tf); }
         return val_reply(0);
     }
 
@@ -2192,20 +2327,20 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     let conn = &mut conns[conn_idx];
     if !conn.in_use {
         drop(conns);
-        for tf in batch { vfs::drop_transfer(tf); }
+        for tf in batch { xfer_drop(tf); }
         return err_reply(-32);
     }
     let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
     if peer_closed {
         drop(conns);
-        for tf in batch { vfs::drop_transfer(tf); }
+        for tf in batch { xfer_drop(tf); }
         return err_reply(-32); // EPIPE
     }
     // Half-close, same rule as handle_send: our write direction or the peer's
     // read direction retired is EPIPE; the peer's write direction is not.
     if conn.wr_shut(is_a) || conn.rd_shut(!is_a) {
         drop(conns);
-        for tf in batch { vfs::drop_transfer(tf); }
+        for tf in batch { xfer_drop(tf); }
         return err_reply(-32); // EPIPE
     }
     // Bound the in-flight SCM_RIGHTS fds on this direction. Past the cap the
@@ -2218,7 +2353,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     };
     if queued + nfd > QUEUED_FD_CAP {
         drop(conns);
-        for tf in batch { vfs::drop_transfer(tf); }
+        for tf in batch { xfer_drop(tf); }
         return err_reply(ETOOMANYREFS);
     }
     let seq = if is_a { conn.ring_ab.wtotal } else { conn.ring_ba.wtotal };
@@ -2237,7 +2372,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
         // Couldn't place even the first byte; the blocking wrapper will retry.
         // Release the batch so the retry re-exports a fresh copy.
         drop(conns);
-        for tf in batch { vfs::drop_transfer(tf); }
+        for tf in batch { xfer_drop(tf); }
         return err_reply(-11); // EAGAIN
     }
     if is_a {
@@ -2349,7 +2484,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     }
 
     let rtotal = if is_a { conn.ring_ba.rtotal } else { conn.ring_ab.rtotal };
-    let deliver: Option<alloc::vec::Vec<vfs::TransferFd>> = {
+    let deliver: Option<alloc::vec::Vec<XferFd>> = {
         let q = if is_a { &mut conn.fdq_ba } else { &mut conn.fdq_ab };
         if !q.is_empty() && q[0].seq_byte < rtotal {
             Some(q.remove(0).fds)
@@ -2379,7 +2514,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         let mut installed = [0i32; SCM_MAX_FD];
         let mut i = 0usize;
         while i < fit {
-            let newfd = vfs::import_fd(pid, fds[i], cloexec);
+            let newfd = xfer_import(pid, fds[i], cloexec);
             if newfd < 0 {
                 // Receiver's fd table is full: everything from here truncates.
                 // `import_fd` consumes a descriptor only when it returns an fd,
@@ -2395,7 +2530,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         }
         // Close every fd that didn't fit — including the one whose import just
         // failed (Linux drops the overflow).
-        for j in fit..nfds { vfs::drop_transfer(fds[j]); }
+        for j in fit..nfds { xfer_drop(fds[j]); }
         if fit > 0 {
             unsafe {
                 let clen = CMSG_HDR_LEN + fit * 4;
@@ -2725,9 +2860,41 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool) -> Message {
         if !conns[conn_idx].in_use { return err_reply(-9); }
         if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
     }
-    // Inet/listening sockets alias fine at the table level: their smoltcp
-    // handle is only released by handle_close, which the refcountless copy
-    // would double-free — so restrict dup to states that carry no handle.
+    // An AF_UNIX listener is refcounted through its bound address, so the two
+    // fds share one listening queue and the address survives until the last of
+    // them closes — Linux semantics, and the reason this is not the EINVAL arm
+    // below any more. libwayland dups EVERY fd it marshals
+    // (`wl_closure_marshal` -> `wl_os_dupfd_cloexec`), so refusing this made
+    // `wp_security_context_v1.create_listener` unmarshallable, which poisons
+    // the caller's whole Wayland connection rather than failing one request:
+    // cosmic-panel died with exit 1 the moment any `X-HostWaylandDisplay=true`
+    // applet (CosmicAppletTiling, CosmicAppletMinimize) was configured.
+    else if let SockState::UnixListening { bound_idx } = entry.state {
+        // BOUND_PATHS is a leaf lock and SOCK_TABLES is held here, so the
+        // increment cannot be done inline; take it after dropping the table.
+        // `new_slot` was chosen under the lock just dropped, so it is re-picked
+        // below rather than trusted across the gap.
+        drop(tbls);
+        bound_ref_inc(bound_idx);
+        let mut tbls = SOCK_TABLES.lock();
+        let placed = match find_tbl(pid, &mut *tbls) {
+            Some(t) => match t.alloc() {
+                Some(s) => { let mut e = entry; e.cloexec = cloexec; t.socks[s] = e; Some(s) }
+                None => None,
+            },
+            None => None,
+        };
+        drop(tbls);
+        return match placed {
+            Some(s) => val_reply((s + SOCK_FD_BASE) as u64),
+            // Nothing was installed, so hand the reference straight back
+            // rather than leaking the address for the life of the system.
+            None => { free_bound_idx(bound_idx); err_reply(-24) } // EMFILE
+        };
+    }
+    // Inet sockets alias fine at the table level, but their smoltcp handle is
+    // only released by handle_close, which the refcountless copy would
+    // double-free — so they stay unsupported.
     else if !matches!(entry.state, SockState::Unbound { .. }) {
         return err_reply(-22); // EINVAL — dup of this socket kind unsupported
     }
@@ -2764,13 +2931,15 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
             let refs = if is_a { &mut c.refs_a } else { &mut c.refs_b };
             *refs = refs.saturating_sub(1);
             let mut end_closed = false;
+            let mut orphans = alloc::vec::Vec::new();
             if *refs == 0 {
                 if is_a { c.closed_a = true; } else { c.closed_b = true; }
                 c.seq = c.seq.wrapping_add(1);
                 end_closed = true;
-                if c.closed_a && c.closed_b { c.drain_fds(); c.in_use = false; }
+                if c.closed_a && c.closed_b { orphans = c.take_fds(); c.in_use = false; }
             }
             drop(conns);
+            for x in orphans { xfer_drop(x); }
             let mut tbls2 = SOCK_TABLES.lock();
             if let Some(t2) = tbls2.iter_mut().find(|t| t.in_use && t.pid == pid) {
                 t2.socks[slot] = SockEntry::empty();
@@ -2850,11 +3019,15 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
             tbl.socks[slot] = SockEntry::empty();
             drop(tbls);
             // A connect that never got accepted: drop its half-open connection.
-            let mut conns = UNIX_CONNS.lock();
-            if conn_idx < MAX_CONNS && conns[conn_idx].in_use {
-                conns[conn_idx].drain_fds();
-                conns[conn_idx].in_use = false;
+            let mut orphans = alloc::vec::Vec::new();
+            {
+                let mut conns = UNIX_CONNS.lock();
+                if conn_idx < MAX_CONNS && conns[conn_idx].in_use {
+                    orphans = conns[conn_idx].take_fds();
+                    conns[conn_idx].in_use = false;
+                }
             }
+            for x in orphans { xfer_drop(x); }
         }
         _ => { tbl.socks[slot] = SockEntry::empty(); }
     }
@@ -3038,6 +3211,9 @@ fn handle_close_all(pid: u32) {
 
         let mut conns = UNIX_CONNS.lock();
         let mut peer_hup = false;
+        // Every in-flight fd orphaned below, released after UNIX_CONNS is
+        // dropped — an orphan may itself be a socket (see `take_fds`).
+        let mut orphans: alloc::vec::Vec<XferFd> = alloc::vec::Vec::new();
         // Connected ends: decrement the per-end refcount and only mark the end
         // closed (peer observes EOF/EPIPE) once the LAST alias of this end is
         // gone — identical to handle_close. Force-freeing the whole connection
@@ -3055,20 +3231,21 @@ fn handle_close_all(pid: u32) {
                     if is_a { c.closed_a = true; } else { c.closed_b = true; }
                     c.seq = c.seq.wrapping_add(1);
                     peer_hup = true;
-                    if c.closed_a && c.closed_b { c.drain_fds(); c.in_use = false; }
+                    if c.closed_a && c.closed_b { orphans.append(&mut c.take_fds()); c.in_use = false; }
                 }
             }
         }
         // Pending-accept half-open connections: drop outright.
         for ci in unix_pending_close {
             if ci < MAX_CONNS && conns[ci].in_use {
-                conns[ci].drain_fds();
+                orphans.append(&mut conns[ci].take_fds());
                 conns[ci].in_use = false;
                 conns[ci].seq = conns[ci].seq.wrapping_add(1);
                 peer_hup = true;
             }
         }
         drop(conns);
+        for x in orphans { xfer_drop(x); }
 
         for bi in bound_to_free { free_bound_idx(bi); }
 
