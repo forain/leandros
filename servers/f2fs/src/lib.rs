@@ -14,6 +14,7 @@ extern crate alloc;
 extern crate mm;
 
 use core::sync::atomic;
+use alloc::boxed::Box;
 use ipc::{Message, port};
 use spin::Mutex;
 use drivers::blkdev as virtio_blk;
@@ -450,19 +451,22 @@ impl CpInfo {
 ///
 /// Cost of 32 -> 256, measured rather than estimated. `size_of::<OpenFile>()`
 /// is 216 B (dominated by `path: [u8; MAX_OPEN_PATH]`) and, at 256 slots,
-/// `size_of::<Option<MountState>>()` is 71,872 B, so `F2FS_MOUNTS` — one such
-/// element per `MAX_MOUNTS` = 8 — carries 574,976 B of payload. `nm` on the
-/// x86_64 kernel built at 32 slots puts the same symbol at 0x2DE08 = 188,936 B,
-/// so the increase is ~386 KB.
+/// `size_of::<Option<MountState>>()` is 71,872 B against 23,617 B at 32.
 ///
-/// That lands in `.data`, not `.bss` (the array is behind a `Mutex`, so it is
-/// emitted initialised), which means it costs kernel *image* bytes as well as
-/// RAM: `.data` goes 13.78 MB -> ~14.16 MB, +2.8 %, and the 21.06 MB image
-/// grows +1.8 %. Taken straight, with neither `MAX_MOUNTS` nor `MAX_OPEN_PATH`
-/// cut to fund it. Shrinking `MAX_OPEN_PATH` to 128 would save 131 KB but
-/// silently stop `/proc/self/fd/N` resolving exactly the long
-/// `/usr/share/icons/...` paths this bug is about, and halving `MAX_MOUNTS`
-/// would trade a limit measured too small for one never tested at all.
+/// That per-mount growth **no longer reaches the kernel image**, and the
+/// history of why is worth keeping: while `F2FS_MOUNTS` held `MountState`
+/// inline it multiplied this constant by `MAX_MOUNTS` = 8 into `.data` (the
+/// array is behind a `Mutex`, so rustc emits it initialised), so 32 -> 256 grew
+/// the image ~386 KB — and that growth alone stopped the x86_64 Linux box
+/// booting, on both architectures, while the identical kernel booted on the
+/// Mac. `F2FS_MOUNTS` now holds `Option<Box<MountState>>`, so this constant
+/// costs heap at mount time and nothing at all in the image. Raising it again
+/// is cheap; it was only ever expensive by accident of where the table lived.
+///
+/// Neither `MAX_MOUNTS` nor `MAX_OPEN_PATH` was cut to fund it. Shrinking
+/// `MAX_OPEN_PATH` to 128 would silently stop `/proc/self/fd/N` resolving
+/// exactly the long `/usr/share/icons/...` paths this bug is about, and halving
+/// `MAX_MOUNTS` would trade a limit measured too small for one never tested.
 const MAX_OPEN_FILES: usize = 256;
 
 /// Longest absolute path remembered per open file, for `VFS_FD_PATH`
@@ -511,7 +515,27 @@ struct MountState {
 
 const MAX_MOUNTS: usize = 8;
 
-static F2FS_MOUNTS: Mutex<[Option<MountState>; MAX_MOUNTS]> =
+/// The mount table holds *pointers*, not inline `MountState`s, and that is a
+/// correctness requirement rather than a tidiness one.
+///
+/// Inline, this static was `MAX_MOUNTS` whole `MountState`s — and because the
+/// array sits behind a `Mutex`, rustc emits it **initialised**, so it landed in
+/// `.data` and cost kernel *image* bytes, not just RAM. `nm` put it at
+/// 0x2DE08 = 188,936 B with `MAX_OPEN_FILES` at 32; raising that constant to
+/// 256 took it to 574,976 B, grew the image ~386 KB, and **stopped the x86_64
+/// Linux box booting on both architectures** — init faulted on its own stack
+/// during the very mount this table serves, while the same kernel booted fine
+/// on the Mac. The size was never the bug's *point*; it was the trigger, and
+/// the underlying layout fragility is still unexplained (see the note in
+/// TODO.md). A table that does not grow with `MAX_OPEN_FILES` cannot pull that
+/// trigger again.
+///
+/// `Option<Box<MountState>>` is one null-pointer-optimised word, so all-`None`
+/// is all-zero bytes and the whole static is 64 B in `.bss`. The per-mount cost
+/// moves to the kernel heap and is paid only by volumes actually mounted —
+/// two of eight in a normal boot — so this is also a ~440 KB RAM saving over
+/// the inline table, on top of removing the image cost entirely.
+static F2FS_MOUNTS: Mutex<[Option<Box<MountState>>; MAX_MOUNTS]> =
     Mutex::new([const { None }; MAX_MOUNTS]);
 
 // ── Exhaustion diagnostics ────────────────────────────────────────────────────
@@ -3372,16 +3396,38 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
     let port = port::create(owner_pid)?;
     port::register_handler(port, f2fs_dispatch);
 
-    mounts[slot_idx] = Some(MountState {
-        dev:          dev_idx,
-        port,
-        mount_prefix: mount_point,
-        sb,
-        cp,
-        dirty_writes: 0,
-        open_files:   [const { OpenFile::empty() }; MAX_OPEN_FILES],
-        cache:        BlockCache::new(),
-    });
+    // Build the mount state directly in its heap allocation, field by field.
+    //
+    // `Box::new(MountState { .. })` is the obvious spelling and is a trap here:
+    // rustc materialises the ~72 KB struct as a stack temporary and memcpys it
+    // in, which measured at `sub rsp, 0x260E8` — a 155,880 B frame, larger than
+    // the whole 128 KB boot stack (`kernel/src/x86_64_start.rs:17`) that the
+    // boot-time mount runs on. That would have reproduced the very class of
+    // early-boot fault this change exists to remove. The two big fields are
+    // filled element-wise for the same reason: `BlockCache::new()` alone is a
+    // ~16 KB temporary and `[OpenFile::empty(); MAX_OPEN_FILES]` is ~55 KB.
+    let mut uninit: Box<core::mem::MaybeUninit<MountState>> = Box::new_uninit();
+    let state: Box<MountState> = unsafe {
+        let p = uninit.as_mut_ptr();
+        core::ptr::addr_of_mut!((*p).dev).write(dev_idx);
+        core::ptr::addr_of_mut!((*p).port).write(port);
+        core::ptr::addr_of_mut!((*p).mount_prefix).write(mount_point);
+        core::ptr::addr_of_mut!((*p).sb).write(sb);
+        core::ptr::addr_of_mut!((*p).cp).write(cp);
+        core::ptr::addr_of_mut!((*p).dirty_writes).write(0);
+        let files = core::ptr::addr_of_mut!((*p).open_files) as *mut OpenFile;
+        for i in 0..MAX_OPEN_FILES {
+            files.add(i).write(OpenFile::empty());
+        }
+        let cache = core::ptr::addr_of_mut!((*p).cache);
+        core::ptr::addr_of_mut!((*cache).tick).write(0);
+        let slots = core::ptr::addr_of_mut!((*cache).slots) as *mut CacheEntry;
+        for i in 0..CACHE_SLOTS {
+            slots.add(i).write(CacheEntry::empty());
+        }
+        uninit.assume_init()
+    };
+    mounts[slot_idx] = Some(state);
 
     drop(mounts);
     let device_str = DEV_NAMES.get(dev_idx).copied().unwrap_or("/dev/vd?");
