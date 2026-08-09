@@ -1,0 +1,7 @@
+[38;5;14m[38;5;5m[0m[0m78[?25h
+[?2004lfork_cow_isolation: PASS
+mremap_preserves_data: PASS
+buddy_survives_churn: PASS
+map_shared_fork_visibility: PASS
+--- memtest done ---
+[?2004h[0m[?25l[50;1H[50;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m

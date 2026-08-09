@@ -1,0 +1,22 @@
+ [38;5;14m[38;5;5m[0m[0m78[?25h
+[?2004lld_so::init tp=0x0000000000000000
+PH type=0x0000000000000006
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000007
+open_event1: PASS
+EVIOCGNAME_tablet: PASS
+EVIOCGBIT_has_EV_ABS: PASS
+EVIOCGBIT_ABS_has_XY: PASS
+EVIOCGABS_max_32767: PASS
+no_INPUT_PROP_DIRECT: PASS
+EVIOCSCLOCKID_monotonic: PASS
+epoll_idle_no_false_wake: PASS
+evtest2: waiting up to 6s for injected pointer motion...
+
+motion: none observed (no injection) - capability checks above are the gate
+
+--- evtest2 done ---
+
+[?2004h[0m[?25l[44;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m

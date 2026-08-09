@@ -278,7 +278,8 @@ fill-buffer, compute and graphics work, `vkswap` drives a headless-surface swapc
 real DRM scanout.
 
 **Suite baselines.** On fresh images with `vfstest` run exactly once per image, both
-arches: vfstest **36/0**, scmtest **32/0**, drmsmoke **29/0** (22 → 25 with `edad115`'s console guards, → 29 with `c8cbbc1`'s atomic lane), wakepolltest 10/0,
+arches: vfstest **36/0**, scmtest **36/0** (was 32 here and 35 in the tree; item 9b's
+`fork_inherits_pending_connector` made it 36), drmsmoke **29/0** (22 → 25 with `edad115`'s console guards, → 29 with `c8cbbc1`'s atomic lane), wakepolltest 10/0,
 forktest 3/0, epolltest **10/0** (was 9/0 — `proc_pid_exe` added with the
 `/proc/<pid>/exe` fix), polltest 6/0, sigtest 6/0, timertest 6/0, memtest 4/0,
 idletest 2/0 (`IDLE_CPU_US 0`), evtest2 8/0. `waittest` has **4** subtests and is **4/0 or 3/1 on either arch** (a harness reporting 5/0 is miscounting the summary line — see instrument entry 11) — a pure timing race in `fork` → child `setpgid(0,0)`+`_exit` →
@@ -1380,7 +1381,7 @@ image contains **exactly one** `.desktop` file — our own applet stub. `cosmic-
 built**. Even with input and shortcuts fixed, `Super` would open a launcher over an empty
 index. **Item 8 is therefore two pieces of work, and the config file is only the first.**
 
-### 9. Five real applets ship and run — two of them paint nothing (2026-08-09)
+### 9. DONE: five real applets ship, run and paint (2026-08-09)
 
 **Superseded in part.** The survey below described a tree with one staged `.desktop`. Five
 now ship (`CosmicPanel{Launcher,App,Workspaces}Button`, `CosmicAppletTiling`,
@@ -1433,55 +1434,88 @@ both arches, `vfstest` **36/36** aarch64 on a fresh image, `epolltest` 10/10, `p
 (The 3 vfstest reds seen mid-lane were dirty-image residue — clean on regeneration. The one
 panic in the logs, `src/comp.rs:37`, is present on the pre-fix control too.)
 
-#### 9b. OPEN: tiling and minimize draw zero pixels
+#### 9b. CLOSED: tiling never ran, and minimize was never broken (2026-08-09)
 
-Both start, stay up (no exits, no restarts, no `Failed to create a listener`) and take their
-privileged socket — and neither paints. The top bar's content extent is **byte-identical**
-(x = 12..709, the clock) to a run without them.
+**Both halves of the recorded finding were wrong.** *"Both start, stay up and take their
+privileged socket — and neither paints"* described a state that did not exist.
+`cosmic-applet-tiling` never reached `execve` at all, and `cosmic-applet-minimize`'s
+blankness is upstream-correct behaviour. Two unrelated LeandrOS defects were hiding behind
+one sentence, and the rendering framing is what concealed both.
 
-**Already eliminated — do not re-test these:**
+**The discriminator, available in the capture that produced the original finding.** Both
+applets print an unconditional `Starting … applet with version` as the first statement of
+`main`. Tiling printed **0** lines, minimize **66**, the panel buttons **129** — and tiling
+logged no exit either. `ProcessManager::start()` had returned `Err`, swallowed by
+cosmic-panel's `if let Ok(key)` (`cosmic-panel-bin/src/main.rs:225`). A spawn that dies
+inside `pre_exec` — after `fork`, before `execve` — emits no stdout, no exit line and no
+error, and is indistinguishable from a live client that draws nothing.
 
-- *"No state to show."* `cosmic-applet-tiling`'s `view()` (`window.rs:245-251`) is
-  unconditional: `icon_button(if self.autotiled { ON } else { OFF })`. It draws an icon
-  whatever the compositor says.
-- *"Icon not staged."* It asks for `com.system76.CosmicAppletTiling.{On,Off}`, and both SVGs
-  are packed into `icons/Cosmic/scalable/apps/` — **the same directory** as
-  `com.system76.CosmicAppLibrary.svg`, which visibly renders in the dock. Lookup in that exact
-  directory is therefore proven by a rendering sibling.
-- *"The applet died."* No exit, no restart, no stderr of its own in a full session.
-- *"Overflow/shrink machinery."* Minimize sits in the Dock's `plugins_center` **alongside the
-  three buttons that do draw**, so the list is not the discriminator.
+**Defect 1 — `handle_fork_dup` dropped `UnixPendingAccept` across `fork`.** The
+fd-inheritance copy in `servers/net` enumerated only `UnixConnected` and `Unbound`, with a
+`_ => {}` catch-all silently discarding the rest. The applet's privileged socket is an
+unaccepted `connect()`: cosmic-panel binds an abstract listener, marshals it to cosmic-comp
+via `create_listener`, and connects to it itself — all synchronously, *before* the request
+is flushed (`wp_security_context.rs:53-72`, the `connect_addr` at :64 is after the marshal).
+launch-pad forks with that connector still pending, and with the state dropped the child's
+`pre_exec` `fcntl(F_GETFD)` returned EBADF. **Why tiling died and minimize lived:** tiling
+is spawn #1, forked before `create_listener` is even flushed; minimize is spawn #5, ~200 ms
+later, by which time comp had accepted and the fd was `UnixConnected`, which the existing
+arm did copy. Same code, same flag, opposite outcomes, decided purely by spawn order.
+Fixed by copying the state (it is end A of a real `UnixConn`, refcounted via `refs_a`) and
+by refcounting it in `handle_close` and `handle_close_all`, both of which force-freed the
+connection and were masked only because defect 1 guaranteed a single holder. Multi-holder
+is routine, not hypothetical — one x86_64 session shows the same `conn=14` inherited by two
+children, i.e. `refs_a == 3` on one unaccepted connection.
 
-**The one thing that is unique to these two, and the place to start:** they are the only
-applets that open a **second Wayland connection** — `cosmic-applet-tiling/src/wayland.rs:44`
-reads `X_PRIVILEGED_WAYLAND_SOCKET` and connects to the real compositor rather than to the
-panel's embedded server. That code path **had never executed once on LeandrOS before
-2026-08-09**, because `create_listener` always failed; it is brand-new surface with zero
-coverage. An iced applet whose subscription wedges on that connection stays alive and never
-commits a first frame — which is exactly the observed shape.
+**Defect 2 — `MAX_OPEN_FILES = 32` is a global pool, and it starved the icon load.** With
+tiling running it reached `SCTK setup complete`, sized a 40x32 surface, then failed with
+`unable to read icon theme directory … code: 24`. `servers/f2fs/src/lib.rs:434` is
+**per-mount and system-wide**, not per-process; everything lives on the one f2fs root mount
+and `handle_open` allocates a slot for directories too. Proof it is global: **10 distinct
+processes hit errno 24 inside a 3 s window** at session startup and then it stopped. It was
+*permanent* for tiling because `freedesktop-icons` holds themes in a `LazyLock` that
+`continue`s past a `read_dir` error and never retries — one transient EMFILE at the wrong
+microsecond leaves that process with an empty theme map for life. Fixed: 32 -> 256, plus a
+real slot leak at `servers/vfs/src/lib.rs:3253-3262` (a mount-open whose fd install fails
+orphaned the slot forever — a death spiral), plus a permanent one-shot
+`report_open_files_full()` so this class names itself instead of surfacing as an opaque
+errno.
 
-**Next, in order:**
+**This retires the recorded elimination** *"icon not staged — lookup in that directory is
+proven by a rendering sibling"*. The sibling (`cosmic-app-library`) genuinely does render,
+and hit errno 24 itself; the inference was still wrong because it treated a **race** as a
+**property**.
 
-1. Prove whether cosmic-comp ever **accepts** on the imported listener. It receives the
-   listener fd over SCM_RIGHTS and `accept()`s it into a new client; a serial print at that
-   accept (or a client-count check) separates "the socket never carried a connection" from
-   "the applet has one and still does not draw". This is the fork in the road — everything
-   below depends on which way it goes.
-2. If the accept never happens: the panel connects to its own abstract address
-   (`UnixStream::connect_addr`) *before* handing the fd over, so the pending connect must
-   survive the transfer and match by `sock_id` — check `handle_accept`'s `UnixListening` arm
-   against an imported `bound_idx`.
-3. If the accept does happen: the applet has a live privileged connection and the failure is
-   downstream in iced/libcosmic. Re-use the recorded icon probe (a temporary `Named::path()`
-   print, `LEANDROS_ICON_PROBE name=… path=…`) on `com.system76.CosmicAppletTiling.On` — a
-   miss is **silent and shaped like success** (`bundle::get` is `None` on unix, so
-   `Named::handle()` falls back to `Svg::from_memory(&[])`: full-size layout, zero pixels).
-4. Only then ask whether the panel allocates the applet space at all — the top Panel is
-   full-width, so bar extents cannot answer that; measure the **dock** width with and without
-   minimize instead, which auto-sizes.
+**Minimize was never broken.** `cosmic-applet-minimize/src/lib.rs:145-149` calls
+`iced::window::minimize(main_window, true)` unconditionally in `init()`, un-hiding on the
+first toplevel (:212) and re-hiding when the list empties (:220-226). With zero toplevels
+`view()` yields an empty `Shrink` row inside `autosize().limits(min_width(1.))` — a 1x1
+transparent surface. The `72x64` in the log is the winit `WindowAttributes` struct at
+creation time, and it carries `visible: false`. Negative control: `Wayland handler thread
+died` (printed unconditionally when the handler returns) appears **zero** times.
+*Still open, deliberately:* an empty toplevel list and a wedged handler look identical in
+this capture. The only test that separates them is opening a real toplevel and checking
+that minimize un-hides.
 
-An empty **minimize** applet with no windows open is correct upstream behaviour, so tiling is
-the one that must be made to draw; minimize should be judged only once a window exists.
+Measured on fresh images, both arches, instrumentation compiled out:
+
+| | before | after |
+|---|---|---|
+| tiling reaches `execve` | no — 0 stdout lines | **yes — 74, both arches** |
+| `code: 24` in a session | 76, across 10 processes | **0** |
+| tiling icon, panel right wing | **0** bright px | **176** bright px, both arches |
+| `[NET]` trace lines | n/a | 0 (proves `NET_DEBUG=false` compiles out) |
+
+`scmtest` is **36/0** both arches (35 before; the Standing-context figure of 32 was stale).
+The new subtest `fork_inherits_pending_connector` has two phases; phase B
+(child-exits-first) is the only coverage `handle_close_all`'s pending arm has. The
+`handle_close` refcount path is also live-verified —
+`[NET] close-pending pid=38 fd=305 conn=70 refs=1`, decrementing rather than destroying. It
+does not fire in most sessions, because the panel's connector is normally accepted before
+launch-pad drops its fd, so the close lands in the `UnixConnected` arm.
+
+Full write-up, including five instrument failures from this lane worth reading before the
+next QEMU measurement: `artifacts/notes/item9b-applet-spawn.md`.
 
 ---
 

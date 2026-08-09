@@ -13,6 +13,7 @@
 extern crate alloc;
 extern crate mm;
 
+use core::sync::atomic;
 use ipc::{Message, port};
 use spin::Mutex;
 use drivers::blkdev as virtio_blk;
@@ -431,7 +432,38 @@ impl CpInfo {
 
 // ── Open file table ───────────────────────────────────────────────────────────
 
-const MAX_OPEN_FILES: usize = 32;
+/// Open-file slots per mount. This pool is **per-mount and system-wide**, not
+/// per-process: every process on a volume draws from the same array, and a
+/// directory held open by `getdents64` occupies a slot exactly like a file
+/// does. Everything on LeandrOS lives on the one f2fs root mount (the initrd
+/// contributes three entries), so in practice this single number is the
+/// whole system's open-file budget.
+///
+/// At 32 it was far too small. Ten distinct processes took errno 24 inside one
+/// 3 s window at session start — concurrent config reads, fontdb directory
+/// scans and icon-theme walks — and the exhaustion is not merely transient in
+/// its effects: `freedesktop-icons` builds its theme map in a `LazyLock`,
+/// initialises it exactly once, and `continue`s past a failed `read_dir`, so a
+/// single EMFILE at the wrong microsecond leaves that process with an empty
+/// theme map for the rest of its life. That is why cosmic-applet-tiling laid
+/// out at full size and painted nothing.
+///
+/// Cost of 32 -> 256, measured rather than estimated. `size_of::<OpenFile>()`
+/// is 216 B (dominated by `path: [u8; MAX_OPEN_PATH]`) and, at 256 slots,
+/// `size_of::<Option<MountState>>()` is 71,872 B, so `F2FS_MOUNTS` — one such
+/// element per `MAX_MOUNTS` = 8 — carries 574,976 B of payload. `nm` on the
+/// x86_64 kernel built at 32 slots puts the same symbol at 0x2DE08 = 188,936 B,
+/// so the increase is ~386 KB.
+///
+/// That lands in `.data`, not `.bss` (the array is behind a `Mutex`, so it is
+/// emitted initialised), which means it costs kernel *image* bytes as well as
+/// RAM: `.data` goes 13.78 MB -> ~14.16 MB, +2.8 %, and the 21.06 MB image
+/// grows +1.8 %. Taken straight, with neither `MAX_MOUNTS` nor `MAX_OPEN_PATH`
+/// cut to fund it. Shrinking `MAX_OPEN_PATH` to 128 would save 131 KB but
+/// silently stop `/proc/self/fd/N` resolving exactly the long
+/// `/usr/share/icons/...` paths this bug is about, and halving `MAX_MOUNTS`
+/// would trade a limit measured too small for one never tested at all.
+const MAX_OPEN_FILES: usize = 256;
 
 /// Longest absolute path remembered per open file, for `VFS_FD_PATH`
 /// (`readlink("/proc/self/fd/N")`). Sized to fit any path the kernel's
@@ -481,6 +513,45 @@ const MAX_MOUNTS: usize = 8;
 
 static F2FS_MOUNTS: Mutex<[Option<MountState>; MAX_MOUNTS]> =
     Mutex::new([const { None }; MAX_MOUNTS]);
+
+// ── Exhaustion diagnostics ────────────────────────────────────────────────────
+//
+// `open` answering errno 24 says "too many open files" and userspace reads
+// that as its OWN fd limit, which is the one thing it is not: the pool that
+// ran out is this server's, per mount and shared by every process on the
+// volume. That misdirection cost a full investigation once already, so the
+// site names the table it actually exhausted — the same contract, and the same
+// once-per-boot budget, as `report_fd_tables_full` in servers/vfs.
+
+extern "C" { fn arch_serial_putc(c: u8); }
+
+fn dbg_str(msg: &str) {
+    for &b in msg.as_bytes() { unsafe { arch_serial_putc(b) }; }
+}
+
+fn dbg_dec(mut v: usize) {
+    if v == 0 { unsafe { arch_serial_putc(b'0') }; return; }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while v > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+    for &b in &buf[i..] { unsafe { arch_serial_putc(b) }; }
+}
+
+/// A mount's open-file array is full, so `open` returns EMFILE. This is
+/// `f2fs::MAX_OPEN_FILES` — a per-mount, system-wide pool that directories
+/// occupy too — and not the calling process's fd limit. Printed once per boot:
+/// the pool tends to sit at its ceiling once it reaches it, and the console
+/// costs ~0.19 s per line.
+fn report_open_files_full() {
+    static REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+    if REPORTED.swap(true, atomic::Ordering::Relaxed) { return; }
+    dbg_str("\n[F2FS] EMFILE: mount open-file pool FULL at ");
+    dbg_dec(MAX_OPEN_FILES);
+    dbg_str(" slots -- this is f2fs::MAX_OPEN_FILES, a per-mount pool shared by\n");
+    dbg_str("[F2FS] EVERY process on the volume (open directories included), NOT the\n");
+    dbg_str("[F2FS] caller's own fd limit. Callers that swallow the error (icon-theme\n");
+    dbg_str("[F2FS] and font scans do) stay silently degraded for the rest of their life.\n");
+}
 
 // ── Reply helpers ─────────────────────────────────────────────────────────────
 
@@ -1972,7 +2043,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
     // Find a free open-file slot
     let slot = match ms.open_files.iter().position(|f| !f.in_use) {
         Some(i) => i,
-        None    => return err_reply(-24), // EMFILE
+        None    => { report_open_files_full(); return err_reply(-24); } // EMFILE
     };
     ms.open_files[slot] = OpenFile { inode: ino, pos: 0, writable, in_use: true,
                                      path: [0; MAX_OPEN_PATH], path_len: 0 };

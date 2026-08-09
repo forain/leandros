@@ -6,6 +6,7 @@ extern crate alloc;
 
 pub mod nftables;
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::Message;
 use spin::Mutex;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
@@ -44,6 +45,49 @@ pub const NET_GETFD:      u64 = 0x48;
 const POLLIN:  u64 = 0x0001;
 const POLLOUT: u64 = 0x0004;
 const POLLHUP: u64 = 0x0010;
+
+// ── AF_UNIX pending-accept lifecycle trace (off) ──────────────────────────────
+//
+// Traces the five points a privileged socket passes through between
+// cosmic-panel's `connect()` and cosmic-comp's `accept()`: connect,
+// fork-inheritance, an EBADF from the child's pre_exec `fcntl(F_GETFD)`,
+// accept, and close. Written to prove the `UnixPendingAccept` refcount fix
+// below; kept because that path has no other visibility and re-deriving the
+// prints costs more than the dead code does.
+//
+// Flip to `true` to re-enable — every print early-returns on this `const`, so
+// off it compiles out entirely. Idiom copied from `servers/drm/src/lib.rs`.
+// What it measured is recorded in `artifacts/notes/item9b-applet-spawn.md`.
+const NET_DEBUG: bool = false;
+
+/// The `accept → EAGAIN` arm is the hot one: every nonblocking accept loop
+/// turn on every AF_UNIX listener in the session reaches it. Bound the
+/// evidence to a handful of lines instead of one per poll, as
+/// `servers/drm/src/lib.rs` bounds its mmap trace.
+static ACCEPT_EAGAIN_SEEN: AtomicU32 = AtomicU32::new(0);
+const ACCEPT_EAGAIN_LIMIT: u32 = 64;
+
+fn dbg(msg: &str) {
+    if !NET_DEBUG { return; }
+    extern "C" { fn arch_serial_putc(c: u8); }
+    for &b in msg.as_bytes() { unsafe { arch_serial_putc(b); } }
+}
+
+/// Unsigned decimal, for pids / fds / table indices. Kept decimal rather than
+/// hex so a trace line can be diffed against the `Starting: <applet>` ordering
+/// in a cosmic-session capture without conversion.
+fn dbg_u(mut v: u64) {
+    if !NET_DEBUG { return; }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 { break; }
+    }
+    dbg(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
+}
 
 // ── shutdown(2) `how` ─────────────────────────────────────────────────────────
 /// Retire the read direction: later recvs report EOF, and the peer's sends
@@ -1597,6 +1641,22 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     let cred_b = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
                     {
                         let mut c = UNIX_CONNS.lock();
+                        // "A pending entry exists" no longer implies "the
+                        // connection behind it does": a pending connector is
+                        // multi-holder now that fork copies it, so the entry
+                        // and the `UnixConn` are freed by different steps.
+                        // `conn_idx` carries no generation, so adopting a
+                        // freed slot would hand the caller a live-looking fd
+                        // onto a connection a later connect() can reuse.
+                        // Unreachable today — both teardown paths clear the
+                        // holder's table slot BEFORE decrementing `refs_a`, so
+                        // reaching zero implies no pending entry survives —
+                        // which is exactly why it is checked rather than
+                        // assumed. EAGAIN is the honest answer: there is
+                        // nothing acceptable here.
+                        if conn_idx >= MAX_CONNS || !c[conn_idx].in_use {
+                            return err_reply(-11);
+                        }
                         c[conn_idx].cred_b = cred_b;
                         // Connection established: the connector's poll becomes
                         // writable/connected (an edge for it).
@@ -1615,13 +1675,22 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                         reuseaddr:  false,
                     };
 
+                    // EVERY alias of this connection flips, in every table —
+                    // no `break`. One connect() is now nameable by several
+                    // entries (fork copies the connector, and `refs_a` counts
+                    // exactly those copies), and leaving one behind as
+                    // `UnixPendingAccept` would let the same `UnixConn` be
+                    // found and accepted a SECOND time by the next accept on
+                    // this listener: two end-B sockets on one connection, and
+                    // an `refs_a` that no longer matches the number of live
+                    // connector fds. Stopping at the first match happened to
+                    // be safe only while a pending entry was unique.
                     for t in tbls.iter_mut() {
                         if !t.in_use { continue; }
                         for s in t.socks.iter_mut() {
                             if let SockState::UnixPendingAccept { conn_idx: pending_conn, .. } = s.state {
                                 if pending_conn == conn_idx {
                                     s.state = SockState::UnixConnected { conn_idx, is_a: true };
-                                    break;
                                 }
                             }
                         }
@@ -1646,11 +1715,29 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     if addrlen_ptr != 0 {
                         unsafe { *(addrlen_ptr as *mut u32) = 2; }
                     }
+                    dbg("[NET] accept pid="); dbg_u(pid as u64);
+                    dbg(" sid="); dbg_u(listen_sock_id);
+                    dbg(" conn="); dbg_u(conn_idx as u64);
+                    dbg(" -> fd="); dbg_u((new_slot + SOCK_FD_BASE) as u64); dbg("\r\n");
                     // Wake the connector parked in poll/connect (K2).
                     sched::wake_poll();
                     val_reply((new_slot + SOCK_FD_BASE) as u64)
                 }
-                None => err_reply(-11),
+                None => {
+                    // SOCK_TABLES is still held by the scan above, and a
+                    // per-byte serial write takes the console's lock — release
+                    // first. The EAGAIN arm is also the hot one (every
+                    // nonblocking accept loop turn on every AF_UNIX listener
+                    // in the session lands here), so the trace is bounded the
+                    // way servers/drm bounds its mmap trace.
+                    drop(tbls);
+                    if NET_DEBUG && ACCEPT_EAGAIN_SEEN.fetch_add(1, Ordering::Relaxed)
+                        < ACCEPT_EAGAIN_LIMIT {
+                        dbg("[NET] accept pid="); dbg_u(pid as u64);
+                        dbg(" sid="); dbg_u(listen_sock_id); dbg(" EAGAIN\r\n");
+                    }
+                    err_reply(-11)
+                }
             }
         }
         _ => err_reply(-22),
@@ -1802,6 +1889,11 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
         tbl.socks[slot].state = SockState::UnixPendingAccept { conn_idx, sock_id };
         drop(tbls);
+        dbg("[NET] connect pid="); dbg_u(pid as u64);
+        dbg(" fd="); dbg_u(fd as u64);
+        dbg(" conn="); dbg_u(conn_idx as u64);
+        dbg(" sid="); dbg_u(sock_id);
+        dbg(if is_abstract { " abstract\r\n" } else { " path\r\n" });
         // A listener parked in accept/poll now has a pending connect on its
         // address (K2 real blocking).
         sched::wake_poll();
@@ -2743,9 +2835,33 @@ fn unix_peer_cred(pid: u32, fd: usize) -> Ucred {
 /// fd-inheritance. Each copied fd is an alias of the same connection end
 /// (per-end refcount bumped), so the child closing its inherited exec-error
 /// socketpair — CLOEXEC at exec, or exit — participates in the same
-/// EOF/EPIPE accounting the parent observes. Inet/listening sockets are NOT
-/// copied: their smoltcp handles have no refcounting and a dup'd close
-/// would double-free them (fork children exec immediately in practice).
+/// EOF/EPIPE accounting the parent observes.
+///
+/// Both AF_UNIX stream states are copied: `UnixConnected` and
+/// `UnixPendingAccept`. The latter is a connect() the peer has not accepted
+/// yet, and it is end A of a perfectly real `UnixConn` — it refcounts through
+/// `refs_a` exactly like a connected end, and `handle_accept`'s fixup loop
+/// converts *every* table's pending entry for that connection, so parent and
+/// child both end up `UnixConnected { is_a: true }` with `refs_a == 2`.
+///
+/// Leaving it out is what stopped every `X-HostWaylandDisplay=true` COSMIC
+/// applet from ever reaching `execve`. cosmic-panel creates the applet's
+/// privileged socket by binding an abstract listener, marshalling it to
+/// cosmic-comp over `wp_security_context_v1.create_listener`, and connecting
+/// to it itself — all synchronously, before the Wayland request has even been
+/// flushed. launch-pad then forks with that connector still in
+/// `UnixPendingAccept`, and the child's `pre_exec` hook clears FD_CLOEXEC on
+/// the inherited fd numbers. With the state dropped here that
+/// `fcntl(F_GETFD)` returned EBADF, `pre_exec` failed, and `Command::spawn`
+/// died *before* `execve` — silently, because cosmic-panel's `if let Ok(key)`
+/// (cosmic-panel-bin/src/main.rs:225) discards the error. The applet then
+/// looks like a live process that draws nothing when in fact it never ran.
+/// Whether it happened at all was a race with cosmic-comp's accept, which is
+/// why the applet spawned last in a batch worked and the first one did not.
+///
+/// Inet/listening sockets are NOT copied: their smoltcp handles have no
+/// refcounting and a dup'd close would double-free them (fork children exec
+/// immediately in practice).
 fn handle_fork_dup(parent: u32, child: u32) -> Message {
     let mut tbls = SOCK_TABLES.lock();
     // Work by table index, copying one SockEntry at a time. Snapshotting the
@@ -2760,24 +2876,53 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
     let parent_pos = tbls.iter().position(|t| t.in_use && t.pid == parent).unwrap();
     let child_pos  = tbls.iter().position(|t| t.in_use && t.pid == child).unwrap();
 
-    let mut ends: alloc::vec::Vec<(usize, bool)> = alloc::vec::Vec::new();
+    // TEMPORARY: (slot, conn_idx) of each inherited pending connector, printed
+    // after both locks are released. `Vec::new` does not allocate, and nothing
+    // is pushed unless NET_DEBUG, so a release build never heap-allocates here.
+    let mut traced: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+
+    // The entry copy and its refcount increment are ONE step, under both
+    // locks. They used to be two passes with the table released in between,
+    // which meant a child entry could be installed without a matching
+    // increment (its connection having gone away between the passes) — and
+    // since `conn_idx` carries no generation, that child's later close would
+    // decrement, and could destroy, whatever connection had since been given
+    // the slot. Copying only what was successfully refcounted removes the
+    // window entirely. The SOCK_TABLES-outer / UNIX_CONNS-inner nesting is the
+    // one `handle_dup` and `handle_accept` already use, and BOUND_PATHS — the
+    // leaf — is never taken here: fork copies no listener.
+    let mut conns = UNIX_CONNS.lock();
     for i in 0..MAX_SOCKS {
         let e = tbls[parent_pos].socks[i];
         if !e.in_use { continue; }
         match e.state {
             SockState::UnixConnected { conn_idx, is_a } => {
+                if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { continue; }
+                if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
                 tbls[child_pos].socks[i] = e;
-                ends.push((conn_idx, is_a));
+            }
+            // An unaccepted connect() is end A of a real connection — see the
+            // doc comment for why dropping it here broke COSMIC's privileged
+            // applet sockets.
+            SockState::UnixPendingAccept { conn_idx, .. } => {
+                if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { continue; }
+                conns[conn_idx].refs_a += 1; // the connector is always end A
+                tbls[child_pos].socks[i] = e;
+                if NET_DEBUG { traced.push((i, conn_idx)); }
             }
             SockState::Unbound { .. } => { tbls[child_pos].socks[i] = e; }
             _ => {} // inet/listening: skipped (see doc comment)
         }
     }
+    drop(conns);
     drop(tbls);
-    let mut conns = UNIX_CONNS.lock();
-    for (conn_idx, is_a) in ends {
-        if !conns[conn_idx].in_use { continue; }
-        if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
+    // TEMPORARY trace, deliberately outside both critical sections: per-byte
+    // serial writes take the console's own lock, and holding a server spinlock
+    // across another subsystem's lock is the shape this tree already bans.
+    for (i, conn_idx) in traced {
+        dbg("[NET] fork "); dbg_u(parent as u64); dbg("->"); dbg_u(child as u64);
+        dbg(" pending fd="); dbg_u((i + SOCK_FD_BASE) as u64);
+        dbg(" conn="); dbg_u(conn_idx as u64); dbg(" COPIED\r\n");
     }
     ok_reply()
 }
@@ -2837,10 +2982,25 @@ fn handle_setfd(pid: u32, sockfd: usize, arg: u32) -> Message {
 /// fcntl(F_GETFD) for sockets: report FD_CLOEXEC.
 fn handle_getfd(pid: u32, sockfd: usize) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
-    let tbls = SOCK_TABLES.lock();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
-    val_reply(if tbl.socks[slot].cloexec { 1 } else { 0 })
+    let cloexec = {
+        let tbls = SOCK_TABLES.lock();
+        match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+            Some(t) if slot < MAX_SOCKS && t.socks[slot].in_use => Some(t.socks[slot].cloexec),
+            _ => None,
+        }
+    };
+    match cloexec {
+        Some(c) => val_reply(if c { 1 } else { 0 }),
+        None => {
+            // TEMPORARY: this is the exact failure the privileged-applet bug
+            // produced — launch-pad's pre_exec clears FD_CLOEXEC on every
+            // inherited fd, and an fd the fork did not copy answers EBADF,
+            // which aborts Command::spawn before execve.
+            dbg("[NET] getfd pid="); dbg_u(pid as u64);
+            dbg(" fd="); dbg_u(sockfd as u64); dbg(" EBADF\r\n");
+            err_reply(-9)
+        }
+    }
 }
 
 /// fcntl(F_DUPFD/F_DUPFD_CLOEXEC) on a socket fd: allocate a second slot
@@ -3018,16 +3178,45 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
         SockState::UnixPendingAccept { conn_idx, .. } => {
             tbl.socks[slot] = SockEntry::empty();
             drop(tbls);
-            // A connect that never got accepted: drop its half-open connection.
+            // A connect that has not been accepted yet is end A, and it is
+            // refcounted like any other end: `handle_fork_dup` copies the fd
+            // to a forked child, so the half-open connection must outlive
+            // whichever holder closes first. Tearing it down unconditionally
+            // meant cosmic-panel destroyed the applet's privileged socket the
+            // instant launch-pad had forked — and cosmic-comp gets exactly one
+            // shot at accepting it (smithay's SecurityContextListenerSource
+            // removes itself as soon as the paired close_fd pipe reports
+            // POLLERR, which it does immediately because the panel drops the
+            // read end), so there is no second chance.
             let mut orphans = alloc::vec::Vec::new();
+            let mut died = false;
+            let mut refs = 0;
             {
                 let mut conns = UNIX_CONNS.lock();
                 if conn_idx < MAX_CONNS && conns[conn_idx].in_use {
-                    orphans = conns[conn_idx].take_fds();
-                    conns[conn_idx].in_use = false;
+                    let c = &mut conns[conn_idx];
+                    c.refs_a = c.refs_a.saturating_sub(1);
+                    refs = c.refs_a;
+                    if c.refs_a == 0 {
+                        orphans = c.take_fds();
+                        c.in_use = false;
+                        c.seq = c.seq.wrapping_add(1);
+                        died = true;
+                    }
                 }
             }
+            // UNIX_CONNS released first: an orphan may itself be a socket, and
+            // releasing one takes BOUND_PATHS (see `take_fds`).
             for x in orphans { xfer_drop(x); }
+            dbg("[NET] close-pending pid="); dbg_u(pid as u64);
+            dbg(" fd="); dbg_u(sockfd as u64);
+            dbg(" conn="); dbg_u(conn_idx as u64);
+            dbg(" refs="); dbg_u(refs as u64);
+            if died { dbg(" DESTROYED"); }
+            dbg("\r\n");
+            // A listener parked in poll must stop reporting POLLIN for a
+            // connect that no longer exists.
+            if died { sched::wake_poll(); }
         }
         _ => { tbl.socks[slot] = SockEntry::empty(); }
     }
@@ -3175,9 +3364,10 @@ fn handle_close_all(pid: u32) {
         // end (is_a) so teardown can decrement that refcount instead of force-
         // freeing a still-referenced connection.
         let mut unix_conn_close: alloc::vec::Vec<(usize, bool)> = alloc::vec::Vec::new();
-        // Pending-accept half-open connections are never dup'd/forked (see
-        // handle_fork_dup, which copies only UnixConnected/Unbound), so they are
-        // dropped outright, matching handle_close's PendingAccept arm.
+        // Pending-accept half-open connections are end A of a real connection
+        // and carry the same `refs_a` count a connected end does — fork copies
+        // one (see handle_fork_dup) — so they are released, not force-freed,
+        // matching handle_close's PendingAccept arm.
         let mut unix_pending_close: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
         // (on_loopback, handle) — an INADDR_ANY listener contributes one of each.
         let mut inet_to_close: alloc::vec::Vec<(bool, SocketHandle)> = alloc::vec::Vec::new();
@@ -3235,13 +3425,21 @@ fn handle_close_all(pid: u32) {
                 }
             }
         }
-        // Pending-accept half-open connections: drop outright.
+        // Pending-accept half-open connections: release this holder's
+        // reference, and only tear the connection down once the last one is
+        // gone. Force-freeing here undid the fork-inheritance fix above — a
+        // forked child that exits (an exec failure, say) would have destroyed
+        // the connector its parent still holds, and vice versa.
         for ci in unix_pending_close {
             if ci < MAX_CONNS && conns[ci].in_use {
-                orphans.append(&mut conns[ci].take_fds());
-                conns[ci].in_use = false;
-                conns[ci].seq = conns[ci].seq.wrapping_add(1);
-                peer_hup = true;
+                let c = &mut conns[ci];
+                c.refs_a = c.refs_a.saturating_sub(1);
+                if c.refs_a == 0 {
+                    orphans.append(&mut c.take_fds());
+                    c.in_use = false;
+                    c.seq = c.seq.wrapping_add(1);
+                    peer_hup = true;
+                }
             }
         }
         drop(conns);

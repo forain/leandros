@@ -244,6 +244,18 @@ impl sockaddr_un {
         a.sun_path[..n].copy_from_slice(&name[..n]);
         (a, 2 + n + 1)
     }
+
+    /// Build a Linux abstract-namespace address: `sun_path[0]` is NUL and the
+    /// name is the following `addrlen - 3` bytes, matched by bytes with no VFS
+    /// node behind it. Nothing is left on disk, so an abstract test needs no
+    /// unlink and cannot be poisoned by a dirty image. This is the form
+    /// `wp_security_context_v1.create_listener` uses.
+    unsafe fn from_abstract(name: &[u8]) -> (sockaddr_un, usize) {
+        let mut a = sockaddr_un { sun_family: AF_UNIX as u16, sun_path: [0u8; 108] };
+        let n = name.len().min(106);
+        a.sun_path[1..1 + n].copy_from_slice(&name[..n]);
+        (a, 2 + 1 + n)
+    }
 }
 
 unsafe fn raw_socket(domain: i32, kind: i32, proto: i32) -> i32 {
@@ -669,6 +681,210 @@ unsafe fn reap(pid: i32) {
     wait4(pid, &mut status, 0, core::ptr::null_mut());
 }
 
+/// recv with a bounded retry, so a broken half of this handshake FAILs loudly
+/// instead of hanging the suite (the same reason `parent_epoll_read_ok` uses a
+/// 5 s epoll_wait rather than a blocking read).
+unsafe fn recv_retry(fd: i32, buf: *mut u8, len: usize) -> isize {
+    let mut tries = 0;
+    while tries < 250 {
+        let r = raw_recv(fd, buf, len, MSG_DONTWAIT);
+        if r >= 0 || get_errno() != EAGAIN { return r; }
+        sleep_ms(20);
+        tries += 1;
+    }
+    -1
+}
+
+// ── fork() inherits an UNACCEPTED connector ────────────────────────────────
+//
+// The regression pinned here is what stopped every `X-HostWaylandDisplay=true`
+// COSMIC applet from ever running. cosmic-panel binds an abstract listener,
+// marshals it to cosmic-comp over `wp_security_context_v1.create_listener`,
+// and connects to it ITSELF — all synchronously, before the Wayland request
+// has even been flushed, so the connector is still `UnixPendingAccept`. It
+// then hands launch-pad that raw fd number, which forks, clears FD_CLOEXEC in
+// the child's pre_exec window, execs the applet, and drops the parent's copy.
+//
+// Two gaps sat on exactly that sequence:
+//
+//   * `handle_fork_dup` copied only `UnixConnected`/`Unbound`, so the child's
+//     fd number did not exist. The pre_exec `fcntl(F_GETFD)` answered EBADF,
+//     `Command::spawn` failed BEFORE `execve`, and cosmic-panel's
+//     `if let Ok(key)` swallowed the error — the applet looked like a live
+//     process that drew nothing when in fact it never ran.
+//   * `handle_close`'s `UnixPendingAccept` arm force-freed the whole
+//     `UnixConn` with no refcount, so the parent dropping its copy right after
+//     the fork destroyed the child's connection too. cosmic-comp gets exactly
+//     one chance to accept (smithay's listener source removes itself as soon
+//     as the paired close_fd pipe reports POLLERR), so that is unrecoverable.
+//
+// Two phases, because the reference can be released from either side and the
+// two releases live in different functions:
+//
+//   A. PARENT closes first (handle_close's UnixPendingAccept arm) — the
+//      cosmic-panel shape, where the child goes on to use the connection.
+//   B. CHILD exits first without closing (handle_close_all's pending loop) —
+//      the exec-failure shape, where the parent must keep a usable connector.
+//
+// PASS => a pending connector survives fork and outlives whichever holder goes
+// away first. FAIL at fcntl => the fork_dup gap. FAIL at accept or on the data
+// round-trip => a refcount gap in the matching teardown path.
+unsafe fn test_fork_inherits_pending_connector() -> bool {
+    let name = b"fork_inherits_pending_connector\0";
+    let ok_a = pending_connector_parent_closes_first();
+    let ok_b = pending_connector_child_exits_first();
+    report(name, ok_a && ok_b)
+}
+
+/// Phase A: the parent drops its copy immediately after the fork and the child
+/// must still have a working connection.
+unsafe fn pending_connector_parent_closes_first() -> bool {
+    let (addr, alen) = sockaddr_un::from_abstract(b"scmtest-pending-connector-a");
+
+    let ls = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    if ls < 0 { dbg0(b"[fpc-a] listener socket failed\n\0"); return false; }
+    if raw_bind(ls, &addr, alen) != 0 {
+        dbg1(b"[fpc-a] bind failed errno=%d\n\0", get_errno() as i64);
+        close(ls); return false;
+    }
+    if raw_listen(ls, 8) != 0 {
+        dbg1(b"[fpc-a] listen failed errno=%d\n\0", get_errno() as i64);
+        close(ls); return false;
+    }
+
+    // Connect and deliberately DO NOT accept: the connector stays
+    // `UnixPendingAccept` across the whole fork, which is the state the old
+    // handle_fork_dup dropped on the floor.
+    let cs = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    if cs < 0 { close(ls); return false; }
+    if raw_connect(cs, &addr, alen) != 0 {
+        dbg1(b"[fpc-a] connect failed errno=%d\n\0", get_errno() as i64);
+        close(cs); close(ls); return false;
+    }
+
+    let pid = fork();
+    if pid == 0 {
+        close(ls);
+        // (a) The inherited fd must exist. This is byte-for-byte the syscall
+        // launch-pad's `mark_as_not_cloexec` issues first, and the one that
+        // used to answer EBADF.
+        if raw_fcntl(cs, F_GETFD, 0) < 0 { exit(11); }
+        // (b) …and the clear must land too — the other half of that helper.
+        if raw_fcntl(cs, F_SETFD, 0) != 0 { exit(12); }
+        // (c) A write before the peer accepts must queue, as on Linux.
+        if write(cs, b"CHLD".as_ptr(), 4) != 4 { exit(13); }
+        // (d) …and the server's reply must arrive on the inherited fd even
+        //     though the parent closed its own copy in the meantime.
+        let mut rb = [0u8; 4];
+        if recv_retry(cs, rb.as_mut_ptr(), 4) != 4 { exit(14); }
+        if &rb != b"SRVR" { exit(15); }
+        close(cs);
+        exit(0);
+    }
+
+    // The parent drops its copy immediately, exactly as cosmic-panel does the
+    // moment launch-pad has forked. The half-open connection must survive on
+    // the child's reference alone.
+    close(cs);
+
+    // Note what a failure looks like, because the two gaps present different
+    // symptoms here and the accept return code alone does not name either.
+    // With BOTH gaps the child has no entry and the parent's close destroys
+    // the connection, so accept finds nothing and answers -1. With only the
+    // close gap the child's entry survives, accept succeeds, and the damage
+    // shows up one line later as a 0-byte (EOF) read off a dead connection.
+    let asf = raw_accept(ls);
+    dbg1(b"[fpc-a] accept after parent close -> %d (want >=0)\n\0", asf as i64);
+
+    let mut ok = asf >= 0;
+    if ok {
+        let mut rb = [0u8; 4];
+        let got = recv_retry(asf, rb.as_mut_ptr(), 4);
+        let sent = if got == 4 && &rb == b"CHLD" { write(asf, b"SRVR".as_ptr(), 4) } else { -1 };
+        dbg2(b"[fpc-a] server read=%d wrote=%d (want 4 4; read=0 == conn destroyed)\n\0",
+             got as i64, sent as i64);
+        ok = got == 4 && &rb == b"CHLD" && sent == 4;
+    }
+
+    let mut status: i32 = -1;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    // 11/12 = the fd never reached the child (fork_dup gap); 13/14/15 = it
+    // reached the child but the connection was torn down under it (close gap).
+    dbg1(b"[fpc-a] child exit status=%d (want 0)\n\0", status as i64);
+    ok = ok && status == 0;
+
+    if asf >= 0 { close(asf); }
+    close(ls);
+    ok
+}
+
+/// Phase B: the mirror image, and the only coverage `handle_close_all`'s
+/// pending arm has. The child exits WITHOUT closing its inherited connector —
+/// the exec-failure shape, and what every forked child that never reaches
+/// `execve` does — so process teardown, not `close(2)`, releases the
+/// reference. Force-freeing there (the old behaviour, and what undoes the
+/// `handle_close` fix if only one of the two is repaired) destroys the
+/// connector the PARENT still holds.
+unsafe fn pending_connector_child_exits_first() -> bool {
+    let (addr, alen) = sockaddr_un::from_abstract(b"scmtest-pending-connector-b");
+
+    let ls = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    if ls < 0 { dbg0(b"[fpc-b] listener socket failed\n\0"); return false; }
+    if raw_bind(ls, &addr, alen) != 0 {
+        dbg1(b"[fpc-b] bind failed errno=%d\n\0", get_errno() as i64);
+        close(ls); return false;
+    }
+    if raw_listen(ls, 8) != 0 {
+        dbg1(b"[fpc-b] listen failed errno=%d\n\0", get_errno() as i64);
+        close(ls); return false;
+    }
+
+    let cs = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    if cs < 0 { close(ls); return false; }
+    if raw_connect(cs, &addr, alen) != 0 {
+        dbg1(b"[fpc-b] connect failed errno=%d\n\0", get_errno() as i64);
+        close(cs); close(ls); return false;
+    }
+
+    let pid = fork();
+    if pid == 0 {
+        close(ls);
+        // Same two fcntls, so a fork_dup regression still FAILs here and not
+        // only in phase A — then exit holding the fd, leaving the release to
+        // handle_close_all.
+        if raw_fcntl(cs, F_GETFD, 0) < 0 { exit(11); }
+        if raw_fcntl(cs, F_SETFD, 0) != 0 { exit(12); }
+        exit(0);
+    }
+
+    // Reap first: the reference must be gone before the parent proves its own
+    // still works, or the test would pass on timing rather than on refcounts.
+    let mut status: i32 = -1;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    dbg1(b"[fpc-b] child exit status=%d (want 0)\n\0", status as i64);
+
+    // The parent's connector must still be acceptable and must still carry
+    // data. A force-free at child teardown shows up either as accept -1 (the
+    // pending entry adopted a dead conn and was refused) or as a 0-byte read.
+    let asf = raw_accept(ls);
+    dbg1(b"[fpc-b] accept after child exit -> %d (want >=0)\n\0", asf as i64);
+
+    let mut ok = asf >= 0 && status == 0;
+    if asf >= 0 {
+        let wrote = write(cs, b"PARN".as_ptr(), 4);
+        let mut rb = [0u8; 4];
+        let got = recv_retry(asf, rb.as_mut_ptr(), 4);
+        dbg2(b"[fpc-b] parent wrote=%d server read=%d (want 4 4; read=0 == conn destroyed)\n\0",
+             wrote as i64, got as i64);
+        ok = ok && wrote == 4 && got == 4 && &rb == b"PARN";
+        close(asf);
+    }
+
+    close(cs);
+    close(ls);
+    ok
+}
+
 // ── mincore: POSIX residency probe (the Mesa _eglPointerIsDereferenceable signal) ──
 //
 // The kernel's mincore used to be a bare `=> 0` stub that reported success for
@@ -725,6 +941,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_fork_exec_inherit() { failures += 1; }
     if !test_fork_exec_inherit_after_shutdown_wr() { failures += 1; }
     if !test_fork_exec_child_clears_cloexec() { failures += 1; }
+    if !test_fork_inherits_pending_connector() { failures += 1; }
     if !test_cmsg_flags() { failures += 1; }
     if !test_shared_memfd_pixels() { failures += 1; }
     if !test_seals() { failures += 1; }

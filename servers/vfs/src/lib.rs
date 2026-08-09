@@ -3255,8 +3255,31 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         Err(e) => {
             // The open identity claimed above has no fd to own it; release it
             // (and tell the server) rather than leaking the slot.
-            if let VnodeKind::DynamicDevice { port, dev_id, open_id } = kind {
-                device_close(port, dev_id, open_id);
+            match kind {
+                VnodeKind::DynamicDevice { port, dev_id, open_id } => {
+                    device_close(port, dev_id, open_id);
+                }
+                // A mount server allocated a real open-file slot for this
+                // open, and that slot is now unreachable: no fd names it, so
+                // no close will ever come. The arm was missing, and the leak
+                // is a death spiral rather than a slow drift — the pool is
+                // per-mount and SYSTEM-WIDE (f2fs::MAX_OPEN_FILES), while the
+                // `Err(-24)` above is the *caller's* own fd table filling up.
+                // A single process that keeps hitting its own limit therefore
+                // burns global slots permanently, one per attempt, until every
+                // other process on the volume can no longer open anything.
+                //
+                // No dup-refcount scan is needed here (unlike handle_close's
+                // MountedFile arm): the server hands out a free slot, so this
+                // `file_id` is brand new and no other fd can be sharing it —
+                // nothing was installed for it to be shared with.
+                VnodeKind::MountedFile { port, file_id } => {
+                    let mut proxy = Message::empty();
+                    proxy.tag = VFS_CLOSE;
+                    proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+                    let _ = call_port(port, proxy);
+                }
+                _ => {}
             }
             err_reply(e)
         }

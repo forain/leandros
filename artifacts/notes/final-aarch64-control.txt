@@ -1,0 +1,3 @@
+[38;5;14m[38;5;5m[0m[0m78[?25h
+[?2004l[31merror:[39m command not found: nosuchbinary_xyz42
+[?2004h[0m[?25l[43;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h

@@ -1,0 +1,16 @@
+ [38;5;14m[38;5;5m[0m[0m78[?25h
+[?2004lld_so::init tp=0x0000000000000000
+PH type=0x0000000000000006
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000001
+PH type=0x0000000000000007
+sigaction_struct_roundtrip: PASS
+signal_delivery_and_return: PASS
+two_signals_distinct_handlers: PASS
+sigprocmask_blocks_and_defers: PASS
+sig_ign_default_disposition: PASS
+raise_delivers_signal: PASS
+--- sigtest done ---
+
+[?2004h[0m[?25l[47;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78
