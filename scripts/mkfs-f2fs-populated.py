@@ -1190,10 +1190,30 @@ def main():
                 hp = os.path.join(dirpath, fn)
                 if os.path.isfile(hp):
                     m4_share_files.append((image_dir, fn, hp))
-    m6_shared_src = session_data("shared")
-    if os.path.isdir(m6_shared_src):
-        for dirpath, _dn, filenames in os.walk(m6_shared_src):
-            rel = os.path.relpath(dirpath, m6_shared_src)  # e.g. "usr/share/backgrounds/cosmic"
+    # `shared` is the one session-data entry that is a TREE, and that makes
+    # session_data()'s whole-entry precedence the wrong rule for it. Resolving it
+    # like a file means an artifacts tree that merely EXISTS shadows the repo copy
+    # entirely, so every .desktop committed afterwards is invisible on that
+    # machine — the same silent skip session_data() was written to kill, one level
+    # up. It cost a session: the box's tree predates the applet .desktop files, so
+    # its panel launched the clock stub alone while this machine drew all of them,
+    # which reads as an x86_64-vs-aarch64 rendering bug and is nothing of the kind.
+    #
+    # The union below keeps per-FILE artifacts precedence (the m4-vkwl rule, which
+    # is what the precedence was actually for) and takes the repo copy only where
+    # the artifacts tree has no such path. Neither side can win wholesale, and
+    # neither may: the wallpaper is gitignored and lives only in the artifacts
+    # tree, the .desktop files are committed and travel with a merge.
+    _shared_roots = []
+    for _r in (os.path.expanduser("~/code/leandros-artifacts/m6-session-data/shared"),
+               os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "..", "artifacts", "m6-session-data", "shared"))):
+        if os.path.isdir(_r) and _r not in _shared_roots:
+            _shared_roots.append(_r)
+    _shared_seen = {}                             # (image_dir, fn) -> root that supplied it
+    for _root in _shared_roots:                   # artifacts tree first, repo second
+        for dirpath, _dn, filenames in os.walk(_root):
+            rel = os.path.relpath(dirpath, _root)  # e.g. "usr/share/backgrounds/cosmic"
             if rel == ".":
                 continue
             parts = rel.split("/")
@@ -1204,8 +1224,22 @@ def main():
                 if fn.endswith(".orig"):          # keep the placeholder off-image
                     continue
                 hp = os.path.join(dirpath, fn)
-                if os.path.isfile(hp):
-                    m4_share_files.append((image_dir, fn, hp))
+                if not os.path.isfile(hp):
+                    continue
+                # A duplicate would pack two directory entries of the same name
+                # into one inode, so the shadowed copy is dropped, not appended.
+                if (image_dir, fn) in _shared_seen:
+                    continue
+                _shared_seen[(image_dir, fn)] = _root
+                m4_share_files.append((image_dir, fn, hp))
+    if len(_shared_roots) > 1:
+        _from_repo = sorted(f"{d}/{n}" for (d, n), r in _shared_seen.items()
+                            if r == _shared_roots[1])
+        if _from_repo:
+            print(f"  session-data/shared: {len(_from_repo)} file(s) taken from the "
+                  f"repo copy, absent from the artifacts tree:")
+            for _p in _from_repo:
+                print(f"    {_p}")
 
     # COSMIC system-default config tree -> /usr/share/cosmic/<component>/v<N>/<key>
     #
@@ -1335,6 +1369,43 @@ def main():
     # Plus safety margin and blocks for directories.
     def content_size(path):
         return len(path) if isinstance(path, (bytes, bytearray)) else os.path.getsize(path)
+
+    # Cross-check staged .desktop Icon= names against staged icon files.
+    #
+    # The icon tree (m6-icons-pruned) is host-only — pruned upstream assets, too
+    # large to commit — so unlike the .desktop files above it has no repo copy to
+    # fall back to, and os.path.isdir() skipping it is silent by construction.
+    # Icons are soft-fail at runtime (a blank button, never a crash), which is
+    # exactly what makes the gap expensive: the panel comes up looking *almost*
+    # right and the missing glyph reads as a rendering bug. This machine had all
+    # ten applet icons and the x86_64 box had none of them, which is precisely the
+    # divergence that is invisible until someone photographs both.
+    #
+    # A name is satisfied if any staged icon's stem matches it — freedesktop
+    # resolves Icon= by stem, and one name legitimately has several files
+    # (…Tiling.On.svg / …Tiling.Off.svg back …Tiling-symbolic).
+    _icon_stems = set()
+    for _d, _n, _p in m4_share_files:
+        if "/icons/" in _d and _n.endswith(".svg"):
+            _icon_stems.add(_n[:-4])
+    _missing_icons = {}
+    for _d, _n, _p in m4_share_files:
+        if _d != "/usr/share/applications" or not _n.endswith(".desktop"):
+            continue
+        try:
+            with open(_p, "r", encoding="utf-8", errors="replace") as _f:
+                for _line in _f:
+                    if _line.startswith("Icon="):
+                        _icon = _line[5:].strip()
+                        if _icon and _icon not in _icon_stems:
+                            _missing_icons.setdefault(_icon, []).append(_n)
+        except OSError:
+            pass
+    if _missing_icons:
+        print(f"  WARNING: {len(_missing_icons)} Icon= name(s) have no staged icon "
+              f"file; those buttons render blank:")
+        for _icon in sorted(_missing_icons):
+            print(f"    {_icon}  (wanted by {', '.join(sorted(_missing_icons[_icon]))})")
 
     required_blocks = 4096 + 100
     # Count each distinct host path once: repeated paths become hardlinks
