@@ -797,6 +797,7 @@ paragraph that leans on "out of scope" with that in mind.
 | 8 | Nothing to launch, and no way to ask for it | Feature — **config DONE**; rest **MIS-SIZED** | `cosmic-term` needs a PTY layer (2-3 wks), not a build |
 | 9 | **5 real applets now ship and run; 2 of them paint nothing** | Feature — panel-death **FIXED**; rendering **OPEN** | 8 processes, 0 exits; tiling + minimize draw zero pixels |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
+| 15 | **~386 KB of extra `.data` stopped the Linux box booting, and nobody knows why** | Bug — **trigger removed, cause OPEN** | Bisected to `MAX_OPEN_FILES` 32→256; `F2FS_MOUNTS` now heap-backed so it cannot recur, but the cliff itself is unexplained |
 | 11 | **PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — greeter one **RETIRED**; session one **cause FIXED** `2d9f0c8` | One patch left; handshake completes 5.022 s → 2.186 s |
 | 12 | **PAM — real support, replacing the C shim** | Feature — **NEW, in scope** | Shim authenticates for real but is C, untracked, coverage unverified |
 | 13 | **utmpx — session accounting, currently absent** | Feature — **NEW, in scope** | Nothing in tree; need is unmeasured |
@@ -1710,6 +1711,42 @@ feature from its name. utmpx could be a fixed-size record appended to two files 
 — or a session-tracking subsystem the kernel has no concept of. **Do not schedule
 implementation work against this item until that question is answered**, and record the
 answer here rather than in a lane report.
+
+### 15. ~386 KB of extra `.data` stopped the Linux box booting, and the cause is open
+
+**Trigger removed 2026-08-09; the underlying fragility is NOT explained.**
+
+`0f56aab` raised `MAX_OPEN_FILES` 32 → 256. `F2FS_MOUNTS` held `MountState`
+inline behind a `Mutex`, so rustc emitted it initialised: the table went from
+188,936 B to 574,976 B **of `.data`**, growing the kernel image ~386 KB. That
+alone stopped the x86_64 Linux box booting — on *both* architectures — with init
+page-faulting on its own stack during the f2fs mount. The same kernel booted
+fine on the Mac.
+
+Ruled out along the way, each by measurement rather than argument: host packages
+(qemu 11.0.1 installed May 30, no pacman transaction since Jul 28), a full root
+disk, KVM vs TCG, guest RAM, SMP (`-smp 1` still fails, with a *different* wild
+fault), the box's own build (the Mac's kernel image faults there too), and
+framebuffer geometry (1920x1080 on both). The one measured difference between
+the hosts is firmware placement — initrd at `0x7C00D000` on the Mac vs
+`0x7E037000` on the box.
+
+**Fixed by removing the lever, not the cause.** `F2FS_MOUNTS` is now
+`[Option<Box<MountState>>; MAX_MOUNTS]` — one null-pointer-optimised word per
+slot, so all-`None` is all-zero and the static is 72 B in `.bss`. The kernel
+went 14,860,768 → 14,281,632 B, *smaller* than it was at 32 slots, and
+`MAX_OPEN_FILES` no longer touches the image at all.
+
+Landmine for whoever builds on this: `Box::new(MountState { .. })` is the
+obvious spelling and is wrong here. rustc materialises the ~72 KB struct as a
+stack temporary first — measured `sub rsp, 0x260E8`, a 155,880 B frame against
+the 128 KB boot stack in `kernel/src/x86_64_start.rs:17`. The mount path builds
+the value in place through `Box::new_uninit()` instead, which takes the frame to
+12,392 B. Verified 36/36 vfstest on fresh volumes, both arches, both machines.
+
+**Still open**: *why* ~386 KB of image growth is fatal on one host and free on
+another. Until that is understood, any future kernel growth can resurrect this,
+and the next occurrence will not have a one-line constant to bisect to.
 
 ### 14. VT switching — was out of scope, now required
 
