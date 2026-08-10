@@ -6111,6 +6111,10 @@ fn vfs_close_all_for(pid: u32) {
     // for a release signal nobody will answer, and only the 5 s watchdog would
     // get the display back.
     tty_server::vt::cleanup_pid(pid);
+    // An EVIOCGRAB held by a process that just died would silence the node for
+    // everyone, and a grabbed node produces no events for `broadcast` to
+    // self-heal on. See TODO.md item 20.
+    evdev_server::cleanup_pid(pid);
     stdio_flags_close_all(pid);
 }
 

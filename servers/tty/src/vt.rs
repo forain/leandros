@@ -590,6 +590,11 @@ static MIRROR_DROPS: AtomicU64 = AtomicU64::new(0);
 /// Modifier keys currently held, as a bitmask — see [`chord_key`].
 static CHORD_MODS: AtomicU32 = AtomicU32::new(0);
 
+/// Ctrl+Alt+Esc was pressed and [`rescue`] is owed. Set from the input IRQ by
+/// [`escape_key`], consumed by [`poll_deferred`] in task context, for exactly
+/// the reason [`PENDING`] is.
+static RESCUE: AtomicBool = AtomicBool::new(false);
+
 /// A `VT_PROCESS` client that never answers must not own the display forever.
 /// 5 s at the 100 Hz scheduler tick; long enough that no honest handshake trips
 /// it, short enough that a wedged compositor is recoverable by hand — which is
@@ -781,6 +786,7 @@ pub fn switch_request(n: usize) {
 /// Cheap enough for the syscall-return path: two relaxed atomic loads when
 /// there is nothing to do.
 pub fn poll_deferred() {
+    if RESCUE.swap(false, Ordering::AcqRel) { rescue(); }
     if PHASE.load(Ordering::Relaxed) != PHASE_IDLE { watchdog(); }
     let n = PENDING.load(Ordering::Relaxed);
     if n == 0 { return; }
@@ -792,6 +798,47 @@ pub fn poll_deferred() {
         // item exists to prevent. The watchdog bounds how long it can bounce.
         let _ = PENDING.compare_exchange(0, n, Ordering::AcqRel, Ordering::Relaxed);
     }
+}
+
+/// Ctrl+Alt+Esc's deferred half: put **VT 1** back into a state a human can use
+/// and move the display to it, asking nobody.
+///
+/// Every other path back from a graphical session is cooperative somewhere —
+/// the release handshake asks the outgoing owner, [`chord_key`] asks the
+/// keyboard mode, `KDSETMODE(KD_TEXT)` asks the client to issue it. This one is
+/// the last resort, so it asks nothing:
+///
+/// * VT 1 is forced to `KD_TEXT` and `K_XLATE`, because releasing the keyboard
+///   to a console that is still gated off behind someone else's `KD_GRAPHICS`
+///   is a rescue nobody can see. This is the half [`crate::vt::escape_key`]'s
+///   companion `release_all_grabs` cannot do.
+/// * VT 1 is dropped to `VT_AUTO`, so a dead or wedged `VT_PROCESS` owner
+///   cannot refuse the display.
+/// * Any handshake in flight is abandoned rather than waited out — the whole
+///   point is not to wait 5 s on the watchdog for a client that has already
+///   proven it will not answer.
+///
+/// Only VT 1 is touched. A rescue that reset whichever VT happened to be on
+/// screen would drop a *healthy* compositor out of graphics mode on its way
+/// past, which is a rescue with collateral damage.
+fn rescue() {
+    let _guard = SWITCH_LOCK.lock();
+    {
+        let mut m = MODES.lock();
+        let v = &mut m[0];
+        v.allocated = true;
+        v.graphics = false;
+        v.kb_mode_p1 = (K_XLATE + 1) as u8;
+        v.mode = VT_AUTO;
+        v.owner = 0;
+    }
+    PHASE.store(PHASE_IDLE, Ordering::Relaxed);
+    PHASE_FROM.store(ACTIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+    PHASE_TO.store(0, Ordering::Relaxed);
+    // Straight to `complete_switch`, not `switch_to`: the release handshake is
+    // the thing being bypassed. It repaints VT 1, revokes the scanout claim and
+    // — through `evdev_vt_activated` — releases every input grab a second time.
+    complete_switch(0);
 }
 
 /// Force a stalled `VT_PROCESS` handshake through.
@@ -988,6 +1035,7 @@ const KEY_RIGHTCTRL: u16 = 97;
 const KEY_LEFTALT: u16 = 56;
 const KEY_RIGHTALT: u16 = 100;
 const KEY_F1: u16 = 59;
+const KEY_ESC: u16 = 1;
 
 const MOD_CTRL: u32 = 1 << 0;
 const MOD_ALT: u32 = 1 << 1;
@@ -1052,6 +1100,44 @@ pub fn chord_key(code: u16, value: i32) -> bool {
     // itself. Divergence 3 above.
     if kb_mode_active_relaxed() != K_XLATE { return false; }
     switch_request((code - KEY_F1) as usize + 1);
+    true
+}
+
+/// **Ctrl+Alt+Esc — the escape hatch.** Returns true when the event is that
+/// chord's key-down, which the caller must consume.
+///
+/// WHY THIS EXISTS AND WHY IT IS NOT [`chord_key`]. `EVIOCGRAB` is enforced now
+/// (TODO.md item 20), and enforcing it is the one change in this tree whose
+/// failure mode is a machine nobody can ask anything. The structural argument
+/// that Ctrl+Alt+Fn is safe — it runs ahead of all per-client routing, so no
+/// grab can swallow it — is an argument about the code as it stands today, and
+/// the thing being defended against is a change nobody has made yet.
+///
+/// Ctrl+Alt+Fn is also not sufficient on its own, and the gap is exact rather
+/// than hypothetical: [`chord_key`] deliberately disables itself outside
+/// `K_XLATE`, matching Linux, so a client that sets `K_RAW` **and** grabs the
+/// keyboard has closed the only keyboard route back. That client is trivial to
+/// write by accident. This one carries **no keyboard-mode gate at all** — it is
+/// the last resort, and a last resort with a precondition is not one.
+///
+/// It does two things, and needs both: release every evdev grab (the caller's
+/// half, in `evdev-server`, immediately and on this IRQ) and put VT 1 back into
+/// a usable state and move the display to it ([`rescue`], deferred to task
+/// context because it repaints). Ungrabbing alone hands the keyboard back to a
+/// console that is still gated off behind the wedged client's `KD_GRAPHICS`,
+/// which is a rescue you cannot see.
+///
+/// Lock-free, IRQ-safe, and it reads [`CHORD_MODS`] rather than tracking its
+/// own modifiers — [`chord_key`] runs first on every key and maintains that
+/// state, so the two recognisers cannot disagree about whether Ctrl is down.
+/// Only the key-down is consumed, for the reason divergence 2 gives on
+/// [`chord_key`].
+pub fn escape_key(code: u16, value: i32) -> bool {
+    if value != 1 || code != KEY_ESC { return false; }
+    if CHORD_MODS.load(Ordering::Relaxed) & (MOD_CTRL | MOD_ALT) != (MOD_CTRL | MOD_ALT) {
+        return false;
+    }
+    RESCUE.store(true, Ordering::Relaxed);
     true
 }
 

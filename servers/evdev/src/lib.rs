@@ -211,10 +211,40 @@ struct EvdevDevice {
     /// monotonic clock `clock_gettime(CLOCK_MONOTONIC)` reports, which is what
     /// libinput asks for.
     clockid_override: u32,
+    /// The open holding `EVIOCGRAB` on this node, keyed exactly the way
+    /// [`EvdevState::find`] keys a client: by `open_id` when there is one, by
+    /// `pid` when there is not. Both zero means no grab, which keeps the whole
+    /// `STATE` static in .bss.
+    grab_open: u32,
+    grab_pid: u32,
+    /// The VT the grab was taken on.
+    ///
+    /// A grab **cannot survive a switch away from that VT**, and this field is
+    /// what says which VT that is. It is recorded rather than compared on the
+    /// push path because the release is driven by the switch itself
+    /// ([`evdev_vt_activated`]) — a grab that merely went *dormant* while its
+    /// VT was off screen would come back live when the VT did, and "the client
+    /// I switched away from is still holding the keyboard" is precisely the
+    /// state this is meant to make unreachable.
+    grab_vt: u32,
 }
 
 impl EvdevDevice {
-    const fn empty() -> Self { Self { in_use: false, clockid_override: 0 } }
+    const fn empty() -> Self {
+        Self { in_use: false, clockid_override: 0, grab_open: 0, grab_pid: 0, grab_vt: 0 }
+    }
+    fn grabbed(&self) -> bool { self.grab_open != 0 || self.grab_pid != 0 }
+    fn ungrab(&mut self) { self.grab_open = 0; self.grab_pid = 0; self.grab_vt = 0; }
+}
+
+/// Does this queue belong to the open `(open_id, pid)` names?
+///
+/// The one place the client key is spelled out, so `find`, the grab holder and
+/// the `VFS_CLOSE` arm cannot drift apart — a grab recorded under one keying
+/// and looked up under another is a grab with no holder, i.e. a deaf machine.
+fn client_matches(c: &EvClient, open_id: u32, pid: u32) -> bool {
+    c.in_use && if open_id != 0 { c.open_id == open_id }
+                else { c.open_id == 0 && c.pid == pid }
 }
 
 struct EvdevState {
@@ -235,11 +265,7 @@ impl EvdevState {
 
     /// Index of the queue `(dev, open_id, pid)` reads from, or None.
     fn find(&self, dev: u32, open_id: u32, pid: u32) -> Option<usize> {
-        self.clients.iter().position(|c| {
-            c.in_use && c.dev_id == dev
-                && if open_id != 0 { c.open_id == open_id }
-                   else { c.open_id == 0 && c.pid == pid }
-        })
+        self.clients.iter().position(|c| c.dev_id == dev && client_matches(c, open_id, pid))
     }
 
     /// Same, registering a queue if this is the first request from that open.
@@ -288,26 +314,104 @@ impl EvdevState {
     ///
     /// `console_ok` false skips the console tap only — see `push_event`.
     ///
-    /// `gate_vt` is the VT currently on screen, and a queue pinned to a
-    /// different one does not receive the event. **0 disables the gate
-    /// entirely** and is how the serial exemption reaches every queue — see
-    /// `push_event`.
+    /// `active_vt` is the VT currently on screen, and a queue pinned to a
+    /// different one does not receive the event.
     ///
-    /// The gate lives HERE, downstream of `push_event`'s `chord_key` call,
-    /// and that ordering is not incidental: Ctrl+Alt+Fn is consumed before any
-    /// per-client routing runs, so no gate — and, later, no grab — can be put
-    /// in front of the one key sequence that escapes a VT holding the display.
-    fn broadcast(&mut self, dev: u32, ev: input_event, console_ok: bool, gate_vt: u32) -> bool {
-        let mut overflowed = false;
-        for c in self.clients.iter_mut() {
-            if c.in_use && c.dev_id == dev {
-                if c.open_id == CONSOLE_OPEN_ID && !console_ok { continue; }
-                if gate_vt != 0 && c.vt != 0 && c.vt != gate_vt { continue; }
-                if c.count >= CLIENT_EVENTS { overflowed = true; }
-                c.push(ev);
+    /// `exempt` bypasses **both** the VT gate and the grab. It is set for
+    /// serial frames only — see `push_event`.
+    ///
+    /// Both filters live HERE, downstream of `push_event`'s `chord_key` and
+    /// `escape_key` calls, and that ordering is not incidental: Ctrl+Alt+Fn and
+    /// Ctrl+Alt+Esc are consumed before any per-client routing runs, so neither
+    /// the gate nor a grab can be put in front of the two key sequences that
+    /// escape a VT holding the display. Nothing in this function can make the
+    /// machine unrecoverable, because nothing in this function is reached by
+    /// the keys that recover it.
+    fn broadcast(&mut self, dev: u32, ev: input_event, console_ok: bool,
+                 active_vt: u32, exempt: bool) -> bool {
+        // Resolve the grab holder, and SELF-HEAL a grab that no longer has
+        // one. A grab whose client is gone would silence the node forever, and
+        // the whole point of item 20's escape hatch is that no state in here
+        // gets to be permanent.
+        let grab_idx = if self.devs[dev as usize].grabbed() {
+            let (g_open, g_pid) =
+                (self.devs[dev as usize].grab_open, self.devs[dev as usize].grab_pid);
+            match self.clients.iter()
+                      .position(|c| c.dev_id == dev && client_matches(c, g_open, g_pid)) {
+                Some(i) => Some(i),
+                None => { self.devs[dev as usize].ungrab(); None }
             }
+        } else {
+            None
+        };
+
+        let mut overflowed = false;
+        for (i, c) in self.clients.iter_mut().enumerate() {
+            if !(c.in_use && c.dev_id == dev) { continue; }
+            if c.open_id == CONSOLE_OPEN_ID && !console_ok { continue; }
+            if !exempt {
+                if active_vt != 0 && c.vt != 0 && c.vt != active_vt { continue; }
+                // EVIOCGRAB: exclusive delivery to the holder, as on Linux —
+                // the in-kernel console tap included, because a compositor that
+                // grabs the keyboard means it, and a console still echoing
+                // underneath a grab is the bug the grab was asked to fix.
+                if let Some(g) = grab_idx {
+                    if i != g { continue; }
+                }
+            }
+            if c.count >= CLIENT_EVENTS { overflowed = true; }
+            c.push(ev);
         }
         overflowed
+    }
+
+    /// `EVIOCGRAB` — take or release exclusive delivery on `dev`.
+    ///
+    /// Returns 0, or a negative errno.
+    fn set_grab(&mut self, dev: u32, open_id: u32, pid: u32, want: bool) -> i32 {
+        let d = &self.devs[dev as usize];
+        let (g_open, g_pid) = (d.grab_open, d.grab_pid);
+        let held_by_caller = g_open == open_id && g_pid == pid;
+
+        if !want {
+            // Only the holder releases, as on Linux (`evdev_ungrab` answers
+            // EINVAL to anyone else, including a caller that never grabbed).
+            if !d.grabbed() || !held_by_caller { return -22; } // EINVAL
+            self.devs[dev as usize].ungrab();
+            return 0;
+        }
+
+        if d.grabbed() && !held_by_caller {
+            // Contested — unless the recorded holder no longer exists, in
+            // which case the stale grab loses rather than locking the node out
+            // of every future grab.
+            let live = self.clients.iter()
+                .any(|c| c.dev_id == dev && client_matches(c, g_open, g_pid));
+            if live { return -16; } // EBUSY
+            self.devs[dev as usize].ungrab();
+        }
+
+        // Register the caller's queue up front. A grab whose holder has no
+        // queue resolves to nothing in `broadcast`, and `broadcast` would then
+        // (correctly) drop the grab on the very first event — a grab that
+        // reported success and did not hold is worse than one that failed.
+        if self.find_or_register(dev, open_id, pid).is_none() { return -12; } // ENOMEM
+        let vt = tty_server::vt::active() as u32;
+        let d = &mut self.devs[dev as usize];
+        d.grab_open = open_id;
+        d.grab_pid = pid;
+        d.grab_vt = vt;
+        0
+    }
+
+    /// Drop every grab on every node. The escape hatch's whole implementation;
+    /// see [`release_all_grabs`].
+    fn ungrab_all(&mut self) -> bool {
+        let mut any = false;
+        for d in self.devs.iter_mut() {
+            if d.grabbed() { d.ungrab(); any = true; }
+        }
+        any
     }
 }
 
@@ -749,12 +853,33 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     unsafe { arch_interrupt_restore(f); }
                     val_reply(0)
                 }
-                // EVIOCGRAB/EVIOCREVOKE → accepted, but deliberately NOT
-                // enforced: a grab that really did cut every other queue off
-                // would take the in-kernel console drain (pop_event) with it,
-                // and nothing can switch back yet. Exclusivity is VT switching's
-                // job, not an ioctl's, until there is a VT to switch to.
-                0x90 | 0x91 => val_reply(0),
+                0x90 => { // EVIOCGRAB — ENFORCED (TODO.md item 20)
+                    // `_IOW('E', 0x90, int)`, but the int is passed BY VALUE:
+                    // userspace calls `ioctl(fd, EVIOCGRAB, 1)`, so `arg_ptr`
+                    // holds 1 or 0 and is not a pointer to dereference.
+                    //
+                    // This was accepted-and-ignored until now, and the comment
+                    // it replaces gave the right reason for that: a real grab
+                    // takes the in-kernel console drain with it, and there was
+                    // nothing to switch back to. There is now — and, more to
+                    // the point, there are three independent ways out that do
+                    // not depend on this code being correct: Ctrl+Alt+Fn and
+                    // Ctrl+Alt+Esc are consumed upstream of `broadcast`, a
+                    // switch drops every grab (`evdev_vt_activated`), and the
+                    // serial line is exempt.
+                    let want = arg_ptr != 0;
+                    let f = unsafe { arch_interrupt_save() };
+                    let rc = STATE.lock().set_grab(dev_id as u32, open_id, pid, want);
+                    unsafe { arch_interrupt_restore(f); }
+                    if rc == 0 { val_reply(0) } else { err_reply(rc) }
+                }
+                // EVIOCREVOKE — still accepted and ignored. Revoking an fd is
+                // not the grab's mechanism (it permanently poisons the
+                // description rather than redirecting delivery) and nothing in
+                // this tree issues it; implementing it on the strength of the
+                // grab work would be shipping an untested second teardown path
+                // for the one subsystem that must not have one.
+                0x91 => val_reply(0),
                 _ if (0x20..0x40).contains(&nr) => // EVIOCGBIT(ev, len)
                     eviocgbit(dev_id, nr - 0x20, arg_ptr, size, pid),
                 _ if (0x40..0x60).contains(&nr) => // EVIOCGABS(abs)
@@ -804,6 +929,13 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     st.clients[i].in_use = false;
                     st.clients[i].count = 0;
                 }
+                // Drop a grab this open was holding. `broadcast` would
+                // self-heal it on the next event anyway, but only once an
+                // event arrives — and while the node is grabbed by a corpse
+                // there are no events to arrive with. The close is the last
+                // moment anything is guaranteed to run.
+                let d = &mut st.devs[dev_id];
+                if d.grab_open == open_id && d.grabbed() { d.ungrab(); }
                 drop(st);
                 unsafe { arch_interrupt_restore(f); }
             }
@@ -907,10 +1039,27 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     // `vt::poll_deferred`. It also applies the K_XLATE gate itself (a raw-mode
     // VT owner does its own switching, as on Linux), so that rule is NOT
     // repeated here: one copy of it, in the module that owns the mode.
-    if dev_id == DEV_KEYBOARD as u32 && type_ == EV_KEY
-        && tty_server::vt::chord_key(code, value) {
-        bump(&C_PUSHED, dev_id as usize);
-        return;
+    if dev_id == DEV_KEYBOARD as u32 && type_ == EV_KEY {
+        if tty_server::vt::chord_key(code, value) {
+            bump(&C_PUSHED, dev_id as usize);
+            return;
+        }
+        // Ctrl+Alt+Esc — the escape hatch (TODO.md item 20). Same position as
+        // the chord and for a stronger version of the same reason: it is the
+        // route back from a client that has BOTH grabbed the keyboard and taken
+        // it out of K_XLATE, which is the one combination the chord above
+        // cannot answer because it gates itself on the keyboard mode. Being
+        // here, upstream of `broadcast`, is the entire safety argument for
+        // enforcing EVIOCGRAB at all: this key is not routed, so it cannot be
+        // grabbed.
+        //
+        // `escape_key` has already asked for the switch back to VT 1; the
+        // grabs are this crate's to release.
+        if tty_server::vt::escape_key(code, value) {
+            release_all_grabs();
+            bump(&C_PUSHED, dev_id as usize);
+            return;
+        }
     }
 
     // Whether this keystroke belongs to the kernel's line discipline. It does
@@ -971,7 +1120,7 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     // predicate) and the cost of it is one extra repeat event, not a stuck key:
     // the key-down that started the repeat was gated, and xkb ignores a repeat
     // for a key it never saw pressed.
-    let gate_vt = if serial_frame { 0 } else { tty_server::vt::active() as u32 };
+    let active_vt = tty_server::vt::active() as u32;
 
     let ev = input_event {
         time: timeval {
@@ -985,7 +1134,7 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     let f = unsafe { arch_interrupt_save() };
     // Broadcast, not enqueue-once: on Linux an event goes to every open of the
     // node and one reader consuming it never removes another's copy.
-    let overflowed = STATE.lock().broadcast(dev_id, ev, console_ok, gate_vt);
+    let overflowed = STATE.lock().broadcast(dev_id, ev, console_ok, active_vt, serial_frame);
     bump(&C_PUSHED, dev_id as usize);
     if overflowed { bump(&C_DROPPED, dev_id as usize); }
     // A key event is a POLLIN edge for a console reader / evdev poller parked on
@@ -1007,15 +1156,69 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
 /// IRQ also takes, so interrupts are masked across the whole update. It does
 /// **not** wake pollers: `complete_switch` calls `sched::wake_poll` immediately
 /// after, and one wake for the whole switch is enough.
+/// It also **drops every `EVIOCGRAB` on every node** — the ungrab-all that
+/// item 20's escape hatch is built out of.
+///
+/// A grab is scoped to the VT that took it and does not survive a switch away
+/// from that VT, which is enforced here rather than by comparing `grab_vt`
+/// against the live VT on the push path: a grab that went dormant and woke up
+/// again would mean "the client I switched away from is still holding the
+/// keyboard", and switching away is exactly how a user says they no longer
+/// want that. It costs a libseat client nothing, because it already closes and
+/// reopens its devices across a switch and re-grabs on the way back in.
 #[no_mangle]
 pub extern "C" fn evdev_vt_activated(new_vt: u32) {
     if new_vt == 0 { return; }
     let now_us = unsafe { arch_monotonic_ns() } / 1_000;
     let f = unsafe { arch_interrupt_save() };
     let mut st = STATE.lock();
+    st.ungrab_all();
     for c in st.clients.iter_mut() {
         if c.in_use && c.vt != 0 && c.vt == new_vt {
             c.force_resync(now_us);
+        }
+    }
+    drop(st);
+    unsafe { arch_interrupt_restore(f); }
+}
+
+/// Release every `EVIOCGRAB` on every node, from anywhere.
+///
+/// Two callers, both of them rescues: the Ctrl+Alt+Esc escape hatch on the IRQ
+/// push path, and process teardown. IRQ-safe — one lock, no user memory, no
+/// `RUN_QUEUE`.
+#[no_mangle]
+pub extern "C" fn release_all_grabs() -> bool {
+    let f = unsafe { arch_interrupt_save() };
+    let any = STATE.lock().ungrab_all();
+    unsafe { arch_interrupt_restore(f); }
+    any
+}
+
+/// A process exited — drop any grab it held.
+///
+/// `VFS_CLOSE` covers an orderly exit and `broadcast` self-heals a grab whose
+/// client is gone, but `broadcast` only runs when an event arrives and a
+/// grabbed node delivers to nobody, so neither is a guarantee for a process
+/// that was killed. This runs from the same task-context teardown that already
+/// calls `vt::cleanup_pid`, and it is the one release that does not depend on
+/// the dead process having cooperated.
+pub fn cleanup_pid(pid: u32) {
+    if pid == 0 { return; }
+    let f = unsafe { arch_interrupt_save() };
+    let mut st = STATE.lock();
+    let holders: [(u32, u32); MAX_DEVICES] =
+        core::array::from_fn(|d| (st.devs[d].grab_open, st.devs[d].grab_pid));
+    for (d, (g_open, g_pid)) in holders.iter().enumerate() {
+        if *g_open == 0 && *g_pid == 0 { continue; }
+        // The grab is keyed by open, not by pid, so the pid it belongs to is
+        // whichever client answers that key — `grab_pid` alone is only
+        // authoritative for a pid-keyed queue.
+        let owner = st.clients.iter()
+            .find(|c| c.dev_id == d as u32 && client_matches(c, *g_open, *g_pid))
+            .map(|c| c.pid);
+        if owner == Some(pid) || (owner.is_none() && *g_pid == pid) {
+            st.devs[d].ungrab();
         }
     }
     drop(st);

@@ -38,6 +38,12 @@
 //!   separate process, and what makes restoring `xlate` afterwards mandatory.
 //! * `vttest gfx <ms>` — `KD_GRAPHICS`, wait, `KD_TEXT`. Proves the console
 //!   goes silent and then repaints from the mirror rather than from a clear.
+//! * `vttest trap <ms>` — grab the keyboard, `K_RAW`, `KD_GRAPHICS`, then sleep
+//!   and restore NOTHING. The deliberately unrecoverable machine that TODO.md
+//!   item 20's escape hatch (Ctrl+Alt+Esc) has to rescue; if it comes back
+//!   before `<ms>` elapses, the kernel brought it back.
+//! * `vttest state` — print the active VT, console mode, keyboard mode and
+//!   whether the keyboard is grabbable. What a rescue is checked against.
 //!
 //! Each check prints "<name>: PASS" or "<name>: FAIL"; the final line is
 //! `vttest: <passed>/<total>` and the exit code is the failure count.
@@ -94,6 +100,10 @@ const VT_PROCESS: u8 = 1;
 const DRM_IOCTL_SET_MASTER: c_ulong = 0x0000_641E;
 const DRM_IOCTL_DROP_MASTER: c_ulong = 0x0000_641F;
 const DRM_IOCTL_MODE_DIRTYFB: c_ulong = 0xC018_64B1;
+
+// EVIOCGRAB — `_IOW('E', 0x90, int)`. The int goes by VALUE, not by pointer:
+// userspace calls `ioctl(fd, EVIOCGRAB, 1)`.
+const EVIOCGRAB: c_ulong = 0x4004_4590;
 
 const POLLIN: i16 = 0x001;
 
@@ -197,6 +207,7 @@ extern "C" {
     pub fn epoll_wait(epfd: c_int, events: *mut epoll_event, maxevents: c_int, timeout: c_int) -> c_int;
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
     pub fn exit(status: c_int) -> !;
+    pub fn getpid() -> c_int;
     pub fn __errno_location() -> *mut c_int;
 }
 
@@ -774,6 +785,178 @@ unsafe fn t_setmaster_background(tty0: c_int) -> bool {
     report(b"setmaster_background", grant && moved && refused && still_suspended && back)
 }
 
+// ── 18-21. EVIOCGRAB ─────────────────────────────────────────────────────────
+//
+// The grab was accepted and ignored until TODO.md item 20 was implemented, and
+// enforcing it is the one change in this tree whose failure mode is a machine
+// nobody can ask anything. These subtests measure the three properties that
+// bound that risk, and every one of them is about a grab ENDING rather than a
+// grab working:
+//
+//   * it is exclusive while it is held (or it is not a grab),
+//   * it does not survive a switch away from the VT that took it,
+//   * it does not survive the fd that took it.
+//
+// They are deliberately written against the ioctl surface alone. Exclusive
+// DELIVERY needs injected events and therefore a host, which is what the
+// `evsplit` runs measure; what a self-contained suite can prove is that the
+// grab is released on every path that must release it — and that is the half
+// where a bug leaves a dead machine.
+
+unsafe fn kbd() -> c_int {
+    open(b"/dev/input/event0\0".as_ptr(), O_RDWR | O_NONBLOCK)
+}
+
+unsafe fn grab(fd: c_int) -> c_int { ioctl(fd, EVIOCGRAB, 1usize as *mut c_void) }
+unsafe fn ungrab(fd: c_int) -> c_int { ioctl(fd, EVIOCGRAB, core::ptr::null_mut()) }
+
+/// Grab, release, and release again. The second release must be refused: an
+/// ungrab that answers 0 to a caller holding nothing cannot be distinguished
+/// from one that silently dropped somebody else's grab.
+unsafe fn t_grab_roundtrip() -> bool {
+    let fd = kbd();
+    if fd < 0 { return report(b"grab_roundtrip", false); }
+    let took = grab(fd) == 0;
+    let gave = ungrab(fd) == 0;
+    let again = ungrab(fd);
+    let e = errno();
+    close(fd);
+    out(b"  took="); out_int(took as c_int);
+    out(b" again="); out_int(again); out(b" errno="); out_int(e); out(b"\n");
+    report(b"grab_roundtrip", took && gave && again < 0 && e == EINVAL)
+}
+
+/// Two opens, one node. The second grab is EBUSY while the first holds, and
+/// succeeds the moment it does not.
+unsafe fn t_grab_is_exclusive() -> bool {
+    let a = kbd();
+    let b = kbd();
+    if a < 0 || b < 0 { return report(b"grab_is_exclusive", false); }
+    let took = grab(a) == 0;
+    let denied = grab(b);
+    let e = errno();
+    let released = ungrab(a) == 0;
+    let now_ok = grab(b) == 0;
+    ungrab(b);
+    close(a);
+    close(b);
+    out(b"  took="); out_int(took as c_int);
+    out(b" denied="); out_int(denied); out(b" errno="); out_int(e);
+    out(b" after_release="); out_int(now_ok as c_int); out(b"\n");
+    report(b"grab_is_exclusive", took && denied < 0 && e == EBUSY && released && now_ok)
+}
+
+/// **The escape hatch's automated half.** A grab is scoped to the VT that took
+/// it: switching away drops it, and the holder is not merely suspended.
+///
+/// Proved two ways at once, because either alone is weak. A second open can
+/// grab the node afterwards (so the grab is really gone, not dormant), and the
+/// original holder's ungrab is refused with EINVAL (so it is gone from the
+/// holder's point of view too, rather than having been quietly handed over).
+unsafe fn t_grab_dies_on_vt_switch(tty0: c_int) -> bool {
+    let a = kbd();
+    let b = kbd();
+    if a < 0 || b < 0 { return report(b"grab_dies_on_vt_switch", false); }
+    let took = grab(a) == 0;
+    let away = switch_to(tty0, 2) && active_vt(tty0) == 2;
+    let back = switch_to(tty0, 1) && active_vt(tty0) == 1;
+    let others_turn = grab(b) == 0;
+    let holder_has_nothing = ungrab(a);
+    let e = errno();
+    ungrab(b);
+    close(a);
+    close(b);
+    out(b"  took="); out_int(took as c_int);
+    out(b" others_turn="); out_int(others_turn as c_int);
+    out(b" holder_ungrab="); out_int(holder_has_nothing);
+    out(b" errno="); out_int(e); out(b"\n");
+    report(b"grab_dies_on_vt_switch",
+           took && away && back && others_turn && holder_has_nothing < 0 && e == EINVAL)
+}
+
+/// A grab does not outlive the fd that took it. This is the path a crashed
+/// client takes, and without it the node stays grabbed by a process that no
+/// longer exists — with no events flowing, so nothing would ever notice.
+unsafe fn t_grab_dies_on_close() -> bool {
+    let a = kbd();
+    if a < 0 { return report(b"grab_dies_on_close", false); }
+    let took = grab(a) == 0;
+    close(a);
+    let b = kbd();
+    if b < 0 { return report(b"grab_dies_on_close", false); }
+    let inherited = grab(b) == 0;
+    ungrab(b);
+    close(b);
+    out(b"  took="); out_int(took as c_int);
+    out(b" next_open_can_grab="); out_int(inherited as c_int); out(b"\n");
+    report(b"grab_dies_on_close", took && inherited)
+}
+
+// ── `trap` — the worst client we can build ───────────────────────────────────
+
+/// Grab the keyboard, take the VT out of `K_XLATE`, take the console into
+/// `KD_GRAPHICS`, and then do nothing at all for `ms`.
+///
+/// This is not a test, it is the MACHINE the escape hatch has to rescue, and it
+/// is built to be exactly as bad as the design argument says it can get:
+///
+/// * `EVIOCGRAB` means no other evdev reader — the console tap included — sees
+///   a keystroke.
+/// * `K_RAW` means `chord_key` disables itself, so **Ctrl+Alt+Fn does nothing**.
+///   That is deliberate and matches Linux, and it is what makes the chord an
+///   insufficient escape on its own.
+/// * `KD_GRAPHICS` means the framebuffer console is gated off, so even handing
+///   the keyboard back would leave nothing on screen to type at.
+///
+/// Nothing this process does after the setup can help: it never restores
+/// anything and it never exits early. If the machine comes back before `ms`
+/// elapses, something in the kernel brought it back.
+unsafe fn cmd_trap(tty0: c_int, ms: i64) -> c_int {
+    let fd = kbd();
+    if fd < 0 {
+        out(b"vttest trap: open /dev/input/event0 failed\n");
+        return 1;
+    }
+    if grab(fd) != 0 {
+        out(b"vttest trap: EVIOCGRAB failed, errno="); out_int(errno()); out(b"\n");
+        return 1;
+    }
+    ioctl(tty0, KDSKBMODE, K_RAW as *mut c_void);
+    set_mode(tty0, KD_GRAPHICS);
+    // The pid is part of the instrument, not decoration: half of what this
+    // exists to demonstrate is that KILLING the grabbing client frees the node,
+    // and a trap that does not say which process to kill makes the tester guess
+    // — which, with every `vttest state` probe also registering an evdev queue,
+    // is a guess that silently picks the wrong pid.
+    out(b"=== TRAPPED === pid="); out_int(getpid());
+    out(b" grab held, K_RAW, KD_GRAPHICS; no chord can reach me\n");
+    sleep_ms(ms);
+    // Reached only if the rescue never came. Say so, and put the machine back
+    // by hand so a failed run does not need a reboot.
+    out(b"=== TRAP EXPIRED === the rescue did NOT arrive within the hold\n");
+    ungrab(fd);
+    close(fd);
+    ioctl(tty0, KDSKBMODE, K_XLATE as *mut c_void);
+    set_mode(tty0, KD_TEXT);
+    0
+}
+
+/// Report what a rescue is supposed to have restored: the active VT, the
+/// console mode, the keyboard mode, and whether the keyboard can be grabbed
+/// (i.e. nobody is still holding it).
+unsafe fn cmd_state(tty0: c_int) -> c_int {
+    let fd = kbd();
+    let can_grab = fd >= 0 && grab(fd) == 0;
+    if can_grab { ungrab(fd); }
+    if fd >= 0 { close(fd); }
+    out(b"vttest state: vt="); out_int(active_vt(tty0));
+    out(b" kdmode="); out_int(get_mode(tty0));
+    out(b" kbmode="); out_int(kb_mode(tty0));
+    out(b" grabbable="); out_int(can_grab as c_int);
+    out(b"\n");
+    0
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 unsafe fn arg_eq(argv: *mut *mut u8, i: isize, s: &[u8]) -> bool {
@@ -815,8 +998,13 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
             cmd_kbmode(tty0, argc > 2 && arg_eq(argv, 2, b"raw"))
         } else if arg_eq(argv, 1, b"gfx") {
             cmd_gfx(tty0, if argc > 2 { arg_num(argv, 2) as i64 } else { 3000 })
+        } else if arg_eq(argv, 1, b"trap") {
+            cmd_trap(tty0, if argc > 2 { arg_num(argv, 2) as i64 } else { 30000 })
+        } else if arg_eq(argv, 1, b"state") {
+            cmd_state(tty0)
         } else {
-            out(b"usage: vttest [hold <vt> <ms> | kbmode raw|xlate | gfx <ms>]\n");
+            out(b"usage: vttest [hold <vt> <ms> | kbmode raw|xlate | gfx <ms> \
+                  | trap <ms> | state]\n");
             2
         };
         close(tty0);
@@ -825,7 +1013,7 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 17usize;
+    let total = 21usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -844,6 +1032,10 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
     if t_master_gates_present() { passed += 1; }
     if t_master_follows_vt(tty0) { passed += 1; }
     if t_setmaster_background(tty0) { passed += 1; }
+    if t_grab_roundtrip() { passed += 1; }
+    if t_grab_is_exclusive() { passed += 1; }
+    if t_grab_dies_on_vt_switch(tty0) { passed += 1; }
+    if t_grab_dies_on_close() { passed += 1; }
 
     // Whatever happened, leave the machine usable: VT 1, text mode, K_XLATE.
     // A suite that fails halfway through a KD_GRAPHICS subtest and stops there
