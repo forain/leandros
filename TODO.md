@@ -2362,7 +2362,8 @@ why they are recorded even though each fix is small.
    output produced *after* that command was sent; the `start_len` guard is what stops it
    matching a prompt already in the transcript. `step_timeout` remains a cap for commands that
    never return a prompt, which is what `evsplit` is as a held final command.
-   **Chord injection RAN against live QEMU 2026-08-10 and worked first try** — four `driver.py chord ctrl alt f{1,2}` injections across two COSMIC sessions, four VT switches, no misses and no stuck modifiers (the desktop kept taking input after every return). That is the measurement piece 1 existed for. `cmd_session`'s fix is still syntax-checked only.
+   **Chord injection RAN against live QEMU 2026-08-10 and worked first try** — four `driver.py chord ctrl alt f{1,2}` injections across two COSMIC sessions, four VT switches, no misses and no stuck modifiers (the desktop kept taking input after every return). That is the measurement piece 1 existed for. *(Independently reproduced on the Mac the same day: `chord ctrl alt f2` then `ctrl alt f1` on aarch64/HVF moved whole-screen mean luma **123 → 0.0 → 52.2** — desktop, blank VT, desktop repainting. The 52.2 rather than 123 is item 14's unfinished master handoff showing through, not a chord defect. `driver.py qmp query-status` also answers correctly.)*
+   ~~`cmd_session`'s fix is still syntax-checked only.~~ **`cmd_session` is now exercised too**: every `artifacts/m21_cpr.py` run drives the guest through it with a held final command (`brush /bin/m20-term …`) for 20-70 minutes, six runs across both arches, and it neither returned early on the embedded `PTYSH> ` prompts that ptytest prints nor capped a run short.
 3. **"`--venus` cannot photograph a session at all" — STALE, and it was already solved when
    this was written.** The `screendump`/QMP half is still true and still worth knowing:
    `virgl_cmd_set_scanout()` leaves `console->scanout.kind = SCANOUT_TEXTURE` and
