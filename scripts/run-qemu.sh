@@ -316,6 +316,25 @@ for IDX in 0 1; do
     fi
 done
 
+# ── QMP socket (TODO.md item 18 gap 1) ──────────────────────────────────────
+# HMP (this script's `-serial mon:stdio`) can't hold a chord — `sendkey`
+# presses and releases a scancode in one shot, so Ctrl+Alt+Fn (the VT-switch
+# combo) has no HMP equivalent — and HMP `mouse_move` is relative while our
+# virtio-tablet is absolute-only, so it's silently dropped. A permanent QMP
+# endpoint (mirroring driver.py's) fixes both. Unique per run (arch + this
+# shell's pid) so two QEMUs never collide on one socket. Skip adding our own
+# if the caller already passed one via extra args (e.g. `-d -qmp ...`).
+QMP_ARGS=()
+case " ${QEMU_EXTRA_ARGS[*]} " in
+    *" -qmp "*) ;;  # caller already set one — don't add a second
+    *)
+        QMP_SOCK="/tmp/leandros-qmp-${ARCH}-$$.sock"
+        rm -f "$QMP_SOCK"
+        QMP_ARGS=(-qmp "unix:${QMP_SOCK},server=on,wait=off")
+        echo "🔌 QMP: unix:${QMP_SOCK}"
+        ;;
+esac
+
 echo "🚀 Starting LeandrOS ($ARCH) in $BOOT_MODE mode"
 echo "=========================================="
 if [ "$BOOT_MODE" = "uefi" ]; then
@@ -347,6 +366,7 @@ if [ "$BOOT_MODE" = "raspi4b" ]; then
         -serial mon:stdio \
         -parallel none \
         -no-reboot \
+        "${QMP_ARGS[@]}" \
         "${QEMU_EXTRA_ARGS[@]}"
 elif [ "$BOOT_MODE" = "uefi" ]; then
     UEFI_FIRMWARE=""
@@ -392,7 +412,8 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
-            -device virtio-net-pci,netdev=net0,disable-legacy=on "${NETDEV_ARGS[@]}" -no-reboot)
+            -device virtio-net-pci,netdev=net0,disable-legacy=on "${NETDEV_ARGS[@]}" -no-reboot \
+            "${QMP_ARGS[@]}")
     else
         # A split firmware (OVMF_CODE*) is read-only and needs its writable VARS
         # half as a second pflash unit; a combined image (OVMF.fd) does not.
@@ -417,7 +438,8 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
-            -device virtio-net-pci,netdev=net0 "${NETDEV_ARGS[@]}" -no-reboot)
+            -device virtio-net-pci,netdev=net0 "${NETDEV_ARGS[@]}" -no-reboot \
+            "${QMP_ARGS[@]}")
 
     fi
     # The vmnet backend selected above is `-netdev socket,fd=3`, and that fd only
@@ -460,6 +482,7 @@ else
             -serial mon:stdio \
             -parallel none \
             -no-reboot \
+            "${QMP_ARGS[@]}" \
             "${QEMU_EXTRA_ARGS[@]}"
     else
         # Use 32-bit ELF for x86_64 (PVH/Multiboot)
@@ -494,6 +517,7 @@ else
             -net none \
             -serial mon:stdio \
             -no-reboot \
+            "${QMP_ARGS[@]}" \
             "${QEMU_EXTRA_ARGS[@]}"
     fi
 fi

@@ -8,6 +8,25 @@ Usage:
   driver.py stop                      Quit QEMU cleanly
   driver.py status                    Check if QEMU is running
   driver.py log                       Dump accumulated serial log
+  driver.py session <step_s> <cmd>... Pump one command per step_s seconds over
+                                       one held serial connection (see
+                                       cmd_session's docstring for the timing
+                                       hazard this fixed re: `evsplit`/`vttest`)
+  driver.py chord <qcode> [<qcode>...] Hold a key chord via QMP, e.g.
+                                       `driver.py chord ctrl alt f2` for the
+                                       VT-switch combo (see below — HMP
+                                       `sendkey` cannot hold a chord at all).
+  driver.py qmp <command> [json-args] Send one raw QMP command and print its
+                                       JSON reply, e.g.
+                                       `driver.py qmp query-status`
+
+A permanent QMP socket is set up by every `start` (unless
+LEANDROS_QEMU_EXTRA already supplies its own `-qmp`), unique per run
+(arch+pid) so concurrent QEMUs don't collide. It backs `chord`/`qmp` above and
+is required for correct pointer injection too: HMP `mouse_move` is RELATIVE
+and our virtio-tablet is absolute-only, so HMP silently drops every injected
+move — use QMP `input-send-event` with abs axes instead (see
+qmp_pointer_abs()).
 
 `mode` (aarch64 only, default "uefi"): on an Apple Silicon host, "uefi" now
 boots with HVF acceleration automatically (fixed 2026-07-15). Pass "uefi-tcg"
@@ -43,6 +62,8 @@ and a 2D listener is what turns that into pixels a client can fetch.
 All paths relative to the repo root (three levels up from this file).
 """
 
+import json
+import shlex
 import socket
 import subprocess
 import sys
@@ -58,6 +79,15 @@ MONITOR_SOCK = "/tmp/leandros-monitor.sock"
 PID_FILE     = "/tmp/leandros-qemu.pid"
 SERIAL_LOG   = "/tmp/leandros-serial.log"
 QEMU_STDERR_LOG = "/tmp/leandros-qemu-stderr.log"
+# Not a socket itself — the resolved path of THIS run's QMP unix socket,
+# written by _prepare_qmp() at `start` time (or parsed out of a
+# caller-supplied LEANDROS_QEMU_EXTRA that already set -qmp) so later
+# `driver.py` invocations (cmd/screenshot/chord/qmp/...) can find it. See
+# TODO.md item 18 gap 1: driver.py had no QMP socket at all, so HMP
+# `mouse_move` (relative; our virtio-tablet is absolute-only) and HMP
+# `sendkey` (cannot hold a chord) were the only injection paths — meaning
+# Ctrl+Alt+Fn could not be injected at all.
+QMP_SOCK_FILE = "/tmp/leandros-qmp-sockpath"
 
 REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../..")
@@ -256,10 +286,60 @@ def _cleanup_socks():
             os.unlink(p)
         except OSError:
             pass
+    qmp_sock = _qmp_sock_path()
+    if qmp_sock:
+        try:
+            os.unlink(qmp_sock)
+        except OSError:
+            pass
+    try:
+        os.unlink(QMP_SOCK_FILE)
+    except OSError:
+        pass
 
 
 def _is_apple_silicon():
     return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def _prepare_qmp(arch, extra_tokens):
+    """Return the extra QEMU args (a list, possibly empty) needed to give
+    this run a QMP socket, and record its path in QMP_SOCK_FILE for later
+    `driver.py` invocations (cmd/screenshot/chord/qmp) to find.
+
+    Unique per run: derived from `arch` + this process's pid, so two QEMUs
+    (e.g. aarch64 and x86_64 launched back to back) never collide on one
+    socket file.
+
+    If `extra_tokens` (from LEANDROS_QEMU_EXTRA) already sets -qmp — the ad
+    hoc way this was obtained before this fix — don't add a second one;
+    instead point QMP_SOCK_FILE at THAT socket (parsed out of its unix:...
+    value) so the helpers below still work against whatever the caller set
+    up. A non-unix backend (tcp:, etc.) is left unresolved: this driver's QMP
+    helpers only speak unix sockets, so leave QMP_SOCK_FILE absent rather
+    than pointing at something they can't connect to.
+    """
+    if "-qmp" in extra_tokens:
+        idx = extra_tokens.index("-qmp")
+        value = extra_tokens[idx + 1] if idx + 1 < len(extra_tokens) else ""
+        m = re.match(r"unix:([^,]+)", value)
+        try:
+            if m:
+                with open(QMP_SOCK_FILE, "w") as f:
+                    f.write(m.group(1))
+            else:
+                os.unlink(QMP_SOCK_FILE)
+        except OSError:
+            pass
+        return []
+    qmp_sock = f"/tmp/leandros-qmp-{arch}-{os.getpid()}.sock"
+    try:
+        os.unlink(qmp_sock)
+    except OSError:
+        pass
+    with open(QMP_SOCK_FILE, "w") as f:
+        f.write(qmp_sock)
+    return ["-qmp", f"unix:{qmp_sock},server=on,wait=off"]
 
 
 def _audiodev_args():
@@ -595,9 +675,11 @@ def cmd_start(arch="aarch64", mode="uefi", venus=False):
     # Debug escape hatch: extra QEMU args, e.g.
     #   LEANDROS_QEMU_EXTRA='-trace enable=virtio_snd_*,file=/tmp/t.log'
     extra = os.environ.get("LEANDROS_QEMU_EXTRA")
-    if extra:
-        import shlex
-        qemu_cmd += shlex.split(extra)
+    extra_tokens = shlex.split(extra) if extra else []
+    # Permanent QMP socket (TODO item 18 gap 1). Skips adding a second -qmp
+    # if extra_tokens already has one (see _prepare_qmp).
+    qemu_cmd += _prepare_qmp(arch, extra_tokens)
+    qemu_cmd += extra_tokens
     if mode in ("uefi", "uefi-hvf", "uefi-tcg"):
         vmnet = _socket_vmnet_prefix()
         if vmnet:
@@ -875,6 +957,152 @@ def _monitor_send(command, timeout=10):
     return "\n".join(lines)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# QMP (TODO.md item 18 gap 1). Unlike the line-oriented HMP monitor above,
+# QMP speaks one JSON object per line and requires a greeting +
+# qmp_capabilities handshake before any real command. This is what makes
+# pointer injection correct (input-send-event with ABSOLUTE axes — HMP
+# `mouse_move` is relative and our virtio-tablet is absolute-only, so it is
+# silently dropped) and chord injection possible at all (HMP `sendkey`
+# releases the key it just sent; it cannot hold multiple keys down at once,
+# so Ctrl+Alt+Fn — the VT-switch combo — has no HMP equivalent).
+# ────────────────────────────────────────────────────────────────────────────
+
+def _qmp_sock_path():
+    """This run's QMP socket path, written by _prepare_qmp() at `start` time
+    (or parsed out of a caller-supplied LEANDROS_QEMU_EXTRA that already set
+    -qmp). None if no run has ever set one up."""
+    try:
+        with open(QMP_SOCK_FILE) as f:
+            path = f.read().strip()
+            return path or None
+    except FileNotFoundError:
+        return None
+
+
+class _QMPSession:
+    """A connected-but-not-yet-handshaken QMP socket, plus the bytes read
+    past the most recently parsed JSON object (asynchronous events can land
+    between a command and its response, or between commands)."""
+    def __init__(self, sock):
+        self.sock = sock
+        self.buf = b""
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def _qmp_recv(session, timeout):
+    """Read one complete QMP JSON object (QMP is line-delimited: one object
+    per line). Returns the parsed dict, or None on timeout/EOF/bad JSON."""
+    deadline = time.time() + timeout
+    while True:
+        while b"\n" not in session.buf:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            if select.select([session.sock], [], [], min(0.2, remaining))[0]:
+                chunk = session.sock.recv(4096)
+                if not chunk:
+                    return None
+                session.buf += chunk
+        line, _, session.buf = session.buf.partition(b"\n")
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+
+def _qmp_command(session, execute, arguments=None, timeout=10):
+    """Send one QMP command on an already-handshaken session, skip past any
+    asynchronous events (e.g. RESUME), and return the 'return'/'error'
+    payload dict (or None on timeout)."""
+    payload = {"execute": execute}
+    if arguments is not None:
+        payload["arguments"] = arguments
+    session.sock.setblocking(True)
+    session.sock.sendall(json.dumps(payload).encode() + b"\n")
+    session.sock.setblocking(False)
+    while True:
+        msg = _qmp_recv(session, timeout)
+        if msg is None or "event" not in msg:
+            return msg
+
+
+def _qmp_open(timeout=10):
+    """Connect to this run's QMP socket and complete the greeting +
+    qmp_capabilities handshake. Caller must .close() the returned session."""
+    sock_path = _qmp_sock_path()
+    if not sock_path:
+        sys.exit("ERROR: no QMP socket for this run (start QEMU first, or set "
+                  "LEANDROS_QEMU_EXTRA with a unix:-backed -qmp)")
+    s = _connect_with_retry(sock_path)
+    if s is None:
+        sys.exit(f"ERROR: cannot connect to QMP socket {sock_path}")
+    s.setblocking(False)
+    session = _QMPSession(s)
+    greeting = _qmp_recv(session, timeout)
+    if greeting is None or "QMP" not in greeting:
+        session.close()
+        sys.exit(f"ERROR: no QMP greeting from {sock_path} (got {greeting!r})")
+    resp = _qmp_command(session, "qmp_capabilities", timeout=timeout)
+    if resp is None or "return" not in resp:
+        session.close()
+        sys.exit(f"ERROR: qmp_capabilities failed: {resp!r}")
+    return session
+
+
+def qmp_inject_chord(qcodes, hold_s=0.15, timeout=10):
+    """Hold a key combination via QMP input-send-event: key-down for every
+    code in `qcodes` in order, a brief hold, then key-up in reverse order —
+    e.g. qcodes=["ctrl","alt","f2"] sends Ctrl down, Alt down, F2 down, [held
+    hold_s], F2 up, Alt up, Ctrl up. This is the ONLY way to hold multiple
+    keys at once: HMP `sendkey` sends one scancode and releases it
+    immediately, so Ctrl+Alt+Fn (the VT-switch chord) cannot be injected
+    through it at all. `qcodes` are QEMU qcode names (see qapi/ui.json)."""
+    session = _qmp_open(timeout=timeout)
+    try:
+        down = [{"type": "key", "data": {"down": True,
+                                          "key": {"type": "qcode", "data": q}}}
+                for q in qcodes]
+        resp = _qmp_command(session, "input-send-event", {"events": down}, timeout=timeout)
+        if resp is None or "return" not in resp:
+            sys.exit(f"ERROR: QMP key-down failed: {resp!r}")
+        time.sleep(hold_s)
+        up = [{"type": "key", "data": {"down": False,
+                                        "key": {"type": "qcode", "data": q}}}
+              for q in reversed(qcodes)]
+        resp = _qmp_command(session, "input-send-event", {"events": up}, timeout=timeout)
+        if resp is None or "return" not in resp:
+            sys.exit(f"ERROR: QMP key-up failed: {resp!r}")
+    finally:
+        session.close()
+
+
+def qmp_pointer_abs(x, y, timeout=10):
+    """Move the absolute pointer via QMP input-send-event. Landmine (TODO
+    item 16/18): HMP `mouse_move` is RELATIVE and our virtio-tablet is
+    absolute-only, so HMP silently drops every injected move — this is the
+    only correct path. x/y are QEMU's abs axis range, 0..32767."""
+    session = _qmp_open(timeout=timeout)
+    try:
+        events = [
+            {"type": "abs", "data": {"axis": "x", "value": x}},
+            {"type": "abs", "data": {"axis": "y", "value": y}},
+        ]
+        resp = _qmp_command(session, "input-send-event", {"events": events}, timeout=timeout)
+        if resp is None or "return" not in resp:
+            sys.exit(f"ERROR: QMP pointer move failed: {resp!r}")
+    finally:
+        session.close()
+
+
 def cmd_screenshot(outfile=None):
     if _qemu_pid() is None:
         sys.exit("ERROR: QEMU not running.")
@@ -938,7 +1166,20 @@ def cmd_session(cmds, step_timeout=6):
     answering terminal probes (cursor-position ESC[6n) like a real terminal
     the whole time. Needed for full-screen/line-editor programs (brush,
     reedline/crossterm) that bail out when the CPR query goes unanswered.
-    Prints the full raw transcript."""
+    Prints the full raw transcript.
+
+    TODO.md item 18 gap 2: `pump()` used to burn the FULL step_timeout for
+    EVERY command regardless of how fast it finished, so `session 45 "pwd"
+    "evsplit 60"` sent "evsplit 60" ~45s into the session while an injector
+    timed to fire at +4s had already come and gone — a silent `STARVED`
+    result indistinguishable from a genuinely broken pointer/chord path.
+    Fixed at the root rather than by detecting the hazard: `pump()` now
+    returns as soon as the shell is back at its prompt (mirroring
+    `_serial_send`'s `_at_prompt` check), so a fast command like "pwd" no
+    longer delays the next command's send time. `step_timeout` remains the
+    CAP for commands that don't return a prompt within it (a genuinely
+    long-running one, or the last command in the session, e.g. `evsplit 60`
+    itself, which is expected to still be running when the transcript ends)."""
     s = _connect_with_retry(SERIAL_SOCK)
     if s is None:
         sys.exit("ERROR: cannot connect to serial socket")
@@ -946,9 +1187,13 @@ def cmd_session(cmds, step_timeout=6):
     transcript = b""
     answered = 0  # CPR probes already replied to
 
-    def pump(duration):
+    def pump(duration, stop_at_prompt=False):
         nonlocal transcript, answered
         end = time.time() + duration
+        start_len = len(transcript)  # only match a prompt in THIS command's
+        # own new output, never a stale prompt already sitting in the
+        # transcript from a previous command (that would return instantly,
+        # before the new command even executes)
         while time.time() < end:
             if select.select([s], [], [], 0.1)[0]:
                 try:
@@ -981,6 +1226,8 @@ def cmd_session(cmds, step_timeout=6):
                     except Exception:
                         pass
                     answered = total
+                if stop_at_prompt and _at_prompt(transcript[start_len:]):
+                    return
 
     pump(0.3)  # drain stale output, answer any pending probe
     for c in cmds:
@@ -990,7 +1237,7 @@ def cmd_session(cmds, step_timeout=6):
             s.sendall(payload[i:i + 8])
             time.sleep(0.02)
         s.setblocking(False)
-        pump(step_timeout)
+        pump(step_timeout, stop_at_prompt=True)
     s.close()
     sys.stdout.write(transcript.decode("utf-8", errors="replace"))
 
@@ -1041,6 +1288,23 @@ if __name__ == "__main__":
         if len(args) < 3:
             sys.exit("Usage: driver.py session <step_timeout_s> <cmd> [<cmd> ...]")
         cmd_session(args[2:], step_timeout=int(args[1]))
+    elif sub == "chord":
+        # driver.py chord <qcode> [<qcode> ...], e.g. `chord ctrl alt f2`
+        if len(args) < 2:
+            sys.exit("Usage: driver.py chord <qcode> [<qcode> ...]  (e.g. chord ctrl alt f2)")
+        qmp_inject_chord(args[1:])
+        print(f"Injected chord: {'+'.join(args[1:])}")
+    elif sub == "qmp":
+        # driver.py qmp <command> [json-arguments], e.g. `qmp query-status`
+        if len(args) < 2:
+            sys.exit("Usage: driver.py qmp <command> [json-arguments]")
+        qmp_arguments = json.loads(args[2]) if len(args) > 2 else None
+        qmp_session = _qmp_open()
+        try:
+            qmp_resp = _qmp_command(qmp_session, args[1], qmp_arguments)
+        finally:
+            qmp_session.close()
+        print(json.dumps(qmp_resp))
     else:
         print(f"Unknown subcommand: {sub}")
         print(__doc__)
