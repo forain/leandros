@@ -258,6 +258,71 @@ def session_data(name):
     return repo if os.path.exists(repo) else tree
 
 
+def verify_dbus_staging(arch):
+    """Refuse to build an image whose staged D-Bus payload is older than its source.
+
+    The m5-session-ship tree is hand-synced and gitignored, and mkfs packs
+    whatever it finds there. That is how commit 84ec91a (busd .service
+    activation) came to be committed, host-tested and absent from every image:
+    the staged busd was byte-identical to the pre-activation build and the
+    staged session.conf had no <servicedir>, while the repo had both. Nothing
+    said so. A boot test asking "does the desktop come up" answered yes, twice.
+
+    ports/busd/build.sh now writes all three staged files from tracked sources
+    every run. This is the backstop for the case that script was not run:
+    the two verbatim files are compared byte-for-byte against ports/, and busd
+    -- which cannot be rebuilt from here (it needs cargo +nightly and the musl
+    CRT) -- is compared by mtime against the patch set that defines it. Adding
+    a patch and forgetting to rebuild is exactly the failure this catches.
+
+    Loud, not silent: this raises SystemExit rather than warning, because a
+    warning in a build that then prints a green image is the thing that failed.
+    """
+    ship = os.path.expanduser(f"~/code/leandros-artifacts/m5-session-ship/{arch}")
+    if not os.path.isdir(ship):
+        return                      # no D-Bus payload staged at all; nothing to check
+    repo = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), ".."))
+    pkg = os.path.join(repo, "ports", "dbus", "session-pkg")
+
+    problems = []
+    for staged_rel, tracked in (
+        ("usr/bin/dbus-run-session",          os.path.join(pkg, "dbus-run-session")),
+        ("usr/share/dbus-1/session.conf",     os.path.join(pkg, "session.conf")),
+    ):
+        staged = os.path.join(ship, staged_rel)
+        if not os.path.exists(staged):
+            problems.append(f"  MISSING  {staged}")
+            continue
+        if not os.path.exists(tracked):
+            continue                # tracked source gone; not this check's business
+        with open(staged, "rb") as a, open(tracked, "rb") as b:
+            if a.read() != b.read():
+                problems.append(f"  STALE    {staged_rel}\n"
+                                f"           differs from {tracked}")
+
+    busd = os.path.join(ship, "usr", "libexec", "busd")
+    patches = [os.path.join(repo, "ports", "busd", f)
+               for f in os.listdir(os.path.join(repo, "ports", "busd"))
+               if f.endswith(".patch")]
+    if not os.path.exists(busd):
+        problems.append(f"  MISSING  {busd}")
+    elif patches:
+        newest = max(patches, key=os.path.getmtime)
+        if os.path.getmtime(newest) > os.path.getmtime(busd):
+            problems.append(
+                f"  STALE    usr/libexec/busd ({arch})\n"
+                f"           {os.path.relpath(newest, repo)} is newer than the staged binary,\n"
+                f"           so the staged busd was built without it.")
+
+    if problems:
+        sys.stderr.write(
+            "\nD-Bus session payload is stale — refusing to build a misleading image.\n"
+            + "\n".join(problems)
+            + f"\n\n  Fix:  ./ports/busd/build.sh {arch}\n\n")
+        raise SystemExit(1)
+
+
 def main():
     if len(sys.argv) < 3:
         print("Usage: mkfs-f2fs-populated.py <output_img> <arch>")
@@ -276,7 +341,7 @@ def main():
         "pthreadtest", "timertest", "sigtest", "polltest", "ptytest", "forktest", "racetest",
         "waittest", "sigchldtest", "scmtest", "epolltest", "wakepolltest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
-        "meminfo",
+        "meminfo", "dbusprobe",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -724,6 +789,7 @@ def main():
     # target-dir inode after the /usr tree registration below). session.conf
     # and the fonts are plain data (0644) and ride the shared /usr tree walk
     # (m4_share_files/m4_share_dirs, generalized here beyond /usr/share).
+    verify_dbus_staging(arch)
     m5_arch_root = os.path.expanduser(f"~/code/leandros-artifacts/m5-session-ship/{arch}")
     m5_fonts_src = os.path.expanduser("~/code/leandros-artifacts/m5-session-ship/share/fonts")
     cosmic_comp  = os.path.expanduser(f"~/code/leandros-artifacts/m3-gl-stack/out/cosmic-comp-{arch}")

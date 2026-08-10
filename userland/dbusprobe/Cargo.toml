@@ -1,0 +1,11 @@
+[package]
+name = "dbusprobe"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dbusprobe"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

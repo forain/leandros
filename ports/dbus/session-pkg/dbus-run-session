@@ -17,15 +17,36 @@
 #   4. Run COMMAND as a child, wait for it to finish.
 #   5. Kill busd, clean up, and exit with COMMAND's exit status.
 #
-# Portability: this is plain POSIX sh on purpose — no arrays, no `[[`,
-# no `local`, no coproc, no process substitution, no here-strings. It
-# must run correctly both under brush (LeandrOS's shell) and under a
-# minimal /bin/sh (verified in this package against busybox ash in an
-# Alpine container), since the two are not guaranteed to share every
-# non-POSIX extension.
+# ============================================================================
+# WHY THIS DIFFERS FROM THE ORIGINAL (root cause of the M5 silent exit-1):
+#
+# The original captured busd's PID with `BUSD_PID=$!` on the line right
+# after `busd ... &`, then used `kill -0 "$BUSD_PID"` as an in-loop liveness
+# check.  Under brush (LeandrOS's shell) `$!` read *synchronously* right
+# after `&` returns the EMPTY STRING.
+#
+# Reason: brush runs a backgrounded external command inside a Tokio task on
+# a worker thread and only learns the child's real PID once that task has
+# been polled far enough to spawn+exec the process (it publishes the PID
+# into a shared "async pid slot" — brush-core/src/interp.rs:298-317 and
+# :541-550, read by `$!` via brush-core/src/expansion.rs:1912-1918 ->
+# jobs.rs representative_pid()).  The foreground shell does not yield to that
+# task before executing the very next statement, so `$!` is still unset.
+# Result on-target:
+#     BUSD_PID=""  ->  `kill -0 ""` fails on the first poll iteration  ->
+#     "busd exited before signaling readiness"  ->  exit 1, child never runs.
+# (Reproduced 1:1 on the host brush binary; /bin/sh populates $! and works.)
+#
+# FIX: do not depend on `$!`.  Launch busd through a tiny `sh -c` wrapper
+# that records busd's REAL pid ($$ survives `exec`) into a pidfile BEFORE
+# exec'ing busd.  The parent reads that pidfile with the `read` builtin
+# (no external process, works inside the busy-poll loop).  This is
+# deterministic regardless of Tokio scheduling and keeps the fast-fail on
+# busd-death behavior the original wanted.
+# ============================================================================
 #
 # --- Why this doesn't use the "classic" `--ready-fd 3 3>fifo` + blocking
-# --- `read` trick (important if you're tempted to simplify this):
+# --- `read` trick (unchanged rationale from the original):
 #
 # On a normal Linux system you'd do:
 #     mkfifo ready.fifo
@@ -39,24 +60,18 @@
 #     fabricates a dirent that *looks* like a FIFO to stat()/getdents64
 #     (S_IFIFO/DT_FIFO) — VFS_OPEN on it still behaves like a plain tmpfs
 #     file with NO blocking open()/read() rendezvous between reader and
-#     writer (see servers/vfs/src/lib.rs handle_mknod's scope note in the
-#     leandros tree). The reader would just get an immediate EOF instead
-#     of blocking, i.e. exactly the race this trick exists to avoid.
+#     writer. The reader would just get an immediate EOF instead of
+#     blocking, i.e. exactly the race this trick exists to avoid.
 #
 # There is also no `sleep` binary and no shell `sleep`/coproc builtin on
-# LeandrOS (checked brush's builtin table: only `read -t` exists, and
-# it's unusable here — a bounded wait needs a primitive that doesn't
-# depend on stdin/tty state, but this script itself may be invoked with
-# stdin already redirected from a file/pipe with nothing to read, e.g.
-# when start-cosmic calls it non-interactively).
+# LeandrOS, so we busy-poll the readiness file's size with `test -s`,
+# bounded by an iteration count rather than wall-clock time.
 #
-# Fix used below: --ready-fd still writes into a REAL regular tmpfs file
-# (not a FIFO) via plain numbered-fd redirection (`3>"$READY_FILE"`,
-# which is plain POSIX sh, not a bashism). Regular-file writes don't need
-# blocking rendezvous to be observed correctly, so we busy-poll the
-# file's size with `test -s`, bounded by an iteration count rather than
-# wall-clock time. This is CPU-noisy for the sub-second startup window
-# but correct everywhere plain POSIX sh runs, including on LeandrOS.
+# NOTE (numbered-fd redirection IS supported by brush — verified): the
+# `3>"$READY_FILE"` form and env-prefix assignments on a backgrounded
+# external command both work correctly under brush
+# (brush-core/src/interp.rs:1742-1753). The ONLY brush-specific pitfall was
+# the synchronous `$!` read described above.
 
 set -u
 
@@ -65,10 +80,8 @@ SESSION_CONF=${SESSION_CONF:-/usr/share/dbus-1/session.conf}
 RUN_DIR=${XDG_RUNTIME_DIR:-/run/user/0}
 BUS_SOCKET="$RUN_DIR/bus"
 READY_FILE="$RUN_DIR/busd-ready.$$"
+PID_FILE="$RUN_DIR/busd-pid.$$"
 # Bound on busy-poll iterations while waiting for busd's readiness write.
-# busd's startup is just "parse a tiny config file + bind one socket", so
-# this is expected to resolve in well under a second; the bound only
-# exists to fail fast (instead of hanging forever) if busd wedges.
 MAX_POLL_ITERS=${DBUS_RUN_SESSION_MAX_POLL_ITERS:-20000000}
 
 usage() {
@@ -88,18 +101,43 @@ if [ ! -x "$BUSD_BIN" ]; then
 fi
 
 # A leftover socket/ready-file from a previous crashed run makes busd's
-# bind() fail with "address in use" (busd's own cleanup() only removes
-# the socket file on a clean shutdown), so always start from a clean slate.
-rm -f "$BUS_SOCKET" "$READY_FILE"
+# bind() fail with "address in use", so always start from a clean slate.
+rm -f "$BUS_SOCKET" "$READY_FILE" "$PID_FILE"
 
-"$BUSD_BIN" --config "$SESSION_CONF" --address "unix:path=$BUS_SOCKET" \
-    --ready-fd 3 3>"$READY_FILE" &
-BUSD_PID=$!
+# Launch busd through a wrapper that records busd's real PID into PID_FILE.
+# `$$` inside the wrapper is the sh process's pid; `exec` replaces that
+# process image with busd WITHOUT changing the pid, so the value written is
+# busd's actual pid. fd 3 (the readiness pipe target) is set on the wrapper
+# by `3>"$READY_FILE"` and is inherited across exec, so busd's
+# `--ready-fd 3` writes land in READY_FILE. Env-prefix assignments pass the
+# parameters into the wrapper's environment (POSIX; honored by brush).
+# DBUS_SESSION_BUS_ADDRESS / DBUS_STARTER_ADDRESS are set HERE, on busd
+# itself, not only on COMMAND further down. busd spawns an activated
+# .service through a plain std::process::Command and injects nothing into it
+# beyond UpdateActivationEnvironment entries, so an activated service
+# inherits BUSD's environment and nothing else. Exporting the address only
+# for COMMAND (as this script did) leaves every activated service with no
+# way to find the bus that started it; it then falls back to a compiled-in
+# default, which happens to be right for a root session
+# (/run/user/0/bus) and wrong for every other uid. Measured against real
+# busd: an activated child that guessed wrong never claimed its name and
+# StartServiceByName burned the full 5 s ACTIVATION_TIMEOUT.
+BUSD_BIN="$BUSD_BIN" \
+SESSION_CONF="$SESSION_CONF" \
+BUS_ADDR="unix:path=$BUS_SOCKET" \
+DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS_SOCKET" \
+DBUS_STARTER_ADDRESS="unix:path=$BUS_SOCKET" \
+PID_FILE="$PID_FILE" \
+    /bin/sh -c 'echo $$ > "$PID_FILE"; exec "$BUSD_BIN" --config "$SESSION_CONF" --address "$BUS_ADDR" --ready-fd 3' \
+    3>"$READY_FILE" &
+
+# We deliberately do NOT use `$!` here (empty under brush; see header).
+BUSD_PID=""
 
 cleanup() {
-    kill "$BUSD_PID" 2>/dev/null
-    wait "$BUSD_PID" 2>/dev/null
-    rm -f "$BUS_SOCKET" "$READY_FILE"
+    [ -n "$BUSD_PID" ] && kill "$BUSD_PID" 2>/dev/null
+    [ -n "$BUSD_PID" ] && wait "$BUSD_PID" 2>/dev/null
+    rm -f "$BUS_SOCKET" "$READY_FILE" "$PID_FILE"
 }
 trap cleanup EXIT INT TERM
 
@@ -108,7 +146,13 @@ while [ "$i" -lt "$MAX_POLL_ITERS" ]; do
     if [ -s "$READY_FILE" ]; then
         break
     fi
-    if ! kill -0 "$BUSD_PID" 2>/dev/null; then
+    # Pick up busd's real pid as soon as the wrapper has written it. `read`
+    # is a builtin, so this adds no external process to the hot loop.
+    if [ -z "$BUSD_PID" ] && [ -s "$PID_FILE" ]; then
+        read BUSD_PID < "$PID_FILE" || BUSD_PID=""
+    fi
+    # Once we know the real pid, fast-fail if busd died before readiness.
+    if [ -n "$BUSD_PID" ] && ! kill -0 "$BUSD_PID" 2>/dev/null; then
         echo "dbus-run-session: busd exited before signaling readiness" >&2
         exit 1
     fi
@@ -118,6 +162,11 @@ done
 if [ ! -s "$READY_FILE" ]; then
     echo "dbus-run-session: timed out waiting for busd readiness" >&2
     exit 1
+fi
+
+# Ensure we have busd's pid for cleanup even if readiness beat the pid read.
+if [ -z "$BUSD_PID" ] && [ -s "$PID_FILE" ]; then
+    read BUSD_PID < "$PID_FILE" || BUSD_PID=""
 fi
 
 DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS_SOCKET"

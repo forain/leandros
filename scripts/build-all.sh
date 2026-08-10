@@ -360,6 +360,37 @@ build_input_stack_shims() {
     ./ports/input-stack/build-shims.sh
 }
 
+
+# Function to build + stage the D-Bus session package (busd, dbus-run-session,
+# session.conf).
+#
+# Same job as build_input_stack_shims above and for the same reason: the image
+# is packed from ~/code/leandros-artifacts/m5-session-ship/<arch>/, which is
+# hand-synced and gitignored, so anything not regenerated from tracked source
+# every build drifts away from the repo without saying so. It did — commit
+# 84ec91a's .service activation sat in the repo and in no image for two days,
+# and a boot test that only asked "does the desktop come up" called it green.
+#
+# A failure here is a warning, not a build stop: this needs cargo +nightly and
+# the musl targets, which not every machine has, and there is a hard gate
+# downstream — mkfs-f2fs-populated.py's verify_dbus_staging() refuses to build
+# an image whose staged payload is older than its source. Warn here, refuse
+# there; never silent in either place.
+stage_dbus_session() {
+    local arch="$1"
+    echo "🚌 Building + staging D-Bus session package ($arch)..."
+    if ! ./ports/busd/build.sh "$arch"; then
+        echo ""
+        echo "⚠️  ================================================================"
+        echo "⚠️  ports/busd/build.sh FAILED for $arch."
+        echo "⚠️  The staged busd/session.conf/dbus-run-session are whatever was"
+        echo "⚠️  there before. mkfs will refuse to build the image if they are"
+        echo "⚠️  older than ports/ — fix the toolchain, do not work around it."
+        echo "⚠️  ================================================================"
+        echo ""
+    fi
+}
+
 # Function to build relibc
 build_relibc() {
     local arch="$1"
@@ -412,6 +443,7 @@ for arch in "${ARCHS[@]}"; do
     build_bottom "$arch"
     build_brush "$arch"
     build_coreutils "$arch"
+    stage_dbus_session "$arch"
     create_initrd "$arch"
     build_kernel "$arch"
     create_disk_image "$arch" "$LIMINE_DIR"

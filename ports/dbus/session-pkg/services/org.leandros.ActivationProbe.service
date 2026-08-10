@@ -1,0 +1,21 @@
+# D-Bus activation self-test for LeandrOS.
+#
+# busd scans <servicedir> ONCE at startup (Peers::load_servicedirs), not on a
+# lookup miss, so a .service file dropped into a running session is never seen.
+# Shipping this one in the image is what makes activation testable at all: it is
+# present before busd starts, on every boot, on both arches.
+#
+# It is a self-test rather than a fixture. Nothing in the COSMIC session asks
+# for this name, so it costs nothing at runtime -- no spawn happens unless
+# something deliberately messages org.leandros.ActivationProbe. That isolation
+# is deliberate: attaching the test to a name the session really wants (the
+# census in ports/busd/service-unknown-reply.patch lists six) would make every
+# boot pay busd's 5 s ACTIVATION_TIMEOUT, and would entangle a desktop
+# regression with an activation regression.
+#
+# `dbusprobe --serve` claims the name, so StartServiceByName returns success
+# instead of timing out -- the difference between proving busd spawned
+# something and proving activation actually completed.
+[D-BUS Service]
+Name=org.leandros.ActivationProbe
+Exec=/bin/dbusprobe --serve org.leandros.ActivationProbe

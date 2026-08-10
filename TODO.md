@@ -1761,7 +1761,49 @@ The build recipe already exists (`m6-session-bins/build-rust.sh`) and the panel'
 libcosmic/iced apps, so **item 7 gates whether they would render**, and the three buttons are
 also the natural triggers item 8 is missing. These three items interlock.
 
-### 10. busd activation — NOT structural; IMPLEMENTED `84ec91a`, never booted
+### 10. busd activation — IMPLEMENTED `84ec91a`, and SHIPPED + BOOTED 2026-08-10
+
+**SHIPPED AND BOOTED 2026-08-10.** Write-up:
+`artifacts/notes/item14-vt-derivation-and-item10-shipping.md`. The blocker was never the
+code: `scripts/mkfs-f2fs-populated.py` packs `m5-session-ship/<arch>/`, a hand-synced
+gitignored tree, and the trap was in `ports/busd/build.sh` — it guarded extraction *and
+patching* with `if [ ! -d "$SRC" ]`, so adding `start-service-activation.patch` left the
+already-extracted tree untouched and the next build recompiled the old sources into a
+byte-identical binary. The pre-existing `.work` tree had **zero** hits for
+`StartServiceByName`.
+
+**The tree had drifted in BOTH directions, which makes "the repo is the source of truth"
+a trap of its own.** `ports/dbus/session-pkg/dbus-run-session` is tracked, was committed
+once in `b8e8be5`, and is the *superseded* launcher: it reads `BUSD_PID=$!` right after
+`busd ... &`, which under brush is the empty string, so `kill -0 ""` fails on the first
+poll and the launcher exits 1 with "busd exited before signaling readiness". The working
+one existed **only** in the untracked tree. Copying `ports/` over the staged tree without
+diffing first would have shipped a desktop that does not start.
+
+Fixed by making `ports/busd/build.sh` own the whole staged payload and write every file
+of it from tracked sources each run (busd built; `dbus-run-session`, `session.conf`,
+`services/*.service` copied), re-extracting and re-patching every run;
+`scripts/build-all.sh` calls it (`stage_dbus_session`, beside `build_input_stack_shims`);
+and `mkfs-f2fs-populated.py` **refuses to build a stale image** (`verify_dbus_staging` —
+byte-compare the verbatim files, mtime-compare busd against `ports/busd/*.patch`). Warn
+in the build, refuse in the image. The guard was tested, not asserted: both drift shapes
+raise `SystemExit(1)`; a clean tree passes.
+
+**Boot evidence.** Session up on **both** arches, full desktop. In-guest on x86_64 via a
+new `userland/dbusprobe` (raw-wire D-Bus, Rust, `no_std`): `STARTSERVICE: result=1 55ms`
+(`DBUS_START_REPLY_SUCCESS` — spawned and saw the name claimed), then `result=2 2ms`
+(`ALREADY_RUNNING`) on a later run, `IMPLICIT: success` both times. Regression guard:
+`UNOWNED: …ServiceUnknown` in **2-3 ms**, and live during aarch64 start-up the new busd
+answered 20 unowned names across nine seconds with nothing blocking and every applet
+drawing.
+
+**Two gaps found on the way.** (a) `load_servicedirs` logs **nothing on success** at any
+level, so "busd logs scanning the servicedirs" is not observable — worth an `info!`.
+(b) busd injects nothing into an activated child's environment, so it inherits *busd's*;
+`dbus-run-session` exported `DBUS_SESSION_BUS_ADDRESS` only for COMMAND, after busd was
+launched. Right by luck for a root session, wrong for every other uid; now set on busd
+itself at the launch site.
+
 
 **"Structural" was wrong, and the word was doing real damage** — it is what made the reference
 `dbus-daemon` fallback look triggered. It is not. **busd already parses `<servicedir>` into a
@@ -2131,7 +2173,33 @@ session plus two switches).
   in that order, on the right edges**. `is_active()` demonstrably observed both — the proof
   is that cosmic-comp **closed both evdev fds on deactivate and reopened them on activate**.
   `card0` is deliberately *not* closed, which is why the auto-rearm covers the return.
-  **The one-line fix is to export `XDG_VTNR` in the session launch path.**
+- **FIXED 2026-08-10, and the fix is neither candidate.** Write-up:
+  `artifacts/notes/item14-vt-derivation-and-item10-shipping.md`. Exporting `XDG_VTNR`
+  and giving the session a `/dev/ttyN` ctty both assert an ownership that **does not
+  exist**: `console_out` writes into `SCREENS[ACTIVE]` (`servers/tty/src/vt.rs`), so the
+  one console session *follows* the foreground VT instead of living on one, and no
+  process in the chain ever opens `/dev/ttyN`. Instead `owned_vt()` gained a third tier
+  below the two that already existed — **the foreground VT at `open_seat()` time**,
+  read from the `VT_GETSTATE` `vt_probe()` was already doing. That is the same
+  derivation `959710d` uses for DRM master (a grant records `vt::active()` when it is
+  made), so the shim and the master gate now agree **by construction** rather than by
+  configuration; a disagreement would have meant a compositor that believes it is active
+  while every present is refused EACCES. It is also what seatd's `terminal.c` does when
+  nothing tells it. Both upper tiers stay, so a future greetd/logind — or a real per-VT
+  getty, which is what would make option B correct — wins outright without touching this
+  file.
+- **Verified both arches, production configuration, no `XDG_VTNR` anywhere.** Identical
+  trace shape on aarch64/TCG and x86_64/KVM: `owned_vt: 1 (foreground VT at open_seat)`,
+  `get_fd` hands back the live `/dev/tty0` fd, and a real `Ctrl+Alt+F2` → `F1` round trip
+  produces **exactly one `disable_seat` and one `enable_seat`, in that order, on the
+  correct edges**, with cosmic-comp closing both evdev fds on deactivate and reopening
+  them on activate. Desktop back intact both times (aarch64 clock 00:03:40, x86_64
+  00:14:30; `item14-fix-{aarch64,x86_64}-desktop-back.png`).
+- **The differential test is the one that matters.** With `Ctrl+Alt+F2` injected
+  *before* COSMIC started, the shim latched **`owned_vt: 2`** (`own_vtnr=2 v_active=2
+  active=1`). A hardcoded `XDG_VTNR=1` would have given `own_vtnr=1 v_active=2 active=0`
+  — the compositor would have come up **deactivated on the VT it was actually on** and
+  never presented.
 - **The input half needs re-stating.** The *kernel* still does not gate `/dev/input/*`.
   But "a backgrounded client still sees the keyboard and mouse" does not survive a working
   seat event: a libseat consumer releases the devices itself. The kernel gate is defence
