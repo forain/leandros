@@ -2168,6 +2168,19 @@ when the switch happens can still land its *pixels* after the console's repaint.
 self-healing (the console draws over it) and it no longer silences the console, but it is a
 visible flash. Closing it properly means interlocking the present itself with the switch.
 
+**⚠ One premise of this design remains ASSERTED, NOT READ: that smithay maps `EACCES` to
+`DrmError::Access` (recoverable) while `EPERM`/`ENODEV` make it tear the device down.** smithay
+is out of tree and was not opened. The errno choice rests on Linux's `drm_ioctl_permit()`
+returning `EACCES` for a `DRM_MASTER` failure, which is a good reason but not the same as
+having read the consumer. **The measurement that would settle it has not been taken, because
+cosmic-comp was never observably refused a present — its VT is the one it presents on.** The
+shape of the risk is exactly the one piece 3 warns about below: correct as a consumer, unproven
+as a producer.
+
+**A design premise was also refined by contact with the code:** "caller's VT not active →
+EACCES" is only decidable for the *holder*, because there is no fd→VT association. A non-holder
+on a background VT gets `EBUSY`, or a grant if nobody currently holds master.
+
 The evdev half of piece 2 *did* land, and the hazard this item named is gone: per-open
 queues keyed on `open_id`, broadcast on push, `SYN_DROPPED` on overflow — two readers of
 one node now both receive everything (`A=60 B=60` on 60 moves, against `A=30 B=30`
@@ -2316,7 +2329,11 @@ an **ungrab-all driven by the VT switch itself** (a grab is scoped to the VT tha
 cannot survive a switch away from it), plus a magic key as a last resort. That removes the
 unrecoverable-machine failure mode outright instead of arguing it cannot be reached — which is
 the right trade when the cost of being wrong is a machine with no way to ask it anything.
-Enforcement lives at `drivers/src/drm_device_interface.rs:667` (`0x90`/`0x91`).
+Enforcement lives at **`servers/evdev/src/lib.rs:667`** (`0x90`/`0x91`). *(Corrected: an earlier
+revision of this line said `drivers/src/drm_device_interface.rs:667`, which is
+`struct drm_virtgpu_execbuffer` — a wrong file that happened to carry a plausible line number.
+Caught by the master work, which had to go looking there to confirm it was leaving the grab
+alone. A citation with the right line and the wrong file survives a careless check.)*
 
 ### Ordering, and why
 
