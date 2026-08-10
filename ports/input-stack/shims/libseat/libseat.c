@@ -54,9 +54,12 @@
  *     libseat_dispatch() for why -- and fires enable_seat/disable_seat
  *     exactly on transitions of *this seat's* VT between foreground and
  *     not.
- *   - "this seat's VT" is not the active VT; it is the VT the compositor
- *     itself owns, which the shim has to determine independently of any
- *     notification -- see owned_vt() for how and why.
+ *   - "this seat's VT" is not "whichever VT is active"; it is a single VT
+ *     number latched once at open_seat() and never moved again, which is
+ *     what makes a comparison against the live active VT mean anything at
+ *     all -- see owned_vt() for how it is determined and why the last
+ *     resort (the VT in the foreground when the compositor started) is a
+ *     derivation rather than a default.
  *
  * Consumer import set satisfied (derived from libseat-sys 0.2.0 extern "C"
  * block + libseat.h): libseat_open_seat, _close_seat, _disable_seat,
@@ -245,7 +248,15 @@ static int owned_vt_from_env(void) {
  * /dev/tty0 itself parses as VT number 0, which the v <= 0 check below
  * rejects explicitly -- tty0 is the "active VT" alias, never a real VT, and
  * is never a process's controlling terminal in practice, but excluding it
- * on principle costs nothing. */
+ * on principle costs nothing.
+ *
+ * Measured on LeandrOS: this never gets as far as the prefix test. ttyname_r
+ * returns ENOTTY (25), because musl calls isatty() first and that fails on
+ * the fd open("/dev/tty") yields for a session whose ctty is the kernel
+ * console. init runs TIOCSCTTY on the console fast path, which records no
+ * per-session ctty, so there is no /dev/ttyN name to find and correcting
+ * only the *name* would fix nothing. This tier is kept for the day a real
+ * per-VT getty exists; until then it declines, correctly. */
 static int owned_vt_from_ctty(void) {
 	int fd = open("/dev/tty", O_RDONLY | O_NOCTTY | O_CLOEXEC);
 	if (fd < 0) {
@@ -284,16 +295,58 @@ static int owned_vt_from_ctty(void) {
 	return (int)v;
 }
 
+/* Last resort: the VT that is in the foreground *right now*, at the moment
+ * libseat_open_seat() is called.
+ *
+ * This is not a guess, and it is not a default. It is the same derivation
+ * the DRM layer already uses to decide who holds master: a grant records
+ * `vt::active()` at the instant it is made, and lapses when the active VT
+ * moves away from it (see drivers/src/drm_device_interface.rs and the
+ * commit "drm: master follows the VT"). A compositor calls open_seat()
+ * during start-up and claims the display moments later, on the same VT, so
+ * adopting the foreground VT here makes the two answers agree *by
+ * construction* rather than by configuration -- and a shim that disagreed
+ * with the master gate would be worse than one that never fires at all.
+ *
+ * seatd resolves the same question the same way when it is not told: its
+ * terminal.c reads the current VT out of /dev/tty0 and binds the seat to
+ * it. We are only doing it in-process because there is no daemon.
+ *
+ * Why this is needed at all on LeandrOS: neither of the two tiers above can
+ * ever resolve here, and not because of a bug that could be fixed one level
+ * down. There is exactly one login session and it runs on /dev/console;
+ * `console_out` writes into SCREENS[ACTIVE] (servers/tty/src/vt.rs), so the
+ * console *follows* whichever VT is in the foreground rather than living on
+ * one. The session therefore genuinely does not own a VT, and giving it a
+ * /dev/ttyN controlling terminal -- or exporting a fixed XDG_VTNR -- would
+ * be inventing an ownership that the rest of the system does not honour.
+ * What owns a VT here is the compositor, from the moment it starts. That is
+ * exactly what this reads. */
+static int owned_vt_from_foreground(const struct vt_stat *st) {
+	if (st->v_active == 0 || st->v_active > MAX_NR_CONSOLES) {
+		trc("owned_vt_from_foreground: v_active=%u out of range", (unsigned)st->v_active);
+		return -1;
+	}
+	return (int)st->v_active;
+}
+
 /* Which VT does *this* seat own? Upstream seatd never has to answer this:
  * a real seatd/logind is the process that launched the session onto a VT
  * in the first place, so it always already knows. We have no such daemon,
  * so the compositor process has to work it out for itself, the same way
- * wlroots' direct (non-logind) session backend does: prefer XDG_VTNR,
- * fall back to the controlling terminal. If neither resolves, ownership is
- * unknowable -- and guessing would be actively harmful (see the header
- * comment on vt_probe()), so the caller must treat that the same as "no VT
- * support" rather than assume VT 1 or similar. */
-static int owned_vt(void) {
+ * wlroots' direct (non-logind) session backend does: prefer XDG_VTNR, then
+ * the controlling terminal, and -- only once both have declined -- the VT
+ * that is in the foreground at open_seat() time.
+ *
+ * The order is a precedence of *decreasing authority*, not of convenience.
+ * XDG_VTNR is somebody telling us; a /dev/ttyN ctty is the kernel telling
+ * us; the foreground VT is us inferring it. Each tier stays in place so a
+ * future greetd/logind that does place the session on a VT wins outright
+ * without this file changing.
+ *
+ * `st` is the VT_GETSTATE the caller has already done, which is why this
+ * takes it as an argument rather than re-querying. */
+static int owned_vt(const struct vt_stat *st) {
 	int v = owned_vt_from_env();
 	if (v > 0) {
 		trc("owned_vt: %d (from XDG_VTNR)", v);
@@ -304,7 +357,12 @@ static int owned_vt(void) {
 		trc("owned_vt: %d (from controlling terminal)", v);
 		return v;
 	}
-	trc("owned_vt: unknown (no XDG_VTNR, no VT controlling terminal)");
+	v = owned_vt_from_foreground(st);
+	if (v > 0) {
+		trc("owned_vt: %d (foreground VT at open_seat)", v);
+		return v;
+	}
+	trc("owned_vt: unknown (no XDG_VTNR, no VT controlling terminal, no usable foreground VT)");
 	return -1;
 }
 
@@ -312,23 +370,21 @@ static int owned_vt(void) {
  * state. On success: *out_active reflects whether own_vtnr is currently the
  * foreground VT, *out_own_vtnr is that VT number, and the returned fd is
  * VT0_PATH, open and the caller's to keep (poll-readable when the kernel
- * later reports a transition). On any failure -- VT ownership unknowable,
- * no such device (ENOENT, ENXIO, ...), or a device that exists but doesn't
- * understand VT_GETSTATE (ENOTTY, EINVAL, ...) -- returns -1 and leaves the
- * out-params untouched; the caller falls back to always-active. This is the
- * only place that treats "no VT support" as ordinary, not exceptional:
- * everywhere else in the file simply branches on vt_fd < 0.
+ * later reports a transition). On any failure -- no such device (ENOENT,
+ * ENXIO, ...), a device that exists but doesn't understand VT_GETSTATE
+ * (ENOTTY, EINVAL, ...), or VT ownership that stays unknowable even so --
+ * returns -1 and leaves the out-params untouched; the caller falls back to
+ * always-active. This is the only place that treats "no VT support" as
+ * ordinary, not exceptional: everywhere else in the file simply branches on
+ * vt_fd < 0.
  *
- * Ownership is resolved *before* touching VT0_PATH at all: without it,
- * there is nothing to compare an active-VT number against, so opening the
- * device would be pure overhead on the way to the same fallback. */
+ * VT0_PATH is opened and queried *before* ownership is resolved: the
+ * foreground VT is now the last-resort answer to "which VT do we own" (see
+ * owned_vt_from_foreground()), so the VT_GETSTATE that used to be pure
+ * overhead on the unknown-ownership path is the thing that decides it. The
+ * open still fails cheaply on a kernel with no VTs, which is the case that
+ * ordering was protecting. */
 static int vt_probe(unsigned int *out_active, int *out_own_vtnr) {
-	int vtnr = owned_vt();
-	if (vtnr < 0) {
-		trc("vt_probe: VT ownership unknown -- no VT support, always-active fallback");
-		return -1;
-	}
-
 	int fd = open(VT0_PATH, O_RDWR | O_CLOEXEC | O_NONBLOCK);
 	if (fd < 0) {
 		trc("vt_probe open(%s) failed errno=%d -- no VT support, always-active fallback", VT0_PATH,
@@ -342,6 +398,13 @@ static int vt_probe(unsigned int *out_active, int *out_own_vtnr) {
 		trc("vt_probe ioctl(%s, VT_GETSTATE) failed errno=%d -- no VT support, always-active "
 		    "fallback",
 		    VT0_PATH, errno);
+		close(fd);
+		return -1;
+	}
+
+	int vtnr = owned_vt(&st);
+	if (vtnr < 0) {
+		trc("vt_probe: VT ownership unknown -- no VT support, always-active fallback");
 		close(fd);
 		return -1;
 	}
