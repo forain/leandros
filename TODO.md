@@ -1761,7 +1761,7 @@ The build recipe already exists (`m6-session-bins/build-rust.sh`) and the panel'
 libcosmic/iced apps, so **item 7 gates whether they would render**, and the three buttons are
 also the natural triggers item 8 is missing. These three items interlock.
 
-### 10. busd has no D-Bus activation — NOT structural; DECIDED 2026-08-10: implement it in busd
+### 10. busd activation — NOT structural; IMPLEMENTED `84ec91a`, never booted
 
 **"Structural" was wrong, and the word was doing real damage** — it is what made the reference
 `dbus-daemon` fallback look triggered. It is not. **busd already parses `<servicedir>` into a
@@ -1793,11 +1793,36 @@ daemon (63 external `pw_*` symbols, no feature gate); unlike the daemon, the por
 *uses* the streams, so the existing inert stub would not suffice. Activation unblocks the
 activation-gated single-instance apps; the portal needs PipeWire as well.
 
-**⚠ The regression to guard.** `service-unknown-reply.patch` (`85f2f4c`+`daa2815`) is what
-stopped every libcosmic app blocking forever on an unowned name. Implicit activation — real
-`dbus-daemon` activates on a *method call* to an unowned activatable name, not only on an
-explicit `StartServiceByName` — must hook in **ahead** of that reply without ever delaying the
-non-activatable case, which must still answer `ServiceUnknown` promptly.
+**IMPLEMENTED 2026-08-10, `84ec91a`** — `ports/busd/start-service-activation.patch`, plus
+`<servicedir>/usr/share/dbus-1/services</servicedir>` in `ports/dbus/session-pkg/session.conf`.
+New `src/config/service_file.rs` parses `Name=`/`Exec=`/`User=` and ignores `SystemdService=`;
+a malformed drop-in is `warn!`-skipped rather than fatal, because one bad file must not stop
+the session bus coming up. `Peers` scans the servicedirs **once at startup, not on miss**, and
+`activate_service` spawns `Exec=` and polls for the name to appear, bounded at 5 s, answering
+`ServiceUnknown`/`SpawnExecFailed`/`SpawnChildExited` rather than a generic `Failed`.
+
+**The patch name sorts after `service-unknown-reply.patch` deliberately** — it extends that
+patch's `send_msg` code, so `build.sh`'s `*.patch` glob must apply it second. Verified by
+re-extracting a fresh crate and applying all three in order: clean, no fuzz.
+
+**⚠ The regression that had to be guarded, and how.** `service-unknown-reply.patch`
+(`85f2f4c`+`daa2815`) is what stopped every libcosmic app blocking forever on an unowned name.
+Implicit activation was implemented rather than deferred — real `dbus-daemon` activates on a
+*method call* to an unowned activatable name, not only on an explicit `StartServiceByName` —
+so the well-known-name branch checks `is_activatable` **first**, and a non-activatable name
+still takes the fast `ServiceUnknown` path with no spawn and no wait. Only genuinely
+activatable names pay the 5 s bound.
+
+**⚠ The 5 s poll is `tokio::time::sleep`, not `thread::sleep`, and that is not a style
+preference.** busd runs a **current-thread** runtime (`current-thread-runtime.patch`), so a
+blocking wait here would stall the *entire broker* for five seconds on every activation.
+
+**Verification state, stated plainly: 44 tests pass on the host** (29 pre-existing, 9 parser,
+6 activation — including a wire-level `DBusProxy` round trip and an implicit-activation
+regression guard), and both musl targets cross-build to stripped static ET_EXEC. **It has
+never been booted.** No image was rebuilt, no `.service` file has been placed on a real image,
+and no on-target `fork`/`execve` has been observed — only host `Command::spawn`. What
+activation does at a real COSMIC session start is **untested**.
 
 ### 11. Permanent COSMIC source patches — the goal is totally unmodified
 
