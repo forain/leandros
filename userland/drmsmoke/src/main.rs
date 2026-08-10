@@ -22,8 +22,17 @@
 //! **0x181818**, then a **256x256 solid 0xFF0000 (pure red)** block is
 //! painted with its top-left corner at pixel **(64, 64)**. Once that content
 //! is flushed to the host it prints the sentinel line `DRMSMOKE: HOLD READY`
-//! to stdout and sleeps in >=1s chunks forever, so a QEMU `screendump` can be
-//! pixel-checked against those exact colours/coordinates.
+//! to stdout, so a QEMU `screendump` can be pixel-checked against those exact
+//! colours/coordinates.
+//!
+//! It then **presents that frame in a loop, ~10 times a second, forever** —
+//! PAGE_FLIP and DIRTYFB, silently. That is what makes `--hold` a stand-in for
+//! a live compositor rather than a still image: the property worth testing
+//! against a VT switch is whether a client that never stops presenting can take
+//! the display back from a console, and a client that presents once cannot
+//! demonstrate either answer. Switching away must leave the console readable
+//! while this loop keeps running; switching back must show the frame again with
+//! no help from the client.
 
 #![no_std]
 #![no_main]
@@ -879,8 +888,21 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         hold_dirty.fb_id = fb.fb_id;
         ioctl(fd, DRM_IOCTL_MODE_DIRTYFB, &mut hold_dirty as *mut _);
         puts(b"DRMSMOKE: HOLD READY\n\0".as_ptr());
+        // PAGE_FLIP, not DIRTYFB alone: only a present moves pixels into the
+        // shared surface, and only a present claims the scanout back off the
+        // framebuffer console. A DIRTYFB-only loop looks like a holding client
+        // and behaves like a still image. No completion event is requested —
+        // nothing reads this fd, and an unread event queue is not what is being
+        // measured here. Every return code is ignored on purpose: once a VT
+        // switch suspends this client's master these all answer EACCES, and
+        // stopping (or complaining, onto the console we just handed back) is
+        // the opposite of what a wedged compositor would do.
+        let mut hold_flip = DrmModeCrtcPageFlip::default();
+        hold_flip.crtc_id = 1;
+        hold_flip.fb_id = fb.fb_id;
         loop {
-            usleep(1_000_000);
+            usleep(100_000);
+            ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &mut hold_flip as *mut _);
             ioctl(fd, DRM_IOCTL_MODE_DIRTYFB, &mut hold_dirty as *mut _);
         }
     }

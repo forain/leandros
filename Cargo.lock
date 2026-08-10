@@ -127,6 +127,7 @@ dependencies = [
  "mm",
  "sched",
  "spin",
+ "tty-server",
 ]
 
 [[package]]

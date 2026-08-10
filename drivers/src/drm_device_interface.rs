@@ -767,7 +767,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use alloc::vec;
 use alloc::collections::VecDeque;
-use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 /// A dumb buffer's physical base and buddy allocation order, so DESTROY_DUMB /
@@ -1970,9 +1970,34 @@ pub fn drm_has_events() -> bool {
 // The refusal happens BEFORE the dispatch `match`, which is also where the
 // present counter is sampled: an ioctl that is refused never runs, so it can
 // never claim.
+//
+// ── VT scoping ───────────────────────────────────────────────────────────────
+//
+// A grant is remembered together with the VT that was on screen when it was
+// made, and it is armed only while that VT is still on screen. The suspension
+// is therefore **derived**: a VT switch writes nothing into the DRM layer and
+// cannot race a present, because the moment `ACTIVE` moves, `master_ok` is
+// already false for everyone whose VT just left. Switching back re-arms it by
+// the same computation.
+//
+// **The auto-rearm is deliberate and load-bearing.** Master is suspended, never
+// destroyed. A compositor that does not re-issue SET_MASTER on resume — and
+// nothing obliges it to — would otherwise come back to a permanently dead
+// display with no console underneath it either, because its VT is KD_GRAPHICS
+// and the console stays gated off. "Cannot present while backgrounded" is the
+// property we want; "cannot ever present again" is a wedge.
+//
+// We cannot ask which VT a card0 fd belongs to — there is no such association,
+// on Linux either — so "the caller's VT" means "the VT that was active when this
+// open was granted master". That is enough for the only question anyone asks:
+// whether the holder is in the foreground.
 
 /// The card0 open holding DRM master, or 0 for "nobody".
 static MASTER_OPEN: AtomicU32 = AtomicU32::new(0);
+
+/// `vt::active()` as it stood when [`MASTER_OPEN`] was granted. Meaningless
+/// while `MASTER_OPEN` is 0.
+static MASTER_VT: AtomicUsize = AtomicUsize::new(0);
 
 /// Ioctls that may only be issued by the DRM master of the VT on screen.
 ///
@@ -1995,9 +2020,13 @@ fn requires_master(cmd: u32) -> bool {
     )
 }
 
-/// True when `open_id` may drive the display.
+/// True when `open_id` holds master **and** the VT it holds it on is the one on
+/// screen. Two relaxed-ish atomic loads and nothing else — this is on the path
+/// of every present.
 fn master_ok(open_id: u32) -> bool {
-    open_id != 0 && MASTER_OPEN.load(Ordering::SeqCst) == open_id
+    open_id != 0
+        && MASTER_OPEN.load(Ordering::SeqCst) == open_id
+        && MASTER_VT.load(Ordering::SeqCst) == tty_server::vt::active()
 }
 
 /// Gate one master-only ioctl, granting master implicitly on first use.
@@ -2016,7 +2045,10 @@ fn master_gate(open_id: u32) -> Result<(), DriverError> {
     if open_id == 0 { return Ok(()); }
     if master_ok(open_id) { return Ok(()); }
     match MASTER_OPEN.compare_exchange(0, open_id, Ordering::SeqCst, Ordering::SeqCst) {
-        Ok(_) => Ok(()),
+        // The VT is stored after the exchange, so a loser of the race cannot
+        // overwrite the winner's. The window in between is the granting open's
+        // own, and the worst it can cost that open is one refused ioctl.
+        Ok(_) => { MASTER_VT.store(tty_server::vt::active(), Ordering::SeqCst); Ok(()) }
         Err(_) => Err(DriverError::Access),
     }
 }
@@ -2025,10 +2057,23 @@ fn master_gate(open_id: u32) -> Result<(), DriverError> {
 fn master_set(open_id: u32) -> Result<usize, DriverError> {
     if open_id == 0 { return Ok(0); }
     let cur = MASTER_OPEN.load(Ordering::SeqCst);
-    if cur == open_id { return Ok(0); }
+    if cur == open_id {
+        // Already master. Answering 0 is required — a compositor re-asserts
+        // master on every session resume and must not be told EBUSY by itself.
+        // Backgrounded, the honest answer is EACCES: the grant is intact but
+        // suspended, and the caller cannot present with it. Note this does NOT
+        // move the grant to the current VT; re-arming is the switch back's job,
+        // not a client's, or a background SET_MASTER would be a way to steal a
+        // console.
+        return if MASTER_VT.load(Ordering::SeqCst) == tty_server::vt::active() {
+            Ok(0)
+        } else {
+            Err(DriverError::Access)
+        };
+    }
     if cur != 0 { return Err(DriverError::Busy); }
     match MASTER_OPEN.compare_exchange(0, open_id, Ordering::SeqCst, Ordering::SeqCst) {
-        Ok(_) => Ok(0),
+        Ok(_) => { MASTER_VT.store(tty_server::vt::active(), Ordering::SeqCst); Ok(0) }
         Err(_) => Err(DriverError::Busy),
     }
 }
@@ -2215,7 +2260,23 @@ impl DrmDeviceInterface {
             }
         };
 
-        if crate::drm::device::SCANOUT_WRITES.load(Ordering::Relaxed) != presents_before {
+        // Re-check master on the way out, not just on the way in. The gate
+        // above refuses ioctls that have not started; it cannot recall one that
+        // is already inside a handler, and on a software-scaled 1920x1080
+        // present that handler runs for tens of milliseconds under TCG. A VT
+        // switch landing in that window used to leave the console repainted,
+        // gated back OFF by the claim this in-flight present made on its way
+        // out, and silent from then on — a black screen that answered every
+        // keystroke and showed none of them. Measured on x86_64, where the
+        // window is wide; the same race exists on aarch64 under HVF, ~30x
+        // narrower.
+        //
+        // A present whose VT left while it ran is stale by definition, so it
+        // does not get to silence the console. `open_id` 0 keeps the legacy
+        // `Driver::handle` behaviour, which has no master to check.
+        if crate::drm::device::SCANOUT_WRITES.load(Ordering::Relaxed) != presents_before
+            && (open_id == 0 || master_ok(open_id))
+        {
             crate::framebuffer::drm_scanout_claim(open_id);
         }
 

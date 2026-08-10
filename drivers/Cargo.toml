@@ -17,5 +17,10 @@ ipc = { path = "../ipc" }
 mm = { path = "../mm" }
 boot = { path = "../boot" }
 evdev-server = { path = "../servers/evdev" }
+# For `vt::active()` only: DRM master is scoped to the VT it was granted on, so
+# the master gate has to know which console is on screen. No cycle — `tty-server`
+# depends on ipc/sched/spin and reaches this crate only through the `fb_vt_*`
+# `#[no_mangle]` seam — and `evdev-server` already pulls it in transitively.
+tty-server = { path = "../servers/tty" }
 sched = { path = "../sched" }
 spin.workspace = true

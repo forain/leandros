@@ -2108,12 +2108,13 @@ One reading gotcha: under a real mouse `evtest2` reports `epoll_idle_no_false_wa
 by construction — that check asserts an empty ring during a 300 ms still-pointer window,
 and a hand on the mouse guarantees it is not empty. It is not a defect in that run.
 
-### 14. VT switching — six VTs land; device arbitration does not
+### 14. VT switching — the display arbitrates; the input devices still do not
 
-**Pieces 1 and 3 are done; piece 2 is half done.** Six VTs exist (`servers/tty/src/vt.rs`,
+**Pieces 1 and 3 are done; piece 2 is now three-quarters done — the DRM master half
+landed 2026-08-10, the `/dev/input/*` half has not.** Six VTs exist (`servers/tty/src/vt.rs`,
 `/dev/tty0`..`/dev/tty6`), the VT/KD ioctl set is implemented, the `VT_PROCESS`
 release/acquire handshake works with a 5 s watchdog, Ctrl+Alt+Fn switches from inside
-`evdev::push_event`, and `vttest` is **12/12** on both arches with the switch
+`evdev::push_event`, and `vttest` is **17/17** on both arches with the switch
 photographed. The header carries the measurements and the four design decisions.
 Piece 1 was built **on** `SCANOUT_OWNER`/`drm_scanout_claim` as this item instructed —
 "a VT is close to *which of N consoles owns the scanout*, which it already answers for
@@ -2129,14 +2130,43 @@ the right time. Until that measurement exists this is a shim that should work, w
 the state this item's own warning describes: a component can be correct as a consumer
 and broken as a producer, and this shim was about to be asked to be the producer.
 
-**What is NOT done is the half that makes a switch safe rather than cosmetic: device
-arbitration.** DRM master handoff and reopening `/dev/input/*` on switch are
-unimplemented. `fb_vt_scanout_revoke` takes the surface back and **the client's next
-present simply re-claims it** — so switching away from a live compositor is not yet a
-handoff, it is a race the compositor wins. Everything that motivated this item is
-therefore reachable except the one case it was opened for: **switching away from a
-*wedged* compositor is not yet proven, because a wedged compositor that keeps presenting
-still takes the scanout back.**
+**DRM master handoff LANDED 2026-08-10 — the case this item was opened for is now
+demonstrated.** `SET_MASTER`/`DROP_MASTER` were a pair of unconditional `Ok(0)`s and
+nothing returned EACCES, so `fb_vt_scanout_revoke` took the surface back only for the
+client's next present to re-claim it. Master is now per card0 *open*, scoped to the VT it
+was granted on, and the seven ioctls that can take the surface are refused with **EACCES**
+while that VT is off screen. Measured, both arches: with `drmsmoke --hold` presenting at
+10 Hz, Ctrl+Alt+F2 leaves a **readable text console that keeps echoing commands for 15-30 s**
+(previously the client's frame returned within one flip), and Ctrl+Alt+F1 brings the
+client's frame back with no `SET_MASTER` from the client — which is also what proves it
+never stopped presenting. Same round trip run against **cosmic-comp** on aarch64: 12.7 s
+on the console, then the desktop returns with its clock advanced 30 s.
+
+Three things that decided the design, each worth keeping:
+
+1. **The gated set is derived, not guessed.** Every path that takes the surface bumps
+   `SCANOUT_WRITES` (`drivers/src/drm/device.rs:370` and `:442`), and those two sites are
+   reachable only from SETCRTC/PAGE_FLIP/ATOMIC/DIRTYFB and the custom 0x1001/0x1004/0x1005.
+   No virtgpu *render* ioctl can reach them, so Vulkan is untouched on either node.
+2. **Suspension is derived too, and the auto-rearm is load-bearing.** A grant records
+   `vt::active()`; `master_ok` compares it against the live value. A switch therefore writes
+   nothing into the DRM layer and cannot race a present, and a compositor that never
+   re-issues `SET_MASTER` still comes back — which it must, since its VT is `KD_GRAPHICS`
+   and the console stays gated off there.
+3. **A refusal at the door is not enough.** The scanout claim is applied *after* dispatch
+   from a present-counter delta, and a full-screen software-scaled present runs for tens of
+   milliseconds; a switch landing inside one left the console repainted and then gated back
+   OFF by the in-flight present — a black screen that answered keystrokes and showed none.
+   Master is re-checked on the way out, so a present whose VT left mid-flight does not get
+   to silence the console. **Found on x86_64 under TCG, where the window is wide; the same
+   race is present on aarch64/HVF ~30x narrower.**
+
+**What is still NOT done is the input half of the arbitration:** `/dev/input/*` is not
+reopened or gated on switch, so a backgrounded client still sees the keyboard and mouse.
+One residual display race is also known and unfixed: a present already inside its handler
+when the switch happens can still land its *pixels* after the console's repaint. It is
+self-healing (the console draws over it) and it no longer silences the console, but it is a
+visible flash. Closing it properly means interlocking the present itself with the switch.
 
 The evdev half of piece 2 *did* land, and the hazard this item named is gone: per-open
 queues keyed on `open_id`, broadcast on push, `SYN_DROPPED` on overflow — two readers of
@@ -2148,10 +2178,11 @@ call and it was paid before the switch shipped, not after.
 `TerminalMode::Stdin`, and every VT call sits behind a match arm that Stdin skips — so
 the port needs nothing from this item, then or now.
 
-**One dependency to settle before the handoff work starts:** `EVIOCGRAB` is accepted but
-not enforced (item 20), and enforcing it and implementing the handoff are two changes
-that must not ride together — a bug in either is indistinguishable from a bug in the
-other, with no working console left to ask from.
+**The dependency this item recorded was honoured:** `EVIOCGRAB` (item 20) was left
+untouched by the master work, and the evdev VT gate was left untouched too, because
+enforcing either and implementing the handoff are changes that must not ride together —
+a bug in one is indistinguishable from a bug in the other, with no working console left to
+ask from. **That order still stands for the input half:** land it on its own.
 
 ### 17. aarch64: command output inside `cosmic-term` is invisible
 

@@ -714,6 +714,66 @@ unsafe fn t_master_gates_present() -> bool {
     report(b"master_gates_present", grant && mine && theirs)
 }
 
+// ── 14-15. Master is scoped to the VT it was granted on ──────────────────────
+//
+// The half of the handoff that makes a switch mean something. A grant is armed
+// only while the VT that was on screen when it was made is still on screen; a
+// switch away suspends it with no write into the DRM layer at all, and a switch
+// back re-arms it.
+//
+// These two run with no compositor anywhere, which is the point: the property is
+// the kernel's, and measuring it through cosmic-comp would measure smithay's
+// error handling at the same time.
+
+/// Present, switch away, present, switch back, present.
+unsafe fn t_master_follows_vt(tty0: c_int) -> bool {
+    let fd = card0();
+    if fd < 0 { return report(b"master_follows_vt", false); }
+    let grant = set_master(fd) == 0;
+    let on_vt1 = dirtyfb(fd) == 0;
+
+    let moved = switch_to(tty0, 2) && active_vt(tty0) == 2;
+    let bg_rc = dirtyfb(fd);
+    let bg_errno = errno();
+    let suspended = bg_rc < 0 && bg_errno == EACCES;
+
+    let back = switch_to(tty0, 1) && active_vt(tty0) == 1;
+    // Re-armed WITHOUT a second SET_MASTER. A compositor is not obliged to
+    // re-assert master on resume, and one that does not must not come back to a
+    // dead display with no console under it either — its VT is KD_GRAPHICS, so
+    // nothing else would be drawing.
+    let rearmed = dirtyfb(fd) == 0;
+
+    drop_master(fd);
+    close(fd);
+    // Never judge before restoring VT 1: a FAIL that returns from VT 2 leaves
+    // the rest of the suite printing onto a console nobody is looking at.
+    out(b"  vt1="); out(if on_vt1 { b"0" } else { b"!0" });
+    out(b" vt2="); out_int(bg_rc); out(b" errno="); out_int(bg_errno);
+    out(b" vt1_again="); out(if rearmed { b"0" } else { b"!0" }); out(b"\n");
+    report(b"master_follows_vt", grant && on_vt1 && moved && suspended && back && rearmed)
+}
+
+/// SET_MASTER from the holder while its VT is off screen is EACCES — and does
+/// NOT move the grant to the VT now on screen. If it did, a background client
+/// could take a console back just by asking.
+unsafe fn t_setmaster_background(tty0: c_int) -> bool {
+    let fd = card0();
+    if fd < 0 { return report(b"setmaster_background", false); }
+    let grant = set_master(fd) == 0;
+    let moved = switch_to(tty0, 2) && active_vt(tty0) == 2;
+    let rc = set_master(fd);
+    let e = errno();
+    let refused = rc < 0 && e == EACCES;
+    // Still refused for presenting, i.e. the failed SET_MASTER did not re-arm.
+    let still_suspended = dirtyfb(fd) < 0;
+    let back = switch_to(tty0, 1) && active_vt(tty0) == 1;
+    drop_master(fd);
+    close(fd);
+    out(b"  rc="); out_int(rc); out(b" errno="); out_int(e); out(b"\n");
+    report(b"setmaster_background", grant && moved && refused && still_suspended && back)
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 unsafe fn arg_eq(argv: *mut *mut u8, i: isize, s: &[u8]) -> bool {
@@ -765,7 +825,7 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 15usize;
+    let total = 17usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -782,6 +842,8 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
     if t_master_is_exclusive() { passed += 1; }
     if t_drop_master_not_master() { passed += 1; }
     if t_master_gates_present() { passed += 1; }
+    if t_master_follows_vt(tty0) { passed += 1; }
+    if t_setmaster_background(tty0) { passed += 1; }
 
     // Whatever happened, leave the machine usable: VT 1, text mode, K_XLATE.
     // A suite that fails halfway through a KD_GRAPHICS subtest and stops there
