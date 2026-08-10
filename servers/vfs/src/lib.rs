@@ -3723,22 +3723,46 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             drop(tbls);
             if count < 128 { return err_reply(-22); } // EINVAL — buffer too small
             // Accept (dequeue) each pending signal in the mask, emitting a
-            // 128-byte signalfd_siginfo per signal. Only ssi_signo (offset 0)
-            // is populated — calloop reads only that; ssi_code/pid/uid stay 0.
-            // Reading consumes the pending bit (POSIX: the signal is accepted,
-            // not run through a handler), relying on the caller having blocked
-            // it in all threads.
+            // 128-byte signalfd_siginfo per signal. Reading consumes the
+            // pending bit (POSIX: the signal is accepted, not run through a
+            // handler), relying on the caller having blocked it in all threads.
+            //
+            // The payload fields come from the same per-signal `SigInfo` a
+            // handler would have been given, via `accept_pending_signal`, so a
+            // process that reaps children through a signalfd and one that
+            // installs a SIGCHLD handler read the same `si_code`/`si_pid`/
+            // `si_status` for the same death. `ssi_signo` alone (which is all
+            // calloop reads) was the previous extent of this.
+            //
+            // struct signalfd_siginfo, Linux <sys/signalfd.h>:
+            //   +0 ssi_signo  +4 ssi_errno   +8 ssi_code  +12 ssi_pid
+            //   +16 ssi_uid   +20 ssi_fd     +24 ssi_tid  +28 ssi_band
+            //   +32 ssi_overrun +36 ssi_trapno +40 ssi_status ... 128 total
+            const SSI_CODE:   usize = 8;
+            const SSI_PID:    usize = 12;
+            const SSI_UID:    usize = 16;
+            const SSI_STATUS: usize = 40;
             let pending = (sched::pending_signals() | sched::shared_pending_signals()) & mask;
             if pending == 0 { return err_reply(-11); } // EAGAIN
             let mut written = 0usize;
             let mut sig = 1u32;
             while sig <= 64 && written + 128 <= count {
                 if pending & (1u64 << (sig - 1)) != 0 {
+                    // Consume first: this returns the payload that was attached
+                    // to the very bit being cleared, so the two can't be for
+                    // different instances of the signal.
+                    let info = sched::accept_pending_signal(sig);
                     unsafe {
-                        core::ptr::write_bytes(buf.add(written), 0, 128);
-                        core::ptr::write(buf.add(written) as *mut u32, sig); // ssi_signo
+                        let rec = buf.add(written);
+                        core::ptr::write_bytes(rec, 0, 128);
+                        // `buf` is a raw user pointer with no alignment
+                        // guarantee beyond the caller's; write unaligned.
+                        core::ptr::write_unaligned(rec as *mut u32, sig); // ssi_signo
+                        core::ptr::write_unaligned(rec.add(SSI_CODE)   as *mut i32, info.si_code);
+                        core::ptr::write_unaligned(rec.add(SSI_PID)    as *mut u32, info.si_pid as u32);
+                        core::ptr::write_unaligned(rec.add(SSI_UID)    as *mut u32, info.si_uid);
+                        core::ptr::write_unaligned(rec.add(SSI_STATUS) as *mut i32, info.si_status);
                     }
-                    sched::clear_pending_signal(sig);
                     written += 128;
                 }
                 sig += 1;

@@ -104,6 +104,88 @@ impl SigAction {
     }
 }
 
+// ── siginfo `si_code` values (Linux/POSIX, architecture-independent) ─────────
+//
+// The negative ones are not a mistake: Linux reserves `si_code <= 0` for
+// user-generated signals and `> 0` for kernel-generated ones, and a handler
+// that tests `si_code > 0` to decide whether the rest of the struct came from
+// the kernel depends on the sign.
+
+/// `kill(2)`/`killpg(2)` — sent by a user process. Value 0, which is also what
+/// a zeroed siginfo reads as; that ambiguity is exactly why "SIGCHLD reports
+/// `SI_USER`" was the pre-`SigInfo` symptom.
+pub const SI_USER:   i32 = 0;
+/// Sent by the kernel itself (VT switch's SIGUSR1/SIGUSR2, and anything else
+/// with no originating process).
+pub const SI_KERNEL: i32 = 0x80;
+/// POSIX timer expiry (`timer_settime`).
+pub const SI_TIMER:  i32 = -2;
+/// `tkill(2)`/`tgkill(2)` — thread-directed, which `raise()` and
+/// `pthread_kill()` both resolve to.
+pub const SI_TKILL:  i32 = -6;
+
+/// SIGCHLD: the child called `_exit`; `si_status` is its exit code.
+pub const CLD_EXITED: i32 = 1;
+/// SIGCHLD: the child was killed by a signal; `si_status` is that signal.
+pub const CLD_KILLED: i32 = 2;
+/// SIGCHLD: killed *and* it dumped core. Unreachable here on purpose — this
+/// kernel has no core-dump path, and `ExitStatus::wait_status` deliberately
+/// never sets `WCOREDUMP`'s 0x80 bit either. Named so the two stay consistent
+/// if that ever changes.
+pub const CLD_DUMPED: i32 = 3;
+
+/// The `siginfo_t` payload for the one pending instance of one signal.
+///
+/// Deliberately **not** a queue. POSIX only guarantees a single pending
+/// instance of a standard signal (1..31), which is precisely what the
+/// `signal_pending` bitmask already models — one bit, therefore one payload.
+/// Real-time queueing (`SIGRTMIN..`, `sigqueue`) is unused by anything this
+/// kernel runs, and a multi-entry queue would multiply the per-signal cost by
+/// its depth inside `Task`, which `Task::new_kernel` materialises as a literal
+/// on the 128 KiB kernel stack (see `scripts/check-stack-frames.py`).
+///
+/// The four fields are the ones a handler and `signalfd` actually read.
+/// `si_addr` is absent: no fault ever reaches a user handler here (every
+/// `arch/*` fault path calls `sched::exit_group_signal` directly, killing the
+/// group), so it would have no producer and no consumer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct SigInfo {
+    /// `SI_*` / `CLD_*` — where the signal came from.
+    pub si_code:   i32,
+    /// Sending process (`SI_USER`/`SI_TKILL`) or exiting child (SIGCHLD).
+    pub si_pid:    i32,
+    /// Real uid of the sender / of the exiting child.
+    pub si_uid:    u32,
+    /// SIGCHLD only: exit code (`CLD_EXITED`) or signal number (`CLD_KILLED`).
+    pub si_status: i32,
+}
+
+impl SigInfo {
+    /// No payload — `si_code == SI_USER` with everything zero, which is byte
+    /// for byte what delivery shipped before per-signal siginfo existed.
+    pub const NONE: SigInfo =
+        SigInfo { si_code: SI_USER, si_pid: 0, si_uid: 0, si_status: 0 };
+
+    /// Generated inside the kernel with no originating process.
+    pub const KERNEL: SigInfo =
+        SigInfo { si_code: SI_KERNEL, si_pid: 0, si_uid: 0, si_status: 0 };
+
+    /// A POSIX timer fired.
+    pub const TIMER: SigInfo =
+        SigInfo { si_code: SI_TIMER, si_pid: 0, si_uid: 0, si_status: 0 };
+
+    /// `kill(2)` / `killpg(2)` from process `pid` running as `uid`.
+    pub const fn user(pid: Pid, uid: u32) -> SigInfo {
+        SigInfo { si_code: SI_USER, si_pid: pid as i32, si_uid: uid, si_status: 0 }
+    }
+
+    /// `tkill(2)` / `tgkill(2)` from process `pid` running as `uid`.
+    pub const fn tkill(pid: Pid, uid: u32) -> SigInfo {
+        SigInfo { si_code: SI_TKILL, si_pid: pid as i32, si_uid: uid, si_status: 0 }
+    }
+}
+
 #[repr(C)]
 pub struct Task {
     pub pid:          Pid,
@@ -194,6 +276,20 @@ pub struct Task {
     pub shared_signal_pending: u64,
     /// Per-signal disposition table (reduced for testing).
     pub signal_actions: [SigAction; 64],
+    /// Payload for the pending instance of each signal — one slot per signal
+    /// number, indexed `signo - 1`, exactly parallel to the `signal_pending`
+    /// bitmask above.
+    ///
+    /// A slot is only meaningful while the matching bit is set in
+    /// `signal_pending` or (on the thread-group leader) `shared_signal_pending`;
+    /// it is written on the 0 → 1 transition of that bit and left alone
+    /// afterwards, so a second instance of an already-pending standard signal
+    /// is discarded payload and all — which is what POSIX says happens to the
+    /// signal itself. Never memcpy the whole array between tasks: the
+    /// `shared_signal_pending` hand-off in `check_and_deliver_signals` copies
+    /// **only the slots whose bits it actually claims**, because copying the
+    /// rest would hand one signal another signal's payload.
+    pub signal_info: [SigInfo; 64],
 
     // ── Thread state ──────────────────────────────────────────────────────────
     /// User-space address of the thread's TID word (for `set_tid_address`).
@@ -324,6 +420,7 @@ impl Task {
             signal_mask: 0,
             shared_signal_pending: 0,
             signal_actions: [DEFAULT_SIGACTION; 64],
+            signal_info: [SigInfo::NONE; 64],
             clear_child_tid: 0,
             heap_start: 0,
             heap_end: 0,
@@ -606,6 +703,15 @@ impl Task {
             core::ptr::write_volatile(action_ptr, DEFAULT_SIGACTION);
         }
 
+        // Initialize signal_info array with SigInfo::NONE, slot by slot for the
+        // same reason signal_actions is done this way: this constructor exists
+        // precisely to avoid materialising a whole-Task literal.
+        let signal_info_ptr = (dest as usize + core::mem::offset_of!(Task, signal_info)) as *mut SigInfo;
+        for i in 0..64 {
+            let info_ptr = (signal_info_ptr as usize + i * core::mem::size_of::<SigInfo>()) as *mut SigInfo;
+            core::ptr::write_volatile(info_ptr, SigInfo::NONE);
+        }
+
         // Initialize cwd array to all zeros, then set first byte to '/'
         let cwd_ptr = (dest as usize + core::mem::offset_of!(Task, cwd)) as *mut [u8; 128];
         core::ptr::write_bytes(cwd_ptr as *mut u8, 0, 128);
@@ -672,6 +778,7 @@ impl Task {
             signal_mask: 0,
             shared_signal_pending: 0,
             signal_actions: [DEFAULT_SIGACTION; 64],
+            signal_info: [SigInfo::NONE; 64],
             clear_child_tid: 0,
             heap_start: 0,
             heap_end: 0,

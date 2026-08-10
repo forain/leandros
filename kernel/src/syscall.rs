@@ -17,7 +17,7 @@ use sched::{
     sys_sigaction, sys_sigprocmask, sys_sigaltstack, restore_signal_frame,
     current_pid, current_ppid,
     ticks, yield_now, irq_window, exit, spawn_user,
-    pending_signals, clear_pending_signal, replace_signal_mask,
+    pending_signals, replace_signal_mask,
     current_reply_port, set_current_reply_port, set_clear_child_tid,
     block_on_port_prepare, block_on_port_cancel, block_on_port_commit,
     replace_address_space,
@@ -2231,13 +2231,20 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
         let pending = pending_signals() & wait_mask;
         if pending != 0 {
             let signo = pending.trailing_zeros() as u32 + 1;
-            // Clear the signal from pending.
-            clear_pending_signal(signo);
-            // Optionally fill siginfo_t (128 bytes) with signo.
+            // Accept the signal, taking its payload with the pending bit.
+            let info = sched::accept_pending_signal(signo);
+            // Optionally fill siginfo_t (128 bytes). Same LP64 offsets the
+            // signal-frame builder uses: si_signo +0, si_code +8, si_pid +16,
+            // si_uid +20, si_status +24.
             if info_ptr != 0 && validate_user_buf(info_ptr, 128) {
                 unsafe {
-                    core::ptr::write_bytes(info_ptr as *mut u8, 0, 128);
-                    core::ptr::write(info_ptr as *mut i32, signo as i32); // si_signo
+                    let p = info_ptr as *mut u8;
+                    core::ptr::write_bytes(p, 0, 128);
+                    core::ptr::write_unaligned(p as *mut i32, signo as i32);
+                    core::ptr::write_unaligned(p.add(8)  as *mut i32, info.si_code);
+                    core::ptr::write_unaligned(p.add(16) as *mut i32, info.si_pid);
+                    core::ptr::write_unaligned(p.add(20) as *mut u32, info.si_uid);
+                    core::ptr::write_unaligned(p.add(24) as *mut i32, info.si_status);
                 }
             }
             return signo as isize;
@@ -2755,15 +2762,20 @@ fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
     let sig = sig_raw as u32;
     if sig >= 64 { return -22; } // EINVAL
     let pid_i = pid_raw as u32 as i32; // pid_t travels sign-extended
+    // SI_USER, carrying the *sender's* identity: the receiving handler's
+    // `si_pid`/`si_uid` name who sent the signal, which is the whole content of
+    // a kill(2) siginfo. The process id, not the thread id — a signal comes
+    // from a process.
+    let info = sched::SigInfo::user(sched::current_tgid(), sched::current_uid());
     if pid_i > 0 {
         if sig == 0 { return sched::exists_probe(pid_i as u32); }
         // kill(2) is process-directed: route to a thread in the target group
         // that hasn't masked `sig`, not blindly its leader.
-        return sched::deliver_signal_process(sched::tgid_of(pid_i as u32), sig);
+        return sched::deliver_signal_process(sched::tgid_of(pid_i as u32), sig, info);
     }
     if pid_i == -1 { return -1; } // EPERM — kill-everything unsupported
     let pgid = if pid_i == 0 { sched::current_pgid() } else { (-(pid_i as i64)) as u32 };
-    sched::kill_pgrp(pgid, sig)
+    sched::kill_pgrp(pgid, sig, info)
 }
 
 fn sys_getppid() -> isize {
@@ -4289,14 +4301,22 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
 /// sys_tgkill(tgid, tid, sig) — send a signal to a specific thread.
 fn sys_tgkill(_tgid: usize, tid: usize, sig: usize) -> isize {
     if sig >= 64 { return -22; } // EINVAL
-    sched::deliver_signal(tid as u32, sig as u32)
+    sched::deliver_signal(tid as u32, sig as u32, tkill_info())
 }
 
 /// sys_tkill(tid, sig) — send a signal to a specific thread (legacy form of
 /// tgkill without the thread-group-id argument). Used by raise()/pthread_kill.
 fn sys_tkill(tid: usize, sig: usize) -> isize {
     if sig >= 64 { return -22; } // EINVAL
-    sched::deliver_signal(tid as u32, sig as u32)
+    sched::deliver_signal(tid as u32, sig as u32, tkill_info())
+}
+
+/// `SI_TKILL`, not `SI_USER`: the two thread-directed forms are how `raise()`
+/// and `pthread_kill()` reach the kernel, and Linux distinguishes them from
+/// `kill(2)` for exactly that reason — a handler can tell a self-raise from an
+/// externally delivered kill. `si_pid` is still the sending *process*.
+fn tkill_info() -> sched::SigInfo {
+    sched::SigInfo::tkill(sched::current_tgid(), sched::current_uid())
 }
 
 // ── Misc syscalls ─────────────────────────────────────────────────────────────

@@ -255,7 +255,10 @@ impl Pending {
     fn fire(self) {
         if let Some((pgid, sig)) = self.0 {
             if pgid != 0 {
-                let _ = sched::kill_pgrp(pgid, sig);
+                // SI_KERNEL: a terminal-generated SIGINT/SIGQUIT/SIGTSTP has
+                // no sending process — Linux sends these with SEND_SIG_PRIV,
+                // which is exactly this si_code.
+                let _ = sched::kill_pgrp(pgid, sig, sched::SigInfo::KERNEL);
             }
         }
     }

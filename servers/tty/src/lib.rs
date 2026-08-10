@@ -176,7 +176,8 @@ pub fn console_intercept_byte(b: u8) -> bool {
     } else {
         return false;
     };
-    let _ = sched::kill_pgrp(pgid, sig);
+    // SI_KERNEL, as in pty.rs: the terminal generated this, not a process.
+    let _ = sched::kill_pgrp(pgid, sig, sched::SigInfo::KERNEL);
     true
 }
 
@@ -350,7 +351,9 @@ pub fn check_timers(pid: u32) {
     for timer in tbl.timers.iter_mut() {
         if !timer.in_use || timer.deadline == 0 { continue; }
         if now >= timer.deadline {
-            sched::deliver_signal(timer.owner_pid, timer.signo);
+            // SI_TIMER — the payload a handler uses to tell a POSIX timer
+            // expiry apart from someone kill()ing it the same signal.
+            sched::deliver_signal(timer.owner_pid, timer.signo, sched::SigInfo::TIMER);
             if timer.interval > 0 {
                 // A process descheduled for a while can miss more than one
                 // period; catch the deadline up to `now` in one step and

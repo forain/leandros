@@ -903,7 +903,8 @@ pub fn switch_to(n: usize) -> isize {
         // `MODES` was read in the scoped block above and is already released:
         // `deliver_signal_process` takes RUN_QUEUE, and no server lock may be
         // held across that.
-        sched::deliver_signal_process(owner, relsig as u32);
+        // SI_KERNEL: a VT switch has no originating process to name.
+        sched::deliver_signal_process(owner, relsig as u32, sched::SigInfo::KERNEL);
         return 0;
     }
     if mode == VT_PROCESS {
@@ -962,7 +963,8 @@ fn complete_switch(to: usize) {
     if mode == VT_PROCESS && owner != 0 && sched::exists_probe(owner) >= 0 && acqsig != 0 {
         PHASE_SINCE.store(sched::ticks(), Ordering::Relaxed);
         PHASE.store(PHASE_WAIT_ACQ, Ordering::Relaxed);
-        sched::deliver_signal_process(owner, acqsig as u32);
+        // SI_KERNEL, as for the release signal above.
+        sched::deliver_signal_process(owner, acqsig as u32, sched::SigInfo::KERNEL);
     } else {
         PHASE.store(PHASE_IDLE, Ordering::Relaxed);
     }

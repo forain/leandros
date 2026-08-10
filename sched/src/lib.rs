@@ -32,6 +32,7 @@ pub mod task;
 pub use clone::{fork_current, clone_thread};
 pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec};
 pub use futex::{futex_wait, futex_wake, futex_requeue};
+pub use task::{SigInfo, SI_USER, SI_KERNEL, SI_TIMER, SI_TKILL, CLD_EXITED, CLD_KILLED, CLD_DUMPED};
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
@@ -137,6 +138,23 @@ impl ExitStatus {
     /// `WEXITSTATUS`), the signal number for a kill (matching `WTERMSIG`).
     pub fn si_status(&self) -> i32 {
         if self.term_signal != 0 { self.term_signal as i32 } else { self.code & 0xff }
+    }
+}
+
+impl SigInfo {
+    /// The SIGCHLD payload for child process `pid` (real uid `uid`) ending with
+    /// `status`.
+    ///
+    /// Defined here rather than beside the other constructors in `task.rs`
+    /// because it must be *derived from* [`ExitStatus`] and not from a second
+    /// reading of the same facts — see the call site in [`exit`].
+    pub fn child(pid: Pid, uid: u32, status: ExitStatus) -> SigInfo {
+        SigInfo {
+            si_code:   status.si_code(),
+            si_pid:    pid as i32,
+            si_uid:    uid,
+            si_status: status.si_status(),
+        }
     }
 }
 
@@ -464,13 +482,28 @@ pub fn ticks() -> u64 {
     TIMER_TICKS.load(Ordering::Relaxed)
 }
 
-pub fn deliver_signal(pid: Pid, signo: u32) -> isize {
+/// Deliver `signo` to the single *thread* `pid`, carrying `info` as its
+/// `siginfo_t` payload.
+///
+/// `info` is not optional and has no default on purpose: every producer has to
+/// answer "where did this signal come from?", because the pre-`SigInfo`
+/// behaviour — a zeroed payload — is indistinguishable from a genuine
+/// `SI_USER` `kill()` and silently misreports every other origin.
+pub fn deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> isize {
     let mut woke = false;
     let ret = {
         let mut rq = RUN_QUEUE.lock();
         let min_vr = rq.min_vruntime();
         if let Some(t) = rq.find_pid_mut(pid) {
             if signo > 0 && signo <= 64 {
+                // First-writer-wins: POSIX keeps exactly one pending instance
+                // of a standard signal and discards later ones, so a second
+                // arrival must not repaint the payload of the instance already
+                // queued — the handler is only going to run once, for the
+                // first one.
+                if t.signal_pending & (1 << (signo - 1)) == 0 {
+                    t.signal_info[(signo - 1) as usize] = info;
+                }
                 t.signal_pending |= 1 << (signo - 1);
                 if t.state == TaskState::Blocked {
                     t.state = TaskState::Ready;
@@ -506,9 +539,10 @@ pub fn deliver_signal(pid: Pid, signo: u32) -> isize {
 /// preferring one already Blocked (so the delivery also wakes it); only if
 /// every thread blocks it do we fall back to the leader, leaving it pending
 /// until some thread unblocks it — again exactly POSIX.
-pub fn deliver_signal_process(tgid: Pid, signo: u32) -> isize {
+pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isize {
     if signo == 0 || signo > 64 { return -22; }
     let bit = 1u64 << (signo - 1);
+    let idx = (signo - 1) as usize;
     let mut woke = false;
     // SIGKILL and SIGSTOP cannot be blocked, so the "does this thread have it
     // unmasked?" test must not gate their delivery. `sys_sigprocmask` already
@@ -537,9 +571,11 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32) -> isize {
             }
         }
         match chosen {
-            Some(idx) => {
+            Some(slot) => {
                 // A thread can take it now: deliver directly, waking it if blocked.
-                if let Some(t) = rq.get_mut(idx) {
+                if let Some(t) = rq.get_mut(slot) {
+                    // Same first-writer-wins rule as `deliver_signal`.
+                    if t.signal_pending & bit == 0 { t.signal_info[idx] = info; }
                     t.signal_pending |= bit;
                     if t.state == TaskState::Blocked {
                         t.state = TaskState::Ready;
@@ -557,7 +593,24 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32) -> isize {
                 // claims it in check_and_deliver_signals. No thread is woken:
                 // the unblock is itself a syscall whose return runs the claim.
                 match rq.find_pid_idx(tgid) {
-                    Some(li) => { if let Some(l) = rq.get_mut(li) { l.shared_signal_pending |= bit; } 0 }
+                    Some(li) => {
+                        if let Some(l) = rq.get_mut(li) {
+                            // The payload rides on the leader's own slot, which
+                            // is the same array the leader's *thread-local*
+                            // pending signals use. That is safe because the
+                            // 0 → 1 test spans both bitmasks: if the leader
+                            // already has this signal pending in either sense,
+                            // this arrival is a duplicate of an already-pending
+                            // standard signal and POSIX discards it, payload
+                            // included. `check_and_deliver_signals` copies the
+                            // slot to whichever thread claims the bit.
+                            if (l.signal_pending | l.shared_signal_pending) & bit == 0 {
+                                l.signal_info[idx] = info;
+                            }
+                            l.shared_signal_pending |= bit;
+                        }
+                        0
+                    }
                     None => -3, // ESRCH
                 }
             }
@@ -587,7 +640,7 @@ pub fn exists_probe(pid: Pid) -> isize {
 /// `pgid` — kill(-pgid) / killpg semantics. One delivery per process; the
 /// per-thread routing happens at handler-delivery time via the shared
 /// TGID action table.
-pub fn kill_pgrp(pgid: Pid, signo: u32) -> isize {
+pub fn kill_pgrp(pgid: Pid, signo: u32, info: task::SigInfo) -> isize {
     // Collect targets first: deliver_signal takes the RUN_QUEUE lock itself.
     let mut targets = [0 as Pid; runqueue::MAX_TASKS];
     let mut n = 0;
@@ -606,7 +659,7 @@ pub fn kill_pgrp(pgid: Pid, signo: u32) -> isize {
     if signo == 0 { return 0; } // existence probe only
     for &pid in &targets[..n] {
         // Process-directed (killpg): route to an unmasked thread per process.
-        let _ = deliver_signal_process(pid, signo);
+        let _ = deliver_signal_process(pid, signo, info);
     }
     0
 }
@@ -625,13 +678,45 @@ pub fn pending_signals() -> u64 {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.signal_pending).unwrap_or(0)
 }
 
-pub fn clear_pending_signal(signo: u32) {
+/// Accept the pending instance of `signo` for the calling task the way
+/// `signalfd`'s `read()` and `sigtimedwait(2)` do — consume the pending bit
+/// *at whichever level it is parked* and hand back the payload it carried.
+///
+/// This replaced a `clear_pending_signal` that returned nothing and cleared
+/// only the thread-local bit. Returning the [`task::SigInfo`] is the point,
+/// but the level matters just as much: the signalfd read path reports
+/// `pending_signals() | shared_pending_signals()`, so a process-directed
+/// signal parked on the leader — which is exactly where a child-exit SIGCHLD
+/// lands in a single-threaded process that has blocked it, i.e. the ordinary
+/// signalfd case — was reported again on every read, forever, because the
+/// shared half was never cleared. Two functions answering "consume this
+/// signal" is how that happened; there is now one.
+pub fn accept_pending_signal(signo: u32) -> task::SigInfo {
+    if signo == 0 || signo > 64 { return task::SigInfo::NONE; }
+    let bit = 1u64 << (signo - 1);
+    let idx = (signo - 1) as usize;
     let pid = current_pid();
-    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        if signo > 0 && signo <= 64 {
-            t.signal_pending &= !(1 << (signo - 1));
-        }
+    let mut rq = RUN_QUEUE.lock();
+    let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return task::SigInfo::NONE };
+
+    // Prefer the thread's own slot; fall back to the leader's parked one. When
+    // the caller *is* the leader these are the same slot, which is why the
+    // "which level" question only has to be answered for the bits, not the
+    // payload.
+    let mine = rq.find_pid(pid).map(|t| t.signal_pending & bit != 0).unwrap_or(false);
+    let info = if mine {
+        rq.find_pid(pid).map(|t| t.signal_info[idx]).unwrap_or(task::SigInfo::NONE)
+    } else {
+        rq.find_pid(tgid).map(|l| l.signal_info[idx]).unwrap_or(task::SigInfo::NONE)
+    };
+
+    if let Some(i) = rq.find_pid_idx(pid) {
+        if let Some(t) = rq.get_mut(i) { t.signal_pending &= !bit; }
     }
+    if let Some(i) = rq.find_pid_idx(tgid) {
+        if let Some(l) = rq.get_mut(i) { l.shared_signal_pending &= !bit; }
+    }
+    info
 }
 
 pub fn replace_signal_mask(new_mask: u64) -> u64 {
@@ -1923,16 +2008,18 @@ pub fn exit(code: i32) -> ! {
         }
     }
 
-    let (tgid, ppid) = {
+    let (tgid, ppid, status, uid) = {
         let mut rq = RUN_QUEUE.lock();
         match rq.find_pid_mut(pid) {
             Some(t) => {
                 t.state = TaskState::Zombie;
                 t.exit_code = code;
                 t.vfork_pending = false; // release a vfork-suspended parent
-                (t.tgid, t.ppid)
+                (t.tgid, t.ppid,
+                 ExitStatus { code: t.exit_code, term_signal: t.term_signal },
+                 t.uid)
             }
-            None => (pid, 0),
+            None => (pid, 0, ExitStatus::NONE, 0),
         }
     };
     // Release the /proc/self/exe side-table slot when the process leader dies.
@@ -1946,7 +2033,15 @@ pub fn exit(code: i32) -> ! {
     if pid == tgid && ppid != 0 {
         // Process-directed: deliver to any parent thread that hasn't masked
         // SIGCHLD (tokio blocks it on the main thread), not blindly the leader.
-        let _ = deliver_signal_process(tgid_of(ppid), 17);
+        //
+        // `si_code`/`si_status` come from `ExitStatus`, never recomputed here.
+        // This is the *third* consumer of "did the child exit or was it
+        // killed?", after `wait4`'s packed status and `waitid`'s siginfo, and
+        // those two already drifted once (si_code was hardcoded `CLD_EXITED`
+        // while `wait_status()` reported the kill). A SIGCHLD handler that
+        // switches on `si_code` and a `waitpid` caller that decodes the packed
+        // status are looking at the same death and must agree.
+        let _ = deliver_signal_process(tgid_of(ppid), 17, SigInfo::child(pid, uid, status));
     }
     yield_now("exit");
     loop { core::hint::spin_loop(); }
