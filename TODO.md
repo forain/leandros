@@ -2110,6 +2110,42 @@ and a hand on the mouse guarantees it is not empty. It is not a defect in that r
 
 ### 14. VT switching — the display arbitrates; the input devices still do not
 
+**PIECE 3 MEASURED 2026-08-10 (x86_64/KVM) — the shim is a correct producer, and it is
+disabled in production.** Full write-up + screenshots:
+`artifacts/notes/item14-libseat-vt-measurement.md`. Two COSMIC sessions were driven
+`Ctrl+Alt+F2` → `Ctrl+Alt+F1` with `driver.py chord`. No instrumentation was written —
+the shim's own `LEANDROS_INPUT_TRACE` was enough, and `SEAT_TRACE_BUDGET` is a non-issue
+because smithay calls `dispatch()` only when `get_fd()` is readable (13 lines for a whole
+session plus two switches).
+
+- **As shipped: zero events, ever.** `owned_vt()` fails, `get_fd()` returns the inert
+  eventfd, and the trace file is **byte-identical** across a full round trip. `98b4a52`
+  fixed the dead fd; nothing reaches the path that would use the live one. The break is
+  **one step earlier than this item assumed**: `ttyname_r` does not return `/dev/console`
+  to be rejected by the prefix test, it returns **ENOTTY (rc=25)** — musl calls `isatty()`
+  first and that fails on the fd `open("/dev/tty")` yields. **A fix that only corrects the
+  name is therefore not enough.** Cause: nothing in the chain ever makes a `/dev/ttyN`
+  anyone's ctty (`init` runs `TIOCSCTTY` on the console fast path, which records no
+  per-session ctty), and nothing sets `XDG_VTNR`.
+- **With `XDG_VTNR=1`: correct.** `disable_seat` then `enable_seat`, **exactly once each,
+  in that order, on the right edges**. `is_active()` demonstrably observed both — the proof
+  is that cosmic-comp **closed both evdev fds on deactivate and reopened them on activate**.
+  `card0` is deliberately *not* closed, which is why the auto-rearm covers the return.
+  **The one-line fix is to export `XDG_VTNR` in the session launch path.**
+- **The input half needs re-stating.** The *kernel* still does not gate `/dev/input/*`.
+  But "a backgrounded client still sees the keyboard and mouse" does not survive a working
+  seat event: a libseat consumer releases the devices itself. The kernel gate is defence
+  against clients that do not, not the only route.
+- **EACCES: cosmic-comp got it and recovered — behaviourally, not by logged errno.** With
+  no `disable_seat`, it kept presenting into a VT it no longer owned; the screen stayed
+  **black for the full 20 s** (pre-`f6ebb8b` it returned within one flip) and came back
+  intact on F1 with its clock advanced 87 s, no re-init, no `SET_MASTER`. **The caveat
+  below is confirmed in its consequence but smithay is still unread**, and there is still
+  no *count*: the kernel logs nothing on refusal, and `cosmic-session` panics early in
+  `parse_and_handle_ipc` — it is what relays cosmic-comp's stderr, so the session log dies
+  before the switch. A count needs a print in `master_gate`'s `Err(_)` arm; note the
+  `drivers` crate has **no print facility at all** today.
+
 **Pieces 1 and 3 are done; piece 2 is now three-quarters done — the DRM master half
 landed 2026-08-10, the `/dev/input/*` half has not.** Six VTs exist (`servers/tty/src/vt.rs`,
 `/dev/tty0`..`/dev/tty6`), the VT/KD ioctl set is implemented, the `VT_PROCESS`
@@ -2288,7 +2324,7 @@ why they are recorded even though each fix is small.
    output produced *after* that command was sent; the `start_len` guard is what stops it
    matching a prompt already in the transcript. `step_timeout` remains a cap for commands that
    never return a prompt, which is what `evsplit` is as a held final command.
-   **Both fixes are syntax-checked only — neither has been run against a live QEMU.**
+   **Chord injection RAN against live QEMU 2026-08-10 and worked first try** — four `driver.py chord ctrl alt f{1,2}` injections across two COSMIC sessions, four VT switches, no misses and no stuck modifiers (the desktop kept taking input after every return). That is the measurement piece 1 existed for. `cmd_session`'s fix is still syntax-checked only.
 3. **"`--venus` cannot photograph a session at all" — STALE, and it was already solved when
    this was written.** The `screendump`/QMP half is still true and still worth knowing:
    `virgl_cmd_set_scanout()` leaves `console->scanout.kind = SCANOUT_TEXTURE` and
