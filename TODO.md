@@ -3,16 +3,182 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-08**. **LeandrOS now boots to a graphical
-login**: upstream `kennylevinsen/greetd` drives `cosmic-greeter`, which runs unprivileged at
-uid 990, authenticates against `/etc/shadow`, and hands off to a COSMIC desktop —
-photographed on **both** arches, on freshly generated images. Scope changed under this wave
-by decision, not by measurement: the greeter, **PAM**, **utmpx** and **VT switching** all
-left *Explicitly out of scope* (items 12-14), and every conclusion that rested on them being
-out of scope is void.
+Last reconciled against `main` on **2026-08-10**. **LeandrOS has a PTY subsystem, six virtual
+terminals, and a terminal emulator on the desktop.** `cosmic-term` is photographed on **both**
+arches inside COSMIC over the Orion Nebula wallpaper with a live `brush-0.5#` prompt, and `id`
+typed through the emulated keyboard executed and printed
+`uid=0(root) gid=0(root) groups=0(root)`. It gets there through a graphical login: upstream
+`kennylevinsen/greetd` drives `cosmic-greeter`, which runs unprivileged at uid 990,
+authenticates against `/etc/shadow`, and hands off to a COSMIC desktop — photographed on both
+arches, on freshly generated images.
 
-**The wave's defining pattern was refutation, and it is worth stating before the results
-because it is the reason to distrust the rest of this file.** Four separate items were
+**Scope changed on 2026-08-08 by decision, not by measurement**: the greeter, **PAM**,
+**utmpx** and **VT switching** all left *Explicitly out of scope* (items 12-14), and every
+conclusion that rested on them being out of scope is void. **VT switching has since landed**
+(item 14); PAM (12) and utmpx (13) are untouched.
+
+---
+
+**What landed on 2026-08-10, all verified on both arches, on freshly generated F2FS images,
+release builds.** The first two are the pieces this file had been sizing wrongly; the last two
+are what fell out of trying to put a shell on the result.
+
+**A complete PTY subsystem.** `servers/tty/src/pty.rs` is new: a pair pool plus a full termios
+line discipline — canonical line editing with `VERASE`/`VKILL`/`VWERASE`, `ISIG`, echo with
+`ECHOCTL`/`ECHOE`, `OPOST`/`ONLCR`, EOF and hangup. `/dev/ptmx`, `/dev/pts/N`, `TIOCGPTN`,
+`TIOCSPTLCK`, `TIOCGPTPEER`, `TIOCSCTTY`, `TIOCSWINSZ`+`SIGWINCH`, and `SIGHUP` on hangup.
+`TIOCGPTPEER` is implemented **properly** — a kernel intercept shaped like
+`DRM_IOCTL_PRIME_HANDLE_TO_FD`, not faked — because returning the conventionally-correct
+`ENOTTY` for it makes **every terminal tab fail to open** (see *The PTY contract `cosmic-term`
+enforces* under Standing context). **The dead skeleton is gone**: `TtyKind::PtsMaster/PtsSlave`,
+`PTS_PAIRS`, `TTY_FD_BASE` and the unroutable `TTY_OPEN/READ/WRITE/CLOSE` handlers are deleted
+and `servers/tty/src/lib.rs` is **468 lines smaller**. `ptytest` **15/15** both arches, and
+**`brush` runs interactively on a pty**: `echo $((21*2))` → `42`, real reedline with bracketed
+paste and CPR probes.
+
+**VT switching — all three pieces of item 14, in one wave.** `servers/tty/src/vt.rs` is new:
+6 VTs with per-VT screen planes, `/dev/tty0`..`/dev/tty6`, `VT_OPENQRY`/`GETMODE`/`SETMODE`/
+`GETSTATE`/`RELDISP`/`ACTIVATE`/`WAITACTIVE`/`DISALLOCATE`, `KDSETMODE`/`KDGETMODE`/
+`KDGKBMODE`/`KDSKBMODE`/`KDGKBTYPE`/`KDSETLED`/`KDGETLED`, the full `VT_PROCESS`
+release/acquire handshake, and Ctrl+Alt+Fn. `vttest` **12/12** both arches. **Photographed**:
+VT 1 carries the boot log, VT 2 shows only its own text, and switching back repaints VT 1
+intact. `KD_GRAPHICS` freezes the screen, and a line written during it appears only after
+`KD_TEXT` repaints — **which is what proves the repaint comes from a mirror that kept
+accumulating while muted, rather than from a clear.**
+
+Four design decisions there, each with its reason, because none is Linux's:
+
+1. **A 5 s watchdog Linux does not have** backs the `VT_PROCESS` handshake. Item 14's own
+   stated reason for reopening was "cannot switch away from a wedged compositor", and **a
+   compositor wedged enough never to run its handler still passes Linux's delivery check.**
+2. **`VT_WAITACTIVE` completes on activation, not on the acquire ack**, so a client that never
+   sends `VT_RELDISP(VT_ACKACQ)` cannot hold every waiter on the system. The missing ack blocks
+   only the next switch.
+3. **The chord is hooked at `evdev::push_event`** — the single choke point every keyboard
+   source funnels through — so a USB HID path added later is covered without being listed
+   anywhere. That is the same argument `drm_scanout_claim` makes against an ioctl allow-list.
+4. Built **on** `SCANOUT_OWNER`/`drm_scanout_claim` as item 14 instructed, not replacing it.
+   `set_console_disabled(false)`'s clear-and-print-`[Console Resumed]` — the single-console
+   assumption, written into the code — is gone, in favour of repainting the target VT's saved
+   text.
+
+**evdev per-open client queues — the measured `dev=0 push=128 conspop=112 deliv=16` defect.**
+Queues are keyed on the VFS `open_id` cookie, broadcast on push, with Linux's `SYN_DROPPED`
+overflow policy and per-open poll readiness. The kernel console drain is now a registered
+pseudo-client (`open_id = u32::MAX`), gated on `vt::console_keyboard_active()` so a
+`KD_GRAPHICS` or `K_RAW` VT no longer feeds the line discipline. **Measured:** event1, 2
+readers, 60 moves — before **A=30 B=30** (split), after **A=60 B=60** (broadcast). event0, 2
+readers plus the console, 10 keys — before A=6 B=4, console 0, prompt echoed nothing; after
+**A=10 B=10, console 10**, prompt echoed `aaaaaaaaaa`. `K_RAW` then silences the console while
+both readers still get all 10.
+
+**A correction from that lane worth recording as a landmine.** Gating the console tap on
+Linux's rule that a raw-mode VT's keystrokes never reach the tty would have **cut serial input
+off the moment a compositor set `KD_GRAPHICS`**. Linux is safe there because its serial console
+is a *separate tty*; ours is not — `arch/*/timer.rs::on_tick` manufactures a synthetic `EV_KEY
+value == 2` on the keyboard node for every UART byte. The gate carries an explicit `value == 2`
+exemption, verified against all four producers. **A rule copied from Linux is only safe if the
+architectural fact underneath it is also true here.**
+
+**Signal and wait-status correctness, found while getting a shell onto a pty.** A
+default-action signal terminated the task via `exit_group(128 + signo)`, so `waitpid` reported
+`WIFEXITED` with `128+signo` and **never `WIFSIGNALED`**. `128+signo` is the *shell's*
+convention for `$?`, not the kernel's wait encoding. `sched::exit_group_signal` now stamps the
+terminating signal on every thread in the group **before** the group kill, because an
+`ExitRecord` is immutable once written and `kill_next_group_member` can reap a sibling
+immediately. **Two further instances of the same shape**: `sys_waitid`'s `si_code` was
+hardcoded `CLD_EXITED`, so a consumer switching on it would have gone on seeing a clean exit
+even after `wait4` was fixed; and unhandled user faults called `exit_group(1)`, so a real
+segfault reported `WIFEXITED status 1`. Fault paths now decode per-vector on both arches —
+x86 `#UD`→SIGILL, `#DE`→SIGFPE, `#GP`/`#PF`→SIGSEGV, `#NP`/`#SS`/`#AC`/`#MC`→SIGBUS,
+`#DB`/`#BP`→SIGTRAP; aarch64 decodes `ESR_EL1.EC` plus the abort FSC (alignment and
+sync-external → SIGBUS, translation / access-flag / permission → SIGSEGV). **A kernel-mode
+abort on a user address is always SIGSEGV** — the faulting access was the kernel's, but the
+task's error is the pointer. **`WCOREDUMP` is never set, deliberately and test-enforced**: we
+write no core files, and claiming a dump sends shells printing "(core dumped)" and artifact
+collectors after a file that does not exist. `waittest` **9/9** both arches, with cases for
+SIGTERM, SIGKILL, normal exit, SIGSEGV and SIGILL.
+
+**Four latent bugs the pty work surfaced. Three of them succeed at the wrong thing rather than
+failing, which is why nothing had ever reported them.**
+
+1. **`/dev/tty` resolved unconditionally to `DevStdio { target_fd: 0 }`** — the machine
+   console, for every process. It does not fail; it **succeeds at the wrong terminal**. A
+   process under a terminal emulator would read the machine keyboard and paint on the
+   framebuffer while the emulator saw nothing. It now resolves through
+   `pty::ctty_for_sid(current_sid())`, and `stat("/dev/tty")` follows the same resolution so
+   `ttyname()` does not reject the fd.
+2. **`TIOCSCTTY` on a pty *master* was an accepted no-op**, commented "meaningless but
+   harmless". It let a terminal emulator claim the pair as its own controlling terminal, which
+   — after fix 1 — would point the emulator's own `/dev/tty` at the slave it drives. Linux's
+   `ptmx` has no `TIOCSCTTY` either.
+3. **`poll_fd_state_nested` short-circuited fd 0 to serial readiness and fd 1/2 to
+   unconditional `POLLOUT`, with no `fd_redirected` equivalent** — read and write both carried
+   the guard; poll never learned it. A shell with pty stdio would have polled the UART. Same
+   shape in `probe_fd_events_seq_nested`, which forced `fd <= 2` level-triggered.
+4. **A lock-order inversion in `pty::ioctl`**: `TIOCSCTTY`/`TIOCGPGRP`/`TIOCGSID` called
+   `sched::current_sid()` **while holding the pool lock**, taking `RUN_QUEUE` underneath it —
+   the exact shape recorded under *Kernel invariants* that once froze all four vCPUs.
+
+**And one that had been silently corrupting every key-injection measurement in the project.**
+`read_input_byte`'s `_ =>` arm emitted any unmapped hardware key-down whose evdev code fell in
+32..127 **as that literal byte** — so pressing Alt typed `8`, F1 typed `;`, F2 typed `<`.
+Tracing every producer showed the arm is reachable **only** with `value == 1` (a real
+key-down), because the `value == 2` serial branch returns unconditionally above it: **its
+stated justification — "already ASCII-range, e.g. from UART" — was false for every input it
+ever saw**, and the surviving control allow-list was dead too (codes 8/9/10/13 are
+`KEY_7`/`KEY_8`/`KEY_9`/`KEY_EQUAL`, all mapped above it). It is now `_ => 0` plus an explicit
+keypad block, because the keypad was producing *wrong* characters through the same fallback
+(KP7 typed `G`, KP5 typed `L`). Measured: injecting alt/ctrl/f1/f2/f8 turned `echo MARK` into
+`echo MARK8;<B`, with the `<` parsed by brush as a redirect. **This is why `driver.py cmd`
+behaved erratically during chord runs.**
+
+**`cosmic-term` is built, staged and running.** From `../cosmic-epoch` at `epoch-1.3.0`
+(`44d042f`), `--no-default-features --features wayland,wgpu`, **first attempt, no source
+patches**. Staged to `/bin` with a `.desktop`, an icon and terminfo (`xterm-256color`, `xterm`,
+`linux`, classic 16-bit `0x011A` format). It is **the first `.desktop` in the image without
+`NoDisplay=true`**. The durable finding is not that it runs but *what it demands of the
+kernel*: see *The PTY contract `cosmic-term` enforces* under Standing context.
+
+**Suite, all on freshly regenerated images, both arches:** `ptytest` **15/15**, `vttest`
+**12/12**, `waittest` **9/9**, `vfstest` **36/36**, `polltest` **6/6**, `epolltest` **10/0**,
+`evtest2` **8/8**, `evsplit` **BROADCAST 60/60**.
+
+**Conclusions in this file that the above voids. Recording these is worth more than the new
+content, because every one of them was written here in good faith with evidence beside it.**
+
+1. **The `servers/tty/src/lib.rs` sizing correction, and with it "`cosmic-term` is a 2-3 week
+   kernel feature wearing a build task's clothes".** The paragraph that stood in this preamble
+   read that file's 957 lines — a header advertising "termios line discipline **and PTY
+   pairs**", `TtyKind::PtsMaster/PtsSlave`, a `PTS_PAIRS` table — as "~0% done, maybe 100 lines
+   of salvage". **The dead-skeleton half was right, and the deletion proves it** — that code is
+   gone and the file is 468 lines smaller. **The estimate was wrong because of an assumption
+   nobody stated**: it sized a PTY as a *second fd class*, which is what the dormant
+   `TTY_FD_BASE` range implied. Modelling the pair as `VnodeKind::Pty { pair, is_master }` —
+   deliberately the same shape as `VnodeKind::Pipe { ring, is_write }` — inherits `dup2`,
+   `fork`, `O_NONBLOCK`, epoll and `SCM_RIGHTS` from the fd table that already exists, and none
+   of that had to be written at all. **Size a feature from the abstraction it can join, not
+   from the dead code that claims to implement it.**
+2. **Item 14's sequencing — "this is the largest of the three and the least urgent … do items
+   12 and 13 first" — is overtaken.** VT switching landed **before** PAM (12) and utmpx (13),
+   both of which remain open and untouched.
+3. **Item 14's three-piece breakdown is now one and a half pieces.** Piece 1 (the console
+   side) is done and photographed. Piece 2 is **half** done: the evdev per-open queues
+   landed, but **DRM master handoff and reopening `/dev/input/*` on switch did not** —
+   `fb_vt_scanout_revoke` takes the surface back and **the client's next present re-claims
+   it**. Piece 3 (the libseat shim) is **written but unmeasured** — see the caveat in
+   item 14's body, and do not count it until a compositor has been switched away from.
+4. **Item 8's "there is still nothing to run … no terminal exists among 175 `/bin` names".**
+   cosmic-term ships and runs.
+5. **Anything in this file asserting the libseat shim *cannot* emit session events.** It has
+   the machinery now, driven by `/dev/tty0`. Item 14's piece 3 and item 5's libseat entry both
+   said so; both are corrected in place. Note the correction is narrow — "cannot" became
+   "should, untested", not "does".
+
+---
+
+**The 2026-08-08 wave's defining pattern was refutation, and it is worth stating before the
+results because it is the reason to distrust the rest of this file.** Four separate items were
 investigated and **four recorded causes turned out to be wrong** — not incomplete, wrong —
 and in three of the four the *instrument or the harness was the defect*:
 
@@ -51,15 +217,7 @@ child from `env::args().skip(1).next()`** — the first argument, whatever it is
 flag parser ignores unknowns, so a misordered flag leaves a healthy compositor on a cleared
 screen.
 
-**A sizing correction that matters more than any single fix.** `servers/tty/src/lib.rs` is
-957 lines whose header advertises "termios line discipline **and PTY pairs**", with
-`TtyKind::PtsMaster/PtsSlave` and a `PTS_PAIRS` table. **It is entirely unreachable** — the
-kernel only ever sends `TTY_IOCTL`, and five of six handlers are dead. Sizing from that
-header gives "~80% done"; the truth is ~0%, with maybe 100 lines of salvage. **`cosmic-term`
-is therefore a 2-3 week kernel feature wearing a build task's clothes**, and item 8's second
-half is two pieces of very different size presented as one.
-
-**Two lessons from this wave that generalise, both about sizing rather than engineering.**
+**Two lessons from that wave that generalise, both about sizing rather than engineering.**
 
 1. **Two of the four "open" items were never work.** Item 1 is a finding whose own text says
    the fix is undecided and warns against implementing one; item 3 is dead by measurement
@@ -188,12 +346,12 @@ inferred is that the input held a rect of ≥ 1,809,216 px.
    `phase6` assertions — phase 6 arrived with `49399f9`. Sixteen new report sites, one
    (`phase6_open_card0`) reachable only on the failure path, so fifteen emit: 91 + 15 =
    106, plus 2 = 108.
-3. **`waittest` has 4 subtests and scores 4/0 or 3/1**, the failure being the known
-   `wait_on_process_group` race. The recorded "5/0 or 3/2" is unreachable against the
-   source, and the cause is now known: `waittest` prints a trailing `WAITTEST: PASS`
-   summary line *on top of* its four subtests, so a naive `grep -c ': PASS'` reads one
-   high. Record the explanation and not just the number — the same extractor may still be
-   in use elsewhere.
+3. **`waittest` prints a trailing `WAITTEST: PASS` summary line *on top of* its subtests, so
+   a naive `grep -c ': PASS'` reads one high.** That is what made "5/0 or 3/2" unreachable
+   against a source file holding four cases. Record the explanation and not just the number —
+   the same extractor may still be in use elsewhere. **Count updated 2026-08-10: nine
+   subtests, 9/0 on both arches** (the five signal-encoding cases arrived with the pty wave).
+   The summary line is unchanged, so the trap is unchanged.
 4. **The handle-retirement item's severity claim was wrong.** It was not one leaked object
    per composited frame. cosmic-comp exports **per buffer at allocation, not per frame**,
    measured in `artifacts/notes/m9-dmabuf-lifetime/mac-verify.md` §5.3-5.5:
@@ -269,10 +427,13 @@ upstream bug report — the primary-plane damage — turned out to have no upstr
 
 **Where it stands.** The desktop runs on both arches: cosmic-session → cosmic-comp on
 KMS/softpipe → busd → cosmic-bg + cosmic-panel renders a wallpaper plus a full-width
-panel bar with an embedded Wayland client, clock ticking. **"Remaining desktop work is
-quality and performance, not bring-up" was wrong** and is corrected by the survey in *Road to
-a complete COSMIC desktop* below: **no input of any kind reaches the compositor**, and no
-libcosmic/iced application renders at all. Both are bring-up, not polish. Vulkan runs **and presents**: `vkrender` executes
+panel bar with an embedded Wayland client, clock ticking — and **a real terminal emulator on
+top of it**, `cosmic-term` on a kernel pty, taking keystrokes and running commands (item 8).
+Behind it are six text VTs reachable with Ctrl+Alt+Fn (item 14). The survey in *Road to a
+complete COSMIC desktop* below opened with **"no input of any kind reaches the compositor"**
+and **"no libcosmic/iced application renders at all"**; **both were refuted by measurement**
+(items 6 and 7) and neither should be quoted from that survey again. Vulkan runs **and
+presents**: `vkrender` executes
 fill-buffer, compute and graphics work, `vkswap` drives a headless-surface swapchain to
 `vkQueuePresentKHR -> VK_SUCCESS`, and `vkrender --present` puts a rendered image on a
 real DRM scanout.
@@ -282,11 +443,16 @@ arches: vfstest **36/0**, scmtest **36/0** (was 32 here and 35 in the tree; item
 `fork_inherits_pending_connector` made it 36), drmsmoke **29/0** (22 → 25 with `edad115`'s console guards, → 29 with `c8cbbc1`'s atomic lane), wakepolltest 10/0,
 forktest 3/0, epolltest **10/0** (was 9/0 — `proc_pid_exe` added with the
 `/proc/<pid>/exe` fix), polltest 6/0, sigtest 6/0, timertest 6/0, memtest 4/0,
-idletest 2/0 (`IDLE_CPU_US 0`), evtest2 8/0. `waittest` has **4** subtests and is **4/0 or 3/1 on either arch** (a harness reporting 5/0 is miscounting the summary line — see instrument entry 11) — a pure timing race in `fork` → child `setpgid(0,0)`+`_exit` →
-parent `waitpid(-pid)`, measured on pristine kernels too; either result is acceptable on
-either arch and the arch asymmetry in any single wave is noise. Note that `waittest` also
-emits a trailing `WAITTEST: PASS` summary line, which a `grep -c ': PASS'` will miscount as
-a fifth subtest. On a **Venus host** (the Linux box, `--venus`): `venustest` **108/0 both
+idletest 2/0 (`IDLE_CPU_US 0`), evtest2 8/0, **ptytest 15/0**, **vttest 12/0**, and
+**evsplit `BROADCAST 60/60`** (two readers of one evdev node, 60 injected moves; a split
+delivery reads 30/30 and is the pre-broadcast signature). `waittest` has **9** subtests since
+the pty wave added SIGTERM/SIGKILL/normal-exit/SIGSEGV/SIGILL encoding cases, and is **9/0 on
+both arches**; its one historical red is `wait_on_process_group`, a pure timing race in `fork`
+→ child `setpgid(0,0)`+`_exit` → parent `waitpid(-pid)`, measured on pristine kernels too, so
+a single flake there is acceptable on either arch and the arch asymmetry in any wave is noise.
+Note `waittest` also emits a trailing `WAITTEST: PASS` summary line, which a
+`grep -c ': PASS'` miscounts as an extra subtest — read the binary's `failures = N` trailer
+instead. On a **Venus host** (the Linux box, `--venus`): `venustest` **108/0 both
 arches**, `vktest` 14/0, `vkrender` **51/0** with `s2_checksum = 0x02C0FDC5` pinned across
 x86_64/KVM, x86_64/TCG and aarch64/TCG, `vkswap` **21/0** (x86_64). `vkrender` under KVM
 does **not** need `VN_PERF=no_fence_feedback`; that dependency died with `18a7a9f`.
@@ -367,9 +533,12 @@ the gap is ever closed.
   KMS path is live and preferred; the legacy path still works but cannot drive a
   cursor plane.
 - Seat/input: **shim** libseat and libudev; **port** real libinput and libxkbcommon.
-  No seatd, no udevd. **VT switching is now IN SCOPE** (items 12-14) — it was
-  previously listed as out of scope, and the whole greeter design was built to route
-  around it. That routing stays correct as an interim, but it is no longer the end state.
+  No seatd, no udevd. **VT switching is implemented** — six VTs, the VT/KD ioctl set and
+  Ctrl+Alt+Fn (item 14) — reversing the original out-of-scope decision. The libseat shim is
+  now a *producer* as well as a consumer: it emits
+  `SessionEvent::ActivateSession`/`Deactivate` driven by `/dev/tty0`. The greeter design's
+  routing around VTs (root compositor, unprivileged client) stays correct as an interim,
+  because **DRM master handoff is still missing** — see item 14.
 - D-Bus: **busd** (pure Rust, from the zbus authors). Reference `dbus-daemon` is the
   fallback if it proves immature.
 - `start-cosmic` runs under **brush**; the boot path is login → root → `start-cosmic`
@@ -392,8 +561,35 @@ the gap is ever closed.
   `execve` on it fails with `Exec format error`. Launch it as
   `brush /bin/start-cosmic-leandros` (item 4).
 
+**The PTY contract `cosmic-term` enforces — these are kernel behaviours, not libc
+conventions.** It reaches the kernel through `rustix 1.1.4`'s `linux_raw` backend, i.e. **raw
+`syscall` instructions, bypassing musl entirely**, so none of this can be absorbed by a libc
+shim later. The sequence is `openat("/dev/ptmx", O_RDWR|O_NOCTTY|O_CLOEXEC)` → `grantpt` (a
+literal no-op on Linux) → `ioctl(TIOCSPTLCK, &int(0))` → `TIOCGPTPEER`, falling back to
+`TIOCGPTN` + `open("/dev/pts/N")` **only on `ENOSYS` or `EPERM`**
+(`rustix-openpty-0.2.0/src/lib.rs:243-247`). **So returning the conventionally-correct
+`ENOTTY` for an unimplemented ioctl makes every terminal tab fail to open** — the fallback is
+never reached, and the correct-looking errno is the bug. Four further hard requirements:
+master is set `O_NONBLOCK` with `fcntl(F_SETFL)` wrapped in `assert_eq!(res, 0)`; the reader
+is one dedicated thread on **level-triggered** `epoll_pwait`; **`read()` on a master whose
+slave is gone must return `EIO`** — `event_loop.rs:282-290` swallows EIO and waits for
+SIGCHLD, so returning EOF instead is an unbreakable 100% CPU spin; and resize is `TIOCSWINSZ`
+on the **master**, with alacritty never sending `SIGWINCH` itself. Panic traps, each of which
+kills the tab outright: `assert_eq!(entry.pw_uid, uid)` (`unix.rs:93`), the `F_SETFL` assert
+(`:436`), and `die!` → `exit(1)` on a failed `TIOCSCTTY` (`:55`) or `TIOCSWINSZ` (`:414`). It
+**daemonizes by default** (`main.rs:148`) — run it `--no-daemon` or lose stderr.
+
 **Kernel invariants.**
 
+- **`/dev/tty` is per-session, and our serial console is NOT a separate tty.** `/dev/tty`
+  resolves through `pty::ctty_for_sid(current_sid())`, so a process under a terminal emulator
+  reaches the emulator's slave rather than the machine console; `stat("/dev/tty")` follows the
+  same resolution, or `ttyname()` rejects the fd. The second half is the trap: Linux can
+  silence a raw-mode VT's keystrokes wholesale because its serial console is a *different*
+  tty. Ours is the same one — `arch/*/timer.rs::on_tick` manufactures a synthetic `EV_KEY
+  value == 2` on the keyboard node for every UART byte. **Any gate on the console keyboard tap
+  must exempt `value == 2`**, or serial input dies the instant a compositor sets
+  `KD_GRAPHICS`.
 - **Filesystem permissions are enforced on ONE operation only: `open(2)` of an inode that
   already exists.** Measured 2026-08-08 by enumerating every `xattr::access_check` call
   site in the tree; there are five outside the xattr crate's own gates, and **each takes a
@@ -663,7 +859,9 @@ generalises; the specifics are what make each one actionable.
     harness walking into it**, because each new harness re-implements the extractor from
     scratch. The durable fix is to stop counting lines and read the binary's own
     `failures = N` trailer, which every one of these test binaries prints and which cannot be
-    inflated by a summary line.
+    inflated by a summary line. (`waittest` now holds **nine** cases, not four; the trailing
+    summary line is unchanged, so the trap is unchanged and the counts a stale harness quotes
+    will simply be wrong by one in a new place.)
 12. **`grep` over a serial log sharing a pty with QEMU's trace stream.** With
     `-trace virtio_gpu_cmd_*` and no `-D`, every guest character triggers a console flush, so
     trace lines land *between* the guest's bytes: `present_addfb2: PASS` arrived as twenty
@@ -784,7 +982,9 @@ argued the honest fix for its permanent patch was to stop shipping it; and PAM/u
 were the three couplings cited when recommending against porting upstream greetd. **All
 of that reasoning is void.** The measurements underneath it survive and are still
 useful — what expired is every conclusion that rested on the scope. Read any older
-paragraph that leans on "out of scope" with that in mind.
+paragraph that leans on "out of scope" with that in mind. **VT switching has since been
+implemented** (item 14), which is the second time in three days that a paragraph arguing
+from this list's contents outlived the list.
 
 ---
 
@@ -794,15 +994,19 @@ paragraph that leans on "out of scope" with that in mind.
 |---|---|---|---|
 | 6 | Input reaches clients **losslessly**; the "starvation" was the harness | Bug — **CLOSED** `af9f076` | 100% at 60 moves/s; a parked serial reader wedged the tick |
 | 7 | libcosmic apps **block in a D-Bus probe**; they render fine | Bug — **FIXED** `85f2f4c`+`daa2815` | busd answers `ServiceUnknown`; 4 parked components alive, both arches |
-| 8 | Nothing to launch, and no way to ask for it | Feature — **config DONE**; rest **MIS-SIZED** | `cosmic-term` needs a PTY layer (2-3 wks), not a build |
+| 8 | ~~Nothing to launch, and no way to ask for it~~ — a terminal ships and runs | Feature — config + terminal **DONE**; keybindings residual **OPEN** | `Super+F9` control still fails, and its attribution died with item 6 |
 | 9 | **5 real applets now ship and run; 2 of them paint nothing** | Feature — panel-death **FIXED**; rendering **OPEN** | 8 processes, 0 exits; tiling + minimize draw zero pixels |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
 | 15 | ~~386 KB of extra `.data` stopped the Linux box booting~~ — it was a **kernel stack overflow** | Bug — **CLOSED** | Not image size and not host-specific: a 155,880 B frame on a 64 KiB stack. Stacks now 128 KiB, frames gated at build time, canary on syscall return |
 | 16 | ~~Mouse input dead on the Linux box "in both arches"~~ — it was **one arch, and no pointer device at all** | Bug — **CLOSED** | `run-qemu.sh` attached `virtio-tablet-pci` only on aarch64; x86_64 got q35's PS/2 mouse, which has no driver. Guest stack cleared at every layer first; real mouse now moves and clicks on both |
 | 11 | **PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — greeter one **RETIRED**; session one **cause FIXED** `2d9f0c8` | One patch left; handshake completes 5.022 s → 2.186 s |
-| 12 | **PAM — real support, replacing the C shim** | Feature — **NEW, in scope** | Shim authenticates for real but is C, untracked, coverage unverified |
-| 13 | **utmpx — session accounting, currently absent** | Feature — **NEW, in scope** | Nothing in tree; need is unmeasured |
-| 14 | **VT switching — was out of scope, now required** | Feature — **NEW, in scope** | No VTs at all; greeter design routes around it |
+| 12 | **PAM — real support, replacing the C shim** | Feature — in scope, **untouched** | Shim authenticates for real but is C, untracked, coverage unverified |
+| 13 | **utmpx — session accounting, currently absent** | Feature — in scope, **untouched** | Nothing in tree; need is unmeasured, and the assumed driver is gone |
+| 14 | **VT switching — six VTs land; device arbitration does not** | Feature — **half done** | `vttest` 12/12, switch photographed; DRM master handoff + `/dev/input/*` reopen absent |
+| 17 | **aarch64: `cosmic-term` shows a prompt but no command output** | Bug — brush/reedline, **not kernel** | `stty size` = 29 118 correct; x86_64 shows the CPR reply echoed as `^[[1;14R` |
+| 18 | **Harness gaps: no QMP in `driver.py`, `evsplit` starves, `--venus` cannot screendump** | Debt — instrument | Each one fails toward looking like a guest bug |
+| 19 | **The two artifacts trees diverged again** | Debt — process | Mac says cosmic-term is unbuilt; the box built it. Diff the trees first |
+| 20 | **`EVIOCGRAB` accepted but not enforced** | Feature — **deliberately held back** | Safe only now the chord pre-empts routing; needs a hand-verified round trip |
 | 1 | A host-refused `RING_IDX` submit costs a full control-queue timeout | Finding — **no action** | Recorded on purpose; fix undecided |
 | 2 | M4 — **COMPLETE, photographed on BOTH arches** | Feature — **DONE** | `132d4df` x86_64, `d91edbf` aarch64 |
 | 3 | Cross-open dmabuf import — dead as an M4 route, alive for other reasons | Feature — deferred | Nothing scheduled |
@@ -1071,7 +1275,10 @@ via `add_directive`, which `RUST_LOG` **cannot** override, *and* its `fmt::layer
 **stdout**, not stderr. So the discarded-stderr finding above is real but insufficient — fixing
 it alone would still yield nothing.
 
-**Three suspects remain, cheapest first.**
+**Three suspects remain, cheapest first.** (All three were subsequently eliminated — see the
+top of this item. Suspect 2 is doubly dead as of 2026-08-10: **the shim now does emit session
+events**, driven by `/dev/tty0`, because VT switching landed. The paragraph is kept for its
+last three sentences, which are the durable part.)
 1. **`~/.config/cosmic/com.system76.CosmicComp/v1/input_devices` with `state: Disabled`**
    produces exactly this symptom. Nearly free to check.
 2. **Our own libseat shim may never activate the session.** It fires `enable_seat`
@@ -1093,13 +1300,14 @@ events ⇒ cosmic-comp's input path is fine and the failure is cursor/render-sid
 nothing ⇒ cosmic-comp drops them. That halves the remaining space before any suspect is
 touched.
 
-**Three further defects the census exposed, none of which is the cause.**
+**Three further defects the census exposed, none of which is the cause.** (The fourth,
+"the in-kernel console steals keyboard events" — `dev=0 push=128 conspop=112 deliv=16` — is
+**fixed**: evdev keeps per-open queues keyed on `open_id` and broadcasts on push, taking two
+readers of event0 from `A=6 B=4, console 0` to `A=10 B=10, console 10` on 10 keys. See the
+header.)
 - **~91% of injected pointer motion is lost between QEMU and the guest ring**: 4632 QMP events
   accepted, **0 rejected**, → **412** evdev pushes (a session run: 3618 → 552). Even a fixed
   compositor would get a badly decimated pointer.
-- **The in-kernel console steals keyboard events**: `dev=0 push=128 conspop=112 deliv=16`.
-  `read_input_byte` pops from evdev device 0, and our evdev has **one ring per device**, not a
-  per-open client queue as Linux has — so **two readers rob each other**.
 - `servers/evdev/src/lib.rs` answers `EVIOCGVERSION` by returning the version as the syscall
   *value* instead of writing it to the user pointer. libevdev only checks `rc < 0`, so it is
   not fatal, but `driver_version` is left uninitialised.
@@ -1330,7 +1538,7 @@ session log (not a tail) and count `busd::peers: unknown destination:` by name. 
 `com.system76.Cosmic*` line per single-instance component confirms they have been blocked at
 startup every boot; their absence refutes it and leaves item 8's attribution intact.
 
-### 8. Nothing to launch, and no way to ask for it
+### 8. There is something to launch now; what is left is asking for it by keyboard
 
 **One 2,867-byte data file disables every system keybinding in the desktop.**
 `Action::System(system)` is handled as
@@ -1382,11 +1590,21 @@ which needs **nothing** from `/usr/share/cosmic`. It fails too. So the remaining
 **item 6**, not the staging — and that control is what makes this a completed fix with a known
 blocker downstream rather than an inconclusive one.
 
-**And then there is still nothing to run.** No terminal exists among 175 `/bin` names, and the
-image contains **exactly one** `.desktop` file — our own applet stub. `cosmic-term`,
-`cosmic-files`, `cosmic-edit`, `cosmic-store` are all in `../cosmic-epoch` and **none is
-built**. Even with input and shortcuts fixed, `Super` would open a launcher over an empty
-index. **Item 8 is therefore two pieces of work, and the config file is only the first.**
+**And there is now something to run.** `cosmic-term` ships: built from `../cosmic-epoch` at
+`epoch-1.3.0` (`44d042f`) with `--no-default-features --features wayland,wgpu`, first attempt,
+no source patches, staged to `/bin` with a `.desktop`, an icon and terminfo, and photographed
+on both arches inside COSMIC with a live `brush-0.5#` prompt taking typed commands. It is
+**the first `.desktop` in the image without `NoDisplay=true`**, so `Super` now opens a
+launcher over a non-empty index. `cosmic-files`, `cosmic-edit` and `cosmic-store` remain
+unbuilt. What it cost was the PTY subsystem, not the build — see the header, and the contract
+it enforces under *Standing context*.
+
+**What survives of this item is the keybindings residual, and its attribution is now stale.**
+The `Super+F9` → `touch /tmp/kb-f9` control — which needs nothing from `/usr/share/cosmic` —
+still fails, and the recorded attribution was "the remaining failure is **item 6**". Item 6
+has since been closed, with delivery to a client shown lossless. **So the residual is
+currently unattributed rather than blocked**, and it must be re-measured against the evdev
+broadcast change before anything is inferred from it.
 
 ### 9. DONE: five real applets ship, run and paint (2026-08-09)
 
@@ -1826,9 +2044,11 @@ and drops them with no diagnostic: 280 accepted `mouse_move` commands produced *
 guest events, which is indistinguishable from a dead driver and nearly sent this into
 the evdev server after a bug that was not there. `info mice` is the tell
 (`* QEMU Virtio Tablet (absolute)`). Use QMP `input-send-event` with `abs`/`btn` data.
-`driver.py` exposes only an HMP socket; to get QMP, read `/proc/<pid>/cmdline`, kill,
-and relaunch the identical argv with `-qmp unix:…` appended — `login`/`cmd` keep working
-because the serial chardev path is unchanged. Note aarch64 already emits
+`driver.py` exposes only an HMP socket. **The recorded workaround — read `/proc/<pid>/cmdline`,
+kill, relaunch the identical argv with `-qmp unix:…` appended — is unnecessarily elaborate**:
+`LEANDROS_QEMU_EXTRA="-qmp unix:/tmp/leandros-qmp.sock,server=on,wait=off"` does it on the
+first launch, which is how the chord-injection work got QMP. A permanent `-qmp` line is item
+18. Note aarch64 already emits
 `-display default,gl=on` when the host has `virtio-gpu-gl-pci`, so appending a second
 `-display` makes QEMU exit outright; x86_64 with `virtio-vga` emits none and tolerates it.
 
@@ -1836,66 +2056,127 @@ One reading gotcha: under a real mouse `evtest2` reports `epoll_idle_no_false_wa
 by construction — that check asserts an empty ring during a 300 ms still-pointer window,
 and a hand on the mouse guarantees it is not empty. It is not a defect in that run.
 
-### 14. VT switching — was out of scope, now required
+### 14. VT switching — six VTs land; device arbitration does not
 
-**In scope as of 2026-08-08, reversing a committed architectural decision.** There are
-no VTs of any kind: no `/dev/tty[0-9]`, no `VT_ACTIVATE`/`VT_WAITACTIVE`/`VT_GETSTATE`,
-no `KDSETMODE`/`KDGKBMODE`, no VT-switch signal handshake. This was deliberate — the
-seat/input architecture shims libseat and libudev precisely so that nothing needs a
-session manager to arbitrate device access.
+**Pieces 1 and 3 are done; piece 2 is half done.** Six VTs exist (`servers/tty/src/vt.rs`,
+`/dev/tty0`..`/dev/tty6`), the VT/KD ioctl set is implemented, the `VT_PROCESS`
+release/acquire handshake works with a 5 s watchdog, Ctrl+Alt+Fn switches from inside
+`evdev::push_event`, and `vttest` is **12/12** on both arches with the switch
+photographed. The header carries the measurements and the four design decisions.
+Piece 1 was built **on** `SCANOUT_OWNER`/`drm_scanout_claim` as this item instructed —
+"a VT is close to *which of N consoles owns the scanout*, which it already answers for
+N=1" turned out to be exactly right, and the extension was to give each VT a saved text
+plane and repaint it, replacing `set_console_disabled(false)`'s clear-and-banner.
+Piece 3 is **written but not demonstrated**: the libseat shim now emits
+`SessionEvent::ActivateSession`/`Deactivate`, driven by `/dev/tty0`, and it was the dead
+fd rather than the missing events that made the old shim unable to deliver one at all —
+`libseat_get_fd` returned an eventfd nothing ever wrote. **No compositor has yet been
+switched away from and back, so nothing has confirmed the events are *correct*** — that
+`smithay`'s `is_active()` gating of `apply_config_for_outputs` sees the right value at
+the right time. Until that measurement exists this is a shim that should work, which is
+the state this item's own warning describes: a component can be correct as a consumer
+and broken as a producer, and this shim was about to be asked to be the producer.
 
-**What that decision is currently holding up, stated plainly so the cost of reversing it
-is visible in both directions.** The greeter design (below) runs **cosmic-comp as root**
-with only the greeter *client* unprivileged, specifically to avoid needing seatd or a VT
-handoff. That is a legitimate interim and should ship as-is; it is **not** a substitute
-for this item, because a single-VT system cannot switch away from a wedged compositor,
-cannot put a text console behind the graphical login, and cannot hand the DRM master
-between the greeter's compositor and the session's.
+**What is NOT done is the half that makes a switch safe rather than cosmetic: device
+arbitration.** DRM master handoff and reopening `/dev/input/*` on switch are
+unimplemented. `fb_vt_scanout_revoke` takes the surface back and **the client's next
+present simply re-claims it** — so switching away from a live compositor is not yet a
+handoff, it is a race the compositor wins. Everything that motivated this item is
+therefore reachable except the one case it was opened for: **switching away from a
+*wedged* compositor is not yet proven, because a wedged compositor that keeps presenting
+still takes the scanout back.**
 
-**Three pieces, and only the first is small.**
-1. **The console side.** The framebuffer console already owns the scanout and already
-   yields it correctly — `SCANOUT_WRITES` + `drm_scanout_claim` (`edad115`, `c8cbbc1`)
-   claims the console from the *present itself* rather than from an ioctl allow-list,
-   falsified by mutation on both arches. **That mechanism is the right foundation** and
-   should be extended rather than replaced; a VT is close to "which of N consoles owns
-   the scanout", which it already answers for N=1.
-2. **The device-arbitration side.** DRM master handoff plus reopening `/dev/input/*` on
-   switch. Note the already-measured hazard: our evdev has **one ring per device, not a
-   per-open client queue as Linux has**, so two readers rob each other — measured as
-   `dev=0 push=128 conspop=112 deliv=16`. **VT switching makes that defect load-bearing**
-   rather than cosmetic, because the whole point is two consumers of one device.
-3. **The libseat shim.** It currently reports a session that is active from
-   construction and never emits `SessionEvent::ActivateSession`/`Deactivate`. Real VT
-   switching means those events must fire and be correct. `smithay`'s KMS paths
-   (`apply_config_for_outputs` and friends) **do** read `is_active()` and early-return
-   when inactive — that was established while exonerating the shim on the input path,
-   where nothing reads it. **A component can be correct as a consumer and broken as a
-   producer**, and this shim is about to be asked to be the producer.
+The evdev half of piece 2 *did* land, and the hazard this item named is gone: per-open
+queues keyed on `open_id`, broadcast on push, `SYN_DROPPED` on overflow — two readers of
+one node now both receive everything (`A=60 B=60` on 60 moves, against `A=30 B=30`
+before). "VT switching makes that defect load-bearing rather than cosmetic" was the right
+call and it was paid before the switch shipped, not after.
 
 **greetd does not force the issue, measured while porting it.** `vt = "none"` selects
 `TerminalMode::Stdin`, and every VT call sits behind a match arm that Stdin skips — so
-the port needs nothing from this item. That is a reason the greeter can ship first, and
-**not** a reason to think the item is cheap: what greetd avoids is *using* VTs, not the
-absence of them.
+the port needs nothing from this item, then or now.
 
-**Sequencing.** This is the largest of the three and the least urgent for a *first*
-graphical login, which the root-compositor design reaches without it. Do items 12 and 13
-first, ship a working greeter, then take this on with a real session behind it — the
-same argument that put an intermediate step in the greeter route.
+**One dependency to settle before the handoff work starts:** `EVIOCGRAB` is accepted but
+not enforced (item 20), and enforcing it and implementing the handoff are two changes
+that must not ride together — a bug in either is indistinguishable from a bug in the
+other, with no working console left to ask from.
+
+### 17. aarch64: command output inside `cosmic-term` is invisible
+
+**The pty is exonerated by the very test meant to indict it.** The prompt renders, typed
+commands echo and execute, and `stty size` inside the terminal returns a correct **29 118** —
+so `TIOCSWINSZ`/`TIOCGWINSZ` propagate and the geometry the emulator sets is the geometry the
+slave reports. What is missing is the *output* of a command, and only on aarch64.
+
+**The instrument is visible in the x86_64 screenshots.** There, output lines are prefixed with
+a literal `^[[1;14R` / `^[[1;21R` — **a CPR reply echoed to the screen instead of consumed by
+brush** — and 14 and 21 are exactly the two command lines' lengths.
+
+**Leading explanation, stated at the strength the evidence supports.** When brush fails to
+consume the CPR reply (x86_64) it skips its repositioned redraw and the output survives; when
+it does consume it (aarch64, different timing) it repositions to the remembered row-1 spot and
+erases downward (`ESC[49;1H`, `ESC[J`) over the output it has just printed. That makes this a
+**brush/reedline-on-pty timing bug, not a kernel or cosmic-term defect** — the same CPR race
+class already fixed once for the serial console (`3861515`, `081fc01`). **brush's source was
+not read**, so the mechanism is *strongly supported, not proven*. The measured facts stand
+independently of it: a correct `stty size`, CPR replies whose row/column match the command
+lengths exactly, and output present on one arch and absent on the other from the same binary.
+
+### 18. Harness gaps, three, all cheap and all failing toward "the guest is broken"
+
+1. **`driver.py` has no QMP socket.** It was obtained ad hoc with
+   `LEANDROS_QEMU_EXTRA="-qmp unix:/tmp/leandros-qmp.sock,server=on,wait=off"`. HMP
+   `mouse_move` is unusable (relative; our virtio-tablet is absolute-only — item 16's
+   landmine) and HMP `sendkey` **cannot hold a chord**, so Ctrl+Alt+Fn cannot be injected
+   without QMP at all. A permanent `-qmp` line is worth landing.
+2. **`evsplit` must be the ONLY command in a session.** `driver.py`'s `cmd_session` pumps the
+   full `step_timeout` for *every* command, so `session 45 "pwd" "evsplit 60"` starts evsplit
+   ~45 s in while the injector fires at +4 s. The result is a silent `STARVED`,
+   **indistinguishable from a broken pointer path** — instrument-reliability class A, the
+   harness reporting a defect it caused. Use `session 30 "evsplit 60"` and inject at +4 s.
+3. **`--venus` cannot photograph a session at all, on any `device=`.**
+   `virgl_cmd_set_scanout()` leaves `console->scanout.kind = SCANOUT_TEXTURE`, and
+   `qemu_console_surface()` returns NULL for anything but `SCANOUT_SURFACE`. This is the same
+   structural limit recorded in next-step 1; it is repeated here because it bites every new
+   harness that reaches for `screendump` before reading that entry.
+
+### 19. The two artifacts trees diverged again
+
+**The standing rule is to diff the two trees FIRST.** `~/code/leandros-artifacts` is
+hand-synced and gitignored, and it diverged during this wave: a Mac-side survey reported
+"cosmic-term is not built and not on the image" — **true on the Mac, false on the box**, where
+the binaries were built. A reconcile is in progress.
+
+**Two facts that make the divergence easy to misread, both worth knowing independently.**
+`ports/cosmic-session/` and `ports/cosmic-greeter/` are **documentation, not build
+directories** — `scripts/build-all.sh` builds **zero** COSMIC components. The machinery lives
+out of repo in `leandros-artifacts/m6-session-bins/`, and the box had only that machinery's
+*outputs*, never the scripts, until this wave ported them. So "it is under `ports/`" says
+nothing about whether anything can build it, and "the binary exists on this machine" says
+nothing about the other.
+
+### 20. `EVIOCGRAB` is accepted but not enforced — deliberately
+
+Enforcement only becomes *safe* now that the chord exists: Ctrl+Alt+Fn runs inside
+`push_event`, ahead of all per-client routing, so a grab **structurally cannot** block it.
+It should still be switched on only after a hand-verified `grab → Ctrl+Alt+F2 → Ctrl+Alt+F1`
+round trip on **both** arches. **It is the one feature whose failure mode is an unrecoverable
+machine**, so it must not ride in the same change as the switching it depends on, and it must
+not ride with item 14's DRM master handoff either.
 
 ### Ordering, and why
 
-1. **Item 6 (input)** first, unconditionally. Windows already map, composite, stack and draw a
-   focus ring; every one of those becomes *usable* the moment input lands, and several rows
-   below cannot even be tested without it.
-2. **Item 8's config file** next — one `mkfs` entry, and it is what makes three
-   already-running components reachable.
-3. **Item 7 (iced renders nothing)**, jointly with the panel gap, because it decides whether
-   items 9 and the rest of the suite are worth building at all.
-4. **Item 9's applets** — no longer gated on 7, and no longer a build task. Five ship and
-   eight processes run (9a); what is left is **9b: tiling paints zero pixels**, and the
-   first step there is proving whether cosmic-comp accepts on the imported listener.
-5. **Item 10** only when a portal-shaped capability is actually wanted.
+1. **Item 17 (aarch64 terminal output)** first — it is the only thing between a terminal that
+   runs and a terminal that is usable on that arch, and the space is already halved: the pty
+   is exonerated and the suspect is named.
+2. **Item 18's harness gaps** next, because they are what everything after this is measured
+   with, and each one currently fails toward a false guest bug.
+3. **Item 20 (`EVIOCGRAB`)**, on its own, after a hand-verified round trip on both arches.
+4. **Item 14's remainder** — DRM master handoff and `/dev/input/*` reopen — which is what
+   makes a switch away from a wedged compositor actually work.
+5. **Items 12 (PAM) and 13 (utmpx)**, in that order; 13 still needs its consumer question
+   answered before any implementation is scheduled.
+6. **Item 10** only when a portal-shaped capability is actually wanted.
 
 ### Corrections this survey forces
 
@@ -2498,6 +2779,11 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
   `is_active()`; its only readers are KMS paths that early-return when inactive and would have
   left every output unmodeset. The desktop renders, so it is active. **No shim edit was made.**
   The original entry's conclusion stands; the reason it gave was weaker than the real one.
+  **Superseded 2026-08-10 on the producer half, and only there.** The shim now *does* emit
+  `SessionEvent::ActivateSession`/`Deactivate`, driven by `/dev/tty0`, because VT switching
+  landed and something has to tell smithay the session went away. The consumer reasoning above
+  is untouched — it was always about whether to `read()` — but **"nothing anywhere writes that
+  eventfd" is no longer true**, and any argument in this file resting on that clause is void.
 - **The input-stack shims were unbuildable and unwired — FIXED in the working tree, and the
   binaries were never actually drifted.** Before: `build-all.sh` never compiled
   `ports/input-stack/shims/` (`grep -iE 'libseat|input-stack|build-shims' scripts/*.sh`
@@ -2570,6 +2856,30 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
   **Do not space such samples with `usleep`/`nanosleep`:** `sys_nanosleep` rounds any nonzero
   request **up** to whole ticks, so sleeping between flips resyncs to the tick edge and
   *reinforces* the phase alignment that produces all-saturated runs. Use busy-work.
+- **Per-signal `siginfo` — deferred, with a costed design, and the cost is the point.**
+  Delivered siginfo fills only `si_signo`, so a SIGCHLD handler reading `si_code` sees `0`
+  (`SI_USER`) rather than `CLD_EXITED`/`CLD_KILLED`; signalfd fills only `ssi_signo`. **That
+  reports *no* status rather than a *wrong* one**, which is the whole reason it is deferrable
+  after the wait-status fixes and not part of them.
+  **Shape:** `SigInfo { si_code, si_pid, si_uid, si_status }` held as
+  `Task.signal_info: [SigInfo; 64]` — one slot per signal number, **not a queue**, which is
+  exactly POSIX for standard signals 1-31 (RT queueing is unused by our stack).
+  **Cost:** `size_of::<Task>()` 3200 → 4224 B, **heap not BSS** — +1 KiB per live task,
+  +256 KiB at capacity — and `Task::new_kernel` materialises a literal on the **kernel stack**
+  against the 48 KiB ceiling `scripts/check-stack-frames.py` enforces at build time. That
+  ceiling is the reason it is one slot per signal and not a multi-entry queue.
+  **The hazard that makes this a feature and not a patch:** the info must travel with the
+  pending bit through the `shared_signal_pending` hand-off (`signal.rs:164-176`), or a SIGCHLD
+  gets delivered carrying another signal's payload — **strictly worse than the zeros shipped
+  today**, and it would look like a userspace bug. ~120 lines in sched, ~12 across the two
+  arch `prepare()` paths, ~15 in the vfs signalfd.
+- **Hardware-keyboard input is still partial, and the residue is narrower than it looks.**
+  Multi-byte `xterm` sequences — arrows, Home, Delete — need ESC-sequence queueing, which does
+  not exist. There is **no Ctrl/Alt modifier state machine at all**: `SHIFT_PRESSED` is the
+  only modifier and is a bare `static mut`. So **Ctrl+C from a hardware keyboard never becomes
+  0x03** — the `ISIG` intercept only ever fires for serial input. Note what this is *not*: the
+  `read_input_byte` fallback that used to type `8` for Alt and `;` for F1 is gone (see the
+  header), so unmapped keys now produce nothing instead of producing something wrong.
 - **Crate layering, worth remembering because it will recur:** `drivers` has **no Cargo edge**
   to the arch crates. The tree's existing answer is a `#[no_mangle] extern "C"` symbol resolved
   at link time — `arch_monotonic_ns`, which `servers/evdev` already uses for input timestamps.
@@ -2622,7 +2932,10 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
   `llvmpipe-lane/deps-*`, pipewire, musl) and build output, which are deliberately excluded
   and must be rebuilt from their recorded recipes; `artifacts/.gitignore` keeps them out.
   **The original directory still exists and was not deleted** — it remains the place where
-  builds actually run.
+  builds actually run, it is still hand-synced between the two machines, and it **diverged
+  again during the pty/VT wave** (item 19). `artifacts/` being versioned does not make
+  `~/code/leandros-artifacts` versioned; they are two trees with similar names, and the
+  standing rule is to diff them before believing either about what is built.
   **`artifacts/` imports no `*.c` or `*.h`**, and `artifacts/.gitignore` blocks them so they
   cannot be reintroduced by a careless drop. The host-side C probes (`vkwl.c`, `vktest.c`,
   `ssp_guard.c`, `caps_probe.c`, `wlclient.c`) stay outside the repo and stay unversioned.
