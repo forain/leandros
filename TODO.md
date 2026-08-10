@@ -1003,7 +1003,7 @@ from this list's contents outlived the list.
 | 12 | **PAM — real support, replacing the C shim** | Feature — in scope, **untouched** | Shim authenticates for real but is C, untracked, coverage unverified |
 | 13 | **utmpx — session accounting, currently absent** | Feature — in scope, **untouched** | Nothing in tree; need is unmeasured, and the assumed driver is gone |
 | 14 | **VT switching — six VTs land; device arbitration does not** | Feature — **half done** | `vttest` 12/12, switch photographed; DRM master handoff + `/dev/input/*` reopen absent |
-| 17 | **aarch64: `cosmic-term` shows a prompt but no command output** | Bug — brush/reedline, **not kernel** | `stty size` = 29 118 correct; x86_64 shows the CPR reply echoed as `^[[1;14R` |
+| 17 | **`cosmic-term` shows a prompt but no command output** — FIXED + verified A/B 2026-08-10 | Bug — crossterm/reedline, **plus** a real pty gap (`b1c3961`) | NOT an arch split: it follows the slow **accelerator**. Fixed by the `../crossterm` fork; `/bin/brush-nofix` reproduces it on demand |
 | 18 | **Harness gaps: no QMP in `driver.py`, `evsplit` starves, `--venus` cannot screendump** | Debt — instrument | Each one fails toward looking like a guest bug |
 | 19 | **The two artifacts trees diverged again** | Debt — process | Mac says cosmic-term is unbuilt; the box built it. Diff the trees first |
 | 20 | **`EVIOCGRAB` accepted but not enforced** | Feature — **deliberately held back** | Safe only now the chord pre-empts routing; needs a hand-verified round trip |
@@ -2233,7 +2233,11 @@ enforcing either and implementing the handoff are changes that must not ride tog
 a bug in one is indistinguishable from a bug in the other, with no working console left to
 ask from. **That order still stands for the input half:** land it on its own.
 
-### 17. aarch64: command output inside `cosmic-term` is invisible
+### 17. Command output inside `cosmic-term` is invisible — FIXED + VERIFIED 2026-08-10
+
+*(The "aarch64" this heading used to carry is wrong and is kept only in the history below: the
+symptom follows the slow **accelerator**, not the architecture. See the verification at the
+end of the item.)*
 
 **The pty is exonerated by the very test meant to indict it.** The prompt renders, typed
 commands echo and execute, and `stty size` inside the terminal returns a correct **29 118** —
@@ -2299,6 +2303,40 @@ against a running guest.**
 and run `brush --input-backend=basic` (`brush-shell/src/args.rs:203`, `entry.rs:285`) inside
 cosmic-term. That backend never calls `cursor::position()` and never repositions. **If output
 becomes visible, reedline's CPR-driven repaint is conclusively the eraser.**
+
+**VERIFIED 2026-08-10 ON THE MAC, BY A/B AND NOT BY INFERENCE — AND THE ARCH IN THE TITLE IS
+WRONG.** `/bin/brush` (patched crossterm) and `/bin/brush-nofix` (crossterm 0.29.0 unmodified,
+same source, same flags) are now both staged, so the broken and the fixed shell run back to
+back in ONE cosmic-term window on ONE image. Three configurations were measured, and together
+they close the mechanism end to end rather than arguing it:
+
+| pty fix | crossterm | `id` in the nofix shell, x86_64 under TCG |
+|---|---|---|
+| no  | unmodified | `^[[5;20Ruid=0(root) …` — reply **echoed** by the pty, output survives |
+| yes | unmodified | *(nothing at all)* — reply **delivered**, output **erased** |
+| yes | patched    | `uid=0(root) gid=0(root) groups=0(root)` — clean |
+
+Row 2 is the prediction this item made ("alone it would … regress x86_64 to aarch64's
+behaviour") produced **on demand**, and row 3 is the fix. `^[[5;20R` is `^[[1;14R`'s successor
+and it appears only on the unpatched binary. The `--input-backend=basic` control printed its
+output in **every** configuration and on both arches, which is what makes reedline's CPR
+repaint — not the pty, not the kernel — conclusively the eraser.
+
+**"aarch64" IS NOT THE VARIABLE; THE ACCELERATOR IS.** The recorded arch split came from the
+box, where x86_64 is KVM and aarch64 is TCG. On this Mac it is inverted — aarch64 runs under
+HVF, x86_64 under TCG — and so is the symptom: the SAME unpatched binary is clean on
+aarch64/HVF and leaks the CPR reply on x86_64/TCG. The failure follows the slow accelerator,
+exactly as `959710d` already found for the master/VT race ("roughly 30x narrower" under HVF).
+Read the title as *"under a slow enough accelerator"*, and note that **the Mac's default
+aarch64 is the configuration least able to reproduce this** — `uefi-tcg` is the faithful one,
+and it was NOT run here.
+
+**Two things the instrument taught, both of which faked guest bugs.** cosmic-term is
+software-rendered (`ICED_BACKEND=tiny-skia`) and under x86_64 TCG its window takes ~125 s to
+appear and then trails typing by ~60-90 s — a shot taken too early shows a bare prompt, which
+is indistinguishable from the erasure being measured, and one intermediate frame showed
+exactly one character 80 s after it was typed. And keystrokes are genuinely **dropped**, not
+merely slow: a typed `PS1=nofix.` arrived as `1=nofix.`. See item 18 and `artifacts/m21_cpr.py`.
 
 ### 18. Harness gaps — 1 and 2 FIXED (`fe89e8c`), 3 was STALE
 
