@@ -112,6 +112,14 @@ extern "C" {
     fn fb_vt_scroll_rows() -> u32;
     /// Console size in character cells, or the 80x24 fallback.
     fn kernel_console_winsize(rows: *mut u16, cols: *mut u16);
+    /// VT `n` (1-based) is now on screen: force `SYN_DROPPED` onto every evdev
+    /// queue pinned to it, so a client that was gated off resynchronises
+    /// instead of replaying state from before the switch.
+    ///
+    /// The seam runs this way round because `evdev-server` already depends on
+    /// `tty-server` for [`chord_key`]; naming it back directly would be a
+    /// cycle.
+    fn evdev_vt_activated(n: u32);
 }
 
 // ── Per-VT text mirror ────────────────────────────────────────────────────────
@@ -879,6 +887,12 @@ fn complete_switch(to: usize) {
     ACTIVE.store(to, Ordering::Relaxed);
     ACTIVE_GRAPHICS.store(graphics, Ordering::Relaxed);
     ACTIVE_KB_P1.store(kb_p1 as u32, Ordering::Relaxed);
+
+    // Input follows the display. AFTER the store, never before: the evdev gate
+    // reads `active()` on the push path, so a resync issued while the old VT
+    // was still published would be immediately followed by events the gate
+    // still routed to the outgoing console.
+    unsafe { evdev_vt_activated((to + 1) as u32) };
 
     if graphics {
         // Silence the console without touching a pixel. The outgoing VT's text

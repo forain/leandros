@@ -7200,6 +7200,7 @@ fn evstat_tick() {
                 mm::gap2::kv(" dev=",     r.dev_id  as usize);
                 mm::gap2::kv(" open=",    r.open_id as usize);
                 mm::gap2::kv(" pid=",     r.pid     as usize);
+                mm::gap2::kv(" vt=",      r.vt      as usize);
                 mm::gap2::kv(" queued=",  r.queued  as usize);
                 mm::gap2::kv(" deliv=",   r.deliv   as usize);
                 mm::gap2::kv(" dropped=", r.dropped as usize);

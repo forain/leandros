@@ -45,6 +45,8 @@ const ZERO_EVENT: input_event = input_event {
 // EV_SYN=0, EV_KEY=1, EV_ABS=3 (linux/input-event-codes.h).
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
+/// SYN_REPORT: the frame terminator every evdev consumer batches on.
+const SYN_REPORT: u16 = 0;
 /// SYN_DROPPED: "your queue overflowed, your state is stale, resync".
 const SYN_DROPPED: u16 = 3;
 
@@ -98,6 +100,21 @@ struct EvClient {
     /// consumers that were robbing each other.
     open_id: u32,
     pid: u32,
+    /// VT this queue was registered on (1-based, as [`tty_server::vt::active`]
+    /// reports it), or **0 for a queue that follows the active VT** rather than
+    /// being pinned to one.
+    ///
+    /// A compositor opens its input devices while it is foreground, so the VT
+    /// that was active at registration is the VT it belongs to; `broadcast`
+    /// then skips it while some other VT is on screen. The console tap keeps 0
+    /// by definition — the in-kernel line discipline *is* whichever VT is
+    /// active, so it can never be off-screen.
+    ///
+    /// The failure mode this tag has is worth naming: a device opened while
+    /// backgrounded gets tagged with the background VT and goes silent until
+    /// that VT comes back. That is why registration logs the tag — the symptom
+    /// is "input stopped working", and only the tag says why.
+    vt: u32,
     events: [input_event; CLIENT_EVENTS],
     head: usize,
     count: usize,
@@ -118,6 +135,7 @@ impl EvClient {
             dev_id: 0,
             open_id: 0,
             pid: 0,
+            vt: 0,
             events: [const { ZERO_EVENT }; CLIENT_EVENTS],
             head: 0,
             count: 0,
@@ -148,6 +166,29 @@ impl EvClient {
             self.enqueue(input_event { time: ev.time, type_: EV_SYN, code: SYN_DROPPED, value: 0 });
         }
         self.enqueue(ev);
+        self.seq = self.seq.wrapping_add(1);
+    }
+
+    /// Discard everything queued and make `SYN_DROPPED` the next event read.
+    ///
+    /// The same treatment `push` gives an overflow, applied for a different
+    /// reason: a queue that was gated off for the length of a VT switch holds
+    /// events from before the switch and is missing every event during it, and
+    /// both halves of that are stale state a client would otherwise act on —
+    /// libinput would replay a key-down whose release it never saw, or a
+    /// pointer coordinate from a gesture that ended minutes ago. `SYN_DROPPED`
+    /// is precisely the "your state is stale, re-read it from the device"
+    /// signal libinput already knows how to resynchronise from, so a resume
+    /// costs nothing new on either side.
+    fn force_resync(&mut self, now_us: u64) {
+        self.dropped += self.count as u64;
+        self.head = 0;
+        self.count = 0;
+        self.enqueue(input_event {
+            time: timeval { tv_sec: (now_us / 1_000_000) as i64,
+                            tv_usec: (now_us % 1_000_000) as i64 },
+            type_: EV_SYN, code: SYN_DROPPED, value: 0,
+        });
         self.seq = self.seq.wrapping_add(1);
     }
 
@@ -220,6 +261,10 @@ impl EvdevState {
                 .map(|(i, _)| i)?,
         };
         let tick = self.tick;
+        // The VT this open belongs to, decided ONCE, here. The console tap
+        // follows the active VT instead of being pinned to one — see
+        // `EvClient::vt`.
+        let vt = if open_id == CONSOLE_OPEN_ID { 0 } else { tty_server::vt::active() as u32 };
         let c = &mut self.clients[slot];
         // Reset the bookkeeping only — `events` is 6 KiB and unreachable while
         // `count` is 0, so zeroing it would just be a memset on the open path.
@@ -227,12 +272,14 @@ impl EvdevState {
         c.dev_id = dev;
         c.open_id = open_id;
         c.pid = pid;
+        c.vt = vt;
         c.head = 0;
         c.count = 0;
         c.seq = 0;
         c.deliv = 0;
         c.dropped = 0;
         c.touched = tick;
+        log_registration(dev, open_id, pid, vt);
         Some(slot)
     }
 
@@ -240,11 +287,22 @@ impl EvdevState {
     /// them was full and lost its contents.
     ///
     /// `console_ok` false skips the console tap only — see `push_event`.
-    fn broadcast(&mut self, dev: u32, ev: input_event, console_ok: bool) -> bool {
+    ///
+    /// `gate_vt` is the VT currently on screen, and a queue pinned to a
+    /// different one does not receive the event. **0 disables the gate
+    /// entirely** and is how the serial exemption reaches every queue — see
+    /// `push_event`.
+    ///
+    /// The gate lives HERE, downstream of `push_event`'s `chord_key` call,
+    /// and that ordering is not incidental: Ctrl+Alt+Fn is consumed before any
+    /// per-client routing runs, so no gate — and, later, no grab — can be put
+    /// in front of the one key sequence that escapes a VT holding the display.
+    fn broadcast(&mut self, dev: u32, ev: input_event, console_ok: bool, gate_vt: u32) -> bool {
         let mut overflowed = false;
         for c in self.clients.iter_mut() {
             if c.in_use && c.dev_id == dev {
                 if c.open_id == CONSOLE_OPEN_ID && !console_ok { continue; }
+                if gate_vt != 0 && c.vt != 0 && c.vt != gate_vt { continue; }
                 if c.count >= CLIENT_EVENTS { overflowed = true; }
                 c.push(ev);
             }
@@ -263,6 +321,9 @@ extern "C" {
     /// Monotonic nanoseconds since boot, sub-tick resolution, never decreasing —
     /// the same clock `clock_gettime(CLOCK_MONOTONIC)` reports to userspace.
     fn arch_monotonic_ns() -> u64;
+    /// Raw UART byte, the same seam `mm::gap2` writes through. Used only by
+    /// `log_registration`, which runs in task context.
+    fn arch_serial_putc(c: u8);
 }
 
 /// Total events ever handed to `push_event`, across every device. A guest-side
@@ -274,6 +335,24 @@ static EVENTS_PUSHED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 pub fn events_pushed() -> u64 {
     EVENTS_PUSHED.load(core::sync::atomic::Ordering::Relaxed)
 }
+
+/// True while the last `EV_KEY` pushed on the keyboard node was a serial
+/// synthetic, so the `SYN_REPORT` that follows it can be exempted from the VT
+/// gate along with the key itself.
+///
+/// The UART drain pushes a PAIR — `EV_KEY value=2` then `EV_SYN/SYN_REPORT`
+/// (`arch/*/timer.rs`, `arch/aarch64/src/exception.rs`) — and an evdev frame is
+/// not a frame without its terminator: libinput accumulates events and acts on
+/// them only at `SYN_REPORT`. Exempting the key but gating its report would
+/// hand a backgrounded reader keystrokes it can never complete, which is a
+/// worse failure than dropping them, because it is silent and unbounded.
+///
+/// Best effort by construction: a real keyboard IRQ landing between the two
+/// halves of a serial frame mis-tags one `SYN_REPORT`. The cost either way is
+/// a single stray or missing frame marker, and the interleaving itself is
+/// pre-existing — the pair was never pushed atomically.
+static LAST_KB_SERIAL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 // ── Per-device I/O census ────────────────────────────────────────────────────
 //
@@ -395,6 +474,11 @@ pub struct EvClientCensus {
     /// otherwise; 0 for a queue keyed by pid alone (see `EvClient::open_id`).
     pub open_id: u32,
     pub pid:     u32,
+    /// The VT this queue is pinned to, or 0 for one that follows the active VT
+    /// (see `EvClient::vt`). Printed because "this client's `deliv` is flat"
+    /// and "this client is gated off" are the same observation only if the tag
+    /// is visible next to the count.
+    pub vt:      u32,
     pub queued:  u32,
     pub deliv:   u64,
     pub dropped: u64,
@@ -402,7 +486,7 @@ pub struct EvClientCensus {
 
 impl EvClientCensus {
     pub const fn empty() -> Self {
-        Self { dev_id: 0, open_id: 0, pid: 0, queued: 0, deliv: 0, dropped: 0 }
+        Self { dev_id: 0, open_id: 0, pid: 0, vt: 0, queued: 0, deliv: 0, dropped: 0 }
     }
 }
 
@@ -421,6 +505,7 @@ pub fn clients_census(out: &mut [EvClientCensus]) -> usize {
             dev_id: c.dev_id,
             open_id: c.open_id,
             pid: c.pid,
+            vt: c.vt,
             queued: c.count as u32,
             deliv: c.deliv,
             dropped: c.dropped,
@@ -847,6 +932,47 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     let serial_byte = dev_id == DEV_KEYBOARD as u32 && type_ == EV_KEY && value == 2;
     let console_ok = serial_byte || tty_server::vt::console_keyboard_active();
 
+    // Widen the serial exemption from the key to its whole FRAME — see
+    // `LAST_KB_SERIAL`. Deliberately NOT folded into `console_ok`: the console
+    // tap discards everything that is not a key-down anyway, and queueing SYNs
+    // into it under KD_GRAPHICS would leave `has_events` true with nothing
+    // `read_input_byte` could ever return, which is the exact confusion
+    // `has_key_event` exists to undo.
+    let serial_frame = if dev_id == DEV_KEYBOARD as u32 {
+        use core::sync::atomic::Ordering::Relaxed;
+        if type_ == EV_KEY {
+            LAST_KB_SERIAL.store(value == 2, Relaxed);
+            serial_byte
+        } else {
+            type_ == EV_SYN && code == SYN_REPORT && LAST_KB_SERIAL.load(Relaxed)
+        }
+    } else {
+        false
+    };
+
+    // Which VT the event belongs to, for the per-client gate in `broadcast`.
+    // One relaxed atomic load; safe from this IRQ context for the same reason
+    // `chord_key` is.
+    //
+    // SERIAL IS EXEMPT HERE TOO (`serial_frame`, computed above), for the reason
+    // above and one more. The console
+    // tap already survives the gate by carrying `vt == 0`, so the exemption is
+    // not what keeps a serial boot's own shell alive — but a *userspace* reader
+    // of `/dev/input/event0` on a serial-only machine has no other source of
+    // keystrokes at all, and pinning it to the VT it happened to start on would
+    // make the UART stop reaching it the moment anything took another VT. That
+    // is the same reasoning `console_ok` already applies one line up, extended
+    // to every queue rather than just the console's; a headless boot must not
+    // be able to lose its only input path to a display-arbitration decision.
+    //
+    // The test is `value == 2`, which a real keyboard's AUTOREPEAT also
+    // produces — so an autorepeat reaches a backgrounded queue. That
+    // conflation is pre-existing (`console_ok` is built from the same
+    // predicate) and the cost of it is one extra repeat event, not a stuck key:
+    // the key-down that started the repeat was gated, and xkb ignores a repeat
+    // for a key it never saw pressed.
+    let gate_vt = if serial_frame { 0 } else { tty_server::vt::active() as u32 };
+
     let ev = input_event {
         time: timeval {
             tv_sec: (now_us / 1_000_000) as i64,
@@ -859,7 +985,7 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     let f = unsafe { arch_interrupt_save() };
     // Broadcast, not enqueue-once: on Linux an event goes to every open of the
     // node and one reader consuming it never removes another's copy.
-    let overflowed = STATE.lock().broadcast(dev_id, ev, console_ok);
+    let overflowed = STATE.lock().broadcast(dev_id, ev, console_ok, gate_vt);
     bump(&C_PUSHED, dev_id as usize);
     if overflowed { bump(&C_DROPPED, dev_id as usize); }
     // A key event is a POLLIN edge for a console reader / evdev poller parked on
@@ -867,6 +993,67 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     // 100 Hz console-read tick is the backstop if RUN_QUEUE is momentarily busy.
     sched::try_wake_poll();
     unsafe { arch_interrupt_restore(f); }
+}
+
+/// VT `new_vt` (1-based) has just come on screen — resynchronise every queue
+/// pinned to it.
+///
+/// Called from `tty_server::vt::complete_switch` through the same
+/// `#[no_mangle]` seam the framebuffer bridge uses, and for the same reason:
+/// `evdev-server` depends on `tty-server` (for `chord_key`), so the tty crate
+/// cannot name this one back without a cycle.
+///
+/// TASK CONTEXT, and it must stay that way — it takes `STATE`, which the input
+/// IRQ also takes, so interrupts are masked across the whole update. It does
+/// **not** wake pollers: `complete_switch` calls `sched::wake_poll` immediately
+/// after, and one wake for the whole switch is enough.
+#[no_mangle]
+pub extern "C" fn evdev_vt_activated(new_vt: u32) {
+    if new_vt == 0 { return; }
+    let now_us = unsafe { arch_monotonic_ns() } / 1_000;
+    let f = unsafe { arch_interrupt_save() };
+    let mut st = STATE.lock();
+    for c in st.clients.iter_mut() {
+        if c.in_use && c.vt != 0 && c.vt == new_vt {
+            c.force_resync(now_us);
+        }
+    }
+    drop(st);
+    unsafe { arch_interrupt_restore(f); }
+}
+
+/// Announce a newly registered queue and, above all, **the VT it was tagged
+/// with**.
+///
+/// This is the one line that names the gate's own failure mode. A device
+/// opened while its owner is backgrounded is tagged with the background VT and
+/// receives nothing until that VT returns; from userspace that is
+/// indistinguishable from a driver that stopped working, and without the tag in
+/// the log there is nothing to look at. Registration is rare — one line per
+/// `open()` of an input node, a handful per session even with a compositor that
+/// reopens its devices on every switch — so this is not gated behind a
+/// diagnostic const the way `[EVSTAT]` is: a diagnostic you have to rebuild to
+/// enable is not there when the report arrives.
+fn log_registration(dev: u32, open_id: u32, pid: u32, vt: u32) {
+    fn s(m: &str) { for &b in m.as_bytes() { unsafe { arch_serial_putc(b) } } }
+    fn d(mut v: u64) {
+        let mut buf = [0u8; 20];
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 { break; }
+        }
+        for &b in &buf[i..] { unsafe { arch_serial_putc(b) } }
+    }
+    s("[EVDEV] register dev="); d(dev as u64);
+    s(" open=");
+    if open_id == CONSOLE_OPEN_ID { s("console"); } else { d(open_id as u64); }
+    s(" pid="); d(pid as u64);
+    s(" vt=");
+    if vt == 0 { s("follow"); } else { d(vt as u64); }
+    s("\n");
 }
 
 pub fn init(owner_pid: u32) -> Option<u32> {

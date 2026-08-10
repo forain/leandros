@@ -47,9 +47,15 @@ const O_NONBLOCK: c_int = 0o4000;
 const EPOLL_CTL_ADD: c_int = 1;
 const EPOLLIN: c_uint = 0x001;
 
+const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
 const EV_ABS: u16 = 3;
 const ABS_X: u16 = 0;
+/// `SYN_DROPPED` — "your queue was discarded, your state is stale, resync".
+/// Counted because the VT gate is required to force exactly one of these onto a
+/// queue that has just been un-backgrounded, and a resync that never arrives
+/// looks identical to one that did until a client acts on stale state.
+const SYN_DROPPED: u16 = 3;
 
 const CLOCK_MONOTONIC: c_int = 1;
 
@@ -140,6 +146,7 @@ struct Tally {
     absx: u32,
     total: u32,
     wakes: u32,
+    syndrop: u32,
 }
 
 fn now_ms() -> i64 {
@@ -182,6 +189,7 @@ fn report(role: &[u8], t: &Tally) {
     put(b" absx=");  put_dec(t.absx as u64);
     put(b" total="); put_dec(t.total as u64);
     put(b" wakes="); put_dec(t.wakes as u64);
+    put(b" syndrop="); put_dec(t.syndrop as u64);
     put(b"\n");
 }
 
@@ -191,7 +199,7 @@ fn report(role: &[u8], t: &Tally) {
 /// action: ABS_X on the tablet (`input-send-event`), a key-down on the keyboard
 /// (`sendkey`).
 unsafe fn drain(dev: u32, deadline_ms: i64) -> Tally {
-    let mut t = Tally { pid: getpid() as u32, absx: 0, total: 0, wakes: 0 };
+    let mut t = Tally { pid: getpid() as u32, absx: 0, total: 0, wakes: 0, syndrop: 0 };
 
     let path: &[u8] = if dev == 0 { b"/dev/input/event0\0" } else { b"/dev/input/event1\0" };
     let fd = open(path.as_ptr(), O_RDONLY | O_NONBLOCK);
@@ -217,6 +225,7 @@ unsafe fn drain(dev: u32, deadline_ms: i64) -> Tally {
                 let counted = if dev == 0 { e.type_ == EV_KEY && e.value == 1 }
                               else { e.type_ == EV_ABS && e.code == ABS_X };
                 if counted { t.absx += 1; }
+                if e.type_ == EV_SYN && e.code == SYN_DROPPED { t.syndrop += 1; }
             }
             if cnt < 64 { break; }
         }
