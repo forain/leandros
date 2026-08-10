@@ -3239,23 +3239,19 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
   **Do not space such samples with `usleep`/`nanosleep`:** `sys_nanosleep` rounds any nonzero
   request **up** to whole ticks, so sleeping between flips resyncs to the tick edge and
   *reinforces* the phase alignment that produces all-saturated runs. Use busy-work.
-- **Per-signal `siginfo` — deferred, with a costed design, and the cost is the point.**
-  Delivered siginfo fills only `si_signo`, so a SIGCHLD handler reading `si_code` sees `0`
-  (`SI_USER`) rather than `CLD_EXITED`/`CLD_KILLED`; signalfd fills only `ssi_signo`. **That
-  reports *no* status rather than a *wrong* one**, which is the whole reason it is deferrable
-  after the wait-status fixes and not part of them.
-  **Shape:** `SigInfo { si_code, si_pid, si_uid, si_status }` held as
-  `Task.signal_info: [SigInfo; 64]` — one slot per signal number, **not a queue**, which is
-  exactly POSIX for standard signals 1-31 (RT queueing is unused by our stack).
-  **Cost:** `size_of::<Task>()` 3200 → 4224 B, **heap not BSS** — +1 KiB per live task,
-  +256 KiB at capacity — and `Task::new_kernel` materialises a literal on the **kernel stack**
-  against the 48 KiB ceiling `scripts/check-stack-frames.py` enforces at build time. That
-  ceiling is the reason it is one slot per signal and not a multi-entry queue.
-  **The hazard that makes this a feature and not a patch:** the info must travel with the
-  pending bit through the `shared_signal_pending` hand-off (`signal.rs:164-176`), or a SIGCHLD
-  gets delivered carrying another signal's payload — **strictly worse than the zeros shipped
-  today**, and it would look like a userspace bug. ~120 lines in sched, ~12 across the two
-  arch `prepare()` paths, ~15 in the vfs signalfd.
+- **Signal masks are not inherited by `fork()` or `pthread_create()`, and POSIX says both
+  should be.** `sched/src/clone.rs` copies uid/gid/cwd/nice/umask/root into the child and
+  never touches `signal_mask`, so a new task starts with everything unblocked no matter what
+  its creator had blocked. Two consequences, and the second is the sharp one. A `fork()`ed
+  child silently loses a mask its parent set. And the standard signalfd event-loop pattern —
+  block the signal in `main`, *then* spawn workers, so the signal can only be collected
+  through the fd — does not hold here: the worker starts with it unblocked, so
+  `deliver_signal_process` hands the signal straight to that worker and the signalfd never
+  sees it. Found while building sigtest's `shared_handoff_keeps_payloads_apart`, which had to
+  block in the worker explicitly to reach the parked-signal path at all; the test carries a
+  comment saying why, and that comment is the thing to delete when this is fixed. **Not
+  fixed here on purpose:** it changes signal-mask semantics for every fork and every thread
+  in the system, which is not a change to make inside a siginfo commit.
 - **Hardware-keyboard input is still partial, and the residue is narrower than it looks.**
   Multi-byte `xterm` sequences — arrows, Home, Delete — need ESC-sequence queueing, which does
   not exist. There is **no Ctrl/Alt modifier state machine at all**: `SHIFT_PRESSED` is the
