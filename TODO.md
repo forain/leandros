@@ -2265,9 +2265,36 @@ Three things that decided the design, each worth keeping:
    to silence the console. **Found on x86_64 under TCG, where the window is wide; the same
    race is present on aarch64/HVF ~30x narrower.**
 
-**What is still NOT done is the input half of the arbitration:** `/dev/input/*` is not
-reopened or gated on switch, so a backgrounded client still sees the keyboard and mouse.
-One residual display race is also known and unfixed: a present already inside its handler
+**THE INPUT HALF LANDED 2026-08-10 (`19f5061`), so the arbitration is now complete on both
+axes.** `EvClient.vt` is tagged once in `find_or_register` from `vt::active()`, and the gate
+`c.vt != 0 && c.vt != active` sits **inside `broadcast`** — downstream of `push_event`'s
+`chord_key` call, verified by reading `push_event` before touching it. `CONSOLE_OPEN_ID` keeps
+`vt = 0` and so follows the active VT by definition. On switch-back, a new
+`#[no_mangle] evdev_vt_activated(n)` seam is called from `vt.rs` `complete_switch` **after**
+`ACTIVE.store`, forcing `SYN_DROPPED` so libinput resyncs instead of replaying stale state.
+Registration now logs `[EVDEV] register dev= open= pid= vt=` unconditionally — a device opened
+while backgrounded would get the wrong tag and go permanently silent, and the log is what makes
+that name itself.
+
+**Measured, both arches** — `evsplit` on event0, 20 QMP keys while backgrounded then 20 after
+switching back: `absx` **44 → 22**, total **174 → 88**, `syndrop` 1. The 22 is exactly the
+foreground burst plus the two chord modifier key-downs that landed while VT1 was still active.
+Serial in the same window, 30 UART bytes while backgrounded: total **14 → 70** (aarch64),
+**16 → 74** (x86_64) — keyboard gated and serial through, in one run.
+
+**⚠ The serial exemption is a FRAME exemption, and the first cut of it was a real defect.** The
+UART drain pushes a *pair* — `EV_KEY value=2` then `EV_SYN/SYN_REPORT`. Exempting only the key
+would have handed a backgrounded reader keystrokes libinput can never complete, having no frame
+terminator: silent, unbounded, and **worse than dropping them**. Tracked with `LAST_KB_SERIAL`.
+Deliberately **not** folded into `console_ok` — queueing SYNs into the console tap under
+`KD_GRAPHICS` is precisely the confusion `has_key_event` exists to undo.
+
+**This is defence in depth, not the only barrier.** The box's libseat measurement showed
+cosmic-comp already closes both evdev fds on deactivate and reopens them on activate. The
+kernel gate covers clients that do *not* use libseat. **It was exercised against
+`vttest`/`evsplit`, not against cosmic-comp.**
+
+One residual display race is known and unfixed: a present already inside its handler
 when the switch happens can still land its *pixels* after the console's repaint. It is
 self-healing (the console draws over it) and it no longer silences the console, but it is a
 visible flash. Closing it properly means interlocking the present itself with the switch.
@@ -2456,14 +2483,48 @@ out of repo in `leandros-artifacts/m6-session-bins/`, and the box had only that 
 nothing about whether anything can build it, and "the binary exists on this machine" says
 nothing about the other.
 
-### 20. `EVIOCGRAB` is accepted but not enforced — DECIDED 2026-08-10: enforce, with an escape hatch
+### 20. `EVIOCGRAB` — ENFORCED 2026-08-10 (`4e0a84f`), and the premise this item was filed on was FALSE
 
-Enforcement only becomes *safe* now that the chord exists: Ctrl+Alt+Fn runs inside
-`push_event`, ahead of all per-client routing, so a grab **structurally cannot** block it.
-It should still be switched on only after a hand-verified `grab → Ctrl+Alt+F2 → Ctrl+Alt+F1`
-round trip on **both** arches. **It is the one feature whose failure mode is an unrecoverable
-machine**, so it must not ride in the same change as the switching it depends on, and it must
-not ride with item 14's DRM master handoff either.
+**⚠ READ THIS FIRST: "a grab structurally cannot block the chord" was WRONG, and enforcing on
+that reasoning would have produced exactly the unrecoverable machine this item feared.**
+`chord_key` gates itself on **K_XLATE** — matching Linux — so a client that takes a grab *and*
+sets `K_RAW` closes the chord. Demonstrated directly, both arches, with `vttest trap` (grab +
+K_RAW + KD_GRAPHICS, restoring nothing):
+
+```
+trapped              vt=1 kdmode=1 kbmode=0 grabbable=0
+after Ctrl+Alt+F2    vt=1 kdmode=1 kbmode=0 grabbable=0   <- chord DEFEATED
+after Ctrl+Alt+Esc   vt=1 kdmode=0 kbmode=1 grabbable=1   <- rescued
+then F2 / F1         vt=2 / vt=1
+```
+
+**The escape hatch is not belt-and-braces; it is the only thing that works in that state.**
+That is why `escape_key` (Ctrl+Alt+Esc) carries **no keyboard-mode gate** at all, unlike the
+chord. The decision to require a hatch rather than trust the chord's precedence was the
+difference between a safe enforcement and a brick.
+
+**Four things now end a grab**, which is why the item can close: an explicit ungrab; the
+grabber's death (`cleanup_pid` from `vfs_close_all_for`, `kernel/src/syscall.rs:6114` —
+`grabbable=0` → `kill -9` → `grabbable=1`, both arches); a **VT switch away** from the VT that
+took it (`grab_vt` scoping); and **Ctrl+Alt+Esc** as the ungated last resort, serviced as a
+deferred `rescue()` via `RESCUE` in `poll_deferred` rather than inside the IRQ path.
+
+Implementation: `EvdevDevice.grab_open/grab_pid/grab_vt`, `set_grab`/`ungrab_all`/
+`release_all_grabs`/`cleanup_pid`, and the grab filter in `broadcast` with self-heal
+(`servers/evdev/src/lib.rs`). **Landmine: the `0x90` argument arrives BY VALUE, not by
+pointer.** `0x91` (`EVIOCREVOKE`) is still accepted-and-ignored. **`vttest` 17/17 → 21/21,
+both arches.**
+
+**Unverified, stated plainly.** Exclusive *delivery* under a grab is **not** directly measured —
+only the ioctl surface and every release path. Proving delivery needs host-injected events plus
+a second reader. The four subtests deliberately cover the half whose failure leaves a dead
+machine. Also: **Ctrl+Alt+Esc is now swallowed from all clients**, so if COSMIC ever binds it,
+that bind will never fire — the same divergence class as the chord, accepted for the same reason.
+
+*Historical, kept because the reasoning was seductive and wrong:* this item originally argued
+enforcement was safe because Ctrl+Alt+Fn runs inside `push_event` ahead of all per-client
+routing, so a grab could not block it. True of *routing*, false of *reachability* — the gate
+that defeats it is upstream of routing entirely.
 
 **DECISION (2026-08-10, the user's): enforce it, and add a kernel-side escape hatch rather than
 relying on the chord alone.** The chord's structural precedence is an argument that the current
@@ -2472,6 +2533,8 @@ an **ungrab-all driven by the VT switch itself** (a grab is scoped to the VT tha
 cannot survive a switch away from it), plus a magic key as a last resort. That removes the
 unrecoverable-machine failure mode outright instead of arguing it cannot be reached — which is
 the right trade when the cost of being wrong is a machine with no way to ask it anything.
+**Vindicated by measurement within hours: the thing it declined to trust turned out not to
+hold.**
 Enforcement lives at **`servers/evdev/src/lib.rs:667`** (`0x90`/`0x91`). *(Corrected: an earlier
 revision of this line said `drivers/src/drm_device_interface.rs:667`, which is
 `struct drm_virtgpu_execbuffer` — a wrong file that happened to carry a plausible line number.
