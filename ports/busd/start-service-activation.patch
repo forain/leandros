@@ -1,0 +1,1186 @@
+D-Bus service activation: real `.service` file parsing, real spawning.
+
+Closes TODO.md item 10. Before this, `servicedirs` was parsed by
+`config/mod.rs` (with passing unit tests) and then never read anywhere else:
+`list_activatable_names` returned `&[]`, `start_service_by_name` and
+`update_activation_environment` both unconditionally returned
+`Error::Failed("Service activation not yet supported")`, and no `.service`
+file parser or spawn path existed in the crate at all.
+
+MUST apply after `service-unknown-reply.patch` (alphabetical `*.patch`
+glob order in `build.sh` already guarantees this: `s`-`e`-`r` < `s`-`t`-`a`).
+The implicit-activation hook added here is a straight extension of that
+patch's `send_msg`/`reply_service_unknown` code, and would fail to apply
+against the unpatched tree.
+
+What's added:
+
+  * `src/config/service_file.rs` (new) -- parses the `[D-BUS Service]`
+    section of a `.service` key file (`Name=`, `Exec=`, `User=`;
+    `SystemdService=` and any other key is ignored, not an error). Never
+    returns an `Err`: a missing section or missing `Name`/`Exec` is `None`,
+    logged with `warn!` by the directory scanner and skipped, exactly like
+    an unreadable file or directory. One bad `.service` file must never
+    stop the bus from starting. Ships its own unit tests, including a
+    real-filesystem `scan_dir` test.
+
+  * `src/peers.rs` -- `Peers` gains `activatable_services` (name ->
+    `ServiceFile`, scanned **once at startup**, not re-scanned lazily on a
+    lookup miss -- see `load_servicedirs`'s doc comment for why that's
+    enough for us: LeandrOS images are read-only per boot, `.service`
+    files don't appear after boot, and it keeps every activation check a
+    plain in-memory `HashMap` read) and `activation_environment` (from
+    `UpdateActivationEnvironment`). `activate_service` spawns `Exec=` via
+    `std::process::Command` and polls `name_registry` (bounded by
+    `ACTIVATION_TIMEOUT` = 5s, `ACTIVATION_POLL_INTERVAL` = 50ms) for the
+    spawned process to actually claim its name, returning the specific
+    D-Bus error to report: `ServiceUnknown` (no `.service` file for the
+    name), `SpawnExecFailed` (`Command::spawn` itself failed, or `Exec=`
+    was empty), or `SpawnChildExited` (spawned fine but never claimed the
+    name before the timeout).
+
+  * `src/bus/mod.rs` / `src/bin/busd.rs` -- `Bus::load_servicedirs`
+    delegates to `Peers::load_servicedirs`, called once from `main()` right
+    after `Bus::for_address` succeeds and before `run()` starts accepting
+    connections.
+
+  * `src/fdo/dbus.rs` -- `list_activatable_names` now returns the union of
+    the scanned service map and currently-owned well-known names (an
+    already-running activatable service is still "activatable" per the
+    spec). `start_service_by_name` returns `AlreadyRunning` if the name is
+    already owned, otherwise calls `activate_service` and reports
+    `Success`/its specific error -- never the old generic `Failed`.
+    `update_activation_environment` stores the environment for future
+    spawns instead of refusing.
+
+  * Implicit activation (`src/peers.rs`, `send_msg`'s well-known-name
+    branch): a plain method call to an unowned name should trigger
+    activation per the spec, not just an explicit `StartServiceByName`.
+    Implemented via `activate_if_activatable`, gated so the risk called
+    out in TODO.md is contained: it first does a **synchronous, zero-cost
+    HashMap lookup** (`is_activatable`) and returns `None` immediately, with
+    no spawn attempt and no delay, for any name that isn't in the scanned
+    service map. That is the overwhelming majority of unowned-name calls a
+    real session makes (`service-unknown-reply.patch`'s own measurements:
+    eleven distinct unowned names in the first ten seconds, mostly
+    libcosmic single-instance probes to app IDs nobody ships a `.service`
+    file for), so the fast `reply_service_unknown` path -- the fix for the
+    hang that blocked every libcosmic app before that patch landed -- is
+    completely unaffected for the non-activatable case: same lookup, same
+    speed, same reply. Only a name that genuinely has a `.service` file
+    pays the activation cost, and that cost (bounded by
+    `ACTIVATION_TIMEOUT`) is inherent to implicit activation being useful
+    at all, not a regression. On activation failure or timeout, the
+    implicit path currently falls back to the same `ServiceUnknown` reply
+    `reply_service_unknown` already sends for "nobody owns this" --
+    slightly less precise than the specific `Spawn.*` error
+    `StartServiceByName` returns for the same failure, but simplest and
+    still correct: the caller gets an error back and does not hang, which
+    is the property that matters here.
+
+  * `User=` is parsed and carried on `ServiceFile`, but busd still has no
+    setuid-helper/privilege-drop implementation (see
+    `ports/dbus/session-pkg/session.conf`), so it can't actually be
+    honoured beyond a `debug!` log; activation still spawns as the daemon's
+    own user. LeandrOS's session bring-up is single-user/root-only today,
+    so this doesn't change behavior in practice.
+
+Verification performed (see AGENTS.md/README.md: this port is built and
+tested outside the LeandrOS image, `cargo build`/`cargo test` against the
+crate directly):
+
+  * `cargo build` / `cargo test` (host, debug) against a **freshly
+    re-extracted** `busd-0.5.0.crate` with all three `*.patch` files
+    applied in the real `build.sh` order -- not just against the
+    incrementally-edited working tree. All pre-existing tests still pass
+    (config, fdo, greet, monitor, multiple_conns), plus this patch's own
+    `src/config/service_file.rs` unit tests and a new
+    `tests/activation.rs` integration suite (`Peers`-level: fast
+    `ServiceUnknown` for an unknown name, `SpawnExecFailed` for a bad
+    `Exec=`, `SpawnChildExited` timeout for a spawn that never claims its
+    name, first-definition-wins on a duplicate `Name=` across two
+    servicedirs; wire-level over a real `Bus` + `DBusProxy`:
+    `ListActivatableNames`, `StartServiceByName` in all three outcomes
+    (`ServiceUnknown`/`SpawnExecFailed`/`AlreadyRunning`),
+    `UpdateActivationEnvironment`; and a regression guard that a plain
+    method call to an unowned-but-activatable name spawns its `Exec=` and
+    still gets an error reply rather than hanging).
+  * `cargo +nightly build --release --target {aarch64,x86_64}-unknown-linux-musl`
+    with the same `-C relocation-model=static` / `rust-lld` config
+    `build.sh` uses -- both produce a statically-linked, stripped ET_EXEC
+    `busd`, matching the existing shipped binaries' format (`file(1)`
+    confirmed).
+
+NOT verified: this has never been booted in QEMU. No LeandrOS image was
+rebuilt, no real `.service` file was placed under the image's servicedir,
+and no on-target activation (implicit or explicit) has been observed. The
+`std::process::Command::spawn` path in particular is unverified against
+LeandrOS's actual `fork`/`execve` behavior -- only against the host
+(macOS) libc's.
+
+diff --git a/Cargo.toml b/Cargo.toml
+index b954365..0eae978 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -44,6 +44,10 @@ path = "src/lib.rs"
+ name = "busd"
+ path = "src/bin/busd.rs"
+ 
++[[test]]
++name = "activation"
++path = "tests/activation.rs"
++
+ [[test]]
+ name = "config"
+ path = "tests/config.rs"
+diff --git a/src/bin/busd.rs b/src/bin/busd.rs
+index a7bc4ed..98301b9 100644
+--- a/src/bin/busd.rs
++++ b/src/bin/busd.rs
+@@ -81,6 +81,11 @@ async fn main() -> Result<()> {
+ 
+     let mut bus = bus::Bus::for_address(address.as_deref()).await?;
+ 
++    // Service activation: scan `<servicedir>`/`<standard_..._servicedirs>`
++    // once at startup, before we start accepting connections. See
++    // `Bus::load_servicedirs` / `Peers::load_servicedirs`.
++    bus.load_servicedirs(&config.servicedirs).await;
++
+     if let Some(fd) = args.ready_fd {
+         // SAFETY: We don't have any way to know if the fd is valid or not. The parent process is
+         // responsible for passing a valid fd.
+diff --git a/src/bus/mod.rs b/src/bus/mod.rs
+index 2aa68b2..b3c0fe8 100644
+--- a/src/bus/mod.rs
++++ b/src/bus/mod.rs
+@@ -1,5 +1,10 @@
+ use anyhow::{bail, Ok, Result};
+-use std::{env, path::Path, str::FromStr, sync::Arc};
++use std::{
++    env,
++    path::{Path, PathBuf},
++    str::FromStr,
++    sync::Arc,
++};
+ use tokio::{fs::remove_file, spawn};
+ use tracing::{debug, info, trace, warn};
+ use zbus::{
+@@ -116,6 +121,15 @@ impl Bus {
+         &self.inner.address
+     }
+ 
++    /// Scan `servicedirs` (from `Config::servicedirs`) for `.service`
++    /// activation files, once. Callers (`src/bin/busd.rs`) invoke this
++    /// right after `for_address` succeeds and before `run()` starts
++    /// serving connections; see `Peers::load_servicedirs` for why the scan
++    /// is startup-once rather than re-scanned lazily on a lookup miss.
++    pub async fn load_servicedirs(&self, servicedirs: &[PathBuf]) {
++        self.inner.peers.load_servicedirs(servicedirs).await;
++    }
++
+     pub async fn run(&mut self) -> Result<()> {
+         loop {
+             self.accept_next().await?;
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+index 4970514..ca743f9 100644
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -11,12 +11,14 @@ use zbus::{Address, AuthMechanism};
+ 
+ pub mod policy;
+ pub mod rule;
++pub mod service_file;
+ mod xml;
+ 
+ pub use policy::Policy;
+ pub use rule::{
+     Access, ConnectOperation, NameOwnership, Operation, ReceiveOperation, SendOperation,
+ };
++pub use service_file::ServiceFile;
+ use xml::{Document, Element, TypeElement};
+ 
+ /// The bus configuration.
+diff --git a/src/config/service_file.rs b/src/config/service_file.rs
+new file mode 100644
+index 0000000..d56d04e
+--- /dev/null
++++ b/src/config/service_file.rs
+@@ -0,0 +1,251 @@
++//! Parsing of D-Bus `.service` activation files.
++//!
++//! These are simple INI-style key files with a single `[D-BUS Service]`
++//! section, documented at
++//! <https://dbus.freedesktop.org/doc/dbus-daemon.1.html#service-files>. We
++//! only need `Name=` (the well-known bus name this file activates) and
++//! `Exec=` (the command line to run). `User=` is recorded, though busd has
++//! no privilege-dropping story yet -- see `Peers::activate_service`.
++//! `SystemdService=` is recognized and ignored: we have no systemd.
++
++use std::{
++    ffi::OsStr,
++    fs,
++    path::{Path, PathBuf},
++};
++
++use tracing::warn;
++
++/// A parsed `.service` file, as far as busd cares.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ServiceFile {
++    /// The well-known bus name this file activates (`Name=`).
++    pub name: String,
++    /// The command line to run to provide that name (`Exec=`).
++    pub exec: String,
++    /// The user the service should ideally run as (`User=`), if given.
++    ///
++    /// busd has no setuid-helper/privilege-drop implementation (see
++    /// `ports/dbus/session-pkg/session.conf`'s header comment), so this is
++    /// currently only used to `warn!` when it doesn't match reality rather
++    /// than to actually change the spawned process's credentials.
++    pub user: Option<String>,
++}
++
++impl ServiceFile {
++    /// Parse the contents of a single `.service` file.
++    ///
++    /// Returns `None` for anything malformed: no `[D-BUS Service]` section,
++    /// or a section missing `Name`/`Exec`. This never returns an `Err`
++    /// because callers must treat a broken/foreign `.service` file as
++    /// "skip it", never as a reason to fail bus startup.
++    pub fn parse(input: &str) -> Option<Self> {
++        let mut in_section = false;
++        let mut name = None;
++        let mut exec = None;
++        let mut user = None;
++
++        for line in input.lines() {
++            let line = line.trim();
++            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
++                continue;
++            }
++            if line.starts_with('[') {
++                // A (malformed) line like `[Foo` with no closing bracket is
++                // treated as "not our section" rather than panicking on the
++                // missing `strip_suffix`.
++                in_section = line.strip_suffix(']') == Some("[D-BUS Service]")
++                    || line == "[D-BUS Service]";
++                continue;
++            }
++            if !in_section {
++                continue;
++            }
++            let Some((key, value)) = line.split_once('=') else {
++                // Not a `Key=Value` line; ignore rather than fail the whole
++                // file, in case of stray comments/continuation lines from a
++                // future spec revision.
++                continue;
++            };
++            match key.trim() {
++                "Name" => name = Some(value.trim().to_string()),
++                "Exec" => exec = Some(value.trim().to_string()),
++                "User" => user = Some(value.trim().to_string()),
++                // `SystemdService=` and any other/vendor key: ignored
++                // gracefully, per the spec's forward-compatibility rules.
++                _ => {}
++            }
++        }
++
++        Some(ServiceFile {
++            name: name?,
++            exec: exec?,
++            user,
++        })
++    }
++
++    /// Scan a single directory (non-recursively) for `*.service` files,
++    /// parsing each one.
++    ///
++    /// Errors are never propagated: an unreadable directory, an unreadable
++    /// file, or a malformed file are all logged with `warn!` and skipped.
++    /// One bad servicedir or `.service` file must never prevent the bus
++    /// from starting.
++    pub fn scan_dir(dir: &Path) -> Vec<(PathBuf, ServiceFile)> {
++        let mut out = Vec::new();
++
++        let entries = match fs::read_dir(dir) {
++            Ok(entries) => entries,
++            Err(e) => {
++                // Most configured servicedirs won't exist on any given
++                // image; that's the common case, not a warning.
++                if e.kind() != std::io::ErrorKind::NotFound {
++                    warn!("Couldn't read service directory `{}`: {}", dir.display(), e);
++                }
++                return out;
++            }
++        };
++
++        for entry in entries {
++            let entry = match entry {
++                Ok(entry) => entry,
++                Err(e) => {
++                    warn!("Couldn't read an entry in `{}`: {}", dir.display(), e);
++                    continue;
++                }
++            };
++            let path = entry.path();
++            if path.extension() != Some(OsStr::new("service")) {
++                continue;
++            }
++            let contents = match fs::read_to_string(&path) {
++                Ok(contents) => contents,
++                Err(e) => {
++                    warn!("Couldn't read service file `{}`: {}", path.display(), e);
++                    continue;
++                }
++            };
++            match Self::parse(&contents) {
++                Some(service) => out.push((path, service)),
++                None => warn!(
++                    "Skipping malformed service file `{}` (no [D-BUS Service] section, or \
++                     missing Name/Exec)",
++                    path.display()
++                ),
++            }
++        }
++
++        out
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parse_minimal_ok() {
++        let input = "[D-BUS Service]\nName=org.example.Foo\nExec=/usr/bin/foo --flag\n";
++        assert_eq!(
++            ServiceFile::parse(input),
++            Some(ServiceFile {
++                name: "org.example.Foo".to_string(),
++                exec: "/usr/bin/foo --flag".to_string(),
++                user: None,
++            })
++        );
++    }
++
++    #[test]
++    fn parse_with_user_and_systemdservice_ok() {
++        let input = "[D-BUS Service]\nName=org.example.Foo\nExec=/usr/bin/foo\nUser=alice\n\
++                      SystemdService=org.example.Foo.service\n";
++        assert_eq!(
++            ServiceFile::parse(input),
++            Some(ServiceFile {
++                name: "org.example.Foo".to_string(),
++                exec: "/usr/bin/foo".to_string(),
++                user: Some("alice".to_string()),
++            })
++        );
++    }
++
++    #[test]
++    fn parse_ignores_comments_and_blank_lines() {
++        let input = "; a comment\n#another\n\n[D-BUS Service]\n\nName=org.example.Foo\n\
++                      Exec=/usr/bin/foo\n";
++        assert_eq!(
++            ServiceFile::parse(input),
++            Some(ServiceFile {
++                name: "org.example.Foo".to_string(),
++                exec: "/usr/bin/foo".to_string(),
++                user: None,
++            })
++        );
++    }
++
++    #[test]
++    fn parse_ignores_other_sections() {
++        let input = "[Other Section]\nName=wrong\nExec=wrong\n[D-BUS Service]\n\
++                      Name=org.example.Foo\nExec=/usr/bin/foo\n";
++        assert_eq!(
++            ServiceFile::parse(input),
++            Some(ServiceFile {
++                name: "org.example.Foo".to_string(),
++                exec: "/usr/bin/foo".to_string(),
++                user: None,
++            })
++        );
++    }
++
++    #[test]
++    fn parse_missing_name_is_none() {
++        let input = "[D-BUS Service]\nExec=/usr/bin/foo\n";
++        assert_eq!(ServiceFile::parse(input), None);
++    }
++
++    #[test]
++    fn parse_missing_exec_is_none() {
++        let input = "[D-BUS Service]\nName=org.example.Foo\n";
++        assert_eq!(ServiceFile::parse(input), None);
++    }
++
++    #[test]
++    fn parse_missing_section_is_none() {
++        let input = "Name=org.example.Foo\nExec=/usr/bin/foo\n";
++        assert_eq!(ServiceFile::parse(input), None);
++    }
++
++    #[test]
++    fn parse_empty_input_is_none() {
++        assert_eq!(ServiceFile::parse(""), None);
++    }
++
++    #[test]
++    fn scan_dir_skips_non_service_files_and_missing_dir() {
++        let dir = std::env::temp_dir().join(format!(
++            "busd-service-file-test-{}-{}",
++            std::process::id(),
++            fastrand::u64(..)
++        ));
++        std::fs::create_dir_all(&dir).unwrap();
++
++        std::fs::write(
++            dir.join("good.service"),
++            "[D-BUS Service]\nName=org.example.Good\nExec=/usr/bin/good\n",
++        )
++        .unwrap();
++        std::fs::write(dir.join("not-a-service.txt"), "irrelevant").unwrap();
++        std::fs::write(dir.join("bad.service"), "no section here").unwrap();
++
++        let mut found = ServiceFile::scan_dir(&dir);
++        found.sort_by(|a, b| a.1.name.cmp(&b.1.name));
++        assert_eq!(found.len(), 1);
++        assert_eq!(found[0].1.name, "org.example.Good");
++
++        // A missing directory must not panic or return anything.
++        assert!(ServiceFile::scan_dir(&dir.join("does-not-exist")).is_empty());
++
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++}
+diff --git a/src/fdo/dbus.rs b/src/fdo/dbus.rs
+index 4bc7429..e8f761a 100644
+--- a/src/fdo/dbus.rs
++++ b/src/fdo/dbus.rs
+@@ -12,7 +12,10 @@ use zbus::{
+         StartServiceReply,
+     },
+     interface, message,
+-    names::{BusName, InterfaceName, OwnedBusName, OwnedUniqueName, UniqueName, WellKnownName},
++    names::{
++        BusName, InterfaceName, OwnedBusName, OwnedUniqueName, OwnedWellKnownName, UniqueName,
++        WellKnownName,
++    },
+     object_server::{ResponseDispatchNotifier, SignalEmitter},
+     zvariant::Optional,
+     OwnedGuid, OwnedMatchRule,
+@@ -271,9 +274,21 @@ impl DBus {
+     }
+ 
+     /// Returns a list of all names that can be activated on the bus.
+-    fn list_activatable_names(&self) -> &[OwnedBusName] {
+-        // TODO: Return actual list when we support service activation.
+-        &[]
++    async fn list_activatable_names(&self) -> Result<Vec<OwnedBusName>> {
++        let peers = self.peers()?;
++
++        // The union of names provided by `.service` files and names that
++        // are already owned: a name that got activated (or was simply
++        // acquired directly) is still "activatable" per the spec -- a
++        // `StartServiceByName` call on it just replies `AlreadyRunning`.
++        let mut names: std::collections::HashSet<OwnedWellKnownName> =
++            peers.activatable_names().await.into_iter().collect();
++        names.extend(peers.name_registry().await.all_names().keys().cloned());
++
++        Ok(names
++            .into_iter()
++            .map(|n| BusName::WellKnown(n.into()).into())
++            .collect())
+     }
+ 
+     /// Returns a list of all currently-owned names on the bus.
+@@ -326,21 +341,27 @@ impl DBus {
+         name: WellKnownName<'_>,
+         _flags: u32,
+     ) -> Result<StartServiceReply> {
+-        if self.name_has_owner(name.into()).await? {
++        if self.name_has_owner(name.clone().into()).await? {
+             return Ok(StartServiceReply::AlreadyRunning);
+         }
+-        // TODO: Implement further when we support service activation.
+-        Err(Error::Failed(
+-            "Service activation not yet supported".to_string(),
+-        ))
++
++        self.peers()?.activate_service(&name).await?;
++
++        Ok(StartServiceReply::Success)
+     }
+ 
+     /// This method adds to or modifies that environment when activating services.
+-    fn update_activation_environment(&self, _environment: HashMap<&str, &str>) -> Result<()> {
+-        // TODO: Implement when we support service activation.
+-        Err(Error::Failed(
+-            "Service activation not yet supported".to_string(),
+-        ))
++    async fn update_activation_environment(
++        &self,
++        environment: HashMap<&str, &str>,
++    ) -> Result<()> {
++        let env = environment
++            .into_iter()
++            .map(|(k, v)| (k.to_string(), v.to_string()))
++            .collect();
++        self.peers()?.update_activation_environment(env).await;
++
++        Ok(())
+     }
+ 
+     /// Reload server configuration.
+diff --git a/src/peers.rs b/src/peers.rs
+index 950cbde..831b9c5 100644
+--- a/src/peers.rs
++++ b/src/peers.rs
+@@ -5,32 +5,58 @@ use futures_util::{
+     stream::StreamExt,
+ };
+ use std::{
+-    collections::BTreeMap,
++    collections::{BTreeMap, HashMap},
+     ops::{Deref, DerefMut},
++    path::PathBuf,
+     sync::Arc,
++    time::Duration,
+ };
+ use tokio::{spawn, sync::RwLock};
+ use tracing::{debug, trace, warn};
+ use zbus::{
+     connection::socket::BoxedSplit,
+     message,
+-    names::{BusName, OwnedUniqueName, UniqueName, WellKnownName},
++    names::{BusName, OwnedUniqueName, OwnedWellKnownName, UniqueName, WellKnownName},
+     zvariant::Optional,
+     AuthMechanism, Message, OwnedGuid,
+ };
+ 
+ use crate::{
++    config::ServiceFile,
+     fdo,
+     match_rules::MatchRules,
+     name_registry::{NameOwnerChanged, NameRegistry},
+     peer::{Monitor, Peer, Stream},
+ };
+ 
++/// How long implicit/explicit activation waits for a spawned service to
++/// actually appear in the name registry before giving up.
++///
++/// The D-Bus spec leaves this to the implementation (the reference
++/// `dbus-daemon` defaults to 25s). We pick something much shorter because
++/// LeandrOS activation targets are local, statically-linked binaries with
++/// no dynamic loader/network startup cost, and a hung activation attempt
++/// otherwise blocks the calling peer's connection for the full timeout.
++const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
++
++/// Poll interval while waiting for an activated service to claim its name.
++/// There's no notification hook into `NameRegistry` to await instead, so
++/// this is a plain poll loop; see `Peers::await_name_owner`.
++const ACTIVATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
++
+ #[derive(Debug)]
+ pub struct Peers {
+     peers: RwLock<BTreeMap<OwnedUniqueName, Peer>>,
+     monitors: RwLock<BTreeMap<OwnedUniqueName, Monitor>>,
+     name_registry: RwLock<NameRegistry>,
++    /// Names activatable via a `.service` file, keyed by the well-known
++    /// name they provide. Populated once at startup by `load_servicedirs`
++    /// -- see that method's doc comment for why this isn't re-scanned on
++    /// a lookup miss.
++    activatable_services: RwLock<HashMap<OwnedWellKnownName, ServiceFile>>,
++    /// Extra environment variables set via `UpdateActivationEnvironment`,
++    /// applied to every subsequently-spawned activated service.
++    activation_environment: RwLock<HashMap<String, String>>,
+ }
+ 
+ impl Peers {
+@@ -41,9 +67,193 @@ impl Peers {
+             peers: RwLock::new(BTreeMap::new()),
+             monitors: RwLock::new(BTreeMap::new()),
+             name_registry: RwLock::new(name_registry),
++            activatable_services: RwLock::new(HashMap::new()),
++            activation_environment: RwLock::new(HashMap::new()),
+         })
+     }
+ 
++    /// Scan `servicedirs` for `.service` files and record the activatable
++    /// names they provide.
++    ///
++    /// This is done **once**, here, at startup (called from
++    /// `src/bin/busd.rs` right after the bus starts listening) rather than
++    /// re-scanned lazily on every lookup miss the way the reference
++    /// `dbus-daemon` does (it journals servicedir mtimes and invalidates a
++    /// cache). Startup-once is enough for us: LeandrOS images are built
++    /// read-only per boot, `.service` files don't appear or change after
++    /// boot, and it means `list_activatable_names`/activation lookups are
++    /// a plain in-memory `HashMap` read with no filesystem cost on the hot
++    /// path (which matters for the implicit-activation check in
++    /// `send_msg` below -- see its doc comment).
++    ///
++    /// A name provided by more than one file keeps its first definition
++    /// (in servicedir order, which `config::Config` already built with the
++    /// spec's precedence -- explicit `<servicedir>` entries before
++    /// `<standard_..._servicedirs>` expansions); later duplicates are
++    /// logged and dropped, matching the reference implementation's
++    /// "first one wins" rule.
++    pub async fn load_servicedirs(&self, servicedirs: &[PathBuf]) {
++        let mut map = self.activatable_services.write().await;
++        for dir in servicedirs {
++            for (path, service) in ServiceFile::scan_dir(dir) {
++                let name = match OwnedWellKnownName::try_from(service.name.clone()) {
++                    Ok(name) => name,
++                    Err(e) => {
++                        warn!(
++                            "Service file `{}` has an invalid Name `{}`: {}",
++                            path.display(),
++                            service.name,
++                            e
++                        );
++                        continue;
++                    }
++                };
++                if map.contains_key(&name) {
++                    debug!(
++                        "Ignoring duplicate activatable name `{}` from `{}`",
++                        name,
++                        path.display()
++                    );
++                    continue;
++                }
++                map.insert(name, service);
++            }
++        }
++    }
++
++    /// All names that can currently be activated (i.e. have a `.service`
++    /// file), for `org.freedesktop.DBus.ListActivatableNames`.
++    pub async fn activatable_names(&self) -> Vec<OwnedWellKnownName> {
++        self.activatable_services.read().await.keys().cloned().collect()
++    }
++
++    /// Merge `env` into the environment applied to services spawned by
++    /// future activations, for `UpdateActivationEnvironment`.
++    pub async fn update_activation_environment(&self, env: HashMap<String, String>) {
++        self.activation_environment.write().await.extend(env);
++    }
++
++    /// Look up `name` in the scanned service map without attempting
++    /// activation. Used by `send_msg`'s implicit-activation hook to decide,
++    /// with no spawn/wait cost, whether an unowned name is even a
++    /// candidate for activation.
++    async fn is_activatable(&self, name: &WellKnownName<'_>) -> bool {
++        self.activatable_services.read().await.contains_key(name.as_str())
++    }
++
++    /// Try to activate `name`: look it up in the scanned service map, spawn
++    /// its `Exec=` command line, and wait (bounded by `ACTIVATION_TIMEOUT`)
++    /// for it to actually call `RequestName` and appear in the name
++    /// registry. A process that spawned but hasn't yet claimed the name it
++    /// promised is not "started" in the D-Bus sense.
++    ///
++    /// Returns the exact D-Bus error to report on failure:
++    ///   * `ServiceUnknown` -- no `.service` file provides this name.
++    ///   * `SpawnExecFailed` -- `Command::spawn` itself failed (bad `Exec=`,
++    ///     ENOENT, EPERM, ...), or the `Exec=` line was empty.
++    ///   * `SpawnChildExited` -- the process spawned but never claimed the
++    ///     name within the timeout. We don't distinguish "exited quickly"
++    ///     from "still running but slow/broken" since `std::process::Child`
++    ///     isn't polled here (we intentionally don't `wait()` on it, so the
++    ///     child can outlive this call the way a real service does); this
++    ///     is the closest standard error code for "activation didn't pan
++    ///     out in time".
++    pub async fn activate_service(
++        &self,
++        name: &WellKnownName<'_>,
++    ) -> std::result::Result<(), zbus::fdo::Error> {
++        let service = self.activatable_services.read().await.get(name.as_str()).cloned();
++        let Some(service) = service else {
++            return Err(zbus::fdo::Error::ServiceUnknown(format!(
++                "The name {name} was not provided by any .service files"
++            )));
++        };
++
++        if let Some(user) = &service.user {
++            // busd has no setuid-helper/privilege-drop implementation (see
++            // `ports/dbus/session-pkg/session.conf`), and LeandrOS's
++            // session bring-up is single-user/root-only, so we can't
++            // actually honour a `User=` that isn't the user we're already
++            // running as. We still spawn -- refusing to activate a service
++            // just because it politely declared a `User=` we can't switch
++            // to would be worse than running it as ourselves.
++            debug!(
++                "Service for `{name}` requests User={user}, but busd cannot change users; \
++                 spawning as the daemon's own user"
++            );
++        }
++
++        let mut parts = service.exec.split_whitespace();
++        let Some(program) = parts.next() else {
++            return Err(zbus::fdo::Error::SpawnExecFailed(format!(
++                "Service file for `{name}` has an empty Exec="
++            )));
++        };
++
++        let mut command = std::process::Command::new(program);
++        command.args(parts);
++        for (key, value) in self.activation_environment.read().await.iter() {
++            command.env(key, value);
++        }
++
++        if let Err(e) = command.spawn() {
++            return Err(zbus::fdo::Error::SpawnExecFailed(format!(
++                "Failed to execute `{program}` for name `{name}`: {e}"
++            )));
++        }
++
++        self.await_name_owner(name, ACTIVATION_TIMEOUT).await
++    }
++
++    /// Poll the name registry until `name` has an owner or `timeout`
++    /// elapses. Each iteration acquires and releases the `name_registry`
++    /// read lock rather than holding it across the `sleep`, so a writer
++    /// (e.g. the very `RequestName` call we're waiting for) is never
++    /// starved by this loop -- same discipline as `send_msg` below.
++    async fn await_name_owner(
++        &self,
++        name: &WellKnownName<'_>,
++        timeout: Duration,
++    ) -> std::result::Result<(), zbus::fdo::Error> {
++        let deadline = tokio::time::Instant::now() + timeout;
++        loop {
++            if self.name_registry.read().await.lookup(name.clone()).is_some() {
++                return Ok(());
++            }
++            if tokio::time::Instant::now() >= deadline {
++                return Err(zbus::fdo::Error::SpawnChildExited(format!(
++                    "Activated service for `{name}` did not claim the name within {timeout:?}"
++                )));
++            }
++            tokio::time::sleep(ACTIVATION_POLL_INTERVAL).await;
++        }
++    }
++
++    /// Implicit activation for `send_msg`'s routing path: if `name` is
++    /// unowned but a `.service` file provides it, activate it (spawn +
++    /// wait, exactly as an explicit `StartServiceByName` call would) and
++    /// return its now-registered owner.
++    ///
++    /// Returns `None` immediately, with **no spawn attempt and no delay**,
++    /// if `name` isn't in the scanned service map. This is the crucial
++    /// property: it keeps the non-activatable path -- the overwhelming
++    /// majority of unowned-name calls in a real session, per
++    /// `service-unknown-reply.patch`'s measurements (single-instance
++    /// probes to app IDs nobody ships a `.service` file for) -- exactly as
++    /// fast as it was before activation existed, so `send_msg` still falls
++    /// through to `reply_service_unknown` promptly instead of ever
++    /// re-introducing the hang that patch fixed.
++    async fn activate_if_activatable(&self, name: &WellKnownName<'_>) -> Option<OwnedUniqueName> {
++        if !self.is_activatable(name).await {
++            return None;
++        }
++        if let Err(e) = self.activate_service(name).await {
++            warn!("Implicit activation of `{name}` failed: {e}");
++            return None;
++        }
++        self.name_registry.read().await.lookup(name.clone())
++    }
++
+     pub async fn add(
+         self: &Arc<Self>,
+         guid: &OwnedGuid,
+@@ -276,10 +486,13 @@ impl Peers {
+                 let owner = self.name_registry().await.lookup(name.clone());
+                 let dest = match owner {
+                     Some(dest) => dest,
+-                    None => {
+-                        self.reply_service_unknown(&msg, &name).await;
+-                        bail!("unknown destination: {}", name);
+-                    }
++                    None => match self.activate_if_activatable(&name).await {
++                        Some(dest) => dest,
++                        None => {
++                            self.reply_service_unknown(&msg, &name).await;
++                            bail!("unknown destination: {}", name);
++                        }
++                    },
+                 };
+                 self.send_msg_to_unique_name(msg, (&*dest).into()).await
+             }
+diff --git a/tests/activation.rs b/tests/activation.rs
+new file mode 100644
+index 0000000..49ae924
+--- /dev/null
++++ b/tests/activation.rs
+@@ -0,0 +1,365 @@
++//! Integration tests for D-Bus service activation (`Peers::load_servicedirs`
++//! / `Peers::activate_service`).
++//!
++//! These exercise `Peers` directly (rather than a full `Bus` + client, the
++//! way `tests/fdo.rs`/`tests/greet.rs` do) because a genuine positive-path
++//! test -- a spawned process that actually calls `Hello`/`RequestName` and
++//! gets observed by `await_name_owner` -- would need a second, D-Bus-aware
++//! helper binary that this crate doesn't otherwise build. What's tested
++//! here instead is the real wiring around that gap: directory scanning,
++//! the fast/no-spawn path for non-activatable names (the property
++//! `send_msg`'s implicit-activation hook depends on to stay safe), a
++//! failed spawn, and a spawn that succeeds but never claims its name.
++//!
++//! These run on the host (`cargo test`), not on a LeandrOS image -- see
++//! `Exec=/usr/bin/touch ...` below, which relies on a host `touch(1)`.
++
++use std::{env::temp_dir, fs, time::Duration};
++
++use busd::{bus::Bus, peers::Peers};
++use enumflags2::BitFlag;
++use ntest::timeout;
++use rand::{
++    distr::{Alphanumeric, SampleString},
++    rng,
++};
++use tokio::{select, sync::mpsc::channel};
++use zbus::{
++    connection,
++    fdo::{self, DBusProxy, RequestNameFlags},
++    names::WellKnownName,
++    proxy::CacheProperties,
++};
++
++/// `tests/greet.rs`/`tests/fdo.rs` each call `busd::tracing_subscriber::init()`
++/// unconditionally, which is safe there because every `[[test]]` binary
++/// runs in its own process. This file has two tests that both need
++/// logging (`activation_end_to_end_over_dbus`,
++/// `implicit_activation_spawns_and_eventually_replies_on_timeout`), and
++/// the default test harness runs them as parallel threads in the *same*
++/// process, so a second unconditional `init()` panics
++/// ("global default trace dispatcher has already been set"). Guard with
++/// `Once` instead.
++fn init_tracing() {
++    static INIT: std::sync::Once = std::sync::Once::new();
++    INIT.call_once(busd::tracing_subscriber::init);
++}
++
++fn temp_servicedir() -> std::path::PathBuf {
++    let s = Alphanumeric.sample_string(&mut rng(), 10);
++    let dir = temp_dir().join(format!("busd-activation-test-{s}"));
++    fs::create_dir_all(&dir).unwrap();
++    dir
++}
++
++#[tokio::test]
++#[timeout(15000)]
++async fn activate_service_unknown_name_is_fast_and_exact() {
++    let peers = Peers::new();
++    let name: WellKnownName = "org.example.NoSuchService".try_into().unwrap();
++
++    let start = std::time::Instant::now();
++    let err = peers.activate_service(&name).await.unwrap_err();
++    // No `.service` file exists for this name, so this must return
++    // immediately -- no spawn attempt, no `ACTIVATION_TIMEOUT` wait. This
++    // is exactly the property `send_msg`'s implicit-activation hook
++    // relies on: the non-activatable path (the overwhelming majority of
++    // unowned-name calls) must stay as fast as it was before activation
++    // existed, or it risks reintroducing the hang
++    // `service-unknown-reply.patch` fixed.
++    assert!(
++        start.elapsed() < Duration::from_millis(500),
++        "activation of an unknown name must not spawn or wait"
++    );
++    assert!(matches!(err, zbus::fdo::Error::ServiceUnknown(_)));
++}
++
++#[tokio::test]
++#[timeout(15000)]
++async fn activate_service_bad_exec_fails_immediately() {
++    let dir = temp_servicedir();
++    fs::write(
++        dir.join("org.example.BadExec.service"),
++        "[D-BUS Service]\nName=org.example.BadExec\n\
++         Exec=/no/such/binary/exists-really-does-not\n",
++    )
++    .unwrap();
++
++    let peers = Peers::new();
++    peers.load_servicedirs(&[dir.clone()]).await;
++
++    let name: WellKnownName = "org.example.BadExec".try_into().unwrap();
++    let start = std::time::Instant::now();
++    let err = peers.activate_service(&name).await.unwrap_err();
++    assert!(
++        start.elapsed() < Duration::from_millis(500),
++        "a spawn() failure (ENOENT) must be reported immediately, not after the activation timeout"
++    );
++    assert!(matches!(err, zbus::fdo::Error::SpawnExecFailed(_)));
++
++    fs::remove_dir_all(&dir).unwrap();
++}
++
++#[tokio::test]
++#[timeout(15000)]
++async fn activate_service_spawns_but_never_claims_name_times_out() {
++    let dir = temp_servicedir();
++    let marker = dir.join("spawned.marker");
++    // A real, spawnable program that exits immediately without ever
++    // touching D-Bus. This proves the `Exec=` line actually ran (the
++    // marker file appears) while still exercising the "spawned but never
++    // claimed the name" timeout path, without needing a D-Bus-aware
++    // helper binary.
++    fs::write(
++        dir.join("org.example.NeverClaims.service"),
++        format!(
++            "[D-BUS Service]\nName=org.example.NeverClaims\nExec=/usr/bin/touch {}\n",
++            marker.display()
++        ),
++    )
++    .unwrap();
++
++    let peers = Peers::new();
++    peers.load_servicedirs(&[dir.clone()]).await;
++
++    assert!(
++        peers
++            .activatable_names()
++            .await
++            .iter()
++            .any(|n| n.as_str() == "org.example.NeverClaims"),
++        "expected the scanned service to be activatable"
++    );
++
++    let name: WellKnownName = "org.example.NeverClaims".try_into().unwrap();
++    let err = peers.activate_service(&name).await.unwrap_err();
++    assert!(matches!(err, zbus::fdo::Error::SpawnChildExited(_)));
++    assert!(
++        marker.exists(),
++        "expected the Exec= program to have actually run"
++    );
++
++    fs::remove_dir_all(&dir).unwrap();
++}
++
++#[tokio::test]
++#[timeout(15000)]
++async fn load_servicedirs_first_definition_wins_on_duplicate_name() {
++    let dir_a = temp_servicedir();
++    let dir_b = temp_servicedir();
++    fs::write(
++        dir_a.join("org.example.Dup.service"),
++        "[D-BUS Service]\nName=org.example.Dup\nExec=/usr/bin/true-from-a\n",
++    )
++    .unwrap();
++    fs::write(
++        dir_b.join("org.example.Dup.service"),
++        "[D-BUS Service]\nName=org.example.Dup\nExec=/usr/bin/true-from-b\n",
++    )
++    .unwrap();
++
++    let peers = Peers::new();
++    // `dir_a` before `dir_b`: the first definition (`dir_a`'s) must win,
++    // matching the reference `dbus-daemon`'s servicedir precedence.
++    peers.load_servicedirs(&[dir_a.clone(), dir_b.clone()]).await;
++
++    let name: WellKnownName = "org.example.Dup".try_into().unwrap();
++    let err = peers.activate_service(&name).await.unwrap_err();
++    // Both would fail to spawn (neither binary exists), but the error
++    // message names the program from `dir_a`, proving precedence.
++    let zbus::fdo::Error::SpawnExecFailed(msg) = err else {
++        panic!("expected SpawnExecFailed, got {err:?}");
++    };
++    assert!(msg.contains("true-from-a"), "message was: {msg}");
++
++    fs::remove_dir_all(&dir_a).unwrap();
++    fs::remove_dir_all(&dir_b).unwrap();
++}
++
++/// End-to-end over a real `Bus` + `DBusProxy`, exercising the actual wire
++/// methods (`ListActivatableNames`, `StartServiceByName`,
++/// `UpdateActivationEnvironment`) rather than calling `Peers` directly, to
++/// prove `src/fdo/dbus.rs`'s handlers are wired up correctly end to end --
++/// same harness shape as `tests/greet.rs`/`tests/fdo.rs`.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++#[timeout(15000)]
++async fn activation_end_to_end_over_dbus() {
++    init_tracing();
++
++    let dir = temp_servicedir();
++    fs::write(
++        dir.join("org.example.BadExec.service"),
++        "[D-BUS Service]\nName=org.example.BadExec\n\
++         Exec=/no/such/binary/exists-really-does-not\n",
++    )
++    .unwrap();
++    fs::write(
++        dir.join("org.example.AlreadyRunning.service"),
++        "[D-BUS Service]\nName=org.example.AlreadyRunning\nExec=/usr/bin/true\n",
++    )
++    .unwrap();
++
++    let s = Alphanumeric.sample_string(&mut rng(), 10);
++    let path = temp_dir().join(s);
++    let address = format!("unix:path={}", path.display());
++
++    let mut bus = Bus::for_address(Some(&address)).await.unwrap();
++    bus.load_servicedirs(&[dir.clone()]).await;
++    let (tx, mut rx) = channel(1);
++
++    let handle = tokio::spawn(async move {
++        select! {
++            _ = rx.recv() => (),
++            res = bus.run() => match res {
++                Ok(()) => panic!("Bus exited unexpectedly"),
++                Err(e) => panic!("Bus exited with an error: {e}"),
++            }
++        }
++        bus
++    });
++
++    let ret = activation_client(&address).await;
++    let _ = tx.send(()).await;
++    let bus = handle.await.unwrap();
++    bus.cleanup().await.unwrap();
++    fs::remove_dir_all(&dir).unwrap();
++    ret.unwrap();
++}
++
++async fn activation_client(address: &str) -> anyhow::Result<()> {
++    use anyhow::ensure;
++
++    let conn = connection::Builder::address(address)?.build().await?;
++    let dbus_proxy = DBusProxy::builder(&conn)
++        .cache_properties(CacheProperties::No)
++        .build()
++        .await?;
++
++    // ListActivatableNames includes both of our scanned service files.
++    let activatable = dbus_proxy.list_activatable_names().await?;
++    ensure!(
++        activatable
++            .iter()
++            .any(|n| n.as_str() == "org.example.BadExec"),
++        "expected org.example.BadExec to be activatable"
++    );
++    ensure!(
++        activatable
++            .iter()
++            .any(|n| n.as_str() == "org.example.AlreadyRunning"),
++        "expected org.example.AlreadyRunning to be activatable"
++    );
++
++    // A name with no `.service` file at all: ServiceUnknown, promptly.
++    let name: WellKnownName = "org.example.NotAService".try_into()?;
++    let res = dbus_proxy.start_service_by_name(name, 0).await;
++    ensure!(
++        matches!(res, Err(fdo::Error::ServiceUnknown(_))),
++        "expected ServiceUnknown for a name with no .service file, got {res:?}"
++    );
++
++    // A name with a `.service` file whose Exec= doesn't exist: the spawn
++    // error surfaces over the wire, not a generic `Failed`.
++    let name: WellKnownName = "org.example.BadExec".try_into()?;
++    let res = dbus_proxy.start_service_by_name(name, 0).await;
++    ensure!(
++        matches!(res, Err(fdo::Error::SpawnExecFailed(_))),
++        "expected SpawnExecFailed for a bad Exec=, got {res:?}"
++    );
++
++    // A name we already own ourselves: StartServiceByName must report
++    // AlreadyRunning (2), not attempt to spawn anything.
++    let name: WellKnownName = "org.example.AlreadyRunning".try_into()?;
++    let reply = dbus_proxy
++        .request_name(name.clone(), RequestNameFlags::empty().into())
++        .await?;
++    ensure!(
++        reply == fdo::RequestNameReply::PrimaryOwner,
++        "expected to become primary owner"
++    );
++    let res = dbus_proxy.start_service_by_name(name, 0).await?;
++    ensure!(
++        res == 2,
++        "expected StartServiceReply::AlreadyRunning (2), got {res}"
++    );
++
++    // UpdateActivationEnvironment is implemented, not `Failed`.
++    let mut env = std::collections::HashMap::new();
++    env.insert("SOME_VAR", "some-value");
++    dbus_proxy.update_activation_environment(env).await?;
++
++    Ok(())
++}
++
++/// Regression guard for the implicit-activation hook in `Peers::send_msg`
++/// (see its doc comment on `activate_if_activatable`): a plain method call
++/// addressed to an unowned *activatable* name -- not an explicit
++/// `StartServiceByName` -- must trigger activation per the D-Bus spec, and
++/// the caller must still get a reply and not hang, even when the spawned
++/// service never claims its name. This is the same failure shape
++/// `service-unknown-reply.patch` fixed for the non-activatable case
++/// (libcosmic blocking forever on an unowned name), now checked for the
++/// "activatable but times out" case that this change newly introduces.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++#[timeout(15000)]
++async fn implicit_activation_spawns_and_eventually_replies_on_timeout() {
++    init_tracing();
++
++    let dir = temp_servicedir();
++    let marker = dir.join("spawned.marker");
++    fs::write(
++        dir.join("org.example.ImplicitNeverClaims.service"),
++        format!(
++            "[D-BUS Service]\nName=org.example.ImplicitNeverClaims\nExec=/usr/bin/touch {}\n",
++            marker.display()
++        ),
++    )
++    .unwrap();
++
++    let s = Alphanumeric.sample_string(&mut rng(), 10);
++    let path = temp_dir().join(s);
++    let address = format!("unix:path={}", path.display());
++
++    let mut bus = Bus::for_address(Some(&address)).await.unwrap();
++    bus.load_servicedirs(&[dir.clone()]).await;
++    let (tx, mut rx) = channel(1);
++
++    let handle = tokio::spawn(async move {
++        select! {
++            _ = rx.recv() => (),
++            res = bus.run() => match res {
++                Ok(()) => panic!("Bus exited unexpectedly"),
++                Err(e) => panic!("Bus exited with an error: {e}"),
++            }
++        }
++        bus
++    });
++
++    let conn = connection::Builder::address(address.as_str())
++        .unwrap()
++        .build()
++        .await
++        .unwrap();
++    let result = conn
++        .call_method(
++            Some("org.example.ImplicitNeverClaims"),
++            "/org/example/Test",
++            Some("org.example.Test"),
++            "Ping",
++            &(),
++        )
++        .await;
++    assert!(
++        result.is_err(),
++        "expected an error reply, not a hang or a success"
++    );
++    assert!(
++        marker.exists(),
++        "expected the Exec= program to have actually run (implicit activation spawned it)"
++    );
++
++    let _ = tx.send(()).await;
++    let bus = handle.await.unwrap();
++    bus.cleanup().await.unwrap();
++    fs::remove_dir_all(&dir).unwrap();
++}
