@@ -873,6 +873,9 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
     let cur_pgid = sched::current_pgid();
     let pending;
     let rc;
+    // Set when a termios change moved bytes into the slave queue; the waiters
+    // are woken after the pool lock is dropped, exactly as `master_write` does.
+    let mut committed = false;
     {
         let mut ptys = PTYS.lock();
         let p = &mut ptys[pair];
@@ -1034,7 +1037,46 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
                 if arg == 0 {
                     -14
                 } else {
-                    unsafe { crate::termios_rw(cmd, arg, &mut p.termios) }
+                    // `tcsetattr` used to be a pure overwrite of the termios
+                    // struct: no flush, and no notice taken of ICANON
+                    // changing. Both halves below are Linux behaviour we
+                    // simply did not have, and their absence STRANDED bytes —
+                    // a reply buffered into `p.canon` while ICANON was set
+                    // could never be read by anyone once the line discipline
+                    // went raw, because the raw path does not consult
+                    // `p.canon` at all.
+                    //
+                    // TCSETSF (`tcsetattr(TCSAFLUSH)`) discards unread input,
+                    // and Linux does it BEFORE applying the new termios
+                    // (tty_ioctl.c: TERMIOS_FLUSH runs in set_termios ahead of
+                    // tty_set_termios). The order is what makes the two halves
+                    // compose: flushing first leaves the ICANON commit below
+                    // with nothing to commit, instead of committing bytes the
+                    // caller just asked to be thrown away.
+                    if cmd == TCSETSF || cmd == TCSETSF2 {
+                        p.to_slave.clear();
+                        p.canon_len = 0;
+                    }
+                    let was_canon = p.termios.c_lflag & ICANON != 0;
+                    let r = unsafe { crate::termios_rw(cmd, arg, &mut p.termios) };
+                    if r == 0 && was_canon && p.termios.c_lflag & ICANON == 0 {
+                        // ICANON -> raw. Linux's n_tty_set_termios() makes the
+                        // half-typed line immediately readable rather than
+                        // discarding it (it pushes commit_head up to
+                        // read_head); committing the pending line to the slave
+                        // queue is the same thing in our shape.
+                        //
+                        // NOTE this is the change that removes x86_64's
+                        // accidental immunity to the crossterm CPR desync: the
+                        // stale reply stops being stranded and is delivered.
+                        // That is correct, and it is only SAFE because the
+                        // crossterm fork now drains a queued reply before
+                        // issuing the next query. Landing this alone would
+                        // hand the poison to the arch that was surviving.
+                        commit_line(p);
+                        committed = true;
+                    }
+                    r
                 }
             }
             _ => -25, // ENOTTY
@@ -1043,6 +1085,9 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
         pending = Pending(sig);
     }
     pending.fire();
+    if committed {
+        sched::wake_poll();
+    }
     rc
 }
 
