@@ -213,7 +213,9 @@ Fixed by setting both variables on busd itself, in the env-prefix at the launch 
    not observable in this build, and `RUST_LOG` (already exported as `info` by
    `start-cosmic-leandros`, so `warn!`/`info!` were visible throughout) does not change
    that. Worth adding an `info!` there. The scan is proven instead by (3).
-3. **Activation spawns, and completes.** In-guest on x86_64, `dbusprobe`:
+3. **Activation spawns, and completes — both arches.** aarch64, in-guest at HEAD:
+   `STARTSERVICE: result=1 82ms`, `UNOWNED: …ServiceUnknown 4ms`,
+   `IMPLICIT: success 20ms`, desktop up (clock 00:04:54). x86_64, `dbusprobe`:
    `STARTSERVICE: result=1 55ms` on the first call — `DBUS_START_REPLY_SUCCESS`, i.e.
    busd found the `.service` file, spawned `/bin/dbusprobe --serve`, and saw it claim
    `org.leandros.ActivationProbe`, all inside 55 ms. A second run minutes later:
@@ -222,7 +224,8 @@ Fixed by setting both variables on busd itself, in the env-prefix at the launch 
    the `send_msg` hook routes to it too. None of that is reachable unless the servicedir
    was scanned and the file parsed.
 4. **The ServiceUnknown fast path is intact.** `UNOWNED:
-   org.freedesktop.DBus.Error.ServiceUnknown` in **3 ms** and **2 ms** on the two runs.
+   org.freedesktop.DBus.Error.ServiceUnknown` in **3 ms** and **2 ms** on the two x86_64
+   runs and **4 ms** on aarch64/TCG.
    And live during aarch64 session start-up, the new busd answered 20 unowned names
    promptly — `org.a11y.Bus`, `com.system76.CosmicAppLibrary`, `CosmicLauncher`,
    `CosmicWorkspaces`, `CosmicOnScreenDisplay`, `CosmicSettingsDaemon` ×4,
