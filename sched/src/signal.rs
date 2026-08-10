@@ -166,11 +166,40 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
         let (tgid, mask) = match rq.find_pid(pid) { Some(t) => (t.tgid, t.signal_mask), None => return };
         let claimable = rq.find_pid(tgid).map(|l| l.shared_signal_pending & !mask).unwrap_or(0);
         if claimable != 0 {
+            // The `SigInfo` payload has to travel with the bit, one slot at a
+            // time, and ONLY for the bits actually being claimed.
+            //
+            // This is the single place where getting it wrong would be worse
+            // than shipping nothing: `claimable` is a *subset* of the leader's
+            // parked signals (the ones this thread has unmasked), so a
+            // whole-array copy would also overwrite the claiming thread's own
+            // payloads for signals it never claimed — a SIGCHLD delivered
+            // carrying, say, a SIGUSR1's `SI_USER`/`si_pid`. The loop below
+            // therefore walks the set bits of `claimable` and touches exactly
+            // those indices.
+            //
+            // Per-slot it keeps the same first-writer-wins rule the producers
+            // use: if this thread already had that signal pending, the parked
+            // process-level instance is a duplicate of an already-pending
+            // standard signal, so its payload is discarded with it.
+            let mut c = claimable;
+            while c != 0 {
+                let b = c.trailing_zeros() as usize;
+                c &= !(1u64 << b);
+                let parked = rq.find_pid(tgid)
+                    .map(|l| l.signal_info[b])
+                    .unwrap_or(crate::task::SigInfo::NONE);
+                if let Some(ti) = rq.find_pid_idx(pid) {
+                    if let Some(t) = rq.get_mut(ti) {
+                        if t.signal_pending & (1u64 << b) == 0 {
+                            t.signal_info[b] = parked;
+                        }
+                        t.signal_pending |= 1u64 << b;
+                    }
+                }
+            }
             if let Some(li) = rq.find_pid_idx(tgid) {
                 if let Some(l) = rq.get_mut(li) { l.shared_signal_pending &= !claimable; }
-            }
-            if let Some(ti) = rq.find_pid_idx(pid) {
-                if let Some(t) = rq.get_mut(ti) { t.signal_pending |= claimable; }
             }
         }
     }
@@ -202,36 +231,41 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                             .map(|leader| leader.signal_actions[bit as usize])
                             .unwrap_or(crate::task::DEFAULT_SIGACTION)
                     };
-                    Some((sig, action, mask))
+                    // Read the payload in the same critical section that picks
+                    // the signal, indexed by the same `bit` — the two can never
+                    // be sampled from different signals.
+                    let info = t.signal_info[bit as usize];
+                    Some((sig, action, mask, info))
                 }
                 None => return,
             }
         };
 
-        let (sig, action, old_mask) = match sample {
+        let (sig, action, old_mask, info) = match sample {
             Some(r) => r,
             None    => return,
         };
 
-        // Clear the pending bit and update the signal mask under the lock.
+        // Dequeue: clear the pending bit under the lock.
+        //
+        // The signal mask and SA_RESETHAND are deliberately NOT touched here.
+        // They belong to *running a handler*, and this loop reaches all three
+        // dispositions. Applying them unconditionally left every ignored signal
+        // permanently blocked: SIG_IGN and default-ignore both `continue` below
+        // without ever building a sigframe, so nothing ever ran the
+        // `rt_sigreturn` that restores the pre-handler mask. One ignored
+        // SIGUSR2 and the process could never receive SIGUSR2 again — and the
+        // common case was worse, because SIGCHLD is in `SIGDFL_IGNORE`: a
+        // program that had not (yet) installed a SIGCHLD handler had SIGCHLD
+        // silently added to its mask by its first child exit, so a handler
+        // installed afterwards was never called and `sigprocmask` reported a
+        // block the program never asked for. Linux applies the blocked set in
+        // `handle_signal()`, on the caught path only, for exactly this reason.
         {
             let mut rq = super::RUN_QUEUE.lock();
-            let tgid = rq.find_pid(pid).map(|t| t.tgid).unwrap_or(0);
-            // Update thread-local pending/mask.
             if let Some(idx) = rq.find_pid_idx(pid) {
                 if let Some(t) = rq.get_mut(idx) {
                     t.signal_pending &= !(1u64 << (sig - 1));
-                    if action.get_flags() & SA_NODEFER == 0 {
-                        t.signal_mask |= (1u64 << (sig - 1)) | action.mask;
-                    }
-                }
-            }
-            // SA_RESETHAND: revert to SIG_DFL on the shared (TGID leader) table.
-            if action.get_flags() & SA_RESETHAND != 0 && tgid != 0 {
-                if let Some(idx) = rq.find_pid_idx(tgid) {
-                    if let Some(leader) = rq.get_mut(idx) {
-                        leader.signal_actions[(sig - 1) as usize].handler = 0;
-                    }
                 }
             }
         }
@@ -265,6 +299,32 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                 continue;
             }
             handler => {
+                // A handler is going to run: now apply its blocked set (the
+                // signal itself unless SA_NODEFER, plus `sa_mask`) and the
+                // one-shot SA_RESETHAND. `old_mask`, sampled before any of
+                // this, is what goes into the frame's `uc_sigmask` and what
+                // `rt_sigreturn` puts back.
+                {
+                    let mut rq = super::RUN_QUEUE.lock();
+                    let tgid = rq.find_pid(pid).map(|t| t.tgid).unwrap_or(0);
+                    if action.get_flags() & SA_NODEFER == 0 {
+                        if let Some(idx) = rq.find_pid_idx(pid) {
+                            if let Some(t) = rq.get_mut(idx) {
+                                t.signal_mask |= (1u64 << (sig - 1)) | action.mask;
+                            }
+                        }
+                    }
+                    // SA_RESETHAND: revert to SIG_DFL on the shared (TGID
+                    // leader) table.
+                    if action.get_flags() & SA_RESETHAND != 0 && tgid != 0 {
+                        if let Some(idx) = rq.find_pid_idx(tgid) {
+                            if let Some(leader) = rq.get_mut(idx) {
+                                leader.signal_actions[(sig - 1) as usize].handler = 0;
+                            }
+                        }
+                    }
+                }
+
                 // aarch64: always return through the kernel-provided
                 // rt_sigreturn trampoline, ignoring any userspace
                 // sa_restorer. This mirrors the Linux-aarch64 kernel, which
@@ -283,7 +343,7 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                     0
                 };
 
-                if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask, action.get_flags()) {
+                if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask, action.get_flags(), info) {
                     // Frame write failed (stack fault) — deliver SIGSEGV.
                     super::exit_group_signal(SIGSEGV);
                 }
@@ -526,15 +586,49 @@ fn arch_prepare_signal_frame(
     restorer:     usize,
     old_mask:     u64,
     action_flags: u32,
+    info:         crate::task::SigInfo,
 ) -> bool {
     #[cfg(target_arch = "aarch64")]
-    return aarch64::prepare(frame_ptr, sig, handler, restorer, old_mask, action_flags);
+    return aarch64::prepare(frame_ptr, sig, handler, restorer, old_mask, action_flags, info);
 
     #[cfg(target_arch = "x86_64")]
-    return x86_64::prepare(frame_ptr, sig, handler, restorer, old_mask, action_flags);
+    return x86_64::prepare(frame_ptr, sig, handler, restorer, old_mask, action_flags, info);
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    { let _ = (frame_ptr, sig, handler, restorer, old_mask, action_flags); false }
+    { let _ = (frame_ptr, sig, handler, restorer, old_mask, action_flags, info); false }
+}
+
+/// The `siginfo_t` field offsets both architectures share.
+///
+/// LP64 Linux uses one `siginfo_t` layout for x86-64 and AArch64 alike — a
+/// three-`int` header (`si_signo`, `si_errno`, `si_code`) followed by the
+/// `_sifields` union at 16, whose `_kill` and `_sigchld` members start with
+/// `si_pid` then `si_uid`, and whose `_sigchld` continues with `si_status`.
+/// relibc's `header::signal::linux` mirrors it, so a handler taking
+/// `siginfo_t *` reads exactly these offsets on both.
+mod si_off {
+    pub const SIGNO:  usize = 0;
+    pub const CODE:   usize = 8;
+    pub const PID:    usize = 16;
+    pub const UID:    usize = 20;
+    pub const STATUS: usize = 24;
+}
+
+/// Serialise the four carried `siginfo_t` fields into a zeroed frame buffer at
+/// `base` (the start of the frame's siginfo region).
+///
+/// Shared by both architectures so the offsets cannot drift between them —
+/// they are the same offsets, and one function is the cheapest way to keep
+/// saying so.
+fn write_siginfo(buf: &mut [u8], base: usize, sig: u32, info: crate::task::SigInfo) {
+    let put = |buf: &mut [u8], off: usize, v: [u8; 4]| {
+        buf[base + off..base + off + 4].copy_from_slice(&v);
+    };
+    put(buf, si_off::SIGNO,  sig.to_le_bytes());
+    put(buf, si_off::CODE,   info.si_code.to_le_bytes());
+    put(buf, si_off::PID,    info.si_pid.to_le_bytes());
+    put(buf, si_off::UID,    info.si_uid.to_le_bytes());
+    put(buf, si_off::STATUS, info.si_status.to_le_bytes());
 }
 
 fn arch_restore_signal_frame(frame_ptr: usize, pid: u32) {
@@ -581,8 +675,8 @@ mod aarch64 {
     const RESERVED_OFFSET:    usize = PSTATE_OFFSET + 8;         // 576
     pub const SIGFRAME_SIZE:  usize = RESERVED_OFFSET + 4096;    // 4672
 
-    // Offsets within siginfo.
-    const SI_SIGNO_OFFSET: usize = 0; // __u32 si_signo
+    // Offsets within siginfo: see `super::si_off`, shared with x86-64.
+    const SI_OFFSET: usize = 0;
 
     /// Allowed user-restorable PSTATE bits on sigreturn: the N/Z/C/V
     /// condition flags only. Everything else — the M[4:0] exception-level
@@ -607,6 +701,7 @@ mod aarch64 {
         restorer:     usize,
         old_mask:     u64,
         action_flags: u32,
+        info:         crate::task::SigInfo,
     ) -> bool {
         let user_frame = unsafe { &mut *(frame_ptr as *mut UserFrame) };
 
@@ -623,9 +718,8 @@ mod aarch64 {
         // _aarch64_ctx terminator at RESERVED_OFFSET falls in naturally).
         let mut buf = alloc::vec![0u8; SIGFRAME_SIZE];
 
-        // siginfo: si_signo at offset 0.
-        buf[SI_SIGNO_OFFSET..SI_SIGNO_OFFSET + 4]
-            .copy_from_slice(&sig.to_le_bytes());
+        // siginfo: si_signo/si_code/si_pid/si_uid/si_status.
+        super::write_siginfo(&mut buf, SI_OFFSET, sig, info);
 
         // uc_sigmask (restored on sigreturn).
         buf[SIGMASK_OFFSET..SIGMASK_OFFSET + 8]
@@ -739,8 +833,9 @@ mod x86_64 {
     // [240 .. 304)  uc.uc_mcontext.__private    (8 * 8, zeroed)
     // [304 .. 312)  uc.uc_sigmask
     // [312 .. 824)  uc.__private                (512 bytes, zeroed)
-    // [824 .. 872)  info (siginfo_t: si_signo, si_errno, si_code, si_pid,
-    //                      si_uid, pad, si_addr, si_status, pad, si_value)
+    // [824 .. 952)  info (the full 128-byte siginfo_t: si_signo, si_errno,
+    //                      si_code, then the _sifields union from +16 —
+    //                      si_pid, si_uid, si_status for _kill/_sigchld)
 
     const PRETCODE_OFFSET:  usize = 0;
     const UC_OFFSET:        usize = PRETCODE_OFFSET + 8;   // 8
@@ -749,8 +844,13 @@ mod x86_64 {
     const GREGS_OFFSET:     usize = MCONTEXT_OFFSET;        // 48
     const SIGMASK_OFFSET:   usize = MCONTEXT_OFFSET + 256;  // 304
     const INFO_OFFSET:      usize = UC_OFFSET + 816;        // 824
-    const SI_SIGNO_OFFSET:  usize = INFO_OFFSET;
-    pub const SIGFRAME_SIZE: usize = INFO_OFFSET + 48;      // 872
+    // The full `siginfo_t` is 128 bytes on LP64 Linux. The frame used to
+    // reserve only the leading 48 — enough for every field the kernel wrote
+    // (si_status ends at 28) but not for a handler that copies `*info` by
+    // value, which would take the tail out of whatever user stack happened to
+    // sit above the frame. Reserving all 128 costs 80 bytes of user stack per
+    // delivery and makes the region an actual siginfo_t.
+    pub const SIGFRAME_SIZE: usize = INFO_OFFSET + 128;     // 952
 
     // gregs[] indices — Linux REG_* enum order for x86-64.
     const REG_R8: usize = 0; const REG_R9: usize = 1; const REG_R10: usize = 2; const REG_R11: usize = 3;
@@ -809,6 +909,7 @@ mod x86_64 {
         restorer:     usize,
         old_mask:     u64,
         action_flags: u32,
+        info:         crate::task::SigInfo,
     ) -> bool {
         let user_frame = unsafe { &mut *(frame_ptr as *mut UserFrame) };
 
@@ -850,9 +951,8 @@ mod x86_64 {
         buf[PRETCODE_OFFSET..PRETCODE_OFFSET + 8]
             .copy_from_slice(&(restorer as u64).to_le_bytes());
 
-        // siginfo: si_signo at offset 0.
-        buf[SI_SIGNO_OFFSET..SI_SIGNO_OFFSET + 4]
-            .copy_from_slice(&sig.to_le_bytes());
+        // siginfo: si_signo/si_code/si_pid/si_uid/si_status.
+        super::write_siginfo(&mut buf, INFO_OFFSET, sig, info);
 
         // uc_sigmask (restored on sigreturn).
         buf[SIGMASK_OFFSET..SIGMASK_OFFSET + 8]
