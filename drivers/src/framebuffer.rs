@@ -894,6 +894,10 @@ fn console_reclaim() {
 /// frame, which is the right outcome for a panic.
 pub fn console_force_reclaim() {
     SCANOUT_OWNER.store(SCANOUT_UNOWNED, core::sync::atomic::Ordering::SeqCst);
+    // And the master grant with it: taking the surface back while leaving a
+    // master able to present would put the panic text one page flip away from
+    // being overwritten by the session that just died under it.
+    crate::drm_device_interface::drm_master_clear(0);
     extern "C" { fn kernel_set_console_enabled(enabled: bool); }
     unsafe { kernel_set_console_enabled(true); }
 }

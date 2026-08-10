@@ -234,6 +234,14 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                 }
                 m
             }
+            // Most failures stay at the historical -1: this seam has never
+            // carried a real errno and widening it wholesale would change the
+            // answer to every ioctl at once. The three master errors are
+            // explicit because their *values* are the contract — see the note
+            // on `DriverError::Access`.
+            Err(drivers::DriverError::Access)    => err_reply(-13), // EACCES
+            Err(drivers::DriverError::Busy)      => err_reply(-16), // EBUSY
+            Err(drivers::DriverError::NotMaster) => err_reply(-22), // EINVAL
             Err(_) => err_reply(-1),
         };
 

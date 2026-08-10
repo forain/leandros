@@ -1153,6 +1153,10 @@ fn ctx_bind(open_id: u32, ctx_id: u32, capset: u32, num_rings: u32) -> Result<()
 /// Called from the DRM server's VFS_CLOSE arm.
 pub fn drm_release_open(open_id: u32) {
     if open_id == 0 { return; }
+    // Master dies with the open that held it. Without this, a compositor that
+    // exits — or crashes — while holding master leaves the node permanently
+    // EBUSY for the next one, and nothing short of a reboot can present again.
+    drm_master_clear(open_id);
     // Take the slot and DROP the guard before touching the device — see the
     // lock-order note above.
     let ctx = {
@@ -1944,6 +1948,114 @@ pub fn drm_has_events() -> bool {
     !READY_EVENTS.lock().is_empty()
 }
 
+// ── DRM master ───────────────────────────────────────────────────────────────
+//
+// Master is per *open* of card0 and it is what decides who may move pixels into
+// the shared hardware surface. Before this, SET_MASTER and DROP_MASTER were a
+// pair of unconditional `Ok(0)`s and nothing anywhere returned EACCES, so
+// `fb_vt_scanout_revoke` — the VT layer taking the display back — was a
+// suggestion: the client's very next present re-claimed the scanout and the
+// console flickered straight back out. Switching away from a live compositor
+// was a race the compositor won, and switching away from a *wedged* one, which
+// is the case the whole VT item exists for, could not be done at all.
+//
+// **Which ioctls are gated is derived, not guessed.** Every path that takes the
+// surface bumps `crate::drm::device::SCANOUT_WRITES` (drm/device.rs:370 and
+// :442), and those two sites are reachable only from SETCRTC, PAGE_FLIP,
+// ATOMIC, DIRTYFB and the three custom LeandrOS codes 0x1001/0x1004/0x1005.
+// Gating exactly that set closes the re-claim hole completely — and, just as
+// importantly, no virtgpu *render* ioctl can reach it, so a Vulkan client on
+// either node is untouched by any of this.
+//
+// The refusal happens BEFORE the dispatch `match`, which is also where the
+// present counter is sampled: an ioctl that is refused never runs, so it can
+// never claim.
+
+/// The card0 open holding DRM master, or 0 for "nobody".
+static MASTER_OPEN: AtomicU32 = AtomicU32::new(0);
+
+/// Ioctls that may only be issued by the DRM master of the VT on screen.
+///
+/// A list, unlike the console-claim rule it sits next to, because a *refusal*
+/// has to be decided before the ioctl runs and therefore cannot be derived from
+/// what the ioctl did. The list is kept honest by the counter: anything added
+/// later that presents will bump `SCANOUT_WRITES` from outside this set, which
+/// is the same observable that caught the previous hardcoded list missing
+/// DRM_IOCTL_MODE_ATOMIC.
+fn requires_master(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        DRM_IOCTL_MODE_SETCRTC
+            | DRM_IOCTL_MODE_PAGE_FLIP
+            | DRM_IOCTL_MODE_ATOMIC
+            | DRM_IOCTL_MODE_DIRTYFB
+            | 0x1001 // set mode
+            | 0x1004 // flip page
+            | 0x1005 // set plane
+    )
+}
+
+/// True when `open_id` may drive the display.
+fn master_ok(open_id: u32) -> bool {
+    open_id != 0 && MASTER_OPEN.load(Ordering::SeqCst) == open_id
+}
+
+/// Gate one master-only ioctl, granting master implicitly on first use.
+///
+/// Linux hands a client implicit master at `drm_open` when the device has none.
+/// We have no VFS_OPEN arm in the DRM server at all — `servers/drm/src/lib.rs`
+/// sees VFS_IOCTL/READ/POLL/CLOSE and nothing else — so the first master-gated
+/// ioctl from an open is our equivalent of that moment. It is what keeps every
+/// existing client working unchanged: `drmsmoke` and DOOM never issue
+/// SET_MASTER, and a gate that required it would have refused both.
+fn master_gate(open_id: u32) -> Result<(), DriverError> {
+    // An open with no identity cannot be arbitrated in either direction: there
+    // is nothing to record as the holder and nothing to compare a later ioctl
+    // against. That is the legacy `Driver::handle` path, which behaves exactly
+    // as it did before.
+    if open_id == 0 { return Ok(()); }
+    if master_ok(open_id) { return Ok(()); }
+    match MASTER_OPEN.compare_exchange(0, open_id, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(DriverError::Access),
+    }
+}
+
+/// `DRM_IOCTL_SET_MASTER`.
+fn master_set(open_id: u32) -> Result<usize, DriverError> {
+    if open_id == 0 { return Ok(0); }
+    let cur = MASTER_OPEN.load(Ordering::SeqCst);
+    if cur == open_id { return Ok(0); }
+    if cur != 0 { return Err(DriverError::Busy); }
+    match MASTER_OPEN.compare_exchange(0, open_id, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => Ok(0),
+        Err(_) => Err(DriverError::Busy),
+    }
+}
+
+/// `DRM_IOCTL_DROP_MASTER`.
+fn master_drop(open_id: u32) -> Result<usize, DriverError> {
+    if open_id == 0 { return Ok(0); }
+    match MASTER_OPEN.compare_exchange(open_id, 0, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => Ok(0),
+        Err(_) => Err(DriverError::NotMaster),
+    }
+}
+
+/// Forget the master grant. `open_id` 0 clears it whoever holds it.
+///
+/// Two call sites, for two different reasons: a card0 open going away (its
+/// master dies with it, or the node is unusable until reboot), and the panic
+/// handler's `console_force_reclaim`, which takes the display back
+/// unconditionally and must not leave a master able to take it away again.
+pub fn drm_master_clear(open_id: u32) {
+    if open_id == 0 {
+        MASTER_OPEN.store(0, Ordering::SeqCst);
+        return;
+    }
+    let _ = MASTER_OPEN.compare_exchange(open_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
+
 /// DRM device interface for userspace communication
 pub struct DrmDeviceInterface {
     driver: DrmDriver,
@@ -1978,6 +2090,15 @@ impl DrmDeviceInterface {
         crate::pci::rdebug("[DRM-IF] handle_ioctl cmd=");
         crate::pci::rdebug_hex(cmd);
         crate::pci::rdebug("\n");
+
+        // MASTER GATE. Deliberately ahead of the present-counter sample and the
+        // dispatch `match` below: a refused ioctl must not reach a handler, and
+        // therefore cannot claim the scanout on its way out. Putting it after
+        // the match — refusing the *result* — would let the present land first
+        // and leave the console gated off by the very ioctl we rejected.
+        if requires_master(cmd) {
+            master_gate(open_id)?;
+        }
 
         // The DRM device lock is a spin::Mutex. It must NOT be held across any
         // dereference of user memory: a demand-paging fault taken under a spinlock
@@ -2045,9 +2166,8 @@ impl DrmDeviceInterface {
             // ── K4: Mesa/GBM buffer + Smithay/libdrm KMS surface ──
             DRM_IOCTL_GET_CAP => self.std_handle_get_cap(arg),
             DRM_IOCTL_SET_CLIENT_CAP => self.std_handle_set_client_cap(arg),
-            // Root single-seat: master is not gated (SETCRTC/PAGE_FLIP never check
-            // it), so accept the transitions unconditionally.
-            DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => Ok(0),
+            DRM_IOCTL_SET_MASTER => master_set(open_id),
+            DRM_IOCTL_DROP_MASTER => master_drop(open_id),
             DRM_IOCTL_GET_MAGIC => self.std_handle_get_magic(arg),
             DRM_IOCTL_AUTH_MAGIC => Ok(0),
             DRM_IOCTL_GEM_CLOSE => self.std_handle_gem_close(arg, open_id),

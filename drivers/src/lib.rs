@@ -63,4 +63,19 @@ pub enum DriverError {
     Io,
     Unsupported,
     InvalidParameter,
+    /// The caller is not permitted to drive this device right now — it does not
+    /// hold DRM master, or the VT it holds it on is not the one on screen.
+    ///
+    /// Answered to userspace as **EACCES**, which is exactly what Linux's
+    /// `drm_ioctl_permit()` returns when a `DRM_MASTER` ioctl arrives from a
+    /// non-master. The errno is load-bearing, not decorative: smithay maps
+    /// EACCES to `DrmError::Access` and logs it, whereas ENODEV makes it tear
+    /// the whole device down and takes the compositor with it.
+    Access,
+    /// Another open already holds DRM master. **EBUSY**, as Linux's
+    /// `drm_setmaster_ioctl` answers for the same case.
+    Busy,
+    /// `DROP_MASTER` from an open that never held it. **EINVAL**, as Linux's
+    /// `drm_dropmaster_ioctl` answers.
+    NotMaster,
 }

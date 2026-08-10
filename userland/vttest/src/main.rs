@@ -57,6 +57,8 @@ const O_RDWR: c_int = 0o2;
 const O_NONBLOCK: c_int = 0o4000;
 
 const EAGAIN: c_int = 11;
+const EACCES: c_int = 13;
+const EBUSY: c_int = 16;
 const EINVAL: c_int = 22;
 const ENOTTY: c_int = 25;
 
@@ -84,6 +86,14 @@ const K_MEDIUMRAW: usize = 2;
 
 const VT_AUTO: u8 = 0;
 const VT_PROCESS: u8 = 1;
+
+// DRM — <drm/drm.h>. Only the three commands a master test needs. They live in
+// the VT suite, not in `drmsmoke`, because what they measure is arbitration
+// between a console and a display client: that is a VT property, and the
+// harness that can switch VTs is this one.
+const DRM_IOCTL_SET_MASTER: c_ulong = 0x0000_641E;
+const DRM_IOCTL_DROP_MASTER: c_ulong = 0x0000_641F;
+const DRM_IOCTL_MODE_DIRTYFB: c_ulong = 0xC018_64B1;
 
 const POLLIN: i16 = 0x001;
 
@@ -117,6 +127,18 @@ struct vt_mode {
     acqsig: u16,
     frsig: u16,
     _guard: u32,
+}
+
+/// `struct drm_mode_fb_dirty_cmd` — 24 bytes, which is the 0x18 size field of
+/// the DIRTYFB request code.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_mode_fb_dirty_cmd {
+    fb_id: u32,
+    flags: u32,
+    color: u32,
+    num_clips: u32,
+    clips_ptr: u64,
 }
 
 #[repr(C)]
@@ -593,6 +615,105 @@ unsafe fn cmd_gfx(tty0: c_int, ms: i64) -> c_int {
     0
 }
 
+// ── 11-13. DRM master ────────────────────────────────────────────────────────
+//
+// Master decides who may put pixels on the screen, and until it was enforced
+// the VT layer could take the display back but not keep it: `vt.rs`'s
+// `fb_vt_scanout_revoke` cleared the ownership word and the client's very next
+// present set it again, so a switch away from a graphical session flickered
+// back within a frame.
+//
+// The probe is DIRTYFB with `fb_id` 0. It is in the gated set, it is cheap, and
+// naming no framebuffer means the handler finds nothing to flush — so a
+// permitted call returns 0 while touching neither the scanout nor the console,
+// and the only thing these subtests can move is the permission itself. Anything
+// that actually presented would blank the console mid-suite and make the run
+// unreadable.
+
+unsafe fn card0() -> c_int {
+    open(b"/dev/dri/card0\0".as_ptr(), O_RDWR)
+}
+
+unsafe fn set_master(fd: c_int) -> c_int {
+    ioctl(fd, DRM_IOCTL_SET_MASTER, core::ptr::null_mut())
+}
+
+unsafe fn drop_master(fd: c_int) -> c_int {
+    ioctl(fd, DRM_IOCTL_DROP_MASTER, core::ptr::null_mut())
+}
+
+unsafe fn dirtyfb(fd: c_int) -> c_int {
+    let mut cmd = drm_mode_fb_dirty_cmd {
+        fb_id: 0, flags: 0, color: 0, num_clips: 0, clips_ptr: 0,
+    };
+    ioctl(fd, DRM_IOCTL_MODE_DIRTYFB, &mut cmd as *mut drm_mode_fb_dirty_cmd as *mut c_void)
+}
+
+/// Two opens cannot both be master, and dropping frees it for the other.
+unsafe fn t_master_is_exclusive() -> bool {
+    let a = card0();
+    let b = card0();
+    if a < 0 || b < 0 {
+        if a >= 0 { close(a); }
+        if b >= 0 { close(b); }
+        return report(b"master_is_exclusive", false);
+    }
+    let grant = set_master(a) == 0;
+    let busy_rc = set_master(b);
+    let busy = busy_rc < 0 && errno() == EBUSY;
+    // Idempotent for the holder: Linux answers 0, and a compositor that
+    // re-asserts master on every session resume must not be told EBUSY by
+    // itself.
+    let again = set_master(a) == 0;
+    let released = drop_master(a) == 0;
+    let handover = set_master(b) == 0;
+    drop_master(b);
+    close(a);
+    close(b);
+    out(b"  grant="); out(if grant { b"0" } else { b"!0" });
+    out(b" second="); out_int(busy_rc);
+    out(b" errno="); out_int(if busy { EBUSY } else { errno() }); out(b"\n");
+    report(b"master_is_exclusive", grant && busy && again && released && handover)
+}
+
+/// `DROP_MASTER` from an open that never held it is EINVAL, not success.
+unsafe fn t_drop_master_not_master() -> bool {
+    let fd = card0();
+    if fd < 0 { return report(b"drop_master_not_master", false); }
+    let r = drop_master(fd);
+    let e = errno();
+    close(fd);
+    out(b"  rc="); out_int(r); out(b" errno="); out_int(e); out(b"\n");
+    report(b"drop_master_not_master", r < 0 && e == EINVAL)
+}
+
+/// A non-master open cannot present. **EACCES specifically**: that is what
+/// Linux's `drm_ioctl_permit()` returns, and it is what smithay maps to the
+/// recoverable `DrmError::Access`. ENODEV in its place makes smithay tear the
+/// device down and takes the compositor with it, so the value is asserted, not
+/// merely the sign.
+unsafe fn t_master_gates_present() -> bool {
+    let a = card0();
+    let b = card0();
+    if a < 0 || b < 0 {
+        if a >= 0 { close(a); }
+        if b >= 0 { close(b); }
+        return report(b"master_gates_present", false);
+    }
+    let grant = set_master(a) == 0;
+    let mine = dirtyfb(a) == 0;
+    let theirs_rc = dirtyfb(b);
+    let theirs = theirs_rc < 0 && errno() == EACCES;
+    let e = errno();
+    drop_master(a);
+    close(a);
+    close(b);
+    out(b"  master_present="); out(if mine { b"0" } else { b"!0" });
+    out(b" other_present="); out_int(theirs_rc);
+    out(b" errno="); out_int(e); out(b"\n");
+    report(b"master_gates_present", grant && mine && theirs)
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 unsafe fn arg_eq(argv: *mut *mut u8, i: isize, s: &[u8]) -> bool {
@@ -644,7 +765,7 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 12usize;
+    let total = 15usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -658,6 +779,9 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
     if t_notify_epollet(tty0) { passed += 1; }
     if t_enotty_on_pipe() { passed += 1; }
     if t_graphics_mode(tty0) { passed += 1; }
+    if t_master_is_exclusive() { passed += 1; }
+    if t_drop_master_not_master() { passed += 1; }
+    if t_master_gates_present() { passed += 1; }
 
     // Whatever happened, leave the machine usable: VT 1, text mode, K_XLATE.
     // A suite that fails halfway through a KD_GRAPHICS subtest and stops there
