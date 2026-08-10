@@ -2998,6 +2998,20 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
 
 ## Housekeeping
 
+- **⚠ NEW out-of-repo sibling, and brush will not build without it: `../crossterm`.** Item 17's
+  fix is a **fork of crossterm 0.29.0** at `~/code/crossterm` (box: `~/Projects/crossterm`,
+  symlinked to `leandros-siblings/`, like every other sibling), wired in by
+  `[patch.crates-io] crossterm = { path = "../crossterm" }` in **brush's** `Cargo.toml`.
+  `cargo tree -i crossterm` must show **one** node with three parents (`brush-shell`,
+  `brush-interactive`, `reedline`) — two divergent copies means the patch missed reedline's
+  transitive dependency and the fix does nothing. The fork *is* a git repo (2 commits: an
+  unmodified import, then the fix), so it is diffable against upstream; it is **not** a
+  submodule of this repo, so nothing here fetches it. A missing `../crossterm` fails brush's
+  build outright rather than silently, which is better than the shell-less-guest gotcha below.
+- **Both sibling patches to `../brush` are UNCOMMITTED, and there are now two.** The
+  pre-existing `kill`-builtin patch (`brush-builtins/src/kill.rs`, `brush-core/src/interp.rs`,
+  `.../jobs.rs`, `.../sys/unix/signal.rs`) and now `Cargo.toml`/`Cargo.lock`. A
+  `git -C ../brush checkout .` loses **both**, on either machine.
 - **Fresh-worktree gotcha: the guest boots with no shell.** `build-all.sh` and
   `mkfs-f2fs-populated.py` resolve the sibling repos as `$ROOT_DIR/../<repo>`, and an agent
   worktree's parent is `.claude/worktrees/`, not `~/code/`. The build **exits 0** and only
