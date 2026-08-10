@@ -809,6 +809,11 @@ pub fn dispatch(
     }
     // Fire any expired POSIX timers before returning to user-space.
     tty_server::check_timers(current_pid());
+    // Perform any VT switch requested from IRQ context (the Ctrl+Alt+Fn chord
+    // recogniser runs on the input drain and can only store an atomic there),
+    // and run the VT_PROCESS handshake watchdog. Two relaxed atomic loads when
+    // there is nothing pending.
+    tty_server::vt::poll_deferred();
     ret
 }
 
@@ -1977,7 +1982,7 @@ fn sys_spawn(entry_va: usize, stack_va: usize, priority_raw: usize) -> isize {
     }
 }
 
-/// Encode an internal exit code as a POSIX wait status.
+/// Encode a reaped child's status as a POSIX wait status.
 ///
 /// `<sys/wait.h>`'s `WIFEXITED`/`WEXITSTATUS` macros expect the musl/Linux
 /// layout, where a normal termination is `(code & 0xff) << 8` and the low 7
@@ -1986,14 +1991,14 @@ fn sys_spawn(entry_va: usize, stack_va: usize, priority_raw: usize) -> isize {
 /// and `WEXITSTATUS(status)` read 0 for any exit code ≥ 128, so every caller
 /// that inspects the status misreads it.
 ///
-/// This kernel tracks only a single `i32` exit code per task with no separate
-/// "terminated by signal" flag (the signal path stores the shell-convention
-/// `128 + signo`), so every wait is reported as a normal exit. That is the
-/// honest encoding for what is tracked; distinguishing `WIFSIGNALED` would
-/// require threading a terminating-signal field through the exit path.
+/// The encoding itself now lives in `sched::ExitStatus::wait_status`, because
+/// only the exit path knows *which* half of the layout applies: encoding
+/// every death as a normal exit — which is what this function did while the
+/// scheduler tracked a bare `i32` and the signal path stored the shell's
+/// `128 + signo` — made `WIFSIGNALED` read false for every killed process.
 #[inline]
-fn encode_wait_status(code: i32) -> i32 {
-    (code & 0xff) << 8
+fn encode_wait_status(status: sched::ExitStatus) -> i32 {
+    status.wait_status()
 }
 
 /// True when the calling task has a deliverable signal — the condition under
@@ -2041,13 +2046,13 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
 
     loop {
         match sched::wait_try(sel, caller_tgid) {
-            sched::WaitTry::Reaped(pid, code) => {
+            sched::WaitTry::Reaped(pid, status) => {
                 if status_ptr != 0 {
                     // Fault the destination in first: a demand-paged .bss
                     // status variable would otherwise make write_user_buf
                     // fail silently.
                     prefault_user(status_ptr, 4);
-                    let status = encode_wait_status(code);
+                    let status = encode_wait_status(status);
                     // Write through the address space's own virt->phys/HHDM
                     // path rather than dereferencing the raw user pointer:
                     // this syscall runs in kernel context (ring 0 / EL1) but
@@ -2119,14 +2124,19 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
     // this syscall runs in kernel context, and the target page may be a
     // CoW-shared, PTE-read-only page the current process's own fault handler
     // never gets a chance to promote in that context.
-    let write_info = |pid: u32, code: i32| {
+    let write_info = |pid: u32, status: sched::ExitStatus| {
         if infop != 0 && validate_user_buf(infop, 128) {
             let mut buf = [0u8; 128];
             if pid != 0 {
+                // si_code and si_status both come from ExitStatus so a waitid
+                // caller that switches on CLD_KILLED reaches the same verdict
+                // as one that decodes wait4's packed status. si_code was
+                // hardcoded to CLD_EXITED here, which is the half of that
+                // disagreement this file owned.
                 buf[0..4].copy_from_slice(&17i32.to_ne_bytes());   // si_signo = SIGCHLD
-                buf[8..12].copy_from_slice(&1i32.to_ne_bytes());   // si_code = CLD_EXITED
+                buf[8..12].copy_from_slice(&status.si_code().to_ne_bytes());
                 buf[16..20].copy_from_slice(&pid.to_ne_bytes());   // si_pid
-                buf[24..28].copy_from_slice(&code.to_ne_bytes());  // si_status
+                buf[24..28].copy_from_slice(&status.si_status().to_ne_bytes());
             }
             with_current_address_space_mut(|as_| as_.write_user_buf(infop, &buf));
         }
@@ -2139,15 +2149,16 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
             sched::wait_peek(sel, caller_tgid)
         };
         match attempt {
-            sched::WaitTry::Reaped(pid, code) if reap_exits => {
-                write_info(pid, code);
+            sched::WaitTry::Reaped(pid, status) if reap_exits => {
+                write_info(pid, status);
                 return 0;
             }
             sched::WaitTry::NoChildren => return -10, // ECHILD
             _ => {
                 // StillRunning, or a terminated child we must not consume.
                 if options & WNOHANG != 0 {
-                    write_info(0, 0); // "no state change" — zeroed si_pid
+                    // "no state change" — zeroed si_pid
+                    write_info(0, sched::ExitStatus::NONE);
                     return 0;
                 }
                 if interrupted() { return -4; } // EINTR
@@ -3831,14 +3842,32 @@ fn read_input_byte() -> Option<u8> {
                         53 => if shifted { b'?' } else { b'/' },
                         57 => b' ', // Space
                         96 => b'\n', // KPEnter
-                        _ => {
-                            // If it's already ASCII-range (e.g. from UART), use it as-is.
-                            // Allow common control characters: Tab(9), LF(10), CR(13), BS(8/127).
-                            let c = ev.code;
-                            if c < 128 && (c > 31 || c == 10 || c == 13 || c == 9 || c == 127 || c == 8) {
-                                c as u8
-                            } else { 0 }
-                        }
+                        // Keypad, read as if NumLock were on. This kernel keeps no
+                        // NumLock state and QEMU sends these codes whatever the host's
+                        // LED says, so there is nothing else to key off. Listed
+                        // explicitly because the fallback below deliberately produces
+                        // nothing and the old one produced the wrong thing: KP7 (71)
+                        // typed 'G'.
+                        55 => b'*', 98 => b'/', 74 => b'-', 78 => b'+',
+                        71 => b'7', 72 => b'8', 73 => b'9',
+                        75 => b'4', 76 => b'5', 77 => b'6',
+                        79 => b'1', 80 => b'2', 81 => b'3',
+                        82 => b'0', 83 => b'.',
+                        // Unmapped key — no byte.
+                        //
+                        // This arm used to pass any evdev code in 32..127 through as
+                        // that literal ASCII byte, on the stated grounds that UART
+                        // input arrives here already-decoded. It does not: serial
+                        // bytes carry value == 2 and are returned by the branch
+                        // above, so nothing that reaches this match is a byte — it is
+                        // a scancode, and only ever a key-*down* (value == 1). The
+                        // arm therefore typed the keycode of every key the table
+                        // above does not list. Injecting F2, Ctrl, Alt, F1 as four
+                        // separate keys produced `<`, nothing, `8`, `;` — codes
+                        // 60/29/56/59 rendered as ASCII — so pressing Alt on a real
+                        // keyboard typed '8', and every key-injection test silently
+                        // corrupted the shell's input line.
+                        _ => 0,
                     };
                     
                     if ascii != 0 {
@@ -3979,9 +4008,14 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
         // VFS target (e.g. a pipe feeding a child's stdin) — see fd_redirected's
         // doc comment and the identical guard in sys_write. Console /dev/std*
         // proxies (dup'd stdio fds) read the console too.
+        // `/dev/tty0` is excluded: its read is the VT-change notification, not
+        // console input (see vfs::fd_vt_number). `/dev/tty1`../dev/tty6` are
+        // not — they read the console like any other console proxy. The extra
+        // lookup only runs for fds fd_is_console_stdio already accepted.
         f if (f == 0 && !vfs::fd_redirected(current_pid(), 0))
             || (f < net_server::SOCK_FD_BASE
-                && vfs::fd_is_console_stdio(current_pid(), f)) => {
+                && vfs::fd_is_console_stdio(current_pid(), f)
+                && vfs::fd_vt_number(current_pid(), f) != Some(0)) => {
             if count == 0 { return 0; }
             if !is_kernel && !validate_user_buf(buf_ptr, count) { return -14; }
             // Edge-triggered epoll consumers (crossterm/mio's TTY reader is
@@ -6073,6 +6107,10 @@ fn vfs_close_all_for(pid: u32) {
         epoll_close_all(pid);
     }
     tty_server::close_all(pid);
+    // A VT held in VT_PROCESS by a process that just died would otherwise wait
+    // for a release signal nobody will answer, and only the 5 s watchdog would
+    // get the display back.
+    tty_server::vt::cleanup_pid(pid);
     stdio_flags_close_all(pid);
 }
 
@@ -6095,8 +6133,14 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     // Console proxies (/dev/tty, dup'd stdio fds) answer terminal ioctls
     // exactly like the console fd they alias — crossterm probes TIOCGWINSZ
     // and termios on its /dev/tty handle.
+    // A VT node is console_stdio for read/write purposes, but folding one to 0
+    // here would erase the very thing the VT dispatch below needs: /dev/tty2's
+    // ioctls would arrive addressed to "the active VT". `fd_vt_number` is only
+    // consulted for fds that already answered true, i.e. never on the DRM or
+    // evdev ioctl paths.
     let fd = if fd > 2 && fd < net_server::SOCK_FD_BASE
-        && vfs::fd_is_console_stdio(pid, fd) { 0 } else { fd };
+        && vfs::fd_is_console_stdio(pid, fd)
+        && vfs::fd_vt_number(pid, fd).is_none() { 0 } else { fd };
 
     if cmd == FIONREAD && fd == 0 {
         if arg == 0 || !validate_user_buf(arg, 4) { return -14; }
@@ -6360,6 +6404,74 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         let reply = vfs::handle(&msg, pid);
         return u64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8])) as isize;
     }
+    // ── Pseudo-terminals ─────────────────────────────────────────────────────
+    // Must come before BOTH the fd<=2 ENOTTY guard and the TTY-server fallback
+    // below. The guard is right for a pipe or file on 0/1/2 and wrong for a
+    // pty slave, which is a real terminal — and it is exactly where a shell
+    // under a terminal emulator has its stdio. The fallback is wrong because
+    // the TTY server holds no pty state at all; `pty::ioctl` is the only thing
+    // that can answer TIOCGPTN, TIOCSPTLCK or a per-pair termios.
+    if let Some(vfs::VnodeKind::Pty { pair, is_master }) = vfs::vfs_get_node_kind(pid, fd) {
+        // TIOCGPTPEER returns a *new fd*, so it cannot be answered by the pty
+        // pool the way every other command here is — the VFS owns fd tables.
+        // Intercepted for the same reason DRM_IOCTL_PRIME_HANDLE_TO_FD is.
+        // `arg` is a value (open flags), not a pointer.
+        //
+        // Answering it at all is what makes cosmic-term able to open a tab:
+        // rustix tries this first and only falls back to TIOCGPTN on ENOSYS or
+        // EPERM, so the generic ENOTTY below would have failed the open.
+        const TIOCGPTPEER: usize = 0x5441;
+        if cmd == TIOCGPTPEER {
+            return vfs::pty_get_peer(pid, fd, arg as u32);
+        }
+        // Size of the object `arg` points at, per command; 0 means `arg` is a
+        // value rather than a pointer (TCFLSH's queue selector, TCSBRK's
+        // duration, TIOCSCTTY/TIOCNOTTY's ignored argument).
+        let arg_len = match cmd {
+            0x5401 | 0x5402 | 0x5403 | 0x5404 => 36, // TCGETS / TCSETS{,W,F}
+            // termios2: 36 bytes of termios plus c_ispeed/c_ospeed.
+            0x802C_542A | 0x402C_542B | 0x402C_542C | 0x402C_542D => 44,
+            0x5413 | 0x5414 => 8,                    // TIOCGWINSZ / TIOCSWINSZ
+            // Everything that reads or writes a single int/pid_t: TIOCGPGRP,
+            // TIOCSPGRP, TIOCOUTQ, FIONREAD, TIOCGSID, TIOCGPTN, TIOCSPTLCK,
+            // TIOCGPTLCK, TIOCSIG.
+            0x540F | 0x5410 | 0x5411 | 0x541B | 0x5429
+            | 0x8004_5430 | 0x4004_5431 | 0x8004_5439 | 0x4004_5436 => 4,
+            _ => 0,
+        };
+        if arg_len != 0 {
+            if arg == 0 || !validate_user_buf(arg, arg_len) { return -14; } // EFAULT
+            // `pty::ioctl` copies through this pointer with the pool lock held.
+            // A demand-paging fault taken there would re-enter the scheduler
+            // from under a server spinlock — the 82d0cc3 hazard — so fault the
+            // page in now, while nothing is held.
+            prefault_user(arg, arg_len);
+        }
+        return unsafe { tty_server::pty::ioctl(pair as usize, is_master, cmd, arg) };
+    }
+
+    // ── Virtual consoles ─────────────────────────────────────────────────────
+    // After the pty arm above, which returns before this is reached: a pty end
+    // is a terminal but not a VT, and `pty::ioctl` answers ENOTTY for the VT/KD
+    // set exactly as Linux does. The two command tables are disjoint anyway
+    // (VT_* is 0x56xx, KD* is 0x4Bxx, every pty command is 0x54xx), so the
+    // ordering is belt and braces rather than the thing that keeps them apart.
+    // Before the fd<=2 guard because a session leader's stdio may be a VT, and
+    // the guard would answer ENOTTY for it.
+    if tty_server::vt::owns_ioctl(cmd) {
+        // Pointer-taking commands read/write at most 8 bytes (`struct vt_mode`;
+        // `struct vt_stat` is 6). Validated before `vt::ioctl`, which copies
+        // through the pointer — though unlike `pty::ioctl` it holds no lock
+        // while doing so, by the contract on its `# Safety` block.
+        if arg != 0 && !validate_user_buf(arg, 8) { return -14; }
+        if let Some(vt) = vfs::fd_vt_number(pid, fd) {
+            return unsafe { tty_server::vt::ioctl(vt, cmd, arg) };
+        }
+        if fd <= 2 && vfs::fd_is_console_stdio(pid, fd) {
+            return unsafe { tty_server::vt::ioctl(0, cmd, arg) };  // 0 = active VT
+        }
+    }
+
     // Everything left is a terminal ioctl, and a terminal ioctl on something
     // that is not a terminal is ENOTTY. The TTY server answers fd 0/1/2
     // unconditionally from the console termios — correct for the console, but
@@ -7055,6 +7167,7 @@ fn evstat_tick() {
         mm::gap2::kv(" push=",    c.pushed  as usize);
         mm::gap2::kv(" drop=",    c.dropped as usize);
         mm::gap2::kv(" depth=",   c.depth   as usize);
+        mm::gap2::kv(" clients=", c.clients as usize);
         mm::gap2::kv(" reads=",   c.reads   as usize);
         mm::gap2::kv(" eagain=",  c.eagain  as usize);
         mm::gap2::kv(" deliv=",   c.deliv   as usize);
@@ -7067,6 +7180,32 @@ fn evstat_tick() {
         mm::gap2::kv(" rpid=",    c.rpid    as usize);
         mm::gap2::kv(" ipid=",    c.ipid    as usize);
         mm::gap2::nl();
+    }
+    // Per-CLIENT census. The per-device totals above cannot show this class of
+    // defect at all: `push=128 deliv=16` reads identically for one starved
+    // reader and for sixteen well-fed ones, and telling those apart is the
+    // whole reason the per-open queues exist. One `try_lock`, ~512 B of stack,
+    // no allocation — safe from this tick (IRQ) context.
+    {
+        let mut rows = [evdev_server::EvClientCensus::empty();
+                        evdev_server::MAX_CLIENTS];
+        let n = evdev_server::clients_census(&mut rows);
+        if n == usize::MAX {
+            // MISSED, which must not print the same as "no clients".
+            mm::gap2::s("[EVCLI] t="); mm::gap2::h(now);
+            mm::gap2::s(" busy\n");
+        } else {
+            for r in rows.iter().take(n) {
+                mm::gap2::s("[EVCLI] t=");    mm::gap2::h(now);
+                mm::gap2::kv(" dev=",     r.dev_id  as usize);
+                mm::gap2::kv(" open=",    r.open_id as usize);
+                mm::gap2::kv(" pid=",     r.pid     as usize);
+                mm::gap2::kv(" queued=",  r.queued  as usize);
+                mm::gap2::kv(" deliv=",   r.deliv   as usize);
+                mm::gap2::kv(" dropped=", r.dropped as usize);
+                mm::gap2::nl();
+            }
+        }
     }
     if drivers::virtio_keyboard::VQ_STATS {
         let v = drivers::virtio_keyboard::vq_census();
@@ -7182,18 +7321,32 @@ fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
     const POLLOUT:  u32 = 0x0004;
     const POLLNVAL: u32 = 0x0020;
 
-    if fd == 0 {
+    // A pty end on 0/1/2 — a shell's stdio under a terminal emulator is
+    // exactly this — is a terminal, but not the console. Its readiness lives
+    // in the pty pool, so it must fall through to VFS_POLL rather than be
+    // answered from the serial port's state. Same rule sys_read/sys_write
+    // already follow via fd_redirected; checked here because the two shortcuts
+    // below are unconditional.
+    //
+    // `/dev/tty0` dup2'd onto stdio is excluded for the same reason a pty is:
+    // its readiness is the VT-change edge the VFS answers, not the console's.
+    let kind0 = if fd <= 2 { vfs::vfs_get_node_kind(pid, fd) } else { None };
+    let is_pty = matches!(kind0, Some(vfs::VnodeKind::Pty { .. }));
+    let is_vt0 = matches!(kind0, Some(vfs::VnodeKind::DevVt { vt: 0, .. }));
+    if fd == 0 && !is_pty && !is_vt0 {
         return if console_input_pending()
             || evdev_server::has_key_event(0) || crate::serial_has_data() { POLLIN } else { 0 };
     }
-    if fd == 1 || fd == 2 {
+    if (fd == 1 || fd == 2) && !is_pty && !is_vt0 {
         return POLLOUT;
     }
     // Console proxy fds (/dev/tty, a dup'd stdin) mirror fd 0/1/2 readiness —
     // crossterm registers its /dev/tty handle in epoll and waits on it for
     // the cursor-position reply; VFS_POLL reports DevStdio not-ready, which
-    // hung that wait.
-    if fd < net_server::SOCK_FD_BASE && vfs::fd_is_console_stdio(pid, fd) {
+    // hung that wait. `/dev/tty0` is the exception: its readiness is the
+    // VT-change edge the VFS answers, not console input.
+    if fd < net_server::SOCK_FD_BASE && vfs::fd_is_console_stdio(pid, fd)
+        && !is_vt0 && vfs::fd_vt_number(pid, fd) != Some(0) {
         return if console_input_pending()
             || evdev_server::has_key_event(0) || crate::serial_has_data() {
             POLLIN | POLLOUT
@@ -7285,7 +7438,26 @@ fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
     // handle_poll reports DevStdio never-ready, so routing them to VFS_POLL
     // below would leave an epoll interest that can never fire (crossterm's
     // mio-registered /dev/tty handle waits there for the ESC[6n reply).
-    if fd <= 2 || vfs::fd_is_console_stdio(pid, fd) {
+    // A pty on 0/1/2 is excluded: it DOES have an edge source (the pool's per
+    // pair seq), and routing it level-triggered here would make an EPOLLET
+    // reader on a pty spin on every epoll_wait return.
+    // Scoped to fd<=2 so the common case costs no extra FD_TABLES lock in
+    // what is a per-interest, per-epoll_wait-pass hot path.
+    // `/dev/tty0` is excluded for the opposite reason: it DOES have an edge
+    // source (the active VT number — see vfs::fd_vt_number), and routing it
+    // level-triggered here would make an EPOLLET libseat shim re-fire on every
+    // epoll_wait return for a switch it has already consumed. The fd<=2 case is
+    // answered from the node kind already fetched for the pty test rather than
+    // a second FD_TABLES pass, and the fd>2 case only from fds
+    // fd_is_console_stdio has already accepted — neither adds a lookup to the
+    // per-interest, per-epoll_wait-pass hot path.
+    let kind0 = if fd <= 2 { vfs::vfs_get_node_kind(pid, fd) } else { None };
+    let is_pty = matches!(kind0, Some(vfs::VnodeKind::Pty { .. }));
+    let is_vt0 = matches!(kind0, Some(vfs::VnodeKind::DevVt { vt: 0, .. }));
+    if (fd <= 2 && !is_pty && !is_vt0)
+        || (fd > 2 && vfs::fd_is_console_stdio(pid, fd)
+                   && vfs::fd_vt_number(pid, fd) != Some(0))
+    {
         return (probe_fd_events(pid, fd, requested), None);
     }
     // Net sockets: a connected AF_UNIX socket now carries a combined edge-seq

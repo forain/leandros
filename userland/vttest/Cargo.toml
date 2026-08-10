@@ -1,0 +1,13 @@
+[package]
+name = "vttest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "vttest"
+path = "src/main.rs"
+
+[dependencies]
+# Links against librelibc.a (like ptytest/evsplit) — the point is to exercise
+# open/read/ioctl/poll on /dev/ttyN through the real libc, the way a libseat
+# shim or a compositor does, not through raw syscalls.

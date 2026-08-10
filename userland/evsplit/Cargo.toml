@@ -1,0 +1,12 @@
+[package]
+name = "evsplit"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "evsplit"
+path = "src/main.rs"
+
+[dependencies]
+# Links against librelibc.a (like evtest2/forktest) — it needs real fork(),
+# waitpid() and MAP_SHARED, not the minimal leandros-libc.

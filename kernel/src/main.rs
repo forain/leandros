@@ -113,6 +113,11 @@ pub extern "C" fn serial_write_byte(b: u8) {
     #[cfg(target_arch = "aarch64")]
     unsafe { arch_aarch64::uart::putc(b); }
 
+    // Mirror every console byte into the active VT's screen buffer before the
+    // enabled gate below: an off-screen VT must keep accumulating its text, or
+    // switching to it later shows a stale screen.
+    tty_server::vt::console_out(b);
+
     if !KERNEL_CONSOLE_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
@@ -646,6 +651,11 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             }
         }
         
+        // Bring up the VT layer now that the framebuffer console (bootloader
+        // or VirtIO GPU) has had its chance to init — covers both branches
+        // above, and is harmless if neither produced a framebuffer.
+        tty_server::vt::init();
+
         serial_print_str("\n[LEANDROS] Kernel starting...\n");
         serial_print_str("[TRACE] boot_info_addr: ");
         serial_print_hex(boot_info_addr);

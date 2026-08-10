@@ -856,8 +856,32 @@ pub fn drm_scanout_release(open_id: u32) {
     if SCANOUT_OWNER.swap(SCANOUT_UNOWNED, core::sync::atomic::Ordering::SeqCst)
         != SCANOUT_UNOWNED
     {
-        set_console_disabled(false);
+        console_reclaim();
     }
+}
+
+/// Hand the surface back to whichever console owns it now.
+///
+/// With one console there was nothing to hand back *to*: the surface WAS the
+/// console's state, a DRM client had overwritten it, and so the reclaim cleared
+/// the screen and printed "[Console Resumed]" — a line nobody wrote, invented
+/// because the alternative was a screen full of somebody else's frame.
+///
+/// With virtual terminals there is a saved text plane per console, so the
+/// correct reclaim is a repaint of it. `vt_console_reclaim` does that and
+/// returns true; it returns false only before the VT layer is up (early boot),
+/// where the old clear is still the best available answer — minus the banner,
+/// which was a bring-up aid and is now just text in the middle of restored
+/// output.
+fn console_reclaim() {
+    extern "C" { fn vt_console_reclaim() -> bool; }
+    if unsafe { vt_console_reclaim() } { return; }
+    set_console_disabled(false);
+    {
+        let mut fb = KERNEL_FB.lock();
+        fb.clear(0x000000);
+    }
+    fb_flush();
 }
 
 /// Take the scanout back for a kernel panic, unconditionally.
@@ -875,25 +899,123 @@ pub fn console_force_reclaim() {
 }
 
 /// Disable or enable kernel console output to prevent blinking during DRM operations.
+///
+/// Pure gate: it flips the flag `serial_write_byte` tests and touches no
+/// pixels. Re-enabling used to clear the screen and print a banner, which is
+/// wrong the moment there is more than one console — see [`console_reclaim`],
+/// which is where "what should be on screen now" belongs.
 pub fn set_console_disabled(disabled: bool) {
     extern "C" { fn kernel_set_console_enabled(enabled: bool); }
     unsafe { kernel_set_console_enabled(!disabled); }
-    
-    // If we are re-enabling the console, trigger a redraw
-    if !disabled {
-        let mut fb = KERNEL_FB.lock();
-        fb.clear(0x000000);
-        fb.cursor_x = 0;
-        fb.cursor_y = 0;
-        
-        // Print a message to show the console is back
-        let msg = b"\n[Console Resumed]\n> \0";
-        for &b in msg {
-            if b == 0 { break; }
-            fb.putc(b);
-        }
+}
+
+// ── VT bridge ─────────────────────────────────────────────────────────────────
+//
+// `servers/tty` owns the VT state machine and depends on `ipc`, `sched` and
+// `spin` only — it cannot call `drivers`, and it should not: the console is a
+// driver and the VT layer is policy above it. These `#[no_mangle]` entry points
+// are that seam, matching the one `kernel_set_console_enabled` and
+// `kernel_console_winsize` already use.
+
+/// Begin a VT repaint: blank the surface and park the cursor at the origin.
+/// Does not flush — [`fb_vt_repaint_end`] transfers the whole frame once.
+#[no_mangle]
+pub extern "C" fn fb_vt_repaint_begin() {
+    KERNEL_FB.lock().clear(0x000000);
+}
+
+/// Draw one text row from `len` packed cells, `(fg ^ 0x00FF_FFFF) << 32 | ch`.
+///
+/// Blank cells are skipped rather than drawn as spaces: `fb_vt_repaint_begin`
+/// already blacked the surface, and `draw_char_vector` fills each cell before
+/// rendering, so drawing a space would cost a full-cell `fill_rect` per empty
+/// column — on a mostly-empty 240x67 console that is the bulk of the repaint.
+///
+/// The colour arrives XOR-inverted because the VT layer's cell tables must be
+/// a zero image to stay in `.bss`; the default white is 0 on the wire.
+#[no_mangle]
+pub extern "C" fn fb_vt_paint_row(row: u32, cells: *const u64, len: u32) {
+    if cells.is_null() { return; }
+    let mut fb = KERNEL_FB.lock();
+    if fb.base.is_null() || fb.char_width == 0 || fb.char_height == 0 { return; }
+    let (cw, chh, w, h) = (fb.char_width, fb.char_height, fb.width, fb.height);
+    let y = row as usize * chh;
+    if y + chh > h { return; }
+    for i in 0..len as usize {
+        let x = i * cw;
+        if x + cw > w { break; }
+        let packed = unsafe { cells.add(i).read() };
+        let ch = packed as u32;
+        if ch == 0 || ch == 0x20 { continue; }
+        let fg = ((packed >> 32) as u32) ^ 0x00FF_FFFF;
+        let disp = if ch < 0x80 {
+            ch as u8 as char
+        } else {
+            fb.map_unicode_to_ascii(ch)
+        };
+        fb.draw_char_vector(x, y, disp, fg);
     }
 }
+
+/// Finish a VT repaint: park the console cursor on the restored VT's cell,
+/// restore its SGR foreground, resync the escape parser and transfer once.
+///
+/// The parser reset matters: a switch can land between the `ESC [` and the
+/// final byte of a sequence the outgoing VT was mid-way through, and a console
+/// left in `Csi` swallows the incoming VT's next few characters as parameters.
+#[no_mangle]
+pub extern "C" fn fb_vt_repaint_end(col: u32, row: u32, fg: u32) {
+    {
+        let mut fb = KERNEL_FB.lock();
+        if fb.char_width == 0 || fb.char_height == 0 { return; }
+        let (cols, rows) = (fb.cols(), fb.rows());
+        if cols == 0 || rows == 0 { return; }
+        fb.set_cell((col as usize).min(cols - 1), (row as usize).min(rows - 1));
+        fb.fg = fg;
+        fb.esc = EscState::Ground;
+        fb.params_len = 0;
+    }
+    fb_flush();
+}
+
+/// Enable or disable console painting on behalf of the VT layer.
+#[no_mangle]
+pub extern "C" fn fb_vt_console_gate(enabled: bool) {
+    set_console_disabled(!enabled);
+}
+
+/// True while a DRM open holds the scanout.
+#[no_mangle]
+pub extern "C" fn fb_vt_scanout_owned() -> bool {
+    SCANOUT_OWNER.load(core::sync::atomic::Ordering::SeqCst) != SCANOUT_UNOWNED
+}
+
+/// Drop any DRM scanout claim so a text VT can take the display back.
+///
+/// Same store [`console_force_reclaim`] makes, and for a related reason: a
+/// switch to a text console is the user saying "give me the screen" over the
+/// top of a client that will not give it up. It deliberately does NOT repaint
+/// or re-enable anything — the caller is mid-switch and owns that decision —
+/// and it deliberately does not consult `open_id`, because there is no open to
+/// consult: the request came from a keyboard chord.
+///
+/// The client is not told, so its next present re-claims the scanout. That is
+/// correct for the switch *back*, and it is the reason this is not the whole of
+/// TODO.md item 14: a real handoff also revokes DRM master and reopens the
+/// input devices, which is that item's second piece.
+#[no_mangle]
+pub extern "C" fn fb_vt_scanout_revoke() {
+    SCANOUT_OWNER.store(SCANOUT_UNOWNED, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Text rows the console advances per scroll.
+///
+/// Read by the VT mirror rather than duplicated there. The mirror has to model
+/// scrolling to know where the cursor ends up, and a mirror that scrolled by a
+/// different step would put every later repaint on the wrong row — a silent
+/// divergence with no symptom until a switch.
+#[no_mangle]
+pub extern "C" fn fb_vt_scroll_rows() -> u32 { SCROLL_ROWS as u32 }
 
 /// Output a character to the global kernel framebuffer.
 pub fn fb_putc(c: u8) {

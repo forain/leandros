@@ -1,17 +1,24 @@
-//! TTY server — POSIX terminal (termios) line discipline and PTY pairs.
+//! TTY server — POSIX terminal state (termios), job control and POSIX timers.
 //!
-//! # Architecture
+//! # What is here
 //!
-//! In-kernel library called directly from syscall.rs for ioctl(TCGETS/TCSETS),
-//! isatty(), and read/write on TTY fds.  /dev/tty and /dev/ttyS0 are VFS devfs
-//! vnodes whose read/write handlers delegate here.
+//! An in-kernel library called directly from `syscall.rs`. Three separate
+//! things live under this roof, sharing only the `Termios` type:
 //!
-//! TTY FDs use the same SOCK_FD_BASE offset scheme as the net server but with
-//! a distinct range: TTY_FD_BASE = 0x1000. (Kept clear of the AF_UNIX socket
-//! window [0x100, 0x300) — MAX_SOCKS was raised to 512 in K1 — and of the
-//! epoll range at 0x400. This TTY-fd path is currently dormant: nothing routes
-//! TTY_OPEN, so relocating the base is behaviourally inert, but it keeps every
-//! server fd range disjoint.)
+//! * **The console's termios**, one record per process (`CONSOLE_TERMIOS`).
+//!   fd 0/1/2 are hardwired to the serial console by the kernel's read/write
+//!   fast paths and never appear in any fd table, so `tcgetattr`/`tcsetattr`/
+//!   `isatty` on them are answered from here. `console_intercept_byte` is the
+//!   ISIG half of that line discipline, called from the UART drain.
+//! * **Job control** (`jobctl_ioctl`) — the console's foreground process group.
+//! * **POSIX timers** — see below.
+//!
+//! Pseudo-terminals are [`pty`], a self-contained pool with its own full
+//! termios line discipline. They do NOT use a private fd range: a pty end is
+//! an ordinary VFS fd (`VnodeKind::Pty`), so it inherits dup/fork/poll/
+//! SCM_RIGHTS for free. The dormant `TTY_FD_BASE` scheme that a second fd
+//! class would have needed was deleted rather than revived — nothing ever
+//! routed `TTY_OPEN` to it.
 //!
 //! # POSIX timers
 //!
@@ -29,14 +36,12 @@
 use ipc::Message;
 use spin::Mutex;
 
+pub mod pty;
+pub mod vt;
+
 // ── Protocol tag constants ────────────────────────────────────────────────────
 
-pub const TTY_OPEN:       u64 = 0x40;
-pub const TTY_READ:       u64 = 0x41;
-pub const TTY_WRITE:      u64 = 0x42;
 pub const TTY_IOCTL:      u64 = 0x43;
-pub const TTY_CLOSE:      u64 = 0x44;
-pub const TTY_ISATTY:     u64 = 0x45;
 
 // POSIX timer protocol
 pub const TIMER_CREATE:   u64 = 0x50;
@@ -47,12 +52,8 @@ pub const TIMER_GETOVERRUN: u64 = 0x54;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-pub const TTY_FD_BASE: usize = 0x1000;
-
 const MAX_PROCS:  usize = 64;
-const MAX_TTYS:   usize = 4;   // per process (stdin/stdout/stderr + one pty)
 const MAX_TIMERS: usize = 8;   // per process POSIX timers
-const TTY_BUF:    usize = 4096;
 
 // ── termios structure (matches Linux struct termios) ──────────────────────────
 // 36 bytes: c_iflag(4)+c_oflag(4)+c_cflag(4)+c_lflag(4)+c_line(1)+[3 pad]+c_cc[19]+[1 pad]
@@ -69,6 +70,18 @@ struct Termios {
 }
 
 impl Termios {
+    /// An all-zero `Termios`, for `static` initialisers only.
+    ///
+    /// Not a usable terminal state (no `ICANON`, no `ECHO`, no `c_cc`) — its
+    /// entire job is to keep the array it initialises in `.bss`. A `const`
+    /// initialiser with any non-zero byte forces the whole enclosing static
+    /// into `.data`, and for the PTY pool that means every ring buffer as
+    /// well: ~200 KiB of image. See TODO item 15 for what an inflated image
+    /// cost once. Callers install real settings straight after.
+    pub(crate) const fn zeroed() -> Self {
+        Self { c_iflag: 0, c_oflag: 0, c_cflag: 0, c_lflag: 0, c_line: 0, c_cc: [0u8; 19] }
+    }
+
     /// Return a sensible default for a serial console.
     const fn default_console() -> Self {
         let mut cc = [0u8; 19];
@@ -95,80 +108,6 @@ impl Termios {
         }
     }
 }
-
-// ── TTY ring buffer ───────────────────────────────────────────────────────────
-
-struct TtyBuf {
-    data:  [u8; TTY_BUF],
-    rpos:  usize,
-    wpos:  usize,
-    count: usize,
-}
-
-impl TtyBuf {
-    const fn new() -> Self {
-        Self { data: [0u8; TTY_BUF], rpos: 0, wpos: 0, count: 0 }
-    }
-
-    fn write(&mut self, b: u8) -> bool {
-        if self.count >= TTY_BUF { return false; }
-        self.data[self.wpos] = b;
-        self.wpos = (self.wpos + 1) % TTY_BUF;
-        self.count += 1;
-        true
-    }
-
-    fn read(&mut self) -> Option<u8> {
-        if self.count == 0 { return None; }
-        let b = self.data[self.rpos];
-        self.rpos = (self.rpos + 1) % TTY_BUF;
-        self.count -= 1;
-        Some(b)
-    }
-}
-
-// ── TTY entry ─────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, PartialEq)]
-enum TtyKind {
-    None,
-    Console,  // /dev/ttyS0 — backed by kernel serial I/O
-    PtsMaster { pair: usize },
-    PtsSlave  { pair: usize },
-}
-
-#[derive(Clone, Copy)]
-struct TtyEntry {
-    kind:   TtyKind,
-    in_use: bool,
-    termios: Termios,
-}
-
-impl TtyEntry {
-    const fn empty() -> Self {
-        Self { kind: TtyKind::None, in_use: false, termios: Termios::default_console() }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ProcTtyTable {
-    pid:    u32,
-    ttys:   [TtyEntry; MAX_TTYS],
-    in_use: bool,
-}
-
-impl ProcTtyTable {
-    const fn empty() -> Self {
-        Self { pid: 0, ttys: [const { TtyEntry::empty() }; MAX_TTYS], in_use: false }
-    }
-
-    fn alloc(&mut self) -> Option<usize> {
-        self.ttys.iter().position(|t| !t.in_use)
-    }
-}
-
-static TTY_TABLES: Mutex<[ProcTtyTable; MAX_PROCS]> =
-    Mutex::new([const { ProcTtyTable::empty() }; MAX_PROCS]);
 
 // ── Hardwired console fds (0/1/2) ─────────────────────────────────────────────
 // The kernel's sys_read/sys_write fast paths (and VFS's alloc_fd, which
@@ -288,25 +227,6 @@ fn get_or_create_console<'a>(pid: u32, tbl: &'a mut [ConsoleTermios]) -> Option<
     Some(&mut tbl[pos])
 }
 
-// ── PTY pairs ────────────────────────────────────────────────────────────────
-
-const MAX_PTS: usize = 8;
-
-struct PtsPair {
-    in_use:   bool,
-    m_to_s:   TtyBuf,  // master→slave (slave reads this)
-    s_to_m:   TtyBuf,  // slave→master (master reads this)
-}
-
-impl PtsPair {
-    const fn new() -> Self {
-        Self { in_use: false, m_to_s: TtyBuf::new(), s_to_m: TtyBuf::new() }
-    }
-}
-
-static PTS_PAIRS: Mutex<[PtsPair; MAX_PTS]> =
-    Mutex::new([const { PtsPair::new() }; MAX_PTS]);
-
 // ── POSIX timer table ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
@@ -382,44 +302,16 @@ fn ok_reply()        -> Message { make_reply(0) }
 fn err_reply(e: i32) -> Message { make_reply(e as i64) }
 fn val_reply(v: u64) -> Message { make_reply(v as i64) }
 
-fn find_tty<'a>(pid: u32, tbls: &'a mut [ProcTtyTable]) -> Option<&'a mut ProcTtyTable> {
-    tbls.iter_mut().find(|t| t.in_use && t.pid == pid)
-}
-
-fn get_or_create_tty<'a>(pid: u32, tbls: &'a mut [ProcTtyTable]) -> Option<&'a mut ProcTtyTable> {
-    if let Some(pos) = tbls.iter().position(|t| t.in_use && t.pid == pid) {
-        return Some(&mut tbls[pos]);
-    }
-    if let Some(pos) = tbls.iter().position(|t| !t.in_use) {
-        tbls[pos] = ProcTtyTable::empty();
-        tbls[pos].in_use = true;
-        tbls[pos].pid    = pid;
-        return Some(&mut tbls[pos]);
-    }
-    None
-}
-
-fn fd_to_slot(fd: usize) -> Option<usize> {
-    if fd >= TTY_FD_BASE && fd < TTY_FD_BASE + MAX_TTYS { Some(fd - TTY_FD_BASE) } else { None }
-}
-
 // ── Public dispatch ───────────────────────────────────────────────────────────
 
 pub fn handle(msg: &Message, caller_pid: u32) -> Message {
-    // Timer/tty tables are per-process (keyed by TGID); any syscall can arrive on
-    // a non-leader thread, so canonicalize at this single IPC choke point (mirrors
-    // vfs::handle / net_server::handle).
+    // Timer/console tables are per-process (keyed by TGID); any syscall can arrive
+    // on a non-leader thread, so canonicalize at this single IPC choke point
+    // (mirrors vfs::handle / net_server::handle).
     let caller_pid = sched::tgid_of(caller_pid);
     match msg.tag {
-        TTY_OPEN    => handle_open(caller_pid, arg(msg,0) as usize),
-        TTY_READ    => handle_read(caller_pid, arg(msg,0) as usize,
-                                   arg(msg,1) as usize, arg(msg,2) as usize),
-        TTY_WRITE   => handle_write(caller_pid, arg(msg,0) as usize,
-                                    arg(msg,1) as usize, arg(msg,2) as usize),
         TTY_IOCTL   => handle_ioctl(caller_pid, arg(msg,0) as usize,
                                     arg(msg,1) as usize, arg(msg,2) as usize),
-        TTY_CLOSE   => handle_close(caller_pid, arg(msg,0) as usize),
-        TTY_ISATTY  => handle_isatty(caller_pid, arg(msg,0) as usize),
         TIMER_CREATE  => handle_timer_create(caller_pid, arg(msg,0) as u32,
                                              arg(msg,1) as usize),
         // `timer_t` handles are `slot + 1` (see handle_timer_create) so a
@@ -493,12 +385,8 @@ pub fn ensure_real_timer(pid: u32, signo: u32) {
     }
 }
 
-/// Drop all TTY and timer state for a process on exit.
+/// Drop all terminal and timer state for a process on exit.
 pub fn close_all(pid: u32) {
-    let mut ttys = TTY_TABLES.lock();
-    if let Some(t) = ttys.iter_mut().find(|t| t.in_use && t.pid == pid) {
-        *t = ProcTtyTable::empty();
-    }
     let mut timers = TIMER_TABLES.lock();
     if let Some(t) = timers.iter_mut().find(|t| t.in_use && t.pid == pid) {
         *t = ProcTimerTable::empty();
@@ -509,121 +397,7 @@ pub fn close_all(pid: u32) {
     }
 }
 
-// ── TTY handlers ──────────────────────────────────────────────────────────────
-
-fn handle_open(pid: u32, kind_raw: usize) -> Message {
-    // kind_raw: 0=console(/dev/ttyS0), 1=pts master, 2=pts slave
-    let kind = match kind_raw {
-        0 => TtyKind::Console,
-        1 => {
-            let pair = {
-                let mut pairs = PTS_PAIRS.lock();
-                match pairs.iter().position(|p| !p.in_use) {
-                    Some(i) => { pairs[i].in_use = true; i }
-                    None    => return err_reply(-24),
-                }
-            };
-            TtyKind::PtsMaster { pair }
-        }
-        2 => {
-            // Slave must be opened after master; pair index carried in kind_raw>>8.
-            let pair = kind_raw >> 8;
-            TtyKind::PtsSlave { pair }
-        }
-        _ => return err_reply(-22),
-    };
-    let mut tbls = TTY_TABLES.lock();
-    let tbl = match get_or_create_tty(pid, &mut *tbls) {
-        Some(t) => t, None => return err_reply(-12),
-    };
-    let slot = match tbl.alloc() { Some(s) => s, None => return err_reply(-24) };
-    tbl.ttys[slot] = TtyEntry { kind, in_use: true, termios: Termios::default_console() };
-    val_reply((slot + TTY_FD_BASE) as u64)
-}
-
-fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
-    let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
-    let tbls = TTY_TABLES.lock();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
-        Some(t) => t, None => return err_reply(-9),
-    };
-    if slot >= MAX_TTYS || !tbl.ttys[slot].in_use { return err_reply(-9); }
-    match tbl.ttys[slot].kind {
-        TtyKind::Console => {
-            // No input buffer yet — return EOF (0).
-            val_reply(0)
-        }
-        TtyKind::PtsSlave { pair } => {
-            drop(tbls);
-            let mut pairs = PTS_PAIRS.lock();
-            let mut n = 0usize;
-            let ring = &mut pairs[pair].m_to_s;
-            while n < count.min(TTY_BUF) {
-                match ring.read() {
-                    Some(b) => { unsafe { *(buf_ptr as *mut u8).add(n) = b; } n += 1; }
-                    None    => break,
-                }
-            }
-            val_reply(n as u64)
-        }
-        TtyKind::PtsMaster { pair } => {
-            drop(tbls);
-            let mut pairs = PTS_PAIRS.lock();
-            let mut n = 0usize;
-            let ring = &mut pairs[pair].s_to_m;
-            while n < count.min(TTY_BUF) {
-                match ring.read() {
-                    Some(b) => { unsafe { *(buf_ptr as *mut u8).add(n) = b; } n += 1; }
-                    None    => break,
-                }
-            }
-            val_reply(n as u64)
-        }
-        TtyKind::None => err_reply(-9),
-    }
-}
-
-fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
-    let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
-    let tbls = TTY_TABLES.lock();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
-        Some(t) => t, None => return err_reply(-9),
-    };
-    if slot >= MAX_TTYS || !tbl.ttys[slot].in_use { return err_reply(-9); }
-    match tbl.ttys[slot].kind {
-        TtyKind::Console => {
-            // Write to serial output.
-            let buf = buf_ptr as *const u8;
-            for i in 0..count.min(4096) {
-                let b = unsafe { *buf.add(i) };
-                // Route through kernel serial — use the extern fn via a raw
-                // byte cast to avoid dependency on kernel crate from here.
-                // The caller (syscall.rs) handles serial; for now just count.
-                let _ = b;
-            }
-            val_reply(count as u64)
-        }
-        TtyKind::PtsMaster { pair } => {
-            drop(tbls);
-            let mut pairs = PTS_PAIRS.lock();
-            let mut n = 0usize;
-            let ring = &mut pairs[pair].m_to_s;
-            let buf = buf_ptr as *const u8;
-            while n < count { if !ring.write(unsafe { *buf.add(n) }) { break; } n += 1; }
-            val_reply(n as u64)
-        }
-        TtyKind::PtsSlave { pair } => {
-            drop(tbls);
-            let mut pairs = PTS_PAIRS.lock();
-            let mut n = 0usize;
-            let ring = &mut pairs[pair].s_to_m;
-            let buf = buf_ptr as *const u8;
-            while n < count { if !ring.write(unsafe { *buf.add(n) }) { break; } n += 1; }
-            val_reply(n as u64)
-        }
-        TtyKind::None => err_reply(-9),
-    }
-}
+// ── Terminal ioctl handler ────────────────────────────────────────────────────
 
 fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg_ptr: usize) -> Message {
     // Termios records are per-process: thread siblings must see the same
@@ -631,7 +405,7 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg_ptr: usize) -> Message {
     let pid = sched::tgid_of(pid);
     if let Some(r) = jobctl_ioctl(cmd, arg_ptr) { return r; }
     if fd <= 2 {
-        // stdin/stdout/stderr never go through TTY_OPEN — see ConsoleTermios.
+        // stdin/stdout/stderr have no fd-table entry at all — see ConsoleTermios.
         let mut console = CONSOLE_TERMIOS.lock();
         let c = match get_or_create_console(pid, &mut *console) {
             Some(c) => c, None => return err_reply(-25),
@@ -639,23 +413,28 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg_ptr: usize) -> Message {
         return termios_ioctl(cmd, arg_ptr, &mut c.termios);
     }
 
-    let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-25) }; // ENOTTY
-    let mut tbls = TTY_TABLES.lock();
-    let tbl = match find_tty(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-25) };
-    if slot >= MAX_TTYS || !tbl.ttys[slot].in_use { return err_reply(-25); }
-    termios_ioctl(cmd, arg_ptr, &mut tbl.ttys[slot].termios)
+    // Nothing above fd 2 reaches here as a terminal: pty ends are dispatched by
+    // `sys_ioctl` straight to `pty::ioctl`, and everything else genuinely is
+    // not a terminal.
+    err_reply(-25) // ENOTTY
 }
 
-/// Linux ioctl commands for termios:
-/// TCGETS = 0x5401, TCSETS = 0x5402, TCSETSW = 0x5403, TCSETSF = 0x5404,
-/// TIOCGWINSZ = 0x5413. Shared by [`handle_ioctl`]'s slot-table path and its
-/// fd-0/1/2 console path, which differ only in where `t` lives.
-fn termios_ioctl(cmd: usize, arg_ptr: usize, t: &mut Termios) -> Message {
+/// Copy a `struct termios`/`termios2` between userspace and `t`, for the
+/// TCGETS/TCSETS family. Returns 0 or `-errno` rather than a `Message` because
+/// both callers want a bare status: [`termios_ioctl`] wraps it for the
+/// console's IPC reply, and [`pty::ioctl`] returns it directly.
+///
+/// A command this does not recognise is `-ENOTTY`, so a caller can use the
+/// return value to decide whether to keep looking.
+///
+/// # Safety
+/// `arg_ptr` is a userspace pointer; the caller must have validated it and
+/// faulted it in (this runs with the pty pool lock held on the pty path).
+pub(crate) unsafe fn termios_rw(cmd: usize, arg_ptr: usize, t: &mut Termios) -> isize {
     const TCGETS:     usize = 0x5401;
     const TCSETS:     usize = 0x5402;
     const TCSETSW:    usize = 0x5403;
     const TCSETSF:    usize = 0x5404;
-    const TIOCGWINSZ: usize = 0x5413;
     // termios2 variants (struct termios2 = termios + c_ispeed/c_ospeed).
     // rustix's linux_raw backend uses TCGETS2 for isatty() — answering
     // ENOTTY there made crossterm decide stdin isn't a terminal and fall
@@ -665,112 +444,67 @@ fn termios_ioctl(cmd: usize, arg_ptr: usize, t: &mut Termios) -> Message {
     const TCSETSW2:   usize = 0x402C_542C;
     const TCSETSF2:   usize = 0x402C_542D;
 
+    if arg_ptr == 0 { return -14; } // EFAULT
     match cmd {
-        TCGETS2 => {
-            if arg_ptr == 0 { return err_reply(-14); }
+        // struct termios is 36 bytes on Linux; termios2 adds c_ispeed/c_ospeed
+        // at offsets 36/40. The leading 36 bytes are identical, so the two
+        // getters differ only in that tail.
+        TCGETS | TCGETS2 => {
             unsafe {
-                core::ptr::write(arg_ptr           as *mut u32, t.c_iflag);
-                core::ptr::write((arg_ptr + 4)     as *mut u32, t.c_oflag);
-                core::ptr::write((arg_ptr + 8)     as *mut u32, t.c_cflag);
-                core::ptr::write((arg_ptr + 12)    as *mut u32, t.c_lflag);
-                core::ptr::write((arg_ptr + 16)    as *mut u8,  t.c_line);
+                core::ptr::write(arg_ptr        as *mut u32, t.c_iflag);
+                core::ptr::write((arg_ptr + 4)  as *mut u32, t.c_oflag);
+                core::ptr::write((arg_ptr + 8)  as *mut u32, t.c_cflag);
+                core::ptr::write((arg_ptr + 12) as *mut u32, t.c_lflag);
+                core::ptr::write((arg_ptr + 16) as *mut u8,  t.c_line);
                 core::ptr::copy_nonoverlapping(t.c_cc.as_ptr(), (arg_ptr + 17) as *mut u8, 19);
-                // c_ispeed / c_ospeed at offsets 36/40 (u32 each).
-                core::ptr::write((arg_ptr + 36) as *mut u32, 38400);
-                core::ptr::write((arg_ptr + 40) as *mut u32, 38400);
+                if cmd == TCGETS2 {
+                    core::ptr::write((arg_ptr + 36) as *mut u32, 38400);
+                    core::ptr::write((arg_ptr + 40) as *mut u32, 38400);
+                }
             }
-            ok_reply()
+            0
         }
-        TCSETS2 | TCSETSW2 | TCSETSF2 => {
-            if arg_ptr == 0 { return err_reply(-14); }
+        TCSETS | TCSETSW | TCSETSF | TCSETS2 | TCSETSW2 | TCSETSF2 => {
             unsafe {
-                t.c_iflag = core::ptr::read(arg_ptr         as *const u32);
-                t.c_oflag = core::ptr::read((arg_ptr + 4)   as *const u32);
-                t.c_cflag = core::ptr::read((arg_ptr + 8)   as *const u32);
-                t.c_lflag = core::ptr::read((arg_ptr + 12)  as *const u32);
-                t.c_line  = core::ptr::read((arg_ptr + 16)  as *const u8);
+                t.c_iflag = core::ptr::read(arg_ptr        as *const u32);
+                t.c_oflag = core::ptr::read((arg_ptr + 4)  as *const u32);
+                t.c_cflag = core::ptr::read((arg_ptr + 8)  as *const u32);
+                t.c_lflag = core::ptr::read((arg_ptr + 12) as *const u32);
+                t.c_line  = core::ptr::read((arg_ptr + 16) as *const u8);
                 core::ptr::copy_nonoverlapping((arg_ptr + 17) as *const u8,
                                                t.c_cc.as_mut_ptr(), 19);
-                // Speeds ignored — serial console rate is fixed.
+                // Speeds ignored — the serial console rate is fixed and a pty
+                // has none.
             }
-            ok_reply()
+            0
         }
-        TCGETS => {
-            // struct termios is 36 bytes on Linux.  We write our fields.
-            if arg_ptr == 0 { return err_reply(-14); }
-            unsafe {
-                core::ptr::write(arg_ptr           as *mut u32, t.c_iflag);
-                core::ptr::write((arg_ptr + 4)     as *mut u32, t.c_oflag);
-                core::ptr::write((arg_ptr + 8)     as *mut u32, t.c_cflag);
-                core::ptr::write((arg_ptr + 12)    as *mut u32, t.c_lflag);
-                core::ptr::write((arg_ptr + 16)    as *mut u8,  t.c_line);
-                core::ptr::copy_nonoverlapping(t.c_cc.as_ptr(), (arg_ptr + 17) as *mut u8, 19);
-            }
-            ok_reply()
-        }
-        TCSETS | TCSETSW | TCSETSF => {
-            if arg_ptr == 0 { return err_reply(-14); }
-            unsafe {
-                t.c_iflag = core::ptr::read(arg_ptr         as *const u32);
-                t.c_oflag = core::ptr::read((arg_ptr + 4)   as *const u32);
-                t.c_cflag = core::ptr::read((arg_ptr + 8)   as *const u32);
-                t.c_lflag = core::ptr::read((arg_ptr + 12)  as *const u32);
-                t.c_line  = core::ptr::read((arg_ptr + 16)  as *const u8);
-                core::ptr::copy_nonoverlapping((arg_ptr + 17) as *const u8,
-                                               t.c_cc.as_mut_ptr(), 19);
-            }
-            ok_reply()
-        }
-        TIOCGWINSZ => {
-            // struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel } — 4×u16 = 8 bytes
-            if arg_ptr == 0 { return err_reply(-14); }
-            // Report the framebuffer's real cell grid: it is the primary
-            // console, and a line editor told 80x24 wraps and repaints against
-            // geometry the screen does not have.
-            extern "C" { fn kernel_console_winsize(rows: *mut u16, cols: *mut u16); }
-            let (mut rows, mut cols) = (24u16, 80u16);
-            unsafe { kernel_console_winsize(&mut rows, &mut cols); }
-            unsafe {
-                core::ptr::write(arg_ptr       as *mut u16, rows);
-                core::ptr::write((arg_ptr + 2) as *mut u16, cols);
-                core::ptr::write((arg_ptr + 4) as *mut u16, 0);
-                core::ptr::write((arg_ptr + 6) as *mut u16, 0);
-            }
-            ok_reply()
-        }
-        _ => err_reply(-25), // ENOTTY — unknown ioctl
+        _ => -25, // ENOTTY
     }
 }
 
-fn handle_close(pid: u32, fd: usize) -> Message {
-    let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
-    let mut tbls = TTY_TABLES.lock();
-    if let Some(tbl) = find_tty(pid, &mut *tbls) {
-        if slot < MAX_TTYS && tbl.ttys[slot].in_use {
-            // Close PTY master → free the pair.
-            if let TtyKind::PtsMaster { pair } = tbl.ttys[slot].kind {
-                drop(tbls);
-                PTS_PAIRS.lock()[pair].in_use = false;
-                return ok_reply();
-            }
-            tbl.ttys[slot] = TtyEntry::empty();
-        }
-    }
-    ok_reply()
-}
+/// The console's terminal ioctls: the TCGETS/TCSETS family via [`termios_rw`],
+/// plus a TIOCGWINSZ that must come from the framebuffer rather than from `t`.
+fn termios_ioctl(cmd: usize, arg_ptr: usize, t: &mut Termios) -> Message {
+    const TIOCGWINSZ: usize = 0x5413;
 
-fn handle_isatty(pid: u32, fd: usize) -> Message {
-    if fd <= 2 { return val_reply(1); } // hardwired to the serial console
-    let slot = match fd_to_slot(fd) { Some(s) => s, None => return val_reply(0) };
-    let tbls = TTY_TABLES.lock();
-    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
-        Some(t) => t, None => return val_reply(0),
-    };
-    if slot < MAX_TTYS && tbl.ttys[slot].in_use && tbl.ttys[slot].kind != TtyKind::None {
-        val_reply(1)
-    } else {
-        val_reply(0)
+    if cmd == TIOCGWINSZ {
+        // struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel } — 4xu16
+        if arg_ptr == 0 { return err_reply(-14); }
+        // Report the framebuffer's real cell grid: it is the primary
+        // console, and a line editor told 80x24 wraps and repaints against
+        // geometry the screen does not have.
+        extern "C" { fn kernel_console_winsize(rows: *mut u16, cols: *mut u16); }
+        let (mut rows, mut cols) = (24u16, 80u16);
+        unsafe { kernel_console_winsize(&mut rows, &mut cols); }
+        unsafe {
+            core::ptr::write(arg_ptr       as *mut u16, rows);
+            core::ptr::write((arg_ptr + 2) as *mut u16, cols);
+            core::ptr::write((arg_ptr + 4) as *mut u16, 0);
+            core::ptr::write((arg_ptr + 6) as *mut u16, 0);
+        }
+        return ok_reply();
     }
+    make_reply(unsafe { termios_rw(cmd, arg_ptr, t) } as i64)
 }
 
 // ── POSIX timer handlers ──────────────────────────────────────────────────────

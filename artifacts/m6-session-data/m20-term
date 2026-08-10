@@ -1,0 +1,190 @@
+# m20-term — first light for cosmic-term inside the COSMIC session.
+#
+# Run it as:  brush /bin/m20-term      (no shebang binfmt; always via a shell)
+# Host half:  artifacts/m20_term.py
+#
+# WHAT THIS IS FOR. Every dependency cosmic-term needs has landed separately and
+# been verified separately: the PTY subsystem (ptytest 15/15, brush interactive
+# on a pty), the fonts, the terminfo entries, the .desktop, and — decisively —
+# the COSMIC_SINGLE_INSTANCE=false discriminator that turned "libcosmic renders
+# nothing" into a fully drawn cosmic-settings window. Nothing has yet put those
+# together. This script does exactly that and nothing else.
+#
+# IT LAUNCHES THE APP ITSELF, NOT THROUGH cosmic-session. cosmic-session spawns
+# children through launch_pad with stderr piped and registers no on_stderr
+# handler (cosmic-session/src/comp.rs:122-134), so a child's stderr goes nowhere
+# at all. cosmic-term has four documented ways to die that ALL announce
+# themselves only on stderr — an assert on pw_uid, an assert on the F_SETFL
+# return value, and die!() on TIOCSCTTY or TIOCSWINSZ — so a run whose stderr is
+# discarded cannot distinguish any of them from "rendered nothing".
+#
+# --no-daemon IS NOT OPTIONAL HERE. main.rs:148 calls fork::daemon by default;
+# the parent exits immediately, the child is reparented, and its stderr is gone
+# along with the pid we would have waited on. Every failure above would then
+# read as a clean exit.
+#
+# COSMIC_SINGLE_INSTANCE=false IS THE ONE THAT WAS EARNED THE HARD WAY.
+# libcosmic's run_single_instance makes a BLOCKING zbus call to its own APP_ID
+# (libcosmic src/app/mod.rs:214-252). busd 0.5.0 answers a call to an unowned
+# well-known name by dropping it with a warn! (busd-0.5.0/src/peers.rs:265-270)
+# and never replies ServiceUnknown; neither side has a timeout, so the caller
+# waits forever, alive and blocked, having never opened a Wayland connection.
+# mod.rs:207-212 honours the variable and skips D-Bus entirely. Without it this
+# script would photograph a black screen and prove nothing about the terminal.
+#
+# THE CONTROL IS THE PROMPT, AND IT IS INSIDE THE PICTURE. A cosmic-term window
+# that draws its chrome but never spawns a shell, and one whose shell is running,
+# differ by whether "brush-0.5#" appears in the client area. That distinction is
+# the whole point of the run, so the shell's own prompt is the success criterion
+# rather than any log line — and /proc/<pid> of the child is checked here so a
+# window with a dead shell cannot read as success.
+#
+# LOGS LIVE ON /data, NOT ON TMPFS. /dev/vdc is a 2 GiB f2fs volume; a tmpfs log
+# from a spinning client would OOM a 2 GiB guest.
+
+# Both windows are arguments because aarch64 on an x86_64 host is TCG, where the
+# same session costs several times what it does under KVM. A window sized for
+# KVM would photograph a terminal that simply had not drawn yet and report it as
+# a failure to draw.
+PRE="${1:-45}"
+POST="${2:-60}"
+
+R=/run/user/0
+L=/data/m20
+
+mkdir -p "$R"
+chmod 0700 "$R"
+rm -rf "$L"
+mkdir -p "$L"
+
+echo "M20: BEGIN"
+
+# ---- preflight: name every staged dependency before using it ----------------
+# A missing font is an exit(1) with a message; a missing terminfo is a silently
+# dumb terminal. Both are cheap to rule out here and expensive to infer later
+# from a blank window.
+echo "M20: ==== BEGIN preflight ===="
+ls -l /bin/cosmic-term
+# fontdb's load_no_fontconfig() walks /usr/share/fonts recursively; the M5 ship
+# set puts the family in a noto/ subdirectory. cosmic-term's Config::default()
+# asks for "Noto Sans Mono" and exit(1)s without BOTH weights.
+ls -l /usr/share/fonts/noto/NotoSansMono-Regular.ttf /usr/share/fonts/noto/NotoSansMono-Bold.ttf
+ls -l /usr/share/terminfo/x/xterm-256color
+ls -l /dev/ptmx
+cat /etc/passwd
+echo "M20: ==== END preflight ===="
+
+# ---- the PTY layer, shown to work in THIS image before it is trusted --------
+# cosmic-term's whole pty half is one dependency, and "the terminal drew nothing"
+# and "the pty subsystem regressed in this build" are indistinguishable from a
+# photograph. ptytest is the direct instrument, so run it here rather than cite
+# an earlier run on an earlier image.
+echo "M20: ==== BEGIN ptytest ===="
+/bin/ptytest
+echo "M20: ptytest exit=$?"
+echo "M20: ==== END ptytest ===="
+
+# ---- the session, silenced ---------------------------------------------------
+sh /bin/start-cosmic-leandros > "$L/cosmic.log" 2>&1 &
+
+i=0
+while [ "$i" -lt 180 ]; do
+	if [ -e "$R/wayland-1" ]; then
+		break
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+echo "M20: wayland-1 after ${i}s"
+# The compositor takes 6-26 s to settle after its first present; launching into
+# it earlier makes "not yet" indistinguishable from "never".
+sleep 25
+
+# ---- the environment cosmic-session's children get, reconstructed ------------
+# A shell started from the console inherits none of this; cosmic-session's
+# children inherit all of it. busd listens on a FIXED path (see
+# /usr/share/dbus-1/session.conf), so the bus address can be named here.
+XDG_RUNTIME_DIR="$R"
+WAYLAND_DISPLAY=wayland-1
+DBUS_SESSION_BUS_ADDRESS="unix:path=$R/bus"
+DBUS_SYSTEM_BUS_ADDRESS="unix:path=$R/bus"
+HOME=/root
+XDG_CONFIG_HOME=/root/.config
+XDG_CACHE_HOME=/root/.cache
+XDG_DATA_HOME=/root/.local/share
+XDG_STATE_HOME=/root/.local/state
+XDG_DATA_DIRS=/usr/local/share:/usr/share
+XDG_CONFIG_DIRS=/etc/xdg
+XDG_CURRENT_DESKTOP=COSMIC
+XDG_SESSION_DESKTOP=COSMIC
+XDG_SESSION_TYPE=wayland
+ICED_BACKEND=tiny-skia
+XCURSOR_THEME=default
+XCURSOR_SIZE=24
+RUST_BACKTRACE=full
+# cosmic-term's main.rs does NOT call run_single_instance, so unlike
+# cosmic-settings it cannot park in busd's unowned-name probe. Set anyway: it is
+# free, and it removes the one failure mode that has already cost this project a
+# month of misattribution should a dependency start taking that path.
+COSMIC_SINGLE_INSTANCE=false
+# cosmic-term sets TERM=xterm-256color for its child itself; setting it here too
+# means the value is the same whether the child is spawned by cosmic-term or by
+# anything else in this script, so a terminfo miss cannot be blamed on the env.
+TERM=xterm-256color
+export XDG_RUNTIME_DIR WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS DBUS_SYSTEM_BUS_ADDRESS
+export HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME
+export XDG_DATA_DIRS XDG_CONFIG_DIRS XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP
+export XDG_SESSION_TYPE ICED_BACKEND XCURSOR_THEME XCURSOR_SIZE RUST_BACKTRACE
+export COSMIC_SINGLE_INSTANCE TERM
+
+echo "M20: ==== BEGIN env-witness ===="
+echo "runtime=$R"
+ls -l "$R"
+echo "M20: ==== END env-witness ===="
+
+# ---- the subject -------------------------------------------------------------
+# Targeted RUST_LOG: a global debug buries the answer and takes minutes to read
+# back over the console. alacritty_terminal names the pty half; cosmic_term the
+# app half; the iced/winit/sctk trio says whether a Wayland connection opened.
+RUST_LOG="info,cosmic_term=debug,alacritty_terminal=debug,cosmic=debug,iced_winit=debug,iced_tiny_skia=debug,winit=debug,sctk=debug,smithay_client_toolkit=debug"
+export RUST_LOG
+echo "M20: MARK TERM"
+/bin/cosmic-term --no-daemon > "$L/term.log" 2>&1 &
+tpid=$!
+sleep "$PRE"
+echo "M20: cosmic-term pid=$tpid"
+# An exited process and a blocked one look identical from a screenshot; this
+# tells them apart before any picture is interpreted.
+ls -d "/proc/$tpid"
+echo "M20: ENDMARK TERM"
+
+# The host half types into the window between these two marks, so the pty has to
+# stay alive across them.
+sleep "$POST"
+echo "M20: cosmic-term still-alive check"
+ls -d "/proc/$tpid"
+echo "M20: CAPTURES DONE"
+
+# ---- exfiltration, bounded ---------------------------------------------------
+# Sizes first: they say whether the head/tail below are the whole log or a window
+# into a much larger one, which changes how a quiet tail reads.
+echo "M20: ==== BEGIN sizes ===="
+wc -c "$L/term.log" "$L/cosmic.log"
+echo "M20: ==== END sizes ===="
+
+echo "M20: ==== BEGIN term-head ===="
+head -c 24000 "$L/term.log"
+echo ""
+echo "M20: ==== END term-head ===="
+
+echo "M20: ==== BEGIN term-tail ===="
+tail -c 16000 "$L/term.log"
+echo ""
+echo "M20: ==== END term-tail ===="
+
+echo "M20: ==== BEGIN cosmic-tail ===="
+tail -c 12000 "$L/cosmic.log"
+echo ""
+echo "M20: ==== END cosmic-tail ===="
+
+echo "M20: DONE"

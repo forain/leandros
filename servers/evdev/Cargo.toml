@@ -7,4 +7,7 @@ edition.workspace = true
 ipc   = { path = "../../ipc" }
 sched = { path = "../../sched" }
 vfs-server = { path = "../vfs" }
+# For the Ctrl+Alt+Fn recogniser only (`vt::chord_key`). No cycle: tty-server
+# depends on ipc/sched/spin and nothing else.
+tty-server = { path = "../tty" }
 spin.workspace = true

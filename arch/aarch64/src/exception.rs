@@ -93,6 +93,50 @@ unsafe extern "C" fn exc_el0_irq_handler(frame: *mut UserFrame) {
     handle_irq(frame);
 }
 
+// POSIX signal numbers (same values as `sched/src/signal.rs` uses; they are
+// architecture-independent).
+const SIGILL:  u32 = 4;
+const SIGTRAP: u32 = 5;
+const SIGBUS:  u32 = 7;
+const SIGFPE:  u32 = 8;
+const SIGSEGV: u32 = 11;
+
+/// The signal a synchronous EL0 exception corresponds to, decoded from
+/// `ESR_EL1.EC` (and, for aborts, `xFSC`).
+///
+/// `exc_el0_sync_handler` is a *single* kill site covering every non-`SVC`
+/// EL0 sync class — data abort, instruction abort, illegal execution state,
+/// undefined instruction, alignment, FP exception, breakpoint — so the
+/// per-class distinction has to be made here or not at all. It killed every
+/// one of them with `exit_group(1)`, which reported a clean exit with code 1
+/// and lost the class entirely; reporting SIGSEGV for all of them would lose
+/// it in a subtler way, since "Illegal instruction" and "Segmentation fault"
+/// are the whole user-visible point of a `WTERMSIG` a shell can name.
+///
+/// The mapping follows Linux's `arch/arm64/kernel/{entry-common,fault}.c`.
+fn el0_fault_signal(esr: u64) -> u32 {
+    let ec  = (esr >> 26) & 0x3F;
+    let fsc = esr & 0x3F;
+    match ec {
+        // Unknown reason (undefined instruction), trapped WF*, trapped
+        // SVE/SIMD/FP access, illegal execution state, trapped MSR/MRS.
+        0x00 | 0x01 | 0x07 | 0x0E | 0x18 => SIGILL,
+        // Instruction / data abort from a lower EL. Most FSCs are a bad
+        // access (SIGSEGV); alignment and synchronous external aborts —
+        // including on a translation-table walk — are bus errors.
+        0x20 | 0x24 => match fsc {
+            0x21 => SIGBUS,
+            0x10 | 0x11 | 0x14..=0x17 => SIGBUS,
+            _ => SIGSEGV,
+        },
+        0x22 | 0x26 => SIGBUS,  // PC / SP alignment fault
+        0x2C        => SIGFPE,  // trapped floating-point exception
+        // Breakpoint, software step, watchpoint, BKPT/BRK.
+        0x30 | 0x32 | 0x34 | 0x38 | 0x3C => SIGTRAP,
+        _ => SIGSEGV,
+    }
+}
+
 #[no_mangle]
 unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
     let far: u64;
@@ -147,7 +191,13 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
         serial_print_str("[EXC] killing PID=");
         print_number(sched::current_pid());
         serial_print_str(" (unresolvable user-pointer fault in kernel)\n");
-        sched::exit_group(1);
+        // Always SIGSEGV, not a decode of this ESR: the faulting access was
+        // the *kernel's*, and what the task did wrong was hand over a bad
+        // pointer — exactly what a userspace dereference of the same pointer
+        // would have been. `exit_group(1)` reported it as a clean exit with
+        // code 1, which no WIFSIGNALED consumer can tell from a program that
+        // chose to return 1.
+        sched::exit_group_signal(SIGSEGV);
     }
 
     loop { core::hint::spin_loop(); }
@@ -353,7 +403,7 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
             sched::dump_user_vma(far as usize);
         }
 
-        sched::exit_group(1);
+        sched::exit_group_signal(el0_fault_signal(esr));
     }
 }
 

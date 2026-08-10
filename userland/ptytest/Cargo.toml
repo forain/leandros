@@ -1,0 +1,13 @@
+[package]
+name = "ptytest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ptytest"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc: links directly against librelibc.a like polltest/sigtest,
+# because the whole point is to exercise open/read/write/ioctl on a pty the way
+# a real terminal emulator does — through the real libc, not raw syscalls.

@@ -37,11 +37,19 @@ pub struct input_event {
     pub value: i32,
 }
 
-// ── Device State ─────────────────────────────────────────────────────────────
+const ZERO_EVENT: input_event = input_event {
+    time: timeval { tv_sec: 0, tv_usec: 0 },
+    type_: 0, code: 0, value: 0,
+};
 
-// A tablet emits X + Y + SYN (and buttons) per motion frame; a fast drag bursts
-// well past 64, so the ring is 256 to avoid dropping frames mid-gesture.
-const MAX_EVENTS: usize = 256;
+// EV_SYN=0, EV_KEY=1, EV_ABS=3 (linux/input-event-codes.h).
+const EV_SYN: u16 = 0;
+const EV_KEY: u16 = 1;
+/// SYN_DROPPED: "your queue overflowed, your state is stale, resync".
+const SYN_DROPPED: u16 = 3;
+
+// ── Device / client state ────────────────────────────────────────────────────
+
 const MAX_DEVICES: usize = 4;
 
 // Device classes we surface. Keyboard = event0 (13:64), tablet = event1 (13:65,
@@ -50,59 +58,202 @@ const MAX_DEVICES: usize = 4;
 const DEV_KEYBOARD: usize = 0;
 const DEV_TABLET: usize = 1;
 
-struct EvdevDevice {
-    events: [input_event; MAX_EVENTS],
-    head:   usize,
-    tail:   usize,
-    count:  usize,
+// A tablet emits X + Y + SYN (and buttons) per motion frame; a fast drag bursts
+// well past 64, so one client's queue is 256 deep to hold a whole gesture even
+// for a reader that only wakes at 60 Hz.
+const CLIENT_EVENTS: usize = 256;
+
+/// Live client queues, pooled across every node rather than fixed per device:
+/// a compositor holds keyboard *and* tablet, and during a VT/session handover
+/// the outgoing and incoming sessions hold both at once. 16 covers that with
+/// headroom; the pool is ~96 KiB of BSS (every field zero-initialised, so it
+/// costs nothing in the image — see TODO.md item 15).
+pub const MAX_CLIENTS: usize = 16;
+
+/// `open_id` marking the in-kernel console drain's queue. The VFS allocates
+/// real open ids from 1 upward out of a 1024-entry table, so `u32::MAX` can
+/// never collide with one.
+pub const CONSOLE_OPEN_ID: u32 = u32::MAX;
+
+/// One open file description's event queue.
+///
+/// Linux gives every `open("/dev/input/eventN")` its own queue and broadcasts
+/// each event to all of them. We used to have a single ring per *device*, so
+/// two readers of one node robbed each other: the `[EVSTAT]` census measured
+/// `dev=0 push=128 conspop=112 deliv=16` — the in-kernel console drain took 112
+/// of 128 keystrokes and the userspace client got the other 16. That is
+/// cosmetic while only one consumer matters and fatal once two do, which is
+/// exactly what a greeter handing over to a session compositor is.
+struct EvClient {
     in_use: bool,
-    /// CLOCK id events are stamped with (EVIOCSCLOCKID). 1 = CLOCK_MONOTONIC,
-    /// which is what libinput requests; we always stamp from the same monotonic
-    /// clock `clock_gettime(CLOCK_MONOTONIC)` reports, so this is advisory only
-    /// (kept for a truthful EVIOCGCLOCKID-style answer and future REALTIME
-    /// support).
-    clockid: u32,
-    /// Monotonic push counter — the poll/epoll readiness sequence (edge emu).
+    dev_id: u32,
+    /// VFS per-open cookie (`VnodeKind::DynamicDevice::open_id`), or
+    /// `CONSOLE_OPEN_ID` for the console tap.
+    ///
+    /// 0 means the request carried no cookie and the queue is keyed by `pid`
+    /// alone. The VFS forwards `open_id` in message slot 4 for ioctls only;
+    /// until it does the same for VFS_READ/VFS_POLL (see the integration note
+    /// on `client_key`), a reader is identified by its process, which is
+    /// per-*process* rather than per-*open* but already separates the
+    /// consumers that were robbing each other.
+    open_id: u32,
+    pid: u32,
+    events: [input_event; CLIENT_EVENTS],
+    head: usize,
+    count: usize,
+    /// Monotonic push counter for THIS queue — the poll/epoll readiness
+    /// sequence (edge emulation). Per client, because an edge is only an edge
+    /// for the reader that has not consumed it.
     seq: u64,
+    deliv: u64,
+    dropped: u64,
+    /// Last time this queue was read/polled, for LRU reclamation.
+    touched: u64,
 }
 
-impl EvdevDevice {
+impl EvClient {
     const fn empty() -> Self {
         Self {
-            events: [const { input_event {
-                time: timeval { tv_sec: 0, tv_usec: 0 },
-                type_: 0, code: 0, value: 0
-            } }; MAX_EVENTS],
-            head:   0,
-            tail:   0,
-            count:  0,
             in_use: false,
-            clockid: 1, // CLOCK_MONOTONIC
+            dev_id: 0,
+            open_id: 0,
+            pid: 0,
+            events: [const { ZERO_EVENT }; CLIENT_EVENTS],
+            head: 0,
+            count: 0,
             seq: 0,
+            deliv: 0,
+            dropped: 0,
+            touched: 0,
         }
     }
 
-    fn push(&mut self, ev: input_event) {
-        if self.count >= MAX_EVENTS {
-            self.head = (self.head + 1) % MAX_EVENTS;
-            self.count -= 1;
-        }
-        self.events[self.tail] = ev;
-        self.tail = (self.tail + 1) % MAX_EVENTS;
+    fn enqueue(&mut self, ev: input_event) {
+        let tail = (self.head + self.count) % CLIENT_EVENTS;
+        self.events[tail] = ev;
         self.count += 1;
+    }
+
+    fn push(&mut self, ev: input_event) {
+        if self.count >= CLIENT_EVENTS {
+            // Linux (drivers/input/evdev.c) does not slide the window on
+            // overflow: it discards the client's whole queue and makes
+            // SYN_DROPPED the next event that client reads. Half a motion
+            // frame is worse than an admitted gap — it moves the pointer to a
+            // coordinate that was never sent — and an admitted gap is
+            // something libinput knows how to resynchronise from.
+            self.dropped += self.count as u64;
+            self.head = 0;
+            self.count = 0;
+            self.enqueue(input_event { time: ev.time, type_: EV_SYN, code: SYN_DROPPED, value: 0 });
+        }
+        self.enqueue(ev);
         self.seq = self.seq.wrapping_add(1);
     }
 
     fn pop(&mut self) -> Option<input_event> {
         if self.count == 0 { return None; }
         let ev = self.events[self.head];
-        self.head = (self.head + 1) % MAX_EVENTS;
+        self.head = (self.head + 1) % CLIENT_EVENTS;
         self.count -= 1;
         Some(ev)
     }
 }
 
-static DEVICES: Mutex<[EvdevDevice; MAX_DEVICES]> = Mutex::new([const { EvdevDevice::empty() }; MAX_DEVICES]);
+struct EvdevDevice {
+    in_use: bool,
+    /// CLOCK id events are stamped with (EVIOCSCLOCKID), as the caller last set
+    /// it, with 0 standing for the CLOCK_MONOTONIC default. Stored inverted
+    /// like that so the whole `STATE` static stays zero-initialised and lands
+    /// in .bss: a `clockid: 1` initialiser would drag ~96 KiB of client queues
+    /// into .data with it. Advisory either way — we always stamp from the same
+    /// monotonic clock `clock_gettime(CLOCK_MONOTONIC)` reports, which is what
+    /// libinput asks for.
+    clockid_override: u32,
+}
+
+impl EvdevDevice {
+    const fn empty() -> Self { Self { in_use: false, clockid_override: 0 } }
+}
+
+struct EvdevState {
+    devs: [EvdevDevice; MAX_DEVICES],
+    clients: [EvClient; MAX_CLIENTS],
+    /// Monotonic counter stamped into `EvClient::touched`.
+    tick: u64,
+}
+
+impl EvdevState {
+    const fn empty() -> Self {
+        Self {
+            devs: [const { EvdevDevice::empty() }; MAX_DEVICES],
+            clients: [const { EvClient::empty() }; MAX_CLIENTS],
+            tick: 0,
+        }
+    }
+
+    /// Index of the queue `(dev, open_id, pid)` reads from, or None.
+    fn find(&self, dev: u32, open_id: u32, pid: u32) -> Option<usize> {
+        self.clients.iter().position(|c| {
+            c.in_use && c.dev_id == dev
+                && if open_id != 0 { c.open_id == open_id }
+                   else { c.open_id == 0 && c.pid == pid }
+        })
+    }
+
+    /// Same, registering a queue if this is the first request from that open.
+    fn find_or_register(&mut self, dev: u32, open_id: u32, pid: u32) -> Option<usize> {
+        self.tick = self.tick.wrapping_add(1);
+        if let Some(i) = self.find(dev, open_id, pid) {
+            self.clients[i].touched = self.tick;
+            return Some(i);
+        }
+        let slot = match self.clients.iter().position(|c| !c.in_use) {
+            Some(i) => i,
+            // Pool exhausted: reclaim the least recently used queue, never the
+            // console tap. A client that stopped reading is by construction the
+            // oldest, and a pid-keyed queue (see `EvClient::open_id`) gets no
+            // VFS_CLOSE naming it, so this is its only reclamation path.
+            None => self.clients.iter().enumerate()
+                .filter(|(_, c)| c.in_use && c.open_id != CONSOLE_OPEN_ID)
+                .min_by_key(|(_, c)| c.touched)
+                .map(|(i, _)| i)?,
+        };
+        let tick = self.tick;
+        let c = &mut self.clients[slot];
+        // Reset the bookkeeping only — `events` is 6 KiB and unreachable while
+        // `count` is 0, so zeroing it would just be a memset on the open path.
+        c.in_use = true;
+        c.dev_id = dev;
+        c.open_id = open_id;
+        c.pid = pid;
+        c.head = 0;
+        c.count = 0;
+        c.seq = 0;
+        c.deliv = 0;
+        c.dropped = 0;
+        c.touched = tick;
+        Some(slot)
+    }
+
+    /// Deliver one event to every queue open on `dev`. Returns true if any of
+    /// them was full and lost its contents.
+    ///
+    /// `console_ok` false skips the console tap only — see `push_event`.
+    fn broadcast(&mut self, dev: u32, ev: input_event, console_ok: bool) -> bool {
+        let mut overflowed = false;
+        for c in self.clients.iter_mut() {
+            if c.in_use && c.dev_id == dev {
+                if c.open_id == CONSOLE_OPEN_ID && !console_ok { continue; }
+                if c.count >= CLIENT_EVENTS { overflowed = true; }
+                c.push(ev);
+            }
+        }
+        overflowed
+    }
+}
+
+static STATE: Mutex<EvdevState> = Mutex::new(EvdevState::empty());
 
 // ── Interrupt Safety ─────────────────────────────────────────────────────────
 
@@ -134,9 +285,9 @@ pub fn events_pushed() -> u64 {
 // are nonzero only if some process is actually talking to the node.
 //
 // Every field is a relaxed atomic so the 0.5 Hz sampler can run from the timer
-// IRQ without taking a lock. The one field that needs the device lock is the
-// live ring depth; it is sampled with `try_lock` and reports `u64::MAX` when
-// the sample was MISSED, never 0 — a missed sample and an empty ring must not
+// IRQ without taking a lock. The one field that needs the state lock is the
+// live queue depth; it is sampled with `try_lock` and reports `u64::MAX` when
+// the sample was MISSED, never 0 — a missed sample and an empty queue must not
 // print the same, which is the whole point of measuring the depth.
 macro_rules! ev_counters {
     ($($name:ident),* $(,)?) => {
@@ -146,9 +297,9 @@ macro_rules! ev_counters {
 }
 ev_counters!(
     C_PUSHED,   // events handed to push_event for this device
-    C_DROPPED,  // pushes that overwrote an unread event (ring was full)
+    C_DROPPED,  // pushes that overflowed at least one client's queue
     C_READS,    // VFS_READ calls
-    C_EAGAIN,   // VFS_READ calls that found the ring empty
+    C_EAGAIN,   // VFS_READ calls that found the caller's queue empty
     C_DELIV,    // input_event records actually copied out by read()
     C_POLLS,    // VFS_POLL calls
     C_POLLIN,   // VFS_POLL calls that answered POLLIN
@@ -167,13 +318,17 @@ fn setv(c: &[core::sync::atomic::AtomicU64; MAX_DEVICES], dev: usize, v: u64) {
     if dev < MAX_DEVICES { c[dev].store(v, core::sync::atomic::Ordering::Relaxed); }
 }
 
-/// One device's I/O census. `depth == u64::MAX` means the ring lock was busy
-/// and the depth was NOT sampled (see the module note above).
+/// One device's I/O census. `depth == u64::MAX` means the state lock was busy
+/// and neither `depth` nor `clients` was sampled (see the module note above).
 #[derive(Clone, Copy)]
 pub struct EvCensus {
     pub pushed:  u64,
     pub dropped: u64,
+    /// Deepest client queue on this device — the shared ring's `depth` has no
+    /// successor now that every open has its own.
     pub depth:   u64,
+    /// Queues currently open on this device, console tap included.
+    pub clients: u64,
     pub reads:   u64,
     pub eagain:  u64,
     pub deliv:   u64,
@@ -188,22 +343,33 @@ pub struct EvCensus {
 }
 
 /// Sample `dev`'s census. Safe from IRQ context: relaxed atomic loads plus one
-/// `try_lock` for the ring depth.
+/// `try_lock` for the queue depth.
 pub fn census(dev: usize) -> EvCensus {
     use core::sync::atomic::Ordering::Relaxed;
     if dev >= MAX_DEVICES {
-        return EvCensus { pushed: 0, dropped: 0, depth: 0, reads: 0, eagain: 0,
-                          deliv: 0, polls: 0, pollin: 0, ioctls: 0, enotty: 0,
-                          lastnr: 0, conspop: 0, rpid: 0, ipid: 0 };
+        return EvCensus { pushed: 0, dropped: 0, depth: 0, clients: 0, reads: 0,
+                          eagain: 0, deliv: 0, polls: 0, pollin: 0, ioctls: 0,
+                          enotty: 0, lastnr: 0, conspop: 0, rpid: 0, ipid: 0 };
     }
-    let depth = match DEVICES.try_lock() {
-        Some(d) => d[dev].count as u64,
-        None => u64::MAX,
+    let (depth, clients) = match STATE.try_lock() {
+        Some(st) => {
+            let mut deepest = 0u64;
+            let mut n = 0u64;
+            for c in st.clients.iter() {
+                if c.in_use && c.dev_id == dev as u32 {
+                    n += 1;
+                    if c.count as u64 > deepest { deepest = c.count as u64; }
+                }
+            }
+            (deepest, n)
+        }
+        None => (u64::MAX, u64::MAX),
     };
     EvCensus {
         pushed:  C_PUSHED[dev].load(Relaxed),
         dropped: C_DROPPED[dev].load(Relaxed),
         depth,
+        clients,
         reads:   C_READS[dev].load(Relaxed),
         eagain:  C_EAGAIN[dev].load(Relaxed),
         deliv:   C_DELIV[dev].load(Relaxed),
@@ -218,11 +384,55 @@ pub fn census(dev: usize) -> EvCensus {
     }
 }
 
+/// One client queue's census. Per-device totals cannot show the defect this
+/// pool exists to fix — `push=128 deliv=16` is equally consistent with one
+/// starved reader and with sixteen well-fed ones — so the numbers that matter
+/// are per queue.
+#[derive(Clone, Copy)]
+pub struct EvClientCensus {
+    pub dev_id:  u32,
+    /// `CONSOLE_OPEN_ID` for the in-kernel console tap; a VFS per-open cookie
+    /// otherwise; 0 for a queue keyed by pid alone (see `EvClient::open_id`).
+    pub open_id: u32,
+    pub pid:     u32,
+    pub queued:  u32,
+    pub deliv:   u64,
+    pub dropped: u64,
+}
+
+impl EvClientCensus {
+    pub const fn empty() -> Self {
+        Self { dev_id: 0, open_id: 0, pid: 0, queued: 0, deliv: 0, dropped: 0 }
+    }
+}
+
+/// Fill `out` with one entry per live client queue and return how many were
+/// written. Returns `usize::MAX` when the state lock was busy — the sample was
+/// MISSED, which must not print the same as "no clients".
+///
+/// Safe from IRQ context: one `try_lock`, no allocation, no user memory.
+pub fn clients_census(out: &mut [EvClientCensus]) -> usize {
+    let st = match STATE.try_lock() { Some(s) => s, None => return usize::MAX };
+    let mut n = 0;
+    for c in st.clients.iter() {
+        if !c.in_use { continue; }
+        if n >= out.len() { break; }
+        out[n] = EvClientCensus {
+            dev_id: c.dev_id,
+            open_id: c.open_id,
+            pid: c.pid,
+            queued: c.count as u32,
+            deliv: c.deliv,
+            dropped: c.dropped,
+        };
+        n += 1;
+    }
+    n
+}
+
 // ── evdev capability constants (linux/input-event-codes.h) ────────────────────
 
 const BUS_VIRTUAL: u16 = 0x06;
-// EV_SYN=0, EV_KEY=1, EV_ABS=3. Type bitmask: kbd = SYN|KEY = 0x03,
-// tablet = SYN|KEY|ABS = 0x0B.
 const ABS_X: usize = 0;
 const ABS_Y: usize = 1;
 
@@ -303,76 +513,78 @@ fn eviocgabs(dev_id: usize, abs: usize, arg_ptr: usize, pid: u32) -> Message {
 
 // ── Message Dispatch ──────────────────────────────────────────────────────────
 
+/// `(open_id, pid)` — which open a request came from.
+///
+/// INTEGRATION NOTE. The VFS forwards the per-open cookie in message slot 4 for
+/// VFS_IOCTL only (`handle_ioctl`, servers/vfs/src/lib.rs). Until it does the
+/// same for VFS_READ and VFS_POLL, slot 4 reads as 0 on those and the queue is
+/// keyed by the caller's pid from slot 3 — per-process instead of per-open,
+/// which already separates the consumers that were robbing each other but makes
+/// two opens *within* one process share a queue. Adding slot 4 to those two
+/// proxies is all it takes to get true Linux semantics; nothing here changes.
+fn client_key(msg: &Message) -> (u32, u32) {
+    (arg(msg, 4) as u32, arg(msg, 3) as u32)
+}
+
 pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
     let tag = msg.tag;
     let dev_id = arg(msg, 0) as usize;
-    
+
     if dev_id >= MAX_DEVICES { return err_reply(-19); } // ENODEV
-    
+
     match tag {
         vfs_server::VFS_READ => {
             let buf_ptr = arg(msg, 1) as usize;
             let count = arg(msg, 2) as usize;
+            let (open_id, pid) = client_key(msg);
             bump(&C_READS, dev_id);
-            setv(&C_RPID, dev_id, arg(msg, 3));
+            setv(&C_RPID, dev_id, pid as u64);
 
-            let f = unsafe { arch_interrupt_save() };
-            let mut devs = DEVICES.lock();
-            let dev = &mut devs[dev_id];
-            
-            if dev.count == 0 {
-                drop(devs);
-                unsafe { arch_interrupt_restore(f); }
+            let event_size = core::mem::size_of::<input_event>();
+            let mut total_copied = 0usize;
+            loop {
+                // Drain a chunk under the lock, then copy it out WITHOUT it:
+                // write_user_buf can take a demand-paging fault, and faulting
+                // while holding a lock the timer IRQ's push_event also takes is
+                // the 82d0cc3 hazard shape.
+                let mut chunk = [ZERO_EVENT; 8];
+                let mut n = 0usize;
+                {
+                    let f = unsafe { arch_interrupt_save() };
+                    let mut st = STATE.lock();
+                    let slot = match st.find_or_register(dev_id as u32, open_id, pid) {
+                        Some(s) => s,
+                        None => { drop(st); unsafe { arch_interrupt_restore(f); } break; }
+                    };
+                    while n < 8 && total_copied + (n + 1) * event_size <= count {
+                        match st.clients[slot].pop() {
+                            Some(ev) => { chunk[n] = ev; n += 1; }
+                            None => break,
+                        }
+                    }
+                    st.clients[slot].deliv += n as u64;
+                    drop(st);
+                    unsafe { arch_interrupt_restore(f); }
+                }
+                if n == 0 { break; }
+
+                let bytes = n * event_size;
+                let ok = sched::with_current_address_space(|as_| {
+                    unsafe {
+                        as_.write_user_buf(buf_ptr + total_copied,
+                            core::slice::from_raw_parts(chunk.as_ptr() as *const u8, bytes))
+                    }
+                }).unwrap_or(false);
+                if !ok { return err_reply(-14); } // EFAULT
+                total_copied += bytes;
+            }
+
+            if total_copied == 0 {
                 bump(&C_EAGAIN, dev_id);
                 return err_reply(-11); // EAGAIN
             }
-            
-            let event_size = core::mem::size_of::<input_event>();
-            let mut n = 0;
-            let mut events_to_copy = [input_event {
-                time: timeval { tv_sec: 0, tv_usec: 0 },
-                type_: 0, code: 0, value: 0
-            }; 8]; // Copy in chunks
-            
-            let mut total_copied = 0;
-            while n + event_size <= count {
-                let mut chunk_count = 0;
-                while chunk_count < 8 && n + event_size <= count {
-                    if let Some(ev) = dev.pop() {
-                        events_to_copy[chunk_count] = ev;
-                        chunk_count += 1;
-                        n += event_size;
-                    } else {
-                        break;
-                    }
-                }
-                
-                if chunk_count > 0 {
-                    let bytes = chunk_count * event_size;
-                    let ok = sched::with_current_address_space(|as_| {
-                        unsafe {
-                            as_.write_user_buf(buf_ptr + total_copied, 
-                                core::slice::from_raw_parts(&events_to_copy as *const _ as *const u8, bytes))
-                        }
-                    }).unwrap_or(false);
-                    
-                    if !ok {
-                        drop(devs);
-                        unsafe { arch_interrupt_restore(f); }
-                        return err_reply(-14); // EFAULT
-                    }
-                    total_copied += bytes;
-                } else {
-                    break;
-                }
-            }
-            drop(devs);
-            unsafe { arch_interrupt_restore(f); }
-            if dev_id < MAX_DEVICES {
-                C_DELIV[dev_id].fetch_add(
-                    (total_copied / core::mem::size_of::<input_event>()) as u64,
-                    core::sync::atomic::Ordering::Relaxed);
-            }
+            C_DELIV[dev_id].fetch_add((total_copied / event_size) as u64,
+                                      core::sync::atomic::Ordering::Relaxed);
             val_reply(total_copied as u64)
         }
         vfs_server::VFS_WRITE => {
@@ -383,6 +595,7 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             let cmd = arg(msg, 1) as usize;
             let pid = arg(msg, 3) as u32;
             let arg_ptr = arg(msg, 2) as usize;
+            let open_id = arg(msg, 4) as u32;
 
             // ioctl request encoding: dir(2) size(14) type(8) nr(8).
             let nr   = cmd & 0xFF;
@@ -393,7 +606,16 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             setv(&C_IPID, dev_id, pid as u64);
 
             if cmd == 0x541B { // FIONREAD (type 'T', not 'E')
-                let count = (DEVICES.lock()[dev_id].count * core::mem::size_of::<input_event>()) as i32;
+                // The caller's OWN queue depth. An ioctl never registers a
+                // queue — a probe must not cost one of the 16 slots, and every
+                // reader reaches VFS_READ/VFS_POLL anyway.
+                let f = unsafe { arch_interrupt_save() };
+                let queued = {
+                    let st = STATE.lock();
+                    st.find(dev_id as u32, open_id, pid).map_or(0, |i| st.clients[i].count)
+                };
+                unsafe { arch_interrupt_restore(f); }
+                let count = (queued * core::mem::size_of::<input_event>()) as i32;
                 return copy_out(pid, arg_ptr, &count.to_ne_bytes());
             }
             if typ != 0x45 { // not an 'E' ioctl → ENOTTY
@@ -438,11 +660,16 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     let mut clk = [0u8; 4];
                     if copy_in(pid, arg_ptr, &mut clk).is_none() { return err_reply(-14); }
                     let f = unsafe { arch_interrupt_save() };
-                    DEVICES.lock()[dev_id].clockid = u32::from_ne_bytes(clk);
+                    STATE.lock().devs[dev_id].clockid_override = u32::from_ne_bytes(clk);
                     unsafe { arch_interrupt_restore(f); }
                     val_reply(0)
                 }
-                0x90 | 0x91 => val_reply(0), // EVIOCGRAB/EVIOCREVOKE → accept
+                // EVIOCGRAB/EVIOCREVOKE → accepted, but deliberately NOT
+                // enforced: a grab that really did cut every other queue off
+                // would take the in-kernel console drain (pop_event) with it,
+                // and nothing can switch back yet. Exclusivity is VT switching's
+                // job, not an ioctl's, until there is a VT to switch to.
+                0x90 | 0x91 => val_reply(0),
                 _ if (0x20..0x40).contains(&nr) => // EVIOCGBIT(ev, len)
                     eviocgbit(dev_id, nr - 0x20, arg_ptr, size, pid),
                 _ if (0x40..0x60).contains(&nr) => // EVIOCGABS(abs)
@@ -457,11 +684,20 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             }
         }
         vfs_server::VFS_POLL => {
-            // POLLIN when any event is queued for this device (raw evdev fds read
-            // whole input_event records, so a pending SYN is readable too). seq
-            // is the push counter for epoll edge emulation.
+            // POLLIN when THIS open has an event queued (raw evdev fds read
+            // whole input_event records, so a pending SYN is readable too), and
+            // `seq` is that queue's own push counter for epoll edge emulation.
+            // Answering from a shared ring made one reader's drain silently
+            // un-ready every other reader.
+            let (open_id, pid) = client_key(msg);
             let f = unsafe { arch_interrupt_save() };
-            let (count, seq) = { let d = &DEVICES.lock()[dev_id]; (d.count, d.seq) };
+            let (count, seq) = {
+                let mut st = STATE.lock();
+                match st.find_or_register(dev_id as u32, open_id, pid) {
+                    Some(i) => (st.clients[i].count, st.clients[i].seq),
+                    None => (0, 0),
+                }
+            };
             unsafe { arch_interrupt_restore(f); }
             let revents: u32 = if count > 0 { 0x1 } else { 0 };
             bump(&C_POLLS, dev_id);
@@ -471,36 +707,63 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             m.data[8..16].copy_from_slice(&seq.to_le_bytes());
             m
         }
+        vfs_server::VFS_CLOSE => {
+            // Sent once the LAST fd on this open is gone, node in slot 0 and the
+            // open cookie in slot 1 (mirrors the DRM server's arm). Retire the
+            // queue so the pool is not held by a process that has exited.
+            let open_id = arg(msg, 1) as u32;
+            if open_id != 0 && open_id != CONSOLE_OPEN_ID {
+                let f = unsafe { arch_interrupt_save() };
+                let mut st = STATE.lock();
+                if let Some(i) = st.find(dev_id as u32, open_id, 0) {
+                    st.clients[i].in_use = false;
+                    st.clients[i].count = 0;
+                }
+                drop(st);
+                unsafe { arch_interrupt_restore(f); }
+            }
+            val_reply(0)
+        }
         _ => err_reply(-38), // ENOSYS
     }
 }
 
+/// Pop one event for the in-kernel console (`read_input_byte`).
+///
+/// The console is a client like any other, holding a permanently registered
+/// queue (`CONSOLE_OPEN_ID`), rather than sharing a ring with userspace. That
+/// is the half of the robbery the census caught from the kernel side:
+/// `conspop=112` of `push=128`, with `deliv=16` left for the compositor.
+///
+/// Its queue is fed only while the keystroke is the line discipline's to have —
+/// see the `console_ok` gate in `push_event`.
 pub fn pop_event(dev_id: u32) -> Option<input_event> {
     if dev_id as usize >= MAX_DEVICES { return None; }
     let f = unsafe { arch_interrupt_save() };
-    let mut devs = DEVICES.lock();
-    let ev = devs[dev_id as usize].pop();
-    drop(devs);
+    let mut st = STATE.lock();
+    let ev = st.find(dev_id, CONSOLE_OPEN_ID, 0).and_then(|i| {
+        let ev = st.clients[i].pop();
+        if ev.is_some() { st.clients[i].deliv += 1; }
+        ev
+    });
+    drop(st);
     unsafe { arch_interrupt_restore(f); }
-    // An event consumed here is consumed by the in-kernel console, NOT by a
-    // userspace reader of /dev/input/eventN — the console and a compositor are
-    // competing consumers of the same ring, and only a separate counter can
-    // tell whose read drained it.
     if ev.is_some() { bump(&C_CONSPOP, dev_id as usize); }
     ev
 }
 
+/// True if the console's queue holds anything at all.
 pub fn has_events(dev_id: u32) -> bool {
     if dev_id as usize >= MAX_DEVICES { return false; }
     let f = unsafe { arch_interrupt_save() };
-    let devs = DEVICES.lock();
-    let count = devs[dev_id as usize].count;
-    drop(devs);
+    let st = STATE.lock();
+    let n = st.find(dev_id, CONSOLE_OPEN_ID, 0).map_or(0, |i| st.clients[i].count);
+    drop(st);
     unsafe { arch_interrupt_restore(f); }
-    count > 0
+    n > 0
 }
 
-/// True if the pending queue holds at least one real key-down/serial event
+/// True if the console's queue holds at least one real key-down/serial event
 /// (`type_ == EV_KEY`, `value == 1` or `2`) rather than only SYN markers or
 /// key-release events. The kernel's `read_input_byte` silently discards
 /// those non-actionable entries by popping and skipping them, so a lone
@@ -512,18 +775,18 @@ pub fn has_events(dev_id: u32) -> bool {
 pub fn has_key_event(dev_id: u32) -> bool {
     if dev_id as usize >= MAX_DEVICES { return false; }
     let f = unsafe { arch_interrupt_save() };
-    let devs = DEVICES.lock();
-    let dev = &devs[dev_id as usize];
-    let mut found = false;
-    for i in 0..dev.count {
-        let idx = (dev.head + i) % MAX_EVENTS;
-        let ev = &dev.events[idx];
-        if ev.type_ == 1 && (ev.value == 1 || ev.value == 2) {
-            found = true;
-            break;
+    let st = STATE.lock();
+    let found = match st.find(dev_id, CONSOLE_OPEN_ID, 0) {
+        Some(i) => {
+            let c = &st.clients[i];
+            (0..c.count).any(|k| {
+                let ev = &c.events[(c.head + k) % CLIENT_EVENTS];
+                ev.type_ == EV_KEY && (ev.value == 1 || ev.value == 2)
+            })
         }
-    }
-    drop(devs);
+        None => false,
+    };
+    drop(st);
     unsafe { arch_interrupt_restore(f); }
     found
 }
@@ -537,11 +800,53 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     // interval between events. A whole-tick stamp gave every event drained in
     // one 10 ms tick an identical timeval and a tv_usec that was always a
     // multiple of 10 000. Read it before masking interrupts and before taking
-    // the device lock: push_event runs in IRQ context and this is two atomic
+    // the state lock: push_event runs in IRQ context and this is two atomic
     // loads and a counter read — no locks and no user memory — but there is
     // still no reason to hold anything across it.
     let now_us = unsafe { arch_monotonic_ns() } / 1_000;
     EVENTS_PUSHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    // Ctrl+Alt+Fn is recognised here rather than in a keyboard driver because
+    // push_event is the one choke point every keyboard source funnels through,
+    // so a future USB HID path is covered without being listed anywhere. It sits
+    // ahead of the broadcast, not inside it: the chord has to be consumed for
+    // EVERY queue at once, or one open still sees the F-key that moved the
+    // display out from under it. Counted as pushed before the return so the
+    // `evpush` witness still accounts for every event that reached the kernel;
+    // it simply reaches no queue.
+    //
+    // `chord_key` is safe from this IRQ context: it does nothing but relaxed
+    // fetch_or/fetch_and/load on CHORD_MODS and ACTIVE_KB_P1 and, on a hit, one
+    // relaxed store in switch_request. No lock, no bounded-at-best loop, no
+    // framebuffer call — the actual switch runs later from task context in
+    // `vt::poll_deferred`. It also applies the K_XLATE gate itself (a raw-mode
+    // VT owner does its own switching, as on Linux), so that rule is NOT
+    // repeated here: one copy of it, in the module that owns the mode.
+    if dev_id == DEV_KEYBOARD as u32 && type_ == EV_KEY
+        && tty_server::vt::chord_key(code, value) {
+        bump(&C_PUSHED, dev_id as usize);
+        return;
+    }
+
+    // Whether this keystroke belongs to the kernel's line discipline. It does
+    // not while a compositor holds the active VT in KD_GRAPHICS, nor while that
+    // VT's owner reads scancodes itself (K_RAW/K_MEDIUMRAW/K_OFF) — in either
+    // case queueing a copy for the console is what makes a shell replay
+    // everything typed into a full-screen client once it exits, which is
+    // measurable: 10 keys injected into two evdev readers came back as
+    // `aaaaaaaaaa` at the prompt afterwards. Two relaxed atomic loads.
+    //
+    // SERIAL IS EXEMPT, and that exemption is load-bearing. The serial line is
+    // this machine's primary console and is not a VT; on Linux it is a separate
+    // tty that the VT keyboard mode has no say over. Here it is unified into
+    // evdev — the UART drain manufactures a synthetic EV_KEY with value == 2 on
+    // the keyboard node for each byte (arch/*/timer.rs `on_tick`, and the
+    // reason `read_input_byte` special-cases that value) — so without this
+    // clause the first compositor to take the display would cut off the only
+    // way to drive a headless boot.
+    let serial_byte = dev_id == DEV_KEYBOARD as u32 && type_ == EV_KEY && value == 2;
+    let console_ok = serial_byte || tty_server::vt::console_keyboard_active();
+
     let ev = input_event {
         time: timeval {
             tv_sec: (now_us / 1_000_000) as i64,
@@ -552,15 +857,11 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
         value,
     };
     let f = unsafe { arch_interrupt_save() };
-    let mut devs = DEVICES.lock();
-    // Sampled BEFORE the push: `push` silently drops the oldest entry when the
-    // ring is full, and a ring that overwrites is the signature of a node
-    // nobody is reading.
-    let full = devs[dev_id as usize].count >= MAX_EVENTS;
-    devs[dev_id as usize].push(ev);
-    drop(devs);
+    // Broadcast, not enqueue-once: on Linux an event goes to every open of the
+    // node and one reader consuming it never removes another's copy.
+    let overflowed = STATE.lock().broadcast(dev_id, ev, console_ok);
     bump(&C_PUSHED, dev_id as usize);
-    if full { bump(&C_DROPPED, dev_id as usize); }
+    if overflowed { bump(&C_DROPPED, dev_id as usize); }
     // A key event is a POLLIN edge for a console reader / evdev poller parked on
     // the poll wait-channel. try_wake (non-blocking) honors IRQ context; the
     // 100 Hz console-read tick is the backstop if RUN_QUEUE is momentarily busy.
@@ -571,9 +872,14 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
 pub fn init(owner_pid: u32) -> Option<u32> {
     let port_id = port::create(owner_pid)?;
     {
-        let mut devs = DEVICES.lock();
-        devs[DEV_KEYBOARD].in_use = true; // event0 (keyboard)
-        devs[DEV_TABLET].in_use = true;   // event1 (virtio-tablet absolute pointer)
+        let mut st = STATE.lock();
+        st.devs[DEV_KEYBOARD].in_use = true; // event0 (keyboard)
+        st.devs[DEV_TABLET].in_use = true;   // event1 (virtio-tablet absolute pointer)
+        // The console drain's queue, registered for the lifetime of the system
+        // on the keyboard node only: `read_input_byte` is the sole caller of
+        // pop_event and only ever asks for device 0, and a tap on the tablet
+        // would just accumulate motion nobody pops.
+        st.find_or_register(DEV_KEYBOARD as u32, CONSOLE_OPEN_ID, 0);
     }
     vfs_server::register_device("/dev/input/event0", port_id, 0, 13, 64);
     vfs_server::register_device("/dev/input/event1", port_id, 1, 13, 65);

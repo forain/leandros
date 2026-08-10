@@ -75,12 +75,77 @@ static EXIT_TEARDOWN_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut())
 
 // ── Exit-code log ────────────────────────────────────────────────────────────
 
+/// How a task died, in the two pieces `wait4`/`waitid` have to report
+/// separately: the value handed to `exit`/`exit_group`, and the signal that
+/// terminated it (0 for a normal exit).
+///
+/// Both are needed because POSIX packs them into *one* `int` in a way that is
+/// not a union of interchangeable values: `128 + signo` is the **shell's**
+/// convention for surfacing a signal death in `$?`, not the kernel's
+/// wait-status encoding. Storing only that (which is what the fatal-signal
+/// path used to do) makes `WIFEXITED` read true and `WIFSIGNALED` read false
+/// for every process killed by a signal — so `brush`'s job control, Rust's
+/// `Command::status()`, and cosmic-term's `waitpid(WNOHANG)` reaper all see a
+/// clean exit with an odd code instead of a kill.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ExitStatus {
+    /// Value passed to `exit`/`exit_group`. For a signal death this is still
+    /// `128 + signo`, kept for the serial exit log and `get_exit_code`; it is
+    /// *not* what `wait_status()` reports in that case.
+    pub code: i32,
+    /// Terminating signal number, or 0 when the task exited normally.
+    pub term_signal: u8,
+}
+
+impl ExitStatus {
+    /// Placeholder for a report that carries no status at all — `waitid`'s
+    /// WNOHANG "no state change" answer, whose `siginfo_t` is zeroed.
+    pub const NONE: ExitStatus = ExitStatus { code: 0, term_signal: 0 };
+
+    /// The POSIX packed wait status written through `wait4`'s `status` pointer.
+    ///
+    /// musl/Linux layout (relibc's `<sys/wait.h>` macros are the consumers):
+    /// a normal termination is `(code & 0xff) << 8` with the low 7 bits zero,
+    /// and a signal death puts `signo` in those low 7 bits — so
+    /// `WIFEXITED(s)` is `(s & 0x7f) == 0` and `WIFSIGNALED(s)` is
+    /// `((s & 0x7f) + 1) >> 1 > 0`.
+    ///
+    /// `WCOREDUMP`'s 0x80 bit is deliberately **never** set: it means "a core
+    /// file was produced", and this kernel has no core-dump path at all. A
+    /// process that reports a dump it did not write sends every consumer
+    /// (shells printing "(core dumped)", CI harnesses collecting artifacts)
+    /// looking for a file that does not exist. Revisit only if core dumping
+    /// is ever implemented.
+    pub fn wait_status(&self) -> i32 {
+        if self.term_signal != 0 {
+            (self.term_signal & 0x7f) as i32
+        } else {
+            (self.code & 0xff) << 8
+        }
+    }
+
+    /// `siginfo_t.si_code` for the SIGCHLD report: `CLD_EXITED` (1) or
+    /// `CLD_KILLED` (2). A `waitid` caller that switches on `si_code` instead
+    /// of decoding the packed status must reach the same verdict as
+    /// `wait_status()` — the two used to disagree, `si_code` being hardcoded
+    /// to CLD_EXITED.
+    pub fn si_code(&self) -> i32 {
+        if self.term_signal != 0 { 2 } else { 1 }
+    }
+
+    /// `siginfo_t.si_status`: the exit code for a normal exit (matching
+    /// `WEXITSTATUS`), the signal number for a kill (matching `WTERMSIG`).
+    pub fn si_status(&self) -> i32 {
+        if self.term_signal != 0 { self.term_signal as i32 } else { self.code & 0xff }
+    }
+}
+
 const EXIT_LOG_LEN: usize = 256;
 
 #[derive(Clone, Copy)]
 struct ExitRecord {
     pid:  Pid,
-    code: i32,
+    status: ExitStatus,
     /// tgid of the parent process, resolved at exit time (the forking thread
     /// may itself die before the child is waited on).
     parent_tgid: Pid,
@@ -95,17 +160,17 @@ struct ExitRecord {
 static EXIT_LOG: Mutex<[Option<ExitRecord>; EXIT_LOG_LEN]> = Mutex::new([const { None }; EXIT_LOG_LEN]);
 static EXIT_LOG_IDX: Mutex<usize> = Mutex::new(0);
 
-fn log_exit(pid: Pid, code: i32, parent_tgid: Pid, pgid: Pid, is_process: bool, consumed: bool) {
+fn log_exit(pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid, is_process: bool, consumed: bool) {
     let mut log = EXIT_LOG.lock();
     let mut idx = EXIT_LOG_IDX.lock();
-    log[*idx] = Some(ExitRecord { pid, code, parent_tgid, pgid, is_process, consumed });
+    log[*idx] = Some(ExitRecord { pid, status, parent_tgid, pgid, is_process, consumed });
     *idx = (*idx + 1) % EXIT_LOG_LEN;
 }
 
 pub fn get_exit_code(pid: Pid) -> Option<i32> {
     let log = EXIT_LOG.lock();
     for entry in log.iter().filter_map(|e| e.as_ref()) {
-        if entry.pid == pid { return Some(entry.code); }
+        if entry.pid == pid { return Some(entry.status.code); }
     }
     None
 }
@@ -1077,9 +1142,11 @@ pub enum WaitSel {
 
 /// One non-blocking wait attempt's outcome.
 pub enum WaitTry {
-    /// A matching child terminated: (pid, exit_code). The child is marked
-    /// reaped and will not be reported again.
-    Reaped(Pid, i32),
+    /// A matching child terminated: (pid, status). The child is marked
+    /// reaped and will not be reported again. Callers encode the status with
+    /// [`ExitStatus::wait_status`] (wait4) or [`ExitStatus::si_code`] /
+    /// [`ExitStatus::si_status`] (waitid) — never by hand.
+    Reaped(Pid, ExitStatus),
     /// Matching children exist but none has terminated yet.
     StillRunning,
     /// The caller has no matching children at all — wait4 returns ECHILD.
@@ -1127,10 +1194,12 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool) -> WaitTry {
 
     // Phase 1: live (or zombie-but-unrecycled) children on the run queue.
     let mut found_live = false;
-    let mut zombie: Option<(usize, Pid, i32)> = None;
+    let mut zombie: Option<(usize, Pid, ExitStatus)> = None;
     for i in 0..runqueue::MAX_TASKS {
-        let (pid, tgid, ppid, pgid, state, code, reported) = match rq.get(i) {
-            Some(t) => (t.pid, t.tgid, t.ppid, t.pgid, t.state, t.exit_code, t.wait_reported),
+        let (pid, tgid, ppid, pgid, state, status, reported) = match rq.get(i) {
+            Some(t) => (t.pid, t.tgid, t.ppid, t.pgid, t.state,
+                        ExitStatus { code: t.exit_code, term_signal: t.term_signal },
+                        t.wait_reported),
             None => continue,
         };
         if pid != tgid { continue; } // threads are not waitable children
@@ -1138,18 +1207,18 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool) -> WaitTry {
         if parent_tgid != caller_tgid || !matches(pid, pgid) { continue; }
         if state == TaskState::Zombie {
             if !reported && zombie.is_none() {
-                zombie = Some((i, pid, code));
+                zombie = Some((i, pid, status));
             }
             // Reported zombies are logically reaped already — skip.
         } else {
             found_live = true;
         }
     }
-    if let Some((i, pid, code)) = zombie {
+    if let Some((i, pid, status)) = zombie {
         if consume {
             if let Some(t) = rq.get_mut(i) { t.wait_reported = true; }
         }
-        return WaitTry::Reaped(pid, code);
+        return WaitTry::Reaped(pid, status);
     }
 
     // Phase 2: already-recycled children in the exit log (still under the
@@ -1161,7 +1230,7 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool) -> WaitTry {
             if entry.parent_tgid != caller_tgid { continue; }
             if matches(entry.pid, entry.pgid) {
                 if consume { entry.consumed = true; }
-                return WaitTry::Reaped(entry.pid, entry.code);
+                return WaitTry::Reaped(entry.pid, entry.status);
             }
         }
     }
@@ -1655,22 +1724,23 @@ fn scheduler_run_loop() -> ! {
                             t.state = TaskState::Ready;
                         }
                         if t.state == TaskState::Zombie {
-                            Some((t.pid, t.exit_code, t.ppid, t.pgid,
-                                  t.pid == t.tgid, t.wait_reported))
+                            Some((t.pid,
+                                  ExitStatus { code: t.exit_code, term_signal: t.term_signal },
+                                  t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported))
                         } else {
                             None
                         }
                     }
                     _ => None,
                 };
-                if let Some((zpid, code, ppid, pgid, is_proc, reported)) = zinfo {
+                if let Some((zpid, status, ppid, pgid, is_proc, reported)) = zinfo {
                     // Log the exit code BEFORE the slot disappears:
                     // a parent polling wait_pid/wait_try on another CPU must
                     // always find the pid either in the queue or in
                     // EXIT_LOG — a gap between remove() and a later
                     // log_exit() makes waitpid return ECHILD.
                     let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
-                    log_exit(zpid, code, parent_tgid, pgid, is_proc, reported);
+                    log_exit(zpid, status, parent_tgid, pgid, is_proc, reported);
                     rq.remove(idx)
                 } else {
                     None
@@ -1740,6 +1810,35 @@ pub fn exit_group(code: i32) -> ! {
         }
     }
     exit(code)
+}
+
+/// Terminate the whole thread group *because of a fatal signal*, recording
+/// `signo` so `wait4`/`waitid` can report `WIFSIGNALED`/`WTERMSIG`.
+///
+/// Every default-action kill must come through here rather than
+/// `exit_group(128 + signo)`. `128 + signo` is the shell's way of showing a
+/// signal death in `$?`; the kernel's wait status has its own encoding (see
+/// [`ExitStatus::wait_status`]), and passing the shell convention off as an
+/// exit code makes `WIFEXITED` true for a killed process. The `128 + signo`
+/// code is still stored, because the serial exit log and `get_exit_code`
+/// have always shown it and it is unambiguous alongside `term_signal`.
+///
+/// The stamping pass runs *before* the group kill: `kill_next_group_member`
+/// can reap and log a sibling immediately, and once logged its `ExitRecord`
+/// is immutable, so a signal recorded afterwards would be lost for exactly
+/// the members that died first.
+pub fn exit_group_signal(signo: u32) -> ! {
+    if signo != 0 && signo <= 64 {
+        let pid = current_pid();
+        let mut rq = RUN_QUEUE.lock();
+        let tgid = rq.find_pid(pid).map(|t| t.tgid).unwrap_or(pid);
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(t) = rq.get_mut(i) {
+                if t.tgid == tgid { t.term_signal = signo as u8; }
+            }
+        }
+    }
+    exit_group(128 + signo as i32)
 }
 
 /// POSIX `execve` thread-group teardown ("de-thread"): terminate **every other
@@ -1908,12 +2007,15 @@ pub fn kill_next_group_member(exit_code: i32) -> GroupKillStep {
         None => return GroupKillStep::Done,
     };
 
-    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported) = {
+    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal) = {
         let t = rq.get_mut(idx).unwrap();
         t.state = TaskState::Zombie;
         t.exit_code = exit_code;
         t.vfork_pending = false; // release a vfork-suspended parent
-        (t.pid, t.on_cpu, t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported)
+        // `term_signal` is NOT set here: `exit_group_signal` stamps it on
+        // every member of the group before this loop starts, so a member
+        // reaped through this path already carries it.
+        (t.pid, t.on_cpu, t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal)
     };
 
     if let Some(cpu) = on_cpu {
@@ -1930,7 +2032,8 @@ pub fn kill_next_group_member(exit_code: i32) -> GroupKillStep {
     // it's safe to reap right now — mirrors scheduler_run_loop's own
     // post-dispatch reap exactly (log, remove, hook, free kernel stack).
     let parent_tgid = rq.find_pid(tppid).map(|p| p.tgid).unwrap_or(tppid);
-    log_exit(tpid, exit_code, parent_tgid, tpgid, t_is_proc, t_reported);
+    log_exit(tpid, ExitStatus { code: exit_code, term_signal: t_term_signal },
+             parent_tgid, tpgid, t_is_proc, t_reported);
     let reaped = rq.remove(idx);
     drop(rq);
 

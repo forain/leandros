@@ -154,6 +154,12 @@ pub struct Task {
     pub address_space: Option<alloc::sync::Arc<AddressSpace>>,
     /// Exit status set by `exit()`.  Valid only when `state == Zombie`.
     pub exit_code:    i32,
+    /// Signal that terminated this task, or 0 if it exited normally. Stamped
+    /// on every member of the thread group by `exit_group_signal` before the
+    /// group kill runs; read back by `wait_scan` and the reap paths so
+    /// `wait4` can report `WIFSIGNALED`/`WTERMSIG` instead of a normal exit
+    /// with the shell's `128 + signo` code. Valid only when `state == Zombie`.
+    pub term_signal:  u8,
     /// Dedicated reply port for sys_call.  Allocated at spawn; freed on exit.
     /// `u32::MAX` = not yet allocated.
     pub reply_port:   u32,
@@ -302,6 +308,7 @@ impl Task {
             blocked_futex: 0,
             address_space: None,
             exit_code: 0,
+            term_signal: 0,
             reply_port: u32::MAX,
             ppid: 0,
             tgid: pid,
@@ -526,6 +533,9 @@ impl Task {
         let exit_code_ptr = (dest as usize + core::mem::offset_of!(Task, exit_code)) as *mut i32;
         core::ptr::write_volatile(exit_code_ptr, 0);
 
+        let term_signal_ptr = (dest as usize + core::mem::offset_of!(Task, term_signal)) as *mut u8;
+        core::ptr::write_volatile(term_signal_ptr, 0);
+
         let reply_port_ptr = (dest as usize + core::mem::offset_of!(Task, reply_port)) as *mut u32;
         core::ptr::write_volatile(reply_port_ptr, u32::MAX);
 
@@ -646,6 +656,7 @@ impl Task {
             blocked_futex: 0,
             address_space: None,
             exit_code: 0,
+            term_signal: 0,
             reply_port: u32::MAX,
             ppid: 0,
             tgid: pid,

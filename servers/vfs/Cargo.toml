@@ -8,4 +8,7 @@ ipc        = { path = "../../ipc" }
 sched      = { path = "../../sched" }
 mm         = { path = "../../mm" }
 xattr      = { path = "../xattr" }
+# The PTY pool + line discipline. No cycle: tty-server depends only on
+# ipc/sched/spin, never on the VFS.
+tty-server = { path = "../tty" }
 spin.workspace = true

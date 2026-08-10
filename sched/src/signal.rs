@@ -252,7 +252,13 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                 // TODO: SIGSTOP's true default action is "stop the process",
                 // not "terminate" — it lands here because there is no stopped
                 // task state yet. Revisit when job control is implemented.
-                super::exit_group(128 + sig as i32);
+                //
+                // `exit_group_signal`, not `exit_group(128 + sig)`: the latter
+                // reports the death as a *normal exit* with a strange code, so
+                // every WIFSIGNALED/WTERMSIG consumer (brush's job control,
+                // Rust's Command::status, cosmic-term's SIGCHLD reaper) misses
+                // that the process was killed at all.
+                super::exit_group_signal(sig);
             }
             1 => {
                 // SIG_IGN — skip, check next.
@@ -279,7 +285,7 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
 
                 if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask, action.get_flags()) {
                     // Frame write failed (stack fault) — deliver SIGSEGV.
-                    super::exit_group(128 + SIGSEGV as i32);
+                    super::exit_group_signal(SIGSEGV);
                 }
 
                 // One signal delivered; re-check for more on the next syscall return.
@@ -683,7 +689,7 @@ mod aarch64 {
         let ok = super::super::with_address_space(pid, |as_| {
             as_.read_user_buf(sigframe_virt, &mut buf)
         }).unwrap_or(false);
-        if !ok { super::super::exit_group(128 + 11); }
+        if !ok { super::super::exit_group_signal(super::SIGSEGV); }
 
         // Restore GPRs from uc_mcontext.
         for i in 0..31 {
@@ -925,7 +931,7 @@ mod x86_64 {
         let ok = super::super::with_address_space(pid, |as_| {
             as_.read_user_buf(sigframe_virt, &mut buf)
         }).unwrap_or(false);
-        if !ok { super::super::exit_group(128 + 11); }
+        if !ok { super::super::exit_group_signal(super::SIGSEGV); }
 
         let rreg = |buf: &alloc::vec::Vec<u8>, i: usize| -> u64 {
             let o = greg_off(i);

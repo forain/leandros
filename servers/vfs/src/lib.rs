@@ -901,6 +901,15 @@ pub enum VnodeKind {
     DevZero,
     /// One end of a pipe.
     Pipe { ring: usize, is_write: bool },
+    /// One end of a pseudo-terminal pair (`/dev/ptmx` or `/dev/pts/N`).
+    ///
+    /// Deliberately shaped like `Pipe`: the pool, the rings and the whole
+    /// termios line discipline live in `tty_server::pty`, and this variant
+    /// exists only so a pty end is an ordinary fd-table entry. Every fd
+    /// behaviour a pipe already has — dup2, fork inheritance, O_NONBLOCK,
+    /// epoll edges, SCM_RIGHTS — therefore applies unchanged, which is why
+    /// each `VnodeKind::Pipe` arm in this file has a `Pty` neighbour.
+    Pty { pair: u16, is_master: bool },
     /// Writable entry in the TmpFiles pool (idx into TMP_FILES).
     TmpFile { idx: usize, pos: usize, writable: bool },
     /// eventfd: counter value; read returns counter as u64, write adds to it.
@@ -930,6 +939,17 @@ pub enum VnodeKind {
     /// delivers events — keeps a config-watch source quiet in an event loop.
     /// `next_wd` hands out monotonic watch descriptors (≥1).
     Inotify { next_wd: u32 },
+    /// `/dev/tty0` .. `/dev/tty6` — a virtual console (`tty_server::vt`).
+    ///
+    /// `vt` is 0 for `/dev/tty0`, which names *the active VT* rather than a
+    /// fixed one, and 1..=6 for `/dev/tty1`../dev/tty6`.
+    ///
+    /// `seen` is the active VT number this **open** last observed, and it is
+    /// the whole of the `/dev/tty0` change-notification state (see
+    /// [`fd_vt_number`]). It lives in the fd entry rather than in a table
+    /// keyed by (pid, fd) because that is what makes two openers independent
+    /// for free — which is the property the notification exists to provide.
+    DevVt { vt: u8, seen: u8 },
 }
 
 // `VnodeKind` is embedded in `FdEntry`, and the fd tables are a static
@@ -956,12 +976,23 @@ pub fn fd_nonblock(pid: u32, fd: usize) -> bool {
     false
 }
 
-/// True when `fd` is a `/dev/stdin|stdout|stderr` proxy whose target is the
-/// raw console (untracked fd 0-2, or itself another console proxy). The
+/// True when `fd`'s reads and writes are the machine console's: a
+/// `/dev/stdin|stdout|stderr` proxy whose target is the raw console (untracked
+/// fd 0-2, or itself another console proxy), or a virtual console node. The
 /// kernel's console fast paths treat such fds exactly like bare 0/1/2 —
 /// without this, a dup'd stdio fd dup2'd back onto 0/1/2 (command_fds'
 /// identity mappings) would recurse inside the VFS instead of reaching the
 /// serial console.
+///
+/// `/dev/ttyN` is included because that is the only thing that makes the
+/// `DevVt` read/write arms below reachable in the way `DevStdio { target_fd:
+/// 0 }` is: fd 0 is untracked for a console session, so a VFS-side delegation
+/// to it answers EBADF, and only the kernel's fast path actually reaches the
+/// console. Callers that must distinguish a VT from a plain console proxy —
+/// the ioctl router, and `/dev/tty0`'s read/poll, which are the VT-change
+/// notification rather than console input — pair this with [`fd_vt_number`];
+/// that costs a second FD_TABLES pass only on fds for which this already
+/// answered true, which is never a hot path.
 pub fn fd_is_console_stdio(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid);
     if fd >= MAX_FDS { return false; }
@@ -976,6 +1007,14 @@ pub fn fd_is_console_stdio(pid: u32, fd: usize) -> bool {
                 if target_fd == cur { return true; }
                 cur = target_fd;
             }
+            // A virtual console IS the console: writes land on the active VT
+            // (the mirror `vt::console_out` feeds), reads take console input.
+            VnodeKind::DevVt { .. } => return true,
+            // Everything else — including a `Pty` on fd 0/1/2, which is a
+            // terminal but emphatically NOT *this* terminal. Answering true
+            // for one would hand every read and write on a shell's pty stdio
+            // to the kernel's serial fast path, and the pty would never see a
+            // byte.
             _ => return false,
         }
     }
@@ -1221,6 +1260,14 @@ fn pipe_ref_inc(kind: &VnodeKind) {
             let mut rings = PIPE_RINGS.lock();
             if *is_write { rings[*ring].writers += 1; } else { rings[*ring].readers += 1; }
         }
+        // A pty end is refcounted for exactly the reason a pipe end is: the
+        // last master fd closing is the hangup that SIGHUPs the slave's job,
+        // and the last slave fd closing is the EOF a terminal emulator reads
+        // as "my child exited". A fork that did not bump this would fire both
+        // the moment the parent closed its copy.
+        VnodeKind::Pty { pair, is_master } => {
+            tty_server::pty::add_ref(*pair as usize, *is_master);
+        }
         // eventfd/timerfd slots are pooled and shared across dup'd fds; bump the
         // slot refcount so the pool entry survives until the last fd closes.
         VnodeKind::EventFd { slot } => { EVENTFD_REFS.lock()[*slot] += 1; }
@@ -1259,6 +1306,9 @@ fn pipe_ref_dec(kind: &VnodeKind) {
     match kind {
         VnodeKind::Pipe { ring, is_write } => {
             pipe_drop_ref(&mut PIPE_RINGS.lock(), *ring, *is_write);
+        }
+        VnodeKind::Pty { pair, is_master } => {
+            tty_server::pty::drop_ref(*pair as usize, *is_master);
         }
         // Symmetric with pipe_ref_inc: a dup2/dup3 that overwrites an open
         // eventfd/timerfd fd releases its slot reference; free the slot only
@@ -1642,6 +1692,13 @@ use core::sync::atomic;
 /// Distinct from the pipe (0x1000_0000) and tmpfs (0x2000_0000) ranges.
 pub const CONSOLE_INO: u64 = 0x3000_0000;
 
+/// Inode number of one end of pty `pair`, shared by `fstat` on the fd and
+/// `stat` on `/dev/ptmx` / `/dev/pts/N` — `ttyname()` compares the two and
+/// treats any disagreement as "not a tty".
+fn pty_ino(pair: u16, is_master: bool) -> u64 {
+    0x4000_0000 + (pair as u64) * 2 + if is_master { 1 } else { 0 }
+}
+
 struct RamEntry { path: &'static [u8], data: &'static [u8] }
 
 static RAMFS: &[RamEntry] = &[
@@ -1659,7 +1716,25 @@ static RAMFS: &[RamEntry] = &[
     // without a table entry it did not exist for `access`, `ls /dev` or the
     // RamFS half of `stat` — and it is the path `ttyname()` now reports.
     RamEntry { path: b"/dev/console", data: b"" },
+    // The virtual consoles. `open` is intercepted below (each maps to a
+    // `DevVt` vnode); the entries are what make `ls /dev`, `access` and
+    // `stat` agree they exist — logind/libseat shims stat /dev/tty0 before
+    // they will admit the system has VTs at all, and a missing node reads as
+    // "seatd is the only option".
+    RamEntry { path: b"/dev/tty0",    data: b"" },
+    RamEntry { path: b"/dev/tty1",    data: b"" },
+    RamEntry { path: b"/dev/tty2",    data: b"" },
+    RamEntry { path: b"/dev/tty3",    data: b"" },
+    RamEntry { path: b"/dev/tty4",    data: b"" },
+    RamEntry { path: b"/dev/tty5",    data: b"" },
+    RamEntry { path: b"/dev/tty6",    data: b"" },
     RamEntry { path: b"/dev/fb0",     data: b"" },
+    // The pty multiplexor. `open` is intercepted (it allocates a pair); the
+    // entry is what makes `access("/dev/ptmx", W_OK)`, `stat` and `ls /dev`
+    // agree that it exists — openpty(3) and posix_openpt(3) both stat it
+    // first, and a missing node is how a terminal emulator concludes the
+    // system has no ptys at all.
+    RamEntry { path: b"/dev/ptmx",    data: b"" },
     // /etc
     RamEntry { path: b"/etc/motd",
                data: b"Welcome to Leandros!\nType 'help' for available commands.\n" },
@@ -1725,6 +1800,12 @@ static RAMFS_DIRS: &[&[u8]] = &[
     // is a live behavioural change in the compositor input path and no part of
     // this.
     b"/dev/dri",
+    // The pts directory. Its contents are synthesised from the live pty pool
+    // (see the getdents pass below); it is listed here so that `open`, `stat`
+    // and `getdents64` agree it is a directory — `/dev/pts/N` resolution in
+    // `handle_open` does not depend on it, but ttyname()'s readlink+stat
+    // cross-check and `ls /dev/pts` do.
+    b"/dev/pts",
     b"/run",
     b"/run/user",
     b"/mnt",
@@ -2164,6 +2245,93 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
 /// `mkdir` with its own uid/gid and 0700 mode. Root's `/run/user/0` is seeded
 /// into the pool by `init()` so it exists from boot.
 static TMPFS_ROOTS: &[&[u8]] = &[b"/tmp", b"/dev/shm", b"/run/user"];
+
+/// The `N` in `/dev/pts/N`, if `path` names an allocated pty slave.
+///
+/// Returns `None` for `/dev/pts` itself (the directory), for a non-numeric or
+/// multi-component tail, and for a number no live master owns — so the caller
+/// falls through to the ordinary ENOENT rather than inventing a device.
+fn pts_number(path: &[u8]) -> Option<usize> {
+    let rest = path.strip_prefix(b"/dev/pts/".as_slice())?;
+    if rest.is_empty() || rest.len() > 3 { return None; }
+    let mut n = 0usize;
+    for &c in rest {
+        if !c.is_ascii_digit() { return None; }
+        n = n * 10 + (c - b'0') as usize;
+    }
+    if tty_server::pty::exists(n) { Some(n) } else { None }
+}
+
+/// The `N` in `/dev/ttyN`, if `path` names a virtual console.
+///
+/// `/dev/tty` (no digit) is deliberately NOT matched: it is the controlling
+/// terminal, resolved through `pty::ctty_for_sid` by the caller, and folding it
+/// in here would put every shell running under `cosmic-term` back on the
+/// framebuffer console.
+fn vt_number(path: &[u8]) -> Option<u8> {
+    let rest = path.strip_prefix(b"/dev/tty".as_slice())?;
+    match rest {
+        [d @ b'0'..=b'6'] => Some(d - b'0'),
+        _ => None,
+    }
+}
+
+/// Inode numbers of the virtual consoles: `VT_INO_BASE + N` for `/dev/ttyN`.
+///
+/// Distinct from the pipe (0x1000_0000), tmpfs (0x2000_0000), console
+/// (0x3000_0000) and pty (0x4000_0000) ranges, and distinct from `CONSOLE_INO`
+/// in particular: `/dev/tty2` and `/dev/console` are different devices, and
+/// `ttyname()` on a VT fd must read back `/dev/tty2`, not the console.
+const VT_INO_BASE: u64 = 0x5000_0000;
+
+/// VT number an fd names: 0 for /dev/tty0 ("the active VT"), 1..=6 for
+/// /dev/tty1../dev/tty6. None for anything that is not a VT node.
+///
+/// Used by `sys_ioctl` to route the VT/KD ioctl set to `tty_server::vt`, and by
+/// the kernel's console fast paths to tell `/dev/tty0` (whose read and poll are
+/// the change notification below) from `/dev/tty1..6` (which are the console).
+///
+/// # The `/dev/tty0` VT-change notification
+///
+/// An open `/dev/tty0` is a **pollable edge source for "the active VT
+/// changed"**, which is the one thing a libseat/logind shim's `get_fd()` +
+/// `dispatch()` contract cannot be built without. The contract, exactly:
+///
+/// * `poll`/`epoll` report `POLLIN` while `vt::active()` differs from the VT
+///   this open last saw. `POLLOUT` is always set (writes go to the console and
+///   never block).
+/// * `read()` with `count >= 1` consumes the edge and returns **one byte**
+///   holding the new active VT number (1..=6). It writes exactly one byte
+///   regardless of `count`.
+/// * `read()` with no edge pending returns `EAGAIN`. A blocking fd therefore
+///   blocks until the next switch; an `O_NONBLOCK` fd (what an event loop
+///   wants) sees `EAGAIN` immediately, so drain-until-EAGAIN is correct.
+/// * The state is **per open**: two `open("/dev/tty0")` calls each get their
+///   own notification, and neither consumes the other's. `dup`/`fork` copies
+///   carry a copy of the state rather than sharing one — a deliberate
+///   divergence from Linux's shared `struct file`, and the safe direction (an
+///   extra notification, never a missing one).
+/// * The epoll edge-seq is the **active VT number itself**, not a monotonic
+///   counter. `sys_epoll_wait` compares the seq for *inequality*, and the
+///   readable condition is exactly "active differs from what this open last
+///   saw", so the two agree by construction: a switch away and back to the same
+///   VT between two polls is genuinely no event for this fd, and both the seq
+///   and the level condition say so.
+///
+/// This is a LeandrOS-specific channel — Linux delivers VT changes by signal
+/// through `VT_SETMODE(VT_PROCESS)`, which we also implement (`vt::ioctl`), but
+/// which cannot be waited on with a file descriptor.
+pub fn fd_vt_number(pid: u32, fd: usize) -> Option<usize> {
+    let pid = sched::tgid_of(pid); // fd tables are per-process
+    if fd >= MAX_FDS { return None; }
+    let mut tbls = FD_TABLES.lock();
+    let tbl = find_tbl(pid, &mut *tbls)?;
+    if !tbl.fds[fd].in_use { return None; }
+    match tbl.fds[fd].kind {
+        VnodeKind::DevVt { vt, .. } => Some(vt as usize),
+        _ => None,
+    }
+}
 
 /// True when `path` names a tmpfs mount root exactly.
 fn is_tmpfs_root(path: &[u8]) -> bool {
@@ -3019,14 +3187,54 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             VnodeKind::DevStdio { target_fd: 1 }
         } else if lookup_path == b"/dev/stderr" {
             VnodeKind::DevStdio { target_fd: 2 }
-        } else if lookup_path == b"/dev/tty" || lookup_path == b"/dev/console" {
-            // The controlling terminal: a console proxy, exactly like a
-            // dup'd stdin (crossterm opens this when it decides stdin isn't
-            // usable; a plain empty RamFile here returned instant EOF and
-            // starved its input reader).
+        } else if lookup_path == b"/dev/tty" {
+            // The caller's *controlling* terminal — which for anything running
+            // under a terminal emulator is its pty slave, not the machine
+            // console. Resolving it to the console unconditionally is what a
+            // shell on a pty cannot survive: crossterm (reedline, brush) opens
+            // /dev/tty for its raw-mode handle and writes the ESC[6n cursor
+            // query there, so the prompt was painted on the framebuffer while
+            // the emulator holding the master saw nothing.
+            //
+            // No ctty (a daemon, or a console session) still means the console
+            // proxy: same object a dup'd stdin gives, and the reason a plain
+            // empty RamFile here used to return instant EOF and starve
+            // crossterm's input reader.
+            match tty_server::pty::ctty_for_sid(sched::current_sid()) {
+                Some(n) => {
+                    if let Err(e) = tty_server::pty::slave_open(n) { return err_reply(e); }
+                    VnodeKind::Pty { pair: n as u16, is_master: false }
+                }
+                None => VnodeKind::DevStdio { target_fd: 0 },
+            }
+        } else if lookup_path == b"/dev/console" {
+            // Always the machine console, never a pty: /dev/console is the
+            // system's console device, not "whatever terminal I happen to be
+            // on". init and the getty write here on purpose.
             VnodeKind::DevStdio { target_fd: 0 }
+        } else if let Some(vt) = vt_number(lookup_path) {
+            // A virtual console. `seen` is snapshotted at open so a fresh
+            // /dev/tty0 is NOT immediately notification-readable: the contract
+            // is "the active VT changed since *this* open last looked", and an
+            // open that has never looked has to start from the truth on screen,
+            // or every consumer would process one phantom switch at start-up.
+            VnodeKind::DevVt { vt, seen: tty_server::vt::active() as u8 }
         } else if lookup_path == b"/dev/fb0" {
             VnodeKind::DevFb { pos: 0 }
+        } else if lookup_path == b"/dev/ptmx" {
+            // Every open of the multiplexor is a *new* pair, not a new handle
+            // on a shared object — that is the whole ptmx contract, and what
+            // TIOCGPTN then reports.
+            match tty_server::pty::alloc() {
+                Some(pair) => VnodeKind::Pty { pair: pair as u16, is_master: true },
+                None => return err_reply(-24), // EMFILE — pool exhausted
+            }
+        } else if let Some(n) = pts_number(lookup_path) {
+            // The slave half. `slave_open` enforces the TIOCSPTLCK lock and the
+            // master's existence, so a mis-sequenced open (no `unlockpt`) fails
+            // loudly instead of quietly working.
+            if let Err(e) = tty_server::pty::slave_open(n) { return err_reply(e); }
+            VnodeKind::Pty { pair: n as u16, is_master: false }
         } else if is_tmp_path(path) && !is_tmpfs_root(path) {
             // ── Writable tmpfs file (/tmp, /dev/shm, /run/user) ──────────────────
             let writable = flags & (O_WRONLY | O_RDWR) != 0;
@@ -3259,6 +3467,13 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 VnodeKind::DynamicDevice { port, dev_id, open_id } => {
                     device_close(port, dev_id, open_id);
                 }
+                // Same shape as the DynamicDevice arm: `pty::alloc`/`slave_open`
+                // above already took the reference this fd was going to own, and
+                // nothing else will ever release it. For a master that leaks the
+                // whole pair permanently (alloc sets master_refs = 1).
+                VnodeKind::Pty { pair, is_master } => {
+                    tty_server::pty::drop_ref(pair as usize, is_master);
+                }
                 // A mount server allocated a real open-file slot for this
                 // open, and that slot is now unreachable: no fd names it, so
                 // no close will ever come. The arm was missing, and the leak
@@ -3318,6 +3533,35 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // Re-enter as read on the target fd.
             handle_read(pid, tfd, buf_ptr, count)
         }
+        VnodeKind::DevVt { vt, seen } => {
+            if *vt == 0 {
+                // /dev/tty0 is the VT-change notification, not console input —
+                // the full contract is on `fd_vt_number`. EAGAIN when nothing
+                // changed makes a blocking fd block (the kernel's VFS_READ
+                // retry loop) and a non-blocking one drain to EAGAIN, which is
+                // what an event loop registered on this fd needs.
+                let cur = tty_server::vt::active() as u8;
+                if cur == *seen { drop(tbls); return err_reply(-11); } // EAGAIN
+                *seen = cur;
+                drop(tbls);
+                // One byte, whatever `count` was, and only after the fd table
+                // lock is released: a demand-paging fault on the user buffer
+                // under it re-enters the scheduler (the 82d0cc3 hazard).
+                unsafe { buf.write(cur); }
+                return val_reply(1);
+            }
+            // /dev/tty1../dev/tty6 read the console, exactly as
+            // `DevStdio { target_fd: 0 }` does. Normally unreachable — the
+            // kernel's console fast path claims these fds first
+            // (`fd_is_console_stdio`) — so this is the same EBADF fallback a
+            // /dev/console fd gets when fd 0 is untracked. The proxy exclusion
+            // is what stops `dup2(vtfd, 0)` from recursing forever.
+            let target_ok = tbl.fds[0].in_use && !matches!(tbl.fds[0].kind,
+                VnodeKind::DevStdio { .. } | VnodeKind::DevVt { .. });
+            drop(tbls);
+            if !target_ok { return err_reply(-9); }
+            handle_read(pid, 0, buf_ptr, count)
+        }
         VnodeKind::DevFb { pos } => {
             let base = FB_BASE.load(atomic::Ordering::SeqCst);
             if base == 0 { return err_reply(-19); } // ENODEV
@@ -3340,9 +3584,10 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             *pos = cur + n;
             val_reply(n as u64)
         }
-        VnodeKind::DynamicDevice { port, dev_id, .. } => {
+        VnodeKind::DynamicDevice { port, dev_id, open_id } => {
             let port = *port;
             let dev_id = *dev_id;
+            let open_id = *open_id;
             drop(tbls);
             let mut proxy_msg = Message::empty();
             proxy_msg.tag = VFS_READ;
@@ -3350,6 +3595,9 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             proxy_msg.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
             proxy_msg.data[16..24].copy_from_slice(&(count as u64).to_le_bytes());
             proxy_msg.data[24..32].copy_from_slice(&(pid as u64).to_le_bytes());
+            // Slot 4: which *open* this read is on — the same cookie handle_ioctl
+            // already forwards. evdev keys its per-open event queue off it.
+            proxy_msg.data[32..40].copy_from_slice(&(open_id as u64).to_le_bytes());
             match call_port(port, proxy_msg) {
                 reply => reply,
             }
@@ -3389,6 +3637,18 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // A writer parked on a full pipe now has POLLOUT space freed.
             if n > 0 { sched::wake_poll(); }
             val_reply(n as u64)
+        }
+        VnodeKind::Pty { pair, is_master } => {
+            let (p, m) = (*pair as usize, *is_master);
+            drop(tbls); // the pty pool lock is taken inside; never nest it under FD_TABLES
+            // Both directions answer -EAGAIN for "nothing yet" and 0 for a real
+            // end-of-input, which is exactly the contract the pipe arm above
+            // has with sys_read's retry loop.
+            let n = unsafe {
+                if m { tty_server::pty::master_read(p, buf, count) }
+                else { tty_server::pty::slave_read(p, buf, count) }
+            };
+            make_reply(n as i64)
         }
         VnodeKind::TmpFile { idx, pos, .. } => {
             let idx = *idx;
@@ -3504,6 +3764,18 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
     match &mut tbl.fds[fd].kind {
         VnodeKind::DevUrandom | VnodeKind::DevNull | VnodeKind::DevZero =>
             val_reply(count as u64),
+        VnodeKind::Pty { pair, is_master } => {
+            let (p, m) = (*pair as usize, *is_master);
+            drop(tbls);
+            // Which direction a write takes is the whole difference between the
+            // two ends: a master write runs the *input* discipline (ISIG,
+            // canonical editing, echo), a slave write only OPOST.
+            let n = unsafe {
+                if m { tty_server::pty::master_write(p, buf, count) }
+                else { tty_server::pty::slave_write(p, buf, count) }
+            };
+            make_reply(n as i64)
+        }
         VnodeKind::Pipe { ring, is_write: true } => {
             let ring_idx = *ring;
             drop(tbls);
@@ -3614,6 +3886,21 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             if !target_tracked || target_is_proxy { return err_reply(-9); }
             handle_write(pid, tfd, buf_ptr, count)
         }
+        VnodeKind::DevVt { .. } => {
+            // Every /dev/ttyN write is a console write, including one to a VT
+            // that is not on screen — a deliberate, documented divergence.
+            // `vt::console_out` mirrors the console byte stream to the ACTIVE
+            // screen and there is no per-VT text sink beneath it, so the honest
+            // behaviour is "this goes wherever console output goes" rather than
+            // a silent discard that would look like it had been remembered.
+            // Same delegation as `DevStdio { target_fd: 0 }`; the kernel's fast
+            // path normally claims these fds before the VFS sees them.
+            let target_ok = tbl.fds[0].in_use && !matches!(tbl.fds[0].kind,
+                VnodeKind::DevStdio { .. } | VnodeKind::DevVt { .. });
+            drop(tbls);
+            if !target_ok { return err_reply(-9); }
+            handle_write(pid, 0, buf_ptr, count)
+        }
         VnodeKind::DevFb { pos } => {
             let base = FB_BASE.load(atomic::Ordering::SeqCst);
             if base == 0 { return err_reply(-19); } // ENODEV
@@ -3689,6 +3976,9 @@ fn handle_close(pid: u32, fd: usize) -> Message {
     match kind {
         VnodeKind::Pipe { ring, is_write } => {
             pipe_drop_ref(&mut PIPE_RINGS.lock(), ring, is_write);
+        }
+        VnodeKind::Pty { pair, is_master } => {
+            tty_server::pty::drop_ref(pair as usize, is_master);
         }
         VnodeKind::EventFd { slot } => {
             // Refcounted: an eventfd is dup-able, so free the pool slot only when
@@ -4064,6 +4354,9 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
     match kind {
         VnodeKind::Pipe { ring, is_write } => {
             pipe_drop_ref(&mut PIPE_RINGS.lock(), ring, is_write);
+        }
+        VnodeKind::Pty { pair, is_master } => {
+            tty_server::pty::drop_ref(pair as usize, is_master);
         }
         VnodeKind::EventFd { slot } => {
             // Only free the slot when the LAST dup of this eventfd closes;
@@ -4501,6 +4794,64 @@ fn handle_alloc_fd(pid: u32, oldfd: usize) -> Message {
     dup_fd_min(pid, oldfd, 3, false)
 }
 
+/// `TIOCGPTPEER(master_fd, open_flags)` — open the slave of the pair `master_fd`
+/// names, without going through `/dev/pts/N`.
+///
+/// It lives here rather than in `pty::ioctl` because it is not really an ioctl:
+/// it *allocates a descriptor*, and descriptors are this crate's business. The
+/// pty pool cannot hand one out.
+///
+/// This is not an optional nicety. `rustix::pty::openpt` tries `TIOCGPTPEER`
+/// **first** and only falls back to `TIOCGPTN` + `open("/dev/pts/N")` on ENOSYS
+/// or EPERM — any other errno (our generic ENOTTY for an unknown command, for
+/// instance) propagates and the pty open fails outright. cosmic-term reaches
+/// the kernel through rustix's raw-syscall backend rather than through musl, so
+/// this path, not the libc one, is what opening a terminal tab actually runs.
+///
+/// Racing the master closed between the ownership check and `slave_open` is
+/// handled by `slave_open` itself, which refuses a pair with no live master.
+pub fn pty_get_peer(pid: u32, master_fd: usize, open_flags: u32) -> isize {
+    let pid = sched::tgid_of(pid);
+    let pair = {
+        let mut tbls = FD_TABLES.lock();
+        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return -9 };
+        if master_fd >= MAX_FDS || !tbl.fds[master_fd].in_use { return -9; }
+        match tbl.fds[master_fd].kind {
+            VnodeKind::Pty { pair, is_master: true } => pair as usize,
+            // ENOTTY on anything else, including the slave end: Linux only
+            // answers this on a ptmx fd.
+            _ => return -25,
+        }
+    };
+    if let Err(e) = tty_server::pty::slave_open(pair) { return e as isize; }
+    let newfd = {
+        let mut tbls = FD_TABLES.lock();
+        let slot = get_or_create(pid, &mut *tbls).and_then(|tbl| {
+            tbl.alloc_fd().map(|f| {
+                tbl.fds[f] = FdEntry {
+                    kind: VnodeKind::Pty { pair: pair as u16, is_master: false },
+                    // Only the two flags the caller can meaningfully ask for
+                    // here; the access mode is implicit (a pty end is always
+                    // read-write) and the rest are creation flags.
+                    flags: open_flags & (O_CLOEXEC | O_NONBLOCK_FL),
+                    in_use: true,
+                };
+                f
+            })
+        });
+        drop(tbls);
+        match slot {
+            Some(f) => f,
+            None => {
+                // The reference `slave_open` just took has no fd to own it.
+                tty_server::pty::drop_ref(pair, false);
+                return -24; // EMFILE
+            }
+        }
+    };
+    newfd as isize
+}
+
 /// Store the getdents64 cursor back into a directory fd without changing what
 /// kind of directory it is. A tmpfs directory is a `TmpFile` vnode whose pool
 /// slot carries `is_dir`; overwriting it with a `RamFile` (as the enumeration
@@ -4621,6 +4972,37 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
             if virtual_idx >= pos {
                 let name = if is_root { &entry.path[1..] } else { &entry.path[dir_len+1..] };
                 if let Some(r) = write_dirent(buf, off, count, virtual_idx as u64 + 200, name, 8) {
+                    off += r; pos += 1;
+                } else {
+                    set_dir_pos(&mut tbl.fds[fd].kind, pos);
+                    return val_reply(off as u64);
+                }
+            }
+            virtual_idx += 1;
+        }
+    }
+
+    // Live pty slaves (/dev/pts). The pool is the only source of truth here —
+    // there is no static table to walk — and `ls /dev/pts` is how a user (and
+    // ttyname's fallback scan) finds which pairs exist.
+    if dir_path == b"/dev/pts" {
+        // Snapshot under the pool lock, then emit: write_dirent touches user
+        // memory, which can demand-page, and a fault taken while holding a
+        // server spinlock re-enters the scheduler (see the 82d0cc3 rule).
+        let mut live = [false; tty_server::pty::MAX_PTYS];
+        tty_server::pty::each_allocated(|n| { if n < live.len() { live[n] = true; } });
+        for (n, &alive) in live.iter().enumerate() {
+            if !alive { continue; }
+            if virtual_idx >= pos {
+                // Two decimal digits cover MAX_PTYS with room to spare.
+                let mut name = [0u8; 3];
+                let nlen = if n < 10 {
+                    name[0] = b'0' + n as u8; 1
+                } else {
+                    name[0] = b'0' + (n / 10) as u8; name[1] = b'0' + (n % 10) as u8; 2
+                };
+                if let Some(r) = write_dirent(buf, off, count, pty_ino(n as u16, false),
+                                              &name[..nlen], 2 /* DT_CHR */) {
                     off += r; pos += 1;
                 } else {
                     set_dir_pos(&mut tbl.fds[fd].kind, pos);
@@ -5182,6 +5564,10 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
 
     let bytes_avail: i32 = match &tbl.fds[fd].kind {
         VnodeKind::Pipe { ring, is_write: false } => { let r = *ring; drop(tbls); PIPE_RINGS.lock()[r].count as i32 }
+        VnodeKind::Pty { pair, is_master } => {
+            let (p, m) = (*pair as usize, *is_master); drop(tbls);
+            tty_server::pty::readable_bytes(p, m) as i32
+        }
         VnodeKind::RamFile { data, pos, is_dir } => {
             if *is_dir { return err_reply(-25); } // ENOTTY — no readable byte stream
             (data.len().saturating_sub(*pos)) as i32
@@ -5237,6 +5623,15 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             };
             (ev, ring.seq)
         }
+        // The pty pool owns the only honest answer here: `poll_mask` mirrors
+        // `master_read`/`slave_read` case for case, including canonical mode's
+        // "a complete line is queued" rule, so an epoll consumer is never woken
+        // for a readability the following read denies.
+        VnodeKind::Pty { pair, is_master } => {
+            let (p, m) = (*pair as usize, *is_master);
+            drop(tbls);
+            (tty_server::pty::poll_mask(p, m), tty_server::pty::seq(p))
+        }
         VnodeKind::RamFile { .. } | VnodeKind::TmpFile { .. } | VnodeKind::MountedFile { .. }
         | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom | VnodeKind::DevFb { .. } => {
             drop(tbls);
@@ -5270,9 +5665,10 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             drop(tbls);
             (0, 0) // never fires — accepted watches silently produce no events
         }
-        VnodeKind::DynamicDevice { port, dev_id, .. } => {
+        VnodeKind::DynamicDevice { port, dev_id, open_id } => {
             let port = *port;
             let dev_id = *dev_id;
+            let open_id = *open_id;
             drop(tbls);
             // Proxy readiness to the owning device server (DRM card0 events,
             // evdev eventN). Holds no VFS lock across the IPC round-trip, and the
@@ -5284,6 +5680,11 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             proxy.tag = VFS_POLL;
             proxy.data[0..8].copy_from_slice(&(dev_id as u64).to_le_bytes());
             proxy.data[24..32].copy_from_slice(&(pid as u64).to_le_bytes());
+            // Slot 4: which *open* this poll is on — the same cookie handle_ioctl
+            // already forwards. Readiness must be answered from the queue the
+            // matching read() will drain, or one reader's drain silently
+            // un-readies the other.
+            proxy.data[32..40].copy_from_slice(&(open_id as u64).to_le_bytes());
             let reply = call_port(port, proxy);
             let raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
             if raw < 0 {
@@ -5291,6 +5692,25 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             } else {
                 let seq = u64::from_le_bytes(reply.data[8..16].try_into().unwrap_or([0u8; 8]));
                 (raw as u32, seq)
+            }
+        }
+        VnodeKind::DevVt { vt, seen } => {
+            let (vt, seen) = (*vt, *seen);
+            drop(tbls);
+            if vt != 0 {
+                // A console; the kernel answers its readiness from the serial
+                // port and evdev before reaching here (`fd_is_console_stdio`).
+                // POLLOUT only, never a POLLIN this crate cannot substantiate.
+                (POLLOUT, 0)
+            } else {
+                // /dev/tty0's VT-change edge. The seq IS the active VT number:
+                // sys_epoll_wait compares seqs for inequality, and the readable
+                // condition below is "active differs from what this open last
+                // saw", so a switch away and back between two polls is one
+                // non-event by both measures. See `fd_vt_number`.
+                let cur = tty_server::vt::active();
+                let ev = if cur as u8 != seen { POLLIN | POLLOUT } else { POLLOUT };
+                (ev, cur as u64)
             }
         }
         VnodeKind::DevStdio { .. } | VnodeKind::None => {
@@ -6771,11 +7191,25 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
             // /proc/self/fd already reports.
             (S_IFIFO | 0o600, 0, 0x1000_0000 + ring as u64)
         }
+        // A pty end is a character device — `isatty()` is TCGETS, but
+        // `ttyname()` additionally readlinks /proc/self/fd/N and demands that
+        // stat of the path it reads back agree with this. 0620 (tty group) is
+        // the mode a real /dev/pts/N carries. The inode must be distinct per
+        // end and per pair, and stable, so `stat("/dev/pts/N")` can reproduce
+        // it; distinct from the pipe (0x1000_0000), tmpfs (0x2000_0000) and
+        // console (0x3000_0000) ranges.
+        VnodeKind::Pty { pair, is_master } => {
+            (S_IFCHR | 0o620, 0, pty_ino(pair, is_master))
+        }
         // A console proxy (a dup'd stdio fd, or an fd opened on /dev/tty or
         // /dev/stdin) is the console, so it reports the console's inode — the
         // same one stat("/dev/console") reports. Without that agreement
         // ttyname() rejects the fd; see CONSOLE_INO.
         VnodeKind::DevStdio { .. } => (S_IFCHR | 0o666, 0, CONSOLE_INO),
+        // A VT is a character device with its OWN inode, not the console's:
+        // ttyname() on a /dev/tty2 fd must read back /dev/tty2. 0620 is the
+        // mode a real /dev/ttyN carries.
+        VnodeKind::DevVt { vt, .. } => (S_IFCHR | 0o620, 0, VT_INO_BASE + vt as u64),
         VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom
         | VnodeKind::DevFb { .. } => (S_IFCHR | 0o666, 0, 0),
         // DynamicDevice is handled by the early return above (it needs st_rdev);
@@ -6856,7 +7290,25 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         // S_IFREG — and must carry CONSOLE_INO so it agrees with fstat on the
         // console fd itself. See CONSOLE_INO for why ttyname() depends on it.
         if lookup_path == b"/dev/tty" || lookup_path == b"/dev/console" {
+            // /dev/tty follows the same ctty resolution `open` does, or
+            // `stat("/dev/tty")` disagrees with `fstat` on the fd that open
+            // just handed back — and disagreement there is precisely what
+            // ttyname() treats as "this fd is not that path".
+            if lookup_path == b"/dev/tty" {
+                if let Some(n) = tty_server::pty::ctty_for_sid(sched::current_sid()) {
+                    write_stat(stat_ptr, 0o020620, 0, pty_ino(n as u16, false));
+                    return ok_reply();
+                }
+            }
             write_stat(stat_ptr, 0o020666, 0, CONSOLE_INO);
+            return ok_reply();
+        }
+        // The virtual consoles. Same reason as /dev/ptmx below: the RAMFS sweep
+        // would report the placeholder entry as a zero-byte S_IFREG, and a
+        // libseat/logind shim that stats /dev/tty0 to decide whether the system
+        // has VTs would conclude it does not.
+        if let Some(vt) = vt_number(lookup_path) {
+            write_stat(stat_ptr, 0o020620, 0, VT_INO_BASE + vt as u64);
             return ok_reply();
         }
         // Special device files.
@@ -6867,6 +7319,18 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         }
         if lookup_path == b"/dev/stdin" || lookup_path == b"/dev/stdout" || lookup_path == b"/dev/stderr" {
             write_stat(stat_ptr, 0o020666, 0, 3);
+            return ok_reply();
+        }
+        // Pty nodes are character devices, and their inode numbers must match
+        // what fstat reports on the corresponding fd — see pty_ino. Answered
+        // ahead of the RAMFS sweep, which would otherwise report /dev/ptmx as
+        // a zero-byte S_IFREG and make ttyname() reject the fd.
+        if lookup_path == b"/dev/ptmx" {
+            write_stat(stat_ptr, 0o020666, 0, pty_ino(0, true));
+            return ok_reply();
+        }
+        if let Some(n) = pts_number(lookup_path) {
+            write_stat(stat_ptr, 0o020620, 0, pty_ino(n as u16, false));
             return ok_reply();
         }
         // Dynamic devices. Report the real st_rdev so a path-based stat of
@@ -6944,7 +7408,7 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
 }
 
 enum FdInfo { Static(&'static [u8]), Pipe(usize), RamData(*const u8), TmpIdx(usize),
-              Mounted(u32, u32), Bad }
+              Mounted(u32, u32), PtsSlave(u16), Bad }
 
 fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Message {
     if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
@@ -6978,6 +7442,12 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             VnodeKind::DevNull => FdInfo::Static(b"/dev/null"),
             VnodeKind::DevZero => FdInfo::Static(b"/dev/zero"),
             VnodeKind::Pipe { ring, .. } => FdInfo::Pipe(*ring),
+            // ptsname(3) in some libcs is a readlink of /proc/self/fd/N on the
+            // *master*, and ttyname(3) on the slave is the same readlink — so
+            // both ends must name the path they were opened by, not an
+            // "anon_inode" placeholder.
+            VnodeKind::Pty { is_master: true, .. } => FdInfo::Static(b"/dev/ptmx"),
+            VnodeKind::Pty { pair, is_master: false } => FdInfo::PtsSlave(*pair),
             // A pseudo-directory's `data` *is* its path, so report it directly;
             // it is not in RAMFS and the reverse data-pointer lookup below
             // would answer ENOENT for it.
@@ -6987,6 +7457,13 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             VnodeKind::EventFd { .. } => FdInfo::Static(b"eventfd"),
             VnodeKind::TimerFd { .. } => FdInfo::Static(b"timerfd"),
             VnodeKind::DevUrandom => FdInfo::Static(b"/dev/urandom"),
+            // ttyname(3) readlinks /proc/self/fd/N and stats what it reads
+            // back, so a VT fd must name the node it was opened by.
+            VnodeKind::DevVt { vt, .. } => FdInfo::Static(match vt {
+                0 => b"/dev/tty0", 1 => b"/dev/tty1", 2 => b"/dev/tty2",
+                3 => b"/dev/tty3", 4 => b"/dev/tty4", 5 => b"/dev/tty5",
+                _ => b"/dev/tty6",
+            }),
             VnodeKind::DevStdio { target_fd: 0 } => FdInfo::Static(b"/dev/stdin"),
             VnodeKind::DevStdio { target_fd: 1 } => FdInfo::Static(b"/dev/stdout"),
             VnodeKind::DevStdio { .. } => FdInfo::Static(b"/dev/stderr"),
@@ -7018,6 +7495,22 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             else { let mut d = [0u8; 10]; let mut di = 0; while v > 0 { d[di] = b'0'+(v%10) as u8; di += 1; v /= 10; } for i in (0..di).rev() { b[n] = d[i]; n += 1; } }
             b[n] = b']'; n += 1;
             let c = n.min(buf_len);
+            unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), buf_ptr as *mut u8, c); }
+            val_reply(c as u64)
+        }
+        FdInfo::PtsSlave(n) => {
+            let mut b = [0u8; 16];
+            let pref = b"/dev/pts/";
+            b[..pref.len()].copy_from_slice(pref);
+            let mut n_out = pref.len();
+            let mut v = n as usize;
+            if v == 0 { b[n_out] = b'0'; n_out += 1; }
+            else {
+                let mut d = [0u8; 5]; let mut di = 0;
+                while v > 0 { d[di] = b'0' + (v % 10) as u8; di += 1; v /= 10; }
+                for i in (0..di).rev() { b[n_out] = d[i]; n_out += 1; }
+            }
+            let c = n_out.min(buf_len);
             unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), buf_ptr as *mut u8, c); }
             val_reply(c as u64)
         }

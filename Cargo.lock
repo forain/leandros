@@ -155,6 +155,7 @@ dependencies = [
  "ipc",
  "sched",
  "spin",
+ "tty-server",
  "vfs-server",
 ]
 
@@ -464,6 +465,7 @@ dependencies = [
  "mm",
  "sched",
  "spin",
+ "tty-server",
  "xattr",
 ]
 

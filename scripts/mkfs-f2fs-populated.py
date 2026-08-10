@@ -273,8 +273,8 @@ def main():
     bin_files = []
     bins = [
         "shell", "login", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
-        "pthreadtest", "timertest", "sigtest", "polltest", "forktest", "racetest",
-        "waittest", "sigchldtest", "scmtest", "epolltest", "wakepolltest", "idletest", "drmsmoke", "evtest2", "venustest",
+        "pthreadtest", "timertest", "sigtest", "polltest", "ptytest", "forktest", "racetest",
+        "waittest", "sigchldtest", "scmtest", "epolltest", "wakepolltest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo",
     ]
@@ -798,6 +798,19 @@ def main():
         ("cosmic-workspaces",      f"{m6_out}/cosmic-workspaces-{arch}"),
         ("cosmic-files-applet",    f"{m6_out}/cosmic-files-applet-{arch}"),
         ("cosmic-idle",            f"{m6_out}/cosmic-idle-{arch}"),
+        # cosmic-term is NOT spawned by cosmic-session. It is launched on demand
+        # from the launcher / app library, which resolve Exec= as a bare name
+        # against PATH=/usr/bin:/bin, so /bin is the right home and the staged
+        # name must match Exec= in
+        #   artifacts/m6-session-data/shared/usr/share/applications/com.system76.CosmicTerm.desktop
+        # Built --no-default-features --features wayland,wgpu: password_manager
+        # is dropped (it pulls secret-service, and nothing on the image owns
+        # org.freedesktop.secrets) and dbus-config is dropped (no cosmic-config
+        # D-Bus daemon is staged; cosmic-config falls back to Default, which
+        # already asks for "Noto Sans Mono" -- the exact family we stage).
+        # Runtime gap: it needs a working /dev/ptmx + TIOCSPTLCK/TIOCGPTPEER
+        # (or ENOSYS so the TIOCGPTN + /dev/pts/N fallback engages).
+        ("cosmic-term",            f"{m6_out}/cosmic-term-{arch}"),
         # The greeter, DELIBERATELY NOT staged as "cosmic-greeter".
         #
         # This one binary is both the login screen and the in-session lock
@@ -1145,6 +1158,16 @@ def main():
     m17_drv = session_data("m17-census")
     if os.path.exists(m17_drv):
         bin_files.append(("m17-census", m17_drv, 0o100755))
+
+    # m20-term — the guest half of artifacts/m20_term.py: first light for
+    # cosmic-term inside a real COSMIC session. Launches it OUTSIDE
+    # cosmic-session, because cosmic-session pipes child stderr and reads it
+    # nowhere (cosmic-session/src/comp.rs:122-134), and every documented way
+    # cosmic-term dies — the pw_uid assert, the F_SETFL assert, die!() on
+    # TIOCSCTTY or TIOCSWINSZ — announces itself only there.
+    m20_drv = session_data("m20-term")
+    if os.path.exists(m20_drv):
+        bin_files.append(("m20-term", m20_drv, 0o100755))
 
     # m4-vkwl-a64 — the same driver with the compositor choice and every wait
     # made an argument, for aarch64 under TCG where "the session never came up"

@@ -25,6 +25,10 @@ name = "epolltest"
 version = "0.1.0"
 
 [[package]]
+name = "evsplit"
+version = "0.1.0"
+
+[[package]]
 name = "evtest2"
 version = "0.1.0"
 
@@ -171,6 +175,10 @@ name = "pthreadtest"
 version = "0.1.0"
 
 [[package]]
+name = "ptytest"
+version = "0.1.0"
+
+[[package]]
 name = "racetest"
 version = "0.1.0"
 
@@ -232,6 +240,10 @@ version = "0.1.0"
 dependencies = [
  "leandros-libc",
 ]
+
+[[package]]
+name = "vttest"
+version = "0.1.0"
 
 [[package]]
 name = "waittest"

@@ -1,6 +1,7 @@
 //! waittest — regression coverage for wait4/waitpid semantics: WNOHANG
-//! polling, blocking wait, ECHILD on no children, and negative-pid
-//! (process-group) reaping.
+//! polling, blocking wait, ECHILD on no children, negative-pid
+//! (process-group) reaping, and the WIFSIGNALED/WIFEXITED split in the
+//! packed wait status.
 //!
 //! Modeled on forktest (fork()/waitpid() through real relibc, plain exit
 //! codes as the parent/child synchronization signal) and exercises the
@@ -45,6 +46,10 @@ type size_t = usize;
 
 const WNOHANG: c_int = 1;
 const ECHILD: c_int = 10;
+const SIGKILL: c_int = 9;
+const SIGTERM: c_int = 15;
+const SIGILL:  c_int = 4;
+const SIGSEGV: c_int = 11;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -58,6 +63,12 @@ pub struct timespec {
 // (0 ⇒ exited normally). Copied from forktest.
 fn wifexited(status: c_int) -> bool { (status & 0x7f) == 0 }
 fn wexitstatus(status: c_int) -> c_int { (status >> 8) & 0xff }
+// WIFSIGNALED / WTERMSIG / WCOREDUMP, same encoding: the low 7 bits hold the
+// terminating signal, and 0x80 says a core file was written. The `+1 >> 1`
+// form is musl's — it excludes both 0 (exited) and 0x7f (stopped).
+fn wifsignaled(status: c_int) -> bool { ((status & 0x7f) + 1) >> 1 > 0 }
+fn wtermsig(status: c_int) -> c_int { status & 0x7f }
+fn wcoredump(status: c_int) -> bool { status & 0x80 != 0 }
 
 extern "C" {
     pub fn relibc_start_v1(
@@ -73,6 +84,7 @@ extern "C" {
     pub fn fork() -> pid_t;
     pub fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_int) -> pid_t;
     pub fn setpgid(pid: pid_t, pgid: pid_t) -> c_int;
+    pub fn kill(pid: pid_t, sig: c_int) -> c_int;
 
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
 }
@@ -110,19 +122,24 @@ core::arch::global_asm!(
 #[no_mangle]
 pub unsafe extern "C" fn wait_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0;
-    let mut failed_cases: [bool; 4] = [false; 4];
+    let mut failed_cases: [bool; 9] = [false; 9];
 
     if !test_wnohang_poll_until_exit() { failures += 1; failed_cases[0] = true; }
     if !test_blocking_wait_for_exit() { failures += 1; failed_cases[1] = true; }
     if !test_echild_no_children() { failures += 1; failed_cases[2] = true; }
     if !test_wait_on_process_group() { failures += 1; failed_cases[3] = true; }
+    if !test_killed_by_sigterm() { failures += 1; failed_cases[4] = true; }
+    if !test_killed_by_sigkill() { failures += 1; failed_cases[5] = true; }
+    if !test_normal_exit_not_signalled() { failures += 1; failed_cases[6] = true; }
+    if !test_segfault_reports_sigsegv() { failures += 1; failed_cases[7] = true; }
+    if !test_bad_opcode_reports_sigill() { failures += 1; failed_cases[8] = true; }
 
     puts(b"--- waittest done ---\n\0".as_ptr());
 
     if failures == 0 {
         puts(b"WAITTEST: PASS\0".as_ptr());
     } else {
-        let labels: [u8; 4] = [b'a', b'b', b'c', b'd'];
+        let labels: [u8; 9] = [b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h', b'i'];
         for (i, &failed) in failed_cases.iter().enumerate() {
             if failed {
                 let prefix = b"WAITTEST: FAIL ";
@@ -239,4 +256,135 @@ unsafe fn test_wait_on_process_group() -> bool {
 
     let ok = waited == r && wifexited(status);
     report(name, ok)
+}
+
+// ── e/f. A child killed by a signal reports WIFSIGNALED, not WIFEXITED ──────
+//
+// The kernel's fatal-signal path used to terminate the process with
+// `exit_group(128 + signo)`, so waitpid reported WIFEXITED with a status of
+// 143 (SIGTERM) or 137 (SIGKILL). `128 + signo` is the *shell's* convention
+// for showing a signal death in `$?`; the wait status has its own encoding,
+// and conflating them makes every WIFSIGNALED consumer — brush's job
+// control, Rust's Command::status(), cosmic-term's SIGCHLD reaper — believe
+// the child exited cleanly with a strange code.
+//
+// SIGTERM and SIGKILL are tested separately on purpose: SIGKILL is
+// unblockable and cannot carry a handler, so it could plausibly take a
+// different kernel path than an ordinary default-action terminate.
+//
+// The child bounds its own life (5 s of sleeps, then a normal exit) so a
+// kernel that never delivers the signal fails this test instead of hanging
+// the suite; a normal exit here reports WIFEXITED and fails the assertion.
+unsafe fn killed_by(name: &[u8], sig: c_int) -> bool {
+    let r = fork();
+    if r == 0 {
+        for _ in 0..50 { sleep_ms(100); }
+        _exit(0);
+    }
+    if r < 0 { return report(name, false); }
+
+    // Let the child reach its sleep loop; a signal sent before it has run at
+    // all is still pending and delivered, but this keeps the test honest
+    // about killing a *running* process.
+    sleep_ms(100);
+    if kill(r, sig) != 0 { return report(name, false); }
+
+    let mut status: c_int = 0;
+    let waited = waitpid(r, &mut status, 0);
+
+    // WCOREDUMP must stay clear: this kernel writes no core files, so
+    // claiming a dump would send consumers looking for a file that does not
+    // exist.
+    let ok = waited == r
+        && wifsignaled(status)
+        && wtermsig(status) == sig
+        && !wifexited(status)
+        && !wcoredump(status);
+    report(name, ok)
+}
+
+unsafe fn test_killed_by_sigterm() -> bool {
+    killed_by(b"killed_by_sigterm\0", SIGTERM)
+}
+
+unsafe fn test_killed_by_sigkill() -> bool {
+    killed_by(b"killed_by_sigkill\0", SIGKILL)
+}
+
+// ── g. A normal exit still reports WIFEXITED with the right code ────────────
+//
+// The other half of the same encoding: fixing the signal case must not
+// disturb `(code & 0xff) << 8`. Exit code 3 is chosen because it is small
+// enough to be mistaken for a signal number if the two halves were ever
+// swapped.
+unsafe fn test_normal_exit_not_signalled() -> bool {
+    let name = b"normal_exit_not_signalled\0";
+
+    let r = fork();
+    if r == 0 {
+        _exit(3);
+    }
+    if r < 0 { return report(name, false); }
+
+    let mut status: c_int = 0;
+    let waited = waitpid(r, &mut status, 0);
+
+    let ok = waited == r
+        && wifexited(status)
+        && wexitstatus(status) == 3
+        && !wifsignaled(status)
+        && wtermsig(status) == 0;
+    report(name, ok)
+}
+
+// ── h/i. A CPU fault reports the *right* signal, not exit code 1 ────────────
+//
+// Death by CPU exception never goes through the signal machinery at all: the
+// arch fault handlers kill the task directly, and they used to do it with
+// `exit_group(1)` — which waitpid reports as a clean exit with code 1,
+// indistinguishable from a program that chose to `return 1`. Two cases
+// because one signal number would not prove the vector→signal mapping: a
+// handler that answers SIGSEGV for everything passes h and fails i.
+//
+// Both children exit normally if the fault does not kill them, so a kernel
+// that mishandles this fails the assertion instead of hanging the suite.
+unsafe fn faulted_with(name: &[u8], sig: c_int, fault: unsafe fn()) -> bool {
+    let r = fork();
+    if r == 0 {
+        fault();
+        _exit(0); // reached only if the fault was not fatal — fails the test
+    }
+    if r < 0 { return report(name, false); }
+
+    let mut status: c_int = 0;
+    let waited = waitpid(r, &mut status, 0);
+
+    let ok = waited == r
+        && wifsignaled(status)
+        && wtermsig(status) == sig
+        && !wcoredump(status);
+    report(name, ok)
+}
+
+// The null pointer goes through `black_box` so the compiler cannot see that
+// the load is UB and replace it with its own trap instruction — which would
+// make this test report SIGILL on a perfectly correct kernel.
+unsafe fn null_deref() {
+    let p = core::hint::black_box(0usize) as *const u8;
+    let _ = core::ptr::read_volatile(p);
+}
+
+unsafe fn bad_opcode() {
+    #[cfg(target_arch = "x86_64")]
+    core::arch::asm!("ud2", options(nomem, nostack));
+    #[cfg(target_arch = "aarch64")]
+    core::arch::asm!("udf #0", options(nomem, nostack));
+}
+
+unsafe fn test_segfault_reports_sigsegv() -> bool {
+    faulted_with(b"segfault_reports_sigsegv\0", SIGSEGV, null_deref)
+}
+
+unsafe fn test_bad_opcode_reports_sigill() -> bool {
+    faulted_with(b"bad_opcode_reports_sigill\0", SIGILL, bad_opcode)
 }
