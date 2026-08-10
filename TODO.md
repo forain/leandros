@@ -1761,16 +1761,43 @@ The build recipe already exists (`m6-session-bins/build-rust.sh`) and the panel'
 libcosmic/iced apps, so **item 7 gates whether they would render**, and the three buttons are
 also the natural triggers item 8 is missing. These three items interlock.
 
-### 10. busd has no D-Bus activation — structural
+### 10. busd has no D-Bus activation — NOT structural; DECIDED 2026-08-10: implement it in busd
 
-`<servicedir>` is **deliberately omitted** from busd's `session.conf`, so **nothing is
-activatable**: every name must already be owned by a running process. This is what makes
-`xdg-desktop-portal-cosmic` — and therefore **screenshots, file choosers and screencast** —
-not a "build it" problem. Compounding it, the portal's PipeWire dependency is **non-optional**
-in exactly the way already documented for the settings daemon (63 external `pw_*` symbols, no
-feature gate); unlike the daemon, the portal actually *uses* the streams, so the existing inert
-stub would not suffice. The committed architecture already names reference `dbus-daemon` as
-the fallback if busd proves immature — **this is the decision point that would trigger it.**
+**"Structural" was wrong, and the word was doing real damage** — it is what made the reference
+`dbus-daemon` fallback look triggered. It is not. **busd already parses `<servicedir>` into a
+field nothing ever reads.** `busd-0.5.0/src/config/mod.rs:66` declares
+`pub servicedirs: Vec<PathBuf>`, the XML parser at `:117-151` fills it from
+`<servicedir>`/`<standard_session_servicedirs>`/`<standard_system_servicedirs>`, and there are
+**passing unit tests** for that at `:736-774` — but `grep -rn "\.servicedirs"` outside that one
+file returns nothing. The consumers are explicit stubs, not absences:
+`list_activatable_names` returns `&[]` (`src/fdo/dbus.rs:273-277`), `start_service_by_name`
+returns `Err(Error::Failed("Service activation not yet supported"))` (`:323-336`),
+`update_activation_environment` is the same shape (`:338-344`). Missing: a `.service` key-file
+parser and a spawn path. **~150-250 lines across 3-4 files in a crate we already patch**
+(`current-thread-runtime.patch`, `service-unknown-reply.patch` — busd is ours).
+
+**Our config's omission was therefore honest, not a choice to revisit**:
+`ports/dbus/session-pkg/session.conf` says so in its header, and pointing `<servicedir>` at a
+directory would have populated a dead field.
+
+**DECISION (2026-08-10, the user's): implement activation in busd.** The alternative was
+rejected on cost and on rule-fit — no `dbus-daemon` port scaffold exists, and the repo's
+Rust-only carve-out only admits C where *the artifact is a C ABI* (the libseat/libudev shims);
+a full parallel broker is not that. See the correction near the end of this file for the exact
+wording of the rule.
+
+**⚠ What this does NOT deliver, so the item is not oversold.** `xdg-desktop-portal-cosmic` —
+and therefore **screenshots, file choosers and screencast** — stays blocked afterwards, because
+its PipeWire dependency is **non-optional** in exactly the way documented for the settings
+daemon (63 external `pw_*` symbols, no feature gate); unlike the daemon, the portal actually
+*uses* the streams, so the existing inert stub would not suffice. Activation unblocks the
+activation-gated single-instance apps; the portal needs PipeWire as well.
+
+**⚠ The regression to guard.** `service-unknown-reply.patch` (`85f2f4c`+`daa2815`) is what
+stopped every libcosmic app blocking forever on an unowned name. Implicit activation — real
+`dbus-daemon` activates on a *method call* to an unowned activatable name, not only on an
+explicit `StartServiceByName` — must hook in **ahead** of that reply without ever delaying the
+non-activatable case, which must still answer `ServiceUnknown` promptly.
 
 ### 11. Permanent COSMIC source patches — the goal is totally unmodified
 
@@ -2112,33 +2139,95 @@ slave reports. What is missing is the *output* of a command, and only on aarch64
 a literal `^[[1;14R` / `^[[1;21R` — **a CPR reply echoed to the screen instead of consumed by
 brush** — and 14 and 21 are exactly the two command lines' lengths.
 
-**Leading explanation, stated at the strength the evidence supports.** When brush fails to
-consume the CPR reply (x86_64) it skips its repositioned redraw and the output survives; when
-it does consume it (aarch64, different timing) it repositions to the remembered row-1 spot and
-erases downward (`ESC[49;1H`, `ESC[J`) over the output it has just printed. That makes this a
-**brush/reedline-on-pty timing bug, not a kernel or cosmic-term defect** — the same CPR race
-class already fixed once for the serial console (`3861515`, `081fc01`). **brush's source was
-not read**, so the mechanism is *strongly supported, not proven*. The measured facts stand
-independently of it: a correct `stty size`, CPR replies whose row/column match the command
-lengths exactly, and output present on one arch and absent on the other from the same binary.
+**ROOT-CAUSED 2026-08-10 by reading the source. The recorded hypothesis was right about the
+mechanism and wrong about the actor, and the correction is what explains the arch
+anti-correlation.** reedline does not *remember* row 1 — it **asks, and is handed the previous
+query's answer**. There is no request/response correlation anywhere in the path:
 
-### 18. Harness gaps, three, all cheap and all failing toward "the guest is broken"
+- `reedline-0.47.0/src/painting/painter.rs:360` — every `read_line` opens with
+  `initialize_prompt_position` → `cursor::position()` (`ESC[6n`), which sets `prompt_start_row`.
+- `painter.rs:122-143` `select_prompt_row`: `let new_row = if column > 0 { row + 1 } else { row };`
+  — a reply of `ESC[1;14R` yields `prompt_start_row = 1`.
+- `painter.rs:449-451` — every repaint then emits `cursor::MoveTo(0, prompt_start_row)` +
+  `Clear(ClearType::FromCursorDown)`, i.e. `ESC[2;1H ESC[J`. **That is the eraser**: everything
+  below line 2, which is exactly the command output just printed.
+- `painter.rs:427-440` is a second, equally destructive branch — `is_reset()` calls
+  `cursor::position()` on *every* repaint, and a stale low row makes it true, flooding newlines
+  that scroll the output away.
 
-1. **`driver.py` has no QMP socket.** It was obtained ad hoc with
-   `LEANDROS_QEMU_EXTRA="-qmp unix:/tmp/leandros-qmp.sock,server=on,wait=off"`. HMP
-   `mouse_move` is unusable (relative; our virtio-tablet is absolute-only — item 16's
-   landmine) and HMP `sendkey` **cannot hold a chord**, so Ctrl+Alt+Fn cannot be injected
-   without QMP at all. A permanent `-qmp` line is worth landing.
-2. **`evsplit` must be the ONLY command in a session.** `driver.py`'s `cmd_session` pumps the
-   full `step_timeout` for *every* command, so `session 45 "pwd" "evsplit 60"` starts evsplit
-   ~45 s in while the injector fires at +4 s. The result is a silent `STARVED`,
+**The desync is crossterm's, it is permanent, and `tcflush` cannot clear it because it lives in
+a private in-process queue.** `crossterm-0.29.0/src/event/read.rs:45-49` returns any
+`CursorPosition` **already sitting in `self.events`** with no check that it belongs to this
+query; `:66-70`/`:82-84` retain one seen while reedline was reading *keys*, across `read_line`
+calls. Two sources orphan a reply: `cursor/sys/unix.rs:32-56` abandons it when
+`poll_internal(Some(2000ms))` returns `Ok(false)`, and `read.rs:71-75` turns
+`ErrorKind::Interrupted` into that same `Ok(false)` **instantly, with no wait at all** — so any
+signal landing inside the CPR window (SIGWINCH from `pty.rs:931-932`, SIGCHLD) orphans one.
+**One orphan poisons every subsequent `position()` forever.**
+
+**Why only aarch64.** Under TCG the CPR window is ~30x wider in wall-clock terms, so both
+orphan sources go from unlikely to near-certain — and because the desync is *sticky*, aarch64
+fails consistently rather than intermittently. `painter.rs:899` (`handle_resize` → another
+`position()`, driven by SIGWINCH) fires exactly during cosmic-term's slow aarch64 startup.
+
+**⚠ x86_64 survives BECAUSE OF A LEANDROS PTY BUG, and this is the load-bearing finding.** A
+late reply arriving while the pty is back in `ICANON` is buffered into `p.canon` and echoed
+(`servers/tty/src/pty.rs:670-676` → `echo()`), but the raw-mode path bypasses `p.canon`
+entirely (`pty.rs:681-688`), and `TCSETS`/`TCSETSF` merely overwrite termios
+(`pty.rs:1033-1039`) — **no flush, no Linux-style ICANON→raw commit**. So x86_64's stale reply
+is *stranded* and can never poison anything. **The visible `^[[1;14R` is the proof its poison
+was neutralised, not the defect.** Therefore: **the pty flush fix is correct and must NOT be
+landed on its own** — alone it would deliver the stranded reply and regress x86_64 to
+aarch64's behaviour. It lands only after the crossterm fix.
+
+**The prior art does not apply.** `3861515`/`081fc01` are dead ends here: ptys are already
+deliberately carved *out* of the console readiness path (`kernel/src/syscall.rs:~7326`,
+`~7443`), and `pty.rs:751-763` drains the whole ring in raw mode while cosmic-term writes the
+reply in one `master_write` — there is nothing split to coalesce.
+
+**Fix, in progress:** fork crossterm and patch `read_position_raw` — drain queued replies
+*before* writing `ESC[6n`, continue on `Interrupted` with the remaining timeout instead of
+bailing, and raise the 2 s bound. Wired into brush via `[patch.crates-io]`. **Not yet verified
+against a running guest.**
+
+**The zero-code experiment that would prove it outright**, still worth running: boot aarch64
+and run `brush --input-backend=basic` (`brush-shell/src/args.rs:203`, `entry.rs:285`) inside
+cosmic-term. That backend never calls `cursor::position()` and never repositions. **If output
+becomes visible, reedline's CPR-driven repaint is conclusively the eraser.**
+
+### 18. Harness gaps — 1 and 2 FIXED (`fe89e8c`), 3 was STALE
+
+All three failed toward "the guest is broken" rather than "the instrument is broken", which is
+why they are recorded even though each fix is small.
+
+1. **`driver.py` had no QMP socket — FIXED.** It was obtained ad hoc with
+   `LEANDROS_QEMU_EXTRA="-qmp unix:…"`. That was never a convenience gap: HMP `mouse_move` is
+   relative and our virtio-tablet is absolute-only (item 16's landmine), and HMP `sendkey`
+   **cannot hold a chord** — so **Ctrl+Alt+Fn, the only escape from a KD_GRAPHICS VT, could not
+   be injected at all.** `driver.py` now opens `/tmp/leandros-qmp-<arch>-<pid>.sock` (unique per
+   run, so concurrent QEMUs cannot collide), detects a caller-supplied `-qmp` and defers to it
+   rather than adding a second, and exposes `driver.py chord <qcode>…` and `driver.py qmp <cmd>`.
+   Chord injection sends key-down in order and key-up in **reverse** order; pointer injection
+   uses absolute axes. **`run-qemu.sh` needed the same line and had none** — it runs
+   `-serial mon:stdio`, HMP only. Item 16's landmine held again: the two build their device
+   lists independently, so the block is repeated across all five `exec` paths rather than shared.
+2. **`evsplit` had to be the ONLY command in a session — FIXED at the cause.** `cmd_session`
+   pumped the full `step_timeout` for *every* command, so `session 45 "pwd" "evsplit 60"`
+   started evsplit ~45 s in while the injector fired at +4 s: a silent `STARVED`,
    **indistinguishable from a broken pointer path** — instrument-reliability class A, the
-   harness reporting a defect it caused. Use `session 30 "evsplit 60"` and inject at +4 s.
-3. **`--venus` cannot photograph a session at all, on any `device=`.**
-   `virgl_cmd_set_scanout()` leaves `console->scanout.kind = SCANOUT_TEXTURE`, and
-   `qemu_console_surface()` returns NULL for anything but `SCANOUT_SURFACE`. This is the same
-   structural limit recorded in next-step 1; it is repeated here because it bites every new
-   harness that reaches for `screendump` before reading that entry.
+   harness reporting a defect it caused. `pump()` now returns as soon as the prompt matches in
+   output produced *after* that command was sent; the `start_len` guard is what stops it
+   matching a prompt already in the transcript. `step_timeout` remains a cap for commands that
+   never return a prompt, which is what `evsplit` is as a held final command.
+   **Both fixes are syntax-checked only — neither has been run against a live QEMU.**
+3. **"`--venus` cannot photograph a session at all" — STALE, and it was already solved when
+   this was written.** The `screendump`/QMP half is still true and still worth knowing:
+   `virgl_cmd_set_scanout()` leaves `console->scanout.kind = SCANOUT_TEXTURE` and
+   `qemu_console_surface()` returns NULL for anything but `SCANOUT_SURFACE`. But that is not a
+   dead end — see next-step 1 (`f1bf200`): **`egl-headless` is a converter, not a pixel sink**,
+   so pairing it with a 2D listener delivers the frame over **RFB, not `screendump`**:
+   `-display egl-headless -vnc 127.0.0.1:9,display=venusgpu`. Instrument, confirmed present:
+   `python3 -u artifacts/venuscap.py <arch> <out.ppm>`.
 
 ### 19. The two artifacts trees diverged again
 
@@ -2155,7 +2244,7 @@ out of repo in `leandros-artifacts/m6-session-bins/`, and the box had only that 
 nothing about whether anything can build it, and "the binary exists on this machine" says
 nothing about the other.
 
-### 20. `EVIOCGRAB` is accepted but not enforced — deliberately
+### 20. `EVIOCGRAB` is accepted but not enforced — DECIDED 2026-08-10: enforce, with an escape hatch
 
 Enforcement only becomes *safe* now that the chord exists: Ctrl+Alt+Fn runs inside
 `push_event`, ahead of all per-client routing, so a grab **structurally cannot** block it.
@@ -2164,19 +2253,34 @@ round trip on **both** arches. **It is the one feature whose failure mode is an 
 machine**, so it must not ride in the same change as the switching it depends on, and it must
 not ride with item 14's DRM master handoff either.
 
+**DECISION (2026-08-10, the user's): enforce it, and add a kernel-side escape hatch rather than
+relying on the chord alone.** The chord's structural precedence is an argument that the current
+code is safe; the escape hatch is what keeps it safe under a change nobody has made yet. Shape:
+an **ungrab-all driven by the VT switch itself** (a grab is scoped to the VT that took it and
+cannot survive a switch away from it), plus a magic key as a last resort. That removes the
+unrecoverable-machine failure mode outright instead of arguing it cannot be reached — which is
+the right trade when the cost of being wrong is a machine with no way to ask it anything.
+Enforcement lives at `drivers/src/drm_device_interface.rs:667` (`0x90`/`0x91`).
+
 ### Ordering, and why
 
-1. **Item 17 (aarch64 terminal output)** first — it is the only thing between a terminal that
-   runs and a terminal that is usable on that arch, and the space is already halved: the pty
-   is exonerated and the suspect is named.
-2. **Item 18's harness gaps** next, because they are what everything after this is measured
-   with, and each one currently fails toward a false guest bug.
-3. **Item 20 (`EVIOCGRAB`)**, on its own, after a hand-verified round trip on both arches.
-4. **Item 14's remainder** — DRM master handoff and `/dev/input/*` reopen — which is what
-   makes a switch away from a wedged compositor actually work.
-5. **Items 12 (PAM) and 13 (utmpx)**, in that order; 13 still needs its consumer question
+Updated 2026-08-10. The first two are no longer "next" — they are in flight or done.
+
+1. ~~**Item 17 (aarch64 terminal output)**~~ — **root-caused**; the eraser is reedline's
+   CPR-driven repaint over a permanently desynced crossterm cursor query, and the fix is a
+   crossterm fork. **Unverified against a running guest.** The `--input-backend=basic` probe
+   is the cheap conclusive check and has not been run.
+2. ~~**Item 18's harness gaps**~~ — **1 and 2 fixed (`fe89e8c`), 3 was stale.** Not yet
+   exercised against a live QEMU.
+3. **Item 14's remainder** — DRM master handoff, then `/dev/input/*` VT-gating as a *separate*
+   commit. This is what makes a switch away from a **wedged** compositor actually work, and it
+   is the last piece of the item. Design settled; see the item.
+4. **Item 20 (`EVIOCGRAB`)**, on its own, never riding with item 14, and now with the escape
+   hatch the decision added.
+5. **Item 10 (busd activation)** — decided and scoped; independent of everything above, so it
+   can proceed in parallel whenever a build slot is free.
+6. **Items 12 (PAM) and 13 (utmpx)**, in that order; 13 still needs its consumer question
    answered before any implementation is scheduled.
-6. **Item 10** only when a portal-shaped capability is actually wanted.
 
 ### Corrections this survey forces
 
