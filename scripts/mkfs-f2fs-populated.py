@@ -1187,6 +1187,23 @@ def main():
     if os.path.exists(_brush_p):
         bin_files.append(("sh", _brush_p, 0o100755))
 
+    # brush-nofix — the SAME brush, built against UNPATCHED crossterm 0.29.0.
+    #
+    # Item 17's fix lives in a sibling fork (`../crossterm`) wired in through
+    # brush's `[patch.crates-io]`, so once it is built there is no way to see
+    # the old behaviour again except by rebuilding — and "output is visible
+    # now" measured against a remembered screenshot from the OTHER machine is
+    # not a measurement, it is a recollection. Staging both binaries lets the
+    # broken and the fixed shell be run back to back in ONE boot, against one
+    # image, inside one cosmic-term window, so the difference cannot be
+    # attributed to arch, image, timing or emulator state.
+    #
+    # Purely diagnostic and entirely optional: absent from the build tree it is
+    # simply not packed, exactly like the m4-vkwl/m20-term drivers above.
+    _brush_nofix_p = f"../brush-nofix-src/target/{brush_target}/release/brush"
+    if os.path.exists(_brush_nofix_p):
+        bin_files.append(("brush-nofix", _brush_nofix_p, 0o100755))
+
     # libpipewire-0.3 stub (inert) -> /usr/lib, resolved by soname for the
     # settings-daemon's DT_NEEDED. Same soname trick as the GL/input libs.
     m6_pw_lib = os.path.expanduser(f"~/code/leandros-artifacts/pipewire-gap/lib/{arch}")
