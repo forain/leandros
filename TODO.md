@@ -3273,6 +3273,28 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
 
 ## Housekeeping
 
+- **⚠ 360 s is NOT a valid COSMIC settle on x86_64/TCG — use ≥700 s.** An integration pass
+  photographed a wallpaper with **no panel and no dock**, unchanged over 200 s, and it read as a
+  clean regression. It was bring-up latency: the wallpaper lands at ~240 s and the full panel is
+  present by ~600 s. A re-run with a 700 s settle gave the full desktop. The committed x86_64
+  evidence elsewhere in this file was taken at guest clock 00:14:30 — **on the box, where x86_64
+  runs on KVM**. This is the same accelerator-vs-arch confound that item 17's title carried: on
+  the Mac x86_64 is the *slow* target. **A screenshot taken too early is indistinguishable from a
+  desktop that never came up.**
+- **⚠ INTEGRATION VERIFIED 2026-08-10 at `a1a2b3d`.** Today's work landed on two machines in
+  parallel and was rebased together; the combination had never been built. It has now been:
+  `build-all.sh` clean both arches on macOS (the box's new staging/guard code is portable —
+  `cargo +nightly`, both musl targets, `rust-lld`, BSD `patch`/`install` all fine), **16/16 test
+  binaries green on both arches with zero deviation from baseline**, a subtest-name-and-result
+  diff identical across arches, COSMIC up on both, and the VT round trip returning the desktop
+  **live** (clock advanced) at 0.0% pixel difference. Positive control (`nosuchbinary_xyz42` →
+  127) confirmed the console was not silently running nothing. Measured with `scmrun.py`, **not**
+  `driver.py cmd`, so the x86_64 output-dropping hazard did not apply.
+- **`verify_dbus_staging`'s first outing did not fire, and that was correct.** The Mac's staged
+  tree was *exactly* the stale state the guard exists to catch (staged `busd` Aug 8 vs the patch
+  Aug 10), but `stage_dbus_session` runs first and rebuilt it, so the guard saw fresh output.
+  **Rebuild-then-verify is the right order**; a guard that fired here would have blocked a build
+  that was about to fix itself.
 - **⚠ NEW out-of-repo sibling, and brush will not build without it: `../crossterm`.** Item 17's
   fix is a **fork of crossterm 0.29.0** at `~/code/crossterm` (box: `~/Projects/crossterm`,
   symlinked to `leandros-siblings/`, like every other sibling), wired in by
