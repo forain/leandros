@@ -413,6 +413,8 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -drive if=none,id=data1,format=raw,file="$DATA1_IMG" \
             -device virtio-blk-pci,drive=data1 \
             "${X86_UEFI_VGA_ARGS[@]}" -device "$GPU_DEV" \
+            -device virtio-keyboard-pci \
+            -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -device virtio-net-pci,netdev=net0 "${NETDEV_ARGS[@]}" -no-reboot)
@@ -485,6 +487,8 @@ else
             -drive if=none,id=data1,format=raw,file="$DATA1_IMG" \
             -device virtio-blk-pci,drive=data1 \
             -vga none -device "$GPU_DEV" \
+            -device virtio-keyboard-pci \
+            -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -net none \

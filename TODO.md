@@ -798,6 +798,7 @@ paragraph that leans on "out of scope" with that in mind.
 | 9 | **5 real applets now ship and run; 2 of them paint nothing** | Feature — panel-death **FIXED**; rendering **OPEN** | 8 processes, 0 exits; tiling + minimize draw zero pixels |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
 | 15 | ~~386 KB of extra `.data` stopped the Linux box booting~~ — it was a **kernel stack overflow** | Bug — **CLOSED** | Not image size and not host-specific: a 155,880 B frame on a 64 KiB stack. Stacks now 128 KiB, frames gated at build time, canary on syscall return |
+| 16 | ~~Mouse input dead on the Linux box "in both arches"~~ — it was **one arch, and no pointer device at all** | Bug — **CLOSED** | `run-qemu.sh` attached `virtio-tablet-pci` only on aarch64; x86_64 got q35's PS/2 mouse, which has no driver. Guest stack cleared at every layer first; real mouse now moves and clicks on both |
 | 11 | **PERMANENT COSMIC source patches** — the goal is totally unmodified | Debt — greeter one **RETIRED**; session one **cause FIXED** `2d9f0c8` | One patch left; handshake completes 5.022 s → 2.186 s |
 | 12 | **PAM — real support, replacing the C shim** | Feature — **NEW, in scope** | Shim authenticates for real but is C, untracked, coverage unverified |
 | 13 | **utmpx — session accounting, currently absent** | Feature — **NEW, in scope** | Nothing in tree; need is unmeasured |
@@ -827,6 +828,11 @@ with zero crashes over 13 minutes**. `zwp_linux_dmabuf_v1`/`wl_drm` are the only
 absences and are expected (`is_software`).
 
 **The one thing that turns most of that into a desktop is input, and there is none.**
+
+**Superseded 2026-08-09 — there is input, and a hand on a real mouse now moves the cursor
+and clicks on both arches.** Item 6 already refuted the "none" for injected events; item 16
+closes the last gap by proving the path from a physical mouse through the QEMU window, and
+by fixing the x86_64 command line that had no pointer device attached at all.
 
 **Read the taxonomy before reading the list.** These four states look identical on a blank
 screen and imply completely different work: **absent from the image**, **staged but never
@@ -1772,6 +1778,63 @@ no longer produces a passing build.
 
 Verified: both arches × both machines boot with zero faults, and the full
 regression suite on freshly generated f2fs volumes.
+
+### 16. `run-qemu.sh` attached no pointer device on x86_64 — CLOSED 2026-08-09
+
+**Reported as "mouse input doesn't work on the Linux box in both arches"; it was one
+arch, and the guest was never at fault.** `scripts/run-qemu.sh` builds **four** QEMU
+command lines — {uefi, direct} × {aarch64, x86_64} — and only the two aarch64 ones
+carried `-device virtio-keyboard-pci -device virtio-tablet-pci`. Commit `ea4b658`
+("attach virtio-tablet by default and poll it on both arches") added them to what its
+message calls "both architecture branches", but both hunks landed inside the
+`if [ "$ARCH" = "aarch64" ]` half of each boot mode. The two blocks are near-identical,
+so the diff context reads as symmetric when it is not. Fix: four added lines.
+
+What x86_64 actually offered the guest, measured through the real script on the box:
+
+| | before | after |
+|---|---|---|
+| x86_64 `query-mice` | `* QEMU PS/2 Mouse absolute=False` | `* QEMU Virtio Tablet absolute=True` |
+| aarch64 `query-mice` | `* QEMU Virtio Tablet absolute=True` | unchanged |
+
+The PS/2 mouse is q35's built-in i8042, and there is no PS/2 mouse driver in the tree,
+so the guest saw nothing at all. aarch64 needed no change and never had this defect.
+
+**The guest input stack was cleared at every layer before the fix was trusted**, since
+a missing device and a broken driver look identical from the symptom. `evtest2` under
+QMP injection, on the box, both arches:
+
+| injection | x86_64 | aarch64 |
+|---|---|---|
+| absolute motion | `motion_abs_frame: PASS`, 24 ev | `PASS`, 27 ev |
+| buttons only (zero ABS) | 16 ev, `motion_abs_frame: FAIL` ⇒ EV_KEY arrived | 16 ev, same |
+
+Then the one thing QMP cannot test — the GTK widget — with a real mouse over a real
+`-display gtk` window: **`motion_events=64`**. So the full chain is proven: real mouse →
+GTK → QEMU input core → virtio-tablet → guest driver → evdev `event1` → userspace read.
+Both arches confirmed by hand afterwards: cursor moves, clicks register.
+
+**LANDMINE — the two QEMU command lines drift.** `scripts/run-qemu.sh` (the human path)
+and `.claude/skills/run-leandros/driver.py` (the agent path) build device lists
+independently. driver.py had the tablet on both arches all along, which is exactly why
+every automated run stayed green while the human path had no mouse for weeks. Any device
+added to one must be added to the other; a shared list would end this class outright.
+
+**LANDMINE — HMP `mouse_move` cannot test this hardware.** It emits **relative** events;
+`virtio-tablet-pci` registers **absolute** axes, so QEMU's input core finds no handler
+and drops them with no diagnostic: 280 accepted `mouse_move` commands produced **zero**
+guest events, which is indistinguishable from a dead driver and nearly sent this into
+the evdev server after a bug that was not there. `info mice` is the tell
+(`* QEMU Virtio Tablet (absolute)`). Use QMP `input-send-event` with `abs`/`btn` data.
+`driver.py` exposes only an HMP socket; to get QMP, read `/proc/<pid>/cmdline`, kill,
+and relaunch the identical argv with `-qmp unix:…` appended — `login`/`cmd` keep working
+because the serial chardev path is unchanged. Note aarch64 already emits
+`-display default,gl=on` when the host has `virtio-gpu-gl-pci`, so appending a second
+`-display` makes QEMU exit outright; x86_64 with `virtio-vga` emits none and tolerates it.
+
+One reading gotcha: under a real mouse `evtest2` reports `epoll_idle_no_false_wake: FAIL`
+by construction — that check asserts an empty ring during a 300 ms still-pointer window,
+and a hand on the mouse guarantees it is not empty. It is not a defect in that run.
 
 ### 14. VT switching — was out of scope, now required
 
