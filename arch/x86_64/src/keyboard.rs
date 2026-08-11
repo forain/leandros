@@ -135,5 +135,8 @@ fn handle_scancode(scancode: u8) {
     if ev_code != 0 {
         evdev_server::push_event(0, 1 /* EV_KEY */, ev_code, if is_up { 0 } else { 1 });
         evdev_server::push_event(0, 0 /* EV_SYN */, 0, 0);
+        // PS/2 IRQ, not the tick — flush here so coalescing costs this path no
+        // latency either. No-op unless the burst mode is compiled in.
+        evdev_server::flush_pending_wake();
     }
 }

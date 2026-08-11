@@ -72,6 +72,10 @@ fn handle_irq(_frame: *mut UserFrame) {
             evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2);
             evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
         }
+        // This is the PRIMARY aarch64 console path, not the tick fallback, so
+        // it flushes its own burst rather than waiting up to 10 ms for the next
+        // tick to do it. No-op unless the burst mode is compiled in.
+        evdev_server::flush_pending_wake();
         unsafe { super::uart::clear_irq(); }
     } else if irq_id != super::gic::SPURIOUS {
         serial_print_str("\n[EXC] Unhandled IRQ ");

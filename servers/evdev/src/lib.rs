@@ -440,6 +440,93 @@ pub fn events_pushed() -> u64 {
     EVENTS_PUSHED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+// ── Poll-wake coalescing ─────────────────────────────────────────────────────
+//
+// `push_event` ends by waking pollers, and `sched::try_wake_poll` is not a
+// targeted wake: `POLL_WAIT_CHANNEL` is ONE global channel shared by every task
+// parked in poll/epoll_wait anywhere. So each event costs a RUN_QUEUE
+// acquisition, an unblock of every polling process in the session, and an IPI —
+// and then each woken process re-probes its epoll set, finds nothing for it,
+// and re-blocks, taking RUN_QUEUE again on the way down.
+//
+// That cost is per EVENT, and a frame is several events. Press and release
+// shift and nothing renders, but four events go through here — key down,
+// SYN_REPORT, key up, SYN_REPORT — so four whole-system herds. Pointer motion
+// is three per sample (ABS_X, ABS_Y, SYN_REPORT) at the tablet's report rate.
+// The symptom is a desktop that slows down in proportion to how fast you type
+// or move, with no relation to what is drawn.
+//
+// ⚠ A related plan — per-instance wait channels — was REFUTED by measurement
+// during the 2026-08-10 sluggishness work: the herd was 0.7% once the epoll
+// scans were bounded. That measurement was taken on an IDLE desktop, which is a
+// different regime from a sustained input storm, so it does not settle this
+// case — but it does mean the modes below exist to be MEASURED against each
+// other, not assumed. `WAKE_MODE_BASELINE` reproduces the pre-existing
+// behaviour exactly, so the comparison is against the real thing.
+//
+// Switching mode is a one-line edit plus a kernel rebuild. `[DRMSTAT]` reports
+// `pollwake` (wakes actually issued) alongside the existing `evpush` (events
+// pushed); their ratio is the whole measurement.
+
+/// Wake on every event — the behaviour before any of this existed. The control.
+pub const WAKE_MODE_BASELINE: u8 = 0;
+/// Wake only on `SYN_REPORT`. A consumer cannot act on a partial frame —
+/// libinput accumulates events and dispatches at the report — so the wakes this
+/// drops could never have been acted on. Frees 2× on keys, 3× on motion.
+pub const WAKE_MODE_SYN: u8 = 1;
+/// Wake once per drain burst. Costs nothing in latency: `poll_events` runs off
+/// the 100 Hz tick and drains the whole virtqueue in one loop, so every event in
+/// a burst becomes visible to userspace at the same instant either way — one
+/// wake after the drain is what the per-event wakes already added up to. Bounds
+/// wakes at the tick rate no matter how fast input arrives.
+pub const WAKE_MODE_BURST: u8 = 2;
+
+/// Which of the three above is compiled in. Change this line and rebuild the
+/// kernel to compare; `[DRMSTAT]`'s `pollwake` field tells you which build a log
+/// came from without having to guess.
+pub const WAKE_MODE: u8 = WAKE_MODE_BURST;
+
+/// Wakes actually issued, against `EVENTS_PUSHED` wakes attempted. Under
+/// `WAKE_MODE_BASELINE` the two climb together; the ratio IS the saving.
+static POLL_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// See `POLL_WAKES`.
+pub fn poll_wakes() -> u64 {
+    POLL_WAKES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set by `push_event` under `WAKE_MODE_BURST`, drained by `flush_pending_wake`.
+static WAKE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Issue the wake and count it. IRQ-safe: `try_wake_poll` is the non-blocking
+/// form and returns false rather than waiting on a contended RUN_QUEUE.
+fn wake_pollers() {
+    if sched::try_wake_poll() {
+        POLL_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    } else if WAKE_MODE == WAKE_MODE_BURST {
+        // Deferred, not lost: leave the flag set so the next drain retries.
+        // The other modes already rely on the 100 Hz tick as their backstop.
+        WAKE_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Issue one wake if any event was pushed since the last flush.
+///
+/// Call at the END of an input drain, after every `push_event` that burst will
+/// make — the tick hooks in `arch/*/timer.rs` (which drain virtio input AND the
+/// UART, in that order), the aarch64 UART IRQ, and the x86_64 PS/2 IRQ. The
+/// non-tick callers flush for themselves rather than waiting for the next tick,
+/// so coalescing costs them no latency either.
+///
+/// A no-op in the other modes, and cheap in all of them: one relaxed load.
+pub fn flush_pending_wake() {
+    if WAKE_MODE != WAKE_MODE_BURST { return; }
+    if WAKE_PENDING.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        wake_pollers();
+    }
+}
+
 /// True while the last `EV_KEY` pushed on the keyboard node was a serial
 /// synthetic, so the `SYN_REPORT` that follows it can be exempted from the VT
 /// gate along with the key itself.
@@ -1140,7 +1227,22 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     // A key event is a POLLIN edge for a console reader / evdev poller parked on
     // the poll wait-channel. try_wake (non-blocking) honors IRQ context; the
     // 100 Hz console-read tick is the backstop if RUN_QUEUE is momentarily busy.
-    sched::try_wake_poll();
+    //
+    // WHICH events wake is the coalescing decision — see `WAKE_MODE`. The wake
+    // stays INSIDE the interrupt-masked region in every mode, where it already
+    // was: `try_wake_poll` takes RUN_QUEUE, and this runs in IRQ context.
+    match WAKE_MODE {
+        WAKE_MODE_SYN => {
+            if type_ == EV_SYN { wake_pollers(); }
+        }
+        WAKE_MODE_BURST => {
+            // Defer to the end of the drain. Nothing is lost if a burst somehow
+            // ends without a flush: the next event's flush picks the flag up,
+            // and the poll-deadline tick is the standing backstop underneath.
+            WAKE_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        _ => wake_pollers(),
+    }
     unsafe { arch_interrupt_restore(f); }
 }
 

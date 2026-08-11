@@ -252,6 +252,12 @@ pub fn on_tick() {
             evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2); // 2 = typematic/serial
             evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
         }
+
+        // One poll wake for everything this tick drained — virtio input above
+        // and the UART bytes just now. Must come after BOTH, which is why it is
+        // here and not at the end of `poll_events`. No-op unless the burst mode
+        // is compiled in (see `evdev_server::WAKE_MODE`).
+        evdev_server::flush_pending_wake();
     }
 
     sched::timer_tick_irq();

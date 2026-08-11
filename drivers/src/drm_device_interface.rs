@@ -1996,6 +1996,14 @@ pub fn drm_tick() {
             crate::pci::serial_debug_hex_64(bo_blob);
             crate::pci::serial_debug(" bo_bhnd=");
             crate::pci::serial_debug_hex_64(bo_bhnd);
+            // Poll wakes actually issued, against `evpush` above (wakes the
+            // uncoalesced path would have issued). Their ratio measures
+            // `evdev_server::WAKE_MODE`: equal under the baseline, ~1/2 on keys
+            // and ~1/3 on motion under SYN-only, and bounded by the tick rate
+            // under burst coalescing however fast input arrives. END of the
+            // line, per the rule above — never inserted mid-line.
+            crate::pci::serial_debug(" pollwake=");
+            crate::pci::serial_debug_hex_64(evdev_server::poll_wakes());
             crate::pci::serial_debug("\n");
         }
     }
