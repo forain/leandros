@@ -108,6 +108,44 @@ export COSMIC_RENDER_DEVICE="${COSMIC_RENDER_DEVICE:-226:0}"
 if [ -n "${GBM_ALWAYS_SOFTWARE:-}" ]; then
 	export GBM_ALWAYS_SOFTWARE
 fi
+
+# ---- Vulkan-backed rendering via Zink ---------------------------------------
+# smithay has NO Vulkan renderer — its only `impl Renderer` are Gles, Glow,
+# Pixman and Dummy — so cosmic-comp composites through GLES no matter what.
+# Zink is Mesa's gallium driver that implements OpenGL *on Vulkan*, so pointing
+# the GLES stack at it turns every compositor draw into Vulkan work, which the
+# Venus ICD carries to the host GPU. No smithay or cosmic-comp change involved.
+#
+# (cosmic-comp does enable smithay's `backend_vulkan` feature, but that is the
+# Vulkan *allocator*, and only in the nested-X11 backend — src/backend/kms/,
+# which is what we run, never touches it. It allocates buffers; it does not
+# render.)
+#
+# ⚠ OPT-IN (LEANDROS_ZINK=1), because cosmic-comp does NOT yet work on it.
+# kmscube does — `renderer: "zink Vulkan 1.4(Virtio-GPU Venus (AMD Ryzen 9 7950X
+# (RADV RAPHAEL_MENDOCINO)))"`, GLES 3.2, 99.96 fps — so the stack itself is
+# sound. cosmic-comp's GBM scanout allocation takes the classic
+# VIRTGPU_RESOURCE_CREATE path, and under a *Venus* host context virglrenderer
+# has no virgl 3D context to own that resource, so RESOURCE_ATTACH_BACKING is
+# rejected (`virtio_gpu_virgl_process_cmd: ctrl 0x106, error 0x1200`) and the
+# guest goes down with it. Proven Zink-specific: the identical Venus device with
+# LEANDROS_NO_ZINK=1 runs cosmic-comp cleanly with zero 0x106 errors. The fix is
+# to route allocation through blob resources when the capset is Venus.
+#
+# Both halves must also be present. The failure mode is silent otherwise:
+# MESA_LOADER_DRIVER_OVERRIDE=zink with no reachable ICD does not fall back to
+# softpipe, it fails to create a screen at all. zink dlopen()s "libvulkan.so.1" —
+# unlike vktest, which dlopens the ICD directly by absolute path and needs no
+# loader, which is why one was never shipped before.
+_leandros_icd="/usr/share/vulkan/icd.d/virtio_icd.$(uname -m).json"
+if [ "${LEANDROS_ZINK:-0}" = "1" ] && [ -r "$_leandros_icd" ] && [ -r /usr/lib/libvulkan.so.1 ]; then
+	# Name the ICD explicitly rather than relying on the loader's directory
+	# scan: there is exactly one, and a scan needs a working /usr/share walk.
+	export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-$_leandros_icd}"
+	export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-zink}"
+	export GALLIUM_DRIVER="${GALLIUM_DRIVER:-zink}"
+fi
+unset _leandros_icd
 # The card now implements atomic KMS, and atomic is the ONLY smithay path
 # that can program a cursor plane (the legacy backend clears the cursor and
 # overlay plane lists outright), so leave it unset by default. Export

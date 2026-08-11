@@ -520,6 +520,12 @@ def main():
                # libzstd.so.1", GBM device creation fails, and cosmic-comp
                # panics in smithay's `Failed to load LibEGL`.
                "libzstd.so.1", "libstdc++.so.6", "libgcc_s.so.1",
+               # The Khronos Vulkan loader, needed only by Zink (GL-on-Vulkan).
+               # vktest reaches Venus by dlopen()ing libvulkan_virtio.so at an
+               # absolute path and never wanted a loader; zink dlopen()s
+               # "libvulkan.so.1" and has no other way to find an ICD, so
+               # without this the whole GL stack silently falls back.
+               "libvulkan.so.1",
                "libwayland-client.so.0", "libwayland-server.so.0",
                # libwayland-egl.so.1 is dlopen()ed at runtime by wayland-sys
                # (wayland-egl.rs egl.rs:25 tries "libwayland-egl.so.1" then
