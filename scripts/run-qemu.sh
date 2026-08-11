@@ -20,6 +20,21 @@ QEMU_EXTRA_ARGS=()
 # after the display selection for what it changes and why it never autodetects.
 VENUS=0
 if [ "${LEANDROS_VENUS:-0}" = "1" ]; then VENUS=1; fi
+# virgl (OpenGL passthrough) on x86_64 via virtio-vga-gl.
+#
+# OPT-IN, not default. The plumbing works end to end — `kmscube` inside the
+# guest reports `renderer: "virgl (AMD Ryzen 9 7950X ... radeonsi ...)"`, i.e.
+# real host-GPU OpenGL — but **cosmic-comp still dies with SIGSEGV** somewhere
+# in the classic virgl resource path (RESOURCE_CREATE_3D / TRANSFER_*_3D, which
+# Venus never exercised because it uses blob resources). Until that is fixed,
+# the default has to stay on the device that gives a working desktop.
+#
+# `--virgl` (or LEANDROS_VIRGL=1) selects virtio-vga-gl. Note the guest's DRM
+# identity follows the device automatically: with virgl negotiated card0 reports
+# `virtio_gpu` so Mesa loads the virgl driver, otherwise it reports
+# `leandros-drm` and Mesa falls through to softpipe.
+VIRGL=0
+if [ "${LEANDROS_VIRGL:-0}" = "1" ]; then VIRGL=1; fi
 
 # Hardware acceleration only applies when the guest architecture matches the
 # host's — a hypervisor virtualises, it does not translate. Map uname's arch
@@ -83,6 +98,8 @@ while [[ "$#" -gt 0 ]]; do
         --kvm) ACCEL="kvm"; shift ;;
         --tcg) ACCEL="tcg"; shift ;;
         --venus) VENUS=1; shift ;;
+        --virgl) VIRGL=1; shift ;;
+        --no-virgl) VIRGL=0; shift ;;
         -d) QEMU_EXTRA_ARGS+=("$2"); shift 2 ;;
         *) QEMU_EXTRA_ARGS+=("$1"); shift ;;
     esac
@@ -176,8 +193,20 @@ if [ "$ARCH" = "aarch64" ]; then
         GPU_DEV="virtio-gpu-pci"
     fi
 else
-    # x86_64: virtio-vga provides VGA registers so OVMF can set up a GOP framebuffer.
-    if $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-vga; then
+    # x86_64 needs a VGA-compatible device or OVMF has no GOP to hand Limine —
+    # which is why virtio-gpu-gl-pci is NOT a candidate here, however much we
+    # want its virgl. virtio-vga-gl is the device that satisfies both: it is
+    # virtio-vga plus a virglrenderer context, so OVMF still sees VGA registers
+    # and the guest still gets 3D. Prefer it, and keep plain virtio-vga as the
+    # fallback for a QEMU built without virglrenderer.
+    #
+    # Ordering matters: `grep -q virtio-vga` also matches "virtio-vga-gl", so the
+    # GL probe has to come FIRST or it can never be reached. That exact shadowing
+    # is what made the old virtio-gpu-gl-pci branch below dead code on x86_64.
+    if [ "$VIRGL" = "1" ] && $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-vga-gl; then
+        GPU_DEV="virtio-vga-gl"
+        GL_ARGS=("-display" "default,gl=on")
+    elif $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-vga; then
         GPU_DEV="virtio-vga"
     elif $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-gpu-gl-pci; then
         GPU_DEV="virtio-gpu-gl-pci"

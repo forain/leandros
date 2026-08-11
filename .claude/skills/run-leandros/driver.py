@@ -168,6 +168,34 @@ def _venus_vnc_args(venus):
     return ["-vnc", f"{VENUS_VNC_ADDR},display=venusgpu"]
 
 
+def _virgl_usable():
+    """True when this host's QEMU can give the x86_64 guest a virgl 3D context.
+
+    Requires `virtio-vga-gl` (a QEMU built against virglrenderer) *and* an
+    `egl-headless` display, since the device is inert without a host GL context.
+    Both are absent on macOS, which has no native EGL — see the Venus notes.
+
+    `LEANDROS_VIRGL=0` forces the plain virtio-vga path back; it is the first
+    thing to try when a display problem appears and you need to know whether 3D
+    is implicated. Mirrors `run-qemu.sh --no-virgl`.
+    """
+    # OPT-IN: cosmic-comp still SIGSEGVs on the virgl path even though
+    # kmscube proves real host-GPU GL works. Default off so the desktop keeps
+    # working; LEANDROS_VIRGL=1 selects it. Mirrors `run-qemu.sh --virgl`.
+    if os.environ.get("LEANDROS_VIRGL", "0") != "1":
+        return False
+    try:
+        devs = subprocess.run(["qemu-system-x86_64", "-device", "help"],
+                              capture_output=True, text=True, timeout=20)
+        if "virtio-vga-gl" not in (devs.stdout + devs.stderr):
+            return False
+        disp = subprocess.run(["qemu-system-x86_64", "-display", "help"],
+                              capture_output=True, text=True, timeout=20)
+        return "egl-headless" in (disp.stdout + disp.stderr)
+    except Exception:
+        return False
+
+
 def _host_arch():
     """uname -m spelling normalised so arm64/aarch64 and x86_64/amd64 compare."""
     m = platform.machine().lower()
@@ -472,8 +500,29 @@ def _build_cmd(arch, mode="uefi", venus=False):
         # `--venus` section for why `device=` isn't used instead). Matches
         # run-qemu.sh's --venus resetting X86_UEFI_VGA_ARGS to empty.
         vga_args = [] if venus else ["-vga", "none"]
-        gpu_args = ["-device", VENUS_GPU_DEV] if venus else ["-device", "virtio-vga"]
-        display_arg = "egl-headless" if venus else "none"
+        virgl = False
+        if venus:
+            gpu_args = ["-device", VENUS_GPU_DEV]
+            display_arg = "egl-headless"
+        elif _virgl_usable():
+            virgl = True
+            # virtio-vga-gl = virtio-vga + virglrenderer: it keeps the VGA
+            # registers OVMF needs for a GOP, so unlike virtio-gpu-gl-pci it is
+            # a legal x86_64 primary display. egl-headless rather than none —
+            # `none` would drop the host GL context the device needs, silently
+            # degrading it back to a plain virtio-vga.
+            #
+            # It needs the same `-vnc` 2D consumer the venus path uses. Once the
+            # guest scans out through GL, QEMU keeps the framebuffer as a host
+            # texture and the console has no DisplaySurface, so a bare
+            # `screendump` fails outright with "no surface" — the device having
+            # VGA registers does NOT mean it keeps a dumpable 2D surface. An
+            # attached VNC client forces QEMU to maintain one.
+            gpu_args = ["-device", "virtio-vga-gl"]
+            display_arg = "egl-headless"
+        else:
+            gpu_args = ["-device", "virtio-vga"]
+            display_arg = "none"
         return [
             "qemu-system-x86_64",
             "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", *cpu_flags, "-m", _guest_mem(),
@@ -496,6 +545,7 @@ def _build_cmd(arch, mode="uefi", venus=False):
             "-no-reboot", "-parallel", "none",
             "-display", display_arg,
             *_venus_vnc_args(venus),
+            *(["-vnc", VENUS_VNC_ADDR] if virgl else []),
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
             "-serial", "chardev:serial0",
             "-monitor", f"unix:{MONITOR_SOCK},server,nowait",

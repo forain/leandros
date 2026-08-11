@@ -89,13 +89,25 @@ export COSMIC_BACKEND="${COSMIC_BACKEND:-kms}"
 # bring-up used when the compositor first presented on both arches.
 export COSMIC_RENDER_DEVICE="${COSMIC_RENDER_DEVICE:-226:0}"
 
-# ---- renderer: force software (no GPU GL for the toolkit + scanout) ---------
-# There is no hardware GL on the QEMU guest, so every rendering path must be
-# CPU/software: GBM must hand out software buffers, smithay must use the legacy
-# (non-atomic) KMS path, and the syncobj / direct-scanout fast paths (which need
-# real DRM features we don't emulate) must be disabled. These five together are
-# the proven-good M5f compositor configuration that presented on both arches.
-export GBM_ALWAYS_SOFTWARE="${GBM_ALWAYS_SOFTWARE:-1}"
+# ---- renderer: hardware GL when the host offers it, software otherwise ------
+# The syncobj / direct-scanout fast paths still need real DRM features we do not
+# emulate, so those stay disabled below regardless. What changed is GBM.
+#
+# GBM_ALWAYS_SOFTWARE=1 forces GBM's swrast backend, which pins the whole stack
+# to softpipe no matter what the card can do. That was correct while every host
+# device was a plain virtio-vga/virtio-gpu-pci with no 3D. It is NOT correct on
+# `virtio-vga-gl`, where the host runs virglrenderer and the guest's Mesa has
+# the `virgl` gallium driver: leaving this set makes the GPU unreachable and
+# silently keeps the CPU rasterizer.
+#
+# Unset by default so GBM binds the real virtio_gpu device. The shipped
+# megadriver carries BOTH virgl and softpipe, so a host without 3D still has a
+# working driver to fall back to. Export GBM_ALWAYS_SOFTWARE=1 before starting
+# the session to force the old CPU-only path — pair it with `run-qemu.sh
+# --no-virgl` when you need to know whether 3D is implicated in a display bug.
+if [ -n "${GBM_ALWAYS_SOFTWARE:-}" ]; then
+	export GBM_ALWAYS_SOFTWARE
+fi
 # The card now implements atomic KMS, and atomic is the ONLY smithay path
 # that can program a cursor plane (the legacy backend clears the cursor and
 # overlay plane lists outright), so leave it unset by default. Export

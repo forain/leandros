@@ -511,6 +511,15 @@ def main():
     gbm_files = []
     for so in ("libEGL.so.1", "libGLESv2.so.2", "libgbm.so.1", "libdrm.so.2",
                "libgallium-25.3.6.so", "libexpat.so.1", "libz.so.1",
+               # New DT_NEEDEDs of the virgl-enabled megadriver. The previous
+               # softpipe-only build (zig cross-musl) needed only z/expat/drm;
+               # the Alpine-native build that adds virgl pulls in zstd for its
+               # shader cache and the C++ runtime that gallium's C++ sources
+               # require. Missing them is not a soft failure: the Mesa loader
+               # reports "failed to open dri: Error loading shared library
+               # libzstd.so.1", GBM device creation fails, and cosmic-comp
+               # panics in smithay's `Failed to load LibEGL`.
+               "libzstd.so.1", "libstdc++.so.6", "libgcc_s.so.1",
                "libwayland-client.so.0", "libwayland-server.so.0",
                # libwayland-egl.so.1 is dlopen()ed at runtime by wayland-sys
                # (wayland-egl.rs egl.rs:25 tries "libwayland-egl.so.1" then
