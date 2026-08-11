@@ -1322,6 +1322,37 @@ fn dumb_lookup(handle: u32) -> Option<DumbBuf> {
     DUMB_BUFFERS.lock().get(&handle).filter(|b| b.handle_live).copied()
 }
 
+/// The host virtio-gpu resource already bound to `handle`, if any.
+///
+/// ## Why this exists — a resource-id space that overlapped itself
+///
+/// Three framebuffer paths derived their host resource as `handle + 10`, with a
+/// comment explaining it avoided the kernel console's id 1. That was true and
+/// insufficient: `alloc_resource_id()` hands out 3D and blob resource ids
+/// starting at **16** (`virtio_gpu.rs`), so gem handle 6 produced host resource
+/// 16 — the very first id the 3D allocator returns. Two live buffers then name
+/// one host resource.
+///
+/// It stayed invisible while the two spaces were never busy at once: dumb
+/// buffers were the softpipe desktop and 3D resources were Venus, and nothing
+/// ran both. Zink runs both. The symptom is a host-side refusal of a *later*
+/// command on the resource — `RESOURCE_ATTACH_BACKING` answering
+/// `VIRTIO_GPU_RESP_ERR_UNSPEC` — and because `VirtioGpu::submit` is a
+/// synchronous busy-spin, the guest then wedges rather than reporting an error.
+///
+/// Both kinds now draw from the single `alloc_resource_id()` space, and a BO
+/// created by `VIRTGPU_RESOURCE_CREATE` keeps the 3D resource it already owns
+/// instead of having a 2D one created over the top of it.
+fn fb_resource_id(handle: u32) -> Option<u32> {
+    DUMB_BUFFERS.lock().get(&handle).map(|b| b.res_id).filter(|r| *r != 0)
+}
+
+/// Remember the host resource bound to `handle`, so a second ADDFB on the same
+/// BO reuses it rather than allocating (and re-attaching) a second one.
+fn fb_set_resource_id(handle: u32, res_id: u32) {
+    if let Some(b) = DUMB_BUFFERS.lock().get_mut(&handle) { b.res_id = res_id; }
+}
+
 /// Does `handle` name a BO this open may reach, of either kind? Upstream's
 /// `drm_gem_object_lookup` miss, which EXECBUFFER answers -ENOENT to.
 ///
@@ -2470,18 +2501,30 @@ impl DrmDeviceInterface {
         let fb_id = fb.id().0;
         device.framebuffers.insert(fb.id(), fb);
 
-        // If Virtio-GPU is present, create a resource for this framebuffer
+        // If Virtio-GPU is present, bind a resource for this framebuffer.
+        // Looked up BEFORE taking the device lock so the two are never nested.
+        let existing_res = fb_resource_id(buffer.handle);
+        let mut bound_res: Option<u32> = None;
         if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-            // Use handle + 10 as resource ID to avoid conflict with kernel console (1)
-            let res_id = buffer.handle + 10;
-            gpu.create_resource_2d(res_id, width, height);
-            gpu.attach_backing(res_id, mmap_offset as u64, width * height * 4);
-            
+            let res_id = match existing_res {
+                // Already has a host resource (a VIRTGPU_RESOURCE_CREATE 3D BO,
+                // or a second ADDFB on the same buffer) — reuse it.
+                Some(r) => r,
+                None => {
+                    let r = gpu.alloc_resource_id();
+                    gpu.create_resource_2d(r, width, height);
+                    gpu.attach_backing(r, mmap_offset as u64, width * height * 4);
+                    r
+                }
+            };
+
             // Also store the resource ID in the FB's handles for flip_page
             if let Some(fb_obj) = device.framebuffers.get_mut(&DrmObjectId(fb_id)) {
                 fb_obj.handles[0] = res_id;
             }
+            bound_res = Some(res_id);
         }
+        if let Some(r) = bound_res { fb_set_resource_id(buffer.handle, r); }
 
         // Return results to userspace.
         // Slot [4] = 0 forces DOOM through its mmap() branch, which calls sys_mmap →
@@ -2857,14 +2900,31 @@ impl DrmDeviceInterface {
         let phys_addr = dumb_lookup(add.handle).map(|b| b.phys).unwrap_or(0);
         fb.physical_addresses[0] = phys_addr as u64;
 
-        // If Virtio-GPU is present, create a resource for this framebuffer
+        // If Virtio-GPU is present, bind a resource for this framebuffer.
+        // See fb_resource_id: `handle + 10` overlapped the id space
+        // alloc_resource_id() hands 3D/blob resources out of, from 16 up.
+        // Resolved before the device lock so DUMB_BUFFERS is never nested
+        // inside VIRTIO_GPU.
+        let existing_res = fb_resource_id(add.handle);
+        let mut bound_res: Option<u32> = None;
         if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-            // Use handle + 10 as resource ID to avoid conflict with kernel console (1)
-            let res_id = add.handle + 10;
-            gpu.create_resource_2d(res_id, add.width, add.height);
-            gpu.attach_backing(res_id, phys_addr as u64, add.width * add.height * 4);
+            let res_id = match existing_res {
+                // A BO that already owns a host resource — a
+                // VIRTGPU_RESOURCE_CREATE 3D buffer, or a re-ADDFB — keeps it.
+                // Creating a 2D resource over the top would either collide with
+                // the 3D one or double-attach its backing.
+                Some(r) => r,
+                None => {
+                    let r = gpu.alloc_resource_id();
+                    gpu.create_resource_2d(r, add.width, add.height);
+                    gpu.attach_backing(r, phys_addr as u64, add.width * add.height * 4);
+                    r
+                }
+            };
             fb.handles[0] = res_id;
+            bound_res = Some(res_id);
         }
+        if let Some(r) = bound_res { fb_set_resource_id(add.handle, r); }
 
         let fb_id = fb.id().0;
         device.framebuffers.insert(fb.id(), fb);
@@ -3639,12 +3699,23 @@ impl DrmDeviceInterface {
         // Bind a virtio-gpu resource so SETCRTC/PAGE_FLIP/DIRTYFB can transfer the
         // CPU-rendered pixels to the host. (This locks VIRTIO_GPU, not the DRM
         // device — no user memory is touched here.)
+        // See fb_resource_id for why this is no longer `handle + 10`.
+        let existing_res = fb_resource_id(handle);
+        let mut bound_res: Option<u32> = None;
         if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-            let res_id = handle + 10;
-            gpu.create_resource_2d(res_id, width, height);
-            gpu.attach_backing(res_id, phys_addr as u64, width * height * 4);
+            let res_id = match existing_res {
+                Some(r) => r,
+                None => {
+                    let r = gpu.alloc_resource_id();
+                    gpu.create_resource_2d(r, width, height);
+                    gpu.attach_backing(r, phys_addr as u64, width * height * 4);
+                    r
+                }
+            };
             fb.handles[0] = res_id;
+            bound_res = Some(res_id);
         }
+        if let Some(r) = bound_res { fb_set_resource_id(handle, r); }
 
         let fb_id = fb.id().0;
         {
@@ -4944,8 +5015,8 @@ impl DrmDumbBuffer {
                 obj: NEXT_BO_OBJ.fetch_add(1, Ordering::Relaxed),
                 refs: 1,
                 handle_live: true,
-                // A dumb buffer's host resource is derived as `handle + 10` at
-                // ADDFB time, not allocated here.
+                // A dumb buffer's host resource is allocated lazily at ADDFB
+                // time (see fb_resource_id), not here.
                 res_id: 0,
             },
         );
