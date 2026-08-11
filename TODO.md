@@ -3,7 +3,7 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-10**. **LeandrOS has a PTY subsystem, six virtual
+Last reconciled against `main` on **2026-08-11**. **LeandrOS has a PTY subsystem, six virtual
 terminals, and a terminal emulator on the desktop.** `cosmic-term` is photographed on **both**
 arches inside COSMIC over the Orion Nebula wallpaper with a live `brush-0.5#` prompt, and `id`
 typed through the emulated keyboard executed and printed
@@ -16,6 +16,59 @@ arches, on freshly generated images.
 **utmpx** and **VT switching** all left *Explicitly out of scope* (items 12-14), and every
 conclusion that rested on them being out of scope is void. **VT switching has since landed**
 (item 14); PAM (12) and utmpx (13) are untouched.
+
+---
+
+**What landed on 2026-08-11: the desktop stopped being slow, and it now composites on the
+GPU.** Two independent efforts, both measured rather than argued.
+
+**The sluggish desktop was our own kernel, not softpipe.** COSMIC on x86_64/KVM managed one
+screen update every 3-5 s. Measured under 30 pointer moves/s: **0.20 fps, mean gap 4.71 s**,
+with QEMU's main loop at 14.5% while four vCPUs burned 212% of a core — so the host was never
+implicated. Sampling 34k guest RIPs put **74.4% of running time in the kernel** and 25.6% in
+userspace, where the rasterizer lives. Three causes, now fixed: `arch_cpu_id()` read the LAPIC
+ID over **uncached MMIO** on every `current_pid()` (12.5%; the index now rides in
+`IA32_TSC_AUX` via `__rdtscp`, with the LAPIC read kept as the CPUID-gated fallback — aarch64
+never showed it because `mrs mpidr_el1` is a register read); both epoll probe loops walked all
+**512** interest slots taking the global lock **once per slot** (22.3%; now bounded by a
+per-instance high-water mark); and `tgid_of` was `RUN_QUEUE.lock()` plus a 256-slot scan
+(10.3%, rising to 21.7% under acceleration; now a lock-free open-addressed pid→tgid side
+table, written only under the scheduler lock). Result: **0.20 → 1.00 fps** (the 1 Hz panel
+clock is now the ceiling, not a bottleneck), idle headroom 22.1% → **41.3%**, kernel share of
+running time 74.4% → **57.7%**, userspace 25.6% → **42.3%**.
+
+A fourth item was planned and **refuted by measurement**: per-instance poll wait channels to
+break the thundering herd. Once the scans are bounded, `unblock_port` measures 0.7% — the
+herd's cost was never the wakeups, it was the 512-slot rescan each woken task did. The design
+note choosing one global `POLL_WAIT_CHANNEL` is still correct.
+
+**Guest OpenGL reaches the host GPU, two ways.** `virtio-vga-gl` (VGA registers for OVMF's
+GOP *and* virglrenderer) is now selectable on x86_64 — `run-qemu.sh --virgl` — and Mesa is
+built with the `virgl` gallium driver: `kmscube` reports
+`renderer: "virgl (AMD Ryzen 9 7950X … radeonsi …)"`. Separately, and the one that matters for
+the compositor: **cosmic-comp composites on Vulkan** via **Zink** (`LEANDROS_ZINK=1` on a
+`--venus` device). smithay has **no Vulkan renderer** — its only `impl Renderer` are Gles,
+Glow, Pixman, Dummy, and the `backend_vulkan` it does enable is an *allocator* used only by
+the nested-X11 backend — so Zink (OpenGL-on-Vulkan) is what turns the existing GLES path into
+Vulkan work without forking smithay. `kmscube`: `zink Vulkan 1.4(Virtio-GPU Venus (… RADV
+RAPHAEL_MENDOCINO))`, GLES **3.2**, **99.96 fps**. cosmic-comp's own log shows
+`virtgpu context created, capset=0x00000004` — capset 4 is Venus — and the session starts with
+zero panics and zero host GPU errors.
+
+Both GPU paths ship **opt-in**, and the default stays softpipe: the virgl path is not yet
+faster, and **neither has had its pixels verified** — `screendump` cannot photograph a session
+once GL scanout engages, because the console then holds a texture rather than a
+DisplaySurface and QMP answers `"no surface"` outright. Confirming pixels needs a real VNC
+client against the `-vnc` listener. That is the next step for both.
+
+Three bugs found along the way are worth keeping in mind because none was where it looked:
+the DRM driver **name** (`leandros-drm`) was deliberately unrecognised so Mesa's loader would
+fall through to software, which became the bug the moment the megadriver gained virgl; the
+classic 3D resource path was a **stub** with no guest backing and no registry entry, so every
+dmabuf export returned an invalid fd; and three framebuffer paths derived their host resource
+as **`handle + 10`**, overlapping the id space `alloc_resource_id()` hands out from 16 — a
+collision that could not bite until Zink made both spaces busy at once, and that wedged the
+guest rather than erroring because `VirtioGpu::submit` busy-spins.
 
 ---
 
@@ -529,9 +582,14 @@ the gap is ever closed.
 - COSMIC builds for `*-unknown-linux-musl`, **dynamically linked** against a real
   `ld-musl`. No Rust std port. `dlopen` is on the critical path in three places
   (cosmic-comp's EGL loading, Mesa's GBM/DRI loader, cosmic-panel's `use_system_lib`).
-- Graphics: Mesa **softpipe** via gallium `kms_swrast` over dumb buffers. The atomic
-  KMS path is live and preferred; the legacy path still works but cannot drive a
-  cursor plane.
+- Graphics: Mesa **softpipe** via gallium `kms_swrast` over dumb buffers is the
+  **default**. The atomic KMS path is live and preferred; the legacy path still works
+  but cannot drive a cursor plane. Two GPU paths now exist alongside it, both opt-in
+  and both with pixels still unverified: **virgl** (`--virgl`, `virtio-vga-gl`) and
+  **Zink over Venus** (`LEANDROS_ZINK=1` on `--venus`), the latter being how
+  cosmic-comp composites on Vulkan given smithay has no Vulkan renderer. card0's DRM
+  identity follows the device — `virtio_gpu` when VIRGL is negotiated so Mesa's loader
+  picks a hardware driver, `leandros-drm` otherwise so it falls through to software.
 - Seat/input: **shim** libseat and libudev; **port** real libinput and libxkbcommon.
   No seatd, no udevd. **VT switching is implemented** — six VTs, the VT/KD ioctl set and
   Ctrl+Alt+Fn (item 14) — reversing the original out-of-scope decision. The libseat shim is
@@ -3099,7 +3157,20 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
   The idle damage counters confirm it from data. The separately-observed 128-dmabuf-fd burn
   in ~1 s and the `MAX_FDS` 64→128 raise are untouched by this and still stand.
 - **llvmpipe** — the TCG-performance lever, staged but not landed. softpipe was chosen for
-  correctness (portable C, no per-arch LLVM codegen bring-up ×2).
+  correctness (portable C, no per-arch LLVM codegen bring-up ×2). Still the right answer
+  where there is no host GPU at all (the Mac has no EGL, so neither virgl nor Venus can
+  run there), and the build recipe is the same Alpine/podman one the virgl and Zink
+  ship-sets now use — `-Dgallium-drivers=llvmpipe,softpipe` with LLVM enabled.
+- **Verify the GPU paths' pixels.** Both virgl and Zink are opt-in precisely because no
+  frame has been photographed: `screendump` cannot capture a session once GL scanout
+  engages. Needs a real VNC client driven against the `-vnc` listener (egl-headless
+  blits the GL scanout into the 2D console surface only when a 2D listener is attached).
+  Until then "the session runs" is verified and "it draws the right thing" is not.
+- **`VirtioGpu::submit` busy-spins.** A command the host refuses leaves the guest
+  spinning instead of returning an error — which is how a resource-id collision
+  presented as a wedged guest, and once as QEMU exiting via `-no-reboot`. A bounded wait
+  with a diagnostic would have turned a day's hunt into a log line. Related: the ISR work
+  (there is no device IRQ infrastructure; even the keyboard is polled).
 - **Synthetic sysfs** — the read-only `/sys/dev/char`, `/sys/class/drm`, `/sys/class/input`
   design in `docs/design/k4-drm-design.md` is execution-ready but deferred; no current
   consumer needs the enumeration.
