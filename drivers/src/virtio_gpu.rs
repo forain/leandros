@@ -657,6 +657,8 @@ impl VirtioGpuDevice {
                 (VIRTIO_GPU_F_RESOURCE_BLOB, "RESOURCE_BLOB"),
                 (VIRTIO_GPU_F_CONTEXT_INIT, "CONTEXT_INIT"),
             ];
+            VIRGL_NEGOTIATED.store(dev_lo & (1 << VIRTIO_GPU_F_VIRGL) != 0,
+                                   core::sync::atomic::Ordering::Relaxed);
             for &(bit, name) in checks.iter() {
                 if dev_lo & (1 << bit) == 0 {
                     crate::pci::serial_debug("[GPU] *** host does NOT offer VIRTIO_GPU_F_");
@@ -1225,17 +1227,35 @@ impl VirtioGpuDevice {
     }
 
     pub fn create_resource_3d(&mut self, resource_id: u32, width: u32, height: u32, format: u32) -> bool {
+        // Back-compat shim for callers with only 2D geometry to offer.
+        self.create_resource_3d_full(resource_id, 2, format, 1, width, height, 1, 1, 0, 0, 0)
+    }
+
+    /// RESOURCE_CREATE_3D with the caller's **actual** pipe parameters.
+    ///
+    /// The old entry point hardcoded `target=PIPE_TEXTURE_2D`, `bind=RENDER_TARGET`,
+    /// `depth=1`, `array_size=1` and dropped `last_level`/`nr_samples`/`flags`
+    /// on the floor. virglrenderer builds the host-side resource from exactly
+    /// these fields, so a Mesa allocation asking for anything else — a
+    /// non-render-target bind, a mip chain, an array texture — got a host
+    /// resource that did not match the guest's idea of it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_resource_3d_full(
+        &mut self, resource_id: u32, target: u32, format: u32, bind: u32,
+        width: u32, height: u32, depth: u32, array_size: u32,
+        last_level: u32, nr_samples: u32, flags: u32,
+    ) -> bool {
         let cmd = VirtioGpuResourceCreate3d {
             hdr: VirtioGpuCtrlHdr {
                 type_: VirtioGpuCmd::ResourceCreate3d as u32,
                 flags: 0, fence_id: 0, ctx_id: 0, padding: 0,
             },
             resource_id,
-            target: 2, // PIPE_TEXTURE_2D
+            target,
             format,
-            bind: 1,   // PIPE_BIND_RENDER_TARGET
-            width, height, depth: 1, array_size: 1,
-            last_level: 0, nr_samples: 0, flags: 0, padding: 0,
+            bind,
+            width, height, depth, array_size,
+            last_level, nr_samples, flags, padding: 0,
         };
         let data = unsafe { core::slice::from_raw_parts(&cmd as *const _ as *const u8, core::mem::size_of::<VirtioGpuResourceCreate3d>()) };
         self.send_command_raw(data).is_ok()
@@ -1550,8 +1570,23 @@ impl VirtioGpuDevice {
     /// byte) — this is what selects Venus rather than the default virgl context.
     /// Returns the new context id.
     pub fn ctx_create(&mut self, capset_id: u32, debug_name: &str) -> Result<u32, ()> {
-        if !self.venus_available() {
-            crate::pci::serial_debug("[GPU] ctx_create refused: host lacks VIRGL/BLOB/CONTEXT_INIT\n");
+        // Gate on what a context of THIS capset actually needs, not on the
+        // Venus superset. Classic virgl (capset 1/2) needs neither host-visible
+        // blob resources nor, for the default context, CONTEXT_INIT — and
+        // `virtio-vga-gl` offers exactly VIRGL + CONTEXT_INIT with
+        // RESOURCE_BLOB=0. Gating all of 3D on `venus_available()` refused
+        // every context on that device, so a host advertising working virgl
+        // (SUPPORTED_CAPSET_IDs = 0b110) could never be used at all.
+        // Blob remains gated where it belongs, in `resource_create_blob`.
+        if !self.has_feature(VIRTIO_GPU_F_VIRGL) {
+            crate::pci::serial_debug("[GPU] ctx_create refused: host lacks VIRTIO_GPU_F_VIRGL\n");
+            return Err(());
+        }
+        // context_init carries the capset selector; without the feature the
+        // host ignores the field and hands back its default (virgl) context,
+        // so asking for a *specific* capset is the only case that needs it.
+        if capset_id != 0 && !self.has_feature(VIRTIO_GPU_F_CONTEXT_INIT) {
+            crate::pci::serial_debug("[GPU] ctx_create refused: capset requested but no CONTEXT_INIT\n");
             return Err(());
         }
         #[repr(C, packed)]
@@ -1849,8 +1884,16 @@ impl VirtioGpuDevice {
     /// the host, and failing the ioctl on it would break clients on hosts that
     /// answer differently but work.
     pub fn submit_3d(&mut self, ctx_id: u32, cmds: &[u8], ring_idx: Option<u8>) -> Result<u64, ()> {
-        if !self.venus_available() {
-            crate::pci::serial_debug("[GPU] submit_3d refused: 3D features unavailable\n");
+        // SUBMIT_3D carries an opaque, context-type-specific command stream —
+        // Venus protocol for a capset-4 context, virgl commands for a virgl
+        // one. The command is the same either way and needs only VIRGL; the
+        // blob/context-init requirements belong to Venus's *resources*, not to
+        // submission. Gating here on `venus_available()` let a virgl context be
+        // created and then refused at its first draw, which surfaces as Mesa's
+        // "got error from kernel - expect bad rendering" and a compositor that
+        // dies with "Backend initialized without output".
+        if !self.has_feature(VIRTIO_GPU_F_VIRGL) {
+            crate::pci::serial_debug("[GPU] submit_3d refused: host lacks VIRTIO_GPU_F_VIRGL\n");
             return Err(());
         }
         if cmds.is_empty() {
@@ -1942,6 +1985,24 @@ impl VirtioGpuDevice {
 }
 
 pub static VIRTIO_GPU: Mutex<Option<VirtioGpuDevice>> = Mutex::new(None);
+
+/// Whether the host negotiated `VIRTIO_GPU_F_VIRGL`, readable without taking
+/// [`VIRTIO_GPU`].
+///
+/// Exists for `DRM_IOCTL_VERSION`, which must answer with a *different driver
+/// name* depending on it: Mesa's DRI loader picks the gallium driver by that
+/// string, so `virtio_gpu` routes it to virgl and anything else falls through
+/// to the software backend. Reporting `virtio_gpu` unconditionally would send
+/// GBM/EGL down the virgl path on a plain `virtio-vga` with no 3D at all,
+/// breaking the software desktop that is otherwise fine — so the identity has
+/// to track the device we actually got.
+pub static VIRGL_NEGOTIATED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// True when this guest's virtio-gpu negotiated virgl, i.e. host 3D is real.
+pub fn virgl_negotiated() -> bool {
+    VIRGL_NEGOTIATED.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 pub fn init() {
     let mut gpu = VIRTIO_GPU.lock();

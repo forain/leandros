@@ -802,6 +802,16 @@ struct DumbBuf {
     /// resolution path treats it as absent, so the handle number is as dead as
     /// it was before this refcount existed.
     handle_live: bool,
+    /// Host virtio-gpu resource id for a BO created by
+    /// `DRM_IOCTL_VIRTGPU_RESOURCE_CREATE` (a virgl 3D resource), or 0 for a
+    /// plain dumb buffer whose host resource is derived elsewhere.
+    ///
+    /// virgl BOs live in this registry rather than one of their own precisely
+    /// so that every existing consumer resolves them unchanged — PRIME export,
+    /// MAP_DUMB, ADDFB2 and the refcounted BO lifetime all key off a gem handle
+    /// here. What they could not derive is the *host* resource id, which
+    /// TRANSFER_TO/FROM_HOST_3D need, so it is carried alongside.
+    res_id: u32,
 }
 
 static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new());
@@ -1126,6 +1136,53 @@ fn ctx_lookup(open_id: u32) -> u32 {
 ///                        must destroy the context it just created and report
 ///                        success, because the open does now have a context.
 const CTX_BIND_NO_SLOT: u32 = 0;
+
+/// Return this open's context id, creating the **default** (virgl) context on
+/// first use if it has none.
+///
+/// Upstream Linux never requires an explicit `CONTEXT_INIT`: `vfpriv` starts
+/// with `context_created = false` and `virtio_gpu_create_context()` runs lazily
+/// from the first ioctl that needs one, with capset 0 so the host picks its
+/// default — virgl. Mesa's virgl winsys leans on that; it only issues
+/// CONTEXT_INIT when it wants a *specific* capset. We required CONTEXT_INIT
+/// unconditionally, which was invisible while Venus was the only consumer
+/// (Venus always asks for capset 4 explicitly) and fails every classic virgl
+/// client at its first EXECBUFFER.
+///
+/// Returns 0 only when no context could be established, which callers must
+/// still treat as a refusal.
+fn ctx_ensure(open_id: u32) -> u32 {
+    if let Some(c) = ctx_lookup_entry(open_id) { return c.ctx_id; }
+    if open_id == 0 { return 0; }
+
+    // capset 0 = "host default". Deliberately not VIRTIO_GPU_CAPSET_VIRGL: the
+    // host may prefer virgl2, and letting it choose is what upstream does.
+    let ctx = {
+        let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+        match guard.as_mut() {
+            Some(gpu) => match gpu.ctx_create(0, "leandros-virgl") {
+                Ok(c) => c,
+                Err(_) => return 0,
+            },
+            None => return 0,
+        }
+    };
+    match ctx_bind(open_id, ctx, 0, 1) {
+        Ok(()) => ctx,
+        // Lost a race: another thread on this open bound first. Its context is
+        // as good as ours, so adopt it and drop the one we just made.
+        Err(winner) if winner != CTX_BIND_NO_SLOT => {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            if let Some(gpu) = guard.as_mut() { gpu.ctx_destroy(ctx); }
+            winner
+        }
+        Err(_) => {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            if let Some(gpu) = guard.as_mut() { gpu.ctx_destroy(ctx); }
+            0
+        }
+    }
+}
 
 fn ctx_bind(open_id: u32, ctx_id: u32, capset: u32, num_rings: u32) -> Result<(), u32> {
     if open_id == 0 { return Err(CTX_BIND_NO_SLOT); }
@@ -2584,13 +2641,46 @@ impl DrmDeviceInterface {
     fn std_handle_version(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let v = unsafe { &mut *(arg as *mut drm_version) };
-        v.version_major = 1;
-        v.version_minor = 6;
-        v.version_patchlevel = 0;
+        // The identity FOLLOWS the device we actually got — see the note below.
+        let virgl = crate::virtio_gpu::virgl_negotiated();
+        if virgl {
+            // Upstream virtio_gpu's DRIVER_MAJOR/MINOR/PATCHLEVEL, matching the
+            // render node (servers/drm/src/lib.rs `render_node_version`).
+            v.version_major = 0;
+            v.version_minor = 1;
+            v.version_patchlevel = 0;
+        } else {
+            v.version_major = 1;
+            v.version_minor = 6;
+            v.version_patchlevel = 0;
+        }
 
-        let name = "leandros-drm\0";
-        let date = "20261201\0";
-        let desc = "LeandrOS DRM driver\0";
+        // card0 used to report `leandros-drm` ON PURPOSE: Mesa's DRI loader
+        // picks a driver by exactly this string (`loader_get_driver_for_fd`),
+        // and an unrecognised name falls through to the software backend. That
+        // was the right call while the shipped megadriver was softpipe-only —
+        // claiming to be virtio_gpu would have sent the loader hunting for a
+        // virgl driver that was not in the image.
+        //
+        // The megadriver now ships `virgl` alongside softpipe, so the fallback
+        // this name bought is exactly what we no longer want: `leandros-drm`
+        // made Mesa pick kms_swrast and report `renderer: "softpipe"` even
+        // with a working virglrenderer on the host. Reporting the upstream
+        // identity is also the truth — every ioctl behind this node is the
+        // virtgpu ABI.
+        //
+        // ⚠ The tradeoff the old comment warned about is real: on the virgl
+        // identity there is no silent software fallback on this fd. If virgl
+        // cannot initialise, GBM/EGL fail outright rather than degrading. That
+        // is why the name is CONDITIONAL on the host having actually negotiated
+        // VIRTIO_GPU_F_VIRGL — on a plain `virtio-vga` (or `run-qemu.sh
+        // --no-virgl`) we keep the old identity and the software path is
+        // untouched, so the fallback is chosen by the device, not by luck.
+        let (name, date, desc) = if virgl {
+            ("virtio_gpu\0", "0\0", "virtio GPU\0")
+        } else {
+            ("leandros-drm\0", "20261201\0", "LeandrOS DRM driver\0")
+        };
 
         if v.name != 0 && v.name_len >= name.len() {
             unsafe { ptr::copy_nonoverlapping(name.as_ptr(), v.name as *mut u8, name.len()); }
@@ -3757,23 +3847,79 @@ impl DrmDeviceInterface {
         // Copy the request out of user memory before taking the device lock.
         let req = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_resource_create) };
 
+        // ── Guest backing store ──────────────────────────────────────────────
+        // The old code created a host resource and stopped. That left a BO with
+        // no guest pages and no entry in any registry, so:
+        //   * PRIME_HANDLE_TO_FD could not resolve the handle at all, which is
+        //     what smithay reported as `AsDmabufError(InvalidFD(InvalidFdError))`
+        //     for every scanout format, ending in "Backend initialized without
+        //     output"; and
+        //   * TRANSFER_TO_HOST_3D had nothing to transfer *from*.
+        //
+        // Mesa supplies `size` (and `stride`); fall back to a tight 4-byte
+        // packing when it asks us to choose, which is what the 2D scanout
+        // formats virgl hands to KMS all are.
+        let stride = if req.stride != 0 { req.stride } else { req.width.saturating_mul(4) };
+        let size = if req.size != 0 {
+            req.size as usize
+        } else {
+            (stride as usize).saturating_mul(req.height.max(1) as usize)
+        };
+        if size == 0 { return Err(DriverError::InvalidParameter); }
+
+        let pages = size.div_ceil(4096);
+        let order = pages.next_power_of_two().trailing_zeros() as usize;
+        let phys = mm::buddy::alloc(order).ok_or(DriverError::Io)?;
+
         let res_handle = {
             let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
-            let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
+            let gpu = match guard.as_mut() {
+                Some(g) => g,
+                None => { mm::buddy::free(phys, order); return Err(DriverError::NotFound); }
+            };
             // Allocate a real resource id rather than the fixed 1 the stub used,
             // and pass the caller's geometry through instead of an empty command
             // body (which, with the old opcode, was not even RESOURCE_CREATE_3D).
             let rid = gpu.alloc_resource_id();
-            if !gpu.create_resource_3d(rid, req.width, req.height, req.format) {
+            if !gpu.create_resource_3d_full(
+                rid, req.target, req.format, req.bind,
+                req.width, req.height, req.depth.max(1), req.array_size.max(1),
+                req.last_level, req.nr_samples, req.flags,
+            ) {
+                mm::buddy::free(phys, order);
+                return Err(DriverError::Io);
+            }
+            // Without ATTACH_BACKING the host resource has no guest memory bound
+            // and every transfer is a no-op the host silently accepts.
+            if !gpu.attach_backing(rid, phys as u64, size as u32) {
+                mm::buddy::free(phys, order);
                 return Err(DriverError::Io);
             }
             rid
         };
 
-        // bo_handle @40, res_handle @44 in drm_virtgpu_resource_create.
+        // Register in the dumb registry so PRIME export / MAP / ADDFB2 and the
+        // refcounted BO lifetime resolve this handle exactly like any other BO.
+        // The gem handle and the host resource id are DIFFERENT namespaces; the
+        // stub returned the resource id as both, which would have collided with
+        // dumb handles the moment anything else allocated one.
+        let handle = DrmDumbBuffer::next_handle();
+        DUMB_BUFFERS.lock().insert(handle, DumbBuf {
+            phys,
+            order,
+            last_fence: 0,
+            obj: NEXT_BO_OBJ.fetch_add(1, Ordering::Relaxed),
+            refs: 1,
+            handle_live: true,
+            res_id: res_handle,
+        });
+
+        // bo_handle @40, res_handle @44, size @48, stride @52.
         unsafe {
-            (arg as *mut u8).add(40).cast::<u32>().write_volatile(res_handle);
+            (arg as *mut u8).add(40).cast::<u32>().write_volatile(handle);
             (arg as *mut u8).add(44).cast::<u32>().write_volatile(res_handle);
+            (arg as *mut u8).add(48).cast::<u32>().write_volatile(size as u32);
+            (arg as *mut u8).add(52).cast::<u32>().write_volatile(stride);
         }
         Ok(0)
     }
@@ -3857,12 +4003,12 @@ impl DrmDeviceInterface {
         // allocator.
         const MAX_BO_HANDLES: u32 = 1024;
 
-        let entry = ctx_lookup_entry(open_id);
-        let ctx = entry.map(|c| c.ctx_id).unwrap_or(0);
+        let ctx = ctx_ensure(open_id);
         if ctx == 0 {
-            crate::pci::serial_debug("[DRM] EXECBUFFER before CONTEXT_INIT\n");
+            crate::pci::serial_debug("[DRM] EXECBUFFER: no context and none could be created\n");
             return Err(DriverError::InvalidParameter);
         }
+        let entry = ctx_lookup_entry(open_id);
 
         gdbg("[EXECDBG] ctx=");
         gdbg_hex(ctx);
@@ -4798,6 +4944,9 @@ impl DrmDumbBuffer {
                 obj: NEXT_BO_OBJ.fetch_add(1, Ordering::Relaxed),
                 refs: 1,
                 handle_live: true,
+                // A dumb buffer's host resource is derived as `handle + 10` at
+                // ADDFB time, not allocated here.
+                res_id: 0,
             },
         );
         

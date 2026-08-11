@@ -40,13 +40,18 @@ impl DrmDriver {
         match command {
             DRM_VERSION => {
                 // Return DRM version information
+                // Upstream virtio_gpu identity — see the long note in
+                // drm_device_interface.rs `std_handle_version` for why this is
+                // no longer `leandros-drm` (Mesa's DRI loader selects the
+                // gallium driver by this exact string, and the shipped
+                // megadriver now has virgl).
                 let version = DrmVersion {
-                    version_major: 1,
-                    version_minor: 6,
+                    version_major: 0,
+                    version_minor: 1,
                     version_patchlevel: 0,
-                    name: "leandros-drm".to_string(),
-                    date: "20261201".to_string(),
-                    desc: "LeandrOS DRM driver".to_string(),
+                    name: "virtio_gpu".to_string(),
+                    date: "0".to_string(),
+                    desc: "virtio GPU".to_string(),
                 };
                 Ok(version.serialize())
             },

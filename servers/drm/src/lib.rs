@@ -112,12 +112,14 @@ struct drm_version {
 /// render node reports the upstream virtio-gpu identity — which is the truth
 /// about it: everything reachable through it is the virtgpu 3D command stream.
 ///
-/// card0 deliberately keeps reporting `leandros-drm` 1.6.0. Mesa's DRI loader
-/// picks a driver .so by exactly this string (`loader_get_driver_for_fd`), and
-/// card0 is the fd the whole COSMIC/GBM/softpipe path runs on: naming it
-/// `virtio_gpu` would send that loader looking for `virtio_gpu_dri.so` instead
-/// of falling through to the software backend it uses today. Per-node identities
-/// keep that path untouched.
+/// card0 now reports the SAME identity. It used to keep `leandros-drm` 1.6.0
+/// deliberately: Mesa's DRI loader picks a driver by exactly this string
+/// (`loader_get_driver_for_fd`), and while the shipped megadriver was
+/// softpipe-only, an unrecognised name was what made card0 fall through to the
+/// software backend. Once the megadriver gained `virgl`, that fallback became
+/// the bug — Mesa reported `renderer: "softpipe"` against a working
+/// virglrenderer host. Both nodes are the virtgpu ABI and both now say so.
+/// See `std_handle_version` in drivers/src/drm_device_interface.rs.
 ///
 /// Runs in the caller's address space (direct port handler), same as the
 /// card0 version handler it shadows.
