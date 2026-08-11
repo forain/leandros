@@ -259,6 +259,27 @@ pub const VIRTIO_GPU_RESP_OK_MAP_INFO: u32 = 0x1106;
 
 /// Set once the first SUBMIT_3D reply is seen not to echo the fence we asked
 /// for, so the diagnosis is stated once instead of once per frame.
+// ── Control-queue stall census ───────────────────────────────────────────────
+//
+// `submit` answers the host SYNCHRONOUSLY, by spinning the vCPU until the used
+// ring moves (see the `spin_loop` below). Every SET_SCANOUT, RESOURCE_FLUSH,
+// TRANSFER_TO_HOST and ATTACH_BACKING therefore blocks whoever called it for a
+// whole host round trip — and under Venus the host has real GPU work behind
+// that round trip, where softpipe had a memcpy.
+//
+// The cursor queue is deliberately NOT counted here: it is fire-and-forget (a
+// single read-only descriptor, no response), so cursor motion cannot stall.
+// That asymmetry is itself diagnostic — if a freeze correlates with input that
+// moves only the cursor, this is not where it is.
+//
+// `ctrlq_us` against `ctrlq_n` gives the mean round trip; `ctrlq_max` catches
+// the outlier a mean hides. `ctrlq_to` counts the 100M-iteration bail-out,
+// which also prints `[GPU] control-queue TIMEOUT` on its own.
+pub static CTRLQ_CMDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CTRLQ_SPIN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CTRLQ_SPIN_MAX_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CTRLQ_TIMEOUTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 static SUBMIT3D_FENCE_ECHO_WARNED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -889,10 +910,24 @@ impl VirtioGpuDevice {
                 (notify_cfg as usize + q.notify_off as usize * mult as usize) as *mut u16;
             notify_addr.write_volatile(0);
 
+            // Time the spin, not just count it: "how many commands" cannot tell
+            // a fast host from a slow one, and the whole question here is how
+            // long the vCPU is parked. Gated so the clock read costs nothing
+            // when the census is off.
+            let stat = crate::drm_device_interface::DRM_STATS;
+            let t0 = if stat { crate::snd::monotonic_us() } else { 0 };
             let mut timeout = 100_000_000u64;
             while q.last_used_idx == (*q.used).idx && timeout > 0 {
                 core::hint::spin_loop();
                 timeout -= 1;
+            }
+            if stat {
+                use core::sync::atomic::Ordering::Relaxed;
+                let dt = crate::snd::monotonic_us().wrapping_sub(t0);
+                CTRLQ_CMDS.fetch_add(1, Relaxed);
+                CTRLQ_SPIN_US.fetch_add(dt, Relaxed);
+                CTRLQ_SPIN_MAX_US.fetch_max(dt, Relaxed);
+                if timeout == 0 { CTRLQ_TIMEOUTS.fetch_add(1, Relaxed); }
             }
 
             if timeout == 0 {

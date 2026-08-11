@@ -1823,7 +1823,12 @@ static LAST_FLIP_DELIVER_TICK: AtomicU64 = AtomicU64::new(0);
 /// DIRTYFB is never used, and the kernel's own scale+flush costs only ~1.7 ms
 /// per flip. The ~1 fps pointer is therefore the compositor recompositing the
 /// whole screen in software, not anything in this path.
-pub const DRM_STATS: bool = false;
+/// ON while the Zink/Venus input-stall investigation is open: the freeze that
+/// follows a keystroke is a STALL with a catch-up burst after it, not a uniform
+/// slowdown, and only the counters below can say which stage stops. Costs one
+/// serial line every 200 ticks (2 s) plus a clock read per page flip and per
+/// control-queue command. Set back to `false` once that is settled.
+pub const DRM_STATS: bool = true;
 static FLIPS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
 static DIRTYFB_CALLS: AtomicU64 = AtomicU64::new(0);
 static DIRTYFB_CLIPS: AtomicU64 = AtomicU64::new(0);
@@ -2004,6 +2009,22 @@ pub fn drm_tick() {
             // line, per the rule above — never inserted mid-line.
             crate::pci::serial_debug(" pollwake=");
             crate::pci::serial_debug_hex_64(evdev_server::poll_wakes());
+            // Control-queue stall census. `submit` spins the vCPU for the whole
+            // host round trip, so these say whether a freeze is the guest
+            // waiting on the host rather than the guest being busy. Mean is
+            // ctrlq_us/ctrlq_n; ctrlq_max is the outlier a mean hides.
+            crate::pci::serial_debug(" ctrlq_n=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_CMDS.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" ctrlq_us=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_SPIN_US.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" ctrlq_max=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_SPIN_MAX_US.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" ctrlq_to=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_TIMEOUTS.load(Ordering::Relaxed));
             crate::pci::serial_debug("\n");
         }
     }
