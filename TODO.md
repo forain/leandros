@@ -55,11 +55,10 @@ RAPHAEL_MENDOCINO))`, GLES **3.2**, **99.96 fps**. cosmic-comp's own log shows
 `virtgpu context created, capset=0x00000004` — capset 4 is Venus — and the session starts with
 zero panics and zero host GPU errors.
 
-Both GPU paths ship **opt-in**, and the default stays softpipe: the virgl path is not yet
-faster, and **neither has had its pixels verified** — `screendump` cannot photograph a session
-once GL scanout engages, because the console then holds a texture rather than a
-DisplaySurface and QMP answers `"no surface"` outright. Confirming pixels needs a real VNC
-client against the `-vnc` listener. That is the next step for both.
+Both GPU paths ship **opt-in**, and the default stays softpipe. `screendump` cannot photograph
+either session once GL scanout engages, because the console then holds a texture rather than a
+DisplaySurface and QMP answers `"no surface"` outright. **Zink's pixels are since VERIFIED**
+(see the next section); virgl's are not, and the virgl path is still not faster.
 
 Three bugs found along the way are worth keeping in mind because none was where it looked:
 the DRM driver **name** (`leandros-drm`) was deliberately unrecognised so Mesa's loader would
@@ -69,6 +68,76 @@ dmabuf export returned an invalid fd; and three framebuffer paths derived their 
 as **`handle + 10`**, overlapping the id space `alloc_resource_id()` hands out from 16 — a
 collision that could not bite until Zink made both spaces busy at once, and that wedged the
 guest rather than erroring because `VirtioGpu::submit` busy-spins.
+
+---
+
+**Also on 2026-08-11, later: the Vulkan desktop is photographed, and the sluggishness it was
+supposed to cure turns out not to be ours.** Three commits, and the last one is a measurement
+that redirects the whole lane.
+
+**`--venus` was putting the desktop on a display head nobody was looking at** (`8a2d16f`).
+`virtio-gpu-gl-pci` has no VGA interface, so on x86_64/UEFI the `--venus` block paired it with
+q35's default std-VGA to give OVMF/Limine a GOP — leaving **two display consoles**, std-VGA on
+0 carrying the framebuffer text console and the GL device on 1 carrying everything cosmic-comp
+scans out. The window, VNC and `screendump` all show console 0, so a desktop compositing
+correctly on Vulkan was indistinguishable from one that never started. **This is the same
+off-by-one-head that left M4's pixels recorded as unproven.** `virtio-vga-gl` accepts
+`venus=on`/`blob=on`/`hostmem=` exactly like `virtio-gpu-gl-pci` and is VGA-compatible, so it
+now satisfies OVMF and Venus with a single device, one console, and `-vga none` intact;
+`virtio-gpu-gl-pci` + std-VGA stays as the fallback and now *says* the desktop is on View #2.
+`--venus` also stopped hardcoding `egl-headless`: it opens `gtk,gl=on` when the host has a
+display server, with `--venus-headless` / `LEANDROS_VENUS_HEADLESS=1` forcing offscreen and
+`LEANDROS_VENUS_DISPLAY=<spec>` overriding outright. **With that, COSMIC on Zink/Venus is seen
+rendering correctly** — the first time the composited pixels have been confirmed at all.
+
+**The poll-wake herd is refuted for input too** (`7b62397`). `evdev::push_event` woke
+`POLL_WAIT_CHANNEL` — one global channel, every polling task in the system — **once per
+event**, so pressing and releasing shift was four whole-system herds for a key that draws
+nothing, and pointer motion was three per sample. Coalescing shipped and works
+(`WAKE_MODE_BASELINE`/`_SYN`/`_BURST`, default burst; `evpush=0x46` → `pollwake=0x8`, ~8.75×
+fewer wakes) and **the desktop was not one bit faster**. So the 2026-08-10 refutation holds in
+the input-storm regime as well, which was the one case it was argued not to cover. Kept
+because it is a real reduction; it is not a fix.
+
+**Measured: the DRM path is 1.2% of wall time, and the desktop runs at 0.65 fps** (`4512ebb`
+adds `ctrlq_n`/`ctrlq_us`/`ctrlq_max`/`ctrlq_to` to `[DRMSTAT]` and turns `DRM_STATS` on).
+Over one clean 80 s span of a live Zink/Venus session: **52 flips (0.65 fps)**, page-flip path
+**0.63 s**, control-queue busy-spin **0.31 s** — together 1.2% of wall clock, and even that
+over-counts because the control-queue commands are issued *inside* the flip path. `flips_del`
+trails `flips_sub` by a constant 3 throughout, so the 50 Hz delivery throttle is nowhere near
+binding and we are not withholding completions. **The compositor is taking ~1.5 s per frame
+and ~12 ms of it is ours.** The rest is cosmic-comp rendering through Zink → Venus → host GPU.
+
+Two things that measurement also settled:
+
+* **The input correlation is not in the DRM counters.** Flip stalls occur in samples with
+  `evpush` Δ=**0**, and the heaviest input sample (825 events, ~412/s) had an *above*-average
+  flip rate. Whatever couples a keystroke to the freeze is inside cosmic-comp's own render
+  loop, not in anything this kernel schedules.
+* **`VirtioGpu::submit`'s busy-spin is a real 267× regression and still not the cause.** Mean
+  control-queue round trip is **2,938 µs against softpipe's 11 µs**, worst case **72.9 ms**,
+  zero timeouts — the host is genuinely slow to answer now that a GPU is behind it, and we
+  spin the vCPU through all of it. Worth fixing on its own merits. It cannot produce a
+  two-second freeze at 0.4% of wall time.
+
+**The conclusion to test first when the box is back**: softpipe was measured at **1.00 fps**
+on 2026-08-10 and Zink now measures **0.65 fps**, so Zink may be *slower* than the software
+rasterizer for cosmic-comp's workload, and the sluggishness may simply be the pre-existing
+~1 fps problem rather than anything Zink introduced. `kmscube` at 99.96 fps does not
+contradict that — it is a trivial workload next to a full desktop recomposite. The decisive
+run needs no code change: `LEANDROS_NO_ZINK=1 sh /bin/start-cosmic-leandros`, ~80 s, capture
+`[DRMSTAT]`, compare `flips_sub` and `ctrlq_us`/`ctrlq_n` against the numbers above. If
+softpipe also sits near 1 fps the target moves off the GPU path entirely, back to where guest
+CPU actually goes — the RIP-sampling method from 2026-08-10, not the DRM driver.
+
+⚠ **`DRM_STATS` is `true` while this is open** (`drivers/src/drm_device_interface.rs`). Set it
+back to `false` when the lane closes.
+
+⚠ **The counters look absent when they are not.** `driver.py` attaches a serial reader only
+for the duration of a command, so QEMU drops everything emitted between commands; `[DRMSTAT]`
+prints every 2 s and read as completely missing until a persistent reader was connected to
+`/tmp/leandros-serial.sock`. `run-qemu.sh`'s `-serial mon:stdio` is a persistent reader and
+does not have this problem.
 
 ---
 
