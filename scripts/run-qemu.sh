@@ -20,6 +20,10 @@ QEMU_EXTRA_ARGS=()
 # after the display selection for what it changes and why it never autodetects.
 VENUS=0
 if [ "${LEANDROS_VENUS:-0}" = "1" ]; then VENUS=1; fi
+# --venus opens a real window when the host has a display server; this forces
+# the offscreen egl-headless path instead, for harnesses that must not open one.
+VENUS_HEADLESS=0
+if [ "${LEANDROS_VENUS_HEADLESS:-0}" = "1" ]; then VENUS_HEADLESS=1; fi
 # virgl (OpenGL passthrough) on x86_64 via virtio-vga-gl.
 #
 # OPT-IN, not default. The plumbing works end to end — `kmscube` inside the
@@ -98,6 +102,7 @@ while [[ "$#" -gt 0 ]]; do
         --kvm) ACCEL="kvm"; shift ;;
         --tcg) ACCEL="tcg"; shift ;;
         --venus) VENUS=1; shift ;;
+        --venus-headless) VENUS=1; VENUS_HEADLESS=1; shift ;;
         --virgl) VIRGL=1; shift ;;
         --no-virgl) VIRGL=0; shift ;;
         -d) QEMU_EXTRA_ARGS+=("$2"); shift 2 ;;
@@ -221,7 +226,9 @@ fi
 # build box) must be told explicitly. egl-headless keeps the guest's virtio-gpu
 # GL-capable, which venus needs; it just renders offscreen. Applies to every
 # boot mode, so it lives before the boot-mode dispatch below.
-if [ "$OS" != "Darwin" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+# --venus makes its own display choice below and would only override this one,
+# so skip it here rather than print a message that the next block contradicts.
+if [ "$VENUS" = "0" ] && [ "$OS" != "Darwin" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     if [ "${#GL_ARGS[@]}" -gt 0 ] && $QEMU_SYSTEM -display help 2>/dev/null | grep -q egl-headless; then
         GL_ARGS=("-display" "egl-headless")
         echo "🖥️  Headless host: using egl-headless (GL preserved)"
@@ -252,9 +259,10 @@ if [ "$VENUS" = "1" ]; then
         echo "   the raspi4b command line attaches no GPU device at all."
         exit 1
     fi
-    if ! $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-gpu-gl-pci; then
-        echo "❌ --venus needs virtio-gpu-gl-pci, which this $QEMU_SYSTEM does not"
-        echo "   provide (a QEMU built without virglrenderer). Fix the host QEMU."
+    if ! $QEMU_SYSTEM -device help 2>&1 | grep -qE 'virtio-gpu-gl-pci|virtio-vga-gl'; then
+        echo "❌ --venus needs a GL virtio-gpu device (virtio-vga-gl or"
+        echo "   virtio-gpu-gl-pci), and this $QEMU_SYSTEM provides neither (a QEMU"
+        echo "   built without virglrenderer). Fix the host QEMU."
         exit 1
     fi
     # -nographic implies -display none and silently wins over any -display
@@ -262,18 +270,55 @@ if [ "$VENUS" = "1" ]; then
     case " ${QEMU_EXTRA_ARGS[*]} " in
         *" -nographic "*)
             echo "❌ --venus is incompatible with -nographic: it implies -display none and"
-            echo "   silently overrides -display egl-headless. Drop it — this script already"
-            echo "   uses -serial mon:stdio."
+            echo "   silently overrides the -display this block sets. Drop it — this script"
+            echo "   already uses -serial mon:stdio."
             exit 1 ;;
     esac
+    # Device: ONE head if the host can give us one.
+    #
+    # virtio-gpu-gl-pci has no VGA interface, so on x86_64/UEFI it has to be
+    # paired with q35's default std-VGA to give OVMF/Limine a GOP. That leaves
+    # the VM with TWO display consoles — std-VGA is console 0 and carries the
+    # framebuffer text console, the GL device is console 1 and carries whatever
+    # cosmic-comp scans out. A working desktop then looks like a black screen,
+    # because the window, VNC and screendump all show console 0; you have to
+    # switch to View #2 (or pass `screendump -d venusgpu`) to see anything.
+    # Worse, under `-display gtk,gl=on` the two consoles fight over EGL contexts
+    # and the host spams `Gdk-WARNING: eglMakeCurrent failed` while the UI stalls.
+    #
+    # virtio-vga-gl is virtio-vga PLUS a virglrenderer context, and it accepts
+    # venus=on/blob=on/hostmem= just like virtio-gpu-gl-pci — so it satisfies
+    # OVMF and Venus with a single device, one console, and `-vga none` intact.
+    # Prefer it; keep the two-device layout only as the fallback for a QEMU that
+    # lacks it. aarch64 has no VGA at all, so it always takes the -pci device.
+    #
     # hostmem= backs the host-visible blob window Mesa's Venus ring maps.
-    GPU_DEV="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,id=venusgpu"
-    GL_ARGS=("-display" "egl-headless")
-    # On x86_64/UEFI, let q35's default std-VGA back in: it gives OVMF/Limine a
-    # GOP while the GL device rides alongside as the Venus device. That is the
-    # archived, proven-to-boot layout. Only this path drops `-vga none`.
-    X86_UEFI_VGA_ARGS=()
-    echo "🌋 Venus: -device $GPU_DEV -display egl-headless"
+    if [ "$ARCH" != "aarch64" ] && $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-vga-gl; then
+        GPU_DEV="virtio-vga-gl,venus=on,blob=on,hostmem=4G,id=venusgpu"
+    else
+        GPU_DEV="virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,id=venusgpu"
+        # Only this path drops `-vga none`, and only on x86_64/UEFI, where the
+        # GL device cannot give OVMF a GOP by itself.
+        [ "$ARCH" = "aarch64" ] || X86_UEFI_VGA_ARGS=()
+    fi
+    # Display: a window when the host has a display server to open one on,
+    # egl-headless otherwise. egl-headless keeps the GL pipeline alive but
+    # attaches no window, which is right for an SSH session or a harness and
+    # useless when you are trying to look at the desktop. LEANDROS_VENUS_DISPLAY
+    # overrides with a literal QEMU -display spec; --venus-headless forces the
+    # offscreen path even on a desktop (harnesses that must not open a window).
+    if [ -n "${LEANDROS_VENUS_DISPLAY:-}" ]; then
+        GL_ARGS=("-display" "$LEANDROS_VENUS_DISPLAY")
+    elif [ "$VENUS_HEADLESS" = "0" ] && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; } \
+         && $QEMU_SYSTEM -display help 2>/dev/null | grep -qx gtk; then
+        GL_ARGS=("-display" "gtk,gl=on")
+    else
+        GL_ARGS=("-display" "egl-headless")
+    fi
+    echo "🌋 Venus: -device $GPU_DEV ${GL_ARGS[*]}"
+    if [ "${#X86_UEFI_VGA_ARGS[@]}" -eq 0 ] && [ "$ARCH" != "aarch64" ]; then
+        echo "   ⚠ two display consoles (std-VGA + GL): the desktop is on View #2."
+    fi
 fi
 
 
