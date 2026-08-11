@@ -65,6 +65,11 @@ impl RunQueue {
         task.place(min_vr);
         for slot in self.tasks.iter_mut() {
             if slot.is_none() {
+                // Publish pid → tgid before the task becomes reachable, so no
+                // CPU can pick it up and then miss in the side table. Safe to
+                // do under this lock: the table is only ever written from here
+                // and from `remove`, both of which hold it.
+                crate::pid_tgid_insert(task.pid, task.tgid);
                 *slot = Some(task);
                 self.len += 1;
                 return true;
@@ -253,8 +258,12 @@ impl RunQueue {
     /// can free its resources.  Decrements the task count.
     pub fn remove(&mut self, idx: usize) -> Option<Box<Task>> {
         let t = self.tasks[idx].take();
-        if t.is_some() {
+        if let Some(task) = t.as_ref() {
             self.len = self.len.saturating_sub(1);
+            // Retire the side-table entry with the slot. Leaving it would hand
+            // a later caller the tgid of a task that no longer exists, where
+            // `tgid_of`'s contract is to fall back to the pid itself.
+            crate::pid_tgid_remove(task.pid);
         }
         t
     }

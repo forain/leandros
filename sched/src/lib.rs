@@ -485,7 +485,97 @@ pub fn pgid_of(pid: Pid) -> Option<Pid> {
 
 /// The thread-group id of `pid`, or `pid` itself if it's not a live task
 /// (matches every task's own fallback of being its own tgid at creation).
+// ── pid → tgid side table ────────────────────────────────────────────────────
+//
+// `tgid_of` used to be `RUN_QUEUE.lock().find_pid(pid)`: the global scheduler
+// spinlock plus a linear scan of all `MAX_TASKS` slots, to answer a question
+// about one task. It is on the hot syscall path — profiling a live COSMIC
+// session put it at **10.3% of running guest CPU**, rising to **21.7%** once GPU
+// acceleration raised the syscall rate — and the lock it takes is the one every
+// CPU needs to schedule, so the cost was contention as much as scanning.
+//
+// This is the same shape as the tgid-keyed exe-path table (`0aefc36`): a fixed
+// open-addressed table, written only under the RUN_QUEUE lock (so writes are
+// already serialised by the scheduler) and read lock-free.
+//
+// Sizing: 1024 slots against `runqueue::MAX_TASKS` = 256, so the table never
+// exceeds a quarter load and linear probes stay short. pids are allocated
+// sequentially from 1, so `pid & (SLOTS-1)` distributes perfectly — the
+// pathological clustering open addressing is usually warned about needs a
+// clumped key space, and this one is a counter.
+const PID_TGID_SLOTS: usize = 1024;
+/// Packed `(pid << 32) | tgid`. `0` = never used, `u64::MAX` = tombstone.
+///
+/// A tombstone rather than a zero on removal is load-bearing: zeroing a slot in
+/// the middle of a probe chain would strand every later entry in that chain,
+/// and the failure would be a *wrong tgid* (the `unwrap_or(pid)` fallback), not
+/// a crash — precisely the silent kind. pid 0 is never allocated (`NEXT_PID`
+/// starts at 1) and `u32::MAX` is not reachable, so neither sentinel collides
+/// with a real key.
+static PID_TGID: [AtomicU64; PID_TGID_SLOTS] =
+    [const { AtomicU64::new(0) }; PID_TGID_SLOTS];
+const PID_TGID_TOMBSTONE: u64 = u64::MAX;
+
+#[inline]
+fn pid_tgid_slot(pid: Pid) -> usize { (pid as usize) & (PID_TGID_SLOTS - 1) }
+
+/// Publish `pid → tgid`. Call sites hold the RUN_QUEUE lock.
+pub(crate) fn pid_tgid_insert(pid: Pid, tgid: Pid) {
+    if pid == 0 { return; }
+    let want = ((pid as u64) << 32) | tgid as u64;
+    let start = pid_tgid_slot(pid);
+    for i in 0..PID_TGID_SLOTS {
+        let s = (start + i) & (PID_TGID_SLOTS - 1);
+        let cur = PID_TGID[s].load(Ordering::Relaxed);
+        // Free, recyclable, or already ours (a re-registration).
+        if cur == 0 || cur == PID_TGID_TOMBSTONE || (cur >> 32) as u32 == pid {
+            PID_TGID[s].store(want, Ordering::Release);
+            return;
+        }
+    }
+    // Full: leave the table alone. `tgid_of` then falls back to the scan, which
+    // is slow but correct — never wrong.
+}
+
+/// Retire `pid`. Call sites hold the RUN_QUEUE lock.
+pub(crate) fn pid_tgid_remove(pid: Pid) {
+    if pid == 0 { return; }
+    let start = pid_tgid_slot(pid);
+    for i in 0..PID_TGID_SLOTS {
+        let s = (start + i) & (PID_TGID_SLOTS - 1);
+        let cur = PID_TGID[s].load(Ordering::Relaxed);
+        if cur == 0 { return; }                       // end of chain, not present
+        if cur != PID_TGID_TOMBSTONE && (cur >> 32) as u32 == pid {
+            PID_TGID[s].store(PID_TGID_TOMBSTONE, Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// O(1) average lookup, no locks.
+fn pid_tgid_get(pid: Pid) -> Option<Pid> {
+    let start = pid_tgid_slot(pid);
+    for i in 0..PID_TGID_SLOTS {
+        let s = (start + i) & (PID_TGID_SLOTS - 1);
+        let cur = PID_TGID[s].load(Ordering::Acquire);
+        if cur == 0 { return None; }                  // end of chain
+        if cur != PID_TGID_TOMBSTONE && (cur >> 32) as u32 == pid {
+            return Some(cur as u32);
+        }
+    }
+    None
+}
+
+/// The thread-group id of `pid`, or `pid` itself if no such task is live.
+///
+/// The fallback is not cosmetic — callers depend on it. See the `owner_tgid`
+/// note in `sys_epoll_ctl`: resolving a *dead* thread's tgid this way is what
+/// made an epoll fd fail EBADF for its surviving siblings, so anything relying
+/// on `tgid_of` for a possibly-exited pid gets the same answer it always did.
 pub fn tgid_of(pid: Pid) -> Pid {
+    if let Some(t) = pid_tgid_get(pid) { return t; }
+    // Miss: either the task is gone, or the table was full when it registered.
+    // Fall back to the authoritative scan rather than guessing.
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.tgid).unwrap_or(pid)
 }
 
