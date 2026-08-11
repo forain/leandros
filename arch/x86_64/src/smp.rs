@@ -236,15 +236,66 @@ unsafe fn write64(phys: usize, val: u64) {
 
 // ── arch_cpu_id — provides the logical CPU index ──────────────────────────────
 
-/// Return the LAPIC ID of the calling CPU.
+/// `IA32_TSC_AUX` — the scratch MSR `RDTSCP` returns in ECX. Nothing else in
+/// LeandrOS uses it (there is no vDSO `getcpu`), so it is free real estate for
+/// the logical CPU index.
+const MSR_TSC_AUX: u32 = 0xC000_0103;
+
+/// Set once the BSP has confirmed `RDTSCP` exists *and* seeded its own
+/// `IA32_TSC_AUX`. Every AP seeds its own inside `apic::init()` before it can
+/// reach a `arch_cpu_id()` caller, so a `true` here means every CPU that can
+/// observe it has a valid value.
+static CPU_ID_VIA_TSC_AUX: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Publish this CPU's LAPIC ID into `IA32_TSC_AUX` so `arch_cpu_id()` can stop
+/// reading the APIC over MMIO.
+///
+/// Called from `apic::init()`, which both the BSP and every AP execute.
+/// Idempotent.
+///
+/// # Why this exists
+/// `arch_cpu_id()` used to read the LAPIC ID register on every call, and
+/// `sched::current_pid()` calls it every time. The APIC page is uncacheable, so
+/// that read costs a trip to the memory controller (~100 ns) where the atomic
+/// load it guards costs ~1 ns. Profiling a live COSMIC session on x86_64/KVM
+/// put **12.5% of all running guest CPU time** on the instruction immediately
+/// after that load — classic long-latency-load skid. aarch64 never showed it
+/// because `mrs mpidr_el1` is a register read.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn seed_cpu_id_fastpath() {
+    use core::sync::atomic::Ordering;
+
+    // Read the ID the slow way exactly once per CPU, then stash it.
+    let id = ((apic::read(apic::LAPIC_ID) >> 24) & 0xFF) as u64;
+    apic::wrmsr(MSR_TSC_AUX, id);
+
+    // CPUID.80000001H:EDX[27] = RDTSCP. Present on every CPU we care about and
+    // on QEMU TCG's `-cpu max`, but the LAPIC path stays as the fallback rather
+    // than assuming it: getting this wrong hands out the wrong per-CPU slot,
+    // which corrupts scheduler state silently instead of faulting.
+    if core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 27) != 0 {
+        CPU_ID_VIA_TSC_AUX.store(true, Ordering::Release);
+    }
+}
+
+/// Return the logical CPU index of the calling CPU.
 ///
 /// For xAPIC the ID lives in bits [31:24] of the APIC ID register.
 /// On QEMU/typical hardware: BSP = 0, APs = 1, 2, 3 …
 ///
-/// Used by `sched` to index the per-CPU state arrays.
+/// Used by `sched` to index the per-CPU state arrays, so it sits on the hot
+/// path of `current_pid()`/`current_tgid()` and must stay cheap — see
+/// [`seed_cpu_id_fastpath`] for why it no longer reads the APIC.
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub unsafe extern "C" fn arch_cpu_id() -> usize {
+    if CPU_ID_VIA_TSC_AUX.load(core::sync::atomic::Ordering::Acquire) {
+        let mut aux: u32 = 0;
+        // RDTSCP returns IA32_TSC_AUX in ECX; the timestamp itself is ignored.
+        let _ = core::arch::x86_64::__rdtscp(&mut aux as *mut u32);
+        return aux as usize;
+    }
     ((apic::read(apic::LAPIC_ID) >> 24) & 0xFF) as usize
 }
 

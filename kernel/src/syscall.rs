@@ -6782,6 +6782,20 @@ impl EpollInterest {
 #[derive(Clone, Copy)]
 struct EpollInstance {
     owner_pid: u32,
+    /// TGID of the creating thread, captured at `epoll_create1`.
+    ///
+    /// Every ownership check wants the *thread group*, and resolving it from
+    /// `owner_pid` meant `sched::tgid_of()` — the global `RUN_QUEUE` lock plus
+    /// a 256-slot linear scan — on every `epoll_wait`/`epoll_ctl`. That was
+    /// 10.4% of running guest CPU on a live COSMIC session.
+    ///
+    /// Caching it is also strictly more correct than resolving it: `tgid_of`
+    /// falls back to the pid itself when the task is gone, so once the thread
+    /// that called `epoll_create1` exited, its still-open epoll fd started
+    /// failing EBADF for every surviving sibling — exactly the thread-scoped
+    /// behaviour the checks were written to avoid. A thread group's id is
+    /// fixed for its lifetime, so the captured value stays valid.
+    owner_tgid: u32,
     interests: [EpollInterest; MAX_EPOLL_INTERESTS],
     in_use:    bool,
     /// Number of epoll fds (EPOLL_FDS entries) referencing this instance.
@@ -6789,12 +6803,29 @@ struct EpollInstance {
     /// instance (mio/tokio clone their registry handle this way); the
     /// instance is only torn down when the last alias closes.
     refs:      u32,
+    /// High-water mark: one past the highest interest slot ever used by this
+    /// instance, so the probe loops can stop there instead of walking all
+    /// `MAX_EPOLL_INTERESTS`.
+    ///
+    /// Monotonic within an instance's lifetime — `CTL_DEL` deliberately does
+    /// not shrink it. A slot freed by DEL can be reused by the next ADD, so a
+    /// shrinking mark would have to rescan to find the new maximum, and every
+    /// consumer only ever uses it as an upper bound over `in_use` slots. It
+    /// resets to 0 with the rest of the instance via [`EpollInstance::empty`].
+    ///
+    /// Why it matters: both probe loops ran `0..MAX_EPOLL_INTERESTS` (512)
+    /// unconditionally, taking the global `EPOLL_INSTANCES` spinlock once per
+    /// slot, for instances that typically watch a handful of fds. On a live
+    /// COSMIC session that put `sys_epoll_wait` + `epoll_any_ready_nested` at
+    /// 22.3% of all running guest CPU.
+    hi:        u16,
 }
 
 impl EpollInstance {
     const fn empty() -> Self {
-        Self { owner_pid: 0, interests: [const { EpollInterest::empty() }; MAX_EPOLL_INTERESTS],
-               in_use: false, refs: 0 }
+        Self { owner_pid: 0, owner_tgid: 0,
+               interests: [const { EpollInterest::empty() }; MAX_EPOLL_INTERESTS],
+               in_use: false, refs: 0, hi: 0 }
     }
 }
 
@@ -6830,7 +6861,7 @@ fn epoll_fcntl(epfd: usize, cmd: usize) -> isize {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let slot = match epoll_slot_of(epfd) { Some(s) => s, None => return -9 };
             let mut ep = EPOLL_INSTANCES.lock();
-            if !ep[slot].in_use || sched::tgid_of(ep[slot].owner_pid) != sched::current_tgid() {
+            if !ep[slot].in_use || ep[slot].owner_tgid != sched::current_tgid() {
                 return -9;
             }
             let mut t = EPOLL_FDS.lock();
@@ -6885,7 +6916,7 @@ fn sys_epoll_close(epfd: usize) -> isize {
     let slot = match epoll_slot_of(epfd) { Some(s) => s, None => return -9 }; // EBADF
     let tgid = sched::current_tgid();
     let mut ep = EPOLL_INSTANCES.lock();
-    if !ep[slot].in_use || sched::tgid_of(ep[slot].owner_pid) != tgid { return -9; } // EBADF
+    if !ep[slot].in_use || ep[slot].owner_tgid != tgid { return -9; } // EBADF
     EPOLL_FDS.lock()[epfd - EPOLL_FD_BASE].in_use = false;
     ep[slot].refs = ep[slot].refs.saturating_sub(1);
     if ep[slot].refs == 0 { ep[slot] = EpollInstance::empty(); }
@@ -6923,7 +6954,8 @@ fn sys_epoll_create1(_flags: usize) -> isize {
         Some(i) => {
             ep[i] = EpollInstance::empty();
             ep[i].in_use    = true;
-            ep[i].owner_pid = pid;
+            ep[i].owner_pid  = pid;
+            ep[i].owner_tgid = sched::current_tgid();
             ep[i].refs      = 1;
             t[fd_idx] = EpollFdEntry { in_use: true, slot: i as u8 };
             (fd_idx + EPOLL_FD_BASE) as isize
@@ -6950,7 +6982,7 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     // sys_epoll_wait's check for the bug this fixes.
     let tgid = sched::current_tgid();
     let mut ep = EPOLL_INSTANCES.lock();
-    if !ep[slot].in_use || sched::tgid_of(ep[slot].owner_pid) != tgid { return -9; }
+    if !ep[slot].in_use || ep[slot].owner_tgid != tgid { return -9; }
 
     match op {
         CTL_ADD | CTL_MOD => {
@@ -6970,6 +7002,7 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
                     // ADD and MOD both (re-)arm: MOD is how a caller re-arms an
                     // EPOLLONESHOT interest that disarmed itself after firing.
                     inst.interests[i] = EpollInterest { fd: fd as i32, events, data, in_use: true, last_seq: u64::MAX, armed: true };
+                    if i as u16 >= inst.hi { inst.hi = i as u16 + 1; }
                     0
                 }
                 None => -12, // ENOMEM — too many interests
@@ -7018,7 +7051,7 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
         // crossterm's `read_position_raw`'s `Err(_) => {}` loop arm), an
         // effectively permanent hang from the caller's perspective.
         let ep = EPOLL_INSTANCES.lock();
-        if !ep[slot].in_use || sched::tgid_of(ep[slot].owner_pid) != sched::current_tgid() {
+        if !ep[slot].in_use || ep[slot].owner_tgid != sched::current_tgid() {
             return -9;
         }
     }
@@ -7042,7 +7075,11 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
         // commit last_seq / disarm ONESHOT, matching by fd since a sibling
         // epoll_ctl may have mutated the slot meanwhile.
         let mut n = 0usize;
-        for i in 0..MAX_EPOLL_INTERESTS {
+        // Re-read the high-water mark on every pass: a CLONE_THREAD sibling
+        // sharing this epoll fd may epoll_ctl(ADD) while we are blocked below,
+        // and the new interest must be visible to the next probe.
+        let hi = { EPOLL_INSTANCES.lock()[slot].hi as usize };
+        for i in 0..hi {
             if n >= maxevents { break; }
             let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
             if !interest.in_use || !interest.armed { continue; }
@@ -7096,7 +7133,8 @@ fn epoll_any_ready(pid: u32, slot: usize) -> bool { epoll_any_ready_nested(pid, 
 /// Also the readiness definition for an epoll fd watched by an OUTER epoll or
 /// poll/select (see `poll_fd_state_nested`).
 fn epoll_any_ready_nested(pid: u32, slot: usize, depth: u32) -> bool {
-    for i in 0..MAX_EPOLL_INTERESTS {
+    let hi = { EPOLL_INSTANCES.lock()[slot].hi as usize };
+    for i in 0..hi {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
         if !interest.in_use || !interest.armed { continue; }
         let (cur, seq) =
@@ -7396,7 +7434,7 @@ fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
             // epoll_any_ready_nested re-takes it per interest (invariant
             // 82d0cc3: never hold a spinlock across a server call).
             let ep = EPOLL_INSTANCES.lock();
-            if !ep[slot].in_use || sched::tgid_of(ep[slot].owner_pid) != sched::tgid_of(pid) {
+            if !ep[slot].in_use || ep[slot].owner_tgid != sched::tgid_of(pid) {
                 return POLLNVAL;
             }
         }

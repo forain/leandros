@@ -63,7 +63,7 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
-unsafe fn wrmsr(msr: u32, val: u64) {
+pub(crate) unsafe fn wrmsr(msr: u32, val: u64) {
     core::arch::asm!(
         "wrmsr",
         in("ecx")  msr,
@@ -134,6 +134,14 @@ pub unsafe fn init() {
 
     // Enable APIC software and set spurious vector to 0xFF.
     write(LAPIC_SVR, SVR_ENABLE | SPURIOUS_VEC);
+
+    // This CPU's ID register is now live and stable — publish it somewhere
+    // `arch_cpu_id()` can read without touching MMIO. Must happen here, in the
+    // one init both the BSP and every AP run, and *after* `init_pat_ap`: the
+    // first `arch_cpu_id()` caller on an AP is `gdt::init_cpu()`, two steps
+    // further down `sched_ap_entry`, so there is no window in which the fast
+    // path could read an unseeded value and hand out CPU 0's index.
+    super::smp::seed_cpu_id_fastpath();
 }
 
 /// Send End-Of-Interrupt to the Local APIC.

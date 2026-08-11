@@ -285,6 +285,21 @@ static mut CURRENT_CTX:   [*mut CpuContext; MAX_CPUS] = [core::ptr::null_mut(); 
 /// `wake_up_an_idle_cpu` reads other CPUs' slots to find an idle target.
 static CURRENT_PID: [AtomicU32; MAX_CPUS] =
     [const { AtomicU32::new(0) }; MAX_CPUS];
+/// TGID of the task running on each CPU (0 = idle / in scheduler), published
+/// by the dispatch path alongside [`CURRENT_PID`].
+///
+/// Exists purely so [`current_tgid`] does not have to call [`tgid_of`], which
+/// takes the global `RUN_QUEUE` lock and linear-scans up to `MAX_TASKS` (256)
+/// slots. That scan sits on hot syscall paths — the epoll ownership check runs
+/// it on every `epoll_wait` — so four vCPUs end up contending the one lock to
+/// answer a question about themselves. Profiling a live COSMIC session put
+/// `tgid_of` at 10.6% of running guest CPU.
+///
+/// Safe to cache because a `Task`'s `tgid` is assigned once at creation and
+/// never reassigned; only the pid→tgid lookup for *another* task still needs
+/// the scan.
+static CURRENT_TGID: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
 
 extern "C" {
     fn arch_set_page_table(root: usize);
@@ -475,6 +490,13 @@ pub fn tgid_of(pid: Pid) -> Pid {
 }
 
 pub fn current_tgid() -> Pid {
+    // Fast path: the dispatch path published this CPU's tgid, so answering
+    // "what thread group am I in" costs an atomic load instead of the global
+    // RUN_QUEUE lock plus a 256-slot scan. See [`CURRENT_TGID`].
+    let cached = CURRENT_TGID[unsafe { cpu_id() }].load(Ordering::Relaxed);
+    if cached != 0 { return cached; }
+    // 0 means "no task on this CPU" — the scheduler context itself, or a call
+    // made before the first dispatch. Fall back rather than report tgid 0.
     tgid_of(current_pid())
 }
 
@@ -1759,18 +1781,19 @@ fn scheduler_run_loop() -> ! {
                     t.on_cpu = Some(id);
                     t.state  = TaskState::Running;
                     let kst = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
-                    Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table))
+                    Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid))
                 }
                 None => None,
             }
         };
 
-        if let Some((idx, ctx_ptr, pid, kernel_stack_top_virt, page_table)) = picked {
+        if let Some((idx, ctx_ptr, pid, kernel_stack_top_virt, page_table, tgid)) = picked {
             let dispatched_at = ticks();
 
             unsafe {
                 CURRENT_CTX[id] = ctx_ptr as *mut CpuContext;
                 CURRENT_PID[id].store(pid, Ordering::Relaxed);
+                CURRENT_TGID[id].store(tgid, Ordering::Relaxed);
 
                 arch_set_kernel_stack(kernel_stack_top_virt as u64);
                 if page_table != 0 {
@@ -1785,6 +1808,7 @@ fn scheduler_run_loop() -> ! {
                 // When we return here, we are in the scheduler context.
                 CURRENT_CTX[id] = core::ptr::null_mut();
                 CURRENT_PID[id].store(0, Ordering::Relaxed);
+                CURRENT_TGID[id].store(0, Ordering::Relaxed);
 
                 // Detach from the task's page table before it can be freed:
                 // if this task exits (reaped below) or exits later on another
