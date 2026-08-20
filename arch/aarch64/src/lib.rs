@@ -80,6 +80,15 @@ pub fn init(boot_info: &boot::BootInfo) {
         uart::set_base(uart_virt);
         uart::reinit(uart_virt);
 
+        // The divisor in force, which on rpi5 is whatever the firmware left and
+        // is our only direct measurement of BCM2712's UARTCLK: the port is
+        // running at 115200, so UARTCLK = 16 * 115200 * (IBRD + FBRD/64).
+        uart::serial_print_str("[ARCH] PL011 IBRD=");
+        uart::print_hex(uart::UART_IBRD_SEEN as usize);
+        uart::serial_print_str(" FBRD=");
+        uart::print_hex(uart::UART_FBRD_SEEN as usize);
+        uart::serial_print_str("\n");
+
         // First point at which the MAIR read-modify-write above can be shown.
         uart::serial_print_str("[ARCH] MAIR_EL1 before=0x");
         uart::print_hex(mmu::MAIR_BEFORE as usize);

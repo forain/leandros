@@ -9,6 +9,19 @@ SECTIONS {
 
     .text : AT(KERNEL_PHYS) {
         __text_start = .;
+        /* The entry stub must be the first thing in the image.
+         *
+         * QEMU's -kernel loads this as an ELF and branches to e_entry, so the
+         * position of _start inside .text never mattered there. The Raspberry
+         * Pi firmware does not parse ELF: it copies the flat binary produced by
+         * objcopy to `kernel_address` and branches to its first byte. With
+         * .text.boot left to fall out of the generic *(.text*) glob below,
+         * _start landed 0xbf8 bytes in and the firmware jumped into
+         * __exception_vectors instead — a silent hang with no output at all,
+         * since nothing had configured VBAR_EL1 or the stack yet.
+         *
+         * KEEP so --gc-sections cannot drop it: nothing references _start. */
+        KEEP(*(.text.boot))
         KEEP(*(.boot))
         . = ALIGN(2048);
         __exception_vectors = .;

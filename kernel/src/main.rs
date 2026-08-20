@@ -9,6 +9,36 @@ mod init;
 mod syscall;
 mod mem;
 
+// Physical MMIO address of the PL011 the entry stub's EARLY_PUTC markers write
+// to, mirroring `arch_aarch64::uart::BASE`. Emitted as an absolute assembler
+// symbol ahead of the stub so the stub itself needs no cfg of its own.
+//
+// The markers run with the MMU off (physical addressing) and again immediately
+// after it comes on, where the identity half of `early_pgtables` covers them —
+// which is why the entry stub maps the BCM2712 MMIO blocks itself rather than
+// waiting for `paging::map_4k`.
+// EARLY_LOWMEM_DESC is the block descriptor the entry stub installs for
+// physical 0..1GiB. 0x701 is Normal memory, 0x705 is Device (MAIR index 1) --
+// the two differ only in the attribute index at bits [4:2]. QEMU virt has
+// nothing but MMIO down there, so Device is right; a Pi has ordinary RAM there
+// and now runs the kernel image itself from it, where Device would be fatal:
+// instruction fetch from a Device mapping is not architecturally permitted.
+//
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+core::arch::global_asm!(
+    ".set EARLY_UART_BASE, 0x107D001000",
+    ".set EARLY_LOWMEM_DESC, 0x701",   // RAM: the kernel itself lives at 0x200000
+);
+#[cfg(all(target_arch = "aarch64", feature = "raspi4b"))]
+core::arch::global_asm!(
+    ".set EARLY_UART_BASE, 0xFE201000",
+    ".set EARLY_LOWMEM_DESC, 0x705",   // BCM2711 peripherals
+);
+#[cfg(all(target_arch = "aarch64", not(any(feature = "rpi5", feature = "raspi4b"))))]
+core::arch::global_asm!(
+    ".set EARLY_UART_BASE, 0x09000000",
+    ".set EARLY_LOWMEM_DESC, 0x705",   // QEMU virt: 0..1GiB is all MMIO
+);
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(include_str!("entry_aarch64.s"));
 #[cfg(target_arch = "x86_64")]
@@ -362,6 +392,29 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 BOOT_INFO = boot_info;
                 BOOT_INFO.hhdm_offset = hhdm_offset;
 
+                // Never probe PCIe on a real Pi 5.
+                //
+                // Unlike raspi4b (which has no ECAM window at all, so the
+                // existing cfg below was enough), BCM2712 does publish a
+                // `pcie@120000` node and `device_tree::parse` duly hands back an
+                // ECAM base. But the controller needs link training and BAR
+                // setup this kernel does not do, so scanning it reads unbacked
+                // Device memory — visible in the boot log as a long run of
+                // 0xDEAD/0xD0D0 vendor IDs.
+                //
+                // Those reads raise external aborts, and on this SoC they are
+                // reported *asynchronously*. DAIF.A is masked for all of early
+                // boot, so nothing happens until the scheduler unmasks to enter
+                // userspace, at which point the whole batch arrives at once as
+                // `[EXC] Unexpected Exception! ESR=0xBE000011` with ELR pointing
+                // at the userspace entry — implicating init, which is innocent.
+                //
+                // Zeroing the base makes drivers/src/pci.rs take its
+                // ecam_base == 0 early return. It costs the RP1 devices behind
+                // PCIe (USB, ethernet), none of which this kernel can drive yet.
+                #[cfg(feature = "rpi5")]
+                { BOOT_INFO.pci_ecam_base = 0; }
+
                 // QEMU `-kernel` provides neither a DTB nor ACPI for a bare ELF,
                 // so the device-tree scan above finds nothing and UART/ECAM stay
                 // zero. Fall back to the fixed QEMU virt MMIO addresses: the PL011
@@ -392,6 +445,12 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             // Direct aarch64 links the kernel at KERNEL_VIRT = 0xffff_8000_0000_0000
             // + KERNEL_PHYS = 0x4008_0000 (see linkers/aarch64-direct.ld).
             const KERNEL_VIRT: usize = 0xffff_8000_0000_0000;
+            // Must match KERNEL_PHYS in whichever direct linker script built
+            // this kernel: linkers/aarch64-direct.ld for QEMU virt, and the
+            // 0x0020_0000 variant build-all.sh derives from it for --rpi5.
+            #[cfg(feature = "rpi5")]
+            const KERNEL_PHYS: usize = 0x0020_0000;
+            #[cfg(not(feature = "rpi5"))]
             const KERNEL_PHYS: usize = 0x4008_0000;
             extern "C" { static __bss_end: u8; }
             let kernel_end_phys =
@@ -403,6 +462,16 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             // still identity-map low RAM, so we can read it here (before the
             // HHDM/buddy come up) to learn its real size, reserve exactly that,
             // and record it in BootInfo for init/execve to use later.
+            // Both boards keep the initrd clear of the kernel image, but the
+            // Pi's has to stay inside the low 1GiB the VideoCore can actually
+            // write during boot -- 0x4800_0000 gets the same silent refusal the
+            // kernel did at 0x4008_0000. 0x1000_0000 sits above the image
+            // (which ends around 0x0160_0000) and below the firmware's
+            // framebuffer at 0x3f80_0000. Keep in sync with the `initramfs`
+            // line scripts/prepare-rpi5-sdcard.sh writes into config.txt.
+            #[cfg(feature = "rpi5")]
+            const INITRD_PHYS: usize = 0x1000_0000;
+            #[cfg(not(feature = "rpi5"))]
             const INITRD_PHYS: usize = 0x4800_0000;
             let initrd_len = init::cpio_image_size(INITRD_PHYS);
             if initrd_len > 0 {

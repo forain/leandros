@@ -6,8 +6,19 @@
 #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 pub const BASE: usize = 0x0900_0000;       // QEMU virt
 
+/// RPi 5 / BCM2712 `uart10` — the PL011 behind the board's dedicated 3-pin
+/// JST-SH debug connector, and the node the vendored
+/// `target/rpi5-uefi/bcm2712-rpi-5-b.dtb` aliases as `console`. The DTB spells
+/// it `serial@7d001000` under the `soc` bus, whose
+/// `ranges = <0x7c000000 0x10 0x7c000000 0x4000000>` translates that to CPU
+/// physical 0x10_7D001000.
+///
+/// Explicitly *not* the UART on GPIO 14/15: on the Pi 5 that one lives inside
+/// the RP1 southbridge (`/axi/pcie@120000/rp1/serial@30000`, the DTB's
+/// `serial0`) and is unreachable without PCIe enumeration and RP1 bring-up. A
+/// serial cable on the 40-pin header sees nothing from this driver.
 #[cfg(feature = "rpi5")]
-pub const BASE: usize = 0x107D_0010_00;    // RPi 5 RP1 UART0
+pub const BASE: usize = 0x107D_0010_00;
 
 /// QEMU -M raspi4b PL011 (BCM2711 peripheral base 0xFE000000 + UART0 offset
 /// 0x201000). Verified live via QMP `info mtree` — see drivers/src/sdhci.rs's
@@ -19,17 +30,31 @@ pub const BASE: usize = 0xFE20_1000;
 #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 const IBRD_VAL: u32 = 13;
 
-// rpi5 and raspi4b's QEMU pl011 model both clock UART0 at 48MHz, giving the
-// same 115200-baud divisor (48_000_000 / (16 * 115200) = 26 + 1/24).
-#[cfg(any(feature = "rpi5", feature = "raspi4b"))]
+// QEMU's raspi4b pl011 model clocks UART0 at 48MHz, giving a 115200-baud
+// divisor of 48_000_000 / (16 * 115200) = 26 + 1/24.
+#[cfg(feature = "raspi4b")]
 const IBRD_VAL: u32 = 26;
+
+// There is deliberately no rpi5 arm here: that path inherits whatever the
+// firmware programmed rather than computing its own divisor. See `reinit`.
+//
+// The DTB is not a usable source for it. `uart10`'s "uartclk" input is the
+// `clk_uart` fixed-clock, `clock-frequency = <0x8ca000>` = 9,216,000 Hz, which
+// would put the 115200 divisor at exactly 5 — but programming 5 produced
+// garbage on real hardware (markers arriving as 0x9E 0xC1 instead of "AB..."),
+// while the firmware's own output through the same UART is clean. So the DTB
+// node describes what Linux is told to assume, not what the firmware actually
+// clocks the port at, and the honest thing is to not second-guess a working
+// configuration we can simply keep.
 
 /// Fractional baud-rate divisor.
 #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 const FBRD_VAL: u32 = 1;
 
-#[cfg(any(feature = "rpi5", feature = "raspi4b"))]
+#[cfg(feature = "raspi4b")]
 const FBRD_VAL: u32 = 3;
+
+
 
 // ── Register offsets ──────────────────────────────────────────────────────────
 const DR:   usize = 0x000;
@@ -93,12 +118,33 @@ pub unsafe fn set_base(base: usize) {
     UART_BASE_ADDR = base;
 }
 
+/// The baud programming `reinit` ended up installing, recorded so `arch::init`
+/// can report it. On rpi5 these are read back from the live port rather than
+/// chosen, and are the only direct evidence of what the firmware clocks
+/// `uart10` at.
+pub static mut UART_IBRD_SEEN: u32 = 0;
+pub static mut UART_FBRD_SEEN: u32 = 0;
+
 pub unsafe fn reinit(base: usize) {
     UART_BASE_ADDR = base;
+
+    // Keep the firmware's divisor and line control on real hardware. It has
+    // demonstrably got 115200 right — its whole boot log arrives clean through
+    // this port — and we have no trustworthy figure for BCM2712's UARTCLK to
+    // recompute one from. Overwriting it with a divisor derived from the DTB's
+    // clk_uart turned every marker into noise.
+    #[cfg(feature = "rpi5")]
+    let (ibrd, fbrd, lcrh) = (rd(IBRD), rd(FBRD), rd(LCRH));
+    #[cfg(not(feature = "rpi5"))]
+    let (ibrd, fbrd, lcrh) = (IBRD_VAL, FBRD_VAL, (0b11 << 5) | (1 << 4));
+
+    UART_IBRD_SEEN = ibrd;
+    UART_FBRD_SEEN = fbrd;
+
     wr(CR,   0);
-    wr(IBRD, IBRD_VAL);
-    wr(FBRD, FBRD_VAL);
-    wr(LCRH, (0b11 << 5) | (1 << 4));
+    wr(IBRD, ibrd);
+    wr(FBRD, fbrd);
+    wr(LCRH, lcrh);
     wr(CR,   (1 << 0) | (1 << 8) | (1 << 9));
     
     // Enable RX interrupt (bit 4) and RT interrupt (bit 6)
