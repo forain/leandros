@@ -1828,7 +1828,7 @@ static LAST_FLIP_DELIVER_TICK: AtomicU64 = AtomicU64::new(0);
 /// slowdown, and only the counters below can say which stage stops. Costs one
 /// serial line every 200 ticks (2 s) plus a clock read per page flip and per
 /// control-queue command. Set back to `false` once that is settled.
-pub const DRM_STATS: bool = true;
+pub const DRM_STATS: bool = false;
 static FLIPS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
 static DIRTYFB_CALLS: AtomicU64 = AtomicU64::new(0);
 static DIRTYFB_CLIPS: AtomicU64 = AtomicU64::new(0);
