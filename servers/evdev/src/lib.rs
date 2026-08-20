@@ -791,13 +791,17 @@ fn eviocgabs(dev_id: usize, abs: usize, arg_ptr: usize, pid: u32) -> Message {
 
 /// `(open_id, pid)` — which open a request came from.
 ///
-/// INTEGRATION NOTE. The VFS forwards the per-open cookie in message slot 4 for
-/// VFS_IOCTL only (`handle_ioctl`, servers/vfs/src/lib.rs). Until it does the
-/// same for VFS_READ and VFS_POLL, slot 4 reads as 0 on those and the queue is
-/// keyed by the caller's pid from slot 3 — per-process instead of per-open,
-/// which already separates the consumers that were robbing each other but makes
-/// two opens *within* one process share a queue. Adding slot 4 to those two
-/// proxies is all it takes to get true Linux semantics; nothing here changes.
+/// The VFS forwards the per-open cookie in message slot 4 on all three proxies
+/// that reach here — VFS_READ, VFS_POLL and VFS_IOCTL (servers/vfs/src/lib.rs)
+/// — so the key is the open, as on Linux, and two opens within one process get
+/// two queues. That the three agree is load-bearing rather than tidy: readiness
+/// must be answered from the queue the matching read() will drain, and FIONREAD
+/// from the queue both of them use. A proxy that stopped forwarding slot 4
+/// would fall back to the pid arm of `client_matches` and quietly key that one
+/// call differently from the other two.
+///
+/// The pid fallback (`open_id == 0`) is still live for the in-kernel console
+/// tap and for any future proxy that has no cookie to send.
 fn client_key(msg: &Message) -> (u32, u32) {
     (arg(msg, 4) as u32, arg(msg, 3) as u32)
 }
@@ -882,13 +886,43 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             setv(&C_IPID, dev_id, pid as u64);
 
             if cmd == 0x541B { // FIONREAD (type 'T', not 'E')
-                // The caller's OWN queue depth. An ioctl never registers a
-                // queue — a probe must not cost one of the 16 slots, and every
-                // reader reaches VFS_READ/VFS_POLL anyway.
+                // The caller's OWN queue depth, REGISTERING one if this open has
+                // none yet. This arm used to take the non-registering `find`, on
+                // the reasoning that a probe must not cost one of the 16 slots
+                // and every reader reaches VFS_READ/VFS_POLL anyway. The second
+                // half of that is false, and it is false in a way that closes a
+                // loop: a client that asks FIONREAD *before every read* — which
+                // is a normal shape, and the one doomgeneric uses
+                // (`leandros_sdl.c` SDL_PollEvent, and the DRM backend's
+                // DG_GetKey) — never reaches VFS_READ at all, because the read
+                // is what it is gating. No queue, so FIONREAD answers 0; it
+                // answers 0, so no read; no read, so no queue. Permanently deaf,
+                // with every counter reporting healthy: `evpush` climbs,
+                // `broadcast` runs, and the events go to the queues of the
+                // clients that DID poll. Before the per-open queues (0bb50b8)
+                // this arm read a shared per-device ring that `push_event`
+                // filled whether or not anyone had registered, so the pattern
+                // worked by accident of that design.
+                //
+                // Registering here is also what makes the answer honest: FIONREAD
+                // promises "this many bytes are waiting for you", and only a
+                // queue that exists can accumulate them. The slot cost is real
+                // but bounded the same way every other registration is — LRU
+                // reclamation in `find_or_register`, which never evicts the
+                // console tap. A prober that never reads is reclaimed as the
+                // least recently touched, which is exactly what it is.
+                //
+                // The first FIONREAD on a fresh open still answers 0, correctly:
+                // the queue starts empty and collects from that moment. A caller
+                // that asks again next frame sees the events. It also fixes the
+                // VT tag, which `find_or_register` assigns at registration —
+                // pinned to the VT the client was actually on when it first
+                // asked, instead of never being assigned at all.
                 let f = unsafe { arch_interrupt_save() };
                 let queued = {
-                    let st = STATE.lock();
-                    st.find(dev_id as u32, open_id, pid).map_or(0, |i| st.clients[i].count)
+                    let mut st = STATE.lock();
+                    st.find_or_register(dev_id as u32, open_id, pid)
+                      .map_or(0, |i| st.clients[i].count)
                 };
                 unsafe { arch_interrupt_restore(f); }
                 let count = (queued * core::mem::size_of::<input_event>()) as i32;
