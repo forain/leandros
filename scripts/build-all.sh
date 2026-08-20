@@ -155,6 +155,21 @@ build_kernel() {
     local target_root_dir="target/build-$arch-direct"
     mkdir -p "$target_root_dir"
     local direct_linker="$ROOT_DIR/linkers/$arch-direct.ld"
+    if [[ "$arch" == "aarch64" && "$RPI5" == "true" ]]; then
+        # Derive the RPi5 direct-boot linker from the generic one so the two
+        # cannot drift: KERNEL_PHYS is the only line that differs.
+        #
+        # The generic 0x40080000 is QEMU virt's RAM base, not a Pi address. On
+        # real hardware the VideoCore does the file loading and reaches only low
+        # memory, so a kernel_address up at 1GiB is refused before the file is
+        # even read -- the firmware log shows the "Loading 'kernel.img' to ..."
+        # line with no matching "Read kernel.img bytes ..." completion, and then
+        # nothing at all. 0x200000 is where the firmware loads its own kernel.
+        direct_linker="$ROOT_DIR/target/aarch64-direct-rpi5.ld"
+        mkdir -p "$ROOT_DIR/target"
+        sed 's/^KERNEL_PHYS = .*/KERNEL_PHYS = 0x00200000;/' \
+            "$ROOT_DIR/linkers/aarch64-direct.ld" > "$direct_linker"
+    fi
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_dir" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
     RUSTFLAGS="-C link-arg=-T$direct_linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro $STACK_SIZES_FLAG" \
     cargo build -p kernel $features_arg --target "$target_spec" --target-dir "$target_root_dir" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
@@ -168,9 +183,19 @@ build_kernel() {
     sysroot=$(rustc --print sysroot)
     local host
     host=$(rustc -vV | grep host | cut -d' ' -f2)
-    local objcopy="$sysroot/lib/rustlib/$host/bin/llvm-objcopy"
+    # The llvm-tools rustup component installs this binary under two different
+    # names depending on the toolchain: `llvm-objcopy` on some, `rust-objcopy`
+    # on others (aarch64-apple-darwin nightly ships only the latter). Probe for
+    # both rather than assuming, then fall back to anything on PATH.
+    local objcopy=""
+    for cand in "$sysroot/lib/rustlib/$host/bin/llvm-objcopy" \
+                "$sysroot/lib/rustlib/$host/bin/rust-objcopy" \
+                "$(command -v llvm-objcopy 2>/dev/null)" \
+                "$(command -v rust-objcopy 2>/dev/null)"; do
+        if [[ -n "$cand" && -x "$cand" ]]; then objcopy="$cand"; break; fi
+    done
 
-    if [[ -f "$objcopy" ]]; then
+    if [[ -n "$objcopy" ]]; then
         "$objcopy" -O binary "target/final-$arch/kernel-direct" "target/final-$arch/kernel-direct.bin"
         echo "  Flat binary generated: target/final-$arch/kernel-direct.bin"
         if [[ "$arch" == "x86_64" ]]; then
@@ -178,7 +203,15 @@ build_kernel() {
             echo "  32-bit ELF generated: target/final-$arch/kernel-direct-32.elf"
         fi
     else
-        echo "⚠️  llvm-objcopy not found at $objcopy, skipping flat binary generation"
+        # Delete rather than leave behind. A stale kernel-direct.bin is worse
+        # than a missing one: scripts/prepare-rpi5-sdcard.sh and
+        # scripts/deploy-rpi5.sh both only test that the file *exists*, so an
+        # image left over from an earlier build would be flashed to hardware
+        # without complaint while this warning scrolls past in the build log.
+        rm -f "target/final-$arch/kernel-direct.bin" "target/final-$arch/kernel-direct-32.elf"
+        echo "⚠️  No objcopy found (tried llvm-objcopy and rust-objcopy in $sysroot/lib/rustlib/$host/bin and on PATH)."
+        echo "⚠️  Skipping flat binary generation; removed any stale target/final-$arch/kernel-direct.bin."
+        echo "⚠️  Install it with: rustup component add llvm-tools"
     fi
 }
 

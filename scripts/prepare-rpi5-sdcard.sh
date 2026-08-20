@@ -78,6 +78,7 @@ esac
 
 KERNEL_STD="$REPO_ROOT/target/final-aarch64/kernel"
 KERNEL_DIRECT="$REPO_ROOT/target/final-aarch64/kernel-direct"
+KERNEL_DIRECT_BIN="$REPO_ROOT/target/final-aarch64/kernel-direct.bin"
 INITRD="$REPO_ROOT/initrd-aarch64.cpio"
 UEFI_DIR="$REPO_ROOT/target/rpi5-uefi"
 
@@ -89,6 +90,11 @@ if [[ "$BOOT_MODE" == "limine" ]]; then
     for f in "$UEFI_DIR/RPI_EFI.fd" "$UEFI_DIR/bcm2712-rpi-5-b.dtb" "$UEFI_DIR/config.txt"; do
         [[ -f "$f" ]] || die "Missing vendored RPi 5 UEFI firmware file: $f"
     done
+else
+    # Direct boot ships the flat image, not the ELF — see the config.txt
+    # heredoc below for why.
+    [[ -f "$KERNEL_DIRECT_BIN" ]] || die "Missing build artifact: $KERNEL_DIRECT_BIN
+  Run: ./scripts/build-all.sh --arch aarch64 --rpi5"
 fi
 
 # ── Device validation & safety guard ─────────────────────────────────────────
@@ -276,30 +282,67 @@ fetch_gpu_firmware
 if [[ "$BOOT_MODE" == "direct" ]]; then
     info "Copying direct-boot kernel + initrd..."
     cp "$UEFI_DIR/bcm2712-rpi-5-b.dtb" "$MOUNT_DIR/bcm2712-rpi-5-b.dtb"
-    cp "$KERNEL_DIRECT" "$MOUNT_DIR/kernel.elf"
+    # The *flat* image, not the ELF. The Raspberry Pi firmware does not parse
+    # ELF for `kernel=`; it copies the file verbatim to `kernel_address` and
+    # branches to the first byte. build-all.sh already emits this via
+    # `llvm-objcopy -O binary`, and the direct ELF's PT_LOADs are contiguous
+    # with paddr == vaddr - 0xffff_8000_0000_0000, so byte 0 of the flat image
+    # is exactly physical 0x4008_0000.
+    cp "$KERNEL_DIRECT_BIN" "$MOUNT_DIR/kernel.img"
     cp "$INITRD" "$MOUNT_DIR/initrd.cpio"
 
     cat > "$MOUNT_DIR/config.txt" <<'EOF'
 arm_64bit=1
-kernel=kernel.elf
-# 0x48000000 matches the fixed address the direct-boot kernel scans for the
-# CPIO magic (see run-qemu.sh's -device loader,addr=0x48000000 for the QEMU
-# equivalent of this same convention).
-initramfs initrd.cpio 0x48000000
-enable_uart=1
-# Real hardware has no VirtIO GPU (that's QEMU-only) and no in-kernel
-# Broadcom mailbox driver yet, so the kernel's only path to HDMI output is
-# a framebuffer the *firmware* pre-allocates and publishes as a
-# `framebuffer` DTB node (simple-framebuffer binding: reg/width/height/
-# stride) — boot/src/device_tree.rs already parses that node, and
-# kernel/src/main.rs already wires a non-zero framebuffer_base straight
-# into the raw-pixel boot console (drivers/src/framebuffer.rs's fb_putc),
-# independent of the VirtIO-GPU/DRM/KMS pipeline. These three directives
-# are what make the firmware actually allocate and publish it.
-framebuffer_width=1024
-framebuffer_height=768
+kernel=kernel.img
+
+# Where the firmware may actually put things.
+#
+# The VideoCore does the file loading during boot and reaches only low memory.
+# Ask for an address it cannot write and the load is refused *before the file is
+# read*: the log shows "Loading 'kernel.img' to ... <addr>" with no matching
+# "Read kernel.img bytes ..." completion line, and then nothing ever again. That
+# is what 0x40080000 -- QEMU virt's RAM base, inherited from
+# linkers/aarch64-direct.ld -- produced on this board, and no amount of fixing
+# the image mattered because the image was never read.
+#
+# 0x200000 is where the firmware loads its own kernel (confirmed from a stock
+# kernel_2712.img boot on this Pi), and build-all.sh links the --rpi5 direct
+# kernel for exactly that address.
+kernel_address=0x200000
+
+# Same low-memory rule, so this is NOT the 0x48000000 the QEMU path uses (see
+# run-qemu.sh's -device loader). Must match kernel/src/main.rs's rpi5
+# INITRD_PHYS. Above the kernel image, which ends near 0x1600000, and below the
+# firmware's framebuffer at 0x3f800000.
+initramfs initrd.cpio 0x10000000
+
+# Ask the firmware for a framebuffer, and publish it in the device tree.
+#
+# Real hardware has no VirtIO GPU (that is QEMU-only) and this kernel has no
+# Broadcom mailbox driver, so its only path to HDMI is a surface the *firmware*
+# allocates and advertises as a `framebuffer` DTB node (simple-framebuffer
+# binding: reg/width/height/stride). boot/src/device_tree.rs matches that node
+# by name and reads exactly those properties, and kernel/src/main.rs wires a
+# non-zero framebuffer_base into the raw-pixel console in drivers/framebuffer.rs
+# — a path completely independent of the VirtIO-GPU/DRM/KMS pipeline.
+#
+# Without these the firmware still lights the display for its own boot messages
+# (the log shows it allocating "FB0 ... 1920x1080 ... base 0x3f800000"), but
+# publishes no node, so the kernel reports "Physical base: 0x0, Resolution: 0x0"
+# and the console never renders. 1920x1080 matches the mode the firmware already
+# negotiated from EDID, so the surface is presented without rescaling.
+framebuffer_width=1920
+framebuffer_height=1080
 framebuffer_depth=32
 hdmi_force_hotplug=1
+
+# Serial console on the dedicated 3-pin debug connector (BCM2712 uart10 @
+# 0x10_7D001000), which is what arch/aarch64/src/uart.rs drives. 115200 8N1.
+enable_uart=1
+# Make the second-stage bootloader narrate what it loads and where. The
+# "Read <file> bytes ..." lines are the ones that matter: a "Loading" line
+# without its matching "Read" is a refused load, not a slow one.
+uart_2ndstage=1
 EOF
 
 else
