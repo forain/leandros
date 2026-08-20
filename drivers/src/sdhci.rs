@@ -66,6 +66,49 @@
 use spin::Mutex;
 use mm;
 
+/// Bring-up marker straight to the Pi's debug PL011, independent of the console
+/// stack. This driver runs before userspace and had never touched real silicon;
+/// when it stalls, the only question worth answering is *which* wait stalled.
+#[cfg(feature = "rpi5")]
+fn dbg(c: u8) {
+    const BASE: usize = 0x107D_0010_00;
+    unsafe {
+        let mut spins = 0u32;
+        while core::ptr::read_volatile((BASE + 0x18) as *const u32) & (1 << 5) != 0 {
+            spins += 1;
+            if spins > 5_000_000 { return; }
+        }
+        core::ptr::write_volatile(BASE as *mut u32, c as u32);
+    }
+}
+#[cfg(not(feature = "rpi5"))]
+fn dbg(_c: u8) {}
+
+/// `dbg` a value as `<hex>`, for the failure paths below.
+fn dbg_hex(v: u64) {
+    dbg(b'<');
+    for i in (0..16).rev() {
+        let nib = ((v >> (i * 4)) & 0xf) as u8;
+        dbg(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
+    }
+    dbg(b'>');
+}
+
+/// Iterations any hardware handshake gets before we call it dead.
+///
+/// Every wait in this driver used to be an unbounded `loop`. That is fine on a
+/// controller that answers, and on QEMU it always did; on real BCM2712 the
+/// first one that does not answer wedges the whole boot with no output, which
+/// is exactly how this driver presented on its first hardware run. A bounded
+/// wait turns "the machine is hung" into "this stage timed out", which is a
+/// bug report rather than a mystery.
+const SPIN_LIMIT: u32 = 20_000_000;
+
+/// `(NORMAL_INT_STATUS << 16) | ERROR_INT_STATUS` as they stood at the moment
+/// the last transfer gave up, latched before they are cleared.
+static LAST_FAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+use core::sync::atomic::Ordering;
+
 // ── Base address ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "rpi5")]
@@ -112,6 +155,14 @@ const EI_ALL: u16 = 0xFFFF;
 
 // Software Reset bits
 const SWRST_ALL: u8 = 1 << 0;
+/// Reset just the CMD and DAT circuits. SDHCI 3.0 §3.10: after an error the
+/// host driver is *required* to reset these before issuing anything else,
+/// otherwise Command/DAT Inhibit stay asserted and every later command is
+/// refused. This driver never did, so the first failed transfer wedged the
+/// controller permanently — visible as PRESENT_STATE stuck at 0x…0207
+/// (CMD inhibit | DAT inhibit | DAT line active) for every subsequent access.
+const SWRST_CMD: u8 = 1 << 1;
+const SWRST_DAT: u8 = 1 << 2;
 
 // Clock Control bits
 const CLK_INTERNAL_EN: u16 = 1 << 0;
@@ -181,9 +232,15 @@ impl SdhciDevice {
     /// a genuine controller-reported error (e.g. command timeout — the
     /// realistic "no card inserted" case), never hangs forever on that path.
     unsafe fn wait_normal_int(&self, bits: u16) -> bool {
+        let mut spins: u32 = 0;
         loop {
             let status = self.r16(REG_NORMAL_INT_STATUS);
             if status & NI_ERROR != 0 {
+                // Latch both registers before clearing them. `do_io`'s failure
+                // report used to read them afterwards and always printed zero,
+                // destroying the only evidence of what actually went wrong.
+                let err = self.r16(REG_ERROR_INT_STATUS);
+                LAST_FAIL.store(((status as u32) << 16) | err as u32, Ordering::Relaxed);
                 self.w16(REG_NORMAL_INT_STATUS, NI_ALL);
                 self.w16(REG_ERROR_INT_STATUS, EI_ALL);
                 return false;
@@ -192,13 +249,23 @@ impl SdhciDevice {
                 self.w16(REG_NORMAL_INT_STATUS, bits);
                 return true;
             }
+            spins += 1;
+            if spins > SPIN_LIMIT {
+                let err = self.r16(REG_ERROR_INT_STATUS);
+                LAST_FAIL.store(((status as u32) << 16) | err as u32, Ordering::Relaxed);
+                dbg(b'!');
+                return false;
+            }
             core::hint::spin_loop();
         }
     }
 
     unsafe fn wait_cmd_inhibit_clear(&self, also_dat: bool) {
         let mask = if also_dat { PSTATE_CMD_INHIBIT | PSTATE_DAT_INHIBIT } else { PSTATE_CMD_INHIBIT };
+        let mut spins: u32 = 0;
         while self.r32(REG_PRESENT_STATE) & mask != 0 {
+            spins += 1;
+            if spins > SPIN_LIMIT { dbg(b'i'); return; }
             core::hint::spin_loop();
         }
     }
@@ -215,6 +282,19 @@ impl SdhciDevice {
         idx_check: bool,
     ) -> Option<[u32; 4]> {
         self.wait_cmd_inhibit_clear(data_present || resp == RESP_48B);
+
+        // Clear both interrupt-status registers before issuing anything.
+        //
+        // `wait_normal_int` only ever clears the specific bits it was waiting
+        // for, so any other bit the controller raised stays latched. A stale
+        // Transfer Complete then satisfies the *next* transfer's completion
+        // wait instantly and falsely, and host and card desynchronise: every
+        // command after that returns Command Timeout (ERROR_INT_STATUS bit 0).
+        // On hardware the first symptom was a write whose Buffer-Write-Ready
+        // wait spun out with NORMAL_INT_STATUS already reading 0x0002.
+        self.w16(REG_NORMAL_INT_STATUS, NI_ALL);
+        self.w16(REG_ERROR_INT_STATUS, EI_ALL);
+
         self.w32(REG_ARGUMENT1, arg);
 
         let mut word = ((index as u16) << 8) | resp;
@@ -269,10 +349,40 @@ impl SdhciDevice {
     fn do_io(&self, is_write: bool, blk: u64, buf: *mut u8) -> bool {
         let abs_blk = blk + self.partition_offset;
         for i in 0..SECTORS_PER_BLOCK {
-            let ok = unsafe {
-                self.do_io_sector(is_write, abs_blk * SECTORS_PER_BLOCK as u64 + i as u64, buf.add(i * SECTOR_SIZE))
-            };
-            if !ok { return false; }
+            let sector = abs_blk * SECTORS_PER_BLOCK as u64 + i as u64;
+            let ok = unsafe { self.do_io_sector(is_write, sector, buf.add(i * SECTOR_SIZE)) };
+            if !ok {
+                // Report the sector and the controller's own account of what
+                // went wrong. Reads demonstrably work (F2FS mounts and root
+                // pivots) and then stop working, so the interesting question is
+                // what distinguishes the failing transfer from the ones before.
+                unsafe {
+                    let latched = LAST_FAIL.load(Ordering::Relaxed);
+                    dbg(b'\n');
+                    dbg(if is_write { b'W' } else { b'R' });
+                    dbg_hex(sector);
+                    dbg(b'p'); dbg_hex(self.r32(REG_PRESENT_STATE) as u64);
+                    dbg(b'N'); dbg_hex((latched >> 16) as u64);
+                    dbg(b'E'); dbg_hex((latched & 0xffff) as u64);
+
+                    // Recover the controller so the *next* transfer has a
+                    // chance. Without this one bad sector poisons every access
+                    // that follows, which is why a single failed write during
+                    // mount turned into "execve /bin/login failed" much later.
+                    self.w8(REG_SOFTWARE_RESET, SWRST_CMD | SWRST_DAT);
+                    let mut spins: u32 = 0;
+                    while self.r8(REG_SOFTWARE_RESET) & (SWRST_CMD | SWRST_DAT) != 0 {
+                        spins += 1;
+                        if spins > SPIN_LIMIT { break; }
+                        core::hint::spin_loop();
+                    }
+                    self.w16(REG_NORMAL_INT_STATUS, NI_ALL);
+                    self.w16(REG_ERROR_INT_STATUS, EI_ALL);
+                    dbg(b'~');
+                    dbg(b'\n');
+                }
+                return false;
+            }
         }
         true
     }
@@ -281,7 +391,10 @@ impl SdhciDevice {
 impl SdhciDevice {
     unsafe fn reset_and_init_clock(&self) {
         self.w8(REG_SOFTWARE_RESET, SWRST_ALL);
+        let mut spins: u32 = 0;
         while self.r8(REG_SOFTWARE_RESET) & SWRST_ALL != 0 {
+            spins += 1;
+            if spins > SPIN_LIMIT { dbg(b'r'); break; }
             core::hint::spin_loop();
         }
 
@@ -296,7 +409,10 @@ impl SdhciDevice {
         // controllers/QEMU's model expect power-on before the external
         // clock actually starts toggling.
         self.w16(REG_CLOCK_CONTROL, CLK_DIV_MAX | CLK_INTERNAL_EN);
+        let mut spins: u32 = 0;
         while self.r16(REG_CLOCK_CONTROL) & CLK_STABLE == 0 {
+            spins += 1;
+            if spins > SPIN_LIMIT { dbg(b'k'); break; }
             core::hint::spin_loop();
         }
 
@@ -363,17 +479,36 @@ unsafe fn probe_card(base: usize) -> Option<SdhciDevice> {
     // outright rather than falling back — acceptable for a v1 targeting
     // SDHC/SDXC cards on QEMU/real hardware.
     let r = dev.send_command(CMD_SEND_IF_COND, 0x1AA, RESP_48, false, true, true)?;
-    if r[0] & 0xFF != 0xAA { return None; }
+    if r[0] & 0xFF != 0xAA { dbg(b'x'); return None; }
 
     // ACMD41 loop: CMD55 (APP_CMD) + ACMD41 (SD_SEND_OP_COND) with HCS set,
     // until the card reports ready (response bit 31). R3 has no valid CRC
     // or command-index field, so both checks are disabled.
+    let mut acmd41_tries: u32 = 0;
     dev.high_capacity = loop {
         dev.send_command(CMD_APP_CMD, 0, RESP_48, false, true, true)?;
-        let r = dev.send_command(ACMD_SD_SEND_OP_COND, 0x5100_0000 /* HCS | 3.3V window */, RESP_48, false, false, false)?;
+        // 0x40FF_8000 = HCS (bit 30) | VDD window 2.7-3.6V (bits 23:8 = 0xFF80).
+        //
+        // The window is the operative part and was previously empty (0x5100_0000
+        // claimed "HCS | 3.3V window" in a comment but set bits 30/28/24 and no
+        // window at all). Per the SD Physical Layer spec an ACMD41 carrying a
+        // zero voltage window is an *inquiry*: the card reports its OCR and
+        // deliberately stays in idle without starting its power-up sequence, so
+        // the busy bit polled below never clears and this loop cannot terminate.
+        // On hardware that hung the boot right after CMD8 succeeded.
+        //
+        // This card's OCR is 0xC0FF8000 — the firmware prints it during its own
+        // probe — so 0xFF80 is exactly the window it supports. Bit 24 (S18R, the
+        // 1.8V signalling request) is deliberately not set: nothing in this
+        // driver implements the voltage switch that would have to follow.
+        let r = dev.send_command(ACMD_SD_SEND_OP_COND, 0x40FF_8000, RESP_48, false, false, false)?;
         if r[0] & (1 << 31) != 0 {
             break r[0] & (1 << 30) != 0;
         }
+        // Power-up can legitimately take ~1s of polling, but not forever: a
+        // card that never sets the ready bit is a dead card, not a slow one.
+        acmd41_tries += 1;
+        if acmd41_tries > 100_000 { dbg(b'a'); return None; }
         core::hint::spin_loop();
     };
 
@@ -417,8 +552,8 @@ pub fn init() {
     // device — so mirroring the index instead of touching shared userland
     // code keeps `/dev/vdb` working unmodified everywhere.
     *cnt = match unsafe { probe_card(virt_base) } {
-        Some(d) => { devs[1] = Some(d); 2 }
-        None => 0,
+        Some(d) => { devs[1] = Some(d); dbg(b']'); 2 }
+        None => { dbg(b'-'); 0 }
     };
 }
 
@@ -434,6 +569,45 @@ pub fn read_block(dev_idx: usize, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool 
     } else {
         false
     }
+}
+
+/// Read `buf.len() / 4096` contiguous blocks starting at logical block `blk`
+/// into `buf`. `buf.len()` must be a non-zero multiple of 4096.
+///
+/// Mirrors `virtio_blk::read_blocks`, which `servers/f2fs` reaches through the
+/// `drivers::blkdev` alias, so the same source compiles against either backend.
+/// There is no `MAX_IO_BLOCKS` splitting to mirror here: `do_io` already
+/// decomposes every 4096-byte block into eight single-sector CMD17 transfers,
+/// so no request this loop issues is larger than one 512-byte sector either
+/// way. One lock acquisition covers the whole span, matching virtio_blk.
+pub fn read_blocks(dev_idx: usize, blk: u64, buf: &mut [u8]) -> bool {
+    if buf.is_empty() || buf.len() % BLOCK_SIZE != 0 { return false; }
+    let devs = DEVICES.lock();
+    let dev = match devs[dev_idx] { Some(ref d) => d, None => return false };
+    let total = buf.len() / BLOCK_SIZE;
+    for i in 0..total {
+        let ok = dev.do_io(false, blk + i as u64, unsafe { buf.as_mut_ptr().add(i * BLOCK_SIZE) });
+        if !ok { return false; }
+    }
+    true
+}
+
+/// Commit `dev_idx`'s writes to stable storage.
+///
+/// The virtio counterpart issues a real `VIRTIO_BLK_T_FLUSH` because the host
+/// backend genuinely holds a writeback cache that `write_block` returning does
+/// not empty. This driver has no such intermediary: writes are single-block
+/// CMD24s driven by programmed I/O straight into the controller's buffer port,
+/// and `do_io_sector` does not return until the controller raises Transfer
+/// Complete — by which point the card has left programming state and the data
+/// is on media. So there is nothing left to commit, and reporting success is
+/// the accurate answer rather than a convenient one.
+///
+/// Still gated on the device existing, so a flush against an absent device
+/// reports failure exactly as virtio_blk does.
+pub fn flush(dev_idx: usize) -> bool {
+    let devs = DEVICES.lock();
+    devs[dev_idx].is_some()
 }
 
 /// Write one 4096-byte block to device `dev_idx` at logical block `blk`.
