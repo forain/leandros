@@ -21,6 +21,40 @@ pub unsafe extern "C" fn arch_flush_cache_range(addr: usize, len: usize) {
     core::arch::asm!("dsb ish", "isb", options(nostack));
 }
 
+/// Clean **and invalidate** a range to the Point of Coherency.
+///
+/// Distinct from `arch_flush_cache_range` above, which issues `dc cvau` —
+/// clean to the Point of *Unification*. PoU is the level at which this PE's
+/// instruction and data caches agree, which is what self-modifying code needs
+/// and all that function was ever written for. A non-coherent DMA master
+/// sitting outside the PE — the Raspberry Pi's VideoCore, which reads our
+/// mailbox property buffer through an uncached bus alias — needs the Point of
+/// *Coherency* instead, and `dc cvau` does not reach it. Using the wrong one
+/// fails silently: the request looks correct in memory from the CPU's side and
+/// the device reads stale bytes.
+///
+/// The line size comes from CTR_EL0.DminLine rather than a constant, so the
+/// sweep neither skips lines on a machine with smaller ones nor wastes
+/// operations on one with larger. Callers must pass a range that is
+/// cache-line aligned and a whole number of lines long if neighbouring data
+/// must not be disturbed — the "invalidate" half discards, and on a shared
+/// line it discards someone else's bytes too.
+#[no_mangle]
+pub unsafe extern "C" fn arch_dcache_clean_inval_range(addr: usize, len: usize) {
+    if len == 0 { return; }
+    let ctr: u64;
+    core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+    // DminLine (bits 19:16) is log2 of the line size in *words*.
+    let line = 4usize << ((ctr >> 16) & 0xF);
+    let mut curr = addr & !(line - 1);
+    let end = addr + len;
+    while curr < end {
+        core::arch::asm!("dc civac, {}", in(reg) curr, options(nostack));
+        curr += line;
+    }
+    core::arch::asm!("dsb sy", "isb", options(nostack));
+}
+
 #[no_mangle]
 pub extern "C" fn arch_interrupt_save() -> usize {
     let daif: usize;
@@ -113,20 +147,18 @@ pub fn init(boot_info: &boot::BootInfo) {
         paging::map_4k(root_phys as *mut u64, gicc_virt, gicc_phys, device_flags);
         if boot_info.framebuffer_base != 0 {
             let fb_start_phys = boot_info.framebuffer_base as usize & !4095;
-            // Mirror kernel_main's pitch fallback (main.rs's `pitch_bytes` calc):
-            // some firmware DTBs omit or zero the `stride` property, in which case
-            // the console falls back to width*4 bytes/row when it *draws*. If this
-            // mapping used the raw (possibly zero) DTB pitch instead, it would map
-            // far fewer pages than the console later writes into, and the very
-            // first fb_putc/clear would walk off the mapped region into an
-            // unhandled data abort — silently hanging with a black screen and no
-            // console output at all.
-            let effective_pitch = if (boot_info.framebuffer_pitch as usize) < boot_info.framebuffer_width as usize * 4 {
-                boot_info.framebuffer_width as usize * 4
-            } else {
-                boot_info.framebuffer_pitch as usize
-            };
-            let fb_size = effective_pitch * boot_info.framebuffer_height as usize;
+            // ONE source for this number, shared with the buddy reservation and
+            // the cache sweep in kernel_main: `BootInfo::framebuffer_bytes()`.
+            // It folds in both the zero-`stride` fallback (some firmware DTBs
+            // omit it, and mapping fewer pages than the console then writes into
+            // aborts on the very first `clear`) and the case where the surface
+            // is taller than the display, which the Raspberry Pi mailbox asks
+            // for so a later lane can scroll by panning instead of copying.
+            //
+            // Deriving it here independently is exactly what produced a level-2
+            // translation fault at `fb_virt + size - 4` the first time the two
+            // halves disagreed. See that method's doc comment.
+            let fb_size = boot_info.framebuffer_bytes();
             let fb_end_phys = (boot_info.framebuffer_base as usize + fb_size + 4095) & !4095;
             let num_pages = (fb_end_phys - fb_start_phys) / 4096;
             // ATTR_NORMAL_NC, not ATTR_NOCACHE. The latter selects MAIR index 3,

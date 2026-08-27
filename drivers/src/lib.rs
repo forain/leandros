@@ -28,6 +28,12 @@ pub mod virtio_net;
 pub mod usb_hcd;
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod sdhci;
+/// VideoCore mailbox — the only source of a framebuffer on a Raspberry Pi 5,
+/// whose firmware publishes no `simple-framebuffer` DTB node. Compiled for
+/// `raspi4b` too, where QEMU models the same property interface and the whole
+/// protocol can be exercised without hardware.
+#[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
+pub mod rpi_mailbox;
 
 /// The active block-storage backend, selected at compile time. `virtio_blk`
 /// on QEMU `virt`/x86_64 (PCI transport); `sdhci` on rpi5/raspi4b builds

@@ -137,6 +137,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             framebuffer_width:   boot_info.framebuffer_width,
             framebuffer_height:  boot_info.framebuffer_height,
             framebuffer_pitch:   boot_info.framebuffer_pitch,
+            framebuffer_size:    boot_info.framebuffer_size,
             rsdp_addr:           boot_info.rsdp_addr,
             uart_base:           boot_info.uart_base,
             pci_ecam_base:       boot_info.pci_ecam_base,

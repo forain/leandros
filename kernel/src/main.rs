@@ -119,6 +119,7 @@ static mut BOOT_INFO: boot::BootInfo = boot::BootInfo {
     framebuffer_width:   0,
     framebuffer_height:  0,
     framebuffer_pitch:   0,
+    framebuffer_size:    0,
     rsdp_addr:           0,
     uart_base:           0,
     pci_ecam_base:       0,
@@ -380,6 +381,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                     framebuffer_width: 0,
                     framebuffer_height: 0,
                     framebuffer_pitch: 0,
+                    framebuffer_size: 0,
                     rsdp_addr:           0,
                     uart_base:           0,
                     pci_ecam_base:       0,
@@ -479,6 +481,110 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 unsafe {
                     BOOT_INFO.initrd_base = INITRD_PHYS as u64;
                     BOOT_INFO.initrd_size = initrd_len as u64;
+                }
+            }
+
+            // ── VideoCore framebuffer (Raspberry Pi / BCM2712, BCM2711) ──────
+            //
+            // The Pi 5 firmware publishes no `simple-framebuffer` DTB node — its
+            // `fb` node is `brcm,bcm2708-fb` with nothing but a `firmware`
+            // phandle — so `device_tree::parse` above leaves framebuffer_base at
+            // 0 and the board has been serial-only. Ask the firmware directly.
+            //
+            // ## Why exactly here
+            //
+            // *After* the DTB parse, which this needs nothing from but must not
+            // disturb.
+            //
+            // *Before* `mm::init_with_map` (below), because that calls
+            // `buddy::init_from_map`, and `mm::buddy::reserve_range` is
+            // documented as usable only before it. Getting the reservation in is
+            // not optional: the firmware's framebuffer very plausibly sits
+            // inside a region the DTB advertises as ordinary available RAM, and
+            // an allocator that hands those frames to the heap both scribbles on
+            // the screen and loses whatever the heap put there. Two slots of
+            // MAX_RESERVED = 8 are used above; this is the third.
+            //
+            // *Before* `arch_aarch64::init`, which already maps
+            // `BOOT_INFO.framebuffer_base` at 0xFFFF_A000_0000_0000 with
+            // ATTR_NORMAL_NC and already mirrors the pitch fallback below. That
+            // virtual base resolves through L0 slot 320, which `entry_aarch64.s`
+            // leaves empty (it populates only 0, 256 and 511) — so `map_4k`
+            // builds real 4 KiB leaf entries there rather than colliding with a
+            // 1 GiB block descriptor it cannot split. Nothing in that function
+            // needs to change.
+            //
+            // The buffer this hands the firmware has to be physically
+            // contiguous, 16-byte aligned, under the 1 GiB VideoCore bus alias,
+            // and coherent with a device that reads around our caches. At this
+            // point in boot there is no buddy allocator, no heap, and no
+            // Normal-NonCacheable MAIR attribute (`mmu::enable_identity`
+            // installs index 2 later, inside `arch_aarch64::init`), so it is a
+            // cache-line-aligned static in the kernel image plus explicit
+            // `dc civac` maintenance. See drivers/src/rpi_mailbox.rs.
+            #[cfg(any(feature = "rpi5", feature = "raspi4b"))]
+            unsafe {
+                // Install VBAR_EL1 before the first MMIO touch of a peripheral
+                // whose address is a *deduction* rather than something this
+                // kernel has already booted on.
+                //
+                // `arch_aarch64::init` does this too, but not until after the
+                // mailbox call below, and until it runs a fault at EL1 vectors
+                // to whatever VBAR_EL1 happens to hold — which is nothing, so
+                // the machine wedges in total silence. Proven, not assumed:
+                // pointing MBOX_BASE_PHYS at an unbacked address under QEMU
+                // raspi4b produced exactly one line of output ("[MBOX] base=")
+                // and then two minutes of nothing, because an external abort on
+                // unassigned MMIO faulted before any timeout could fire. With
+                // vectors installed the same run reports ESR and FAR instead.
+                //
+                // On a board whose SD card has to be physically moved between
+                // machines to reflash, the difference between "silence" and
+                // "ESR=…, FAR=0x107C013880" is an entire round trip. `init` is
+                // a single `msr vbar_el1` against a static table with no
+                // dependencies, and calling it twice writes the same value.
+                arch_aarch64::exception::init();
+
+                if let Some((s, e)) = drivers::rpi_mailbox::scratch_reservation() {
+                    // raspi4b only: that build links at physical 0x4008_0000,
+                    // above the bus alias, so the property buffer cannot live in
+                    // the image and uses a fixed low scratch page instead.
+                    mm::buddy::reserve_range(s, e);
+                }
+                match drivers::rpi_mailbox::init_framebuffer(hhdm_offset as usize, 1920, 1080) {
+                    Ok(fb) => {
+                        BOOT_INFO.framebuffer_base = fb.phys;
+                        BOOT_INFO.framebuffer_width = fb.width;
+                        BOOT_INFO.framebuffer_height = fb.height;
+                        BOOT_INFO.framebuffer_pitch = fb.pitch;
+                        // The WHOLE allocation, off-screen panning rows
+                        // included — `reserve_len()` is `virt_height`-based on
+                        // purpose. Reserving only the visible `pitch * height`
+                        // would hand the buddy allocator the half of the buffer
+                        // the next lane wants to pan into.
+                        let len = fb.reserve_len() as usize;
+                        // Tells `arch_aarch64::init` to map the whole buffer,
+                        // not just the visible `pitch * height`. Without it the
+                        // off-screen panning rows are reserved but unmapped —
+                        // caught on the very first QEMU raspi4b run as a level-2
+                        // translation fault at FAR = fb_virt + size - 4.
+                        BOOT_INFO.framebuffer_size = len as u64;
+                        mm::buddy::reserve_range(fb.phys as usize, fb.phys as usize + len);
+                        arch_aarch64::uart::serial_print_str("[MBOX] reserved ");
+                        arch_aarch64::uart::print_hex(fb.phys as usize);
+                        arch_aarch64::uart::serial_print_str("-");
+                        arch_aarch64::uart::print_hex(fb.phys as usize + len);
+                        arch_aarch64::uart::serial_print_str(" virt_height=");
+                        crate::print_number(fb.virt_height);
+                        arch_aarch64::uart::serial_print_str("\n");
+                    }
+                    Err(_) => {
+                        // Already logged in detail by the driver. Leaving
+                        // framebuffer_base at 0 drops through to kernel_main's
+                        // existing "no bootloader framebuffer" branch and a
+                        // serial-only boot — bit for bit what this board does
+                        // today, so the failure path is already proven.
+                    }
                 }
             }
         }
@@ -650,10 +756,10 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             // Set VFS framebuffer info for DRM driver
             let width = bi.framebuffer_width;
             let height = bi.framebuffer_height;
-            let pitch = bi.framebuffer_pitch;
 
-            // Ensure pitch is in bytes
-            let pitch_bytes = if pitch < width * 4 { width * 4 } else { pitch };
+            // Same accessor `arch_aarch64::init` mapped with, so the console
+            // can never draw against a stride the mapping did not cover.
+            let pitch_bytes = bi.framebuffer_pitch_bytes() as u32;
 
             vfs_server::set_framebuffer(bi.framebuffer_base, width, height, pitch_bytes);
             
@@ -675,12 +781,113 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             serial_print_hex(fb_virt);
             serial_print_str("\n");
 
+            // ── Raspberry Pi framebuffer: evict the cacheable aliases ────────
+            //
+            // The surface is mapped Normal-NonCacheable at fb_virt, but the same
+            // physical pages are ALSO covered by the 1 GiB Normal Write-Back
+            // block descriptors `entry_aarch64.s` installs — once identity
+            // (TTBR0, L0[0]) and once through the HHDM (TTBR1, L0[256]). Nothing
+            // reads or writes the framebuffer through those aliases, which is
+            // what makes the mismatched attributes survivable, but a line pulled
+            // in speculatively before the reservation took effect would shadow
+            // the first frame. One `dc civac` sweep forecloses that whole class
+            // of "stale pixels on the one hardware boot" for well under a
+            // millisecond: 8.3 MB at a 64-byte line is ~130k operations.
+            //
+            // Covers RPI_FB_RESERVE_LEN, not `pitch * height` — the allocation
+            // may be twice as tall as the visible area.
+            //
+            // Runs here rather than in `arch_aarch64::init`, which maps the
+            // framebuffer *before* `exception::init` installs VBAR_EL1; a fault
+            // there would be a silent hang with no vectors to report it.
+            #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
+            {
+                // Identical accessor to the one `arch_aarch64::init` mapped
+                // with — the sweep can no longer outrun the mapping.
+                let sweep = bi.framebuffer_bytes();
+                arch_aarch64::arch_dcache_clean_inval_range(fb_virt, sweep);
+                serial_print_str("[MBOX] dcache sweep ");
+                serial_print_hex(sweep);
+                serial_print_str("\n");
+
+                // Readback probe: prove the mapping lands on real, writable
+                // memory before the console starts trusting it. A wrong
+                // bus→physical conversion produces a mapping that reads back
+                // something other than what was written (or faults), and this
+                // says so in one line instead of costing a second boot.
+                let p = fb_virt as *mut u32;
+                let last = (sweep / 4).saturating_sub(1);
+                p.write_volatile(0xA5A5_5A5A);
+                p.add(last).write_volatile(0x5A5A_A5A5);
+                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+                serial_print_str("[MBOX] fbrb first=");
+                serial_print_hex(p.read_volatile() as usize);
+                serial_print_str(" last=");
+                serial_print_hex(p.add(last).read_volatile() as usize);
+                serial_print_str("\n");
+            }
+
             drivers::framebuffer::init_kernel_fb(
                 fb_virt as *mut u32,
                 width as usize,
                 height as usize,
                 pitch_bytes as usize,
             );
+
+            // ── Pixel-order reference bars ───────────────────────────────────
+            //
+            // Red, green and blue in vertical thirds across the top of the
+            // screen, painted straight into the surface after the console has
+            // cleared it, and held long enough to photograph.
+            //
+            // `SET_PIXEL_ORDER` takes 0 for BGR and 1 for RGB, and which one
+            // matches this console is the single thing in the whole design that
+            // serial output cannot settle: `drivers::framebuffer` composes
+            // colours as 0x00RRGGBB, and whether the firmware scans those bytes
+            // out as red-first depends on a value we had to guess. A photograph
+            // settles it. The Pi 5's SD card has to be physically moved between
+            // machines to reflash, so three seconds of boot time is a very cheap
+            // substitute for a second round trip. Set the hold to 0 to disable.
+            //
+            // Vertical thirds rather than horizontal bands so left-to-right
+            // order is unambiguous in the photo; the console keeps drawing over
+            // them from the top-left as boot proceeds, which is fine.
+            #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
+            {
+                const BAR_HOLD_SECS: u64 = 3;
+                const BAR_ROWS: usize = 128;
+                let stride = pitch_bytes as usize / 4;
+                let p = fb_virt as *mut u32;
+                let w = width as usize;
+                let rows = if (height as usize) < BAR_ROWS { height as usize } else { BAR_ROWS };
+                for y in 0..rows {
+                    for x in 0..w {
+                        let c = if x < w / 3 {
+                            0x00FF_0000 // red
+                        } else if x < 2 * w / 3 {
+                            0x0000_FF00 // green
+                        } else {
+                            0x0000_00FF // blue
+                        };
+                        p.add(y * stride + x).write_volatile(c);
+                    }
+                }
+                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+                serial_print_str("[MBOX] colour bars: RED GREEN BLUE left-to-right, holding\n");
+                if BAR_HOLD_SECS > 0 {
+                    let f: u64;
+                    core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack));
+                    let hz = if f == 0 { 100_000_000 } else { f };
+                    let start: u64;
+                    core::arch::asm!("mrs {}, cntvct_el0", out(reg) start, options(nomem, nostack));
+                    loop {
+                        let now: u64;
+                        core::arch::asm!("mrs {}, cntvct_el0", out(reg) now, options(nomem, nostack));
+                        if now.wrapping_sub(start) >= hz * BAR_HOLD_SECS { break; }
+                        core::hint::spin_loop();
+                    }
+                }
+            }
             serial_print_str("[MAIN] Framebuffer console initialized.\n");
         } else {
             // No bootloader-provided framebuffer.  This is the normal case on
