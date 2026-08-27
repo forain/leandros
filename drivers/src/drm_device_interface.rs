@@ -73,6 +73,114 @@ const DRM_IOCTL_MODE_GETPROPBLOB: u32 = 0xC01064AC;
 const DRM_CAP_CURSOR_WIDTH: u64 = 0x8;
 const DRM_CAP_CURSOR_HEIGHT: u64 = 0x9;
 
+// ── Sync objects (DRM_IOCTL_SYNCOBJ_*) ───────────────────────────────────────
+//
+// WHY THESE EXIST AT ALL. `TODO.md:3251` recorded that syncobj was "not on the
+// critical path — Mesa compiles the SIMULATE path unconditionally". That is
+// true of the **virtgpu** gallium/Venus driver and false of **v3d**:
+// `drm_v3d_submit_cl` carries `in_sync_bcl`, `in_sync_rcl` and `out_sync` as
+// syncobj handles unconditionally and the v3d gallium/vulkan drivers have no
+// simulate path. So this is a hard prerequisite for the Pi 5 GPU, and it is
+// fully testable under QEMU with no hardware.
+//
+// REQUEST CODES ARE DERIVED, NOT GUESSED — this file's convention, and the two
+// codes that were once guessed here cost real sessions. `_IOC(dir, type, nr,
+// size) = dir<<30 | size<<16 | type<<8 | nr`, with `_IOWR` => dir 3 =>
+// 0xC000_0000, DRM's type 'd' => 0x64 => 0x6400. Every syncobj ioctl is _IOWR.
+// The `nr`s are drm.h's 0xBF..0xCF block. Sizes are the C struct sizes, all of
+// which are 8-byte aligned so `sizeof` is just the sum of the fields:
+//
+//   nr    struct                        fields                          size
+//   ────  ────────────────────────────  ──────────────────────────────  ────
+//   0xBF  drm_syncobj_create            u32 handle, u32 flags            8  0x08
+//   0xC0  drm_syncobj_destroy           u32 handle, u32 pad              8  0x08
+//   0xC1  drm_syncobj_handle            u32 handle, u32 flags,
+//         (HANDLE_TO_FD)                s32 fd,     u32 pad             16  0x10
+//   0xC2  drm_syncobj_handle            (same struct)                   16  0x10
+//   0xC3  drm_syncobj_wait              u64 handles, s64 timeout_nsec,
+//                                       u32 count_handles, u32 flags,
+//                                       u32 first_signaled, u32 pad     32  0x20
+//   0xC4  drm_syncobj_array             u64 handles, u32 count, u32 pad 16  0x10
+//   0xC5  drm_syncobj_array             (same struct)                   16  0x10
+//   0xCA  drm_syncobj_timeline_wait     u64 handles, u64 points,
+//                                       s64 timeout_nsec, u32 count,
+//                                       u32 flags, u32 first, u32 pad   40  0x28
+//   0xCB  drm_syncobj_timeline_array    u64 handles, u64 points,
+//                                       u32 count_handles, u32 flags    24  0x18
+//   0xCC  drm_syncobj_transfer          u32 src_handle, u32 dst_handle,
+//                                       u64 src_point, u64 dst_point,
+//                                       u32 flags, u32 pad              32  0x20
+//   0xCD  drm_syncobj_timeline_array    (same struct)                   24  0x18
+//   0xCF  drm_syncobj_eventfd           u32 handle, u32 flags, u64 point,
+//                                       s32 fd, u32 pad                 24  0x18
+//
+// Cross-check against a code already proven in this file: ATOMIC is nr 0xBC on
+// a 56-byte struct and reads 0xC038_64BC — 0xC0000000 | 0x38<<16 | 0x6400 |
+// 0xBC. The arithmetic below is identical.
+const DRM_IOCTL_SYNCOBJ_CREATE: u32 = 0xC00864BF;
+const DRM_IOCTL_SYNCOBJ_DESTROY: u32 = 0xC00864C0;
+const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: u32 = 0xC01064C1;
+const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: u32 = 0xC01064C2;
+const DRM_IOCTL_SYNCOBJ_WAIT: u32 = 0xC02064C3;
+const DRM_IOCTL_SYNCOBJ_RESET: u32 = 0xC01064C4;
+const DRM_IOCTL_SYNCOBJ_SIGNAL: u32 = 0xC01064C5;
+const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: u32 = 0xC02864CA;
+const DRM_IOCTL_SYNCOBJ_QUERY: u32 = 0xC01864CB;
+const DRM_IOCTL_SYNCOBJ_TRANSFER: u32 = 0xC02064CC;
+const DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL: u32 = 0xC01864CD;
+const DRM_IOCTL_SYNCOBJ_EVENTFD: u32 = 0xC01864CF;
+
+/// True for every `DRM_IOCTL_SYNCOBJ_*` request code, implemented or not.
+///
+/// The DRM server uses this to pick the syncobj errno table: this seam has
+/// historically collapsed every failure to -1, and syncobj is the first family
+/// whose *errno values* are part of the contract Mesa reads (ETIME vs ENOENT vs
+/// EINVAL decide whether a wait retries, a handle is re-created, or the driver
+/// aborts). Derived from the encoded `nr` rather than a hand-kept list so a
+/// code added above cannot be forgotten here.
+pub fn is_syncobj_ioctl(cmd: u32) -> bool {
+    if (cmd >> 8) & 0xFF != 0x64 { return false; }
+    matches!(cmd & 0xFF, 0xBF | 0xC0 | 0xC1 | 0xC2 | 0xC3 | 0xC4 | 0xC5
+                       | 0xCA | 0xCB | 0xCC | 0xCD | 0xCF)
+}
+
+// drm_syncobj_create.flags
+const DRM_SYNCOBJ_CREATE_SIGNALED: u32 = 1 << 0;
+// drm_syncobj_wait.flags
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1 << 0;
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: u32 = 1 << 1;
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: u32 = 1 << 2;
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE: u32 = 1 << 3;
+
+// drm_get_cap.capability
+const DRM_CAP_SYNCOBJ: u64 = 0x13;
+const DRM_CAP_SYNCOBJ_TIMELINE: u64 = 0x14;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_syncobj_create { handle: u32, flags: u32 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_syncobj_destroy { handle: u32, pad: u32 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_syncobj_array { handles: u64, count_handles: u32, pad: u32 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_syncobj_wait {
+    handles: u64,
+    /// **Absolute** CLOCK_MONOTONIC nanoseconds, not a duration — upstream's
+    /// `drm_timeout_abs_to_jiffies`. <= 0, or already past, means "poll".
+    timeout_nsec: i64,
+    count_handles: u32,
+    flags: u32,
+    first_signaled: u32,
+    pad: u32,
+}
+
 /// Synthetic plane ids. 30 is the pre-existing primary; 31 is the new cursor
 /// plane. crtc/connector/encoder all keep id 1 (see the note above) — object
 /// *types* are disambiguated in the atomic path by the property id, since our
@@ -903,10 +1011,16 @@ struct BlobObj {
     /// `virtio_gpu_object`, and two handles naming one buffer must not disagree
     /// about whether work against it has retired.
     last_fence: u64,
-    /// `blob_mem` the blob was created with (VIRTIO_GPU_BLOB_MEM_*). Never 0:
-    /// RESOURCE_CREATE_BLOB rejects blob_mem == 0, so every entry in this map is
-    /// a real blob. RESOURCE_INFO reports it, and Mesa's Venus backend refuses
-    /// an imported BO whose blob_mem is not the one it allocates with.
+    /// `blob_mem` the blob was created with (VIRTIO_GPU_BLOB_MEM_*). Non-zero
+    /// for every *virtgpu* entry: RESOURCE_CREATE_BLOB rejects blob_mem == 0.
+    /// RESOURCE_INFO reports it, and Mesa's Venus backend refuses an imported BO
+    /// whose blob_mem is not the one it allocates with.
+    ///
+    /// **0 for a v3d BO**, which is not a blob at all and has no virtio-gpu
+    /// blob_mem to report. The two kinds can never be seen by one client — the
+    /// backends are mutually exclusive for the life of the boot — so no virtgpu
+    /// consumer of this field is reachable with a v3d object in hand; `v3d_va`
+    /// is the field that says which kind this is.
     blob_mem: u32,
     /// Host-visible window bookkeeping, both zero until RESOURCE_MAP_BLOB has
     /// succeeded for this blob (and zero forever for a guest-backed one). Per
@@ -929,6 +1043,25 @@ struct BlobObj {
     /// Live references: one per `BlobHandle` naming this object, plus one per
     /// exporting `TmpVmo` slot. See `BO LIFETIME`.
     refs: u32,
+    /// GPU virtual address, for a BO created by `DRM_IOCTL_V3D_CREATE_BO`;
+    /// **0 for every virtgpu blob**, which is also what makes this field the
+    /// marker for "this object belongs to the v3d backend".
+    ///
+    /// Reusing `BLOB_OBJS` for v3d BOs rather than standing up a third registry
+    /// is deliberate: GEM_CLOSE, the refcounted `BO LIFETIME` rules, per-open
+    /// reachability, `bo_fence`/`bo_attach_fence`, PRIME export and the
+    /// `bo_census` leak audit are all generic and all key off this map, and a
+    /// parallel registry would have to re-derive every one of them (and could
+    /// drift from them). What is NOT generic is the host round-trip in
+    /// `blob_unref` — a v3d BO has no virtio-gpu resource behind it — so that
+    /// teardown is gated on `res_handle != 0`, which is a true statement about
+    /// any object with no host resource and not a v3d special case.
+    ///
+    /// A u64 rather than the u32 the UAPI carries, so the allocator's window
+    /// arithmetic (`V3D_VA_TOP` is 0x1_0000_0000) does not have to be done in a
+    /// type that cannot hold its own upper bound. Every value stored here fits
+    /// in a u32 by construction.
+    v3d_va: u64,
 }
 
 /// One gem handle naming a `BlobObj`. **The handle IS one reference.**
@@ -989,6 +1122,10 @@ struct BlobView {
     last_fence: u64,
     blob_mem: u32,
     map_phys: u64,
+    /// See `BlobObj::v3d_va`. Non-zero means this is a v3d BO, which is what
+    /// GET_BO_OFFSET answers with and what MMAP_BO refuses to confuse with a
+    /// virtgpu blob's host-visible token.
+    v3d_va: u64,
 }
 
 impl BlobView {
@@ -1001,6 +1138,7 @@ impl BlobView {
             last_fence: o.last_fence,
             blob_mem: o.blob_mem,
             map_phys: o.map_phys,
+            v3d_va: o.v3d_va,
         }
     }
 }
@@ -1253,6 +1391,13 @@ pub fn drm_release_open(open_id: u32) {
         DrmDeviceInterface::free_blob(h);
     }
 
+    // Sync objects this open created and never destroyed. Same reason as the
+    // blob sweep above and the same shape: upstream destroys a `drm_file`'s
+    // whole syncobj idr in `drm_syncobj_release`, and without this a client
+    // that exits mid-frame leaks one entry per fence it ever created — which,
+    // for a v3d client, is one per submit.
+    syncobj_release_open(open_id);
+
     // Nothing further to do for an open that never created a context — but its
     // blobs, above, still had to be reclaimed.
     if ctx == 0 { return; }
@@ -1430,7 +1575,16 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
     // Nothing to say to the device: an fd reference (`detach_ctx == 0`) going
     // away while other references remain is pure bookkeeping. Skipping the lock
     // matters because this is now the compositor's per-frame dmabuf-close path.
-    if detach_ctx != 0 || dead.is_some() {
+    //
+    // `res_handle != 0` is the second reason to say nothing, and it is the one
+    // a v3d BO takes: an object with no host virtio-gpu resource has nothing to
+    // unmap, detach or unref, and issuing `resource_unref(0)` would name the
+    // host's resource id 0. Written as a property of the object rather than as
+    // "is this v3d", because it is true of any object with no host resource and
+    // stays true if another kind ever appears. Every virtgpu blob has a
+    // non-zero `res_handle` (`alloc_resource_id()` starts at 16), so this
+    // changes nothing on that path.
+    if res_handle != 0 && (detach_ctx != 0 || dead.is_some()) {
         let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
         if let Some(gpu) = guard.as_mut() {
             // UNMAP before UNREF: the host holds the window sub-region on behalf
@@ -1463,6 +1617,13 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
         // RESOURCE_MAP_BLOB at that offset is rejected and rolls itself back.
         if o.map_phys != 0 {
             hostvis_free(o.win_off);
+        }
+        // The GPU address space, on the same "the record is what it is
+        // reachable from" principle as the window reservation above: once this
+        // record is gone nothing else can return the span, so it is returned
+        // here, unconditionally, from the one place the object dies.
+        if o.v3d_va != 0 {
+            v3d_va_free(o.v3d_va);
         }
         if o.phys != 0 {
             mm::buddy::free(o.phys, o.order);
@@ -1560,6 +1721,26 @@ pub fn blob_map_cache_type(phys: u64) -> u32 {
     for b in blobs.values() {
         if b.map_phys != 0 && phys >= b.map_phys && phys - b.map_phys < b.size {
             return b.map_info & crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_MASK;
+        }
+        // A v3d BO is guest RAM, so the paragraph above would call it CACHED —
+        // and that is exactly the wrong answer. On real V3D the GPU is not
+        // coherent with the CPU caches: upstream maps every v3d BO write-combine
+        // (`v3d_bo.c` sets `pgprot_writecombine`), and Mesa relies on it, writing
+        // command lists and vertex data through the mapping with no flush of its
+        // own. Answering CACHED here would work under QEMU — where the "GPU"
+        // is this stub and reads nothing — and then fail on the Pi in the way
+        // that is hardest to see, as sporadically wrong geometry rather than as
+        // an error. The stub therefore reports what the hardware needs, so the
+        // mapping attributes are settled before the hardware arrives.
+        //
+        // Same containment test as above, and against `phys`/`size` rather than
+        // `map_phys`: a v3d BO's mmap token IS its guest-physical base.
+        if b.v3d_va != 0
+            && b.phys != 0
+            && phys >= (b.phys as u64)
+            && phys - (b.phys as u64) < b.size
+        {
+            return crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_WC;
         }
     }
     crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_CACHED
@@ -1800,6 +1981,674 @@ pub fn prime_export_acquire(handle: u32, open_id: u32) -> Option<PrimeExport> {
     })
 }
 
+// ── DRM sync objects ─────────────────────────────────────────────────────────
+//
+// A syncobj is a *named, per-drm_file container for a fence*. That indirection
+// is the whole point: a client creates the handle, hands it to a submission as
+// `out_sync`, and waits on it later — the fence inside is replaced each time
+// the handle is submitted against. v3d's `drm_v3d_submit_cl` takes three of
+// them (`in_sync_bcl`, `in_sync_rcl`, `out_sync`) and has no simulate path.
+//
+// THE SHORTCUT NOT TAKEN. The virtgpu out-fence eventfd in this tree is
+// signalled *at creation* (TODO.md:3251). That is only correct because
+// `VirtioGpu::submit` is a synchronous busy-spin, so every fence it hands out
+// is already retired when the ioctl returns. V3D submission is asynchronous by
+// construction, so a syncobj here carries a real fence id and a real,
+// separately-published retirement, and nothing in this section declares a
+// syncobj signalled merely because it was created or submitted against.
+//
+// THE FENCE MODEL, and how it stays honest with only two words of state:
+//   * `fence == 0`               — NULL fence. Upstream's "no fence yet".
+//   * `signaled == true`         — an explicitly signalled stub fence
+//                                  (CREATE_SIGNALED / SIGNAL), or a retirement
+//                                  already folded in.
+//   * `fence != 0 && !signaled`  — a real pending fence, signalled iff it has
+//                                  been retired.
+// Retirement is published as a **lock-free watermark** (`SYNCOBJ_FENCE_DONE`),
+// not by walking the table, so `syncobj_retire_fence` is callable straight from
+// a GPU completion ISR: it is one `fetch_max` plus a try-wake, takes no lock at
+// all, and therefore cannot be the 82d0cc3 shape (a lock ordered against
+// RUN_QUEUE taken with IRQs off). The cost of a watermark is that it assumes
+// fence ids retire in issue order, which holds for a single in-order job queue
+// — v3d's bin and render queues each are one — and is why the retire entry
+// point is documented as per-queue-monotonic rather than arbitrary.
+//
+// LOCK ORDER. `SYNCOBJS` is a leaf, exactly like `BLOB_OBJS`/`BLOB_BUFFERS`:
+// nothing else is ever locked while it is held, no user memory is touched while
+// it is held, and it is never held across a `VIRTIO_GPU` round trip or across
+// a `yield`. The WAIT path in particular copies the caller's handle array into
+// a kernel `Vec` *before* it locks anything and blocks with the lock dropped.
+
+/// One DRM sync object. Binary only — see `syncobj_timeline_stub`.
+#[derive(Clone, Copy)]
+struct SyncObj {
+    /// The `open_id` that may name this syncobj — upstream gives each
+    /// `drm_file` its own syncobj idr, and this is the same owner-tag
+    /// flattening `BlobHandle::owner` uses, tested through the same
+    /// `open_may_reach` so there is one ownership rule in this file and not
+    /// two that can drift.
+    owner: u32,
+    /// Explicitly signalled. RESET clears it, SIGNAL and CREATE_SIGNALED set
+    /// it, and a retired `fence` folds into it lazily via `syncobj_is_signaled`
+    /// rather than eagerly, so retirement costs nothing per syncobj.
+    signaled: bool,
+    /// The fence this syncobj currently holds; 0 is upstream's NULL fence, and
+    /// is what makes a WAIT without `WAIT_FOR_SUBMIT` return EINVAL.
+    fence: u64,
+    /// Live references. One per handle. The second reference a
+    /// `HANDLE_TO_FD`-exported sync file would hold does not exist yet (that
+    /// ioctl is ENOSYS — there is no fd-minting seam inside this crate), so the
+    /// count can only be 1 today. It is here so that adding fd export is a
+    /// refcount change and not a lifetime redesign, which is the lesson
+    /// `BO LIFETIME` above was paid for.
+    refs: u32,
+}
+
+/// Syncobj handles. A namespace of its own, disjoint from GEM handles by
+/// definition (upstream keeps a separate idr per `drm_file`), so this starts at
+/// 1 and does not have to dodge `NEXT_BLOB_HANDLE`.
+static SYNCOBJS: Mutex<BTreeMap<u32, SyncObj>> = Mutex::new(BTreeMap::new());
+static NEXT_SYNCOBJ_HANDLE: AtomicU32 = AtomicU32::new(1);
+
+/// Highest retired fence id. Lock-free so an ISR can publish into it. See
+/// "THE FENCE MODEL" above for the in-order assumption this encodes.
+static SYNCOBJ_FENCE_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// Tasks currently parked inside `syncobj_handle_wait`.
+///
+/// Load-bearing for idle CPU, not diagnostic: `SIGNAL` and fence retirement
+/// wake the *global* poll wait-channel, and `idletest` guards the property that
+/// an idle system issues no wakes at all. Gating every wake on this counter
+/// means a syncobj that nobody is waiting on costs one relaxed load and wakes
+/// nothing.
+static SYNCOBJ_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// `SYNCOBJ_FENCE_DONE` as of the last wake `drm_tick` issued for it. The
+/// backstop for a retirement whose `try_wake_poll` lost the RUN_QUEUE race:
+/// `try_wake_poll` is allowed to defer, and unlike the flip queue there is
+/// nothing that would naturally retry, so the tick does.
+static SYNCOBJ_WAKE_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// The most a single WAIT/RESET/SIGNAL may name. Upstream has no explicit cap
+/// (it fails at `kmalloc_array`); a bound is cheaper than trusting a `u32`
+/// count from userspace to be sane, and real callers use single digits.
+const SYNCOBJ_MAX_HANDLES: u32 = 4096;
+
+/// Is this syncobj signalled *right now*? `done` is a hoisted snapshot of
+/// `SYNCOBJ_FENCE_DONE` so one probe pass answers consistently for every
+/// handle in the array rather than re-reading a moving watermark per entry.
+fn syncobj_is_signaled(s: &SyncObj, done: u64) -> bool {
+    s.signaled || (s.fence != 0 && s.fence <= done)
+}
+
+/// Wake syncobj waiters, if there are any. Task context.
+fn syncobj_wake() {
+    if SYNCOBJ_WAITERS.load(Ordering::Relaxed) != 0 {
+        // No lock held here, by construction — every caller drops SYNCOBJS
+        // first. `wake_poll` takes RUN_QUEUE.
+        sched::wake_poll();
+    }
+}
+
+/// Drop one reference on `handle`, removing it at zero. Takes the map the
+/// caller already holds: this is called from teardown loops and from DESTROY,
+/// and re-locking inside would be a nested acquisition of a leaf lock.
+fn syncobj_put(map: &mut BTreeMap<u32, SyncObj>, handle: u32) {
+    if let Some(s) = map.get_mut(&handle) {
+        s.refs = s.refs.saturating_sub(1);
+        if s.refs == 0 { map.remove(&handle); }
+    }
+}
+
+/// Copy a user array of `count` `u32` syncobj handles into kernel memory.
+///
+/// **Done before any lock is taken, always.** This is the exact hazard
+/// `82d0cc3` records: the array is ordinary user memory and may be paged out,
+/// so touching it takes a demand-paging fault, and a demand-paging fault under
+/// an IRQ-off spinlock re-enters the scheduler lock and freezes every vCPU with
+/// no panic. A raw (unaligned) read rather than `read_user_buf` is deliberate
+/// and matches every other arm in this file: the DRM server's ioctl path runs
+/// **synchronously on the caller's thread in the caller's address space**, so a
+/// fault here is a normal, serviceable fault, whereas `read_user_buf` walks the
+/// page tables by hand and simply fails on a non-resident page.
+fn syncobj_read_handles(ptr: u64, count: u32) -> Result<Vec<u32>, DriverError> {
+    if ptr == 0 || count == 0 || count > SYNCOBJ_MAX_HANDLES {
+        return Err(DriverError::InvalidParameter);
+    }
+    let mut v = vec![0u32; count as usize];
+    for i in 0..count as usize {
+        v[i] = unsafe { ptr::read_unaligned((ptr as *const u32).add(i)) };
+    }
+    Ok(v)
+}
+
+/// Absolute-nanosecond timeout to an absolute tick deadline.
+///
+/// `None` means "do not block at all" — upstream's `drm_timeout_abs_to_jiffies`
+/// returns 0 for a zero/negative timeout *and* for one already in the past, and
+/// a zero timeout is documented there as "make 0 timeout mean poll". Rounding
+/// **up** to the next tick is what keeps a sub-tick timeout from degenerating
+/// into a busy-poll loop that never sleeps; the same truncation-to-zero bug in
+/// `nanosleep` (`fb398c7`) is on record in this tree.
+///
+/// The clock is `arch_monotonic_ns`, which is literally the same
+/// `timer::monotonic_ns` that backs `sys_clock_gettime(CLOCK_MONOTONIC)` — the
+/// clock userspace computed the absolute deadline from. If those two ever
+/// diverge, every syncobj wait either times out instantly or hangs forever.
+fn syncobj_deadline_ticks(timeout_nsec: i64) -> Option<u64> {
+    if timeout_nsec <= 0 { return None; }
+    let abs = timeout_nsec as u64;
+    let now = unsafe { arch_monotonic_ns() };
+    if abs <= now { return None; }
+    // 100 Hz tick.
+    let rel_ticks = (abs - now) / 10_000_000 + 1;
+    Some(sched::ticks().checked_add(rel_ticks).unwrap_or(u64::MAX))
+}
+
+/// One evaluation of a whole WAIT predicate.
+///
+/// `Ok(Some(i))` — satisfied, `i` is the index of the first signalled handle
+/// (upstream sets `first_signaled` to that index regardless of `WAIT_ALL`).
+/// `Ok(None)`    — not yet; the caller may block.
+/// `Err(..)`     — permanent refusal, exactly as upstream orders the checks:
+///                 an unreachable handle is ENOENT (`drm_syncobj_array_find`),
+///                 and a NULL fence without `WAIT_FOR_SUBMIT` is EINVAL.
+///
+/// Holds `SYNCOBJS` for the whole pass and touches no user memory inside it.
+fn syncobj_probe(
+    handles: &[u32],
+    open_id: u32,
+    wait_all: bool,
+    for_submit: bool,
+) -> Result<Option<u32>, DriverError> {
+    let done = SYNCOBJ_FENCE_DONE.load(Ordering::Acquire);
+    let map = SYNCOBJS.lock();
+    let mut first: Option<u32> = None;
+    let mut all = true;
+    for (i, &h) in handles.iter().enumerate() {
+        let s = match map.get(&h) {
+            Some(s) if open_may_reach(open_id, s.owner) => s,
+            // Unknown, or another open's. Indistinguishable on purpose — see
+            // the note on `open_may_reach`.
+            _ => return Err(DriverError::NotFound),
+        };
+        if syncobj_is_signaled(s, done) {
+            if first.is_none() { first = Some(i as u32); }
+        } else {
+            if s.fence == 0 && !for_submit {
+                // Upstream refuses the whole call rather than waiting forever
+                // on a container that nothing has submitted into.
+                return Err(DriverError::InvalidParameter);
+            }
+            all = false;
+        }
+    }
+    if wait_all {
+        Ok(if all { Some(first.unwrap_or(0)) } else { None })
+    } else {
+        Ok(first)
+    }
+}
+
+/// The last fd on a card0/renderD128 open closed: destroy that open's
+/// syncobjs. Called from `drm_release_open`, same shape as the blob sweep it
+/// sits next to — collect the keys, then drop the references, all under one
+/// acquisition of the leaf map and with no device round trip inside it.
+fn syncobj_release_open(open_id: u32) {
+    let mut map = SYNCOBJS.lock();
+    let dead: Vec<u32> = map
+        .iter()
+        .filter(|(_, s)| s.owner == open_id)
+        .map(|(h, _)| *h)
+        .collect();
+    for h in dead { syncobj_put(&mut map, h); }
+}
+
+// ── The V3D submit seam ──────────────────────────────────────────────────────
+//
+// These three are the entire interface a `drm_v3d_submit_cl` implementation
+// needs from this section. They are `pub` and unused inside this crate today,
+// which is the point: the syncobj contract is settled and testable *before* the
+// GPU driver that consumes it exists, rather than being re-derived under a live
+// client.
+
+/// Read the fence a syncobj currently holds — v3d's `in_sync_bcl`/`in_sync_rcl`
+/// dependency lookup. `Some(0)` means "this syncobj exists and holds no fence",
+/// which is a satisfied dependency, not an error. `None` means the handle names
+/// nothing this open may reach (answer ENOENT).
+pub fn syncobj_fence(handle: u32, open_id: u32) -> Option<u64> {
+    let map = SYNCOBJS.lock();
+    let s = map.get(&handle)?;
+    if !open_may_reach(open_id, s.owner) { return None; }
+    if s.signaled { return Some(0); }
+    Some(s.fence)
+}
+
+/// Install `fence` as a syncobj's pending fence — v3d's `out_sync` at submit
+/// time. Clears any previous signalled state: the container now tracks *this*
+/// submission and must not report the previous one's completion.
+///
+/// False if the handle names nothing this open may reach. Never declares the
+/// fence retired, however fast the submission actually is.
+pub fn syncobj_attach_fence(handle: u32, open_id: u32, fence: u64) -> bool {
+    let mut map = SYNCOBJS.lock();
+    match map.get_mut(&handle) {
+        Some(s) if open_may_reach(open_id, s.owner) => {
+            s.fence = fence;
+            s.signaled = false;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Publish "every fence up to and including `fence` has retired".
+///
+/// **Callable from a GPU completion ISR**: one `fetch_max` and one non-blocking
+/// wake, no lock of any kind, so it cannot take a lock ordered against
+/// RUN_QUEUE with IRQs off. `fence` must come from a single in-order queue (see
+/// "THE FENCE MODEL"); calling it with an out-of-order id would signal earlier
+/// fences that have not actually completed.
+///
+/// The wake is best-effort — `try_wake_poll` defers under RUN_QUEUE contention
+/// — and `drm_tick` retries any deferred wake within one tick.
+pub fn syncobj_retire_fence(fence: u64) {
+    if fence == 0 { return; }
+    SYNCOBJ_FENCE_DONE.fetch_max(fence, Ordering::Release);
+    if SYNCOBJ_WAITERS.load(Ordering::Relaxed) != 0 {
+        sched::try_wake_poll();
+    }
+}
+
+/// Tick backstop for a deferred `syncobj_retire_fence` wake. Two relaxed loads
+/// and nothing else when no task is waiting, which is why it is safe to sit
+/// ahead of `drm_tick`'s throttle return without touching idle CPU.
+fn syncobj_tick() {
+    if SYNCOBJ_WAITERS.load(Ordering::Relaxed) == 0 { return; }
+    let done = SYNCOBJ_FENCE_DONE.load(Ordering::Relaxed);
+    if SYNCOBJ_WAKE_SEEN.load(Ordering::Relaxed) != done {
+        SYNCOBJ_WAKE_SEEN.store(done, Ordering::Relaxed);
+        sched::try_wake_poll();
+    }
+}
+
+// ── V3D (Broadcom VideoCore VI/VII 3D core) ──────────────────────────────────
+//
+// WHY THIS EXISTS. The Raspberry Pi 5's GPU is a `v3d` DRM device, and Mesa's
+// `v3d` gallium driver talks to it through the UAPI below and nothing else.
+// QEMU models no V3D on any machine type, so none of this can be exercised
+// against a device — but roughly half of it is pure DECODE (request codes,
+// struct layouts, parameter values, handle/VA bookkeeping, the Mesa loader
+// handshake), and that half is exactly the half that is expensive to debug with
+// a Pi on the desk. The stub backend below closes it under QEMU.
+//
+// WHAT IS REAL AND WHAT IS STUBBED, stated once so nothing here is mistaken for
+// a driver:
+//   REAL — GET_PARAM (fixed, self-consistent V3D 7.1 identity), CREATE_BO
+//          (buddy-backed guest pages + a GPU VA), MMAP_BO, GET_BO_OFFSET,
+//          WAIT_BO, GEM_CLOSE, and SUBMIT_CL's *decode*: BO-list validation,
+//          in-sync resolution, fence allocation, out-sync attach, deferred
+//          retirement.
+//   STUBBED — there is no GPU. SUBMIT_CL executes nothing; the command lists
+//          are not even read. SUBMIT_TFU / SUBMIT_CSD / PERFMON_* are ENOSYS.
+//
+// REQUEST CODES ARE DERIVED, NOT GUESSED — this file's convention (see the
+// syncobj block above; the two codes that were ever guessed cost real
+// sessions). `_IOC(dir, type, nr, size) = dir<<30 | size<<16 | type<<8 | nr`,
+// DRM's type is 'd' = 0x64, `nr = DRM_COMMAND_BASE (0x40) + index`, _IOWR is
+// dir 3 => 0xC000_0000 and _IOW is dir 1 => 0x4000_0000. Struct sizes are from
+// Mesa's vendored `include/drm-uapi/v3d_drm.h` and were checked by compiling
+// that header's declarations and printing `sizeof`, not by eye:
+//
+//  idx  nr    ioctl                struct / fields                       size  code
+//  ───  ────  ───────────────────  ────────────────────────────────────  ────  ──────────
+//  0x00 0x40  SUBMIT_CL            10*u32 (bcl/rcl/sync/qma/qms/qts),
+//                                  u64 bo_handles, 4*u32, u64 exts        72   0xC0486440
+//  0x01 0x41  WAIT_BO              u32 handle, u32 pad, u64 timeout_ns    16   0xC0106441
+//  0x02 0x42  CREATE_BO            u32 size, flags, handle, offset        16   0xC0106442
+//  0x03 0x43  MMAP_BO              u32 handle, u32 flags, u64 offset      16   0xC0106443
+//  0x04 0x44  GET_PARAM            u32 param, u32 pad, u64 value          16   0xC0106444
+//  0x05 0x45  GET_BO_OFFSET        u32 handle, u32 offset                  8   0xC0086445
+//  0x06 0x46  SUBMIT_TFU (_IOW)    7*u32, u32 coef[4], u32 bo_handles[4],
+//                                  3*u32, u64 exts, {u32 ioc, u32 pad}    88   0x40586446
+//  0x07 0x47  SUBMIT_CSD (_IOW)    u32 cfg[7], u32 coef[4], (pad 4),
+//                                  u64 bo_handles, 4*u32, u64 exts, 2*u32 88   0x40586447
+//  0x08 0x48  PERFMON_CREATE       u32 id, u32 ncounters, u8 c[32]        40   0xC0286448
+//  0x09 0x49  PERFMON_DESTROY      u32 id                                  4   0xC0046449
+//  0x0a 0x4a  PERFMON_GET_VALUES   u32 id, u32 pad, u64 values_ptr        16   0xC010644A
+//  0x0b 0x4b  SUBMIT_CPU (_IOW)    u64 bo_handles, 2*u32, u64 exts        24   0x4018644B
+//  0x0c 0x4c  PERFMON_GET_COUNTER  u8 counter + name[64] + category[32]
+//                                  + description[256] + reserved[7]      360   0xC168644C
+//  0x0d 0x4d  PERFMON_SET_GLOBAL   u32 flags, u32 id            (_IOW)     8   0x4008644D
+//
+// Two of those sizes are the ones eyeballing gets wrong, so they are called
+// out: SUBMIT_CSD has **four bytes of tail padding after `coef[4]`** to align
+// the `u64 bo_handles` that follows (44 -> 48), and PERFMON_GET_COUNTER is a
+// byte-aligned 360, not a rounded 368.
+const DRM_IOCTL_V3D_SUBMIT_CL: u32 = 0xC0486440;
+const DRM_IOCTL_V3D_WAIT_BO: u32 = 0xC0106441;
+const DRM_IOCTL_V3D_CREATE_BO: u32 = 0xC0106442;
+const DRM_IOCTL_V3D_MMAP_BO: u32 = 0xC0106443;
+const DRM_IOCTL_V3D_GET_PARAM: u32 = 0xC0106444;
+const DRM_IOCTL_V3D_GET_BO_OFFSET: u32 = 0xC0086445;
+const DRM_IOCTL_V3D_SUBMIT_TFU: u32 = 0x40586446;
+const DRM_IOCTL_V3D_SUBMIT_CSD: u32 = 0x40586447;
+const DRM_IOCTL_V3D_PERFMON_CREATE: u32 = 0xC0286448;
+const DRM_IOCTL_V3D_PERFMON_DESTROY: u32 = 0xC0046449;
+const DRM_IOCTL_V3D_PERFMON_GET_VALUES: u32 = 0xC010644A;
+const DRM_IOCTL_V3D_SUBMIT_CPU: u32 = 0x4018644B;
+const DRM_IOCTL_V3D_PERFMON_GET_COUNTER: u32 = 0xC168644C;
+const DRM_IOCTL_V3D_PERFMON_SET_GLOBAL: u32 = 0x4008644D;
+
+/// True for every `DRM_IOCTL_V3D_*` request code. Derived from the encoded `nr`
+/// (0x40..0x4D on DRM's type 'd') rather than from a hand-kept list, exactly as
+/// `is_syncobj_ioctl` is, so a code added above cannot be forgotten here.
+///
+/// Used by the DRM server to pick the v3d errno table. `nr` alone is not enough
+/// to identify a driver-private ioctl in general — `DRM_COMMAND_BASE + n` means
+/// something different for every driver — but this device answers exactly one
+/// driver ABI at a time, and the whole 0x40+ block is v3d's while the v3d
+/// backend is active and virtgpu's otherwise. `virtgpu`'s codes are 0x40..0x4C
+/// too, so the backend flag is what disambiguates, not the number.
+pub fn is_v3d_ioctl(cmd: u32) -> bool {
+    if !v3d_active() { return false; }
+    if (cmd >> 8) & 0xFF != 0x64 { return false; }
+    matches!(cmd & 0xFF, 0x40..=0x4D)
+}
+
+// `enum drm_v3d_param` — the ordinal IS the wire value, so these are written as
+// the ordinals they are. 0x00..0x0C are the block this driver answers; 0x0D
+// (MAX_PERF_COUNTERS), 0x0E (SUPPORTS_SUPER_PAGES), 0x0F (GLOBAL_RESET_COUNTER)
+// and 0x10 (CONTEXT_RESET_COUNTER) were appended by later kernels and are
+// answered too, because `v3d_get_device_info` reads two of them.
+const V3D_PARAM_UIFCFG: u32 = 0;
+const V3D_PARAM_HUB_IDENT1: u32 = 1;
+const V3D_PARAM_HUB_IDENT2: u32 = 2;
+const V3D_PARAM_HUB_IDENT3: u32 = 3;
+const V3D_PARAM_CORE0_IDENT0: u32 = 4;
+const V3D_PARAM_CORE0_IDENT1: u32 = 5;
+const V3D_PARAM_CORE0_IDENT2: u32 = 6;
+const V3D_PARAM_SUPPORTS_TFU: u32 = 7;
+const V3D_PARAM_SUPPORTS_CSD: u32 = 8;
+const V3D_PARAM_SUPPORTS_CACHE_FLUSH: u32 = 9;
+const V3D_PARAM_SUPPORTS_PERFMON: u32 = 10;
+const V3D_PARAM_SUPPORTS_MULTISYNC_EXT: u32 = 11;
+const V3D_PARAM_SUPPORTS_CPU_QUEUE: u32 = 12;
+const V3D_PARAM_MAX_PERF_COUNTERS: u32 = 13;
+const V3D_PARAM_SUPPORTS_SUPER_PAGES: u32 = 14;
+const V3D_PARAM_GLOBAL_RESET_COUNTER: u32 = 15;
+const V3D_PARAM_CONTEXT_RESET_COUNTER: u32 = 16;
+
+// THE IDENTITY. Mesa decodes these three registers and refuses any version it
+// does not compile support for, so they are not decoration — they select the
+// code path for every shader Mesa will ever emit against this device
+// (`v3d_device_info.c:32`, `v3d_screen.c:796`):
+//
+//   ver         = ((IDENT0 >> 24) & 0xff) * 10 + (IDENT1 & 0xf)
+//   vpm_size    = ((IDENT1 >> 28) & 0xf) * 8192
+//   qpu_count   = ((IDENT1 >> 4) & 0xf) * ((IDENT1 >> 8) & 0xf)   // nslc * qups
+//   rev         =  (HUB_IDENT3 >> 8)  & 0xff
+//   compat_rev  =  (HUB_IDENT3 >> 16) & 0xff
+//
+// and `ver` must come out 42 or 71 — anything else is
+// "V3D %d.%d not supported by this version of Mesa" and a NULL screen. The Pi 5
+// is 7.1, so:
+//
+//   IDENT0 = 0x07443356 -> major 7. The low three bytes are the core's ASCII
+//            tag, 'V' 0x56, '3' 0x33, 'D' 0x44, in ascending byte order exactly
+//            as the hardware lays it out. Nothing in Mesa reads them; they are
+//            written truthfully rather than zeroed so a serial dump of this
+//            register looks like the register it claims to be.
+//   IDENT1 = 0x20000421 -> minor 1 (=> ver 71), nslc 2, qups 4 => 8 QPUs,
+//            VPM nibble 2 => 16384 bytes. 8 QPUs is the documented Pi 4/Pi 5
+//            core width; VPM 16 KiB is the V3D 4.x/7.x figure. Both feed real
+//            arithmetic in the compiler (`vir.c:2454` asserts vpm_size > 0 and
+//            divides by a sector size; `v3d_program.c:542` sizes the spill BO
+//            as qpu_count * 4 * ...), so a zero in either is a divide-by-zero
+//            or a zero-sized allocation later, not a cosmetic wrong number.
+//   HUB_IDENT3 = 0x00040600 -> rev 6, compat_rev 4. Not arbitrary: Mesa's
+//            `v3d_device_info.h:105` branches on exactly `rev == 6 &&
+//            compat_rev >= 4`, which is a real silicon point, and several
+//            workarounds key on `ver == 71 && rev < 6`. Claiming rev 6 selects
+//            the same paths a Pi 5 does, which is the whole point of a stub
+//            that exists to de-risk the hardware phase.
+const V3D_IDENT0: u64 = 0x0744_3356;
+const V3D_IDENT1: u64 = 0x2000_0421;
+const V3D_HUB_IDENT3: u64 = 0x0004_0600;
+/// 1 core, hub revision 1, TVER 7. Read by Linux's debugfs and by nothing in
+/// Mesa; answered rather than refused so a probe of the whole param block does
+/// not have to special-case which ids exist.
+const V3D_HUB_IDENT1: u64 = 0x0700_0101;
+
+/// **Zero on purpose, and load-bearing.** `v3d_get_device_info` stores this in
+/// `devinfo->max_perfcnt`, and `v3dx_counter.c:41` then reads the performance
+/// counter *descriptions* one of two ways: through
+/// `DRM_IOCTL_V3D_PERFMON_GET_COUNTER` when `max_perfcnt` is non-zero, and from
+/// Mesa's own compiled-in table when it is zero. `v3d_perfcntrs_init` runs
+/// during `v3d_screen_create` and a NULL return there is a hard `goto fail`, so
+/// advertising a non-zero count while PERFMON_GET_COUNTER answers ENOSYS would
+/// fail screen creation outright. Zero is also the truth: there are no counters.
+const V3D_MAX_PERF_COUNTERS: u64 = 0;
+
+// ── Backend selection ────────────────────────────────────────────────────────
+//
+// THE CONSTRAINT. On a QEMU/virtio build every byte of today's behaviour must
+// be unchanged unless the v3d backend is explicitly asked for — the same node
+// answers virtgpu (Venus, virgl, Zink) and its `DRM_IOCTL_VERSION` identity is
+// what Mesa's loader picks a driver by, so a backend that guessed wrong would
+// silently swap the whole userspace stack.
+//
+// THE MECHANISM: one atomic, default off, armed through
+// `DRM_IOCTL_SET_CLIENT_CAP` with a private capability id.
+//
+// Why SET_CLIENT_CAP and not a new ioctl: it is an *existing* entry point that
+// already exists to let a client declare which contract it wants (that is
+// literally what DRM_CLIENT_CAP_ATOMIC does here), it is reachable from
+// userspace with no new plumbing, its handler already ignores unknown ids so
+// adding one cannot break an existing caller, and it needs no edit to
+// `drivers/src/lib.rs` (owned by another lane). A cargo feature was rejected
+// for the opposite reason: it cannot be toggled inside one boot, so the
+// A/B evidence this lane exists to produce — virtgpu behaviour and v3d
+// behaviour from the same image — would need two builds and two boots.
+//
+// Why nothing auto-detects: the honest auto-rule is "this is a Pi 5", and this
+// crate has no board identity that is not owned by another lane right now.
+// "There is no virtio-GPU" is a tempting proxy and a wrong one — it is also
+// true of every headless QEMU run. When the real Pi 5 v3d driver lands it
+// should call `v3d_set_enabled(true)` from its own probe; that is one line and
+// it belongs to the code that actually found the hardware.
+//
+// SCOPE: device-global, not per-open, deliberately. `DRM_IOCTL_VERSION` has no
+// open identity to key on at the seam that answers it for the render node
+// (`servers/drm/src/lib.rs`), and the whole point of the flag is to change the
+// identity Mesa reads *before* it has created anything. Arming it is a
+// statement about the device, so it reads as one.
+const DRM_CLIENT_CAP_LEANDROS_V3D: u64 = 0x1000_0003;
+
+static V3D_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// v3d request codes already reported by the first-of-each-kind trace in
+/// `v3d_dispatch`. Its own set, separate from `UNKNOWN_IOCTLS`: that one is a
+/// 32-entry cap shared with every unimplemented ioctl in the driver, and a
+/// noisy boot could evict the v3d entries from it.
+static V3D_FIRST_SEEN: Mutex<NoteSet> = Mutex::new(NoteSet::new());
+
+/// Is the v3d backend the one answering for this device right now?
+#[inline]
+pub fn v3d_active() -> bool {
+    V3D_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Arm or disarm the v3d backend. Called from `SET_CLIENT_CAP`, and intended to
+/// be called from a real Pi 5 GPU probe once one exists.
+pub fn v3d_set_enabled(on: bool) {
+    V3D_ENABLED.store(on, Ordering::Relaxed);
+}
+
+// ── GPU virtual address space ────────────────────────────────────────────────
+//
+// Every v3d BO has an address in the GPU's own 32-bit space, handed back by
+// CREATE_BO (`offset`) and re-readable with GET_BO_OFFSET. It is NOT the CPU
+// mmap token — MMAP_BO answers that separately — and on real hardware it is
+// what the MMU page tables are keyed by. Mesa bakes it straight into command
+// lists and shader uniforms, so it has to be stable for the life of the handle.
+//
+// Same shape as `hostvis_alloc` above (first-fit over a `BTreeMap<u64, u64>` of
+// live spans in a bounded window) and for the same reason: a real allocator
+// rather than a bump pointer, so a client that churns BOs reuses low addresses
+// instead of walking off the end of the window.
+//
+// GRAIN 4 KiB — the V3D MMU's page size, so every BO starts on a page the MMU
+// can map independently.
+// WINDOW 0x1000 .. 0x1_0000_0000 — the full 32-bit space **minus page zero**.
+// `drm_v3d_create_bo.offset` is a u32, so the top is exclusive and the largest
+// address this can hand out is 0xFFFF_F000, which still fits. Leaving page 0
+// out is what makes a null GPU pointer invalid, and it is also what upstream
+// promises in the UAPI header: "This offset value will always be nonzero, since
+// various HW units treat 0 specially."
+//
+// LOCK ORDER: a leaf, exactly like HOSTVIS_SPANS. Never held across a device
+// round-trip, across another BO map, or across any access to user memory.
+const V3D_VA_GRAIN: u64 = 4096;
+const V3D_VA_BASE: u64 = 0x1000;
+const V3D_VA_TOP: u64 = 0x1_0000_0000;
+const MAX_V3D_VA_SPANS: usize = 1024;
+
+static V3D_VA_SPANS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+/// Reserve `bytes` of GPU address space. Returns the base address, or None when
+/// the window (or the span table) is full.
+fn v3d_va_alloc(bytes: u64) -> Option<u64> {
+    if bytes == 0 { return None; }
+    let need = bytes.checked_add(V3D_VA_GRAIN - 1)? & !(V3D_VA_GRAIN - 1);
+    let mut spans = V3D_VA_SPANS.lock();
+    if spans.len() >= MAX_V3D_VA_SPANS { return None; }
+    // First fit, ascending. `cursor` starts at V3D_VA_BASE rather than 0, which
+    // is the only difference from `hostvis_alloc`: page 0 is never a candidate,
+    // so it cannot be handed out even when the map is empty.
+    let mut cursor: u64 = V3D_VA_BASE;
+    for (&off, &len) in spans.iter() {
+        if off.saturating_sub(cursor) >= need { break; }
+        cursor = cursor.max(off.checked_add(len)?);
+    }
+    if cursor.checked_add(need)? > V3D_VA_TOP { return None; }
+    spans.insert(cursor, need);
+    Some(cursor)
+}
+
+/// Release a reservation previously returned by `v3d_va_alloc`.
+fn v3d_va_free(va: u64) {
+    if va == 0 { return; }
+    V3D_VA_SPANS.lock().remove(&va);
+}
+
+// ── The stub submit queue ────────────────────────────────────────────────────
+//
+// THE THING THIS EXISTS NOT TO DO. `TODO.md:3251` records that virtgpu signals
+// its EXECBUFFER out-fence at *creation* time. That is defensible there only
+// because `VirtioGpu::submit` is a synchronous busy-spin, so the work really is
+// finished before the ioctl returns. It is not defensible here and it is not
+// what this does: a stub that retires its fence inside the submit ioctl exposes
+// a fence that is never once observably outstanding, and every consumer built
+// against it — Mesa's `v3d_fence`, WAIT_BO, SYNCOBJ_WAIT — gets tested against
+// a shape that real hardware will not have. The asynchrony is most of what
+// there is to get right, so the stub models it.
+//
+// HOW IT DEFERS. `drm_tick` is already registered as a 100 Hz scheduler tick
+// hook (`servers/drm`'s `init`) and is already the thing that paces page-flip
+// completions for exactly this reason. A submitted fence is queued here with a
+// due tick of `now + 1` and retired by the tick hook, so it is outstanding for
+// at least one full tick (~10 ms) and userspace can observe it as outstanding.
+// The tick hook is the closest structural analogue this kernel has to the GPU
+// completion interrupt that will replace it: it runs in interrupt-driven
+// context, it is not the submitting thread, and it retires in issue order.
+//
+// IN-ORDER, WHICH THE WATERMARK REQUIRES. `syncobj_retire_fence` publishes a
+// high-water mark, so fence ids must be per-queue monotonic and must retire in
+// issue order or a later fence would signal earlier ones that have not
+// finished. One queue, one counter, one FIFO, drained from the front only —
+// and `V3D_FENCE_NEXT` is never reused within a boot, so a stale id resolves to
+// "long since retired" rather than to somebody else's work.
+//
+// IDLE COST. `V3D_INFLIGHT_N` is the reason `drm_tick` can consult this with a
+// single relaxed load when nothing is in flight. `idletest` asserts that an
+// idle system issues no wakes at all, and taking a `Mutex` per tick to discover
+// an empty queue would put a lock acquisition on the idle path for no reason.
+/// How many 100 Hz ticks a stub submission stays outstanding.
+///
+/// TWO, not one, and the reason is a race rather than a preference. Retirement
+/// fires when `sched::ticks() >= due`, so `due = now + 1` means "at the next
+/// tick edge" — which can be 10 ms away or 10 µs away, depending on where in
+/// the tick the submit landed. A test that submits and then immediately polls
+/// the out-fence, expecting to find it outstanding, would fail whenever the
+/// submit happened to land just before an edge: rare, timing-dependent, and
+/// indistinguishable from a real regression. `now + 2` puts a full tick under
+/// the floor, so the fence is outstanding for at least 10 ms however the submit
+/// is aligned. Latency is not a property a stub has to optimise.
+const V3D_STUB_LATENCY_TICKS: u64 = 2;
+
+/// Next fence id. Monotonic, never reused, starts at 1 because 0 is
+/// "no fence" everywhere in this file.
+static V3D_FENCE_NEXT: AtomicU64 = AtomicU64::new(1);
+
+/// (fence, due tick), oldest first. Drained only from the front.
+static V3D_INFLIGHT: Mutex<VecDeque<(u64, u64)>> = Mutex::new(VecDeque::new());
+
+/// `V3D_INFLIGHT.len()`, readable without the lock. See IDLE COST above.
+static V3D_INFLIGHT_N: AtomicUsize = AtomicUsize::new(0);
+
+/// Bound on outstanding stub submissions. A client that submits faster than the
+/// tick retires would otherwise grow the queue without limit; refusing at the
+/// cap is the same back-pressure a real ring gives.
+const MAX_V3D_INFLIGHT: usize = 256;
+
+/// Allocate a fence id and queue it for deferred retirement. None when too much
+/// is already outstanding (answer EBUSY).
+fn v3d_submit_fence() -> Option<u64> {
+    let mut q = V3D_INFLIGHT.lock();
+    if q.len() >= MAX_V3D_INFLIGHT { return None; }
+    let fence = V3D_FENCE_NEXT.fetch_add(1, Ordering::Relaxed);
+    q.push_back((fence, sched::ticks().wrapping_add(V3D_STUB_LATENCY_TICKS)));
+    V3D_INFLIGHT_N.store(q.len(), Ordering::Relaxed);
+    Some(fence)
+}
+
+/// Retire every stub submission whose deferral has elapsed. Called from
+/// `drm_tick`; the stand-in for a GPU completion ISR.
+///
+/// Retires strictly from the front, so the watermark
+/// `syncobj_retire_fence` publishes never skips an unfinished fence. The `>=`
+/// comparison is on a monotonic tick counter, and the queue is short, so this
+/// is a couple of compares per tick in the worst case.
+fn v3d_tick() {
+    if V3D_INFLIGHT_N.load(Ordering::Relaxed) == 0 { return; }
+    let now = sched::ticks();
+    let mut highest = 0u64;
+    {
+        // try_lock, not lock: this runs in tick context and a submitting thread
+        // may hold the queue. Missing a tick costs 10 ms of extra latency on a
+        // stub; spinning in a tick hook costs the machine.
+        let mut q = match V3D_INFLIGHT.try_lock() { Some(g) => g, None => return };
+        while let Some(&(fence, due)) = q.front() {
+            if now < due { break; }
+            q.pop_front();
+            highest = fence;
+        }
+        V3D_INFLIGHT_N.store(q.len(), Ordering::Relaxed);
+    }
+    // Outside the lock: `syncobj_retire_fence` wakes pollers, and a wake taken
+    // under a leaf lock held in tick context is the 82d0cc3 ordering hazard.
+    // One call with the highest id retires everything below it — that is what a
+    // watermark means — so a burst costs one wake, not one per fence.
+    if highest != 0 { syncobj_retire_fence(highest); }
+}
+
+/// Has `fence` retired? Reads the same watermark `syncobj_is_signaled` does, so
+/// WAIT_BO and SYNCOBJ_WAIT can never disagree about one fence.
+fn v3d_fence_done(fence: u64) -> bool {
+    fence == 0 || fence <= SYNCOBJ_FENCE_DONE.load(Ordering::Acquire)
+}
+
 // ── DRM page-flip event channel ──────────────────────────────────────────────
 // PAGE_FLIP-with-event completions are NOT delivered instantly: doing so lets a
 // compositor's render loop resubmit with zero delay and peg the CPU (there is no
@@ -2028,6 +2877,19 @@ pub fn drm_tick() {
             crate::pci::serial_debug("\n");
         }
     }
+    // Deferred-wake backstop for syncobj fence retirement. Ahead of the flip
+    // throttle's early return because it is not a flip and must not be gated on
+    // one; free when nothing is waiting (one relaxed load), which is what keeps
+    // idletest's zero-idle-wake property intact.
+    syncobj_tick();
+
+    // Deferred retirement of stub v3d submissions — the stand-in for the GPU
+    // completion interrupt. Ahead of the flip throttle for the same reason
+    // `syncobj_tick` is: it is not a flip and must not be paced by one. One
+    // relaxed load when nothing is in flight, which is what keeps `idletest`'s
+    // zero-idle-wake property intact on a build where v3d is never armed.
+    v3d_tick();
+
     let last = LAST_FLIP_DELIVER_TICK.load(Ordering::Relaxed);
     // One tick (~10 ms) since the last delivery. The throttle exists so an idle
     // compositor cannot spin — one event per tick still guarantees that, and
@@ -2289,7 +3151,15 @@ impl DrmDeviceInterface {
         // single here — where it was not, this would need the open id threaded
         // down to the composite instead.
         let presents_before = crate::drm::device::SCANOUT_WRITES.load(Ordering::Relaxed);
-        let res = match cmd {
+
+        // V3D FIRST, AND ONLY WHEN ARMED. Two v3d request codes are bit-identical
+        // to two virtgpu ones (see `v3d_dispatch`), so a flat `match` cannot hold
+        // both and the active backend is the only thing that disambiguates them.
+        // Disarmed — which is every QEMU/virtio build unless a client explicitly
+        // asks — this is one relaxed load and the `match` below is reached
+        // bit-identically.
+        let v3d_res = if v3d_active() { self.v3d_dispatch(cmd, arg, open_id) } else { None };
+        let res = match v3d_res { Some(r) => r, None => match cmd {
             // ── Mode setting ioctls (Custom LeandrOS / DOOM path) ──
             0x1001 => self.handle_set_mode(arg),
             0x1003 => self.handle_get_mode_safe(arg),
@@ -2347,6 +3217,24 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_CREATEPROPBLOB => self.std_handle_create_blob(arg),
             DRM_IOCTL_MODE_DESTROYPROPBLOB => self.std_handle_destroy_blob(arg),
             DRM_IOCTL_MODE_GETPROPBLOB => self.std_handle_get_blob(arg),
+
+            // ── Sync objects ──
+            // Binary syncobjs are implemented; the timeline family and sync-file
+            // export answer ENOSYS explicitly (see `syncobj_timeline_stub`).
+            // None of these is master-gated and none can present, so they are
+            // absent from `requires_master` by construction.
+            DRM_IOCTL_SYNCOBJ_CREATE => self.syncobj_handle_create(arg, open_id),
+            DRM_IOCTL_SYNCOBJ_DESTROY => self.syncobj_handle_destroy(arg, open_id),
+            DRM_IOCTL_SYNCOBJ_WAIT => self.syncobj_handle_wait(arg, open_id),
+            DRM_IOCTL_SYNCOBJ_RESET => self.syncobj_handle_array(arg, open_id, false),
+            DRM_IOCTL_SYNCOBJ_SIGNAL => self.syncobj_handle_array(arg, open_id, true),
+            DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD
+            | DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE
+            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
+            | DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL
+            | DRM_IOCTL_SYNCOBJ_QUERY
+            | DRM_IOCTL_SYNCOBJ_TRANSFER
+            | DRM_IOCTL_SYNCOBJ_EVENTFD => self.syncobj_timeline_stub(arg),
             // No PRIME (single node, render==scanout) — Mesa falls back to software.
             DRM_IOCTL_PRIME_HANDLE_TO_FD | DRM_IOCTL_PRIME_FD_TO_HANDLE => Err(DriverError::Unsupported),
 
@@ -2375,7 +3263,7 @@ impl DrmDeviceInterface {
                 }
                 Err(DriverError::Unsupported)
             }
-        };
+        }};
 
         // Re-check master on the way out, not just on the way in. The gate
         // above refuses ioctls that have not started; it cannot recall one that
@@ -2713,6 +3601,61 @@ impl DrmDeviceInterface {
     fn std_handle_version(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let v = unsafe { &mut *(arg as *mut drm_version) };
+
+        // ── v3d ──────────────────────────────────────────────────────────────
+        // Ahead of everything below, and an early return, because when the v3d
+        // backend is armed there is no virtio question left to ask: this node
+        // answers the v3d ABI and nothing else.
+        //
+        // THE NAME MUST BE EXACTLY `v3d`. Mesa's pipe loader reads
+        // `DRM_IOCTL_VERSION.name` (`pipe_loader_drm.c:276`) and plain
+        // `strcmp`s it against each driver's descriptor (`:98`). There is no
+        // fuzzy match and no diagnostic: an unrecognised name silently selects
+        // the software backend, which is the identical failure the virgl lane
+        // already paid for once with `leandros-drm`.
+        //
+        // Version 1.0.0 is upstream's v3d DRIVER_MAJOR/MINOR/PATCHLEVEL.
+        //
+        // ⚠ THE STRINGS BELOW CARRY NO TRAILING NUL, unlike the two arms after
+        // this one, and that is a fix rather than an inconsistency. libdrm's
+        // `drmGetVersion` is a two-pass protocol: pass one asks with null
+        // pointers, `malloc`s `name_len + 1`, passes `name_len` BACK UNCHANGED
+        // in pass two, and NUL-terminates the result itself. The sibling arms
+        // report `"virtio_gpu\0".len()` — 11 for a 10-character name — so the
+        // capacity guard is `name_len >= 11` and libdrm's honest reply of 11
+        // satisfies it by luck: the count it was given is the count it hands
+        // back. Reporting the true `strlen` while still guarding on
+        // `len + 1` would NOT satisfy it, and the copy would silently not
+        // happen, which is how this was found — `v3d` reported as 4 characters.
+        //
+        // Upstream Linux reports `strlen` and copies `min(user_len, strlen)`
+        // bytes, leaving termination to the caller. That is what this arm does.
+        // The sibling arms are left exactly as they were: their off-by-one is
+        // self-consistent, Venus and the DRI loader both work against it today,
+        // and changing it would change every existing client's answer for no
+        // benefit to this lane.
+        if v3d_active() {
+            v.version_major = 1;
+            v.version_minor = 0;
+            v.version_patchlevel = 0;
+            let name = "v3d";
+            let date = "20180419";
+            let desc = "Broadcom V3D graphics";
+            if v.name != 0 && v.name_len >= name.len() {
+                unsafe { ptr::copy_nonoverlapping(name.as_ptr(), v.name as *mut u8, name.len()); }
+            }
+            v.name_len = name.len();
+            if v.date != 0 && v.date_len >= date.len() {
+                unsafe { ptr::copy_nonoverlapping(date.as_ptr(), v.date as *mut u8, date.len()); }
+            }
+            v.date_len = date.len();
+            if v.desc != 0 && v.desc_len >= desc.len() {
+                unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), v.desc as *mut u8, desc.len()); }
+            }
+            v.desc_len = desc.len();
+            return Ok(0);
+        }
+
         // The identity FOLLOWS the device we actually got — see the note below.
         let virgl = crate::virtio_gpu::virgl_negotiated();
         if virgl {
@@ -3084,6 +4027,16 @@ impl DrmDeviceInterface {
             // makes smithay skip the cursor plane entirely.
             DRM_CAP_CURSOR_WIDTH => 64,
             DRM_CAP_CURSOR_HEIGHT => 64,
+            // Binary sync objects: CREATE/DESTROY/WAIT/RESET/SIGNAL are real.
+            // v3d's Vulkan and gallium drivers use them unconditionally.
+            DRM_CAP_SYNCOBJ => 1,
+            // Timeline sync objects: NOT implemented, and this zero is the
+            // load-bearing half of that decision, not a placeholder. It is the
+            // flag Mesa's `vk_sync_timeline` reads to fall back to emulating
+            // timelines on binary syncobjs, and the one v3dv reads into
+            // `caps.multisync`. Reporting 1 here while TIMELINE_WAIT answers
+            // ENOSYS would make clients take a path that cannot work.
+            DRM_CAP_SYNCOBJ_TIMELINE => 0,
             // Unknown caps: value 0 + success. Smithay probes many optional caps
             // and treats an ioctl error differently from "cap == 0".
             _ => 0,
@@ -3103,6 +4056,21 @@ impl DrmDeviceInterface {
                 Ok(0)
             }
             DRM_CLIENT_CAP_UNIVERSAL_PLANES => Ok(0),
+            // Private, and the ONE way the v3d backend is armed. See "Backend
+            // selection". Deliberately in the client-cap space rather than as a
+            // new ioctl number: this entry point exists to let a client say
+            // which contract it wants, unknown ids here have always been
+            // accepted-and-ignored so nothing existing can be broken by adding
+            // one, and no Mesa/libdrm caller sets a capability above 6.
+            DRM_CLIENT_CAP_LEANDROS_V3D => {
+                v3d_set_enabled(cap.value != 0);
+                crate::pci::serial_debug(if cap.value != 0 {
+                    "[DRM] v3d backend ARMED (card0 and renderD128 now report \"v3d\")\n"
+                } else {
+                    "[DRM] v3d backend disarmed\n"
+                });
+                Ok(0)
+            }
             _ => Ok(0),
         }
     }
@@ -4597,6 +5565,10 @@ impl DrmDeviceInterface {
                 map_phys: 0,
                 map_info: 0,
                 refs: 1,
+                // A virtgpu blob has no GPU virtual address: the host owns the
+                // GPU-side mapping. Zero here is also what keeps it out of
+                // every v3d path (see `BlobObj::v3d_va`).
+                v3d_va: 0,
             },
         );
         let handle = NEXT_BLOB_HANDLE.fetch_add(1, Ordering::Relaxed);
@@ -4925,6 +5897,736 @@ impl DrmDeviceInterface {
             gpu.fence_retired(fence)
         };
         if retired { Ok(0) } else { Err(DriverError::Io) }
+    }
+
+    // ── DRM_IOCTL_SYNCOBJ_* ──────────────────────────────────────────────────
+    //
+    // ERRNO IS THE CONTRACT HERE. These arms return `DriverError` like every
+    // other arm, but the DRM server maps them through a *syncobj-specific*
+    // table (`servers/drm/src/lib.rs`) because Mesa branches on the value:
+    //
+    //   InvalidParameter -> EINVAL (22)   bad flags/count, NULL fence w/o
+    //                                     WAIT_FOR_SUBMIT, DESTROY of nothing
+    //   NotFound         -> ENOENT (2)    a handle no such open may reach
+    //   Busy             -> ETIME  (62)   WAIT ran out of time
+    //   Io               -> EINTR  (4)    WAIT interrupted by a signal
+    //   Unsupported      -> ENOSYS (38)   timeline / fd-export, not implemented
+    //
+    // `Busy`/`Io` are puns: `drivers/src/lib.rs` has no Timeout or Interrupted
+    // variant and is owned elsewhere. They are unambiguous because the mapping
+    // is keyed on the ioctl being a syncobj one, and no syncobj arm returns
+    // either for any other reason.
+
+    /// DRM_IOCTL_SYNCOBJ_CREATE. `flags` may only be CREATE_SIGNALED.
+    fn syncobj_handle_create(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let mut c = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_create) };
+        if c.flags & !DRM_SYNCOBJ_CREATE_SIGNALED != 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+        let handle = NEXT_SYNCOBJ_HANDLE.fetch_add(1, Ordering::Relaxed);
+        // Never reused within a boot, so a stale handle resolves to nothing
+        // rather than to somebody else's syncobj — the same property
+        // `NEXT_BO_OBJ` buys for BOs. 2^32 creates is not reachable.
+        if handle == 0 { return Err(DriverError::Io); }
+        {
+            let mut map = SYNCOBJS.lock();
+            map.insert(handle, SyncObj {
+                owner: open_id,
+                signaled: c.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0,
+                fence: 0,
+                refs: 1,
+            });
+        }
+        // Write-back with the map dropped: user memory, never under a lock.
+        c.handle = handle;
+        unsafe { ptr::write_unaligned(arg as *mut drm_syncobj_create, c); }
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_SYNCOBJ_DESTROY. Upstream answers **EINVAL**, not ENOENT, for
+    /// a handle that is not there (`drm_syncobj_destroy_ioctl` fails the
+    /// `idr_remove`), which is why this one arm differs from RESET/SIGNAL/WAIT.
+    fn syncobj_handle_destroy(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let d = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_destroy) };
+        if d.pad != 0 { return Err(DriverError::InvalidParameter); }
+        let mut map = SYNCOBJS.lock();
+        match map.get(&d.handle) {
+            Some(s) if open_may_reach(open_id, s.owner) => {}
+            _ => return Err(DriverError::InvalidParameter),
+        }
+        syncobj_put(&mut map, d.handle);
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_SYNCOBJ_RESET / _SIGNAL — both take `drm_syncobj_array`.
+    ///
+    /// All-or-nothing, like upstream's `drm_syncobj_array_find`: every handle
+    /// is validated before any of them is mutated, so a bad handle late in the
+    /// array cannot leave the earlier ones half-signalled.
+    fn syncobj_handle_array(
+        &mut self,
+        arg: usize,
+        open_id: u32,
+        signal: bool,
+    ) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let a = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_array) };
+        if a.pad != 0 { return Err(DriverError::InvalidParameter); }
+        // Copied out of user memory BEFORE the lock — see `syncobj_read_handles`.
+        let handles = syncobj_read_handles(a.handles, a.count_handles)?;
+        {
+            let mut map = SYNCOBJS.lock();
+            for &h in &handles {
+                match map.get(&h) {
+                    Some(s) if open_may_reach(open_id, s.owner) => {}
+                    _ => return Err(DriverError::NotFound),
+                }
+            }
+            for &h in &handles {
+                if let Some(s) = map.get_mut(&h) {
+                    if signal {
+                        // A stub already-signalled fence, upstream's
+                        // `drm_syncobj_replace_fence(syncobj, NULL)` + signal.
+                        s.signaled = true;
+                    } else {
+                        // RESET installs the NULL fence. Both halves must go:
+                        // leaving `fence` behind would let a since-retired id
+                        // re-signal the container the client just cleared.
+                        s.signaled = false;
+                        s.fence = 0;
+                    }
+                }
+            }
+        }
+        if signal { syncobj_wake(); }
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_SYNCOBJ_WAIT.
+    ///
+    /// HOW IT BLOCKS. The three-phase `block_on_poll_*` protocol, verbatim from
+    /// `sys_epoll_wait` — prepare (publish Blocked-on-poll while still
+    /// running), re-probe, then commit or cancel. The re-probe is what closes
+    /// the check-then-sleep lost wake: a `SIGNAL` landing after the first probe
+    /// either finds this task already Blocked (and `wake_poll` flips it Ready)
+    /// or shows up in the re-probe. There is no busy-spin and no polling
+    /// timer — a zero/past timeout returns without ever entering the loop body,
+    /// and a real timeout sleeps to its deadline tick.
+    ///
+    /// NO LOCK IS HELD ACROSS THE BLOCK. `syncobj_probe` takes and drops
+    /// `SYNCOBJS` inside itself; the handle array was copied out of user memory
+    /// before the first probe; the only thing live across `yield` is a kernel
+    /// `Vec`. That is the `82d0cc3` rule applied to a path that sleeps, where
+    /// breaking it would not merely fault under a spinlock but hold one for the
+    /// entire duration of a GPU job.
+    fn syncobj_handle_wait(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let mut w = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_wait) };
+        const KNOWN_FLAGS: u32 = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
+            | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
+            | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE
+            | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE;
+        if w.flags & !KNOWN_FLAGS != 0 { return Err(DriverError::InvalidParameter); }
+        if w.pad != 0 { return Err(DriverError::InvalidParameter); }
+        let handles = syncobj_read_handles(w.handles, w.count_handles)?;
+        let wait_all = w.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
+        // WAIT_AVAILABLE is deliberately NOT folded in here. On a timeline it
+        // asks to wait for a *point* to become available rather than signalled;
+        // on a binary syncobj it degenerates, and treating it as
+        // WAIT_FOR_SUBMIT would silently turn an EINVAL that upstream returns
+        // into an unbounded wait. Accepted as a known flag, otherwise ignored.
+        let for_submit = w.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0;
+        // WAIT_DEADLINE only asks the driver to *boost* toward the deadline.
+        // We have no scheduler to boost, so honouring it is a no-op.
+        let deadline = syncobj_deadline_ticks(w.timeout_nsec);
+
+        SYNCOBJ_WAITERS.fetch_add(1, Ordering::Relaxed);
+        let outcome = loop {
+            match syncobj_probe(&handles, open_id, wait_all, for_submit) {
+                Err(e) => break Err(e),
+                Ok(Some(first)) => break Ok(first),
+                Ok(None) => {}
+            }
+            // A zero or already-expired timeout is a pure poll. This is also
+            // the only exit for a wait that genuinely runs out of time.
+            let dl = match deadline {
+                None => break Err(DriverError::Busy), // ETIME
+                Some(d) => d,
+            };
+            if sched::ticks() >= dl { break Err(DriverError::Busy); }
+            // Upstream sleeps TASK_INTERRUPTIBLE and answers -ERESTARTSYS.
+            // Returning EINTR is the honest equivalent at this seam; the
+            // deadline is absolute, so a caller that restarts the ioctl waits
+            // for exactly the time it had left.
+            if sched::has_deliverable_signal() { break Err(DriverError::Io); }
+
+            sched::block_on_poll_prepare_until(dl);
+            let ready = !matches!(
+                syncobj_probe(&handles, open_id, wait_all, for_submit),
+                Ok(None)
+            );
+            if ready || sched::ticks() >= dl || sched::has_deliverable_signal() {
+                sched::block_on_poll_cancel();
+                continue;
+            }
+            sched::block_on_poll_commit();
+        };
+        SYNCOBJ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+
+        let first = outcome?;
+        // Write-back only on success, and only with every lock dropped.
+        w.first_signaled = first;
+        unsafe { ptr::write_unaligned(arg as *mut drm_syncobj_wait, w); }
+        Ok(0)
+    }
+
+    /// Timeline syncobjs (TIMELINE_WAIT / TIMELINE_SIGNAL / QUERY / TRANSFER)
+    /// and sync-file export (HANDLE_TO_FD / FD_TO_HANDLE) — **ENOSYS, on
+    /// purpose**, and reported as such rather than as a generic failure.
+    ///
+    /// TIMELINE: a correct timeline needs a *chain* of per-point fences, not a
+    /// scalar payload — a point may be submitted-but-unsignalled, and
+    /// `WAIT_AVAILABLE` exists precisely to distinguish that state. A scalar
+    /// approximation would pass a smoke test and deadlock Mesa the first time
+    /// it waited on a point that had been signalled out of order. It is also
+    /// unnecessary: `DRM_CAP_SYNCOBJ_TIMELINE` reports 0, which is the flag
+    /// Mesa's `vk_sync_timeline` reads to select its binary-syncobj emulation,
+    /// and v3d's `caps.multisync` reads to stay off. v3d needs binary.
+    ///
+    /// HANDLE_TO_FD / FD_TO_HANDLE: minting an fd is a VFS/syscall-layer
+    /// operation and there is no seam for it inside this crate — note that the
+    /// PRIME arms in the dispatch below are `Unsupported` for the same reason
+    /// and are intercepted a layer up. Native fence sync is not needed for the
+    /// first v3d bring-up.
+    fn syncobj_timeline_stub(&mut self, _arg: usize) -> Result<usize, DriverError> {
+        Err(DriverError::Unsupported)
+    }
+
+    // ── V3D ioctl handlers ───────────────────────────────────────────────────
+
+    /// Route a `DRM_IOCTL_V3D_*` request, or `None` if this is not one.
+    ///
+    /// A SEPARATE DISPATCH, AHEAD OF THE MAIN `match cmd`, AND NOT AN ARM OF IT.
+    /// That is forced, not stylistic: **two v3d request codes are bit-identical
+    /// to two virtgpu ones**, because both drivers number their private ioctls
+    /// from `DRM_COMMAND_BASE` and two of the structs happen to be the same
+    /// size —
+    ///
+    ///     0xC0106441 = V3D_WAIT_BO (16 B)  = VIRTGPU_MAP      (16 B)
+    ///     0xC0106443 = V3D_MMAP_BO (16 B)  = VIRTGPU_GETPARAM (16 B)
+    ///
+    /// A flat `match` cannot hold both; the number alone does not identify the
+    /// operation, and only the active backend does. Routing v3d first, and only
+    /// when armed, gives exactly the required property: with the backend
+    /// disarmed this function is one relaxed load and every existing arm is
+    /// reached bit-identically, and with it armed the whole `DRM_COMMAND_BASE`
+    /// block is v3d's, which is what "this device answers one driver ABI"
+    /// means.
+    ///
+    /// `None` for a code in the block that is not a v3d code — a size that does
+    /// not match, say — so it falls through to the main match's unknown-ioctl
+    /// reporter, which prints `nr` and `size` and is precisely the diagnostic
+    /// for a struct whose layout drifted from the caller's.
+    fn v3d_dispatch(
+        &mut self,
+        cmd: u32,
+        arg: usize,
+        open_id: u32,
+    ) -> Option<Result<usize, DriverError>> {
+        // FIRST OF EACH KIND, ONCE PER BOOT. Not a debug hack — it is the only
+        // way to tell "Mesa never opened this device" from "Mesa got as far as
+        // CREATE_BO and then died in its own code", and those two look
+        // identical from userspace when the client crashes with no output. One
+        // `NoteSet` compare after the first call of each code, so a client in a
+        // per-frame submit loop pays nothing. Its own note set rather than
+        // `UNKNOWN_IOCTLS`, which is capped at 32 entries and is about a
+        // different question.
+        //
+        // AFTER the `match`, not before it. Written the other way round it fired
+        // for every ioctl that merely *reached* this function — VERSION,
+        // GETRESOURCES, GETCONNECTOR — because the `_ => return None` arm had
+        // not run yet, and a trace that reports non-v3d ioctls as v3d ones is
+        // worse than no trace.
+        let out = match cmd {
+            DRM_IOCTL_V3D_GET_PARAM => self.v3d_handle_get_param(arg),
+            DRM_IOCTL_V3D_CREATE_BO => self.v3d_handle_create_bo(arg, open_id),
+            DRM_IOCTL_V3D_MMAP_BO => self.v3d_handle_mmap_bo(arg, open_id),
+            DRM_IOCTL_V3D_GET_BO_OFFSET => self.v3d_handle_get_bo_offset(arg, open_id),
+            DRM_IOCTL_V3D_WAIT_BO => self.v3d_handle_wait_bo(arg, open_id),
+            DRM_IOCTL_V3D_SUBMIT_CL => self.v3d_handle_submit_cl(arg, open_id),
+            DRM_IOCTL_V3D_SUBMIT_TFU
+            | DRM_IOCTL_V3D_SUBMIT_CSD
+            | DRM_IOCTL_V3D_SUBMIT_CPU
+            | DRM_IOCTL_V3D_PERFMON_CREATE
+            | DRM_IOCTL_V3D_PERFMON_DESTROY
+            | DRM_IOCTL_V3D_PERFMON_GET_VALUES
+            | DRM_IOCTL_V3D_PERFMON_GET_COUNTER
+            | DRM_IOCTL_V3D_PERFMON_SET_GLOBAL => Self::v3d_enosys(cmd),
+            _ => return None,
+        };
+        // GET_PARAM is keyed on the PARAM rather than the request code, because
+        // every one of Mesa's device-info reads shares one code: without the
+        // param id the trace cannot distinguish "Mesa read IDENT0 and died"
+        // from "Mesa read all nine and died", which is the whole question when a
+        // client crashes silently during screen creation. Read back out of the
+        // caller's struct, which the handler has already validated.
+        let key = if cmd == DRM_IOCTL_V3D_GET_PARAM && arg != 0 {
+            0x8000_0000 | unsafe { ptr::read_unaligned(arg as *const u32) }
+        } else {
+            cmd
+        };
+        if V3D_FIRST_SEEN.lock().first(key) {
+            crate::pci::serial_debug("[V3D] first ");
+            if cmd == DRM_IOCTL_V3D_GET_PARAM {
+                crate::pci::serial_debug("GET_PARAM param=");
+                crate::pci::serial_debug_hex(key & 0x7FFF_FFFF);
+            } else {
+                crate::pci::serial_debug("ioctl nr=");
+                crate::pci::serial_debug_hex(cmd & 0xFF);
+            }
+            crate::pci::serial_debug(if out.is_ok() { " -> ok\n" } else { " -> err\n" });
+        }
+        Some(out)
+    }
+
+    /// The v3d ioctls this backend deliberately does not implement.
+    ///
+    /// **ENOSYS, explicitly, not a generic failure.** Each one is a whole
+    /// engine, and a stub for any of them would be a lie a caller could not
+    /// detect:
+    ///   * SUBMIT_TFU — the texture formatting unit. `DRM_V3D_PARAM_SUPPORTS_TFU`
+    ///     reports 1 because that is what a Pi 5 reports and it is what
+    ///     `v3d_screen.c:298` reads to advertise `PIPE_CAP_GENERATE_MIPMAP`.
+    ///     The mismatch is intentional and is the one place this backend is
+    ///     knowingly inconsistent: screen creation and every path that does not
+    ///     generate a mipmap work, and a path that does gets a hard ENOSYS at
+    ///     the exact ioctl instead of silently wrong texture data. Reporting 0
+    ///     instead would change which Mesa code path runs and therefore reduce
+    ///     what this stub covers, which is the opposite of its purpose.
+    ///   * SUBMIT_CSD — compute. `SUPPORTS_CSD` reports 0, so Mesa never issues
+    ///     one; the arm exists so that if it ever does, it is told why.
+    ///   * SUBMIT_CPU — the CPU-job queue. `SUPPORTS_CPU_QUEUE` reports 0.
+    ///   * PERFMON_* — `SUPPORTS_PERFMON` reports 0 and `MAX_PERF_COUNTERS`
+    ///     reports 0, which together keep Mesa on its compiled-in counter table
+    ///     and off this family entirely (see `V3D_MAX_PERF_COUNTERS`).
+    ///
+    /// Logged once per code per boot, through the same `UNKNOWN_IOCTLS` note set
+    /// the unimplemented-ioctl reporter uses, so a client that retries in a loop
+    /// cannot flood the console.
+    fn v3d_enosys(cmd: u32) -> Result<usize, DriverError> {
+        if UNKNOWN_IOCTLS.lock().first(cmd) {
+            crate::pci::serial_debug("[DRM] v3d ioctl not implemented (ENOSYS) cmd=");
+            crate::pci::serial_debug_hex(cmd);
+            crate::pci::serial_debug(" nr=");
+            crate::pci::serial_debug_hex(cmd & 0xFF);
+            crate::pci::serial_debug(" (reported once per boot)\n");
+        }
+        Err(DriverError::Unsupported)
+    }
+
+    /// DRM_IOCTL_V3D_GET_PARAM — `struct drm_v3d_get_param { u32 param; u32 pad;
+    /// u64 value; }`.
+    ///
+    /// **This is the gate on the whole driver.** `v3d_get_device_info` fails
+    /// screen creation outright if either CORE0_IDENT0 or CORE0_IDENT1 errors
+    /// (`v3d_device_info.c:52,58`), and `v3d_screen_create` then `goto fail`s
+    /// (`v3d_screen.c:796`). See the IDENTITY block for what the values decode
+    /// to and why each one is the number it is.
+    ///
+    /// An unknown param is EINVAL, as upstream's `v3d_get_param_ioctl` answers,
+    /// and NOT a zero value: `v3d_has_feature` reads the return code, so
+    /// answering 0 successfully for an id we have never heard of would claim we
+    /// understood the question.
+    fn v3d_handle_get_param(&mut self, arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let param = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let pad = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
+        if pad != 0 { return Err(DriverError::InvalidParameter); }
+
+        let value: u64 = match param {
+            V3D_PARAM_CORE0_IDENT0 => V3D_IDENT0,
+            V3D_PARAM_CORE0_IDENT1 => V3D_IDENT1,
+            // Per-core config (TMU/slice geometry) that Mesa never reads.
+            V3D_PARAM_CORE0_IDENT2 => 0,
+            V3D_PARAM_HUB_IDENT1 => V3D_HUB_IDENT1,
+            // Hub MMU/AXI config. Not read by the gallium driver.
+            V3D_PARAM_HUB_IDENT2 => 0,
+            V3D_PARAM_HUB_IDENT3 => V3D_HUB_IDENT3,
+            // UIF (Uniform InterleaveD Format) memory configuration. Mesa's UIF
+            // layout code uses its own compiled-in constants
+            // (`V3D_UIFCFG_BANKS`/`_PAGE_SIZE`/`_XOR_VALUE` in v3d_screen.h) and
+            // never reads this register, so it is answered rather than refused
+            // only so a probe of the whole block does not have to know that.
+            V3D_PARAM_UIFCFG => 0,
+
+            // Feature bits. Each one selects a Mesa code path; see `v3d_enosys`
+            // for why TFU is 1 while SUBMIT_TFU is not implemented.
+            V3D_PARAM_SUPPORTS_TFU => 1,
+            V3D_PARAM_SUPPORTS_CSD => 0,
+            // Costs nothing here (there are no caches to flush) and keeps Mesa
+            // on the same submit path a Pi 5 takes: it sets
+            // DRM_V3D_SUBMIT_CL_FLUSH_CACHE in `flags`, which SUBMIT_CL below
+            // accepts as a known flag.
+            V3D_PARAM_SUPPORTS_CACHE_FLUSH => 1,
+            V3D_PARAM_SUPPORTS_PERFMON => 0,
+            // **0 on purpose.** Advertising it turns every submit into an
+            // extension chain (`drm_v3d_multi_sync` hung off `extensions`)
+            // instead of the flat `in_sync_bcl`/`in_sync_rcl`/`out_sync` fields,
+            // which is strictly more decode surface for no capability we have.
+            V3D_PARAM_SUPPORTS_MULTISYNC_EXT => 0,
+            V3D_PARAM_SUPPORTS_CPU_QUEUE => 0,
+            V3D_PARAM_SUPPORTS_SUPER_PAGES => 0,
+            V3D_PARAM_MAX_PERF_COUNTERS => V3D_MAX_PERF_COUNTERS,
+            // GPU reset accounting. Answered (rather than refused) with 0: the
+            // ioctl succeeding is what sets `devinfo->has_reset_counter`, and 0
+            // is the truth — this device has never been reset, because it has
+            // never run anything.
+            V3D_PARAM_GLOBAL_RESET_COUNTER => 0,
+            V3D_PARAM_CONTEXT_RESET_COUNTER => 0,
+
+            _ => return Err(DriverError::InvalidParameter),
+        };
+
+        // `value` is at offset 8. Written with no lock held.
+        unsafe { ((arg as *mut u8).add(8) as *mut u64).write_unaligned(value) };
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_V3D_CREATE_BO — `struct drm_v3d_create_bo { u32 size; u32
+    /// flags; u32 handle; u32 offset; }`.
+    ///
+    /// Allocates physically contiguous guest pages and a GPU virtual address,
+    /// and returns the gem handle plus that address. Contiguous because there is
+    /// no V3D MMU behind this stub to scatter-gather with; when the real driver
+    /// lands it will program the MMU instead and this becomes a
+    /// non-contiguous allocation with the same interface.
+    ///
+    /// **NON-ROUND SIZES ARE THE NORMAL CASE, not an edge case.** Mesa
+    /// over-allocates every resource it creates: `v3d_resource.c:113-116` adds
+    /// `V3D_TFU_READAHEAD_SIZE` (64 B) to every non-`PIPE_BUFFER` resource and 4 B
+    /// to every `PIPE_BUFFER`, precisely so the TFU's and `ldunifa`'s read-ahead
+    /// cannot run off the end of the last page. So a 4096-byte texture arrives
+    /// here as 4160 and MUST become a two-page allocation. Rounding down, or
+    /// rejecting, would fail the very allocation Mesa makes most often.
+    fn v3d_handle_create_bo(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let size = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let flags = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
+        // Upstream: "There are currently no values for the flags argument", and
+        // `v3d_create_bo_ioctl` refuses a non-zero one. Refusing keeps a flag
+        // added later from being silently ignored.
+        if flags != 0 { return Err(DriverError::InvalidParameter); }
+        if size == 0 { return Err(DriverError::InvalidParameter); }
+
+        let pages = ((size as usize) + 4095) / 4096;
+        // Buddy order convention, as at `kms.rs:117`: ceil_log2 of the page
+        // count. Freeing with a different order corrupts the allocator, so the
+        // order is stored on the object and never recomputed at teardown.
+        let order = pages.next_power_of_two().trailing_zeros() as usize;
+        let alloc_bytes = ((1usize << order) * 4096) as u64;
+
+        let phys = mm::buddy::alloc(order).ok_or(DriverError::Io)?;
+        // Zeroed, like every other BO this driver hands out. A GPU BO whose
+        // contents are whatever the buddy allocator last had there is an
+        // information leak across processes, and the one class of bug that
+        // looks like a rendering artefact rather than like a security hole.
+        unsafe { ptr::write_bytes(mm::phys_to_virt(phys) as *mut u8, 0, alloc_bytes as usize); }
+
+        let va = match v3d_va_alloc(alloc_bytes) {
+            Some(v) => v,
+            None => {
+                mm::buddy::free(phys, order);
+                return Err(DriverError::Io);
+            }
+        };
+
+        // Object then handle, exactly as RESOURCE_CREATE_BLOB does it: the
+        // handle IS the object's one initial reference (`BO LIFETIME`).
+        let obj = NEXT_BO_OBJ.fetch_add(1, Ordering::Relaxed);
+        BLOB_OBJS.lock().insert(
+            obj,
+            BlobObj {
+                phys,
+                order,
+                // No host virtio-gpu resource exists behind a v3d BO. This is
+                // what keeps `blob_unref` from talking to a device about it.
+                res_handle: 0,
+                // The ALLOCATED size, not the requested one: `handle_ioctl_mmap`
+                // and `blob_map_cache_type` both test containment against it,
+                // and a caller that mmaps its whole BO must be inside.
+                size: alloc_bytes,
+                blob_mem: 0,
+                last_fence: 0,
+                win_off: 0,
+                map_phys: 0,
+                map_info: 0,
+                refs: 1,
+                v3d_va: va,
+            },
+        );
+        let handle = NEXT_BLOB_HANDLE.fetch_add(1, Ordering::Relaxed);
+        BLOB_BUFFERS.lock().insert(handle, BlobHandle { obj, owner: open_id, ctx: 0 });
+
+        // handle at offset 8, offset at offset 12. Written after every lock is
+        // dropped.
+        unsafe {
+            (arg as *mut u8).add(8).cast::<u32>().write_unaligned(handle);
+            (arg as *mut u8).add(12).cast::<u32>().write_unaligned(va as u32);
+        }
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_V3D_MMAP_BO — `struct drm_v3d_mmap_bo { u32 handle; u32 flags;
+    /// u64 offset; }`.
+    ///
+    /// Despite the name this performs no mapping; it turns a gem handle into the
+    /// offset to pass to `mmap()` on the drm fd. That is this driver's existing
+    /// token scheme unchanged — the offset IS the guest-physical base, validated
+    /// on the way back in by `handle_ioctl_mmap` (0x1007) so a caller cannot map
+    /// physical memory this device never handed out.
+    ///
+    /// The **cacheability** is the part that is not free. `blob_map_cache_type`
+    /// answers write-combine for a v3d BO, which propagates through
+    /// `servers/drm`'s `MMAP_HINT_UNCACHED` into `sys_mmap`. See the note there
+    /// for why CACHED would pass under QEMU and fail on the Pi.
+    fn v3d_handle_mmap_bo(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let handle = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let flags = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
+        if flags != 0 { return Err(DriverError::InvalidParameter); }
+
+        let b = blob_lookup(handle, open_id).ok_or(DriverError::NotFound)?;
+        // Scoped to v3d BOs even though the registry is shared: a virtgpu blob
+        // reached through a v3d ioctl would be a caller confusing two ABIs, and
+        // its token is not derived the same way.
+        if b.v3d_va == 0 || b.phys == 0 { return Err(DriverError::NotFound); }
+
+        unsafe { ((arg as *mut u8).add(8) as *mut u64).write_unaligned(b.phys as u64) };
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_V3D_GET_BO_OFFSET — `struct drm_v3d_get_bo_offset { u32 handle;
+    /// u32 offset; }`.
+    ///
+    /// The GPU address CREATE_BO already returned. It exists for the handle that
+    /// arrived some other way (an import), and Mesa calls it on the BO-cache
+    /// path, so it must answer the same value for the life of the handle — which
+    /// it does, because the address lives on the object and is released only
+    /// when the object dies.
+    fn v3d_handle_get_bo_offset(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let handle = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let b = blob_lookup(handle, open_id).ok_or(DriverError::NotFound)?;
+        if b.v3d_va == 0 { return Err(DriverError::NotFound); }
+        unsafe { (arg as *mut u8).add(4).cast::<u32>().write_unaligned(b.v3d_va as u32) };
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_V3D_WAIT_BO — `struct drm_v3d_wait_bo { u32 handle; u32 pad;
+    /// u64 timeout_ns; }`.
+    ///
+    /// Waits for the last submission that named this BO. Built on the existing
+    /// per-BO `bo_fence` state and the same `SYNCOBJ_FENCE_DONE` watermark
+    /// SYNCOBJ_WAIT reads, so the two can never disagree about one fence.
+    ///
+    /// `timeout_ns` is a **RELATIVE** duration here, unlike `drm_syncobj_wait`'s
+    /// absolute `timeout_nsec` — upstream v3d runs it through
+    /// `nsecs_to_jiffies_timeout`, and it decrements the field by the elapsed
+    /// time on the way out so an interrupted caller can re-issue the ioctl and
+    /// wait only the remainder. Both behaviours are reproduced; getting the
+    /// absolute/relative distinction wrong is a wait that either returns
+    /// instantly forever or never returns.
+    ///
+    /// Timeout is ETIME (`DriverError::Busy`, punned as the syncobj family
+    /// already does — `drivers/src/lib.rs` has no `Timeout` variant and is owned
+    /// by another lane; the pun is unambiguous because `drm_errno` consults the
+    /// v3d table only for v3d ioctls). An unknown handle is EINVAL, matching
+    /// upstream's `drm_gem_dma_resv_wait`, not ENOENT.
+    fn v3d_handle_wait_bo(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let handle = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let pad = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
+        if pad != 0 { return Err(DriverError::InvalidParameter); }
+        let timeout_ns = unsafe { ((arg as *const u8).add(8) as *const u64).read_unaligned() };
+
+        // Resolve BEFORE parking, and refuse an unknown handle even when the
+        // timeout is zero: a poll of a handle that does not exist is still a
+        // bad handle.
+        let fence = bo_fence(handle, open_id).ok_or(DriverError::InvalidParameter)?;
+
+        let start_ns = unsafe { arch_monotonic_ns() };
+        // Relative -> absolute, then reuse the one deadline converter so the
+        // rounding-up rule (never truncate a sub-tick timeout to a busy-poll —
+        // the `fb398c7` class) is stated in exactly one place.
+        let deadline = if timeout_ns == 0 {
+            None
+        } else {
+            syncobj_deadline_ticks(start_ns.saturating_add(timeout_ns).min(i64::MAX as u64) as i64)
+        };
+
+        // Registered in the SYNCOBJ waiter count on purpose: that counter is
+        // what `syncobj_retire_fence` consults before issuing a wake, and this
+        // is a task parked on exactly the fence it retires. A separate counter
+        // would mean a retirement that woke syncobj waiters and left BO waiters
+        // asleep until the next tick.
+        SYNCOBJ_WAITERS.fetch_add(1, Ordering::Relaxed);
+        let outcome = loop {
+            if v3d_fence_done(fence) { break Ok(()); }
+            let dl = match deadline {
+                None => break Err(DriverError::Busy), // ETIME — pure poll
+                Some(d) => d,
+            };
+            if sched::ticks() >= dl { break Err(DriverError::Busy); }
+            // Upstream sleeps interruptibly and answers -ERESTARTSYS; EINTR is
+            // the honest equivalent at this seam, and the deadline written back
+            // below is what makes a restart wait only the remainder.
+            if sched::has_deliverable_signal() { break Err(DriverError::Io); }
+
+            sched::block_on_poll_prepare_until(dl);
+            if v3d_fence_done(fence) || sched::ticks() >= dl || sched::has_deliverable_signal() {
+                sched::block_on_poll_cancel();
+                continue;
+            }
+            sched::block_on_poll_commit();
+        };
+        SYNCOBJ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+
+        // Decrement the caller's timeout by however long this actually took.
+        // Upstream does this on EVERY exit including the error ones, which is
+        // why it is here rather than inside the success arm.
+        let elapsed = unsafe { arch_monotonic_ns() }.saturating_sub(start_ns);
+        let remaining = timeout_ns.saturating_sub(elapsed);
+        unsafe { ((arg as *mut u8).add(8) as *mut u64).write_unaligned(remaining) };
+
+        outcome.map(|_| 0usize)
+    }
+
+    /// DRM_IOCTL_V3D_SUBMIT_CL — **decode only**.
+    ///
+    /// Nothing is executed and the command lists are not even read: there is no
+    /// V3D core under QEMU and pretending otherwise would be the whole value of
+    /// this exercise thrown away. What IS real is everything around the
+    /// execution — and that is the half that is expensive to get wrong later:
+    ///
+    ///   1. every field is validated, in upstream's order, with upstream's errno;
+    ///   2. every handle in `bo_handles` must name a BO this open can reach;
+    ///   3. `in_sync_bcl` / `in_sync_rcl` resolve through `syncobj_fence`, so a
+    ///      stale syncobj handle is ENOENT here rather than a hang later;
+    ///   4. a monotonic fence id is allocated and queued for **deferred**
+    ///      retirement (see "The stub submit queue"), so the fence is genuinely
+    ///      outstanding when this ioctl returns;
+    ///   5. `out_sync` gets that fence via `syncobj_attach_fence`, and every BO
+    ///      named gets it via `bo_attach_fence`, so WAIT_BO and SYNCOBJ_WAIT
+    ///      both see the same one submission.
+    ///
+    /// DEPENDENCIES ARE SATISFIED BY CONSTRUCTION, not by ignoring them. There
+    /// is one queue, ids are monotonic, and retirement is a watermark drained
+    /// strictly from the front — so any fence this submission could name as a
+    /// dependency is numerically smaller than the one it is about to get, and
+    /// therefore retires first. A second queue (TFU, CSD) would break that and
+    /// is exactly why neither exists yet.
+    fn v3d_handle_submit_cl(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let u32_at = |i: usize| -> u32 { unsafe { ptr::read_unaligned((arg as *const u32).add(i)) } };
+        let u64_at = |b: usize| -> u64 { unsafe { ((arg as *const u8).add(b) as *const u64).read_unaligned() } };
+
+        let bcl_start = u32_at(0);
+        let bcl_end = u32_at(1);
+        let rcl_start = u32_at(2);
+        let rcl_end = u32_at(3);
+        let in_sync_bcl = u32_at(4);
+        let in_sync_rcl = u32_at(5);
+        let out_sync = u32_at(6);
+        let bo_handles = u64_at(40);
+        let bo_handle_count = u32_at(12); // byte offset 48
+        let flags = u32_at(13); // byte offset 52
+        let perfmon_id = u32_at(14); // byte offset 56
+        let pad = u32_at(15); // byte offset 60
+        let extensions = u64_at(64);
+
+        if pad != 0 { return Err(DriverError::InvalidParameter); }
+
+        const V3D_SUBMIT_CL_FLUSH_CACHE: u32 = 0x01;
+        const V3D_SUBMIT_EXTENSION: u32 = 0x02;
+        if flags & !(V3D_SUBMIT_CL_FLUSH_CACHE | V3D_SUBMIT_EXTENSION) != 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+        // We advertise `SUPPORTS_MULTISYNC_EXT = 0`, so no client has any reason
+        // to hang an extension chain off this submit and there is no decoder for
+        // one. Refusing is what turns "we quietly ignored your wait/signal
+        // dependencies" — which would show up as a race, days later — into an
+        // error at the call site. Both the flag and a stray pointer are refused,
+        // because upstream only walks the chain when the flag is set and a
+        // non-zero pointer without it is a caller that thinks otherwise.
+        if flags & V3D_SUBMIT_EXTENSION != 0 || extensions != 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+        // `SUPPORTS_PERFMON` is 0, so there are no perfmon ids to find.
+        // Upstream answers ENOENT for an id that does not resolve; every id
+        // fails to resolve here.
+        if perfmon_id != 0 { return Err(DriverError::NotFound); }
+        // Upstream validates the CL extents (`v3d_job_init` / the CL bounds
+        // checks): an end before its start is a command list of negative length.
+        // A zero-length BCL is legal — an RCL-only blit submits exactly that.
+        if bcl_end < bcl_start || rcl_end < rcl_start {
+            return Err(DriverError::InvalidParameter);
+        }
+
+        // USER MEMORY FIRST, LOCKS AFTER — the 82d0cc3 rule. `syncobj_read_handles`
+        // is the shared copier and states it; a BO handle array is the same
+        // shape as a syncobj handle array and gets the same cap.
+        let handles = if bo_handle_count == 0 {
+            Vec::new()
+        } else {
+            syncobj_read_handles(bo_handles, bo_handle_count)?
+        };
+        // Upstream's `v3d_lookup_bos` fails the whole submit on the first handle
+        // that does not resolve, before any of them is fenced. Validate the
+        // entire list before attaching anything, so a rejected submit leaves no
+        // BO carrying a fence for work that will never run.
+        for &h in handles.iter() {
+            if !bo_exists(h, open_id) { return Err(DriverError::NotFound); }
+        }
+
+        // Dependencies. `Some(0)` is a real answer — the syncobj exists and holds
+        // no fence, which is a satisfied dependency — and `None` is "this handle
+        // names nothing you can reach", which is ENOENT.
+        for h in [in_sync_bcl, in_sync_rcl] {
+            if h != 0 && syncobj_fence(h, open_id).is_none() {
+                return Err(DriverError::NotFound);
+            }
+        }
+        // Resolve the out-sync BEFORE allocating a fence, so a bad handle costs
+        // no fence id and queues no phantom retirement. It is re-resolved by the
+        // attach below; the window between is a concurrent DESTROY on another
+        // thread, which upstream races the same way and which costs only a fence
+        // that retires with nothing listening.
+        if out_sync != 0 && syncobj_fence(out_sync, open_id).is_none() {
+            return Err(DriverError::NotFound);
+        }
+
+        // Everything is valid: take a fence id and queue the deferred retirement.
+        let fence = v3d_submit_fence().ok_or(DriverError::Busy)?;
+
+        if out_sync != 0 && !syncobj_attach_fence(out_sync, open_id, fence) {
+            return Err(DriverError::NotFound);
+        }
+        // Upstream attaches the job's fence to every BO the job named, which is
+        // what makes WAIT_BO answer about the right work. A handle closed
+        // between validation and here returns false, which is benign — a closed
+        // BO is one nothing can wait on.
+        for &h in handles.iter() {
+            bo_attach_fence(h, open_id, fence);
+        }
+
+        gdbg("[V3D] SUBMIT_CL fence=");
+        gdbg_hex_64(fence);
+        gdbg(" bos=");
+        gdbg_hex(bo_handle_count);
+        gdbg("\n");
+        Ok(0)
     }
 
     fn virtgpu_handle_transfer_to_host(&mut self, _arg: usize) -> Result<usize, DriverError> {

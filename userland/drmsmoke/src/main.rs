@@ -69,6 +69,64 @@ const DRM_IOCTL_MODE_ATOMIC: c_ulong = 0xC03864BC;
 const DRM_IOCTL_PRIME_HANDLE_TO_FD: c_ulong = 0xC00C642D;
 const DRM_IOCTL_PRIME_FD_TO_HANDLE: c_ulong = 0xC00C642E;
 
+// ── Sync objects ─────────────────────────────────────────────────────────────
+// _IOWR('d', nr, struct) = 0xC0000000 | size<<16 | 0x6400 | nr. Sizes: create
+// and destroy 8, array 16, wait 32, timeline_wait 40. Same arithmetic as
+// ATOMIC's 0xC038_64BC above (nr 0xBC, 56-byte struct).
+const DRM_IOCTL_SYNCOBJ_CREATE: c_ulong = 0xC00864BF;
+const DRM_IOCTL_SYNCOBJ_DESTROY: c_ulong = 0xC00864C0;
+const DRM_IOCTL_SYNCOBJ_WAIT: c_ulong = 0xC02064C3;
+const DRM_IOCTL_SYNCOBJ_RESET: c_ulong = 0xC01064C4;
+const DRM_IOCTL_SYNCOBJ_SIGNAL: c_ulong = 0xC01064C5;
+const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: c_ulong = 0xC02864CA;
+
+const DRM_SYNCOBJ_CREATE_SIGNALED: u32 = 1 << 0;
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1 << 0;
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: u32 = 1 << 1;
+
+const DRM_CAP_SYNCOBJ: u64 = 0x13;
+const DRM_CAP_SYNCOBJ_TIMELINE: u64 = 0x14;
+
+const EINVAL: i32 = 22;
+const ENOENT: i32 = 2;
+const ETIME: i32 = 62;
+const ENOSYS: i32 = 38;
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmSyncobjCreate { handle: u32, flags: u32 }
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmSyncobjDestroy { handle: u32, pad: u32 }
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmSyncobjArray { handles: u64, count_handles: u32, pad: u32 }
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmSyncobjWait {
+    handles: u64,
+    timeout_nsec: i64,
+    count_handles: u32,
+    flags: u32,
+    first_signaled: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmSyncobjTimelineWait {
+    handles: u64,
+    points: u64,
+    timeout_nsec: i64,
+    count_handles: u32,
+    flags: u32,
+    first_signaled: u32,
+    pad: u32,
+}
+
 const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
 const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
 
@@ -98,6 +156,98 @@ const POLLIN: i16 = 0x001;
 
 const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
 const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 0x6;
+
+
+// ── V3D (Broadcom VideoCore VI/VII 3D core) ──────────────────────────────────
+// `_IOC(dir, type, nr, size) = dir<<30 | size<<16 | type<<8 | nr`, DRM's type
+// 'd' = 0x64, `nr = DRM_COMMAND_BASE (0x40) + index`, _IOWR = 0xC000_0000 and
+// _IOW = 0x4000_0000. Sizes are `sizeof` of the structs in Mesa's vendored
+// `include/drm-uapi/v3d_drm.h`. Same arithmetic as the syncobj codes above.
+//
+//   SUBMIT_CL     idx 0x00 -> nr 0x40, 72 B -> 0xC0486440
+//   WAIT_BO       idx 0x01 -> nr 0x41, 16 B -> 0xC0106441
+//   CREATE_BO     idx 0x02 -> nr 0x42, 16 B -> 0xC0106442
+//   MMAP_BO       idx 0x03 -> nr 0x43, 16 B -> 0xC0106443
+//   GET_PARAM     idx 0x04 -> nr 0x44, 16 B -> 0xC0106444
+//   GET_BO_OFFSET idx 0x05 -> nr 0x45,  8 B -> 0xC0086445
+//   SUBMIT_TFU    idx 0x06 -> nr 0x46, 88 B, _IOW -> 0x40586446
+//   PERFMON_CREATE idx 0x08 -> nr 0x48, 40 B -> 0xC0286448
+//
+// ⚠ WAIT_BO and MMAP_BO are BIT-IDENTICAL to VIRTGPU_MAP and VIRTGPU_GETPARAM
+// respectively — both drivers number from DRM_COMMAND_BASE and the structs
+// happen to match in size. The number does not identify the operation; the
+// armed backend does. That is what V3D_ARM below is for.
+const DRM_IOCTL_V3D_SUBMIT_CL: c_ulong = 0xC0486440;
+const DRM_IOCTL_V3D_WAIT_BO: c_ulong = 0xC0106441;
+const DRM_IOCTL_V3D_CREATE_BO: c_ulong = 0xC0106442;
+const DRM_IOCTL_V3D_MMAP_BO: c_ulong = 0xC0106443;
+const DRM_IOCTL_V3D_GET_PARAM: c_ulong = 0xC0106444;
+const DRM_IOCTL_V3D_GET_BO_OFFSET: c_ulong = 0xC0086445;
+const DRM_IOCTL_V3D_SUBMIT_TFU: c_ulong = 0x40586446;
+const DRM_IOCTL_V3D_PERFMON_CREATE: c_ulong = 0xC0286448;
+
+const DRM_IOCTL_SET_CLIENT_CAP: c_ulong = 0x4010640D;
+/// Private client capability that arms the kernel's v3d backend. Not upstream:
+/// see "Backend selection" in drivers/src/drm_device_interface.rs for why this
+/// entry point rather than a new ioctl number.
+const DRM_CLIENT_CAP_LEANDROS_V3D: u64 = 0x1000_0003;
+
+const V3D_PARAM_HUB_IDENT3: u32 = 3;
+const V3D_PARAM_CORE0_IDENT0: u32 = 4;
+const V3D_PARAM_CORE0_IDENT1: u32 = 5;
+const V3D_PARAM_SUPPORTS_TFU: u32 = 7;
+const V3D_PARAM_SUPPORTS_CSD: u32 = 8;
+const V3D_PARAM_SUPPORTS_PERFMON: u32 = 10;
+const V3D_PARAM_SUPPORTS_MULTISYNC_EXT: u32 = 11;
+const V3D_PARAM_MAX_PERF_COUNTERS: u32 = 13;
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmSetClientCap { capability: u64, value: u64 }
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmV3dGetParam { param: u32, pad: u32, value: u64 }
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmV3dCreateBo { size: u32, flags: u32, handle: u32, offset: u32 }
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmV3dMmapBo { handle: u32, flags: u32, offset: u64 }
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmV3dGetBoOffset { handle: u32, offset: u32 }
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmV3dWaitBo { handle: u32, pad: u32, timeout_ns: u64 }
+
+/// 72 bytes. Ten u32 then a naturally-aligned u64 at offset 40, four more u32,
+/// and a u64 at offset 64 — no interior padding anywhere, which is why the
+/// declaration order below IS the wire layout.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmV3dSubmitCl {
+    bcl_start: u32,
+    bcl_end: u32,
+    rcl_start: u32,
+    rcl_end: u32,
+    in_sync_bcl: u32,
+    in_sync_rcl: u32,
+    out_sync: u32,
+    qma: u32,
+    qms: u32,
+    qts: u32,
+    bo_handles: u64,
+    bo_handle_count: u32,
+    flags: u32,
+    perfmon_id: u32,
+    pad: u32,
+    extensions: u64,
+}
 
 // ── DRM structs (fixed-width, identical on x86_64 == aarch64) ─────────────────
 #[repr(C)]
@@ -310,6 +460,27 @@ extern "C" {
     pub fn poll(fds: *mut pollfd, nfds: u64, timeout: c_int) -> c_int;
     pub fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int,
                 fd: c_int, offset: i64) -> *mut c_void;
+    // Syncobj timeouts are ABSOLUTE CLOCK_MONOTONIC nanoseconds, so the test
+    // has to read the same clock the kernel compares against.
+    pub fn clock_gettime(clk_id: c_int, tp: *mut timespec) -> c_int;
+    // relibc's errno. The syncobj lane is the first part of this file where the
+    // *errno value* is the thing under test (ETIME vs ENOENT vs EINVAL decide
+    // what Mesa does next), not merely whether the ioctl failed.
+    pub fn __errno_location() -> *mut c_int;
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct timespec { tv_sec: i64, tv_nsec: i64 }
+
+const CLOCK_MONOTONIC: c_int = 1;
+
+unsafe fn errno() -> i32 { *__errno_location() }
+
+unsafe fn monotonic_ns() -> u64 {
+    let mut ts = timespec::default();
+    if clock_gettime(CLOCK_MONOTONIC, &mut ts as *mut _) != 0 { return 0; }
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -615,6 +786,43 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         return 1;
     }
     report(b"open_card0", true);
+
+    // ── `--arm-v3d` / `--disarm-v3d`: set the backend flag and leave ─────────
+    //
+    // The v3d backend flag is DEVICE-GLOBAL and survives the fd that set it,
+    // which is not an accident — it changes the `DRM_IOCTL_VERSION` identity,
+    // and Mesa reads that identity in `pipe_loader_drm.c` before it has created
+    // anything. So the only way to point a SEPARATE process (Mesa, kmscube,
+    // cosmic-comp) at the v3d ABI is for something to arm it first and exit.
+    // That is what this mode is: two ioctls and nothing else.
+    //
+    // Kept out of the main suite, which arms and disarms around its own block,
+    // so a normal `drmsmoke` run still leaves the machine exactly as it found
+    // it. Leaving the device armed by accident would send the next Mesa process
+    // hunting for a driver that cannot work under QEMU.
+    if argc > 1 {
+        let a1 = *argv.add(1) as *const u8;
+        let arm = arg_is(a1, b"--arm-v3d");
+        if arm || arg_is(a1, b"--disarm-v3d") {
+            let mut cc = DrmSetClientCap {
+                capability: DRM_CLIENT_CAP_LEANDROS_V3D,
+                value: if arm { 1 } else { 0 },
+            };
+            let ok = ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &mut cc as *mut _) == 0;
+            // Read the identity back, so the line printed is what the device
+            // will actually tell Mesa rather than what we asked for.
+            let mut nb = [0u8; 32];
+            let mut vv = DrmVersion::default();
+            vv.name_len = nb.len();
+            vv.name = nb.as_mut_ptr() as u64;
+            ioctl(fd, DRM_IOCTL_VERSION, &mut vv as *mut _);
+            write(1, b"drmsmoke: DRM driver name is now \"".as_ptr() as *const c_void, 34);
+            write(1, nb.as_ptr() as *const c_void, vv.name_len);
+            write(1, b"\"\n".as_ptr() as *const c_void, 2);
+            close(fd);
+            return if ok { 0 } else { 1 };
+        }
+    }
 
     // st_rdev == 226:0 == 0xE200
     let mut stbuf = [0u8; 160];
@@ -1053,6 +1261,607 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         puts(b"  FLIP_TS_SUBTICK: note - every sample hit the clamp; interpolation is live but the timer IRQ ran late throughout\n\0".as_ptr());
     }
     if !report(b"FLIP_TS_SUBTICK", subtick_ok) { failures += 1; }
+
+    // ── Sync objects (DRM_IOCTL_SYNCOBJ_*) ──────────────────────────────────
+    //
+    // Binary syncobjs, which v3d's `drm_v3d_submit_cl` needs unconditionally
+    // (`in_sync_bcl` / `in_sync_rcl` / `out_sync` are syncobj handles and there
+    // is no simulate path). Every check below is errno-exact, because the errno
+    // is what Mesa branches on: ETIME means "not yet, ask again", ENOENT means
+    // "your handle is gone", EINVAL means "you asked for something impossible".
+    //
+    // The two checks that are not merely surface coverage:
+    //   * WAIT_ALL_BLOCKS_ETIME measures wall time across a wait that must
+    //     time out, so a WAIT that returned instantly (a broken deadline
+    //     conversion — the `fb398c7` nanosleep-truncation shape) fails here
+    //     rather than passing quietly.
+    //   * WAIT_WOKEN_BY_FORKED_SIGNAL parks the parent with no deadline
+    //     pressure and has a forked child signal the syncobj on the INHERITED
+    //     fd. That proves the park/wake path, which a poll-only test cannot:
+    //     a WAIT that busy-spun, or one that slept and was never woken, both
+    //     fail it. It also proves syncobj handles follow the open-file
+    //     description across fork, which is what "per-open, not per-process"
+    //     has to mean.
+    let mut cap_so = DrmGetCap { capability: DRM_CAP_SYNCOBJ, value: 0 };
+    let cap_so_ok = ioctl(fd, DRM_IOCTL_GET_CAP, &mut cap_so as *mut _) == 0 && cap_so.value == 1;
+    if !report(b"GET_CAP_SYNCOBJ", cap_so_ok) { failures += 1; }
+
+    // Deliberately 0: timeline syncobjs are ENOSYS, and this is the flag Mesa
+    // reads to fall back to emulating them on binary syncobjs. Reporting 1
+    // here would be the actual bug.
+    let mut cap_tl = DrmGetCap { capability: DRM_CAP_SYNCOBJ_TIMELINE, value: 0 };
+    let cap_tl_ok = ioctl(fd, DRM_IOCTL_GET_CAP, &mut cap_tl as *mut _) == 0 && cap_tl.value == 0;
+    if !report(b"GET_CAP_SYNCOBJ_TIMELINE_IS_ZERO", cap_tl_ok) { failures += 1; }
+
+    let mut sc_a = DrmSyncobjCreate::default();
+    let mut sc_b = DrmSyncobjCreate::default();
+    let mut sc_c = DrmSyncobjCreate { handle: 0, flags: DRM_SYNCOBJ_CREATE_SIGNALED };
+    let create_so_ok = ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &mut sc_a as *mut _) == 0
+        && ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &mut sc_b as *mut _) == 0
+        && ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &mut sc_c as *mut _) == 0
+        && sc_a.handle != 0 && sc_b.handle != 0 && sc_c.handle != 0
+        && sc_a.handle != sc_b.handle && sc_b.handle != sc_c.handle;
+    if !report(b"SYNCOBJ_CREATE", create_so_ok) { failures += 1; }
+
+    let ha = sc_a.handle;
+    let hb = sc_b.handle;
+    let hc = sc_c.handle;
+
+    // Helper-free inline WAIT: a fresh syncobj holds the NULL fence, so waiting
+    // on it WITHOUT WAIT_FOR_SUBMIT is EINVAL — upstream refuses rather than
+    // waiting forever on a container nothing has submitted into.
+    let handles_a: [u32; 1] = [ha];
+    let mut w = DrmSyncobjWait {
+        handles: handles_a.as_ptr() as u64,
+        timeout_nsec: 0,
+        count_handles: 1,
+        flags: 0,
+        first_signaled: 0,
+        pad: 0,
+    };
+    let null_fence_einval = ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &mut w as *mut _) == -1
+        && errno() == EINVAL;
+    if !report(b"SYNCOBJ_WAIT_NULL_FENCE_EINVAL", null_fence_einval) { failures += 1; }
+
+    // With WAIT_FOR_SUBMIT and a zero timeout it is a pure poll, so it must
+    // come back ETIME immediately rather than block.
+    w.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+    w.timeout_nsec = 0;
+    let poll_etime = ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &mut w as *mut _) == -1
+        && errno() == ETIME;
+    if !report(b"SYNCOBJ_WAIT_ZERO_TIMEOUT_ETIME", poll_etime) { failures += 1; }
+
+    // CREATE_SIGNALED really did create a signalled one.
+    let handles_c: [u32; 1] = [hc];
+    let mut wc = DrmSyncobjWait {
+        handles: handles_c.as_ptr() as u64,
+        timeout_nsec: 0,
+        count_handles: 1,
+        flags: 0,
+        first_signaled: 0xFFFF_FFFF,
+        pad: 0,
+    };
+    let created_signaled = ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &mut wc as *mut _) == 0
+        && wc.first_signaled == 0;
+    if !report(b"SYNCOBJ_CREATE_SIGNALED", created_signaled) { failures += 1; }
+
+    // SIGNAL then poll: succeeds, and first_signaled is the ARRAY INDEX of the
+    // first signalled handle, not the handle value. [hb, ha] with only ha
+    // signalled must report 1.
+    let sig_arr: [u32; 1] = [ha];
+    let mut sa = DrmSyncobjArray {
+        handles: sig_arr.as_ptr() as u64,
+        count_handles: 1,
+        pad: 0,
+    };
+    let signal_ok = ioctl(fd, DRM_IOCTL_SYNCOBJ_SIGNAL, &mut sa as *mut _) == 0;
+    if !report(b"SYNCOBJ_SIGNAL", signal_ok) { failures += 1; }
+
+    let handles_ba: [u32; 2] = [hb, ha];
+    let mut w2 = DrmSyncobjWait {
+        handles: handles_ba.as_ptr() as u64,
+        timeout_nsec: 0,
+        count_handles: 2,
+        // hb still holds the NULL fence, so WAIT_FOR_SUBMIT is required for the
+        // call to be legal at all; ANY (no WAIT_ALL) is satisfied by ha.
+        flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+        first_signaled: 0xFFFF_FFFF,
+        pad: 0,
+    };
+    let first_idx_ok = ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &mut w2 as *mut _) == 0
+        && w2.first_signaled == 1;
+    if !report(b"SYNCOBJ_WAIT_ANY_FIRST_SIGNALED", first_idx_ok) { failures += 1; }
+
+    // WAIT_ALL over [hb, ha] cannot be satisfied (hb is unsignalled), so it
+    // must sleep to its deadline and then answer ETIME. ~150 ms of wall clock
+    // is the evidence that it really parked: a driver that returned instantly,
+    // or one whose ns->tick conversion truncated to zero, comes back in ~0 ms
+    // and fails here even though its errno is right.
+    let t0 = monotonic_ns();
+    let mut w3 = DrmSyncobjWait {
+        handles: handles_ba.as_ptr() as u64,
+        timeout_nsec: (t0 + 150_000_000) as i64, // ABSOLUTE, +150 ms
+        count_handles: 2,
+        flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+        first_signaled: 0,
+        pad: 0,
+    };
+    let all_rc = ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &mut w3 as *mut _);
+    let all_errno = errno();
+    let elapsed_ms = (monotonic_ns().saturating_sub(t0)) / 1_000_000;
+    print_dec(b"  SYNCOBJ_WAIT_ALL elapsed_ms=", elapsed_ms);
+    // Lower bound only. An upper bound would be a flake generator under TCG.
+    let wait_all_ok = all_rc == -1 && all_errno == ETIME && elapsed_ms >= 100;
+    if !report(b"SYNCOBJ_WAIT_ALL_BLOCKS_ETIME", wait_all_ok) { failures += 1; }
+
+    // RESET installs the NULL fence again, so ha goes back to being illegal to
+    // wait on without WAIT_FOR_SUBMIT.
+    let mut ra = DrmSyncobjArray {
+        handles: sig_arr.as_ptr() as u64,
+        count_handles: 1,
+        pad: 0,
+    };
+    let reset_rc = ioctl(fd, DRM_IOCTL_SYNCOBJ_RESET, &mut ra as *mut _);
+    let mut w4 = DrmSyncobjWait {
+        handles: handles_a.as_ptr() as u64,
+        timeout_nsec: 0,
+        count_handles: 1,
+        flags: 0,
+        first_signaled: 0,
+        pad: 0,
+    };
+    let reset_ok = reset_rc == 0
+        && ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &mut w4 as *mut _) == -1
+        && errno() == EINVAL;
+    if !report(b"SYNCOBJ_RESET", reset_ok) { failures += 1; }
+
+    // A handle that was never allocated is ENOENT from WAIT (upstream's
+    // drm_syncobj_array_find), and EINVAL from DESTROY (upstream's failed
+    // idr_remove). The two differ on purpose; getting them backwards is
+    // exactly the kind of drift this check exists to catch.
+    let bogus: [u32; 1] = [0xDEAD_BEEF];
+    let mut w5 = DrmSyncobjWait {
+        handles: bogus.as_ptr() as u64,
+        timeout_nsec: 0,
+        count_handles: 1,
+        flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+        first_signaled: 0,
+        pad: 0,
+    };
+    let enoent_ok = ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &mut w5 as *mut _) == -1
+        && errno() == ENOENT;
+    if !report(b"SYNCOBJ_WAIT_BAD_HANDLE_ENOENT", enoent_ok) { failures += 1; }
+
+    // Timeline family: ENOSYS, explicitly, not a generic failure.
+    let tl_points: [u64; 1] = [1];
+    let mut tw = DrmSyncobjTimelineWait {
+        handles: handles_a.as_ptr() as u64,
+        points: tl_points.as_ptr() as u64,
+        timeout_nsec: 0,
+        count_handles: 1,
+        flags: 0,
+        first_signaled: 0,
+        pad: 0,
+    };
+    let tl_enosys = ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut tw as *mut _) == -1
+        && errno() == ENOSYS;
+    if !report(b"SYNCOBJ_TIMELINE_WAIT_ENOSYS", tl_enosys) { failures += 1; }
+
+    // ── The blocking wake, proven ───────────────────────────────────────────
+    // Parent waits on hb with a 5 s deadline it must NOT reach; the child
+    // signals hb ~200 ms in, over the fd it inherited. Success means the wait
+    // returned 0 well inside the deadline, which is only possible if the
+    // parent actually parked and something actually woke it.
+    let wake_ok;
+    {
+        let handles_b: [u32; 1] = [hb];
+        let child = fork();
+        if child == 0 {
+            usleep(200_000);
+            let sig_b: [u32; 1] = [hb];
+            let mut sb = DrmSyncobjArray {
+                handles: sig_b.as_ptr() as u64,
+                count_handles: 1,
+                pad: 0,
+            };
+            ioctl(fd, DRM_IOCTL_SYNCOBJ_SIGNAL, &mut sb as *mut _);
+            _exit(0);
+        } else if child < 0 {
+            wake_ok = false;
+        } else {
+            let s0 = monotonic_ns();
+            let mut w6 = DrmSyncobjWait {
+                handles: handles_b.as_ptr() as u64,
+                timeout_nsec: (s0 + 5_000_000_000) as i64,
+                count_handles: 1,
+                flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+                first_signaled: 0xFFFF_FFFF,
+                pad: 0,
+            };
+            let rc = ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &mut w6 as *mut _);
+            let waited_ms = (monotonic_ns().saturating_sub(s0)) / 1_000_000;
+            let mut st: c_int = 0;
+            waitpid(child, &mut st as *mut c_int, 0);
+            print_dec(b"  SYNCOBJ_WAKE waited_ms=", waited_ms);
+            wake_ok = rc == 0 && w6.first_signaled == 0 && waited_ms < 4_000;
+        }
+    }
+    if !report(b"SYNCOBJ_WAIT_WOKEN_BY_FORKED_SIGNAL", wake_ok) { failures += 1; }
+
+    // DESTROY retires the handle; destroying it twice is EINVAL.
+    let mut d_a = DrmSyncobjDestroy { handle: ha, pad: 0 };
+    let mut d_b = DrmSyncobjDestroy { handle: hb, pad: 0 };
+    let mut d_c = DrmSyncobjDestroy { handle: hc, pad: 0 };
+    let mut d_again = DrmSyncobjDestroy { handle: ha, pad: 0 };
+    let destroy_ok = ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut d_a as *mut _) == 0
+        && ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut d_b as *mut _) == 0
+        && ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut d_c as *mut _) == 0
+        && ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut d_again as *mut _) == -1
+        && errno() == EINVAL;
+    if !report(b"SYNCOBJ_DESTROY", destroy_ok) { failures += 1; }
+
+    // ── V3D UAPI decode layer (stub backend) ────────────────────────────────
+    //
+    // QEMU models no V3D on any machine type, so none of this can be exercised
+    // against a device. What CAN be exercised — and is, here — is everything
+    // between Mesa and the device: the request codes, the struct layouts, the
+    // parameter values Mesa gates screen creation on, the BO/VA bookkeeping,
+    // and the *shape* of an asynchronous submission. That is roughly half the
+    // ioctl surface, closed before a Pi is on the desk.
+    //
+    // THE BACKEND IS ARMED HERE AND DISARMED AT THE END OF THE BLOCK, on
+    // purpose. It is device-global (it has to be: it changes the
+    // DRM_IOCTL_VERSION identity, which Mesa reads before it has created
+    // anything), and two of the v3d request codes are bit-identical to virtgpu
+    // ones. Leaving it armed would change what every other client on this
+    // machine sees. Every check above this point therefore ran against the
+    // unarmed device, and every check below it does too.
+    {
+        let mut ccap = DrmSetClientCap {
+            capability: DRM_CLIENT_CAP_LEANDROS_V3D,
+            value: 1,
+        };
+        let arm_ok = ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &mut ccap as *mut _) == 0;
+        if !report(b"V3D_ARM", arm_ok) { failures += 1; }
+
+        // ── The Mesa loader handshake ───────────────────────────────────────
+        // `pipe_loader_drm.c:276` reads this name and `:98` plain-`strcmp`s it
+        // against every driver descriptor. Not "starts with", not "contains" —
+        // an unrecognised name silently selects the software backend, which is
+        // the exact failure the virgl lane already paid for with `leandros-drm`.
+        // So the test is byte-exact, including the length.
+        //
+        // `name_len == 3`, the STRLEN, is half the assertion and not a detail.
+        // libdrm's `drmGetVersion` asks once with null pointers, allocates
+        // `name_len + 1`, and passes `name_len` back UNCHANGED on the second
+        // call — so a driver that reports a length including its own NUL and
+        // then guards the copy on that same inflated length happens to work,
+        // while one that mixes the two conventions silently copies nothing.
+        // Checking the reported length here is what pins the convention: this
+        // check failing with the right bytes in the buffer is exactly the bug.
+        //
+        // The two passes are done separately, as libdrm does them, so a driver
+        // that only works when told a generous capacity up front fails here.
+        let mut probe = DrmVersion::default();
+        let probe_ok = ioctl(fd, DRM_IOCTL_VERSION, &mut probe as *mut _) == 0
+            && probe.name_len == 3;
+        let mut vnamebuf = [0u8; 8];
+        let mut vver = DrmVersion::default();
+        vver.name_len = probe.name_len;
+        vver.name = vnamebuf.as_mut_ptr() as u64;
+        let name_ok = probe_ok
+            && ioctl(fd, DRM_IOCTL_VERSION, &mut vver as *mut _) == 0
+            && vver.name_len == 3
+            && vnamebuf[0] == b'v' && vnamebuf[1] == b'3' && vnamebuf[2] == b'd'
+            && vver.version_major == 1;
+        if !report(b"V3D_VERSION_NAME_IS_EXACTLY_V3D", name_ok) { failures += 1; }
+
+        // ── GET_PARAM: the gate on screen creation ──────────────────────────
+        // `v3d_device_info.c:32` hard-fails if CORE0_IDENT0 or IDENT1 errors,
+        // and `v3d_screen.c:796` turns that into a NULL screen. The decode
+        // reproduced here is Mesa's, character for character, so a value that
+        // would make Mesa reject the device fails HERE instead of inside a
+        // driver with no error message.
+        let mut p0 = DrmV3dGetParam { param: V3D_PARAM_CORE0_IDENT0, pad: 0, value: 0 };
+        let mut p1 = DrmV3dGetParam { param: V3D_PARAM_CORE0_IDENT1, pad: 0, value: 0 };
+        let mut p3 = DrmV3dGetParam { param: V3D_PARAM_HUB_IDENT3, pad: 0, value: 0 };
+        let ident_read = ioctl(fd, DRM_IOCTL_V3D_GET_PARAM, &mut p0 as *mut _) == 0
+            && ioctl(fd, DRM_IOCTL_V3D_GET_PARAM, &mut p1 as *mut _) == 0
+            && ioctl(fd, DRM_IOCTL_V3D_GET_PARAM, &mut p3 as *mut _) == 0;
+        let major = ((p0.value >> 24) & 0xff) as u32;
+        let minor = (p1.value & 0xf) as u32;
+        let ver = major * 10 + minor;
+        let vpm_size = (((p1.value >> 28) & 0xf) as u32) * 8192;
+        let nslc = ((p1.value >> 4) & 0xf) as u32;
+        let qups = ((p1.value >> 8) & 0xf) as u32;
+        let qpu_count = nslc * qups;
+        let rev = ((p3.value >> 8) & 0xff) as u32;
+        print_dec(b"  V3D ver=", ver as u64);
+        print_dec(b"  V3D vpm_size=", vpm_size as u64);
+        print_dec(b"  V3D qpu_count=", qpu_count as u64);
+        print_dec(b"  V3D rev=", rev as u64);
+        // ver 71 exactly: Mesa compiles support for 42 and 71 and prints
+        // "V3D %d.%d not supported by this version of Mesa" for anything else.
+        // vpm_size and qpu_count feed real arithmetic (a division in
+        // `vir.c:2456`, a spill-BO size in `v3d_program.c:542`), so zero in
+        // either is a divide-by-zero or a zero-sized allocation later.
+        let ident_ok = ident_read && ver == 71 && vpm_size > 0 && qpu_count > 0;
+        if !report(b"V3D_GET_PARAM_IDENT_IS_COHERENT_V3D_71", ident_ok) { failures += 1; }
+
+        // Feature bits, each of which selects a Mesa code path.
+        let mut feat = [0u64; 5];
+        let feat_ids = [
+            V3D_PARAM_SUPPORTS_TFU,
+            V3D_PARAM_SUPPORTS_CSD,
+            V3D_PARAM_SUPPORTS_PERFMON,
+            V3D_PARAM_SUPPORTS_MULTISYNC_EXT,
+            V3D_PARAM_MAX_PERF_COUNTERS,
+        ];
+        let mut feat_read = true;
+        let mut fi = 0usize;
+        while fi < feat_ids.len() {
+            let mut pf = DrmV3dGetParam { param: feat_ids[fi], pad: 0, value: 0 };
+            if ioctl(fd, DRM_IOCTL_V3D_GET_PARAM, &mut pf as *mut _) != 0 { feat_read = false; }
+            feat[fi] = pf.value;
+            fi += 1;
+        }
+        // MAX_PERF_COUNTERS == 0 is the load-bearing one: non-zero makes
+        // `v3dx_counter.c:41` issue PERFMON_GET_COUNTER, which is ENOSYS, and
+        // `v3d_perfcntrs_init` failing is a hard `goto fail` in screen creation.
+        // MULTISYNC == 0 keeps submits on the flat sync fields instead of an
+        // extension chain.
+        let feat_ok = feat_read
+            && feat[0] == 1  // TFU
+            && feat[1] == 0  // CSD
+            && feat[2] == 0  // PERFMON
+            && feat[3] == 0  // MULTISYNC_EXT
+            && feat[4] == 0; // MAX_PERF_COUNTERS
+        if !report(b"V3D_GET_PARAM_FEATURE_BITS", feat_ok) { failures += 1; }
+
+        // An id we have never heard of is EINVAL, not a successful zero:
+        // `v3d_has_feature` reads the RETURN CODE, so answering 0 successfully
+        // would claim we understood the question.
+        let mut pbad = DrmV3dGetParam { param: 0xDEAD, pad: 0, value: 0 };
+        let param_einval = ioctl(fd, DRM_IOCTL_V3D_GET_PARAM, &mut pbad as *mut _) == -1
+            && errno() == EINVAL;
+        if !report(b"V3D_GET_PARAM_UNKNOWN_EINVAL", param_einval) { failures += 1; }
+
+        // ── CREATE_BO with the size Mesa actually asks for ──────────────────
+        // `v3d_resource.c:113-116` pads EVERY resource: +64 (V3D_TFU_READAHEAD_SIZE)
+        // for a texture, +4 for a PIPE_BUFFER, so the TFU's and `ldunifa`'s
+        // read-ahead cannot run off the last page. A page-sized texture
+        // therefore arrives as 4160 bytes and MUST become a two-page
+        // allocation. This is the common case, not an edge case.
+        const BO_REQ: u32 = 4096 + 64;
+        let mut cbo = DrmV3dCreateBo { size: BO_REQ, flags: 0, handle: 0, offset: 0 };
+        let create_ok = ioctl(fd, DRM_IOCTL_V3D_CREATE_BO, &mut cbo as *mut _) == 0
+            && cbo.handle != 0
+            // "This offset value will always be nonzero, since various HW units
+            // treat 0 specially" — the UAPI header's own promise, which is why
+            // the VA allocator leaves page 0 unallocated.
+            && cbo.offset != 0
+            // The V3D MMU's page size. A BO that did not start on one could not
+            // be mapped independently.
+            && cbo.offset % 4096 == 0;
+        if !report(b"V3D_CREATE_BO_UNROUNDED_SIZE", create_ok) { failures += 1; }
+
+        let mut cbo_bad = DrmV3dCreateBo { size: 4096, flags: 1, handle: 0, offset: 0 };
+        let flags_einval = ioctl(fd, DRM_IOCTL_V3D_CREATE_BO, &mut cbo_bad as *mut _) == -1
+            && errno() == EINVAL;
+        if !report(b"V3D_CREATE_BO_FLAGS_EINVAL", flags_einval) { failures += 1; }
+
+        // GET_BO_OFFSET must answer the SAME address CREATE_BO did, for the
+        // life of the handle — Mesa's BO cache re-reads it rather than
+        // remembering it, and a moving address would be baked into an already
+        // built command list.
+        let mut gbo = DrmV3dGetBoOffset { handle: cbo.handle, offset: 0 };
+        let offset_ok = create_ok
+            && ioctl(fd, DRM_IOCTL_V3D_GET_BO_OFFSET, &mut gbo as *mut _) == 0
+            && gbo.offset == cbo.offset;
+        if !report(b"V3D_GET_BO_OFFSET_MATCHES_CREATE", offset_ok) { failures += 1; }
+
+        // ── MMAP_BO round-trip ──────────────────────────────────────────────
+        // The returned offset is this driver's mmap token (a guest-physical
+        // base), validated on the way back in so a caller cannot map memory the
+        // device never handed out. The sentinel is written at the LAST byte of
+        // the SECOND page, which is the part a one-page allocation would not
+        // have: this is what actually proves the non-round size was rounded UP.
+        let mut mbo = DrmV3dMmapBo { handle: cbo.handle, flags: 0, offset: 0 };
+        let mut map_ok = false;
+        if create_ok && ioctl(fd, DRM_IOCTL_V3D_MMAP_BO, &mut mbo as *mut _) == 0 && mbo.offset != 0 {
+            let span = 8192usize; // two pages: 4160 bytes rounds up to two
+            let p = mmap(core::ptr::null_mut(), span, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, mbo.offset as i64);
+            if p as isize > 0 {
+                let b = p as *mut u8;
+                // Zeroed at creation, so this also checks we do not hand a
+                // client whatever the buddy allocator last had in these pages.
+                let was_zero = *b.add(0) == 0 && *b.add(span - 1) == 0;
+                *b.add(0) = 0x5A;
+                *b.add(span - 1) = 0xA5;
+                map_ok = was_zero && *b.add(0) == 0x5A && *b.add(span - 1) == 0xA5;
+            }
+        }
+        if !report(b"V3D_MMAP_BO_ROUNDTRIP", map_ok) { failures += 1; }
+
+        let mut mbo_bad = DrmV3dMmapBo { handle: 0xDEAD_BEEF, flags: 0, offset: 0 };
+        let mmap_enoent = ioctl(fd, DRM_IOCTL_V3D_MMAP_BO, &mut mbo_bad as *mut _) == -1
+            && errno() == ENOENT;
+        if !report(b"V3D_MMAP_BO_BAD_HANDLE_ENOENT", mmap_enoent) { failures += 1; }
+
+        // ── SUBMIT_CL: the fence must NOT be retired when submit returns ─────
+        //
+        // THE POINT OF THE WHOLE STUB. `TODO.md:3251` records virtgpu signalling
+        // its out-fence at *creation*, which is only correct there because its
+        // submit is a synchronous busy-spin. A stub that copied that would
+        // expose a fence that is never once observably outstanding, and every
+        // consumer built against it would be tested against a shape real
+        // hardware does not have. So: submit, then IMMEDIATELY poll the
+        // out-sync with a zero timeout, and require **ETIME** — the fence is
+        // still in flight. Then wait properly and require it to complete.
+        //
+        // A submit that retired instantly passes every other check in this file
+        // and fails exactly this one.
+        let mut so = DrmSyncobjCreate::default();
+        let so_ok = ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &mut so as *mut _) == 0 && so.handle != 0;
+
+        let bo_list: [u32; 1] = [cbo.handle];
+        let mut sub = DrmV3dSubmitCl::default();
+        sub.bcl_start = cbo.offset;
+        sub.bcl_end = cbo.offset + 64;
+        sub.rcl_start = cbo.offset + 64;
+        sub.rcl_end = cbo.offset + 128;
+        sub.out_sync = so.handle;
+        sub.bo_handles = bo_list.as_ptr() as u64;
+        sub.bo_handle_count = 1;
+        let submit_ok = so_ok && create_ok
+            && ioctl(fd, DRM_IOCTL_V3D_SUBMIT_CL, &mut sub as *mut _) == 0;
+        if !report(b"V3D_SUBMIT_CL", submit_ok) { failures += 1; }
+
+        let so_handles: [u32; 1] = [so.handle];
+        let mut poll_w = DrmSyncobjWait {
+            handles: so_handles.as_ptr() as u64,
+            timeout_nsec: 0,
+            count_handles: 1,
+            flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+            first_signaled: 0,
+            pad: 0,
+        };
+        let outstanding = submit_ok
+            && ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &mut poll_w as *mut _) == -1
+            && errno() == ETIME;
+        if !report(b"V3D_SUBMIT_CL_FENCE_NOT_RETIRED_AT_SUBMIT", outstanding) { failures += 1; }
+
+        // ...and it does retire, without anyone poking it — the deferral is a
+        // real completion path, not a value nothing ever changes. A generous
+        // 2 s deadline; the stub retires within two 100 Hz ticks.
+        let s0 = monotonic_ns();
+        let mut done_w = DrmSyncobjWait {
+            handles: so_handles.as_ptr() as u64,
+            timeout_nsec: (s0 + 2_000_000_000) as i64,
+            count_handles: 1,
+            flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+            first_signaled: 0xFFFF_FFFF,
+            pad: 0,
+        };
+        let retired = submit_ok
+            && ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &mut done_w as *mut _) == 0
+            && done_w.first_signaled == 0;
+        print_dec(b"  V3D fence_retire_ms=", monotonic_ns().saturating_sub(s0) / 1_000_000);
+        if !report(b"V3D_SUBMIT_CL_FENCE_RETIRES_ASYNCHRONOUSLY", retired) { failures += 1; }
+
+        // A handle that names no BO fails the WHOLE submit, before anything is
+        // fenced — upstream's `v3d_lookup_bos` behaviour, and the reason the
+        // list is validated in full before a fence is allocated.
+        let bad_list: [u32; 2] = [cbo.handle, 0xDEAD_BEEF];
+        let mut sub_bad = sub;
+        sub_bad.out_sync = 0;
+        sub_bad.bo_handles = bad_list.as_ptr() as u64;
+        sub_bad.bo_handle_count = 2;
+        let bad_bo_enoent = ioctl(fd, DRM_IOCTL_V3D_SUBMIT_CL, &mut sub_bad as *mut _) == -1
+            && errno() == ENOENT;
+        if !report(b"V3D_SUBMIT_CL_BAD_BO_ENOENT", bad_bo_enoent) { failures += 1; }
+
+        // We advertise SUPPORTS_MULTISYNC_EXT = 0, so an extension chain is
+        // refused rather than silently ignored — ignoring it would drop the
+        // caller's wait/signal dependencies and show up days later as a race.
+        let mut sub_ext = sub;
+        sub_ext.out_sync = 0;
+        sub_ext.bo_handle_count = 0;
+        sub_ext.bo_handles = 0;
+        sub_ext.flags = 0x02; // DRM_V3D_SUBMIT_EXTENSION
+        let ext_einval = ioctl(fd, DRM_IOCTL_V3D_SUBMIT_CL, &mut sub_ext as *mut _) == -1
+            && errno() == EINVAL;
+        if !report(b"V3D_SUBMIT_CL_EXTENSION_EINVAL", ext_einval) { failures += 1; }
+
+        // ── WAIT_BO ─────────────────────────────────────────────────────────
+        // Same two-phase property as the syncobj checks, on the per-BO fence
+        // instead: a fresh submit leaves the BO busy, and `timeout_ns` here is a
+        // RELATIVE duration (upstream v3d runs it through
+        // `nsecs_to_jiffies_timeout`), unlike drm_syncobj_wait's absolute one.
+        // Getting that backwards is a wait that returns instantly forever.
+        let mut sub2 = sub;
+        sub2.out_sync = 0;
+        let submit2_ok = create_ok
+            && ioctl(fd, DRM_IOCTL_V3D_SUBMIT_CL, &mut sub2 as *mut _) == 0;
+        let mut wb0 = DrmV3dWaitBo { handle: cbo.handle, pad: 0, timeout_ns: 0 };
+        let bo_busy = submit2_ok
+            && ioctl(fd, DRM_IOCTL_V3D_WAIT_BO, &mut wb0 as *mut _) == -1
+            && errno() == ETIME;
+        if !report(b"V3D_WAIT_BO_ZERO_TIMEOUT_ETIME_WHILE_BUSY", bo_busy) { failures += 1; }
+
+        let mut wb1 = DrmV3dWaitBo { handle: cbo.handle, pad: 0, timeout_ns: 2_000_000_000 };
+        let bo_wait_ok = submit2_ok
+            && ioctl(fd, DRM_IOCTL_V3D_WAIT_BO, &mut wb1 as *mut _) == 0
+            // Upstream decrements the caller's timeout by the elapsed time on
+            // the way out, so a restarted wait waits only the remainder. It
+            // therefore cannot come back untouched.
+            && wb1.timeout_ns < 2_000_000_000;
+        if !report(b"V3D_WAIT_BO_BLOCKS_THEN_COMPLETES", bo_wait_ok) { failures += 1; }
+
+        // Upstream's `drm_gem_dma_resv_wait` answers EINVAL for a handle that
+        // does not resolve — NOT ENOENT, which is what SUBMIT_CL answers for
+        // the same mistake. The two differ on purpose.
+        let mut wbb = DrmV3dWaitBo { handle: 0xDEAD_BEEF, pad: 0, timeout_ns: 0 };
+        let wait_einval = ioctl(fd, DRM_IOCTL_V3D_WAIT_BO, &mut wbb as *mut _) == -1
+            && errno() == EINVAL;
+        if !report(b"V3D_WAIT_BO_BAD_HANDLE_EINVAL", wait_einval) { failures += 1; }
+
+        // ── The engines that are not implemented ────────────────────────────
+        // ENOSYS explicitly, so a caller can tell "absent" from "broken".
+        let mut tfu = [0u8; 88];
+        let tfu_enosys = ioctl(fd, DRM_IOCTL_V3D_SUBMIT_TFU, tfu.as_mut_ptr()) == -1
+            && errno() == ENOSYS;
+        if !report(b"V3D_SUBMIT_TFU_ENOSYS", tfu_enosys) { failures += 1; }
+
+        let mut pm = [0u8; 40];
+        let pm_enosys = ioctl(fd, DRM_IOCTL_V3D_PERFMON_CREATE, pm.as_mut_ptr()) == -1
+            && errno() == ENOSYS;
+        if !report(b"V3D_PERFMON_CREATE_ENOSYS", pm_enosys) { failures += 1; }
+
+        // ── GEM_CLOSE returns the GPU address space ─────────────────────────
+        // The VA allocator is first-fit over live spans, so a BO created after
+        // the only live one is closed must land back at the same address. A
+        // bump pointer passes every other check here and fails this one — and
+        // would then walk off the end of a 32-bit space in a long session.
+        let mut hclose = cbo.handle;
+        let closed = ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut hclose as *mut u32) == 0;
+        let mut cbo2 = DrmV3dCreateBo { size: BO_REQ, flags: 0, handle: 0, offset: 0 };
+        let recycled = closed && create_ok
+            && ioctl(fd, DRM_IOCTL_V3D_CREATE_BO, &mut cbo2 as *mut _) == 0
+            && cbo2.offset == cbo.offset
+            // A fresh gem handle, though: handles are never reused within a
+            // boot, so a stale one resolves to nothing rather than to somebody
+            // else's buffer.
+            && cbo2.handle != cbo.handle;
+        if !report(b"V3D_GEM_CLOSE_RECYCLES_GPU_VA", recycled) { failures += 1; }
+        if cbo2.handle != 0 {
+            let mut h2 = cbo2.handle;
+            ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut h2 as *mut u32);
+        }
+        if so_ok {
+            let mut dso = DrmSyncobjDestroy { handle: so.handle, pad: 0 };
+            ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut dso as *mut _);
+        }
+
+        // ── Disarm, and prove it took ───────────────────────────────────────
+        // The identity must go back to what every other client on this machine
+        // expects. Leaving the device claiming to be v3d would send the next
+        // Mesa process hunting for a driver that cannot work here.
+        ccap.value = 0;
+        let disarm_ok = ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &mut ccap as *mut _) == 0;
+        let mut vnamebuf2 = [0u8; 32];
+        let mut vver2 = DrmVersion::default();
+        vver2.name_len = vnamebuf2.len();
+        vver2.name = vnamebuf2.as_mut_ptr() as u64;
+        let restored = disarm_ok
+            && ioctl(fd, DRM_IOCTL_VERSION, &mut vver2 as *mut _) == 0
+            // Whatever this device called itself before the block (the name
+            // depends on whether the host negotiated virgl), it is not `v3d`.
+            && !(vnamebuf2[0] == b'v' && vnamebuf2[1] == b'3'
+                 && vnamebuf2[2] == b'd' && vnamebuf2[3] == 0);
+        if !report(b"V3D_DISARM_RESTORES_IDENTITY", restored) { failures += 1; }
+    }
 
     // ── PRIME / dmabuf export + import round-trip (K5) ──────────────────────
     // Export the dumb buffer as a dmabuf fd, mmap that fd, and confirm it

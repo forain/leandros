@@ -126,14 +126,45 @@ struct drm_version {
 fn render_node_version(arg: usize) -> Message {
     if arg == 0 { return err_reply(-22); } // EINVAL
     let v = unsafe { &mut *(arg as *mut drm_version) };
-    // Upstream virtio_gpu's DRIVER_MAJOR/MINOR/PATCHLEVEL.
-    v.version_major = 0;
-    v.version_minor = 1;
-    v.version_patchlevel = 0;
 
-    let name = "virtio_gpu\0";
-    let date = "0\0";
-    let desc = "virtio GPU\0";
+    // WHICH IDENTITY. This function exists only because Venus hard-`strcmp`s
+    // the RENDER node, so it must keep answering `virtio_gpu` on every build
+    // where Venus can work — that is, whenever the v3d backend is not armed.
+    //
+    // When it IS armed the answer has to change here too, and not only on
+    // card0: v3d is a single-device design (Mesa's `v3d_drm_winsys.c:36` passes
+    // `ro == NULL`, so the render node is the whole device, not a companion to a
+    // separate display node), and a render node still calling itself
+    // `virtio_gpu` while card0 says `v3d` would be two drivers on one device.
+    // Nothing armed can be a Venus session, so nothing is taken away.
+    let v3d = drivers::drm_device_interface::v3d_active();
+    if v3d {
+        v.version_major = 1;
+        v.version_minor = 0;
+        v.version_patchlevel = 0;
+    } else {
+        // Upstream virtio_gpu's DRIVER_MAJOR/MINOR/PATCHLEVEL.
+        v.version_major = 0;
+        v.version_minor = 1;
+        v.version_patchlevel = 0;
+    }
+
+    // ⚠ `v3d` must be EXACTLY that: Mesa's pipe loader plain-`strcmp`s this
+    // string (`pipe_loader_drm.c:98`) and silently falls back to software on
+    // anything else — the `leandros-drm` failure the virgl lane already paid
+    // for. Kept byte-for-byte identical to `std_handle_version`'s v3d arm.
+    //
+    // ⚠ NO TRAILING NUL ON THE v3d STRINGS, deliberately — see the long note in
+    // `std_handle_version`. libdrm hands `name_len` back unchanged in its second
+    // pass, so the length this reports and the capacity it guards on must be the
+    // same number. Upstream reports `strlen` and lets the caller terminate; the
+    // `virtio_gpu` triple keeps its historical NUL-inclusive length, because
+    // that is what every client on that path already agrees with.
+    let (name, date, desc) = if v3d {
+        ("v3d", "20180419", "Broadcom V3D graphics")
+    } else {
+        ("virtio_gpu\0", "0\0", "virtio GPU\0")
+    };
 
     // Two-pass contract: the caller first asks with null pointers to learn the
     // lengths, then again with buffers. Always report the lengths; only fill a
@@ -151,6 +182,70 @@ fn render_node_version(arg: usize) -> Message {
     }
     v.desc_len = desc.len();
     ok_reply()
+}
+
+/// Map a `DriverError` to the errno this *particular* ioctl must answer with.
+///
+/// WHY IT IS KEYED ON `cmd`. `DriverError` has seven variants and this seam has
+/// dozens of ioctls; collapsing every failure to -1 was safe precisely because
+/// nothing downstream branched on the value. Two families now do, and each gets
+/// its own table rather than one shared widening:
+///
+///   * DRM master (`Access`/`Busy`/`NotMaster`) — see `DriverError::Access`.
+///   * `DRM_IOCTL_SYNCOBJ_*` — Mesa branches on **ETIME vs ENOENT vs EINVAL**
+///     to decide whether a wait retries, a handle is stale, or the driver
+///     aborts, so the values are the contract. `Busy`->ETIME and `Io`->EINTR
+///     are puns: `drivers/src/lib.rs` has no Timeout/Interrupted variant, and
+///     they are unambiguous only because this arm is reached solely for syncobj
+///     ioctls, no syncobj handler returns either for any other reason, and the
+///     syncobj table is consulted BEFORE the master one.
+///
+/// Everything else keeps the historical -1, deliberately.
+fn drm_errno(cmd: u32, e: drivers::DriverError) -> i32 {
+    use drivers::DriverError as E;
+    if drivers::drm_device_interface::is_syncobj_ioctl(cmd) {
+        return match e {
+            E::InvalidParameter => -22, // EINVAL
+            E::NotFound         => -2,  // ENOENT
+            E::Busy             => -62, // ETIME
+            E::Io               => -4,  // EINTR
+            E::Unsupported      => -38, // ENOSYS
+            _                   => -1,
+        };
+    }
+    // The v3d family, on the same principle and for the same reason: Mesa reads
+    // these values and branches on them. `v3d_bo_wait` retries on **ETIME** and
+    // gives up on anything else; `v3d_screen_create` treats a failed GET_PARAM
+    // as "no such device" and returns a NULL screen; and **ENOSYS** is what
+    // tells a caller that SUBMIT_TFU/SUBMIT_CSD/PERFMON_* are absent rather
+    // than broken, which is the whole point of answering them explicitly.
+    //
+    // `Busy -> ETIME` and `Io -> EINTR` are the same puns the syncobj table
+    // makes, for the same reason — `drivers::DriverError` has no `Timeout` or
+    // `Interrupted` variant and `drivers/src/lib.rs` is owned by another lane —
+    // and they are unambiguous here because this arm is reached only for v3d
+    // ioctls, and no v3d handler returns either for any other reason.
+    //
+    // Consulted AFTER the syncobj table (the two families do not overlap) and
+    // BEFORE the master one. `is_v3d_ioctl` is false whenever the v3d backend is
+    // disarmed, so on a virtio build this table is unreachable and every errno
+    // is exactly what it was.
+    if drivers::drm_device_interface::is_v3d_ioctl(cmd) {
+        return match e {
+            E::InvalidParameter => -22, // EINVAL
+            E::NotFound         => -2,  // ENOENT
+            E::Busy             => -62, // ETIME
+            E::Io               => -4,  // EINTR
+            E::Unsupported      => -38, // ENOSYS
+            _                   => -1,
+        };
+    }
+    match e {
+        E::Access    => -13, // EACCES
+        E::Busy      => -16, // EBUSY
+        E::NotMaster => -22, // EINVAL
+        _            => -1,
+    }
 }
 
 /// Handle DRM device requests
@@ -240,11 +335,9 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             // carried a real errno and widening it wholesale would change the
             // answer to every ioctl at once. The three master errors are
             // explicit because their *values* are the contract — see the note
-            // on `DriverError::Access`.
-            Err(drivers::DriverError::Access)    => err_reply(-13), // EACCES
-            Err(drivers::DriverError::Busy)      => err_reply(-16), // EBUSY
-            Err(drivers::DriverError::NotMaster) => err_reply(-22), // EINVAL
-            Err(_) => err_reply(-1),
+            // on `DriverError::Access`. The syncobj family is the second such
+            // exception, scoped the same way — by ioctl, never wholesale.
+            Err(e) => err_reply(drm_errno(cmd, e)),
         };
 
         serial_debug("[DRM-SRV] handle_ioctl finished, returning\n");
