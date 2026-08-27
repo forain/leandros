@@ -50,37 +50,80 @@ pub unsafe extern "C" fn arch_set_kernel_stack(kst: u64) {
 // Use the definition from sched::context to ensure consistency
 pub use sched::context::UserFrame;
 
-// ── Sync Exception Handlers ──────────────────────────────────────────────────
+// ── IRQ dispatch ─────────────────────────────────────────────────────────────
+//
+// `handle_irq` used to be a hardcoded `if/else` chain over interrupt IDs, which
+// meant every new interrupt-driven driver had to edit this file. It is now a
+// table lookup in `gic`; the built-in handlers below are ordinary registrations
+// with no privileged status, so the V3D driver's SPIs arrive by exactly the
+// path the timer and UART do.
+
+/// Generic timer PPI (virtual or physical).
+///
+/// Reloads the countdown, advances timekeeping and runs the scheduler tick.
+/// A missed registration here is a dead machine, not a failing test, which is
+/// why `gic::init` registers before it enables anything.
+fn timer_irq() {
+    super::timer::on_tick();
+}
+
+/// Reschedule IPI from another CPU.
+///
+/// Deliberately empty: the sender already set this CPU's `PREEMPT_NEEDED`
+/// flag, and the `preempt_check` at the end of `handle_irq` acts on it. An idle
+/// CPU parked in `wfi` is woken by the interrupt's arrival alone.
+fn resched_ipi() {}
+
+/// PL011 UART receive.
+///
+/// Honours the IRQ-context contract in `gic::register_handler`: it reads only
+/// MMIO, hands bytes to the tty/evdev servers' own queues, touches no user
+/// memory, and clears the device condition before returning — required,
+/// because INTID 33 is level-triggered and EOI follows immediately.
+fn uart_irq() {
+    while let Some(b) = unsafe { super::uart::getc() } {
+        // Line-discipline ISIG intercept: ^C/^\/^Z become signals to
+        // the foreground process group instead of input bytes.
+        if tty_server::console_intercept_byte(b) { continue; }
+        evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2);
+        evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
+    }
+    // This is the PRIMARY aarch64 console path, not the tick fallback, so
+    // it flushes its own burst rather than waiting up to 10 ms for the next
+    // tick to do it. No-op unless the burst mode is compiled in.
+    evdev_server::flush_pending_wake();
+    unsafe { super::uart::clear_irq(); }
+}
+
+/// Populate the dispatch table with the interrupts the kernel itself owns.
+///
+/// Called from `gic::init` (BSP) and `gic::init_cpu_interface` (each AP) before
+/// either enables anything, so no interrupt can ever be delivered into an empty
+/// slot. Idempotent — each entry is a single atomic store of the same pointer.
+pub(crate) fn register_builtin_handlers() {
+    use super::gic;
+    gic::register_handler(gic::PPI_VIRT_TIMER, timer_irq);
+    gic::register_handler(gic::PPI_PHYS_TIMER, timer_irq);
+    gic::register_handler(gic::SGI_RESCHED,    resched_ipi);
+    gic::register_handler(gic::SPI_PL011,      uart_irq);
+}
 
 fn handle_irq(_frame: *mut UserFrame) {
     let iar = super::gic::ack();
     let irq_id = super::gic::irq_id(iar);
 
-    if irq_id == 27 || irq_id == 30 {
-        // Virtual or Physical Timer
-        super::timer::on_tick();
-    } else if irq_id == super::gic::SGI_RESCHED {
-        // Reschedule IPI from another CPU.  The sender already set this
-        // CPU's PREEMPT_NEEDED flag; the preempt_check below acts on it.
-        // An idle CPU parked in wfi is woken by the interrupt itself.
-    } else if irq_id == 33 {
-        // PL011 UART
-        while let Some(b) = unsafe { super::uart::getc() } {
-            // Line-discipline ISIG intercept: ^C/^\/^Z become signals to
-            // the foreground process group instead of input bytes.
-            if tty_server::console_intercept_byte(b) { continue; }
-            evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2);
-            evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
-        }
-        // This is the PRIMARY aarch64 console path, not the tick fallback, so
-        // it flushes its own burst rather than waiting up to 10 ms for the next
-        // tick to do it. No-op unless the burst mode is compiled in.
-        evdev_server::flush_pending_wake();
-        unsafe { super::uart::clear_irq(); }
-    } else if irq_id != super::gic::SPURIOUS {
+    if irq_id != super::gic::SPURIOUS && !super::gic::dispatch(irq_id) {
         serial_print_str("\n[EXC] Unhandled IRQ ");
         unsafe { print_number(irq_id); }
         serial_print_str("\n");
+        // Mask an unclaimed SPI rather than leave it armed. Level-triggered
+        // sources stay asserted after EOI, so an unhandled one re-fires
+        // immediately and livelocks this CPU printing the line above forever —
+        // an unrecoverable hang whose only symptom is console spam. Masking it
+        // turns a wedged machine into one diagnostic line. SGIs and PPIs are
+        // excluded by `disable_spi` itself: they are banked per CPU, and the
+        // kernel's own are all registered above.
+        super::gic::disable_spi(irq_id);
     }
 
     super::gic::eoi(iar);
@@ -96,6 +139,8 @@ unsafe extern "C" fn exc_el1_irq_handler(frame: *mut UserFrame) {
 unsafe extern "C" fn exc_el0_irq_handler(frame: *mut UserFrame) {
     handle_irq(frame);
 }
+
+// ── Sync Exception Handlers ──────────────────────────────────────────────────
 
 // POSIX signal numbers (same values as `sched/src/signal.rs` uses; they are
 // architecture-independent).
