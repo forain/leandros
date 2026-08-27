@@ -10,6 +10,14 @@
 set -e
 ARCH="$1"; [ -n "$ARCH" ] || { echo "usage: $0 <x86_64|aarch64>"; exit 2; }
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+# Broadcom V3D (Raspberry Pi 5 / BCM2712, V3D 7.1) is aarch64-only for us, and
+# needs NO LLVM (NIR + Broadcom's own QPU backend), so it costs only compile
+# time. softpipe stays in the list as the QEMU/software fallback: the megadriver
+# holds both and the pipe loader picks by DRM driver name at runtime.
+case "$ARCH" in
+  aarch64) GALLIUM_DRIVERS=softpipe,v3d ;;
+  *)       GALLIUM_DRIVERS=softpipe ;;
+esac
 export PATH="/opt/homebrew/opt/bison/bin:$PATH"                     # modern bison ahead of Apple 2.3
 export PYTHONPATH="$(echo "$ROOT"/.venv/lib/python3.*/site-packages)"  # mako/packaging for meson AND ninja
 cd "$ROOT/src/mesa"
@@ -22,7 +30,7 @@ meson setup "$B" \
   -Dplatforms=wayland \
   -Dlegacy-wayland=bind-wayland-display \
   -Degl=enabled -Dgles2=enabled -Dgbm=enabled -Dopengl=true \
-  -Dglx=disabled -Dgallium-drivers=softpipe -Dvulkan-drivers=[] \
+  -Dglx=disabled -Dgallium-drivers="$GALLIUM_DRIVERS" -Dvulkan-drivers=[] \
   -Dllvm=disabled -Dshared-glapi=enabled -Dglvnd=disabled \
   -Dtools=[] -Dvalgrind=disabled
 ninja -C "$B"

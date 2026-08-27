@@ -157,3 +157,64 @@ Goal 1 (wayland x86_64): DONE. EGL_EXT_platform_wayland present. EGL_WL_bind_way
   off for swrast (compile-opt + runtime dma-buf) — documented above.
 Goal 2 (aarch64): DONE. Toolchain (zig cc -target aarch64-linux-musl) + lld produced clean aarch64 ELF for
   libdrm, libffi, libwayland, and the whole Mesa tree. No aarch64-specific zig/lld blocker encountered.
+
+================================================================================
+# WAVE 3 — v3d (Raspberry Pi 5 / BCM2712, V3D 7.1) gallium driver — BUILDS CLEAN
+Date 2026-08-20. Build workdir: /Users/forain/.claude-forain/jobs/854210c9/tmp/mesa-v3d
+(symlinks src/, host/, sysroot-*, .venv into the surviving wave2 + s3 job trees).
+
+## RESULT: `-Dgallium-drivers=softpipe,v3d` for aarch64 — configure rc=0, ninja rc=0, install rc=0.
+ZERO new blockers. Not one of the wave1/wave2 host fixes had to be re-derived, and
+v3d needed no new fix of its own. 1149 ninja targets, ~37 s wall on the M-series Mac
+(zig's global compilation cache made most non-broadcom objects a hit).
+- Toolchain unchanged: zig 0.16.0 cc/lld, meson 1.11.2, ninja 1.13.2, brew bison 3.8.2,
+  python 3.14.6 + venv (mako/packaging/pyyaml/pyelftools). Same cross ini, same wrappers.
+- The `-Wl,--version-script` wrapper normalisation (UPDATE 7) is still required and still works.
+- v3d needs NO LLVM (NIR + Broadcom's own QPU backend) — confirmed empirically, `-Dllvm=disabled`.
+- src/broadcom/{cle,compiler,qpu,common} compiled clean for aarch64-linux-musl. No musl-isms.
+
+## Artifact deltas vs the July softpipe-only aarch64 ship-set
+  libgallium-25.3.6.so   82,063,600 -> 88,239,608 B   (+6.2 MB, the v3d driver + Broadcom compiler)
+  Everything else byte-for-byte the same set. **DT_NEEDED graph is UNCHANGED** — v3d adds no new
+  external shared-library dependency. Ship-set and musl-libc.so requirement are exactly as WAVE 2.
+Proof v3d is really linked in (July's .so has none of this):
+  - `v3d_driver_descriptor` present in .symtab; `GALLIUM_V3D` defined in build.ninja
+  - V3D_QPU_*/v3d_bo_alloc/v3d_setup_slices/V3D_DEBUG strings present
+  - ELF is aarch64 LSB shared object
+
+## KERNEL CONTRACT the v3d gallium driver imposes on our DRM driver
+1. **The DRM driver name must be exactly `v3d`.** pipe_loader_drm.c:276 calls
+   `loader_get_kernel_driver_name(fd)` (DRM_IOCTL_VERSION `.name`) and pipe_loader_drm.c:98
+   does a plain `strcmp` against `drm_driver_descriptor.driver_name`, which
+   drm_helper.h:13-20 stringifies from the driver token — so `#v3d` == "v3d".
+   Any other name (e.g. "leandros-drm") silently falls through to software. Same class of
+   bug as the virgl lane already hit.
+2. **Screen creation probes DRM_IOCTL_V3D_GET_PARAM before anything else.**
+   v3d_screen.c:797 -> v3d_device_info.c:32 `v3d_get_device_info()` **hard-fails the screen**
+   (returns false -> goto fail) if either V3D_CORE0_IDENT0 or V3D_CORE0_IDENT1 errors.
+   It also reads V3D_HUB_IDENT3, MAX_PERF_COUNTERS, GLOBAL_RESET_COUNTER. `devinfo->ver` is
+   decoded as `major*10 + minor` from IDENT0>>24 and IDENT1&0xf — for V3D 7.1 report
+   major=7, minor=1 so ver==71. VPM size and QPU count come out of IDENT1 bitfields.
+   Then `v3d_perfcntrs_init()` runs and must also succeed.
+3. BO allocation is DRM_IOCTL_V3D_CREATE_BO via `v3d_bo_alloc()`; every non-PIPE_BUFFER
+   resource is over-allocated by `V3D_TFU_READAHEAD_SIZE` = 64 B (v3d_resource.c:113-116,
+   v3d_device_info.h:80) and PIPE_BUFFER by 4 B, to keep ldunifa/TFU prefetch in-bounds.
+   Our CREATE_BO must tolerate these non-round sizes.
+
+## SINGLE-DEVICE (`ro == NULL`) DESIGN — SUPPORTED, see the separate write-up
+Short version: `renderonly` is OPTIONAL and NULL is the *upstream primary* path.
+v3d_drm_winsys.c:36 `v3d_drm_screen_create()` passes **NULL** for `ro`; the renderonly
+variant is a distinct function only ever called from kmsro_drm_winsys.c:118. So one device
+named `v3d` carrying both KMS and render is exactly what the plain pipe loader builds.
+PIPE_BIND_SCANOUT forces linear **unconditionally, independent of `ro`**
+(v3d_resource.c:823-825), and with `ro == NULL` the SCANOUT branch at :847 is skipped and
+allocation falls to the ordinary `v3d_resource_bo_alloc()`. WINSYS_HANDLE_TYPE_KMS then
+returns the v3d GEM handle directly (v3d_resource.c:470) — correct for one device.
+⚠ Linear stride is TIGHTLY PACKED: `slice->stride = level_width * cpp` with no alignment
+for 2D targets (v3d_resource.c:692-695; the align() at :644 is 1D-only). 1920x1080 XRGB8888
+=> stride exactly 7680. Our ADDFB2/scanout path must accept the tight pitch (or blit).
+⚠ If a caller passes an explicit modifier list for a SCANOUT resource, that list MUST
+contain DRM_FORMAT_MOD_LINEAR or the allocation hard-fails with "Unsupported modifier
+requested" (v3d_resource.c:836-839), because should_tile is already false so the UIF
+branch cannot be taken. v3d advertises {BROADCOM_UIF, LINEAR} (v3d_screen.c:634-635),
+so a modifier-aware GBM path is fine as long as our IN_FORMATS includes LINEAR.
