@@ -1563,9 +1563,11 @@ fn sys_call(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
 
 // ── Memory syscalls ───────────────────────────────────────────────────────────
 
-/// Maximum bytes a single sys_map_mem call may request.
-/// Prevents a user task from exhausting the buddy allocator in one call.
+/// Limit eagerly populated file/device mappings per call.
 const MAP_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+/// Anonymous mappings are demand-paged. FluidR3's floating-point sample
+/// bank needs about 283 MiB in one contiguous virtual allocation.
+const ANON_MAP_MAX_BYTES: usize = 512 * 1024 * 1024;
 
 /// Translate Linux `mmap(2)` `prot` bits to kernel `PageFlags`.
 fn prot_to_page_flags(prot: usize) -> PageFlags {
@@ -1603,7 +1605,12 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
 
     let page = mm::buddy::PAGE_SIZE;
     let len  = (len + page - 1) & !(page - 1);
-    if len > MAP_MAX_BYTES { return -22; }
+    let max_bytes = if flags & MAP_ANONYMOUS != 0 {
+        ANON_MAP_MAX_BYTES
+    } else {
+        MAP_MAX_BYTES
+    };
+    if len > max_bytes { return -22; }
 
     let page_flags = prot_to_page_flags(prot);
 

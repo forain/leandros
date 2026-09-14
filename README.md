@@ -179,6 +179,15 @@ Use the top-level build script to compile all targets:
 ./scripts/build-all.sh --raspi4b             # QEMU raspi4b / SDHCI test path
 ```
 
+When the Doom sibling checkout is present, the build downloads the pinned
+[Fluid R3 3.1 SoundFont source archive](https://deb.debian.org/debian/pool/main/f/fluid-soundfont/)
+(about 129 MiB) for General MIDI music. The 142 MiB `FluidR3_GM.sf2`, original
+MIT license (`COPYING`), and attribution (`README`) are cached under
+`${XDG_CACHE_HOME:-$HOME/.cache}/leandros/soundfonts` and installed in
+`/usr/share/soundfonts` on both architectures. Cached files are SHA256-verified;
+subsequent builds need no download. To stage them separately, run
+`python3 scripts/soundfont.py`.
+
 ⚠️ **Important**: Always use release builds — debug builds may hang during early boot due to large stack requirements and symbol desync issues.
 
 ---

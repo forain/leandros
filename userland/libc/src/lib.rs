@@ -22,6 +22,7 @@ pub mod start;
 pub mod process;
 pub mod io;
 pub mod mem;
+pub mod math;
 pub mod string;
 pub mod stdio;
 pub mod errno;

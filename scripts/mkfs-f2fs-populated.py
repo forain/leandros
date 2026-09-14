@@ -7,6 +7,7 @@ import hashlib
 import struct
 import sys
 import os
+import soundfont
 
 BLOCK_SIZE     = 4096
 BLOCKS_PER_SEG = 512       # 2 MB segments (log_blocks_per_seg = 9)
@@ -1484,6 +1485,10 @@ def main():
                       f"the compatibility copy in mkfs is redundant and can go")
             else:
                 _stage_cosmic_default(f"{_theme}/v2/list_button", _v1)
+
+    if any(name == "doom" for name, _path, _mode in bin_files):
+        m4_share_dirs.update(("/usr/share", "/usr/share/soundfonts"))
+        m4_share_files.extend(soundfont.packaged_files())
 
     # 2. Dynamically calculate required blocks and image size
     # Each meta segment takes 512 blocks. We have 8 meta segments (4096 blocks).

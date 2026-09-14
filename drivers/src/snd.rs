@@ -108,7 +108,7 @@ struct VirtioUsedElem { id: u32, len: u32 }
 struct VirtioUsed { flags: u16, idx: u16, ring: [VirtioUsedElem; QUEUE_SIZE], avail_event: u16 }
 
 struct VirtQueue {
-    id: u16, notify_off: u16,
+    id: u16, notify_off: u16, size: u16,
     desc: *mut VirtioDesc, avail: *mut VirtioAvail, used: *mut VirtioUsed,
     last_avail_idx: u16, last_used_idx: u16, free_head: u16, num_free: u16,
 }
@@ -178,9 +178,13 @@ impl VirtioSnd {
         self.write_common_32(8, 0); // Feature selector 0
         self.write_common_32(12, 0); // Reject all features in selector 0
         
-        self.write_common_32(8, 1); // Feature selector 1
+        // Device and driver feature selectors are separate registers.
+        // Modern PCI notifications require VERSION_1 to be negotiated.
+        self.write_common_32(0, 1); // Device feature selector 1
         let f1 = self.read_common_32(4);
-        self.write_common_32(12, f1 & 1); // Accept VERSION_1
+        if f1 & 1 == 0 { return Err(DriverError::Unsupported); }
+        self.write_common_32(8, 1); // Driver feature selector 1
+        self.write_common_32(12, 1); // Accept VERSION_1
         
         status |= 8; // FEATURES_OK
         self.write_common_8(20, status);
@@ -197,25 +201,26 @@ impl VirtioSnd {
 
     unsafe fn init_vq(&mut self, qid: u16) -> Result<(), DriverError> {
         self.write_common_16(22, qid);
-        if self.read_common_16(24) == 0 { return Err(DriverError::Unsupported); }
+        let size = self.read_common_16(24).min(QUEUE_SIZE as u16);
+        if size < 3 || !size.is_power_of_two() { return Err(DriverError::Unsupported); }
         let phys = buddy::alloc(1).ok_or(DriverError::Io)?;
         let virt = phys_to_virt(phys);
         let desc = virt as *mut VirtioDesc;
-        let avail = (virt + 16 * QUEUE_SIZE) as *mut VirtioAvail;
-        let used = leandros_lib::align_up(virt + 16 * QUEUE_SIZE + 6 + 2 * QUEUE_SIZE, 4) as *mut VirtioUsed;
+        let avail = (virt + 16 * size as usize) as *mut VirtioAvail;
+        let used = leandros_lib::align_up(virt + 16 * size as usize + 6 + 2 * size as usize, 4) as *mut VirtioUsed;
         core::ptr::write_bytes(virt as *mut u8, 0, 8192);
-        for i in 0..QUEUE_SIZE as u16 {
-            (*desc.add(i as usize)).next = (i + 1) % QUEUE_SIZE as u16;
+        for i in 0..size {
+            (*desc.add(i as usize)).next = (i + 1) % size;
             (*desc.add(i as usize)).flags = 0;
         }
-        self.write_common_16(24, QUEUE_SIZE as u16);
+        self.write_common_16(24, size);
         self.write_common_64(32, phys as u64);
         self.write_common_64(40, (phys + (avail as usize - virt)) as u64);
         self.write_common_64(48, (phys + (used as usize - virt)) as u64);
         self.write_common_16(28, 1);
         self.vqs[qid as usize] = Some(VirtQueue {
-            id: qid, notify_off: self.read_common_16(30), desc, avail, used,
-            last_avail_idx: 0, last_used_idx: 0, free_head: 0, num_free: QUEUE_SIZE as u16,
+            id: qid, notify_off: self.read_common_16(30), size, desc, avail, used,
+            last_avail_idx: 0, last_used_idx: 0, free_head: 0, num_free: size,
         });
         Ok(())
     }
@@ -268,6 +273,9 @@ impl VirtioSnd {
     unsafe fn read_common_8(&self, o: usize) -> u8 { core::ptr::read_volatile((self.common_cfg+o) as *const u8) }
 
     pub fn reconfigure_stream(&mut self, stream_id: u32, freq: u32, channels: u8) {
+        self.stream_active = false;
+        self.stream_started = false;
+        if !self.initialized { return; }
         let rate = match freq { 11025=>2, 22050=>4, 44100=>6, 48000=>7, _=>6 };
         pci::serial_debug("[SND] reconfigure: freq=");
         pci::serial_debug_hex(freq);
@@ -283,15 +291,22 @@ impl VirtioSnd {
         // just returns BAD_MSG which is harmless. Gating this on
         // stream_active leaves the stream in an undefined state when our
         // bookkeeping disagrees with the device.
-        self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_STOP }, stream_id });
-        self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_RELEASE }, stream_id });
+        for code in [VIRTIO_SND_R_PCM_STOP, VIRTIO_SND_R_PCM_RELEASE] {
+            if self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code }, stream_id }) == u32::MAX {
+                return;
+            }
+        }
 
         let s1 = self.send_control_cmd(&VirtioSndPcmSetParams {
             hdr: VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_SET_PARAMS }, stream_id },
             buffer_bytes: 65536, period_bytes: 4096, features: 0, channels, format: VIRTIO_SND_PCM_FMT_S16, rate, padding: 0,
         });
-        let s2 = self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_PREPARE }, stream_id });
-        let s3 = self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_START }, stream_id });
+        let s2 = if s1 == VIRTIO_SND_S_OK {
+            self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_PREPARE }, stream_id })
+        } else { u32::MAX };
+        let s3 = if s2 == VIRTIO_SND_S_OK {
+            self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_START }, stream_id })
+        } else { u32::MAX };
 
         // START must be sent HERE, before any TX buffers are queued: QEMU
         // does not reliably move buffers submitted on a merely-PREPARE'd
@@ -384,6 +399,15 @@ impl VirtioSnd {
             vq_id = vq.id;
             notify_off = vq.notify_off;
             unsafe {
+                // A timed-out request still belongs to the device. Do not
+                // overwrite its shared command/status buffers until returned.
+                let used = core::ptr::read_volatile(&(*vq.used).idx);
+                atomic::fence(Ordering::Acquire);
+                while vq.last_used_idx != used {
+                    vq.last_used_idx = vq.last_used_idx.wrapping_add(1);
+                    vq.num_free += 2;
+                }
+                if vq.last_avail_idx != vq.last_used_idx { return u32::MAX; }
                 core::ptr::copy_nonoverlapping(cmd as *const T as *const u8, (*self.persistent).ctrl_cmd.as_mut_ptr(), core::mem::size_of::<T>());
                 core::ptr::write_volatile(&mut (*self.persistent).ctrl_status.code, 0xFFFF);
                 let h = vq.free_head;
@@ -394,7 +418,7 @@ impl VirtioSnd {
                 (*d2).addr = virt_to_phys(&(*self.persistent).ctrl_status as *const _ as usize) as u64;
                 (*d2).len = 4; (*d2).flags = 2;
                 vq.free_head = (*d2).next; vq.num_free -= 2;
-                (*vq.avail).ring[vq.last_avail_idx as usize % QUEUE_SIZE] = h;
+                (*vq.avail).ring[vq.last_avail_idx as usize % vq.size as usize] = h;
                 vq.last_avail_idx = vq.last_avail_idx.wrapping_add(1);
                 atomic::fence(Ordering::SeqCst);
                 core::ptr::write_volatile(&mut (*vq.avail).idx, vq.last_avail_idx);
@@ -418,6 +442,7 @@ impl VirtioSnd {
                 vq.last_used_idx = vq.last_used_idx.wrapping_add(1);
                 vq.num_free += 2;
             }
+            atomic::fence(Ordering::Acquire);
             let s = core::ptr::read_volatile(&(*self.persistent).ctrl_status.code);
             pci::rdebug_hex(s); pci::rdebug("\n");
             s
@@ -426,12 +451,13 @@ impl VirtioSnd {
 
     /// Non-blocking PCM transmission. Returns bytes actually queued.
     pub fn send_pcm_data(&mut self, data: &[u8]) -> usize {
-        if !self.initialized { return 0; }
+        if !self.initialized || !self.stream_active { return 0; }
         
         let dbg_first = !self.dbg_first_completion;
         let vq = self.vqs[2].as_mut().unwrap();
         // Reclaim processed descriptors
         let used = unsafe { core::ptr::read_volatile(&(*vq.used).idx) };
+        atomic::fence(Ordering::Acquire);
         if dbg_first && vq.last_used_idx != used {
             let slot = vq.last_used_idx as usize % QUEUE_SIZE;
             let st = unsafe { core::ptr::read_volatile(&(*self.persistent).tx_status[slot].status) };
@@ -481,7 +507,7 @@ impl VirtioSnd {
             (*d3).len = 8; (*d3).flags = 2;
             
             vq.free_head = (*d3).next; vq.num_free -= 3;
-            (*vq.avail).ring[vq.last_avail_idx as usize % QUEUE_SIZE] = h;
+            (*vq.avail).ring[vq.last_avail_idx as usize % vq.size as usize] = h;
             vq.last_avail_idx = vq.last_avail_idx.wrapping_add(1);
             atomic::fence(Ordering::SeqCst);
             core::ptr::write_volatile(&mut (*vq.avail).idx, vq.last_avail_idx);

@@ -11,3 +11,4 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 ipc = { path = "../../ipc", default-features = false }
+libm = "0.2.16"

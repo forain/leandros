@@ -461,6 +461,11 @@ LIMINE_DIR="$LIMINE_CACHE_DIR/limine-$LIMINE_VERSION-binary"
 
 build_input_stack_shims
 
+# Doom's General MIDI music uses the same pinned SoundFont on both CPUs.
+if [[ -d "$ROOT_DIR/../doomgeneric" ]]; then
+    python3 "$ROOT_DIR/scripts/soundfont.py"
+fi
+
 # Determine architectures to build
 if [[ "$ARCH" == "both" ]]; then
     ARCHS=("aarch64" "x86_64")
