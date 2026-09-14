@@ -20,18 +20,36 @@
 //! plus SPI 33 (PL011). PPI #30, the physical timer, is dispatched too but
 //! never enabled by us; firmware can leave it armed.
 //!
-//! **All three targets are GICv2.** `scripts/run-qemu.sh:161` pins the virt
-//! board to `-machine virt,gic-version=2`, and both Pi boards carry a GIC-400,
-//! which *is* a GICv2 implementation. That is not a convenience assumption we
-//! could relax later in one place: acknowledge and EOI here go through the
-//! memory-mapped CPU interface (`GICC_IAR`/`GICC_EOIR`), which GICv3 replaces
-//! wholesale with the `ICC_*` system registers. A GICv3 port would therefore
-//! rewrite `ack`/`eoi`/`init` as well as the affinity routing — so `enable_spi`
-//! deliberately programs only the GICv2 `GICD_ITARGETSR` 8-bit CPU mask rather
-//! than pretending to abstract over a `GICD_IROUTER` path that nothing else in
-//! this file could survive.
+//! **Both Pi boards are GICv2** (a GIC-400), and on those builds this file is
+//! GICv2 only. **QEMU virt is GICv2 or GICv3 depending on `gic-version=`**,
+//! and since QEMU 11.1 HVF on Apple Silicon refuses to launch a GICv2 machine
+//! at all, so the virt build detects the version at `init` and drives either.
 //!
-//! Ref: ARM GIC Architecture Specification v2.0
+//! The two differ in exactly the places this file touches, and nowhere else:
+//!
+//! * **Acknowledge / EOI.** GICv2 goes through the memory-mapped CPU
+//!   interface (`GICC_IAR` / `GICC_EOIR`); GICv3 replaces that wholesale with
+//!   the `ICC_*` system registers (`ICC_IAR1_EL1` / `ICC_EOIR1_EL1`), which
+//!   must first be switched on through `ICC_SRE_EL1` — and, if the kernel was
+//!   entered at EL2, through `ICC_SRE_EL2` before the drop (see
+//!   `entry_aarch64.s` and the AP stub in `smp.rs`).
+//! * **Per-CPU interrupts.** GICv2 banks the SGI/PPI words of the distributor
+//!   per CPU; GICv3 moves them into a per-CPU *redistributor* frame, found by
+//!   matching `GICR_TYPER`'s affinity against this CPU's `MPIDR_EL1`, and a
+//!   sleeping redistributor must be woken (`GICR_WAKER`) before it forwards
+//!   anything.
+//! * **SPI routing.** GICv2's `GICD_ITARGETSR` is an 8-bit CPU mask; GICv3
+//!   with affinity routing enabled (`GICD_CTLR.ARE`) ignores it and reads a
+//!   64-bit `GICD_IROUTER[n]` holding an affinity value instead.
+//! * **SGIs.** `GICD_SGIR` becomes `ICC_SGI1R_EL1`, targeted by affinity.
+//!
+//! Everything else — enable/disable/pending/priority/config arrays, the
+//! `ITLinesNumber` field, the spurious ID 1023 — has the same layout in both,
+//! and the dispatch table below is version-agnostic. Only four interrupts are
+//! consumed in the whole kernel (PPI 27/30, SGI 1, SPI 33; every virtio device
+//! is polled), no MSI is ever allocated, and so no ITS is needed.
+//!
+//! Ref: ARM GIC Architecture Specification v2.0; ARM IHI 0069 (GICv3/v4).
 
 #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 pub const GICD_BASE: usize = 0x0800_0000;
@@ -48,6 +66,18 @@ pub const GICD_BASE: usize = 0xFF84_1000;
 #[cfg(feature = "raspi4b")]
 pub const GICC_BASE: usize = 0xFF84_2000;
 
+/// GICv3 layout on QEMU virt. The distributor is a 64 KiB frame there (GICv2
+/// used 4 KiB): `GICD_IROUTER` starts at 0x6100 and the ID registers sit at
+/// 0xFFD0+, so the virt build maps the whole frame. Redistributors start at
+/// `GICR_BASE`, one `GICR_STRIDE` (RD frame + SGI frame, 64 KiB each) per CPU.
+/// `lib.rs` maps `GICR_MAX_FRAMES` of them, matching `smp::MAX_CPUS`.
+#[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
+pub const GICD_SIZE: usize = 0x1_0000;
+#[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
+pub const GICR_BASE: usize = 0x080A_0000;
+pub const GICR_STRIDE: usize = 0x2_0000;
+pub const GICR_MAX_FRAMES: usize = 8;
+
 // Distributor register offsets.
 //
 // Every register this driver touches lives inside the first 4 KiB of the
@@ -63,6 +93,23 @@ const GICD_IPRIORITYR:  usize = 0x400; // priority    (1 byte / IRQ)
 const GICD_ITARGETSR:   usize = 0x800; // target CPUs (1 byte / IRQ)
 const GICD_ICFGR:       usize = 0xC00; // configuration (2 bits / IRQ)
 const GICD_SGIR:        usize = 0xF00; // software-generated interrupt register
+// GICv3-only distributor registers.
+const GICD_IGROUPR:     usize = 0x080; // interrupt group (1 bit / IRQ; 1 = Group 1)
+const GICD_IROUTER:     usize = 0x6100; // affinity routing (8 bytes / SPI), ARE=1 only
+const GICD_PIDR2_V2:    usize = 0xFE8; // GICv2 location; ArchRev in bits [7:4] (v3 keeps it at 0xFFE8)
+const GICD_CTLR_ARE:    u32 = 1 << 4;  // affinity routing enable (ARE / ARE_NS)
+const GICD_CTLR_RWP:    u32 = 1 << 31; // register write pending
+
+// GICv3 redistributor: RD frame, then the SGI frame 64 KiB above it.
+const GICR_CTLR:        usize = 0x000;
+const GICR_TYPER:       usize = 0x008; // 64-bit; [63:32] affinity, bit 4 Last
+const GICR_WAKER:       usize = 0x014; // bit 1 ProcessorSleep, bit 2 ChildrenAsleep
+const GICR_CTLR_RWP:    u32 = 1 << 3;
+const GICR_SGI_BASE:    usize = 0x1_0000;
+const GICR_IGROUPR0:    usize = 0x080;
+const GICR_ISENABLER0:  usize = 0x100;
+const GICR_ICENABLER0:  usize = 0x180;
+const GICR_IPRIORITYR:  usize = 0x400;
 
 /// SGI used as the cross-CPU reschedule IPI.
 pub const SGI_RESCHED: u32 = 1;
@@ -118,6 +165,196 @@ unsafe fn gicc_r32(off: usize) -> u32 {
 unsafe fn gicc_w32(off: usize, v: u32) {
     let base = mm::phys_to_virt(GICC_BASE);
     ((base + off) as *mut u32).write_volatile(v)
+}
+unsafe fn gicd_w64(off: usize, v: u64) {
+    let base = mm::phys_to_virt(GICD_BASE);
+    ((base + off) as *mut u64).write_volatile(v)
+}
+/// `rd` is a redistributor frame's *virtual* base (see `own_redistributor`).
+unsafe fn gicr_r32(rd: usize, off: usize) -> u32 { ((rd + off) as *const u32).read_volatile() }
+unsafe fn gicr_w32(rd: usize, off: usize, v: u32) { ((rd + off) as *mut u32).write_volatile(v) }
+unsafe fn gicr_r64(rd: usize, off: usize) -> u64 { ((rd + off) as *const u64).read_volatile() }
+
+// ── GICv3 mode ────────────────────────────────────────────────────────────
+//
+// Decided once by the BSP in `init`, read on every interrupt by `ack`/`eoi`.
+// A relaxed load: the APs are started by CPU_ON strictly after `init` returns,
+// and the BSP's own first interrupt cannot arrive before `init` unmasks it.
+
+use core::sync::atomic::AtomicBool;
+
+static V3: AtomicBool = AtomicBool::new(false);
+
+/// Packed affinity of the BSP in `GICD_IROUTER` layout (Aff3 at [39:32],
+/// Aff2/1/0 at [23:0]). Every SPI is routed here, matching the GICv2 path's
+/// `SPI_TARGET_CPU_MASK = 0x01`.
+static BSP_ROUTE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub fn is_v3() -> bool { V3.load(Ordering::Relaxed) }
+
+/// The `ICC_*` system registers by encoding rather than name, so the kernel's
+/// own target features (a softfloat build, see `project_aarch64_kernel_fpsimd`)
+/// never decide whether the assembler accepts them.
+mod icc {
+    macro_rules! sysreg {
+        ($name:ident, $enc:literal) => {
+            #[allow(dead_code)]
+            pub mod $name {
+                #[inline(always)]
+                pub unsafe fn read() -> u64 {
+                    let v: u64;
+                    core::arch::asm!(concat!("mrs {}, ", $enc), out(reg) v, options(nomem, nostack));
+                    v
+                }
+                #[inline(always)]
+                pub unsafe fn write(v: u64) {
+                    core::arch::asm!(concat!("msr ", $enc, ", {}"), in(reg) v, options(nomem, nostack));
+                }
+            }
+        };
+    }
+    sysreg!(sre_el1,    "S3_0_C12_C12_5"); // ICC_SRE_EL1
+    sysreg!(pmr_el1,    "S3_0_C4_C6_0");   // ICC_PMR_EL1
+    sysreg!(igrpen1_el1,"S3_0_C12_C12_7"); // ICC_IGRPEN1_EL1
+    sysreg!(iar1_el1,   "S3_0_C12_C12_0"); // ICC_IAR1_EL1
+    sysreg!(eoir1_el1,  "S3_0_C12_C12_1"); // ICC_EOIR1_EL1
+    sysreg!(sgi1r_el1,  "S3_0_C12_C11_5"); // ICC_SGI1R_EL1
+}
+
+#[inline(always)]
+unsafe fn isb() { core::arch::asm!("isb", options(nomem, nostack)); }
+
+fn read_mpidr() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) v, options(nomem, nostack)); }
+    v
+}
+
+/// `MPIDR_EL1` → the 32-bit affinity value `GICR_TYPER[63:32]` reports
+/// (Aff3:Aff2:Aff1:Aff0, one byte each).
+fn mpidr_to_typer_affinity(mpidr: u64) -> u32 {
+    ((mpidr & 0x00FF_FFFF) | ((mpidr >> 32 & 0xFF) << 24)) as u32
+}
+
+/// `MPIDR_EL1` → `GICD_IROUTER` layout (Aff3 at [39:32], Aff2:Aff1:Aff0 at [23:0]).
+fn mpidr_to_irouter(mpidr: u64) -> u64 {
+    (mpidr & 0x00FF_FFFF) | (mpidr & 0xFF_0000_0000)
+}
+
+/// Is this a GICv3? Virt build only; both Pi boards are GIC-400 by construction.
+///
+/// A functional probe rather than an ID register: write `GICD_CTLR.ARE` (with
+/// both group enables clear, the only state in which the spec allows ARE to
+/// change) and read it back. On every GICv2 that bit is reserved, RAZ/WI —
+/// QEMU's `arm_gic` keeps only the two enable bits, and the GIC-400 TRM lists
+/// it reserved — so it reads back 0. On a GICv3 it sticks, and it is the very
+/// bit `init_dist_v3` needs set anyway, so the probe costs nothing.
+///
+/// The obvious alternatives are both wrong here. `ID_AA64PFR0_EL1.GIC` is 0
+/// under HVF with `-cpu host` (QEMU masks it, since the Apple in-kernel GIC
+/// bypasses the CPU-interface model that would set it) — measured, and the
+/// reason this is not the ID check. `GICD_PIDR2` sits at 0xFFE8 on v3 but
+/// 0xFE8 on v2, and reading the v3 offset on a QEMU GICv2 board lands in an
+/// unassigned hole above its 4 KiB frame, which TCG turns into an external
+/// abort. The v2-offset value is still logged for the record.
+#[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
+fn detect_v3() -> bool {
+    let pfr0: u64;
+    unsafe { core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack)); }
+    let (pidr2_v2, ctlr) = unsafe {
+        let pidr2_v2 = gicd_r32(GICD_PIDR2_V2);
+        gicd_w32(GICD_CTLR, GICD_CTLR_ARE);
+        gicd_wait_rwp();
+        (pidr2_v2, gicd_r32(GICD_CTLR))
+    };
+    let v3 = ctlr & GICD_CTLR_ARE != 0;
+    crate::uart::serial_print_str("[GIC] ID_AA64PFR0.GIC=");
+    crate::uart::print_hex(((pfr0 >> 24) & 0xF) as usize);
+    crate::uart::serial_print_str(" PIDR2@0xFE8=");
+    crate::uart::print_hex(pidr2_v2 as usize);
+    crate::uart::serial_print_str(" GICD_CTLR after ARE write=");
+    crate::uart::print_hex(ctlr as usize);
+    crate::uart::serial_print_str(if v3 { " -> GICv3\n" } else { " -> GICv2\n" });
+    v3
+}
+#[cfg(any(feature = "rpi5", feature = "raspi4b"))]
+fn detect_v3() -> bool { false }
+
+/// Spin until the distributor has absorbed a `GICD_CTLR` write. Bounded so a
+/// misdetected controller degrades to a slow boot, not a silent hang.
+unsafe fn gicd_wait_rwp() {
+    for _ in 0..1_000_000 {
+        if gicd_r32(GICD_CTLR) & GICD_CTLR_RWP == 0 { return; }
+    }
+    crate::uart::serial_print_str("[GIC] GICD_CTLR.RWP never cleared\n");
+}
+
+unsafe fn gicr_wait_rwp(rd: usize) {
+    for _ in 0..1_000_000 {
+        if gicr_r32(rd, GICR_CTLR) & GICR_CTLR_RWP == 0 { return; }
+    }
+    crate::uart::serial_print_str("[GIC] GICR_CTLR.RWP never cleared\n");
+}
+
+/// Virtual base of this CPU's redistributor frame, found by walking the
+/// region and matching `GICR_TYPER`'s affinity to our `MPIDR_EL1`. `None` if
+/// the walk hits the Last frame without a match — a CPU the GIC cannot see.
+#[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
+unsafe fn own_redistributor() -> Option<usize> {
+    let want = mpidr_to_typer_affinity(read_mpidr());
+    for i in 0..GICR_MAX_FRAMES {
+        let rd = mm::phys_to_virt(GICR_BASE + i * GICR_STRIDE);
+        let typer = gicr_r64(rd, GICR_TYPER);
+        if (typer >> 32) as u32 == want { return Some(rd); }
+        if typer & (1 << 4) != 0 { break; } // Last
+    }
+    None
+}
+#[cfg(any(feature = "rpi5", feature = "raspi4b"))]
+unsafe fn own_redistributor() -> Option<usize> { None }
+
+/// GICv3 per-CPU bring-up: wake this CPU's redistributor, enable its PPI 27 and
+/// SGI 1 there, then switch on the system-register CPU interface. Run by the
+/// BSP from `init` and by every AP from `init_cpu_interface`.
+unsafe fn init_cpu_v3() {
+    let Some(rd) = own_redistributor() else {
+        crate::uart::serial_print_str("[GIC] no redistributor matches MPIDR ");
+        crate::uart::print_hex(read_mpidr() as usize);
+        crate::uart::serial_print_str("\n");
+        return;
+    };
+
+    // Wake: clear ProcessorSleep, wait for ChildrenAsleep to drop.
+    gicr_w32(rd, GICR_WAKER, gicr_r32(rd, GICR_WAKER) & !(1 << 1));
+    for _ in 0..1_000_000 {
+        if gicr_r32(rd, GICR_WAKER) & (1 << 2) == 0 { break; }
+    }
+
+    let sgi = rd + GICR_SGI_BASE;
+    // Everything per-CPU is Group 1 (the group ICC_IGRPEN1_EL1 enables and
+    // IAR1/EOIR1 serve); mask all first so the enables below are the only
+    // thing that opens the gate.
+    gicr_w32(sgi, GICR_ICENABLER0, 0xFFFF_FFFF);
+    gicr_wait_rwp(rd);
+    gicr_w32(sgi, GICR_IGROUPR0, 0xFFFF_FFFF);
+    for id in [PPI_VIRT_TIMER, SGI_RESCHED] {
+        let off   = GICR_IPRIORITYR + (id as usize / 4) * 4;
+        let shift = (id % 4) * 8;
+        let v = (gicr_r32(sgi, off) & !(0xFF << shift)) | (IRQ_PRIORITY << shift);
+        gicr_w32(sgi, off, v);
+    }
+    gicr_w32(sgi, GICR_ISENABLER0, (1 << PPI_VIRT_TIMER) | (1 << SGI_RESCHED));
+    dsb_st();
+
+    // CPU interface: system registers on (SRE), accept every priority, Group 1
+    // enabled. The isb after SRE is what makes the rest of the ICC_* space
+    // accessible at all.
+    icc::sre_el1::write(icc::sre_el1::read() | 1);
+    isb();
+    icc::pmr_el1::write(0xFF);
+    icc::igrpen1_el1::write(1);
+    isb();
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -330,7 +567,12 @@ fn enable_spi_configured(id: u32, edge: bool) {
     unsafe {
         gicd_set_cfg(id, edge);
         gicd_set_byte_field(GICD_IPRIORITYR, id, IRQ_PRIORITY);
-        gicd_set_byte_field(GICD_ITARGETSR,  id, SPI_TARGET_CPU_MASK);
+        if is_v3() {
+            // ARE=1: ITARGETSR is ignored; IROUTER carries the target affinity.
+            gicd_w64(GICD_IROUTER + id as usize * 8, BSP_ROUTE.load(Ordering::Relaxed));
+        } else {
+            gicd_set_byte_field(GICD_ITARGETSR,  id, SPI_TARGET_CPU_MASK);
+        }
         dsb_st();
         gicd_w32(GICD_ISENABLER0 + (id as usize / 32) * 4, 1 << (id % 32));
         dsb_st();
@@ -353,12 +595,40 @@ pub fn disable_spi(id: u32) {
 }
 
 /// Initialise GICv2 and enable PPI #27 (EL1 virtual timer).
+/// GICv3 distributor bring-up, BSP only. Affinity routing on, every SPI in
+/// Group 1, then enable.
+///
+/// `GICD_CTLR`'s bit assignments depend on `DS` (Disable Security): with DS=1
+/// (QEMU virt, `secure=off`) bit 0 is EnableGrp0 and bit 1 EnableGrp1NS; from
+/// the Non-secure view of a DS=0 controller bit 0 is EnableGrp1 and bit 1
+/// EnableGrp1A. Setting both low bits plus ARE is correct under either reading
+/// — an enabled Group 0 with nothing configured in it delivers nothing.
+unsafe fn init_dist_v3() {
+    gicd_w32(GICD_CTLR, GICD_CTLR_ARE);
+    gicd_wait_rwp();
+    let words = (num_irqs_implemented() / 32) as usize;
+    for w in 1..words { // word 0 is SGIs/PPIs, owned by the redistributors
+        gicd_w32(GICD_IGROUPR + w * 4, 0xFFFF_FFFF);
+    }
+    gicd_w32(GICD_CTLR, GICD_CTLR_ARE | 0b11);
+    gicd_wait_rwp();
+    dsb_st();
+}
+
 pub fn init() {
     // Claim the built-in interrupts before anything can be delivered. IRQs are
     // still masked at EL1 here (`timer::init` does the `daifclr` afterwards),
     // but doing this first also means the distributor is never enabled with an
     // empty table.
     super::exception::register_builtin_handlers();
+
+    if detect_v3() {
+        V3.store(true, Ordering::Release);
+        BSP_ROUTE.store(mpidr_to_irouter(read_mpidr()), Ordering::Release);
+        unsafe { init_dist_v3(); init_cpu_v3(); }
+        enable_spi(SPI_PL011);
+        return;
+    }
 
     unsafe {
         // Enable distributor.
@@ -399,6 +669,11 @@ pub fn init_cpu_interface() {
     // covered — the cost is a handful of stores, once per CPU.
     super::exception::register_builtin_handlers();
 
+    if is_v3() {
+        unsafe { init_cpu_v3(); }
+        return;
+    }
+
     unsafe {
         // Banked per-CPU enables: virtual timer PPI 27 + reschedule SGI 1.
         gicd_w32(GICD_ISENABLER0, (1 << PPI_VIRT_TIMER) | (1 << SGI_RESCHED));
@@ -418,6 +693,27 @@ pub fn init_cpu_interface() {
 /// GICD_SGIR layout: [25:24] target-list filter (0 = use CPU target list),
 /// [23:16] CPU target list bitmask, [3:0] SGI ID.
 pub fn send_sgi(cpu: usize, sgi_id: u32) {
+    if is_v3() {
+        // ICC_SGI1R_EL1: Aff3 [55:48], Aff2 [39:32], INTID [27:24],
+        // Aff1 [23:16], TargetList [15:0] — one bit per Aff0 within the
+        // (Aff3,Aff2,Aff1) cluster. The target's MPIDR comes from what it
+        // recorded at entry; a CPU that has not recorded one yet is addressed
+        // as Aff0 = index in cluster 0, which is what QEMU virt reports.
+        let mpidr = super::smp::mpidr_of(cpu).unwrap_or(cpu as u64);
+        let aff0 = mpidr & 0xFF;
+        if aff0 >= 16 { return; }
+        let v = ((mpidr >> 32) & 0xFF) << 48
+              | ((mpidr >> 16) & 0xFF) << 32
+              | ((sgi_id as u64) & 0xF) << 24
+              | ((mpidr >> 8) & 0xFF) << 16
+              | 1u64 << aff0;
+        unsafe {
+            dsb_st();
+            icc::sgi1r_el1::write(v);
+            isb();
+        }
+        return;
+    }
     if cpu >= 8 { return; } // GICv2 supports at most 8 CPU interfaces
     unsafe {
         gicd_w32(GICD_SGIR, ((1u32 << cpu) << 16) | (sgi_id & 0xF));
@@ -428,17 +724,28 @@ pub fn send_sgi(cpu: usize, sgi_id: u32) {
 /// Acknowledge the current interrupt; returns the raw IAR value.
 #[inline]
 pub fn ack() -> u32 {
-    unsafe { gicc_r32(GICC_IAR) }
+    if is_v3() {
+        // INTID is 24 bits on GICv3 (bits above 511 are LPIs, which this
+        // kernel never allocates); 1023 is spurious in both.
+        unsafe { icc::iar1_el1::read() as u32 }
+    } else {
+        unsafe { gicc_r32(GICC_IAR) }
+    }
 }
 
 /// Signal end-of-interrupt.
 #[inline]
 pub fn eoi(iar: u32) {
-    unsafe { gicc_w32(GICC_EOIR, iar); }
+    if is_v3() {
+        unsafe { icc::eoir1_el1::write(iar as u64); isb(); }
+    } else {
+        unsafe { gicc_w32(GICC_EOIR, iar); }
+    }
 }
 
-/// Extract the interrupt ID from a raw IAR value (bits [9:0]).
+/// Extract the interrupt ID from a raw IAR value: bits [9:0] on GICv2 (the
+/// rest is the source CPU of an SGI), [23:0] on GICv3.
 #[inline]
 pub fn irq_id(iar: u32) -> u32 {
-    iar & 0x3FF
+    if is_v3() { iar & 0xFF_FFFF } else { iar & 0x3FF }
 }

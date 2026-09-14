@@ -9,10 +9,12 @@ HOST_ARCH=$(uname -m)
 BOOT_MODE="uefi"
 ARCH="x86_64"
 # HVF (Hypervisor.framework) auto-selects on an Apple Silicon host below, once
-# ARCH/BOOT_MODE are known — only the aarch64 UEFI/Limine path supports it
-# (fixed 2026-07-15, see drivers/src/virtio_gpu.rs's volatile-MMIO fix). Force
-# override with --tcg (software emulation, e.g. for comparison/debugging) or
-# --hvf (force HVF even off Apple Silicon, where it will fail to launch).
+# ARCH/BOOT_MODE are known — only the aarch64 UEFI/Limine path supports it.
+# QEMU >= 11.1 refuses `-accel hvf` on a GICv2 machine ("HVF does not support
+# GICv2 emulation"), so the virt board is GICv3 (the kernel detects either at
+# boot). Force override with --tcg (software emulation, e.g. for comparison/
+# debugging) or --hvf (force HVF even off Apple Silicon, where it will fail
+# to launch).
 ACCEL=""
 QEMU_EXTRA_ARGS=()
 # Venus (Vulkan over virtio-gpu) mode. Opt-in only, via --venus below or
@@ -157,8 +159,10 @@ if [ "$BOOT_MODE" = "raspi4b" ]; then
     DISK_IMAGE="leandros-limine-aarch64.img" # unused in raspi4b mode
 elif [ "$ARCH" = "aarch64" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
-    # -smp 4: SMP bringup via PSCI CPU_ON (GICv2 supports up to 8 CPUs).
-    MACHINE_ARGS="-machine virt,gic-version=2 -m 2G -smp 4"
+    # -smp 4: SMP bringup via PSCI CPU_ON.
+    # gic-version=3: the only GIC HVF will launch (QEMU >= 11.1); the kernel
+    # drives GICv2 or GICv3 by detection, so TCG/KVM hosts use the same line.
+    MACHINE_ARGS="-machine virt,gic-version=3 -m 2G -smp 4"
     # -cpu host: real host ID registers, required by HVF/KVM passthrough
     # (vs. -cpu max's synthesized model, which is TCG-only).
     #

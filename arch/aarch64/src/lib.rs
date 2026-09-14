@@ -145,6 +145,26 @@ pub fn init(boot_info: &boot::BootInfo) {
         };
         paging::map_4k(root_phys as *mut u64, gicd_virt, gicd_phys, device_flags);
         paging::map_4k(root_phys as *mut u64, gicc_virt, gicc_phys, device_flags);
+
+        // virt may be a GICv3 (it must be, under HVF): the distributor is then
+        // a 64 KiB frame whose IROUTER and ID registers lie above the first
+        // page, and each CPU's redistributor lives in its own frame at
+        // GICR_BASE. Mapped unconditionally on the virt build — nothing is
+        // touched unless `gic::init` detects a v3 — and never on the Pi
+        // builds, whose GIC-400 has neither and where the addresses are
+        // not ours to map.
+        #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
+        {
+            let hhdm = boot_info.hhdm_offset as usize;
+            for off in (4096..gic::GICD_SIZE).step_by(4096) {
+                paging::map_4k(root_phys as *mut u64, gicd_virt + off, gicd_phys + off, device_flags);
+            }
+            let gicr_len = gic::GICR_STRIDE * gic::GICR_MAX_FRAMES;
+            for off in (0..gicr_len).step_by(4096) {
+                let phys = gic::GICR_BASE + off;
+                paging::map_4k(root_phys as *mut u64, phys + hhdm, phys, device_flags);
+            }
+        }
         if boot_info.framebuffer_base != 0 {
             let fb_start_phys = boot_info.framebuffer_base as usize & !4095;
             // ONE source for this number, shared with the buddy reservation and

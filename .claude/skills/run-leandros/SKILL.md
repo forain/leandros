@@ -127,7 +127,17 @@ Build time: ~3–5 minutes clean, ~30s incremental.
 
 ## Gotchas
 
-- **HVF acceleration doesn't boot LeandrOS on Apple Silicon** — on QEMU 10.x this was an
+- **HVF needs a GICv3 machine since QEMU 11.1 (Homebrew, 2026-09-05).** `-accel hvf` on
+  `-machine virt,gic-version=2` exits immediately with `HVF does not support GICv2
+  emulation` — a launch refusal, not a guest hang, and the reason every aarch64 boot on
+  the Mac silently failed between 2026-09-05 and 2026-09-14. Both launchers now pass
+  `gic-version=3`; the kernel detects GICv2 vs GICv3 at `gic::init` (serial prints
+  `[GIC] ID_AA64PFR0.GIC=… -> GICv3`) and drives either, so the same command line works
+  under TCG and KVM. Only the virt build detects — both Pi boards are GIC-400 (GICv2)
+  and stay on the memory-mapped path. If a boot dies with zero serial output, read
+  `/tmp/leandros-qemu-stderr.log` for this refusal before bisecting the kernel.
+
+- **HVF acceleration history (the direct-boot path is still TCG-only)** — on QEMU 10.x this was an
   outright crash (`Assertion failed: (isv), function hvf_handle_exception, file hvf.c,
   line 1883`). Re-tested and root-caused 2026-07-15 on QEMU 11.0.2: the crash is gone,
   and the hang is NOT in LeandrOS's own boot path — bisected with serial markers through

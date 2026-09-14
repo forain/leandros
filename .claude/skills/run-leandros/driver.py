@@ -447,7 +447,9 @@ def _build_cmd(arch, mode="uefi", venus=False):
         display_arg = "egl-headless" if venus else "none"
         return [
             "qemu-system-aarch64",
-            "-machine", "virt,gic-version=2", "-smp", "4", *cpu_flags, "-m", _guest_mem(),
+            # gic-version=3: QEMU >= 11.1 HVF refuses a GICv2 machine outright;
+            # the kernel detects v2/v3 at boot, so TCG uses the same line.
+            "-machine", "virt,gic-version=3", "-smp", "4", *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             "-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}",
@@ -569,7 +571,7 @@ def _build_direct_cmd(arch):
             sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
         return [
             "qemu-system-aarch64",
-            "-machine", "virt,gic-version=2", "-smp", "4", "-cpu", "max", "-m", _guest_mem(), "-accel", "tcg",
+            "-machine", "virt,gic-version=3", "-smp", "4", "-cpu", "max", "-m", _guest_mem(), "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
             "-drive", f"if=none,id=data0,format=raw,file={data0}",

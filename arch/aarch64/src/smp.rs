@@ -66,6 +66,18 @@ pub extern "C" fn arch_core_of(cpu: usize) -> usize {
     }
 }
 
+/// `MPIDR_EL1` of logical CPU `cpu` as recorded at its entry, or `None` if
+/// that CPU has not run `record_own_mpidr` yet. `gic::send_sgi` needs the
+/// full affinity on GICv3, where an SGI is addressed by (Aff3,Aff2,Aff1) plus
+/// a bit for Aff0 rather than by CPU-interface number.
+pub fn mpidr_of(cpu: usize) -> Option<u64> {
+    if cpu >= MAX_CPUS { return None; }
+    let v = CPU_MPIDRS[cpu].load(Ordering::Relaxed);
+    // The BSP's MPIDR is legitimately 0 on QEMU virt; 0 is only "unrecorded"
+    // for a CPU other than 0.
+    if v == 0 && cpu != 0 { None } else { Some(v) }
+}
+
 fn record_own_mpidr() {
     let mpidr: u64;
     unsafe {
@@ -127,6 +139,21 @@ aarch64_ap_entry:
     movz  x4, #0x8000, lsl #16    // HCR_EL2.RW: EL1 is AArch64
     msr   hcr_el2, x4
 
+    // GICv3 system-register interface: with ICC_SRE_EL2.Enable clear, EL1's
+    // first ICC_SRE_EL1 access traps to EL2, where nothing handles it. Set
+    // SRE|Enable here, gated on ID_AA64PFR0_EL1.GIC exactly as Linux's
+    // init_el2 does, so a core without the interface never sees the
+    // register. Harmless on a GIC-400 system: EL1's own SRE stays 0.
+    mrs   x4, id_aa64pfr0_el1
+    ubfx  x4, x4, #24, #4
+    cbz   x4, 1f
+    mrs   x4, S3_4_C12_C9_5       // ICC_SRE_EL2
+    mov   x5, #0x9            // SRE | Enable (0b1001 is not a logical immediate)
+
+    orr   x4, x4, x5
+    msr   S3_4_C12_C9_5, x4
+    isb
+1:
     movz  x4, #0x0800             // SCTLR_EL1 reset: RES1, MMU off
     movk  x4, #0x30d0, lsl #16
     msr   sctlr_el1, x4

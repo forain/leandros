@@ -173,6 +173,22 @@ check_el2:
     movz    x4, #0x8000, lsl #16    // HCR_EL2.RW (bit 31): EL1 executes AArch64
     msr     hcr_el2, x4
 
+    // GICv3 system-register interface (see the identical block in the AP
+    // stub, arch/aarch64/src/smp.rs): without ICC_SRE_EL2.Enable, EL1's
+    // ICC_SRE_EL1 access traps into the EL2 vectors we never install.
+    // Gated on ID_AA64PFR0_EL1.GIC so a core without the interface never
+    // touches the register.
+    mrs     x4, id_aa64pfr0_el1
+    ubfx    x4, x4, #24, #4
+    cbz     x4, el2_sre_done
+    mrs     x4, S3_4_C12_C9_5       // ICC_SRE_EL2
+    mov     x5, #0x9            // SRE | Enable (0b1001 is not a logical immediate)
+
+    orr     x4, x4, x5
+    msr     S3_4_C12_C9_5, x4
+    isb
+el2_sre_done:
+
     // Check if we are running at a virtual address (MMU ON)
     adr     x4, at_el1
     tbz     x4, #63, el2_mmu_off    // if bit 63 is 0, MMU is already off
