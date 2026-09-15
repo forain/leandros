@@ -36,6 +36,11 @@ use spin::Mutex;
 extern crate alloc;
 extern crate mm;
 
+/// Block devices (`/dev/vd*`, partitions, loop devices) and the synthesized
+/// `/sys/class/block` tree. See the module docs for why it lives here and why
+/// sysfs is generated on demand rather than stored.
+pub mod block;
+
 // ── Protocol tag constants ────────────────────────────────────────────────────
 
 pub const VFS_OPEN:        u64 = 0x10;
@@ -950,6 +955,23 @@ pub enum VnodeKind {
     /// keyed by (pid, fd) because that is what makes two openers independent
     /// for free — which is the property the notification exists to provide.
     DevVt { vt: u8, seen: u8 },
+    /// A block device node: `/dev/vda`, a partition of one, `/dev/loopN`, or
+    /// the `/dev/loop-control` character node (`dev == block::LOOP_CONTROL`).
+    ///
+    /// `pos` is the fd's byte offset, kept here rather than in the block
+    /// registry because it is a property of the *descriptor*: two opens of
+    /// `/dev/loop0` seek independently, and the `gpt` crate sizes a device by
+    /// `lseek(fd, 0, SEEK_END)` on its own handle while the partitioner holds
+    /// another.
+    BlockDev { dev: u16, pos: u64 },
+    /// A directory in the synthesized `/sys/class/block` tree, named by the
+    /// registry slot it describes plus which level of the tree it is (see
+    /// `block::LVL_*`). Container directories (`/sys`, `/sys/class`,
+    /// `/sys/class/block`) use `block::NO_DEV`. `pos` is the getdents cursor.
+    ///
+    /// No path string is stored: the pair *is* the identity, which is what
+    /// keeps this variant inside the 32-byte `VnodeKind` budget below.
+    SysBlock { dev: u16, level: u8, pos: u32 },
 }
 
 // `VnodeKind` is embedded in `FdEntry`, and the fd tables are a static
@@ -1816,6 +1838,11 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/mnt",
     b"/home",
     b"/root",
+    // Only the root of the sysfs tree is listed. Everything below it is
+    // synthesized by `block::sysfs_*` from the live block registry and opens
+    // as a `SysBlock` vnode; listing it here is what makes `ls /` show it and
+    // `stat /sys` agree that it is a directory.
+    b"/sys",
     b"/proc/net",
     b"/proc/sys",
     b"/proc/sys/kernel",
@@ -2220,6 +2247,10 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
        // the /dev/ prefix above; /tmp rides /tmp/. Intercept /run/user before
        // the mount table so it lands on tmpfs, not the pivoted F2FS root.
        || path.starts_with(b"/run/user") || path == b"/run"
+       // The synthesized sysfs tree. Like /proc it is not a mount and must be
+       // intercepted before `find_mount_port()`, which matches every absolute
+       // path once init has pivot_root'ed the F2FS volume onto "/".
+       || path == b"/sys" || path.starts_with(b"/sys/")
     {
         return Some(path);
     }
@@ -2972,6 +3003,40 @@ fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
 }
 
+/// Generate a `/sys/class/block/...` attribute file.
+///
+/// Same shape as `gen_proc_system`: the bytes are parked in an ephemeral
+/// tmpfs slot under a synthetic "/tmp/.sysfs_<idx>" path no user path can
+/// name, and the fd is an ordinary read-only `TmpFile`. The slot is released
+/// by `handle_close` like every other ephemeral snapshot.
+fn gen_sysfs(path: &[u8]) -> Option<VnodeKind> {
+    let mut buf = [0u8; TMP_BUF_SIZE];
+    let len = block::sysfs_attr(path, &mut buf)?;
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp.iter().position(|e| !e.in_use)?;
+    tmp[idx] = TmpFileEntry::empty();
+    tmp[idx].in_use = true;
+    tmp[idx].ephemeral = true;
+    let mut fake = [0u8; 24];
+    let base = b"/tmp/.sysfs_";
+    fake[..base.len()].copy_from_slice(base);
+    let mut fl = base.len();
+    let mut n = idx;
+    if n == 0 { fake[fl] = b'0'; fl += 1; }
+    else {
+        let mut d = [0u8; 5]; let mut di = 0;
+        while n > 0 { d[di] = b'0' + (n % 10) as u8; di += 1; n /= 10; }
+        while di > 0 { di -= 1; fake[fl] = d[di]; fl += 1; }
+    }
+    let fl = fl.min(MAX_TMP_PATH - 1);
+    tmp[idx].path[..fl].copy_from_slice(&fake[..fl]);
+    tmp[idx].path_len = fl;
+    let copy = len.min(TMP_BUF_SIZE);
+    tmp[idx].data[..copy].copy_from_slice(&buf[..copy]);
+    tmp[idx].len = copy;
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
+}
+
 fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<usize> {
     let ticks = sched::ticks();
     let uptime_sec  = ticks / 100;
@@ -3241,6 +3306,25 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             VnodeKind::DevVt { vt, seen: tty_server::vt::active() as u8 }
         } else if lookup_path == b"/dev/fb0" {
             VnodeKind::DevFb { pos: 0 }
+        } else if block::is_sysfs_path(lookup_path) {
+            // A directory in the tree, or one of its attribute files. Checked
+            // before the RAMFS sweep below, which would otherwise answer
+            // ENOENT for everything under /sys (nothing there is static).
+            if let Some((dev, level)) = block::sysfs_dir(lookup_path) {
+                if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
+                VnodeKind::SysBlock { dev, level, pos: 0 }
+            } else {
+                match gen_sysfs(lookup_path) {
+                    Some(v) => v,
+                    None => return err_reply(-2),
+                }
+            }
+        } else if let Some(dev) = block::lookup_dev_node(lookup_path) {
+            // /dev/vda, /dev/vda1, /dev/loopN, /dev/loop-control. Ahead of the
+            // RAMFS sweep for the same reason /dev/ptmx is: a placeholder entry
+            // there would report a zero-byte regular file.
+            let pos = if flags & O_APPEND != 0 { block::dev_size(dev) } else { 0 };
+            VnodeKind::BlockDev { dev, pos }
         } else if lookup_path == b"/dev/ptmx" {
             // Every open of the multiplexor is a *new* pair, not a new handle
             // on a shared object — that is the whole ptmx contract, and what
@@ -3605,6 +3689,24 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             *pos = cur + n;
             val_reply(n as u64)
         }
+        // A block device. The FD table lock is released before any I/O:
+        // a loop device's read re-enters the VFS (`call_port` to the mount
+        // holding its backing file), and the user buffer is touched with
+        // nothing held so a demand-paging fault there resolves normally.
+        VnodeKind::BlockDev { dev, pos } => {
+            let (d, p) = (*dev, *pos);
+            drop(tbls);
+            if block::dev_is_char(d) { return val_reply(0); } // /dev/loop-control
+            let n = block::read_at(d, p, buf_ptr, count);
+            if n < 0 { return make_reply(n as i64); }
+            let mut tbls2 = FD_TABLES.lock();
+            if let Some(t) = find_tbl(pid, &mut *tbls2) {
+                if let VnodeKind::BlockDev { pos, .. } = &mut t.fds[fd].kind {
+                    *pos = p + n as u64;
+                }
+            }
+            val_reply(n as u64)
+        }
         VnodeKind::DynamicDevice { port, dev_id, open_id } => {
             let port = *port;
             let dev_id = *dev_id;
@@ -3809,6 +3911,22 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
     match &mut tbl.fds[fd].kind {
         VnodeKind::DevUrandom | VnodeKind::DevNull | VnodeKind::DevZero =>
             val_reply(count as u64),
+        // See the read arm: locks dropped before I/O and before the user
+        // buffer is read.
+        VnodeKind::BlockDev { dev, pos } => {
+            let (d, p) = (*dev, *pos);
+            drop(tbls);
+            if block::dev_is_char(d) { return err_reply(-9); } // EBADF on loop-control
+            let n = block::write_at(d, p, buf_ptr, count);
+            if n < 0 { return make_reply(n as i64); }
+            let mut tbls2 = FD_TABLES.lock();
+            if let Some(t) = find_tbl(pid, &mut *tbls2) {
+                if let VnodeKind::BlockDev { pos, .. } = &mut t.fds[fd].kind {
+                    *pos = p + n as u64;
+                }
+            }
+            val_reply(n as u64)
+        }
         VnodeKind::Pty { pair, is_master } => {
             let (p, m) = (*pair as usize, *is_master);
             drop(tbls);
@@ -4123,6 +4241,36 @@ fn handle_lseek(pid: u32, fd: usize, offset: i64, whence: u32) -> Message {
             };
             if new_pos < 0 { return err_reply(-22); }
             *pos = new_pos as usize;
+            val_reply(new_pos as u64)
+        }
+        // A block device is seekable and `SEEK_END` must report its real
+        // capacity: the `gpt` crate finds the backup GPT header with
+        // `seek(SeekFrom::End(0))` (gpt-4.1.0 header/mod.rs:384) and gives up
+        // with "too small for backup" if that answers 0.
+        VnodeKind::BlockDev { dev, pos } => {
+            let d = *dev;
+            let len = block::dev_size(d) as i64;
+            let new_pos = match whence {
+                SEEK_SET => offset,
+                SEEK_CUR => *pos as i64 + offset,
+                SEEK_END => len + offset,
+                _        => return err_reply(-22),
+            };
+            if new_pos < 0 { return err_reply(-22); }
+            *pos = new_pos as u64;
+            val_reply(new_pos as u64)
+        }
+        // A sysfs directory's `pos` is the getdents cursor, so
+        // lseek(fd, 0, SEEK_SET) works as rewinddir().
+        VnodeKind::SysBlock { pos, .. } => {
+            let new_pos = match whence {
+                SEEK_SET => offset,
+                SEEK_CUR => *pos as i64 + offset,
+                SEEK_END => offset,
+                _        => return err_reply(-22),
+            };
+            if new_pos < 0 { return err_reply(-22); }
+            *pos = new_pos as u32;
             val_reply(new_pos as u64)
         }
         VnodeKind::MountedFile { port, file_id } => {
@@ -4905,6 +5053,7 @@ fn set_dir_pos(kind: &mut VnodeKind, new_pos: usize) {
     match kind {
         VnodeKind::RamFile { pos, .. } => *pos = new_pos,
         VnodeKind::TmpFile { pos, .. }  => *pos = new_pos,
+        VnodeKind::SysBlock { pos, .. } => *pos = new_pos as u32,
         _ => {}
     }
 }
@@ -4923,6 +5072,44 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     let mut tmp_dir_buf = [0u8; MAX_TMP_PATH];
     let mut tmp_dir_len = 0usize;
     let mut dir_is_tmp  = false;
+    // A synthesized sysfs directory has no path to walk and no static table to
+    // sweep — the block registry is enumerated directly. Handled here rather
+    // than in the sweeps below because nothing in them applies.
+    if let VnodeKind::SysBlock { dev, level, pos } = tbl.fds[fd].kind {
+        let (dev, level) = (dev, level);
+        let buf = buf_ptr as *mut u8;
+        let mut off = 0usize;
+        let mut cur = pos as usize;
+        loop {
+            let mut name = [0u8; block::NAME_MAX];
+            let (nlen, is_dir, ino) = if cur == 0 {
+                name[0] = b'.'; (1, true, 1)
+            } else if cur == 1 {
+                name[0] = b'.'; name[1] = b'.'; (2, true, 1)
+            } else {
+                match block::sysfs_dirent(dev, level, cur - 2, &mut name) {
+                    Some((n, d)) => (n, d, 0x5000_0000 + cur as u64),
+                    None => break,
+                }
+            };
+            let reclen = ((8 + 8 + 2 + 1 + nlen + 1) + 7) & !7;
+            if off + reclen > count { break; }
+            unsafe {
+                let p = buf.add(off);
+                core::ptr::write(p as *mut u64, ino);
+                core::ptr::write(p.add(8) as *mut u64, 0u64);
+                core::ptr::write(p.add(16) as *mut u16, reclen as u16);
+                *p.add(18) = if is_dir { 4 } else { 8 }; // DT_DIR / DT_REG
+                core::ptr::copy_nonoverlapping(name.as_ptr(), p.add(19), nlen);
+                *p.add(19 + nlen) = 0;
+            }
+            off += reclen;
+            cur += 1;
+        }
+        if let VnodeKind::SysBlock { pos, .. } = &mut tbl.fds[fd].kind { *pos = cur as u32; }
+        return val_reply(off as u64);
+    }
+
     let (static_path, start_pos): (&'static [u8], usize) = match &tbl.fds[fd].kind {
         VnodeKind::RamFile { data, pos, .. } => (*data, *pos),
         VnodeKind::TmpFile { idx, pos, .. } => {
@@ -5025,6 +5212,38 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
             }
             virtual_idx += 1;
         }
+    }
+
+    // Block device nodes (/dev). Synthesized from the live registry for the
+    // same reason /dev/pts is: there is no static table, and `ls /dev` plus
+    // any tool that scans the directory for `vd*`/`loop*` has to see them.
+    if dir_path == b"/dev" {
+        let mut i = 0usize;
+        loop {
+            let mut name = [0u8; block::NAME_MAX];
+            let nlen = match block::dev_node_name(i, &mut name) { Some(n) => n, None => break };
+            if virtual_idx >= pos {
+                if let Some(r) = write_dirent(buf, off, count, 0x4000_0000 + i as u64,
+                                              &name[..nlen], 6 /* DT_BLK */) {
+                    off += r; pos += 1;
+                } else {
+                    set_dir_pos(&mut tbl.fds[fd].kind, pos);
+                    return val_reply(off as u64);
+                }
+            }
+            virtual_idx += 1;
+            i += 1;
+        }
+        if virtual_idx >= pos {
+            if let Some(r) = write_dirent(buf, off, count, 0x4000_0000 + 0xFFFE,
+                                          b"loop-control", 2 /* DT_CHR */) {
+                off += r; pos += 1;
+            } else {
+                set_dir_pos(&mut tbl.fds[fd].kind, pos);
+                return val_reply(off as u64);
+            }
+        }
+        virtual_idx += 1;
     }
 
     // Live pty slaves (/dev/pts). The pool is the only source of truth here —
@@ -5555,6 +5774,15 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
 
 
+    // Block-device ioctls (BLKGETSIZE64, BLKSSZGET, BLKPG, LOOP_*). The FD
+    // table lock is dropped first: LOOP_SET_FD re-enters this server to
+    // resolve and open the backing file, and every arm touches user memory
+    // through `arg`, which must be able to demand-page.
+    if let VnodeKind::BlockDev { dev, .. } = tbl.fds[fd].kind {
+        drop(tbls);
+        return make_reply(block::ioctl(pid, dev, cmd, arg) as i64);
+    }
+
     if let VnodeKind::DynamicDevice { port, dev_id, open_id } = &tbl.fds[fd].kind {
         let port = *port;
         let dev_id = *dev_id;
@@ -5678,7 +5906,8 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             (tty_server::pty::poll_mask(p, m), tty_server::pty::seq(p))
         }
         VnodeKind::RamFile { .. } | VnodeKind::TmpFile { .. } | VnodeKind::MountedFile { .. }
-        | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom | VnodeKind::DevFb { .. } => {
+        | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom | VnodeKind::DevFb { .. }
+        | VnodeKind::BlockDev { .. } | VnodeKind::SysBlock { .. } => {
             drop(tbls);
             (POLLIN | POLLOUT, 0) // synchronous, memory- or polled-disk-backed I/O never blocks here
         }
@@ -5848,6 +6077,13 @@ fn handle_fsync(pid: u32, fd: usize) -> Message {
             let mut proxy = Message::empty();
             proxy.tag = VFS_FSYNC;
             call_port(port, proxy)
+        }
+        // `gpt::GptDisk::write()` hands its caller the device file and
+        // disks-rs immediately calls `sync_all()` on it, so this must both
+        // succeed and actually commit the device's write cache.
+        VnodeKind::BlockDev { dev, .. } => {
+            drop(tbls);
+            make_reply(block::flush_dev(dev) as i64)
         }
         _ => ok_reply(),
     }
@@ -7243,6 +7479,27 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         return call_port(port, proxy);
     }
 
+    // A block device node. `S_IFBLK` is load-bearing: `fs::metadata().is_file()`
+    // is false for one, tools branch on the type, and st_size must be the
+    // device capacity so a caller that sizes by stat agrees with lseek(END).
+    // /dev/loop-control is the exception — it is a character device (10:237).
+    if let VnodeKind::BlockDev { dev, .. } = kind {
+        const S_IFBLK: u32 = 0o060000;
+        let ifmt = if block::dev_is_char(dev) { S_IFCHR } else { S_IFBLK };
+        write_stat_full_rdev(stat_ptr, ifmt | 0o660, 1, block::dev_size(dev),
+                             block::dev_ino(dev), 0, 6, block::dev_rdev(dev));
+        return ok_reply();
+    }
+
+    // A synthesized sysfs directory. musl's `fdopendir` (issued by every
+    // `opendir`, and therefore by `fs::read_dir`) fstats the fd and answers
+    // ENOTDIR unless this says S_IFDIR.
+    if let VnodeKind::SysBlock { dev, level, .. } = kind {
+        write_stat_full(stat_ptr, S_IFDIR | 0o755, 1, 0,
+                        0x5000_0000 + (dev as u64) * 8 + level as u64, 0, 0);
+        return ok_reply();
+    }
+
     // A dynamic device node (DRM card0, evdev eventN) must report its real
     // st_rdev — libdrm computes major(st_rdev)==226 to find /sys/dev/char/226:0,
     // and libudev keys on it. The rdev comes from the registry (port, dev_id).
@@ -7284,6 +7541,8 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         // DynamicDevice is handled by the early return above (it needs st_rdev);
         // this arm exists only for match exhaustiveness.
         VnodeKind::DynamicDevice { .. } => return err_reply(-9),
+        // Likewise handled by the early returns above.
+        VnodeKind::BlockDev { .. } | VnodeKind::SysBlock { .. } => return err_reply(-9),
         // A pseudo-directory reports S_IFDIR with size 0. It used to report
         // S_IFREG with `size = data.len()`, i.e. the length of its own path —
         // which is what let memmap2 map `/tmp` as a 4-byte "file".
@@ -7401,6 +7660,32 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         if let Some(n) = pts_number(lookup_path) {
             write_stat(stat_ptr, 0o020620, 0, pty_ino(n as u16, false));
             return ok_reply();
+        }
+        // Block device nodes. Must agree byte for byte with what `handle_fstat`
+        // reports for an fd on the same path — a `fs::metadata` caller and an
+        // `fstat` caller have to see the same device.
+        if let Some(dev) = block::lookup_dev_node(lookup_path) {
+            const S_IFBLK: u32 = 0o060000;
+            let ifmt = if block::dev_is_char(dev) { 0o020000 } else { S_IFBLK };
+            write_stat_full_rdev(stat_ptr, ifmt | 0o660, 1, block::dev_size(dev),
+                                 block::dev_ino(dev), 0, 6, block::dev_rdev(dev));
+            return ok_reply();
+        }
+        // The synthesized sysfs tree: directories, then attribute files. `/sys`
+        // itself is answered by the RAMFS_DIRS sweep at the top of this
+        // function, which reports the same S_IFDIR.
+        if block::is_sysfs_path(lookup_path) {
+            if let Some((dev, level)) = block::sysfs_dir(lookup_path) {
+                write_stat(stat_ptr, 0o040755, 0,
+                           0x5000_0000 + (dev as u64) * 8 + level as u64);
+                return ok_reply();
+            }
+            let mut buf = [0u8; TMP_BUF_SIZE];
+            if let Some(n) = block::sysfs_attr(lookup_path, &mut buf) {
+                write_stat(stat_ptr, 0o100444, n as u64, path_ino(lookup_path, 5));
+                return ok_reply();
+            }
+            return err_reply(-2); // ENOENT — nothing else exists under /sys
         }
         // Dynamic devices. Report the real st_rdev so a path-based stat of
         // /dev/dri/card0 agrees with fstat (libdrm derives 226:0 from it).

@@ -6236,6 +6236,18 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         return net_reply_val(&net_server::handle(&set_msg, pid));
     }
 
+    // ── Block devices ────────────────────────────────────────────────────────
+    // BLKGETSIZE64/BLKSSZGET/BLKPG/LOOP_* live in the VFS's block registry,
+    // which owns the node, its size and its partition table. Dispatched on the
+    // *fd kind* rather than on the command number because the LOOP_* range
+    // (0x4C00..) collides with nothing here but the BLK* range (0x12xx) would
+    // otherwise have to be enumerated twice — and because an ioctl aimed at a
+    // block device must never fall through to the TTY server's ENOTTY.
+    if let Some(vfs::VnodeKind::BlockDev { .. }) = vfs::vfs_get_node_kind(pid, fd) {
+        let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
+        return vfs_reply_val(&vfs::handle(&msg, pid));
+    }
+
     // DRM ioctl commands
     const DRM_IOCTL_GET_MODE: usize = 0x1003;
     const DRM_IOCTL_SET_MODE: usize = 0x1001;

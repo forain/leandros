@@ -85,6 +85,24 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::blkdev::init();
+    // Publish the disks to the VFS, which owns /dev/vd*, /dev/loopN and the
+    // synthesized /sys/class/block tree. `vfs-server` deliberately does not
+    // depend on `drivers` (the VFS sits below the device layer), so the
+    // backend crosses the boundary as this vtable — the same shape the DRM
+    // dmabuf hook uses. Registered here because this crate is the one place
+    // that already depends on both.
+    static DISK_OPS: vfs_server::block::DiskOps = vfs_server::block::DiskOps {
+        disk_count: || drivers::blkdev::device_count(),
+        // `info()` reports 4096-byte blocks; the registry counts bytes.
+        disk_bytes: |i| drivers::blkdev::info(i).map_or(0, |v| v.total_blocks * 4096),
+        read_blocks: |i, blk, buf| drivers::blkdev::read_blocks(i, blk, buf),
+        write_block: |i, blk, buf| match <&[u8; 4096]>::try_from(buf) {
+            Ok(b) => drivers::blkdev::write_block(i, blk, b),
+            Err(_) => false,
+        },
+        flush: |i| drivers::blkdev::flush(i),
+    };
+    vfs_server::block::init(&DISK_OPS);
 
     // ── USB ───────────────────────────────────────────────────────────────────
     drivers::usb_hcd::init();
