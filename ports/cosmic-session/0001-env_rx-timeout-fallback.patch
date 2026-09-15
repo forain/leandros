@@ -1,5 +1,5 @@
 Subject: [PATCH] cosmic-session: fall back to WAYLAND_DISPLAY=wayland-1 if the
- comp env handshake does not complete
+ comp env handshake does not complete, and don't panic on a late SetEnv
 
 LeandrOS startup-rendezvous workaround (M7q). cosmic-session blocks forever at
 main.rs's `env_rx.await`, waiting for cosmic-comp to deliver SetEnv{WAYLAND_
@@ -15,6 +15,12 @@ back to the compositor's known wayland socket name (`/run/user/0/wayland-1`,
 which cosmic-comp does create) so the component cascade can start and the
 desktop comes up. This is a startup-rendezvous workaround, not a functional
 COSMIC change.
+
+That timeout fallback drops `env_rx`'s sender's receiver, so when cosmic-comp's
+real SetEnv arrives late over the IPC socket, `comp.rs`'s
+`env_tx.send(variables).unwrap()` panics because the receiver is gone -- killing
+the whole session (and the panel with it). Make the late send a no-op instead of
+a panic.
 
 Apply against the vendored cosmic-session source tree (the build tree is
 ~/code/leandros-artifacts/m6-session-bins/src/cosmic-session, byte-identical to
@@ -56,3 +62,17 @@ m6-session-bins/out/cosmic-session-<arch>, and regenerate the f2fs images.
  		"got environmental variables from cosmic-comp: {:?}",
  		env_vars
  	);
+--- a/src/comp.rs
++++ b/src/comp.rs
+@@ -34,7 +34,10 @@
+ 	match serde_json::from_slice::<Message>(&state.buf) {
+ 		Ok(Message::SetEnv { variables }) => {
+ 			if let Some(env_tx) = state.env_tx.take() {
+-				env_tx.send(variables).unwrap();
++				// LeandrOS: after the 5 s env_rx fallback in main.rs fires, the receiver
++				// is gone. A late SetEnv from cosmic-comp must be ignored, not unwrapped
++				// into a panic that kills the session.
++				let _ = env_tx.send(variables);
+ 			}
+ 		}
+ 		Err(_) => {
