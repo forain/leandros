@@ -2807,10 +2807,14 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
         // even forwarded to this function.
         0 | 9 => {
             // FUTEX_WAIT: if *uaddr == val, block until woken.  The value
-            // check happens inside futex_wait under the FUTEX_TABLE lock —
+            // check happens inside futex_wait, between that task's
+            // registration in FUTEX_TABLE and its commit to Blocked —
             // checking it out here would reopen the SMP lost-wake-up window
             // (another CPU could change the value and issue FUTEX_WAKE
-            // between an early check and the waiter registration).
+            // between an early check and the waiter registration).  Note it
+            // deliberately does NOT happen under the FUTEX_TABLE lock: the
+            // read can take a demand-paging fault, and `handle_page_fault`
+            // re-enters the scheduler.  See the sched::futex module docs.
             if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
             // timeout_ptr is a `struct timespec` (relative — real FUTEX_WAIT
             // semantics; treated the same for the WAIT_BITSET/9 case, which
