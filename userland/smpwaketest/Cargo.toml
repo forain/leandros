@@ -1,0 +1,15 @@
+[package]
+name = "smpwaketest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "smpwaketest"
+path = "src/main.rs"
+
+[dependencies]
+# Links directly against librelibc.a (same as pthreadtest/timertest/
+# wakepolltest): exercises the real futex(2)/eventfd2/pthread/nanosleep Pal
+# calls. This test measures cross-thread WAKE LATENCY (how long it takes a
+# blocked thread to return once a peer thread/CPU issues the wake), which
+# wakepolltest's binary-pass/fail edge coverage does not quantify.
