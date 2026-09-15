@@ -1,0 +1,21 @@
+[workspace]
+
+[package]
+name = "mkfs-fat"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "dosfstools-compatible mkfs.fat, FAT32-only, for LeandrOS"
+
+# Cargo rejects a '.' in a bin/crate name, so the crate builds as
+# `mkfs-fat` and build.sh (and cargo itself, via [[bin]]) renames the
+# installed artifact to the dosfstools-compatible `mkfs.fat` name.
+[[bin]]
+name = "mkfs-fat"
+path = "src/main.rs"
+
+[dependencies]
+fatfs = "0.3.6"
+
+[profile.release]
+panic = "abort"
