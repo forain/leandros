@@ -1040,13 +1040,12 @@ def main():
     #           once each; desktop alive at t+3 min (aarch64) / t+8 min (x86_64)
     # scmtest 35/35 and vfstest 36/36 on both arches.
     #
-    # STILL OPEN, and deliberately not conflated with the above: neither
-    # cosmic-applet-tiling nor cosmic-applet-minimize paints any pixels yet.
-    # Both start, stay up, and take their privileged socket without error, but
-    # the top bar's content extent is byte-identical to a run without them. An
-    # empty minimize applet is correct with no windows open; tiling is not, and
-    # is the same class of "lays out, paints nothing" gap noted for the icons
-    # above. That is a rendering question, not this one.
+    # RESOLVED, and deliberately not conflated with the spawn fix above: the
+    # tiling icon now paints, after 0f56aab+cdd613e (fork_dup dropped
+    # UnixPendingAccept fds; f2fs MAX_OPEN_FILES 32->256) and 4085b7f (nested
+    # epoll fd read as POLLNVAL readiness, which is what unblocked the clock).
+    # cosmic-applet-minimize stays a 1x1 hidden surface with zero toplevels —
+    # correct with no windows open, by upstream design, not a bug.
     m6_applets = [
         ("cosmic-panel-button",     f"{m6_out}/cosmic-panel-button-{arch}"),
         ("cosmic-applet-minimize",  f"{m6_out}/cosmic-applet-minimize-{arch}"),
