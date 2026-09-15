@@ -6955,6 +6955,30 @@ pub fn write_stat_full(
     write_stat_full_rdev(stat_ptr, mode, nlink, size, ino, uid, gid, 0);
 }
 
+/// As `write_stat_full`, but with `st_blocks` supplied rather than derived from
+/// `st_size`.
+///
+/// Deriving it is only right for a densely allocated file. A sparse one — a
+/// disk image ftruncated to 32 GiB with 30 blocks actually written, which is
+/// what `disks-rs` builds — then reports 32 GiB of occupied space on a volume
+/// that does not have it, and `du` bills the caller for every hole. A
+/// filesystem that knows the real count passes it here.
+pub fn write_stat_full_blocks(
+    stat_ptr: usize,
+    mode:     u32,
+    nlink:    u64,
+    size:     u64,
+    ino:      u64,
+    uid:      u32,
+    gid:      u32,
+    blocks:   u64,
+) {
+    write_stat_full_rdev(stat_ptr, mode, nlink, size, ino, uid, gid, 0);
+    unsafe {
+        ((stat_ptr as *mut u8).add(64) as *mut u64).write_unaligned(blocks);
+    }
+}
+
 /// As `write_stat_full`, but also fills `st_rdev` (device number) for
 /// character/block device nodes. The st_rdev offset is arch-specific
 /// (x86-64: 40, aarch64: 32 — see the layout comment above).

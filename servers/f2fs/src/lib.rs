@@ -137,6 +137,12 @@ const INO_SIZE:      usize = 16;
 // so every existing on-disk inode reads back 0 here = "no xattrs", and mkfs
 // needs no change. See the xattr node-block layout in the setxattr path.
 const INO_XATTR:     usize = 24;
+/// `i_advise` — one byte of per-inode flags, zero on every inode mkfs writes.
+const INO_ADVISE:    usize = 2;
+/// `i_blocks` (u64): 4 KiB blocks charged to this inode, data *and* node. Only
+/// meaningful when `INO_ADVISE` carries `F2FS_ADVISE_IBLOCKS`. Offsets 28..84
+/// are unused by both mkfs scripts and by `create_inode`.
+const INO_BLOCKS:    usize = 28;
 const INO_NAMELEN:   usize = 88;
 const INO_NAME:      usize = 92;   // [u8; 255]
 // The union (i_addr / extra-attrs) starts here:
@@ -147,6 +153,14 @@ const NODE_FOOTER_OFF:usize = 4076; // footer = 5×u32 = 20 bytes
 
 // F2FS_INLINE flags
 const F2FS_EXTRA_ATTR:    u8 = 0x20;
+
+/// `i_advise` bit meaning "`i_blocks` at `INO_BLOCKS` is maintained for this
+/// inode". Inodes this server creates set it; the ones the two mkfs scripts
+/// bake into the image do not, and those are all fully allocated, so `stat`
+/// falls back to deriving the count from `i_size` for them — which for a dense
+/// file is the right answer anyway. Without the bit there is no way to tell
+/// "sparse file, 3 blocks" from "pre-existing inode, count never kept".
+const F2FS_ADVISE_IBLOCKS: u8 = 0x80;
 
 // NAT
 const NAT_ENTRY_SIZE:     usize = 9;   // version(1) + ino(4) + blkaddr(4)
@@ -717,10 +731,16 @@ fn sit_mark_block_free(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
 }
 
 /// Release a single physical block back to the allocator. No-op for holes.
-fn free_block(ms: &mut MountState, phys: u32) {
+///
+/// Returns whether a real block was actually released, so the truncate walk can
+/// refund exactly that many against the inode's `i_blocks` — a hole costs
+/// nothing and must not be refunded, or a sparse file's count goes negative.
+fn free_block(ms: &mut MountState, phys: u32) -> bool {
     if let Some((seg, blk)) = blkaddr_to_seg(ms, phys) {
         sit_mark_block_free(ms, seg, blk);
+        return true;
     }
+    false
 }
 
 /// Sum the valid-block counts across every main-area segment, reading each SIT
@@ -749,6 +769,25 @@ fn sit_count_valid_blocks(ms: &mut MountState) -> u64 {
 
 // ── Log-structured block allocator ───────────────────────────────────────────
 
+/// Hand out one data block, **guaranteed to read back as zeros**.
+///
+/// The zeroing is not defensive tidiness, it is the hole contract. A write that
+/// does not cover a whole block goes through `cache.get_mut`, i.e. read the
+/// block off the device, overlay the new bytes, write it back. For a block that
+/// was just carved out of free space, "off the device" is whatever the segment
+/// held in its previous life — a deleted file's contents, or mkfs's fill. So a
+/// partial write into a hole published that stale data as the rest of the
+/// block, and a read of the never-written part of the file returned it. The
+/// probe for disks-rs's GPT pattern caught exactly this: the backup GPT starts
+/// 34 KiB before EOF, i.e. mid-block, and the 2 KiB of hole ahead of it came
+/// back as the recycled segment's old bytes instead of zeros. It is also a
+/// cross-file information leak, which is the reason it is fixed here (at the
+/// source of every data block) rather than at the one write path that noticed.
+///
+/// Free, in practice: the zeros go into the block cache, so a full-block write
+/// immediately afterwards replaces the same slot with no device I/O, and any
+/// stale *dirty* cache entry left over from the block's previous owner is
+/// dropped rather than being written back over the new contents.
 fn alloc_data_block(ms: &mut MountState) -> Option<u32> {
     let bps = ms.sb.blocks_per_seg;
     if ms.cp.cur_data_blkoff as u32 >= bps {
@@ -761,6 +800,8 @@ fn alloc_data_block(ms: &mut MountState) -> Option<u32> {
     let phys  = ms.sb.main_blkaddr + seg * bps + blkoff as u32;
     sit_mark_block_used(ms, seg, blkoff as u32);
     ms.cp.cur_data_blkoff += 1;
+    let zeros = [0u8; BLOCK_SIZE];
+    ms.cache.write(ms.dev, phys as u64, &zeros);
     Some(phys)
 }
 
@@ -845,6 +886,37 @@ fn inode_gid(blk: &[u8]) -> u32 { r32(blk, INO_GID) }
 fn inode_links(blk: &[u8]) -> u32 { r32(blk, INO_LINKS) }
 fn inode_is_dir(blk: &[u8]) -> bool { (inode_mode(blk) & S_IFMT) == S_IFDIR }
 
+/// Blocks charged to this inode, or `None` when the inode predates the counter
+/// (see `F2FS_ADVISE_IBLOCKS`).
+fn inode_blocks(blk: &[u8]) -> Option<u64> {
+    if blk[INO_ADVISE] & F2FS_ADVISE_IBLOCKS != 0 { Some(r64(blk, INO_BLOCKS)) } else { None }
+}
+
+/// `st_blocks` (512-byte units) for an inode, from the real count when it is
+/// kept and from `i_size` otherwise. Saturating rather than wrapping: a bad
+/// count must not report a file as astronomically large, and it must never
+/// underflow to `u64::MAX`.
+fn inode_stat_blocks(blk: &[u8]) -> u64 {
+    match inode_blocks(blk) {
+        Some(b) => b.saturating_mul((BLOCK_SIZE / 512) as u64),
+        None    => inode_size(blk).div_ceil(512),
+    }
+}
+
+/// Charge (`delta > 0`) or refund (`delta < 0`) blocks on an inode image.
+/// No-op on an inode that does not carry the counter, so an old inode is never
+/// given a half-maintained one.
+fn inode_add_blocks(blk: &mut [u8], delta: i64) {
+    if blk[INO_ADVISE] & F2FS_ADVISE_IBLOCKS == 0 { return; }
+    let cur = r64(blk, INO_BLOCKS);
+    let new = if delta >= 0 {
+        cur.saturating_add(delta as u64)
+    } else {
+        cur.saturating_sub(delta.unsigned_abs())
+    };
+    w64(blk, INO_BLOCKS, new);
+}
+
 /// Allocate and initialize a new inode block; returns (ino, phys_blkaddr).
 fn create_inode(ms: &mut MountState, mode: u16, uid: u32, gid: u32,
                 parent_ino: u32, name: &[u8]) -> Option<(u32, u32)> {
@@ -862,6 +934,11 @@ fn create_inode(ms: &mut MountState, mode: u16, uid: u32, gid: u32,
     w32(&mut buf, INO_GID,     gid);
     w32(&mut buf, INO_LINKS,   1);
     w64(&mut buf, INO_SIZE,    0);
+    // Opt this inode into real block accounting, starting at 1 for the inode
+    // block itself — same convention as Linux F2FS, where i_blocks counts the
+    // node blocks too.
+    buf[INO_ADVISE] |= F2FS_ADVISE_IBLOCKS;
+    w64(&mut buf, INO_BLOCKS,  1);
     w32(&mut buf, 84, parent_ino); // i_pino
     let namelen = name.len().min(255) as u32;
     w32(&mut buf, INO_NAMELEN, namelen);
@@ -1118,9 +1195,10 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
 
     // Inline direct addresses: logical index == slot.
     let max_direct = inode_max_direct(&iblk);
+    let mut freed = 0u64;
     for i in 0..max_direct {
         if i as u64 >= keep {
-            free_block(ms, inode_get_blkaddr(&iblk, i));
+            if free_block(ms, inode_get_blkaddr(&iblk, i)) { freed += 1; }
             inode_set_blkaddr(&mut iblk, i, 0);
         }
     }
@@ -1129,7 +1207,7 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
     // i_nid[0], i_nid[1]: direct nodes.
     for slot in 0..=1usize {
         let nid = inode_get_nid(&iblk, slot);
-        if truncate_dnode(ms, nid, base, keep) { inode_set_nid(&mut iblk, slot, 0); }
+        if truncate_dnode(ms, nid, base, keep, &mut freed) { inode_set_nid(&mut iblk, slot, 0); }
         base += ADDRS;
     }
 
@@ -1137,14 +1215,15 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
     let per_ind = NIDS * ADDRS;
     for slot in 2..=3usize {
         let nid = inode_get_nid(&iblk, slot);
-        if truncate_indirect(ms, nid, base, keep) { inode_set_nid(&mut iblk, slot, 0); }
+        if truncate_indirect(ms, nid, base, keep, &mut freed) { inode_set_nid(&mut iblk, slot, 0); }
         base += per_ind;
     }
 
     // i_nid[4]: double-indirect.
     let dind_nid = inode_get_nid(&iblk, 4);
-    if truncate_dindirect(ms, dind_nid, base, keep) { inode_set_nid(&mut iblk, 4, 0); }
+    if truncate_dindirect(ms, dind_nid, base, keep, &mut freed) { inode_set_nid(&mut iblk, 4, 0); }
 
+    inode_add_blocks(&mut iblk, -(freed as i64));
     w64(&mut iblk, INO_SIZE, new_len);
     ms.cache.write(ms.dev, iblkaddr as u64, &iblk);
     nat_update(ms, ino, iblkaddr);
@@ -1154,7 +1233,7 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
 /// (its slots cover indices `[base, base + 1019)`). Returns `true` when the
 /// node block itself was freed because nothing live remained, so the caller
 /// must clear its pointer.
-fn truncate_dnode(ms: &mut MountState, nid: u32, base: u64, keep: u64) -> bool {
+fn truncate_dnode(ms: &mut MountState, nid: u32, base: u64, keep: u64, freed: &mut u64) -> bool {
     const ADDRS_PER_DNODE: usize = NODE_FOOTER_OFF / 4; // 1019
     if nid == 0 { return false; }
     // Wholly within the kept region: nothing to do, and skipping avoids reading
@@ -1166,7 +1245,7 @@ fn truncate_dnode(ms: &mut MountState, nid: u32, base: u64, keep: u64) -> bool {
     let mut any_kept = false;
     for i in 0..ADDRS_PER_DNODE {
         if base + i as u64 >= keep {
-            free_block(ms, dnode_get_blkaddr(&dblk, i));
+            if free_block(ms, dnode_get_blkaddr(&dblk, i)) { *freed += 1; }
             dnode_set_blkaddr(&mut dblk, i, 0);
         } else if dnode_get_blkaddr(&dblk, i) != 0 {
             any_kept = true;
@@ -1176,14 +1255,14 @@ fn truncate_dnode(ms: &mut MountState, nid: u32, base: u64, keep: u64) -> bool {
         ms.cache.write(ms.dev, dblkaddr as u64, &dblk);
         false
     } else {
-        free_block(ms, dblkaddr);
+        if free_block(ms, dblkaddr) { *freed += 1; }
         true
     }
 }
 
 /// One level up from `truncate_dnode`: an indirect node holding up to 1019
 /// direct-node nids, each covering 1019 logical indices.
-fn truncate_indirect(ms: &mut MountState, nid: u32, base: u64, keep: u64) -> bool {
+fn truncate_indirect(ms: &mut MountState, nid: u32, base: u64, keep: u64, freed: &mut u64) -> bool {
     const NIDS_PER_BLOCK: usize = NODE_FOOTER_OFF / 4; // 1019
     const ADDRS: u64 = (NODE_FOOTER_OFF / 4) as u64;
     if nid == 0 { return false; }
@@ -1196,7 +1275,7 @@ fn truncate_indirect(ms: &mut MountState, nid: u32, base: u64, keep: u64) -> boo
         let child_nid = dnode_get_blkaddr(&ind_blk, i);
         if child_nid == 0 { continue; }
         let child_base = base + i as u64 * ADDRS;
-        if truncate_dnode(ms, child_nid, child_base, keep) {
+        if truncate_dnode(ms, child_nid, child_base, keep, freed) {
             dnode_set_blkaddr(&mut ind_blk, i, 0);
         } else {
             any_kept = true;
@@ -1206,14 +1285,14 @@ fn truncate_indirect(ms: &mut MountState, nid: u32, base: u64, keep: u64) -> boo
         ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
         false
     } else {
-        free_block(ms, ind_blkaddr);
+        if free_block(ms, ind_blkaddr) { *freed += 1; }
         true
     }
 }
 
 /// One more level up: a double-indirect node holding up to 1019 indirect-node
 /// nids.
-fn truncate_dindirect(ms: &mut MountState, nid: u32, base: u64, keep: u64) -> bool {
+fn truncate_dindirect(ms: &mut MountState, nid: u32, base: u64, keep: u64, freed: &mut u64) -> bool {
     const NIDS_PER_BLOCK: usize = NODE_FOOTER_OFF / 4; // 1019
     const ADDRS: u64 = (NODE_FOOTER_OFF / 4) as u64;
     let per_ind = NIDS_PER_BLOCK as u64 * ADDRS;
@@ -1227,7 +1306,7 @@ fn truncate_dindirect(ms: &mut MountState, nid: u32, base: u64, keep: u64) -> bo
         let child_nid = dnode_get_blkaddr(&dind_blk, i);
         if child_nid == 0 { continue; }
         let child_base = base + i as u64 * per_ind;
-        if truncate_indirect(ms, child_nid, child_base, keep) {
+        if truncate_indirect(ms, child_nid, child_base, keep, freed) {
             dnode_set_blkaddr(&mut dind_blk, i, 0);
         } else {
             any_kept = true;
@@ -1237,7 +1316,7 @@ fn truncate_dindirect(ms: &mut MountState, nid: u32, base: u64, keep: u64) -> bo
         ms.cache.write(ms.dev, dind_blkaddr as u64, &dind_blk);
         false
     } else {
-        free_block(ms, dind_blkaddr);
+        if free_block(ms, dind_blkaddr) { *freed += 1; }
         true
     }
 }
@@ -1356,6 +1435,7 @@ fn inode_logical_to_phys_for_write(
         let phys = inode_get_blkaddr(iblk, idx as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_block(ms) {
+            inode_add_blocks(iblk, 1);
             inode_set_blkaddr(iblk, idx as usize, new_phys);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
             return new_phys;
@@ -1375,6 +1455,7 @@ fn inode_logical_to_phys_for_write(
                 Some(v) => v,
                 None => return 0,
             };
+            inode_add_blocks(iblk, 1);
             nid = new_nid;
             inode_set_nid(iblk, 0, nid);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
@@ -1384,6 +1465,7 @@ fn inode_logical_to_phys_for_write(
         let phys = dnode_get_blkaddr(&dnblk_copy, rem as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_block(ms) {
+            inode_add_blocks(iblk, 1);
             dnode_set_blkaddr(&mut dnblk_copy, rem as usize, new_phys);
             ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
@@ -1400,6 +1482,7 @@ fn inode_logical_to_phys_for_write(
                 Some(v) => v,
                 None => return 0,
             };
+            inode_add_blocks(iblk, 1);
             nid = new_nid;
             inode_set_nid(iblk, 1, nid);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
@@ -1409,6 +1492,7 @@ fn inode_logical_to_phys_for_write(
         let phys = dnode_get_blkaddr(&dnblk_copy, rem as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_block(ms) {
+            inode_add_blocks(iblk, 1);
             dnode_set_blkaddr(&mut dnblk_copy, rem as usize, new_phys);
             ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
@@ -1426,6 +1510,7 @@ fn inode_logical_to_phys_for_write(
                 Some(v) => v,
                 None => return 0,
             };
+            inode_add_blocks(iblk, 1);
             nid = new_nid;
             inode_set_nid(iblk, 2, nid);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
@@ -1440,6 +1525,7 @@ fn inode_logical_to_phys_for_write(
                 Some(v) => v,
                 None => return 0,
             };
+            inode_add_blocks(iblk, 1);
             dnid = new_nid;
             dnode_set_blkaddr(&mut ind_blk, dnode_idx as usize, dnid);
             ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
@@ -1449,6 +1535,7 @@ fn inode_logical_to_phys_for_write(
         let phys = dnode_get_blkaddr(&dnblk_copy, dnode_off as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_block(ms) {
+            inode_add_blocks(iblk, 1);
             dnode_set_blkaddr(&mut dnblk_copy, dnode_off as usize, new_phys);
             ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
@@ -1465,6 +1552,7 @@ fn inode_logical_to_phys_for_write(
                 Some(v) => v,
                 None => return 0,
             };
+            inode_add_blocks(iblk, 1);
             nid = new_nid;
             inode_set_nid(iblk, 3, nid);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
@@ -1479,6 +1567,7 @@ fn inode_logical_to_phys_for_write(
                 Some(v) => v,
                 None => return 0,
             };
+            inode_add_blocks(iblk, 1);
             dnid = new_nid;
             dnode_set_blkaddr(&mut ind_blk, dnode_idx as usize, dnid);
             ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
@@ -1488,6 +1577,7 @@ fn inode_logical_to_phys_for_write(
         let phys = dnode_get_blkaddr(&dnblk_copy, dnode_off as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_block(ms) {
+            inode_add_blocks(iblk, 1);
             dnode_set_blkaddr(&mut dnblk_copy, dnode_off as usize, new_phys);
             ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
@@ -1505,6 +1595,7 @@ fn inode_logical_to_phys_for_write(
                 Some(v) => v,
                 None => return 0,
             };
+            inode_add_blocks(iblk, 1);
             nid = new_nid;
             inode_set_nid(iblk, 4, nid);
             ms.cache.write(ms.dev, iblkaddr as u64, iblk);
@@ -1519,6 +1610,7 @@ fn inode_logical_to_phys_for_write(
                 Some(v) => v,
                 None => return 0,
             };
+            inode_add_blocks(iblk, 1);
             ind_nid = new_nid;
             dnode_set_blkaddr(&mut dind_blk, ind_idx as usize, ind_nid);
             ms.cache.write(ms.dev, dind_blkaddr as u64, &dind_blk);
@@ -1533,6 +1625,7 @@ fn inode_logical_to_phys_for_write(
                 Some(v) => v,
                 None => return 0,
             };
+            inode_add_blocks(iblk, 1);
             dnid = new_nid;
             dnode_set_blkaddr(&mut ind_blk, dnode_idx as usize, dnid);
             ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
@@ -1542,6 +1635,7 @@ fn inode_logical_to_phys_for_write(
         let phys = dnode_get_blkaddr(&dnblk_copy, dnode_off as usize);
         if phys != 0 { return phys; }
         if let Some(new_phys) = alloc_data_block(ms) {
+            inode_add_blocks(iblk, 1);
             dnode_set_blkaddr(&mut dnblk_copy, dnode_off as usize, new_phys);
             ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
@@ -1639,11 +1733,12 @@ fn dir_add_entry(ms: &mut MountState, dir_ino: u32, name: &[u8], child_ino: u32,
             p
         } else {
             // Allocate a new data block
+            // `alloc_data_block` hands the block back already zeroed, which a
+            // dentry block relies on: every slot must read as "free" and every
+            // name byte as NUL.
             let p = match alloc_data_block(ms) { Some(p) => p, None => return false };
-            // Zero it out
-            let nb = [0u8; BLOCK_SIZE];
-            ms.cache.write(ms.dev, p as u64, &nb);
             // Update inode
+            inode_add_blocks(&mut iblk_copy, 1);
             inode_set_blkaddr(&mut iblk_copy, blk_pass, p);
             n_data_blks += 1;
             p
@@ -2148,7 +2243,9 @@ fn handle_fstat(ms: &mut MountState, file_id: u64, stat_ptr: u64) -> Message {
     let links = inode_links(iblk);
     let uid   = inode_uid(iblk);
     let gid   = inode_gid(iblk);
-    vfs_server::write_stat_full(stat_ptr as usize, mode, links as u64, size, ino as u64, uid, gid);
+    let blks  = inode_stat_blocks(iblk);
+    vfs_server::write_stat_full_blocks(stat_ptr as usize, mode, links as u64, size,
+                                       ino as u64, uid, gid, blks);
     ok_reply()
 }
 
@@ -2179,6 +2276,7 @@ fn stat_common(ms: &mut MountState, path_ptr: u64, stat_ptr: u64, follow: bool) 
     let links = inode_links(iblk);
     let uid   = inode_uid(iblk);
     let gid   = inode_gid(iblk);
+    let blks  = inode_stat_blocks(iblk);
 
     // Emit the stat struct in the target's native layout. This used to
     // open-code the x86-64 offsets, which put st_mode and st_nlink in the
@@ -2188,7 +2286,8 @@ fn stat_common(ms: &mut MountState, path_ptr: u64, stat_ptr: u64, follow: bool) 
     // the /bin binaries), and `links` the real hard-link count. `uid`/`gid`
     // used to be hardcoded 0/0 since nothing ever persisted a chown — now
     // that handle_chown writes INO_UID/INO_GID, stat reflects it.
-    vfs_server::write_stat_full(stat_ptr as usize, mode, links as u64, size, ino as u64, uid, gid);
+    vfs_server::write_stat_full_blocks(stat_ptr as usize, mode, links as u64, size,
+                                       ino as u64, uid, gid, blks);
     ok_reply()
 }
 
@@ -2983,6 +3082,7 @@ fn persist_xattr_block(ms: &mut MountState, ino: u32, xnid: u32, blkbuf: &[u8; B
         {
             let iblk = ms.cache.get_mut(ms.dev, iaddr as u64);
             w32(iblk, INO_XATTR, new_nid);
+            inode_add_blocks(iblk, 1);
         }
         nat_update(ms, ino, iaddr);
         new_nid
