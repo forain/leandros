@@ -381,6 +381,63 @@ build_brush() {
     )
 }
 
+# Function to build mkfs.fat — the FAT32 formatter disks-rs execs by bare name
+# for every ESP and XBOOTLDR partition it lays down. Unlike brush/coreutils this
+# is in-tree Rust (ports/mkfs-fat), so it has its own build.sh that owns the
+# musl/ET_EXEC toolchain details, exactly as ports/greetd and ports/busd do; all
+# that belongs here is the call. A failure is fatal, not a warning: the source
+# is checked in, so the only way it breaks is a real regression.
+build_mkfs_fat() {
+    local arch="$1"
+    echo "🗂️  Building $arch mkfs.fat..."
+    if [[ ! -x "$ROOT_DIR/ports/mkfs-fat/build.sh" ]]; then
+        echo "⚠️  ports/mkfs-fat not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/ports/mkfs-fat/build.sh" "$arch"
+}
+
+# Function to build mkfs.xfs — the XFS v5 formatter for the root partition.
+# Same shape as build_mkfs_fat; its build.sh takes one arch (or "all") and
+# installs the binary, which cargo builds as mkfs_xfs because a target name
+# cannot contain a dot, to ports/mkfs-xfs/out/<arch>/mkfs.xfs.
+build_mkfs_xfs() {
+    local arch="$1"
+    echo "🗃️  Building $arch mkfs.xfs..."
+    if [[ ! -x "$ROOT_DIR/ports/mkfs-xfs/build.sh" ]]; then
+        echo "⚠️  ports/mkfs-xfs not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/ports/mkfs-xfs/build.sh" "$arch"
+}
+
+# Function to build disktester — AerynOS's disks-rs end-to-end provisioning
+# driver, which is what actually exercises the block layer: sparse file, loop
+# device, GPT write, BLKPG partition sync, then mkfs.fat/mkfs.xfs on the
+# resulting partition nodes. The checkout is a sibling repo and stays
+# UNMODIFIED, so it is built exactly like brush: same pinned nightly, same musl
+# linker wrapper, and skipped with a warning when it is not present.
+build_disktester() {
+    local arch="$1"
+    echo "🧪 Building $arch disktester (disks-rs)..."
+    local disks_dir="$ROOT_DIR/../disks-rs"
+    if [[ ! -d "$disks_dir" ]]; then
+        echo "⚠️  disks-rs source not found at $disks_dir, skipping"
+        return 0
+    fi
+    local target_triple
+    if [[ "$arch" == "aarch64" ]]; then
+        target_triple="aarch64-unknown-linux-musl"
+    else
+        target_triple="x86_64-unknown-linux-musl"
+    fi
+    (
+        cd "$disks_dir" || exit 1
+        RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
+        cargo "$PINNED_TOOLCHAIN" build -p disktester --target "$target_triple" --release --locked
+    )
+}
+
 # Function to build the input-stack ABI shims (libseat, libudev). These are
 # tracked C source (ports/input-stack/shims) that the image previously packed
 # as a prebuilt blob from ~/code/leandros-artifacts/m4-input-ship because
@@ -481,6 +538,9 @@ for arch in "${ARCHS[@]}"; do
     build_bottom "$arch"
     build_brush "$arch"
     build_coreutils "$arch"
+    build_mkfs_fat "$arch"
+    build_mkfs_xfs "$arch"
+    build_disktester "$arch"
     stage_dbus_session "$arch"
     create_initrd "$arch"
     build_kernel "$arch"

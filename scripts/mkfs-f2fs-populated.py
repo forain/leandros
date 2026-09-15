@@ -349,6 +349,27 @@ def main():
         if os.path.exists(p):
             bin_files.append((b, p, 0o100755))
 
+    # Ad-hoc binaries staged from outside the tree: point LEANDROS_EXTRA_BIN at
+    # a directory and every regular file in it lands in /bin. A name ending in
+    # "-aarch64" or "-x86_64" is per-architecture and is staged, without the
+    # suffix, only into that architecture's image — so one directory can hold
+    # both builds of the same program and each image gets the right one.
+    extra_dir = os.environ.get("LEANDROS_EXTRA_BIN")
+    if extra_dir and os.path.isdir(extra_dir):
+        for name in sorted(os.listdir(extra_dir)):
+            p = os.path.join(extra_dir, name)
+            if not os.path.isfile(p):
+                continue
+            for suffix in ("-aarch64", "-x86_64"):
+                if name.endswith(suffix):
+                    if suffix != f"-{arch}":
+                        name = None
+                    else:
+                        name = name[: -len(suffix)]
+                    break
+            if name:
+                bin_files.append((name, p, 0o100755))
+
     # Static-musl tokio binaries from the S1 spike — K2 acceptance
     # (tokio-echo-selftest regression + the idle-CPU cross-check).
     musl_target = "aarch64-unknown-linux-musl" if arch == "aarch64" else "x86_64-unknown-linux-musl"
@@ -1175,6 +1196,50 @@ def main():
     if os.path.exists(coreutils_bin):
         m4_share_dirs.add("/usr/bin")
         m5_exec_files.append(("/usr/bin", "env", coreutils_bin))
+
+    # ── disks-rs: the disk-provisioning end-to-end path ──────────────────────
+    # disktester (AerynOS's disks-rs, built UNMODIFIED from the sibling
+    # checkout) drives the whole block layer in one run: ftruncate a 32 GiB
+    # sparse image, attach it to /dev/loopN, write a GPT, sync the partition
+    # nodes through BLKPG, then format them. The two formatters are ours
+    # (ports/mkfs-fat, ports/mkfs-xfs) and are execed BY BARE NAME through
+    # std::process::Command — partitioning/src/formatter.rs hardcodes
+    # "mkfs.fat" and "mkfs.xfs" — so they have to sit on the guest's PATH,
+    # which is /usr/bin:/bin. /bin is where every other static binary lives
+    # and is what the names resolve against; there is no /sbin on this image.
+    #
+    # Each of the three is staged only if it was built: mkfs.fat and mkfs.xfs
+    # come from in-tree ports whose build.sh may not have run, and disktester
+    # needs a sibling repo build-all.sh skips with a warning when absent.
+    _musl_triple = ("aarch64-unknown-linux-musl" if arch == "aarch64"
+                    else "x86_64-unknown-linux-musl")
+    p = f"ports/mkfs-fat/target/{_musl_triple}/release/mkfs.fat"
+    if os.path.exists(p):
+        bin_files.append(("mkfs.fat", p, 0o100755))
+    p = f"ports/mkfs-xfs/out/{arch}/mkfs.xfs"
+    if os.path.exists(p):
+        bin_files.append(("mkfs.xfs", p, 0o100755))
+    p = f"../disks-rs/target/{_musl_triple}/release/disktester"
+    if os.path.exists(p):
+        bin_files.append(("disktester", p, 0o100755))
+
+    # disktester loads its provisioning strategy from a path RELATIVE to the
+    # working directory — load_provisioning("crates/provisioning/tests/
+    # use_whole_disk.kdl") in its main.rs — so the file has to be reachable
+    # from wherever it is started, and the documented way to run it is
+    #     cd /root/disks-rs && disktester
+    # Mirroring the upstream tree layout under /root/disks-rs keeps that one
+    # instruction true and leaves disks-rs itself untouched. Copied straight
+    # out of the sibling checkout so the guest reads the same strategy the
+    # upstream tests do; without it the run reaches "Loopback device:
+    # /dev/loop0" and then fails at the KDL parse before touching the disk.
+    _kdl = "../disks-rs/crates/provisioning/tests/use_whole_disk.kdl"
+    if os.path.exists(_kdl):
+        _kdl_dir = "/root/disks-rs/crates/provisioning/tests"
+        for _d in ("/root/disks-rs", "/root/disks-rs/crates",
+                   "/root/disks-rs/crates/provisioning", _kdl_dir):
+            m4_share_dirs.add(_d)
+        m4_share_files.append((_kdl_dir, "use_whole_disk.kdl", _kdl))
 
     # The session launcher itself (a POSIX-sh script). The kernel execve()s ELF
     # only (no "#!"-shebang binfmt), so it is run as `sh /bin/start-cosmic-leandros`.
