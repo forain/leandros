@@ -1758,6 +1758,11 @@ static RAMFS: &[RamEntry] = &[
                data: b"NAME=\"Leandros\"\nVERSION=\"1.0\"\nID=leandros\nPRETTY_NAME=\"Leandros 1.0\"\n" },
     RamEntry { path: b"/proc/version",
                data: b"Linux version 6.0.0-leandros (Leandros Project) (gcc 13.0)\n" },
+    // /proc/cpuinfo is generated dynamically (see gen_proc_system_content) —
+    // it needs one "processor" block per online CPU, which this static
+    // table can't express. This entry is unreachable (the dynamic path is
+    // checked first) but is kept so the RAMFS table still lists the path
+    // for any code that enumerates it statically.
     RamEntry { path: b"/proc/cpuinfo",
                data: b"processor\t: 0\nmodel name\t: Leandros Virtual CPU\ncpu MHz\t\t: 1000.000\n\
                        cache size\t: 4096 KB\nflags\t\t: fpu vme de pse tsc msr pae mce\n" },
@@ -3027,6 +3032,21 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
         return Some(p);
     }
 
+    if path == b"/proc/cpuinfo" {
+        // One block per online CPU — Linux tools (nproc, lscpu, and
+        // anything that counts "processor :" lines) derive the CPU count
+        // from this file, same as sched_getaffinity's mask.
+        let n = sched::active_cpu_count();
+        let mut p = 0;
+        for cpu in 0..n {
+            p = write_lit(buf, p, b"processor\t: ");
+            p = write_u32(buf, p, cpu as u32);
+            p = write_lit(buf, p, b"\nmodel name\t: Leandros Virtual CPU\n\
+                                    cpu MHz\t\t: 1000.000\n\n");
+        }
+        return Some(p);
+    }
+
     if path == b"/proc/mounts" {
         // Legacy mtab-format mount table, generated from the live mount
         // registry — see write_mtab_lines for the field layout and why.
@@ -3332,7 +3352,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/meminfo" || lookup_path == b"/proc/uptime"
                || lookup_path == b"/proc/loadavg" || lookup_path == b"/proc/stat"
-               || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts" {
+               || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts"
+               || lookup_path == b"/proc/cpuinfo" {
             match gen_proc_system(lookup_path) {
                 Some(v) => v,
                 None    => return err_reply(-2),

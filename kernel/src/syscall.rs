@@ -4450,14 +4450,28 @@ fn sys_sched_getparam(_pid: usize, param_ptr: usize) -> isize {
     0
 }
 
-/// sys_sched_getaffinity(pid, cpusetsize, mask_ptr) — report CPU 0 only.
+/// sys_sched_getaffinity(pid, cpusetsize, mask_ptr) — report every online CPU.
+///
+/// Rust's `std::thread::available_parallelism()` on linux-musl derives the
+/// default Tokio/rayon worker-thread count directly from the popcount of
+/// this mask, so under-reporting it (this used to hardcode "CPU 0 only")
+/// silently pins every multi-threaded userland program — brush, cosmic-comp,
+/// and anything else that sizes its thread pool this way — to a single
+/// worker thread no matter how many vCPUs are actually online.
 fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask_ptr: usize) -> isize {
     if mask_ptr == 0 { return -14; }
     let bytes = cpusetsize.min(128);
     if !validate_user_buf(mask_ptr, bytes) { return -14; }
     unsafe { core::ptr::write_bytes(mask_ptr as *mut u8, 0, bytes); }
-    // Set bit 0 — CPU 0 is available.
-    if bytes > 0 { unsafe { *(mask_ptr as *mut u8) = 0x01; } }
+    // Set bits 0..n for the CPUs actually online, clamped to what the
+    // caller's mask can hold (cpusetsize * 8 bits).
+    let n = sched::active_cpu_count().min(bytes.saturating_mul(8));
+    for cpu in 0..n {
+        unsafe {
+            let byte = mask_ptr.wrapping_add(cpu / 8) as *mut u8;
+            *byte |= 1 << (cpu % 8);
+        }
+    }
     bytes as isize
 }
 

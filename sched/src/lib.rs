@@ -323,6 +323,17 @@ pub unsafe fn cpu_id() -> usize {
     arch_cpu_id()
 }
 
+/// Number of CPUs that have entered the scheduler (BSP + booted APs),
+/// clamped to `MAX_CPUS` and to at least 1.
+///
+/// Callers outside this module (e.g. `sys_sched_getaffinity`) must not call
+/// the raw `arch_active_cpu_count()` extern directly — this wrapper is the
+/// safe, clamped entry point.
+pub fn active_cpu_count() -> usize {
+    let n = unsafe { arch_active_cpu_count() };
+    n.clamp(1, MAX_CPUS)
+}
+
 /// Mark `cpu` as needing a reschedule and, if it is a remote CPU, kick it
 /// with a reschedule IPI so it acts on the flag promptly (an idle CPU is
 /// sitting in `hlt`/`wfi`; a busy one preempts at the IPI return path).
