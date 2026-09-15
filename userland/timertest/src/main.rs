@@ -87,6 +87,19 @@ const ITIMER_REAL: c_int = 0;
 const EAGAIN: c_int = 11;
 const MAX_TIMERS: usize = 8;
 
+// timerfd_create/timerfd_settime have no relibc C wrapper (same as
+// idletest/wakepolltest) — issued via the raw `syscall` vararg thunk.
+#[cfg(target_arch = "x86_64")]
+mod nr {
+    pub const TIMERFD_CREATE: i64 = 283;
+    pub const TIMERFD_SETTIME: i64 = 286;
+}
+#[cfg(target_arch = "aarch64")]
+mod nr {
+    pub const TIMERFD_CREATE: i64 = 85;
+    pub const TIMERFD_SETTIME: i64 = 86;
+}
+
 extern "C" {
     pub fn relibc_start_v1(
         sp: *const c_void,
@@ -95,8 +108,11 @@ extern "C" {
 
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    pub fn read(fd: c_int, buf: *mut u8, count: usize) -> isize;
+    pub fn close(fd: c_int) -> c_int;
     pub fn exit(status: i32) -> !;
     pub fn __errno_location() -> *mut c_int;
+    pub fn syscall(sysno: c_long, ...) -> c_long;
 
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
     pub fn clock_gettime(clockid: clockid_t, tp: *mut timespec) -> c_int;
@@ -159,6 +175,7 @@ pub unsafe extern "C" fn timer_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_timer_max_and_eagain() { failures += 1; }
     if !test_alarm_and_setitimer_no_leak() { failures += 1; }
     if !test_clock_monotonic_subtick() { failures += 1; }
+    if !test_timerfd_subtick_interval() { failures += 1; }
 
     puts(b"--- timertest done ---\n\0".as_ptr());
     failures
@@ -456,6 +473,44 @@ unsafe fn test_clock_monotonic_subtick() -> bool {
     print_kv(b"  loop_span_ns=\0", (last - first).max(0) as u64);
 
     report(name, res_ok && monotonic && off_boundary && subtick_step && advanced && sleep_plausible)
+}
+
+// ── 7. timerfd sub-tick periodic interval must not decay to one-shot ────────
+//
+// handle_timerfd_settime converts it_interval from nanoseconds to 100 Hz
+// scheduler ticks by dividing by NS_PER_TICK (10ms). A 5ms interval used to
+// truncate to 0 ticks, and 0 ticks means one-shot to the rest of the timerfd
+// machinery (timerfd_poll_expirations, fold_expired_timerfds), so a timerfd
+// armed with a sub-tick period fired once and never rearmed. Regression for
+// the fix: it_interval floors at 1 tick whenever a nonzero interval_ns was
+// requested.
+
+unsafe fn test_timerfd_subtick_interval() -> bool {
+    let name = b"timerfd_subtick_interval\0";
+
+    let tfd = syscall(nr::TIMERFD_CREATE, CLOCK_MONOTONIC as c_long, 0i64) as c_int;
+    if tfd < 0 { return report(name, false); }
+
+    // 5ms value and interval — both shorter than the 10ms scheduler tick.
+    let its = itimerspec {
+        it_interval: timespec { tv_sec: 0, tv_nsec: 5_000_000 },
+        it_value:    timespec { tv_sec: 0, tv_nsec: 5_000_000 },
+    };
+    if syscall(nr::TIMERFD_SETTIME, tfd as c_long, 0i64,
+        &its as *const itimerspec as c_long, 0i64) != 0 {
+        close(tfd);
+        return report(name, false);
+    }
+
+    // ~100ms at a 5ms period should yield well over one expiration if the
+    // timer keeps rearming; a decayed one-shot would report exactly 1.
+    sleep_ms(100);
+
+    let mut count: u64 = 0;
+    let n = read(tfd, &mut count as *mut u64 as *mut u8, 8);
+
+    close(tfd);
+    report(name, n == 8 && count >= 2)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

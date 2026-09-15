@@ -5674,7 +5674,15 @@ fn handle_timerfd_settime(pid: u32, fd: usize, value_ns: u64, interval_ns: u64) 
     let mut pool = TIMERFD_POOL.lock();
     let e = &mut pool[slot];
     if value_ns == 0 { e.armed = false; e.expirations = 0; }
-    else { e.armed = true; e.deadline_ticks = now + (value_ns / NS_PER_TICK).max(1); e.interval_ticks = interval_ns / NS_PER_TICK; e.expirations = 0; }
+    else {
+        e.armed = true;
+        e.deadline_ticks = now + (value_ns / NS_PER_TICK).max(1);
+        // Sub-tick periodic interval must round up, not down to one-shot:
+        // interval_ticks == 0 means one-shot, so any nonzero interval_ns
+        // shorter than NS_PER_TICK has to floor at 1 tick, not truncate to 0.
+        e.interval_ticks = if interval_ns > 0 { (interval_ns / NS_PER_TICK).max(1) } else { 0 };
+        e.expirations = 0;
+    }
     let armed_deadline = if e.armed { Some(e.deadline_ticks) } else { None };
     drop(pool);
     // Publish the expiry so the poll-deadline tick wakes an epoll_wait(-1)
