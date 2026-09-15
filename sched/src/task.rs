@@ -221,6 +221,12 @@ pub struct Task {
     /// per-task deadline, not a single global that a concurrent register/reset
     /// could clobber (M7 lost-wake).
     pub poll_deadline: u64,
+    /// Interest-set tag mask for a task parked in poll/epoll_wait/select (see
+    /// `poll_tag` / `wake_poll_tagged`). Valid ONLY while `state == Blocked` and
+    /// `blocked_on == Some(POLL_WAIT_CHANNEL)`; written in the same RUN_QUEUE
+    /// hold that publishes those two, and reset to `POLL_TAG_ALL` on wake and in
+    /// `block_on_port_cancel`. `POLL_TAG_ALL` = "wake me for anything".
+    pub poll_mask:     u64,
     /// Futex user-space address this task is waiting on (0 = none).
     pub blocked_futex: usize,
     /// Per-process virtual address space (None for kernel tasks).
@@ -401,6 +407,7 @@ impl Task {
             kernel_stack: stack_base,
             blocked_on: None,
             poll_deadline: u64::MAX,
+            poll_mask:     crate::POLL_TAG_ALL,
             blocked_futex: 0,
             address_space: None,
             exit_code: 0,
@@ -759,6 +766,7 @@ impl Task {
             kernel_stack: kernel_stack_phys,
             blocked_on: None,
             poll_deadline: u64::MAX,
+            poll_mask:     crate::POLL_TAG_ALL,
             blocked_futex: 0,
             address_space: None,
             exit_code: 0,

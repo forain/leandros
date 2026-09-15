@@ -103,6 +103,8 @@ pub struct timespec {
     pub tv_nsec: c_long,
 }
 
+pub type pthread_t = *mut c_void;
+
 extern "C" {
     pub fn relibc_start_v1(
         sp: *const c_void,
@@ -127,6 +129,15 @@ extern "C" {
     pub fn clock_gettime(clockid: clockid_t, tp: *mut timespec) -> c_int;
     pub fn readlink(path: *const u8, buf: *mut u8, bufsize: size_t) -> ssize_t;
     pub fn getpid() -> c_int;
+
+    pub fn usleep(usec: c_uint) -> c_int;
+    pub fn pthread_create(
+        thread: *mut pthread_t,
+        attr: *const c_void,
+        start_routine: extern "C" fn(*mut c_void) -> *mut c_void,
+        arg: *mut c_void,
+    ) -> c_int;
+    pub fn pthread_join(thread: pthread_t, retval: *mut *mut c_void) -> c_int;
 
     // eventfd2/signalfd4/inotify_init1/inotify_add_watch have no relibc C
     // wrapper — go straight through the raw syscall entry point.
@@ -177,8 +188,9 @@ pub unsafe extern "C" fn epoll_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_proc_self_exe() { failures += 1; }
     if !test_proc_pid_exe() { failures += 1; }
     if !test_nested_epoll() { failures += 1; }
+    if !test_epoll_ctl_add_wakes_parked_waiter() { failures += 1; }
 
-    write_summary(10, failures);
+    write_summary(11, failures);
     puts(b"--- epolltest done ---\n\0".as_ptr());
     failures
 }
@@ -550,6 +562,82 @@ unsafe fn test_nested_epoll() -> bool {
     write(1, b"\n".as_ptr(), 1);
 
     report(name, idle_ok && armed_ok && drained_ok)
+}
+
+// ── 11. epoll_ctl(ADD) must wake a sibling already parked in epoll_wait ───────
+//
+// The targeted-wake scheme records a `poll_mask` (the OR of the parked
+// interests' tags) when a thread parks in epoll_wait, and a producer wakes only
+// pollers whose mask intersects the changed object's tag. That opens exactly
+// one lost-wake hole: a CLONE_THREAD sibling EPOLL_CTL_ADDs a NEW fd to a
+// shared epoll instance while this thread is already parked with a mask
+// computed BEFORE that fd existed. A later targeted wake for the new fd (here
+// the eventfd write, tagged EVENTFD) would not intersect the stale mask (the
+// dummy pipe's PIPE tag) and would be lost. The kernel closes it by making
+// sys_epoll_ctl issue an untagged BROADCAST wake on any successful mutation;
+// this test is the direct check of that.
+
+#[repr(C)]
+struct AddRaceArgs { ep: c_int, efd: c_int }
+
+extern "C" fn add_race_sibling(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let a = &*(arg as *const AddRaceArgs);
+        usleep(80_000); // let the main thread reach epoll_wait and park
+        let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { fd: a.efd } };
+        epoll_ctl(a.ep, EPOLL_CTL_ADD, a.efd, &mut ev); // the add whose broadcast we test
+        usleep(5_000);
+        let one: u64 = 1;
+        write(a.efd, &one as *const u64 as *const u8, 8); // EVENTFD-tagged edge
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_epoll_ctl_add_wakes_parked_waiter() -> bool {
+    let name = b"epoll_ctl_add_wakes_parked_waiter\0";
+    // A dummy pipe, never written, keeps the set non-empty and gives the parked
+    // waiter a NARROW mask (the pipe's tag) that excludes the eventfd added
+    // later — the exact stale mask the broadcast must defeat.
+    let mut pfds = [0 as c_int; 2];
+    if pipe2(pfds.as_mut_ptr(), O_NONBLOCK) != 0 { return report(name, false); }
+    let (prd, pwr) = (pfds[0], pfds[1]);
+    let ep = epoll_create1(0);
+    if ep < 0 { close(prd); close(pwr); return report(name, false); }
+    let mut pev = epoll_event { events: EPOLLIN, data: epoll_data { fd: prd } };
+    if epoll_ctl(ep, EPOLL_CTL_ADD, prd, &mut pev) != 0 {
+        close(ep); close(prd); close(pwr); return report(name, false);
+    }
+    let efd = syscall(nr::EVENTFD2, 0i64, 0i64) as c_int;
+    if efd < 0 { close(ep); close(prd); close(pwr); return report(name, false); }
+
+    let mut args = AddRaceArgs { ep, efd };
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(),
+                      add_race_sibling, &mut args as *mut _ as *mut c_void) != 0 {
+        close(efd); close(ep); close(prd); close(pwr); return report(name, false);
+    }
+
+    let mut start: timespec = core::mem::zeroed();
+    clock_gettime(CLOCK_MONOTONIC, &mut start);
+    // Finite (not -1) so a REGRESSED kernel fails slow at the deadline instead
+    // of hanging the whole suite; the parked code path is identical either way.
+    let mut out: [epoll_event; 4] = core::mem::zeroed();
+    let n = epoll_wait(ep, out.as_mut_ptr(), 4, 4000);
+    let mut end: timespec = core::mem::zeroed();
+    clock_gettime(CLOCK_MONOTONIC, &mut end);
+    let elapsed_ms = (end.tv_sec - start.tv_sec) * 1000
+        + (end.tv_nsec - start.tv_nsec) / 1_000_000;
+
+    pthread_join(th, core::ptr::null_mut());
+
+    let mut saw_efd = false;
+    for i in 0..(n.max(0) as usize).min(4) {
+        if out[i].data.fd == efd { saw_efd = true; }
+    }
+    close(efd); close(ep); close(prd); close(pwr);
+    // PROMPT wake is the assertion: a kernel that lost the add-race wake only
+    // returns at the 4000ms deadline (>1000ms).
+    report(name, n >= 1 && saw_efd && elapsed_ms < 1000)
 }
 
 fn ends_with(haystack: &[u8], suffix: &[u8]) -> bool {

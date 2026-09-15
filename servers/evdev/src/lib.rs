@@ -1036,6 +1036,16 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             let mut m = Message::empty();
             m.data[0..8].copy_from_slice(&(revents as u64).to_le_bytes());
             m.data[8..16].copy_from_slice(&seq.to_le_bytes());
+            // Targeted-wake tag: report a narrow EVDEV/dev_id tag so a
+            // compositor that watches /dev/input/eventN in its epoll set keeps a
+            // NARROW poll_mask (it is not forced to POLL_TAG_ALL by this fd) and
+            // is therefore NOT woken by unrelated pipe/eventfd herds. NOTE: the
+            // input push path still wakes BROADCAST (device-agnostic burst
+            // flush — see WAKE_MODE_BURST), so a keystroke still wakes other
+            // pollers; narrowing that producer is a possible follow-up.
+            m.data[24..32].copy_from_slice(
+                &sched::poll_tag(sched::poll_class::EVDEV, dev_id as u32).to_le_bytes());
+            m.data[32] = 1;
             m
         }
         vfs_server::VFS_CLOSE => {

@@ -971,7 +971,7 @@ fn complete_switch(to: usize) {
 
     // Wake VT_WAITACTIVE sleepers; they park on the poll wait-channel rather
     // than yield-spinning, so nothing else brings them back promptly.
-    sched::wake_poll();
+    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::DEVVT, 0));
 }
 
 /// `VT_RELDISP` — the client's half of the handshake.
@@ -988,7 +988,7 @@ fn reldisp(idx: usize, arg: usize) -> isize {
         if arg == 0 {
             // The owner refused. Abandon the switch; the display does not move.
             PHASE.store(PHASE_IDLE, Ordering::Relaxed);
-            sched::wake_poll();
+            sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::DEVVT, 0));
             return 0;
         }
         complete_switch(PHASE_TO.load(Ordering::Relaxed));
@@ -999,7 +999,7 @@ fn reldisp(idx: usize, arg: usize) -> isize {
     if idx != PHASE_TO.load(Ordering::Relaxed) { return EINVAL; }
     if arg != VT_ACKACQ { return EINVAL; }
     PHASE.store(PHASE_IDLE, Ordering::Relaxed);
-    sched::wake_poll();
+    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::DEVVT, 0));
     0
 }
 
@@ -1169,7 +1169,7 @@ pub fn cleanup_pid(pid: u32) {
         PHASE_WAIT_REL => complete_switch(PHASE_TO.load(Ordering::Relaxed)),
         PHASE_WAIT_ACQ => {
             PHASE.store(PHASE_IDLE, Ordering::Relaxed);
-            sched::wake_poll();
+            sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::DEVVT, 0));
         }
         _ => {}
     }

@@ -2488,7 +2488,7 @@ fn sys_poll(fds_ptr: usize, nfds: usize, timeout_ms: isize) -> isize {
         if !infinite && ticks() >= deadline { return 0; }
         if interrupted() { return -4; } // EINTR
 
-        poll_block(infinite, deadline, || poll_any_ready(pid, fds_ptr, nfds));
+        poll_block(infinite, deadline, poll_fds_mask(pid, fds_ptr, nfds), || poll_any_ready(pid, fds_ptr, nfds));
     }
 }
 
@@ -2539,7 +2539,7 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
         if !infinite && ticks() >= deadline { return 0; }
         if interrupted() { return -4; } // EINTR
 
-        poll_block(infinite, deadline, || poll_any_ready(pid, fds_ptr, nfds));
+        poll_block(infinite, deadline, poll_fds_mask(pid, fds_ptr, nfds), || poll_any_ready(pid, fds_ptr, nfds));
     }
 }
 
@@ -7021,7 +7021,7 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     let mut ep = EPOLL_INSTANCES.lock();
     if !ep[slot].in_use || ep[slot].owner_tgid != tgid { return -9; }
 
-    match op {
+    let r = match op {
         CTL_ADD | CTL_MOD => {
             if event_ptr == 0 || !validate_user_buf(event_ptr, EPOLL_EVENT_SIZE) { return -14; }
             let events = unsafe { core::ptr::read(event_ptr as *const u32) };
@@ -7053,7 +7053,16 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
             0
         }
         _ => -22, // EINVAL
-    }
+    };
+    drop(ep);
+    // THE ONE REAL LOST-WAKE HOLE (see the targeted-wake design): a sibling
+    // thread may be parked in epoll_wait on this instance with a `poll_mask`
+    // computed BEFORE this add/mod/del, so a *targeted* wake for the newly
+    // added fd would never reach it. Broadcast unconditionally on any
+    // successful mutation — epoll_ctl is not a hot path, and Linux likewise
+    // wakes waiters from ep_insert/ep_modify.
+    if r >= 0 { sched::wake_poll(); }
+    r
 }
 
 /// sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms)
@@ -7112,6 +7121,11 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
         // commit last_seq / disarm ONESHOT, matching by fd since a sibling
         // epoll_ctl may have mutated the slot meanwhile.
         let mut n = 0usize;
+        // OR of every armed interest's targeted-wake tag; becomes this task's
+        // `poll_mask` if we park below. The loop only `break`s early once an
+        // event has fired (n > 0), in which case we return before using `mask`,
+        // so whenever we reach the park `mask` has seen every armed interest.
+        let mut mask = 0u64;
         // Re-read the high-water mark on every pass: a CLONE_THREAD sibling
         // sharing this epoll fd may epoll_ctl(ADD) while we are blocked below,
         // and the new interest must be visible to the next probe.
@@ -7120,7 +7134,8 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
             if n >= maxevents { break; }
             let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
             if !interest.in_use || !interest.armed { continue; }
-            let (cur, seq) = probe_fd_events_seq(pid, interest.fd as usize, interest.events);
+            let (cur, seq, tag) = probe_fd_events_seq(pid, interest.fd as usize, interest.events);
+            mask |= tag;
             let et = interest.events & EPOLLET != 0;
             let fire = cur != 0 && (!et || match seq {
                 Some(s) => s != interest.last_seq,
@@ -7151,7 +7166,11 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
         // re-probe between prepare and commit closes the check-then-sleep
         // lost-wake (an edge landing after the probe above lands as a
         // wake_poll against an already-Blocked task, or shows in the re-probe).
-        sched::block_on_poll_prepare_until(if infinite { u64::MAX } else { deadline });
+        // A zero mask (e.g. the only interest is an empty nested epoll) must
+        // NOT park narrow — poll_mask 0 is immune even to a broadcast wake, a
+        // hang. Fall back to broadcast.
+        let mask = if mask == 0 { sched::POLL_TAG_ALL } else { mask };
+        sched::block_on_poll_prepare_masked(if infinite { u64::MAX } else { deadline }, mask);
         if epoll_any_ready(pid, slot) || interrupted()
             || (!infinite && ticks() >= deadline) {
             sched::block_on_poll_cancel();
@@ -7174,7 +7193,7 @@ fn epoll_any_ready_nested(pid: u32, slot: usize, depth: u32) -> bool {
     for i in 0..hi {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
         if !interest.in_use || !interest.armed { continue; }
-        let (cur, seq) =
+        let (cur, seq, _tag) =
             probe_fd_events_seq_nested(pid, interest.fd as usize, interest.events, depth);
         let et = interest.events & EPOLLET != 0;
         let fire = cur != 0 && (!et || match seq {
@@ -7355,6 +7374,13 @@ pub fn poll_deadline_tick() {
         // registering (M7 lost-wake). Contended tick just retries next tick.
         sched::service_poll_deadlines(now, timerfd_due);
     }
+    // Pay any wake a pipe deferred because it only advanced an object's edge
+    // `seq` without changing its readable/writable level (see
+    // `sched::request_poll_wake` and the pipe arms in `servers/vfs`). This is
+    // NOT the safety net below: it fires only when some writer actually asked
+    // for it, so an idle system still takes zero wakes per tick, and a burst of
+    // thousands of small writes costs one herd per tick instead of one each.
+    sched::service_deferred_poll_wake();
     // Bring-up safety net (design §1), OFF: a periodic unconditional wake would
     // turn any missed edge site into a ≤100 ms latency blip instead of a hang.
     // Kept false so the idle-CPU test proves edge coverage is complete.
@@ -7367,13 +7393,51 @@ pub fn poll_deadline_tick() {
 /// deadline tick. `reprobe` is a read-only "is anything ready now" check — it
 /// must not write user memory (that happens at the caller's loop top). The
 /// re-probe between prepare and commit closes the check-then-sleep lost-wake.
-fn poll_block(infinite: bool, deadline: u64, reprobe: impl FnOnce() -> bool) {
-    sched::block_on_poll_prepare_until(if infinite { u64::MAX } else { deadline });
+fn poll_block(infinite: bool, deadline: u64, mask: u64, reprobe: impl FnOnce() -> bool) {
+    // `mask` is the OR of the interest set's tags; 0 (empty/untaggable set)
+    // falls back to broadcast so the parked task is never immune to a wake.
+    let mask = if mask == 0 { sched::POLL_TAG_ALL } else { mask };
+    sched::block_on_poll_prepare_masked(if infinite { u64::MAX } else { deadline }, mask);
     if reprobe() || interrupted() || (!infinite && ticks() >= deadline) {
         sched::block_on_poll_cancel();
         return;
     }
     sched::block_on_poll_commit();
+}
+
+/// The targeted-wake mask for a directly-watched fd (poll/ppoll/select). One
+/// VFS_POLL/NET_POLL round trip via `probe_fd_events_seq`; broadcast for the
+/// console/fd-0 shortcuts and any untagged server.
+fn poll_fd_tag(pid: u32, fd: usize) -> u64 {
+    probe_fd_events_seq(pid, fd, u32::MAX).2
+}
+
+/// OR of the tags of every fd a `poll`/`ppoll` set names. Run only on the park
+/// path (nready == 0), so the extra round trips cost nothing while events are
+/// ready. Negative (skipped) pollfd entries contribute nothing; a 0 result
+/// (empty/untaggable set) is turned into broadcast by `poll_block`.
+fn poll_fds_mask(pid: u32, fds_ptr: usize, nfds: usize) -> u64 {
+    let mut mask = 0u64;
+    for i in 0..nfds {
+        let pfd = fds_ptr + i * 8;
+        let fd = unsafe { core::ptr::read(pfd as *const i32) };
+        if fd < 0 { continue; }
+        mask |= poll_fd_tag(pid, fd as usize);
+    }
+    mask
+}
+
+/// OR of the tags of every fd a `select` set names (read or write side).
+fn select_fds_mask(pid: u32, nfds: usize, rfds: usize, wfds: usize,
+                    has_r: bool, has_w: bool) -> u64 {
+    let mut mask = 0u64;
+    for fd in 0..nfds {
+        let want_r = has_r && unsafe { (*(rfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
+        let want_w = has_w && unsafe { (*(wfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
+        if !want_r && !want_w { continue; }
+        mask |= poll_fd_tag(pid, fd);
+    }
+    mask
 }
 
 /// Read-only "any pollfd ready" scan for the poll/ppoll re-probe (no revents
@@ -7514,13 +7578,19 @@ fn probe_fd_events_nested(pid: u32, fd: usize, requested: u32, depth: u32) -> u3
 /// VFS handle_poll); `None` means the fd has no edge source (net sockets, fd
 /// 0-2), so the caller must treat it level-triggered. The revents masking
 /// matches `probe_fd_events` exactly.
-fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>) {
+fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>, u64) {
     probe_fd_events_seq_nested(pid, fd, requested, 0)
 }
 
 /// `probe_fd_events_seq` with the nested-epoll recursion depth threaded through.
+///
+/// The third return value is the targeted-wake tag for this interest (see
+/// `sched::poll_tag`): the caller ORs it into the parked poller's `poll_mask`.
+/// It is `POLL_TAG_ALL` (broadcast) for anything with no per-object tag (fd
+/// 0-2, console proxies, a device server that does not fill data[32]) so a
+/// forgotten producer degrades to today's herd, never to a lost wake.
 fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
-    -> (u32, Option<u64>)
+    -> (u32, Option<u64>, u64)
 {
     const POLLERR:  u32 = 0x0008;
     const POLLHUP:  u32 = 0x0010;
@@ -7529,9 +7599,16 @@ fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
     // A nested epoll fd has no edge source of its own, so it stays
     // level-triggered (None) — its readiness is recomputed from its interest
     // list on every probe. Checked before the console/socket routing below
-    // because EPOLL_FD_BASE sits inside the "not a VFS fd" range.
+    // because EPOLL_FD_BASE sits inside the "not a VFS fd" range. Its tag is
+    // the OR of its children's tags (see `epoll_tag_mask`); an empty nested set
+    // contributes 0 (any later add broadcasts via sys_epoll_ctl).
     if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&fd) {
-        return (probe_fd_events_nested(pid, fd, requested, depth), None);
+        let state = probe_fd_events_nested(pid, fd, requested, depth);
+        let tag = match epoll_slot_of(fd) {
+            Some(slot) => epoll_tag_mask(pid, slot, depth),
+            None       => sched::POLL_TAG_ALL,
+        };
+        return (state, None, tag);
     }
     // fd 0-2 and console stdio proxies (/dev/tty, dup'd stdin — VFS DevStdio
     // vnodes) have no edge source and stay level-triggered (None): VFS
@@ -7558,12 +7635,16 @@ fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
         || (fd > 2 && vfs::fd_is_console_stdio(pid, fd)
                    && vfs::fd_vt_number(pid, fd) != Some(0))
     {
-        return (probe_fd_events(pid, fd, requested), None);
+        // fd 0-2 / console proxies: no per-object tag, so broadcast. This makes
+        // any poller that watches stdin/console woken by everything — rare, and
+        // the safe direction.
+        return (probe_fd_events(pid, fd, requested), None, sched::POLL_TAG_ALL);
     }
     // Net sockets: a connected AF_UNIX socket now carries a combined edge-seq
     // (data[16]==1) so an EPOLLET tokio socket is edge-gated instead of
     // re-firing on every level-writable epoll_wait return; listeners/inet
-    // report no seq (data[16]==0) → level.
+    // report no seq (data[16]==0) → level. data[32]==1 carries the poll tag
+    // (AF_UNIX); inet leaves it 0 → broadcast.
     if fd >= net_server::SOCK_FD_BASE {
         let msg = make_vfs_msg(net_server::NET_POLL, &[fd as u64]);
         let reply = net_server::handle(&msg, pid);
@@ -7572,16 +7653,51 @@ fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
         let seq = if reply.data[16] == 1 {
             Some(u64::from_le_bytes(reply.data[8..16].try_into().unwrap_or([0u8; 8])))
         } else { None };
+        let tag = reply_poll_tag(&reply);
         let masked = (state & requested) | (state & (POLLERR | POLLHUP | POLLNVAL));
-        return (masked, seq);
+        return (masked, seq, tag);
     }
     let msg = make_vfs_msg(vfs::VFS_POLL, &[fd as u64]);
     let reply = vfs::handle(&msg, pid);
     let r = vfs_reply_val(&reply);
     let state = if r < 0 { POLLNVAL } else { r as u32 };
     let seq = u64::from_le_bytes(reply.data[8..16].try_into().unwrap_or([0u8; 8]));
+    let tag = reply_poll_tag(&reply);
     let masked = (state & requested) | (state & (POLLERR | POLLHUP | POLLNVAL));
-    (masked, Some(seq))
+    (masked, Some(seq), tag)
+}
+
+/// Read the targeted-wake tag from a VFS_POLL / NET_POLL reply: data[24..32]
+/// when the valid flag data[32]==1, else `POLL_TAG_ALL` (broadcast). A server
+/// that has not been converted leaves data[32]==0 and its pollers degrade to
+/// broadcast — never to tag 0, which would contribute nothing and lose a wake.
+fn reply_poll_tag(reply: &Message) -> u64 {
+    if reply.data[32] == 1 {
+        u64::from_le_bytes(reply.data[24..32].try_into().unwrap_or([0u8; 8]))
+    } else {
+        sched::POLL_TAG_ALL
+    }
+}
+
+/// OR of the tags of an epoll instance's armed interests — the tag a nested or
+/// directly-watched epoll fd contributes. Recurses through nested epoll fds;
+/// at the nesting limit it cannot enumerate, so it returns `POLL_TAG_ALL`
+/// (broadcast) rather than narrowing. An empty instance returns 0 (contributes
+/// nothing — a later epoll_ctl ADD broadcasts). Per-interest EPOLL_INSTANCES
+/// lock, dropped before each probe (invariant 82d0cc3), mirroring
+/// `epoll_any_ready_nested`.
+fn epoll_tag_mask(pid: u32, slot: usize, depth: u32) -> u64 {
+    if depth >= EPOLL_MAX_NEST { return sched::POLL_TAG_ALL; }
+    let hi = { EPOLL_INSTANCES.lock()[slot].hi as usize };
+    let mut mask = 0u64;
+    for i in 0..hi {
+        let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
+        if !interest.in_use || !interest.armed { continue; }
+        let (_cur, _seq, tag) =
+            probe_fd_events_seq_nested(pid, interest.fd as usize, interest.events, depth + 1);
+        mask |= tag;
+    }
+    mask
 }
 
 fn sys_eventfd2(initval: usize, flags: usize) -> isize {
@@ -7830,7 +7946,7 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize)
         }
         if interrupted() { return -4; } // EINTR
 
-        poll_block(infinite, deadline, || select_any_ready(pid, nfds, rfds, wfds, has_r, has_w));
+        poll_block(infinite, deadline, select_fds_mask(pid, nfds, rfds, wfds, has_r, has_w), || select_any_ready(pid, nfds, rfds, wfds, has_r, has_w));
     }
 }
 

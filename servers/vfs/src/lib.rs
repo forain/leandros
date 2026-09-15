@@ -211,9 +211,16 @@ fn val_reply(v: u64) -> Message { make_reply(v as i64) }
 
 /// VFS_POLL reply carrying both the revents bitmask (data[0..8]) and the
 /// object's edge-trigger sequence (data[8..16]). See handle_poll / PipeRing::seq.
-fn poll_reply(revents: u32, seq: u64) -> Message {
+fn poll_reply(revents: u32, seq: u64, tag: u64) -> Message {
     let mut m = make_reply(revents as i64);
     m.data[8..16].copy_from_slice(&seq.to_le_bytes());
+    // Targeted-wake tag (see sched::poll_tag): data[24..32] carries it and
+    // data[32] == 1 marks it valid. data[32] == 0 (a server that does not fill
+    // this in) means the kernel prober must treat the interest as broadcast
+    // (POLL_TAG_ALL) — never as tag 0, which would contribute nothing and could
+    // lose a wake.
+    m.data[24..32].copy_from_slice(&tag.to_le_bytes());
+    m.data[32] = 1;
     m
 }
 
@@ -3759,6 +3766,9 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 //    0 (EOF)     = write end closed → caller returns 0
                 return if r.writers > 0 { err_reply(-11) } else { val_reply(0) };
             }
+            // Only a FULL ring withholds POLLOUT (see handle_poll's write-end
+            // arm), so only a drain that starts from full is a level change.
+            let was_full = r.count == PIPE_RING_SIZE;
             let mut n = 0usize;
             while n < count.min(4096) {
                 match r.get() { Some(b) => { unsafe { *buf.add(n) = b; } n += 1; } None => break }
@@ -3768,8 +3778,21 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // pipe is re-woken edge-triggered.
             if n > 0 { r.seq = r.seq.wrapping_add(1); }
             drop(rings); // release PIPE_RINGS before waking pollers (K2 lock order)
-            // A writer parked on a full pipe now has POLLOUT space freed.
-            if n > 0 { sched::wake_poll(); }
+            // Mirror of the write arm below, and for the same reason: an
+            // unconditional `wake_poll` here is a system-wide herd, and a
+            // reader draining a pipe in 4 KiB bites pays it on every single
+            // read. Only the full → not-full transition actually flips the
+            // write end's POLLOUT level, so only that transition can release a
+            // poller that parked *because* POLLOUT was false. Every other
+            // drain merely advanced `seq`, which matters solely to an EPOLLET
+            // interest that is parked with `last_seq == seq`; that is real but
+            // rare, so it is deferred and coalesced by the tick rather than
+            // charged to every read.
+            if n > 0 {
+                let tag = sched::poll_tag(sched::poll_class::PIPE, ring_idx as u32);
+                if was_full { sched::wake_poll_tagged(tag); }
+                else        { sched::request_poll_wake_tagged(tag); }
+            }
             val_reply(n as u64)
         }
         VnodeKind::Pty { pair, is_master } => {
@@ -3956,6 +3979,11 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             let mut rings = PIPE_RINGS.lock();
             let r = &mut rings[ring_idx];
             if r.readers == 0 { return err_reply(-32); } // EPIPE
+            // Captured before the put loop: an EMPTY ring is the only state in
+            // which the read end withholds POLLIN, so empty → non-empty is the
+            // only write that changes the read end's readiness *level*. See the
+            // wake block below.
+            let was_empty = r.count == 0;
             let mut n = 0usize;
             while n < count {
                 if !r.put(unsafe { *buf.add(n) }) { break; }
@@ -3973,7 +4001,45 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // A reader parked in poll/epoll_wait on the read end has a new
             // POLLIN edge (K2 real blocking — the seq bump above alone no
             // longer suffices once the reader actually sleeps).
-            if n > 0 { sched::wake_poll(); }
+            //
+            // THE HERD. `sched::wake_poll` is not a targeted wake: there is one
+            // global POLL_WAIT_CHANNEL, so it wakes EVERY parked poller in the
+            // system, each of which then re-probes its entire interest set
+            // through the global FD_TABLES / PIPE_RINGS locks. Calling it
+            // unconditionally charges that to every write(2), however small.
+            // Rust's `std::io::Stderr` is unbuffered, so tracing's fmt layer
+            // emits one write per format fragment: cosmic-comp's ~4.4 KB of
+            // startup logging is thousands of writes down a launch-pad pipe,
+            // thousands of herds, and a cosmic-session handshake that took
+            // ~40 s on 4 vCPUs against ~2.4 s with the same output redirected
+            // to a file (the file path calls wake_poll never).
+            //
+            // WHY THE EDGE IS ENOUGH. A poller only ever parks after its
+            // re-probe said "not ready": epoll_wait's three-phase block
+            // (kernel/src/syscall.rs ~:7156) publishes Blocked, RE-probes, and
+            // cancels if anything is ready, so a reader cannot be asleep on a
+            // ring it has been told holds data. A blocking read()er likewise
+            // only returns to its retry loop on EAGAIN, which the arm above
+            // answers only when `count == 0`. So a parked POLLIN waiter implies
+            // an empty ring, and `was_empty` is exactly the transition that can
+            // release one.
+            //
+            // WHY THE OTHER CASE IS DEFERRED, NOT DROPPED. One poller CAN park
+            // with data queued: an EPOLLET interest that was already delivered
+            // for the current `seq` does not re-fire until `seq` moves again
+            // (`fire = cur != 0 && seq != last_seq`), so it can re-enter
+            // epoll_wait while the ring is non-empty. A write that leaves the
+            // ring non-empty still moves `seq` and so still owes that interest
+            // a wake. `request_poll_wake` hands it to the 100 Hz tick, which
+            // collapses any number of such writes into one herd and bounds the
+            // extra latency at ~10 ms. Dropping it instead would be a real lost
+            // wake: POLL_SAFETY_WAKE is off and an epoll_wait(-1) waiter has no
+            // deadline, so nothing else would ever wake it.
+            if n > 0 {
+                let tag = sched::poll_tag(sched::poll_class::PIPE, ring_idx as u32);
+                if was_empty { sched::wake_poll_tagged(tag); }
+                else         { sched::request_poll_wake_tagged(tag); }
+            }
             val_reply(n as u64)
         }
         VnodeKind::TmpFile { idx, pos, writable } => {
@@ -4045,7 +4111,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             drop(seqs);
             // eventfd is mio/tokio's runtime waker: a POLLIN edge for whoever
             // is parked in epoll_wait (K2 real blocking).
-            sched::wake_poll();
+            sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::EVENTFD, slot as u32));
             val_reply(8)
         }
         VnodeKind::DevStdio { target_fd } => {
@@ -5720,7 +5786,9 @@ fn handle_timerfd_settime(pid: u32, fd: usize, value_ns: u64, interval_ns: u64) 
     // waiter parked on this timerfd (K2). If it is already due, wake now.
     if let Some(d) = armed_deadline {
         sched::register_poll_deadline(d);
-        if sched::ticks() >= d { sched::wake_poll(); }
+        if sched::ticks() >= d {
+            sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::TIMERFD, slot as u32));
+        }
     }
     ok_reply()
 }
@@ -5912,7 +5980,7 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
     // EVENTFD_SEQ). fd kinds with no re-arming edge source report seq 0, which
     // makes an EPOLLET interest fire exactly once for their (constant)
     // readiness — correct edge behaviour for an always-ready fd.
-    let (revents, seq): (u32, u64) = match &tbl.fds[fd].kind {
+    let (revents, seq, tag): (u32, u64, u64) = match &tbl.fds[fd].kind {
         VnodeKind::Pipe { ring, is_write: false } => {
             let r = *ring;
             drop(tbls);
@@ -5920,7 +5988,7 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             let mut ev = 0;
             if ring.count > 0 { ev |= POLLIN; }
             if ring.writers == 0 { ev |= POLLIN | POLLHUP; } // EOF: read() returns 0 without blocking
-            (ev, ring.seq)
+            (ev, ring.seq, sched::poll_tag(sched::poll_class::PIPE, r as u32))
         }
         VnodeKind::Pipe { ring, is_write: true } => {
             let r = *ring;
@@ -5933,7 +6001,7 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             } else {
                 0
             };
-            (ev, ring.seq)
+            (ev, ring.seq, sched::poll_tag(sched::poll_class::PIPE, r as u32))
         }
         // The pty pool owns the only honest answer here: `poll_mask` mirrors
         // `master_read`/`slave_read` case for case, including canonical mode's
@@ -5942,20 +6010,23 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
         VnodeKind::Pty { pair, is_master } => {
             let (p, m) = (*pair as usize, *is_master);
             drop(tbls);
-            (tty_server::pty::poll_mask(p, m), tty_server::pty::seq(p))
+            (tty_server::pty::poll_mask(p, m), tty_server::pty::seq(p),
+             sched::poll_tag(sched::poll_class::PTY, p as u32))
         }
         VnodeKind::RamFile { .. } | VnodeKind::TmpFile { .. } | VnodeKind::MountedFile { .. }
         | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom | VnodeKind::DevFb { .. }
         | VnodeKind::BlockDev { .. } | VnodeKind::SysBlock { .. } => {
             drop(tbls);
-            (POLLIN | POLLOUT, 0) // synchronous, memory- or polled-disk-backed I/O never blocks here
+            // Always ready ⇒ a poller never actually parks on these; broadcast
+            // tag is correct and costs nothing.
+            (POLLIN | POLLOUT, 0, sched::POLL_TAG_ALL)
         }
         VnodeKind::EventFd { slot } => {
             let s = *slot;
             drop(tbls);
             let mut ev = POLLOUT; // only EINVAL's on overflow, never actually blocks
             if EVENTFD_COUNTERS.lock()[s] > 0 { ev |= POLLIN; }
-            (ev, EVENTFD_SEQ.lock()[s])
+            (ev, EVENTFD_SEQ.lock()[s], sched::poll_tag(sched::poll_class::EVENTFD, s as u32))
         }
         VnodeKind::TimerFd { slot } => {
             let s = *slot;
@@ -5964,7 +6035,8 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             // expiration advances it; a read that resets expirations drops
             // revents to 0 so no spurious fire results.
             let exp = timerfd_poll_expirations(s);
-            (if exp > 0 { POLLIN } else { 0 }, exp)
+            (if exp > 0 { POLLIN } else { 0 }, exp,
+             sched::poll_tag(sched::poll_class::TIMERFD, s as u32))
         }
         VnodeKind::SignalFd { mask } => {
             let mask = *mask;
@@ -5972,11 +6044,14 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             // POLLIN once a signal in the mask is pending for the caller. seq 0
             // (level); calloop's Signals source registers this level-triggered.
             let pending = (sched::pending_signals() | sched::shared_pending_signals()) & mask;
-            (if pending != 0 { POLLIN } else { 0 }, 0)
+            // No producer calls wake_poll for a signalfd today (a pending signal
+            // is delivered by the signal machinery, which broadcasts). Broadcast
+            // mask so a level-triggered calloop Signals source is never missed.
+            (if pending != 0 { POLLIN } else { 0 }, 0, sched::POLL_TAG_ALL)
         }
         VnodeKind::Inotify { .. } => {
             drop(tbls);
-            (0, 0) // never fires — accepted watches silently produce no events
+            (0, 0, sched::POLL_TAG_ALL) // never fires — accepted watches silently produce no events
         }
         VnodeKind::DynamicDevice { port, dev_id, open_id } => {
             let port = *port;
@@ -6001,10 +6076,19 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             let reply = call_port(port, proxy);
             let raw = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
             if raw < 0 {
-                (0, 0)
+                (0, 0, sched::POLL_TAG_ALL)
             } else {
                 let seq = u64::from_le_bytes(reply.data[8..16].try_into().unwrap_or([0u8; 8]));
-                (raw as u32, seq)
+                // A device server that fills data[32]=1 gives us its object tag
+                // (evdev does — see servers/evdev VFS_POLL). One that does not
+                // (DRM today) leaves data[32]==0, and we fall back to broadcast
+                // so its wake_poll is never missed.
+                let tag = if reply.data[32] == 1 {
+                    u64::from_le_bytes(reply.data[24..32].try_into().unwrap_or([0u8; 8]))
+                } else {
+                    sched::POLL_TAG_ALL
+                };
+                (raw as u32, seq, tag)
             }
         }
         VnodeKind::DevVt { vt, seen } => {
@@ -6014,7 +6098,7 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
                 // A console; the kernel answers its readiness from the serial
                 // port and evdev before reaching here (`fd_is_console_stdio`).
                 // POLLOUT only, never a POLLIN this crate cannot substantiate.
-                (POLLOUT, 0)
+                (POLLOUT, 0, sched::POLL_TAG_ALL)
             } else {
                 // /dev/tty0's VT-change edge. The seq IS the active VT number:
                 // sys_epoll_wait compares seqs for inequality, and the readable
@@ -6023,15 +6107,15 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
                 // non-event by both measures. See `fd_vt_number`.
                 let cur = tty_server::vt::active();
                 let ev = if cur as u8 != seen { POLLIN | POLLOUT } else { POLLOUT };
-                (ev, cur as u64)
+                (ev, cur as u64, sched::poll_tag(sched::poll_class::DEVVT, 0))
             }
         }
         VnodeKind::DevStdio { .. } | VnodeKind::None => {
             drop(tbls);
-            (0, 0)
+            (0, 0, sched::POLL_TAG_ALL)
         }
     };
-    poll_reply(revents, seq)
+    poll_reply(revents, seq, tag)
 }
 
 fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
@@ -7727,7 +7811,8 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
                 write_stat(stat_ptr, 0o100444, n as u64, path_ino(lookup_path, 5));
                 return ok_reply();
             }
-            return err_reply(-2); // ENOENT — nothing else exists under /sys
+            // ENOENT — nothing else exists under the synthesized subtree
+            return err_reply(-2);
         }
         // Dynamic devices. Report the real st_rdev so a path-based stat of
         // /dev/dri/card0 agrees with fstat (libdrm derives 226:0 from it).

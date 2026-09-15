@@ -164,19 +164,26 @@ impl RunQueue {
 
     /// Block the task with `pid`, recording the port it is waiting on.
     pub fn block_on_port(&mut self, pid: Pid, port: u32) {
-        self.block_on_port_until(pid, port, u64::MAX);
+        // IPC/generic waiters are woken by an untagged `unblock_port`; register
+        // the broadcast mask so a tagged poll-wake also always reaches them.
+        self.block_on_port_until(pid, port, u64::MAX, crate::POLL_TAG_ALL);
     }
 
     /// Block the task with `pid` on `port`, recording its wake deadline
-    /// (absolute ticks; `u64::MAX` = none). Set atomically with `state`/
-    /// `blocked_on` so the poll-deadline tick sees a consistent snapshot.
-    pub fn block_on_port_until(&mut self, pid: Pid, port: u32, deadline: u64) {
+    /// (absolute ticks; `u64::MAX` = none) and its poll interest-set `mask`
+    /// (see `poll_tag`; `POLL_TAG_ALL` = broadcast). All three are set
+    /// atomically with `state`/`blocked_on` under the one RUN_QUEUE hold so the
+    /// poll-deadline tick and `unblock_port_tagged` see a consistent snapshot,
+    /// and so no window exists in which `blocked_on == POLL_WAIT_CHANNEL` is
+    /// visible with a stale `poll_mask`.
+    pub fn block_on_port_until(&mut self, pid: Pid, port: u32, deadline: u64, mask: u64) {
         for slot in &mut self.tasks {
             if let Some(task) = slot {
                 if task.pid == pid {
                     task.state         = TaskState::Blocked;
                     task.blocked_on    = Some(port);
                     task.poll_deadline = deadline;
+                    task.poll_mask     = mask;
                     return;
                 }
             }
@@ -186,14 +193,31 @@ impl RunQueue {
     /// Wake all tasks blocked on `port`.  Returns the number woken so the
     /// caller can kick an idle CPU when work became available.
     pub fn unblock_port(&mut self, port: u32) -> usize {
+        // Broadcast: `POLL_TAG_ALL` intersects every non-zero `poll_mask`, and
+        // an IPC waiter's mask is `POLL_TAG_ALL`, so this is exactly the old
+        // wake-everyone behaviour.
+        self.unblock_port_tagged(port, crate::POLL_TAG_ALL)
+    }
+
+    /// Wake tasks blocked on `port` whose `poll_mask` intersects `tag`. IPC
+    /// waiters carry `poll_mask == POLL_TAG_ALL` and so are matched by any
+    /// non-zero tag; a poll waiter carries the OR of its interests' tags. On
+    /// wake the mask is reset to `POLL_TAG_ALL` so a future non-poll block
+    /// (which does not go through `block_on_port_until` — e.g. nothing) can
+    /// never inherit a stale narrow value; the read here is under the same lock
+    /// that the write in `block_on_port_until` took, with `blocked_on` and
+    /// `Blocked` both still true, so the value is always the one this park set.
+    pub fn unblock_port_tagged(&mut self, port: u32, tag: u64) -> usize {
         let min_vr = self.min_vruntime();
         let mut woken = 0;
         for slot in &mut self.tasks {
             if let Some(task) = slot {
-                if task.blocked_on == Some(port) && task.state == TaskState::Blocked {
+                if task.blocked_on == Some(port) && task.state == TaskState::Blocked
+                    && (task.poll_mask & tag) != 0 {
                     task.state         = TaskState::Ready;
                     task.blocked_on    = None;
                     task.poll_deadline = u64::MAX;
+                    task.poll_mask     = crate::POLL_TAG_ALL;
                     task.place(min_vr);
                     woken += 1;
                 }
@@ -229,7 +253,7 @@ impl RunQueue {
                 if !is_poll && !is_futex { continue; }
                 if (timerfd_due && is_poll) || task.poll_deadline <= now {
                     task.state         = TaskState::Ready;
-                    if is_poll  { task.blocked_on    = None; }
+                    if is_poll  { task.blocked_on = None; task.poll_mask = crate::POLL_TAG_ALL; }
                     if is_futex { task.blocked_futex = 0;    }
                     task.poll_deadline = u64::MAX;
                     task.place(min_vr);

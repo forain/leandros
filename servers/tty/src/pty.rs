@@ -389,7 +389,7 @@ pub fn drop_ref(pair: usize, is_master: bool) {
         pending
     };
     pending.fire();
-    sched::wake_poll();
+    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PTY, pair as u32));
 }
 
 // ── output side: slave writes, master reads ──────────────────────────────────
@@ -443,7 +443,7 @@ pub unsafe fn slave_write(pair: usize, buf: *const u8, count: usize) -> isize {
     }
     p.seq = p.seq.wrapping_add(1);
     drop(ptys);
-    sched::wake_poll();
+    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PTY, pair as u32));
     n as isize
 }
 
@@ -482,7 +482,7 @@ pub unsafe fn master_read(pair: usize, buf: *mut u8, count: usize) -> isize {
     drop(ptys);
     // Draining frees space — a slave blocked writing a long output has a new
     // POLLOUT edge.
-    sched::wake_poll();
+    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PTY, pair as u32));
     n as isize
 }
 
@@ -699,7 +699,7 @@ pub unsafe fn master_write(pair: usize, buf: *const u8, count: usize) -> isize {
     }
     pending.fire();
     if n > 0 {
-        sched::wake_poll();
+        sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PTY, pair as u32));
     }
     if n == 0 && count > 0 {
         return -11; // EAGAIN — input queue full, nothing consumed
@@ -766,7 +766,7 @@ pub unsafe fn slave_read(pair: usize, buf: *mut u8, count: usize) -> isize {
     }
     p.seq = p.seq.wrapping_add(1);
     drop(ptys);
-    sched::wake_poll();
+    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PTY, pair as u32));
     n as isize
 }
 
@@ -1089,7 +1089,7 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
     }
     pending.fire();
     if committed {
-        sched::wake_poll();
+        sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PTY, pair as u32));
     }
     rc
 }

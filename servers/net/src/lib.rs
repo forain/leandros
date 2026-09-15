@@ -240,11 +240,19 @@ fn val_reply(v: u64) -> Message { make_reply(v as i64) }
 /// AF_UNIX socket), 0 for level-only sockets (listeners, inet) so the epoll
 /// layer treats them level-triggered. Mirrors vfs::poll_reply plus the
 /// has-seq flag.
-fn net_poll_reply(revents: u64, seq: Option<u64>) -> Message {
+fn net_poll_reply(revents: u64, seq: Option<u64>, tag: Option<u64>) -> Message {
     let mut m = make_reply(revents as i64);
     if let Some(s) = seq {
         m.data[8..16].copy_from_slice(&s.to_le_bytes());
         m.data[16] = 1;
+    }
+    // Targeted-wake tag (see sched::poll_tag): data[24..32] + valid flag at
+    // data[32]. `None` leaves data[32]==0 so the kernel prober treats the
+    // socket as broadcast (POLL_TAG_ALL) — inet has no per-socket identity that
+    // matches its (broadcast) wake_poll, so it always reports None here.
+    if let Some(t) = tag {
+        m.data[24..32].copy_from_slice(&t.to_le_bytes());
+        m.data[32] = 1;
     }
     m
 }
@@ -1720,7 +1728,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     dbg(" conn="); dbg_u(conn_idx as u64);
                     dbg(" -> fd="); dbg_u((new_slot + SOCK_FD_BASE) as u64); dbg("\r\n");
                     // Wake the connector parked in poll/connect (K2).
-                    sched::wake_poll();
+                    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32));
                     val_reply((new_slot + SOCK_FD_BASE) as u64)
                 }
                 None => {
@@ -1896,7 +1904,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         dbg(if is_abstract { " abstract\r\n" } else { " path\r\n" });
         // A listener parked in accept/poll now has a pending connect on its
         // address (K2 real blocking).
-        sched::wake_poll();
+        sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, sock_id as u32));
         ok_reply()
     }
 }
@@ -1993,7 +2001,7 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // New readable edge for the peer end.
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns); // release UNIX_CONNS before waking pollers (K2 lock order)
-            if n > 0 { sched::wake_poll(); }
+            if n > 0 { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
             // Full ring on a non-empty send (couldn't place even one byte) while
             // the peer is still open → EAGAIN, not a bogus "sent 0 bytes".
             // net_blocking_op only retries on -11; a 0 return reaches libwayland,
@@ -2022,7 +2030,7 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             let n = conn.ring_ab.write(buf_ptr as *const u8, len);
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns);
-            if n > 0 { sched::wake_poll(); }
+            if n > 0 { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
             // Full pre-accept buffer on a non-empty send → EAGAIN, not a bogus 0
             // (same livelock as the UnixConnected branch above; peer_closed/
             // closed_b already handled above).
@@ -2192,7 +2200,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // Draining bytes frees ring space → a POLLOUT edge for the peer.
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns); // release UNIX_CONNS before waking pollers (K2 lock order)
-            if n > 0 { sched::wake_poll(); }
+            if n > 0 { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
             val_reply(n as u64)
         }
         SockState::UnixPendingAccept { conn_idx, .. } => {
@@ -2207,7 +2215,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             if n == 0 && len > 0 && !conn.closed_b { return err_reply(-11); } // EAGAIN
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns);
-            if n > 0 { sched::wake_poll(); }
+            if n > 0 { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
             val_reply(n as u64)
         }
         SockState::InetConnected { socket_handle, lo, .. } => {
@@ -2475,7 +2483,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     // New readable edge for the peer (total > 0 guaranteed above).
     conn.seq = conn.seq.wrapping_add(1);
     drop(conns); // release UNIX_CONNS before waking pollers (K2 lock order)
-    sched::wake_poll();
+    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32));
     val_reply(total as u64)
 }
 
@@ -2588,7 +2596,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     let freed = nread > 0;
     if freed { conn.seq = conn.seq.wrapping_add(1); }
     drop(conns); // release before importing (locks FD_TABLES)
-    if freed { sched::wake_poll(); }
+    if freed { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
 
     // Install the delivered fds into the receiver and serialize the cmsg.
     let cloexec = flags & MSG_CMSG_CLOEXEC != 0;
@@ -2689,7 +2697,7 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
             // through the EOF it was waiting for.
             conn.seq = conn.seq.wrapping_add(1);
         } // release UNIX_CONNS before waking pollers (K2 lock order)
-        sched::wake_poll();
+        sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32));
         return ok_reply();
     }
 
@@ -3106,7 +3114,7 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
             }
             drop(tbls2);
             // Peer sees POLLHUP/POLLIN (EOF) once this end really closed.
-            if end_closed { sched::wake_poll(); }
+            if end_closed { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
         }
         SockState::InetConnected { socket_handle, lo, .. } => {
             let sock_type = tbl.socks[slot].sock_type;
@@ -3216,7 +3224,7 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
             dbg("\r\n");
             // A listener parked in poll must stop reporting POLLIN for a
             // connect that no longer exists.
-            if died { sched::wake_poll(); }
+            if died { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
         }
         _ => { tbl.socks[slot] = SockEntry::empty(); }
     }
@@ -3233,7 +3241,7 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
 
-    let (revents, seq): (u64, Option<u64>) = match state {
+    let (revents, seq, tag): (u64, Option<u64>, Option<u64>) = match state {
         SockState::UnixConnected { conn_idx, is_a } => {
             drop(tbls);
             let conns = UNIX_CONNS.lock();
@@ -3258,7 +3266,7 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             // discard a socket that is still writable in the other direction.
             if !conn.in_use || peer_closed { ev |= POLLHUP; }
             // Connected sockets carry the edge-seq so EPOLLET works.
-            (ev, Some(conn.seq))
+            (ev, Some(conn.seq), Some(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)))
         }
         SockState::UnixPendingAccept { conn_idx, .. } => {
             // Connector (end A) awaiting accept: established + writable now (Linux),
@@ -3275,7 +3283,7 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             if readable > 0 || !conn.in_use || conn.rd_shut(true) { ev |= POLLIN; }
             if conn.in_use && !conn.closed_b && !conn.wr_shut(true) && write_free > 0 { ev |= POLLOUT; }
             if !conn.in_use || conn.closed_b { ev |= POLLHUP; }
-            (ev, Some(conn.seq))
+            (ev, Some(conn.seq), Some(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)))
         }
         SockState::UnixListening { bound_idx } => {
             drop(tbls);
@@ -3292,7 +3300,12 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             let pending = listen_sock_id != 0 && tbls2.iter().any(|t| t.in_use && t.socks.iter()
                 .any(|s| matches!(s.state,
                     SockState::UnixPendingAccept { sock_id, .. } if sock_id == listen_sock_id)));
-            (if pending { POLLIN } else { 0 }, None)
+            // A connect() to this listener wakes with poll_tag(UNIX, sock_id)
+            // (see handle_connect), keyed on the SAME sock_id this arm matches.
+            let tag = if listen_sock_id != 0 {
+                Some(sched::poll_tag(sched::poll_class::UNIX, listen_sock_id as u32))
+            } else { None };
+            (if pending { POLLIN } else { 0 }, None, tag)
         }
         SockState::InetConnected { socket_handle, lo, .. } => {
             drop(tbls);
@@ -3315,7 +3328,7 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             } else {
                 0
             };
-            (ev, None)
+            (ev, None, None) // inet: broadcast wake, no per-socket tag
         }
         SockState::InetListening { main, lo, .. } => {
             drop(tbls);
@@ -3333,7 +3346,7 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
                 }
             };
             let ev = if ready(false, main) || ready(true, lo) { POLLIN } else { 0 };
-            (ev, None)
+            (ev, None, None) // inet: broadcast wake, no per-socket tag
         }
         SockState::IcmpBound { socket_handle } => {
             drop(tbls);
@@ -3347,11 +3360,11 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             } else {
                 0
             };
-            (ev, None)
+            (ev, None, None) // icmp: broadcast wake, no per-socket tag
         }
-        _ => { drop(tbls); (0, None) }
+        _ => { drop(tbls); (0, None, None) }
     };
-    net_poll_reply(revents, seq)
+    net_poll_reply(revents, seq, tag)
 }
 
 fn handle_close_all(pid: u32) {

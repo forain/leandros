@@ -1160,6 +1160,7 @@ pub fn block_on_port_cancel() {
         t.state         = TaskState::Running;
         t.blocked_on    = None;
         t.poll_deadline = u64::MAX;
+        t.poll_mask     = POLL_TAG_ALL; // hygiene: never leave a narrow mask behind
     }
 }
 
@@ -1179,6 +1180,53 @@ pub fn block_on_port_commit() {
 // genuine IPC never touches pollers and `wake_poll` never touches IPC waiters.
 pub const POLL_WAIT_CHANNEL: u32 = 0xFFFF_FF01;
 
+// ── Targeted poll wakes (hash-bitmask filtering) ────────────────────────────
+//
+// `wake_poll` is a system-wide herd: every task parked on the single
+// `POLL_WAIT_CHANNEL` is made Ready and re-probes its whole interest set. To
+// wake only the pollers that care about the object that just changed, each
+// parked poller records a `poll_mask: u64` — the OR of a one-bit hash tag per
+// interest it holds — and each producer wakes with the SAME tag for the object
+// it changed; `unblock_port_tagged` skips any task whose `poll_mask & tag == 0`.
+//
+// SAFETY RULE, because a lost wake is a hang: `POLL_TAG_ALL` (all ones) is the
+// broadcast. Every producer that is not converted, and every consumer interest
+// that cannot be hashed, MUST fall back to `POLL_TAG_ALL` — never to a narrower
+// value. A broadcast wake (`tag == POLL_TAG_ALL`) reaches every non-zero mask,
+// and a broadcast mask (`poll_mask == POLL_TAG_ALL`) is reached by every wake,
+// so a forgotten site degrades to today's herd, never to a missed wake.
+pub const POLL_TAG_ALL: u64 = u64::MAX;
+
+/// Poll-object classes. The class disambiguates index spaces that would
+/// otherwise collide (pipe ring 3 vs eventfd slot 3) before hashing.
+pub mod poll_class {
+    pub const PIPE:    u32 = 1;
+    pub const PTY:     u32 = 2;
+    pub const EVENTFD: u32 = 3;
+    pub const TIMERFD: u32 = 4;
+    pub const UNIX:    u32 = 5;
+    pub const INET:    u32 = 6;
+    pub const CONSOLE: u32 = 7;
+    pub const DEVVT:   u32 = 8;
+    pub const DRM:     u32 = 9;
+    pub const EVDEV:   u32 = 10;
+}
+
+/// Hash a `(class, index)` object identity into a single-bit tag. A collision
+/// only makes an extra poller wake (harmless — it re-probes and re-parks); it
+/// can never suppress a needed wake. splitmix64 finalizer for good bit spread
+/// across the 64 buckets; `const fn` so IRQ/tick producers can call it.
+#[inline]
+pub const fn poll_tag(class: u32, index: u32) -> u64 {
+    let mut x = ((class as u64) << 32) | (index as u64);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^= x >> 33;
+    1u64 << (x & 63)
+}
+
 /// Phase 1: publish Blocked-on-poll intent while still executing. No deadline
 /// (an infinite / edge-only waiter). A timed waiter uses
 /// `block_on_poll_prepare_until` instead so its deadline rides the SAME
@@ -1191,9 +1239,25 @@ pub fn block_on_poll_prepare() { block_on_poll_prepare_until(u64::MAX) }
 /// the global `NEXT_POLL_DEADLINE` hint (lock-free) so the tick's fast path can
 /// skip the run-queue scan while nothing is due. The task field is the
 /// authority; the hint is only an optimisation the tick recomputes exactly.
+///
+/// This variant registers a `POLL_TAG_ALL` (broadcast) mask, so it is woken by
+/// any wake_poll. Generic timed parks that are not epoll/poll/select interest
+/// sets (wait4, the net daemon's 100 Hz cadence, nanosleep, drm retire waits)
+/// use it as-is. The real poll/epoll/select park sites use
+/// `block_on_poll_prepare_masked` to register a narrow mask.
 pub fn block_on_poll_prepare_until(deadline: u64) {
+    block_on_poll_prepare_masked(deadline, POLL_TAG_ALL)
+}
+
+/// Phase 1 with an explicit interest-set `mask` (see `poll_tag`). Written in
+/// the SAME RUN_QUEUE critical section that publishes Blocked + `blocked_on ==
+/// POLL_WAIT_CHANNEL`, and read only under that lock with both still true, so a
+/// stale mask is unreachable rather than defended against: every state
+/// transition out of Blocked clears `blocked_on`, and the next park rewrites
+/// the mask.
+pub fn block_on_poll_prepare_masked(deadline: u64, mask: u64) {
     let pid = current_pid();
-    RUN_QUEUE.lock().block_on_port_until(pid, POLL_WAIT_CHANNEL, deadline);
+    RUN_QUEUE.lock().block_on_port_until(pid, POLL_WAIT_CHANNEL, deadline, mask);
     if deadline != u64::MAX {
         NEXT_POLL_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
     }
@@ -1207,15 +1271,81 @@ pub fn block_on_poll_commit()  { block_on_port_commit() }
 /// in net/vfs, the deadline tick, signal delivery) MUST hold no server lock —
 /// this takes RUN_QUEUE. Task context only (blocking lock); IRQ context uses
 /// `try_wake_poll`.
-pub fn wake_poll() { unblock_port(POLL_WAIT_CHANNEL); }
+pub fn wake_poll() { wake_poll_tagged(POLL_TAG_ALL); }
+
+/// Wake every poll-channel waiter whose `poll_mask` intersects `tag`. A
+/// producer passes the `poll_tag(class, index)` of the object it changed; an
+/// unconvertible producer passes `POLL_TAG_ALL` (== `wake_poll`). Same lock /
+/// context contract as `wake_poll`.
+pub fn wake_poll_tagged(tag: u64) {
+    let woken = RUN_QUEUE.lock().unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
+    if woken > 0 { wake_up_an_idle_cpu(); }
+}
+
+/// A `wake_poll` that has been asked for but not yet paid for, as an OR of the
+/// tags requested since the last service. `0` = nothing pending. See
+/// `request_poll_wake`.
+static POLL_WAKE_PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// Ask for a poll-channel wake to happen "soon" (within one 100 Hz tick)
+/// instead of right now, and COALESCE every such request in that window into
+/// a single wake.
+///
+/// `wake_poll` is a system-wide thundering herd, and a deliberately blunt one:
+/// there is exactly one `POLL_WAIT_CHANNEL`, so it takes RUN_QUEUE, linear-
+/// scans all `MAX_TASKS` slots and makes EVERY parked poller in the system
+/// Ready at `min_vruntime` (so the herd also preempts the caller), and each
+/// woken poller then re-probes its whole interest set through the global
+/// `FD_TABLES` / `PIPE_RINGS` locks. Paying that once per `write(2)` is
+/// affordable for a few large writes and ruinous for thousands of tiny ones.
+///
+/// Callers that publish a readiness *level* change (a pipe going empty ->
+/// readable, or full -> writable) must still use `wake_poll`: a poller parked
+/// with that level false has no other way to learn it flipped. Callers that
+/// only advanced an object's edge `seq` without changing its level use this
+/// instead. That case is not merely an optimisation — an `EPOLLET` interest
+/// whose `last_seq` already equals the object's `seq` can be parked with data
+/// still queued, and only a later `seq` change makes it fire again — so the
+/// request must never be dropped, merely deferred. `service_deferred_poll_wake`
+/// on the poll-deadline tick pays it, bounding the delay at one tick (~10 ms)
+/// while collapsing an unbounded burst of writes into <= 100 herds per second.
+pub fn request_poll_wake() { request_poll_wake_tagged(POLL_TAG_ALL); }
+
+/// `request_poll_wake` carrying the tag of the object whose edge `seq` moved.
+/// `fetch_or` merges every deferred request in the window into one tag mask, so
+/// a request landing while a wake is already in flight is merged rather than
+/// stranded.
+pub fn request_poll_wake_tagged(tag: u64) {
+    POLL_WAKE_PENDING.fetch_or(tag, Ordering::Release);
+}
+
+/// Pay any outstanding `request_poll_wake`. Tick / IRQ context only: this uses
+/// `try_wake_poll`, which honors the tick hook's try-lock-only contract.
+///
+/// The swap happens BEFORE the wake, never after: a request published while
+/// the wake is already in flight would otherwise be cleared by a store that
+/// ran after it, and that request's `seq` bump would be stranded until some
+/// unrelated edge happened along. Taking the flag first means such a request
+/// re-arms the flag and is paid by the next tick. A contended `try_wake_poll`
+/// re-arms it too, so contention costs <= 10 ms and never a lost edge.
+pub fn service_deferred_poll_wake() {
+    let tag = POLL_WAKE_PENDING.swap(0, Ordering::AcqRel);
+    if tag != 0 && !try_wake_poll_tagged(tag) {
+        // Contended try_lock: re-arm (OR back) so the next tick pays it.
+        POLL_WAKE_PENDING.fetch_or(tag, Ordering::Release);
+    }
+}
 
 /// Non-blocking `wake_poll` for IRQ / tick context: honors the tick hook's
 /// try_lock-only contract. Returns false (wake deferred) if RUN_QUEUE is
 /// momentarily contended on another CPU; the next tick retries.
-pub fn try_wake_poll() -> bool {
+pub fn try_wake_poll() -> bool { try_wake_poll_tagged(POLL_TAG_ALL) }
+
+/// Non-blocking `wake_poll_tagged` for IRQ / tick context.
+pub fn try_wake_poll_tagged(tag: u64) -> bool {
     match RUN_QUEUE.try_lock() {
         Some(mut rq) => {
-            let woken = rq.unblock_port(POLL_WAIT_CHANNEL);
+            let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
             drop(rq);
             if woken > 0 { wake_up_an_idle_cpu(); }
             true
