@@ -917,10 +917,82 @@ impl VirtioGpuDevice {
             let stat = crate::drm_device_interface::DRM_STATS;
             let t0 = if stat { crate::snd::monotonic_us() } else { 0 };
             let mut timeout = 100_000_000u64;
+
+            // Let the 100 Hz tick in while we wait on the host, WITHOUT making
+            // this a context-switch point.
+            //
+            // Syscalls run with IRQs masked, so this loop used to park the vCPU
+            // at IF=0 for the whole round trip — up to 72 ms under Venus on a
+            // slow host. For that entire window TIMER_TICKS stopped advancing
+            // and none of the tick hooks ran: poll/epoll deadlines went unmet,
+            // `nanosleep` overslept, the audio pump missed its refill (the MAME
+            // latency floor is built on it), and `drm_tick` delivered no
+            // page-flip completions. `irq_window()` fixes that.
+            //
+            // But `irq_window()` on its own is ALSO a scheduling point:
+            // `timer_irq` calls `sched::preempt_check()`, which calls
+            // `yield_now()` even when the IRQ landed in kernel mode. `submit`
+            // is always called with the global `VIRTIO_GPU` mutex held by the
+            // caller (and on several DRM paths with the DRM device mutex held
+            // above it — `drm/device.rs:321`, `:518`,
+            // `drm_device_interface.rs:3425`, `:3882`). Yielding there parks
+            // those mutexes, and all ~28 `VIRTIO_GPU` acquirers and all 21
+            // `get_drm_device()` acquirers are blind `.lock()` spins in syscall
+            // context with IRQs masked: the next task to touch the GPU would
+            // spin at IF=0 forever, never be preempted, and never let the
+            // holder run again. That is a deterministic hang on a 1-vCPU guest
+            // and an eventual one on 4. `preempt_disable` keeps the tick and
+            // drops only the switch, which is the half we cannot afford here.
+            //
+            // The gate: only open a window if IRQs were masked on entry.
+            // `irq_window()` ends by masking, so running it on a caller that
+            // had interrupts ENABLED would hand back a CPU with them off — a
+            // silent state change for the boot paths that reach this same code
+            // (`kms::detect_and_configure`, the early console before
+            // `timer::init` does its `daifclr`). `pid != 0` keeps boot and the
+            // idle task on the old pure-spin path, where there is no tick to
+            // preserve anyway.
+            let window = sched::irqs_masked() && sched::current_pid() != 0;
+
+            /// Restores the preempt count on EVERY exit from the wait — the
+            /// timeout branch, a panic unwind, or any future `?` added inside.
+            /// Leaking the count would wedge preemption on this CPU for good.
+            struct PreemptGuard;
+            impl Drop for PreemptGuard {
+                fn drop(&mut self) {
+                    // NOT `preempt_enable()`: that resched-es here, and here
+                    // the caller still holds `VIRTIO_GPU`. `PREEMPT_NEEDED` was
+                    // left set, so the next `preempt_check` — the next timer
+                    // IRQ, ≤10 ms out, or the syscall return — switches at a
+                    // point where no GPU lock is held.
+                    sched::preempt_enable_no_resched();
+                }
+            }
+            let _preempt = if window {
+                sched::preempt_disable();
+                Some(PreemptGuard)
+            } else {
+                None
+            };
+
+            // The window is throttled to one iteration in 256, and that is not
+            // cosmetic: the bail-out below is an ITERATION count, so its
+            // wall-clock meaning is whatever one iteration costs. `sti; pause;
+            // cli` forces an exit from the TCG execution loop and is two to
+            // three orders of magnitude dearer than a bare `spin_loop`, so
+            // opening a window every pass would silently stretch the same
+            // 100_000_000 budget from seconds into minutes — a wedged control
+            // queue would read as a total freeze instead of printing its
+            // TIMEOUT line. One window per 256 spins still delivers thousands
+            // of windows per millisecond of waiting, against the 100 Hz the
+            // tick actually needs, and leaves the budget's duration roughly
+            // where it was.
             while q.last_used_idx == (*q.used).idx && timeout > 0 {
+                if window && timeout & 0xFF == 0 { sched::irq_window(); }
                 core::hint::spin_loop();
                 timeout -= 1;
             }
+            drop(_preempt);
             if stat {
                 use core::sync::atomic::Ordering::Relaxed;
                 let dt = crate::snd::monotonic_us().wrapping_sub(t0);

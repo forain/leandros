@@ -61,6 +61,22 @@ pub fn get_audio_port() -> u32 { SYS_AUDIO_PORT.load(Ordering::Relaxed) }
 static PREEMPT_NEEDED: [AtomicBool; MAX_CPUS] =
     [const { AtomicBool::new(false) }; MAX_CPUS];
 
+/// Per-CPU preemption-disable nesting depth.  Non-zero means `preempt_check`
+/// must leave `PREEMPT_NEEDED` SET and return without switching: the tick is
+/// deferred, not lost.
+///
+/// This exists so a kernel wait loop can open interrupt windows — keeping the
+/// 100 Hz tick, the tick hooks, poll deadlines, `nanosleep` and the audio pump
+/// alive — *without* the window becoming a context-switch point.  That
+/// distinction is load-bearing: `irq_window()` alone is already a scheduling
+/// point, because `timer_irq` calls `preempt_check()` which calls `yield_now()`
+/// even when the IRQ landed in kernel mode.  A loop that holds a `spin::Mutex`
+/// and yields parks that mutex, and every other acquirer of it spins with IRQs
+/// masked in syscall context and can never be descheduled — a hard hang on a
+/// 1-vCPU guest.  `virtio_gpu::submit` is the first user.
+static PREEMPT_DISABLE: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+
 /// Opened by `run()` on the BSP once kernel init is complete.  APs spin on
 /// this in `ap_entry()` so no task can run on a secondary CPU while the BSP
 /// is still bringing up servers and drivers.
@@ -1555,8 +1571,86 @@ pub fn timer_tick_irq() {
     PREEMPT_NEEDED[id.min(MAX_CPUS - 1)].store(true, Ordering::Relaxed);
 }
 
+/// Suppress preemption on this CPU until the matching `preempt_enable*`.
+///
+/// Ticks still fire and tick hooks still run; only the context switch is
+/// deferred.  Nests.  See [`PREEMPT_DISABLE`] for why the two are separable.
+///
+/// INVARIANT this creates, and the reason it is spelled out here: a section
+/// that pairs `preempt_disable` with `irq_window` runs the **tick hooks on
+/// this CPU with whatever locks that section holds**.  `virtio_gpu::submit`
+/// holds `VIRTIO_GPU`, so every registered tick hook must stay `try_lock`-only
+/// and must never touch `VIRTIO_GPU` or the framebuffer console (`fb_flush`,
+/// `println!`, `serial_print*`).  Hooks that need to log must use
+/// `pci::serial_debug`, which writes the UART directly and takes no lock.
+/// All four current hooks satisfy this — `drm_tick`, `poll_deadline_tick`,
+/// `pipewire::tick_pump`, and the audio pump — and a new one that does not
+/// would deadlock on a non-reentrant `spin::Mutex` against its own CPU.
+#[inline]
+pub fn preempt_disable() {
+    let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    PREEMPT_DISABLE[id].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Undo one `preempt_disable` and honour any tick that arrived meanwhile.
+///
+/// Only safe where a context switch is safe — i.e. no `spin::Mutex` is held.
+/// A section that holds one wants [`preempt_enable_no_resched`].
+#[inline]
+pub fn preempt_enable() {
+    let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    PREEMPT_DISABLE[id].fetch_sub(1, Ordering::Relaxed);
+    preempt_check();
+}
+
+/// Undo one `preempt_disable` WITHOUT resched-ing here.
+///
+/// For sections whose caller still holds a lock when the section ends — the
+/// `virtio_gpu::submit` case, where `VIRTIO_GPU` is held by the caller, so
+/// switching on the way out would be the very yield-under-the-mutex this
+/// mechanism exists to avoid.  Nothing is lost: `PREEMPT_NEEDED` was left set,
+/// so the next `preempt_check` — the next timer IRQ, ≤10 ms away, or the
+/// syscall return path — performs the switch at a point where no lock is held.
+#[inline]
+pub fn preempt_enable_no_resched() {
+    let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    PREEMPT_DISABLE[id].fetch_sub(1, Ordering::Relaxed);
+}
+
+/// True if IRQs are masked on this CPU right now.
+///
+/// Lets a wait loop tell "I was entered from a syscall, IRQs are off, opening
+/// a window is the whole point" from "I was entered with IRQs already on".
+/// `irq_window()` ends by MASKING, so calling it in the latter case would hand
+/// the caller back a CPU with interrupts off — a silent state change for the
+/// boot paths (`kms::detect_and_configure`, the early console) that reach the
+/// same code.
+#[inline(always)]
+pub fn irqs_masked() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let rflags: usize;
+        core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nomem, preserves_flags));
+        rflags & (1 << 9) == 0 // IF
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let daif: usize;
+        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack, preserves_flags));
+        daif & (1 << 7) != 0 // I
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    { true }
+}
+
 pub fn preempt_check() {
     let id = unsafe { cpu_id() };
+    // Hot path is one relaxed load. When preemption is disabled the flag is
+    // deliberately LEFT SET rather than swapped out: the tick is deferred to
+    // the next check, never dropped.
+    if PREEMPT_DISABLE[id.min(MAX_CPUS - 1)].load(Ordering::Relaxed) != 0 {
+        return;
+    }
     if PREEMPT_NEEDED[id.min(MAX_CPUS - 1)].swap(false, Ordering::Relaxed) {
         yield_now("preempt");
     }
