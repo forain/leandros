@@ -1,0 +1,31 @@
+# Deliberately its own workspace root: this crate is built for a musl std
+# target by ports/mkfs-xfs/build.sh, not by the repo-root workspace (kernel /
+# servers, no_std) nor by userland/. Without this, cargo would try to attach it
+# to whichever workspace contains it and fail.
+[workspace]
+
+[package]
+name = "mkfs-xfs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "XFS v5 filesystem formatter for LeandrOS (CLI-compatible with xfsprogs mkfs.xfs)"
+
+[[bin]]
+# Cargo cannot build a target whose name is not a valid crate name, so the
+# binary is built as mkfs_xfs and installed as mkfs.xfs by build.sh.
+name = "mkfs_xfs"
+path = "src/main.rs"
+
+[dependencies]
+# The only dependency: ioctl(BLKGETSIZE64) for block devices whose size
+# lseek(SEEK_END) reports as 0. CRC32C, UUID handling and randomness are all
+# hand-rolled in-crate so the port stays a two-crate build.
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
