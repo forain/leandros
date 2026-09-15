@@ -54,8 +54,8 @@ pub const NAME_MAX: usize = 16;
 /// Slot id naming `/dev/loop-control`, which is a *character* device with no
 /// registry entry of its own.
 pub const LOOP_CONTROL: u16 = 0xFFFE;
-/// "not a device" — the `/sys`, `/sys/class` and `/sys/class/block`
-/// container directories, which belong to no particular device.
+/// "not a device" — the `/sys/class/block` container directory, which
+/// belongs to no particular device.
 pub const NO_DEV: u16 = 0xFFFF;
 
 /// The 512-byte unit every `size`/`start` sysfs attribute is counted in.
@@ -68,9 +68,11 @@ pub const SECTOR: u64 = 512;
 const DISK_BLOCK: usize = 4096;
 
 // ── sysfs directory levels ───────────────────────────────────────────────────
+//
+// Only `/sys/class/block` and below are synthesized; `/sys` and `/sys/class`
+// themselves are staged on disk (see mkfs-f2fs-populated.py) and resolved by
+// the normal mount lookup, so there is no LVL_SYS/LVL_CLASS here.
 
-pub const LVL_SYS: u8 = 0; // /sys
-pub const LVL_CLASS: u8 = 1; // /sys/class
 pub const LVL_BLOCK: u8 = 2; // /sys/class/block
 pub const LVL_DEV: u8 = 3; // /sys/class/block/<name>
 pub const LVL_QUEUE: u8 = 4; // /sys/class/block/<name>/queue
@@ -553,15 +555,16 @@ fn sub_level(dev: u16, e: &BDev, sub: &[u8]) -> Option<u8> {
     }
 }
 
-/// True when `path` is inside the synthesized sysfs tree at all.
+/// True when `path` is inside the synthesized sysfs tree: only
+/// `/sys/class/block` and its descendants are synthesized here. The rest of
+/// `/sys` (including `/sys` and `/sys/class` themselves) is staged on disk
+/// and resolved by the normal mount lookup, exactly like any other path.
 pub fn is_sysfs_path(path: &[u8]) -> bool {
-    path == b"/sys" || path.starts_with(b"/sys/")
+    path == SYS_BLOCK || path.starts_with(b"/sys/class/block/")
 }
 
 /// Resolve `path` to a sysfs *directory*, as `(registry slot, level)`.
 pub fn sysfs_dir(path: &[u8]) -> Option<(u16, u8)> {
-    if path == b"/sys" { return Some((NO_DEV, LVL_SYS)); }
-    if path == b"/sys/class" { return Some((NO_DEV, LVL_CLASS)); }
     if path == SYS_BLOCK { return Some((NO_DEV, LVL_BLOCK)); }
     let (a, b, c) = sys_split(path)?;
     if c.is_some() { return None; } // three components are always an attribute
@@ -722,8 +725,6 @@ pub fn sysfs_dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_MAX])
         Some((n, is_dir))
     };
     match level {
-        LVL_SYS => if idx == 0 { emit(out, b"class", true) } else { None },
-        LVL_CLASS => if idx == 0 { emit(out, b"block", true) } else { None },
         LVL_BLOCK => {
             let b = BDEVS.lock();
             let e = b.iter().filter(|e| e.in_use).nth(idx)?;

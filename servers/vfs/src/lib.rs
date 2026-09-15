@@ -1846,11 +1846,10 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/mnt",
     b"/home",
     b"/root",
-    // Only the root of the sysfs tree is listed. Everything below it is
-    // synthesized by `block::sysfs_*` from the live block registry and opens
-    // as a `SysBlock` vnode; listing it here is what makes `ls /` show it and
-    // `stat /sys` agree that it is a directory.
-    b"/sys",
+    // `/sys` itself is staged on disk (see mkfs-f2fs-populated.py) and is not
+    // listed here; only `/sys/class/block` and below are synthesized by
+    // `block::sysfs_*` from the live block registry and open as a `SysBlock`
+    // vnode.
     b"/proc/net",
     b"/proc/sys",
     b"/proc/sys/kernel",
@@ -2255,10 +2254,12 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
        // the /dev/ prefix above; /tmp rides /tmp/. Intercept /run/user before
        // the mount table so it lands on tmpfs, not the pivoted F2FS root.
        || path.starts_with(b"/run/user") || path == b"/run"
-       // The synthesized sysfs tree. Like /proc it is not a mount and must be
-       // intercepted before `find_mount_port()`, which matches every absolute
-       // path once init has pivot_root'ed the F2FS volume onto "/".
-       || path == b"/sys" || path.starts_with(b"/sys/")
+       // Only the synthesized `/sys/class/block` subtree. Like /proc it is not
+       // a mount and must be intercepted before `find_mount_port()`, which
+       // matches every absolute path once init has pivot_root'ed the F2FS
+       // volume onto "/". The rest of /sys is staged on disk and falls
+       // through to the normal mount lookup below.
+       || block::is_sysfs_path(path)
     {
         return Some(path);
     }
@@ -3315,9 +3316,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         } else if lookup_path == b"/dev/fb0" {
             VnodeKind::DevFb { pos: 0 }
         } else if block::is_sysfs_path(lookup_path) {
-            // A directory in the tree, or one of its attribute files. Checked
-            // before the RAMFS sweep below, which would otherwise answer
-            // ENOENT for everything under /sys (nothing there is static).
+            // A directory in the synthesized `/sys/class/block` subtree, or
+            // one of its attribute files. Checked before the RAMFS sweep
+            // below, which would otherwise answer ENOENT for it (nothing
+            // there is static). The rest of /sys is staged on disk and is
+            // handled by the ordinary mount lookup, not here.
             if let Some((dev, level)) = block::sysfs_dir(lookup_path) {
                 if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
                 VnodeKind::SysBlock { dev, level, pos: 0 }
@@ -7382,8 +7385,10 @@ fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
     let path = strip_trailing_slash(&pbuf[..plen]);
 
     // /proc and /dev are synthetic and never live on a mount, even after
-    // pivot_root has made "/" a prefix match for everything.
-    if path.starts_with(b"/proc") || path.starts_with(b"/dev") || path.starts_with(b"/sys") {
+    // pivot_root has made "/" a prefix match for everything. Only the
+    // synthesized `/sys/class/block` subtree is synthetic the same way; the
+    // rest of /sys is staged on disk and falls through to the mount lookup.
+    if path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path) {
         write_statfs(buf_ptr, &procfs_statfs());
         return statfs_reply();
     }
@@ -7707,9 +7712,10 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
                                  block::dev_ino(dev), 0, 6, block::dev_rdev(dev));
             return ok_reply();
         }
-        // The synthesized sysfs tree: directories, then attribute files. `/sys`
-        // itself is answered by the RAMFS_DIRS sweep at the top of this
-        // function, which reports the same S_IFDIR.
+        // The synthesized sysfs subtree: `/sys/class/block` directories, then
+        // their attribute files. `/sys` and `/sys/class` themselves, and
+        // everything outside this subtree, are staged on disk and answered
+        // by the ordinary mount lookup below, not here.
         if block::is_sysfs_path(lookup_path) {
             if let Some((dev, level)) = block::sysfs_dir(lookup_path) {
                 write_stat(stat_ptr, 0o040755, 0,

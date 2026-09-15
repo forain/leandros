@@ -738,7 +738,13 @@ def main():
     # The bus directory the "subsystem" links point at. Only its name matters to
     # libdrm (it string-matches the final component), but a link that resolves
     # is cheaper to reason about than one that dangles.
-    for d in ("/sys", "/sys/bus", "/sys/bus/pci", "/sys/bus/pci/devices"):
+    #
+    # /sys/class and /sys/class/block are staged here too: the vfs only
+    # synthesizes the *contents* of /sys/class/block (see block::is_sysfs_path),
+    # so the directories themselves must exist on disk for `ls /sys/class` to
+    # list `block` at all.
+    for d in ("/sys", "/sys/bus", "/sys/bus/pci", "/sys/bus/pci/devices",
+              "/sys/class", "/sys/class/block"):
         m4_share_dirs.add(d)
 
     for _minor, _node in ((0, "card0"), (128, "renderD128")):
