@@ -75,6 +75,13 @@ const O_RDWR:    u64 = 2;
 const O_CREAT:   u64 = 0o100;
 const O_EXCL:    u64 = 0o200;
 const O_TRUNC:   u64 = 0o1000;
+/// Present here only for documentation: the VFS does **not** latch O_APPEND
+/// into the open-file slot, it sets arg3 of every VFS_WRITE for an appending
+/// descriptor (see `handle_write`). Latching it at open would be wrong twice
+/// over — `fcntl(F_SETFL)` can add the bit afterwards, and a latched flag
+/// invites "seek to EOF once at open", which is not what O_APPEND means.
+#[allow(dead_code)]
+const O_APPEND:  u64 = 0o2000;
 /// Refuse to open a symlink through its target (`ELOOP`). Security-relevant:
 /// it is how a privileged writer avoids being redirected by a symlink an
 /// unprivileged user planted in a shared directory.
@@ -2185,14 +2192,40 @@ fn handle_read(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) -> M
     val_reply(n as u64)
 }
 
-fn handle_write(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) -> Message {
+/// `VFS_WRITE(file_id, buf_ptr, count, append)`.
+///
+/// `append` is the VFS's O_APPEND bit for the *descriptor* that issued this
+/// write (the mount protocol's arg3; zero from any sender that does not set
+/// it). When it is set the write goes to the current end of file rather than
+/// to the slot's recorded position, and the position is left just past what
+/// was written — Linux's O_APPEND, which re-derives EOF on every write and not
+/// merely once at open.
+///
+/// This is the whole of the append implementation for a mounted file, and it
+/// lives here because the position does: the VFS keeps no `pos` for a
+/// `MountedFile` vnode, so it has nothing it could have seeked. Deriving EOF
+/// here also makes an intervening `lseek` irrelevant, exactly as on Linux
+/// ("the file offset is ignored for writes"), and makes `pwrite` on an
+/// O_APPEND fd append too — Linux's documented behaviour, and unavoidable
+/// anyway since the kernel implements pwrite as lseek/write/lseek-back.
+fn handle_write(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64,
+                append: u64) -> Message {
     let slot = file_id as usize;
     if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); }
     if !ms.open_files[slot].writable { return err_reply(-13); } // EACCES
     let ino = ms.open_files[slot].inode;
-    let pos = ms.open_files[slot].pos;
+    let pos = if append != 0 {
+        // Same read as handle_lseek's SEEK_END: i_size out of the live inode
+        // block, so a write that another descriptor just extended the file
+        // with is already accounted for.
+        let iblkaddr = nat_lookup(ms, ino);
+        let iblk = ms.cache.read(ms.dev, iblkaddr as u64);
+        inode_size(iblk)
+    } else {
+        ms.open_files[slot].pos
+    };
     let n = write_file_data(ms, ino, pos, buf_ptr as *const u8, count as usize);
-    ms.open_files[slot].pos += n as u64;
+    ms.open_files[slot].pos = pos + n as u64;
     val_reply(n as u64)
 }
 
@@ -3385,7 +3418,7 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
     match msg.tag {
         VFS_OPEN       => handle_open(ms, arg(msg,0), arg(msg,1), arg(msg,2), euid, egid),
         VFS_READ       => handle_read(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
-        VFS_WRITE      => handle_write(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
+        VFS_WRITE      => handle_write(ms, arg(msg,0), arg(msg,1), arg(msg,2), arg(msg,3)),
         VFS_CLOSE      => handle_close(ms, arg(msg,0)),
         VFS_LSEEK      => handle_lseek(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_STAT       => handle_stat(ms, arg(msg,0), arg(msg,1)),

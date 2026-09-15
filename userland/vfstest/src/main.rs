@@ -662,6 +662,13 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_f2fs_ownership_enforced() { failures += 1; }
     if !test_chroot_confines_symlink_resolution() { failures += 1; }
 
+    // O_APPEND, on both backends: the f2fs pair is the regression (appends
+    // through the mount proxy wrote from offset 0), the tmpfs pair is the
+    // control that the VFS-owned path still behaves the same way.
+    if !test_append_across_opens(b"/data", b"append_across_opens_f2fs\0") { failures += 1; }
+    if !test_append_across_opens(b"/tmp", b"append_across_opens_tmpfs\0") { failures += 1; }
+    if !test_append_after_lseek(b"/data", b"append_after_lseek_f2fs\0") { failures += 1; }
+
     // Extended attributes / POSIX ACLs, each run against both the tmpfs
     // mount at /tmp and the f2fs mount at /data.
     if !test_xattr_basic(b"/tmp/xa", b"xattr_basic_tmpfs\0") { failures += 1; }
@@ -991,6 +998,73 @@ unsafe fn test_chroot_confines_symlink_resolution() -> bool {
     wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
     // Leaving /tmp/jail behind is fine: /tmp is volatile tmpfs.
     report(name, status == 0)
+}
+
+/// O_APPEND must survive the close: three separate opens of the same file,
+/// the first truncating and the next two appending, have to leave all three
+/// bodies end to end. This is the shape a shell produces for
+/// `printf a > f; printf b >> f; printf c >> f`, and on a mounted filesystem
+/// it used to leave only the *last* body: the mount protocol's VFS_WRITE
+/// carried no position and the server's open-file slot started every open at
+/// 0, so each append overwrote from offset 0. tmpfs was unaffected (the VFS
+/// owns that position itself), which is exactly why the bug hid.
+unsafe fn test_append_across_opens(dir: &[u8], name: &[u8]) -> bool {
+    let mut pb = [0u8; 96];
+    let path = mkpath(&mut pb, dir, b"/vt_append");
+
+    // First writer truncates, so a leftover file from an earlier run cannot
+    // make a broken append look correct.
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    if write(fd, b"one\n".as_ptr(), 4) != 4 { close(fd); return report(name, false); }
+    close(fd);
+
+    for body in [&b"two\n"[..], &b"three\n"[..]] {
+        let fd = open(path, O_WRONLY | O_APPEND, 0);
+        if fd < 0 { return report(name, false); }
+        let n = write(fd, body.as_ptr(), body.len());
+        close(fd);
+        if n != body.len() as isize { return report(name, false); }
+    }
+
+    let fd = open(path, O_RDONLY, 0);
+    if fd < 0 { return report(name, false); }
+    let mut buf = [0u8; 32];
+    let n = read(fd, buf.as_mut_ptr(), 32);
+    close(fd);
+    unlink(path);
+    report(name, n == 14 && &buf[..14] == b"one\ntwo\nthree\n")
+}
+
+/// With O_APPEND the file offset is ignored for writes: seeking back to 0 and
+/// writing must still land at end of file (Linux: "the file offset is ignored
+/// for writes"). Guards the difference between a correct implementation and
+/// the tempting wrong one — seeking to EOF once, at open — which this test
+/// would catch and `append_across_opens` would not.
+unsafe fn test_append_after_lseek(dir: &[u8], name: &[u8]) -> bool {
+    let mut pb = [0u8; 96];
+    let path = mkpath(&mut pb, dir, b"/vt_append_seek");
+
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    if write(fd, b"HEAD".as_ptr(), 4) != 4 { close(fd); return report(name, false); }
+    close(fd);
+
+    let fd = open(path, O_WRONLY | O_APPEND, 0);
+    if fd < 0 { return report(name, false); }
+    if lseek(fd, 0, SEEK_SET) != 0 { close(fd); return report(name, false); }
+    let n = write(fd, b"TAIL".as_ptr(), 4);
+    close(fd);
+    if n != 4 { return report(name, false); }
+
+    let fd = open(path, O_RDONLY, 0);
+    if fd < 0 { return report(name, false); }
+    let mut buf = [0u8; 16];
+    let got = read(fd, buf.as_mut_ptr(), 16);
+    close(fd);
+    unlink(path);
+    // "HEADTAIL", not "TAIL" (overwritten in place) and not "TAILHEAD".
+    report(name, got == 8 && &buf[..8] == b"HEADTAIL")
 }
 
 // `struct flock` from leandros_libc::io, aliased for readability.

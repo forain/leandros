@@ -27,6 +27,14 @@
 //! | VFS_FCHOWN      | fd         | uid       | gid     | 0 or -errno         |
 //! | VFS_STATFS      | path_ptr   | statfs_ptr| 0       | 0 or -errno         |
 //! | VFS_FSTATFS     | fd         | statfs_ptr| 0       | 0 or -errno         |
+//!
+//! When the VFS *forwards* one of these to a mount server, VFS_WRITE carries a
+//! fourth argument the kernel never sends: arg3 != 0 means "this descriptor is
+//! O_APPEND, write at end-of-file". It has to be per write rather than per
+//! open because the mount server owns the file position and O_APPEND positions
+//! at EOF at write time (and because `fcntl(F_SETFL)` can set the bit after
+//! the open was forwarded). Unset — a zeroed payload — means an ordinary write
+//! at the slot's current position, so senders that predate it are unaffected.
 
 #![no_std]
 
@@ -4113,12 +4121,32 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
         }
         VnodeKind::MountedFile { port, file_id } => {
             let port = *port; let file_id = *file_id;
+            // O_APPEND is a property of *this descriptor*, and the file
+            // position of a mounted file lives in the mount server's open-file
+            // slot — the VFS has no `pos` of its own to bump here. So the bit
+            // travels with every write (arg3) rather than being latched at
+            // open: the mount server then positions at EOF at write time,
+            // which is what O_APPEND actually means (Linux appends at the
+            // moment of the write, not at the moment of the open).
+            //
+            // Carrying it per write rather than per open is also what keeps
+            // `fcntl(fd, F_SETFL, O_APPEND)` working — F_SETFL rewrites these
+            // flags long after VFS_OPEN was forwarded, and nothing re-opens
+            // the mount-side slot. Before this, every append to an f2fs file
+            // wrote from offset 0: `printf x >> f` three times left only the
+            // last line, because each open started the server slot at pos 0
+            // and nothing ever moved it.
+            //
+            // Message::empty() zeroes the payload, so any other sender of
+            // VFS_WRITE to a mount port defaults to "not appending".
+            let append = tbl.fds[fd].flags & O_APPEND != 0;
             drop(tbls);
             let mut proxy = Message::empty();
             proxy.tag = VFS_WRITE;
             proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
             proxy.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
             proxy.data[16..24].copy_from_slice(&(count as u64).to_le_bytes());
+            proxy.data[24..32].copy_from_slice(&(append as u64).to_le_bytes());
             call_port(port, proxy)
         }
         _ => err_reply(-9),
