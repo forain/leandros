@@ -69,7 +69,16 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 DRIVER = os.path.join(HERE, "driver.py")
 
-NOISE_RE = re.compile(r"^\[|Task::|2004|brush-0|^$")
+# Kernel log lines and prompt remnants that are not command output.
+#
+# "2004" used to be in here to catch brush's bracketed-paste toggles
+# (ESC[?2004l / ESC[?2004h). It was actively destructive: driver.py returned
+# those escapes un-stripped and brush emits ESC[?2004l with no newline after
+# it, so the first line of every command's real output arrived as
+# "ESC[?2004lGOOD" — and this pattern then deleted it. driver.py now slices the
+# stdout out on those toggles and strips escapes, so nothing here should ever
+# see one again; matching on "2004" would only risk eating a legitimate line.
+NOISE_RE = re.compile(r"^\[|Task::|brush-0|^\s*$")
 
 
 def guest(line, timeout=20):
@@ -229,7 +238,9 @@ TESTS = [
     ("shuf", "shuf w1", contains_all("a", "b", "c"), False),
     ("sleep", "sleep 0 && echo GOOD || echo BAD", equals("GOOD"), False),
     ("sort", "sort s1", lambda t: t.strip().splitlines()[:1] == ["a"], False),
-    ("split", "split -l2 cs1 splout; stat -c %F splout00", contains_all("regular file"), False),
+    # split's default suffix is ALPHABETIC (sploutaa, sploutab) — splout00 only
+    # exists under -d. The old assertion named a file split never creates.
+    ("split", "split -l2 cs1 splout; stat -c %F sploutaa", contains_all("regular file"), False),
     ("stat", "stat -c %s s1", nonempty(), False),
     ("stty", "stty --help", lambda t: True, True),
     ("sum", "sum sm1", nonempty(), False),
@@ -239,7 +250,9 @@ TESTS = [
     ("tee", "tee --help", lambda t: True, True),
     ("test", "test 1 -eq 1 && echo GOOD || echo BAD", equals("GOOD"), False),
     ("timeout", "timeout 2 true && echo GOOD || echo BAD", equals("GOOD"), False),
-    ("touch", "touch to1; stat -c %F to1", contains_all("regular file"), False),
+    # A 0-byte file's %F is "regular empty file", not "regular file" — touch
+    # creates one, so the old assertion could never hold.
+    ("touch", "touch to1; stat -c %F to1", contains_all("regular"), False),
     ("tr", "tr --help", lambda t: True, True),
     ("true", "true && echo GOOD || echo BAD", equals("GOOD"), False),
     ("truncate", "truncate -s5 trn1; stat -c %s trn1", contains_all("5"), False),

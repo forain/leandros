@@ -248,6 +248,44 @@ def _strip_ansi(data: bytes) -> bytes:
     return _ANSI_RE.sub(b"", data)
 
 
+# Escape sequences the GUEST's own line editor emits (brush drives reedline,
+# which repaints the whole prompt line on every keystroke). This is a separate
+# job from _strip_ansi above and must not be merged with it: that one begins by
+# deleting bare "[...]" runs with no ESC in front — correct for QEMU monitor
+# echo, corrupting for real command output.
+#
+# What actually shows up on the wire, in order of how much damage it did:
+#   ESC[?2004l / ESC[?2004h  bracketed-paste toggles — CSI with a PRIVATE "?"
+#                            parameter, which several naive patterns miss
+#   ESC[38;5;14m, ESC[0m     256-colour SGR with ";"-separated parameters
+#   ESC 7 / ESC 8            DECSC/DECRC — two-byte, no "[" at all
+#   ESC[?25l / ESC[?25h      cursor hide/show
+#   ESC[44;1H, ESC[J         absolute cursor position + erase (the repaint)
+# plus OSC title strings, and the ESC[row;colR cursor-position REPLY the kernel
+# writes back onto the serial line when a program asks with ESC[6n (a plain CSI
+# ending in "R", covered by the CSI branch).
+_GUEST_ANSI_RE = re.compile(
+    rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"   # OSC ... BEL / ST
+    rb"|\x1b\[[0-?]*[ -/]*[@-~]"            # CSI, private params included
+    rb"|\x1b[()#][0-9A-Za-z]"               # charset designators
+    rb"|\x1b[0-9A-Za-z=><]"                 # two-byte ESC: ESC 7, ESC 8, ESC =
+    rb"|\x1b"                               # stray/truncated ESC
+    rb"|[\x00\x07\x08]"
+)
+
+
+def _strip_guest_ansi(data: bytes) -> bytes:
+    return _GUEST_ANSI_RE.sub(b"", data)
+
+
+# brush brackets every command run with its bracketed-paste toggles: ESC[?2004l
+# goes out immediately BEFORE the line runs and ESC[?2004h immediately AFTER it,
+# with no newline on either side. They are therefore an exact delimiter for the
+# command's own stdout.
+_PASTE_OFF = b"\x1b[?2004l"
+_PASTE_ON  = b"\x1b[?2004h"
+
+
 # A shell prompt sitting at the very END of what we have received so far: a
 # line of its own, a run of non-space characters, then "#", "$" or ">" and one
 # space. brush's is "brush-0.5# ".
@@ -914,6 +952,15 @@ def _serial_send(command, timeout=8):
     s.setblocking(False)
 
     buf = b""
+    # The bare CR sent above to sync leaves brush repainting a FRESH prompt,
+    # and whatever of that repaint the sync loop did not consume is the first
+    # thing this loop reads. It ends in "brush-0.5# ", so _at_prompt() matched
+    # it and the read returned before the command had even been submitted —
+    # yielding nothing but prompt escapes. Which chunk boundary the repaint
+    # lands on decides whether that happens, so it looked intermittent. Arm the
+    # prompt check only once the echoed command line has appeared.
+    armed = False
+    echo_needle = command.strip().encode()
     deadline = time.time() + timeout
     while time.time() < deadline:
         if select.select([s], [], [], 0.1)[0]:
@@ -940,18 +987,36 @@ def _serial_send(command, timeout=8):
                     pass
                 # Stop once the shell is back at its prompt — and only at the
                 # END of the stream, never on a "-> " in the middle of a line.
-                if _at_prompt(buf[len(command):]):
+                if not armed:
+                    armed = echo_needle in buf
+                elif _at_prompt(buf):
                     break
             except BlockingIOError:
                 pass
     s.close()
 
-    text = buf.decode("utf-8", errors="replace")
-    # Strip echoed command and trailing prompt lines
-    lines = text.splitlines()
+    # Slice the command's own stdout out on the bracketed-paste toggles. This
+    # is what a line-based slice could not do: brush writes ESC[?2004l with no
+    # newline after it, so the first byte of stdout is GLUED to that escape
+    # ("ESC[?2004lhi"), and for output with no trailing newline the following
+    # prompt repaint is glued to the last byte. Splitting into lines and
+    # dropping the ones that "look like" prompt noise therefore ate the first
+    # line of every command's real output.
+    start = buf.rfind(_PASTE_OFF)
+    if start != -1:
+        body = buf[start + len(_PASTE_OFF):]
+        end = body.find(_PASTE_ON)
+        if end != -1:
+            body = body[:end]
+        text = _strip_guest_ansi(body).decode("utf-8", errors="replace")
+        return text.replace("\r\n", "\n").strip("\n")
+
+    # Fallback for a shell that never enables bracketed paste: the old
+    # echo-line heuristic, but on ANSI-stripped text so the match can succeed.
+    text = _strip_guest_ansi(buf).decode("utf-8", errors="replace")
     out = []
     skip_echo = True
-    for line in lines:
+    for line in text.replace("\r\n", "\n").split("\n"):
         if skip_echo and command.rstrip() in line:
             skip_echo = False
             continue
