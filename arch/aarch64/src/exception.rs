@@ -163,26 +163,35 @@ const SIGSEGV: u32 = 11;
 /// are the whole user-visible point of a `WTERMSIG` a shell can name.
 ///
 /// The mapping follows Linux's `arch/arm64/kernel/{entry-common,fault}.c`.
-fn el0_fault_signal(esr: u64) -> u32 {
+///
+/// Returns `(signal, si_code, si_addr)`: the data address (FAR) for memory
+/// aborts, the faulting PC for everything else — what a SIGSEGV/SIGBUS/
+/// SIGILL handler installed with `SA_SIGINFO` reads out of `siginfo_t`.
+fn el0_fault_signal(esr: u64, far: u64, elr: u64, sp: u64) -> (u32, i32, usize) {
     let ec  = (esr >> 26) & 0x3F;
     let fsc = esr & 0x3F;
     match ec {
         // Unknown reason (undefined instruction), trapped WF*, trapped
         // SVE/SIMD/FP access, illegal execution state, trapped MSR/MRS.
-        0x00 | 0x01 | 0x07 | 0x0E | 0x18 => SIGILL,
+        0x00 | 0x01 | 0x07 | 0x0E | 0x18 => (SIGILL, sched::ILL_ILLOPC, elr as usize),
         // Instruction / data abort from a lower EL. Most FSCs are a bad
         // access (SIGSEGV); alignment and synchronous external aborts —
-        // including on a translation-table walk — are bus errors.
+        // including on a translation-table walk — are bus errors. A
+        // permission fault (the page exists, the access is disallowed) is
+        // SEGV_ACCERR; a translation/access-flag fault is SEGV_MAPERR.
         0x20 | 0x24 => match fsc {
-            0x21 => SIGBUS,
-            0x10 | 0x11 | 0x14..=0x17 => SIGBUS,
-            _ => SIGSEGV,
+            0x21 => (SIGBUS, sched::BUS_ADRALN, far as usize),
+            0x10 | 0x11 | 0x14..=0x17 => (SIGBUS, sched::BUS_ADRERR, far as usize),
+            0x0D..=0x0F => (SIGSEGV, sched::SEGV_ACCERR, far as usize),
+            _ => (SIGSEGV, sched::SEGV_MAPERR, far as usize),
         },
-        0x22 | 0x26 => SIGBUS,  // PC / SP alignment fault
-        0x2C        => SIGFPE,  // trapped floating-point exception
+        0x22 => (SIGBUS, sched::BUS_ADRALN, elr as usize), // PC alignment fault
+        0x26 => (SIGBUS, sched::BUS_ADRALN, sp as usize),  // SP alignment fault
+        0x2C => (SIGFPE, sched::FPE_FLTINV, elr as usize), // trapped floating-point exception
         // Breakpoint, software step, watchpoint, BKPT/BRK.
-        0x30 | 0x32 | 0x34 | 0x38 | 0x3C => SIGTRAP,
-        _ => SIGSEGV,
+        0x30 | 0x34 | 0x38 | 0x3C => (SIGTRAP, sched::TRAP_BRKPT, elr as usize),
+        0x32 => (SIGTRAP, sched::TRAP_TRACE, elr as usize),
+        _ => (SIGSEGV, sched::SEGV_MAPERR, far as usize),
     }
 }
 
@@ -283,7 +292,21 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
             if (is_translation || is_permission) && sched::handle_page_fault(far as usize, is_write) {
                 return; // page mapped — resume EL0 and retry the faulting access
             }
-            
+        }
+
+        // The task may have a handler for this fault. If so, queue the
+        // signal with its `siginfo_t` (SEGV_MAPERR/ACCERR, si_addr) and
+        // return: the vector stub runs `check_and_deliver_signals` next,
+        // which builds the signal frame and `eret`s into the handler. The
+        // diagnostics below are for the process that is about to die, not
+        // for a fault the program handles as a matter of course (a GC
+        // write barrier, a stack-probe, a `siglongjmp` recovery).
+        let (sig, si_code, si_addr) = el0_fault_signal(esr, far, elr, (*frame).sp_el0);
+        if sched::fault_signal(sig, si_code, si_addr) {
+            return;
+        }
+
+        if ec == 0x24 || ec == 0x20 {
             serial_print_str("[FAULT] far=");
             print_hex(far as usize);
             serial_print_str(" dfsc=");
@@ -452,7 +475,7 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
             sched::dump_user_vma(far as usize);
         }
 
-        sched::exit_group_signal(el0_fault_signal(esr));
+        sched::exit_group_signal(sig);
     }
 }
 

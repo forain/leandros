@@ -145,6 +145,35 @@ pub const CLD_STOPPED: i32 = 5;
 /// SIGCHLD: a stopped child was resumed by SIGCONT; `si_status` is SIGCONT.
 pub const CLD_CONTINUED: i32 = 6;
 
+// `si_code` values for the synchronous fault signals (Linux/POSIX).
+/// SIGSEGV: address not mapped to an object.
+pub const SEGV_MAPERR: i32 = 1;
+/// SIGSEGV: invalid permissions for the mapped object.
+pub const SEGV_ACCERR: i32 = 2;
+/// SIGBUS: invalid address alignment.
+pub const BUS_ADRALN:  i32 = 1;
+/// SIGBUS: nonexistent physical address (external abort).
+pub const BUS_ADRERR:  i32 = 2;
+/// SIGILL: illegal opcode.
+pub const ILL_ILLOPC:  i32 = 1;
+/// SIGFPE: integer divide by zero.
+pub const FPE_INTDIV:  i32 = 1;
+/// SIGFPE: invalid floating-point operation (the generic FP fault code).
+pub const FPE_FLTINV:  i32 = 7;
+/// SIGTRAP: process breakpoint.
+pub const TRAP_BRKPT:  i32 = 1;
+/// SIGTRAP: process trace trap (single-step / debug exception).
+pub const TRAP_TRACE:  i32 = 2;
+
+/// Signals a CPU fault generates synchronously. `check_and_deliver_signals`
+/// dequeues these ahead of anything else pending (as Linux's
+/// `dequeue_synchronous_signal` does), so the handler for the fault runs
+/// before, say, a queued SIGCHLD — otherwise that handler would return to
+/// the faulting instruction, re-fault, and only then see SIGSEGV. Bit N =
+/// signal N+1: SIGILL 4, SIGTRAP 5, SIGBUS 7, SIGFPE 8, SIGSEGV 11.
+pub const SYNCHRONOUS_MASK: u64 =
+    (1u64 << 3) | (1u64 << 4) | (1u64 << 6) | (1u64 << 7) | (1u64 << 10);
+
 /// The `siginfo_t` payload for the one pending instance of one signal.
 ///
 /// Deliberately **not** a queue. POSIX only guarantees a single pending
@@ -155,14 +184,15 @@ pub const CLD_CONTINUED: i32 = 6;
 /// its depth inside `Task`, which `Task::new_kernel` materialises as a literal
 /// on the 128 KiB kernel stack (see `scripts/check-stack-frames.py`).
 ///
-/// The four fields are the ones a handler and `signalfd` actually read.
-/// `si_addr` is absent: no fault ever reaches a user handler here (every
-/// `arch/*` fault path calls `sched::exit_group_signal` directly, killing the
-/// group), so it would have no producer and no consumer.
+/// The five fields are the ones a handler and `signalfd` actually read.
+/// `si_addr` is only meaningful for the synchronous fault signals
+/// (`SYNCHRONOUS_MASK`), whose `siginfo_t._sifields._sigfault` overlays the
+/// `si_pid`/`si_uid` slot of the `_kill` member — `write_siginfo` picks the
+/// member by signal class.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct SigInfo {
-    /// `SI_*` / `CLD_*` — where the signal came from.
+    /// `SI_*` / `CLD_*` / `SEGV_*` … — where the signal came from.
     pub si_code:   i32,
     /// Sending process (`SI_USER`/`SI_TKILL`) or exiting child (SIGCHLD).
     pub si_pid:    i32,
@@ -171,36 +201,44 @@ pub struct SigInfo {
     /// SIGCHLD only: exit code (`CLD_EXITED`) or signal number (`CLD_KILLED`,
     /// `CLD_STOPPED`, `CLD_CONTINUED`).
     pub si_status: i32,
+    /// Fault signals only: the faulting address (data address for a memory
+    /// fault, PC for SIGILL/SIGFPE/SIGTRAP).
+    pub si_addr:   usize,
 }
 
 impl SigInfo {
     /// No payload — `si_code == SI_USER` with everything zero, which is byte
     /// for byte what delivery shipped before per-signal siginfo existed.
     pub const NONE: SigInfo =
-        SigInfo { si_code: SI_USER, si_pid: 0, si_uid: 0, si_status: 0 };
+        SigInfo { si_code: SI_USER, si_pid: 0, si_uid: 0, si_status: 0, si_addr: 0 };
 
     /// Generated inside the kernel with no originating process.
     pub const KERNEL: SigInfo =
-        SigInfo { si_code: SI_KERNEL, si_pid: 0, si_uid: 0, si_status: 0 };
+        SigInfo { si_code: SI_KERNEL, si_pid: 0, si_uid: 0, si_status: 0, si_addr: 0 };
 
     /// A POSIX timer fired.
     pub const TIMER: SigInfo =
-        SigInfo { si_code: SI_TIMER, si_pid: 0, si_uid: 0, si_status: 0 };
+        SigInfo { si_code: SI_TIMER, si_pid: 0, si_uid: 0, si_status: 0, si_addr: 0 };
 
     /// `kill(2)` / `killpg(2)` from process `pid` running as `uid`.
     pub const fn user(pid: Pid, uid: u32) -> SigInfo {
-        SigInfo { si_code: SI_USER, si_pid: pid as i32, si_uid: uid, si_status: 0 }
+        SigInfo { si_code: SI_USER, si_pid: pid as i32, si_uid: uid, si_status: 0, si_addr: 0 }
     }
 
     /// `tkill(2)` / `tgkill(2)` from process `pid` running as `uid`.
     pub const fn tkill(pid: Pid, uid: u32) -> SigInfo {
-        SigInfo { si_code: SI_TKILL, si_pid: pid as i32, si_uid: uid, si_status: 0 }
+        SigInfo { si_code: SI_TKILL, si_pid: pid as i32, si_uid: uid, si_status: 0, si_addr: 0 }
+    }
+
+    /// A synchronous CPU fault at `addr` (SEGV_MAPERR, BUS_ADRALN, …).
+    pub const fn fault(code: i32, addr: usize) -> SigInfo {
+        SigInfo { si_code: code, si_pid: 0, si_uid: 0, si_status: 0, si_addr: addr }
     }
 
     /// SIGCHLD for a child process `pid` (real uid `uid`) that was stopped by
     /// `sig` (`CLD_STOPPED`) or resumed (`CLD_CONTINUED`, `sig == SIGCONT`).
     pub const fn child_state(code: i32, pid: Pid, uid: u32, sig: u32) -> SigInfo {
-        SigInfo { si_code: code, si_pid: pid as i32, si_uid: uid, si_status: sig as i32 }
+        SigInfo { si_code: code, si_pid: pid as i32, si_uid: uid, si_status: sig as i32, si_addr: 0 }
     }
 }
 

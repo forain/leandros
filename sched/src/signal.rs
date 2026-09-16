@@ -251,7 +251,12 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                 Some(t) => {
                     let unmasked = t.signal_pending & !t.signal_mask;
                     if unmasked == 0 { return; }
-                    let bit  = unmasked.trailing_zeros() as u32;
+                    // A synchronous fault signal (SIGSEGV et al.) is delivered
+                    // ahead of anything else pending: its handler must run
+                    // before the faulting instruction is retried.
+                    let sync = unmasked & crate::task::SYNCHRONOUS_MASK;
+                    let pick = if sync != 0 { sync } else { unmasked };
+                    let bit  = pick.trailing_zeros() as u32;
                     let sig  = bit + 1;
                     let mask = t.signal_mask;
                     // Signal disposition is shared across the thread group: read
@@ -505,6 +510,47 @@ pub(crate) fn notify_parent_state_change(tgid: super::task::Pid, ppid: super::ta
         return;
     }
     let _ = super::deliver_signal_process(parent_tgid, SIGCHLD, info);
+}
+
+// ── Synchronous faults ───────────────────────────────────────────────────────
+
+/// Route a user-mode CPU fault to the task's signal handler, if one can run.
+///
+/// Returns `true` when `sig` has been queued on the calling thread carrying
+/// `SigInfo::fault(si_code, addr)`; the arch fault stub then falls through to
+/// `check_and_deliver_signals`, which builds the signal frame and redirects
+/// the return-to-user to the handler. Returns `false` when the fault must
+/// kill the process — SIG_DFL, SIG_IGN, or the signal blocked — mirroring
+/// Linux's `force_sig_fault`: an ignored or blocked synchronous signal is
+/// not deferred, because the faulting instruction would just fault again.
+/// The caller prints its diagnostics and calls `exit_group_signal`.
+///
+/// The blocked check is also the re-entrancy guard. A handler runs with its
+/// own signal masked (unless SA_NODEFER), so a handler that faults *again*
+/// arrives here with the bit set and is killed instead of recursing.
+///
+/// The payload overwrites any earlier pending instance of the same signal:
+/// a fault's `si_addr` is what the handler is about to inspect, and a stale
+/// `kill(2)` payload for the same number would misdirect it.
+pub fn fault_signal(sig: u32, si_code: i32, addr: usize) -> bool {
+    if sig == 0 || sig > 64 { return false; }
+    let pid = super::current_pid();
+    if pid == 0 { return false; }
+    let bit = 1u64 << (sig - 1);
+    let mut rq = super::RUN_QUEUE.lock();
+    let (tgid, mask) = match rq.find_pid(pid) {
+        Some(t) => (t.tgid, t.signal_mask),
+        None => return false,
+    };
+    let handler = rq.find_pid(tgid)
+        .map(|l| l.signal_actions[(sig - 1) as usize].handler)
+        .unwrap_or(0);
+    if handler <= 1 || mask & bit != 0 { return false; }
+    if let Some(t) = rq.find_pid_mut(pid) {
+        t.signal_info[(sig - 1) as usize] = crate::task::SigInfo::fault(si_code, addr);
+        t.signal_pending |= bit;
+    }
+    true
 }
 
 /// Restore user context from the saved signal frame on the user stack.
@@ -764,23 +810,36 @@ mod si_off {
     pub const PID:    usize = 16;
     pub const UID:    usize = 20;
     pub const STATUS: usize = 24;
+    /// `_sifields._sigfault.si_addr` — the union's first word, overlaying
+    /// `si_pid`/`si_uid`.
+    pub const ADDR:   usize = 16;
 }
 
-/// Serialise the four carried `siginfo_t` fields into a zeroed frame buffer at
+/// Serialise the carried `siginfo_t` fields into a zeroed frame buffer at
 /// `base` (the start of the frame's siginfo region).
 ///
 /// Shared by both architectures so the offsets cannot drift between them —
 /// they are the same offsets, and one function is the cheapest way to keep
-/// saying so.
+/// saying so. The `_sifields` member is chosen by signal class: a
+/// kernel-generated (`si_code > 0`) SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP
+/// carries `_sigfault` (`si_addr`), everything else `_kill`/`_sigchld`.
 fn write_siginfo(buf: &mut [u8], base: usize, sig: u32, info: crate::task::SigInfo) {
     let put = |buf: &mut [u8], off: usize, v: [u8; 4]| {
         buf[base + off..base + off + 4].copy_from_slice(&v);
     };
     put(buf, si_off::SIGNO,  sig.to_le_bytes());
     put(buf, si_off::CODE,   info.si_code.to_le_bytes());
-    put(buf, si_off::PID,    info.si_pid.to_le_bytes());
-    put(buf, si_off::UID,    info.si_uid.to_le_bytes());
-    put(buf, si_off::STATUS, info.si_status.to_le_bytes());
+    let is_fault = sig >= 1 && sig <= 64
+        && crate::task::SYNCHRONOUS_MASK & (1u64 << (sig - 1)) != 0
+        && info.si_code > 0;
+    if is_fault {
+        buf[base + si_off::ADDR..base + si_off::ADDR + 8]
+            .copy_from_slice(&(info.si_addr as u64).to_le_bytes());
+    } else {
+        put(buf, si_off::PID,    info.si_pid.to_le_bytes());
+        put(buf, si_off::UID,    info.si_uid.to_le_bytes());
+        put(buf, si_off::STATUS, info.si_status.to_le_bytes());
+    }
 }
 
 fn arch_restore_signal_frame(frame_ptr: usize, pid: u32) {

@@ -30,10 +30,12 @@ pub mod signal;
 pub mod task;
 
 pub use clone::{fork_current, clone_thread};
-pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec};
+pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec, fault_signal};
 pub use futex::{futex_wait, futex_wake, futex_requeue};
 pub use task::{SigInfo, SI_USER, SI_KERNEL, SI_TIMER, SI_TKILL, CLD_EXITED, CLD_KILLED, CLD_DUMPED,
-               CLD_STOPPED, CLD_CONTINUED};
+               CLD_STOPPED, CLD_CONTINUED,
+               SEGV_MAPERR, SEGV_ACCERR, BUS_ADRALN, BUS_ADRERR, ILL_ILLOPC, FPE_INTDIV, FPE_FLTINV,
+               TRAP_BRKPT, TRAP_TRACE};
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
@@ -171,6 +173,7 @@ impl SigInfo {
             si_pid:    pid as i32,
             si_uid:    uid,
             si_status: status.si_status(),
+            si_addr:   0,
         }
     }
 }
