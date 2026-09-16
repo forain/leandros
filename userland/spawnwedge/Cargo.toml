@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "spawnwedge"
+version = "0.1.0"
+edition = "2021"
+description = "musl thread/fork lock-handoff regression test for LeandrOS"
+
+# Standalone, outside the userland workspace: that workspace builds
+# relibc-linked no_std binaries for *-unknown-none, while this test must be
+# musl std — it exercises musl's own pthread_create/fork/pthread_exit lock
+# protocol (the thread-list lock keyed on the kernel-supplied tid), which
+# relibc does not reproduce. Built by build.sh exactly like ports/mkfs-fat.
+[[bin]]
+name = "spawnwedge"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = 2

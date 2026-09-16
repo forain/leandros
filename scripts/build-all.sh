@@ -397,6 +397,22 @@ build_mkfs_fat() {
     "$ROOT_DIR/ports/mkfs-fat/build.sh" "$arch"
 }
 
+# Function to build spawnwedge — the musl thread/fork lock-handoff regression
+# test (userland/spawnwedge). It cannot live in the userland workspace: that
+# builds relibc-linked no_std binaries, and this test must run musl's own
+# pthread_create/fork/pthread_exit protocol, so it is a std/musl crate with
+# its own build.sh, in the mold of ports/mkfs-fat. In-tree Rust, so a failure
+# is fatal.
+build_spawnwedge() {
+    local arch="$1"
+    echo "🧵 Building $arch spawnwedge..."
+    if [[ ! -x "$ROOT_DIR/userland/spawnwedge/build.sh" ]]; then
+        echo "⚠️  userland/spawnwedge not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/spawnwedge/build.sh" "$arch"
+}
+
 # Function to build mkfs.xfs — the XFS v5 formatter for the root partition.
 # Same shape as build_mkfs_fat; its build.sh takes one arch (or "all") and
 # installs the binary, which cargo builds as mkfs_xfs because a target name
@@ -540,6 +556,7 @@ for arch in "${ARCHS[@]}"; do
     build_coreutils "$arch"
     build_mkfs_fat "$arch"
     build_mkfs_xfs "$arch"
+    build_spawnwedge "$arch"
     build_disktester "$arch"
     stage_dbus_session "$arch"
     create_initrd "$arch"
