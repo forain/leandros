@@ -160,12 +160,16 @@ Build time: ~3–5 minutes clean, ~30s incremental.
   EPOLL / ADDRSPACE_BUSY (`sched::lockwatch`). Only a stall of ALL CPUs at once
   prints nothing — then the host `sample` is the instrument.
 
-- **The guest clock runs slow under HVF: ~71 Hz idle, ~85 Hz under MAME, not
-  100 Hz.** `timer::on_tick` reloads `CNTV_TVAL` from *now*, so every tick's
-  interrupt latency (≈4 ms for a WFI wake through Hypervisor.framework) is added
-  to the period. `sleep 1` takes 1.2–1.4 s; MAME's "59 seconds" take 69 s. Not
-  fixed yet (reload should be `CVAL += interval`); do not read run wall times as
-  guest-time.
+- **The guest clock used to run slow — 5–23 % under HVF, 12–17 % under
+  aarch64 TCG, 1–36 % on x86_64/TCG — FIXED 2026-09-16 (`67c9ba1`).** aarch64
+  reloaded `CNTV_TVAL` from *now* inside the tick handler so each tick's
+  interrupt latency stretched the period; x86_64 lost LAPIC periods that TCG
+  coalesced. Both now keep the tick on an absolute grid with catch-up, and
+  `clock_gettime` reads the counter (CNTVCT / TSC) directly. Measure with
+  `clockdrift.py <secs> <label>` (same `LEANDROS_RUN_ID`): it prints
+  `guest=… host=… ratio=… err=…`; expect |err| < 0.5 % idle. Any timing
+  baseline recorded before this date (MAME run wall times, `sleep` durations,
+  desktop settle times, `[WDOG]` intervals) was measured on the slow clock.
 
 - **HVF needs a GICv3 machine since QEMU 11.1 (Homebrew, 2026-09-05).** `-accel hvf` on
   `-machine virt,gic-version=2` exits immediately with `HVF does not support GICv2
