@@ -74,11 +74,17 @@ import select
 import platform
 import shutil
 
-SERIAL_SOCK  = "/tmp/leandros-serial.sock"
-MONITOR_SOCK = "/tmp/leandros-monitor.sock"
-PID_FILE     = "/tmp/leandros-qemu.pid"
-SERIAL_LOG   = "/tmp/leandros-serial.log"
-QEMU_STDERR_LOG = "/tmp/leandros-qemu-stderr.log"
+# LEANDROS_RUN_ID scopes every host-side path this driver owns, so two trees
+# (or two agents) can each drive their own QEMU on one machine. Unset, the
+# paths are the historical ones and behaviour is unchanged. Every later
+# `driver.py` invocation (cmd/screenshot/stop/...) must carry the same value.
+RUN_ID = os.environ.get("LEANDROS_RUN_ID", "")
+_TAG = f"-{RUN_ID}" if RUN_ID else ""
+SERIAL_SOCK  = f"/tmp/leandros{_TAG}-serial.sock"
+MONITOR_SOCK = f"/tmp/leandros{_TAG}-monitor.sock"
+PID_FILE     = f"/tmp/leandros{_TAG}-qemu.pid"
+SERIAL_LOG   = f"/tmp/leandros{_TAG}-serial.log"
+QEMU_STDERR_LOG = f"/tmp/leandros{_TAG}-qemu-stderr.log"
 # Not a socket itself — the resolved path of THIS run's QMP unix socket,
 # written by _prepare_qmp() at `start` time (or parsed out of a
 # caller-supplied LEANDROS_QEMU_EXTRA that already set -qmp) so later
@@ -87,7 +93,7 @@ QEMU_STDERR_LOG = "/tmp/leandros-qemu-stderr.log"
 # `mouse_move` (relative; our virtio-tablet is absolute-only) and HMP
 # `sendkey` (cannot hold a chord) were the only injection paths — meaning
 # Ctrl+Alt+Fn could not be injected at all.
-QMP_SOCK_FILE = "/tmp/leandros-qmp-sockpath"
+QMP_SOCK_FILE = f"/tmp/leandros{_TAG}-qmp-sockpath"
 
 REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../..")
@@ -158,7 +164,8 @@ VENUS_GPU_DEV = "virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,id=venusgpu"
 # A VNC listener bound to the venusgpu console is that missing 2D consumer, and
 # it reads the same con->surface the readback fills. Loopback-only; port 5909.
 VENUS_VNC_ADDR = "127.0.0.1:9"
-VENUS_VNC_PORT = 5909
+# Overridable so parallel --venus instances do not fight over one display.
+VENUS_VNC_PORT = int(os.environ.get("LEANDROS_VNC_PORT", "5909"))
 
 
 def _venus_vnc_args(venus):
@@ -1224,7 +1231,7 @@ def cmd_screenshot(outfile=None):
     if _qemu_pid() is None:
         sys.exit("ERROR: QEMU not running.")
     if outfile is None:
-        outfile = "/tmp/leandros-screen.ppm"
+        outfile = f"/tmp/leandros{_TAG}-screen.ppm"
     # Deliberately bare (no device=): under a --venus session this captures
     # the primary console (q35's implicit std-VGA, since venus mode drops -vga
     # none) and gives a valid non-blank PPM. Passing device=venusgpu now
