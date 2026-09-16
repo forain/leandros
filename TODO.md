@@ -3302,11 +3302,24 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
   engages. Needs a real VNC client driven against the `-vnc` listener (egl-headless
   blits the GL scanout into the 2D console surface only when a 2D listener is attached).
   Until then "the session runs" is verified and "it draws the right thing" is not.
-- **`VirtioGpu::submit` busy-spins.** A command the host refuses leaves the guest
-  spinning instead of returning an error — which is how a resource-id collision
-  presented as a wedged guest, and once as QEMU exiting via `-no-reboot`. A bounded wait
-  with a diagnostic would have turned a day's hunt into a log line. Related: the ISR work
-  (there is no device IRQ infrastructure; even the keyboard is polled).
+- **`VirtioGpu::submit` busy-spins — CLOSED 2026-09-16 (lane `ctrlq`).** Presents,
+  transfers, SUBMIT_3D and CTX_{ATTACH,DETACH}_RESOURCE go through `submit_async` and cost
+  the vCPU only the enqueue; completions are reaped from the used ring by chain head
+  (out-of-order safe — QEMU parks fenced replies) from the next submit, the 100 Hz tick
+  (`ctrlq_tick`) and, on x86_64, an MSI-X interrupt (vector 0x41, `virtio_gpu_msix_isr`).
+  Reply-needing commands (`GET_CAPSET`, `RESOURCE_CREATE_*`, `MAP_BLOB`, `CTX_CREATE`,
+  the teardown commands that give guest pages back) still spin with the tick let in —
+  they hold `VIRTIO_GPU`, so they cannot sleep without the wait moving to the call
+  sites; `ctrlq_sync` in the DRMSTAT line says how many there are (~0.5 % of traffic
+  under Zink). Measured on the desktop (KVM, Zink desktop, same 80 s script):
+  `ctrlq_us` 42 % → 0.03 % of wall, 19.3 → 20.1 fps, 15.6k IRQs, 0 timeouts.
+  ⚠ `snd::monotonic_us` on x86_64 is `rdtsc/1000`, i.e. 4.49× too fast on the 7950X —
+  every `*_us` census field there is inflated by that factor (`now_us` at the end of the
+  DRMSTAT line lets a reader calibrate); the 42 % was ≈9.4 % of real wall time.
+  A host-refused `RING_IDX` submit (item 1 below) no longer spins anyone: the chain stays
+  in flight and its descriptors are lost until the device answers, bounded by the ring.
+  Still polled: keyboard, blk, net, snd; aarch64 GPU (no MSI-X path there — INTx via GIC
+  SPI would be the next step, and the tick poller is the fallback everywhere).
 - **Synthetic sysfs** — the read-only `/sys/dev/char`, `/sys/class/drm`, `/sys/class/input`
   design in `docs/design/k4-drm-design.md` is execution-ready but deferred; no current
   consumer needs the enumeration.
@@ -3316,11 +3329,15 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
 - **`FENCE_FD_IN`** (sync-file import) still needs the reverse plumbing and has no
   signalled-by-construction shortcut, unlike `FENCE_FD_OUT` (`09def61`). Real
   `DRM_IOCTL_SYNCOBJ_*` are not on the critical path — Mesa 25.3.6 compiles the SIMULATE
-  path unconditionally. **A dependency to remember:** the out-fence eventfd is signalled at
-  creation, which is correct **only while `VirtioGpu::submit` is a synchronous busy-spin**.
-  If the ISR work ever makes submission asynchronous, that becomes a lie and must become a
-  real waitable fence. The dependency is on `submit`, not on the syncobj code, and the
-  source comment says so.
+  path unconditionally. **The dependency recorded here was paid 2026-09-16:** submission is
+  asynchronous now, so the out-fence eventfd is minted at zero and armed on the open's
+  newest fence (`out_fence_register`); `ctrlq_tick`/the ISR signal it when the host retires
+  that fence, through a VFS seam (`eventfd_slot_signal_unref`) that also holds a slot
+  reference so a closed fd's slot cannot be reused before its signal lands.
+  `VIRTGPU_WAIT` without `NOWAIT` blocks (15 s, EBUSY after) instead of answering from a
+  stale watermark. venustest `phase7_fence_fd_unsignalled_at_return` /
+  `phase7_fence_fd_signals_within_2s` / `virtgpu_wait_nowait_busy_after_kick` prove both
+  halves.
 - **ELF loader follow-ups from the dynamic-linking wave**: interp is eagerly loaded
   (~4.8 MB per exec), and there is a pre-existing buddy-slack leak on the eager→lazy split.
 - **`/proc/self/exe` returns `/bin/init` regardless of the caller — WRONG AS RECORDED, and
