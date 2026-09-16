@@ -8212,18 +8212,30 @@ fn sys_clone_or_fork(
 ) -> isize {
     const CLONE_VM: usize = 0x0000_0100;
 
+    const CLONE_PARENT_SETTID: usize = 0x0010_0000;
+    const CLONE_CHILD_SETTID:  usize = 0x0100_0000;
+
     #[cfg(target_arch = "x86_64")]
-    let (flags, child_stack, _ptid, ctid, tls) = (a0, a1, a2, a3, a4);
+    let (flags, child_stack, ptid, ctid, tls) = (a0, a1, a2, a3, a4);
 
     #[cfg(target_arch = "aarch64")]
-    let (flags, child_stack, _ptid, tls, ctid) = (a0, a1, a2, a3, a4);
+    let (flags, child_stack, ptid, tls, ctid) = (a0, a1, a2, a3, a4);
+
+    // The tid words are stored through the VMA tables inside clone_thread
+    // (no user access under RUN_QUEUE), which cannot fault a lazy page in.
+    // Make them resident here, with no lock held. musl's `&new->tid` shares
+    // a page with the `struct pthread` it has just initialised, so this is
+    // normally a no-op, but a pointer into an untouched mapping would
+    // otherwise be silently skipped.
+    if flags & CLONE_PARENT_SETTID != 0 { prefault_user(ptid, 4); }
+    if flags & CLONE_CHILD_SETTID  != 0 { prefault_user(ctid, 4); }
 
     if flags & CLONE_VM != 0 {
         const CLONE_THREAD: usize = 0x0001_0000;
         // Identify the parent by tgid: its fd table is keyed there, not by the
         // (possibly non-leader) forking thread's pid.
         let parent_pid = sched::tgid_of(current_pid());
-        clone_thread(flags, child_stack, tls, ctid, frame_ptr, |child_pid| {
+        clone_thread(flags, child_stack, tls, ptid, ctid, frame_ptr, |child_pid| {
             // Real CLONE_THREAD siblings (pthread_create) share the leader's
             // tgid and, today, have no fd table of their own at all — every
             // VFS call from such a thread already resolves fds by its own
@@ -8247,7 +8259,7 @@ fn sys_clone_or_fork(
             }
         })
     } else {
-        let _ = (child_stack, _ptid, tls, ctid);
+        let _ = (child_stack, tls, ctid);
         // fd tables are keyed by tgid, so the parent must be identified by its
         // thread-group id — a fork issued by a non-leader thread (e.g. a tokio
         // worker calling std's pre_exec fork path) otherwise names a pid the
@@ -8255,13 +8267,21 @@ fn sys_clone_or_fork(
         let parent_pid = sched::tgid_of(current_pid());
         // Duplicate the fd table before the child becomes runnable (see the
         // FORK arm of syscall_dispatch for the SMP race this prevents).
-        fork_current(frame_ptr, |child_pid| {
+        let ret = fork_current(frame_ptr, |child_pid| {
             let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
                                    &[parent_pid as u64, child_pid as u64]);
             let _ = vfs::handle(&msg, parent_pid);
             let nmsg = make_vfs_msg(net_server::NET_FORK_DUP,
                                     &[parent_pid as u64, child_pid as u64]);
             let _ = net_server::handle(&nmsg, parent_pid);
-        })
+        });
+        // CLONE_PARENT_SETTID on a plain fork names a word in the PARENT's
+        // memory (the child got its own copy at fork), and only the parent
+        // returns here with a positive pid.
+        if ret > 0 && flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
+            let tid = (ret as u32).to_ne_bytes();
+            let _ = with_current_address_space(|as_| as_.write_user_buf(ptid, &tid));
+        }
+        ret
     }
 }

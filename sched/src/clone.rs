@@ -330,6 +330,20 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
 
 /// Spawn a new thread sharing the current process's virtual address space.
 ///
+/// `ptid` is the `CLONE_PARENT_SETTID` word: the child's tid is stored there,
+/// in the shared address space, before the child becomes runnable. musl's
+/// `pthread_create` relies on it for `new->tid` — it never assigns the
+/// clone() return value itself — and `__tl_lock` keys the thread-list lock on
+/// `__pthread_self()->tid`. A thread left with tid 0 treats a free lock
+/// (value 0) as one it already holds recursively, bumping the process-wide
+/// `tl_lock_count` without acquiring; when that thread exits (`pthread_exit`
+/// takes the lock and leaves it for the kernel's CLEARTID to release) the
+/// count stays high, the next real `__tl_lock`/`__tl_unlock` pair by the
+/// main thread decrements the count instead of storing 0, and the lock is
+/// held by the main thread forever. The first `fork()` from another thread
+/// then parks in `__tl_lock` holding `__malloc_lock`, and the process wedges
+/// — cosmic-comp's first keybinding spawn.
+///
 /// `before_enqueue` mirrors `fork_current`'s hook of the same name: it runs
 /// with the child's PID after construction but before the child is made
 /// runnable, so the caller can duplicate per-process kernel-side state (the
@@ -341,6 +355,7 @@ pub fn clone_thread(
     child_stack: usize,
     #[allow(unused_variables)]
     tls:         usize,
+    ptid:        usize,
     ctid:        usize,
     frame_ptr:   usize,
     before_enqueue: impl FnOnce(u32),
@@ -348,13 +363,14 @@ pub fn clone_thread(
     #[allow(dead_code)]
     const CLONE_SETTLS:         usize = 0x0008_0000;
     const CLONE_THREAD:         usize = 0x0001_0000;
+    const CLONE_PARENT_SETTID:  usize = 0x0010_0000;
     const CLONE_CHILD_SETTID:   usize = 0x0100_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
     const CLONE_VFORK:          usize = 0x0000_4000;
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        let _ = (flags, child_stack, tls, ctid, frame_ptr);
+        let _ = (flags, child_stack, tls, ptid, ctid, frame_ptr);
         return -38; // ENOSYS
     }
 
@@ -443,7 +459,7 @@ pub fn clone_thread(
 
         // ── Collect parent credentials and page table ─────────────────────────
         let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, heap_start, heap_end,
-             ctid_phys, cwd, leader_as, nice, umask, root) = {
+             ctid_phys, ptid_phys, cwd, leader_as, nice, umask, root) = {
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid) {
                 Some(t) => {
@@ -451,6 +467,15 @@ pub fn clone_thread(
                     let cp = if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
                         leader.address_space.as_ref()
                             .and_then(|a| a.virt_to_phys(ctid))
+                    } else {
+                        None
+                    };
+                    // Resolved through the VMA tables like `cp`: no user
+                    // access under RUN_QUEUE. The caller prefaults the word,
+                    // so a None here means a bad pointer, not a lazy page.
+                    let pp = if flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
+                        leader.address_space.as_ref()
+                            .and_then(|a| a.virt_to_phys(ptid))
                     } else {
                         None
                     };
@@ -463,7 +488,7 @@ pub fn clone_thread(
                     // leader's tgid, so lock_leader_address_space's tgid
                     // lookup already resolves to it.
                     (t.page_table, t.tgid, t.pgid, t.sid,
-                     t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, hs, he, cp, (t.cwd.clone(), t.cwd_len),
+                     t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, hs, he, cp, pp, (t.cwd.clone(), t.cwd_len),
                      leader.address_space.clone(), t.priority, t.umask, (t.root.clone(), t.root_len))
                 }
                 None => {
@@ -475,10 +500,17 @@ pub fn clone_thread(
 
         let child_pid = super::alloc_pid();
 
-        // Write child PID to ctid (CLONE_CHILD_SETTID).
+        // Write child PID to ctid (CLONE_CHILD_SETTID) and ptid
+        // (CLONE_PARENT_SETTID). Both land before the child is enqueued, so
+        // neither side can observe a stale word: under CLONE_VM the parent's
+        // store is the child's view too.
         if let Some(phys) = ctid_phys {
             let virt = mm::phys_to_virt(phys);
-            unsafe { core::ptr::write(virt as *mut u32, child_pid); }
+            unsafe { core::ptr::write_volatile(virt as *mut u32, child_pid); }
+        }
+        if let Some(phys) = ptid_phys {
+            let virt = mm::phys_to_virt(phys);
+            unsafe { core::ptr::write_volatile(virt as *mut u32, child_pid); }
         }
 
         // ── Build and enqueue child task ──────────────────────────────────────
