@@ -163,9 +163,12 @@ VENUS_GPU_DEV = "virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,id=venusgpu"
 #
 # A VNC listener bound to the venusgpu console is that missing 2D consumer, and
 # it reads the same con->surface the readback fills. Loopback-only; port 5909.
-VENUS_VNC_ADDR = "127.0.0.1:9"
 # Overridable so parallel --venus instances do not fight over one display.
+# The listener and the port the photograph is taken from are derived from ONE
+# value: they used to be separate (the listener hardcoded to :9), so a
+# LEANDROS_VNC_PORT other than 5909 grabbed from a port nothing listened on.
 VENUS_VNC_PORT = int(os.environ.get("LEANDROS_VNC_PORT", "5909"))
+VENUS_VNC_ADDR = f"127.0.0.1:{VENUS_VNC_PORT - 5900}"
 
 
 def _venus_vnc_args(venus):
