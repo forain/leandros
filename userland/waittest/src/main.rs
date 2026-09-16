@@ -239,8 +239,18 @@ unsafe fn test_echild_no_children() -> bool {
     report(name, ok)
 }
 
-// ── d. waitpid(-pgid, ...) reaps a child that made itself a group leader ────
-
+// ── d. waitpid(-pgid, ...) reaps a child placed in its own process group ────
+//
+// The parent moves the child into the group itself, before waiting. The
+// earlier version had the child call setpgid(0, 0) and the parent wait on
+// -child straight after fork(), which is a race on SMP: if the parent's
+// waitpid ran before the child's setpgid, no child was in that group yet
+// and the kernel answered ECHILD — correctly, exactly as Linux does. That
+// flake was mis-filed as a kernel bug for two months. setpgid(child, child)
+// from the parent is allowed for a child that has not exec'd (POSIX), and
+// works whether the child is still running or already a zombie; the child's
+// own setpgid(0, 0) is kept as an idempotent no-op so either order lands in
+// the same state.
 unsafe fn test_wait_on_process_group() -> bool {
     let name = b"wait_on_process_group\0";
 
@@ -250,6 +260,14 @@ unsafe fn test_wait_on_process_group() -> bool {
         _exit(0);
     }
     if r < 0 { return report(name, false); }
+
+    if setpgid(r, r) != 0 {
+        // Reap the child so the later ECHILD-shaped tests are not confused
+        // by a stray zombie, then fail.
+        let mut st: c_int = 0;
+        waitpid(r, &mut st, 0);
+        return report(name, false);
+    }
 
     let mut status: c_int = 0;
     let waited = waitpid(-r, &mut status, 0);
