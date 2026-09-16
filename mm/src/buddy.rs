@@ -21,10 +21,10 @@ pub fn free_pages()  -> usize { FREE_PAGES.load(Ordering::Relaxed) }
 /// A free list for one order level.
 ///
 /// Doubly-linked: each free block stores its own `next` pointer at byte
-/// offset 0 and `prev` pointer at byte offset 8 (accessed via the HHDM).
-/// This gives O(1) removal of an arbitrary node once located, which
-/// `free()` needs to unlink a buddy from the middle of its list when
-/// coalescing.  `0` is never a valid block address (page 0 is always
+/// offset 0, `prev` pointer at byte offset 8 and its order at byte offset 16
+/// (accessed via the HHDM). This gives O(1) removal of an arbitrary node,
+/// which `free()` needs to unlink a buddy from the middle of its list when
+/// coalescing. `0` is never a valid block address (page 0 is always
 /// reserved by the boot memory map) so it doubles as the "no link" sentinel,
 /// matching the convention the allocator already used before coalescing.
 struct FreeList {
@@ -37,10 +37,45 @@ impl FreeList {
 
 static FREE_LISTS: Mutex<[FreeList; MAX_ORDER]> = Mutex::new([const { FreeList::empty() }; MAX_ORDER]);
 
+/// One bit per physical page: set while that page is the head of a block on
+/// a free list. This is what lets `free()` answer "is my buddy free, and at
+/// my order?" in O(1) (the order is then read from the node itself, which
+/// the bit guarantees is free memory and so holds real link data). Without
+/// it the coalesce check was a walk of the whole order-0 list per page
+/// freed — fine on a fresh boot (one block), but fork's eager copies
+/// fragment RAM fast (2,285 order-0 blocks after 40 fork+exec cycles) and
+/// the exec-time teardown of a forked child went from 50 ms to seconds,
+/// growing with uptime.
+///
+/// Covers `BITMAP_COVERAGE` bytes of physical address space from 0; pages
+/// beyond it fall back to the list walk, so coverage is a speed bound, not a
+/// correctness one. Accessed only with `FREE_LISTS` held.
+const BITMAP_COVERAGE: usize = 16 << 30; // 16 GiB
+const BITMAP_WORDS: usize = BITMAP_COVERAGE / PAGE_SIZE / 64;
+struct FreeHeadBitmap(core::cell::UnsafeCell<[u64; BITMAP_WORDS]>);
+unsafe impl Sync for FreeHeadBitmap {}
+static FREE_HEAD: FreeHeadBitmap = FreeHeadBitmap(core::cell::UnsafeCell::new([0; BITMAP_WORDS]));
+
+#[inline] fn covered(addr: usize) -> bool { addr < BITMAP_COVERAGE }
+/// Caller holds `FREE_LISTS`.
+#[inline] unsafe fn head_bit_set(addr: usize, v: bool) {
+    if !covered(addr) { return; }
+    let page = addr / PAGE_SIZE;
+    let w = &mut (*FREE_HEAD.0.get())[page / 64];
+    if v { *w |= 1 << (page % 64); } else { *w &= !(1 << (page % 64)); }
+}
+/// Caller holds `FREE_LISTS`. Only meaningful for `covered` addresses.
+#[inline] unsafe fn head_bit(addr: usize) -> bool {
+    let page = addr / PAGE_SIZE;
+    (*FREE_HEAD.0.get())[page / 64] & (1 << (page % 64)) != 0
+}
+
 unsafe fn node_next(addr: usize) -> usize { *(crate::phys_to_virt(addr) as *const usize) }
 unsafe fn node_set_next(addr: usize, v: usize) { *(crate::phys_to_virt(addr) as *mut usize) = v; }
 unsafe fn node_prev(addr: usize) -> usize { *((crate::phys_to_virt(addr) + 8) as *const usize) }
 unsafe fn node_set_prev(addr: usize, v: usize) { *((crate::phys_to_virt(addr) + 8) as *mut usize) = v; }
+unsafe fn node_order(addr: usize) -> usize { *((crate::phys_to_virt(addr) + 16) as *const usize) }
+unsafe fn node_set_order(addr: usize, v: usize) { *((crate::phys_to_virt(addr) + 16) as *mut usize) = v; }
 
 /// Push `addr` onto the head of `lists[order]`.
 fn push_front(lists: &mut [FreeList; MAX_ORDER], order: usize, addr: usize) {
@@ -48,31 +83,49 @@ fn push_front(lists: &mut [FreeList; MAX_ORDER], order: usize, addr: usize) {
     unsafe {
         node_set_next(addr, old_head.unwrap_or(0));
         node_set_prev(addr, 0);
+        node_set_order(addr, order);
         if let Some(h) = old_head { node_set_prev(h, addr); }
+        head_bit_set(addr, true);
     }
     lists[order].head = Some(addr);
 }
 
-/// If `target` is present in `lists[order]`, unlink and remove it.
+/// Unlink `addr`, known to be on `lists[order]`, in O(1) via its own links.
+fn unlink(lists: &mut [FreeList; MAX_ORDER], order: usize, addr: usize) {
+    unsafe {
+        let next = node_next(addr);
+        let prev = node_prev(addr);
+        if prev != 0 {
+            node_set_next(prev, next);
+        } else {
+            lists[order].head = if next == 0 { None } else { Some(next) };
+        }
+        if next != 0 { node_set_prev(next, prev); }
+        head_bit_set(addr, false);
+    }
+}
+
+/// If `target` is the head of a free block of exactly `order`, unlink and
+/// remove it. O(1) through the bitmap where it covers `target`; otherwise a
+/// walk of `lists[order]`.
 ///
 /// Safe to walk: every node visited here is, by definition, already-free
 /// memory holding real next/prev link data (never arbitrary or allocated
 /// memory), since the only way an address gets onto this list is via
 /// `push_front`.
 fn try_remove(lists: &mut [FreeList; MAX_ORDER], order: usize, target: usize) -> bool {
+    if covered(target) {
+        unsafe {
+            if !head_bit(target) || node_order(target) != order { return false; }
+        }
+        unlink(lists, order, target);
+        return true;
+    }
     let mut cur = lists[order].head;
     while let Some(addr) = cur {
         let next = unsafe { node_next(addr) };
         if addr == target {
-            let prev = unsafe { node_prev(addr) };
-            if prev != 0 {
-                unsafe { node_set_next(prev, next); }
-            } else {
-                lists[order].head = if next == 0 { None } else { Some(next) };
-            }
-            if next != 0 {
-                unsafe { node_set_prev(next, prev); }
-            }
+            unlink(lists, order, addr);
             return true;
         }
         cur = if next == 0 { None } else { Some(next) };
@@ -166,6 +219,7 @@ pub fn alloc(order: usize) -> Option<usize> {
                 } else {
                     lists[o].head = None;
                 }
+                head_bit_set(addr, false);
             }
 
             // Split excess blocks back down, pushing each buddy half onto
@@ -211,4 +265,27 @@ pub fn free(addr: usize, order: usize) {
         order += 1;
     }
     push_front(&mut lists, order, addr);
+}
+
+/// Free-list census for the Ctrl-T task dump: the number of free blocks at
+/// each order, written with `emit`. `try_remove` walks the order-0 list once
+/// per page freed, so the order-0 count is the per-page cost of tearing an
+/// address space down. Uses `try_lock` so an IRQ-context caller cannot
+/// deadlock against an allocation in progress.
+pub fn free_list_census(emit: &mut dyn FnMut(usize, usize)) -> bool {
+    let lists = match FREE_LISTS.try_lock() { Some(l) => l, None => return false };
+    for order in 0..MAX_ORDER {
+        let mut n = 0usize;
+        let mut cur = lists[order].head;
+        // Bounded: a corrupted (cyclic) list must not turn a diagnostic into
+        // a hang. `usize::MAX` reports a walk that hit the bound.
+        while let Some(addr) = cur {
+            n += 1;
+            if n > 4_000_000 { n = usize::MAX; break; }
+            let next = unsafe { node_next(addr) };
+            cur = if next == 0 { None } else { Some(next) };
+        }
+        emit(order, n);
+    }
+    true
 }
