@@ -1,28 +1,71 @@
 # ports/cosmic-session
 
-LeandrOS-local patch(es) to [cosmic-session](https://github.com/pop-os/cosmic-epoch)
-for the COSMIC desktop bring-up.
+**There is no LeandrOS patch to cosmic-session any more.** The shipped binary is
+upstream [cosmic-session](https://github.com/pop-os/cosmic-epoch) at the
+`epoch-1.3.0` submodule revision (`b5ef6c0`), built unmodified with its default
+features. This directory keeps the build recipe and the history of the one patch
+it used to carry, so nobody reintroduces it.
 
-## 0001-env_rx-timeout-fallback.patch
+## The retired patch: `0001-env_rx-timeout-fallback.patch` (2026-07-25 → 2026-09-15)
 
-A startup-rendezvous workaround for the `cosmic-session` ↔ `cosmic-comp`
-readiness handshake. `cosmic-session` blocks at `env_rx.await` waiting for
-`cosmic-comp` to send `SetEnv{WAYLAND_DISPLAY}` over the `COSMIC_SESSION_SOCK`
-UnixStream pair; under LeandrOS's tokio async-read integration that oneshot
-never resolves, so no session component is ever spawned. The patch races the
-await against a 5 s timeout and falls back to `WAYLAND_DISPLAY=wayland-1` (the
-socket cosmic-comp actually creates at `/run/user/0/wayland-1`).
+`cosmic-session` blocks at `env_rx.await` (`src/main.rs`) until `cosmic-comp`
+sends `SetEnv{WAYLAND_DISPLAY}` over the `COSMIC_SESSION_SOCK` UnixStream pair.
+On LeandrOS that message never arrived, so no session child (panel, bg,
+settings-daemon, notifications, …) was ever spawned. The patch raced the await
+against a 5 s timeout and fell back to `WAYLAND_DISPLAY=wayland-1`; a second hunk
+(`8d0bb66`) made a *late* `SetEnv` a no-op instead of an `unwrap()` panic on the
+dropped receiver.
 
-This is **not** a functional COSMIC change — it is a bring-up rendezvous
-workaround for a known-hard tokio-integration gap. The kernel's socket / fork /
-execve / fd-inherit / epoll-wake path is independently verified sound by
-`userland/scmtest`'s `fork_exec_inherit` and `fork_exec_child_clears_cloexec`
-deciders (both pass on both arches).
+It was recorded as "a tokio-integration residual". That was never demonstrated
+and was not true. Two kernel bugs, both fixed on our side, were the cause:
 
-### Build / restage
+1. **`shutdown(2)` was a socket teardown** (`2d9f0c8`, `servers/net`).
+   `handle_shutdown` ignored `how`; `shutdown(fd, SHUT_WR)` destroyed the caller's
+   fd and flagged the whole end closed. tokio's `OwnedWriteHalf::drop` issues
+   exactly that call when `comp.rs` does `session.into_split()` — before
+   cosmic-comp is even spawned — so the session's read half was dead on arrival.
+   `scmtest` gained the `*_shutdown_wr*` guards (32 → 35).
+2. **Poll wakes were broadcast** (`daaf2cc`, `sched`/`vfs`). Every pipe write
+   woke every parked poller in the system; cosmic-comp's unbuffered stderr
+   through launch-pad's pipes turned that into a 40 s handshake on 4 vCPUs,
+   which is why the 5 s fallback kept winning even after (1) — and why the real
+   `SetEnv` then arrived late enough to hit the `unwrap()` that `8d0bb66` papered
+   over.
+
+### Retirement measurement (2026-09-15, pristine binary, both arches)
+
+`Starting cosmic-session` → `got environmental variables from cosmic-comp`, read
+from the session log (`brush /bin/start-cosmic-leandros > /data/x.log 2>&1 &`):
+
+| arch / accel      | boot 1 (fresh image) | boots 2–5                      |
+|-------------------|----------------------|--------------------------------|
+| aarch64 / HVF     | 8.86 s               | 1.64 s, 1.75 s, 1.71 s, 1.65 s |
+| x86_64 / TCG      | 8.36 s            | 8.35 s, 57.25 s, 7.96 s, 8.32 s                      |
+
+`SetEnv` arrived on every boot; no panic; the desktop (panel, dock, wallpaper)
+rendered on every boot. The one x86_64 outlier (57.25 s) shows no compositor exit
+or restart in the session log — cosmic-comp was simply slow to say ready that
+boot, and the session waited for it instead of racing a fallback. The first boot of a freshly generated image is slower
+because cosmic-comp and cosmic-config do their first-run writes then.
+
+What cosmic-comp actually exports is only `WAYLAND_DISPLAY=wayland-1` — the same
+value the fallback hard-coded — so the patch's functional cost was never the
+*contents* of the child environment, it was *ordering*: every child was spawned
+at t+5 s regardless of whether the compositor was ready. Without the patch the
+cascade starts when cosmic-comp says so.
+
+### Rule
+
+Do not bring this patch back under any new justification. If the handshake ever
+stalls again, the surfaces are all ours and all guarded: `scmtest`
+(`fork_exec_inherit*`, the `*shutdown_wr*` deciders), `smpwaketest` (pipe-EPOLLET
+herd, forked-child stdout), and the timing read above.
+
+## Build / restage
 
 The build tree is `~/code/leandros-artifacts/m6-session-bins/src/cosmic-session`
-(byte-identical to upstream). Apply the patch there, then:
+and must stay byte-identical to `../cosmic-epoch/cosmic-session` (check with
+`diff -r src ~/code/cosmic-epoch/cosmic-session/src`).
 
 ```sh
 cd ~/code/leandros-artifacts/m6-session-bins
@@ -35,8 +78,7 @@ cp src/cosmic-session/target/x86_64-unknown-linux-musl/release/cosmic-session ou
 
 ## Kernel fixes this desktop bring-up depends on (in the main tree)
 
-Three real kernel bugs were found and fixed while bringing the session up — each
-has a permanent regression test in `userland/scmtest`:
+Each has a permanent regression test in `userland/scmtest`:
 
 1. **`fcntl(F_SETFD/F_GETFD)` was a no-op for AF_UNIX socket fds**
    (`kernel/src/syscall.rs` + `servers/net` `NET_SETFD`/`NET_GETFD`). Clearing
@@ -54,13 +96,6 @@ has a permanent regression test in `userland/scmtest`:
 3. **The global pipe pool was too small** (`servers/vfs` `MAX_PIPES` 16 → 128).
    Every `command.spawn()` holds 3 stdio pipes; the full session's ~14
    components exhausted 16 pipes → `ENFILE` for every later component.
-
-## Residual (not yet resolved)
-
-With all of the above, `cosmic-comp` composites and `cosmic-bg` renders the
-wallpaper, and `cosmic-panel` connects, binds globals, creates its output and
-spawns all 16 applets, reaching "Waiting for configure event" — but then exits
-with code 101 (a silent exit, no panic message even at `RUST_BACKTRACE=full`)
-and launch_pad restart-loops it. Root cause not yet isolated; needs the full
-cosmic-session context (notification-fd handoff + workspaces D-Bus service) to
-reproduce. This is the remaining blocker to a panel-bearing desktop.
+4. **`shutdown(2)` was a teardown, not a half-close** (`2d9f0c8`, above).
+   Regression: `fork_exec_inherit_after_shutdown_wr`,
+   `socketpair_shutdown_wr_half_close`, `shutdown_wr_keeps_fd_pollable`.
