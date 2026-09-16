@@ -1,0 +1,33 @@
+=== aarch64 boot 2  22:19:54 ===
+
+Thu Jan  1 00:00:00 UTC 1970
+host launch 22:20:05
+PNG:        /tmp/ports/aarch64-boot2.png
+1970-01-01T00:00:00.649764Z  INFO cosmic_session: Starting cosmic-session
+1970-01-01T00:00:00.650043Z  INFO launch_pad: starting process ' COSMIC_SESSION_SOCK=261 /bin/cosmic-comp  --no-xwayland'
+1970-01-01T00:00:02.287876Z  INFO cosmic_session: got environmental variables from cosmic-comp: [("WAYLAND_DISPLAY", "wayland-1")]
+=== aarch64 boot 3  22:20:51 ===
+
+Thu Jan  1 00:00:00 UTC 1970
+host launch 22:21:02
+PNG:        /tmp/ports/aarch64-boot3.png
+1970-01-01T00:00:00.644516Z  INFO cosmic_session: Starting cosmic-session
+1970-01-01T00:00:00.644840Z  INFO launch_pad: starting process ' COSMIC_SESSION_SOCK=261 /bin/cosmic-comp  --no-xwayland'
+1970-01-01T00:00:02.390145Z  INFO cosmic_session: got environmental variables from cosmic-comp: [("WAYLAND_DISPLAY", "wayland-1")]
+=== aarch64 boot 4  22:21:48 ===
+
+Thu Jan  1 00:00:00 UTC 1970
+host launch 22:21:59
+PNG:        /tmp/ports/aarch64-boot4.png
+1970-01-01T00:00:00.644335Z  INFO cosmic_session: Starting cosmic-session
+1970-01-01T00:00:00.644671Z  INFO launch_pad: starting process ' COSMIC_SESSION_SOCK=261 /bin/cosmic-comp  --no-xwayland'
+1970-01-01T00:00:02.350027Z  INFO cosmic_session: got environmental variables from cosmic-comp: [("WAYLAND_DISPLAY", "wayland-1")]
+=== aarch64 boot 5  22:22:45 ===
+
+Thu Jan  1 00:00:00 UTC 1970
+host launch 22:22:56
+PNG:        /tmp/ports/aarch64-boot5.png
+1970-01-01T00:00:00.627943Z  INFO cosmic_session: Starting cosmic-session
+1970-01-01T00:00:00.628272Z  INFO launch_pad: starting process ' COSMIC_SESSION_SOCK=261 /bin/cosmic-comp  --no-xwayland'
+1970-01-01T00:00:02.274021Z  INFO cosmic_session: got environmental variables from cosmic-comp: [("WAYLAND_DISPLAY", "wayland-1")]
+=== done 22:24:03 ===
