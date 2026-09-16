@@ -392,6 +392,49 @@ pub fn drop_ref(pair: usize, is_master: bool) {
     sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PTY, pair as u32));
 }
 
+// ── job control ──────────────────────────────────────────────────────────────
+
+/// Which slave-side operation is asking.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobOp {
+    Read,
+    Write,
+    /// `tcsetpgrp`: like a write, but not gated on `TOSTOP`.
+    SetPgrp,
+}
+
+/// The job-control gate for the slave end of `pair`, for the calling
+/// process: 0 to proceed, else `-EIO`/`-EINTR`. Samples the pair's session
+/// and foreground group under the pool lock, drops it, and defers to
+/// [`crate::jobctl::check`], which may stop the caller and come back with
+/// `Retry` once the group is continued — hence the loop. A pair with no
+/// controlling session or no foreground group applies no job control.
+fn job_control(pair: usize, op: JobOp) -> isize {
+    const TOSTOP: u32 = 0x0100;
+    loop {
+        let (sid, pgrp, tostop) = {
+            let ptys = PTYS.lock();
+            let p = &ptys[pair];
+            if !p.in_use {
+                return 0; // the operation itself reports the dead pair
+            }
+            (p.sid, p.pgrp, p.termios.c_lflag & TOSTOP != 0)
+        };
+        if sid == 0 || pgrp == 0 {
+            return 0;
+        }
+        let v = match op {
+            JobOp::Read => crate::jobctl::check(sid, pgrp, crate::jobctl::SIGTTIN),
+            JobOp::Write => crate::jobctl::check_write(sid, pgrp, tostop),
+            JobOp::SetPgrp => crate::jobctl::check(sid, pgrp, crate::jobctl::SIGTTOU),
+        };
+        match v {
+            crate::jobctl::Verdict::Retry => continue,
+            v => return crate::jobctl::errno(v),
+        }
+    }
+}
+
 // ── output side: slave writes, master reads ──────────────────────────────────
 
 /// The slave wrote `count` bytes (a program's stdout). Applies `OPOST`
@@ -402,6 +445,13 @@ pub fn drop_ref(pair: usize, is_master: bool) {
 pub unsafe fn slave_write(pair: usize, buf: *const u8, count: usize) -> isize {
     if pair >= MAX_PTYS {
         return -5;
+    }
+    // Job control first, with no lock held: a background writer of its
+    // controlling terminal takes SIGTTOU when the terminal has TOSTOP, and
+    // the stop that implies parks this thread inside `check_write`.
+    let r = job_control(pair, JobOp::Write);
+    if r != 0 {
+        return r;
     }
     let mut ptys = PTYS.lock();
     let p = &mut ptys[pair];
@@ -717,6 +767,13 @@ pub unsafe fn slave_read(pair: usize, buf: *mut u8, count: usize) -> isize {
     if pair >= MAX_PTYS || count == 0 {
         return 0;
     }
+    // A background process reading its controlling terminal is stopped with
+    // SIGTTIN (or told EIO if it cannot be) before any byte is looked at —
+    // `n_tty_read`'s `job_control()` gate. No lock held across it.
+    let r = job_control(pair, JobOp::Read);
+    if r != 0 {
+        return r;
+    }
     let mut ptys = PTYS.lock();
     let p = &mut ptys[pair];
     if !p.in_use {
@@ -868,12 +925,40 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
     if pair >= MAX_PTYS {
         return -25; // ENOTTY
     }
-    // Sampled before the pool lock is taken. `current_sid`/`current_pgid` both
-    // take the scheduler's run-queue lock, and PTYS → RUN_QUEUE is exactly the
+    // Sampled before the pool lock is taken. `current_sid_pgid` takes the
+    // scheduler's run-queue lock, and PTYS → RUN_QUEUE is exactly the
     // inversion the `Pending` dance at the end of this function exists to
     // avoid — see its doc comment. Cheap enough to read unconditionally.
-    let cur_sid = sched::current_sid();
-    let cur_pgid = sched::current_pgid();
+    let (cur_sid, cur_pgid) = sched::current_sid_pgid();
+    if cmd == TIOCSPGRP {
+        // tcsetpgrp(3), Linux `tiocspgrp()`, evaluated before the pool lock
+        // because the SIGTTOU leg can park the caller: the pty must be the
+        // caller's controlling terminal (ENOTTY), the new foreground group a
+        // group of that session (EPERM), and a background caller takes
+        // SIGTTOU first unless it ignores it — brush's own hand-off relies on
+        // that exemption, as bash's does.
+        if arg == 0 {
+            return -14;
+        }
+        let term_sid = {
+            let ptys = PTYS.lock();
+            if !ptys[pair].in_use {
+                return -25;
+            }
+            ptys[pair].sid
+        };
+        if is_master || term_sid == 0 || cur_sid != term_sid {
+            return -25; // ENOTTY
+        }
+        let pgid = unsafe { core::ptr::read(arg as *const u32) };
+        if !sched::pgrp_in_session(pgid, term_sid) {
+            return -1; // EPERM
+        }
+        let r = job_control(pair, JobOp::SetPgrp);
+        if r != 0 {
+            return r;
+        }
+    }
     let pending;
     let rc;
     // Set when a termios change moved bytes into the slave queue; the waiters

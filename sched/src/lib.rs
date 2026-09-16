@@ -529,6 +529,60 @@ pub fn pgid_of(pid: Pid) -> Option<Pid> {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.pgid)
 }
 
+/// `(sid, pgid)` of the calling *process* in one run-queue acquisition — the
+/// pair every terminal job-control check needs ("is this my controlling
+/// terminal, and am I its foreground group?").
+///
+/// Read from the thread-group leader, not the calling thread. `setsid`/
+/// `setpgid` update the calling task only, so a worker thread of a threaded
+/// shell (brush's tokio runtime) can carry a stale `pgid` from before the
+/// shell moved itself into its own group; judging it by that would let its
+/// own terminal stop it with SIGTTIN. Process groups and sessions are
+/// process attributes, and the leader is where every other consumer
+/// (`kill_pgrp`, wait4's pgid match) reads them.
+pub fn current_sid_pgid() -> (Pid, Pid) {
+    let pid = current_pid();
+    let rq = RUN_QUEUE.lock();
+    let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return (0, 0) };
+    rq.find_pid(tgid).map(|l| (l.sid, l.pgid)).unwrap_or((0, 0))
+}
+
+/// True when some live process (leader) of group `pgid` belongs to session
+/// `sid` — the `tcsetpgrp(3)` precondition (EPERM otherwise): a terminal's
+/// foreground group must be a group of the session it controls.
+pub fn pgrp_in_session(pgid: Pid, sid: Pid) -> bool {
+    if pgid == 0 { return false; }
+    let rq = RUN_QUEUE.lock();
+    for i in 0..runqueue::MAX_TASKS {
+        if let Some(t) = rq.get(i) {
+            if t.pid == t.tgid && t.pgid == pgid && t.sid == sid
+                && t.state != TaskState::Zombie {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `(ppid, pgid, sid, state)` of process `pid` for `/proc/<pid>/stat`, with
+/// the state as its procps letter: `R` runnable, `S` sleeping on a wait
+/// channel, `T` job-control stopped, `Z` zombie. A stop is reported from the
+/// leader's `stop_signal` as well as the `Stopped` task state, so a threaded
+/// process whose leader happens to be mid-park still reads `T`.
+pub fn proc_stat_of(pid: Pid) -> Option<(Pid, Pid, Pid, u8)> {
+    let rq = RUN_QUEUE.lock();
+    let t = rq.find_pid(pid)?;
+    let leader_stopped = rq.find_pid(t.tgid).map(|l| l.stop_signal != 0).unwrap_or(false);
+    let letter = match t.state {
+        TaskState::Zombie  => b'Z',
+        TaskState::Stopped => b'T',
+        _ if leader_stopped => b'T',
+        TaskState::Blocked => b'S',
+        TaskState::Ready | TaskState::Running => b'R',
+    };
+    Some((t.ppid, t.pgid, t.sid, letter))
+}
+
 /// The thread-group id of `pid`, or `pid` itself if it's not a live task
 /// (matches every task's own fallback of being its own tgid at creation).
 // ── pid → tgid side table ────────────────────────────────────────────────────
@@ -3095,6 +3149,11 @@ pub fn exit(code: i32) -> ! {
     };
     // Release the /proc/self/exe side-table slot when the process leader dies.
     if pid == tgid { clear_exe_path(tgid); }
+    // A process leaving can orphan a stopped job: POSIX says that job gets
+    // SIGHUP + SIGCONT rather than staying stopped with no shell left to
+    // continue it. Must run after the zombie marking above so the scan does
+    // not count the exiting process as a live anchor.
+    if pid == tgid { signal::kill_orphaned_pgrps(tgid); }
     // POSIX: the parent gets SIGCHLD when a child *process* terminates.
     // Threads (pid != tgid) don't signal, and the signal goes to the parent's
     // thread-group leader since the signal-action table is TGID-shared.

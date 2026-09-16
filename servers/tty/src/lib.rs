@@ -36,6 +36,7 @@
 use ipc::Message;
 use spin::Mutex;
 
+pub mod jobctl;
 pub mod pty;
 pub mod vt;
 
@@ -138,8 +139,55 @@ static CONSOLE_TERMIOS: Mutex<[ConsoleTermios; MAX_PROCS]> =
 /// intercept (`console_intercept_byte`) and TIOCGPGRP.
 static CONSOLE_FG_PGID: Mutex<u32> = Mutex::new(0);
 
+/// Session that holds the console as its controlling terminal (0 = none).
+/// Set by `TIOCSCTTY` — `init`'s session child does that before exec'ing
+/// `login`, so the serial login shell and its jobs are in it. Job control
+/// (SIGTTIN/SIGTTOU, `tcsetpgrp`) applies only to processes of this session:
+/// anything else that has the console on its stdio — the greeter chain,
+/// which `setsid`s without claiming a terminal, or `init` itself — reads and
+/// writes it as a plain device, exactly as on Linux.
+static CONSOLE_SID: Mutex<u32> = Mutex::new(0);
+
 /// The console's current foreground process group (0 = unset).
 pub fn console_fg_pgid() -> u32 { *CONSOLE_FG_PGID.lock() }
+
+/// `TOSTOP` of the console, read from the foreground leader's termios record
+/// (the same record `console_intercept_byte` consults; the console default
+/// has it clear).
+fn console_tostop(fg: u32) -> bool {
+    const TOSTOP: u32 = 0x0100;
+    let tbl = CONSOLE_TERMIOS.lock();
+    tbl.iter().find(|c| c.in_use && c.pid == fg)
+        .map(|c| c.termios.c_lflag & TOSTOP != 0)
+        .unwrap_or(false)
+}
+
+/// Job-control gate for a console `read` by the calling process: 0 to
+/// proceed, `-EIO` or `-EINTR`. A background reader of its controlling
+/// console is stopped with SIGTTIN *inside this call* and re-checked once
+/// continued (see [`jobctl`]).
+pub fn console_read_check() -> isize {
+    loop {
+        let (sid, fg) = (*CONSOLE_SID.lock(), *CONSOLE_FG_PGID.lock());
+        match jobctl::check(sid, fg, jobctl::SIGTTIN) {
+            jobctl::Verdict::Retry => continue,
+            v => return jobctl::errno(v),
+        }
+    }
+}
+
+/// Job-control gate for a console `write`: SIGTTOU to a background writer,
+/// only when the console has `TOSTOP`.
+pub fn console_write_check() -> isize {
+    loop {
+        let (sid, fg) = (*CONSOLE_SID.lock(), *CONSOLE_FG_PGID.lock());
+        if sid == 0 || fg == 0 { return 0; }
+        match jobctl::check_write(sid, fg, console_tostop(fg)) {
+            jobctl::Verdict::Retry => continue,
+            v => return jobctl::errno(v),
+        }
+    }
+}
 
 /// Line-discipline ISIG intercept, called from the per-tick UART drain for
 /// every incoming console byte BEFORE it is queued as input. Returns true
@@ -209,13 +257,36 @@ fn jobctl_ioctl(cmd: usize, arg_ptr: usize) -> Option<Message> {
         TIOCSPGRP => {
             if arg_ptr == 0 { return Some(err_reply(-14)); }
             let pgid = unsafe { core::ptr::read(arg_ptr as *const u32) };
+            // tcsetpgrp(3), Linux `tiocspgrp()`: the console must be the
+            // caller's controlling terminal (ENOTTY), the new foreground
+            // group must be a group of that session (EPERM), and a caller
+            // that is itself in the background takes SIGTTOU first — unless
+            // it ignores it, which is how every shell (brush included) does
+            // its own hand-off. Before this the console accepted any pgid
+            // from anyone, and a job could steal the terminal from under
+            // the shell that spawned it.
+            let (my_sid, _) = sched::current_sid_pgid();
+            let sid = *CONSOLE_SID.lock();
+            if sid == 0 || my_sid != sid { return Some(err_reply(-25)); } // ENOTTY
+            if !sched::pgrp_in_session(pgid, sid) { return Some(err_reply(-1)); } // EPERM
+            loop {
+                let fg = *CONSOLE_FG_PGID.lock();
+                match jobctl::check(sid, fg, jobctl::SIGTTOU) {
+                    jobctl::Verdict::Retry => continue,
+                    jobctl::Verdict::Proceed => break,
+                    v => return Some(err_reply(jobctl::errno(v) as i32)),
+                }
+            }
             *CONSOLE_FG_PGID.lock() = pgid;
             Some(ok_reply())
         }
         TIOCSCTTY => {
             // Acquiring the controlling terminal also makes the caller's
-            // process group foreground (matches how shells use it).
-            *CONSOLE_FG_PGID.lock() = sched::current_pgid();
+            // process group foreground (matches how shells use it), and
+            // records the caller's session as the one the console controls.
+            let (sid, pgid) = sched::current_sid_pgid();
+            *CONSOLE_SID.lock() = sid;
+            *CONSOLE_FG_PGID.lock() = pgid;
             Some(ok_reply())
         }
         TIOCGSID => {
@@ -414,20 +485,18 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg_ptr: usize) -> Message {
     // Termios records are per-process: thread siblings must see the same
     // console state (same tgid canonicalization as the VFS/net servers).
     let pid = sched::tgid_of(pid);
+    // Nothing above fd 2 reaches here as a terminal: pty ends are dispatched
+    // by `sys_ioctl` straight to `pty::ioctl`, console proxies were folded to
+    // fd 0 there, and everything else genuinely is not a terminal — including
+    // for the job-control commands, which used to be answered for any fd.
+    if fd > 2 { return err_reply(-25); } // ENOTTY
     if let Some(r) = jobctl_ioctl(cmd, arg_ptr) { return r; }
-    if fd <= 2 {
-        // stdin/stdout/stderr have no fd-table entry at all — see ConsoleTermios.
-        let mut console = CONSOLE_TERMIOS.lock();
-        let c = match get_or_create_console(pid, &mut *console) {
-            Some(c) => c, None => return err_reply(-25),
-        };
-        return termios_ioctl(cmd, arg_ptr, &mut c.termios);
-    }
-
-    // Nothing above fd 2 reaches here as a terminal: pty ends are dispatched by
-    // `sys_ioctl` straight to `pty::ioctl`, and everything else genuinely is
-    // not a terminal.
-    err_reply(-25) // ENOTTY
+    // stdin/stdout/stderr have no fd-table entry at all — see ConsoleTermios.
+    let mut console = CONSOLE_TERMIOS.lock();
+    let c = match get_or_create_console(pid, &mut *console) {
+        Some(c) => c, None => return err_reply(-25),
+    };
+    termios_ioctl(cmd, arg_ptr, &mut c.termios)
 }
 
 /// Copy a `struct termios`/`termios2` between userspace and `t`, for the

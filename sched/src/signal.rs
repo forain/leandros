@@ -491,6 +491,202 @@ fn do_signal_stop(pid: super::task::Pid, sig: u32) {
     super::yield_now("stopped");
 }
 
+// ── Terminal job control: SIGTTIN/SIGTTOU from inside a syscall ──────────────
+
+/// SIGHUP, for the orphaned-process-group rule.
+const SIGHUP: u32 = 1;
+
+/// Is `sig` ignored by the calling process — `SIG_IGN`, or blocked on the
+/// calling thread? This is Linux's `is_ignored()` in `n_tty`/`tty_io`, the
+/// test that decides whether a background read/write/`tcsetpgrp` raises the
+/// job-control signal or is answered without one (EIO for a read, silent
+/// success for the other two).
+pub fn signal_ignored_or_blocked(sig: u32) -> bool {
+    if sig == 0 || sig > 64 { return true; }
+    let pid = super::current_pid();
+    if pid == 0 { return true; }
+    let bit = 1u64 << (sig - 1);
+    let rq = super::RUN_QUEUE.lock();
+    let (tgid, mask) = match rq.find_pid(pid) {
+        Some(t) => (t.tgid, t.signal_mask),
+        None => return true,
+    };
+    if mask & bit != 0 { return true; }
+    rq.find_pid(tgid)
+        .map(|l| l.signal_actions[(sig - 1) as usize].handler == 1)
+        .unwrap_or(true)
+}
+
+/// The terminal just sent `sig` (SIGTTIN/SIGTTOU) to the calling process's
+/// own group from inside a read/write/ioctl, and the syscall cannot complete
+/// until the group is continued in the foreground. Linux returns
+/// `-ERESTARTSYS` and re-executes the syscall after `SIGCONT`; this kernel
+/// has no restart mechanism, so the stop runs *here*, inside the syscall,
+/// and the caller loops back to re-check the foreground group once
+/// `do_signal_stop` returns.
+///
+/// Returns `true` when the default action ran (the caller retries) and
+/// `false` when the process catches the signal — then the handler must run
+/// on the way back to user space and the syscall reports `EINTR`, which is
+/// what Linux does without `SA_RESTART`.
+///
+/// `kill_pgrp` may have parked the bit on a sibling thread of a threaded
+/// process; it is claimed from whichever thread holds it so the stop is not
+/// taken twice — once here and once on that thread's next return to user
+/// space. If the bit is already gone (a sibling dequeued it first and
+/// stopped the group, leaving this thread `stop_pending`), park directly.
+pub fn stop_now_if_pending(sig: u32) -> bool {
+    if sig == 0 || sig > 64 || SIGDFL_STOP & (1u64 << (sig - 1)) == 0 { return false; }
+    let pid = super::current_pid();
+    if pid == 0 { return false; }
+    let bit = 1u64 << (sig - 1);
+    let park_only = {
+        let mut rq = super::RUN_QUEUE.lock();
+        let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return false };
+        let handler = rq.find_pid(tgid)
+            .map(|l| l.signal_actions[(sig - 1) as usize].handler)
+            .unwrap_or(0);
+        if handler != 0 { return false; } // caught (or SIG_IGN, never sent): EINTR path
+        let mut found = false;
+        for i in 0..super::runqueue::MAX_TASKS {
+            if let Some(t) = rq.get_mut(i) {
+                if t.tgid != tgid { continue; }
+                if t.signal_pending & bit != 0 {
+                    t.signal_pending &= !bit;
+                    found = true;
+                }
+            }
+        }
+        if let Some(l) = rq.find_pid_mut(tgid) {
+            if l.shared_signal_pending & bit != 0 {
+                l.shared_signal_pending &= !bit;
+                found = true;
+            }
+        }
+        if found {
+            false
+        } else {
+            match rq.find_pid_mut(pid) {
+                Some(t) if t.stop_pending => {
+                    t.state = crate::task::TaskState::Stopped;
+                    clear_block_fields(t);
+                    true
+                }
+                _ => return true, // already continued: nothing to wait for
+            }
+        }
+    };
+    if park_only {
+        super::yield_now("stopped");
+    } else {
+        do_signal_stop(pid, sig);
+    }
+    true
+}
+
+/// POSIX orphaned process group: every member's parent is either in the
+/// group itself or in another session (a dead parent counts as gone). A
+/// background job in such a group can never be continued by a shell, so the
+/// terminal answers its reads with EIO instead of stopping it forever.
+///
+/// Evaluated against a run-queue borrow: `kill_orphaned_pgrps` scans several
+/// groups under one acquisition.
+fn pgrp_orphaned_locked(rq: &super::runqueue::RunQueue, pgid: super::task::Pid) -> bool {
+    for i in 0..super::runqueue::MAX_TASKS {
+        if let Some(t) = rq.get(i) {
+            if t.pgid != pgid || t.pid != t.tgid
+                || t.state == crate::task::TaskState::Zombie { continue; }
+            // The parent's group/session are read from ITS leader: a child
+            // forked by a worker thread has that thread as `ppid`, and only
+            // leaders carry authoritative `pgid`/`sid` (see current_sid_pgid).
+            let parent = rq.find_pid(t.ppid)
+                .and_then(|p| if p.pid == p.tgid { Some(p) } else { rq.find_pid(p.tgid) });
+            if let Some(p) = parent {
+                if p.state != crate::task::TaskState::Zombie
+                    && p.pgid != pgid && p.sid == t.sid {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+pub fn pgrp_is_orphaned(pgid: super::task::Pid) -> bool {
+    if pgid == 0 { return true; }
+    let rq = super::RUN_QUEUE.lock();
+    pgrp_orphaned_locked(&rq, pgid)
+}
+
+/// Any live process of `pgid` with a job-control stop on record. Leaders
+/// only: `stop_signal` lives there, and a non-leader thread's `pgid` may be
+/// stale (see `current_sid_pgid`).
+fn pgrp_has_stopped_locked(rq: &super::runqueue::RunQueue, pgid: super::task::Pid) -> bool {
+    for i in 0..super::runqueue::MAX_TASKS {
+        if let Some(t) = rq.get(i) {
+            if t.pgid != pgid || t.pid != t.tgid
+                || t.state == crate::task::TaskState::Zombie { continue; }
+            if t.state == crate::task::TaskState::Stopped || t.stop_signal != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The orphaned-process-group rule (POSIX 2.2.2.52, Linux
+/// `kill_orphaned_pgrp`): when `exiting` leaves, any process group it was
+/// anchoring — its own, or a child's group in the same session — that has
+/// just become orphaned *and* has stopped members gets SIGHUP followed by
+/// SIGCONT. Without it a job stopped under a shell that then died stays
+/// stopped for ever, with nothing left that could ever `fg` it.
+///
+/// Called from `exit` once the leader is already a zombie, so the scan
+/// naturally ignores it. Runs with no locks held: the signals go out after
+/// the run-queue scan.
+pub(crate) fn kill_orphaned_pgrps(exiting: super::task::Pid) {
+    const MAX_GROUPS: usize = 16;
+    let mut doomed = [0 as super::task::Pid; MAX_GROUPS];
+    let mut n = 0usize;
+    {
+        let rq = super::RUN_QUEUE.lock();
+        let (my_pgid, my_sid) = match rq.find_pid(exiting) {
+            Some(t) => (t.pgid, t.sid),
+            None => return,
+        };
+        let mut cands = [0 as super::task::Pid; MAX_GROUPS];
+        let mut nc = 0usize;
+        if my_pgid != 0 { cands[nc] = my_pgid; nc += 1; }
+        for i in 0..super::runqueue::MAX_TASKS {
+            if let Some(t) = rq.get(i) {
+                if t.pid != t.tgid || t.state == crate::task::TaskState::Zombie
+                    || t.sid != my_sid || t.pgid == 0 || t.pgid == my_pgid { continue; }
+                // A child of the exiting process, in its session, in another
+                // group: the exiting process was what kept that group anchored.
+                // The cheap field tests above run first; `find_pid` is a scan,
+                // and this runs on every process exit.
+                let parent_tgid = if t.ppid == exiting { exiting } else {
+                    rq.find_pid(t.ppid).map(|p| p.tgid).unwrap_or(t.ppid)
+                };
+                if parent_tgid != exiting { continue; }
+                if cands[..nc].contains(&t.pgid) { continue; }
+                if nc < MAX_GROUPS { cands[nc] = t.pgid; nc += 1; }
+            }
+        }
+        // Stopped members first: that is one linear pass and almost always
+        // false, and only then the parent-per-member orphan scan.
+        for &g in &cands[..nc] {
+            if pgrp_has_stopped_locked(&rq, g) && pgrp_orphaned_locked(&rq, g) {
+                doomed[n] = g; n += 1;
+            }
+        }
+    }
+    for &g in &doomed[..n] {
+        let _ = super::kill_pgrp(g, SIGHUP, crate::task::SigInfo::KERNEL);
+        let _ = super::kill_pgrp(g, SIGCONT, crate::task::SigInfo::KERNEL);
+    }
+}
+
 /// SIGCHLD to the parent of process `tgid` for a stop/continue, honouring
 /// the parent's SA_NOCLDSTOP. Runs with no locks held.
 pub(crate) fn notify_parent_state_change(tgid: super::task::Pid, ppid: super::task::Pid,
