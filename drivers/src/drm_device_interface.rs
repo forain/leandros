@@ -1981,6 +1981,72 @@ pub fn prime_export_acquire(handle: u32, open_id: u32) -> Option<PrimeExport> {
     })
 }
 
+/// PRIME_FD_TO_HANDLE for a **blob** object: mint a gem handle that the
+/// IMPORTING open may reach, or return the one it already holds on this object.
+///
+/// WHY. Handles are scoped to the open that created them (`BlobHandle::owner`,
+/// `open_may_reach`). PRIME_FD_TO_HANDLE used to echo the *exporter's* handle
+/// across the fd, so the very next thing an importer does with it —
+/// `VIRTGPU_RESOURCE_INFO`, which Mesa's Venus backend issues in
+/// `virtgpu_bo_create_from_dma_buf` — resolved to "not yours" and was refused
+/// as an unknown handle. Under Zink that is the compositor importing a client's
+/// `zwp_linux_dmabuf_v1` buffer: cosmic-comp answered cosmic-panel's
+/// `create_immed` with a protocol error and the panel died on every start.
+///
+/// WHAT UPSTREAM DOES, which this mirrors:
+///   * `drm_gem_prime_fd_to_handle` gives each `drm_file` its own handle on the
+///     shared object, and returns the *existing* handle if that file already
+///     imported (or created) the object — hence the dedup scan first, which also
+///     makes a self-import (Mesa re-importing its own export) answer with the
+///     original handle;
+///   * `virtio_gpu_gem_object_open` then sends CTX_ATTACH_RESOURCE for the
+///     importer's context, because the host renderer's per-context resource
+///     table is what `vkAllocateMemory` with a resource import consults — a
+///     Venus context can only import a resource it has been told about.
+///
+/// The new handle is one reference on the object (`BO LIFETIME`), released
+/// by GEM_CLOSE like any other, and it records the importer's context so the
+/// close detaches exactly what this attach attached.
+///
+/// Returns `None` if `obj` names no live blob object — a dumb-buffer export,
+/// whose handles are deliberately global (see `open_may_reach`), or a buffer
+/// torn down between the fd read and here — and the caller falls back to the
+/// exporter's handle, which for a dumb buffer is the right answer.
+pub fn prime_import_blob(obj: u32, open_id: u32) -> Option<u32> {
+    if open_id == 0 { return None; } // no identity: every handle is reachable anyway
+    {
+        let map = BLOB_BUFFERS.lock();
+        if let Some((h, _)) = map.iter().find(|(_, h)| h.obj == obj && h.owner == open_id) {
+            return Some(*h);
+        }
+    }
+    // Take the handle's reference under ONE acquisition of the object map.
+    let res_handle = {
+        let mut objs = BLOB_OBJS.lock();
+        let o = objs.get_mut(&obj)?;
+        o.refs = o.refs.saturating_add(1);
+        o.res_handle
+    };
+    let ctx = ctx_lookup(open_id);
+    if ctx != 0 && res_handle != 0 {
+        let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+        if let Some(gpu) = guard.as_mut() {
+            // Logged, not propagated — same contract as RESOURCE_CREATE_BLOB's
+            // attach: upstream issues it for effect and returns 0 regardless.
+            if !gpu.ctx_attach_resource(ctx, res_handle) {
+                crate::pci::serial_debug("[DRM] PRIME import: CTX_ATTACH_RESOURCE refused ctx=");
+                crate::pci::serial_debug_hex(ctx);
+                crate::pci::serial_debug(" res=");
+                crate::pci::serial_debug_hex(res_handle);
+                crate::pci::serial_debug("\n");
+            }
+        }
+    }
+    let handle = NEXT_BLOB_HANDLE.fetch_add(1, Ordering::Relaxed);
+    BLOB_BUFFERS.lock().insert(handle, BlobHandle { obj, owner: open_id, ctx });
+    Some(handle)
+}
+
 // ── DRM sync objects ─────────────────────────────────────────────────────────
 //
 // A syncobj is a *named, per-drm_file container for a fence*. That indirection

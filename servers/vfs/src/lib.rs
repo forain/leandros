@@ -778,6 +778,21 @@ pub fn dmabuf_handle_of(pid: u32, fd: usize) -> Option<u32> {
     }
 }
 
+/// The BO **object** id a dmabuf fd holds its reference on — the lifetime
+/// identity `prime_export_acquire` returned, not the exporter's gem handle.
+/// This is what PRIME_FD_TO_HANDLE hands to `prime_import_blob` so the
+/// importing open gets a handle of its own; the exporter's handle number is
+/// meaningless to any other open (see `BlobHandle::owner`). `None` if the fd is
+/// not a borrowed dmabuf VMO.
+pub fn dmabuf_obj_of(pid: u32, fd: usize) -> Option<u32> {
+    let idx = tmpfile_owner_of(pid, fd)?;
+    let vmos = TMP_VMOS.lock();
+    match vmos[idx].as_ref() {
+        Some(vmo) if vmo.borrowed && vmo.dmabuf_obj != 0 => Some(vmo.dmabuf_obj),
+        _ => None,
+    }
+}
+
 /// Ensure the tmpfs/memfd file behind `fd` has a VMO whose frames cover the
 /// page range `[off, off+len)`, pin **one** `pageref` reference per mapped
 /// frame, and return those frames in order for

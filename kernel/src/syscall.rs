@@ -6406,10 +6406,23 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         let dfd = unsafe { ((arg + 8) as *const i32).read() };
         // Same TGID canonicalisation as HANDLE_TO_FD: the dmabuf fd lives in the
         // process (TGID) table, but dmabuf_handle_of indexes it directly.
-        let handle = match vfs::dmabuf_handle_of(sched::tgid_of(pid), dfd as usize) {
+        let tgid = sched::tgid_of(pid);
+        let exporter_handle = match vfs::dmabuf_handle_of(tgid, dfd as usize) {
             Some(h) => h,
             None => return -22, // EINVAL
         };
+        // A blob is reachable only by the open that owns a handle on it, so the
+        // importer needs a handle of its own (`prime_import_blob`); echoing the
+        // exporter's handle is right only for a dumb buffer, whose handles are
+        // global. The import is scoped to the calling open exactly as the
+        // export above is.
+        let open_id = match vfs::vfs_get_node_kind(pid, fd) {
+            Some(vfs::VnodeKind::DynamicDevice { open_id, .. }) => open_id,
+            _ => 0,
+        };
+        let handle = vfs::dmabuf_obj_of(tgid, dfd as usize)
+            .and_then(|obj| drivers::drm_device_interface::prime_import_blob(obj, open_id))
+            .unwrap_or(exporter_handle);
         unsafe { (arg as *mut u32).write(handle); }
         return 0;
     }
