@@ -5,7 +5,6 @@
 #![no_std]
 
 use ipc::{Message, port};
-use spin::Mutex;
 use drivers::snd::VirtioSnd;
 use drivers::Driver;
 use drivers::pci;
@@ -105,7 +104,14 @@ impl PipeWireState {
                     last_used = self.snd_driver.tx_used_idx();
                     stall_start = monotonic_us();
                 }
-                if now.wrapping_sub(start) > 3_000_000 { break; } // give up: drop
+                if now.wrapping_sub(start) > 3_000_000 {
+                    // Give up and drop the rest. Say so: a producer that keeps
+                    // hitting this is what a "silent" audio death looks like.
+                    pci::serial_debug("[PW] push blocked 3 s with no TX progress, dropping ");
+                    pci::serial_debug_hex((data.len() - off) as u32);
+                    pci::serial_debug(" bytes\n");
+                    break;
+                }
                 for _ in 0..1000 { core::hint::spin_loop(); }
             }
         }
@@ -137,7 +143,8 @@ impl PipeWireState {
     }
 }
 
-static STATE: Mutex<PipeWireState> = Mutex::new(PipeWireState::new());
+static STATE: sched::lockwatch::TrackedMutex<PipeWireState> =
+    sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_PIPEWIRE, PipeWireState::new());
 
 // ── Protocol helper ──────────────────────────────────────────────────────────
 

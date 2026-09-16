@@ -1,4 +1,3 @@
-use spin::Mutex;
 use alloc::vec::Vec;
 use crate::pci::{PciDevice, find_device, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
 use mm;
@@ -2091,7 +2090,8 @@ impl VirtioGpuDevice {
     }
 }
 
-pub static VIRTIO_GPU: Mutex<Option<VirtioGpuDevice>> = Mutex::new(None);
+pub static VIRTIO_GPU: sched::lockwatch::TrackedMutex<Option<VirtioGpuDevice>> =
+    sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_VIRTIO_GPU, None);
 
 /// Whether the host negotiated `VIRTIO_GPU_F_VIRGL`, readable without taking
 /// [`VIRTIO_GPU`].

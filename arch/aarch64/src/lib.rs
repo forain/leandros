@@ -294,3 +294,8 @@ fn init_timer() {
     }
     unsafe { timer::init(); }
 }
+
+/// Scheduler hook: detect and repair a local virtual timer that stopped
+/// firing (see `timer::check_alive`).
+#[no_mangle]
+pub extern "C" fn arch_timer_check_alive() -> bool { timer::check_alive() }

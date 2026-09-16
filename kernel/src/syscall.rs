@@ -742,7 +742,9 @@ pub fn dispatch(
     frame_ptr: usize,
 ) -> isize {
     dbg_serial_dump_maybe();
+    sched::note_syscall_enter(number);
     let ret = dispatch_inner(number, a0, a1, a2, a3, a4, a5, frame_ptr);
+    sched::note_syscall_exit();
     // The syscall is the deepest the kernel stack ever gets — every filesystem
     // and network server runs in kernel context off the back of one. Checking
     // here costs a mask and a compare, and it is the difference between an
@@ -6944,8 +6946,8 @@ const EPOLL_EVENT_SIZE: usize = 16;
 #[cfg(not(target_arch = "x86_64"))]
 const EPOLL_EVENT_DATA_OFF: usize = 8;
 
-static EPOLL_INSTANCES: spin::Mutex<[EpollInstance; MAX_EPOLL_INSTANCES]> =
-    spin::Mutex::new([const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES]);
+static EPOLL_INSTANCES: sched::lockwatch::TrackedMutex<[EpollInstance; MAX_EPOLL_INSTANCES]> =
+    sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_EPOLL, [const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES]);
 
 /// Close an epoll fd alias: drop its fd entry; release the instance slot
 /// (and all interests with it) when the last alias goes away.
