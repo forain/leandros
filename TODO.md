@@ -19,6 +19,64 @@ conclusion that rested on them being out of scope is void. **VT switching has si
 
 ---
 
+## Open work (2026-09-16 reconciliation)
+
+Reconciled against `main` at `60f49bd` following the 2026-09-15/16 bug sweep
+(`artifacts/notes/wave-2026-09-15-16.md`). Merged this wave: `lane/ctrlq`, `lane/timers`,
+`lane/drmsmoke`, `lane/buddy4g`, `lane/killmt`, `lane/hvfclock`.
+
+**Still open:**
+- **P0 #5** — aarch64 "clicks ignored" on the linux desktop; needs a physical mouse to
+  reproduce/verify.
+- **Compositor-death memory leak** — ~140 MB of kernel memory leaks per `cosmic-comp` death;
+  a respawn storm hits `[BUDDY] Allocation failed`. Retest by killing the greeter's compositor
+  15× on `8d8edc2`-or-later; init should back off exponentially. (`lane/zinkimg` finding.)
+- `execve` from a non-leader thread leaves the fd table keyed by the old leader pid;
+  `kill_next_group_member` frees an off-CPU Blocked sibling's kernel stack in place.
+- aarch64 virtio-gpu completion is poller-only (GIC SPI INTx is the next step); reply-needing
+  ctrlq commands still spin under `VIRTIO_GPU` (~0.5% of traffic); flip-done events tick-paced.
+- x86_64 `monotonic_us` = `rdtsc/1000` (4.49× too fast on the 7950X) — needs the
+  PIT-calibrated TSC scale.
+- greetd tokio `Bad read on self-pipe: EBADF` in the session `sh -c` wrapper (harmless,
+  unexplained); greeter keystroke-render lag — re-measure (clock fixed 2026-09-16).
+- x86_64/TCG `[WDOG] … cosmic-comp` one-off seen during integration verify (not reproduced;
+  not a blocker if seen again).
+- Timespec family still wrong: `nanosleep`/`sleep_ticks_from`, relative `FUTEX_WAIT`,
+  `poll`/`select`/`ppoll` timeouts compute deadlines from `ticks()` (fire up to 10 ms early;
+  sub-tick waits truncate to 0) instead of `monotonic_ns()`; `gettimeofday`/`time` are
+  tick-derived while `clock_gettime(REALTIME)` is not (two wall clocks); `timerfd_create`
+  ignores clockid; `setpgid` has no permission model.
+- `RUN_QUEUE` is contended on most 100 Hz ticks with the greeter desktop idle (tick-hook
+  `try_lock` fails >50%) → every timed poll/epoll wake pays 1–2 ticks of retry latency; the
+  long holder is not yet found.
+- `utimensat` is a kernel no-op; exec x-bit unchecked; no supplementary groups; default-ACL
+  inheritance missing.
+- Everything in the pre-existing numbered `## Open work` table and *Road to a complete COSMIC
+  desktop* below not named here (P2/P3, RPi5 hardware lanes, verification gaps) still stands.
+
+**In flight (lane branches on `origin`, NOT merged into `main`):**
+- **`lane/perms`** (`ee52c98`) — permission enforcement VERIFIED on aarch64 (permtest 25/25,
+  vfstest/f2fstest/scmtest/sigtest2 green, `/run/user/{0,990,1000}` seeded 0700); greetd
+  stripping `XDG_SESSION_CLASS` (which broke the greeter's `/run/user` lookup) is fixed via
+  `/etc/profile` keying on `GREETD_SOCK`. **Blocker: greeter login is 0/2** — boot-time
+  `cosmic-comp` opens `/dev/input/event*` but never polls them (no `[EVDEV] register` for the
+  compositor pid); a *respawned* chain hears input within 1 s. Likely a startup race between
+  libinput device-add and epoll interest, possibly PRE-EXISTING on main (unverified — check
+  `4b7096b` the same way). x86_64 not yet run. **Needs before merge:** a proven login on this
+  branch, both arches.
+- **`lane/idlecpu`** (`d7caad8`) — x86_64/KVM only. **Blocker: aarch64 unbuilt, and
+  sigtest2/killmt/smpwaketest not re-run** on this branch. Real idle floor dropped 388% → 200%
+  (rest is cosmic-comp's softpipe re-render loop); `wakepolltest` 45/45 there. **Needs before
+  merge:** sigsuspend/AF_UNIX parking verified, plus a full aarch64 build and test pass.
+- **`lane/jobctl`** (`0ff1d7f`) — code + build only, **runtime UNVERIFIED** (built on the
+  laptop, no QEMU there yet). Adds SIGTTIN/SIGTTOU, session-scoped `tcsetpgrp`, orphaned-pgrp
+  SIGHUP+SIGCONT, `/proc/<pid>/{stat,status}`, stop-inside-syscall retry, `#!` script exec.
+  Tests `jobtest` (6), `exectest` (9). HIGH-RISK paths: brush on the serial console and
+  cosmic-term's pty (`tcsetpgrp` can now fail where it never did). **Needs before merge:** a
+  real QEMU run on both arches, particular attention to the serial console and cosmic-term.
+
+---
+
 **What landed on 2026-08-11: the desktop stopped being slow, and it now composites on the
 GPU.** Two independent efforts, both measured rather than argued.
 
@@ -99,45 +157,16 @@ fewer wakes) and **the desktop was not one bit faster**. So the 2026-08-10 refut
 the input-storm regime as well, which was the one case it was argued not to cover. Kept
 because it is a real reduction; it is not a fix.
 
-**Measured: the DRM path is 1.2% of wall time, and the desktop runs at 0.65 fps** (`4512ebb`
-adds `ctrlq_n`/`ctrlq_us`/`ctrlq_max`/`ctrlq_to` to `[DRMSTAT]` and turns `DRM_STATS` on).
-Over one clean 80 s span of a live Zink/Venus session: **52 flips (0.65 fps)**, page-flip path
-**0.63 s**, control-queue busy-spin **0.31 s** — together 1.2% of wall clock, and even that
-over-counts because the control-queue commands are issued *inside* the flip path. `flips_del`
-trails `flips_sub` by a constant 3 throughout, so the 50 Hz delivery throttle is nowhere near
-binding and we are not withholding completions. **The compositor is taking ~1.5 s per frame
-and ~12 ms of it is ours.** The rest is cosmic-comp rendering through Zink → Venus → host GPU.
-
-Two things that measurement also settled:
-
-* **The input correlation is not in the DRM counters.** Flip stalls occur in samples with
-  `evpush` Δ=**0**, and the heaviest input sample (825 events, ~412/s) had an *above*-average
-  flip rate. Whatever couples a keystroke to the freeze is inside cosmic-comp's own render
-  loop, not in anything this kernel schedules.
-* **`VirtioGpu::submit`'s busy-spin is a real 267× regression and still not the cause.** Mean
-  control-queue round trip is **2,938 µs against softpipe's 11 µs**, worst case **72.9 ms**,
-  zero timeouts — the host is genuinely slow to answer now that a GPU is behind it, and we
-  spin the vCPU through all of it. Worth fixing on its own merits. It cannot produce a
-  two-second freeze at 0.4% of wall time.
-
-**The conclusion to test first when the box is back**: softpipe was measured at **1.00 fps**
-on 2026-08-10 and Zink now measures **0.65 fps**, so Zink may be *slower* than the software
-rasterizer for cosmic-comp's workload, and the sluggishness may simply be the pre-existing
-~1 fps problem rather than anything Zink introduced. `kmscube` at 99.96 fps does not
-contradict that — it is a trivial workload next to a full desktop recomposite. The decisive
-run needs no code change: `LEANDROS_NO_ZINK=1 sh /bin/start-cosmic-leandros`, ~80 s, capture
-`[DRMSTAT]`, compare `flips_sub` and `ctrlq_us`/`ctrlq_n` against the numbers above. If
-softpipe also sits near 1 fps the target moves off the GPU path entirely, back to where guest
-CPU actually goes — the RIP-sampling method from 2026-08-10, not the DRM driver.
-
-⚠ **`DRM_STATS` is `true` while this is open** (`drivers/src/drm_device_interface.rs`). Set it
-back to `false` when the lane closes.
-
-⚠ **The counters look absent when they are not.** `driver.py` attaches a serial reader only
-for the duration of a command, so QEMU drops everything emitted between commands; `[DRMSTAT]`
-prints every 2 s and read as completely missing until a persistent reader was connected to
-`/tmp/leandros-serial.sock`. `run-qemu.sh`'s `-serial mon:stdio` is a persistent reader and
-does not have this problem.
+**CLOSED 2026-09-16 — the "0.65 fps" measurement was correct and the wrong question.**
+The 2026-08-11 DRM-counter measurement (52 flips over 80 s) was real, but the premise it fed —
+"Zink is slower than softpipe" — was never tested against the actual defect: the Zink desktop
+was rendering **ZERO frames**, not 0.65/s. Root causes: `CLONE_PARENT_SETTID` (see Standing
+context), `PRIME_FD_TO_HANDLE` echoing the exporter's handle instead of minting a per-open one,
+and no scanout path for host-memory buffers at all (`ADDFB2` only resolved through the dumb
+registry, so a 2D resource sat over guest address 0 and every flip went to black). Fixed with
+`SET_SCANOUT_BLOB` + `RESOURCE_FLUSH` and a strict `ADDFB` path (`51d9248`, `5c3c552`,
+`e758d09`); Zink now runs at **20 fps** (softpipe: 2.3 fps). Regression: `venustest` phase 5b.
+`DRM_STATS` is back to `false`.
 
 ---
 
@@ -569,9 +598,9 @@ idletest 2/0 (`IDLE_CPU_US 0`), evtest2 8/0, **ptytest 15/0**, **vttest 12/0**, 
 **evsplit `BROADCAST 60/60`** (two readers of one evdev node, 60 injected moves; a split
 delivery reads 30/30 and is the pre-broadcast signature). `waittest` has **9** subtests since
 the pty wave added SIGTERM/SIGKILL/normal-exit/SIGSEGV/SIGILL encoding cases, and is **9/0 on
-both arches**; its one historical red is `wait_on_process_group`, a pure timing race in `fork`
-→ child `setpgid(0,0)`+`_exit` → parent `waitpid(-pid)`, measured on pristine kernels too, so
-a single flake there is acceptable on either arch and the arch asymmetry in any wave is noise.
+both arches**. `wait_on_process_group`'s historical flake was the TEST racing `fork` → child
+`setpgid(0,0)`+`_exit` against parent `waitpid(-pid)`, not the kernel — fixed in the test
+2026-09-16 (`d57ffed`); 9/9 is now the expected result every run, no flake.
 Note `waittest` also emits a trailing `WAITTEST: PASS` summary line, which a
 `grep -c ': PASS'` miscounts as an extra subtest — read the binary's `failures = N` trailer
 instead. On a **Venus host** (the Linux box, `--venus`): `venustest` **108/0 both
@@ -1694,22 +1723,22 @@ Instrument that found it: the Ctrl-T dump now appends every process socket table
 AF_UNIX connection (per-end refcounts, closed/shutdown flags, peer creds, ring fill) and every
 bound address (`sched::register_dump_hook`, `net_server::dump_sockets`).
 
-Still open around the login path, all recorded with evidence and none blocking:
-- **`kill -9` of a multi-threaded process while its siblings run on other CPUs can wedge
-  those CPUs**: run 1 killed the session tree by hand and three CPUs stopped ticking with
-  `[PF] no address space for faulting task` for `cosmic-launcher` threads (`[WDOG] cpuN took no
-  timer tick for ~82 s … not in a syscall`). The address space goes away under a thread that is
-  still executing. greetd's alarm path SIGKILLs a greeter that ignores SIGTERM for 10 s, so
-  this is reachable from the login path too.
+Still open around the login path:
+- **CLOSED 2026-09-16 — `kill -9` of a multi-threaded process wedging CPUs its siblings ran
+  on.** Only the leader held the address-space `Arc` (reaped it out from under running
+  siblings), there was no single group-exit owner, and x86_64 IRQ returns never delivered
+  signals to a user-spinning thread. Fixed (`6b206f0`, test `killmt`, 8 modes); the leader's
+  fd/socket/VT teardown now runs regardless of which CPU it dies on.
 - **`thread 'tokio-rt-worker' panicked … Bad read on self-pipe: Bad file descriptor`** in
   `/var/log/greetd.log` right after `profile: session starting`. The thread ids (60, 72) fall
   between the session's `sh -c` pid and cosmic-session's, so this is most likely brush's tokio
-  signal driver in greetd's `source_profile` wrapper, not greetd itself; unverified.
+  signal driver in greetd's `source_profile` wrapper, not greetd itself; unverified, harmless.
 - The greeter's cosmic-comp logs `eglMakeCurrent … BadDisplay` / `Failed to convert between
   dmabuf and EGLImage` on its way out (kiosk exit after cosmic-greeter exits); cosmetic, the
   scanout is released and the console comes back.
 - The greeter renders each keystroke slowly enough (tiny-skia, uid 990 `Running` for tens of
-  seconds) that the dots lag the typing by 20 s or more; the keys are not lost.
+  seconds) that the dots visibly lag the typing — re-measure (clock fixed 2026-09-16, see
+  Standing context); not a loss, keys are not dropped.
 
 ### 8. There is something to launch now; what is left is asking for it by keyboard
 
@@ -3502,14 +3531,22 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
 
 ## Housekeeping
 
-- **⚠ 360 s is NOT a valid COSMIC settle on x86_64/TCG — use ≥700 s.** An integration pass
-  photographed a wallpaper with **no panel and no dock**, unchanged over 200 s, and it read as a
-  clean regression. It was bring-up latency: the wallpaper lands at ~240 s and the full panel is
-  present by ~600 s. A re-run with a 700 s settle gave the full desktop. The committed x86_64
-  evidence elsewhere in this file was taken at guest clock 00:14:30 — **on the box, where x86_64
-  runs on KVM**. This is the same accelerator-vs-arch confound that item 17's title carried: on
-  the Mac x86_64 is the *slow* target. **A screenshot taken too early is indistinguishable from a
-  desktop that never came up.**
+- **CLOSED 2026-09-16 — three more kernel gaps fixed in the same sweep, no prior TODO entry:**
+  buddy allocator's `free()` was O(n) per page (fragmentation-growing fork/exec teardown time);
+  now O(1) via a per-page free-block-head bitmap, plus a fork double-free of the child's page-
+  table root on three rollback paths and a free block at physical page 0 (`13fc269`,
+  `cddbf4d`, `5f48843`; test `memtest fill_ram_no_leak`, `c8c9c2f`). User-mode faults
+  (SIGSEGV/SIGBUS/SIGILL/SIGFPE) now reach handlers with real `_sigfault` siginfo instead of
+  only killing the task (`dbc96e5`; test `sigtest2`). A real `TaskState::Stopped` exists:
+  SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU stop the group, SIGCONT resumes,
+  `waitpid(WUNTRACED/WCONTINUED)` works (`61f8bcd`) — tty `^Z`/VSUSP and the orphaned-pgrp rule
+  are `lane/jobctl`, not yet merged (see Open work above).
+- **x86_64/TCG COSMIC settle timing is stale — re-measure (clock fixed 2026-09-16).** The old
+  ~700 s settle budget (wallpaper at ~240 s, full panel by ~600 s) was measured on the slow guest
+  clock (`67c9ba1` fixed 5–36% drift across all accelerators); every wall-time figure recorded
+  before 2026-09-16 is suspect. The underlying lesson stands regardless of the number: on the
+  Mac x86_64 is the *slow* target (TCG, not KVM), and **a screenshot taken too early is
+  indistinguishable from a desktop that never came up.**
 - **⚠ INTEGRATION VERIFIED 2026-08-10 at `a1a2b3d`.** Today's work landed on two machines in
   parallel and was rebased together; the combination had never been built. It has now been:
   `build-all.sh` clean both arches on macOS (the box's new staging/guard code is portable —
