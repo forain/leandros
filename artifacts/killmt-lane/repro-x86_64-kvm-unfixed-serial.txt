@@ -1,0 +1,24 @@
+[?2004l[?2004h[0m[?25l[1;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m78[?25h[0m[?25l[1;1H[J[39mbrush-0.5# [38;5;14m[38;5;5m[0m[0m  killmt 30 worker_parked78[?25h
+[?2004lkillmt: 30 iterations x 1 modes, pid 192
+[P[F]P nFo]  anddor easds dsrpeacses f ors pfaaculet ifnog rta sfka
+uulsteirn pgag et afsaukl
+t uRsIPe=r0 x0p00a0g00e00 01f0a15u8lFt4  RCRI2=P0x=0000x0000000000010010508F04 1C0R13=0x00500800F040 6CAERF2A=000x0 0e0r0r0=00x00000001000100500800F040 0C14R: 3ta=s0k xk0il0le0d00
+0 0 P0M6L4A[0E00F0A0000000 00e0r00r0=000x]0=000x0000000000000060b020b08001004
+: task killed
+  PML4[0000000000000000]=0x000000006b2b8000
+
+[WDOG] cpu0 took no timer tick for ~2 s (IRQs masked or timer dead): pid=230 (/bin/killmt) not in a syscall preempt_disable=0 local_ticks=16894 (seen from cpu3)
+
+[WDOG] cpu1 took no timer tick for ~2 s (IRQs masked or timer dead): pid=232 (/bin/killmt) last syscall 00000000000000E6 preempt_disable=0 local_ticks=16887 (seen from cpu3)
+
+[WDOG] cpu2 took no timer tick for ~2 s (IRQs masked or timer dead): pid=231 (/bin/killmt) not in a syscall preempt_disable=0 local_ticks=16735 (seen from cpu3)
+
+[WDOG] cpu0 took no timer tick for ~12 s (IRQs masked or timer dead): pid=230 (/bin/killmt) not in a syscall preempt_disable=0 local_ticks=16894 (seen from cpu3)
+[WDOG]   cpu0 holds RUN_QUEUE
+
+[WDOG] cpu1 took no timer tick for ~12 s (IRQs masked or timer dead): pid=232 (/bin/killmt) last syscall 00000000000000E6 preempt_disable=0 local_ticks=16887 (seen from cpu3)
+
+[WDOG] cpu2 took no timer tick for ~12 s (IRQs masked or timer dead): pid=231 (/bin/killmt) not in a syscall preempt_disable=0 local_ticks=16735 (seen from cpu3)
+
+[WDOG] cpu0 took no timer tick for ~22 s (IRQs masked or timer dead): pid=230 (/bin/killmt) not in a syscall preempt_disable=0 local_ticks=16894 (seen from cpu3)
+

@@ -32,7 +32,7 @@
 //!
 //! usage: killmt [iterations] [mode]    (defaults 100, all modes)
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -159,8 +159,12 @@ fn spin_for(d: Duration) {
 fn child_body(mode: Mode, ready_fd: i32) -> ! {
     const WORKERS: usize = 3;
     let started = Arc::new(AtomicUsize::new(0));
+    // Set once the parent has been told we are ready, so a self-inflicted
+    // death (segv, exit_group_worker) cannot beat the ready byte.
+    let go = Arc::new(AtomicBool::new(false));
     for i in 0..WORKERS {
         let started = started.clone();
+        let go = go.clone();
         thread::spawn(move || {
             started.fetch_add(1, Ordering::SeqCst);
             match mode {
@@ -170,6 +174,7 @@ fn child_body(mode: Mode, ready_fd: i32) -> ! {
                 Mode::Syscall => syscall_forever(),
                 Mode::Segv => {
                     if i == 0 {
+                        while !go.load(Ordering::SeqCst) { std::hint::spin_loop(); }
                         spin_for(Duration::from_millis(2));
                         unsafe { core::ptr::write_volatile(8usize as *mut u64, 0xdead); }
                     }
@@ -177,6 +182,7 @@ fn child_body(mode: Mode, ready_fd: i32) -> ! {
                 }
                 Mode::ExitGroupWorker => {
                     if i == 0 {
+                        while !go.load(Ordering::SeqCst) { std::hint::spin_loop(); }
                         spin_for(Duration::from_millis(2));
                         unsafe { syscall1(nr::EXIT_GROUP, 42); }
                     }
@@ -187,6 +193,7 @@ fn child_body(mode: Mode, ready_fd: i32) -> ! {
     }
     while started.load(Ordering::SeqCst) < WORKERS { thread::yield_now(); }
     unsafe { write(ready_fd, b"R".as_ptr(), 1); close(ready_fd); }
+    go.store(true, Ordering::SeqCst);
     match mode {
         Mode::LeaderParked => park_forever(),
         Mode::Touch | Mode::Segv => touch_forever(),
