@@ -127,6 +127,46 @@ Build time: ~3–5 minutes clean, ~30s incremental.
 
 ## Gotchas
 
+- **HMP `x` / `info registers` can hang QEMU's main loop for good under HVF
+  (QEMU 11.1.1, in-kernel GICv3, macOS 26) — do not poll them as a liveness
+  probe.** Both need `run_on_cpu` on a vCPU; roughly one call in a few hundred
+  never completes (seen 4× on 2026-09-15, including on an *idle* guest with
+  nothing else running). The monitor then stops answering, `quit`/SIGTERM are
+  ignored (SIGKILL works), and — because every virtio device is processed by the
+  main loop — the guest sees dead devices: `[GPU] control-queue TIMEOUT`, frozen
+  audio/wav, `[PW] producer gap`, fork/exec blocked on virtio-blk. The probe
+  manufactures the whole-guest wedge it was meant to diagnose. Liveness comes
+  from the guest instead: `liveness-run.py` (below), the `[WDOG]`/`[TIMER]`
+  kernel lines, and a userspace heartbeat. Serial output still works during a
+  main-loop hang (PL011 TX runs on the vCPU thread), serial *input* does not.
+
+- **`liveness-run.py <label> "<cmd>" [--wav] [--timeout S]`** runs one guest
+  command with a userspace heartbeat, a persistent (nothing-dropped, timestamped)
+  serial reader, optional wav-growth tracking, and — only at a stall — a
+  host-side `sample` of the QEMU process (which vCPU threads spin in `hv_trap`
+  vs sleep in the framework's WFI) before any monitor command. Output under
+  `$LEANDROS_LIVENESS_OUT` (default `/tmp/leandros-liveness`). Use it for any
+  guest workload longer than a few seconds where "it hung" is a possible outcome.
+
+- **Kernel stall diagnostics (2026-09-15):** every CPU counts its local timer
+  ticks; a CPU that takes none for 2 s is reported by a live one on the raw UART as
+  `[WDOG] cpuN took no timer tick for ~2 s ...: pid=P (/bin/x) last syscall 0x..
+  preempt_disable=.. [spinning for LOCK held by cpuM]`, repeated every 10 s, and
+  kicked with a reschedule IPI each scan. `pid=0` = the CPU is idle with a dead
+  timer (hypervisor lost the vtimer edge — a `[TIMER] cpuN virtual timer silent
+  ... re-armed` line follows once the IPI runs its idle loop); `pid=P in syscall`
+  = an IRQ-off spin in the kernel, and the lock line names it when it is one of
+  RUN_QUEUE / PIPEWIRE_STATE / FD_TABLES / PIPE_RINGS / VIRTIO_GPU / PORT_TABLE /
+  EPOLL / ADDRSPACE_BUSY (`sched::lockwatch`). Only a stall of ALL CPUs at once
+  prints nothing — then the host `sample` is the instrument.
+
+- **The guest clock runs slow under HVF: ~71 Hz idle, ~85 Hz under MAME, not
+  100 Hz.** `timer::on_tick` reloads `CNTV_TVAL` from *now*, so every tick's
+  interrupt latency (≈4 ms for a WFI wake through Hypervisor.framework) is added
+  to the period. `sleep 1` takes 1.2–1.4 s; MAME's "59 seconds" take 69 s. Not
+  fixed yet (reload should be `CVAL += interval`); do not read run wall times as
+  guest-time.
+
 - **HVF needs a GICv3 machine since QEMU 11.1 (Homebrew, 2026-09-05).** `-accel hvf` on
   `-machine virt,gic-version=2` exits immediately with `HVF does not support GICv2
   emulation` — a launch refusal, not a guest hang, and the reason every aarch64 boot on
