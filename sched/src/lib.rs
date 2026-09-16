@@ -2074,8 +2074,19 @@ fn watchdog_scan(me: usize) {
     }
 }
 
-pub fn timer_tick_irq() {
+/// The local timer interrupt on this CPU.
+///
+/// `elapsed` is how many 10 ms ticks of real time the arch timer found had
+/// passed since the last one it accounted — 1 for a tick that arrived on
+/// time, more when the interrupt was late by whole intervals (a long
+/// IRQ-masked stretch, a stalled vCPU, a lost timer edge re-armed by
+/// `arch_timer_check_alive`), 0 for a spurious interrupt. `TIMER_TICKS`
+/// advances by that amount, so it stays a count of real time and every
+/// tick-based deadline in the kernel expires when it should, while the tick
+/// hooks run once per interrupt: a catch-up is a jump, never a storm.
+pub fn timer_tick_irq(elapsed: u64) {
     let id = unsafe { cpu_id() };
+    // The watchdog counts INTERRUPTS taken (is this CPU alive?), not time.
     let mine = LOCAL_TICKS[id.min(MAX_CPUS - 1)].fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if mine % WD_SCAN_TICKS == 0 && id < MAX_CPUS {
         watchdog_scan(id);
@@ -2083,7 +2094,7 @@ pub fn timer_tick_irq() {
     // Every CPU has its own local timer; only the BSP advances global time so
     // TIMER_TICKS keeps its 100 Hz meaning regardless of CPU count.
     if id == 0 {
-        TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+        TIMER_TICKS.fetch_add(elapsed, Ordering::Relaxed);
         for h in TICK_HOOKS.iter() {
             let hook = h.load(Ordering::Acquire);
             if hook != 0 {
