@@ -2382,6 +2382,7 @@ pub fn dump_tasks() {
     print_str(" len="); pn(rq.len() as u32);
     print_str(" quiesce_tgid="); pn(QUIESCE_TGID.load(Ordering::Relaxed));
     print_str("\n[TASKS] buddy free_pages="); pn(mm::buddy::free_pages() as u32);
+    print_str(" refused_frees="); pn(mm::buddy::bad_frees() as u32);
     print_str(" blocks/order:");
     // Collected first, printed after: the census holds FREE_LISTS.
     let mut census = [0usize; mm::buddy::MAX_ORDER];

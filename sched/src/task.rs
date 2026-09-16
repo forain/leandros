@@ -953,10 +953,16 @@ impl Task {
                 o
             };
 
-            let ptr = match mm::buddy::alloc(order) {
-                Some(addr) => addr as *mut Task,
+            // Through the HHDM. This used to cast the physical address itself
+            // to a pointer, which worked only because Limine identity-maps the
+            // first 4 GiB on x86-64 — a frame above that (any guest over 2.75
+            // GiB has RAM at physical 4 GiB) faulted the moment the low RAM
+            // was gone.
+            let phys = match mm::buddy::alloc(order) {
+                Some(addr) => addr,
                 None => panic!("Failed to allocate Task struct"),
             };
+            let ptr = mm::phys_to_virt(phys) as *mut Task;
 
             // Zero the memory
             core::ptr::write_bytes(ptr as *mut u8, 0, task_size);
@@ -967,7 +973,7 @@ impl Task {
             // Copy to stack and free buddy allocation to return a proper Task
             let task_ref = &*ptr;
             let task = core::ptr::read(task_ref);
-            mm::buddy::free(ptr as usize, order);
+            mm::buddy::free(phys, order);
 
             task
         }
