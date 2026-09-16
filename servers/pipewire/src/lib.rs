@@ -13,7 +13,7 @@ use drivers::pci;
 pub const PW_SOCKET_PATH: &str = "/run/pipewire/pipewire-0";
 
 /// Latency knob: spool depth. With backpressure the spool runs full, so this
-/// plus the driver's TX_MAX_INFLIGHT×512 B is the steady-state audio latency
+/// plus the driver's TX in-flight bytes is the steady-state audio latency
 /// (176,400 B ≈ 1 s at 44.1 kHz stereo S16). It is also the cushion that
 /// absorbs producer scheduling hiccups — too small and the stream underruns,
 /// which QEMU 11.x punishes by killing the voice (recovery = audible gap).
@@ -66,7 +66,7 @@ impl PipeWireState {
     ///
     /// Stall recovery: QEMU 11.x permanently stops consuming an output
     /// stream that ever underruns (audio-core auto-disable; virtio-snd never
-    /// re-enables the voice). A live stream completes a 512-byte ring buffer
+    /// re-enables the voice). A live stream completes a TX_BUF_BYTES buffer
     /// every ~3 ms, so if the TX used index freezes while we sit here with
     /// data blocked, the stream is dead — recover it. This works precisely
     /// because we are mid-push: data flows immediately after the restart, so
@@ -116,9 +116,9 @@ impl PipeWireState {
         if !self.initialized { return; }
         
         while self.spool_len > 0 {
-            // Read from spool in chunks of up to 512 bytes
-            let mut chunk = [0u8; 512];
-            let n = self.spool_len.min(512);
+            // Read from spool in chunks of up to TX_BUF_BYTES bytes
+            let mut chunk = [0u8; drivers::snd::TX_BUF_BYTES];
+            let n = self.spool_len.min(drivers::snd::TX_BUF_BYTES);
             
             // Handle wrapping
             for i in 0..n {
@@ -126,7 +126,10 @@ impl PipeWireState {
             }
             
             let accepted = self.snd_driver.send_pcm_data(&chunk[..n]);
-            if accepted == 0 { break; } // Hardware ring is full
+            // 0 = hardware ring full, or a sub-frame tail that must wait
+            // for the producer's next push (the driver only sends whole
+            // frames).
+            if accepted == 0 { break; }
             
             self.spool_head = (self.spool_head + accepted) % self.spool.len();
             self.spool_len -= accepted;

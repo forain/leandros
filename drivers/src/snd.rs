@@ -31,20 +31,30 @@ pub const VIRTIO_SND_PCM_RATE_48000:     u8 = 7;
 
 const QUEUE_SIZE: usize = 256;
 
-/// Latency knob: max PCM buffers queued to the device at once
-/// (each = 512 B ≈ 2.9 ms at 44.1 kHz stereo S16). Safe to keep small ONLY
-/// because the 100 Hz tick pump (servers/pipewire tick_pump) guarantees the
-/// queue never runs empty — QEMU 11.x's split audio backend permanently
-/// loses the frontend-refill wakeup the first time it polls an empty
-/// stream queue (one-shot, unrecoverable without a stream restart).
-const TX_MAX_INFLIGHT: u16 = 256;
+/// Bytes of PCM carried by one TX buffer (512 B ≈ 2.9 ms at 44.1 kHz
+/// stereo S16). The device negotiates the descriptor count: QEMU 11.1+
+/// enforces its 64-entry queues (11.0 silently accepted 256), and each TX
+/// buffer takes 3 descriptors, so 21 buffers can be in flight. Larger
+/// buffers were measured (2026-09-15) to make QEMU's stream death MORE
+/// frequent, not less — the device cares about element cadence, not bytes.
+pub const TX_BUF_BYTES: usize = 512;
 
-/// Silence top-up watermark for the tick pump: when fewer than this many
-/// buffers are queued, top_up_silence() pads with zeros up to it. Sized at
-/// 2x QEMU's worst observed single-poll demand (its audio timer slips and
-/// gulps several periods of catch-up at once): 32 × 512 B ≈ 93 ms. Must
-/// stay below TX_MAX_INFLIGHT so real data always has room on top.
-const TX_TOPUP_BUFS: u16 = 32;
+/// Latency knob: max PCM bytes queued to the device at once. Safe to keep
+/// small ONLY because the 100 Hz tick pump (servers/pipewire tick_pump)
+/// guarantees the queue never runs empty — QEMU 11.x's split audio backend
+/// permanently loses the frontend-refill wakeup the first time it polls an
+/// empty stream queue (one-shot, unrecoverable without a stream restart).
+/// In practice the negotiated ring is the tighter bound.
+const TX_MAX_INFLIGHT_BYTES: usize = 128 * 1024;
+const TX_MAX_INFLIGHT: u16 = (TX_MAX_INFLIGHT_BYTES / TX_BUF_BYTES) as u16;
+
+/// Silence top-up watermark for the tick pump: when fewer bytes than this
+/// are queued, top_up_silence() pads with zeros up to it. Sized at 2x QEMU's
+/// worst observed single-poll demand (its audio timer slips and gulps
+/// several periods of catch-up at once, ~46 ms): 16 KiB ≈ 93 ms. Must stay
+/// below TX_MAX_INFLIGHT so real data always has room on top.
+const TX_TOPUP_BYTES: usize = 16 * 1024;
+const TX_TOPUP_BUFS: u16 = (TX_TOPUP_BYTES / TX_BUF_BYTES) as u16;
 
 /// Coarse monotonic clock for stall detection. Reads a hardware counter
 /// that keeps advancing even while spinning in kernel context with IRQs
@@ -119,8 +129,14 @@ struct VirtioSndPersistent {
     ctrl_status: VirtioSndHdr,
     tx_xfer: [VirtioSndPcmXfer; QUEUE_SIZE],
     tx_status: [VirtioSndPcmStatus; QUEUE_SIZE],
-    tx_data: [[u8; 512]; QUEUE_SIZE],
+    tx_data: [[u8; TX_BUF_BYTES]; QUEUE_SIZE],
 }
+
+/// Buddy order that holds VirtioSndPersistent.
+const PERSISTENT_ORDER: usize = {
+    let pages = (core::mem::size_of::<VirtioSndPersistent>() + 4095) / 4096;
+    pages.next_power_of_two().trailing_zeros() as usize
+};
 
 pub struct VirtioSnd {
     common_cfg: usize, notify_cfg: usize, notify_off_multiplier: u32,
@@ -160,9 +176,9 @@ impl VirtioSnd {
         let pci_cmd = pci::pci_read_config_16(dev.bus, dev.dev, dev.func, 0x04);
         pci::pci_write_config_16(dev.bus, dev.dev, dev.func, 0x04, pci_cmd | 0x06);
 
-        let phys = buddy::alloc(6).ok_or(DriverError::Io)?; // Allocate 64 pages (order 6)
+        let phys = buddy::alloc(PERSISTENT_ORDER).ok_or(DriverError::Io)?;
         self.persistent = phys_to_virt(phys) as *mut VirtioSndPersistent;
-        core::ptr::write_bytes(self.persistent as *mut u8, 0, 64 * 4096);
+        core::ptr::write_bytes(self.persistent as *mut u8, 0, (1 << PERSISTENT_ORDER) * 4096);
 
         self.parse_caps(&dev)?;
         if self.common_cfg == 0 { 
@@ -290,10 +306,18 @@ impl VirtioSnd {
         // on STOP/RELEASE, and an invalid transition (stream never started)
         // just returns BAD_MSG which is harmless. Gating this on
         // stream_active leaves the stream in an undefined state when our
-        // bookkeeping disagrees with the device.
+        // bookkeeping disagrees with the device. A refused STOP/RELEASE does
+        // not abort the recovery: every send_control_cmd re-checks, so the
+        // bring-up below is either refused the same way (and logged by the
+        // "stream setup FAILED" branch) or succeeds once the device returns.
         for code in [VIRTIO_SND_R_PCM_STOP, VIRTIO_SND_R_PCM_RELEASE] {
             if self.send_control_cmd(&VirtioSndPcmHdr { hdr: VirtioSndHdr { code }, stream_id }) == u32::MAX {
-                return;
+                // The device still owns an earlier control request. Keep going:
+                // every send_control_cmd re-checks, so the bring-up below is either
+                // refused the same way (and logged) or succeeds once it returns.
+                pci::serial_debug("[SND] ctrl busy during teardown, code=");
+                pci::serial_debug_hex(code);
+                pci::serial_debug("\n");
             }
         }
 
@@ -332,8 +356,8 @@ impl VirtioSnd {
     }
 
     /// TX used-index snapshot for stall detection: a live stream advances
-    /// this every ~3 ms (one 512-byte buffer at 44.1 kHz stereo); a stream
-    /// killed by QEMU's underrun auto-disable never advances it again.
+    /// this every ~3 ms (one TX_BUF_BYTES buffer at 44.1 kHz stereo); a
+    /// stream killed by QEMU's underrun auto-disable never advances it again.
     pub fn tx_used_idx(&self) -> u16 {
         match self.vqs[2].as_ref() {
             Some(vq) => unsafe { core::ptr::read_volatile(&(*vq.used).idx) },
@@ -360,7 +384,7 @@ impl VirtioSnd {
     /// play for this wall-clock interval.
     pub fn top_up_silence(&mut self) {
         if !self.initialized || !self.stream_active { return; }
-        let silence = [0u8; 512];
+        let silence = [0u8; TX_BUF_BYTES];
         while self.tx_level() < TX_TOPUP_BUFS {
             if self.send_pcm_data(&silence) == 0 { break; }
         }
@@ -473,9 +497,10 @@ impl VirtioSnd {
         let level_now = vq.last_avail_idx.wrapping_sub(vq.last_used_idx);
         if level_now < self.dbg_min_level { self.dbg_min_level = level_now; }
 
-        // In-flight cap: each queued buffer is ~2.9 ms of audio, so the cap
-        // (not the 256-descriptor ring) sets the hardware-side latency:
-        // TX_MAX_INFLIGHT × 512 B. Must stay above TX_TOPUP_BUFS.
+        // In-flight cap: each queued buffer is TX_BUF_BYTES (~2.9 ms) of
+        // audio, so the cap (not the negotiated descriptor ring) sets the
+        // hardware-side latency: TX_MAX_INFLIGHT_BYTES. Must stay above
+        // TX_TOPUP_BUFS.
         if vq.num_free < 3 || level_now >= TX_MAX_INFLIGHT {
             if !self.dbg_ring_full {
                 pci::serial_debug("[SND] TX ring full (first time), submitted=");
@@ -486,7 +511,16 @@ impl VirtioSnd {
             return 0;
         }
         
-        let chunk_len = data.len().min(512);
+        // A TX buffer must hold whole frames. QEMU's audio core writes
+        // nothing for a remainder shorter than one frame, virtio-snd reads
+        // that 0 as "backend full" and keeps the buffer at the head of its
+        // queue forever: the stream freezes with the ring full until the
+        // stall detector restarts it (traced 2026-09-15 — a 438-byte chunk
+        // from the spool tail was the killer). Sub-frame tails stay with the
+        // caller until more data arrives.
+        let frame_bytes = (self.last_channels.max(1) as usize) * 2;
+        let chunk_len = data.len().min(TX_BUF_BYTES) / frame_bytes * frame_bytes;
+        if chunk_len == 0 { return 0; }
         let vq_id = vq.id;
         let notify_off = vq.notify_off;
         unsafe {

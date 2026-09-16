@@ -239,11 +239,19 @@ Build time: ~3–5 minutes clean, ~30s incremental.
   gulps up to buffer_bytes at once, its timer slips multiply per-tick demand,
   and configurations below this line are bimodally unstable (pass some boots,
   death-spiral others — validated over ~25 test runs on 2026-07-18, aarch64
-  HVF). Steady-state audio latency is ~610 ms (43.5 KiB ring + 64 KiB spool,
-  both kept full by backpressure). Re-test with
-  `.claude/skills/run-leandros/audio-glitch-test.sh <label>`
-  runs (60 s MAME, count recoveries + music-region zero-runs) on QEMU
-  upgrades.
+  HVF). Steady-state audio latency is ~425 ms (10.5 KiB ring + 64 KiB spool,
+  both kept full by backpressure). **QEMU 11.1+ enforces the device's 64-entry
+  queues** (11.0 silently accepted our 256), so the TX ring holds 21 × 512 B;
+  serial prints `TX ring full (first time), submitted=0x15`. **Every TX buffer
+  must be whole frames** (traced 2026-09-15): QEMU's audio core writes nothing
+  for a sub-frame remainder, virtio-snd reads the 0 as "backend full" and holds
+  that buffer forever — the stream freezes with a full ring until the detector
+  restarts it, ~30×/min in MAME. `send_pcm_data` rounds down to `channels×2`.
+  Re-test with `audio-glitch-test.sh <label> [arch] [--no-build]` (60 s MAME;
+  count `recovering stream` + `producer gap` lines — the wav zero-run metric is
+  blind to stalls because QEMU's wav backend writes nothing while a stream is
+  released) on QEMU upgrades, and check `/tmp/leandros-qemu-stderr.log` for
+  `exceeds max size`.
 
 - **AArch64 UEFI outputs VT100 cursor codes on serial** — UEFI and Limine use
   `\e[row;colH` cursor positioning and `\e[K` erase sequences. The serial log contains
