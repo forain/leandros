@@ -1873,6 +1873,98 @@ pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
     ok
 }
 
+/// Diagnostic: dump every task in the run queue to the serial console — the
+/// kernel's equivalent of SysRq-t. Wired to Ctrl-T (0x14) on the serial line
+/// by `tty_server::console_intercept_byte`, so a wedged userspace can be
+/// asked where its threads are parked without a rebuild: `state`, the CPU it
+/// is on, the IPC port it is blocked on (`POLL_WAIT_CHANNEL` for
+/// poll/epoll/select/nanosleep), its poll deadline and the futex address it
+/// is waiting on. Runs from IRQ context, so the run-queue lock is only tried:
+/// the interrupted context may be holding it, and a spin here would be the
+/// deadlock the dump exists to diagnose.
+pub fn dump_tasks() {
+    fn print_str(s: &str) {
+        extern "C" { fn arch_serial_putc(c: u8); }
+        for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } }
+    }
+    extern "C" { fn print_hex(n: usize); fn print_number(n: u32); }
+    fn ph(n: usize) { unsafe { print_hex(n) } }
+    fn pn(n: u32)  { unsafe { print_number(n) } }
+    let rq = match RUN_QUEUE.try_lock() {
+        Some(rq) => rq,
+        None => { print_str("[TASKS] run queue busy, try again\n"); return; }
+    };
+    print_str("[TASKS] tick="); pn(ticks() as u32);
+    print_str(" len="); pn(rq.len() as u32);
+    print_str(" quiesce_tgid="); pn(QUIESCE_TGID.load(Ordering::Relaxed));
+    print_str("\n");
+    for i in 0..runqueue::MAX_TASKS {
+        let t = match rq.get(i) { Some(t) => t, None => continue };
+        print_str("[TASKS] pid="); pn(t.pid);
+        print_str(" tgid="); pn(t.tgid);
+        print_str(" ppid="); pn(t.ppid);
+        print_str(match t.state {
+            TaskState::Ready => " Ready",
+            TaskState::Running => " Running",
+            TaskState::Blocked => " Blocked",
+            TaskState::Zombie => " Zombie",
+        });
+        if let Some(c) = t.on_cpu { print_str(" cpu="); pn(c as u32); }
+        if let Some(port) = t.blocked_on {
+            if port == POLL_WAIT_CHANNEL {
+                print_str(" on=poll dl=");
+                if t.poll_deadline == u64::MAX { print_str("inf"); } else { pn(t.poll_deadline as u32); }
+            } else {
+                print_str(" on=port:"); pn(port);
+            }
+        }
+        if t.blocked_futex != 0 {
+            print_str(" futex="); ph(t.blocked_futex);
+            // The word's current value — for a musl lock that is the holder's
+            // tid, which is what turns "blocked on a futex" into "blocked on
+            // THAT thread". Read through the leader's VMA tables (no fault
+            // possible), never through the user mapping.
+            let leader_as = rq.find_pid(t.tgid).and_then(|l| l.address_space.as_ref());
+            if let Some(phys) = leader_as.and_then(|a| a.virt_to_phys(t.blocked_futex)) {
+                let v = unsafe { (mm::phys_to_virt(phys) as *const u32).read_volatile() };
+                print_str("="); ph(v as usize);
+            }
+        }
+        if t.vfork_pending { print_str(" vfork_pending"); }
+        // Where in userspace the task stopped: for a user task parked in a
+        // syscall, the EL0 frame the exception stub saved at the top of its
+        // kernel stack (`sub sp, sp, #288` below `tpidr_el1`). aarch64 only.
+        #[cfg(target_arch = "aarch64")]
+        if t.kernel_stack != 0 && t.state == TaskState::Blocked && rq.find_pid(t.tgid).map_or(false, |l| l.address_space.is_some()) {
+            let frame = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE - 288;
+            let f = unsafe { &*(frame as *const crate::context::UserFrame) };
+            print_str(" pc="); ph(f.elr_el1 as usize);
+            print_str(" lr="); ph(f.x[30] as usize);
+            print_str(" sp="); ph(f.sp_el0 as usize);
+            print_str(" x8="); ph(f.x[8] as usize);
+            // For a task parked on a futex (a lock-contention wedge, the case
+            // this dump exists for), also spill a slice of the user stack so a
+            // deadlock can be walked back to its callers offline. Read through
+            // the leader's VMA tables, so a missing page reads as nothing
+            // rather than faulting. Values that look like text/stack addresses
+            // only, to keep the noise down.
+            if t.blocked_futex != 0 {
+                let leader_as = rq.find_pid(t.tgid).and_then(|l| l.address_space.as_ref());
+                print_str("\n[TASKS]   stack:");
+                for i in 0..48usize {
+                    let va = f.sp_el0 as usize + i * 8;
+                    if let Some(phys) = leader_as.and_then(|a| a.virt_to_phys(va)) {
+                        let v = unsafe { (mm::phys_to_virt(phys) as *const u64).read_volatile() };
+                        if v >= 0x10000 && v < 0x0000_8000_0000_0000 { print_str(" "); ph(v as usize); }
+                    }
+                }
+            }
+        }
+        print_str("\n");
+    }
+    drop(rq);
+}
+
 /// Diagnostic: print the faulting task's identity — its pid, tgid, its own
 /// saved page-table root, and the *leader* it resolves to (pid + AS root +
 /// region count + VA span). Reveals whether a worker thread's fault is being
