@@ -1418,6 +1418,117 @@ fn ctx_record_fence(open_id: u32, fence: u64) {
     }
 }
 
+/// The fence of the most recent EXECBUFFER on `open_id`, 0 if none. This is
+/// what an out-fence (`FENCE_FD_OUT`) describes: the syscall layer reads it
+/// right after the ioctl returns, on the same task, and arms the caller's
+/// eventfd on it (`out_fence_register`). A sibling thread submitting in
+/// between can only make it a *later* fence — the fd then signals late, never
+/// early.
+pub fn open_last_fence(open_id: u32) -> u64 {
+    ctx_lookup_entry(open_id).map(|c| c.last_fence).unwrap_or(0)
+}
+
+// ── Out-fences: FENCE_FD_OUT made real ───────────────────────────────────────
+//
+// Until submission went asynchronous the out-fence eventfd could be minted
+// pre-signalled: `VirtioGpu::submit` busy-spun until the host answered, so the
+// work a submission described had retired before the ioctl returned. That is
+// no longer true — SUBMIT_3D returns at the kick — so the fd is now created at
+// zero and signalled from here when the fence actually retires.
+//
+// WHO SIGNALS. The eventfd lives in the VFS, which this crate cannot reach, so
+// the kernel installs `OUT_FENCE_SIGNAL` (a `fn(token) -> bool` that adds one
+// to the eventfd `token` names and wakes its pollers). It runs from the tick,
+// so it must try-lock and may fail; a failure leaves the entry queued and the
+// next tick retries. The token also carries a reference on the eventfd slot,
+// taken by the syscall layer before registering and dropped by the signaller,
+// so an fd closed before its fence retires cannot have its slot reused by a
+// stranger who then gets our signal.
+//
+// ORDER. `GPU_FENCE_FLOOR` is the lock-free "everything up to here retired"
+// mark `virtio_gpu` publishes; entries are only ever compared against it, so
+// a fence that retired out of order ahead of an older one signals when the
+// floor passes it — late by one older submission, never early.
+static OUT_FENCES: Mutex<VecDeque<(u64, u64)>> = Mutex::new(VecDeque::new());
+static OUT_FENCES_N: AtomicUsize = AtomicUsize::new(0);
+static OUT_FENCE_SIGNAL: AtomicUsize = AtomicUsize::new(0);
+/// Bound on armed-but-unretired out-fences; the ring can only hold this many
+/// fenced chains anyway, so hitting it means the device stopped answering.
+const MAX_OUT_FENCES: usize = 512;
+
+/// Install the eventfd signaller. Kernel init, once.
+pub fn set_out_fence_signaller(f: fn(u64) -> bool) {
+    OUT_FENCE_SIGNAL.store(f as usize, Ordering::Release);
+}
+
+/// Arm `token`'s eventfd to signal when `fence` retires. Returns false if the
+/// fence had already retired (or the table is full) — the caller then signals
+/// the eventfd itself, immediately. The retirement re-check happens under the
+/// table lock so a retirement racing this registration is never lost: either
+/// this sees it, or `out_fence_service` — which takes the same lock after
+/// advancing the floor — does.
+pub fn out_fence_register(fence: u64, token: u64) -> bool {
+    if fence == 0 { return false; }
+    let mut q = OUT_FENCES.lock();
+    if fence <= crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire) { return false; }
+    if q.len() >= MAX_OUT_FENCES { return false; }
+    q.push_back((fence, token));
+    OUT_FENCES_N.store(q.len(), Ordering::Relaxed);
+    true
+}
+
+/// Signal every armed out-fence whose fence has retired. Tick context: try_lock
+/// only; false means "call again next tick".
+fn out_fence_service() -> bool {
+    if OUT_FENCES_N.load(Ordering::Relaxed) == 0 { return true; }
+    let p = OUT_FENCE_SIGNAL.load(Ordering::Acquire);
+    if p == 0 { return true; }
+    // SAFETY: only ever written by `set_out_fence_signaller` from a `fn(u64) -> bool`.
+    let signal: fn(u64) -> bool = unsafe { ::core::mem::transmute::<usize, fn(u64) -> bool>(p) };
+    let floor = crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire);
+    let mut q = match OUT_FENCES.try_lock() { Some(g) => g, None => return false };
+    let mut complete = true;
+    // Entries are in submission order but fences are per-open, so a retired
+    // one can sit behind an unretired one: scan the whole queue, keep what has
+    // not retired. `retain` in place; the queue is short.
+    let mut i = 0;
+    while i < q.len() {
+        let (fence, token) = q[i];
+        if fence <= floor {
+            if signal(token) {
+                q.remove(i);
+                continue;
+            }
+            // Contended in the VFS: leave it, try again next tick.
+            complete = false;
+        }
+        i += 1;
+    }
+    OUT_FENCES_N.store(q.len(), Ordering::Relaxed);
+    complete
+}
+
+// ── Fence waiters (VIRTGPU_WAIT without NOWAIT) ──────────────────────────────
+//
+// Parked with the poll-channel protocol on this tag; `gpu_fence_event` wakes
+// them when any fence retires and they re-check their own. The tick backstop
+// is `virtio_gpu::ctrlq_tick` re-arming `FENCE_EVENT_PENDING` when the try-wake
+// loses the RUN_QUEUE race.
+const FENCE_POLL_INDEX: u32 = 0xF00D;
+static FENCE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+static FENCE_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// `virtio_gpu`'s fence-event hook: runs from `ctrlq_tick` after a reap retired
+/// fences. False asks to be re-run next tick.
+fn gpu_fence_event() -> bool {
+    let mut ok = out_fence_service();
+    if FENCE_WAITERS.load(Ordering::Relaxed) != 0 {
+        let tag = sched::poll_tag(sched::poll_class::DRM, FENCE_POLL_INDEX);
+        if !sched::try_wake_poll_tagged(tag) { ok = false; }
+    }
+    ok
+}
+
 // ── BO handle resolution, scoped to the calling open ─────────────────────────
 //
 // Every ioctl that consumes a BO handle — MAP, RESOURCE_INFO, WAIT, GEM_CLOSE,
@@ -3024,6 +3135,14 @@ fn bo_census() -> (u64, u64, u64, u64) {
 /// by the DRM server at init. Consistent lock order (PENDING then READY) + the
 /// read/flip paths each touching only one of the two means no deadlock.
 pub fn drm_tick() {
+    // Control-queue completions first: they retire fences and free the ring,
+    // and everything below (out-fences, waiters) is downstream of them. The
+    // hook that lets `ctrlq_tick` call back into this layer is installed on
+    // the first tick, which is also the first moment either side runs.
+    if !FENCE_HOOK_INSTALLED.swap(true, Ordering::AcqRel) {
+        crate::virtio_gpu::set_fence_event_hook(gpu_fence_event);
+    }
+    crate::virtio_gpu::ctrlq_tick();
     let now = sched::ticks();
     if DRM_STATS {
         let ls = LAST_STAT_TICK.load(Ordering::Relaxed);
@@ -3111,6 +3230,37 @@ pub fn drm_tick() {
             crate::pci::serial_debug(" ctrlq_to=");
             crate::pci::serial_debug_hex_64(
                 crate::virtio_gpu::CTRLQ_TIMEOUTS.load(Ordering::Relaxed));
+            // Asynchronous-submission census (END of line, per the rule above).
+            // `ctrlq_us` above is now vCPU time actually spent waiting;
+            // `ctrlq_lat_us` is how long the host took over the async commands
+            // nobody waited for. `now_us` is `monotonic_us` itself, so a reader
+            // can calibrate every `*_us` field against wall time — on x86_64 it
+            // is TSC/1000, i.e. TSC-GHz-times-too-fast (4.5x on a 7950X).
+            crate::pci::serial_debug(" ctrlq_async=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_ASYNC.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" ctrlq_sync=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_SYNC.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" ctrlq_lat_us=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_ASYNC_LAT_US.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" ctrlq_lat_max=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_ASYNC_LAT_MAX_US.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" ctrlq_room=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_ROOM_WAITS.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" ctrlq_refused=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_ASYNC_REFUSED.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" outfence_n=");
+            crate::pci::serial_debug_hex_64(OUT_FENCES_N.load(Ordering::Relaxed) as u64);
+            crate::pci::serial_debug(" now_us=");
+            crate::pci::serial_debug_hex_64(crate::snd::monotonic_us());
+            crate::pci::serial_debug(" ctrlq_irqs=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_IRQS.load(Ordering::Relaxed));
             crate::pci::serial_debug("\n");
         }
     }
@@ -5344,11 +5494,12 @@ impl DrmDeviceInterface {
         // `vn_ring_destroy`. Refusing it is therefore not a safe conservative
         // choice; it silently leaks a host-side ring per Venus instance.
         //
-        // It is also exactly answerable here: `submit` busy-spins on the used
-        // ring (virtio_gpu.rs), so every earlier submission on this open is
-        // already retired by the time any ioctl returns. A fence over an empty
-        // stream is a no-op whose result is "already signalled", which is the
-        // truth rather than an approximation.
+        // It is answerable without submitting anything: "a fence for
+        // everything so far" is this open's most recent fence
+        // (`open_last_fence`), which the syscall layer arms the out-fence fd on
+        // after this returns — signalled already if that work has retired,
+        // later if it has not. Submission is asynchronous, so the latter is
+        // the common case.
         //
         // Only BOTH-zero is a fence-only request. `size` without `command`, or
         // `command` without `size`, stays malformed and stays refused.
@@ -5486,11 +5637,11 @@ impl DrmDeviceInterface {
 
         // A fence-only request submits nothing. Returning here — rather than
         // handing `submit_3d` an empty slice, which it refuses — is the point:
-        // there is no stream to execute and no new fence to mint, because every
-        // earlier submission on this open has already retired. Deliberately NOT
-        // touching `ctx_record_fence`: recording a fence id that was never sent
-        // to the host would make a later WAIT report on a submission that does
-        // not exist. `bo_handles` was still validated above, so a fence-only
+        // there is no stream to execute and no new fence to mint; the out-fence
+        // rides the open's last fence. Deliberately NOT touching
+        // `ctx_record_fence`: recording a fence id that was never sent to the
+        // host would make a later WAIT report on a submission that does not
+        // exist. `bo_handles` was still validated above, so a fence-only
         // request naming a bogus BO is still refused, exactly as a real one is.
         if fence_only {
             return Ok(0);
@@ -6187,12 +6338,43 @@ impl DrmDeviceInterface {
         if fence == 0 {
             return Ok(0);
         }
-        let retired = {
-            let guard = crate::virtio_gpu::VIRTIO_GPU.lock();
-            let gpu = guard.as_ref().ok_or(DriverError::NotFound)?;
-            gpu.fence_retired(fence)
+        // Upstream: NOWAIT is a pure probe (`dma_resv_test_signaled`), anything
+        // else waits up to 15 s (`dma_resv_wait_timeout(..., 15 * HZ)`) and
+        // answers -EBUSY on timeout. Submission is asynchronous now, so the
+        // blocking half is real: the task parks on the fence tag with the
+        // three-phase poll protocol (see `syncobj_handle_wait`) and is woken by
+        // `gpu_fence_event` from the reap that retires the fence. The probe
+        // reaps first (`fence_retired_now`) so it answers about the used ring
+        // as it is, not as of the last tick. No lock is held across the park.
+        const VIRTGPU_WAIT_NOWAIT: u32 = 1;
+        let probe = |fence: u64| -> Result<bool, DriverError> {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
+            Ok(gpu.fence_retired_now(fence))
         };
-        if retired { Ok(0) } else { Err(DriverError::Io) }
+        if probe(fence)? { return Ok(0); }
+        if w.flags & VIRTGPU_WAIT_NOWAIT != 0 { return Err(DriverError::Io); }
+
+        let dl = sched::ticks().wrapping_add(15 * 100);
+        let tag = sched::poll_tag(sched::poll_class::DRM, FENCE_POLL_INDEX);
+        FENCE_WAITERS.fetch_add(1, Ordering::Relaxed);
+        let outcome = loop {
+            if sched::ticks() >= dl { break Err(DriverError::Io); }
+            if sched::has_deliverable_signal() { break Err(DriverError::Io); }
+            sched::block_on_poll_prepare_masked(dl, tag);
+            match probe(fence) {
+                Err(e) => { sched::block_on_poll_cancel(); break Err(e); }
+                Ok(true) => { sched::block_on_poll_cancel(); break Ok(0); }
+                Ok(false) => {}
+            }
+            if sched::ticks() >= dl || sched::has_deliverable_signal() {
+                sched::block_on_poll_cancel();
+                continue;
+            }
+            sched::block_on_poll_commit();
+        };
+        FENCE_WAITERS.fetch_sub(1, Ordering::Relaxed);
+        outcome
     }
 
     // ── DRM_IOCTL_SYNCOBJ_* ──────────────────────────────────────────────────

@@ -6504,13 +6504,16 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     //      ARM that, on every vkDestroyInstance. Hence: one change, and the write
     //      lives here, above the accept, where nothing can bypass it.
     //
-    // WHY AN EVENTFD, AND WHY PRE-SIGNALLED. Mesa's entire use of this fd is
+    // WHY AN EVENTFD, AND WHEN IT SIGNALS. Mesa's entire use of this fd is
     // `poll(POLLIN)` (`sim_syncobj_poll`), `fcntl(F_DUPFD_CLOEXEC)` and `close`.
-    // It never `read`s it, so an eventfd created with counter 1 stays readable
-    // forever. That is not an optimistic lie: `VirtioGpu::submit` busy-spins on
-    // the used ring, so the work a submission describes is already retired by the
-    // time this ioctl returns. There is no window in which the fd is signalled
-    // and the work is not done.
+    // It never `read`s it, so an eventfd whose counter goes 0 → 1 once is a
+    // fence: unreadable until the work retires, readable forever after.
+    // Submission is asynchronous (`VirtioGpu::submit_async` returns at the
+    // kick), so the fd is minted at ZERO and armed on the submission's fence
+    // through `drm_device_interface::out_fence_register`; the DRM tick adds one
+    // to it when the host retires that fence. It used to be minted pre-signalled,
+    // which was true only while `submit` busy-spun for the reply — the
+    // dependency TODO.md's FENCE_FD_OUT note warned about, now paid.
     //
     // ORDERING follows upstream `virtio_gpu_execbuffer_ioctl`: reserve the out
     // fence BEFORE submitting, so a submission is never charged for an fd-table
@@ -6536,7 +6539,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         // Reserve the out fence first. EFD_CLOEXEC matches upstream's
         // `get_unused_fd_flags(O_CLOEXEC)` and Mesa's own `os_dupfd_cloexec`:
         // a fence fd must not survive into an exec'd child.
-        let efd_msg = make_vfs_msg(vfs::VFS_EVENTFD, &[1u64, EFD_CLOEXEC]);
+        let efd_msg = make_vfs_msg(vfs::VFS_EVENTFD, &[0u64, EFD_CLOEXEC]);
         let efd = vfs_reply_val(&vfs::handle(&efd_msg, pid));
         if efd < 0 {
             unsafe { ((arg + FENCE_FD_OFF) as *mut i32).write(-1); }
@@ -6553,6 +6556,37 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
             let _ = vfs::handle(&close_msg, pid);
             unsafe { ((arg + FENCE_FD_OFF) as *mut i32).write(-1); }
             return rc;
+        }
+        // Arm the fd on the open's newest fence — this submission's, or for the
+        // fence-only probe, the last real one. The slot reference taken here is
+        // dropped by the signaller, so a close() racing the retirement cannot
+        // hand the slot to a stranger. If the fence has already retired (or
+        // there is none), signal now: the fd is then readable on return, which
+        // is exactly the pre-change behaviour for work that is in fact done.
+        let open_id = match vfs::vfs_get_node_kind(pid, fd) {
+            Some(vfs::VnodeKind::DynamicDevice { open_id, .. }) => open_id,
+            _ => 0,
+        };
+        let fence = drivers::drm_device_interface::open_last_fence(open_id);
+        // The DRM layer signals the fd through the VFS, which it cannot name;
+        // hand it the seam once, from the one path that arms anything.
+        static OUT_FENCE_SIGNALLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+        if !OUT_FENCE_SIGNALLER_INSTALLED.swap(true, Ordering::AcqRel) {
+            fn out_fence_signal(token: u64) -> bool { vfs::eventfd_slot_signal_unref(token as usize) }
+            drivers::drm_device_interface::set_out_fence_signaller(out_fence_signal);
+        }
+        if let Some(vfs::VnodeKind::EventFd { slot }) = vfs::vfs_get_node_kind(pid, efd as usize) {
+            if fence != 0 {
+                vfs::eventfd_slot_ref(slot);
+                if !drivers::drm_device_interface::out_fence_register(fence, slot as u64) {
+                    // Already retired (or the table is full): signal now and
+                    // give the reference back ourselves.
+                    vfs::eventfd_slot_signal(slot);
+                    vfs::eventfd_slot_unref(slot);
+                }
+            } else {
+                vfs::eventfd_slot_signal(slot);
+            }
         }
         unsafe { ((arg + FENCE_FD_OFF) as *mut i32).write(efd as i32); }
         return rc;

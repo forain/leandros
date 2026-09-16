@@ -1425,6 +1425,78 @@ static EVENTFD_SEQ: Mutex<[u64; MAX_EVENTFDS]> = Mutex::new([0u64; MAX_EVENTFDS]
 /// Mirrors the pipe reader/writer refcount; bumped by pipe_ref_inc on every dup.
 static EVENTFD_REFS: Mutex<[u32; MAX_EVENTFDS]> = Mutex::new([0u32; MAX_EVENTFDS]);
 
+// ── Kernel-side eventfd signalling (GPU out-fences) ──────────────────────────
+//
+// A `FENCE_FD_OUT` eventfd is signalled by the DRM layer when the GPU fence it
+// was armed on retires — from the 100 Hz tick, not from a syscall. Two seams
+// make that safe: the arming side takes an extra slot reference so a caller
+// closing the fd before its fence retires cannot have the slot reallocated to
+// an unrelated eventfd that then receives our signal, and the signalling side
+// only ever try-locks, because a tick must not spin on a pool lock a
+// preempted task may hold.
+
+/// Take one more reference on eventfd `slot`. Task context (blocking locks).
+pub fn eventfd_slot_ref(slot: usize) {
+    if slot >= MAX_EVENTFDS { return; }
+    let mut refs = EVENTFD_REFS.lock();
+    if refs[slot] > 0 { refs[slot] += 1; }
+}
+
+/// Add one to eventfd `slot`, wake its pollers, and drop the reference
+/// `eventfd_slot_ref` took. Tick/IRQ safe: try-locks only, and the wake is
+/// deferred to the poll-deadline tick if RUN_QUEUE is busy. Returns false — and
+/// changes nothing — if a pool lock was contended; the caller retries later.
+pub fn eventfd_slot_signal_unref(slot: usize) -> bool {
+    if slot >= MAX_EVENTFDS { return true; }
+    let mut refs = match EVENTFD_REFS.try_lock() { Some(g) => g, None => return false };
+    let mut counters = match EVENTFD_COUNTERS.try_lock() { Some(g) => g, None => return false };
+    let mut seqs = match EVENTFD_SEQ.try_lock() { Some(g) => g, None => return false };
+    let live = refs[slot] > 0 && counters[slot] != u64::MAX;
+    refs[slot] = refs[slot].saturating_sub(1);
+    if refs[slot] == 0 {
+        // Ours was the last reference: the fd is gone, nobody can read it.
+        counters[slot] = u64::MAX;
+        seqs[slot] = 0;
+        return true;
+    }
+    if live {
+        counters[slot] = counters[slot].saturating_add(1);
+        seqs[slot] = seqs[slot].wrapping_add(1);
+    }
+    drop(seqs); drop(counters); drop(refs);
+    let tag = sched::poll_tag(sched::poll_class::EVENTFD, slot as u32);
+    if !sched::try_wake_poll_tagged(tag) { sched::request_poll_wake_tagged(tag); }
+    true
+}
+
+/// Drop the reference `eventfd_slot_ref` took, from task context. Frees the
+/// slot if it was the last one, exactly as `release_vnode` does.
+pub fn eventfd_slot_unref(slot: usize) {
+    if slot >= MAX_EVENTFDS { return; }
+    let mut refs = EVENTFD_REFS.lock();
+    refs[slot] = refs[slot].saturating_sub(1);
+    if refs[slot] == 0 {
+        EVENTFD_COUNTERS.lock()[slot] = u64::MAX;
+        EVENTFD_SEQ.lock()[slot] = 0;
+    }
+}
+
+/// Add one to eventfd `slot` right now, from task context (the fence had
+/// already retired when the fd was minted). Blocking locks, like a write(2).
+pub fn eventfd_slot_signal(slot: usize) {
+    if slot >= MAX_EVENTFDS { return; }
+    {
+        let mut counters = EVENTFD_COUNTERS.lock();
+        if counters[slot] == u64::MAX { return; }
+        counters[slot] = counters[slot].saturating_add(1);
+    }
+    {
+        let mut seqs = EVENTFD_SEQ.lock();
+        seqs[slot] = seqs[slot].wrapping_add(1);
+    }
+    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::EVENTFD, slot as u32));
+}
+
 // ── /dev/urandom LFSR ─────────────────────────────────────────────────────────
 
 static LFSR_STATE: Mutex<u64> = Mutex::new(0xdeadbeef_cafebabe);
