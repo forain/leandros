@@ -27,31 +27,52 @@ export PATH
 # PER-UID, NOT /run/user/0. This file is sourced by greetd's source_profile
 # wrapper for BOTH sessions it starts: the greeter session, which is root, and
 # the user session, which is whoever just logged in. A hardcoded /run/user/0
-# therefore puts a uid-1000 login session's wayland-N and session-bus sockets
-# inside root's runtime directory, sharing one socket namespace between two
-# sessions that are supposed to be independent.
+# would put a uid-1000 login session's wayland-N and session-bus sockets
+# inside root's runtime directory.
 #
-# WHAT THIS IS NOT: it is not a permission fix, and the 0700 on that directory
-# is not what would stop anyone. Measured in servers/vfs and servers/f2fs:
-# path traversal reads no mode/uid/gid on any component; creating an entry
-# inside a directory (open O_CREAT, mkdir, mknod, symlink, AF_UNIX bind) checks
-# only that the parent EXISTS; and AF_UNIX connect discards the caller
-# entirely (`unix_resolve_node(_pid, path)`). The single enforced case is
-# open(2) of an inode that already exists. So a uid-1000 session can today
-# create its sockets inside a 0700 root directory unimpeded — every 0700 in
-# this image is documentation, not enforcement. This change is the XDG
-# contract and the arrangement that keeps working if the VFS ever grows real
-# enforcement; it is not load-bearing for the login today.
+# This IS load-bearing. The VFS enforces search permission on every path
+# component, write+search on a parent to create anything in it (AF_UNIX bind
+# included), and write on a socket inode to connect to it. So:
+#
+#   * the user session (class "user", uid 1000) needs a directory it owns:
+#     /run/user/1000. It cannot create it — /run/user is a 0755 root tmpfs
+#     mount — so userland/init seeds /run/user/<uid> 0700 for every passwd
+#     account at boot, and the mkdir/chmod below are a harmless no-op;
+#
+#   * the GREETER session (class "greeter") is root — cosmic-comp must stay
+#     privileged — but its client, cosmic-greeter, runs as the cosmic-greeter
+#     account (uid 990) after /bin/greeter-launch drops to it, and it must
+#     connect to the compositor's wayland-N. A 0700 root /run/user/0 is EACCES
+#     for it, so the greeter session uses the GREETER ACCOUNT's runtime dir,
+#     /run/user/990 (owned by it), and greeter-launch chowns the socket node
+#     to the account before dropping. greetd's control socket is bound in the
+#     same directory (GREETD_SOCK_DIR in /bin/greeter-real). The greeter
+#     session is recognised by GREETD_SOCK: greetd's session worker putenv's
+#     it for the greeter session only, and cosmic-greeter forwards nothing
+#     but XDG_SESSION_TYPE/CURRENT_DESKTOP/SESSION_DESKTOP to the user session.
+#     NOT XDG_SESSION_CLASS — the worker putenv's it for PAM and then REMOVES
+#     it (`pam.putenv("XDG_SESSION_CLASS")`, no '=') before pam_getenvlist
+#     builds the session's environment, so no session ever sees it.
 #
 # /run/user is a tmpfs MOUNT ROOT (servers/vfs TMPFS_ROOTS), which is what
 # makes AF_UNIX binds work under it at all — an f2fs /run has no S_IFSOCK.
-# /run/user/0 is seeded at boot for root. `id` is addressed by absolute path:
-# /bin/sh is brush, and brush's exec search does not fall through
-# /usr/bin -> /bin.
-XDG_RUNTIME_DIR=/run/user/$(/bin/id -u)
+# `id` is addressed by absolute path: /bin/sh is brush, and brush's exec
+# search does not fall through /usr/bin -> /bin.
+_runtime_uid=$(/bin/id -u)
+if [ -n "${GREETD_SOCK:-}" ] || [ "${XDG_SESSION_CLASS:-user}" = greeter ]; then
+    _greeter_uid=$(while IFS=: read -r _n _p _u _rest; do
+        if [ "$_n" = cosmic-greeter ]; then echo "$_u"; break; fi
+    done < /etc/passwd)
+    if [ -n "$_greeter_uid" ]; then
+        _runtime_uid=$_greeter_uid
+    fi
+fi
+XDG_RUNTIME_DIR=/run/user/$_runtime_uid
 export XDG_RUNTIME_DIR
 /bin/mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+/bin/chown "$_runtime_uid:$_runtime_uid" "$XDG_RUNTIME_DIR" 2>/dev/null || true
 /bin/chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+unset _runtime_uid _greeter_uid
 
 # ---- desktop identity ------------------------------------------------------
 XDG_CURRENT_DESKTOP=COSMIC

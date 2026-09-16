@@ -338,7 +338,7 @@ def main():
     
     bin_files = []
     bins = [
-        "shell", "login", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
+        "shell", "login", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "permtest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "ptytest", "forktest", "racetest",
         "waittest", "sigchldtest", "sigtest2", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",

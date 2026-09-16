@@ -177,6 +177,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "permtest"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
+]
+
+[[package]]
 name = "ping"
 version = "0.1.0"
 

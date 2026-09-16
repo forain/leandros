@@ -230,16 +230,28 @@ modes are unverified, so the compositor cannot yet be unprivileged. greetd's
 command — which is why the boundary is a separate binary rather than a config
 line.
 
-**What makes the drop survivable, stated because it is a kernel gap and not a
-design:** the greeter reaches both the compositor's `wayland-1` under the
-`0700 root` `/run/user/0` and greetd's own control socket, because this kernel
-checks neither. Path resolution applies no search-permission test on any
-component (`servers/vfs` `tmp_resolve_links`, `servers/f2fs` `resolve_path_ex`),
-and `AF_UNIX` connect discards the caller entirely — `servers/vfs`
-`unix_resolve_node` takes a pid and never uses it, so a socket's owner and mode
-are never consulted. If path-walk permission is ever enforced, the greeter loses
-both sockets at once; the fix then is `WAYLAND_SOCKET` fd inheritance for the
-compositor half and a socket directory the greeter account owns for greetd's.
+**What makes the drop survivable (2026-09-16, lane `perms`):** the VFS now
+enforces search permission on every path component and write permission on a
+socket inode for `AF_UNIX` connect, so a uid-990 client cannot reach anything
+under the `0700 root` `/run/user/0`, nor connect to a `0755 root` socket. The
+greeter phase therefore uses the **greeter account's own runtime directory**,
+`/run/user/990` (seeded 0700, owned by the account, by `userland/init` for every
+passwd account at boot): `/bin/greeter-real` points `GREETD_SOCK_DIR` there,
+`/etc/profile` selects it as `XDG_RUNTIME_DIR` for the session that carries
+`GREETD_SOCK` — the greeter session, the only one greetd's worker putenv's it
+for (so cosmic-comp binds `wayland-N` there). `XDG_SESSION_CLASS` cannot be the
+discriminator: the worker sets it for PAM and removes it again before
+`pam_getenvlist` builds the session's environment, so neither session sees it
+(verified on the Mac 2026-09-16: `profile: session starting, uid=0
+XDG_RUNTIME_DIR=/run/user/0`, then the uid-990 greeter died with
+`NoCompositor`). And
+`/bin/greeter-launch`, still root, `chown`s both socket nodes —
+`$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` and `$GREETD_SOCK` — to the account before
+it drops. That is upstream's ownership arrangement (greetd chowns its socket to
+the greeter user; the greeter's compositor runs as that user) reached without
+unprivileging the compositor. The user session is unaffected: it runs entirely
+as uid 1000 inside `/run/user/1000`, which init pre-creates because the
+`mkdir -p` in `/etc/profile` runs as the user and `/run/user` is `0755 root`.
 
 ### Guest files
 

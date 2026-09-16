@@ -665,9 +665,11 @@ documented slirp configuration. Also, proven by an A/B control against a pre-pat
 kernel: on slirp, aarch64 never prints the `[NET] DHCP configured` line, though it does
 reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print it.
 
-**The permission gap the greeter's privilege drop depends on is stated in full under *Kernel
+**The permission gap the greeter's privilege drop depended on is stated in full under *Kernel
 invariants*** — "Filesystem permissions are enforced on ONE operation only: `open(2)` of an
-inode that already exists". That entry supersedes the narrower version written while
+inode that already exists" — **and was closed on 2026-09-16 (lane `perms`); that entry now
+records what is enforced and how the greeter survived it.** What follows is the pre-fix
+account. That entry supersedes the narrower version written while
 designing the drop, which established that path-walk and `AF_UNIX` connect were unenforced
 but stopped there and so left open whether a dropped greeter could *create* anything. It
 can: entry creation checks only that the parent exists. Both of this launcher's live
@@ -746,8 +748,25 @@ kills the tab outright: `assert_eq!(entry.pw_uid, uid)` (`unix.rs:93`), the `F_S
   value == 2` on the keyboard node for every UART byte. **Any gate on the console keyboard tap
   must exempt `value == 2`**, or serial input dies the instant a compositor sets
   `KD_GRAPHICS`.
-- **Filesystem permissions are enforced on ONE operation only: `open(2)` of an inode that
-  already exists.** Measured 2026-08-08 by enumerating every `xattr::access_check` call
+- **Filesystem permissions are enforced on every path operation (lane `perms`, 2026-09-16)
+  — the paragraph below is the pre-fix finding, kept for the boundary it measured.** The
+  gates now: traversal (`MAY_EXEC` on every directory component of the resolved path, in
+  `servers/f2fs` `resolve_path_ex` and `servers/vfs` `tmp_resolve_links` — EACCES before the
+  lookup, so a missing leaf under an unsearchable directory never leaks as ENOENT), creation
+  (`open(O_CREAT)`, `mkdir`, `mknod`, `symlink`, `link`, AF_UNIX `bind`: write+search on the
+  parent), removal (`unlink`, `rmdir`, `rename` on both parents + the sticky rule → EPERM,
+  write on a directory that changes parents), AF_UNIX `connect` (write on the socket inode),
+  `O_TRUNC` (write), `chown` (uid root-only, gid only to the caller's egid). All of it is
+  one evaluator, `xattr::may_access` (mode bits + stored POSIX ACL + root bypass), so ACLs
+  keep working on the new sites. `/tmp` is now `1777` like `/dev/shm`. `userland/permtest`
+  pins the matrix on f2fs (`/data`) and tmpfs. The greeter's two dependencies below were
+  resolved by staging, not by holes: `userland/init` seeds `/run/user/<uid>` per passwd
+  account, the greeter phase lives in `/run/user/990`, and `greeter-launch` chowns the two
+  socket nodes to the account before dropping (`ports/greetd/README.md`). Still unchecked:
+  `utimensat` (a no-op syscall), exec's x-bit, supplementary groups (none exist),
+  default-ACL inheritance at create time.
+  *Historical finding:* Filesystem permissions were enforced on ONE operation only: `open(2)`
+  of an inode that already exists. Measured 2026-08-08 by enumerating every `xattr::access_check` call
   site in the tree; there are five outside the xattr crate's own gates, and **each takes a
   fully-resolved existing inode as its subject — not one takes a parent directory**:
   `servers/vfs/src/lib.rs:3010` (opendir of a tmpfs directory, read bit on that directory),
