@@ -1039,6 +1039,7 @@ impl smoltcp::phy::TxToken for TxToken {
 }
 
 pub fn init() {
+    sched::register_dump_hook(dump_sockets);
     init_loopback();
     if drivers::virtio_net::device_count() > 0 {
         if let Some(mac) = drivers::virtio_net::get_mac_address(0) {
@@ -3483,4 +3484,80 @@ fn handle_close_all(pid: u32) {
 fn net_val(m: &Message) -> isize {
     let bytes: [u8; 8] = m.data[0..8].try_into().unwrap_or([0u8; 8]);
     i64::from_le_bytes(bytes) as isize
+}
+
+/// Diagnostic, appended to the Ctrl-T task dump (`sched::dump_tasks`): every
+/// process socket table entry, every live AF_UNIX connection with its per-end
+/// refcounts, closed/shutdown flags, peer credentials and ring fill, and every
+/// bound AF_UNIX address. IRQ context: try_lock only, prints on the raw UART.
+pub fn dump_sockets() {
+    extern "C" { fn arch_serial_putc(c: u8); fn print_number(n: u32); }
+    fn ps(s: &str) { for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } } }
+    fn pn(n: u64) { unsafe { print_number(n as u32) } }
+    fn pb(b: bool) { ps(if b { "1" } else { "0" }) }
+    {
+        let tbls = match SOCK_TABLES.try_lock() {
+            Some(t) => t,
+            None => { ps("[SOCK] tables busy\n"); return; }
+        };
+        for t in tbls.iter() {
+            if !t.in_use { continue; }
+            ps("[SOCK] pid="); pn(t.pid as u64); ps(":");
+            for (i, e) in t.socks.iter().enumerate() {
+                if !e.in_use { continue; }
+                ps(" fd"); pn((i + SOCK_FD_BASE) as u64);
+                if e.cloexec { ps("x"); }
+                if e.nonblock { ps("n"); }
+                ps("=");
+                match e.state {
+                    SockState::None => ps("none"),
+                    SockState::Unbound { .. } => ps("unbound"),
+                    SockState::UnixListening { bound_idx } => { ps("listen@"); pn(bound_idx as u64); }
+                    SockState::UnixConnected { conn_idx, is_a } => { ps("conn"); pn(conn_idx as u64); ps(if is_a { "a" } else { "b" }); }
+                    SockState::UnixPendingAccept { conn_idx, .. } => { ps("pend"); pn(conn_idx as u64); }
+                    SockState::InetBound { .. } => ps("inetbound"),
+                    SockState::InetListening { .. } => ps("inetlisten"),
+                    SockState::InetConnected { .. } => ps("inetconn"),
+                    SockState::IcmpUnbound | SockState::IcmpBound { .. } => ps("icmp"),
+                }
+            }
+            ps("\n");
+        }
+    }
+    {
+        let conns = match UNIX_CONNS.try_lock() {
+            Some(c) => c,
+            None => { ps("[SOCK] conns busy\n"); return; }
+        };
+        for (i, c) in conns.iter().enumerate() {
+            if !c.in_use { continue; }
+            ps("[CONN] "); pn(i as u64);
+            ps(" a{pid="); pn(c.cred_a.pid as u64); ps(" uid="); pn(c.cred_a.uid as u64);
+            ps(" refs="); pn(c.refs_a as u64); ps(" closed="); pb(c.closed_a);
+            ps(" shut="); pb(c.shut_rd_a); pb(c.shut_wr_a); ps("}");
+            ps(" b{pid="); pn(c.cred_b.pid as u64); ps(" uid="); pn(c.cred_b.uid as u64);
+            ps(" refs="); pn(c.refs_b as u64); ps(" closed="); pb(c.closed_b);
+            ps(" shut="); pb(c.shut_rd_b); pb(c.shut_wr_b); ps("}");
+            ps(" ab="); pn(c.ring_ab.count as u64); ps("/"); pn(c.ring_ab.wtotal);
+            ps(" ba="); pn(c.ring_ba.count as u64); ps("/"); pn(c.ring_ba.wtotal);
+            ps(" fdq="); pn(c.fdq_ab.len() as u64); ps("/"); pn(c.fdq_ba.len() as u64);
+            ps(" seq="); pn(c.seq);
+            ps("\n");
+        }
+    }
+    {
+        let bound = match BOUND_PATHS.try_lock() {
+            Some(b) => b,
+            None => { ps("[SOCK] bound busy\n"); return; }
+        };
+        for (i, b) in bound.iter().enumerate() {
+            if !b.in_use { continue; }
+            ps("[BOUND] "); pn(i as u64); ps(" refs="); pn(b.refs as u64);
+            ps(" id="); pn(b.sock_id); ps(" ");
+            if b.is_abstract { ps("@"); }
+            let n = b.path_len.min(PATH_MAX);
+            for &ch in &b.path[..n] { if ch >= 0x20 && ch < 0x7f { unsafe { arch_serial_putc(ch); } } }
+            ps("\n");
+        }
+    }
 }
