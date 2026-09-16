@@ -91,6 +91,7 @@ const EINVAL: i32 = 22;
 const ENOENT: i32 = 2;
 const ETIME: i32 = 62;
 const ENOSYS: i32 = 38;
+const EACCES: i32 = 13;
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -644,6 +645,34 @@ fn report(name: &[u8], ok: bool) -> bool {
     ok
 }
 
+// Same as report(), but on FAIL also prints the errno the failing ioctl/read
+// left behind, so a cascade of generic FAILs (e.g. every master-gated KMS
+// ioctl answering EACCES because another DRM master is running) is
+// diagnosable from the log alone instead of needing a debugger. `err` must be
+// captured by the caller immediately after the syscall under test -- any
+// syscall issued between that call and this one (fb0_census, provoke_console,
+// print_dec, ...) will have overwritten relibc's errno.
+fn report_errno(name: &[u8], ok: bool, err: i32) -> bool {
+    if !ok {
+        unsafe { print_dec(b"  errno=", err as u64); }
+    }
+    report(name, ok)
+}
+
+// Prints "<name>: SKIP\n" for a case that was never attempted because a
+// precondition it depends on (a live DRM master, in practice) was not met.
+// Deliberately NOT routed through report()/failures: a SKIP is neither a PASS
+// nor a FAIL, and counting it as one or the other would either hide a real
+// regression behind a "just skipped" excuse or fail a run for a condition
+// (another compositor holding card0) that has nothing to do with drmsmoke's
+// own correctness.
+fn report_skip(name: &[u8]) {
+    unsafe {
+        write(1, name.as_ptr() as *const c_void, name.len());
+        write(1, b": SKIP\n".as_ptr() as *const c_void, 7);
+    }
+}
+
 // Prints "<label><v>\n" in decimal — used by FLIP_TS_SUBTICK to put the raw
 // observed tv_sec/tv_usec values in the serial log so a human can see the
 // actual numbers, not just PASS/FAIL.
@@ -776,6 +805,7 @@ unsafe fn spin_delay(iters: u64) {
 #[no_mangle]
 pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0i32;
+    let mut skips = 0i32;
 
     let hold_mode = argc > 1 && arg_is(*argv.add(1) as *const u8, b"--hold");
 
@@ -840,24 +870,28 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     ver.name = namebuf.as_mut_ptr() as u64;
     ver.name_len = namebuf.len();
     let ver_ok = ioctl(fd, DRM_IOCTL_VERSION, &mut ver as *mut _) == 0 && namebuf[0] != 0;
-    if !report(b"VERSION", ver_ok) { failures += 1; }
+    let ver_errno = errno();
+    if !report_errno(b"VERSION", ver_ok, ver_errno) { failures += 1; }
 
     // GET_CAP(DUMB_BUFFER) == 1
     let mut cap = DrmGetCap { capability: DRM_CAP_DUMB_BUFFER, value: 0 };
     let cap_dumb_ok = ioctl(fd, DRM_IOCTL_GET_CAP, &mut cap as *mut _) == 0 && cap.value == 1;
-    if !report(b"GET_CAP_DUMB_BUFFER", cap_dumb_ok) { failures += 1; }
+    let cap_dumb_errno = errno();
+    if !report_errno(b"GET_CAP_DUMB_BUFFER", cap_dumb_ok, cap_dumb_errno) { failures += 1; }
 
     // GET_CAP(TIMESTAMP_MONOTONIC) == 1
     let mut cap2 = DrmGetCap { capability: DRM_CAP_TIMESTAMP_MONOTONIC, value: 0 };
     let cap_ts_ok = ioctl(fd, DRM_IOCTL_GET_CAP, &mut cap2 as *mut _) == 0 && cap2.value == 1;
-    if !report(b"GET_CAP_TIMESTAMP_MONOTONIC", cap_ts_ok) { failures += 1; }
+    let cap_ts_errno = errno();
+    if !report_errno(b"GET_CAP_TIMESTAMP_MONOTONIC", cap_ts_ok, cap_ts_errno) { failures += 1; }
 
     // GETRESOURCES — expect >=1 crtc/connector/encoder, sane min/max
     let mut res = DrmModeCardRes::default();
     let res_ok = ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut res as *mut _) == 0
         && res.count_crtcs >= 1 && res.count_connectors >= 1
         && res.max_width >= res.min_width && res.max_height >= res.min_height;
-    if !report(b"GETRESOURCES", res_ok) { failures += 1; }
+    let res_errno = errno();
+    if !report_errno(b"GETRESOURCES", res_ok, res_errno) { failures += 1; }
 
     // GETCONNECTOR — connected + >=1 mode. Two-pass: count then fill.
     let connector_id = 1u32; // GETRESOURCES reports connector id 1
@@ -874,7 +908,8 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     let conn_ok = ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &mut conn2 as *mut _) == 0
         && conn2.connection == 1 && conn2.count_modes >= 1
         && modes[0].hdisplay > 0 && modes[0].vdisplay > 0;
-    if !report(b"GETCONNECTOR", conn_ok) { failures += 1; }
+    let conn_errno = errno();
+    if !report_errno(b"GETCONNECTOR", conn_ok, conn_errno) { failures += 1; }
 
     let w = if modes[0].hdisplay > 0 { modes[0].hdisplay as u32 } else { 256 };
     let h = if modes[0].vdisplay > 0 { modes[0].vdisplay as u32 } else { 256 };
@@ -885,13 +920,15 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     cd.height = h;
     cd.bpp = 32;
     let create_ok = ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut cd as *mut _) == 0 && cd.handle != 0;
-    if !report(b"CREATE_DUMB", create_ok) { failures += 1; }
+    let create_errno = errno();
+    if !report_errno(b"CREATE_DUMB", create_ok, create_errno) { failures += 1; }
 
     // MAP_DUMB
     let mut md = DrmModeMapDumb::default();
     md.handle = cd.handle;
     let map_ok = ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut md as *mut _) == 0;
-    if !report(b"MAP_DUMB", map_ok) { failures += 1; }
+    let map_errno = errno();
+    if !report_errno(b"MAP_DUMB", map_ok, map_errno) { failures += 1; }
 
     // mmap + fill gradient
     let mut mmap_ok = false;
@@ -930,7 +967,8 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     fb.handles[0] = cd.handle;
     fb.pitches[0] = cd.pitch;
     let addfb_ok = ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &mut fb as *mut _) == 0 && fb.fb_id != 0;
-    if !report(b"ADDFB2", addfb_ok) { failures += 1; }
+    let addfb_errno = errno();
+    if !report_errno(b"ADDFB2", addfb_ok, addfb_errno) { failures += 1; }
 
     // ── Atomic KMS: present, and the console yield that present must produce ──
     //
@@ -978,6 +1016,18 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         }
     }
 
+    // DRM_IOCTL_MODE_ATOMIC(TEST_ONLY) below is the FIRST master-gated ioctl
+    // this test issues. If some other process (a compositor) already holds
+    // DRM master on card0, every master-gated ioctl from here through
+    // FLIP_TS_SUBTICK answers EACCES, and letting each one cascade into its
+    // own generic FAIL just buries the one real diagnosis under ~10 lookalike
+    // ones. So this first attempt doubles as the probe: read its errno, and if
+    // it is EACCES, print one diagnosis line and mark every remaining
+    // master-gated case SKIP instead of FAIL, while still running the
+    // non-master cases (PRIME_*, V3D_*, SYNCOBJ_*, FORK_DEVMAP_*,
+    // DESTROY_DUMB) that follow.
+    let mut master_conflict = false;
+
     if atomic_setup_ok {
         // TEST_ONLY is validation only and must present nothing — smithay
         // issues these constantly, and one that presents would make every
@@ -987,39 +1037,51 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         // output would move the hash. `row_ok` is a content fingerprint and is
         // immune to that.)
         let test_rc = atomic_plane_commit(fd, afb.fb_id, w, h, DRM_MODE_ATOMIC_TEST_ONLY);
-        let (hash_t, bytes_t, row_t) = fb0_census(w as usize, ATOMIC_ROW_R);
-        let test_only_ok = test_rc == 0 && bytes_t > 0 && !row_t;
-        if !report(b"ATOMIC_TEST_ONLY_NO_PRESENT", test_only_ok) { failures += 1; }
+        let test_errno = errno();
+        master_conflict = test_rc != 0 && test_errno == EACCES;
 
-        // The real thing: one plane-only commit, no modeset, no event.
-        let commit_rc = atomic_plane_commit(fd, afb.fb_id, w, h, 0);
-        if !report(b"ATOMIC_COMMIT", commit_rc == 0) { failures += 1; }
+        if master_conflict {
+            puts(b"drmsmoke: card0 has another DRM master (a compositor is running) -- skipping 12 KMS cases; stop the compositor to run them (touch /etc/leandros/text-login; kill $(cat /run/greetd-init.pid))\n\0".as_ptr());
+            report_skip(b"ATOMIC_TEST_ONLY_NO_PRESENT"); skips += 1;
+            report_skip(b"ATOMIC_COMMIT"); skips += 1;
+            report_skip(b"ATOMIC_PRESENTS_PIXELS"); skips += 1;
+            report_skip(b"CONSOLE_YIELDS_TO_ATOMIC"); skips += 1;
+        } else {
+            let (hash_t, bytes_t, row_t) = fb0_census(w as usize, ATOMIC_ROW_R);
+            let test_only_ok = test_rc == 0 && bytes_t > 0 && !row_t;
+            if !report_errno(b"ATOMIC_TEST_ONLY_NO_PRESENT", test_only_ok, test_errno) { failures += 1; }
 
-        let (hash_a, bytes_a, row_a) = fb0_census(w as usize, ATOMIC_ROW_R);
-        print_dec(b"  ATOMIC fnv_test_only=", hash_t);
-        print_dec(b"  ATOMIC fnv_after_commit=", hash_a);
-        let px_ok = commit_rc == 0 && bytes_a > 0 && bytes_a == bytes_t && row_a;
-        if !px_ok {
-            puts(b"  ATOMIC_PRESENTS_PIXELS: FAIL the atomic commit returned but its pixels are not on the scanout\n\0".as_ptr());
+            // The real thing: one plane-only commit, no modeset, no event.
+            let commit_rc = atomic_plane_commit(fd, afb.fb_id, w, h, 0);
+            let commit_errno = errno();
+            if !report_errno(b"ATOMIC_COMMIT", commit_rc == 0, commit_errno) { failures += 1; }
+
+            let (hash_a, bytes_a, row_a) = fb0_census(w as usize, ATOMIC_ROW_R);
+            print_dec(b"  ATOMIC fnv_test_only=", hash_t);
+            print_dec(b"  ATOMIC fnv_after_commit=", hash_a);
+            let px_ok = commit_rc == 0 && bytes_a > 0 && bytes_a == bytes_t && row_a;
+            if !px_ok {
+                puts(b"  ATOMIC_PRESENTS_PIXELS: FAIL the atomic commit returned but its pixels are not on the scanout\n\0".as_ptr());
+            }
+            if !report(b"ATOMIC_PRESENTS_PIXELS", px_ok) { failures += 1; }
+
+            // ── CONSOLE_YIELDS_TO_ATOMIC ─────────────────────────────────────
+            // An atomic-only present must claim the console exactly as SETCRTC
+            // does. Same provocation and same byte-identity verdict as
+            // CONSOLE_YIELDS_TO_SCANOUT below, but reached without any legacy
+            // KMS ioctl ever having been issued on this fd.
+            provoke_console(fd);
+            let (hash_b, bytes_b, _) = fb0_census(w as usize, ATOMIC_ROW_R);
+            print_dec(b"  CONSOLE_YIELDS_TO_ATOMIC bytes_before=", bytes_a);
+            print_dec(b"  CONSOLE_YIELDS_TO_ATOMIC bytes_after=", bytes_b);
+            print_dec(b"  CONSOLE_YIELDS_TO_ATOMIC fnv_before=", hash_a);
+            print_dec(b"  CONSOLE_YIELDS_TO_ATOMIC fnv_after=", hash_b);
+            let held = px_ok && bytes_a == bytes_b && hash_a == hash_b;
+            if !held {
+                puts(b"  CONSOLE_YIELDS_TO_ATOMIC: FAIL the scanout changed after an ATOMIC-only present -- the console was never claimed from the atomic path, or an unrelated card0 close handed it back\n\0".as_ptr());
+            }
+            if !report(b"CONSOLE_YIELDS_TO_ATOMIC", held) { failures += 1; }
         }
-        if !report(b"ATOMIC_PRESENTS_PIXELS", px_ok) { failures += 1; }
-
-        // ── CONSOLE_YIELDS_TO_ATOMIC ─────────────────────────────────────────
-        // An atomic-only present must claim the console exactly as SETCRTC
-        // does. Same provocation and same byte-identity verdict as
-        // CONSOLE_YIELDS_TO_SCANOUT below, but reached without any legacy
-        // KMS ioctl ever having been issued on this fd.
-        provoke_console(fd);
-        let (hash_b, bytes_b, _) = fb0_census(w as usize, ATOMIC_ROW_R);
-        print_dec(b"  CONSOLE_YIELDS_TO_ATOMIC bytes_before=", bytes_a);
-        print_dec(b"  CONSOLE_YIELDS_TO_ATOMIC bytes_after=", bytes_b);
-        print_dec(b"  CONSOLE_YIELDS_TO_ATOMIC fnv_before=", hash_a);
-        print_dec(b"  CONSOLE_YIELDS_TO_ATOMIC fnv_after=", hash_b);
-        let held = px_ok && bytes_a == bytes_b && hash_a == hash_b;
-        if !held {
-            puts(b"  CONSOLE_YIELDS_TO_ATOMIC: FAIL the scanout changed after an ATOMIC-only present -- the console was never claimed from the atomic path, or an unrelated card0 close handed it back\n\0".as_ptr());
-        }
-        if !report(b"CONSOLE_YIELDS_TO_ATOMIC", held) { failures += 1; }
     } else {
         if !report(b"ATOMIC_TEST_ONLY_NO_PRESENT", false) { failures += 1; }
         if !report(b"ATOMIC_COMMIT", false) { failures += 1; }
@@ -1038,8 +1100,16 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     set.mode.vdisplay = h as u16;
     set.mode.vrefresh = 60;
     set.mode_valid = 1;
-    let setcrtc_ok = ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &mut set as *mut _) == 0;
-    if !report(b"SETCRTC", setcrtc_ok) { failures += 1; }
+    let setcrtc_ok = if master_conflict {
+        report_skip(b"SETCRTC");
+        skips += 1;
+        false
+    } else {
+        let ok = ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &mut set as *mut _) == 0;
+        let err = errno();
+        if !report_errno(b"SETCRTC", ok, err) { failures += 1; }
+        ok
+    };
 
     // ── CONSOLE_YIELDS_TO_SCANOUT ────────────────────────────────────────────
     //
@@ -1083,6 +1153,9 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
             puts(b"  CONSOLE_YIELDS_TO_SCANOUT: FAIL the scanout changed while a DRM master held it -- the fb console painted or scrolled over it\n\0".as_ptr());
         }
         if !report(b"CONSOLE_YIELDS_TO_SCANOUT", held) { failures += 1; }
+    } else if master_conflict {
+        report_skip(b"FB0_SHOWS_SCANOUT"); skips += 1;
+        report_skip(b"CONSOLE_YIELDS_TO_SCANOUT"); skips += 1;
     } else {
         if !report(b"FB0_SHOWS_SCANOUT", false) { failures += 1; }
         if !report(b"CONSOLE_YIELDS_TO_SCANOUT", false) { failures += 1; }
@@ -1118,8 +1191,16 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     // DIRTYFB — flush CPU render to host
     let mut dirty = DrmModeFbDirtyCmd::default();
     dirty.fb_id = fb.fb_id;
-    let dirty_ok = ioctl(fd, DRM_IOCTL_MODE_DIRTYFB, &mut dirty as *mut _) == 0;
-    if !report(b"DIRTYFB", dirty_ok) { failures += 1; }
+    let dirty_ok = if master_conflict {
+        report_skip(b"DIRTYFB");
+        skips += 1;
+        false
+    } else {
+        let ok = ioctl(fd, DRM_IOCTL_MODE_DIRTYFB, &mut dirty as *mut _) == 0;
+        let err = errno();
+        if !report_errno(b"DIRTYFB", ok, err) { failures += 1; }
+        ok
+    };
 
     // PAGE_FLIP with a completion event, then poll + read the drm_event_vblank.
     // This exercises the K4 event channel (commit 3): the flip queues an event,
@@ -1131,21 +1212,52 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     flip.fb_id = fb.fb_id;
     flip.flags = DRM_MODE_PAGE_FLIP_EVENT;
     flip.user_data = magic;
-    let flip_ok = ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &mut flip as *mut _) == 0;
-    if !report(b"PAGE_FLIP_EVENT", flip_ok) { failures += 1; }
+    let _flip_ok = if master_conflict {
+        report_skip(b"PAGE_FLIP_EVENT");
+        skips += 1;
+        false
+    } else {
+        let ok = ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &mut flip as *mut _) == 0;
+        let err = errno();
+        if !report_errno(b"PAGE_FLIP_EVENT", ok, err) { failures += 1; }
+        ok
+    };
 
     // poll for readiness (throttled delivery is up to ~20 ms out; allow 500 ms).
     let mut pfd = pollfd { fd, events: POLLIN, revents: 0 };
-    let poll_rc = poll(&mut pfd as *mut _, 1, 500);
-    let poll_ok = poll_rc == 1 && (pfd.revents & POLLIN) != 0;
-    if !report(b"POLL_CARD0_READABLE", poll_ok) { failures += 1; }
+    let poll_ok = if master_conflict {
+        report_skip(b"POLL_CARD0_READABLE");
+        skips += 1;
+        false
+    } else {
+        let poll_rc = poll(&mut pfd as *mut _, 1, 500);
+        let ok = poll_rc == 1 && (pfd.revents & POLLIN) != 0;
+        if !report(b"POLL_CARD0_READABLE", ok) { failures += 1; }
+        ok
+    };
 
-    // read the event back and validate it
+    // read the event back and validate it. Gated on poll_ok: read() used to run
+    // unconditionally here, so a poll() that timed out (or, under a master
+    // conflict, was never going to see an event because PAGE_FLIP above never
+    // queued one) fell straight into a read() with nothing to read — on a
+    // blocking fd that hangs the test forever instead of failing it. Treat
+    // "poll never said readable" as an immediate FAIL for this case instead of
+    // gambling on read() anyway.
     let mut ev = DrmEventVblank::default();
-    let rn = read(fd, &mut ev as *mut _ as *mut c_void, core::mem::size_of::<DrmEventVblank>());
-    let read_ok = rn == 32 && ev.ev_type == DRM_EVENT_FLIP_COMPLETE
-        && ev.length == 32 && ev.user_data == magic;
-    if !report(b"READ_FLIP_EVENT", read_ok) { failures += 1; }
+    let _read_ok = if master_conflict {
+        report_skip(b"READ_FLIP_EVENT");
+        skips += 1;
+        false
+    } else if poll_ok {
+        let rn = read(fd, &mut ev as *mut _ as *mut c_void, core::mem::size_of::<DrmEventVblank>());
+        let ok = rn == 32 && ev.ev_type == DRM_EVENT_FLIP_COMPLETE
+            && ev.length == 32 && ev.user_data == magic;
+        if !report(b"READ_FLIP_EVENT", ok) { failures += 1; }
+        ok
+    } else {
+        if !report(b"READ_FLIP_EVENT", false) { failures += 1; }
+        false
+    };
 
     // FLIP_TS_SUBTICK — proves the flip-event timestamp is actually being
     // built from the interpolated arch_monotonic_ns() clock (queue_flip_event
@@ -1203,6 +1315,10 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     const FLIP_TS_SAMPLES: usize = 16;
     const FLIP_TS_SPIN_BASE: u64 = 5_000;
     const FLIP_TS_SPIN_STEP: u64 = 47_777; // deliberately not a round number
+    if master_conflict {
+        report_skip(b"FLIP_TS_SUBTICK");
+        skips += 1;
+    } else {
     let mut subtick_all_read_ok = true;
     let mut n_tick_multiple = 0u32;
     let mut n_saturated = 0u32;
@@ -1221,10 +1337,19 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         let spoll_rc = poll(&mut spfd as *mut _, 1, 500);
         let spoll_ok = spoll_rc == 1 && (spfd.revents & POLLIN) != 0;
 
+        // Gated on spoll_ok, same fix as READ_FLIP_EVENT above: this read()
+        // used to run unconditionally after poll(), so a timed-out poll (no
+        // event ever queued) fell into a read() with nothing there -- on a
+        // blocking fd, forever. A poll miss is now an immediate per-sample
+        // FAIL instead of a hang.
         let mut sev = DrmEventVblank::default();
-        let srn = read(fd, &mut sev as *mut _ as *mut c_void, core::mem::size_of::<DrmEventVblank>());
-        let sread_ok = srn == 32 && sev.ev_type == DRM_EVENT_FLIP_COMPLETE
-            && sev.length == 32 && sev.user_data == sflip.user_data;
+        let sread_ok = if spoll_ok {
+            let srn = read(fd, &mut sev as *mut _ as *mut c_void, core::mem::size_of::<DrmEventVblank>());
+            srn == 32 && sev.ev_type == DRM_EVENT_FLIP_COMPLETE
+                && sev.length == 32 && sev.user_data == sflip.user_data
+        } else {
+            false
+        };
 
         if !sflip_ok || !spoll_ok || !sread_ok {
             subtick_all_read_ok = false;
@@ -1261,6 +1386,7 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         puts(b"  FLIP_TS_SUBTICK: note - every sample hit the clamp; interpolation is live but the timer IRQ ran late throughout\n\0".as_ptr());
     }
     if !report(b"FLIP_TS_SUBTICK", subtick_ok) { failures += 1; }
+    }
 
     // ── Sync objects (DRM_IOCTL_SYNCOBJ_*) ──────────────────────────────────
     //
@@ -1870,7 +1996,8 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     let mut ph = DrmPrimeHandle::default();
     ph.handle = cd.handle;
     let export_ok = ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _) == 0 && ph.fd >= 0;
-    if !report(b"PRIME_HANDLE_TO_FD", export_ok) { failures += 1; }
+    let export_errno = errno();
+    if !report_errno(b"PRIME_HANDLE_TO_FD", export_ok, export_errno) { failures += 1; }
 
     let mut alias_ok = false;
     if export_ok && cd.size > 0 {
@@ -1893,7 +2020,8 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     ph2.fd = ph.fd;
     let import_ok = ioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut ph2 as *mut _) == 0
         && ph2.handle == cd.handle;
-    if !report(b"PRIME_FD_TO_HANDLE", import_ok) { failures += 1; }
+    let import_errno = errno();
+    if !report_errno(b"PRIME_FD_TO_HANDLE", import_ok, import_errno) { failures += 1; }
 
     // A dumb buffer's handles are deliberately global (ADDFB2, the console and
     // PRIME consume them with no open identity), so importing its fd on a
@@ -1905,7 +2033,8 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     let other_ok = fd_other >= 0 && export_ok
         && ioctl(fd_other, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut ph3 as *mut _) == 0
         && ph3.handle == cd.handle;
-    if !report(b"PRIME_FD_TO_HANDLE_OTHER_OPEN_DUMB", other_ok) { failures += 1; }
+    let other_errno = errno();
+    if !report_errno(b"PRIME_FD_TO_HANDLE_OTHER_OPEN_DUMB", other_ok, other_errno) { failures += 1; }
     if fd_other >= 0 { close(fd_other); }
 
     if export_ok { close(ph.fd); }
@@ -2017,9 +2146,19 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     let mut dd = DrmModeCreateDumb::default();
     dd.handle = cd.handle;
     let destroy_ok = ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut (dd.handle) as *mut u32) == 0;
-    if !report(b"DESTROY_DUMB", destroy_ok) { failures += 1; }
+    let destroy_errno = errno();
+    if !report_errno(b"DESTROY_DUMB", destroy_ok, destroy_errno) { failures += 1; }
 
+    // close() is what hands the framebuffer console back — SETCRTC (when it
+    // ran) disabled it, and this restores it. Reached on every path out of the
+    // checks above, including the master-conflict SKIP path (SETCRTC itself
+    // was never called, so there is nothing to restore, but every fd this
+    // process opened is still closed the same way) and any early per-case
+    // failure, since none of those branches return out of this function.
     close(fd);
+
+    print_dec(b"drmsmoke: failed=", failures as u64);
+    print_dec(b"drmsmoke: skipped=", skips as u64);
     puts(b"--- drmsmoke done ---\n\0".as_ptr());
     failures
 }
