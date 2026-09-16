@@ -332,6 +332,8 @@ extern "C" {
     fn arch_set_kernel_stack(rsp: u64);
     fn arch_cpu_id() -> usize;
     fn arch_timer_check_alive() -> bool;
+    /// Monotonic nanoseconds since boot (sub-tick), for CPU-time accounting.
+    fn arch_monotonic_ns() -> u64;
     pub fn arch_alloc_page_table_root() -> usize;
     /// Send a reschedule IPI to `cpu` (x86-64: LAPIC vector 0x40; AArch64: SGI 1).
     fn arch_send_resched_ipi(cpu: usize);
@@ -873,10 +875,22 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isi
 /// (called at successful execve and at exit) — releases the parent from its
 /// vfork suspension loop in `clone_thread`.
 pub fn vfork_complete(pid: Pid) {
-    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        t.vfork_pending = false;
-    }
+    let mut rq = RUN_QUEUE.lock();
+    let was = match rq.find_pid_mut(pid) {
+        Some(t) => core::mem::replace(&mut t.vfork_pending, false),
+        None => false,
+    };
+    let woken = if was { rq.unblock_port(VFORK_WAIT_CHANNEL) } else { 0 };
+    drop(rq);
+    if woken > 0 { wake_up_an_idle_cpu(); }
 }
+
+/// Wait-channel a CLONE_VFORK parent parks on while its child borrows the
+/// address space (`clone.rs`). Released by `vfork_complete` (the child's
+/// successful execve) and by the child's exit paths; like `POLL_WAIT_CHANNEL`
+/// it is outside the real port-id range. Before 2026-09-16 the parent
+/// yield-spun instead, one full CPU for every spawn's exec window.
+pub const VFORK_WAIT_CHANNEL: u32 = 0xFFFF_FF02;
 
 /// kill(0-probe): 0 if `pid` names a live task, else -ESRCH.
 pub fn exists_probe(pid: Pid) -> isize {
@@ -1887,6 +1901,25 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
     if found_live { WaitTry::StillRunning } else { WaitTry::NoChildren }
 }
 
+/// CPU nanoseconds consumed by one task (`Task::cpu_ns`), 0 if unknown.
+pub fn thread_cpu_ns(pid: Pid) -> u64 {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.cpu_ns).unwrap_or(0)
+}
+
+/// CPU nanoseconds consumed by every live task of a thread group. Exited
+/// threads are not folded in (no accounting survives a slot's recycling), so
+/// this is a floor for a group that has lost threads.
+pub fn process_cpu_ns(tgid: Pid) -> u64 {
+    let rq = RUN_QUEUE.lock();
+    let mut total = 0u64;
+    for i in 0..runqueue::MAX_TASKS {
+        if let Some(t) = rq.get(i) {
+            if t.tgid == tgid { total = total.saturating_add(t.cpu_ns); }
+        }
+    }
+    total
+}
+
 /// The calling task's blocked-signal mask.
 pub fn current_sigmask() -> u64 {
     let pid = current_pid();
@@ -2017,15 +2050,30 @@ const WD_REPEAT_SCANS: u32 = 20; // then every 10 s while it lasts
 pub const NO_SYSCALL: u32 = u32::MAX;
 static CUR_SYSCALL: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(NO_SYSCALL) }; MAX_CPUS];
 
+/// Per-pid last syscall, `(pid << 32) | (nr << 1) | in_syscall`, indexed by
+/// `pid & 1023` (pids are a sequential counter). The Ctrl-T dump prints it
+/// for every task: a Running/Ready task that is "in" the same syscall on
+/// every dump is a kernel-side yield-spin (the idle-CPU floor of 2026-09-16
+/// was three of those), one that is "out" is a userland busy loop. One
+/// relaxed store on entry and exit; the pid load is a per-CPU atomic.
+static LAST_SYSCALL: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+
 #[inline]
 pub fn note_syscall_enter(number: usize) {
     let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
     CUR_SYSCALL[id].store(number as u32, Ordering::Relaxed);
+    let pid = CURRENT_PID[id].load(Ordering::Relaxed);
+    LAST_SYSCALL[(pid as usize) & 1023]
+        .store(((pid as u64) << 32) | ((number as u64) << 1) | 1, Ordering::Relaxed);
 }
 #[inline]
 pub fn note_syscall_exit() {
     let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
     CUR_SYSCALL[id].store(NO_SYSCALL, Ordering::Relaxed);
+    let pid = CURRENT_PID[id].load(Ordering::Relaxed);
+    let slot = &LAST_SYSCALL[(pid as usize) & 1023];
+    let v = slot.load(Ordering::Relaxed);
+    if (v >> 32) as u32 == pid { slot.store(v & !1, Ordering::Relaxed); }
 }
 
 /// Local tick count of `cpu` (for tests and the monitor: a live CPU's count
@@ -2433,6 +2481,20 @@ pub fn dump_tasks() {
             if t.poll_deadline != u64::MAX { print_str(" dl="); pn(t.poll_deadline as u32); }
         }
         if t.vfork_pending { print_str(" vfork_pending"); }
+        // Last syscall entered by this pid and whether it is still inside it.
+        let l = LAST_SYSCALL[(t.pid as usize) & 1023].load(Ordering::Relaxed);
+        if (l >> 32) as u32 == t.pid {
+            print_str(" last=0x"); ph(((l >> 1) & 0x7FFF_FFFF) as usize);
+            print_str(if l & 1 != 0 { " in" } else { " out" });
+        }
+        // The group leader's executable, when the path table is free.
+        if let Some(tbl) = EXE_PATHS.try_lock() {
+            if let Some(e) = tbl.iter().find(|e| e.tgid == t.tgid) {
+                print_str(" (");
+                for &b in &e.path[..(e.len as usize).min(e.path.len())] { print_str(core::str::from_utf8(&[b]).unwrap_or("?")); }
+                print_str(")");
+            }
+        }
         // Where in userspace the task stopped: the EL0 frame the exception
         // stub saved at the top of its kernel stack (`sub sp, sp, #288` below
         // `tpidr_el1`). For a Blocked task that is the syscall it parked in;
@@ -2440,6 +2502,17 @@ pub fn dump_tasks() {
         // syscall, a fault or the tick — so a task spinning in a fault or
         // syscall loop shows that loop (printed as `last=`, since the task
         // may since have moved on). aarch64 only.
+        // x86_64: the same frame lives at top - UserFrame::SIZE (see task_rows).
+        // For a Running task it is its most recent kernel entry (syscall or
+        // IRQ) — enough to place a userland busy loop.
+        #[cfg(target_arch = "x86_64")]
+        if t.kernel_stack != 0 && t.state != TaskState::Zombie && rq.find_pid(t.tgid).map_or(false, |l| l.address_space.is_some()) {
+            let top = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
+            let f = unsafe { &*((top - context::UserFrame::SIZE) as *const context::UserFrame) };
+            print_str(if t.state == TaskState::Blocked { " pc=" } else { " last pc=" }); ph(f.rip as usize);
+            print_str(" sp="); ph(f.rsp as usize);
+            print_str(" rax="); ph(f.rax as usize);
+        }
         #[cfg(target_arch = "aarch64")]
         if t.kernel_stack != 0 && t.state != TaskState::Zombie && rq.find_pid(t.tgid).map_or(false, |l| l.address_space.is_some()) {
             let frame = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE - 288;
@@ -2736,6 +2809,7 @@ fn scheduler_run_loop() -> ! {
 
         if let Some((idx, ctx_ptr, pid, kernel_stack_top_virt, page_table, tgid)) = picked {
             let dispatched_at = ticks();
+            let dispatched_ns = unsafe { arch_monotonic_ns() };
 
             unsafe {
                 CURRENT_CTX[id] = ctx_ptr as *mut CpuContext;
@@ -2775,6 +2849,7 @@ fn scheduler_run_loop() -> ! {
                     Some(t) if t.pid == pid => {
                         let delta = ticks().saturating_sub(dispatched_at);
                         t.charge_vruntime(delta);
+                        t.cpu_ns += unsafe { arch_monotonic_ns() }.saturating_sub(dispatched_ns);
                         t.on_cpu = None;
                         if t.state == TaskState::Running {
                             t.state = TaskState::Ready;
@@ -3081,17 +3156,19 @@ pub fn exit(code: i32) -> ! {
 
     let (tgid, ppid, status, uid) = {
         let mut rq = RUN_QUEUE.lock();
-        match rq.find_pid_mut(pid) {
+        let (r, had_vfork) = match rq.find_pid_mut(pid) {
             Some(t) => {
                 t.state = TaskState::Zombie;
                 t.exit_code = code;
-                t.vfork_pending = false; // release a vfork-suspended parent
-                (t.tgid, t.ppid,
-                 ExitStatus { code: t.exit_code, term_signal: t.term_signal },
-                 t.uid)
+                let had_vfork = core::mem::replace(&mut t.vfork_pending, false); // release a vfork-suspended parent
+                ((t.tgid, t.ppid,
+                  ExitStatus { code: t.exit_code, term_signal: t.term_signal },
+                  t.uid), had_vfork)
             }
-            None => (pid, 0, ExitStatus::NONE, 0),
-        }
+            None => ((pid, 0, ExitStatus::NONE, 0), false),
+        };
+        if had_vfork { rq.unblock_port(VFORK_WAIT_CHANNEL); }
+        r
     };
     // Release the /proc/self/exe side-table slot when the process leader dies.
     if pid == tgid { clear_exe_path(tgid); }
@@ -3177,16 +3254,17 @@ pub fn kill_next_group_member(exit_code: i32) -> GroupKillStep {
         None => return GroupKillStep::Done,
     };
 
-    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal) = {
+    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal, had_vfork) = {
         let t = rq.get_mut(idx).unwrap();
         t.state = TaskState::Zombie;
         t.exit_code = exit_code;
-        t.vfork_pending = false; // release a vfork-suspended parent
+        let had_vfork = core::mem::replace(&mut t.vfork_pending, false); // release a vfork-suspended parent
         // `term_signal` is NOT set here: `exit_group_signal` stamps it on
         // every member of the group before this loop starts, so a member
         // reaped through this path already carries it.
-        (t.pid, t.on_cpu, t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal)
+        (t.pid, t.on_cpu, t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal, had_vfork)
     };
+    if had_vfork { rq.unblock_port(VFORK_WAIT_CHANNEL); }
 
     if let Some(cpu) = on_cpu {
         // Still running on another core — cannot touch its kernel stack or

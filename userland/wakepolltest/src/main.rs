@@ -834,6 +834,227 @@ unsafe fn run_stress() -> i32 {
     total_fails
 }
 
+// ── pipe blocking-writer coverage (idlecpu lane, 2026-09-16) ───────────────
+//
+// A full pipe's writer used to yield-spin inside the kernel (sys_write's
+// EAGAIN retry) for as long as the reader was slow — one host core pinned per
+// pipeline. It now parks on the pipe's wake tag like a poll(POLLOUT) waiter.
+// These cases pin down the contract: the writer's CPU time is a small fraction
+// of its wall time; POLLOUT on a full pipe stays clear until a drain frees
+// PIPE_BUF; writes <= PIPE_BUF are atomic; and a close(2) of either end wakes
+// the parked peer (EOF / EPIPE) promptly — a live process closing its end,
+// not an exit, which the SIGCHLD broadcast used to paper over.
+
+const O_NONBLOCK: c_int = 0o4000;
+const POLLOUT: i16 = 0x004;
+const CLOCK_THREAD_CPUTIME_ID: clockid_t = 3;
+const F_GETPIPE_SZ: c_int = 1032;
+const SIGPIPE: c_int = 13;
+const SIG_IGN: usize = 1;
+const PIPE_BUF: usize = 4096;
+
+#[repr(C)]
+struct pollfd { fd: c_int, events: i16, revents: i16 }
+
+extern "C" {
+    fn pipe2(fildes: *mut c_int, flags: c_int) -> c_int;
+    fn poll(fds: *mut pollfd, nfds: u64, timeout: c_int) -> c_int;
+    fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int;
+    fn signal(sig: c_int, handler: usize) -> usize;
+}
+
+unsafe fn thread_cpu_ms() -> i64 {
+    let mut ts = timespec { tv_sec: 0, tv_nsec: 0 };
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts);
+    ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
+}
+
+const XFER_BYTES: usize = 16 * 1024 * 1024;
+static mut XFER_BUF: [u8; 65536] = [0x5a; 65536];
+static mut READ_TOTAL: usize = 0;
+
+/// Slow reader: 4 KiB bites, a 10 ms nap every 128 KiB, so the 16 KiB ring
+/// is full for most of the transfer and the writer must wait ~128 times.
+extern "C" fn slow_reader(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let mut buf = [0u8; 4096];
+        let mut total = 0usize;
+        let mut reads = 0usize;
+        loop {
+            let n = read(STIM_FD, buf.as_mut_ptr(), buf.len());
+            if n <= 0 { break; }
+            total += n as usize;
+            reads += 1;
+            if reads % 32 == 0 { usleep(10_000); }
+        }
+        READ_TOTAL = total;
+    }
+    core::ptr::null_mut()
+}
+
+/// Fast writer of XFER_BYTES into a pipe drained by `slow_reader`: PASS when
+/// everything arrived and the writer's thread CPU time is under a quarter of
+/// its wall time (a parked writer spends ~0; the old spin spent ~all of it).
+unsafe fn test_pipe_writer_blocks() -> bool {
+    let name = b"pipe_writer_blocks";
+    let mut fds = [0i32; 2];
+    if pipe2(fds.as_mut_ptr(), 0) != 0 { return report(name, false, 0); }
+    let (rfd, wfd) = (fds[0], fds[1]);
+    STIM_FD = rfd;
+    READ_TOTAL = 0;
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(), slow_reader, core::ptr::null_mut()) != 0 {
+        return report(name, false, 0);
+    }
+    let t0 = now_ms();
+    let c0 = thread_cpu_ms();
+    let mut sent = 0usize;
+    while sent < XFER_BYTES {
+        let want = (XFER_BYTES - sent).min(XFER_BUF.len());
+        let n = write(wfd, XFER_BUF.as_ptr(), want);
+        if n <= 0 { break; }
+        sent += n as usize;
+    }
+    let wall = now_ms() - t0;
+    let cpu = thread_cpu_ms() - c0;
+    close(wfd); // EOF for the reader
+    pthread_join(th, core::ptr::null_mut());
+    close(rfd);
+    let ok = sent == XFER_BYTES && READ_TOTAL == XFER_BYTES && wall > 0 && cpu * 4 < wall;
+    // report_x's n/wrote columns carry cpu ms and bytes received (KiB).
+    report_x(name, ok, wall, cpu as i32, (READ_TOTAL / 1024) as i64)
+}
+
+/// Fill a non-blocking pipe to EAGAIN; returns the byte count that fit.
+unsafe fn fill_pipe(wfd: c_int) -> usize {
+    let mut filled = 0usize;
+    loop {
+        let n = write(wfd, XFER_BUF.as_ptr(), PIPE_BUF);
+        if n <= 0 { break; }
+        filled += n as usize;
+        if filled > 1 << 24 { break; } // never full: give up (the test fails below)
+    }
+    filled
+}
+
+extern "C" fn drain_one_chunk(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        writer_delay();
+        let mut buf = [0u8; PIPE_BUF];
+        read(STIM_FD, buf.as_mut_ptr(), buf.len());
+        WROTE_AT = now_ms();
+    }
+    core::ptr::null_mut()
+}
+
+/// poll(POLLOUT) on a full pipe: not writable now (0 with a zero timeout),
+/// then woken promptly when the reader frees PIPE_BUF bytes.
+unsafe fn test_pipe_pollout_full() -> bool {
+    let name = b"pipe_pollout_full";
+    let mut fds = [0i32; 2];
+    if pipe2(fds.as_mut_ptr(), O_NONBLOCK) != 0 { return report(name, false, 0); }
+    let (rfd, wfd) = (fds[0], fds[1]);
+    let filled = fill_pipe(wfd);
+    let mut pfd = pollfd { fd: wfd, events: POLLOUT, revents: 0 };
+    let now0 = poll(&mut pfd, 1, 0);
+    STIM_FD = rfd;
+    WROTE_AT = -1;
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(), drain_one_chunk, core::ptr::null_mut()) != 0 {
+        return report(name, false, 0);
+    }
+    let t0 = now_ms();
+    pfd.revents = 0;
+    let n = poll(&mut pfd, 1, WINDOW_MS);
+    let el = now_ms() - t0;
+    pthread_join(th, core::ptr::null_mut());
+    close(rfd); close(wfd);
+    let ok = filled > 0 && now0 == 0 && n == 1 && pfd.revents & POLLOUT != 0 && el < PROMPT_MS;
+    report_x(name, ok, el, n, WROTE_AT)
+}
+
+/// PIPE_BUF atomicity on a non-blocking pipe with 100 bytes free: a 4096-byte
+/// write is refused whole (EAGAIN), an 8192-byte one is written partially
+/// (100), and then 50 bytes find no room.
+unsafe fn test_pipe_buf_atomic() -> bool {
+    let name = b"pipe_buf_atomic";
+    let mut fds = [0i32; 2];
+    if pipe2(fds.as_mut_ptr(), O_NONBLOCK) != 0 { return report(name, false, 0); }
+    let (rfd, wfd) = (fds[0], fds[1]);
+    let filled = fill_pipe(wfd);
+    let mut buf = [0u8; 100];
+    let got = read(rfd, buf.as_mut_ptr(), buf.len());
+    let w1 = write(wfd, XFER_BUF.as_ptr(), 4096);
+    let w2 = write(wfd, XFER_BUF.as_ptr(), 8192);
+    let w3 = write(wfd, XFER_BUF.as_ptr(), 50);
+    close(rfd); close(wfd);
+    let ok = filled > 0 && got == 100 && w1 < 0 && w2 == 100 && w3 < 0;
+    report_x(name, ok, filled as i64, w1 as i32, w2 as i64)
+}
+
+extern "C" fn close_stim_fd(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        writer_delay();
+        close(STIM_FD);
+        WROTE_AT = now_ms();
+    }
+    core::ptr::null_mut()
+}
+
+/// A blocking read() parked on an empty pipe returns 0 promptly when the
+/// (only) write end is closed by another thread.
+unsafe fn test_pipe_close_wakes_reader() -> bool {
+    let name = b"pipe_close_wakes_reader";
+    let mut fds = [0i32; 2];
+    if pipe2(fds.as_mut_ptr(), 0) != 0 { return report(name, false, 0); }
+    let (rfd, wfd) = (fds[0], fds[1]);
+    STIM_FD = wfd;
+    WROTE_AT = -1;
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(), close_stim_fd, core::ptr::null_mut()) != 0 {
+        return report(name, false, 0);
+    }
+    let t0 = now_ms();
+    let mut b = [0u8; 16];
+    let n = read(rfd, b.as_mut_ptr(), b.len());
+    let el = now_ms() - t0;
+    pthread_join(th, core::ptr::null_mut());
+    close(rfd);
+    report_x(name, n == 0 && el < PROMPT_MS, el, n as i32, WROTE_AT)
+}
+
+/// A blocking write() parked on a full pipe fails with EPIPE promptly when the
+/// read end is closed by another thread (SIGPIPE ignored for the check).
+unsafe fn test_pipe_close_wakes_writer() -> bool {
+    let name = b"pipe_close_wakes_writer";
+    signal(SIGPIPE, SIG_IGN);
+    let mut fds = [0i32; 2];
+    if pipe2(fds.as_mut_ptr(), 0) != 0 { return report(name, false, 0); }
+    let (rfd, wfd) = (fds[0], fds[1]);
+    // Fill exactly to capacity with blocking writes (each fits, none waits).
+    let cap = fcntl(wfd, F_GETPIPE_SZ, 0);
+    if cap <= 0 { return report(name, false, 0); }
+    let mut filled = 0usize;
+    while filled < cap as usize {
+        let want = (cap as usize - filled).min(PIPE_BUF);
+        let n = write(wfd, XFER_BUF.as_ptr(), want);
+        if n <= 0 { return report(name, false, filled as i64); }
+        filled += n as usize;
+    }
+    STIM_FD = rfd;
+    WROTE_AT = -1;
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(), close_stim_fd, core::ptr::null_mut()) != 0 {
+        return report(name, false, 0);
+    }
+    let t0 = now_ms();
+    let n = write(wfd, XFER_BUF.as_ptr(), 1); // full: parks until the reader closes
+    let el = now_ms() - t0;
+    pthread_join(th, core::ptr::null_mut());
+    close(wfd);
+    report_x(name, n < 0 && el < PROMPT_MS, el, n as i32, WROTE_AT)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn wake_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     puts(b"--- wakepolltest start ---\n\0".as_ptr());
@@ -860,10 +1081,16 @@ pub unsafe extern "C" fn wake_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     // accept4(SOCK_NONBLOCK) flag plumbing — the W1 wedge regression guard.
     if !test_accept4_nonblock_eagain() { failures += 1; }
     if !test_accept_noflags_blocking() { failures += 1; }
+    // Blocking pipe writer/reader park (not spin), PIPE_BUF, close wakes.
+    if !test_pipe_writer_blocks() { failures += 1; }
+    if !test_pipe_pollout_full() { failures += 1; }
+    if !test_pipe_buf_atomic() { failures += 1; }
+    if !test_pipe_close_wakes_reader() { failures += 1; }
+    if !test_pipe_close_wakes_writer() { failures += 1; }
 
     // SUMMARY pass=<P> fail=<F>  (P is informational; the exit code is the
     // failure count — 0 means every wake path is clean.)
-    let total: i32 = 30 + 8 + 2;
+    let total: i32 = 30 + 8 + 2 + 5;
     let mut line = [0u8; 48];
     let mut p = 0;
     macro_rules! put { ($s:expr) => { for &b in $s { line[p] = b; p += 1; } } }

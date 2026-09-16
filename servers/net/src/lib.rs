@@ -781,6 +781,25 @@ fn inet_remote_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
     }
 }
 
+/// The targeted-wake tag a blocking send/recv on `fd` may park under (see
+/// `sched::poll_tag`), or `None` for a socket whose producers still broadcast
+/// (inet: the daemon's `wake_poll`) — the caller then parks on the broadcast
+/// mask with a tick deadline. Unix connections are `Some`: every ring write,
+/// half/whole close and death on a connection wakes `poll_tag(UNIX, conn_idx)`,
+/// the same tag `handle_poll` reports for it. `pid` may be any thread's.
+pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<u64> {
+    let pid = sched::tgid_of(pid);
+    let slot = fd_to_slot(fd)?;
+    let tbls = SOCK_TABLES.lock();
+    let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return None; }
+    match tbl.socks[slot].state {
+        SockState::UnixConnected { conn_idx, .. } | SockState::UnixPendingAccept { conn_idx, .. } =>
+            Some(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)),
+        _ => None,
+    }
+}
+
 /// `(state, sock_type, bound_port)` of one fd, read under SOCK_TABLES and with
 /// the lock released before the caller touches any stack.
 fn inet_sock_info(pid: u32, fd: usize) -> Option<(SockState, u8, u16)> {

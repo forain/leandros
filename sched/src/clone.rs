@@ -637,17 +637,22 @@ pub fn clone_thread(
         // frame — so letting the parent run early means both sides corrupt
         // each other's stack. No EINTR here: vfork isn't restartable.
         if flags & CLONE_VFORK != 0 {
-            loop {
-                let pending = {
-                    let rq = super::RUN_QUEUE.lock();
-                    match rq.find_pid(child_pid) {
-                        Some(t) => t.vfork_pending,
-                        None    => false, // already reaped — definitely done
-                    }
-                };
-                if !pending { break; }
-                super::irq_window();
-                super::yield_now("vfork_wait");
+            // Park until the child execs or exits (`vfork_complete` / the exit
+            // paths wake VFORK_WAIT_CHANNEL). Three-phase so a release that
+            // lands between the check and the park is not lost. Signals do not
+            // interrupt this wait — Linux holds them too while the child borrows
+            // the address space.
+            let pending = |child_pid| {
+                let rq = super::RUN_QUEUE.lock();
+                match rq.find_pid(child_pid) {
+                    Some(t) => t.vfork_pending,
+                    None    => false, // already reaped — definitely done
+                }
+            };
+            while pending(child_pid) {
+                super::block_on_port_prepare(super::VFORK_WAIT_CHANNEL);
+                if !pending(child_pid) { super::block_on_port_cancel(); break; }
+                super::block_on_port_commit();
             }
         }
 
