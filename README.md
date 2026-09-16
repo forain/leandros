@@ -6,7 +6,7 @@ Leandros follows the classic microkernel design: the kernel itself provides only
 
 On top of that microkernel core sits a **Linux-compatible syscall personality**: the dispatcher implements the real Linux syscall numbers, so unmodified `*-unknown-linux-musl` binaries — a shell, coreutils, Mesa, a Wayland compositor — run without a source patch or a shim ABI.
 
-**Current state** — Leandros boots to a **graphical login** on both architectures. Upstream `kennylevinsen/greetd` drives **`cosmic-greeter`**, which runs unprivileged (uid 990), authenticates against `/etc/shadow`, and hands off to a full **COSMIC desktop**: `cosmic-session` → `cosmic-comp` on KMS/softpipe → `busd` (D-Bus) → `cosmic-bg` + `cosmic-panel`, with a wallpaper, a full-width panel bar, and eight applet processes across the Panel and Dock spaces. COSMIC itself is unmodified. Vulkan reaches real host GPU hardware through Mesa's **Venus** ICD over virtio-gpu, and a Vulkan client presents into the compositor — photographed on both architectures.
+**Current state** — Leandros boots to a **graphical login** on both architectures by default. `greetd` + `cosmic-greeter` runs unprivileged (uid 990), authenticates against `/etc/shadow` (`root`/`root` or `leandro`/`leandro`), and hands off to a full **COSMIC desktop**: `cosmic-session` → `cosmic-comp` → `busd` (D-Bus) → `cosmic-bg` + `cosmic-panel`, with a wallpaper, a full-width panel bar, a real terminal emulator (`cosmic-term` on a kernel PTY), and eight applet processes across the Panel and Dock spaces. COSMIC is **unmodified — zero permanent source patches**. The default desktop composites on **softpipe**; an opt-in `--venus` mode instead runs it on **Zink** (OpenGL-on-Vulkan) through Mesa's Venus ICD over virtio-gpu, reaching a real host GPU at ~20 fps, with a Vulkan client able to present into the compositor directly — photographed on both architectures.
 
 ---
 
@@ -218,28 +218,50 @@ The runner also handles the host environment for you:
 
 ### Logging in
 
-Boot lands on a text login prompt served by a getty loop in PID-1. Two accounts are provisioned in `/etc/shadow` (SHA-256 crypt):
+**The default is a graphical login.** PID-1 (`userland/init`) supervises two logins side by side: `greetd` driving `cosmic-comp` in kiosk mode with `cosmic-greeter` as its child on the display, and a serial `login:` getty loop on `ttyS0` (both respawned whenever they exit). A correct password at the greeter starts the COSMIC session; a wrong one leaves the greeter up. Two accounts are provisioned in `/etc/shadow` (SHA-256 crypt), usable from either login:
 
 | User | Password |
 |---|---|
 | `root` | `root` |
 | `leandro` | `leandro` |
 
-Non-root sessions are fully supported, including a COSMIC desktop session with per-uid `/run/user/<uid>` runtime directories.
+Touch `/etc/leandros/text-login` to opt out and boot to the serial prompt only — init checks for that marker before forking the greetd chain. The `vfs` server seeds `/run/user/0` at boot so the greeter and root sessions have a runtime dir from the first syscall; a login session gets its own per-uid `/run/user/<uid>` created the same way. Non-root sessions are fully supported, including a full COSMIC desktop session as `leandro`.
 
-#### Graphical login
-
-`sh /bin/greeter-real` from that prompt starts **greetd**, which brings up `cosmic-comp` in kiosk mode with `cosmic-greeter` as its child; a correct password starts the COSMIC session, a wrong one leaves the greeter up. `sh /bin/greeter-fake` runs the same greeter against upstream's `fakegreet` protocol harness, with no daemon, no PAM, and no session worker in the way — the smaller thing to reach for when the greeter itself is what's under test.
+`sh /bin/greeter-fake` runs the same greeter against upstream's `fakegreet` protocol harness, with no daemon, no PAM, and no session worker in the way — the smaller thing to reach for when the greeter itself is what's under test.
 
 Three constraints shape that arrangement, and all three are properties of this kernel rather than of greetd:
 
 - **The greeter's role comes from its account, not its filename.** `cosmic-greeter` runs `greeter::main()` only when `getpwuid(getuid())` names it `cosmic-greeter`, and `locker::main()` otherwise. `cosmic-greeter` is therefore a real system account (uid 990, below `UID_MIN` so it does not list itself on its own login screen), and `/bin/greeter-launch` exists to *become* it: it looks the account up by name, `setresgid`/`setresuid`s, **reads `getuid()` back**, and `execve`s the greeter. A launcher that reports a drop it did not perform produces a login screen indistinguishable from a correct one.
-- **`vt = "none"` is the only workable terminal mode.** There is no VT layer here at all, and every other value opens `/dev/tty0` during startup, so greetd exits before it binds its socket.
+- **`vt = "none"` is the only workable terminal mode for greetd itself.** Six virtual terminals exist and Ctrl+Alt+Fn switches between them (see *Boot flow*), but greetd's own VT-open-on-startup path is not what drives them here, and every other `vt` value makes greetd open `/dev/tty0` during startup and exit before it binds its socket.
 - **greetd's control socket cannot live in `/run`.** `/run` is ordinary f2fs, and f2fs has no `S_IFSOCK`, so upstream's hardcoded path fails to bind with `EOPNOTSUPP`. `GREETD_SOCK_DIR` points it at the runtime dir instead; the socket-capable mounts are `/tmp`, `/dev/shm`, and `/run/user`.
 
 There is no PAM stack in the system, so `ports/greetd/pam-leandros` supplies the libpam application ABI `pam-sys` binds to, backed by the same `$sha256$` `/etc/shadow` scheme `/bin/login` validates. Its `pam_putenv`/`pam_getenvlist` do real work, because greetd builds a session's entire environment out of that table and inherits nothing of its own — which is why the COSMIC render environment reaches the session through `/etc/profile` and `source_profile = true`.
 
 `cosmic-comp` itself still runs as root: `libseat` is a shim with no seatd behind it, and the `/dev/dri` and `/dev/input` node modes are unverified. Only the greeter client is unprivileged.
+
+### Development workflow
+
+Day-to-day development runs across three machines, each with a different job:
+
+| Machine | Accelerators | Role |
+|---|---|---|
+| A Mac (Apple Silicon) | aarch64/HVF, x86-64/TCG | Primary dev box; every change is built and tested on both arches here |
+| A Linux desktop | x86-64/KVM, host GPU | The only machine that can run `--venus` for real (a real GPU behind Venus/Zink/virgl) |
+| A Linux laptop | x86-64/KVM | Build-only until QEMU is installed there; code + build lanes |
+
+`.claude/skills/run-leandros/driver.py` is the scriptable path into QEMU (headless, over Unix sockets for the serial console and the QEMU monitor); `run-qemu.sh` is the interactive one. A few environment variables make multiple driven instances and diagnostics work together:
+
+- **`LEANDROS_RUN_ID`** — scopes every socket, log, and image path the driver owns to a name, so several QEMUs (e.g. parallel work lanes) can run on the same machine without colliding.
+- **`LEANDROS_VNC_PORT`** — which `-vnc` listener a `--venus` capture connects to, for machines running more than one Venus session.
+- **`scripts/zinkbench.py`** — drives a `--venus` desktop census end-to-end (boot, settle, capture) and reports fps/flip counters; the tool behind the Zink performance numbers above.
+- **`.claude/skills/run-leandros/clockdrift.py <secs> <label>`** — measures the guest clock against host wall time; prints `guest=… host=… ratio=… err=…` (expect |err| < 0.5% idle post-2026-09-16).
+- **`.claude/skills/run-leandros/liveness-run.py <label> "<cmd>"`** — runs one guest command with a persistent serial reader, a userspace heartbeat, and (only on a stall) a host-side sample of the QEMU process, instead of polling the QEMU monitor.
+
+**Never poll the HMP monitor (`x` / `info registers`) as a liveness probe under HVF** — on this QEMU/macOS combination it can hang QEMU's main loop for good (roughly 1 in a few hundred calls, even against an idle guest), which then looks exactly like the guest wedge it was meant to diagnose. Use the guest-side signals instead: the `[WDOG]`/`[TIMER]` kernel lines, a userspace heartbeat, or `liveness-run.py`.
+
+`drmsmoke`'s KMS ioctl cases (`ATOMIC_COMMIT`, `SETCRTC`, page-flip, etc.) need exclusive DRM master and are **expected to SKIP** with a one-line diagnosis whenever the greetd compositor is running and already holds it — stop the compositor first (`touch /etc/leandros/text-login`; `kill $(cat /run/greetd-init.pid)`) to exercise them.
+
+Lane development worktrees must be **siblings of the repo root** (`../leandros-lane-foo`, not nested inside it) — some tooling resolves sibling paths (e.g. `../brush`) relative to the repo root, and a nested worktree breaks that resolution.
 
 ---
 
@@ -277,7 +299,7 @@ sudo ./scripts/deploy-rpi5.sh \
 
 ### Memory management (`mm`)
 
-- **Buddy allocator** — power-of-two physical page allocator (up to 4 MiB contiguous blocks, order 0–10). Initialised from the boot memory map; firmware-reserved regions (from the FDT `/memreserve/` block) are excluded automatically.
+- **Buddy allocator** — power-of-two physical page allocator (up to 4 MiB contiguous blocks, order 0–10). Initialised from the boot memory map; firmware-reserved regions (from the FDT `/memreserve/` block) are excluded automatically. `free()` coalescing is **O(1)** via a per-page free-block-head bitmap (512 KiB, 16 GiB of coverage), not a per-order list walk, and every `free()` runs a release-time sanity check that refuses and reports a bad/double free rather than corrupting the allocator silently — closed a real fork double-free of a child's page-table root on rollback paths.
 - **Slab allocator** — fixed-size object caches (8 B – 4 KiB, powers of two) backed by the buddy allocator. Requests larger than one page fall through to the buddy allocator directly.
 - **VMM** — per-process `AddressSpace` holding a list of `VmaRegion` descriptors. Supports eager (`map`) and demand-paged (`map_lazy`) mappings. Lazy VMAs fault in individual 4 KiB pages on access; W^X is enforced at the syscall boundary.
 - **Kernel device mapping** — `map_kernel_device` provides identity mappings for MMIO regions (framebuffer, VirtIO BARs, etc.) with device-memory attributes, and exposes the page-table root for DRM mmap.
@@ -291,10 +313,15 @@ sudo ./scripts/deploy-rpi5.sh \
 - Tasks block on IPC ports (`block_on(port)`) and are unblocked by `send` or port close.
 - SMP: up to 8 CPUs. BSP runs `sched::run()`; APs are started via PSCI `CPU_ON` (AArch64) and SIPI (x86-64), then enter `sched::ap_entry()`. Idle-CPU selection is SMT-aware on x86-64 (hyperthread topology from CPUID leaf 0xB).
 - `wait_pid` uses an exit-log side-table to avoid the race where the scheduler reaps a zombie before the waiter resumes.
-- **Threads** — `clone` with `CLONE_VM` spawns a true OS thread sharing the caller's address space; `futex` (`FUTEX_WAIT`/`FUTEX_WAIT_BITSET`/`FUTEX_WAKE`) is the only other thread primitive in the kernel. Timed futex waiters are woken by a cross-thread `FUTEX_WAKE`, not left to time out.
+- **Threads** — `clone` with `CLONE_VM` spawns a true OS thread sharing the caller's address space; `futex` (`FUTEX_WAIT`/`FUTEX_WAIT_BITSET`/`FUTEX_WAKE`) is the only other thread primitive in the kernel. `FUTEX_WAIT_BITSET`'s timespec is honoured as the absolute `CLOCK_MONOTONIC` deadline it is (it used to be read as a relative interval, so every Rust std timed wait lasted uptime-plus-timeout). Timed futex waiters are woken by a cross-thread `FUTEX_WAKE`, not left to time out. `clone(CLONE_PARENT_SETTID)` is honoured, which musl needs to give every thread a non-zero tid.
+- **`kill -9` of a multi-threaded process** terminates the whole group cleanly even while its siblings run on other CPUs: a single owner runs group-exit teardown (fd/socket/VT cleanup) exactly once regardless of which CPU the fatal signal lands on, and the address-space `Arc` is no longer reaped out from under a sibling still executing on another core.
+- **A real `Stopped` task state** — `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` stop the whole thread group, `SIGCONT` resumes it, and `waitpid(WUNTRACED)`/`waitpid(WCONTINUED)` observe the transitions, matching POSIX job control.
+- **Per-CPU tick watchdog** — every CPU counts its own timer ticks; a CPU silent for ~2 s is reported by a live one on the raw UART (`[WDOG] cpuN took no timer tick …: pid=P last syscall 0x.. [spinning for LOCK held by cpuM]`) and kicked with a reschedule IPI. A dead virtual-timer edge self-heals and logs `[TIMER] cpuN virtual timer silent … re-armed`.
+- **Ctrl-T (0x14 on the serial console)** dumps every task's state/CPU/blocked port or futex word, its last EL0 frame, a buddy allocator census, and the full AF_UNIX socket/connection tables — the primary wedge-diagnosis tool alongside the watchdog lines.
 - **A global poll wait-channel with a deadline tick** lets blocking waiters sleep instead of spinning; servers publish readiness edges onto it.
 - User stacks are 8 MB, matching the Linux default.
 - **Auxv-based service discovery** — the kernel stamps server port numbers into the auxiliary vector at task creation. Userspace reads port IDs for audio, DRM, VFS, and other services from `AT_*` entries without a name-service round-trip.
+- **Monotonic clock** — `monotonic_ns()` reads the free-running hardware counter directly (CNTVCT on AArch64, TSC on x86-64) rather than accumulating tick periods, and the periodic tick itself stays on an absolute grid with catch-up rather than reloading from "now". Measured drift ±0.3% idle, down from 5–36% depending on accelerator before the fix.
 
 ### IPC (`ipc`)
 
@@ -337,10 +364,12 @@ Beyond the syscall surface, the kernel also stamps server port IDs into the ELF 
 Full POSIX-style signal delivery is implemented on **both** architectures:
 
 - **Delivery path** — `check_and_deliver_signals()` runs on every return to userspace from a syscall, IRQ, or fault, on both AArch64 (`exception_asm.s`, EL0 paths only — the EL1 IRQ path deliberately skips it, since that path returns to interrupted kernel code) and x86-64 (`syscall_entry` return path in `arch/x86_64/src/syscall.rs`).
+- **User-mode faults reach handlers.** Every user-committable fault vector (SIGSEGV/SIGBUS/SIGILL/SIGFPE) delivers to a registered handler with real `_sigfault` siginfo (`si_addr`, `MAPERR`/`ACCERR`) instead of only killing the task; x86-64 routes every such vector through a full `UserFrame` path.
+- **Inheritance** — `fork()` and `pthread_create()` both inherit the caller's `signal_mask`; a new *process* also inherits the leader's dispositions (`SIG_IGN` survives `fork`, per POSIX).
 - **Signal frames** — real `rt_sigframe`s on both architectures; the x86-64 frame matches the SysV `ucontext`/`mcontext` layout expected by relibc's Linux-ABI `__restore_rt` trampoline.
 - **`sigaltstack`** — real per-thread alt-stack state (`Task::altstack_sp/size/flags`). `SA_ONSTACK` redirects signal delivery onto the configured alt-stack; `SS_ONSTACK`/`EPERM`-while-active are derived from the live user stack pointer at syscall time rather than tracked separately, matching Linux's `get_sigframe()`/`do_sigaltstack()` semantics.
 - **Hardening** — `rt_sigreturn` masks the restored `spsr_el1`/`rflags` value to just the condition-code bits before applying it, so a forged signal-stack frame can't be used to request a privilege escalation (e.g. an EL0→EL1 mode-bit forgery on AArch64) via `sigreturn`.
-- **Testing** — `userland/sigtest` covers a `sigaction()` struct field-order round trip, real delivery-and-return through the sigreturn trampoline, per-signal handler dispatch, `sigprocmask`/`sigpending` blocking and deferred delivery, `SIG_IGN`, and `raise()` (which resolves to a `TKILL` syscall against the caller's own tid, distinct from the `KILL`/`TGKILL` paths the other checks exercise).
+- **Testing** — `userland/sigtest` covers a `sigaction()` struct field-order round trip, real delivery-and-return through the sigreturn trampoline, per-signal handler dispatch, `sigprocmask`/`sigpending` blocking and deferred delivery, `SIG_IGN`, and `raise()` (which resolves to a `TKILL` syscall against the caller's own tid, distinct from the `KILL`/`TGKILL` paths the other checks exercise). `userland/sigtest2` adds mask/disposition inheritance across `fork`/`pthread_create`, fault-handler `siginfo` delivery (including `siglongjmp` out of a handler), default-action kills while blocked/inside a handler, and stop/continue/kill-while-stopped.
 
 ### POSIX timers
 
@@ -350,6 +379,8 @@ Full POSIX-style signal delivery is implemented on **both** architectures:
 - **Overrun accounting** — a timer descheduled across more than one period has its deadline caught up in a single step; the number of skipped periods accumulates in a per-timer counter read (and reset) by `timer_getoverrun()`.
 - **`alarm()`/`setitimer(ITIMER_REAL)`** share one reserved, idempotently-rearmed table slot rather than allocating a fresh one per call, so repeated use can't exhaust the table.
 - User-pointer access from the in-kernel `tty` server goes through `AddressSpace::read_user_buf`/`write_user_buf`, not a raw pointer dereference, for the same reason `wait`/`waitid`/`flock` do — a supervisor-mode page fault on a not-yet-faulted CoW page has no recovery path.
+- **`timerfd_create`/`timerfd_settime`** honour `TFD_TIMER_ABSTIME`, arm on the monotonic clock, and never lose the expiry edge — a relative timerfd used to be able to fire early, and a tick whose `RUN_QUEUE.try_lock()` failed (which it does on more than half of ticks with a desktop compositor up) could drop a poll edge entirely.
+- **Timespec sources are still split two ways** — `nanosleep`, relative `FUTEX_WAIT`, and `poll`/`select`/`ppoll` timeouts compute deadlines from the 100 Hz tick counter rather than `monotonic_ns()` (so they can fire up to 10 ms early, and a sub-tick wait truncates to zero); `gettimeofday`/`time` are similarly tick-derived while `clock_gettime(CLOCK_REALTIME)` is not. Known, not yet unified.
 
 ### Poll / select / epoll
 
@@ -368,7 +399,7 @@ The process model is POSIX-shaped rather than task-shaped, which is what allows 
 
 - **Thread groups** — a process is a TGID with threads under it. A fatal signal or a fatal user fault terminates the **whole thread group**, not the one thread that took it; `execve` de-threads (terminates siblings) and resets caught signal dispositions, both per POSIX. Per-process tables are keyed by TGID, never by the raw pid of whichever thread happened to call.
 - **Login sessions** — real `setresuid`/`setresgid`, a `$sha256$`-hashed `/etc/shadow`, `/bin/login`, and a getty loop in PID-1. Sessions run as an unprivileged user with correct ownership throughout.
-- **Job control** — `servers/tty` implements the job-control ioctls and line-discipline signal generation (`SIGINT`/`SIGTSTP`/`SIGTTOU`), so shell job control behaves.
+- **Job control** — `servers/tty` implements the job-control ioctls and line-discipline signal generation (`SIGINT`/`SIGTSTP`/`SIGTTOU`); `sched` backs it with a real `Stopped` task state (see Scheduler above), so `^Z`/`fg`/`bg` behave like Linux. tty `^Z`/`VSUSP` wiring and the orphaned-process-group rule are further along in an unmerged branch (`lane/jobctl` — code and build only, runtime unverified; see `TODO.md`).
 - **`chroot(2)`** — real confinement: symlink resolution and fd-to-path resolution are both confined to the jail rather than escaping through the mount table.
 - **Priorities** — `setpriority`/`getpriority` back `nice(1)`.
 - **Process state** — `/proc` via `servers/proc`, including `/proc/<pid>/exe` for any pid, not just the `self` alias. It resolves inside `readlink(2)` only — nothing `open`s or `execve`s that path, which is why greetd's session worker has to call `std::env::current_exe()` before it forks rather than handing the magic path to `execv`.
@@ -439,11 +470,12 @@ Firmware → _start (MMU off, x0 = DTB physical address)
 ```
 init (PID 1) → start servers (vfs, f2fs, net, tty, drm, evdev, pipewire, proc)
              → mount / and /data from virtio-blk
-             → getty loop → /bin/login → authenticate against /etc/shadow
-             → setresuid/setresgid → brush
-             → (optionally) start-cosmic → cosmic-session → COSMIC desktop
-             → or greeter-real → greetd → cosmic-comp (kiosk) → greeter-launch
-                                        → cosmic-greeter → cosmic-session
+             → fork the graphical login (default; skipped if /etc/leandros/text-login exists):
+                 greetd → cosmic-comp (kiosk) → greeter-launch
+                        → cosmic-greeter → authenticates → cosmic-session → COSMIC desktop
+             → fork the serial getty loop (always): /bin/login → authenticate against /etc/shadow
+                        → setresuid/setresgid → brush → (optionally) start-cosmic manually
+             → both chains supervised and respawned independently for the life of the system
 ```
 
 **Boot protocol invariant** — the minimum Limine revision is **6**. Do not lower it.
@@ -546,6 +578,18 @@ Both are photographed on **both** architectures, against pass criteria committed
 
 One recorded requirement did not survive contact with the guest. `MESA_VK_WSI_DEBUG=sw,noshm` was measured correctly on the RADV *host* and written down as though it held generally; inside the guest, Venus reports `VK_EXT_external_memory_host = no`, so Mesa already selects the memcpy path and plain `sw` is right. A host control is a client sanity check, never a guest prediction.
 
+### COSMIC on Vulkan — Zink (opt-in)
+
+`--venus` doesn't just expose Vulkan to test binaries — it can run the **entire COSMIC compositor on it**. smithay has no Vulkan renderer of its own (its `backend_vulkan` is only an X11 allocator), so cosmic-comp instead runs its existing GLES renderer through **Zink** (OpenGL-on-Vulkan), which turns every draw into Venus → host GPU work. Enumerated over `kmscube`: `zink Vulkan 1.4(Virtio-GPU Venus (…RADV…))`, GLES 3.2, 99.96 fps for that trivial workload; the full desktop composites at **~20 fps** (softpipe: ~2.3 fps for comparison). The default desktop stays on softpipe — Zink is opt-in because no host GPU is required for softpipe and the Mac has no EGL at all, so neither Zink nor virgl can run there.
+
+Getting real frames out of it took three kernel-side fixes, none of them in the GPU driver itself: `CLONE_PARENT_SETTID` being ignored deadlocked musl's thread-list lock on the first `fork()` from a compositor thread (the same root cause behind system keybindings never firing, since the bound action's `fork()` is exactly this path); `PRIME_FD_TO_HANDLE` echoed the *exporter's* handle instead of minting the importer one, since blob handles are scoped per open file description; and there was no scanout path for host-memory buffers at all — `ADDFB2` only resolved handles through the dumb-buffer registry, so a real 3D resource ended up scanning out guest address 0. Fixed with `DRM_IOCTL_MODE_ADDFB2` accepting host-memory (blob) handles through `SET_SCANOUT_BLOB` + `RESOURCE_FLUSH`, on a strict `ADDFB` path. An earlier "0.65 fps" measurement of this same desktop was real but answered the wrong question: it was measuring 52 real page-flips over 80 seconds while the desktop was actually managing to composite *zero* frames end-to-end; the flips were geometry probes, not presents.
+
+**The virtio-gpu control queue no longer costs a busy-spinning vCPU for most traffic.** Presents, transfers, `SUBMIT_3D`, and context attach/detach go through async submission — the vCPU pays only the enqueue cost, and completions are reaped from the used ring by descriptor chain head (safe against the host answering out of order) on the next submit, a 100 Hz tick, and — the first device interrupt in the system — an **MSI-X ISR on x86_64** (`virtio_gpu_msix_isr`). Measured on the Zink desktop: control-queue time **42% → 0.03%** of wall clock, 19.3 → 20.1 fps. aarch64 stays poller-only (no MSI-X path there yet; GIC SPI INTx is the natural next step) and reply-needing commands (`GET_CAPSET`, `RESOURCE_CREATE_*`, `MAP_BLOB`, `CTX_CREATE`) still spin briefly while they hold the device lock — about 0.5% of ctrlq traffic. `EXECBUFFER` fences (`FENCE_FD_OUT`) signal on real host completion instead of a synthesize-at-submit shortcut.
+
+**`virtio-vga-gl`** (VGA registers for OVMF/Limine's GOP *and* Venus/virgl) is what `--venus` uses so the whole session lives on one display console — `virtio-gpu-gl-pci` has no VGA interface, so pairing it with a separate std-VGA device for firmware boot used to leave two display consoles, with the window/VNC/`screendump` all showing the wrong one (the text console, not the GPU one). One console, one device, `venus=on`/`blob=on`/`hostmem=` all still work exactly as before.
+
+**`virtio-vga-gl` also gives a second, non-Venus opt-in path: virgl.** `run-qemu.sh --virgl` selects it with Mesa's `virgl` gallium driver instead of Zink — guest OpenGL reaches the host GPU through virglrenderer rather than Vulkan (`kmscube` reports a real `radeonsi`/etc. renderer string). It is opt-in and, as measured, not yet a win: real host-GPU acceleration moved the bottleneck into the kernel rather than reducing total busy time, so softpipe remains the default even when a host GPU is available.
+
 ---
 
 ## Audio stack
@@ -617,16 +661,17 @@ greetd
                                                   ↓ authenticates
 cosmic-session
   ├─ busd                D-Bus broker (pure Rust, from the zbus authors)
-  ├─ cosmic-comp         Wayland compositor, on KMS via Mesa softpipe
+  ├─ cosmic-comp         Wayland compositor (softpipe default, Zink under --venus)
   ├─ cosmic-bg           wallpaper
-  └─ cosmic-panel        panel bar + Dock, 8 applet processes over 5 real applets
+  ├─ cosmic-panel        panel bar + Dock, 8 applet processes over 5 real applets
+  └─ cosmic-term         terminal emulator, on a kernel PTY
 ```
 
-**"Unmodified" is one patch short of true, and the shortfall is worth stating.** The project rule is that temporary debug edits to COSMIC are fine and permanent ones are not — every permanent fix belongs on the LeandrOS side. Two permanent patches once existed. The greeter's is gone. The session's (`ports/cosmic-session/0001-env_rx-timeout-fallback.patch`) is still applied to the staged build even though the kernel bug behind it — `shutdown(2)` ignoring `how` — is fixed; retiring it needs a clean musl rebuild and a re-staged image, and shipping a reverted tree with a patched binary still in the image would be worse than either. Measured payoff of the kernel fix: the component cascade starts 5.022 s after `Starting cosmic-session` on the defective kernel (the 5 s `env_rx` timeout expiring, to within 22 ms) and 2.186 s with it fixed.
+**Zero permanent COSMIC source patches remain.** The project rule is that temporary debug edits to COSMIC are fine and permanent ones are not — every permanent fix belongs on the LeandrOS side. Two permanent patches once existed; both are now retired. The greeter's went first. The session's (`ports/cosmic-session/0001-env_rx-timeout-fallback.patch`) worked around the kernel's `shutdown(2)` ignoring `how`, which is now fixed, so the patch was deleted, the vendored source restored byte-identical to upstream, and `SetEnv` re-verified arriving on every boot. Measured payoff of the underlying kernel fix: the component cascade used to start 5.022 s after `Starting cosmic-session` (the 5 s `env_rx` timeout expiring, to within 22 ms) and now starts at 2.186 s.
 
-The applet set is the other thing that recently became real: five applets ship (`CosmicPanel{Launcher,App,Workspaces}Button`, `CosmicAppletTiling`, `CosmicAppletMinimize`) plus the stub clock, and eight processes run — because `entries` is `["Panel", "Dock"]`, the two spaces resolve their plugin lists independently, and two applets appear in both. A name is not a process, and reasoning about "how many applets" as a count is what made an earlier descriptor-exhaustion diagnosis wrong.
+The applet set is the other thing that recently became real: five applets ship (`CosmicPanel{Launcher,App,Workspaces}Button`, `CosmicAppletTiling`, `CosmicAppletMinimize`) plus the stub clock, and eight processes run — because `entries` is `["Panel", "Dock"]`, the two spaces resolve their plugin lists independently, and two applets appear in both. A name is not a process, and reasoning about "how many applets" as a count is what made an earlier descriptor-exhaustion diagnosis wrong. `pop-launcher` (v1.2.7, unmodified) is built and staged too, with the `desktop_entries` and `cosmic_toplevel` plugins, so `cosmic-launcher`/`Super` has a working backend behind it rather than a bare-name `PATH` lookup that resolved to nothing.
 
-**Committed architecture.** COSMIC is built for `*-unknown-linux-musl` and **dynamically linked** against a real `ld-musl` — `dlopen` sits on the critical path in three separate places (cosmic-comp's EGL loading, Mesa's GBM/DRI loader, cosmic-panel's `use_system_lib`), so static linking was never an option. Graphics go through Mesa **softpipe** via gallium `kms_swrast` over dumb buffers, on the atomic KMS path. The session launches from a login shell: login → `start-cosmic` under `brush`.
+**Committed architecture.** COSMIC is built for `*-unknown-linux-musl` and **dynamically linked** against a real `ld-musl` — `dlopen` sits on the critical path in three separate places (cosmic-comp's EGL loading, Mesa's GBM/DRI loader, cosmic-panel's `use_system_lib`), so static linking was never an option. Graphics go through Mesa **softpipe** via gallium `kms_swrast` over dumb buffers on the atomic KMS path by default; `--venus` instead runs the same compositor through Zink onto a real host GPU (see *GPU acceleration* above). The session launches from a login shell: login → `start-cosmic` under `brush`, or automatically through the graphical login (see *Logging in*).
 
 Supporting this required the ELF loader to grow real dynamic-linking support — `ET_DYN` loaded at a bias, `PT_INTERP` honoured — plus VMA splitting at range boundaries for `munmap`/`mprotect`, an 8 MB user stack matching the Linux default, and shared tmpfs/memfd pages for `wl_shm` pools.
 
@@ -636,10 +681,10 @@ Most of the kernel work in this area was not "add a feature" but "match Linux ex
 
 ### What the desktop still cannot do
 
-- **No terminal emulator.** `servers/tty` advertises "termios line discipline and PTY pairs" in its header and has a `PTS_PAIRS` table, but that half is entirely unreachable — the kernel only ever sends `TTY_IOCTL`. `cosmic-term` is a multi-week kernel feature wearing a build task's clothes.
 - **No D-Bus activation.** `busd` deliberately omits `<servicedir>`, so nothing starts on demand: no portal, and therefore no screenshot, no file chooser.
-- **No VT switching, no PAM stack, no utmpx.** All three were once out of scope and are now in it, because the greeter routes around all three rather than needing none of them.
-- **The privilege boundary is thinner than it looks.** The greeter reaches the compositor's `wayland-1` under a `0700` root-owned `/run/user/0`, and greetd's root-owned control socket, because path resolution applies no search-permission test to any component and AF_UNIX `connect` discards the caller identity outright. That is a recorded gap, not a design.
+- **VT switching lands; device arbitration does not.** Six virtual terminals work and a switch is photographed, but DRM master handoff and `/dev/input/*` reopen on switch are still absent — a background VT can still read live keyboard/pointer events. No PAM stack, no utmpx.
+- **The privilege boundary is thinner than it looks.** The greeter reaches the compositor's `wayland-1` under a `0700` root-owned `/run/user/0`, and greetd's root-owned control socket, because path resolution applies no search-permission test to any component and AF_UNIX `connect` discards the caller identity outright. `cosmic-comp` itself still runs as root: `libseat` is a shim with no seatd behind it. That is a recorded gap, not a design. (`lane/perms` adds enforcement here; not yet merged — see `TODO.md`.)
+- **A compositor death leaks kernel memory** — roughly 140 MB per `cosmic-comp` respawn; a fast respawn storm can exhaust the buddy allocator. Not yet fixed.
 
 ### Ports
 
@@ -772,20 +817,24 @@ A ported **coreutils** provides the usual file and text utilities.
 
 | Suite | Coverage |
 |---|---|
-| `memtest` | fork/CoW isolation, `mremap`, buddy allocator churn, `MAP_SHARED` |
+| `memtest` | fork/CoW isolation, `mremap`, buddy allocator churn, `MAP_SHARED`, `fill_ram_no_leak` (allocate/verify/free at guest-RAM scale) |
 | `vfstest` | `rmdir`, cross-mount `rename` (incl. POSIX replace), `flock`/`fcntl` locking, permissions, xattrs |
 | `f2fstest` | Direct/indirect/double-indirect block pointers, directories |
 | `pthreadtest` | `pthread_create`/`join`, mutex, condvar, TSD, cleanup handlers |
-| `timertest` | POSIX timers, `alarm`/`setitimer`, real `SIGALRM` delivery |
+| `timertest` | POSIX timers, `alarm`/`setitimer`, real `SIGALRM` delivery, timerfd `TFD_TIMER_ABSTIME`, sub-tick `clock_gettime`/`timerfd` intervals |
 | `sigtest` | `sigaction` struct layout, signal delivery/return, `sigprocmask`/`sigpending`, `SIG_IGN`, `raise()` |
+| `sigtest2` | mask/disposition inheritance across `fork`/`pthread_create`, fault-handler `siginfo` delivery, default-action kills, stop/continue/kill-while-stopped |
 | `polltest` | `poll`/`select`/`epoll` real fd readiness, `epoll_wait` timeout, pipe `POLLHUP` writer refcount across `dup` |
-| `epolltest` / `wakepolltest` | epoll edge cases; same-thread `EPOLLET`/level eventfd re-arm |
+| `epolltest` / `wakepolltest` | epoll edge cases; same-thread `EPOLLET`/level eventfd re-arm; pipe/AF_UNIX blocking-wake and `FUTEX_WAIT_BITSET` absolute/past-deadline cases |
 | `scmtest` | `SCM_RIGHTS` fd passing, shared mmap, memfd seals and collisions, AF_UNIX socket nodes, tmpfs mounts, `mincore`, fork+exec fd inheritance |
-| `forktest` / `waittest` / `sigchldtest` / `racetest` | Process lifecycle, `wait4`/`waitid`, `SIGCHLD`, concurrency races |
+| `forktest` / `waittest` / `sigchldtest` / `racetest` | Process lifecycle, `wait4`/`waitid`, `SIGCHLD`, concurrency races, process-group wait semantics |
+| `killmt` | `kill -9` of a multi-threaded process across several modes, including siblings spinning on other CPUs at the moment of the kill |
+| `spawnwedge` | The musl thread/fork lock-handoff regression (`CLONE_PARENT_SETTID`): repeated `fork`/`posix_spawn` from a multithreaded process under allocator pressure |
 | `idletest` | Verifies the system genuinely idles rather than busy-polling |
-| `drmsmoke` | Raw-ioctl DRM smoke test against `/dev/dri/card0`: drives a real atomic commit, guards the console/scanout handoff it must cause, classifies page-flip timestamps, and `--hold` paints a checkable frame and leaves it on the scanout for capture |
+| `drmsmoke` | Raw-ioctl DRM smoke test against `/dev/dri/card0`: drives a real atomic commit, guards the console/scanout handoff it must cause, classifies page-flip timestamps, and `--hold` paints a checkable frame and leaves it on the scanout for capture. KMS cases SKIP with a diagnosis (not a FAIL) when the compositor already holds DRM master |
 | `evtest2` | evdev virtio-tablet capability and poll test |
-| `venustest` | Venus/virtio-gpu 3D **transport** conformance, 108 subtests — a non-empty host-populated capset, per-open GEM ownership, and dmabuf/blob lifetime across `close`. "The ioctl returned 0" proves nothing when the risk is a silently wrong wire protocol, so the blob phase also carries a gate asserting its own assertions ran, which is what distinguishes "passed" from "silently skipped" |
+| `venustest` | Venus/virtio-gpu 3D **transport** conformance — a non-empty host-populated capset, per-open GEM ownership, and dmabuf/blob lifetime across `close`. Phase 5b covers PRIME import of a blob into another open fd; phase 7 covers `SET_SCANOUT_BLOB` scanout of a host-memory buffer, the fix behind the Zink desktop's real frames. "The ioctl returned 0" proves nothing when the risk is a silently wrong wire protocol, so the blob phase also carries a gate asserting its own assertions ran, which is what distinguishes "passed" from "silently skipped". Needs a blob-capable virtio-gpu (a `--venus` host); most phases report FAIL, not SKIP, on a host without one (e.g. the Mac) |
+| `permtest`, `jobtest`, `exectest` | Permission enforcement, job-control signals (`SIGTTIN`/`SIGTTOU`, orphaned-pgrp), and `#!`-script `execve` — all three are on unmerged branches (`lane/perms`, `lane/jobctl`); not yet part of a default build |
 
 `vktest` (a staged external binary, built from the Mesa port) is the end-to-end Vulkan check: it `dlopen`s the Venus ICD, enumerates physical devices, and creates a logical device on the real host GPU.
 
