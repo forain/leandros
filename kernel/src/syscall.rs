@@ -1470,23 +1470,12 @@ fn dispatch_inner(
         // ── Misc ──────────────────────────────────────────────────────────────
         UNAME      => sys_uname(a0),
         PRLIMIT64  => sys_prlimit64(a0, a1, a2, a3),
-        EXIT_GROUP => {
-            // Linux exit_group(2) kills every thread in the calling process,
-            // not just the caller. Do that for real before tearing down the
-            // shared address space (owned by the thread-group leader's
-            // Task) — otherwise a sibling still mid-flight on another CPU
-            // (e.g. a std::thread worker that outlives main()) faults into
-            // page tables that vanished under it. See sched::kill_next_group_member.
-            loop {
-                match sched::kill_next_group_member(a0 as i32) {
-                    sched::GroupKillStep::Done => break,
-                    sched::GroupKillStep::Reaped(pid) => vfs_close_all_for(pid),
-                    sched::GroupKillStep::Kicking => core::hint::spin_loop(),
-                }
-            }
-            vfs_close_all_current();
-            exit(a0 as i32)
-        }
+        // Linux exit_group(2) kills every thread in the calling process, not
+        // just the caller. `sched::exit_group` owns that sequence (single
+        // owner, siblings reaped before the address space can go, fd
+        // teardown through the registered hook); this used to be an inline
+        // copy of its loop, which did not take part in the owner protocol.
+        EXIT_GROUP => sched::exit_group(a0 as i32),
 
         // ── File advise / range operations (advisory — safe to no-op) ────────
         POSIX_FADVISE | SYNC_FILE_RANGE | READAHEAD => 0,

@@ -82,12 +82,13 @@ pub fn init() {
         IDT.0[18] = IdtEntry::new(exc_mc  as *const () as usize, 0x08, 0, 0x8E);
         IDT.0[19] = IdtEntry::new(fault_stub_19 as *const () as usize, 0x08, 0, 0x8E);
 
-        // Vector 32 = IRQ0 (8253/8254 timer after PIC remapping).
-        IDT.0[32] = IdtEntry::new(timer_irq as *const () as usize, 0x08, 0, 0x8E);
+        // Vector 32 = IRQ0 (8253/8254 timer after PIC remapping) and vector
+        // 0x40 = reschedule IPI: full-frame stubs, so a return to ring 3
+        // delivers pending signals (see `irq_common`).
+        IDT.0[32] = IdtEntry::new(irq_stub_32 as *const () as usize, 0x08, 0, 0x8E);
         // Vector 33 = IRQ1 (PS/2 keyboard).
         IDT.0[33] = IdtEntry::new(keyboard_irq as *const () as usize, 0x08, 0, 0x8E);
-        // Vector 0x40 = reschedule IPI (cross-CPU preemption kick).
-        IDT.0[0x40] = IdtEntry::new(resched_irq as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[0x40] = IdtEntry::new(irq_stub_64 as *const () as usize, 0x08, 0, 0x8E);
         // Vector 0xFD = TLB shootdown IPI (remote TLB invalidation).
         IDT.0[0xFD] = IdtEntry::new(tlb_shootdown_irq as *const () as usize, 0x08, 0, 0x8E);
 
@@ -400,7 +401,27 @@ extern "C" {
     fn fault_stub_5();  fn fault_stub_6();  fn fault_stub_7();  fn fault_stub_10();
     fn fault_stub_11(); fn fault_stub_12(); fn fault_stub_13(); fn fault_stub_14();
     fn fault_stub_16(); fn fault_stub_17(); fn fault_stub_19();
+    fn irq_stub_32();   fn irq_stub_64();
 }
+
+// ── IRQ entry stubs: full UserFrame + signal delivery on return to ring 3 ────
+//
+// The timer tick and the reschedule IPI used to be `extern "x86-interrupt"`
+// handlers, which see only the five words the CPU pushes and can therefore
+// never run `check_and_deliver_signals`. On this arch a signal was thus only
+// ever delivered on a syscall or fault return: a thread spinning in user
+// mode with no syscalls could not be killed at all — `kill -9` of such a
+// process left it running forever (killmt `spin_all`), and a SIGKILL on a
+// threaded process only reached the threads that happened to trap. AArch64
+// has always delivered on its IRQ return path (`exc_el1_irq` in
+// exception_asm.s), so this closes an arch asymmetry, not a design choice.
+//
+// Same frame layout and GS handling as the fault stubs above; the fake
+// error-code push keeps the shapes identical. `irq_common` runs the
+// device/IPI work and the preemption check; a fatal signal found on the way
+// out ends in `exit_group` exactly as it does after a syscall.
+fault_stub!("irq_stub_32", 32, "push 0");  // LAPIC timer
+fault_stub!("irq_stub_64", 64, "push 0");  // reschedule IPI (0x40)
 
 /// Common fault handler behind every `fault_stub_N`.
 ///
@@ -423,6 +444,15 @@ extern "C" {
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, error_code: u64) {
+    // IRQs routed through the fault stubs (see `irq_stub_*`): EOI, drive
+    // the tick, preempt if asked, and return through the common epilogue,
+    // which delivers pending signals when the frame is a ring-3 one.
+    if vector == 32 || vector == 0x40 {
+        super::apic::eoi();
+        if vector == 32 { super::timer::on_tick(); }
+        sched::preempt_check();
+        return;
+    }
     let frame = unsafe { &mut *frame };
     let from_user = frame.cs & 3 != 0;
 
@@ -481,52 +511,12 @@ extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, e
 #[cfg(not(target_arch = "x86_64"))]
 extern "C" fn exc_misc(_frame: InterruptStackFrame) { loop {} }
 
-/// Timer IRQ handler — APIC timer at 100 Hz.
-///
-/// Sends LAPIC EOI, drives the scheduler tick, then checks if the running
-/// task should be preempted.  `sched::preempt_check()` calls `yield_now()`
-/// if needed; the `iretq` epilogue then resumes the correct task.
-#[cfg(target_arch = "x86_64")]
-extern "x86-interrupt" fn timer_irq(frame: InterruptStackFrame) {
-    let from_user = (frame.cs & 3) != 0;
-    if from_user {
-        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
-    }
-
-    super::apic::eoi();
-    super::timer::on_tick();
-    sched::preempt_check();
-
-    if from_user {
-        // preempt_check may have context-switched: this task can resume here
-        // on a different CPU, so re-derive GS from the live CPU instead of a
-        // bare swapgs (see restore_user_gs).
-        unsafe { super::syscall::restore_user_gs(); }
-    }
-}
-
-/// Reschedule IPI handler — vector 0x40.
-///
-/// Sent by `sched::trigger_preempt` from another CPU.  The sender already set
-/// this CPU's `PREEMPT_NEEDED` slot; we only need to EOI and run
-/// `preempt_check`, which context-switches away if a reschedule is pending.
-/// An idle CPU parked in `sti; hlt` is woken by the interrupt itself and
-/// re-picks from the run queue when the handler returns.
-#[cfg(target_arch = "x86_64")]
-extern "x86-interrupt" fn resched_irq(frame: InterruptStackFrame) {
-    let from_user = (frame.cs & 3) != 0;
-    if from_user {
-        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
-    }
-
-    super::apic::eoi();
-    sched::preempt_check();
-
-    if from_user {
-        // May have migrated across the preempt_check — see restore_user_gs.
-        unsafe { super::syscall::restore_user_gs(); }
-    }
-}
+// The timer IRQ (vector 32, APIC timer at 100 Hz) and the reschedule IPI
+// (vector 0x40, sent by `sched::trigger_preempt`; the sender already set this
+// CPU's `PREEMPT_NEEDED` slot) enter through `irq_stub_32`/`irq_stub_64` and
+// are handled at the top of `fault_common`. An idle CPU parked in `sti; hlt`
+// is woken by the interrupt itself and re-picks from the run queue when the
+// handler returns.
 
 /// TLB shootdown IPI handler — vector 0xFD.
 ///
@@ -558,8 +548,6 @@ extern "x86-interrupt" fn tlb_shootdown_irq(frame: InterruptStackFrame) {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-extern "C" fn resched_irq(_frame: InterruptStackFrame) {}
-#[cfg(not(target_arch = "x86_64"))]
 extern "C" fn tlb_shootdown_irq(_frame: InterruptStackFrame) {}
 
 /// Keyboard IRQ handler — PS/2 keyboard at IRQ 1 (vector 33).
@@ -576,11 +564,6 @@ extern "x86-interrupt" fn keyboard_irq(frame: InterruptStackFrame) {
     if from_user {
         unsafe { super::syscall::restore_user_gs(); }
     }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-extern "C" fn timer_irq(_frame: InterruptStackFrame) {
-    // No-op: timer module is only present on x86_64.
 }
 
 #[cfg(not(target_arch = "x86_64"))]
