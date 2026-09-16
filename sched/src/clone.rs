@@ -171,8 +171,16 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         let child_as = match cloned {
             Some(a) => a,
             None    => {
+                // `clone_as` builds the child around `child_pt` as a local
+                // `AddressSpace`; on OOM it returns None having already
+                // dropped that AddressSpace, whose `Drop` freed `child_pt`
+                // (and every child page it had mapped). Freeing `child_pt`
+                // again here is a double free that corrupts the buddy free
+                // list — the latent cause of the intermittent `Vector=0xE`
+                // in a later `buddy::free` on a large guest, where the OOM
+                // rollback path actually runs. Only the kernel stack, which
+                // no AddressSpace owns, is freed here.
                 mm::buddy::free(stack_base_phys, stack_pages);
-                mm::buddy::free(child_pt, 0);
                 return -12;
             }
         };
@@ -241,8 +249,9 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
                  t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, (t.cwd.clone(), t.cwd_len), t.tls_base,
                  t.priority, t.umask, (t.root.clone(), t.root_len), t.signal_mask)
             } else {
+                // `child_as` owns `child_pt` and is dropped on this return,
+                // which frees it; an explicit free here would double it.
                 mm::buddy::free(stack_base_phys, stack_pages);
-                mm::buddy::free(child_pt, 0);
                 return -3;
             }
         };
@@ -343,8 +352,11 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
 
         if !super::RUN_QUEUE.lock().enqueue(child) {
             report_task_table_full();
+            // A failed `enqueue` drops the `Box<Task>` it was handed, which
+            // drops the child's address-space Arc and frees `child_pt`. The
+            // kernel stack is not owned by the Task (the reaper frees it
+            // explicitly), so it — and only it — is freed here.
             mm::buddy::free(stack_base_phys, stack_pages);
-            mm::buddy::free(child_pt, 0);
             return -12;
         }
         super::wake_up_an_idle_cpu();
