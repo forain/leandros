@@ -1,0 +1,39 @@
+2026-09-16 p0/iced verdict — "no libcosmic/iced app paints a pixel" is STALE (false).
+Kernel: ea84b54 + cherry-picks 8897e02 (CLONE_PARENT_SETTID) + 4f27545 (Ctrl-T dump), aarch64/HVF.
+Desktop via `sh /bin/start-cosmic-leandros &` from the serial root shell, settled 90 s: 00-desktop.png
+  (panel bar with Workspaces/Applications applets, live clock 00:01:45, dock with 3 applets — all iced).
+Standalone cosmic-settings (iced, tiny-skia, single-instance probe answered by busd): 01-settings.png
+  — full window: sidebar, icons, list rows, scrollbar, close button, at t+40 s.
+cosmic-app-library hand-started -> "Successfully activated another instance" -> the autostarted
+  instance drew its full overlay (search field, COSMIC Terminal icon, group bar): 02-applib.png.
+Nothing had to be fixed for this. Proceeding to make greetd + cosmic-greeter the default login.
+
+--- GREETER AS DEFAULT LOGIN (2026-09-16) ---
+Kernel: cherry-picks only in the end (CLONE_PARENT_SETTID + Ctrl-T dump). The
+previous agent's net_block_until_ready socket-parking WIP was DROPPED (unvalidated
+optimization replacing a working yield_now on the greetd<->worker socketpair path).
+userland/init: greetd is now the default login, supervised alongside the serial
+getty (recovery + test-harness path always up); /etc/leandros/text-login opts out.
+servers/tty/vt: console_keyboard_active() now also returns false while a DRM client
+holds the scanout, so a graphical login's keystrokes do not double as serial-getty input.
+
+Boot verified (aarch64/HVF): init auto-starts greetd -> cosmic-comp kiosk -> greeter,
+which PAINTS at boot with no shell action (screenshots 10/20). Greeter RECEIVES
+keyboard (HMP sendkey; QMP input-send-event was unreliable), field fills to 7 dots
+(15/23/32). Enter AUTHENTICATES leandro: greeter exits, greetd starts the uid=1000
+session, busd + cosmic-session + cosmic-comp launch (33/34, g.log).
+
+OPEN BLOCKER (not iced, not a simple kernel gap): the SESSION's cosmic-comp wedges in
+smithay GlowRenderer::new (0x127E830) — all 4 threads parked on futexes, none running
+— right after the GREETER's cosmic-comp exited with EGL errors (eglMakeCurrent
+BadDisplay / dmabuf->EGLImage). So the desktop does not paint after login. A single
+start-cosmic-leandros from a fresh boot paints fine (00-02); the wedge is specific to a
+SECOND compositor acquiring the GPU/DRM after the first released it uncleanly. Session
+cosmic-comp logs are swallowed by cosmic-session (TODO item 7), so it is diagnosed only
+via the Ctrl-T dump. Recommend: gate greetd-default behind the text-login marker until
+the compositor-handoff GPU/EGL teardown is fixed, OR fix the greeter compositor's clean
+EGL/GBM teardown so the session compositor can re-init GL.
+
+x86_64/TCG: same image recipe; init auto-starts greetd; the greeter paints at ~t+4 min
+(1920x1080, screenshot 41-x86-greeter.png); serial `login root root` works alongside.
+Login hand-off not driven on x86_64 (TCG too slow for the budget).

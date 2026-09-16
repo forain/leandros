@@ -1120,7 +1120,7 @@ from this list's contents outlived the list.
 | # | Item | Category | State |
 |---|---|---|---|
 | 6 | Input reaches clients **losslessly**; the "starvation" was the harness | Bug — **CLOSED** `af9f076` | 100% at 60 moves/s; a parked serial reader wedged the tick |
-| 7 | libcosmic apps **block in a D-Bus probe**; they render fine | Bug — **FIXED** `85f2f4c`+`daa2815` | busd answers `ServiceUnknown`; 4 parked components alive, both arches |
+| 7 | libcosmic apps **block in a D-Bus probe**; they render fine — and the **greeter → session hand-off now works** | Bug — **FIXED** `85f2f4c`+`daa2815`; hand-off **FIXED** (`FUTEX_WAIT_BITSET` deadline was read as an interval) | busd answers `ServiceUnknown`; login → uid-1000 desktop photographed aarch64/HVF |
 | 8 | ~~Nothing to launch, and no way to ask for it~~ — a terminal ships, runs, and answers keybindings | Feature — config + terminal + keybindings **DONE** | `Super+F9`→Spawn fired ×5 and `Super+T` raised cosmic-term; the residual was a kernel `clone()`/`CLONE_PARENT_SETTID` deadlock, fixed `8897e02` (test `spawnwedge`) |
 | 9 | **5 real applets now ship and run; tiling paints, minimize is a design no-op** | Feature — panel-death **FIXED**; rendering **FIXED** | tiling icon paints after `0f56aab`+`cdd613e` (fork_dup dropped UnixPendingAccept fds; f2fs MAX_OPEN_FILES 32→256); clock ticks after `4085b7f` (nested epoll fd read as POLLNVAL readiness); minimize is a 1×1 hidden surface with zero toplevels by upstream design, not a bug |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
@@ -1670,6 +1670,46 @@ keybinding. **The cheapest next measurement is a census, not an experiment:** ca
 session log (not a tail) and count `busd::peers: unknown destination:` by name. One
 `com.system76.Cosmic*` line per single-instance component confirms they have been blocked at
 startup every boot; their absence refutes it and leaves item 8's attribution intact.
+
+**Graphical login hand-off — WORKING, 2026-09-16 (`p0/iced`).** greetd is the default
+login (`efb3a85`); boot → greeter paints → password typed through the emulated keyboard →
+greetd starts the uid-1000 session → **the session desktop paints**, panel and dock, within
+two minutes (`artifacts/iced2-lane/run4-aarch64-session-desktop-after-login.png`, aarch64/HVF).
+What blocked it was filed as "the second compositor deadlocks in `GlowRenderer::new`" and was
+neither a deadlock nor GL: the main thread was parked in
+`futures_executor::block_on(zbus::Connection::session())` inside `State::new` (the earlier
+symbolization used load base 0 for a PIE the kernel places at 2 MiB — `0x127E830` is
+`parking::Inner::park`, not `GlowRenderer::new`), and the Ctrl-T socket dump showed **busd's
+Hello reply, 279 bytes, sitting unread on the compositor's side** of a healthy connection. The
+reader was never woken because async-io's driver thread was in `park_timeout(≤10 ms)` — and
+**`sys_futex` read `FUTEX_WAIT_BITSET`'s timespec as a relative interval.** It is an absolute
+CLOCK_MONOTONIC deadline, and both Rust std's `futex_wait` and relibc's `Pal::futex_wait` pass
+`now + timeout` through it, so every std timed wait in every Rust program lasted **uptime plus
+the timeout**: unnoticeable a minute after boot, a three-minute stall three minutes in — which
+is why a compositor started from a fresh boot always came up and one started after a greeter
+login "never" did (it did, ~20 minutes later; photographed mid-fade-in). Fixed in the kernel;
+`wakepolltest` gained `futex_bitset_abs_deadline` / `futex_bitset_past_deadline`. Nothing in
+the DRM/GPU release path was involved — the session compositor had not opened card0 yet.
+Instrument that found it: the Ctrl-T dump now appends every process socket table, every live
+AF_UNIX connection (per-end refcounts, closed/shutdown flags, peer creds, ring fill) and every
+bound address (`sched::register_dump_hook`, `net_server::dump_sockets`).
+
+Still open around the login path, all recorded with evidence and none blocking:
+- **`kill -9` of a multi-threaded process while its siblings run on other CPUs can wedge
+  those CPUs**: run 1 killed the session tree by hand and three CPUs stopped ticking with
+  `[PF] no address space for faulting task` for `cosmic-launcher` threads (`[WDOG] cpuN took no
+  timer tick for ~82 s … not in a syscall`). The address space goes away under a thread that is
+  still executing. greetd's alarm path SIGKILLs a greeter that ignores SIGTERM for 10 s, so
+  this is reachable from the login path too.
+- **`thread 'tokio-rt-worker' panicked … Bad read on self-pipe: Bad file descriptor`** in
+  `/var/log/greetd.log` right after `profile: session starting`. The thread ids (60, 72) fall
+  between the session's `sh -c` pid and cosmic-session's, so this is most likely brush's tokio
+  signal driver in greetd's `source_profile` wrapper, not greetd itself; unverified.
+- The greeter's cosmic-comp logs `eglMakeCurrent … BadDisplay` / `Failed to convert between
+  dmabuf and EGLImage` on its way out (kiosk exit after cosmic-greeter exits); cosmetic, the
+  scanout is released and the console comes back.
+- The greeter renders each keystroke slowly enough (tiny-skia, uid 990 `Running` for tens of
+  seconds) that the dots lag the typing by 20 s or more; the keys are not lost.
 
 ### 8. There is something to launch now; what is left is asking for it by keyboard
 

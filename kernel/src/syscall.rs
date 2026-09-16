@@ -2855,15 +2855,41 @@ fn sys_set_tid_address(tidptr: usize) -> isize {
 }
 
 fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: usize, val3: usize) -> isize {
-    // Strip FUTEX_PRIVATE_FLAG (128) and FUTEX_CLOCK_REALTIME (256).
-    const FUTEX_PRIVATE_FLAG: usize = 128;
-    match op & !FUTEX_PRIVATE_FLAG {
-        // FUTEX_WAIT and FUTEX_WAIT_BITSET (9): relibc's RlctMutex/condvar
-        // always call the bitset form with FUTEX_BITSET_MATCH_ANY (no actual
-        // bitmask filtering), so it's semantically identical to plain WAIT
-        // here — the extra uaddr2/val3 args (a4/a5, unused for *_WAIT) aren't
-        // even forwarded to this function.
-        0 | 9 => {
+    // Strip FUTEX_PRIVATE_FLAG (128) and FUTEX_CLOCK_REALTIME (256). The
+    // clock flag is not load-bearing here: every clock this kernel reports is
+    // the same tick counter with boot as the epoch (see `sys_clock_gettime`),
+    // so an absolute CLOCK_REALTIME deadline and an absolute CLOCK_MONOTONIC
+    // one are the same number of ticks.
+    const FUTEX_PRIVATE_FLAG:   usize = 128;
+    const FUTEX_CLOCK_REALTIME: usize = 256;
+    const FUTEX_WAIT:           usize = 0;
+    const FUTEX_WAIT_BITSET:    usize = 9;
+    let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+    match cmd {
+        // FUTEX_WAIT and FUTEX_WAIT_BITSET: the bitset form is only ever
+        // called with FUTEX_BITSET_MATCH_ANY by the libcs in this tree (musl,
+        // relibc, Rust std), so the mask itself is not filtered on — the extra
+        // uaddr2/val3 args aren't even consulted for it.
+        //
+        // The two differ in what the timeout MEANS, and that difference is
+        // load-bearing: FUTEX_WAIT takes a RELATIVE interval, FUTEX_WAIT_BITSET
+        // an ABSOLUTE deadline on CLOCK_MONOTONIC (or CLOCK_REALTIME with the
+        // flag). musl's pthread code uses the relative form. Rust std's
+        // `futex_wait` — under every `Condvar::wait_timeout`,
+        // `thread::park_timeout`, `mpsc::recv_timeout` and `Mutex` spin fallback
+        // in every Rust program — uses the bitset form with `now + timeout`.
+        // Treating that as relative made every std timed wait last "uptime plus
+        // the intended duration": harmless in the first seconds after boot,
+        // and a wedge a few minutes in. async-io's driver thread backs off
+        // with `park_timeout(≤10 ms)` while any thread is inside
+        // `async_io::block_on` (zbus's executor thread is, permanently), and
+        // at three minutes of uptime each of those became a three-minute
+        // sleep — the session compositor started by greetd after the greeter
+        // login sat in `zbus::Connection::session()` with its Hello reply
+        // unread in the socket for minutes, while the same compositor started
+        // a minute after boot came up fine. Same bug class
+        // `sys_clock_nanosleep` fixed for TIMER_ABSTIME.
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             // FUTEX_WAIT: if *uaddr == val, block until woken.  The value
             // check happens inside futex_wait, between that task's
             // registration in FUTEX_TABLE and its commit to Blocked —
@@ -2874,13 +2900,8 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
             // read can take a demand-paging fault, and `handle_page_fault`
             // re-enters the scheduler.  See the sched::futex module docs.
             if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
-            // timeout_ptr is a `struct timespec` (relative — real FUTEX_WAIT
-            // semantics; treated the same for the WAIT_BITSET/9 case, which
-            // is technically absolute on real Linux, but no caller in this
-            // tree relies on that distinction and treating it as relative is
-            // never worse than this kernel's prior behavior of ignoring it
-            // outright). Converted to a `ticks()` deadline exactly like
-            // sys_nanosleep. NULL means no timeout (block indefinitely).
+            // timeout_ptr is a `struct timespec`; NULL means no timeout (block
+            // indefinitely). Converted to a `ticks()` deadline.
             let deadline = if timeout_ptr == 0 {
                 None
             } else {
@@ -2888,8 +2909,27 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
                 let tv_sec  = unsafe { core::ptr::read(timeout_ptr as *const i64) };
                 let tv_nsec = unsafe { core::ptr::read((timeout_ptr + 8) as *const i64) };
                 if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 { return -22; } // EINVAL
-                let ticks_needed = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
-                Some(ticks().wrapping_add(ticks_needed))
+                let ns = (tv_sec as u128) * 1_000_000_000 + tv_nsec as u128;
+                if cmd == FUTEX_WAIT_BITSET {
+                    // Absolute: the deadline in this kernel's one clock,
+                    // rounded up like the relative path and clock_nanosleep so
+                    // a wait never returns early. A deadline already in the
+                    // past is answered without parking, value check first
+                    // (Linux reports EAGAIN over ETIMEDOUT when the word has
+                    // moved).
+                    let target = ns.div_ceil(10_000_000) as u64;
+                    if target <= ticks() {
+                        // Already expired. No lock is held, so the read may
+                        // fault and be serviced like any other user read.
+                        let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+                        return if cur != val as u32 { -11 } else { -110 }; // EAGAIN / ETIMEDOUT
+                    }
+                    Some(target)
+                } else {
+                    // Relative, exactly as sys_nanosleep converts it.
+                    let ticks_needed = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
+                    Some(ticks().wrapping_add(ticks_needed))
+                }
             };
             sched::futex_wait(uaddr, val as u32, deadline)
         }
@@ -2901,7 +2941,7 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
             // FUTEX_REQUEUE = 3, FUTEX_CMP_REQUEUE = 4
             if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
             if !validate_user_ptr_aligned(uaddr2, 4, 4) { return -14; }
-            if op & !FUTEX_PRIVATE_FLAG == 4 {
+            if cmd == 4 {
                 let current = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
                 if current != val3 as u32 {
                     return -11; // EAGAIN

@@ -681,14 +681,26 @@ pub fn kb_mode_active_relaxed() -> u32 {
 
 /// True when console keystrokes belong to the kernel's line discipline.
 ///
-/// Two relaxed atomic loads, so the input drain can gate on it. The answer is
-/// no when a compositor has taken the active VT with `KD_GRAPHICS`, and no when
-/// the VT's owner reads scancodes itself (`K_RAW`/`K_MEDIUMRAW`) or has asked
-/// for nothing at all (`K_OFF`) — in every one of those cases a keystroke
-/// belongs to that owner, and queueing a copy for the console is what makes a
-/// shell replay everything typed into a full-screen client after it exits.
+/// Three atomic loads, so the input drain can gate on it. The answer is no
+/// when a compositor has taken the active VT with `KD_GRAPHICS`, no when the
+/// VT's owner reads scancodes itself (`K_RAW`/`K_MEDIUMRAW`) or has asked for
+/// nothing at all (`K_OFF`), and no while a DRM client holds the scanout — in
+/// every one of those cases a keystroke belongs to that owner, and queueing a
+/// copy for the console is what makes a shell replay everything typed into a
+/// full-screen client after it exits.
+///
+/// The scanout test is the derived form of the first two. seatd puts the VT in
+/// `KD_GRAPHICS`/`K_OFF` on the compositor's behalf; the libseat shim this
+/// system runs does not, so a compositor here never announces that it owns the
+/// keyboard. It does announce that it owns the display, on every present, and
+/// the console is already gated off the framebuffer on exactly that signal
+/// (`fb_vt_scanout_owned`). Keys typed into a graphical login screen must not
+/// double as input to the serial getty underneath it, so the keyboard follows
+/// the display. Serial bytes are exempt at the caller (they can only have come
+/// from someone at the serial console).
 pub fn console_keyboard_active() -> bool {
     is_text_console() && kb_mode_active_relaxed() == K_XLATE
+        && !unsafe { fb_vt_scanout_owned() }
 }
 
 /// Console bytes lost from the mirror to lock contention. Diagnostic.

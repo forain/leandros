@@ -1,0 +1,34 @@
+2026-09-16 p0/iced lane "iced2" — greeter -> session hand-off WORKS on both arches.
+
+Root cause of the "second compositor deadlocks in GlowRenderer::new": NOT a deadlock, NOT GL,
+NOT DRM state. sys_futex read FUTEX_WAIT_BITSET's timespec as a RELATIVE interval; it is an
+ABSOLUTE CLOCK_MONOTONIC deadline (Rust std futex_wait, relibc Pal::futex_wait both pass
+now+timeout through it). Every std timed wait lasted uptime+timeout. async-io's driver thread
+backs off with park_timeout(<=10ms) while any thread is in async_io::block_on (zbus's executor
+thread is, permanently) -> at 3 min uptime each backoff = 3 min -> the session compositor sat in
+futures_executor::block_on(zbus::Connection::session()) in State::new with busd's Hello reply
+(279 bytes) unread in its socket. It did paint ~20 min later (run3-desktop-fading-in...).
+
+Discriminators, in order:
+  run1: reproduced on merged main+zink2 DRM; Ctrl-T dump symbolized with the PIE bias 0x200000
+        (previous agent used base 0): main thread at State::new+0x4238 parked (Parker=-1), not
+        GlowRenderer::new. The session comp had not opened card0 -> H1 (DRM leak) irrelevant.
+  run2: uid-1000 start-cosmic-leandros from a serial login at ~1 min uptime paints fine.
+  run3: new Ctrl-T socket dump: [CONN] 7 a{pid=76 comp} b{pid=68 busd} ab=0/179 ba=279/316 ->
+        healthy connection, reply queued client-side, never read. Then 20 min later the
+        desktop came up on its own -> a timeout, not a lost wake.
+  run4/5 (aarch64/HVF, fixed kernel, two clean boots): greeter -> sendkey password -> desktop
+        (panel+dock) in <2 min. wakepolltest 12/12 incl. the new futex_bitset_abs_deadline.
+  run6 (x86_64/TCG): greeter paints at ~4 min, hand-off completes (~9 min), wakepolltest 12/12.
+
+Files: kernel/src/syscall.rs (sys_futex), sched/src/lib.rs (dump hooks, futex dl=),
+servers/net/src/lib.rs (dump_sockets), userland/wakepolltest (2 new cases), TODO.md item 7,
+ports/greetd/README.md.
+
+Ship state: efb3a85 (greetd default) STAYS the default. No text-login marker needed.
+
+Open, with evidence in this directory:
+  - kill -9 of a multi-threaded process wedges CPUs its threads are running on:
+    "[PF] no address space for faulting task", WDOG cpu0/1/2 no tick for 82 s (run1, by hand).
+  - tokio "Bad read on self-pipe: EBADF" panics in the session's sh -c wrapper (brush), harmless.
+  - greeter cosmic-comp exits with EGL BadDisplay warnings (kiosk exit), harmless.

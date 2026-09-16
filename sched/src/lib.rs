@@ -2358,6 +2358,11 @@ pub fn dump_tasks() {
                 let v = unsafe { (mm::phys_to_virt(phys) as *const u32).read_volatile() };
                 print_str("="); ph(v as usize);
             }
+            // A timed waiter's deadline, in ticks: with `tick=` at the top of
+            // the dump this shows a wait that will outlive its caller's
+            // intent (the FUTEX_WAIT_BITSET absolute/relative confusion made
+            // every std timed wait last uptime + timeout).
+            if t.poll_deadline != u64::MAX { print_str(" dl="); pn(t.poll_deadline as u32); }
         }
         if t.vfork_pending { print_str(" vfork_pending"); }
         // Where in userspace the task stopped: the EL0 frame the exception
@@ -2397,6 +2402,31 @@ pub fn dump_tasks() {
         print_str("\n");
     }
     drop(rq);
+    // Subsystem dumps (the net server's socket tables) run after the run
+    // queue is released: they take their own locks, by try_lock only.
+    for h in DUMP_HOOKS.iter() {
+        let f = h.load(Ordering::Acquire);
+        if f != 0 {
+            let f: fn() = unsafe { core::mem::transmute(f) };
+            f();
+        }
+    }
+}
+
+/// Up to 4 subsystem hooks appended to the Ctrl-T task dump. Same contract as
+/// a tick hook: IRQ context, try_lock only, no allocation.
+const MAX_DUMP_HOOKS: usize = 4;
+static DUMP_HOOKS: [core::sync::atomic::AtomicUsize; MAX_DUMP_HOOKS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_DUMP_HOOKS];
+
+/// Register a function to run at the end of every `dump_tasks`. Silently
+/// ignored past MAX_DUMP_HOOKS registrations.
+pub fn register_dump_hook(f: fn()) {
+    for h in DUMP_HOOKS.iter() {
+        if h.compare_exchange(0, f as usize, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return;
+        }
+    }
 }
 
 /// Diagnostic: print the faulting task's identity — its pid, tgid, its own

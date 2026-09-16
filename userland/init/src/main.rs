@@ -1,8 +1,10 @@
 //! LeandrOS Init - userspace init program (PID 1)
 //!
 //! This is the first userspace program that runs and manages the system.
-//! It mounts the F2FS root filesystem, copies userland files, pivots root,
-//! and launches the shell.
+//! It mounts the F2FS root filesystem, pivots root, mounts /etc/fstab, then
+//! supervises two logins: the graphical one (greetd -> cosmic-comp ->
+//! cosmic-greeter -> COSMIC session) on the display, and a getty on the
+//! serial console.
 
 #![no_std]
 #![no_main]
@@ -11,11 +13,50 @@ extern crate leandros_libc;
 
 use leandros_libc::{
     write, STDOUT_FILENO, getpid, execve, sched_yield, mount, pivot_root, mkdir,
-    open, read, close, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC,
+    open, read, close, dup3, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND,
     fork, wait4, setsid, ioctl, usleep, exit,
 };
 
 const TIOCSCTTY: usize = 0x540E;
+
+// ── Graphical login ──────────────────────────────────────────────────────────
+//
+// The default login is graphical: greetd drives cosmic-comp in kiosk mode with
+// cosmic-greeter as its client, and a successful login hands off to a COSMIC
+// session (ports/greetd, ports/cosmic-greeter). init owns that chain the way it
+// owns the serial getty: forked once, supervised, respawned when it exits.
+//
+// The serial getty loop stays. A serial `login:` is what the QEMU driver and
+// every test harness talk to, and it is also the recovery path when the
+// graphical stack is broken — exactly the arrangement Linux has with a display
+// manager on the seat and agetty on ttyS0.
+
+/// The launcher the graphical login runs through. `/bin/greeter-real` exports
+/// the render environment (`/bin/greeter-env`) and execs `/bin/greetd`; it is
+/// the same script a hand-started greeter uses, so the two paths cannot drift.
+const DM_LAUNCHER: &[u8] = b"/bin/greeter-real\0";
+const DM_SHELL: &[u8] = b"/bin/sh\0";
+/// The daemon itself. Its absence (an image built without the greetd
+/// artifacts) means "text login", not an error.
+const DM_DAEMON: &[u8] = b"/bin/greetd\0";
+const DM_CONFIG: &[u8] = b"/etc/greetd/greetd.conf\0";
+/// Opt-out marker: when this file exists the boot lands on the serial/text
+/// login only. Persistent across boots (it lives on the root f2fs), so a
+/// test image can be switched with one `touch` from a root shell.
+const DM_TEXT_LOGIN_MARKER: &[u8] = b"/etc/leandros/text-login\0";
+/// Where the greeter chain's stdout/stderr go. greetd runs with `vt = "none"`
+/// and passes its own stdio to the greeter and to the session, so this one
+/// file carries cosmic-comp, cosmic-greeter, cosmic-session and every applet.
+/// It is not the console on purpose: the framebuffer console is what the
+/// compositor is about to draw over, and painting thousands of tracing lines
+/// into it costs a full-surface memmove per scrolled line.
+const DM_LOG: &[u8] = b"/var/log/greetd.log\0";
+const DM_PID_FILE: &[u8] = b"/run/greetd-init.pid\0";
+/// Respawn spacing and ceiling. A greeter chain that dies at once (a missing
+/// library, a compositor that cannot open the GPU) must not become a fork
+/// storm on the same console the serial login is trying to use.
+const DM_RESPAWN_DELAY_US: u32 = 3_000_000;
+const DM_MAX_RESPAWNS: u32 = 20;
 
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
@@ -59,25 +100,155 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // that one since fstab itself lives on the filesystem being mounted).
     mount_from_fstab();
 
-    // 5. Getty loop: fork a fresh session for /bin/login on every iteration
-    // so a login shell that exits (or a crashing login) always gets a new
-    // console session rather than leaving init with no controlling tty.
+    // 5. Graphical login, when the image carries one and nothing opted out.
+    let graphical = graphical_login_wanted();
+    let mut dm_pid: i32 = if graphical { spawn_display_manager() } else { 0 };
+    let mut dm_respawns: u32 = 0;
+
+    // 6. Supervisor loop. The serial getty is respawned every time it exits so
+    // a login shell that exits (or a crashing login) always gets a new console
+    // session rather than leaving init with no controlling tty; the graphical
+    // login is respawned the same way, with spacing and a ceiling. wait4(-1)
+    // also reaps any orphan reparented to init, which is simply ignored.
     write_str("Starting getty loop...\n");
+    let mut login_pid: i32 = spawn_login();
     loop {
-        let pid = fork();
-        if pid == 0 {
-            run_session();
-            // run_session only returns if both execve attempts failed.
-            exit(1);
-        } else if pid > 0 {
-            let mut status = 0i32;
-            wait4(pid, &mut status, 0, core::ptr::null_mut());
-            write_str("session ended, restarting login\n");
-        } else {
-            write_str("ERROR: fork failed in getty loop\n");
+        let mut status = 0i32;
+        let pid = wait4(-1, &mut status, 0, core::ptr::null_mut());
+        if pid <= 0 {
+            // No children at all (both spawns failed): back off and retry.
+            usleep(1_000_000);
+            if login_pid <= 0 { login_pid = spawn_login(); }
+            continue;
         }
-        usleep(1_000_000);
+        if pid == login_pid {
+            write_str("session ended, restarting login\n");
+            usleep(1_000_000);
+            login_pid = spawn_login();
+        } else if dm_pid > 0 && pid == dm_pid {
+            dm_pid = 0;
+            dm_respawns += 1;
+            if dm_respawns > DM_MAX_RESPAWNS {
+                write_str("graphical login exited too many times; leaving the text login only\n");
+                continue;
+            }
+            write_str("graphical login exited, restarting in 3 s (");
+            write_u32(dm_respawns);
+            write_str("/");
+            write_u32(DM_MAX_RESPAWNS);
+            write_str(")\n");
+            usleep(DM_RESPAWN_DELAY_US);
+            if graphical_login_wanted() {
+                dm_pid = spawn_display_manager();
+            }
+        }
     }
+}
+
+/// Fork the serial getty: a fresh session running /bin/login. Returns the
+/// child's pid, or -1 if the fork failed.
+unsafe fn spawn_login() -> i32 {
+    let pid = fork();
+    if pid == 0 {
+        run_session();
+        // run_session only returns if both execve attempts failed.
+        exit(1);
+    } else if pid < 0 {
+        write_str("ERROR: fork failed in getty loop\n");
+    }
+    pid
+}
+
+fn exists(path: &[u8]) -> bool {
+    unsafe {
+        let fd = open(path.as_ptr(), O_RDONLY, 0);
+        if fd < 0 { return false; }
+        close(fd);
+        true
+    }
+}
+
+/// The three-way decision: the daemon and its config are staged, and nobody
+/// asked for a text login.
+unsafe fn graphical_login_wanted() -> bool {
+    if exists(DM_TEXT_LOGIN_MARKER) {
+        write_str("graphical login disabled by /etc/leandros/text-login\n");
+        return false;
+    }
+    if !exists(DM_DAEMON) || !exists(DM_CONFIG) {
+        write_str("no greetd in this image; text login only\n");
+        return false;
+    }
+    true
+}
+
+/// Fork the graphical login chain. Returns the child's pid, or -1.
+///
+/// The child becomes a session leader with no controlling tty (greetd runs with
+/// `vt = "none"`, and the compositor takes the display through DRM, not through
+/// a tty), reads nothing (stdin is /dev/null) and logs to `DM_LOG`. It then
+/// execs `/bin/sh /bin/greeter-real` with the minimal environment the launcher
+/// itself completes.
+unsafe fn spawn_display_manager() -> i32 {
+    mkdir(b"/var\0".as_ptr(), 0o755);
+    mkdir(b"/var/log\0".as_ptr(), 0o755);
+    mkdir(b"/etc/leandros\0".as_ptr(), 0o755);
+    let pid = fork();
+    if pid < 0 {
+        write_str("ERROR: fork failed for the graphical login\n");
+        return pid;
+    }
+    if pid > 0 {
+        write_str("graphical login started (greetd, pid ");
+        write_u32(pid as u32);
+        write_str("), log at /var/log/greetd.log\n");
+        write_pid_file(pid as u32);
+        return pid;
+    }
+    // Child.
+    setsid();
+    let devnull = open(b"/dev/null\0".as_ptr(), O_RDONLY, 0);
+    if devnull >= 0 {
+        dup3(devnull, 0, 0);
+        if devnull != 0 { close(devnull); }
+    }
+    let log = open(DM_LOG.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0o644);
+    if log >= 0 {
+        dup3(log, 1, 0);
+        dup3(log, 2, 0);
+        if log > 2 { close(log); }
+    }
+    let argv: [*const u8; 3] = [DM_SHELL.as_ptr(), DM_LAUNCHER.as_ptr(), core::ptr::null()];
+    let envp: [*const u8; 3] = [
+        b"PATH=/usr/bin:/bin\0".as_ptr(),
+        b"HOME=/root\0".as_ptr(),
+        core::ptr::null(),
+    ];
+    execve(DM_SHELL.as_ptr(), argv.as_ptr(), envp.as_ptr());
+    // Only reached if the exec failed; the supervisor sees the exit and
+    // applies its ceiling.
+    write_str("ERROR: execve /bin/sh /bin/greeter-real failed\n");
+    exit(1);
+}
+
+/// Record the supervised greetd pid so a root shell can `kill` the chain
+/// (`kill $(cat /run/greetd-init.pid)`); with /etc/leandros/text-login in
+/// place first, the supervisor then leaves it down.
+unsafe fn write_pid_file(pid: u32) {
+    let fd = open(DM_PID_FILE.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+    if fd < 0 { return; }
+    let mut buf = [0u8; 11];
+    let mut n = pid;
+    let mut i = buf.len() - 1;
+    buf[i] = b'\n';
+    if n == 0 { i -= 1; buf[i] = b'0'; }
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    write(fd, buf.as_ptr().add(i), buf.len() - i);
+    close(fd);
 }
 
 /// Runs in the forked child: become a session leader, claim the console as
