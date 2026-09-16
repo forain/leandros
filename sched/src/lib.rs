@@ -1873,6 +1873,26 @@ pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
     ok
 }
 
+/// Number printers for the Ctrl-T dumps: raw UART only. The kernel's
+/// print_number/print_hex go through serial_write_byte, which mirrors every
+/// byte into the VT screen buffer under the VT lock — and the dumps run in
+/// IRQ context holding RUN_QUEUE (and, for the buddy census, FREE_LISTS), so
+/// a CPU holding the VT lock while waiting on either deadlocks with the dump
+/// (observed: the census wedged all four CPUs at its first digit).
+mod dump_raw {
+    extern "C" { fn arch_serial_putc(c: u8); }
+    pub fn ph(n: usize) {
+        let d = b"0123456789ABCDEF";
+        for i in (0..16).rev() { unsafe { arch_serial_putc(d[(n >> (i * 4)) & 0xF]); } }
+    }
+    pub fn pn(n: u32) {
+        if n == 0 { unsafe { arch_serial_putc(b'0'); } return; }
+        let mut buf = [0u8; 10]; let mut i = 0; let mut v = n;
+        while v > 0 { buf[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
+        for j in (0..i).rev() { unsafe { arch_serial_putc(buf[j]); } }
+    }
+}
+
 /// Diagnostic: dump every task in the run queue to the serial console — the
 /// kernel's equivalent of SysRq-t. Wired to Ctrl-T (0x14) on the serial line
 /// by `tty_server::console_intercept_byte`, so a wedged userspace can be
@@ -1887,9 +1907,7 @@ pub fn dump_tasks() {
         extern "C" { fn arch_serial_putc(c: u8); }
         for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } }
     }
-    extern "C" { fn print_hex(n: usize); fn print_number(n: u32); }
-    fn ph(n: usize) { unsafe { print_hex(n) } }
-    fn pn(n: u32)  { unsafe { print_number(n) } }
+    use dump_raw::{ph, pn};
     let rq = match RUN_QUEUE.try_lock() {
         Some(rq) => rq,
         None => { print_str("[TASKS] run queue busy, try again\n"); return; }
@@ -1897,6 +1915,17 @@ pub fn dump_tasks() {
     print_str("[TASKS] tick="); pn(ticks() as u32);
     print_str(" len="); pn(rq.len() as u32);
     print_str(" quiesce_tgid="); pn(QUIESCE_TGID.load(Ordering::Relaxed));
+    print_str("\n[TASKS] buddy free_pages="); pn(mm::buddy::free_pages() as u32);
+    print_str(" blocks/order:");
+    // Collected first, printed after: the census holds FREE_LISTS.
+    let mut census = [0usize; mm::buddy::MAX_ORDER];
+    let ok = mm::buddy::free_list_census(&mut |o, n| census[o] = n);
+    if ok {
+        for (o, &n) in census.iter().enumerate() {
+            print_str(" "); pn(o as u32); print_str(":");
+            if n == usize::MAX { print_str("CYCLE"); } else { pn(n as u32); }
+        }
+    } else { print_str(" (busy)"); }
     print_str("\n");
     for i in 0..runqueue::MAX_TASKS {
         let t = match rq.get(i) { Some(t) => t, None => continue };
@@ -1931,17 +1960,22 @@ pub fn dump_tasks() {
             }
         }
         if t.vfork_pending { print_str(" vfork_pending"); }
-        // Where in userspace the task stopped: for a user task parked in a
-        // syscall, the EL0 frame the exception stub saved at the top of its
-        // kernel stack (`sub sp, sp, #288` below `tpidr_el1`). aarch64 only.
+        // Where in userspace the task stopped: the EL0 frame the exception
+        // stub saved at the top of its kernel stack (`sub sp, sp, #288` below
+        // `tpidr_el1`). For a Blocked task that is the syscall it parked in;
+        // for a Running/Ready one it is its most recent EL0 exception — a
+        // syscall, a fault or the tick — so a task spinning in a fault or
+        // syscall loop shows that loop (printed as `last=`, since the task
+        // may since have moved on). aarch64 only.
         #[cfg(target_arch = "aarch64")]
-        if t.kernel_stack != 0 && t.state == TaskState::Blocked && rq.find_pid(t.tgid).map_or(false, |l| l.address_space.is_some()) {
+        if t.kernel_stack != 0 && t.state != TaskState::Zombie && rq.find_pid(t.tgid).map_or(false, |l| l.address_space.is_some()) {
             let frame = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE - 288;
             let f = unsafe { &*(frame as *const crate::context::UserFrame) };
-            print_str(" pc="); ph(f.elr_el1 as usize);
+            print_str(if t.state == TaskState::Blocked { " pc=" } else { " last pc=" }); ph(f.elr_el1 as usize);
             print_str(" lr="); ph(f.x[30] as usize);
             print_str(" sp="); ph(f.sp_el0 as usize);
             print_str(" x8="); ph(f.x[8] as usize);
+            print_str(" x0="); ph(f.x[0] as usize);
             // For a task parked on a futex (a lock-contention wedge, the case
             // this dump exists for), also spill a slice of the user stack so a
             // deadlock can be walked back to its callers offline. Read through
@@ -1974,9 +2008,7 @@ pub fn dump_task_ident() {
         extern "C" { fn arch_serial_putc(c: u8); }
         for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } }
     }
-    extern "C" { fn print_hex(n: usize); fn print_number(n: u32); }
-    fn ph(n: usize) { unsafe { print_hex(n) } }
-    fn pn(n: u32)  { unsafe { print_number(n) } }
+    use dump_raw::{ph, pn};
     let pid = current_pid();
     let rq = RUN_QUEUE.lock();
     let (tgid, own_pt) = match rq.find_pid(pid) {
