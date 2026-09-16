@@ -2260,11 +2260,15 @@ fn sys_rt_sigsuspend(mask_ptr: usize, _sigsetsize: usize) -> isize {
         0
     };
     let old_mask = replace_signal_mask(new_mask);
-    // Yield until a signal arrives that is not blocked by new_mask.
+    // Park until a signal arrives that is not blocked by new_mask. Every
+    // delivery path (`deliver_signal`, `deliver_signal_process`) ends in a
+    // `wake_poll` broadcast, so the poll wait-channel is the wake source;
+    // three-phase, re-checking the pending set after publishing Blocked.
     loop {
         if pending_signals() & !new_mask != 0 { break; }
-        irq_window();
-        yield_now("sigsuspend");
+        sched::block_on_poll_prepare();
+        if pending_signals() & !new_mask != 0 { sched::block_on_poll_cancel(); break; }
+        sched::block_on_poll_commit();
     }
     // Restore old mask before returning.
     let _ = replace_signal_mask(old_mask);
@@ -2317,8 +2321,10 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
         if let Some(dl) = deadline {
             if ticks() >= dl { return -110; } // ETIMEDOUT
         }
-        irq_window();
-        yield_now("sigtimedwait");
+        // Park (see sys_rt_sigsuspend); the deadline rides the poll tick.
+        sched::block_on_poll_prepare_until(deadline.unwrap_or(u64::MAX));
+        if pending_signals() & wait_mask != 0 { sched::block_on_poll_cancel(); continue; }
+        sched::block_on_poll_commit();
     }
 }
 
@@ -2345,9 +2351,17 @@ fn monotonic_ns() -> u64 {
 /// Writes a `struct timespec { tv_sec: i64, tv_nsec: i64 }` at `tp_ptr`.
 /// The 100 Hz tick supplies the whole ticks; `monotonic_ns` interpolates
 /// inside the current one from the architecture's free-running counter.
-fn sys_clock_gettime(_clkid: usize, tp_ptr: usize) -> isize {
+fn sys_clock_gettime(clkid: usize, tp_ptr: usize) -> isize {
     if !validate_user_ptr_aligned(tp_ptr, 16, 8) { return -14; }
-    let ns = monotonic_ns();
+    const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
+    const CLOCK_THREAD_CPUTIME_ID:  usize = 3;
+    // The CPU-time clocks are real (see `Task::cpu_ns`); every other id is
+    // the monotonic clock (REALTIME has no epoch here).
+    let ns = match clkid {
+        CLOCK_PROCESS_CPUTIME_ID => sched::process_cpu_ns(sched::current_tgid()),
+        CLOCK_THREAD_CPUTIME_ID  => sched::thread_cpu_ns(current_pid()),
+        _ => monotonic_ns(),
+    };
     let tv_sec  = (ns / 1_000_000_000) as i64;
     let tv_nsec = (ns % 1_000_000_000) as i64;
     unsafe {
@@ -4064,13 +4078,9 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
             let msg = make_vfs_msg(net_server::NET_SEND,
                 &[fd as u64, buf_ptr as u64, count as u64, 0, 0, 0]);
             let nonblock = net_fd_nonblock(pid, fd);
-            loop {
-                let n = net_reply_val(&net_server::handle(&msg, pid));
-                if n != -11 || nonblock { return n; }
-                if interrupted() { return -4; } // EINTR
-                irq_window();
-                yield_now("sys_write_sock");
-            }
+            block_until_ready(nonblock,
+                || net_reply_val(&net_server::handle(&msg, pid)),
+                || net_block_hint(pid, fd))
         }
 
         _ => {
@@ -4081,13 +4091,9 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
             // sys_read), or any pipeline carrying more than one ring's worth of
             // data dies with a spurious "failed to write whole buffer".
             let nonblock = vfs::fd_nonblock(pid, fd);
-            loop {
-                let n = vfs_reply_val(&vfs::handle(&msg, pid));
-                if n != -11 || nonblock { return n; }
-                if interrupted() { return -4; } // EINTR
-                irq_window();
-                yield_now("sys_write_vfs");
-            }
+            block_until_ready(nonblock,
+                || vfs_reply_val(&vfs::handle(&msg, pid)),
+                || vfs_block_hint(pid, fd))
         }
     }
 }
@@ -4267,13 +4273,9 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
             let msg = make_vfs_msg(net_server::NET_RECV,
                 &[fd as u64, buf_ptr as u64, count as u64, 0, 0, 0]);
             let nonblock = net_fd_nonblock(pid, fd);
-            loop {
-                let n = net_reply_val(&net_server::handle(&msg, pid));
-                if n != -11 || nonblock { return n; }
-                if interrupted() { return -4; } // EINTR
-                irq_window();
-                yield_now("sys_read_sock");
-            }
+            block_until_ready(nonblock,
+                || net_reply_val(&net_server::handle(&msg, pid)),
+                || net_block_hint(pid, fd))
         }
         _ => {
             if !is_kernel {
@@ -4287,19 +4289,14 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
             let pid = current_pid();
             let msg = make_vfs_msg(vfs::VFS_READ, &[fd as u64, buf_ptr as u64, count as u64]);
             // Pipe read: VFS returns -EAGAIN when write end is open but empty.
-            // Block (yield-loop) until data arrives or the write end closes —
-            // but only for blocking fds. O_NONBLOCK readers (e.g. an evdev
-            // poll loop) must see EAGAIN, or a single read() call spins here
-            // forever while the device stays empty.
+            // Block (park on the fd's wake tag) until data arrives or the write
+            // end closes — but only for blocking fds. O_NONBLOCK readers (e.g.
+            // an evdev poll loop) must see EAGAIN, or a single read() call
+            // never returns while the device stays empty.
             let nonblock = vfs::fd_nonblock(pid, fd);
-            loop {
-                let n = vfs_reply_val(&vfs::handle(&msg, pid));
-                if n != -11 || nonblock { return n; }
-                if interrupted() { return -4; } // EINTR
-                irq_window();
-
-                yield_now("sys_read_vfs");
-            }
+            block_until_ready(nonblock,
+                || vfs_reply_val(&vfs::handle(&msg, pid)),
+                || vfs_block_hint(pid, fd))
         }
     }
 }
@@ -4391,14 +4388,11 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
                 if !validate_user_buf(base, len) { return -14; }
                 prefault_user(base, len);
                 let msg = make_vfs_msg(vfs::VFS_READ, &[fd as u64, base as u64, len as u64]);
-                // Blocking pipe: yield-loop on EAGAIN.
-                let n = loop {
-                    let v = vfs_reply_val(&vfs::handle(&msg, pid));
-                    if v != -11 { break v; }
-                    if interrupted() { break -4; } // EINTR (short read if partial)
-                    irq_window();
-                    yield_now("sys_readv_vfs");
-                };
+                // Blocking pipe: park on EAGAIN (EINTR = short read if partial).
+                let nonblock = vfs::fd_nonblock(pid, fd);
+                let n = block_until_ready(nonblock,
+                    || vfs_reply_val(&vfs::handle(&msg, pid)),
+                    || vfs_block_hint(pid, fd));
                 if n < 0 { return if total > 0 { total } else { n }; }
                 total = total.saturating_add(n);
                 if (n as usize) < len { break; } // short read
@@ -4483,11 +4477,19 @@ fn sys_getrlimit(_resource: usize, rlim_ptr: usize) -> isize {
 ///
 /// All CPU-time fields are zero (no per-task accounting).  Wall-clock time is
 /// approximated from tick counter.
-fn sys_getrusage(_who: usize, usage_ptr: usize) -> isize {
+fn sys_getrusage(who: usize, usage_ptr: usize) -> isize {
     // struct rusage is 144 bytes on Linux.
     if !validate_user_buf(usage_ptr, 144) { return -14; }
     unsafe { core::ptr::write_bytes(usage_ptr as *mut u8, 0, 144); }
-    // ru_utime (offset 0) and ru_stime (offset 16) left as 0.
+    // ru_utime (offset 0) carries the task's whole CPU time (user and kernel
+    // are not separated — see `Task::cpu_ns`); ru_stime (offset 16) stays 0.
+    const RUSAGE_THREAD: usize = 1;
+    let ns = if who == RUSAGE_THREAD { sched::thread_cpu_ns(current_pid()) }
+             else { sched::process_cpu_ns(sched::current_tgid()) };
+    unsafe {
+        core::ptr::write(usage_ptr as *mut i64, (ns / 1_000_000_000) as i64);
+        core::ptr::write((usage_ptr + 8) as *mut i64, ((ns % 1_000_000_000) / 1000) as i64);
+    }
     // ru_maxrss (offset 32) — report a plausible 4 MiB RSS.
     unsafe { core::ptr::write((usage_ptr + 32) as *mut i64, 4096); }
     0
@@ -6760,19 +6762,66 @@ fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     r
 }
 
+
+/// Blocking retry for a read/write/send/recv that answered EAGAIN on a
+/// blocking fd — the replacement for the `irq_window(); yield_now(..)` spins
+/// that used to sit here.
+///
+/// Those spins kept a CPU 100 % busy for as long as a blocking read()er waited
+/// on an empty pipe or socket: greetd's PAM worker alone (recvfrom on a
+/// socketpair) pinned one host core for the life of the greeter, and every
+/// `cmd | cmd` pipeline with a slow side pinned another (2026-09-16).
+///
+/// Three-phase park on the poll wait-channel, exactly as poll()/epoll_wait do:
+/// publish Blocked with the fd's interest tag, re-issue the operation (a
+/// producer that changed the level between the first EAGAIN and the publish is
+/// caught here, and its wake — which found us already Blocked — makes the
+/// commit a no-op yield), then yield. The wake that releases us is the one a
+/// poll(POLLIN/POLLOUT) waiter on the same fd relies on, so the guarantee is
+/// no weaker than poll's. `hint` gives `(mask, deadline)`: a kind whose
+/// producers are trusted parks on its tag with no deadline; one without parks
+/// on the broadcast mask with a one-tick deadline — a 100 Hz re-probe, never a
+/// spin.
+fn block_until_ready(nonblock: bool, mut op: impl FnMut() -> isize, hint: impl Fn() -> (u64, u64)) -> isize {
+    loop {
+        let n = op();
+        if n != -11 || nonblock { return n; }
+        if interrupted() { return -4; } // EINTR
+        let (mask, deadline) = hint();
+        sched::block_on_poll_prepare_masked(deadline, mask);
+        let n = op();
+        if n != -11 { sched::block_on_poll_cancel(); return n; }
+        if interrupted() { sched::block_on_poll_cancel(); return -4; }
+        sched::block_on_poll_commit();
+    }
+}
+
+/// `block_until_ready` hint for a VFS fd: its producer tag, or broadcast + one
+/// tick when the kind has no trusted tagged producer.
+fn vfs_block_hint(pid: u32, fd: usize) -> (u64, u64) {
+    match vfs::fd_wake_tag(pid, fd) {
+        Some(tag) => (tag, u64::MAX),
+        None => (sched::POLL_TAG_ALL, sched::ticks() + 1),
+    }
+}
+
+/// `block_until_ready` hint for a socket fd (see `net_server::fd_wake_tag`).
+fn net_block_hint(pid: u32, fd: usize) -> (u64, u64) {
+    match net_server::fd_wake_tag(pid, fd) {
+        Some(tag) => (tag, u64::MAX),
+        None => (sched::POLL_TAG_ALL, sched::ticks() + 1),
+    }
+}
+
 /// Shared blocking wrapper for the four send/recv syscalls: a blocking
 /// socket loops on EAGAIN (EINTR-aware), a nonblocking one — O_NONBLOCK on
 /// the fd or MSG_DONTWAIT in `flags` — returns it straight through.
 fn net_blocking_op(pid: u32, sockfd: usize, flags: usize, msg: &Message) -> isize {
     const MSG_DONTWAIT: usize = 0x40;
     let nonblock = flags & MSG_DONTWAIT != 0 || net_fd_nonblock(pid, sockfd);
-    loop {
-        let n = net_reply_val(&net_server::handle(msg, pid));
-        if n != -11 || nonblock { return n; }
-        if interrupted() { return -4; } // EINTR
-        irq_window();
-        yield_now("net_blocking_op");
-    }
+    block_until_ready(nonblock,
+        || net_reply_val(&net_server::handle(msg, pid)),
+        || net_block_hint(pid, sockfd))
 }
 
 /// M4/M5 unix-socket exchange trace. Prints one line per connect/accept and

@@ -258,6 +258,13 @@ pub struct Task {
     pub weight:       u32,
     /// EEVDF weighted virtual runtime (NICE0-tick units).
     pub vruntime:     u64,
+    /// Nanoseconds this task has spent on a CPU (user + kernel, undivided),
+    /// charged at every switch-back with the dispatch clock. Backs
+    /// CLOCK_THREAD_CPUTIME_ID / CLOCK_PROCESS_CPUTIME_ID and getrusage's
+    /// ru_utime: tick-granular charging would credit a yield-spinner (many
+    /// sub-tick dispatches) with almost nothing, which is exactly the pattern
+    /// the pipe/idle tests exist to catch.
+    pub cpu_ns:       u64,
     /// EEVDF virtual deadline; the runnable, eligible task with the earliest
     /// deadline is picked next.
     pub vdeadline:    u64,
@@ -471,6 +478,7 @@ impl Task {
             on_cpu: None,
             weight: nice_to_weight(0),
             vruntime: 0,
+            cpu_ns: 0,
             vdeadline: 0,
             ctx: if entry == 0 {
                 CpuContext::zeroed()
@@ -847,6 +855,7 @@ impl Task {
             on_cpu: None,
             weight: nice_to_weight(0),
             vruntime: 0,
+            cpu_ns: 0,
             vdeadline: 0,
             ctx: crate::context::CpuContext::new_user_task_with_pt(user_entry, user_sp, kernel_stack_virt + kernel_stack_size, page_table),
             page_table,
