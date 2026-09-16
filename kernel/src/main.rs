@@ -696,6 +696,25 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         serial_print_str(" HHDM: ");
         serial_print_hex(hhdm_offset as usize);
         serial_print_str("\n");
+        // The whole map, once: which physical ranges the buddy owns and
+        // which it must never touch is the first question of every
+        // memory-corruption post-mortem, and it changes with guest RAM size.
+        for r in unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() } {
+            serial_print_str("[MEMMAP] ");
+            serial_print_hex(r.base as usize);
+            serial_print_str(" +");
+            serial_print_hex(r.length as usize);
+            serial_print_str(match r.kind {
+                boot::MemoryType::Available       => " usable\n",
+                boot::MemoryType::AcpiReclaimable => " acpi-reclaimable\n",
+                boot::MemoryType::AcpiNvs         => " acpi-nvs\n",
+                boot::MemoryType::BadMemory       => " bad\n",
+                _                                 => " reserved\n",
+            });
+        }
+        serial_print_str("[MEMMAP] buddy pages total=");
+        serial_print_hex(mm::buddy::total_pages());
+        serial_print_str("\n");
         serial_print_str("[MAIN] UART base: ");
         serial_print_hex(unsafe { BOOT_INFO.uart_base as usize });
         serial_print_str(" PCI ECAM: ");
@@ -727,6 +746,25 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         serial_print_hex(unsafe { BOOT_INFO.memory_map_len });
         serial_print_str(" HHDM: ");
         serial_print_hex(hhdm_offset as usize);
+        serial_print_str("\n");
+        // The whole map, once: which physical ranges the buddy owns and
+        // which it must never touch is the first question of every
+        // memory-corruption post-mortem, and it changes with guest RAM size.
+        for r in unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() } {
+            serial_print_str("[MEMMAP] ");
+            serial_print_hex(r.base as usize);
+            serial_print_str(" +");
+            serial_print_hex(r.length as usize);
+            serial_print_str(match r.kind {
+                boot::MemoryType::Available       => " usable\n",
+                boot::MemoryType::AcpiReclaimable => " acpi-reclaimable\n",
+                boot::MemoryType::AcpiNvs         => " acpi-nvs\n",
+                boot::MemoryType::BadMemory       => " bad\n",
+                _                                 => " reserved\n",
+            });
+        }
+        serial_print_str("[MEMMAP] buddy pages total=");
+        serial_print_hex(mm::buddy::total_pages());
         serial_print_str("\n");
         serial_print_str("[MAIN] UART base: ");
         serial_print_hex(unsafe { BOOT_INFO.uart_base as usize });

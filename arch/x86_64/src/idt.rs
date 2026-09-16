@@ -447,6 +447,37 @@ extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, e
         };
         print_exception(&isf, vector, error_code);
         if vector == 14 { serial_str(b"CR2=0x"); serial_hex64(cr2); serial_str(b"\r\n"); }
+        // The rest of the machine state a kernel-mode fault needs to be
+        // diagnosed from one serial dump: which CPU and task, which page
+        // table, the general registers (a corrupt pointer is usually still
+        // sitting in one of them), and the page-table walk of the faulting
+        // address so "not present" can be told apart from "wrong CR3".
+        serial_str(b"CR3=0x");   serial_hex64(cr3);
+        serial_str(b" CPU=0x");  serial_hex64(unsafe { sched::cpu_id() } as u64);
+        serial_str(b" PID=0x");  serial_hex64(sched::current_pid() as u64);
+        serial_str(b"\r\n");
+        serial_str(b"RAX=0x"); serial_hex64(frame.rax); serial_str(b" RBX=0x"); serial_hex64(frame.rbx);
+        serial_str(b" RCX=0x"); serial_hex64(frame.rcx); serial_str(b" RDX=0x"); serial_hex64(frame.rdx); serial_str(b"\r\n");
+        serial_str(b"RSI=0x"); serial_hex64(frame.rsi); serial_str(b" RDI=0x"); serial_hex64(frame.rdi);
+        serial_str(b" RBP=0x"); serial_hex64(frame.rbp); serial_str(b" R8 =0x"); serial_hex64(frame.r8);  serial_str(b"\r\n");
+        serial_str(b"R9 =0x"); serial_hex64(frame.r9);  serial_str(b" R10=0x"); serial_hex64(frame.r10);
+        serial_str(b" R11=0x"); serial_hex64(frame.r11); serial_str(b" R12=0x"); serial_hex64(frame.r12); serial_str(b"\r\n");
+        serial_str(b"R13=0x"); serial_hex64(frame.r13); serial_str(b" R14=0x"); serial_hex64(frame.r14);
+        serial_str(b" R15=0x"); serial_hex64(frame.r15); serial_str(b"\r\n");
+        if vector == 14 {
+            serial_str(b"page-table walk of CR2 in CR3:\r\n");
+            unsafe { super::paging::debug_walk_pte((cr3 & !0xFFF) as usize, cr2 as usize); }
+        }
+        // A few words of the kernel stack: the return addresses in them are
+        // the only backtrace a release kernel has.
+        serial_str(b"stack:");
+        for i in 0..24u64 {
+            let p = (frame.rsp + i * 8) as *const u64;
+            if (p as u64) < 0xFFFF_8000_0000_0000 { break; }
+            if i % 4 == 0 { serial_str(b"\r\n  "); }
+            serial_hex64(unsafe { p.read_volatile() }); serial_str(b" ");
+        }
+        serial_str(b"\r\n");
         loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
     }
 
