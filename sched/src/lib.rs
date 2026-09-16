@@ -1123,13 +1123,32 @@ pub fn set_current_altstack(sp: usize, size: usize, flags: u32) {
     }
 }
 
+/// setpgid(2) core: move `pid` into process group `pgid`. Returns false if no
+/// such process exists (ESRCH).
+///
+/// An exited-but-not-yet-waited-for child counts as existing, as it does on
+/// Linux, where the zombie's task_struct lives until it is reaped. This
+/// kernel takes a zombie off the run queue the moment it dies and keeps only
+/// its `EXIT_LOG` record, so the group has to be rewritten there: the
+/// job-control idiom `fork(); setpgid(child, child); waitpid(-child, ..)` is
+/// otherwise a race the parent loses whenever the child exits first (ESRCH
+/// from setpgid, or ECHILD from the wait because the record still carries
+/// the old group). Lock order is RUN_QUEUE then EXIT_LOG, as in `wait_scan`.
 pub fn set_pgid(pid: Pid, pgid: Pid) -> bool {
     let mut rq = RUN_QUEUE.lock();
     if let Some(t) = rq.find_pid_mut(pid) {
         t.pgid = pgid;
         return true;
     }
-    false
+    let mut log = EXIT_LOG.lock();
+    let mut found = false;
+    for rec in log.iter_mut().filter_map(|e| e.as_mut()) {
+        if rec.pid == pid && rec.is_process && !rec.consumed {
+            rec.pgid = pgid;
+            found = true;
+        }
+    }
+    found
 }
 
 pub fn euid_of(pid: Pid) -> u32 {

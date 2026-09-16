@@ -93,11 +93,25 @@ const MAX_TIMERS: usize = 8;
 mod nr {
     pub const TIMERFD_CREATE: i64 = 283;
     pub const TIMERFD_SETTIME: i64 = 286;
+    pub const TIMERFD_GETTIME: i64 = 287;
 }
 #[cfg(target_arch = "aarch64")]
 mod nr {
     pub const TIMERFD_CREATE: i64 = 85;
     pub const TIMERFD_SETTIME: i64 = 86;
+    pub const TIMERFD_GETTIME: i64 = 87;
+}
+
+const TFD_TIMER_ABSTIME: i64 = 1;
+const TFD_TIMER_CANCEL_ON_SET: i64 = 2;
+const POLLIN: i16 = 0x0001;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct pollfd {
+    pub fd: c_int,
+    pub events: i16,
+    pub revents: i16,
 }
 
 extern "C" {
@@ -115,6 +129,7 @@ extern "C" {
     pub fn syscall(sysno: c_long, ...) -> c_long;
 
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
+    pub fn poll(fds: *mut pollfd, nfds: u64, timeout: c_int) -> c_int;
     pub fn clock_gettime(clockid: clockid_t, tp: *mut timespec) -> c_int;
     pub fn clock_getres(clockid: clockid_t, res: *mut timespec) -> c_int;
     pub fn sigaction(sig: c_int, act: *const sigaction, oact: *mut sigaction) -> c_int;
@@ -176,6 +191,9 @@ pub unsafe extern "C" fn timer_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_alarm_and_setitimer_no_leak() { failures += 1; }
     if !test_clock_monotonic_subtick() { failures += 1; }
     if !test_timerfd_subtick_interval() { failures += 1; }
+    if !test_timerfd_abstime_future() { failures += 1; }
+    if !test_timerfd_abstime_past() { failures += 1; }
+    if !test_timerfd_relative_unchanged() { failures += 1; }
 
     puts(b"--- timertest done ---\n\0".as_ptr());
     failures
@@ -511,6 +529,172 @@ unsafe fn test_timerfd_subtick_interval() -> bool {
 
     close(tfd);
     report(name, n == 8 && count >= 2)
+}
+
+// ── 8–10. timerfd TFD_TIMER_ABSTIME ─────────────────────────────────────────
+//
+// sys_timerfd_settime used to drop its flags argument, so an absolute
+// it_value (a CLOCK_MONOTONIC reading) was armed as a *relative* interval and
+// fired at `now + now + delta` — roughly "uptime from now", growing with
+// uptime. The same landmine class as clock_nanosleep's TIMER_ABSTIME and
+// FUTEX_WAIT_BITSET before their fixes. These cases compute every expected
+// value from clock_gettime at run time so they hold at any uptime: run them
+// a few seconds after boot at least, when the bug's error would be seconds,
+// not the tens of milliseconds the bounds tolerate.
+
+unsafe fn now_ns() -> i64 {
+    let mut ts = core::mem::zeroed::<timespec>();
+    clock_gettime(CLOCK_MONOTONIC, &mut ts);
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+fn ts_from_ns(ns: i64) -> timespec {
+    timespec { tv_sec: ns / 1_000_000_000, tv_nsec: ns % 1_000_000_000 }
+}
+
+fn ts_to_ns(ts: &timespec) -> i64 { ts.tv_sec * 1_000_000_000 + ts.tv_nsec }
+
+unsafe fn tfd_settime(tfd: c_int, flags: i64, its: *const itimerspec, old: *mut itimerspec) -> c_long {
+    syscall(nr::TIMERFD_SETTIME, tfd as c_long, flags, its as c_long, old as c_long)
+}
+
+unsafe fn tfd_gettime(tfd: c_int) -> Option<itimerspec> {
+    let mut cur = core::mem::zeroed::<itimerspec>();
+    if syscall(nr::TIMERFD_GETTIME, tfd as c_long, &mut cur as *mut itimerspec as c_long) != 0 {
+        return None;
+    }
+    Some(cur)
+}
+
+/// Wait up to `timeout_ms` for the timerfd to become readable, then read it.
+/// Returns (expiration count, elapsed ns since `t0`), or None on failure.
+unsafe fn tfd_wait_read(tfd: c_int, t0: i64, timeout_ms: c_int) -> Option<(u64, i64)> {
+    let mut pfd = pollfd { fd: tfd, events: POLLIN, revents: 0 };
+    let pr = poll(&mut pfd, 1, timeout_ms);
+    let elapsed = now_ns() - t0;
+    if pr != 1 || pfd.revents & POLLIN == 0 { return None; }
+    let mut count: u64 = 0;
+    if read(tfd, &mut count as *mut u64 as *mut u8, 8) != 8 { return None; }
+    Some((count, elapsed))
+}
+
+// 8. An absolute deadline 300 ms ahead fires in [300, 400) ms, and gettime
+//    reports the remaining time (not the absolute timestamp) while armed.
+unsafe fn test_timerfd_abstime_future() -> bool {
+    let name = b"timerfd_abstime_future\0";
+
+    let tfd = syscall(nr::TIMERFD_CREATE, CLOCK_MONOTONIC as c_long, 0i64) as c_int;
+    if tfd < 0 { return report(name, false); }
+
+    let t0 = now_ns();
+    let its = itimerspec {
+        it_interval: timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value:    ts_from_ns(t0 + 300_000_000),
+    };
+    // CANCEL_ON_SET rides along: it must be accepted (ignored), not EINVAL.
+    if tfd_settime(tfd, TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET, &its, core::ptr::null_mut()) != 0 {
+        close(tfd);
+        return report(name, false);
+    }
+
+    // Remaining time must be relative and within the deadline: an
+    // implementation that stored the absolute value as an interval reports
+    // ~uptime here.
+    let armed = match tfd_gettime(tfd) { Some(c) => c, None => { close(tfd); return report(name, false); } };
+    let remaining = ts_to_ns(&armed.it_value);
+    let remaining_ok = remaining > 0 && remaining <= 300_000_000 + 2 * TICK_NS
+        && ts_to_ns(&armed.it_interval) == 0;
+
+    let fired = tfd_wait_read(tfd, t0, 2000);
+    let after = tfd_gettime(tfd);
+    close(tfd);
+
+    let (count, elapsed) = match fired { Some(v) => v, None => (0, -1) };
+    let fired_ok = count == 1 && elapsed >= 300_000_000 && elapsed < 400_000_000;
+    // One-shot: disarmed after the expiry was read.
+    let disarmed_ok = match after { Some(c) => ts_to_ns(&c.it_value) == 0, None => false };
+
+    print_kv(b"  abstime_future_remaining_ns=\0", remaining.max(0) as u64);
+    print_kv(b"  abstime_future_elapsed_ns=\0", elapsed.max(0) as u64);
+    print_kv(b"  abstime_future_count=\0", count);
+    report(name, remaining_ok && fired_ok && disarmed_ok)
+}
+
+// 9. An absolute deadline already in the past fires immediately, exactly
+//    once, and leaves the one-shot disarmed.
+unsafe fn test_timerfd_abstime_past() -> bool {
+    let name = b"timerfd_abstime_past\0";
+
+    let tfd = syscall(nr::TIMERFD_CREATE, CLOCK_MONOTONIC as c_long, 0i64) as c_int;
+    if tfd < 0 { return report(name, false); }
+
+    let t0 = now_ns();
+    // Half of uptime ago, floored at 1 ns (0 would mean "disarm").
+    let past = (t0 / 2).max(1);
+    let its = itimerspec {
+        it_interval: timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value:    ts_from_ns(past),
+    };
+    if tfd_settime(tfd, TFD_TIMER_ABSTIME, &its, core::ptr::null_mut()) != 0 {
+        close(tfd);
+        return report(name, false);
+    }
+
+    let fired = tfd_wait_read(tfd, t0, 2000);
+    let after = tfd_gettime(tfd);
+    close(tfd);
+
+    let (count, elapsed) = match fired { Some(v) => v, None => (0, -1) };
+    // "Immediately": well under the 300 ms a live deadline would take, with
+    // room for a couple of scheduler ticks of wake latency.
+    let fired_ok = count == 1 && elapsed >= 0 && elapsed < 100_000_000;
+    let disarmed_ok = match after { Some(c) => ts_to_ns(&c.it_value) == 0, None => false };
+
+    print_kv(b"  abstime_past_elapsed_ns=\0", elapsed.max(0) as u64);
+    print_kv(b"  abstime_past_count=\0", count);
+    report(name, fired_ok && disarmed_ok)
+}
+
+// 10. A relative 300 ms one-shot still fires in [300, 400) ms, and the
+//     old_value out-parameter reports the setting being replaced.
+unsafe fn test_timerfd_relative_unchanged() -> bool {
+    let name = b"timerfd_relative_unchanged\0";
+
+    let tfd = syscall(nr::TIMERFD_CREATE, CLOCK_MONOTONIC as c_long, 0i64) as c_int;
+    if tfd < 0 { return report(name, false); }
+
+    // Arm a far-off timer first so the real arming below has something to
+    // report back through old_value.
+    let far = itimerspec {
+        it_interval: timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value:    timespec { tv_sec: 10, tv_nsec: 0 },
+    };
+    if tfd_settime(tfd, 0, &far, core::ptr::null_mut()) != 0 { close(tfd); return report(name, false); }
+
+    let t0 = now_ns();
+    let its = itimerspec {
+        it_interval: timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value:    timespec { tv_sec: 0, tv_nsec: 300_000_000 },
+    };
+    let mut old = core::mem::zeroed::<itimerspec>();
+    if tfd_settime(tfd, 0, &its, &mut old) != 0 { close(tfd); return report(name, false); }
+    let old_ns = ts_to_ns(&old.it_value);
+    let old_ok = old_ns > 9_000_000_000 && old_ns <= 10_000_000_000 + 2 * TICK_NS;
+
+    let armed = match tfd_gettime(tfd) { Some(c) => c, None => { close(tfd); return report(name, false); } };
+    let remaining = ts_to_ns(&armed.it_value);
+    let remaining_ok = remaining > 0 && remaining <= 300_000_000 + 2 * TICK_NS;
+
+    let fired = tfd_wait_read(tfd, t0, 2000);
+    close(tfd);
+
+    let (count, elapsed) = match fired { Some(v) => v, None => (0, -1) };
+    let fired_ok = count == 1 && elapsed >= 300_000_000 && elapsed < 400_000_000;
+
+    print_kv(b"  relative_old_value_ns=\0", old_ns.max(0) as u64);
+    print_kv(b"  relative_remaining_ns=\0", remaining.max(0) as u64);
+    print_kv(b"  relative_elapsed_ns=\0", elapsed.max(0) as u64);
+    report(name, old_ok && remaining_ok && fired_ok)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

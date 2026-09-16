@@ -7569,18 +7569,26 @@ pub fn poll_deadline_tick() {
         // the idle-desktop wake storm that stopped ext-idle-notify's `Idled`
         // from ever firing. `timerfd_due` is now "a timerfd expired on THIS
         // pass", not "a stale deadline is still <= now".
-        let timerfd_due = if tfd != u64::MAX && now >= tfd {
-            vfs::fold_expired_timerfds(now) > 0
+        let timerfd_tags = if tfd != u64::MAX && now >= tfd {
+            vfs::fold_expired_timerfds(now)
         } else {
-            false
+            0
         };
         // Wake the poll-channel waiters whose PER-TASK deadline has passed (or
         // all, if a timerfd expired this pass), and republish the hint to the
         // EXACT earliest remaining deadline — all under one RUN_QUEUE hold. The
         // per-task deadline is the authority, so unlike the old single-global
         // `store(u64::MAX)` this can't clobber a deadline a concurrent waiter is
-        // registering (M7 lost-wake). Contended tick just retries next tick.
-        sched::service_poll_deadlines(now, timerfd_due);
+        // registering (M7 lost-wake). A contended tick retries the per-task
+        // deadlines next tick by itself — they are still `<= now` then — but
+        // the timerfd edge is NOT retried: the fold above already disarmed a
+        // one-shot (advanced a periodic), so `earliest_timerfd_deadline` stops
+        // reporting it and the waiter would sleep until its own timeout. Hand
+        // the expired timerfds' tags to the deferred-wake path, which the next
+        // tick pays with `try_wake_poll_tagged` (and re-arms on contention).
+        if !sched::service_poll_deadlines(now, timerfd_tags != 0) && timerfd_tags != 0 {
+            sched::request_poll_wake_tagged(timerfd_tags);
+        }
     }
     // Pay any wake a pipe deferred because it only advanced an object's edge
     // `seq` without changing its readable/writable level (see
@@ -8070,9 +8078,38 @@ fn sys_timerfd_create(_clockid: usize, flags: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
+/// `TFD_TIMER_ABSTIME` — timerfd_settime's absolute-deadline mode.
+const TFD_TIMER_ABSTIME: usize = 1;
+/// `TFD_TIMER_CANCEL_ON_SET` — only meaningful for CLOCK_REALTIME timers when
+/// the wall clock is stepped. This kernel has one clock and never steps it, so
+/// the flag is accepted and ignored (a rejection would break callers that set
+/// it unconditionally).
+const TFD_TIMER_CANCEL_ON_SET: usize = 2;
+
 /// timerfd_settime(fd, flags, new_value_ptr, old_value_ptr)
-/// Reads itimerspec {interval, value} from new_value_ptr (2×16 bytes).
-fn sys_timerfd_settime(fd: usize, _flags: usize, new_ptr: usize, _old_ptr: usize) -> isize {
+///
+/// Reads itimerspec {interval, value} from new_value_ptr (2×16 bytes) and
+/// hands the vfs an ABSOLUTE deadline on the monotonic clock `clock_gettime`
+/// reports, whichever way the caller expressed it:
+///
+/// * with `TFD_TIMER_ABSTIME`, `it_value` already is that reading (every
+///   clockid here is the same monotonic clock). This used to be ignored and
+///   the value armed as a relative interval, firing at `uptime + deadline` —
+///   the same landmine `sys_clock_nanosleep`'s TIMER_ABSTIME and
+///   FUTEX_WAIT_BITSET had. Nothing in the desktop passed it yet
+///   (calloop/polling arm relative timeouts), but glib and every "fire at T"
+///   loop does;
+/// * without it, `it_value` is added to `monotonic_ns()` NOW — not to the
+///   tick counter. A relative deadline expressed in whole ticks from the
+///   current tick ignores the fraction of the tick already elapsed and fires
+///   up to 10 ms early by clock_gettime's reckoning; a 300 ms timer armed
+///   late in a tick came back at 297 ms. Linux converts relative to absolute
+///   at settime for the same reason.
+///
+/// `old_value_ptr`, if given, receives the timer's previous setting exactly as
+/// timerfd_gettime would report it, before the new one is armed.
+fn sys_timerfd_settime(fd: usize, flags: usize, new_ptr: usize, old_ptr: usize) -> isize {
+    if flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0 { return -22; } // EINVAL
     if new_ptr == 0 || !validate_user_buf(new_ptr, 32) { return -14; } // EFAULT
     let (value_ns, interval_ns) = unsafe {
         let p = new_ptr as *const i64;
@@ -8080,12 +8117,30 @@ fn sys_timerfd_settime(fd: usize, _flags: usize, new_ptr: usize, _old_ptr: usize
         let iv_nsec = p.add(1).read();// interval.tv_nsec
         let vl_sec  = p.add(2).read();// value.tv_sec
         let vl_nsec = p.add(3).read();// value.tv_nsec
-        let interval = (iv_sec as u64) * 1_000_000_000 + (iv_nsec as u64);
-        let value    = (vl_sec as u64) * 1_000_000_000 + (vl_nsec as u64);
+        if iv_sec < 0 || iv_nsec < 0 || iv_nsec >= 1_000_000_000
+            || vl_sec < 0 || vl_nsec < 0 || vl_nsec >= 1_000_000_000 {
+            return -22; // EINVAL
+        }
+        let interval = (iv_sec as u64).saturating_mul(1_000_000_000).saturating_add(iv_nsec as u64);
+        let value    = (vl_sec as u64).saturating_mul(1_000_000_000).saturating_add(vl_nsec as u64);
         (value, interval)
     };
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_TIMERFD_SETTIME, &[fd as u64, value_ns, interval_ns]);
+    if old_ptr != 0 {
+        if !validate_user_buf(old_ptr, 32) { return -14; }
+        // The vfs writes the itimerspec straight into user memory, so the
+        // fetch has to happen while the old setting is still in place.
+        let gmsg = make_vfs_msg(vfs::VFS_TIMERFD_GETTIME, &[fd as u64, old_ptr as u64]);
+        let r = vfs_reply_val(&vfs::handle(&gmsg, pid));
+        if r < 0 { return r; }
+    }
+    // 0 keeps its itimerspec meaning of "disarm"; any other value becomes an
+    // absolute deadline (a relative value is never 0 after the add, since
+    // monotonic_ns() is nonzero once the clock has ticked).
+    let deadline_ns = if value_ns == 0 { 0 }
+        else if flags & TFD_TIMER_ABSTIME != 0 { value_ns }
+        else { monotonic_ns().saturating_add(value_ns).max(1) };
+    let msg = make_vfs_msg(vfs::VFS_TIMERFD_SETTIME, &[fd as u64, deadline_ns, interval_ns]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 

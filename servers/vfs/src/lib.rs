@@ -72,7 +72,7 @@ pub const VFS_RENAME:      u64 = 0x22; // rename(old_ptr, new_ptr) — rename /t
 pub const VFS_FD_PATH:     u64 = 0x23; // fd_path(fd, buf_ptr, buf_len) → len or -errno
 pub const VFS_EVENTFD:     u64 = 0x24; // eventfd2(initval, flags) → fd or -errno
 pub const VFS_TIMERFD_CREATE:  u64 = 0x25; // timerfd_create(clockid) → fd
-pub const VFS_TIMERFD_SETTIME: u64 = 0x26; // timerfd_settime(fd, flags, new_ns, interval_ns)
+pub const VFS_TIMERFD_SETTIME: u64 = 0x26; // timerfd_settime(fd, deadline_ns (absolute monotonic; 0 = disarm), interval_ns)
 pub const VFS_TIMERFD_GETTIME: u64 = 0x27; // timerfd_gettime(fd, out_ptr)
 pub const VFS_IOCTL:           u64 = 0x28; // ioctl(fd, cmd, arg) → result or -errno
 pub const VFS_RMDIR:           u64 = 0x29; // rmdir(path_ptr) → 0 or -errno
@@ -5847,20 +5847,36 @@ fn handle_timerfd_create(pid: u32, flags: u32) -> Message {
     val_reply(fd as u64)
 }
 
-fn handle_timerfd_settime(pid: u32, fd: usize, value_ns: u64, interval_ns: u64) -> Message {
+/// Arm (or disarm, `deadline_ns == 0`) a timerfd.
+///
+/// `deadline_ns` is ABSOLUTE on the monotonic clock `clock_gettime` reports
+/// (`ticks × 10 ms + sub-tick fraction`); the kernel has already added a
+/// relative `it_value` to the current reading (see `sys_timerfd_settime`).
+/// The deadline tick is the first tick at or after that instant — rounded
+/// UP like `sys_clock_nanosleep`'s absolute path and the FUTEX_WAIT_BITSET
+/// deadline, so a timerfd is never observed expired before the instant it
+/// was armed for.
+///
+/// A deadline already in the past is not an error and not a disarm: the
+/// timer fires immediately (one expiration for a one-shot; for a periodic
+/// timer the missed periods are counted as overruns by
+/// `timerfd_poll_expirations`, as Linux's `hrtimer_forward_now` does).
+fn handle_timerfd_settime(pid: u32, fd: usize, deadline_ns: u64, interval_ns: u64) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
     let slot = match tbl.fds[fd].kind { VnodeKind::TimerFd { slot } => slot, _ => return err_reply(-22) };
     drop(tbls);
     const NS_PER_TICK: u64 = 10_000_000;
-    let now = sched::ticks();
     let mut pool = TIMERFD_POOL.lock();
     let e = &mut pool[slot];
-    if value_ns == 0 { e.armed = false; e.expirations = 0; }
+    if deadline_ns == 0 { e.armed = false; e.expirations = 0; }
     else {
         e.armed = true;
-        e.deadline_ticks = now + (value_ns / NS_PER_TICK).max(1);
+        // `.max(1)`: deadline_ticks == 0 is the free-slot sentinel
+        // (`is_free`), and a deadline under one tick would otherwise make a
+        // live fd's slot look reclaimable once its expiry has been read.
+        e.deadline_ticks = deadline_ns.div_ceil(NS_PER_TICK).max(1);
         // Sub-tick periodic interval must round up, not down to one-shot:
         // interval_ticks == 0 means one-shot, so any nonzero interval_ns
         // shorter than NS_PER_TICK has to floor at 1 tick, not truncate to 0.
@@ -5902,8 +5918,9 @@ pub fn earliest_timerfd_deadline() -> u64 {
 /// `timerfd_poll_expirations` would when its owner polls it — one-shots are
 /// disarmed, periodics are re-armed onto their next future deadline, and the
 /// missed-expiration count is accumulated (never cleared, so a later poll/read
-/// still observes the expiry). Returns the number of timerfds that expired on
-/// this pass. Called from the 100 Hz `poll_deadline_tick`.
+/// still observes the expiry). Returns the OR of the poll tags of every
+/// timerfd that expired on this pass (0 = none), so the caller can wake or
+/// defer exactly those interests. Called from the 100 Hz `poll_deadline_tick`.
 ///
 /// Why this exists: an armed one-shot timerfd whose owner does not promptly
 /// consume it (e.g. a compositor briefly descheduled) used to sit `armed` with
@@ -5915,10 +5932,10 @@ pub fn earliest_timerfd_deadline() -> u64 {
 /// Folding here retires each expiry once, turning the perpetual `timerfd_due`
 /// into a single edge per expiration. IRQ-context safe: try_lock only
 /// (82d0cc3 invariant — no user memory touched, no cross-server call).
-pub fn fold_expired_timerfds(now: u64) -> u32 {
+pub fn fold_expired_timerfds(now: u64) -> u64 {
     let mut pool = match TIMERFD_POOL.try_lock() { Some(p) => p, None => return 0 };
-    let mut folded = 0u32;
-    for e in pool.iter_mut() {
+    let mut tags = 0u64;
+    for (slot, e) in pool.iter_mut().enumerate() {
         if e.armed && now >= e.deadline_ticks {
             let elapsed = now - e.deadline_ticks;
             if e.interval_ticks > 0 {
@@ -5929,10 +5946,10 @@ pub fn fold_expired_timerfds(now: u64) -> u32 {
                 e.expirations += 1;
                 e.armed = false; // one-shot: retire (expiry preserved in `expirations`)
             }
-            folded += 1;
+            tags |= sched::poll_tag(sched::poll_class::TIMERFD, slot as u32);
         }
     }
-    folded
+    tags
 }
 
 fn handle_timerfd_gettime(pid: u32, fd: usize, out_ptr: usize) -> Message {
