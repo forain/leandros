@@ -1504,6 +1504,7 @@ pub fn register_poll_deadline(deadline: u64) {
 pub struct TaskCensusRow {
     pub pid: Pid,
     pub tgid: Pid,
+    /// 0 Ready, 1 Running, 2 Blocked, 3 Zombie, 4 Stopped.
     pub state: u8,
     pub blocked_on: u32,
     pub poll_deadline: u64,
@@ -1537,6 +1538,7 @@ pub fn task_rows(out: &mut [TaskCensusRow]) -> usize {
                 state: match t.state {
                     task::TaskState::Ready => 0, task::TaskState::Running => 1,
                     task::TaskState::Blocked => 2, task::TaskState::Zombie => 3,
+                    task::TaskState::Stopped => 4,
                 },
                 blocked_on: t.blocked_on.unwrap_or(0xFFFF_FFFF),
                 poll_deadline: t.poll_deadline,
