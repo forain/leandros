@@ -48,6 +48,15 @@ pub struct DrmFramebuffer {
     pub offsets: [u32; 4], // Byte offset of each plane
     pub pitches: [u32; 4], // Pitch of each plane
     pub physical_addresses: [u64; 4], // Physical address of each plane
+    /// Host virtio-gpu resource of a **host-memory blob** BO this framebuffer
+    /// wraps, or 0 for every other kind. Such a buffer has no guest pages
+    /// (`physical_addresses[0] == 0`), so it cannot be CPU-copied into the
+    /// console's resource 1 the way dumb buffers are; it is presented by
+    /// pointing the scanout at the blob itself (SET_SCANOUT_BLOB). This is
+    /// what a GBM buffer rendered by Zink/Venus is.
+    pub blob_res: u32,
+    /// `VIRTIO_GPU_FORMAT_*` for `format`, as SET_SCANOUT_BLOB wants it.
+    pub virtio_format: u32,
 }
 
 impl DrmFramebuffer {
@@ -77,6 +86,8 @@ impl DrmFramebuffer {
             offsets,
             pitches,
             physical_addresses,
+            blob_res: 0,
+            virtio_format: 0,
         }
     }
 
@@ -94,6 +105,8 @@ impl DrmFramebuffer {
             offsets,
             pitches,
             physical_addresses: [0u64; 4],
+            blob_res: 0,
+            virtio_format: 0,
         }
     }
 

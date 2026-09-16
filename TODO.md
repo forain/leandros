@@ -533,15 +533,15 @@ taught you in `artifacts/notes/`** — a finding whose only evidence was a delet
 is a finding nobody can re-check. **Any permanent fix belongs on the LeandrOS side** — kernel,
 shims, or our own launcher — never in COSMIC.
 
-**ONE PERMANENT patch now violates this**, down from two:
-`ports/cosmic-session/0001-env_rx-timeout-fallback.patch`.
+**ZERO permanent COSMIC patches remain (2026-09-15)**, down from two.
 (`ports/busd/current-thread-runtime.patch` is fine — busd is ours.) The greeter's
 `0001-locker-idle-without-logind.patch` is **RETIRED, not merely justified** — deleted, with
-the behaviour it patched around removed by a staging decision instead. See item 11. The session one **fires every boot** — `handshake did not complete`,
-so every session runs on a 5 s fallback and no child receives cosmic-comp's exported
-environment — and its recorded root cause, "a tokio-integration residual", is **asserted, not
-demonstrated**. Under this policy that patch is a standing debt with an unproven
-justification: root-cause it and fix it on our side, or demonstrate why it cannot be. Everything beneath COSMIC — kernel, libc,
+the behaviour it patched around removed by a staging decision instead. The session's
+`0001-env_rx-timeout-fallback.patch` is **RETIRED too** — deleted, the vendored source
+byte-identical to upstream again, the pristine binary restaged, and `SetEnv` measured
+arriving on 5/5 boots per arch (see item 11). Its recorded root cause, "a tokio-integration
+residual", was never true: it was a kernel `shutdown(2)` bug (`2d9f0c8`) and then the poll
+wake broadcast (`daaf2cc`). Everything beneath COSMIC — kernel, libc,
 system libraries, daemons — is ours. **This constraint stays load-bearing**: the missing
 dmabuf global is behind cosmic-comp's `!is_software` gate (item 3), and the reachable
 outcome there is a measurement, not a patch. The one place it looked like it would force an
@@ -1630,7 +1630,13 @@ though on aarch64 a hand-started `cosmic-workspaces` is photographed drawing a r
 `pop-launcher` by bare name via `PATH`, a binary that is neither built nor staged; its
 `ERROR pop-launcher failed to start` line is now *positive* evidence that the launcher
 itself is running, since a component still blocked in the probe never reaches its
-backend. That is item 8's remaining half, not this one's.
+backend. That is item 8's remaining half, not this one's. **DONE 2026-09-15:**
+`pop-launcher` is built (upstream `a332a3a`, the revision cosmic-launcher's Cargo.lock
+pins, unmodified) and staged as `/usr/bin/pop-launcher` plus the `desktop_entries` and
+`cosmic_toplevel` plugins under `/usr/lib/pop-launcher/plugins/` — hardlinks to the one
+multicall binary. `cosmic-launcher input term` from the console hands the query to the
+running instance over D-Bus and the launcher lists **COSMIC Terminal** (photographed, both
+arches). `ports/pop-launcher/README.md` has the recipe and the plugin decisions.
 
 **A staging gap worth knowing about.** `scripts/mkfs-f2fs-populated.py` stages the guest
 half of the census harness from `~/code/leandros-artifacts/m6-session-data/`, but the file
@@ -1997,8 +2003,9 @@ activation does at a real COSMIC session start is **untested**.
 
 Policy is in *Goal* (Standing context): **temporary debug edits to COSMIC are allowed and
 encouraged**; permanent ones are not, and every permanent fix belongs on the LeandrOS side.
-**One of the two is now gone outright** (the greeter's); what is left is the session's, whose
-cause is fixed and whose deletion is therefore justified but not yet done.
+**Both are gone outright.** The greeter's went by a staging decision; the session's
+(`0001-env_rx-timeout-fallback.patch`) was **RETIRED 2026-09-15** — see the measurement
+below. `ports/` now carries no COSMIC source patch at all.
 
 **ROOT-CAUSED AND FIXED (`2d9f0c8`). The cause was a kernel `shutdown(2)` bug, and the
 recorded "tokio-integration residual" was never demonstrated because it was never true.**
@@ -2029,28 +2036,39 @@ with the fix, i.e. `env_rx` resolving on its own. The literal `handshake did not
 line is *unrecoverable*: `cosmic-session` and `busd` inherit one redirected fd with
 independent file offsets and overwrite each other by offset, and cosmic-session's line is
 visibly clobbered mid-line in **both** runs. Do not read its absence as evidence.
-**Retiring the patch is now justified and is the next step, not yet taken.** It is applied
-*in place* in `~/code/leandros-artifacts/m6-session-bins/src/cosmic-session/src/main.rs`,
-so removing it needs a clean musl rebuild plus a re-staged image — and shipping a reverted
-tree with a patched binary still in the image is worse than either.
+**RETIRED 2026-09-15.** The vendored tree
+`~/code/leandros-artifacts/m6-session-bins/src/cosmic-session` is byte-identical to
+`../cosmic-epoch/cosmic-session` again (`diff -r` clean), both musl binaries were rebuilt
+from it and restaged as `out/cosmic-session-{aarch64,x86_64}`, and the patch file is
+deleted. Measured on the pristine binary, `Starting cosmic-session` → `got environmental
+variables from cosmic-comp`, five consecutive boots per arch: **aarch64/HVF 8.86 s (first
+boot of a fresh image), then 1.64 / 1.75 / 1.71 / 1.65 s; x86_64/TCG 8.36 s, then
+8.35 s, 57.25 s, 7.96 s, 8.32 s.** `SetEnv` arrived every time, zero panics, panel + dock + wallpaper rendered
+every time. **One x86_64 outlier, open:** boot 3's handshake took 57.25 s with nothing in
+the session log between `starting process … cosmic-comp` and `got environmental variables`
+— no compositor exit, no restart, so cosmic-comp itself was slow to reach `SetEnv` (or its
+message was slow to be read); the desktop still rendered. Not the constant 40 s herd of
+`daaf2cc` (that was deterministic), and without the patch such a boot simply waits instead
+of racing a fallback. If it recurs, split comp-side from pipe-side the way the SMP hunt did:
+spawn comp through a wrapper that redirects its stdout to a file. Note what cosmic-comp
+actually exports: only `WAYLAND_DISPLAY=wayland-1`, the
+very value the fallback hard-coded — so the patch's live cost was never the child
+environment's *contents*, it was spawning every child at t+5 s whether or not the
+compositor was ready. The ~7 s first-boot excess is first-run work (cosmic-comp/cosmic-config
+writing defaults); it did not recur. `8d0bb66`'s "late SetEnv panics the dropped receiver"
+hunk is gone with the rest: with the handshake resolving there is no dropped receiver.
+`ports/cosmic-session/README.md` holds the history; do not bring the patch back.
 **Two risks the fix leaves open, stated because nothing in-tree covers them:**
 `tcp_time_wait` passes but never calls `shutdown`, so the `tcp::Socket::close()` path is
 **still unexercised**; and the new `ENOTCONN` on listeners/unconnected sockets — POSIX-
 correct, previously a silent success — is untested by anything we ship.
 
-**`ports/cosmic-session/0001-env_rx-timeout-fallback.patch` — the real one.** It races
-`env_rx` against a 5 s timeout and falls back to `WAYLAND_DISPLAY=wayland-1`. It **fires every
-boot** (`handshake did not complete`), so **no child process ever receives the environment
-cosmic-comp exports** — every one launches with only `WAYLAND_DISPLAY=wayland-1
-XDG_SESSION_TYPE=wayland`. That is a live functional difference on every session, not a
-cosmetic patch, and its recorded cause — "a tokio-integration residual" — is **asserted, never
-demonstrated**. **Root-cause it on our side.** The handshake is a socket exchange over
-`COSMIC_SESSION_SOCK`; the plausible failure surfaces are our `SCM_RIGHTS`/`AF_UNIX`
-implementation, `socketpair` semantics, or fd inheritance across `execve` — all ours, all
-testable in `scmtest` (currently **32/0**), which is where a guard for it would live.
-**Worth suspecting a shared cause with item 6:** a session whose env handshake never completes
-and a compositor that ignores input are both "cosmic-comp is running but not talking to
-anything", and it would be a mistake to assume they are unrelated before checking.
+**`ports/cosmic-session/0001-env_rx-timeout-fallback.patch` — RETIRED 2026-09-15** (the
+paragraph above has the numbers). What this entry used to say — "fires every boot",
+"root-cause it on our side", "the plausible failure surfaces are our AF_UNIX
+implementation" — was right about the direction and wrong about the surface: it was
+`shutdown(2)` (`2d9f0c8`), guarded in `scmtest` since, and then the poll-wake broadcast
+(`daaf2cc`). Kept as one line so the history of the survey stays readable.
 
 **`ports/cosmic-greeter/0001-locker-idle-without-logind.patch` — RETIRED, and the way it went
 is worth copying.** The old recommendation here ("stop shipping cosmic-greeter at all") died
@@ -2691,12 +2709,13 @@ Updated 2026-08-10. The first two are no longer "next" — they are in flight or
 ### Corrections this survey forces
 
 - **"Run COSMIC *unmodified*… No COSMIC source patches" is not true of the tree.** Three
-  patches existed under `ports/` when this was written: `cosmic-session/0001-env_rx-timeout-fallback.patch`,
+  patches existed under `ports/` when this was written: `cosmic-session/0001-env_rx-timeout-fallback.patch`
+  (**since retired 2026-09-15 — see item 11**),
   `cosmic-greeter/0001-locker-idle-without-logind.patch` (**since retired — see item 11**), and
-  `busd/current-thread-runtime.patch` (busd is ours, so that one is fine). **The session patch is still firing every boot** —
-  `handshake did not complete` — so every session runs on a 5 s fallback and **no child ever
-  receives cosmic-comp's exported environment**; its recorded root cause ("a tokio-integration
-  residual") is asserted, not demonstrated. The *intent* — don't fork COSMIC to make it work —
+  `busd/current-thread-runtime.patch` (busd is ours, so that one is fine). The session patch
+  fired every boot at the time — `handshake did not complete` — on a 5 s fallback, and its
+  recorded root cause ("a tokio-integration residual") was asserted, not demonstrated; the
+  real causes were kernel-side and are fixed. The *intent* — don't fork COSMIC to make it work —
   is clearly still honoured; the claim of zero patches is what is false. **Second absolute rule
   in one day that a two-command check refutes** (the first was "the repo is Rust-only").
   **Resolved as policy, not by dropping the rule** (see *Goal* in Standing context): temporary

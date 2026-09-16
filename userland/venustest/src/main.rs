@@ -480,6 +480,38 @@ struct DrmPrimeHandle {
 }
 const DRM_IOCTL_PRIME_HANDLE_TO_FD: c_ulong = 0xC00C642D;
 const DRM_IOCTL_PRIME_FD_TO_HANDLE: c_ulong = 0xC00C642E;
+
+/// `struct drm_mode_fb_cmd2`, for building a framebuffer over a blob BO.
+#[repr(C)]
+#[derive(Default)]
+struct DrmModeFbCmd2 {
+    fb_id: u32,
+    width: u32,
+    height: u32,
+    pixel_format: u32,
+    flags: u32,
+    handles: [u32; 4],
+    pitches: [u32; 4],
+    offsets: [u32; 4],
+    modifier: [u64; 4],
+}
+const DRM_IOCTL_MODE_ADDFB2: c_ulong = 0xC06864B8;
+const DRM_IOCTL_MODE_RMFB: c_ulong = 0xC00464AF;
+const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
+
+/// ADDFB2 of a 32x32 XRGB8888 single-plane framebuffer over `handle`; the
+/// fb_id on success, 0 on refusal. Removed again by the caller.
+unsafe fn addfb2_32x32(fd: c_int, handle: u32) -> u32 {
+    let mut fb = DrmModeFbCmd2 {
+        width: 32,
+        height: 32,
+        pixel_format: DRM_FORMAT_XRGB8888,
+        ..Default::default()
+    };
+    fb.handles[0] = handle;
+    fb.pitches[0] = 32 * 4;
+    if ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &mut fb as *mut _) == 0 { fb.fb_id } else { 0 }
+}
 const SEEK_END: c_int = 2;
 const SEEK_SET: c_int = 0;
 
@@ -2189,6 +2221,180 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
                 let _ = gem_close(fd_a, hh);
             } else {
                 out(b"  (no host3d blob on this host - skipping host-side export checks)\n");
+            }
+        }
+        if fd_a >= 0 { close(fd_a); }
+        if fd_b >= 0 { close(fd_b); }
+    }
+
+    // ── phase 5b: PRIME import of a blob into ANOTHER open ───────────────────
+    //
+    // WHY THIS EXISTS. `PRIME_FD_TO_HANDLE` used to echo the EXPORTER's gem
+    // handle across the fd. Blob handles are scoped to the open that created
+    // them, so the very next ioctl the importer issued on that handle —
+    // RESOURCE_INFO, which Mesa's Venus backend runs in
+    // `virtgpu_bo_create_from_dma_buf` — was refused as an unknown handle.
+    // Under Zink that is cosmic-comp importing a client's `zwp_linux_dmabuf`
+    // buffer: the import failed, the compositor answered `create_immed` with a
+    // protocol error, and cosmic-panel died on every start. Upstream's
+    // `drm_gem_prime_fd_to_handle` gives each drm_file its own handle on the
+    // shared object; this asserts that shape, both directions of isolation,
+    // the dedup of a repeat import, and that the importer's handle alone keeps
+    // the object alive once the exporter has let go.
+    //
+    // The HOST3D half is the Zink scanout shape exactly: a buffer rendered on
+    // the render node, exported, imported on card0 by `zink_bo_get_kms_handle`,
+    // and handed to ADDFB2 — which must accept the importer's handle, and must
+    // refuse a handle the open cannot reach rather than build a framebuffer
+    // over guest address 0.
+    out(b"--- phase 5b: PRIME import of a blob into another open ---\n");
+    {
+        let fd_a = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let fd_b = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if fd_a < 0 || fd_b < 0 {
+            if !report(b"phase5b_open_two_fds", false) { failures += 1; }
+        } else {
+            let _ = ctx_init_venus(fd_a);
+            let _ = ctx_init_venus(fd_b);
+
+            const P5B_SIZE: u64 = 0x3000;
+            let mut blob = DrmVirtgpuResourceCreateBlob {
+                blob_mem: VIRTGPU_BLOB_MEM_GUEST,
+                blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+                size: P5B_SIZE,
+                ..Default::default()
+            };
+            let rc = ioctl(fd_a, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, &mut blob as *mut _);
+            let have = rc == 0 && blob.bo_handle != 0;
+            if !report(b"phase5b_guest_blob_created", have) { failures += 1; }
+            if have {
+                let h = blob.bo_handle;
+                let mut ph = DrmPrimeHandle { handle: h, flags: 0, fd: -1 };
+                let exported =
+                    ioctl(fd_a, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _) == 0 && ph.fd >= 0;
+                if !report(b"phase5b_export", exported) { failures += 1; }
+                if exported {
+                    let mut pb = DrmPrimeHandle { handle: 0, flags: 0, fd: ph.fd };
+                    let imported =
+                        ioctl(fd_b, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut pb as *mut _) == 0
+                            && pb.handle != 0;
+                    if !report(b"phase5b_import_into_other_open", imported) { failures += 1; }
+                    if imported {
+                        let hb = pb.handle;
+                        if !report(b"phase5b_importer_gets_own_handle", hb != h) { failures += 1; }
+
+                        let mut ia = DrmVirtgpuResourceInfo { bo_handle: h, res_handle: 0, size: 0, blob_mem: 0 };
+                        let mut ib = DrmVirtgpuResourceInfo { bo_handle: hb, res_handle: 0, size: 0, blob_mem: 0 };
+                        let ra = ioctl(fd_a, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &mut ia as *mut _) == 0;
+                        let rb = ioctl(fd_b, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &mut ib as *mut _) == 0;
+                        if !report(b"phase5b_importer_resource_info", rb) { failures += 1; }
+                        let same = ra && rb && ia.res_handle != 0 && ia.res_handle == ib.res_handle
+                            && ib.size as u64 == P5B_SIZE && ib.blob_mem == VIRTGPU_BLOB_MEM_GUEST;
+                        if !report(b"phase5b_import_names_same_resource", same) { failures += 1; }
+
+                        // The importer maps the very pages the exporter maps.
+                        let mut alias_ok = false;
+                        let mut ma = DrmVirtgpuMap { offset: 0, handle: h, pad: 0 };
+                        let mut mb = DrmVirtgpuMap { offset: 0, handle: hb, pad: 0 };
+                        let map_ok = ioctl(fd_b, DRM_IOCTL_VIRTGPU_MAP, &mut mb as *mut _) == 0;
+                        if !report(b"phase5b_importer_can_map", map_ok) { failures += 1; }
+                        if map_ok && ioctl(fd_a, DRM_IOCTL_VIRTGPU_MAP, &mut ma as *mut _) == 0 {
+                            let pa = mmap(core::ptr::null_mut(), P5B_SIZE as size_t,
+                                          PROT_READ | PROT_WRITE, MAP_SHARED, fd_a, ma.offset as i64);
+                            let pbm = mmap(core::ptr::null_mut(), P5B_SIZE as size_t,
+                                           PROT_READ | PROT_WRITE, MAP_SHARED, fd_b, mb.offset as i64);
+                            if pa as isize > 0 && pbm as isize > 0 {
+                                *(pa as *mut u32) = 0x1A5B_C0DE;
+                                alias_ok = *(pbm as *const u32) == 0x1A5B_C0DE;
+                            }
+                        }
+                        if !report(b"phase5b_import_aliases_exporter_pages", alias_ok) { failures += 1; }
+
+                        // Isolation runs both ways: the exporter cannot use the
+                        // importer's handle any more than the reverse.
+                        if !report(b"phase5b_exporter_cannot_reach_importer_handle",
+                                   resource_info_rc(fd_a, hb) != 0) { failures += 1; }
+
+                        // A repeat import answers with the handle already held,
+                        // and a self-import with the original.
+                        let mut pb2 = DrmPrimeHandle { handle: 0, flags: 0, fd: ph.fd };
+                        let dedup = ioctl(fd_b, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut pb2 as *mut _) == 0
+                            && pb2.handle == hb;
+                        if !report(b"phase5b_repeat_import_dedups", dedup) { failures += 1; }
+                        let mut pa2 = DrmPrimeHandle { handle: 0, flags: 0, fd: ph.fd };
+                        let selfi = ioctl(fd_a, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut pa2 as *mut _) == 0
+                            && pa2.handle == h;
+                        if !report(b"phase5b_self_import_returns_original", selfi) { failures += 1; }
+
+                        // Lifetime: the exporter drops its handle AND its fd; the
+                        // importer's handle is a reference of its own.
+                        let _ = gem_close(fd_a, h);
+                        close(ph.fd);
+                        if !report(b"phase5b_importer_handle_keeps_object_alive",
+                                   resource_info_rc(fd_b, hb) == 0) { failures += 1; }
+                        if !report(b"phase5b_importer_gem_close", gem_close(fd_b, hb) == 0) { failures += 1; }
+                        if !report(b"phase5b_importer_handle_gone_after_close",
+                                   resource_info_rc(fd_b, hb) != 0) { failures += 1; }
+                    } else {
+                        close(ph.fd);
+                        let _ = gem_close(fd_a, h);
+                    }
+                } else {
+                    let _ = gem_close(fd_a, h);
+                }
+            }
+
+            // HOST3D: the Zink scanout shape.
+            let mut hblob = DrmVirtgpuResourceCreateBlob {
+                blob_mem: VIRTGPU_BLOB_MEM_HOST3D,
+                blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+                size: 32 * 32 * 4,
+                ..Default::default()
+            };
+            let hrc = ioctl(fd_a, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, &mut hblob as *mut _);
+            if hrc == 0 && hblob.bo_handle != 0 {
+                let hh = hblob.bo_handle;
+                let mut ph = DrmPrimeHandle { handle: hh, flags: 0, fd: -1 };
+                let exported =
+                    ioctl(fd_a, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _) == 0 && ph.fd >= 0;
+                let mut pb = DrmPrimeHandle { handle: 0, flags: 0, fd: ph.fd };
+                let imported = exported
+                    && ioctl(fd_b, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut pb as *mut _) == 0
+                    && pb.handle != 0 && pb.handle != hh;
+                if !report(b"phase5b_host3d_import_into_other_open", imported) { failures += 1; }
+                if imported {
+                    let hb = pb.handle;
+                    let mut ib = DrmVirtgpuResourceInfo { bo_handle: hb, res_handle: 0, size: 0, blob_mem: 0 };
+                    let rb = ioctl(fd_b, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &mut ib as *mut _) == 0
+                        && ib.blob_mem == VIRTGPU_BLOB_MEM_HOST3D && ib.res_handle != 0;
+                    if !report(b"phase5b_host3d_import_resource_info", rb) { failures += 1; }
+
+                    // The importer builds a framebuffer over its handle: no 2D
+                    // resource, no backing to attach, just the blob's own host
+                    // resource recorded for SET_SCANOUT_BLOB.
+                    let fb_b = addfb2_32x32(fd_b, hb);
+                    if !report(b"phase5b_addfb2_on_imported_host3d_blob", fb_b != 0) { failures += 1; }
+                    if fb_b != 0 {
+                        let mut id = fb_b;
+                        let _ = ioctl(fd_b, DRM_IOCTL_MODE_RMFB, &mut id as *mut _);
+                    }
+                    // The exporter's own handle is just as good a framebuffer.
+                    let fb_a = addfb2_32x32(fd_a, hh);
+                    if !report(b"phase5b_addfb2_on_exporter_host3d_blob", fb_a != 0) { failures += 1; }
+                    if fb_a != 0 {
+                        let mut id = fb_a;
+                        let _ = ioctl(fd_a, DRM_IOCTL_MODE_RMFB, &mut id as *mut _);
+                    }
+                    // A handle this open cannot reach is refused, not wrapped in
+                    // a framebuffer over guest address 0.
+                    if !report(b"phase5b_addfb2_unreachable_handle_refused",
+                               addfb2_32x32(fd_a, hb) == 0) { failures += 1; }
+                    let _ = gem_close(fd_b, hb);
+                }
+                if exported { close(ph.fd); }
+                let _ = gem_close(fd_a, hh);
+            } else {
+                out(b"  (no host3d blob on this host - skipping host3d import checks)\n");
             }
         }
         if fd_a >= 0 { close(fd_a); }

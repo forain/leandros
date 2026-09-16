@@ -1895,6 +1895,19 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         && ph2.handle == cd.handle;
     if !report(b"PRIME_FD_TO_HANDLE", import_ok) { failures += 1; }
 
+    // A dumb buffer's handles are deliberately global (ADDFB2, the console and
+    // PRIME consume them with no open identity), so importing its fd on a
+    // SECOND open answers with the very same handle — unlike a blob, whose
+    // importer is minted a handle of its own (venustest phase 5b).
+    let fd_other = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    let mut ph3 = DrmPrimeHandle::default();
+    ph3.fd = ph.fd;
+    let other_ok = fd_other >= 0 && export_ok
+        && ioctl(fd_other, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut ph3 as *mut _) == 0
+        && ph3.handle == cd.handle;
+    if !report(b"PRIME_FD_TO_HANDLE_OTHER_OPEN_DUMB", other_ok) { failures += 1; }
+    if fd_other >= 0 { close(fd_other); }
+
     if export_ok { close(ph.fd); }
 
     // ── fork() with a device mapping live ────────────────────────────────────

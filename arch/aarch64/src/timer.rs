@@ -20,6 +20,19 @@ static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAST_TICK_CNT: AtomicU64 = AtomicU64::new(0);
 static MONO_LAST_NS:  AtomicU64 = AtomicU64::new(0);
 
+/// CNTVCT_EL0 at each CPU's most recent tick (0 = timer not started yet).
+/// `check_alive` compares it against the counter to catch a virtual timer
+/// that stopped delivering: the countdown is only ever re-armed from inside
+/// `on_tick`, so a single lost interrupt silences that CPU's tick forever —
+/// and on the BSP that freezes `TICK_COUNT`, every `nanosleep`, every poll
+/// deadline and the audio pump at once, with no panic and no output.
+const TIMER_MAX_CPUS: usize = 8;
+static LAST_TICK_CNT_CPU: [AtomicU64; TIMER_MAX_CPUS] =
+    [const { AtomicU64::new(0) }; TIMER_MAX_CPUS];
+/// Times `check_alive` had to re-arm this CPU's timer (for the watchdog line).
+static REARMS: [core::sync::atomic::AtomicU32; TIMER_MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; TIMER_MAX_CPUS];
+
 /// Read the always-on virtual counter.
 #[inline]
 fn cntvct() -> u64 {
@@ -110,6 +123,45 @@ pub fn init() {
     }
 }
 
+/// Self-check for a silently dead local timer; re-arms it if so.
+///
+/// Called by the scheduler wherever it opens an IRQ window. If this CPU has
+/// had interrupts enabled and still not ticked for `2 s` of counter time, the
+/// virtual timer is not going to fire on its own (its countdown expired and
+/// was never reloaded — the `on_tick` reload is the only one), so reload it
+/// here and say so on the raw UART. Cost on the normal path: one counter read
+/// and a compare. Returns true when a re-arm was needed.
+pub fn check_alive() -> bool {
+    let cpu = unsafe { super::smp::arch_cpu_id() }.min(TIMER_MAX_CPUS - 1);
+    let last = LAST_TICK_CNT_CPU[cpu].load(Ordering::Relaxed);
+    if last == 0 { return false; }
+    let now = cntvct();
+    let f = freq();
+    if f == 0 || now.wrapping_sub(last) < 2 * f { return false; }
+    // Claim the report so a spinning caller prints once per episode.
+    if LAST_TICK_CNT_CPU[cpu].compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return false;
+    }
+    let n = REARMS[cpu].fetch_add(1, Ordering::Relaxed) + 1;
+    let ctl: u64;
+    let cval: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntv_ctl_el0", out(reg) ctl, options(nomem, nostack));
+        core::arch::asm!("mrs {}, cntv_cval_el0", out(reg) cval, options(nomem, nostack));
+        core::arch::asm!("msr cntv_tval_el0, {}", in(reg) interval(), options(nomem, nostack));
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack));
+        core::arch::asm!("isb", options(nomem, nostack));
+    }
+    extern "C" { fn arch_serial_putc(c: u8); fn print_number(n: u32); fn print_hex(n: usize); }
+    fn s(m: &str) { for &b in m.as_bytes() { unsafe { arch_serial_putc(b) } } }
+    s("\n[TIMER] cpu"); unsafe { print_number(cpu as u32) };
+    s(" virtual timer silent for "); unsafe { print_number((now.wrapping_sub(last) / (f / 1000).max(1)) as u32) };
+    s(" ms with IRQ windows open: cntv_ctl="); unsafe { print_hex(ctl as usize) };
+    s(" cval-now="); unsafe { print_hex(cval.wrapping_sub(now) as usize) };
+    s(" re-armed (#"); unsafe { print_number(n) }; s(")\n");
+    true
+}
+
 /// Called from the IRQ handler when PPI #27 fires (Virtual Timer).
 ///
 /// Reloads the (banked, per-CPU) countdown register.  Global timekeeping and
@@ -122,6 +174,7 @@ pub fn on_tick() {
     }
 
     let cpu = unsafe { super::smp::arch_cpu_id() };
+    LAST_TICK_CNT_CPU[cpu.min(TIMER_MAX_CPUS - 1)].store(cntvct(), Ordering::Relaxed);
     if cpu == 0 {
         // Anchor the sub-tick interpolation BEFORE publishing the new tick, so a
         // concurrent reader can only ever see an anchor that is at most one tick

@@ -1202,6 +1202,53 @@ def main():
         m4_share_dirs.add("/usr/bin")
         m5_exec_files.append(("/usr/bin", "env", coreutils_bin))
 
+    # pop-launcher — the search backend behind cosmic-launcher. The frontend
+    # spawns it as `Command::new("pop-launcher")` with piped stdin/stdout
+    # (pop-launcher-service client.rs), so it is a PATH lookup and /usr/bin is
+    # the natural home. Without it the launcher window opens, logs
+    # `pop-launcher failed to start`, and every query returns nothing.
+    #
+    # One multicall binary serves the service AND every plugin, dispatching on
+    # the basename of argv[0] (bin/src/main.rs). The service discovers plugins
+    # by walking /usr/lib/pop-launcher/plugins/<name>/plugin.ron and execs
+    # `<that dir>/<bin.path>` — upstream's justfile symlinks each plugin name
+    # back to the main binary; here each is a HARDLINK (add_files_to_dir dedupes
+    # by host path), so no symlink resolution is needed at exec time and the
+    # image grows by one dentry per plugin, not one 10 MB copy.
+    #
+    # Only plugins whose runtime exists on this image are staged:
+    #   desktop_entries  .desktop search over XDG_DATA_DIRS/applications — the
+    #                    launcher's core function. Its startup GPU probe asks
+    #                    net.hadess.SwitcherooControl on the system bus (aliased
+    #                    to busd); busd's ServiceUnknown reply lets it fall
+    #                    through instead of hanging before the first search.
+    #   cosmic_toplevel  open-window switching over cosmic-comp's toplevel-info
+    #                    protocol; needs only WAYLAND_DISPLAY.
+    # Left out: calc (execs qalc), pulse (PulseAudio), pop_shell (GNOME ext),
+    # web/terminal/files/find/recent/scripts (browser, terminal-by-name, fd,
+    # recently-used.xbel, user scripts — nothing here provides them yet).
+    #
+    # Sources: the binary is a musl cross-build of upstream pop-os/launcher at
+    # the exact revision cosmic-launcher's Cargo.lock pins (a332a3a, the
+    # epoch-1.3.0 submodule), unmodified; the plugin.ron files come from the
+    # same pinned checkout in the ../cosmic-epoch sibling.
+    popl_bin = os.path.expanduser(
+        f"~/code/leandros-artifacts/m6-session-bins/out/pop-launcher-{arch}")
+    popl_src = os.path.expanduser("~/code/cosmic-epoch/pop-launcher/plugins/src")
+    if os.path.exists(popl_bin):
+        m4_share_dirs.add("/usr/bin")
+        m5_exec_files.append(("/usr/bin", "pop-launcher", popl_bin))
+        for _plugin in ("desktop_entries", "cosmic_toplevel"):
+            _ron = f"{popl_src}/{_plugin}/plugin.ron"
+            if not os.path.exists(_ron):
+                print(f"  WARNING: pop-launcher plugin {_plugin}: {_ron} absent, not staged")
+                continue
+            _pdir = f"/usr/lib/pop-launcher/plugins/{_plugin}"
+            for _d in ("/usr/lib/pop-launcher", "/usr/lib/pop-launcher/plugins", _pdir):
+                m4_share_dirs.add(_d)
+            m4_share_files.append((_pdir, "plugin.ron", _ron))
+            m5_exec_files.append((_pdir, _plugin.replace("_", "-"), popl_bin))
+
     # ── disks-rs: the disk-provisioning end-to-end path ──────────────────────
     # disktester (AerynOS's disks-rs, built UNMODIFIED from the sibling
     # checkout) drives the whole block layer in one run: ftruncate a 32 GiB
