@@ -4042,6 +4042,11 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
         // dup2'd back onto 1/2) is console output too.
         f if (matches!(f, 1 | 2) && !vfs::fd_redirected(pid, f))
             || (f < net_server::SOCK_FD_BASE && vfs::fd_is_console_stdio(pid, f)) => {
+            // Job control (TOSTOP): a background writer of its controlling
+            // console takes SIGTTOU; see console_read_check for the shape.
+            let jc = tty_server::console_write_check();
+            if jc != 0 { return jc; }
+
             let mut kbuf = Vec::with_capacity(count);
             unsafe { kbuf.set_len(count); }
 
@@ -4142,6 +4147,15 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                 && vfs::fd_vt_number(current_pid(), f) != Some(0)) => {
             if count == 0 { return 0; }
             if !is_kernel && !validate_user_buf(buf_ptr, count) { return -14; }
+            // Job control: a background process of the console's session
+            // reading its controlling terminal is stopped with SIGTTIN (EIO if
+            // it cannot be) before any input is consumed. The stop runs
+            // inside the check; it returns once the group is continued in
+            // the foreground, or with the errno to report.
+            if !is_kernel {
+                let jc = tty_server::console_read_check();
+                if jc != 0 { return jc; }
+            }
             // Edge-triggered epoll consumers (crossterm/mio's TTY reader is
             // exactly this) set O_NONBLOCK and expect a "readable" epoll
             // notification to be followed by read-until-EAGAIN, not a
@@ -4322,6 +4336,9 @@ fn sys_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
     let console = (matches!(fd, 1 | 2) && !vfs::fd_redirected(pid, fd))
         || (fd < net_server::SOCK_FD_BASE && vfs::fd_is_console_stdio(pid, fd));
     if console {
+        // Same TOSTOP job-control gate as sys_write's console arm.
+        let jc = tty_server::console_write_check();
+        if jc != 0 { return jc; }
         // Gather every iovec into ONE kernel buffer, then hand the console a
         // single write. musl's stdio and tracing's fmt layer both emit a log
         // line as a multi-iovec writev; writing them one iovec at a time let
