@@ -153,6 +153,14 @@ pub fn console_fg_pgid() -> u32 { *CONSOLE_FG_PGID.lock() }
 /// that put ITS record in raw mode (ISIG off) while ITSELF foreground keeps
 /// receiving ^C as an ordinary byte for its line editor.
 pub fn console_intercept_byte(b: u8) -> bool {
+    // Ctrl-T on the serial line dumps the run queue (`sched::dump_tasks`), the
+    // one way to ask a wedged userspace where its threads are parked. Serial
+    // only — the framebuffer console never comes through here — and taken
+    // before the ISIG intercept so it works with no foreground process group.
+    if b == 0x14 {
+        sched::dump_tasks();
+        return true;
+    }
     let pgid = *CONSOLE_FG_PGID.lock();
     if pgid == 0 { return false; }
     let (lflag, cc) = {
