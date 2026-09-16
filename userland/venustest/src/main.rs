@@ -743,6 +743,15 @@ unsafe fn poll_in_ready(fd: c_int) -> bool {
     poll(&mut p as *mut PollFd, 1, 0) == 1 && (p.revents & POLLIN) != 0
 }
 
+/// `poll_in_ready` with a deadline: does `fd` become readable within
+/// `timeout_ms`? This is `sim_syncobj_wait`'s shape — the same `poll(POLLIN)`,
+/// given time — and the honest question for a fence that is only signalled
+/// when the host retires the work.
+unsafe fn poll_in_within(fd: c_int, timeout_ms: c_int) -> bool {
+    let mut p = PollFd { fd, events: POLLIN, revents: 0 };
+    poll(&mut p as *mut PollFd, 1, timeout_ms) == 1 && (p.revents & POLLIN) != 0
+}
+
 /// SIMULATE_SYNCOBJ: the out-fence fd Mesa's venus backend demands.
 ///
 /// WHY THIS PHASE EXISTS, AND WHAT EACH SUBTEST WOULD CATCH.
@@ -832,8 +841,10 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
     if !report(b"phase7_syncobj_probe_fence_fd_written", probe_fd >= 3) { failures += 1; }
 
     // [GUARD] Guarded on `probe_fd >= 3` so an unpatched kernel fails here
-    // without this test ever polling fd 0.
-    let signalled = probe_fd >= 3 && poll_in_ready(probe_fd);
+    // without this test ever polling fd 0. The probe's fence is "everything
+    // submitted so far on this open"; with asynchronous submission that may
+    // still be in flight, so give it the time a real waiter would.
+    let signalled = probe_fd >= 3 && poll_in_within(probe_fd, 2000);
     if !report(b"phase7_syncobj_probe_fd_signalled", signalled) { failures += 1; }
 
     // [GUARD] `sim_syncobj_submit`/`sim_syncobj_export` reach the fd only
@@ -863,13 +874,44 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
     if !report(b"phase7_submit_fence_fd_out_written", sub_ok) { failures += 1; }
     let first_fd = sub.fence_fd;
     if first_fd >= 3 {
-        if !report(b"phase7_submit_fence_fd_signalled", poll_in_ready(first_fd)) {
+        if !report(b"phase7_submit_fence_fd_signalled", poll_in_within(first_fd, 2000)) {
             failures += 1;
         }
         close(first_fd);
     } else if !report(b"phase7_submit_fence_fd_signalled", false) {
         failures += 1;
     }
+
+    // ── 2b. The fence is a FENCE: unsignalled until the host retires it ─────
+    // Submission is asynchronous (the ioctl returns at the ring kick), so an
+    // out-fence minted pre-signalled would tell `vkWaitForFences` the work is
+    // done while the GPU still runs it. Four fenced submissions back to back:
+    // QEMU retires a fence from its 10 ms fence poll at the earliest, the
+    // ioctls return in microseconds, so the fds must NOT be readable on return
+    // — asserted as "at least one of the four", which is the strongest claim
+    // that survives a host answering faster than the ioctl chain — and every
+    // one must become readable once the host has answered.
+    let mut fds = [-1i32; 4];
+    let mut pending_at_return = 0;
+    let mut minted = 0;
+    for slot in fds.iter_mut() {
+        let mut e = exec_req(EXECBUF_FENCE_FD_OUT, &stream, &[], 0);
+        if ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e as *mut _) == 0 && e.fence_fd >= 3 {
+            *slot = e.fence_fd;
+            minted += 1;
+            if !poll_in_ready(e.fence_fd) { pending_at_return += 1; }
+        }
+    }
+    if !report(b"phase7_fence_fd_minted_x4", minted == 4) { failures += 1; }
+    if !report(b"phase7_fence_fd_unsignalled_at_return", pending_at_return >= 1) { failures += 1; }
+    let mut all_signalled = minted == 4;
+    for &f in fds.iter() {
+        if f >= 3 {
+            if !poll_in_within(f, 2000) { all_signalled = false; }
+            close(f);
+        }
+    }
+    if !report(b"phase7_fence_fd_signals_within_2s", all_signalled) { failures += 1; }
 
     // ── 3. Lifetime: 64 submits must consume no fds on net ───────────────────
     // [GUARD] Fails on an unpatched kernel because `first_fd` is 0, not >= 3.
@@ -1611,12 +1653,30 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
         // only possible once handles are resolved rather than ignored.
         if blob.bo_handle != 0 {
             // A submission that names a real BO is accepted, and the BO can
-            // then be waited on.
+            // then be waited on. WAIT without NOWAIT blocks until the fence
+            // retires (upstream: up to 15 s, -EBUSY after), so a 0 here means
+            // the host really answered.
             let rc = exec_with_bos(fd, &[blob.bo_handle]);
             if !report(b"execbuffer_with_bo_handles", rc == 0) { failures += 1; }
             if !report(b"virtgpu_wait_after_bo_exec", wait_bo(fd, blob.bo_handle) == 0) {
                 failures += 1;
             }
+            // NOWAIT is the probe: asked right after the kick it must say
+            // "busy" (submission is asynchronous and QEMU retires fences from
+            // a 10 ms poll), and a blocking WAIT afterwards must still answer 0.
+            // "At least once in three" is the hedge against a host that
+            // answers faster than the ioctl chain.
+            const VIRTGPU_WAIT_NOWAIT: u32 = 1;
+            let mut busy_seen = 0;
+            let mut settled = true;
+            for _ in 0..3 {
+                if exec_with_bos(fd, &[blob.bo_handle]) != 0 { settled = false; break; }
+                let mut w = DrmVirtgpu3dWait { handle: blob.bo_handle, flags: VIRTGPU_WAIT_NOWAIT };
+                if ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &mut w as *mut _) != 0 { busy_seen += 1; }
+                if wait_bo(fd, blob.bo_handle) != 0 { settled = false; }
+            }
+            if !report(b"virtgpu_wait_nowait_busy_after_kick", busy_seen >= 1) { failures += 1; }
+            if !report(b"virtgpu_wait_blocks_until_retired", settled) { failures += 1; }
         }
 
         // A submission naming a handle that was never allocated must be refused

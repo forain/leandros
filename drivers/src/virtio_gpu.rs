@@ -96,8 +96,23 @@ pub struct VirtioGpuDevice {
     /// Monotonically increasing fence id.  Never reused, never zero: the host
     /// treats fence_id 0 as "no fence" on some paths.
     next_fence_id: u64,
-    /// Highest fence id the host has retired (completed the used-ring entry for).
-    last_completed_fence: u64,
+    /// Every fence id `<= fence_floor` has retired. Fences that retired ahead
+    /// of a lower unretired one (a Venus ring finishing before an older
+    /// submission on another ring) wait in `fences_ahead` until the floor
+    /// reaches them, so `fence_retired` is exact rather than a watermark that
+    /// would declare an unfinished fence done because a later one finished.
+    fence_floor: u64,
+    /// Retired fence ids above `fence_floor`; 0 marks a free slot. Sized to the
+    /// control queue, which bounds how many fences can be outstanding at all.
+    fences_ahead: Vec<u64>,
+    /// Control-queue commands the host has not answered yet, indexed by the
+    /// head descriptor of their chain. See `Inflight`.
+    inflight: Vec<Option<Inflight>>,
+    /// Pages whose command has completed but which were reaped in tick context,
+    /// where the buddy allocator must not be entered. Drained by the next
+    /// `submit`/`submit_async` from task context. Capacity reserved at init so
+    /// a push never allocates.
+    deferred_free: Vec<(usize, usize)>,
     /// Next 3D context id to hand out.  Context 0 means "no context".
     next_ctx_id: u32,
     /// Next resource id for 3D/blob resources.  1 is the console scanout and 2
@@ -258,26 +273,42 @@ pub const VIRTIO_GPU_RESP_OK_MAP_INFO: u32 = 0x1106;
 
 /// Set once the first SUBMIT_3D reply is seen not to echo the fence we asked
 /// for, so the diagnosis is stated once instead of once per frame.
-// ── Control-queue stall census ───────────────────────────────────────────────
+// ── Control-queue census ─────────────────────────────────────────────────────
 //
-// `submit` answers the host SYNCHRONOUSLY, by spinning the vCPU until the used
-// ring moves (see the `spin_loop` below). Every SET_SCANOUT, RESOURCE_FLUSH,
-// TRANSFER_TO_HOST and ATTACH_BACKING therefore blocks whoever called it for a
-// whole host round trip — and under Venus the host has real GPU work behind
-// that round trip, where softpipe had a memcpy.
+// Presents, transfers and SUBMIT_3D are submitted asynchronously (`submit_async`)
+// and cost the vCPU only the enqueue; commands whose reply is needed (`submit`)
+// still spin the vCPU for a host round trip, with the tick let in. Under Venus
+// the host has real GPU work behind a fenced round trip, where softpipe had a
+// memcpy — which is why the split matters.
 //
 // The cursor queue is deliberately NOT counted here: it is fire-and-forget (a
 // single read-only descriptor, no response), so cursor motion cannot stall.
 // That asymmetry is itself diagnostic — if a freeze correlates with input that
 // moves only the cursor, this is not where it is.
 //
-// `ctrlq_us` against `ctrlq_n` gives the mean round trip; `ctrlq_max` catches
-// the outlier a mean hides. `ctrlq_to` counts the 100M-iteration bail-out,
-// which also prints `[GPU] control-queue TIMEOUT` on its own.
+// `ctrlq_n` counts every command kicked. `ctrlq_us` is the vCPU time spent
+// waiting — synchronous round trips plus ring-full waits — against
+// `ctrlq_sync` for the mean; `ctrlq_max` catches the outlier a mean hides.
+// `ctrlq_to` counts the bounded-wait bail-out, which also prints
+// `[GPU] control-queue TIMEOUT` on its own.
 pub static CTRLQ_CMDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static CTRLQ_SPIN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static CTRLQ_SPIN_MAX_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static CTRLQ_TIMEOUTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Commands submitted without waiting (`submit_async`) / with a spin (`submit`).
+/// `ctrlq_us` above now counts only the spinning half plus ring-full waits —
+/// the vCPU time the queue actually costs — while `ctrlq_lat_us` is how long
+/// the asynchronous commands took the host to answer, which nobody waited for.
+pub static CTRLQ_ASYNC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CTRLQ_SYNC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CTRLQ_ASYNC_LAT_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CTRLQ_ASYNC_LAT_MAX_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Times a submit found the ring full and had to wait for the host.
+pub static CTRLQ_ROOM_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Asynchronous commands the host answered with an error (nobody else sees it).
+pub static CTRLQ_ASYNC_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Pages a tick-context reap could neither free nor defer. Should stay 0.
+pub static CTRLQ_LEAKED_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 static SUBMIT3D_FENCE_ECHO_WARNED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -482,6 +513,116 @@ pub fn order_for_bytes(bytes: usize) -> usize {
     }
 }
 
+/// One control-queue chain the host has not answered yet. Indexed by its
+/// head descriptor in `VirtioGpuDevice::inflight`. `Copy` so a reap can lift it
+/// out before mutating the device.
+#[derive(Clone, Copy)]
+struct Inflight {
+    req_phys: usize, req_order: usize,
+    /// 0 when the command carried no payload descriptor.
+    pay_phys: usize, pay_order: usize,
+    resp_phys: usize, resp_order: usize, resp_capacity: usize,
+    /// 0 = unfenced.
+    fence_id: u64,
+    hdr_type: u32,
+    /// `monotonic_us` at kick, for the completion-latency census.
+    submitted_us: u64,
+    /// A `submit` caller is spinning on `done`; the reaper must not free the
+    /// buffers, the caller reads the reply out of them.
+    sync: bool,
+    done: bool,
+    resp_type: u32,
+}
+
+/// Bound on any control-queue wait, in spin iterations (each ≤ one
+/// `irq_window` in 256). The device answering nothing for this long is wedged.
+const CTRLQ_WAIT_ITERS: u64 = 100_000_000;
+
+/// All fence ids `<= GPU_FENCE_FLOOR` have retired. Lock-free mirror of
+/// `VirtioGpuDevice::fence_floor` for the DRM layer's out-fence service, which
+/// runs from the tick and must not take `VIRTIO_GPU`.
+pub static GPU_FENCE_FLOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A reap retired at least one fence and the DRM layer has not been told yet.
+/// Set under `VIRTIO_GPU` (any context), consumed by `ctrlq_tick`.
+static FENCE_EVENT_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Called by `ctrlq_tick` after fences retired: the DRM layer's out-fence and
+/// VIRTGPU_WAIT service. Returns false if it could not finish (a try_lock
+/// lost) and wants to be called again next tick. Installed by the DRM layer.
+static FENCE_EVENT_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+static CTRLQ_CORRUPT_WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Register the fence-event service (`fn() -> bool`). One hook; the last
+/// registration wins.
+pub fn set_fence_event_hook(f: fn() -> bool) {
+    FENCE_EVENT_HOOK.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Tick-hook entry: reap the control queue if the device is free, then pay any
+/// pending fence notification. Never blocks — `try_lock` on the device and
+/// no allocation or free inside — so it is safe from the 100 Hz tick on any CPU.
+/// Called from `drm_device_interface::drm_tick`.
+pub fn ctrlq_tick() {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+    if let Some(mut g) = VIRTIO_GPU.try_lock() {
+        if let Some(gpu) = g.as_mut() {
+            if gpu.ctrlq_reap(false) { FENCE_EVENT_PENDING.store(true, Release); }
+        }
+    }
+    if FENCE_EVENT_PENDING.swap(false, AcqRel) {
+        let p = FENCE_EVENT_HOOK.load(Acquire);
+        if p != 0 {
+            // SAFETY: only ever written by `set_fence_event_hook` from a `fn() -> bool`.
+            let f: fn() -> bool = unsafe { core::mem::transmute::<usize, fn() -> bool>(p) };
+            if !f() { FENCE_EVENT_PENDING.store(true, Release); }
+        }
+    }
+}
+
+
+/// Release the preempt-disable taken for a spin window on EVERY exit from
+/// the wait — timeout, panic unwind, or any future `?`. Leaking the count
+/// would wedge preemption on this CPU for good.
+///
+/// Why a window at all: syscalls run with IRQs masked, so a spin here would
+/// otherwise park the vCPU at IF=0 for the whole host round trip and stop
+/// the tick — poll deadlines unmet, `nanosleep` overslept, the audio pump
+/// starved, no page-flip deliveries. `irq_window()` lets the tick in. But
+/// the tick's `preempt_check` would then `yield_now()` while the caller
+/// still holds `VIRTIO_GPU` (and often the DRM device mutex above it); the
+/// next task to touch the GPU spins at IF=0 forever on that mutex and the
+/// holder never runs again — a deterministic hang on one vCPU. So the
+/// window runs with preemption disabled: tick yes, switch no. The count is
+/// released without a resched (`PREEMPT_NEEDED` stays set, so the switch
+/// happens at the next `preempt_check`, where no GPU lock is held).
+///
+/// Gated on IRQs being masked at entry: the boot console reaches this code
+/// before `timer::init`, with interrupts *enabled*, and `irq_window()` ends
+/// by masking — running it there would hand back a CPU with them off.
+struct SpinWindow { open: bool }
+impl SpinWindow {
+    fn new() -> Self {
+        let open = sched::irqs_masked() && sched::current_pid() != 0;
+        if open { sched::preempt_disable(); }
+        SpinWindow { open }
+    }
+    /// One iteration in 256, not every one: `sti; pause; cli` forces a TCG
+    /// exit and costs two to three orders of magnitude more than a bare
+    /// `spin_loop`, and the bail-out below is an iteration count.
+    #[inline]
+    fn pulse(&self, iter: u64) {
+        if self.open && iter & 0xFF == 0 { sched::irq_window(); }
+    }
+}
+impl Drop for SpinWindow {
+    fn drop(&mut self) {
+        if self.open { sched::preempt_enable_no_resched(); }
+    }
+}
+
+
 impl VirtioGpuDevice {
     pub fn new() -> Option<Self> {
         let dev = find_device(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_GPU)?;
@@ -608,7 +749,10 @@ impl VirtioGpuDevice {
             features_hi: 0,
             shmem,
             next_fence_id: 1,
-            last_completed_fence: 0,
+            fence_floor: 0,
+            fences_ahead: Vec::new(),
+            inflight: Vec::new(),
+            deferred_free: Vec::new(),
             next_ctx_id: 1,
             next_3d_resource_id: 16,
             current_resource_id: 0,
@@ -730,12 +874,22 @@ impl VirtioGpuDevice {
             if self.queues[1].is_none() {
                 cdebug("[GPU] no cursor queue; hardware cursor disabled\n");
             }
+            // In-flight bookkeeping for the control queue, sized once from the
+            // negotiated ring: one slot per descriptor (a chain's head can be
+            // any of them), one pending-fence slot per descriptor (every fence
+            // rides exactly one chain), and room to defer every buffer of every
+            // chain so a tick-context reap never allocates.
+            let qsize = self.queues[0].as_ref().map(|q| q.size as usize).unwrap_or(0);
+            self.inflight = alloc::vec![None; qsize];
+            self.fences_ahead = alloc::vec![0u64; qsize.max(1)];
+            self.deferred_free = Vec::with_capacity(qsize * 3 + 8);
 
             // 7. Set DRIVER_OK status bit
             status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER_OK);
         }
         crate::pci::rdebug("[GPU] VirtIO GPU initialized\n");
     }
+
 
     unsafe fn setup_queue(&mut self, id: u16) -> Option<VirtioQueue> {
         let cfg = self.common_cfg;
@@ -748,9 +902,9 @@ impl VirtioGpuDevice {
         // per page (the avail ring fits ≤2045, the used ring ≤511).  A device
         // is free to advertise a larger queue, so cap to what fits and round
         // down to a power of two (queue_size must be a power of two), then
-        // negotiate the reduced size back to the device.  This driver issues
-        // commands synchronously — one descriptor chain outstanding at a time —
-        // so even a small queue is ample.
+        // negotiate the reduced size back to the device.  The in-flight table
+        // (`inflight`) is sized from the result, so up to a ring's worth of
+        // chains can be outstanding at once.
         const MAX_FIT: u16 = (4096 / core::mem::size_of::<VirtqDesc>()) as u16; // 256
         let capped = max_size.min(MAX_FIT);
         // floor to a power of two; `capped` is in [1, 256] here.
@@ -800,48 +954,207 @@ impl VirtioGpuDevice {
         })
     }
 
-    /// Submit one control-queue command and block until the host completes it.
+    // ---------------------------------------------------------------------
+    // Control queue (queue 0): asynchronous submission
+    //
+    // A command is a descriptor chain — request, optional payload, response —
+    // and until the host writes the chain's head into the used ring, all three
+    // buffers are the device's. `Inflight` remembers them, indexed by that
+    // head descriptor, so the used ring can be drained in whatever order the
+    // host answers: unfenced commands complete in issue order, but a fenced
+    // one (every SUBMIT_3D) is only answered once the GPU work behind it has
+    // finished, and QEMU parks it aside meanwhile. Nothing here assumes the
+    // next used entry is the last thing submitted.
+    //
+    // Two kinds of caller share one enqueue path:
+    //   * `submit_async` — presents, transfers, SUBMIT_3D — returns as soon as
+    //     the chain is kicked. Completion is reaped later, from the next submit
+    //     or from the tick (`ctrlq_tick`), which frees the buffers, retires the
+    //     fence and flags the DRM layer to signal whoever waits on it.
+    //   * `submit` — anything whose reply is needed now (GET_CAPSET,
+    //     RESOURCE_MAP_BLOB, CTX_CREATE, RESOURCE_CREATE_*, the teardown
+    //     commands that release guest pages) — still spins, with the 100 Hz
+    //     tick let through, but the spin also reaps everything else that
+    //     completes meanwhile.
+    //
+    // The callers hold `VIRTIO_GPU` throughout, which is why `submit` cannot
+    // simply sleep: yielding under that spinlock deadlocks every other GPU user
+    // (see `SpinWindow`). Making the reply-needing commands sleep would require
+    // the wait to happen with the lock dropped, i.e. at the call sites, and the
+    // census (`ctrlq_sync_n`) says how much that would buy before it is built.
+    // ---------------------------------------------------------------------
+
+    /// Give back every page a tick-context reap could not. Task context only.
+    fn drain_deferred_frees(&mut self) {
+        while let Some((phys, order)) = self.deferred_free.pop() {
+            mm::buddy::free(phys, order);
+        }
+    }
+
+    /// Free (or defer freeing) the three buffers of a completed chain.
+    fn release_buffers(&mut self, e: &Inflight, task_ctx: bool) {
+        let mut bufs = [(e.req_phys, e.req_order), (e.resp_phys, e.resp_order), (e.pay_phys, e.pay_order)];
+        if e.pay_phys == 0 { bufs[2].0 = 0; }
+        for &(phys, order) in bufs.iter() {
+            if phys == 0 { continue; }
+            if task_ctx {
+                mm::buddy::free(phys, order);
+            } else if self.deferred_free.len() < self.deferred_free.capacity() {
+                self.deferred_free.push((phys, order));
+            } else {
+                // Cannot happen — capacity covers every buffer of every slot —
+                // but a leaked page beats an allocation in tick context.
+                CTRLQ_LEAKED_PAGES.fetch_add(1 << order, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Record that the host retired `id`. Exact, not a watermark: the floor
+    /// only advances over ids that have actually completed.
+    fn fence_complete(&mut self, id: u64) {
+        if id == 0 || id <= self.fence_floor { return; }
+        if id == self.fence_floor + 1 {
+            self.fence_floor = id;
+            // Fold in everything that had finished ahead of the floor.
+            loop {
+                let next = self.fence_floor + 1;
+                match self.fences_ahead.iter().position(|&f| f == next) {
+                    Some(i) => { self.fences_ahead[i] = 0; self.fence_floor = next; }
+                    None => break,
+                }
+            }
+        } else if let Some(i) = self.fences_ahead.iter().position(|&f| f == 0) {
+            self.fences_ahead[i] = id;
+        } else {
+            // No slot: more fences ahead of the floor than the ring can carry,
+            // which the accounting above makes impossible. Fall back to the
+            // watermark rather than lose the retirement.
+            self.fence_floor = id;
+        }
+        GPU_FENCE_FLOOR.store(self.fence_floor, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Drain the used ring. Every completed chain is either handed to its
+    /// spinning `submit` caller (`sync`: marked done, buffers kept for it) or
+    /// finished here (`async`: fence retired, buffers released). Returns true
+    /// if any fence retired, so the caller can notify the DRM layer.
     ///
-    /// `head` is the command struct (always beginning with a `VirtioGpuCtrlHdr`).
-    /// `payload` is optional trailing data that upstream places in a descriptor
-    /// of its own rather than inline — SUBMIT_3D's command stream and
-    /// RESOURCE_CREATE_BLOB's `virtio_gpu_mem_entry` array both work this way.
-    /// `resp_capacity` sizes the device-writable response buffer.
-    ///
-    /// None of the three buffers is capped at one page: each is a physically
-    /// contiguous buddy run sized to its content, so a multi-kilobyte Venus
-    /// command stream or a large capset response rides a single descriptor and
-    /// needs no scatter-gather.  (The previous implementation hardcoded a single
-    /// 4 KiB page for request and response alike and truncated anything longer.)
-    ///
-    /// With `fenced`, VIRTIO_GPU_FLAG_FENCE and a fresh monotonic fence id are
-    /// patched into the *copied* header.  Because this path waits on the used
-    /// ring, the fence has necessarily retired by the time it returns — that is
-    /// what `last_completed_fence` records.
-    fn submit(
+    /// `task_ctx` says whether the buddy allocator may be entered. The tick
+    /// hook passes false; it must not take a lock a preempted task may hold.
+    /// No allocation happens on either path.
+    fn ctrlq_reap(&mut self, task_ctx: bool) -> bool {
+        let mut retired = false;
+        let (size, used) = match self.queues[0].as_ref() {
+            Some(q) => (q.size as usize, q.used),
+            None => return false,
+        };
+        let stat = crate::drm_device_interface::DRM_STATS;
+        loop {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            let (last, idx) = {
+                let q = match self.queues[0].as_ref() { Some(q) => q, None => break };
+                (q.last_used_idx, unsafe { core::ptr::addr_of!((*used).idx).read_volatile() })
+            };
+            if last == idx { break; }
+            let head = unsafe {
+                let ring = (used as usize + 4) as *const VirtqUsedElem;
+                let slot = ring.add(last as usize % size);
+                (slot as *const u32).read_volatile() as usize
+            };
+            let entry = if head < size { self.inflight[head] } else { None };
+            let e = match entry {
+                Some(e) => e,
+                None => {
+                    // A used id naming no chain of ours: the ring is out of
+                    // step with the device. Resync to its index rather than
+                    // free pages by a corrupt id. Reported once.
+                    if !CTRLQ_CORRUPT_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                        crate::pci::serial_debug("[GPU] ctrlq used ring named unknown chain head=");
+                        crate::pci::serial_debug_hex(head as u32);
+                        crate::pci::serial_debug("; resyncing\n");
+                    }
+                    if let Some(q) = self.queues[0].as_mut() { q.last_used_idx = idx; }
+                    break;
+                }
+            };
+            // The response header: type @0, flags @4, fence_id @8.
+            let (resp_type, resp_flags, resp_fence) = unsafe {
+                let r = mm::phys_to_virt(e.resp_phys) as *const u8;
+                ((r as *const u32).read_volatile(),
+                 (r.add(4) as *const u32).read_volatile(),
+                 (r.add(8) as *const u64).read_unaligned())
+            };
+            if let Some(q) = self.queues[0].as_mut() {
+                q.last_used_idx = q.last_used_idx.wrapping_add(1);
+            }
+            if e.fence_id != 0 {
+                self.fence_complete(e.fence_id);
+                retired = true;
+                // The one independent liveness signal for SUBMIT_3D: a reply
+                // that does not echo the fence came from somewhere other than
+                // the fence path, and the stream was very likely not executed.
+                // Reported once per boot.
+                if e.hdr_type == VirtioGpuCmd::Submit3d as u32
+                    && ((resp_flags & VIRTIO_GPU_FLAG_FENCE) == 0 || resp_fence != e.fence_id)
+                    && !SUBMIT3D_FENCE_ECHO_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed)
+                {
+                    crate::pci::serial_debug("[GPU] SUBMIT_3D reply did not echo our fence: sent=");
+                    crate::pci::serial_debug_hex_64(e.fence_id);
+                    crate::pci::serial_debug(" got=");
+                    crate::pci::serial_debug_hex_64(resp_fence);
+                    crate::pci::serial_debug(" flags=");
+                    crate::pci::serial_debug_hex(resp_flags);
+                    crate::pci::serial_debug(" (reported once per boot)\n");
+                }
+            }
+            if e.sync {
+                // The submitter is spinning on this slot; it copies the reply
+                // and releases the chain itself.
+                if let Some(slot) = self.inflight.get_mut(head) {
+                    if let Some(s) = slot.as_mut() { s.done = true; s.resp_type = resp_type; }
+                }
+                continue;
+            }
+            // Asynchronous: nobody reads the reply, so a refusal is only ever
+            // visible here. Same as upstream, which attaches no callback to
+            // these commands — but say so, bounded, because a refused present
+            // is a black screen with no other symptom.
+            if resp_type >= 0x1200 {
+                use core::sync::atomic::Ordering::Relaxed;
+                let n = CTRLQ_ASYNC_REFUSED.fetch_add(1, Relaxed);
+                if n < 8 {
+                    crate::pci::serial_debug("[GPU] async cmd ");
+                    crate::pci::serial_debug_hex(e.hdr_type);
+                    crate::pci::serial_debug(" refused by host, resp=");
+                    crate::pci::serial_debug_hex(resp_type);
+                    crate::pci::serial_debug("\n");
+                }
+            }
+            if stat {
+                use core::sync::atomic::Ordering::Relaxed;
+                let lat = crate::snd::monotonic_us().wrapping_sub(e.submitted_us);
+                CTRLQ_ASYNC_LAT_US.fetch_add(lat, Relaxed);
+                CTRLQ_ASYNC_LAT_MAX_US.fetch_max(lat, Relaxed);
+            }
+            if let Some(q) = self.queues[0].as_mut() { unsafe { q.free_chain(head as u16); } }
+            self.inflight[head] = None;
+            self.release_buffers(&e, task_ctx);
+        }
+        retired
+    }
+
+    /// Build, record and kick one control-queue chain. The caller has already
+    /// checked there is room. Returns the head descriptor and the fence id
+    /// (0 if unfenced).
+    fn enqueue(
         &mut self,
         head: &[u8],
-        payload: Option<&[u8]>,
+        payload: &[u8],
         resp_capacity: usize,
         fenced: bool,
-    ) -> Result<Vec<u8>, ()> {
-        const HDR_LEN: usize = core::mem::size_of::<VirtioGpuCtrlHdr>();
-        if head.len() < HDR_LEN {
-            return Err(());
-        }
-        let payload = payload.unwrap_or(&[]);
-        let resp_capacity = resp_capacity.max(HDR_LEN);
-        let need_desc = if payload.is_empty() { 2 } else { 3 };
-
-        // Verify queue capacity before allocating, so no failure path below has
-        // to unwind a partially-built allocation set.
-        match self.queues[0].as_ref() {
-            Some(q) if q.num_free >= need_desc => {}
-            _ => return Err(()),
-        }
-
+        sync: bool,
+    ) -> Result<(u16, u64), ()> {
         let hdr_type = u32::from_le_bytes(head[0..4].try_into().unwrap_or([0; 4]));
-
         let fence_id = if fenced {
             let f = self.next_fence_id;
             self.next_fence_id = self.next_fence_id.wrapping_add(1).max(1);
@@ -877,7 +1190,8 @@ impl VirtioGpuDevice {
 
         let notify_cfg = self.notify_cfg;
         let mult = self.notify_off_multiplier;
-        let mut out: Result<Vec<u8>, ()> = Err(());
+        let stat = crate::drm_device_interface::DRM_STATS;
+        let submitted_us = if stat { crate::snd::monotonic_us() } else { 0 };
 
         unsafe {
             let req_virt = mm::phys_to_virt(req_phys) as *mut u8;
@@ -898,7 +1212,6 @@ impl VirtioGpuDevice {
             core::ptr::write_bytes(mm::phys_to_virt(resp_phys) as *mut u8, 0, resp_capacity);
 
             let q = self.queues[0].as_mut().ok_or(())?;
-
             let head_idx = q.add_desc(req_phys as u64, head.len() as u32, VIRTQ_DESC_F_NEXT);
             let mut last = head_idx;
             if !payload.is_empty() {
@@ -909,141 +1222,163 @@ impl VirtioGpuDevice {
             let resp_idx = q.add_desc(resp_phys as u64, resp_capacity as u32, VIRTQ_DESC_F_WRITE);
             (*q.desc.add(last as usize)).next = resp_idx;
 
-            q.submit(head_idx);
+            self.inflight[head_idx as usize] = Some(Inflight {
+                req_phys, req_order, pay_phys, pay_order, resp_phys, resp_order, resp_capacity,
+                fence_id, hdr_type, submitted_us, sync, done: false, resp_type: 0,
+            });
 
+            let q = self.queues[0].as_mut().ok_or(())?;
+            q.submit(head_idx);
             let notify_addr =
                 (notify_cfg as usize + q.notify_off as usize * mult as usize) as *mut u16;
             notify_addr.write_volatile(0);
+            CTRLQ_CMDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Ok((head_idx, fence_id))
+        }
+    }
 
-            // Time the spin, not just count it: "how many commands" cannot tell
-            // a fast host from a slow one, and the whole question here is how
-            // long the vCPU is parked. Gated so the clock read costs nothing
-            // when the census is off.
-            let stat = crate::drm_device_interface::DRM_STATS;
-            let t0 = if stat { crate::snd::monotonic_us() } else { 0 };
-            let mut timeout = 100_000_000u64;
+    /// Make room for a chain of `need` descriptors: reap what has completed,
+    /// and if the ring is still full wait — spinning with the tick let in —
+    /// for the host to finish something. False after the bounded wait, which
+    /// means the device has stopped answering.
+    fn ensure_ctrlq_room(&mut self, need: u16) -> bool {
+        self.drain_deferred_frees();
+        if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
+        if self.queues[0].as_ref().map(|q| q.num_free >= need).unwrap_or(false) { return true; }
 
-            // Let the 100 Hz tick in while we wait on the host, WITHOUT making
-            // this a context-switch point.
-            //
-            // Syscalls run with IRQs masked, so this loop used to park the vCPU
-            // at IF=0 for the whole round trip — up to 72 ms under Venus on a
-            // slow host. For that entire window TIMER_TICKS stopped advancing
-            // and none of the tick hooks ran: poll/epoll deadlines went unmet,
-            // `nanosleep` overslept, the audio pump missed its refill (the MAME
-            // latency floor is built on it), and `drm_tick` delivered no
-            // page-flip completions. `irq_window()` fixes that.
-            //
-            // But `irq_window()` on its own is ALSO a scheduling point:
-            // `timer_irq` calls `sched::preempt_check()`, which calls
-            // `yield_now()` even when the IRQ landed in kernel mode. `submit`
-            // is always called with the global `VIRTIO_GPU` mutex held by the
-            // caller (and on several DRM paths with the DRM device mutex held
-            // above it — `drm/device.rs:321`, `:518`,
-            // `drm_device_interface.rs:3425`, `:3882`). Yielding there parks
-            // those mutexes, and all ~28 `VIRTIO_GPU` acquirers and all 21
-            // `get_drm_device()` acquirers are blind `.lock()` spins in syscall
-            // context with IRQs masked: the next task to touch the GPU would
-            // spin at IF=0 forever, never be preempted, and never let the
-            // holder run again. That is a deterministic hang on a 1-vCPU guest
-            // and an eventual one on 4. `preempt_disable` keeps the tick and
-            // drops only the switch, which is the half we cannot afford here.
-            //
-            // The gate: only open a window if IRQs were masked on entry.
-            // `irq_window()` ends by masking, so running it on a caller that
-            // had interrupts ENABLED would hand back a CPU with them off — a
-            // silent state change for the boot paths that reach this same code
-            // (`kms::detect_and_configure`, the early console before
-            // `timer::init` does its `daifclr`). `pid != 0` keeps boot and the
-            // idle task on the old pure-spin path, where there is no tick to
-            // preserve anyway.
-            let window = sched::irqs_masked() && sched::current_pid() != 0;
+        let stat = crate::drm_device_interface::DRM_STATS;
+        let t0 = if stat { crate::snd::monotonic_us() } else { 0 };
+        CTRLQ_ROOM_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let window = SpinWindow::new();
+        let mut iter = 0u64;
+        let mut ok = false;
+        while iter < CTRLQ_WAIT_ITERS {
+            if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
+            if self.queues[0].as_ref().map(|q| q.num_free >= need).unwrap_or(false) { ok = true; break; }
+            window.pulse(iter);
+            core::hint::spin_loop();
+            iter += 1;
+        }
+        drop(window);
+        if stat { Self::account_spin(t0); }
+        if !ok {
+            CTRLQ_TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::pci::serial_debug("[GPU] control-queue TIMEOUT waiting for ring room\n");
+        }
+        ok
+    }
 
-            /// Restores the preempt count on EVERY exit from the wait — the
-            /// timeout branch, a panic unwind, or any future `?` added inside.
-            /// Leaking the count would wedge preemption on this CPU for good.
-            struct PreemptGuard;
-            impl Drop for PreemptGuard {
-                fn drop(&mut self) {
-                    // NOT `preempt_enable()`: that resched-es here, and here
-                    // the caller still holds `VIRTIO_GPU`. `PREEMPT_NEEDED` was
-                    // left set, so the next `preempt_check` — the next timer
-                    // IRQ, ≤10 ms out, or the syscall return — switches at a
-                    // point where no GPU lock is held.
-                    sched::preempt_enable_no_resched();
-                }
-            }
-            let _preempt = if window {
-                sched::preempt_disable();
-                Some(PreemptGuard)
-            } else {
-                None
-            };
+    fn account_spin(t0: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let dt = crate::snd::monotonic_us().wrapping_sub(t0);
+        CTRLQ_SPIN_US.fetch_add(dt, Relaxed);
+        CTRLQ_SPIN_MAX_US.fetch_max(dt, Relaxed);
+    }
 
-            // The window is throttled to one iteration in 256, and that is not
-            // cosmetic: the bail-out below is an ITERATION count, so its
-            // wall-clock meaning is whatever one iteration costs. `sti; pause;
-            // cli` forces an exit from the TCG execution loop and is two to
-            // three orders of magnitude dearer than a bare `spin_loop`, so
-            // opening a window every pass would silently stretch the same
-            // 100_000_000 budget from seconds into minutes — a wedged control
-            // queue would read as a total freeze instead of printing its
-            // TIMEOUT line. One window per 256 spins still delivers thousands
-            // of windows per millisecond of waiting, against the 100 Hz the
-            // tick actually needs, and leaves the budget's duration roughly
-            // where it was.
-            while q.last_used_idx == (*q.used).idx && timeout > 0 {
-                if window && timeout & 0xFF == 0 { sched::irq_window(); }
-                core::hint::spin_loop();
-                timeout -= 1;
-            }
-            drop(_preempt);
-            if stat {
-                use core::sync::atomic::Ordering::Relaxed;
-                let dt = crate::snd::monotonic_us().wrapping_sub(t0);
-                CTRLQ_CMDS.fetch_add(1, Relaxed);
-                CTRLQ_SPIN_US.fetch_add(dt, Relaxed);
-                CTRLQ_SPIN_MAX_US.fetch_max(dt, Relaxed);
-                if timeout == 0 { CTRLQ_TIMEOUTS.fetch_add(1, Relaxed); }
-                // zink-lane: name every control-queue round trip over 20 ms,
-                // with the calling task and the age of the last input event.
-                if dt > 20_000 {
-                    let now = crate::snd::monotonic_us();
-                    mm::gap2::s("[SUBMIT] cmd="); mm::gap2::h(hdr_type as usize);
-                    mm::gap2::kv(" dt_us=", dt as usize);
-                    mm::gap2::kv(" pid=", sched::current_pid() as usize);
-                    mm::gap2::kv(" inp_age_us=", now.wrapping_sub(evdev_server::last_push_us()) as usize);
-                    mm::gap2::kv(" t_us=", now as usize);
-                    mm::gap2::nl();
-                }
-            }
+    /// Submit one control-queue command and return without waiting for the
+    /// host. Use for commands whose reply nobody reads: presents (SET_SCANOUT,
+    /// SET_SCANOUT_BLOB, RESOURCE_FLUSH), TRANSFER_TO_HOST_*, SUBMIT_3D,
+    /// CTX_{ATTACH,DETACH}_RESOURCE. NOT for anything that hands guest pages
+    /// back afterwards (DETACH_BACKING, RESOURCE_UNREF), reads the reply, or
+    /// must be ordered against the cursor queue.
+    ///
+    /// With `fenced`, returns the fence id; it retires when the host answers
+    /// (`fence_retired`), and the DRM layer is told through `ctrlq_tick`.
+    /// Ring full → bounded wait for the host, then Err.
+    fn submit_async(&mut self, head: &[u8], payload: Option<&[u8]>, fenced: bool) -> Result<u64, ()> {
+        const HDR_LEN: usize = core::mem::size_of::<VirtioGpuCtrlHdr>();
+        if head.len() < HDR_LEN { return Err(()); }
+        let payload = payload.unwrap_or(&[]);
+        let need = if payload.is_empty() { 2 } else { 3 };
+        if !self.ensure_ctrlq_room(need) { return Err(()); }
+        let (_, fence) = self.enqueue(head, payload, HDR_LEN, fenced, false)?;
+        CTRLQ_ASYNC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Ok(fence)
+    }
 
-            if timeout == 0 {
-                crate::pci::serial_debug("[GPU] control-queue TIMEOUT, cmd=");
-                crate::pci::serial_debug_hex(hdr_type);
-                crate::pci::serial_debug("\n");
-                // Deliberately leak the descriptors and the three pages: the
-                // host may still DMA into them at any later point, and handing
-                // them back to the buddy allocator would corrupt whoever gets
-                // them next.  The queue is wedged regardless.
-            } else {
-                q.last_used_idx = q.last_used_idx.wrapping_add(1);
-                let resp_virt = mm::phys_to_virt(resp_phys) as *const u8;
-                out = Ok(core::slice::from_raw_parts(resp_virt, resp_capacity).to_vec());
+    /// Submit one control-queue command and wait for the host's reply.
+    ///
+    /// `head` is the command struct (always beginning with a `VirtioGpuCtrlHdr`).
+    /// `payload` is optional trailing data that upstream places in a descriptor
+    /// of its own rather than inline — RESOURCE_CREATE_BLOB's
+    /// `virtio_gpu_mem_entry` array works this way. `resp_capacity` sizes the
+    /// device-writable response buffer. None of the three buffers is capped at
+    /// one page: each is a physically contiguous buddy run sized to its content.
+    ///
+    /// The wait is a spin with the tick let through (`SpinWindow`), bounded by
+    /// `CTRLQ_WAIT_ITERS`; other chains completing meanwhile are reaped along
+    /// the way. On timeout the chain is left in flight — the host may still
+    /// DMA into it — but is re-tagged asynchronous, so if the device ever does
+    /// answer, the descriptors and pages come back.
+    fn submit(
+        &mut self,
+        head: &[u8],
+        payload: Option<&[u8]>,
+        resp_capacity: usize,
+        fenced: bool,
+    ) -> Result<Vec<u8>, ()> {
+        const HDR_LEN: usize = core::mem::size_of::<VirtioGpuCtrlHdr>();
+        if head.len() < HDR_LEN { return Err(()); }
+        let payload = payload.unwrap_or(&[]);
+        let resp_capacity = resp_capacity.max(HDR_LEN);
+        let need = if payload.is_empty() { 2 } else { 3 };
+        if !self.ensure_ctrlq_room(need) { return Err(()); }
+        let hdr_type = u32::from_le_bytes(head[0..4].try_into().unwrap_or([0; 4]));
+        let (head_idx, _fence) = self.enqueue(head, payload, resp_capacity, fenced, true)?;
+        CTRLQ_SYNC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-                q.free_chain(head_idx);
-                mm::buddy::free(req_phys, req_order);
-                mm::buddy::free(resp_phys, resp_order);
-                if !payload.is_empty() {
-                    mm::buddy::free(pay_phys, pay_order);
-                }
+        let stat = crate::drm_device_interface::DRM_STATS;
+        let t0 = if stat { crate::snd::monotonic_us() } else { 0 };
+        let window = SpinWindow::new();
+        let mut iter = 0u64;
+        let mut done = false;
+        while iter < CTRLQ_WAIT_ITERS {
+            if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
+            if self.inflight[head_idx as usize].map(|e| e.done).unwrap_or(false) { done = true; break; }
+            window.pulse(iter);
+            core::hint::spin_loop();
+            iter += 1;
+        }
+        drop(window);
+        if stat {
+            use core::sync::atomic::Ordering::Relaxed;
+            let dt = crate::snd::monotonic_us().wrapping_sub(t0);
+            CTRLQ_SPIN_US.fetch_add(dt, Relaxed);
+            CTRLQ_SPIN_MAX_US.fetch_max(dt, Relaxed);
+            // Name every synchronous round trip over 20 ms, with the calling
+            // task and the age of the last input event.
+            if dt > 20_000 {
+                let now = crate::snd::monotonic_us();
+                mm::gap2::s("[SUBMIT] cmd="); mm::gap2::h(hdr_type as usize);
+                mm::gap2::kv(" dt_us=", dt as usize);
+                mm::gap2::kv(" pid=", sched::current_pid() as usize);
+                mm::gap2::kv(" inp_age_us=", now.wrapping_sub(evdev_server::last_push_us()) as usize);
+                mm::gap2::kv(" t_us=", now as usize);
+                mm::gap2::nl();
             }
         }
 
-        if out.is_ok() && fenced {
-            self.last_completed_fence = fence_id;
+        if !done {
+            CTRLQ_TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::pci::serial_debug("[GPU] control-queue TIMEOUT, cmd=");
+            crate::pci::serial_debug_hex(hdr_type);
+            crate::pci::serial_debug("\n");
+            // Leave the chain to the reaper: the host may still DMA into it.
+            if let Some(e) = self.inflight[head_idx as usize].as_mut() { e.sync = false; }
+            return Err(());
         }
-        out
+
+        let e = match self.inflight[head_idx as usize].take() {
+            Some(e) => e,
+            None => return Err(()),
+        };
+        let out = unsafe {
+            let resp_virt = mm::phys_to_virt(e.resp_phys) as *const u8;
+            core::slice::from_raw_parts(resp_virt, e.resp_capacity).to_vec()
+        };
+        if let Some(q) = self.queues[0].as_mut() { unsafe { q.free_chain(head_idx); } }
+        self.release_buffers(&e, true);
+        Ok(out)
     }
 
     /// `submit` + check that the host answered with a success response type.
@@ -1081,6 +1416,13 @@ impl VirtioGpuDevice {
         }
         Ok(())
     }
+
+    /// Fire-and-forget counterpart of `send_command_raw`: true once the chain
+    /// is kicked. A host refusal surfaces in `ctrlq_reap`'s log, not here.
+    fn send_command_async(&mut self, cmd_data: &[u8]) -> bool {
+        self.submit_async(cmd_data, None, false).is_ok()
+    }
+
     // ---------------------------------------------------------------------
     // Cursor queue (queue 1)
     //
@@ -1419,7 +1761,7 @@ impl VirtioGpuDevice {
             resource_id,
         };
         let data = unsafe { core::slice::from_raw_parts(&cmd as *const _ as *const u8, core::mem::size_of::<VirtioGpuSetScanout>()) };
-        self.send_command_raw(data).is_ok()
+        self.send_command_async(data)
     }
 
     pub fn flush(&mut self, resource_id: u32, x: u32, y: u32, width: u32, height: u32) -> bool {
@@ -1448,7 +1790,7 @@ impl VirtioGpuDevice {
             core::slice::from_raw_parts(&transfer as *const _ as *const u8, core::mem::size_of::<VirtioGpuTransferToHost2d>())
         };
         
-        if self.send_command_raw(transfer_data).is_err() { return false; }
+        if !self.send_command_async(transfer_data) { return false; }
         
         let flush = VirtioGpuResourceFlush {
             hdr: VirtioGpuCtrlHdr {
@@ -1464,7 +1806,7 @@ impl VirtioGpuDevice {
             core::slice::from_raw_parts(&flush as *const _ as *const u8, core::mem::size_of::<VirtioGpuResourceFlush>())
         };
         
-        self.send_command_raw(flush_data).is_ok()
+        self.send_command_async(flush_data)
     }
 
     /// SET_SCANOUT_BLOB: point scanout 0 at a **blob** resource, described the
@@ -1530,7 +1872,7 @@ impl VirtioGpuDevice {
                 core::mem::size_of::<SetScanoutBlob>(),
             )
         };
-        let ok = self.send_command_raw(data).is_ok();
+        let ok = self.send_command_async(data);
         if ok {
             // Same bookkeeping `flush` keeps for a 2D scanout, so the console's
             // next `flush(1, ..)` knows it has to re-point the scanout at
@@ -1561,7 +1903,7 @@ impl VirtioGpuDevice {
                 core::mem::size_of::<VirtioGpuResourceFlush>(),
             )
         };
-        self.send_command_raw(data).is_ok()
+        self.send_command_async(data)
     }
 
     /// The scanout resource currently bound on this device (0 = none yet).
@@ -1587,7 +1929,7 @@ impl VirtioGpuDevice {
             core::slice::from_raw_parts(&transfer as *const _ as *const u8, core::mem::size_of::<VirtioGpuTransferToHost3d>())
         };
         
-        self.send_command_raw(transfer_data).is_ok()
+        self.send_command_async(transfer_data)
     }
 
     pub fn scale_blit(&mut self, resource_id: u32, _scanout_id: u32, src: (u32, u32, u32, u32), _dst: (u32, u32, u32, u32)) -> bool {
@@ -1609,7 +1951,7 @@ impl VirtioGpuDevice {
             padding: 0,
         };
         let transfer_data = unsafe { core::slice::from_raw_parts(&transfer as *const _ as *const u8, core::mem::size_of::<VirtioGpuTransferToHost2d>()) };
-        if self.send_command_raw(transfer_data).is_err() { return false; }
+        if !self.send_command_async(transfer_data) { return false; }
         
         // 2. Flush resource (using SOURCE region - host handles scaling to scanout)
         let flush = VirtioGpuResourceFlush {
@@ -1623,7 +1965,7 @@ impl VirtioGpuDevice {
         };
         let flush_data = unsafe { core::slice::from_raw_parts(&flush as *const _ as *const u8, core::mem::size_of::<VirtioGpuResourceFlush>()) };
         
-        self.send_command_raw(flush_data).is_ok()
+        self.send_command_async(flush_data)
     }
 
     /// True once a scanout resource has been bound on this device, e.g. by the
@@ -1694,8 +2036,20 @@ impl VirtioGpuDevice {
     /// this driver ever handed out is retired by the time the submitting call
     /// returned; the counter exists so VIRTGPU_WAIT can answer truthfully rather
     /// than unconditionally reporting success.
+    /// Has the host retired fence `id`? Exact (see `fence_floor`); reads only
+    /// device state, so it says nothing about a fence still in flight beyond
+    /// "not yet" — reap first if the answer must be fresh.
     pub fn fence_retired(&self, id: u64) -> bool {
-        id != 0 && id <= self.last_completed_fence
+        id != 0 && (id <= self.fence_floor || self.fences_ahead.iter().any(|&f| f == id))
+    }
+
+    /// `fence_retired` after draining the used ring, for a waiter that needs
+    /// the current truth rather than the last reap's. Task context.
+    pub fn fence_retired_now(&mut self, id: u64) -> bool {
+        if self.fence_retired(id) { return true; }
+        self.drain_deferred_frees();
+        if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
+        self.fence_retired(id)
     }
 
     fn hdr_for(&self, cmd: VirtioGpuCmd, ctx_id: u32) -> VirtioGpuCtrlHdr {
@@ -1873,8 +2227,9 @@ impl VirtioGpuDevice {
                 core::mem::size_of::<CtxResource>(),
             )
         };
-        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
-            .is_ok()
+        // Asynchronous: virglrenderer registers a blob at RESOURCE_CREATE_BLOB
+        // time and this is bookkeeping ordered behind it on the same queue.
+        self.submit_async(bytes, None, false).is_ok()
     }
 
     pub fn ctx_attach_resource(&mut self, ctx_id: u32, resource_id: u32) -> bool {
@@ -2149,31 +2504,11 @@ impl VirtioGpuDevice {
                 core::mem::size_of::<CmdSubmit>(),
             )
         };
-        let fence = self.next_fence_id;
-        let resp = self.submit_checked(bytes, Some(cmds), 64, true, VIRTIO_GPU_RESP_OK_NODATA)?;
-
-        // The one independent liveness signal available here — see the header
-        // comment. Reported once per boot: EXECBUFFER runs per frame, and a
-        // host that answers this way answers it every time.
-        let rflags = u32::from_le_bytes(resp.get(4..8).ok_or(())?.try_into().map_err(|_| ())?);
-        let rfence = u64::from_le_bytes(resp.get(8..16).ok_or(())?.try_into().map_err(|_| ())?);
-        if (rflags & VIRTIO_GPU_FLAG_FENCE) == 0 || rfence != fence {
-            if !SUBMIT3D_FENCE_ECHO_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                crate::pci::serial_debug("[GPU] SUBMIT_3D reply did not echo our fence: sent=");
-                crate::pci::serial_debug_hex_64(fence);
-                crate::pci::serial_debug(" got=");
-                crate::pci::serial_debug_hex_64(rfence);
-                crate::pci::serial_debug(" flags=");
-                crate::pci::serial_debug_hex(rflags);
-                crate::pci::serial_debug(
-                    " — the host did NOT answer from its fence path, so this stream was\
-                     \n      very likely never executed. Note the host discards the renderer's\
-                     \n      own verdict either way, so a matching fence is not proof of\
-                     \n      execution. (reported once per boot)\n",
-                );
-            }
-        }
-        Ok(fence)
+        // Asynchronous: the Venus reply travels through the shared-memory ring,
+        // not this response, and the fence is what a waiter consults — so the
+        // caller has nothing to wait for here. The fence-echo liveness check
+        // that used to run on the reply now runs in `ctrlq_reap`.
+        self.submit_async(bytes, Some(cmds), true)
     }
 
     /// Query the host for the preferred display mode via GET_DISPLAY_INFO.
