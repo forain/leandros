@@ -52,6 +52,17 @@ fn report_task_table_full() {
     }
 }
 
+/// Copy the signal-disposition table of thread group `parent_tgid` into a
+/// freshly built child process. A short RUN_QUEUE hold of its own, after the
+/// child exists, so the 2 KiB table is copied straight into the child's
+/// heap allocation rather than staged through a stack temporary.
+fn inherit_signal_actions(child: &mut task::Task, parent_tgid: u32) {
+    let rq = super::RUN_QUEUE.lock();
+    if let Some(leader) = rq.find_pid(parent_tgid) {
+        child.signal_actions = leader.signal_actions;
+    }
+}
+
 /// Perform a POSIX `fork()`.
 ///
 /// `frame_ptr` — virtual address of the `UserFrame` saved on the parent's
@@ -218,8 +229,8 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         }
 
         // ── Step 6: gather parent credentials ────────────────────────────────
-        let (heap_start, heap_end, pid, _tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, cwd, tls_base,
-             nice, umask, root) = {
+        let (heap_start, heap_end, pid, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, cwd, tls_base,
+             nice, umask, root, signal_mask) = {
             let rq = super::RUN_QUEUE.lock();
             if let Some(t) = rq.find_pid(parent_pid) {
                 let leader = rq.find_pid(t.tgid).unwrap_or(t);
@@ -228,7 +239,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
                     .unwrap_or((0, 0));
                 (hs, he, t.pid, t.tgid, t.pgid, t.sid,
                  t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, (t.cwd.clone(), t.cwd_len), t.tls_base,
-                 t.priority, t.umask, (t.root.clone(), t.root_len))
+                 t.priority, t.umask, (t.root.clone(), t.root_len), t.signal_mask)
             } else {
                 mm::buddy::free(stack_base_phys, stack_pages);
                 mm::buddy::free(child_pt, 0);
@@ -306,11 +317,25 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         // A chrooted parent's children stay in the jail.
         child.root          = root.0;
         child.root_len      = root.1;
-        child.signal_actions = [DEFAULT_SIGACTION; 64];
+        // POSIX fork(2): the child inherits the calling *thread's* signal
+        // mask and the process's signal dispositions; only the pending set
+        // starts empty (which `Task::new_kernel` already guarantees).
+        //
+        // Both used to be reset here. The mask reset broke the standard
+        // "block SIGTERM/SIGINT in main, then spawn workers + signalfd"
+        // pattern (tokio's signal driver, D-Bus daemons): every child and
+        // worker came up with an empty mask, so the signal the parent had
+        // carefully blocked killed the child instead of reaching the
+        // signalfd. The disposition reset meant a SIG_IGN set by the parent
+        // (a `nohup`-style SIGHUP, Rust std's SIGPIPE) never reached the
+        // child, and a handler installed before fork was silently gone in a
+        // child that did not exec.
+        child.signal_mask   = signal_mask;
+        inherit_signal_actions(&mut child, parent_tgid);
 
         // The child is a new process (its tgid == child_pid); inherit the
         // parent's /proc/self/exe path until it execs.
-        super::inherit_exe_path(super::tgid_of(parent_pid), child_pid);
+        super::inherit_exe_path(parent_tgid, child_pid);
 
         // Give the caller its chance to set up per-child kernel state (VFS
         // fd table) while the child is still invisible to other CPUs.
@@ -443,7 +468,7 @@ pub fn clone_thread(
 
         // ── Collect parent credentials and page table ─────────────────────────
         let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, heap_start, heap_end,
-             ctid_phys, cwd, leader_as, nice, umask, root) = {
+             ctid_phys, cwd, leader_as, nice, umask, root, signal_mask) = {
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid) {
                 Some(t) => {
@@ -464,7 +489,8 @@ pub fn clone_thread(
                     // lookup already resolves to it.
                     (t.page_table, t.tgid, t.pgid, t.sid,
                      t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, hs, he, cp, (t.cwd.clone(), t.cwd_len),
-                     leader.address_space.clone(), t.priority, t.umask, (t.root.clone(), t.root_len))
+                     leader.address_space.clone(), t.priority, t.umask, (t.root.clone(), t.root_len),
+                     t.signal_mask)
                 }
                 None => {
                     mm::buddy::free(stack_base_phys, stack_pages);
@@ -518,7 +544,18 @@ pub fn clone_thread(
         child.umask      = umask;
         child.root       = root.0;
         child.root_len   = root.1;
-        child.signal_actions = [DEFAULT_SIGACTION; 64];
+        // A new thread starts with its creator's signal mask (POSIX
+        // pthread_create), and so does a vfork-style child (fork semantics).
+        // Dispositions live on the thread-group leader, so a CLONE_THREAD
+        // sibling's own table is never consulted and stays at the default;
+        // a non-CLONE_THREAD child is a new process and copies them like
+        // fork_current does.
+        child.signal_mask = signal_mask;
+        if flags & CLONE_THREAD == 0 {
+            inherit_signal_actions(&mut child, parent_tgid);
+        } else {
+            child.signal_actions = [DEFAULT_SIGACTION; 64];
+        }
         child.vfork_pending = flags & CLONE_VFORK != 0;
         if flags & CLONE_CHILD_CLEARTID != 0 {
             child.clear_child_tid = ctid;
