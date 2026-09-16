@@ -26,6 +26,11 @@ set -u
 # real cosmic-greeter account (uid 990) before exec'ing the greeter, so
 # getpwuid returns the name because the process genuinely is that account.
 
+# fakegreet binds greetd.sock in its cwd and its cosmic-comp child inherits
+# XDG_RUNTIME_DIR for wayland-N, so both go to the greeter account's runtime
+# dir — the one directory the uid-990 greeter can traverse (see greeter-env).
+XDG_RUNTIME_DIR=$GREETER_RUNTIME_DIR
+export XDG_RUNTIME_DIR
 cd "$XDG_RUNTIME_DIR"
 /bin/rm -f greetd.sock 2>/dev/null || true
 

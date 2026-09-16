@@ -12,7 +12,7 @@
 extern crate leandros_libc;
 
 use leandros_libc::{
-    write, STDOUT_FILENO, getpid, execve, sched_yield, mount, pivot_root, mkdir,
+    write, STDOUT_FILENO, getpid, execve, sched_yield, mount, pivot_root, mkdir, chown,
     open, read, close, dup3, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND,
     fork, wait4, setsid, ioctl, usleep, exit,
 };
@@ -99,6 +99,10 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // handled above by the hardcoded bootstrap mount — fstab can't drive
     // that one since fstab itself lives on the filesystem being mounted).
     mount_from_fstab();
+
+    // 4c. One XDG runtime directory per account, owned by it, before any login
+    // can need one.
+    seed_runtime_dirs();
 
     // 5. Graphical login, when the image carries one and nothing opted out.
     let graphical = graphical_login_wanted();
@@ -269,6 +273,77 @@ unsafe fn run_session() {
     execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
 
     write_str("ERROR: execve /bin/shell failed!\n");
+}
+
+/// Create `/run/user/<uid>` (0700, owned uid:gid) for every account in
+/// /etc/passwd except root, whose `/run/user/0` the VFS seeds at boot.
+///
+/// This is the job pam_systemd/logind does per login on Linux. Here it has to
+/// happen in init, as root, because `/run/user` is a 0755 root tmpfs mount and
+/// the VFS enforces that: the `mkdir -p "$XDG_RUNTIME_DIR"` in /etc/profile and
+/// start-cosmic-leandros runs as the session user and is EACCES there. Without
+/// this a uid-1000 session has nowhere to bind its wayland-N and session-bus
+/// sockets and never reaches a desktop; the greeter account (uid 990) needs
+/// its own for the greeter phase's sockets (see /etc/profile).
+///
+/// tmpfs is volatile, so this runs on every boot. The parse is deliberately
+/// tolerant: a malformed line is skipped, and a directory that already exists
+/// is simply re-owned.
+unsafe fn seed_runtime_dirs() {
+    let fd = open(b"/etc/passwd\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        write_str("no /etc/passwd; skipping /run/user seeding\n");
+        return;
+    }
+    let mut buf = [0u8; 8192];
+    let mut total = 0usize;
+    loop {
+        if total >= buf.len() { break; }
+        let n = read(fd, buf.as_mut_ptr().add(total), buf.len() - total);
+        if n <= 0 { break; }
+        total += n as usize;
+    }
+    close(fd);
+
+    for line in buf[..total].split(|&b| b == b'\n') {
+        if line.is_empty() || line[0] == b'#' { continue; }
+        let mut fields = line.split(|&b| b == b':');
+        let _name = fields.next();
+        let _pw = fields.next();
+        let uid = match fields.next().and_then(parse_u32) { Some(u) => u, None => continue };
+        let gid = match fields.next().and_then(parse_u32) { Some(g) => g, None => continue };
+        if uid == 0 { continue; }
+
+        // "/run/user/" + decimal uid + NUL.
+        let mut path = [0u8; 32];
+        let prefix = b"/run/user/";
+        path[..prefix.len()].copy_from_slice(prefix);
+        let mut digits = [0u8; 10];
+        let mut n = uid;
+        let mut i = digits.len();
+        if n == 0 { i -= 1; digits[i] = b'0'; }
+        while n > 0 { i -= 1; digits[i] = b'0' + (n % 10) as u8; n /= 10; }
+        let dl = digits.len() - i;
+        path[prefix.len()..prefix.len() + dl].copy_from_slice(&digits[i..]);
+        // path is NUL-terminated by the zeroed buffer.
+
+        mkdir(path.as_ptr(), 0o700);
+        if chown(path.as_ptr(), uid, gid) != 0 {
+            write_str("WARNING: chown of /run/user/");
+            write_u32(uid);
+            write_str(" failed\n");
+        }
+    }
+}
+
+fn parse_u32(s: &[u8]) -> Option<u32> {
+    if s.is_empty() || s.len() > 10 { return None; }
+    let mut v: u32 = 0;
+    for &b in s {
+        if !b.is_ascii_digit() { return None; }
+        v = v.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+    }
+    Some(v)
 }
 
 /// Read `/etc/fstab` and mount every entry except the root ("/") one, which

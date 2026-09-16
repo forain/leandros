@@ -16,20 +16,19 @@
 //! greeter inherits this pid, so cosmic-comp's kiosk-child exit handling and
 //! greetd's session lifetime both keep working unchanged.
 //!
-//! Why nothing here relaxes a directory mode or passes a socket fd. The
-//! compositor binds its wayland socket in $XDG_RUNTIME_DIR, which is 0700 root,
-//! and greetd binds its control socket on a tmpfs root; a dropped-privilege
-//! client reaches both because this kernel checks neither. Path resolution
-//! applies no search-permission test on any component (servers/vfs
-//! tmp_resolve_links and servers/f2fs resolve_path_ex read no mode at all), and
-//! AF_UNIX connect discards the caller outright — servers/vfs unix_resolve_node
-//! takes the pid and ignores it, so a socket's owner and mode are never
-//! consulted. That is a gap in the VFS, not a design, and it is the load-bearing
-//! assumption of this launcher. If path-walk permission is ever enforced, the
-//! greeter loses both sockets at once and the fix is to hand it the wayland
-//! connection as an inherited fd via WAYLAND_SOCKET (honoured by libwayland and
-//! by wayland-client alike) and to move the greetd socket somewhere the greeter
-//! account can reach.
+//! The two sockets the greeter must reach, and why this launcher chowns them.
+//! The VFS enforces POSIX permissions on path traversal and on AF_UNIX connect
+//! (write on the socket inode). The compositor runs as root and binds its
+//! wayland socket 0755 root in $XDG_RUNTIME_DIR; greetd binds its control
+//! socket 0755 and chowns it to `default_session.user`, which is root here
+//! because the compositor is the session. A uid-990 client can write to
+//! neither. So, while still root, this launcher chowns both nodes —
+//! `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` and `$GREETD_SOCK` — to the greeter
+//! account, which is exactly the ownership upstream greetd arranges (its
+//! socket is chowned to the greeter user, and the greeter's compositor runs as
+//! that user). The directory they live in is the greeter account's own runtime
+//! dir, `/run/user/990`, selected by /etc/profile for the greeter session class
+//! and by /bin/greeter-env for greetd itself, so traversal is the owner's.
 
 #![no_std]
 #![no_main]
@@ -37,8 +36,8 @@
 extern crate leandros_libc;
 
 use leandros_libc::{
-    chdir, close, execve, exit, getuid, open, read, setresgid, setresuid, write, O_RDONLY,
-    STDERR_FILENO,
+    chdir, chown, close, execve, exit, getuid, open, read, setresgid, setresuid, write,
+    O_RDONLY, STDERR_FILENO,
 };
 
 /// The account name cosmic-greeter matches on. Staged by
@@ -246,6 +245,59 @@ unsafe fn lookup_greeter() -> Option<Account> {
     None
 }
 
+/// Value of `KEY=` in `envp`, or None.
+unsafe fn env_get<'a>(envp: *const *const u8, key: &[u8]) -> Option<&'a [u8]> {
+    if envp.is_null() { return None; }
+    let mut i = 0usize;
+    loop {
+        let e = *envp.add(i);
+        if e.is_null() { return None; }
+        let mut len = 0usize;
+        while len < 4096 && *e.add(len) != 0 { len += 1; }
+        let entry = core::slice::from_raw_parts(e, len);
+        if entry.len() >= key.len() && &entry[..key.len()] == key {
+            return Some(&entry[key.len()..]);
+        }
+        i += 1;
+    }
+}
+
+/// chown `$dir_key/$name_key` (or just `$name_key` when `dir_key` is empty or
+/// the name is absolute) to the greeter account. See the module comment.
+unsafe fn chown_to_greeter(envp: *const *const u8, dir_key: &[u8], name_key: &[u8], acct: &Account) {
+    let name = match env_get(envp, name_key) {
+        Some(n) if !n.is_empty() => n,
+        _ => { emit(b"greeter-launch: "); emit(name_key); emit(b" unset; socket not handed over\n"); return; }
+    };
+    let mut path = [0u8; 256];
+    let mut n = 0usize;
+    if name[0] != b'/' && !dir_key.is_empty() {
+        let dir = match env_get(envp, dir_key) {
+            Some(d) if !d.is_empty() => d,
+            _ => { emit(b"greeter-launch: "); emit(dir_key); emit(b" unset; socket not handed over\n"); return; }
+        };
+        if dir.len() + 1 + name.len() >= path.len() { return; }
+        path[..dir.len()].copy_from_slice(dir);
+        n = dir.len();
+        path[n] = b'/';
+        n += 1;
+    } else if name.len() >= path.len() {
+        return;
+    }
+    path[n..n + name.len()].copy_from_slice(name);
+    n += name.len();
+    path[n] = 0;
+    if chown(path.as_ptr(), acct.uid, acct.gid) != 0 {
+        emit(b"greeter-launch: WARNING: chown of ");
+        emit(&path[..n]);
+        emit(b" to the greeter account failed\n");
+    } else {
+        emit(b"GREETER-LAUNCH: handed ");
+        emit(&path[..n]);
+        emit(b" to the greeter account\n");
+    }
+}
+
 fn fail(msg: &[u8]) -> ! {
     emit(b"greeter-launch: ");
     emit(msg);
@@ -342,6 +394,14 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
         }
     }
     args[nargs] = core::ptr::null();
+
+    // ---- hand the sockets to the greeter account -----------------------------
+    // Still root here. Failure is reported, not fatal: the greeter then fails to
+    // connect exactly as it would have without this step, and greetd's
+    // supervision (and init's) applies — a hard exit here would turn a missing
+    // variable into a respawn loop with no screen to show for it.
+    chown_to_greeter(envp, b"XDG_RUNTIME_DIR=", b"WAYLAND_DISPLAY=", &acct);
+    chown_to_greeter(envp, b"", b"GREETD_SOCK=", &acct);
 
     // ---- cross the boundary --------------------------------------------------
     // gid first: after the uid drop the process can no longer change its gid.

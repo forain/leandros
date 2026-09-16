@@ -26,10 +26,16 @@ set -u
 # an ordinary f2fs directory and f2fs has no S_IFSOCK support, so that bind
 # fails with EOPNOTSUPP ("unable to open listener: Not supported (os error 95)")
 # before the greeter is ever spawned. The socket-capable mounts are /tmp,
-# /dev/shm and /run/user (servers/vfs TMPFS_ROOTS), so point greetd at the
-# runtime dir. GREETD_SOCK_DIR is ports/greetd/patches/0003; unset, greetd
-# behaves exactly as upstream.
-GREETD_SOCK_DIR=$XDG_RUNTIME_DIR
+# /dev/shm and /run/user (servers/vfs TMPFS_ROOTS). GREETD_SOCK_DIR is
+# ports/greetd/patches/0003; unset, greetd behaves exactly as upstream.
+#
+# The directory is the GREETER ACCOUNT's runtime dir, not root's: the greeter
+# client connects to this socket as uid 990, and the VFS enforces search
+# permission on the path — a 0700 root /run/user/0 is EACCES for it. greetd
+# chowns the socket to default_session.user (root, because the compositor is
+# the session); /bin/greeter-launch re-chowns it to the greeter account before
+# dropping to it. See greeter-env.
+GREETD_SOCK_DIR=$GREETER_RUNTIME_DIR
 export GREETD_SOCK_DIR
 
 cd "$XDG_RUNTIME_DIR"
