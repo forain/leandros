@@ -30,18 +30,23 @@ static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 static TICKS_PER_IRQ: AtomicU32 = AtomicU32::new(0);
 
 /// TSC cycles in one 10 ms tick, measured in the same PIT window that
-/// calibrates the APIC timer; the TSC sampled at the most recent BSP tick; and
-/// the highest value `monotonic_ns` has ever returned. See `monotonic_ns`.
+/// calibrates the APIC timer. See `monotonic_ns`.
 static TSC_PER_TICK:  AtomicU64 = AtomicU64::new(0);
-static LAST_TICK_TSC: AtomicU64 = AtomicU64::new(0);
-static MONO_LAST_NS:  AtomicU64 = AtomicU64::new(0);
+/// TSC at `init` on the BSP: the origin of CLOCK_MONOTONIC and of the tick
+/// grid. 0 until the BSP timer has started.
+static EPOCH_TSC: AtomicU64 = AtomicU64::new(0);
+/// The grid point (TSC value `EPOCH_TSC + TICK_COUNT × TSC_PER_TICK`) of the
+/// most recent tick the BSP has accounted. See `on_tick`.
+static GRID_TSC: AtomicU64 = AtomicU64::new(0);
+/// Ticks the BSP accounted without an interrupt of their own (diagnostic).
+static CATCH_UP_TICKS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn rdtsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
-/// Monotonic nanoseconds since boot, interpolated *inside* the current tick.
+/// Monotonic nanoseconds since the BSP timer started, read from the TSC.
 ///
 /// A 100 Hz tick counter alone answers `clock_gettime` in 10 ms steps, which is
 /// not merely coarse — it is wrong in a way userspace acts on. Mesa's venus ring
@@ -54,27 +59,23 @@ fn rdtsc() -> u64 {
 ///
 /// The scale comes from the PIT window that already calibrates the APIC timer,
 /// so it is measured, not assumed: a real host TSC (~4 GHz) and TCG's virtual
-/// one (~1 GHz) both come out right with no per-accelerator special case.
-///
-/// The tick and its TSC anchor are published from `on_tick` one after the other,
-/// so a reader can catch them mid-update; the anchor is re-read to detect that,
-/// the fraction is clamped below one tick, and the result is passed through a
-/// `fetch_max` so the clock can never step backwards.
+/// one (~1 GHz) both come out right with no per-accelerator special case. The
+/// clock is the counter against that scale — not the tick count with a
+/// clamped fraction, which inherited every lost tick (see `on_tick`). Falls
+/// back to the tick count if the PIT window never established the scale.
 pub fn monotonic_ns() -> u64 {
     let per = TSC_PER_TICK.load(Ordering::Relaxed);
-    let ns = loop {
-        let a = LAST_TICK_TSC.load(Ordering::Acquire);
-        let t = TICK_COUNT.load(Ordering::Acquire);
-        let b = LAST_TICK_TSC.load(Ordering::Acquire);
-        if a != b { continue; }
-        let base = t.wrapping_mul(10_000_000);
-        if a == 0 || per == 0 { break base; }
-        let d = rdtsc().wrapping_sub(a);
-        let frac = ((d as u128) * 10_000_000u128 / per as u128) as u64;
-        break base + frac.min(9_999_999);
-    };
-    let prev = MONO_LAST_NS.fetch_max(ns, Ordering::Relaxed);
-    if prev > ns { prev } else { ns }
+    let e = EPOCH_TSC.load(Ordering::Relaxed);
+    if per == 0 || e == 0 {
+        return TICK_COUNT.load(Ordering::Relaxed).wrapping_mul(10_000_000);
+    }
+    let d = rdtsc().wrapping_sub(e);
+    ((d as u128) * 10_000_000u128 / per as u128) as u64
+}
+
+/// Ticks the BSP has had to account without their own interrupt (diagnostic).
+pub fn catch_up_ticks() -> u64 {
+    CATCH_UP_TICKS.load(Ordering::Relaxed)
 }
 
 /// Resolution of `monotonic_ns` in nanoseconds: the period of the TSC the
@@ -200,6 +201,9 @@ pub unsafe fn init() {
     // LVT_TIMER bits: [18:17]=00 (one-shot) / 01 (periodic) / 10 (TSC-deadline)
     //                 [16]=0 (not masked)
     //                 [7:0]=vector
+    let now = rdtsc();
+    EPOCH_TSC.store(now, Ordering::Release);
+    GRID_TSC.store(now, Ordering::Relaxed);
     apic::write(apic::LAPIC_TIMER_DIV,  0x3);                // divide by 16
     apic::write(apic::LAPIC_LVT_TIMER,  (1 << 17) | 32);    // periodic, vec 32
     apic::write(apic::LAPIC_TIMER_INIT, ticks_per_irq);
@@ -227,16 +231,30 @@ pub unsafe fn init_local_timer() {
 /// Every CPU ticks its own LAPIC timer; global timekeeping and UART polling
 /// are BSP-only so wall-clock ticks don't advance N× faster with N CPUs and
 /// the single serial FIFO has a single consumer.
+///
+/// The LAPIC timer is periodic on an exact grid, but an interrupt is not a
+/// tick of time: when the BSP takes one late by more than a period (QEMU TCG
+/// delivers the expiry from its main loop and skips an expiry it is already
+/// past; a long IRQ-masked section merges two into one pending bit), the
+/// missed periods used to vanish from `TICK_COUNT` — measured as the guest
+/// clock running 1–36 % slow on x86_64/TCG, worse under load. So the tick
+/// count is anchored to a TSC grid instead: each interrupt accounts however
+/// many whole `TSC_PER_TICK` periods have elapsed since the last accounted
+/// grid point (normally one; zero on an early or spurious one), and the
+/// scheduler is told the number so `sched::ticks()` keeps time.
 #[inline]
 pub fn on_tick() {
     let cpu = unsafe { super::smp::arch_cpu_id() };
+    let mut elapsed = 1u64;
     if cpu == 0 {
-        // Anchor the sub-tick interpolation BEFORE publishing the new tick, so a
-        // concurrent reader can only ever see an anchor that is at most one tick
-        // stale (bounded by the clamp in `monotonic_ns`), never one from the
-        // future.
-        LAST_TICK_TSC.store(rdtsc(), Ordering::Release);
-        TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+        let per = TSC_PER_TICK.load(Ordering::Relaxed);
+        let grid = GRID_TSC.load(Ordering::Relaxed);
+        if per != 0 && grid != 0 {
+            elapsed = rdtsc().wrapping_sub(grid) / per;
+            GRID_TSC.store(grid.wrapping_add(elapsed.wrapping_mul(per)), Ordering::Relaxed);
+            if elapsed > 1 { CATCH_UP_TICKS.fetch_add(elapsed - 1, Ordering::Relaxed); }
+        }
+        TICK_COUNT.fetch_add(elapsed, Ordering::Relaxed);
 
         // Poll VirtIO input devices (keyboard + tablet). The primary x86_64
         // console keyboard still comes from the UART drain below; this drains
@@ -260,5 +278,5 @@ pub fn on_tick() {
         evdev_server::flush_pending_wake();
     }
 
-    sched::timer_tick_irq();
+    sched::timer_tick_irq(elapsed);
 }

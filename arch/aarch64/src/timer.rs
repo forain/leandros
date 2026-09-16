@@ -1,32 +1,61 @@
-//! AArch64 generic timer — EL1 physical timer (CNTP).
+//! AArch64 generic timer — EL1 virtual timer (CNTV), 100 Hz.
 //!
-//! Configured for 100 Hz using CNTFRQ_EL0 as the frequency reference.
-//! The IRQ (PPI #30) is routed through the GIC by `gic::init()` before
-//! this module is initialised.
+//! The IRQ (PPI #27) is routed through the GIC by `gic::init()` before this
+//! module is initialised.
 //!
-//! Ref: ARM Architecture Reference Manual §D7 (Generic Timer)
+//! ## Timekeeping model
+//!
+//! Every CPU's tick is programmed as an ABSOLUTE compare value on a fixed grid:
+//! deadline `k` is `EPOCH + k × interval` in CNTVCT_EL0 units, and `on_tick`
+//! arms the next grid point strictly after "now". The interrupt latency of a
+//! tick therefore never leaks into the period. It used to: the handler
+//! reloaded `CNTV_TVAL_EL0` (a countdown from *now*), so a tick taken 4 ms late
+//! — the cost of a `wfi` wake through Hypervisor.framework — scheduled the next
+//! one 14 ms after the previous, and the "100 Hz" tick ran at 71 Hz idle and
+//! 85 Hz under load. Every second of guest time was 1.2–1.4 host seconds.
+//!
+//! When the handler finds that more than one grid point has passed (a long
+//! IRQ-masked section, a stalled vCPU, a lost timer edge later repaired by
+//! `check_alive`), it does NOT fire the missed ticks back to back: it skips to
+//! the next future grid point and hands the scheduler the number of grid points
+//! that elapsed, so `sched::ticks()` stays a faithful 10 ms count of real time
+//! and every tick-based deadline (nanosleep, poll, futex, timerfd) expires when
+//! it should — without an interrupt storm.
+//!
+//! CLOCK_MONOTONIC (`monotonic_ns`) is read straight from CNTVCT_EL0 against
+//! the same epoch, not from the tick count, so it is exact and continuous;
+//! `sched::ticks() × 10 ms` trails it by at most one interval plus the latency
+//! of the tick in flight, which is the direction deadlines need (never early).
+//!
+//! Ref: ARM Architecture Reference Manual §D11 (Generic Timer)
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Target interrupt rate.
 const TICK_HZ: u64 = 100;
 
-/// Global tick counter — incremented on every timer interrupt.
-static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+/// CNTVCT_EL0 at `init` on the BSP — the origin of both the tick grid and
+/// CLOCK_MONOTONIC. 0 until the BSP timer has started.
+static EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// CNTVCT_EL0 sampled at the instant of the most recent BSP tick, and the
-/// highest value `monotonic_ns` has ever returned. Together they give
-/// CLOCK_MONOTONIC sub-tick resolution: see `monotonic_ns`.
-static LAST_TICK_CNT: AtomicU64 = AtomicU64::new(0);
-static MONO_LAST_NS:  AtomicU64 = AtomicU64::new(0);
+/// Total grid points the BSP's handler found already elapsed beyond the one it
+/// was servicing (each is a tick accounted without its own interrupt).
+static CATCH_UP_TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// CNTVCT_EL0 at each CPU's most recent tick (0 = timer not started yet).
-/// `check_alive` compares it against the counter to catch a virtual timer
-/// that stopped delivering: the countdown is only ever re-armed from inside
-/// `on_tick`, so a single lost interrupt silences that CPU's tick forever —
-/// and on the BSP that freezes `TICK_COUNT`, every `nanosleep`, every poll
-/// deadline and the audio pump at once, with no panic and no output.
 const TIMER_MAX_CPUS: usize = 8;
+
+/// Per CPU: the grid point (counter value) of the most recent tick this CPU
+/// has accounted for. The programmed compare value is always `GRID + interval`.
+/// 0 = timer not started on that CPU.
+static GRID_CPU: [AtomicU64; TIMER_MAX_CPUS] =
+    [const { AtomicU64::new(0) }; TIMER_MAX_CPUS];
+
+/// CNTVCT_EL0 at each CPU's most recent tick INTERRUPT (0 = timer not started
+/// yet). `check_alive` compares it against the counter to catch a virtual
+/// timer that stopped delivering: a lost interrupt would silence that CPU's
+/// tick forever — and on the BSP that freezes `sched::ticks()`, every
+/// `nanosleep`, every poll deadline and the audio pump at once, with no panic
+/// and no output.
 static LAST_TICK_CNT_CPU: [AtomicU64; TIMER_MAX_CPUS] =
     [const { AtomicU64::new(0) }; TIMER_MAX_CPUS];
 /// Times `check_alive` had to re-arm this CPU's timer (for the watchdog line).
@@ -37,47 +66,52 @@ static REARMS: [core::sync::atomic::AtomicU32; TIMER_MAX_CPUS] =
 #[inline]
 fn cntvct() -> u64 {
     let c: u64;
-    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) c, options(nomem, nostack)); }
+    // ISB first: CNTVCT_EL0 reads may be speculated past earlier instructions;
+    // for a clock that has to agree with the tick grid that is not acceptable.
+    unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) c, options(nomem, nostack)); }
     c
 }
 
-/// Monotonic nanoseconds since boot, interpolated *inside* the current tick.
-///
-/// A 100 Hz tick counter alone answers `clock_gettime` in 10 ms steps, which is
-/// not merely coarse — it is wrong in a way userspace acts on. Mesa's venus ring
-/// throttles the "wake the idle renderer" notification to one per 1 ms, and
-/// decides using this clock; with a 10 ms clock two submissions up to 10 ms
-/// apart read the *same* timestamp, the second notification is suppressed, and
-/// virglrenderer's ring thread — which re-idles after 1 ms and only ever waits
-/// on an explicit notify — sleeps forever. That is the whole `vktest`-under-TCG
-/// hang. The generic timer is free-running, per-architecture exact (CNTFRQ_EL0),
-/// and readable at EL0 cost, so the fraction is real, not estimated.
-///
-/// The tick and its counter anchor are published from `on_tick` one after the
-/// other, so a reader can catch them mid-update; the anchor is re-read to detect
-/// that, the fraction is clamped below one tick, and the result is passed
-/// through a `fetch_max` so the clock can never step backwards.
-pub fn monotonic_ns() -> u64 {
-    let f = freq();
-    let ns = loop {
-        let a = LAST_TICK_CNT.load(Ordering::Acquire);
-        let t = TICK_COUNT.load(Ordering::Acquire);
-        let b = LAST_TICK_CNT.load(Ordering::Acquire);
-        if a != b { continue; }
-        let base = t.wrapping_mul(10_000_000);
-        if a == 0 || f == 0 { break base; }
-        let d = cntvct().wrapping_sub(a);
-        let frac = ((d as u128) * 1_000_000_000u128 / f as u128) as u64;
-        break base + frac.min(9_999_999);
-    };
-    let prev = MONO_LAST_NS.fetch_max(ns, Ordering::Relaxed);
-    if prev > ns { prev } else { ns }
+#[inline]
+fn write_cval(v: u64) {
+    unsafe {
+        core::arch::asm!("msr cntv_cval_el0, {}", in(reg) v, options(nomem, nostack));
+    }
 }
 
-/// Return the number of timer ticks since boot.
+/// Monotonic nanoseconds since the BSP timer started.
+///
+/// Read directly from the free-running counter (CNTFRQ_EL0 is exact for the
+/// architecture, and CNTVCT_EL0 is the same clock on every PE). It is not
+/// interpolated from the tick count any more — that made the clock inherit
+/// every period error of the tick, and clamped it inside a 10 ms window so a
+/// 14 ms tick period read as 10 ms of elapsed time: the guest clock ran 15–30 %
+/// slow under HVF. Zero before `init` (nothing consults the clock that early
+/// except the boot log, and a zero there is honest).
+///
+/// Sub-tick resolution is load-bearing for userspace, not cosmetic: Mesa's
+/// venus ring throttles renderer wake-ups to one per 1 ms using this clock and
+/// hangs when two submissions read the same timestamp.
+pub fn monotonic_ns() -> u64 {
+    let e = EPOCH.load(Ordering::Relaxed);
+    let f = freq();
+    if e == 0 || f == 0 { return 0; }
+    let d = cntvct().wrapping_sub(e);
+    ((d as u128) * 1_000_000_000u128 / f as u128) as u64
+}
+
+/// Whole 10 ms ticks of real time since the BSP timer started, from the
+/// counter (what `sched::ticks()` converges to after each BSP tick).
 #[inline]
 pub fn ticks() -> u64 {
-    TICK_COUNT.load(Ordering::Relaxed)
+    let e = EPOCH.load(Ordering::Relaxed);
+    if e == 0 { return 0; }
+    cntvct().wrapping_sub(e) / interval()
+}
+
+/// Ticks the BSP has had to account without their own interrupt (diagnostic).
+pub fn catch_up_ticks() -> u64 {
+    CATCH_UP_TICKS.load(Ordering::Relaxed)
 }
 
 /// Read the hardware timer frequency (CNTFRQ_EL0).
@@ -90,29 +124,65 @@ pub fn freq() -> u64 {
 }
 
 /// Resolution of `monotonic_ns` in nanoseconds: the period of the generic
-/// timer the sub-tick fraction is interpolated from, floored at 1 ns. Falls
-/// back to a whole tick if CNTFRQ_EL0 reads zero, so the answer is never better
-/// than what the clock can actually deliver.
+/// timer, floored at 1 ns. Falls back to a whole tick if CNTFRQ_EL0 reads zero,
+/// so the answer is never better than what the clock can actually deliver.
 pub fn resolution_ns() -> u64 {
     let f = freq();
     if f == 0 { return 10_000_000; }
     (1_000_000_000u64 / f).max(1)
 }
 
-/// Compute the reload value for one tick interval.
+/// Counter units in one tick interval.
+#[inline]
 fn interval() -> u64 {
     let f = freq();
     if f == 0 { 1_000_000 } else { f / TICK_HZ } // guard against uninitialised freq
 }
 
-/// Initialise the virtual timer and unmask IRQs at EL1.
+/// Advance this CPU's grid past `now` and program the compare value for the
+/// first grid point strictly after it. Returns how many grid points were at or
+/// before `now` — the ticks of real time this CPU has to account for (1 on a
+/// tick that arrived on time, 0 on a spurious interrupt, N after a stall).
+fn advance_grid(cpu: usize, now: u64) -> u64 {
+    let iv = interval();
+    let grid = GRID_CPU[cpu].load(Ordering::Relaxed);
+    let due = grid.wrapping_add(iv);
+    let passed = if now.wrapping_sub(due) < (1u64 << 63) {
+        // due <= now: the point we were armed for has passed, plus however
+        // many whole intervals after it.
+        now.wrapping_sub(due) / iv + 1
+    } else {
+        0
+    };
+    let new_grid = grid.wrapping_add(passed.wrapping_mul(iv));
+    GRID_CPU[cpu].store(new_grid, Ordering::Relaxed);
+    write_cval(new_grid.wrapping_add(iv));
+    passed
+}
+
+/// Initialise this CPU's virtual timer and unmask IRQs at EL1.
 ///
-/// Must be called after `gic::init()` so the IRQ reaches the CPU.
+/// Must be called after `gic::init()` / `gic::init_cpu_interface()` so the IRQ
+/// reaches the CPU. The BSP defines the epoch; APs join the same grid so all
+/// CPUs tick at (nominally) the same instants and `monotonic_ns` has one
+/// origin.
 pub fn init() {
+    let cpu = unsafe { super::smp::arch_cpu_id() }.min(TIMER_MAX_CPUS - 1);
+    let now = cntvct();
+    let iv = interval();
+    let epoch = if cpu == 0 {
+        EPOCH.store(now, Ordering::Release);
+        now
+    } else {
+        let e = EPOCH.load(Ordering::Acquire);
+        if e == 0 { now } else { e }
+    };
+    // The grid point at or before now, on the BSP's grid.
+    let grid = epoch.wrapping_add((now.wrapping_sub(epoch) / iv).wrapping_mul(iv));
+    GRID_CPU[cpu].store(grid, Ordering::Relaxed);
+    LAST_TICK_CNT_CPU[cpu].store(now, Ordering::Relaxed);
     unsafe {
-        // Load the countdown value (CNTV_TVAL_EL0).
-        core::arch::asm!("msr cntv_tval_el0, {}", in(reg) interval(),
-                         options(nomem, nostack));
+        write_cval(grid.wrapping_add(iv));
         // Enable the timer: ENABLE=1, IMASK=0.
         core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64,
                          options(nomem, nostack));
@@ -127,10 +197,13 @@ pub fn init() {
 ///
 /// Called by the scheduler wherever it opens an IRQ window. If this CPU has
 /// had interrupts enabled and still not ticked for `2 s` of counter time, the
-/// virtual timer is not going to fire on its own (its countdown expired and
-/// was never reloaded — the `on_tick` reload is the only one), so reload it
-/// here and say so on the raw UART. Cost on the normal path: one counter read
-/// and a compare. Returns true when a re-arm was needed.
+/// virtual timer is not going to fire on its own (the hypervisor lost the
+/// edge; the compare value sits in the past with nothing re-asserting it), so
+/// program a FUTURE compare value — the next grid point after now — and say so
+/// on the raw UART. The grid itself is left where it was: the tick that then
+/// fires finds every missed grid point and accounts them all at once, so the
+/// clock does not lose the silent stretch. Cost on the normal path: one counter
+/// read and a compare. Returns true when a re-arm was needed.
 pub fn check_alive() -> bool {
     let cpu = unsafe { super::smp::arch_cpu_id() }.min(TIMER_MAX_CPUS - 1);
     let last = LAST_TICK_CNT_CPU[cpu].load(Ordering::Relaxed);
@@ -148,7 +221,13 @@ pub fn check_alive() -> bool {
     unsafe {
         core::arch::asm!("mrs {}, cntv_ctl_el0", out(reg) ctl, options(nomem, nostack));
         core::arch::asm!("mrs {}, cntv_cval_el0", out(reg) cval, options(nomem, nostack));
-        core::arch::asm!("msr cntv_tval_el0, {}", in(reg) interval(), options(nomem, nostack));
+    }
+    let iv = interval();
+    let grid = GRID_CPU[cpu].load(Ordering::Relaxed);
+    // First grid point strictly after now (≤ one interval away).
+    let next = grid.wrapping_add((now.wrapping_sub(grid) / iv + 1).wrapping_mul(iv));
+    unsafe {
+        write_cval(next);
         core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack));
         core::arch::asm!("isb", options(nomem, nostack));
     }
@@ -164,24 +243,20 @@ pub fn check_alive() -> bool {
 
 /// Called from the IRQ handler when PPI #27 fires (Virtual Timer).
 ///
-/// Reloads the (banked, per-CPU) countdown register.  Global timekeeping and
-/// device polling are BSP-only so wall-clock ticks don't advance N× faster
-/// with N CPUs and the single UART/virtio queues have a single consumer.
+/// Arms the next grid point on this CPU's (banked) timer and accounts the
+/// elapsed ticks. Global timekeeping and device polling are BSP-only so
+/// wall-clock ticks don't advance N× faster with N CPUs and the single
+/// UART/virtio queues have a single consumer.
 pub fn on_tick() {
-    unsafe {
-        core::arch::asm!("msr cntv_tval_el0, {}", in(reg) interval(),
-                         options(nomem, nostack));
-    }
+    let cpu = unsafe { super::smp::arch_cpu_id() }.min(TIMER_MAX_CPUS - 1);
+    let now = cntvct();
+    let passed = advance_grid(cpu, now);
+    LAST_TICK_CNT_CPU[cpu].store(now, Ordering::Relaxed);
 
-    let cpu = unsafe { super::smp::arch_cpu_id() };
-    LAST_TICK_CNT_CPU[cpu.min(TIMER_MAX_CPUS - 1)].store(cntvct(), Ordering::Relaxed);
     if cpu == 0 {
-        // Anchor the sub-tick interpolation BEFORE publishing the new tick, so a
-        // concurrent reader can only ever see an anchor that is at most one tick
-        // stale (bounded by the clamp in `monotonic_ns`), never one from the
-        // future.
-        LAST_TICK_CNT.store(cntvct(), Ordering::Release);
-        let _count = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+        if passed > 1 {
+            CATCH_UP_TICKS.fetch_add(passed - 1, Ordering::Relaxed);
+        }
 
         // Poll VirtIO Keyboard
         drivers::virtio_keyboard::poll_events();
@@ -203,5 +278,5 @@ pub fn on_tick() {
         evdev_server::flush_pending_wake();
     }
 
-    sched::timer_tick_irq();
+    sched::timer_tick_irq(passed);
 }
