@@ -2892,12 +2892,17 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
                     // Absolute: the deadline in this kernel's one clock,
                     // rounded up like the relative path and clock_nanosleep so
                     // a wait never returns early. A deadline already in the
-                    // past still gets the value check inside futex_wait (Linux
-                    // reports EAGAIN over ETIMEDOUT when the word has moved),
-                    // and the current tick as its deadline means the
-                    // deadline tick releases it at once.
+                    // past is answered without parking, value check first
+                    // (Linux reports EAGAIN over ETIMEDOUT when the word has
+                    // moved).
                     let target = ns.div_ceil(10_000_000) as u64;
-                    Some(target.max(ticks()))
+                    if target <= ticks() {
+                        // Already expired. No lock is held, so the read may
+                        // fault and be serviced like any other user read.
+                        let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+                        return if cur != val as u32 { -11 } else { -110 }; // EAGAIN / ETIMEDOUT
+                    }
+                    Some(target)
                 } else {
                     // Relative, exactly as sys_nanosleep converts it.
                     let ticks_needed = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
