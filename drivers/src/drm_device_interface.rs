@@ -1498,6 +1498,177 @@ fn fb_set_resource_id(handle: u32, res_id: u32) {
     if let Some(b) = DUMB_BUFFERS.lock().get_mut(&handle) { b.res_id = res_id; }
 }
 
+// ── Blob framebuffers ────────────────────────────────────────────────────────
+//
+// THE GAP THIS CLOSES. Both ADDFB paths resolved their handle through the
+// dumb-buffer registry only, and presentation is a CPU copy of the
+// framebuffer's guest pages into the console's resource 1
+// (`perform_software_scaling` / `present_damaged`). A **blob** BO — the handle
+// Zink's GBM path mints for every buffer it renders, via `vkGetMemoryFdKHR`
+// on the render node and `PRIME_FD_TO_HANDLE` on card0 — fell through both:
+// ADDFB2 built a 2D resource over it and tried to ATTACH_BACKING guest address
+// 0 (the four `ctrl 0x106, error 0x1200` refusals in QEMU's stderr), and the
+// present found `physical_addresses[0] == 0` and returned without touching a
+// pixel. cosmic-comp under Zink/Venus therefore flipped at ~20 fps into a
+// scanout that stayed black. Not a Zink problem: no path existed by which a
+// buffer living in host memory could reach the display.
+//
+// THE MODEL, which is upstream's (`virtio_gpu_primary_plane_update`): a blob BO
+// already owns a host resource, so the framebuffer records that resource and
+// nothing is created or attached; a present points the scanout at the blob
+// itself with SET_SCANOUT_BLOB and repaints with RESOURCE_FLUSH. QEMU exports
+// the blob as a dmabuf to its display backend — zero copies, which is the
+// whole point of rendering on the host GPU.
+//
+// A GUEST-backed blob (`phys != 0`) keeps the CPU path: it has guest pages, the
+// existing copy works on them unchanged, and QEMU cannot export a guest-iov
+// blob as a dmabuf anyway. `blob_res` is therefore set only when there are no
+// guest pages, and `physical_addresses[0] == 0 && blob_res != 0` is the one
+// test every present path makes.
+
+/// `DRM_FORMAT_*` fourcc → `VIRTIO_GPU_FORMAT_*`, upstream's
+/// `virtio_gpu_translate_format` for the formats this KMS offers. XRGB8888 is
+/// the fallback because it is the only format the plane advertised before
+/// blob framebuffers existed, so it is what every existing client sends.
+fn virtio_format_for(fourcc: u32) -> u32 {
+    use crate::virtio_gpu as vg;
+    match fourcc {
+        0x34325241 /* AR24 ARGB8888 */ => vg::VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
+        0x34324258 /* XB24 XBGR8888 */ => vg::VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM,
+        0x34324241 /* AB24 ABGR8888 */ => vg::VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM,
+        _ /* XR24 XRGB8888 and anything else */ => vg::VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
+    }
+}
+
+/// Build the framebuffer for a blob BO, or None if `handle` names no blob this
+/// open may reach (the caller then takes the dumb-buffer path unchanged).
+///
+/// `handles[0]` becomes the host resource id, as the 2D path does, so DIRTYFB
+/// and every other consumer that reads it as a resource keep working. No lock
+/// is held on return, and `VIRTIO_GPU` is never taken: there is nothing to
+/// create.
+fn blob_framebuffer(
+    handle: u32,
+    open_id: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    offset: u32,
+    fourcc: u32,
+    modifier: u64,
+) -> Option<DrmFramebuffer> {
+    let b = blob_lookup(handle, open_id)?;
+    // A v3d BO is not a virtio-gpu resource and cannot be scanned out here.
+    if b.v3d_va != 0 || b.res_handle == 0 { return None; }
+    let mut fb = DrmFramebuffer::new(width, height, DrmFormat::Xrgb8888, handle, pitch);
+    fb.offsets[0] = offset;
+    fb.modifier = modifier;
+    fb.handles[0] = b.res_handle;
+    fb.physical_addresses[0] = b.phys as u64;
+    fb.virtio_format = virtio_format_for(fourcc);
+    if b.phys == 0 { fb.blob_res = b.res_handle; }
+    if DRM_STATS {
+        crate::pci::serial_debug("[DRM] blob framebuffer: handle=");
+        crate::pci::serial_debug_hex(handle);
+        crate::pci::serial_debug(" res=");
+        crate::pci::serial_debug_hex(b.res_handle);
+        crate::pci::serial_debug(" fourcc=");
+        crate::pci::serial_debug_hex(fourcc);
+        crate::pci::serial_debug(" pitch=");
+        crate::pci::serial_debug_hex(pitch);
+        crate::pci::serial_debug(" mod_lo=");
+        crate::pci::serial_debug_hex(modifier as u32);
+        crate::pci::serial_debug(" guest_phys=");
+        crate::pci::serial_debug_hex(b.phys as u32);
+        crate::pci::serial_debug("\n");
+    }
+    Some(fb)
+}
+
+/// Present `fb_id` if it is a host-memory blob framebuffer: SET_SCANOUT_BLOB
+/// when the scanout is not already on this resource, then RESOURCE_FLUSH over
+/// the damage (the whole surface when `rects` is None).
+///
+/// Returns None when the framebuffer is not a blob one, and the caller falls
+/// through to the CPU-copy present exactly as before. Called with the DRM
+/// device lock held; `VIRTIO_GPU` nests inside it in the same order
+/// `atomic_commit` already uses.
+///
+/// Every successful present bumps `SCANOUT_WRITES`, because that counter is
+/// how `handle_ioctl` learns a DRM client has taken the surface and silences
+/// the console (`drm_scanout_claim`). Without it the console's next dirty
+/// rectangle would `flush(1, ..)` and yank the scanout back to resource 1.
+fn present_blob_fb(
+    device: &mut DrmDevice,
+    fb_id: DrmObjectId,
+    rects: Option<&[(i32, i32, i32, i32)]>,
+) -> Option<Result<(), DriverError>> {
+    let (res, w, h, format, stride, offset) = {
+        let fb = device.get_framebuffer(fb_id)?;
+        if fb.blob_res == 0 || fb.physical_addresses[0] != 0 { return None; }
+        (fb.blob_res, fb.width, fb.height, fb.virtio_format, fb.pitches[0], fb.offsets[0])
+    };
+    if w == 0 || h == 0 { return Some(Err(DriverError::InvalidParameter)); }
+
+    // Damage union in framebuffer coordinates, clamped; an empty list after
+    // clamping still owes the scanout switch (the buffer may be new) but no
+    // flush.
+    let (mut x0, mut y0, mut x1, mut y1) = (0u32, 0u32, w, h);
+    if let Some(clips) = rects {
+        let (mut ux0, mut uy0, mut ux1, mut uy1) = (w, h, 0u32, 0u32);
+        for &(a, b, c, d) in clips {
+            let sx0 = a.max(0) as u32;
+            let sy0 = b.max(0) as u32;
+            let sx1 = (c.max(0) as u32).min(w);
+            let sy1 = (d.max(0) as u32).min(h);
+            if sx0 >= sx1 || sy0 >= sy1 { continue; }
+            if sx0 < ux0 { ux0 = sx0; }
+            if sy0 < uy0 { uy0 = sy0; }
+            if sx1 > ux1 { ux1 = sx1; }
+            if sy1 > uy1 { uy1 = sy1; }
+        }
+        (x0, y0, x1, y1) = (ux0, uy0, ux1, uy1);
+    }
+
+    let r = {
+        let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+        let gpu = match guard.as_mut() {
+            Some(g) => g,
+            None => return Some(Err(DriverError::NotFound)),
+        };
+        let mut switched = false;
+        if gpu.current_scanout() != res {
+            if !gpu.set_scanout_blob(res, w, h, format, stride, offset) {
+                crate::pci::serial_debug("[DRM] SET_SCANOUT_BLOB refused res=");
+                crate::pci::serial_debug_hex(res);
+                crate::pci::serial_debug("\n");
+                return Some(Err(DriverError::Io));
+            }
+            switched = true;
+        }
+        // A fresh scanout binding is displayed by the host on its own; a flush
+        // is still what tells it which rectangle changed, so send one whenever
+        // there is damage or the binding just moved.
+        if x0 < x1 && y0 < y1 {
+            if !gpu.resource_flush(res, x0, y0, x1 - x0, y1 - y0) {
+                crate::pci::serial_debug("[DRM] blob RESOURCE_FLUSH refused res=");
+                crate::pci::serial_debug_hex(res);
+                crate::pci::serial_debug("\n");
+                return Some(Err(DriverError::Io));
+            }
+        } else if switched {
+            let _ = gpu.resource_flush(res, 0, 0, w, h);
+        }
+        Ok(())
+    };
+
+    crate::drm::device::SCANOUT_WRITES.fetch_add(1, Ordering::Relaxed);
+    if let Some(plane) = device.planes.first_mut() {
+        plane.fb_id = Some(fb_id);
+    }
+    Some(r)
+}
+
 /// Does `handle` name a BO this open may reach, of either kind? Upstream's
 /// `drm_gem_object_lookup` miss, which EXECBUFFER answers -ENOENT to.
 ///
@@ -1979,6 +2150,72 @@ pub fn prime_export_acquire(handle: u32, open_id: u32) -> Option<PrimeExport> {
         len: (1usize << b.order) * 4096,
         obj: b.obj,
     })
+}
+
+/// PRIME_FD_TO_HANDLE for a **blob** object: mint a gem handle that the
+/// IMPORTING open may reach, or return the one it already holds on this object.
+///
+/// WHY. Handles are scoped to the open that created them (`BlobHandle::owner`,
+/// `open_may_reach`). PRIME_FD_TO_HANDLE used to echo the *exporter's* handle
+/// across the fd, so the very next thing an importer does with it —
+/// `VIRTGPU_RESOURCE_INFO`, which Mesa's Venus backend issues in
+/// `virtgpu_bo_create_from_dma_buf` — resolved to "not yours" and was refused
+/// as an unknown handle. Under Zink that is the compositor importing a client's
+/// `zwp_linux_dmabuf_v1` buffer: cosmic-comp answered cosmic-panel's
+/// `create_immed` with a protocol error and the panel died on every start.
+///
+/// WHAT UPSTREAM DOES, which this mirrors:
+///   * `drm_gem_prime_fd_to_handle` gives each `drm_file` its own handle on the
+///     shared object, and returns the *existing* handle if that file already
+///     imported (or created) the object — hence the dedup scan first, which also
+///     makes a self-import (Mesa re-importing its own export) answer with the
+///     original handle;
+///   * `virtio_gpu_gem_object_open` then sends CTX_ATTACH_RESOURCE for the
+///     importer's context, because the host renderer's per-context resource
+///     table is what `vkAllocateMemory` with a resource import consults — a
+///     Venus context can only import a resource it has been told about.
+///
+/// The new handle is one reference on the object (`BO LIFETIME`), released
+/// by GEM_CLOSE like any other, and it records the importer's context so the
+/// close detaches exactly what this attach attached.
+///
+/// Returns `None` if `obj` names no live blob object — a dumb-buffer export,
+/// whose handles are deliberately global (see `open_may_reach`), or a buffer
+/// torn down between the fd read and here — and the caller falls back to the
+/// exporter's handle, which for a dumb buffer is the right answer.
+pub fn prime_import_blob(obj: u32, open_id: u32) -> Option<u32> {
+    if open_id == 0 { return None; } // no identity: every handle is reachable anyway
+    {
+        let map = BLOB_BUFFERS.lock();
+        if let Some((h, _)) = map.iter().find(|(_, h)| h.obj == obj && h.owner == open_id) {
+            return Some(*h);
+        }
+    }
+    // Take the handle's reference under ONE acquisition of the object map.
+    let res_handle = {
+        let mut objs = BLOB_OBJS.lock();
+        let o = objs.get_mut(&obj)?;
+        o.refs = o.refs.saturating_add(1);
+        o.res_handle
+    };
+    let ctx = ctx_lookup(open_id);
+    if ctx != 0 && res_handle != 0 {
+        let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+        if let Some(gpu) = guard.as_mut() {
+            // Logged, not propagated — same contract as RESOURCE_CREATE_BLOB's
+            // attach: upstream issues it for effect and returns 0 regardless.
+            if !gpu.ctx_attach_resource(ctx, res_handle) {
+                crate::pci::serial_debug("[DRM] PRIME import: CTX_ATTACH_RESOURCE refused ctx=");
+                crate::pci::serial_debug_hex(ctx);
+                crate::pci::serial_debug(" res=");
+                crate::pci::serial_debug_hex(res_handle);
+                crate::pci::serial_debug("\n");
+            }
+        }
+    }
+    let handle = NEXT_BLOB_HANDLE.fetch_add(1, Ordering::Relaxed);
+    BLOB_BUFFERS.lock().insert(handle, BlobHandle { obj, owner: open_id, ctx });
+    Some(handle)
 }
 
 // ── DRM sync objects ─────────────────────────────────────────────────────────
@@ -3178,7 +3415,7 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_GETCRTC => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_crtc(&mut g, arg) },
             DRM_IOCTL_MODE_CREATE_DUMB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_create_dumb(&mut g, arg) },
             DRM_IOCTL_MODE_MAP_DUMB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_map_dumb(&mut g, arg) },
-            DRM_IOCTL_MODE_ADDFB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_addfb(&mut g, arg) },
+            DRM_IOCTL_MODE_ADDFB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_addfb(&mut g, arg, open_id) },
             DRM_IOCTL_MODE_SETCRTC => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_set_crtc(&mut g, arg) },
             DRM_IOCTL_MODE_PAGE_FLIP => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_page_flip(&mut g, arg) },
 
@@ -3204,7 +3441,7 @@ impl DrmDeviceInterface {
             DRM_IOCTL_AUTH_MAGIC => Ok(0),
             DRM_IOCTL_GEM_CLOSE => self.std_handle_gem_close(arg, open_id),
             DRM_IOCTL_MODE_DESTROY_DUMB => self.std_handle_destroy_dumb(arg, open_id),
-            DRM_IOCTL_MODE_ADDFB2 => self.std_handle_addfb2(arg),
+            DRM_IOCTL_MODE_ADDFB2 => self.std_handle_addfb2(arg, open_id),
             DRM_IOCTL_MODE_RMFB => self.std_handle_rmfb(arg),
             DRM_IOCTL_MODE_DIRTYFB => self.std_handle_dirtyfb(arg),
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => self.std_handle_obj_get_properties(arg),
@@ -3467,6 +3704,12 @@ impl DrmDeviceInterface {
         let _flags = flip_data[1];
         let src_width = if flip_data[2] != 0 { flip_data[2] } else { 320 };
         let src_height = if flip_data[3] != 0 { flip_data[3] } else { 200 };
+
+        // A host-memory blob framebuffer is scanned out directly; there are no
+        // guest pixels for the software-scaling path below to copy.
+        if let Some(r) = present_blob_fb(device, fb_id, None) {
+            return r.map(|_| 0);
+        }
 
         crate::pci::rdebug("[DRM-IF] handle_flip_page fb_id=");
         crate::pci::rdebug_hex(fb_id.0);
@@ -3856,9 +4099,19 @@ impl DrmDeviceInterface {
             None => Err(DriverError::NotFound),
         }
     }
-    fn std_handle_addfb(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+    fn std_handle_addfb(&mut self, device: &mut DrmDevice, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let add = unsafe { &mut *(arg as *mut drm_mode_fb_cmd) };
+
+        // Blob BO: see "Blob framebuffers". Legacy ADDFB carries no fourcc;
+        // 32 bpp is XRGB8888, which is the only depth this path ever accepted.
+        if let Some(fb) = blob_framebuffer(add.handle, open_id, add.width, add.height,
+                                           add.pitch, 0, 0x34325258, 0) {
+            let fb_id = fb.id().0;
+            device.framebuffers.insert(fb.id(), fb);
+            add.fb_id = fb_id;
+            return Ok(0);
+        }
 
         let mut fb = DrmFramebuffer::new(
             add.width,
@@ -3868,8 +4121,10 @@ impl DrmDeviceInterface {
             add.pitch
         );
 
-        // Use the physical address associated with the dumb buffer handle
-        let phys_addr = dumb_lookup(add.handle).map(|b| b.phys).unwrap_or(0);
+        // Use the physical address associated with the dumb buffer handle. An
+        // unknown handle is refused (see std_handle_addfb2), not given a
+        // framebuffer over guest address 0.
+        let phys_addr = dumb_lookup(add.handle).map(|b| b.phys).ok_or(DriverError::NotFound)?;
         fb.physical_addresses[0] = phys_addr as u64;
 
         // If Virtio-GPU is present, bind a resource for this framebuffer.
@@ -4471,7 +4726,10 @@ impl DrmDeviceInterface {
                                     DAMAGE_RECT.fetch_add(1, Ordering::Relaxed);
                                     DAMAGE_PX.fetch_add(damage_area(clips), Ordering::Relaxed);
                                 }
-                                g.present_damaged(DrmObjectId(fb_id), clips).map(|_| 0usize)
+                                match present_blob_fb(&mut g, DrmObjectId(fb_id), Some(clips)) {
+                                    Some(r) => r.map(|_| 0usize),
+                                    None => g.present_damaged(DrmObjectId(fb_id), clips).map(|_| 0usize),
+                                }
                             }
                             None => {
                                 if DRM_STATS { DAMAGE_FULL.fetch_add(1, Ordering::Relaxed); }
@@ -4494,6 +4752,14 @@ impl DrmDeviceInterface {
                     // used to be the same number by construction, which is what
                     // made "smithay flips the primary every frame" unfalsifiable.
                     FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed);
+                    if DRM_STATS {
+                        let now = crate::snd::monotonic_us();
+                        mm::gap2::s("[FLIP] t_us="); mm::gap2::h(now as usize);
+                        mm::gap2::kv(" pid=", sched::current_pid() as usize);
+                        mm::gap2::kv(" inp_age_us=", now.wrapping_sub(evdev_server::last_push_us()) as usize);
+                        mm::gap2::kv(" n=", FLIPS_SUBMITTED.load(Ordering::Relaxed) as usize);
+                        mm::gap2::nl();
+                    }
                     presented = true;
                 }
 
@@ -4680,7 +4946,7 @@ impl DrmDeviceInterface {
     }
 
     /// DRM_IOCTL_MODE_ADDFB2 — LINEAR only, plane 0. Same internal path as ADDFB.
-    fn std_handle_addfb2(&mut self, arg: usize) -> Result<usize, DriverError> {
+    fn std_handle_addfb2(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let mut cmd2 = unsafe { ptr::read_unaligned(arg as *const drm_mode_fb_cmd2) };
 
@@ -4688,7 +4954,31 @@ impl DrmDeviceInterface {
         let width = cmd2.width;
         let height = cmd2.height;
         let pitch = if cmd2.pitches[0] != 0 { cmd2.pitches[0] } else { width * 4 };
-        let phys_addr = dumb_lookup(handle).map(|b| b.phys).unwrap_or(0);
+
+        // A blob BO keeps the host resource it already has; see "Blob
+        // framebuffers". Resolved before VIRTIO_GPU is taken, like the dumb
+        // lookup below, so the BO maps never nest inside it.
+        const DRM_MODE_FB_MODIFIERS: u32 = 1 << 1;
+        let modifier = if cmd2.flags & DRM_MODE_FB_MODIFIERS != 0 { cmd2.modifier[0] } else { 0 };
+        if let Some(fb) = blob_framebuffer(handle, open_id, width, height, pitch,
+                                           cmd2.offsets[0], cmd2.pixel_format, modifier) {
+            let fb_id = fb.id().0;
+            {
+                let dev = get_drm_device();
+                let mut g = dev.lock();
+                g.framebuffers.insert(fb.id(), fb);
+            }
+            cmd2.fb_id = fb_id;
+            unsafe { ptr::write_unaligned(arg as *mut drm_mode_fb_cmd2, cmd2); }
+            return Ok(0);
+        }
+
+        // A handle naming no BO this open may reach is upstream's
+        // `drm_gem_object_lookup` miss, -ENOENT. It used to fall through to
+        // `phys_addr = 0`, which built a 2D resource over guest address 0 and
+        // asked the host to attach it — the `ctrl 0x106, error 0x1200`
+        // refusals every Zink session used to log four of.
+        let phys_addr = dumb_lookup(handle).map(|b| b.phys).ok_or(DriverError::NotFound)?;
 
         let mut fb = DrmFramebuffer::new(width, height, DrmFormat::Xrgb8888, handle, pitch);
         fb.physical_addresses[0] = phys_addr as u64;
@@ -4747,11 +5037,17 @@ impl DrmDeviceInterface {
         let flush_args = {
             let dev = get_drm_device();
             let g = dev.lock();
-            g.get_framebuffer(DrmObjectId(cmd.fb_id)).map(|fb| (fb.handles[0], fb.width, fb.height))
+            g.get_framebuffer(DrmObjectId(cmd.fb_id))
+                .map(|fb| (fb.handles[0], fb.width, fb.height, fb.blob_res != 0 && fb.physical_addresses[0] == 0))
         };
-        if let Some((res_id, w, h)) = flush_args {
+        if let Some((res_id, w, h, host_blob)) = flush_args {
             if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-                gpu.flush(res_id, 0, 0, w, h);
+                if host_blob {
+                    // Nothing to transfer: the host already holds the pixels.
+                    gpu.resource_flush(res_id, 0, 0, w, h);
+                } else {
+                    gpu.flush(res_id, 0, 0, w, h);
+                }
             }
         }
         Ok(0)

@@ -735,6 +735,19 @@ pub extern "C" fn syscall_dispatch(
     dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr)
 }
 
+/// zink-lane instrumentation: per-syscall time census for the focus tgid
+/// (`sched::SC_FOCUS_TGID`, cosmic-comp) plus a lock-free pid -> last syscall
+/// table, printed by `scstat_tick`. Compile-time gated like `DRM_STATS`.
+pub const SC_STATS: bool = false;
+const SC_SLOTS: usize = 512;
+static SC_N:   [AtomicU64; SC_SLOTS] = [const { AtomicU64::new(0) }; SC_SLOTS];
+static SC_NS:  [AtomicU64; SC_SLOTS] = [const { AtomicU64::new(0) }; SC_SLOTS];
+static SC_MAX: [AtomicU64; SC_SLOTS] = [const { AtomicU64::new(0) }; SC_SLOTS];
+/// pid & 1023 -> (pid << 32) | (nr << 1) | in_syscall
+static LAST_SC: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+/// 0 = not requested, 1 = dump the focus process's VMAs on its next syscall, 2 = done.
+static SC_VMA_DUMP: AtomicU32 = AtomicU32::new(0);
+
 pub fn dispatch(
     number: usize,
     a0: usize, a1: usize, a2: usize,
@@ -743,7 +756,28 @@ pub fn dispatch(
 ) -> isize {
     dbg_serial_dump_maybe();
     sched::note_syscall_enter(number);
+    let (sc_pid, sc_focus, sc_t0) = if SC_STATS {
+        let pid = current_pid();
+        LAST_SC[(pid as usize) & 1023].store(((pid as u64) << 32) | ((number as u64) << 1) | 1, Ordering::Relaxed);
+        let f = sched::SC_FOCUS_TGID.load(Ordering::Relaxed);
+        let focus = f != 0 && sched::current_tgid() == f;
+        (pid, focus, if focus { monotonic_ns() } else { 0 })
+    } else { (0, false, 0) };
     let ret = dispatch_inner(number, a0, a1, a2, a3, a4, a5, frame_ptr);
+    if SC_STATS && sc_focus && SC_VMA_DUMP.load(Ordering::Relaxed) == 1 {
+        SC_VMA_DUMP.store(2, Ordering::Relaxed);
+        mm::gap2::s("[VMA] focus tgid dump follows\n");
+        sched::dump_user_vma(0);
+    }
+    if SC_STATS {
+        LAST_SC[(sc_pid as usize) & 1023].store(((sc_pid as u64) << 32) | ((number as u64) << 1), Ordering::Relaxed);
+        if sc_focus && number < SC_SLOTS {
+            let dt = monotonic_ns().wrapping_sub(sc_t0);
+            SC_N[number].fetch_add(1, Ordering::Relaxed);
+            SC_NS[number].fetch_add(dt, Ordering::Relaxed);
+            SC_MAX[number].fetch_max(dt, Ordering::Relaxed);
+        }
+    }
     sched::note_syscall_exit();
     // The syscall is the deepest the kernel stack ever gets — every filesystem
     // and network server runs in kernel context off the back of one. Checking
@@ -3640,6 +3674,9 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // kpath is the resolved absolute path. Must precede replace_address_space,
     // which never returns.
     sched::set_exe_path(fd_owner, kpath.bytes());
+    if SC_STATS && kpath.bytes().ends_with(b"cosmic-comp") {
+        sched::SC_FOCUS_TGID.store(fd_owner, Ordering::Relaxed);
+    }
 
     // POSIX execve: caught signal handlers revert to SIG_DFL in the new image
     // (SIG_IGN/SIG_DFL and the signal mask are preserved). Omitting this let a
@@ -6371,10 +6408,23 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         let dfd = unsafe { ((arg + 8) as *const i32).read() };
         // Same TGID canonicalisation as HANDLE_TO_FD: the dmabuf fd lives in the
         // process (TGID) table, but dmabuf_handle_of indexes it directly.
-        let handle = match vfs::dmabuf_handle_of(sched::tgid_of(pid), dfd as usize) {
+        let tgid = sched::tgid_of(pid);
+        let exporter_handle = match vfs::dmabuf_handle_of(tgid, dfd as usize) {
             Some(h) => h,
             None => return -22, // EINVAL
         };
+        // A blob is reachable only by the open that owns a handle on it, so the
+        // importer needs a handle of its own (`prime_import_blob`); echoing the
+        // exporter's handle is right only for a dumb buffer, whose handles are
+        // global. The import is scoped to the calling open exactly as the
+        // export above is.
+        let open_id = match vfs::vfs_get_node_kind(pid, fd) {
+            Some(vfs::VnodeKind::DynamicDevice { open_id, .. }) => open_id,
+            _ => 0,
+        };
+        let handle = vfs::dmabuf_obj_of(tgid, dfd as usize)
+            .and_then(|obj| drivers::drm_device_interface::prime_import_blob(obj, open_id))
+            .unwrap_or(exporter_handle);
         unsafe { (arg as *mut u32).write(handle); }
         return 0;
     }
@@ -7344,10 +7394,81 @@ fn evstat_tick() {
     }
 }
 
+/// 0.5 Hz `[SCSTAT]` top-syscalls line for the focus tgid, and a 0.1 Hz
+/// `[TASK]` census of every live task (state, wait object, last syscall).
+/// IRQ context: atomics + one RUN_QUEUE try_lock + UART-direct output.
+fn scstat_tick() {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !SC_STATS { return; }
+    static LAST: AtomicUsize = AtomicUsize::new(0);
+    static ROUND: AtomicUsize = AtomicUsize::new(0);
+    let now = ticks() as usize;
+    if now.wrapping_sub(LAST.load(Relaxed)) < 200 { return; }
+    LAST.store(now, Relaxed);
+    let focus = sched::SC_FOCUS_TGID.load(Relaxed);
+    if focus != 0 {
+        // Top 10 by cumulative ns, unsorted scan (512 slots, 10 passes).
+        mm::gap2::s("[SCSTAT] t="); mm::gap2::h(now);
+        mm::gap2::kv(" tgid=", focus as usize);
+        let mut taken = [false; SC_SLOTS];
+        for _ in 0..10 {
+            let mut best = 0usize; let mut best_ns = 0u64;
+            for i in 0..SC_SLOTS {
+                if taken[i] { continue; }
+                let v = SC_NS[i].load(Relaxed);
+                if v > best_ns { best_ns = v; best = i; }
+            }
+            if best_ns == 0 { break; }
+            taken[best] = true;
+            mm::gap2::s(" nr"); mm::gap2::h(best);
+            mm::gap2::s(":"); mm::gap2::h(SC_N[best].load(Relaxed) as usize);
+            mm::gap2::s(":"); mm::gap2::h((best_ns / 1000) as usize);
+            mm::gap2::s(":"); mm::gap2::h((SC_MAX[best].load(Relaxed) / 1000) as usize);
+        }
+        mm::gap2::nl();
+    }
+    let r = ROUND.fetch_add(1, Relaxed);
+    // Ask for the focus process's VMA map ~20 s after it appears (its libraries
+    // are loaded by then), once.
+    if focus != 0 && r >= 10 && SC_VMA_DUMP.load(Relaxed) == 0 { SC_VMA_DUMP.store(1, Relaxed); }
+    // Once, ~40 s after focus: stack scan of every parked thread in the group.
+    if focus != 0 && r >= 20 && SC_VMA_DUMP.load(Relaxed) == 2 {
+        if sched::dump_group_stacks(focus, 1024) { SC_VMA_DUMP.store(3, Relaxed); }
+    }
+    if r % 5 == 0 {
+        let mut rows = [sched::TaskCensusRow::empty(); 96];
+        let n = sched::task_rows(&mut rows);
+        if n == usize::MAX {
+            mm::gap2::s("[TASK] t="); mm::gap2::h(now); mm::gap2::s(" busy\n");
+        } else {
+            for row in rows.iter().take(n) {
+                let l = LAST_SC[(row.pid as usize) & 1023].load(Relaxed);
+                mm::gap2::s("[TASK] t="); mm::gap2::h(now);
+                mm::gap2::kv(" pid=", row.pid as usize);
+                mm::gap2::kv(" tgid=", row.tgid as usize);
+                mm::gap2::kv(" st=", row.state as usize);
+                mm::gap2::kv(" bo=", row.blocked_on as usize);
+                mm::gap2::kv(" pd=", row.poll_deadline as usize);
+                mm::gap2::kv(" fut=", row.blocked_futex);
+                mm::gap2::kv(" cpu=", row.on_cpu as usize);
+                if (l >> 32) as u32 == row.pid {
+                    mm::gap2::kv(" sc=", ((l >> 1) & 0x7FFF_FFFF) as usize);
+                    mm::gap2::kv(" in=", (l & 1) as usize);
+                }
+                mm::gap2::kv(" rip=", row.urip as usize);
+                mm::gap2::kv(" rsp=", row.ursp as usize);
+                if row.futex_val != u64::MAX { mm::gap2::kv(" fval=", row.futex_val as usize); }
+                mm::gap2::nl();
+            }
+        }
+    }
+}
+
 pub fn poll_deadline_tick() {
     use core::sync::atomic::Ordering::Relaxed;
     gap2_sample_tick();
     evstat_tick();
+    scstat_tick();
     let now = ticks();
     let tfd = vfs::earliest_timerfd_deadline();
     // Fast path: the lock-free hint (min of parked timed waiters' deadlines)
@@ -8214,18 +8335,30 @@ fn sys_clone_or_fork(
 ) -> isize {
     const CLONE_VM: usize = 0x0000_0100;
 
+    const CLONE_PARENT_SETTID: usize = 0x0010_0000;
+    const CLONE_CHILD_SETTID:  usize = 0x0100_0000;
+
     #[cfg(target_arch = "x86_64")]
-    let (flags, child_stack, _ptid, ctid, tls) = (a0, a1, a2, a3, a4);
+    let (flags, child_stack, ptid, ctid, tls) = (a0, a1, a2, a3, a4);
 
     #[cfg(target_arch = "aarch64")]
-    let (flags, child_stack, _ptid, tls, ctid) = (a0, a1, a2, a3, a4);
+    let (flags, child_stack, ptid, tls, ctid) = (a0, a1, a2, a3, a4);
+
+    // The tid words are stored through the VMA tables inside clone_thread
+    // (no user access under RUN_QUEUE), which cannot fault a lazy page in.
+    // Make them resident here, with no lock held. musl's `&new->tid` shares
+    // a page with the `struct pthread` it has just initialised, so this is
+    // normally a no-op, but a pointer into an untouched mapping would
+    // otherwise be silently skipped.
+    if flags & CLONE_PARENT_SETTID != 0 { prefault_user(ptid, 4); }
+    if flags & CLONE_CHILD_SETTID  != 0 { prefault_user(ctid, 4); }
 
     if flags & CLONE_VM != 0 {
         const CLONE_THREAD: usize = 0x0001_0000;
         // Identify the parent by tgid: its fd table is keyed there, not by the
         // (possibly non-leader) forking thread's pid.
         let parent_pid = sched::tgid_of(current_pid());
-        clone_thread(flags, child_stack, tls, ctid, frame_ptr, |child_pid| {
+        clone_thread(flags, child_stack, tls, ptid, ctid, frame_ptr, |child_pid| {
             // Real CLONE_THREAD siblings (pthread_create) share the leader's
             // tgid and, today, have no fd table of their own at all — every
             // VFS call from such a thread already resolves fds by its own
@@ -8249,7 +8382,7 @@ fn sys_clone_or_fork(
             }
         })
     } else {
-        let _ = (child_stack, _ptid, tls, ctid);
+        let _ = (child_stack, tls, ctid);
         // fd tables are keyed by tgid, so the parent must be identified by its
         // thread-group id — a fork issued by a non-leader thread (e.g. a tokio
         // worker calling std's pre_exec fork path) otherwise names a pid the
@@ -8257,13 +8390,21 @@ fn sys_clone_or_fork(
         let parent_pid = sched::tgid_of(current_pid());
         // Duplicate the fd table before the child becomes runnable (see the
         // FORK arm of syscall_dispatch for the SMP race this prevents).
-        fork_current(frame_ptr, |child_pid| {
+        let ret = fork_current(frame_ptr, |child_pid| {
             let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
                                    &[parent_pid as u64, child_pid as u64]);
             let _ = vfs::handle(&msg, parent_pid);
             let nmsg = make_vfs_msg(net_server::NET_FORK_DUP,
                                     &[parent_pid as u64, child_pid as u64]);
             let _ = net_server::handle(&nmsg, parent_pid);
-        })
+        });
+        // CLONE_PARENT_SETTID on a plain fork names a word in the PARENT's
+        // memory (the child got its own copy at fork), and only the parent
+        // returns here with a positive pid.
+        if ret > 0 && flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
+            let tid = (ret as u32).to_ne_bytes();
+            let _ = with_current_address_space(|as_| as_.write_user_buf(ptid, &tid));
+        }
+        ret
     }
 }
