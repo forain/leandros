@@ -1,0 +1,13 @@
+[package]
+name = "sigtest2"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sigtest2"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc: links directly against librelibc.a like sigtest, because
+# sigaction()/sigsetjmp()/pthread_create()/waitpid() need relibc's real TLS
+# and the SA_RESTORER trampoline that relibc_start_v1 sets up.

@@ -56,27 +56,31 @@ pub fn init() {
             IDT.0[i] = IdtEntry::new(exc_misc as *const () as usize, 0x08, 0, 0x8E);
         }
 
-        // Per-exception handlers with correct vector numbers.
-        IDT.0[0]  = IdtEntry::new(exc_de  as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[1]  = IdtEntry::new(exc_db  as *const () as usize, 0x08, 0, 0x8E);
+        // Per-exception handlers with correct vector numbers. Every fault a
+        // user program can commit goes through a `fault_stub_N` asm entry
+        // (full `UserFrame`, signal delivery on the way out — see
+        // `fault_common`); NMI, #DF and #MC are not the task's doing and keep
+        // the print-and-halt handlers.
+        IDT.0[0]  = IdtEntry::new(fault_stub_0  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[1]  = IdtEntry::new(fault_stub_1  as *const () as usize, 0x08, 0, 0x8E);
         IDT.0[2]  = IdtEntry::new(exc_nmi as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[3]  = IdtEntry::new(exc_bp  as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[4]  = IdtEntry::new(exc_of  as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[5]  = IdtEntry::new(exc_br  as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[6]  = IdtEntry::new(exc_ud  as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[7]  = IdtEntry::new(exc_nm  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[3]  = IdtEntry::new(fault_stub_3  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[4]  = IdtEntry::new(fault_stub_4  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[5]  = IdtEntry::new(fault_stub_5  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[6]  = IdtEntry::new(fault_stub_6  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[7]  = IdtEntry::new(fault_stub_7  as *const () as usize, 0x08, 0, 0x8E);
         // Vector 8 = double fault — uses IST1 (dedicated stack in TSS).
         IDT.0[8]  = IdtEntry::new(exc_df  as *const () as usize, 0x08, 1, 0x8E);
-        IDT.0[10] = IdtEntry::new(exc_ts  as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[11] = IdtEntry::new(exc_np  as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[12] = IdtEntry::new(exc_ss  as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[13] = IdtEntry::new(exc_gp  as *const () as usize, 0x08, 0, 0x8E);
-        // Vector 14 = page fault — needs CR2 in addition to error code.
-        IDT.0[14] = IdtEntry::new(page_fault as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[16] = IdtEntry::new(exc_mf  as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[17] = IdtEntry::new(exc_ac  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[10] = IdtEntry::new(fault_stub_10 as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[11] = IdtEntry::new(fault_stub_11 as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[12] = IdtEntry::new(fault_stub_12 as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[13] = IdtEntry::new(fault_stub_13 as *const () as usize, 0x08, 0, 0x8E);
+        // Vector 14 = page fault — CR2 is read inside `fault_common`.
+        IDT.0[14] = IdtEntry::new(fault_stub_14 as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[16] = IdtEntry::new(fault_stub_16 as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[17] = IdtEntry::new(fault_stub_17 as *const () as usize, 0x08, 0, 0x8E);
         IDT.0[18] = IdtEntry::new(exc_mc  as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[19] = IdtEntry::new(exc_xf  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[19] = IdtEntry::new(fault_stub_19 as *const () as usize, 0x08, 0, 0x8E);
 
         // Vector 32 = IRQ0 (8253/8254 timer after PIC remapping).
         IDT.0[32] = IdtEntry::new(timer_irq as *const () as usize, 0x08, 0, 0x8E);
@@ -210,84 +214,217 @@ const fn fault_signal(vector: u64) -> u32 {
     }
 }
 
-/// Generate a named exception handler that doesn't take an error code.
-/// Each exception gets its own function so the actual vector number is known.
-macro_rules! fault_no_err_handler {
+/// `si_code` and `si_addr` for a user-mode exception, alongside the signal.
+///
+/// Linux's `arch/x86/kernel/traps.c` conventions: a page fault reports the
+/// faulting address with SEGV_MAPERR (not present) or SEGV_ACCERR (protection
+/// violation, error-code bit 0); #UD/#DE/#BP report the faulting RIP; #GP and
+/// the segment faults have no meaningful address and use SI_KERNEL.
+const fn fault_siginfo(vector: u64, error_code: u64, cr2: u64, rip: u64) -> (u32, i32, usize) {
+    let sig = fault_signal(vector);
+    match vector {
+        14 => (sig, if error_code & 1 != 0 { sched::SEGV_ACCERR } else { sched::SEGV_MAPERR }, cr2 as usize),
+        0  => (sig, sched::FPE_INTDIV,  rip as usize),
+        16 | 19 => (sig, sched::FPE_FLTINV, rip as usize),
+        6  | 7  => (sig, sched::ILL_ILLOPC, rip as usize),
+        3  => (sig, sched::TRAP_BRKPT, rip as usize),
+        1  => (sig, sched::TRAP_TRACE, rip as usize),
+        17 => (sig, sched::BUS_ADRALN, 0),
+        _  => (sig, sched::SI_KERNEL, 0),
+    }
+}
+
+/// Generate a print-and-halt handler for exceptions that are never a user
+/// task's own fault (NMI, #DF, #MC, the catch-all). Taken from ring 3 they
+/// still kill the task — there is nothing else to do — but they never reach
+/// a user signal handler.
+macro_rules! fatal_no_err_handler {
     ($name:ident, $vector:expr) => {
         #[cfg(target_arch = "x86_64")]
         extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
-            let from_user = (frame.cs & 3) != 0;
-            if from_user {
-                unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
-                serial_str(b"user fault vec="); serial_hex64($vector);
-                serial_str(b" RIP=0x"); serial_hex64(frame.ip);
-                serial_str(b" CS=0x"); serial_hex64(frame.cs);
-                serial_str(b" RSP=0x"); serial_hex64(frame.sp);
-                serial_str(b": task killed\r\n");
-                sched::exit_group_signal(fault_signal($vector));
-            } else {
-                print_exception(&frame, $vector, 0);
-                loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
-            }
+            fatal_exception(&frame, $vector, 0);
         }
     }
 }
 
-/// Generate a named exception handler that takes an error code.
-macro_rules! fault_with_err_handler {
+/// Error-code variant of [`fatal_no_err_handler`].
+macro_rules! fatal_with_err_handler {
     ($name:ident, $vector:expr) => {
         #[cfg(target_arch = "x86_64")]
         extern "x86-interrupt" fn $name(frame: InterruptStackFrame, error_code: u64) {
-            let from_user = (frame.cs & 3) != 0;
-            if from_user {
-                unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
-                serial_str(b"user fault vec="); serial_hex64($vector);
-                serial_str(b" RIP=0x"); serial_hex64(frame.ip);
-                serial_str(b" CS=0x"); serial_hex64(frame.cs);
-                serial_str(b" RSP=0x"); serial_hex64(frame.sp);
-                serial_str(b" err=0x"); serial_hex64(error_code);
-                serial_str(b": task killed\r\n");
-                sched::exit_group_signal(fault_signal($vector));
-            } else {
-                print_exception(&frame, $vector, error_code);
-                loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
-            }
+            fatal_exception(&frame, $vector, error_code);
         }
     }
 }
 
-fault_no_err_handler!(exc_de,  0);   // #DE Divide Error
-fault_no_err_handler!(exc_db,  1);   // #DB Debug
-fault_no_err_handler!(exc_nmi, 2);   // NMI
-fault_no_err_handler!(exc_bp,  3);   // #BP Breakpoint
-fault_no_err_handler!(exc_of,  4);   // #OF Overflow
-fault_no_err_handler!(exc_br,  5);   // #BR Bound Range
-fault_no_err_handler!(exc_ud,  6);   // #UD Invalid Opcode
-fault_no_err_handler!(exc_nm,  7);   // #NM Device Not Available
-fault_with_err_handler!(exc_df,  8); // #DF Double Fault
-fault_with_err_handler!(exc_ts, 10); // #TS Invalid TSS
-fault_with_err_handler!(exc_np, 11); // #NP Segment Not Present
-fault_with_err_handler!(exc_ss, 12); // #SS Stack-Segment Fault
-fault_with_err_handler!(exc_gp, 13); // #GP General Protection
-fault_no_err_handler!(exc_mf, 16);   // #MF x87 FPE
-fault_with_err_handler!(exc_ac, 17); // #AC Alignment Check
-fault_no_err_handler!(exc_mc, 18);   // #MC Machine Check
-fault_no_err_handler!(exc_xf, 19);   // #XF SIMD FPE
-fault_no_err_handler!(exc_misc, 0xFE); // catch-all for other vectors
-
-/// Page fault handler — also reads CR2 (faulting virtual address).
-///
-/// Error code bit 0 (P): 0 = not-present, 1 = protection violation.
-///
-/// For user-mode not-present faults we first try the demand-paging path.
-/// If that succeeds the handler returns normally and execution resumes.
-/// All other user faults kill the task; kernel faults halt.
 #[cfg(target_arch = "x86_64")]
-extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64) {
+fn fatal_exception(frame: &InterruptStackFrame, vector: u64, error_code: u64) -> ! {
     let from_user = (frame.cs & 3) != 0;
     if from_user {
         unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+        serial_str(b"user fault vec="); serial_hex64(vector);
+        serial_str(b" RIP=0x"); serial_hex64(frame.ip);
+        serial_str(b" CS=0x"); serial_hex64(frame.cs);
+        serial_str(b" RSP=0x"); serial_hex64(frame.sp);
+        serial_str(b" err=0x"); serial_hex64(error_code);
+        serial_str(b": task killed\r\n");
+        sched::exit_group_signal(fault_signal(vector));
     }
+    print_exception(frame, vector, error_code);
+    loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+}
+
+fatal_no_err_handler!(exc_nmi, 2);        // NMI
+fatal_with_err_handler!(exc_df, 8);       // #DF Double Fault
+fatal_no_err_handler!(exc_mc, 18);        // #MC Machine Check
+fatal_no_err_handler!(exc_misc, 0xFE);    // catch-all for other vectors
+
+// ── Fault entry stubs: full UserFrame + signal delivery ──────────────────────
+//
+// A user-mode CPU exception is the only way a task reaches a SIGSEGV/SIGBUS/
+// SIGILL/SIGFPE/SIGTRAP handler, and running one needs exactly what the
+// SYSCALL path has: the complete user register file in a `UserFrame` on the
+// kernel stack (`check_and_deliver_signals` snapshots it into the signal
+// frame and rewrites rip/rsp/rdi/rsi/rdx to enter the handler) and a pop +
+// `iretq` epilogue that honours the rewritten frame. The `extern
+// "x86-interrupt"` handlers these stubs replace saw only the five words the
+// CPU pushes and could therefore do nothing but kill the task.
+//
+// Layout built here is byte-for-byte `sched::context::UserFrame` — the same
+// push order as `syscall_entry` in syscall.rs, so `sched::signal::x86_64`
+// needs no second frame type. The CPU pushes `[err] rip cs rflags rsp ss`;
+// vectors without an error code first push a 0 so the two shapes coincide,
+// and `xchg r11, [rsp]` then swaps the error code out of the frame and the
+// user r11 into its slot in one instruction (r11 is otherwise the only
+// register the stub would have to save before it had a scratch register).
+//
+// Alignment: on a ring-3 → ring-0 fault the CPU aligns RSP to 16 before the
+// 5-word frame, so `frame + err` = 48 bytes and the 14 pushes = 112 bytes
+// leave RSP ≡ 0 (mod 16) — `call` then lands `fault_common` at the SysV
+// RSP+8 alignment. Same-privilege (kernel-mode) faults are aligned the same
+// way by the CPU.
+//
+// GS: from ring 3, `swapgs` on entry as the other handlers do, and the
+// migration-proof `restore_user_gs` on exit (see syscall.rs). A kernel-mode
+// fault leaves GS alone — the kernel does not use it, and the syscall exit
+// that eventually follows restores the user invariant itself.
+macro_rules! fault_stub {
+    ($name:literal, $vector:literal, $push_zero:literal) => {
+        core::arch::global_asm!(concat!(r#"
+.section .text, "ax", @progbits
+.global "#, $name, r#"
+.type   "#, $name, r#", @function
+"#, $name, r#":
+    "#, $push_zero, r#"
+    xchg  r11, [rsp]          // r11 = error code; user r11 -> frame slot
+    push  rcx
+    push  rax
+    push  rdi
+    push  rsi
+    push  rdx
+    push  r8
+    push  r9
+    push  r10
+    push  rbx
+    push  rbp
+    push  r12
+    push  r13
+    push  r14
+    push  r15
+    mov   rdx, r11            // arg3 = error code
+    mov   esi, "#, $vector, r#" // arg2 = vector
+    jmp   fault_common_asm
+"#));
+    };
+}
+
+fault_stub!("fault_stub_0",  0,  "push 0");   // #DE Divide Error
+fault_stub!("fault_stub_1",  1,  "push 0");   // #DB Debug
+fault_stub!("fault_stub_3",  3,  "push 0");   // #BP Breakpoint
+fault_stub!("fault_stub_4",  4,  "push 0");   // #OF Overflow
+fault_stub!("fault_stub_5",  5,  "push 0");   // #BR Bound Range
+fault_stub!("fault_stub_6",  6,  "push 0");   // #UD Invalid Opcode
+fault_stub!("fault_stub_7",  7,  "push 0");   // #NM Device Not Available
+fault_stub!("fault_stub_10", 10, "");         // #TS Invalid TSS (err)
+fault_stub!("fault_stub_11", 11, "");         // #NP Segment Not Present (err)
+fault_stub!("fault_stub_12", 12, "");         // #SS Stack-Segment Fault (err)
+fault_stub!("fault_stub_13", 13, "");         // #GP General Protection (err)
+fault_stub!("fault_stub_14", 14, "");         // #PF Page Fault (err)
+fault_stub!("fault_stub_16", 16, "push 0");   // #MF x87 FPE
+fault_stub!("fault_stub_17", 17, "");         // #AC Alignment Check (err)
+fault_stub!("fault_stub_19", 19, "push 0");   // #XF SIMD FPE
+
+core::arch::global_asm!(r#"
+.section .text, "ax", @progbits
+.global fault_common_asm
+.type   fault_common_asm, @function
+fault_common_asm:
+    // rsi = vector, rdx = error code (set by the stub); rdi = frame.
+    mov   rdi, rsp
+    // UserFrame.cs is the 17th word: 15 GPR slots + rip.
+    test  qword ptr [rsp + 128], 3
+    jz    1f
+    // ── from ring 3 ──
+    swapgs
+    call  fault_common
+    // Deliver the fault signal `fault_common` queued (and anything else
+    // pending) — builds the signal frame and redirects this UserFrame.
+    mov   rdi, rsp
+    call  check_and_deliver_signals
+    call  restore_user_gs
+    jmp   2f
+1:
+    // ── from ring 0 (kernel-mode fault on a demand-paged user address) ──
+    call  fault_common
+2:
+    pop   r15
+    pop   r14
+    pop   r13
+    pop   r12
+    pop   rbp
+    pop   rbx
+    pop   r10
+    pop   r9
+    pop   r8
+    pop   rdx
+    pop   rsi
+    pop   rdi
+    pop   rax
+    pop   rcx
+    pop   r11
+    iretq
+"#);
+
+extern "C" {
+    fn fault_stub_0();  fn fault_stub_1();  fn fault_stub_3();  fn fault_stub_4();
+    fn fault_stub_5();  fn fault_stub_6();  fn fault_stub_7();  fn fault_stub_10();
+    fn fault_stub_11(); fn fault_stub_12(); fn fault_stub_13(); fn fault_stub_14();
+    fn fault_stub_16(); fn fault_stub_17(); fn fault_stub_19();
+}
+
+/// Common fault handler behind every `fault_stub_N`.
+///
+/// Returning resumes the interrupted context through the frame: either the
+/// fault was serviced (demand paging), or `sched::fault_signal` queued the
+/// signal for a user handler and the stub's `check_and_deliver_signals`
+/// redirects the frame into it. Everything else ends here — a user fault
+/// with no handler kills the group, a kernel fault halts for triage.
+///
+/// Page faults: error code bit 0 (P) 0 = not-present (demand-paging path),
+/// 1 = protection violation — also routed through `handle_page_fault` so a
+/// write to a read-only CoW page can be promoted instead of killing the
+/// task. Bit 1 = write. Kernel-mode faults on a *user* address are kernel/
+/// server code dereferencing a demand-paged user pointer (lazy heap, CoW, a
+/// never-touched exec image page); the servers run synchronously in the
+/// calling task's context, so its address space is the right one. Faults
+/// that need a *file read* must never be taken while filesystem locks are
+/// held — the syscall layer prefaults every user buffer it forwards into the
+/// VFS to guarantee that; this path is the safety net for everything else.
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, error_code: u64) {
+    let frame = unsafe { &mut *frame };
+    let from_user = frame.cs & 3 != 0;
 
     let cr2: u64;
     let cr3: u64;
@@ -296,53 +433,53 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
     }
 
-    if from_user {
-        // Bit 0 of the error code: 0 = not-present (translation fault), which
-        // demand-paging handles; 1 = protection violation, which is also
-        // routed through here so a write to a read-only CoW page can be
-        // promoted instead of killing the task outright. Bit 1 = write.
+    if vector == 14 {
+        const USER_VA_LIMIT: u64 = 0x0000_8000_0000_0000;
         let is_write = error_code & 2 != 0;
-        if sched::handle_page_fault(cr2 as usize, is_write) {
-            unsafe { super::syscall::restore_user_gs(); }
-            return; // fault handled — resume user task
+        if (from_user || cr2 < USER_VA_LIMIT) && sched::handle_page_fault(cr2 as usize, is_write) {
+            return; // fault handled — resume the interrupted instruction
         }
-        serial_str(b"user page fault RIP=0x"); serial_hex64(frame.ip);
+    }
+
+    if !from_user {
+        let isf = InterruptStackFrame {
+            ip: frame.rip, cs: frame.cs, flags: frame.rflags, sp: frame.rsp, ss: frame.ss,
+        };
+        print_exception(&isf, vector, error_code);
+        if vector == 14 { serial_str(b"CR2=0x"); serial_hex64(cr2); serial_str(b"\r\n"); }
+        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+    }
+
+    // A user fault with a handler installed: queue SIGSEGV/SIGBUS/… with its
+    // siginfo and let the stub deliver it. Silent on purpose — a program
+    // that handles its own faults (GC barriers, stack probes, siglongjmp
+    // recovery) must not spam the console on each one.
+    let (sig, si_code, si_addr) = fault_siginfo(vector, error_code, cr2, frame.rip);
+    if sched::fault_signal(sig, si_code, si_addr) {
+        return;
+    }
+
+    if vector == 14 {
+        serial_str(b"user page fault RIP=0x"); serial_hex64(frame.rip);
         serial_str(b" CR2=0x"); serial_hex64(cr2);
         serial_str(b" CR3=0x"); serial_hex64(cr3);
         serial_str(b" err=0x"); serial_hex64(error_code);
         serial_str(b": task killed\r\n");
-
         unsafe { super::paging::debug_walk_pte((cr3 & !0xFFF) as usize, cr2 as usize); }
-
-        sched::exit_group_signal(fault_signal(14));
     } else {
-        // Kernel-mode fault on a *user* address: kernel/server code
-        // dereferenced a user pointer whose page is demand-paged (lazy heap,
-        // CoW, or a file-backed exec image page never touched yet).  The
-        // servers run synchronously in the calling task's context, so the
-        // current task's address space is the right one — service it like a
-        // user fault and resume the faulting kernel instruction.
-        //
-        // Deadlock note: faults that require a *file read* must never be
-        // taken while the filesystem's own locks are held; the syscall layer
-        // prefaults every user buffer it forwards into VFS to guarantee
-        // that.  This path is the safety net for everything else.
-        const USER_VA_LIMIT: u64 = 0x0000_8000_0000_0000;
-        let is_write = error_code & 2 != 0;
-        if cr2 < USER_VA_LIMIT && sched::handle_page_fault(cr2 as usize, is_write) {
-            return;
-        }
-        print_exception(&frame, 14, error_code);
-        serial_str(b"CR2=0x"); serial_hex64(cr2); serial_str(b"\r\n");
-        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+        serial_str(b"user fault vec="); serial_hex64(vector);
+        serial_str(b" RIP=0x"); serial_hex64(frame.rip);
+        serial_str(b" CS=0x"); serial_hex64(frame.cs);
+        serial_str(b" RSP=0x"); serial_hex64(frame.rsp);
+        serial_str(b" err=0x"); serial_hex64(error_code);
+        serial_str(b": task killed\r\n");
     }
+    sched::exit_group_signal(sig);
 }
 
 // Non-x86 stubs (satisfy the compiler on other targets).
 #[cfg(not(target_arch = "x86_64"))]
 extern "C" fn exc_misc(_frame: InterruptStackFrame) { loop {} }
-#[cfg(not(target_arch = "x86_64"))]
-extern "C" fn page_fault(_frame: InterruptStackFrame, _error_code: u64) { loop {} }
 
 /// Timer IRQ handler — APIC timer at 100 Hz.
 ///

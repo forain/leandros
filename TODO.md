@@ -3411,6 +3411,11 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
   comment saying why, and that comment is the thing to delete when this is fixed. **Not
   fixed here on purpose:** it changes signal-mask semantics for every fork and every thread
   in the system, which is not a change to make inside a siginfo commit.
+  **FIXED on `p1/signals`:** `fork_current` and `clone_thread` now copy the creator's
+  `signal_mask`, and a new *process* also inherits the leader's dispositions (POSIX; they
+  used to be reset to SIG_DFL, so a parent's SIG_IGN never reached a non-exec'ing child).
+  sigtest's handoff worker no longer blocks by hand; `sigtest2` checks both fork and
+  pthread inheritance directly.
 - **Hardware-keyboard input is still partial, and the residue is narrower than it looks.**
   Multi-byte `xterm` sequences — arrows, Home, Delete — need ESC-sequence queueing, which does
   not exist. There is **no Ctrl/Alt modifier state machine at all**: `SHIFT_PRESSED` is the

@@ -635,15 +635,13 @@ extern "C" fn handoff_usr_handler(_sig: c_int, info: *const siginfo_t, _uc: *mut
 
 extern "C" fn handoff_worker(_arg: *mut c_void) -> *mut c_void {
     unsafe {
-        // Block explicitly rather than relying on inheritance. POSIX says a
-        // new thread starts with the creating thread's signal mask, but this
-        // kernel's `clone_thread` does not copy `signal_mask` at all, so a
-        // worker here starts with everything unblocked. Leaning on inheritance
-        // would silently defeat the whole check: with SIGCHLD unblocked in
-        // this thread, `deliver_signal_process` would hand it straight over
-        // and the parked-then-claimed path under test would never run.
-        let both: sigset_t = (1u64 << (SIGCHLD - 1)) | (1u64 << (SIGUSR2 - 1));
-        sigprocmask(SIG_BLOCK, &both, core::ptr::null_mut());
+        // No sigprocmask here on purpose: this worker relies on starting with
+        // the creating thread's mask (SIGCHLD and SIGUSR2 blocked, step 2),
+        // as POSIX specifies and `clone_thread` now implements. The check
+        // below only exercises the parked-then-claimed path if that
+        // inheritance holds — with SIGCHLD unblocked here,
+        // `deliver_signal_process` would hand it straight over. sigtest2's
+        // `pthread_inherits_mask` tests the inheritance directly.
 
         // Step 3: a thread-directed SIGUSR2, blocked, so it stays pending on
         // this thread with SI_TKILL in this thread's slot.

@@ -58,15 +58,28 @@ pub const SIGRET_TRAMPOLINE_VA: usize = 0x0000_7fff_ff00_0000;
 
 // Signals whose SIG_DFL action is "ignore" (bit N = signal N+1 is default-ignore).
 //   SIGCHLD = 17  (bit 16)
+//   SIGCONT = 18  (bit 17) — its default action is "resume if stopped", which
+//                 `deliver_signal*` performs at send time; by the time the
+//                 signal itself is dequeued there is nothing left to do.
 //   SIGURG  = 23  (bit 22)
 //   SIGWINCH = 28 (bit 27)
-const SIGDFL_IGNORE: u64 = (1u64 << 16) | (1u64 << 22) | (1u64 << 27);
+const SIGDFL_IGNORE: u64 = (1u64 << 16) | (1u64 << 17) | (1u64 << 22) | (1u64 << 27);
+
+/// Signals whose SIG_DFL action is "stop the process": SIGSTOP 19, SIGTSTP 20,
+/// SIGTTIN 21, SIGTTOU 22 (bits 18..=21).
+pub(crate) const SIGDFL_STOP: u64 = (1u64 << 18) | (1u64 << 19) | (1u64 << 20) | (1u64 << 21);
 
 // Signal numbers used for default-terminate calculation.
 const SIGSEGV: u32 = 11;
+const SIGCHLD: u32 = 17;
 
 pub(crate) const SIGKILL: u32 = 9;
+pub(crate) const SIGCONT: u32 = 18;
 pub(crate) const SIGSTOP: u32 = 19;
+
+/// `sa_flags` bit on the parent's SIGCHLD action: do not send SIGCHLD when a
+/// child stops or continues (Linux value).
+const SA_NOCLDSTOP: u32 = 0x0000_0001;
 
 /// The two signals POSIX makes undeniable: they can never be blocked, caught,
 /// or ignored.
@@ -204,16 +217,46 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
         }
     }
 
+    // One `RUN_QUEUE` acquisition per iteration decides between three
+    // outcomes: nothing to do (return), park this thread because a sibling
+    // stopped the group, or deliver one signal.
+    enum Step {
+        Park,
+        Deliver(u32, crate::task::SigAction, u64, crate::task::SigInfo),
+    }
+
     loop {
         // Sample the pending+mask state under the queue lock, then release it
         // before any further work (signal frame writing might block elsewhere).
-        let sample = {
-            let rq = super::RUN_QUEUE.lock();
-            match rq.find_pid(pid) {
+        let step = {
+            let mut rq = super::RUN_QUEUE.lock();
+            let idx = match rq.find_pid_idx(pid) { Some(i) => i, None => return };
+            let park = match rq.get(idx) {
+                Some(t) => t.stop_pending && t.state != crate::task::TaskState::Zombie,
+                None => return,
+            };
+            if park {
+                // Another thread of this group took a stop signal and asked
+                // every sibling to park (see `do_signal_stop`). Honour it
+                // here, on the way back to user space, rather than waiting
+                // for the next preemption to route through the scheduler's
+                // post-dispatch check. Same critical section as the sample,
+                // so the common no-signal path still costs one lock.
+                if let Some(t) = rq.get_mut(idx) {
+                    t.state = crate::task::TaskState::Stopped;
+                    clear_block_fields(t);
+                }
+                Step::Park
+            } else { match rq.get(idx) {
                 Some(t) => {
                     let unmasked = t.signal_pending & !t.signal_mask;
                     if unmasked == 0 { return; }
-                    let bit  = unmasked.trailing_zeros() as u32;
+                    // A synchronous fault signal (SIGSEGV et al.) is delivered
+                    // ahead of anything else pending: its handler must run
+                    // before the faulting instruction is retried.
+                    let sync = unmasked & crate::task::SYNCHRONOUS_MASK;
+                    let pick = if sync != 0 { sync } else { unmasked };
+                    let bit  = pick.trailing_zeros() as u32;
                     let sig  = bit + 1;
                     let mask = t.signal_mask;
                     // Signal disposition is shared across the thread group: read
@@ -235,15 +278,22 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                     // the signal, indexed by the same `bit` — the two can never
                     // be sampled from different signals.
                     let info = t.signal_info[bit as usize];
-                    Some((sig, action, mask, info))
+                    Step::Deliver(sig, action, mask, info)
                 }
                 None => return,
-            }
+            } }
         };
 
-        let (sig, action, old_mask, info) = match sample {
-            Some(r) => r,
-            None    => return,
+        let (sig, action, old_mask, info) = match step {
+            Step::Deliver(sig, action, mask, info) => (sig, action, mask, info),
+            Step::Park => {
+                // Resumed by SIGCONT/SIGKILL, which cleared `stop_pending`
+                // before making us Ready; loop again so anything that arrived
+                // while stopped is delivered on this same return to user
+                // space. A stop that raced in between simply parks us again.
+                super::yield_now("stopped");
+                continue;
+            }
         };
 
         // Dequeue: clear the pending bit under the lock.
@@ -276,16 +326,21 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                 if SIGDFL_IGNORE & (1u64 << (sig - 1)) != 0 {
                     continue; // check next pending signal
                 }
+                // Default action "stop": park the whole thread group in
+                // `TaskState::Stopped` until SIGCONT (or SIGKILL). Returns once
+                // the group has been continued; loop again so a SIGCONT
+                // handler, or anything that arrived while stopped, is
+                // delivered on this same return to user space.
+                if SIGDFL_STOP & (1u64 << (sig - 1)) != 0 {
+                    do_signal_stop(pid, sig);
+                    continue;
+                }
                 // Default action: terminate — the whole thread group, not just
                 // this thread. A fatal signal ends a *process*; `exit` alone
                 // would reap only the thread that happened to take delivery,
                 // and `deliver_signal_process` prefers a blocked thread (an
                 // epoll-parked tokio worker, typically) over the leader. That
                 // is what made `kill -9` on a threaded process a coin flip.
-                //
-                // TODO: SIGSTOP's true default action is "stop the process",
-                // not "terminate" — it lands here because there is no stopped
-                // task state yet. Revisit when job control is implemented.
                 //
                 // `exit_group_signal`, not `exit_group(128 + sig)`: the latter
                 // reports the death as a *normal exit* with a strange code, so
@@ -353,6 +408,149 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
             }
         }
     }
+}
+
+// ── Job control: stopping and resuming a thread group ────────────────────────
+
+/// Reset the wait-channel bookkeeping of a task that is being taken out of
+/// `Blocked` by something other than the channel it was parked on (a stop or
+/// a continue). Leaves nothing that a later `unblock_port`/deadline scan could
+/// mistake for a live registration.
+pub(crate) fn clear_block_fields(t: &mut crate::task::Task) {
+    t.blocked_on    = None;
+    t.poll_deadline = u64::MAX;
+    t.poll_mask     = super::POLL_TAG_ALL;
+    t.blocked_futex = 0;
+}
+
+/// Default action of SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU, run by the thread that
+/// dequeued the signal: stop every thread of the group, tell the parent, and
+/// park until SIGCONT (or SIGKILL) resumes the group.
+///
+/// Threads that are `Ready` or `Blocked` (not on any CPU) are moved to
+/// `Stopped` right here. A thread mid-flight on another CPU cannot be — its
+/// registers are still live there — so it gets `stop_pending` plus a
+/// reschedule IPI, and parks itself either in `check_and_deliver_signals` on its
+/// next return to user space or in the scheduler's post-dispatch check the
+/// moment it stops running (see `scheduler_run_loop`). Only the pick-side
+/// state matters for correctness: `pick_next` dispatches `Ready` tasks only.
+///
+/// A thread parked while `Blocked` loses any channel wake that arrives during
+/// the stop (`unblock_port*`/`futex_wake`/the deadline tick all require
+/// `Blocked`). That is deliberate: SIGCONT makes it `Ready`, it returns from
+/// its yield as a spurious wake, and every blocking primitive re-checks its
+/// condition and re-parks. The alternative — leaving it `Blocked` and having
+/// every wake path consult a stop flag — spreads job control over a dozen
+/// wake sites.
+fn do_signal_stop(pid: super::task::Pid, sig: u32) {
+    let mut kick: [Option<usize>; super::MAX_CPUS] = [None; super::MAX_CPUS];
+    let (ppid, uid, tgid) = {
+        let mut rq = super::RUN_QUEUE.lock();
+        let (tgid, ppid, uid) = match rq.find_pid(pid) {
+            Some(t) => (t.tgid, t.ppid, t.uid),
+            None => return,
+        };
+        // Leader bookkeeping for wait4/waitid. A fresh stop supersedes any
+        // continue that was still unreported; a stop while already stopped
+        // (SIGTSTP after SIGSTOP) is not a new state change.
+        if let Some(l) = rq.find_pid_mut(tgid) {
+            if l.stop_signal == 0 {
+                l.stop_signal   = sig as u8;
+                l.stop_reported = false;
+            }
+            l.cont_pending = false;
+        }
+        let mut n = 0;
+        for i in 0..super::runqueue::MAX_TASKS {
+            if let Some(t) = rq.get_mut(i) {
+                if t.tgid != tgid || t.state == crate::task::TaskState::Zombie { continue; }
+                // POSIX: a stop signal discards a pending SIGCONT.
+                t.signal_pending &= !(1u64 << (SIGCONT - 1));
+                t.stop_pending = true;
+                if t.pid == pid {
+                    t.state = crate::task::TaskState::Stopped;
+                    clear_block_fields(t);
+                } else if let Some(cpu) = t.on_cpu {
+                    if n < kick.len() { kick[n] = Some(cpu); n += 1; }
+                } else if matches!(t.state, crate::task::TaskState::Ready | crate::task::TaskState::Blocked) {
+                    t.state = crate::task::TaskState::Stopped;
+                    clear_block_fields(t);
+                }
+            }
+        }
+        (ppid, uid, tgid)
+    };
+    for cpu in kick.iter().flatten() {
+        super::trigger_preempt(*cpu);
+    }
+    // Tell the parent (SIGCHLD/CLD_STOPPED) unless it opted out with
+    // SA_NOCLDSTOP. `deliver_signal_process` also wakes the poll channel, so a
+    // parent blocked in wait4(WUNTRACED) re-scans and sees the stop.
+    notify_parent_state_change(tgid, ppid, uid,
+        crate::task::SigInfo::child_state(crate::task::CLD_STOPPED, tgid, uid, sig));
+    super::yield_now("stopped");
+}
+
+/// SIGCHLD to the parent of process `tgid` for a stop/continue, honouring
+/// the parent's SA_NOCLDSTOP. Runs with no locks held.
+pub(crate) fn notify_parent_state_change(tgid: super::task::Pid, ppid: super::task::Pid,
+                                         _uid: u32, info: crate::task::SigInfo) {
+    if tgid == 0 || ppid == 0 { return; }
+    let parent_tgid = super::tgid_of(ppid);
+    let suppressed = {
+        let rq = super::RUN_QUEUE.lock();
+        rq.find_pid(parent_tgid)
+            .map(|p| p.signal_actions[(SIGCHLD - 1) as usize].get_flags() & SA_NOCLDSTOP != 0)
+            .unwrap_or(true)
+    };
+    if suppressed {
+        // Still wake a parent parked in wait4/waitid: the state change is
+        // reportable even when the signal is not wanted.
+        super::wake_poll();
+        return;
+    }
+    let _ = super::deliver_signal_process(parent_tgid, SIGCHLD, info);
+}
+
+// ── Synchronous faults ───────────────────────────────────────────────────────
+
+/// Route a user-mode CPU fault to the task's signal handler, if one can run.
+///
+/// Returns `true` when `sig` has been queued on the calling thread carrying
+/// `SigInfo::fault(si_code, addr)`; the arch fault stub then falls through to
+/// `check_and_deliver_signals`, which builds the signal frame and redirects
+/// the return-to-user to the handler. Returns `false` when the fault must
+/// kill the process — SIG_DFL, SIG_IGN, or the signal blocked — mirroring
+/// Linux's `force_sig_fault`: an ignored or blocked synchronous signal is
+/// not deferred, because the faulting instruction would just fault again.
+/// The caller prints its diagnostics and calls `exit_group_signal`.
+///
+/// The blocked check is also the re-entrancy guard. A handler runs with its
+/// own signal masked (unless SA_NODEFER), so a handler that faults *again*
+/// arrives here with the bit set and is killed instead of recursing.
+///
+/// The payload overwrites any earlier pending instance of the same signal:
+/// a fault's `si_addr` is what the handler is about to inspect, and a stale
+/// `kill(2)` payload for the same number would misdirect it.
+pub fn fault_signal(sig: u32, si_code: i32, addr: usize) -> bool {
+    if sig == 0 || sig > 64 { return false; }
+    let pid = super::current_pid();
+    if pid == 0 { return false; }
+    let bit = 1u64 << (sig - 1);
+    let mut rq = super::RUN_QUEUE.lock();
+    let (tgid, mask) = match rq.find_pid(pid) {
+        Some(t) => (t.tgid, t.signal_mask),
+        None => return false,
+    };
+    let handler = rq.find_pid(tgid)
+        .map(|l| l.signal_actions[(sig - 1) as usize].handler)
+        .unwrap_or(0);
+    if handler <= 1 || mask & bit != 0 { return false; }
+    if let Some(t) = rq.find_pid_mut(pid) {
+        t.signal_info[(sig - 1) as usize] = crate::task::SigInfo::fault(si_code, addr);
+        t.signal_pending |= bit;
+    }
+    true
 }
 
 /// Restore user context from the saved signal frame on the user stack.
@@ -612,23 +810,36 @@ mod si_off {
     pub const PID:    usize = 16;
     pub const UID:    usize = 20;
     pub const STATUS: usize = 24;
+    /// `_sifields._sigfault.si_addr` — the union's first word, overlaying
+    /// `si_pid`/`si_uid`.
+    pub const ADDR:   usize = 16;
 }
 
-/// Serialise the four carried `siginfo_t` fields into a zeroed frame buffer at
+/// Serialise the carried `siginfo_t` fields into a zeroed frame buffer at
 /// `base` (the start of the frame's siginfo region).
 ///
 /// Shared by both architectures so the offsets cannot drift between them —
 /// they are the same offsets, and one function is the cheapest way to keep
-/// saying so.
+/// saying so. The `_sifields` member is chosen by signal class: a
+/// kernel-generated (`si_code > 0`) SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP
+/// carries `_sigfault` (`si_addr`), everything else `_kill`/`_sigchld`.
 fn write_siginfo(buf: &mut [u8], base: usize, sig: u32, info: crate::task::SigInfo) {
     let put = |buf: &mut [u8], off: usize, v: [u8; 4]| {
         buf[base + off..base + off + 4].copy_from_slice(&v);
     };
     put(buf, si_off::SIGNO,  sig.to_le_bytes());
     put(buf, si_off::CODE,   info.si_code.to_le_bytes());
-    put(buf, si_off::PID,    info.si_pid.to_le_bytes());
-    put(buf, si_off::UID,    info.si_uid.to_le_bytes());
-    put(buf, si_off::STATUS, info.si_status.to_le_bytes());
+    let is_fault = sig >= 1 && sig <= 64
+        && crate::task::SYNCHRONOUS_MASK & (1u64 << (sig - 1)) != 0
+        && info.si_code > 0;
+    if is_fault {
+        buf[base + si_off::ADDR..base + si_off::ADDR + 8]
+            .copy_from_slice(&(info.si_addr as u64).to_le_bytes());
+    } else {
+        put(buf, si_off::PID,    info.si_pid.to_le_bytes());
+        put(buf, si_off::UID,    info.si_uid.to_le_bytes());
+        put(buf, si_off::STATUS, info.si_status.to_le_bytes());
+    }
 }
 
 fn arch_restore_signal_frame(frame_ptr: usize, pid: u32) {
