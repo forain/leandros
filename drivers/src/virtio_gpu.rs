@@ -319,6 +319,12 @@ pub const VIRTIO_GPU_BLOB_MEM_HOST3D: u32 = 0x0002;
 pub const VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
 pub const VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 pub const VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
+/// `enum virtio_gpu_formats`, the subset this KMS can hand SET_SCANOUT_BLOB.
+/// Named after the fourcc each one is the host-side spelling of.
+pub const VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM: u32 = 1;   // DRM_FORMAT_ARGB8888
+pub const VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM: u32 = 2;   // DRM_FORMAT_XRGB8888
+pub const VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM: u32 = 67;  // DRM_FORMAT_ABGR8888
+pub const VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM: u32 = 134; // DRM_FORMAT_XBGR8888
 
 // ── RESOURCE_MAP_BLOB `map_info` (cache type the host wants the guest to use) ─
 // virtio_gpu.h: VIRTIO_GPU_MAP_CACHE_*.  The low nibble is the cache type.
@@ -1460,6 +1466,108 @@ impl VirtioGpuDevice {
         };
         
         self.send_command_raw(flush_data).is_ok()
+    }
+
+    /// SET_SCANOUT_BLOB: point scanout 0 at a **blob** resource, described the
+    /// way the guest's ADDFB2 described it (format, stride, offset).
+    ///
+    /// This is how a buffer that lives in host memory is displayed at all.
+    /// `set_scanout` + `flush` assume a 2D resource with guest backing the
+    /// device can TRANSFER_TO_HOST_2D out of; a HOST3D blob — every image
+    /// Venus allocates, hence every GBM buffer Zink renders — has no guest
+    /// pages, so there is nothing to transfer and nothing to CPU-copy into the
+    /// console's resource 1. Upstream's `virtio_gpu_primary_plane_update`
+    /// makes exactly this split: `host3d_blob || guest_blob` → SET_SCANOUT_BLOB,
+    /// otherwise SET_SCANOUT. On the host QEMU exports the blob as a dmabuf and
+    /// hands it to the display backend (`dpy_gl_scanout_dmabuf`), which is the
+    /// zero-copy path a GPU-rendered desktop is supposed to take.
+    ///
+    /// `struct virtio_gpu_set_scanout_blob { hdr; rect r; le32 scanout_id;
+    /// le32 resource_id; le32 width; le32 height; le32 format; le32 padding;
+    /// le32 strides[4]; le32 offsets[4]; }` — `width`/`height` are the
+    /// framebuffer's, `r` is the visible rectangle. Single-plane only here,
+    /// which is every format this KMS advertises.
+    pub fn set_scanout_blob(
+        &mut self,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        stride: u32,
+        offset: u32,
+    ) -> bool {
+        if !self.has_feature(VIRTIO_GPU_F_RESOURCE_BLOB) {
+            crate::pci::serial_debug("[GPU] set_scanout_blob refused: no RESOURCE_BLOB\n");
+            return false;
+        }
+        #[repr(C, packed)]
+        struct SetScanoutBlob {
+            hdr: VirtioGpuCtrlHdr,
+            r: VirtioGpuRect,
+            scanout_id: u32,
+            resource_id: u32,
+            width: u32,
+            height: u32,
+            format: u32,
+            padding: u32,
+            strides: [u32; 4],
+            offsets: [u32; 4],
+        }
+        let cmd = SetScanoutBlob {
+            hdr: self.hdr_for(VirtioGpuCmd::SetScanoutBlob, 0),
+            r: VirtioGpuRect { x: 0, y: 0, width, height },
+            scanout_id: 0,
+            resource_id,
+            width,
+            height,
+            format,
+            padding: 0,
+            strides: [stride, 0, 0, 0],
+            offsets: [offset, 0, 0, 0],
+        };
+        let data = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<SetScanoutBlob>(),
+            )
+        };
+        let ok = self.send_command_raw(data).is_ok();
+        if ok {
+            // Same bookkeeping `flush` keeps for a 2D scanout, so the console's
+            // next `flush(1, ..)` knows it has to re-point the scanout at
+            // resource 1 rather than assuming it still owns it.
+            self.scanout_w = width;
+            self.scanout_h = height;
+            self.current_resource_id = resource_id;
+        }
+        ok
+    }
+
+    /// RESOURCE_FLUSH alone — no TRANSFER_TO_HOST_2D, no scanout switch. For a
+    /// blob resource the host already holds the pixels; this only tells it
+    /// which rectangle of the scanout to repaint.
+    pub fn resource_flush(&mut self, resource_id: u32, x: u32, y: u32, width: u32, height: u32) -> bool {
+        let flush = VirtioGpuResourceFlush {
+            hdr: VirtioGpuCtrlHdr {
+                type_: VirtioGpuCmd::ResourceFlush as u32,
+                flags: 0, fence_id: 0, ctx_id: 0, padding: 0,
+            },
+            r: VirtioGpuRect { x, y, width, height },
+            resource_id,
+            padding: 0,
+        };
+        let data = unsafe {
+            core::slice::from_raw_parts(
+                &flush as *const _ as *const u8,
+                core::mem::size_of::<VirtioGpuResourceFlush>(),
+            )
+        };
+        self.send_command_raw(data).is_ok()
+    }
+
+    /// The scanout resource currently bound on this device (0 = none yet).
+    pub fn current_scanout(&self) -> u32 {
+        self.current_resource_id
     }
 
     pub fn transfer_to_host_3d(&mut self, resource_id: u32, x: u32, y: u32, width: u32, height: u32) -> bool {
