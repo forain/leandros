@@ -3641,6 +3641,10 @@ impl DrmDeviceInterface {
         // Allocate dumb buffer
         let buffer = DrmDumbBuffer::create(width, height, 32)?;
         let mmap_offset = buffer.mmap_offset;
+        // This legacy ABI returns the physical address in a u32 slot. Refuse a
+        // frame that does not fit rather than hand the caller the low half —
+        // on a guest with RAM above 4 GiB that is somebody else's memory.
+        if mmap_offset > u32::MAX as usize { return Err(DriverError::Io); }
 
         // Create framebuffer object
         let mut fb = DrmFramebuffer::new(
@@ -3684,7 +3688,7 @@ impl DrmDeviceInterface {
         // Slot [4] = 0 forces DOOM through its mmap() branch, which calls sys_mmap →
         // ioctl 0x1007 → map_device(virt, phys_addr, len) — giving DOOM a proper virtual
         // address that maps to the same physical page VirtIO reads via attach_backing.
-        // Slot [5] carries the physical address used as the mmap offset (< 4 GiB assumed).
+        // Slot [5] carries the physical address used as the mmap offset (< 4 GiB, checked above).
         fb_data[3] = fb_id;
         fb_data[4] = 0;                        // no direct buffer pointer — force mmap
         fb_data[5] = mmap_offset as u32;       // physical address as mmap offset
