@@ -12,6 +12,13 @@ pub enum TaskState {
     Ready,
     Running,
     Blocked,  // Waiting on an IPC port or futex.
+    /// Job-control stop (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU default action).
+    /// Not runnable, not woken by any wait channel; only SIGCONT (→ Ready)
+    /// or SIGKILL (→ Ready, then Zombie) move a task out of this state. A
+    /// task that was `Blocked` when it was stopped resumes as a spurious
+    /// wake: every blocking primitive re-checks its condition after a
+    /// yield, so it simply re-parks. See `sched::signal::do_signal_stop`.
+    Stopped,
     Zombie,
 }
 
@@ -133,6 +140,10 @@ pub const CLD_KILLED: i32 = 2;
 /// never sets `WCOREDUMP`'s 0x80 bit either. Named so the two stay consistent
 /// if that ever changes.
 pub const CLD_DUMPED: i32 = 3;
+/// SIGCHLD: the child was stopped by a signal; `si_status` is that signal.
+pub const CLD_STOPPED: i32 = 5;
+/// SIGCHLD: a stopped child was resumed by SIGCONT; `si_status` is SIGCONT.
+pub const CLD_CONTINUED: i32 = 6;
 
 /// The `siginfo_t` payload for the one pending instance of one signal.
 ///
@@ -157,7 +168,8 @@ pub struct SigInfo {
     pub si_pid:    i32,
     /// Real uid of the sender / of the exiting child.
     pub si_uid:    u32,
-    /// SIGCHLD only: exit code (`CLD_EXITED`) or signal number (`CLD_KILLED`).
+    /// SIGCHLD only: exit code (`CLD_EXITED`) or signal number (`CLD_KILLED`,
+    /// `CLD_STOPPED`, `CLD_CONTINUED`).
     pub si_status: i32,
 }
 
@@ -183,6 +195,12 @@ impl SigInfo {
     /// `tkill(2)` / `tgkill(2)` from process `pid` running as `uid`.
     pub const fn tkill(pid: Pid, uid: u32) -> SigInfo {
         SigInfo { si_code: SI_TKILL, si_pid: pid as i32, si_uid: uid, si_status: 0 }
+    }
+
+    /// SIGCHLD for a child process `pid` (real uid `uid`) that was stopped by
+    /// `sig` (`CLD_STOPPED`) or resumed (`CLD_CONTINUED`, `sig == SIGCONT`).
+    pub const fn child_state(code: i32, pid: Pid, uid: u32, sig: u32) -> SigInfo {
+        SigInfo { si_code: code, si_pid: pid as i32, si_uid: uid, si_status: sig as i32 }
     }
 }
 
@@ -346,6 +364,24 @@ pub struct Task {
     /// posix_spawn runs the child on a buffer inside the parent's stack
     /// frame; an unsuspended parent races it and both corrupt each other).
     pub vfork_pending: bool,
+
+    // ── Job control (SIGSTOP / SIGCONT) ───────────────────────────────────────
+    /// This thread must park in `TaskState::Stopped` at its next scheduler
+    /// pass or signal check. Set on every member of the group by
+    /// `do_signal_stop`; cleared on every member by SIGCONT and SIGKILL. A
+    /// thread that is on a CPU when the stop begins cannot be moved to
+    /// `Stopped` from another CPU (its registers are still live), so the
+    /// flag carries the request to the point where it stops running.
+    pub stop_pending: bool,
+    /// Thread-group leader only: the signal that stopped the group, or 0
+    /// while it is running. `wait4(WUNTRACED)` reports it as `WSTOPSIG`.
+    pub stop_signal: u8,
+    /// Leader only: the current stop has been reported to a waiter (so the
+    /// same stop is never reported twice).
+    pub stop_reported: bool,
+    /// Leader only: the group was resumed by SIGCONT and no waiter has yet
+    /// collected the `WIFCONTINUED` / `CLD_CONTINUED` report.
+    pub cont_pending: bool,
 }
 
 impl Task {
@@ -442,6 +478,10 @@ impl Task {
             altstack_flags: 2, // SS_DISABLE
             wait_reported: false,
             vfork_pending: false,
+            stop_pending: false,
+            stop_signal: 0,
+            stop_reported: false,
+            cont_pending: false,
         };
         temp_task.cwd[0] = b'/';
 
@@ -733,6 +773,16 @@ impl Task {
         let root_len_ptr = (dest as usize + core::mem::offset_of!(Task, root_len)) as *mut usize;
         core::ptr::write_volatile(root_len_ptr, 0);
 
+        // Job-control state: a kernel task is never stopped.
+        let stop_pending_ptr = (dest as usize + core::mem::offset_of!(Task, stop_pending)) as *mut bool;
+        core::ptr::write_volatile(stop_pending_ptr, false);
+        let stop_signal_ptr = (dest as usize + core::mem::offset_of!(Task, stop_signal)) as *mut u8;
+        core::ptr::write_volatile(stop_signal_ptr, 0);
+        let stop_reported_ptr = (dest as usize + core::mem::offset_of!(Task, stop_reported)) as *mut bool;
+        core::ptr::write_volatile(stop_reported_ptr, false);
+        let cont_pending_ptr = (dest as usize + core::mem::offset_of!(Task, cont_pending)) as *mut bool;
+        core::ptr::write_volatile(cont_pending_ptr, false);
+
         let msg2 = b"Task::new_kernel_inplace: completed\r\n";
         for &b in msg2 { arch_serial_putc(b); }
     }
@@ -801,6 +851,10 @@ impl Task {
             altstack_flags: 2, // SS_DISABLE
             wait_reported: false,
             vfork_pending: false,
+            stop_pending: false,
+            stop_signal: 0,
+            stop_reported: false,
+            cont_pending: false,
         };
         task.cwd[0] = b'/';
 

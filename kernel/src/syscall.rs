@@ -2036,7 +2036,38 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
     if status_ptr != 0 && !validate_user_ptr_aligned(status_ptr, core::mem::size_of::<i32>(), 4) {
         return -14;
     }
-    const WNOHANG: usize = 1;
+    const WNOHANG:    usize = 1;
+    const WUNTRACED:  usize = 2;
+    const WCONTINUED: usize = 8;
+    let what = sched::WaitWhat {
+        exited:    true,
+        stopped:   options & WUNTRACED != 0,
+        continued: options & WCONTINUED != 0,
+    };
+    // Packed wait status for a stopped child: `WIFSTOPPED` is `(s & 0xff) ==
+    // 0x7f`, `WSTOPSIG` is `(s >> 8) & 0xff`. A continued child is the fixed
+    // 0xffff (`WIFCONTINUED`). musl/relibc `<sys/wait.h>` encoding.
+    let stopped_status = |sig: u32| -> i32 { ((sig as i32) << 8) | 0x7f };
+    const CONTINUED_STATUS: i32 = 0xffff;
+    let write_status = |status: i32| {
+        if status_ptr != 0 {
+            // Fault the destination in first: a demand-paged .bss
+            // status variable would otherwise make write_user_buf
+            // fail silently.
+            prefault_user(status_ptr, 4);
+            // Write through the address space's own virt->phys/HHDM
+            // path rather than dereferencing the raw user pointer:
+            // this syscall runs in kernel context (ring 0 / EL1) but
+            // the target page may still be a CoW-shared, PTE-read-only
+            // page belonging to the current process (e.g. its own
+            // stack right after a fork()) — a raw write would fault
+            // in a context this kernel's page-fault handlers don't
+            // attempt to recover from.
+            with_current_address_space_mut(|as_| {
+                as_.write_user_buf(status_ptr, &status.to_ne_bytes())
+            });
+        }
+    };
     // pid_t travels as a sign-extended long; truncating through u32 maps
     // both 0xFFFF_FFFF and 0xFFFF_FFFF_FFFF_FFFF to -1.
     let pid_i = pid_raw as u32 as i32;
@@ -2052,26 +2083,17 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
     let caller_tgid = sched::current_tgid();
 
     loop {
-        match sched::wait_try(sel, caller_tgid) {
+        match sched::wait_try(sel, caller_tgid, what) {
             sched::WaitTry::Reaped(pid, status) => {
-                if status_ptr != 0 {
-                    // Fault the destination in first: a demand-paged .bss
-                    // status variable would otherwise make write_user_buf
-                    // fail silently.
-                    prefault_user(status_ptr, 4);
-                    let status = encode_wait_status(status);
-                    // Write through the address space's own virt->phys/HHDM
-                    // path rather than dereferencing the raw user pointer:
-                    // this syscall runs in kernel context (ring 0 / EL1) but
-                    // the target page may still be a CoW-shared, PTE-read-only
-                    // page belonging to the current process (e.g. its own
-                    // stack right after a fork()) — a raw write would fault
-                    // in a context this kernel's page-fault handlers don't
-                    // attempt to recover from.
-                    with_current_address_space_mut(|as_| {
-                        as_.write_user_buf(status_ptr, &status.to_ne_bytes())
-                    });
-                }
+                write_status(encode_wait_status(status));
+                return pid as isize;
+            }
+            sched::WaitTry::Stopped(pid, sig) => {
+                write_status(stopped_status(sig));
+                return pid as isize;
+            }
+            sched::WaitTry::Continued(pid) => {
+                write_status(CONTINUED_STATUS);
                 return pid as isize;
             }
             sched::WaitTry::NoChildren => return -10, // ECHILD
@@ -2087,7 +2109,7 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
                 // init/shell waiters stayed perpetually runnable, churning the
                 // scheduler run-loop and starving the very child's event loop.
                 sched::block_on_poll_prepare_until(sched::ticks() + 2);
-                if matches!(sched::wait_peek(sel, caller_tgid), sched::WaitTry::StillRunning)
+                if matches!(sched::wait_peek(sel, caller_tgid, what), sched::WaitTry::StillRunning)
                     && !interrupted() {
                     sched::block_on_poll_commit();
                 } else {
@@ -2121,9 +2143,12 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
     // Without WEXITED the caller only wants stop/continue reports (e.g.
     // brush's poll_for_stopped_children uses WSTOPPED|WNOHANG) — exit
     // statuses must be left for a later wait4/WEXITED wait to collect.
-    // This kernel has no stopped-task states yet, so such a wait can only
-    // ever report "no state change" (or ECHILD).
-    let reap_exits = options & WEXITED != 0;
+    // `wait_scan` only consumes the kinds of report asked for here.
+    let what = sched::WaitWhat {
+        exited:    options & WEXITED != 0,
+        stopped:   options & WSTOPPED != 0,
+        continued: options & WCONTINUED != 0,
+    };
 
     // Fill siginfo_t (si_signo=SIGCHLD at +0, si_code at +8, si_pid at +16,
     // si_status at +24). Built as a kernel-local buffer and copied out via
@@ -2131,41 +2156,43 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
     // this syscall runs in kernel context, and the target page may be a
     // CoW-shared, PTE-read-only page the current process's own fault handler
     // never gets a chance to promote in that context.
-    let write_info = |pid: u32, status: sched::ExitStatus| {
+    let write_info = |pid: u32, si_code: i32, si_status: i32| {
         if infop != 0 && validate_user_buf(infop, 128) {
             let mut buf = [0u8; 128];
             if pid != 0 {
-                // si_code and si_status both come from ExitStatus so a waitid
-                // caller that switches on CLD_KILLED reaches the same verdict
-                // as one that decodes wait4's packed status. si_code was
-                // hardcoded to CLD_EXITED here, which is the half of that
-                // disagreement this file owned.
                 buf[0..4].copy_from_slice(&17i32.to_ne_bytes());   // si_signo = SIGCHLD
-                buf[8..12].copy_from_slice(&status.si_code().to_ne_bytes());
+                buf[8..12].copy_from_slice(&si_code.to_ne_bytes());
                 buf[16..20].copy_from_slice(&pid.to_ne_bytes());   // si_pid
-                buf[24..28].copy_from_slice(&status.si_status().to_ne_bytes());
+                buf[24..28].copy_from_slice(&si_status.to_ne_bytes());
             }
             with_current_address_space_mut(|as_| as_.write_user_buf(infop, &buf));
         }
     };
 
     loop {
-        let attempt = if reap_exits {
-            sched::wait_try(sel, caller_tgid)
-        } else {
-            sched::wait_peek(sel, caller_tgid)
-        };
-        match attempt {
-            sched::WaitTry::Reaped(pid, status) if reap_exits => {
-                write_info(pid, status);
+        match sched::wait_try(sel, caller_tgid, what) {
+            sched::WaitTry::Reaped(pid, status) => {
+                // si_code and si_status both come from ExitStatus so a waitid
+                // caller that switches on CLD_KILLED reaches the same verdict
+                // as one that decodes wait4's packed status. si_code was
+                // hardcoded to CLD_EXITED here, which is the half of that
+                // disagreement this file owned.
+                write_info(pid, status.si_code(), status.si_status());
+                return 0;
+            }
+            sched::WaitTry::Stopped(pid, sig) => {
+                write_info(pid, sched::CLD_STOPPED, sig as i32);
+                return 0;
+            }
+            sched::WaitTry::Continued(pid) => {
+                write_info(pid, sched::CLD_CONTINUED, 18); // si_status = SIGCONT
                 return 0;
             }
             sched::WaitTry::NoChildren => return -10, // ECHILD
-            _ => {
-                // StillRunning, or a terminated child we must not consume.
+            sched::WaitTry::StillRunning => {
                 if options & WNOHANG != 0 {
                     // "no state change" — zeroed si_pid
-                    write_info(0, sched::ExitStatus::NONE);
+                    write_info(0, 0, 0);
                     return 0;
                 }
                 if interrupted() { return -4; } // EINTR
@@ -2175,13 +2202,8 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
                 // 100 % CPU. Woken by child-exit SIGCHLD -> wake_poll; the
                 // 2-tick poll deadline bounds a missed edge to ~20 ms.
                 sched::block_on_poll_prepare_until(sched::ticks() + 2);
-                let peek = sched::wait_peek(sel, caller_tgid);
-                let ready = if reap_exits {
-                    !matches!(peek, sched::WaitTry::StillRunning)
-                } else {
-                    matches!(peek, sched::WaitTry::NoChildren)
-                };
-                if ready || interrupted() {
+                let peek = sched::wait_peek(sel, caller_tgid, what);
+                if !matches!(peek, sched::WaitTry::StillRunning) || interrupted() {
                     sched::block_on_poll_cancel();
                 } else {
                     sched::block_on_poll_commit();

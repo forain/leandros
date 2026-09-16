@@ -32,7 +32,8 @@ pub mod task;
 pub use clone::{fork_current, clone_thread};
 pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec};
 pub use futex::{futex_wait, futex_wake, futex_requeue};
-pub use task::{SigInfo, SI_USER, SI_KERNEL, SI_TIMER, SI_TKILL, CLD_EXITED, CLD_KILLED, CLD_DUMPED};
+pub use task::{SigInfo, SI_USER, SI_KERNEL, SI_TIMER, SI_TKILL, CLD_EXITED, CLD_KILLED, CLD_DUMPED,
+               CLD_STOPPED, CLD_CONTINUED};
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
@@ -630,8 +631,16 @@ pub fn ticks() -> u64 {
 /// `SI_USER` `kill()` and silently misreports every other origin.
 pub fn deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> isize {
     let mut woke = false;
+    let mut resumed = None;
     let ret = {
         let mut rq = RUN_QUEUE.lock();
+        if signo > 0 && signo <= 64 {
+            if let Some(tgid) = rq.find_pid(pid).map(|t| t.tgid) {
+                let (made_ready, r) = on_signal_generated(&mut rq, tgid, signo);
+                resumed = r;
+                woke |= made_ready;
+            }
+        }
         let min_vr = rq.min_vruntime();
         if let Some(t) = rq.find_pid_mut(pid) {
             if signo > 0 && signo <= 64 {
@@ -658,10 +667,84 @@ pub fn deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> isize {
         }
     };
     if woke { wake_up_an_idle_cpu(); }
+    if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
     // A signalfd registered in this tgid may be parked in epoll_wait; the
     // new pending bit is a readiness edge for it. RUN_QUEUE is released above.
     wake_poll();
     ret
+}
+
+/// Job-control side effects of *generating* `signo` for thread group `tgid`,
+/// applied under the RUN_QUEUE lock before the signal is queued.
+///
+/// * SIGCONT and SIGKILL make every `Stopped` thread of the group `Ready`
+///   again and withdraw any outstanding stop request (`stop_pending`), so a
+///   stopped process can be resumed or killed. SIGCONT additionally
+///   discards pending stop signals (POSIX) and, if the group *was* stopped,
+///   arms the `WIFCONTINUED` report and asks the caller to notify the
+///   parent — returned as `Some((tgid, ppid, uid))` because the SIGCHLD has
+///   to be sent after this lock is released.
+/// * A stop signal discards a pending SIGCONT (the mirror rule).
+///
+/// The continue is performed at *send* time, not when the signal is
+/// dequeued: a stopped thread never returns to user space, so it could never
+/// dequeue the very signal that is supposed to wake it.
+///
+/// Returns `(made_ready, resumed)`: `made_ready` is true when at least one
+/// `Stopped` thread became `Ready` (SIGCONT *or* SIGKILL), so the caller
+/// kicks an idle CPU — the thread it goes on to target is no longer
+/// `Blocked`, so the ordinary wake path would not.
+fn on_signal_generated(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32)
+    -> (bool, Option<(Pid, Pid, u32)>)
+{
+    let bit = 1u64 << (signo - 1);
+    if signo == signal::SIGCONT || signo == signal::SIGKILL {
+        let min_vr = rq.min_vruntime();
+        let mut made_ready = false;
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(t) = rq.get_mut(i) {
+                if t.tgid != tgid { continue; }
+                t.stop_pending = false;
+                if signo == signal::SIGCONT { t.signal_pending &= !signal::SIGDFL_STOP; }
+                if t.state == TaskState::Stopped {
+                    t.state = TaskState::Ready;
+                    signal::clear_block_fields(t);
+                    t.place(min_vr);
+                    made_ready = true;
+                }
+            }
+        }
+        let mut resumed = None;
+        if let Some(l) = rq.find_pid_mut(tgid) {
+            if signo == signal::SIGCONT { l.shared_signal_pending &= !signal::SIGDFL_STOP; }
+            if l.stop_signal != 0 {
+                l.stop_signal   = 0;
+                l.stop_reported = false;
+                if signo == signal::SIGCONT {
+                    l.cont_pending = true;
+                    resumed = Some((tgid, l.ppid, l.uid));
+                }
+            }
+        }
+        return (made_ready, resumed);
+    }
+    if signal::SIGDFL_STOP & bit != 0 {
+        let cont = 1u64 << (signal::SIGCONT - 1);
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(t) = rq.get_mut(i) {
+                if t.tgid == tgid { t.signal_pending &= !cont; }
+            }
+        }
+        if let Some(l) = rq.find_pid_mut(tgid) { l.shared_signal_pending &= !cont; }
+    }
+    (false, None)
+}
+
+/// SIGCHLD/CLD_CONTINUED to the parent of a just-resumed process. No locks
+/// held.
+fn notify_continued(tgid: Pid, ppid: Pid, uid: u32) {
+    signal::notify_parent_state_change(tgid, ppid, uid,
+        SigInfo::child_state(task::CLD_CONTINUED, tgid, uid, signal::SIGCONT));
 }
 
 /// Deliver a *process-directed* signal (child-exit SIGCHLD, kill(pid), killpg)
@@ -690,8 +773,14 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isi
     // pending set: for these two, any live thread in the group is a valid
     // target. Belt and braces on the one pair of signals that must never fail.
     let unblockable = signal::UNBLOCKABLE & bit != 0;
+    let resumed;
     let ret = {
         let mut rq = RUN_QUEUE.lock();
+        // SIGCONT/SIGKILL: resume a stopped group first, so the thread chosen
+        // below is runnable and can actually take the signal.
+        let (made_ready, r) = on_signal_generated(&mut rq, tgid, signo);
+        resumed = r;
+        woke |= made_ready;
         let min_vr = rq.min_vruntime();
         // Prefer a Blocked thread with the signal unmasked; otherwise any
         // unmasked thread; otherwise the leader.
@@ -756,6 +845,7 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isi
         }
     };
     if woke { wake_up_an_idle_cpu(); }
+    if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
     // Wake any signalfd poller in the target tgid (RUN_QUEUE released above).
     wake_poll();
     ret
@@ -1501,18 +1591,39 @@ pub enum WaitTry {
     /// [`ExitStatus::wait_status`] (wait4) or [`ExitStatus::si_code`] /
     /// [`ExitStatus::si_status`] (waitid) — never by hand.
     Reaped(Pid, ExitStatus),
-    /// Matching children exist but none has terminated yet.
+    /// A matching child is stopped by job control: (pid, stop signal). Only
+    /// reported when [`WaitWhat::stopped`] is set; consumed once per stop.
+    Stopped(Pid, u32),
+    /// A matching stopped child was resumed by SIGCONT. Only reported when
+    /// [`WaitWhat::continued`] is set; consumed once per continue.
+    Continued(Pid),
+    /// Matching children exist but none has a reportable state change.
     StillRunning,
     /// The caller has no matching children at all — wait4 returns ECHILD.
     NoChildren,
 }
 
+/// Which child state changes a wait call is interested in — wait4's
+/// `WUNTRACED`/`WCONTINUED` and waitid's `WEXITED`/`WSTOPPED`/`WCONTINUED`.
+#[derive(Clone, Copy)]
+pub struct WaitWhat {
+    pub exited:    bool,
+    pub stopped:   bool,
+    pub continued: bool,
+}
+
+impl WaitWhat {
+    /// Terminations only — what every wait call before job control asked for.
+    pub const EXITED: WaitWhat = WaitWhat { exited: true, stopped: false, continued: false };
+}
+
 /// Non-consuming variant of `wait_try`: reports whether a matching child
-/// exists / has terminated without reaping it. Used by waitid() calls that
-/// don't include WEXITED (stopped/continued-only waits must leave exit
-/// statuses for a later wait4 to collect).
-pub fn wait_peek(sel: WaitSel, caller_tgid: Pid) -> WaitTry {
-    wait_scan(sel, caller_tgid, false)
+/// exists / has a reportable state change without consuming the report.
+/// Used by the blocking paths' re-check and by waitid() calls that don't
+/// include WEXITED (stopped/continued-only waits must leave exit statuses
+/// for a later wait4 to collect).
+pub fn wait_peek(sel: WaitSel, caller_tgid: Pid, what: WaitWhat) -> WaitTry {
+    wait_scan(sel, caller_tgid, false, what)
 }
 
 /// Single non-blocking scan for a terminated child of `caller_tgid`.
@@ -1525,11 +1636,11 @@ pub fn wait_peek(sel: WaitSel, caller_tgid: Pid) -> WaitTry {
 /// `EXIT_LOG` record is then born consumed. This closes the
 /// SIGCHLD→wait4(WNOHANG) race: the child is waitable the moment it is a
 /// zombie, not only once the scheduler has recycled its slot.
-pub fn wait_try(sel: WaitSel, caller_tgid: Pid) -> WaitTry {
-    wait_scan(sel, caller_tgid, true)
+pub fn wait_try(sel: WaitSel, caller_tgid: Pid, what: WaitWhat) -> WaitTry {
+    wait_scan(sel, caller_tgid, true, what)
 }
 
-fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool) -> WaitTry {
+fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> WaitTry {
     let matches = |pid: Pid, pgid: Pid| -> bool {
         match sel {
             WaitSel::Pid(p)  => pid == p,
@@ -1549,13 +1660,16 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool) -> WaitTry {
     // Phase 1: live (or zombie-but-unrecycled) children on the run queue.
     let mut found_live = false;
     let mut zombie: Option<(usize, Pid, ExitStatus)> = None;
+    let mut stopped: Option<(usize, Pid, u32)> = None;
+    let mut continued: Option<(usize, Pid)> = None;
     for i in 0..runqueue::MAX_TASKS {
-        let (pid, tgid, ppid, pgid, state, status, reported) = match rq.get(i) {
-            Some(t) => (t.pid, t.tgid, t.ppid, t.pgid, t.state,
-                        ExitStatus { code: t.exit_code, term_signal: t.term_signal },
-                        t.wait_reported),
-            None => continue,
-        };
+        let (pid, tgid, ppid, pgid, state, status, reported, stop_sig, stop_reported, cont_pending) =
+            match rq.get(i) {
+                Some(t) => (t.pid, t.tgid, t.ppid, t.pgid, t.state,
+                            ExitStatus { code: t.exit_code, term_signal: t.term_signal },
+                            t.wait_reported, t.stop_signal, t.stop_reported, t.cont_pending),
+                None => continue,
+            };
         if pid != tgid { continue; } // threads are not waitable children
         let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
         if parent_tgid != caller_tgid || !matches(pid, pgid) { continue; }
@@ -1566,27 +1680,53 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool) -> WaitTry {
             // Reported zombies are logically reaped already — skip.
         } else {
             found_live = true;
-        }
-    }
-    if let Some((i, pid, status)) = zombie {
-        if consume {
-            if let Some(t) = rq.get_mut(i) { t.wait_reported = true; }
-        }
-        return WaitTry::Reaped(pid, status);
-    }
-
-    // Phase 2: already-recycled children in the exit log (still under the
-    // run-queue lock, so a concurrent reap cannot slip between the phases).
-    {
-        let mut log = EXIT_LOG.lock();
-        for entry in log.iter_mut().filter_map(|e| e.as_mut()) {
-            if entry.consumed || !entry.is_process { continue; }
-            if entry.parent_tgid != caller_tgid { continue; }
-            if matches(entry.pid, entry.pgid) {
-                if consume { entry.consumed = true; }
-                return WaitTry::Reaped(entry.pid, entry.status);
+            // Job-control reports live on the leader: a stop not yet handed
+            // to a waiter, or a resume not yet collected with WCONTINUED.
+            if what.stopped && stop_sig != 0 && !stop_reported && stopped.is_none() {
+                stopped = Some((i, pid, stop_sig as u32));
+            }
+            if what.continued && cont_pending && continued.is_none() {
+                continued = Some((i, pid));
             }
         }
+    }
+    if what.exited {
+        if let Some((i, pid, status)) = zombie {
+            if consume {
+                if let Some(t) = rq.get_mut(i) { t.wait_reported = true; }
+            }
+            return WaitTry::Reaped(pid, status);
+        }
+
+        // Phase 2: already-recycled children in the exit log (still under the
+        // run-queue lock, so a concurrent reap cannot slip between the phases).
+        {
+            let mut log = EXIT_LOG.lock();
+            for entry in log.iter_mut().filter_map(|e| e.as_mut()) {
+                if entry.consumed || !entry.is_process { continue; }
+                if entry.parent_tgid != caller_tgid { continue; }
+                if matches(entry.pid, entry.pgid) {
+                    if consume { entry.consumed = true; }
+                    return WaitTry::Reaped(entry.pid, entry.status);
+                }
+            }
+        }
+    } else if zombie.is_some() {
+        // A terminated child the caller did not ask about (waitid without
+        // WEXITED) still counts as an existing child.
+        found_live = true;
+    }
+    if let Some((i, pid, sig)) = stopped {
+        if consume {
+            if let Some(t) = rq.get_mut(i) { t.stop_reported = true; }
+        }
+        return WaitTry::Stopped(pid, sig);
+    }
+    if let Some((i, pid)) = continued {
+        if consume {
+            if let Some(t) = rq.get_mut(i) { t.cont_pending = false; }
+        }
+        return WaitTry::Continued(pid);
     }
 
     if found_live { WaitTry::StillRunning } else { WaitTry::NoChildren }
@@ -2156,6 +2296,17 @@ fn scheduler_run_loop() -> ! {
                         t.on_cpu = None;
                         if t.state == TaskState::Running {
                             t.state = TaskState::Ready;
+                        }
+                        // A sibling took SIGSTOP while this thread was on
+                        // the CPU (see signal::do_signal_stop): now that
+                        // its registers are saved, park it. Ready or
+                        // Blocked alike — a Blocked thread resumes as a
+                        // spurious wake on SIGCONT and re-parks itself.
+                        if t.stop_pending
+                            && matches!(t.state, TaskState::Ready | TaskState::Blocked)
+                        {
+                            t.state = TaskState::Stopped;
+                            signal::clear_block_fields(t);
                         }
                         if t.state == TaskState::Zombie {
                             Some((t.pid,
