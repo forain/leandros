@@ -440,6 +440,13 @@ pub fn events_pushed() -> u64 {
     EVENTS_PUSHED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Monotonic microseconds of the most recent `push_event` (zink-lane
+/// instrumentation: lets the DRM/GPU paths report "time since last input").
+static LAST_PUSH_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub fn last_push_us() -> u64 {
+    LAST_PUSH_US.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // ── Poll-wake coalescing ─────────────────────────────────────────────────────
 //
 // `push_event` ends by waking pollers, and `sched::try_wake_poll` is not a
@@ -1153,6 +1160,7 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     // still no reason to hold anything across it.
     let now_us = unsafe { arch_monotonic_ns() } / 1_000;
     EVENTS_PUSHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    LAST_PUSH_US.store(now_us, core::sync::atomic::Ordering::Relaxed);
 
     // Ctrl+Alt+Fn is recognised here rather than in a keyboard driver because
     // push_event is the one choke point every keyboard source funnels through,

@@ -4494,6 +4494,14 @@ impl DrmDeviceInterface {
                     // used to be the same number by construction, which is what
                     // made "smithay flips the primary every frame" unfalsifiable.
                     FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed);
+                    if DRM_STATS {
+                        let now = crate::snd::monotonic_us();
+                        mm::gap2::s("[FLIP] t_us="); mm::gap2::h(now as usize);
+                        mm::gap2::kv(" pid=", sched::current_pid() as usize);
+                        mm::gap2::kv(" inp_age_us=", now.wrapping_sub(evdev_server::last_push_us()) as usize);
+                        mm::gap2::kv(" n=", FLIPS_SUBMITTED.load(Ordering::Relaxed) as usize);
+                        mm::gap2::nl();
+                    }
                     presented = true;
                 }
 

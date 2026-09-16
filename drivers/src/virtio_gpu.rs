@@ -1000,6 +1000,17 @@ impl VirtioGpuDevice {
                 CTRLQ_SPIN_US.fetch_add(dt, Relaxed);
                 CTRLQ_SPIN_MAX_US.fetch_max(dt, Relaxed);
                 if timeout == 0 { CTRLQ_TIMEOUTS.fetch_add(1, Relaxed); }
+                // zink-lane: name every control-queue round trip over 20 ms,
+                // with the calling task and the age of the last input event.
+                if dt > 20_000 {
+                    let now = crate::snd::monotonic_us();
+                    mm::gap2::s("[SUBMIT] cmd="); mm::gap2::h(hdr_type as usize);
+                    mm::gap2::kv(" dt_us=", dt as usize);
+                    mm::gap2::kv(" pid=", sched::current_pid() as usize);
+                    mm::gap2::kv(" inp_age_us=", now.wrapping_sub(evdev_server::last_push_us()) as usize);
+                    mm::gap2::kv(" t_us=", now as usize);
+                    mm::gap2::nl();
+                }
             }
 
             if timeout == 0 {

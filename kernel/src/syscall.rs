@@ -735,6 +735,19 @@ pub extern "C" fn syscall_dispatch(
     dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr)
 }
 
+/// zink-lane instrumentation: per-syscall time census for the focus tgid
+/// (`sched::SC_FOCUS_TGID`, cosmic-comp) plus a lock-free pid -> last syscall
+/// table, printed by `scstat_tick`. Compile-time gated like `DRM_STATS`.
+pub const SC_STATS: bool = false;
+const SC_SLOTS: usize = 512;
+static SC_N:   [AtomicU64; SC_SLOTS] = [const { AtomicU64::new(0) }; SC_SLOTS];
+static SC_NS:  [AtomicU64; SC_SLOTS] = [const { AtomicU64::new(0) }; SC_SLOTS];
+static SC_MAX: [AtomicU64; SC_SLOTS] = [const { AtomicU64::new(0) }; SC_SLOTS];
+/// pid & 1023 -> (pid << 32) | (nr << 1) | in_syscall
+static LAST_SC: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+/// 0 = not requested, 1 = dump the focus process's VMAs on its next syscall, 2 = done.
+static SC_VMA_DUMP: AtomicU32 = AtomicU32::new(0);
+
 pub fn dispatch(
     number: usize,
     a0: usize, a1: usize, a2: usize,
@@ -742,7 +755,28 @@ pub fn dispatch(
     frame_ptr: usize,
 ) -> isize {
     dbg_serial_dump_maybe();
+    let (sc_pid, sc_focus, sc_t0) = if SC_STATS {
+        let pid = current_pid();
+        LAST_SC[(pid as usize) & 1023].store(((pid as u64) << 32) | ((number as u64) << 1) | 1, Ordering::Relaxed);
+        let f = sched::SC_FOCUS_TGID.load(Ordering::Relaxed);
+        let focus = f != 0 && sched::current_tgid() == f;
+        (pid, focus, if focus { monotonic_ns() } else { 0 })
+    } else { (0, false, 0) };
     let ret = dispatch_inner(number, a0, a1, a2, a3, a4, a5, frame_ptr);
+    if SC_STATS && sc_focus && SC_VMA_DUMP.load(Ordering::Relaxed) == 1 {
+        SC_VMA_DUMP.store(2, Ordering::Relaxed);
+        mm::gap2::s("[VMA] focus tgid dump follows\n");
+        sched::dump_user_vma(0);
+    }
+    if SC_STATS {
+        LAST_SC[(sc_pid as usize) & 1023].store(((sc_pid as u64) << 32) | ((number as u64) << 1), Ordering::Relaxed);
+        if sc_focus && number < SC_SLOTS {
+            let dt = monotonic_ns().wrapping_sub(sc_t0);
+            SC_N[number].fetch_add(1, Ordering::Relaxed);
+            SC_NS[number].fetch_add(dt, Ordering::Relaxed);
+            SC_MAX[number].fetch_max(dt, Ordering::Relaxed);
+        }
+    }
     // The syscall is the deepest the kernel stack ever gets — every filesystem
     // and network server runs in kernel context off the back of one. Checking
     // here costs a mask and a compare, and it is the difference between an
@@ -3638,6 +3672,9 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // kpath is the resolved absolute path. Must precede replace_address_space,
     // which never returns.
     sched::set_exe_path(fd_owner, kpath.bytes());
+    if SC_STATS && kpath.bytes().ends_with(b"cosmic-comp") {
+        sched::SC_FOCUS_TGID.store(fd_owner, Ordering::Relaxed);
+    }
 
     // POSIX execve: caught signal handlers revert to SIG_DFL in the new image
     // (SIG_IGN/SIG_DFL and the signal mask are preserved). Omitting this let a
@@ -7342,10 +7379,81 @@ fn evstat_tick() {
     }
 }
 
+/// 0.5 Hz `[SCSTAT]` top-syscalls line for the focus tgid, and a 0.1 Hz
+/// `[TASK]` census of every live task (state, wait object, last syscall).
+/// IRQ context: atomics + one RUN_QUEUE try_lock + UART-direct output.
+fn scstat_tick() {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !SC_STATS { return; }
+    static LAST: AtomicUsize = AtomicUsize::new(0);
+    static ROUND: AtomicUsize = AtomicUsize::new(0);
+    let now = ticks() as usize;
+    if now.wrapping_sub(LAST.load(Relaxed)) < 200 { return; }
+    LAST.store(now, Relaxed);
+    let focus = sched::SC_FOCUS_TGID.load(Relaxed);
+    if focus != 0 {
+        // Top 10 by cumulative ns, unsorted scan (512 slots, 10 passes).
+        mm::gap2::s("[SCSTAT] t="); mm::gap2::h(now);
+        mm::gap2::kv(" tgid=", focus as usize);
+        let mut taken = [false; SC_SLOTS];
+        for _ in 0..10 {
+            let mut best = 0usize; let mut best_ns = 0u64;
+            for i in 0..SC_SLOTS {
+                if taken[i] { continue; }
+                let v = SC_NS[i].load(Relaxed);
+                if v > best_ns { best_ns = v; best = i; }
+            }
+            if best_ns == 0 { break; }
+            taken[best] = true;
+            mm::gap2::s(" nr"); mm::gap2::h(best);
+            mm::gap2::s(":"); mm::gap2::h(SC_N[best].load(Relaxed) as usize);
+            mm::gap2::s(":"); mm::gap2::h((best_ns / 1000) as usize);
+            mm::gap2::s(":"); mm::gap2::h((SC_MAX[best].load(Relaxed) / 1000) as usize);
+        }
+        mm::gap2::nl();
+    }
+    let r = ROUND.fetch_add(1, Relaxed);
+    // Ask for the focus process's VMA map ~20 s after it appears (its libraries
+    // are loaded by then), once.
+    if focus != 0 && r >= 10 && SC_VMA_DUMP.load(Relaxed) == 0 { SC_VMA_DUMP.store(1, Relaxed); }
+    // Once, ~40 s after focus: stack scan of every parked thread in the group.
+    if focus != 0 && r >= 20 && SC_VMA_DUMP.load(Relaxed) == 2 {
+        if sched::dump_group_stacks(focus, 1024) { SC_VMA_DUMP.store(3, Relaxed); }
+    }
+    if r % 5 == 0 {
+        let mut rows = [sched::TaskCensusRow::empty(); 96];
+        let n = sched::task_rows(&mut rows);
+        if n == usize::MAX {
+            mm::gap2::s("[TASK] t="); mm::gap2::h(now); mm::gap2::s(" busy\n");
+        } else {
+            for row in rows.iter().take(n) {
+                let l = LAST_SC[(row.pid as usize) & 1023].load(Relaxed);
+                mm::gap2::s("[TASK] t="); mm::gap2::h(now);
+                mm::gap2::kv(" pid=", row.pid as usize);
+                mm::gap2::kv(" tgid=", row.tgid as usize);
+                mm::gap2::kv(" st=", row.state as usize);
+                mm::gap2::kv(" bo=", row.blocked_on as usize);
+                mm::gap2::kv(" pd=", row.poll_deadline as usize);
+                mm::gap2::kv(" fut=", row.blocked_futex);
+                mm::gap2::kv(" cpu=", row.on_cpu as usize);
+                if (l >> 32) as u32 == row.pid {
+                    mm::gap2::kv(" sc=", ((l >> 1) & 0x7FFF_FFFF) as usize);
+                    mm::gap2::kv(" in=", (l & 1) as usize);
+                }
+                mm::gap2::kv(" rip=", row.urip as usize);
+                mm::gap2::kv(" rsp=", row.ursp as usize);
+                if row.futex_val != u64::MAX { mm::gap2::kv(" fval=", row.futex_val as usize); }
+                mm::gap2::nl();
+            }
+        }
+    }
+}
+
 pub fn poll_deadline_tick() {
     use core::sync::atomic::Ordering::Relaxed;
     gap2_sample_tick();
     evstat_tick();
+    scstat_tick();
     let now = ticks();
     let tfd = vfs::earliest_timerfd_deadline();
     // Fast path: the lock-free hint (min of parked timed waiters' deadlines)

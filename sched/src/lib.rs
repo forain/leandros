@@ -1403,6 +1403,122 @@ pub fn register_poll_deadline(deadline: u64) {
     NEXT_POLL_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
 }
 
+// ── Task census (zink-lane instrumentation, IRQ-safe, try_lock only) ────────
+#[derive(Clone, Copy)]
+pub struct TaskCensusRow {
+    pub pid: Pid,
+    pub tgid: Pid,
+    pub state: u8,
+    pub blocked_on: u32,
+    pub poll_deadline: u64,
+    pub blocked_futex: usize,
+    pub on_cpu: u8,
+    /// User PC/SP from the trap frame at the top of the kernel stack (valid
+    /// for a task parked inside a syscall), and the current value of the
+    /// futex word it is parked on (`u64::MAX` = unreadable).
+    pub urip: u64,
+    pub ursp: u64,
+    pub futex_val: u64,
+}
+impl TaskCensusRow {
+    pub const fn empty() -> Self {
+        Self { pid: 0, tgid: 0, state: 0, blocked_on: 0, poll_deadline: 0, blocked_futex: 0, on_cpu: 0xFF,
+               urip: 0, ursp: 0, futex_val: u64::MAX }
+    }
+}
+/// Snapshot every live (non-zombie) task. Returns `usize::MAX` when RUN_QUEUE
+/// is contended (sample missed), else the number of rows written.
+pub fn task_rows(out: &mut [TaskCensusRow]) -> usize {
+    let rq = match RUN_QUEUE.try_lock() { Some(r) => r, None => return usize::MAX };
+    let mut n = 0;
+    for i in 0..runqueue::MAX_TASKS {
+        if n >= out.len() { break; }
+        if let Some(t) = rq.get(i) {
+            if matches!(t.state, task::TaskState::Zombie) { continue; }
+            out[n] = TaskCensusRow {
+                pid: t.pid,
+                tgid: t.tgid,
+                state: match t.state {
+                    task::TaskState::Ready => 0, task::TaskState::Running => 1,
+                    task::TaskState::Blocked => 2, task::TaskState::Zombie => 3,
+                },
+                blocked_on: t.blocked_on.unwrap_or(0xFFFF_FFFF),
+                poll_deadline: t.poll_deadline,
+                blocked_futex: t.blocked_futex,
+                on_cpu: t.on_cpu.map(|c| c as u8).unwrap_or(0xFF),
+                urip: 0, ursp: 0, futex_val: u64::MAX,
+            };
+            // Trap frame: the syscall entry stub switches to the kernel stack
+            // top and pushes [ss, rsp, rflags, cs, rip] then the GPRs, so the
+            // UserFrame sits at top - SIZE. Only meaningful for a parked task.
+            if matches!(t.state, task::TaskState::Blocked) && t.on_cpu.is_none() && t.kernel_stack != 0 {
+                let top = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
+                let f = unsafe { &*((top - context::UserFrame::SIZE) as *const context::UserFrame) };
+                #[cfg(target_arch = "x86_64")]
+                { out[n].urip = f.rip; out[n].ursp = f.rsp; }
+                #[cfg(target_arch = "aarch64")]
+                { out[n].urip = f.elr_el1; out[n].ursp = f.sp_el0; }
+                if t.blocked_futex != 0 {
+                    if let Some(leader) = rq.find_pid(t.tgid) {
+                        if let Some(as_) = leader.address_space.as_ref() {
+                            if let Some(pa) = as_.virt_to_phys(t.blocked_futex) {
+                                out[n].futex_val = unsafe {
+                                    core::ptr::read_volatile(mm::phys_to_virt(pa) as *const u32) } as u64;
+                            }
+                        }
+                    }
+                }
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Poor man's backtrace for every parked thread of `tgid`: scan up to `words`
+/// u64s above the saved user SP and report those that land inside an
+/// executable VMA of the group's address space, plus every VMA once.
+/// Physical reads only (page-table walk via `virt_to_phys`); never faults.
+pub fn dump_group_stacks(tgid: Pid, words: usize) -> bool {
+    let rq = match RUN_QUEUE.try_lock() { Some(r) => r, None => return false };
+    let leader = match rq.find_pid(tgid) { Some(t) => t, None => return true };
+    let as_ = match leader.address_space.as_ref() { Some(a) => a, None => return true };
+    for r in as_.regions.iter().filter_map(|r| r.as_ref()) {
+        mm::gap2::s("[VMAP] "); mm::gap2::h(r.start); mm::gap2::s("-"); mm::gap2::h(r.end);
+        mm::gap2::kv(" prot=", r.prot as usize); mm::gap2::kv(" cap=", r.file_cap);
+        mm::gap2::kv(" foff=", r.file_off as usize); mm::gap2::kv(" lazy=", r.lazy as usize);
+        mm::gap2::nl();
+    }
+    for i in 0..runqueue::MAX_TASKS {
+        let t = match rq.get(i) { Some(t) => t, None => continue };
+        if t.tgid != tgid || !matches!(t.state, task::TaskState::Blocked) || t.on_cpu.is_some() || t.kernel_stack == 0 { continue; }
+        let top = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
+        let f = unsafe { &*((top - context::UserFrame::SIZE) as *const context::UserFrame) };
+        #[cfg(target_arch = "x86_64")]
+        let (rip, sp) = (f.rip as usize, f.rsp as usize);
+        #[cfg(target_arch = "aarch64")]
+        let (rip, sp) = (f.elr_el1 as usize, f.sp_el0 as usize);
+        mm::gap2::s("[BT] pid="); mm::gap2::h(t.pid as usize);
+        mm::gap2::kv(" rip=", rip); mm::gap2::kv(" sp=", sp); mm::gap2::s(" :");
+        let mut n = 0usize;
+        let mut va = sp & !7;
+        while n < words {
+            let pa = match as_.virt_to_phys(va) { Some(p) => p, None => break };
+            let w = unsafe { core::ptr::read_volatile(mm::phys_to_virt(pa) as *const usize) };
+            if w >= 0x1000 && as_.find(w).map(|r| r.prot & 0x4 != 0).unwrap_or(false) {
+                mm::gap2::s(" "); mm::gap2::h(w);
+            }
+            va += 8; n += 1;
+        }
+        mm::gap2::nl();
+    }
+    true
+}
+
+/// Which tgid the `[SCSTAT]` per-syscall census follows (0 = none). Set by
+/// `sys_execve` when the image path ends in `cosmic-comp`.
+pub static SC_FOCUS_TGID: AtomicU32 = AtomicU32::new(0);
+
 // ── Per-process executable path (/proc/self/exe) ────────────────────────────
 //
 // A tgid-keyed side table rather than a `Task` field, so fork/clone's raw-copy
