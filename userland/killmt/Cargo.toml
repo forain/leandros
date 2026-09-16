@@ -1,0 +1,21 @@
+[workspace]
+
+[package]
+name = "killmt"
+version = "0.1.0"
+edition = "2021"
+description = "kill -9 of a multithreaded process: every thread must be reaped, no CPU may wedge"
+
+# Standalone, outside the userland workspace: that workspace builds
+# relibc-linked no_std binaries for *-unknown-none, while this test wants
+# std threads, fork() and waitpid() from musl. Built by build.sh exactly like
+# userland/spawnwedge and ports/mkfs-fat.
+[[bin]]
+name = "killmt"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = 2
