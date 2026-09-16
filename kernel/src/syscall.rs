@@ -3138,10 +3138,108 @@ impl ExecStrBuf {
         }
     }
 
+    /// Append one string that already lives in kernel memory — the
+    /// interpreter, its optional argument and the script path a `#!` line
+    /// puts in front of the caller's argv. Returns false when it does not fit.
+    fn push_bytes(&mut self, s: &[u8]) -> bool {
+        if self.count >= MAX_EXEC_ARGS { return false; }
+        if self.end + s.len() + 1 > MAX_EXEC_STR { return false; }
+        let start = self.end;
+        self.data[start..start + s.len()].copy_from_slice(s);
+        self.data[start + s.len()] = 0;
+        self.end = start + s.len() + 1;
+        self.offsets[self.count] = start;
+        self.lengths[self.count] = s.len();
+        self.count += 1;
+        true
+    }
+
     fn reset(&mut self) { self.end = 0; self.count = 0; }
 }
 
 static EXEC_ARGV: spin::Mutex<ExecStrBuf> = spin::Mutex::new(ExecStrBuf::new());
+
+// ── `#!` scripts (Linux binfmt_script) ───────────────────────────────────────
+
+/// Linux's `BINPRM_BUF_SIZE`: the `#!` line is parsed out of the first 256
+/// bytes of the file and no further.
+const SHEBANG_BUF: usize = 256;
+/// Linux's `BINPRM_MAX_RECURSION`: a script may name a script as its
+/// interpreter this many times; one more is ELOOP.
+const SHEBANG_MAX_DEPTH: usize = 4;
+
+/// The first `n` bytes of `path` (fewer if the file is shorter), or None when
+/// it cannot be opened or read at all — in which case the caller lets the ELF
+/// path report the failure it always has.
+fn read_file_prefix(path: &str, n: usize) -> Option<alloc::vec::Vec<u8>> {
+    let fd = open_kernel_path(path, 0 /* O_RDONLY */, 0);
+    if fd < 0 { return None; }
+    let fd = fd as usize;
+    let mut buf = alloc::vec![0u8; n];
+    let got = read_fd_upto(fd, &mut buf);
+    let _ = sys_close(fd);
+    if got < 0 { return None; }
+    buf.truncate(got as usize);
+    Some(buf)
+}
+
+/// Parse a `#!` line the way `binfmt_script.c` does. `buf` is the file's
+/// first `SHEBANG_BUF` bytes (at most) and starts with `#!`.
+///
+/// Returns `(interpreter, optional single argument)`. The interpreter runs
+/// from the first non-blank after `#!` to the first blank; everything after
+/// the following blanks up to the end of the line, trailing blanks trimmed,
+/// is ONE argument (Linux does not split it further). A NUL ends the line
+/// early. Without a newline inside the buffer the interpreter path must still
+/// be terminated by a blank inside it, or it may be truncated and the exec is
+/// refused (ENOEXEC); the argument may be truncated, the interpreter re-reads
+/// the script anyway.
+fn parse_shebang(buf: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+    let blank = |b: u8| b == b' ' || b == b'\t';
+    let body = &buf[2..];
+    let line_end = match body.iter().position(|&b| b == b'\n') {
+        Some(i) => i,
+        None => {
+            let start = body.iter().position(|&b| !blank(b))?;
+            body[start..].iter().position(|&b| blank(b) || b == 0)?;
+            body.len()
+        }
+    };
+    let mut line = &body[..line_end];
+    if let Some(z) = line.iter().position(|&b| b == 0) { line = &line[..z]; }
+    while let Some(&last) = line.last() {
+        if blank(last) { line = &line[..line.len() - 1]; } else { break; }
+    }
+    let start = line.iter().position(|&b| !blank(b))?;
+    let rest = &line[start..];
+    match rest.iter().position(|&b| blank(b)) {
+        None => Some((rest, None)),
+        Some(i) => {
+            let interp = &rest[..i];
+            let arg = rest[i..].iter().position(|&b| !blank(b)).map(|k| &rest[i + k..]);
+            Some((interp, arg))
+        }
+    }
+}
+
+/// Exec permission for a script: some execute bit must be set (EACCES
+/// otherwise), asked of the owning filesystem through `VFS_ACCESS` so ACLs
+/// count, with the `VFS_STAT` mode-bit fallback `sys_faccessat` uses for a
+/// filesystem that predates it. Linux checks this at `open_exec` for every
+/// binary; here it is applied to `#!` scripts, whose exec bit is the only
+/// thing that distinguishes a program from a data file the interpreter
+/// would otherwise happily run.
+fn script_exec_permitted(kp: &KPath, pid: u32) -> isize {
+    const X_OK: u64 = 1;
+    let amsg = make_vfs_msg(vfs::VFS_ACCESS, &[kp.ptr() as u64, X_OK]);
+    let ar = vfs_reply_val(&vfs::handle(&amsg, pid));
+    if ar != -38 { return if ar < 0 { -13 } else { 0 }; }
+    let mut stat_buf = [0u8; STAT_SIZE];
+    let msg = make_vfs_msg(vfs::VFS_STAT, &[kp.ptr() as u64, stat_buf.as_mut_ptr() as u64]);
+    if vfs_reply_val(&vfs::handle(&msg, pid)) < 0 { return 0; } // unknowable: as before
+    let st_mode = vfs::read_stat_mode(stat_buf.as_ptr() as usize);
+    if st_mode & 0o111 == 0 { -13 } else { 0 }
+}
 static EXEC_ENVP: spin::Mutex<ExecStrBuf> = spin::Mutex::new(ExecStrBuf::new());
 
 /// sys_execve(path_ptr, argv_ptr, envp_ptr) — Phase 3 ABI (VFS path lookup).
@@ -3317,7 +3415,54 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 
     // Resolve against the cwd through the shared helper, so `./prog` and
     // `prog` name the same file execve sees as every other path syscall.
-    let kpath = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
+    let mut kpath = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
+
+    // ── `#!` scripts ─────────────────────────────────────────────────────────
+    // A file starting with `#!` names its interpreter; exec that instead, with
+    // argv rewritten as Linux's binfmt_script does: the caller's argv[0] is
+    // dropped and `[interpreter, argument?, script-path]` goes in front of
+    // argv[1..]. `script-path` is the resolved absolute path (the caller's
+    // cwd is what it was resolved against, so the interpreter finds the same
+    // file). Nesting — an interpreter that is itself a script — repeats the
+    // rewrite: `[i2, a2?, i1, a1?, script, argv[1..]]`, up to
+    // SHEBANG_MAX_DEPTH levels.
+    let mut head_args: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    let mut depth = 0usize;
+    loop {
+        let cur = match core::str::from_utf8(kpath.bytes()) {
+            Ok(s) => s,
+            Err(_) => return -2,
+        };
+        let head = match read_file_prefix(cur, SHEBANG_BUF) {
+            Some(h) => h,
+            None => break, // unreadable: the ELF path below reports it
+        };
+        if head.len() < 2 || &head[..2] != b"#!" { break; }
+        if depth >= SHEBANG_MAX_DEPTH { return -40; } // ELOOP
+        let perm = script_exec_permitted(&kpath, pid);
+        if perm != 0 { return perm; }
+        let (interp, iarg) = match parse_shebang(&head) {
+            Some(x) => x,
+            None => return -8, // ENOEXEC
+        };
+        let mut next: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+        next.push(interp.to_vec());
+        if let Some(a) = iarg { next.push(a.to_vec()); }
+        next.push(kpath.bytes().to_vec());
+        // The previous level's interpreter name (head_args[0]) is the file we
+        // just parsed and was re-added above as its own script path.
+        next.extend(head_args.into_iter().skip(1));
+        head_args = next;
+
+        let mut abs = [0u8; KPATH_MAX];
+        let n = resolve_path(interp, &mut abs);
+        if n == 0 { return -2; } // ENOENT
+        kpath = KPath { buf: [0u8; KPATH_MAX + 1], len: n };
+        kpath.buf[..n].copy_from_slice(&abs[..n]);
+        depth += 1;
+    }
+    let script = !head_args.is_empty();
+
     let path = match core::str::from_utf8(kpath.bytes()) {
         Ok(s) => s,
         Err(_) => return -2, // ENOENT — non-UTF-8 paths do not exist here
@@ -3398,7 +3543,13 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     prefault_user(argv_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
     prefault_user(envp_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
 
-    // Read argv[] from user-space (array of pointers, null-terminated).
+    // A script's rewritten head goes first (see the `#!` loop above).
+    for a in &head_args {
+        if !argv.push_bytes(a) { return -7; } // E2BIG
+    }
+    drop(head_args);
+    // Read argv[] from user-space (array of pointers, null-terminated). For a
+    // script, argv[0] was replaced by the head above and is skipped.
     if argv_ptr != 0 {
         let mut i = 0usize;
         loop {
@@ -3414,6 +3565,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
             }).unwrap_or(false);
             if !ok || str_ptr == 0 { break; }
 
+            if script && i == 0 { i += 1; continue; }
             // push_cstr faults in + fault-checks each page of the string itself
             // (demand-paged argv literals live in .rodata); it never raw-derefs.
             argv.push_cstr(str_ptr);
