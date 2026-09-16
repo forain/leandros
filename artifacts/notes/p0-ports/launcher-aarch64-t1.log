@@ -1,0 +1,45 @@
+=== aarch64 launcher test t1 22:27:49 ===
+
+-rwxr-xr-x 3 root root 9666008 Jan  1 00:00 /usr/bin/pop-launcher
+/usr/lib/pop-launcher/plugins/cosmic_toplevel/:
+-rwxr-xr-x 3 root root 9666008 Jan  1 00:00 cosmic-toplevel
+-rw-r--r-- 1 root root     237 Jan  1 00:00 plugin.ron
+/usr/lib/pop-launcher/plugins/desktop_entries/:
+-rwxr-xr-x 3 root root 9666008 Jan  1 00:00 desktop-entries
+-rw-r--r-- 1 root root     191 Jan  1 00:00 plugin.ron
+host launch 22:27:58
+PNG:        /tmp/ports/aarch64-t1-desktop.png
+host launcher toggle 22:28:45
+PNG:        /tmp/ports/aarch64-t1-launcher.png
+1970-01-01T00:00:01.026976Z  INFO cosmic_session: Starting cosmic-session
+1970-01-01T00:00:02.930685Z  INFO cosmic_session: got environmental variables from cosmic-comp: [("WAYLAND_DISPLAY", "wayland-1")]
+1970-01-01T00:00:04.531204Z  INFO cosmic-launcher: cosmic_session: 1970-01-01T00:00:04.187073Z  INFO cosmic-launcher (com.system76.CosmicLauncher)
+1970-01-01T00:00:04.531279Z  INFO cosmic-launcher: cosmic_session: 1970-01-01T00:00:04.191519Z  INFO Version: 1.0.12 (release)
+1970-01-01T00:00:04.677938Z  INFO cosmic-launcher: cosmic_session: 1970-01-01T00:00:04.612935Z  WARN Failed to activate another instance err=MethodError(OwnedErrorName("org.freedesktop.DBus.Error.ServiceUnknown"), Some("
+1970-01-01T00:00:05.003858Z  WARN cosmic-launcher: cosmic_session: xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+1970-01-01T00:00:05.090953Z  INFO cosmic-launcher: cosmic_session: 1970-01-01T00:00:05.088264Z  INFO starting pop-launcher service
+1970-01-01T00:00:05.135537Z  INFO cosmic-launcher: cosmic_session: 1970-01-01T00:00:05.132604Z  INFO starting pop-launcher instance
+1970-01-01T00:00:05.144246Z  WARN cosmic-launcher: cosmic_session: xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+1970-01-01T00:00:05.144694Z  INFO cosmic-launcher: cosmic_session: 1970-01-01T00:00:05.144452Z  WARN {}{task_name="org.freedesktop.portal.Settings proxy caching"}: Failed to populate properties cache via GetAll: org.free
+1970-01-01T00:00:05.145031Z  WARN cosmic-launcher: cosmic_session: xkbcommon: ERROR: couldn't find a Compose file for locale "C" (mapped to "C")
+1970-01-01T00:00:05.145856Z  INFO cosmic-launcher: cosmic_session: 1970-01-01T00:00:05.145790Z ERROR Failed to get the color scheme Portal(ZBus(MethodError(OwnedErrorName("org.freedesktop.DBus.Error.ServiceUnknown"), Som
+1970-01-01T00:00:05.150814Z  INFO cosmic-launcher: cosmic_session: 1970-01-01T00:00:05.150658Z ERROR Failed to get the contrast Portal(ZBus(MethodError(OwnedErrorName("org.freedesktop.DBus.Error.ServiceUnknown"), Some("T
+1970-01-01T00:00:05.233736Z  INFO cosmic-launcher: cosmic_session: 1970-01-01T00:00:05.233641Z  WARN {}{task_name="org.a11y.Status proxy caching"}: Failed to populate properties cache via GetAll: org.freedesktop.DBus.Err
+1970-01-01T00:00:05.364820Z  WARN cosmic-launcher: cosmic_session: could not read cache file
+1970-01-01T00:00:05.365170Z  WARN cosmic-launcher: cosmic_session: No such file or directory (os error 2)
+total 40
+drwxr-xr-x 1 root root 4096 Jan  1 00:00 .
+drwxr-xr-x 1 root root 4096 Jan  1 00:00 ..
+-rw-r--r-- 1 root root   40 Jan  1 00:00 cosmic-toplevel.log
+-rw-r--r-- 1 root root   40 Jan  1 00:00 desktop-entries.log
+-rw-r--r-- 1 root root  221 Jan  1 00:00 pop-launcher.log
+00:00:05  INFO starting cosmic-toplevel
+00:00:45  INFO starting desktop-entries
+00:00:05  INFO starting pop-launcher
+00:00:05  INFO found plugin "/usr/lib/pop-launcher/plugins/cosmic_toplevel/cosmic-toplevel"
+00:00:05  INFO found plugin "/usr/lib/pop-launcher/plugins/desktop_entries/desktop-entries"
+1970-01-01T00:00:45.109999Z  INFO cosmic-launcher (com.system76.CosmicLauncher)
+1970-01-01T00:00:45.110882Z  INFO Version: 1.0.12 (release)
+1970-01-01T00:00:45.244346Z  INFO Successfully activated another instance
+1970-01-01T00:00:45.244562Z  INFO Another instance is running
+=== done 22:30:02 ===

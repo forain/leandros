@@ -1630,7 +1630,13 @@ though on aarch64 a hand-started `cosmic-workspaces` is photographed drawing a r
 `pop-launcher` by bare name via `PATH`, a binary that is neither built nor staged; its
 `ERROR pop-launcher failed to start` line is now *positive* evidence that the launcher
 itself is running, since a component still blocked in the probe never reaches its
-backend. That is item 8's remaining half, not this one's.
+backend. That is item 8's remaining half, not this one's. **DONE 2026-09-15:**
+`pop-launcher` is built (upstream `a332a3a`, the revision cosmic-launcher's Cargo.lock
+pins, unmodified) and staged as `/usr/bin/pop-launcher` plus the `desktop_entries` and
+`cosmic_toplevel` plugins under `/usr/lib/pop-launcher/plugins/` — hardlinks to the one
+multicall binary. `cosmic-launcher input term` from the console hands the query to the
+running instance over D-Bus and the launcher lists **COSMIC Terminal** (photographed, both
+arches). `ports/pop-launcher/README.md` has the recipe and the plugin decisions.
 
 **A staging gap worth knowing about.** `scripts/mkfs-f2fs-populated.py` stages the guest
 half of the census harness from `~/code/leandros-artifacts/m6-session-data/`, but the file
