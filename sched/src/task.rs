@@ -420,6 +420,15 @@ pub struct Task {
     /// Leader only: the group was resumed by SIGCONT and no waiter has yet
     /// collected the `WIFCONTINUED` / `CLD_CONTINUED` report.
     pub cont_pending: bool,
+
+    // ── Thread-group teardown ─────────────────────────────────────────────────
+    /// Leader only: pid of the thread running `exit_group`'s kill loop for
+    /// this group, or 0 while the group is alive. Exactly one thread may run
+    /// that loop — two threads each marking the other Zombie and each
+    /// spinning for the other to leave its CPU is a deadlock with IRQs off
+    /// (see `sched::claim_group_exit`). A leader that is gone means the same
+    /// thing as a foreign owner: the group is dying, just exit.
+    pub group_exit_owner: Pid,
 }
 
 impl Task {
@@ -520,6 +529,7 @@ impl Task {
             stop_signal: 0,
             stop_reported: false,
             cont_pending: false,
+            group_exit_owner: 0,
         };
         temp_task.cwd[0] = b'/';
 
@@ -820,6 +830,8 @@ impl Task {
         core::ptr::write_volatile(stop_reported_ptr, false);
         let cont_pending_ptr = (dest as usize + core::mem::offset_of!(Task, cont_pending)) as *mut bool;
         core::ptr::write_volatile(cont_pending_ptr, false);
+        let group_exit_owner_ptr = (dest as usize + core::mem::offset_of!(Task, group_exit_owner)) as *mut Pid;
+        core::ptr::write_volatile(group_exit_owner_ptr, 0);
 
         let msg2 = b"Task::new_kernel_inplace: completed\r\n";
         for &b in msg2 { arch_serial_putc(b); }
@@ -893,6 +905,7 @@ impl Task {
             stop_signal: 0,
             stop_reported: false,
             cont_pending: false,
+            group_exit_owner: 0,
         };
         task.cwd[0] = b'/';
 

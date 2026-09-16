@@ -1283,6 +1283,13 @@ def main():
     if os.path.exists(p):
         bin_files.append(("spawnwedge", p, 0o100755))
 
+    # killmt: kill -9 of a multithreaded process must reap every thread and
+    # wedge no CPU. A std/musl crate with its own build.sh (userland/killmt),
+    # staged like spawnwedge. Run as .
+    p = f"userland/killmt/target/{_musl_triple}/release/killmt"
+    if os.path.exists(p):
+        bin_files.append(("killmt", p, 0o100755))
+
     # disktester loads its provisioning strategy from a path RELATIVE to the
     # working directory — load_provisioning("crates/provisioning/tests/
     # use_whole_disk.kdl") in its main.rs — so the file has to be reachable

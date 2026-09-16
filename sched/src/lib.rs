@@ -482,6 +482,18 @@ pub fn unquiesce_thread_group() {
     QUIESCE_TGID.store(0, Ordering::Release);
 }
 
+/// A task being reaped while it owns the fork quiesce (it was killed by a
+/// sibling's `exit_group` in the middle of its own fork) must release it,
+/// or no process on the machine ever forks again — the CAS in
+/// `quiesce_thread_group` would spin on a slot whose owner no longer exists.
+fn release_quiesce_if_owner(tgid: Pid, pid: Pid) {
+    if QUIESCE_TGID.load(Ordering::Acquire) == tgid
+        && QUIESCE_EXCEPT.load(Ordering::Acquire) == pid
+    {
+        unquiesce_thread_group();
+    }
+}
+
 pub fn alloc_pid() -> Pid {
     let mut pid_guard = NEXT_PID.lock();
     let pid = *pid_guard;
@@ -2219,8 +2231,18 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
     loop {
         {
             let mut rq = RUN_QUEUE.lock();
-            let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => { lockwatch::note_wait(0); return None; } };
-            let leader = match rq.find_pid_mut(tgid) { Some(l) => l, None => { lockwatch::note_wait(0); return None; } };
+            // Every thread of a group holds the same `Arc` (see clone_thread),
+            // so a thread's own reference is preferred: it stays valid
+            // while the group is being torn down and the leader's slot may
+            // already be gone. The leader lookup covers tasks created before
+            // that (the leader itself, kernel-spawned tasks) and is the same
+            // object anyway.
+            let (tgid, own) = match rq.find_pid(pid) {
+                Some(t) => (t.tgid, t.address_space.is_some()),
+                None => { lockwatch::note_wait(0); return None; }
+            };
+            let holder = if own { rq.find_pid_mut(pid) } else { rq.find_pid_mut(tgid) };
+            let leader = match holder { Some(l) => l, None => { lockwatch::note_wait(0); return None; } };
             let as_ = match leader.address_space.as_ref() { Some(a) => a, None => { lockwatch::note_wait(0); return None; } };
             if as_
                 .busy
@@ -2272,6 +2294,20 @@ pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
     let as_ptr = match lock_leader_address_space(pid) {
         Some(p) => p,
         None => {
+            // A thread that `exit_group` has already marked Zombie (its
+            // reschedule IPI is in flight) must not be told to die again —
+            // that would enter the group kill a second time and spin for
+            // the first killer to leave its CPU while the first killer
+            // spins for this one: the CPU wedge behind `[PF] no address
+            // space for faulting task` + `[WDOG]`. Yield instead: the
+            // scheduler's post-dispatch check reaps a Zombie the moment it
+            // is off the CPU, so this never returns.
+            let dying = RUN_QUEUE.lock().find_pid(pid)
+                .map_or(false, |t| t.state == TaskState::Zombie);
+            if dying {
+                yield_now("page fault on a dying thread");
+                loop { core::hint::spin_loop(); }
+            }
             print_str("[PF] no address space for faulting task\n");
             return false;
         }
@@ -2752,6 +2788,8 @@ fn scheduler_run_loop() -> ! {
                     // log_exit() makes waitpid return ECHILD.
                     let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
                     log_exit(zpid, status, parent_tgid, pgid, is_proc, reported);
+                    let ztgid = rq.get(idx).map(|t| t.tgid).unwrap_or(zpid);
+                    release_quiesce_if_owner(ztgid, zpid);
                     rq.remove(idx)
                 } else {
                     None
@@ -2813,14 +2851,99 @@ fn run_exit_teardown(pid: Pid) {
 /// [`kill_next_group_member`]: every sibling must have actually *stopped*
 /// before the leader's shared `AddressSpace` may be dropped.
 pub fn exit_group(code: i32) -> ! {
+    let pid = current_pid();
+    let (tgid, ppid, uid) = match claim_group_exit(pid) {
+        GroupExitClaim::Owner { tgid, ppid, uid } => (tgid, ppid, uid),
+        GroupExitClaim::AlreadyDying => exit_dying_thread(code),
+    };
+    run_group_kill(code);
+    if pid != tgid {
+        // The leader died on some other CPU (or was reaped off-CPU above)
+        // without ever running its own `exit`, and the fd table, sockets,
+        // epoll instances, VT and evdev grabs are all keyed by *its* pid:
+        // release them here, from a task context, or a `kill -9` of a
+        // threaded compositor leaves the DRM master fd open forever.
+        // Re-running this for a pid whose table is already empty is a no-op.
+        run_exit_teardown(tgid);
+        // Likewise the parent's SIGCHLD, which only `exit` on the leader
+        // itself would have sent.
+        if ppid != 0 {
+            let term_signal = RUN_QUEUE.lock().find_pid(pid).map(|t| t.term_signal).unwrap_or(0);
+            let status = ExitStatus { code, term_signal };
+            let _ = deliver_signal_process(tgid_of(ppid), 17, SigInfo::child(tgid, uid, status));
+        }
+    }
+    exit(code)
+}
+
+/// Result of [`claim_group_exit`].
+enum GroupExitClaim {
+    /// The caller runs the kill loop. `ppid`/`uid` are the leader's, captured
+    /// while its slot still exists so a non-leader owner can send SIGCHLD.
+    Owner { tgid: Pid, ppid: Pid, uid: u32 },
+    /// Another thread is already tearing the group down (or the leader is
+    /// already gone). The caller must not run the kill loop.
+    AlreadyDying,
+}
+
+/// Make the calling thread the one and only thread that runs the group kill
+/// loop for its thread group.
+///
+/// Why one: a thread that finds itself in `exit_group` while a sibling is
+/// already running the loop — because that sibling marked it Zombie and its
+/// page tables are on the way out, so it faulted; or because two threads
+/// took fatal signals at once — would mark the sibling Zombie in turn and
+/// spin (IRQs masked) for it to leave its CPU, while the sibling spins for
+/// it. Each CPU takes no timer tick from then on; that is the `[WDOG]` wedge
+/// behind `kill -9` of a multithreaded process. The second thread must
+/// instead just stop, and let the owner's loop find it gone.
+fn claim_group_exit(pid: Pid) -> GroupExitClaim {
+    let mut rq = RUN_QUEUE.lock();
+    let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return GroupExitClaim::AlreadyDying };
+    let leader = match rq.find_pid_mut(tgid) { Some(l) => l, None => return GroupExitClaim::AlreadyDying };
+    if leader.group_exit_owner != 0 && leader.group_exit_owner != pid {
+        return GroupExitClaim::AlreadyDying;
+    }
+    leader.group_exit_owner = pid;
+    let (ppid, uid) = (leader.ppid, leader.uid);
+    // A stop request from a sibling must not park the owner mid-teardown.
+    if let Some(me) = rq.find_pid_mut(pid) { me.stop_pending = false; }
+    GroupExitClaim::Owner { tgid, ppid, uid }
+}
+
+/// Reap every other member of the calling thread's group (see
+/// [`kill_next_group_member`]). Waiting for a member that is mid-flight on
+/// another CPU keeps an IRQ window open: the kick is a reschedule IPI, and
+/// the other CPU may in turn be waiting on *this* CPU for a TLB-shootdown
+/// acknowledgement — a bare IRQ-off spin here would deadlock the pair.
+fn run_group_kill(code: i32) {
     loop {
         match kill_next_group_member(code) {
             GroupKillStep::Done        => break,
             GroupKillStep::Reaped(pid) => run_exit_teardown(pid),
-            GroupKillStep::Kicking     => core::hint::spin_loop(),
+            GroupKillStep::Kicking     => { irq_window(); core::hint::spin_loop(); }
         }
     }
-    exit(code)
+}
+
+/// Terminate the calling thread because its group is already being torn
+/// down by another thread (see [`claim_group_exit`]). Marks the thread a
+/// Zombie and leaves the CPU; the scheduler's post-dispatch check reaps it,
+/// and the owner's loop then finds it gone. No fd teardown, no
+/// `clear_child_tid`, no SIGCHLD: those are process-level and the owner
+/// does them exactly once.
+fn exit_dying_thread(code: i32) -> ! {
+    let pid = current_pid();
+    {
+        let mut rq = RUN_QUEUE.lock();
+        if let Some(t) = rq.find_pid_mut(pid) {
+            if t.state != TaskState::Zombie { t.exit_code = code; }
+            t.state = TaskState::Zombie;
+            t.vfork_pending = false;
+        }
+    }
+    yield_now("exit: group already dying");
+    loop { core::hint::spin_loop(); }
 }
 
 /// Terminate the whole thread group *because of a fatal signal*, recording
@@ -2878,17 +3001,19 @@ pub fn exit_group_signal(signo: u32) -> ! {
 /// the leader's pid — here it simply becomes its own single-thread group, which
 /// is sufficient because the old leader has just been reaped above).
 pub fn dethread_current_group() {
-    loop {
-        match kill_next_group_member(0) {
-            GroupKillStep::Done        => break,
-            GroupKillStep::Reaped(pid) => run_exit_teardown(pid),
-            GroupKillStep::Kicking     => core::hint::spin_loop(),
-        }
-    }
     let pid = current_pid();
+    // An execve racing a fatal signal on a sibling: the process is dying,
+    // so the exec never happens — this thread dies with the rest.
+    if let GroupExitClaim::AlreadyDying = claim_group_exit(pid) {
+        exit_dying_thread(0);
+    }
+    run_group_kill(0);
     let mut rq = RUN_QUEUE.lock();
     if let Some(t) = rq.find_pid_mut(pid) {
         t.tgid = pid;
+        // The caller lives on as a single-thread group: its own slot is the
+        // leader's now, and it is not exiting.
+        t.group_exit_owner = 0;
     }
 }
 
@@ -2994,18 +3119,22 @@ pub enum GroupKillStep {
 /// caller. Before this existed, `EXIT_GROUP` only called [`exit`] for the
 /// calling task, so e.g. a Rust `std::thread` worker that outlived `main()`
 /// (a common pattern — `bottom`'s data-collection threads do exactly this)
-/// kept running after the thread-group leader was reaped. The leader owns
-/// the shared `AddressSpace` (see `Task::address_space`); reaping it drops
-/// the page tables out from under any sibling still mid-execution on
-/// another CPU, which then takes an instruction-fetch page fault that
-/// `handle_page_fault` can't service — its `tgid` lookup fails because the
-/// leader is already gone (`lock_leader_address_space` returns `None`,
-/// logged as "no address space for faulting task").
+/// kept running after the thread-group leader was reaped.
 ///
-/// Call this in a loop (see `EXIT_GROUP` in `kernel/src/syscall.rs`) until
-/// it returns `Done`, *then* call `exit` for the caller — that ordering
-/// guarantees every sibling has actually stopped running (not merely been
-/// asked to) before the leader's `AddressSpace` can be dropped.
+/// Every thread holds a reference to the shared `AddressSpace` (see
+/// `Task::address_space` and `clone_thread`), so a sibling that is still
+/// mid-execution on another CPU keeps its page tables alive until its own
+/// CPU has reaped it. That was not always so: only the leader used to hold
+/// one, and a kill loop run by a non-leader thread — whichever thread the
+/// fatal signal landed on — reaped the leader while siblings still ran on
+/// its tables. Their next TLB miss was "no address space for faulting
+/// task", each entered its own kill loop, and the loops waited on each
+/// other with IRQs off (`[WDOG]` on every CPU involved).
+///
+/// Only the group's designated owner may call this (see `claim_group_exit`
+/// / [`exit_group`]), in a loop until it returns `Done`, *then* `exit` for
+/// the caller — that ordering guarantees every sibling has actually stopped
+/// running (not merely been asked to) before the last reference drops.
 pub fn kill_next_group_member(exit_code: i32) -> GroupKillStep {
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
@@ -3055,6 +3184,7 @@ pub fn kill_next_group_member(exit_code: i32) -> GroupKillStep {
     let parent_tgid = rq.find_pid(tppid).map(|p| p.tgid).unwrap_or(tppid);
     log_exit(tpid, ExitStatus { code: exit_code, term_signal: t_term_signal },
              parent_tgid, tpgid, t_is_proc, t_reported);
+    release_quiesce_if_owner(tgid, tpid);
     let reaped = rq.remove(idx);
     drop(rq);
 
@@ -3187,8 +3317,10 @@ pub fn with_task_address_space<F, R>(pid: Pid, f: F) -> Option<R>
 where F: FnOnce() -> R {
     let rq = RUN_QUEUE.lock();
     let t = rq.find_pid(pid)?;
-    let leader = rq.find_pid(t.tgid)?;
-    let pt_root = leader.address_space.as_ref()?.root();
+    let pt_root = match t.address_space.as_ref() {
+        Some(a) => a.root(),
+        None => rq.find_pid(t.tgid)?.address_space.as_ref()?.root(),
+    };
     drop(rq);
 
     extern "C" {

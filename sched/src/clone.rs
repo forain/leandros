@@ -507,11 +507,9 @@ pub fn clone_thread(
                     let (hs, he) = leader.address_space.as_ref()
                         .map(|a| (a.heap_start, a.heap_end))
                         .unwrap_or((0, 0));
-                    // Cheap Arc clone (refcount bump) — handed to non-
-                    // CLONE_THREAD (vfork-style) children below. Real
-                    // CLONE_THREAD siblings don't need it: they share the
-                    // leader's tgid, so lock_leader_address_space's tgid
-                    // lookup already resolves to it.
+                    // Cheap Arc clone (refcount bump) — handed to every
+                    // child below, CLONE_THREAD siblings included (see the
+                    // note at the assignment).
                     (t.page_table, t.tgid, t.pgid, t.sid,
                      t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, hs, he, cp, pp, (t.cwd.clone(), t.cwd_len),
                      leader.address_space.clone(), t.priority, t.umask, (t.root.clone(), t.root_len),
@@ -547,18 +545,27 @@ pub fn clone_thread(
         child.tls_base   = child_tls;
         child.ppid       = parent_pid;
         child.tgid       = if flags & CLONE_THREAD != 0 { parent_tgid } else { child_pid };
+        // Every child aliases the same Arc — not a copy: the whole point of
+        // CLONE_VM is that parent and child share one address space until
+        // the child execve()s or exits.
+        //
         // Vfork-style children (CLONE_VM without CLONE_THREAD — musl/std's
         // Command::spawn fast path) get their own tgid above, so they can't
-        // ride the leader's tgid lookup the way real CLONE_THREAD siblings
-        // do (see lock_leader_address_space). Without this, any real page
-        // fault the child takes (not just the deliberate exec-failure
-        // poison fault) hits "no address space for faulting task" and gets
-        // killed. Aliasing the same Arc — not a copy — is required: the
-        // whole point of CLONE_VM is that parent and child share one
-        // address space until the child execve()s or exits.
-        if flags & CLONE_THREAD == 0 {
-            child.address_space = leader_as;
-        }
+        // ride the leader's tgid lookup (see lock_leader_address_space);
+        // without their own reference any real page fault the child takes
+        // hit "no address space for faulting task" and killed it.
+        //
+        // CLONE_THREAD siblings hold a reference too, and that is what keeps
+        // `kill -9` of a threaded process from tearing the page tables out
+        // from under a thread still executing on another CPU. Only the
+        // leader used to own the space; a non-leader thread running the
+        // group kill (`exit_group` from whichever thread the signal landed
+        // on) could reap the leader while it, and other siblings, were still
+        // running on those tables — a freed root under a live CPU. The
+        // space is now freed when the *last* thread's Task drops, which the
+        // scheduler only does once that thread is off its CPU and the CPU
+        // has switched back to the kernel page table.
+        child.address_space = leader_as;
         child.pgid       = pgid;
         child.sid        = sid;
         child.uid        = uid;  child.gid  = gid;

@@ -1,0 +1,61 @@
+2026-09-16 lane "killmt" — kill -9 of a multithreaded process wedged CPUs. FIXED, both arches.
+
+Reproduced on x86_64/KVM (linux desktop) with userland/killmt, mode worker_parked, in
+under 30 iterations on the unfixed kernel (repro-x86_64-kvm-unfixed-serial.txt):
+  [PF] no address space for faulting task  (x2, interleaved from two CPUs)
+  user page fault RIP=... CR2=... : task killed  (x2)
+  [WDOG] cpu0/cpu1/cpu2 took no timer tick for ~2 s .. ~82 s: pid=230/231/232 (/bin/killmt)
+         "not in a syscall" / "last syscall 0xE6", "holds RUN_QUEUE"
+Same signature as iced2's cosmic-launcher wedge on aarch64/HVF.
+
+Root cause (sched/src/lib.rs, sched/src/clone.rs):
+  1. Only the thread-group LEADER held the Arc<AddressSpace>; CLONE_THREAD siblings had
+     None and resolved it through tgid. exit_group's kill loop marks members Zombie in
+     slot order and the leader, when on another CPU, is reaped by that CPU's post-dispatch
+     check as soon as the resched IPI lands — dropping the address space while the other
+     siblings are still executing user code on those page tables (kill loop run by a
+     non-leader thread: the thread SIGKILL was delivered to, preferring a Blocked one).
+  2. The orphaned siblings then fault ("no address space"), each calls
+     exit_group_signal(SIGSEGV), each marks the others Zombie and spins (IRQs masked) for
+     them to leave their CPUs — a cycle. Nothing bounded the number of concurrent kill
+     loops per group.
+  3. x86_64 only: timer_irq/resched_irq were bare `extern "x86-interrupt"` handlers with no
+     check_and_deliver_signals on return to ring 3, so a thread spinning in user mode with
+     no syscalls could not be killed at all (killmt spin_all: child never reaped).
+     aarch64's exc_el1_irq path always delivered.
+
+Fix:
+  - every CLONE_THREAD child aliases the leader's Arc<AddressSpace>; the space is freed when
+    the LAST thread's Task drops, which the scheduler does only after that CPU switched
+    back to the kernel page table. lock_leader_address_space / with_task_address_space
+    prefer the task's own reference.
+  - single owner per group teardown: claim_group_exit (Task::group_exit_owner on the
+    leader); a second thread entering exit_group (fault, concurrent signal, execve race)
+    just marks itself Zombie and yields (exit_dying_thread). The owner's Kicking spin opens
+    an IRQ window (TLB-shootdown acks). A Zombie thread that page-faults yields instead of
+    re-entering the kill path. The EXIT_GROUP syscall arm now routes through
+    sched::exit_group (it had an inline copy of the loop outside the owner protocol).
+  - a non-leader owner runs the process-level fd/socket/epoll/VT/evdev teardown for the
+    leader's pid (it never ran when the leader died on another CPU — fd table leak, likely
+    the "kill -9 of a compositor poisons the next one" DRM-master symptom) and sends the
+    parent's SIGCHLD.
+  - a reaped task that owned the fork quiesce releases it (release_quiesce_if_owner).
+  - x86_64: vectors 32 and 0x40 enter through full-UserFrame stubs (fault_stub! shape) and
+    deliver pending signals on return to ring 3.
+
+Verification:
+  x86_64/KVM: killmt 100/100 in all 8 modes; sigtest2 9/9, sigchldtest, waittest,
+    racetest, smpwaketest 9/9, spawnwedge 4 16 200: green. COSMIC desktop started from a
+    root serial shell (text-login marker + kill of the greetd chain): kill -9 cosmic-launcher
+    -> respawned by cosmic-session; kill -9 cosmic-panel -> panel+notifications respawned,
+    dock and clock back (desk-before/after screenshots in tmp-killmt). No [PF]/[WDOG].
+  aarch64/TCG: killmt 20/20 in all 8 modes; sigtest2, sigchldtest, racetest, smpwaketest
+    9/9, spawnwedge 3/3 green. waittest/wait_on_process_group flips PASS/FAIL between runs
+    = the documented pre-existing flake (memory: project_sigkill_thread_exit).
+
+Open:
+  - execve from a NON-leader thread leaves the fd table keyed by the old leader's pid
+    (dethread promotes tgid=pid) — pre-existing, not touched.
+  - kill_next_group_member still reaps an off-CPU sibling that is Blocked mid-syscall by
+    freeing its kernel stack in place (pre-existing design since 8b1f76a).
+  - waittest/wait_on_process_group flake (pre-existing).

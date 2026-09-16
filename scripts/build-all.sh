@@ -413,6 +413,20 @@ build_spawnwedge() {
     "$ROOT_DIR/userland/spawnwedge/build.sh" "$arch"
 }
 
+# Function to build killmt — kill -9 of a multithreaded process (userland/
+# killmt). Same shape as spawnwedge: a std/musl crate with its own build.sh,
+# because it needs musl's pthreads, fork() and waitpid(). In-tree Rust, so a
+# failure is fatal.
+build_killmt() {
+    local arch="$1"
+    echo "🔪 Building $arch killmt..."
+    if [[ ! -x "$ROOT_DIR/userland/killmt/build.sh" ]]; then
+        echo "⚠️  userland/killmt not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/killmt/build.sh" "$arch"
+}
+
 # Function to build mkfs.xfs — the XFS v5 formatter for the root partition.
 # Same shape as build_mkfs_fat; its build.sh takes one arch (or "all") and
 # installs the binary, which cargo builds as mkfs_xfs because a target name
@@ -557,6 +571,7 @@ for arch in "${ARCHS[@]}"; do
     build_mkfs_fat "$arch"
     build_mkfs_xfs "$arch"
     build_spawnwedge "$arch"
+    build_killmt "$arch"
     build_disktester "$arch"
     stage_dbus_session "$arch"
     create_initrd "$arch"
