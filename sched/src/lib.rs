@@ -2337,6 +2337,7 @@ pub fn dump_tasks() {
             TaskState::Running => " Running",
             TaskState::Blocked => " Blocked",
             TaskState::Zombie => " Zombie",
+            TaskState::Stopped => " Stopped",
         });
         if let Some(c) = t.on_cpu { print_str(" cpu="); pn(c as u32); }
         if let Some(port) = t.blocked_on {
