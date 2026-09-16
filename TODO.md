@@ -1121,7 +1121,7 @@ from this list's contents outlived the list.
 |---|---|---|---|
 | 6 | Input reaches clients **losslessly**; the "starvation" was the harness | Bug — **CLOSED** `af9f076` | 100% at 60 moves/s; a parked serial reader wedged the tick |
 | 7 | libcosmic apps **block in a D-Bus probe**; they render fine | Bug — **FIXED** `85f2f4c`+`daa2815` | busd answers `ServiceUnknown`; 4 parked components alive, both arches |
-| 8 | ~~Nothing to launch, and no way to ask for it~~ — a terminal ships and runs | Feature — config + terminal **DONE**; keybindings residual **OPEN** | `Super+F9` control still fails, and its attribution died with item 6 |
+| 8 | ~~Nothing to launch, and no way to ask for it~~ — a terminal ships, runs, and answers keybindings | Feature — config + terminal + keybindings **DONE** | `Super+F9`→Spawn fired ×5 and `Super+T` raised cosmic-term; the residual was a kernel `clone()`/`CLONE_PARENT_SETTID` deadlock, fixed `8897e02` (test `spawnwedge`) |
 | 9 | **5 real applets now ship and run; tiling paints, minimize is a design no-op** | Feature — panel-death **FIXED**; rendering **FIXED** | tiling icon paints after `0f56aab`+`cdd613e` (fork_dup dropped UnixPendingAccept fds; f2fs MAX_OPEN_FILES 32→256); clock ticks after `4085b7f` (nested epoll fd read as POLLNVAL readiness); minimize is a 1×1 hidden surface with zero toplevels by upstream design, not a bug |
 | 10 | **busd has no D-Bus activation**, so no portal, no screenshot, no file chooser | Feature — structural | `<servicedir>` deliberately omitted |
 | 15 | ~~386 KB of extra `.data` stopped the Linux box booting~~ — it was a **kernel stack overflow** | Bug — **CLOSED** | Not image size and not host-specific: a 155,880 B frame on a 64 KiB stack. Stacks now 128 KiB, frames gated at build time, canary on syscall return |
@@ -1717,11 +1717,14 @@ nothing to miss and produced no failure anywhere.**
 0**; `Panel Entry Error: NoConfigDirectory` **1 → 0**. The four panel errors that remain are a
 *different class* — `GetKey("padding_overlap")`, `GetKey("keep_style_on_maximize")` — because
 upstream ships 22 keys for a 24-field struct, so they appear on a correct install too.
-**Keybindings still do not fire, and that residual is cleanly attributed rather than guessed.**
-The lane built a **control**: `Super+F9` bound in the *user* config to `touch /tmp/kb-f9`,
-which needs **nothing** from `/usr/share/cosmic`. It fails too. So the remaining failure is
-**item 6**, not the staging — and that control is what makes this a completed fix with a known
-blocker downstream rather than an inconclusive one.
+**Keybindings fire — the residual was a kernel `clone()` bug, now fixed (`8897e02`).** The
+`Super+F9` → `Spawn("touch /tmp/kb-f9")` control created `/tmp/kb-f9` on all 5 injections, and
+`Super+T` opened `cosmic-term`, on both arches. What had actually failed was not input, xkb or
+config: the bound action ran, spawned its command, and cosmic-comp then deadlocked. musl
+`fork()` from a spawned thread ABBA-deadlocked on `__malloc_lock`/`__thread_list_lock` because
+the kernel ignored `CLONE_PARENT_SETTID`, so `pthread_create` never saw a non-main thread's tid
+(every such thread ran with `pthread_self()->tid == 0`), and `__tl_lock`'s recursion count
+drifted until the lock was held by the main thread forever. Honouring the ptid store closes it.
 
 **And there is now something to run.** `cosmic-term` ships: built from `../cosmic-epoch` at
 `epoch-1.3.0` (`44d042f`) with `--no-default-features --features wayland,wgpu`, first attempt,
@@ -1732,12 +1735,17 @@ launcher over a non-empty index. `cosmic-files`, `cosmic-edit` and `cosmic-store
 unbuilt. What it cost was the PTY subsystem, not the build — see the header, and the contract
 it enforces under *Standing context*.
 
-**What survives of this item is the keybindings residual, and its attribution is now stale.**
-The `Super+F9` → `touch /tmp/kb-f9` control — which needs nothing from `/usr/share/cosmic` —
-still fails, and the recorded attribution was "the remaining failure is **item 6**". Item 6
-has since been closed, with delivery to a client shown lossless. **So the residual is
-currently unattributed rather than blocked**, and it must be re-measured against the evdev
-broadcast change before anything is inferred from it.
+**The keybindings residual is CLOSED.** It was never item 6 (input reaches clients losslessly)
+nor the config staging: the action fired and spawned, and cosmic-comp deadlocked in the child's
+`fork()` on the musl thread-list / malloc lock handoff, because `clone()` ignored
+`CLONE_PARENT_SETTID` and left every non-main thread's tid at 0 (`8897e02`; regression test
+`spawnwedge`, `c85bbed`). Verified end to end on aarch64/HVF — cold boot, `Super+F9` ×5 each
+spawning `/tmp/kb-f9`, then `Super+T` raising `cosmic-term`, the panel/clock/dock alive
+throughout — and `spawnwedge` PASSes both the fork and posix_spawn paths on x86_64/TCG too. One
+caveat worth recording: on a cold boot the compositor holds a wayland socket within ~6 s but
+does not composite to the display or process keybindings for ~10 min under HVF+softpipe (the
+item-7 D-Bus warmup, not this bug); injections before that land on a socket nobody is reading
+yet.
 
 ### 9. DONE: five real applets ship, run and paint (2026-08-09)
 

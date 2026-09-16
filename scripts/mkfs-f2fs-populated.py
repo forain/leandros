@@ -1275,6 +1275,14 @@ def main():
     if os.path.exists(p):
         bin_files.append(("disktester", p, 0o100755))
 
+    # spawnwedge: the musl thread/fork lock-handoff regression test (the
+    # cosmic-comp keybinding wedge). A std/musl crate with its own build.sh
+    # (userland/spawnwedge), not a workspace member, hence staged here rather
+    # than through `bins` above. Run as `spawnwedge`; PASS/FAIL per subtest.
+    p = f"userland/spawnwedge/target/{_musl_triple}/release/spawnwedge"
+    if os.path.exists(p):
+        bin_files.append(("spawnwedge", p, 0o100755))
+
     # disktester loads its provisioning strategy from a path RELATIVE to the
     # working directory — load_provisioning("crates/provisioning/tests/
     # use_whole_disk.kdl") in its main.rs — so the file has to be reachable
