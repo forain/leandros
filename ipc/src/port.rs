@@ -11,6 +11,7 @@
 //! | `MAX_PORTS`   | 65536 | Maximum number of simultaneously open ports.  |
 //! | `QUEUE_DEPTH` | 16    | Per-port message queue capacity.               |
 
+#[cfg(not(feature = "kernel"))]
 use spin::Mutex;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use super::message::Message;
@@ -255,6 +256,10 @@ fn note_high_water(live: usize, owner_pid: u32) {
     port_serial_debug("\n");
 }
 
+#[cfg(feature = "kernel")]
+static PORT_TABLE: sched::lockwatch::TrackedMutex<PortTable> =
+    sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_PORT_TABLE, PortTable::new());
+#[cfg(not(feature = "kernel"))]
 static PORT_TABLE: Mutex<PortTable> = Mutex::new(PortTable::new());
 
 extern "C" { fn arch_serial_putc(c: u8); }

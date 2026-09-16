@@ -304,3 +304,8 @@ pub unsafe fn serial_has_data() -> bool {
     asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
     lsr & 0x01 != 0
 }
+
+/// Scheduler hook, no-op here: the LAPIC timer runs in periodic mode, so a
+/// single lost interrupt cannot silence it the way a one-shot reload can.
+#[no_mangle]
+pub extern "C" fn arch_timer_check_alive() -> bool { false }

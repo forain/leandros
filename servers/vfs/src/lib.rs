@@ -1285,8 +1285,8 @@ impl PipeRing {
     }
 }
 
-static PIPE_RINGS: Mutex<[PipeRing; MAX_PIPES]> =
-    Mutex::new([const { PipeRing::new() }; MAX_PIPES]);
+static PIPE_RINGS: sched::lockwatch::TrackedMutex<[PipeRing; MAX_PIPES]> =
+    sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_PIPE_RINGS, [const { PipeRing::new() }; MAX_PIPES]);
 
 /// Bump the reader/writer refcount for a pipe endpoint when an fd referring to
 /// it is duplicated (dup, dup2, fork inheritance). No-op for non-pipe fds.
@@ -1531,8 +1531,8 @@ impl ProcFdTable {
     }
 }
 
-static FD_TABLES: Mutex<[ProcFdTable; MAX_PROCS]> =
-    Mutex::new([const { ProcFdTable::empty() }; MAX_PROCS]);
+static FD_TABLES: sched::lockwatch::TrackedMutex<[ProcFdTable; MAX_PROCS]> =
+    sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_FD_TABLES, [const { ProcFdTable::empty() }; MAX_PROCS]);
 
 // ── Dynamic-device open identities ───────────────────────────────────────────
 //
