@@ -3258,6 +3258,9 @@ pub fn drm_tick() {
             crate::pci::serial_debug_hex_64(OUT_FENCES_N.load(Ordering::Relaxed) as u64);
             crate::pci::serial_debug(" now_us=");
             crate::pci::serial_debug_hex_64(crate::snd::monotonic_us());
+            crate::pci::serial_debug(" ctrlq_irqs=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_IRQS.load(Ordering::Relaxed));
             crate::pci::serial_debug("\n");
         }
     }

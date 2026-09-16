@@ -93,6 +93,10 @@ pub struct VirtioGpuDevice {
     features_hi: u32,
     /// The host-visible blob window, if the device exposed one.
     shmem: Option<SharedMemRegion>,
+    /// MSI-X: config-space offset of the capability and the mapped vector
+    /// table, when the device has one and this arch can take the interrupt.
+    /// `None` leaves completion to the tick poller alone.
+    msix: Option<(u8, *mut u32)>,
     /// Monotonically increasing fence id.  Never reused, never zero: the host
     /// treats fence_id 0 as "no fence" on some paths.
     next_fence_id: u64,
@@ -554,6 +558,31 @@ static FENCE_EVENT_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::A
 
 static CTRLQ_CORRUPT_WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// IDT vector the control queue's MSI-X message carries. Must match the entry
+/// `arch_x86_64::idt::init` installs for `virtio_gpu_msix_isr`. 0x40 is the
+/// reschedule IPI and 0xFD the TLB shootdown; 0x41 is free.
+pub const MSIX_VECTOR_CTRLQ: u8 = 0x41;
+/// MSI message address base (the LAPIC's), destination APIC id in bits 12..19.
+const MSI_ADDR_BASE: u32 = 0xFEE0_0000;
+/// The BSP. Physical destination mode, fixed delivery, edge — the data word
+/// carries only the vector.
+const MSIX_DEST_APIC_ID: u32 = 0;
+/// Set once `enable_msix` succeeded; the interrupt census below is only
+/// meaningful then.
+pub static CTRLQ_IRQ_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Control-queue interrupts taken.
+pub static CTRLQ_IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The control-queue MSI-X handler, entered from `arch_x86_64::idt` (vector
+/// `MSIX_VECTOR_CTRLQ`) after the LAPIC EOI. IRQ context: it is exactly the
+/// tick poller's body — try_lock the device, reap, pay the fence notification
+/// with try-wakes — and nothing else. No allocation, no blocking lock.
+#[no_mangle]
+pub extern "C" fn virtio_gpu_msix_isr() {
+    CTRLQ_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    ctrlq_tick();
+}
+
 /// Register the fence-event service (`fn() -> bool`). One hook; the last
 /// registration wins.
 pub fn set_fence_event_hook(f: fn() -> bool) {
@@ -644,11 +673,47 @@ impl VirtioGpuDevice {
         let mut device_cfg = core::ptr::null_mut();
         let mut _isr_cfg = core::ptr::null_mut();
         let mut shmem: Option<SharedMemRegion> = None;
+        let mut msix: Option<(u8, *mut u32)> = None;
 
         unsafe {
             let mut cap_ptr = pci_read_config_8(dev.bus, dev.dev, dev.func, 0x34);
             while cap_ptr != 0 {
                 let cap_id = pci_read_config_8(dev.bus, dev.dev, dev.func, cap_ptr);
+                if cap_id == 0x11 && cfg!(target_arch = "x86_64") {
+                    // MSI-X capability: Message Control @2 (table size - 1 in
+                    // the low 11 bits), Table Offset/BIR @4 (BIR in bits 0..2).
+                    // Map the vector table so `enable_msix` can program entry 0
+                    // for the control queue. Delivery is a LAPIC message, so no
+                    // IOAPIC routing or INTx pin swizzle is involved.
+                    let ctrl = pci_read_config_16(dev.bus, dev.dev, dev.func, cap_ptr + 2);
+                    let entries = (ctrl & 0x7FF) as usize + 1;
+                    let tbl = pci_read_config_32(dev.bus, dev.dev, dev.func, cap_ptr + 4);
+                    let bir = (tbl & 7) as usize;
+                    let toff = (tbl & !7) as usize;
+                    if bir < 6 && dev.bars[bir] & 1 == 0 {
+                        let raw = dev.bars[bir];
+                        let base: u64 = if (raw >> 1) & 3 == 2 && bir + 1 < 6 {
+                            ((raw & !0xF) as u64) | ((dev.bars[bir + 1] as u64) << 32)
+                        } else {
+                            (raw & !0xF) as u64
+                        };
+                        if base != 0 {
+                            let virt = mm::paging::map_kernel_device(
+                                base as usize + toff,
+                                entries * 16,
+                                mm::paging::PageFlags::PRESENT | mm::paging::PageFlags::WRITABLE | mm::paging::PageFlags::MMIO,
+                            ).unwrap_or_else(|| mm::phys_to_virt(base as usize + toff));
+                            crate::pci::serial_debug("[GPU] MSI-X table: entries=");
+                            crate::pci::serial_debug_hex(entries as u32);
+                            crate::pci::serial_debug(" bar=");
+                            crate::pci::serial_debug_hex(bir as u32);
+                            crate::pci::serial_debug(" off=");
+                            crate::pci::serial_debug_hex(toff as u32);
+                            crate::pci::serial_debug("\n");
+                            msix = Some((cap_ptr, virt as *mut u32));
+                        }
+                    }
+                }
                 if cap_id == 0x09 { // VIRTIO_PCI_CAP_VENDOR_CFG
                     let cfg_type = pci_read_config_8(dev.bus, dev.dev, dev.func, cap_ptr + 3);
                     let bar_idx = pci_read_config_8(dev.bus, dev.dev, dev.func, cap_ptr + 4);
@@ -748,6 +813,7 @@ impl VirtioGpuDevice {
             features: 0,
             features_hi: 0,
             shmem,
+            msix,
             next_fence_id: 1,
             fence_floor: 0,
             fences_ahead: Vec::new(),
@@ -884,12 +950,61 @@ impl VirtioGpuDevice {
             self.fences_ahead = alloc::vec![0u64; qsize.max(1)];
             self.deferred_free = Vec::with_capacity(qsize * 3 + 8);
 
+            // 6b. Control-queue completion interrupt (MSI-X vector 0), before
+            //     DRIVER_OK as the spec orders it. Failure leaves the poller.
+            self.enable_msix();
+
             // 7. Set DRIVER_OK status bit
             status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER_OK);
         }
         crate::pci::rdebug("[GPU] VirtIO GPU initialized\n");
     }
 
+    /// Route control-queue completions to a LAPIC interrupt through MSI-X.
+    ///
+    /// Entry 0 of the vector table is programmed for `MSIX_VECTOR_CTRLQ` on
+    /// APIC id 0 (the BSP under QEMU; the IDT is shared, so any CPU could take
+    /// it), the function is enabled masked, the control queue is bound to
+    /// vector 0 in `common_cfg` and the binding read back — the device answers
+    /// `NO_VECTOR` if it could not take it — and only then is the mask lifted.
+    /// The config-change vector stays unassigned. The handler is
+    /// `virtio_gpu_msix_isr`, reached from `arch_x86_64::idt` by symbol.
+    ///
+    /// The 100 Hz poller (`ctrlq_tick`) keeps running regardless: an
+    /// interrupt can be lost or unavailable (no MSI-X on the device, another
+    /// arch, a host that never delivers), and the poller costs one try_lock
+    /// per tick when nothing is in flight.
+    unsafe fn enable_msix(&mut self) {
+        let (cap, table) = match self.msix { Some(m) => m, None => return };
+        const NO_VECTOR: u16 = 0xFFFF;
+        let dev = &self._pci_dev;
+        // Entry 0, masked while it is being written.
+        table.add(3).write_volatile(1);
+        table.add(0).write_volatile(MSI_ADDR_BASE | (MSIX_DEST_APIC_ID << 12));
+        table.add(1).write_volatile(0);
+        table.add(2).write_volatile(MSIX_VECTOR_CTRLQ as u32);
+        // MSI-X Enable (bit 15) with Function Mask (bit 14) set.
+        let ctrl = pci_read_config_16(dev.bus, dev.dev, dev.func, cap + 2);
+        pci_write_config_16(dev.bus, dev.dev, dev.func, cap + 2, ctrl | 0xC000);
+        let cfg = self.common_cfg;
+        core::ptr::addr_of_mut!((*cfg).config_msix_vector).write_volatile(NO_VECTOR);
+        core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(0);
+        core::ptr::addr_of_mut!((*cfg).queue_msix_vector).write_volatile(0);
+        let got = core::ptr::addr_of!((*cfg).queue_msix_vector).read_volatile();
+        if got != 0 {
+            crate::pci::serial_debug("[GPU] MSI-X: device refused vector 0 for the control queue; polling only\n");
+            pci_write_config_16(dev.bus, dev.dev, dev.func, cap + 2, ctrl & !0x8000);
+            self.msix = None;
+            return;
+        }
+        // Lift the function mask and the entry mask.
+        pci_write_config_16(dev.bus, dev.dev, dev.func, cap + 2, (ctrl | 0x8000) & !0x4000);
+        table.add(3).write_volatile(0);
+        CTRLQ_IRQ_ARMED.store(true, core::sync::atomic::Ordering::Release);
+        crate::pci::serial_debug("[GPU] MSI-X armed: control queue -> vector ");
+        crate::pci::serial_debug_hex(MSIX_VECTOR_CTRLQ as u32);
+        crate::pci::serial_debug("\n");
+    }
 
     unsafe fn setup_queue(&mut self, id: u16) -> Option<VirtioQueue> {
         let cfg = self.common_cfg;

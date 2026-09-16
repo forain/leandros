@@ -88,6 +88,9 @@ pub fn init() {
         IDT.0[33] = IdtEntry::new(keyboard_irq as *const () as usize, 0x08, 0, 0x8E);
         // Vector 0x40 = reschedule IPI (cross-CPU preemption kick).
         IDT.0[0x40] = IdtEntry::new(resched_irq as *const () as usize, 0x08, 0, 0x8E);
+        // Vector 0x41 = virtio-gpu control-queue completion (MSI-X entry 0;
+        // `drivers::virtio_gpu::MSIX_VECTOR_CTRLQ`).
+        IDT.0[0x41] = IdtEntry::new(gpu_irq as *const () as usize, 0x08, 0, 0x8E);
         // Vector 0xFD = TLB shootdown IPI (remote TLB invalidation).
         IDT.0[0xFD] = IdtEntry::new(tlb_shootdown_irq as *const () as usize, 0x08, 0, 0x8E);
 
@@ -577,6 +580,31 @@ extern "x86-interrupt" fn keyboard_irq(frame: InterruptStackFrame) {
         unsafe { super::syscall::restore_user_gs(); }
     }
 }
+
+/// virtio-gpu control-queue completion — MSI-X vector 0x41.
+///
+/// EOI first, then the driver's reaper (`drivers::virtio_gpu::virtio_gpu_msix_isr`,
+/// reached by symbol the way `arch_serial_putc` is, since this crate cannot
+/// name `drivers`). The reaper only try-locks and never sleeps, so no
+/// reschedule happens here and the exit path is the keyboard handler's.
+#[cfg(target_arch = "x86_64")]
+extern "x86-interrupt" fn gpu_irq(frame: InterruptStackFrame) {
+    extern "C" { fn virtio_gpu_msix_isr(); }
+    let from_user = (frame.cs & 3) != 0;
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
+    }
+
+    super::apic::eoi();
+    unsafe { virtio_gpu_msix_isr(); }
+
+    if from_user {
+        unsafe { super::syscall::restore_user_gs(); }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+extern "C" fn gpu_irq(_frame: InterruptStackFrame) {}
 
 #[cfg(not(target_arch = "x86_64"))]
 extern "C" fn timer_irq(_frame: InterruptStackFrame) {
