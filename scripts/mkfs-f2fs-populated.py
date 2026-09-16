@@ -340,7 +340,7 @@ def main():
     bins = [
         "shell", "login", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "ptytest", "forktest", "racetest",
-        "waittest", "sigchldtest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
+        "waittest", "sigchldtest", "sigtest2", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe",
     ]
