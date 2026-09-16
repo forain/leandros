@@ -13,6 +13,81 @@ static TOTAL_PAGES: AtomicUsize = AtomicUsize::new(0);
 /// Current free page count (updated on alloc/free).
 static FREE_PAGES:  AtomicUsize = AtomicUsize::new(0);
 
+/// One past the highest physical address `init_from_map` handed to the
+/// allocator. Every block that is ever freed must lie below it.
+static PHYS_END: AtomicUsize = AtomicUsize::new(0);
+/// Number of `free()` calls the sanity checks refused (leaked instead of
+/// corrupting the lists). Shown by the Ctrl-T census.
+static BAD_FREES: AtomicUsize = AtomicUsize::new(0);
+pub fn bad_frees() -> usize { BAD_FREES.load(Ordering::Relaxed) }
+
+/// Sanity checks on every `free()` and on every link the allocator follows.
+/// Each is a handful of compares (plus one bitmap read for the double-free
+/// test), so they stay on in release builds; a refused free leaks the block
+/// and prints who asked, which is strictly better than the alternative — a
+/// corrupt intrusive list that faults in some later, unrelated `free()`.
+const CHECKS: bool = true;
+
+extern "C" { fn serial_write_byte_direct(b: u8); }
+fn dbg_str(s: &[u8]) { for &b in s { unsafe { serial_write_byte_direct(b); } } }
+fn dbg_hex(v: usize) {
+    const HEX: &[u8] = b"0123456789abcdef";
+    dbg_str(b"0x");
+    let mut started = false;
+    for i in (0..16).rev() {
+        let n = (v >> (i * 4)) & 0xF;
+        if n != 0 || started || i == 0 { dbg_str(&HEX[n..n + 1]); started = true; }
+    }
+}
+fn dbg_dec(mut v: usize) {
+    let mut buf = [0u8; 20]; let mut i = buf.len();
+    loop { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+    dbg_str(&buf[i..]);
+}
+
+/// Report a refused `free(addr, order)`; `why` names the failed check.
+#[cold]
+fn report_bad_free(addr: usize, order: usize, why: &[u8], loc: &core::panic::Location<'_>) {
+    BAD_FREES.fetch_add(1, Ordering::Relaxed);
+    dbg_str(b"[BUDDY] BAD FREE refused: addr="); dbg_hex(addr);
+    dbg_str(b" order="); dbg_dec(order);
+    dbg_str(b" ("); dbg_str(why); dbg_str(b") from ");
+    dbg_str(loc.file().as_bytes()); dbg_str(b":"); dbg_dec(loc.line() as usize);
+    dbg_str(b" phys_end="); dbg_hex(PHYS_END.load(Ordering::Relaxed));
+    dbg_str(b"\n");
+}
+
+/// Report a link (`next`/`prev`) that cannot be a free block's address, and
+/// halt: the list is already corrupt and every later step would fault
+/// somewhere less informative.
+#[cold]
+fn report_bad_link(node: usize, order: usize, what: &[u8], val: usize) -> ! {
+    dbg_str(b"[BUDDY] CORRUPT LINK: node="); dbg_hex(node);
+    dbg_str(b" order="); dbg_dec(order);
+    dbg_str(b" "); dbg_str(what); dbg_str(b"="); dbg_hex(val);
+    dbg_str(b" phys_end="); dbg_hex(PHYS_END.load(Ordering::Relaxed));
+    dbg_str(b" node[0..4]=");
+    unsafe {
+        let p = crate::phys_to_virt(node) as *const usize;
+        for i in 0..4 { dbg_hex(*p.add(i)); dbg_str(b" "); }
+    }
+    dbg_str(b"\n");
+    panic!("buddy free list corrupt");
+}
+
+/// A link is sane if it is the null sentinel or a page-aligned address
+/// inside the RAM the allocator was given.
+#[inline]
+fn link_ok(val: usize) -> bool {
+    val == 0 || (val & (PAGE_SIZE - 1) == 0 && val < PHYS_END.load(Ordering::Relaxed))
+}
+#[inline]
+fn check_links(node: usize, order: usize, next: usize, prev: usize) {
+    if !CHECKS { return; }
+    if !link_ok(next) { report_bad_link(node, order, b"next", next); }
+    if !link_ok(prev) { report_bad_link(node, order, b"prev", prev); }
+}
+
 /// Return total pages registered with the buddy allocator.
 pub fn total_pages() -> usize { TOTAL_PAGES.load(Ordering::Relaxed) }
 /// Return approximate number of free pages.
@@ -24,9 +99,10 @@ pub fn free_pages()  -> usize { FREE_PAGES.load(Ordering::Relaxed) }
 /// offset 0, `prev` pointer at byte offset 8 and its order at byte offset 16
 /// (accessed via the HHDM). This gives O(1) removal of an arbitrary node,
 /// which `free()` needs to unlink a buddy from the middle of its list when
-/// coalescing. `0` is never a valid block address (page 0 is always
-/// reserved by the boot memory map) so it doubles as the "no link" sentinel,
-/// matching the convention the allocator already used before coalescing.
+/// coalescing. `0` is never a valid block address (`init_from_map` keeps
+/// everything below `LOW_RESERVED_END` out of the pool) so it doubles as
+/// the "no link" sentinel, matching the convention the allocator already
+/// used before coalescing.
 struct FreeList {
     head: Option<usize>, // physical address of first free block
 }
@@ -95,6 +171,7 @@ fn unlink(lists: &mut [FreeList; MAX_ORDER], order: usize, addr: usize) {
     unsafe {
         let next = node_next(addr);
         let prev = node_prev(addr);
+        check_links(addr, order, next, prev);
         if prev != 0 {
             node_set_next(prev, next);
         } else {
@@ -124,6 +201,7 @@ fn try_remove(lists: &mut [FreeList; MAX_ORDER], order: usize, target: usize) ->
     let mut cur = lists[order].head;
     while let Some(addr) = cur {
         let next = unsafe { node_next(addr) };
+        check_links(addr, order, next, 0);
         if addr == target {
             unlink(lists, order, addr);
             return true;
@@ -165,16 +243,34 @@ fn overlaps_reserved(addr: usize, size: usize) -> bool {
     false
 }
 
+/// Physical memory below this is never handed to the allocator, whatever
+/// the memory map says about it.
+///
+/// Page 0 first: the free lists are intrusive and use address 0 as their
+/// "no link" sentinel (`push_front`, `unlink`), and `alloc` returning 0 reads
+/// as failure to half its callers. The x86-64 UEFI map from OVMF lists
+/// `[0, 0x87000)` as usable, so before this `init_from_map` put a 512 KiB
+/// block *at address 0* on the order-7 list: the block behind it became
+/// unreachable the first time anything was pushed in front of it (its `next`
+/// was written as 0 = end of list), its buddy-coalescing state went stale
+/// with it, and the frame the allocator did hand out as "0" was reported as
+/// an out-of-memory failure. The rest of the first MiB is the AP startup
+/// trampoline at 0x7000 (`arch/x86_64/src/smp.rs`), which the buddy must not
+/// hand out from under a SIPI, plus real-mode firmware structures. Linux
+/// reserves the same megabyte for the same reasons.
+const LOW_RESERVED_END: usize = 1 << 20;
+
 /// Initialise the buddy allocator from the boot memory map.
 pub fn init_from_map(regions: &[boot::MemoryRegion]) {
     for region in regions {
         if region.kind != boot::MemoryType::Available { continue; }
 
         // Use all available RAM. Limine marks kernel/modules as reserved.
-        let start = leandros_lib::align_up(region.base as usize, PAGE_SIZE);
+        let start = leandros_lib::align_up(region.base as usize, PAGE_SIZE).max(LOW_RESERVED_END);
         let end = leandros_lib::align_down((region.base + region.length) as usize, PAGE_SIZE);
 
         if start >= end { continue; }
+        if end > PHYS_END.load(Ordering::Relaxed) { PHYS_END.store(end, Ordering::Relaxed); }
 
         // Walk from start to end, releasing the largest aligned block each time.
         let mut addr = start;
@@ -213,6 +309,7 @@ pub fn alloc(order: usize) -> Option<usize> {
             // with no predecessor.
             unsafe {
                 let next_val = node_next(addr);
+                check_links(addr, o, next_val, 0);
                 if next_val != 0 {
                     node_set_prev(next_val, 0);
                     lists[o].head = Some(next_val);
@@ -233,11 +330,7 @@ pub fn alloc(order: usize) -> Option<usize> {
         }
     }
     
-    extern "C" { fn serial_write_byte_direct(b: u8); }
-    let msg = b"[BUDDY] Allocation failed! Out of memory.\n";
-    for &b in msg {
-        unsafe { serial_write_byte_direct(b); }
-    }
+    dbg_str(b"[BUDDY] Allocation failed! Out of memory.\n");
     None
 }
 
@@ -250,10 +343,26 @@ pub fn alloc(order: usize) -> Option<usize> {
 /// (preserved by both `init_from_map`'s alignment-constrained order pick and
 /// `alloc`'s splitting), so `addr ^ (PAGE_SIZE << order)` always yields the
 /// correct buddy address.
+#[track_caller]
 pub fn free(addr: usize, order: usize) {
-    if order >= MAX_ORDER { return; }
-    FREE_PAGES.fetch_add(1 << order, Ordering::Relaxed);
+    let loc = core::panic::Location::caller();
+    if order >= MAX_ORDER { report_bad_free(addr, order, b"order", loc); return; }
+    if CHECKS {
+        let size = PAGE_SIZE << order;
+        let end = PHYS_END.load(Ordering::Relaxed);
+        if addr == 0 { report_bad_free(addr, order, b"null", loc); return; }
+        if addr & (size - 1) != 0 { report_bad_free(addr, order, b"misaligned", loc); return; }
+        if end != 0 && addr.checked_add(size).map_or(true, |e| e > end) {
+            report_bad_free(addr, order, b"beyond RAM", loc); return;
+        }
+        if overlaps_reserved(addr, size) { report_bad_free(addr, order, b"reserved", loc); return; }
+    }
     let mut lists = FREE_LISTS.lock();
+    if CHECKS && covered(addr) && unsafe { head_bit(addr) } {
+        drop(lists);
+        report_bad_free(addr, order, b"double free", loc); return;
+    }
+    FREE_PAGES.fetch_add(1 << order, Ordering::Relaxed);
 
     let mut addr = addr;
     let mut order = order;
