@@ -178,6 +178,34 @@ cleared and starts nothing, so `pam-leandros` really is checking `/etc/shadow`.
 Guest RAM made no difference: the screen is byte-identical at `-m 2G` and
 `-m 4G`.
 
+## The login hand-off works (aarch64/HVF, 2026-09-16)
+
+greetd is the default login (`userland/init`, opt out with
+`/etc/leandros/text-login`). Boot → the greeter paints (~80 s after the login
+prompt under HVF) → `leandro`'s password typed through the emulated keyboard
+(HMP `sendkey`, one key per ~0.8 s; the field's dots lag the keys by 20 s or
+more, the keys are not lost) → greetd starts the uid-1000 session through
+`source_profile` → busd, cosmic-session, cosmic-comp → **the desktop paints**,
+panel and dock, within two minutes of Enter
+(`artifacts/iced2-lane/run4-aarch64-session-desktop-after-login.png`).
+
+What kept it from working was not the greeter, greetd, PAM or the GPU
+hand-over. The session compositor sat in `zbus::Connection::session()` with
+busd's Hello reply unread in its socket, because the kernel read
+`FUTEX_WAIT_BITSET`'s timespec — an absolute deadline, and what Rust std's
+`Condvar::wait_timeout`/`park_timeout` issue — as a relative interval, so every
+std timed wait lasted uptime plus the timeout. A compositor started a minute
+after boot never noticed; one started after a greeter login, three minutes in,
+stalled for minutes per backoff step. See TODO.md item 7 for the diagnosis and
+the Ctrl-T socket dump that pinned it. Kernel fix, no port change.
+
+Two things are known and harmless: the greeter's cosmic-comp logs
+`eglMakeCurrent … BadDisplay` / `Failed to convert between dmabuf and EGLImage`
+while exiting (kiosk exit after cosmic-greeter exits on `Success`), and
+`/var/log/greetd.log` carries a `tokio-rt-worker … Bad read on self-pipe:
+EBADF` panic right after `profile: session starting` — from a thread in the
+session's `sh -c` wrapper (brush), not from greetd, and the session proceeds.
+
 ### The greeter role, and what is still privileged
 
 cosmic-greeter has no flag and no environment variable for its role: it runs
