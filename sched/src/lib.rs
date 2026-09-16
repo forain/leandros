@@ -2184,6 +2184,11 @@ pub fn dump_tasks() {
                 let v = unsafe { (mm::phys_to_virt(phys) as *const u32).read_volatile() };
                 print_str("="); ph(v as usize);
             }
+            // A timed waiter's deadline, in ticks: with `tick=` at the top of
+            // the dump this shows a wait that will outlive its caller's
+            // intent (the FUTEX_WAIT_BITSET absolute/relative confusion made
+            // every std timed wait last uptime + timeout).
+            if t.poll_deadline != u64::MAX { print_str(" dl="); pn(t.poll_deadline as u32); }
         }
         if t.vfork_pending { print_str(" vfork_pending"); }
         // Where in userspace the task stopped: for a user task parked in a

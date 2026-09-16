@@ -396,6 +396,61 @@ unsafe fn test_xthread_futex_timed_wake() -> bool {
     report_x(name, el < PROMPT_MS, el, r as i32, WROTE_AT)
 }
 
+// ── 2c. FUTEX_WAIT_BITSET takes an ABSOLUTE deadline ───────────────────────
+//    Rust std's `futex_wait` (under every Condvar::wait_timeout /
+//    thread::park_timeout / mpsc::recv_timeout) and relibc's Pal::futex_wait
+//    both issue FUTEX_WAIT_BITSET with `now + timeout` on CLOCK_MONOTONIC, as
+//    Linux defines it. A kernel that reads that timespec as a RELATIVE interval
+//    sleeps for "uptime + timeout": invisible in the first seconds after boot,
+//    a multi-minute stall once the machine has been up a few minutes — which is
+//    exactly how the session compositor started by greetd after a greeter
+//    login sat in zbus's D-Bus handshake with its reply unread. Nobody wakes
+//    the word here, so the only way out is the deadline: it must fire at the
+//    deadline, not at deadline-plus-uptime.
+
+unsafe fn test_futex_bitset_abs_deadline() -> bool {
+    let name = b"futex_bitset_abs_deadline";
+    FUTEX_WORD = 0;
+    let mut now = timespec { tv_sec: 0, tv_nsec: 0 };
+    clock_gettime(CLOCK_MONOTONIC, &mut now);
+    // Absolute deadline 200 ms from now.
+    let mut dl = timespec { tv_sec: now.tv_sec, tv_nsec: now.tv_nsec + 200_000_000 };
+    if dl.tv_nsec >= 1_000_000_000 { dl.tv_sec += 1; dl.tv_nsec -= 1_000_000_000; }
+    let t0 = now_ms();
+    let r = syscall(
+        nr::FUTEX,
+        core::ptr::addr_of!(FUTEX_WORD) as c_long,
+        9i64 | 128,                 // FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG
+        0i64,                       // expected value (matches FUTEX_WORD)
+        &dl as *const timespec as c_long,
+        0i64,
+        0xffff_ffffi64,             // FUTEX_BITSET_MATCH_ANY
+    );
+    let el = now_ms() - t0;
+    // -ETIMEDOUT (-110) at ~200 ms. Relative misreading sleeps ~uptime (tens of
+    // seconds by the time this test runs), so the bound is generous and still
+    // discriminating.
+    let ok = r == -110 && el >= 150 && el < 2000;
+    if !report_x(name, ok, el, r as i32, -1) { return false; }
+
+    // A deadline already in the past times out at once (Linux: ETIMEDOUT, the
+    // value check still wins with EAGAIN when the word has moved).
+    let name2 = b"futex_bitset_past_deadline";
+    let past = timespec { tv_sec: 0, tv_nsec: 1 };
+    let t0 = now_ms();
+    let r = syscall(
+        nr::FUTEX,
+        core::ptr::addr_of!(FUTEX_WORD) as c_long,
+        9i64 | 128,
+        0i64,
+        &past as *const timespec as c_long,
+        0i64,
+        0xffff_ffffi64,
+    );
+    let el = now_ms() - t0;
+    report_x(name2, r == -110 && el < 500, el, r as i32, -1)
+}
+
 // ── 3. cross-thread pipe wake (level) ──────────────────────────────────────
 
 unsafe fn test_xthread_pipe_level() -> bool {
@@ -794,6 +849,7 @@ pub unsafe extern "C" fn wake_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     BUSY_WRITER = false;
     if !test_probe_eventfd() { failures += 1; }
     if !test_xthread_futex_timed_wake() { failures += 1; }
+    if !test_futex_bitset_abs_deadline() { failures += 1; }
     if !test_xthread_pipe_level() { failures += 1; }
     if !test_xthread_unix_level() { failures += 1; }
     if !test_timerfd_deadline() { failures += 1; }
