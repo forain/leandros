@@ -46,15 +46,20 @@ export PATH
 #     for it, so the greeter session uses the GREETER ACCOUNT's runtime dir,
 #     /run/user/990 (owned by it), and greeter-launch chowns the socket node
 #     to the account before dropping. greetd's control socket is bound in the
-#     same directory (GREETD_SOCK_DIR in /bin/greeter-real). XDG_SESSION_CLASS
-#     is set by greetd's session worker from the session's class.
+#     same directory (GREETD_SOCK_DIR in /bin/greeter-real). The greeter
+#     session is recognised by GREETD_SOCK: greetd's session worker putenv's
+#     it for the greeter session only, and cosmic-greeter forwards nothing
+#     but XDG_SESSION_TYPE/CURRENT_DESKTOP/SESSION_DESKTOP to the user session.
+#     NOT XDG_SESSION_CLASS — the worker putenv's it for PAM and then REMOVES
+#     it (`pam.putenv("XDG_SESSION_CLASS")`, no '=') before pam_getenvlist
+#     builds the session's environment, so no session ever sees it.
 #
 # /run/user is a tmpfs MOUNT ROOT (servers/vfs TMPFS_ROOTS), which is what
 # makes AF_UNIX binds work under it at all — an f2fs /run has no S_IFSOCK.
 # `id` is addressed by absolute path: /bin/sh is brush, and brush's exec
 # search does not fall through /usr/bin -> /bin.
 _runtime_uid=$(/bin/id -u)
-if [ "${XDG_SESSION_CLASS:-user}" = greeter ]; then
+if [ -n "${GREETD_SOCK:-}" ] || [ "${XDG_SESSION_CLASS:-user}" = greeter ]; then
     _greeter_uid=$(while IFS=: read -r _n _p _u _rest; do
         if [ "$_n" = cosmic-greeter ]; then echo "$_u"; break; fi
     done < /etc/passwd)

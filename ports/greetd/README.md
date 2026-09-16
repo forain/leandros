@@ -237,8 +237,14 @@ under the `0700 root` `/run/user/0`, nor connect to a `0755 root` socket. The
 greeter phase therefore uses the **greeter account's own runtime directory**,
 `/run/user/990` (seeded 0700, owned by the account, by `userland/init` for every
 passwd account at boot): `/bin/greeter-real` points `GREETD_SOCK_DIR` there,
-`/etc/profile` selects it as `XDG_RUNTIME_DIR` for the session whose
-`XDG_SESSION_CLASS` is `greeter` (so cosmic-comp binds `wayland-N` there), and
+`/etc/profile` selects it as `XDG_RUNTIME_DIR` for the session that carries
+`GREETD_SOCK` — the greeter session, the only one greetd's worker putenv's it
+for (so cosmic-comp binds `wayland-N` there). `XDG_SESSION_CLASS` cannot be the
+discriminator: the worker sets it for PAM and removes it again before
+`pam_getenvlist` builds the session's environment, so neither session sees it
+(verified on the Mac 2026-09-16: `profile: session starting, uid=0
+XDG_RUNTIME_DIR=/run/user/0`, then the uid-990 greeter died with
+`NoCompositor`). And
 `/bin/greeter-launch`, still root, `chown`s both socket nodes —
 `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` and `$GREETD_SOCK` — to the account before
 it drops. That is upstream's ownership arrangement (greetd chowns its socket to
