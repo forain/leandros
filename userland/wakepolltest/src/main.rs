@@ -873,8 +873,11 @@ const XFER_BYTES: usize = 16 * 1024 * 1024;
 static mut XFER_BUF: [u8; 65536] = [0x5a; 65536];
 static mut READ_TOTAL: usize = 0;
 
-/// Slow reader: 4 KiB bites, a 10 ms nap every 128 KiB, so the 16 KiB ring
-/// is full for most of the transfer and the writer must wait ~128 times.
+/// Slow reader: 4 KiB bites, a NAP_MS nap every 128 KiB, so the 16 KiB ring
+/// is full for most of the transfer and the writer must wait NAP_COUNT times.
+const NAP_MS: i64 = 10;
+const NAP_COUNT: i64 = (XFER_BYTES / (32 * 4096)) as i64;
+
 extern "C" fn slow_reader(_arg: *mut c_void) -> *mut c_void {
     unsafe {
         let mut buf = [0u8; 4096];
@@ -885,7 +888,7 @@ extern "C" fn slow_reader(_arg: *mut c_void) -> *mut c_void {
             if n <= 0 { break; }
             total += n as usize;
             reads += 1;
-            if reads % 32 == 0 { usleep(10_000); }
+            if reads % 32 == 0 { usleep((NAP_MS * 1000) as c_uint); }
         }
         READ_TOTAL = total;
     }
@@ -893,8 +896,13 @@ extern "C" fn slow_reader(_arg: *mut c_void) -> *mut c_void {
 }
 
 /// Fast writer of XFER_BYTES into a pipe drained by `slow_reader`: PASS when
-/// everything arrived and the writer's thread CPU time is under a quarter of
-/// its wall time (a parked writer spends ~0; the old spin spent ~all of it).
+/// everything arrived and the writer's thread CPU time leaves out at least
+/// half of the reader's total nap time. While the reader naps the ring is
+/// full and a parked writer runs nothing, so its CPU is at most wall minus
+/// the naps; the old spin burned the naps too (CPU ~= wall). The transfer's
+/// own cost (one wake per 4 KiB drained) is on both sides of the inequality,
+/// so the verdict does not depend on the accelerator: ~55 ms on KVM, ~620 ms
+/// under TCG.
 unsafe fn test_pipe_writer_blocks() -> bool {
     let name = b"pipe_writer_blocks";
     let mut fds = [0i32; 2];
@@ -920,7 +928,8 @@ unsafe fn test_pipe_writer_blocks() -> bool {
     close(wfd); // EOF for the reader
     pthread_join(th, core::ptr::null_mut());
     close(rfd);
-    let ok = sent == XFER_BYTES && READ_TOTAL == XFER_BYTES && wall > 0 && cpu * 4 < wall;
+    let ok = sent == XFER_BYTES && READ_TOTAL == XFER_BYTES && wall > 0
+        && cpu + NAP_COUNT * NAP_MS / 2 < wall;
     // report_x's n/wrote columns carry cpu ms and bytes received (KiB).
     report_x(name, ok, wall, cpu as i32, (READ_TOTAL / 1024) as i64)
 }
