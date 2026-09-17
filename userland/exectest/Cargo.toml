@@ -1,0 +1,12 @@
+[package]
+name = "exectest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "exectest"
+path = "src/main.rs"
+
+[dependencies]
+# No leandros-libc: links directly against librelibc.a like sigtest2, for
+# fork()/waitpid()/sigaction() with real TLS and the SA_RESTORER trampoline.

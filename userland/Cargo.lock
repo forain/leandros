@@ -40,6 +40,10 @@ name = "evtest2"
 version = "0.1.0"
 
 [[package]]
+name = "exectest"
+version = "0.1.0"
+
+[[package]]
 name = "f2fstest"
 version = "0.1.0"
 dependencies = [
@@ -75,6 +79,10 @@ dependencies = [
  "leandros-lib",
  "spin",
 ]
+
+[[package]]
+name = "jobtest"
+version = "0.1.0"
 
 [[package]]
 name = "leandros-greeter-launch"

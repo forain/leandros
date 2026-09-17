@@ -3406,15 +3406,48 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
 }
 
+/// `/proc/<digits>/stat` or `/proc/<digits>/status` → that pid. Only the two
+/// files a job-control consumer reads (`ps`-style state probing; jobtest
+/// checks for `T`) are served for another process; everything else under
+/// `/proc/<pid>/` is still `/proc/self/`-only.
+fn proc_pid_path(path: &[u8]) -> Option<u32> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let (digits, tail) = (&rest[..slash], &rest[slash..]);
+    if digits.is_empty() || digits.len() > 9 || !digits.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if tail != b"/stat" && tail != b"/status" {
+        return None;
+    }
+    let mut pid = 0u32;
+    for &d in digits { pid = pid * 10 + (d - b'0') as u32; }
+    Some(pid)
+}
+
 fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<usize> {
-    let ppid = sched::current_ppid();
-    let pgid = sched::current_pgid();
+    // Real values for the process named — `/proc/self/` (the caller) or
+    // `/proc/<pid>/` — including the procps state letter, so a stopped job
+    // reads `T` the way `ps` and `jobs` expect. The caller can only ever see
+    // itself as `R`.
+    let (ppid, pgid, state) = match sched::proc_stat_of(pid) {
+        Some((ppid, pgid, _sid, state)) => (ppid, pgid, state),
+        None => (sched::current_ppid(), sched::current_pgid(), b'R'),
+    };
+    let state_word: &[u8] = match state {
+        b'S' => b"S (sleeping)",
+        b'T' => b"T (stopped)",
+        b'Z' => b"Z (zombie)",
+        _    => b"R (running)",
+    };
     let ticks = sched::ticks();
     let uptime_sec = ticks / 100;
 
     if path == b"/proc/self/status" || path.ends_with(b"/status") {
         let mut p = 0;
-        p = write_lit(buf, p, b"Name:\tleandros\nState:\tR (running)\nPid:\t");
+        p = write_lit(buf, p, b"Name:\tleandros\nState:\t");
+        p = write_lit(buf, p, state_word);
+        p = write_lit(buf, p, b"\nPid:\t");
         p = write_u32(buf, p, pid);
         p = write_lit(buf, p, b"\nPPid:\t");
         p = write_u32(buf, p, ppid);
@@ -3429,7 +3462,9 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         // Format: pid (comm) state ppid pgid ...
         let mut p = 0;
         p = write_u32(buf, p, pid);
-        p = write_lit(buf, p, b" (leandros) R ");
+        p = write_lit(buf, p, b" (leandros) ");
+        p = write_lit(buf, p, &[state]);
+        p = write_lit(buf, p, b" ");
         p = write_u32(buf, p, ppid);
         p = write_lit(buf, p, b" ");
         p = write_u32(buf, p, pgid);
@@ -3690,6 +3725,13 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         } else if lookup_path.starts_with(b"/proc/self/") && lookup_path != b"/proc/self/" {
             let kind = gen_proc_self(pid, lookup_path);
             match kind {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if let Some(tpid) = proc_pid_path(lookup_path) {
+            // /proc/<pid>/stat and /proc/<pid>/status of another live process.
+            if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
+            match gen_proc_self(tpid, lookup_path) {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }

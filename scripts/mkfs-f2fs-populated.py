@@ -340,7 +340,7 @@ def main():
     bins = [
         "shell", "login", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "permtest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "ptytest", "forktest", "racetest",
-        "waittest", "sigchldtest", "sigtest2", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
+        "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe",
     ]
@@ -348,6 +348,22 @@ def main():
         p = os.path.join(userland_dir, b)
         if os.path.exists(p):
             bin_files.append((b, p, 0o100755))
+
+    # exectest's `#!` fixtures. The modes are the test: exectest-noexec.sh must
+    # have no execute bit (EACCES), everything else is 0755 so the kernel's
+    # binfmt_script path accepts it; exectest-data.txt is executable but is
+    # neither ELF nor `#!` (ENOEXEC).
+    _exectest_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "userland", "exectest", "scripts")
+    for _s in ("exectest-echo.sh", "exectest-env.sh", "exectest-nested.sh",
+               "exectest-trail.sh", "exectest-data.txt", "exectest-missing.sh",
+               "exectest-loop.sh"):
+        _p = os.path.join(_exectest_dir, _s)
+        if os.path.exists(_p):
+            bin_files.append((_s, _p, 0o100755))
+    _p = os.path.join(_exectest_dir, "exectest-noexec.sh")
+    if os.path.exists(_p):
+        bin_files.append(("exectest-noexec.sh", _p, 0o100644))
 
     # Ad-hoc binaries staged from outside the tree: point LEANDROS_EXTRA_BIN at
     # a directory and every regular file in it lands in /bin. A name ending in
@@ -1126,7 +1142,7 @@ def main():
         bin_files.append(("fakegreet", fakegreet_bin, 0o100755))
 
     # The two greeter launchers and the environment they share, POSIX-sh
-    # scripts run as `sh /bin/<name>` (no shebang binfmt in the kernel). Staged
+    # scripts run as `sh /bin/<name>` (they carry no `#!` line). Staged
     # into /bin next to start-cosmic-leandros for the same reason that one is:
     # committing the whole launch up front keeps the typed command short, and
     # serial RX drops characters once a session is live.
@@ -1308,14 +1324,16 @@ def main():
             m4_share_dirs.add(_d)
         m4_share_files.append((_kdl_dir, "use_whole_disk.kdl", _kdl))
 
-    # The session launcher itself (a POSIX-sh script). The kernel execve()s ELF
-    # only (no "#!"-shebang binfmt), so it is run as `sh /bin/start-cosmic-leandros`.
+    # The session launcher itself (a POSIX-sh script with a `#!/bin/sh` line).
+    # execve() honours `#!` since the jobctl lane, so both
+    # `/bin/start-cosmic-leandros` and the historical
+    # `sh /bin/start-cosmic-leandros` work; init and greetd keep the latter.
     m6_launcher = session_data("start-cosmic-leandros")
     if os.path.exists(m6_launcher):
         bin_files.append(("start-cosmic-leandros", m6_launcher, 0o100755))
     # m4-vkwl — the M4 driver: backgrounds start-cosmic-leandros with its log
     # redirected to a file, waits for the wayland-1 socket, then runs vkwl
-    # against it. Same no-shebang rule: run as `brush /bin/m4-vkwl`.
+    # against it. No `#!` line either: run as `brush /bin/m4-vkwl`.
     m4_drv = session_data("m4-vkwl")
     if os.path.exists(m4_drv):
         bin_files.append(("m4-vkwl", m4_drv, 0o100755))
@@ -1324,7 +1342,7 @@ def main():
     # wl-globals, one window, two windows, move/resize/close, an application)
     # announcing each window as "M12: MARK <name> <secs>" so artifacts/
     # m12_caps.py can inject QMP input and photograph the scanout inside it.
-    # Same no-shebang rule: run as `brush /bin/m12-caps`.
+    # No `#!` line either: run as `brush /bin/m12-caps`.
     m12_drv = session_data("m12-caps")
     if os.path.exists(m12_drv):
         bin_files.append(("m12-caps", m12_drv, 0o100755))
@@ -1340,7 +1358,7 @@ def main():
     # `state: Disabled` produces exactly the observed symptom), then runs
     # /bin/wlinput against cosmic-comp's socket so the same injection can be
     # counted BELOW the compositor ([EVSTAT]) and ABOVE it ([WLI]) in one run.
-    # Same no-shebang rule: run as `brush /bin/m14-input`.
+    # No `#!` line either: run as `brush /bin/m14-input`.
     m14_drv = session_data("m14-input")
     if os.path.exists(m14_drv):
         bin_files.append(("m14-input", m14_drv, 0o100755))
@@ -1350,7 +1368,7 @@ def main():
     # own stderr survives (launch_pad pipes child stderr and registers no
     # on_stderr handler, cosmic-session/src/comp.rs:122-134) and WAYLAND_DEBUG
     # can say whether it never commits or commits blank buffers.
-    # Same no-shebang rule: run as `brush /bin/m15-iced`.
+    # No `#!` line either: run as `brush /bin/m15-iced`.
     m15_drv = session_data("m15-iced")
     if os.path.exists(m15_drv):
         bin_files.append(("m15-iced", m15_drv, 0o100755))
@@ -1392,11 +1410,10 @@ def main():
     if os.path.exists(m4_drv_a64):
         bin_files.append(("m4-vkwl-a64", m4_drv_a64, 0o100755))
 
-    # /bin/sh -> brush (hardlinked; add_files_to_dir dedupes by host path). The
-    # kernel has no shebang binfmt, so shell scripts (start-cosmic-leandros,
-    # dbus-run-session) are executed as `sh <script>`; the proposed
-    # dbus-run-session also uses `sh -c ...`. brush, invoked as sh, interprets the
-    # script argument directly — no shebang or ENOEXEC-fallback dependency.
+    # /bin/sh -> brush (hardlinked; add_files_to_dir dedupes by host path).
+    # Shell scripts (start-cosmic-leandros, dbus-run-session) are still invoked
+    # as `sh <script>` by init/greetd — that predates the kernel's `#!` support
+    # and keeps working; scripts with a `#!/bin/sh` line now also exec directly.
     _brush_p = f"../brush/target/{brush_target}/release/brush"
     if os.path.exists(_brush_p):
         bin_files.append(("sh", _brush_p, 0o100755))

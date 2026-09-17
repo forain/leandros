@@ -690,6 +690,11 @@ unsafe fn test_sigint(m: c_int, n: usize) -> bool {
     PARENT_INT.store(0, Ordering::SeqCst);
     let child = fork();
     if child == 0 {
+        // fork inherits the parent's dispositions (as on Linux, since
+        // edff93c), so the SIGINT handler installed above for the negative
+        // half would make the child *catch* the ^C and run on to `_exit(9)`.
+        // A real foreground job has the default action; restore it.
+        signal(SIGINT, 0 /* SIG_DFL */);
         close(m);
         if !child_login_tty(n) {
             _exit(1);
