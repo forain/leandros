@@ -2253,10 +2253,13 @@ fn sys_rt_sigsuspend(mask_ptr: usize, _sigsetsize: usize) -> isize {
     // delivery path (`deliver_signal`, `deliver_signal_process`) ends in a
     // `wake_poll` broadcast, so the poll wait-channel is the wake source;
     // three-phase, re-checking the pending set after publishing Blocked.
+    // Thread-directed and process-directed instances both count (the latter
+    // sit on the leader until the syscall-exit pass claims them).
+    let wakeable = || (pending_signals() | sched::shared_pending_signals()) & !new_mask != 0;
     loop {
-        if pending_signals() & !new_mask != 0 { break; }
+        if wakeable() { break; }
         sched::block_on_poll_prepare();
-        if pending_signals() & !new_mask != 0 { sched::block_on_poll_cancel(); break; }
+        if wakeable() { sched::block_on_poll_cancel(); break; }
         sched::block_on_poll_commit();
     }
     // The old mask is NOT put back here: the signal that ended the wait is
@@ -2291,7 +2294,9 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
     };
 
     loop {
-        let pending = pending_signals() & wait_mask;
+        // A process-directed signal that every thread blocks — the normal
+        // sigwait pattern — is parked on the leader, not on this thread.
+        let pending = (pending_signals() | sched::shared_pending_signals()) & wait_mask;
         if pending != 0 {
             let signo = pending.trailing_zeros() as u32 + 1;
             // Accept the signal, taking its payload with the pending bit.
@@ -2318,7 +2323,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
         }
         // Park (see sys_rt_sigsuspend); the deadline rides the poll tick.
         sched::block_on_poll_prepare_until(deadline.unwrap_or(u64::MAX));
-        if pending_signals() & wait_mask != 0 { sched::block_on_poll_cancel(); continue; }
+        if (pending_signals() | sched::shared_pending_signals()) & wait_mask != 0 { sched::block_on_poll_cancel(); continue; }
         sched::block_on_poll_commit();
     }
 }
