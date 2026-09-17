@@ -2542,6 +2542,22 @@ fn tmp_dir_may(tmp: &[TmpFileEntry], dir: &[u8], euid: u32, egid: u32, mask: u8)
     }
 }
 
+/// Gate for creating a NEW entry `path` in the tmpfs pool, in Linux's order
+/// (`filename_create` then `may_create`): search on the parent (EACCES),
+/// then the existence probe (EEXIST), then write on the parent (EACCES).
+/// The order is observable: `mkdir /tmp` as a user is "File exists", not
+/// "Permission denied", and Rust's `create_dir_all` relies on it — it treats
+/// any error other than NotFound as fatal unless the path already is a
+/// directory... which it never gets to ask when the answer was EACCES.
+/// Existence is not a secret to anyone with search permission anyway
+/// (`stat` tells).
+fn tmp_create_gate(tmp: &[TmpFileEntry], path: &[u8], euid: u32, egid: u32) -> Result<(), i32> {
+    let parent = match tmp_parent(path) { Some(p) => p, None => return Err(-2) }; // ENOENT
+    tmp_dir_may(tmp, parent, euid, egid, xattr::MAY_EXEC)?;
+    if tmp_find(tmp, path).is_some() { return Err(-17); }                        // EEXIST
+    tmp_dir_may(tmp, parent, euid, egid, xattr::MAY_WRITE | xattr::MAY_EXEC)
+}
+
 /// The sticky rule for removing/replacing pool entry `victim` inside `parent`
 /// (`xattr::sticky_denies`): true means EPERM.
 fn tmp_sticky_denies(tmp: &[TmpFileEntry], parent: &[u8], victim: usize, euid: u32) -> bool {
@@ -6635,16 +6651,9 @@ fn handle_mkdir(pid: u32, path_ptr: usize, mode: u32) -> Message {
         // Intermediate components must already exist — `mkdir -p` creates
         // them outermost-first, so this is the check that makes it correct
         // rather than silently producing an orphaned "/tmp/a/b" — and the
-        // caller needs write + search on the parent. Before the EEXIST probe,
-        // so a caller who may not create here learns nothing about contents.
-        match tmp_parent(path) {
-            Some(p) => if let Err(e) = tmp_dir_may(&tmp[..], p, euid, egid,
-                                                   xattr::MAY_WRITE | xattr::MAY_EXEC) {
-                return err_reply(e);
-            },
-            None => return err_reply(-2), // ENOENT
-        }
-        if tmp_find(&tmp[..], path).is_some() { return err_reply(-17); }
+        // caller needs write + search on the parent, checked in Linux's
+        // order (see `tmp_create_gate`: EEXIST before the write check).
+        if let Err(e) = tmp_create_gate(&tmp[..], path, euid, egid) { return err_reply(e); }
         let idx = match tmp.iter().position(|e| !e.in_use) {
             Some(i) => i,
             None    => return err_reply(-28), // ENOSPC
@@ -6694,14 +6703,7 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
         if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }    // ENAMETOOLONG
         let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
         let mut tmp = TMP_FILES.lock();
-        match tmp_parent(path) {
-            Some(p) => if let Err(e) = tmp_dir_may(&tmp[..], p, euid, egid,
-                                                   xattr::MAY_WRITE | xattr::MAY_EXEC) {
-                return err_reply(e);
-            },
-            None => return err_reply(-2), // ENOENT
-        }
-        if tmp_find(&tmp[..], path).is_some() { return err_reply(-17); } // EEXIST
+        if let Err(e) = tmp_create_gate(&tmp[..], path, euid, egid) { return err_reply(e); }
         let idx = match tmp.iter().position(|e| !e.in_use) {
             Some(i) => i,
             None    => return err_reply(-28), // ENOSPC
@@ -6749,14 +6751,7 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
     let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
     let mut tmp = TMP_FILES.lock();
     // A socket node is an entry like any other: write + search on the parent.
-    match tmp_parent(tpath) {
-        Some(p) => if let Err(e) = tmp_dir_may(&tmp[..], p, euid, egid,
-                                               xattr::MAY_WRITE | xattr::MAY_EXEC) {
-            return e;
-        },
-        None => return -2, // ENOENT
-    }
-    if tmp_find(&tmp[..], tpath).is_some() { return -17; } // EEXIST
+    if let Err(e) = tmp_create_gate(&tmp[..], tpath, euid, egid) { return e; }
     let idx = match tmp.iter().position(|e| !e.in_use) {
         Some(i) => i, None => return -28, // ENOSPC
     };
@@ -6824,14 +6819,7 @@ fn handle_symlink(pid: u32, target_ptr: usize, link_ptr: usize) -> Message {
         if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); } // ENAMETOOLONG
         let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
         let mut tmp = TMP_FILES.lock();
-        match tmp_parent(path) {
-            Some(p) => if let Err(e) = tmp_dir_may(&tmp[..], p, euid, egid,
-                                                   xattr::MAY_WRITE | xattr::MAY_EXEC) {
-                return err_reply(e);
-            },
-            None => return err_reply(-2), // ENOENT
-        }
-        if tmp_find(&tmp[..], path).is_some() { return err_reply(-17); } // EEXIST
+        if let Err(e) = tmp_create_gate(&tmp[..], path, euid, egid) { return err_reply(e); }
         let idx = match tmp.iter().position(|e| !e.in_use) {
             Some(i) => i,
             None    => return err_reply(-28), // ENOSPC
@@ -6929,14 +6917,7 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
             let mut tmp = TMP_FILES.lock();
             let src = match tmp_find(&tmp[..], old) { Some(i) => i, None => return err_reply(-2) };
             if tmp[src].is_dir { return err_reply(-1); } // EPERM
-            match tmp_parent(new) {
-                Some(p) => if let Err(e) = tmp_dir_may(&tmp[..], p, euid, egid,
-                                                       xattr::MAY_WRITE | xattr::MAY_EXEC) {
-                    return err_reply(e);
-                },
-                None => return err_reply(-2), // ENOENT
-            }
-            if tmp_find(&tmp[..], new).is_some() { return err_reply(-17); } // EEXIST
+            if let Err(e) = tmp_create_gate(&tmp[..], new, euid, egid) { return err_reply(e); }
             let owner = tmp_owner(&tmp[..], src);
             let idx = match tmp.iter().position(|e| !e.in_use) {
                 Some(i) => i,

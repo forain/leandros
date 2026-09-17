@@ -318,6 +318,22 @@ unsafe fn case_create_denied(root: &[u8]) -> bool {
     ok
 }
 
+/// Creating a name that ALREADY EXISTS in a 0755 root dir is EEXIST, not
+/// EACCES — Linux's order (lookup, then may_create): `mkdir /usr` as a user
+/// says "File exists". Rust's `create_dir_all` depends on it: it only asks
+/// "is it a directory already?" after an error that is not NotFound, and on
+/// EACCES it has no reason to — so every `create_dir_all` over a chain some
+/// other uid made (`/run/cosmic-greeter/...` in the user session) failed
+/// with EACCES before this was fixed.
+unsafe fn case_create_existing_eexist(root: &[u8]) -> bool {
+    let mut ok = true;
+    ok &= step(fails_with(mkdir(p!(root, b"/ro755/subdir\0").as_ptr(), 0o755) as isize, EEXIST), b"mkdir existing dir in 0755 dir is EEXIST");
+    ok &= step(fails_with(mkdir(p!(root, b"/ro755/victim\0").as_ptr(), 0o755) as isize, EEXIST), b"mkdir over existing file is EEXIST");
+    ok &= step(fails_with(raw_symlink(b"x\0".as_ptr(), p!(root, b"/ro755/victim\0").as_ptr()), EEXIST), b"symlink over existing name is EEXIST");
+    ok &= step(fails_with(raw_link(p!(root, b"/ro755/victim\0").as_ptr(), p!(root, b"/ro755/subdir\0").as_ptr()), EEXIST), b"link over existing name is EEXIST");
+    ok
+}
+
 /// mknod (FIFO) in a 0755 root dir is EACCES — tmpfs only, f2fs has no mknod.
 unsafe fn case_mknod_denied(root: &[u8]) -> bool {
     step(fails_with(raw_mknod(p!(root, b"/ro755/fifo\0").as_ptr(), S_IFIFO | 0o644), EACCES), b"mknod in 0755 dir")
@@ -539,6 +555,7 @@ unsafe fn run_matrix(root: &[u8], tag: &[u8], with_sockets: bool) -> u32 {
 
     case!(b"traversal_denied", UID_USER, case_traversal_denied);
     case!(b"create_denied_0755", UID_USER, case_create_denied);
+    case!(b"create_existing_eexist", UID_USER, case_create_existing_eexist);
     if with_sockets { case!(b"mknod_denied_0755", UID_USER, case_mknod_denied); }
     case!(b"remove_denied_0755", UID_USER, case_remove_denied);
     case!(b"allowed_0777", UID_USER, case_allowed_0777);

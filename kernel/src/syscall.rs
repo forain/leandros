@@ -788,7 +788,7 @@ pub fn dispatch(
         sched::report_stack_overflow(current_pid(), number);
         sched::exit_group(-1);
     }
-    if SYSCALL_TRACE_EINVAL && ret == -22 && current_pid() >= 3 {
+    if ((SYSCALL_TRACE_EINVAL && ret == -22) || (SYSCALL_TRACE_EACCES && ret == -13)) && current_pid() >= 3 {
         let _g = TRACE_LOCK.lock();
         #[cfg(target_arch = "aarch64")]
         if frame_ptr != 0 {
@@ -815,7 +815,7 @@ pub fn dispatch(
             }
             crate::serial_print_str("\n");
         }
-        crate::serial_print_str("[SC-EINVAL] nr=");
+        crate::serial_print_str(if ret == -13 { "[SC-EACCES] nr=" } else { "[SC-EINVAL] nr=" });
         crate::serial_print_hex(number);
         crate::serial_print_str(" a0=");
         crate::serial_print_hex(a0);
@@ -918,6 +918,10 @@ const SYSCALL_TRACE: bool = false;
 /// Log every syscall that fails with EINVAL (nr + args + pid). Cheap and
 /// high-signal while bringing up a new ported binary.
 const SYSCALL_TRACE_EINVAL: bool = false;
+
+/// Same for EACCES (nr + args + pid), for pinning down which syscall a
+/// permission-enforcement failure comes from; shares the EINVAL printer.
+const SYSCALL_TRACE_EACCES: bool = false;
 
 /// Log the fd-lifecycle syscalls (pipe2/dup/dup2/dup3/fcntl/close/execve) with
 /// their arguments AND return value, plus how sys_write resolved each fd.

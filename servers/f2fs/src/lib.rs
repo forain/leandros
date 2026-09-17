@@ -1950,6 +1950,23 @@ fn may_modify_dir(ms: &mut MountState, dir: u32) -> Result<(), i32> {
     if may_access_ino(ms, dir, xattr::MAY_WRITE | xattr::MAY_EXEC) { Ok(()) } else { Err(-13) }
 }
 
+/// Gate for creating a NEW entry `name` in directory `parent`, in Linux's
+/// order (`filename_create` then `may_create`): search on the parent
+/// (EACCES), the existence probe (EEXIST), then write + search on the parent
+/// (EACCES). The order is observable — `mkdir /usr` as a user is "File
+/// exists" — and Rust's `create_dir_all` depends on it: it stops at the
+/// first error that is not NotFound unless the path already is a directory,
+/// and only asks that question after EEXIST, never after EACCES. So every
+/// `create_dir_all` over a chain some other uid already made (the session's
+/// `/run/cosmic-greeter/...`, seeded by the root greeter compositor) failed
+/// with the old order. Existence is no secret to a caller with search
+/// permission anyway; `stat` answers it.
+fn create_gate(ms: &mut MountState, parent: u32, name: &[u8]) -> Result<(), i32> {
+    if !may_access_ino(ms, parent, xattr::MAY_EXEC) { return Err(-13); }
+    if dir_lookup(ms, parent, name) != 0 { return Err(-17); } // EEXIST
+    may_modify_dir(ms, parent)
+}
+
 /// Removal/replacement of `victim` inside `dir`: `may_modify_dir` plus the
 /// sticky-bit rule (only the entry's owner, the directory's owner or root may
 /// remove an entry from a directory with S_ISVTX set — EPERM otherwise).
@@ -2522,12 +2539,8 @@ fn handle_mkdir(ms: &mut MountState, path_ptr: u64, mode: u64,
         let iblk = ms.cache.read(ms.dev, parent_iblkaddr as u64);
         if !inode_is_dir(iblk) { return err_reply(-20); }
     }
-    // Write + search on the parent. Before the EEXIST probe: a caller who may
-    // not create here learns nothing about what already exists.
-    if let Err(e) = may_modify_dir(ms, parent_ino) { return err_reply(e); }
-
-    // Check name doesn't already exist
-    if dir_lookup(ms, parent_ino, name) != 0 { return err_reply(-17); } // EEXIST
+    // Search on the parent, EEXIST, then write on the parent — Linux's order.
+    if let Err(e) = create_gate(ms, parent_ino, name) { return err_reply(e); }
 
     let imode = S_IFDIR | (mode as u16 & 0o7777);
     let (new_ino, _) = match create_inode(ms, imode, euid, egid, parent_ino, name) {
@@ -2649,8 +2662,7 @@ fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64,
         Ok(p) => p,
         Err(e) => return err_reply(e),
     };
-    if let Err(e) = may_modify_dir(ms, parent_ino) { return err_reply(e); }
-    if dir_lookup(ms, parent_ino, name) != 0 { return err_reply(-17); } // EEXIST
+    if let Err(e) = create_gate(ms, parent_ino, name) { return err_reply(e); }
 
     // Copy the target off the caller's buffer before any allocation runs: the
     // pointer is only guaranteed live for the duration of this call, and the
@@ -2758,8 +2770,7 @@ fn handle_link(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
         Ok(p) => p,
         Err(e) => return err_reply(e),
     };
-    if let Err(e) = may_modify_dir(ms, parent_ino) { return err_reply(e); }
-    if dir_lookup(ms, parent_ino, name) != 0 { return err_reply(-17); } // EEXIST
+    if let Err(e) = create_gate(ms, parent_ino, name) { return err_reply(e); }
 
     let ftype = match mode & S_IFMT {
         S_IFLNK => DT_LNK,
