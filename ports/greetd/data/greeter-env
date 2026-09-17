@@ -14,12 +14,39 @@
 PATH=/usr/bin:/bin
 export PATH
 
-# ---- runtime dir ------------------------------------------------------------
-# cosmic-comp binds $XDG_RUNTIME_DIR/wayland-1 here and fakegreet binds
-# greetd.sock in its cwd, which the callers set to this same directory. Seeded
-# 0700 root by the VFS at boot.
+# ---- runtime dirs -----------------------------------------------------------
+# Two of them. XDG_RUNTIME_DIR is greetd's own (root's, seeded 0700 root by the
+# VFS at boot) and is where the callers cd. GREETER_RUNTIME_DIR is the
+# cosmic-greeter ACCOUNT's, /run/user/<its uid>, 0700 and owned by it: that is
+# where greetd's control socket (GREETD_SOCK_DIR in greeter-real, fakegreet's
+# cwd in greeter-fake) and the greeter session's wayland socket (/etc/profile,
+# greeter class) are bound, because the VFS enforces search permission on
+# every path component and AF_UNIX connect, and the greeter client runs as
+# uid 990 after /bin/greeter-launch drops to it. A root-owned 0700 /run/user/0
+# is unreachable for it; its own directory is not. The socket NODES are then
+# chowned to the account by greeter-launch, still root, just before the drop.
+#
+# userland/init seeds /run/user/<uid> for every passwd account at boot; the
+# mkdir/chown/chmod here only make this script correct when run by hand.
 XDG_RUNTIME_DIR=/run/user/0
 export XDG_RUNTIME_DIR
+# The uid is looked up by NAME in /etc/passwd with shell builtins only — the
+# same way /bin/greeter-launch resolves it — so the number lives in one place.
+GREETER_UID=$(while IFS=: read -r _n _p _u _rest; do
+    if [ "$_n" = cosmic-greeter ]; then echo "$_u"; break; fi
+done < /etc/passwd)
+if [ -n "$GREETER_UID" ]; then
+    GREETER_RUNTIME_DIR=/run/user/$GREETER_UID
+    /bin/mkdir -p "$GREETER_RUNTIME_DIR" 2>/dev/null || true
+    /bin/chown "$GREETER_UID:$GREETER_UID" "$GREETER_RUNTIME_DIR" 2>/dev/null || true
+    /bin/chmod 0700 "$GREETER_RUNTIME_DIR" 2>/dev/null || true
+else
+    # No greeter account in /etc/passwd: greeter-launch will refuse to run
+    # anyway; keep the old single-directory arrangement so the failure is its
+    # clear message rather than a missing directory here.
+    GREETER_RUNTIME_DIR=$XDG_RUNTIME_DIR
+fi
+export GREETER_RUNTIME_DIR
 
 # ---- HOME / XDG dirs --------------------------------------------------------
 # cosmic-config create_dir_all()s $XDG_CONFIG_HOME/cosmic/... at startup and

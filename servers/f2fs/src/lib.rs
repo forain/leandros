@@ -532,6 +532,16 @@ struct MountState {
     dirty_writes: u32,
     open_files:   [OpenFile; MAX_OPEN_FILES],
     cache:        BlockCache,
+    /// Effective uid/gid of the process whose request is being served. Set by
+    /// `dispatch_msg` on entry (the server is single-threaded and IPC is
+    /// synchronous, so one pair per mount is exact) and read by the path walk
+    /// so every directory component can be checked for search permission
+    /// without threading credentials through fifteen signatures.
+    euid:         u32,
+    egid:         u32,
+    /// Why the last `resolve_path_ex` returned 0 (negative errno, 0 = ENOENT).
+    /// Read through `take_walk_err`; see `resolve_path_r`.
+    walk_err:     i32,
 }
 
 const MAX_MOUNTS: usize = 8;
@@ -1909,10 +1919,92 @@ fn read_link_target(ms: &mut MountState, ino: u32, out: &mut [u8; 256]) -> usize
     read_file_data(ms, ino, 0, out.as_mut_ptr(), n)
 }
 
-/// Resolve an absolute path (with mount prefix stripped) to an inode.
-/// Returns 0 on failure (not found, or ELOOP).
-fn resolve_path(ms: &mut MountState, path: &[u8]) -> u32 {
-    resolve_path_ex(ms, path, true)
+// ── permission gates ─────────────────────────────────────────────────────────
+//
+// Every gate funnels through `xattr::may_access` (mode bits + stored POSIX ACL
+// + root bypass) on the inode's live meta. `ms.euid/egid` are the caller's,
+// published by `dispatch_msg`. Errors are POSIX: a component the caller may not
+// search is EACCES even when what follows it does not exist, so a walk never
+// leaks existence through ENOENT.
+
+/// `xattr::may_access` on inode `ino` for the current caller. Reads the xattr
+/// node only when the inode has one, so the common ACL-less directory costs a
+/// single (cached) inode-block read.
+fn may_access_ino(ms: &mut MountState, ino: u32, mask: u8) -> bool {
+    let (euid, egid) = (ms.euid, ms.egid);
+    let (meta, xnid) = load_meta_xnid(ms, ino);
+    if euid == 0 && !(mask & xattr::MAY_EXEC != 0 && !xattr::is_dir(meta.mode)) {
+        return true; // root: skip the xattr read entirely
+    }
+    let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, xnid)) } else { None };
+    let acl = match &xbuf {
+        Some(b) => xattr::find(&b[..xattr::F2FS_XATTR_ARENA], xattr::IDX_ACL_ACCESS, b""),
+        None => None,
+    };
+    xattr::may_access(&meta, euid, egid, acl, mask)
+}
+
+/// Gate for creating an entry in / removing an entry from directory `dir`:
+/// write + search on the directory. `Err(-EACCES)` when refused.
+fn may_modify_dir(ms: &mut MountState, dir: u32) -> Result<(), i32> {
+    if may_access_ino(ms, dir, xattr::MAY_WRITE | xattr::MAY_EXEC) { Ok(()) } else { Err(-13) }
+}
+
+/// Gate for creating a NEW entry `name` in directory `parent`, in Linux's
+/// order (`filename_create` then `may_create`): search on the parent
+/// (EACCES), the existence probe (EEXIST), then write + search on the parent
+/// (EACCES). The order is observable — `mkdir /usr` as a user is "File
+/// exists" — and Rust's `create_dir_all` depends on it: it stops at the
+/// first error that is not NotFound unless the path already is a directory,
+/// and only asks that question after EEXIST, never after EACCES. So every
+/// `create_dir_all` over a chain some other uid already made (the session's
+/// `/run/cosmic-greeter/...`, seeded by the root greeter compositor) failed
+/// with the old order. Existence is no secret to a caller with search
+/// permission anyway; `stat` answers it.
+fn create_gate(ms: &mut MountState, parent: u32, name: &[u8]) -> Result<(), i32> {
+    if !may_access_ino(ms, parent, xattr::MAY_EXEC) { return Err(-13); }
+    if dir_lookup(ms, parent, name) != 0 { return Err(-17); } // EEXIST
+    may_modify_dir(ms, parent)
+}
+
+/// Removal/replacement of `victim` inside `dir`: `may_modify_dir` plus the
+/// sticky-bit rule (only the entry's owner, the directory's owner or root may
+/// remove an entry from a directory with S_ISVTX set — EPERM otherwise).
+fn may_delete_in(ms: &mut MountState, dir: u32, victim: u32) -> Result<(), i32> {
+    may_modify_dir(ms, dir)?;
+    let (dmeta, _) = load_meta_xnid(ms, dir);
+    let (vmeta, _) = load_meta_xnid(ms, victim);
+    if xattr::sticky_denies(&dmeta, vmeta.uid, ms.euid) { Err(-1) } else { Ok(()) }
+}
+
+/// Resolve the parent of a to-be-created / to-be-removed entry. `parent_rel`
+/// is the volume-relative parent path ("" or "/" for the root).
+fn resolve_parent(ms: &mut MountState, parent_rel: &[u8]) -> Result<u32, i32> {
+    if parent_rel.is_empty() || parent_rel == b"/" {
+        return Ok(ms.sb.root_ino);
+    }
+    resolve_path_r(ms, parent_rel, true)
+}
+
+/// `resolve_path_ex` with the errno preserved: `Err(-ENOENT)` for a missing
+/// component, `Err(-EACCES)` for a directory the caller may not search,
+/// `Err(-ENOTDIR)` for a non-directory used as one, `Err(-ELOOP)` on a
+/// symlink cycle.
+fn resolve_path_r(ms: &mut MountState, path: &[u8], follow_final: bool) -> Result<u32, i32> {
+    match resolve_path_ex(ms, path, follow_final) {
+        0 => Err(ms.take_walk_err()),
+        ino => Ok(ino),
+    }
+}
+
+impl MountState {
+    /// The errno of the last failed `resolve_path_ex` walk, defaulting to
+    /// ENOENT. Cleared on read so a stale value can never outlive its walk.
+    fn take_walk_err(&mut self) -> i32 {
+        let e = self.walk_err;
+        self.walk_err = 0;
+        if e == 0 { -2 } else { e }
+    }
 }
 
 /// Path walk with explicit control over the final component.
@@ -1943,6 +2035,7 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
     let mut len = normalize_volume_path_floor(path, &mut buf, floor);
     let mut hops = 0u32;
 
+    ms.walk_err = 0;
     'restart: loop {
         if len <= 1 { return ms.sb.root_ino; }
         let mut ino = ms.sb.root_ino;
@@ -1958,13 +2051,31 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
             let nlen = comp_end - comp_start - 1;
             name[..nlen].copy_from_slice(&buf[comp_start + 1..comp_end]);
 
+            // Search permission on the directory we are about to look into.
+            // This is the traversal check POSIX requires on every component of
+            // the prefix, and it comes BEFORE the lookup so an unsearchable
+            // directory answers EACCES whether or not the name exists in it.
+            // A non-directory in the middle of a path is ENOTDIR.
+            {
+                let is_dir = {
+                    let addr = nat_lookup(ms, ino);
+                    let iblk = ms.cache.read(ms.dev, addr as u64);
+                    inode_is_dir(iblk)
+                };
+                if !is_dir { ms.walk_err = -20; return 0; } // ENOTDIR
+                if !may_access_ino(ms, ino, xattr::MAY_EXEC) {
+                    ms.walk_err = -13; // EACCES
+                    return 0;
+                }
+            }
+
             let (next, ftype) = dir_lookup_ft(ms, ino, &name[..nlen]);
             if next == 0 { return 0; }
 
             let is_last = comp_end == len;
             if ftype == DT_LNK && !(is_last && !follow_final) {
                 hops += 1;
-                if hops > SYMLINK_MAX_HOPS { return 0; } // ELOOP
+                if hops > SYMLINK_MAX_HOPS { ms.walk_err = -40; return 0; } // ELOOP
 
                 let mut target = [0u8; 256];
                 let tlen = read_link_target(ms, next, &mut target);
@@ -2074,23 +2185,25 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
     // With O_NOFOLLOW the final component must not be traversed, so that a
     // symlink resolves to *itself* and can then be rejected below. Resolving
     // first and checking afterwards would already have opened the target.
-    let ino = if nofollow {
-        resolve_path_ex(ms, rel, false)
-    } else {
-        resolve_path(ms, rel)
+    let ino = match resolve_path_r(ms, rel, !nofollow) {
+        Ok(i) => i,
+        // A prefix the caller may not search (or that is not a directory) is
+        // the answer regardless of O_CREAT: only a genuinely missing final
+        // component may fall through to creation.
+        Err(e) if e != -2 => return err_reply(e),
+        Err(_) => 0,
     };
 
     let ino = if ino == 0 {
         if !create || !writable { return err_reply(-2); } // ENOENT
         // Create the file
         let (parent_path, name) = path_split(rel);
-        let parent_ino = if parent_path.is_empty() || parent_path == b"/" {
-            ms.sb.root_ino
-        } else {
-            let p = resolve_path(ms, parent_path);
-            if p == 0 { return err_reply(-2); }
-            p
+        let parent_ino = match resolve_parent(ms, parent_path) {
+            Ok(p) => p,
+            Err(e) => return err_reply(e),
         };
+        // Creating an entry needs write + search on the parent directory.
+        if let Err(e) = may_modify_dir(ms, parent_ino) { return err_reply(e); }
         // The caller's mode, not a hardcoded 0644. umask is applied kernel-side
         // (where Linux applies it) so tmpfs and f2fs cannot disagree about it.
         let imode = S_IFREG | (mode as u16 & 0o7777);
@@ -2124,7 +2237,9 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         // check precedes O_TRUNC so an unwritable file is never truncated.
         if euid != 0 {
             let want_read  = flags & O_WRONLY == 0; // RDONLY/RDWR read; WRONLY does not
-            let want_write = writable;
+            // O_TRUNC destroys content, so it needs write permission even on
+            // an O_RDONLY open (Linux may_open: O_TRUNC implies MAY_WRITE).
+            let want_write = writable || flags & O_TRUNC != 0;
             let (meta, xnid) = load_meta_xnid(ms, ino);
             let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, xnid)) } else { None };
             let acl = match &xbuf {
@@ -2299,8 +2414,7 @@ fn stat_common(ms: &mut MountState, path_ptr: u64, stat_ptr: u64, follow: bool) 
         Some(r) => r,
         None    => return err_reply(-2),
     };
-    let ino = resolve_path_ex(ms, rel, follow);
-    if ino == 0 { return err_reply(-2); }
+    let ino = match resolve_path_r(ms, rel, follow) { Ok(i) => i, Err(e) => return err_reply(e) };
 
     let iblkaddr = nat_lookup(ms, ino);
     let iblk = ms.cache.read(ms.dev, iblkaddr as u64);
@@ -2415,12 +2529,9 @@ fn handle_mkdir(ms: &mut MountState, path_ptr: u64, mode: u64,
         None    => return err_reply(-2),
     };
     let (parent_rel, name) = path_split(rel);
-    let parent_ino = if parent_rel.is_empty() || parent_rel == b"/" {
-        ms.sb.root_ino
-    } else {
-        let p = resolve_path(ms, parent_rel);
-        if p == 0 { return err_reply(-2); }
-        p
+    let parent_ino = match resolve_parent(ms, parent_rel) {
+        Ok(p) => p,
+        Err(e) => return err_reply(e),
     };
     // Check parent is a directory
     let parent_iblkaddr = nat_lookup(ms, parent_ino);
@@ -2428,9 +2539,8 @@ fn handle_mkdir(ms: &mut MountState, path_ptr: u64, mode: u64,
         let iblk = ms.cache.read(ms.dev, parent_iblkaddr as u64);
         if !inode_is_dir(iblk) { return err_reply(-20); }
     }
-
-    // Check name doesn't already exist
-    if dir_lookup(ms, parent_ino, name) != 0 { return err_reply(-17); } // EEXIST
+    // Search on the parent, EEXIST, then write on the parent — Linux's order.
+    if let Err(e) = create_gate(ms, parent_ino, name) { return err_reply(e); }
 
     let imode = S_IFDIR | (mode as u16 & 0o7777);
     let (new_ino, _) = match create_inode(ms, imode, euid, egid, parent_ino, name) {
@@ -2464,17 +2574,21 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
         None    => return err_reply(-2),
     };
     let (parent_rel, name) = path_split(rel);
-    let parent_ino = if parent_rel.is_empty() || parent_rel == b"/" {
-        ms.sb.root_ino
-    } else {
-        resolve_path(ms, parent_rel)
+    let parent_ino = match resolve_parent(ms, parent_rel) {
+        Ok(p) => p,
+        Err(e) => return err_reply(e),
     };
-    if parent_ino == 0 { return err_reply(-2); }
+    // Search on the parent is what makes the lookup below legitimate; write on
+    // it is what unlink itself needs. Checked before the lookup so a caller
+    // without them learns nothing about the directory's contents.
+    if !may_access_ino(ms, parent_ino, xattr::MAY_EXEC) { return err_reply(-13); }
     let ino = dir_lookup(ms, parent_ino, name);
     if ino == 0 { return err_reply(-2); }
     let iblkaddr = nat_lookup(ms, ino);
     let is_dir = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_is_dir(iblk) };
     if is_dir { return err_reply(-21); } // EISDIR — use rmdir() instead
+    // Write on the parent, plus the sticky rule for a directory like /tmp.
+    if let Err(e) = may_delete_in(ms, parent_ino, ino) { return err_reply(e); }
     if !dir_remove_entry(ms, parent_ino, name) { return err_reply(-2); }
 
     // Drop one reference. Blocks are reclaimable only when the count reaches
@@ -2544,13 +2658,11 @@ fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64,
     };
     let (parent_rel, name) = path_split(rel);
     if name.is_empty() { return err_reply(-17); } // EEXIST — the mount point
-    let parent_ino = if parent_rel.is_empty() || parent_rel == b"/" {
-        ms.sb.root_ino
-    } else {
-        resolve_path(ms, parent_rel)
+    let parent_ino = match resolve_parent(ms, parent_rel) {
+        Ok(p) => p,
+        Err(e) => return err_reply(e),
     };
-    if parent_ino == 0 { return err_reply(-2); }
-    if dir_lookup(ms, parent_ino, name) != 0 { return err_reply(-17); } // EEXIST
+    if let Err(e) = create_gate(ms, parent_ino, name) { return err_reply(e); }
 
     // Copy the target off the caller's buffer before any allocation runs: the
     // pointer is only guaranteed live for the duration of this call, and the
@@ -2605,8 +2717,7 @@ fn handle_readlink(ms: &mut MountState, path_ptr: u64, buf_ptr: u64, buf_len: u6
         Some(r) => r,
         None    => return err_reply(-2),
     };
-    let ino = resolve_path_ex(ms, rel, false);
-    if ino == 0 { return err_reply(-2); }
+    let ino = match resolve_path_r(ms, rel, false) { Ok(i) => i, Err(e) => return err_reply(e) };
 
     let addr = nat_lookup(ms, ino);
     let (mode, size) = {
@@ -2639,8 +2750,10 @@ fn handle_link(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
     let new_rel = match get_relative_path(ms, new_bytes) { Some(r) => r, None => return err_reply(-18) }; // EXDEV
 
     // link(2) does not follow the final component of either path.
-    let src_ino = resolve_path_ex(ms, old_rel, false);
-    if src_ino == 0 { return err_reply(-2); }
+    let src_ino = match resolve_path_r(ms, old_rel, false) {
+        Ok(i) => i,
+        Err(e) => return err_reply(e),
+    };
 
     let addr = nat_lookup(ms, src_ino);
     let (mode, links) = {
@@ -2653,13 +2766,11 @@ fn handle_link(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
 
     let (parent_rel, name) = path_split(new_rel);
     if name.is_empty() { return err_reply(-17); }
-    let parent_ino = if parent_rel.is_empty() || parent_rel == b"/" {
-        ms.sb.root_ino
-    } else {
-        resolve_path(ms, parent_rel)
+    let parent_ino = match resolve_parent(ms, parent_rel) {
+        Ok(p) => p,
+        Err(e) => return err_reply(e),
     };
-    if parent_ino == 0 { return err_reply(-2); }
-    if dir_lookup(ms, parent_ino, name) != 0 { return err_reply(-17); } // EEXIST
+    if let Err(e) = create_gate(ms, parent_ino, name) { return err_reply(e); }
 
     let ftype = match mode & S_IFMT {
         S_IFLNK => DT_LNK,
@@ -2691,8 +2802,7 @@ fn handle_chmod(ms: &mut MountState, path_ptr: u64, mode: u32, follow: bool,
         Some(r) => r,
         None    => return err_reply(-2), // ENOENT
     };
-    let ino = resolve_path_ex(ms, rel, follow);
-    if ino == 0 { return err_reply(-2); }
+    let ino = match resolve_path_r(ms, rel, follow) { Ok(i) => i, Err(e) => return err_reply(e) };
     chmod_inode(ms, ino, mode, euid)
 }
 
@@ -2777,8 +2887,7 @@ fn handle_chown(ms: &mut MountState, path_ptr: u64, uid: u32, gid: u32, follow: 
         Some(r) => r,
         None    => return err_reply(-2),
     };
-    let ino = resolve_path_ex(ms, rel, follow);
-    if ino == 0 { return err_reply(-2); }
+    let ino = match resolve_path_r(ms, rel, follow) { Ok(i) => i, Err(e) => return err_reply(e) };
     chown_inode(ms, ino, uid, gid, euid, egid)
 }
 
@@ -2862,17 +2971,17 @@ fn handle_rmdir(ms: &mut MountState, path_ptr: u64) -> Message {
         None    => return err_reply(-2),
     };
     let (parent_rel, name) = path_split(rel);
-    let parent_ino = if parent_rel.is_empty() || parent_rel == b"/" {
-        ms.sb.root_ino
-    } else {
-        resolve_path(ms, parent_rel)
+    let parent_ino = match resolve_parent(ms, parent_rel) {
+        Ok(p) => p,
+        Err(e) => return err_reply(e),
     };
-    if parent_ino == 0 { return err_reply(-2); }
+    if !may_access_ino(ms, parent_ino, xattr::MAY_EXEC) { return err_reply(-13); }
     let ino = dir_lookup(ms, parent_ino, name);
     if ino == 0 { return err_reply(-2); }
     let iblkaddr = nat_lookup(ms, ino);
     let is_dir = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_is_dir(iblk) };
     if !is_dir { return err_reply(-20); } // ENOTDIR
+    if let Err(e) = may_delete_in(ms, parent_ino, ino) { return err_reply(e); }
     if !dir_is_empty(ms, ino) { return err_reply(-39); } // ENOTEMPTY
     if !dir_remove_entry(ms, parent_ino, name) { return err_reply(-2); }
     // An empty directory has no other links (no child ".." points back), so
@@ -2911,21 +3020,29 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) ->
     };
     let (old_parent_rel, old_name) = path_split(old_rel);
     let (new_parent_rel, new_name) = path_split(new_rel);
-    let old_parent_ino = if old_parent_rel.is_empty() || old_parent_rel == b"/" {
-        ms.sb.root_ino
-    } else {
-        resolve_path(ms, old_parent_rel)
+    let old_parent_ino = match resolve_parent(ms, old_parent_rel) {
+        Ok(p) => p, Err(e) => return err_reply(e),
     };
-    let new_parent_ino = if new_parent_rel.is_empty() || new_parent_rel == b"/" {
-        ms.sb.root_ino
-    } else {
-        resolve_path(ms, new_parent_rel)
+    let new_parent_ino = match resolve_parent(ms, new_parent_rel) {
+        Ok(p) => p, Err(e) => return err_reply(e),
     };
-    if old_parent_ino == 0 || new_parent_ino == 0 { return err_reply(-2); }
+    if !may_access_ino(ms, old_parent_ino, xattr::MAY_EXEC) { return err_reply(-13); }
     let ino = dir_lookup(ms, old_parent_ino, old_name);
     if ino == 0 { return err_reply(-2); }
     let iblkaddr = nat_lookup(ms, ino);
     let is_dir = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_is_dir(iblk) };
+
+    // Permissions, Linux may_delete/may_create order: removing the source
+    // name from its parent (write+search, sticky rule on the source), creating
+    // the destination name (write+search on the new parent, sticky rule on a
+    // replaced victim), and — for a directory changing parents — write on the
+    // directory itself, since its ".." is rewritten.
+    if let Err(e) = may_delete_in(ms, old_parent_ino, ino) { return err_reply(e); }
+    if let Err(e) = may_modify_dir(ms, new_parent_ino) { return err_reply(e); }
+    if is_dir && new_parent_ino != old_parent_ino
+        && !may_access_ino(ms, ino, xattr::MAY_WRITE) {
+        return err_reply(-13);
+    }
 
     // POSIX rename atomically replaces an existing destination (the atomic-
     // write idiom — write tempfile, rename over the real name — depends on
@@ -2935,6 +3052,7 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) ->
     if dst_ino != 0 {
         if flags & RENAME_NOREPLACE != 0 { return err_reply(-17); } // EEXIST
         if dst_ino == ino { return ok_reply(); } // same file — POSIX no-op
+        if let Err(e) = may_delete_in(ms, new_parent_ino, dst_ino) { return err_reply(e); }
         let dst_iblkaddr = nat_lookup(ms, dst_ino);
         let dst_is_dir =
             { let iblk = ms.cache.read(ms.dev, dst_iblkaddr as u64); inode_is_dir(iblk) };
@@ -3177,9 +3295,7 @@ fn xattr_path_ino(ms: &mut MountState, path_ptr: u64, follow: bool) -> Result<u3
         Some(r) => r,
         None => return Err(err_reply(-2)), // ENOENT
     };
-    let ino = resolve_path_ex(ms, rel, follow);
-    if ino == 0 { return Err(err_reply(-2)); }
-    Ok(ino)
+    match resolve_path_r(ms, rel, follow) { Ok(i) => Ok(i), Err(e) => Err(err_reply(e)) }
 }
 
 /// Resolve an f-form xattr op to an inode via the open-file table (arg0 is the
@@ -3415,6 +3531,10 @@ fn caller_creds(pid: u32) -> (u32, u32) {
 
 fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message {
     let (euid, egid) = caller_creds(caller_pid);
+    // Published for the path walk (`resolve_path_ex`) and the parent-directory
+    // gates (`may_access_ino`), which run below this frame for every path op.
+    ms.euid = euid;
+    ms.egid = egid;
     match msg.tag {
         VFS_OPEN       => handle_open(ms, arg(msg,0), arg(msg,1), arg(msg,2), euid, egid),
         VFS_READ       => handle_read(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
@@ -3552,6 +3672,9 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
         core::ptr::addr_of_mut!((*p).sb).write(sb);
         core::ptr::addr_of_mut!((*p).cp).write(cp);
         core::ptr::addr_of_mut!((*p).dirty_writes).write(0);
+        core::ptr::addr_of_mut!((*p).euid).write(0);
+        core::ptr::addr_of_mut!((*p).egid).write(0);
+        core::ptr::addr_of_mut!((*p).walk_err).write(0);
         let files = core::ptr::addr_of_mut!((*p).open_files) as *mut OpenFile;
         for i in 0..MAX_OPEN_FILES {
             files.add(i).write(OpenFile::empty());

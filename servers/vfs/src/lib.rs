@@ -2193,13 +2193,13 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_GETDENTS64   => handle_getdents64(caller_pid, arg(msg,0) as usize,
                                                arg(msg,1) as usize, arg(msg,2) as usize),
         VFS_ALLOC_FD     => handle_alloc_fd(caller_pid, arg(msg,0) as usize),
-        VFS_UNLINK       => handle_unlink(arg(msg,0) as usize),
+        VFS_UNLINK       => handle_unlink(caller_pid, arg(msg,0) as usize),
         VFS_MKDIR        => handle_mkdir(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         VFS_MKNOD        => handle_mknod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         VFS_FTRUNCATE    => handle_ftruncate(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_FSYNC        => handle_fsync(caller_pid, arg(msg,0) as usize),
         VFS_SYNC         => handle_sync(),
-        VFS_RENAME       => handle_rename(arg(msg,0) as usize, arg(msg,1) as usize,
+        VFS_RENAME       => handle_rename(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize,
                                           arg(msg,2) as usize),
         VFS_FD_PATH      => handle_fd_path(caller_pid, arg(msg,0) as usize,
                                             arg(msg,1) as usize, arg(msg,2) as usize),
@@ -2214,7 +2214,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
                                                         arg(msg,1) as usize),
         VFS_IOCTL            => handle_ioctl(caller_pid, arg(msg,0) as usize,
                                               arg(msg,1) as usize, arg(msg,2) as usize),
-        VFS_RMDIR            => handle_rmdir(arg(msg,0) as usize),
+        VFS_RMDIR            => handle_rmdir(caller_pid, arg(msg,0) as usize),
         VFS_FLOCK            => handle_flock(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         VFS_CHMOD            => handle_chmod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, true),
         VFS_LCHMOD           => handle_chmod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, false),
@@ -2230,7 +2230,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_SYMLINK          => handle_symlink(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_READLINK         => handle_readlink(arg(msg,0) as usize, arg(msg,1) as usize,
                                                 arg(msg,2) as usize),
-        VFS_LINK             => handle_link(arg(msg,0) as usize, arg(msg,1) as usize),
+        VFS_LINK             => handle_link(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_LSTAT            => stat_common(arg(msg,0) as usize, arg(msg,1) as usize, false),
         VFS_SETXATTR | VFS_LSETXATTR
                              => handle_setxattr(caller_pid, msg.tag, arg(msg,0) as usize,
@@ -2491,15 +2491,115 @@ fn is_tmp_path(path: &[u8]) -> bool {
 }
 
 /// S_IFDIR mode (type | permission bits) for a RAMFS_DIRS pseudo-directory.
-/// The K1 tmpfs mount roots carry conventional perms: `/dev/shm` is
-/// world-writable + sticky (1777, like a real shm mount). Everything else
-/// keeps the historical 0755 (`/run/user` is 0755 root, like Linux; the
-/// per-uid dirs under it are pool entries carrying their own uid + 0700).
+/// The tmpfs mount roots carry the conventional Linux perms, and since the
+/// VFS now enforces them on creation these are load-bearing: `/tmp` and
+/// `/dev/shm` are world-writable + sticky (1777) so any uid can create there
+/// but only remove its own entries; `/run/user` stays 0755 root — the per-uid
+/// dirs under it are created by root (`userland/init` seeds one per account)
+/// and are pool entries carrying their own uid + 0700. Everything else keeps
+/// the historical 0755.
 fn ramfs_dir_mode(dir: &[u8]) -> u32 {
     match dir {
-        b"/dev/shm" => 0o041777,
-        _           => 0o040755,
+        b"/tmp" | b"/dev/shm" => 0o041777,
+        _                     => 0o040755,
     }
+}
+
+// ── tmpfs permission gates ───────────────────────────────────────────────────
+//
+// One evaluator for the whole pool: `xattr::may_access` on the entry's meta
+// (`tmp_meta`) and its stored access ACL. The gates below only decide WHICH
+// inode is the subject — the parent for create/remove, each prefix component
+// for traversal (`tmp_resolve_links`), the socket node for connect.
+
+/// Meta of a tmpfs mount root ("/tmp", "/dev/shm", "/run/user"): root-owned,
+/// mode from `ramfs_dir_mode`, no ACL.
+fn tmp_root_meta(root: &[u8]) -> xattr::FileMeta {
+    xattr::FileMeta { mode: ramfs_dir_mode(root) as u16, uid: 0, gid: 0 }
+}
+
+/// `xattr::may_access` on pool entry `idx` (resolved through `tmp_owner`, so a
+/// hard-link alias is judged by the inode it names).
+fn tmp_may(tmp: &[TmpFileEntry], idx: usize, euid: u32, egid: u32, mask: u8) -> bool {
+    let e = &tmp[tmp_owner(tmp, idx)];
+    let meta = tmp_meta(e);
+    let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+    xattr::may_access(&meta, euid, egid, acl, mask)
+}
+
+/// Check `mask` against directory `dir` (a mount root or a pool directory).
+/// `Err(-ENOENT)` if it does not exist, `Err(-ENOTDIR)` if it is not a
+/// directory, `Err(-EACCES)` if the caller lacks the permission. The
+/// creation/removal gates call this with `MAY_WRITE | MAY_EXEC`.
+fn tmp_dir_may(tmp: &[TmpFileEntry], dir: &[u8], euid: u32, egid: u32, mask: u8) -> Result<(), i32> {
+    if is_tmpfs_root(dir) {
+        return if xattr::may_access(&tmp_root_meta(dir), euid, egid, None, mask) { Ok(()) } else { Err(-13) };
+    }
+    match tmp_find(tmp, dir) {
+        None => Err(-2),
+        Some(i) if !tmp[i].is_dir => Err(-20),
+        Some(i) => if tmp_may(tmp, i, euid, egid, mask) { Ok(()) } else { Err(-13) },
+    }
+}
+
+/// Gate for creating a NEW entry `path` in the tmpfs pool, in Linux's order
+/// (`filename_create` then `may_create`): search on the parent (EACCES),
+/// then the existence probe (EEXIST), then write on the parent (EACCES).
+/// The order is observable: `mkdir /tmp` as a user is "File exists", not
+/// "Permission denied", and Rust's `create_dir_all` relies on it — it treats
+/// any error other than NotFound as fatal unless the path already is a
+/// directory... which it never gets to ask when the answer was EACCES.
+/// Existence is not a secret to anyone with search permission anyway
+/// (`stat` tells).
+fn tmp_create_gate(tmp: &[TmpFileEntry], path: &[u8], euid: u32, egid: u32) -> Result<(), i32> {
+    let parent = match tmp_parent(path) { Some(p) => p, None => return Err(-2) }; // ENOENT
+    tmp_dir_may(tmp, parent, euid, egid, xattr::MAY_EXEC)?;
+    if tmp_find(tmp, path).is_some() { return Err(-17); }                        // EEXIST
+    tmp_dir_may(tmp, parent, euid, egid, xattr::MAY_WRITE | xattr::MAY_EXEC)
+}
+
+/// The sticky rule for removing/replacing pool entry `victim` inside `parent`
+/// (`xattr::sticky_denies`): true means EPERM.
+fn tmp_sticky_denies(tmp: &[TmpFileEntry], parent: &[u8], victim: usize, euid: u32) -> bool {
+    let dmeta = if is_tmpfs_root(parent) {
+        tmp_root_meta(parent)
+    } else {
+        match tmp_find(tmp, parent) { Some(i) => tmp_meta(&tmp[i]), None => return false }
+    };
+    let vuid = tmp[tmp_owner(tmp, victim)].uid;
+    xattr::sticky_denies(&dmeta, vuid, euid)
+}
+
+/// Removal gate: write + search on `parent`, then the sticky rule for `victim`.
+fn tmp_may_delete(tmp: &[TmpFileEntry], parent: &[u8], victim: usize, euid: u32, egid: u32) -> Result<(), i32> {
+    tmp_dir_may(tmp, parent, euid, egid, xattr::MAY_WRITE | xattr::MAY_EXEC)?;
+    if tmp_sticky_denies(tmp, parent, victim, euid) { Err(-1) } else { Ok(()) }
+}
+
+/// Search permission on every directory component of `path` strictly between
+/// its tmpfs mount root and byte offset `upto` (the '/' that starts the
+/// component being looked up). This is POSIX path traversal for the pool;
+/// the mount roots themselves are world-searchable and skipped. Root bypasses
+/// (`MAY_EXEC` on a directory is always granted to euid 0), and the check
+/// stops at the first component that fails, so a caller learns nothing about
+/// what lies below an unsearchable directory: EACCES, never ENOENT.
+fn tmp_check_traversal(tmp: &[TmpFileEntry], path: &[u8], upto: usize, euid: u32, egid: u32) -> Result<(), i32> {
+    if euid == 0 { return Ok(()); }
+    let root_len = match tmpfs_root_of(path) { Some(r) => r.len(), None => return Ok(()) };
+    let mut end = root_len;
+    while end < upto {
+        // `end` is the '/' preceding a component; find its end.
+        let mut ce = end + 1;
+        while ce < upto && path[ce] != b'/' { ce += 1; }
+        if ce > upto { break; } // the component starting at `upto` is the leaf — not traversed
+        match tmp_find(tmp, &path[..ce]) {
+            None => return Err(-2),
+            Some(i) if !tmp[i].is_dir => return Err(-20),
+            Some(i) => if !tmp_may(tmp, i, euid, egid, xattr::MAY_EXEC) { return Err(-13); },
+        }
+        end = ce;
+    }
+    Ok(())
 }
 
 // ── tmpfs path convention ────────────────────────────────────────────────────
@@ -2560,12 +2660,6 @@ fn tmp_find(tmp: &[TmpFileEntry], path: &[u8]) -> Option<usize> {
     tmp.iter().position(|e| {
         e.in_use && !e.ephemeral && e.path_len == path.len() && &e.path[..e.path_len] == path
     })
-}
-
-/// True when `path` names an existing directory that entries may be created
-/// under: "/tmp" always, otherwise an in-use `is_dir` pool entry.
-fn tmp_dir_exists(tmp: &[TmpFileEntry], path: &[u8]) -> bool {
-    is_tmpfs_root(path) || tmp_find(tmp, path).map_or(false, |i| tmp[i].is_dir)
 }
 
 /// True when any pool entry (other than `skip`) lives under directory `dir`.
@@ -2837,6 +2931,11 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
     let mut cur_len = normalize_abs_floor(input, &mut cur, floor);
     let mut hops = 0u32;
 
+    // The caller's credentials, for the traversal check on each directory the
+    // walk passes through. Taken before TMP_FILES (RUN_QUEUE is never taken
+    // under it here).
+    let (euid, egid) = (sched::current_euid(), sched::current_egid());
+
     loop {
         let path = &cur[..cur_len];
         // Left the tmpfs namespace (an absolute target pointing elsewhere) —
@@ -2871,6 +2970,16 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
                 }
                 comp_start = comp_end;
             }
+            // Traversal: every directory walked to reach the symlink (or, when
+            // fully resolved, every directory above the final component) must
+            // be searchable by the caller. Checked on each hop so a link
+            // reached through an unsearchable directory is refused even when
+            // its body leads somewhere the caller could otherwise reach.
+            let upto = match found {
+                Some((cs, _, _, _)) => cs,
+                None => path.iter().rposition(|&b| b == b'/').unwrap_or(0),
+            };
+            tmp_check_traversal(&tmp[..], path, upto, euid, egid)?;
             found
         };
 
@@ -3458,7 +3567,9 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             let excl     = create && flags & O_EXCL != 0;
             let accmode  = flags & 0x3;
             let want_read  = accmode != O_WRONLY;
-            let want_write = accmode == O_WRONLY || accmode == O_RDWR;
+            // O_TRUNC destroys content, so it needs write permission even on
+            // an O_RDONLY open (Linux may_open: O_TRUNC implies MAY_WRITE).
+            let want_write = accmode == O_WRONLY || accmode == O_RDWR || trunc;
             let euid = sched::euid_of(pid);
             let egid = sched::egid_of(pid);
 
@@ -3509,10 +3620,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 None if create => {
                     // The parent directory must already exist, exactly as on
                     // any real fs: `touch /tmp/nodir/f` is ENOENT, not a file
-                    // named "/tmp/nodir/f" that no directory can enumerate.
+                    // named "/tmp/nodir/f" that no directory can enumerate —
+                    // and the caller needs write + search on it to create.
                     match tmp_parent(path) {
-                        Some(p) if tmp_dir_exists(&tmp[..], p) => {}
-                        _ => return err_reply(-2), // ENOENT
+                        Some(p) => if let Err(e) = tmp_dir_may(&tmp[..], p, euid, egid,
+                                                               xattr::MAY_WRITE | xattr::MAY_EXEC) {
+                            return err_reply(e);
+                        },
+                        None => return err_reply(-2), // ENOENT
                     }
                     if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }
                     // Allocate a new slot.
@@ -3521,7 +3636,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                             tmp[idx] = TmpFileEntry::empty();
                             tmp[idx].in_use   = true;
                             tmp[idx].is_dir   = false;
-                            tmp[idx].mode     = mode & 0o777 & !sched::umask(u32::MAX);
+                            tmp[idx].mode     = mode & 0o7777 & !sched::umask(u32::MAX);
                             tmp[idx].uid      = euid;
                             tmp[idx].gid      = egid;
                             tmp_set_path(&mut tmp[idx], path);
@@ -6346,12 +6461,12 @@ fn handle_sync() -> Message {
 // See the comment on `tmpfs_path` for why the reverse order silently routed
 // all of /tmp's mutating operations at the pivoted-root F2FS mount.
 
-fn handle_rename(old_ptr: usize, new_ptr: usize, flags: usize) -> Message {
+fn handle_rename(pid: u32, old_ptr: usize, new_ptr: usize, flags: usize) -> Message {
     let (obuf, olen) = match read_cstr_raw(old_ptr) { Some(r) => r, None => return err_reply(-14) };
     let (nbuf, nlen) = match read_cstr_raw(new_ptr) { Some(r) => r, None => return err_reply(-14) };
 
     match (tmpfs_path(&obuf[..olen]), tmpfs_path(&nbuf[..nlen])) {
-        (Some(old), Some(new)) => tmpfs_rename(old, new, flags),
+        (Some(old), Some(new)) => tmpfs_rename(pid, old, new, flags),
         // One side in tmpfs, the other not: a real cross-filesystem move,
         // which is EXDEV. Coreutils' `mv` falls back to copy+unlink on this.
         (Some(_), None) | (None, Some(_)) => err_reply(-18),
@@ -6378,17 +6493,21 @@ fn handle_rename(old_ptr: usize, new_ptr: usize, flags: usize) -> Message {
 ///
 /// Renaming a directory rewrites every descendant's stored path, since the
 /// pool is flat and parentage is encoded in the path bytes alone.
-fn tmpfs_rename(old: &[u8], new: &[u8], flags: usize) -> Message {
+fn tmpfs_rename(pid: u32, old: &[u8], new: &[u8], flags: usize) -> Message {
     const RENAME_NOREPLACE: usize = 1;
     if old == new { return ok_reply(); }
     if is_tmpfs_root(old) || is_tmpfs_root(new) { return err_reply(-16); } // EBUSY — mount root
     if new.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }     // ENAMETOOLONG
+    let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
 
     let open_fds = tmp_open_fd_mask(); // before TMP_FILES: FD_TABLES → TMP_FILES
     // A DRM reference released from a clobbered destination inode, held until
     // the TMP_FILES guard is gone (see `DMABUF_RELEASE`).
     let mut clobbered_obj: Option<u32> = None;
     let mut tmp = TMP_FILES.lock();
+    // Search on the source's parent legitimises the lookup that follows.
+    let old_parent = match tmp_parent(old) { Some(p) => p, None => return err_reply(-16) };
+    if let Err(e) = tmp_dir_may(&tmp[..], old_parent, euid, egid, xattr::MAY_EXEC) { return err_reply(e); }
     let idx = match tmp_find(&tmp[..], old) { Some(i) => i, None => return err_reply(-2) };
     let src_is_dir = tmp[idx].is_dir;
 
@@ -6397,12 +6516,23 @@ fn tmpfs_rename(old: &[u8], new: &[u8], flags: usize) -> Message {
         return err_reply(-22); // EINVAL
     }
     let parent = match tmp_parent(new) { Some(p) => p, None => return err_reply(-16) };
-    if !tmp_dir_exists(&tmp[..], parent) { return err_reply(-2); } // ENOENT
+    // Permissions, Linux may_delete/may_create order: removing the source
+    // name (write+search on its parent, sticky rule), creating the destination
+    // name (write+search on the new parent), and write on a directory that
+    // changes parents.
+    if let Err(e) = tmp_may_delete(&tmp[..], old_parent, idx, euid, egid) { return err_reply(e); }
+    if let Err(e) = tmp_dir_may(&tmp[..], parent, euid, egid, xattr::MAY_WRITE | xattr::MAY_EXEC) {
+        return err_reply(e);
+    }
+    if src_is_dir && parent != old_parent && !tmp_may(&tmp[..], idx, euid, egid, xattr::MAY_WRITE) {
+        return err_reply(-13);
+    }
 
     // Destination handling, POSIX order: type mismatches first, then the
     // implicit removal of an existing target.
     if let Some(didx) = tmp_find(&tmp[..], new) {
         if flags & RENAME_NOREPLACE != 0 { return err_reply(-17); } // EEXIST
+        if tmp_sticky_denies(&tmp[..], parent, didx, euid) { return err_reply(-1); } // EPERM
         let dst_is_dir = tmp[didx].is_dir;
         if src_is_dir && !dst_is_dir { return err_reply(-20); }  // ENOTDIR
         if !src_is_dir && dst_is_dir { return err_reply(-21); }  // EISDIR
@@ -6464,17 +6594,22 @@ fn tmpfs_rename(old: &[u8], new: &[u8], flags: usize) -> Message {
     ok_reply()
 }
 
-fn handle_unlink(path_ptr: usize) -> Message {
+fn handle_unlink(pid: u32, path_ptr: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
 
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-21); } // EISDIR — mount root
+        let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
         let open_fds = tmp_open_fd_mask(); // before TMP_FILES: FD_TABLES → TMP_FILES
         let mut tmp = TMP_FILES.lock();
+        let parent = match tmp_parent(path) { Some(p) => p, None => return err_reply(-21) };
+        if let Err(e) = tmp_dir_may(&tmp[..], parent, euid, egid, xattr::MAY_EXEC) { return err_reply(e); }
         let (reply, freed_obj) = match tmp_find(&tmp[..], path) {
             Some(idx) if tmp[idx].is_dir => (err_reply(-21), None), // EISDIR — use rmdir()
-            // Drops the *name*. The bytes go only when the last name does —
+            // Drops the *name* — once write on the parent and the sticky rule
+            // allow it (a /tmp file belonging to someone else stays put). The
+            // bytes go only when the last name does —
             // see tmp_drop_name. A symlink lands here too (the choke point
             // deliberately did not follow the final component), so `rm l`
             // removes the link and never the file it points at.
@@ -6484,7 +6619,10 @@ fn handle_unlink(path_ptr: usize) -> Message {
             // so nothing is released here and `freed_obj` is None. It becomes
             // Some only if the name outlived every fd, which the PRIME
             // intercept's immediate unlink makes impossible in practice.
-            Some(idx) => (ok_reply(), tmp_drop_name(&mut tmp[..], idx, open_fds)),
+            Some(idx) => match tmp_may_delete(&tmp[..], parent, idx, euid, egid) {
+                Ok(())  => (ok_reply(), tmp_drop_name(&mut tmp[..], idx, open_fds)),
+                Err(e)  => (err_reply(e), None),
+            },
             None      => (err_reply(-2), None),
         };
         // TMP_FILES gone before the device is touched (see `DMABUF_RELEASE`).
@@ -6508,15 +6646,14 @@ fn handle_mkdir(pid: u32, path_ptr: usize, mode: u32) -> Message {
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-17); }              // EEXIST — mount root
         if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }    // ENAMETOOLONG
+        let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
         let mut tmp = TMP_FILES.lock();
-        if tmp_find(&tmp[..], path).is_some() { return err_reply(-17); }
         // Intermediate components must already exist — `mkdir -p` creates
         // them outermost-first, so this is the check that makes it correct
-        // rather than silently producing an orphaned "/tmp/a/b".
-        match tmp_parent(path) {
-            Some(p) if tmp_dir_exists(&tmp[..], p) => {}
-            _ => return err_reply(-2), // ENOENT
-        }
+        // rather than silently producing an orphaned "/tmp/a/b" — and the
+        // caller needs write + search on the parent, checked in Linux's
+        // order (see `tmp_create_gate`: EEXIST before the write check).
+        if let Err(e) = tmp_create_gate(&tmp[..], path, euid, egid) { return err_reply(e); }
         let idx = match tmp.iter().position(|e| !e.in_use) {
             Some(i) => i,
             None    => return err_reply(-28), // ENOSPC
@@ -6524,7 +6661,7 @@ fn handle_mkdir(pid: u32, path_ptr: usize, mode: u32) -> Message {
         tmp[idx] = TmpFileEntry::empty();
         tmp[idx].in_use = true;
         tmp[idx].is_dir = true;
-        tmp[idx].mode = mode & 0o777 & !sched::umask(u32::MAX);
+        tmp[idx].mode = mode & 0o7777 & !sched::umask(u32::MAX);
         tmp[idx].uid  = sched::euid_of(pid);
         tmp[idx].gid  = sched::egid_of(pid);
         tmp_set_path(&mut tmp[idx], path);
@@ -6564,12 +6701,9 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-17); }              // EEXIST — mount root
         if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }    // ENAMETOOLONG
+        let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
         let mut tmp = TMP_FILES.lock();
-        if tmp_find(&tmp[..], path).is_some() { return err_reply(-17); } // EEXIST
-        match tmp_parent(path) {
-            Some(p) if tmp_dir_exists(&tmp[..], p) => {}
-            _ => return err_reply(-2), // ENOENT
-        }
+        if let Err(e) = tmp_create_gate(&tmp[..], path, euid, egid) { return err_reply(e); }
         let idx = match tmp.iter().position(|e| !e.in_use) {
             Some(i) => i,
             None    => return err_reply(-28), // ENOSPC
@@ -6578,7 +6712,7 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
         tmp[idx].in_use  = true;
         tmp[idx].is_dir  = false;
         tmp[idx].is_fifo = mode & S_IFMT == S_IFIFO;
-        tmp[idx].mode = mode & 0o777 & !sched::umask(u32::MAX);
+        tmp[idx].mode = mode & 0o7777 & !sched::umask(u32::MAX);
         tmp[idx].uid  = sched::euid_of(pid);
         tmp[idx].gid  = sched::egid_of(pid);
         tmp_set_path(&mut tmp[idx], path);
@@ -6614,12 +6748,10 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
     };
     if is_tmpfs_root(tpath) { return -17; }             // EEXIST — the mount root
     if tpath.len() > MAX_TMP_PATH - 1 { return -36; }   // ENAMETOOLONG
+    let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
     let mut tmp = TMP_FILES.lock();
-    if tmp_find(&tmp[..], tpath).is_some() { return -17; } // EEXIST
-    match tmp_parent(tpath) {
-        Some(p) if tmp_dir_exists(&tmp[..], p) => {}
-        _ => return -2, // ENOENT
-    }
+    // A socket node is an entry like any other: write + search on the parent.
+    if let Err(e) = tmp_create_gate(&tmp[..], tpath, euid, egid) { return e; }
     let idx = match tmp.iter().position(|e| !e.in_use) {
         Some(i) => i, None => return -28, // ENOSPC
     };
@@ -6637,7 +6769,9 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
 /// connect(): resolve `path` (following symlinks on every component) to the
 /// `sock_id` of the S_IFSOCK node bound there. Returns the sock_id (>= 0) or a
 /// negative errno: -2 ENOENT (nothing there), -111 ECONNREFUSED (exists but is
-/// not a socket).
+/// not a socket), -13 EACCES (a prefix directory the caller may not search,
+/// or a socket node the caller may not write — connect needs write on the
+/// socket inode, exactly as on Linux; root bypasses).
 ///
 /// A non-tmpfs path is ENOENT, not EOPNOTSUPP: sockets can only ever be bound
 /// on tmpfs here, so no socket exists at such a path — and that is exactly
@@ -6645,7 +6779,7 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
 /// there (e.g. zbus probing /run/dbus/system_bus_socket on a system with no
 /// system bus). EOPNOTSUPP stays reserved for bind, where it correctly says
 /// "this filesystem cannot host a socket node".
-pub fn unix_resolve_node(_pid: u32, path: &[u8]) -> i64 {
+pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 {
     let mut resolved = [0u8; 256];
     let rpath = match tmp_resolve_links(path, true, &mut resolved) {
         Ok(n)  => &resolved[..n],
@@ -6655,9 +6789,13 @@ pub fn unix_resolve_node(_pid: u32, path: &[u8]) -> i64 {
         Some(p) => p,
         None    => return -2, // ENOENT — no socket can exist off-tmpfs
     };
+    let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
     let tmp = TMP_FILES.lock();
     match tmp_find(&tmp[..], tpath) {
-        Some(idx) if tmp[idx].is_sock => tmp[idx].sock_id as i64,
+        Some(idx) if tmp[idx].is_sock => {
+            if !tmp_may(&tmp[..], idx, euid, egid, xattr::MAY_WRITE) { return -13; } // EACCES
+            tmp[tmp_owner(&tmp[..], idx)].sock_id as i64
+        }
         Some(_) => -111, // exists, not a socket → ECONNREFUSED
         None    => -2,   // ENOENT
     }
@@ -6679,12 +6817,9 @@ fn handle_symlink(pid: u32, target_ptr: usize, link_ptr: usize) -> Message {
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-17); }           // EEXIST — mount root
         if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); } // ENAMETOOLONG
+        let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
         let mut tmp = TMP_FILES.lock();
-        if tmp_find(&tmp[..], path).is_some() { return err_reply(-17); } // EEXIST
-        match tmp_parent(path) {
-            Some(p) if tmp_dir_exists(&tmp[..], p) => {}
-            _ => return err_reply(-2), // ENOENT
-        }
+        if let Err(e) = tmp_create_gate(&tmp[..], path, euid, egid) { return err_reply(e); }
         let idx = match tmp.iter().position(|e| !e.in_use) {
             Some(i) => i,
             None    => return err_reply(-28), // ENOSPC
@@ -6769,7 +6904,7 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
 /// that to fall back to a copy. Directory sources are EPERM (Linux reserves
 /// directory hard links for the filesystem's own "." and ".." and refuses them
 /// to userspace, because a directory cycle has no safe unwind).
-fn handle_link(old_ptr: usize, new_ptr: usize) -> Message {
+fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
     let (obuf, olen) = match read_cstr_raw(old_ptr) { Some(r) => r, None => return err_reply(-14) };
     let (nbuf, nlen) = match read_cstr_raw(new_ptr) { Some(r) => r, None => return err_reply(-14) };
     let (oraw, nraw) = (&obuf[..olen], &nbuf[..nlen]);
@@ -6778,14 +6913,11 @@ fn handle_link(old_ptr: usize, new_ptr: usize) -> Message {
     match (otmp, ntmp) {
         (Some(old), Some(new)) => {
             if new.len() > MAX_TMP_PATH - 1 { return err_reply(-36); } // ENAMETOOLONG
+            let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
             let mut tmp = TMP_FILES.lock();
             let src = match tmp_find(&tmp[..], old) { Some(i) => i, None => return err_reply(-2) };
             if tmp[src].is_dir { return err_reply(-1); } // EPERM
-            if tmp_find(&tmp[..], new).is_some() { return err_reply(-17); } // EEXIST
-            match tmp_parent(new) {
-                Some(p) if tmp_dir_exists(&tmp[..], p) => {}
-                _ => return err_reply(-2), // ENOENT
-            }
+            if let Err(e) = tmp_create_gate(&tmp[..], new, euid, egid) { return err_reply(e); }
             let owner = tmp_owner(&tmp[..], src);
             let idx = match tmp.iter().position(|e| !e.in_use) {
                 Some(i) => i,
@@ -6827,15 +6959,19 @@ fn handle_link(old_ptr: usize, new_ptr: usize) -> Message {
     }
 }
 
-fn handle_rmdir(path_ptr: usize) -> Message {
+fn handle_rmdir(pid: u32, path_ptr: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
 
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-16); } // EBUSY — mount root
+        let (euid, egid) = (sched::euid_of(pid), sched::egid_of(pid));
         let mut tmp = TMP_FILES.lock();
+        let parent = match tmp_parent(path) { Some(p) => p, None => return err_reply(-16) };
+        if let Err(e) = tmp_dir_may(&tmp[..], parent, euid, egid, xattr::MAY_EXEC) { return err_reply(e); }
         let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
         if !tmp[idx].is_dir { return err_reply(-20); } // ENOTDIR
+        if let Err(e) = tmp_may_delete(&tmp[..], parent, idx, euid, egid) { return err_reply(e); }
         if tmp_has_descendants(&tmp[..], path, idx) { return err_reply(-39); } // ENOTEMPTY
         tmp[idx] = TmpFileEntry::empty();
         return ok_reply();
@@ -6875,7 +7011,7 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
             Some(idx) => {
                 let owner = tmp_owner(&tmp[..], idx);
                 if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
-                tmp[owner].mode = mode & 0o777;
+                tmp[owner].mode = mode & 0o7777;
                 tmp_acl_chmod_sync(&mut tmp[owner], mode);
                 ok_reply()
             }
@@ -6907,7 +7043,7 @@ fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
             let mut tmp = TMP_FILES.lock();
             let owner = tmp_owner(&tmp[..], idx);
             if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
-            tmp[owner].mode = mode & 0o777;
+            tmp[owner].mode = mode & 0o7777;
             tmp_acl_chmod_sync(&mut tmp[owner], mode);
             ok_reply()
         }
@@ -6931,9 +7067,10 @@ fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32, follow: bool) -> 
     let raw = &pbuf[..plen];
     if let Some(path) = tmpfs_path(raw) {
         let euid = sched::euid_of(pid);
+        let egid = sched::egid_of(pid);
         let mut tmp = TMP_FILES.lock();
         return match tmp_find(&tmp[..], path) {
-            Some(idx) => apply_chown(&mut tmp[idx], euid, uid, gid),
+            Some(idx) => { let o = tmp_owner(&tmp[..], idx); apply_chown(&mut tmp[o], euid, egid, uid, gid) }
             None => err_reply(-2), // ENOENT
         };
     }
@@ -6957,8 +7094,10 @@ fn handle_fchown(pid: u32, fd: usize, uid: u32, gid: u32) -> Message {
         VnodeKind::TmpFile { idx, .. } => {
             drop(tbls);
             let euid = sched::euid_of(pid);
+            let egid = sched::egid_of(pid);
             let mut tmp = TMP_FILES.lock();
-            apply_chown(&mut tmp[idx], euid, uid, gid)
+            let o = tmp_owner(&tmp[..], idx);
+            apply_chown(&mut tmp[o], euid, egid, uid, gid)
         }
         VnodeKind::MountedFile { port, file_id } => {
             drop(tbls);
@@ -6973,16 +7112,18 @@ fn handle_fchown(pid: u32, fd: usize, uid: u32, gid: u32) -> Message {
     }
 }
 
-/// Only root may change the owning uid; the owner (or root) may change gid.
-fn apply_chown(e: &mut TmpFileEntry, euid: u32, uid: u32, gid: u32) -> Message {
-    if uid != u32::MAX {
-        if euid != 0 { return err_reply(-1); } // EPERM
-        e.uid = uid;
+/// chown(2) rules, the same ones `chown_inode` applies on f2fs: only root may
+/// change the owning uid (a non-root owner may restate its own); the owner may
+/// change the gid only to a group it belongs to, which with no supplementary
+/// groups means its egid; anyone else is EPERM. All-or-nothing.
+fn apply_chown(e: &mut TmpFileEntry, euid: u32, egid: u32, uid: u32, gid: u32) -> Message {
+    if euid != 0 {
+        if euid != e.uid { return err_reply(-1); }                     // EPERM
+        if uid != u32::MAX && uid != e.uid { return err_reply(-1); }
+        if gid != u32::MAX && gid != egid  { return err_reply(-1); }
     }
-    if gid != u32::MAX {
-        if euid != 0 && euid != e.uid { return err_reply(-1); } // EPERM
-        e.gid = gid;
-    }
+    if uid != u32::MAX { e.uid = uid; }
+    if gid != u32::MAX { e.gid = gid; }
     ok_reply()
 }
 

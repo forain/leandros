@@ -497,6 +497,37 @@ pub fn acl_chmod_rewrite(value: &mut [u8], mode: u16) {
 
 // ── access evaluation ────────────────────────────────────────────────────────
 
+/// Permission-mask bits for `may_access`, Linux `MAY_*` values.
+pub const MAY_EXEC: u8 = 1;
+pub const MAY_WRITE: u8 = 2;
+pub const MAY_READ: u8 = 4;
+
+/// THE permission gate for every filesystem operation that consults an inode's
+/// mode — path traversal (`MAY_EXEC` on each directory component), creating or
+/// removing an entry (`MAY_WRITE | MAY_EXEC` on the parent), opening
+/// (`MAY_READ`/`MAY_WRITE`), and AF_UNIX `connect` (`MAY_WRITE` on the socket
+/// node). It is `access_check` with a Linux-style mask, so the two filesystems
+/// and the VFS share one evaluator (mode bits, stored POSIX ACL, root bypass).
+///
+/// Root (euid 0) passes every check except execute on a non-directory with no
+/// x bit at all — CAP_DAC_OVERRIDE semantics. The stored access ACL, if any,
+/// is honoured exactly as it is for open/faccessat.
+#[inline]
+pub fn may_access(meta: &FileMeta, euid: u32, egid: u32, acl: Option<&[u8]>, mask: u8) -> bool {
+    access_check(meta, euid, egid, acl,
+                 mask & MAY_READ != 0, mask & MAY_WRITE != 0, mask & MAY_EXEC != 0)
+}
+
+/// The sticky-directory rule (Linux `check_sticky`): unlinking, renaming over
+/// or renaming away an entry inside a directory with S_ISVTX set is allowed
+/// only to the entry's owner, the directory's owner, or root. `dir` is the
+/// parent's meta, `victim_uid` the owner of the entry being removed/replaced.
+/// Returns true when the operation must be refused with EPERM.
+#[inline]
+pub fn sticky_denies(dir: &FileMeta, victim_uid: u32, euid: u32) -> bool {
+    dir.mode & S_ISVTX != 0 && euid != 0 && euid != victim_uid && euid != dir.uid
+}
+
 /// Unified permission check for open/faccessat: POSIX 1003.1e ACL walk when
 /// a (non-trivial, stored) access ACL is present, classic mode bits
 /// otherwise. Root (euid 0) bypasses R/W always; X needs at least one x bit

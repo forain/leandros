@@ -1,0 +1,11 @@
+[package]
+name = "permtest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "permtest"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }
