@@ -51,29 +51,23 @@ Reconciled against `main` at `60f49bd` following the 2026-09-15/16 bug sweep
   long holder is not yet found.
 - `utimensat` is a kernel no-op; exec x-bit unchecked; no supplementary groups; default-ACL
   inheritance missing.
+- brush wedges the login shell if a pipeline wait errors before it restores the foreground
+  pgrp (bash restores it regardless; brush doesn't).
+- brush `fg` of a stopped PIPELINE re-reports Stopped (`kill` vs `killpg` — `../brush`).
+- `cmd &` shows `<pid unknown>`.
+- Super+T did not fire in a serial-started session.
+- x86_64 serial Ctrl-T dump loses a ~1.5 KB chunk.
+- `[WDOG] cosmic-comp mmap ~2 s` now seen on aarch64/TCG too (previously x86_64-only).
+- `/run/cosmic-greeter` is not seeded for the greeter account.
+- vfstest leaves residue on re-run in the same boot/image (`/tmp/jail`, `xa_list`) — run once
+  per fresh image.
 - Everything in the pre-existing numbered `## Open work` table and *Road to a complete COSMIC
   desktop* below not named here (P2/P3, RPi5 hardware lanes, verification gaps) still stands.
 
-**In flight (lane branches on `origin`, NOT merged into `main`):**
-- **`lane/perms`** (`ee52c98`) — permission enforcement VERIFIED on aarch64 (permtest 25/25,
-  vfstest/f2fstest/scmtest/sigtest2 green, `/run/user/{0,990,1000}` seeded 0700); greetd
-  stripping `XDG_SESSION_CLASS` (which broke the greeter's `/run/user` lookup) is fixed via
-  `/etc/profile` keying on `GREETD_SOCK`. **Blocker: greeter login is 0/2** — boot-time
-  `cosmic-comp` opens `/dev/input/event*` but never polls them (no `[EVDEV] register` for the
-  compositor pid); a *respawned* chain hears input within 1 s. Likely a startup race between
-  libinput device-add and epoll interest, possibly PRE-EXISTING on main (unverified — check
-  `4b7096b` the same way). x86_64 not yet run. **Needs before merge:** a proven login on this
-  branch, both arches.
-- **`lane/idlecpu`** (`d7caad8`) — x86_64/KVM only. **Blocker: aarch64 unbuilt, and
-  sigtest2/killmt/smpwaketest not re-run** on this branch. Real idle floor dropped 388% → 200%
-  (rest is cosmic-comp's softpipe re-render loop); `wakepolltest` 45/45 there. **Needs before
-  merge:** sigsuspend/AF_UNIX parking verified, plus a full aarch64 build and test pass.
-- **`lane/jobctl`** (`0ff1d7f`) — code + build only, **runtime UNVERIFIED** (built on the
-  laptop, no QEMU there yet). Adds SIGTTIN/SIGTTOU, session-scoped `tcsetpgrp`, orphaned-pgrp
-  SIGHUP+SIGCONT, `/proc/<pid>/{stat,status}`, stop-inside-syscall retry, `#!` script exec.
-  Tests `jobtest` (6), `exectest` (9). HIGH-RISK paths: brush on the serial console and
-  cosmic-term's pty (`tcsetpgrp` can now fail where it never did). **Needs before merge:** a
-  real QEMU run on both arches, particular attention to the serial console and cosmic-term.
+**Merged since the 2026-09-16 sweep (were "in flight", now on `main`):**
+- **`lane/perms`** — `e67aeaf` (permission enforcement).
+- **`lane/idlecpu`** — `6378caf` (blocking syscalls park instead of yield-spinning).
+- **`lane/jobctl`** — `503b11e` (terminal job control + `#!` scripts).
 
 ---
 
