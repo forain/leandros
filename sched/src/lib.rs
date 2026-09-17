@@ -934,6 +934,15 @@ pub fn shared_pending_signals() -> u64 {
     rq.find_pid(tgid).map(|l| l.shared_signal_pending).unwrap_or(0)
 }
 
+/// Park `sigsuspend(2)`'s caller mask for the delivery pass on this syscall's
+/// return (see `Task::saved_sigmask`).
+pub fn stash_sigsuspend_mask(old_mask: u64) {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        t.saved_sigmask = Some(old_mask);
+    }
+}
+
 pub fn pending_signals() -> u64 {
     let pid = current_pid();
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.signal_pending).unwrap_or(0)

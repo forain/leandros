@@ -685,9 +685,11 @@ unsafe fn delayed_sender(target: pid_t, sig: c_int, delay_ms: i64) -> pid_t {
 }
 
 /// The parked-wait contract: woke within the window, and spent well under a
-/// quarter of that wall time on a CPU (a spin spends nearly all of it).
+/// quarter of that wall time on a CPU (a spin spends nearly all of it). `lo`
+/// is nominal; sleeps and deadlines are tick-granular (10 ms), so the wait
+/// may end up to one tick early.
 fn parked_ok(wall_ms: i64, cpu_ms: i64, lo: i64, hi: i64) -> bool {
-    wall_ms >= lo && wall_ms < hi && cpu_ms * 4 < wall_ms
+    wall_ms >= lo - 10 && wall_ms < hi && cpu_ms * 4 < wall_ms
 }
 
 unsafe fn report_timing(name: &[u8], wall_ms: i64, cpu_ms: i64) {
@@ -725,17 +727,21 @@ unsafe fn test_sigsuspend_parks() -> bool {
     let wall = clock_ms(CLOCK_MONOTONIC) - wall0;
     let cpu = clock_ms(CLOCK_THREAD_CPUTIME_ID) - cpu0;
     report_timing(name, wall, cpu);
+    // Sampled before the unblock below: the handler must have run on
+    // sigsuspend's own return, not when the mask was later lifted.
+    let seen = USR1_SEEN.load(Ordering::SeqCst);
+    let mut cur: sigset_t = 0;
+    let mask_ok = sigprocmask(SIG_BLOCK, core::ptr::null(), &mut cur) == 0 && cur & usr1 != 0;
+    sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
 
     let reaped = reap(child).is_some();
     // sigsuspend always returns -1/EINTR, the handler ran exactly once, and
-    // the caller's mask (SIGUSR1 blocked) is back in place.
+    // the caller's mask (SIGUSR1 blocked) was back in place afterwards.
     if r != -1 || e != EINTR { return fail_at(name, 4); }
-    if USR1_SEEN.load(Ordering::SeqCst) != 1 { return fail_at(name, 5); }
-    let mut cur: sigset_t = 0;
-    if sigprocmask(SIG_BLOCK, core::ptr::null(), &mut cur) != 0 || cur & usr1 == 0 { return fail_at(name, 6); }
+    if seen != 1 { return fail_at(name, 5); }
+    if !mask_ok { return fail_at(name, 6); }
     if !reaped { return fail_at(name, 7); }
     if !parked_ok(wall, cpu, SENDER_DELAY_MS, SENDER_DELAY_MS + 100) { return fail_at(name, 8); }
-    sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
     report(name, true)
 }
 
@@ -756,6 +762,7 @@ unsafe fn test_sigtimedwait_parks() -> bool {
     let wall = clock_ms(CLOCK_MONOTONIC) - wall0;
     let cpu = clock_ms(CLOCK_THREAD_CPUTIME_ID) - cpu0;
     report_timing(name, wall, cpu);
+    sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
 
     let reaped = reap(child).is_some();
     if r != SIGUSR1 { return fail_at(name, 3); }
@@ -766,7 +773,6 @@ unsafe fn test_sigtimedwait_parks() -> bool {
     if si_pid != child { return fail_at(name, 5); }
     if !reaped { return fail_at(name, 6); }
     if !parked_ok(wall, cpu, SENDER_DELAY_MS, SENDER_DELAY_MS + 100) { return fail_at(name, 7); }
-    sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
     report(name, true)
 }
 
@@ -785,9 +791,9 @@ unsafe fn test_sigtimedwait_timeout() -> bool {
     let wall = clock_ms(CLOCK_MONOTONIC) - wall0;
     let cpu = clock_ms(CLOCK_THREAD_CPUTIME_ID) - cpu0;
     report_timing(name, wall, cpu);
+    sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
 
     if r != -1 || e != EAGAIN { return fail_at(name, 2); }
     if !parked_ok(wall, cpu, 200, 300) { return fail_at(name, 3); }
-    sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
     report(name, true)
 }

@@ -2259,8 +2259,13 @@ fn sys_rt_sigsuspend(mask_ptr: usize, _sigsetsize: usize) -> isize {
         if pending_signals() & !new_mask != 0 { sched::block_on_poll_cancel(); break; }
         sched::block_on_poll_commit();
     }
-    // Restore old mask before returning.
-    let _ = replace_signal_mask(old_mask);
+    // The old mask is NOT put back here: the signal that ended the wait is
+    // unblocked only under `new_mask`, and it is delivered on this syscall's
+    // return to user space — restoring first would leave it pending and
+    // blocked, with the handler never run. `check_and_deliver_signals`
+    // consumes the saved mask: into the handler frame's `uc_sigmask`, or
+    // straight back into `signal_mask` when nothing was deliverable after all.
+    sched::stash_sigsuspend_mask(old_mask);
     -4 // EINTR
 }
 
