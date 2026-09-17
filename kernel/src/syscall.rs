@@ -2308,7 +2308,8 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
             return signo as isize;
         }
         if let Some(dl) = deadline {
-            if ticks() >= dl { return -110; } // ETIMEDOUT
+            // EAGAIN: POSIX and Linux report an expired wait this way, not ETIMEDOUT.
+            if ticks() >= dl { return -11; }
         }
         // Park (see sys_rt_sigsuspend); the deadline rides the poll tick.
         sched::block_on_poll_prepare_until(deadline.unwrap_or(u64::MAX));
