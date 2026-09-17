@@ -13,6 +13,9 @@
 //!     reports `WIFSTOPPED`, the child really makes no progress, SIGCONT
 //!     resumes it and `waitpid(WCONTINUED)` reports `WIFCONTINUED`, and
 //!     SIGKILL ends it — stopped or running — with `WIFSIGNALED(SIGKILL)`.
+//!  4. `sigsuspend()` and `sigtimedwait()` park the caller (they used to
+//!     yield-spin in the kernel): the wait's CPU time is a small fraction of
+//!     its wall time, the wake is prompt, and the timeout path is honoured.
 //!
 //! Same shape as sigtest: relibc_start_v1 entry, relibc's POSIX wrappers, one
 //! "<name>: PASS"/"<name>: FAIL" line per check and a final "SIGTEST2: PASS"
@@ -131,6 +134,10 @@ extern "C" {
     pub fn sigprocmask(how: c_int, set: *const sigset_t, oset: *mut sigset_t) -> c_int;
     pub fn pthread_sigmask(how: c_int, set: *const sigset_t, oset: *mut sigset_t) -> c_int;
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
+    pub fn clock_gettime(clk: c_int, tp: *mut timespec) -> c_int;
+    pub fn getpid() -> pid_t;
+    pub fn sigsuspend(mask: *const sigset_t) -> c_int;
+    pub fn sigtimedwait(set: *const sigset_t, info: *mut c_void, timeout: *const timespec) -> c_int;
 
     pub fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, fd: c_int, off: off_t) -> *mut c_void;
     pub fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int;
@@ -196,6 +203,10 @@ pub unsafe extern "C" fn sig2_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     // 3. job control
     if !test_stop_continue_kill() { failures += 1; }
     if !test_kill_while_stopped() { failures += 1; }
+    // 4. blocking signal waits park
+    if !test_sigsuspend_parks() { failures += 1; }
+    if !test_sigtimedwait_parks() { failures += 1; }
+    if !test_sigtimedwait_timeout() { failures += 1; }
 
     puts(b"--- sigtest2 done ---\0".as_ptr());
     if failures == 0 {
@@ -632,5 +643,151 @@ unsafe fn test_kill_while_stopped() -> bool {
     let st = match reap(child) { Some(s) => s, None => return fail_at(name, 9) };
     close(rfd);
     if !wifsignaled(st) || wtermsig(st) != SIGKILL { return fail_at(name, 10); }
+    report(name, true)
+}
+
+// ── 4. Blocking signal waits park instead of spinning ─────────────────────
+//
+// `sigsuspend` and `sigtimedwait` used to yield-spin in the kernel until a
+// signal arrived, pinning a CPU for the whole wait. They now park on the poll
+// wait-channel, so the waiter's CPU time (CLOCK_THREAD_CPUTIME_ID, which is
+// real accounting) must be a small fraction of its wall time, and the wake
+// must still be prompt: a child delivers SIGUSR1 after ~300 ms and the wait
+// returns inside [300, 400) ms. The timeout path is checked the same way.
+
+const CLOCK_MONOTONIC: c_int = 1;
+const CLOCK_THREAD_CPUTIME_ID: c_int = 3;
+const EINTR: c_int = 4;
+const SENDER_DELAY_MS: i64 = 300;
+
+static USR1_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn usr1_count(_sig: c_int) {
+    USR1_SEEN.fetch_add(1, Ordering::SeqCst);
+}
+
+unsafe fn clock_ms(clk: c_int) -> i64 {
+    let mut ts = timespec { tv_sec: 0, tv_nsec: 0 };
+    clock_gettime(clk, &mut ts);
+    ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
+}
+
+/// Fork a child that sends `sig` to the caller after `delay_ms`; its pid.
+unsafe fn delayed_sender(target: pid_t, sig: c_int, delay_ms: i64) -> pid_t {
+    let child = fork();
+    if child == 0 {
+        let ts = timespec { tv_sec: delay_ms / 1000, tv_nsec: (delay_ms % 1000) * 1_000_000 };
+        nanosleep(&ts, core::ptr::null_mut());
+        kill(target, sig);
+        _exit(0);
+    }
+    child
+}
+
+/// The parked-wait contract: woke within the window, and spent well under a
+/// quarter of that wall time on a CPU (a spin spends nearly all of it).
+fn parked_ok(wall_ms: i64, cpu_ms: i64, lo: i64, hi: i64) -> bool {
+    wall_ms >= lo && wall_ms < hi && cpu_ms * 4 < wall_ms
+}
+
+unsafe fn report_timing(name: &[u8], wall_ms: i64, cpu_ms: i64) {
+    // "<name>: wall=NNNms cpu=NNNms"
+    write(1, name.as_ptr(), name.len() - 1);
+    let mut line = *b": wall=0000ms cpu=0000ms\0";
+    let mut put = |off: usize, v: i64| {
+        let v = v.clamp(0, 9999) as u32;
+        line[off]     = b'0' + (v / 1000 % 10) as u8;
+        line[off + 1] = b'0' + (v / 100 % 10) as u8;
+        line[off + 2] = b'0' + (v / 10 % 10) as u8;
+        line[off + 3] = b'0' + (v % 10) as u8;
+    };
+    put(7, wall_ms);
+    put(18, cpu_ms);
+    puts(line.as_ptr());
+}
+
+unsafe fn test_sigsuspend_parks() -> bool {
+    let name = b"sigsuspend_parks\0";
+    let usr1: sigset_t = 1u64 << (SIGUSR1 - 1);
+    let act = zeroed_sigaction(Some(usr1_count));
+    if sigaction(SIGUSR1, &act, core::ptr::null_mut()) != 0 { return fail_at(name, 1); }
+    if sigprocmask(SIG_BLOCK, &usr1, core::ptr::null_mut()) != 0 { return fail_at(name, 2); }
+    USR1_SEEN.store(0, Ordering::SeqCst);
+
+    let child = delayed_sender(getpid(), SIGUSR1, SENDER_DELAY_MS);
+    if child < 0 { return fail_at(name, 3); }
+
+    let none: sigset_t = 0;
+    let wall0 = clock_ms(CLOCK_MONOTONIC);
+    let cpu0 = clock_ms(CLOCK_THREAD_CPUTIME_ID);
+    let r = sigsuspend(&none);
+    let e = errno();
+    let wall = clock_ms(CLOCK_MONOTONIC) - wall0;
+    let cpu = clock_ms(CLOCK_THREAD_CPUTIME_ID) - cpu0;
+    report_timing(name, wall, cpu);
+
+    let reaped = reap(child).is_some();
+    // sigsuspend always returns -1/EINTR, the handler ran exactly once, and
+    // the caller's mask (SIGUSR1 blocked) is back in place.
+    if r != -1 || e != EINTR { return fail_at(name, 4); }
+    if USR1_SEEN.load(Ordering::SeqCst) != 1 { return fail_at(name, 5); }
+    let mut cur: sigset_t = 0;
+    if sigprocmask(SIG_BLOCK, core::ptr::null(), &mut cur) != 0 || cur & usr1 == 0 { return fail_at(name, 6); }
+    if !reaped { return fail_at(name, 7); }
+    if !parked_ok(wall, cpu, SENDER_DELAY_MS, SENDER_DELAY_MS + 100) { return fail_at(name, 8); }
+    sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
+    report(name, true)
+}
+
+unsafe fn test_sigtimedwait_parks() -> bool {
+    let name = b"sigtimedwait_parks\0";
+    let usr1: sigset_t = 1u64 << (SIGUSR1 - 1);
+    if sigprocmask(SIG_BLOCK, &usr1, core::ptr::null_mut()) != 0 { return fail_at(name, 1); }
+
+    let child = delayed_sender(getpid(), SIGUSR1, SENDER_DELAY_MS);
+    if child < 0 { return fail_at(name, 2); }
+
+    // A full 128-byte siginfo_t: si_signo at +0, si_pid at +16.
+    let mut info = [0u64; 16];
+    let timeout = timespec { tv_sec: 2, tv_nsec: 0 };
+    let wall0 = clock_ms(CLOCK_MONOTONIC);
+    let cpu0 = clock_ms(CLOCK_THREAD_CPUTIME_ID);
+    let r = sigtimedwait(&usr1, info.as_mut_ptr() as *mut c_void, &timeout);
+    let wall = clock_ms(CLOCK_MONOTONIC) - wall0;
+    let cpu = clock_ms(CLOCK_THREAD_CPUTIME_ID) - cpu0;
+    report_timing(name, wall, cpu);
+
+    let reaped = reap(child).is_some();
+    if r != SIGUSR1 { return fail_at(name, 3); }
+    let p = info.as_ptr() as *const u8;
+    let si_signo = core::ptr::read_unaligned(p as *const i32);
+    let si_pid = core::ptr::read_unaligned(p.add(16) as *const i32);
+    if si_signo != SIGUSR1 { return fail_at(name, 4); }
+    if si_pid != child { return fail_at(name, 5); }
+    if !reaped { return fail_at(name, 6); }
+    if !parked_ok(wall, cpu, SENDER_DELAY_MS, SENDER_DELAY_MS + 100) { return fail_at(name, 7); }
+    sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
+    report(name, true)
+}
+
+unsafe fn test_sigtimedwait_timeout() -> bool {
+    let name = b"sigtimedwait_timeout\0";
+    let usr1: sigset_t = 1u64 << (SIGUSR1 - 1);
+    if sigprocmask(SIG_BLOCK, &usr1, core::ptr::null_mut()) != 0 { return fail_at(name, 1); }
+
+    // Nobody sends: the wait must end at the deadline with EAGAIN, having
+    // parked (not re-probed at full speed) for the whole 200 ms.
+    let timeout = timespec { tv_sec: 0, tv_nsec: 200_000_000 };
+    let wall0 = clock_ms(CLOCK_MONOTONIC);
+    let cpu0 = clock_ms(CLOCK_THREAD_CPUTIME_ID);
+    let r = sigtimedwait(&usr1, core::ptr::null_mut(), &timeout);
+    let e = errno();
+    let wall = clock_ms(CLOCK_MONOTONIC) - wall0;
+    let cpu = clock_ms(CLOCK_THREAD_CPUTIME_ID) - cpu0;
+    report_timing(name, wall, cpu);
+
+    if r != -1 || e != EAGAIN { return fail_at(name, 2); }
+    if !parked_ok(wall, cpu, 200, 300) { return fail_at(name, 3); }
+    sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
     report(name, true)
 }
