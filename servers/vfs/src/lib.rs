@@ -1028,6 +1028,30 @@ pub fn fd_nonblock(pid: u32, fd: usize) -> bool {
     false
 }
 
+/// The targeted-wake tag (`sched::poll_tag`) a blocking read()/write() on
+/// `fd` may park under, or `None` when the fd's kind has no producer that is
+/// trusted to wake its level changes with a tag — the caller then parks on
+/// the broadcast mask with a tick deadline instead. The `Some` kinds are
+/// exactly those whose `handle_poll` arm reports the same tag and whose
+/// producers (pipe write/read/close, pty writes, eventfd write, timerfd
+/// expiry, VT switch) call `wake_poll_tagged` with it, so a parked read()er
+/// has the same wake guarantee a poll(POLLIN) waiter on that fd has.
+pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<u64> {
+    use sched::{poll_class, poll_tag};
+    let pid = sched::tgid_of(pid);
+    let mut tbls = FD_TABLES.lock();
+    let tbl = find_tbl(pid, &mut *tbls)?;
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
+    match &tbl.fds[fd].kind {
+        VnodeKind::Pipe { ring, .. }  => Some(poll_tag(poll_class::PIPE, *ring as u32)),
+        VnodeKind::Pty { pair, .. }   => Some(poll_tag(poll_class::PTY, *pair as u32)),
+        VnodeKind::EventFd { slot }   => Some(poll_tag(poll_class::EVENTFD, *slot as u32)),
+        VnodeKind::TimerFd { slot }   => Some(poll_tag(poll_class::TIMERFD, *slot as u32)),
+        VnodeKind::DevVt { .. }       => Some(poll_tag(poll_class::DEVVT, 0)),
+        _ => None,
+    }
+}
+
 /// True when `fd`'s reads and writes are the machine console's: a
 /// `/dev/stdin|stdout|stderr` proxy whose target is the raw console (untracked
 /// fd 0-2, or itself another console proxy), or a virtual console node. The
@@ -1240,6 +1264,11 @@ fn find_mount_port(path: &[u8]) -> Option<u32> {
 /// than merely error. See the F_SETPIPE_SZ arm in handle_fcntl, which refuses
 /// requests above this so that case fails cleanly instead of wedging.
 const PIPE_RING_SIZE: usize = 16384;
+/// POSIX PIPE_BUF: a write of at most this many bytes is atomic — it is
+/// either written whole or (blocking fd) waits / (O_NONBLOCK) fails EAGAIN,
+/// never interleaved with another writer's bytes. Also the POLLOUT threshold:
+/// the write end is writable when at least PIPE_BUF bytes are free (Linux).
+const PIPE_BUF: usize = 4096;
 // The full COSMIC desktop session spawns ~14 long-lived components via
 // cosmic-session/launch_pad, each holding 3 stdio pipes (stdin/stdout/stderr)
 // for its whole lifetime so launch_pad can stream on_stdout/on_stderr — plus
@@ -1338,26 +1367,36 @@ fn pipe_ref_inc(kind: &VnodeKind) {
 /// When the last endpoint on BOTH sides is gone, reset the ring: the allocator
 /// in handle_pipe only reuses slots with `count == 0`, so a pipe abandoned with
 /// unread data would otherwise leak its slot for the lifetime of the system.
-fn pipe_drop_ref(rings: &mut [PipeRing; MAX_PIPES], ring: usize, is_write: bool) {
-    if is_write { rings[ring].writers = rings[ring].writers.saturating_sub(1); }
-    else        { rings[ring].readers = rings[ring].readers.saturating_sub(1); }
-    // The last writer or reader going away is a new pollable edge (EOF/HUP on
-    // the read end, EPIPE/ERR on the write end) — advance the seq so epoll
-    // re-fires it once, edge-triggered.
-    if (is_write && rings[ring].writers == 0) || (!is_write && rings[ring].readers == 0) {
-        rings[ring].seq = rings[ring].seq.wrapping_add(1);
-    }
-    if rings[ring].readers == 0 && rings[ring].writers == 0 {
-        rings[ring].read_pos  = 0;
-        rings[ring].write_pos = 0;
-        rings[ring].count     = 0;
-    }
+fn pipe_drop_ref(ring: usize, is_write: bool) {
+    let edge = {
+        let mut rings = PIPE_RINGS.lock();
+        if is_write { rings[ring].writers = rings[ring].writers.saturating_sub(1); }
+        else        { rings[ring].readers = rings[ring].readers.saturating_sub(1); }
+        // The last writer or reader going away is a new pollable edge (EOF/HUP on
+        // the read end, EPIPE/ERR on the write end) — advance the seq so epoll
+        // re-fires it once, edge-triggered.
+        let edge = (is_write && rings[ring].writers == 0) || (!is_write && rings[ring].readers == 0);
+        if edge { rings[ring].seq = rings[ring].seq.wrapping_add(1); }
+        if rings[ring].readers == 0 && rings[ring].writers == 0 {
+            rings[ring].read_pos  = 0;
+            rings[ring].write_pos = 0;
+            rings[ring].count     = 0;
+        }
+        edge
+    };
+    // A level change too: the read end becomes readable-at-EOF, the write end
+    // POLLERR. Until 2026-09-16 nothing woke a poller (or, now, a parked
+    // blocking read()er/write()r) for a close(2) — only a process exit did, via
+    // the SIGCHLD broadcast — so a live process closing its end left the peer
+    // asleep until some unrelated wake. PIPE_RINGS is released first (lock
+    // order: never take RUN_QUEUE under a server lock).
+    if edge { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PIPE, ring as u32)); }
 }
 
 fn pipe_ref_dec(kind: &VnodeKind) {
     match kind {
         VnodeKind::Pipe { ring, is_write } => {
-            pipe_drop_ref(&mut PIPE_RINGS.lock(), *ring, *is_write);
+            pipe_drop_ref(*ring, *is_write);
         }
         VnodeKind::Pty { pair, is_master } => {
             tty_server::pty::drop_ref(*pair as usize, *is_master);
@@ -3968,13 +4007,16 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 //    0 (EOF)     = write end closed → caller returns 0
                 return if r.writers > 0 { err_reply(-11) } else { val_reply(0) };
             }
-            // Only a FULL ring withholds POLLOUT (see handle_poll's write-end
-            // arm), so only a drain that starts from full is a level change.
-            let was_full = r.count == PIPE_RING_SIZE;
+            // The write end withholds POLLOUT while fewer than PIPE_BUF bytes
+            // are free (see handle_poll's write-end arm and the atomic-write
+            // rule in the write arm), so only a drain that crosses that line
+            // is a level change.
+            let was_full = PIPE_RING_SIZE - r.count < PIPE_BUF;
             let mut n = 0usize;
             while n < count.min(4096) {
                 match r.get() { Some(b) => { unsafe { *buf.add(n) = b; } n += 1; } None => break }
             }
+            let now_writable = PIPE_RING_SIZE - r.count >= PIPE_BUF;
             // Draining bytes frees ring space → a new POLLOUT edge for the
             // write end. Advance the seq so an epoll writer blocked on a full
             // pipe is re-woken edge-triggered.
@@ -3992,8 +4034,8 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // charged to every read.
             if n > 0 {
                 let tag = sched::poll_tag(sched::poll_class::PIPE, ring_idx as u32);
-                if was_full { sched::wake_poll_tagged(tag); }
-                else        { sched::request_poll_wake_tagged(tag); }
+                if was_full && now_writable { sched::wake_poll_tagged(tag); }
+                else                        { sched::request_poll_wake_tagged(tag); }
             }
             val_reply(n as u64)
         }
@@ -4186,10 +4228,17 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // only write that changes the read end's readiness *level*. See the
             // wake block below.
             let was_empty = r.count == 0;
+            // PIPE_BUF atomicity: a write of at most PIPE_BUF bytes goes in
+            // whole or not at all (EAGAIN; the kernel's blocking retry parks
+            // the writer until the reader has freed enough). Larger writes
+            // fill whatever is free and return the partial count, as Linux.
+            let free = PIPE_RING_SIZE - r.count;
             let mut n = 0usize;
-            while n < count {
-                if !r.put(unsafe { *buf.add(n) }) { break; }
-                n += 1;
+            if count > PIPE_BUF || free >= count {
+                while n < count {
+                    if !r.put(unsafe { *buf.add(n) }) { break; }
+                    n += 1;
+                }
             }
             if n > 0 { r.seq = r.seq.wrapping_add(1); } // new readable edge for the read end
             let no_space = n == 0 && count > 0;
@@ -4437,7 +4486,7 @@ fn handle_close(pid: u32, fd: usize) -> Message {
 
     match kind {
         VnodeKind::Pipe { ring, is_write } => {
-            pipe_drop_ref(&mut PIPE_RINGS.lock(), ring, is_write);
+            pipe_drop_ref(ring, is_write);
         }
         VnodeKind::Pty { pair, is_master } => {
             tty_server::pty::drop_ref(pair as usize, is_master);
@@ -4845,7 +4894,7 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
     if let Some(key) = lock_key_of(&kind) { release_locks(key, pid); }
     match kind {
         VnodeKind::Pipe { ring, is_write } => {
-            pipe_drop_ref(&mut PIPE_RINGS.lock(), ring, is_write);
+            pipe_drop_ref(ring, is_write);
         }
         VnodeKind::Pty { pair, is_master } => {
             tty_server::pty::drop_ref(pair as usize, is_master);
@@ -5094,7 +5143,10 @@ fn handle_fcntl_lock(pid: u32, kind: VnodeKind, cmd: usize, arg: usize) -> Messa
         }
         drop(locks);
         if cmd == F_SETLK { return err_reply(-11); } // EAGAIN
-        sched::yield_now("fcntl_setlkw");
+        // No release wakes a lock waiter; re-probe on the tick (10 ms) rather
+        // than spin a CPU for the whole hold.
+        sched::block_on_poll_prepare_until(sched::ticks() + 1);
+        sched::block_on_poll_commit();
     }
 }
 
@@ -5135,7 +5187,8 @@ fn handle_flock(pid: u32, fd: usize, op: u32) -> Message {
         }
         drop(locks);
         if nonblock { return err_reply(-11); } // EWOULDBLOCK
-        sched::yield_now("flock");
+        sched::block_on_poll_prepare_until(sched::ticks() + 1); // see F_SETLKW above
+        sched::block_on_poll_commit();
     }
 }
 
@@ -6215,8 +6268,8 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
             let ring = &PIPE_RINGS.lock()[r];
             let ev = if ring.readers == 0 {
                 POLLERR // reader gone: next write() gets EPIPE
-            } else if ring.count < PIPE_RING_SIZE {
-                POLLOUT
+            } else if PIPE_RING_SIZE - ring.count >= PIPE_BUF {
+                POLLOUT // a PIPE_BUF-sized write will not block (Linux rule)
             } else {
                 0
             };

@@ -247,41 +247,59 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                     clear_block_fields(t);
                 }
                 Step::Park
-            } else { match rq.get(idx) {
-                Some(t) => {
-                    let unmasked = t.signal_pending & !t.signal_mask;
-                    if unmasked == 0 { return; }
-                    // A synchronous fault signal (SIGSEGV et al.) is delivered
-                    // ahead of anything else pending: its handler must run
-                    // before the faulting instruction is retried.
-                    let sync = unmasked & crate::task::SYNCHRONOUS_MASK;
-                    let pick = if sync != 0 { sync } else { unmasked };
-                    let bit  = pick.trailing_zeros() as u32;
-                    let sig  = bit + 1;
-                    let mask = t.signal_mask;
-                    // Signal disposition is shared across the thread group: read
-                    // from the TGID leader so all threads see installed handlers.
-                    //
-                    // SIGKILL/SIGSTOP ignore that table entirely: POSIX says
-                    // they can be neither caught nor ignored, so a handler
-                    // registered for them (which `sys_sigaction` now rejects,
-                    // but an already-installed one could predate that) must not
-                    // be able to divert them.
-                    let action = if UNBLOCKABLE & (1u64 << bit) != 0 {
-                        crate::task::DEFAULT_SIGACTION
-                    } else {
-                        rq.find_pid(t.tgid)
-                            .map(|leader| leader.signal_actions[bit as usize])
-                            .unwrap_or(crate::task::DEFAULT_SIGACTION)
-                    };
-                    // Read the payload in the same critical section that picks
-                    // the signal, indexed by the same `bit` — the two can never
-                    // be sampled from different signals.
-                    let info = t.signal_info[bit as usize];
-                    Step::Deliver(sig, action, mask, info)
+            } else {
+                // A mask parked by `sigsuspend` (see `Task::saved_sigmask`) is
+                // what the handler frame restores; with nothing deliverable under
+                // the temporary mask it goes straight back.
+                let saved = rq.get(idx).and_then(|t| t.saved_sigmask);
+                let unmasked = match rq.get(idx) {
+                    Some(t) => t.signal_pending & !t.signal_mask,
+                    None => return,
+                };
+                if unmasked == 0 {
+                    if let Some(m) = saved {
+                        if let Some(t) = rq.get_mut(idx) { t.signal_mask = m; t.saved_sigmask = None; }
+                    }
+                    return;
                 }
-                None => return,
-            } }
+                let step = match rq.get(idx) {
+                    Some(t) => {
+                        // A synchronous fault signal (SIGSEGV et al.) is delivered
+                        // ahead of anything else pending: its handler must run
+                        // before the faulting instruction is retried.
+                        let sync = unmasked & crate::task::SYNCHRONOUS_MASK;
+                        let pick = if sync != 0 { sync } else { unmasked };
+                        let bit  = pick.trailing_zeros() as u32;
+                        let sig  = bit + 1;
+                        let mask = saved.unwrap_or(t.signal_mask);
+                        // Signal disposition is shared across the thread group: read
+                        // from the TGID leader so all threads see installed handlers.
+                        //
+                        // SIGKILL/SIGSTOP ignore that table entirely: POSIX says
+                        // they can be neither caught nor ignored, so a handler
+                        // registered for them (which `sys_sigaction` now rejects,
+                        // but an already-installed one could predate that) must not
+                        // be able to divert them.
+                        let action = if UNBLOCKABLE & (1u64 << bit) != 0 {
+                            crate::task::DEFAULT_SIGACTION
+                        } else {
+                            rq.find_pid(t.tgid)
+                                .map(|leader| leader.signal_actions[bit as usize])
+                                .unwrap_or(crate::task::DEFAULT_SIGACTION)
+                        };
+                        // Read the payload in the same critical section that picks
+                        // the signal, indexed by the same `bit` — the two can never
+                        // be sampled from different signals.
+                        let info = t.signal_info[bit as usize];
+                        Step::Deliver(sig, action, mask, info)
+                    }
+                    None => return,
+                };
+                if saved.is_some() {
+                    if let Some(t) = rq.get_mut(idx) { t.saved_sigmask = None; }
+                }
+                step
+            }
         };
 
         let (sig, action, old_mask, info) = match step {
