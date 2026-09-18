@@ -293,6 +293,15 @@ unsafe fn test_xattr_list(root: &[u8], name: &[u8]) -> bool {
     let mut pb = [0u8; 96];
     let path = mkpath(&mut pb, root, b"_list");
 
+    // Idempotent for a re-run in the same boot: setxattr/removexattr leave
+    // their marks on the *inode*, not the file's byte content, so
+    // O_CREAT|O_TRUNC against a leftover inode from an earlier run reopens
+    // that same inode with its xattrs intact (this matches real filesystem
+    // semantics — truncating a file never clears its xattrs). The "starts
+    // empty" assumption below only holds for a genuinely fresh inode, so
+    // unlink the leftover first (best-effort; ENOENT on a first run) to
+    // force a new one.
+    unlink(path);
     let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
     if fd < 0 { return report(name, false); }
     close(fd);
@@ -979,6 +988,15 @@ unsafe fn test_f2fs_ownership_enforced() -> bool {
 /// `/etc/passwd`.
 unsafe fn test_chroot_confines_symlink_resolution() -> bool {
     let name = b"chroot_confines_symlink_resolution\0";
+
+    // Idempotent for a re-run in the same boot: a prior run leaves
+    // `/tmp/jail` (containing `link`) behind on purpose (see the comment at
+    // the bottom of this function), so a bare `mkdir` here would fail with
+    // EEXIST on the second run and turn a pass into a spurious FAIL. Clear
+    // any leftovers first — best-effort, ignoring errors, since on a first
+    // run neither exists yet.
+    unlink(b"/tmp/jail/link\0".as_ptr());
+    rmdir(b"/tmp/jail\0".as_ptr());
 
     let pid = fork();
     if pid == 0 {

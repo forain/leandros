@@ -249,6 +249,39 @@ pub fn arch_serial_putc(c: u8) {
     unsafe { putc(c); }
 }
 
+/// Blocking putc for the explicit, human-triggered Ctrl-T task dump
+/// (`sched::dump_tasks`) only — never for routine IRQ-context output.
+///
+/// `putc` shares one sticky `TX_WEDGED` latch across every caller so that a
+/// back-pressured console costs one deadline per episode rather than one per
+/// byte (see its comment). That is the wrong trade for a diagnostic dump:
+/// dump_tasks() emits on the order of a kilobyte in one burst, and if a
+/// single byte's deadline expires mid-dump (a transient stall while the
+/// socket-backed chardev on the other end catches up, not a genuinely dead
+/// consumer), `TX_WEDGED` latches and every later byte in the *same dump*
+/// takes the single-probe-and-drop fast path with no wait at all — turning
+/// one transient blip into a dropped chunk the size of "however many bytes
+/// this loop emits before the host catches up", which is exactly the
+/// ~1.5 KB hole seen in the middle of Ctrl-T dumps. This path polls LSR.THRE
+/// with a full per-byte deadline and never reads or sets `TX_WEDGED`, so a
+/// transient stall costs at most one byte, not the rest of the dump — while
+/// still bounded (not a true indefinite wait) if the host is truly gone.
+pub unsafe fn putc_dump(c: u8) {
+    use core::arch::asm;
+    let deadline = rdtsc_raw().wrapping_add(UART_TX_WAIT_CYCLES);
+    loop {
+        let lsr: u8;
+        asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
+        if lsr & 0x20 != 0 { break; }
+        if rdtsc_raw().wrapping_sub(deadline) < (1u64 << 63) {
+            UART_TX_DROPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    asm!("out dx, al", in("dx") 0x3F8u16, in("al") c, options(nomem, nostack));
+}
+
 #[no_mangle]
 pub extern "C" fn arch_interrupt_save() -> usize {
     let rflags: usize;

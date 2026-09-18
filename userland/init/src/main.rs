@@ -289,6 +289,14 @@ unsafe fn run_session() {
 /// tmpfs is volatile, so this runs on every boot. The parse is deliberately
 /// tolerant: a malformed line is skipped, and a directory that already exists
 /// is simply re-owned.
+///
+/// Also seeds `/run/cosmic-greeter` for the `cosmic-greeter` account while
+/// it is here reading /etc/passwd for exactly this reason. Upstream ships it
+/// via tmpfiles.d (`debian/cosmic-greeter.tmpfiles`):
+///   d /run/cosmic-greeter 0755 cosmic-greeter cosmic-greeter -
+/// cosmic-config's system-scope store (used by the a11y/settings-daemon
+/// glue linked into the greeter binary) lands there; without it the greeter
+/// logs a missing-directory complaint every boot.
 unsafe fn seed_runtime_dirs() {
     let fd = open(b"/etc/passwd\0".as_ptr(), O_RDONLY, 0);
     if fd < 0 {
@@ -308,11 +316,22 @@ unsafe fn seed_runtime_dirs() {
     for line in buf[..total].split(|&b| b == b'\n') {
         if line.is_empty() || line[0] == b'#' { continue; }
         let mut fields = line.split(|&b| b == b':');
-        let _name = fields.next();
+        let name = fields.next();
         let _pw = fields.next();
         let uid = match fields.next().and_then(parse_u32) { Some(u) => u, None => continue };
         let gid = match fields.next().and_then(parse_u32) { Some(g) => g, None => continue };
         if uid == 0 { continue; }
+
+        if name == Some(&b"cosmic-greeter"[..]) {
+            // Mode and ownership mirror upstream's tmpfiles.d line exactly
+            // (0755, cosmic-greeter:cosmic-greeter) — see this function's
+            // doc comment. uid/gid come from /etc/passwd rather than a
+            // hardcoded 990 so a re-staged account still gets this right.
+            mkdir(b"/run/cosmic-greeter\0".as_ptr(), 0o755);
+            if chown(b"/run/cosmic-greeter\0".as_ptr(), uid, gid) != 0 {
+                write_str("WARNING: chown of /run/cosmic-greeter failed\n");
+            }
+        }
 
         // "/run/user/" + decimal uid + NUL.
         let mut path = [0u8; 32];
