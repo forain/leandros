@@ -162,8 +162,13 @@ impl Drop for AddressSpace {
                 }
             }
         }
-        // Free the page-table root (PGD on AArch64, PML4 on x86-64).
+        // Free the intermediate tables, then the root (PGD on AArch64, PML4
+        // on x86-64). Every level below the root was allocated by this
+        // address space's own mappings (fork maps page by page into a fresh
+        // root; nothing shares tables between roots), so the whole user
+        // tree goes with it.
         if self.page_table_root != 0 {
+            unsafe { crate::paging::free_user_page_tables(self.page_table_root); }
             buddy_free(self.page_table_root, 0);
         }
         // Flush stale TLB entries on all CPUs now that all mappings are gone.
