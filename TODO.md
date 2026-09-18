@@ -19,62 +19,50 @@ conclusion that rested on them being out of scope is void. **VT switching has si
 
 ---
 
-## Open work (2026-09-16 reconciliation)
+## Open work (2026-09-18 reconciliation)
 
-Reconciled against `main` at `60f49bd` following the 2026-09-15/16 bug sweep
-(`artifacts/notes/wave-2026-09-15-16.md`). Merged this wave: `lane/ctrlq`, `lane/timers`,
-`lane/drmsmoke`, `lane/buddy4g`, `lane/killmt`, `lane/hvfclock`.
+Reconciled against `main` following the 2026-09-18 ten-lane bug sweep
+(`artifacts/notes/wave-2026-09-18.md`; per-lane detail in
+`artifacts/notes/lane-<name>-2026-09-18.md`). Merged this wave through `integ/wave-0918`:
+`lane/timespec`, `lane/tsccal`, `lane/brush`, `lane/vfsperm2`, `lane/runq`, `lane/pollout`,
+`lane/execfd`, `lane/misc`, `lane/complk`, `lane/gpuirq`.
 
 **Still open:**
-- **P0 #5** — aarch64 "clicks ignored" on the linux desktop; needs a physical mouse to
-  reproduce/verify.
-- **Compositor-death memory leak** — ~140 MB of kernel memory leaks per `cosmic-comp` death;
-  a respawn storm hits `[BUDDY] Allocation failed`. Retest by killing the greeter's compositor
-  15× on `8d8edc2`-or-later; init should back off exponentially. (`lane/zinkimg` finding.)
-- `execve` from a non-leader thread leaves the fd table keyed by the old leader pid;
-  `kill_next_group_member` frees an off-CPU Blocked sibling's kernel stack in place.
-- aarch64 virtio-gpu completion is poller-only (GIC SPI INTx is the next step); reply-needing
-  ctrlq commands still spin under `VIRTIO_GPU` (~0.5% of traffic); flip-done events tick-paced.
-- greetd tokio `Bad read on self-pipe: EBADF` in the session `sh -c` wrapper (harmless,
-  unexplained); greeter keystroke-render lag — re-measure (clock fixed 2026-09-16).
-- x86_64/TCG `[WDOG] … cosmic-comp` one-off seen during integration verify (not reproduced;
-  not a blocker if seen again).
-- Timespec family still wrong: `nanosleep`/`sleep_ticks_from`, relative `FUTEX_WAIT`,
-  `poll`/`select`/`ppoll` timeouts compute deadlines from `ticks()` (fire up to 10 ms early;
-  sub-tick waits truncate to 0) instead of `monotonic_ns()`; `gettimeofday`/`time` are
-  tick-derived while `clock_gettime(REALTIME)` is not (two wall clocks); `timerfd_create`
-  ignores clockid; `setpgid` has no permission model.
-- ~~`RUN_QUEUE` is contended on most 100 Hz ticks with the greeter desktop idle (tick-hook
-  `try_lock` fails >50%) → every timed poll/epoll wake pays 1–2 ticks of retry latency; the
-  long holder is not yet found.~~ CLOSED 2026-09-18 (`lane/runq`, note
-  `artifacts/notes/lane-runq-2026-09-18.md`): measured 8.2 %, not >50 %, and there is no
-  long holder (99.9 % of holds < 1 µs) — it was ~760 k acquisitions/s, four per
-  synchronous server call from the compositor's render loop. Now 0 per call, tick failure
-  0.05 %, bounded `try_lock_spin` on the tick; `poll(10 ms)` overshoot p90 9.5 ms → 0.1 ms.
-  Ctrl-T prints a `[RQPROF]` block (`sched::lockwatch`, `HOLD_PROFILE` for the histogram).
-- `polltest` `pipe_epoll_pollout_reflects_ring_full` FAILS on main (seen 2026-09-18 on the
-  2026-09-16 image, both arches) — the tallies below still say 6/6.
-- ~~brush wedges the login shell if a pipeline wait errors / `fg` of a stopped pipeline
-  re-reports Stopped / `cmd &` shows `<pid unknown>`~~ — **FIXED 2026-09-18 (lane/brush)**, all
-  three were brush bugs (`../brush` `3423c0e`, pinned in `ports/brush/`): `fg`/`bg`/`kill %n`
-  signalled one pid instead of the job's pgrp (the real wedge: `cat` stayed stopped, `fg`
-  waited for ever), the terminal was not restored on pipeline error paths, and the `&`
-  announcement was formatted before the task had spawned. No pipeline wait actually errors on
-  LeandrOS. Regression: `scripts/shjobs.py` 36/36 both arches + brush's own pty tests. See
-  `artifacts/notes/lane-brush-2026-09-18.md`.
-- Super+T did not fire in a serial-started session.
-- x86_64 serial Ctrl-T dump loses a ~1.5 KB chunk.
-- `[WDOG] cosmic-comp mmap ~2 s` now seen on aarch64/TCG too (previously x86_64-only).
-- `/run/cosmic-greeter` is not seeded for the greeter account.
-- vfstest leaves residue on re-run in the same boot/image (`/tmp/jail`, `xa_list`) — run once
-  per fresh image.
+- **Leak residue:** ~55 MiB per greeter-chain death STILL leaks on x86_64 (not dumb bufs/page
+  tables/VMOs/pipes/fds/processes; suspects: kernel heap growth — `PAGE_REFS`, Vecs, `EXIT_LOG`,
+  net buffers — and f2fs behind the flooded `/var/log/greetd.log`); ~100–160 pages per plain
+  process death residual on both arches; `killmt exec_worker` leaks ~121 KiB per exec (one
+  order-5 block) — next: single-threaded exec loop to split plain-exec from takeover; 15-death
+  storm not re-run to the end; aarch64 `drmsmoke --leak` read 657 KiB/death while the greeter
+  was still starting (unseparated; 0 KiB/death on both arches with the greeter killed first —
+  merged-tree verify); memtest `lost_kib_per_death` 473 aarch64 / 507 x86_64 on the merged tree.
+- `fork` copies ~210 MiB eagerly for cosmic-comp (`mm/src/cow.rs`) — the transient that trips
+  `[BUDDY] Allocation failed`.
+- **gpuirq on KVM/Zink not re-run**: presents are now fenced (incl. SET_SCANOUT_BLOB) — run
+  `scripts/zinkbench.py` on the desktop before calling x86_64/KVM safe. Parked ctrlq wait still
+  holds `VIRTIO_GPU`; storm-guard path untested.
+- x86_64 audio stall detector now really waits 250 ms (was 56 ms on the 7950X) — run
+  `audio-glitch-test.sh` on the desktop.
+- POSIX timers / `setitimer` (tty server) still tick-based; wake latency is tick-bounded (≤ 10 ms
+  late) — and with timespec's never-early absolute deadlines a back-to-back `poll(10 ms)` loop
+  now overshoots a full tick every time (`polltest poll_timeout_wake_latency` FAILs on both
+  arches, p50 ≈ 9.3–9.9 ms; lane/runq's p90 ≤ 5 ms bound was calibrated on tick-floored
+  deadlines; bisected to the timespec×runq interaction, not execfd/complk/gpuirq — see the
+  verification section). Next: a one-shot timer armed to `NEXT_POLL_DEADLINE`.
+- `access(2)` uses euid not ruid; atime not updated on read; greeter-launch lacks `initgroups`;
+  vfstest header comment still says raw wait4 status (it is Linux-encoded).
+- `lock_leader_address_space` is now the top RUN_QUEUE site (~30 k/s); `pick_next` O(256);
+  cosmic-comp's thread is never idle (mmap/munmap/epoll churn).
+- `scripts/build-all.sh` runs `make clean` in the shared `../doomgeneric` — concurrent worktree
+  builds on one machine collide (plan in `lane-pollout` note: per-worktree/arch OBJDIR, drop
+  clean, atomic mv).
+- Super+T still does not fire in a serial-started session (one try, misc lane).
+- Unchanged from before: P0 #5 aarch64 clicks on the desktop (needs a physical mouse), greetd
+  `EBADF` self-pipe, greeter keystroke lag re-measure, `[WDOG] … cosmic-comp mmap ~2 s`.
+- Mac `~/code/brush` sibling is divergent: `ports/brush/sync.sh apply ~/code/brush` before
+  building brush on the Mac.
 - Everything in the pre-existing numbered `## Open work` table and *Road to a complete COSMIC
   desktop* below not named here (P2/P3, RPi5 hardware lanes, verification gaps) still stands.
-
-**Merged since the 2026-09-16 sweep (were "in flight", now on `main`):**
-- **`lane/perms`** — `e67aeaf` (permission enforcement).
-- **`lane/idlecpu`** — `6378caf` (blocking syscalls park instead of yield-spinning).
-- **`lane/jobctl`** — `503b11e` (terminal job control + `#!` scripts).
 
 ---
 
