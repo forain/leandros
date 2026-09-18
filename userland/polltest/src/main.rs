@@ -237,9 +237,12 @@ unsafe fn test_pipe_epoll_no_false_positive() -> bool {
 
 // ── 2. epoll POLLOUT reflects real ring occupancy, not "always writable" ────
 //
-// Fills the pipe's 4096-byte ring completely via one short write, then
+// Fills the pipe's ring completely via short writes until EAGAIN, then
 // checks epoll reports NOT writable — the pre-fix code always reported
-// EPOLLOUT regardless of ring state.
+// EPOLLOUT regardless of ring state. Also checks the PIPE_BUF threshold:
+// draining a few bytes must not flip POLLOUT back on; only freeing a full
+// PIPE_BUF (4096) does. See the PIPE_BUF comment below for the Linux
+// ground-truth measurement this mirrors.
 
 unsafe fn test_pipe_epoll_pollout_reflects_ring_full() -> bool {
     let name = b"pipe_epoll_pollout_reflects_ring_full\0";
@@ -270,17 +273,36 @@ unsafe fn test_pipe_epoll_pollout_reflects_ring_full() -> bool {
     let mut out: [epoll_event; 4] = core::mem::zeroed();
     let n_full = epoll_wait(ep, out.as_mut_ptr(), 4, 0);
 
-    // Drain some space, then confirm writability reappears.
-    let mut drain = [0u8; 256];
-    let n_drained = read(rfd, drain.as_mut_ptr(), 256);
-    let n_after_drain = epoll_wait(ep, out.as_mut_ptr(), 4, 200);
-    let writable_again = n_after_drain == 1 && (out[0].events & EPOLLOUT) != 0;
+    // POSIX PIPE_BUF: writes of at most this many bytes are atomic, and it's
+    // also Linux's POLLOUT threshold — the write end only becomes writable
+    // once at least PIPE_BUF (4096) bytes are free, not merely >0. Verified
+    // against real Linux (5.x, glibc) on x86_64: filling a pipe to EAGAIN and
+    // draining 256 bytes leaves poll()/epoll_wait() reporting NOT writable;
+    // draining up to exactly 4095 bytes free still reports NOT writable;
+    // crossing to 4096 bytes free is the first point POLLOUT/EPOLLOUT appears.
+    // A small drain must therefore NOT reappear as writable — only a drain
+    // that frees a full PIPE_BUF does.
+    const PIPE_BUF: usize = 4096;
+
+    // Small drain (well under PIPE_BUF): must stay NOT writable.
+    let mut small_drain = [0u8; 256];
+    let n_small_drained = read(rfd, small_drain.as_mut_ptr(), 256);
+    let n_after_small_drain = epoll_wait(ep, out.as_mut_ptr(), 4, 50);
+    let still_not_writable = n_after_small_drain == 0;
+
+    // Drain the rest of a full PIPE_BUF worth of free space; writability
+    // must now reappear.
+    let mut rest_drain = [0u8; PIPE_BUF];
+    let n_rest_drained = read(rfd, rest_drain.as_mut_ptr(), PIPE_BUF - 256);
+    let n_after_full_drain = epoll_wait(ep, out.as_mut_ptr(), 4, 200);
+    let writable_again = n_after_full_drain == 1 && (out[0].events & EPOLLOUT) != 0;
 
     close(rfd);
     close(wfd);
     close(ep);
 
-    report(name, filled && n_full == 0 && n_drained > 0 && writable_again)
+    report(name, filled && n_full == 0 && n_small_drained > 0 && still_not_writable
+        && n_rest_drained > 0 && writable_again)
 }
 
 // ── 3. Real poll()/select() (layered on epoll in relibc) see real readiness ─
