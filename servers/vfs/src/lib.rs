@@ -320,6 +320,13 @@ pub fn call_port(port_id: u32, mut msg: Message) -> Message {
     }
 
     let caller = sched::current_pid();
+    // A port with a direct handler answers inside `port::send`, so the reply
+    // is normally already queued here: take it without the prepare/cancel
+    // park protocol below, which costs two RUN_QUEUE holds per call for a
+    // sleep that never happens.
+    if let Some(reply) = port::recv_as(reply_port, caller) {
+        return reply;
+    }
     loop {
         // Publish Blocked before the queue check so a reply enqueued after
         // an empty recv_as still finds us Blocked and its unblock_port()

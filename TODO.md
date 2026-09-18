@@ -44,9 +44,16 @@ Reconciled against `main` at `60f49bd` following the 2026-09-15/16 bug sweep
   sub-tick waits truncate to 0) instead of `monotonic_ns()`; `gettimeofday`/`time` are
   tick-derived while `clock_gettime(REALTIME)` is not (two wall clocks); `timerfd_create`
   ignores clockid; `setpgid` has no permission model.
-- `RUN_QUEUE` is contended on most 100 Hz ticks with the greeter desktop idle (tick-hook
+- ~~`RUN_QUEUE` is contended on most 100 Hz ticks with the greeter desktop idle (tick-hook
   `try_lock` fails >50%) → every timed poll/epoll wake pays 1–2 ticks of retry latency; the
-  long holder is not yet found.
+  long holder is not yet found.~~ CLOSED 2026-09-18 (`lane/runq`, note
+  `artifacts/notes/lane-runq-2026-09-18.md`): measured 8.2 %, not >50 %, and there is no
+  long holder (99.9 % of holds < 1 µs) — it was ~760 k acquisitions/s, four per
+  synchronous server call from the compositor's render loop. Now 0 per call, tick failure
+  0.05 %, bounded `try_lock_spin` on the tick; `poll(10 ms)` overshoot p90 9.5 ms → 0.1 ms.
+  Ctrl-T prints a `[RQPROF]` block (`sched::lockwatch`, `HOLD_PROFILE` for the histogram).
+- `polltest` `pipe_epoll_pollout_reflects_ring_full` FAILS on main (seen 2026-09-18 on the
+  2026-09-16 image, both arches) — the tallies below still say 6/6.
 - ~~brush wedges the login shell if a pipeline wait errors / `fg` of a stopped pipeline
   re-reports Stopped / `cmd &` shows `<pid unknown>`~~ — **FIXED 2026-09-18 (lane/brush)**, all
   three were brush bugs (`../brush` `3423c0e`, pinned in `ports/brush/`): `fg`/`bg`/`kill %n`

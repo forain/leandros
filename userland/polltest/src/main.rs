@@ -92,6 +92,11 @@ impl fd_set {
 #[derive(Clone, Copy)]
 pub struct timeval { pub tv_sec: i64, pub tv_usec: i64 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct timespec { pub tv_sec: i64, pub tv_nsec: i64 }
+const CLOCK_MONOTONIC: c_int = 1;
+
 extern "C" {
     pub fn relibc_start_v1(
         sp: *const c_void,
@@ -121,6 +126,7 @@ extern "C" {
     pub fn epoll_create1(flags: c_int) -> c_int;
     pub fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut epoll_event) -> c_int;
     pub fn epoll_wait(epfd: c_int, events: *mut epoll_event, maxevents: c_int, timeout: c_int) -> c_int;
+    pub fn clock_gettime(clk: c_int, tp: *mut timespec) -> c_int;
 }
 
 // ── Assembly entry point (identical to timertest's) ──────────────────────────
@@ -163,6 +169,7 @@ pub unsafe extern "C" fn poll_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     if !test_socketpair_epoll_readiness_and_real_recv() { failures += 1; }
     if !test_epoll_wait_times_out_then_sees_write() { failures += 1; }
     if !test_pipe_hup_reflects_writer_refcount() { failures += 1; }
+    if !test_poll_timeout_wake_latency() { failures += 1; }
 
     puts(b"--- polltest done ---\n\0".as_ptr());
     failures
@@ -413,4 +420,75 @@ unsafe fn test_pipe_hup_reflects_writer_refcount() -> bool {
 
     close(rfd);
     report(name, no_hup_while_writer_open && hup_after_last_writer)
+}
+
+// ── 7. Timed-poll wake latency: how late does a 10 ms poll() come back? ─────
+//
+// 1000 × poll(one idle pipe, 10 ms), each timed with CLOCK_MONOTONIC. The
+// overshoot (elapsed − 10 ms) is what the kernel's poll-deadline tick adds on
+// top of the timeout. The tick services timed waiters under a
+// `RUN_QUEUE.try_lock()`; when that failed, the wake slipped by one tick per
+// failure, so a 10 ms poll routinely came back at 20–30 ms with the desktop
+// idle (the tick-aligned idle loops of the other CPUs held the lock at the
+// very instant the tick tried it). The bound is two ticks of slack past the
+// one-tick granularity of a tick-based deadline; p50/p99/max are printed so a
+// regression shows as numbers, not just a FAIL.
+
+unsafe fn print_num(v: u64) {
+    let mut buf = [0u8; 20]; let mut i = 0; let mut x = v;
+    if x == 0 { write(1, b"0".as_ptr(), 1); return; }
+    while x > 0 { buf[i] = b'0' + (x % 10) as u8; x /= 10; i += 1; }
+    while i > 0 { i -= 1; write(1, buf.as_ptr().add(i), 1); }
+}
+
+unsafe fn now_ns() -> u64 {
+    let mut ts = timespec { tv_sec: 0, tv_nsec: 0 };
+    clock_gettime(CLOCK_MONOTONIC, &mut ts);
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+unsafe fn test_poll_timeout_wake_latency() -> bool {
+    let name = b"poll_timeout_wake_latency\0";
+    const N: usize = 1000;
+    const TIMEOUT_MS: u64 = 10;
+    let (rfd, wfd) = new_pipe();
+    static mut OVER_US: [u32; N] = [0; N];
+    let mut early = 0usize;
+    for i in 0..N {
+        let mut pfd = pollfd { fd: rfd, events: POLLIN, revents: 0 };
+        let t0 = now_ns();
+        let r = poll(&mut pfd, 1, TIMEOUT_MS as c_int);
+        let t1 = now_ns();
+        if r != 0 { early += 1; } // an idle pipe never becomes readable
+        let el = t1.saturating_sub(t0);
+        let over = el.saturating_sub(TIMEOUT_MS * 1_000_000) / 1000;
+        OVER_US[i] = over.min(u32::MAX as u64) as u32;
+        // Tick-based deadlines fire at the next tick, up to 10 ms early; count
+        // (and print) it, but only a wake more than a tick early is a failure.
+        if el + 10_000_000 < TIMEOUT_MS * 1_000_000 { early += 1; }
+    }
+    close(rfd); close(wfd);
+    // Insertion sort: N is small and this is a no_std binary.
+    for i in 1..N {
+        let v = OVER_US[i]; let mut j = i;
+        while j > 0 && OVER_US[j - 1] > v { OVER_US[j] = OVER_US[j - 1]; j -= 1; }
+        OVER_US[j] = v;
+    }
+    let p50 = OVER_US[N / 2] as u64;
+    let p90 = OVER_US[N * 9 / 10] as u64;
+    let p99 = OVER_US[N * 99 / 100] as u64;
+    let max = OVER_US[N - 1] as u64;
+    write(1, b"poll 10ms x1000 overshoot us: p50=".as_ptr(), 34); print_num(p50);
+    write(1, b" p90=".as_ptr(), 5); print_num(p90);
+    write(1, b" p99=".as_ptr(), 5); print_num(p99);
+    write(1, b" max=".as_ptr(), 5); print_num(max);
+    write(1, b" early=".as_ptr(), 7); print_num(early as u64);
+    write(1, b"\n".as_ptr(), 1);
+    // Measured 2026-09-18 with the greeter desktop up: before the fix
+    // p50=10 p90=9494 p99=21002 max=40445 (aarch64/HVF); after, p90 ≤ ~200
+    // and p99 ≤ ~2.5 ms on HVF, p99 ≤ ~7.5 ms on x86_64/TCG. A tick-slip
+    // regression puts p90 back at a full tick (10 ms) — the p90 bound is the
+    // sharp one; the p99 bound is one tick of slack for the odd host-preempted
+    // holder.
+    report(name, early == 0 && p90 <= 5_000 && p99 <= 20_000)
 }

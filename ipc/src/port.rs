@@ -377,8 +377,18 @@ pub fn send(port: Port, msg: Message) -> Result<(), SendError> {
     }
 
     if table.buckets[idx].enqueue(msg) {
+        let owner = table.buckets[idx].owner_pid;
         drop(table);
-        sched::unblock_port(port);
+        // Only the owner ever receives on a port (`recv_as` refuses anyone
+        // else), so when the owner is the task running this very send — the
+        // synchronous case: a kernel-context server handler replying to its
+        // caller's reply port — nobody can be parked on it, and the wake
+        // would be a full RUN_QUEUE scan that finds nothing. That scan was
+        // the single largest RUN_QUEUE holder on an idle desktop (≈170 k
+        // acquisitions/s, ~400 ns each; see lockwatch's `[RQPROF]`).
+        if owner != sched::current_pid() {
+            sched::unblock_port(port);
+        }
         Ok(())
     } else {
         Err(SendError::QueueFull)

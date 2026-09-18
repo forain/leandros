@@ -322,6 +322,14 @@ static CURRENT_PID: [AtomicU32; MAX_CPUS] =
 /// the scan.
 static CURRENT_TGID: [AtomicU32; MAX_CPUS] =
     [const { AtomicU32::new(0) }; MAX_CPUS];
+/// Reply port of the task running on each CPU (`u32::MAX` = none yet),
+/// published at dispatch and by [`set_current_reply_port`], so
+/// [`current_reply_port`] — the first step of every synchronous server call —
+/// does not take `RUN_QUEUE` and scan for its own task. Safe for the same
+/// reason as [`CURRENT_TGID`]: only the task itself ever changes its
+/// `reply_port`, and it does so through `set_current_reply_port`.
+static CURRENT_REPLY_PORT: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
 
 extern "C" {
     fn arch_set_page_table(root: usize);
@@ -1136,8 +1144,9 @@ pub fn replace_signal_mask(new_mask: u64) -> u64 {
 }
 
 pub fn current_reply_port() -> u32 {
-    let pid = current_pid();
-    RUN_QUEUE.lock().find_pid(pid).map(|t| t.reply_port).unwrap_or(u32::MAX)
+    let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    if CURRENT_PID[id].load(Ordering::Relaxed) == 0 { return u32::MAX; }
+    CURRENT_REPLY_PORT[id].load(Ordering::Relaxed)
 }
 
 pub fn set_current_reply_port(port: u32) {
@@ -1145,6 +1154,8 @@ pub fn set_current_reply_port(port: u32) {
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
         t.reply_port = port;
     }
+    let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    CURRENT_REPLY_PORT[id].store(port, Ordering::Relaxed);
 }
 
 pub fn current_cwd(buf: *mut u8, max_len: usize) -> isize {
@@ -1647,27 +1658,38 @@ pub fn request_poll_wake_tagged(tag: u64) {
 /// re-arms it too, so contention costs <= 10 ms and never a lost edge.
 pub fn service_deferred_poll_wake() {
     let tag = POLL_WAKE_PENDING.swap(0, Ordering::AcqRel);
-    if tag != 0 && !try_wake_poll_tagged(tag) {
+    if tag == 0 { return; }
+    let ok = try_wake_poll_tagged(tag);
+    lockwatch::note_tick_try(lockwatch::L_RUN_QUEUE, ok);
+    if !ok {
         // Contended try_lock: re-arm (OR back) so the next tick pays it.
         POLL_WAKE_PENDING.fetch_or(tag, Ordering::Release);
     }
 }
 
 /// Non-blocking `wake_poll` for IRQ / tick context: honors the tick hook's
-/// try_lock-only contract. Returns false (wake deferred) if RUN_QUEUE is
-/// momentarily contended on another CPU; the next tick retries.
+/// no-indefinite-wait contract (bounded `try_lock_spin`). Returns false (wake
+/// deferred) if RUN_QUEUE stays held on another CPU past the bound; the next
+/// tick retries.
 pub fn try_wake_poll() -> bool { try_wake_poll_tagged(POLL_TAG_ALL) }
+
+/// How long an IRQ-context poll wake may wait for `RUN_QUEUE` before deferring
+/// to the next tick. Holds are sub-microsecond; 50 µs covers all but host
+/// vCPU preemption of the holder, and is bounded, so no deadlock-freedom is
+/// lost (see `lockwatch::TrackedMutex::try_lock_spin`).
+const TICK_LOCK_WAIT_NS: u64 = 50_000;
 
 /// Non-blocking `wake_poll_tagged` for IRQ / tick context.
 pub fn try_wake_poll_tagged(tag: u64) -> bool {
-    match RUN_QUEUE.try_lock() {
+    match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
+            lockwatch::note_wake_try(true);
             let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
             drop(rq);
             if woken > 0 { wake_up_an_idle_cpu(); }
             true
         }
-        None => false,
+        None => { lockwatch::note_wake_try(false); false }
     }
 }
 
@@ -1687,11 +1709,13 @@ pub fn try_wake_poll_tagged(tag: u64) -> bool {
 ///
 /// `now` is a `monotonic_ns()` reading; every deadline is one too.
 ///
-/// Non-blocking (try_lock) for the tick's contract; a contended tick leaves the
-/// hint and retries next tick (≤10 ms defer, within the timeout granularity).
+/// Bounded wait (`try_lock_spin`, ≤ `TICK_LOCK_WAIT_NS`) for the tick's
+/// contract; a tick that still finds the lock held leaves the hint and retries
+/// next tick (≤10 ms defer, within the timeout granularity).
 pub fn service_poll_deadlines(now: u64, timerfd_due: bool) -> bool {
-    match RUN_QUEUE.try_lock() {
+    match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
+            lockwatch::note_tick_try(lockwatch::L_RUN_QUEUE, true);
             let (new_min, woken) =
                 rq.wake_due_poll_deadlines(POLL_WAIT_CHANNEL, now, timerfd_due);
             NEXT_POLL_DEADLINE.store(new_min, Ordering::Relaxed); // exact, under the lock
@@ -1699,7 +1723,7 @@ pub fn service_poll_deadlines(now: u64, timerfd_due: bool) -> bool {
             if woken > 0 { wake_up_an_idle_cpu(); }
             true
         }
-        None => false,
+        None => { lockwatch::note_tick_try(lockwatch::L_RUN_QUEUE, false); false }
     }
 }
 
@@ -2227,6 +2251,10 @@ const WD_REPEAT_SCANS: u32 = 20; // then every 10 s while it lasts
 /// doing; two relaxed stores per syscall.
 pub const NO_SYSCALL: u32 = u32::MAX;
 static CUR_SYSCALL: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(NO_SYSCALL) }; MAX_CPUS];
+/// Syscall number `cpu` is servicing (`NO_SYSCALL` outside one). For lockwatch.
+pub(crate) fn syscall_on_cpu(cpu: usize) -> u32 { CUR_SYSCALL[cpu.min(MAX_CPUS - 1)].load(Ordering::Relaxed) }
+/// PID running on `cpu` (0 = idle / in scheduler). For lockwatch.
+pub(crate) fn pid_on_cpu(cpu: usize) -> u32 { CURRENT_PID[cpu.min(MAX_CPUS - 1)].load(Ordering::Relaxed) }
 
 /// Per-pid last syscall, `(pid << 32) | (nr << 1) | in_syscall`, indexed by
 /// `pid & 1023` (pids are a sequential counter). The Ctrl-T dump prints it
@@ -2372,6 +2400,7 @@ pub fn timer_tick_irq(elapsed: u64) {
 /// that pairs `preempt_disable` with `irq_window` runs the **tick hooks on
 /// this CPU with whatever locks that section holds**.  `virtio_gpu::submit`
 /// holds `VIRTIO_GPU`, so every registered tick hook must stay `try_lock`-only
+/// (a time-bounded `try_lock_spin` counts: it can stall, never deadlock)
 /// and must never touch `VIRTIO_GPU` or the framebuffer console (`fb_flush`,
 /// `println!`, `serial_print*`).  Hooks that need to log must use
 /// `pci::serial_debug`, which writes the UART directly and takes no lock.
@@ -2600,6 +2629,7 @@ pub fn dump_tasks() {
         for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } }
     }
     use dump_raw::{ph, pn};
+    lockwatch::dump_profile();
     let rq = match RUN_QUEUE.try_lock() {
         Some(rq) => rq,
         None => { print_str("[TASKS] run queue busy, try again\n"); return; }
@@ -2980,13 +3010,13 @@ fn scheduler_run_loop() -> ! {
                     t.on_cpu = Some(id);
                     t.state  = TaskState::Running;
                     let kst = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
-                    Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid))
+                    Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port))
                 }
                 None => None,
             }
         };
 
-        if let Some((idx, ctx_ptr, pid, kernel_stack_top_virt, page_table, tgid)) = picked {
+        if let Some((idx, ctx_ptr, pid, kernel_stack_top_virt, page_table, tgid, reply_port)) = picked {
             let dispatched_at = ticks();
             let dispatched_ns = unsafe { arch_monotonic_ns() };
 
@@ -2994,6 +3024,7 @@ fn scheduler_run_loop() -> ! {
                 CURRENT_CTX[id] = ctx_ptr as *mut CpuContext;
                 CURRENT_PID[id].store(pid, Ordering::Relaxed);
                 CURRENT_TGID[id].store(tgid, Ordering::Relaxed);
+                CURRENT_REPLY_PORT[id].store(reply_port, Ordering::Relaxed);
 
                 arch_set_kernel_stack(kernel_stack_top_virt as u64);
                 if page_table != 0 {
