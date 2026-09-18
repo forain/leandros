@@ -7,12 +7,21 @@
 //!   1. Program PIT ch2 for a one-shot 10 ms countdown.
 //!   2. Start APIC timer counting down from 0xFFFF_FFFF (divide-by-16).
 //!   3. Wait for PIT ch2 to finish (poll bit 5 of port 0x61).
-//!   4. Measure APIC ticks elapsed → derive ticks-per-100Hz-interrupt.
+//!   4. Measure APIC ticks elapsed → derive ticks-per-100Hz-interrupt,
+//!      and TSC cycles elapsed → the TSC frequency.
 //!
 //! The PIT is only touched during this brief calibration; after init it
 //! is never programmed again and all timer IRQs come from the APIC.
 //!
-//! Ref: Intel SDM Vol 3A §10.5 (APIC Timer); OSDev wiki "APIC timer"
+//! The TSC frequency is what every kernel clock derives from (`monotonic_ns`,
+//! and through it `arch_monotonic_ns` / `drivers::snd::monotonic_us`), so it is
+//! resolved with some care — see `resolve_tsc_khz`: a frequency the CPU or the
+//! hypervisor states through CPUID is preferred, the PIT window is the
+//! measurement that confirms it or stands in for it, and the result is printed
+//! once at boot as `[TSC] … MHz`.
+//!
+//! Ref: Intel SDM Vol 3A §10.5 (APIC Timer), Vol 2A CPUID leaves 15H/16H;
+//! OSDev wiki "APIC timer"
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use super::apic;
@@ -29,9 +38,13 @@ static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 /// off the same clock anyway.
 static TICKS_PER_IRQ: AtomicU32 = AtomicU32::new(0);
 
-/// TSC cycles in one 10 ms tick, measured in the same PIT window that
-/// calibrates the APIC timer. See `monotonic_ns`.
+/// TSC cycles in one 10 ms tick — `TSC_KHZ × 10`. See `monotonic_ns`.
 static TSC_PER_TICK:  AtomicU64 = AtomicU64::new(0);
+/// The resolved TSC frequency in kHz (0 until `init`). See `resolve_tsc_khz`.
+static TSC_KHZ: AtomicU64 = AtomicU64::new(0);
+/// Where `TSC_KHZ` came from (a `TscSource` discriminant), for `/proc/cpuinfo`
+/// readers and the boot line.
+static TSC_SOURCE: AtomicU32 = AtomicU32::new(0);
 /// TSC at `init` on the BSP: the origin of CLOCK_MONOTONIC and of the tick
 /// grid. 0 until the BSP timer has started.
 static EPOCH_TSC: AtomicU64 = AtomicU64::new(0);
@@ -57,12 +70,13 @@ fn rdtsc() -> u64 {
 /// on an explicit notify — sleeps forever. That is the whole `vktest`-under-TCG
 /// hang.
 ///
-/// The scale comes from the PIT window that already calibrates the APIC timer,
-/// so it is measured, not assumed: a real host TSC (~4 GHz) and TCG's virtual
-/// one (~1 GHz) both come out right with no per-accelerator special case. The
-/// clock is the counter against that scale — not the tick count with a
-/// clamped fraction, which inherited every lost tick (see `on_tick`). Falls
-/// back to the tick count if the PIT window never established the scale.
+/// The scale is the TSC frequency `init` resolved (`resolve_tsc_khz`: CPUID
+/// when the CPU or hypervisor states it, else the PIT window that already
+/// calibrates the APIC timer), so it is stated or measured, never assumed: a
+/// real host TSC (~2–5 GHz) and TCG's virtual one both come out right with no
+/// per-accelerator special case. The clock is the counter against that scale —
+/// not the tick count with a clamped fraction, which inherited every lost tick
+/// (see `on_tick`). Falls back to the tick count until `init` has run.
 pub fn monotonic_ns() -> u64 {
     let per = TSC_PER_TICK.load(Ordering::Relaxed);
     let e = EPOCH_TSC.load(Ordering::Relaxed);
@@ -92,6 +106,101 @@ pub fn resolution_ns() -> u64 {
 #[inline]
 pub fn ticks() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
+}
+
+/// The TSC frequency `init` resolved, in kHz; 0 before `init`.
+pub fn tsc_khz() -> u64 {
+    TSC_KHZ.load(Ordering::Relaxed)
+}
+
+/// TSC cycles per 10 ms scheduler tick; 0 before `init`. The unit anything
+/// that wants to wait "a few milliseconds" against a raw `rdtsc` should use.
+pub fn tsc_per_tick() -> u64 {
+    TSC_PER_TICK.load(Ordering::Relaxed)
+}
+
+/// Where the TSC frequency came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum TscSource {
+    /// `init` has not run.
+    None = 0,
+    /// Hypervisor timing leaf CPUID.4000_0010H (VMware convention; QEMU/KVM
+    /// exposes it with `vmware-cpuid-freq` when the TSC is stable and known).
+    HvLeaf = 1,
+    /// CPUID.15H with the core crystal frequency enumerated: exact.
+    Crystal = 2,
+    /// CPUID.15H ratio × CPUID.16H nominal frequency, with the implied crystal
+    /// snapped to the standard part it must be (Linux does the same in
+    /// `native_calibrate_tsc`, less the snap).
+    Nominal = 3,
+    /// Measured against the PIT (min of three 10 ms windows).
+    Pit = 4,
+}
+
+/// Where the TSC frequency came from.
+pub fn tsc_source() -> TscSource {
+    match TSC_SOURCE.load(Ordering::Relaxed) {
+        1 => TscSource::HvLeaf,
+        2 => TscSource::Crystal,
+        3 => TscSource::Nominal,
+        4 => TscSource::Pit,
+        _ => TscSource::None,
+    }
+}
+
+impl TscSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            TscSource::None => "unresolved",
+            TscSource::HvLeaf => "cpuid 0x40000010",
+            TscSource::Crystal => "cpuid 0x15",
+            TscSource::Nominal => "cpuid 0x15+0x16",
+            TscSource::Pit => "pit",
+        }
+    }
+}
+
+/// TSC frequency stated by CPUID, if any: the hypervisor's timing leaf first
+/// (it describes the virtual TSC the guest actually sees), then Intel's leaf
+/// 15H (exact when the crystal is enumerated), then 15H's ratio against the
+/// nominal frequency of 16H. Returns `None` on CPUs and hypervisors that state
+/// nothing (QEMU TCG, `-cpu` models below level 0x15, pre-Skylake parts).
+fn tsc_khz_from_cpuid() -> Option<(u64, TscSource)> {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    {
+        if __cpuid(1).ecx & (1 << 31) != 0 {
+            let hv = __cpuid(0x4000_0000);
+            if hv.eax >= 0x4000_0010 {
+                let t = __cpuid(0x4000_0010);
+                if t.eax != 0 { return Some((t.eax as u64, TscSource::HvLeaf)); }
+            }
+        }
+        let max = __cpuid(0).eax;
+        if max < 0x15 { return None; }
+        let l = __cpuid_count(0x15, 0);
+        let (den, num, crystal_hz) = (l.eax as u64, l.ebx as u64, l.ecx as u64);
+        if den == 0 || num == 0 { return None; }
+        if crystal_hz != 0 {
+            return Some((crystal_hz * num / den / 1000, TscSource::Crystal));
+        }
+        if max < 0x16 { return None; }
+        let base_mhz = __cpuid_count(0x16, 0).eax as u64;
+        if base_mhz == 0 { return None; }
+        // 16H's nominal frequency is the TSC frequency rounded to a MHz. The
+        // crystal it implies is one of the standard parts; snapping to it
+        // recovers the exact value (a 1.9 GHz nominal Kaby Lake is really
+        // 24 MHz × 79 = 1896 MHz, and 16H says 1900).
+        let implied_khz = base_mhz * 1000 * den / num;
+        let mut khz = base_mhz * 1000;
+        for &c in &[19_200u64, 24_000, 25_000, 38_400] {
+            if implied_khz.abs_diff(c) * 100 < c {
+                khz = c * num / den;
+                break;
+            }
+        }
+        Some((khz, TscSource::Nominal))
+    }
 }
 
 // ── PIT channel 2 calibration helpers ────────────────────────────────────────
@@ -124,12 +233,11 @@ unsafe fn inb(port: u16) -> u8 {
     v
 }
 
-/// Calibrate the APIC timer against PIT channel 2.
-///
-/// Returns the number of APIC timer ticks (divide-by-16) that elapsed
-/// during a ~10 ms PIT countdown.  Returns a safe fallback if the APIC
-/// counter did not decrease (hardware oddity or very fast/slow clock).
-unsafe fn calibrate_apic_ticks_10ms() -> u32 {
+/// One PIT channel 2 window: the APIC timer ticks (divide-by-16) and the TSC
+/// cycles that elapsed during a ~10 ms PIT countdown. `None` if the PIT never
+/// signalled — no 8254 on this board, or its gate is not ours to open — after
+/// a bounded wait, so a missing PIT costs a moment of boot, not the boot.
+unsafe fn pit_window_10ms() -> Option<(u32, u64)> {
     // ── Enable PIT channel 2 gate via keyboard controller port 0x61 ──────────
     // Bits [1:0] control the gate and speaker:
     //   bit 0 = gate for PIT ch2  (1 = enable)
@@ -155,28 +263,86 @@ unsafe fn calibrate_apic_ticks_10ms() -> u32 {
     let tsc_start = rdtsc();
 
     // ── Wait for PIT ch2 output (bit 5 of port 0x61 goes high when done) ─────
+    // Bounded: 2^32 cycles is ~1 s at 4 GHz, ~4 s on a 1 GHz virtual TSC —
+    // either way two orders of magnitude past the window.
+    let mut done = false;
     loop {
-        if inb(KBD_PORT) & (1 << 5) != 0 { break; }
+        if inb(KBD_PORT) & (1 << 5) != 0 { done = true; break; }
+        if rdtsc().wrapping_sub(tsc_start) > (1u64 << 32) { break; }
     }
 
     let end = apic::read(apic::LAPIC_TIMER_CURR);
     let tsc_elapsed = rdtsc().wrapping_sub(tsc_start);
-    if tsc_elapsed != 0 {
-        TSC_PER_TICK.store(tsc_elapsed, Ordering::Release);
-    }
 
     // Mask the APIC timer again; we are not yet in periodic mode.
     apic::write(apic::LAPIC_LVT_TIMER, (1 << 16) | 0xFF);
 
-    // ── Compute elapsed APIC ticks ────────────────────────────────────────────
+    if !done { return None; }
     // The counter counts *down*; elapsed = start - end.
-    let elapsed = start.wrapping_sub(end);
-    if elapsed == 0 {
-        // Fallback: assume ~1 GHz bus / 16 = 62.5 MHz APIC, 10 ms = 625_000 ticks.
-        625_000
-    } else {
-        elapsed
+    Some((start.wrapping_sub(end), tsc_elapsed))
+}
+
+/// Calibrate against the PIT: the APIC timer ticks and TSC cycles in one
+/// 10 ms window. Three windows are taken and the shortest kept: a window can
+/// only ever read long (the host deschedules the vCPU, an SMI, a slow port
+/// exit on the poll that would have seen the flag), never short, so the
+/// minimum is the truest and a single preempted window cannot skew the clock
+/// by whatever the host stole. Both figures come from the same window so the
+/// APIC/TSC ratio stays consistent. `None` if the PIT is not there.
+unsafe fn calibrate_pit() -> Option<(u32, u64)> {
+    let mut best: Option<(u32, u64)> = None;
+    for _ in 0..3 {
+        let w = pit_window_10ms()?;
+        best = match best {
+            Some(b) if b.1 <= w.1 => Some(b),
+            _ => Some(w),
+        };
     }
+    best
+}
+
+/// Decide the TSC frequency from what CPUID states and what the PIT measured.
+///
+/// A stated frequency wins when it exists and the measurement agrees with it
+/// to 5 %: the hypervisor leaf describes the very TSC the guest sees, and
+/// leaf 15H is the hardware's own ratio to a crystal, both exact where a
+/// 10 ms window is good to ~0.05 %. When they disagree by more than that the
+/// measurement wins — a hypervisor that scales the TSC but forwards the host's
+/// CPUID would state a frequency the counter does not run at, and the PIT is
+/// the one comparing the counter against real time. Without a PIT the stated
+/// value stands alone; without either, the last resort is 1 GHz, which is what
+/// TCG's virtual TSC runs at on the hosts this kernel is developed on.
+fn resolve_tsc_khz(stated: Option<(u64, TscSource)>, measured_khz: Option<u64>) -> (u64, TscSource) {
+    match (stated, measured_khz) {
+        (Some((s, src)), Some(m)) if s.abs_diff(m) * 20 < s => (s, src),
+        (_, Some(m)) => (m, TscSource::Pit),
+        (Some((s, src)), None) => (s, src),
+        (None, None) => (1_000_000, TscSource::None),
+    }
+}
+
+/// `[TSC] 1896.000 MHz (cpuid 0x15+0x16); pit measured 1895.912 MHz` — once,
+/// so a reader of any later `*_us` diagnostic can trust its unit.
+fn log_tsc(khz: u64, src: TscSource, stated: Option<(u64, TscSource)>, measured_khz: Option<u64>) {
+    fn s(m: &str) { for &b in m.as_bytes() { unsafe { super::putc(b) } } }
+    fn dec(mut v: u64) {
+        let mut buf = [0u8; 20]; let mut n = 0;
+        loop { buf[n] = b'0' + (v % 10) as u8; n += 1; v /= 10; if v == 0 { break; } }
+        while n > 0 { n -= 1; unsafe { super::putc(buf[n]) } }
+    }
+    fn mhz(khz: u64) {
+        dec(khz / 1000); s(".");
+        let f = khz % 1000; if f < 100 { s("0"); } if f < 10 { s("0"); } dec(f); s(" MHz");
+    }
+    s("[TSC] "); mhz(khz); s(" ("); s(src.name()); s(")");
+    if let Some((v, ssrc)) = stated {
+        if ssrc != src { s("; "); s(ssrc.name()); s(" states "); mhz(v); }
+    }
+    match measured_khz {
+        Some(m) => { if src != TscSource::Pit { s("; pit measured "); mhz(m); } }
+        None => s("; no pit"),
+    }
+    s("\n");
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -186,7 +352,22 @@ unsafe fn calibrate_apic_ticks_10ms() -> u32 {
 /// # Safety
 /// `apic::init()` must have been called first (LAPIC must be enabled).
 pub unsafe fn init() {
-    let ticks_10ms = calibrate_apic_ticks_10ms();
+    let pit = calibrate_pit();
+    let stated = tsc_khz_from_cpuid();
+    let measured_khz = pit.map(|(_, tsc)| tsc / 10);
+    let (khz, src) = resolve_tsc_khz(stated, measured_khz);
+    TSC_KHZ.store(khz, Ordering::Release);
+    TSC_PER_TICK.store(khz * 10, Ordering::Release);
+    TSC_SOURCE.store(src as u32, Ordering::Release);
+    log_tsc(khz, src, stated, measured_khz);
+
+    // APIC ticks in the PIT window; without a PIT, or if the APIC counter did
+    // not decrease (hardware oddity), assume ~1 GHz bus / 16 = 62.5 MHz APIC,
+    // 10 ms = 625_000 ticks.
+    let ticks_10ms = match pit {
+        Some((apic, _)) if apic != 0 => apic,
+        _ => 625_000,
+    };
 
     // Ticks per interrupt at TICK_HZ:
     //   100 Hz → 10 ms per tick → initial count = ticks_10ms

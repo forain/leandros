@@ -196,7 +196,7 @@ pub unsafe fn putc(c: u8) {
         }
         TX_WEDGED.store(false, Relaxed);
     } else {
-        let deadline = rdtsc_raw().wrapping_add(UART_TX_WAIT_CYCLES);
+        let deadline = rdtsc_raw().wrapping_add(uart_tx_wait_cycles());
         loop {
             let lsr: u8;
             asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
@@ -225,12 +225,24 @@ unsafe fn rdtsc_raw() -> u64 {
 }
 
 /// How long `putc` will wait for the UART transmitter before giving the byte
-/// up, in TSC cycles. Deliberately a raw cycle count and not a calibrated
-/// interval: this runs before (and independently of) timer calibration. ~7 ms
-/// at 3 GHz, ~20 ms on a 1 GHz part — either way orders of magnitude above the
-/// ~87 us a real 16550 needs at 115200 baud, and short enough that a wedged
-/// host back end cannot eat a scheduling quantum's worth of ticks.
+/// up, in TSC cycles, before `timer::init` has resolved the TSC frequency: a
+/// raw cycle count because nothing better exists yet. ~7 ms at 3 GHz, ~20 ms
+/// on a 1 GHz part — either way orders of magnitude above the ~87 us a real
+/// 16550 needs at 115200 baud, and short enough that a wedged host back end
+/// cannot eat a scheduling quantum's worth of ticks.
 pub const UART_TX_WAIT_CYCLES: u64 = 20_000_000;
+
+/// The `putc` wait in TSC cycles: half a scheduler tick (5 ms) once the TSC
+/// frequency is known, so the bound means the same on a 4.5 GHz host TSC as
+/// on TCG's virtual one, and `UART_TX_WAIT_CYCLES` before that.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn uart_tx_wait_cycles() -> u64 {
+    match timer::tsc_per_tick() {
+        0 => UART_TX_WAIT_CYCLES,
+        per => per / 2,
+    }
+}
 
 /// Latched when a `putc` wait expires; cleared by the first later probe that
 /// finds the transmitter free. Keeps a back-pressured console at one probe per
@@ -276,6 +288,16 @@ pub extern "C" fn arch_interrupt_restore(flags: usize) {
 #[no_mangle]
 pub extern "C" fn arch_monotonic_ns() -> u64 {
     timer::monotonic_ns()
+}
+
+/// The TSC frequency `timer::init` resolved, in kHz, for crates below this one
+/// (`/proc/cpuinfo` in the VFS server reports it as `cpu MHz`, which is how a
+/// userspace test checks that `clock_gettime` and a raw `rdtsc` agree). 0
+/// before `timer::init`.
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub extern "C" fn arch_tsc_khz() -> u64 {
+    timer::tsc_khz()
 }
 
 /// x86_64 serial input.

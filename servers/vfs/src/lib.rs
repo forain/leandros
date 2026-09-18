@@ -3352,13 +3352,31 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
         // One block per online CPU — Linux tools (nproc, lscpu, and
         // anything that counts "processor :" lines) derive the CPU count
         // from this file, same as sched_getaffinity's mask.
+        //
+        // `cpu MHz` is the TSC frequency the x86_64 timer resolved at boot
+        // (CPUID-stated or PIT-measured; the `[TSC]` boot line), which is the
+        // scale behind CLOCK_MONOTONIC and every kernel `*_us` diagnostic —
+        // timertest reads it back to check `clock_gettime` against a raw
+        // `rdtsc`. Other arches have no such single number and keep the
+        // placeholder.
+        #[cfg(target_arch = "x86_64")]
+        let khz = {
+            extern "C" { fn arch_tsc_khz() -> u64; }
+            unsafe { arch_tsc_khz() }
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let khz: u64 = 1_000_000;
         let n = sched::active_cpu_count();
         let mut p = 0;
         for cpu in 0..n {
             p = write_lit(buf, p, b"processor\t: ");
             p = write_u32(buf, p, cpu as u32);
-            p = write_lit(buf, p, b"\nmodel name\t: Leandros Virtual CPU\n\
-                                    cpu MHz\t\t: 1000.000\n\n");
+            p = write_lit(buf, p, b"\nmodel name\t: Leandros Virtual CPU\ncpu MHz\t\t: ");
+            p = write_u32(buf, p, (khz / 1000) as u32);
+            let frac = (khz % 1000) as u32;
+            p = write_lit(buf, p, if frac < 10 { b".00" } else if frac < 100 { b".0" } else { b"." });
+            p = write_u32(buf, p, frac);
+            p = write_lit(buf, p, b"\n\n");
         }
         return Some(p);
     }

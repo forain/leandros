@@ -56,11 +56,17 @@ const TX_MAX_INFLIGHT: u16 = (TX_MAX_INFLIGHT_BYTES / TX_BUF_BYTES) as u16;
 const TX_TOPUP_BYTES: usize = 16 * 1024;
 const TX_TOPUP_BUFS: u16 = (TX_TOPUP_BYTES / TX_BUF_BYTES) as u16;
 
-/// Coarse monotonic clock for stall detection. Reads a hardware counter
-/// that keeps advancing even while spinning in kernel context with IRQs
-/// masked (unlike sched::ticks()). The x86_64 arm assumes ~1 GHz TSC —
-/// only ever used for order-of-magnitude stall thresholds, where a few x
-/// of error just makes detection proportionally slower.
+/// Monotonic microseconds for stall detection and the `*_us` diagnostics
+/// (audio stall recovery, the DRM/GPU latency census, PipeWire's producer
+/// gap). Reads the free-running hardware counter, so it keeps advancing even
+/// while spinning in kernel context with IRQs masked (unlike sched::ticks()).
+///
+/// On x86_64 this is `arch_monotonic_ns` — the TSC against the frequency
+/// `timer::init` resolved (CPUID or PIT-measured) — and not a raw `rdtsc`
+/// divided by an assumed 1 GHz, which it was until 2026-09-18: on a 4.49 GHz
+/// host TSC every "250 ms" stall threshold was really 56 ms and every census
+/// field 4.5× inflated; on a 1.9 GHz laptop, 1.9×. Zero until the BSP timer
+/// has started, which is before any driver that calls this is initialised.
 pub fn monotonic_us() -> u64 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -72,7 +78,8 @@ pub fn monotonic_us() -> u64 {
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        core::arch::x86_64::_rdtsc() / 1000
+        extern "C" { fn arch_monotonic_ns() -> u64; }
+        arch_monotonic_ns() / 1000
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
