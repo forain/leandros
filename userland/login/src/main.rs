@@ -15,7 +15,7 @@ use leandros_libc::{
     write, read, STDOUT_FILENO, STDIN_FILENO,
     open, close, O_RDONLY,
     execve, chdir, exit,
-    setresuid, setresgid,
+    setresuid, setresgid, setgroups,
     ioctl,
 };
 
@@ -279,8 +279,54 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Supplementary groups of `username` from /etc/group: every group whose
+/// member list names the user, plus every group whose gid is the user's
+/// primary gid is left to setresgid. `initgroups(3)` without the libc.
+unsafe fn lookup_groups(username: &str, out: &mut [u32; 32]) -> usize {
+    let fd = open(b"/etc/group\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return 0;
+    }
+    let mut buf = [0u8; 4096];
+    let n = read(fd, buf.as_mut_ptr(), buf.len());
+    close(fd);
+    if n <= 0 {
+        return 0;
+    }
+    let content = match core::str::from_utf8(&buf[..n as usize]) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let mut count = 0usize;
+    for line in content.lines() {
+        // name:passwd:gid:member,member,...
+        let mut fields = line.splitn(4, ':');
+        let _name = fields.next().unwrap_or("");
+        let _pw = fields.next().unwrap_or("");
+        let gid = match parse_u32(fields.next().unwrap_or("")) {
+            Some(g) => g,
+            None => continue,
+        };
+        let members = fields.next().unwrap_or("");
+        if members.split(',').any(|m| m == username) && count < out.len() {
+            out[count] = gid;
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Drop privileges to the matched user and exec their shell. Never returns.
 unsafe fn do_login(rec: &UserRec) -> ! {
+    // Supplementary groups first: setgroups needs root, which setresuid
+    // below gives up.
+    let name = core::str::from_utf8(&rec.name[..rec.name_len]).unwrap_or("");
+    let mut groups = [0u32; 32];
+    let ngroups = lookup_groups(name, &mut groups);
+    if setgroups(ngroups, groups.as_ptr()) != 0 {
+        write_str("login: setgroups failed\n");
+        exit(1);
+    }
     if setresgid(rec.gid, rec.gid, rec.gid) != 0 {
         write_str("login: setresgid failed\n");
         exit(1);

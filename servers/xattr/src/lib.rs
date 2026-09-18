@@ -88,6 +88,41 @@ pub struct FileMeta {
     pub gid: u32,
 }
 
+/// Most supplementary groups a task may hold (Linux allows 65536; nothing in
+/// this image needs more than a handful, and the array lives inline in the
+/// task struct).
+pub const NGROUPS_MAX: usize = 32;
+
+/// The caller's identity as every permission gate sees it: effective uid,
+/// effective gid, and the supplementary group list. Group membership is
+/// `egid` OR any supplementary group — there is exactly one place that
+/// answers "is the caller in group g", [`Cred::in_group`], so an evaluator
+/// can never consult the egid alone by accident.
+#[derive(Clone, Copy)]
+pub struct Cred {
+    pub euid: u32,
+    pub egid: u32,
+    pub ngroups: u8,
+    pub groups: [u32; NGROUPS_MAX],
+}
+
+impl Cred {
+    pub const fn new(euid: u32, egid: u32) -> Self {
+        Cred { euid, egid, ngroups: 0, groups: [0; NGROUPS_MAX] }
+    }
+    pub const ROOT: Cred = Cred::new(0, 0);
+    #[inline]
+    pub fn in_group(&self, gid: u32) -> bool {
+        if self.egid == gid { return true; }
+        let n = (self.ngroups as usize).min(NGROUPS_MAX);
+        self.groups[..n].iter().any(|&g| g == gid)
+    }
+    #[inline]
+    pub fn groups(&self) -> &[u32] {
+        &self.groups[..(self.ngroups as usize).min(NGROUPS_MAX)]
+    }
+}
+
 // ── name <-> (namespace index, suffix) ───────────────────────────────────────
 
 /// Split a full attribute name into (namespace index, suffix).
@@ -289,13 +324,13 @@ pub fn remove(arena: &mut [u8], idx: u8, suf: &[u8]) -> Result<usize, i32> {
 //   trusted.* root only; hidden (ENODATA / filtered) from others.
 
 /// Gate for getxattr. `acl` = the stored access ACL, if any.
-pub fn may_read_xattr(idx: u8, meta: &FileMeta, euid: u32, egid: u32, acl: Option<&[u8]>) -> Result<(), i32> {
+pub fn may_read_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>) -> Result<(), i32> {
     match idx {
         IDX_USER => {
             if !is_reg(meta.mode) && !is_dir(meta.mode) {
                 return Err(ENODATA);
             }
-            if access_check(meta, euid, egid, acl, true, false, false) {
+            if access_check(meta, cred, acl, true, false, false) {
                 Ok(())
             } else {
                 Err(EACCES)
@@ -303,7 +338,7 @@ pub fn may_read_xattr(idx: u8, meta: &FileMeta, euid: u32, egid: u32, acl: Optio
         }
         IDX_ACL_ACCESS | IDX_ACL_DEFAULT => Ok(()),
         IDX_TRUSTED => {
-            if euid == 0 {
+            if cred.euid == 0 {
                 Ok(())
             } else {
                 Err(ENODATA)
@@ -314,7 +349,7 @@ pub fn may_read_xattr(idx: u8, meta: &FileMeta, euid: u32, egid: u32, acl: Optio
 }
 
 /// Gate for setxattr/removexattr.
-pub fn may_write_xattr(idx: u8, meta: &FileMeta, euid: u32, egid: u32, acl: Option<&[u8]>) -> Result<(), i32> {
+pub fn may_write_xattr(idx: u8, meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>) -> Result<(), i32> {
     if is_lnk(meta.mode) {
         return Err(EPERM); // no user.* and no ACLs on symlinks
     }
@@ -323,17 +358,17 @@ pub fn may_write_xattr(idx: u8, meta: &FileMeta, euid: u32, egid: u32, acl: Opti
             if !is_reg(meta.mode) && !is_dir(meta.mode) {
                 return Err(EPERM);
             }
-            if is_dir(meta.mode) && meta.mode & S_ISVTX != 0 && euid != meta.uid && euid != 0 {
+            if is_dir(meta.mode) && meta.mode & S_ISVTX != 0 && cred.euid != meta.uid && cred.euid != 0 {
                 return Err(EPERM);
             }
-            if access_check(meta, euid, egid, acl, false, true, false) {
+            if access_check(meta, cred, acl, false, true, false) {
                 Ok(())
             } else {
                 Err(EACCES)
             }
         }
         IDX_ACL_ACCESS | IDX_ACL_DEFAULT => {
-            if euid != meta.uid && euid != 0 {
+            if cred.euid != meta.uid && cred.euid != 0 {
                 return Err(EPERM);
             }
             if idx == IDX_ACL_DEFAULT && !is_dir(meta.mode) {
@@ -342,7 +377,7 @@ pub fn may_write_xattr(idx: u8, meta: &FileMeta, euid: u32, egid: u32, acl: Opti
             Ok(())
         }
         IDX_TRUSTED => {
-            if euid == 0 {
+            if cred.euid == 0 {
                 Ok(())
             } else {
                 Err(EPERM)
@@ -513,8 +548,8 @@ pub const MAY_READ: u8 = 4;
 /// x bit at all — CAP_DAC_OVERRIDE semantics. The stored access ACL, if any,
 /// is honoured exactly as it is for open/faccessat.
 #[inline]
-pub fn may_access(meta: &FileMeta, euid: u32, egid: u32, acl: Option<&[u8]>, mask: u8) -> bool {
-    access_check(meta, euid, egid, acl,
+pub fn may_access(meta: &FileMeta, cred: &Cred, acl: Option<&[u8]>, mask: u8) -> bool {
+    access_check(meta, cred, acl,
                  mask & MAY_READ != 0, mask & MAY_WRITE != 0, mask & MAY_EXEC != 0)
 }
 
@@ -533,17 +568,18 @@ pub fn sticky_denies(dir: &FileMeta, victim_uid: u32, euid: u32) -> bool {
 /// otherwise. Root (euid 0) bypasses R/W always; X needs at least one x bit
 /// unless the target is a directory.
 ///
-/// Group matching is `egid == gid` only (no supplementary groups exist).
+/// Group matching is `cred.in_group(gid)`: the effective gid or any
+/// supplementary group.
 pub fn access_check(
     meta: &FileMeta,
-    euid: u32,
-    egid: u32,
+    cred: &Cred,
     acl: Option<&[u8]>,
     want_r: bool,
     want_w: bool,
     want_x: bool,
 ) -> bool {
     let want: u16 = (want_r as u16) << 2 | (want_w as u16) << 1 | want_x as u16;
+    let euid = cred.euid;
     if euid == 0 {
         if want_x && !is_dir(meta.mode) {
             return meta.mode & 0o111 != 0;
@@ -552,14 +588,14 @@ pub fn access_check(
     }
     if let Some(bytes) = acl {
         if acl_validate(bytes).is_ok() {
-            return acl_walk(bytes, meta, euid, egid, want);
+            return acl_walk(bytes, meta, cred, want);
         }
         // Corrupt stored ACL: fall through to mode bits (fail-open to the
         // mode, which the invariant keeps at least as strict as the mask).
     }
     let bits = if euid == meta.uid {
         (meta.mode >> 6) & 7
-    } else if egid == meta.gid {
+    } else if cred.in_group(meta.gid) {
         (meta.mode >> 3) & 7
     } else {
         meta.mode & 7
@@ -567,7 +603,8 @@ pub fn access_check(
     bits & want == want
 }
 
-fn acl_walk(value: &[u8], meta: &FileMeta, euid: u32, egid: u32, want: u16) -> bool {
+fn acl_walk(value: &[u8], meta: &FileMeta, cred: &Cred, want: u16) -> bool {
+    let euid = cred.euid;
     let n = acl_entry_count(value);
     let mask = (0..n)
         .map(|i| acl_entry(value, i))
@@ -590,7 +627,7 @@ fn acl_walk(value: &[u8], meta: &FileMeta, euid: u32, egid: u32, want: u16) -> b
                 }
             }
             ACL_GROUP_OBJ => {
-                if egid == meta.gid {
+                if cred.in_group(meta.gid) {
                     group_found = true;
                     if masked(e.perm) & want == want {
                         return true;
@@ -598,7 +635,7 @@ fn acl_walk(value: &[u8], meta: &FileMeta, euid: u32, egid: u32, want: u16) -> b
                 }
             }
             ACL_GROUP => {
-                if egid == e.id {
+                if cred.in_group(e.id) {
                     group_found = true;
                     if masked(e.perm) & want == want {
                         return true;
@@ -618,4 +655,114 @@ fn acl_walk(value: &[u8], meta: &FileMeta, euid: u32, egid: u32, want: u16) -> b
         }
     }
     false
+}
+
+// ── creation: default-ACL inheritance ────────────────────────────────────────
+//
+// Linux `posix_acl_create`. When the parent directory carries a default ACL,
+// a new entry inherits it: every child gets the default ACL — with its
+// USER_OBJ / (MASK or GROUP_OBJ) / OTHER permissions intersected with the
+// requested creation mode — as its *access* ACL, and a child directory also
+// gets it verbatim as its own *default* ACL. The umask is NOT applied in that
+// case (the default ACL replaces it, POSIX 1003.1e §23.4.2). With no default
+// ACL on the parent the mode is simply `mode & !umask`, as ever.
+//
+// The requested mode and the caller's umask travel in one u64 on the wire:
+// `mode | umask << MODE_UMASK_SHIFT` (see `pack_create_mode`), so both
+// filesystems decide the child's mode through the same function and the
+// kernel does not have to know whether the parent has a default ACL.
+
+/// Bit position of the caller's umask inside a creation-mode argument.
+pub const MODE_UMASK_SHIFT: u32 = 16;
+
+#[inline]
+pub fn pack_create_mode(mode: u32, umask: u32) -> u64 {
+    ((mode & 0o7777) as u64) | (((umask & 0o777) as u64) << MODE_UMASK_SHIFT)
+}
+
+/// `(mode, umask)` from a packed creation-mode argument.
+#[inline]
+pub fn unpack_create_mode(arg: u64) -> (u16, u16) {
+    ((arg & 0o7777) as u16, ((arg >> MODE_UMASK_SHIFT) & 0o777) as u16)
+}
+
+/// Longest ACL value the inheritance path handles (32 entries).
+pub const ACL_INHERIT_MAX: usize = ACL_HDR + 32 * ACL_ENT;
+
+/// What a new inode gets at creation.
+pub struct Created {
+    /// The 12 permission/setid bits to store in the inode mode.
+    pub mode: u16,
+    /// A non-trivial access ACL to store, if the default ACL yielded one.
+    pub access_len: usize,
+    pub access: [u8; ACL_INHERIT_MAX],
+    /// True when the child is a directory and must also store the parent's
+    /// default ACL as its own default ACL (verbatim).
+    pub inherit_default: bool,
+}
+
+/// Compute the creation mode (and inherited access ACL) for a child of a
+/// directory whose default ACL is `default_acl` (None/invalid = none).
+/// `mode` is the caller's requested permission bits, `umask` the caller's
+/// umask, `is_dir` whether the child is a directory.
+pub fn acl_create(default_acl: Option<&[u8]>, mode: u16, umask: u16, is_dir: bool) -> Created {
+    let mut out = Created {
+        mode: (mode & 0o7777) & !(umask & 0o777),
+        access_len: 0,
+        access: [0u8; ACL_INHERIT_MAX],
+        inherit_default: false,
+    };
+    let dacl = match default_acl {
+        Some(v) if v.len() <= ACL_INHERIT_MAX && acl_validate(v).is_ok() => v,
+        _ => return out,
+    };
+    // posix_acl_create_masq over a copy of the default ACL.
+    let mut clone = [0u8; ACL_INHERIT_MAX];
+    clone[..dacl.len()].copy_from_slice(dacl);
+    let n = acl_entry_count(dacl);
+    let mut user_perm = (mode >> 6) & 7;
+    let mut group_perm = (mode >> 3) & 7;
+    let mut other_perm = mode & 7;
+    let mut not_equiv = false;
+    let mut mask_idx: Option<usize> = None;
+    let mut group_obj_idx: Option<usize> = None;
+    for i in 0..n {
+        let o = ACL_HDR + i * ACL_ENT;
+        let e = acl_entry(dacl, i);
+        match e.tag {
+            ACL_USER_OBJ => {
+                let p = e.perm & user_perm;
+                clone[o + 2..o + 4].copy_from_slice(&p.to_le_bytes());
+                user_perm = p;
+            }
+            ACL_OTHER => {
+                let p = e.perm & other_perm;
+                clone[o + 2..o + 4].copy_from_slice(&p.to_le_bytes());
+                other_perm = p;
+            }
+            ACL_MASK => mask_idx = Some(i),
+            ACL_GROUP_OBJ => group_obj_idx = Some(i),
+            ACL_USER | ACL_GROUP => not_equiv = true,
+            _ => {}
+        }
+    }
+    let gi = match mask_idx.or(group_obj_idx) {
+        Some(i) => i,
+        None => return out, // cannot happen for a validated ACL
+    };
+    {
+        let o = ACL_HDR + gi * ACL_ENT;
+        let e = acl_entry(dacl, gi);
+        let p = e.perm & group_perm;
+        clone[o + 2..o + 4].copy_from_slice(&p.to_le_bytes());
+        group_perm = p;
+    }
+    if mask_idx.is_some() { not_equiv = true; }
+    out.mode = (mode & 0o7000) | (user_perm << 6) | (group_perm << 3) | other_perm;
+    if not_equiv {
+        out.access_len = dacl.len();
+        out.access[..dacl.len()].copy_from_slice(&clone[..dacl.len()]);
+    }
+    out.inherit_default = is_dir;
+    out
 }

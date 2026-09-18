@@ -1,6 +1,6 @@
 //! Process lifecycle: exit, abort, fork, exec, getpid, wait.
 
-use crate::syscall::{nr, syscall0, syscall1, syscall3, syscall4};
+use crate::syscall::{nr, syscall0, syscall1, syscall2, syscall3, syscall4};
 
 pub type pid_t = i32;
 
@@ -121,6 +121,21 @@ pub unsafe extern "C" fn setresuid(ruid: u32, euid: u32, suid: u32) -> i32 {
 pub unsafe extern "C" fn setresgid(rgid: u32, egid: u32, sgid: u32) -> i32 {
     let r = syscall3(nr::SETRESGID, rgid as usize, egid as usize, sgid as usize);
     if r < 0 { crate::errno::set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Replace the supplementary group list (root only).
+#[no_mangle]
+pub unsafe extern "C" fn setgroups(size: usize, list: *const u32) -> i32 {
+    let r = syscall2(nr::SETGROUPS, size, list as usize);
+    if r < 0 { crate::errno::set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Supplementary group list: `size == 0` returns the count, otherwise fills
+/// `list` and returns the count.
+#[no_mangle]
+pub unsafe extern "C" fn getgroups(size: usize, list: *mut u32) -> i32 {
+    let r = syscall2(nr::GETGROUPS, size, list as usize);
+    if r < 0 { crate::errno::set_errno(-r as i32); -1 } else { r as i32 }
 }
 
 /// Start a new session, making the caller its session and process group leader.

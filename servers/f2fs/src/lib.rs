@@ -69,6 +69,9 @@ const VFS_REMOVEXATTR:  u64 = 0x46;
 const VFS_LREMOVEXATTR: u64 = 0x47;
 const VFS_FREMOVEXATTR: u64 = 0x48;
 const VFS_ACCESS:       u64 = 0x49;
+const VFS_UTIMENS:      u64 = vfs_server::VFS_UTIMENS;
+const VFS_LUTIMENS:     u64 = vfs_server::VFS_LUTIMENS;
+const VFS_FUTIMENS:     u64 = vfs_server::VFS_FUTIMENS;
 
 const O_WRONLY:  u64 = 1;
 const O_RDWR:    u64 = 2;
@@ -150,6 +153,16 @@ const INO_ADVISE:    usize = 2;
 /// meaningful when `INO_ADVISE` carries `F2FS_ADVISE_IBLOCKS`. Offsets 28..84
 /// are unused by both mkfs scripts and by `create_inode`.
 const INO_BLOCKS:    usize = 28;
+/// Timestamps: `{ u64 sec, u32 nsec }` × atime/mtime/ctime in the otherwise
+/// unused 36..72 span (this volume format is not Linux's, whose i_atime sits
+/// at 32). Every inode mkfs writes reads back 0 here — the epoch, which is
+/// exactly what stat reported for everything before timestamps existed.
+const INO_ATIME:     usize = 36;
+const INO_ATIME_NS:  usize = 44;
+const INO_MTIME:     usize = 48;
+const INO_MTIME_NS:  usize = 56;
+const INO_CTIME:     usize = 60;
+const INO_CTIME_NS:  usize = 68;
 const INO_NAMELEN:   usize = 88;
 const INO_NAME:      usize = 92;   // [u8; 255]
 // The union (i_addr / extra-attrs) starts here:
@@ -532,13 +545,12 @@ struct MountState {
     dirty_writes: u32,
     open_files:   [OpenFile; MAX_OPEN_FILES],
     cache:        BlockCache,
-    /// Effective uid/gid of the process whose request is being served. Set by
+    /// Credentials of the process whose request is being served. Set by
     /// `dispatch_msg` on entry (the server is single-threaded and IPC is
-    /// synchronous, so one pair per mount is exact) and read by the path walk
+    /// synchronous, so one `Cred` per mount is exact) and read by the path walk
     /// so every directory component can be checked for search permission
     /// without threading credentials through fifteen signatures.
-    euid:         u32,
-    egid:         u32,
+    cred:         xattr::Cred,
     /// Why the last `resolve_path_ex` returned 0 (negative errno, 0 = ENOENT).
     /// Read through `take_walk_err`; see `resolve_path_r`.
     walk_err:     i32,
@@ -903,6 +915,28 @@ fn inode_gid(blk: &[u8]) -> u32 { r32(blk, INO_GID) }
 fn inode_links(blk: &[u8]) -> u32 { r32(blk, INO_LINKS) }
 fn inode_is_dir(blk: &[u8]) -> bool { (inode_mode(blk) & S_IFMT) == S_IFDIR }
 
+/// `(atime, mtime, ctime)` as `(sec, nsec)` pairs.
+fn inode_times(blk: &[u8]) -> ((i64, i64), (i64, i64), (i64, i64)) {
+    ((r64(blk, INO_ATIME) as i64, r32(blk, INO_ATIME_NS) as i64),
+     (r64(blk, INO_MTIME) as i64, r32(blk, INO_MTIME_NS) as i64),
+     (r64(blk, INO_CTIME) as i64, r32(blk, INO_CTIME_NS) as i64))
+}
+fn inode_set_atime(blk: &mut [u8], t: (i64, i64)) { w64(blk, INO_ATIME, t.0 as u64); w32(blk, INO_ATIME_NS, t.1 as u32); }
+fn inode_set_mtime(blk: &mut [u8], t: (i64, i64)) { w64(blk, INO_MTIME, t.0 as u64); w32(blk, INO_MTIME_NS, t.1 as u32); }
+fn inode_set_ctime(blk: &mut [u8], t: (i64, i64)) { w64(blk, INO_CTIME, t.0 as u64); w32(blk, INO_CTIME_NS, t.1 as u32); }
+/// Data changed: mtime and ctime = now.
+fn inode_touch_mtime(blk: &mut [u8]) { let n = sched::clock_ts(); inode_set_mtime(blk, n); inode_set_ctime(blk, n); }
+/// Metadata changed: ctime = now, on the live inode block of `ino`.
+fn touch_ctime(ms: &mut MountState, ino: u32) {
+    let addr = nat_lookup(ms, ino);
+    if addr == 0 { return; }
+    {
+        let iblk = ms.cache.get_mut(ms.dev, addr as u64);
+        inode_set_ctime(iblk, sched::clock_ts());
+    }
+    nat_update(ms, ino, addr);
+}
+
 /// Blocks charged to this inode, or `None` when the inode predates the counter
 /// (see `F2FS_ADVISE_IBLOCKS`).
 fn inode_blocks(blk: &[u8]) -> Option<u64> {
@@ -956,6 +990,10 @@ fn create_inode(ms: &mut MountState, mode: u16, uid: u32, gid: u32,
     // node blocks too.
     buf[INO_ADVISE] |= F2FS_ADVISE_IBLOCKS;
     w64(&mut buf, INO_BLOCKS,  1);
+    let now = sched::clock_ts();
+    inode_set_atime(&mut buf, now);
+    inode_set_mtime(&mut buf, now);
+    inode_set_ctime(&mut buf, now);
     w32(&mut buf, 84, parent_ino); // i_pino
     let namelen = name.len().min(255) as u32;
     w32(&mut buf, INO_NAMELEN, namelen);
@@ -1429,9 +1467,11 @@ fn write_file_data(ms: &mut MountState, ino: u32, pos: u64, src: *const u8, coun
         done += chunk;
     }
 
-    // Update file size
+    // Update file size and the modification time (the inode block is being
+    // rewritten anyway, so the stamp is free).
     let new_size = (pos + done as u64).max(inode_size(&iblk_copy));
     w64(&mut iblk_copy, INO_SIZE, new_size);
+    inode_touch_mtime(&mut iblk_copy);
     ms.cache.write(ms.dev, iblkaddr as u64, &iblk_copy);
     nat_update(ms, ino, iblkaddr);
 
@@ -1922,7 +1962,7 @@ fn read_link_target(ms: &mut MountState, ino: u32, out: &mut [u8; 256]) -> usize
 // ── permission gates ─────────────────────────────────────────────────────────
 //
 // Every gate funnels through `xattr::may_access` (mode bits + stored POSIX ACL
-// + root bypass) on the inode's live meta. `ms.euid/egid` are the caller's,
+// + root bypass) on the inode's live meta. `ms.cred` is the caller's,
 // published by `dispatch_msg`. Errors are POSIX: a component the caller may not
 // search is EACCES even when what follows it does not exist, so a walk never
 // leaks existence through ENOENT.
@@ -1931,9 +1971,9 @@ fn read_link_target(ms: &mut MountState, ino: u32, out: &mut [u8; 256]) -> usize
 /// node only when the inode has one, so the common ACL-less directory costs a
 /// single (cached) inode-block read.
 fn may_access_ino(ms: &mut MountState, ino: u32, mask: u8) -> bool {
-    let (euid, egid) = (ms.euid, ms.egid);
+    let cred = ms.cred;
     let (meta, xnid) = load_meta_xnid(ms, ino);
-    if euid == 0 && !(mask & xattr::MAY_EXEC != 0 && !xattr::is_dir(meta.mode)) {
+    if cred.euid == 0 && !(mask & xattr::MAY_EXEC != 0 && !xattr::is_dir(meta.mode)) {
         return true; // root: skip the xattr read entirely
     }
     let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, xnid)) } else { None };
@@ -1941,7 +1981,7 @@ fn may_access_ino(ms: &mut MountState, ino: u32, mask: u8) -> bool {
         Some(b) => xattr::find(&b[..xattr::F2FS_XATTR_ARENA], xattr::IDX_ACL_ACCESS, b""),
         None => None,
     };
-    xattr::may_access(&meta, euid, egid, acl, mask)
+    xattr::may_access(&meta, &cred, acl, mask)
 }
 
 /// Gate for creating an entry in / removing an entry from directory `dir`:
@@ -1974,7 +2014,7 @@ fn may_delete_in(ms: &mut MountState, dir: u32, victim: u32) -> Result<(), i32> 
     may_modify_dir(ms, dir)?;
     let (dmeta, _) = load_meta_xnid(ms, dir);
     let (vmeta, _) = load_meta_xnid(ms, victim);
-    if xattr::sticky_denies(&dmeta, vmeta.uid, ms.euid) { Err(-1) } else { Ok(()) }
+    if xattr::sticky_denies(&dmeta, vmeta.uid, ms.cred.euid) { Err(-1) } else { Ok(()) }
 }
 
 /// Resolve the parent of a to-be-created / to-be-removed entry. `parent_rel`
@@ -2165,7 +2205,7 @@ fn path_split(path: &[u8]) -> (&[u8], &[u8]) {
 // ── VFS handler implementations ───────────────────────────────────────────────
 
 fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
-               euid: u32, egid: u32) -> Message {
+               cred: &xattr::Cred) -> Message {
     let path_bytes = unsafe {
         let ptr = path_ptr as *const u8;
         let mut len = 0;
@@ -2204,13 +2244,18 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         };
         // Creating an entry needs write + search on the parent directory.
         if let Err(e) = may_modify_dir(ms, parent_ino) { return err_reply(e); }
-        // The caller's mode, not a hardcoded 0644. umask is applied kernel-side
-        // (where Linux applies it) so tmpfs and f2fs cannot disagree about it.
-        let imode = S_IFREG | (mode as u16 & 0o7777);
-        let (new_ino, _) = match create_inode(ms, imode, euid, egid, parent_ino, name) {
+        // The caller's mode, not a hardcoded 0644. The umask travels with it
+        // (`xattr::pack_create_mode`) and `acl_create` applies it — or the
+        // parent's default ACL instead, when there is one — through the same
+        // function tmpfs uses, so the two filesystems cannot disagree.
+        let (m, um) = xattr::unpack_create_mode(mode);
+        let created = inherit_create_mode(ms, parent_ino, m, um, false);
+        let imode = S_IFREG | (created.mode & 0o7777);
+        let (new_ino, _) = match create_inode(ms, imode, cred.euid, cred.egid, parent_ino, name) {
             Some(v) => v,
             None    => return err_reply(-28), // ENOSPC
         };
+        store_inherited_acls(ms, new_ino, parent_ino, &created);
         if !dir_add_entry(ms, parent_ino, name, new_ino, DT_REG) {
             return err_reply(-28);
         }
@@ -2235,7 +2280,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         // (init/getty/login all run as root before setuid) is unaffected; the
         // freshly-created branch above is not gated (the creator owns it). The
         // check precedes O_TRUNC so an unwritable file is never truncated.
-        if euid != 0 {
+        if cred.euid != 0 {
             let want_read  = flags & O_WRONLY == 0; // RDONLY/RDWR read; WRONLY does not
             // O_TRUNC destroys content, so it needs write permission even on
             // an O_RDONLY open (Linux may_open: O_TRUNC implies MAY_WRITE).
@@ -2246,7 +2291,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
                 Some(b) => xattr::find(&b[..xattr::F2FS_XATTR_ARENA], xattr::IDX_ACL_ACCESS, b""),
                 None => None,
             };
-            if !xattr::access_check(&meta, euid, egid, acl, want_read, want_write, false) {
+            if !xattr::access_check(&meta, cred, acl, want_read, want_write, false) {
                 return err_reply(-13); // EACCES
             }
         }
@@ -2392,8 +2437,10 @@ fn handle_fstat(ms: &mut MountState, file_id: u64, stat_ptr: u64) -> Message {
     let uid   = inode_uid(iblk);
     let gid   = inode_gid(iblk);
     let blks  = inode_stat_blocks(iblk);
+    let (at, mt, ct) = inode_times(iblk);
     vfs_server::write_stat_full_blocks(stat_ptr as usize, mode, links as u64, size,
                                        ino as u64, uid, gid, blks);
+    vfs_server::write_stat_times(stat_ptr as usize, at, mt, ct);
     ok_reply()
 }
 
@@ -2424,6 +2471,7 @@ fn stat_common(ms: &mut MountState, path_ptr: u64, stat_ptr: u64, follow: bool) 
     let uid   = inode_uid(iblk);
     let gid   = inode_gid(iblk);
     let blks  = inode_stat_blocks(iblk);
+    let (at, mt, ct) = inode_times(iblk);
 
     // Emit the stat struct in the target's native layout. This used to
     // open-code the x86-64 offsets, which put st_mode and st_nlink in the
@@ -2435,6 +2483,7 @@ fn stat_common(ms: &mut MountState, path_ptr: u64, stat_ptr: u64, follow: bool) 
     // that handle_chown writes INO_UID/INO_GID, stat reflects it.
     vfs_server::write_stat_full_blocks(stat_ptr as usize, mode, links as u64, size,
                                        ino as u64, uid, gid, blks);
+    vfs_server::write_stat_times(stat_ptr as usize, at, mt, ct);
     ok_reply()
 }
 
@@ -2517,7 +2566,7 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) 
 }
 
 fn handle_mkdir(ms: &mut MountState, path_ptr: u64, mode: u64,
-                euid: u32, egid: u32) -> Message {
+                cred: &xattr::Cred) -> Message {
     let path_bytes = unsafe {
         let ptr = path_ptr as *const u8;
         let mut len = 0;
@@ -2542,11 +2591,14 @@ fn handle_mkdir(ms: &mut MountState, path_ptr: u64, mode: u64,
     // Search on the parent, EEXIST, then write on the parent — Linux's order.
     if let Err(e) = create_gate(ms, parent_ino, name) { return err_reply(e); }
 
-    let imode = S_IFDIR | (mode as u16 & 0o7777);
-    let (new_ino, _) = match create_inode(ms, imode, euid, egid, parent_ino, name) {
+    let (m, um) = xattr::unpack_create_mode(mode);
+    let created = inherit_create_mode(ms, parent_ino, m, um, true);
+    let imode = S_IFDIR | (created.mode & 0o7777);
+    let (new_ino, _) = match create_inode(ms, imode, cred.euid, cred.egid, parent_ino, name) {
         Some(v) => v,
         None    => return err_reply(-28),
     };
+    store_inherited_acls(ms, new_ino, parent_ino, &created);
     if !dir_add_entry(ms, parent_ino, name, new_ino, DT_DIR) {
         return err_reply(-28);
     }
@@ -2637,7 +2689,7 @@ fn ino_is_open(ms: &MountState, ino: u32) -> bool {
 /// full data block. That matches how every other file on this volume is
 /// stored and keeps the read path (`read_file_data`) the single one.
 fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64,
-                  euid: u32, egid: u32) -> Message {
+                  cred: &xattr::Cred) -> Message {
     let target = unsafe {
         let ptr = target_ptr as *const u8;
         let mut len = 0;
@@ -2671,7 +2723,7 @@ fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64,
     let tlen = target.len().min(255);
     tbuf[..tlen].copy_from_slice(&target[..tlen]);
 
-    let (new_ino, _) = match create_inode(ms, S_IFLNK | 0o777, euid, egid, parent_ino, name) {
+    let (new_ino, _) = match create_inode(ms, S_IFLNK | 0o777, cred.euid, cred.egid, parent_ino, name) {
         Some(v) => v,
         None    => return err_reply(-28), // ENOSPC
     };
@@ -2839,6 +2891,7 @@ fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32, euid: u32) -> Message {
         let cur = inode_mode(iblk);
         new_mode = (cur & S_IFMT) | (mode as u16 & !S_IFMT);
         w16(iblk, INO_MODE, new_mode);
+        inode_set_ctime(iblk, sched::clock_ts());
     }
     nat_update(ms, ino, addr);
 
@@ -2876,7 +2929,7 @@ fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32, euid: u32) -> Message {
 /// See `handle_chmod` for `follow`; lchown(2) is the usual false case, and
 /// arrives here as VFS_LCHOWN.
 fn handle_chown(ms: &mut MountState, path_ptr: u64, uid: u32, gid: u32, follow: bool,
-                euid: u32, egid: u32) -> Message {
+                cred: &xattr::Cred) -> Message {
     let path_bytes = unsafe {
         let ptr = path_ptr as *const u8;
         let mut len = 0;
@@ -2888,38 +2941,39 @@ fn handle_chown(ms: &mut MountState, path_ptr: u64, uid: u32, gid: u32, follow: 
         None    => return err_reply(-2),
     };
     let ino = match resolve_path_r(ms, rel, follow) { Ok(i) => i, Err(e) => return err_reply(e) };
-    chown_inode(ms, ino, uid, gid, euid, egid)
+    chown_inode(ms, ino, uid, gid, cred)
 }
 
 /// fchown(2) — fd already resolved to an inode via the open-file table.
 fn handle_fchown(ms: &mut MountState, file_id: u64, uid: u32, gid: u32,
-                 euid: u32, egid: u32) -> Message {
+                 cred: &xattr::Cred) -> Message {
     let slot = file_id as usize;
     if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); }
     let ino = ms.open_files[slot].inode;
-    chown_inode(ms, ino, uid, gid, euid, egid)
+    chown_inode(ms, ino, uid, gid, cred)
 }
 
 /// Mutate i_uid/i_gid in place and write the inode block back, same
 /// nat_update + maybe_flush shape as chmod_inode/handle_link.
 fn chown_inode(ms: &mut MountState, ino: u32, uid: u32, gid: u32,
-               euid: u32, egid: u32) -> Message {
+               cred: &xattr::Cred) -> Message {
     let addr = nat_lookup(ms, ino);
     {
         let iblk = ms.cache.read(ms.dev, addr as u64);
         let owner = inode_uid(iblk);
-        if euid != 0 {
+        if cred.euid != 0 {
             // Non-root: must own the file, may never hand it to someone else,
-            // and may only set a group it belongs to. With no supplementary
-            // groups, "belongs to" means egid.
-            if euid != owner { return err_reply(-1); }               // EPERM
+            // and may only set a group it belongs to (effective gid or any
+            // supplementary group).
+            if cred.euid != owner { return err_reply(-1); }          // EPERM
             if uid != u32::MAX && uid != owner { return err_reply(-1); }
-            if gid != u32::MAX && gid != egid  { return err_reply(-1); }
+            if gid != u32::MAX && !cred.in_group(gid) { return err_reply(-1); }
         }
     }
     let iblk = ms.cache.get_mut(ms.dev, addr as u64);
     if uid != u32::MAX { w32(iblk, INO_UID, uid); }
     if gid != u32::MAX { w32(iblk, INO_GID, gid); }
+    inode_set_ctime(iblk, sched::clock_ts());
     nat_update(ms, ino, addr);
     maybe_flush(ms);
     ok_reply()
@@ -3114,9 +3168,14 @@ fn handle_ftruncate(ms: &mut MountState, file_id: u64, length: u64) -> Message {
     // only i_size changes.
     if length < old_size {
         truncate_to(ms, ino, length);
+        let iblkaddr = nat_lookup(ms, ino);
+        let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
+        inode_touch_mtime(iblk);
+        nat_update(ms, ino, iblkaddr);
     } else {
         let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
         w64(iblk, INO_SIZE, length);
+        inode_touch_mtime(iblk);
         nat_update(ms, ino, iblkaddr);
     }
     maybe_flush(ms);
@@ -3309,7 +3368,7 @@ fn xattr_fd_ino(ms: &MountState, file_id: u64) -> Result<u32, Message> {
 }
 
 fn xattr_get(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u64,
-             euid: u32, egid: u32) -> Message {
+             cred: &xattr::Cred) -> Message {
     let mut namebuf = [0u8; xattr::XATTR_NAME_MAX + 1];
     let nlen = match unsafe { load_xattr_name(name_ptr, &mut namebuf) } {
         Ok(n) => n,
@@ -3322,13 +3381,13 @@ fn xattr_get(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
     let (meta, xnid) = load_meta_xnid(ms, ino);
     if xnid == 0 {
         // Gate still runs (it can return EACCES/EPERM/EOPNOTSUPP), then ENODATA.
-        if let Err(e) = xattr::may_read_xattr(idx, &meta, euid, egid, None) { return err_reply(-e); }
+        if let Err(e) = xattr::may_read_xattr(idx, &meta, cred, None) { return err_reply(-e); }
         return err_reply(-61); // ENODATA
     }
     let blkbuf = read_xattr_arena(ms, xnid);
     let arena = &blkbuf[..xattr::F2FS_XATTR_ARENA];
     let acl = xattr::find(arena, xattr::IDX_ACL_ACCESS, b"");
-    if let Err(e) = xattr::may_read_xattr(idx, &meta, euid, egid, acl) { return err_reply(-e); }
+    if let Err(e) = xattr::may_read_xattr(idx, &meta, cred, acl) { return err_reply(-e); }
     let val = match xattr::find(arena, idx, suf) {
         Some(v) => v,
         None => return err_reply(-61), // ENODATA
@@ -3359,7 +3418,7 @@ fn xattr_list(ms: &mut MountState, ino: u32, list_ptr: u64, size: u64, euid: u32
 }
 
 fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u64,
-             flags: u64, euid: u32, egid: u32) -> Message {
+             flags: u64, cred: &xattr::Cred) -> Message {
     let mut namebuf = [0u8; xattr::XATTR_NAME_MAX + 1];
     let nlen = match unsafe { load_xattr_name(name_ptr, &mut namebuf) } {
         Ok(n) => n,
@@ -3377,7 +3436,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
     {
         let arena = &blkbuf[..xattr::F2FS_XATTR_ARENA];
         let acl = if xnid != 0 { xattr::find(arena, xattr::IDX_ACL_ACCESS, b"") } else { None };
-        if let Err(e) = xattr::may_write_xattr(idx, &meta, euid, egid, acl) { return err_reply(-e); }
+        if let Err(e) = xattr::may_write_xattr(idx, &meta, cred, acl) { return err_reply(-e); }
     }
 
     // The kernel prefaulted the value; forward the raw span verbatim.
@@ -3446,7 +3505,7 @@ fn xattr_set(ms: &mut MountState, ino: u32, name_ptr: u64, val_ptr: u64, size: u
     ok_reply()
 }
 
-fn xattr_remove(ms: &mut MountState, ino: u32, name_ptr: u64, euid: u32, egid: u32) -> Message {
+fn xattr_remove(ms: &mut MountState, ino: u32, name_ptr: u64, cred: &xattr::Cred) -> Message {
     let mut namebuf = [0u8; xattr::XATTR_NAME_MAX + 1];
     let nlen = match unsafe { load_xattr_name(name_ptr, &mut namebuf) } {
         Ok(n) => n,
@@ -3461,7 +3520,7 @@ fn xattr_remove(ms: &mut MountState, ino: u32, name_ptr: u64, euid: u32, egid: u
     {
         let arena = &blkbuf[..xattr::F2FS_XATTR_ARENA];
         let acl = if xnid != 0 { xattr::find(arena, xattr::IDX_ACL_ACCESS, b"") } else { None };
-        if let Err(e) = xattr::may_write_xattr(idx, &meta, euid, egid, acl) { return err_reply(-e); }
+        if let Err(e) = xattr::may_write_xattr(idx, &meta, cred, acl) { return err_reply(-e); }
     }
     if xnid == 0 { return err_reply(-61); } // ENODATA
     let removed = {
@@ -3482,7 +3541,7 @@ fn xattr_remove(ms: &mut MountState, ino: u32, name_ptr: u64, euid: u32, egid: u
 
 /// VFS_ACCESS(path_ptr, amode) — faccessat routed to the owning filesystem so a
 /// stored POSIX ACL is honoured. amode == 0 (F_OK) is pure existence.
-fn xattr_access(ms: &mut MountState, path_ptr: u64, amode: u64, euid: u32, egid: u32) -> Message {
+fn xattr_access(ms: &mut MountState, path_ptr: u64, amode: u64, cred: &xattr::Cred) -> Message {
     let ino = match xattr_path_ino(ms, path_ptr, true) {
         Ok(i) => i,
         Err(m) => return m,
@@ -3494,11 +3553,98 @@ fn xattr_access(ms: &mut MountState, path_ptr: u64, amode: u64, euid: u32, egid:
         Some(b) => xattr::find(&b[..xattr::F2FS_XATTR_ARENA], xattr::IDX_ACL_ACCESS, b""),
         None => None,
     };
-    if xattr::access_check(&meta, euid, egid, acl, amode & 4 != 0, amode & 2 != 0, amode & 1 != 0) {
+    if xattr::access_check(&meta, cred, acl, amode & 4 != 0, amode & 2 != 0, amode & 1 != 0) {
         ok_reply()
     } else {
         err_reply(-13) // EACCES
     }
+}
+
+// ── creation: default-ACL inheritance ────────────────────────────────────────
+
+/// The parent's default ACL, copied out of its xattr node (None when absent).
+fn parent_default_acl(ms: &mut MountState, parent_ino: u32, out: &mut [u8; xattr::ACL_INHERIT_MAX]) -> usize {
+    let (_, xnid) = load_meta_xnid(ms, parent_ino);
+    if xnid == 0 { return 0; }
+    let blk = read_xattr_arena(ms, xnid);
+    match xattr::find(&blk[..xattr::F2FS_XATTR_ARENA], xattr::IDX_ACL_DEFAULT, b"") {
+        Some(v) if v.len() <= out.len() => { out[..v.len()].copy_from_slice(v); v.len() }
+        _ => 0,
+    }
+}
+
+/// `xattr::acl_create` against the parent's default ACL: the child's mode
+/// (umask applied only when there is no default ACL) plus what to store.
+fn inherit_create_mode(ms: &mut MountState, parent_ino: u32, mode: u16, umask: u16, is_dir: bool) -> xattr::Created {
+    let mut dbuf = [0u8; xattr::ACL_INHERIT_MAX];
+    let dlen = parent_default_acl(ms, parent_ino, &mut dbuf);
+    let dacl = if dlen > 0 { Some(&dbuf[..dlen]) } else { None };
+    xattr::acl_create(dacl, mode, umask, is_dir)
+}
+
+/// Give a freshly created inode its inherited access ACL and (directories)
+/// the parent's default ACL, in a new xattr node block. No-op when there is
+/// nothing to store — the common case costs no block.
+fn store_inherited_acls(ms: &mut MountState, ino: u32, parent_ino: u32, c: &xattr::Created) {
+    if c.access_len == 0 && !c.inherit_default { return; }
+    let mut dbuf = [0u8; xattr::ACL_INHERIT_MAX];
+    let dlen = if c.inherit_default { parent_default_acl(ms, parent_ino, &mut dbuf) } else { 0 };
+    if c.access_len == 0 && dlen == 0 { return; }
+    let mut blkbuf = [0u8; BLOCK_SIZE];
+    {
+        let arena = &mut blkbuf[..xattr::F2FS_XATTR_ARENA];
+        if c.access_len > 0 {
+            let _ = xattr::set(arena, xattr::IDX_ACL_ACCESS, b"", &c.access[..c.access_len], 0);
+        }
+        if dlen > 0 {
+            let _ = xattr::set(arena, xattr::IDX_ACL_DEFAULT, b"", &dbuf[..dlen], 0);
+        }
+    }
+    persist_xattr_block(ms, ino, 0, &blkbuf);
+}
+
+// ── utimensat ────────────────────────────────────────────────────────────────
+
+/// Apply decoded times to inode `ino` after the utimensat(2) permission rule
+/// (see the VFS's `utimens_permission`): explicit times need ownership or
+/// root (EPERM); "now" needs ownership, root, or write permission (EACCES).
+fn utimens_inode(ms: &mut MountState, ino: u32, at: (i64, i64), mt: (i64, i64), explicit: bool,
+                 cred: &xattr::Cred) -> Message {
+    let (meta, xnid) = load_meta_xnid(ms, ino);
+    if cred.euid != 0 && cred.euid != meta.uid {
+        if explicit { return err_reply(-1); } // EPERM
+        let xbuf = if xnid != 0 { Some(read_xattr_arena(ms, xnid)) } else { None };
+        let acl = match &xbuf {
+            Some(b) => xattr::find(&b[..xattr::F2FS_XATTR_ARENA], xattr::IDX_ACL_ACCESS, b""),
+            None => None,
+        };
+        if !xattr::may_access(&meta, cred, acl, xattr::MAY_WRITE) { return err_reply(-13); } // EACCES
+    }
+    let addr = nat_lookup(ms, ino);
+    if addr == 0 { return err_reply(-2); }
+    {
+        let iblk = ms.cache.get_mut(ms.dev, addr as u64);
+        if at.1 != vfs_server::UTIME_OMIT { inode_set_atime(iblk, at); }
+        if mt.1 != vfs_server::UTIME_OMIT { inode_set_mtime(iblk, mt); }
+        inode_set_ctime(iblk, sched::clock_ts());
+    }
+    nat_update(ms, ino, addr);
+    maybe_flush(ms);
+    ok_reply()
+}
+
+fn handle_utimens(ms: &mut MountState, msg: &Message, follow: bool, cred: &xattr::Cred) -> Message {
+    let ino = match xattr_path_ino(ms, arg(msg, 0), follow) { Ok(i) => i, Err(m) => return m };
+    utimens_inode(ms, ino, (arg(msg, 1) as i64, arg(msg, 2) as i64),
+                  (arg(msg, 3) as i64, arg(msg, 4) as i64),
+                  arg(msg, 5) & vfs_server::UTIMENS_EXPLICIT != 0, cred)
+}
+
+fn handle_futimens(ms: &mut MountState, msg: &Message, cred: &xattr::Cred) -> Message {
+    let ino = match xattr_fd_ino(ms, arg(msg, 0)) { Ok(i) => i, Err(m) => return m };
+    utimens_inode(ms, ino, (arg(msg, 1) as i64, arg(msg, 2) as i64),
+                  (arg(msg, 3) as i64, arg(msg, 4) as i64),
+                  arg(msg, 5) & vfs_server::UTIMENS_EXPLICIT != 0, cred)
 }
 
 // ── IPC dispatch ──────────────────────────────────────────────────────────────
@@ -3515,28 +3661,18 @@ fn f2fs_dispatch(msg: &Message, caller_pid: u32, target_port: u32) -> Message {
     err_reply(-5) // EIO — no mount found for this port
 }
 
-/// Effective uid/gid of the process that made the call.
-///
-/// `port::send` invokes handlers synchronously in the caller's own task
-/// context and passes its pid, so this needs no protocol change — the value
-/// was already on the wire, it was simply discarded.
-///
-/// Note `sched::euid_of` answers 0 for a pid it cannot find, i.e. it fails
-/// *open* to root. That is the right answer for the boot-time mount path,
-/// which runs before there is a user process to attribute, but it is a
-/// deliberate choice rather than an accident.
-fn caller_creds(pid: u32) -> (u32, u32) {
-    (sched::euid_of(pid), sched::egid_of(pid))
-}
-
 fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message {
-    let (euid, egid) = caller_creds(caller_pid);
     // Published for the path walk (`resolve_path_ex`) and the parent-directory
     // gates (`may_access_ino`), which run below this frame for every path op.
-    ms.euid = euid;
-    ms.egid = egid;
+    //
+    // Note `vfs_server::cred_of` answers root for a pid it cannot find, i.e.
+    // it fails *open* to root. That is the right answer for the boot-time
+    // mount path, which runs before there is a user process to attribute, but
+    // it is a deliberate choice rather than an accident.
+    ms.cred = vfs_server::cred_of(caller_pid);
+    let cred = ms.cred;
     match msg.tag {
-        VFS_OPEN       => handle_open(ms, arg(msg,0), arg(msg,1), arg(msg,2), euid, egid),
+        VFS_OPEN       => handle_open(ms, arg(msg,0), arg(msg,1), arg(msg,2), &cred),
         VFS_READ       => handle_read(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_WRITE      => handle_write(ms, arg(msg,0), arg(msg,1), arg(msg,2), arg(msg,3)),
         VFS_CLOSE      => handle_close(ms, arg(msg,0)),
@@ -3544,24 +3680,24 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
         VFS_STAT       => handle_stat(ms, arg(msg,0), arg(msg,1)),
         VFS_FSTAT      => handle_fstat(ms, arg(msg,0), arg(msg,1)),
         VFS_GETDENTS64 => handle_getdents(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
-        VFS_MKDIR      => handle_mkdir(ms, arg(msg,0), arg(msg,1), euid, egid),
+        VFS_MKDIR      => handle_mkdir(ms, arg(msg,0), arg(msg,1), &cred),
         VFS_UNLINK     => handle_unlink(ms, arg(msg,0)),
         VFS_RMDIR      => handle_rmdir(ms, arg(msg,0)),
         VFS_RENAME     => handle_rename(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_FTRUNCATE  => handle_ftruncate(ms, arg(msg,0), arg(msg,1)),
         VFS_STATFS     => handle_statfs(ms, arg(msg,1)),
         VFS_LSTAT      => handle_lstat(ms, arg(msg,0), arg(msg,1)),
-        VFS_SYMLINK    => handle_symlink(ms, arg(msg,0), arg(msg,1), euid, egid),
+        VFS_SYMLINK    => handle_symlink(ms, arg(msg,0), arg(msg,1), &cred),
         VFS_FD_PATH    => handle_fd_path(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_READLINK   => handle_readlink(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_LINK       => handle_link(ms, arg(msg,0), arg(msg,1)),
-        VFS_CHMOD      => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, true, euid),
-        VFS_LCHMOD     => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, false, euid),
-        VFS_FCHMOD     => handle_fchmod(ms, arg(msg,0), arg(msg,1) as u32, euid),
+        VFS_CHMOD      => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, true, cred.euid),
+        VFS_LCHMOD     => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, false, cred.euid),
+        VFS_FCHMOD     => handle_fchmod(ms, arg(msg,0), arg(msg,1) as u32, cred.euid),
         VFS_FSYNC      => handle_fsync(ms),
-        VFS_CHOWN      => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, true, euid, egid),
-        VFS_LCHOWN     => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, false, euid, egid),
-        VFS_FCHOWN     => handle_fchown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, euid, egid),
+        VFS_CHOWN      => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, true, &cred),
+        VFS_LCHOWN     => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, false, &cred),
+        VFS_FCHOWN     => handle_fchown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, &cred),
 
         // Extended attributes. Path forms carry (path, name, value, size, flags);
         // f-forms replace path with a mount-local file_id. The l-forms differ
@@ -3569,45 +3705,48 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
         // from the same inline payload (Message.data holds 55 u64 words).
         VFS_SETXATTR | VFS_LSETXATTR =>
             match xattr_path_ino(ms, arg(msg,0), msg.tag == VFS_SETXATTR) {
-                Ok(ino) => xattr_set(ms, ino, arg(msg,1), arg(msg,2), arg(msg,3), arg(msg,4), euid, egid),
+                Ok(ino) => xattr_set(ms, ino, arg(msg,1), arg(msg,2), arg(msg,3), arg(msg,4), &cred),
                 Err(m) => m,
             },
         VFS_FSETXATTR =>
             match xattr_fd_ino(ms, arg(msg,0)) {
-                Ok(ino) => xattr_set(ms, ino, arg(msg,1), arg(msg,2), arg(msg,3), arg(msg,4), euid, egid),
+                Ok(ino) => xattr_set(ms, ino, arg(msg,1), arg(msg,2), arg(msg,3), arg(msg,4), &cred),
                 Err(m) => m,
             },
         VFS_GETXATTR | VFS_LGETXATTR =>
             match xattr_path_ino(ms, arg(msg,0), msg.tag == VFS_GETXATTR) {
-                Ok(ino) => xattr_get(ms, ino, arg(msg,1), arg(msg,2), arg(msg,3), euid, egid),
+                Ok(ino) => xattr_get(ms, ino, arg(msg,1), arg(msg,2), arg(msg,3), &cred),
                 Err(m) => m,
             },
         VFS_FGETXATTR =>
             match xattr_fd_ino(ms, arg(msg,0)) {
-                Ok(ino) => xattr_get(ms, ino, arg(msg,1), arg(msg,2), arg(msg,3), euid, egid),
+                Ok(ino) => xattr_get(ms, ino, arg(msg,1), arg(msg,2), arg(msg,3), &cred),
                 Err(m) => m,
             },
         VFS_LISTXATTR | VFS_LLISTXATTR =>
             match xattr_path_ino(ms, arg(msg,0), msg.tag == VFS_LISTXATTR) {
-                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), euid),
+                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.euid),
                 Err(m) => m,
             },
         VFS_FLISTXATTR =>
             match xattr_fd_ino(ms, arg(msg,0)) {
-                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), euid),
+                Ok(ino) => xattr_list(ms, ino, arg(msg,1), arg(msg,2), cred.euid),
                 Err(m) => m,
             },
         VFS_REMOVEXATTR | VFS_LREMOVEXATTR =>
             match xattr_path_ino(ms, arg(msg,0), msg.tag == VFS_REMOVEXATTR) {
-                Ok(ino) => xattr_remove(ms, ino, arg(msg,1), euid, egid),
+                Ok(ino) => xattr_remove(ms, ino, arg(msg,1), &cred),
                 Err(m) => m,
             },
         VFS_FREMOVEXATTR =>
             match xattr_fd_ino(ms, arg(msg,0)) {
-                Ok(ino) => xattr_remove(ms, ino, arg(msg,1), euid, egid),
+                Ok(ino) => xattr_remove(ms, ino, arg(msg,1), &cred),
                 Err(m) => m,
             },
-        VFS_ACCESS     => xattr_access(ms, arg(msg,0), arg(msg,1), euid, egid),
+        VFS_ACCESS     => xattr_access(ms, arg(msg,0), arg(msg,1), &cred),
+        VFS_UTIMENS    => handle_utimens(ms, msg, true, &cred),
+        VFS_LUTIMENS   => handle_utimens(ms, msg, false, &cred),
+        VFS_FUTIMENS   => handle_futimens(ms, msg, &cred),
 
         _              => err_reply(-22), // EINVAL
     }
@@ -3672,8 +3811,7 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
         core::ptr::addr_of_mut!((*p).sb).write(sb);
         core::ptr::addr_of_mut!((*p).cp).write(cp);
         core::ptr::addr_of_mut!((*p).dirty_writes).write(0);
-        core::ptr::addr_of_mut!((*p).euid).write(0);
-        core::ptr::addr_of_mut!((*p).egid).write(0);
+        core::ptr::addr_of_mut!((*p).cred).write(xattr::Cred::ROOT);
         core::ptr::addr_of_mut!((*p).walk_err).write(0);
         let files = core::ptr::addr_of_mut!((*p).open_files) as *mut OpenFile;
         for i in 0..MAX_OPEN_FILES {

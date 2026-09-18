@@ -641,6 +641,9 @@ mod nr {
     pub const FDATASYNC:      usize = 75;
     pub const FALLOCATE:      usize = 285;
     pub const UTIMENSAT:      usize = 280;
+    pub const UTIME:          usize = 132;
+    pub const UTIMES:         usize = 235;
+    pub const FUTIMESAT:      usize = 261;
     pub const MKNOD:          usize = 133;
     pub const MKNODAT:        usize = 259;
     // poll / select / epoll (x86-64)
@@ -1254,10 +1257,10 @@ fn dispatch_inner(
         SETGID => if sched::set_current_gid(a0 as u32) { 0 } else { -1 }, // EPERM
         SETRESUID => if sched::set_current_resuid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
         SETRESGID => if sched::set_current_resgid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
-        SETGROUPS => 0, // accept-and-ignore
+        SETGROUPS => sys_setgroups(a0, a1),
         GETRESUID   => sys_getresxid(a0, a1, a2, false),
         GETRESGID   => sys_getresxid(a0, a1, a2, true),
-        GETGROUPS   => 0,   // 0 supplementary groups
+        GETGROUPS   => sys_getgroups(a0, a1),
         UMASK       => sched::umask(a0 as u32) as isize,
         // Filesystem operations (writable for /tmp, read-only otherwise)
         MKDIRAT     => sys_mkdirat(a0, a1, a2),
@@ -1284,7 +1287,13 @@ fn dispatch_inner(
         FSYNC | FDATASYNC | SYNCFS => sys_fsync(a0),
         SYNC        => sys_sync(),
         FALLOCATE   => 0, // advisory pre-allocation; no-op is valid
-        UTIMENSAT   => 0,
+        UTIMENSAT   => sys_utimensat(a0, a1, a2, a3),
+        #[cfg(not(target_arch = "aarch64"))]
+        UTIMES      => sys_utimes(AT_FDCWD, a0, a1, false),
+        #[cfg(not(target_arch = "aarch64"))]
+        FUTIMESAT   => sys_utimes(a0, a1, a2, false),
+        #[cfg(not(target_arch = "aarch64"))]
+        UTIME       => sys_utimes(AT_FDCWD, a0, a1, true),
         MKNODAT     => sys_mknodat(a0, a1, a2, a3),
         #[cfg(not(target_arch = "aarch64"))]
         UNLINK => sys_unlinkat(AT_FDCWD, a0, 0),
@@ -2349,6 +2358,10 @@ fn monotonic_ns() -> u64 {
     { arch_aarch64::timer::monotonic_ns() }
 }
 
+/// The clock the filesystems stamp inodes with (`sched::clock_ns`): the same
+/// reading `clock_gettime` hands userspace, so `stat` and the clock agree.
+pub fn clock_ns_for_sched() -> u64 { monotonic_ns() }
+
 /// sys_clock_gettime(clkid, tp_ptr) — write the monotonic clock to user memory.
 ///
 /// `clkid` is ignored (all clocks return the same monotonic reading).
@@ -3247,11 +3260,19 @@ fn parse_shebang(buf: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
 /// binary; here it is applied to `#!` scripts, whose exec bit is the only
 /// thing that distinguishes a program from a data file the interpreter
 /// would otherwise happily run.
-fn script_exec_permitted(kp: &KPath, pid: u32) -> isize {
+/// The execute-permission gate for execve: `access(X_OK)` on the file, as the
+/// caller (owner/group/other bits, a stored ACL, supplementary groups; root
+/// still needs at least one x bit). Used for the `#!` script and, since the
+/// ELF loader never asked, for the final binary as well — a 0644 ELF used to
+/// exec fine for anyone who could read it. A filesystem that cannot answer
+/// (ENOSYS: the initrd) falls back to the stat mode bits.
+fn exec_permitted(kp: &KPath, pid: u32) -> isize {
     const X_OK: u64 = 1;
     let amsg = make_vfs_msg(vfs::VFS_ACCESS, &[kp.ptr() as u64, X_OK]);
     let ar = vfs_reply_val(&vfs::handle(&amsg, pid));
-    if ar != -38 { return if ar < 0 { -13 } else { 0 }; }
+    // Only a refusal is an answer: a missing file (ENOENT) or a filesystem
+    // that cannot say (ENOSYS) leaves the loader to report its own errno.
+    if ar != -38 { return if ar == -13 { -13 } else { 0 }; }
     let mut stat_buf = [0u8; STAT_SIZE];
     let msg = make_vfs_msg(vfs::VFS_STAT, &[kp.ptr() as u64, stat_buf.as_mut_ptr() as u64]);
     if vfs_reply_val(&vfs::handle(&msg, pid)) < 0 { return 0; } // unknowable: as before
@@ -3457,7 +3478,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         };
         if head.len() < 2 || &head[..2] != b"#!" { break; }
         if depth >= SHEBANG_MAX_DEPTH { return -40; } // ELOOP
-        let perm = script_exec_permitted(&kpath, pid);
+        let perm = exec_permitted(&kpath, pid);
         if perm != 0 { return perm; }
         let (interp, iarg) = match parse_shebang(&head) {
             Some(x) => x,
@@ -3480,6 +3501,14 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         depth += 1;
     }
     let script = !head_args.is_empty();
+
+    // The binary itself (or the script's interpreter) needs execute permission.
+    // A missing file still reports ENOENT below, not EACCES: exec_permitted
+    // only rules when the file exists and the caller lacks x on it.
+    {
+        let perm = exec_permitted(&kpath, pid);
+        if perm != 0 { return perm; }
+    }
 
     let path = match core::str::from_utf8(kpath.bytes()) {
         Ok(s) => s,
@@ -4907,18 +4936,22 @@ fn sys_prlimit64(
 fn vfs_open_resolved(path_ptr: usize, flags: usize, mode: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, flags as u64,
-                                            apply_umask(mode) as u64]);
+                                            pack_create_mode(mode)]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-/// Strip the caller's umask from a creation mode.
+/// Pack a creation mode with the caller's umask for the filesystem
+/// (`xattr::pack_create_mode`).
 ///
-/// Done here, in the kernel, because that is where Linux does it and because
-/// it is the one place both filesystems pass through — applying it per-server
-/// invites tmpfs and f2fs to disagree about the mode of the same new file.
-/// Passing `u32::MAX` reads the mask without altering it.
-fn apply_umask(mode: usize) -> usize {
-    mode & !(sched::umask(u32::MAX) as usize) & 0o7777
+/// The umask used to be applied here, in the kernel, so tmpfs and f2fs could
+/// not disagree about the mode of a new file. It still cannot: both now run
+/// `xattr::acl_create`, which applies the umask itself — unless the parent
+/// directory carries a default POSIX ACL, in which case the ACL, not the
+/// umask, decides the child's permission bits (POSIX 1003.1e; Linux
+/// `posix_acl_create`). Only the filesystem knows which case it is, so the
+/// mask has to travel with the mode. `u32::MAX` reads the mask unchanged.
+fn pack_create_mode(mode: usize) -> u64 {
+    xattr::pack_create_mode(mode as u32, sched::umask(u32::MAX))
 }
 
 /// Open a kernel-resident path string (no user-pointer validation, no cwd
@@ -5598,6 +5631,126 @@ fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, flags: us
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
+/// setgroups(size, list) — replace the supplementary group list. Root only
+/// (EPERM), at most `NGROUPS_MAX` entries (EINVAL). Inherited across fork and
+/// exec like the other credentials; consulted by every filesystem permission
+/// check through `xattr::Cred::in_group`.
+fn sys_setgroups(size: usize, list_ptr: usize) -> isize {
+    if size > xattr::NGROUPS_MAX { return -22; } // EINVAL
+    let mut groups = [0u32; xattr::NGROUPS_MAX];
+    if size > 0 {
+        if !validate_user_buf(list_ptr, size * 4) { return -14; } // EFAULT
+        prefault_user(list_ptr, size * 4);
+        let bytes = unsafe { core::slice::from_raw_parts_mut(groups.as_mut_ptr() as *mut u8, size * 4) };
+        let ok = with_current_address_space(|as_| as_.read_user_buf(list_ptr, bytes)).unwrap_or(false);
+        if !ok { return -14; }
+    }
+    if sched::set_current_groups(&groups[..size]) { 0 } else { -1 } // EPERM
+}
+
+/// getgroups(size, list) — `size == 0` queries the count; otherwise the list
+/// is copied out (EINVAL when it does not fit). Returns the count.
+fn sys_getgroups(size: usize, list_ptr: usize) -> isize {
+    let mut groups = [0u32; xattr::NGROUPS_MAX];
+    let n = sched::groups_of(current_pid(), &mut groups);
+    if size == 0 { return n as isize; }
+    if size < n { return -22; } // EINVAL
+    if n > 0 {
+        if !validate_user_buf(list_ptr, n * 4) { return -14; }
+        prefault_user(list_ptr, n * 4);
+        let bytes = unsafe { core::slice::from_raw_parts(groups.as_ptr() as *const u8, n * 4) };
+        let ok = with_current_address_space(|as_| as_.write_user_buf(list_ptr, bytes)).unwrap_or(false);
+        if !ok { return -14; }
+    }
+    n as isize
+}
+
+/// One resolved timestamp for the VFS: `UTIME_NOW` becomes the current time
+/// here (so both filesystems stamp the same clock userspace reads), and
+/// `UTIME_OMIT` travels as `nsec == UTIME_OMIT`. Returns `(sec, nsec,
+/// explicit)` where `explicit` means the caller supplied a concrete time.
+fn utimens_resolve(sec: i64, nsec: i64, now: (i64, i64)) -> Result<(i64, i64, bool), isize> {
+    if nsec == vfs::UTIME_NOW {
+        Ok((now.0, now.1, false))
+    } else if nsec == vfs::UTIME_OMIT {
+        Ok((0, vfs::UTIME_OMIT, false))
+    } else if !(0..1_000_000_000).contains(&nsec) {
+        Err(-22) // EINVAL
+    } else {
+        Ok((sec, nsec, true))
+    }
+}
+
+/// Send a resolved `VFS_UTIMENS`/`VFS_LUTIMENS`/`VFS_FUTIMENS`.
+fn utimens_send(tag: u64, target: u64, at: (i64, i64, bool), mt: (i64, i64, bool)) -> isize {
+    let mut flags = 0u64;
+    if at.2 || mt.2 { flags |= vfs::UTIMENS_EXPLICIT; }
+    let pid = current_pid();
+    let msg = make_vfs_msg(tag, &[target, at.0 as u64, at.1 as u64, mt.0 as u64, mt.1 as u64, flags]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// utimensat(dirfd, path, times, flags) — also `futimens` (path == NULL, the
+/// fd form). `times == NULL` means both timestamps become the current time.
+fn sys_utimensat(dirfd: usize, path_ptr: usize, times_ptr: usize, flags: usize) -> isize {
+    // struct timespec[2]: { atime.sec, atime.nsec, mtime.sec, mtime.nsec }
+    let mut ts = [0i64; 4];
+    if times_ptr != 0 {
+        if !validate_user_buf(times_ptr, 32) { return -14; }
+        prefault_user(times_ptr, 32);
+        let bytes = unsafe { core::slice::from_raw_parts_mut(ts.as_mut_ptr() as *mut u8, 32) };
+        let ok = with_current_address_space(|as_| as_.read_user_buf(times_ptr, bytes)).unwrap_or(false);
+        if !ok { return -14; }
+    } else {
+        ts = [0, vfs::UTIME_NOW, 0, vfs::UTIME_NOW];
+    }
+    // One reading for both, so "now" means the same instant for atime and mtime.
+    let now = sched::clock_ts();
+    let at = match utimens_resolve(ts[0], ts[1], now) { Ok(v) => v, Err(e) => return e };
+    let mt = match utimens_resolve(ts[2], ts[3], now) { Ok(v) => v, Err(e) => return e };
+    if at.1 == vfs::UTIME_OMIT && mt.1 == vfs::UTIME_OMIT { return 0; } // nothing to do (Linux skips the lookup too)
+    if path_ptr == 0 {
+        // futimens(fd, times): Linux accepts a NULL path here (glibc/musl
+        // both use it) and acts on the descriptor.
+        if dirfd == AT_FDCWD { return -14; } // EFAULT, as Linux
+        return utimens_send(vfs::VFS_FUTIMENS, dirfd as u64, at, mt);
+    }
+    let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    let tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LUTIMENS } else { vfs::VFS_UTIMENS };
+    utimens_send(tag, path.ptr() as u64, at, mt)
+}
+
+/// x86-64 legacy `utimes(path, timeval[2])` / `futimesat(dirfd, path,
+/// timeval[2])` and — with `is_utime` — `utime(path, utimbuf)` (two `time_t`
+/// seconds). NULL times = now.
+#[cfg(not(target_arch = "aarch64"))]
+fn sys_utimes(dirfd: usize, path_ptr: usize, times_ptr: usize, is_utime: bool) -> isize {
+    let mut ts = [0i64; 4];
+    if times_ptr != 0 {
+        let n = if is_utime { 16 } else { 32 };
+        if !validate_user_buf(times_ptr, n) { return -14; }
+        prefault_user(times_ptr, n);
+        let mut raw = [0i64; 4];
+        let bytes = unsafe { core::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, n) };
+        let ok = with_current_address_space(|as_| as_.read_user_buf(times_ptr, bytes)).unwrap_or(false);
+        if !ok { return -14; }
+        if is_utime {
+            ts = [raw[0], 0, raw[1], 0];
+        } else {
+            if !(0..1_000_000).contains(&raw[1]) || !(0..1_000_000).contains(&raw[3]) { return -22; }
+            ts = [raw[0], raw[1] * 1000, raw[2], raw[3] * 1000];
+        }
+    } else {
+        ts = [0, vfs::UTIME_NOW, 0, vfs::UTIME_NOW];
+    }
+    // One reading for both, so "now" means the same instant for atime and mtime.
+    let now = sched::clock_ts();
+    let at = match utimens_resolve(ts[0], ts[1], now) { Ok(v) => v, Err(e) => return e };
+    let mt = match utimens_resolve(ts[2], ts[3], now) { Ok(v) => v, Err(e) => return e };
+    let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    utimens_send(vfs::VFS_UTIMENS, path.ptr() as u64, at, mt)
+}
+
 fn sys_flock(fd: usize, op: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_FLOCK, &[fd as u64, op as u64]);
@@ -5667,7 +5820,7 @@ fn sys_getdents64(fd: usize, buf_ptr: usize, count: usize) -> isize {
 fn sys_mkdirat(dirfd: usize, path_ptr: usize, mode: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_MKDIR, &[path.ptr() as u64, apply_umask(mode) as u64]);
+    let msg = make_vfs_msg(vfs::VFS_MKDIR, &[path.ptr() as u64, pack_create_mode(mode)]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 

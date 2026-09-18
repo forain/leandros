@@ -19,7 +19,19 @@
 //!     caller's own group — EPERM;
 //!   * a stored POSIX ACL is honoured on the same checks (a named-user x entry
 //!     opens a 0700 directory to that user);
-//!   * root (euid 0) bypasses all of it.
+//!   * root (euid 0) bypasses all of it;
+//!   * supplementary groups (setgroups/getgroups, inherited across fork and
+//!     exec) count as group membership on every check, and chgrp may target
+//!     any of them;
+//!   * execve needs execute permission on an ELF, not just on a `#!` script
+//!     (root included: at least one x bit);
+//!   * utimensat: explicit times need ownership (EPERM), "now" needs write
+//!     permission (EACCES), UTIME_OMIT leaves a timestamp alone, and
+//!     AT_SYMLINK_NOFOLLOW stamps the link itself;
+//!   * a directory's default ACL is inherited at creation: the child's mode
+//!     comes from the ACL (the umask is ignored), a named entry becomes part
+//!     of the child's access ACL, and a child directory carries the default
+//!     ACL on.
 //!
 //! Runs as ROOT. Each negative case runs in a forked child that drops to
 //! uid/gid 1000 (`leandro`) with setresgid + setresuid; the parent reads the
@@ -31,8 +43,8 @@
 //! case, failure count as the exit code — so a harness can grep it. A failing
 //! child also prints the step and errno that failed, indented, for diagnosis.
 //!
-//! Note: this kernel's `wait4()` reports a child's raw `exit()` argument as
-//! `wstatus` (not the shifted Linux encoding), so `status == 0` is the check.
+//! Note: `wait4()` reports the Linux-encoded status (exit code in bits 8..16),
+//! so `status == 0` is the check for a clean pass.
 
 #![no_std]
 #![no_main]
@@ -65,6 +77,28 @@ use leandros_libc::syscall::{syscall2, syscall3, syscall4, syscall5};
 #[cfg(target_arch = "x86_64")]  const SYS_LISTEN:     usize = 50;
 #[cfg(target_arch = "aarch64")] const SYS_CONNECT:    usize = 203;
 #[cfg(target_arch = "x86_64")]  const SYS_CONNECT:    usize = 42;
+#[cfg(target_arch = "aarch64")] const SYS_UTIMENSAT:  usize = 88;
+#[cfg(target_arch = "x86_64")]  const SYS_UTIMENSAT:  usize = 280;
+#[cfg(target_arch = "aarch64")] const SYS_GETXATTR:   usize = 8;
+#[cfg(target_arch = "x86_64")]  const SYS_GETXATTR:   usize = 191;
+#[cfg(target_arch = "aarch64")] const SYS_SETGROUPS:  usize = 159;
+#[cfg(target_arch = "x86_64")]  const SYS_SETGROUPS:  usize = 116;
+#[cfg(target_arch = "aarch64")] const SYS_GETGROUPS:  usize = 158;
+#[cfg(target_arch = "x86_64")]  const SYS_GETGROUPS:  usize = 115;
+#[cfg(target_arch = "aarch64")] const SYS_FCHOWNAT:   usize = 54;
+#[cfg(target_arch = "x86_64")]  const SYS_FCHOWNAT:   usize = 260;
+
+const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+const UTIME_NOW:  i64 = (1 << 30) - 1;
+const UTIME_OMIT: i64 = (1 << 30) - 2;
+// struct stat timestamps: st_atim at 72, st_mtim at 88 (sec, nsec as i64 each)
+// on both ABIs — see servers/vfs write_stat_times.
+const STAT_ATIME_OFF: usize = 72;
+const STAT_MTIME_OFF: usize = 88;
+#[cfg(target_arch = "aarch64")] const STAT_MODE_OFF: usize = 16;
+#[cfg(target_arch = "x86_64")]  const STAT_MODE_OFF: usize = 24;
+#[cfg(target_arch = "aarch64")] const STAT_GID_OFF: usize = 28;
+#[cfg(target_arch = "x86_64")]  const STAT_GID_OFF: usize = 32;
 
 // `struct stat`: the 128-byte asm-generic layout on AArch64 (st_uid at 24),
 // x86-64's native 144-byte layout (st_uid at 28) — see servers/vfs
@@ -81,6 +115,8 @@ const SOCK_STREAM: i32 = 1;
 
 const UID_USER: u32 = 1000;  // leandro
 const UID_OTHER: u32 = 1001; // a second unprivileged owner, exists only as a number
+const GID_VIDEO: u32 = 44;   // a supplementary group (leandro is a member per /etc/group)
+const GID_NONE: u32 = 45;    // a group the user is NOT in
 
 fn xret(r: isize) -> isize {
     if r < 0 { set_errno(-r as i32); -1 } else { r }
@@ -107,6 +143,47 @@ unsafe fn raw_umask(mask: usize) -> isize {
 unsafe fn raw_setxattr(path: *const u8, name: *const u8, value: *const u8, size: usize) -> isize {
     xret(syscall5(SYS_SETXATTR, path as usize, name as usize, value as usize, size, 0))
 }
+unsafe fn raw_utimensat(path: *const u8, times: *const i64, flags: usize) -> isize {
+    xret(syscall4(SYS_UTIMENSAT, AT_FDCWD as usize, path as usize, times as usize, flags))
+}
+unsafe fn raw_futimens(fd: i32, times: *const i64) -> isize {
+    xret(syscall4(SYS_UTIMENSAT, fd as usize, 0, times as usize, 0))
+}
+unsafe fn raw_getxattr(path: *const u8, name: *const u8, buf: *mut u8, size: usize) -> isize {
+    xret(syscall4(SYS_GETXATTR, path as usize, name as usize, buf as usize, size))
+}
+unsafe fn raw_setgroups(groups: &[u32]) -> isize {
+    xret(syscall2(SYS_SETGROUPS, groups.len(), groups.as_ptr() as usize))
+}
+unsafe fn raw_getgroups(out: &mut [u32; 32]) -> isize {
+    xret(syscall2(SYS_GETGROUPS, out.len(), out.as_mut_ptr() as usize))
+}
+unsafe fn raw_lchown(path: *const u8, uid: u32, gid: u32) -> isize {
+    xret(syscall5(SYS_FCHOWNAT, AT_FDCWD as usize, path as usize, uid as usize, gid as usize, AT_SYMLINK_NOFOLLOW))
+}
+unsafe fn raw_lstat(path: *const u8, buf: *mut u8) -> isize {
+    xret(syscall4(SYS_NEWFSTATAT, AT_FDCWD as usize, path as usize, buf as usize, AT_SYMLINK_NOFOLLOW))
+}
+
+/// `(atime, mtime)` seconds+nanoseconds of `path`, or None when stat fails.
+unsafe fn stat_times(path: *const u8, follow: bool) -> Option<((i64, i64), (i64, i64))> {
+    let mut st = [0u8; STAT_SIZE];
+    let r = if follow { raw_stat(path, st.as_mut_ptr()) } else { raw_lstat(path, st.as_mut_ptr()) };
+    if r != 0 { return None; }
+    let rd = |o: usize| i64::from_ne_bytes(st[o..o + 8].try_into().unwrap());
+    Some(((rd(STAT_ATIME_OFF), rd(STAT_ATIME_OFF + 8)), (rd(STAT_MTIME_OFF), rd(STAT_MTIME_OFF + 8))))
+}
+unsafe fn stat_mode(path: *const u8) -> u32 {
+    let mut st = [0u8; STAT_SIZE];
+    if raw_stat(path, st.as_mut_ptr()) != 0 { return u32::MAX; }
+    u32::from_ne_bytes(st[STAT_MODE_OFF..STAT_MODE_OFF + 4].try_into().unwrap())
+}
+unsafe fn stat_gid(path: *const u8) -> u32 {
+    let mut st = [0u8; STAT_SIZE];
+    if raw_stat(path, st.as_mut_ptr()) != 0 { return u32::MAX; }
+    u32::from_ne_bytes(st[STAT_GID_OFF..STAT_GID_OFF + 4].try_into().unwrap())
+}
+
 unsafe fn raw_socket() -> i32 {
     xret(syscall3(SYS_SOCKET, AF_UNIX as usize, SOCK_STREAM as usize, 0)) as i32
 }
@@ -197,9 +274,15 @@ unsafe fn fails_with(r: isize, e: i32) -> bool { r == -1 && get_errno() == e }
 /// Run `f` in a forked child as `uid`/`gid` (0 = stay root). The child's exit
 /// status is the verdict: 0 = every step passed.
 unsafe fn run_as(uid: u32, gid: u32, f: unsafe fn(&[u8]) -> bool, root: &[u8]) -> bool {
+    run_as_groups(uid, gid, &[], f, root)
+}
+
+/// As `run_as`, with a supplementary group list installed before the drop.
+unsafe fn run_as_groups(uid: u32, gid: u32, groups: &[u32], f: unsafe fn(&[u8]) -> bool, root: &[u8]) -> bool {
     let pid = fork();
     if pid == 0 {
         if uid != 0 {
+            if raw_setgroups(groups) != 0 { out(b"    setgroups failed\n"); exit(2); }
             if setresgid(gid, gid, gid) != 0 { out(b"    setresgid failed\n"); exit(2); }
             if setresuid(uid, uid, uid) != 0 { out(b"    setresuid failed\n"); exit(2); }
             if geteuid() != uid { out(b"    privilege drop did not take\n"); exit(2); }
@@ -257,6 +340,43 @@ unsafe fn setup(root: &[u8]) -> bool {
     ok &= step(create(p!(root, b"/rootfile\0").as_ptr(), 0o644), b"setup rootfile");
     ok &= step(create(p!(root, b"/ownfile\0").as_ptr(), 0o644), b"setup ownfile");
     ok &= step(chown(p!(root, b"/ownfile\0").as_ptr(), UID_USER, UID_USER) == 0, b"setup chown ownfile");
+    // Group-only objects: reachable through group 44 (video) alone.
+    ok &= step(mkdir(p!(root, b"/grpdir\0").as_ptr(), 0o070) == 0, b"setup grpdir");
+    ok &= step(chown(p!(root, b"/grpdir\0").as_ptr(), 0, GID_VIDEO) == 0, b"setup chown grpdir");
+    ok &= step(create(p!(root, b"/grpfile\0").as_ptr(), 0o640), b"setup grpfile");
+    ok &= step(chown(p!(root, b"/grpfile\0").as_ptr(), 0, GID_VIDEO) == 0, b"setup chown grpfile");
+    // utimensat targets: a world-writable root file, and a symlink to ownfile.
+    ok &= step(create(p!(root, b"/rw666\0").as_ptr(), 0o666), b"setup rw666");
+    ok &= step(raw_symlink(p!(root, b"/ownfile\0").as_ptr(), p!(root, b"/ownlink\0").as_ptr()) == 0, b"setup ownlink");
+    ok &= step(raw_lchown(p!(root, b"/ownlink\0").as_ptr(), UID_USER, UID_USER) == 0, b"setup lchown ownlink");
+    // Default-ACL directory, open to everyone so creation itself is not the
+    // question.
+    ok &= step(mkdir(p!(root, b"/dacl\0").as_ptr(), 0o777) == 0, b"setup dacl");
+    ok &= step(set_default_acl(p!(root, b"/dacl\0").as_ptr()), b"setup dacl default ACL");
+    ok
+}
+
+/// Copy /bin/hello (a tiny static ELF that exits 0) to `<root>/exe*` in three
+/// modes for the execve x-bit cases. f2fs only: the x86-64 binary is bigger
+/// than a tmpfs file may be.
+unsafe fn setup_exec(root: &[u8]) -> bool {
+    let src = open(b"/bin/hello\0".as_ptr(), O_RDONLY, 0);
+    if !step(src >= 0, b"setup open /bin/hello") { return false; }
+    static mut BUF: [u8; 131072] = [0u8; 131072];
+    let n = read(src, core::ptr::addr_of_mut!(BUF) as *mut u8, 131072);
+    close(src);
+    if !step(n > 0 && n < 131072, b"setup read /bin/hello") { return false; }
+    let mut ok = true;
+    for (name, mode) in [(&b"/exe644\0"[..], 0o644u32), (b"/exe755\0", 0o755), (b"/exe700\0", 0o700)] {
+        let path = p!(root, name);
+        let fd = open(path.as_ptr(), O_CREAT | O_WRONLY | O_TRUNC, mode);
+        ok &= step(fd >= 0, b"setup create exe");
+        if fd < 0 { continue; }
+        let w = write(fd, core::ptr::addr_of!(BUF) as *const u8, n as usize);
+        close(fd);
+        ok &= step(w == n, b"setup write exe");
+        ok &= step(chmod(path.as_ptr(), mode) == 0, b"setup chmod exe");
+    }
     ok
 }
 
@@ -267,11 +387,15 @@ unsafe fn teardown(root: &[u8]) {
               b"/sticky/rootfile\0", b"/sticky/otherfile\0", b"/sticky/mine\0", b"/sticky/mine2\0",
               b"/sticky/renamed\0", b"/home/f\0", b"/home/l\0", b"/home/g\0", b"/home/s\0",
               b"/open777/f\0", b"/open777/g\0", b"/open777/l\0", b"/open777/sock\0",
-              b"/open777/sock600\0", b"/rootfile\0", b"/ownfile\0"] {
+              b"/open777/sock600\0", b"/rootfile\0", b"/ownfile\0",
+              b"/grpdir/f\0", b"/grpfile\0", b"/rw666\0", b"/ownlink\0",
+              b"/exe644\0", b"/exe755\0", b"/exe700\0",
+              b"/dacl/sub/subsub/f\0", b"/dacl/sub/f\0", b"/dacl/f\0"] {
         unlink(p!(root, s).as_ptr());
     }
     for s in [&b"/rootonly/sub\0"[..], b"/rootonly\0", b"/ro755/subdir\0", b"/ro755\0",
-              b"/open777/d\0", b"/open777\0", b"/sticky\0", b"/home/d\0", b"/home\0"] {
+              b"/open777/d\0", b"/open777\0", b"/sticky\0", b"/home/d\0", b"/home\0",
+              b"/grpdir\0", b"/dacl/sub/subsub\0", b"/dacl/sub\0", b"/dacl\0"] {
         rmdir(p!(root, s).as_ptr());
     }
     rmdir(p!(root, b"\0").as_ptr());
@@ -526,9 +650,265 @@ unsafe fn set_acl_x_for_user(dir: *const u8) -> bool {
     raw_setxattr(dir, b"system.posix_acl_access\0".as_ptr(), v.as_ptr(), v.len()) == 0
 }
 
+// ── supplementary groups ─────────────────────────────────────────────────────
+
+/// Without group 44: a 0070 root:44 directory and a 0640 root:44 file are
+/// closed to uid 1000 (primary gid 1000).
+unsafe fn case_group_denied(root: &[u8]) -> bool {
+    let mut ok = true;
+    ok &= step(fails_with(open(p!(root, b"/grpfile\0").as_ptr(), O_RDONLY, 0) as isize, EACCES), b"0640 root:44 file closed without the group");
+    ok &= step(fails_with(open(p!(root, b"/grpdir/f\0").as_ptr(), O_CREAT | O_WRONLY, 0o644) as isize, EACCES), b"0070 root:44 dir closed without the group");
+    // Unprivileged setgroups is EPERM, and the list is empty.
+    ok &= step(fails_with(raw_setgroups(&[GID_VIDEO]), EPERM), b"setgroups as user is EPERM");
+    let mut g = [0u32; 32];
+    ok &= step(raw_getgroups(&mut g) == 0, b"getgroups is empty");
+    ok
+}
+
+/// With group 44 installed by setgroups before the drop: the same objects
+/// open, getgroups reports the list, and a forked + exec'd child still has it.
+unsafe fn case_group_allowed(root: &[u8]) -> bool {
+    let mut ok = true;
+    let mut g = [0u32; 32];
+    let n = raw_getgroups(&mut g);
+    ok &= step(n == 1 && g[0] == GID_VIDEO, b"getgroups reports the supplementary group");
+    let fd = open(p!(root, b"/grpfile\0").as_ptr(), O_RDONLY, 0);
+    ok &= step(fd >= 0, b"0640 root:44 file opens through the group");
+    if fd >= 0 { close(fd); }
+    let fd = open(p!(root, b"/grpdir/f\0").as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    ok &= step(fd >= 0, b"create in 0070 root:44 dir through the group");
+    if fd >= 0 { close(fd); }
+    ok &= step(unlink(p!(root, b"/grpdir/f\0").as_ptr()) == 0, b"unlink in 0070 root:44 dir through the group");
+    // chgrp: the owner may hand a file to a supplementary group, not to another.
+    ok &= step(chown(p!(root, b"/ownfile\0").as_ptr(), u32::MAX, GID_VIDEO) == 0, b"chgrp to a supplementary group");
+    ok &= step(stat_gid(p!(root, b"/ownfile\0").as_ptr()) == GID_VIDEO, b"chgrp took");
+    ok &= step(fails_with(chown(p!(root, b"/ownfile\0").as_ptr(), u32::MAX, GID_NONE) as isize, EPERM), b"chgrp to a foreign group is EPERM");
+    ok &= step(chown(p!(root, b"/ownfile\0").as_ptr(), u32::MAX, UID_USER) == 0, b"chgrp back");
+    // Inheritance: fork, then exec /bin/permtest --groups 44, which exits 0
+    // only when getgroups returns exactly that list.
+    let pid = fork();
+    if pid == 0 {
+        let argv: [*const u8; 4] = [b"/bin/permtest\0".as_ptr(), b"--groups\0".as_ptr(), b"44\0".as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        execve(argv[0], argv.as_ptr(), envp.as_ptr());
+        exit(3);
+    }
+    let mut status: i32 = -1;
+    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    ok &= step(status == 0, b"groups survive fork + exec");
+    ok
+}
+
+/// `permtest --groups <gid>`: the exec'd half of case_group_allowed.
+unsafe fn groups_probe(want: u32) -> i32 {
+    let mut g = [0u32; 32];
+    let n = raw_getgroups(&mut g);
+    if n == 1 && g[0] == want { 0 } else { 1 }
+}
+
+// ── execve x-bit ─────────────────────────────────────────────────────────────
+
+/// Fork + exec `path`; returns the wait status, or -errno when execve failed
+/// (the child exits with 100 + errno).
+unsafe fn try_exec(path: *const u8) -> i32 {
+    let pid = fork();
+    if pid == 0 {
+        let argv: [*const u8; 2] = [path, core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        execve(path, argv.as_ptr(), envp.as_ptr());
+        exit(100 + get_errno());
+    }
+    let mut status: i32 = -1;
+    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    // Linux wait-status encoding: exit code in bits 8..16 of a normal exit.
+    let code = if status & 0x7f == 0 { (status >> 8) & 0xff } else { -1 };
+    if code >= 100 { -(code - 100) } else { code }
+}
+
+/// As uid 1000: a 0644 ELF and a 0700 root ELF are EACCES; 0755 runs.
+unsafe fn case_exec_xbit_user(root: &[u8]) -> bool {
+    let mut ok = true;
+    ok &= step(try_exec(p!(root, b"/exe644\0").as_ptr()) == -EACCES, b"exec 0644 ELF is EACCES");
+    ok &= step(try_exec(p!(root, b"/exe700\0").as_ptr()) == -EACCES, b"exec 0700 root ELF is EACCES for others");
+    ok &= step(try_exec(p!(root, b"/exe755\0").as_ptr()) == 0, b"exec 0755 ELF runs");
+    ok
+}
+
+/// As root: 0700 runs (owner), 0755 runs, but a file with no x bit at all is
+/// still EACCES — CAP_DAC_OVERRIDE does not manufacture execute permission.
+unsafe fn case_exec_xbit_root(root: &[u8]) -> bool {
+    let mut ok = true;
+    ok &= step(try_exec(p!(root, b"/exe644\0").as_ptr()) == -EACCES, b"root exec of 0644 ELF is EACCES");
+    ok &= step(try_exec(p!(root, b"/exe700\0").as_ptr()) == 0, b"root exec of 0700 ELF runs");
+    ok &= step(try_exec(p!(root, b"/exe755\0").as_ptr()) == 0, b"root exec of 0755 ELF runs");
+    ok
+}
+
+// ── utimensat ────────────────────────────────────────────────────────────────
+
+/// As uid 1000, owner of ownfile: explicit times land exactly; UTIME_OMIT
+/// leaves the other timestamp alone; NOFOLLOW stamps the link, not the
+/// target; futimens works through an fd; a non-owned 0644 file is EPERM for
+/// explicit times and EACCES for "now"; a non-owned 0666 file takes "now"
+/// but not explicit times.
+unsafe fn case_utimens(root: &[u8]) -> bool {
+    let mut ok = true;
+    let own = p!(root, b"/ownfile\0");
+    let times: [i64; 4] = [1_000_000, 111, 2_000_000, 222];
+    ok &= step(raw_utimensat(own.as_ptr(), times.as_ptr(), 0) == 0, b"utimensat explicit as owner");
+    match stat_times(own.as_ptr(), true) {
+        Some((a, m)) => ok &= step(a == (1_000_000, 111) && m == (2_000_000, 222), b"stat reads the explicit times back"),
+        None => ok &= step(false, b"stat after utimensat"),
+    }
+    let omit_a: [i64; 4] = [0, UTIME_OMIT, 3_000_000, 333];
+    ok &= step(raw_utimensat(own.as_ptr(), omit_a.as_ptr(), 0) == 0, b"utimensat UTIME_OMIT atime");
+    match stat_times(own.as_ptr(), true) {
+        Some((a, m)) => ok &= step(a == (1_000_000, 111) && m == (3_000_000, 333), b"UTIME_OMIT left atime alone"),
+        None => ok &= step(false, b"stat after UTIME_OMIT"),
+    }
+    // Both omitted: a no-op that succeeds even where the caller has no rights.
+    let omit_both: [i64; 4] = [0, UTIME_OMIT, 0, UTIME_OMIT];
+    ok &= step(raw_utimensat(p!(root, b"/rootfile\0").as_ptr(), omit_both.as_ptr(), 0) == 0, b"both UTIME_OMIT is a no-op");
+    // NULL times = now: must be later than the explicit stamp above and
+    // never zero.
+    ok &= step(raw_utimensat(own.as_ptr(), core::ptr::null(), 0) == 0, b"utimensat NULL as owner");
+    match stat_times(own.as_ptr(), true) {
+        Some((a, m)) => ok &= step(a.0 >= 0 && m.0 >= 0 && m != (3_000_000, 333) && a == m, b"NULL set both to now"),
+        None => ok &= step(false, b"stat after NULL"),
+    }
+    // futimens through an fd.
+    let fd = open(own.as_ptr(), O_RDWR, 0);
+    ok &= step(fd >= 0, b"open ownfile for futimens");
+    if fd >= 0 {
+        let t: [i64; 4] = [4_000_000, 444, 5_000_000, 555];
+        ok &= step(raw_futimens(fd, t.as_ptr()) == 0, b"futimens explicit as owner");
+        close(fd);
+        match stat_times(own.as_ptr(), true) {
+            Some((a, m)) => ok &= step(a == (4_000_000, 444) && m == (5_000_000, 555), b"futimens landed"),
+            None => ok &= step(false, b"stat after futimens"),
+        }
+    }
+    // AT_SYMLINK_NOFOLLOW: the link's own timestamps change, the target's don't.
+    let link = p!(root, b"/ownlink\0");
+    let lt: [i64; 4] = [6_000_000, 666, 7_000_000, 777];
+    ok &= step(raw_utimensat(link.as_ptr(), lt.as_ptr(), AT_SYMLINK_NOFOLLOW) == 0, b"utimensat NOFOLLOW on link");
+    match (stat_times(link.as_ptr(), false), stat_times(own.as_ptr(), true)) {
+        (Some((la, lm)), Some((_, m))) => {
+            ok &= step(la == (6_000_000, 666) && lm == (7_000_000, 777), b"link carries its own times");
+            ok &= step(m == (5_000_000, 555), b"target untouched by NOFOLLOW");
+        }
+        _ => ok &= step(false, b"lstat/stat after NOFOLLOW"),
+    }
+    // Following the link stamps the target.
+    let ft: [i64; 4] = [8_000_000, 888, 9_000_000, 999];
+    ok &= step(raw_utimensat(link.as_ptr(), ft.as_ptr(), 0) == 0, b"utimensat through link");
+    match stat_times(own.as_ptr(), true) {
+        Some((a, m)) => ok &= step(a == (8_000_000, 888) && m == (9_000_000, 999), b"target stamped through link"),
+        None => ok &= step(false, b"stat after follow"),
+    }
+    // Not the owner: 0644 root file.
+    let rf = p!(root, b"/rootfile\0");
+    ok &= step(fails_with(raw_utimensat(rf.as_ptr(), times.as_ptr(), 0), EPERM), b"explicit times on foreign file is EPERM");
+    ok &= step(fails_with(raw_utimensat(rf.as_ptr(), core::ptr::null(), 0), EACCES), b"NULL on unwritable foreign file is EACCES");
+    // Not the owner, but writable: 0666 root file.
+    let rw = p!(root, b"/rw666\0");
+    ok &= step(raw_utimensat(rw.as_ptr(), core::ptr::null(), 0) == 0, b"NULL on writable foreign file is allowed");
+    let now_both: [i64; 4] = [0, UTIME_NOW, 0, UTIME_NOW];
+    ok &= step(raw_utimensat(rw.as_ptr(), now_both.as_ptr(), 0) == 0, b"UTIME_NOW pair on writable foreign file is allowed");
+    ok &= step(fails_with(raw_utimensat(rw.as_ptr(), times.as_ptr(), 0), EPERM), b"explicit times on writable foreign file is still EPERM");
+    // Bad nanoseconds.
+    let bad: [i64; 4] = [0, 1_000_000_000, 0, 0];
+    ok &= step(fails_with(raw_utimensat(own.as_ptr(), bad.as_ptr(), 0), EINVAL), b"nsec out of range is EINVAL");
+    ok
+}
+
+/// Root may set explicit times on anything.
+unsafe fn case_utimens_root(root: &[u8]) -> bool {
+    let times: [i64; 4] = [10_000_000, 1, 11_000_000, 2];
+    let own = p!(root, b"/ownfile\0");
+    let mut ok = step(raw_utimensat(own.as_ptr(), times.as_ptr(), 0) == 0, b"root utimensat on a user file");
+    match stat_times(own.as_ptr(), true) {
+        Some((a, m)) => ok &= step(a == (10_000_000, 1) && m == (11_000_000, 2), b"root's times landed"),
+        None => ok &= step(false, b"stat after root utimensat"),
+    }
+    ok
+}
+
+// ── default ACL inheritance ──────────────────────────────────────────────────
+
+/// `system.posix_acl_default` on <root>/dacl: USER_OBJ rwx, USER(1001) rwx,
+/// GROUP_OBJ r-x, MASK rwx, OTHER ---.
+unsafe fn set_default_acl(dir: *const u8) -> bool {
+    let mut v = [0u8; 4 + 5 * 8];
+    v[..4].copy_from_slice(&2u32.to_le_bytes());
+    let entries: [(u16, u16, u32); 5] = [(0x01, 7, u32::MAX), (0x02, 7, UID_OTHER), (0x04, 5, u32::MAX),
+                                        (0x10, 7, u32::MAX), (0x20, 0, u32::MAX)];
+    for (i, (tag, perm, id)) in entries.iter().enumerate() {
+        let o = 4 + i * 8;
+        v[o..o + 2].copy_from_slice(&tag.to_le_bytes());
+        v[o + 2..o + 4].copy_from_slice(&perm.to_le_bytes());
+        v[o + 4..o + 8].copy_from_slice(&id.to_le_bytes());
+    }
+    raw_setxattr(dir, b"system.posix_acl_default\0".as_ptr(), v.as_ptr(), v.len()) == 0
+}
+
+/// Length of the named ACL xattr on `path`, or -1 when absent.
+unsafe fn acl_len(path: *const u8, name: &[u8]) -> isize {
+    let mut buf = [0u8; 256];
+    raw_getxattr(path, name.as_ptr(), buf.as_mut_ptr(), buf.len())
+}
+
+/// As uid 1000 with umask 022: a file created 0666 under dacl gets mode 0660
+/// (the ACL's group/mask r-x∧rw- = rw-, other ---; the umask would have said
+/// 0644) and an access ACL naming uid 1001; a directory created 0777 gets
+/// 0770, the same access ACL, and the default ACL itself; and its own child
+/// inherits again.
+unsafe fn case_default_acl_inherit(root: &[u8]) -> bool {
+    let mut ok = true;
+    raw_umask(0o022);
+    let f = p!(root, b"/dacl/f\0");
+    ok &= step(create(f.as_ptr(), 0o666), b"create file under default-ACL dir");
+    ok &= step(stat_mode(f.as_ptr()) & 0o777 == 0o660, b"file mode comes from the default ACL, not the umask");
+    ok &= step(acl_len(f.as_ptr(), b"system.posix_acl_access\0") == 4 + 5 * 8, b"file inherited an access ACL");
+    ok &= step(acl_len(f.as_ptr(), b"system.posix_acl_default\0") == -1, b"file has no default ACL");
+    let d = p!(root, b"/dacl/sub\0");
+    ok &= step(mkdir(d.as_ptr(), 0o777) == 0, b"mkdir under default-ACL dir");
+    ok &= step(stat_mode(d.as_ptr()) & 0o777 == 0o770, b"dir mode comes from the default ACL");
+    ok &= step(acl_len(d.as_ptr(), b"system.posix_acl_access\0") == 4 + 5 * 8, b"dir inherited an access ACL");
+    ok &= step(acl_len(d.as_ptr(), b"system.posix_acl_default\0") == 4 + 5 * 8, b"dir inherited the default ACL");
+    let d2 = p!(root, b"/dacl/sub/subsub\0");
+    ok &= step(mkdir(d2.as_ptr(), 0o755) == 0, b"mkdir two levels down");
+    ok &= step(stat_mode(d2.as_ptr()) & 0o777 == 0o750, b"grandchild dir mode from the inherited default ACL");
+    ok &= step(acl_len(d2.as_ptr(), b"system.posix_acl_default\0") == 4 + 5 * 8, b"grandchild inherited the default ACL");
+    let f2 = p!(root, b"/dacl/sub/subsub/f\0");
+    ok &= step(create(f2.as_ptr(), 0o644), b"create file two levels down");
+    ok &= step(stat_mode(f2.as_ptr()) & 0o777 == 0o640, b"grandchild file mode from the inherited default ACL");
+    // A file outside the ACL'd tree still obeys the umask.
+    let g = p!(root, b"/home/g\0");
+    ok &= step(create(g.as_ptr(), 0o666), b"create control file");
+    ok &= step(stat_mode(g.as_ptr()) & 0o777 == 0o644, b"control file obeys the umask");
+    raw_umask(0);
+    ok
+}
+
+/// As uid 1001, named in the inherited access ACL: the file created by uid
+/// 1000 is readable and writable although its mode says other=---. As uid
+/// 1002 it is not.
+unsafe fn case_default_acl_named_user(root: &[u8]) -> bool {
+    let f = p!(root, b"/dacl/f\0");
+    let fd = open(f.as_ptr(), O_RDWR, 0);
+    let ok = step(fd >= 0, b"named user opens the inherited-ACL file rw");
+    if fd >= 0 { close(fd); }
+    ok
+}
+unsafe fn case_default_acl_other_denied(root: &[u8]) -> bool {
+    let f = p!(root, b"/dacl/f\0");
+    step(fails_with(open(f.as_ptr(), O_RDONLY, 0) as isize, EACCES), b"unnamed user is denied by the inherited ACL")
+}
+
 // ── driver ───────────────────────────────────────────────────────────────────
 
-unsafe fn run_matrix(root: &[u8], tag: &[u8], with_sockets: bool) -> u32 {
+unsafe fn run_matrix(root: &[u8], tag: &[u8], with_sockets: bool, with_exec: bool) -> u32 {
     let mut failures = 0u32;
     let mut name = [0u8; 96];
     let mut named = |case: &[u8]| -> *const u8 {
@@ -593,12 +973,48 @@ unsafe fn run_matrix(root: &[u8], tag: &[u8], with_sockets: bool) -> u32 {
         if !report(core::slice::from_raw_parts(named(b"acl_grants_traversal"), 20 + tag.len()), false) { failures += 1; }
     }
 
+    case!(b"group_denied_without_membership", UID_USER, case_group_denied);
+    {
+        let n = named(b"group_allowed_supplementary");
+        let nm = core::slice::from_raw_parts(n, 27 + tag.len());
+        if !report(nm, run_as_groups(UID_USER, UID_USER, &[GID_VIDEO], case_group_allowed, root)) { failures += 1; }
+    }
+
+    if with_exec {
+        if setup_exec(root) {
+            case!(b"exec_xbit_user", UID_USER, case_exec_xbit_user);
+            case!(b"exec_xbit_root", 0, case_exec_xbit_root);
+        } else if !report(core::slice::from_raw_parts(named(b"exec_setup"), 10 + tag.len()), false) {
+            failures += 1;
+        }
+    }
+
+    case!(b"utimens_rules", UID_USER, case_utimens);
+    case!(b"utimens_root", 0, case_utimens_root);
+
+    case!(b"default_acl_inherit", UID_USER, case_default_acl_inherit);
+    case!(b"default_acl_named_user", UID_OTHER, case_default_acl_named_user);
+    case!(b"default_acl_other_denied", 1002, case_default_acl_other_denied);
+
     teardown(root);
     failures
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
+pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
+    // `permtest --groups <gid>`: the exec'd probe of case_group_allowed.
+    if argc >= 3 {
+        let a1 = *argv.add(1);
+        let mut n = 0usize;
+        while *a1.add(n) != 0 { n += 1; }
+        if core::slice::from_raw_parts(a1, n) == b"--groups" {
+            let a2 = *argv.add(2);
+            let mut want = 0u32;
+            let mut i = 0usize;
+            while *a2.add(i) != 0 { want = want * 10 + (*a2.add(i) - b'0') as u32; i += 1; }
+            return groups_probe(want);
+        }
+    }
     if geteuid() != 0 {
         puts(b"permtest: must run as root\0".as_ptr());
         return 1;
@@ -607,8 +1023,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     raw_umask(0);
 
     let mut failures = 0u32;
-    failures += run_matrix(b"/data/pt", b"_f2fs", false);
-    failures += run_matrix(b"/tmp/pt", b"_tmpfs", true);
+    failures += run_matrix(b"/data/pt", b"_f2fs", false, true);
+    failures += run_matrix(b"/tmp/pt", b"_tmpfs", true, false);
 
     out(b"--- permtest done: ");
     out_dec(failures);

@@ -38,7 +38,7 @@ pub use task::{SigInfo, SI_USER, SI_KERNEL, SI_TIMER, SI_TKILL, CLD_EXITED, CLD_
                SEGV_MAPERR, SEGV_ACCERR, BUS_ADRALN, BUS_ADRERR, ILL_ILLOPC, FPE_INTDIV, FPE_FLTINV,
                TRAP_BRKPT, TRAP_TRACE};
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 use task::{Pid, Task, TaskState};
 use context::CpuContext;
@@ -696,6 +696,33 @@ pub fn ticks() -> u64 {
     TIMER_TICKS.load(Ordering::Relaxed)
 }
 
+/// Nanosecond clock source registered by the kernel at boot (the same
+/// counter-derived reading `clock_gettime` returns), so servers can stamp
+/// inodes with a time that agrees with what userspace reads. Falls back to
+/// the 10 ms tick until registered.
+static CLOCK_NS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn register_clock_ns(f: fn() -> u64) {
+    CLOCK_NS.store(f as usize, Ordering::Release);
+}
+
+/// Nanoseconds since boot (this kernel's CLOCK_REALTIME has no epoch).
+pub fn clock_ns() -> u64 {
+    let f = CLOCK_NS.load(Ordering::Acquire);
+    if f != 0 {
+        let f: fn() -> u64 = unsafe { core::mem::transmute(f) };
+        f()
+    } else {
+        ticks() * 10_000_000
+    }
+}
+
+/// `(sec, nsec)` of [`clock_ns`] — the shape a `struct timespec` wants.
+pub fn clock_ts() -> (i64, i64) {
+    let ns = clock_ns();
+    ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
+}
+
 /// Deliver `signo` to the single *thread* `pid`, carrying `info` as its
 /// `siginfo_t` payload.
 ///
@@ -1234,6 +1261,36 @@ pub fn euid_of(pid: Pid) -> u32 {
 
 pub fn egid_of(pid: Pid) -> u32 {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.egid).unwrap_or(0)
+}
+
+/// Supplementary groups of `pid`, copied into `out`; returns the count.
+/// An unknown pid (the boot-time mount path) has none.
+pub fn groups_of(pid: Pid, out: &mut [u32; task::NGROUPS_MAX]) -> usize {
+    let rq = RUN_QUEUE.lock();
+    match rq.find_pid(pid) {
+        Some(t) => {
+            let n = (t.ngroups as usize).min(task::NGROUPS_MAX);
+            out[..n].copy_from_slice(&t.groups[..n]);
+            n
+        }
+        None => 0,
+    }
+}
+
+/// setgroups(2): replace the calling thread's supplementary group list.
+/// Privileged only (CAP_SETGID ≙ euid 0) — returns false (⇒ EPERM) otherwise.
+/// `groups.len()` must not exceed `NGROUPS_MAX` (the caller maps that to EINVAL).
+pub fn set_current_groups(groups: &[u32]) -> bool {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    if let Some(t) = rq.find_pid_mut(pid) {
+        if t.euid != 0 { return false; }
+        let n = groups.len().min(task::NGROUPS_MAX);
+        t.groups[..n].copy_from_slice(&groups[..n]);
+        t.ngroups = n as u8;
+        return true;
+    }
+    false
 }
 
 pub fn current_uid()  -> u32 { RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.uid).unwrap_or(0) }

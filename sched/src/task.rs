@@ -242,6 +242,9 @@ impl SigInfo {
     }
 }
 
+/// Most supplementary groups a task may hold; mirrors `xattr::NGROUPS_MAX`.
+pub const NGROUPS_MAX: usize = 32;
+
 #[repr(C)]
 pub struct Task {
     pub pid:          Pid,
@@ -335,6 +338,11 @@ pub struct Task {
     pub egid: u32,
     pub suid: u32,
     pub sgid: u32,
+    /// Supplementary groups (`setgroups(2)`), `groups[..ngroups]`. Copied at
+    /// clone like the ids above; consulted by every filesystem permission
+    /// check through `xattr::Cred::in_group`.
+    pub ngroups: u8,
+    pub groups: [u32; NGROUPS_MAX],
 
     // ── Signal state ──────────────────────────────────────────────────────────
     /// Bitmask of pending signals (bit N = signal N+1 is pending).
@@ -522,6 +530,8 @@ impl Task {
             egid: 0,
             suid: 0,
             sgid: 0,
+            ngroups: 0,
+            groups: [0; NGROUPS_MAX],
             signal_pending: 0,
             signal_mask: 0,
             shared_signal_pending: 0,
@@ -900,6 +910,8 @@ impl Task {
             egid: 0,
             suid: 0,
             sgid: 0,
+            ngroups: 0,
+            groups: [0; NGROUPS_MAX],
             signal_pending: 0,
             signal_mask: 0,
             shared_signal_pending: 0,
