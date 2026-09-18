@@ -177,10 +177,14 @@ impl VirtioKeyboardDevice {
     pub fn new_from(dev: PciDevice) -> Option<Self> {
         crate::pci::serial_debug("[INPUT] Found VirtIO Input device\n");
 
-        // Enable PCI Memory Space (bit 1) and Bus Master (bit 2)
+        // Enable PCI Memory Space (bit 1) and Bus Master (bit 2); INTx
+        // Disable (bit 10) too — this driver polls and never reads its ISR
+        // status, so an asserted INTx would stay asserted forever and storm
+        // the GPU's completion interrupt on a shared virt PCIe line
+        // (`virtio_gpu::enable_intx`).
         unsafe {
             let cmd = pci_read_config_16(dev.bus, dev.dev, dev.func, 0x04);
-            pci_write_config_16(dev.bus, dev.dev, dev.func, 0x04, cmd | 0x0006);
+            pci_write_config_16(dev.bus, dev.dev, dev.func, 0x04, (cmd | 0x0006) | crate::pci::PCI_CMD_INTX_DISABLE);
         }
 
         let mut common_cfg = core::ptr::null_mut();

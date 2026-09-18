@@ -3,6 +3,13 @@
 use alloc::vec::Vec;
 use spin::Mutex;
 
+/// PCI command register (offset 0x04) bit 10, Interrupt Disable: the function
+/// must not assert its INTx pin. Set by every driver that polls its virtio
+/// device (blk, net, snd, input), because a device whose ISR status is never
+/// read holds INTx asserted for good, and on QEMU virt's four shared PCIe
+/// lines that would storm the GPU's completion interrupt.
+pub const PCI_CMD_INTX_DISABLE: u16 = 1 << 10;
+
 #[derive(Debug, Clone, Copy)]
 pub struct PciDevice {
     pub bus: u8,

@@ -64,6 +64,7 @@ const DRM_IOCTL_MODE_ADDFB2: c_ulong = 0xC06864B8;
 const DRM_IOCTL_MODE_SETCRTC: c_ulong = 0xC06864A2;
 const DRM_IOCTL_MODE_DIRTYFB: c_ulong = 0xC01864B1;
 const DRM_IOCTL_MODE_DESTROY_DUMB: c_ulong = 0xC00464B4;
+const DRM_IOCTL_MODE_RMFB: c_ulong = 0xC00464AF;
 const DRM_IOCTL_MODE_PAGE_FLIP: c_ulong = 0xC01864B0;
 const DRM_IOCTL_MODE_ATOMIC: c_ulong = 0xC03864BC;
 const DRM_IOCTL_PRIME_HANDLE_TO_FD: c_ulong = 0xC00C642D;
@@ -1536,6 +1537,132 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         puts(b"  FLIP_TS_SUBTICK: note - every sample hit the clamp; interpolation is live but the timer IRQ ran late throughout\n\0".as_ptr());
     }
     if !report(b"FLIP_TS_SUBTICK", subtick_ok) { failures += 1; }
+    }
+
+    // ── GPU completion interrupt (LeandrOS 0x1008 census) ───────────────────
+    //
+    // The virtio-gpu control queue completes on a device interrupt on both
+    // QEMU targets — MSI-X vector 0x41 on x86_64, INTx on the virt board's
+    // PCIe line (GIC SPI, INTID 35..38) on aarch64 — with the 100 Hz tick
+    // poller as the fallback. These checks read the kernel's own counters
+    // through ioctl 0x1008 before and after a burst of presents, so they are
+    // deterministic where a latency histogram would only be suggestive:
+    //   * GPU_IRQ_ARMED — the device took the interrupt at probe. A build
+    //     that fell back to polling fails here, loudly, rather than being
+    //     10 ms slower per completion forever.
+    //   * GPU_IRQ_COMPLETIONS_COUNTED — the interrupt actually fires: the
+    //     census advances across presents whose fences the host answers.
+    //   * FLIP_EVENT_DELIVERED_ON_FENCE — flip-complete events rode the
+    //     fence path (delivered when the host retired the present) rather
+    //     than the tick fallback, for every flip of the burst.
+    //   * SYNC_CMD_PARKED — a reply-needing command (ADDFB2's
+    //     RESOURCE_CREATE_2D + ATTACH_BACKING) parked the CPU on the
+    //     interrupt instead of spinning under the device lock.
+    //   * GPU_IRQ_NO_TIMEOUTS / INTX_NOT_STORMING — nothing wedged and the
+    //     shared level line is not being held by another function.
+    const DRM_IOCTL_LEANDROS_GPU_IRQ_STATS: c_ulong = 0x1008;
+    if master_conflict {
+        report_skip(b"GPU_IRQ_ARMED");
+        report_skip(b"GPU_IRQ_COMPLETIONS_COUNTED");
+        report_skip(b"FLIP_EVENT_DELIVERED_ON_FENCE");
+        report_skip(b"SYNC_CMD_PARKED");
+        report_skip(b"GPU_IRQ_NO_TIMEOUTS");
+        report_skip(b"INTX_NOT_STORMING");
+        skips += 6;
+    } else {
+        let mut st0 = [0u64; 8];
+        let st0_ok = ioctl(fd, DRM_IOCTL_LEANDROS_GPU_IRQ_STATS, st0.as_mut_ptr()) == 0;
+        let armed = st0_ok && st0[0] == 1;
+        print_dec(b"  GPU_IRQ armed=", st0[0]);
+        print_dec(b"  GPU_IRQ irqs_before=", st0[1]);
+        if !report(b"GPU_IRQ_ARMED", armed) { failures += 1; }
+
+        // A burst of presents with events, each read back before the next,
+        // so every one of them is a fenced RESOURCE_FLUSH the host answers.
+        // The submit-to-event latency of each is the measurement that tells
+        // the two delivery paths apart: on the tick it is uniform over
+        // 0..10 ms (mean ~5 ms), on the fence it is the host's present time
+        // plus interrupt latency. Printed, not judged — the pass/fail below
+        // reads the kernel's own counters instead.
+        const IRQ_BURST: usize = 32;
+        let mut burst_ok = true;
+        let mut lat_sum_us = 0u64;
+        let mut lat_max_us = 0u64;
+        let mut lat_min_us = u64::MAX;
+        let burst_t0 = monotonic_ns();
+        for i in 0..IRQ_BURST {
+            let mut bflip = DrmModeCrtcPageFlip::default();
+            bflip.crtc_id = 1;
+            bflip.fb_id = fb.fb_id;
+            bflip.flags = DRM_MODE_PAGE_FLIP_EVENT;
+            bflip.user_data = 0x1A5E_0000 + i as u64;
+            let t0 = monotonic_ns();
+            if ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &mut bflip as *mut _) != 0 { burst_ok = false; break; }
+            let mut bpfd = pollfd { fd, events: POLLIN, revents: 0 };
+            let bpoll = poll(&mut bpfd as *mut _, 1, 500);
+            let t1 = monotonic_ns();
+            if bpoll != 1 || (bpfd.revents & POLLIN) == 0 { burst_ok = false; break; }
+            let mut bev = DrmEventVblank::default();
+            let brn = read(fd, &mut bev as *mut _ as *mut c_void, core::mem::size_of::<DrmEventVblank>());
+            if brn != 32 || bev.user_data != bflip.user_data { burst_ok = false; break; }
+            let lat = t1.wrapping_sub(t0) / 1000;
+            lat_sum_us += lat;
+            if lat > lat_max_us { lat_max_us = lat; }
+            if lat < lat_min_us { lat_min_us = lat; }
+        }
+        let burst_us = monotonic_ns().wrapping_sub(burst_t0) / 1000;
+        if burst_ok {
+            print_dec(b"  GPU_IRQ flip_event_latency_mean_us=", lat_sum_us / IRQ_BURST as u64);
+            print_dec(b"  GPU_IRQ flip_event_latency_min_us=", lat_min_us);
+            print_dec(b"  GPU_IRQ flip_event_latency_max_us=", lat_max_us);
+            // Presents per second a client that waits for each event can reach.
+            print_dec(b"  GPU_IRQ flip_rate_per_s=", IRQ_BURST as u64 * 1_000_000 / burst_us.max(1));
+        }
+        // Reply-needing commands: ADDFB2 over a fresh dumb buffer issues
+        // RESOURCE_CREATE_2D and ATTACH_BACKING synchronously (the reply is
+        // checked before the fb exists).
+        let mut sd = DrmModeCreateDumb::default();
+        sd.width = 64; sd.height = 64; sd.bpp = 32;
+        let mut sd_ok = ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut sd as *mut _) == 0;
+        if sd_ok {
+            let mut sfb = DrmModeFbCmd2::default();
+            sfb.width = 64;
+            sfb.height = 64;
+            sfb.pixel_format = DRM_FORMAT_XRGB8888;
+            sfb.handles[0] = sd.handle;
+            sfb.pitches[0] = sd.pitch;
+            sd_ok = ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &mut sfb as *mut _) == 0 && sfb.fb_id != 0;
+            if sd_ok {
+                let mut rm = sfb.fb_id;
+                let _ = ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut rm as *mut u32);
+            }
+            let mut dd = sd.handle;
+            let _ = ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut dd as *mut u32);
+        }
+
+        let mut st1 = [0u64; 8];
+        let st1_ok = ioctl(fd, DRM_IOCTL_LEANDROS_GPU_IRQ_STATS, st1.as_mut_ptr()) == 0;
+        let d_irqs   = st1[1].wrapping_sub(st0[1]);
+        let d_fflips = st1[2].wrapping_sub(st0[2]);
+        let d_parked = st1[3].wrapping_sub(st0[3]);
+        let d_spur   = st1[4].wrapping_sub(st0[4]);
+        let d_deliv  = st1[5].wrapping_sub(st0[5]);
+        let d_sync   = st1[6].wrapping_sub(st0[6]);
+        let d_to     = st1[7].wrapping_sub(st0[7]);
+        print_dec(b"  GPU_IRQ burst_flips=", IRQ_BURST as u64);
+        print_dec(b"  GPU_IRQ d_irqs=", d_irqs);
+        print_dec(b"  GPU_IRQ d_flips_delivered=", d_deliv);
+        print_dec(b"  GPU_IRQ d_flips_on_fence=", d_fflips);
+        print_dec(b"  GPU_IRQ d_sync_cmds=", d_sync);
+        print_dec(b"  GPU_IRQ d_parked=", d_parked);
+        print_dec(b"  GPU_IRQ d_intx_spurious=", d_spur);
+        print_dec(b"  GPU_IRQ d_timeouts=", d_to);
+        let ok_all = st0_ok && st1_ok && burst_ok && sd_ok;
+        if !report(b"GPU_IRQ_COMPLETIONS_COUNTED", ok_all && armed && d_irqs >= 1) { failures += 1; }
+        if !report(b"FLIP_EVENT_DELIVERED_ON_FENCE", ok_all && armed && d_fflips >= IRQ_BURST as u64) { failures += 1; }
+        if !report(b"SYNC_CMD_PARKED", ok_all && armed && d_sync >= 1 && d_parked >= 1) { failures += 1; }
+        if !report(b"GPU_IRQ_NO_TIMEOUTS", ok_all && d_to == 0) { failures += 1; }
+        if !report(b"INTX_NOT_STORMING", ok_all && d_spur < 64) { failures += 1; }
     }
 
     // ── Sync objects (DRM_IOCTL_SYNCOBJ_*) ──────────────────────────────────

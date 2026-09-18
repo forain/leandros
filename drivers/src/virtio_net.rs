@@ -203,7 +203,11 @@ unsafe impl Sync for VirtioNetDevice {}
 
 unsafe fn enable_pci_mmio(pci: &PciDevice) {
     let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
-    pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd | 0x0006);
+    // Memory Space + Bus Master on; INTx Disable (bit 10) on: this driver
+    // polls and never reads its ISR status, so an asserted INTx would stay
+    // asserted forever and, on the virt board's shared PCIe lines, storm the
+    // GPU's completion interrupt (`virtio_gpu::enable_intx`).
+    pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, (cmd | 0x0006) | crate::pci::PCI_CMD_INTX_DISABLE);
 }
 
 fn bar64(pci: &PciDevice, bar_idx: usize) -> u64 {

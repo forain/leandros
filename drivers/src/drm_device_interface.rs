@@ -1550,6 +1550,7 @@ static FENCE_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// fences. False asks to be re-run next tick.
 fn gpu_fence_event() -> bool {
     let mut ok = out_fence_service();
+    if !flip_fence_service() { ok = false; }
     if FENCE_WAITERS.load(Ordering::Relaxed) != 0 {
         let tag = sched::poll_tag(sched::poll_class::DRM, FENCE_POLL_INDEX);
         if !sched::try_wake_poll_tagged(tag) { ok = false; }
@@ -3045,13 +3046,29 @@ fn v3d_fence_done(fence: u64) -> bool {
 }
 
 // ── DRM page-flip event channel ──────────────────────────────────────────────
-// PAGE_FLIP-with-event completions are NOT delivered instantly: doing so lets a
-// compositor's render loop resubmit with zero delay and peg the CPU (there is no
-// real vblank here). Instead they queue in PENDING_FLIPS and `drm_tick()` — a
-// 100 Hz tick hook — promotes at most one per ~vblank window into READY_EVENTS,
-// which read()/poll() on the card fd drain. This gives Smithay/kmscube a stable
+// PAGE_FLIP-with-event completions are NOT delivered at submission: doing so
+// lets a compositor's render loop resubmit with zero delay and peg the CPU
+// (there is no real vblank here). They queue in PENDING_FLIPS, each with the
+// fence of the present it stands for, and are promoted into READY_EVENTS —
+// which read()/poll() on the card fd drain — by whichever comes first:
+//   * the present's fence retiring, observed on the completion interrupt
+//     (`flip_fence_service`, reached from `gpu_fence_event`), which is the
+//     host having shown the frame;
+//   * `drm_tick()`, the 100 Hz tick hook, at most one per tick — the fallback
+//     for an unfenced entry (a commit that moved no pixels, delivered on the
+//     next tick as before) and for a fenced one the host has not answered
+//     within `FLIP_FALLBACK_TICKS` (a lost interrupt, or a present slower
+//     than that: the event then says "done" before the pixels are, which is
+//     what every flip event said before the fence existed).
+// Either way delivery is in queue order. This gives Smithay/kmscube a stable
 // frame cadence and keeps idle CPU at zero (idletest guards it).
-static PENDING_FLIPS: Mutex<VecDeque<[u8; 32]>> = Mutex::new(VecDeque::new());
+//
+// Entry: (event bytes, present fence or 0, tick queued at).
+static PENDING_FLIPS: Mutex<VecDeque<([u8; 32], u64, u64)>> = Mutex::new(VecDeque::new());
+/// Ticks a fenced flip may wait for its fence before the tick delivers it
+/// anyway. Two ticks: one is the poller's own reap latency when no interrupt
+/// is armed, so one would make the fallback race the poller it backs up.
+const FLIP_FALLBACK_TICKS: u64 = 2;
 static READY_EVENTS:  Mutex<VecDeque<[u8; 32]>> = Mutex::new(VecDeque::new());
 static FLIP_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static LAST_FLIP_DELIVER_TICK: AtomicU64 = AtomicU64::new(0);
@@ -3098,9 +3115,12 @@ extern "C" {
     fn arch_monotonic_ns() -> u64;
 }
 
-/// Queue a FLIP_COMPLETE event for throttled delivery. Called from the PAGE_FLIP
-/// ioctl (syscall context — a normal lock is fine; `drm_tick` uses try_lock).
-fn queue_flip_event(crtc_id: u32, user_data: u64) {
+/// Queue a FLIP_COMPLETE event for delivery. Called from the PAGE_FLIP and
+/// ATOMIC ioctls (syscall context — a normal lock is fine; `drm_tick` uses
+/// try_lock). `fence` is the present's (`virtio_gpu::LAST_PRESENT_FENCE`,
+/// read by the caller right after the present it issued) or 0 for a commit
+/// that presented nothing, which the tick delivers.
+fn queue_flip_event(crtc_id: u32, user_data: u64, fence: u64) {
     let seq = FLIP_SEQUENCE.fetch_add(1, Ordering::SeqCst);
     // Sub-tick-resolution timestamp (interpolated inside the current 100 Hz
     // tick from the arch's free-running counter) rather than the raw tick
@@ -3119,8 +3139,37 @@ fn queue_flip_event(crtc_id: u32, user_data: u64) {
     };
     let mut blob = [0u8; 32];
     unsafe { ptr::copy_nonoverlapping(&ev as *const _ as *const u8, blob.as_mut_ptr(), 32); }
-    PENDING_FLIPS.lock().push_back(blob);
+    PENDING_FLIPS.lock().push_back((blob, fence, sched::ticks()));
 }
+
+/// Promote every pending flip, in order, whose present the host has retired.
+/// IRQ context (the completion interrupt or the tick): try_lock only; false
+/// when a lock was busy and the fence hook should be called again.
+fn flip_fence_service() -> bool {
+    let floor = crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire);
+    let mut pend = match PENDING_FLIPS.try_lock() { Some(g) => g, None => return false };
+    let due = pend.front().map(|&(_, f, _)| f != 0 && f <= floor).unwrap_or(false);
+    if !due { return true; }
+    let mut ready = match READY_EVENTS.try_lock() { Some(g) => g, None => return false };
+    let mut n = 0u64;
+    while let Some(&(_, f, _)) = pend.front() {
+        if f == 0 || f > floor { break; }
+        if let Some((blob, _, _)) = pend.pop_front() { ready.push_back(blob); n += 1; }
+    }
+    drop(ready);
+    drop(pend);
+    if n != 0 {
+        LAST_FLIP_DELIVER_TICK.store(sched::ticks(), Ordering::Relaxed);
+        FLIPS_IRQ_DELIVERED.fetch_add(n, Ordering::Relaxed);
+        DELIVERED_SEQ.fetch_add(n, Ordering::Relaxed);
+        sched::try_wake_poll();
+    }
+    true
+}
+
+/// Flip events delivered on their present's fence (the interrupt path), as
+/// against `DELIVERED_SEQ`, which counts both paths.
+static FLIPS_IRQ_DELIVERED: AtomicU64 = AtomicU64::new(0);
 
 /// Live-object census for the `[DRMSTAT]` line: `(dumb, dumb_retired, blob_objs,
 /// blob_handles)`.
@@ -3190,6 +3239,9 @@ pub fn drm_tick() {
         crate::virtio_gpu::set_fence_event_hook(gpu_fence_event);
     }
     crate::virtio_gpu::ctrlq_tick();
+    // A fence that retired while `gpu_fence_event` lost a try_lock, or that a
+    // task-context reap retired without raising the hook, is delivered here.
+    flip_fence_service();
     let now = sched::ticks();
     if DRM_STATS {
         let ls = LAST_STAT_TICK.load(Ordering::Relaxed);
@@ -3310,6 +3362,17 @@ pub fn drm_tick() {
             crate::pci::serial_debug(" ctrlq_irqs=");
             crate::pci::serial_debug_hex_64(
                 crate::virtio_gpu::CTRLQ_IRQS.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" flips_irq=");
+            crate::pci::serial_debug_hex_64(FLIPS_IRQ_DELIVERED.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" ctrlq_parked=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_PARKED.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" intx_spurious=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::INTX_SPURIOUS.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" park_kicks=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_PARK_KICKS.load(Ordering::Relaxed));
             crate::pci::serial_debug("\n");
         }
     }
@@ -3333,9 +3396,17 @@ pub fn drm_tick() {
     if now.wrapping_sub(last) < 1 { return; }
 
     let mut pend = match PENDING_FLIPS.try_lock() { Some(g) => g, None => return };
-    if pend.is_empty() { return; }
+    // The front entry is the tick's to deliver only when it is unfenced or its
+    // fence has gone unanswered for the fallback window; a fenced one inside
+    // the window belongs to `flip_fence_service`, which ran just above through
+    // `ctrlq_tick` if the fence retired.
+    let tick_due = match pend.front() {
+        Some(&(_, f, queued)) => f == 0 || now.wrapping_sub(queued) >= FLIP_FALLBACK_TICKS,
+        None => false,
+    };
+    if !tick_due { return; }
     let mut ready = match READY_EVENTS.try_lock() { Some(g) => g, None => return };
-    if let Some(blob) = pend.pop_front() {
+    if let Some((blob, _, _)) = pend.pop_front() {
         ready.push_back(blob);
         drop(ready);
         drop(pend);
@@ -3604,6 +3675,7 @@ impl DrmDeviceInterface {
             0x1004 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_flip_page(&mut g, arg) },
             0x1005 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_set_plane(&mut g, arg) },
             0x1006 => self.handle_get_capabilities(arg),
+            0x1008 => Self::handle_gpu_irq_stats(arg),
             0x1007 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_ioctl_mmap(&mut g, arg) },
 
             // ── Standard Linux DRM IOCTLs (already wired) ──
@@ -4045,6 +4117,26 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
+    /// LeandrOS 0x1008: the virtio-gpu completion-interrupt census, for
+    /// drmsmoke's regression test of the interrupt path. Read-only, no device
+    /// lock. `arg` points to eight u64s:
+    ///   [0] irq_armed (0/1)   [1] ctrlq_irqs      [2] flips_irq (fence path)
+    ///   [3] ctrlq_parked      [4] intx_spurious   [5] flips delivered (both)
+    ///   [6] ctrlq_sync        [7] ctrlq_timeouts
+    fn handle_gpu_irq_stats(arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let out = unsafe { slice::from_raw_parts_mut(arg as *mut u64, 8) };
+        out[0] = crate::virtio_gpu::irq_armed() as u64;
+        out[1] = crate::virtio_gpu::CTRLQ_IRQS.load(Ordering::Relaxed);
+        out[2] = FLIPS_IRQ_DELIVERED.load(Ordering::Relaxed);
+        out[3] = crate::virtio_gpu::CTRLQ_PARKED.load(Ordering::Relaxed);
+        out[4] = crate::virtio_gpu::INTX_SPURIOUS.load(Ordering::Relaxed);
+        out[5] = DELIVERED_SEQ.load(Ordering::Relaxed);
+        out[6] = crate::virtio_gpu::CTRLQ_SYNC.load(Ordering::Relaxed);
+        out[7] = crate::virtio_gpu::CTRLQ_TIMEOUTS.load(Ordering::Relaxed);
+        Ok(0)
+    }
+
     // ── Standard Linux DRM IOCTL Handlers ─────────────────────────────────────
 
     fn std_handle_version(&mut self, arg: usize) -> Result<usize, DriverError> {
@@ -4424,7 +4516,8 @@ impl DrmDeviceInterface {
         // the next frame.
         if r.is_ok() { FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed); }
         if r.is_ok() && (flags & DRM_MODE_PAGE_FLIP_EVENT != 0) {
-            queue_flip_event(crtc_id, user_data);
+            queue_flip_event(crtc_id, user_data,
+                crate::virtio_gpu::LAST_PRESENT_FENCE.load(Ordering::Acquire));
         }
         r
     }
@@ -4980,9 +5073,13 @@ impl DrmDeviceInterface {
 
         // A commit that only reconfigured the cursor plane still owes the
         // client its completion event, otherwise smithay's frame loop stalls.
-        let _ = presented;
         if flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-            queue_flip_event(DRM_CRTC_ID, user_data);
+            let fence = if presented {
+                crate::virtio_gpu::LAST_PRESENT_FENCE.load(Ordering::Acquire)
+            } else {
+                0
+            };
+            queue_flip_event(DRM_CRTC_ID, user_data, fence);
         }
         Ok(0)
     }
