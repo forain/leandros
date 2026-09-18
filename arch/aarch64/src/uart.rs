@@ -214,6 +214,24 @@ pub unsafe fn putc(c: u8) {
     wr(DR, c as u32);
 }
 
+/// Blocking putc for the explicit, human-triggered Ctrl-T task dump — see
+/// `arch_x86_64::putc_dump` for why this exists as a separate path from the
+/// sticky-`TX_WEDGED` `putc` above (shared reasoning, PL011 FR_TXFF in place
+/// of 16550 LSR.THRE).
+pub unsafe fn putc_dump(c: u8) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if UART_BASE_ADDR == 0 { return; }
+    let deadline = cntvct_raw().wrapping_add(tx_wait_ticks());
+    while rd(FR) & FR_TXFF != 0 {
+        if cntvct_raw().wrapping_sub(deadline) < (1u64 << 63) {
+            UART_TX_DROPPED.fetch_add(1, Relaxed);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    wr(DR, c as u32);
+}
+
 pub unsafe fn getc() -> Option<u8> {
     if UART_BASE_ADDR == 0 { return None; }
     if rd(FR) & FR_RXFE != 0 {

@@ -2604,16 +2604,16 @@ pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
 /// a CPU holding the VT lock while waiting on either deadlocks with the dump
 /// (observed: the census wedged all four CPUs at its first digit).
 mod dump_raw {
-    extern "C" { fn arch_serial_putc(c: u8); }
+    extern "C" { fn arch_serial_putc_dump(c: u8); }
     pub fn ph(n: usize) {
         let d = b"0123456789ABCDEF";
-        for i in (0..16).rev() { unsafe { arch_serial_putc(d[(n >> (i * 4)) & 0xF]); } }
+        for i in (0..16).rev() { unsafe { arch_serial_putc_dump(d[(n >> (i * 4)) & 0xF]); } }
     }
     pub fn pn(n: u32) {
-        if n == 0 { unsafe { arch_serial_putc(b'0'); } return; }
+        if n == 0 { unsafe { arch_serial_putc_dump(b'0'); } return; }
         let mut buf = [0u8; 10]; let mut i = 0; let mut v = n;
         while v > 0 { buf[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
-        for j in (0..i).rev() { unsafe { arch_serial_putc(buf[j]); } }
+        for j in (0..i).rev() { unsafe { arch_serial_putc_dump(buf[j]); } }
     }
 }
 
@@ -2628,8 +2628,8 @@ mod dump_raw {
 /// deadlock the dump exists to diagnose.
 pub fn dump_tasks() {
     fn print_str(s: &str) {
-        extern "C" { fn arch_serial_putc(c: u8); }
-        for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } }
+        extern "C" { fn arch_serial_putc_dump(c: u8); }
+        for &b in s.as_bytes() { unsafe { arch_serial_putc_dump(b); } }
     }
     use dump_raw::{ph, pn};
     lockwatch::dump_profile();

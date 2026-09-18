@@ -185,6 +185,17 @@ pub unsafe extern "C" fn arch_serial_putc(c: u8) {
     serial_write_byte_direct(c); 
 }
 
+/// Serial write for the Ctrl-T task dump only (`sched::dump_tasks`) — see
+/// `arch_x86_64::putc_dump` / `arch_aarch64::uart::putc_dump` for why this
+/// bypasses the sticky TX_WEDGED drop latch that `arch_serial_putc` uses.
+#[no_mangle]
+pub unsafe extern "C" fn arch_serial_putc_dump(c: u8) {
+    #[cfg(target_arch = "x86_64")]
+    arch_x86_64::putc_dump(c);
+    #[cfg(target_arch = "aarch64")]
+    arch_aarch64::uart::putc_dump(c);
+}
+
 #[no_mangle]
 pub extern "C" fn print_number(n: u32) {
     if n == 0 { serial_write_byte(b'0'); return; }
