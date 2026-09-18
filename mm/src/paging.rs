@@ -47,6 +47,10 @@ extern "C" {
     /// Arch-provided: broadcast TLB invalidation for all user-space entries to
     /// all CPUs (inner-shareable TLBI on AArch64; CR3 reload on x86-64).
     fn arch_tlb_shootdown_all();
+    /// Arch-provided: free every intermediate page-table page reachable from
+    /// the user half of `page_table_root` (not the root itself, not the leaf
+    /// frames — those belong to the VMAs). See [`free_user_page_tables`].
+    fn arch_free_user_page_tables(page_table_root: usize);
 }
 
 /// Map a single virtual page to a physical frame in the given address space.
@@ -65,6 +69,24 @@ pub unsafe fn unmap_page(page_table_root: usize, virt: usize) {
 }
 
 /// Invalidate all user-space TLB entries across all CPUs.
+/// Release the intermediate page-table pages of a dying address space.
+///
+/// `AddressSpace::drop` frees the VMA backing frames and the root page, but
+/// the PDPT/PD/PT (L1/L2/L3) pages `ensure_table` allocated on the way to
+/// every mapping were never released: ~17 pages for a small static binary,
+/// hundreds for a compositor, per process death, for as long as the kernel
+/// has existed — the buddy free-list census showed the order-5 blocks being
+/// split into 4 KiB tables and never coalescing back. Only *table* entries
+/// are followed; huge/block entries and leaf descriptors are left alone.
+///
+/// # Safety
+/// `page_table_root` must be a root no CPU is running on any more — this is
+/// called from the last `Arc<AddressSpace>` drop, after every thread of the
+/// process has been reaped and its CPU has reloaded the kernel tables.
+pub unsafe fn free_user_page_tables(page_table_root: usize) {
+    arch_free_user_page_tables(page_table_root);
+}
+
 pub fn tlb_shootdown_all() {
     unsafe { arch_tlb_shootdown_all(); }
 }

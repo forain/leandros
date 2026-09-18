@@ -319,7 +319,10 @@ static CURRENT_PID: [AtomicU32; MAX_CPUS] =
 ///
 /// Safe to cache because a `Task`'s `tgid` is assigned once at creation and
 /// never reassigned; only the pid→tgid lookup for *another* task still needs
-/// the scan.
+/// the scan. The one exception — a non-leader `execve` whose leader is
+/// already gone, promoted in `take_over_leader` — re-publishes both this
+/// slot and the side table in the same `RUN_QUEUE` hold. (The ordinary
+/// non-leader `execve` changes the thread's *pid*, never its tgid.)
 static CURRENT_TGID: [AtomicU32; MAX_CPUS] =
     [const { AtomicU32::new(0) }; MAX_CPUS];
 
@@ -2870,13 +2873,14 @@ fn scheduler_run_loop() -> ! {
             }
         };
 
-        if let Some((idx, ctx_ptr, pid, kernel_stack_top_virt, page_table, tgid)) = picked {
+        if let Some((idx, ctx_ptr, dispatched_pid, kernel_stack_top_virt, page_table, tgid)) = picked {
             let dispatched_at = ticks();
             let dispatched_ns = unsafe { arch_monotonic_ns() };
+            let pid;
 
             unsafe {
                 CURRENT_CTX[id] = ctx_ptr as *mut CpuContext;
-                CURRENT_PID[id].store(pid, Ordering::Relaxed);
+                CURRENT_PID[id].store(dispatched_pid, Ordering::Relaxed);
                 CURRENT_TGID[id].store(tgid, Ordering::Relaxed);
 
                 arch_set_kernel_stack(kernel_stack_top_virt as u64);
@@ -2890,6 +2894,13 @@ fn scheduler_run_loop() -> ! {
                 );
 
                 // When we return here, we are in the scheduler context.
+                // The task's pid is re-read from the per-CPU slot rather
+                // than the copy taken at dispatch: a non-leader execve
+                // exchanges the running thread's pid for the leader's
+                // (`take_over_leader`) and publishes the new one there, and
+                // the identity check below must follow it or the task would
+                // never have its on_cpu claim released.
+                pid = CURRENT_PID[id].load(Ordering::Relaxed);
                 CURRENT_CTX[id] = core::ptr::null_mut();
                 CURRENT_PID[id].store(0, Ordering::Relaxed);
                 CURRENT_TGID[id].store(0, Ordering::Relaxed);
@@ -3153,26 +3164,207 @@ pub fn exit_group_signal(signo: u32) -> ! {
 ///
 /// Reuses [`kill_next_group_member`]'s loop, so the same "every sibling has
 /// actually *stopped* before its address space may change" ordering guarantee
-/// applies. The caller keeps its own kernel stack and identity and continues
-/// into `replace_address_space`; the promotion (`tgid = pid`) only matters for
-/// the non-leader-thread `execve` case (Linux would have the caller take over
-/// the leader's pid — here it simply becomes its own single-thread group, which
-/// is sufficient because the old leader has just been reaped above).
+/// applies. The caller keeps its own kernel stack and continues into
+/// `replace_address_space`.
+///
+/// **A non-leader caller takes over the leader's pid** (Linux `de_thread`:
+/// the exec'ing thread becomes the group leader and inherits its tid, so the
+/// process keeps its pid across the exec). This is what keeps every
+/// per-process table valid: fd tables, sockets, epoll instances, the exe
+/// path, POSIX timers, the tty/VT tables, signal dispositions and the
+/// `pid → tgid` side table are all keyed by the tgid, and the tgid never
+/// changes. The alternative — promoting the caller to a *new* single-thread
+/// group under its own pid — is what this used to do, and it went wrong in
+/// three ways at once: the kill loop reaped the old leader as a *process*
+/// (its whole fd table torn down, the parent handed a spurious exit), the
+/// side table and this CPU's cached tgid still said "old leader" until the
+/// next dispatch, and once they caught up the new image found an empty fd
+/// table under its new key. See [`take_over_leader`] for the exchange.
 pub fn dethread_current_group() {
     let pid = current_pid();
     // An execve racing a fatal signal on a sibling: the process is dying,
     // so the exec never happens — this thread dies with the rest.
-    if let GroupExitClaim::AlreadyDying = claim_group_exit(pid) {
-        exit_dying_thread(0);
+    let tgid = match claim_group_exit(pid) {
+        GroupExitClaim::Owner { tgid, .. } => tgid,
+        GroupExitClaim::AlreadyDying => exit_dying_thread(0),
+    };
+    if pid == tgid {
+        run_group_kill(0);
+        let mut rq = RUN_QUEUE.lock();
+        if let Some(t) = rq.find_pid_mut(pid) {
+            // The caller lives on as a single-thread group and is not exiting.
+            t.group_exit_owner = 0;
+        }
+        return;
     }
-    run_group_kill(0);
+    // Non-leader: every *other* sibling first, the leader last — its Task
+    // carries the process-level state the caller inherits in the exchange,
+    // and it must still be there when that happens.
+    loop {
+        match kill_next_group_member_except(0, tgid) {
+            GroupKillStep::Done        => break,
+            GroupKillStep::Reaped(p)   => run_exit_teardown(p),
+            GroupKillStep::Kicking     => { irq_window(); core::hint::spin_loop(); }
+        }
+    }
+    loop {
+        match take_over_leader(pid, tgid) {
+            GroupKillStep::Done        => break,
+            GroupKillStep::Reaped(old) => { run_exit_teardown(old); break; }
+            GroupKillStep::Kicking     => { irq_window(); core::hint::spin_loop(); }
+        }
+    }
+}
+
+/// The pid exchange behind a non-leader `execve` (see
+/// [`dethread_current_group`]): the calling thread `pid` becomes the thread
+/// whose pid is `tgid`, and the old leader's `Task` — already off every CPU —
+/// retires under the caller's old pid, exactly as a plain thread exit would.
+///
+/// Returns `Kicking` while the leader is still on another CPU (its registers
+/// are live there; the caller spins as for any other sibling), `Reaped(old)`
+/// once the exchange is done and the old leader's Task has been reaped under
+/// the caller's old pid `old`, or `Done` if the leader was already gone (a
+/// `pthread_exit` from `main` racing the exec) — then the caller simply
+/// becomes a fresh single-thread group under its own pid, and the cached
+/// tgid and the side table are re-keyed with it.
+///
+/// What the caller inherits from the leader's slot is exactly the state this
+/// kernel keeps *leader-only*: `ppid`/`pgid`/`sid` (`setpgid` writes the
+/// leader), the credentials, the signal disposition table (`sigaction` and
+/// `reset_handlers_on_exec` write the leader), the process-level pending set
+/// with its payloads, the job-control stop/continue bookkeeping, and the
+/// leader's reply port (its owner in the port table is `tgid`, which is now
+/// the caller). The leader's own thread-pending signals are merged in too:
+/// after the exchange the caller *is* that tid, and a SIGKILL that was on
+/// its way to the leader must still end the process. Per-thread state — the
+/// signal mask, cwd, umask, altstack, TLS, the kernel stack — stays the
+/// caller's own. Children the caller forked carry its *thread* pid as
+/// `ppid` (`fork_current` records the forking thread), so they are
+/// re-parented to `tgid` or `wait4` would never find them again.
+///
+/// The exchange happens under one `RUN_QUEUE` hold together with the
+/// leader's removal, so no lookup can observe two tasks with the same pid.
+/// `CURRENT_PID` for this CPU is updated in the same hold — the dispatch
+/// loop's switch-back identity check reads it (not a copy taken at
+/// dispatch) for exactly this reason.
+fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
+    let cpu = unsafe { cpu_id() };
     let mut rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        t.tgid = pid;
-        // The caller lives on as a single-thread group: its own slot is the
-        // leader's now, and it is not exiting.
-        t.group_exit_owner = 0;
+    let me_idx = match rq.find_pid_idx(pid) { Some(i) => i, None => return GroupKillStep::Done };
+    let lidx = match rq.find_pid_idx(tgid) {
+        Some(i) => i,
+        None => {
+            // Leader already reaped: promote in place. The tgid changes, so
+            // the two caches that mirror it must follow (this is the "never
+            // reassigned" assumption `CURRENT_TGID` documents — this is the
+            // one exception, and it is re-published here).
+            if let Some(me) = rq.get_mut(me_idx) {
+                me.tgid = pid;
+                me.group_exit_owner = 0;
+            }
+            pid_tgid_insert(pid, pid);
+            CURRENT_TGID[cpu].store(pid, Ordering::Relaxed);
+            return GroupKillStep::Done;
+        }
+    };
+
+    let had_vfork = {
+        let leader = rq.get_mut(lidx).unwrap();
+        if let Some(lcpu) = leader.on_cpu {
+            // Its registers are live on another CPU. It is NOT marked Zombie
+            // the way `kill_next_group_member` does: that CPU's switch-back
+            // reaps a Zombie on the spot, and with `pid == tgid` it would log
+            // a *process* exit (the parent's wait4 would see the process die
+            // while it is in fact exec'ing) and free the very slot this
+            // exchange needs. Ask it to park instead — `stop_pending` is the
+            // one flag the switch-back honours from another CPU — and come
+            // back once it is off the CPU.
+            leader.stop_pending = true;
+            drop(rq);
+            trigger_preempt(lcpu);
+            return GroupKillStep::Kicking;
+        }
+        // Off-CPU (Ready, Blocked or parked Stopped): nothing executes on
+        // its stack. Zombie from here on, in the same hold that removes it.
+        leader.state = TaskState::Zombie;
+        leader.exit_code = 0;
+        core::mem::replace(&mut leader.vfork_pending, false)
+    };
+    if had_vfork { rq.unblock_port(VFORK_WAIT_CHANNEL); }
+
+    // Copy out what the caller inherits, then exchange the pids.
+    let (ppid, pgid, sid, creds, actions, shared_pending, pending, info, stop, reply_port, wait_reported) = {
+        let l = rq.get(lidx).unwrap();
+        (l.ppid, l.pgid, l.sid,
+         (l.uid, l.gid, l.euid, l.egid, l.suid, l.sgid),
+         l.signal_actions, l.shared_signal_pending, l.signal_pending, l.signal_info,
+         (l.stop_signal, l.stop_reported, l.cont_pending),
+         l.reply_port, l.wait_reported)
+    };
+    let old_pid = pid;
+    {
+        let me = rq.get_mut(me_idx).unwrap();
+        me.pid  = tgid;
+        me.ppid = ppid; me.pgid = pgid; me.sid = sid;
+        (me.uid, me.gid, me.euid, me.egid, me.suid, me.sgid) = creds;
+        me.signal_actions = actions;
+        // Only the payload slots whose bits are actually taken over move,
+        // never the whole array (see `Task::signal_info`).
+        me.shared_signal_pending |= shared_pending;
+        let new_bits = pending & !me.signal_pending;
+        me.signal_pending |= pending;
+        for bit in 0..64 {
+            if (shared_pending | new_bits) & (1u64 << bit) != 0 {
+                me.signal_info[bit] = info[bit];
+            }
+        }
+        (me.stop_signal, me.stop_reported, me.cont_pending) = stop;
+        me.stop_pending = false;
+        me.wait_reported = wait_reported;
+        me.group_exit_owner = 0;
+        // The caller's own reply port is owned by `old_pid` in the port
+        // table and is released with it below; the leader's is owned by
+        // `tgid` — the caller's pid from here on.
+        me.reply_port = reply_port;
     }
+    {
+        let leader = rq.get_mut(lidx).unwrap();
+        leader.pid = old_pid;
+    }
+    // Children forked by this thread name its old tid as parent.
+    for i in 0..runqueue::MAX_TASKS {
+        if let Some(t) = rq.get_mut(i) {
+            if t.ppid == old_pid && t.pid != old_pid { t.ppid = tgid; }
+        }
+    }
+    CURRENT_PID[cpu].store(tgid, Ordering::Relaxed);
+
+    // Reap the old leader's Task under the caller's old pid: a *thread*
+    // exit — no process exit record, no fd teardown for `tgid`, no SIGCHLD.
+    // `remove` retires `old_pid` from the pid→tgid side table; the
+    // `tgid → tgid` entry the leader registered at creation is the caller's
+    // now and stays.
+    let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
+    log_exit(old_pid, ExitStatus { code: 0, term_signal: 0 }, parent_tgid, pgid, false, false);
+    release_quiesce_if_owner(tgid, tgid);
+    let reaped = rq.remove(lidx);
+    drop(rq);
+
+    // The leader may have been parked in futex_wait: that registration is
+    // keyed by `tgid`, which now names the (running) caller, and a stale
+    // slot would swallow a future wake for the new image.
+    futex::remove_waiter(tgid);
+
+    if let Some(t) = reaped {
+        let hook_ptr = TASK_EXIT_HOOK.load(Ordering::Acquire);
+        if !hook_ptr.is_null() {
+            let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
+            hook(t.pid);   // == old_pid: releases the caller's old reply port
+        }
+        mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
+    }
+    GroupKillStep::Reaped(old_pid)
 }
 
 pub fn exit(code: i32) -> ! {
@@ -3301,6 +3493,13 @@ pub enum GroupKillStep {
 /// the caller — that ordering guarantees every sibling has actually stopped
 /// running (not merely been asked to) before the last reference drops.
 pub fn kill_next_group_member(exit_code: i32) -> GroupKillStep {
+    kill_next_group_member_except(exit_code, 0)
+}
+
+/// [`kill_next_group_member`] that leaves the member `skip` alone (0 = none).
+/// A non-leader `execve` uses it to reap every sibling *except* the leader,
+/// whose slot it takes over afterwards (see [`take_over_leader`]).
+fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
     let tgid = match rq.find_pid(pid) {
@@ -3311,7 +3510,7 @@ pub fn kill_next_group_member(exit_code: i32) -> GroupKillStep {
     let mut target: Option<usize> = None;
     for i in 0..runqueue::MAX_TASKS {
         if let Some(t) = rq.get(i) {
-            if t.tgid == tgid && t.pid != pid {
+            if t.tgid == tgid && t.pid != pid && t.pid != skip {
                 target = Some(i);
                 break;
             }
@@ -3416,6 +3615,11 @@ pub fn replace_address_space(
             { t.ctx.tpidr_el0 = 0; }
             #[cfg(target_arch = "x86_64")]
             { t.ctx.fs_base = 0; }
+            // The TID-clear address belongs to the old image (Linux drops it
+            // in `mm_release` on exec). Left in place, `exit` would write a
+            // zero into whatever the new image put at that address; the new
+            // image's libc registers its own with set_tid_address.
+            t.clear_child_tid = 0;
             displaced
         } else {
             None
