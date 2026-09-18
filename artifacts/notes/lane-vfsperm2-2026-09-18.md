@@ -70,8 +70,26 @@ disagree. Sites: tmpfs open(O_CREAT)/mkdir/mknod/symlink, f2fs open(O_CREAT)/mkd
 - `vfstest`: `timestamps_tmpfs` / `timestamps_f2fs` (create ≈ CLOCK_REALTIME, write
   advances mtime, utimensat exact).
 
-## Evidence
-(filled in below per arch)
+## Evidence (fresh images from `build-all.sh`, root login over serial)
+
+| | aarch64 / HVF (Mac) | x86_64 / TCG (Mac) |
+|---|---|---|
+| `permtest` | 43/43 PASS, 0 failures (f2fs matrix incl. `exec_xbit_*`, tmpfs matrix incl. sockets) | 43/43 PASS, 0 failures |
+| `vfstest` (first run on the image) | 41/41 PASS incl. `timestamps_tmpfs`/`timestamps_f2fs` | 41/41 PASS incl. both timestamp cases |
+| `exectest` | — | 10/10 PASS (the `#!` gate, ENOEXEC, ELOOP paths unchanged) |
+| `login leandro` → `id` | `uid=1000(leandro) gid=1000(leandro) groups=1000(leandro),44(video),104(input)` | same |
+| coreutils `touch`/`stat` | `stat` shows real times; `touch -d @5000` → `%Y` = 5000 (legacy `utimes` on x86-64) | same |
+| Greeter login → desktop | boot-time greeter, typed `leandro`+Enter via HMP sendkey: uid-1000 session, cosmic-panel + dock painted at ~4 min 52 s guest time; `/var/log/greetd.log` has **zero** `Permission denied`/EACCES | not run (x86_64/TCG desktop is a ~10 min affair and the code paths are arch-independent) |
+| `chmod 644` a copied ELF, run it from brush | `Permission denied (os error 13)`, rc 126 | — |
+
+vfstest's `chroot_confines_symlink_resolution` and `xattr_list_*` FAIL on a **re-run** in the
+same image (the known `/tmp/jail` / `xa_list` residue, sibling lane `misc`) — the numbers
+above are first runs.
+
+Two findings during the run, both in the new test, not the kernel: `wait4` now returns the
+Linux-encoded status (exit code in bits 8..16 — permtest's header comment said raw, and
+`exectest` already decodes `>> 8`), and the kernel read the clock once per timestamp so a
+`NULL` utimensat gave atime != mtime by a few µs; it now reads once for both.
 
 ## Left open
 - `access(2)` still evaluates with the effective ids (Linux uses the real ids unless
