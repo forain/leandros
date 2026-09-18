@@ -49,10 +49,14 @@ Reconciled against `main` at `60f49bd` following the 2026-09-15/16 bug sweep
   long holder is not yet found.
 - `utimensat` is a kernel no-op; exec x-bit unchecked; no supplementary groups; default-ACL
   inheritance missing.
-- brush wedges the login shell if a pipeline wait errors before it restores the foreground
-  pgrp (bash restores it regardless; brush doesn't).
-- brush `fg` of a stopped PIPELINE re-reports Stopped (`kill` vs `killpg` — `../brush`).
-- `cmd &` shows `<pid unknown>`.
+- ~~brush wedges the login shell if a pipeline wait errors / `fg` of a stopped pipeline
+  re-reports Stopped / `cmd &` shows `<pid unknown>`~~ — **FIXED 2026-09-18 (lane/brush)**, all
+  three were brush bugs (`../brush` `3423c0e`, pinned in `ports/brush/`): `fg`/`bg`/`kill %n`
+  signalled one pid instead of the job's pgrp (the real wedge: `cat` stayed stopped, `fg`
+  waited for ever), the terminal was not restored on pipeline error paths, and the `&`
+  announcement was formatted before the task had spawned. No pipeline wait actually errors on
+  LeandrOS. Regression: `scripts/shjobs.py` 36/36 both arches + brush's own pty tests. See
+  `artifacts/notes/lane-brush-2026-09-18.md`.
 - Super+T did not fire in a serial-started session.
 - x86_64 serial Ctrl-T dump loses a ~1.5 KB chunk.
 - `[WDOG] cosmic-comp mmap ~2 s` now seen on aarch64/TCG too (previously x86_64-only).

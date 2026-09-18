@@ -1,0 +1,237 @@
+From 39d00b365d2ce340dd8f0492141d387e8ce7732b Mon Sep 17 00:00:00 2001
+From: Leandro Forain <leandro.forain@instructure.com>
+Date: Fri, 18 Sep 2026 00:55:50 -0300
+Subject: [PATCH 1/3] LeandrOS integration: crossterm fork, kill builtin,
+ background job pids
+
+- Cargo.toml: [patch.crates-io] crossterm = ../crossterm, the 0.29.0 fork
+  that fixes the unix cursor-position-report request/response desync.
+- kill: default signal is SIGTERM (POSIX/bash), numeric signal specs are
+  accepted, and `kill -0` probes with signal 0 instead of failing.
+- jobs: a background job run as an internal task publishes the pid of the
+  first external process it spawns, so $!, jobs and kill %n have a pid.
+---
+ Cargo.lock                        |  2 --
+ Cargo.toml                        | 11 +++++++++++
+ brush-builtins/src/kill.rs        | 10 ++++++----
+ brush-core/src/interp.rs          | 28 +++++++++++++++++++++++++--
+ brush-core/src/jobs.rs            | 32 +++++++++++++++++++++++++++++++
+ brush-core/src/sys/unix/signal.rs | 14 ++++++++------
+ 6 files changed, 83 insertions(+), 14 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 53a37f8..1947c3d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1209,8 +1209,6 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+ [[package]]
+ name = "crossterm"
+ version = "0.29.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
+ dependencies = [
+  "bitflags 2.13.0",
+  "crossterm_winapi",
+diff --git a/Cargo.toml b/Cargo.toml
+index b759572..7cb6a8c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -117,3 +117,14 @@ panic = "abort"
+ [profile.bench]
+ inherits = "release"
+ strip = "debuginfo"
++
++# LeandrOS: local fork of crossterm 0.29.0 fixing the unix CPR
++# (cursor-position-report) request/response desync in
++# src/cursor/sys/unix.rs::read_position_raw — a stale/orphaned ESC[6n reply
++# (from a timeout or a signal-interrupted poll) used to get handed to the
++# NEXT caller of cursor::position(), which is what made reedline paint
++# command output over itself on aarch64 (TODO item 17). See
++# /Users/forain/code/crossterm's git history for the patch. Covers reedline's
++# transitive crossterm dependency too, since this is a workspace-wide patch.
++[patch.crates-io]
++crossterm = { path = "../crossterm" }
+diff --git a/brush-builtins/src/kill.rs b/brush-builtins/src/kill.rs
+index f69b9fa..1ccf73c 100644
+--- a/brush-builtins/src/kill.rs
++++ b/brush-builtins/src/kill.rs
+@@ -33,12 +33,14 @@ impl builtins::Command for KillCommand {
+         &self,
+         context: brush_core::ExecutionContext<'_, SE>,
+     ) -> Result<brush_core::ExecutionResult, Self::Error> {
+-        // Default signal is SIGKILL.
+-        let mut trap_signal = TrapSignal::Signal(nix::sys::signal::Signal::SIGKILL);
++        // Default signal is SIGTERM, matching POSIX/bash behavior.
++        let mut trap_signal = TrapSignal::Signal(nix::sys::signal::Signal::SIGTERM);
+ 
+-        // Try parsing the signal name (if specified).
++        // Try parsing the signal name (if specified). We parse via `FromStr` (rather than the
++        // `&str` conversion) so that numeric specs like `-s 0` or `-s 9` are also accepted, as
++        // bash does.
+         if let Some(signal_name) = &self.signal_name {
+-            if let Ok(parsed_trap_signal) = TrapSignal::try_from(signal_name.as_str()) {
++            if let Ok(parsed_trap_signal) = signal_name.parse::<TrapSignal>() {
+                 trap_signal = parsed_trap_signal;
+             } else {
+                 writeln!(
+diff --git a/brush-core/src/interp.rs b/brush-core/src/interp.rs
+index ddf637f..134fc95 100644
+--- a/brush-core/src/interp.rs
++++ b/brush-core/src/interp.rs
+@@ -38,6 +38,10 @@ pub struct ExecutionParameters {
+     /// Whether `errexit` (exit on error) behavior should be
+     /// suppressed in this execution context. Defaults to `false`.
+     pub suppress_errexit: bool,
++    /// If set, a shared slot into which the PID of the first external process spawned in this
++    /// execution context should be published. Used so that a background job (which executes in a
++    /// separate task) can report a representative PID for `$!`, `jobs`, and `kill %n`.
++    pub(crate) async_pid_slot: Option<jobs::AsyncPidSlot>,
+ }
+ 
+ impl ExecutionParameters {
+@@ -291,17 +295,26 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
+         cloned_params.set_fd(openfiles::OpenFiles::STDIN_FD, null);
+     }
+ 
++    // Set up a shared slot so the background task can publish the PID of the first external
++    // process it spawns. This lets the job report a representative PID (for `$!`, `jobs`, and
++    // `kill %n`) even though its only task is an internal Tokio task.
++    let pid_slot: jobs::AsyncPidSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
++    cloned_params.async_pid_slot = Some(pid_slot.clone());
++
+     let join_handle = tokio::spawn(async move {
+         cloned_ao_list
+             .execute(&mut cloned_shell, &cloned_params)
+             .await
+     });
+ 
+-    shell.jobs_mut().add_as_current(jobs::Job::new(
++    let mut job = jobs::Job::new(
+         [jobs::JobTask::Internal(join_handle)],
+         ao_list.to_string(),
+         jobs::JobState::Running,
+-    ))
++    );
++    job.set_pid_slot(pid_slot);
++
++    shell.jobs_mut().add_as_current(job)
+ }
+ 
+ #[async_trait::async_trait]
+@@ -524,6 +537,17 @@ async fn spawn_pipeline_processes(
+             if process_group_id.is_none() {
+                 process_group_id = child.pgid();
+             }
++
++            // If this execution is a background job awaiting a representative PID, publish the
++            // first spawned process's PID into the shared slot.
++            if let Some(slot) = &params.async_pid_slot {
++                if let Some(pid) = child.pid() {
++                    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
++                    if guard.is_none() {
++                        *guard = Some(pid);
++                    }
++                }
++            }
+         }
+ 
+         spawn_results.push_back(spawn_result);
+diff --git a/brush-core/src/jobs.rs b/brush-core/src/jobs.rs
+index a549c92..ebd6ee2 100644
+--- a/brush-core/src/jobs.rs
++++ b/brush-core/src/jobs.rs
+@@ -3,6 +3,7 @@
+ use std::borrow::Cow;
+ use std::collections::VecDeque;
+ use std::fmt::Display;
++use std::sync::{Arc, Mutex};
+ 
+ use futures::FutureExt;
+ 
+@@ -16,6 +17,13 @@ use crate::traps;
+ pub(crate) type JobJoinHandle = tokio::task::JoinHandle<Result<ExecutionResult, error::Error>>;
+ pub(crate) type JobResult = (Job, Result<ExecutionResult, error::Error>);
+ 
++/// A shared slot used to publish the PID of the first external process spawned by an
++/// asynchronously-executing (background) job. Background jobs are run inside a Tokio task
++/// (`JobTask::Internal`), so the child process's PID is not known at the time the job is
++/// registered; the task fills this slot in once the process is spawned, allowing the job to
++/// report a representative PID for `$!`, `jobs`, and `kill %n`.
++pub(crate) type AsyncPidSlot = Arc<Mutex<Option<sys::process::ProcessId>>>;
++
+ /// Manages the jobs that are currently managed by the shell.
+ #[derive(Default)]
+ pub struct JobManager {
+@@ -272,6 +280,11 @@ pub struct Job {
+ 
+     /// The current operational state of the job.
+     pub state: JobState,
++
++    /// If available, a shared slot carrying the PID of the first external process spawned by
++    /// this job when it runs asynchronously (i.e., as a background task). Used as a fallback
++    /// source for the job's representative PID.
++    pid_slot: Option<AsyncPidSlot>,
+ }
+ 
+ impl Display for Job {
+@@ -303,9 +316,21 @@ impl Job {
+             annotation: JobAnnotation::None,
+             command_line,
+             state,
++            pid_slot: None,
+         }
+     }
+ 
++    /// Attaches a shared PID slot to the job. The slot is expected to be filled in
++    /// asynchronously by the background task executing the job, once it has spawned its first
++    /// external process.
++    ///
++    /// # Arguments
++    ///
++    /// * `slot` - The shared PID slot to attach.
++    pub(crate) fn set_pid_slot(&mut self, slot: AsyncPidSlot) {
++        self.pid_slot = Some(slot);
++    }
++
+     /// Returns a pid-style string for the job.
+     pub fn to_pid_style_string(&self) -> String {
+         let display_pid = self
+@@ -447,6 +472,13 @@ impl Job {
+                 JobTask::Internal(_) => (),
+             }
+         }
++        // Fall back to a PID published asynchronously by the background task executing this job
++        // (e.g., a job started via `cmd &`, whose tasks are all `Internal`).
++        if let Some(slot) = &self.pid_slot {
++            if let Some(pid) = slot.lock().ok().and_then(|guard| *guard) {
++                return Some(pid);
++            }
++        }
+         None
+     }
+ 
+diff --git a/brush-core/src/sys/unix/signal.rs b/brush-core/src/sys/unix/signal.rs
+index 36830d6..1e9cb2b 100644
+--- a/brush-core/src/sys/unix/signal.rs
++++ b/brush-core/src/sys/unix/signal.rs
+@@ -19,12 +19,14 @@ pub fn kill_process(
+     pid: sys::process::ProcessId,
+     signal: traps::TrapSignal,
+ ) -> Result<(), error::Error> {
+-    let translated_signal = match signal {
+-        traps::TrapSignal::Signal(signal) => signal,
+-        traps::TrapSignal::Debug
+-        | traps::TrapSignal::Err
+-        | traps::TrapSignal::Exit
+-        | traps::TrapSignal::Return => {
++    // A `TrapSignal::Exit` here stands in for POSIX signal 0. Sending signal 0 does not deliver
++    // a signal but still performs the usual error checking, so it can be used to probe whether a
++    // process exists (and whether we have permission to signal it). This is what `kill -0` relies
++    // on. Passing `None` to `nix::sys::signal::kill` sends signal 0.
++    let translated_signal: Option<Signal> = match signal {
++        traps::TrapSignal::Signal(signal) => Some(signal),
++        traps::TrapSignal::Exit => None,
++        traps::TrapSignal::Debug | traps::TrapSignal::Err | traps::TrapSignal::Return => {
+             return Err(error::ErrorKind::InvalidSignal(signal.to_string()).into());
+         }
+     };
