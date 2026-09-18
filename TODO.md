@@ -35,8 +35,6 @@ Reconciled against `main` at `60f49bd` following the 2026-09-15/16 bug sweep
   `kill_next_group_member` frees an off-CPU Blocked sibling's kernel stack in place.
 - aarch64 virtio-gpu completion is poller-only (GIC SPI INTx is the next step); reply-needing
   ctrlq commands still spin under `VIRTIO_GPU` (~0.5% of traffic); flip-done events tick-paced.
-- x86_64 `monotonic_us` = `rdtsc/1000` (4.49× too fast on the 7950X) — needs the
-  PIT-calibrated TSC scale.
 - greetd tokio `Bad read on self-pipe: EBADF` in the session `sh -c` wrapper (harmless,
   unexplained); greeter keystroke-render lag — re-measure (clock fixed 2026-09-16).
 - x86_64/TCG `[WDOG] … cosmic-comp` one-off seen during integration verify (not reproduced;
@@ -3355,9 +3353,10 @@ fix that only scoped reclaim from the full one. ~30 lines closes it; details in 
   sites; `ctrlq_sync` in the DRMSTAT line says how many there are (~0.5 % of traffic
   under Zink). Measured on the desktop (KVM, Zink desktop, same 80 s script):
   `ctrlq_us` 42 % → 0.03 % of wall, 19.3 → 20.1 fps, 15.6k IRQs, 0 timeouts.
-  ⚠ `snd::monotonic_us` on x86_64 is `rdtsc/1000`, i.e. 4.49× too fast on the 7950X —
-  every `*_us` census field there is inflated by that factor (`now_us` at the end of the
-  DRMSTAT line lets a reader calibrate); the 42 % was ≈9.4 % of real wall time.
+  ⚠ `snd::monotonic_us` on x86_64 was `rdtsc/1000` until 2026-09-18 (lane/tsccal), i.e.
+  4.49× too fast on the 7950X — every `*_us` census field measured before that is inflated
+  by that factor; the 42 % was ≈9.4 % of real wall time. It is now `arch_monotonic_ns/1000`
+  on the resolved TSC frequency (`[TSC] … MHz` boot line, `cpu MHz` in `/proc/cpuinfo`).
   A host-refused `RING_IDX` submit (item 1 below) no longer spins anyone: the chain stays
   in flight and its descriptors are lost until the device answers, bounded by the ring.
   Still polled: keyboard, blk, net, snd; aarch64 GPU (no MSI-X path there — INTx via GIC

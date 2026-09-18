@@ -167,9 +167,19 @@ Build time: ~3–5 minutes clean, ~30s incremental.
   coalesced. Both now keep the tick on an absolute grid with catch-up, and
   `clock_gettime` reads the counter (CNTVCT / TSC) directly. Measure with
   `clockdrift.py <secs> <label>` (same `LEANDROS_RUN_ID`): it prints
-  `guest=… host=… ratio=… err=…`; expect |err| < 0.5 % idle. Any timing
-  baseline recorded before this date (MAME run wall times, `sleep` durations,
-  desktop settle times, `[WDOG]` intervals) was measured on the slow clock.
+  `guest=… host=… ratio=… err=…`; expect |err| < 0.5 % idle over 30 s (a
+  10 s window carries ±50 ms of serial/echo offset, i.e. ±0.5 % of noise —
+  use 30 s before believing a rate error). Any timing baseline recorded
+  before this date (MAME run wall times, `sleep` durations, desktop settle
+  times, `[WDOG]` intervals) was measured on the slow clock. On x86_64 the
+  boot log prints the TSC frequency every clock derives from, once:
+  `[TSC] 1896.002 MHz (cpuid 0x40000010); pit measured 1895.921 MHz` —
+  the source in parentheses is CPUID when the CPU/hypervisor states one
+  (QEMU only does with `-cpu …,tsc-frequency=<Hz>`), else `pit`. The same
+  number is `cpu MHz` in `/proc/cpuinfo`. Kernel `*_us` diagnostics
+  (`[SND] TX stalled t_ms`, `[PW] producer gap`, DRMSTAT) were a raw
+  `rdtsc/1000` on x86_64 until 2026-09-18 — 1.9× fast on the laptop, 4.5×
+  on the 7950X — and are on this clock since.
 
 - **HVF needs a GICv3 machine since QEMU 11.1 (Homebrew, 2026-09-05).** `-accel hvf` on
   `-machine virt,gic-version=2` exits immediately with `HVF does not support GICv2
