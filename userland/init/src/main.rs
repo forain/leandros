@@ -14,8 +14,9 @@ extern crate leandros_libc;
 use leandros_libc::{
     write, STDOUT_FILENO, getpid, execve, sched_yield, mount, pivot_root, mkdir, chown,
     open, read, close, dup3, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND,
-    fork, wait4, setsid, ioctl, usleep, exit,
+    fork, wait4, setsid, ioctl, usleep, exit, clock_gettime, timespec,
 };
+use leandros_libc::syscall::{nr, syscall2};
 
 const TIOCSCTTY: usize = 0x540E;
 
@@ -55,7 +56,15 @@ const DM_PID_FILE: &[u8] = b"/run/greetd-init.pid\0";
 /// Respawn spacing and ceiling. A greeter chain that dies at once (a missing
 /// library, a compositor that cannot open the GPU) must not become a fork
 /// storm on the same console the serial login is trying to use.
+///
+/// The delay doubles on every death that follows a short run — 3, 6, 12, 24,
+/// then 30 s — and drops back to 3 s once a chain has stayed up for
+/// `DM_STABLE_SECS`: a greeter that crashed once after an hour is restarted
+/// promptly, one that dies on every start is throttled to the cap, and the
+/// respawn ceiling counts only consecutive short-lived runs.
 const DM_RESPAWN_DELAY_US: u32 = 3_000_000;
+const DM_RESPAWN_DELAY_MAX_US: u32 = 30_000_000;
+const DM_STABLE_SECS: u64 = 60;
 const DM_MAX_RESPAWNS: u32 = 20;
 
 #[no_mangle]
@@ -108,6 +117,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     let graphical = graphical_login_wanted();
     let mut dm_pid: i32 = if graphical { spawn_display_manager() } else { 0 };
     let mut dm_respawns: u32 = 0;
+    let mut dm_delay_us: u32 = DM_RESPAWN_DELAY_US;
+    let mut dm_started: u64 = monotonic_secs();
 
     // 6. Supervisor loop. The serial getty is respawned every time it exits so
     // a login shell that exits (or a crashing login) always gets a new console
@@ -131,22 +142,156 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             login_pid = spawn_login();
         } else if dm_pid > 0 && pid == dm_pid {
             dm_pid = 0;
+            // greetd is gone, but its session tree may not be: a greeter
+            // whose compositor died spins on the broken Wayland socket
+            // forever, at ~180 MiB and a full CPU apiece, and every respawn
+            // adds another. systemd would kill the unit's cgroup here; we
+            // kill what the kernel has reparented to us (see `sweep_strays`).
+            sweep_strays(login_pid);
+            let ran_secs = monotonic_secs().saturating_sub(dm_started);
+            if ran_secs >= DM_STABLE_SECS {
+                dm_respawns = 0;
+                dm_delay_us = DM_RESPAWN_DELAY_US;
+            }
             dm_respawns += 1;
             if dm_respawns > DM_MAX_RESPAWNS {
                 write_str("graphical login exited too many times; leaving the text login only\n");
                 continue;
             }
-            write_str("graphical login exited, restarting in 3 s (");
+            write_str("graphical login exited after ");
+            write_u32(ran_secs as u32);
+            write_str(" s, restarting in ");
+            write_u32(dm_delay_us / 1_000_000);
+            write_str(" s (");
             write_u32(dm_respawns);
             write_str("/");
             write_u32(DM_MAX_RESPAWNS);
             write_str(")\n");
-            usleep(DM_RESPAWN_DELAY_US);
+            usleep(dm_delay_us);
+            dm_delay_us = (dm_delay_us.saturating_mul(2)).min(DM_RESPAWN_DELAY_MAX_US);
             if graphical_login_wanted() {
                 dm_pid = spawn_display_manager();
+                dm_started = monotonic_secs();
             }
         }
     }
+}
+
+/// CLOCK_MONOTONIC in whole seconds (0 if the clock is unavailable).
+unsafe fn monotonic_secs() -> u64 {
+    let mut ts = timespec { tv_sec: 0, tv_nsec: 0 };
+    if clock_gettime(1, &mut ts) != 0 { return 0; }
+    ts.tv_sec as u64
+}
+
+/// Kill every process the kernel has handed to init that init did not start
+/// and that is not part of the serial login's session — the remains of a
+/// display-manager tree whose greetd has just exited.
+///
+/// The kernel reparents orphans to init (POSIX), so once greetd, its session
+/// worker and the compositor are gone, the compositor's stranded clients are
+/// init's children with a parent pid of init's own. They are found the way
+/// `ps` finds anything: `/proc/loadavg`'s last field is the highest pid
+/// allocated, `/proc/<pid>/stat` gives ppid and session. The serial login
+/// (and a `nohup` job it left behind, which shares its session) is never
+/// touched; neither is the login pid itself.
+///
+/// SIGKILL, not SIGTERM: a greeter spinning on a dead compositor socket is
+/// past graceful shutdown, and nothing else in that tree survives greetd on
+/// a systemd host either.
+unsafe fn sweep_strays(login_pid: i32) {
+    const SIGKILL: usize = 9;
+    let me = getpid() as u32;
+    let login_sid = if login_pid > 0 { proc_stat(login_pid as u32).map(|(_, _, _, s)| s) } else { None };
+    let mut killed = 0u32;
+    // Killing a stray orphans ITS children onto init in turn (greetd gone
+    // with the compositor still up: the compositor is a stray, the greeter
+    // becomes one only once the compositor is dead), so sweep until a pass
+    // finds nothing, with a bounded number of passes.
+    let mut pass = 0;
+    while pass < 5 {
+        let last = proc_last_pid();
+        let mut killed_this_pass = 0u32;
+        let mut pid = 1u32;
+        while pid <= last {
+            if pid != me && pid as i32 != login_pid {
+                if let Some((state, ppid, _pgid, sid)) = proc_stat(pid) {
+                    let protected = match login_sid { Some(s) => s == sid, None => false };
+                    // A zombie is already dead and waiting for the wait4 loop.
+                    if ppid == me && !protected && state != b'Z' {
+                        syscall2(nr::KILL, pid as usize, SIGKILL);
+                        killed_this_pass += 1;
+                    }
+                }
+            }
+            pid += 1;
+        }
+        killed += killed_this_pass;
+        if killed_this_pass == 0 { break; }
+        usleep(200_000);
+        pass += 1;
+    }
+    if killed > 0 {
+        write_str("killed ");
+        write_u32(killed);
+        write_str(" stray process(es) left by the graphical login\n");
+    }
+}
+
+/// `/proc/loadavg`'s last field: the highest pid allocated so far.
+unsafe fn proc_last_pid() -> u32 {
+    let mut buf = [0u8; 128];
+    let n = read_file(b"/proc/loadavg\0", &mut buf);
+    if n == 0 { return 0; }
+    let line = &buf[..n];
+    let end = line.iter().position(|&b| b == b'\n').unwrap_or(line.len());
+    let line = &line[..end];
+    let start = line.iter().rposition(|&b| b == b' ').map(|i| i + 1).unwrap_or(0);
+    parse_u32(&line[start..]).unwrap_or(0)
+}
+
+/// `(state, ppid, pgid, sid)` from `/proc/<pid>/stat`, or `None` if `pid` is
+/// not a live process.
+unsafe fn proc_stat(pid: u32) -> Option<(u8, u32, u32, u32)> {
+    let mut path = [0u8; 32];
+    let mut p = 0;
+    for &b in b"/proc/" { path[p] = b; p += 1; }
+    p += fmt_u32(&mut path[p..], pid);
+    for &b in b"/stat\0" { path[p] = b; p += 1; }
+    let mut buf = [0u8; 256];
+    let n = read_file(&path[..p], &mut buf);
+    if n == 0 { return None; }
+    // "pid (comm) state ppid pgid sid ..." — skip past the comm's closing paren.
+    let line = &buf[..n];
+    let close = line.iter().rposition(|&b| b == b')')?;
+    let mut fields = line[close + 1..].split(|&b| b == b' ').filter(|f| !f.is_empty());
+    let state = *fields.next()?.first()?;
+    let ppid = parse_u32(fields.next()?)?;
+    let pgid = parse_u32(fields.next()?)?;
+    let sid = parse_u32(fields.next()?)?;
+    Some((state, ppid, pgid, sid))
+}
+
+unsafe fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
+    let fd = open(path.as_ptr(), O_RDONLY, 0);
+    if fd < 0 { return 0; }
+    let mut total = 0usize;
+    while total < buf.len() {
+        let n = read(fd, buf.as_mut_ptr().add(total), buf.len() - total);
+        if n <= 0 { break; }
+        total += n as usize;
+    }
+    close(fd);
+    total
+}
+
+fn fmt_u32(out: &mut [u8], mut n: u32) -> usize {
+    let mut tmp = [0u8; 10];
+    let mut i = 0;
+    if n == 0 { tmp[0] = b'0'; i = 1; }
+    while n > 0 { tmp[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
+    for j in 0..i { out[j] = tmp[i - 1 - j]; }
+    i
 }
 
 /// Fork the serial getty: a fresh session running /bin/login. Returns the

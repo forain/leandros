@@ -409,6 +409,9 @@ fn load_and_spawn_elf(elf_data: &[u8]) -> u32 {
     if !as_.write_user_buf(user_sp, &zero) { panic!("failed to initialize user stack"); }
 
     let pid = sched::spawn_user_with_address_space(entry, user_sp, as_).expect("failed to spawn init");
+    // The first (and only) boot-loaded ELF is init: the process every orphan
+    // is reparented to.
+    if sched::init_pid() == 0 { sched::set_init_pid(pid); }
     
     serial_print_str("[INIT] load_and_spawn_elf: entry=");
     serial_print_hex(entry);

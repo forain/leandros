@@ -1994,9 +1994,64 @@ static RAMFS_DIRS: &[&[u8]] = &[
 static SERVER_PORT: Mutex<u32> = Mutex::new(u32::MAX);
 
 /// Initialise the VFS server and return its IPC port ID.
+/// Ctrl-T dump hook: the VFS's pooled kernel memory, so a leak that lives in a
+/// tmpfs/memfd VMO, a pipe ring or a stale fd table is visible next to the
+/// buddy census rather than only as a lower `free_pages`. IRQ context —
+/// `try_lock` only, nothing user-visible touched.
+pub fn dump_vfs_census() {
+    extern "C" { fn arch_serial_putc(c: u8); }
+    fn ps(s: &str) { for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } } }
+    // Raw UART only: the kernel's print_number mirrors into the VT buffer
+    // under the VT lock, which an interrupted CPU may hold (see `dump_raw`).
+    fn pn(mut v: usize) {
+        let mut buf = [0u8; 20]; let mut i = buf.len();
+        loop { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+        for &b in &buf[i..] { unsafe { arch_serial_putc(b); } }
+    }
+    ps("[VFS]");
+    match TMP_FILES.try_lock() {
+        Some(t) => {
+            let (mut used, mut eph) = (0usize, 0usize);
+            for e in t.iter() { if e.in_use { used += 1; if e.ephemeral { eph += 1; } } }
+            ps(" tmpfiles="); pn(used); ps(" ephemeral="); pn(eph);
+        }
+        None => ps(" tmpfiles=busy"),
+    }
+    match TMP_VMOS.try_lock() {
+        Some(v) => {
+            let (mut slots, mut pages, mut borrowed, mut memfd) = (0usize, 0usize, 0usize, 0usize);
+            for e in v.iter().flatten() {
+                slots += 1;
+                if e.borrowed { borrowed += 1; } else { pages += e.pages.len(); }
+                if e.is_memfd { memfd += 1; }
+            }
+            ps(" vmos="); pn(slots); ps(" vmo_pages="); pn(pages);
+            ps(" memfd="); pn(memfd); ps(" dmabuf="); pn(borrowed);
+        }
+        None => ps(" vmos=busy"),
+    }
+    match PIPE_RINGS.try_lock() {
+        Some(r) => {
+            let live = r.iter().filter(|p| p.readers > 0 || p.writers > 0).count();
+            ps(" pipes="); pn(live);
+        }
+        None => ps(" pipes=busy"),
+    }
+    match FD_TABLES.try_lock() {
+        Some(t) => {
+            let (mut tables, mut fds) = (0usize, 0usize);
+            for tb in t.iter() { if tb.in_use { tables += 1; fds += tb.fds.iter().filter(|f| f.in_use).count(); } }
+            ps(" fdtables="); pn(tables); ps(" fds="); pn(fds);
+        }
+        None => ps(" fdtables=busy"),
+    }
+    ps("\n");
+}
+
 pub fn init(owner_pid: u32) -> Option<u32> {
     let port_id = port::create(owner_pid)?;
     *SERVER_PORT.lock() = port_id;
+    sched::register_dump_hook(dump_vfs_census);
 
     // Seed root's XDG runtime dir. /run/user/<uid> dirs are ordinary tmpfs
     // pool directories under the /run/user mount root, normally mkdir'd by
@@ -3305,9 +3360,12 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
     }
 
     if path == b"/proc/loadavg" {
+        // Last field is the most recently allocated pid, as on Linux: it is
+        // the upper bound a `/proc/<pid>/stat` scan (init's stray sweep,
+        // a `ps`) needs, since /proc has no per-pid directory listing.
         let mut p = 0;
         p = write_lit(buf, p, b"0.00 0.00 0.00 1/1 ");
-        p = write_u32(buf, p, sched::current_pid());
+        p = write_u32(buf, p, sched::last_pid());
         p = write_lit(buf, p, b"\n");
         return Some(p);
     }
@@ -3430,9 +3488,9 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
     // `/proc/<pid>/` — including the procps state letter, so a stopped job
     // reads `T` the way `ps` and `jobs` expect. The caller can only ever see
     // itself as `R`.
-    let (ppid, pgid, state) = match sched::proc_stat_of(pid) {
-        Some((ppid, pgid, _sid, state)) => (ppid, pgid, state),
-        None => (sched::current_ppid(), sched::current_pgid(), b'R'),
+    let (ppid, pgid, sid, state) = match sched::proc_stat_of(pid) {
+        Some((ppid, pgid, sid, state)) => (ppid, pgid, sid, state),
+        None => (sched::current_ppid(), sched::current_pgid(), sched::current_sid(), b'R'),
     };
     let state_word: &[u8] = match state {
         b'S' => b"S (sleeping)",
@@ -3468,7 +3526,9 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         p = write_u32(buf, p, ppid);
         p = write_lit(buf, p, b" ");
         p = write_u32(buf, p, pgid);
-        p = write_lit(buf, p, b" 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 ");
+        p = write_lit(buf, p, b" ");
+        p = write_u32(buf, p, sid); // field 6: session id
+        p = write_lit(buf, p, b" 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 ");
         p = write_u32(buf, p, uptime_sec as u32);
         p = write_lit(buf, p, b" 8388608 2048 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
         return Some(p);

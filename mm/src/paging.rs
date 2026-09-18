@@ -47,6 +47,17 @@ extern "C" {
     /// Arch-provided: broadcast TLB invalidation for all user-space entries to
     /// all CPUs (inner-shareable TLBI on AArch64; CR3 reload on x86-64).
     fn arch_tlb_shootdown_all();
+    /// Arch-provided: free every intermediate page-table node below the user
+    /// root `page_table_root` (not the root itself, never the kernel's shared
+    /// nodes). Returns the number of 4 KiB table pages released.
+    fn arch_free_user_page_tables(page_table_root: usize) -> usize;
+}
+
+/// Release the intermediate page tables of a dead user address space. Every
+/// leaf must already be unmapped or about to be discarded with the root: the
+/// walk frees nodes, not frames. Returns the number of table pages freed.
+pub unsafe fn free_user_page_tables(page_table_root: usize) -> usize {
+    arch_free_user_page_tables(page_table_root)
 }
 
 /// Map a single virtual page to a physical frame in the given address space.

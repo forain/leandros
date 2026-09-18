@@ -162,8 +162,15 @@ impl Drop for AddressSpace {
                 }
             }
         }
-        // Free the page-table root (PGD on AArch64, PML4 on x86-64).
+        // Free the page-table tree: every intermediate node `map_page`
+        // allocated on the way down, then the root (PGD on AArch64, PML4 on
+        // x86-64). Until 2026-09-18 only the root was returned, and every
+        // PDPT/PD/PT page a process ever touched leaked for the rest of the
+        // boot — ~50 pages per `brush -c true`, ~1000 per greeter chain.
+        // The leaves were unmapped or discarded above, so the walk frees
+        // nodes only (see `arch_free_user_page_tables`).
         if self.page_table_root != 0 {
+            unsafe { crate::paging::free_user_page_tables(self.page_table_root); }
             buddy_free(self.page_table_root, 0);
         }
         // Flush stale TLB entries on all CPUs now that all mappings are gone.

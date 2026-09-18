@@ -455,6 +455,10 @@ extern "C" {
     pub fn waitpid(pid: i32, stat_loc: *mut c_int, options: c_int) -> i32;
     pub fn _exit(status: c_int) -> !;
     pub fn usleep(usec: c_uint) -> c_int;
+    // `--leak`: the parent SIGKILLs half of its children mid-allocation and
+    // syncs on a pipe, so the death is exactly a compositor's `kill -9`.
+    pub fn kill(pid: i32, sig: c_int) -> c_int;
+    pub fn pipe(fds: *mut c_int) -> c_int;
     pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     pub fn fstat(fildes: c_int, buf: *mut u8) -> c_int;
     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> isize;
@@ -802,12 +806,158 @@ unsafe fn spin_delay(iters: u64) {
     core::ptr::write_volatile(core::ptr::addr_of_mut!(SPIN_SINK), acc);
 }
 
+// ── `--leak [N]`: N compositor-shaped deaths must cost ~0 kernel pages ──────
+//
+// The regression this guards (2026-09-18): a compositor that died holding its
+// swapchain leaked every dumb buffer it had, because a dumb gem handle had no
+// owner and `drm_release_open` never retired one; on top of that every
+// process leaked its intermediate page tables. Killing the greeter's
+// cosmic-comp 15 times ended in `[BUDDY] Allocation failed`.
+//
+// Each iteration forks a child that does what cosmic-comp's GBM/kms_swrast
+// path does at start-up — CREATE_DUMB x3 (two swapchain buffers and a cursor),
+// MAP_DUMB + mmap + touch, ADDFB2, one PRIME export mmapped through its fd —
+// and then dies WITHOUT any DESTROY_DUMB/RMFB/GEM_CLOSE: odd iterations
+// `_exit`, even ones are SIGKILLed by the parent mid-flight. No master, no
+// SETCRTC, so it is safe to run next to a live compositor. The parent reads
+// MemFree before and after and demands the per-death cost stay under
+// LEAK_BUDGET_KIB — a single leaked 4 MiB buffer is 16x over it.
+const LEAK_BUDGET_KIB: u64 = 256;
+
+/// `MemFree:` from /proc/meminfo, in KiB (buddy free pages x 4).
+unsafe fn mem_free_kib() -> u64 {
+    let fd = open(b"/proc/meminfo\0".as_ptr(), O_RDONLY);
+    if fd < 0 { return 0; }
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    loop {
+        let r = read(fd, buf.as_mut_ptr().add(n) as *mut c_void, buf.len() - n);
+        if r <= 0 { break; }
+        n += r as usize;
+        if n >= buf.len() { break; }
+    }
+    close(fd);
+    let text = &buf[..n];
+    let key = b"MemFree:";
+    let mut i = 0usize;
+    while i + key.len() <= text.len() {
+        if &text[i..i + key.len()] == key {
+            let mut j = i + key.len();
+            while j < text.len() && text[j] == b' ' { j += 1; }
+            let mut v = 0u64;
+            while j < text.len() && text[j].is_ascii_digit() {
+                v = v * 10 + (text[j] - b'0') as u64;
+                j += 1;
+            }
+            return v;
+        }
+        i += 1;
+    }
+    0
+}
+
+/// The child half of one `--leak` iteration. Never returns.
+unsafe fn leak_child(ready_wr: c_int, wait_for_kill: bool) -> ! {
+    let fd = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    if fd < 0 { _exit(2); }
+    let mut handles = [0u32; 3];
+    let dims: [(u32, u32); 3] = [(1280, 800), (1280, 800), (64, 64)];
+    for (i, &(w, h)) in dims.iter().enumerate() {
+        let mut cd = DrmModeCreateDumb { height: h, width: w, bpp: 32, flags: 0, handle: 0, pitch: 0, size: 0 };
+        if ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut cd as *mut _) != 0 { _exit(3); }
+        handles[i] = cd.handle;
+        let mut md = DrmModeMapDumb { handle: cd.handle, pad: 0, offset: 0 };
+        if ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut md as *mut _) != 0 { _exit(4); }
+        let len = cd.size as usize;
+        let p = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, md.offset as i64);
+        if (p as isize) == -1 { _exit(5); }
+        // Touch every page the way a renderer would, then leave it mapped.
+        let mut off = 0usize;
+        while off < len { *(p as *mut u8).add(off) = 0x18; off += 4096; }
+        let mut fb = DrmModeFbCmd2::default();
+        fb.width = w; fb.height = h; fb.pixel_format = DRM_FORMAT_XRGB8888;
+        fb.handles[0] = cd.handle; fb.pitches[0] = cd.pitch;
+        if ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &mut fb as *mut _) != 0 { _exit(6); }
+    }
+    // One buffer exported over PRIME and mapped through the dmabuf fd — the
+    // exported-while-owned shape smithay's software renderer leaves behind.
+    let mut ph = DrmPrimeHandle { handle: handles[0], flags: 0, fd: -1 };
+    if ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _) != 0 || ph.fd < 0 { _exit(7); }
+    let p = mmap(core::ptr::null_mut(), 4096 * 16, PROT_READ | PROT_WRITE, MAP_SHARED, ph.fd, 0);
+    if (p as isize) == -1 { _exit(8); }
+    *(p as *mut u8) = 1;
+    // Tell the parent every allocation is in place, then die holding all of it.
+    let b = [b'k'];
+    write(ready_wr, b.as_ptr() as *const c_void, 1);
+    if wait_for_kill {
+        loop { usleep(10_000); }
+    }
+    _exit(0);
+}
+
+unsafe fn leak_mode(iters: u32) -> i32 {
+    let mut failures = 0i32;
+    let before = mem_free_kib();
+    if before == 0 {
+        report(b"leak_meminfo_readable", false);
+        return 1;
+    }
+    let mut child_failures = 0u32;
+    let mut i = 0u32;
+    while i < iters {
+        let mut fds = [0 as c_int; 2];
+        if pipe(fds.as_mut_ptr()) != 0 { child_failures += 1; i += 1; continue; }
+        let by_signal = i % 2 == 1;
+        let pid = fork();
+        if pid == 0 {
+            close(fds[0]);
+            leak_child(fds[1], by_signal);
+        }
+        close(fds[1]);
+        if pid < 0 { close(fds[0]); child_failures += 1; i += 1; continue; }
+        let mut tok = [0u8; 1];
+        let got = read(fds[0], tok.as_mut_ptr() as *mut c_void, 1);
+        close(fds[0]);
+        if got != 1 { child_failures += 1; }
+        if by_signal { kill(pid, 9); }
+        let mut status = 0 as c_int;
+        waitpid(pid, &mut status, 0);
+        if !by_signal && got == 1 && status != 0 { child_failures += 1; }
+        i += 1;
+    }
+    // Let the last reap's teardown land before sampling.
+    usleep(200_000);
+    let after = mem_free_kib();
+    let lost_kib = before.saturating_sub(after);
+    let per_death = if iters > 0 { lost_kib / iters as u64 } else { 0 };
+    print_dec(b"  leak: deaths=", iters as u64);
+    print_dec(b"  leak: memfree_before_kib=", before);
+    print_dec(b"  leak: memfree_after_kib=", after);
+    print_dec(b"  leak: kib_lost_per_death=", per_death);
+    if !report(b"leak_children_alloc_ok", child_failures == 0) { failures += 1; }
+    if !report(b"leak_per_death_under_budget", per_death < LEAK_BUDGET_KIB) { failures += 1; }
+    failures
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0i32;
     let mut skips = 0i32;
 
     let hold_mode = argc > 1 && arg_is(*argv.add(1) as *const u8, b"--hold");
+
+    if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--leak") {
+        let mut iters = 20u32;
+        if argc > 2 {
+            let p = *argv.add(2) as *const u8;
+            let mut v = 0u32; let mut k = 0usize;
+            while !p.is_null() && (*p.add(k)).is_ascii_digit() { v = v * 10 + (*p.add(k) - b'0') as u32; k += 1; }
+            if v > 0 { iters = v; }
+        }
+        let f = leak_mode(iters);
+        puts(b"--- drmsmoke done ---\n\0".as_ptr());
+        return f;
+    }
 
     let fd = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
     if fd < 0 {
