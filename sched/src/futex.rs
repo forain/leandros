@@ -65,7 +65,7 @@ static FUTEX_TABLE: Mutex<[Option<FutexWaiter>; MAX_FUTEX_WAITERS]> =
     Mutex::new([const { None }; MAX_FUTEX_WAITERS]);
 
 /// Block the current task on `uaddr` until a `futex_wake` targets it, or
-/// (if `deadline` is `Some`) until `ticks() >= deadline`.
+/// (if `deadline` is `Some`) until `monotonic_ns() >= deadline`.
 ///
 /// `expected` is compared against `*uaddr` with no kernel lock held, between
 /// this task's registration in `FUTEX_TABLE` and its commit to `Blocked` (see
@@ -251,7 +251,7 @@ pub fn futex_wait(uaddr: usize, expected: u32, deadline: Option<u64>) -> isize {
     // stray poll wake) and returns 0, since every futex caller re-checks its
     // own condition on wake.
     if let Some(dl) = deadline {
-        if super::ticks() >= dl { return -110; } // ETIMEDOUT
+        if super::monotonic_ns() >= dl { return -110; } // ETIMEDOUT
     }
     0
 }

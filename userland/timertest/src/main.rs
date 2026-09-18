@@ -94,12 +94,32 @@ mod nr {
     pub const TIMERFD_CREATE: i64 = 283;
     pub const TIMERFD_SETTIME: i64 = 286;
     pub const TIMERFD_GETTIME: i64 = 287;
+    pub const FUTEX: i64 = 202;
+    pub const EPOLL_CREATE1: i64 = 291;
+    pub const EPOLL_WAIT: i64 = 232;
+    pub const GETTIMEOFDAY: i64 = 96;
+    pub const TIME: i64 = 201;
+    pub const CLOCK_NANOSLEEP: i64 = 230;
+    pub const PIPE2: i64 = 293;
+    pub const SELECT: i64 = 23;
+    pub const PSELECT6: i64 = 270;
+    pub const EPOLL_PWAIT2: i64 = 441;
 }
 #[cfg(target_arch = "aarch64")]
 mod nr {
     pub const TIMERFD_CREATE: i64 = 85;
     pub const TIMERFD_SETTIME: i64 = 86;
     pub const TIMERFD_GETTIME: i64 = 87;
+    pub const FUTEX: i64 = 98;
+    pub const EPOLL_CREATE1: i64 = 20;
+    pub const EPOLL_WAIT: i64 = 22; // epoll_pwait
+    pub const GETTIMEOFDAY: i64 = 169;
+    pub const TIME: i64 = -1; // no time(2) on AArch64
+    pub const CLOCK_NANOSLEEP: i64 = 115;
+    pub const PIPE2: i64 = 59;
+    pub const SELECT: i64 = -1; // no select(2) on AArch64
+    pub const PSELECT6: i64 = 72;
+    pub const EPOLL_PWAIT2: i64 = 441;
 }
 
 const TFD_TIMER_ABSTIME: i64 = 1;
@@ -194,6 +214,15 @@ pub unsafe extern "C" fn timer_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_timerfd_abstime_future() { failures += 1; }
     if !test_timerfd_abstime_past() { failures += 1; }
     if !test_timerfd_relative_unchanged() { failures += 1; }
+    if !test_nanosleep_500us_never_early() { failures += 1; }
+    if !test_futex_wait_relative_3ms() { failures += 1; }
+    if !test_poll_1ms_never_early() { failures += 1; }
+    if !test_epoll_wait_1ms_never_early() { failures += 1; }
+    if !test_select_1ms_never_early() { failures += 1; }
+    if !test_gettimeofday_matches_realtime() { failures += 1; }
+    if !test_realtime_is_not_uptime() { failures += 1; }
+    if !test_timerfd_realtime_vs_monotonic() { failures += 1; }
+    if !test_clock_nanosleep_realtime_abstime() { failures += 1; }
 
     puts(b"--- timertest done ---\n\0".as_ptr());
     failures
@@ -695,6 +724,325 @@ unsafe fn test_timerfd_relative_unchanged() -> bool {
     print_kv(b"  relative_remaining_ns=\0", remaining.max(0) as u64);
     print_kv(b"  relative_elapsed_ns=\0", elapsed.max(0) as u64);
     report(name, old_ok && remaining_ok && fired_ok)
+}
+
+
+// ── Timespec family: one monotonic source, one realtime source ─────────────
+//
+// Every deadline below used to be derived from the 100 Hz tick counter while
+// CLOCK_MONOTONIC was read from the free-running counter: a relative timeout
+// was floored to whole ticks (sub-tick waits became 0 → return at once) and a
+// deadline of "tick N" fired at the next tick edge, up to 10 ms before the
+// requested interval had elapsed by clock_gettime's reckoning. These cases
+// measure with CLOCK_MONOTONIC and demand the POSIX "at least" guarantee.
+
+/// How late a timed wake may be before the case fails: several ticks, since
+/// the tick that releases a waiter can lose `RUN_QUEUE.try_lock()` a few times
+/// in a row under a live desktop, and an idle vCPU's exit through the
+/// hypervisor adds milliseconds. The cases are about *early*, never *late*.
+const LATE_BOUND_NS: i64 = 50_000_000;
+
+unsafe fn realtime_ns() -> i64 {
+    let mut ts = core::mem::zeroed::<timespec>();
+    clock_gettime(CLOCK_REALTIME, &mut ts);
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+/// Burn a little CPU so successive samples do not sit on the same tick phase
+/// (a sleep between samples would re-sync to the tick edge).
+fn busy_ns(ns: i64) {
+    let t0 = unsafe { now_ns() };
+    let mut x = 0u64;
+    while unsafe { now_ns() } - t0 < ns {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        core::hint::black_box(x);
+    }
+}
+
+// 11. A 500 us nanosleep must sleep at least 500 us, every time. 40 samples
+//     at random tick phases: the tick-derived sleep woke at the next tick
+//     edge, so roughly one sample in twenty came back short.
+unsafe fn test_nanosleep_500us_never_early() -> bool {
+    let name = b"nanosleep_500us_never_early\0";
+    let mut min = i64::MAX;
+    let mut max = 0i64;
+    for i in 0..40 {
+        // Spread the samples across the whole 10 ms tick: each sleep wakes on
+        // a tick edge, so a fixed busy phase would only ever probe one point.
+        busy_ns((i * 1_234_567) % 10_000_000);
+        let req = timespec { tv_sec: 0, tv_nsec: 500_000 };
+        let t0 = now_ns();
+        let r = nanosleep(&req, core::ptr::null_mut());
+        let dt = now_ns() - t0;
+        if r != 0 { return report(name, false); }
+        if dt < min { min = dt; }
+        if dt > max { max = dt; }
+    }
+    print_kv(b"  nanosleep_500us_min_ns=\0", min as u64);
+    print_kv(b"  nanosleep_500us_max_ns=\0", max as u64);
+    // At least the request — that is the property. Lateness is wake latency
+    // (tick granularity, RUN_QUEUE contention on the tick, hypervisor idle
+    // exit) and only sanity-bounded.
+    report(name, min >= 500_000 && max < 500_000 + LATE_BOUND_NS)
+}
+
+// 12. A relative FUTEX_WAIT of 3 ms on an unchanged word returns ETIMEDOUT no
+//     sooner than 3 ms later. The tick-derived path floored 3 ms to 0 ticks
+//     and the very next tick released the waiter.
+unsafe fn test_futex_wait_relative_3ms() -> bool {
+    let name = b"futex_wait_relative_3ms\0";
+    const FUTEX_WAIT: c_long = 0;
+    const FUTEX_PRIVATE: c_long = 128;
+    const ETIMEDOUT: c_int = 110;
+    let word: u32 = 7;
+    let mut min = i64::MAX;
+    let mut max = 0i64;
+    for i in 0..10 {
+        busy_ns(700_000 * (i % 5 + 1));
+        let to = timespec { tv_sec: 0, tv_nsec: 3_000_000 };
+        let t0 = now_ns();
+        let r = syscall(nr::FUTEX, &word as *const u32 as c_long, FUTEX_WAIT | FUTEX_PRIVATE,
+                        7 as c_long, &to as *const timespec as c_long, 0 as c_long, 0 as c_long);
+        let dt = now_ns() - t0;
+        // relibc's syscall() returns the raw kernel value (-errno).
+        if r != -(ETIMEDOUT as c_long) { return report(name, false); }
+        if dt < min { min = dt; }
+        if dt > max { max = dt; }
+    }
+    print_kv(b"  futex_3ms_min_ns=\0", min as u64);
+    print_kv(b"  futex_3ms_max_ns=\0", max as u64);
+    report(name, min >= 3_000_000 && max < 3_000_000 + LATE_BOUND_NS)
+}
+
+/// A pipe whose read end never becomes readable: the fd every timed wait
+/// below parks on.
+unsafe fn idle_pipe() -> Option<[c_int; 2]> {
+    let mut fds = [0 as c_int; 2];
+    if syscall(nr::PIPE2, fds.as_mut_ptr() as c_long, 0 as c_long) != 0 { return None; }
+    Some(fds)
+}
+
+// 13. poll(1 ms) on an idle fd takes at least 1 ms — and so does the
+//     `poll(NULL, 0, ms)` sleep idiom, which used to return at once.
+unsafe fn test_poll_1ms_never_early() -> bool {
+    let name = b"poll_1ms_never_early\0";
+    let fds = match idle_pipe() { Some(f) => f, None => return report(name, false) };
+    let mut min = i64::MAX;
+    let mut max = 0i64;
+    let mut ok = true;
+    for i in 0..10 {
+        busy_ns(600_000 * (i % 6 + 1));
+        let mut pfd = pollfd { fd: fds[0], events: POLLIN, revents: 0 };
+        let t0 = now_ns();
+        let r = poll(&mut pfd, 1, 1);
+        let dt = now_ns() - t0;
+        if r != 0 { ok = false; }
+        if dt < min { min = dt; }
+        if dt > max { max = dt; }
+    }
+    let t0 = now_ns();
+    let r0 = poll(core::ptr::null_mut(), 0, 5);
+    let dt0 = now_ns() - t0;
+    close(fds[0]); close(fds[1]);
+    print_kv(b"  poll_1ms_min_ns=\0", min as u64);
+    print_kv(b"  poll_1ms_max_ns=\0", max as u64);
+    print_kv(b"  poll_nfds0_5ms_ns=\0", dt0.max(0) as u64);
+    report(name, ok && min >= 1_000_000 && max < 1_000_000 + LATE_BOUND_NS
+        && r0 == 0 && dt0 >= 5_000_000 && dt0 < 5_000_000 + LATE_BOUND_NS)
+}
+
+// 14. epoll_wait(1 ms) with nothing ready takes at least 1 ms.
+unsafe fn test_epoll_wait_1ms_never_early() -> bool {
+    let name = b"epoll_wait_1ms_never_early\0";
+    let ep = syscall(nr::EPOLL_CREATE1, 0 as c_long) as c_int;
+    if ep < 0 { return report(name, false); }
+    let fds = match idle_pipe() { Some(f) => f, None => { close(ep); return report(name, false) } };
+    // EPOLL_CTL_ADD the idle read end so the interest set is not empty.
+    #[cfg(target_arch = "x86_64")]
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    struct epoll_event { events: u32, data: u64 }
+    #[cfg(not(target_arch = "x86_64"))]
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct epoll_event { events: u32, data: u64 }
+    let mut ev = epoll_event { events: POLLIN as u32, data: 0 };
+    #[cfg(target_arch = "x86_64")] const EPOLL_CTL: c_long = 233;
+    #[cfg(target_arch = "aarch64")] const EPOLL_CTL: c_long = 21;
+    if syscall(EPOLL_CTL, ep as c_long, 1 as c_long, fds[0] as c_long, &mut ev as *mut epoll_event as c_long) != 0 {
+        close(ep); close(fds[0]); close(fds[1]);
+        return report(name, false);
+    }
+    let mut min = i64::MAX;
+    let mut max = 0i64;
+    let mut ok = true;
+    for i in 0..10 {
+        busy_ns(600_000 * (i % 6 + 1));
+        let mut out = [epoll_event { events: 0, data: 0 }; 4];
+        let t0 = now_ns();
+        let r = syscall(nr::EPOLL_WAIT, ep as c_long, out.as_mut_ptr() as c_long, 4 as c_long,
+                        1 as c_long, 0 as c_long, 8 as c_long);
+        let dt = now_ns() - t0;
+        if r != 0 { ok = false; }
+        if dt < min { min = dt; }
+        if dt > max { max = dt; }
+    }
+    // epoll_pwait2 takes a timespec, not milliseconds: 2 ms must not be read
+    // as 2 000 000 ms.
+    let ts = timespec { tv_sec: 0, tv_nsec: 2_000_000 };
+    let mut out = [epoll_event { events: 0, data: 0 }; 4];
+    let t0 = now_ns();
+    let r2 = syscall(nr::EPOLL_PWAIT2, ep as c_long, out.as_mut_ptr() as c_long, 4 as c_long,
+                     &ts as *const timespec as c_long, 0 as c_long, 8 as c_long);
+    let dt2 = now_ns() - t0;
+    close(ep); close(fds[0]); close(fds[1]);
+    print_kv(b"  epoll_wait_1ms_min_ns=\0", min as u64);
+    print_kv(b"  epoll_wait_1ms_max_ns=\0", max as u64);
+    print_kv(b"  epoll_pwait2_2ms_ns=\0", dt2.max(0) as u64);
+    report(name, ok && min >= 1_000_000 && max < 1_000_000 + LATE_BOUND_NS
+        && r2 == 0 && dt2 >= 2_000_000 && dt2 < 2_000_000 + LATE_BOUND_NS)
+}
+
+// 15. select/pselect6 with a 1 ms timeout takes at least 1 ms, and pselect6's
+//     timeout is a timespec (nanoseconds), not a timeval.
+unsafe fn test_select_1ms_never_early() -> bool {
+    let name = b"select_1ms_never_early\0";
+    let fds = match idle_pipe() { Some(f) => f, None => return report(name, false) };
+    let mut set = [0u64; 16];
+    set[(fds[0] as usize) / 64] |= 1u64 << ((fds[0] as usize) % 64);
+    let nfds = (fds[0] + 1) as c_long;
+    let mut ok = true;
+    let mut min = i64::MAX;
+    let mut max = 0i64;
+    for i in 0..6 {
+        busy_ns(900_000 * (i % 4 + 1));
+        let mut rs = set;
+        let ts = timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+        let t0 = now_ns();
+        let r = syscall(nr::PSELECT6, nfds, rs.as_mut_ptr() as c_long, 0 as c_long, 0 as c_long,
+                        &ts as *const timespec as c_long, 0 as c_long);
+        let dt = now_ns() - t0;
+        if r != 0 { ok = false; }
+        if dt < min { min = dt; }
+        if dt > max { max = dt; }
+    }
+    let mut sel_ok = true;
+    let mut sel_dt = 0i64;
+    if nr::SELECT >= 0 {
+        let mut rs = set;
+        let tv = timeval { tv_sec: 0, tv_usec: 1_000 };
+        let t0 = now_ns();
+        let r = syscall(nr::SELECT, nfds, rs.as_mut_ptr() as c_long, 0 as c_long, 0 as c_long,
+                        &tv as *const timeval as c_long);
+        sel_dt = now_ns() - t0;
+        sel_ok = r == 0 && sel_dt >= 1_000_000 && sel_dt < 1_000_000 + LATE_BOUND_NS;
+    }
+    close(fds[0]); close(fds[1]);
+    print_kv(b"  pselect6_1ms_min_ns=\0", min as u64);
+    print_kv(b"  pselect6_1ms_max_ns=\0", max as u64);
+    print_kv(b"  select_1ms_ns=\0", sel_dt.max(0) as u64);
+    report(name, ok && min >= 1_000_000 && max < 1_000_000 + LATE_BOUND_NS && sel_ok)
+}
+
+// 16. gettimeofday, time(2) and clock_gettime(CLOCK_REALTIME) are the same
+//     clock: within 1 ms of each other, sampled at spread tick phases. They
+//     used to be two clocks (ticks × 10 ms vs the counter) up to 10 ms apart.
+unsafe fn test_gettimeofday_matches_realtime() -> bool {
+    let name = b"gettimeofday_matches_realtime\0";
+    let mut worst = 0i64;
+    let mut time_ok = true;
+    for i in 0..10 {
+        busy_ns(400_000 * (i % 9 + 1));
+        let r0 = realtime_ns();
+        let mut tv = core::mem::zeroed::<timeval>();
+        if syscall(nr::GETTIMEOFDAY, &mut tv as *mut timeval as c_long, 0 as c_long) != 0 {
+            return report(name, false);
+        }
+        let g = tv.tv_sec * 1_000_000_000 + tv.tv_usec * 1_000;
+        let r1 = realtime_ns();
+        // gettimeofday was read between r0 and r1, so it must land inside
+        // [r0 - 1 ms, r1 + 1 ms] (the 1 ms is its own microsecond rounding
+        // plus syscall latency).
+        let d = if g < r0 { r0 - g } else if g > r1 { g - r1 } else { 0 };
+        if d > worst { worst = d; }
+        if nr::TIME >= 0 {
+            let t = syscall(nr::TIME, 0 as c_long);
+            let sec = r1 / 1_000_000_000;
+            if t < sec - 1 || t > sec + 1 { time_ok = false; }
+        }
+    }
+    print_kv(b"  gettimeofday_worst_skew_ns=\0", worst as u64);
+    report(name, worst < 1_000_000 && time_ok)
+}
+
+// 17. CLOCK_REALTIME carries an epoch: on QEMU both boards expose a
+//     battery-clock (PL031 / CMOS) the kernel reads at boot, so REALTIME
+//     reads as a date after 2020, and REALTIME - MONOTONIC is a constant
+//     offset (no drift between the two sources).
+unsafe fn test_realtime_is_not_uptime() -> bool {
+    let name = b"realtime_is_not_uptime\0";
+    let off0 = realtime_ns() - now_ns();
+    busy_ns(20_000_000);
+    let off1 = realtime_ns() - now_ns();
+    let drift = (off1 - off0).abs();
+    let sec = realtime_ns() / 1_000_000_000;
+    print_kv(b"  realtime_sec=\0", sec.max(0) as u64);
+    print_kv(b"  realtime_offset_drift_ns=\0", drift as u64);
+    // 2020-01-01 = 1577836800.
+    report(name, sec > 1_577_836_800 && drift < 100_000)
+}
+
+// 18. timerfd_create honours its clockid: an absolute deadline on
+//     CLOCK_REALTIME is read on the realtime clock (a kernel that treats it
+//     as monotonic would wait ~56 years), an absolute deadline on
+//     CLOCK_MONOTONIC on the monotonic one, and gettime reports the remaining
+//     interval for both.
+unsafe fn test_timerfd_realtime_vs_monotonic() -> bool {
+    let name = b"timerfd_realtime_vs_monotonic\0";
+    let mut all_ok = true;
+    for (clk, label) in [(CLOCK_REALTIME, b"  tfd_realtime_elapsed_ns=\0" as &[u8]),
+                         (CLOCK_MONOTONIC, b"  tfd_monotonic_elapsed_ns=\0")] {
+        let tfd = syscall(nr::TIMERFD_CREATE, clk as c_long, 0i64) as c_int;
+        if tfd < 0 { return report(name, false); }
+        let base = if clk == CLOCK_REALTIME { realtime_ns() } else { now_ns() };
+        let t0 = now_ns();
+        let its = itimerspec {
+            it_interval: timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value:    ts_from_ns(base + 50_000_000),
+        };
+        if tfd_settime(tfd, TFD_TIMER_ABSTIME, &its, core::ptr::null_mut()) != 0 {
+            close(tfd);
+            return report(name, false);
+        }
+        let armed = match tfd_gettime(tfd) { Some(c) => c, None => { close(tfd); return report(name, false); } };
+        let remaining = ts_to_ns(&armed.it_value);
+        let remaining_ok = remaining > 0 && remaining <= 50_000_000 + TICK_NS;
+        let fired = tfd_wait_read(tfd, t0, 1000);
+        close(tfd);
+        let (count, elapsed) = match fired { Some(v) => v, None => (0, -1) };
+        let fired_ok = count == 1 && elapsed >= 50_000_000 && elapsed < 50_000_000 + LATE_BOUND_NS;
+        print_kv(label, elapsed.max(0) as u64);
+        if !(remaining_ok && fired_ok) { all_ok = false; }
+    }
+    report(name, all_ok)
+}
+
+// 19. clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME) sleeps until a realtime
+//     instant — [20, 40) ms for now + 20 ms. A SIGALRM is armed first so a
+//     kernel that reads the deadline on the wrong clock (≈ 56 years) fails
+//     with EINTR after one second instead of hanging the test.
+unsafe fn test_clock_nanosleep_realtime_abstime() -> bool {
+    let name = b"clock_nanosleep_realtime_abstime\0";
+    if !install_sigalrm_handler() { return report(name, false); }
+    alarm(1);
+    let t0 = now_ns();
+    let target = ts_from_ns(realtime_ns() + 20_000_000);
+    let r = syscall(nr::CLOCK_NANOSLEEP, CLOCK_REALTIME as c_long, 1 as c_long,
+                    &target as *const timespec as c_long, 0 as c_long);
+    let dt = now_ns() - t0;
+    alarm(0);
+    print_kv(b"  clock_nanosleep_realtime_ns=\0", dt.max(0) as u64);
+    report(name, r == 0 && dt >= 20_000_000 && dt < 20_000_000 + LATE_BOUND_NS)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

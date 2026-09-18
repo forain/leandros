@@ -283,8 +283,9 @@ pub struct Task {
     pub kernel_stack: usize,
     /// IPC port this task is sleeping on (Some when state == Blocked on IPC).
     pub blocked_on:   Option<u32>,
-    /// Absolute tick at which a timed poll/select/epoll_wait/nanosleep waiter
-    /// (blocked_on == POLL_WAIT_CHANNEL) must be woken; `u64::MAX` = no deadline
+    /// Absolute `monotonic_ns()` instant at which a timed poll/select/
+    /// epoll_wait/nanosleep waiter (blocked_on == POLL_WAIT_CHANNEL) must be
+    /// woken; `u64::MAX` = no deadline
     /// (an infinite/edge-only waiter). Set atomically with `state`/`blocked_on`
     /// when the task parks and cleared on wake, so the 100 Hz poll-deadline tick
     /// can find the true earliest deadline by scanning the run queue — a

@@ -2474,23 +2474,22 @@ fn syncobj_read_handles(ptr: u64, count: u32) -> Result<Vec<u32>, DriverError> {
 ///
 /// `None` means "do not block at all" — upstream's `drm_timeout_abs_to_jiffies`
 /// returns 0 for a zero/negative timeout *and* for one already in the past, and
-/// a zero timeout is documented there as "make 0 timeout mean poll". Rounding
-/// **up** to the next tick is what keeps a sub-tick timeout from degenerating
-/// into a busy-poll loop that never sleeps; the same truncation-to-zero bug in
-/// `nanosleep` (`fb398c7`) is on record in this tree.
+/// a zero timeout is documented there as "make 0 timeout mean poll".
 ///
 /// The clock is `arch_monotonic_ns`, which is literally the same
 /// `timer::monotonic_ns` that backs `sys_clock_gettime(CLOCK_MONOTONIC)` — the
-/// clock userspace computed the absolute deadline from. If those two ever
-/// diverge, every syncobj wait either times out instantly or hangs forever.
-fn syncobj_deadline_ticks(timeout_nsec: i64) -> Option<u64> {
+/// clock userspace computed the absolute deadline from, and the clock every
+/// scheduler wait deadline is expressed in (`sched::monotonic_ns`), so the
+/// absolute value is the deadline: no tick conversion, no rounding. A sub-tick
+/// timeout parks until the first tick at or after the instant, which is what
+/// keeps it from degenerating into a busy-poll loop that never sleeps (the
+/// `nanosleep` truncation-to-zero bug, `fb398c7`, is on record in this tree).
+fn syncobj_deadline_ns(timeout_nsec: i64) -> Option<u64> {
     if timeout_nsec <= 0 { return None; }
     let abs = timeout_nsec as u64;
     let now = unsafe { arch_monotonic_ns() };
     if abs <= now { return None; }
-    // 100 Hz tick.
-    let rel_ticks = (abs - now) / 10_000_000 + 1;
-    Some(sched::ticks().checked_add(rel_ticks).unwrap_or(u64::MAX))
+    Some(abs)
 }
 
 /// One evaluation of a whole WAIT predicate.
@@ -6359,11 +6358,11 @@ impl DrmDeviceInterface {
         if probe(fence)? { return Ok(0); }
         if w.flags & VIRTGPU_WAIT_NOWAIT != 0 { return Err(DriverError::Io); }
 
-        let dl = sched::ticks().wrapping_add(15 * 100);
+        let dl = sched::monotonic_ns().saturating_add(15_000_000_000);
         let tag = sched::poll_tag(sched::poll_class::DRM, FENCE_POLL_INDEX);
         FENCE_WAITERS.fetch_add(1, Ordering::Relaxed);
         let outcome = loop {
-            if sched::ticks() >= dl { break Err(DriverError::Io); }
+            if sched::monotonic_ns() >= dl { break Err(DriverError::Io); }
             if sched::has_deliverable_signal() { break Err(DriverError::Io); }
             sched::block_on_poll_prepare_masked(dl, tag);
             match probe(fence) {
@@ -6371,7 +6370,7 @@ impl DrmDeviceInterface {
                 Ok(true) => { sched::block_on_poll_cancel(); break Ok(0); }
                 Ok(false) => {}
             }
-            if sched::ticks() >= dl || sched::has_deliverable_signal() {
+            if sched::monotonic_ns() >= dl || sched::has_deliverable_signal() {
                 sched::block_on_poll_cancel();
                 continue;
             }
@@ -6522,7 +6521,7 @@ impl DrmDeviceInterface {
         let for_submit = w.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0;
         // WAIT_DEADLINE only asks the driver to *boost* toward the deadline.
         // We have no scheduler to boost, so honouring it is a no-op.
-        let deadline = syncobj_deadline_ticks(w.timeout_nsec);
+        let deadline = syncobj_deadline_ns(w.timeout_nsec);
 
         SYNCOBJ_WAITERS.fetch_add(1, Ordering::Relaxed);
         let outcome = loop {
@@ -6537,7 +6536,7 @@ impl DrmDeviceInterface {
                 None => break Err(DriverError::Busy), // ETIME
                 Some(d) => d,
             };
-            if sched::ticks() >= dl { break Err(DriverError::Busy); }
+            if sched::monotonic_ns() >= dl { break Err(DriverError::Busy); }
             // Upstream sleeps TASK_INTERRUPTIBLE and answers -ERESTARTSYS.
             // Returning EINTR is the honest equivalent at this seam; the
             // deadline is absolute, so a caller that restarts the ioctl waits
@@ -6549,7 +6548,7 @@ impl DrmDeviceInterface {
                 syncobj_probe(&handles, open_id, wait_all, for_submit),
                 Ok(None)
             );
-            if ready || sched::ticks() >= dl || sched::has_deliverable_signal() {
+            if ready || sched::monotonic_ns() >= dl || sched::has_deliverable_signal() {
                 sched::block_on_poll_cancel();
                 continue;
             }
@@ -6945,7 +6944,7 @@ impl DrmDeviceInterface {
         let deadline = if timeout_ns == 0 {
             None
         } else {
-            syncobj_deadline_ticks(start_ns.saturating_add(timeout_ns).min(i64::MAX as u64) as i64)
+            syncobj_deadline_ns(start_ns.saturating_add(timeout_ns).min(i64::MAX as u64) as i64)
         };
 
         // Registered in the SYNCOBJ waiter count on purpose: that counter is
@@ -6960,14 +6959,14 @@ impl DrmDeviceInterface {
                 None => break Err(DriverError::Busy), // ETIME — pure poll
                 Some(d) => d,
             };
-            if sched::ticks() >= dl { break Err(DriverError::Busy); }
+            if sched::monotonic_ns() >= dl { break Err(DriverError::Busy); }
             // Upstream sleeps interruptibly and answers -ERESTARTSYS; EINTR is
             // the honest equivalent at this seam, and the deadline written back
             // below is what makes a restart wait only the remainder.
             if sched::has_deliverable_signal() { break Err(DriverError::Io); }
 
             sched::block_on_poll_prepare_until(dl);
-            if v3d_fence_done(fence) || sched::ticks() >= dl || sched::has_deliverable_signal() {
+            if v3d_fence_done(fence) || sched::monotonic_ns() >= dl || sched::has_deliverable_signal() {
                 sched::block_on_poll_cancel();
                 continue;
             }

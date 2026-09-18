@@ -71,8 +71,8 @@ pub const VFS_FTRUNCATE:   u64 = 0x21; // ftruncate(fd, length) — set file siz
 pub const VFS_RENAME:      u64 = 0x22; // rename(old_ptr, new_ptr) — rename /tmp file
 pub const VFS_FD_PATH:     u64 = 0x23; // fd_path(fd, buf_ptr, buf_len) → len or -errno
 pub const VFS_EVENTFD:     u64 = 0x24; // eventfd2(initval, flags) → fd or -errno
-pub const VFS_TIMERFD_CREATE:  u64 = 0x25; // timerfd_create(clockid) → fd
-pub const VFS_TIMERFD_SETTIME: u64 = 0x26; // timerfd_settime(fd, deadline_ns (absolute monotonic; 0 = disarm), interval_ns)
+pub const VFS_TIMERFD_CREATE:  u64 = 0x25; // timerfd_create(flags, clockid) → fd
+pub const VFS_TIMERFD_SETTIME: u64 = 0x26; // timerfd_settime(fd, value_ns (0 = disarm), interval_ns, absolute: bool)
 pub const VFS_TIMERFD_GETTIME: u64 = 0x27; // timerfd_gettime(fd, out_ptr)
 pub const VFS_IOCTL:           u64 = 0x28; // ioctl(fd, cmd, arg) → result or -errno
 pub const VFS_RMDIR:           u64 = 0x29; // rmdir(path_ptr) → 0 or -errno
@@ -1561,17 +1561,23 @@ const MAX_TIMERFDS: usize = 256;
 
 #[derive(Clone, Copy)]
 struct TimerFdEntry {
-    armed:          bool,
-    deadline_ticks: u64,   // absolute tick when next expiration fires
-    interval_ticks: u64,   // 0 = one-shot
-    expirations:    u64,   // accumulated unread expiration count
+    armed:        bool,
+    /// Absolute `sched::monotonic_ns()` instant of the next expiration. The
+    /// deadline lives on the monotonic clock whatever `clockid` says: a
+    /// CLOCK_REALTIME absolute value is translated at settime.
+    deadline_ns:  u64,
+    interval_ns:  u64,   // 0 = one-shot
+    expirations:  u64,   // accumulated unread expiration count
+    /// CLOCK_REALTIME (0) or CLOCK_MONOTONIC (1): decides how a
+    /// TFD_TIMER_ABSTIME `it_value` is read at settime.
+    clockid:      u32,
 }
 
 impl TimerFdEntry {
     const fn free() -> Self {
-        Self { armed: false, deadline_ticks: 0, interval_ticks: 0, expirations: 0 }
+        Self { armed: false, deadline_ns: 0, interval_ns: 0, expirations: 0, clockid: 1 }
     }
-    const fn is_free(&self) -> bool { !self.armed && self.deadline_ticks == 0 && self.expirations == 0 }
+    const fn is_free(&self) -> bool { !self.armed && self.deadline_ns == 0 && self.expirations == 0 }
 }
 
 static TIMERFD_POOL: Mutex<[TimerFdEntry; MAX_TIMERFDS]> =
@@ -1579,7 +1585,7 @@ static TIMERFD_POOL: Mutex<[TimerFdEntry; MAX_TIMERFDS]> =
 /// Per-slot fd refcount for timerfds — same dup-aliasing hazard as EVENTFD_REFS.
 static TIMERFD_REFS: Mutex<[u32; MAX_TIMERFDS]> = Mutex::new([0u32; MAX_TIMERFDS]);
 
-/// Recompute a timerfd's pending-expiration count against the current tick,
+/// Recompute a timerfd's pending-expiration count against the monotonic clock,
 /// folding any missed periods into `expirations` and rearming the deadline —
 /// the same catch-up logic `handle_read`'s `TimerFd` arm used to run inline.
 /// Non-consuming: callers that read the count (rather than just probing
@@ -1587,15 +1593,15 @@ static TIMERFD_REFS: Mutex<[u32; MAX_TIMERFDS]> = Mutex::new([0u32; MAX_TIMERFDS
 /// Shared with `handle_ioctl`'s `FIONREAD` and `handle_poll` so neither can
 /// under-report an expiry that hasn't been read yet.
 fn timerfd_poll_expirations(slot: usize) -> u64 {
-    let now = sched::ticks();
+    let now = sched::monotonic_ns();
     let mut pool = TIMERFD_POOL.lock();
     let e = &mut pool[slot];
-    if e.armed && now >= e.deadline_ticks {
-        let elapsed = now - e.deadline_ticks;
-        let extra = if e.interval_ticks > 0 { elapsed / e.interval_ticks + 1 } else { 1 };
+    if e.armed && now >= e.deadline_ns {
+        let elapsed = now - e.deadline_ns;
+        let extra = if e.interval_ns > 0 { elapsed / e.interval_ns + 1 } else { 1 };
         e.expirations += extra;
-        if e.interval_ticks > 0 {
-            e.deadline_ticks += extra * e.interval_ticks;
+        if e.interval_ns > 0 {
+            e.deadline_ns += extra * e.interval_ns;
         } else {
             e.armed = false;
         }
@@ -2246,9 +2252,10 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_SIGNALFD_CREATE  => handle_signalfd_create(caller_pid, arg(msg,0) as usize, arg(msg,1) as u64, arg(msg,2) as u32),
         VFS_INOTIFY_CREATE   => handle_inotify_create(caller_pid, arg(msg,0) as u32),
         VFS_INOTIFY_ADD      => handle_inotify_add(caller_pid, arg(msg,0) as usize),
-        VFS_TIMERFD_CREATE   => handle_timerfd_create(caller_pid, arg(msg,0) as u32),
+        VFS_TIMERFD_CREATE   => handle_timerfd_create(caller_pid, arg(msg,0) as u32, arg(msg,1) as u32),
         VFS_TIMERFD_SETTIME  => handle_timerfd_settime(caller_pid, arg(msg,0) as usize,
-                                                        arg(msg,1) as u64, arg(msg,2) as u64),
+                                                        arg(msg,1) as u64, arg(msg,2) as u64,
+                                                        arg(msg,3) != 0),
         VFS_TIMERFD_GETTIME  => handle_timerfd_gettime(caller_pid, arg(msg,0) as usize,
                                                         arg(msg,1) as usize),
         VFS_IOCTL            => handle_ioctl(caller_pid, arg(msg,0) as usize,
@@ -5187,7 +5194,7 @@ fn handle_fcntl_lock(pid: u32, kind: VnodeKind, cmd: usize, arg: usize) -> Messa
         if cmd == F_SETLK { return err_reply(-11); } // EAGAIN
         // No release wakes a lock waiter; re-probe on the tick (10 ms) rather
         // than spin a CPU for the whole hold.
-        sched::block_on_poll_prepare_until(sched::ticks() + 1);
+        sched::block_on_poll_prepare_until(sched::monotonic_ns() + 10_000_000);
         sched::block_on_poll_commit();
     }
 }
@@ -5229,7 +5236,7 @@ fn handle_flock(pid: u32, fd: usize, op: u32) -> Message {
         }
         drop(locks);
         if nonblock { return err_reply(-11); } // EWOULDBLOCK
-        sched::block_on_poll_prepare_until(sched::ticks() + 1); // see F_SETLKW above
+        sched::block_on_poll_prepare_until(sched::monotonic_ns() + 10_000_000); // see F_SETLKW above
         sched::block_on_poll_commit();
     }
 }
@@ -6032,7 +6039,7 @@ fn handle_inotify_add(pid: u32, fd: usize) -> Message {
     }
 }
 
-fn handle_timerfd_create(pid: u32, flags: u32) -> Message {
+fn handle_timerfd_create(pid: u32, flags: u32, clockid: u32) -> Message {
     // Preserve TFD_NONBLOCK/TFD_CLOEXEC (== O_NONBLOCK/O_CLOEXEC). The polling
     // crate (calloop's poller) reads its timeout timerfd expecting EAGAIN before
     // it fires; without the recorded O_NONBLOCK the kernel read yield-spins,
@@ -6043,7 +6050,8 @@ fn handle_timerfd_create(pid: u32, flags: u32) -> Message {
         Some(s) => s, None => return err_reply(-24),
     };
     pool[slot] = TimerFdEntry::free();
-    pool[slot].deadline_ticks = 1;
+    pool[slot].deadline_ns = 1;
+    pool[slot].clockid = clockid;
     drop(pool);
     TIMERFD_REFS.lock()[slot] = 1;
     let mut tbls = FD_TABLES.lock();
@@ -6057,57 +6065,64 @@ fn handle_timerfd_create(pid: u32, flags: u32) -> Message {
     val_reply(fd as u64)
 }
 
-/// Arm (or disarm, `deadline_ns == 0`) a timerfd.
+/// Arm (or disarm, `value_ns == 0`) a timerfd.
 ///
-/// `deadline_ns` is ABSOLUTE on the monotonic clock `clock_gettime` reports
-/// (`ticks × 10 ms + sub-tick fraction`); the kernel has already added a
-/// relative `it_value` to the current reading (see `sys_timerfd_settime`).
-/// The deadline tick is the first tick at or after that instant — rounded
-/// UP like `sys_clock_nanosleep`'s absolute path and the FUTEX_WAIT_BITSET
-/// deadline, so a timerfd is never observed expired before the instant it
-/// was armed for.
+/// `value_ns` is `it_value`: with `absolute` it is an instant on the fd's own
+/// clock (CLOCK_MONOTONIC as `clock_gettime` reports it, or CLOCK_REALTIME,
+/// translated through `sched::realtime_to_monotonic_ns`); otherwise it is an
+/// interval added to `sched::monotonic_ns()` NOW — not to the tick counter,
+/// which ignores the fraction of the tick already elapsed and fired up to
+/// 10 ms early by clock_gettime's reckoning. Linux converts relative to
+/// absolute at settime for the same reason. The stored deadline is always a
+/// monotonic instant, compared exactly (nanoseconds) by the poll-deadline
+/// tick, so a timerfd is never observed expired before the instant it was
+/// armed for; the tick only bounds how late (≤ 10 ms) the wake can be.
 ///
 /// A deadline already in the past is not an error and not a disarm: the
 /// timer fires immediately (one expiration for a one-shot; for a periodic
 /// timer the missed periods are counted as overruns by
 /// `timerfd_poll_expirations`, as Linux's `hrtimer_forward_now` does).
-fn handle_timerfd_settime(pid: u32, fd: usize, deadline_ns: u64, interval_ns: u64) -> Message {
+fn handle_timerfd_settime(pid: u32, fd: usize, value_ns: u64, interval_ns: u64, absolute: bool) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
     let slot = match tbl.fds[fd].kind { VnodeKind::TimerFd { slot } => slot, _ => return err_reply(-22) };
     drop(tbls);
-    const NS_PER_TICK: u64 = 10_000_000;
+    const CLOCK_REALTIME: u32 = 0;
     let mut pool = TIMERFD_POOL.lock();
     let e = &mut pool[slot];
-    if deadline_ns == 0 { e.armed = false; e.expirations = 0; }
+    if value_ns == 0 { e.armed = false; e.expirations = 0; }
     else {
         e.armed = true;
-        // `.max(1)`: deadline_ticks == 0 is the free-slot sentinel
-        // (`is_free`), and a deadline under one tick would otherwise make a
-        // live fd's slot look reclaimable once its expiry has been read.
-        e.deadline_ticks = deadline_ns.div_ceil(NS_PER_TICK).max(1);
-        // Sub-tick periodic interval must round up, not down to one-shot:
-        // interval_ticks == 0 means one-shot, so any nonzero interval_ns
-        // shorter than NS_PER_TICK has to floor at 1 tick, not truncate to 0.
-        e.interval_ticks = if interval_ns > 0 { (interval_ns / NS_PER_TICK).max(1) } else { 0 };
+        let deadline = if !absolute {
+            sched::monotonic_ns().saturating_add(value_ns)
+        } else if e.clockid == CLOCK_REALTIME {
+            sched::realtime_to_monotonic_ns(value_ns)
+        } else {
+            value_ns
+        };
+        // `.max(1)`: deadline_ns == 0 is the free-slot sentinel (`is_free`),
+        // and an already-due deadline would otherwise make a live fd's slot
+        // look reclaimable once its expiry has been read.
+        e.deadline_ns = deadline.max(1);
+        e.interval_ns = interval_ns;
         e.expirations = 0;
     }
-    let armed_deadline = if e.armed { Some(e.deadline_ticks) } else { None };
+    let armed_deadline = if e.armed { Some(e.deadline_ns) } else { None };
     drop(pool);
     // Publish the expiry so the poll-deadline tick wakes an epoll_wait(-1)
     // waiter parked on this timerfd (K2). If it is already due, wake now.
     if let Some(d) = armed_deadline {
         sched::register_poll_deadline(d);
-        if sched::ticks() >= d {
+        if sched::monotonic_ns() >= d {
             sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::TIMERFD, slot as u32));
         }
     }
     ok_reply()
 }
 
-/// Earliest absolute tick at which any armed timerfd next expires (u64::MAX =
-/// none). Folded into the K2 poll-deadline tick so a periodic timerfd nobody
+/// Earliest absolute `sched::monotonic_ns()` instant at which any armed timerfd
+/// next expires (u64::MAX = none). Folded into the K2 poll-deadline tick so a periodic timerfd nobody
 /// re-arms still fires, and an epoll_wait(-1) waiter on a timerfd wakes on
 /// time with no per-tick wake_poll. try_lock only (tick contract): a contended
 /// scan just defers this tick's decision ≤10 ms.
@@ -6116,7 +6131,7 @@ pub fn earliest_timerfd_deadline() -> u64 {
         Some(pool) => {
             let mut m = u64::MAX;
             for e in pool.iter() {
-                if e.armed && e.deadline_ticks < m { m = e.deadline_ticks; }
+                if e.armed && e.deadline_ns < m { m = e.deadline_ns; }
             }
             m
         }
@@ -6146,12 +6161,12 @@ pub fn fold_expired_timerfds(now: u64) -> u64 {
     let mut pool = match TIMERFD_POOL.try_lock() { Some(p) => p, None => return 0 };
     let mut tags = 0u64;
     for (slot, e) in pool.iter_mut().enumerate() {
-        if e.armed && now >= e.deadline_ticks {
-            let elapsed = now - e.deadline_ticks;
-            if e.interval_ticks > 0 {
-                let extra = elapsed / e.interval_ticks + 1;
+        if e.armed && now >= e.deadline_ns {
+            let elapsed = now - e.deadline_ns;
+            if e.interval_ns > 0 {
+                let extra = elapsed / e.interval_ns + 1;
                 e.expirations += extra;
-                e.deadline_ticks += extra * e.interval_ticks; // stays armed, next future tick
+                e.deadline_ns += extra * e.interval_ns; // stays armed, next future instant
             } else {
                 e.expirations += 1;
                 e.armed = false; // one-shot: retire (expiry preserved in `expirations`)
@@ -6169,12 +6184,11 @@ fn handle_timerfd_gettime(pid: u32, fd: usize, out_ptr: usize) -> Message {
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
     let slot = match tbl.fds[fd].kind { VnodeKind::TimerFd { slot } => slot, _ => return err_reply(-22) };
     drop(tbls);
-    const NS_PER_TICK: u64 = 10_000_000;
     let pool = TIMERFD_POOL.lock();
     let e = &pool[slot];
-    let now = sched::ticks();
-    let remaining_ns = if e.armed && e.deadline_ticks > now { (e.deadline_ticks - now) * NS_PER_TICK } else { 0 };
-    let interval_ns = e.interval_ticks * NS_PER_TICK;
+    let now = sched::monotonic_ns();
+    let remaining_ns = if e.armed && e.deadline_ns > now { e.deadline_ns - now } else { 0 };
+    let interval_ns = e.interval_ns;
     drop(pool);
     unsafe {
         let p = out_ptr as *mut i64;

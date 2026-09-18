@@ -6,6 +6,7 @@ pub mod exception;
 pub mod gic;
 pub mod mmu;
 pub mod paging;
+pub mod rtc;
 pub mod smp;
 pub mod timer;
 pub mod uart;
@@ -164,6 +165,10 @@ pub fn init(boot_info: &boot::BootInfo) {
                 let phys = gic::GICR_BASE + off;
                 paging::map_4k(root_phys as *mut u64, phys + hhdm, phys, device_flags);
             }
+            // PL031 RTC: one page, the wall-clock epoch (virt only, like the
+            // GICv3 frames above — the Pi boards have no battery clock).
+            paging::map_4k(root_phys as *mut u64, rtc::BASE + hhdm, rtc::BASE, device_flags);
+            rtc::set_base(rtc::BASE + hhdm);
         }
         if boot_info.framebuffer_base != 0 {
             let fb_start_phys = boot_info.framebuffer_base as usize & !4095;

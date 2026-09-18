@@ -13,6 +13,8 @@ pub mod apic;
 #[cfg(target_arch = "x86_64")]
 pub mod pic;
 #[cfg(target_arch = "x86_64")]
+pub mod rtc;
+#[cfg(target_arch = "x86_64")]
 pub mod smp;
 #[cfg(target_arch = "x86_64")]
 pub mod syscall;

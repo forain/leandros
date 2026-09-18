@@ -696,6 +696,58 @@ pub fn ticks() -> u64 {
     TIMER_TICKS.load(Ordering::Relaxed)
 }
 
+/// CLOCK_MONOTONIC in nanoseconds: the architecture's free-running counter
+/// (CNTVCT_EL0 / TSC) against the boot epoch, sub-tick, never decreasing.
+///
+/// This is THE monotonic source for every timed wait in the kernel. Every
+/// `poll_deadline`, `NEXT_POLL_DEADLINE`, timerfd deadline and futex timeout
+/// is an absolute reading of this clock, and `service_poll_deadlines` compares
+/// them against it on each tick. Deadlines used to be tick counts: a relative
+/// timeout was floored to whole ticks (so any wait under 10 ms became 0 and
+/// returned at once) and a deadline of "tick N" was released at tick N's edge
+/// — up to 10 ms before the requested interval had elapsed on the clock
+/// userspace measures with. A deadline in nanoseconds keeps the POSIX "at
+/// least this long" guarantee; the 100 Hz tick still bounds how *late* a wake
+/// can be (≤ one tick), not how early.
+#[inline]
+pub fn monotonic_ns() -> u64 {
+    unsafe { arch_monotonic_ns() }
+}
+
+/// `CLOCK_REALTIME - CLOCK_MONOTONIC`, in nanoseconds (signed: a wall clock
+/// stepped backwards below the boot instant is representable). 0 until
+/// `set_realtime_offset_ns` runs at boot (from the board's battery clock) or
+/// `clock_settime`/`settimeofday` steps the wall clock, so on a board with no
+/// RTC the realtime epoch is the boot instant.
+static REALTIME_OFFSET_NS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+/// CLOCK_REALTIME in nanoseconds since the Unix epoch: the ONE wall clock.
+/// `clock_gettime(CLOCK_REALTIME)`, `gettimeofday`, `time` and every
+/// CLOCK_REALTIME deadline (timerfd, clock_nanosleep, FUTEX_CLOCK_REALTIME)
+/// derive from this, so they can never drift apart — they used to be two
+/// clocks (`ticks × 10 ms` vs the counter), up to 10 ms apart.
+#[inline]
+pub fn realtime_ns() -> u64 {
+    let off = REALTIME_OFFSET_NS.load(Ordering::Relaxed);
+    (monotonic_ns() as i64).saturating_add(off).max(0) as u64
+}
+
+pub fn realtime_offset_ns() -> i64 { REALTIME_OFFSET_NS.load(Ordering::Relaxed) }
+
+/// Step the wall clock so that CLOCK_REALTIME reads `realtime_ns` NOW.
+pub fn set_realtime_ns(realtime_ns: u64) {
+    let off = (realtime_ns as i64).saturating_sub(monotonic_ns() as i64);
+    REALTIME_OFFSET_NS.store(off, Ordering::Relaxed);
+}
+
+/// Convert an absolute CLOCK_REALTIME instant into the monotonic reading the
+/// wait machinery compares against (saturating at 0 = already due).
+#[inline]
+pub fn realtime_to_monotonic_ns(realtime_ns: u64) -> u64 {
+    let off = REALTIME_OFFSET_NS.load(Ordering::Relaxed);
+    (realtime_ns as i64).saturating_sub(off).max(0) as u64
+}
+
 /// Deliver `signo` to the single *thread* `pid`, carrying `info` as its
 /// `siginfo_t` payload.
 ///
@@ -1438,8 +1490,8 @@ pub const fn poll_tag(class: u32, index: u32) -> u64 {
 /// the task, not a clobber-prone global.
 pub fn block_on_poll_prepare() { block_on_poll_prepare_until(u64::MAX) }
 
-/// Phase 1 for a timed waiter: publish Blocked-on-poll AND the absolute-tick
-/// wake deadline atomically (one RUN_QUEUE hold), then fold the deadline into
+/// Phase 1 for a timed waiter: publish Blocked-on-poll AND the absolute
+/// `monotonic_ns()` wake deadline atomically (one RUN_QUEUE hold), then fold the deadline into
 /// the global `NEXT_POLL_DEADLINE` hint (lock-free) so the tick's fast path can
 /// skip the run-queue scan while nothing is due. The task field is the
 /// authority; the hint is only an optimisation the tick recomputes exactly.
@@ -1572,6 +1624,8 @@ pub fn try_wake_poll_tagged(tag: u64) -> bool {
 /// lock-free, but its authoritative value is its own task field, set under this
 /// same lock next time it parks) after the recompute — nothing to clobber.
 ///
+/// `now` is a `monotonic_ns()` reading; every deadline is one too.
+///
 /// Non-blocking (try_lock) for the tick's contract; a contended tick leaves the
 /// hint and retries next tick (≤10 ms defer, within the timeout granularity).
 pub fn service_poll_deadlines(now: u64, timerfd_due: bool) -> bool {
@@ -1588,8 +1642,8 @@ pub fn service_poll_deadlines(now: u64, timerfd_due: bool) -> bool {
     }
 }
 
-/// Earliest absolute tick at which a timed poll/select/epoll_wait waiter wants
-/// to be re-woken (u64::MAX = no timed waiter). This is a lock-free HINT that
+/// Earliest absolute `monotonic_ns()` instant at which a timed poll/select/
+/// epoll_wait waiter wants to be re-woken (u64::MAX = no timed waiter). This is a lock-free HINT that
 /// lets `poll_deadline_tick` skip the run-queue scan while nothing is due; the
 /// authoritative deadlines live in each `Task::poll_deadline`, and the tick
 /// recomputes this hint exactly under RUN_QUEUE in `service_poll_deadlines`. A
@@ -2520,8 +2574,8 @@ pub fn dump_tasks() {
         if let Some(c) = t.on_cpu { print_str(" cpu="); pn(c as u32); }
         if let Some(port) = t.blocked_on {
             if port == POLL_WAIT_CHANNEL {
-                print_str(" on=poll dl=");
-                if t.poll_deadline == u64::MAX { print_str("inf"); } else { pn(t.poll_deadline as u32); }
+                print_str(" on=poll dl_ms=");
+                if t.poll_deadline == u64::MAX { print_str("inf"); } else { pn((t.poll_deadline / 1_000_000) as u32); }
             } else {
                 print_str(" on=port:"); pn(port);
             }
@@ -2537,11 +2591,12 @@ pub fn dump_tasks() {
                 let v = unsafe { (mm::phys_to_virt(phys) as *const u32).read_volatile() };
                 print_str("="); ph(v as usize);
             }
-            // A timed waiter's deadline, in ticks: with `tick=` at the top of
-            // the dump this shows a wait that will outlive its caller's
-            // intent (the FUTEX_WAIT_BITSET absolute/relative confusion made
-            // every std timed wait last uptime + timeout).
-            if t.poll_deadline != u64::MAX { print_str(" dl="); pn(t.poll_deadline as u32); }
+            // A timed waiter's deadline, in ms of CLOCK_MONOTONIC: against
+            // `tick=` × 10 at the top of the dump this shows a wait that will
+            // outlive its caller's intent (the FUTEX_WAIT_BITSET absolute/
+            // relative confusion made every std timed wait last uptime +
+            // timeout).
+            if t.poll_deadline != u64::MAX { print_str(" dl_ms="); pn((t.poll_deadline / 1_000_000) as u32); }
         }
         if t.vfork_pending { print_str(" vfork_pending"); }
         // Last syscall entered by this pid and whether it is still inside it.

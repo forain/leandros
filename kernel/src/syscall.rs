@@ -343,6 +343,8 @@ mod nr {
     pub const CLOCK_NANOSLEEP: usize = 115;
     pub const NANOSLEEP:      usize = 101;
     pub const GETTIMEOFDAY:   usize = 169;
+    pub const SETTIMEOFDAY:   usize = 170;
+    pub const CLOCK_SETTIME:  usize = 112;
     pub const SYSINFO:        usize = 179;
     pub const GETRLIMIT:      usize = 163;
     pub const SETRLIMIT:      usize = 164;
@@ -556,6 +558,8 @@ mod nr {
     pub const CLOCK_NANOSLEEP: usize = 230;
     pub const NANOSLEEP:      usize = 35;
     pub const GETTIMEOFDAY:   usize = 96;
+    pub const SETTIMEOFDAY:   usize = 164;
+    pub const CLOCK_SETTIME:  usize = 227;
     pub const SYSINFO:        usize = 99;
     pub const TIME:           usize = 201;
     pub const GETRLIMIT:      usize = 97;
@@ -1361,6 +1365,8 @@ fn dispatch_inner(
         TIMERFD_SETTIME => sys_timerfd_settime(a0, a1, a2, a3),
         TIMERFD_GETTIME => sys_timerfd_gettime(a0, a1),
         GETTIMEOFDAY => sys_gettimeofday(a0, a1),
+        SETTIMEOFDAY => sys_settimeofday(a0, a1),
+        CLOCK_SETTIME => sys_clock_settime(a0, a1),
         SYSINFO      => sys_sysinfo(a0),
         SENDFILE     => sys_sendfile(a0, a1, a2, a3),
         // copy_file_range(fd_in, off_in, fd_out, off_out, len, flags) puts the
@@ -1396,10 +1402,12 @@ fn dispatch_inner(
         TIME         => sys_time(a0),
 
         // ── poll / select / epoll (Phase 9) ───────────────────────────────────
-        SELECT | PSELECT6 => sys_select(a0, a1, a2, a3, a4),
+        SELECT   => sys_select(a0, a1, a2, a3, a4, false),
+        PSELECT6 => sys_select(a0, a1, a2, a3, a4, true),
         EPOLL_CREATE1  => sys_epoll_create1(a0),
         EPOLL_CTL      => sys_epoll_ctl(a0, a1, a2, a3),
-        EPOLL_PWAIT | EPOLL_PWAIT2 => sys_epoll_wait(a0, a1, a2, a3),
+        EPOLL_PWAIT  => sys_epoll_wait(a0, a1, a2, a3),
+        EPOLL_PWAIT2 => sys_epoll_pwait2(a0, a1, a2, a3),
         EVENTFD2       => sys_eventfd2(a0, a1),
         SIGNALFD4      => sys_signalfd4(a0, a1, a2, a3),
 
@@ -2137,7 +2145,7 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
                 // (e.g. a compositor that runs for the session) at 100 % CPU —
                 // init/shell waiters stayed perpetually runnable, churning the
                 // scheduler run-loop and starving the very child's event loop.
-                sched::block_on_poll_prepare_until(sched::ticks() + 2);
+                sched::block_on_poll_prepare_until(sched::monotonic_ns() + 20_000_000);
                 if matches!(sched::wait_peek(sel, caller_tgid, what), sched::WaitTry::StillRunning)
                     && !interrupted() {
                     sched::block_on_poll_commit();
@@ -2230,7 +2238,7 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
                 // a service) otherwise pins its blocking-waitid reaper at
                 // 100 % CPU. Woken by child-exit SIGCHLD -> wake_poll; the
                 // 2-tick poll deadline bounds a missed edge to ~20 ms.
-                sched::block_on_poll_prepare_until(sched::ticks() + 2);
+                sched::block_on_poll_prepare_until(sched::monotonic_ns() + 20_000_000);
                 let peek = sched::wait_peek(sel, caller_tgid, what);
                 if !matches!(peek, sched::WaitTry::StillRunning) || interrupted() {
                     sched::block_on_poll_cancel();
@@ -2283,15 +2291,12 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
         unsafe { core::ptr::read(set_ptr as *const u64) }
     } else { !0u64 };
 
-    // Compute deadline from timespec (tv_sec + tv_nsec).
+    // Absolute monotonic deadline from the relative timespec ({0,0} = poll
+    // once: the deadline is "now" and the check below fires at once).
     let deadline = if timeout_ptr != 0 && validate_user_buf(timeout_ptr, 16) {
-        let tv_sec  = unsafe { core::ptr::read(timeout_ptr as *const i64) };
-        let tv_nsec = unsafe { core::ptr::read((timeout_ptr + 8) as *const i64) };
-        if tv_sec == 0 && tv_nsec == 0 {
-            Some(ticks()) // zero timeout = poll only
-        } else {
-            let ticks_val = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
-            Some(ticks() + ticks_val.max(1))
+        match read_user_timespec(timeout_ptr) {
+            Ok(ns) => Some(deadline_after_ns(ns)),
+            Err(e) => return e,
         }
     } else {
         None // no timeout — wait indefinitely
@@ -2323,7 +2328,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
         }
         if let Some(dl) = deadline {
             // EAGAIN: POSIX and Linux report an expired wait this way, not ETIMEDOUT.
-            if ticks() >= dl { return -11; }
+            if monotonic_ns() >= dl { return -11; }
         }
         // Park (see sys_rt_sigsuspend); the deadline rides the poll tick.
         sched::block_on_poll_prepare_until(deadline.unwrap_or(u64::MAX));
@@ -2341,37 +2346,99 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
 /// wake-up for up to 10 ms — while virglrenderer's ring thread re-idles after
 /// 1 ms and, once idle, waits only on that notification and never re-checks the
 /// ring. That is the whole `vktest`-under-TCG hang.
+///
+/// This is `sched::monotonic_ns()`: the ONE monotonic source. Every timed wait
+/// in this file (nanosleep, poll/ppoll/select/epoll_wait, FUTEX_WAIT,
+/// rt_sigtimedwait, timerfd) expresses its deadline as an absolute reading of
+/// this clock, and the poll-deadline tick compares against the same reading.
+/// They used to be tick counts: a relative timeout was floored to whole ticks
+/// (any wait under 10 ms became 0 and returned at once) and a deadline of
+/// "tick N" was released at N's edge — up to 10 ms before the requested
+/// interval had elapsed by `clock_gettime`'s reckoning.
 #[inline]
-fn monotonic_ns() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    { arch_x86_64::timer::monotonic_ns() }
-    #[cfg(target_arch = "aarch64")]
-    { arch_aarch64::timer::monotonic_ns() }
+fn monotonic_ns() -> u64 { sched::monotonic_ns() }
+
+/// CLOCK_REALTIME: the ONE wall clock (see `sched::realtime_ns`). Read from
+/// the board's battery clock once at boot (`time_init`), steppable with
+/// clock_settime/settimeofday, and otherwise `monotonic_ns` plus a constant.
+#[inline]
+fn realtime_ns() -> u64 { sched::realtime_ns() }
+
+const CLOCK_REALTIME:           usize = 0;
+const CLOCK_MONOTONIC:          usize = 1;
+const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
+const CLOCK_THREAD_CPUTIME_ID:  usize = 3;
+const CLOCK_MONOTONIC_RAW:      usize = 4;
+const CLOCK_REALTIME_COARSE:    usize = 5;
+const CLOCK_MONOTONIC_COARSE:   usize = 6;
+const CLOCK_BOOTTIME:           usize = 7;
+
+/// Read a user `struct timespec { tv_sec: i64, tv_nsec: i64 }` as nanoseconds.
+/// `Err(-EFAULT)` for a bad pointer, `Err(-EINVAL)` for a negative field or
+/// `tv_nsec >= 1e9` (the checks POSIX requires of every timespec consumer).
+fn read_user_timespec(ptr: usize) -> Result<u64, isize> {
+    if !validate_user_buf(ptr, 16) { return Err(-14); }
+    let tv_sec  = unsafe { core::ptr::read(ptr       as *const i64) };
+    let tv_nsec = unsafe { core::ptr::read((ptr + 8) as *const i64) };
+    if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 { return Err(-22); }
+    Ok((tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(tv_nsec as u64))
 }
 
-/// sys_clock_gettime(clkid, tp_ptr) — write the monotonic clock to user memory.
+/// Write nanoseconds as a user `struct timespec` (pointer already validated).
+fn write_user_timespec(ptr: usize, ns: u64) {
+    unsafe {
+        core::ptr::write(ptr       as *mut i64, (ns / 1_000_000_000) as i64);
+        core::ptr::write((ptr + 8) as *mut i64, (ns % 1_000_000_000) as i64);
+    }
+}
+
+/// Absolute monotonic deadline `rel_ns` from now. Saturates at `u64::MAX`,
+/// which the park API reads as "no deadline" — a 584-year timeout is one.
+#[inline]
+fn deadline_after_ns(rel_ns: u64) -> u64 { monotonic_ns().saturating_add(rel_ns) }
+
+#[inline]
+fn deadline_after_ms(ms: u64) -> u64 { deadline_after_ns(ms.saturating_mul(1_000_000)) }
+
+/// sys_clock_gettime(clkid, tp_ptr).
 ///
-/// `clkid` is ignored (all clocks return the same monotonic reading).
-/// Writes a `struct timespec { tv_sec: i64, tv_nsec: i64 }` at `tp_ptr`.
-/// The 100 Hz tick supplies the whole ticks; `monotonic_ns` interpolates
-/// inside the current one from the architecture's free-running counter.
+/// CLOCK_REALTIME (and _COARSE) is the wall clock; the CPU-time clocks are
+/// real (see `Task::cpu_ns`); MONOTONIC, MONOTONIC_RAW, MONOTONIC_COARSE and
+/// BOOTTIME are all `monotonic_ns` (nothing here suspends, and the raw clock
+/// is not slewed). Unknown ids are EINVAL, as on Linux.
 fn sys_clock_gettime(clkid: usize, tp_ptr: usize) -> isize {
     if !validate_user_ptr_aligned(tp_ptr, 16, 8) { return -14; }
-    const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
-    const CLOCK_THREAD_CPUTIME_ID:  usize = 3;
-    // The CPU-time clocks are real (see `Task::cpu_ns`); every other id is
-    // the monotonic clock (REALTIME has no epoch here).
     let ns = match clkid {
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => realtime_ns(),
         CLOCK_PROCESS_CPUTIME_ID => sched::process_cpu_ns(sched::current_tgid()),
         CLOCK_THREAD_CPUTIME_ID  => sched::thread_cpu_ns(current_pid()),
-        _ => monotonic_ns(),
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => monotonic_ns(),
+        _ => return -22, // EINVAL
     };
-    let tv_sec  = (ns / 1_000_000_000) as i64;
-    let tv_nsec = (ns % 1_000_000_000) as i64;
-    unsafe {
-        core::ptr::write(tp_ptr as *mut i64, tv_sec);
-        core::ptr::write((tp_ptr + 8) as *mut i64, tv_nsec);
-    }
+    write_user_timespec(tp_ptr, ns);
+    0
+}
+
+/// sys_clock_settime(clkid, tp_ptr) — step the wall clock (root only). Only
+/// CLOCK_REALTIME is settable; the monotonic and CPU clocks are EINVAL.
+fn sys_clock_settime(clkid: usize, tp_ptr: usize) -> isize {
+    if clkid != CLOCK_REALTIME { return -22; }
+    let ns = match read_user_timespec(tp_ptr) { Ok(n) => n, Err(e) => return e };
+    if sched::current_euid() != 0 { return -1; } // EPERM
+    sched::set_realtime_ns(ns);
+    0
+}
+
+/// sys_settimeofday(tv_ptr, tz_ptr) — step the wall clock from a `struct
+/// timeval` (root only). The timezone argument is accepted and ignored.
+fn sys_settimeofday(tv_ptr: usize, _tz_ptr: usize) -> isize {
+    if tv_ptr == 0 { return 0; }
+    if !validate_user_buf(tv_ptr, 16) { return -14; }
+    let tv_sec  = unsafe { core::ptr::read(tv_ptr       as *const i64) };
+    let tv_usec = unsafe { core::ptr::read((tv_ptr + 8) as *const i64) };
+    if tv_sec < 0 || tv_usec < 0 || tv_usec >= 1_000_000 { return -22; }
+    if sched::current_euid() != 0 { return -1; } // EPERM
+    sched::set_realtime_ns((tv_sec as u64).saturating_mul(1_000_000_000) + (tv_usec as u64) * 1_000);
     0
 }
 
@@ -2531,17 +2598,20 @@ fn sys_times(buf_ptr: usize) -> isize {
 /// sys_poll(fds_ptr, nfds, timeout_ms) — old-style poll syscall.
 #[cfg(not(target_arch = "aarch64"))]
 fn sys_poll(fds_ptr: usize, nfds: usize, timeout_ms: isize) -> isize {
-    if nfds == 0 { return 0; }
+    // `poll(NULL, 0, ms)` is a portable sleep: nothing to probe, but the
+    // timeout still has to elapse (it used to return 0 at once).
     let sz = nfds.saturating_mul(8);
-    if !validate_user_buf(fds_ptr, sz) { return -14; }
+    if nfds != 0 && !validate_user_buf(fds_ptr, sz) { return -14; }
 
     let pid = current_pid();
 
+    // The low 32 bits are the C `int`; a caller that passed -1 through a
+    // zero-extending register still means "forever".
+    let timeout_ms = timeout_ms as i32;
     let (infinite, deadline) = if timeout_ms < 0 {
         (true, 0)
     } else {
-        let ticks_needed = (timeout_ms as u64) / 10;
-        (false, ticks().wrapping_add(ticks_needed))
+        (false, deadline_after_ms(timeout_ms as u64))
     };
 
     loop {
@@ -2561,7 +2631,7 @@ fn sys_poll(fds_ptr: usize, nfds: usize, timeout_ms: isize) -> isize {
             if revents != 0 && revents != POLLNVAL { nready += 1; }
         }
         if nready > 0 { return nready; }
-        if !infinite && ticks() >= deadline { return 0; }
+        if !infinite && monotonic_ns() >= deadline { return 0; }
         if interrupted() { return -4; } // EINTR
 
         poll_block(infinite, deadline, poll_fds_mask(pid, fds_ptr, nfds), || poll_any_ready(pid, fds_ptr, nfds));
@@ -2579,21 +2649,18 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
     // struct pollfd { fd: i32, events: i16, revents: i16 } = 8 bytes.
     const POLLNVAL: i16 = 0x0020;
 
-    if nfds == 0 { return 0; }
     let sz = nfds.saturating_mul(8);
-    if !validate_user_buf(fds_ptr, sz) { return -14; }
+    if nfds != 0 && !validate_user_buf(fds_ptr, sz) { return -14; }
 
     let pid = current_pid();
 
     let (infinite, deadline) = if timeout_ptr == 0 {
         (true, 0)
     } else {
-        if !validate_user_buf(timeout_ptr, 16) { return -14; }
-        let tv_sec  = unsafe { core::ptr::read(timeout_ptr       as *const i64) };
-        let tv_nsec = unsafe { core::ptr::read((timeout_ptr + 8) as *const i64) };
-        if tv_sec < 0 || tv_nsec < 0 { return -22; } // EINVAL
-        let ticks_needed = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
-        (false, ticks().wrapping_add(ticks_needed))
+        match read_user_timespec(timeout_ptr) {
+            Ok(ns) => (false, deadline_after_ns(ns)),
+            Err(e) => return e,
+        }
     };
 
     loop {
@@ -2612,48 +2679,36 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
             if revents != 0 && revents != POLLNVAL { nready += 1; }
         }
         if nready > 0 { return nready; }
-        if !infinite && ticks() >= deadline { return 0; }
+        if !infinite && monotonic_ns() >= deadline { return 0; }
         if interrupted() { return -4; } // EINTR
 
         poll_block(infinite, deadline, poll_fds_mask(pid, fds_ptr, nfds), || poll_any_ready(pid, fds_ptr, nfds));
     }
 }
 
-/// sys_nanosleep / sys_clock_nanosleep — yield-loop until the requested time
-/// has elapsed (based on tick counter).
+/// sys_nanosleep(rqtp, rmtp) — park until the requested interval has elapsed
+/// on `monotonic_ns`.
 ///
-/// `rqtp_ptr` points to `struct timespec { tv_sec: i64, tv_nsec: i64 }`.
-/// The second argument (`clockid` for clock_nanosleep, or `rmtp` for nanosleep)
-/// is ignored; remaining time is never written back.
+/// POSIX requires nanosleep to suspend for *at least* the requested interval.
+/// The deadline is `now + request` in nanoseconds, compared against the same
+/// clock: a 500 µs request armed 9.9 ms into a tick parks through the next
+/// tick edge (0.1 ms away) and the one after it, rather than returning at the
+/// first edge 400 µs short. Earlier versions counted ticks — a sub-tick request
+/// was first truncated to 0 (Mesa's 160 µs ring backoffs became no-ops and its
+/// 4096-iteration budget elapsed in 17 ms), then rounded up to one tick, which
+/// still fired at the next edge: `sleep(200 ms)` measured 196.9 ms. The tick
+/// bounds how *late* the wake is (≤ 10 ms), never how early.
 fn sys_nanosleep(rqtp_ptr: usize, rmtp_ptr: usize) -> isize {
     if rqtp_ptr == 0 { return 0; }
-    if !validate_user_buf(rqtp_ptr, 16) { return -14; }
-    let tv_sec  = unsafe { core::ptr::read(rqtp_ptr         as *const i64) };
-    let tv_nsec = unsafe { core::ptr::read((rqtp_ptr + 8)   as *const i64) };
-    if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 { return -22; } // EINVAL
-    // Convert to ticks (~100 Hz), rounding UP. POSIX requires nanosleep to
-    // suspend for *at least* the requested interval, so truncating is not a
-    // rounding nicety: it made every sleep shorter than one tick return
-    // immediately. Mesa's ring backoff (vn_relax) sleeps 160/320/640/1280 us,
-    // all under a tick, so all of them became no-ops and its 4096-iteration
-    // budget -- which upstream asserts takes 3.48 s -- elapsed in 17 ms. Its
-    // ring-alive watchdog then fired ~200x early and abort()ed the process,
-    // while the host renderer was still on its normal 3 s re-stamp cycle.
-    // Sleeping a whole tick for a 160 us request is coarse but correct; the
-    // fix for the coarseness is a finer tick or a one-shot timer, not this.
-    let total_ns = (tv_sec as u128) * 1_000_000_000 + (tv_nsec as u128);
-    let ticks_needed = total_ns.div_ceil(10_000_000) as u64;
-    if ticks_needed == 0 { return 0; }
-    sleep_ticks_from(ticks(), ticks_needed, rmtp_ptr)
+    let ns = match read_user_timespec(rqtp_ptr) { Ok(n) => n, Err(e) => return e };
+    if ns == 0 { return 0; }
+    sleep_until_ns(deadline_after_ns(ns), rmtp_ptr)
 }
 
-/// Shared sleep body for the relative and absolute paths.
-///
-/// `start` is the tick the sleep is measured from, so the absolute path can
-/// pass the same `ticks()` reading it used to compute `ticks_needed` and not
-/// re-round a second time. `rmtp_ptr` may be 0 (nothing to report back).
-fn sleep_ticks_from(start: u64, ticks_needed: u64, rmtp_ptr: usize) -> isize {
-    let deadline = start.wrapping_add(ticks_needed);
+/// Shared sleep body for the relative and absolute paths: park on the poll
+/// wait-channel until `monotonic_ns() >= deadline`. `rmtp_ptr` may be 0
+/// (nothing to report back).
+fn sleep_until_ns(deadline: u64, rmtp_ptr: usize) -> isize {
     loop {
         if interrupted() {
             // Report the time still owed in `rmtp`. Leaving it untouched is
@@ -2663,24 +2718,19 @@ fn sleep_ticks_from(start: u64, ticks_needed: u64, rmtp_ptr: usize) -> isize {
             // duration from scratch. Callers may also pass rqtp == rmtp, so
             // the request was read out above before anything is written back.
             if rmtp_ptr != 0 && validate_user_buf(rmtp_ptr, 16) {
-                let elapsed = ticks().wrapping_sub(start);
-                let left = ticks_needed.saturating_sub(elapsed);
-                unsafe {
-                    core::ptr::write(rmtp_ptr       as *mut i64, (left / 100) as i64);
-                    core::ptr::write((rmtp_ptr + 8) as *mut i64, ((left % 100) * 10_000_000) as i64);
-                }
+                write_user_timespec(rmtp_ptr, deadline.saturating_sub(monotonic_ns()));
             }
             return -4; // EINTR
         }
-        if ticks() >= deadline { break; }
+        if monotonic_ns() >= deadline { break; }
         // Block on the poll wait-channel until the sleep deadline instead of a
         // yield_now busy-poll: the old spin pinned a CPU for the whole sleep
         // (e.g. init's getty-loop `usleep(1s)` — pid 1 churning the scheduler
-        // run-loop at 100 %+ CPU and starving every other task). The deadline
-        // tick wakes us exactly at `deadline`; a spurious early wake (another
-        // waiter's nearer deadline) just re-checks the tick above and re-blocks.
+        // run-loop at 100 %+ CPU and starving every other task). The first
+        // tick at or after `deadline` wakes us; a spurious early wake (another
+        // waiter's nearer deadline) just re-checks the clock and re-blocks.
         sched::block_on_poll_prepare_until(deadline);
-        if ticks() >= deadline || interrupted() {
+        if monotonic_ns() >= deadline || interrupted() {
             sched::block_on_poll_cancel();
         } else {
             sched::block_on_poll_commit();
@@ -2694,46 +2744,46 @@ const TIMER_ABSTIME: usize = 1;
 
 /// sys_clock_nanosleep(clockid, flags, rqtp, rmtp).
 ///
-/// Every clock here is the same 10 ms tick counter (see `sys_clock_gettime`),
-/// so the clockid is not load-bearing — but the flags are. This used to
-/// dispatch straight to `sys_nanosleep(a2, a3)`, discarding them, which turned
-/// "wait until this absolute timestamp" into "sleep FOR that timestamp": a
-/// deadline a few seconds into the future became a sleep of however long the
-/// machine has been up plus a few seconds, and a wall-clock deadline became
-/// decades. Nothing in the current userland passes TIMER_ABSTIME, so it never
-/// fired — it was a landmine, not a live bug.
-fn sys_clock_nanosleep(_clkid: usize, flags: usize, rqtp_ptr: usize, rmtp_ptr: usize) -> isize {
+/// The relative form is `sys_nanosleep` on every clock (a relative interval
+/// is the same length on the wall clock and the monotonic one). With
+/// `TIMER_ABSTIME` the deadline is an instant on `clockid`: CLOCK_REALTIME is
+/// translated onto the monotonic clock through the current offset, everything
+/// else is read as monotonic. This used to dispatch straight to
+/// `sys_nanosleep(a2, a3)`, discarding the flags, which turned "wait until
+/// this absolute timestamp" into "sleep FOR that timestamp": a deadline a few
+/// seconds into the future became a sleep of however long the machine has
+/// been up plus a few seconds, and a wall-clock deadline became decades.
+fn sys_clock_nanosleep(clkid: usize, flags: usize, rqtp_ptr: usize, rmtp_ptr: usize) -> isize {
     if flags & TIMER_ABSTIME == 0 {
         return sys_nanosleep(rqtp_ptr, rmtp_ptr);
     }
     if rqtp_ptr == 0 { return 0; }
-    if !validate_user_buf(rqtp_ptr, 16) { return -14; }
-    let tv_sec  = unsafe { core::ptr::read(rqtp_ptr       as *const i64) };
-    let tv_nsec = unsafe { core::ptr::read((rqtp_ptr + 8) as *const i64) };
-    if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 { return -22; } // EINVAL
-    // Round the deadline up, for the same reason the relative path does.
-    let target = ((tv_sec as u128) * 1_000_000_000 + tv_nsec as u128)
-        .div_ceil(10_000_000) as u64;
-    let now = ticks();
+    let ns = match read_user_timespec(rqtp_ptr) { Ok(n) => n, Err(e) => return e };
+    let target = match clkid {
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => sched::realtime_to_monotonic_ns(ns),
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => return -22, // EINVAL, as Linux
+        _ => ns,
+    };
     // A deadline already in the past is not an error; it is a completed sleep.
-    if target <= now { return 0; }
-    let ticks_needed = target - now;
+    if target <= monotonic_ns() { return 0; }
     // Absolute sleeps have nothing to report in rmtp on EINTR (the caller
     // simply re-issues with the same deadline), so pass 0 for it.
-    sleep_ticks_from(now, ticks_needed, 0)
+    sleep_until_ns(target, 0)
 }
 
 /// sys_gettimeofday(tv_ptr, tz_ptr) — fill `struct timeval` with wall-clock time.
 ///
-/// We don't have a real-time clock, so we synthesise from ticks (boot = epoch).
-/// `tz_ptr` is always written as UTC (+0).
+/// The same `realtime_ns` that `clock_gettime(CLOCK_REALTIME)` reports, so the
+/// two can never disagree (they used to be the tick counter vs the counter:
+/// up to 10 ms apart, drifting within every tick). `tz_ptr` is always written
+/// as UTC (+0).
 fn sys_gettimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
     // struct timeval { tv_sec: i64, tv_usec: i64 }
     if tv_ptr != 0 {
         if !validate_user_buf(tv_ptr, 16) { return -14; }
-        let ticks = ticks();
-        let tv_sec  = (ticks / 100) as i64;
-        let tv_usec = ((ticks % 100) * 10_000) as i64;
+        let ns = realtime_ns();
+        let tv_sec  = (ns / 1_000_000_000) as i64;
+        let tv_usec = ((ns % 1_000_000_000) / 1_000) as i64;
         unsafe {
             core::ptr::write(tv_ptr        as *mut i64, tv_sec);
             core::ptr::write((tv_ptr + 8)  as *mut i64, tv_usec);
@@ -2746,12 +2796,12 @@ fn sys_gettimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
     0
 }
 
-/// sys_time(tloc) — return seconds since boot as a `time_t` (i64).
+/// sys_time(tloc) — CLOCK_REALTIME in whole seconds as a `time_t` (i64).
 ///
 /// x86-64 only (AArch64 does not have syscall #201 for `time`).
 #[cfg(not(target_arch = "aarch64"))]
 fn sys_time(tloc: usize) -> isize {
-    let t = (ticks() / 100) as i64;
+    let t = (realtime_ns() / 1_000_000_000) as i64;
     if tloc != 0 && validate_user_buf(tloc, 8) {
         unsafe { core::ptr::write(tloc as *mut i64, t); }
     }
@@ -2874,10 +2924,9 @@ fn sys_set_tid_address(tidptr: usize) -> isize {
 
 fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: usize, val3: usize) -> isize {
     // Strip FUTEX_PRIVATE_FLAG (128) and FUTEX_CLOCK_REALTIME (256). The
-    // clock flag is not load-bearing here: every clock this kernel reports is
-    // the same tick counter with boot as the epoch (see `sys_clock_gettime`),
-    // so an absolute CLOCK_REALTIME deadline and an absolute CLOCK_MONOTONIC
-    // one are the same number of ticks.
+    // clock flag matters for FUTEX_WAIT_BITSET only: its absolute deadline is
+    // then an instant on the wall clock, translated onto the monotonic clock
+    // (FUTEX_WAIT's interval is relative on either clock, as on Linux).
     const FUTEX_PRIVATE_FLAG:   usize = 128;
     const FUTEX_CLOCK_REALTIME: usize = 256;
     const FUTEX_WAIT:           usize = 0;
@@ -2919,24 +2968,22 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
             // re-enters the scheduler.  See the sched::futex module docs.
             if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
             // timeout_ptr is a `struct timespec`; NULL means no timeout (block
-            // indefinitely). Converted to a `ticks()` deadline.
+            // indefinitely). Converted to an absolute `monotonic_ns` deadline.
             let deadline = if timeout_ptr == 0 {
                 None
             } else {
-                if !validate_user_buf(timeout_ptr, 16) { return -14; }
-                let tv_sec  = unsafe { core::ptr::read(timeout_ptr as *const i64) };
-                let tv_nsec = unsafe { core::ptr::read((timeout_ptr + 8) as *const i64) };
-                if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 { return -22; } // EINVAL
-                let ns = (tv_sec as u128) * 1_000_000_000 + tv_nsec as u128;
+                let ns = match read_user_timespec(timeout_ptr) { Ok(n) => n, Err(e) => return e };
                 if cmd == FUTEX_WAIT_BITSET {
-                    // Absolute: the deadline in this kernel's one clock,
-                    // rounded up like the relative path and clock_nanosleep so
-                    // a wait never returns early. A deadline already in the
-                    // past is answered without parking, value check first
+                    // Absolute on the requested clock. A deadline already in
+                    // the past is answered without parking, value check first
                     // (Linux reports EAGAIN over ETIMEDOUT when the word has
                     // moved).
-                    let target = ns.div_ceil(10_000_000) as u64;
-                    if target <= ticks() {
+                    let target = if op & FUTEX_CLOCK_REALTIME != 0 {
+                        sched::realtime_to_monotonic_ns(ns)
+                    } else {
+                        ns
+                    };
+                    if target <= monotonic_ns() {
                         // Already expired. No lock is held, so the read may
                         // fault and be serviced like any other user read.
                         let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
@@ -2944,9 +2991,9 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
                     }
                     Some(target)
                 } else {
-                    // Relative, exactly as sys_nanosleep converts it.
-                    let ticks_needed = (tv_sec as u64) * 100 + (tv_nsec as u64) / 10_000_000;
-                    Some(ticks().wrapping_add(ticks_needed))
+                    // Relative, exactly as sys_nanosleep converts it: a 3 ms
+                    // wait is 3 ms, not "0 ticks, wake at the next edge".
+                    Some(deadline_after_ns(ns))
                 }
             };
             sched::futex_wait(uaddr, val as u32, deadline)
@@ -4366,7 +4413,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                             // tick could never fire. The now+1 deadline wakes us
                             // each tick to retry, which is exactly when the drain
                             // has run.
-                            sched::block_on_poll_prepare_until(ticks().wrapping_add(1));
+                            sched::block_on_poll_prepare_until(monotonic_ns() + 10_000_000);
                             if console_input_pending() || evdev_server::has_key_event(0)
                                 || interrupted() {
                                 sched::block_on_poll_cancel();
@@ -7008,7 +7055,7 @@ fn block_until_ready(nonblock: bool, mut op: impl FnMut() -> isize, hint: impl F
 fn vfs_block_hint(pid: u32, fd: usize) -> (u64, u64) {
     match vfs::fd_wake_tag(pid, fd) {
         Some(tag) => (tag, u64::MAX),
-        None => (sched::POLL_TAG_ALL, sched::ticks() + 1),
+        None => (sched::POLL_TAG_ALL, sched::monotonic_ns() + 10_000_000),
     }
 }
 
@@ -7016,7 +7063,7 @@ fn vfs_block_hint(pid: u32, fd: usize) -> (u64, u64) {
 fn net_block_hint(pid: u32, fd: usize) -> (u64, u64) {
     match net_server::fd_wake_tag(pid, fd) {
         Some(tag) => (tag, u64::MAX),
-        None => (sched::POLL_TAG_ALL, sched::ticks() + 1),
+        None => (sched::POLL_TAG_ALL, sched::monotonic_ns() + 10_000_000),
     }
 }
 
@@ -7443,6 +7490,32 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
 /// millisecond budget rounded to this kernel's ~10ms tick granularity.
 /// Returns the number of ready events, or 0 on timeout.
 fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usize) -> isize {
+    // The low 32 bits are the C `int` timeout in ms; -1 = forever (whether
+    // the caller sign- or zero-extended it into the register).
+    let timeout_ms = timeout as i32;
+    let (infinite, deadline) = if timeout_ms < 0 { (true, 0) }
+        else { (false, deadline_after_ms(timeout_ms as u64)) };
+    epoll_wait_until(epfd, events_ptr, maxevents, infinite, deadline)
+}
+
+/// sys_epoll_pwait2(epfd, events_ptr, maxevents, timeout_ptr, sigmask, sigsetsize)
+///
+/// The timeout is a `struct timespec *` (NULL = forever), NOT milliseconds:
+/// routing this number to `sys_epoll_wait` read the pointer as a timeout of
+/// ~10^14 ms, so every epoll_pwait2 with a finite timeout waited forever.
+fn sys_epoll_pwait2(epfd: usize, events_ptr: usize, maxevents: usize, timeout_ptr: usize) -> isize {
+    let (infinite, deadline) = if timeout_ptr == 0 { (true, 0) } else {
+        match read_user_timespec(timeout_ptr) {
+            Ok(ns) => (false, deadline_after_ns(ns)),
+            Err(e) => return e,
+        }
+    };
+    epoll_wait_until(epfd, events_ptr, maxevents, infinite, deadline)
+}
+
+/// Shared body: wait until an interest is ready, `deadline` (absolute
+/// `monotonic_ns`, ignored when `infinite`) passes, or a signal arrives.
+fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: bool, deadline: u64) -> isize {
     if maxevents == 0 { return -22; }
     if !validate_user_buf(events_ptr, maxevents * EPOLL_EVENT_SIZE) { return -14; }
 
@@ -7471,9 +7544,6 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
             return -9;
         }
     }
-
-    let infinite = timeout == usize::MAX;
-    let deadline = ticks().wrapping_add((timeout as u64) / 10);
 
     // EPOLLET (edge-triggered) fires only when the object's per-event seq
     // advanced since the last delivery — so a permanently-level-ready fd (a
@@ -7529,7 +7599,7 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
             }
         }
         if n > 0 { return n as isize; }
-        if timeout == 0 || (!infinite && ticks() >= deadline) { return 0; }
+        if !infinite && monotonic_ns() >= deadline { return 0; }
         if interrupted() { return -4; } // EINTR — lets e.g. tokio's SIGCHLD handler run
 
         // ---- BLOCK ---- three-phase on the global poll wait-channel; the
@@ -7542,7 +7612,7 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
         let mask = if mask == 0 { sched::POLL_TAG_ALL } else { mask };
         sched::block_on_poll_prepare_masked(if infinite { u64::MAX } else { deadline }, mask);
         if epoll_any_ready(pid, slot) || interrupted()
-            || (!infinite && ticks() >= deadline) {
+            || (!infinite && monotonic_ns() >= deadline) {
             sched::block_on_poll_cancel();
             continue;
         }
@@ -7787,7 +7857,7 @@ pub fn poll_deadline_tick() {
     gap2_sample_tick();
     evstat_tick();
     scstat_tick();
-    let now = ticks();
+    let now = monotonic_ns();
     let tfd = vfs::earliest_timerfd_deadline();
     // Fast path: the lock-free hint (min of parked timed waiters' deadlines)
     // and the timerfd pool say nothing is due → no run-queue scan, no wake.
@@ -7847,7 +7917,7 @@ fn poll_block(infinite: bool, deadline: u64, mask: u64, reprobe: impl FnOnce() -
     // falls back to broadcast so the parked task is never immune to a wake.
     let mask = if mask == 0 { sched::POLL_TAG_ALL } else { mask };
     sched::block_on_poll_prepare_masked(if infinite { u64::MAX } else { deadline }, mask);
-    if reprobe() || interrupted() || (!infinite && ticks() >= deadline) {
+    if reprobe() || interrupted() || (!infinite && monotonic_ns() >= deadline) {
         sched::block_on_poll_cancel();
         return;
     }
@@ -8298,7 +8368,14 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
     }
 }
 
-fn sys_timerfd_create(_clockid: usize, flags: usize) -> isize {
+fn sys_timerfd_create(clockid: usize, flags: usize) -> isize {
+    // CLOCK_REALTIME or CLOCK_MONOTONIC (Linux also takes BOOTTIME and the
+    // _ALARM variants; nothing here suspends, so BOOTTIME is MONOTONIC).
+    let clockid = match clockid {
+        CLOCK_REALTIME => CLOCK_REALTIME,
+        CLOCK_MONOTONIC | CLOCK_BOOTTIME => CLOCK_MONOTONIC,
+        _ => return -22, // EINVAL
+    };
     let pid = current_pid();
     // flags carries TFD_NONBLOCK/TFD_CLOEXEC (== O_NONBLOCK/O_CLOEXEC). It MUST
     // be recorded on the fd: the `polling` crate (calloop's poller) creates its
@@ -8307,37 +8384,34 @@ fn sys_timerfd_create(_clockid: usize, flags: usize) -> isize {
     // kernel read path yield-spins on EAGAIN, pinning the caller's thread in the
     // read instead of letting its event loop poll other fds — which is exactly
     // how a single-threaded compositor stops accepting wayland clients.
-    let msg = make_vfs_msg(vfs::VFS_TIMERFD_CREATE, &[flags as u64]);
+    let msg = make_vfs_msg(vfs::VFS_TIMERFD_CREATE, &[flags as u64, clockid as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
 /// `TFD_TIMER_ABSTIME` — timerfd_settime's absolute-deadline mode.
 const TFD_TIMER_ABSTIME: usize = 1;
-/// `TFD_TIMER_CANCEL_ON_SET` — only meaningful for CLOCK_REALTIME timers when
-/// the wall clock is stepped. This kernel has one clock and never steps it, so
-/// the flag is accepted and ignored (a rejection would break callers that set
-/// it unconditionally).
+/// `TFD_TIMER_CANCEL_ON_SET` — asks a CLOCK_REALTIME absolute timer to fail
+/// with ECANCELED if the wall clock is stepped under it. Accepted and ignored
+/// (a rejection would break callers that set it unconditionally); a stepped
+/// clock simply moves the deadline, since it is stored on the monotonic clock.
 const TFD_TIMER_CANCEL_ON_SET: usize = 2;
 
 /// timerfd_settime(fd, flags, new_value_ptr, old_value_ptr)
 ///
 /// Reads itimerspec {interval, value} from new_value_ptr (2×16 bytes) and
-/// hands the vfs an ABSOLUTE deadline on the monotonic clock `clock_gettime`
-/// reports, whichever way the caller expressed it:
+/// hands the vfs `it_value` plus whether it is absolute; the vfs, which knows
+/// the fd's clockid, turns it into an absolute deadline on the monotonic
+/// clock (see `handle_timerfd_settime`):
 ///
-/// * with `TFD_TIMER_ABSTIME`, `it_value` already is that reading (every
-///   clockid here is the same monotonic clock). This used to be ignored and
-///   the value armed as a relative interval, firing at `uptime + deadline` —
-///   the same landmine `sys_clock_nanosleep`'s TIMER_ABSTIME and
-///   FUTEX_WAIT_BITSET had. Nothing in the desktop passed it yet
-///   (calloop/polling arm relative timeouts), but glib and every "fire at T"
-///   loop does;
+/// * with `TFD_TIMER_ABSTIME`, `it_value` is an instant on the fd's clock —
+///   CLOCK_REALTIME is translated through the wall-clock offset. This used to
+///   be ignored and the value armed as a relative interval, firing at
+///   `uptime + deadline` — the same landmine `sys_clock_nanosleep`'s
+///   TIMER_ABSTIME and FUTEX_WAIT_BITSET had;
 /// * without it, `it_value` is added to `monotonic_ns()` NOW — not to the
-///   tick counter. A relative deadline expressed in whole ticks from the
-///   current tick ignores the fraction of the tick already elapsed and fires
-///   up to 10 ms early by clock_gettime's reckoning; a 300 ms timer armed
-///   late in a tick came back at 297 ms. Linux converts relative to absolute
-///   at settime for the same reason.
+///   tick counter, which ignores the fraction of the tick already elapsed and
+///   fired up to 10 ms early by clock_gettime's reckoning. Linux converts
+///   relative to absolute at settime for the same reason.
 ///
 /// `old_value_ptr`, if given, receives the timer's previous setting exactly as
 /// timerfd_gettime would report it, before the new one is armed.
@@ -8367,13 +8441,9 @@ fn sys_timerfd_settime(fd: usize, flags: usize, new_ptr: usize, old_ptr: usize) 
         let r = vfs_reply_val(&vfs::handle(&gmsg, pid));
         if r < 0 { return r; }
     }
-    // 0 keeps its itimerspec meaning of "disarm"; any other value becomes an
-    // absolute deadline (a relative value is never 0 after the add, since
-    // monotonic_ns() is nonzero once the clock has ticked).
-    let deadline_ns = if value_ns == 0 { 0 }
-        else if flags & TFD_TIMER_ABSTIME != 0 { value_ns }
-        else { monotonic_ns().saturating_add(value_ns).max(1) };
-    let msg = make_vfs_msg(vfs::VFS_TIMERFD_SETTIME, &[fd as u64, deadline_ns, interval_ns]);
+    // 0 keeps its itimerspec meaning of "disarm".
+    let absolute = (flags & TFD_TIMER_ABSTIME != 0) as u64;
+    let msg = make_vfs_msg(vfs::VFS_TIMERFD_SETTIME, &[fd as u64, value_ns, interval_ns, absolute]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
@@ -8394,7 +8464,12 @@ fn sys_timerfd_gettime(fd: usize, cur_ptr: usize) -> isize {
 /// "exceptional condition" distinct from POLLERR/POLLHUP. Bad fds (bits set
 /// past `nfds`'s real descriptor table) are simply never marked ready rather
 /// than failing the call with EBADF, unlike real Linux `select(2)`.
-fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize) -> isize {
+///
+/// `timespec` says which timeout struct `tv_ptr` points at: `select(2)` passes
+/// a `struct timeval` (µs), `pselect6(2)` — the only form on AArch64 — a
+/// `struct timespec` (ns). Reading a timespec as a timeval made every
+/// pselect6 timeout 1000× too long.
+fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize, timespec: bool) -> isize {
     const POLLIN:  u32 = 0x0001;
     const POLLOUT: u32 = 0x0004;
 
@@ -8408,13 +8483,18 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize)
 
     let (infinite, deadline) = if tv_ptr == 0 {
         (true, 0)
+    } else if timespec {
+        match read_user_timespec(tv_ptr) {
+            Ok(ns) => (false, deadline_after_ns(ns)),
+            Err(e) => return e,
+        }
     } else {
         if !validate_user_buf(tv_ptr, 16) { return -14; }
         let tv_sec  = unsafe { core::ptr::read(tv_ptr       as *const i64) };
         let tv_usec = unsafe { core::ptr::read((tv_ptr + 8) as *const i64) };
         if tv_sec < 0 || tv_usec < 0 { return -22; } // EINVAL
-        let ticks_needed = (tv_sec as u64) * 100 + (tv_usec as u64) / 10_000;
-        (false, ticks().wrapping_add(ticks_needed))
+        let ns = (tv_sec as u64).saturating_mul(1_000_000_000).saturating_add((tv_usec as u64).saturating_mul(1_000));
+        (false, deadline_after_ns(ns))
     };
 
     loop {
@@ -8434,7 +8514,7 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize)
             if want_w && ev & POLLOUT != 0 { out_w[fd / 8] |= 1 << (fd % 8); nready += 1; }
         }
 
-        if nready > 0 || (!infinite && ticks() >= deadline) {
+        if nready > 0 || (!infinite && monotonic_ns() >= deadline) {
             if has_r { unsafe { core::ptr::copy_nonoverlapping(out_r.as_ptr(), rfds as *mut u8, bytes); } }
             if has_w { unsafe { core::ptr::copy_nonoverlapping(out_w.as_ptr(), wfds as *mut u8, bytes); } }
             if has_e { unsafe { core::ptr::write_bytes(efds as *mut u8, 0, bytes); } }

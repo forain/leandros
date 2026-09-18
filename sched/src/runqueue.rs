@@ -170,7 +170,7 @@ impl RunQueue {
     }
 
     /// Block the task with `pid` on `port`, recording its wake deadline
-    /// (absolute ticks; `u64::MAX` = none) and its poll interest-set `mask`
+    /// (absolute `monotonic_ns()`; `u64::MAX` = none) and its poll interest-set `mask`
     /// (see `poll_tag`; `POLL_TAG_ALL` = broadcast). All three are set
     /// atomically with `state`/`blocked_on` under the one RUN_QUEUE hold so the
     /// poll-deadline tick and `unblock_port_tagged` see a consistent snapshot,

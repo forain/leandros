@@ -641,6 +641,11 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     #[cfg(target_arch = "x86_64")] { arch_x86_64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
 
+    // The wall clock's epoch, from the board's battery clock, now that the
+    // monotonic counter is running (arch init started the timer). Without a
+    // readable RTC, CLOCK_REALTIME counts from the boot instant.
+    time_init();
+
     // aarch64: SIMD and UART are now available. Run DTB fallback search if Limine
     // didn't provide uart_base/pci_ecam_base via its DTB request.
     #[cfg(target_arch = "aarch64")]
@@ -1001,4 +1006,26 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     }
     serial_print_str("\n--------------------\n");
     loop { core::hint::spin_loop(); }
+}
+
+/// Seed CLOCK_REALTIME from the board's real-time clock (PL031 on virt,
+/// CMOS on x86). One read, at boot: from here on the wall clock is the
+/// monotonic counter plus a constant (`sched::realtime_ns`), so
+/// `clock_gettime(CLOCK_REALTIME)`, `gettimeofday`, `time` and every
+/// CLOCK_REALTIME deadline agree by construction. `clock_settime` and
+/// `settimeofday` can step it later.
+fn time_init() {
+    #[cfg(target_arch = "x86_64")]
+    let secs = arch_x86_64::rtc::epoch_secs();
+    #[cfg(target_arch = "aarch64")]
+    let secs = arch_aarch64::rtc::epoch_secs();
+    match secs {
+        Some(s) => {
+            sched::set_realtime_ns(s.saturating_mul(1_000_000_000));
+            serial_print_str("[RTC] epoch seconds: ");
+            print_number(s as u32); // 2038-safe enough for a boot line
+            serial_print_str("\n");
+        }
+        None => serial_print_str("[RTC] no battery clock; CLOCK_REALTIME starts at boot\n"),
+    }
 }

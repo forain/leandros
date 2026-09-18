@@ -1033,7 +1033,7 @@ fn wait_active(n: usize) -> isize {
         // sit here for the whole life of another session, and a yield loop
         // there pins a CPU at 100% (the same defect sys_wait4 was fixed for).
         // The 20 ms deadline bounds any missed wake edge.
-        sched::block_on_poll_prepare_until(sched::ticks() + 2);
+        sched::block_on_poll_prepare_until(sched::monotonic_ns() + 20_000_000);
         if ACTIVE.load(Ordering::Relaxed) == want {
             sched::block_on_poll_cancel();
             return 0;
