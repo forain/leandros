@@ -143,6 +143,7 @@ extern "C" {
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     pub fn read(fd: c_int, buf: *mut u8, count: usize) -> isize;
+    pub fn open(path: *const u8, flags: c_int, ...) -> c_int;
     pub fn close(fd: c_int) -> c_int;
     pub fn exit(status: i32) -> !;
     pub fn __errno_location() -> *mut c_int;
@@ -210,6 +211,7 @@ pub unsafe extern "C" fn timer_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_timer_max_and_eagain() { failures += 1; }
     if !test_alarm_and_setitimer_no_leak() { failures += 1; }
     if !test_clock_monotonic_subtick() { failures += 1; }
+    if !test_clock_monotonic_tsc_scale() { failures += 1; }
     if !test_timerfd_subtick_interval() { failures += 1; }
     if !test_timerfd_abstime_future() { failures += 1; }
     if !test_timerfd_abstime_past() { failures += 1; }
@@ -520,6 +522,87 @@ unsafe fn test_clock_monotonic_subtick() -> bool {
     print_kv(b"  loop_span_ns=\0", (last - first).max(0) as u64);
 
     report(name, res_ok && monotonic && off_boundary && subtick_step && advanced && sleep_plausible)
+}
+
+// ── 6b. CLOCK_MONOTONIC runs at the TSC frequency the kernel reports ────────
+//
+// x86_64's CLOCK_MONOTONIC is the TSC against a frequency the kernel resolves
+// once at boot (CPUID-stated, else PIT-measured — the `[TSC]` boot line), and
+// the same scale is what every kernel `*_us` diagnostic and stall threshold
+// runs on. Until 2026-09-18 those diagnostics divided a raw `rdtsc` by an
+// assumed 1 GHz, 1.9× wrong on a 1.9 GHz laptop and 4.5× on a 4.5 GHz desktop.
+// The kernel now publishes the resolved frequency as `cpu MHz` in
+// /proc/cpuinfo; this test reads it back and requires that a raw `rdtsc`,
+// counted over ~300 ms of CLOCK_MONOTONIC, runs at that frequency to 1 %.
+// A wrong published frequency (the old hardcoded 1000.000) or a wrong
+// monotonic scale both fail it. Only x86_64 exposes its counter to EL0 this
+// way; on other arches there is nothing to compare and the test is a no-op.
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn test_clock_monotonic_tsc_scale() -> bool {
+    let name = b"clock_monotonic_tsc_scale\0";
+
+    // /proc/cpuinfo → first "cpu MHz\t\t: NNNN.FFF" → kHz.
+    let fd = open(b"/proc/cpuinfo\0".as_ptr(), 0);
+    if fd < 0 { return report(name, false); }
+    let mut buf = [0u8; 1024];
+    let mut len = 0usize;
+    loop {
+        let n = read(fd, buf.as_mut_ptr().add(len), buf.len() - len);
+        if n <= 0 { break; }
+        len += n as usize;
+        if len == buf.len() { break; }
+    }
+    close(fd);
+    let text = &buf[..len];
+    let key = b"cpu MHz";
+    let mut reported_khz: u64 = 0;
+    if let Some(at) = text.windows(key.len()).position(|w| w == key) {
+        let mut i = at + key.len();
+        while i < len && text[i] != b':' { i += 1; }
+        i += 1;
+        while i < len && text[i] == b' ' { i += 1; }
+        let mut mhz: u64 = 0;
+        while i < len && text[i].is_ascii_digit() { mhz = mhz * 10 + (text[i] - b'0') as u64; i += 1; }
+        let mut frac: u64 = 0;
+        let mut digits = 0;
+        if i < len && text[i] == b'.' {
+            i += 1;
+            while i < len && text[i].is_ascii_digit() && digits < 3 {
+                frac = frac * 10 + (text[i] - b'0') as u64; digits += 1; i += 1;
+            }
+        }
+        while digits < 3 { frac *= 10; digits += 1; }
+        reported_khz = mhz * 1000 + frac;
+    }
+
+    // ~300 ms of CLOCK_MONOTONIC against the raw counter.
+    let mut a = core::mem::zeroed::<timespec>();
+    let mut b = core::mem::zeroed::<timespec>();
+    clock_gettime(CLOCK_MONOTONIC, &mut a);
+    let c0 = core::arch::x86_64::_rdtsc();
+    sleep_ms(300);
+    clock_gettime(CLOCK_MONOTONIC, &mut b);
+    let c1 = core::arch::x86_64::_rdtsc();
+    let dns = (b.tv_sec * 1_000_000_000 + b.tv_nsec) - (a.tv_sec * 1_000_000_000 + a.tv_nsec);
+    let measured_khz = if dns > 0 {
+        ((c1.wrapping_sub(c0) as u128 * 1_000_000u128) / dns as u128) as u64
+    } else { 0 };
+
+    // 1 %: a stated frequency is exact and a PIT-measured one is good to
+    // ~0.05 %; the sleep spans 30 ticks so the two clock reads add ~nothing.
+    let plausible = reported_khz >= 100_000 && reported_khz <= 10_000_000;
+    let agree = plausible && measured_khz.abs_diff(reported_khz) * 100 <= reported_khz;
+
+    print_kv(b"  cpuinfo_tsc_khz=\0", reported_khz);
+    print_kv(b"  measured_tsc_khz=\0", measured_khz);
+    print_kv(b"  span_ns=\0", dns.max(0) as u64);
+    report(name, agree)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn test_clock_monotonic_tsc_scale() -> bool {
+    report(b"clock_monotonic_tsc_scale (n/a on this arch)\0", true)
 }
 
 // ── 7. timerfd sub-tick periodic interval must not decay to one-shot ────────

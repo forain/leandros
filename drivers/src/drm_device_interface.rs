@@ -3233,8 +3233,10 @@ pub fn drm_tick() {
             // `ctrlq_us` above is now vCPU time actually spent waiting;
             // `ctrlq_lat_us` is how long the host took over the async commands
             // nobody waited for. `now_us` is `monotonic_us` itself, so a reader
-            // can calibrate every `*_us` field against wall time — on x86_64 it
-            // is TSC/1000, i.e. TSC-GHz-times-too-fast (4.5x on a 7950X).
+            // can check every `*_us` field against wall time: `now_us / 10_000`
+            // and `t` are the same clock in different units (since 2026-09-18
+            // on x86_64 too — it used to be a raw TSC/1000, 4.5x fast on a
+            // 7950X).
             crate::pci::serial_debug(" ctrlq_async=");
             crate::pci::serial_debug_hex_64(
                 crate::virtio_gpu::CTRLQ_ASYNC.load(Ordering::Relaxed));
