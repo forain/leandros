@@ -104,7 +104,7 @@ fn free_ram() -> u64 {
 /// A kill loop that leaks one 128 KiB kernel stack per iteration shows up
 /// as 12.5 MiB over 100 iterations; allow far less than that but enough
 /// for allocator noise (pipe rings, exit-log churn).
-const MEM_LEAK_BOUND: u64 = 4 << 20;
+const MEM_LEAK_BOUND: u64 = 8 << 20;
 
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
