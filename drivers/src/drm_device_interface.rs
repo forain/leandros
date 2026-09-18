@@ -920,6 +920,15 @@ struct DumbBuf {
     /// here. What they could not derive is the *host* resource id, which
     /// TRANSFER_TO/FROM_HOST_3D need, so it is carried alongside.
     res_id: u32,
+    /// The `open_id` whose gem handle this is, or 0 for a buffer minted with
+    /// no open identity (the legacy `Driver::handle` path). Upstream keeps a
+    /// handle table per `drm_file` and `drm_gem_release` retires every entry
+    /// when the file goes; here the handle space is global, so the owner is
+    /// carried on the record and `drm_release_open` sweeps by it. Without
+    /// this a compositor that died holding its swapchain — `kill -9`, a
+    /// panic, greetd's SIGKILL alarm — leaked every scanout buffer it had:
+    /// three 8 MiB dumb buffers per 1920x1080 cosmic-comp death, forever.
+    owner: u32,
 }
 
 static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new());
@@ -1397,6 +1406,25 @@ pub fn drm_release_open(open_id: u32) {
     // that exits mid-frame leaks one entry per fence it ever created — which,
     // for a v3d client, is one per submit.
     syncobj_release_open(open_id);
+
+    // Dumb (and virgl 3D) gem handles this open created and never retired —
+    // the swapchain of a compositor that died without DESTROY_DUMB. Same rule
+    // and same shape as the blob sweep: the HANDLE's reference goes, and the
+    // pages follow only when nothing else (an exported dmabuf fd, which may
+    // be held by another process) still references the object.
+    //
+    // Collected under the map lock, retired after it: `free_dumb` takes the
+    // map itself and then, for a buffer that owned a host resource, the device.
+    let orphans: Vec<u32> = {
+        let map = DUMB_BUFFERS.lock();
+        map.iter()
+            .filter(|(_, b)| b.owner == open_id && b.handle_live)
+            .map(|(h, _)| *h)
+            .collect()
+    };
+    for h in orphans {
+        DrmDeviceInterface::free_dumb(h);
+    }
 
     // Nothing further to do for an open that never created a context — but its
     // blobs, above, still had to be reclaimed.
@@ -1935,9 +1963,29 @@ fn dumb_unref_by_obj(obj: u32) -> bool {
     let dead = if zero { m.remove(&handle) } else { None };
     drop(m);
     if let Some(b) = dead {
+        dumb_release_host_resource(b.res_id);
         mm::buddy::free(b.phys, b.order);
     }
     true
+}
+
+/// The host side of a dumb BO's death: the 2D resource ADDFB bound to it (or
+/// the 3D resource VIRTGPU_RESOURCE_CREATE made it with) is unreferenced so
+/// the host drops its backing iov and, for a 2D resource, the host-side
+/// pixel copy QEMU keeps per resource — otherwise each ADDFB'd buffer that
+/// died with its process cost the host a frame's worth of memory for good.
+/// Called with NO BO map held (lock order: `VIRTIO_GPU` is a leaf below the
+/// BO maps), and only from the zero arm of a BO's refcount, so it runs
+/// exactly once per object.
+///
+/// Unreferencing the resource that is currently scanned out is legal — the
+/// host disables that scanout — and the DRM server's VFS_CLOSE arm hands the
+/// surface back to the console right after the sweep that gets here.
+fn dumb_release_host_resource(res_id: u32) {
+    if res_id == 0 { return; }
+    if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+        gpu.resource_unref(res_id);
+    }
 }
 
 /// **The VFS release hook.** One exporting `TmpVmo` slot has gone away; drop the
@@ -3564,14 +3612,14 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_GETCONNECTOR => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_connector(&mut g, arg) },
             DRM_IOCTL_MODE_GETENCODER => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_encoder(&mut g, arg) },
             DRM_IOCTL_MODE_GETCRTC => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_crtc(&mut g, arg) },
-            DRM_IOCTL_MODE_CREATE_DUMB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_create_dumb(&mut g, arg) },
+            DRM_IOCTL_MODE_CREATE_DUMB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_create_dumb(&mut g, arg, open_id) },
             DRM_IOCTL_MODE_MAP_DUMB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_map_dumb(&mut g, arg) },
             DRM_IOCTL_MODE_ADDFB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_addfb(&mut g, arg, open_id) },
             DRM_IOCTL_MODE_SETCRTC => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_set_crtc(&mut g, arg) },
             DRM_IOCTL_MODE_PAGE_FLIP => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_page_flip(&mut g, arg) },
 
             // ── Virtio-GPU 3D IOCTLs (lock VIRTIO_GPU, not the DRM device) ──
-            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => self.virtgpu_handle_resource_create(arg),
+            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => self.virtgpu_handle_resource_create(arg, open_id),
             DRM_IOCTL_VIRTGPU_EXECBUFFER => self.virtgpu_handle_execbuffer(arg, open_id),
             DRM_IOCTL_VIRTGPU_GET_CAPS => self.virtgpu_handle_get_caps(arg),
             DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => self.virtgpu_handle_transfer_to_host(arg),
@@ -3790,7 +3838,10 @@ impl DrmDeviceInterface {
         let _format = fb_data[2];
 
         // Allocate dumb buffer
-        let buffer = DrmDumbBuffer::create(width, height, 32)?;
+        // Legacy custom ioctl: no open identity is threaded down here, so the
+        // buffer stays unowned (reachable from anywhere, swept by nobody),
+        // exactly as before.
+        let buffer = DrmDumbBuffer::create(width, height, 32, 0)?;
         let mmap_offset = buffer.mmap_offset;
         // This legacy ABI returns the physical address in a u32 slot. Refuse a
         // frame that does not fit rather than hand the caller the low half —
@@ -4232,10 +4283,10 @@ impl DrmDeviceInterface {
         }
     }
 
-    fn std_handle_create_dumb(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+    fn std_handle_create_dumb(&mut self, _device: &mut DrmDevice, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let create = unsafe { &mut *(arg as *mut drm_mode_create_dumb) };
-        let buffer = DrmDumbBuffer::create(create.width, create.height, create.bpp)?;
+        let buffer = DrmDumbBuffer::create(create.width, create.height, create.bpp, open_id)?;
         
         create.handle = buffer.handle;
         create.pitch = buffer.pitch;
@@ -4407,6 +4458,7 @@ impl DrmDeviceInterface {
         let dead = if zero { map.remove(&handle) } else { None };
         drop(map);
         if let Some(b) = dead {
+            dumb_release_host_resource(b.res_id);
             mm::buddy::free(b.phys, b.order);
         }
     }
@@ -5361,7 +5413,7 @@ impl DrmDeviceInterface {
 
     // ── Virtio-GPU IOCTL Handlers ───────────────────────────────────────────
 
-    fn virtgpu_handle_resource_create(&mut self, arg: usize) -> Result<usize, DriverError> {
+    fn virtgpu_handle_resource_create(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         // Copy the request out of user memory before taking the device lock.
         let req = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_resource_create) };
@@ -5431,6 +5483,7 @@ impl DrmDeviceInterface {
             refs: 1,
             handle_live: true,
             res_id: res_handle,
+            owner: open_id,
         });
 
         // bo_handle @40, res_handle @44, size @48, stride @52.
@@ -7185,7 +7238,7 @@ pub struct DrmDumbBuffer {
 
 impl DrmDumbBuffer {
     /// Create a dumb buffer for simple framebuffer access
-    pub fn create(width: u32, height: u32, bpp: u32) -> Result<Self, DriverError> {
+    pub fn create(width: u32, height: u32, bpp: u32, owner: u32) -> Result<Self, DriverError> {
         let pitch = width * ((bpp + 7) / 8);
         let size = pitch * height;
 
@@ -7232,6 +7285,7 @@ impl DrmDumbBuffer {
                 // A dumb buffer's host resource is allocated lazily at ADDFB
                 // time (see fb_resource_id), not here.
                 res_id: 0,
+                owner,
             },
         );
         

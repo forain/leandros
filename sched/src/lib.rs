@@ -514,6 +514,52 @@ pub fn alloc_pid() -> Pid {
     pid
 }
 
+/// The highest pid handed out so far (`/proc/loadavg`'s last field), so a
+/// userspace scan of `/proc/<pid>/` knows where to stop.
+pub fn last_pid() -> Pid {
+    NEXT_PID.lock().saturating_sub(1)
+}
+
+/// The userspace init process — the reaper every orphan is handed to. 0 until
+/// `kernel::init` has spawned it; nothing is reparented before then.
+static INIT_PID: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_init_pid(pid: Pid) { INIT_PID.store(pid, Ordering::Release); }
+pub fn init_pid() -> Pid { INIT_PID.load(Ordering::Acquire) }
+
+/// POSIX orphan reparenting: every child process of the dying thread group
+/// `dead_tgid` becomes a child of init, so init's `wait4(-1)` reaps it when
+/// it exits and — the reason this matters here — init can *see* it while it
+/// lives. Until 2026-09-18 an orphan kept its dead parent's pid: its exit
+/// record then named a parent that would never wait, and a supervisor had no
+/// way to tell a stray from a dead subtree apart from anything else. That is
+/// how every `cosmic-greeter` outlived its compositor, spinning on a broken
+/// Wayland socket at ~180 MiB apiece, and what looked like a kernel leak per
+/// compositor death.
+///
+/// Parentage is matched the way `wait_scan` matches it — through the parent
+/// thread's group — and only process leaders are moved; a thread's `ppid`
+/// names the sibling that created it and is not parentage at all. Must run
+/// while the dying group's threads are still on the run queue (before the
+/// group kill reaps them), or a child forked by a non-leader thread cannot be
+/// resolved to the group any more.
+fn reparent_children(dead_tgid: Pid) {
+    let init = init_pid();
+    if init == 0 || init == dead_tgid { return; }
+    let mut rq = RUN_QUEUE.lock();
+    let mut moved: [Pid; runqueue::MAX_TASKS] = [0; runqueue::MAX_TASKS];
+    let mut n = 0usize;
+    for i in 0..runqueue::MAX_TASKS {
+        let (pid, tgid, ppid) = match rq.get(i) { Some(t) => (t.pid, t.tgid, t.ppid), None => continue };
+        if pid != tgid || pid == dead_tgid { continue; }
+        let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
+        if parent_tgid == dead_tgid { moved[n] = pid; n += 1; }
+    }
+    for &pid in &moved[..n] {
+        if let Some(t) = rq.find_pid_mut(pid) { t.ppid = init; }
+    }
+}
+
 pub fn current_pid() -> Pid {
     CURRENT_PID[unsafe { cpu_id() }].load(Ordering::Relaxed)
 }
@@ -3172,6 +3218,9 @@ pub fn exit_group(code: i32) -> ! {
         GroupExitClaim::Owner { tgid, ppid, uid } => (tgid, ppid, uid),
         GroupExitClaim::AlreadyDying => exit_dying_thread(code),
     };
+    // Before the group kill, while every thread that may have forked a child
+    // is still resolvable to this group (see `reparent_children`).
+    reparent_children(tgid);
     run_group_kill(code);
     if pid != tgid {
         // The leader died on some other CPU (or was reaped off-CPU above)
@@ -3580,6 +3629,9 @@ pub fn exit(code: i32) -> ! {
     };
     // Release the /proc/self/exe side-table slot when the process leader dies.
     if pid == tgid { clear_exe_path(tgid); }
+    // Hand this process's children to init. `exit_group` already did this
+    // with the whole group live; a second pass finds nothing and is harmless.
+    if pid == tgid { reparent_children(tgid); }
     // A process leaving can orphan a stopped job: POSIX says that job gets
     // SIGHUP + SIGCONT rather than staying stopped with no shell left to
     // continue it. Must run after the zombie marking above so the scan does

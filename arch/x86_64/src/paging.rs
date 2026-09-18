@@ -624,6 +624,49 @@ pub unsafe extern "C" fn arch_alloc_page_table_root() -> usize {
     }
 }
 
+// ── arch_free_user_page_tables ───────────────────────────────────────────────
+
+/// Free every intermediate page-table node reachable from the USER half of
+/// the PML4 rooted at `pml4_phys` (entries 0..256), returning how many 4 KiB
+/// table pages were released. The root itself is left to the caller.
+///
+/// The kernel half (256..512) is a copy of the boot PML4's entries and shares
+/// its PDPT/PD/PT nodes with every other address space, so it is never walked.
+/// Leaf frames are the VMA layer's business and are not touched here: this
+/// walk releases only the nodes `ensure_table` allocated on the way down.
+/// Huge-page entries are leaves and are skipped.
+#[no_mangle]
+pub unsafe extern "C" fn arch_free_user_page_tables(pml4_phys: usize) -> usize {
+    let present = PageTableFlags::PRESENT.bits();
+    let huge = PageTableFlags::HUGE.bits();
+    let mut freed = 0usize;
+    let pml4 = mm::phys_to_virt(pml4_phys) as *mut u64;
+    for i in 0..256 {
+        let e4 = pml4.add(i).read();
+        if e4 & present == 0 { continue; }
+        let pdpt_phys = (e4 & PHYS_ADDR_MASK) as usize;
+        let pdpt = mm::phys_to_virt(pdpt_phys) as *mut u64;
+        for j in 0..512 {
+            let e3 = pdpt.add(j).read();
+            if e3 & present == 0 || e3 & huge != 0 { continue; }
+            let pd_phys = (e3 & PHYS_ADDR_MASK) as usize;
+            let pd = mm::phys_to_virt(pd_phys) as *mut u64;
+            for k in 0..512 {
+                let e2 = pd.add(k).read();
+                if e2 & present == 0 || e2 & huge != 0 { continue; }
+                mm::buddy::free((e2 & PHYS_ADDR_MASK) as usize, 0);
+                freed += 1;
+            }
+            mm::buddy::free(pd_phys, 0);
+            freed += 1;
+        }
+        mm::buddy::free(pdpt_phys, 0);
+        freed += 1;
+        pml4.add(i).write(0);
+    }
+    freed
+}
+
 // ── arch_map_page / arch_unmap_page ──────────────────────────────────────────
 // Resolved at link time by mm::paging — no circular crate dependency.
 
@@ -683,37 +726,4 @@ pub unsafe extern "C" fn arch_map_page(
 #[no_mangle]
 pub unsafe extern "C" fn arch_unmap_page(page_table_root: usize, virt: usize) {
     unmap_4k(page_table_root, virt);
-}
-
-/// Free every PDPT, PD and PT page reachable from the *lower half* of
-/// `pml4_phys` (see `mm::paging::free_user_page_tables`). The upper 256
-/// PML4 entries are the kernel's own tables, copied by
-/// `arch_alloc_page_table_root` and shared by every root — never followed.
-/// Huge entries are leaves, not tables, and are skipped; 4 KiB leaf frames
-/// are the VMAs' to free. The root page itself is left to the caller.
-#[no_mangle]
-pub unsafe extern "C" fn arch_free_user_page_tables(pml4_phys: usize) {
-    let present = PageTableFlags::PRESENT.bits();
-    let huge    = PageTableFlags::HUGE.bits();
-    let pml4 = mm::phys_to_virt(pml4_phys) as *mut u64;
-    for i in 0..256 {
-        let e = pml4.add(i).read();
-        if e & present == 0 || e & huge != 0 { continue; }
-        let pdpt_phys = (e & PHYS_ADDR_MASK) as usize;
-        let pdpt = mm::phys_to_virt(pdpt_phys) as *mut u64;
-        for j in 0..512 {
-            let e = pdpt.add(j).read();
-            if e & present == 0 || e & huge != 0 { continue; }
-            let pd_phys = (e & PHYS_ADDR_MASK) as usize;
-            let pd = mm::phys_to_virt(pd_phys) as *mut u64;
-            for k in 0..512 {
-                let e = pd.add(k).read();
-                if e & present == 0 || e & huge != 0 { continue; }
-                mm::buddy::free((e & PHYS_ADDR_MASK) as usize, 0);
-            }
-            mm::buddy::free(pd_phys, 0);
-        }
-        mm::buddy::free(pdpt_phys, 0);
-        pml4.add(i).write(0);
-    }
 }

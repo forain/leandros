@@ -6758,6 +6758,14 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     if cmd == DRM_IOCTL_PRIME_HANDLE_TO_FD {
         if arg == 0 || !validate_user_buf(arg, 12) { return -14; } // EFAULT
         let handle = unsafe { (arg as *const u32).read() };
+        // `drm_prime_handle.flags`: DRM_CLOEXEC (0x2) asks for an fd that does
+        // not survive exec, and every Mesa/libdrm export passes it. Ignoring it
+        // handed the compositor's swapchain dmabufs to its kiosk child — the
+        // greeter inherited a reference on every scanout buffer across
+        // fork+exec, and a greeter that outlived its compositor pinned them.
+        const DRM_CLOEXEC: u32 = 0x2;
+        let prime_flags = unsafe { ((arg + 4) as *const u32).read() };
+        let open_cloexec: u64 = if prime_flags & DRM_CLOEXEC != 0 { 0x8_0000 } else { 0 };
         // Scope the lookup to the calling open, exactly as every other
         // handle-consuming virtgpu ioctl does (b80ab5a). A card/render fd
         // carries a per-open identity; anything else resolves to 0, which
@@ -6793,7 +6801,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         while dn > 0 { dn -= 1; path[plen] = digits[dn]; plen += 1; }
         let open_msg = make_vfs_msg(vfs::VFS_OPEN, &[
             path.as_ptr() as u64,
-            (0x042 | 0x200) as u64, // O_RDWR|O_CREAT|O_TRUNC
+            (0x042 | 0x200) as u64 | open_cloexec, // O_RDWR|O_CREAT|O_TRUNC [|O_CLOEXEC]
             0o600u64,
         ]);
         let newfd = vfs_reply_val(&vfs::handle(&open_msg, pid));

@@ -27,6 +27,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_buddy_survives_churn() { failures += 1; }
     if !test_map_shared_fork_visibility() { failures += 1; }
     if !test_fill_most_of_ram() { failures += 1; }
+    if !test_exit_frees_page_tables() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -147,7 +148,12 @@ unsafe fn test_map_shared_fork_visibility() -> bool {
 /// demand-paged, so this is also the biggest page-fault storm in the suite:
 /// ~0.9 M faults on a 4 GiB guest, a few seconds under KVM.
 unsafe fn free_ram() -> usize {
+    // Linux's own numbers (see userland/meminfo): 99 was x86_64-only, so on
+    // aarch64 this read 0 and the RAM tests silently skipped themselves.
+    #[cfg(target_arch = "x86_64")]
     const SYS_SYSINFO: usize = 99;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_SYSINFO: usize = 179;
     let mut si = [0u8; 112];
     if leandros_libc::syscall::syscall1(SYS_SYSINFO, si.as_mut_ptr() as usize) != 0 { return 0; }
     u64::from_le_bytes(si[40..48].try_into().unwrap()) as usize
@@ -230,6 +236,51 @@ unsafe fn test_fill_most_of_ram() -> bool {
     let _ = free0;
     let ok = worst_bad == 0 && last_delta < (64 << 20);
     report(name, ok)
+}
+
+/// A process's death must return its page-table tree, not just its frames.
+///
+/// Until 2026-09-18 `AddressSpace::drop` freed the leaf frames and the root
+/// and left every intermediate PDPT/PD/PT page allocated forever: ~50 pages
+/// per `brush -c true`, ~1000 per greeter chain, unbounded across a boot.
+/// Each child here maps 16 sparse 64 MiB regions and touches one page per
+/// 2 MiB of each, so it owns ~512 page-table pages (2 MiB) that only the
+/// tree walk can return; 32 such deaths that leaked would cost 64 MiB, a
+/// tree that is freed costs the noise floor. The bar is the mean loss per
+/// death, so a concurrent desktop's one-off allocation cannot fail it.
+unsafe fn test_exit_frees_page_tables() -> bool {
+    let name = b"exit_frees_page_tables\0";
+    const REGION: usize = 64 << 20;
+    const REGIONS: usize = 16;
+    const DEATHS: usize = 32;
+    let before = free_ram();
+    let mut spawn_failures = 0usize;
+    for _ in 0..DEATHS {
+        let pid = fork();
+        if pid == 0 {
+            for _ in 0..REGIONS {
+                let p = mmap(core::ptr::null_mut(), REGION, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if p as isize == -1 { exit(3); }
+                let mut off = 0usize;
+                while off < REGION { *p.add(off) = 1; off += 2 << 20; }
+            }
+            exit(0);
+        }
+        if pid < 0 { spawn_failures += 1; continue; }
+        let mut status: i32 = 0;
+        wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+        if status != 0 { spawn_failures += 1; }
+    }
+    let after = free_ram();
+    let lost = before.saturating_sub(after);
+    let per_death = lost / DEATHS;
+    write(STDOUT_FILENO, b"  deaths=".as_ptr(), 9); print_dec(DEATHS);
+    write(STDOUT_FILENO, b" lost_kib_per_death=".as_ptr(), 20); print_dec(per_death >> 10);
+    write(STDOUT_FILENO, b" child_failures=".as_ptr(), 16); print_dec(spawn_failures);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    // A leaked tree is >= 2 MiB per death; the budget is a quarter of it.
+    report(name, spawn_failures == 0 && per_death < (512 << 10))
 }
 
 unsafe fn print_dec(mut v: usize) {

@@ -235,41 +235,6 @@ pub unsafe extern "C" fn arch_unmap_page(page_table_root: usize, virt: usize) {
     unmap_4k(page_table_root as *mut u64, virt);
 }
 
-/// Free every L1, L2 and L3 table page reachable from the L0 root `pgd_phys`
-/// (see `mm::paging::free_user_page_tables`). A TTBR0 root holds nothing but
-/// this address space's own tables — the kernel lives in TTBR1 — including
-/// the UART/GIC identity tables `arch_alloc_page_table_root` installed.
-/// Block descriptors (bit 1 clear) are leaves and are skipped; L3 page
-/// descriptors are the VMAs' frames and are not touched. The root page
-/// itself is left to the caller.
-#[no_mangle]
-pub unsafe extern "C" fn arch_free_user_page_tables(pgd_phys: usize) {
-    const ADDR: u64 = 0x0000_FFFF_FFFF_F000;
-    let valid = PageDescFlags::VALID.bits();
-    let is_table = |e: u64| e & valid != 0 && e & 0b10 != 0;
-    let pgd = mm::phys_to_virt(pgd_phys) as *mut u64;
-    for i in 0..512 {
-        let e0 = pgd.add(i).read();
-        if !is_table(e0) { continue; }
-        let l1_phys = (e0 & ADDR) as usize;
-        let l1 = mm::phys_to_virt(l1_phys) as *mut u64;
-        for j in 0..512 {
-            let e1 = l1.add(j).read();
-            if !is_table(e1) { continue; }
-            let l2_phys = (e1 & ADDR) as usize;
-            let l2 = mm::phys_to_virt(l2_phys) as *mut u64;
-            for k in 0..512 {
-                let e2 = l2.add(k).read();
-                if !is_table(e2) { continue; }
-                mm::buddy::free((e2 & ADDR) as usize, 0);
-            }
-            mm::buddy::free(l2_phys, 0);
-        }
-        mm::buddy::free(l1_phys, 0);
-        pgd.add(i).write(0);
-    }
-}
-
 // ── arch_set_page_table ───────────────────────────────────────────────────────
 
 /// Returns the current user-space page table root (TTBR0_EL1).
@@ -319,6 +284,51 @@ pub unsafe extern "C" fn arch_set_page_table(root: usize) {
 /// needed.
 #[no_mangle]
 pub unsafe extern "C" fn arch_load_kernel_page_table() {
+}
+
+// ── arch_free_user_page_tables ───────────────────────────────────────────────
+
+/// Free every intermediate table reachable from the TTBR0 root `pgd_phys`
+/// (L1, L2 and L3 tables), returning how many 4 KiB table pages were
+/// released. The root itself is left to the caller.
+///
+/// A TTBR0 root is private to one address space: `arch_alloc_page_table_root`
+/// starts from a zeroed page and every table below it — including the ones
+/// behind the UART/GIC identity mappings it installs — was allocated for this
+/// root alone, so the whole tree is ours to return. TTBR1 (the kernel half)
+/// is a separate root and is never reachable from here. Block descriptors
+/// (bit 1 clear) are leaves and are skipped; leaf page frames belong to the
+/// VMA layer and are not touched.
+#[no_mangle]
+pub unsafe extern "C" fn arch_free_user_page_tables(pgd_phys: usize) -> usize {
+    const ADDR: u64 = 0x0000_FFFF_FFFF_F000;
+    let valid = PageDescFlags::VALID.bits();
+    let mut freed = 0usize;
+    let pgd = mm::phys_to_virt(pgd_phys) as *mut u64;
+    for i in 0..512 {
+        let e0 = pgd.add(i).read();
+        if e0 & valid == 0 || e0 & 0b10 == 0 { continue; }
+        let l1_phys = (e0 & ADDR) as usize;
+        let l1 = mm::phys_to_virt(l1_phys) as *mut u64;
+        for j in 0..512 {
+            let e1 = l1.add(j).read();
+            if e1 & valid == 0 || e1 & 0b10 == 0 { continue; }
+            let l2_phys = (e1 & ADDR) as usize;
+            let l2 = mm::phys_to_virt(l2_phys) as *mut u64;
+            for k in 0..512 {
+                let e2 = l2.add(k).read();
+                if e2 & valid == 0 || e2 & 0b10 == 0 { continue; }
+                mm::buddy::free((e2 & ADDR) as usize, 0);
+                freed += 1;
+            }
+            mm::buddy::free(l2_phys, 0);
+            freed += 1;
+        }
+        mm::buddy::free(l1_phys, 0);
+        freed += 1;
+        pgd.add(i).write(0);
+    }
+    freed
 }
 
 // ── arch_alloc_page_table_root ────────────────────────────────────────────────
