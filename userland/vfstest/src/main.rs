@@ -159,6 +159,60 @@ unsafe fn raw_mode(path: *const u8) -> i32 {
     core::ptr::read_unaligned(p) as i32
 }
 
+#[cfg(target_arch = "aarch64")] const SYS_UTIMENSAT: usize = 88;
+#[cfg(target_arch = "x86_64")]  const SYS_UTIMENSAT: usize = 280;
+// st_mtim (sec, nsec as i64) at 88 on both ABIs — servers/vfs write_stat_times.
+const STAT_MTIME_OFF: usize = 88;
+
+/// `st_mtim` of `path` as (sec, nsec), or None when stat fails.
+unsafe fn raw_mtime(path: *const u8) -> Option<(i64, i64)> {
+    let mut buf = [0u8; STAT_SIZE];
+    let r = syscall4(SYS_NEWFSTATAT, AT_FDCWD as usize, path as usize, buf.as_mut_ptr() as usize, 0);
+    if r < 0 { set_errno(-r as i32); return None; }
+    let sec  = core::ptr::read_unaligned(buf.as_ptr().add(STAT_MTIME_OFF) as *const i64);
+    let nsec = core::ptr::read_unaligned(buf.as_ptr().add(STAT_MTIME_OFF + 8) as *const i64);
+    Some((sec, nsec))
+}
+
+unsafe fn raw_utimensat(path: *const u8, times: *const i64) -> i32 {
+    let r = syscall4(SYS_UTIMENSAT, AT_FDCWD as usize, path as usize, times as usize, 0);
+    if r < 0 { set_errno(-r as i32); -1 } else { 0 }
+}
+
+/// Timestamps are real, on both backends: a new file's mtime is "now" (the
+/// same clock `clock_gettime` reads — this kernel's CLOCK_REALTIME counts
+/// from boot, so the two agree to within the call gap), a write moves it
+/// forward, and utimensat sets it to the nanosecond. Before this, stat
+/// reported every timestamp as 0 and utimensat was a kernel no-op.
+unsafe fn test_timestamps(root: &[u8], name: &[u8]) -> bool {
+    let mut b = [0u8; 96];
+    let path = mkpath(&mut b, root, b"_ts");
+    unlink(path);
+    let mut t0 = timespec { tv_sec: 0, tv_nsec: 0 };
+    clock_gettime(0, &mut t0); // CLOCK_REALTIME
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    let m1 = match raw_mtime(path) { Some(m) => m, None => { close(fd); return report(name, false); } };
+    let ns = |t: (i64, i64)| t.0 * 1_000_000_000 + t.1;
+    let t0n = t0.tv_sec * 1_000_000_000 + t0.tv_nsec;
+    // Created "now": not zero, not before the clock we read just before, and
+    // not more than a second after it.
+    if ns(m1) == 0 || ns(m1) < t0n - 20_000_000 || ns(m1) > t0n + 1_000_000_000 {
+        close(fd); unlink(path); return report(name, false);
+    }
+    usleep(30_000); // well past the 10 ms tick either way
+    if write(fd, b"x".as_ptr(), 1) != 1 { close(fd); unlink(path); return report(name, false); }
+    close(fd);
+    let m2 = match raw_mtime(path) { Some(m) => m, None => { unlink(path); return report(name, false); } };
+    if ns(m2) <= ns(m1) { unlink(path); return report(name, false); }
+    // Exact set.
+    let times: [i64; 4] = [123, 456, 789_000, 12_345];
+    if raw_utimensat(path, times.as_ptr()) != 0 { unlink(path); return report(name, false); }
+    let m3 = raw_mtime(path);
+    unlink(path);
+    report(name, m3 == Some((789_000, 12_345)))
+}
+
 /// `faccessat(AT_FDCWD, path, mode, 0)` — used to probe ACL-enforced access.
 unsafe fn raw_faccessat(path: *const u8, mode: i32) -> i32 {
     let r = syscall4(SYS_FACCESSAT, AT_FDCWD as usize, path as usize, mode as usize, 0);
@@ -703,6 +757,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_symlink_read(b"/tmp/xa", b"symlink_read_relative_tmpfs\0", b"symlink_read_absolute_tmpfs\0") { failures += 1; }
     if !test_symlink_read(b"/data/xa", b"symlink_read_relative_f2fs\0", b"symlink_read_absolute_f2fs\0") { failures += 1; }
     if !test_symlink_cross_mount(b"symlink_cross_mount_tmpfs_to_f2fs\0") { failures += 1; }
+
+    if !test_timestamps(b"/tmp/xa", b"timestamps_tmpfs\0") { failures += 1; }
+    if !test_timestamps(b"/data/xa", b"timestamps_f2fs\0") { failures += 1; }
 
     puts(b"--- vfstest done ---\0".as_ptr());
     failures

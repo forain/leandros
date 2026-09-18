@@ -47,8 +47,6 @@ Reconciled against `main` at `60f49bd` following the 2026-09-15/16 bug sweep
 - `RUN_QUEUE` is contended on most 100 Hz ticks with the greeter desktop idle (tick-hook
   `try_lock` fails >50%) → every timed poll/epoll wake pays 1–2 ticks of retry latency; the
   long holder is not yet found.
-- `utimensat` is a kernel no-op; exec x-bit unchecked; no supplementary groups; default-ACL
-  inheritance missing.
 - ~~brush wedges the login shell if a pipeline wait errors / `fg` of a stopped pipeline
   re-reports Stopped / `cmd &` shows `<pid unknown>`~~ — **FIXED 2026-09-18 (lane/brush)**, all
   three were brush bugs (`../brush` `3423c0e`, pinned in `ports/brush/`): `fg`/`bg`/`kill %n`
@@ -758,9 +756,15 @@ kills the tab outright: `assert_eq!(entry.pw_uid, uid)` (`unix.rs:93`), the `F_S
   pins the matrix on f2fs (`/data`) and tmpfs. The greeter's two dependencies below were
   resolved by staging, not by holes: `userland/init` seeds `/run/user/<uid>` per passwd
   account, the greeter phase lives in `/run/user/990`, and `greeter-launch` chowns the two
-  socket nodes to the account before dropping (`ports/greetd/README.md`). Still unchecked:
-  `utimensat` (a no-op syscall), exec's x-bit, supplementary groups (none exist),
-  default-ACL inheritance at create time.
+  socket nodes to the account before dropping (`ports/greetd/README.md`). The four gaps that
+  note left open were closed by lane `vfsperm2` (2026-09-18, `artifacts/notes/
+  lane-vfsperm2-2026-09-18.md`): every gate now takes an `xattr::Cred` (euid, egid,
+  supplementary groups — `setgroups`/`getgroups` are real, `/bin/login` sets them from
+  `/etc/group`); `execve` needs x on the ELF, not just on a `#!` script; `utimensat` (and
+  x86-64 `utimes`/`utime`/`futimesat`) is real, with the owner-vs-write rule, and both
+  filesystems keep atime/mtime/ctime (f2fs inode bytes 36..72) — `stat` used to report 0;
+  a directory's default ACL is inherited at creation (`xattr::acl_create`, the umask
+  travels with the mode as `mode | umask << 16` and is ignored when a default ACL applies).
   *Historical finding:* Filesystem permissions were enforced on ONE operation only: `open(2)`
   of an inode that already exists. Measured 2026-08-08 by enumerating every `xattr::access_check` call
   site in the tree; there are five outside the xattr crate's own gates, and **each takes a

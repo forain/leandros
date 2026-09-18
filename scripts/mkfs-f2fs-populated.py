@@ -495,8 +495,15 @@ def main():
     # for every caller in the image and the change persisted across boots on a
     # writable root. /bin/greeter-launch replaces it by becoming the account for
     # real, so /etc/passwd is left alone.
+    # Supplementary memberships are real: /bin/login (and musl's initgroups,
+    # which greetd's session worker calls) read the member lists and
+    # setgroups(2) them, and every filesystem permission check consults the
+    # list. `video`/`input` carry the conventional Debian gids so a device node
+    # chgrp'd to either is reachable by the account without being world-rw.
     etc_files.append(("group", (
         b"root:x:0:\n"
+        b"video:x:44:leandro\n"
+        b"input:x:104:leandro\n"
         b"cosmic-greeter:x:990:\n"
         b"leandro:x:1000:\n"
     ), 0o100644))

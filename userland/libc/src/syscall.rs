@@ -385,6 +385,12 @@ pub mod nr {
     #[cfg(target_arch = "aarch64")] pub const SETSID:         usize = 157;
     #[cfg(target_arch = "x86_64")]  pub const SETSID:         usize = 112;
 
+    #[cfg(target_arch = "aarch64")] pub const GETGROUPS:      usize = 158;
+    #[cfg(target_arch = "x86_64")]  pub const GETGROUPS:      usize = 115;
+
+    #[cfg(target_arch = "aarch64")] pub const SETGROUPS:      usize = 159;
+    #[cfg(target_arch = "x86_64")]  pub const SETGROUPS:      usize = 116;
+
     #[cfg(target_arch = "aarch64")] pub const FCHMOD:         usize = 52;
     #[cfg(target_arch = "x86_64")]  pub const FCHMOD:         usize = 91;
 
@@ -534,6 +540,10 @@ pub mod nr {
     pub const SETRESGID: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const SETSID: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const GETGROUPS: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const SETGROUPS: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const FCHMOD: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
