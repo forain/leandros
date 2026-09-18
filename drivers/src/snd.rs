@@ -174,7 +174,11 @@ impl VirtioSnd {
         })?;
         
         let pci_cmd = pci::pci_read_config_16(dev.bus, dev.dev, dev.func, 0x04);
-        pci::pci_write_config_16(dev.bus, dev.dev, dev.func, 0x04, pci_cmd | 0x06);
+        // Memory Space + Bus Master on; INTx Disable (bit 10) on: this driver
+        // polls and never reads its ISR status, so an asserted INTx would stay
+        // asserted forever and storm the GPU's completion interrupt on a
+        // shared virt PCIe line (`virtio_gpu::enable_intx`).
+        pci::pci_write_config_16(dev.bus, dev.dev, dev.func, 0x04, (pci_cmd | 0x06) | pci::PCI_CMD_INTX_DISABLE);
 
         let phys = buddy::alloc(PERSISTENT_ORDER).ok_or(DriverError::Io)?;
         self.persistent = phys_to_virt(phys) as *mut VirtioSndPersistent;

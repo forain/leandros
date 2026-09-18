@@ -97,6 +97,13 @@ pub struct VirtioGpuDevice {
     /// table, when the device has one and this arch can take the interrupt.
     /// `None` leaves completion to the tick poller alone.
     msix: Option<(u8, *mut u32)>,
+    /// The ISR status byte (`VIRTIO_PCI_CAP_ISR_CFG`). Reading it returns and
+    /// clears the queue/config interrupt bits and deasserts INTx; null when
+    /// the device did not expose one.
+    isr_cfg: *mut u8,
+    /// GIC INTID the device's INTx pin is armed on (aarch64), `None` when
+    /// completion is left to the tick poller.
+    intx: Option<u32>,
     /// Monotonically increasing fence id.  Never reused, never zero: the host
     /// treats fence_id 0 as "no fence" on some paths.
     next_fence_id: u64,
@@ -542,6 +549,11 @@ struct Inflight {
 /// `irq_window` in 256). The device answering nothing for this long is wedged.
 const CTRLQ_WAIT_ITERS: u64 = 100_000_000;
 
+/// Fence id of the most recent present (`send_present_async`), 0 before the
+/// first. Written under `VIRTIO_GPU`; read by the DRM layer right after the
+/// present it just issued, on the same task, so it names that present.
+pub static LAST_PRESENT_FENCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// All fence ids `<= GPU_FENCE_FLOOR` have retired. Lock-free mirror of
 /// `VirtioGpuDevice::fence_floor` for the DRM layer's out-fence service, which
 /// runs from the tick and must not take `VIRTIO_GPU`.
@@ -581,6 +593,97 @@ pub static CTRLQ_IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 pub extern "C" fn virtio_gpu_msix_isr() {
     CTRLQ_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     ctrlq_tick();
+    kick_parked_waiter();
+}
+
+/// QEMU virt wires the PCIe host bridge's four INTx lines to SPIs 3..6, i.e.
+/// INTIDs 35..38, swizzled per slot: line = (slot + pin) % 4 with INTA = 0
+/// (`hw/arm/virt.c` VIRT_PCIE, `pci_swizzle_map_irq_fn`).
+#[cfg(target_arch = "aarch64")]
+const VIRT_PCIE_INTX_BASE_INTID: u32 = 32 + 3;
+/// Deliveries on the armed INTx line that found no GPU condition (`isr == 0`):
+/// another function on the same line. Diagnostic; the guard below acts on the
+/// consecutive count.
+pub static INTX_SPURIOUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(target_arch = "aarch64")]
+static INTX_SPURIOUS_RUN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Consecutive deliveries with no GPU condition after which the line is judged
+/// held by someone else and given up (a level line nobody clears re-fires at
+/// every EOI and would livelock the CPU otherwise). Legitimate sharing yields
+/// far fewer between two GPU completions.
+#[cfg(target_arch = "aarch64")]
+const INTX_STORM_LIMIT: u32 = 1024;
+/// INTID the line is armed on, 0 when it is not, for the storm guard and the
+/// `[DRMSTAT]` line.
+static INTX_INTID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The ISR status byte, published for the handler, which must reach it without
+/// the device lock (the lock holder is often the very task it interrupted).
+static INTX_ISR_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The INTx handler, entered from `arch_aarch64::exception::handle_irq` via
+/// the GIC dispatch table, IRQs masked, before EOI. Reading the ISR status
+/// byte is what deasserts the level line, so it comes first and
+/// unconditionally; then the same body as the MSI-X handler. Bit 0 is a
+/// queue interrupt (control or cursor queue — the cursor queue's avail flags
+/// ask for none), bit 1 a config change (display-info), which nobody
+/// consumes yet.
+#[cfg(target_arch = "aarch64")]
+extern "C" fn virtio_gpu_intx_isr() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let p = INTX_ISR_PTR.load(core::sync::atomic::Ordering::Acquire) as *mut u8;
+    if p.is_null() { return; }
+    let isr = unsafe { p.read_volatile() };
+    if isr == 0 {
+        INTX_SPURIOUS.fetch_add(1, Relaxed);
+        let run = INTX_SPURIOUS_RUN.fetch_add(1, Relaxed) + 1;
+        if run >= INTX_STORM_LIMIT {
+            let id = INTX_INTID.swap(0, Relaxed);
+            if id != 0 {
+                extern "C" { fn arch_disable_irq(id: u32); }
+                unsafe { arch_disable_irq(id); }
+                CTRLQ_IRQ_ARMED.store(false, core::sync::atomic::Ordering::Release);
+                crate::pci::serial_debug("[GPU] INTx storm: INTID ");
+                crate::pci::serial_debug_hex(id);
+                crate::pci::serial_debug(" held asserted by another function; masked, polling only\n");
+            }
+        }
+        return;
+    }
+    INTX_SPURIOUS_RUN.store(0, Relaxed);
+    if isr & 1 != 0 {
+        if CTRLQ_IRQS.fetch_add(1, Relaxed) == 0 {
+            crate::pci::serial_debug("[GPU] INTx: first control-queue completion interrupt\n");
+        }
+        ctrlq_tick();
+        kick_parked_waiter();
+    }
+}
+
+/// True when a completion interrupt is armed on this device (MSI-X on x86_64,
+/// INTx on aarch64): a waiter may park the CPU instead of spinning, because
+/// the host's answer will wake it.
+#[inline]
+pub fn irq_armed() -> bool {
+    CTRLQ_IRQ_ARMED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Park the CPU until the next interrupt, IRQs masked at entry and exit, and
+/// let that interrupt run. On aarch64 `wfi` wakes on a pending interrupt
+/// whether or not PSTATE.I masks it, so the sequence is race-free: a
+/// completion that lands between the caller's check and the `wfi` is pending
+/// and returns immediately. On x86_64 `hlt` needs IF=1 to wake at all; the
+/// `sti` shadow delays recognition to the `hlt` itself, which gives the same
+/// atomicity. Either way the handler that ran could not take the device lock
+/// the caller holds; the caller reaps after this returns.
+#[inline]
+fn park_until_irq() {
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("wfi", options(nomem, nostack));
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+    }
+    sched::irq_window();
 }
 
 /// Register the fence-event service (`fn() -> bool`). One hook; the last
@@ -651,6 +754,73 @@ impl Drop for SpinWindow {
     }
 }
 
+/// Synchronous waits `submit` and `ensure_ctrlq_room` still take under
+/// `VIRTIO_GPU` (the reply-needing ~0.5 % of traffic and a full ring) no
+/// longer spin the vCPU when a completion interrupt is armed: each step parks
+/// the CPU in `wfi`/`hlt` until an interrupt — the device's, or the tick —
+/// and reaps on return. The lock stays held, so this is not a sleep other
+/// tasks can use the CPU through, but the host sees an idle vCPU for the
+/// round trip and the wake is the interrupt's latency, not a poll's.
+///
+/// Without an interrupt the wake would be the tick, up to 10 ms away, so the
+/// unarmed case keeps the spin. Bounded in ticks rather than iterations
+/// because each parked step is at least one interrupt long.
+pub static CTRLQ_PARKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const CTRLQ_PARK_TIMEOUT_TICKS: u64 = 500; // 5 s at 100 Hz: the device is wedged
+/// The CPU a `CtrlqWait` is parked on, `NO_PARKED_CPU` when none. The
+/// completion interrupt is routed to the BSP (MSI-X destination APIC 0, the
+/// GIC IROUTER), so a waiter on any other CPU would sleep through it until
+/// its own tick; the handler reads this and kicks that CPU with the
+/// reschedule IPI (no flag set, so nothing reschedules — the SGI/vector
+/// only ends the `wfi`/`hlt`). Set for the whole wait, not just around the
+/// park, so a completion that lands between the waiter's check and its park
+/// still sends the kick, which is then pending when the park begins and ends
+/// it at once. One waiter at a time: the wait holds `VIRTIO_GPU`.
+static CTRLQ_PARKED_CPU: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(NO_PARKED_CPU);
+const NO_PARKED_CPU: usize = usize::MAX;
+/// IPIs the completion handler sent to a parked waiter on another CPU.
+pub static CTRLQ_PARK_KICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// From the completion handler: wake a waiter parked on another CPU.
+#[inline]
+fn kick_parked_waiter() {
+    extern "C" { fn arch_send_resched_ipi(cpu: usize); }
+    let c = CTRLQ_PARKED_CPU.load(core::sync::atomic::Ordering::Acquire);
+    if c != NO_PARKED_CPU && c != unsafe { sched::cpu_id() } {
+        CTRLQ_PARK_KICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        unsafe { arch_send_resched_ipi(c); }
+    }
+}
+
+struct CtrlqWait { park: bool, deadline: u64 }
+impl CtrlqWait {
+    fn new(window: &SpinWindow) -> Self {
+        let park = window.open && irq_armed();
+        if park {
+            CTRLQ_PARKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            CTRLQ_PARKED_CPU.store(unsafe { sched::cpu_id() }, core::sync::atomic::Ordering::Release);
+        }
+        CtrlqWait { park, deadline: sched::ticks().wrapping_add(CTRLQ_PARK_TIMEOUT_TICKS) }
+    }
+    /// One wait step; false when the parked wait has run out of time.
+    #[inline]
+    fn step(&self, window: &SpinWindow, iter: u64) -> bool {
+        if self.park {
+            park_until_irq();
+            (sched::ticks().wrapping_sub(self.deadline) as i64) < 0
+        } else {
+            window.pulse(iter);
+            core::hint::spin_loop();
+            true
+        }
+    }
+}
+impl Drop for CtrlqWait {
+    fn drop(&mut self) {
+        if self.park { CTRLQ_PARKED_CPU.store(NO_PARKED_CPU, core::sync::atomic::Ordering::Release); }
+    }
+}
+
 
 impl VirtioGpuDevice {
     pub fn new() -> Option<Self> {
@@ -671,7 +841,7 @@ impl VirtioGpuDevice {
         let mut notify_cfg = core::ptr::null_mut();
         let mut notify_off_multiplier = 0;
         let mut device_cfg = core::ptr::null_mut();
-        let mut _isr_cfg = core::ptr::null_mut();
+        let mut isr_cfg: *mut u8 = core::ptr::null_mut();
         let mut shmem: Option<SharedMemRegion> = None;
         let mut msix: Option<(u8, *mut u32)> = None;
 
@@ -784,7 +954,7 @@ impl VirtioGpuDevice {
                                         notify_off_multiplier = pci_read_config_32(dev.bus, dev.dev, dev.func, cap_ptr + 16);
                                         notify_cfg = virt as *mut u32;
                                     },
-                                    VIRTIO_PCI_CAP_ISR_CFG => _isr_cfg = virt as *mut u8,
+                                    VIRTIO_PCI_CAP_ISR_CFG => isr_cfg = virt as *mut u8,
                                     VIRTIO_PCI_CAP_DEVICE_CFG => {
                                         crate::pci::rdebug("[GPU] Found DEVICE_CFG\n");
                                         device_cfg = virt as *mut u8;
@@ -814,6 +984,8 @@ impl VirtioGpuDevice {
             features_hi: 0,
             shmem,
             msix,
+            isr_cfg,
+            intx: None,
             next_fence_id: 1,
             fence_floor: 0,
             fences_ahead: Vec::new(),
@@ -953,6 +1125,7 @@ impl VirtioGpuDevice {
             // 6b. Control-queue completion interrupt (MSI-X vector 0), before
             //     DRIVER_OK as the spec orders it. Failure leaves the poller.
             self.enable_msix();
+            self.enable_intx();
 
             // 7. Set DRIVER_OK status bit
             status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER_OK);
@@ -1006,6 +1179,61 @@ impl VirtioGpuDevice {
         crate::pci::serial_debug("\n");
     }
 
+    /// Route control-queue completions to a GIC SPI through the device's INTx
+    /// pin (aarch64, QEMU virt). The transport is virtio-gpu-pci behind the
+    /// virt board's PCIe host bridge, whose INTA..D are SPIs 3..6; the line a
+    /// function lands on is the standard swizzle of its slot and pin. INTx is
+    /// level-triggered: the handler reads the ISR status byte, which is what
+    /// deasserts it, before the common dispatcher EOIs.
+    ///
+    /// Every other virtio-pci function this kernel drives is polled and sets
+    /// its own INTx-disable bit (PCI command bit 10), so a line shared with
+    /// one of them is never held asserted by a device nobody services. The
+    /// handler's storm guard covers a function that does not, by masking the
+    /// SPI again and leaving the poller.
+    ///
+    /// The 100 Hz poller keeps running regardless, exactly as with MSI-X.
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe fn enable_intx(&mut self) {}
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn enable_intx(&mut self) {
+        if self.msix.is_some() || self.isr_cfg.is_null() { return; }
+        extern "C" { fn arch_request_irq(id: u32, handler: usize) -> bool; }
+        let dev = &self._pci_dev;
+        let pin = pci_read_config_8(dev.bus, dev.dev, dev.func, 0x3D);
+        if pin == 0 || pin > 4 {
+            crate::pci::serial_debug("[GPU] INTx: device has no interrupt pin; polling only\n");
+            return;
+        }
+        let intid = VIRT_PCIE_INTX_BASE_INTID + ((dev.dev as u32 + (pin as u32 - 1)) % 4);
+        // INTx enabled (command bit 10 clear); MSI-X stays off, so the queue
+        // and config vectors in common_cfg are irrelevant.
+        let cmd = pci_read_config_16(dev.bus, dev.dev, dev.func, 0x04);
+        pci_write_config_16(dev.bus, dev.dev, dev.func, 0x04, cmd & !0x0400);
+        // Any stale condition from before the handler existed would be
+        // delivered the instant the SPI is enabled; clear it first.
+        let _ = self.isr_cfg.read_volatile();
+        INTX_ISR_PTR.store(self.isr_cfg as usize, core::sync::atomic::Ordering::Release);
+        INTX_INTID.store(intid, core::sync::atomic::Ordering::Release);
+        if !arch_request_irq(intid, virtio_gpu_intx_isr as *const () as usize) {
+            INTX_INTID.store(0, core::sync::atomic::Ordering::Release);
+            crate::pci::serial_debug("[GPU] INTx: GIC refused INTID ");
+            crate::pci::serial_debug_hex(intid);
+            crate::pci::serial_debug("; polling only\n");
+            return;
+        }
+        self.intx = Some(intid);
+        CTRLQ_IRQ_ARMED.store(true, core::sync::atomic::Ordering::Release);
+        crate::pci::serial_debug("[GPU] INTx armed: slot ");
+        crate::pci::serial_debug_hex(dev.dev as u32);
+        crate::pci::serial_debug(" pin ");
+        crate::pci::serial_debug_hex(pin as u32);
+        crate::pci::serial_debug(" -> INTID ");
+        crate::pci::serial_debug_hex(intid);
+        crate::pci::serial_debug("\n");
+    }
+
     unsafe fn setup_queue(&mut self, id: u16) -> Option<VirtioQueue> {
         let cfg = self.common_cfg;
         core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(id);
@@ -1050,6 +1278,15 @@ impl VirtioGpuDevice {
             (*desc.add(i as usize)).next = i + 1;
         }
         (*desc.add((size - 1) as usize)).next = 0xFFFF; // Mark end of chain
+
+        // The cursor queue is reaped lazily on the next cursor command and
+        // nobody waits on it, so ask the device not to interrupt for it: on a
+        // shared INTx line every cursor completion would otherwise enter the
+        // control-queue handler for nothing. Advisory per the spec; QEMU
+        // honours it.
+        if id == 1 {
+            core::ptr::addr_of_mut!((*avail).flags).write_volatile(1); // VIRTQ_AVAIL_F_NO_INTERRUPT
+        }
 
         core::ptr::addr_of_mut!((*cfg).queue_desc).write_volatile(desc_phys as u64);
         core::ptr::addr_of_mut!((*cfg).queue_driver).write_volatile(avail_phys as u64);
@@ -1365,13 +1602,13 @@ impl VirtioGpuDevice {
         let t0 = if stat { crate::snd::monotonic_us() } else { 0 };
         CTRLQ_ROOM_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let window = SpinWindow::new();
+        let wait = CtrlqWait::new(&window);
         let mut iter = 0u64;
         let mut ok = false;
         while iter < CTRLQ_WAIT_ITERS {
             if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
             if self.queues[0].as_ref().map(|q| q.num_free >= need).unwrap_or(false) { ok = true; break; }
-            window.pulse(iter);
-            core::hint::spin_loop();
+            if !wait.step(&window, iter) { break; }
             iter += 1;
         }
         drop(window);
@@ -1445,13 +1682,13 @@ impl VirtioGpuDevice {
         let stat = crate::drm_device_interface::DRM_STATS;
         let t0 = if stat { crate::snd::monotonic_us() } else { 0 };
         let window = SpinWindow::new();
+        let wait = CtrlqWait::new(&window);
         let mut iter = 0u64;
         let mut done = false;
         while iter < CTRLQ_WAIT_ITERS {
             if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
             if self.inflight[head_idx as usize].map(|e| e.done).unwrap_or(false) { done = true; break; }
-            window.pulse(iter);
-            core::hint::spin_loop();
+            if !wait.step(&window, iter) { break; }
             iter += 1;
         }
         drop(window);
@@ -1536,6 +1773,18 @@ impl VirtioGpuDevice {
     /// is kicked. A host refusal surfaces in `ctrlq_reap`'s log, not here.
     fn send_command_async(&mut self, cmd_data: &[u8]) -> bool {
         self.submit_async(cmd_data, None, false).is_ok()
+    }
+
+    /// The last command of a present (RESOURCE_FLUSH, SET_SCANOUT_BLOB),
+    /// fenced, with the fence id published in `LAST_PRESENT_FENCE` so the DRM
+    /// layer can hang the flip-complete event on the host actually having
+    /// shown the frame (`drm_device_interface::queue_flip_event`) rather
+    /// than on the next tick.
+    fn send_present_async(&mut self, cmd_data: &[u8]) -> bool {
+        match self.submit_async(cmd_data, None, true) {
+            Ok(f) => { LAST_PRESENT_FENCE.store(f, core::sync::atomic::Ordering::Release); true }
+            Err(()) => false,
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1921,7 +2170,7 @@ impl VirtioGpuDevice {
             core::slice::from_raw_parts(&flush as *const _ as *const u8, core::mem::size_of::<VirtioGpuResourceFlush>())
         };
         
-        self.send_command_async(flush_data)
+        self.send_present_async(flush_data)
     }
 
     /// SET_SCANOUT_BLOB: point scanout 0 at a **blob** resource, described the
@@ -1987,7 +2236,7 @@ impl VirtioGpuDevice {
                 core::mem::size_of::<SetScanoutBlob>(),
             )
         };
-        let ok = self.send_command_async(data);
+        let ok = self.send_present_async(data);
         if ok {
             // Same bookkeeping `flush` keeps for a 2D scanout, so the console's
             // next `flush(1, ..)` knows it has to re-point the scanout at
@@ -2018,7 +2267,7 @@ impl VirtioGpuDevice {
                 core::mem::size_of::<VirtioGpuResourceFlush>(),
             )
         };
-        self.send_command_async(data)
+        self.send_present_async(data)
     }
 
     /// The scanout resource currently bound on this device (0 = none yet).

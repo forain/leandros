@@ -6535,6 +6535,9 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     const DRM_IOCTL_FLIP_PAGE: usize = 0x1004;
     const DRM_IOCTL_SET_PLANE: usize = 0x1005;
     const DRM_IOCTL_GET_CAPS: usize = 0x1006;
+    // Read-only virtio-gpu completion-interrupt census (drmsmoke's regression
+    // test of the interrupt path); eight u64s written back.
+    const DRM_IOCTL_GPU_IRQ_STATS: usize = 0x1008;
 
     // Check if it's a standard Linux EVDEV (type 'E' = 0x45) or DRM (type 'd' = 0x64) ioctl
     let ioctl_type = (cmd >> 8) & 0xFF;
@@ -6782,6 +6785,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
        cmd == DRM_IOCTL_GET_MODE || cmd == DRM_IOCTL_SET_MODE ||
        cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||
        cmd == DRM_IOCTL_SET_PLANE || cmd == DRM_IOCTL_GET_CAPS ||
+       cmd == DRM_IOCTL_GPU_IRQ_STATS ||
        is_evdev || is_drm {
         
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);

@@ -299,3 +299,34 @@ fn init_timer() {
 /// firing (see `timer::check_alive`).
 #[no_mangle]
 pub extern "C" fn arch_timer_check_alive() -> bool { timer::check_alive() }
+
+/// Driver-side entry to the GIC dispatch table, for crates below this one in
+/// the dependency graph (`drivers` cannot name `gic`; same seam as
+/// `arch_monotonic_ns`). `handler` is a `fn()` pointer cast to `usize`, and
+/// must honour the IRQ-context contract on `gic::register_handler`: no user
+/// memory, no blocking lock, and the device condition cleared before it
+/// returns, because the SPI is configured level-sensitive and EOI follows
+/// immediately. Registers before enabling (`gic::request_irq`) so a condition
+/// already latched in the device cannot arrive at an empty slot.
+///
+/// Returns false for an id outside the table or a null handler; nothing is
+/// enabled then and the caller keeps whatever polling path it had.
+#[no_mangle]
+pub extern "C" fn arch_request_irq(id: u32, handler: usize) -> bool {
+    if handler == 0 || (id as usize) >= gic::NUM_IRQS || id < 32 { return false; }
+    // SAFETY: the caller passes a `fn()` cast to usize, the representation
+    // `gic::dispatch` reads back.
+    let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(handler) };
+    gic::request_irq(id, f);
+    true
+}
+
+/// Mask an SPI again and drop its pending state, for a driver whose interrupt
+/// turned out to be unusable (a shared level line another function holds
+/// asserted, for instance). The dispatch slot is released too, so a later
+/// delivery — impossible while masked — would take the unhandled path.
+#[no_mangle]
+pub extern "C" fn arch_disable_irq(id: u32) {
+    gic::disable_spi(id);
+    gic::unregister_handler(id);
+}
