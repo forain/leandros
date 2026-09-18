@@ -1,0 +1,825 @@
+From 3423c0e34906ab12c2a45bafee6d26d7ac18fa2b Mon Sep 17 00:00:00 2001
+From: Leandro Forain <leandro.forain@instructure.com>
+Date: Fri, 18 Sep 2026 01:12:34 -0300
+Subject: [PATCH 3/3] jobs: continue and signal whole process groups, keep the
+ terminal, report background pids
+
+Three job-control defects, all visible on Linux with the interactive tests
+added here and on any login console:
+
+* `fg`/`bg` of a stopped pipeline sent SIGCONT to a single pid (the group
+  leader). A pipeline is stopped as a group, so every other member stayed
+  stopped and `fg` then waited on them for ever, leaving the shell hung
+  with the terminal handed to a job that could never finish. Job signals
+  now go to the job's process group (`killpg`, as bash does) when it has
+  one, and to each known process otherwise (job control off). The job's
+  group is taken from its spawned children rather than assumed to equal
+  the first pid, and `kill %n` uses the same path.
+
+* A pipeline that failed after a member had already taken the terminal --
+  a later member failing to spawn, an expansion error, a failed wait --
+  propagated the error without taking the terminal back. The terminal's
+  foreground group was then a dead group, the shell's next read was a
+  background read (SIGTTIN, or EIO for an orphaned login shell) and the
+  shell was wedged. `Pipeline::execute` and `fg` now restore the shell's
+  group on every path, like bash's give_terminal_to(shell_pgrp).
+
+* `cmd &` printed `[1] <pid unknown>`: the announcement was formatted
+  before the background task had spawned anything. The async pid slot is
+  now a resolvable cell; the parent waits for the task to decide what its
+  first command is (first external process spawned, a loop entered, or
+  the task finished) before announcing, so `[n] pid` and `$!` carry the
+  real pid immediately. The slot also carries the process group so
+  `fg`/`bg`/`kill %n` of such a job address the whole group.
+---
+ brush-builtins/src/fg.rs                      |  42 ++--
+ brush-core/Cargo.toml                         |   3 +-
+ brush-core/src/interp.rs                      | 119 +++++++---
+ brush-core/src/jobs.rs                        | 213 ++++++++++++++----
+ brush-core/src/sys/stubs/signal.rs            |  14 ++
+ brush-core/src/sys/unix/signal.rs             |  49 ++--
+ .../tests/cases/compat/background_jobs.yaml   |  43 ++++
+ brush-shell/tests/interactive_tests.rs        |  68 ++++++
+ 8 files changed, 456 insertions(+), 95 deletions(-)
+
+diff --git a/brush-builtins/src/fg.rs b/brush-builtins/src/fg.rs
+index ec5796f..e14ab17 100644
+--- a/brush-builtins/src/fg.rs
++++ b/brush-builtins/src/fg.rs
+@@ -24,13 +24,7 @@ impl builtins::Command for FgCommand {
+ 
+         if let Some(job_spec) = &self.job_spec {
+             if let Some(job) = context.shell.jobs_mut().resolve_job_spec(job_spec) {
+-                job.move_to_foreground()?;
+-                writeln!(stderr, "{}", job.command_line)?;
+-
+-                let result = job.wait().await?;
+-                if is_interactive {
+-                    sys::terminal::move_self_to_foreground()?;
+-                }
++                let result = run_in_foreground(job, is_interactive, &mut stderr).await?;
+ 
+                 if matches!(job.state, jobs::JobState::Stopped) {
+                     // N.B. We use the '\r' to overwrite any ^Z output.
+@@ -49,13 +43,7 @@ impl builtins::Command for FgCommand {
+             }
+         } else {
+             if let Some(job) = context.shell.jobs_mut().current_job_mut() {
+-                job.move_to_foreground()?;
+-                writeln!(stderr, "{}", job.command_line)?;
+-
+-                let result = job.wait().await?;
+-                if is_interactive {
+-                    sys::terminal::move_self_to_foreground()?;
+-                }
++                let result = run_in_foreground(job, is_interactive, &mut stderr).await?;
+ 
+                 if matches!(job.state, jobs::JobState::Stopped) {
+                     // N.B. We use the '\r' to overwrite any ^Z output.
+@@ -71,3 +59,29 @@ impl builtins::Command for FgCommand {
+         }
+     }
+ }
++
++/// Hands the terminal to the job, continues it, announces it, and waits for it to complete
++/// or stop. The shell takes the terminal back on every path — a failed hand-over or a failed
++/// wait included — since a terminal left with a job's process group makes the shell's next
++/// read a background read (SIGTTIN, or EIO for an orphaned login shell), which wedges it.
++async fn run_in_foreground(
++    job: &mut jobs::Job,
++    is_interactive: bool,
++    stderr: &mut impl Write,
++) -> Result<ExecutionResult, brush_core::Error> {
++    let result = match job.move_to_foreground() {
++        Ok(()) => {
++            // Announce only once the job owns the terminal and is running, so that a ^Z
++            // typed right after the announcement reaches the job rather than the shell.
++            writeln!(stderr, "{}", job.command_line)?;
++            job.wait().await
++        }
++        Err(e) => Err(e),
++    };
++
++    if is_interactive {
++        let _ = sys::terminal::move_self_to_foreground();
++    }
++
++    result
++}
+diff --git a/brush-core/Cargo.toml b/brush-core/Cargo.toml
+index d3f59d2..c455ed0 100644
+--- a/brush-core/Cargo.toml
++++ b/brush-core/Cargo.toml
+@@ -45,7 +45,7 @@ thiserror = "2.0.18"
+ tracing = "0.1.44"
+ 
+ [target.'cfg(target_family = "wasm")'.dependencies]
+-tokio = { version = "1.52.3", features = ["io-util", "macros", "rt", "sync"] }
++tokio = { version = "1.52.3", features = ["io-util", "macros", "rt", "sync", "time"] }
+ 
+ [target.'cfg(any(unix, windows))'.dependencies]
+ hostname = "0.4.2"
+@@ -58,6 +58,7 @@ tokio = { version = "1.52.3", features = [
+     "rt-multi-thread",
+     "signal",
+     "sync",
++    "time",
+ ] }
+ 
+ [target.'cfg(windows)'.dependencies]
+diff --git a/brush-core/src/interp.rs b/brush-core/src/interp.rs
+index e839662..8e5b3d1 100644
+--- a/brush-core/src/interp.rs
++++ b/brush-core/src/interp.rs
+@@ -38,13 +38,34 @@ pub struct ExecutionParameters {
+     /// Whether `errexit` (exit on error) behavior should be
+     /// suppressed in this execution context. Defaults to `false`.
+     pub suppress_errexit: bool,
+-    /// If set, a shared slot into which the PID of the first external process spawned in this
+-    /// execution context should be published. Used so that a background job (which executes in a
+-    /// separate task) can report a representative PID for `$!`, `jobs`, and `kill %n`.
+-    pub(crate) async_pid_slot: Option<jobs::AsyncPidSlot>,
++    /// If set, a shared slot through which this execution context reports the identity of its
++    /// first command — the PID (and process group) of the first external process it spawns, or
++    /// "no process" once it is clear that no process will lead it. Used so that a background job
++    /// (which executes in a separate task) can report a representative PID for `[n] pid`,
++    /// `$!`, `jobs`, and `kill %n`.
++    pub(crate) async_pid_slot: Option<std::sync::Arc<jobs::AsyncPidSlot>>,
+ }
+ 
+ impl ExecutionParameters {
++    /// Reports the first external process spawned in this context to the background job
++    /// waiting for it, if any. Only the first report counts.
++    pub(crate) fn publish_async_pid(
++        &self,
++        pid: Option<sys::process::ProcessId>,
++        pgid: Option<sys::process::ProcessId>,
++    ) {
++        if let Some(slot) = &self.async_pid_slot {
++            slot.resolve(pid, pgid);
++        }
++    }
++
++    /// Reports that this context's first command is not going to be an external process it
++    /// can name (it is entering a loop, which may never spawn one), so that the background
++    /// job waiting for a PID stops waiting.
++    pub(crate) fn publish_no_async_pid(&self) {
++        self.publish_async_pid(None, None);
++    }
++
+     /// Returns the standard input file; usable with `write!` et al.
+     ///
+     /// # Arguments
+@@ -253,7 +274,7 @@ impl Execute for ast::CompoundList {
+             let run_async = matches!(sep, ast::SeparatorOperator::Async);
+ 
+             if run_async {
+-                let job = spawn_async_ao_list_in_task(ao_list, shell, params);
++                let job = spawn_async_ao_list_in_task(ao_list, shell, params).await;
+                 let job_formatted = job.to_pid_style_string();
+ 
+                 if shell.options().interactive && !shell.is_subshell() {
+@@ -277,7 +298,7 @@ impl Execute for ast::CompoundList {
+     }
+ }
+ 
+-fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
++async fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
+     ao_list: &ast::AndOrList,
+     shell: &'a mut Shell<SE>,
+     params: &ExecutionParameters,
+@@ -295,18 +316,38 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
+         cloned_params.set_fd(openfiles::OpenFiles::STDIN_FD, null);
+     }
+ 
+-    // Set up a shared slot so the background task can publish the PID of the first external
+-    // process it spawns. This lets the job report a representative PID (for `$!`, `jobs`, and
+-    // `kill %n`) even though its only task is an internal Tokio task.
+-    let pid_slot: jobs::AsyncPidSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
++    // Set up a shared slot through which the background task reports the first external
++    // process it spawns. This lets the job report a representative PID (for `[n] pid`, `$!`,
++    // `jobs`, and `kill %n`) even though its only task is an internal Tokio task.
++    let pid_slot = jobs::AsyncPidSlot::new();
+     cloned_params.async_pid_slot = Some(pid_slot.clone());
+ 
++    let task_pid_slot = pid_slot.clone();
+     let join_handle = tokio::spawn(async move {
+-        cloned_ao_list
++        let result = cloned_ao_list
+             .execute(&mut cloned_shell, &cloned_params)
+-            .await
++            .await;
++
++        // Whatever happened, nothing further will be spawned: release a parent still
++        // waiting for a PID (e.g. a job made only of builtins, or one that failed early).
++        task_pid_slot.resolve(None, None);
++
++        result
+     });
+ 
++    // Wait until the job has decided what its first command is — like bash, which has the
++    // child's PID in hand the moment `fork()` returns — so that `[n] pid` is printed with
++    // the real PID rather than a placeholder, and `$!` is valid from the very next command.
++    // This resolves as soon as the task spawns its first process, enters a loop, or ends.
++    // The wait is capped so that a first command which is a blocking builtin (`wait &`,
++    // `read x < /dev/tty &`) cannot hold the parent shell; the slot still resolves later
++    // and `$!`/`jobs` read it lazily.
++    let _ = tokio::time::timeout(
++        std::time::Duration::from_secs(2),
++        pid_slot.wait_resolved(),
++    )
++    .await;
++
+     let mut job = jobs::Job::new(
+         [jobs::JobTask::Internal(join_handle)],
+         ao_list.to_string(),
+@@ -395,13 +436,22 @@ impl Execute for ast::Pipeline {
+         }
+ 
+         // Spawn all the processes required for the pipeline, connecting outputs/inputs with pipes
+-        // as needed.
+-        let spawn_results = spawn_pipeline_processes(self, shell, &params).await?;
+-
+-        // Wait for the processes. This also has a side effect of updating pipeline status.
+-        let mut result =
+-            wait_for_pipeline_processes_and_update_status(self, spawn_results, shell, &params)
+-                .await?;
++        // as needed, then wait for them (which also updates the pipeline status). A foreground
++        // child takes the terminal for its process group when it starts, so whatever goes wrong
++        // after that point — a later member failing to spawn, an expansion error, a failed wait
++        // — the shell must take the terminal back before reporting the error: otherwise the
++        // terminal's foreground group is a dead group, the shell's next read from it is a
++        // background read (SIGTTIN, or EIO for an orphaned login shell), and the shell is
++        // wedged. bash does the same (`give_terminal_to(shell_pgrp)` on every path).
++        let mut result = match run_pipeline_processes(self, shell, &params).await {
++            Ok(result) => result,
++            Err(e) => {
++                if shell.options().interactive {
++                    let _ = sys::terminal::move_self_to_foreground();
++                }
++                return Err(e);
++            }
++        };
+ 
+         // Invert the exit code if requested.
+         if self.bang {
+@@ -456,6 +506,15 @@ impl Execute for ast::Pipeline {
+     }
+ }
+ 
++async fn run_pipeline_processes(
++    pipeline: &ast::Pipeline,
++    shell: &mut Shell<impl extensions::ShellExtensions>,
++    params: &ExecutionParameters,
++) -> Result<ExecutionResult, error::Error> {
++    let spawn_results = spawn_pipeline_processes(pipeline, shell, params).await?;
++    wait_for_pipeline_processes_and_update_status(pipeline, spawn_results, shell, params).await
++}
++
+ async fn spawn_pipeline_processes(
+     pipeline: &ast::Pipeline,
+     shell: &mut Shell<impl extensions::ShellExtensions>,
+@@ -538,15 +597,10 @@ async fn spawn_pipeline_processes(
+                 process_group_id = child.pgid();
+             }
+ 
+-            // If this execution is a background job awaiting a representative PID, publish the
+-            // first spawned process's PID into the shared slot.
+-            if let Some(slot) = &params.async_pid_slot {
+-                if let Some(pid) = child.pid() {
+-                    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+-                    if guard.is_none() {
+-                        *guard = Some(pid);
+-                    }
+-                }
++            // If this execution is a background job awaiting a representative PID, report the
++            // first spawned process (and its process group) through the shared slot.
++            if let Some(pid) = child.pid() {
++                params.publish_async_pid(Some(pid), child.pgid());
+             }
+         }
+ 
+@@ -848,6 +902,9 @@ impl Execute for ast::ForClauseCommand {
+             expanded_values.extend_from_slice(shell.current_shell_args());
+         }
+ 
++        // A loop may never spawn a process: stop a background job's parent waiting for one.
++        params.publish_no_async_pid();
++
+         for value in expanded_values {
+             tokio::task::consume_budget().await;
+ 
+@@ -1038,6 +1095,9 @@ impl Execute for (WhileOrUntil, &ast::WhileOrUntilClauseCommand) {
+         let mut condition_params = params.clone();
+         condition_params.suppress_errexit = true;
+ 
++        // A loop may never spawn a process: stop a background job's parent waiting for one.
++        params.publish_no_async_pid();
++
+         loop {
+             // Cooperatively yield at the top of every iteration: a builtin-only loop body
+             // (e.g. `while :; do :; done`) never reaches a pending await on its own, so
+@@ -1114,6 +1174,9 @@ impl Execute for ast::ArithmeticForClauseCommand {
+             initializer.eval(shell, params, true).await?;
+         }
+ 
++        // A loop may never spawn a process: stop a background job's parent waiting for one.
++        params.publish_no_async_pid();
++
+         loop {
+             tokio::task::consume_budget().await;
+ 
+diff --git a/brush-core/src/jobs.rs b/brush-core/src/jobs.rs
+index ebd6ee2..a83f646 100644
+--- a/brush-core/src/jobs.rs
++++ b/brush-core/src/jobs.rs
+@@ -17,12 +17,91 @@ use crate::traps;
+ pub(crate) type JobJoinHandle = tokio::task::JoinHandle<Result<ExecutionResult, error::Error>>;
+ pub(crate) type JobResult = (Job, Result<ExecutionResult, error::Error>);
+ 
+-/// A shared slot used to publish the PID of the first external process spawned by an
+-/// asynchronously-executing (background) job. Background jobs are run inside a Tokio task
+-/// (`JobTask::Internal`), so the child process's PID is not known at the time the job is
+-/// registered; the task fills this slot in once the process is spawned, allowing the job to
+-/// report a representative PID for `$!`, `jobs`, and `kill %n`.
+-pub(crate) type AsyncPidSlot = Arc<Mutex<Option<sys::process::ProcessId>>>;
++/// A shared slot through which an asynchronously-executing (background) job publishes the
++/// identity of its first command. Background jobs run inside a Tokio task
++/// (`JobTask::Internal`), so nothing is known about their processes at the time the job is
++/// registered; the task resolves this slot as soon as it has decided what its first command
++/// is — the PID (and process group) of the first external process it spawns, or "no
++/// process" when that command is a builtin, a function or a compound command — which lets
++/// the parent shell report a representative PID for `[n] pid`, `$!`, `jobs` and `kill %n`,
++/// and lets `fg`/`bg`/`kill %n` reach the job's process group.
++pub(crate) struct AsyncPidSlot {
++    state: Mutex<AsyncPidState>,
++    resolved: tokio::sync::Notify,
++}
++
++#[derive(Clone, Copy)]
++enum AsyncPidState {
++    Pending,
++    Resolved {
++        pid: Option<sys::process::ProcessId>,
++        pgid: Option<sys::process::ProcessId>,
++    },
++}
++
++impl AsyncPidSlot {
++    /// Returns a new, unresolved slot.
++    pub(crate) fn new() -> Arc<Self> {
++        Arc::new(Self {
++            state: Mutex::new(AsyncPidState::Pending),
++            resolved: tokio::sync::Notify::new(),
++        })
++    }
++
++    /// Resolves the slot; the first resolution wins and later ones are ignored.
++    ///
++    /// # Arguments
++    ///
++    /// * `pid` - The PID of the job's first external process, if it has one.
++    /// * `pgid` - That process's process group, if known.
++    pub(crate) fn resolve(
++        &self,
++        pid: Option<sys::process::ProcessId>,
++        pgid: Option<sys::process::ProcessId>,
++    ) {
++        {
++            let mut state = self
++                .state
++                .lock()
++                .unwrap_or_else(|poisoned| poisoned.into_inner());
++            if matches!(*state, AsyncPidState::Resolved { .. }) {
++                return;
++            }
++            *state = AsyncPidState::Resolved { pid, pgid };
++        }
++        self.resolved.notify_waiters();
++    }
++
++    /// Returns `(pid, pgid)` once resolved, `None` while still pending.
++    pub(crate) fn get(
++        &self,
++    ) -> Option<(
++        Option<sys::process::ProcessId>,
++        Option<sys::process::ProcessId>,
++    )> {
++        let state = *self
++            .state
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner());
++        match state {
++            AsyncPidState::Pending => None,
++            AsyncPidState::Resolved { pid, pgid } => Some((pid, pgid)),
++        }
++    }
++
++    /// Waits until the slot has been resolved.
++    pub(crate) async fn wait_resolved(&self) {
++        loop {
++            let notified = self.resolved.notified();
++            tokio::pin!(notified);
++            notified.as_mut().enable();
++            if self.get().is_some() {
++                return;
++            }
++            notified.await;
++        }
++    }
++}
+ 
+ /// Manages the jobs that are currently managed by the shell.
+ #[derive(Default)]
+@@ -281,10 +360,10 @@ pub struct Job {
+     /// The current operational state of the job.
+     pub state: JobState,
+ 
+-    /// If available, a shared slot carrying the PID of the first external process spawned by
+-    /// this job when it runs asynchronously (i.e., as a background task). Used as a fallback
+-    /// source for the job's representative PID.
+-    pid_slot: Option<AsyncPidSlot>,
++    /// If available, a shared slot carrying the PID and process group of the first external
++    /// process spawned by this job when it runs asynchronously (i.e., as a background task).
++    /// Used as a fallback source for the job's representative PID and process group.
++    pid_slot: Option<Arc<AsyncPidSlot>>,
+ }
+ 
+ impl Display for Job {
+@@ -327,7 +406,7 @@ impl Job {
+     /// # Arguments
+     ///
+     /// * `slot` - The shared PID slot to attach.
+-    pub(crate) fn set_pid_slot(&mut self, slot: AsyncPidSlot) {
++    pub(crate) fn set_pid_slot(&mut self, slot: Arc<AsyncPidSlot>) {
+         self.pid_slot = Some(slot);
+     }
+ 
+@@ -417,13 +496,9 @@ impl Job {
+     /// Moves the job to execute in the background.
+     pub fn move_to_background(&mut self) -> Result<(), error::Error> {
+         if matches!(self.state, JobState::Stopped) {
+-            if let Some(pgid) = self.process_group_id() {
+-                sys::signal::continue_process(pgid)?;
+-                self.state = JobState::Running;
+-                Ok(())
+-            } else {
+-                Err(error::ErrorKind::FailedToSendSignal.into())
+-            }
++            self.continue_all()?;
++            self.state = JobState::Running;
++            Ok(())
+         } else {
+             error::unimp("move job to background")
+         }
+@@ -431,17 +506,67 @@ impl Job {
+ 
+     /// Moves the job to execute in the foreground.
+     pub fn move_to_foreground(&mut self) -> Result<(), error::Error> {
++        // Hand the terminal over first, then continue: a member resumed while its group is
++        // still in the background would immediately take SIGTTIN/SIGTTOU again.
++        if let Some(pgid) = self.process_group_id() {
++            sys::terminal::move_to_foreground(pgid)?;
++        }
++
+         if matches!(self.state, JobState::Stopped) {
+-            if let Some(pgid) = self.process_group_id() {
+-                sys::signal::continue_process(pgid)?;
+-                self.state = JobState::Running;
+-            } else {
+-                return Err(error::ErrorKind::FailedToSendSignal.into());
+-            }
++            self.continue_all()?;
++            self.state = JobState::Running;
+         }
+ 
++        Ok(())
++    }
++
++    /// Continues every process of the job. A pipeline that was stopped has *all* of its
++    /// members stopped, so SIGCONT has to reach the whole process group (as bash's
++    /// `killpg(pgrp, SIGCONT)` does); continuing only the leader leaves the others stopped
++    /// and a subsequent wait on the job never completes.
++    fn continue_all(&self) -> Result<(), error::Error> {
++        self.signal_targets(
++            sys::signal::continue_process_group,
++            sys::signal::continue_process,
++        )
++    }
++
++    /// Sends a signal to every process of the job: to its process group when it has one of
++    /// its own, otherwise to each of its known processes individually.
++    fn signal_all(&self, signal: traps::TrapSignal) -> Result<(), error::Error> {
++        self.signal_targets(
++            |pgid| sys::signal::kill_process_group(pgid, signal),
++            |pid| sys::signal::kill_process(pid, signal),
++        )
++    }
++
++    /// Applies `to_group` to the job's own process group when it has one; otherwise applies
++    /// `to_process` to each of its known processes.
++    fn signal_targets(
++        &self,
++        to_group: impl Fn(sys::process::ProcessId) -> Result<(), error::Error>,
++        to_process: impl Fn(sys::process::ProcessId) -> Result<(), error::Error>,
++    ) -> Result<(), error::Error> {
+         if let Some(pgid) = self.process_group_id() {
+-            sys::terminal::move_to_foreground(pgid)?;
++            return to_group(pgid);
++        }
++
++        let pids: Vec<_> = self
++            .tasks
++            .iter()
++            .filter_map(|task| match task {
++                JobTask::External(p) => p.pid(),
++                JobTask::Internal(_) => None,
++            })
++            .chain(self.pid_slot.as_ref().and_then(|slot| slot.get()?.0))
++            .collect();
++
++        if pids.is_empty() {
++            return Err(error::ErrorKind::FailedToSendSignal.into());
++        }
++
++        for pid in pids {
++            to_process(pid)?;
+         }
+ 
+         Ok(())
+@@ -453,11 +578,7 @@ impl Job {
+     ///
+     /// * `signal` - The signal to send to the job.
+     pub fn kill(&self, signal: traps::TrapSignal) -> Result<(), error::Error> {
+-        if let Some(pid) = self.process_group_id() {
+-            sys::signal::kill_process(pid, signal)
+-        } else {
+-            Err(error::ErrorKind::FailedToSendSignal.into())
+-        }
++        self.signal_all(signal)
+     }
+ 
+     /// Tries to retrieve a "representative" pid for the job.
+@@ -474,17 +595,31 @@ impl Job {
+         }
+         // Fall back to a PID published asynchronously by the background task executing this job
+         // (e.g., a job started via `cmd &`, whose tasks are all `Internal`).
+-        if let Some(slot) = &self.pid_slot {
+-            if let Some(pid) = slot.lock().ok().and_then(|guard| *guard) {
+-                return Some(pid);
+-            }
+-        }
+-        None
++        self.pid_slot
++            .as_ref()
++            .and_then(|slot| slot.get())
++            .and_then(|(pid, _pgid)| pid)
+     }
+ 
+-    /// Tries to retrieve the process group ID (PGID) of the job.
++    /// Tries to retrieve the process group ID (PGID) of the job. Returns `None` when the
++    /// job's processes share the shell's own process group (job control disabled), in which
++    /// case signals must be addressed to the processes individually.
+     pub fn process_group_id(&self) -> Option<sys::process::ProcessId> {
+-        // TODO(jobs): Don't assume that the first PID is the PGID.
+-        self.pgid.or_else(|| self.representative_pid())
++        if self.pgid.is_some() {
++            return self.pgid;
++        }
++
++        for task in &self.tasks {
++            if let JobTask::External(p) = task {
++                if let Some(pgid) = p.pgid() {
++                    return Some(pgid);
++                }
++            }
++        }
++
++        self.pid_slot
++            .as_ref()
++            .and_then(|slot| slot.get())
++            .and_then(|(_pid, pgid)| pgid)
+     }
+ }
+diff --git a/brush-core/src/sys/stubs/signal.rs b/brush-core/src/sys/stubs/signal.rs
+index 24cab4e..7eceba2 100644
+--- a/brush-core/src/sys/stubs/signal.rs
++++ b/brush-core/src/sys/stubs/signal.rs
+@@ -36,6 +36,20 @@ pub(crate) fn continue_process(_pid: sys::process::ProcessId) -> Result<(), erro
+     Err(error::ErrorKind::NotSupportedOnThisPlatform("continuing process").into())
+ }
+ 
++pub(crate) fn continue_process_group(_pgid: sys::process::ProcessId) -> Result<(), error::Error> {
++    Err(error::ErrorKind::NotSupportedOnThisPlatform("continuing process group").into())
++}
++
++/// Sends a signal to every process in a process group.
++///
++/// This is a stub implementation that returns an error.
++pub fn kill_process_group(
++    _pgid: sys::process::ProcessId,
++    _signal: traps::TrapSignal,
++) -> Result<(), error::Error> {
++    Err(error::ErrorKind::NotSupportedOnThisPlatform("killing process group").into())
++}
++
+ /// Sends a signal to a specific process.
+ ///
+ /// This is a stub implementation that returns an error.
+diff --git a/brush-core/src/sys/unix/signal.rs b/brush-core/src/sys/unix/signal.rs
+index 1e9cb2b..6d64941 100644
+--- a/brush-core/src/sys/unix/signal.rs
++++ b/brush-core/src/sys/unix/signal.rs
+@@ -10,6 +10,41 @@ pub(crate) fn continue_process(pid: sys::process::ProcessId) -> Result<(), error
+     Ok(())
+ }
+ 
++/// Continues every process in a process group (`killpg(pgid, SIGCONT)`).
++pub(crate) fn continue_process_group(pgid: sys::process::ProcessId) -> Result<(), error::Error> {
++    nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), nix::sys::signal::SIGCONT)
++        .map_err(|_errno| error::ErrorKind::FailedToSendSignal)?;
++    Ok(())
++}
++
++/// Sends a signal to every process in a process group.
++///
++/// # Arguments
++/// * `pgid` - The process group ID to send the signal to
++/// * `signal` - The signal to send (must be a real signal, not a trap signal)
++pub fn kill_process_group(
++    pgid: sys::process::ProcessId,
++    signal: traps::TrapSignal,
++) -> Result<(), error::Error> {
++    nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), translate_signal(signal)?)
++        .map_err(|_errno| error::ErrorKind::FailedToSendSignal)?;
++    Ok(())
++}
++
++/// Maps a trap signal onto the signal `kill(2)` sends for it. `TrapSignal::Exit` stands in for
++/// POSIX signal 0: sending it delivers nothing but still performs the usual error checking, so
++/// it probes whether a process exists (and whether we may signal it), which is what `kill -0`
++/// relies on. Passing `None` to `nix::sys::signal::kill` sends signal 0.
++fn translate_signal(signal: traps::TrapSignal) -> Result<Option<Signal>, error::Error> {
++    match signal {
++        traps::TrapSignal::Signal(signal) => Ok(Some(signal)),
++        traps::TrapSignal::Exit => Ok(None),
++        traps::TrapSignal::Debug | traps::TrapSignal::Err | traps::TrapSignal::Return => {
++            Err(error::ErrorKind::InvalidSignal(signal.to_string()).into())
++        }
++    }
++}
++
+ /// Sends a signal to a specific process.
+ ///
+ /// # Arguments
+@@ -19,19 +54,7 @@ pub fn kill_process(
+     pid: sys::process::ProcessId,
+     signal: traps::TrapSignal,
+ ) -> Result<(), error::Error> {
+-    // A `TrapSignal::Exit` here stands in for POSIX signal 0. Sending signal 0 does not deliver
+-    // a signal but still performs the usual error checking, so it can be used to probe whether a
+-    // process exists (and whether we have permission to signal it). This is what `kill -0` relies
+-    // on. Passing `None` to `nix::sys::signal::kill` sends signal 0.
+-    let translated_signal: Option<Signal> = match signal {
+-        traps::TrapSignal::Signal(signal) => Some(signal),
+-        traps::TrapSignal::Exit => None,
+-        traps::TrapSignal::Debug | traps::TrapSignal::Err | traps::TrapSignal::Return => {
+-            return Err(error::ErrorKind::InvalidSignal(signal.to_string()).into());
+-        }
+-    };
+-
+-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), translated_signal)
++    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), translate_signal(signal)?)
+         .map_err(|_errno| error::ErrorKind::FailedToSendSignal)?;
+ 
+     Ok(())
+diff --git a/brush-shell/tests/cases/compat/background_jobs.yaml b/brush-shell/tests/cases/compat/background_jobs.yaml
+index 7afb338..7cc38c9 100644
+--- a/brush-shell/tests/cases/compat/background_jobs.yaml
++++ b/brush-shell/tests/cases/compat/background_jobs.yaml
+@@ -87,3 +87,46 @@ cases:
+       wait
+       echo 2 &
+       wait
++
++  # === $! ===
++
++  - name: "$! of a background command is its PID"
++    stdin: |
++      sleep 0.2 &
++      pid=$!
++      [[ -n "$pid" ]] && echo has-pid
++      kill -0 "$pid" && echo alive
++      wait
++      echo "status: $?"
++
++  - name: "$! of a background pipeline is a PID of the job"
++    stdin: |
++      sleep 0.2 | cat &
++      pid=$!
++      [[ -n "$pid" ]] && echo has-pid
++      kill -0 "$pid" && echo alive
++      wait
++      echo "status: $?"
++
++  - name: "$! of a background brace group naming a process"
++    stdin: |
++      { sleep 0.2; } &
++      pid=$!
++      [[ -n "$pid" ]] && echo has-pid
++      kill -0 "$pid" && echo alive
++      wait
++      echo "status: $?"
++
++  - name: "Background loop does not stall the parent"
++    stdin: |
++      while :; do break; done &
++      echo continued
++      wait
++      echo "status: $?"
++
++  - name: "Background command substitution does not stall the parent"
++    stdin: |
++      x=$(echo inner) &
++      echo continued
++      wait
++      echo "status: $?"
+diff --git a/brush-shell/tests/interactive_tests.rs b/brush-shell/tests/interactive_tests.rs
+index 21f2c41..194a891 100644
+--- a/brush-shell/tests/interactive_tests.rs
++++ b/brush-shell/tests/interactive_tests.rs
+@@ -100,6 +100,74 @@ fn run_in_bg_then_fg() -> anyhow::Result<()> {
+     Ok(())
+ }
+ 
++#[test_with::executable(sleep)]
++#[test]
++fn run_pipeline_suspend_and_fg() -> anyhow::Result<()> {
++    let mut session = start_shell_session()?;
++
++    // Start a pipeline; every member is a process, so ^Z stops all of them.
++    session.expect_prompt()?;
++    session.send_line("sleep 2 | cat")?;
++
++    // Suspend it, then bring it back: `fg` must continue the WHOLE process group (not just
++    // the leader), so the pipeline has to run to completion and get reported as done rather
++    // than as stopped again — and the shell must be usable afterwards.
++    std::thread::sleep(std::time::Duration::from_millis(500));
++    session.suspend()?;
++    session.expect("Stopped")?;
++    session.expect_prompt()?;
++
++    let jobs_output = session.exec_output("jobs")?;
++    assert!(jobs_output.contains("Stopped"));
++
++    session.send_line("fg")?;
++    session.expect("sleep 2")?;
++    session.expect_prompt()?;
++
++    let jobs_output = session.exec_output("jobs")?;
++    assert!(
++        !jobs_output.contains("Stopped"),
++        "pipeline still stopped after fg: {jobs_output}"
++    );
++
++    let output = session.exec_output("echo alive")?;
++    assert!(output.contains("alive"));
++
++    session.exit()?;
++
++    Ok(())
++}
++
++#[test_with::executable(sleep)]
++#[test]
++fn run_in_background_reports_pid() -> anyhow::Result<()> {
++    let mut session = start_shell_session()?;
++
++    // `cmd &` must announce the job with a real PID, like bash, and $! must be that PID
++    // from the very next command on.
++    session.expect_prompt()?;
++    session.send_line("sleep 1 &")?;
++    let announcement = session.expect(expectrl::Regex(r"\[1\]\+?\s+(\d+)"))?;
++    let announced_pid = String::from_utf8(announcement.get(1).unwrap().to_vec())?;
++    session.expect_prompt()?;
++
++    let pid_output = session.exec_output("echo $!")?;
++    assert!(
++        pid_output.contains(&announced_pid),
++        "$! ({pid_output}) does not match the announced PID ({announced_pid})"
++    );
++
++    let jobs_output = session.exec_output("jobs -p")?;
++    assert!(jobs_output.contains(&announced_pid));
++
++    session.send_line("wait")?;
++    session.expect_prompt()?;
++
++    session.exit()?;
++
++    Ok(())
++}
++
+ #[test_with::executable(less)]
+ #[test]
+ fn run_pipeline_interactively() -> anyhow::Result<()> {
