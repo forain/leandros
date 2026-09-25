@@ -106,18 +106,19 @@ fn exec_file_register(port: u32, file_id: u32) -> Option<usize> {
 /// synchronous direct call into the f2fs server (registered port handlers
 /// execute in the caller's context) ending in polled virtio I/O — no
 /// blocking, no rescheduling, no IPC reply ports.
-fn exec_file_read(cap: usize, offset: u64, dst: *mut u8, len: usize) -> bool {
-    if cap == 0 || cap > MAX_EXEC_FILES { return false; }
+fn exec_file_read(cap: usize, offset: u64, dst: *mut u8, len: usize) -> isize {
+    if cap >= MMAP_CAP_BASE { return mmap_file_read(cap, offset, dst, len); }
+    if cap == 0 || cap > MAX_EXEC_FILES { return -9; }
     let entry = match EXEC_FILES.lock()[cap - 1] {
         Some(e) => e,
-        None    => return false,
+        None    => return -9,
     };
     f2fs_server::pread_by_port(entry.port, entry.file_id as u64, dst, len, offset)
-        == len as isize
 }
 
 /// mm file-retain hook (one reference per live VMA; fork clones retain).
 fn exec_file_retain(cap: usize) {
+    if cap >= MMAP_CAP_BASE { return mmap_file_ref(cap, true); }
     if cap == 0 || cap > MAX_EXEC_FILES { return; }
     if let Some(ref mut e) = EXEC_FILES.lock()[cap - 1] {
         e.refs += 1;
@@ -126,6 +127,7 @@ fn exec_file_retain(cap: usize) {
 
 /// mm file-release hook; closes the mount-side file when the last VMA goes.
 fn exec_file_release(cap: usize) {
+    if cap >= MMAP_CAP_BASE { return mmap_file_ref(cap, false); }
     if cap == 0 || cap > MAX_EXEC_FILES { return; }
     let closed = {
         let mut tbl = EXEC_FILES.lock();
@@ -148,6 +150,81 @@ fn exec_file_release(cap: usize) {
     }
 }
 
+// ── Private file mmap(2): backing-inode registry ─────────────────────────────
+//
+// MAP_PRIVATE mappings of f2fs files are demand-paged exactly like exec
+// images (the eager whole-file copy in sys_mmap cost ~1-1.5 s per COSMIC
+// process start: each Rust binary maps its own 33-36 MiB executable to
+// symbolize backtraces, ld-musl maps libgallium's 23 MiB). A mapping outlives
+// its descriptor, so the registry names the *inode* (mount port + inode
+// number), deduplicated — every process mapping libfoo.so shares one entry
+// — and pins it in f2fs against unlink/rename-over reclaim instead of
+// holding one of the mount's 256 open-file slots. Caps are MMAP_CAP_BASE +
+// index, disjoint from the exec caps (1..=MAX_EXEC_FILES). `refs` counts
+// live VMAs plus transient references (sys_mmap's creation reference, a
+// fault's read in flight).
+
+const MMAP_CAP_BASE: usize = 0x1_0000;
+const MAX_MMAP_FILES: usize = 2048;
+
+#[derive(Clone, Copy)]
+struct MmapFileEntry {
+    port: u32,
+    ino:  u32,
+    refs: u32,
+}
+
+static MMAP_FILES: spin::Mutex<[Option<MmapFileEntry>; MAX_MMAP_FILES]> =
+    spin::Mutex::new([None; MAX_MMAP_FILES]);
+
+/// Cap for (port, ino), taking one reference (the caller's creation ref).
+fn mmap_file_register(port: u32, ino: u32) -> Option<usize> {
+    let mut tbl = MMAP_FILES.lock();
+    let mut free = None;
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        match slot {
+            Some(e) if e.port == port && e.ino == ino => {
+                e.refs += 1;
+                return Some(MMAP_CAP_BASE + i);
+            }
+            None if free.is_none() => free = Some(i),
+            _ => {}
+        }
+    }
+    let i = free?;
+    tbl[i] = Some(MmapFileEntry { port, ino, refs: 1 });
+    f2fs_server::pin_inode(port, ino);
+    Some(MMAP_CAP_BASE + i)
+}
+
+fn mmap_file_ref(cap: usize, inc: bool) {
+    let i = cap - MMAP_CAP_BASE;
+    if i >= MAX_MMAP_FILES { return; }
+    let mut tbl = MMAP_FILES.lock();
+    if let Some(ref mut e) = tbl[i] {
+        if inc {
+            e.refs += 1;
+        } else {
+            e.refs -= 1;
+            if e.refs == 0 {
+                let (port, ino) = (e.port, e.ino);
+                tbl[i] = None;
+                f2fs_server::unpin_inode(port, ino);
+            }
+        }
+    }
+}
+
+fn mmap_file_read(cap: usize, offset: u64, dst: *mut u8, len: usize) -> isize {
+    let i = cap - MMAP_CAP_BASE;
+    if i >= MAX_MMAP_FILES { return -9; }
+    let e = match MMAP_FILES.lock()[i] {
+        Some(e) => e,
+        None    => return -9,
+    };
+    f2fs_server::pread_ino_by_port(e.port, e.ino, dst, len, offset)
+}
+
 /// Wire the mm crate's file-backed-VMA hooks to the registry above.
 /// Called once from kernel init, before userspace starts.
 pub fn init_exec_file_backing() {
@@ -165,6 +242,20 @@ pub fn init_exec_file_backing() {
 /// therefore be faulted in first, while no filesystem lock is held.
 fn prefault_user(ptr: usize, len: usize) {
     if ptr == 0 || len == 0 { return; }
+    // Absent pages first, one real fault each: a page of a demand-paged file
+    // mapping (exec image, private mmap) is then read with the address space
+    // unlocked instead of inside `prefault_range`'s locked walk. The walk
+    // below still does what is left: CoW unsharing of present pages.
+    let end = match ptr.checked_add(len) { Some(e) => e, None => return };
+    let mut from = ptr;
+    while let Some(Some(va)) = with_current_address_space_mut(|as_| {
+        as_.first_absent_file_page(from, end)
+    }) {
+        // Each fault reads a fault-around window; a page it cannot populate
+        // (past EOF) is skipped and left to the caller's own access.
+        let _ = sched::prefault_user_page(va);
+        from = va + mm::buddy::PAGE_SIZE;
+    }
     let _ = with_current_address_space_mut(|as_| as_.prefault_range(ptr, len));
 }
 
@@ -1708,7 +1799,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
         crate::serial_print_str("[MMAP-SLOW] pid=");
         mmap_print_dec(current_pid() as usize);
         crate::serial_print_str(" kind=");
-        crate::serial_print_str(match tr.kind { 1 => "anon", 2 => "device", 3 => "shared-vmo", 4 => "file-copy", _ => "?" });
+        crate::serial_print_str(match tr.kind { 1 => "anon", 2 => "device", 3 => "shared-vmo", 4 => "file-copy", 5 => "file-lazy", _ => "?" });
         crate::serial_print_str(" len=");
         crate::serial_print_hex(len);
         crate::serial_print_str(" flags=");
@@ -1956,6 +2047,40 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         }
     }
 
+    // ── Private f2fs file mmap: demand-paged ──────────────────────────────────
+    // No read here at all: the VMA names the file's inode and each page is
+    // read on first touch (see map_private_file / install_file_fault), with
+    // Linux EOF semantics. mmap(2) never moves the descriptor's position.
+    // Unaligned offsets (EINVAL on Linux) keep the old eager copy below.
+    if flags & MAP_SHARED == 0 && off % page == 0 {
+        if let Some(vfs::VnodeKind::MountedFile { port, file_id }) = kind {
+            if let Some(cap) = f2fs_server::inode_by_port(port, file_id as u64)
+                .and_then(|ino| mmap_file_register(port, ino))
+            {
+                tr.kind = 5;
+                let tm = monotonic_ns();
+                let mut mapped = with_current_address_space_mut(|as_| {
+                    if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
+                    as_.map_private_file(virt, len, page_flags, cap, off as u64)
+                });
+                let mut at = virt;
+                if mapped == Some(false) && flags & MAP_FIXED == 0 && addr != 0 {
+                    // The hint overlapped something: place it like anon mmap.
+                    at = MMAP_BUMP.fetch_add(len, Ordering::Relaxed);
+                    mapped = with_current_address_space_mut(|as_| {
+                        as_.map_private_file(at, len, page_flags, cap, off as u64)
+                    });
+                }
+                tr.map_ns = monotonic_ns().wrapping_sub(tm);
+                mmap_file_ref(cap, false); // drop the creation reference
+                return match mapped {
+                    Some(true) => at as isize,
+                    _ => enomem_map_site("mmap/file-private"),
+                };
+            }
+        }
+    }
+
     // [GAP2] A MAP_SHARED file mapping that did NOT take the K1 aliasing branch
     // above is about to get an EAGER PRIVATE COPY (the read loop below). If the
     // Wayland shm-pool fd shows up here, that mapping is frozen at frame 0.
@@ -1993,12 +2118,17 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // the copy in step 4 lands in physical memory regardless of prot bits.
     // The final page_flags (which may be read-only) are applied via map_flags
     // on the VMA; subsequent accesses use those bits.
+    //
+    // The copy below goes through the kernel direct map, so the VMA is
+    // installed with its final protection right away (no temporary WRITABLE
+    // + mprotect fixup: on x86_64/TCG that second locked pass with its TLB
+    // shootdown cost 0.5-1.7 s per map during session start).
     tr.kind = 4;
-    let write_flags = page_flags | PageFlags::WRITABLE;
     let tm = monotonic_ns();
     let mapped_phys = with_current_address_space_mut(|as_| {
         if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
-        if !as_.map(virt, len, write_flags) { return None; }
+        if !as_.map(virt, len, page_flags) { return None; }
+        as_.set_prot(virt, prot as u32);
         // Retrieve the physical base of the just-created VMA.
         as_.find(virt).map(|vma| vma.phys)
     });
@@ -2059,14 +2189,19 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         return n as isize;
     }
 
-    // Step 4: if the caller wants read-only, downgrade the page permissions.
-    // Re-map each page with the original (possibly non-writable) page_flags.
-    if !page_flags.contains(PageFlags::WRITABLE) {
-        // mprotect the VMA to remove the temporary WRITABLE bit.
-        // Use sys_mprotect's logic: walk VMA list, remap pages.
-        let tf = monotonic_ns();
-        let _ = sys_mprotect(virt, len, prot);
-        tr.fixup_ns = monotonic_ns().wrapping_sub(tf);
+    // AArch64: the copy went through the data side of the direct map; make
+    // an executable mapping's bytes visible to instruction fetch.
+    #[cfg(target_arch = "aarch64")]
+    if page_flags.contains(PageFlags::EXECUTE) {
+        unsafe {
+            let mut line = hhdm_ptr as usize & !63;
+            let end_a = hhdm_ptr as usize + len;
+            while line < end_a {
+                core::arch::asm!("dc cvau, {}", in(reg) line);
+                line += 64;
+            }
+            core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb");
+        }
     }
 
     virt as isize
@@ -2115,6 +2250,10 @@ fn sys_mremap(
                           0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */, usize::MAX, 0);
     if result < 0 { return result; }
     let new_va = result as usize;
+    // The copy below reads only present pages: fault the old range in first
+    // (a demand-paged file mapping may have untouched pages; their read runs
+    // unlocked here).
+    prefault_user(old_addr, old_size);
 
     // Preserve the overlapping `old_size` bytes.  Old and new mappings are
     // always in the caller's own address space, so both can be reached

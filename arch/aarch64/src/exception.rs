@@ -307,7 +307,13 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
         // diagnostics below are for the process that is about to die, not
         // for a fault the program handles as a matter of course (a GC
         // write barrier, a stack-probe, a `siglongjmp` recovery).
-        let (sig, si_code, si_addr) = el0_fault_signal(esr, far, elr, (*frame).sp_el0);
+        // A file-mapping page past end of file is a bus error, not a bad
+        // address (handle_page_fault recorded which it was).
+        let (sig, si_code, si_addr) = if (ec == 0x24 || ec == 0x20) && sched::take_fault_sigbus() {
+            (SIGBUS, sched::BUS_ADRERR, far as usize)
+        } else {
+            el0_fault_signal(esr, far, elr, (*frame).sp_el0)
+        };
         if sched::fault_signal(sig, si_code, si_addr) {
             return;
         }
