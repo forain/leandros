@@ -5308,7 +5308,7 @@ fn write_flock(ptr: usize, l_type: i16, l_whence: i16, l_start: i64, l_len: i64,
     buf[8..16].copy_from_slice(&l_start.to_le_bytes());
     buf[16..24].copy_from_slice(&l_len.to_le_bytes());
     buf[24..28].copy_from_slice(&l_pid.to_le_bytes());
-    sched::with_current_address_space(|as_| as_.write_user_buf(ptr, &buf)).unwrap_or(false)
+    sched::with_current_address_space_mut(|as_| as_.write_user_buf(ptr, &buf)).unwrap_or(false)
 }
 
 const F_RDLCK: i16 = 0;
@@ -6433,7 +6433,7 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
             info[6] = 32;
             info[7] = pitch;
 
-            let ok = sched::with_current_address_space(|as_| {
+            let ok = sched::with_current_address_space_mut(|as_| {
                 unsafe {
                     as_.write_user_buf(arg, core::slice::from_raw_parts(&info as *const _ as *const u8, 32))
                 }

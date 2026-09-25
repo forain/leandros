@@ -3738,7 +3738,7 @@ pub fn exit(code: i32) -> ! {
     };
     if clear_addr != 0 {
         let zero = 0u32;
-        let written = with_current_address_space(|as_| {
+        let written = with_current_address_space_mut(|as_| {
             as_.write_user_buf(clear_addr, &zero.to_ne_bytes())
         }).unwrap_or(false);
         if written {
