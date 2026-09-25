@@ -204,41 +204,58 @@ pub struct SigInfo {
     /// Fault signals only: the faulting address (data address for a memory
     /// fault, PC for SIGILL/SIGFPE/SIGTRAP).
     pub si_addr:   usize,
+    /// POSIX timer only: the `sigevent.sigev_value` the timer was armed with
+    /// (`siginfo_t._sifields._timer._sigval`). For `SI_TIMER` this overlays
+    /// the `_kill`/`_sigchld` member's `si_status` slot and beyond — see
+    /// `write_siginfo`'s `SI_TIMER` branch, which picks this member instead.
+    pub si_value:  u64,
 }
 
 impl SigInfo {
     /// No payload — `si_code == SI_USER` with everything zero, which is byte
     /// for byte what delivery shipped before per-signal siginfo existed.
     pub const NONE: SigInfo =
-        SigInfo { si_code: SI_USER, si_pid: 0, si_uid: 0, si_status: 0, si_addr: 0 };
+        SigInfo { si_code: SI_USER, si_pid: 0, si_uid: 0, si_status: 0, si_addr: 0, si_value: 0 };
 
     /// Generated inside the kernel with no originating process.
     pub const KERNEL: SigInfo =
-        SigInfo { si_code: SI_KERNEL, si_pid: 0, si_uid: 0, si_status: 0, si_addr: 0 };
+        SigInfo { si_code: SI_KERNEL, si_pid: 0, si_uid: 0, si_status: 0, si_addr: 0, si_value: 0 };
 
-    /// A POSIX timer fired.
+    /// A POSIX timer fired, with no `sigev_value`/timer-id/overrun payload —
+    /// kept for callers with no `PosixTimer` in hand; `check_timers` and
+    /// `service_timers_irq` build the real per-timer payload via `timer`.
     pub const TIMER: SigInfo =
-        SigInfo { si_code: SI_TIMER, si_pid: 0, si_uid: 0, si_status: 0, si_addr: 0 };
+        SigInfo { si_code: SI_TIMER, si_pid: 0, si_uid: 0, si_status: 0, si_addr: 0, si_value: 0 };
 
     /// `kill(2)` / `killpg(2)` from process `pid` running as `uid`.
     pub const fn user(pid: Pid, uid: u32) -> SigInfo {
-        SigInfo { si_code: SI_USER, si_pid: pid as i32, si_uid: uid, si_status: 0, si_addr: 0 }
+        SigInfo { si_code: SI_USER, si_pid: pid as i32, si_uid: uid, si_status: 0, si_addr: 0, si_value: 0 }
     }
 
     /// `tkill(2)` / `tgkill(2)` from process `pid` running as `uid`.
     pub const fn tkill(pid: Pid, uid: u32) -> SigInfo {
-        SigInfo { si_code: SI_TKILL, si_pid: pid as i32, si_uid: uid, si_status: 0, si_addr: 0 }
+        SigInfo { si_code: SI_TKILL, si_pid: pid as i32, si_uid: uid, si_status: 0, si_addr: 0, si_value: 0 }
     }
 
     /// A synchronous CPU fault at `addr` (SEGV_MAPERR, BUS_ADRALN, …).
     pub const fn fault(code: i32, addr: usize) -> SigInfo {
-        SigInfo { si_code: code, si_pid: 0, si_uid: 0, si_status: 0, si_addr: addr }
+        SigInfo { si_code: code, si_pid: 0, si_uid: 0, si_status: 0, si_addr: addr, si_value: 0 }
     }
 
     /// SIGCHLD for a child process `pid` (real uid `uid`) that was stopped by
     /// `sig` (`CLD_STOPPED`) or resumed (`CLD_CONTINUED`, `sig == SIGCONT`).
     pub const fn child_state(code: i32, pid: Pid, uid: u32, sig: u32) -> SigInfo {
-        SigInfo { si_code: code, si_pid: pid as i32, si_uid: uid, si_status: sig as i32, si_addr: 0 }
+        SigInfo { si_code: code, si_pid: pid as i32, si_uid: uid, si_status: sig as i32, si_addr: 0, si_value: 0 }
+    }
+
+    /// A POSIX timer (`timer_create(2)`) expiry: `timerid` is the `timer_t`
+    /// handle (`slot + 1`, matching what `timer_create` handed userspace),
+    /// `overrun` the extra-expirations count so far, `value` the timer's
+    /// `sigevent.sigev_value` — Linux's `siginfo_t._sifields._timer`
+    /// (`si_tid`/`si_overrun`/`si_value` in the SI_TIMER case).
+    pub const fn timer(timerid: i32, overrun: i32, value: u64) -> SigInfo {
+        SigInfo { si_code: SI_TIMER, si_pid: timerid, si_uid: overrun as u32, si_status: 0,
+                  si_addr: 0, si_value: value }
     }
 }
 

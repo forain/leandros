@@ -176,6 +176,7 @@ impl SigInfo {
             si_uid:    uid,
             si_status: status.si_status(),
             si_addr:   0,
+            si_value:  0,
         }
     }
 }
@@ -847,48 +848,78 @@ pub fn clock_ts() -> (i64, i64) {
 /// behaviour — a zeroed payload — is indistinguishable from a genuine
 /// `SI_USER` `kill()` and silently misreports every other origin.
 pub fn deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> isize {
-    let mut woke = false;
-    let mut resumed = None;
-    let ret = {
-        let mut rq = RUN_QUEUE.lock();
-        if signo > 0 && signo <= 64 {
-            if let Some(tgid) = rq.find_pid(pid).map(|t| t.tgid) {
-                let (made_ready, r) = on_signal_generated(&mut rq, tgid, signo);
-                resumed = r;
-                woke |= made_ready;
-            }
-        }
-        let min_vr = rq.min_vruntime();
-        if let Some(t) = rq.find_pid_mut(pid) {
-            if signo > 0 && signo <= 64 {
-                // First-writer-wins: POSIX keeps exactly one pending instance
-                // of a standard signal and discards later ones, so a second
-                // arrival must not repaint the payload of the instance already
-                // queued — the handler is only going to run once, for the
-                // first one.
-                if t.signal_pending & (1 << (signo - 1)) == 0 {
-                    t.signal_info[(signo - 1) as usize] = info;
-                }
-                t.signal_pending |= 1 << (signo - 1);
-                if t.state == TaskState::Blocked {
-                    t.state = TaskState::Ready;
-                    t.place(min_vr);
-                    woke = true;
-                }
-                0
-            } else {
-                -22 // EINVAL
-            }
-        } else {
-            -3 // ESRCH
-        }
-    };
+    let (ret, woke, resumed) = post_signal_thread(&mut RUN_QUEUE.lock(), pid, signo, info);
     if woke { wake_up_an_idle_cpu(); }
     if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
     // A signalfd registered in this tgid may be parked in epoll_wait; the
     // new pending bit is a readiness edge for it. RUN_QUEUE is released above.
     wake_poll();
     ret
+}
+
+/// `deliver_signal` for IRQ context (a POSIX-timer SIGEV_THREAD_ID expiry
+/// targeting a specific thread): bounded `try_lock_spin`, `None` when
+/// RUN_QUEUE stayed contended (the caller retries) — the single-thread
+/// counterpart of [`try_deliver_signal_process`], for exactly the same
+/// reason (never take a full lock from IRQ context). SIGCONT is refused
+/// (`None`): its parent notification needs task context, as for the process
+/// variant. `Some(1)` = an instance was already pending on this thread, so
+/// this one coalesced into it (a POSIX timer counts that as an overrun).
+pub fn try_deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> Option<isize> {
+    if signo == 0 || signo > 64 { return Some(-22); }
+    if signo == signal::SIGCONT { return None; }
+    let bit = 1u64 << (signo - 1);
+    let mut rq = RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS)?;
+    let already = rq.find_pid(pid).map_or(false, |t| t.signal_pending & bit != 0);
+    let (ret, woke, _) = post_signal_thread(&mut rq, pid, signo, info);
+    let ret = if ret == 0 && already { 1 } else { ret };
+    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, POLL_TAG_ALL);
+    drop(rq);
+    if woke || woken > 0 { wake_up_an_idle_cpu(); }
+    Some(ret)
+}
+
+/// The RUN_QUEUE-held half of `deliver_signal`/`try_deliver_signal`: returns
+/// `(ret, woke, resumed)` for the caller to act on after unlocking. Split out
+/// exactly as `post_signal_process` is split from `deliver_signal_process`,
+/// so the IRQ-safe try-lock variant can share the same logic.
+fn post_signal_thread(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: task::SigInfo)
+    -> (isize, bool, Option<(Pid, Pid, u32)>)
+{
+    let mut woke = false;
+    let mut resumed = None;
+    if signo > 0 && signo <= 64 {
+        if let Some(tgid) = rq.find_pid(pid).map(|t| t.tgid) {
+            let (made_ready, r) = on_signal_generated(rq, tgid, signo);
+            resumed = r;
+            woke |= made_ready;
+        }
+    }
+    let min_vr = rq.min_vruntime();
+    let ret = if let Some(t) = rq.find_pid_mut(pid) {
+        if signo > 0 && signo <= 64 {
+            // First-writer-wins: POSIX keeps exactly one pending instance
+            // of a standard signal and discards later ones, so a second
+            // arrival must not repaint the payload of the instance already
+            // queued — the handler is only going to run once, for the
+            // first one.
+            if t.signal_pending & (1 << (signo - 1)) == 0 {
+                t.signal_info[(signo - 1) as usize] = info;
+            }
+            t.signal_pending |= 1 << (signo - 1);
+            if t.state == TaskState::Blocked {
+                t.state = TaskState::Ready;
+                t.place(min_vr);
+                woke = true;
+            }
+            0
+        } else {
+            -22 // EINVAL
+        }
+    } else {
+        -3 // ESRCH
+    };
+    (ret, woke, resumed)
 }
 
 /// Job-control side effects of *generating* `signo` for thread group `tgid`,

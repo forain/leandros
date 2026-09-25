@@ -1087,6 +1087,11 @@ mod si_off {
     /// `_sifields._sigfault.si_addr` — the union's first word, overlaying
     /// `si_pid`/`si_uid`.
     pub const ADDR:   usize = 16;
+    /// `_sifields._timer._sigval` (`sigev_value`, 8 bytes) — SI_TIMER only.
+    /// Overlays `_kill`'s `si_status` slot and the padding after it, the same
+    /// way `_timer`'s `_tid`/`_overrun` (4 bytes apiece) overlay `si_pid`/
+    /// `si_uid` at PID/UID above.
+    pub const VALUE:  usize = 24;
 }
 
 /// Serialise the carried `siginfo_t` fields into a zeroed frame buffer at
@@ -1096,7 +1101,9 @@ mod si_off {
 /// they are the same offsets, and one function is the cheapest way to keep
 /// saying so. The `_sifields` member is chosen by signal class: a
 /// kernel-generated (`si_code > 0`) SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP
-/// carries `_sigfault` (`si_addr`), everything else `_kill`/`_sigchld`.
+/// carries `_sigfault` (`si_addr`), everything else `_kill`/`_sigchld` — or,
+/// for a POSIX timer expiry (`SI_TIMER`), `_timer` (`si_tid`/`si_overrun`/
+/// `si_value`, carried in `info.si_pid`/`si_uid`/`si_value` respectively).
 fn write_siginfo(buf: &mut [u8], base: usize, sig: u32, info: crate::task::SigInfo) {
     let put = |buf: &mut [u8], off: usize, v: [u8; 4]| {
         buf[base + off..base + off + 4].copy_from_slice(&v);
@@ -1109,6 +1116,11 @@ fn write_siginfo(buf: &mut [u8], base: usize, sig: u32, info: crate::task::SigIn
     if is_fault {
         buf[base + si_off::ADDR..base + si_off::ADDR + 8]
             .copy_from_slice(&(info.si_addr as u64).to_le_bytes());
+    } else if info.si_code == crate::task::SI_TIMER {
+        put(buf, si_off::PID, info.si_pid.to_le_bytes());          // si_tid
+        put(buf, si_off::UID, info.si_uid.to_le_bytes());          // si_overrun
+        buf[base + si_off::VALUE..base + si_off::VALUE + 8]
+            .copy_from_slice(&info.si_value.to_le_bytes());        // si_value
     } else {
         put(buf, si_off::PID,    info.si_pid.to_le_bytes());
         put(buf, si_off::UID,    info.si_uid.to_le_bytes());

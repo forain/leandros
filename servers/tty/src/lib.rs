@@ -318,17 +318,26 @@ fn get_or_create_console<'a>(pid: u32, tbl: &'a mut [ConsoleTermios]) -> Option<
 
 #[derive(Clone, Copy)]
 struct PosixTimer {
-    in_use:    bool,
-    signo:     u32,
-    interval:  u64, // repeat interval in ns (0 = one-shot)
-    deadline:  u64, // absolute monotonic_ns deadline (0 = disarmed)
-    overrun:   u32, // extra expirations missed since last timer_getoverrun()
-    owner_pid: u32,
+    in_use:      bool,
+    signo:       u32,
+    interval:    u64, // repeat interval in ns (0 = one-shot)
+    deadline:    u64, // absolute monotonic_ns deadline (0 = disarmed)
+    overrun:     u32, // extra expirations missed since last timer_getoverrun()
+    owner_pid:   u32,
+    /// `sigevent.sigev_value` this timer was armed with (`timer_create(2)`),
+    /// carried into the delivered signal's `si_value` (SIGEV_SIGNAL) — 0 for
+    /// the reserved slot-0 real timer (`alarm`/`setitimer`), which has none.
+    sigev_value: u64,
+    /// SIGEV_THREAD_ID's target: 0 = process-directed (SIGEV_SIGNAL, or the
+    /// slot-0 real timer), non-zero = deliver straight to this thread id
+    /// instead of picking an unmasked thread in the process (sigevent(7)).
+    target_tid:  u32,
 }
 
 impl PosixTimer {
     const fn new() -> Self {
-        Self { in_use: false, signo: 0, interval: 0, deadline: 0, overrun: 0, owner_pid: 0 }
+        Self { in_use: false, signo: 0, interval: 0, deadline: 0, overrun: 0, owner_pid: 0,
+               sigev_value: 0, target_tid: 0 }
     }
 }
 
@@ -400,7 +409,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         TTY_IOCTL   => handle_ioctl(caller_pid, arg(msg,0) as usize,
                                     arg(msg,1) as usize, arg(msg,2) as usize),
         TIMER_CREATE  => handle_timer_create(caller_pid, arg(msg,0) as u32,
-                                             arg(msg,1) as usize),
+                                             arg(msg,1) as usize, arg(msg,2), arg(msg,3) as u32),
         // `timer_t` handles are `slot + 1` (see handle_timer_create) so a
         // valid handle never numerically equals NULL; undo that here at the
         // single IPC boundary that decodes a caller-supplied timer_t.
@@ -434,20 +443,31 @@ pub fn check_timers(pid: u32) {
     let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t, None => return,
     };
-    for timer in tbl.timers.iter_mut() {
+    for (idx, timer) in tbl.timers.iter_mut().enumerate() {
         if !timer.in_use || timer.deadline == 0 { continue; }
         if now >= timer.deadline {
             // SI_TIMER — the payload a handler uses to tell a POSIX timer
-            // expiry apart from someone kill()ing it the same signal.
+            // expiry apart from someone kill()ing it the same signal. `idx+1`
+            // matches the `timer_t` handle `handle_timer_create` handed out
+            // (see `decode_timerid`); `sigev_value` is whatever `timer_create`
+            // was armed with (0 for the slot-0 real timer, which has none).
             if timer.signo != 0 {
-                match sched::try_deliver_signal_process(timer.owner_pid, timer.signo,
-                                                        sched::SigInfo::TIMER) {
-                    Some(1) => timer.overrun = timer.overrun.saturating_add(1),
-                    Some(_) => {}
-                    None if timer.signo == 18 => {
-                        sched::deliver_signal_process(timer.owner_pid, 18, sched::SigInfo::TIMER);
+                let info = sched::SigInfo::timer((idx as i32) + 1, timer.overrun as i32,
+                                                 timer.sigev_value);
+                if timer.target_tid != 0 {
+                    // SIGEV_THREAD_ID: deliver straight to the named thread,
+                    // not the process (sigevent(7)) — a dead target is
+                    // dropped silently, as Linux does once the thread is gone.
+                    let _ = sched::deliver_signal(timer.target_tid, timer.signo, info);
+                } else {
+                    match sched::try_deliver_signal_process(timer.owner_pid, timer.signo, info) {
+                        Some(1) => timer.overrun = timer.overrun.saturating_add(1),
+                        Some(_) => {}
+                        None if timer.signo == 18 => {
+                            sched::deliver_signal_process(timer.owner_pid, 18, info);
+                        }
+                        None => continue, // contended: the deadline IRQ retries
                     }
-                    None => continue, // contended: the deadline IRQ retries
                 }
             }
             if timer.interval > 0 {
@@ -484,7 +504,7 @@ pub fn service_timers_irq(now: u64) -> bool {
     let mut done = true;
     let mut next = u64::MAX;
     for tbl in tbls.iter_mut().filter(|t| t.in_use) {
-        for timer in tbl.timers.iter_mut() {
+        for (idx, timer) in tbl.timers.iter_mut().enumerate() {
             if !timer.in_use || timer.deadline == 0 { continue; }
             // SIGCONT's parent notification needs task context: leave it to
             // the syscall-return path, and keep it out of the hint so it
@@ -492,8 +512,16 @@ pub fn service_timers_irq(now: u64) -> bool {
             if timer.signo == 18 { continue; }
             if now >= timer.deadline {
                 if timer.signo != 0 {
-                    match sched::try_deliver_signal_process(timer.owner_pid, timer.signo,
-                                                            sched::SigInfo::TIMER) {
+                    let info = sched::SigInfo::timer((idx as i32) + 1, timer.overrun as i32,
+                                                     timer.sigev_value);
+                    let result = if timer.target_tid != 0 {
+                        // SIGEV_THREAD_ID, IRQ-safe thread-targeted delivery
+                        // (mirrors try_deliver_signal_process's try-lock below).
+                        sched::try_deliver_signal(timer.target_tid, timer.signo, info)
+                    } else {
+                        sched::try_deliver_signal_process(timer.owner_pid, timer.signo, info)
+                    };
+                    match result {
                         // Coalesced into a still-pending instance: POSIX overrun.
                         Some(1) => timer.overrun = timer.overrun.saturating_add(1),
                         Some(_) => {}
@@ -535,7 +563,7 @@ pub fn ensure_real_timer(pid: u32, signo: u32) {
     };
     if !tbl.timers[0].in_use {
         tbl.timers[0] = PosixTimer { in_use: true, signo, interval: 0, deadline: 0,
-                                     overrun: 0, owner_pid: pid };
+                                     overrun: 0, owner_pid: pid, sigev_value: 0, target_tid: 0 };
     }
 }
 
@@ -685,14 +713,14 @@ fn write_itimerspec(ptr: usize, interval_ns: u64, value_ns: u64) -> bool {
     sched::with_current_address_space(|as_| as_.write_user_buf(ptr, &buf)).unwrap_or(false)
 }
 
-fn handle_timer_create(pid: u32, signo: u32, timerid_ptr: usize) -> Message {
+fn handle_timer_create(pid: u32, signo: u32, timerid_ptr: usize, sigev_value: u64, target_tid: u32) -> Message {
     let mut tbls = TIMER_TABLES.lock();
     let tbl = match get_or_create_timer_table(pid, &mut *tbls) {
         Some(t) => t, None => return err_reply(-12),
     };
     let slot = match tbl.alloc() { Some(s) => s, None => return err_reply(-11) };
     tbl.timers[slot] = PosixTimer { in_use: true, signo, interval: 0, deadline: 0,
-                                    overrun: 0, owner_pid: pid };
+                                    overrun: 0, owner_pid: pid, sigev_value, target_tid };
     drop(tbls);
     if timerid_ptr != 0 {
         // `timer_t` is a pointer-sized opaque handle (8 bytes on both our

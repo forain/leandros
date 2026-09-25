@@ -34,6 +34,7 @@ pub struct sigaction {
     pub sa_mask: sigset_t,
 }
 
+const SIGALRM: c_int = 14;
 const SIGKILL: c_int = 9;
 const SIGUSR1: c_int = 10;
 const SIGUSR2: c_int = 12;
@@ -44,8 +45,13 @@ const SIG_UNBLOCK: c_int = 1;
 
 const SA_RESTORER: c_int = 0x0400_0000;
 const SA_SIGINFO:  c_int = 0x0000_0004;
+const SA_RESTART:  c_int = 0x1000_0000;
+
+const CLOCK_MONOTONIC: c_int = 1;
 
 const WNOHANG: c_int = 1;
+const EINTR:     c_int = 4;
+const ETIMEDOUT: c_int = 110;
 
 // siginfo_t.si_code values — see `sched/src/task.rs`.
 const SI_USER:     c_int = 0;
@@ -81,9 +87,9 @@ mod ssi {
 }
 
 #[cfg(target_arch = "x86_64")]
-mod nr { pub const SIGNALFD4: i64 = 289; }
+mod nr { pub const SIGNALFD4: i64 = 289; pub const FUTEX: i64 = 202; }
 #[cfg(target_arch = "aarch64")]
-mod nr { pub const SIGNALFD4: i64 = 74; }
+mod nr { pub const SIGNALFD4: i64 = 74; pub const FUTEX: i64 = 98; }
 
 pub type pthread_t = *mut c_void;
 
@@ -110,6 +116,7 @@ extern "C" {
     pub fn sigprocmask(how: c_int, set: *const sigset_t, oset: *mut sigset_t) -> c_int;
     pub fn sigpending(set: *mut sigset_t) -> c_int;
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
+    pub fn clock_gettime(clockid: c_int, tp: *mut timespec) -> c_int;
 
     pub fn pthread_create(
         thread: *mut pthread_t,
@@ -132,6 +139,12 @@ type time_t = i64;
 pub struct timespec {
     pub tv_sec:  time_t,
     pub tv_nsec: c_long,
+}
+
+unsafe fn now_ns() -> i64 {
+    let mut ts = core::mem::zeroed::<timespec>();
+    clock_gettime(CLOCK_MONOTONIC, &mut ts);
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
 }
 
 /// Sleep ~10 ms. Every handshake in the siginfo tests below is a bounded poll
@@ -219,6 +232,8 @@ pub unsafe extern "C" fn sig_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut
     if !test_sigchld_siginfo_killed() { failures += 1; }
     if !test_signalfd_agrees_with_handler() { failures += 1; }
     if !test_shared_handoff_keeps_payloads_apart() { failures += 1; }
+    if !test_futex_wait_signal_restart() { failures += 1; }
+    if !test_futex_wait_bitset_unaffected() { failures += 1; }
 
     puts(b"--- sigtest done ---\n\0".as_ptr());
     failures
@@ -799,4 +814,105 @@ unsafe fn report(name: &[u8], passed: bool) -> bool {
         write(1, b": FAIL\n".as_ptr(), 7);
     }
     passed
+}
+
+// ── FUTEX_WAIT interrupted by a signal: restart vs. EINTR ───────────────────
+
+static FUTEX_SIG_COUNT: AtomicI32 = AtomicI32::new(0);
+extern "C" fn futex_sig_handler(_sig: c_int) { FUTEX_SIG_COUNT.fetch_add(1, Ordering::SeqCst); }
+
+const FUTEX_WAIT:        c_long = 0;
+const FUTEX_WAIT_BITSET: c_long = 9;
+const FUTEX_PRIVATE:     c_long = 128;
+const FUTEX_BITSET_MATCH_ANY: u32 = !0;
+
+/// FUTEX_WAIT (relative timeout) interrupted by a signal: Linux restarts it
+/// transparently (via restart_syscall) when the handler has SA_RESTART or no
+/// handler ran, and reports EINTR otherwise — the same SA_RESTART/no-handler
+/// rule every other restartable syscall here follows. A child sends SIGALRM
+/// ~50 ms in; the futex word never changes, so no genuine FUTEX_WAKE is ever
+/// coming and the only way the wait ends is via that signal or the 300 ms
+/// timeout. Margins are wide (50 ms fire / 300 ms timeout, 220 ms window
+/// between "restarted" and "not restarted") to stay clear of scheduling
+/// jitter on a loaded host — this is a real end-to-end wait, not a tight
+/// busy-loop, and the two outcomes differ by hundreds of ms.
+unsafe fn test_futex_wait_signal_restart() -> bool {
+    let name = b"futex_wait_signal_restart\0";
+    let parent = getpid();
+    let mut ok = true;
+
+    for &restart in &[true, false] {
+        FUTEX_SIG_COUNT.store(0, Ordering::SeqCst);
+        let act = sigaction {
+            sa_handler: Some(futex_sig_handler),
+            sa_flags: if restart { SA_RESTART } else { 0 },
+            sa_restorer: None,
+            sa_mask: 0,
+        };
+        if sigaction(SIGALRM, &act, core::ptr::null_mut()) != 0 { ok = false; continue; }
+
+        let child = fork();
+        if child == 0 {
+            let fire = timespec { tv_sec: 0, tv_nsec: 50_000_000 }; // ~50 ms
+            nanosleep(&fire, core::ptr::null_mut());
+            kill(parent, SIGALRM);
+            _exit(0);
+        }
+
+        let word: u32 = 7; // never mutated: no real FUTEX_WAKE is ever coming
+        let to = timespec { tv_sec: 0, tv_nsec: 300_000_000 }; // 300 ms relative
+        let t0 = now_ns();
+        let r = syscall(nr::FUTEX, &word as *const u32 as c_long, FUTEX_WAIT | FUTEX_PRIVATE,
+                        7 as c_long, &to as *const timespec as c_long, 0 as c_long, 0 as c_long);
+        let el = now_ns() - t0;
+        reap(child);
+
+        let case_ok = if restart {
+            // Restarted transparently: the wait re-arms with the same 300 ms
+            // relative timeout (our restart mechanism replays the syscall
+            // verbatim), so it ends at ETIMEDOUT well after the ~50 ms
+            // signal, never with EINTR.
+            r == -(ETIMEDOUT as c_long) && el >= 280_000_000
+                && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 1
+        } else {
+            // No SA_RESTART: EINTR right at the signal, long before the
+            // 300 ms timeout.
+            r == -(EINTR as c_long) && el >= 30_000_000 && el < 250_000_000
+                && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 1
+        };
+        ok &= case_ok;
+    }
+    report(name, ok)
+}
+
+/// FUTEX_WAIT_BITSET's absolute deadline is deliberately left unaffected by
+/// the restart fix above: a signal still just releases it early as a plain
+/// spurious wake (return 0), never EINTR/restart bookkeeping. This guards
+/// against the fix overreaching to the bitset form, which Linux does not
+/// restart either (its deadline is already absolute).
+unsafe fn test_futex_wait_bitset_unaffected() -> bool {
+    let name = b"futex_wait_bitset_unaffected\0";
+    let parent = getpid();
+    FUTEX_SIG_COUNT.store(0, Ordering::SeqCst);
+    let act = sigaction { sa_handler: Some(futex_sig_handler), sa_flags: 0, sa_restorer: None, sa_mask: 0 };
+    if sigaction(SIGALRM, &act, core::ptr::null_mut()) != 0 { return report(name, false); }
+
+    let child = fork();
+    if child == 0 {
+        let fire = timespec { tv_sec: 0, tv_nsec: 30_000_000 };
+        nanosleep(&fire, core::ptr::null_mut());
+        kill(parent, SIGALRM);
+        _exit(0);
+    }
+
+    let word: u32 = 7;
+    let t0 = now_ns();
+    let deadline = t0 + 200_000_000;
+    let to = timespec { tv_sec: deadline / 1_000_000_000, tv_nsec: deadline % 1_000_000_000 };
+    let r = syscall(nr::FUTEX, &word as *const u32 as c_long, FUTEX_WAIT_BITSET | FUTEX_PRIVATE,
+                    7 as c_long, &to as *const timespec as c_long, 0 as c_long,
+                    FUTEX_BITSET_MATCH_ANY as c_long);
+    let el = now_ns() - t0;
+    reap(child);
+    report(name, r == 0 && el < 150_000_000 && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 1)
 }

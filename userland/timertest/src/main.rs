@@ -79,6 +79,7 @@ pub struct sigaction {
 }
 
 const SIGEV_SIGNAL: c_int = 0;
+const SIGEV_THREAD_ID: c_int = 4;
 const SIGALRM: c_int = 14;
 const CLOCK_REALTIME: clockid_t = 0;
 const CLOCK_MONOTONIC: clockid_t = 1;
@@ -104,6 +105,7 @@ mod nr {
     pub const SELECT: i64 = 23;
     pub const PSELECT6: i64 = 270;
     pub const EPOLL_PWAIT2: i64 = 441;
+    pub const GETTID: i64 = 186;
 }
 #[cfg(target_arch = "aarch64")]
 mod nr {
@@ -120,6 +122,7 @@ mod nr {
     pub const SELECT: i64 = -1; // no select(2) on AArch64
     pub const PSELECT6: i64 = 72;
     pub const EPOLL_PWAIT2: i64 = 441;
+    pub const GETTID: i64 = 178;
 }
 
 const TFD_TIMER_ABSTIME: i64 = 1;
@@ -181,7 +184,17 @@ extern "C" {
     pub fn sigprocmask(how: c_int, set: *const sigset_t, oset: *mut sigset_t) -> c_int;
     pub fn sigsuspend(mask: *const sigset_t) -> c_int;
     pub fn sigwaitinfo(set: *const sigset_t, info: *mut u8) -> c_int;
+
+    pub fn pthread_create(
+        thread: *mut pthread_t,
+        attr: *const c_void,
+        start_routine: extern "C" fn(*mut c_void) -> *mut c_void,
+        arg: *mut c_void,
+    ) -> c_int;
+    pub fn pthread_join(thread: pthread_t, retval: *mut *mut c_void) -> c_int;
 }
+
+pub type pthread_t = *mut c_void;
 
 // ── Assembly entry point (identical to pthreadtest's) ───────────────────────
 
@@ -241,6 +254,8 @@ pub unsafe extern "C" fn timer_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_alarm_wakes_pause() { failures += 1; }
     if !test_setitimer_wakes_sigsuspend() { failures += 1; }
     if !test_timer_create_rt_sigwaitinfo() { failures += 1; }
+    if !test_timer_create_sigev_value() { failures += 1; }
+    if !test_timer_create_sigev_thread_id() { failures += 1; }
     if !test_itimer_periodic_sigsuspend_never_early() { failures += 1; }
     if !test_blocked_read_sa_restart() { failures += 1; }
 
@@ -1386,6 +1401,129 @@ unsafe fn test_timer_create_rt_sigwaitinfo() -> bool {
         && SIGRT_COUNT.load(Ordering::SeqCst) == 0
         && SIGUSR1_COUNT.load(Ordering::SeqCst) == 0
         && el >= 15_000_000 && el < 500_000_000)
+}
+
+/// timer_create(SIGEV_SIGNAL) with a non-zero sigev_value: the delivered
+/// siginfo carries it back as si_value (`siginfo_t._sifields._timer`),
+/// alongside si_code == SI_TIMER, the timer_t handle as si_tid, and a fresh
+/// one-shot timer's si_overrun == 0.
+unsafe fn test_timer_create_sigev_value() -> bool {
+    let name = b"timer_create_sigev_value\0";
+    SIGRT_COUNT.store(0, Ordering::SeqCst);
+    set_handler(SIGRT_TEST, sigrt_handler, 0); // must NOT run: sigwaitinfo takes it
+    let mut old: sigset_t = 0;
+    let blk = bit(SIGRT_TEST);
+    sigprocmask(SIG_BLOCK, &blk, &mut old);
+    // A pointer-sized sigev_value so all 8 bytes are deterministic (a union
+    // literal naming only `sival_int` leaves the upper 4 bytes unspecified).
+    const SIVAL: usize = 0x5a5a;
+    let mut evp = sigevent {
+        sigev_value: sigval { sival_ptr: SIVAL as *mut c_void },
+        sigev_signo: SIGRT_TEST,
+        sigev_notify: SIGEV_SIGNAL,
+        sigev_notify_thread_id: 0,
+        __unused1: [0; 11],
+    };
+    let mut tid: timer_t = core::ptr::null_mut();
+    if timer_create(CLOCK_MONOTONIC, &mut evp, &mut tid) != 0 {
+        sigprocmask(SIG_SETMASK, &old, core::ptr::null_mut());
+        return report(name, false);
+    }
+    let wd = start_watchdog(WATCHDOG_MS);
+    let spec = itimerspec {
+        it_interval: timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value:    timespec { tv_sec: 0, tv_nsec: 15_000_000 },
+    };
+    timer_settime(tid, 0, &spec, core::ptr::null_mut());
+    let mut info = [0u8; 128];
+    let r = sigwaitinfo(&blk, info.as_mut_ptr());
+    stop_watchdog(wd);
+    timer_delete(tid);
+    sigprocmask(SIG_SETMASK, &old, core::ptr::null_mut());
+    let signo    = i32::from_ne_bytes(info[0..4].try_into().unwrap());
+    let code     = i32::from_ne_bytes(info[8..12].try_into().unwrap());
+    let si_tid   = i32::from_ne_bytes(info[16..20].try_into().unwrap());
+    let overrun  = u32::from_ne_bytes(info[20..24].try_into().unwrap());
+    let si_value = u64::from_ne_bytes(info[24..32].try_into().unwrap());
+    report(name, r == SIGRT_TEST && signo == SIGRT_TEST && code == SI_TIMER
+        && si_tid == tid as i32 && overrun == 0 && si_value == SIVAL as u64
+        && SIGRT_COUNT.load(Ordering::SeqCst) == 0)
+}
+
+const SIGRT_TID_TEST: c_int = 41; // distinct real-time signal, SIGEV_THREAD_ID only
+
+static SIGEV_TID_HANDLER_TID:   AtomicI32 = AtomicI32::new(0);
+static SIGEV_TID_HANDLER_COUNT: AtomicI32 = AtomicI32::new(0);
+static SIGEV_TID_WORKER_TID:    AtomicI32 = AtomicI32::new(0);
+
+/// Runs on whichever thread actually receives `SIGRT_TID_TEST` — recording
+/// its own tid is how the test tells apart "delivered to the named thread"
+/// from "delivered to the tgid leader" (the process-directed heuristic's
+/// pick, since the leader is created first and scanned first).
+extern "C" fn sigev_tid_handler(_sig: c_int) {
+    SIGEV_TID_HANDLER_TID.store(unsafe { syscall(nr::GETTID, 0 as c_long) } as i32, Ordering::SeqCst);
+    SIGEV_TID_HANDLER_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+extern "C" fn sigev_tid_worker(_arg: *mut c_void) -> *mut c_void {
+    SIGEV_TID_WORKER_TID.store(unsafe { syscall(nr::GETTID, 0 as c_long) } as i32, Ordering::SeqCst);
+    // Busy-wait (short sleeps, never blocking on the signal itself) for the
+    // handler to run, bounded by the caller's watchdog.
+    for _ in 0..500 {
+        if SIGEV_TID_HANDLER_COUNT.load(Ordering::SeqCst) != 0 { break; }
+        sleep_ms(2);
+    }
+    core::ptr::null_mut()
+}
+
+/// timer_create(SIGEV_THREAD_ID) delivers to the *named thread* — not the
+/// tgid leader the process-directed heuristic would otherwise pick (it scans
+/// `0..MAX_TASKS` and the leader, created first, is found first). Both the
+/// main thread and the worker are unmasked and unblocked for
+/// `SIGRT_TID_TEST` here, so a delivery that fell back to process-directed
+/// routing would land on the main thread; this only passes if it lands on
+/// the worker specifically.
+unsafe fn test_timer_create_sigev_thread_id() -> bool {
+    let name = b"timer_create_sigev_thread_id\0";
+    SIGEV_TID_HANDLER_TID.store(0, Ordering::SeqCst);
+    SIGEV_TID_HANDLER_COUNT.store(0, Ordering::SeqCst);
+    SIGEV_TID_WORKER_TID.store(0, Ordering::SeqCst);
+    if !set_handler(SIGRT_TID_TEST, sigev_tid_handler, 0) { return report(name, false); }
+
+    let mut thread: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut thread, core::ptr::null(), sigev_tid_worker, core::ptr::null_mut()) != 0 {
+        return report(name, false);
+    }
+    let wd = start_watchdog(WATCHDOG_MS);
+    let mut worker_tid = 0i32;
+    for _ in 0..200 {
+        worker_tid = SIGEV_TID_WORKER_TID.load(Ordering::SeqCst);
+        if worker_tid != 0 { break; }
+        sleep_ms(2);
+    }
+    let mut evp = sigevent {
+        sigev_value: sigval { sival_int: 0 },
+        sigev_signo: SIGRT_TID_TEST,
+        sigev_notify: SIGEV_THREAD_ID,
+        sigev_notify_thread_id: worker_tid,
+        __unused1: [0; 11],
+    };
+    let mut tid: timer_t = core::ptr::null_mut();
+    let created = worker_tid != 0 && timer_create(CLOCK_MONOTONIC, &mut evp, &mut tid) == 0;
+    if created {
+        let spec = itimerspec {
+            it_interval: timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value:    timespec { tv_sec: 0, tv_nsec: 15_000_000 },
+        };
+        timer_settime(tid, 0, &spec, core::ptr::null_mut());
+    }
+    let mut retval: *mut c_void = core::ptr::null_mut();
+    pthread_join(thread, &mut retval);
+    stop_watchdog(wd);
+    if created { timer_delete(tid); }
+    let handler_tid   = SIGEV_TID_HANDLER_TID.load(Ordering::SeqCst);
+    let handler_count = SIGEV_TID_HANDLER_COUNT.load(Ordering::SeqCst);
+    report(name, wd > 0 && created && handler_count == 1 && handler_tid == worker_tid)
 }
 
 /// A 5 ms periodic ITIMER_REAL waking sigsuspend 10 times: the k-th wake is

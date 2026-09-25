@@ -2441,7 +2441,9 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
             let info = sched::accept_pending_signal(signo);
             // Optionally fill siginfo_t (128 bytes). Same LP64 offsets the
             // signal-frame builder uses: si_signo +0, si_code +8, si_pid +16,
-            // si_uid +20, si_status +24.
+            // si_uid +20, si_status +24 — or, for a POSIX timer (SI_TIMER),
+            // si_tid +16, si_overrun +20, si_value (8 bytes) +24, mirroring
+            // sched::signal::write_siginfo's SI_TIMER branch.
             if info_ptr != 0 && validate_user_buf(info_ptr, 128) {
                 unsafe {
                     let p = info_ptr as *mut u8;
@@ -2450,7 +2452,11 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
                     core::ptr::write_unaligned(p.add(8)  as *mut i32, info.si_code);
                     core::ptr::write_unaligned(p.add(16) as *mut i32, info.si_pid);
                     core::ptr::write_unaligned(p.add(20) as *mut u32, info.si_uid);
-                    core::ptr::write_unaligned(p.add(24) as *mut i32, info.si_status);
+                    if info.si_code == sched::SI_TIMER {
+                        core::ptr::write_unaligned(p.add(24) as *mut u64, info.si_value);
+                    } else {
+                        core::ptr::write_unaligned(p.add(24) as *mut i32, info.si_status);
+                    }
                 }
             }
             return signo as isize;
@@ -3137,7 +3143,22 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
                     Some(deadline_after_ns(ns))
                 }
             };
-            sched::futex_wait(uaddr, val as u32, deadline)
+            let r = sched::futex_wait(uaddr, val as u32, deadline);
+            // Linux: FUTEX_WAIT (relative timeout, or none) is interrupted by
+            // a signal via -ERESTARTSYS/restart_syscall — SA_RESTART (or no
+            // handler run) replays it transparently, otherwise EINTR — the
+            // exact SA_RESTART decision every other restartable syscall here
+            // gets from `note_syscall_restart`/`check_and_deliver_signals`.
+            // `futex_wait` cannot itself tell "a real FUTEX_WAKE claimed this
+            // waiter" apart from "released with nothing pending" once it has
+            // returned, so it reports the latter as a plain 0 (a spurious
+            // wake, by its own docs) whenever no wake and no timeout claimed
+            // the waiter; that is precisely the case a pending/just-delivered
+            // signal produces. FUTEX_WAIT_BITSET keeps the old behaviour
+            // unchanged: its deadline is already absolute, Linux does not
+            // restart it, and nothing here has reason to.
+            if r == 0 && cmd == FUTEX_WAIT && interrupted() { return ERESTARTSYS; }
+            r
         }
         1 => {
             // FUTEX_WAKE: wake up to `val` tasks sleeping on `uaddr`.
@@ -7244,33 +7265,41 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
 
 /// sys_timer_create(clockid, sigevent_ptr, timerid_ptr)
 fn sys_timer_create(_clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) -> isize {
-    // struct sigevent: sigev_value(8) + sigev_signo(4) + sigev_notify(4) + ...
-    // We only care about sigev_signo at offset 8 (SIGEV_SIGNAL = 0).
+    // struct sigevent: sigev_value(8) + sigev_signo(4) + sigev_notify(4) +
+    // sigev_notify_thread_id(4) + ... . We read the first 20 bytes: value,
+    // signo, notify, and (for SIGEV_THREAD_ID) the target tid.
     if timerid_ptr != 0 && !validate_user_buf(timerid_ptr, core::mem::size_of::<usize>()) { return -14; }
     // sigev_notify at offset 12: SIGEV_SIGNAL = 0, SIGEV_NONE = 1 (armed,
     // readable via timer_gettime, never signals — encoded as signo 0),
-    // SIGEV_THREAD_ID = 4 (delivered process-directed here).
-    let signo = if sigevent_ptr != 0 {
-        let mut buf = [0u8; 16];
-        let ok = validate_user_buf(sigevent_ptr, 16)
+    // SIGEV_THREAD_ID = 4 (delivered to the named thread — sigev_notify_thread_id
+    // at offset 16 — rather than process-directed, per sigevent(7)).
+    let (signo, sigev_value, target_tid) = if sigevent_ptr != 0 {
+        let mut buf = [0u8; 20];
+        let ok = validate_user_buf(sigevent_ptr, 20)
             && with_current_address_space(|as_| as_.read_user_buf(sigevent_ptr, &mut buf))
                 .unwrap_or(false);
         if !ok { return -14; }
+        let value  = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
         let signo  = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
         let notify = u32::from_ne_bytes(buf[12..16].try_into().unwrap());
         match notify {
             // SIGEV_THREAD has no kernel meaning (libc builds it on
             // SIGEV_THREAD_ID) and relibc passes it straight through: keep
             // the old silent behaviour rather than start failing callers.
-            1 | 2 => 0,
-            0 | 4 if (1..=64).contains(&signo) => signo,
+            1 | 2 => (0, 0, 0),
+            0 if (1..=64).contains(&signo) => (signo, value, 0),
+            4 if (1..=64).contains(&signo) => {
+                let tid = u32::from_ne_bytes(buf[16..20].try_into().unwrap());
+                (signo, value, tid)
+            }
             _ => return -22, // EINVAL
         }
     } else {
-        14 // SIGALRM default
+        (14, 0, 0) // SIGALRM default
     };
     let pid = current_pid();
-    let msg = make_vfs_msg(tty_server::TIMER_CREATE, &[signo as u64, timerid_ptr as u64]);
+    let msg = make_vfs_msg(tty_server::TIMER_CREATE,
+        &[signo as u64, timerid_ptr as u64, sigev_value, target_tid as u64]);
     let reply = tty_server::handle(&msg, pid);
     net_reply_val(&reply)
 }
