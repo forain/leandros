@@ -437,8 +437,12 @@ pub unsafe extern "C" fn arch_tlb_shootdown_all() {
             options(nostack)
         );
 
+        mm::paging::tlbstat::FLUSHES.fetch_add(1, Ordering::Relaxed);
         let ncpus = super::smp::active_cpu_count();
         if ncpus <= 1 { return; }
+        mm::paging::tlbstat::REMOTE_FLUSHES.fetch_add(1, Ordering::Relaxed);
+        mm::paging::tlbstat::IPIS.fetch_add((ncpus - 1) as u64, Ordering::Relaxed);
+        let t0 = mm::paging::tlbstat::now_ns();
 
         while TLB_LOCK
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -454,8 +458,13 @@ pub unsafe extern "C" fn arch_tlb_shootdown_all() {
         while TLB_PENDING_ACKS.load(Ordering::Acquire) != 0 {
             core::hint::spin_loop();
             spins += 1;
-            if spins > 200_000 { break; } // opportunistic — see note above
+            if spins > 200_000 { // opportunistic — see note above
+                mm::paging::tlbstat::TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
         }
+        mm::paging::tlbstat::add(&mm::paging::tlbstat::WAIT_NS, &mm::paging::tlbstat::WAIT_MAX_NS,
+            mm::paging::tlbstat::now_ns().saturating_sub(t0));
 
         TLB_PENDING_ACKS.store(0, Ordering::Release);
         TLB_LOCK.store(false, Ordering::Release);

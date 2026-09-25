@@ -2505,6 +2505,48 @@ fn watchdog_scan(me: usize) {
     }
 }
 
+/// `[TLBSTAT]` period: 10 s of 100 Hz ticks.
+const TLBSTAT_PERIOD_TICKS: u64 = 1000;
+
+/// Print the TLB-shootdown / CoW-promotion counters of `mm::paging::tlbstat`
+/// as deltas over the last period, when anything changed. BSP timer IRQ
+/// only; raw UART, no locks.
+fn tlbstat_tick(now: u64) {
+    use mm::paging::tlbstat as ts;
+    use core::sync::atomic::AtomicU64;
+    extern "C" { fn arch_serial_putc(c: u8); }
+    fn s(msg: &str) { for &b in msg.as_bytes() { unsafe { arch_serial_putc(b) } } }
+    fn n(mut v: u64) {
+        let mut buf = [0u8; 20]; let mut i = 0;
+        if v == 0 { s("0"); return; }
+        while v > 0 { buf[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
+        for j in (0..i).rev() { unsafe { arch_serial_putc(buf[j]) } }
+    }
+    const K: usize = 11;
+    static PREV: [AtomicU64; K] = [const { AtomicU64::new(0) }; K];
+    let cur: [&AtomicU64; K] = [&ts::FLUSHES, &ts::REMOTE_FLUSHES, &ts::IPIS, &ts::WAIT_NS,
+        &ts::TIMEOUTS, &ts::SERVICED, &ts::COW_COPY, &ts::COW_COPY_NS, &ts::COW_REUSE,
+        &ts::EXEC_PRE, &ts::EXEC_PRE_NS];
+    let mut d = [0u64; K];
+    let mut any = false;
+    for i in 0..K {
+        let c = cur[i].load(Ordering::Relaxed);
+        d[i] = c.wrapping_sub(PREV[i].swap(c, Ordering::Relaxed));
+        if d[i] != 0 && i != 3 && i != 7 && i != 10 { any = true; }
+    }
+    if !any { return; }
+    s("[TLBSTAT] t="); n(now / 100);
+    s(" flush="); n(d[0]); s(" remote="); n(d[1]); s(" ipi="); n(d[2]);
+    s(" wait_us="); n(d[3] / 1000); s(" wait_max_us="); n(ts::WAIT_MAX_NS.swap(0, Ordering::Relaxed) / 1000);
+    s(" timeout="); n(d[4]); s(" serviced="); n(d[5]);
+    s(" cow_copy="); n(d[6]); s(" cow_us="); n(d[7] / 1000);
+    s(" cow_max_us="); n(ts::COW_COPY_MAX_NS.swap(0, Ordering::Relaxed) / 1000);
+    s(" cow_reuse="); n(d[8]);
+    s(" exec="); n(d[9]); s(" exec_pre_us="); n(d[10] / 1000);
+    s(" exec_pre_max_us="); n(ts::EXEC_PRE_MAX_NS.swap(0, Ordering::Relaxed) / 1000);
+    s("\n");
+}
+
 /// The local timer interrupt on this CPU.
 ///
 /// `elapsed` is how many 10 ms ticks of real time the arch timer found had
@@ -2525,7 +2567,10 @@ pub fn timer_tick_irq(elapsed: u64) {
     // Every CPU has its own local timer; only the BSP advances global time so
     // TIMER_TICKS keeps its 100 Hz meaning regardless of CPU count.
     if id == 0 {
-        TIMER_TICKS.fetch_add(elapsed, Ordering::Relaxed);
+        let before = TIMER_TICKS.fetch_add(elapsed, Ordering::Relaxed);
+        if before / TLBSTAT_PERIOD_TICKS != (before + elapsed) / TLBSTAT_PERIOD_TICKS {
+            tlbstat_tick(before + elapsed);
+        }
         for h in TICK_HOOKS.iter() {
             let hook = h.load(Ordering::Acquire);
             if hook != 0 {

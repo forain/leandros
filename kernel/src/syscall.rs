@@ -3919,6 +3919,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     argv.reset();
     envp.reset();
 
+    let t_pre = mm::paging::tlbstat::now_ns();
     // Fault in the pointer arrays themselves (they can live in .data/.rodata
     // of a demand-paged image, not just on the stack).
     prefault_user(argv_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
@@ -3975,6 +3976,11 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     }
     let argc = argv.count;
     let envc = envp.count;
+    {
+        use mm::paging::tlbstat as ts;
+        ts::EXEC_PRE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        ts::add(&ts::EXEC_PRE_NS, &ts::EXEC_PRE_MAX_NS, ts::now_ns().saturating_sub(t_pre));
+    }
 
     // ── Load ELF into fresh address space ─────────────────────────────────────
     let pt_root = unsafe { arch_alloc_page_table_root() };

@@ -191,6 +191,7 @@ unsafe fn ensure_table(parent: *mut u64, idx: usize) -> Ensure {
 /// ensure CPU B sees the changes.
 #[no_mangle]
 pub unsafe extern "C" fn arch_tlb_shootdown_all() {
+    mm::paging::tlbstat::FLUSHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     core::arch::asm!(
         "dsb ishst",
         "tlbi vmalle1is",   // broadcast across inner-shareable domain

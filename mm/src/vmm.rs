@@ -706,6 +706,7 @@ impl AddressSpace {
             // Serialize the get→copy→dec promotion against clone_as and
             // against promotions in the sibling address space — see
             // cow::COW_LOCK's doc comment.
+            let t_promo = crate::paging::tlbstat::now_ns();
             let _cow_guard = crate::cow::COW_LOCK.lock();
             let refcount = crate::pageref::get(lazy_phys);
             let new_phys = if refcount <= 1 {
@@ -738,6 +739,14 @@ impl AddressSpace {
                 return FaultPlan::Done(Fault::Segv);
             }
             region.lazy_pages[page_idx] = new_phys;
+            {
+                use crate::paging::tlbstat as ts;
+                if new_phys != lazy_phys {
+                    ts::COW_COPY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                } else {
+                    ts::COW_REUSE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
             // A *copy* promotion rewrote a live PTE to point at a different
             // frame (old shared → fresh copy). `map_page` (arch_map_page) issues
             // only a local store barrier, never a TLB invalidation — its barrier
@@ -750,6 +759,8 @@ impl AddressSpace {
             // frame-changing copy path needs this.)
             if new_phys != lazy_phys {
                 tlb_shootdown_all();
+                use crate::paging::tlbstat as ts;
+                ts::add(&ts::COW_COPY_NS, &ts::COW_COPY_MAX_NS, ts::now_ns().saturating_sub(t_promo));
             }
             return FaultPlan::Done(Fault::Handled);
         }

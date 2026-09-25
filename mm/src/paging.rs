@@ -105,3 +105,45 @@ pub unsafe fn map_kernel_device(phys: usize, size: usize, flags: PageFlags) -> O
     }
     Some(virt)
 }
+
+/// TLB-maintenance and CoW-promotion counters (always on: relaxed atomics).
+/// Printed as a `[TLBSTAT]` delta line every 10 s by the BSP's timer tick
+/// when anything changed (`sched::tlbstat_tick`).
+pub mod tlbstat {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Cross-CPU flush requests (every shootdown call, targeted or not).
+    pub static FLUSHES: AtomicU64 = AtomicU64::new(0);
+    /// Flush requests that needed at least one remote CPU (x86: an IPI).
+    pub static REMOTE_FLUSHES: AtomicU64 = AtomicU64::new(0);
+    /// Shootdown IPIs sent (a broadcast counts once per target CPU).
+    pub static IPIS: AtomicU64 = AtomicU64::new(0);
+    /// Time initiators spent waiting for remote acknowledgements.
+    pub static WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WAIT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+    /// Waits that gave up before every target acknowledged.
+    pub static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+    /// Flush requests a lock spinner serviced itself (x86).
+    pub static SERVICED: AtomicU64 = AtomicU64::new(0);
+    /// CoW promotions that copied the page (frame changed), with cost.
+    pub static COW_COPY: AtomicU64 = AtomicU64::new(0);
+    pub static COW_COPY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COW_COPY_MAX_NS: AtomicU64 = AtomicU64::new(0);
+    /// CoW promotions that reused the frame in place (sole owner).
+    pub static COW_REUSE: AtomicU64 = AtomicU64::new(0);
+    /// execve: argv/envp prefault + collection, per call.
+    pub static EXEC_PRE: AtomicU64 = AtomicU64::new(0);
+    pub static EXEC_PRE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static EXEC_PRE_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" { fn arch_monotonic_ns() -> u64; }
+
+    #[inline]
+    pub fn now_ns() -> u64 { unsafe { arch_monotonic_ns() } }
+
+    #[inline]
+    pub fn add(total: &AtomicU64, max: &AtomicU64, ns: u64) {
+        total.fetch_add(ns, Relaxed);
+        max.fetch_max(ns, Relaxed);
+    }
+}
