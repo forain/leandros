@@ -7,7 +7,7 @@
 # llvmpipe) is never a silent fallback — it costs seconds per frame (the
 # greeter's blur alone was ~4 s/frame on softpipe) and hides a broken GPU path.
 #
-# Order of preference, each one VERIFIED by /usr/bin/gpuprobe creating a real
+# Order of preference, each one VERIFIED by /bin/gpuprobe creating a real
 # GBM + EGL context the way cosmic-comp does and reading GL_RENDERER back:
 #
 #   zink   OpenGL on Vulkan over the Venus capset (virtio-gpu venus=on) —
@@ -57,10 +57,10 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
     GPU_VIRGL=0
     GPU_DRM_NAME=
     GPU_CAPSETS=0x0
-    if [ -x /usr/bin/gpuprobe ]; then
-        eval "$(/usr/bin/gpuprobe caps 2>/dev/null)"
+    if [ -x /bin/gpuprobe ]; then
+        eval "$(/bin/gpuprobe caps 2>/dev/null)"
     else
-        echo "gpu-env: /usr/bin/gpuprobe missing from this image" >&2
+        echo "gpu-env: /bin/gpuprobe missing from this image" >&2
     fi
     echo "gpu-env: card0=${GPU_DRM_NAME:-none} capsets=$GPU_CAPSETS venus=$GPU_VENUS virgl=$GPU_VIRGL want=$_gpu_want" >&2
 
@@ -83,7 +83,7 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
             GALLIUM_DRIVER=zink
             export VK_ICD_FILENAMES MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER
             GL_RENDERER=
-            _gpu_out=$(/usr/bin/gpuprobe gl 2>/dev/null)
+            _gpu_out=$(/bin/gpuprobe gl 2>/dev/null)
             _gpu_rc=$?
             eval "$_gpu_out"
             if [ "$_gpu_rc" = 0 ]; then
@@ -104,7 +104,7 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
     if [ -z "$LEANDROS_RENDERER_PATH" ] && [ "$GPU_VIRGL" = 1 ] \
        && { [ "$_gpu_want" = auto ] || [ "$_gpu_want" = virgl ]; }; then
         GL_RENDERER=
-        _gpu_out=$(/usr/bin/gpuprobe gl 2>/dev/null)
+        _gpu_out=$(/bin/gpuprobe gl 2>/dev/null)
         _gpu_rc=$?
         eval "$_gpu_out"
         if [ "$_gpu_rc" = 0 ]; then

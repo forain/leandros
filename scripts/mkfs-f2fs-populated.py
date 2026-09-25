@@ -583,6 +583,24 @@ def main():
     # versioned .so, so the content is stored once under the soname name.
     gl_root = os.path.expanduser("~/code/leandros-artifacts/m3-gl-stack")
     gl_lib_dir = f"{gl_root}/sysroot-{arch}/usr/lib"
+    # The GPU ship-set (ports/mesa/build-gpu-stack.sh): one megadriver with
+    # zink + virgl + softpipe, the Venus ICD, the Vulkan loader zink dlopen()s,
+    # libzstd, and /bin/gpuprobe. Every file it provides WINS over the
+    # softpipe-era sysroot above; everything it does not provide (libdrm,
+    # expat, wayland, ...) still comes from the sysroot. Without it the image
+    # has no GPU renderer and /bin/gpu-env refuses to start COSMIC — say so
+    # here, at build time, rather than on a black screen.
+    gpu_stage = f"{gl_root}/gpu-stage-{arch}"
+    gpu_lib_dir = f"{gpu_stage}/usr/lib"
+    if not os.path.exists(f"{gpu_lib_dir}/libgallium-25.3.6.so"):
+        print(f"⚠️  no GPU Mesa ship-set at {gpu_stage} — COSMIC will have NO GPU "
+              f"renderer in this image (build it: ports/mesa/build-gpu-stack.sh {arch})")
+    def gl_lib(name):
+        p = f"{gpu_lib_dir}/{name}"
+        return p if os.path.exists(p) else f"{gl_lib_dir}/{name}"
+    _gpuprobe = f"{gpu_stage}/usr/bin/gpuprobe"
+    if os.path.exists(_gpuprobe):
+        bin_files.append(("gpuprobe", _gpuprobe, 0o100755))
     gbm_files = []
     for so in ("libEGL.so.1", "libGLESv2.so.2", "libgbm.so.1", "libdrm.so.2",
                "libgallium-25.3.6.so", "libexpat.so.1", "libz.so.1",
@@ -619,11 +637,11 @@ def main():
                # but the library still has to be present or the greeter fails to
                # load. Do not unstage it on the grounds that nothing calls it.
                "libpam.so.0"):
-        p = f"{gl_lib_dir}/{so}"
+        p = gl_lib(so)
         if os.path.exists(p):
             usr_lib_files.append((so, p, 0o100755))
     # GBM backend, dlopened by absolute path /usr/lib/gbm/dri_gbm.so.
-    dri = f"{gl_lib_dir}/gbm/dri_gbm.so"
+    dri = gl_lib("gbm/dri_gbm.so")
     if os.path.exists(dri):
         gbm_files.append(("dri_gbm.so", dri, 0o100755))
     # kmscube itself (dynamic ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1).
@@ -839,7 +857,10 @@ def main():
     # the JSON below exists so anything that does read an ICD manifest finds the
     # same library_path.
     venus_root = os.path.expanduser(f"~/code/leandros-artifacts/venus-lane/stage-{arch}")
-    _icd_so = f"{venus_root}/usr/lib/libvulkan_virtio.so"
+    # The ICD + manifest come from the GPU ship-set when it exists: built in
+    # the same tree as the zink megadriver, so the two are ABI-consistent.
+    _icd_root = gpu_stage if os.path.exists(f"{gpu_stage}/usr/lib/libvulkan_virtio.so") else venus_root
+    _icd_so = f"{_icd_root}/usr/lib/libvulkan_virtio.so"
     if os.path.exists(_icd_so):
         usr_lib_files.append(("libvulkan_virtio.so", _icd_so, 0o100755))
     _vktest = f"{venus_root}/usr/bin/vktest"
@@ -865,7 +886,7 @@ def main():
     # has to be in m4_share_dirs — /usr is static (ino 15) but /usr/share only
     # exists because the M4 walk happens to create it, which is not a dependency
     # worth having.
-    _icd_json = f"{venus_root}/usr/share/vulkan/icd.d/virtio_icd.{arch}.json"
+    _icd_json = f"{_icd_root}/usr/share/vulkan/icd.d/virtio_icd.{arch}.json"
     if os.path.exists(_icd_json):
         for d in ("/usr/share", "/usr/share/vulkan", "/usr/share/vulkan/icd.d"):
             m4_share_dirs.add(d)
@@ -1185,7 +1206,7 @@ def main():
     # serial RX drops characters once a session is live.
     _greetd_scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "..", "ports", "greetd", "data")
-    for _s in ("greeter-env", "greeter-fake", "greeter-real"):
+    for _s in ("greeter-env", "greeter-fake", "greeter-real", "gpu-env"):
         _p = os.path.normpath(os.path.join(_greetd_scripts, _s))
         if os.path.exists(_p):
             bin_files.append((_s, _p, 0o100755))

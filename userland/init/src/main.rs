@@ -66,6 +66,8 @@ const DM_RESPAWN_DELAY_US: u32 = 3_000_000;
 const DM_RESPAWN_DELAY_MAX_US: u32 = 30_000_000;
 const DM_STABLE_SECS: u64 = 60;
 const DM_MAX_RESPAWNS: u32 = 20;
+/// greeter-real's "no GPU renderer" refusal (EX_CONFIG); see ports/greetd/data/gpu-env.
+const DM_EXIT_NO_GPU: i32 = 78;
 
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
@@ -148,6 +150,21 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             // adds another. systemd would kill the unit's cgroup here; we
             // kill what the kernel has reparented to us (see `sweep_strays`).
             sweep_strays(login_pid);
+            // Exit 78 (EX_CONFIG) from /bin/greeter-real: /bin/gpu-env found
+            // no hardware GL renderer and refused to start a software-rendered
+            // COSMIC. Not a crash — respawning cannot fix it — so say it once,
+            // loudly, on the console and keep only the text login.
+            if status & 0x7f == 0 && (status >> 8) & 0xff == DM_EXIT_NO_GPU {
+                write_str("\n");
+                write_str("################################################################\n");
+                write_str("## NO GPU RENDERER: the graphical login (COSMIC) was NOT started.\n");
+                write_str("## COSMIC renders on the host GPU only (zink/Venus or virgl);\n");
+                write_str("## this VM has no GL-capable virtio-gpu, or its GPU stack failed.\n");
+                write_str("## Details: /var/log/greetd.log. Software rendering is opt-in:\n");
+                write_str("##   touch /etc/leandros/allow-software-render\n");
+                write_str("################################################################\n");
+                continue;
+            }
             let ran_secs = monotonic_secs().saturating_sub(dm_started);
             if ran_secs >= DM_STABLE_SECS {
                 dm_respawns = 0;
