@@ -326,6 +326,22 @@ static CURRENT_PID: [AtomicU32; MAX_CPUS] =
 /// non-leader `execve` changes the thread's *pid*, never its tgid.)
 static CURRENT_TGID: [AtomicU32; MAX_CPUS] =
     [const { AtomicU32::new(0) }; MAX_CPUS];
+/// Address space of the task running on each CPU (its own `Arc`'s pointee;
+/// null = none / not dispatched), published at dispatch, cleared at
+/// switch-back and re-published by `replace_address_space` (execve). Lets
+/// `lock_leader_address_space` serve the running task's own page faults and
+/// mm syscalls without RUN_QUEUE: that site was ~296 k RUN_QUEUE holds/s
+/// (8 % of a CPU held, the top site by far) while a COSMIC session starts.
+///
+/// Why the pointer stays valid while it is published: it points into the
+/// `Arc<AddressSpace>` held by the task running on this CPU. A running task
+/// is never reaped (reaping happens at its own switch-back), nothing else
+/// ever drops or replaces a task's `address_space` except that task's own
+/// `execve`, which updates this slot in the same RUN_QUEUE hold, and
+/// syscalls / fault handlers run with IRQs masked, so the reader cannot
+/// migrate between reading `cpu_id()` and using the slot.
+static CURRENT_AS: [core::sync::atomic::AtomicPtr<mm::vmm::AddressSpace>; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
 /// Reply port of the task running on each CPU (`u32::MAX` = none yet),
 /// published at dispatch and by [`set_current_reply_port`], so
 /// [`current_reply_port`] — the first step of every synchronous server call —
@@ -2631,6 +2647,29 @@ pub fn preempt_check() {
 ///  * `replace_address_space` (execve) waits for `busy` to clear before
 ///    dropping the displaced address space.
 pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::AddressSpace> {
+    // Fast path: the running task's own address space (page faults, its own
+    // mm syscalls — nearly every call), via the per-CPU slot, no RUN_QUEUE.
+    // See `CURRENT_AS` for why the pointer is live here.
+    let t0 = lockwatch::as_clock();
+    let cpu = unsafe { cpu_id() };
+    if pid != 0 && CURRENT_PID[cpu].load(Ordering::Relaxed) == pid {
+        let p = CURRENT_AS[cpu].load(Ordering::Acquire);
+        if !p.is_null() {
+            let as_ = unsafe { &*p };
+            let mut spins: u32 = 0;
+            loop {
+                if as_.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    lockwatch::note_wait(0);
+                    lockwatch::note_hold(lockwatch::L_AS_BUSY, true);
+                    lockwatch::note_as_acquired(t0, spins != 0);
+                    return Some(p);
+                }
+                spins = spins.wrapping_add(1);
+                if spins == 1 { lockwatch::note_wait(lockwatch::L_AS_BUSY); }
+                core::hint::spin_loop();
+            }
+        }
+    }
     let mut spins: u32 = 0;
     loop {
         {
@@ -2655,6 +2694,7 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
             {
                 lockwatch::note_wait(0);
                 lockwatch::note_hold(lockwatch::L_AS_BUSY, true);
+                lockwatch::note_as_acquired(t0, spins != 0);
                 // `as_` is a shared `&Arc<AddressSpace>` now (see
                 // `Task::address_space`'s doc comment for why it's an `Arc`,
                 // not a `Box`) — the cast to `*mut` is the same "exclusivity
@@ -2676,6 +2716,7 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
 /// Release exclusive access taken by `lock_leader_address_space`.
 pub(crate) unsafe fn unlock_address_space(as_ptr: *mut mm::vmm::AddressSpace) {
     lockwatch::note_hold(lockwatch::L_AS_BUSY, false);
+    lockwatch::note_as_released();
     (*as_ptr).busy.store(false, Ordering::Release);
 }
 
@@ -3141,13 +3182,15 @@ fn scheduler_run_loop() -> ! {
                     t.on_cpu = Some(id);
                     t.state  = TaskState::Running;
                     let kst = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
-                    Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port))
+                    let as_ptr = t.address_space.as_ref()
+                        .map_or(core::ptr::null_mut(), |a| alloc::sync::Arc::as_ptr(a) as *mut mm::vmm::AddressSpace);
+                    Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port, as_ptr))
                 }
                 None => None,
             }
         };
 
-        if let Some((idx, ctx_ptr, dispatched_pid, kernel_stack_top_virt, page_table, tgid, reply_port)) = picked {
+        if let Some((idx, ctx_ptr, dispatched_pid, kernel_stack_top_virt, page_table, tgid, reply_port, as_ptr)) = picked {
             let dispatched_at = ticks();
             let dispatched_ns = unsafe { arch_monotonic_ns() };
             let pid;
@@ -3157,6 +3200,7 @@ fn scheduler_run_loop() -> ! {
                 CURRENT_PID[id].store(dispatched_pid, Ordering::Relaxed);
                 CURRENT_TGID[id].store(tgid, Ordering::Relaxed);
                 CURRENT_REPLY_PORT[id].store(reply_port, Ordering::Relaxed);
+                CURRENT_AS[id].store(as_ptr, Ordering::Release);
 
                 arch_set_kernel_stack(kernel_stack_top_virt as u64);
                 if page_table != 0 {
@@ -3179,6 +3223,7 @@ fn scheduler_run_loop() -> ! {
                 CURRENT_CTX[id] = core::ptr::null_mut();
                 CURRENT_PID[id].store(0, Ordering::Relaxed);
                 CURRENT_TGID[id].store(0, Ordering::Relaxed);
+                CURRENT_AS[id].store(core::ptr::null_mut(), Ordering::Release);
 
                 // Detach from the task's page table before it can be freed:
                 // if this task exits (reaped below) or exits later on another
@@ -3614,6 +3659,10 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
         let leader = rq.get_mut(lidx).unwrap();
         leader.pid = old_pid;
     }
+    // Keep the run queue's pid → slot hint current (a stale hint is only
+    // slower, never wrong — see `RunQueue::pid_index`).
+    rq.reindex(me_idx);
+    rq.reindex(lidx);
     // Children forked by this thread name its old tid as parent.
     for i in 0..runqueue::MAX_TASKS {
         if let Some(t) = rq.get_mut(i) {
@@ -3963,6 +4012,10 @@ pub fn replace_address_space(
         let mut rq = RUN_QUEUE.lock();
         if let Some(t) = rq.find_pid_mut(pid) {
             let displaced = t.address_space.replace(alloc::sync::Arc::new(new_as));
+            // Re-publish before the displaced one can be dropped (below).
+            let cur = t.address_space.as_ref()
+                .map_or(core::ptr::null_mut(), |a| alloc::sync::Arc::as_ptr(a) as *mut mm::vmm::AddressSpace);
+            CURRENT_AS[unsafe { cpu_id() }].store(cur, Ordering::Release);
             t.page_table    = pt_root;
             t.heap_start    = heap_start;
             t.heap_end      = heap_start;
