@@ -2505,6 +2505,11 @@ fn watchdog_scan(me: usize) {
     }
 }
 
+/// Emit the periodic `[TLBSTAT]` line. Off by default: raw UART writes from
+/// the timer IRQ interleave with the serial console and break harnesses that
+/// expect the shell prompt at the end of output.
+const TLBSTAT_PRINT: bool = false;
+
 /// `[TLBSTAT]` period: 10 s of 100 Hz ticks.
 const TLBSTAT_PERIOD_TICKS: u64 = 1000;
 
@@ -2569,7 +2574,9 @@ pub fn timer_tick_irq(elapsed: u64) {
     // TIMER_TICKS keeps its 100 Hz meaning regardless of CPU count.
     if id == 0 {
         let before = TIMER_TICKS.fetch_add(elapsed, Ordering::Relaxed);
-        if before / TLBSTAT_PERIOD_TICKS != (before + elapsed) / TLBSTAT_PERIOD_TICKS {
+        if TLBSTAT_PRINT
+            && before / TLBSTAT_PERIOD_TICKS != (before + elapsed) / TLBSTAT_PERIOD_TICKS
+        {
             tlbstat_tick(before + elapsed);
         }
         for h in TICK_HOOKS.iter() {
