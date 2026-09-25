@@ -1,0 +1,149 @@
+# /bin/gpu-env — choose the renderer for a COSMIC compositor. Sourced
+# (`. /bin/gpu-env`) by /etc/profile (both greetd sessions), /bin/greeter-real
+# (before greetd starts) and /bin/start-cosmic-leandros (serial-started
+# sessions). POSIX sh only: /bin/sh is brush.
+#
+# RULE: COSMIC renders on the GPU. A software-rendered session (softpipe /
+# llvmpipe) is never a silent fallback — it costs seconds per frame (the
+# greeter's blur alone was ~4 s/frame on softpipe) and hides a broken GPU path.
+#
+# Order of preference, each one VERIFIED by /usr/bin/gpuprobe creating a real
+# GBM + EGL context the way cosmic-comp does and reading GL_RENDERER back:
+#
+#   zink   OpenGL on Vulkan over the Venus capset (virtio-gpu venus=on) —
+#          the host GPU through Vulkan; the measured fast path (20 fps).
+#   virgl  OpenGL passthrough over the virgl capset (virtio-vga-gl /
+#          virtio-gpu-gl-pci without Venus, e.g. a host with GL but no
+#          Vulkan driver, or UTM on macOS).
+#
+# If neither yields a hardware renderer the result is LEANDROS_RENDERER_PATH=
+# refused and the caller refuses to start the compositor (greeter-real exits
+# 78, which init reports on the serial console and stops respawning). The ONLY
+# way to get a software-rendered COSMIC is an explicit opt-in:
+#
+#   LEANDROS_RENDERER=software                 (environment), or
+#   /etc/leandros/renderer containing "software", or
+#   /etc/leandros/allow-software-render        (marker file)
+#
+# and even then a banner says so in the log. Headless kernel tests do not need
+# any of this: they log in on the serial getty, which never runs a compositor
+# (`touch /etc/leandros/text-login` skips the graphical login entirely).
+#
+# LEANDROS_RENDERER=zink|virgl forces one path (still verified; refused if it
+# does not come up in hardware). Outputs, exported:
+#   LEANDROS_RENDERER_PATH  zink | virgl | software | refused
+#   LEANDROS_GL_RENDERER    the GL_RENDERER string gpuprobe read back
+#   LEANDROS_RENDERER_DECIDED=1  so a nested source (profile -> start-cosmic-
+#                                leandros) does not probe twice
+
+if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
+    _gpu_want=${LEANDROS_RENDERER:-}
+    if [ -z "$_gpu_want" ] && [ -r /etc/leandros/renderer ]; then
+        read -r _gpu_want < /etc/leandros/renderer || true
+    fi
+    [ -n "$_gpu_want" ] || _gpu_want=auto
+    _gpu_allow_sw=0
+    if [ "$_gpu_want" = software ] || [ "${LEANDROS_ALLOW_SOFTWARE_RENDER:-0}" = 1 ] \
+       || [ -e /etc/leandros/allow-software-render ]; then
+        _gpu_allow_sw=1
+    fi
+
+    # Start from a clean slate: these are what select the driver, and a value
+    # inherited from an older launcher (GBM_ALWAYS_SOFTWARE=1 was the default
+    # until 2026-09) would pin softpipe no matter what the device offers.
+    unset GBM_ALWAYS_SOFTWARE MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER VK_ICD_FILENAMES || true
+
+    GPU_VENUS=0
+    GPU_VIRGL=0
+    GPU_DRM_NAME=
+    GPU_CAPSETS=0x0
+    if [ -x /usr/bin/gpuprobe ]; then
+        eval "$(/usr/bin/gpuprobe caps 2>/dev/null)"
+    else
+        echo "gpu-env: /usr/bin/gpuprobe missing from this image" >&2
+    fi
+    echo "gpu-env: card0=${GPU_DRM_NAME:-none} capsets=$GPU_CAPSETS venus=$GPU_VENUS virgl=$GPU_VIRGL want=$_gpu_want" >&2
+
+    LEANDROS_RENDERER_PATH=
+    LEANDROS_GL_RENDERER=
+    # One ICD manifest per image (virtio_icd.<arch>.json); glob it rather
+    # than spawn uname.
+    _gpu_icd=
+    for _gpu_f in /usr/share/vulkan/icd.d/virtio_icd.*.json; do
+        [ -r "$_gpu_f" ] && _gpu_icd=$_gpu_f
+    done
+    unset _gpu_f
+
+    # -- zink over Venus ------------------------------------------------------
+    if [ -z "$LEANDROS_RENDERER_PATH" ] && [ "$GPU_VENUS" = 1 ] \
+       && { [ "$_gpu_want" = auto ] || [ "$_gpu_want" = zink ]; }; then
+        if [ -n "$_gpu_icd" ] && [ -r /usr/lib/libvulkan.so.1 ]; then
+            VK_ICD_FILENAMES=$_gpu_icd
+            MESA_LOADER_DRIVER_OVERRIDE=zink
+            GALLIUM_DRIVER=zink
+            export VK_ICD_FILENAMES MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER
+            GL_RENDERER=
+            _gpu_out=$(/usr/bin/gpuprobe gl 2>/dev/null)
+            _gpu_rc=$?
+            eval "$_gpu_out"
+            if [ "$_gpu_rc" = 0 ]; then
+                LEANDROS_RENDERER_PATH=zink
+                LEANDROS_GL_RENDERER=$GL_RENDERER
+            else
+                echo "gpu-env: zink probe failed (rc=$_gpu_rc renderer='$GL_RENDERER')" >&2
+                unset VK_ICD_FILENAMES MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER
+            fi
+        else
+            echo "gpu-env: Venus offered but the virtio ICD manifest or /usr/lib/libvulkan.so.1 is not in the image" >&2
+        fi
+    fi
+
+    # -- virgl ----------------------------------------------------------------
+    # No override needed: card0 reports `virtio_gpu` whenever virgl was
+    # negotiated, and Mesa's loader maps that name to the virgl driver.
+    if [ -z "$LEANDROS_RENDERER_PATH" ] && [ "$GPU_VIRGL" = 1 ] \
+       && { [ "$_gpu_want" = auto ] || [ "$_gpu_want" = virgl ]; }; then
+        GL_RENDERER=
+        _gpu_out=$(/usr/bin/gpuprobe gl 2>/dev/null)
+        _gpu_rc=$?
+        eval "$_gpu_out"
+        if [ "$_gpu_rc" = 0 ]; then
+            LEANDROS_RENDERER_PATH=virgl
+            LEANDROS_GL_RENDERER=$GL_RENDERER
+        else
+            echo "gpu-env: virgl probe failed (rc=$_gpu_rc renderer='$GL_RENDERER')" >&2
+        fi
+    fi
+
+    # -- no hardware renderer ---------------------------------------------------
+    if [ -z "$LEANDROS_RENDERER_PATH" ]; then
+        if [ "$_gpu_allow_sw" = 1 ]; then
+            LEANDROS_RENDERER_PATH=software
+            LEANDROS_GL_RENDERER=softpipe
+            GBM_ALWAYS_SOFTWARE=1
+            export GBM_ALWAYS_SOFTWARE
+            echo "" >&2
+            echo "################################################################" >&2
+            echo "## gpu-env: SOFTWARE RENDERING (softpipe) — explicitly allowed ##" >&2
+            echo "## COSMIC will be slow (seconds per frame). This is a debugging ##" >&2
+            echo "## mode, not a supported configuration.                        ##" >&2
+            echo "################################################################" >&2
+        else
+            LEANDROS_RENDERER_PATH=refused
+            echo "" >&2
+            echo "################################################################" >&2
+            echo "## gpu-env: NO GPU RENDERER — refusing to start COSMIC.         ##" >&2
+            echo "## card0=${GPU_DRM_NAME:-none} capsets=$GPU_CAPSETS venus=$GPU_VENUS virgl=$GPU_VIRGL" >&2
+            echo "## Boot with a host-GPU device (run-qemu.sh picks one by       ##" >&2
+            echo "## default where the host has it), or opt in to softpipe with  ##" >&2
+            echo "## touch /etc/leandros/allow-software-render                   ##" >&2
+            echo "################################################################" >&2
+        fi
+    else
+        echo "gpu-env: renderer=$LEANDROS_RENDERER_PATH GL_RENDERER='$LEANDROS_GL_RENDERER'" >&2
+    fi
+
+    LEANDROS_RENDERER_DECIDED=1
+    export LEANDROS_RENDERER_PATH LEANDROS_GL_RENDERER LEANDROS_RENDERER_DECIDED
+    unset _gpu_want _gpu_allow_sw _gpu_icd _gpu_rc _gpu_out GL_RENDERER
+fi

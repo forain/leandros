@@ -32,7 +32,7 @@ if [ -n "${GPU_BUILD_TMP:-}" ]; then mkdir -p "$GPU_BUILD_TMP"; TMPMNT="-v $GPU_
 # shellcheck disable=SC2086
 "$CT" run --rm --platform "$PLAT" $TMPMNT \
     -v "$MESA_SRC:/work/mesa" -v "$HERE:/src:ro" -v "$OUT:/out" \
-    alpine:3.21 sh /src/build-gpu-stack-alpine.sh "$ARCH" >"$LOG" 2>&1 || true
+    alpine:3.21 sh /src/build-gpu-stack-alpine.sh "$ARCH" "${2:-all}" >"$LOG" 2>&1 || true
 tail -30 "$LOG"
 tail -1 "$LOG" | grep -q '=== rc=0 ' || { echo "❌ build failed (see $LOG)"; exit 1; }
 echo "✅ $OUT/gpu-stage-$ARCH"

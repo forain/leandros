@@ -28,6 +28,7 @@
 #
 # Emits '=== rc=N arch=A ===' as the LAST line — trust that, not log content.
 ARCH="$1"
+MODE="${2:-all}"   # all | probe (rebuild only gpuprobe against an existing stage)
 case "$ARCH" in
   aarch64) DRIVERS=zink,virgl,softpipe,v3d ;;
   x86_64)  DRIVERS=zink,virgl,softpipe ;;
@@ -43,6 +44,10 @@ esac
   apk add --no-cache -X https://dl-cdn.alpinelinux.org/alpine/edge/main --allow-untrusted \
     libdisplay-info=0.3.0-r1 libdisplay-info-dev=0.3.0-r1
   cc -fPIC -fno-stack-protector -c /src/ssp_guard.c -o /tmp/ssp_guard.o
+  S=/tmp/gpu-stage-$ARCH
+  if [ "$MODE" = probe ]; then
+    rm -rf "$S"; mkdir -p "$S"; cp -a "/out/gpu-stage-$ARCH/." "$S/"
+  else
   B=/tmp/build-gpu-$ARCH
   rm -rf "$B"
   meson setup "$B" /work/mesa --prefix=/usr --buildtype=release --wrap-mode=nodownload \
@@ -57,15 +62,22 @@ esac
     "-Dc_link_args=['-static-libgcc','/tmp/ssp_guard.o']" \
     "-Dcpp_link_args=['-static-libstdc++','-static-libgcc','/tmp/ssp_guard.o']"
   ninja -C "$B"
-  S=/tmp/gpu-stage-$ARCH
   rm -rf "$S"
   DESTDIR="$S" ninja -C "$B" install
+  fi
+  # gpuprobe: linked against the libraries it ships with. Alpine's PT_INTERP
+  # (/lib/ld-musl-<arch>.so.1) is already the guest's; only the libc soname
+  # needs rewriting, done by the loop below.
+  mkdir -p "$S/usr/bin"
+  cc -O2 -fno-stack-protector -o "$S/usr/bin/gpuprobe" /src/gpuprobe.c \
+    -I"$S/usr/include" -L"$S/usr/lib" -Wl,-rpath-link,"$S/usr/lib" \
+    -lEGL -lGLESv2 -lgbm /tmp/ssp_guard.o
   # The loader zink dlopen()s, and the zstd runtime the shader cache needs
   # (the older softpipe-only sysroots never had it).
   cp -L /usr/lib/libvulkan.so.1 "$S/usr/lib/"
   cp -L /usr/lib/libzstd.so.1 "$S/usr/lib/"
   cd "$S/usr/lib"
-  for f in $(find . -type f -name '*.so*'); do
+  for f in $(find . ../bin -type f); do
     if file "$f" | grep -q ELF; then
       patchelf --replace-needed "libc.musl-$ARCH.so.1" libc.so "$f" 2>/dev/null || true
     fi
