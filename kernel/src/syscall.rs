@@ -1660,6 +1660,8 @@ fn prot_to_page_flags(prot: usize) -> PageFlags {
 /// exists because `[WDOG] ... cosmic-comp ... last syscall 9` was seen with no
 /// way to say which mapping, of what, cost the seconds.
 const MMAP_SLOW_NS: u64 = 500_000_000;
+/// File mappings at least this long are reported as `[MMAP-BIG]`.
+const MMAP_BIG_LEN: usize = 4 << 20;
 
 /// Largest single VFS read the eager file-mmap copy issues before opening an
 /// interrupt window (see the copy loop in `sys_mmap_inner`). 512 KiB is a few
@@ -1689,6 +1691,19 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     let t0 = monotonic_ns();
     let r = sys_mmap_inner(addr, len, prot, flags, fd, off, &mut tr);
     let dt = monotonic_ns().wrapping_sub(t0);
+    // Every big file mapping, however fast: the per-mmap latency of the
+    // mappings that used to be copied eagerly (a Rust binary mapping its own
+    // executable, ld-musl mapping libgallium).
+    if (tr.kind == 4 || tr.kind == 5) && len >= MMAP_BIG_LEN {
+        crate::serial_print_str("[MMAP-BIG] pid=");
+        mmap_print_dec(current_pid() as usize);
+        crate::serial_print_str(if tr.kind == 5 { " kind=file-lazy" } else { " kind=file-copy" });
+        crate::serial_print_str(" len_kib=");
+        mmap_print_dec(len >> 10);
+        crate::serial_print_str(" us=");
+        mmap_print_dec((dt / 1000) as usize);
+        crate::serial_print_str("\n");
+    }
     if dt >= MMAP_SLOW_NS {
         crate::serial_print_str("[MMAP-SLOW] pid=");
         mmap_print_dec(current_pid() as usize);
