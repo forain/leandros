@@ -2,7 +2,7 @@
 """LeandrOS QEMU driver for agent interaction.
 
 Usage:
-  driver.py start [aarch64|x86_64] [mode] [--venus]   Launch QEMU, wait for shell prompt
+  driver.py start [aarch64|x86_64] [mode] [--venus|--virgl]  Launch QEMU, wait for shell prompt
   driver.py cmd "<command>"           Send shell command, print output
   driver.py screenshot [out.ppm]      Capture GPU framebuffer via monitor
   driver.py stop                      Quit QEMU cleanly
@@ -59,6 +59,18 @@ now attaches in venus mode (see VENUS_VNC_ADDR): egl-headless reads the GL
 framebuffer back into that same console surface and calls dpy_gfx_update(),
 and a 2D listener is what turns that into pixels a client can fetch.
 
+`--virgl` (any position after `start`): a virgl 3D device — aarch64
+`virtio-gpu-gl-pci,id=virglgpu`, x86_64 `virtio-vga-gl` — under
+`-display egl-headless` plus a loopback VNC listener on that console
+(LEANDROS_VNC_PORT, default 5909). `LEANDROS_GPU=virgl` does the same.
+On macOS this needs the GPU QEMU from scripts/mac-qemu-gpu/build.sh (virgl on
+ANGLE/Metal); `screenshot` then photographs the GL scanout over that VNC
+listener (screendump has no surface for a GL scanout — see above).
+
+Host QEMU: `LEANDROS_QEMU_PREFIX=<prefix>` runs <prefix>/bin/qemu-system-*
+with <prefix>/share/qemu firmware; on macOS ~/.local/qemu-gpu (the
+scripts/mac-qemu-gpu/build.sh default) is used automatically when present.
+
 All paths relative to the repo root (three levels up from this file).
 """
 
@@ -99,7 +111,34 @@ REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../..")
 )
 
-AARCH64_FW_PATHS = [
+def _qemu_prefix():
+    """Install prefix of the QEMU to run, or None for plain $PATH lookup.
+
+    macOS: Homebrew's qemu has no virglrenderer, so the GPU build from
+    scripts/mac-qemu-gpu/build.sh (default ~/.local/qemu-gpu) wins when it is
+    installed. LEANDROS_QEMU_PREFIX overrides on any host."""
+    p = os.environ.get("LEANDROS_QEMU_PREFIX")
+    if p:
+        return os.path.expanduser(p)
+    if sys.platform == "darwin":
+        d = os.path.expanduser("~/.local/qemu-gpu")
+        if os.access(os.path.join(d, "bin", "qemu-system-aarch64"), os.X_OK):
+            return d
+    return None
+
+
+QEMU_PREFIX = _qemu_prefix()
+
+
+def _qemu_bin(name):
+    return os.path.join(QEMU_PREFIX, "bin", name) if QEMU_PREFIX else name
+
+
+def _prefix_fw(*names):
+    return [os.path.join(QEMU_PREFIX, "share", "qemu", n) for n in names] if QEMU_PREFIX else []
+
+
+AARCH64_FW_PATHS = _prefix_fw("edk2-aarch64-code.fd") + [
     "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
     "/usr/share/AAVMF/AAVMF_CODE.fd",
     "/usr/share/edk2-armvirt/aarch64/QEMU_EFI-pflash.raw",
@@ -110,7 +149,7 @@ AARCH64_FW_PATHS = [
     "/usr/share/edk2/aarch64/QEMU_CODE.fd",
     "/usr/share/edk2/aarch64/QEMU_EFI.fd",
 ]
-X86_64_FW_PATHS = [
+X86_64_FW_PATHS = _prefix_fw("edk2-x86_64-code.fd") + [
     "/opt/homebrew/share/qemu/edk2-x86_64-code.fd",
     "/usr/share/ovmf/OVMF.fd",
     "/usr/share/OVMF/OVMF_CODE.fd",
@@ -121,14 +160,14 @@ X86_64_FW_PATHS = [
 ]
 # Writable VARS templates matching the split CODE firmwares above. A combined
 # image (OVMF.fd) carries its own vars and needs none of these.
-AARCH64_VARS_PATHS = [
+AARCH64_VARS_PATHS = _prefix_fw("edk2-arm-vars.fd") + [
     "/opt/homebrew/share/qemu/edk2-arm-vars.fd",
     "/usr/share/edk2/aarch64/QEMU_VARS.4m.fd",
     "/usr/share/edk2/aarch64/QEMU_VARS.fd",
     "/usr/share/edk2-armvirt/aarch64/vars-template-pflash.raw",
     "/usr/share/AAVMF/AAVMF_VARS.fd",
 ]
-X86_64_VARS_PATHS = [
+X86_64_VARS_PATHS = _prefix_fw("edk2-i386-vars.fd") + [
     "/opt/homebrew/share/qemu/edk2-i386-vars.fd",
     "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
     "/usr/share/edk2/x64/OVMF_VARS.fd",
@@ -171,11 +210,52 @@ VENUS_VNC_PORT = int(os.environ.get("LEANDROS_VNC_PORT", "5909"))
 VENUS_VNC_ADDR = f"127.0.0.1:{VENUS_VNC_PORT - 5900}"
 
 
+# Written at `start` when this run has a VNC listener on a GL console, so a
+# later `screenshot` (a separate process) knows to photograph over VNC.
+VNC_STATE_FILE = f"/tmp/leandros{_TAG}-vnc-port"
+VIRGL_GPU_DEV_AARCH64 = "virtio-gpu-gl-pci,id=virglgpu"
+
+
 def _venus_vnc_args(venus):
     """Pair -display egl-headless with a 2D pixel consumer on the GL console."""
     if not venus:
         return []
     return ["-vnc", f"{VENUS_VNC_ADDR},display=venusgpu"]
+
+
+def _gpu_request(args):
+    """'venus' | 'virgl' | None from start flags, else LEANDROS_GPU."""
+    if "--venus" in args:
+        return "venus"
+    if "--virgl" in args:
+        return "virgl"
+    env = os.environ.get("LEANDROS_GPU", "")
+    if env in ("venus", "virgl"):
+        return env
+    if env == "auto":
+        return "virgl" if _gl_capable_qemu("qemu-system-aarch64") else None
+    return None
+
+
+def _venus_capable_qemu(name):
+    try:
+        out = subprocess.run([_qemu_bin(name), "-device", "virtio-gpu-gl-pci,help"],
+                             capture_output=True, text=True, timeout=20)
+        return "venus=" in out.stdout + out.stderr
+    except Exception:
+        return False
+
+
+def _gl_capable_qemu(name):
+    """This host's QEMU has a virgl device and an egl-headless display."""
+    try:
+        exe = _qemu_bin(name)
+        devs = subprocess.run([exe, "-device", "help"], capture_output=True, text=True, timeout=20)
+        disp = subprocess.run([exe, "-display", "help"], capture_output=True, text=True, timeout=20)
+        return ("virtio-gpu-gl-pci" in devs.stdout + devs.stderr
+                and "egl-headless" in disp.stdout + disp.stderr)
+    except Exception:
+        return False
 
 
 def _virgl_usable():
@@ -195,11 +275,11 @@ def _virgl_usable():
     if os.environ.get("LEANDROS_VIRGL", "0") != "1":
         return False
     try:
-        devs = subprocess.run(["qemu-system-x86_64", "-device", "help"],
+        devs = subprocess.run([_qemu_bin("qemu-system-x86_64"), "-device", "help"],
                               capture_output=True, text=True, timeout=20)
         if "virtio-vga-gl" not in (devs.stdout + devs.stderr):
             return False
-        disp = subprocess.run(["qemu-system-x86_64", "-display", "help"],
+        disp = subprocess.run([_qemu_bin("qemu-system-x86_64"), "-display", "help"],
                               capture_output=True, text=True, timeout=20)
         return "egl-headless" in (disp.stdout + disp.stderr)
     except Exception:
@@ -443,7 +523,14 @@ def _guest_mem():
     return os.environ.get("LEANDROS_QEMU_MEM", "2G")
 
 
-def _build_cmd(arch, mode="uefi", venus=False):
+def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
+    if virgl:
+        if mode not in ("uefi", "uefi-hvf", "uefi-tcg"):
+            sys.exit(f"ERROR: --virgl only supports UEFI boot modes (got mode={mode!r})")
+        if not _gl_capable_qemu(f"qemu-system-{arch}"):
+            sys.exit(f"ERROR: --virgl: {_qemu_bin('qemu-system-' + arch)} has no virgl device "
+                     "or no egl-headless display. On macOS build it with "
+                     "scripts/mac-qemu-gpu/build.sh.")
     if venus:
         # Mirrors run-qemu.sh's --venus guards: it never autodetects and never
         # degrades, because every way of getting this wrong (wrong boot mode,
@@ -452,9 +539,9 @@ def _build_cmd(arch, mode="uefi", venus=False):
         # back blank).
         if mode not in ("uefi", "uefi-hvf", "uefi-tcg"):
             sys.exit(f"ERROR: --venus only supports UEFI boot modes (got mode={mode!r})")
-        if sys.platform == "darwin":
-            sys.exit("ERROR: --venus needs a host EGL implementation; macOS has none, so "
-                      "virtio-gpu-gl-pci,venus=on cannot initialise. Use the Linux box.")
+        if sys.platform == "darwin" and not _venus_capable_qemu(f"qemu-system-{arch}"):
+            sys.exit("ERROR: --venus: this macOS QEMU has no venus= property (stock "
+                      "virglrenderer has no macOS Venus); use --virgl, or the Linux box.")
     if mode == "direct":
         return _build_direct_cmd(arch)
     if mode == "raspi4b":
@@ -491,10 +578,10 @@ def _build_cmd(arch, mode="uefi", venus=False):
         data1   = os.path.join(REPO_ROOT, "f2fs-data1-aarch64.img")
         # venus=False (the default) is byte-identical to the pre-venus command:
         # virtio-gpu-pci under -display none.
-        gpu_dev = VENUS_GPU_DEV if venus else "virtio-gpu-pci"
-        display_arg = "egl-headless" if venus else "none"
+        gpu_dev = VENUS_GPU_DEV if venus else (VIRGL_GPU_DEV_AARCH64 if virgl else "virtio-gpu-pci")
+        display_arg = "egl-headless" if (venus or virgl) else "none"
         return [
-            "qemu-system-aarch64",
+            _qemu_bin("qemu-system-aarch64"),
             # gic-version=3: QEMU >= 11.1 HVF refuses a GICv2 machine outright;
             # the kernel detects v2/v3 at boot, so TCG uses the same line.
             "-machine", "virt,gic-version=3", "-smp", "4", *cpu_flags, "-m", _guest_mem(),
@@ -517,6 +604,7 @@ def _build_cmd(arch, mode="uefi", venus=False):
             "-no-reboot", "-parallel", "none",
             "-display", display_arg,
             *_venus_vnc_args(venus),
+            *(["-vnc", f"{VENUS_VNC_ADDR},display=virglgpu"] if virgl else []),
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
             "-serial", "chardev:serial0",
             "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
@@ -550,12 +638,12 @@ def _build_cmd(arch, mode="uefi", venus=False):
         # `--venus` section for why `device=` isn't used instead). Matches
         # run-qemu.sh's --venus resetting X86_UEFI_VGA_ARGS to empty.
         vga_args = [] if venus else ["-vga", "none"]
-        virgl = False
+        use_virgl = False
         if venus:
             gpu_args = ["-device", VENUS_GPU_DEV]
             display_arg = "egl-headless"
-        elif _virgl_usable():
-            virgl = True
+        elif virgl or _virgl_usable():
+            use_virgl = True
             # virtio-vga-gl = virtio-vga + virglrenderer: it keeps the VGA
             # registers OVMF needs for a GOP, so unlike virtio-gpu-gl-pci it is
             # a legal x86_64 primary display. egl-headless rather than none —
@@ -574,7 +662,7 @@ def _build_cmd(arch, mode="uefi", venus=False):
             gpu_args = ["-device", "virtio-vga"]
             display_arg = "none"
         return [
-            "qemu-system-x86_64",
+            _qemu_bin("qemu-system-x86_64"),
             "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
@@ -595,7 +683,7 @@ def _build_cmd(arch, mode="uefi", venus=False):
             "-no-reboot", "-parallel", "none",
             "-display", display_arg,
             *_venus_vnc_args(venus),
-            *(["-vnc", VENUS_VNC_ADDR] if virgl else []),
+            *(["-vnc", VENUS_VNC_ADDR] if use_virgl else []),
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
             "-serial", "chardev:serial0",
             "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
@@ -618,7 +706,7 @@ def _build_direct_cmd(arch):
         if not os.path.exists(kernel):
             sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
         return [
-            "qemu-system-aarch64",
+            _qemu_bin("qemu-system-aarch64"),
             "-machine", "virt,gic-version=3", "-smp", "4", "-cpu", "max", "-m", _guest_mem(), "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
@@ -763,7 +851,7 @@ def _read_serial_until(sentinel, timeout=120, at_prompt=False):
     return None
 
 
-def cmd_start(arch="aarch64", mode="uefi", venus=False):
+def cmd_start(arch="aarch64", mode="uefi", venus=False, virgl=False):
     if _qemu_pid() is not None:
         print("QEMU already running. Run 'stop' first.")
         sys.exit(1)
@@ -771,7 +859,14 @@ def cmd_start(arch="aarch64", mode="uefi", venus=False):
     _cleanup_socks()
     open(SERIAL_LOG, "wb").close()
 
-    qemu_cmd = _build_cmd(arch, mode, venus=venus)
+    qemu_cmd = _build_cmd(arch, mode, venus=venus, virgl=virgl)
+    try:
+        os.unlink(VNC_STATE_FILE)
+    except FileNotFoundError:
+        pass
+    if "-vnc" in qemu_cmd:
+        with open(VNC_STATE_FILE, "w") as f:
+            f.write(str(VENUS_VNC_PORT))
     # Debug escape hatch: extra QEMU args, e.g.
     #   LEANDROS_QEMU_EXTRA='-trace enable=virtio_snd_*,file=/tmp/t.log'
     extra = os.environ.get("LEANDROS_QEMU_EXTRA")
@@ -1243,7 +1338,21 @@ def cmd_screenshot(outfile=None):
     # no DisplaySurface for QMP to dump — see the module docstring's `--venus`
     # section. This is already correct for the non-venus default path too, so
     # no branching here.
-    _monitor_send(f"screendump {outfile}", timeout=15)
+    vnc_port = None
+    try:
+        with open(VNC_STATE_FILE) as f:
+            vnc_port = int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        pass
+    if vnc_port is not None and os.environ.get("LEANDROS_SCREENSHOT", "vnc") == "vnc":
+        # GL scanout (virgl/venus): screendump has no surface, VNC does.
+        try:
+            _vnc_grab_ppm(vnc_port, outfile)
+        except Exception as e:
+            print(f"WARNING: VNC grab on port {vnc_port} failed ({e}); trying screendump")
+            _monitor_send(f"screendump {outfile}", timeout=15)
+    else:
+        _monitor_send(f"screendump {outfile}", timeout=15)
     if os.path.exists(outfile):
         sz = os.path.getsize(outfile)
         print(f"Screenshot: {outfile} ({sz} bytes)")
@@ -1253,6 +1362,73 @@ def cmd_screenshot(outfile=None):
             print(f"PNG:        {png}")
     else:
         print(f"WARNING: screendump did not create {outfile}")
+
+
+def _vnc_grab_ppm(port, path, timeout=30):
+    """One full-frame RFB 3.8 raw-encoding grab from a no-auth QEMU VNC
+    listener, written as a binary PPM (P6). No third-party modules."""
+    import struct
+    so = socket.create_connection(("127.0.0.1", port), timeout=10)
+    so.settimeout(timeout)
+
+    def rd(n):
+        b = b""
+        while len(b) < n:
+            c = so.recv(n - len(b))
+            if not c:
+                raise IOError("vnc eof")
+            b += c
+        return b
+    try:
+        rd(12)
+        so.sendall(b"RFB 003.008\n")
+        types = rd(rd(1)[0])
+        if 1 not in types:
+            raise IOError(f"vnc security types {types!r}")
+        so.sendall(b"\x01")
+        if struct.unpack(">I", rd(4))[0] != 0:
+            raise IOError("vnc security failed")
+        so.sendall(b"\x01")  # shared
+        w, h = struct.unpack(">HH", rd(4))
+        rd(16)
+        rd(struct.unpack(">I", rd(4))[0])
+        # SetPixelFormat: 32bpp little-endian BGRX, then raw encoding only
+        so.sendall(struct.pack(">BxxxBBBBHHHBBBxxx", 0, 32, 24, 0, 1, 255, 255, 255, 16, 8, 0))
+        so.sendall(struct.pack(">BxHi", 2, 1, 0))
+        so.sendall(struct.pack(">BBHHHH", 3, 0, 0, 0, w, h))
+        fb = bytearray(w * h * 3)
+        got = 0
+        deadline = time.time() + timeout
+        while got < w * h and time.time() < deadline:
+            mt = rd(1)[0]
+            if mt == 2:          # bell
+                continue
+            if mt == 1:          # colour map
+                rd(1); _, nc = struct.unpack(">HH", rd(4)); rd(6 * nc); continue
+            if mt == 3:          # cut text
+                rd(3); rd(struct.unpack(">I", rd(4))[0]); continue
+            if mt != 0:
+                raise IOError(f"vnc message {mt}")
+            rd(1)
+            for _ in range(struct.unpack(">H", rd(2))[0]):
+                x, y, rw, rh, enc = struct.unpack(">HHHHi", rd(12))
+                if enc == -223:  # DesktopSize pseudo-encoding
+                    continue
+                if enc != 0:
+                    raise IOError(f"vnc encoding {enc}")
+                data = rd(rw * rh * 4)
+                for j in range(rh):
+                    row = data[j * rw * 4:(j + 1) * rw * 4]
+                    o = ((y + j) * w + x) * 3
+                    fb[o:o + rw * 3:3] = row[2::4]
+                    fb[o + 1:o + rw * 3:3] = row[1::4]
+                    fb[o + 2:o + rw * 3:3] = row[0::4]
+                got += rw * rh
+    finally:
+        so.close()
+    with open(path, "wb") as f:
+        f.write(b"P6\n%d %d\n255\n" % (w, h))
+        f.write(fb)
 
 
 def cmd_stop():
@@ -1388,11 +1564,11 @@ if __name__ == "__main__":
         # --venus is a flag, not positional, so it can land anywhere after
         # "start" (e.g. "start x86_64 --venus" or "start --venus x86_64
         # uefi-tcg") without disturbing the arch/mode positions.
-        venus = "--venus" in args[1:]
+        gpu = _gpu_request(args[1:])
         positional = [a for a in args[1:] if not a.startswith("--")]
         arch = positional[0] if len(positional) > 0 else "aarch64"
         mode = positional[1] if len(positional) > 1 else "uefi"
-        cmd_start(arch, mode, venus=venus)
+        cmd_start(arch, mode, venus=(gpu == "venus"), virgl=(gpu == "virgl"))
     elif sub == "cmd":
         if len(args) < 2:
             sys.exit("Usage: driver.py cmd <shell-command> [timeout_seconds]")
