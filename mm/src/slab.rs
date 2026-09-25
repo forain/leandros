@@ -40,6 +40,9 @@ impl Cache {
             Some(p) => p,
             None    => return false,
         };
+        if let Some(i) = size_class_idx(self.obj_size) {
+            CLASS_PAGES[i].fetch_add(1, Ordering::Relaxed);
+        }
         let virt = crate::phys_to_virt(phys);
         let n = PAGE_SIZE / self.obj_size;
         let mut addr = virt;
@@ -101,6 +104,54 @@ fn pages_to_order(pages: usize) -> Option<usize> {
     Some(order)
 }
 
+// ── Accounting ────────────────────────────────────────────────────────────────
+//
+// Live objects per exact size (8-byte granularity up to 4096; larger requests
+// by page count up to 1024 pages, the rest lumped), plus pages each class has
+// pulled from the buddy. Caches never give pages back, so `CLASS_PAGES` is the
+// high-water mark of that class; a leak shows as `LIVE_BY_SIZE` growing at
+// one size across identical workloads, which names the type far better than
+// a class does. Read by `/proc/kmemstat`.
+
+use core::sync::atomic::{AtomicUsize, AtomicIsize, Ordering};
+const SMALL_BUCKETS: usize = 4096 / 8 + 1;
+const LARGE_BUCKETS: usize = 1025;
+static LIVE_BY_SIZE: [AtomicIsize; SMALL_BUCKETS] = [const { AtomicIsize::new(0) }; SMALL_BUCKETS];
+static LIVE_BY_PAGES: [AtomicIsize; LARGE_BUCKETS] = [const { AtomicIsize::new(0) }; LARGE_BUCKETS];
+static CLASS_PAGES: [AtomicUsize; NUM_CLASSES] = [const { AtomicUsize::new(0) }; NUM_CLASSES];
+static CLASS_LIVE: [AtomicIsize; NUM_CLASSES] = [const { AtomicIsize::new(0) }; NUM_CLASSES];
+
+fn account(size: usize, delta: isize) {
+    if size <= 4096 {
+        LIVE_BY_SIZE[(size + 7) / 8].fetch_add(delta, Ordering::Relaxed);
+        if let Some(i) = size_class_idx(size) { CLASS_LIVE[i].fetch_add(delta, Ordering::Relaxed); }
+    } else {
+        let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+        LIVE_BY_PAGES[pages.min(LARGE_BUCKETS - 1)].fetch_add(delta, Ordering::Relaxed);
+    }
+}
+
+/// `emit(class_size, pages_owned, live_objects)` per size class.
+pub fn class_census(emit: &mut dyn FnMut(usize, usize, isize)) {
+    for i in 0..NUM_CLASSES {
+        emit(SIZE_CLASSES[i], CLASS_PAGES[i].load(Ordering::Relaxed), CLASS_LIVE[i].load(Ordering::Relaxed));
+    }
+}
+
+/// `emit(size_upper_bytes, live_objects)` for every exact-size bucket with a
+/// live object; sizes > 4096 are reported as `pages * 4096` (the last bucket
+/// is "1024 pages or more").
+pub fn size_census(emit: &mut dyn FnMut(usize, isize)) {
+    for i in 1..SMALL_BUCKETS {
+        let n = LIVE_BY_SIZE[i].load(Ordering::Relaxed);
+        if n != 0 { emit(i * 8, n); }
+    }
+    for p in 1..LARGE_BUCKETS {
+        let n = LIVE_BY_PAGES[p].load(Ordering::Relaxed);
+        if n != 0 { emit(p * PAGE_SIZE, n); }
+    }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// No-op — caches are lazily filled on first allocation.
@@ -114,6 +165,12 @@ pub fn alloc(size: usize) -> Option<*mut u8> {
     if size == 0 {
         return Some(core::ptr::NonNull::dangling().as_ptr());
     }
+    let r = alloc_inner(size);
+    if r.is_some() { account(size, 1); }
+    r
+}
+
+fn alloc_inner(size: usize) -> Option<*mut u8> {
     match size_class_idx(size) {
         Some(idx) => CACHES.lock().0[idx].alloc(),
         None => {
@@ -131,6 +188,7 @@ pub fn alloc(size: usize) -> Option<*mut u8> {
 /// `ptr` must have been returned by `slab::alloc` with the same `size`.
 pub unsafe fn free(ptr: *mut u8, size: usize) {
     if size == 0 || ptr.is_null() { return; }
+    account(size, -1);
     match size_class_idx(size) {
         Some(idx) => CACHES.lock().0[idx].free(ptr),
         None => {

@@ -298,8 +298,134 @@ pub fn init_from_map(regions: &[boot::MemoryRegion]) {
     TOTAL_PAGES.store(FREE_PAGES.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
-/// Allocate 2^order contiguous physical pages. Returns physical address or None.
+// ── Per-call-site accounting ─────────────────────────────────────────────────
+//
+// Every block `alloc` hands out is charged to the source location that asked
+// for it (`#[track_caller]`, so a helper that wants its own callers charged
+// instead marks itself `#[track_caller]` too). A one-byte tag per physical
+// page remembers which site owns it, so `free` — which may release a block in
+// different pieces than it was allocated in — credits the right site page by
+// page. `/proc/kmemstat` prints the live pages per site; a site whose count
+// only ever grows across identical workloads is a leak, and its file:line
+// names the allocation.
+//
+// Cost: a hashed probe of a 255-entry table and one byte store per page on
+// alloc, one byte load per page on free; no lock beyond the atomics.
+
+const SITE_SLOTS: usize = 256;
+/// `&'static Location` of the site, as an address; 0 = empty slot. Slot 0 is
+/// reserved for "untagged" (allocated before the tag array existed, or the
+/// table was full).
+static SITE_KEY: [AtomicUsize; SITE_SLOTS] = [const { AtomicUsize::new(0) }; SITE_SLOTS];
+/// Live pages charged to the site. Signed: slot 0 goes negative when pages
+/// allocated before `init_site_tags` are freed.
+static SITE_PAGES: [core::sync::atomic::AtomicIsize; SITE_SLOTS] =
+    [const { core::sync::atomic::AtomicIsize::new(0) }; SITE_SLOTS];
+/// Peak of `SITE_PAGES`, for "what did it cost at worst".
+static SITE_PEAK: [core::sync::atomic::AtomicIsize; SITE_SLOTS] =
+    [const { core::sync::atomic::AtomicIsize::new(0) }; SITE_SLOTS];
+/// Base of the per-page tag array (HHDM virtual address), 0 until set up.
+static TAGS: AtomicUsize = AtomicUsize::new(0);
+/// Number of pages the tag array covers (from physical address 0).
+static TAG_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+fn site_slot(loc: &'static core::panic::Location<'static>) -> usize {
+    let key = loc as *const _ as usize;
+    let mut i = (key >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56; // 0..=255
+    for _ in 0..SITE_SLOTS {
+        if i == 0 { i = 1; }
+        let k = SITE_KEY[i].load(Ordering::Relaxed);
+        if k == key { return i; }
+        if k == 0 {
+            match SITE_KEY[i].compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return i,
+                Err(k2) if k2 == key => return i,
+                Err(_) => {}
+            }
+        }
+        i = (i + 1) % SITE_SLOTS;
+    }
+    0
+}
+
+fn charge(slot: usize, pages: isize) {
+    let now = SITE_PAGES[slot].fetch_add(pages, Ordering::Relaxed) + pages;
+    if pages > 0 && now > SITE_PEAK[slot].load(Ordering::Relaxed) {
+        SITE_PEAK[slot].store(now, Ordering::Relaxed);
+    }
+}
+
+fn tag_block(addr: usize, order: usize, slot: u8) {
+    let tags = TAGS.load(Ordering::Relaxed);
+    if tags == 0 { return; }
+    let first = addr / PAGE_SIZE;
+    let n = TAG_PAGES.load(Ordering::Relaxed);
+    let last = (first + (1usize << order)).min(n);
+    for pfn in first..last {
+        unsafe { *((tags + pfn) as *mut u8) = slot; }
+    }
+}
+
+/// Credit every page of [addr, addr + 2^order) back to the site that owns it.
+fn untag_block(addr: usize, order: usize) {
+    let tags = TAGS.load(Ordering::Relaxed);
+    if tags == 0 { return; }
+    let first = addr / PAGE_SIZE;
+    let n = TAG_PAGES.load(Ordering::Relaxed);
+    let last = (first + (1usize << order)).min(n);
+    // Runs of the same tag are credited in one atomic op.
+    let mut run_tag = 0u8; let mut run_len = 0isize;
+    for pfn in first..last {
+        let t = unsafe { core::ptr::replace((tags + pfn) as *mut u8, 0) };
+        if t != run_tag && run_len != 0 { charge(run_tag as usize, -run_len); run_len = 0; }
+        run_tag = t; run_len += 1;
+    }
+    if run_len != 0 { charge(run_tag as usize, -run_len); }
+}
+
+/// Set up the per-page site tags. Called once, right after `init_from_map`;
+/// allocations before this are untagged (slot 0).
+pub fn init_site_tags() {
+    let n = PHYS_END.load(Ordering::Relaxed) / PAGE_SIZE;
+    if n == 0 { return; }
+    let pages = (n + PAGE_SIZE - 1) / PAGE_SIZE;
+    let mut order = 0; while (1usize << order) < pages { order += 1; }
+    let phys = match alloc_untracked(order) { Some(p) => p, None => return };
+    let virt = crate::phys_to_virt(phys);
+    unsafe { core::ptr::write_bytes(virt as *mut u8, 0, n); }
+    TAG_PAGES.store(n, Ordering::Relaxed);
+    TAGS.store(virt, Ordering::Release);
+}
+
+/// Walk the site table: `emit(file, line, live_pages, peak_pages)` for every
+/// site that has ever allocated (slot 0 is reported with file "untagged").
+pub fn site_census(emit: &mut dyn FnMut(&str, u32, isize, isize)) {
+    emit("untagged", 0, SITE_PAGES[0].load(Ordering::Relaxed), SITE_PEAK[0].load(Ordering::Relaxed));
+    for i in 1..SITE_SLOTS {
+        let k = SITE_KEY[i].load(Ordering::Relaxed);
+        if k == 0 { continue; }
+        let loc = unsafe { &*(k as *const core::panic::Location<'static>) };
+        emit(loc.file(), loc.line(), SITE_PAGES[i].load(Ordering::Relaxed),
+             SITE_PEAK[i].load(Ordering::Relaxed));
+    }
+}
+
+/// Allocate 2^order contiguous physical pages, charged to the caller's
+/// source location (see "Per-call-site accounting"). Returns physical
+/// address or None.
+#[track_caller]
 pub fn alloc(order: usize) -> Option<usize> {
+    let loc = core::panic::Location::caller();
+    let addr = alloc_untracked(order)?;
+    if TAGS.load(Ordering::Relaxed) != 0 {
+        let slot = site_slot(loc);
+        charge(slot, 1isize << order);
+        tag_block(addr, order, slot as u8);
+    }
+    Some(addr)
+}
+
+fn alloc_untracked(order: usize) -> Option<usize> {
     if order >= MAX_ORDER { return None; }
     let mut lists = FREE_LISTS.lock();
     // Walk up from requested order looking for a free block.
@@ -362,6 +488,9 @@ pub fn free(addr: usize, order: usize) {
         drop(lists);
         report_bad_free(addr, order, b"double free", loc); return;
     }
+    // Under FREE_LISTS: the block is still ours until it is pushed below, and
+    // a racing double free has just been refused above.
+    untag_block(addr, order);
     FREE_PAGES.fetch_add(1 << order, Ordering::Relaxed);
 
     let mut addr = addr;
