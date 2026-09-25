@@ -609,6 +609,12 @@ impl AddressSpace {
                 np
             };
 
+            if new_phys != lazy_phys {
+                // Break-before-make: the PTE's output address changes, which
+                // AArch64 only permits through an invalid entry + TLB flush.
+                unsafe { unmap_page(page_table_root, page_va); }
+                tlb_shootdown_all();
+            }
             let mapped = unsafe { map_page(page_table_root, page_va, new_phys, region.flags) };
             if !mapped {
                 if new_phys != lazy_phys { buddy_free(new_phys, 0); }
@@ -743,9 +749,45 @@ impl AddressSpace {
         while va < page_end {
             if self.virt_to_phys(va).is_none() {
                 self.handle_user_page_fault(va, false);
+            } else {
+                // A kernel store into a writable page still shared
+                // copy-on-write would fault (the PTE is read-only for the
+                // kernel too) — possibly under a lock the fault path cannot
+                // take. Prefaulting promises no fault afterwards, so give
+                // this side its private copy now.
+                let _ = self.unshare_cow_page(va, true);
             }
             va += PAGE_SIZE;
         }
+    }
+
+    /// If the page at `va` is still shared copy-on-write with another address
+    /// space, promote it to a private copy here (as a user write fault would).
+    ///
+    /// Required before any store the kernel makes through the HHDM
+    /// (`write_user_buf`): that path bypasses the read-only PTE, so without
+    /// this the store lands in the frame the fork sibling still maps.
+    /// Returns false only when the private copy could not be made (OOM).
+    /// `only_writable` restricts it to VMAs userspace may write (the
+    /// prefault case, which also covers buffers the kernel only reads).
+    pub fn unshare_cow_page(&mut self, va: usize, only_writable: bool) -> bool {
+        let shared = match self.regions.iter().filter_map(|r| r.as_ref())
+            .find(|r| va >= r.start && va < r.end)
+        {
+            Some(r) if r.lazy && r.cow
+                && (!only_writable || r.flags.contains(PageFlags::WRITABLE)) =>
+            {
+                let idx = ((va & !(PAGE_SIZE - 1)) - r.start) / PAGE_SIZE;
+                let phys = r.lazy_pages.get(idx).copied().unwrap_or(0);
+                // Refcount 1 cannot rise under us: only a fork of an address
+                // space mapping this frame could raise it, and the only such
+                // space is this one, whose busy lock the caller holds.
+                phys != 0 && crate::pageref::get(phys) > 1
+            }
+            _ => false,
+        };
+        // false only when a needed private copy could not be made (OOM).
+        !shared || self.handle_user_page_fault(va, true)
     }
 
     /// Split the VMA that *strictly* contains the page-aligned `boundary` into
@@ -973,10 +1015,15 @@ impl AddressSpace {
     }
 
     /// Write data from a kernel buffer into user virtual memory.
-    pub fn write_user_buf(&self, user_va: usize, src: &[u8]) -> bool {
+    ///
+    /// The store goes through the HHDM, not the user mapping, so it ignores
+    /// the PTE's write protection: a page still shared copy-on-write with a
+    /// fork sibling is unshared first, or the sibling would see the write.
+    pub fn write_user_buf(&mut self, user_va: usize, src: &[u8]) -> bool {
         let mut offset = 0;
         while offset < src.len() {
             let va = user_va + offset;
+            if !self.unshare_cow_page(va, false) { return false; }
             let phys = match self.virt_to_phys(va) {
                 Some(p) => p,
                 None => return false,

@@ -3120,7 +3120,7 @@ fn sys_mincore(addr: usize, length: usize, vec: usize) -> isize {
         None => return -12, // ENOMEM
     };
 
-    with_current_address_space(|as_| {
+    with_current_address_space_mut(|as_| {
         // Pass 1: the whole range must be backed by VMAs — this is the exact
         // "is this address mapped?" signal callers depend on. Bail before
         // touching `vec` if any page is unmapped.
@@ -4498,7 +4498,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
             if is_kernel {
                 unsafe { core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf_ptr as *mut u8, n); }
             } else {
-                let ok = with_current_address_space(|as_| {
+                let ok = with_current_address_space_mut(|as_| {
                     as_.write_user_buf(buf_ptr, &kbuf[..n])
                 }).unwrap_or(false);
                 if !ok { return -14; }
@@ -5709,7 +5709,7 @@ fn sys_getgroups(size: usize, list_ptr: usize) -> isize {
         if !validate_user_buf(list_ptr, n * 4) { return -14; }
         prefault_user(list_ptr, n * 4);
         let bytes = unsafe { core::slice::from_raw_parts(groups.as_ptr() as *const u8, n * 4) };
-        let ok = with_current_address_space(|as_| as_.write_user_buf(list_ptr, bytes)).unwrap_or(false);
+        let ok = with_current_address_space_mut(|as_| as_.write_user_buf(list_ptr, bytes)).unwrap_or(false);
         if !ok { return -14; }
     }
     n as isize
@@ -8889,7 +8889,7 @@ fn sys_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize {
 
     if old_ptr != 0 {
         let obuf = itimerval_bytes(old_interval_ticks, old_value_ticks);
-        if !with_current_address_space(|as_| as_.write_user_buf(old_ptr, &obuf)).unwrap_or(false) {
+        if !with_current_address_space_mut(|as_| as_.write_user_buf(old_ptr, &obuf)).unwrap_or(false) {
             return -14;
         }
     }
@@ -8903,7 +8903,7 @@ fn sys_getitimer(which: usize, cur_ptr: usize) -> isize {
     let pid = current_pid();
     let (interval_ticks, value_ticks) = tty_server::get_real_itimer(pid);
     let buf = itimerval_bytes(interval_ticks, value_ticks);
-    if with_current_address_space(|as_| as_.write_user_buf(cur_ptr, &buf)).unwrap_or(false) { 0 } else { -14 }
+    if with_current_address_space_mut(|as_| as_.write_user_buf(cur_ptr, &buf)).unwrap_or(false) { 0 } else { -14 }
 }
 
 /// sys_sigpending(set_ptr) — return the set of pending signals.
@@ -8913,7 +8913,7 @@ fn sys_sigpending(set_ptr: usize) -> isize {
     // that every thread currently masks is parked on the leader
     // (shared_signal_pending) but is still "pending" to sigpending(2).
     let pending = pending_signals() | sched::shared_pending_signals();
-    if with_current_address_space(|as_| as_.write_user_buf(set_ptr, &pending.to_ne_bytes())).unwrap_or(false) {
+    if with_current_address_space_mut(|as_| as_.write_user_buf(set_ptr, &pending.to_ne_bytes())).unwrap_or(false) {
         0
     } else {
         -14
@@ -9024,7 +9024,7 @@ fn sys_clone_or_fork(
         // returns here with a positive pid.
         if ret > 0 && flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
             let tid = (ret as u32).to_ne_bytes();
-            let _ = with_current_address_space(|as_| as_.write_user_buf(ptid, &tid));
+            let _ = with_current_address_space_mut(|as_| as_.write_user_buf(ptid, &tid));
         }
         ret
     }

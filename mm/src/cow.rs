@@ -26,7 +26,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use crate::vmm::{AddressSpace, VmaRegion, MAP_SHARED};
 use crate::paging::{map_page, tlb_shootdown_all, PageFlags};
-use crate::buddy::{PAGE_SIZE, alloc as buddy_alloc};
+use crate::buddy::PAGE_SIZE;
 use crate::pageref;
 
 /// Serializes every compound pageref transaction: `clone_as`'s inc+downgrade
@@ -38,6 +38,14 @@ use crate::pageref;
 /// own-AS-busy → COW_LOCK, so the two-lock combination cannot deadlock.
 pub static COW_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
+/// Pages the most recent `clone_as` shared copy-on-write / copied outright.
+/// Advisory diagnostics for the `[FORK]` serial line in `sched::clone`.
+pub static LAST_SHARED_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub static LAST_COPIED_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Of `LAST_SHARED_PAGES`, those in writable private VMAs — what the old
+/// eager-copy fork duplicated up front.
+pub static LAST_PRIVATE_RW_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Clone `src` into a fresh `AddressSpace` rooted at `new_page_table_root`.
 ///
 /// Takes `src` by mutable reference: sharing a page copy-on-write requires
@@ -47,6 +55,9 @@ pub static COW_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 /// Returns `None` on out-of-memory.
 pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<AddressSpace> {
     let _cow_guard = COW_LOCK.lock();
+    let mut shared_pages = 0usize;
+    let copied_pages = 0usize; // nothing is copied at fork any more
+    let mut private_rw_pages = 0usize;
     let src_root = src.root();
     let mut dst = AddressSpace::new(new_page_table_root);
     dst.heap_start = src.heap_start;
@@ -122,73 +133,32 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
         }
 
         let downgraded = region.flags & !PageFlags::WRITABLE;
+        let private_rw = !is_shared && region.flags.contains(PageFlags::WRITABLE);
+        let shared_before = shared_pages;
         let mut dst_lazy_pages = Vec::new();
         let mut dst_lazy_count = 0usize;
 
         // Writable private regions (stack, heap, .data/.bss, RW mmaps) are
-        // *eagerly copied* into the child rather than shared copy-on-write.
+        // shared copy-on-write exactly like read-only ones: both sides map
+        // the frame read-only and the first writer takes a private copy.
         //
-        // Sharing a writable page CoW with a just-forked child exposes an SMP
-        // race in the runtime copy-promotion: when the parent (a multithreaded
-        // process — brush's tokio runtime) writes such a page, its fault
-        // handler copies the shared frame to a fresh one and remaps only the
-        // parent, while the child still references the original. Under
-        // concurrent access from the forking process's other threads this
-        // deterministically-by-layout corrupts one small parent struct
-        // (observed: std's `Process.pidfd` reading 0 instead of -1, so tokio's
-        // reaper takes the `waitid(P_PIDFD)` path and brush exits with
-        // "Invalid argument"). Giving the child its own copies here removes the
-        // shared-writable window entirely: no writable page is ever both
-        // parent- and child-mapped, so the copy-promotion never runs on a page
-        // another address space still holds.
-        //
-        // Read-only private regions (the bulk of a static musl image: .text,
-        // .rodata, demand-paged executable pages) keep full CoW below — they
-        // are never written, so they never promote and cannot hit the race,
-        // and sharing them keeps fork cheap.
-        let is_writable = region.flags.contains(PageFlags::WRITABLE);
-        if !is_shared && is_writable {
-            if !region.lazy {
-                let n_pages = (region.end - region.start) / PAGE_SIZE;
-                dst_lazy_pages.resize(n_pages, 0);
-                for i in 0..n_pages {
-                    let src_phys = region.phys + i * PAGE_SIZE;
-                    let np = match buddy_alloc(0) { Some(p) => p, None => return None };
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            crate::phys_to_virt(src_phys) as *const u8,
-                            crate::phys_to_virt(np) as *mut u8, PAGE_SIZE);
-                        map_page(new_page_table_root, region.start + i * PAGE_SIZE, np, region.flags);
-                    }
-                    dst_lazy_pages[i] = np;
-                    dst_lazy_count += 1;
-                }
-            } else {
-                dst_lazy_pages.resize(region.lazy_pages.len(), 0);
-                for (i, &phys) in region.lazy_pages.iter().enumerate() {
-                    if phys == 0 { continue; } // absent: child demand-pages it independently
-                    let np = match buddy_alloc(0) { Some(p) => p, None => return None };
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            crate::phys_to_virt(phys) as *const u8,
-                            crate::phys_to_virt(np) as *mut u8, PAGE_SIZE);
-                        map_page(new_page_table_root, region.start + i * PAGE_SIZE, np, region.flags);
-                    }
-                    dst_lazy_pages[i] = np;
-                    dst_lazy_count += 1;
-                }
-            }
-            // Parent VMA is left exactly as it was — it keeps its own frames,
-            // fully writable, and never takes a CoW fault for this region.
-            if crate::vmm::is_file_backed(region.file_cap) { crate::vmm::file_retain(region.file_cap); }
-            *dst_slot = Some(VmaRegion {
-                start: region.start, end: region.end, phys: 0, flags: region.flags,
-                lazy: true, lazy_pages: dst_lazy_pages, lazy_count: dst_lazy_count,
-                prot: region.prot, map_flags: region.map_flags, file_cap: region.file_cap,
-                file_off: region.file_off, file_len: region.file_len, cow: false,
-            });
-            continue;
-        }
+        // Until 2026-09-24 they were copied eagerly here (e9510cb), which
+        // cost a ~200 MiB transient per cosmic-comp spawn and tripped
+        // `[BUDDY] Allocation failed` on a depleted guest. The corruption
+        // that motivated the eager copy (brush/tokio: std's `Process.pidfd`
+        // reading 0) has two causes, both closed elsewhere now:
+        //   * a sibling thread writing through a stale writable TLB entry
+        //     into the frame the child now shares — closed by the
+        //     stop-the-world quiesce around this clone
+        //     (`sched::quiesce_thread_group`) plus the final shootdown below;
+        //   * the kernel storing into user memory through the HHDM
+        //     (`write_user_buf`: wait status, signal frames, read(2) into a
+        //     buffer) — which bypasses the page-table write protection and
+        //     would land in the frame both sides still share. `write_user_buf`
+        //     and `prefault_range` now break the sharing first
+        //     (`AddressSpace::unshare_cow_page`), and direct kernel stores
+        //     through a user pointer take the ordinary EL1/ring-0 write fault
+        //     (the PTE is read-only for the kernel too: AP[2] / CR0.WP).
 
         if !region.lazy {
             // Still-contiguous, never-forked eager block: convert both
@@ -199,6 +169,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
             for i in 0..n_pages {
                 let phys = region.phys + i * PAGE_SIZE;
                 pageref::inc(phys);
+                shared_pages += 1;
                 dst_lazy_pages[i] = phys;
                 dst_lazy_count += 1;
                 let install_flags = if is_shared { region.flags } else { downgraded };
@@ -218,6 +189,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
             for (i, &phys) in region.lazy_pages.iter().enumerate() {
                 if phys == 0 { continue; }
                 pageref::inc(phys);
+                shared_pages += 1;
                 if dst_lazy_pages.len() <= i { dst_lazy_pages.resize(i + 1, 0); }
                 dst_lazy_pages[i] = phys;
                 dst_lazy_count += 1;
@@ -231,6 +203,8 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
             }
             if !is_shared { region.cow = true; }
         }
+
+        if private_rw { private_rw_pages += shared_pages - shared_before; }
 
         // The child VMA holds its own reference to any backing file: pages
         // still absent after the fork are demand-read by whichever side
@@ -268,5 +242,9 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
     // post-fork write takes the CoW fault it must.
     tlb_shootdown_all();
 
+    use core::sync::atomic::Ordering;
+    LAST_SHARED_PAGES.store(shared_pages, Ordering::Relaxed);
+    LAST_COPIED_PAGES.store(copied_pages, Ordering::Relaxed);
+    LAST_PRIVATE_RW_PAGES.store(private_rw_pages, Ordering::Relaxed);
     Some(dst)
 }

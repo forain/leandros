@@ -611,7 +611,7 @@ fn itimerspec_bytes(interval_ticks: u64, value_ticks: u64) -> [u8; 32] {
 /// the same pattern, established during the Phase 6/7 hazard sweep).
 fn write_itimerspec(ptr: usize, interval_ticks: u64, value_ticks: u64) -> bool {
     let buf = itimerspec_bytes(interval_ticks, value_ticks);
-    sched::with_current_address_space(|as_| as_.write_user_buf(ptr, &buf)).unwrap_or(false)
+    sched::with_current_address_space_mut(|as_| as_.write_user_buf(ptr, &buf)).unwrap_or(false)
 }
 
 fn handle_timer_create(pid: u32, signo: u32, timerid_ptr: usize) -> Message {
@@ -635,7 +635,7 @@ fn handle_timer_create(pid: u32, signo: u32, timerid_ptr: usize) -> Message {
         // `timer_t` as EFAULT, and a raw index of 0 (this process's very
         // first timer) *is* NULL once cast to `*mut c_void`. See
         // `handle_timer_settime`/etc. below, which undo the offset.
-        let ok = sched::with_current_address_space(|as_| {
+        let ok = sched::with_current_address_space_mut(|as_| {
             as_.write_user_buf(timerid_ptr, &((slot as u64) + 1).to_ne_bytes())
         }).unwrap_or(false);
         if !ok {

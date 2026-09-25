@@ -52,6 +52,28 @@ fn report_task_table_full() {
     }
 }
 
+/// One serial line per fork of a non-trivial address space (> 1 MiB resident):
+/// pages shared copy-on-write, pages copied outright, and the clone's wall
+/// time. Small forks (shells, init) stay silent.
+fn report_large_fork(tgid: u32, ns: u64) {
+    use core::sync::atomic::Ordering;
+    let shared = mm::cow::LAST_SHARED_PAGES.load(Ordering::Relaxed);
+    let copied = mm::cow::LAST_COPIED_PAGES.load(Ordering::Relaxed);
+    let private_rw = mm::cow::LAST_PRIVATE_RW_PAGES.load(Ordering::Relaxed);
+    if shared + copied < 256 { return; }
+    extern "C" {
+        fn arch_serial_putc(c: u8);
+        fn print_number(n: u32);
+    }
+    let put = |s: &[u8]| for &b in s { unsafe { arch_serial_putc(b) }; };
+    put(b"[FORK] tgid=");        unsafe { print_number(tgid) };
+    put(b" shared_pages=");      unsafe { print_number(shared as u32) };
+    put(b" private_rw_pages=");  unsafe { print_number(private_rw as u32) };
+    put(b" copied_pages=");      unsafe { print_number(copied as u32) };
+    put(b" clone_us=");          unsafe { print_number((ns / 1000) as u32) };
+    put(b"\n");
+}
+
 /// Copy the signal-disposition table of thread group `parent_tgid` into a
 /// freshly built child process. A short RUN_QUEUE hold of its own, after the
 /// child exists, so the 2 KiB table is copied straight into the child's
@@ -165,9 +187,11 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
                 }
             };
 
+        let clone_t0 = super::monotonic_ns();
         let cloned = unsafe { mm::cow::clone_as(&mut *as_raw_ptr, child_pt) };
         unsafe { super::unlock_address_space(as_raw_ptr); }
         if quiesced { super::unquiesce_thread_group(); }
+        report_large_fork(parent_tgid_for_quiesce, super::monotonic_ns().saturating_sub(clone_t0));
         let child_as = match cloned {
             Some(a) => a,
             None    => {
