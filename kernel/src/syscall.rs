@@ -7195,8 +7195,13 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
             Some(vfs::VnodeKind::DynamicDevice { open_id, .. }) => open_id,
             _ => 0,
         };
-        let handle = vfs::dmabuf_obj_of(tgid, dfd as usize)
+        // A dumb / virgl 3D object gets a per-open alias the same way
+        // (`prime_import_dumb`): echoing the exporter's number let the
+        // importer's GEM_CLOSE retire the exporter's handle.
+        let obj = vfs::dmabuf_obj_of(tgid, dfd as usize);
+        let handle = obj
             .and_then(|obj| drivers::drm_device_interface::prime_import_blob(obj, open_id))
+            .or_else(|| obj.and_then(|obj| drivers::drm_device_interface::prime_import_dumb(obj, open_id)))
             .unwrap_or(exporter_handle);
         unsafe { (arg as *mut u32).write(handle); }
         return 0;
