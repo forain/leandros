@@ -377,99 +377,199 @@ unsafe fn alloc_zeroed_page() -> Option<usize> {
     Some(phys)
 }
 
-// ── arch_tlb_shootdown_all ────────────────────────────────────────────────────
+// ── Targeted TLB shootdown ────────────────────────────────────────────────────
+//
+// Every CR3 write goes through `arch_set_page_table` /
+// `arch_load_kernel_page_table` (or reloads the same root), and this kernel
+// uses neither PCID nor global user pages, so a CPU caches translations of a
+// user root only while that root is in its CR3. `LOADED_ROOT[cpu]` publishes
+// that root. A flush of root R therefore only has to reach the CPUs whose
+// slot holds R — for a single-threaded process, none but the local one: no
+// IPI at all. Before 2026-09-25 every flush reloaded CR3 on ALL CPUs and
+// waited for all of them, twice per CoW promotion.
+//
+// Ordering (Dekker): a CPU stores its slot (SeqCst) before loading CR3; an
+// initiator writes the PTE, fences (SeqCst), then reads the slots. Either the
+// initiator sees the new root and IPIs that CPU, or the CPU's CR3 load comes
+// after the PTE store and walks the new entry.
+//
+// Acknowledgement is a per-CPU generation: the target bumps
+// `FLUSH_GEN[cpu]` *before* it reloads CR3 (in the IPI handler, or in a lock
+// spin loop via `arch_tlb_service_pending`), so an initiator that saw the
+// generation move knows a full flush of that CPU starts after its PTE store
+// with nothing in between that touches user memory. No global initiator
+// lock is needed: concurrent initiators each wait on their own snapshot.
+//
+// The wait stays bounded. This kernel runs syscalls and the scheduler with
+// IF=0; a target spinning on a lock with IRQs masked cannot take the IPI.
+// The two spins that matter — a sibling thread waiting for this address
+// space's `busy` flag (the initiator holds it) and RUN_QUEUE — service
+// pending flushes themselves. Anything else hits the timeout; the IPI stays
+// pended and is taken before that CPU next runs user code (as before).
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-/// Serializes shootdown initiators so concurrent invalidations don't mix
-/// their acknowledgement counts.
-static TLB_LOCK: AtomicBool = AtomicBool::new(false);
+/// CPUs (by LAPIC ID) the targeted protocol tracks. IDs at or above this
+/// fall back to a broadcast without acknowledgement.
+const TRACK: usize = 64;
 
-/// Number of remote CPUs that still owe an acknowledgement for the current
-/// shootdown round.  Set by the initiator, decremented by each target's
-/// vector-0xFD handler after its CR3 reload.
-static TLB_PENDING_ACKS: AtomicUsize = AtomicUsize::new(0);
+/// Root currently in each CPU's CR3 (0 = never loaded a user root).
+static LOADED_ROOT: [AtomicUsize; TRACK] = [const { AtomicUsize::new(0) }; TRACK];
+/// A flush was requested of this CPU and not yet performed.
+static FLUSH_REQ: [AtomicBool; TRACK] = [const { AtomicBool::new(false) }; TRACK];
+/// Bumped by each CPU immediately before every requested full flush.
+static FLUSH_GEN: [AtomicU64; TRACK] = [const { AtomicU64::new(0) }; TRACK];
 
-/// Called from the TLB-shootdown IPI handler (vector 0xFD) after the local
-/// flush completed on the target CPU.
-pub fn tlb_shootdown_ack() {
-    // saturating decrement: a late ack after an initiator timed out and reset
-    // the counter must not wrap around and wedge the next round.
-    let _ = TLB_PENDING_ACKS.fetch_update(
-        Ordering::AcqRel, Ordering::Acquire,
-        |v| v.checked_sub(1),
-    );
+/// Pages up to which the local CPU uses `invlpg` instead of a CR3 reload.
+const LOCAL_INVLPG_MAX: usize = 32;
+/// Initiator ack-wait bound, in spin iterations (the pre-existing bound).
+const ACK_SPINS: usize = 200_000;
+
+/// This CPU's index into the tables above. Before any AP is online only the
+/// BSP (LAPIC ID 0) runs, and the LAPIC may not be mapped yet.
+#[inline]
+fn this_cpu() -> usize {
+    if super::smp::active_cpu_count() <= 1 { 0 } else { unsafe { super::smp::arch_cpu_id() } }
 }
 
-/// Broadcast a TLB invalidation for all user-space entries to all CPUs.
-///
-/// `arch_set_page_table` only writes CR3 on the **current** CPU, so after
-/// changing shared mappings (CoW downgrade, munmap, mprotect) every other
-/// online CPU must flush too:
-///
-///   1. Reload CR3 locally.
-///   2. If other CPUs are online: serialize initiators, arm the ack counter,
-///      broadcast IPI vector 0xFD (shorthand all-excluding-self).
-///   3. Spin until every target acknowledged.
-///
-/// The wait is **short and opportunistic**: this kernel runs syscalls and
-/// the scheduler loop with IF=0, and shootdowns are frequently initiated
-/// while holding the run-queue lock (mm operations run under
-/// `with_*_address_space_mut`).  A target CPU spinning on that same lock
-/// cannot take the IPI until the initiator releases it — so waiting "until
-/// all CPUs ack" can only ever complete for targets that are idle in the
-/// `sti; hlt` window (they ack within microseconds) and burns the full
-/// timeout whenever any target is lock-spinning, freezing fork/exec storms.
-/// On timeout we proceed: the IPI stays pended and the target flushes at its
-/// next interrupt window (≤ one 10 ms tick), which precedes its next return
-/// to user space.  The residual stale-TLB window only matters for another
-/// thread of the same process concurrently touching the remapped page from
-/// kernel context — accepted for now (the previous implementation never
-/// notified other CPUs at all).
+#[inline]
+unsafe fn reload_cr3() {
+    core::arch::asm!("mov {tmp}, cr3", "mov cr3, {tmp}", tmp = out(reg) _, options(nostack));
+}
+
+/// Record that this CPU is about to load `root` (called before the CR3 write).
+#[inline]
+fn publish_root(root: usize) {
+    let c = this_cpu();
+    if c < TRACK { LOADED_ROOT[c].swap(root, Ordering::SeqCst); }
+}
+
+/// Take and perform this CPU's pending flush request, if any. Used by the
+/// IPI handler and by IRQ-masked spin loops so an initiator is never left
+/// waiting on a CPU that is itself waiting for the initiator's lock.
+#[inline]
+fn service_flush(c: usize) -> bool {
+    if c >= TRACK { return false; }
+    if !FLUSH_REQ[c].load(Ordering::Relaxed) { return false; }
+    if !FLUSH_REQ[c].swap(false, Ordering::AcqRel) { return false; }
+    FLUSH_GEN[c].fetch_add(1, Ordering::SeqCst);
+    unsafe { reload_cr3(); }
+    true
+}
+
+/// TLB-shootdown IPI (vector 0xFD) body: flush, whether or not a request is
+/// flagged (a broadcast from the untracked fallback carries none).
+pub fn tlb_shootdown_irq_body() {
+    let c = this_cpu();
+    if c < TRACK {
+        FLUSH_REQ[c].store(false, Ordering::Release);
+        FLUSH_GEN[c].fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe { reload_cr3(); }
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn arch_tlb_shootdown_all() {
-    #[cfg(target_arch = "x86_64")]
-    {
-        core::arch::asm!(
-            "mov {tmp}, cr3",
-            "mov cr3, {tmp}",
-            tmp = out(reg) _,
-            options(nostack)
-        );
-
-        mm::paging::tlbstat::FLUSHES.fetch_add(1, Ordering::Relaxed);
-        let ncpus = super::smp::active_cpu_count();
-        if ncpus <= 1 { return; }
-        mm::paging::tlbstat::REMOTE_FLUSHES.fetch_add(1, Ordering::Relaxed);
-        mm::paging::tlbstat::IPIS.fetch_add((ncpus - 1) as u64, Ordering::Relaxed);
-        let t0 = mm::paging::tlbstat::now_ns();
-
-        while TLB_LOCK
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-
-        TLB_PENDING_ACKS.store(ncpus - 1, Ordering::Release);
-        super::smp::send_tlb_shootdown_broadcast();
-
-        let mut spins: usize = 0;
-        while TLB_PENDING_ACKS.load(Ordering::Acquire) != 0 {
-            core::hint::spin_loop();
-            spins += 1;
-            if spins > 200_000 { // opportunistic — see note above
-                mm::paging::tlbstat::TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
-        }
-        mm::paging::tlbstat::add(&mm::paging::tlbstat::WAIT_NS, &mm::paging::tlbstat::WAIT_MAX_NS,
-            mm::paging::tlbstat::now_ns().saturating_sub(t0));
-
-        TLB_PENDING_ACKS.store(0, Ordering::Release);
-        TLB_LOCK.store(false, Ordering::Release);
+pub extern "C" fn arch_tlb_service_pending() {
+    if super::smp::active_cpu_count() <= 1 { return; }
+    if service_flush(this_cpu()) {
+        mm::paging::tlbstat::SERVICED.fetch_add(1, Ordering::Relaxed);
     }
 }
+
+/// Flush the remote CPUs whose CR3 may hold `root` (`root == usize::MAX`:
+/// every CPU that ever loaded a user root) and wait, bounded, for them.
+unsafe fn flush_remote(root: usize) {
+    use mm::paging::tlbstat as ts;
+    let ncpus = super::smp::active_cpu_count();
+    if ncpus <= 1 { return; }
+    let me = this_cpu();
+    // Pairs with the SeqCst slot store in `publish_root`.
+    core::sync::atomic::fence(Ordering::SeqCst);
+    if me >= TRACK || ncpus > TRACK {
+        ts::REMOTE_FLUSHES.fetch_add(1, Ordering::Relaxed);
+        ts::IPIS.fetch_add((ncpus - 1) as u64, Ordering::Relaxed);
+        super::smp::send_tlb_shootdown_broadcast();
+        return;
+    }
+    let mut mask: u64 = 0;
+    let mut gens = [0u64; TRACK];
+    for c in 0..TRACK {
+        if c == me { continue; }
+        let loaded = LOADED_ROOT[c].load(Ordering::SeqCst);
+        let hit = if root == usize::MAX {
+            loaded != 0 && loaded != KERNEL_CR3.load(Ordering::Relaxed)
+        } else { loaded == root };
+        if !hit { continue; }
+        gens[c] = FLUSH_GEN[c].load(Ordering::SeqCst);
+        FLUSH_REQ[c].store(true, Ordering::SeqCst);
+        super::smp::send_tlb_shootdown_ipi(c);
+        mask |= 1 << c;
+    }
+    if mask == 0 { return; }
+    ts::REMOTE_FLUSHES.fetch_add(1, Ordering::Relaxed);
+    ts::IPIS.fetch_add(mask.count_ones() as u64, Ordering::Relaxed);
+    let t0 = ts::now_ns();
+    let mut spins = 0usize;
+    while mask != 0 {
+        let mut m = mask;
+        while m != 0 {
+            let c = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let moved = FLUSH_GEN[c].load(Ordering::Acquire) != gens[c];
+            // A CPU that switched to another root reloaded CR3 already
+            // (the kernel-root store follows its CR3 write; a user-root
+            // store precedes one that runs before any user access).
+            let left = root != usize::MAX && LOADED_ROOT[c].load(Ordering::Acquire) != root;
+            if moved || left { mask &= !(1 << c); }
+        }
+        if mask == 0 { break; }
+        // Two initiators waiting on each other with IRQs masked would each
+        // time out; answer requests aimed at this CPU while waiting.
+        service_flush(me);
+        core::hint::spin_loop();
+        spins += 1;
+        if spins > ACK_SPINS {
+            ts::TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+    }
+    ts::add(&ts::WAIT_NS, &ts::WAIT_MAX_NS, ts::now_ns().saturating_sub(t0));
+}
+
+/// Invalidate `pages` pages at `va` of the address space rooted at `root`
+/// (`pages == usize::MAX`: the whole address space) on every CPU that may
+/// cache it: `invlpg`/CR3 reload locally if this CPU has it loaded, a
+/// targeted IPI to each other CPU that has it loaded.
+#[no_mangle]
+pub unsafe extern "C" fn arch_tlb_flush_range(root: usize, va: usize, pages: usize) {
+    mm::paging::tlbstat::FLUSHES.fetch_add(1, Ordering::Relaxed);
+    if arch_get_current_root() == root {
+        if pages <= LOCAL_INVLPG_MAX {
+            for i in 0..pages {
+                core::arch::asm!("invlpg [{a}]", a = in(reg) va + i * 4096, options(nostack));
+            }
+        } else {
+            reload_cr3();
+        }
+    }
+    flush_remote(root);
+}
+
+/// Invalidate one page on this CPU only (a permission upgrade on the
+/// current root; x86 re-walks after a #PF anyway).
+#[no_mangle]
+pub unsafe extern "C" fn arch_tlb_flush_local_page(va: usize) {
+    core::arch::asm!("invlpg [{a}]", a = in(reg) va, options(nostack));
+}
+
+/// Flush all user translations on every CPU that has any user root loaded.
+#[no_mangle]
+pub unsafe extern "C" fn arch_tlb_shootdown_all() {
+    mm::paging::tlbstat::FLUSHES.fetch_add(1, Ordering::Relaxed);
+    reload_cr3();
+    flush_remote(usize::MAX);
+}
+
 
 // ── Kernel page-table root ────────────────────────────────────────────────────
 
@@ -495,6 +595,8 @@ pub unsafe extern "C" fn arch_load_kernel_page_table() {
     if root == 0 { return; } // pre-capture (early boot): current CR3 is the kernel's
     #[cfg(target_arch = "x86_64")]
     core::arch::asm!("mov cr3, {r}", r = in(reg) root, options(nostack));
+    // After the CR3 write: this CPU no longer caches any user root.
+    publish_root(root);
 }
 
 // ── arch_set_page_table ───────────────────────────────────────────────────────
@@ -522,6 +624,8 @@ pub unsafe extern "C" fn arch_get_kernel_root() -> usize {
 #[no_mangle]
 pub unsafe extern "C" fn arch_set_page_table(root: usize) {
     if root != 0 {
+        // Before the CR3 write: see "Targeted TLB shootdown" above.
+        publish_root(root);
         #[cfg(target_arch = "x86_64")]
         core::arch::asm!(
             "mov cr3, {r}",

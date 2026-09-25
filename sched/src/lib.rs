@@ -2711,6 +2711,9 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
                 }
                 spins = spins.wrapping_add(1);
                 if spins == 1 { lockwatch::note_wait(lockwatch::L_AS_BUSY); }
+                // The holder may be waiting for this CPU's TLB flush (it
+                // shares this address space, and IRQs are masked here).
+                mm::paging::tlb_service_pending();
                 core::hint::spin_loop();
             }
         }
@@ -2754,6 +2757,7 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
         // dropped so schedulers stay unblocked while we wait.
         spins = spins.wrapping_add(1);
         if spins == 1 { lockwatch::note_wait(lockwatch::L_AS_BUSY); }
+        mm::paging::tlb_service_pending();
         core::hint::spin_loop();
     }
 }

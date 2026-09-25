@@ -47,6 +47,16 @@ extern "C" {
     /// Arch-provided: broadcast TLB invalidation for all user-space entries to
     /// all CPUs (inner-shareable TLBI on AArch64; CR3 reload on x86-64).
     fn arch_tlb_shootdown_all();
+    /// Arch-provided: invalidate `pages` pages at `va` of the address space
+    /// rooted at `root` (`usize::MAX` pages: all of it) on every CPU that may
+    /// cache them. x86-64: local `invlpg` + an IPI only to CPUs with `root`
+    /// in CR3; AArch64: broadcast `tlbi vaae1is`.
+    fn arch_tlb_flush_range(root: usize, va: usize, pages: usize);
+    /// Arch-provided: invalidate one page on this CPU only.
+    fn arch_tlb_flush_local_page(va: usize);
+    /// Arch-provided: perform a flush another CPU requested of this one
+    /// (x86-64; no-op on AArch64). Called from IRQ-masked spin loops.
+    fn arch_tlb_service_pending();
     /// Arch-provided: free every intermediate page-table node below the user
     /// root `page_table_root` (not the root itself, never the kernel's shared
     /// nodes). Returns the number of 4 KiB table pages released.
@@ -78,6 +88,33 @@ pub unsafe fn unmap_page(page_table_root: usize, virt: usize) {
 /// Invalidate all user-space TLB entries across all CPUs.
 pub fn tlb_shootdown_all() {
     unsafe { arch_tlb_shootdown_all(); }
+}
+
+/// Invalidate `[va, va + pages * 4 KiB)` of the address space rooted at
+/// `root` on every CPU that may cache it — only those (x86-64 tracks which
+/// CPUs have which root loaded). Waits, bounded, for remote completion.
+pub fn tlb_flush_range(root: usize, va: usize, pages: usize) {
+    if pages == 0 { return; }
+    unsafe { arch_tlb_flush_range(root, va, pages); }
+}
+
+/// Invalidate every user translation of the address space rooted at `root`
+/// on every CPU that may cache it.
+pub fn tlb_flush_as(root: usize) {
+    unsafe { arch_tlb_flush_range(root, 0, usize::MAX); }
+}
+
+/// Invalidate one page on this CPU only.
+pub fn tlb_flush_local_page(va: usize) {
+    unsafe { arch_tlb_flush_local_page(va); }
+}
+
+/// Perform any TLB flush another CPU is waiting for on this one. Spin loops
+/// that run with IRQs masked call this so a shootdown initiator is not left
+/// waiting on a CPU that is waiting on it.
+#[inline]
+pub fn tlb_service_pending() {
+    unsafe { arch_tlb_service_pending(); }
 }
 
 pub fn get_current_root() -> usize {

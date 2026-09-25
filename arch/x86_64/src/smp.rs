@@ -79,6 +79,19 @@ pub unsafe fn send_tlb_shootdown_broadcast() {
     apic::write(0x300, (3 << 18) | (1 << 14) | TLB_SHOOTDOWN_VECTOR);
 }
 
+/// Send the TLB shootdown IPI (vector 0xFD) to the CPU with LAPIC ID `cpu`.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn send_tlb_shootdown_ipi(cpu: usize) {
+    // IRQs off across the ICR high/low pair: an IRQ handler sending its own
+    // IPI in between would retarget this one.
+    let rflags: u64;
+    core::arch::asm!("pushfq", "pop {}", "cli", out(reg) rflags);
+    icr_wait_idle();
+    apic::write(0x310, (cpu as u32) << 24);
+    apic::write(0x300, (1 << 14) | TLB_SHOOTDOWN_VECTOR);
+    if rflags & (1 << 9) != 0 { core::arch::asm!("sti"); }
+}
+
 // ── SMT topology ──────────────────────────────────────────────────────────────
 
 /// Cached number of low APIC-ID bits that address the SMT (hyperthread)

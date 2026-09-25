@@ -201,6 +201,46 @@ pub unsafe extern "C" fn arch_tlb_shootdown_all() {
     );
 }
 
+/// Pages up to which a range flush issues one `tlbi vaae1is` per page;
+/// above it a single `tlbi vmalle1is` is cheaper (notably under TCG, where
+/// every broadcast TLBI synchronises all vCPUs).
+const RANGE_TLBI_MAX: usize = 16;
+
+/// Invalidate `pages` pages at `va` (`usize::MAX`: everything) on every PE.
+///
+/// No IPI is involved: `TLBI …IS` is broadcast to the inner-shareable domain
+/// by hardware and the trailing `dsb ish` waits for every PE to complete it.
+/// There are no ASIDs (each TTBR0 switch does a local `tlbi vmalle1`), user
+/// entries are global, so the by-VA form is the all-ASID one and `root` is
+/// not needed to scope it.
+#[no_mangle]
+pub unsafe extern "C" fn arch_tlb_flush_range(_root: usize, va: usize, pages: usize) {
+    mm::paging::tlbstat::FLUSHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if pages > RANGE_TLBI_MAX {
+        core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+        return;
+    }
+    core::arch::asm!("dsb ishst", options(nostack));
+    for i in 0..pages {
+        let arg = ((va + i * 4096) >> 12) & 0x0000_0FFF_FFFF_FFFF;
+        core::arch::asm!("tlbi vaae1is, {a}", a = in(reg) arg, options(nostack));
+    }
+    core::arch::asm!("dsb ish", "isb", options(nostack));
+}
+
+/// Invalidate one page on this PE only: a permission upgrade (read-only →
+/// writable, same frame) needs no break-before-make, but a PE may keep the
+/// read-only entry that just faulted, and re-fault on it.
+#[no_mangle]
+pub unsafe extern "C" fn arch_tlb_flush_local_page(va: usize) {
+    let arg = (va >> 12) & 0x0000_0FFF_FFFF_FFFF;
+    core::arch::asm!("dsb nshst", "tlbi vaale1, {a}", "dsb nsh", "isb", a = in(reg) arg, options(nostack));
+}
+
+/// Nothing to service: AArch64 TLB maintenance needs no remote cooperation.
+#[no_mangle]
+pub extern "C" fn arch_tlb_service_pending() {}
+
 /// Translate mm::PageFlags bits to AArch64 page-descriptor flags.
 fn translate_flags(bits: u64) -> PageDescFlags {
     use mm::paging::PageFlags;
