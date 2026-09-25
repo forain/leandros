@@ -1386,7 +1386,15 @@ def main():
     # execve() honours `#!` since the jobctl lane, so both
     # `/bin/start-cosmic-leandros` and the historical
     # `sh /bin/start-cosmic-leandros` work; init and greetd keep the latter.
-    m6_launcher = session_data("start-cosmic-leandros")
+    # The session launcher carries the renderer policy (/bin/gpu-env: GPU or a
+    # loud refusal, never silent softpipe), so the TRACKED copy wins here —
+    # unlike the other session_data entries. Hand-synced artifacts trees held
+    # a months-old copy that exported GBM_ALWAYS_SOFTWARE=1 and silently
+    # shadowed every repo change to this file.
+    _repo_launcher = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "..", "artifacts", "m6-session-data", "start-cosmic-leandros")
+    m6_launcher = (os.path.normpath(_repo_launcher) if os.path.exists(_repo_launcher)
+                   else session_data("start-cosmic-leandros"))
     if os.path.exists(m6_launcher):
         bin_files.append(("start-cosmic-leandros", m6_launcher, 0o100755))
     # m4-vkwl — the M4 driver: backgrounds start-cosmic-leandros with its log
