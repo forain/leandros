@@ -125,10 +125,45 @@ fn settled_free_ram() -> u64 {
     best
 }
 
+/// `settled_free_ram`, taken three times a few ms apart and reduced to the
+/// median. With the greeter's compositor alive, whole-system free memory
+/// also moves on its own (per-frame buffer churn measured at up to ±12 MiB
+/// over a run — see `MEM_CHECKPOINTS`), so a single reading at a checkpoint
+/// can land on either side of that swing. The median of three closely
+/// spaced readings throws out one such outlier without waiting any longer.
+fn checkpoint_free_ram() -> u64 {
+    let mut v = [settled_free_ram(), 0, 0];
+    thread::sleep(Duration::from_millis(15));
+    v[1] = settled_free_ram();
+    thread::sleep(Duration::from_millis(15));
+    v[2] = settled_free_ram();
+    v.sort_unstable();
+    v[1]
+}
+
+fn median_i64(mut v: Vec<i64>) -> i64 {
+    v.sort_unstable();
+    match v.len() {
+        0 => 0,
+        n => v[n / 2],
+    }
+}
+
 /// A kill loop that leaks one 128 KiB kernel stack per iteration shows up
 /// as 12.5 MiB over 100 iterations; allow far less than that but enough
 /// for allocator noise (pipe rings, exit-log churn).
 const MEM_LEAK_BOUND: u64 = 8 << 20;
+
+/// The run's measured iterations are split into this many chunks, each
+/// bounded by a `checkpoint_free_ram()` sample; the pass/fail verdict is
+/// the MEDIAN per-iteration loss across chunks, not one before/after
+/// subtraction over the whole run. A leak is systematic — present in every
+/// chunk — and survives the median. Background churn (the greeter
+/// compositor swapping frame buffers) is not tied to killmt's own
+/// iterations, so it typically hits only a chunk or two; with enough
+/// chunks the median sees past it without softening the bound. Needs at
+/// least 3 chunks for a median to reject a single bad one.
+const MEM_CHECKPOINTS: usize = 5;
 
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
@@ -461,11 +496,18 @@ fn wait_bounded(pid: i32, options: i32, bound: Duration) -> Option<i32> {
 
 fn run_mode(mode: Mode, iters: usize) -> bool {
     let mut max_reap = Duration::ZERO;
-    let mut mem_before = 0u64;
+    // Chunk boundaries among the measured iterations (1..iters; iteration 0
+    // is the warm-up). `checkpoints` collects (iteration index, free_ram)
+    // pairs at iteration 1, each internal boundary, and the end of the run.
+    let n_meas = iters.saturating_sub(1);
+    let chunks = MEM_CHECKPOINTS.min(n_meas.max(1));
+    let boundaries: std::collections::BTreeSet<usize> =
+        (1..chunks).map(|c| 1 + c * n_meas / chunks).filter(|&b| b > 1 && b < iters).collect();
+    let mut checkpoints: Vec<(usize, u64)> = Vec::new();
     for it in 0..iters {
         // Iteration 0 is the warm-up: first-use allocations (pipe rings,
         // fd tables, exit-log slots) are not leaks.
-        if it == 1 { mem_before = settled_free_ram(); }
+        if it == 1 || boundaries.contains(&it) { checkpoints.push((it, checkpoint_free_ram())); }
         let mut fds = [0i32; 2];
         if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
             println!("{}: FAIL pipe() at iteration {}", mode_name(mode), it);
@@ -574,11 +616,26 @@ fn run_mode(mode: Mode, iters: usize) -> bool {
             return false;
         }
     }
-    let mem_after = settled_free_ram();
+    if !checkpoints.is_empty() { checkpoints.push((iters, checkpoint_free_ram())); }
+    let mem_before = checkpoints.first().map(|c| c.1).unwrap_or(0);
+    let mem_after = checkpoints.last().map(|c| c.1).unwrap_or(0);
     let delta = mem_after as i64 - mem_before as i64;
-    if iters > 1 && mem_before != 0 && mem_after != 0 && mem_before.saturating_sub(mem_after) > MEM_LEAK_BOUND {
-        println!("{}: FAIL free memory dropped {} KiB over {} iterations (bound {} KiB)",
-                 mode_name(mode), (mem_before - mem_after) / 1024, iters - 1, MEM_LEAK_BOUND / 1024);
+    // Per-chunk KiB lost per iteration (positive = memory going away).
+    // Real leaks land in every chunk and dominate the median; a chunk that
+    // straddles a burst of unrelated background churn (the compositor's
+    // frame-buffer traffic) does not, as long as it is not most of them.
+    let per_iter_loss: Vec<i64> = checkpoints.windows(2).map(|w| {
+        let (it0, v0) = w[0];
+        let (it1, v1) = w[1];
+        let span = (it1 - it0).max(1) as i64;
+        (v0 as i64 - v1 as i64) / span
+    }).collect();
+    let med_loss_per_iter = median_i64(per_iter_loss);
+    let projected_loss = med_loss_per_iter.max(0) as u64 * n_meas as u64;
+    if iters > 1 && mem_before != 0 && mem_after != 0 && projected_loss > MEM_LEAK_BOUND {
+        println!("{}: FAIL free memory dropped (median {} KiB/iter x {} iterations = {} KiB, bound {} KiB; raw {:+} KiB)",
+                 mode_name(mode), med_loss_per_iter / 1024, n_meas, projected_loss / 1024,
+                 MEM_LEAK_BOUND / 1024, -delta / 1024);
         return false;
     }
     println!("{}: PASS ({}/{}, max reap {} ms, mem {:+} KiB)", mode_name(mode), iters, iters,

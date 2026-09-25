@@ -100,15 +100,59 @@ def sample(i, phase):
 def comp_pids(ps):
     return [p[0] for p in ps if p[1].endswith("/cosmic-comp")]
 
+def median_of(vals):
+    vals = sorted(vals)
+    return vals[len(vals) // 2]
+
+def median_sample(recs):
+    """Collapse a few sample() records taken a few seconds apart into one
+    synthetic record, using the per-key MEDIAN across them. The compositor's
+    own per-frame buffer churn can swing free memory (and whichever buddy
+    site it lands in) by several MiB on its own; used as-is, a single
+    reading right after the first kill becomes the anchor for every later
+    per-death delta and bakes that swing into all of them. The median of a
+    few readings spread over several seconds throws that out without
+    lengthening the run's settle time."""
+    km = {"site": {}, "slab": {}, "heap": {}}
+    for key in ("site", "slab", "heap"):
+        keys = set()
+        for r in recs:
+            keys |= set(r["km"].get(key, {}))
+        for k in keys:
+            vals = []
+            for r in recs:
+                v = r["km"].get(key, {}).get(k, [0, 0] if key != "heap" else 0)
+                vals.append(v[0] if isinstance(v, list) else v)
+            km[key][k] = [median_of(vals), 0] if key != "heap" else median_of(vals)
+    for k in ("free_pages", "total_pages", "site_sum"):
+        vals = [r["km"][k] for r in recs if r["km"].get(k) is not None]
+        if vals:
+            km[k] = median_of(vals)
+    memfree = [r["memfree_kib"] for r in recs if r["memfree_kib"] is not None]
+    return {"i": recs[0]["i"], "phase": recs[0]["phase"] + "-median", "t": recs[-1]["t"],
+            "memfree_kib": median_of(memfree) if memfree else None,
+            "procs": recs[-1]["procs"], "km": km}
+
 if "--attach" not in args:
     driver.cmd_start(ARCH)
     driver.cmd_login("root", "root")
 log(f"booted; first settle {FIRST}s")
 time.sleep(FIRST)
 samples = []
+anchor = None
 for i in range(DEATHS + 1):
     rec = sample(i, "settled")
     samples.append(rec)
+    if i == 1:
+        # This becomes `a`, the baseline every later per-death delta is
+        # measured against: two more quick readings a few seconds apart,
+        # reduced to their median (see median_sample), instead of trusting
+        # this one instantaneous reading.
+        calib = [rec]
+        for _ in range(2):
+            time.sleep(5)
+            calib.append(sample(i, "settled-calib"))
+        anchor = median_sample(calib)
     if i == DEATHS:
         break
     pids = comp_pids(rec["procs"])
@@ -133,7 +177,7 @@ def delta(a, b, key):
             out[k] = vb - va
     return out
 
-a, b = samples[1] if len(samples) > 2 else samples[0], samples[-1]
+a, b = (anchor if anchor is not None else samples[0]), samples[-1]
 n = b["i"] - a["i"]
 log(f"=== deltas sample {a['i']} -> {b['i']} ({n} deaths) ===")
 log(f"free_pages {a['km'].get('free_pages')} -> {b['km'].get('free_pages')} "
