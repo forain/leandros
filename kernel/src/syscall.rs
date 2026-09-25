@@ -6861,6 +6861,10 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     // Read-only virtio-gpu completion-interrupt census (drmsmoke's regression
     // test of the interrupt path); eight u64s written back.
     const DRM_IOCTL_GPU_IRQ_STATS: usize = 0x1008;
+    // Read/set the control queue's spin-before-park interval (root; one u64,
+    // new value in, old value out). drmsmoke uses it to force a parked wait.
+    const DRM_IOCTL_GPU_PARK_SPIN: usize = 0x1009;
+    if cmd == DRM_IOCTL_GPU_PARK_SPIN && (arg == 0 || !validate_user_buf(arg, 8)) { return -14; } // EFAULT
 
     // Check if it's a standard Linux EVDEV (type 'E' = 0x45) or DRM (type 'd' = 0x64) ioctl
     let ioctl_type = (cmd >> 8) & 0xFF;
@@ -7116,7 +7120,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
        cmd == DRM_IOCTL_GET_MODE || cmd == DRM_IOCTL_SET_MODE ||
        cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||
        cmd == DRM_IOCTL_SET_PLANE || cmd == DRM_IOCTL_GET_CAPS ||
-       cmd == DRM_IOCTL_GPU_IRQ_STATS ||
+       cmd == DRM_IOCTL_GPU_IRQ_STATS || cmd == DRM_IOCTL_GPU_PARK_SPIN ||
        is_evdev || is_drm {
         
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
