@@ -20,14 +20,129 @@ pub const MAX_TASKS: usize = 256;
 
 use alloc::boxed::Box;
 
+/// Words in the slot-occupancy bitmap.
+const OCC_WORDS: usize = MAX_TASKS / 64;
+// Slot indices are packed into a byte (`pid_index`, `pick_next`'s candidates).
+const _: () = assert!(MAX_TASKS <= 256 && MAX_TASKS % 64 == 0);
+/// pid → slot hint table: `PID_INDEX_SLOTS` entries, each pid hashed to a
+/// window of `PID_INDEX_PROBE` consecutive entries.
+const PID_INDEX_SLOTS: usize = 1024;
+const PID_INDEX_PROBE: usize = 8;
+
 pub struct RunQueue {
-    pub tasks: [Option<Box<Task>>; MAX_TASKS],
+    /// Private on purpose: every `&mut Task` must come from a method that
+    /// maintains `maybe_ready` (`get_mut`, `find_pid_mut`, or a loop in this
+    /// file that sets the bit itself).
+    tasks: [Option<Box<Task>>; MAX_TASKS],
     len:       usize,
+    /// Bit `i` set ⇔ `tasks[i].is_some()`. Maintained by `enqueue`/`remove`
+    /// (the only writers of `tasks`), so scans skip empty slots.
+    occupied:  [u64; OCC_WORDS],
+    /// `pick_next`'s candidate set: a SUPERSET of the pickable slots. Set
+    /// whenever a `&mut Task` is handed out (and on enqueue); cleared only by
+    /// `pick_next` itself on finding the task not `Ready`. A task can only
+    /// become pickable through a `&mut` to it, so a clear bit means "not
+    /// Ready" — and the once-per-tick full scan in `pick_next` checks that.
+    maybe_ready: [u64; OCC_WORDS],
+    /// `ticks()` of the last full-scan pick.
+    last_full_scan: u64,
+    /// pid → slot index, packed `(pid << 8) | idx`, `0` = empty.
+    ///
+    /// Every pid lookup (`find_pid*`) used to be a linear scan of all 256
+    /// slots under RUN_QUEUE, dereferencing each live `Task` — ~1 µs per
+    /// lookup with ~120 tasks on a COSMIC desktop, and several lookups per
+    /// hold (`has_deliverable_signal` does two). This table is only a HINT:
+    /// a hit is verified against `tasks[idx].pid` and anything else falls back
+    /// to the scan, so a stale or missing entry can cost time but can never
+    /// return the wrong task. Probing is bounded to a fixed window (no
+    /// tombstones, no unbounded chains): pids are sequential, so with ≤ 256
+    /// live tasks in 1024 entries a window is essentially never full; if it
+    /// is, the pid just isn't indexed.
+    pid_index: [u64; PID_INDEX_SLOTS],
 }
 
 impl RunQueue {
     pub const fn new() -> Self {
-        Self { tasks: [const { None }; MAX_TASKS], len: 0 }
+        Self {
+            tasks: [const { None }; MAX_TASKS],
+            len: 0,
+            occupied: [0; OCC_WORDS],
+            maybe_ready: [0; OCC_WORDS],
+            last_full_scan: 0,
+            pid_index: [0; PID_INDEX_SLOTS],
+        }
+    }
+
+    #[inline]
+    fn index_home(pid: Pid) -> usize { (pid as usize) & (PID_INDEX_SLOTS - 1) }
+
+    /// Record `tasks[idx]`'s pid in the hint table (pid 0 is never indexed).
+    fn index_insert(&mut self, pid: Pid, idx: usize) {
+        if pid == 0 { return; }
+        let want = ((pid as u64) << 8) | idx as u64;
+        let home = Self::index_home(pid);
+        let mut free = None;
+        for k in 0..PID_INDEX_PROBE {
+            let s = (home + k) & (PID_INDEX_SLOTS - 1);
+            let e = self.pid_index[s];
+            if e == want { return; }
+            if (e >> 8) as u32 == pid { self.pid_index[s] = want; return; }
+            if free.is_none() && (e == 0 || !self.index_entry_live(e)) { free = Some(s); }
+        }
+        if let Some(s) = free { self.pid_index[s] = want; }
+    }
+
+    /// Drop `pid`'s hint entry, if any.
+    fn index_remove(&mut self, pid: Pid) {
+        if pid == 0 { return; }
+        let home = Self::index_home(pid);
+        for k in 0..PID_INDEX_PROBE {
+            let s = (home + k) & (PID_INDEX_SLOTS - 1);
+            if self.pid_index[s] != 0 && (self.pid_index[s] >> 8) as u32 == pid {
+                self.pid_index[s] = 0;
+            }
+        }
+    }
+
+    /// An entry still describes the task in its slot.
+    #[inline]
+    fn index_entry_live(&self, e: u64) -> bool {
+        let idx = (e & 0xff) as usize;
+        self.tasks[idx].as_ref().map_or(false, |t| t.pid == (e >> 8) as u32)
+    }
+
+    /// Slot of `pid` via the hint table (verified), else `None`.
+    #[inline]
+    fn index_lookup(&self, pid: Pid) -> Option<usize> {
+        if pid == 0 { return None; }
+        let home = Self::index_home(pid);
+        for k in 0..PID_INDEX_PROBE {
+            let e = self.pid_index[(home + k) & (PID_INDEX_SLOTS - 1)];
+            if e != 0 && (e >> 8) as u32 == pid {
+                let idx = (e & 0xff) as usize;
+                if self.tasks[idx].as_ref().map_or(false, |t| t.pid == pid) {
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
+    /// Re-index the task in slot `idx` after its pid was changed in place
+    /// (`take_over_leader`'s pid exchange). Without it the lookups still
+    /// work — the stale entry fails verification and the scan runs.
+    pub fn reindex(&mut self, idx: usize) {
+        if let Some(pid) = self.tasks[idx].as_ref().map(|t| t.pid) {
+            self.index_insert(pid, idx);
+        }
+    }
+
+    /// Linear-scan fallback for `find_pid*`.
+    #[inline(never)]
+    fn scan_pid(&self, pid: Pid) -> Option<usize> {
+        self.tasks.iter().position(|s| {
+            s.as_ref().map(|t| t.pid == pid).unwrap_or(false)
+        })
     }
 
     /// Get the number of tasks currently in the run queue.
@@ -63,14 +178,18 @@ impl RunQueue {
     pub fn enqueue(&mut self, mut task: Box<Task>) -> bool {
         let min_vr = self.min_vruntime();
         task.place(min_vr);
-        for slot in self.tasks.iter_mut() {
-            if slot.is_none() {
+        for i in 0..MAX_TASKS {
+            if self.tasks[i].is_none() {
                 // Publish pid → tgid before the task becomes reachable, so no
                 // CPU can pick it up and then miss in the side table. Safe to
                 // do under this lock: the table is only ever written from here
                 // and from `remove`, both of which hold it.
                 crate::pid_tgid_insert(task.pid, task.tgid);
-                *slot = Some(task);
+                let pid = task.pid;
+                self.tasks[i] = Some(task);
+                self.occupied[i / 64] |= 1u64 << (i % 64);
+                self.touch(i);
+                self.index_insert(pid, i);
                 self.len += 1;
                 return true;
             }
@@ -82,38 +201,75 @@ impl RunQueue {
     ///
     /// Tasks already running on another CPU (`on_cpu.is_some()`) are skipped.
     /// Returns the slot index so the caller can track which task is active.
+    ///
+    /// Cost: proportional to the tasks in `maybe_ready`, not to `MAX_TASKS`
+    /// (was: two passes over all 256 slots, touching every live `Task` —
+    /// ~2 µs per dispatch with ~110 tasks under a COSMIC desktop, the
+    /// longest regular RUN_QUEUE hold). Once per tick one pick walks every
+    /// occupied slot instead and repairs `maybe_ready`, so a hint the
+    /// invariant somehow missed costs at most one tick, never a lost task.
     pub fn pick_next(&mut self) -> Option<usize> {
         if self.len == 0 { return None; }
 
-        // Pass 1: total weight and weighted vruntime sum of the candidates.
-        // The weighted average sum_wv / sum_w is the virtual time "V" against
-        // which eligibility is judged.
+        let t0 = crate::lockwatch::pick_clock();
+        let mut visited = 0u32;
+        let now = crate::ticks();
+        let full = now != self.last_full_scan;
+        if full { self.last_full_scan = now; }
+
+        // Pass 1: total weight and weighted vruntime sum of the candidates —
+        // the weighted average sum_wv / sum_w is the virtual time "V" against
+        // which eligibility is judged — and the candidates' slot indices, in
+        // slot order (the same tie-break order as a full scan).
+        let mut cand = [0u8; MAX_TASKS];
+        let mut n = 0usize;
         let mut sum_w:  u64  = 0;
         let mut sum_wv: u128 = 0;
-        for slot in self.tasks.iter() {
-            if let Some(t) = slot {
-                if t.state == TaskState::Ready && t.on_cpu.is_none()
-                    && !super::quiesce_filtered(t.tgid, t.pid)
-                {
-                    sum_w  += t.weight as u64;
-                    sum_wv += t.weight as u128 * t.vruntime as u128;
+        for w in 0..OCC_WORDS {
+            let mut bits = if full { self.occupied[w] } else { self.maybe_ready[w] & self.occupied[w] };
+            while bits != 0 {
+                let i = w * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                visited += 1;
+                let bit = 1u64 << (i % 64);
+                let t = match &self.tasks[i] { Some(t) => t, None => continue };
+                if t.state != TaskState::Ready {
+                    // Blocked / Running / Stopped / Zombie: not pickable until
+                    // something takes `&mut` to it again, which re-sets the bit.
+                    self.maybe_ready[w] &= !bit;
+                    continue;
                 }
+                if full && self.maybe_ready[w] & bit == 0 {
+                    // A Ready task no `&mut` path flagged: the invariant was
+                    // broken somewhere. Repair and count it (RQPROF prints it).
+                    self.maybe_ready[w] |= bit;
+                    crate::lockwatch::note_ready_hint_miss();
+                }
+                // Stop-the-world fork: siblings of a mid-clone_as thread group
+                // stay parked until the CoW downgrade + TLB shootdown are
+                // complete (see sched::quiesce_thread_group). They, and Ready
+                // tasks whose registers are still live on another CPU, keep
+                // their bit.
+                if t.on_cpu.is_some() || super::quiesce_filtered(t.tgid, t.pid) { continue; }
+                sum_w  += t.weight as u64;
+                sum_wv += t.weight as u128 * t.vruntime as u128;
+                cand[n] = i as u8;
+                n += 1;
             }
         }
-        if sum_w == 0 { return None; }
+        if sum_w == 0 {
+            crate::lockwatch::note_pick(full, visited, crate::lockwatch::pick_clock().wrapping_sub(t0));
+            return None;
+        }
 
-        // Pass 2: earliest virtual deadline among eligible tasks.  The task
-        // with the minimum vruntime is always eligible, so `best` is always
-        // found; `fallback` guards against arithmetic corner cases only.
+        // Pass 2: earliest virtual deadline among eligible candidates.  The
+        // task with the minimum vruntime is always eligible, so `best` is
+        // always found; `fallback` guards against arithmetic corner cases only.
         let mut best:     Option<(usize, u64)> = None; // (idx, vdeadline)
         let mut fallback: Option<(usize, u64)> = None; // (idx, vruntime)
-        for (i, slot) in self.tasks.iter().enumerate() {
-            if let Some(t) = slot {
-                if t.state != TaskState::Ready || t.on_cpu.is_some() { continue; }
-                // Stop-the-world fork: siblings of a mid-clone_as thread
-                // group stay parked until the CoW downgrade + TLB shootdown
-                // are complete (see sched::quiesce_thread_group).
-                if super::quiesce_filtered(t.tgid, t.pid) { continue; }
+        for &c in &cand[..n] {
+            let i = c as usize;
+            if let Some(t) = &self.tasks[i] {
                 let eligible = (t.vruntime as u128) * (sum_w as u128) <= sum_wv;
                 if eligible && best.map_or(true, |(_, d)| t.vdeadline < d) {
                     best = Some((i, t.vdeadline));
@@ -123,10 +279,20 @@ impl RunQueue {
                 }
             }
         }
+        crate::lockwatch::note_pick(full, visited, crate::lockwatch::pick_clock().wrapping_sub(t0));
         best.or(fallback).map(|(i, _)| i)
     }
 
+    /// Flag slot `idx` as possibly pickable. Every path that can hand out a
+    /// `&mut Task` calls this, so any state change — in particular any
+    /// transition to `Ready`, or `on_cpu` being released — leaves the bit set.
+    #[inline(always)]
+    fn touch(&mut self, idx: usize) {
+        self.maybe_ready[idx / 64] |= 1u64 << (idx % 64);
+    }
+
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut Task> {
+        self.touch(idx);
         self.tasks[idx].as_mut().map(|boxed_task| boxed_task.as_mut())
     }
 
@@ -135,31 +301,25 @@ impl RunQueue {
     }
 
     pub fn find_pid(&self, pid: Pid) -> Option<&Task> {
-        for slot in &self.tasks {
-            if let Some(task) = slot {
-                if task.pid == pid {
-                    return Some(task);
-                }
-            }
-        }
-        None
+        let idx = self.find_pid_idx(pid)?;
+        self.tasks[idx].as_deref()
     }
 
     pub fn find_pid_mut(&mut self, pid: Pid) -> Option<&mut Task> {
-        for slot in &mut self.tasks {
-            if let Some(task) = slot {
-                if task.pid == pid {
-                    return Some(task);
-                }
-            }
-        }
-        None
+        let idx = self.find_pid_idx(pid)?;
+        self.touch(idx);
+        self.tasks[idx].as_deref_mut()
     }
 
+    /// Slot of `pid`: the verified hint table first, the full scan on a miss
+    /// (a dead pid, pid 0, or an unindexed task), so the answer is always
+    /// the scan's answer.
+    #[inline]
     pub fn find_pid_idx(&self, pid: Pid) -> Option<usize> {
-        self.tasks.iter().position(|s| {
-            s.as_ref().map(|t| t.pid == pid).unwrap_or(false)
-        })
+        match self.index_lookup(pid) {
+            Some(i) => Some(i),
+            None => self.scan_pid(pid),
+        }
     }
 
     /// Block the task with `pid`, recording the port it is waiting on.
@@ -177,16 +337,11 @@ impl RunQueue {
     /// and so no window exists in which `blocked_on == POLL_WAIT_CHANNEL` is
     /// visible with a stale `poll_mask`.
     pub fn block_on_port_until(&mut self, pid: Pid, port: u32, deadline: u64, mask: u64) {
-        for slot in &mut self.tasks {
-            if let Some(task) = slot {
-                if task.pid == pid {
-                    task.state         = TaskState::Blocked;
-                    task.blocked_on    = Some(port);
-                    task.poll_deadline = deadline;
-                    task.poll_mask     = mask;
-                    return;
-                }
-            }
+        if let Some(task) = self.find_pid_mut(pid) {
+            task.state         = TaskState::Blocked;
+            task.blocked_on    = Some(port);
+            task.poll_deadline = deadline;
+            task.poll_mask     = mask;
         }
     }
 
@@ -210,10 +365,11 @@ impl RunQueue {
     pub fn unblock_port_tagged(&mut self, port: u32, tag: u64) -> usize {
         let min_vr = self.min_vruntime();
         let mut woken = 0;
-        for slot in &mut self.tasks {
+        for (i, slot) in self.tasks.iter_mut().enumerate() {
             if let Some(task) = slot {
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
                     && (task.poll_mask & tag) != 0 {
+                    self.maybe_ready[i / 64] |= 1u64 << (i % 64);
                     task.state         = TaskState::Ready;
                     task.blocked_on    = None;
                     task.poll_deadline = u64::MAX;
@@ -240,7 +396,7 @@ impl RunQueue {
         let min_vr = self.min_vruntime();
         let mut new_min = u64::MAX;
         let mut woken = 0;
-        for slot in &mut self.tasks {
+        for (i, slot) in self.tasks.iter_mut().enumerate() {
             if let Some(task) = slot {
                 if task.state != TaskState::Blocked { continue; }
                 let is_poll  = task.blocked_on == Some(port);
@@ -252,6 +408,7 @@ impl RunQueue {
                 let is_futex = task.blocked_futex != 0;
                 if !is_poll && !is_futex { continue; }
                 if (timerfd_due && is_poll) || task.poll_deadline <= now {
+                    self.maybe_ready[i / 64] |= 1u64 << (i % 64);
                     task.state         = TaskState::Ready;
                     if is_poll  { task.blocked_on = None; task.poll_mask = crate::POLL_TAG_ALL; }
                     if is_futex { task.blocked_futex = 0;    }
@@ -268,13 +425,8 @@ impl RunQueue {
 
     /// Mark a task as Zombie (terminal; will not be scheduled again).
     pub fn mark_zombie(&mut self, pid: Pid) {
-        for slot in &mut self.tasks {
-            if let Some(task) = slot {
-                if task.pid == pid {
-                    task.state = TaskState::Zombie;
-                    return;
-                }
-            }
+        if let Some(task) = self.find_pid_mut(pid) {
+            task.state = TaskState::Zombie;
         }
     }
 
@@ -284,6 +436,9 @@ impl RunQueue {
         let t = self.tasks[idx].take();
         if let Some(task) = t.as_ref() {
             self.len = self.len.saturating_sub(1);
+            self.occupied[idx / 64] &= !(1u64 << (idx % 64));
+            self.maybe_ready[idx / 64] &= !(1u64 << (idx % 64));
+            self.index_remove(task.pid);
             // Retire the side-table entry with the slot. Leaving it would hand
             // a later caller the tgid of a task that no longer exists, where
             // `tgid_of`'s contract is to fall back to the pid itself.
