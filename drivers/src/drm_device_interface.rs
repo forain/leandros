@@ -1744,10 +1744,19 @@ fn present_blob_fb(
     fb_id: DrmObjectId,
     rects: Option<&[(i32, i32, i32, i32)]>,
 ) -> Option<Result<(), DriverError>> {
-    let (res, w, h, format, stride, offset) = {
+    // A virgl 3D BO (VIRTGPU_RESOURCE_CREATE) is presented the same way minus
+    // the blob: its pixels live in the host texture and its guest pages are
+    // only TRANSFER_3D staging, so the CPU-copy present below would upload
+    // stale staging memory into the console resource — the noise every virgl
+    // scanout showed. Upstream (`virtio_gpu_primary_plane_update`) points the
+    // scanout at the 3D resource with plain SET_SCANOUT and repaints with
+    // RESOURCE_FLUSH; so do we.
+    let (res, w, h, format, stride, offset, virgl) = {
         let fb = device.get_framebuffer(fb_id)?;
-        if fb.blob_res == 0 || fb.physical_addresses[0] != 0 { return None; }
-        (fb.blob_res, fb.width, fb.height, fb.virtio_format, fb.pitches[0], fb.offsets[0])
+        let virgl = fb.blob_res == 0 && crate::virtio_gpu::is_host_rendered(fb.handles[0]);
+        if !virgl && (fb.blob_res == 0 || fb.physical_addresses[0] != 0) { return None; }
+        let res = if virgl { fb.handles[0] } else { fb.blob_res };
+        (res, fb.width, fb.height, fb.virtio_format, fb.pitches[0], fb.offsets[0], virgl)
     };
     if w == 0 || h == 0 { return Some(Err(DriverError::InvalidParameter)); }
 
@@ -1778,7 +1787,15 @@ fn present_blob_fb(
             None => return Some(Err(DriverError::NotFound)),
         };
         let mut switched = false;
-        if gpu.current_scanout() != res {
+        if gpu.current_scanout() != res && virgl {
+            if !gpu.set_scanout_resource(res, w, h) {
+                crate::pci::serial_debug("[DRM] SET_SCANOUT (virgl) refused res=");
+                crate::pci::serial_debug_hex(res);
+                crate::pci::serial_debug("\n");
+                return Some(Err(DriverError::Io));
+            }
+            switched = true;
+        } else if gpu.current_scanout() != res {
             if !gpu.set_scanout_blob(res, w, h, format, stride, offset) {
                 crate::pci::serial_debug("[DRM] SET_SCANOUT_BLOB refused res=");
                 crate::pci::serial_debug_hex(res);
@@ -1792,7 +1809,7 @@ fn present_blob_fb(
         // there is damage or the binding just moved.
         if x0 < x1 && y0 < y1 {
             if !gpu.resource_flush(res, x0, y0, x1 - x0, y1 - y0) {
-                crate::pci::serial_debug("[DRM] blob RESOURCE_FLUSH refused res=");
+                crate::pci::serial_debug("[DRM] scanout RESOURCE_FLUSH refused res=");
                 crate::pci::serial_debug_hex(res);
                 crate::pci::serial_debug("\n");
                 return Some(Err(DriverError::Io));
@@ -5574,6 +5591,16 @@ impl DrmDeviceInterface {
         };
         if size == 0 { return Err(DriverError::InvalidParameter); }
 
+        // Upstream parity: `virtio_gpu_resource_create_ioctl` creates the
+        // open's context first (lazily, host-default capset) and
+        // `virtio_gpu_gem_object_open` then CTX_ATTACH_RESOURCEs the new BO to
+        // it. We did neither, so virglrenderer's per-context resource table
+        // never held the resource: the first TRANSFER_3D that named it failed
+        // with `Illegal resource N`, the renderer put the whole context in the
+        // error state, and every later draw/blit was silently dropped — the
+        // virgl scanout showed noise (kmscube) or black (cosmic-greeter).
+        let ctx = ctx_ensure(open_id);
+
         let pages = size.div_ceil(4096);
         let order = pages.next_power_of_two().trailing_zeros() as usize;
         let phys = mm::buddy::alloc(order).ok_or(DriverError::Io)?;
@@ -5601,6 +5628,14 @@ impl DrmDeviceInterface {
             if !gpu.attach_backing(rid, phys as u64, size as u32) {
                 mm::buddy::free(phys, order);
                 return Err(DriverError::Io);
+            }
+            // Logged, not propagated — as in the blob path and upstream.
+            if ctx != 0 && !gpu.ctx_attach_resource(ctx, rid) {
+                crate::pci::serial_debug("[DRM] RESOURCE_CREATE: CTX_ATTACH_RESOURCE refused ctx=");
+                crate::pci::serial_debug_hex(ctx);
+                crate::pci::serial_debug(" res=");
+                crate::pci::serial_debug_hex(rid);
+                crate::pci::serial_debug("\n");
             }
             rid
         };
@@ -6463,10 +6498,11 @@ impl DrmDeviceInterface {
     /// carries the ownership that upstream's per-`drm_file` GEM table carries.
     /// It costs Mesa nothing: it creates and queries on the same fd.
     ///
-    /// Only blob BOs are known here. A dumb-buffer handle has no `res_handle`
-    /// recorded (DumbBuf carries no host resource id), and Venus never creates
-    /// dumb buffers, so an unknown handle is refused with NotFound — upstream's
-    /// -ENOENT for a handle lookup miss.
+    /// Blob BOs, plus virgl 3D BOs from VIRTGPU_RESOURCE_CREATE (dumb registry,
+    /// `res_id` host-rendered) — the latter also take a CTX_ATTACH_RESOURCE
+    /// for the asking open, the only VIRTIO_GPU lock taken here and with no
+    /// user memory touched under it. A plain 2D dumb buffer is still refused
+    /// with NotFound — upstream's -ENOENT for a handle lookup miss.
     fn virtgpu_handle_resource_info(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         // Read the input BEFORE taking any lock, and write the outputs back
@@ -6474,6 +6510,35 @@ impl DrmDeviceInterface {
         // 82d0cc3 all-vCPU freeze class. No device round-trip is needed — this
         // is pure guest-side bookkeeping — so VIRTIO_GPU is never locked at all.
         let req = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_resource_info) };
+
+        // A virgl 3D BO (VIRTGPU_RESOURCE_CREATE) lives in the dumb registry,
+        // not the blob maps. Mesa's virgl winsys imports every dmabuf with
+        // PRIME_FD_TO_HANDLE + RESOURCE_INFO, so refusing it here failed every
+        // cross-process import: cosmic-comp answered cosmic-panel's
+        // linux-dmabuf `create_immed` with "produced an invalid wl_buffer" and
+        // the panel/dock never appeared under virgl. Answer it, and attach the
+        // resource to the asking open's context the way upstream's
+        // `virtio_gpu_gem_object_open` does for an imported object — the host
+        // refuses commands naming a resource its context was never given.
+        if blob_lookup(req.bo_handle, open_id).is_none() {
+            if let Some(d) = dumb_lookup(req.bo_handle).filter(|d| {
+                d.res_id != 0 && crate::virtio_gpu::is_host_rendered(d.res_id)
+            }) {
+                let ctx = ctx_ensure(open_id);
+                if ctx != 0 {
+                    if let Some(gpu) = crate::virtio_gpu::VIRTIO_GPU.lock().as_mut() {
+                        let _ = gpu.ctx_attach_resource(ctx, d.res_id);
+                    }
+                }
+                let size = ((1usize << d.order) * 4096) as u32;
+                unsafe {
+                    (arg as *mut u8).add(4).cast::<u32>().write_volatile(d.res_id);
+                    (arg as *mut u8).add(8).cast::<u32>().write_volatile(size);
+                    (arg as *mut u8).add(12).cast::<u32>().write_volatile(0);
+                }
+                return Ok(0);
+            }
+        }
 
         let blob = match blob_lookup(req.bo_handle, open_id) {
             Some(b) => b,
