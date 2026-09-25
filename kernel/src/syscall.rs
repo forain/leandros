@@ -739,8 +739,22 @@ pub extern "C" fn syscall_dispatch(
     a3: usize, a4: usize,
     a5: usize, frame_ptr: usize, _padding: usize,
 ) -> isize {
-    dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr)
+    let ret = dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr);
+    if ret == ERESTARTSYS {
+        // Never reaches user space: the frame gets EINTR, and the signal
+        // pass that runs next rewinds to re-execute the syscall when the
+        // handler has SA_RESTART (or no handler runs).
+        sched::signal::note_syscall_restart(number, a0);
+        return -4;
+    }
+    ret
 }
+
+/// Kernel-internal "interrupted, restartable" return (Linux -ERESTARTSYS):
+/// used by blocking read/write/send/recv/wait4/waitid. Timed waits
+/// (nanosleep, poll, select, epoll_wait, sigsuspend, sigtimedwait) return a
+/// plain EINTR, as on Linux, whatever SA_RESTART says.
+const ERESTARTSYS: isize = -512;
 
 /// zink-lane instrumentation: per-syscall time census for the focus tgid
 /// (`sched::SC_FOCUS_TGID`, cosmic-comp) plus a lock-free pid -> last syscall
@@ -1190,7 +1204,7 @@ fn dispatch_inner(
         RT_SIGSUSPEND  => sys_rt_sigsuspend(a0, a1),
         RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(a0, a1, a2, a3),
         #[cfg(not(target_arch = "aarch64"))]
-        PAUSE          => sys_rt_sigsuspend(0, 0),
+        PAUSE          => sys_pause(),
 
         // ── Threads ────────────────────────────────────────────────────────────
         SET_TID_ADDR => sys_set_tid_address(a0),
@@ -1636,8 +1650,68 @@ fn prot_to_page_flags(prot: usize) -> PageFlags {
 ///   - `addr == 0`         — bump-allocate a fresh VA region.
 ///
 /// Returns the mapped virtual address on success, or a negative errno.
+/// Report any mmap that takes longer than this, with where the time went.
+/// Cheap (two clock reads per phase) and silent unless something is slow; it
+/// exists because `[WDOG] ... cosmic-comp ... last syscall 9` was seen with no
+/// way to say which mapping, of what, cost the seconds.
+const MMAP_SLOW_NS: u64 = 500_000_000;
+
+/// Largest single VFS read the eager file-mmap copy issues before opening an
+/// interrupt window (see the copy loop in `sys_mmap_inner`). 512 KiB is a few
+/// ms of f2fs/virtio-blk on KVM and well under a tick-watchdog period on TCG.
+const MMAP_READ_CHUNK: usize = 512 * 1024;
+
+fn mmap_print_dec(mut n: usize) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop { i -= 1; buf[i] = b"0"[0] + (n % 10) as u8; n /= 10; if n == 0 { break; } }
+    crate::serial_print_str(core::str::from_utf8(&buf[i..]).unwrap_or("?"));
+}
+
+#[derive(Default)]
+struct MmapTrace {
+    /// 1 anon, 2 device, 3 shared-vmo, 4 file-copy
+    kind: u8,
+    map_ns: u64,
+    io_ns: u64,
+    fixup_ns: u64,
+    bytes: usize,
+}
+
 fn sys_mmap(addr: usize, len: usize, prot: usize,
             flags: usize, fd: usize, off: usize) -> isize {
+    let mut tr = MmapTrace::default();
+    let t0 = monotonic_ns();
+    let r = sys_mmap_inner(addr, len, prot, flags, fd, off, &mut tr);
+    let dt = monotonic_ns().wrapping_sub(t0);
+    if dt >= MMAP_SLOW_NS {
+        crate::serial_print_str("[MMAP-SLOW] pid=");
+        mmap_print_dec(current_pid() as usize);
+        crate::serial_print_str(" kind=");
+        crate::serial_print_str(match tr.kind { 1 => "anon", 2 => "device", 3 => "shared-vmo", 4 => "file-copy", _ => "?" });
+        crate::serial_print_str(" len=");
+        crate::serial_print_hex(len);
+        crate::serial_print_str(" flags=");
+        crate::serial_print_hex(flags);
+        crate::serial_print_str(" fd=");
+        mmap_print_dec(fd);
+        crate::serial_print_str(" total_ms=");
+        mmap_print_dec((dt / 1_000_000) as usize);
+        crate::serial_print_str(" map_ms=");
+        mmap_print_dec((tr.map_ns / 1_000_000) as usize);
+        crate::serial_print_str(" io_ms=");
+        mmap_print_dec((tr.io_ns / 1_000_000) as usize);
+        crate::serial_print_str(" fixup_ms=");
+        mmap_print_dec((tr.fixup_ns / 1_000_000) as usize);
+        crate::serial_print_str(" bytes=");
+        crate::serial_print_hex(tr.bytes);
+        crate::serial_print_str("\n");
+    }
+    r
+}
+
+fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
+            flags: usize, fd: usize, off: usize, tr: &mut MmapTrace) -> isize {
     // Linux mmap flags.
     const MAP_SHARED:    usize = 0x01;
     const MAP_FIXED:     usize = 0x10;
@@ -1683,11 +1757,14 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
 
     // ── Anonymous mmap ────────────────────────────────────────────────────────
     if flags & MAP_ANONYMOUS != 0 {
+        tr.kind = 1;
         let is_shared = flags & MAP_SHARED != 0;
+        let tm = monotonic_ns();
         let mapped = with_current_address_space_mut(|as_| {
             if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
             as_.map_lazy(virt, len, page_flags, is_shared)
         });
+        tr.map_ns = monotonic_ns().wrapping_sub(tm);
         return match mapped {
             Some(true)  => virt as isize,
             Some(false) => {
@@ -1719,7 +1796,9 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     let pid = current_pid();
 
     // Step 1: Check if the fd is a device supporting direct mmap via ioctl 0x1007
+    let tk = monotonic_ns();
     let kind = vfs::vfs_get_node_kind(pid, fd);
+    tr.io_ns = monotonic_ns().wrapping_sub(tk);
     let mut phys_addr: usize = 0;
     // Set from slot 1 of the device's 0x1007 reply; see MMAP_HINT_UNCACHED.
     let mut dev_uncached = false;
@@ -1741,7 +1820,10 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
         // a device server sees one consistent open across ioctl and mmap.
         proxy_msg.data[32..40].copy_from_slice(&(open_id as u64).to_le_bytes());
 
+        tr.kind = 2;
+        let tc = monotonic_ns();
         let reply = vfs::call_port(port, proxy_msg);
+        tr.io_ns += monotonic_ns().wrapping_sub(tc);
         if reply.tag == 0 {
             let res = u64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8])) as usize;
             if DBG_MMAP {
@@ -1781,10 +1863,12 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
         } else {
             page_flags
         };
+        let tm = monotonic_ns();
         let mapped = with_current_address_space_mut(|as_| {
             if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
             as_.map_device(virt, phys_addr, len, dev_flags)
         });
+        tr.map_ns = monotonic_ns().wrapping_sub(tm);
         let ret = match mapped {
             Some(true)  => virt as isize,
             _           => enomem_map_site(("mmap/device")),
@@ -1808,7 +1892,11 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     // MAP_SHARED still falls through to the eager private-copy path below.
     if flags & MAP_SHARED != 0 {
         if let Some(vfs::VnodeKind::TmpFile { idx, .. }) = kind {
-            match vfs::vmo_acquire_frames(pid, fd, off, len) {
+            tr.kind = 3;
+            let ta = monotonic_ns();
+            let acquired = vfs::vmo_acquire_frames(pid, fd, off, len);
+            tr.io_ns += monotonic_ns().wrapping_sub(ta);
+            match acquired {
                 Some(frames) => {
                     // [GAP2] snapshot before the frames are consumed by the map.
                     let g2_p0 = frames.first().copied().unwrap_or(0);
@@ -1885,7 +1973,9 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     // the copy in step 4 lands in physical memory regardless of prot bits.
     // The final page_flags (which may be read-only) are applied via map_flags
     // on the VMA; subsequent accesses use those bits.
+    tr.kind = 4;
     let write_flags = page_flags | PageFlags::WRITABLE;
+    let tm = monotonic_ns();
     let mapped_phys = with_current_address_space_mut(|as_| {
         if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
         if !as_.map(virt, len, write_flags) { return None; }
@@ -1893,6 +1983,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
         as_.find(virt).map(|vma| vma.phys)
     });
 
+    tr.map_ns = monotonic_ns().wrapping_sub(tm);
     // mapped_phys : Option<Option<usize>> — outer None = no address space
     let phys = match mapped_phys {
         Some(Some(p)) => p,
@@ -1908,15 +1999,32 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     let hhdm_ptr = mm::phys_to_virt(phys) as *mut u8;
     let mut filled: usize = 0;
     let mut n: isize = 0;
+    let tio = monotonic_ns();
+    //
+    // Bounded chunks with an interrupt window between them. Syscalls run with
+    // IRQs masked, and this copy is EAGER: a MAP_PRIVATE map of a whole file
+    // reads all of it here. Rust binaries map their own executable to
+    // symbolize a backtrace (cosmic-comp 33 MiB, cosmic-greeter-login 36 MiB)
+    // and ld-musl maps libgallium's 23 MiB text segment the same way, so one
+    // unbroken read was 1.1-1.4 s on x86_64/KVM and 2.3-3.7 s on x86_64/TCG
+    // with no timer tick on that CPU -- the `[WDOG] ... cosmic-comp ... last
+    // syscall 9` report. Nothing is held between chunks (the VMA is already
+    // mapped and the copy goes through the kernel direct map), so the window
+    // may also reschedule; the total cost is unchanged, the CPU is simply no
+    // longer deaf for all of it.
     while filled < len {
+        let want = (len - filled).min(MMAP_READ_CHUNK);
         let read_msg = make_vfs_msg(vfs::VFS_READ,
-            &[fd as u64, (hhdm_ptr as usize + filled) as u64, (len - filled) as u64]);
+            &[fd as u64, (hhdm_ptr as usize + filled) as u64, want as u64]);
         let r = vfs_reply_val(&vfs::handle(&read_msg, pid));
         if r < 0 { n = r; break; }
         if r == 0 { break; } // genuine EOF; the rest of the mapping stays zero
         filled += r as usize;
+        irq_window();
     }
     if n >= 0 { n = filled as isize; }
+    tr.io_ns += monotonic_ns().wrapping_sub(tio);
+    tr.bytes = filled;
 
     // Restore the descriptor's original file position — mmap(2) leaves it alone.
     if saved_pos >= 0 {
@@ -1936,7 +2044,9 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     if !page_flags.contains(PageFlags::WRITABLE) {
         // mprotect the VMA to remove the temporary WRITABLE bit.
         // Use sys_mprotect's logic: walk VMA list, remap pages.
+        let tf = monotonic_ns();
         let _ = sys_mprotect(virt, len, prot);
+        tr.fixup_ns = monotonic_ns().wrapping_sub(tf);
     }
 
     virt as isize
@@ -2145,7 +2255,7 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
             sched::WaitTry::NoChildren => return -10, // ECHILD
             sched::WaitTry::StillRunning => {
                 if options & WNOHANG != 0 { return 0; }
-                if interrupted() { return -4; } // EINTR
+                if interrupted() { return ERESTARTSYS; }
                 // Block on the poll wait-channel instead of a yield-spin. A
                 // child exit delivers SIGCHLD which calls sched::wake_poll,
                 // waking us to reap; a short poll deadline bounds any missed
@@ -2241,7 +2351,7 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
                     write_info(0, 0, 0);
                     return 0;
                 }
-                if interrupted() { return -4; } // EINTR
+                if interrupted() { return ERESTARTSYS; }
                 // Block on the poll wait-channel rather than a yield-spin —
                 // same fix as sys_wait4: a long-running child (a compositor,
                 // a service) otherwise pins its blocking-waitid reaper at
@@ -2264,11 +2374,21 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
 /// Replaces the current signal mask, then yields until any unmasked signal
 /// arrives.  Always returns -EINTR.
 fn sys_rt_sigsuspend(mask_ptr: usize, _sigsetsize: usize) -> isize {
-    let new_mask = if mask_ptr != 0 && validate_user_buf(mask_ptr, 8) {
-        unsafe { core::ptr::read(mask_ptr as *const u64) }
-    } else {
-        0
-    };
+    if mask_ptr == 0 || !validate_user_buf(mask_ptr, 8) { return -14; } // EFAULT
+    let new_mask = unsafe { core::ptr::read(mask_ptr as *const u64) };
+    sigsuspend_with(new_mask)
+}
+
+/// pause(2): sigsuspend under the CURRENT mask. It used to be
+/// `rt_sigsuspend(NULL)`, which installed an all-clear mask — a pause()
+/// with SIGALRM blocked woke on it and ran the handler.
+fn sys_pause() -> isize {
+    let cur = replace_signal_mask(0);
+    replace_signal_mask(cur);
+    sigsuspend_with(cur)
+}
+
+fn sigsuspend_with(new_mask: u64) -> isize {
     let old_mask = replace_signal_mask(new_mask);
     // Park until a signal arrives that is not blocked by new_mask. Every
     // delivery path (`deliver_signal`, `deliver_signal_process`) ends in a
@@ -2335,13 +2455,18 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
             }
             return signo as isize;
         }
+        // Any OTHER signal that will run a handler (or kill) ends the wait
+        // with EINTR, as on Linux; the waited-for set is checked first above.
+        if interrupted() { return -4; }
         if let Some(dl) = deadline {
             // EAGAIN: POSIX and Linux report an expired wait this way, not ETIMEDOUT.
             if monotonic_ns() >= dl { return -11; }
         }
         // Park (see sys_rt_sigsuspend); the deadline rides the poll tick.
         sched::block_on_poll_prepare_until(deadline.unwrap_or(u64::MAX));
-        if (pending_signals() | sched::shared_pending_signals()) & wait_mask != 0 { sched::block_on_poll_cancel(); continue; }
+        if (pending_signals() | sched::shared_pending_signals()) & wait_mask != 0 || interrupted() {
+            sched::block_on_poll_cancel(); continue;
+        }
         sched::block_on_poll_commit();
     }
 }
@@ -3963,6 +4088,29 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     drop(envp);
 
     // ── VFS lifecycle and address space replacement ────────────────────────────
+    // POSIX execve terminates every *other* thread in the caller's group: the
+    // old program image (their code and stacks) is about to be replaced, so any
+    // sibling left running would execute freed/stale mappings. Without it, a
+    // COSMIC component that re-exec'd with a live worker thread orphaned that
+    // worker on the old address space; its next fault resolved against the
+    // leader's *new* AS and killed it, and freeing the old AS out from under it
+    // faulted the page-table walk (M7o).
+    //
+    // Everything from here on is infallible, so this is the point of no
+    // return and no sibling is reaped on a path that could still fail. It
+    // must come BEFORE the close-on-exec sweeps below, as Linux's de_thread
+    // precedes do_close_on_exec: the sweeps close fds the siblings are still
+    // using, and a sibling alive across them sees its fds vanish. That was
+    // tokio's "Bad read on self-pipe: EBADF" panic in brush whenever it ran
+    // `exec <cmd>` (greetd's session wrapper): closing the SOCK_CLOEXEC signal
+    // socketpair woke a worker parked in epoll_wait on it, and its read of the
+    // already-closed receiver failed EBADF before the kill reached it.
+    //
+    // A non-leader caller takes over the leader's pid here, so `pid` is
+    // re-read; the tgid (the fd-table key) does not change.
+    sched::dethread_current_group();
+    let pid = current_pid();
+
     // VFS_EXEC_CLOEXEC takes the owning pid explicitly and so bypasses the
     // tgid canonicalization vfs::handle applies to ordinary calls. fd tables
     // are keyed by tgid, so an execve issued from a non-leader thread (a tokio
@@ -3997,18 +4145,12 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // stack-exhausting recursion that blocked the COSMIC session launcher.
     sched::reset_handlers_on_exec(fd_owner);
 
-    // POSIX execve terminates every *other* thread in the caller's group: the
-    // old program image (their code and stacks) is about to be replaced, so any
-    // sibling left running would execute freed/stale mappings. Do this as the
-    // last step before the (non-returning) address-space swap — the point of no
-    // return — so no sibling is reaped on a path that could still fail. Without
-    // it, a COSMIC component that re-exec'd with a live worker thread orphaned
-    // that worker on the old address space; its next fault resolved against the
-    // leader's *new* AS and killed it, and freeing the old AS out from under it
-    // faulted the page-table walk (M7o).
-    sched::dethread_current_group();
-
-    replace_address_space(*new_as, pt_root, heap_start, entry, user_sp);
+    // Unbox in an inner scope: `replace_address_space` never returns, so a
+    // `Box` still alive in this frame is never deallocated — `*new_as` as the
+    // argument moved the value out but left the 56-byte box allocation to a
+    // scope end that never comes, one slab object per exec.
+    let new_as: mm::vmm::AddressSpace = { let b = new_as; *b };
+    replace_address_space(new_as, pt_root, heap_start, entry, user_sp);
 }
 
 // ── I/O syscalls ──────────────────────────────────────────────────────────────
@@ -4423,7 +4565,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                 match read_input_byte() {
                     Some(b) => break b,
                     None    => {
-                        if interrupted() { return -4; } // EINTR
+                        if interrupted() { return if is_kernel { -4 } else { ERESTARTSYS }; }
                         if nonblocking {
                             spins += 1;
                             if spins >= NONBLOCK_RETRY_SPINS { return -11; } // EAGAIN
@@ -6098,7 +6240,7 @@ fn sys_getresxid(r_ptr: usize, e_ptr: usize, s_ptr: usize, is_gid: bool) -> isiz
 /// which case fall back to the old VFS_STAT + mode-bit probe below (kept
 /// verbatim, F_OK short-circuit and RamFS/tmpfs fallback included) so nothing
 /// regresses for a mount that predates VFS_ACCESS.
-fn sys_faccessat(dirfd: usize, path_ptr: usize, mode: usize, _flags: usize) -> isize {
+fn sys_faccessat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let path_ptr = path.ptr();
 
@@ -6106,10 +6248,17 @@ fn sys_faccessat(dirfd: usize, path_ptr: usize, mode: usize, _flags: usize) -> i
     const X_OK: usize = 1;
     const W_OK: usize = 2;
     const R_OK: usize = 4;
+    // Linux `AT_EACCESS`: check with the effective ids instead of the real
+    // ones. Without it — plain `access(2)` always calls in with flags == 0 —
+    // POSIX asks for the REAL uid/gid, so a setuid-root program can find out
+    // what its (often unprivileged) invoker is allowed to do, not what it
+    // itself can do right now.
+    const AT_EACCESS: usize = 0x200;
 
     let pid = current_pid();
+    let eaccess = flags & AT_EACCESS != 0;
 
-    let amsg = make_vfs_msg(vfs::VFS_ACCESS, &[path_ptr as u64, mode as u64]);
+    let amsg = make_vfs_msg(vfs::VFS_ACCESS, &[path_ptr as u64, mode as u64, eaccess as u64]);
     let ar = vfs_reply_val(&vfs::handle(&amsg, pid));
     if ar != -38 { return ar; } // anything but ENOSYS is the real answer
 
@@ -6741,6 +6890,10 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     // Read-only virtio-gpu completion-interrupt census (drmsmoke's regression
     // test of the interrupt path); eight u64s written back.
     const DRM_IOCTL_GPU_IRQ_STATS: usize = 0x1008;
+    // Read/set the control queue's spin-before-park interval (root; one u64,
+    // new value in, old value out). drmsmoke uses it to force a parked wait.
+    const DRM_IOCTL_GPU_PARK_SPIN: usize = 0x1009;
+    if cmd == DRM_IOCTL_GPU_PARK_SPIN && (arg == 0 || !validate_user_buf(arg, 8)) { return -14; } // EFAULT
 
     // Check if it's a standard Linux EVDEV (type 'E' = 0x45) or DRM (type 'd' = 0x64) ioctl
     let ioctl_type = (cmd >> 8) & 0xFF;
@@ -6996,7 +7149,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
        cmd == DRM_IOCTL_GET_MODE || cmd == DRM_IOCTL_SET_MODE ||
        cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||
        cmd == DRM_IOCTL_SET_PLANE || cmd == DRM_IOCTL_GET_CAPS ||
-       cmd == DRM_IOCTL_GPU_IRQ_STATS ||
+       cmd == DRM_IOCTL_GPU_IRQ_STATS || cmd == DRM_IOCTL_GPU_PARK_SPIN ||
        is_evdev || is_drm {
         
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
@@ -7094,11 +7247,25 @@ fn sys_timer_create(_clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) ->
     // struct sigevent: sigev_value(8) + sigev_signo(4) + sigev_notify(4) + ...
     // We only care about sigev_signo at offset 8 (SIGEV_SIGNAL = 0).
     if timerid_ptr != 0 && !validate_user_buf(timerid_ptr, core::mem::size_of::<usize>()) { return -14; }
-    let signo = if sigevent_ptr != 0 && validate_user_buf(sigevent_ptr, 12) {
-        let mut buf = [0u8; 12];
-        let ok = with_current_address_space(|as_| as_.read_user_buf(sigevent_ptr, &mut buf))
-            .unwrap_or(false);
-        if ok { u32::from_ne_bytes(buf[8..12].try_into().unwrap()) } else { 14 }
+    // sigev_notify at offset 12: SIGEV_SIGNAL = 0, SIGEV_NONE = 1 (armed,
+    // readable via timer_gettime, never signals — encoded as signo 0),
+    // SIGEV_THREAD_ID = 4 (delivered process-directed here).
+    let signo = if sigevent_ptr != 0 {
+        let mut buf = [0u8; 16];
+        let ok = validate_user_buf(sigevent_ptr, 16)
+            && with_current_address_space(|as_| as_.read_user_buf(sigevent_ptr, &mut buf))
+                .unwrap_or(false);
+        if !ok { return -14; }
+        let signo  = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        let notify = u32::from_ne_bytes(buf[12..16].try_into().unwrap());
+        match notify {
+            // SIGEV_THREAD has no kernel meaning (libc builds it on
+            // SIGEV_THREAD_ID) and relibc passes it straight through: keep
+            // the old silent behaviour rather than start failing callers.
+            1 | 2 => 0,
+            0 | 4 if (1..=64).contains(&signo) => signo,
+            _ => return -22, // EINVAL
+        }
     } else {
         14 // SIGALRM default
     };
@@ -7208,12 +7375,12 @@ fn block_until_ready(nonblock: bool, mut op: impl FnMut() -> isize, hint: impl F
     loop {
         let n = op();
         if n != -11 || nonblock { return n; }
-        if interrupted() { return -4; } // EINTR
+        if interrupted() { return ERESTARTSYS; }
         let (mask, deadline) = hint();
         sched::block_on_poll_prepare_masked(deadline, mask);
         let n = op();
         if n != -11 { sched::block_on_poll_cancel(); return n; }
-        if interrupted() { sched::block_on_poll_cancel(); return -4; }
+        if interrupted() { sched::block_on_poll_cancel(); return ERESTARTSYS; }
         sched::block_on_poll_commit();
     }
 }
@@ -8020,13 +8187,22 @@ fn scstat_tick() {
     }
 }
 
-pub fn poll_deadline_tick() {
+/// Wake every timed waiter (poll/select/epoll/futex/nanosleep/…) and timerfd
+/// whose deadline is `<= now`, and return the next pending deadline
+/// (`u64::MAX` = none). Runs from the 100 Hz BSP tick (`poll_deadline_tick`)
+/// AND from any CPU's one-shot deadline interrupt (`sched::timer_deadline_irq`,
+/// armed by `sched::register_poll_deadline`), so a timed wait is released
+/// within interrupt latency of its deadline instead of at the next tick edge.
+/// IRQ context, try-lock only (the tick-hook contract).
+pub fn poll_deadline_service(now: u64) -> u64 {
     use core::sync::atomic::Ordering::Relaxed;
-    gap2_sample_tick();
-    evstat_tick();
-    scstat_tick();
-    let now = monotonic_ns();
     let tfd = vfs::earliest_timerfd_deadline();
+    // POSIX timers / itimers: post the signal (and wake its parked target)
+    // from here, not at the owner's next syscall return. A contended pass
+    // leaves the timer due, so the retry below re-arms 200 µs out.
+    if tty_server::earliest_timer_deadline() <= now {
+        tty_server::service_timers_irq(now);
+    }
     // Fast path: the lock-free hint (min of parked timed waiters' deadlines)
     // and the timerfd pool say nothing is due → no run-queue scan, no wake.
     let due = core::cmp::min(sched::NEXT_POLL_DEADLINE.load(Relaxed), tfd);
@@ -8061,6 +8237,21 @@ pub fn poll_deadline_tick() {
             sched::request_poll_wake_tagged(timerfd_tags);
         }
     }
+    let next = core::cmp::min(sched::NEXT_POLL_DEADLINE.load(Relaxed),
+                              vfs::earliest_timerfd_deadline())
+        .min(tty_server::earliest_timer_deadline());
+    // Still due after the service = the RUN_QUEUE try-lock lost (the hint was
+    // left in place for a retry). Retry shortly rather than immediately — an
+    // immediate re-arm would be an interrupt storm against the lock holder —
+    // and never later than the tick would have.
+    if next <= now { now + 200_000 } else { next }
+}
+
+pub fn poll_deadline_tick() {
+    gap2_sample_tick();
+    evstat_tick();
+    scstat_tick();
+    poll_deadline_service(monotonic_ns());
     // Pay any wake a pipe deferred because it only advanced an object's edge
     // `seq` without changing its readable/writable level (see
     // `sched::request_poll_wake` and the pipe arms in `servers/vfs`). This is
@@ -8838,28 +9029,32 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: usize, count: usize) ->
 ///
 /// Maps `ITIMER_REAL` (which=0) to a POSIX timer with SIGALRM.
 /// Other `which` values (VIRTUAL, PROF) are accepted but ignored.
-const ITIMER_TICK_HZ: u64 = 100;
-const ITIMER_USEC_PER_TICK: u64 = 1_000_000 / ITIMER_TICK_HZ;
-
 /// Parse a 32-byte `struct itimerval` (`{ it_interval, it_value }`, each a
-/// `{ tv_sec: i64, tv_usec: i64 }` pair) into `(interval_ticks, value_ticks)`.
-fn parse_itimerval(buf: &[u8; 32]) -> (u64, u64) {
-    let iv_sec  = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
-    let iv_usec = i64::from_ne_bytes(buf[8..16].try_into().unwrap());
-    let va_sec  = i64::from_ne_bytes(buf[16..24].try_into().unwrap());
-    let va_usec = i64::from_ne_bytes(buf[24..32].try_into().unwrap());
-    let itv = (iv_sec as u64 * ITIMER_TICK_HZ) + (iv_usec as u64 / ITIMER_USEC_PER_TICK);
-    let vtv = (va_sec as u64 * ITIMER_TICK_HZ) + (va_usec as u64 / ITIMER_USEC_PER_TICK);
-    (itv, vtv)
+/// `{ tv_sec: i64, tv_usec: i64 }` pair) into `(interval_ns, value_ns)`, or
+/// `None` for a negative field / `tv_usec` outside `0..1_000_000` (EINVAL).
+/// Nanoseconds, not ticks: a sub-10 ms it_value used to floor to 0 ticks,
+/// which is "disarm".
+fn parse_itimerval(buf: &[u8; 32]) -> Option<(u64, u64)> {
+    let f = |o: usize| i64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
+    let (iv_sec, iv_usec, va_sec, va_usec) = (f(0), f(8), f(16), f(24));
+    if iv_sec < 0 || va_sec < 0 || !(0..1_000_000).contains(&iv_usec) || !(0..1_000_000).contains(&va_usec) {
+        return None;
+    }
+    let ns = |s: i64, us: i64| (s as u64).saturating_mul(1_000_000_000).saturating_add(us as u64 * 1000);
+    Some((ns(iv_sec, iv_usec), ns(va_sec, va_usec)))
 }
 
-/// Encode `(interval_ticks, value_ticks)` as a 32-byte `struct itimerval`.
-fn itimerval_bytes(interval_ticks: u64, value_ticks: u64) -> [u8; 32] {
+/// Encode `(interval_ns, value_ns)` as a 32-byte `struct itimerval`. A
+/// remaining value is rounded UP to the microsecond so an armed timer never
+/// reads as 0 (disarmed).
+fn itimerval_bytes(interval_ns: u64, value_ns: u64) -> [u8; 32] {
     let mut buf = [0u8; 32];
-    buf[0..8].copy_from_slice(&((interval_ticks / ITIMER_TICK_HZ) as i64).to_ne_bytes());
-    buf[8..16].copy_from_slice(&(((interval_ticks % ITIMER_TICK_HZ) * ITIMER_USEC_PER_TICK) as i64).to_ne_bytes());
-    buf[16..24].copy_from_slice(&((value_ticks / ITIMER_TICK_HZ) as i64).to_ne_bytes());
-    buf[24..32].copy_from_slice(&(((value_ticks % ITIMER_TICK_HZ) * ITIMER_USEC_PER_TICK) as i64).to_ne_bytes());
+    let iv_us = (interval_ns + 999) / 1000;
+    let va_us = (value_ns + 999) / 1000;
+    buf[0..8].copy_from_slice(&((iv_us / 1_000_000) as i64).to_ne_bytes());
+    buf[8..16].copy_from_slice(&((iv_us % 1_000_000) as i64).to_ne_bytes());
+    buf[16..24].copy_from_slice(&((va_us / 1_000_000) as i64).to_ne_bytes());
+    buf[24..32].copy_from_slice(&((va_us % 1_000_000) as i64).to_ne_bytes());
     buf
 }
 
@@ -8873,22 +9068,22 @@ fn sys_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize {
 
     let pid = current_pid();
 
-    let (interval_ticks, value_ticks) = if new_ptr != 0 {
+    let (interval_ns, value_ns) = if new_ptr != 0 {
         let mut buf = [0u8; 32];
         if !with_current_address_space(|as_| as_.read_user_buf(new_ptr, &mut buf)).unwrap_or(false) {
             return -14;
         }
-        parse_itimerval(&buf)
+        match parse_itimerval(&buf) { Some(v) => v, None => return -22 }
     } else {
         (0, 0)
     };
 
-    // Arm the reserved ITIMER_REAL slot directly (tick units — no synthetic
+    // Arm the reserved ITIMER_REAL slot directly (ns — no synthetic
     // user-space pointer round-trip; see set_real_itimer's doc comment).
-    let (old_interval_ticks, old_value_ticks) = tty_server::set_real_itimer(pid, interval_ticks, value_ticks);
+    let (old_interval_ns, old_value_ns) = tty_server::set_real_itimer(pid, interval_ns, value_ns);
 
     if old_ptr != 0 {
-        let obuf = itimerval_bytes(old_interval_ticks, old_value_ticks);
+        let obuf = itimerval_bytes(old_interval_ns, old_value_ns);
         if !with_current_address_space_mut(|as_| as_.write_user_buf(old_ptr, &obuf)).unwrap_or(false) {
             return -14;
         }
@@ -8901,8 +9096,8 @@ fn sys_getitimer(which: usize, cur_ptr: usize) -> isize {
     if which != 0 { return 0; }
     if !validate_user_buf(cur_ptr, 32) { return -14; }
     let pid = current_pid();
-    let (interval_ticks, value_ticks) = tty_server::get_real_itimer(pid);
-    let buf = itimerval_bytes(interval_ticks, value_ticks);
+    let (interval_ns, value_ns) = tty_server::get_real_itimer(pid);
+    let buf = itimerval_bytes(interval_ns, value_ns);
     if with_current_address_space_mut(|as_| as_.write_user_buf(cur_ptr, &buf)).unwrap_or(false) { 0 } else { -14 }
 }
 
@@ -8924,16 +9119,16 @@ fn sys_sigpending(set_ptr: usize) -> isize {
 #[cfg(not(target_arch = "aarch64"))]
 fn sys_alarm(seconds: usize) -> isize {
     let pid = current_pid();
-    const TICK_HZ: u64 = 100;
-    let value_ticks = seconds as u64 * TICK_HZ;
+    const NS: u64 = 1_000_000_000;
+    let value_ns = (seconds as u64).saturating_mul(NS);
 
     // One-shot (no interval) — arm the reserved ITIMER_REAL slot directly.
-    let (_, old_value_ticks) = tty_server::set_real_itimer(pid, 0, value_ticks);
+    let (_, old_value_ns) = tty_server::set_real_itimer(pid, 0, value_ns);
 
     // Real alarm() returns the number of seconds remaining on any previous
     // alarm, rounded up so a caller never sees "0 seconds left" for an
     // alarm that's about to fire (matches glibc/Linux behavior).
-    ((old_value_ticks + TICK_HZ - 1) / TICK_HZ) as isize
+    ((old_value_ns + NS - 1) / NS) as isize
 }
 
 // ── fork / clone ──────────────────────────────────────────────────────────────

@@ -592,8 +592,7 @@ pub static CTRLQ_IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 #[no_mangle]
 pub extern "C" fn virtio_gpu_msix_isr() {
     CTRLQ_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    ctrlq_tick();
-    kick_parked_waiter();
+    if !ctrlq_tick() { kick_waiting_cpus(); }
 }
 
 /// QEMU virt wires the PCIe host bridge's four INTx lines to SPIs 3..6, i.e.
@@ -654,8 +653,7 @@ extern "C" fn virtio_gpu_intx_isr() {
         if CTRLQ_IRQS.fetch_add(1, Relaxed) == 0 {
             crate::pci::serial_debug("[GPU] INTx: first control-queue completion interrupt\n");
         }
-        ctrlq_tick();
-        kick_parked_waiter();
+        if !ctrlq_tick() { kick_waiting_cpus(); }
     }
 }
 
@@ -695,10 +693,14 @@ pub fn set_fence_event_hook(f: fn() -> bool) {
 /// Tick-hook entry: reap the control queue if the device is free, then pay any
 /// pending fence notification. Never blocks — `try_lock` on the device and
 /// no allocation or free inside — so it is safe from the 100 Hz tick on any CPU.
-/// Called from `drm_device_interface::drm_tick`.
-pub fn ctrlq_tick() {
+/// Called from `drm_device_interface::drm_tick`. Returns false when the device
+/// lock was busy and nothing could be reaped: the completion interrupt then
+/// kicks every waiting CPU so each reaps for itself (`kick_waiting_cpus`).
+pub fn ctrlq_tick() -> bool {
     use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+    let mut reaped = false;
     if let Some(mut g) = VIRTIO_GPU.try_lock() {
+        reaped = true;
         if let Some(gpu) = g.as_mut() {
             if gpu.ctrlq_reap(false) { FENCE_EVENT_PENDING.store(true, Release); }
         }
@@ -711,6 +713,7 @@ pub fn ctrlq_tick() {
             if !f() { FENCE_EVENT_PENDING.store(true, Release); }
         }
     }
+    reaped
 }
 
 
@@ -754,59 +757,204 @@ impl Drop for SpinWindow {
     }
 }
 
-/// Synchronous waits `submit` and `ensure_ctrlq_room` still take under
-/// `VIRTIO_GPU` (the reply-needing ~0.5 % of traffic and a full ring) no
-/// longer spin the vCPU when a completion interrupt is armed: each step parks
-/// the CPU in `wfi`/`hlt` until an interrupt — the device's, or the tick —
-/// and reaps on return. The lock stays held, so this is not a sleep other
-/// tasks can use the CPU through, but the host sees an idle vCPU for the
-/// round trip and the wake is the interrupt's latency, not a poll's.
+/// Synchronous control-queue waits: a reply-needing command (`submit`, the
+/// ~0.5 % of traffic that is not `submit_async`) or a full ring
+/// (`ensure_ctrlq_room`).
 ///
-/// Without an interrupt the wake would be the tick, up to 10 ms away, so the
-/// unarmed case keeps the spin. Bounded in ticks rather than iterations
-/// because each parked step is at least one interrupt long.
+/// Where the wait runs. A command submitted through a `GpuLocked` handle
+/// (`lock_gpu`, every DRM-ioctl path) is enqueued under `VIRTIO_GPU`, then the
+/// lock is RELEASED for the wait (`wait_sync_unlocked`) and retaken to collect
+/// the reply. Completion is published per chain (`SYNC_DONE`) by whichever reap
+/// retires it — the completion interrupt, the tick, another submitter, or the
+/// waiter itself — so a slow host round trip no longer serializes every other
+/// GPU user behind it. Only the init/console paths, which hold a bare
+/// `&mut VirtioGpuDevice`, and ring-full waits still wait under the lock.
+///
+/// How it waits. When a completion interrupt is armed, after
+/// `CTRLQ_SPIN_BEFORE_PARK_US` of spinning each step parks the CPU in
+/// `wfi`/`hlt` until an interrupt and re-checks on return. Without an
+/// interrupt the wake would be the tick, up to 10 ms away, so the unarmed case
+/// keeps the spin. Bounded in ticks rather than iterations because each parked
+/// step is at least one interrupt long.
+///
+/// `CTRLQ_PARKED` counts waits that actually parked the CPU at least once
+/// (before 2026-09-24 it counted waits that were merely allowed to).
 pub static CTRLQ_PARKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 const CTRLQ_PARK_TIMEOUT_TICKS: u64 = 500; // 5 s at 100 Hz: the device is wedged
-/// The CPU a `CtrlqWait` is parked on, `NO_PARKED_CPU` when none. The
-/// completion interrupt is routed to the BSP (MSI-X destination APIC 0, the
-/// GIC IROUTER), so a waiter on any other CPU would sleep through it until
-/// its own tick; the handler reads this and kicks that CPU with the
-/// reschedule IPI (no flag set, so nothing reschedules — the SGI/vector
-/// only ends the `wfi`/`hlt`). Set for the whole wait, not just around the
-/// park, so a completion that lands between the waiter's check and its park
-/// still sends the kick, which is then pending when the park begins and ends
-/// it at once. One waiter at a time: the wait holds `VIRTIO_GPU`.
-static CTRLQ_PARKED_CPU: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(NO_PARKED_CPU);
 const NO_PARKED_CPU: usize = usize::MAX;
-/// IPIs the completion handler sent to a parked waiter on another CPU.
+/// IPIs sent to wake a parked waiter on another CPU.
 pub static CTRLQ_PARK_KICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Synchronous waits that ran with `VIRTIO_GPU` released.
+pub static CTRLQ_UNLOCKED_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Parked unlocked waits that woke to find the host's answer sitting in the
+/// used ring, unreaped, and had to reap it themselves: nobody who took the
+/// interrupt had reaped it for them. `ctrlq_lost_wake` is the subset whose
+/// park spanned a tick, i.e. that were most likely woken by their own tick
+/// rather than by the completion — the lost-wake signature.
+pub static CTRLQ_PARK_STRANDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CTRLQ_LOST_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// From the completion handler: wake a waiter parked on another CPU.
+/// Upper bound on the control queue (`setup_queue` caps it at 256 entries).
+const CTRLQ_MAX: usize = 256;
+/// Per-chain completion flag for synchronous commands, indexed by head
+/// descriptor. Cleared at enqueue, set by the reap that retires the chain; the
+/// waiter polls it without the device lock.
+static SYNC_DONE: [core::sync::atomic::AtomicBool; CTRLQ_MAX] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; CTRLQ_MAX];
+/// The CPU parked on each synchronous chain, `NO_PARKED_CPU` when none: the
+/// reap that marks the chain done IPIs it. Set before the waiter's last
+/// `SYNC_DONE` check and read after the reaper's store (both SeqCst), so one
+/// of the two always sees the other and the wake cannot be lost.
+static SYNC_WAITER: [core::sync::atomic::AtomicUsize; CTRLQ_MAX] =
+    [const { core::sync::atomic::AtomicUsize::new(NO_PARKED_CPU) }; CTRLQ_MAX];
+/// CPUs (bit = CPU id) with a waiter allowed to park. The completion interrupt
+/// is routed to one CPU (MSI-X destination APIC 0; the GIC's routing on
+/// aarch64); when its handler cannot take `VIRTIO_GPU` it cannot reap, so it
+/// kicks every CPU here and each re-checks — reaping itself when it can —
+/// instead of sleeping to its own tick. One waiter per CPU: a wait runs with
+/// preemption disabled.
+static SYNC_WAITING_CPUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `DRM_STATS` only: when each synchronous chain was reaped and on which CPU,
+/// for the slow-wait line (`[CTRLQ-SLOW]`).
+static SYNC_DONE_US: [core::sync::atomic::AtomicU64; CTRLQ_MAX] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; CTRLQ_MAX];
+static SYNC_DONE_CPU: [core::sync::atomic::AtomicUsize; CTRLQ_MAX] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; CTRLQ_MAX];
+
+/// Address of the control queue's used-ring `idx` and the reaper's mirror of
+/// `last_used_idx`: a lock-free "has the host answered something nobody has
+/// reaped yet".
+static CTRLQ_USED_IDX_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static CTRLQ_LAST_USED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 #[inline]
-fn kick_parked_waiter() {
+fn ctrlq_unreaped() -> bool {
+    use core::sync::atomic::Ordering::{Acquire, SeqCst};
+    let p = CTRLQ_USED_IDX_PTR.load(Acquire) as *const u16;
+    if p.is_null() { return false; }
+    core::sync::atomic::fence(SeqCst);
+    let idx = unsafe { p.read_volatile() };
+    idx != CTRLQ_LAST_USED.load(Acquire) as u16
+}
+
+/// From the completion handler, when it could not take the device lock: wake
+/// every CPU with a parked waiter so it re-checks for itself.
+#[inline]
+fn kick_waiting_cpus() {
     extern "C" { fn arch_send_resched_ipi(cpu: usize); }
-    let c = CTRLQ_PARKED_CPU.load(core::sync::atomic::Ordering::Acquire);
+    let me = unsafe { sched::cpu_id() };
+    let mut m = SYNC_WAITING_CPUS.load(core::sync::atomic::Ordering::SeqCst);
+    if me < 64 { m &= !(1u64 << me); }
+    while m != 0 {
+        let c = m.trailing_zeros() as usize;
+        m &= m - 1;
+        CTRLQ_PARK_KICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        unsafe { arch_send_resched_ipi(c); }
+    }
+}
+
+/// From a reap that just retired synchronous chain `head`: publish it and wake
+/// its waiter if that is parked on another CPU.
+#[inline]
+fn sync_chain_done(head: usize) {
+    extern "C" { fn arch_send_resched_ipi(cpu: usize); }
+    use core::sync::atomic::Ordering::SeqCst;
+    if head >= CTRLQ_MAX { return; }
+    if crate::drm_device_interface::DRM_STATS {
+        SYNC_DONE_US[head].store(crate::snd::monotonic_us(), core::sync::atomic::Ordering::Relaxed);
+        SYNC_DONE_CPU[head].store(unsafe { sched::cpu_id() }, core::sync::atomic::Ordering::Relaxed);
+    }
+    SYNC_DONE[head].store(true, SeqCst);
+    let c = SYNC_WAITER[head].load(SeqCst);
     if c != NO_PARKED_CPU && c != unsafe { sched::cpu_id() } {
         CTRLQ_PARK_KICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         unsafe { arch_send_resched_ipi(c); }
     }
 }
 
-struct CtrlqWait { park: bool, deadline: u64 }
+/// How long a wait spins before it parks, in microseconds. Most
+/// reply-needing commands come back well inside this (x86_64/KVM Zink
+/// session start: mean 55 us spinning), and a spun wait sees the reply the
+/// moment it lands. Parking from the first step measured mean 55 -> 330-370 us
+/// per reply-needing command and max 2.5 -> 8.8-9.5 ms against spinning
+/// (x86_64/KVM, Zink session start, ~130 commands, lock held across the wait);
+/// spinning 200 us first: 50-64 us, 2.8 ms. Parking is kept for the slow tail,
+/// where an idle vCPU is worth a wake-up's latency. Adjustable through
+/// LeandrOS ioctl 0x1009 so drmsmoke can force the parked path.
+static CTRLQ_SPIN_BEFORE_PARK_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(200);
+const CTRLQ_SPIN_BEFORE_PARK_MAX_US: u64 = 100_000;
+
+/// Set the spin-before-park interval (clamped to 100 ms); returns the old one.
+pub fn set_park_spin_us(us: u64) -> u64 {
+    CTRLQ_SPIN_BEFORE_PARK_US.swap(us.min(CTRLQ_SPIN_BEFORE_PARK_MAX_US), core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Wait-time histogram of synchronous control-queue waits (`DRM_STATS`
+/// only): < 50 us, < 200 us, < 1 ms, < 5 ms, >= 5 ms.
+pub static CTRLQ_WAIT_HIST: [core::sync::atomic::AtomicU64; 5] = [
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+struct CtrlqWait {
+    park: bool,
+    deadline: u64,
+    t0: u64,
+    spin_us: u64,
+    /// Head of the synchronous chain waited on; `usize::MAX` for a room wait.
+    head: usize,
+    cpu: usize,
+    parking: core::cell::Cell<bool>,
+    /// Parks taken (`DRM_STATS` diagnostics).
+    parks: core::cell::Cell<u32>,
+    /// The last step parked; the tick count when it began.
+    parked_at: core::cell::Cell<Option<u64>>,
+}
 impl CtrlqWait {
-    fn new(window: &SpinWindow) -> Self {
-        let park = window.open && irq_armed();
+    fn new(window: &SpinWindow, head: Option<u16>) -> Self {
+        use core::sync::atomic::Ordering::SeqCst;
+        let cpu = unsafe { sched::cpu_id() };
+        let park = window.open && irq_armed() && cpu < 64;
+        let head = head.map(|h| h as usize).filter(|&h| h < CTRLQ_MAX).unwrap_or(usize::MAX);
         if park {
-            CTRLQ_PARKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            CTRLQ_PARKED_CPU.store(unsafe { sched::cpu_id() }, core::sync::atomic::Ordering::Release);
+            if head != usize::MAX { SYNC_WAITER[head].store(cpu, SeqCst); }
+            SYNC_WAITING_CPUS.fetch_or(1u64 << cpu, SeqCst);
         }
-        CtrlqWait { park, deadline: sched::ticks().wrapping_add(CTRLQ_PARK_TIMEOUT_TICKS) }
+        CtrlqWait {
+            park,
+            deadline: sched::ticks().wrapping_add(CTRLQ_PARK_TIMEOUT_TICKS),
+            t0: crate::snd::monotonic_us(),
+            spin_us: CTRLQ_SPIN_BEFORE_PARK_US.load(core::sync::atomic::Ordering::Relaxed),
+            head,
+            cpu,
+            parking: core::cell::Cell::new(false),
+            parks: core::cell::Cell::new(0),
+            parked_at: core::cell::Cell::new(None),
+        }
     }
     /// One wait step; false when the parked wait has run out of time.
     #[inline]
     fn step(&self, window: &SpinWindow, iter: u64) -> bool {
-        if self.park {
-            park_until_irq();
+        self.parked_at.set(None);
+        if self.park && (self.parking.get()
+            || crate::snd::monotonic_us().wrapping_sub(self.t0) >= self.spin_us)
+        {
+            if !self.parking.replace(true) {
+                CTRLQ_PARKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            // Never sleep over an answer already in the used ring: whoever
+            // took its interrupt may have been unable to reap it, and nobody
+            // else is coming. Spin until it is reaped instead.
+            if ctrlq_unreaped() {
+                window.pulse(0);
+                core::hint::spin_loop();
+            } else {
+                let t = sched::ticks();
+                park_until_irq();
+                self.parks.set(self.parks.get().wrapping_add(1));
+                self.parked_at.set(Some(t));
+            }
             (sched::ticks().wrapping_sub(self.deadline) as i64) < 0
         } else {
             window.pulse(iter);
@@ -817,8 +965,86 @@ impl CtrlqWait {
 }
 impl Drop for CtrlqWait {
     fn drop(&mut self) {
-        if self.park { CTRLQ_PARKED_CPU.store(NO_PARKED_CPU, core::sync::atomic::Ordering::Release); }
+        use core::sync::atomic::Ordering::SeqCst;
+        if self.park {
+            if self.head != usize::MAX { SYNC_WAITER[self.head].store(NO_PARKED_CPU, SeqCst); }
+            SYNC_WAITING_CPUS.fetch_and(!(1u64 << self.cpu), SeqCst);
+        }
+        if crate::drm_device_interface::DRM_STATS {
+            let dt = crate::snd::monotonic_us().wrapping_sub(self.t0);
+            let b = if dt < 50 { 0 } else if dt < 200 { 1 } else if dt < 1000 { 2 } else if dt < 5000 { 3 } else { 4 };
+            CTRLQ_WAIT_HIST[b].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
     }
+}
+
+/// Wait for synchronous chain `head` with `VIRTIO_GPU` released; true once it
+/// completed. The caller enqueued it under the lock and retakes the lock to
+/// collect the reply (`GpuLocked::submit`).
+fn wait_sync_unlocked(head: u16, hdr_type: u32) -> bool {
+    let stat = crate::drm_device_interface::DRM_STATS;
+    let (irq0, kick0, tick0) = if stat {
+        (CTRLQ_IRQS.load(core::sync::atomic::Ordering::Relaxed),
+         CTRLQ_PARK_KICKS.load(core::sync::atomic::Ordering::Relaxed), sched::ticks())
+    } else { (0, 0, 0) };
+    let mut self_reaped = false;
+    let mut parks = 0u32;
+    let t0 = crate::snd::monotonic_us();
+    let done = wait_sync_unlocked_inner(head, &mut self_reaped, &mut parks);
+    if stat {
+        let now = crate::snd::monotonic_us();
+        let dt = now.wrapping_sub(t0);
+        if dt >= 1000 {
+            use core::sync::atomic::Ordering::Relaxed;
+            let h = head as usize;
+            mm::gap2::s("[CTRLQ-SLOW] cmd="); mm::gap2::h(hdr_type as usize);
+            mm::gap2::kv(" dt_us=", dt as usize);
+            mm::gap2::kv(" done=", done as usize);
+            mm::gap2::kv(" parks=", parks as usize);
+            mm::gap2::kv(" ticks=", sched::ticks().wrapping_sub(tick0) as usize);
+            mm::gap2::kv(" irqs=", CTRLQ_IRQS.load(Relaxed).wrapping_sub(irq0) as usize);
+            mm::gap2::kv(" kicks=", CTRLQ_PARK_KICKS.load(Relaxed).wrapping_sub(kick0) as usize);
+            mm::gap2::kv(" self_reap=", self_reaped as usize);
+            mm::gap2::kv(" reap_to_seen_us=", now.wrapping_sub(SYNC_DONE_US[h].load(Relaxed)) as usize);
+            mm::gap2::kv(" cpu=", unsafe { sched::cpu_id() });
+            mm::gap2::kv(" reaper_cpu=", SYNC_DONE_CPU[h].load(Relaxed));
+            mm::gap2::nl();
+        }
+    }
+    done
+}
+
+fn wait_sync_unlocked_inner(head: u16, self_reaped: &mut bool, parks: &mut u32) -> bool {
+    use core::sync::atomic::Ordering::{Relaxed, Release, SeqCst};
+    let h = head as usize;
+    if h >= CTRLQ_MAX { return false; }
+    let window = SpinWindow::new();
+    let wait = CtrlqWait::new(&window, Some(head));
+    let mut iter = 0u64;
+    let done = loop {
+        if SYNC_DONE[h].load(SeqCst) { break true; }
+        if ctrlq_unreaped() && (iter & 0xF == 0 || wait.parked_at.get().is_some()) {
+            let woke_at = wait.parked_at.get();
+            if let Some(mut g) = VIRTIO_GPU.try_lock() {
+                if let Some(gpu) = g.as_mut() {
+                    if gpu.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, Release); }
+                }
+                drop(g);
+                if SYNC_DONE[h].load(SeqCst) {
+                    *self_reaped = true;
+                    if let Some(t) = woke_at {
+                        CTRLQ_PARK_STRANDED.fetch_add(1, Relaxed);
+                        if sched::ticks() != t { CTRLQ_LOST_WAKES.fetch_add(1, Relaxed); }
+                    }
+                    break true;
+                }
+            }
+        }
+        if iter >= CTRLQ_WAIT_ITERS || !wait.step(&window, iter) { break false; }
+        iter += 1;
+    };
+    *parks = wait.parks.get();
+    done
 }
 
 
@@ -1119,6 +1345,13 @@ impl VirtioGpuDevice {
             // chain so a tick-context reap never allocates.
             let qsize = self.queues[0].as_ref().map(|q| q.size as usize).unwrap_or(0);
             self.inflight = alloc::vec![None; qsize];
+            if let Some(q) = self.queues[0].as_ref() {
+                CTRLQ_LAST_USED.store(q.last_used_idx as u32, core::sync::atomic::Ordering::Release);
+                CTRLQ_USED_IDX_PTR.store(
+                    core::ptr::addr_of!((*q.used).idx) as usize,
+                    core::sync::atomic::Ordering::Release,
+                );
+            }
             self.fences_ahead = alloc::vec![0u64; qsize.max(1)];
             self.deferred_free = Vec::with_capacity(qsize * 3 + 8);
 
@@ -1426,6 +1659,7 @@ impl VirtioGpuDevice {
                         crate::pci::serial_debug("; resyncing\n");
                     }
                     if let Some(q) = self.queues[0].as_mut() { q.last_used_idx = idx; }
+                    CTRLQ_LAST_USED.store(idx as u32, core::sync::atomic::Ordering::Release);
                     break;
                 }
             };
@@ -1438,6 +1672,7 @@ impl VirtioGpuDevice {
             };
             if let Some(q) = self.queues[0].as_mut() {
                 q.last_used_idx = q.last_used_idx.wrapping_add(1);
+                CTRLQ_LAST_USED.store(q.last_used_idx as u32, core::sync::atomic::Ordering::Release);
             }
             if e.fence_id != 0 {
                 self.fence_complete(e.fence_id);
@@ -1465,6 +1700,7 @@ impl VirtioGpuDevice {
                 if let Some(slot) = self.inflight.get_mut(head) {
                     if let Some(s) = slot.as_mut() { s.done = true; s.resp_type = resp_type; }
                 }
+                sync_chain_done(head);
                 continue;
             }
             // Asynchronous: nobody reads the reply, so a refusal is only ever
@@ -1574,6 +1810,9 @@ impl VirtioGpuDevice {
             let resp_idx = q.add_desc(resp_phys as u64, resp_capacity as u32, VIRTQ_DESC_F_WRITE);
             (*q.desc.add(last as usize)).next = resp_idx;
 
+            if sync && (head_idx as usize) < CTRLQ_MAX {
+                SYNC_DONE[head_idx as usize].store(false, core::sync::atomic::Ordering::SeqCst);
+            }
             self.inflight[head_idx as usize] = Some(Inflight {
                 req_phys, req_order, pay_phys, pay_order, resp_phys, resp_order, resp_capacity,
                 fence_id, hdr_type, submitted_us, sync, done: false, resp_type: 0,
@@ -1602,7 +1841,7 @@ impl VirtioGpuDevice {
         let t0 = if stat { crate::snd::monotonic_us() } else { 0 };
         CTRLQ_ROOM_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let window = SpinWindow::new();
-        let wait = CtrlqWait::new(&window);
+        let wait = CtrlqWait::new(&window, None);
         let mut iter = 0u64;
         let mut ok = false;
         while iter < CTRLQ_WAIT_ITERS {
@@ -1648,7 +1887,9 @@ impl VirtioGpuDevice {
         Ok(fence)
     }
 
-    /// Submit one control-queue command and wait for the host's reply.
+    /// Enqueue one reply-needing control-queue command; the first half of a
+    /// synchronous `submit`. Returns the chain's head descriptor and the
+    /// command type.
     ///
     /// `head` is the command struct (always beginning with a `VirtioGpuCtrlHdr`).
     /// `payload` is optional trailing data that upstream places in a descriptor
@@ -1656,19 +1897,13 @@ impl VirtioGpuDevice {
     /// `virtio_gpu_mem_entry` array works this way. `resp_capacity` sizes the
     /// device-writable response buffer. None of the three buffers is capped at
     /// one page: each is a physically contiguous buddy run sized to its content.
-    ///
-    /// The wait is a spin with the tick let through (`SpinWindow`), bounded by
-    /// `CTRLQ_WAIT_ITERS`; other chains completing meanwhile are reaped along
-    /// the way. On timeout the chain is left in flight — the host may still
-    /// DMA into it — but is re-tagged asynchronous, so if the device ever does
-    /// answer, the descriptors and pages come back.
-    fn submit(
+    fn submit_begin(
         &mut self,
         head: &[u8],
         payload: Option<&[u8]>,
         resp_capacity: usize,
         fenced: bool,
-    ) -> Result<Vec<u8>, ()> {
+    ) -> Result<(u16, u32), ()> {
         const HDR_LEN: usize = core::mem::size_of::<VirtioGpuCtrlHdr>();
         if head.len() < HDR_LEN { return Err(()); }
         let payload = payload.unwrap_or(&[]);
@@ -1678,21 +1913,19 @@ impl VirtioGpuDevice {
         let hdr_type = u32::from_le_bytes(head[0..4].try_into().unwrap_or([0; 4]));
         let (head_idx, _fence) = self.enqueue(head, payload, resp_capacity, fenced, true)?;
         CTRLQ_SYNC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Ok((head_idx, hdr_type))
+    }
 
-        let stat = crate::drm_device_interface::DRM_STATS;
-        let t0 = if stat { crate::snd::monotonic_us() } else { 0 };
-        let window = SpinWindow::new();
-        let wait = CtrlqWait::new(&window);
-        let mut iter = 0u64;
-        let mut done = false;
-        while iter < CTRLQ_WAIT_ITERS {
-            if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
-            if self.inflight[head_idx as usize].map(|e| e.done).unwrap_or(false) { done = true; break; }
-            if !wait.step(&window, iter) { break; }
-            iter += 1;
-        }
-        drop(window);
-        if stat {
+    /// Second half of a synchronous `submit`: account the wait that began at
+    /// `t0`, then hand back the reply and release the chain — or, if it never
+    /// completed, leave it in flight re-tagged asynchronous (the host may still
+    /// DMA into it; if it ever answers, the reaper returns descriptors and
+    /// pages).
+    fn submit_finish(&mut self, head_idx: u16, done: bool, hdr_type: u32, t0: u64) -> Result<Vec<u8>, ()> {
+        // A completion that landed between the wait giving up and this call.
+        let done = done || self.inflight.get(head_idx as usize)
+            .and_then(|e| e.as_ref()).map(|e| e.sync && e.done).unwrap_or(false);
+        if crate::drm_device_interface::DRM_STATS {
             use core::sync::atomic::Ordering::Relaxed;
             let dt = crate::snd::monotonic_us().wrapping_sub(t0);
             CTRLQ_SPIN_US.fetch_add(dt, Relaxed);
@@ -1733,41 +1966,52 @@ impl VirtioGpuDevice {
         Ok(out)
     }
 
-    /// `submit` + check that the host answered with a success response type.
-    /// Returns the full response bytes so callers can read result payloads.
-    fn submit_checked(
+    /// Submit one control-queue command and wait for the host's reply with
+    /// `VIRTIO_GPU` HELD — for callers that only have `&mut self` (device
+    /// init, the boot console, the cursor). Everything reached through a DRM
+    /// ioctl goes through `GpuLocked::submit` instead, which drops the lock
+    /// for the wait. `GpuSync::submit` on a bare device lands here.
+    ///
+    /// The wait is a spin with the tick let through (`SpinWindow`), then a
+    /// park when an interrupt is armed (`CtrlqWait`), bounded by
+    /// `CTRLQ_WAIT_ITERS`; other chains completing meanwhile are reaped along
+    /// the way.
+    fn submit_locked(
         &mut self,
         head: &[u8],
         payload: Option<&[u8]>,
         resp_capacity: usize,
         fenced: bool,
-        expect: u32,
     ) -> Result<Vec<u8>, ()> {
-        let resp = self.submit(head, payload, resp_capacity, fenced)?;
-        let ty = u32::from_le_bytes(resp.get(0..4).ok_or(())?.try_into().map_err(|_| ())?);
-        if ty != expect && ty != VIRTIO_GPU_RESP_OK_NODATA {
-            let cmd = u32::from_le_bytes(head[0..4].try_into().unwrap_or([0; 4]));
-            crate::pci::serial_debug("[GPU] cmd ");
-            crate::pci::serial_debug_hex(cmd);
-            crate::pci::serial_debug(" failed, resp=");
-            crate::pci::serial_debug_hex(ty);
-            crate::pci::serial_debug("\n");
-            return Err(());
+        let (head_idx, hdr_type) = self.submit_begin(head, payload, resp_capacity, fenced)?;
+        let t0 = crate::snd::monotonic_us();
+        let window = SpinWindow::new();
+        let wait = CtrlqWait::new(&window, Some(head_idx));
+        let mut iter = 0u64;
+        let mut done = false;
+        while iter < CTRLQ_WAIT_ITERS {
+            if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
+            if self.inflight[head_idx as usize].map(|e| e.done).unwrap_or(false) { done = true; break; }
+            if !wait.step(&window, iter) { break; }
+            iter += 1;
         }
-        Ok(resp)
+        let parks = wait.parks.get();
+        drop(wait);
+        drop(window);
+        if crate::drm_device_interface::DRM_STATS {
+            let dt = crate::snd::monotonic_us().wrapping_sub(t0);
+            if dt >= 1000 {
+                mm::gap2::s("[CTRLQ-SLOW] locked cmd="); mm::gap2::h(hdr_type as usize);
+                mm::gap2::kv(" dt_us=", dt as usize);
+                mm::gap2::kv(" parks=", parks as usize);
+                mm::gap2::kv(" pid=", sched::current_pid() as usize);
+                mm::gap2::nl();
+            }
+        }
+        self.submit_finish(head_idx, done, hdr_type, t0)
     }
 
-    fn send_command_raw(&mut self, cmd_data: &[u8]) -> Result<(), ()> {
-        let resp = self.submit(cmd_data, None, 4096, false)?;
-        let ty = u32::from_le_bytes(resp.get(0..4).ok_or(())?.try_into().map_err(|_| ())?);
-        if ty != VIRTIO_GPU_RESP_OK_NODATA && ty != VIRTIO_GPU_RESP_OK_DISPLAY_INFO {
-            crate::pci::rdebug("[GPU] Command failed with resp ");
-            crate::pci::rdebug_hex(ty);
-            crate::pci::rdebug("\n");
-            return Err(());
-        }
-        Ok(())
-    }
+
 
     /// Fire-and-forget counterpart of `send_command_raw`: true once the chain
     /// is kicked. A host refusal surfaces in `ctrlq_reap`'s log, not here.
@@ -2040,77 +2284,9 @@ impl VirtioGpuDevice {
         }
     }
 
-    pub fn create_resource_2d(&mut self, resource_id: u32, width: u32, height: u32) -> bool {
-        let cmd = VirtioGpuResourceCreate2d {
-            hdr: VirtioGpuCtrlHdr {
-                type_: VirtioGpuCmd::ResourceCreate2d as u32,
-                flags: 0, fence_id: 0, ctx_id: 0, padding: 0,
-            },
-            resource_id,
-            format: 1, // VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
-            width,
-            height,
-        };
-        let data = unsafe { core::slice::from_raw_parts(&cmd as *const _ as *const u8, core::mem::size_of::<VirtioGpuResourceCreate2d>()) };
-        self.send_command_raw(data).is_ok()
-    }
 
-    pub fn create_resource_3d(&mut self, resource_id: u32, width: u32, height: u32, format: u32) -> bool {
-        // Back-compat shim for callers with only 2D geometry to offer.
-        self.create_resource_3d_full(resource_id, 2, format, 1, width, height, 1, 1, 0, 0, 0)
-    }
 
-    /// RESOURCE_CREATE_3D with the caller's **actual** pipe parameters.
-    ///
-    /// The old entry point hardcoded `target=PIPE_TEXTURE_2D`, `bind=RENDER_TARGET`,
-    /// `depth=1`, `array_size=1` and dropped `last_level`/`nr_samples`/`flags`
-    /// on the floor. virglrenderer builds the host-side resource from exactly
-    /// these fields, so a Mesa allocation asking for anything else — a
-    /// non-render-target bind, a mip chain, an array texture — got a host
-    /// resource that did not match the guest's idea of it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_resource_3d_full(
-        &mut self, resource_id: u32, target: u32, format: u32, bind: u32,
-        width: u32, height: u32, depth: u32, array_size: u32,
-        last_level: u32, nr_samples: u32, flags: u32,
-    ) -> bool {
-        let cmd = VirtioGpuResourceCreate3d {
-            hdr: VirtioGpuCtrlHdr {
-                type_: VirtioGpuCmd::ResourceCreate3d as u32,
-                flags: 0, fence_id: 0, ctx_id: 0, padding: 0,
-            },
-            resource_id,
-            target,
-            format,
-            bind,
-            width, height, depth, array_size,
-            last_level, nr_samples, flags, padding: 0,
-        };
-        let data = unsafe { core::slice::from_raw_parts(&cmd as *const _ as *const u8, core::mem::size_of::<VirtioGpuResourceCreate3d>()) };
-        self.send_command_raw(data).is_ok()
-    }
 
-    pub fn attach_backing(&mut self, resource_id: u32, phys_addr: u64, size: u32) -> bool {
-        // ResourceAttachBacking expects:
-        // hdr (24 bytes)
-        // resource_id (4 bytes)
-        // nr_entries (4 bytes)
-        // entries[]: { addr (8 bytes), length (4 bytes), padding (4 bytes) }
-        let mut buf = [0u8; 48];
-        let hdr = VirtioGpuCtrlHdr {
-            type_: VirtioGpuCmd::ResourceAttachBacking as u32,
-            flags: 0, fence_id: 0, ctx_id: 0, padding: 0,
-        };
-        unsafe {
-            core::ptr::write_unaligned(buf.as_mut_ptr() as *mut VirtioGpuCtrlHdr, hdr);
-            core::ptr::write_unaligned(buf.as_mut_ptr().add(24) as *mut u32, resource_id);
-            core::ptr::write_unaligned(buf.as_mut_ptr().add(28) as *mut u32, 1); // nr_entries
-            core::ptr::write_unaligned(buf.as_mut_ptr().add(32) as *mut u64, phys_addr);
-            core::ptr::write_unaligned(buf.as_mut_ptr().add(40) as *mut u32, size);
-            core::ptr::write_unaligned(buf.as_mut_ptr().add(44) as *mut u32, 0); // padding
-        }
-        self.send_command_raw(&buf).is_ok()
-    }
 
     pub fn set_scanout(&mut self, resource_id: u32, width: u32, height: u32) -> bool {
         self.scanout_w = width;
@@ -2426,152 +2602,10 @@ impl VirtioGpuDevice {
         }
     }
 
-    /// GET_CAPSET_INFO for `capset_index`.  Returns
-    /// `(capset_id, capset_max_version, capset_max_size)`.
-    ///
-    /// This is a *different command* from GET_CAPSET (0x0108 vs 0x0109); the two
-    /// were previously conflated under a single wrong opcode.  The index is a
-    /// slot number in `[0, num_capsets)`, not a capset id — the id is what comes
-    /// back in the response.
-    pub fn get_capset_info(&mut self, capset_index: u32) -> Result<(u32, u32, u32), ()> {
-        #[repr(C, packed)]
-        struct GetCapsetInfo {
-            hdr: VirtioGpuCtrlHdr,
-            capset_index: u32,
-            padding: u32,
-        }
-        let cmd = GetCapsetInfo {
-            hdr: self.hdr_for(VirtioGpuCmd::GetCapsetInfo, 0),
-            capset_index,
-            padding: 0,
-        };
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &cmd as *const _ as *const u8,
-                core::mem::size_of::<GetCapsetInfo>(),
-            )
-        };
-        // virtio_gpu_resp_capset_info: hdr(24) + id + max_version + max_size + pad.
-        let resp = self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_CAPSET_INFO)?;
-        let rd = |o: usize| -> Result<u32, ()> {
-            Ok(u32::from_le_bytes(
-                resp.get(o..o + 4).ok_or(())?.try_into().map_err(|_| ())?,
-            ))
-        };
-        Ok((rd(24)?, rd(28)?, rd(32)?))
-    }
 
-    /// GET_CAPSET: fetch the host's capability blob for `capset_id`.
-    ///
-    /// The response is `virtio_gpu_resp_capset` — a 24-byte header followed by
-    /// `max_size` bytes of opaque capset data.  `max_size` comes from
-    /// GET_CAPSET_INFO and is routinely far larger than one page, which is why
-    /// the response buffer here is sized rather than fixed.
-    pub fn get_capset(&mut self, capset_id: u32, capset_version: u32, max_size: usize) -> Result<Vec<u8>, ()> {
-        #[repr(C, packed)]
-        struct GetCapset {
-            hdr: VirtioGpuCtrlHdr,
-            capset_id: u32,
-            capset_version: u32,
-        }
-        let cmd = GetCapset {
-            hdr: self.hdr_for(VirtioGpuCmd::GetCapset, 0),
-            capset_id,
-            capset_version,
-        };
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &cmd as *const _ as *const u8,
-                core::mem::size_of::<GetCapset>(),
-            )
-        };
-        let cap = 24 + max_size;
-        let resp = self.submit_checked(bytes, None, cap, false, VIRTIO_GPU_RESP_OK_CAPSET)?;
-        Ok(resp.get(24..24 + max_size).ok_or(())?.to_vec())
-    }
 
-    /// Walk the host's capset table looking for `capset_id`, returning
-    /// `(max_version, max_size)`.
-    ///
-    /// The table is indexed by slot, not by id, so finding Venus means issuing
-    /// GET_CAPSET_INFO for each of `num_capsets` slots and comparing the id that
-    /// comes back.  A `None` here is itself the answer to "does the host's
-    /// virglrenderer expose Venus at all".
-    pub fn find_capset(&mut self, capset_id: u32) -> Option<(u32, u32)> {
-        let n = self.num_capsets();
-        for i in 0..n.min(16) {
-            if let Ok((id, max_version, max_size)) = self.get_capset_info(i) {
-                if id == capset_id {
-                    return Some((max_version, max_size));
-                }
-            }
-        }
-        None
-    }
 
-    /// CTX_CREATE with an explicit `context_init` (the capset id in its low
-    /// byte) — this is what selects Venus rather than the default virgl context.
-    /// Returns the new context id.
-    pub fn ctx_create(&mut self, capset_id: u32, debug_name: &str) -> Result<u32, ()> {
-        // Gate on what a context of THIS capset actually needs, not on the
-        // Venus superset. Classic virgl (capset 1/2) needs neither host-visible
-        // blob resources nor, for the default context, CONTEXT_INIT — and
-        // `virtio-vga-gl` offers exactly VIRGL + CONTEXT_INIT with
-        // RESOURCE_BLOB=0. Gating all of 3D on `venus_available()` refused
-        // every context on that device, so a host advertising working virgl
-        // (SUPPORTED_CAPSET_IDs = 0b110) could never be used at all.
-        // Blob remains gated where it belongs, in `resource_create_blob`.
-        if !self.has_feature(VIRTIO_GPU_F_VIRGL) {
-            crate::pci::serial_debug("[GPU] ctx_create refused: host lacks VIRTIO_GPU_F_VIRGL\n");
-            return Err(());
-        }
-        // context_init carries the capset selector; without the feature the
-        // host ignores the field and hands back its default (virgl) context,
-        // so asking for a *specific* capset is the only case that needs it.
-        if capset_id != 0 && !self.has_feature(VIRTIO_GPU_F_CONTEXT_INIT) {
-            crate::pci::serial_debug("[GPU] ctx_create refused: capset requested but no CONTEXT_INIT\n");
-            return Err(());
-        }
-        #[repr(C, packed)]
-        struct CtxCreate {
-            hdr: VirtioGpuCtrlHdr,
-            nlen: u32,
-            context_init: u32,
-            debug_name: [u8; 64],
-        }
-        let ctx_id = self.next_ctx_id;
-        let mut name = [0u8; 64];
-        let n = debug_name.len().min(63);
-        name[..n].copy_from_slice(&debug_name.as_bytes()[..n]);
 
-        let cmd = CtxCreate {
-            hdr: self.hdr_for(VirtioGpuCmd::CtxCreate, ctx_id),
-            nlen: n as u32,
-            context_init: capset_id & VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK,
-            debug_name: name,
-        };
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &cmd as *const _ as *const u8,
-                core::mem::size_of::<CtxCreate>(),
-            )
-        };
-        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)?;
-        self.next_ctx_id += 1;
-        Ok(ctx_id)
-    }
-
-    pub fn ctx_destroy(&mut self, ctx_id: u32) -> bool {
-        let hdr = self.hdr_for(VirtioGpuCmd::CtxDestroy, ctx_id);
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &hdr as *const _ as *const u8,
-                core::mem::size_of::<VirtioGpuCtrlHdr>(),
-            )
-        };
-        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
-            .is_ok()
-    }
 
     fn ctx_resource(&mut self, cmd: VirtioGpuCmd, ctx_id: u32, resource_id: u32) -> bool {
         #[repr(C, packed)]
@@ -2604,192 +2638,9 @@ impl VirtioGpuDevice {
         self.ctx_resource(VirtioGpuCmd::CtxDetachResource, ctx_id, resource_id)
     }
 
-    /// RESOURCE_CREATE_BLOB.
-    ///
-    /// For `VIRTIO_GPU_BLOB_MEM_GUEST` (and HOST3D_GUEST) the guest supplies the
-    /// backing pages inline as a `virtio_gpu_mem_entry` array appended to the
-    /// command; `guest_backing` is `(phys, len)`.  For `VIRTIO_GPU_BLOB_MEM_HOST3D`
-    /// the storage is host-side and the array is empty — the guest reaches it
-    /// through RESOURCE_MAP_BLOB into the shared-memory BAR window instead.
-    pub fn resource_create_blob(
-        &mut self,
-        ctx_id: u32,
-        resource_id: u32,
-        blob_mem: u32,
-        blob_flags: u32,
-        blob_id: u64,
-        size: u64,
-        guest_backing: Option<(u64, u32)>,
-    ) -> Result<(), ()> {
-        if !self.has_feature(VIRTIO_GPU_F_RESOURCE_BLOB) {
-            crate::pci::serial_debug("[GPU] resource_create_blob refused: no RESOURCE_BLOB\n");
-            return Err(());
-        }
-        #[repr(C, packed)]
-        struct CreateBlob {
-            hdr: VirtioGpuCtrlHdr,
-            resource_id: u32,
-            blob_mem: u32,
-            blob_flags: u32,
-            nr_entries: u32,
-            blob_id: u64,
-            size: u64,
-        }
-        #[repr(C, packed)]
-        struct MemEntry {
-            addr: u64,
-            length: u32,
-            padding: u32,
-        }
 
-        let (nr_entries, entries): (u32, Vec<u8>) = match guest_backing {
-            Some((phys, len)) => {
-                let e = MemEntry { addr: phys, length: len, padding: 0 };
-                let b = unsafe {
-                    core::slice::from_raw_parts(
-                        &e as *const _ as *const u8,
-                        core::mem::size_of::<MemEntry>(),
-                    )
-                }
-                .to_vec();
-                (1, b)
-            }
-            None => (0, Vec::new()),
-        };
 
-        let cmd = CreateBlob {
-            hdr: self.hdr_for(VirtioGpuCmd::ResourceCreateBlob, ctx_id),
-            resource_id,
-            blob_mem,
-            blob_flags,
-            nr_entries,
-            blob_id,
-            size,
-        };
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &cmd as *const _ as *const u8,
-                core::mem::size_of::<CreateBlob>(),
-            )
-        };
-        let payload = if entries.is_empty() { None } else { Some(&entries[..]) };
-        self.submit_checked(bytes, payload, 64, false, VIRTIO_GPU_RESP_OK_NODATA)?;
-        Ok(())
-    }
 
-    /// RESOURCE_MAP_BLOB: ask the host to expose `resource_id` at `offset` inside
-    /// the shared-memory BAR window.  Returns the response's `map_info` (cache
-    /// type, `VIRTIO_GPU_MAP_CACHE_*`).  Only meaningful for host-side blob
-    /// memory.
-    ///
-    /// `struct virtio_gpu_resource_map_blob { hdr; le32 resource_id; le32 padding;
-    /// le64 offset; }` and `struct virtio_gpu_resp_map_info { hdr; le32 map_info;
-    /// le32 padding; }` — the header carries no context id (upstream's
-    /// `virtio_gpu_cmd_map` leaves it zero), so the resource is named globally.
-    ///
-    /// The response type is checked STRICTLY against OK_MAP_INFO rather than
-    /// through `submit_checked` alone: that helper also accepts OK_NODATA (many
-    /// commands legitimately answer with it), and an OK_NODATA here would leave
-    /// `map_info` reading the response buffer's zero fill — i.e. a host that
-    /// answered the wrong shape would look like a successful map with cache type
-    /// NONE.  This is the one command whose entire value is in its payload.
-    pub fn resource_map_blob(&mut self, resource_id: u32, offset: u64) -> Result<u32, ()> {
-        // A map has nowhere to land without the window the host advertises it in.
-        let window = match self.shmem {
-            Some(r) if r.len != 0 => r,
-            _ => {
-                crate::pci::serial_debug(
-                    "[GPU] resource_map_blob refused: no host-visible shmem region\n",
-                );
-                return Err(());
-            }
-        };
-        if offset >= window.len {
-            crate::pci::serial_debug("[GPU] resource_map_blob refused: offset past window\n");
-            return Err(());
-        }
-        #[repr(C, packed)]
-        struct MapBlob {
-            hdr: VirtioGpuCtrlHdr,
-            resource_id: u32,
-            padding: u32,
-            offset: u64,
-        }
-        let cmd = MapBlob {
-            hdr: self.hdr_for(VirtioGpuCmd::ResourceMapBlob, 0),
-            resource_id,
-            padding: 0,
-            offset,
-        };
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &cmd as *const _ as *const u8,
-                core::mem::size_of::<MapBlob>(),
-            )
-        };
-        let resp = self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_MAP_INFO)?;
-        let ty = u32::from_le_bytes(resp.get(0..4).ok_or(())?.try_into().map_err(|_| ())?);
-        if ty != VIRTIO_GPU_RESP_OK_MAP_INFO {
-            crate::pci::serial_debug("[GPU] MAP_BLOB: wrong response type resp=");
-            crate::pci::serial_debug_hex(ty);
-            crate::pci::serial_debug("\n");
-            return Err(());
-        }
-        Ok(u32::from_le_bytes(
-            resp.get(24..28).ok_or(())?.try_into().map_err(|_| ())?,
-        ))
-    }
-
-    /// RESOURCE_UNREF — drop a host-side resource of any kind.
-    pub fn resource_unref(&mut self, resource_id: u32) -> bool {
-        #[repr(C, packed)]
-        struct Unref {
-            hdr: VirtioGpuCtrlHdr,
-            resource_id: u32,
-            padding: u32,
-        }
-        let cmd = Unref {
-            hdr: self.hdr_for(VirtioGpuCmd::ResourceUnref, 0),
-            resource_id,
-            padding: 0,
-        };
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &cmd as *const _ as *const u8,
-                core::mem::size_of::<Unref>(),
-            )
-        };
-        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
-            .is_ok()
-    }
-
-    /// RESOURCE_UNMAP_BLOB — retract a host-visible blob from the shared-memory
-    /// window.  `struct virtio_gpu_resource_unmap_blob { hdr; le32 resource_id;
-    /// le32 padding; }`, answered with a plain OK_NODATA.  Must precede
-    /// RESOURCE_UNREF for a mapped blob, and must precede any re-map of the same
-    /// resource: the host tracks one window sub-region per resource and refuses a
-    /// second map of an already-mapped one.
-    pub fn resource_unmap_blob(&mut self, resource_id: u32) -> bool {
-        #[repr(C, packed)]
-        struct UnmapBlob {
-            hdr: VirtioGpuCtrlHdr,
-            resource_id: u32,
-            padding: u32,
-        }
-        let cmd = UnmapBlob {
-            hdr: self.hdr_for(VirtioGpuCmd::ResourceUnmapBlob, 0),
-            resource_id,
-            padding: 0,
-        };
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &cmd as *const _ as *const u8,
-                core::mem::size_of::<UnmapBlob>(),
-            )
-        };
-        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
-            .is_ok()
-    }
 
     /// SUBMIT_3D: hand `cmds` (an opaque, context-type-specific command stream —
     /// for a Venus context, Venus wire-protocol bytes) to the host.
@@ -2905,6 +2756,534 @@ impl VirtioGpuDevice {
             }
         }
         None
+    }
+}
+
+/// The reply-needing (synchronous) control-queue commands, written once for
+/// two ways of holding the device:
+///
+/// * a bare `&mut VirtioGpuDevice` (init, boot console, cursor) waits with
+///   `VIRTIO_GPU` held (`submit_locked`), as it always did;
+/// * a `GpuLocked` handle (`lock_gpu`, every DRM-ioctl path) enqueues under the
+///   lock, RELEASES it for the host round trip, and retakes it to collect the
+///   reply, so one slow command no longer stalls every other GPU user.
+///
+/// Callers of the second kind must not rely on the device staying untouched
+/// across one of these calls: other tasks may submit in between. Per-call
+/// state that must be unique (a context id) is reserved before the wait.
+pub trait GpuSync {
+    fn dev(&mut self) -> &mut VirtioGpuDevice;
+    /// Submit one command and wait for its reply.
+    fn submit(&mut self, head: &[u8], payload: Option<&[u8]>, resp_capacity: usize, fenced: bool)
+        -> Result<Vec<u8>, ()>;
+
+    /// `submit` + check that the host answered with a success response type.
+    /// Returns the full response bytes so callers can read result payloads.
+    fn submit_checked(
+        &mut self,
+        head: &[u8],
+        payload: Option<&[u8]>,
+        resp_capacity: usize,
+        fenced: bool,
+        expect: u32,
+    ) -> Result<Vec<u8>, ()> {
+        let resp = self.submit(head, payload, resp_capacity, fenced)?;
+        let ty = u32::from_le_bytes(resp.get(0..4).ok_or(())?.try_into().map_err(|_| ())?);
+        if ty != expect && ty != VIRTIO_GPU_RESP_OK_NODATA {
+            let cmd = u32::from_le_bytes(head[0..4].try_into().unwrap_or([0; 4]));
+            crate::pci::serial_debug("[GPU] cmd ");
+            crate::pci::serial_debug_hex(cmd);
+            crate::pci::serial_debug(" failed, resp=");
+            crate::pci::serial_debug_hex(ty);
+            crate::pci::serial_debug("\n");
+            return Err(());
+        }
+        Ok(resp)
+    }
+
+    fn send_command_raw(&mut self, cmd_data: &[u8]) -> Result<(), ()> {
+        let resp = self.submit(cmd_data, None, 4096, false)?;
+        let ty = u32::from_le_bytes(resp.get(0..4).ok_or(())?.try_into().map_err(|_| ())?);
+        if ty != VIRTIO_GPU_RESP_OK_NODATA && ty != VIRTIO_GPU_RESP_OK_DISPLAY_INFO {
+            crate::pci::rdebug("[GPU] Command failed with resp ");
+            crate::pci::rdebug_hex(ty);
+            crate::pci::rdebug("\n");
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn create_resource_2d(&mut self, resource_id: u32, width: u32, height: u32) -> bool {
+        let cmd = VirtioGpuResourceCreate2d {
+            hdr: VirtioGpuCtrlHdr {
+                type_: VirtioGpuCmd::ResourceCreate2d as u32,
+                flags: 0, fence_id: 0, ctx_id: 0, padding: 0,
+            },
+            resource_id,
+            format: 1, // VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
+            width,
+            height,
+        };
+        let data = unsafe { core::slice::from_raw_parts(&cmd as *const _ as *const u8, core::mem::size_of::<VirtioGpuResourceCreate2d>()) };
+        self.send_command_raw(data).is_ok()
+    }
+
+    fn create_resource_3d(&mut self, resource_id: u32, width: u32, height: u32, format: u32) -> bool {
+        // Back-compat shim for callers with only 2D geometry to offer.
+        self.create_resource_3d_full(resource_id, 2, format, 1, width, height, 1, 1, 0, 0, 0)
+    }
+
+    /// RESOURCE_CREATE_3D with the caller's **actual** pipe parameters.
+    ///
+    /// The old entry point hardcoded `target=PIPE_TEXTURE_2D`, `bind=RENDER_TARGET`,
+    /// `depth=1`, `array_size=1` and dropped `last_level`/`nr_samples`/`flags`
+    /// on the floor. virglrenderer builds the host-side resource from exactly
+    /// these fields, so a Mesa allocation asking for anything else — a
+    /// non-render-target bind, a mip chain, an array texture — got a host
+    /// resource that did not match the guest's idea of it.
+    #[allow(clippy::too_many_arguments)]
+    fn create_resource_3d_full(
+        &mut self, resource_id: u32, target: u32, format: u32, bind: u32,
+        width: u32, height: u32, depth: u32, array_size: u32,
+        last_level: u32, nr_samples: u32, flags: u32,
+    ) -> bool {
+        let cmd = VirtioGpuResourceCreate3d {
+            hdr: VirtioGpuCtrlHdr {
+                type_: VirtioGpuCmd::ResourceCreate3d as u32,
+                flags: 0, fence_id: 0, ctx_id: 0, padding: 0,
+            },
+            resource_id,
+            target,
+            format,
+            bind,
+            width, height, depth, array_size,
+            last_level, nr_samples, flags, padding: 0,
+        };
+        let data = unsafe { core::slice::from_raw_parts(&cmd as *const _ as *const u8, core::mem::size_of::<VirtioGpuResourceCreate3d>()) };
+        self.send_command_raw(data).is_ok()
+    }
+
+    fn attach_backing(&mut self, resource_id: u32, phys_addr: u64, size: u32) -> bool {
+        // ResourceAttachBacking expects:
+        // hdr (24 bytes)
+        // resource_id (4 bytes)
+        // nr_entries (4 bytes)
+        // entries[]: { addr (8 bytes), length (4 bytes), padding (4 bytes) }
+        let mut buf = [0u8; 48];
+        let hdr = VirtioGpuCtrlHdr {
+            type_: VirtioGpuCmd::ResourceAttachBacking as u32,
+            flags: 0, fence_id: 0, ctx_id: 0, padding: 0,
+        };
+        unsafe {
+            core::ptr::write_unaligned(buf.as_mut_ptr() as *mut VirtioGpuCtrlHdr, hdr);
+            core::ptr::write_unaligned(buf.as_mut_ptr().add(24) as *mut u32, resource_id);
+            core::ptr::write_unaligned(buf.as_mut_ptr().add(28) as *mut u32, 1); // nr_entries
+            core::ptr::write_unaligned(buf.as_mut_ptr().add(32) as *mut u64, phys_addr);
+            core::ptr::write_unaligned(buf.as_mut_ptr().add(40) as *mut u32, size);
+            core::ptr::write_unaligned(buf.as_mut_ptr().add(44) as *mut u32, 0); // padding
+        }
+        self.send_command_raw(&buf).is_ok()
+    }
+
+    /// GET_CAPSET_INFO for `capset_index`.  Returns
+    /// `(capset_id, capset_max_version, capset_max_size)`.
+    ///
+    /// This is a *different command* from GET_CAPSET (0x0108 vs 0x0109); the two
+    /// were previously conflated under a single wrong opcode.  The index is a
+    /// slot number in `[0, num_capsets)`, not a capset id — the id is what comes
+    /// back in the response.
+    fn get_capset_info(&mut self, capset_index: u32) -> Result<(u32, u32, u32), ()> {
+        #[repr(C, packed)]
+        struct GetCapsetInfo {
+            hdr: VirtioGpuCtrlHdr,
+            capset_index: u32,
+            padding: u32,
+        }
+        let cmd = GetCapsetInfo {
+            hdr: self.dev().hdr_for(VirtioGpuCmd::GetCapsetInfo, 0),
+            capset_index,
+            padding: 0,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<GetCapsetInfo>(),
+            )
+        };
+        // virtio_gpu_resp_capset_info: hdr(24) + id + max_version + max_size + pad.
+        let resp = self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_CAPSET_INFO)?;
+        let rd = |o: usize| -> Result<u32, ()> {
+            Ok(u32::from_le_bytes(
+                resp.get(o..o + 4).ok_or(())?.try_into().map_err(|_| ())?,
+            ))
+        };
+        Ok((rd(24)?, rd(28)?, rd(32)?))
+    }
+
+    /// GET_CAPSET: fetch the host's capability blob for `capset_id`.
+    ///
+    /// The response is `virtio_gpu_resp_capset` — a 24-byte header followed by
+    /// `max_size` bytes of opaque capset data.  `max_size` comes from
+    /// GET_CAPSET_INFO and is routinely far larger than one page, which is why
+    /// the response buffer here is sized rather than fixed.
+    fn get_capset(&mut self, capset_id: u32, capset_version: u32, max_size: usize) -> Result<Vec<u8>, ()> {
+        #[repr(C, packed)]
+        struct GetCapset {
+            hdr: VirtioGpuCtrlHdr,
+            capset_id: u32,
+            capset_version: u32,
+        }
+        let cmd = GetCapset {
+            hdr: self.dev().hdr_for(VirtioGpuCmd::GetCapset, 0),
+            capset_id,
+            capset_version,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<GetCapset>(),
+            )
+        };
+        let cap = 24 + max_size;
+        let resp = self.submit_checked(bytes, None, cap, false, VIRTIO_GPU_RESP_OK_CAPSET)?;
+        Ok(resp.get(24..24 + max_size).ok_or(())?.to_vec())
+    }
+
+    /// CTX_CREATE with an explicit `context_init` (the capset id in its low
+    /// byte) — this is what selects Venus rather than the default virgl context.
+    /// Returns the new context id.
+    fn ctx_create(&mut self, capset_id: u32, debug_name: &str) -> Result<u32, ()> {
+        // Gate on what a context of THIS capset actually needs, not on the
+        // Venus superset. Classic virgl (capset 1/2) needs neither host-visible
+        // blob resources nor, for the default context, CONTEXT_INIT — and
+        // `virtio-vga-gl` offers exactly VIRGL + CONTEXT_INIT with
+        // RESOURCE_BLOB=0. Gating all of 3D on `venus_available()` refused
+        // every context on that device, so a host advertising working virgl
+        // (SUPPORTED_CAPSET_IDs = 0b110) could never be used at all.
+        // Blob remains gated where it belongs, in `resource_create_blob`.
+        if !self.dev().has_feature(VIRTIO_GPU_F_VIRGL) {
+            crate::pci::serial_debug("[GPU] ctx_create refused: host lacks VIRTIO_GPU_F_VIRGL\n");
+            return Err(());
+        }
+        // context_init carries the capset selector; without the feature the
+        // host ignores the field and hands back its default (virgl) context,
+        // so asking for a *specific* capset is the only case that needs it.
+        if capset_id != 0 && !self.dev().has_feature(VIRTIO_GPU_F_CONTEXT_INIT) {
+            crate::pci::serial_debug("[GPU] ctx_create refused: capset requested but no CONTEXT_INIT\n");
+            return Err(());
+        }
+        #[repr(C, packed)]
+        struct CtxCreate {
+            hdr: VirtioGpuCtrlHdr,
+            nlen: u32,
+            context_init: u32,
+            debug_name: [u8; 64],
+        }
+        // Reserved before the round trip: a `GpuLocked` wait releases the
+        // device lock, and a concurrent create must not pick the same id. A
+        // failed create leaks the id, which is harmless.
+        let ctx_id = {
+            let d = self.dev();
+            let id = d.next_ctx_id;
+            d.next_ctx_id += 1;
+            id
+        };
+        let mut name = [0u8; 64];
+        let n = debug_name.len().min(63);
+        name[..n].copy_from_slice(&debug_name.as_bytes()[..n]);
+
+        let cmd = CtxCreate {
+            hdr: self.dev().hdr_for(VirtioGpuCmd::CtxCreate, ctx_id),
+            nlen: n as u32,
+            context_init: capset_id & VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK,
+            debug_name: name,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<CtxCreate>(),
+            )
+        };
+        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)?;
+        Ok(ctx_id)
+    }
+
+    fn ctx_destroy(&mut self, ctx_id: u32) -> bool {
+        let hdr = self.dev().hdr_for(VirtioGpuCmd::CtxDestroy, ctx_id);
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &hdr as *const _ as *const u8,
+                core::mem::size_of::<VirtioGpuCtrlHdr>(),
+            )
+        };
+        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
+            .is_ok()
+    }
+
+    /// RESOURCE_CREATE_BLOB.
+    ///
+    /// For `VIRTIO_GPU_BLOB_MEM_GUEST` (and HOST3D_GUEST) the guest supplies the
+    /// backing pages inline as a `virtio_gpu_mem_entry` array appended to the
+    /// command; `guest_backing` is `(phys, len)`.  For `VIRTIO_GPU_BLOB_MEM_HOST3D`
+    /// the storage is host-side and the array is empty — the guest reaches it
+    /// through RESOURCE_MAP_BLOB into the shared-memory BAR window instead.
+    fn resource_create_blob(
+        &mut self,
+        ctx_id: u32,
+        resource_id: u32,
+        blob_mem: u32,
+        blob_flags: u32,
+        blob_id: u64,
+        size: u64,
+        guest_backing: Option<(u64, u32)>,
+    ) -> Result<(), ()> {
+        if !self.dev().has_feature(VIRTIO_GPU_F_RESOURCE_BLOB) {
+            crate::pci::serial_debug("[GPU] resource_create_blob refused: no RESOURCE_BLOB\n");
+            return Err(());
+        }
+        #[repr(C, packed)]
+        struct CreateBlob {
+            hdr: VirtioGpuCtrlHdr,
+            resource_id: u32,
+            blob_mem: u32,
+            blob_flags: u32,
+            nr_entries: u32,
+            blob_id: u64,
+            size: u64,
+        }
+        #[repr(C, packed)]
+        struct MemEntry {
+            addr: u64,
+            length: u32,
+            padding: u32,
+        }
+
+        let (nr_entries, entries): (u32, Vec<u8>) = match guest_backing {
+            Some((phys, len)) => {
+                let e = MemEntry { addr: phys, length: len, padding: 0 };
+                let b = unsafe {
+                    core::slice::from_raw_parts(
+                        &e as *const _ as *const u8,
+                        core::mem::size_of::<MemEntry>(),
+                    )
+                }
+                .to_vec();
+                (1, b)
+            }
+            None => (0, Vec::new()),
+        };
+
+        let cmd = CreateBlob {
+            hdr: self.dev().hdr_for(VirtioGpuCmd::ResourceCreateBlob, ctx_id),
+            resource_id,
+            blob_mem,
+            blob_flags,
+            nr_entries,
+            blob_id,
+            size,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<CreateBlob>(),
+            )
+        };
+        let payload = if entries.is_empty() { None } else { Some(&entries[..]) };
+        self.submit_checked(bytes, payload, 64, false, VIRTIO_GPU_RESP_OK_NODATA)?;
+        Ok(())
+    }
+
+    /// RESOURCE_MAP_BLOB: ask the host to expose `resource_id` at `offset` inside
+    /// the shared-memory BAR window.  Returns the response's `map_info` (cache
+    /// type, `VIRTIO_GPU_MAP_CACHE_*`).  Only meaningful for host-side blob
+    /// memory.
+    ///
+    /// `struct virtio_gpu_resource_map_blob { hdr; le32 resource_id; le32 padding;
+    /// le64 offset; }` and `struct virtio_gpu_resp_map_info { hdr; le32 map_info;
+    /// le32 padding; }` — the header carries no context id (upstream's
+    /// `virtio_gpu_cmd_map` leaves it zero), so the resource is named globally.
+    ///
+    /// The response type is checked STRICTLY against OK_MAP_INFO rather than
+    /// through `submit_checked` alone: that helper also accepts OK_NODATA (many
+    /// commands legitimately answer with it), and an OK_NODATA here would leave
+    /// `map_info` reading the response buffer's zero fill — i.e. a host that
+    /// answered the wrong shape would look like a successful map with cache type
+    /// NONE.  This is the one command whose entire value is in its payload.
+    fn resource_map_blob(&mut self, resource_id: u32, offset: u64) -> Result<u32, ()> {
+        // A map has nowhere to land without the window the host advertises it in.
+        let window = match self.dev().shmem {
+            Some(r) if r.len != 0 => r,
+            _ => {
+                crate::pci::serial_debug(
+                    "[GPU] resource_map_blob refused: no host-visible shmem region\n",
+                );
+                return Err(());
+            }
+        };
+        if offset >= window.len {
+            crate::pci::serial_debug("[GPU] resource_map_blob refused: offset past window\n");
+            return Err(());
+        }
+        #[repr(C, packed)]
+        struct MapBlob {
+            hdr: VirtioGpuCtrlHdr,
+            resource_id: u32,
+            padding: u32,
+            offset: u64,
+        }
+        let cmd = MapBlob {
+            hdr: self.dev().hdr_for(VirtioGpuCmd::ResourceMapBlob, 0),
+            resource_id,
+            padding: 0,
+            offset,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<MapBlob>(),
+            )
+        };
+        let resp = self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_MAP_INFO)?;
+        let ty = u32::from_le_bytes(resp.get(0..4).ok_or(())?.try_into().map_err(|_| ())?);
+        if ty != VIRTIO_GPU_RESP_OK_MAP_INFO {
+            crate::pci::serial_debug("[GPU] MAP_BLOB: wrong response type resp=");
+            crate::pci::serial_debug_hex(ty);
+            crate::pci::serial_debug("\n");
+            return Err(());
+        }
+        Ok(u32::from_le_bytes(
+            resp.get(24..28).ok_or(())?.try_into().map_err(|_| ())?,
+        ))
+    }
+
+    /// RESOURCE_UNREF — drop a host-side resource of any kind.
+    fn resource_unref(&mut self, resource_id: u32) -> bool {
+        #[repr(C, packed)]
+        struct Unref {
+            hdr: VirtioGpuCtrlHdr,
+            resource_id: u32,
+            padding: u32,
+        }
+        let cmd = Unref {
+            hdr: self.dev().hdr_for(VirtioGpuCmd::ResourceUnref, 0),
+            resource_id,
+            padding: 0,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<Unref>(),
+            )
+        };
+        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
+            .is_ok()
+    }
+
+    /// RESOURCE_UNMAP_BLOB — retract a host-visible blob from the shared-memory
+    /// window.  `struct virtio_gpu_resource_unmap_blob { hdr; le32 resource_id;
+    /// le32 padding; }`, answered with a plain OK_NODATA.  Must precede
+    /// RESOURCE_UNREF for a mapped blob, and must precede any re-map of the same
+    /// resource: the host tracks one window sub-region per resource and refuses a
+    /// second map of an already-mapped one.
+    fn resource_unmap_blob(&mut self, resource_id: u32) -> bool {
+        #[repr(C, packed)]
+        struct UnmapBlob {
+            hdr: VirtioGpuCtrlHdr,
+            resource_id: u32,
+            padding: u32,
+        }
+        let cmd = UnmapBlob {
+            hdr: self.dev().hdr_for(VirtioGpuCmd::ResourceUnmapBlob, 0),
+            resource_id,
+            padding: 0,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &cmd as *const _ as *const u8,
+                core::mem::size_of::<UnmapBlob>(),
+            )
+        };
+        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
+            .is_ok()
+    }
+    /// Walk the host's capset table looking for `capset_id`, returning
+    /// `(max_version, max_size)`.
+    ///
+    /// The table is indexed by slot, not by id, so finding Venus means issuing
+    /// GET_CAPSET_INFO for each of `num_capsets` slots and comparing the id that
+    /// comes back.  A `None` here is itself the answer to "does the host's
+    /// virglrenderer expose Venus at all".
+    fn find_capset(&mut self, capset_id: u32) -> Option<(u32, u32)> {
+        let n = self.dev().num_capsets();
+        for i in 0..n.min(16) {
+            if let Ok((id, max_version, max_size)) = self.get_capset_info(i) {
+                if id == capset_id {
+                    return Some((max_version, max_size));
+                }
+            }
+        }
+        None
+    }
+
+}
+
+impl GpuSync for VirtioGpuDevice {
+    #[inline]
+    fn dev(&mut self) -> &mut VirtioGpuDevice { self }
+    fn submit(&mut self, head: &[u8], payload: Option<&[u8]>, resp_capacity: usize, fenced: bool)
+        -> Result<Vec<u8>, ()>
+    {
+        self.submit_locked(head, payload, resp_capacity, fenced)
+    }
+}
+
+/// `VIRTIO_GPU`, held — except across the host round trip of a synchronous
+/// command, which it waits out with the lock released (`GpuSync`). Derefs to
+/// the device for everything else. Obtain with `lock_gpu`, which returns
+/// `None` when there is no device.
+pub struct GpuLocked {
+    guard: Option<sched::lockwatch::TrackedGuard<'static, Option<VirtioGpuDevice>>>,
+}
+
+/// Lock the device for a caller that may issue synchronous commands; see
+/// `GpuLocked`.
+#[track_caller]
+pub fn lock_gpu() -> Option<GpuLocked> {
+    let g = VIRTIO_GPU.lock();
+    if g.is_none() { return None; }
+    Some(GpuLocked { guard: Some(g) })
+}
+
+impl core::ops::Deref for GpuLocked {
+    type Target = VirtioGpuDevice;
+    #[inline]
+    fn deref(&self) -> &VirtioGpuDevice {
+        // Only `GpuSync::submit` empties `guard`, and refills it before return.
+        self.guard.as_ref().and_then(|g| g.as_ref()).expect("GpuLocked: device lock not held")
+    }
+}
+impl core::ops::DerefMut for GpuLocked {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut VirtioGpuDevice {
+        self.guard.as_mut().and_then(|g| g.as_mut()).expect("GpuLocked: device lock not held")
+    }
+}
+
+impl GpuSync for GpuLocked {
+    #[inline]
+    fn dev(&mut self) -> &mut VirtioGpuDevice { self }
+    fn submit(&mut self, head: &[u8], payload: Option<&[u8]>, resp_capacity: usize, fenced: bool)
+        -> Result<Vec<u8>, ()>
+    {
+        let (head_idx, hdr_type) = self.dev().submit_begin(head, payload, resp_capacity, fenced)?;
+        let t0 = crate::snd::monotonic_us();
+        CTRLQ_UNLOCKED_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // No reference into the device survives this: `self` is borrowed
+        // mutably for the whole call, so dropping the guard is sound.
+        self.guard = None;
+        let done = wait_sync_unlocked(head_idx, hdr_type);
+        self.guard = Some(VIRTIO_GPU.lock());
+        self.dev().submit_finish(head_idx, done, hdr_type, t0)
     }
 }
 

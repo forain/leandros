@@ -15,6 +15,11 @@
 //!     limit.
 //!  9. `/bin/start-cosmic-leandros` — the one production script — carries a
 //!     `#!` line (the file is checked, not run).
+//! 10. execve from a multi-threaded process: no sibling thread may observe the
+//!     close-on-exec sweep. Linux kills the siblings (de_thread) *before*
+//!     closing cloexec fds; closing first let a tokio worker blocked on its
+//!     signal self-pipe (a SOCK_CLOEXEC socketpair) wake to EBADF and panic
+//!     "Bad read on self-pipe" whenever brush ran `exec <cmd>`.
 //!
 //! Shape as sigtest2: relibc_start_v1 entry, "<name>: PASS"/"<name>: FAIL at
 //! step N" per check, "EXECTEST: PASS"/"EXECTEST: FAIL <n>" summary, exit
@@ -78,6 +83,13 @@ extern "C" {
     pub fn kill(pid: pid_t, sig: c_int) -> c_int;
     pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> c_int;
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
+    pub fn socketpair(domain: c_int, kind: c_int, protocol: c_int, sv: *mut c_int) -> c_int;
+    pub fn pthread_create(
+        thread: *mut usize,
+        attr: *const c_void,
+        start_routine: extern "C" fn(*mut c_void) -> *mut c_void,
+        arg: *mut c_void,
+    ) -> c_int;
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -115,7 +127,10 @@ const ENVP: [*const u8; 3] = [
 ];
 
 #[no_mangle]
-pub unsafe extern "C" fn exec_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn exec_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    // Re-exec target for test 10: exit at once, touching nothing.
+    if argc > 1 && cstr_is(*argv.add(1), b"--exit0\0") { return 0; }
+
     let mut failures = 0;
 
     if !test_script_argv() { failures += 1; }
@@ -127,6 +142,7 @@ pub unsafe extern "C" fn exec_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     if !test_missing_interpreter_enoent() { failures += 1; }
     if !test_self_interpreter_eloop() { failures += 1; }
     if !test_launcher_has_shebang() { failures += 1; }
+    if !test_exec_hides_cloexec_from_siblings() { failures += 1; }
 
     puts(b"--- exectest done ---\0".as_ptr());
     if failures == 0 {
@@ -354,5 +370,97 @@ unsafe fn test_launcher_has_shebang() -> bool {
     close(fd);
     if n < 2 { return fail_at(name, 1); }
     if &head[..2] != b"#!" { return fail_at(name, 2); }
+    report(name, true)
+}
+
+// ── 10. execve with a live sibling thread: siblings die before cloexec ─────
+
+const AF_UNIX: c_int = 1;
+const SOCK_STREAM: c_int = 1;
+const SOCK_CLOEXEC: c_int = 0o2000000;
+const EINTR: c_int = 4;
+const EAGAIN: c_int = 11;
+
+unsafe fn cstr_is(p: *const u8, want: &[u8]) -> bool {
+    if p.is_null() { return false; }
+    for (i, &b) in want.iter().enumerate() {
+        if *p.add(i) != b { return false; }
+    }
+    true
+}
+
+/// (socket the watcher blocks on, report pipe write end). Written by the
+/// forked child before it creates the thread, so plain statics suffice.
+static mut WATCH_FD: c_int = -1;
+static mut REPORT_FD: c_int = -1;
+
+/// Polls a nonblocking cloexec socket nobody writes to, the way a busy tokio
+/// worker would find it: anything but EAGAIN means this thread was still
+/// running after its process's execve had begun closing cloexec fds. It
+/// reports what it saw ('0' = EOF, else the errno) and exits.
+extern "C" fn exec_watcher(_: *mut c_void) -> *mut c_void {
+    unsafe {
+        let mut b = [0u8; 1];
+        loop {
+            let n = read(WATCH_FD, b.as_mut_ptr(), 1);
+            if n < 0 {
+                let e = *__errno_location();
+                if e == EINTR || e == EAGAIN { continue; }
+            }
+            let tag = if n == 0 { b'0' } else if n < 0 { *__errno_location() as u8 } else { b'D' };
+            write(REPORT_FD, &tag, 1);
+            return core::ptr::null_mut();
+        }
+    }
+}
+
+unsafe fn test_exec_hides_cloexec_from_siblings() -> bool {
+    let name = b"exec_hides_cloexec_from_siblings\0";
+    const ROUNDS: usize = 30;
+    for _ in 0..ROUNDS {
+        let mut rp: [c_int; 2] = [0; 2];
+        if pipe(rp.as_mut_ptr()) != 0 { return fail_at(name, 1); }
+        let child = fork();
+        if child < 0 { return fail_at(name, 2); }
+        if child == 0 {
+            close(rp[0]);
+            let mut sv: [c_int; 2] = [0; 2];
+            if socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv.as_mut_ptr()) != 0 { _exit(97); }
+            let fl = fcntl(sv[0], F_GETFL, 0);
+            if fl < 0 || fcntl(sv[0], F_SETFL, fl | O_NONBLOCK) != 0 { _exit(96); }
+            WATCH_FD = sv[0];
+            REPORT_FD = rp[1];
+            let mut t: usize = 0;
+            if pthread_create(&mut t, core::ptr::null(), exec_watcher, core::ptr::null_mut()) != 0 {
+                _exit(98);
+            }
+            nap(); // let the watcher start polling
+            let argv: [*const u8; 3] = [b"/bin/exectest\0".as_ptr(), b"--exit0\0".as_ptr(), core::ptr::null()];
+            execve(b"/bin/exectest\0".as_ptr(), argv.as_ptr(), ENVP.as_ptr());
+            _exit(99);
+        }
+        close(rp[1]);
+        let mut st: c_int = 0;
+        let mut reaped = false;
+        for _ in 0..500 {
+            if waitpid(child, &mut st, WNOHANG) == child { reaped = true; break; }
+            nap();
+        }
+        if !reaped { kill(child, SIGKILL); close(rp[0]); return fail_at(name, 3); }
+        if !wifexited(st) || wexitstatus(st) != 0 { close(rp[0]); return fail_at(name, 4); }
+        // The exec'd image (and every holder of rp[1]) is gone: read to EOF.
+        let mut tag = [0u8; 1];
+        let n = read(rp[0], tag.as_mut_ptr(), 1);
+        close(rp[0]);
+        if n != 0 {
+            let mut line = *b"  sibling saw the cloexec sweep: 000\0";
+            let v = tag[0];
+            line[33] = b'0' + v / 100;
+            line[34] = b'0' + (v / 10) % 10;
+            line[35] = b'0' + v % 10;
+            puts(line.as_ptr());
+            return fail_at(name, 5);
+        }
+    }
     report(name, true)
 }

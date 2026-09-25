@@ -28,6 +28,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_map_shared_fork_visibility() { failures += 1; }
     if !test_fill_most_of_ram() { failures += 1; }
     if !test_exit_frees_page_tables() { failures += 1; }
+    if !test_eager_split_frees_tail() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -279,8 +280,66 @@ unsafe fn test_exit_frees_page_tables() -> bool {
     write(STDOUT_FILENO, b" lost_kib_per_death=".as_ptr(), 20); print_dec(per_death >> 10);
     write(STDOUT_FILENO, b" child_failures=".as_ptr(), 16); print_dec(spawn_failures);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
-    // A leaked tree is >= 2 MiB per death; the budget is a quarter of it.
-    report(name, spawn_failures == 0 && per_death < (512 << 10))
+    // A leaked tree is >= 2 MiB per death. The reading is 0 on an idle system
+    // since exit releases the address space before the parent's wait4 can
+    // return (it was ~470 KiB while the last child's pages were still held);
+    // the budget leaves room for a desktop allocating in the background.
+    report(name, spawn_failures == 0 && per_death < (256 << 10))
+}
+
+/// Splitting an eager file mapping must give back its buddy block's tail.
+///
+/// A private file mmap is backed eagerly by one naturally aligned buddy
+/// block rounded up to a power of two (65 pages -> a 128-page block), and only
+/// the whole-VMA teardown knew that order. `mprotect` of a sub-range and
+/// fork both convert the VMA to per-page tracking, and until 2026-09-24 that
+/// conversion dropped the unmapped tail on the floor: 63 pages here per round,
+/// and ~55 MiB per greeter-chain death (every library ld.so maps, RELROs and
+/// forks). Each round maps 65 pages of this binary (past EOF reads as zeros),
+/// splits it (mprotect on a middle page) or forks over it, then unmaps it; the
+/// bar is 8 pages lost per round — the leak costs 63, and a live desktop's
+/// own growth over the run stays under the bar.
+unsafe fn test_eager_split_frees_tail() -> bool {
+    let name = b"eager_split_frees_tail\0";
+    #[cfg(target_arch = "x86_64")]
+    const SYS_MPROTECT: usize = 10;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_MPROTECT: usize = 226;
+    const ROUNDS: usize = 64;
+    const LEN: usize = 65 * PAGE;
+    let fd = open(b"/bin/memtest\0".as_ptr(), 0 /* O_RDONLY */, 0);
+    if fd < 0 { return report(name, false); }
+    let before = free_ram();
+    let mut failures = 0usize;
+    for r in 0..ROUNDS {
+        let p = mmap(core::ptr::null_mut(), LEN, PROT_READ, MAP_PRIVATE, fd, 0);
+        if p as isize == -1 { failures += 1; continue; }
+        let _ = core::ptr::read_volatile(p.add(PAGE * 64));
+        if r % 2 == 0 {
+            // split_at: a middle-page mprotect cuts the VMA in three.
+            if leandros_libc::syscall::syscall3(SYS_MPROTECT, p as usize + PAGE * 32, PAGE,
+                                                (PROT_READ | PROT_WRITE) as usize) != 0 {
+                failures += 1;
+            }
+        } else {
+            // clone_as: fork converts the parent's read-only eager VMA.
+            let pid = fork();
+            if pid == 0 { exit(0); }
+            if pid < 0 { failures += 1; } else {
+                let mut status: i32 = 0;
+                wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+            }
+        }
+        munmap(p, LEN);
+    }
+    close(fd);
+    let after = free_ram();
+    let lost_pages = before.saturating_sub(after) / PAGE;
+    write(STDOUT_FILENO, b"  rounds=".as_ptr(), 9); print_dec(ROUNDS);
+    write(STDOUT_FILENO, b" lost_pages=".as_ptr(), 12); print_dec(lost_pages);
+    write(STDOUT_FILENO, b" failures=".as_ptr(), 10); print_dec(failures);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, failures == 0 && lost_pages < 8 * ROUNDS)
 }
 
 unsafe fn print_dec(mut v: usize) {

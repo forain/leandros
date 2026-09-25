@@ -2389,7 +2389,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
                                                    arg(msg,1) as usize),
         VFS_FREMOVEXATTR     => handle_fremovexattr(caller_pid, arg(msg,0) as usize,
                                                     arg(msg,1) as usize),
-        VFS_ACCESS           => handle_access(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        VFS_ACCESS           => handle_access(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) != 0),
         _                    => err_reply(-38), // ENOSYS
     }
 }
@@ -3348,6 +3348,62 @@ fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
 }
 
+/// `/proc/kmemstat`: where the kernel's pages are, for leak hunting.
+///
+/// Three tables, all read without locks: buddy pages live per allocation
+/// site (`mm::buddy` charges every block to its caller's file:line), slab
+/// pages and live objects per size class, and live heap objects per exact
+/// size. Too large for the 512-byte `gen_proc_system` buffer, so it is
+/// formatted straight into the tmpfs slot (32 KiB).
+fn gen_kmemstat() -> Option<VnodeKind> {
+    struct W<'a> { buf: &'a mut [u8], p: usize }
+    impl W<'_> {
+        fn s(&mut self, t: &str) {
+            for &b in t.as_bytes() { if self.p < self.buf.len() { self.buf[self.p] = b; self.p += 1; } }
+        }
+        fn i(&mut self, v: isize) {
+            if v < 0 { self.s("-"); }
+            let mut v = v.unsigned_abs();
+            let mut d = [0u8; 20]; let mut n = d.len();
+            loop { n -= 1; d[n] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+            for k in n..d.len() { if self.p < self.buf.len() { self.buf[self.p] = d[k]; self.p += 1; } }
+        }
+    }
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp.iter().position(|e| !e.in_use)?;
+    tmp[idx] = TmpFileEntry::empty();
+    tmp[idx].in_use = true;
+    tmp[idx].ephemeral = true;
+    let fake = b"/tmp/.kmemstat";
+    tmp[idx].path[..fake.len()].copy_from_slice(fake);
+    tmp[idx].path_len = fake.len();
+    let len = {
+        let mut w = W { buf: &mut tmp[idx].data[..], p: 0 };
+        w.s("total_pages "); w.i(mm::buddy::total_pages() as isize);
+        w.s("\nfree_pages "); w.i(mm::buddy::free_pages() as isize);
+        w.s("\nrefused_frees "); w.i(mm::buddy::bad_frees() as isize);
+        w.s("\nfields site file:line live_pages peak_pages\n");
+        let mut sum = 0isize;
+        mm::buddy::site_census(&mut |f, l, live, peak| {
+            sum += live;
+            w.s("site "); w.s(f); w.s(":"); w.i(l as isize);
+            w.s(" "); w.i(live); w.s(" "); w.i(peak); w.s("\n");
+        });
+        w.s("site_sum "); w.i(sum);
+        w.s("\nfields slab class_bytes pages live_objs\n");
+        mm::slab::class_census(&mut |c, pages, live| {
+            w.s("slab "); w.i(c as isize); w.s(" "); w.i(pages as isize); w.s(" "); w.i(live); w.s("\n");
+        });
+        w.s("fields heap size_bytes live_objs (small: 8-byte bucket upper bound; large: pages*4096)\n");
+        mm::slab::size_census(&mut |sz, n| {
+            w.s("heap "); w.i(sz as isize); w.s(" "); w.i(n); w.s("\n");
+        });
+        w.p
+    };
+    tmp[idx].len = len;
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
+}
+
 /// Generate a `/sys/class/block/...` attribute file.
 ///
 /// Same shape as `gen_proc_system`: the bytes are parked in an ephemeral
@@ -3852,6 +3908,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if lookup_path == b"/proc/kmemstat" {
+            match gen_kmemstat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
         } else if lookup_path == b"/proc/meminfo" || lookup_path == b"/proc/uptime"
                || lookup_path == b"/proc/loadavg" || lookup_path == b"/proc/stat"
                || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts"
@@ -4214,7 +4275,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             let idx = *idx;
             let cur = *pos;
             drop(tbls);
-            let tmp = TMP_FILES.lock();
+            let mut tmp = TMP_FILES.lock();
             // `entry.len` mirrors `vmo.len` for a promoted file, so the EOF
             // bound is the same whether or not a VMO backs this inode.
             let remaining = tmp[idx].len.saturating_sub(cur);
@@ -4237,6 +4298,11 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 unsafe { core::ptr::copy_nonoverlapping(tmp[idx].data.as_ptr().add(cur), buf, n); }
             }
             drop(vmos);
+            // relatime: a real read happened, so consider bumping atime.
+            let now = sched::clock_ts();
+            if relatime_needs_update(tmp[idx].atime, tmp[idx].mtime, tmp[idx].ctime, now) {
+                tmp[idx].atime = now;
+            }
             drop(tmp);
             let mut tbls2 = FD_TABLES.lock();
             if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
@@ -7480,6 +7546,17 @@ pub fn cred_of(pid: u32) -> xattr::Cred {
     c
 }
 
+/// The caller's credentials built from the REAL uid/gid rather than the
+/// effective ones. POSIX `access()`/`faccessat()` (without `AT_EACCESS`) ask
+/// "could the real user do this", specifically so a setuid-root program can
+/// check what its invoker — not itself — is allowed to do. Same supplementary
+/// group list either way: this kernel has no setuid-triggered group swap.
+pub fn real_cred_of(pid: u32) -> xattr::Cred {
+    let mut c = xattr::Cred::new(sched::ruid_of(pid), sched::rgid_of(pid));
+    c.ngroups = sched::groups_of(pid, &mut c.groups) as u8;
+    c
+}
+
 /// Stamp all three timestamps with "now" — a freshly created entry.
 fn tmp_stamp_new(e: &mut TmpFileEntry) {
     let now = sched::clock_ts();
@@ -7493,6 +7570,19 @@ fn tmp_touch_mtime(e: &mut TmpFileEntry) {
 /// Metadata changed: ctime.
 fn tmp_touch_ctime(e: &mut TmpFileEntry) {
     e.ctime = sched::clock_ts();
+}
+
+/// Linux's `relatime` mount default (what `/proc/mounts` already claims for
+/// this filesystem, per the `rw,relatime` line below — before this, that was
+/// aspirational, since nothing ever touched atime on a read at all): skip the
+/// update unless the file's mtime or ctime is at or past the current atime,
+/// or the current atime is at least a day stale. Keeps a read from dirtying
+/// the entry (and, on f2fs, the inode block) on every call.
+const RELATIME_INTERVAL_SEC: i64 = 86_400;
+fn relatime_needs_update(atime: (i64, i64), mtime: (i64, i64), ctime: (i64, i64), now: (i64, i64)) -> bool {
+    if atime.0 < mtime.0 || (atime.0 == mtime.0 && atime.1 <= mtime.1) { return true; }
+    if atime.0 < ctime.0 || (atime.0 == ctime.0 && atime.1 <= ctime.1) { return true; }
+    now.0.saturating_sub(atime.0) >= RELATIME_INTERVAL_SEC
 }
 
 /// Initialise the permission bits, inherited ACLs and timestamps of the
@@ -7729,11 +7819,15 @@ fn handle_removexattr(pid: u32, tag: u64, path_ptr: usize, name_ptr: usize) -> M
 /// faccessat(2): permission probe honoring any stored access ACL. `amode==0`
 /// (F_OK) is pure existence. A path this server does not own answers -38 so the
 /// kernel's legacy fallback runs.
-fn handle_access(pid: u32, path_ptr: usize, amode: u32) -> Message {
+/// `eaccess`: use the caller's effective ids (Linux `AT_EACCESS`) instead of
+/// the real ids `access(2)`/plain `faccessat(2)` ask with. Real ids are the
+/// POSIX default — the whole point of `access()` is answering "could the
+/// real (often unprivileged) user do this", not "can I, right now".
+fn handle_access(pid: u32, path_ptr: usize, amode: u32, eaccess: bool) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
     if let Some(path) = tmpfs_path(raw) {
-        let cred = cred_of(pid);
+        let cred = if eaccess { cred_of(pid) } else { real_cred_of(pid) };
         let tmp = TMP_FILES.lock();
         // Not a pool entry (e.g. "/tmp" itself, a ramfs dir): -38 so the
         // kernel's stat-based fallback answers, exactly as before VFS_ACCESS
@@ -7749,7 +7843,7 @@ fn handle_access(pid: u32, path_ptr: usize, amode: u32) -> Message {
         return if ok { ok_reply() } else { err_reply(-13) }; // EACCES
     }
     if let Some(port) = find_mount_port(raw) {
-        return xattr_proxy(port, VFS_ACCESS, path_ptr as u64, amode as u64, 0, 0, 0);
+        return xattr_proxy(port, VFS_ACCESS, path_ptr as u64, amode as u64, eaccess as u64, 0, 0);
     }
     err_reply(-38) // ENOSYS — let the kernel's legacy access() fallback run
 }

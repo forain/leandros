@@ -45,6 +45,7 @@ pub extern "C" fn mm_get_hhdm_offset() -> u64 {
 pub fn init_with_map(regions: &[boot::MemoryRegion], hhdm_offset: usize) {
     set_hhdm_offset(hhdm_offset);
     buddy::init_from_map(regions);
+    buddy::init_site_tags();
     slab::init();
 }
 

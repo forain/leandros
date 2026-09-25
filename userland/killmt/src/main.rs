@@ -39,6 +39,12 @@
 //!                       be able to wait for a child the thread forked, and
 //!                       its exit status must reach the parent's waitpid
 //!
+//! Extra modes (by name only): single_sleep / single_spin / single_pipe (one
+//! thread, SIGKILLed), and two memory baselines with no kill at all —
+//!   exec_plain        — a single-threaded child execve()s this binary, which
+//!                       reports OK and exits 42 (plain exec, no takeover)
+//!   fork_exit         — the child reports ready and _exit(42)s (plain death)
+//!
 //! Every mode also compares `sysinfo().freeram` before and after its
 //! iterations (one warm-up iteration excluded): a kernel stack or address
 //! space leaked per kill shows up as a monotonic drop.
@@ -48,6 +54,7 @@
 //!
 //! usage: killmt [iterations] [mode]    (defaults 100, all modes)
 //!        killmt --exec-child ...       (internal: the exec_worker image)
+//!        killmt --exec-plain <fd>      (internal: the exec_plain image)
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -99,6 +106,23 @@ fn free_ram() -> u64 {
     };
     if unsafe { sysinfo(&mut si) } != 0 { return 0; }
     si.freeram * (si.mem_unit.max(1) as u64)
+}
+
+/// `free_ram` once the previous child's memory has been returned: a group
+/// killed by a signal is waitable as soon as its leader is reaped, while a
+/// sibling's CPU may still be dropping the last reference to the address
+/// space (one child — an eager copy of this process's 8 MiB stack and its
+/// writable data — reads as a ~8 MiB swing, the size of MEM_LEAK_BOUND).
+/// Poll until the reading stops rising.
+fn settled_free_ram() -> u64 {
+    let mut best = free_ram();
+    for _ in 0..50 {
+        thread::sleep(Duration::from_millis(10));
+        let v = free_ram();
+        if v <= best { break; }
+        best = v;
+    }
+    best
 }
 
 /// A kill loop that leaks one 128 KiB kernel stack per iteration shows up
@@ -158,6 +182,8 @@ enum Mode {
     SingleSleep,
     SingleSpin,
     SinglePipe,
+    ExecPlain,
+    ForkExit,
 }
 
 const ALL_MODES: [Mode; 11] = [
@@ -165,7 +191,8 @@ const ALL_MODES: [Mode; 11] = [
     Mode::Syscall, Mode::Stopped, Mode::Segv, Mode::ExitGroupWorker,
     Mode::ParkedMix, Mode::LeaderKills, Mode::ExecWorker,
 ];
-const EXTRA_MODES: [Mode; 3] = [Mode::SingleSleep, Mode::SingleSpin, Mode::SinglePipe];
+const EXTRA_MODES: [Mode; 5] = [Mode::SingleSleep, Mode::SingleSpin, Mode::SinglePipe,
+                                Mode::ExecPlain, Mode::ForkExit];
 
 fn mode_name(m: Mode) -> &'static str {
     match m {
@@ -183,6 +210,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::SingleSleep => "single_sleep",
         Mode::SingleSpin => "single_spin",
         Mode::SinglePipe => "single_pipe",
+        Mode::ExecPlain => "exec_plain",
+        Mode::ForkExit => "fork_exit",
     }
 }
 
@@ -343,6 +372,17 @@ fn spin_for(d: Duration) {
 fn child_body(mode: Mode, ready_fd: i32) -> ! {
     const WORKERS: usize = 3;
     if mode == Mode::ExecWorker { exec_child_body(ready_fd); }
+    if mode == Mode::ExecPlain {
+        let path = cstr("/bin/killmt");
+        let args = [cstr("killmt"), cstr("--exec-plain"), cstr(&ready_fd.to_string())];
+        let argv: [*const u8; 4] = [args[0].as_ptr(), args[1].as_ptr(), args[2].as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        unsafe { execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()); }
+        unsafe { write(ready_fd, b"E0 execve failed\n".as_ptr(), 17); _exit(99); }
+    }
+    if mode == Mode::ForkExit {
+        unsafe { write(ready_fd, b"OK\n".as_ptr(), 3); _exit(42); }
+    }
     if matches!(mode, Mode::SingleSleep | Mode::SingleSpin | Mode::SinglePipe) {
         unsafe { write(ready_fd, b"R".as_ptr(), 1); close(ready_fd); }
         match mode {
@@ -382,7 +422,8 @@ fn child_body(mode: Mode, ready_fd: i32) -> ! {
                     spin_forever()
                 }
                 Mode::ParkedMix | Mode::LeaderKills => parked_body(i),
-                Mode::ExecWorker | Mode::SingleSleep | Mode::SingleSpin | Mode::SinglePipe => unreachable!(),
+                Mode::ExecWorker | Mode::SingleSleep | Mode::SingleSpin | Mode::SinglePipe
+                | Mode::ExecPlain | Mode::ForkExit => unreachable!(),
             }
         });
     }
@@ -424,7 +465,7 @@ fn run_mode(mode: Mode, iters: usize) -> bool {
     for it in 0..iters {
         // Iteration 0 is the warm-up: first-use allocations (pipe rings,
         // fd tables, exit-log slots) are not leaks.
-        if it == 1 { mem_before = free_ram(); }
+        if it == 1 { mem_before = settled_free_ram(); }
         let mut fds = [0i32; 2];
         if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
             println!("{}: FAIL pipe() at iteration {}", mode_name(mode), it);
@@ -442,7 +483,7 @@ fn run_mode(mode: Mode, iters: usize) -> bool {
         unsafe { close(fds[1]); }
         let mut b = 0u8;
         let n = unsafe { read(fds[0], &mut b, 1) };
-        if mode == Mode::ExecWorker {
+        if matches!(mode, Mode::ExecWorker | Mode::ExecPlain | Mode::ForkExit) {
             // The ready byte is the exec'd image's report line.
             let mut line = Vec::new();
             if n == 1 { line.push(b); }
@@ -533,7 +574,7 @@ fn run_mode(mode: Mode, iters: usize) -> bool {
             return false;
         }
     }
-    let mem_after = free_ram();
+    let mem_after = settled_free_ram();
     let delta = mem_after as i64 - mem_before as i64;
     if iters > 1 && mem_before != 0 && mem_after != 0 && mem_before.saturating_sub(mem_after) > MEM_LEAK_BOUND {
         println!("{}: FAIL free memory dropped {} KiB over {} iterations (bound {} KiB)",
@@ -548,6 +589,10 @@ fn run_mode(mode: Mode, iters: usize) -> bool {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("--exec-child") { exec_child_main(&args); }
+    if args.get(1).map(|s| s.as_str()) == Some("--exec-plain") {
+        let fd: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(-1);
+        unsafe { write(fd, b"OK\n".as_ptr(), 3); close(fd); _exit(42); }
+    }
     let iters: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
     let modes: Vec<Mode> = match args.get(2) {
         Some(name) => match mode_from_name(name) {

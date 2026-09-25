@@ -272,10 +272,32 @@ build_doom() {
         echo "⚠️  doomgeneric source not found at $doom_dir, skipping"
         return 0
     fi
+
+    # doomgeneric is a shared, non-git sibling checkout: `../doomgeneric`
+    # resolves to the SAME physical directory from every worktree of this
+    # repo on a machine. Vendor the OBJDIR/atomic-link Makefile.leandros
+    # (scripts/vendor/doomgeneric/Makefile.leandros) into that shared
+    # checkout whenever it differs, so every worktree — and every machine,
+    # the next time it runs build-all.sh — picks up the collision fix instead
+    # of only the one checkout someone hand-edited. Idempotent: skipped once
+    # the sibling already matches, so it doesn't perturb mtimes/incremental
+    # state on every build. See artifacts/notes/lane-buildobj-2026-09-24.md.
+    local vendored_makefile="$ROOT_DIR/scripts/vendor/doomgeneric/Makefile.leandros"
+    if [[ -f "$vendored_makefile" ]] && ! cmp -s "$vendored_makefile" "$doom_dir/Makefile.leandros" 2>/dev/null; then
+        echo "  Updating $doom_dir/Makefile.leandros from vendored copy..."
+        cp "$vendored_makefile" "$doom_dir/Makefile.leandros"
+    fi
+
+    # Per-worktree, per-arch object directory, and no shared `make clean`:
+    # two worktrees (or two arches) building concurrently against this one
+    # shared sibling never read or clobber each other's .o files. The final
+    # doom-$arch binary is still a shared, fixed path (mkfs-f2fs-populated.py
+    # reads it by that name), but Makefile.leandros now links it atomically
+    # (temp name + mv), so a concurrent reader never sees a torn file.
+    local objdir="$doom_dir/.obj-$(basename "$ROOT_DIR")-$arch"
     (
         cd "$doom_dir" || exit 1
-        make -f Makefile.leandros ARCH="$arch" LEANDROS_ROOT="$ROOT_DIR" clean
-        make -f Makefile.leandros ARCH="$arch" LEANDROS_ROOT="$ROOT_DIR"
+        make -f Makefile.leandros ARCH="$arch" LEANDROS_ROOT="$ROOT_DIR" OBJDIR="$objdir"
     )
 }
 

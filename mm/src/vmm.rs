@@ -834,6 +834,7 @@ impl AddressSpace {
                 let n = (r.end - r.start) / PAGE_SIZE;
                 let mut v = Vec::with_capacity(n);
                 for i in 0..n { v.push(r.phys + i * PAGE_SIZE); }
+                free_eager_tail(r.phys, n);
                 r.lazy = true;
                 r.phys = 0;
                 r.lazy_pages = v;
@@ -1250,6 +1251,34 @@ pub fn last_map_fail() -> &'static str {
         FAIL_NO_HEAP     => "no-heap-vma",
         FAIL_BAD_FILECAP => "bad-file-cap",
         _                => "unrecorded",
+    }
+}
+
+/// Free the rounding tail of an eager VMA's buddy block.
+///
+/// `map` backs an `n`-page VMA with one naturally aligned block of
+/// `2^pages_to_order(n)` pages and maps only the first `n`; the rest is
+/// reachable solely through that order, which is how `Drop` and
+/// `unmap_range` give the whole block back. The moment a VMA goes from eager
+/// to per-page tracking (`split_at`, fork's `clone_as`) the order is
+/// forgotten and each side frees exactly its `n` pages — so the tail, never
+/// mapped and owned by nobody, must be returned right there. Until
+/// 2026-09-24 it was not: a 5 MiB file mmap (8 MiB block) that `ld.so` then
+/// MAP_FIXED-overlaid or RELRO-mprotected leaked 3 MiB for the rest of the
+/// boot, ~14k pages (~55 MiB) per greeter-chain death on x86_64.
+///
+/// Freed as the largest aligned sub-blocks (the block is aligned to its
+/// order, so every sub-block is aligned to its own), not page by page.
+pub(crate) fn free_eager_tail(phys: usize, n: usize) {
+    if phys == 0 || n == 0 { return; }
+    let total = 1usize << pages_to_order(n);
+    let mut i = n;
+    while i < total {
+        // Largest k with i aligned to 2^k and i + 2^k <= total.
+        let mut k = i.trailing_zeros() as usize;
+        while i + (1usize << k) > total { k -= 1; }
+        buddy_free(phys + i * PAGE_SIZE, k);
+        i += 1usize << k;
     }
 }
 

@@ -36,6 +36,7 @@
 const SA_RESTORER:  u32 = 0x04000000;
 const SA_NODEFER:   u32 = 0x40000000;
 const SA_RESETHAND: u32 = 0x80000000;
+const SA_RESTART:   u32 = 0x10000000;
 const SA_ONSTACK:   u32 = 0x08000000;
 
 // ── sigaltstack() ss_flags bits (Linux values; relibc's
@@ -164,6 +165,58 @@ pub(crate) fn has_deliverable_signal_locked(
 /// x86-64 `syscall_entry`).
 #[no_mangle]
 pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
+    // A restartable syscall interrupted by a signal returned EINTR and left
+    // its (nr, a0) here. Linux's -ERESTARTSYS rule: re-execute it when the
+    // handler has SA_RESTART or when no handler runs at all (the signal was
+    // claimed elsewhere, or a stop/continue); otherwise EINTR stands.
+    let mut restart = take_syscall_restart();
+    deliver_pending_signals(frame_ptr, &mut restart);
+    if let Some(r) = restart { rewind_syscall(frame_ptr, r); }
+}
+
+// ── Syscall restart (SA_RESTART) ─────────────────────────────────────────────
+
+/// Per-CPU `(nr + 1, a0)` of the syscall that just returned -ERESTARTSYS,
+/// set by the dispatcher and consumed by the `check_and_deliver_signals` call
+/// that immediately follows on the same CPU (IRQs are masked in between, so
+/// neither a migration nor another return path can interleave).
+static RESTART_NR: [core::sync::atomic::AtomicU64; super::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; super::MAX_CPUS];
+static RESTART_A0: [core::sync::atomic::AtomicU64; super::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; super::MAX_CPUS];
+
+/// Record that the syscall being returned from on this CPU may be restarted
+/// (the dispatcher reports EINTR to the frame; see
+/// [`check_and_deliver_signals`]).
+pub fn note_syscall_restart(nr: usize, a0: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let cpu = unsafe { super::cpu_id() };
+    RESTART_A0[cpu].store(a0 as u64, Relaxed);
+    RESTART_NR[cpu].store(nr as u64 + 1, Relaxed);
+}
+
+fn take_syscall_restart() -> Option<(u64, u64)> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let cpu = unsafe { super::cpu_id() };
+    let nr = RESTART_NR[cpu].swap(0, Relaxed);
+    if nr == 0 { return None; }
+    Some((nr - 1, RESTART_A0[cpu].load(Relaxed)))
+}
+
+/// Point the user frame back at the syscall instruction with its original
+/// number/first argument, so returning to user space re-executes it.
+fn rewind_syscall(frame_ptr: usize, (nr, a0): (u64, u64)) {
+    if frame_ptr == 0 { return; }
+    let f = unsafe { &mut *(frame_ptr as *mut crate::context::UserFrame) };
+    #[cfg(target_arch = "x86_64")]
+    { let _ = a0; f.rax = nr; f.rip -= 2; f.rcx = f.rip; } // `syscall` is 0F 05
+    #[cfg(target_arch = "aarch64")]
+    { let _ = nr; f.x[0] = a0; f.elr_el1 -= 4; }            // `svc #0`, x8 intact
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    { let _ = (f, nr, a0); }
+}
+
+fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
     if frame_ptr == 0 { return; }
 
     let pid = super::current_pid();
@@ -415,6 +468,13 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
                 } else {
                     0
                 };
+
+                // Settle an interrupted restartable syscall BEFORE the frame
+                // snapshots the registers: SA_RESTART re-executes it after
+                // the handler returns, otherwise it reports EINTR.
+                if let Some(r) = restart.take() {
+                    if action.get_flags() & SA_RESTART != 0 { rewind_syscall(frame_ptr, r); }
+                }
 
                 if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask, action.get_flags(), info) {
                     // Frame write failed (stack fault) — deliver SIGSEGV.

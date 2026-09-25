@@ -305,6 +305,11 @@ fn init_timer() {
 #[no_mangle]
 pub extern "C" fn arch_timer_check_alive() -> bool { timer::check_alive() }
 
+/// Scheduler hook: arm this CPU's one-shot timer for an absolute
+/// `monotonic_ns()` deadline (see `timer::arm_deadline`).
+#[no_mangle]
+pub extern "C" fn arch_timer_arm_deadline(deadline_ns: u64) { timer::arm_deadline(deadline_ns) }
+
 /// Driver-side entry to the GIC dispatch table, for crates below this one in
 /// the dependency graph (`drivers` cannot name `gic`; same seam as
 /// `arch_monotonic_ns`). `handler` is a `fn()` pointer cast to `usize`, and

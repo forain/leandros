@@ -7,6 +7,7 @@ import hashlib
 import struct
 import sys
 import os
+import subprocess
 import soundfont
 
 BLOCK_SIZE     = 4096
@@ -257,6 +258,35 @@ def session_data(name):
     # Returning `tree` when neither exists keeps the callers' os.path.exists
     # gate meaningful and their error messages pointing at the intended source.
     return repo if os.path.exists(repo) else tree
+
+
+def _find_cosmic_epoch():
+    """Locate the cosmic-epoch checkout that the /usr/share/cosmic tree comes from.
+
+    Order: $LEANDROS_COSMIC_EPOCH; a sibling of this checkout (`../cosmic-epoch`,
+    which is where every other sibling repo lives); a sibling of the MAIN
+    checkout when this is a git worktree placed elsewhere; ~/code/cosmic-epoch
+    (the Mac layout). Returns the first candidate that has cosmic-comp/data,
+    else the first candidate (so the caller's error names a real path).
+    """
+    here = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    cands = []
+    env = os.environ.get("LEANDROS_COSMIC_EPOCH")
+    if env:
+        cands.append(os.path.expanduser(env))
+    cands.append(os.path.join(os.path.dirname(here), "cosmic-epoch"))
+    try:
+        common = subprocess.run(["git", "-C", here, "rev-parse", "--git-common-dir"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        main = os.path.dirname(os.path.normpath(os.path.join(here, common)))
+        cands.append(os.path.join(os.path.dirname(main), "cosmic-epoch"))
+    except Exception:
+        pass
+    cands.append(os.path.expanduser("~/code/cosmic-epoch"))
+    for c in cands:
+        if os.path.isdir(os.path.join(c, "cosmic-comp", "data")):
+            return c
+    return cands[0]
 
 
 def verify_dbus_staging(arch):
@@ -1554,7 +1584,7 @@ def main():
     # epoch-1.3.0), reproducing exactly what upstream's own install rules place
     # under $prefix/share/cosmic — better provenance than the unversioned
     # ~/code/leandros-artifacts staging dirs the rest of the session ship uses.
-    cosmic_epoch = os.path.expanduser("~/code/cosmic-epoch")
+    cosmic_epoch = _find_cosmic_epoch()
 
     def _stage_cosmic_default(rel, hostpath):
         """rel is "<component>/v<N>/<key>"; register every ancestor directory."""
@@ -1606,6 +1636,30 @@ def main():
     ):
         if os.path.isfile(_src):
             _stage_cosmic_default(_rel, _src)
+
+    # LOUD, not silent. Every lookup above is gated on isdir/isfile, so a host
+    # without the cosmic-epoch checkout used to produce an image with NO
+    # /usr/share/cosmic at all -- and therefore a desktop with an empty
+    # keybinding table (Super+T, Super, Super+F9 all silently dead) and
+    # `NoConfigDirectory` in every shortcuts lookup. That is exactly what both
+    # Linux hosts shipped until 2026-09-24: the path was hardcoded to
+    # ~/code/cosmic-epoch, which exists only on the Mac. The keybinding table
+    # is not optional, so refuse to build without it.
+    _staged = {os.path.join(d, f) for d, f, _h in m4_share_files}
+    _required = (
+        "/usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1/defaults",
+        "/usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1/system_actions",
+    )
+    _missing = [r for r in _required if r not in _staged]
+    if _missing:
+        raise SystemExit(
+            "ERROR: COSMIC system defaults not staged -- the desktop would have "
+            "no keybindings.\n  missing: " + ", ".join(_missing) +
+            f"\n  cosmic-epoch looked up at: {cosmic_epoch}"
+            "\n  Check out ../cosmic-epoch (epoch-1.3.0) next to the repo, or set "
+            "LEANDROS_COSMIC_EPOCH=<path>.")
+    print(f"  COSMIC system defaults: {sum(1 for d, _f, _h in m4_share_files if d.startswith('/usr/share/cosmic/'))} "
+          f"file(s) from {cosmic_epoch}")
 
     # v2 theme schema is missing `list_button`, and that ONE absent file makes the
     # whole system theme fail to load in EVERY libcosmic process.

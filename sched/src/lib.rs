@@ -343,6 +343,9 @@ extern "C" {
     fn arch_set_kernel_stack(rsp: u64);
     fn arch_cpu_id() -> usize;
     fn arch_timer_check_alive() -> bool;
+    /// Arm this CPU's one-shot timer for the absolute `monotonic_ns()` instant
+    /// `deadline_ns` if it is sooner than whatever is armed already.
+    fn arch_timer_arm_deadline(deadline_ns: u64);
     /// Monotonic nanoseconds since boot (sub-tick), for CPU-time accounting.
     fn arch_monotonic_ns() -> u64;
     pub fn arch_alloc_page_table_root() -> usize;
@@ -977,6 +980,43 @@ fn notify_continued(tgid: Pid, ppid: Pid, uid: u32) {
 /// until some thread unblocks it — again exactly POSIX.
 pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isize {
     if signo == 0 || signo > 64 { return -22; }
+    let (ret, woke, resumed) = post_signal_process(&mut RUN_QUEUE.lock(), tgid, signo, info);
+    if woke { wake_up_an_idle_cpu(); }
+    if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
+    // Wake any signalfd poller in the target tgid (RUN_QUEUE released above).
+    wake_poll();
+    ret
+}
+
+/// `deliver_signal_process` for IRQ context (a POSIX-timer / itimer expiry
+/// serviced from the timer interrupt): bounded `try_lock_spin`, `None` when
+/// RUN_QUEUE stayed contended (nothing was posted — the caller retries). The
+/// poll-channel broadcast rides the same lock hold, which is what releases a
+/// thread parked in pause/sigsuspend/sigtimedwait/nanosleep/poll. SIGCONT is
+/// refused (`None`): its parent notification needs task context.
+///
+/// `Some(1)` = an instance was already pending somewhere in the group, so this
+/// one coalesced into it (a POSIX timer counts that as an overrun).
+pub fn try_deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> Option<isize> {
+    if signo == 0 || signo > 64 { return Some(-22); }
+    if signo == signal::SIGCONT { return None; }
+    let bit = 1u64 << (signo - 1);
+    let mut rq = RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS)?;
+    let already = (0..runqueue::MAX_TASKS).any(|i| rq.get(i).map_or(false, |t|
+        t.tgid == tgid && (t.signal_pending | t.shared_signal_pending) & bit != 0));
+    let (ret, woke, _) = post_signal_process(&mut rq, tgid, signo, info);
+    let ret = if ret == 0 && already { 1 } else { ret };
+    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, POLL_TAG_ALL);
+    drop(rq);
+    if woke || woken > 0 { wake_up_an_idle_cpu(); }
+    Some(ret)
+}
+
+/// The RUN_QUEUE-held half of `deliver_signal_process`: returns
+/// `(ret, woke, resumed)` for the caller to act on after unlocking.
+fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info: task::SigInfo)
+    -> (isize, bool, Option<(Pid, Pid, u32)>)
+{
     let bit = 1u64 << (signo - 1);
     let idx = (signo - 1) as usize;
     let mut woke = false;
@@ -989,10 +1029,9 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isi
     let unblockable = signal::UNBLOCKABLE & bit != 0;
     let resumed;
     let ret = {
-        let mut rq = RUN_QUEUE.lock();
         // SIGCONT/SIGKILL: resume a stopped group first, so the thread chosen
         // below is runnable and can actually take the signal.
-        let (made_ready, r) = on_signal_generated(&mut rq, tgid, signo);
+        let (made_ready, r) = on_signal_generated(rq, tgid, signo);
         resumed = r;
         woke |= made_ready;
         let min_vr = rq.min_vruntime();
@@ -1058,11 +1097,7 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isi
             }
         }
     };
-    if woke { wake_up_an_idle_cpu(); }
-    if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
-    // Wake any signalfd poller in the target tgid (RUN_QUEUE released above).
-    wake_poll();
-    ret
+    (ret, woke, resumed)
 }
 
 /// Mark a CLONE_VFORK child as done borrowing the parent's address space
@@ -1379,6 +1414,17 @@ pub fn egid_of(pid: Pid) -> u32 {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.egid).unwrap_or(0)
 }
 
+/// The REAL (not effective) uid/gid — what `access(2)`/`faccessat(2)` without
+/// `AT_EACCESS` must check against. Same fail-open-to-root default for an
+/// unknown pid as `euid_of`/`egid_of`.
+pub fn ruid_of(pid: Pid) -> u32 {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.uid).unwrap_or(0)
+}
+
+pub fn rgid_of(pid: Pid) -> u32 {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.gid).unwrap_or(0)
+}
+
 /// Supplementary groups of `pid`, copied into `out`; returns the count.
 /// An unknown pid (the boot-time mount path) has none.
 pub fn groups_of(pid: Pid, out: &mut [u32; task::NGROUPS_MAX]) -> usize {
@@ -1636,7 +1682,7 @@ pub fn block_on_poll_prepare_masked(deadline: u64, mask: u64) {
     let pid = current_pid();
     RUN_QUEUE.lock().block_on_port_until(pid, POLL_WAIT_CHANNEL, deadline, mask);
     if deadline != u64::MAX {
-        NEXT_POLL_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
+        register_poll_deadline(deadline);
     }
 }
 /// Undo a prepared poll-block (the re-probe found readiness or a signal).
@@ -1793,6 +1839,38 @@ pub static NEXT_POLL_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 /// AND folds it into this hint.
 pub fn register_poll_deadline(deadline: u64) {
     NEXT_POLL_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
+    // Arm this CPU's one-shot timer so the deadline is serviced when it falls
+    // due, not at the next 100 Hz tick edge after it (up to 10 ms late: with
+    // never-early absolute deadlines, a back-to-back `poll(10 ms)` loop re-arms
+    // just past a tick edge and used to overshoot by a whole tick every time).
+    // Cheap and idempotent: the arch keeps the earliest armed instant per CPU
+    // and only reprograms the compare value when this one is sooner.
+    if deadline != u64::MAX {
+        unsafe { arch_timer_arm_deadline(deadline); }
+    }
+}
+
+/// The deadline service run from a CPU's one-shot timer interrupt (see
+/// `timer_deadline_irq`); 0 until the kernel registers it.
+static DEADLINE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register the poll-deadline service for one-shot timer interrupts. `f(now)`
+/// wakes every due timed waiter (same try-lock-only IRQ contract as a tick
+/// hook) and returns the next pending deadline (`u64::MAX` = none).
+pub fn register_deadline_hook(f: fn(u64) -> u64) {
+    DEADLINE_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Called by the arch timer IRQ on ANY CPU whose one-shot deadline (armed by
+/// `register_poll_deadline`) has come due. Services the due deadlines and
+/// returns the next pending one so the arch can re-arm for it; `u64::MAX` when
+/// nothing is pending or no hook is registered (the 100 Hz tick remains the
+/// fallback either way).
+pub fn timer_deadline_irq() -> u64 {
+    let hook = DEADLINE_HOOK.load(Ordering::Acquire);
+    if hook == 0 { return u64::MAX; }
+    let f: fn(u64) -> u64 = unsafe { core::mem::transmute(hook) };
+    f(monotonic_ns())
 }
 
 // ── Task census (zink-lane instrumentation, IRQ-safe, try_lock only) ────────
@@ -3167,6 +3245,10 @@ fn scheduler_run_loop() -> ! {
                     let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
                     hook(t.pid);
                 }
+                // A leader reaped here never ran `exit` itself when a sibling's
+                // group kill took it off-CPU: release its /proc/self/exe slot,
+                // or the 64-entry table fills and every later exec reads /bin/init.
+                if t.pid == t.tgid { clear_exe_path(t.pid); }
                 mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
             }
         } else {
@@ -3611,6 +3693,11 @@ pub fn exit(code: i32) -> ! {
         }
     }
 
+    // Last use of user memory is above: release the address space now, before
+    // the task turns Zombie and becomes waitable (Linux: `exit_mm` precedes
+    // `exit_notify`).
+    release_exiting_address_space(pid);
+
     let (tgid, ppid, status, uid) = {
         let mut rq = RUN_QUEUE.lock();
         let (r, had_vfork) = match rq.find_pid_mut(pid) {
@@ -3658,6 +3745,68 @@ pub fn exit(code: i32) -> ! {
     }
     yield_now("exit");
     loop { core::hint::spin_loop(); }
+}
+
+/// Free a dying process's address space from `exit` itself, before the task
+/// is marked Zombie.
+///
+/// `wait_scan` reports a Zombie the moment it is marked, but the reaping
+/// CPU's scheduler loop only drops the `Task` — and with it the address
+/// space — after it has switched away from it. A parent's `wait4` therefore
+/// returned while the child's whole footprint (an eager copy of every
+/// writable page of the forker, its page tables, its user stack) was still
+/// allocated, and `sysinfo`/`MemFree` read right after the wait counted a
+/// dead child as live memory: memtest's `lost_kib_per_death` ≈ 470–500 and
+/// killmt's `exec_worker` "121 KiB/exec" were exactly that one in-flight
+/// child, not leaked pages (the buddy census before/after the same runs
+/// differs by 0–4 pages).
+///
+/// Only the sole owner releases early: the caller must be the last task of
+/// its thread group — the leader with every sibling gone, or the thread
+/// that ran a group kill after the leader was reaped (siblings resolve their
+/// faults through the leader's `address_space`, see
+/// `lock_leader_address_space`, so a leader with live threads must keep
+/// it) — and the Arc must have no other holder (a `CLONE_VM`/vfork sharer
+/// keeps it alive). Anything else keeps the old behaviour: the reaper drops
+/// it.
+///
+/// The `Task` keeps running kernel code after this, so its root is detached
+/// first (in the same RUN_QUEUE hold `page_table` is cleared, so a
+/// re-dispatch after a preemption never loads the freed root), and the drop
+/// waits out any in-flight `busy` holder exactly as `replace_address_space`
+/// does.
+fn release_exiting_address_space(pid: Pid) {
+    let taken = {
+        let mut rq = RUN_QUEUE.lock();
+        let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return };
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(t) = rq.get(i) {
+                if t.tgid == tgid && t.pid != pid { return; }
+            }
+        }
+        let t = match rq.find_pid_mut(pid) { Some(t) => t, None => return };
+        match t.address_space.as_ref() {
+            Some(a) if alloc::sync::Arc::strong_count(a) == 1 => {}
+            _ => return,
+        }
+        t.page_table = 0;
+        let taken = t.address_space.take();
+        unsafe {
+            // x86_64: back onto the kernel CR3; aarch64: TTBR0 := 0 + local
+            // TLB flush (the kernel runs from TTBR1 either way).
+            arch_load_kernel_page_table();
+            arch_set_page_table(0);
+        }
+        taken
+    };
+    if let Some(old) = taken {
+        if old.busy.load(Ordering::Acquire) {
+            lockwatch::note_wait(lockwatch::L_AS_BUSY);
+            while old.busy.load(Ordering::Acquire) { core::hint::spin_loop(); }
+            lockwatch::note_wait(0);
+        }
+        drop(old);
+    }
 }
 
 /// Outcome of one `kill_next_group_member` step.
@@ -3766,6 +3915,10 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
             let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
             hook(t.pid);
         }
+        // A leader reaped here never ran `exit` itself when a sibling's
+        // group kill took it off-CPU: release its /proc/self/exe slot,
+        // or the 64-entry table fills and every later exec reads /bin/init.
+        if t.pid == t.tgid { clear_exe_path(t.pid); }
         mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
     }
     GroupKillStep::Reaped(tpid)
