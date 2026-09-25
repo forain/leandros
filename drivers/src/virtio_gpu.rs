@@ -2311,6 +2311,17 @@ impl VirtioGpuDevice {
             self.current_resource_id = resource_id;
         }
 
+        // A virgl 3D resource (VIRTGPU_RESOURCE_CREATE) is rendered BY THE HOST:
+        // its pixels already live in the host texture, and its guest backing is
+        // only the staging area for explicit TRANSFER_*_3D. A 2D transfer here
+        // would upload that stale guest memory OVER the rendered frame — on UTM
+        // (virgl over ANGLE/Metal) the greeter scanned out as noise. Present it
+        // the way upstream's virtio_gpu_primary_plane_update does for a 3D BO:
+        // RESOURCE_FLUSH only.
+        if is_host_rendered(resource_id) {
+            return self.resource_flush(resource_id, x, y, width, height);
+        }
+
         // Byte offset of (x, y) within the resource backing.  The device uses the
         // resource's own width as the stride, so a partial-rect transfer must
         // point `offset` at the rect origin rather than the start of the buffer.
@@ -3306,6 +3317,24 @@ pub static VIRGL_NEGOTIATED: core::sync::atomic::AtomicBool =
 /// True when this guest's virtio-gpu negotiated virgl, i.e. host 3D is real.
 pub fn virgl_negotiated() -> bool {
     VIRGL_NEGOTIATED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Host resource ids whose content the HOST renders (virgl 3D resources), so a
+/// present must never TRANSFER_TO_HOST_2D over them. Small and leaf-locked:
+/// taken inside `flush()` with VIRTIO_GPU already held, never the other way.
+static HOST_RENDERED: spin::Mutex<Vec<u32>> = spin::Mutex::new(Vec::new());
+
+pub fn mark_host_rendered(res_id: u32) {
+    let mut v = HOST_RENDERED.lock();
+    if !v.contains(&res_id) { v.push(res_id); }
+}
+
+pub fn unmark_host_rendered(res_id: u32) {
+    HOST_RENDERED.lock().retain(|r| *r != res_id);
+}
+
+pub fn is_host_rendered(res_id: u32) -> bool {
+    HOST_RENDERED.lock().contains(&res_id)
 }
 
 pub fn init() {
