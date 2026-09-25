@@ -26,6 +26,7 @@ pub mod clone;
 pub mod context;
 pub mod futex;
 pub mod lockwatch;
+pub mod pcsample;
 pub mod runqueue;
 pub mod signal;
 pub mod task;
@@ -1958,6 +1959,8 @@ pub fn dump_group_stacks(tgid: Pid, words: usize) -> bool {
 /// Which tgid the `[SCSTAT]` per-syscall census follows (0 = none). Set by
 /// `sys_execve` when the image path ends in `cosmic-comp`.
 pub static SC_FOCUS_TGID: AtomicU32 = AtomicU32::new(0);
+/// Second `[SCSTAT]` focus: the tgid whose image ends in `cosmic-greeter-login`.
+pub static SC_FOCUS2_TGID: AtomicU32 = AtomicU32::new(0);
 
 // ── Per-process executable path (/proc/self/exe) ────────────────────────────
 //
@@ -2724,6 +2727,7 @@ pub fn dump_tasks() {
         for &b in s.as_bytes() { unsafe { arch_serial_putc_dump(b); } }
     }
     use dump_raw::{ph, pn};
+    pcsample::request_drain();
     lockwatch::dump_profile();
     let rq = match RUN_QUEUE.try_lock() {
         Some(rq) => rq,

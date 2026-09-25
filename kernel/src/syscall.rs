@@ -747,9 +747,11 @@ pub extern "C" fn syscall_dispatch(
 /// table, printed by `scstat_tick`. Compile-time gated like `DRM_STATS`.
 pub const SC_STATS: bool = false;
 const SC_SLOTS: usize = 512;
-static SC_N:   [AtomicU64; SC_SLOTS] = [const { AtomicU64::new(0) }; SC_SLOTS];
-static SC_NS:  [AtomicU64; SC_SLOTS] = [const { AtomicU64::new(0) }; SC_SLOTS];
-static SC_MAX: [AtomicU64; SC_SLOTS] = [const { AtomicU64::new(0) }; SC_SLOTS];
+/// Index 0 follows `SC_FOCUS_TGID` (cosmic-comp), 1 `SC_FOCUS2_TGID`
+/// (cosmic-greeter-login).
+static SC_N:   [[AtomicU64; SC_SLOTS]; 2] = [const { [const { AtomicU64::new(0) }; SC_SLOTS] }; 2];
+static SC_NS:  [[AtomicU64; SC_SLOTS]; 2] = [const { [const { AtomicU64::new(0) }; SC_SLOTS] }; 2];
+static SC_MAX: [[AtomicU64; SC_SLOTS]; 2] = [const { [const { AtomicU64::new(0) }; SC_SLOTS] }; 2];
 /// pid & 1023 -> (pid << 32) | (nr << 1) | in_syscall
 static LAST_SC: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
 /// 0 = not requested, 1 = dump the focus process's VMAs on its next syscall, 2 = done.
@@ -767,22 +769,25 @@ pub fn dispatch(
         let pid = current_pid();
         LAST_SC[(pid as usize) & 1023].store(((pid as u64) << 32) | ((number as u64) << 1) | 1, Ordering::Relaxed);
         let f = sched::SC_FOCUS_TGID.load(Ordering::Relaxed);
-        let focus = f != 0 && sched::current_tgid() == f;
-        (pid, focus, if focus { monotonic_ns() } else { 0 })
-    } else { (0, false, 0) };
+        let f2 = sched::SC_FOCUS2_TGID.load(Ordering::Relaxed);
+        let tg = sched::current_tgid();
+        let focus = if f != 0 && tg == f { 1u8 } else if f2 != 0 && tg == f2 { 2 } else { 0 };
+        (pid, focus, if focus != 0 { monotonic_ns() } else { 0 })
+    } else { (0, 0u8, 0) };
     let ret = dispatch_inner(number, a0, a1, a2, a3, a4, a5, frame_ptr);
-    if SC_STATS && sc_focus && SC_VMA_DUMP.load(Ordering::Relaxed) == 1 {
+    if SC_STATS && sc_focus == 1 && SC_VMA_DUMP.load(Ordering::Relaxed) == 1 {
         SC_VMA_DUMP.store(2, Ordering::Relaxed);
         mm::gap2::s("[VMA] focus tgid dump follows\n");
         sched::dump_user_vma(0);
     }
     if SC_STATS {
         LAST_SC[(sc_pid as usize) & 1023].store(((sc_pid as u64) << 32) | ((number as u64) << 1), Ordering::Relaxed);
-        if sc_focus && number < SC_SLOTS {
+        if sc_focus != 0 && number < SC_SLOTS {
+            let k = (sc_focus - 1) as usize;
             let dt = monotonic_ns().wrapping_sub(sc_t0);
-            SC_N[number].fetch_add(1, Ordering::Relaxed);
-            SC_NS[number].fetch_add(dt, Ordering::Relaxed);
-            SC_MAX[number].fetch_max(dt, Ordering::Relaxed);
+            SC_N[k][number].fetch_add(1, Ordering::Relaxed);
+            SC_NS[k][number].fetch_add(dt, Ordering::Relaxed);
+            SC_MAX[k][number].fetch_max(dt, Ordering::Relaxed);
         }
     }
     sched::note_syscall_exit();
@@ -4107,6 +4112,9 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     if SC_STATS && kpath.bytes().ends_with(b"cosmic-comp") {
         sched::SC_FOCUS_TGID.store(fd_owner, Ordering::Relaxed);
     }
+    if SC_STATS && kpath.bytes().ends_with(b"cosmic-greeter-login") {
+        sched::SC_FOCUS2_TGID.store(fd_owner, Ordering::Relaxed);
+    }
 
     // POSIX execve: caught signal handlers revert to SIG_DFL in the new image
     // (SIG_IGN/SIG_DFL and the signal mask are preserved). Omitting this let a
@@ -5456,6 +5464,7 @@ fn fstatat_into(
     }
 
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    if SC_STATS { sc_stat_path_trace(path.bytes()); }
     let path_ptr = path.ptr();
     let pid = current_pid();
 
@@ -8074,6 +8083,22 @@ fn evstat_tick() {
     }
 }
 
+/// `[SCPATH]`: the path of a stat() by the second focus (cosmic-greeter-login),
+/// the first 300 and then every 500th — enough to name a stat loop's target.
+fn sc_stat_path_trace(path: &[u8]) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let f2 = sched::SC_FOCUS2_TGID.load(Ordering::Relaxed);
+    if f2 == 0 || sched::current_tgid() != f2 { return; }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= 300 && n % 500 != 0 { return; }
+    mm::gap2::s("[SCPATH] n="); mm::gap2::h(n);
+    mm::gap2::kv(" t=", ticks() as usize);
+    mm::gap2::kv(" pid=", current_pid() as usize);
+    mm::gap2::s(" ");
+    for &b in path.iter().take(160) { mm::gap2::s(if b.is_ascii_graphic() { core::str::from_utf8(core::slice::from_ref(&b)).unwrap_or("?") } else { "?" }); }
+    mm::gap2::nl();
+}
+
 /// 0.5 Hz `[SCSTAT]` top-syscalls line for the focus tgid, and a 0.1 Hz
 /// `[TASK]` census of every live task (state, wait object, last syscall).
 /// IRQ context: atomics + one RUN_QUEUE try_lock + UART-direct output.
@@ -8086,24 +8111,26 @@ fn scstat_tick() {
     if now.wrapping_sub(LAST.load(Relaxed)) < 200 { return; }
     LAST.store(now, Relaxed);
     let focus = sched::SC_FOCUS_TGID.load(Relaxed);
-    if focus != 0 {
-        // Top 10 by cumulative ns, unsorted scan (512 slots, 10 passes).
+    let focus2 = sched::SC_FOCUS2_TGID.load(Relaxed);
+    for (k, f) in [(0usize, focus), (1usize, focus2)] {
+        if f == 0 { continue; }
+        // Top 12 by cumulative ns, unsorted scan (512 slots, 12 passes).
         mm::gap2::s("[SCSTAT] t="); mm::gap2::h(now);
-        mm::gap2::kv(" tgid=", focus as usize);
+        mm::gap2::kv(" tgid=", f as usize);
         let mut taken = [false; SC_SLOTS];
-        for _ in 0..10 {
+        for _ in 0..12 {
             let mut best = 0usize; let mut best_ns = 0u64;
             for i in 0..SC_SLOTS {
                 if taken[i] { continue; }
-                let v = SC_NS[i].load(Relaxed);
+                let v = SC_NS[k][i].load(Relaxed);
                 if v > best_ns { best_ns = v; best = i; }
             }
             if best_ns == 0 { break; }
             taken[best] = true;
             mm::gap2::s(" nr"); mm::gap2::h(best);
-            mm::gap2::s(":"); mm::gap2::h(SC_N[best].load(Relaxed) as usize);
+            mm::gap2::s(":"); mm::gap2::h(SC_N[k][best].load(Relaxed) as usize);
             mm::gap2::s(":"); mm::gap2::h((best_ns / 1000) as usize);
-            mm::gap2::s(":"); mm::gap2::h((SC_MAX[best].load(Relaxed) / 1000) as usize);
+            mm::gap2::s(":"); mm::gap2::h((SC_MAX[k][best].load(Relaxed) / 1000) as usize);
         }
         mm::gap2::nl();
     }
