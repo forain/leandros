@@ -814,6 +814,12 @@ static SYNC_WAITER: [core::sync::atomic::AtomicUsize; CTRLQ_MAX] =
 /// instead of sleeping to its own tick. One waiter per CPU: a wait runs with
 /// preemption disabled.
 static SYNC_WAITING_CPUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `DRM_STATS` only: when each synchronous chain was reaped and on which CPU,
+/// for the slow-wait line (`[CTRLQ-SLOW]`).
+static SYNC_DONE_US: [core::sync::atomic::AtomicU64; CTRLQ_MAX] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; CTRLQ_MAX];
+static SYNC_DONE_CPU: [core::sync::atomic::AtomicUsize; CTRLQ_MAX] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; CTRLQ_MAX];
 
 /// Address of the control queue's used-ring `idx` and the reaper's mirror of
 /// `last_used_idx`: a lock-free "has the host answered something nobody has
@@ -854,6 +860,10 @@ fn sync_chain_done(head: usize) {
     extern "C" { fn arch_send_resched_ipi(cpu: usize); }
     use core::sync::atomic::Ordering::SeqCst;
     if head >= CTRLQ_MAX { return; }
+    if crate::drm_device_interface::DRM_STATS {
+        SYNC_DONE_US[head].store(crate::snd::monotonic_us(), core::sync::atomic::Ordering::Relaxed);
+        SYNC_DONE_CPU[head].store(unsafe { sched::cpu_id() }, core::sync::atomic::Ordering::Relaxed);
+    }
     SYNC_DONE[head].store(true, SeqCst);
     let c = SYNC_WAITER[head].load(SeqCst);
     if c != NO_PARKED_CPU && c != unsafe { sched::cpu_id() } {
@@ -896,6 +906,8 @@ struct CtrlqWait {
     head: usize,
     cpu: usize,
     parking: core::cell::Cell<bool>,
+    /// Parks taken (`DRM_STATS` diagnostics).
+    parks: core::cell::Cell<u32>,
     /// The last step parked; the tick count when it began.
     parked_at: core::cell::Cell<Option<u64>>,
 }
@@ -917,6 +929,7 @@ impl CtrlqWait {
             head,
             cpu,
             parking: core::cell::Cell::new(false),
+            parks: core::cell::Cell::new(0),
             parked_at: core::cell::Cell::new(None),
         }
     }
@@ -939,6 +952,7 @@ impl CtrlqWait {
             } else {
                 let t = sched::ticks();
                 park_until_irq();
+                self.parks.set(self.parks.get().wrapping_add(1));
                 self.parked_at.set(Some(t));
             }
             (sched::ticks().wrapping_sub(self.deadline) as i64) < 0
@@ -967,15 +981,48 @@ impl Drop for CtrlqWait {
 /// Wait for synchronous chain `head` with `VIRTIO_GPU` released; true once it
 /// completed. The caller enqueued it under the lock and retakes the lock to
 /// collect the reply (`GpuLocked::submit`).
-fn wait_sync_unlocked(head: u16) -> bool {
+fn wait_sync_unlocked(head: u16, hdr_type: u32) -> bool {
+    let stat = crate::drm_device_interface::DRM_STATS;
+    let (irq0, kick0, tick0) = if stat {
+        (CTRLQ_IRQS.load(core::sync::atomic::Ordering::Relaxed),
+         CTRLQ_PARK_KICKS.load(core::sync::atomic::Ordering::Relaxed), sched::ticks())
+    } else { (0, 0, 0) };
+    let mut self_reaped = false;
+    let mut parks = 0u32;
+    let t0 = crate::snd::monotonic_us();
+    let done = wait_sync_unlocked_inner(head, &mut self_reaped, &mut parks);
+    if stat {
+        let now = crate::snd::monotonic_us();
+        let dt = now.wrapping_sub(t0);
+        if dt >= 1000 {
+            use core::sync::atomic::Ordering::Relaxed;
+            let h = head as usize;
+            mm::gap2::s("[CTRLQ-SLOW] cmd="); mm::gap2::h(hdr_type as usize);
+            mm::gap2::kv(" dt_us=", dt as usize);
+            mm::gap2::kv(" done=", done as usize);
+            mm::gap2::kv(" parks=", parks as usize);
+            mm::gap2::kv(" ticks=", sched::ticks().wrapping_sub(tick0) as usize);
+            mm::gap2::kv(" irqs=", CTRLQ_IRQS.load(Relaxed).wrapping_sub(irq0) as usize);
+            mm::gap2::kv(" kicks=", CTRLQ_PARK_KICKS.load(Relaxed).wrapping_sub(kick0) as usize);
+            mm::gap2::kv(" self_reap=", self_reaped as usize);
+            mm::gap2::kv(" reap_to_seen_us=", now.wrapping_sub(SYNC_DONE_US[h].load(Relaxed)) as usize);
+            mm::gap2::kv(" cpu=", unsafe { sched::cpu_id() });
+            mm::gap2::kv(" reaper_cpu=", SYNC_DONE_CPU[h].load(Relaxed));
+            mm::gap2::nl();
+        }
+    }
+    done
+}
+
+fn wait_sync_unlocked_inner(head: u16, self_reaped: &mut bool, parks: &mut u32) -> bool {
     use core::sync::atomic::Ordering::{Relaxed, Release, SeqCst};
     let h = head as usize;
     if h >= CTRLQ_MAX { return false; }
     let window = SpinWindow::new();
     let wait = CtrlqWait::new(&window, Some(head));
     let mut iter = 0u64;
-    loop {
-        if SYNC_DONE[h].load(SeqCst) { return true; }
+    let done = loop {
+        if SYNC_DONE[h].load(SeqCst) { break true; }
         if ctrlq_unreaped() && (iter & 0xF == 0 || wait.parked_at.get().is_some()) {
             let woke_at = wait.parked_at.get();
             if let Some(mut g) = VIRTIO_GPU.try_lock() {
@@ -984,17 +1031,20 @@ fn wait_sync_unlocked(head: u16) -> bool {
                 }
                 drop(g);
                 if SYNC_DONE[h].load(SeqCst) {
+                    *self_reaped = true;
                     if let Some(t) = woke_at {
                         CTRLQ_PARK_STRANDED.fetch_add(1, Relaxed);
                         if sched::ticks() != t { CTRLQ_LOST_WAKES.fetch_add(1, Relaxed); }
                     }
-                    return true;
+                    break true;
                 }
             }
         }
-        if iter >= CTRLQ_WAIT_ITERS || !wait.step(&window, iter) { return false; }
+        if iter >= CTRLQ_WAIT_ITERS || !wait.step(&window, iter) { break false; }
         iter += 1;
-    }
+    };
+    *parks = wait.parks.get();
+    done
 }
 
 
@@ -3220,7 +3270,7 @@ impl GpuSync for GpuLocked {
         // No reference into the device survives this: `self` is borrowed
         // mutably for the whole call, so dropping the guard is sound.
         self.guard = None;
-        let done = wait_sync_unlocked(head_idx);
+        let done = wait_sync_unlocked(head_idx, hdr_type);
         self.guard = Some(VIRTIO_GPU.lock());
         self.dev().submit_finish(head_idx, done, hdr_type, t0)
     }
