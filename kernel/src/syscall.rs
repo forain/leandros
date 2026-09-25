@@ -4008,7 +4008,12 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // faulted the page-table walk (M7o).
     sched::dethread_current_group();
 
-    replace_address_space(*new_as, pt_root, heap_start, entry, user_sp);
+    // Unbox in an inner scope: `replace_address_space` never returns, so a
+    // `Box` still alive in this frame is never deallocated — `*new_as` as the
+    // argument moved the value out but left the 56-byte box allocation to a
+    // scope end that never comes, one slab object per exec.
+    let new_as: mm::vmm::AddressSpace = { let b = new_as; *b };
+    replace_address_space(new_as, pt_root, heap_start, entry, user_sp);
 }
 
 // ── I/O syscalls ──────────────────────────────────────────────────────────────
