@@ -233,6 +233,7 @@ pub unsafe extern "C" fn sig_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut
     if !test_signalfd_agrees_with_handler() { failures += 1; }
     if !test_shared_handoff_keeps_payloads_apart() { failures += 1; }
     if !test_futex_wait_signal_restart() { failures += 1; }
+    if !test_futex_wait_restart_stress() { failures += 1; }
     if !test_futex_wait_bitset_unaffected() { failures += 1; }
 
     puts(b"--- sigtest done ---\n\0".as_ptr());
@@ -883,6 +884,70 @@ unsafe fn test_futex_wait_signal_restart() -> bool {
         ok &= case_ok;
     }
     report(name, ok)
+}
+
+/// Stress the SA_RESTART case alone, 20×, tallying outcomes: a margin problem
+/// (scheduling jitter around the pass/fail elapsed-time thresholds) would show
+/// up as occasional EINTR *near the 30-300 ms boundary* while still being
+/// "restarted" in substance, but a genuine restart-mechanism failure shows up
+/// as EINTR at the SIGALRM's ~50 ms mark, indistinguishable from the
+/// non-restart case. Printing raw (r, el_us) per iteration makes that
+/// distinction visible instead of collapsing it into a single pass/fail.
+unsafe fn test_futex_wait_restart_stress() -> bool {
+    let name = b"futex_wait_restart_stress\0";
+    let parent = getpid();
+    let mut timedout = 0i32;
+    let mut eintr = 0i32;
+    let mut other = 0i32;
+
+    for i in 0..20 {
+        FUTEX_SIG_COUNT.store(0, Ordering::SeqCst);
+        let act = sigaction {
+            sa_handler: Some(futex_sig_handler),
+            sa_flags: SA_RESTART,
+            sa_restorer: None,
+            sa_mask: 0,
+        };
+        if sigaction(SIGALRM, &act, core::ptr::null_mut()) != 0 { other += 1; continue; }
+
+        let child = fork();
+        if child == 0 {
+            let fire = timespec { tv_sec: 0, tv_nsec: 50_000_000 };
+            nanosleep(&fire, core::ptr::null_mut());
+            kill(parent, SIGALRM);
+            _exit(0);
+        }
+
+        let word: u32 = 7;
+        let to = timespec { tv_sec: 0, tv_nsec: 300_000_000 };
+        let t0 = now_ns();
+        let r = syscall(nr::FUTEX, &word as *const u32 as c_long, FUTEX_WAIT | FUTEX_PRIVATE,
+                        7 as c_long, &to as *const timespec as c_long, 0 as c_long, 0 as c_long);
+        let el = now_ns() - t0;
+        reap(child);
+
+        write(1, b"  restart_stress[".as_ptr(), 18);
+        put_i32(i);
+        write(1, b"] r=".as_ptr(), 4);
+        put_i32(r as i32);
+        write(1, b" el_us=".as_ptr(), 7);
+        put_i32((el / 1000) as i32);
+        write(1, b"\n".as_ptr(), 1);
+
+        if r == -(ETIMEDOUT as c_long) { timedout += 1; }
+        else if r == -(EINTR as c_long) { eintr += 1; }
+        else { other += 1; }
+    }
+
+    write(1, b"  restart_stress: timedout=".as_ptr(), 28);
+    put_i32(timedout);
+    write(1, b" eintr=".as_ptr(), 7);
+    put_i32(eintr);
+    write(1, b" other=".as_ptr(), 7);
+    put_i32(other);
+    write(1, b"\n".as_ptr(), 1);
+
+    report(name, eintr == 0 && other == 0 && timedout == 20)
 }
 
 /// FUTEX_WAIT_BITSET's absolute deadline is deliberately left unaffected by
