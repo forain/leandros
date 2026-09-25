@@ -756,10 +756,11 @@ impl Drop for SpinWindow {
 
 /// Synchronous waits `submit` and `ensure_ctrlq_room` still take under
 /// `VIRTIO_GPU` (the reply-needing ~0.5 % of traffic and a full ring) no
-/// longer spin the vCPU when a completion interrupt is armed: each step parks
-/// the CPU in `wfi`/`hlt` until an interrupt — the device's, or the tick —
-/// and reaps on return. The lock stays held, so this is not a sleep other
-/// tasks can use the CPU through, but the host sees an idle vCPU for the
+/// longer spin the vCPU for long when a completion interrupt is armed: after
+/// `CTRLQ_SPIN_BEFORE_PARK_US` of spinning, each step parks the CPU in
+/// `wfi`/`hlt` until an interrupt — the device's, or the tick — and reaps on
+/// return. The lock stays held, so this is not a sleep other tasks can use
+/// the CPU through, but the host sees an idle vCPU for the
 /// round trip and the wake is the interrupt's latency, not a poll's.
 ///
 /// Without an interrupt the wake would be the tick, up to 10 ms away, so the
@@ -792,7 +793,33 @@ fn kick_parked_waiter() {
     }
 }
 
-struct CtrlqWait { park: bool, deadline: u64 }
+/// How long a wait spins before it parks, in microseconds. Most
+/// reply-needing commands come back well inside this (x86_64/KVM Zink
+/// session start: mean 55 us spinning), and a spun wait sees the reply the
+/// moment it lands. A parked one depends on the completion interrupt
+/// reaching the BSP and, when the waiter sits elsewhere, on the BSP's IPI
+/// back — and the BSP takes neither while it runs with IRQs masked (a
+/// syscall, or spinning at IF=0 for the very `VIRTIO_GPU` lock this wait
+/// holds), so a parked wait can last until the waiter's own tick. Parking
+/// from the first step measured mean 55 -> 330-370 us per reply-needing
+/// command and max 2.5 -> 8.8-9.5 ms against spinning (x86_64/KVM, Zink
+/// session start, ~130 commands); spinning 200 us first: 50-64 us, 2.8 ms.
+/// Parking is kept for the slow tail, where an idle vCPU is worth a
+/// wake-up's latency.
+const CTRLQ_SPIN_BEFORE_PARK_US: u64 = 200;
+
+/// Wait-time histogram of synchronous control-queue waits (`DRM_STATS`
+/// only): < 50 us, < 200 us, < 1 ms, < 5 ms, >= 5 ms.
+pub static CTRLQ_WAIT_HIST: [core::sync::atomic::AtomicU64; 5] = [
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+/// Waits that outlasted the spin and reached the parked phase (`DRM_STATS`
+/// only); `CTRLQ_PARKED` counts every wait that was allowed to park.
+pub static CTRLQ_PARK_PHASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+struct CtrlqWait { park: bool, deadline: u64, t0: u64, parking: core::cell::Cell<bool> }
 impl CtrlqWait {
     fn new(window: &SpinWindow) -> Self {
         let park = window.open && irq_armed();
@@ -800,12 +827,22 @@ impl CtrlqWait {
             CTRLQ_PARKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             CTRLQ_PARKED_CPU.store(unsafe { sched::cpu_id() }, core::sync::atomic::Ordering::Release);
         }
-        CtrlqWait { park, deadline: sched::ticks().wrapping_add(CTRLQ_PARK_TIMEOUT_TICKS) }
+        CtrlqWait {
+            park,
+            deadline: sched::ticks().wrapping_add(CTRLQ_PARK_TIMEOUT_TICKS),
+            t0: crate::snd::monotonic_us(),
+            parking: core::cell::Cell::new(false),
+        }
     }
     /// One wait step; false when the parked wait has run out of time.
     #[inline]
     fn step(&self, window: &SpinWindow, iter: u64) -> bool {
-        if self.park {
+        if self.park && (self.parking.get()
+            || crate::snd::monotonic_us().wrapping_sub(self.t0) >= CTRLQ_SPIN_BEFORE_PARK_US)
+        {
+            if !self.parking.replace(true) && crate::drm_device_interface::DRM_STATS {
+                CTRLQ_PARK_PHASE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
             park_until_irq();
             (sched::ticks().wrapping_sub(self.deadline) as i64) < 0
         } else {
@@ -818,6 +855,11 @@ impl CtrlqWait {
 impl Drop for CtrlqWait {
     fn drop(&mut self) {
         if self.park { CTRLQ_PARKED_CPU.store(NO_PARKED_CPU, core::sync::atomic::Ordering::Release); }
+        if crate::drm_device_interface::DRM_STATS {
+            let dt = crate::snd::monotonic_us().wrapping_sub(self.t0);
+            let b = if dt < 50 { 0 } else if dt < 200 { 1 } else if dt < 1000 { 2 } else if dt < 5000 { 3 } else { 4 };
+            CTRLQ_WAIT_HIST[b].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
