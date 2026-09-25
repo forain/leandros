@@ -25,13 +25,18 @@ case "$ARCH" in aarch64) PLAT=linux/arm64 ;; x86_64) PLAT=linux/amd64 ;; *) exit
 mkdir -p "$OUT"
 LOG="$OUT/gpu-stage-$ARCH.log"
 echo "building GPU Mesa for $ARCH with $CT (log: $LOG)"
+# Run a private COPY of the container scripts: sh reads a script as it goes,
+# so editing the checkout mid-build would otherwise change the running build.
+SNAP=$(mktemp -d "${TMPDIR:-/tmp}/gpu-stack-src.XXXXXX")
+cp "$HERE/build-gpu-stack-alpine.sh" "$HERE/gpuprobe.c" "$HERE/ssp_guard.c" "$SNAP/"
+trap 'rm -rf "$SNAP"' EXIT
 # GPU_BUILD_TMP: host dir for the container's /tmp (the ~2 GB build tree) when
 # the container storage lives on a nearly-full root filesystem.
 TMPMNT=""
 if [ -n "${GPU_BUILD_TMP:-}" ]; then mkdir -p "$GPU_BUILD_TMP"; TMPMNT="-v $GPU_BUILD_TMP:/tmp"; fi
 # shellcheck disable=SC2086
 "$CT" run --rm --platform "$PLAT" $TMPMNT \
-    -v "$MESA_SRC:/work/mesa" -v "$HERE:/src:ro" -v "$OUT:/out" \
+    -v "$MESA_SRC:/work/mesa" -v "$SNAP:/src:ro" -v "$OUT:/out" \
     alpine:3.21 sh /src/build-gpu-stack-alpine.sh "$ARCH" "${2:-all}" >"$LOG" 2>&1 || true
 tail -30 "$LOG"
 tail -1 "$LOG" | grep -q '=== rc=0 ' || { echo "❌ build failed (see $LOG)"; exit 1; }

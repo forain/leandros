@@ -95,8 +95,11 @@ esac
   if readelf -d libgallium-25.3.6.so libvulkan_virtio.so libvulkan.so.1 | grep -q 'libc.musl'; then
     echo "musl soname still present"; exit 4
   fi
+  # Never copy anything but a finished stage: an empty $S here once made
+  # `cp -a "$S/."` copy the container's whole root (with /proc) into /out.
+  [ -n "$S" ] && [ "$S" != / ] && [ -f "$S/usr/lib/libgallium-25.3.6.so" ] && [ -x "$S/usr/bin/gpuprobe" ]
   rm -rf "/out/gpu-stage-$ARCH"
   mkdir -p "/out/gpu-stage-$ARCH"
-  cp -a "$S/." "/out/gpu-stage-$ARCH/"
+  cp -a "$S/usr" "/out/gpu-stage-$ARCH/"
 )
 echo "=== rc=$? arch=$ARCH ==="
