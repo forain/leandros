@@ -2569,6 +2569,7 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
     // Fast path: the running task's own address space (page faults, its own
     // mm syscalls — nearly every call), via the per-CPU slot, no RUN_QUEUE.
     // See `CURRENT_AS` for why the pointer is live here.
+    let t0 = lockwatch::as_clock();
     let cpu = unsafe { cpu_id() };
     if pid != 0 && CURRENT_PID[cpu].load(Ordering::Relaxed) == pid {
         let p = CURRENT_AS[cpu].load(Ordering::Acquire);
@@ -2579,6 +2580,7 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
                 if as_.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                     lockwatch::note_wait(0);
                     lockwatch::note_hold(lockwatch::L_AS_BUSY, true);
+                    lockwatch::note_as_acquired(t0, spins != 0);
                     return Some(p);
                 }
                 spins = spins.wrapping_add(1);
@@ -2611,6 +2613,7 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
             {
                 lockwatch::note_wait(0);
                 lockwatch::note_hold(lockwatch::L_AS_BUSY, true);
+                lockwatch::note_as_acquired(t0, spins != 0);
                 // `as_` is a shared `&Arc<AddressSpace>` now (see
                 // `Task::address_space`'s doc comment for why it's an `Arc`,
                 // not a `Box`) — the cast to `*mut` is the same "exclusivity
@@ -2632,6 +2635,7 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
 /// Release exclusive access taken by `lock_leader_address_space`.
 pub(crate) unsafe fn unlock_address_space(as_ptr: *mut mm::vmm::AddressSpace) {
     lockwatch::note_hold(lockwatch::L_AS_BUSY, false);
+    lockwatch::note_as_released();
     (*as_ptr).busy.store(false, Ordering::Release);
 }
 

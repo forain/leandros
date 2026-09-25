@@ -122,6 +122,37 @@ pub fn note_pick(full: bool, visited: u32, ns: u64) {
 }
 #[inline]
 pub fn pick_clock() -> u64 { if HOLD_PROFILE { now_ns() } else { 0 } }
+/// Address-space acquisition census (HOLD_PROFILE only): every
+/// `lock_leader_address_space` success — how long getting it took (RUN_QUEUE
+/// wait + `busy` spin; `contended` = it had to spin on `busy`) and how long
+/// `busy` was then held.
+static AS_ACQ: AtomicU32 = AtomicU32::new(0);
+static AS_CONT: AtomicU32 = AtomicU32::new(0);
+static AS_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static AS_WAIT_MAX: AtomicU32 = AtomicU32::new(0);
+static AS_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+static AS_HOLD_MAX: AtomicU32 = AtomicU32::new(0);
+static AS_SINCE: [AtomicU64; super::MAX_CPUS] = [const { AtomicU64::new(0) }; super::MAX_CPUS];
+#[inline]
+pub fn as_clock() -> u64 { if HOLD_PROFILE { now_ns() } else { 0 } }
+#[inline]
+pub fn note_as_acquired(t0: u64, contended: bool) {
+    if !HOLD_PROFILE { return; }
+    let t = now_ns();
+    let w = t.saturating_sub(t0);
+    AS_ACQ.fetch_add(1, Ordering::Relaxed);
+    if contended { AS_CONT.fetch_add(1, Ordering::Relaxed); }
+    AS_WAIT_NS.fetch_add(w, Ordering::Relaxed);
+    AS_WAIT_MAX.fetch_max(w.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+    AS_SINCE[me()].store(t, Ordering::Relaxed);
+}
+#[inline]
+pub fn note_as_released() {
+    if !HOLD_PROFILE { return; }
+    let h = now_ns().saturating_sub(AS_SINCE[me()].load(Ordering::Relaxed));
+    AS_HOLD_NS.fetch_add(h, Ordering::Relaxed);
+    AS_HOLD_MAX.fetch_max(h.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+}
 pub fn note_ready_hint_miss() { READY_HINT_MISS.fetch_add(1, Ordering::Relaxed); }
 /// Hold-age histogram at tick failure (same buckets).
 static TFAIL_HIST: [AtomicU32; NBUCKETS] = [const { AtomicU32::new(0) }; NBUCKETS];
@@ -239,7 +270,13 @@ pub fn dump_profile() {
     s(" full="); n(PICK_FULL.load(Ordering::Relaxed) as u64);
     s(" visited="); n(PICK_VISITED.load(Ordering::Relaxed));
     s(" pick_ns="); n(PICK_NS.load(Ordering::Relaxed));
-    s(" | age-at-fail:");
+    s(" | as acq="); n(AS_ACQ.load(Ordering::Relaxed) as u64);
+    s(" cont="); n(AS_CONT.load(Ordering::Relaxed) as u64);
+    s(" wait_us="); n(AS_WAIT_NS.load(Ordering::Relaxed) / 1000);
+    s(" wait_max="); n(AS_WAIT_MAX.load(Ordering::Relaxed) as u64);
+    s("ns hold_us="); n(AS_HOLD_NS.load(Ordering::Relaxed) / 1000);
+    s(" hold_max="); n(AS_HOLD_MAX.load(Ordering::Relaxed) as u64);
+    s("ns | age-at-fail:");
     for b in 0..NBUCKETS { s(" "); n(TFAIL_HIST[b].load(Ordering::Relaxed) as u64); }
     s("  (buckets <1u <4u <16u <64u <256u <1m >=1m)
 ");
