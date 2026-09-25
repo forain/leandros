@@ -1,0 +1,29 @@
+--- a/src/dispatch_common.c	2026-09-25 16:49:06
++++ b/src/dispatch_common.c	2026-09-25 16:49:06
+@@ -176,8 +176,13 @@
+ #if defined(__APPLE__)
+ #define GLX_LIB "/opt/X11/lib/libGL.1.dylib"
+ #define OPENGL_LIB "/System/Library/Frameworks/OpenGL.framework/Versions/Current/OpenGL"
+-#define GLES1_LIB "libGLESv1_CM.so"
+-#define GLES2_LIB "libGLESv2.so"
++/* ANGLE (EGL + GLES over Metal); @ANGLE_LIBDIR@ is filled in at build time. */
++#ifndef EPOXY_ANGLE_LIBDIR
++#define EPOXY_ANGLE_LIBDIR "@ANGLE_LIBDIR@"
++#endif
++#define EGL_LIB EPOXY_ANGLE_LIBDIR "libEGL.dylib"
++#define GLES1_LIB EPOXY_ANGLE_LIBDIR "libGLESv1_CM.dylib"
++#define GLES2_LIB EPOXY_ANGLE_LIBDIR "libGLESv2.dylib"
+ #elif defined(__ANDROID__)
+ #define GLX_LIB "libGLESv2.so"
+ #define EGL_LIB "libEGL.so"
+--- a/src/dispatch_common.h	2026-09-25 16:49:06
++++ b/src/dispatch_common.h	2026-09-25 16:49:06
+@@ -28,7 +28,7 @@
+ #define PLATFORM_HAS_GLX ENABLE_GLX
+ #define PLATFORM_HAS_WGL 1
+ #elif defined(__APPLE__)
+-#define PLATFORM_HAS_EGL 0 
++#define PLATFORM_HAS_EGL ENABLE_EGL
+ #define PLATFORM_HAS_GLX ENABLE_GLX
+ #define PLATFORM_HAS_WGL 0
+ #elif defined(ANDROID)

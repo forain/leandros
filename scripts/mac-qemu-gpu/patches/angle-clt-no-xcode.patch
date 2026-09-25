@@ -1,0 +1,128 @@
+diff --color -ru a/build/config/apple/sdk_info.py b/build/config/apple/sdk_info.py
+--- a/build/config/apple/sdk_info.py	2026-09-25 16:50:09
++++ b/build/config/apple/sdk_info.py	2026-09-25 16:50:09
+@@ -62,11 +62,16 @@
+         settings['xcode_build'] = version_plist['ProductBuildVersion']
+         return
+ 
+-    lines = (
+-        subprocess.check_output(['xcodebuild', '-version'])
+-        .decode('UTF-8')
+-        .splitlines()
+-    )
++    try:
++        lines = (
++            subprocess.check_output(['xcodebuild', '-version'],
++                                    stderr=subprocess.DEVNULL)
++            .decode('UTF-8')
++            .splitlines()
++        )
++    except (subprocess.CalledProcessError, OSError):
++        # Command Line Tools only (no Xcode.app): pretend Xcode 26.0.
++        lines = ['Xcode 26.0', 'Build version 17A324']
+     version_verbatim = lines[0].split()[-1]
+     settings['xcode_version'] = FormatVersion(version_verbatim)
+     settings['xcode_version_int'] = int(settings['xcode_version'], 10)
+@@ -85,40 +90,23 @@
+ 
+ 
+ def FillSDKPathAndVersion(settings, platform, xcode_version):
+-    """Fills the SDK path and version for |platform| into |settings|."""
+-    settings['sdk_path'] = (
+-        subprocess.check_output(['xcrun', '-sdk', platform, '--show-sdk-path'])
+-        .decode('UTF-8')
+-        .strip()
+-    )
+-    settings['sdk_version'] = (
+-        subprocess.check_output(
+-            ['xcrun', '-sdk', platform, '--show-sdk-version']
+-        )
+-        .decode('UTF-8')
+-        .strip()
+-    )
+-    settings['sdk_platform_path'] = (
+-        subprocess.check_output(
+-            ['xcrun', '-sdk', platform, '--show-sdk-platform-path']
+-        )
+-        .decode('UTF-8')
+-        .strip()
+-    )
+-    settings['sdk_build'] = (
+-        subprocess.check_output(
+-            ['xcrun', '-sdk', platform, '--show-sdk-build-version']
+-        )
+-        .decode('UTF-8')
+-        .strip()
+-    )
+-    settings['toolchains_path'] = os.path.join(
+-        subprocess.check_output(['xcode-select', '-print-path'])
+-        .decode('UTF-8')
+-        .strip(),
+-        'Toolchains/XcodeDefault.xctoolchain',
+-    )
+-
++    """Fills the SDK path and version for |platform| into |settings|.
++    Command-Line-Tools-friendly: honours $SDKROOT, tolerates missing items."""
++    def q(*a):
++        try:
++            return subprocess.check_output(['xcrun', '-sdk', platform] + list(a),
++                                           stderr=subprocess.DEVNULL).decode('UTF-8').strip()
++        except subprocess.CalledProcessError:
++            return ''
++    sdk = os.environ.get('SDKROOT') or q('--show-sdk-path')
++    settings['sdk_path'] = sdk
++    with open(os.path.join(sdk, 'SDKSettings.json')) as f:
++        import json
++        js = json.load(f)
++    settings['sdk_version'] = js.get('Version', '26.0')
++    settings['sdk_platform_path'] = q('--show-sdk-platform-path') or os.path.dirname(os.path.dirname(sdk))
++    settings['sdk_build'] = js.get('ProductBuildVersion', q('--show-sdk-build-version') or '0')
++    settings['toolchains_path'] = '/Library/Developer/CommandLineTools'
+ 
+ def CreateXcodeSymlinkAt(src, dst, root_build_dir):
+     """Create symlink to Xcode directory at target location."""
+diff --color -ru a/build/mac/find_sdk.py b/build/mac/find_sdk.py
+--- a/build/mac/find_sdk.py	2026-09-25 16:50:09
++++ b/build/mac/find_sdk.py	2026-09-25 16:50:09
+@@ -84,6 +84,9 @@
+     dev_dir = out.decode('UTF-8').rstrip()
+     sdk_dir = os.path.join(dev_dir, 'Platforms/MacOSX.platform/Developer/SDKs')
+ 
++    if not os.path.isdir(sdk_dir) and os.environ.get('SDKROOT'):
++        _sdk = os.environ['SDKROOT'].rstrip('/')
++        sdk_dir = os.path.dirname(_sdk)
+     if not os.path.isdir(sdk_dir):
+         raise SdkError(
+             'Install Xcode, launch it, accept the license '
+@@ -103,6 +106,10 @@
+             f'No {min_sdk_version}+ SDK found. {sdk_dir} contains: {sdk_dir_list}'
+         )
+     best_sdk = sorted(sdks, key=parse_version)[0]
++    if os.environ.get('SDKROOT'):
++        _m = re.findall(r'MacOSX(\d+\.\d+)\.sdk$', os.environ['SDKROOT'].rstrip('/'))
++        if _m:
++            best_sdk = _m[0]
+     sdk_name = 'MacOSX' + best_sdk + '.sdk'
+     sdk_path = os.path.join(sdk_dir, sdk_name)
+ 
+@@ -111,6 +118,8 @@
+ 
+     if options.print_bin_path:
+         bin_path = 'Toolchains/XcodeDefault.xctoolchain/usr/bin/'
++        if not os.path.isdir(os.path.join(dev_dir, bin_path)):
++            bin_path = 'usr/bin/'
+         print(os.path.join(dev_dir, bin_path))
+ 
+     if options.print_sdk_build:
+diff --color -ru a/src/libANGLE/renderer/metal/metal_backend.gni b/src/libANGLE/renderer/metal/metal_backend.gni
+--- a/src/libANGLE/renderer/metal/metal_backend.gni	2026-09-14 19:01:31
++++ b/src/libANGLE/renderer/metal/metal_backend.gni	2026-09-25 16:50:09
+@@ -101,7 +101,7 @@
+ # explicit Metal toolchain via "angle_metal_toolchain_dir" opts in to
+ # precompiling the internal shaders anyway, which enables prebuilt internal
+ # shaders for iOS as well.
+-metal_internal_shader_compilation_supported =
++metal_internal_shader_compilation_supported = false &&
+     angle_has_build &&
+     (angle_metal_toolchain_dir != "" || (!is_ios && target_os == host_os))
+ 
