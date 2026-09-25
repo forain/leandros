@@ -571,6 +571,23 @@ unsafe fn mem_guard(g: &mut MemGuard, dm_pid: i32) {
     write_str(") and its session;\n");
     write_str("## it restarts under the usual backoff. See /var/log/greetd.log.\n");
     write_str("################################################################\n");
+    // The serial console is not always being read (a driver socket with no
+    // client drops it), so leave the same fact in the log the chain wrote.
+    let fd = open(DM_LOG.as_ptr(), O_WRONLY | O_APPEND, 0);
+    if fd >= 0 {
+        let mut line = [0u8; 128];
+        let mut p = 0;
+        let head = b"[init] MEMORY PRESSURE: MemAvailable ";
+        line[..head.len()].copy_from_slice(head); p += head.len();
+        p += fmt_u32(&mut line[p..], (avail / 1024) as u32);
+        let mid = b" MiB < floor ";
+        line[p..p + mid.len()].copy_from_slice(mid); p += mid.len();
+        p += fmt_u32(&mut line[p..], (floor / 1024) as u32);
+        let tail = b" MiB; killing the graphical login\n";
+        line[p..p + tail.len()].copy_from_slice(tail); p += tail.len();
+        write(fd, line.as_ptr(), p);
+        close(fd);
+    }
     syscall2(nr::KILL, dm_pid as usize, 9);
 }
 
