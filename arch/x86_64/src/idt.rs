@@ -525,7 +525,13 @@ extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, e
     // siginfo and let the stub deliver it. Silent on purpose — a program
     // that handles its own faults (GC barriers, stack probes, siglongjmp
     // recovery) must not spam the console on each one.
-    let (sig, si_code, si_addr) = fault_siginfo(vector, error_code, cr2, frame.rip);
+    // A file-mapping page past end of file is a bus error, not a bad
+    // address (handle_page_fault recorded which it was).
+    let (sig, si_code, si_addr) = if vector == 14 && sched::take_fault_sigbus() {
+        (SIGBUS, sched::BUS_ADRERR, cr2 as usize)
+    } else {
+        fault_siginfo(vector, error_code, cr2, frame.rip)
+    };
     if sched::fault_signal(sig, si_code, si_addr) {
         return;
     }

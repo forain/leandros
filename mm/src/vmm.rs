@@ -74,9 +74,10 @@ pub struct VmaRegion {
 // filesystem side services them with direct handler calls and polling I/O,
 // so they never block or reschedule.
 
-/// Read `len` bytes at byte `offset` of the backing file identified by
-/// `file_cap` into `dst` (a kernel HHDM pointer).  Returns false on error.
-pub type FileReadFn = fn(file_cap: usize, offset: u64, dst: *mut u8, len: usize) -> bool;
+/// Read up to `len` bytes at byte `offset` of the backing file identified by
+/// `file_cap` into `dst` (a kernel HHDM pointer).  Returns the number of
+/// bytes read (short only at end of file) or a negative errno.
+pub type FileReadFn = fn(file_cap: usize, offset: u64, dst: *mut u8, len: usize) -> isize;
 /// Adjust the reference count of `file_cap` (one reference per live VMA).
 pub type FileRefFn = fn(file_cap: usize);
 
@@ -100,26 +101,73 @@ pub fn is_file_backed(file_cap: usize) -> bool {
     file_cap != 0 && file_cap != usize::MAX
 }
 
-fn file_read(file_cap: usize, offset: u64, dst: *mut u8, len: usize) -> bool {
+/// Read through the registered file hook (see [`FileReadFn`]). Public so
+/// the scheduler's fault path can do the read with the address space
+/// unlocked (see [`AddressSpace::plan_user_page_fault`]).
+pub fn file_read(file_cap: usize, offset: u64, dst: *mut u8, len: usize) -> isize {
     let f = FILE_READ_HOOK.load(Ordering::Acquire);
-    if f == 0 { return false; }
+    if f == 0 { return -5; }
     let f: FileReadFn = unsafe { core::mem::transmute(f) };
     f(file_cap, offset, dst, len)
 }
 
-pub(crate) fn file_retain(file_cap: usize) {
+/// Kernel-private `map_flags` bit (Linux never sets bit 30): the VMA is an
+/// mmap(2) file mapping, so a page lying wholly past the file's *current*
+/// end raises SIGBUS instead of being zero-filled, and the part of the last
+/// page past EOF reads as zeros. ELF segments leave it clear: their span
+/// past `p_filesz` is BSS and must zero-fill.
+pub const MAP_EOF_SIGBUS: u32 = 1 << 30;
+
+/// Outcome of a user page fault.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fault {
+    /// Resolved (or raced with a concurrent change): retry the access.
+    Handled,
+    /// Not mapped, or an access the mapping forbids: SIGSEGV.
+    Segv,
+    /// A file page past end of file, or a read error: SIGBUS.
+    Bus,
+}
+
+/// A file-backed fault whose read the caller performs with the address
+/// space *unlocked*, then hands to [`AddressSpace::install_file_fault`].
+#[derive(Clone, Copy, Debug)]
+pub struct FileFault {
+    pub cap:     usize,
+    /// Page-aligned faulting address.
+    pub page_va: usize,
+    /// File byte offset backing `page_va`.
+    pub pos:     u64,
+    /// Bytes to read at `pos` (0: the window is pure BSS).
+    pub len:     usize,
+    /// Pages in the fault-around window, starting at `page_va`.
+    pub window:  usize,
+    pub eof_sigbus: bool,
+}
+
+/// First half of a fault: either finished under the lock, or a file read to
+/// do without it.
+pub enum FaultPlan {
+    Done(Fault),
+    Read(FileFault),
+}
+
+pub fn file_retain(file_cap: usize) {
     let f = FILE_RETAIN_HOOK.load(Ordering::Acquire);
     if f == 0 { return; }
     let f: FileRefFn = unsafe { core::mem::transmute(f) };
     f(file_cap)
 }
 
-pub(crate) fn file_release(file_cap: usize) {
+pub fn file_release(file_cap: usize) {
     let f = FILE_RELEASE_HOOK.load(Ordering::Acquire);
     if f == 0 { return; }
     let f: FileRefFn = unsafe { core::mem::transmute(f) };
     f(file_cap)
 }
+
+/// Pages a file-backed fault reads ahead in one go (64 KiB).
+const FAULT_AROUND_PAGES: usize = 16;
 
 /// Per-process address space.
 pub struct AddressSpace {
@@ -493,6 +541,38 @@ impl AddressSpace {
         file_off: u64,
         file_len: u64,
     ) -> bool {
+        self.map_lazy_file_with(virt, size, flags, file_cap, file_off, file_len, MAP_PRIVATE)
+    }
+
+    /// `mmap(2)` of a regular file, `MAP_PRIVATE`: demand-paged like an exec
+    /// segment, but with Linux end-of-file semantics ([`MAP_EOF_SIGBUS`]):
+    /// the whole VMA may be read from the file, and what the file no longer
+    /// covers at fault time is SIGBUS (whole pages) or zeros (last page).
+    /// Pages are private copies from the first fault, so a write needs no
+    /// copy-on-write of its own; fork shares them CoW like anonymous memory.
+    pub fn map_private_file(
+        &mut self,
+        virt: usize,
+        size: usize,
+        flags: PageFlags,
+        file_cap: usize,
+        file_off: u64,
+    ) -> bool {
+        let span = ((size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)) as u64;
+        self.map_lazy_file_with(virt, size, flags, file_cap, file_off, span,
+                                MAP_PRIVATE | MAP_EOF_SIGBUS)
+    }
+
+    fn map_lazy_file_with(
+        &mut self,
+        virt: usize,
+        size: usize,
+        flags: PageFlags,
+        file_cap: usize,
+        file_off: u64,
+        file_len: u64,
+        map_flags: u32,
+    ) -> bool {
         if size == 0 { return note_fail(FAIL_ZERO_SIZE); }
         if !is_file_backed(file_cap) { return note_fail(FAIL_BAD_FILECAP); }
 
@@ -531,7 +611,7 @@ impl AddressSpace {
             lazy_pages: Vec::new(),
             lazy_count: 0,
             prot,
-            map_flags: MAP_PRIVATE,
+            map_flags,
             file_cap,
             file_off,
             file_len,
@@ -554,6 +634,43 @@ impl AddressSpace {
     /// if `fault_va` is not within any VMA, or it's a genuine protection
     /// violation (segmentation fault either way).
     pub fn handle_user_page_fault(&mut self, fault_va: usize, is_write: bool) -> bool {
+        self.user_page_fault(fault_va, is_write) == Fault::Handled
+    }
+
+    /// [`handle_user_page_fault`] with the SIGSEGV/SIGBUS distinction, doing
+    /// any file read *while this address space is held*. Only for callers
+    /// that already hold it (prefault, the ELF loader); the scheduler's
+    /// fault entry splits the work with [`plan_user_page_fault`] instead.
+    ///
+    /// [`handle_user_page_fault`]: Self::handle_user_page_fault
+    /// [`plan_user_page_fault`]: Self::plan_user_page_fault
+    pub fn user_page_fault(&mut self, fault_va: usize, is_write: bool) -> Fault {
+        match self.plan_user_page_fault(fault_va, is_write) {
+            FaultPlan::Done(f) => f,
+            FaultPlan::Read(p) => {
+                let mut bounce: Vec<u8> = alloc::vec![0u8; p.len];
+                let got = if p.len == 0 { 0 } else {
+                    file_read(p.cap, p.pos, bounce.as_mut_ptr(), p.len)
+                };
+                self.install_file_fault(&p, &bounce, got)
+            }
+        }
+    }
+
+    /// First half of a user page fault.
+    ///
+    /// Looks up the VMA that contains `fault_va`:
+    ///   - Not backed yet, anonymous: allocate one zeroed page and map it.
+    ///   - Not backed yet, file-backed: return the read to perform
+    ///     ([`FaultPlan::Read`]). The caller reads with the address space
+    ///     *unlocked* — file I/O is milliseconds, and holding `busy` across
+    ///     it stalls every sibling thread's fault and mm syscall — then
+    ///     calls [`install_file_fault`](Self::install_file_fault).
+    ///   - Backed, write fault, `region.cow`: promote — copy the page (or
+    ///     reuse it in place if we're already the sole remaining owner) and
+    ///     remap it writable in this address space only.
+    ///   - Backed, anything else: a real protection violation.
+    pub fn plan_user_page_fault(&mut self, fault_va: usize, is_write: bool) -> FaultPlan {
         let page_va = fault_va & !(PAGE_SIZE - 1);
         let page_table_root = self.page_table_root;
 
@@ -562,11 +679,11 @@ impl AddressSpace {
             |r| fault_va >= r.start && fault_va < r.end
         ) {
             Some(r) => r,
-            None    => return false, // not mapped at all → segfault
+            None    => return FaultPlan::Done(Fault::Segv), // not mapped at all
         };
 
         if !region.lazy {
-            return false;
+            return FaultPlan::Done(Fault::Segv);
         }
 
         // Compute the page index within this VMA.
@@ -583,7 +700,7 @@ impl AddressSpace {
             // will succeed. Only an access the region forbids is a real
             // protection violation.
             if !(is_write && region.cow) {
-                return !is_write || (region.prot & PROT_WRITE) != 0;
+                return FaultPlan::Done(if !is_write || (region.prot & PROT_WRITE) != 0 { Fault::Handled } else { Fault::Segv });
             }
 
             // Serialize the get→copy→dec promotion against clone_as and
@@ -596,7 +713,7 @@ impl AddressSpace {
             } else {
                 let np = match buddy_alloc(0) {
                     Some(p) => p,
-                    None    => return false, // OOM
+                    None    => return FaultPlan::Done(Fault::Segv), // OOM
                 };
                 unsafe {
                     core::ptr::copy_nonoverlapping(
@@ -618,7 +735,7 @@ impl AddressSpace {
             let mapped = unsafe { map_page(page_table_root, page_va, new_phys, region.flags) };
             if !mapped {
                 if new_phys != lazy_phys { buddy_free(new_phys, 0); }
-                return false;
+                return FaultPlan::Done(Fault::Segv);
             }
             region.lazy_pages[page_idx] = new_phys;
             // A *copy* promotion rewrote a live PTE to point at a different
@@ -634,23 +751,18 @@ impl AddressSpace {
             if new_phys != lazy_phys {
                 tlb_shootdown_all();
             }
-            return true;
+            return FaultPlan::Done(Fault::Handled);
         }
 
-        // ── Populate the absent page ──────────────────────────────────────────
+        // ── Absent page ───────────────────────────────────────────────────────
         //
-        // Anonymous VMAs get one zeroed page.  File-backed VMAs (demand-paged
-        // exec image) additionally read the page's bytes from the backing
-        // file — and fault around: a run of following absent pages is
-        // populated in the same fault, so one gathered file read (which the
-        // filesystem turns into few multi-block device requests) replaces up
-        // to FAULT_AROUND_PAGES separate fault round trips.
-        const FAULT_AROUND_PAGES: usize = 16;
-
-        let region_pages = (region.end - region.start) / PAGE_SIZE;
-        let file_backed  = is_file_backed(region.file_cap);
-
-        let window = if file_backed {
+        // File-backed VMAs (demand-paged exec images and private mmap(2) of
+        // a file) fault around: a run of following absent pages is read in
+        // the same fault, so one gathered file read (which the filesystem
+        // turns into few multi-block device requests) replaces up to
+        // FAULT_AROUND_PAGES separate fault round trips.
+        if is_file_backed(region.file_cap) {
+            let region_pages = (region.end - region.start) / PAGE_SIZE;
             let mut n = 1usize;
             while n < FAULT_AROUND_PAGES
                 && page_idx + n < region_pages
@@ -658,50 +770,104 @@ impl AddressSpace {
             {
                 n += 1;
             }
-            n
+            // Window tails past the file extent are BSS and stay zero.
+            let win_off = (page_idx * PAGE_SIZE) as u64;
+            let len = if win_off < region.file_len {
+                ((region.file_len - win_off) as usize).min(n * PAGE_SIZE)
+            } else { 0 };
+            return FaultPlan::Read(FileFault {
+                cap: region.file_cap,
+                page_va,
+                pos: region.file_off + win_off,
+                len,
+                window: n,
+                eof_sigbus: region.map_flags & MAP_EOF_SIGBUS != 0,
+            });
+        }
+
+        // Anonymous: one zeroed page.
+        let phys = match buddy_alloc(0) {
+            Some(p) => p,
+            None    => return FaultPlan::Done(Fault::Segv), // OOM
+        };
+        unsafe { (crate::phys_to_virt(phys) as *mut u8).write_bytes(0, PAGE_SIZE); }
+        if !unsafe { map_page(page_table_root, page_va, phys, region.flags) } {
+            buddy_free(phys, 0);
+            return FaultPlan::Done(Fault::Segv);
+        }
+        if region.lazy_pages.len() <= page_idx {
+            region.lazy_pages.resize(page_idx + 1, 0);
+        }
+        region.lazy_pages[page_idx] = phys;
+        region.lazy_count += 1;
+        FaultPlan::Done(Fault::Handled)
+    }
+
+    /// Second half of a file-backed fault: install the pages read for `p`.
+    ///
+    /// `data` holds the bytes read at `p.pos` and `got` is the read's result
+    /// (bytes, or a negative errno). The address space was unlocked during
+    /// the read, so everything is re-validated: if the VMA at `p.page_va` is
+    /// gone or no longer maps the same file bytes (munmap, MAP_FIXED
+    /// overlay, split with a different offset), nothing is installed and the
+    /// access simply retries against the new state. Pages a concurrent fault
+    /// populated meanwhile are left alone.
+    pub fn install_file_fault(&mut self, p: &FileFault, data: &[u8], got: isize) -> Fault {
+        let page_table_root = self.page_table_root;
+        let region = match self.regions.iter_mut().filter_map(|r| r.as_mut()).find(
+            |r| p.page_va >= r.start && p.page_va < r.end
+        ) {
+            Some(r) => r,
+            None    => return Fault::Handled, // unmapped meanwhile: the retry decides
+        };
+        let page_idx = (p.page_va - region.start) / PAGE_SIZE;
+        if !region.lazy
+            || region.file_cap != p.cap
+            || region.file_off + (page_idx * PAGE_SIZE) as u64 != p.pos
+            || (region.map_flags & MAP_EOF_SIGBUS != 0) != p.eof_sigbus
+        {
+            return Fault::Handled;
+        }
+        if region.lazy_pages.get(page_idx).copied().unwrap_or(0) != 0 {
+            return Fault::Handled; // a sibling's fault got there first
+        }
+
+        // How many bytes are valid, and how many pages to populate.
+        let (valid, pages) = if p.eof_sigbus {
+            if got < 0 { return Fault::Bus; } // I/O error: SIGBUS, as on Linux
+            let valid = (got as usize).min(p.len).min(data.len());
+            if valid == 0 { return Fault::Bus; } // page wholly past EOF
+            // Pages wholly past the end stay absent, so touching them later
+            // raises SIGBUS (or reads data the file has grown into).
+            (valid, ((valid + PAGE_SIZE - 1) / PAGE_SIZE).min(p.window))
         } else {
-            1
+            // ELF segment: the file extent is exact; a short read is an error.
+            if p.len != 0 && got != p.len as isize { return Fault::Segv; }
+            (p.len.min(data.len()), p.window)
         };
 
-        // One gathered read for the window's file bytes (window tails past
-        // the file extent are BSS and stay zero).
-        let mut bounce: Vec<u8> = Vec::new();
-        let mut read_len = 0usize;
-        if file_backed {
-            let win_off = (page_idx * PAGE_SIZE) as u64;
-            if win_off < region.file_len {
-                read_len = ((region.file_len - win_off) as usize).min(window * PAGE_SIZE);
-                bounce = alloc::vec![0u8; read_len];
-                if !file_read(
-                    region.file_cap,
-                    region.file_off + win_off,
-                    bounce.as_mut_ptr(),
-                    read_len,
-                ) {
-                    return false;
-                }
-            }
+        let region_pages = (region.end - region.start) / PAGE_SIZE;
+        if region.lazy_pages.len() < (page_idx + pages).min(region_pages) {
+            region.lazy_pages.resize((page_idx + pages).min(region_pages), 0);
         }
 
-        if region.lazy_pages.len() < page_idx + window {
-            region.lazy_pages.resize(page_idx + window, 0);
-        }
-
-        for i in 0..window {
+        for i in 0..pages {
             let idx = page_idx + i;
+            if idx >= region_pages { break; }
+            if region.lazy_pages[idx] != 0 { continue; }
             let phys = match buddy_alloc(0) {
                 Some(p) => p,
                 // OOM on a fault-around page is not a failure as long as the
                 // faulting page itself (i == 0) was populated.
-                None => return i > 0,
+                None => return if i > 0 { Fault::Handled } else { Fault::Segv },
             };
             let dst = crate::phys_to_virt(phys) as *mut u8;
             unsafe { dst.write_bytes(0, PAGE_SIZE); }
             let copy_start = i * PAGE_SIZE;
-            if copy_start < read_len {
-                let n = (read_len - copy_start).min(PAGE_SIZE);
+            if copy_start < valid {
+                let n = (valid - copy_start).min(PAGE_SIZE);
                 unsafe {
-                    core::ptr::copy_nonoverlapping(bounce.as_ptr().add(copy_start), dst, n);
+                    core::ptr::copy_nonoverlapping(data.as_ptr().add(copy_start), dst, n);
                 }
             }
             // AArch64: clean the D-cache for executable pages so the I-cache
@@ -722,21 +888,21 @@ impl AddressSpace {
             };
             if !mapped {
                 buddy_free(phys, 0);
-                return i > 0;
+                return if i > 0 { Fault::Handled } else { Fault::Segv };
             }
             region.lazy_pages[idx] = phys;
             region.lazy_count += 1;
         }
 
         #[cfg(target_arch = "aarch64")]
-        if file_backed && region.flags.contains(PageFlags::EXECUTE) {
+        if region.flags.contains(PageFlags::EXECUTE) {
             unsafe {
                 core::arch::asm!("ic iallu");
                 core::arch::asm!("isb");
             }
         }
 
-        true
+        Fault::Handled
     }
 
     /// Demand-page all unmapped pages in `[addr, addr+len)` so the kernel can
@@ -932,26 +1098,35 @@ impl AddressSpace {
                     if phys != 0 {
                         unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); }
                         crate::pageref::unref_or_free(phys, 0);
+                        did_unmap = true;
                     }
                 }
             } else if region.file_cap == usize::MAX {
                 // Device mapping: drop the PTEs but never free the phys range.
                 for i in 0..n_pages { unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); } }
+                did_unmap = true;
             } else {
                 // Eager, contiguous buddy-backed block: unmap and free whole.
                 for i in 0..n_pages { unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); } }
                 if region.phys != 0 {
                     buddy_free(region.phys, pages_to_order(n_pages));
                 }
+                did_unmap = true;
             }
 
             if is_file_backed(region.file_cap) {
                 file_release(region.file_cap);
             }
             *slot = None;
-            did_unmap = true;
         }
 
+        // Only a PTE that was present can be cached in a TLB (an absent
+        // lazy page never had one; every path that clears a lazy page's PTE
+        // shoots down itself). So a VMA that was never touched — ld.so's
+        // whole-library reservation it then MAP_FIXED-overlays with the
+        // segments, now that file mappings are demand-paged — goes without
+        // the all-CPU shootdown, which cost 0.5-1.2 s per overlay on
+        // x86_64/TCG.
         if did_unmap { tlb_shootdown_all(); }
     }
 
@@ -960,6 +1135,42 @@ impl AddressSpace {
     /// Delegates to [`unmap_range`]; kept for compatibility with existing call sites.
     pub fn unmap(&mut self, virt: usize, size: usize) {
         self.unmap_range(virt, size);
+    }
+
+    /// Lowest page in `[from, end)` that belongs to a file-backed VMA and is
+    /// not populated yet — what a kernel prefault must read in (unlocked,
+    /// through the real fault path) before its locked `prefault_range` walk.
+    pub fn first_absent_file_page(&self, from: usize, end: usize) -> Option<usize> {
+        let from = from & !(PAGE_SIZE - 1);
+        let mut best: Option<usize> = None;
+        for r in self.regions.iter().filter_map(|r| r.as_ref()) {
+            if !r.lazy || !is_file_backed(r.file_cap) || r.end <= from || r.start >= end {
+                continue;
+            }
+            let mut va = from.max(r.start);
+            let stop = end.min(r.end);
+            while va < stop && best.map_or(true, |b| va < b) {
+                let idx = (va - r.start) / PAGE_SIZE;
+                if r.lazy_pages.get(idx).copied().unwrap_or(0) == 0 {
+                    best = Some(va);
+                    break;
+                }
+                va += PAGE_SIZE;
+            }
+        }
+        best
+    }
+
+    /// Record the POSIX protection of the VMA starting at `virt` (used by
+    /// mmap's eager file copy, which installs the final page flags directly
+    /// through `map`, whose VMA would otherwise claim PROT_READ|PROT_WRITE).
+    pub fn set_prot(&mut self, virt: usize, prot: u32) {
+        let virt = virt & !(PAGE_SIZE - 1);
+        if let Some(r) = self.regions.iter_mut().filter_map(|r| r.as_mut())
+            .find(|r| r.start == virt)
+        {
+            r.prot = prot;
+        }
     }
 
     /// Look up the VmaRegion that contains `virt`, if any.

@@ -29,6 +29,11 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_fill_most_of_ram() { failures += 1; }
     if !test_exit_frees_page_tables() { failures += 1; }
     if !test_eager_split_frees_tail() { failures += 1; }
+    if !test_file_private_lazy_content() { failures += 1; }
+    if !test_file_private_sigbus_past_eof() { failures += 1; }
+    if !test_file_private_no_leak() { failures += 1; }
+    if !test_file_private_survives_unlink() { failures += 1; }
+    if !test_file_private_map_cost() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -314,7 +319,9 @@ unsafe fn test_eager_split_frees_tail() -> bool {
     for r in 0..ROUNDS {
         let p = mmap(core::ptr::null_mut(), LEN, PROT_READ, MAP_PRIVATE, fd, 0);
         if p as isize == -1 { failures += 1; continue; }
-        let _ = core::ptr::read_volatile(p.add(PAGE * 64));
+        // Page 0: every page wholly past this binary's end raises SIGBUS now
+        // (private file mappings are demand-paged with Linux EOF semantics).
+        let _ = core::ptr::read_volatile(p);
         if r % 2 == 0 {
             // split_at: a middle-page mprotect cuts the VMA in three.
             if leandros_libc::syscall::syscall3(SYS_MPROTECT, p as usize + PAGE * 32, PAGE,
@@ -340,6 +347,247 @@ unsafe fn test_eager_split_frees_tail() -> bool {
     write(STDOUT_FILENO, b" failures=".as_ptr(), 10); print_dec(failures);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, failures == 0 && lost_pages < 8 * ROUNDS)
+}
+
+const SEEK_SET: i32 = 0;
+const SEEK_CUR: i32 = 1;
+const SEEK_END: i32 = 2;
+
+#[cfg(target_arch = "x86_64")]
+const SYS_MPROTECT_NR: usize = 10;
+#[cfg(target_arch = "aarch64")]
+const SYS_MPROTECT_NR: usize = 226;
+
+/// A multi-MiB f2fs file (several fault-around windows, a partial last
+/// page), falling back to this binary.
+unsafe fn open_big_file() -> i32 {
+    let fd = open(b"/bin/brush\0".as_ptr(), 0, 0);
+    if fd >= 0 { fd } else { open(b"/bin/memtest\0".as_ptr(), 0, 0) }
+}
+
+/// Size of the file behind `fd`, leaving its position where it was.
+unsafe fn file_size(fd: i32) -> usize {
+    let cur = lseek(fd, 0, SEEK_CUR);
+    let end = lseek(fd, 0, SEEK_END);
+    lseek(fd, cur, SEEK_SET);
+    if end < 0 { 0 } else { end as usize }
+}
+
+/// Read exactly `len` bytes at `off` (loops over short reads).
+unsafe fn pread_all(fd: i32, off: usize, dst: *mut u8, len: usize) -> bool {
+    if lseek(fd, off as _, SEEK_SET) < 0 { return false; }
+    let mut done = 0usize;
+    while done < len {
+        let r = read(fd, dst.add(done), len - done);
+        if r <= 0 { return false; }
+        done += r as usize;
+    }
+    true
+}
+
+fn now_ns() -> u64 {
+    let mut ts = timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { clock_gettime(1 /* CLOCK_MONOTONIC */, &mut ts); }
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// A MAP_PRIVATE file mapping (demand-paged since 2026-09-25) must read the
+/// file's bytes, zero-fill the tail of the last page, leave the descriptor's
+/// position alone, keep its own writes private (from the file and from a
+/// fork child), and survive a sub-range mprotect split.
+unsafe fn test_file_private_lazy_content() -> bool {
+    let name = b"file_private_lazy_content\0";
+    let fd = open_big_file();
+    if fd < 0 { return report(name, false); }
+    let size = file_size(fd);
+    let len = (size + PAGE - 1) & !(PAGE - 1);
+    let mut ok = size > 3 * PAGE;
+    lseek(fd, 123, SEEK_SET);
+    let p = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if p as isize == -1 { close(fd); return report(name, false); }
+    if lseek(fd, 0, SEEK_CUR) != 123 { ok = false; puts(b"  fd position moved\0".as_ptr()); }
+    let buf = malloc(PAGE);
+    // Walk backwards so the fault-around window does not pre-populate most pages.
+    let mut pg = len / PAGE;
+    while ok && pg > 0 {
+        pg -= 1;
+        let off = pg * PAGE;
+        let n = if size - off < PAGE { size - off } else { PAGE };
+        if !pread_all(fd, off, buf, n) { ok = false; break; }
+        if memcmp(p.add(off), buf, n) != 0 {
+            ok = false; puts(b"  content mismatch\0".as_ptr()); break;
+        }
+        for i in n..PAGE {
+            if *p.add(off + i) != 0 { ok = false; puts(b"  tail not zero\0".as_ptr()); break; }
+        }
+    }
+    let orig0 = *p;
+    *p = 0x5A;
+    *p.add(PAGE * 2) = 0x5B;
+    let pid = fork();
+    if pid == 0 {
+        let seen = *p == 0x5A && *p.add(PAGE * 2) == 0x5B;
+        *p = 0x77;
+        exit(if seen && *p == 0x77 { 0 } else { 1 });
+    }
+    let mut status: i32 = 0;
+    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    if status != 0 { ok = false; puts(b"  child saw wrong data\0".as_ptr()); }
+    if *p != 0x5A { ok = false; puts(b"  child write leaked into parent\0".as_ptr()); }
+    let mut b0 = 0u8;
+    if !pread_all(fd, 0, &mut b0, 1) || b0 != orig0 {
+        ok = false; puts(b"  private write reached the file\0".as_ptr());
+    }
+    // Split in the middle and re-verify a page on each side.
+    if leandros_libc::syscall::syscall3(SYS_MPROTECT_NR, p as usize + PAGE, PAGE,
+                                        PROT_READ as usize) != 0 { ok = false; }
+    if !pread_all(fd, PAGE, buf, PAGE) || memcmp(p.add(PAGE), buf, PAGE) != 0 { ok = false; }
+    if *p.add(PAGE * 2) != 0x5B { ok = false; }
+    free(buf);
+    munmap(p, len);
+    close(fd);
+    report(name, ok)
+}
+
+/// A page wholly past the end of the file raises SIGBUS (Linux semantics),
+/// while the partial last page reads the file then zeros.
+unsafe fn test_file_private_sigbus_past_eof() -> bool {
+    let name = b"file_private_sigbus_past_eof\0";
+    let fd = open(b"/bin/memtest\0".as_ptr(), 0, 0);
+    if fd < 0 { return report(name, false); }
+    let size = file_size(fd);
+    let len = ((size + PAGE - 1) & !(PAGE - 1)) + 2 * PAGE;
+    let p = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if p as isize == -1 { return report(name, false); }
+    let pid = fork();
+    if pid == 0 {
+        if size % PAGE != 0 && core::ptr::read_volatile(p.add(size)) != 0 { exit(3); }
+        let _ = core::ptr::read_volatile(p.add(len - PAGE));
+        exit(4); // must not get here
+    }
+    let mut status: i32 = 0;
+    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    munmap(p, len);
+    write(STDOUT_FILENO, b"  child_status=".as_ptr(), 15); print_dec(status as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, status & 0x7f == 7)
+}
+
+/// Demand-paged private file mappings, touched, forked and unmapped, must
+/// return every page they populated. The rounds run in a child so the page
+/// tables each fresh mapping address costs (kept until exit, ~3 per 6 MiB
+/// round) are returned too, and the bar can be tight.
+unsafe fn test_file_private_no_leak() -> bool {
+    let name = b"file_private_no_leak\0";
+    const ROUNDS: usize = 32;
+    let fd = open_big_file();
+    if fd < 0 { return report(name, false); }
+    let size = file_size(fd);
+    let len = (size + PAGE - 1) & !(PAGE - 1);
+    // Warm-up round so one-time allocations (registry, page tables) settle.
+    let w = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if w as isize != -1 { let _ = core::ptr::read_volatile(w); munmap(w, len); }
+    let before = free_ram();
+    let worker = fork();
+    if worker == 0 {
+        let mut failures = 0i32;
+        for r in 0..ROUNDS {
+            let p = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+            if p as isize == -1 { failures += 1; continue; }
+            let mut off = 0usize;
+            while off < size { let _ = core::ptr::read_volatile(p.add(off)); off += PAGE; }
+            *p.add(PAGE) = 1;
+            if r % 2 == 1 {
+                let pid = fork();
+                if pid == 0 { *p = 2; exit(0); }
+                if pid < 0 { failures += 1; } else {
+                    let mut status: i32 = 0;
+                    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+                }
+            }
+            munmap(p, len);
+        }
+        exit(failures);
+    }
+    let mut status: i32 = -1;
+    if worker > 0 { wait4(worker, &mut status as *mut i32, 0, core::ptr::null_mut()); }
+    close(fd);
+    let after = free_ram();
+    let lost_pages = before.saturating_sub(after) / PAGE;
+    write(STDOUT_FILENO, b"  rounds=".as_ptr(), 9); print_dec(ROUNDS);
+    write(STDOUT_FILENO, b" file_pages=".as_ptr(), 12); print_dec(len / PAGE);
+    write(STDOUT_FILENO, b" lost_pages=".as_ptr(), 12); print_dec(lost_pages);
+    write(STDOUT_FILENO, b" worker_status=".as_ptr(), 15); print_dec(status as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, status == 0 && lost_pages < 64)
+}
+
+/// A private mapping outlives its descriptor *and* the file's name: pages
+/// first touched after close + unlink (and after other files reuse freed
+/// blocks) must still read the original bytes — the inode is pinned.
+unsafe fn test_file_private_survives_unlink() -> bool {
+    let name = b"file_private_survives_unlink\0";
+    const PAGES: usize = 40;
+    let path = b"/root/.memtest-lazymmap\0";
+    let other = b"/root/.memtest-lazymmap-2\0";
+    let fd = open(path.as_ptr(), 0x40 | 0x2 | 0x200 /* O_CREAT|O_RDWR|O_TRUNC */, 0o600);
+    if fd < 0 { return report(name, false); }
+    let buf = malloc(PAGE);
+    for pg in 0..PAGES {
+        for i in 0..PAGE { *buf.add(i) = (pg * 7 + i % 251) as u8; }
+        if write(fd, buf, PAGE) != PAGE as isize { close(fd); free(buf); return report(name, false); }
+    }
+    let p = mmap(core::ptr::null_mut(), PAGES * PAGE, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    unlink(path.as_ptr());
+    let mut ok = p as isize != -1;
+    // Churn the freed-block pool: write and delete another file of the same size.
+    let fd2 = open(other.as_ptr(), 0x40 | 0x2 | 0x200, 0o600);
+    if fd2 >= 0 {
+        memset(buf, 0xEE, PAGE);
+        for _ in 0..PAGES { write(fd2, buf, PAGE); }
+        close(fd2);
+        unlink(other.as_ptr());
+    }
+    if ok {
+        let mut pg = PAGES;
+        while pg > 0 {
+            pg -= 1;
+            for i in (0..PAGE).step_by(97) {
+                if *p.add(pg * PAGE + i) != (pg * 7 + i % 251) as u8 { ok = false; break; }
+            }
+            if !ok { break; }
+        }
+        munmap(p, PAGES * PAGE);
+    }
+    free(buf);
+    report(name, ok)
+}
+
+/// mmap(2) of a big file must not cost a copy of the file: time it.
+/// Reports map_us and the first-touch cost; fails only if the map fails.
+unsafe fn test_file_private_map_cost() -> bool {
+    let name = b"file_private_map_cost\0";
+    let mut fd = open(b"/bin/cosmic-comp\0".as_ptr(), 0, 0);
+    if fd < 0 { fd = open(b"/bin/memtest\0".as_ptr(), 0, 0); }
+    if fd < 0 { return report(name, false); }
+    let size = file_size(fd);
+    let t0 = now_ns();
+    let p = mmap(core::ptr::null_mut(), size, PROT_READ, MAP_PRIVATE, fd, 0);
+    let t1 = now_ns();
+    close(fd);
+    if p as isize == -1 { return report(name, false); }
+    let _ = core::ptr::read_volatile(p.add(size / 2));
+    let t2 = now_ns();
+    munmap(p, size);
+    let t3 = now_ns();
+    write(STDOUT_FILENO, b"  bytes=".as_ptr(), 8); print_dec(size);
+    write(STDOUT_FILENO, b" map_us=".as_ptr(), 8); print_dec(((t1 - t0) / 1000) as usize);
+    write(STDOUT_FILENO, b" touch_us=".as_ptr(), 10); print_dec(((t2 - t1) / 1000) as usize);
+    write(STDOUT_FILENO, b" unmap_us=".as_ptr(), 10); print_dec(((t3 - t2) / 1000) as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, true)
 }
 
 unsafe fn print_dec(mut v: usize) {
