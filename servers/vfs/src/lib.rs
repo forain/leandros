@@ -2389,7 +2389,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
                                                    arg(msg,1) as usize),
         VFS_FREMOVEXATTR     => handle_fremovexattr(caller_pid, arg(msg,0) as usize,
                                                     arg(msg,1) as usize),
-        VFS_ACCESS           => handle_access(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        VFS_ACCESS           => handle_access(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) != 0),
         _                    => err_reply(-38), // ENOSYS
     }
 }
@@ -4214,7 +4214,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             let idx = *idx;
             let cur = *pos;
             drop(tbls);
-            let tmp = TMP_FILES.lock();
+            let mut tmp = TMP_FILES.lock();
             // `entry.len` mirrors `vmo.len` for a promoted file, so the EOF
             // bound is the same whether or not a VMO backs this inode.
             let remaining = tmp[idx].len.saturating_sub(cur);
@@ -4237,6 +4237,11 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 unsafe { core::ptr::copy_nonoverlapping(tmp[idx].data.as_ptr().add(cur), buf, n); }
             }
             drop(vmos);
+            // relatime: a real read happened, so consider bumping atime.
+            let now = sched::clock_ts();
+            if relatime_needs_update(tmp[idx].atime, tmp[idx].mtime, tmp[idx].ctime, now) {
+                tmp[idx].atime = now;
+            }
             drop(tmp);
             let mut tbls2 = FD_TABLES.lock();
             if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
@@ -7480,6 +7485,17 @@ pub fn cred_of(pid: u32) -> xattr::Cred {
     c
 }
 
+/// The caller's credentials built from the REAL uid/gid rather than the
+/// effective ones. POSIX `access()`/`faccessat()` (without `AT_EACCESS`) ask
+/// "could the real user do this", specifically so a setuid-root program can
+/// check what its invoker — not itself — is allowed to do. Same supplementary
+/// group list either way: this kernel has no setuid-triggered group swap.
+pub fn real_cred_of(pid: u32) -> xattr::Cred {
+    let mut c = xattr::Cred::new(sched::ruid_of(pid), sched::rgid_of(pid));
+    c.ngroups = sched::groups_of(pid, &mut c.groups) as u8;
+    c
+}
+
 /// Stamp all three timestamps with "now" — a freshly created entry.
 fn tmp_stamp_new(e: &mut TmpFileEntry) {
     let now = sched::clock_ts();
@@ -7493,6 +7509,19 @@ fn tmp_touch_mtime(e: &mut TmpFileEntry) {
 /// Metadata changed: ctime.
 fn tmp_touch_ctime(e: &mut TmpFileEntry) {
     e.ctime = sched::clock_ts();
+}
+
+/// Linux's `relatime` mount default (what `/proc/mounts` already claims for
+/// this filesystem, per the `rw,relatime` line below — before this, that was
+/// aspirational, since nothing ever touched atime on a read at all): skip the
+/// update unless the file's mtime or ctime is at or past the current atime,
+/// or the current atime is at least a day stale. Keeps a read from dirtying
+/// the entry (and, on f2fs, the inode block) on every call.
+const RELATIME_INTERVAL_SEC: i64 = 86_400;
+fn relatime_needs_update(atime: (i64, i64), mtime: (i64, i64), ctime: (i64, i64), now: (i64, i64)) -> bool {
+    if atime.0 < mtime.0 || (atime.0 == mtime.0 && atime.1 <= mtime.1) { return true; }
+    if atime.0 < ctime.0 || (atime.0 == ctime.0 && atime.1 <= ctime.1) { return true; }
+    now.0.saturating_sub(atime.0) >= RELATIME_INTERVAL_SEC
 }
 
 /// Initialise the permission bits, inherited ACLs and timestamps of the
@@ -7729,11 +7758,15 @@ fn handle_removexattr(pid: u32, tag: u64, path_ptr: usize, name_ptr: usize) -> M
 /// faccessat(2): permission probe honoring any stored access ACL. `amode==0`
 /// (F_OK) is pure existence. A path this server does not own answers -38 so the
 /// kernel's legacy fallback runs.
-fn handle_access(pid: u32, path_ptr: usize, amode: u32) -> Message {
+/// `eaccess`: use the caller's effective ids (Linux `AT_EACCESS`) instead of
+/// the real ids `access(2)`/plain `faccessat(2)` ask with. Real ids are the
+/// POSIX default — the whole point of `access()` is answering "could the
+/// real (often unprivileged) user do this", not "can I, right now".
+fn handle_access(pid: u32, path_ptr: usize, amode: u32, eaccess: bool) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
     if let Some(path) = tmpfs_path(raw) {
-        let cred = cred_of(pid);
+        let cred = if eaccess { cred_of(pid) } else { real_cred_of(pid) };
         let tmp = TMP_FILES.lock();
         // Not a pool entry (e.g. "/tmp" itself, a ramfs dir): -38 so the
         // kernel's stat-based fallback answers, exactly as before VFS_ACCESS
@@ -7749,7 +7782,7 @@ fn handle_access(pid: u32, path_ptr: usize, amode: u32) -> Message {
         return if ok { ok_reply() } else { err_reply(-13) }; // EACCES
     }
     if let Some(port) = find_mount_port(raw) {
-        return xattr_proxy(port, VFS_ACCESS, path_ptr as u64, amode as u64, 0, 0, 0);
+        return xattr_proxy(port, VFS_ACCESS, path_ptr as u64, amode as u64, eaccess as u64, 0, 0);
     }
     err_reply(-38) // ENOSYS — let the kernel's legacy access() fallback run
 }

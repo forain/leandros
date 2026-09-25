@@ -1382,6 +1382,17 @@ pub fn egid_of(pid: Pid) -> u32 {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.egid).unwrap_or(0)
 }
 
+/// The REAL (not effective) uid/gid — what `access(2)`/`faccessat(2)` without
+/// `AT_EACCESS` must check against. Same fail-open-to-root default for an
+/// unknown pid as `euid_of`/`egid_of`.
+pub fn ruid_of(pid: Pid) -> u32 {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.uid).unwrap_or(0)
+}
+
+pub fn rgid_of(pid: Pid) -> u32 {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.gid).unwrap_or(0)
+}
+
 /// Supplementary groups of `pid`, copied into `out`; returns the count.
 /// An unknown pid (the boot-time mount path) has none.
 pub fn groups_of(pid: Pid, out: &mut [u32; task::NGROUPS_MAX]) -> usize {

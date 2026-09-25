@@ -3963,6 +3963,29 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     drop(envp);
 
     // ── VFS lifecycle and address space replacement ────────────────────────────
+    // POSIX execve terminates every *other* thread in the caller's group: the
+    // old program image (their code and stacks) is about to be replaced, so any
+    // sibling left running would execute freed/stale mappings. Without it, a
+    // COSMIC component that re-exec'd with a live worker thread orphaned that
+    // worker on the old address space; its next fault resolved against the
+    // leader's *new* AS and killed it, and freeing the old AS out from under it
+    // faulted the page-table walk (M7o).
+    //
+    // Everything from here on is infallible, so this is the point of no
+    // return and no sibling is reaped on a path that could still fail. It
+    // must come BEFORE the close-on-exec sweeps below, as Linux's de_thread
+    // precedes do_close_on_exec: the sweeps close fds the siblings are still
+    // using, and a sibling alive across them sees its fds vanish. That was
+    // tokio's "Bad read on self-pipe: EBADF" panic in brush whenever it ran
+    // `exec <cmd>` (greetd's session wrapper): closing the SOCK_CLOEXEC signal
+    // socketpair woke a worker parked in epoll_wait on it, and its read of the
+    // already-closed receiver failed EBADF before the kill reached it.
+    //
+    // A non-leader caller takes over the leader's pid here, so `pid` is
+    // re-read; the tgid (the fd-table key) does not change.
+    sched::dethread_current_group();
+    let pid = current_pid();
+
     // VFS_EXEC_CLOEXEC takes the owning pid explicitly and so bypasses the
     // tgid canonicalization vfs::handle applies to ordinary calls. fd tables
     // are keyed by tgid, so an execve issued from a non-leader thread (a tokio
@@ -3996,17 +4019,6 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // signal_hook_registry chained to itself on the next signal — an unbounded,
     // stack-exhausting recursion that blocked the COSMIC session launcher.
     sched::reset_handlers_on_exec(fd_owner);
-
-    // POSIX execve terminates every *other* thread in the caller's group: the
-    // old program image (their code and stacks) is about to be replaced, so any
-    // sibling left running would execute freed/stale mappings. Do this as the
-    // last step before the (non-returning) address-space swap — the point of no
-    // return — so no sibling is reaped on a path that could still fail. Without
-    // it, a COSMIC component that re-exec'd with a live worker thread orphaned
-    // that worker on the old address space; its next fault resolved against the
-    // leader's *new* AS and killed it, and freeing the old AS out from under it
-    // faulted the page-table walk (M7o).
-    sched::dethread_current_group();
 
     // Unbox in an inner scope: `replace_address_space` never returns, so a
     // `Box` still alive in this frame is never deallocated — `*new_as` as the
@@ -6103,7 +6115,7 @@ fn sys_getresxid(r_ptr: usize, e_ptr: usize, s_ptr: usize, is_gid: bool) -> isiz
 /// which case fall back to the old VFS_STAT + mode-bit probe below (kept
 /// verbatim, F_OK short-circuit and RamFS/tmpfs fallback included) so nothing
 /// regresses for a mount that predates VFS_ACCESS.
-fn sys_faccessat(dirfd: usize, path_ptr: usize, mode: usize, _flags: usize) -> isize {
+fn sys_faccessat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let path_ptr = path.ptr();
 
@@ -6111,10 +6123,17 @@ fn sys_faccessat(dirfd: usize, path_ptr: usize, mode: usize, _flags: usize) -> i
     const X_OK: usize = 1;
     const W_OK: usize = 2;
     const R_OK: usize = 4;
+    // Linux `AT_EACCESS`: check with the effective ids instead of the real
+    // ones. Without it — plain `access(2)` always calls in with flags == 0 —
+    // POSIX asks for the REAL uid/gid, so a setuid-root program can find out
+    // what its (often unprivileged) invoker is allowed to do, not what it
+    // itself can do right now.
+    const AT_EACCESS: usize = 0x200;
 
     let pid = current_pid();
+    let eaccess = flags & AT_EACCESS != 0;
 
-    let amsg = make_vfs_msg(vfs::VFS_ACCESS, &[path_ptr as u64, mode as u64]);
+    let amsg = make_vfs_msg(vfs::VFS_ACCESS, &[path_ptr as u64, mode as u64, eaccess as u64]);
     let ar = vfs_reply_val(&vfs::handle(&amsg, pid));
     if ar != -38 { return ar; } // anything but ENOSYS is the real answer
 

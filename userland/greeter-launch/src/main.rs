@@ -36,8 +36,8 @@
 extern crate leandros_libc;
 
 use leandros_libc::{
-    chdir, chown, close, execve, exit, getuid, open, read, setresgid, setresuid, write,
-    O_RDONLY, STDERR_FILENO,
+    chdir, chown, close, execve, exit, getuid, open, read, setgroups, setresgid, setresuid,
+    write, O_RDONLY, STDERR_FILENO,
 };
 
 /// The account name cosmic-greeter matches on. Staged by
@@ -50,6 +50,8 @@ const GREETER_USER: &[u8] = b"cosmic-greeter";
 const GREETER_BIN: &[u8] = b"/bin/cosmic-greeter-login\0";
 
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
+const GROUP_PATH: &[u8] = b"/etc/group\0";
+const MAX_GROUPS: usize = 32;
 
 /// Environment names this launcher replaces. Everything else is inherited
 /// verbatim — XDG_RUNTIME_DIR and WAYLAND_DISPLAY name the compositor's socket,
@@ -181,6 +183,50 @@ struct Account {
     gid: u32,
     home: [u8; HOME_CAP],
     home_len: usize,
+}
+
+/// Supplementary groups of `username` from /etc/group: every group whose
+/// member list names it. Byte-oriented like the rest of this module (no str
+/// parsing crate to pull into a `no_std` binary) — mirrors `/bin/login`'s
+/// `lookup_groups`/`initgroups`, duplicated rather than shared since this is
+/// a separate crate. Without this, `setresgid`/`setresuid` below dropped to
+/// the greeter account's primary group only, and the greeter session ran
+/// with zero supplementary groups no matter what `/etc/group` said.
+unsafe fn lookup_groups(username: &[u8], out: &mut [u32; MAX_GROUPS]) -> usize {
+    let fd = open(GROUP_PATH.as_ptr(), O_RDONLY, 0);
+    if fd < 0 { return 0; }
+    let mut buf = [0u8; 4096];
+    let mut total = 0usize;
+    loop {
+        if total >= buf.len() { break; }
+        let n = read(fd, buf.as_mut_ptr().add(total), buf.len() - total);
+        if n <= 0 { break; }
+        total += n as usize;
+    }
+    close(fd);
+
+    let data = &buf[..total];
+    let mut count = 0usize;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= data.len() {
+        if i == data.len() || data[i] == b'\n' {
+            let line = &data[start..i];
+            start = i + 1;
+            if !line.is_empty() {
+                let gid = field(line, 2).and_then(parse_u32);
+                let members = field(line, 3);
+                if let (Some(gid), Some(members)) = (gid, members) {
+                    if count < out.len() && members.split(|&b| b == b',').any(|m| m == username) {
+                        out[count] = gid;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    count
 }
 
 /// Look `GREETER_USER` up in /etc/passwd. Matching by NAME rather than by uid is
@@ -404,6 +450,14 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     chown_to_greeter(envp, b"", b"GREETD_SOCK=", &acct);
 
     // ---- cross the boundary --------------------------------------------------
+    // Supplementary groups first: setgroups needs root, which setresuid below
+    // gives up, and the effective gid becoming non-root right after setresgid
+    // would make it ambiguous which privilege level a failure here ran at.
+    let mut groups = [0u32; MAX_GROUPS];
+    let ngroups = lookup_groups(GREETER_USER, &mut groups);
+    if setgroups(ngroups, groups.as_ptr()) != 0 {
+        fail(b"setgroups failed");
+    }
     // gid first: after the uid drop the process can no longer change its gid.
     if setresgid(acct.gid, acct.gid, acct.gid) != 0 {
         fail(b"setresgid failed");
