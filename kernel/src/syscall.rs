@@ -8020,12 +8020,15 @@ fn scstat_tick() {
     }
 }
 
-pub fn poll_deadline_tick() {
+/// Wake every timed waiter (poll/select/epoll/futex/nanosleep/…) and timerfd
+/// whose deadline is `<= now`, and return the next pending deadline
+/// (`u64::MAX` = none). Runs from the 100 Hz BSP tick (`poll_deadline_tick`)
+/// AND from any CPU's one-shot deadline interrupt (`sched::timer_deadline_irq`,
+/// armed by `sched::register_poll_deadline`), so a timed wait is released
+/// within interrupt latency of its deadline instead of at the next tick edge.
+/// IRQ context, try-lock only (the tick-hook contract).
+pub fn poll_deadline_service(now: u64) -> u64 {
     use core::sync::atomic::Ordering::Relaxed;
-    gap2_sample_tick();
-    evstat_tick();
-    scstat_tick();
-    let now = monotonic_ns();
     let tfd = vfs::earliest_timerfd_deadline();
     // Fast path: the lock-free hint (min of parked timed waiters' deadlines)
     // and the timerfd pool say nothing is due → no run-queue scan, no wake.
@@ -8061,6 +8064,20 @@ pub fn poll_deadline_tick() {
             sched::request_poll_wake_tagged(timerfd_tags);
         }
     }
+    let next = core::cmp::min(sched::NEXT_POLL_DEADLINE.load(Relaxed),
+                              vfs::earliest_timerfd_deadline());
+    // Still due after the service = the RUN_QUEUE try-lock lost (the hint was
+    // left in place for a retry). Retry shortly rather than immediately — an
+    // immediate re-arm would be an interrupt storm against the lock holder —
+    // and never later than the tick would have.
+    if next <= now { now + 200_000 } else { next }
+}
+
+pub fn poll_deadline_tick() {
+    gap2_sample_tick();
+    evstat_tick();
+    scstat_tick();
+    poll_deadline_service(monotonic_ns());
     // Pay any wake a pipe deferred because it only advanced an object's edge
     // `seq` without changing its readable/writable level (see
     // `sched::request_poll_wake` and the pipe arms in `servers/vfs`). This is
@@ -8838,28 +8855,32 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: usize, count: usize) ->
 ///
 /// Maps `ITIMER_REAL` (which=0) to a POSIX timer with SIGALRM.
 /// Other `which` values (VIRTUAL, PROF) are accepted but ignored.
-const ITIMER_TICK_HZ: u64 = 100;
-const ITIMER_USEC_PER_TICK: u64 = 1_000_000 / ITIMER_TICK_HZ;
-
 /// Parse a 32-byte `struct itimerval` (`{ it_interval, it_value }`, each a
-/// `{ tv_sec: i64, tv_usec: i64 }` pair) into `(interval_ticks, value_ticks)`.
-fn parse_itimerval(buf: &[u8; 32]) -> (u64, u64) {
-    let iv_sec  = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
-    let iv_usec = i64::from_ne_bytes(buf[8..16].try_into().unwrap());
-    let va_sec  = i64::from_ne_bytes(buf[16..24].try_into().unwrap());
-    let va_usec = i64::from_ne_bytes(buf[24..32].try_into().unwrap());
-    let itv = (iv_sec as u64 * ITIMER_TICK_HZ) + (iv_usec as u64 / ITIMER_USEC_PER_TICK);
-    let vtv = (va_sec as u64 * ITIMER_TICK_HZ) + (va_usec as u64 / ITIMER_USEC_PER_TICK);
-    (itv, vtv)
+/// `{ tv_sec: i64, tv_usec: i64 }` pair) into `(interval_ns, value_ns)`, or
+/// `None` for a negative field / `tv_usec` outside `0..1_000_000` (EINVAL).
+/// Nanoseconds, not ticks: a sub-10 ms it_value used to floor to 0 ticks,
+/// which is "disarm".
+fn parse_itimerval(buf: &[u8; 32]) -> Option<(u64, u64)> {
+    let f = |o: usize| i64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
+    let (iv_sec, iv_usec, va_sec, va_usec) = (f(0), f(8), f(16), f(24));
+    if iv_sec < 0 || va_sec < 0 || !(0..1_000_000).contains(&iv_usec) || !(0..1_000_000).contains(&va_usec) {
+        return None;
+    }
+    let ns = |s: i64, us: i64| (s as u64).saturating_mul(1_000_000_000).saturating_add(us as u64 * 1000);
+    Some((ns(iv_sec, iv_usec), ns(va_sec, va_usec)))
 }
 
-/// Encode `(interval_ticks, value_ticks)` as a 32-byte `struct itimerval`.
-fn itimerval_bytes(interval_ticks: u64, value_ticks: u64) -> [u8; 32] {
+/// Encode `(interval_ns, value_ns)` as a 32-byte `struct itimerval`. A
+/// remaining value is rounded UP to the microsecond so an armed timer never
+/// reads as 0 (disarmed).
+fn itimerval_bytes(interval_ns: u64, value_ns: u64) -> [u8; 32] {
     let mut buf = [0u8; 32];
-    buf[0..8].copy_from_slice(&((interval_ticks / ITIMER_TICK_HZ) as i64).to_ne_bytes());
-    buf[8..16].copy_from_slice(&(((interval_ticks % ITIMER_TICK_HZ) * ITIMER_USEC_PER_TICK) as i64).to_ne_bytes());
-    buf[16..24].copy_from_slice(&((value_ticks / ITIMER_TICK_HZ) as i64).to_ne_bytes());
-    buf[24..32].copy_from_slice(&(((value_ticks % ITIMER_TICK_HZ) * ITIMER_USEC_PER_TICK) as i64).to_ne_bytes());
+    let iv_us = (interval_ns + 999) / 1000;
+    let va_us = (value_ns + 999) / 1000;
+    buf[0..8].copy_from_slice(&((iv_us / 1_000_000) as i64).to_ne_bytes());
+    buf[8..16].copy_from_slice(&((iv_us % 1_000_000) as i64).to_ne_bytes());
+    buf[16..24].copy_from_slice(&((va_us / 1_000_000) as i64).to_ne_bytes());
+    buf[24..32].copy_from_slice(&((va_us % 1_000_000) as i64).to_ne_bytes());
     buf
 }
 
@@ -8873,22 +8894,22 @@ fn sys_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize {
 
     let pid = current_pid();
 
-    let (interval_ticks, value_ticks) = if new_ptr != 0 {
+    let (interval_ns, value_ns) = if new_ptr != 0 {
         let mut buf = [0u8; 32];
         if !with_current_address_space(|as_| as_.read_user_buf(new_ptr, &mut buf)).unwrap_or(false) {
             return -14;
         }
-        parse_itimerval(&buf)
+        match parse_itimerval(&buf) { Some(v) => v, None => return -22 }
     } else {
         (0, 0)
     };
 
-    // Arm the reserved ITIMER_REAL slot directly (tick units — no synthetic
+    // Arm the reserved ITIMER_REAL slot directly (ns — no synthetic
     // user-space pointer round-trip; see set_real_itimer's doc comment).
-    let (old_interval_ticks, old_value_ticks) = tty_server::set_real_itimer(pid, interval_ticks, value_ticks);
+    let (old_interval_ns, old_value_ns) = tty_server::set_real_itimer(pid, interval_ns, value_ns);
 
     if old_ptr != 0 {
-        let obuf = itimerval_bytes(old_interval_ticks, old_value_ticks);
+        let obuf = itimerval_bytes(old_interval_ns, old_value_ns);
         if !with_current_address_space(|as_| as_.write_user_buf(old_ptr, &obuf)).unwrap_or(false) {
             return -14;
         }
@@ -8901,8 +8922,8 @@ fn sys_getitimer(which: usize, cur_ptr: usize) -> isize {
     if which != 0 { return 0; }
     if !validate_user_buf(cur_ptr, 32) { return -14; }
     let pid = current_pid();
-    let (interval_ticks, value_ticks) = tty_server::get_real_itimer(pid);
-    let buf = itimerval_bytes(interval_ticks, value_ticks);
+    let (interval_ns, value_ns) = tty_server::get_real_itimer(pid);
+    let buf = itimerval_bytes(interval_ns, value_ns);
     if with_current_address_space(|as_| as_.write_user_buf(cur_ptr, &buf)).unwrap_or(false) { 0 } else { -14 }
 }
 
@@ -8924,16 +8945,16 @@ fn sys_sigpending(set_ptr: usize) -> isize {
 #[cfg(not(target_arch = "aarch64"))]
 fn sys_alarm(seconds: usize) -> isize {
     let pid = current_pid();
-    const TICK_HZ: u64 = 100;
-    let value_ticks = seconds as u64 * TICK_HZ;
+    const NS: u64 = 1_000_000_000;
+    let value_ns = (seconds as u64).saturating_mul(NS);
 
     // One-shot (no interval) — arm the reserved ITIMER_REAL slot directly.
-    let (_, old_value_ticks) = tty_server::set_real_itimer(pid, 0, value_ticks);
+    let (_, old_value_ns) = tty_server::set_real_itimer(pid, 0, value_ns);
 
     // Real alarm() returns the number of seconds remaining on any previous
     // alarm, rounded up so a caller never sees "0 seconds left" for an
     // alarm that's about to fire (matches glibc/Linux behavior).
-    ((old_value_ticks + TICK_HZ - 1) / TICK_HZ) as isize
+    ((old_value_ns + NS - 1) / NS) as isize
 }
 
 // ── fork / clone ──────────────────────────────────────────────────────────────

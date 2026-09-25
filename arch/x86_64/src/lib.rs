@@ -362,7 +362,13 @@ pub unsafe fn serial_has_data() -> bool {
     lsr & 0x01 != 0
 }
 
-/// Scheduler hook, no-op here: the LAPIC timer runs in periodic mode, so a
-/// single lost interrupt cannot silence it the way a one-shot reload can.
+/// Scheduler hook: the LAPIC timer is periodic except while a one-shot
+/// deadline countdown is armed; restore periodic mode if that one-shot's
+/// interrupt was lost (see `timer::check_alive`).
 #[no_mangle]
-pub extern "C" fn arch_timer_check_alive() -> bool { false }
+pub extern "C" fn arch_timer_check_alive() -> bool { timer::check_alive() }
+
+/// Scheduler hook: arm this CPU's one-shot deadline (see
+/// `timer::arm_deadline`).
+#[no_mangle]
+pub extern "C" fn arch_timer_arm_deadline(deadline_ns: u64) { timer::arm_deadline(deadline_ns) }

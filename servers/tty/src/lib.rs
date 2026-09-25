@@ -24,8 +24,9 @@
 //!
 //! `timer_create`/`timer_settime`/`timer_gettime`/`timer_delete` are
 //! implemented here as a small per-process timer table.  Each timer is a
-//! deadline (in scheduler ticks) checked on every syscall return and yielded
-//! tick.  Expiry fires by calling `sched::deliver_signal`.
+//! deadline (absolute `sched::monotonic_ns()`, so sub-tick values neither
+//! floor to "disarmed" nor fire early) checked on every syscall return and
+//! yielded tick.  Expiry fires by calling `sched::deliver_signal`.
 //!
 //! # Message encoding
 //!
@@ -313,8 +314,8 @@ fn get_or_create_console<'a>(pid: u32, tbl: &'a mut [ConsoleTermios]) -> Option<
 struct PosixTimer {
     in_use:    bool,
     signo:     u32,
-    interval:  u64, // repeat interval in ticks (0 = one-shot)
-    deadline:  u64, // absolute tick deadline (0 = disarmed)
+    interval:  u64, // repeat interval in ns (0 = one-shot)
+    deadline:  u64, // absolute monotonic_ns deadline (0 = disarmed)
     overrun:   u32, // extra expirations missed since last timer_getoverrun()
     owner_pid: u32,
 }
@@ -422,7 +423,7 @@ pub fn check_timers(pid: u32) {
     let pid = sched::tgid_of(pid); // TIMER_TABLES is per-process; called on every
     // syscall return under the running thread's raw tid — a worker-thread-armed
     // timer would otherwise be checked by nobody.
-    let now = sched::ticks();
+    let now = sched::monotonic_ns();
     let mut tbls = TIMER_TABLES.lock();
     let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t, None => return,
@@ -589,18 +590,17 @@ fn termios_ioctl(cmd: usize, arg_ptr: usize, t: &mut Termios) -> Message {
 
 // ── POSIX timer handlers ──────────────────────────────────────────────────────
 
-const TICK_HZ: u64 = 100;
-const NSEC_PER_TICK: u64 = 1_000_000_000 / TICK_HZ;
+const NSEC_PER_SEC: u64 = 1_000_000_000;
 
-/// Encode `(interval_ticks, value_ticks)` as a 32-byte `struct itimerspec`
+/// Encode `(interval_ns, value_ns)` as a 32-byte `struct itimerspec`
 /// (`{ it_interval: timespec, it_value: timespec }`, each `{ tv_sec, tv_nsec }`
 /// as `i64` pairs).
-fn itimerspec_bytes(interval_ticks: u64, value_ticks: u64) -> [u8; 32] {
+fn itimerspec_bytes(interval_ns: u64, value_ns: u64) -> [u8; 32] {
     let mut buf = [0u8; 32];
-    buf[0..8].copy_from_slice(&((interval_ticks / TICK_HZ) as i64).to_ne_bytes());
-    buf[8..16].copy_from_slice(&(((interval_ticks % TICK_HZ) * NSEC_PER_TICK) as i64).to_ne_bytes());
-    buf[16..24].copy_from_slice(&((value_ticks / TICK_HZ) as i64).to_ne_bytes());
-    buf[24..32].copy_from_slice(&(((value_ticks % TICK_HZ) * NSEC_PER_TICK) as i64).to_ne_bytes());
+    buf[0..8].copy_from_slice(&((interval_ns / NSEC_PER_SEC) as i64).to_ne_bytes());
+    buf[8..16].copy_from_slice(&((interval_ns % NSEC_PER_SEC) as i64).to_ne_bytes());
+    buf[16..24].copy_from_slice(&((value_ns / NSEC_PER_SEC) as i64).to_ne_bytes());
+    buf[24..32].copy_from_slice(&((value_ns % NSEC_PER_SEC) as i64).to_ne_bytes());
     buf
 }
 
@@ -609,8 +609,8 @@ fn itimerspec_bytes(interval_ticks: u64, value_ticks: u64) -> [u8; 32] {
 /// pointer directly, since it may sit on a CoW page a supervisor-mode fault
 /// can't recover from (see `read_flock`/`write_flock` in the VFS server for
 /// the same pattern, established during the Phase 6/7 hazard sweep).
-fn write_itimerspec(ptr: usize, interval_ticks: u64, value_ticks: u64) -> bool {
-    let buf = itimerspec_bytes(interval_ticks, value_ticks);
+fn write_itimerspec(ptr: usize, interval_ns: u64, value_ns: u64) -> bool {
+    let buf = itimerspec_bytes(interval_ns, value_ns);
     sched::with_current_address_space(|as_| as_.write_user_buf(ptr, &buf)).unwrap_or(false)
 }
 
@@ -651,60 +651,60 @@ fn handle_timer_create(pid: u32, signo: u32, timerid_ptr: usize) -> Message {
     ok_reply()
 }
 
-/// Core rearm logic in tick units, decoupled from parsing a user-space
+/// Core rearm logic in nanoseconds, decoupled from parsing a user-space
 /// itimerspec pointer.  Kernel-internal callers (`alarm()`/`setitimer()`,
-/// via [`set_real_itimer`]) already have tick counts in hand and must not
+/// via [`set_real_itimer`]) already have ns values in hand and must not
 /// round-trip through a synthetic *user*-space pointer to reach this, since
 /// [`write_itimerspec`]/`read_user_buf` resolve addresses through the
 /// current task's own page tables. Returns the timer's previous
-/// `(interval_ticks, remaining_ticks)` on success.
-fn set_timer_ticks(pid: u32, timerid: usize, interval_ticks: u64, value_ticks: u64)
+/// `(interval_ns, remaining_ns)` on success.
+fn set_timer_ns(pid: u32, timerid: usize, interval_ns: u64, value_ns: u64)
     -> Option<(u64, u64)>
 {
     let mut tbls = TIMER_TABLES.lock();
     let tbl = tbls.iter_mut().find(|t| t.in_use && t.pid == pid)?;
     if timerid >= MAX_TIMERS || !tbl.timers[timerid].in_use { return None; }
     let old_interval = tbl.timers[timerid].interval;
-    let now = sched::ticks();
+    let now = sched::monotonic_ns();
     let old_remaining = {
         let dl = tbl.timers[timerid].deadline;
         if dl > now { dl - now } else { 0 }
     };
-    tbl.timers[timerid].interval = interval_ticks;
-    tbl.timers[timerid].deadline = if value_ticks > 0 { now + value_ticks } else { 0 };
+    tbl.timers[timerid].interval = interval_ns;
+    tbl.timers[timerid].deadline = if value_ns > 0 { now.saturating_add(value_ns) } else { 0 };
     tbl.timers[timerid].overrun = 0;
     Some((old_interval, old_remaining))
 }
 
-/// Core read logic in tick units — see [`set_timer_ticks`] for why this is
+/// Core read logic in nanoseconds — see [`set_timer_ns`] for why this is
 /// split out from the user-pointer-parsing IPC handler.
-fn get_timer_ticks(pid: u32, timerid: usize) -> Option<(u64, u64)> {
+fn get_timer_ns(pid: u32, timerid: usize) -> Option<(u64, u64)> {
     let tbls = TIMER_TABLES.lock();
     let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
     if timerid >= MAX_TIMERS || !tbl.timers[timerid].in_use { return None; }
-    let interval_ticks = tbl.timers[timerid].interval;
-    let now = sched::ticks();
+    let interval_ns = tbl.timers[timerid].interval;
+    let now = sched::monotonic_ns();
     let remaining = {
         let dl = tbl.timers[timerid].deadline;
         if dl > now { dl - now } else { 0 }
     };
-    Some((interval_ticks, remaining))
+    Some((interval_ns, remaining))
 }
 
 /// Direct (non-IPC) API for `setitimer(ITIMER_REAL, ...)`: arms the
-/// reserved slot-0 timer and returns its previous `(interval_ticks,
-/// remaining_ticks)`, creating the slot on first use.
-pub fn set_real_itimer(pid: u32, interval_ticks: u64, value_ticks: u64) -> (u64, u64) {
+/// reserved slot-0 timer and returns its previous `(interval_ns,
+/// remaining_ns)`, creating the slot on first use. All values in ns.
+pub fn set_real_itimer(pid: u32, interval_ns: u64, value_ns: u64) -> (u64, u64) {
     let pid = sched::tgid_of(pid); // per-process timer table
     ensure_real_timer(pid, 14 /* SIGALRM */);
-    set_timer_ticks(pid, 0, interval_ticks, value_ticks).unwrap_or((0, 0))
+    set_timer_ns(pid, 0, interval_ns, value_ns).unwrap_or((0, 0))
 }
 
 /// Direct (non-IPC) API for `getitimer(ITIMER_REAL, ...)` / `alarm()`'s
 /// "previous value" query.
 pub fn get_real_itimer(pid: u32) -> (u64, u64) {
     let pid = sched::tgid_of(pid); // per-process timer table
-    get_timer_ticks(pid, 0).unwrap_or((0, 0))
+    get_timer_ns(pid, 0).unwrap_or((0, 0))
 }
 
 fn handle_timer_settime(pid: u32, timerid: usize, ispec_ptr: usize, ospec_ptr: usize)
@@ -712,7 +712,8 @@ fn handle_timer_settime(pid: u32, timerid: usize, ispec_ptr: usize, ospec_ptr: u
 {
     // struct itimerspec: { it_interval: timespec, it_value: timespec }
     // struct timespec:   { tv_sec: i64, tv_nsec: i64 } (16 bytes each)
-    // Total: 32 bytes.  We convert to scheduler ticks (100 Hz assumed).
+    // Total: 32 bytes, kept in nanoseconds (no tick flooring: a sub-10 ms
+    // it_value used to floor to 0 ticks and silently DISARM the timer).
     if ispec_ptr == 0 { return err_reply(-14); }
     let mut ispec = [0u8; 32];
     let ok = sched::with_current_address_space(|as_| as_.read_user_buf(ispec_ptr, &mut ispec))
@@ -723,12 +724,17 @@ fn handle_timer_settime(pid: u32, timerid: usize, ispec_ptr: usize, ospec_ptr: u
     let value_sec     = i64::from_ne_bytes(ispec[16..24].try_into().unwrap());
     let value_nsec    = i64::from_ne_bytes(ispec[24..32].try_into().unwrap());
 
-    let interval_ticks = (interval_sec as u64 * TICK_HZ)
-                       + (interval_nsec as u64 / (1_000_000_000 / TICK_HZ));
-    let value_ticks    = (value_sec as u64 * TICK_HZ)
-                       + (value_nsec as u64 / (1_000_000_000 / TICK_HZ));
+    if interval_sec < 0 || value_sec < 0
+        || !(0..1_000_000_000).contains(&interval_nsec)
+        || !(0..1_000_000_000).contains(&value_nsec) {
+        return err_reply(-22); // EINVAL
+    }
+    let interval_ns = (interval_sec as u64).saturating_mul(NSEC_PER_SEC)
+                        .saturating_add(interval_nsec as u64);
+    let value_ns    = (value_sec as u64).saturating_mul(NSEC_PER_SEC)
+                        .saturating_add(value_nsec as u64);
 
-    let (old_interval, old_remaining) = match set_timer_ticks(pid, timerid, interval_ticks, value_ticks) {
+    let (old_interval, old_remaining) = match set_timer_ns(pid, timerid, interval_ns, value_ns) {
         Some(v) => v,
         None => return err_reply(-22),
     };
@@ -741,11 +747,11 @@ fn handle_timer_settime(pid: u32, timerid: usize, ispec_ptr: usize, ospec_ptr: u
 
 fn handle_timer_gettime(pid: u32, timerid: usize, ospec_ptr: usize) -> Message {
     if ospec_ptr == 0 { return err_reply(-14); }
-    let (interval_ticks, remaining) = match get_timer_ticks(pid, timerid) {
+    let (interval_ns, remaining) = match get_timer_ns(pid, timerid) {
         Some(v) => v,
         None => return err_reply(-22),
     };
-    if write_itimerspec(ospec_ptr, interval_ticks, remaining) { ok_reply() } else { err_reply(-14) }
+    if write_itimerspec(ospec_ptr, interval_ns, remaining) { ok_reply() } else { err_reply(-14) }
 }
 
 /// timer_getoverrun(timerid) — number of extra expirations folded into the

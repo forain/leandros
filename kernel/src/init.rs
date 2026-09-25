@@ -82,6 +82,9 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // K2 poll-deadline tick hook: wakes finite-timeout poll/select/epoll_wait
     // waiters and timerfd sleepers on time (audio keeps its own hook slot).
     sched::register_tick_hook(crate::syscall::poll_deadline_tick);
+    // …and the same service from each CPU's one-shot deadline interrupt, so a
+    // timed wait wakes at its deadline rather than at the next tick edge.
+    sched::register_deadline_hook(crate::syscall::poll_deadline_service);
     sched::register_clock_ns(crate::syscall::clock_ns_for_sched);
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────

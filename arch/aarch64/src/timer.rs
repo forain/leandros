@@ -139,6 +139,46 @@ fn interval() -> u64 {
     if f == 0 { 1_000_000 } else { f / TICK_HZ } // guard against uninitialised freq
 }
 
+/// Per CPU: the earliest pending one-shot deadline (CNTVCT units) armed by
+/// `arm_deadline`, `u64::MAX` = none. The compare value is always
+/// `min(next grid point, ONESHOT_CPU)`, so a timed wait is serviced within
+/// interrupt latency of its deadline instead of at the next 10 ms grid point.
+/// Only this CPU touches its slot, with IRQs masked.
+static ONESHOT_CPU: [AtomicU64; TIMER_MAX_CPUS] =
+    [const { AtomicU64::new(u64::MAX) }; TIMER_MAX_CPUS];
+
+/// Absolute `monotonic_ns()` instant → counter value, rounded UP (so the
+/// compare never fires before the deadline on the clock that judges it).
+fn ns_to_cnt(ns: u64) -> u64 {
+    let e = EPOCH.load(Ordering::Relaxed);
+    let f = freq();
+    let d = ((ns as u128) * f as u128 + 999_999_999) / 1_000_000_000u128;
+    e.wrapping_add(d.min(u64::MAX as u128 / 2) as u64)
+}
+
+/// Arm this CPU's one-shot timer for the absolute `monotonic_ns()` instant
+/// `deadline_ns` when it is sooner than what is armed already (see
+/// `sched::register_poll_deadline`). Safe from task or IRQ context.
+pub fn arm_deadline(deadline_ns: u64) {
+    let cpu = unsafe { super::smp::arch_cpu_id() }.min(TIMER_MAX_CPUS - 1);
+    let daif: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, daif", "msr daifset, #2", out(reg) daif, options(nomem, nostack));
+    }
+    let grid = GRID_CPU[cpu].load(Ordering::Relaxed);
+    if grid != 0 && EPOCH.load(Ordering::Relaxed) != 0 {
+        let c = ns_to_cnt(deadline_ns);
+        if c < ONESHOT_CPU[cpu].load(Ordering::Relaxed) {
+            ONESHOT_CPU[cpu].store(c, Ordering::Relaxed);
+            if c < grid.wrapping_add(interval()) {
+                write_cval(c);
+                unsafe { core::arch::asm!("isb", options(nomem, nostack)); }
+            }
+        }
+    }
+    unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack)); }
+}
+
 /// Advance this CPU's grid past `now` and program the compare value for the
 /// first grid point strictly after it. Returns how many grid points were at or
 /// before `now` — the ticks of real time this CPU has to account for (1 on a
@@ -252,6 +292,26 @@ pub fn on_tick() {
     let now = cntvct();
     let passed = advance_grid(cpu, now);
     LAST_TICK_CNT_CPU[cpu].store(now, Ordering::Relaxed);
+
+    // One-shot deadline: service it if due (any CPU), then fold the next
+    // pending deadline back into the compare value (advance_grid just set it
+    // to the next grid point).
+    let os = ONESHOT_CPU[cpu].load(Ordering::Relaxed);
+    if os != u64::MAX && now >= os {
+        ONESHOT_CPU[cpu].store(u64::MAX, Ordering::Relaxed);
+        let next = sched::timer_deadline_irq();
+        if next != u64::MAX {
+            ONESHOT_CPU[cpu].store(ns_to_cnt(next), Ordering::Relaxed);
+        }
+    }
+    let os = ONESHOT_CPU[cpu].load(Ordering::Relaxed);
+    let next_grid = GRID_CPU[cpu].load(Ordering::Relaxed).wrapping_add(interval());
+    if os < next_grid {
+        write_cval(os);
+    }
+    // A pure deadline interrupt (no grid point passed) is not a tick: no
+    // device polling, no tick hooks, no timeslice accounting.
+    if passed == 0 { return; }
 
     if cpu == 0 {
         if passed > 1 {
