@@ -386,12 +386,25 @@ _PASTE_ON  = b"\x1b[?2004h"
 # off after the first one and the truncation read as a hang.
 _PROMPT_TAIL_RE = re.compile(r"\n\S*[#$>] \Z")
 
+# Kernel diagnostics the BSP timer tick writes straight to the UART, e.g.
+# "[TLBSTAT] t=10 flush=172 ...\n" every 10 s after a period with an exec.
+# They are not synchronised with the guest's tty output, so one routinely lands
+# glued to the END of a freshly painted prompt ("brush-0.5# ...ESC[?25h[TLBSTAT]
+# ...\n"). The prompt is then no longer the tail of the stream and a caller
+# waiting for it times out: that is the "brush never prints its prompt after
+# pthreadtest" hang (wave 2026-09-24, lane epollwake) — the shell was idle at
+# its prompt in reedline's blocking key read the whole time. Drop whole
+# trailing kernel lines (raw bytes, before _strip_ansi, which would eat the
+# "[T" of "[TLBSTAT]") so the prompt underneath is seen.
+_KLOG_TAIL_RE = re.compile(rb"(?:\[[A-Z][A-Z0-9_]*\][^\n\x1b]*\n+)+\Z")
+
 
 def _at_prompt(buf: bytes) -> bool:
     """True iff `buf` ends at an interactive shell prompt."""
     # Only the tail can match, and this runs per received chunk, so never
     # rescan a megabyte of `mame` output to answer it.
-    text = _strip_ansi(buf[-512:]).decode("utf-8", errors="replace")
+    tail = _KLOG_TAIL_RE.sub(b"", buf[-2048:])
+    text = _strip_ansi(tail[-512:]).decode("utf-8", errors="replace")
     # reedline's cursor save/restore (ESC 7 / ESC 8) and keypad-mode toggles
     # sit between the prompt and end-of-buffer; _strip_ansi drops the CSI body
     # but leaves the ESC that introduced it, so clear both before matching.
