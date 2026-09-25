@@ -115,6 +115,25 @@ list, not just first.
 
 This is useless headless and blocks the terminal; use the agent path above.
 
+### GPU path (COSMIC never renders in software)
+
+`run-qemu.sh` picks the GPU device by default (`--gpu auto`): Venus
+(`venus=on`, guest renders through zink) where the host QEMU/virglrenderer
+supports it, virgl where only GL passthrough exists, nothing otherwise
+(macOS Homebrew QEMU has no virglrenderer — it prints a warning). Override
+with `--venus`, `--virgl`, `--no-gpu` or `LEANDROS_GPU=auto|venus|virgl|none`.
+
+In the guest, `/bin/gpu-env` (sourced by `/etc/profile`, `greeter-real`,
+`start-cosmic-leandros`) verifies a hardware `GL_RENDERER` with
+`/bin/gpuprobe gl` before any compositor starts. No GPU renderer ⇒ the
+graphical login is **not started**, init prints a `NO GPU RENDERER` banner on
+serial, and `start-cosmic-leandros` exits 78. The serial login is unaffected,
+so **`driver.py start` without `--venus` is the headless-test path** (plain
+virtio-gpu, no greeter burning CPU). softpipe is explicit opt-in only:
+`touch /etc/leandros/allow-software-render` (or `LEANDROS_RENDERER=software`).
+The Mesa ship-set comes from `ports/mesa/build-gpu-stack.sh <arch>`
+(→ `leandros-artifacts/m3-gl-stack/gpu-stage-<arch>`); mkfs warns if it is absent.
+
 ## Build
 
 ```sh

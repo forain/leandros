@@ -1985,6 +1985,7 @@ fn dumb_unref_by_obj(obj: u32) -> bool {
 /// surface back to the console right after the sweep that gets here.
 fn dumb_release_host_resource(res_id: u32) {
     if res_id == 0 { return; }
+    crate::virtio_gpu::unmark_host_rendered(res_id);
     if let Some(gpu) = &mut crate::virtio_gpu::lock_gpu() {
         gpu.resource_unref(res_id);
     }
@@ -5603,6 +5604,8 @@ impl DrmDeviceInterface {
             }
             rid
         };
+        // The host renders into it; presents must not 2D-transfer over it.
+        crate::virtio_gpu::mark_host_rendered(res_handle);
 
         // Register in the dumb registry so PRIME export / MAP / ADDFB2 and the
         // refcounted BO lifetime resolve this handle exactly like any other BO.
