@@ -1995,8 +1995,19 @@ impl VirtioGpuDevice {
             if !wait.step(&window, iter) { break; }
             iter += 1;
         }
+        let parks = wait.parks.get();
         drop(wait);
         drop(window);
+        if crate::drm_device_interface::DRM_STATS {
+            let dt = crate::snd::monotonic_us().wrapping_sub(t0);
+            if dt >= 1000 {
+                mm::gap2::s("[CTRLQ-SLOW] locked cmd="); mm::gap2::h(hdr_type as usize);
+                mm::gap2::kv(" dt_us=", dt as usize);
+                mm::gap2::kv(" parks=", parks as usize);
+                mm::gap2::kv(" pid=", sched::current_pid() as usize);
+                mm::gap2::nl();
+            }
+        }
         self.submit_finish(head_idx, done, hdr_type, t0)
     }
 
