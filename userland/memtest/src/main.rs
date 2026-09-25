@@ -475,7 +475,9 @@ unsafe fn test_file_private_sigbus_past_eof() -> bool {
 }
 
 /// Demand-paged private file mappings, touched, forked and unmapped, must
-/// return every page they populated.
+/// return every page they populated. The rounds run in a child so the page
+/// tables each fresh mapping address costs (kept until exit, ~3 per 6 MiB
+/// round) are returned too, and the bar can be tight.
 unsafe fn test_file_private_no_leak() -> bool {
     let name = b"file_private_no_leak\0";
     const ROUNDS: usize = 32;
@@ -487,32 +489,38 @@ unsafe fn test_file_private_no_leak() -> bool {
     let w = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
     if w as isize != -1 { let _ = core::ptr::read_volatile(w); munmap(w, len); }
     let before = free_ram();
-    let mut failures = 0usize;
-    for r in 0..ROUNDS {
-        let p = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-        if p as isize == -1 { failures += 1; continue; }
-        let mut off = 0usize;
-        while off < size { let _ = core::ptr::read_volatile(p.add(off)); off += PAGE; }
-        *p.add(PAGE) = 1;
-        if r % 2 == 1 {
-            let pid = fork();
-            if pid == 0 { *p = 2; exit(0); }
-            if pid < 0 { failures += 1; } else {
-                let mut status: i32 = 0;
-                wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    let worker = fork();
+    if worker == 0 {
+        let mut failures = 0i32;
+        for r in 0..ROUNDS {
+            let p = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+            if p as isize == -1 { failures += 1; continue; }
+            let mut off = 0usize;
+            while off < size { let _ = core::ptr::read_volatile(p.add(off)); off += PAGE; }
+            *p.add(PAGE) = 1;
+            if r % 2 == 1 {
+                let pid = fork();
+                if pid == 0 { *p = 2; exit(0); }
+                if pid < 0 { failures += 1; } else {
+                    let mut status: i32 = 0;
+                    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+                }
             }
+            munmap(p, len);
         }
-        munmap(p, len);
+        exit(failures);
     }
+    let mut status: i32 = -1;
+    if worker > 0 { wait4(worker, &mut status as *mut i32, 0, core::ptr::null_mut()); }
     close(fd);
     let after = free_ram();
     let lost_pages = before.saturating_sub(after) / PAGE;
     write(STDOUT_FILENO, b"  rounds=".as_ptr(), 9); print_dec(ROUNDS);
     write(STDOUT_FILENO, b" file_pages=".as_ptr(), 12); print_dec(len / PAGE);
     write(STDOUT_FILENO, b" lost_pages=".as_ptr(), 12); print_dec(lost_pages);
-    write(STDOUT_FILENO, b" failures=".as_ptr(), 10); print_dec(failures);
+    write(STDOUT_FILENO, b" worker_status=".as_ptr(), 15); print_dec(status as usize);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
-    report(name, failures == 0 && lost_pages < 4 * ROUNDS)
+    report(name, status == 0 && lost_pages < 64)
 }
 
 /// A private mapping outlives its descriptor *and* the file's name: pages
