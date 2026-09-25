@@ -3373,6 +3373,13 @@ pub fn drm_tick() {
             crate::pci::serial_debug(" park_kicks=");
             crate::pci::serial_debug_hex_64(
                 crate::virtio_gpu::CTRLQ_PARK_KICKS.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" park_phase=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_PARK_PHASE.load(Ordering::Relaxed));
+            for (i, h) in crate::virtio_gpu::CTRLQ_WAIT_HIST.iter().enumerate() {
+                crate::pci::serial_debug([" wh0=", " wh1=", " wh2=", " wh3=", " wh4="][i]);
+                crate::pci::serial_debug_hex_64(h.load(Ordering::Relaxed));
+            }
             crate::pci::serial_debug("\n");
         }
     }
