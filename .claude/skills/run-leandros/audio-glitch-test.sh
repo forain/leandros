@@ -2,7 +2,8 @@
 # One full glitch-test cycle: build, boot, 60s MAME run, analyze.
 # Usage: audio-glitch-test.sh <label> [arch] [--no-build]
 set -e
-cd /Users/forain/code/leandros
+# Repo root: this script lives in <root>/.claude/skills/run-leandros/.
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 L=$1
 ARCH=${2:-aarch64}
 NO_BUILD=0

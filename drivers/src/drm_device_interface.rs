@@ -8,6 +8,7 @@ use ::core::ptr;
 use super::drm::*;
 use super::drm_driver::*;
 use super::{Driver, DriverError};
+use crate::virtio_gpu::GpuSync;
 
 // ── Standard Linux DRM IOCTL Constants ───────────────────────────────────────
 
@@ -1305,7 +1306,7 @@ fn ctx_ensure(open_id: u32) -> u32 {
     // capset 0 = "host default". Deliberately not VIRTIO_GPU_CAPSET_VIRGL: the
     // host may prefer virgl2, and letting it choose is what upstream does.
     let ctx = {
-        let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+        let mut guard = crate::virtio_gpu::lock_gpu();
         match guard.as_mut() {
             Some(gpu) => match gpu.ctx_create(0, "leandros-virgl") {
                 Ok(c) => c,
@@ -1319,12 +1320,12 @@ fn ctx_ensure(open_id: u32) -> u32 {
         // Lost a race: another thread on this open bound first. Its context is
         // as good as ours, so adopt it and drop the one we just made.
         Err(winner) if winner != CTX_BIND_NO_SLOT => {
-            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let mut guard = crate::virtio_gpu::lock_gpu();
             if let Some(gpu) = guard.as_mut() { gpu.ctx_destroy(ctx); }
             winner
         }
         Err(_) => {
-            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let mut guard = crate::virtio_gpu::lock_gpu();
             if let Some(gpu) = guard.as_mut() { gpu.ctx_destroy(ctx); }
             0
         }
@@ -1430,7 +1431,7 @@ pub fn drm_release_open(open_id: u32) {
     // blobs, above, still had to be reclaimed.
     if ctx == 0 { return; }
 
-    let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+    let mut guard = crate::virtio_gpu::lock_gpu();
     if let Some(gpu) = guard.as_mut() {
         gpu.ctx_destroy(ctx);
     }
@@ -1896,7 +1897,7 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
     // non-zero `res_handle` (`alloc_resource_id()` starts at 16), so this
     // changes nothing on that path.
     if res_handle != 0 && (detach_ctx != 0 || dead.is_some()) {
-        let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+        let mut guard = crate::virtio_gpu::lock_gpu();
         if let Some(gpu) = guard.as_mut() {
             // UNMAP before UNREF: the host holds the window sub-region on behalf
             // of a live resource, and unreferencing it first leaves the
@@ -1984,7 +1985,7 @@ fn dumb_unref_by_obj(obj: u32) -> bool {
 /// surface back to the console right after the sweep that gets here.
 fn dumb_release_host_resource(res_id: u32) {
     if res_id == 0 { return; }
-    if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+    if let Some(gpu) = &mut crate::virtio_gpu::lock_gpu() {
         gpu.resource_unref(res_id);
     }
 }
@@ -3373,13 +3374,28 @@ pub fn drm_tick() {
             crate::pci::serial_debug(" park_kicks=");
             crate::pci::serial_debug_hex_64(
                 crate::virtio_gpu::CTRLQ_PARK_KICKS.load(Ordering::Relaxed));
+            // Since 2026-09-24 `ctrlq_parked` itself counts waits that really
+            // parked, so `park_phase` repeats it (kept for the field layout).
             crate::pci::serial_debug(" park_phase=");
             crate::pci::serial_debug_hex_64(
-                crate::virtio_gpu::CTRLQ_PARK_PHASE.load(Ordering::Relaxed));
+                crate::virtio_gpu::CTRLQ_PARKED.load(Ordering::Relaxed));
             for (i, h) in crate::virtio_gpu::CTRLQ_WAIT_HIST.iter().enumerate() {
                 crate::pci::serial_debug([" wh0=", " wh1=", " wh2=", " wh3=", " wh4="][i]);
                 crate::pci::serial_debug_hex_64(h.load(Ordering::Relaxed));
             }
+            // Synchronous waits run with VIRTIO_GPU released, and the wake
+            // census: parked waits that found their answer unreaped on waking
+            // (`stranded`) and the subset whose park spanned a tick
+            // (`lost_wake`, woken by their own tick, not the completion).
+            crate::pci::serial_debug(" unlocked_waits=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_UNLOCKED_WAITS.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" stranded=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_PARK_STRANDED.load(Ordering::Relaxed));
+            crate::pci::serial_debug(" lost_wake=");
+            crate::pci::serial_debug_hex_64(
+                crate::virtio_gpu::CTRLQ_LOST_WAKES.load(Ordering::Relaxed));
             crate::pci::serial_debug("\n");
         }
     }
@@ -3683,6 +3699,7 @@ impl DrmDeviceInterface {
             0x1005 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_set_plane(&mut g, arg) },
             0x1006 => self.handle_get_capabilities(arg),
             0x1008 => Self::handle_gpu_irq_stats(arg),
+            0x1009 => Self::handle_gpu_park_spin(arg),
             0x1007 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_ioctl_mmap(&mut g, arg) },
 
             // ── Standard Linux DRM IOCTLs (already wired) ──
@@ -3944,7 +3961,7 @@ impl DrmDeviceInterface {
         // Looked up BEFORE taking the device lock so the two are never nested.
         let existing_res = fb_resource_id(buffer.handle);
         let mut bound_res: Option<u32> = None;
-        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+        if let Some(gpu) = &mut crate::virtio_gpu::lock_gpu() {
             let res_id = match existing_res {
                 // Already has a host resource (a VIRTGPU_RESOURCE_CREATE 3D BO,
                 // or a second ADDFB on the same buffer) — reuse it.
@@ -4141,6 +4158,20 @@ impl DrmDeviceInterface {
         out[5] = DELIVERED_SEQ.load(Ordering::Relaxed);
         out[6] = crate::virtio_gpu::CTRLQ_SYNC.load(Ordering::Relaxed);
         out[7] = crate::virtio_gpu::CTRLQ_TIMEOUTS.load(Ordering::Relaxed);
+        Ok(0)
+    }
+
+    /// LeandrOS 0x1009: read and set how long a synchronous control-queue
+    /// wait spins before it parks (`virtio_gpu::set_park_spin_us`). `arg`
+    /// points to one u64: the new value in microseconds (clamped to 100 ms),
+    /// replaced by the old one. drmsmoke sets 0 to force the parked path and
+    /// restores what it read. Root only: a long spin costs every GPU user.
+    fn handle_gpu_park_spin(arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        if sched::current_euid() != 0 { return Err(DriverError::Access); }
+        let p = arg as *mut u64;
+        let old = crate::virtio_gpu::set_park_spin_us(unsafe { p.read_volatile() });
+        unsafe { p.write_volatile(old); }
         Ok(0)
     }
 
@@ -4439,7 +4470,7 @@ impl DrmDeviceInterface {
         // inside VIRTIO_GPU.
         let existing_res = fb_resource_id(add.handle);
         let mut bound_res: Option<u32> = None;
-        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+        if let Some(gpu) = &mut crate::virtio_gpu::lock_gpu() {
             let res_id = match existing_res {
                 // A BO that already owns a host resource — a
                 // VIRTGPU_RESOURCE_CREATE 3D buffer, or a re-ADDFB — keeps it.
@@ -5300,7 +5331,7 @@ impl DrmDeviceInterface {
         // See fb_resource_id for why this is no longer `handle + 10`.
         let existing_res = fb_resource_id(handle);
         let mut bound_res: Option<u32> = None;
-        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+        if let Some(gpu) = &mut crate::virtio_gpu::lock_gpu() {
             let res_id = match existing_res {
                 Some(r) => r,
                 None => {
@@ -5547,7 +5578,7 @@ impl DrmDeviceInterface {
         let phys = mm::buddy::alloc(order).ok_or(DriverError::Io)?;
 
         let res_handle = {
-            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let mut guard = crate::virtio_gpu::lock_gpu();
             let gpu = match guard.as_mut() {
                 Some(g) => g,
                 None => { mm::buddy::free(phys, order); return Err(DriverError::NotFound); }
@@ -5848,7 +5879,7 @@ impl DrmDeviceInterface {
 
         // Fetch into a kernel buffer under the device lock …
         let blob = {
-            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let mut guard = crate::virtio_gpu::lock_gpu();
             let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
 
             // Like Linux: resolve the capset id against the host's table first.
@@ -5936,7 +5967,7 @@ impl DrmDeviceInterface {
         }
 
         let value: u64 = {
-            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let mut guard = crate::virtio_gpu::lock_gpu();
             let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
             use crate::virtio_gpu as vg;
             match req.param {
@@ -6051,7 +6082,7 @@ impl DrmDeviceInterface {
         }
 
         let ctx = {
-            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let mut guard = crate::virtio_gpu::lock_gpu();
             let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
             gpu.ctx_create(capset_id, "leandros-venus")
                 .map_err(|_| DriverError::Io)?
@@ -6059,7 +6090,7 @@ impl DrmDeviceInterface {
         if let Err(winner) = ctx_bind(open_id, ctx, capset_id, num_rings) {
             // Nothing else may reach this context, so drop it either way.
             {
-                let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+                let mut guard = crate::virtio_gpu::lock_gpu();
                 if let Some(gpu) = guard.as_mut() { gpu.ctx_destroy(ctx); }
             }
             if winner != CTX_BIND_NO_SLOT {
@@ -6109,7 +6140,7 @@ impl DrmDeviceInterface {
         let backing = if guest_backed { Some((phys as u64, size as u32)) } else { None };
 
         let res_handle = {
-            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let mut guard = crate::virtio_gpu::lock_gpu();
             let gpu = match guard.as_mut() {
                 Some(g) => g,
                 None => {
@@ -6322,7 +6353,7 @@ impl DrmDeviceInterface {
         };
 
         let map_info = {
-            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let mut guard = crate::virtio_gpu::lock_gpu();
             match guard.as_mut() {
                 Some(gpu) => gpu.resource_map_blob(b.res_handle, off),
                 None => Err(()),
@@ -6365,7 +6396,7 @@ impl DrmDeviceInterface {
         };
         if !recorded {
             {
-                let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+                let mut guard = crate::virtio_gpu::lock_gpu();
                 if let Some(gpu) = guard.as_mut() { gpu.resource_unmap_blob(b.res_handle); }
             }
             hostvis_free(off);

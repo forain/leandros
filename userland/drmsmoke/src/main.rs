@@ -1556,11 +1556,15 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     //     fence path (delivered when the host retired the present) rather
     //     than the tick fallback, for every flip of the burst.
     //   * SYNC_CMD_PARKED — a reply-needing command (ADDFB2's
-    //     RESOURCE_CREATE_2D + ATTACH_BACKING) parked the CPU on the
-    //     interrupt instead of spinning under the device lock.
+    //     RESOURCE_CREATE_2D + ATTACH_BACKING) really parked the CPU on the
+    //     interrupt and was woken. The counter counts waits that actually
+    //     parked, and a normal wait finishes inside its spin-before-park
+    //     window, so the spin is set to 0 (ioctl 0x1009, root) around the
+    //     ADDFB2 and restored after.
     //   * GPU_IRQ_NO_TIMEOUTS / INTX_NOT_STORMING — nothing wedged and the
     //     shared level line is not being held by another function.
     const DRM_IOCTL_LEANDROS_GPU_IRQ_STATS: c_ulong = 0x1008;
+    const DRM_IOCTL_LEANDROS_GPU_PARK_SPIN: c_ulong = 0x1009;
     if master_conflict {
         report_skip(b"GPU_IRQ_ARMED");
         report_skip(b"GPU_IRQ_COMPLETIONS_COUNTED");
@@ -1624,6 +1628,9 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         let mut sd = DrmModeCreateDumb::default();
         sd.width = 64; sd.height = 64; sd.bpp = 32;
         let mut sd_ok = ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut sd as *mut _) == 0;
+        let mut spin_saved: u64 = 0;
+        let spin_forced = ioctl(fd, DRM_IOCTL_LEANDROS_GPU_PARK_SPIN, &mut spin_saved as *mut u64) == 0;
+        let sync_t0 = monotonic_ns();
         if sd_ok {
             let mut sfb = DrmModeFbCmd2::default();
             sfb.width = 64;
@@ -1639,6 +1646,14 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
             let mut dd = sd.handle;
             let _ = ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut dd as *mut u32);
         }
+        let sync_us = monotonic_ns().wrapping_sub(sync_t0) / 1000;
+        if spin_forced {
+            let mut v = spin_saved;
+            let _ = ioctl(fd, DRM_IOCTL_LEANDROS_GPU_PARK_SPIN, &mut v as *mut u64);
+        }
+        print_dec(b"  GPU_IRQ park_spin_forced_to_0=", spin_forced as u64);
+        print_dec(b"  GPU_IRQ park_spin_restored_us=", spin_saved);
+        print_dec(b"  GPU_IRQ sync_addfb_rmfb_us=", sync_us);
 
         let mut st1 = [0u64; 8];
         let st1_ok = ioctl(fd, DRM_IOCTL_LEANDROS_GPU_IRQ_STATS, st1.as_mut_ptr()) == 0;

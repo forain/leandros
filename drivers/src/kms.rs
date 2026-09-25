@@ -7,6 +7,7 @@
 use spin::Mutex;
 use super::{Driver, DriverError};
 use crate::framebuffer::{Framebuffer, get_hardware_fb_info};
+use crate::virtio_gpu::GpuSync;
 
 // ── EDID Data Structures ─────────────────────────────────────────────────────
 
