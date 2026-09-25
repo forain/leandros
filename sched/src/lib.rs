@@ -2509,7 +2509,7 @@ fn watchdog_scan(me: usize) {
 const TLBSTAT_PERIOD_TICKS: u64 = 1000;
 
 /// Print the TLB-shootdown / CoW-promotion counters of `mm::paging::tlbstat`
-/// as deltas over the last period, when anything changed. BSP timer IRQ
+/// as deltas over the last period, when there was real activity. BSP timer IRQ
 /// only; raw UART, no locks.
 fn tlbstat_tick(now: u64) {
     use mm::paging::tlbstat as ts;
@@ -2528,13 +2528,14 @@ fn tlbstat_tick(now: u64) {
         &ts::TIMEOUTS, &ts::SERVICED, &ts::COW_COPY, &ts::COW_COPY_NS, &ts::COW_REUSE,
         &ts::EXEC_PRE, &ts::EXEC_PRE_NS];
     let mut d = [0u64; K];
-    let mut any = false;
     for i in 0..K {
         let c = cur[i].load(Ordering::Relaxed);
         d[i] = c.wrapping_sub(PREV[i].swap(c, Ordering::Relaxed));
-        if d[i] != 0 && i != 3 && i != 7 && i != 10 { any = true; }
     }
-    if !any { return; }
+    // Quiet on an idle system (a desktop still does a few flushes per
+    // period): only periods with an exec, an ack timeout or a burst of CoW
+    // copies are printed.
+    if d[9] == 0 && d[4] == 0 && d[6] < 64 { return; }
     s("[TLBSTAT] t="); n(now / 100);
     s(" flush="); n(d[0]); s(" remote="); n(d[1]); s(" ipi="); n(d[2]);
     s(" wait_us="); n(d[3] / 1000); s(" wait_max_us="); n(ts::WAIT_MAX_NS.swap(0, Ordering::Relaxed) / 1000);

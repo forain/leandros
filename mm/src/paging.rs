@@ -145,7 +145,7 @@ pub unsafe fn map_kernel_device(phys: usize, size: usize, flags: PageFlags) -> O
 
 /// TLB-maintenance and CoW-promotion counters (always on: relaxed atomics).
 /// Printed as a `[TLBSTAT]` delta line every 10 s by the BSP's timer tick
-/// when anything changed (`sched::tlbstat_tick`).
+/// when there was activity (`sched::tlbstat_tick`).
 pub mod tlbstat {
     use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
