@@ -13,7 +13,7 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use crate::paging::{PageFlags, map_page, unmap_page, tlb_shootdown_all};
+use crate::paging::{PageFlags, map_page, unmap_page, tlb_flush_range, tlb_flush_as, tlb_flush_local_page};
 use crate::buddy::{PAGE_SIZE, alloc as buddy_alloc, free as buddy_free};
 
 // ── POSIX mmap/mprotect protection flags ─────────────────────────────────────
@@ -221,11 +221,13 @@ impl Drop for AddressSpace {
         // The leaves were unmapped or discarded above, so the walk frees
         // nodes only (see `arch_free_user_page_tables`).
         if self.page_table_root != 0 {
+            // Flush stale TLB entries on any CPU that may still cache this
+            // root before its table pages are returned (normally none: a
+            // dying address space is loaded nowhere).
+            tlb_flush_as(self.page_table_root);
             unsafe { crate::paging::free_user_page_tables(self.page_table_root); }
             buddy_free(self.page_table_root, 0);
         }
-        // Flush stale TLB entries on all CPUs now that all mappings are gone.
-        tlb_shootdown_all();
     }
 }
 
@@ -706,50 +708,60 @@ impl AddressSpace {
             // Serialize the get→copy→dec promotion against clone_as and
             // against promotions in the sibling address space — see
             // cow::COW_LOCK's doc comment.
+            let t_promo = crate::paging::tlbstat::now_ns();
             let _cow_guard = crate::cow::COW_LOCK.lock();
             let refcount = crate::pageref::get(lazy_phys);
-            let new_phys = if refcount <= 1 {
-                lazy_phys // sole remaining owner: no copy needed
-            } else {
-                let np = match buddy_alloc(0) {
-                    Some(p) => p,
-                    None    => return FaultPlan::Done(Fault::Segv), // OOM
-                };
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        crate::phys_to_virt(lazy_phys) as *const u8,
-                        crate::phys_to_virt(np)        as *mut u8,
-                        PAGE_SIZE,
-                    );
+            if refcount <= 1 {
+                // Sole remaining owner: same frame, read-only → writable. A
+                // permission upgrade needs no break-before-make and no remote
+                // flush (a stale read-only entry elsewhere only re-faults and
+                // lands here); drop this CPU's copy of the entry that faulted.
+                if !unsafe { map_page(page_table_root, page_va, lazy_phys, region.flags) } {
+                    return FaultPlan::Done(Fault::Segv);
                 }
-                crate::pageref::dec(lazy_phys);
-                np
-            };
-
-            if new_phys != lazy_phys {
-                // Break-before-make: the PTE's output address changes, which
-                // AArch64 only permits through an invalid entry + TLB flush.
-                unsafe { unmap_page(page_table_root, page_va); }
-                tlb_shootdown_all();
+                tlb_flush_local_page(page_va);
+                crate::paging::tlbstat::COW_REUSE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return FaultPlan::Done(Fault::Handled);
             }
-            let mapped = unsafe { map_page(page_table_root, page_va, new_phys, region.flags) };
-            if !mapped {
-                if new_phys != lazy_phys { buddy_free(new_phys, 0); }
+            let new_phys = match buddy_alloc(0) {
+                Some(p) => p,
+                None    => return FaultPlan::Done(Fault::Segv), // OOM
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    crate::phys_to_virt(lazy_phys) as *const u8,
+                    crate::phys_to_virt(new_phys)  as *mut u8,
+                    PAGE_SIZE,
+                );
+            }
+            // Break-before-make with ONE flush: the output address changes,
+            // which AArch64 only permits through an invalid entry plus TLB
+            // invalidation, and which on x86 must not let one thread's CPU
+            // keep reading the old frame while another already writes the new
+            // one. Clear, flush this page on every CPU that may cache this
+            // address space (x86: only CPUs with this root loaded — none but
+            // this one for a single-threaded process; AArch64: one broadcast
+            // `tlbi vaae1is`), then install. invalid → valid needs no second
+            // flush on either architecture (neither caches a not-present or
+            // translation-faulting entry). A sibling thread touching the page
+            // meanwhile faults and waits for this address space's `busy`.
+            // Until 2026-09-25 this did an all-CPU shootdown both before and
+            // after the install.
+            unsafe { unmap_page(page_table_root, page_va); }
+            tlb_flush_range(page_table_root, page_va, 1);
+            if !unsafe { map_page(page_table_root, page_va, new_phys, region.flags) } {
+                buddy_free(new_phys, 0);
                 return FaultPlan::Done(Fault::Segv);
             }
             region.lazy_pages[page_idx] = new_phys;
-            // A *copy* promotion rewrote a live PTE to point at a different
-            // frame (old shared → fresh copy). `map_page` (arch_map_page) issues
-            // only a local store barrier, never a TLB invalidation — its barrier
-            // reasoning covers invalid→valid transitions only. The threads of a
-            // multithreaded process share this page table across CPUs, so a
-            // sibling on another CPU would otherwise keep a stale TLB entry
-            // pointing at the OLD frame. Broadcast an inner-shareable shootdown
-            // to drop those stale entries, exactly as clone_as does after its
-            // own downgrades. (Reuse-in-place keeps the same frame, so only the
-            // frame-changing copy path needs this.)
-            if new_phys != lazy_phys {
-                tlb_shootdown_all();
+            // Drop our reference to the shared frame only now that no CPU can
+            // still reach it through this address space: the other owner may
+            // reuse it in place (and write it) as soon as it is sole owner.
+            crate::pageref::dec(lazy_phys);
+            {
+                use crate::paging::tlbstat as ts;
+                ts::COW_COPY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                ts::add(&ts::COW_COPY_NS, &ts::COW_COPY_MAX_NS, ts::now_ns().saturating_sub(t_promo));
             }
             return FaultPlan::Done(Fault::Handled);
         }
@@ -922,6 +934,25 @@ impl AddressSpace {
                 // take. Prefaulting promises no fault afterwards, so give
                 // this side its private copy now.
                 let _ = self.unshare_cow_page(va, true);
+            }
+            va += PAGE_SIZE;
+        }
+    }
+
+    /// [`prefault_range`](Self::prefault_range) for a buffer the kernel will
+    /// only READ: absent pages are faulted in, but a present page still shared
+    /// copy-on-write is left shared — a read through the read-only PTE (or
+    /// the HHDM) never faults. Copying it would be pure waste: execve reads
+    /// argv/envp from a freshly forked child's CoW stack just before throwing
+    /// the whole address space away.
+    pub fn prefault_range_ro(&mut self, addr: usize, len: usize) {
+        if len == 0 { return; }
+        let page_start = addr & !(PAGE_SIZE - 1);
+        let page_end   = (addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let mut va = page_start;
+        while va < page_end {
+            if self.virt_to_phys(va).is_none() {
+                self.handle_user_page_fault(va, false);
             }
             va += PAGE_SIZE;
         }
@@ -1127,7 +1158,7 @@ impl AddressSpace {
         // segments, now that file mappings are demand-paged — goes without
         // the all-CPU shootdown, which cost 0.5-1.2 s per overlay on
         // x86_64/TCG.
-        if did_unmap { tlb_shootdown_all(); }
+        if did_unmap { tlb_flush_range(pt, virt, len / PAGE_SIZE); }
     }
 
     /// Unmap `size` bytes starting at `virt` and free the backing pages.
@@ -1326,7 +1357,7 @@ impl AddressSpace {
             changed = true;
         }
 
-        if changed { tlb_shootdown_all(); }
+        if changed { tlb_flush_range(self.page_table_root, addr, (end - addr) / PAGE_SIZE); }
         changed
     }
 
@@ -1412,7 +1443,8 @@ impl AddressSpace {
                     region.lazy_count = region.lazy_count.saturating_sub(1);
                 }
             }
-            tlb_shootdown_all();
+            tlb_flush_range(self.page_table_root, heap_start + first_idx * PAGE_SIZE,
+                            last_idx.saturating_sub(first_idx));
         }
 
         self.heap_end = new_end;

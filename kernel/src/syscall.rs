@@ -259,6 +259,23 @@ fn prefault_user(ptr: usize, len: usize) {
     let _ = with_current_address_space_mut(|as_| as_.prefault_range(ptr, len));
 }
 
+/// [`prefault_user`] for a buffer the kernel only reads (paths, execve's
+/// argv/envp): faults absent pages in, but does not unshare copy-on-write
+/// pages — reading one never faults, so the private copy (and its TLB flush)
+/// would be wasted.
+fn prefault_user_ro(ptr: usize, len: usize) {
+    if ptr == 0 || len == 0 { return; }
+    let end = match ptr.checked_add(len) { Some(e) => e, None => return };
+    let mut from = ptr;
+    while let Some(Some(va)) = with_current_address_space_mut(|as_| {
+        as_.first_absent_file_page(from, end)
+    }) {
+        let _ = sched::prefault_user_page(va);
+        from = va + mm::buddy::PAGE_SIZE;
+    }
+    let _ = with_current_address_space_mut(|as_| as_.prefault_range_ro(ptr, len));
+}
+
 // ── VFS call helper ───────────────────────────────────────────────────────────
 
 /// Build a VFS message with up to 7 u64 arguments packed into data[].
@@ -3482,7 +3499,7 @@ impl ExecStrBuf {
             let chunk = core::cmp::min(core::cmp::min(to_page, room), buf.len());
             // Back the (possibly demand-paged) source page, then read it via a
             // fault-checked copy.  Never raw-deref the user pointer.
-            prefault_user(read_from, chunk);
+            prefault_user_ro(read_from, chunk);
             let ok = with_current_address_space(|as_| {
                 as_.read_user_buf(read_from, &mut buf[..chunk])
             }).unwrap_or(false);
@@ -3919,10 +3936,11 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     argv.reset();
     envp.reset();
 
+    let t_pre = mm::paging::tlbstat::now_ns();
     // Fault in the pointer arrays themselves (they can live in .data/.rodata
     // of a demand-paged image, not just on the stack).
-    prefault_user(argv_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
-    prefault_user(envp_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
+    prefault_user_ro(argv_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
+    prefault_user_ro(envp_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
 
     // A script's rewritten head goes first (see the `#!` loop above).
     for a in &head_args {
@@ -3975,6 +3993,11 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     }
     let argc = argv.count;
     let envc = envp.count;
+    {
+        use mm::paging::tlbstat as ts;
+        ts::EXEC_PRE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        ts::add(&ts::EXEC_PRE_NS, &ts::EXEC_PRE_MAX_NS, ts::now_ns().saturating_sub(t_pre));
+    }
 
     // ── Load ELF into fresh address space ─────────────────────────────────────
     let pt_root = unsafe { arch_alloc_page_table_root() };
@@ -6631,7 +6654,7 @@ impl KPath {
 /// `AT_EMPTY_PATH`, handled separately by `sys_newfstatat`).
 fn resolve_user_path(path_ptr: usize) -> Result<KPath, isize> {
     if path_ptr == 0 || !validate_user_buf(path_ptr, 1) { return Err(-14); }
-    prefault_user(path_ptr, KPATH_MAX);
+    prefault_user_ro(path_ptr, KPATH_MAX);
 
     let (raw, raw_len) = match read_cstr_for_vfs(unsafe {
         core::slice::from_raw_parts(path_ptr as *const u8, KPATH_MAX)
@@ -6663,7 +6686,7 @@ fn resolve_user_path(path_ptr: usize) -> Result<KPath, isize> {
 /// directory rather than the creating process's cwd.
 fn read_user_cstr_kpath(ptr: usize) -> Result<KPath, isize> {
     if ptr == 0 || !validate_user_buf(ptr, 1) { return Err(-14); }
-    prefault_user(ptr, KPATH_MAX);
+    prefault_user_ro(ptr, KPATH_MAX);
     let (raw, raw_len) = match read_cstr_for_vfs(unsafe {
         core::slice::from_raw_parts(ptr as *const u8, KPATH_MAX)
     }) {
@@ -6759,7 +6782,7 @@ fn resolve_at_path(dirfd: usize, path_ptr: usize) -> Result<KPath, isize> {
     if dirfd == AT_FDCWD { return resolve_user_path(path_ptr); }
 
     if path_ptr == 0 || !validate_user_buf(path_ptr, 1) { return Err(-14); }
-    prefault_user(path_ptr, KPATH_MAX);
+    prefault_user_ro(path_ptr, KPATH_MAX);
     let (raw, raw_len) = match read_cstr_for_vfs(unsafe {
         core::slice::from_raw_parts(path_ptr as *const u8, KPATH_MAX)
     }) {
