@@ -288,9 +288,19 @@ fn dnode_set_blkaddr(blk: &mut [u8], idx: usize, addr: u32) {
 
 // ── Block cache ───────────────────────────────────────────────────────────────
 
-// 4 slots × 4 KB = 16 KB per mount — keeps MountState small enough to construct
-// on the 64 KB kernel boot stack without overflowing and corrupting statics.
-const CACHE_SLOTS: usize = 4;
+// 192 slots × 4 KB = 768 KB per mount (MountState ~840 KB, under one order-8
+// buddy block). The old 4 slots dated from when MountState was built on the
+// 64 KB boot stack; it is now built element-wise in its heap Box (`mount`).
+//
+// Four slots could not hold even one path component's working set: a dentry
+// lookup touches the dir's NAT block and inode block, then per dentry block
+// the NAT + inode again (`inode_logical_to_phys`) and the data block. Every
+// component therefore missed, and a stat() of a path that does not exist —
+// three resolutions (VFS_STAT, `is_directory`, VFS_OPEN) — cost ~2.8 ms of
+// synchronous virtio-blk reads on x86_64/KVM. cosmic-greeter's icon lookup
+// stats ~750 missing theme paths per repaint on its UI thread, which spent
+// 93 % of its time in stat() and made each keystroke wait 5–44 s.
+const CACHE_SLOTS: usize = 192;
 const NULL_BLK: u64 = u64::MAX;
 
 #[derive(Clone, Copy)]

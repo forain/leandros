@@ -1,10 +1,10 @@
 # cosmic-greeter port (LeandrOS)
 
-**There is no COSMIC source patch here any more, and there should not be one
-again.** The single `.rs` change this directory used to carry
-(`0001-locker-idle-without-logind.patch`) has been retired by a staging decision
-instead — see "Why there is no patch" below. What remains is the build recipe and
-the two facts a rebuild has to honour.
+**One source patch, `0001-blur-opt-in-under-softpipe.patch` (2026-09-25), and
+it is a performance decision, not a functional one** — see "3. Background blur"
+below. The older `0001-locker-idle-without-logind.patch` stays retired by a
+staging decision — see "Why there is no patch" below. Apart from that, this is
+the build recipe and the two facts a rebuild has to honour.
 
 ## 1. Built with `--no-default-features`
 
@@ -46,6 +46,27 @@ Consequences worth stating so they are not rediscovered:
   resolve it. Unstaging it turns every greeter launch into a load failure.
 - Anything that wants the lock screen back must both restore a
   `/bin/cosmic-greeter` name and deal with the immediate-lock loop again.
+
+## 3. Background blur is opt-in (`0001-blur-opt-in-under-softpipe.patch`)
+
+`Common::blur_rects` asks the compositor (ext-background-effect) to blur what is
+behind the login card. cosmic-comp implements that as a multi-pass
+downsample/upsample shader over the card region, redone on every frame, and on
+LeandrOS the compositor renders with Mesa **softpipe** (an interpreted TGSI
+rasterizer). Measured on x86_64/KVM (lane greeterlag, 2026-09-25): cosmic-comp's
+render thread sat in softpipe (`fetch_source`, `img_filter_2d_linear`,
+`exec_instruction`, ...) ~80 % of a CPU with the greeter idle, one frame took ~4 s,
+and every keystroke waited for the next frame. With blur off and nothing else
+changed, per-key latency went from p50 10.8 s to 0.16 s.
+
+The patch returns early unless `/etc/leandros/greeter-blur` exists, so blur can be
+turned back on without a rebuild (`touch /etc/leandros/greeter-blur`, restart the
+greeter) once the compositor has a GPU renderer (virgl/Zink/v3d). Rebuild:
+`cd ~/code/leandros-artifacts/m6-session-bins/src/cosmic-greeter && patch -p1 <
+<this dir>/0001-blur-opt-in-under-softpipe.patch && sh ../../build-greeter.sh <arch>`
+then copy `target/<arch>-unknown-linux-musl/release/cosmic-greeter` to
+`../../out/cosmic-greeter-<arch>` (unpatched originals kept as
+`out/cosmic-greeter-<arch>.orig-pre-noblur`).
 
 ## PAM
 

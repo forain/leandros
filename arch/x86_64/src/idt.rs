@@ -453,7 +453,13 @@ extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, e
     // which delivers pending signals when the frame is a ring-3 one.
     if vector == 32 || vector == 0x40 {
         super::apic::eoi();
-        if vector == 32 { super::timer::on_tick(); }
+        if vector == 32 {
+            if sched::pcsample::ENABLED {
+                let f = unsafe { &*frame };
+                sched::pcsample::sample(f.rip, f.cs & 3 != 0);
+            }
+            super::timer::on_tick();
+        }
         sched::preempt_check();
         return;
     }
