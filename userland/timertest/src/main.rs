@@ -169,6 +169,18 @@ extern "C" {
     pub fn setitimer(which: c_int, value: *const itimerval, ovalue: *mut itimerval) -> c_int;
     pub fn getitimer(which: c_int, value: *mut itimerval) -> c_int;
     pub fn alarm(seconds: u32) -> u32;
+
+    pub fn fork() -> c_int;
+    pub fn getpid() -> c_int;
+    pub fn getppid() -> c_int;
+    pub fn kill(pid: c_int, sig: c_int) -> c_int;
+    pub fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+    pub fn _exit(status: c_int) -> !;
+    pub fn pipe(fds: *mut c_int) -> c_int;
+    pub fn pause() -> c_int;
+    pub fn sigprocmask(how: c_int, set: *const sigset_t, oset: *mut sigset_t) -> c_int;
+    pub fn sigsuspend(mask: *const sigset_t) -> c_int;
+    pub fn sigwaitinfo(set: *const sigset_t, info: *mut u8) -> c_int;
 }
 
 // ── Assembly entry point (identical to pthreadtest's) ───────────────────────
@@ -226,6 +238,11 @@ pub unsafe extern "C" fn timer_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_timerfd_realtime_vs_monotonic() { failures += 1; }
     if !test_clock_nanosleep_realtime_abstime() { failures += 1; }
     if !test_itimer_subtick_arms_never_early() { failures += 1; }
+    if !test_alarm_wakes_pause() { failures += 1; }
+    if !test_setitimer_wakes_sigsuspend() { failures += 1; }
+    if !test_timer_create_rt_sigwaitinfo() { failures += 1; }
+    if !test_itimer_periodic_sigsuspend_never_early() { failures += 1; }
+    if !test_blocked_read_sa_restart() { failures += 1; }
 
     puts(b"--- timertest done ---\n\0".as_ptr());
     failures
@@ -347,20 +364,29 @@ unsafe fn test_timer_periodic_overrun() -> bool {
     let mut tid: timer_t = core::ptr::null_mut();
     if timer_create(CLOCK_REALTIME, &mut evp, &mut tid) != 0 { return report(name, false); }
 
-    // 20ms period. A single 300ms sleep lets ~14 periods elapse without any
-    // syscall in between to notice them individually, so check_timers()
-    // must catch the deadline up in one step and fold the extra
-    // expirations into the overrun counter rather than losing them.
+    // 20ms period with SIGALRM BLOCKED for ~300 ms: the first expiry stays
+    // pending and the ~14 later ones must be folded into the overrun count
+    // (POSIX: an expiry while the timer's signal is still pending is an
+    // overrun). Unblocking then runs the handler once. This used to rely on
+    // the expiry being invisible to a sleeping process — expiry now
+    // interrupts the sleep, so an unblocked run would see ~0 overrun, as on
+    // Linux.
+    let blk = 1u64 << (SIGALRM - 1);
+    let mut old_mask: sigset_t = 0;
+    sigprocmask(0 /* SIG_BLOCK */, &blk, &mut old_mask);
     let spec = itimerspec {
         it_interval: timespec { tv_sec: 0, tv_nsec: 20_000_000 },
         it_value:    timespec { tv_sec: 0, tv_nsec: 20_000_000 },
     };
     if timer_settime(tid, 0, &spec, core::ptr::null_mut()) != 0 {
         timer_delete(tid);
+        sigprocmask(2, &old_mask, core::ptr::null_mut());
         return report(name, false);
     }
 
-    sleep_ms(300);
+    let t0 = now_ns();
+    while now_ns() - t0 < 300_000_000 { sleep_ms(10); }
+    sigprocmask(2 /* SIG_SETMASK */, &old_mask, core::ptr::null_mut());
 
     let fired_once = SIGALRM_COUNT.load(Ordering::SeqCst) >= 1;
     let overrun = timer_getoverrun(tid);
@@ -1213,4 +1239,241 @@ unsafe fn test_itimer_subtick_arms_never_early() -> bool {
     print_kv(b"  itimer_5ms_elapsed_us=\0", it_el.max(0) as u64 / 1000);
     print_kv(b"  timer_settime_3ms_elapsed_us=\0", pt_el.max(0) as u64 / 1000);
     report(name, it_ok && pt_ok)
+}
+
+// ── Timer signals wake a thread that is parked in the kernel ────────────────
+//
+// Expiry used to be noticed only on the owner's next syscall RETURN, so a
+// process asleep in pause()/sigsuspend()/sigwaitinfo() with no other wake
+// source never saw its own SIGALRM. Each case below parks with nothing but
+// the timer to wake it. A forked watchdog sends SIGUSR1 (handled, so it
+// interrupts any of these waits) after WATCHDOG_MS, so a regression FAILs
+// instead of hanging the suite.
+
+const SIGUSR1: c_int = 10;
+const SIG_BLOCK: c_int = 0;
+const SIG_SETMASK: c_int = 2;
+const SA_RESTART: c_int = 0x1000_0000;
+const EINTR: c_int = 4;
+const SI_TIMER: c_int = -2;
+const SIGRT_TEST: c_int = 40; // a real-time signal, clear of relibc's reserved pair
+const WATCHDOG_MS: i64 = 3000;
+
+static SIGUSR1_COUNT: AtomicI32 = AtomicI32::new(0);
+static SIGRT_COUNT: AtomicI32 = AtomicI32::new(0);
+extern "C" fn sigusr1_handler(_sig: c_int) { SIGUSR1_COUNT.fetch_add(1, Ordering::SeqCst); }
+extern "C" fn sigrt_handler(_sig: c_int) { SIGRT_COUNT.fetch_add(1, Ordering::SeqCst); }
+
+fn bit(sig: c_int) -> sigset_t { 1u64 << (sig - 1) }
+
+unsafe fn set_handler(sig: c_int, h: extern "C" fn(c_int), flags: c_int) -> bool {
+    let act = sigaction { sa_handler: Some(h), sa_flags: flags, sa_restorer: None, sa_mask: 0 };
+    sigaction(sig, &act, core::ptr::null_mut()) == 0
+}
+
+/// Fork a child that SIGUSR1s us after `ms`. Returns its pid (or -1).
+unsafe fn start_watchdog(ms: i64) -> c_int {
+    SIGUSR1_COUNT.store(0, Ordering::SeqCst);
+    if !set_handler(SIGUSR1, sigusr1_handler, 0) { return -1; }
+    let parent = getpid();
+    let pid = fork();
+    if pid == 0 {
+        sleep_ms(ms);
+        kill(parent, SIGUSR1);
+        _exit(0);
+    }
+    pid
+}
+
+unsafe fn stop_watchdog(pid: c_int) {
+    if pid > 0 {
+        kill(pid, 9);
+        let mut st = 0;
+        waitpid(pid, &mut st, 0);
+    }
+}
+
+unsafe fn disarm_itimer() {
+    let z = core::mem::zeroed::<itimerval>();
+    setitimer(ITIMER_REAL, &z, core::ptr::null_mut());
+}
+
+/// alarm(1) + pause(): pause returns -1/EINTR after the handler ran, at
+/// >= 1 s (never early) and well before the watchdog.
+unsafe fn test_alarm_wakes_pause() -> bool {
+    let name = b"alarm_wakes_pause\0";
+    if !install_sigalrm_handler() { return report(name, false); }
+    SIGALRM_COUNT.store(0, Ordering::SeqCst);
+    let wd = start_watchdog(WATCHDOG_MS);
+    let t0 = now_ns();
+    alarm(1);
+    let r = pause();
+    let err = *__errno_location();
+    let el = now_ns() - t0;
+    alarm(0);
+    stop_watchdog(wd);
+    let got = SIGALRM_COUNT.load(Ordering::SeqCst);
+    print_kv(b"  alarm1_pause_elapsed_us=\0", el.max(0) as u64 / 1000);
+    report(name, wd > 0 && r == -1 && err == EINTR && got == 1
+        && SIGUSR1_COUNT.load(Ordering::SeqCst) == 0
+        && el >= 1_000_000_000 && el < 1_500_000_000)
+}
+
+/// SIGALRM blocked, setitimer(20 ms), sigsuspend(empty): the handler runs
+/// inside sigsuspend, which returns EINTR with the old (blocking) mask back.
+unsafe fn test_setitimer_wakes_sigsuspend() -> bool {
+    let name = b"setitimer_wakes_sigsuspend\0";
+    if !install_sigalrm_handler() { return report(name, false); }
+    SIGALRM_COUNT.store(0, Ordering::SeqCst);
+    let mut old: sigset_t = 0;
+    let blk = bit(SIGALRM);
+    sigprocmask(SIG_BLOCK, &blk, &mut old);
+    let wd = start_watchdog(WATCHDOG_MS);
+    let v = itimerval {
+        it_interval: timeval { tv_sec: 0, tv_usec: 0 },
+        it_value:    timeval { tv_sec: 0, tv_usec: 20_000 },
+    };
+    let t0 = now_ns();
+    setitimer(ITIMER_REAL, &v, core::ptr::null_mut());
+    let empty: sigset_t = 0;
+    let r = sigsuspend(&empty);
+    let err = *__errno_location();
+    let el = now_ns() - t0;
+    stop_watchdog(wd);
+    disarm_itimer();
+    let mut after: sigset_t = 0;
+    sigprocmask(SIG_SETMASK, &old, &mut after);
+    let restored = after & blk != 0;
+    print_kv(b"  itimer20_sigsuspend_elapsed_us=\0", el.max(0) as u64 / 1000);
+    report(name, wd > 0 && r == -1 && err == EINTR && restored
+        && SIGALRM_COUNT.load(Ordering::SeqCst) == 1
+        && SIGUSR1_COUNT.load(Ordering::SeqCst) == 0
+        && el >= 20_000_000 && el < 500_000_000)
+}
+
+/// timer_create(SIGEV_SIGNAL, real-time signal) + sigwaitinfo on it while
+/// blocked: returns that signal with si_code SI_TIMER, never early.
+unsafe fn test_timer_create_rt_sigwaitinfo() -> bool {
+    let name = b"timer_create_rt_sigwaitinfo\0";
+    SIGRT_COUNT.store(0, Ordering::SeqCst);
+    set_handler(SIGRT_TEST, sigrt_handler, 0); // must NOT run: sigwaitinfo takes it
+    let mut old: sigset_t = 0;
+    let blk = bit(SIGRT_TEST);
+    sigprocmask(SIG_BLOCK, &blk, &mut old);
+    let mut evp = zeroed_sigevent(SIGRT_TEST);
+    let mut tid: timer_t = core::ptr::null_mut();
+    if timer_create(CLOCK_MONOTONIC, &mut evp, &mut tid) != 0 {
+        sigprocmask(SIG_SETMASK, &old, core::ptr::null_mut());
+        return report(name, false);
+    }
+    let wd = start_watchdog(WATCHDOG_MS);
+    let spec = itimerspec {
+        it_interval: timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value:    timespec { tv_sec: 0, tv_nsec: 15_000_000 },
+    };
+    let t0 = now_ns();
+    timer_settime(tid, 0, &spec, core::ptr::null_mut());
+    let mut info = [0u8; 128];
+    let r = sigwaitinfo(&blk, info.as_mut_ptr());
+    let el = now_ns() - t0;
+    stop_watchdog(wd);
+    timer_delete(tid);
+    sigprocmask(SIG_SETMASK, &old, core::ptr::null_mut());
+    let signo = i32::from_ne_bytes(info[0..4].try_into().unwrap());
+    let code  = i32::from_ne_bytes(info[8..12].try_into().unwrap());
+    print_kv(b"  rt_timer15_sigwaitinfo_elapsed_us=\0", el.max(0) as u64 / 1000);
+    report(name, wd > 0 && r == SIGRT_TEST && signo == SIGRT_TEST && code == SI_TIMER
+        && SIGRT_COUNT.load(Ordering::SeqCst) == 0
+        && SIGUSR1_COUNT.load(Ordering::SeqCst) == 0
+        && el >= 15_000_000 && el < 500_000_000)
+}
+
+/// A 5 ms periodic ITIMER_REAL waking sigsuspend 10 times: the k-th wake is
+/// never before k * 5 ms after arming, and the run is not tick-paced.
+unsafe fn test_itimer_periodic_sigsuspend_never_early() -> bool {
+    let name = b"itimer_periodic_sigsuspend_never_early\0";
+    if !install_sigalrm_handler() { return report(name, false); }
+    SIGALRM_COUNT.store(0, Ordering::SeqCst);
+    let mut old: sigset_t = 0;
+    let blk = bit(SIGALRM);
+    sigprocmask(SIG_BLOCK, &blk, &mut old);
+    let wd = start_watchdog(WATCHDOG_MS);
+    let v = itimerval {
+        it_interval: timeval { tv_sec: 0, tv_usec: 5_000 },
+        it_value:    timeval { tv_sec: 0, tv_usec: 5_000 },
+    };
+    let empty: sigset_t = 0;
+    let t0 = now_ns();
+    setitimer(ITIMER_REAL, &v, core::ptr::null_mut());
+    let mut early = 0u64;
+    let mut max_late = 0i64;
+    let mut done = 0i64;
+    while done < 10 && SIGUSR1_COUNT.load(Ordering::SeqCst) == 0 {
+        sigsuspend(&empty);
+        let el = now_ns() - t0;
+        let k = SIGALRM_COUNT.load(Ordering::SeqCst) as i64;
+        if k == 0 { continue; }
+        // k expirations have been delivered, the k-th due at k * 5 ms.
+        if el < k * 5_000_000 { early += 1; }
+        max_late = max_late.max(el - k * 5_000_000);
+        done = k;
+    }
+    let total = now_ns() - t0;
+    disarm_itimer();
+    stop_watchdog(wd);
+    sigprocmask(SIG_SETMASK, &old, core::ptr::null_mut());
+    print_kv(b"  periodic5ms_x10_total_us=\0", total.max(0) as u64 / 1000);
+    print_kv(b"  periodic5ms_max_late_us=\0", max_late.max(0) as u64 / 1000);
+    print_kv(b"  periodic5ms_early=\0", early);
+    report(name, wd > 0 && done >= 10 && early == 0
+        && SIGUSR1_COUNT.load(Ordering::SeqCst) == 0 && total < 500_000_000)
+}
+
+/// A blocking pipe read interrupted by a timer signal: with SA_RESTART it is
+/// transparently restarted and returns the byte a child writes at ~150 ms;
+/// without it, it fails EINTR at the timer (~20 ms).
+unsafe fn test_blocked_read_sa_restart() -> bool {
+    let name = b"blocked_read_sa_restart\0";
+    let mut ok = true;
+    for &restart in &[true, false] {
+        SIGALRM_COUNT.store(0, Ordering::SeqCst);
+        if !set_handler(SIGALRM, sigalrm_handler, if restart { SA_RESTART } else { 0 }) {
+            return report(name, false);
+        }
+        let mut fds = [0 as c_int; 2];
+        if pipe(fds.as_mut_ptr()) != 0 { return report(name, false); }
+        let child = fork();
+        if child == 0 {
+            close(fds[0]);
+            sleep_ms(150);
+            write(fds[1], b"x".as_ptr(), 1);
+            _exit(0);
+        }
+        close(fds[1]);
+        let v = itimerval {
+            it_interval: timeval { tv_sec: 0, tv_usec: 0 },
+            it_value:    timeval { tv_sec: 0, tv_usec: 20_000 },
+        };
+        let t0 = now_ns();
+        setitimer(ITIMER_REAL, &v, core::ptr::null_mut());
+        let mut b = 0u8;
+        let r = read(fds[0], &mut b, 1);
+        let err = *__errno_location();
+        let el = now_ns() - t0;
+        disarm_itimer();
+        let mut st = 0;
+        waitpid(child, &mut st, 0);
+        close(fds[0]);
+        let got = SIGALRM_COUNT.load(Ordering::SeqCst);
+        let case_ok = if restart {
+            r == 1 && b == b'x' && got == 1 && el >= 150_000_000
+        } else {
+            r == -1 && err == EINTR && got == 1 && el >= 20_000_000 && el < 140_000_000
+        };
+        print_kv(if restart { b"  sa_restart_read_elapsed_us=\0" } else { b"  no_restart_read_elapsed_us=\0" },
+                 el.max(0) as u64 / 1000);
+        ok &= case_ok;
+    }
+    install_sigalrm_handler();
+    report(name, ok)
 }

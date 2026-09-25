@@ -25,8 +25,13 @@
 //! `timer_create`/`timer_settime`/`timer_gettime`/`timer_delete` are
 //! implemented here as a small per-process timer table.  Each timer is a
 //! deadline (absolute `sched::monotonic_ns()`, so sub-tick values neither
-//! floor to "disarmed" nor fire early) checked on every syscall return and
-//! yielded tick.  Expiry fires by calling `sched::deliver_signal`.
+//! floor to "disarmed" nor fire early). Expiry is serviced from the timer
+//! interrupt ([`service_timers_irq`], driven by the one-shot deadline IRQ the
+//! arm path programs via `sched::register_poll_deadline`), so a process
+//! parked in pause()/sigsuspend()/sigtimedwait()/any interruptible sleep is
+//! woken by its own SIGALRM; syscall return ([`check_timers`]) remains a
+//! fallback. The signal is process-directed (`deliver_signal_process`), as on
+//! Linux for SIGEV_SIGNAL, alarm() and ITIMER_REAL.
 //!
 //! # Message encoding
 //!
@@ -34,6 +39,7 @@
 
 #![no_std]
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use ipc::Message;
 use spin::Mutex;
 
@@ -433,7 +439,17 @@ pub fn check_timers(pid: u32) {
         if now >= timer.deadline {
             // SI_TIMER — the payload a handler uses to tell a POSIX timer
             // expiry apart from someone kill()ing it the same signal.
-            sched::deliver_signal(timer.owner_pid, timer.signo, sched::SigInfo::TIMER);
+            if timer.signo != 0 {
+                match sched::try_deliver_signal_process(timer.owner_pid, timer.signo,
+                                                        sched::SigInfo::TIMER) {
+                    Some(1) => timer.overrun = timer.overrun.saturating_add(1),
+                    Some(_) => {}
+                    None if timer.signo == 18 => {
+                        sched::deliver_signal_process(timer.owner_pid, 18, sched::SigInfo::TIMER);
+                    }
+                    None => continue, // contended: the deadline IRQ retries
+                }
+            }
             if timer.interval > 0 {
                 // A process descheduled for a while can miss more than one
                 // period; catch the deadline up to `now` in one step and
@@ -447,6 +463,61 @@ pub fn check_timers(pid: u32) {
             }
         }
     }
+}
+
+/// Lock-free hint: the earliest armed POSIX-timer/itimer deadline
+/// (`u64::MAX` = none). Lowered by every arm (`fetch_min`), recomputed exactly
+/// by [`service_timers_irq`]; a stale-low value only costs one extra pass.
+static NEXT_TIMER_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Earliest pending timer deadline, for the deadline IRQ's re-arm.
+pub fn earliest_timer_deadline() -> u64 { NEXT_TIMER_DEADLINE.load(Ordering::Relaxed) }
+
+/// Fire every POSIX timer / itimer due at `now`, in IRQ context (try-lock
+/// only). Posting the signal also wakes the target, so a thread blocked in
+/// pause()/sigsuspend()/sigtimedwait()/nanosleep()/poll() sees it now rather
+/// than at its next syscall return. Returns false if a lock was contended and
+/// a due timer was left armed for the caller's retry.
+pub fn service_timers_irq(now: u64) -> bool {
+    if NEXT_TIMER_DEADLINE.load(Ordering::Relaxed) > now { return true; }
+    let mut tbls = match TIMER_TABLES.try_lock() { Some(t) => t, None => return false };
+    let mut done = true;
+    let mut next = u64::MAX;
+    for tbl in tbls.iter_mut().filter(|t| t.in_use) {
+        for timer in tbl.timers.iter_mut() {
+            if !timer.in_use || timer.deadline == 0 { continue; }
+            // SIGCONT's parent notification needs task context: leave it to
+            // the syscall-return path, and keep it out of the hint so it
+            // cannot become a retry storm.
+            if timer.signo == 18 { continue; }
+            if now >= timer.deadline {
+                if timer.signo != 0 {
+                    match sched::try_deliver_signal_process(timer.owner_pid, timer.signo,
+                                                            sched::SigInfo::TIMER) {
+                        // Coalesced into a still-pending instance: POSIX overrun.
+                        Some(1) => timer.overrun = timer.overrun.saturating_add(1),
+                        Some(_) => {}
+                        None => {
+                            done = false; // RUN_QUEUE contended: retry
+                            next = next.min(timer.deadline);
+                            continue;
+                        }
+                    }
+                }
+                if timer.interval > 0 {
+                    let missed = (now - timer.deadline) / timer.interval;
+                    timer.deadline += timer.interval * (missed + 1);
+                    timer.overrun = timer.overrun.saturating_add(missed as u32);
+                } else {
+                    timer.deadline = 0;
+                    continue;
+                }
+            }
+            next = next.min(timer.deadline);
+        }
+    }
+    NEXT_TIMER_DEADLINE.store(next, Ordering::Relaxed); // exact, under TIMER_TABLES
+    done
 }
 
 /// Ensure `pid` has its reserved slot-0 timer armed for `signo`, without
@@ -671,8 +742,17 @@ fn set_timer_ns(pid: u32, timerid: usize, interval_ns: u64, value_ns: u64)
         if dl > now { dl - now } else { 0 }
     };
     tbl.timers[timerid].interval = interval_ns;
-    tbl.timers[timerid].deadline = if value_ns > 0 { now.saturating_add(value_ns) } else { 0 };
+    let deadline = if value_ns > 0 { now.saturating_add(value_ns) } else { 0 };
+    tbl.timers[timerid].deadline = deadline;
     tbl.timers[timerid].overrun = 0;
+    if deadline != 0 {
+        // Publish under TIMER_TABLES (the IRQ service recomputes the hint
+        // under the same lock, so this cannot be clobbered), then arm this
+        // CPU's one-shot timer for it.
+        NEXT_TIMER_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
+        drop(tbls);
+        sched::register_poll_deadline(deadline);
+    }
     Some((old_interval, old_remaining))
 }
 

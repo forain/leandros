@@ -739,8 +739,22 @@ pub extern "C" fn syscall_dispatch(
     a3: usize, a4: usize,
     a5: usize, frame_ptr: usize, _padding: usize,
 ) -> isize {
-    dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr)
+    let ret = dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr);
+    if ret == ERESTARTSYS {
+        // Never reaches user space: the frame gets EINTR, and the signal
+        // pass that runs next rewinds to re-execute the syscall when the
+        // handler has SA_RESTART (or no handler runs).
+        sched::signal::note_syscall_restart(number, a0);
+        return -4;
+    }
+    ret
 }
+
+/// Kernel-internal "interrupted, restartable" return (Linux -ERESTARTSYS):
+/// used by blocking read/write/send/recv/wait4/waitid. Timed waits
+/// (nanosleep, poll, select, epoll_wait, sigsuspend, sigtimedwait) return a
+/// plain EINTR, as on Linux, whatever SA_RESTART says.
+const ERESTARTSYS: isize = -512;
 
 /// zink-lane instrumentation: per-syscall time census for the focus tgid
 /// (`sched::SC_FOCUS_TGID`, cosmic-comp) plus a lock-free pid -> last syscall
@@ -1190,7 +1204,7 @@ fn dispatch_inner(
         RT_SIGSUSPEND  => sys_rt_sigsuspend(a0, a1),
         RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(a0, a1, a2, a3),
         #[cfg(not(target_arch = "aarch64"))]
-        PAUSE          => sys_rt_sigsuspend(0, 0),
+        PAUSE          => sys_pause(),
 
         // ── Threads ────────────────────────────────────────────────────────────
         SET_TID_ADDR => sys_set_tid_address(a0),
@@ -2241,7 +2255,7 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
             sched::WaitTry::NoChildren => return -10, // ECHILD
             sched::WaitTry::StillRunning => {
                 if options & WNOHANG != 0 { return 0; }
-                if interrupted() { return -4; } // EINTR
+                if interrupted() { return ERESTARTSYS; }
                 // Block on the poll wait-channel instead of a yield-spin. A
                 // child exit delivers SIGCHLD which calls sched::wake_poll,
                 // waking us to reap; a short poll deadline bounds any missed
@@ -2337,7 +2351,7 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
                     write_info(0, 0, 0);
                     return 0;
                 }
-                if interrupted() { return -4; } // EINTR
+                if interrupted() { return ERESTARTSYS; }
                 // Block on the poll wait-channel rather than a yield-spin —
                 // same fix as sys_wait4: a long-running child (a compositor,
                 // a service) otherwise pins its blocking-waitid reaper at
@@ -2360,11 +2374,21 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
 /// Replaces the current signal mask, then yields until any unmasked signal
 /// arrives.  Always returns -EINTR.
 fn sys_rt_sigsuspend(mask_ptr: usize, _sigsetsize: usize) -> isize {
-    let new_mask = if mask_ptr != 0 && validate_user_buf(mask_ptr, 8) {
-        unsafe { core::ptr::read(mask_ptr as *const u64) }
-    } else {
-        0
-    };
+    if mask_ptr == 0 || !validate_user_buf(mask_ptr, 8) { return -14; } // EFAULT
+    let new_mask = unsafe { core::ptr::read(mask_ptr as *const u64) };
+    sigsuspend_with(new_mask)
+}
+
+/// pause(2): sigsuspend under the CURRENT mask. It used to be
+/// `rt_sigsuspend(NULL)`, which installed an all-clear mask — a pause()
+/// with SIGALRM blocked woke on it and ran the handler.
+fn sys_pause() -> isize {
+    let cur = replace_signal_mask(0);
+    replace_signal_mask(cur);
+    sigsuspend_with(cur)
+}
+
+fn sigsuspend_with(new_mask: u64) -> isize {
     let old_mask = replace_signal_mask(new_mask);
     // Park until a signal arrives that is not blocked by new_mask. Every
     // delivery path (`deliver_signal`, `deliver_signal_process`) ends in a
@@ -2431,13 +2455,18 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
             }
             return signo as isize;
         }
+        // Any OTHER signal that will run a handler (or kill) ends the wait
+        // with EINTR, as on Linux; the waited-for set is checked first above.
+        if interrupted() { return -4; }
         if let Some(dl) = deadline {
             // EAGAIN: POSIX and Linux report an expired wait this way, not ETIMEDOUT.
             if monotonic_ns() >= dl { return -11; }
         }
         // Park (see sys_rt_sigsuspend); the deadline rides the poll tick.
         sched::block_on_poll_prepare_until(deadline.unwrap_or(u64::MAX));
-        if (pending_signals() | sched::shared_pending_signals()) & wait_mask != 0 { sched::block_on_poll_cancel(); continue; }
+        if (pending_signals() | sched::shared_pending_signals()) & wait_mask != 0 || interrupted() {
+            sched::block_on_poll_cancel(); continue;
+        }
         sched::block_on_poll_commit();
     }
 }
@@ -4536,7 +4565,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                 match read_input_byte() {
                     Some(b) => break b,
                     None    => {
-                        if interrupted() { return -4; } // EINTR
+                        if interrupted() { return if is_kernel { -4 } else { ERESTARTSYS }; }
                         if nonblocking {
                             spins += 1;
                             if spins >= NONBLOCK_RETRY_SPINS { return -11; } // EAGAIN
@@ -7218,11 +7247,25 @@ fn sys_timer_create(_clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) ->
     // struct sigevent: sigev_value(8) + sigev_signo(4) + sigev_notify(4) + ...
     // We only care about sigev_signo at offset 8 (SIGEV_SIGNAL = 0).
     if timerid_ptr != 0 && !validate_user_buf(timerid_ptr, core::mem::size_of::<usize>()) { return -14; }
-    let signo = if sigevent_ptr != 0 && validate_user_buf(sigevent_ptr, 12) {
-        let mut buf = [0u8; 12];
-        let ok = with_current_address_space(|as_| as_.read_user_buf(sigevent_ptr, &mut buf))
-            .unwrap_or(false);
-        if ok { u32::from_ne_bytes(buf[8..12].try_into().unwrap()) } else { 14 }
+    // sigev_notify at offset 12: SIGEV_SIGNAL = 0, SIGEV_NONE = 1 (armed,
+    // readable via timer_gettime, never signals — encoded as signo 0),
+    // SIGEV_THREAD_ID = 4 (delivered process-directed here).
+    let signo = if sigevent_ptr != 0 {
+        let mut buf = [0u8; 16];
+        let ok = validate_user_buf(sigevent_ptr, 16)
+            && with_current_address_space(|as_| as_.read_user_buf(sigevent_ptr, &mut buf))
+                .unwrap_or(false);
+        if !ok { return -14; }
+        let signo  = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        let notify = u32::from_ne_bytes(buf[12..16].try_into().unwrap());
+        match notify {
+            // SIGEV_THREAD has no kernel meaning (libc builds it on
+            // SIGEV_THREAD_ID) and relibc passes it straight through: keep
+            // the old silent behaviour rather than start failing callers.
+            1 | 2 => 0,
+            0 | 4 if (1..=64).contains(&signo) => signo,
+            _ => return -22, // EINVAL
+        }
     } else {
         14 // SIGALRM default
     };
@@ -7332,12 +7375,12 @@ fn block_until_ready(nonblock: bool, mut op: impl FnMut() -> isize, hint: impl F
     loop {
         let n = op();
         if n != -11 || nonblock { return n; }
-        if interrupted() { return -4; } // EINTR
+        if interrupted() { return ERESTARTSYS; }
         let (mask, deadline) = hint();
         sched::block_on_poll_prepare_masked(deadline, mask);
         let n = op();
         if n != -11 { sched::block_on_poll_cancel(); return n; }
-        if interrupted() { sched::block_on_poll_cancel(); return -4; }
+        if interrupted() { sched::block_on_poll_cancel(); return ERESTARTSYS; }
         sched::block_on_poll_commit();
     }
 }
@@ -8154,6 +8197,12 @@ fn scstat_tick() {
 pub fn poll_deadline_service(now: u64) -> u64 {
     use core::sync::atomic::Ordering::Relaxed;
     let tfd = vfs::earliest_timerfd_deadline();
+    // POSIX timers / itimers: post the signal (and wake its parked target)
+    // from here, not at the owner's next syscall return. A contended pass
+    // leaves the timer due, so the retry below re-arms 200 µs out.
+    if tty_server::earliest_timer_deadline() <= now {
+        tty_server::service_timers_irq(now);
+    }
     // Fast path: the lock-free hint (min of parked timed waiters' deadlines)
     // and the timerfd pool say nothing is due → no run-queue scan, no wake.
     let due = core::cmp::min(sched::NEXT_POLL_DEADLINE.load(Relaxed), tfd);
@@ -8189,7 +8238,8 @@ pub fn poll_deadline_service(now: u64) -> u64 {
         }
     }
     let next = core::cmp::min(sched::NEXT_POLL_DEADLINE.load(Relaxed),
-                              vfs::earliest_timerfd_deadline());
+                              vfs::earliest_timerfd_deadline())
+        .min(tty_server::earliest_timer_deadline());
     // Still due after the service = the RUN_QUEUE try-lock lost (the hint was
     // left in place for a retry). Retry shortly rather than immediately — an
     // immediate re-arm would be an interrupt storm against the lock holder —
