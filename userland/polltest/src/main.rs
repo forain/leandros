@@ -485,9 +485,9 @@ unsafe fn test_poll_timeout_wake_latency() -> bool {
         let el = t1.saturating_sub(t0);
         let over = el.saturating_sub(TIMEOUT_MS * 1_000_000) / 1000;
         OVER_US[i] = over.min(u32::MAX as u64) as u32;
-        // Tick-based deadlines fire at the next tick, up to 10 ms early; count
-        // (and print) it, but only a wake more than a tick early is a failure.
-        if el + 10_000_000 < TIMEOUT_MS * 1_000_000 { early += 1; }
+        // Deadlines are absolute and never early (POSIX "at least"): any
+        // return before the full timeout has elapsed is a failure.
+        if el < TIMEOUT_MS * 1_000_000 { early += 1; }
     }
     close(rfd); close(wfd);
     // Insertion sort: N is small and this is a no_std binary.
@@ -511,6 +511,9 @@ unsafe fn test_poll_timeout_wake_latency() -> bool {
     // and p99 ≤ ~2.5 ms on HVF, p99 ≤ ~7.5 ms on x86_64/TCG. A tick-slip
     // regression puts p90 back at a full tick (10 ms) — the p90 bound is the
     // sharp one; the p99 bound is one tick of slack for the odd host-preempted
-    // holder.
+    // holder. 2026-09-24 (lane/polltimer): with never-early absolute deadlines
+    // (lane/timespec) the wake was tick-granular and p90 sat at ~10.1 ms; a
+    // one-shot timer armed to each deadline brings it to p50 ≈ 0.3 ms / p90
+    // ≈ 1.3–1.8 ms on aarch64/HVF and p90 ≈ 0.26 ms on x86_64/TCG (steady state).
     report(name, early == 0 && p90 <= 5_000 && p99 <= 20_000)
 }

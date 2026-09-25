@@ -407,6 +407,161 @@ pub unsafe fn init_local_timer() {
     apic::write(apic::LAPIC_TIMER_INIT, ticks_per_irq);
 }
 
+const TIMER_MAX_CPUS: usize = sched::MAX_CPUS;
+
+/// Per CPU: the earliest pending one-shot deadline (TSC units) armed by
+/// `arm_deadline`, `u64::MAX` = none. Only this CPU touches its slot, with
+/// IRQs masked.
+static ONESHOT_TSC: [AtomicU64; TIMER_MAX_CPUS] =
+    [const { AtomicU64::new(u64::MAX) }; TIMER_MAX_CPUS];
+/// Per CPU: what the LAPIC countdown is currently programmed for.
+/// `ST_PERIODIC` = the plain 100 Hz periodic mode; `ST_DEADLINE` = a ONE-SHOT
+/// countdown to a pending deadline; `ST_REALIGN` = a one-shot countdown to the
+/// next tick after a deadline interrupt, whose handler restores periodic mode.
+///
+/// The short countdowns must be one-shot, never a shortened *period*: QEMU's
+/// `apic_timer` re-arms a periodic timer from its previous expiry, so a
+/// microsecond-scale period that has fallen behind makes the main loop run
+/// the timer callback forever under the BQL — every vCPU and every device
+/// stops (seen on x86_64/TCG: guest wedged right after the login prompt).
+/// `check_alive` restores periodic mode if a one-shot interrupt is ever lost.
+static LAPIC_STATE: [AtomicU32; TIMER_MAX_CPUS] =
+    [const { AtomicU32::new(ST_PERIODIC) }; TIMER_MAX_CPUS];
+const ST_PERIODIC: u32 = 0;
+const ST_DEADLINE: u32 = 1;
+const ST_REALIGN: u32 = 2;
+/// Per CPU: TSC at its most recent timer interrupt of any kind (`check_alive`).
+static LAST_IRQ_TSC: [AtomicU64; TIMER_MAX_CPUS] =
+    [const { AtomicU64::new(0) }; TIMER_MAX_CPUS];
+
+const LVT_ONESHOT: u32 = 32;               // one-shot, vector 32
+const LVT_PERIODIC: u32 = (1 << 17) | 32;  // periodic, vector 32
+
+/// Program a one-shot countdown of `count` (IRQs masked by the caller).
+unsafe fn program_oneshot(count: u32) {
+    apic::write(apic::LAPIC_LVT_TIMER, LVT_ONESHOT);
+    apic::write(apic::LAPIC_TIMER_INIT, count.max(1));
+}
+
+/// Back to the plain 100 Hz periodic tick (IRQs masked by the caller).
+///
+/// ORDER MATTERS: load the full initial count while still in one-shot mode,
+/// THEN flip the mode bit. The other order leaves the timer periodic with the
+/// tiny leftover one-shot count for one MMIO gap, and QEMU's main loop can
+/// take the BQL in that gap and spin re-arming a ~30 ns period forever (the
+/// same wedge the one-shot mode exists to avoid). Flipping the mode does not
+/// restart the countdown, so the tick phase is unchanged.
+unsafe fn program_periodic() {
+    apic::write(apic::LAPIC_TIMER_INIT, TICKS_PER_IRQ.load(Ordering::Relaxed).max(1000));
+    apic::write(apic::LAPIC_LVT_TIMER, LVT_PERIODIC);
+}
+
+/// Per AP: TSC at its most recent tick (APs keep no global time; this only
+/// decides whether an interrupt was a tick or a pure deadline interrupt).
+static LAST_TICK_TSC: [AtomicU64; TIMER_MAX_CPUS] =
+    [const { AtomicU64::new(0) }; TIMER_MAX_CPUS];
+
+/// Absolute `monotonic_ns()` instant → TSC value, rounded up.
+fn ns_to_tsc(ns: u64) -> u64 {
+    let per = TSC_PER_TICK.load(Ordering::Relaxed);
+    let e = EPOCH_TSC.load(Ordering::Relaxed);
+    let d = ((ns as u128) * per as u128 + 9_999_999) / 10_000_000u128;
+    e.wrapping_add(d.min(u64::MAX as u128 / 2) as u64)
+}
+
+/// TSC cycles from now until `target` → LAPIC initial count (divide-by-16
+/// units), biased 1/256 late so the APIC and TSC calibrations disagreeing by
+/// a hair cannot make the interrupt land before the instant it is for (an
+/// early one is harmless — the handler re-arms — but costs an interrupt).
+fn tsc_delta_to_count(delta: u64) -> u32 {
+    let per = TSC_PER_TICK.load(Ordering::Relaxed).max(1);
+    let tpi = TICKS_PER_IRQ.load(Ordering::Relaxed) as u128;
+    let c = (delta as u128) * tpi / per as u128;
+    (c + c / 256 + 1).min(u32::MAX as u128) as u32
+}
+
+/// Arm this CPU's one-shot timer for the absolute `monotonic_ns()` instant
+/// `deadline_ns` when it is sooner than what is armed already (see
+/// `sched::register_poll_deadline`). Safe from task or IRQ context.
+pub fn arm_deadline(deadline_ns: u64) {
+    if TSC_PER_TICK.load(Ordering::Relaxed) == 0 || TICKS_PER_IRQ.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nomem)); }
+    let cpu = unsafe { super::smp::arch_cpu_id() }.min(TIMER_MAX_CPUS - 1);
+    let t = ns_to_tsc(deadline_ns);
+    if t < ONESHOT_TSC[cpu].load(Ordering::Relaxed) {
+        ONESHOT_TSC[cpu].store(t, Ordering::Relaxed);
+        let want = tsc_delta_to_count(t.saturating_sub(rdtsc()));
+        // CURR reads 0 when a one-shot already expired with its interrupt
+        // still pending (IRQs are masked here): that handler will see the new
+        // ONESHOT_TSC and program it, so leave the hardware alone.
+        let cur = unsafe { apic::read(apic::LAPIC_TIMER_CURR) };
+        if want < cur {
+            unsafe { program_oneshot(want); }
+            LAPIC_STATE[cpu].store(ST_DEADLINE, Ordering::Relaxed);
+        }
+    }
+    if flags & (1 << 9) != 0 { unsafe { core::arch::asm!("sti", options(nomem, nostack)); } }
+}
+
+/// Service a due one-shot deadline and reprogram the countdown for whichever
+/// comes first, the deadline or the next tick at `next_tick` (TSC). Returns the
+/// LAPIC state the interrupt was taken in.
+fn deadline_irq(cpu: usize, next_tick: u64) -> u32 {
+    let st = LAPIC_STATE[cpu].load(Ordering::Relaxed);
+    let now = rdtsc();
+    LAST_IRQ_TSC[cpu].store(now, Ordering::Relaxed);
+    let os = ONESHOT_TSC[cpu].load(Ordering::Relaxed);
+    if os != u64::MAX && now >= os {
+        ONESHOT_TSC[cpu].store(u64::MAX, Ordering::Relaxed);
+        let next = sched::timer_deadline_irq();
+        if next != u64::MAX {
+            ONESHOT_TSC[cpu].store(ns_to_tsc(next), Ordering::Relaxed);
+        }
+    }
+    let os = ONESHOT_TSC[cpu].load(Ordering::Relaxed);
+    let now = rdtsc();
+    unsafe {
+        if os < next_tick {
+            program_oneshot(tsc_delta_to_count(os.saturating_sub(now)));
+            LAPIC_STATE[cpu].store(ST_DEADLINE, Ordering::Relaxed);
+        } else if st == ST_DEADLINE {
+            program_oneshot(tsc_delta_to_count(next_tick.saturating_sub(now)));
+            LAPIC_STATE[cpu].store(ST_REALIGN, Ordering::Relaxed);
+        } else if st == ST_REALIGN {
+            program_periodic();
+            LAPIC_STATE[cpu].store(ST_PERIODIC, Ordering::Relaxed);
+        }
+    }
+    st
+}
+
+/// Self-check for a lost one-shot interrupt (the periodic tick cannot die on
+/// its own, a one-shot can): if this CPU is in a one-shot state and has taken
+/// no timer interrupt for 4 ticks, restore periodic mode. Called by the
+/// scheduler wherever it opens an IRQ window. Returns true when it re-armed.
+pub fn check_alive() -> bool {
+    let per = TSC_PER_TICK.load(Ordering::Relaxed);
+    if per == 0 { return false; }
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nomem)); }
+    let cpu = unsafe { super::smp::arch_cpu_id() }.min(TIMER_MAX_CPUS - 1);
+    let last = LAST_IRQ_TSC[cpu].load(Ordering::Relaxed);
+    let mut rearmed = false;
+    if LAPIC_STATE[cpu].load(Ordering::Relaxed) != ST_PERIODIC && last != 0
+        && rdtsc().wrapping_sub(last) > 4 * per
+    {
+        unsafe { program_periodic(); }
+        LAPIC_STATE[cpu].store(ST_PERIODIC, Ordering::Relaxed);
+        LAST_IRQ_TSC[cpu].store(rdtsc(), Ordering::Relaxed);
+        rearmed = true;
+    }
+    if flags & (1 << 9) != 0 { unsafe { core::arch::asm!("sti", options(nomem, nostack)); } }
+    rearmed
+}
+
 /// Called from the timer IRQ handler (vector 32) on every APIC timer tick.
 ///
 /// Every CPU ticks its own LAPIC timer; global timekeeping and UART polling
@@ -426,14 +581,21 @@ pub unsafe fn init_local_timer() {
 #[inline]
 pub fn on_tick() {
     let cpu = unsafe { super::smp::arch_cpu_id() };
+    let c = cpu.min(TIMER_MAX_CPUS - 1);
     let mut elapsed = 1u64;
+    let per = TSC_PER_TICK.load(Ordering::Relaxed);
     if cpu == 0 {
-        let per = TSC_PER_TICK.load(Ordering::Relaxed);
         let grid = GRID_TSC.load(Ordering::Relaxed);
         if per != 0 && grid != 0 {
             elapsed = rdtsc().wrapping_sub(grid) / per;
             GRID_TSC.store(grid.wrapping_add(elapsed.wrapping_mul(per)), Ordering::Relaxed);
             if elapsed > 1 { CATCH_UP_TICKS.fetch_add(elapsed - 1, Ordering::Relaxed); }
+        }
+        if per != 0 {
+            let next_tick = GRID_TSC.load(Ordering::Relaxed).wrapping_add(per);
+            let st = deadline_irq(c, next_tick);
+            // A pure deadline interrupt (no grid point passed) is not a tick.
+            if st == ST_DEADLINE && elapsed == 0 { return; }
         }
         TICK_COUNT.fetch_add(elapsed, Ordering::Relaxed);
 
@@ -457,6 +619,15 @@ pub fn on_tick() {
         // here and not at the end of `poll_events`. No-op unless the burst mode
         // is compiled in (see `evdev_server::WAKE_MODE`).
         evdev_server::flush_pending_wake();
+    } else if per != 0 {
+        let now = rdtsc();
+        let last = LAST_TICK_TSC[c].load(Ordering::Relaxed);
+        let is_tick = LAPIC_STATE[c].load(Ordering::Relaxed) != ST_DEADLINE
+            || last == 0 || now.wrapping_sub(last) >= per;
+        if is_tick { LAST_TICK_TSC[c].store(now, Ordering::Relaxed); }
+        let base = if is_tick { now } else { last };
+        deadline_irq(c, base.wrapping_add(per));
+        if !is_tick { return; }
     }
 
     sched::timer_tick_irq(elapsed);

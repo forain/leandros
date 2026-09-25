@@ -343,6 +343,9 @@ extern "C" {
     fn arch_set_kernel_stack(rsp: u64);
     fn arch_cpu_id() -> usize;
     fn arch_timer_check_alive() -> bool;
+    /// Arm this CPU's one-shot timer for the absolute `monotonic_ns()` instant
+    /// `deadline_ns` if it is sooner than whatever is armed already.
+    fn arch_timer_arm_deadline(deadline_ns: u64);
     /// Monotonic nanoseconds since boot (sub-tick), for CPU-time accounting.
     fn arch_monotonic_ns() -> u64;
     pub fn arch_alloc_page_table_root() -> usize;
@@ -1636,7 +1639,7 @@ pub fn block_on_poll_prepare_masked(deadline: u64, mask: u64) {
     let pid = current_pid();
     RUN_QUEUE.lock().block_on_port_until(pid, POLL_WAIT_CHANNEL, deadline, mask);
     if deadline != u64::MAX {
-        NEXT_POLL_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
+        register_poll_deadline(deadline);
     }
 }
 /// Undo a prepared poll-block (the re-probe found readiness or a signal).
@@ -1793,6 +1796,38 @@ pub static NEXT_POLL_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 /// AND folds it into this hint.
 pub fn register_poll_deadline(deadline: u64) {
     NEXT_POLL_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
+    // Arm this CPU's one-shot timer so the deadline is serviced when it falls
+    // due, not at the next 100 Hz tick edge after it (up to 10 ms late: with
+    // never-early absolute deadlines, a back-to-back `poll(10 ms)` loop re-arms
+    // just past a tick edge and used to overshoot by a whole tick every time).
+    // Cheap and idempotent: the arch keeps the earliest armed instant per CPU
+    // and only reprograms the compare value when this one is sooner.
+    if deadline != u64::MAX {
+        unsafe { arch_timer_arm_deadline(deadline); }
+    }
+}
+
+/// The deadline service run from a CPU's one-shot timer interrupt (see
+/// `timer_deadline_irq`); 0 until the kernel registers it.
+static DEADLINE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register the poll-deadline service for one-shot timer interrupts. `f(now)`
+/// wakes every due timed waiter (same try-lock-only IRQ contract as a tick
+/// hook) and returns the next pending deadline (`u64::MAX` = none).
+pub fn register_deadline_hook(f: fn(u64) -> u64) {
+    DEADLINE_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Called by the arch timer IRQ on ANY CPU whose one-shot deadline (armed by
+/// `register_poll_deadline`) has come due. Services the due deadlines and
+/// returns the next pending one so the arch can re-arm for it; `u64::MAX` when
+/// nothing is pending or no hook is registered (the 100 Hz tick remains the
+/// fallback either way).
+pub fn timer_deadline_irq() -> u64 {
+    let hook = DEADLINE_HOOK.load(Ordering::Acquire);
+    if hook == 0 { return u64::MAX; }
+    let f: fn(u64) -> u64 = unsafe { core::mem::transmute(hook) };
+    f(monotonic_ns())
 }
 
 // ── Task census (zink-lane instrumentation, IRQ-safe, try_lock only) ────────

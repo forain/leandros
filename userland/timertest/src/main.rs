@@ -225,6 +225,7 @@ pub unsafe extern "C" fn timer_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_realtime_is_not_uptime() { failures += 1; }
     if !test_timerfd_realtime_vs_monotonic() { failures += 1; }
     if !test_clock_nanosleep_realtime_abstime() { failures += 1; }
+    if !test_itimer_subtick_arms_never_early() { failures += 1; }
 
     puts(b"--- timertest done ---\n\0".as_ptr());
     failures
@@ -1157,4 +1158,59 @@ unsafe fn report(name: &[u8], passed: bool) -> bool {
         write(1, b": FAIL\n".as_ptr(), 7);
     }
     passed
+}
+
+// ── itimer/POSIX timer values below one tick ────────────────────────────────
+//
+// setitimer/timer_settime used to convert to 100 Hz ticks, flooring: a 5 ms
+// it_value became 0 ticks, which is "disarm" — the timer silently never
+// fired — and any sub-tick remainder made the expiry up to 10 ms early. Now
+// in ns: a 5 ms ITIMER_REAL must read back armed (0 < remaining <= 5 ms) and
+// SIGALRM must not arrive before 5 ms have elapsed; a 3 ms POSIX timer the
+// same. (Delivery is still noticed at syscall return, hence the 1 ms sleeps.)
+unsafe fn test_itimer_subtick_arms_never_early() -> bool {
+    let name = b"itimer_subtick_arms_never_early\0";
+    if !install_sigalrm_handler() { return report(name, false); }
+
+    SIGALRM_COUNT.store(0, Ordering::SeqCst);
+    let v = itimerval {
+        it_interval: timeval { tv_sec: 0, tv_usec: 0 },
+        it_value:    timeval { tv_sec: 0, tv_usec: 5_000 },
+    };
+    let t0 = now_ns();
+    let set_ok = setitimer(ITIMER_REAL, &v, core::ptr::null_mut()) == 0;
+    let mut cur = core::mem::zeroed::<itimerval>();
+    let got = getitimer(ITIMER_REAL, &mut cur) == 0;
+    let armed = got && cur.it_value.tv_sec == 0 && cur.it_value.tv_usec > 0
+        && cur.it_value.tv_usec <= 5_000;
+    let mut it_el = -1i64;
+    for _ in 0..200 {
+        if SIGALRM_COUNT.load(Ordering::SeqCst) > 0 { it_el = now_ns() - t0; break; }
+        sleep_ms(1);
+    }
+    let it_ok = set_ok && armed && it_el >= 5_000_000;
+
+    SIGALRM_COUNT.store(0, Ordering::SeqCst);
+    let mut evp = zeroed_sigevent(SIGALRM);
+    let mut tid: timer_t = core::ptr::null_mut();
+    let mut pt_el = -1i64;
+    if timer_create(CLOCK_MONOTONIC, &mut evp, &mut tid) == 0 {
+        let spec = itimerspec {
+            it_interval: timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value:    timespec { tv_sec: 0, tv_nsec: 3_000_000 },
+        };
+        let t1 = now_ns();
+        if timer_settime(tid, 0, &spec, core::ptr::null_mut()) == 0 {
+            for _ in 0..200 {
+                if SIGALRM_COUNT.load(Ordering::SeqCst) > 0 { pt_el = now_ns() - t1; break; }
+                sleep_ms(1);
+            }
+        }
+        timer_delete(tid);
+    }
+    let pt_ok = pt_el >= 3_000_000;
+
+    print_kv(b"  itimer_5ms_elapsed_us=\0", it_el.max(0) as u64 / 1000);
+    print_kv(b"  timer_settime_3ms_elapsed_us=\0", pt_el.max(0) as u64 / 1000);
+    report(name, it_ok && pt_ok)
 }
