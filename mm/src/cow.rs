@@ -207,6 +207,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
                     map_page(src_root, region.start + i * PAGE_SIZE, phys, install_flags);
                 }
             }
+            crate::vmm::free_eager_tail(region.phys, n_pages);
             region.lazy = true;
             region.phys = 0;
             region.lazy_pages = dst_lazy_pages.clone();

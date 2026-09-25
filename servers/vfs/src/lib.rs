@@ -3348,6 +3348,62 @@ fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
 }
 
+/// `/proc/kmemstat`: where the kernel's pages are, for leak hunting.
+///
+/// Three tables, all read without locks: buddy pages live per allocation
+/// site (`mm::buddy` charges every block to its caller's file:line), slab
+/// pages and live objects per size class, and live heap objects per exact
+/// size. Too large for the 512-byte `gen_proc_system` buffer, so it is
+/// formatted straight into the tmpfs slot (32 KiB).
+fn gen_kmemstat() -> Option<VnodeKind> {
+    struct W<'a> { buf: &'a mut [u8], p: usize }
+    impl W<'_> {
+        fn s(&mut self, t: &str) {
+            for &b in t.as_bytes() { if self.p < self.buf.len() { self.buf[self.p] = b; self.p += 1; } }
+        }
+        fn i(&mut self, v: isize) {
+            if v < 0 { self.s("-"); }
+            let mut v = v.unsigned_abs();
+            let mut d = [0u8; 20]; let mut n = d.len();
+            loop { n -= 1; d[n] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+            for k in n..d.len() { if self.p < self.buf.len() { self.buf[self.p] = d[k]; self.p += 1; } }
+        }
+    }
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp.iter().position(|e| !e.in_use)?;
+    tmp[idx] = TmpFileEntry::empty();
+    tmp[idx].in_use = true;
+    tmp[idx].ephemeral = true;
+    let fake = b"/tmp/.kmemstat";
+    tmp[idx].path[..fake.len()].copy_from_slice(fake);
+    tmp[idx].path_len = fake.len();
+    let len = {
+        let mut w = W { buf: &mut tmp[idx].data[..], p: 0 };
+        w.s("total_pages "); w.i(mm::buddy::total_pages() as isize);
+        w.s("\nfree_pages "); w.i(mm::buddy::free_pages() as isize);
+        w.s("\nrefused_frees "); w.i(mm::buddy::bad_frees() as isize);
+        w.s("\nfields site file:line live_pages peak_pages\n");
+        let mut sum = 0isize;
+        mm::buddy::site_census(&mut |f, l, live, peak| {
+            sum += live;
+            w.s("site "); w.s(f); w.s(":"); w.i(l as isize);
+            w.s(" "); w.i(live); w.s(" "); w.i(peak); w.s("\n");
+        });
+        w.s("site_sum "); w.i(sum);
+        w.s("\nfields slab class_bytes pages live_objs\n");
+        mm::slab::class_census(&mut |c, pages, live| {
+            w.s("slab "); w.i(c as isize); w.s(" "); w.i(pages as isize); w.s(" "); w.i(live); w.s("\n");
+        });
+        w.s("fields heap size_bytes live_objs (small: 8-byte bucket upper bound; large: pages*4096)\n");
+        mm::slab::size_census(&mut |sz, n| {
+            w.s("heap "); w.i(sz as isize); w.s(" "); w.i(n); w.s("\n");
+        });
+        w.p
+    };
+    tmp[idx].len = len;
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
+}
+
 /// Generate a `/sys/class/block/...` attribute file.
 ///
 /// Same shape as `gen_proc_system`: the bytes are parked in an ephemeral
@@ -3849,6 +3905,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // /proc/<pid>/stat and /proc/<pid>/status of another live process.
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
             match gen_proc_self(tpid, lookup_path) {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/kmemstat" {
+            match gen_kmemstat() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
