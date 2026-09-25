@@ -108,9 +108,15 @@ pub(crate) fn register_builtin_handlers() {
     gic::register_handler(gic::SPI_PL011,      uart_irq);
 }
 
-fn handle_irq(_frame: *mut UserFrame) {
+fn handle_irq(frame: *mut UserFrame) {
     let iar = super::gic::ack();
     let irq_id = super::gic::irq_id(iar);
+    if sched::pcsample::ENABLED
+        && (irq_id == super::gic::PPI_VIRT_TIMER || irq_id == super::gic::PPI_PHYS_TIMER)
+    {
+        let f = unsafe { &*frame };
+        sched::pcsample::sample(f.elr_el1, f.spsr_el1 & 0xf == 0);
+    }
 
     if irq_id != super::gic::SPURIOUS && !super::gic::dispatch(irq_id) {
         serial_print_str("\n[EXC] Unhandled IRQ ");

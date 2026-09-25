@@ -1480,24 +1480,203 @@ def main():
         if os.path.exists(sp):
             usr_lib_files.append((so, sp, 0o100755))
 
-    # Cosmic icon theme -> /usr/share/icons/Cosmic/… (pruned set) and the default
-    # wallpaper -> the exact hardcoded fallback path cosmic-bg expects
-    # (/usr/share/backgrounds/cosmic/orion_nebula_nasa_heic0601a.jpg). Both are
-    # soft-fail data (blank icons / black background if absent, never a crash);
-    # they ride the shared /usr/share tree walk (m4_share_files/m4_share_dirs).
-    m6_icons_src = os.path.expanduser("~/code/leandros-artifacts/m6-icons-pruned/share")
-    if os.path.isdir(m6_icons_src):
-        for dirpath, _dn, filenames in os.walk(m6_icons_src):
-            rel = os.path.relpath(dirpath, m6_icons_src)   # e.g. "icons/Cosmic/scalable"
+    # Cosmic + hicolor icon themes -> /usr/share/icons/{Cosmic,hicolor}/… and the
+    # default wallpaper -> the exact hardcoded fallback path cosmic-bg expects
+    # (/usr/share/backgrounds/cosmic/orion_nebula_nasa_heic0601a.jpg). Icons are
+    # soft-fail data at RUNTIME (a blank button, never a crash), which is exactly
+    # what made the gap expensive at BUILD time: it was invisible until someone
+    # photographed the greeter.
+    #
+    # Until 2026-09-25 this pulled a 94-file HAND-PRUNED subset from a host-only
+    # artifacts tree (~/code/leandros-artifacts/m6-icons-pruned), staged only on
+    # machines where someone had manually assembled that tree -- which is why one
+    # box had ten applet icons and another had none of them (lane sessmisc,
+    # 2026-09-24), and why cosmic-greeter's OWN buttons -- never part of that
+    # hand-picked set -- rendered as empty circles no matter which machine built
+    # the image. The greeter's [SCPATH] stat trace found ~750 failed icon-path
+    # lookups per repaint (lane greeterlag, 2026-09-24): with the f2fs block cache
+    # at its old 4 slots each one cost ~3 ms; fixed to 192 slots that dropped to
+    # ~1% of the UI thread, but the lookups still failed, because most of the
+    # requested names had no file to find at ANY cache size. Cross-referencing
+    # cosmic-greeter's source (src/{greeter,locker,common}.rs) against what was
+    # staged: object-select-symbolic, input-keyboard-symbolic,
+    # system-{suspend,reboot,shutdown}-symbolic, system-users-symbolic,
+    # application-menu-symbolic, applications-accessibility-symbolic, six
+    # network-*-symbolic names and the cosmic-applet-battery-level-* family were
+    # ALL absent from the pruned set (a live screendump showed exactly 5 of the
+    # greeter's 7 button icons blank, matching this list one for one).
+    #
+    # Fix: stage the actual upstream theme SOURCE, not a hand-picked subset, split
+    # across Cosmic and hicolor exactly as each project's own justfile/Makefile
+    # installs it (checked against cosmic-icons/justfile, cosmic-applets/justfile
+    # `_install_icons` -> $prefix/share/icons/hicolor, cosmic-launcher and
+    # cosmic-applibrary's nested data/icons/justfile -> hicolor/scalable/apps,
+    # cosmic-workspaces-epoch's Makefile -> hicolor/scalable/apps, cosmic-term's
+    # justfile -> hicolor/<size>/apps). Getting this split right matters: a panel
+    # button WEARS ITS TARGET'S ICON (cosmic-panel-button/src/lib.rs:215-244), so
+    # com.system76.Cosmic{Launcher,AppLibrary,Workspaces} silently painting zero
+    # pixels looks exactly like "the applet never started" (see the comment on
+    # m6_session_bins above) -- the old pruned set covered these ten by accident
+    # of where someone put them, and staging only cosmic-icons here would have
+    # REGRESSED all ten (caught by the Icon= cross-check below before this
+    # landed: 1 pre-existing miss became 10 on the first build with only Cosmic
+    # staged). Sourced from the SAME cosmic-epoch checkout as the
+    # /usr/share/cosmic config tree below (same _find_cosmic_epoch() lookup
+    # order: $LEANDROS_COSMIC_EPOCH; a sibling of this checkout; a sibling of the
+    # main checkout; ~/code/cosmic-epoch) so every machine resolves the identical
+    # source instead of depending on who happened to hand-copy an artifacts tree
+    # where. Fails loudly (SystemExit) if cosmic-icons is missing there -- a
+    # silent skip is exactly the bug this replaces, and blank buttons must not go
+    # undiagnosed a second time.
+    cosmic_epoch_icons = _find_cosmic_epoch()
+    _icon_seen = {}      # (theme, image_dir, fn) -> source root; first wins
+    _icon_file_count = 0
+    _icon_byte_count = 0
+
+    def _stage_icon_tree(src, theme, prefix=""):
+        """Walk `src`, staging every file under /usr/share/icons/<theme>/<prefix>/<relpath>."""
+        nonlocal _icon_file_count, _icon_byte_count
+        if not os.path.isdir(src):
+            return 0
+        n = 0
+        for dirpath, _dn, filenames in os.walk(src):
+            rel = os.path.relpath(dirpath, src)
             sub = "" if rel == "." else "/" + rel
-            image_dir = "/usr/share" + sub
-            parts = ("usr/share" + sub).split("/")
+            image_dir = f"/usr/share/icons/{theme}/{prefix}{sub}" if prefix else f"/usr/share/icons/{theme}{sub}"
+            parts = image_dir.lstrip("/").split("/")
             for i in range(2, len(parts) + 1):
                 m4_share_dirs.add("/" + "/".join(parts[:i]))
             for fn in sorted(filenames):
                 hp = os.path.join(dirpath, fn)
-                if os.path.isfile(hp):
-                    m4_share_files.append((image_dir, fn, hp))
+                if not os.path.isfile(hp):
+                    continue
+                key = (theme, image_dir, fn)
+                if key in _icon_seen:
+                    continue
+                _icon_seen[key] = src
+                m4_share_files.append((image_dir, fn, hp))
+                _icon_file_count += 1
+                _icon_byte_count += os.path.getsize(hp)
+                n += 1
+        return n
+
+    def _stage_icon_file(hp, theme, image_dir):
+        nonlocal _icon_file_count, _icon_byte_count
+        if not os.path.isfile(hp):
+            return 0
+        fn = os.path.basename(hp)
+        key = (theme, image_dir, fn)
+        if key in _icon_seen:
+            return 0
+        parts = image_dir.lstrip("/").split("/")
+        for i in range(2, len(parts) + 1):
+            m4_share_dirs.add("/" + "/".join(parts[:i]))
+        _icon_seen[key] = hp
+        m4_share_files.append((image_dir, fn, hp))
+        _icon_file_count += 1
+        _icon_byte_count += os.path.getsize(hp)
+        return 1
+
+    # Cosmic theme: cosmic-icons' own freedesktop/ and extra/ scalable trees,
+    # both merged into Cosmic/scalable/… (extra winning the handful of
+    # same-named files, matching cosmic-icons/justfile's install order).
+    _cosmic_freedesktop = os.path.join(cosmic_epoch_icons, "cosmic-icons", "freedesktop", "scalable")
+    if not os.path.isdir(_cosmic_freedesktop):
+        sys.exit(
+            f"mkfs: {os.path.join(cosmic_epoch_icons, 'cosmic-icons')} is missing "
+            f"(no freedesktop/scalable) -- the Cosmic icon theme cannot be staged "
+            f"and the greeter/panel/applet buttons that depend on it would render "
+            f"blank (this is the 2026-09-25 icons-lane bug, do not silently skip "
+            f"it again). Set LEANDROS_COSMIC_EPOCH, or check out cosmic-icons "
+            f"beside cosmic-epoch at {cosmic_epoch_icons} (a data-only subset is "
+            f"enough -- see README.subset next to it).")
+    _n = _stage_icon_tree(_cosmic_freedesktop, "Cosmic", "scalable")
+    _n += _stage_icon_tree(os.path.join(cosmic_epoch_icons, "cosmic-icons", "extra", "scalable"),
+                           "Cosmic", "scalable")
+    print(f"  Cosmic icon theme (cosmic-icons): {_n} file(s) from {cosmic_epoch_icons}")
+
+    # Cosmic's own index.theme (Inherits=Pop,hicolor -- Pop is not staged; a
+    # missing inherited theme is a spec-legal no-op for freedesktop-icons
+    # resolution, not an error). Fail loudly rather than silently shipping a
+    # theme with no index (every lookup would miss regardless of what's on disk).
+    _cosmic_index = os.path.join(cosmic_epoch_icons, "cosmic-icons", "index.theme")
+    if not os.path.isfile(_cosmic_index):
+        sys.exit(f"mkfs: {_cosmic_index} is missing -- cannot stage Cosmic/index.theme")
+    m4_share_dirs.add("/usr/share/icons/Cosmic")
+    m4_share_files.append(("/usr/share/icons/Cosmic", "index.theme", _cosmic_index))
+
+    # hicolor: every per-component app/applet icon upstream installs there
+    # directly (NOT into Cosmic -- see the comment above). Each is optional here
+    # (a missing one only re-blanks that one button, caught by the Icon=
+    # cross-check below) except the three panel-button LAUNCH TARGETS, which are
+    # load-bearing for the dock/panel and therefore fail loudly like Cosmic does.
+    _hicolor_n0 = _icon_file_count
+    _capp = os.path.join(cosmic_epoch_icons, "cosmic-applets")
+    for _name in ("cosmic-app-list", "cosmic-applet-a11y", "cosmic-applet-audio",
+                  "cosmic-applet-input-sources", "cosmic-applet-battery",
+                  "cosmic-applet-bluetooth", "cosmic-applet-minimize",
+                  "cosmic-applet-network", "cosmic-applet-notifications",
+                  "cosmic-applet-power", "cosmic-applet-status-area",
+                  "cosmic-applet-tiling", "cosmic-applet-time",
+                  "cosmic-applet-workspaces", "cosmic-panel-app-button",
+                  "cosmic-panel-launcher-button", "cosmic-panel-workspaces-button"):
+        _stage_icon_tree(os.path.join(_capp, _name, "data", "icons"), "hicolor")
+    # The three panel-button launch targets: a single flat {APPID}.svg installed
+    # by a nested data/icons/justfile (launcher, app library) or a Makefile
+    # (workspaces) straight to hicolor/scalable/apps -- load-bearing, so missing
+    # ANY of the three fails loudly (a blank dock button is otherwise silent and
+    # shaped exactly like success, per the comment above).
+    _launch_targets = (
+        (os.path.join(cosmic_epoch_icons, "cosmic-launcher", "data", "icons",
+                      "com.system76.CosmicLauncher.svg"), "com.system76.CosmicLauncher"),
+        (os.path.join(cosmic_epoch_icons, "cosmic-applibrary", "data", "icons",
+                      "com.system76.CosmicAppLibrary.svg"), "com.system76.CosmicAppLibrary"),
+        (os.path.join(cosmic_epoch_icons, "cosmic-workspaces-epoch", "data",
+                      "com.system76.CosmicWorkspaces.svg"), "com.system76.CosmicWorkspaces"),
+    )
+    for _hp, _appid in _launch_targets:
+        if not os.path.isfile(_hp):
+            sys.exit(
+                f"mkfs: {_hp} is missing -- {_appid} is a panel-button LAUNCH "
+                f"TARGET (cosmic-panel-button wears the target's icon, not its "
+                f"own); without it the dock/panel button paints zero pixels and "
+                f"looks exactly like the applet never started.")
+        _stage_icon_file(_hp, "hicolor", "/usr/share/icons/hicolor/scalable/apps")
+    # cosmic-term ships pre-rendered SVGs under its own hicolor/<size>/apps/
+    # tree (not scalable) -- stage it as-is, same relative layout.
+    _stage_icon_tree(os.path.join(cosmic_epoch_icons, "cosmic-term", "res", "icons", "hicolor"),
+                     "hicolor")
+    print(f"  hicolor icon theme (per-component app/applet icons): "
+          f"{_icon_file_count - _hicolor_n0} file(s)")
+
+    # hicolor's own index.theme: minimal but REAL (not index-only) -- cosmic-term
+    # stages real files into fixed 16..256 apps/ dirs and the applets above into
+    # scalable/{apps,status}, and freedesktop-icons needs the matching
+    # Directories/Type/Size sections to find them, not just the directories on
+    # disk. Pop is also inherited by Cosmic but not staged; that is a spec-legal
+    # no-op, not something hicolor needs to cover.
+    m4_share_dirs.add("/usr/share/icons/hicolor")
+    _hicolor_index = (
+        b"[Icon Theme]\n"
+        b"Name=Hicolor\n"
+        b"Comment=Fallback icon theme\n"
+        b"Hidden=true\n"
+        b"Directories=16x16/apps,24x24/apps,32x32/apps,48x48/apps,64x64/apps,"
+        b"128x128/apps,256x256/apps,scalable/apps,scalable/status\n"
+        b"\n"
+        b"[16x16/apps]\nSize=16\nContext=Applications\nType=Fixed\n\n"
+        b"[24x24/apps]\nSize=24\nContext=Applications\nType=Fixed\n\n"
+        b"[32x32/apps]\nSize=32\nContext=Applications\nType=Fixed\n\n"
+        b"[48x48/apps]\nSize=48\nContext=Applications\nType=Fixed\n\n"
+        b"[64x64/apps]\nSize=64\nContext=Applications\nType=Fixed\n\n"
+        b"[128x128/apps]\nSize=128\nContext=Applications\nType=Fixed\n\n"
+        b"[256x256/apps]\nSize=256\nContext=Applications\nType=Fixed\n\n"
+        b"[scalable/apps]\nSize=48\nMinSize=8\nMaxSize=512\nContext=Applications\nType=Scalable\n\n"
+        b"[scalable/status]\nSize=48\nMinSize=8\nMaxSize=512\nContext=Status\nType=Scalable\n"
+    )
+    m4_share_files.append(("/usr/share/icons/hicolor", "index.theme", _hicolor_index))
+    print(f"  icon themes total: {_icon_file_count} file(s), "
+          f"{_icon_byte_count / 1024 / 1024:.2f} MiB, from {cosmic_epoch_icons}")
     # `shared` is the one session-data entry that is a TREE, and that makes
     # session_data()'s whole-entry precedence the wrong rule for it. Resolving it
     # like a file means an artifacts tree that merely EXISTS shadows the repo copy
@@ -1708,14 +1887,14 @@ def main():
 
     # Cross-check staged .desktop Icon= names against staged icon files.
     #
-    # The icon tree (m6-icons-pruned) is host-only — pruned upstream assets, too
-    # large to commit — so unlike the .desktop files above it has no repo copy to
-    # fall back to, and os.path.isdir() skipping it is silent by construction.
-    # Icons are soft-fail at runtime (a blank button, never a crash), which is
-    # exactly what makes the gap expensive: the panel comes up looking *almost*
-    # right and the missing glyph reads as a rendering bug. This machine had all
-    # ten applet icons and the x86_64 box had none of them, which is precisely the
-    # divergence that is invisible until someone photographs both.
+    # The icon tree now comes from cosmic-epoch (see above; SystemExit already
+    # fires there if it is missing), but this check stays: it catches a name an
+    # upstream .desktop asks for that genuinely has no file anywhere in
+    # cosmic-icons/cosmic-applet-battery, not just a staging gap. Icons are
+    # soft-fail at runtime (a blank button, never a crash), which is exactly what
+    # makes the gap expensive: the panel comes up looking *almost* right and the
+    # missing glyph reads as a rendering bug, invisible until someone photographs
+    # it (this is exactly how the greeter's blank buttons went unnoticed).
     #
     # A name is satisfied if any staged icon's stem matches it — freedesktop
     # resolves Icon= by stem, and one name legitimately has several files

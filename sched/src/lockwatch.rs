@@ -71,6 +71,9 @@ static SITE_LOC:      [AtomicUsize; PROFILE_SITES] = [const { AtomicUsize::new(0
 static SITE_HOLDS:    [AtomicU32; PROFILE_SITES]   = [const { AtomicU32::new(0) }; PROFILE_SITES];
 static SITE_NS:       [AtomicU64; PROFILE_SITES]   = [const { AtomicU64::new(0) }; PROFILE_SITES];
 static SITE_MAX_NS:   [AtomicU32; PROFILE_SITES]   = [const { AtomicU32::new(0) }; PROFILE_SITES];
+/// Contended acquires (fast try_lock failed) and total ns spent spinning.
+static SITE_CWAITS:   [AtomicU32; PROFILE_SITES]   = [const { AtomicU32::new(0) }; PROFILE_SITES];
+static SITE_CWAIT_NS: [AtomicU64; PROFILE_SITES]   = [const { AtomicU64::new(0) }; PROFILE_SITES];
 static SITE_HIST:     [[AtomicU32; NBUCKETS]; PROFILE_SITES] =
     [const { [const { AtomicU32::new(0) }; NBUCKETS] }; PROFILE_SITES];
 /// Tick try_lock failures charged to this site, and the age of the hold then.
@@ -100,6 +103,57 @@ static WAKE_FAIL: AtomicU32 = AtomicU32::new(0);
 static SPIN_HITS:    [AtomicU32; N_LOCKS] = [const { AtomicU32::new(0) }; N_LOCKS];
 static SPIN_MAX_NS:  [AtomicU32; N_LOCKS] = [const { AtomicU32::new(0) }; N_LOCKS];
 static SPIN_GAVE_UP: [AtomicU32; N_LOCKS] = [const { AtomicU32::new(0) }; N_LOCKS];
+/// Ready tasks `RunQueue::pick_next`'s once-per-tick full scan found with
+/// their `maybe_ready` bit clear — must stay 0 (a non-zero count is a `&mut
+/// Task` path that bypasses the hint; each costs that task ≤ 1 tick).
+static READY_HINT_MISS: AtomicU32 = AtomicU32::new(0);
+static PICK_N: AtomicU32 = AtomicU32::new(0);
+static PICK_FULL: AtomicU32 = AtomicU32::new(0);
+static PICK_VISITED: AtomicU64 = AtomicU64::new(0);
+static PICK_NS: AtomicU64 = AtomicU64::new(0);
+/// `pick_next` census (HOLD_PROFILE only): picks, full scans, tasks visited, ns.
+#[inline]
+pub fn note_pick(full: bool, visited: u32, ns: u64) {
+    if !HOLD_PROFILE { return; }
+    PICK_N.fetch_add(1, Ordering::Relaxed);
+    if full { PICK_FULL.fetch_add(1, Ordering::Relaxed); }
+    PICK_VISITED.fetch_add(visited as u64, Ordering::Relaxed);
+    PICK_NS.fetch_add(ns, Ordering::Relaxed);
+}
+#[inline]
+pub fn pick_clock() -> u64 { if HOLD_PROFILE { now_ns() } else { 0 } }
+/// Address-space acquisition census (HOLD_PROFILE only): every
+/// `lock_leader_address_space` success — how long getting it took (RUN_QUEUE
+/// wait + `busy` spin; `contended` = it had to spin on `busy`) and how long
+/// `busy` was then held.
+static AS_ACQ: AtomicU32 = AtomicU32::new(0);
+static AS_CONT: AtomicU32 = AtomicU32::new(0);
+static AS_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static AS_WAIT_MAX: AtomicU32 = AtomicU32::new(0);
+static AS_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+static AS_HOLD_MAX: AtomicU32 = AtomicU32::new(0);
+static AS_SINCE: [AtomicU64; super::MAX_CPUS] = [const { AtomicU64::new(0) }; super::MAX_CPUS];
+#[inline]
+pub fn as_clock() -> u64 { if HOLD_PROFILE { now_ns() } else { 0 } }
+#[inline]
+pub fn note_as_acquired(t0: u64, contended: bool) {
+    if !HOLD_PROFILE { return; }
+    let t = now_ns();
+    let w = t.saturating_sub(t0);
+    AS_ACQ.fetch_add(1, Ordering::Relaxed);
+    if contended { AS_CONT.fetch_add(1, Ordering::Relaxed); }
+    AS_WAIT_NS.fetch_add(w, Ordering::Relaxed);
+    AS_WAIT_MAX.fetch_max(w.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+    AS_SINCE[me()].store(t, Ordering::Relaxed);
+}
+#[inline]
+pub fn note_as_released() {
+    if !HOLD_PROFILE { return; }
+    let h = now_ns().saturating_sub(AS_SINCE[me()].load(Ordering::Relaxed));
+    AS_HOLD_NS.fetch_add(h, Ordering::Relaxed);
+    AS_HOLD_MAX.fetch_max(h.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+}
+pub fn note_ready_hint_miss() { READY_HINT_MISS.fetch_add(1, Ordering::Relaxed); }
 /// Hold-age histogram at tick failure (same buckets).
 static TFAIL_HIST: [AtomicU32; NBUCKETS] = [const { AtomicU32::new(0) }; NBUCKETS];
 
@@ -211,7 +265,18 @@ pub fn dump_profile() {
     s("ns gave_up="); n(SPIN_GAVE_UP[L_RUN_QUEUE as usize].load(Ordering::Relaxed) as u64);
     s(" | wake try="); n(WAKE_TRY.load(Ordering::Relaxed) as u64);
     s(" failed="); n(WAKE_FAIL.load(Ordering::Relaxed) as u64);
-    s(" | age-at-fail:");
+    s(" | ready_hint_miss="); n(READY_HINT_MISS.load(Ordering::Relaxed) as u64);
+    s(" | picks="); n(PICK_N.load(Ordering::Relaxed) as u64);
+    s(" full="); n(PICK_FULL.load(Ordering::Relaxed) as u64);
+    s(" visited="); n(PICK_VISITED.load(Ordering::Relaxed));
+    s(" pick_ns="); n(PICK_NS.load(Ordering::Relaxed));
+    s(" | as acq="); n(AS_ACQ.load(Ordering::Relaxed) as u64);
+    s(" cont="); n(AS_CONT.load(Ordering::Relaxed) as u64);
+    s(" wait_us="); n(AS_WAIT_NS.load(Ordering::Relaxed) / 1000);
+    s(" wait_max="); n(AS_WAIT_MAX.load(Ordering::Relaxed) as u64);
+    s("ns hold_us="); n(AS_HOLD_NS.load(Ordering::Relaxed) / 1000);
+    s(" hold_max="); n(AS_HOLD_MAX.load(Ordering::Relaxed) as u64);
+    s("ns | age-at-fail:");
     for b in 0..NBUCKETS { s(" "); n(TFAIL_HIST[b].load(Ordering::Relaxed) as u64); }
     s("  (buckets <1u <4u <16u <64u <256u <1m >=1m)
 ");
@@ -230,6 +295,11 @@ pub fn dump_profile() {
             s(" avg="); n(SITE_NS[i].load(Ordering::Relaxed) / holds as u64);
             s("ns max="); n(SITE_MAX_NS[i].load(Ordering::Relaxed) as u64); s("ns hist:");
             for b in 0..NBUCKETS { s(" "); n(SITE_HIST[i][b].load(Ordering::Relaxed) as u64); }
+        }
+        let cw = SITE_CWAITS[i].load(Ordering::Relaxed);
+        if cw > 0 {
+            s(" | contended="); n(cw as u64);
+            s(" waited_us="); n(SITE_CWAIT_NS[i].load(Ordering::Relaxed) / 1000);
         }
         if tf > 0 {
             s(" | tickfail="); n(tf as u64);
@@ -310,10 +380,15 @@ impl<T> TrackedMutex<T> {
             return TrackedGuard { id: self.id, site1, since, guard };
         }
         WANT[cpu].store(self.id, Ordering::Relaxed);
+        let w0 = if HOLD_PROFILE { now_ns() } else { 0 };
         let guard = self.inner.lock();
         WANT[cpu].store(0, Ordering::Relaxed);
         HOLDER[self.id as usize].store(cpu as u8 + 1, Ordering::Relaxed);
         let (site1, since) = on_acquire(self.id, loc);
+        if HOLD_PROFILE && site1 != 0 {
+            SITE_CWAITS[site1 as usize - 1].fetch_add(1, Ordering::Relaxed);
+            SITE_CWAIT_NS[site1 as usize - 1].fetch_add(since.saturating_sub(w0), Ordering::Relaxed);
+        }
         TrackedGuard { id: self.id, site1, since, guard }
     }
 

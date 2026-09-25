@@ -856,7 +856,7 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                 if n == 0 { break; }
 
                 let bytes = n * event_size;
-                let ok = sched::with_current_address_space(|as_| {
+                let ok = sched::with_current_address_space_mut(|as_| {
                     unsafe {
                         as_.write_user_buf(buf_ptr + total_copied,
                             core::slice::from_raw_parts(chunk.as_ptr() as *const u8, bytes))
