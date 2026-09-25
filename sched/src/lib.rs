@@ -980,6 +980,43 @@ fn notify_continued(tgid: Pid, ppid: Pid, uid: u32) {
 /// until some thread unblocks it — again exactly POSIX.
 pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isize {
     if signo == 0 || signo > 64 { return -22; }
+    let (ret, woke, resumed) = post_signal_process(&mut RUN_QUEUE.lock(), tgid, signo, info);
+    if woke { wake_up_an_idle_cpu(); }
+    if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
+    // Wake any signalfd poller in the target tgid (RUN_QUEUE released above).
+    wake_poll();
+    ret
+}
+
+/// `deliver_signal_process` for IRQ context (a POSIX-timer / itimer expiry
+/// serviced from the timer interrupt): bounded `try_lock_spin`, `None` when
+/// RUN_QUEUE stayed contended (nothing was posted — the caller retries). The
+/// poll-channel broadcast rides the same lock hold, which is what releases a
+/// thread parked in pause/sigsuspend/sigtimedwait/nanosleep/poll. SIGCONT is
+/// refused (`None`): its parent notification needs task context.
+///
+/// `Some(1)` = an instance was already pending somewhere in the group, so this
+/// one coalesced into it (a POSIX timer counts that as an overrun).
+pub fn try_deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> Option<isize> {
+    if signo == 0 || signo > 64 { return Some(-22); }
+    if signo == signal::SIGCONT { return None; }
+    let bit = 1u64 << (signo - 1);
+    let mut rq = RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS)?;
+    let already = (0..runqueue::MAX_TASKS).any(|i| rq.get(i).map_or(false, |t|
+        t.tgid == tgid && (t.signal_pending | t.shared_signal_pending) & bit != 0));
+    let (ret, woke, _) = post_signal_process(&mut rq, tgid, signo, info);
+    let ret = if ret == 0 && already { 1 } else { ret };
+    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, POLL_TAG_ALL);
+    drop(rq);
+    if woke || woken > 0 { wake_up_an_idle_cpu(); }
+    Some(ret)
+}
+
+/// The RUN_QUEUE-held half of `deliver_signal_process`: returns
+/// `(ret, woke, resumed)` for the caller to act on after unlocking.
+fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info: task::SigInfo)
+    -> (isize, bool, Option<(Pid, Pid, u32)>)
+{
     let bit = 1u64 << (signo - 1);
     let idx = (signo - 1) as usize;
     let mut woke = false;
@@ -992,10 +1029,9 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isi
     let unblockable = signal::UNBLOCKABLE & bit != 0;
     let resumed;
     let ret = {
-        let mut rq = RUN_QUEUE.lock();
         // SIGCONT/SIGKILL: resume a stopped group first, so the thread chosen
         // below is runnable and can actually take the signal.
-        let (made_ready, r) = on_signal_generated(&mut rq, tgid, signo);
+        let (made_ready, r) = on_signal_generated(rq, tgid, signo);
         resumed = r;
         woke |= made_ready;
         let min_vr = rq.min_vruntime();
@@ -1061,11 +1097,7 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isi
             }
         }
     };
-    if woke { wake_up_an_idle_cpu(); }
-    if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
-    // Wake any signalfd poller in the target tgid (RUN_QUEUE released above).
-    wake_poll();
-    ret
+    (ret, woke, resumed)
 }
 
 /// Mark a CLONE_VFORK child as done borrowing the parent's address space
