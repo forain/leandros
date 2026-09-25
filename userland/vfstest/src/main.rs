@@ -7,9 +7,11 @@
 //! Each check prints "<name>: PASS" or "<name>: FAIL" to stdout (serial
 //! console); `main` returns the number of failures as the exit code.
 //!
-//! Note: this kernel's `wait4()` reports a child's raw `exit()` argument as
-//! `wstatus` directly (not the shifted Linux `WEXITSTATUS` encoding), so
-//! tests below compare `wstatus` to a plain 0/1, not `status >> 8`.
+//! Note: this kernel's `wait4()` reports the Linux-encoded `wstatus` (exit
+//! code in bits 8..16, `WEXITSTATUS(status) == status >> 8`), not a child's
+//! raw `exit()` argument. Tests below only ever compare `wstatus` to 0, which
+//! is 0 either way, so the encoding doesn't matter here — but don't compare
+//! it to a bare 1 expecting `exit(1)` to show up as that.
 
 #![no_std]
 #![no_main]
@@ -163,6 +165,8 @@ unsafe fn raw_mode(path: *const u8) -> i32 {
 #[cfg(target_arch = "x86_64")]  const SYS_UTIMENSAT: usize = 280;
 // st_mtim (sec, nsec as i64) at 88 on both ABIs — servers/vfs write_stat_times.
 const STAT_MTIME_OFF: usize = 88;
+// st_atim precedes st_mtim by one (sec, nsec) pair — servers/vfs write_stat_times.
+const STAT_ATIME_OFF: usize = 72;
 
 /// `st_mtim` of `path` as (sec, nsec), or None when stat fails.
 unsafe fn raw_mtime(path: *const u8) -> Option<(i64, i64)> {
@@ -171,6 +175,16 @@ unsafe fn raw_mtime(path: *const u8) -> Option<(i64, i64)> {
     if r < 0 { set_errno(-r as i32); return None; }
     let sec  = core::ptr::read_unaligned(buf.as_ptr().add(STAT_MTIME_OFF) as *const i64);
     let nsec = core::ptr::read_unaligned(buf.as_ptr().add(STAT_MTIME_OFF + 8) as *const i64);
+    Some((sec, nsec))
+}
+
+/// `st_atim` of `path` as (sec, nsec), or None when stat fails.
+unsafe fn raw_atime(path: *const u8) -> Option<(i64, i64)> {
+    let mut buf = [0u8; STAT_SIZE];
+    let r = syscall4(SYS_NEWFSTATAT, AT_FDCWD as usize, path as usize, buf.as_mut_ptr() as usize, 0);
+    if r < 0 { set_errno(-r as i32); return None; }
+    let sec  = core::ptr::read_unaligned(buf.as_ptr().add(STAT_ATIME_OFF) as *const i64);
+    let nsec = core::ptr::read_unaligned(buf.as_ptr().add(STAT_ATIME_OFF + 8) as *const i64);
     Some((sec, nsec))
 }
 
@@ -213,11 +227,21 @@ unsafe fn test_timestamps(root: &[u8], name: &[u8]) -> bool {
     report(name, m3 == Some((789_000, 12_345)))
 }
 
-/// `faccessat(AT_FDCWD, path, mode, 0)` — used to probe ACL-enforced access.
-unsafe fn raw_faccessat(path: *const u8, mode: i32) -> i32 {
-    let r = syscall4(SYS_FACCESSAT, AT_FDCWD as usize, path as usize, mode as usize, 0);
+/// `faccessat(AT_FDCWD, path, mode, flags)`.
+unsafe fn raw_faccessat_flags(path: *const u8, mode: i32, flags: i32) -> i32 {
+    let r = syscall4(SYS_FACCESSAT, AT_FDCWD as usize, path as usize, mode as usize, flags as usize);
     if r < 0 { set_errno(-r as i32); -1 } else { 0 }
 }
+
+/// `faccessat(AT_FDCWD, path, mode, 0)` — used to probe ACL-enforced access.
+unsafe fn raw_faccessat(path: *const u8, mode: i32) -> i32 {
+    raw_faccessat_flags(path, mode, 0)
+}
+
+/// Linux `AT_EACCESS`: check with the caller's effective ids instead of the
+/// real ones. Plain `access()`/`faccessat()` without it (flags == 0) is the
+/// POSIX default: real ids.
+const AT_EACCESS: i32 = 0x200;
 
 /// Build a NUL-terminated path by concatenating `root` and `suffix` (neither
 /// includes its own terminator) into `buf`.
@@ -723,6 +747,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_fcntl_byte_range_conflict() { failures += 1; }
     if !test_permission_enforced() { failures += 1; }
     if !test_f2fs_ownership_enforced() { failures += 1; }
+    if !test_access_real_vs_effective(b"/tmp", b"access_real_vs_effective_tmpfs\0") { failures += 1; }
+    if !test_access_real_vs_effective(b"/data", b"access_real_vs_effective_f2fs\0") { failures += 1; }
     if !test_chroot_confines_symlink_resolution() { failures += 1; }
 
     // O_APPEND, on both backends: the f2fs pair is the regression (appends
@@ -769,6 +795,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
 
     if !test_timestamps(b"/tmp/xa", b"timestamps_tmpfs\0") { failures += 1; }
     if !test_timestamps(b"/data/xa", b"timestamps_f2fs\0") { failures += 1; }
+    if !test_atime_relatime(b"/tmp/xa", b"atime_relatime_tmpfs\0") { failures += 1; }
+    if !test_atime_relatime(b"/data/xa", b"atime_relatime_f2fs\0") { failures += 1; }
 
     puts(b"--- vfstest done ---\0".as_ptr());
     failures
@@ -1029,6 +1057,83 @@ unsafe fn test_f2fs_ownership_enforced() -> bool {
     let mut st2: i32 = -1;
     wait4(owner, &mut st2 as *mut i32, 0, core::ptr::null_mut());
     report(name, st2 == 0)
+}
+
+/// access(2)/faccessat(2) without `AT_EACCESS` must check the REAL uid/gid,
+/// not the effective ones — the entire point of `access()` is letting a
+/// privileged (often setuid) caller ask "could the *invoker* do this", not
+/// "can I do this right now". Built without a setuid binary: `setresuid`
+/// splits real and effective ids apart directly (root may set either to
+/// anything), which is exactly the id pair a setuid-root program has right
+/// after it does the equivalent split itself.
+unsafe fn test_access_real_vs_effective(root: &[u8], name: &[u8]) -> bool {
+    let mut b = [0u8; 96];
+    let path = mkpath(&mut b, root, b"_access_ruid");
+    unlink(path);
+
+    // Owned by root, mode 0600: uid 1000 has zero bits in "other".
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o600);
+    if fd < 0 { return report(name, false); }
+    close(fd);
+
+    let pid = fork();
+    if pid == 0 {
+        // Real uid 1000, effective uid stays 0 (root).
+        if setresuid(1000, 0, 0) != 0 { exit(1); }
+        let real_denied = raw_faccessat_flags(path, R_OK, 0) == -1 && get_errno() == EACCES;
+        let eff_allowed = raw_faccessat_flags(path, R_OK, AT_EACCESS) == 0;
+        // Control: open() always checks the EFFECTIVE ids (this fix must not
+        // touch that) — root's euid still opens its own 0600 file.
+        let ofd = open(path, O_RDONLY, 0);
+        let open_ok = ofd >= 0;
+        if open_ok { close(ofd); }
+        exit(if real_denied && eff_allowed && open_ok { 0 } else { 1 });
+    }
+    let mut status: i32 = -1;
+    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    unlink(path);
+    report(name, status == 0)
+}
+
+/// atime must move on a read, but only within Linux's `relatime` budget. A
+/// freshly created file has atime == mtime, which `relatime_needs_update`
+/// treats as stale, so the FIRST read after creation must move it forward.
+/// A SECOND read immediately after — mtime/ctime unchanged, nowhere near a
+/// day old — must NOT move it again; that's the whole difference between
+/// relatime and a naive "touch atime on every read", and the property that
+/// makes the update cheap enough to do on every backend.
+unsafe fn test_atime_relatime(root: &[u8], name: &[u8]) -> bool {
+    let ns = |t: (i64, i64)| t.0 * 1_000_000_000 + t.1;
+    let mut b = [0u8; 96];
+    let path = mkpath(&mut b, root, b"_relatime");
+    unlink(path);
+
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    if write(fd, b"hello".as_ptr(), 5) != 5 { close(fd); unlink(path); return report(name, false); }
+    close(fd);
+
+    let a0 = match raw_atime(path) { Some(a) => a, None => { unlink(path); return report(name, false); } };
+
+    usleep(30_000); // well past the 10 ms tick, same margin test_timestamps uses
+    let rfd = open(path, O_RDONLY, 0);
+    if rfd < 0 { unlink(path); return report(name, false); }
+    let mut rbuf = [0u8; 8];
+    read(rfd, rbuf.as_mut_ptr(), 5);
+    close(rfd);
+    let a1 = match raw_atime(path) { Some(a) => a, None => { unlink(path); return report(name, false); } };
+    let first_moved = ns(a1) > ns(a0);
+
+    usleep(30_000);
+    let rfd2 = open(path, O_RDONLY, 0);
+    if rfd2 < 0 { unlink(path); return report(name, false); }
+    read(rfd2, rbuf.as_mut_ptr(), 5);
+    close(rfd2);
+    let a2 = match raw_atime(path) { Some(a) => a, None => { unlink(path); return report(name, false); } };
+    let second_held = a2 == a1;
+
+    unlink(path);
+    report(name, first_moved && second_held)
 }
 
 /// chroot() must actually confine tmpfs symlink resolution to the new root:

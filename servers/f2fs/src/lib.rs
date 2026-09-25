@@ -937,6 +937,35 @@ fn touch_ctime(ms: &mut MountState, ino: u32) {
     nat_update(ms, ino, addr);
 }
 
+/// Linux's `relatime` mount default (the option `/proc/mounts` already claims
+/// for this filesystem): skip the atime update unless mtime or ctime is at or
+/// past the current atime, or the current atime is at least a day stale.
+/// Keeps a read from dirtying the inode block on every call.
+const RELATIME_INTERVAL_SEC: i64 = 86_400;
+fn relatime_needs_update(atime: (i64, i64), mtime: (i64, i64), ctime: (i64, i64), now: (i64, i64)) -> bool {
+    if atime.0 < mtime.0 || (atime.0 == mtime.0 && atime.1 <= mtime.1) { return true; }
+    if atime.0 < ctime.0 || (atime.0 == ctime.0 && atime.1 <= ctime.1) { return true; }
+    now.0.saturating_sub(atime.0) >= RELATIME_INTERVAL_SEC
+}
+
+/// A read happened: relatime-gated atime touch on the live inode block of `ino`.
+fn touch_atime_relatime(ms: &mut MountState, ino: u32) {
+    let addr = nat_lookup(ms, ino);
+    if addr == 0 { return; }
+    let now = sched::clock_ts();
+    let needs = {
+        let iblk = ms.cache.read(ms.dev, addr as u64);
+        let (at, mt, ct) = inode_times(iblk);
+        relatime_needs_update(at, mt, ct, now)
+    };
+    if !needs { return; }
+    {
+        let iblk = ms.cache.get_mut(ms.dev, addr as u64);
+        inode_set_atime(iblk, now);
+    }
+    nat_update(ms, ino, addr);
+}
+
 /// Blocks charged to this inode, or `None` when the inode predates the counter
 /// (see `F2FS_ADVISE_IBLOCKS`).
 fn inode_blocks(blk: &[u8]) -> Option<u64> {
@@ -2349,6 +2378,7 @@ fn handle_read(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) -> M
     let pos = ms.open_files[slot].pos;
     let n = read_file_data(ms, ino, pos, buf_ptr as *mut u8, count as usize);
     ms.open_files[slot].pos += n as u64;
+    touch_atime_relatime(ms, ino);
     val_reply(n as u64)
 }
 
@@ -3743,7 +3773,13 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
                 Ok(ino) => xattr_remove(ms, ino, arg(msg,1), &cred),
                 Err(m) => m,
             },
-        VFS_ACCESS     => xattr_access(ms, arg(msg,0), arg(msg,1), &cred),
+        VFS_ACCESS     => {
+            // arg(msg,2) is AT_EACCESS (0/1 from the kernel's faccessat). The
+            // POSIX default for access()/faccessat() is the REAL ids, not the
+            // effective ones `ms.cred` above was just built with.
+            let acred = if arg(msg,2) != 0 { cred } else { vfs_server::real_cred_of(caller_pid) };
+            xattr_access(ms, arg(msg,0), arg(msg,1), &acred)
+        }
         VFS_UTIMENS    => handle_utimens(ms, msg, true, &cred),
         VFS_LUTIMENS   => handle_utimens(ms, msg, false, &cred),
         VFS_FUTIMENS   => handle_futimens(ms, msg, &cred),
