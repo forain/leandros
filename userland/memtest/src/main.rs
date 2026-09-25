@@ -279,8 +279,11 @@ unsafe fn test_exit_frees_page_tables() -> bool {
     write(STDOUT_FILENO, b" lost_kib_per_death=".as_ptr(), 20); print_dec(per_death >> 10);
     write(STDOUT_FILENO, b" child_failures=".as_ptr(), 16); print_dec(spawn_failures);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
-    // A leaked tree is >= 2 MiB per death; the budget is a quarter of it.
-    report(name, spawn_failures == 0 && per_death < (512 << 10))
+    // A leaked tree is >= 2 MiB per death. The reading is 0 on an idle system
+    // since exit releases the address space before the parent's wait4 can
+    // return (it was ~470 KiB while the last child's pages were still held);
+    // the budget leaves room for a desktop allocating in the background.
+    report(name, spawn_failures == 0 && per_death < (256 << 10))
 }
 
 unsafe fn print_dec(mut v: usize) {

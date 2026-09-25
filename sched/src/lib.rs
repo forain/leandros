@@ -3167,6 +3167,10 @@ fn scheduler_run_loop() -> ! {
                     let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
                     hook(t.pid);
                 }
+                // A leader reaped here never ran `exit` itself when a sibling's
+                // group kill took it off-CPU: release its /proc/self/exe slot,
+                // or the 64-entry table fills and every later exec reads /bin/init.
+                if t.pid == t.tgid { clear_exe_path(t.pid); }
                 mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
             }
         } else {
@@ -3611,6 +3615,11 @@ pub fn exit(code: i32) -> ! {
         }
     }
 
+    // Last use of user memory is above: release the address space now, before
+    // the task turns Zombie and becomes waitable (Linux: `exit_mm` precedes
+    // `exit_notify`).
+    release_exiting_address_space(pid);
+
     let (tgid, ppid, status, uid) = {
         let mut rq = RUN_QUEUE.lock();
         let (r, had_vfork) = match rq.find_pid_mut(pid) {
@@ -3658,6 +3667,68 @@ pub fn exit(code: i32) -> ! {
     }
     yield_now("exit");
     loop { core::hint::spin_loop(); }
+}
+
+/// Free a dying process's address space from `exit` itself, before the task
+/// is marked Zombie.
+///
+/// `wait_scan` reports a Zombie the moment it is marked, but the reaping
+/// CPU's scheduler loop only drops the `Task` — and with it the address
+/// space — after it has switched away from it. A parent's `wait4` therefore
+/// returned while the child's whole footprint (an eager copy of every
+/// writable page of the forker, its page tables, its user stack) was still
+/// allocated, and `sysinfo`/`MemFree` read right after the wait counted a
+/// dead child as live memory: memtest's `lost_kib_per_death` ≈ 470–500 and
+/// killmt's `exec_worker` "121 KiB/exec" were exactly that one in-flight
+/// child, not leaked pages (the buddy census before/after the same runs
+/// differs by 0–4 pages).
+///
+/// Only the sole owner releases early: the caller must be the last task of
+/// its thread group — the leader with every sibling gone, or the thread
+/// that ran a group kill after the leader was reaped (siblings resolve their
+/// faults through the leader's `address_space`, see
+/// `lock_leader_address_space`, so a leader with live threads must keep
+/// it) — and the Arc must have no other holder (a `CLONE_VM`/vfork sharer
+/// keeps it alive). Anything else keeps the old behaviour: the reaper drops
+/// it.
+///
+/// The `Task` keeps running kernel code after this, so its root is detached
+/// first (in the same RUN_QUEUE hold `page_table` is cleared, so a
+/// re-dispatch after a preemption never loads the freed root), and the drop
+/// waits out any in-flight `busy` holder exactly as `replace_address_space`
+/// does.
+fn release_exiting_address_space(pid: Pid) {
+    let taken = {
+        let mut rq = RUN_QUEUE.lock();
+        let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return };
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(t) = rq.get(i) {
+                if t.tgid == tgid && t.pid != pid { return; }
+            }
+        }
+        let t = match rq.find_pid_mut(pid) { Some(t) => t, None => return };
+        match t.address_space.as_ref() {
+            Some(a) if alloc::sync::Arc::strong_count(a) == 1 => {}
+            _ => return,
+        }
+        t.page_table = 0;
+        let taken = t.address_space.take();
+        unsafe {
+            // x86_64: back onto the kernel CR3; aarch64: TTBR0 := 0 + local
+            // TLB flush (the kernel runs from TTBR1 either way).
+            arch_load_kernel_page_table();
+            arch_set_page_table(0);
+        }
+        taken
+    };
+    if let Some(old) = taken {
+        if old.busy.load(Ordering::Acquire) {
+            lockwatch::note_wait(lockwatch::L_AS_BUSY);
+            while old.busy.load(Ordering::Acquire) { core::hint::spin_loop(); }
+            lockwatch::note_wait(0);
+        }
+        drop(old);
+    }
 }
 
 /// Outcome of one `kill_next_group_member` step.
@@ -3766,6 +3837,10 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
             let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
             hook(t.pid);
         }
+        // A leader reaped here never ran `exit` itself when a sibling's
+        // group kill took it off-CPU: release its /proc/self/exe slot,
+        // or the 64-entry table fills and every later exec reads /bin/init.
+        if t.pid == t.tgid { clear_exe_path(t.pid); }
         mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
     }
     GroupKillStep::Reaped(tpid)
