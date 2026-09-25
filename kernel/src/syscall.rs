@@ -1636,8 +1636,68 @@ fn prot_to_page_flags(prot: usize) -> PageFlags {
 ///   - `addr == 0`         — bump-allocate a fresh VA region.
 ///
 /// Returns the mapped virtual address on success, or a negative errno.
+/// Report any mmap that takes longer than this, with where the time went.
+/// Cheap (two clock reads per phase) and silent unless something is slow; it
+/// exists because `[WDOG] ... cosmic-comp ... last syscall 9` was seen with no
+/// way to say which mapping, of what, cost the seconds.
+const MMAP_SLOW_NS: u64 = 500_000_000;
+
+/// Largest single VFS read the eager file-mmap copy issues before opening an
+/// interrupt window (see the copy loop in `sys_mmap_inner`). 512 KiB is a few
+/// ms of f2fs/virtio-blk on KVM and well under a tick-watchdog period on TCG.
+const MMAP_READ_CHUNK: usize = 512 * 1024;
+
+fn mmap_print_dec(mut n: usize) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop { i -= 1; buf[i] = b"0"[0] + (n % 10) as u8; n /= 10; if n == 0 { break; } }
+    crate::serial_print_str(core::str::from_utf8(&buf[i..]).unwrap_or("?"));
+}
+
+#[derive(Default)]
+struct MmapTrace {
+    /// 1 anon, 2 device, 3 shared-vmo, 4 file-copy
+    kind: u8,
+    map_ns: u64,
+    io_ns: u64,
+    fixup_ns: u64,
+    bytes: usize,
+}
+
 fn sys_mmap(addr: usize, len: usize, prot: usize,
             flags: usize, fd: usize, off: usize) -> isize {
+    let mut tr = MmapTrace::default();
+    let t0 = monotonic_ns();
+    let r = sys_mmap_inner(addr, len, prot, flags, fd, off, &mut tr);
+    let dt = monotonic_ns().wrapping_sub(t0);
+    if dt >= MMAP_SLOW_NS {
+        crate::serial_print_str("[MMAP-SLOW] pid=");
+        mmap_print_dec(current_pid() as usize);
+        crate::serial_print_str(" kind=");
+        crate::serial_print_str(match tr.kind { 1 => "anon", 2 => "device", 3 => "shared-vmo", 4 => "file-copy", _ => "?" });
+        crate::serial_print_str(" len=");
+        crate::serial_print_hex(len);
+        crate::serial_print_str(" flags=");
+        crate::serial_print_hex(flags);
+        crate::serial_print_str(" fd=");
+        mmap_print_dec(fd);
+        crate::serial_print_str(" total_ms=");
+        mmap_print_dec((dt / 1_000_000) as usize);
+        crate::serial_print_str(" map_ms=");
+        mmap_print_dec((tr.map_ns / 1_000_000) as usize);
+        crate::serial_print_str(" io_ms=");
+        mmap_print_dec((tr.io_ns / 1_000_000) as usize);
+        crate::serial_print_str(" fixup_ms=");
+        mmap_print_dec((tr.fixup_ns / 1_000_000) as usize);
+        crate::serial_print_str(" bytes=");
+        crate::serial_print_hex(tr.bytes);
+        crate::serial_print_str("\n");
+    }
+    r
+}
+
+fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
+            flags: usize, fd: usize, off: usize, tr: &mut MmapTrace) -> isize {
     // Linux mmap flags.
     const MAP_SHARED:    usize = 0x01;
     const MAP_FIXED:     usize = 0x10;
@@ -1683,11 +1743,14 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
 
     // ── Anonymous mmap ────────────────────────────────────────────────────────
     if flags & MAP_ANONYMOUS != 0 {
+        tr.kind = 1;
         let is_shared = flags & MAP_SHARED != 0;
+        let tm = monotonic_ns();
         let mapped = with_current_address_space_mut(|as_| {
             if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
             as_.map_lazy(virt, len, page_flags, is_shared)
         });
+        tr.map_ns = monotonic_ns().wrapping_sub(tm);
         return match mapped {
             Some(true)  => virt as isize,
             Some(false) => {
@@ -1719,7 +1782,9 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     let pid = current_pid();
 
     // Step 1: Check if the fd is a device supporting direct mmap via ioctl 0x1007
+    let tk = monotonic_ns();
     let kind = vfs::vfs_get_node_kind(pid, fd);
+    tr.io_ns = monotonic_ns().wrapping_sub(tk);
     let mut phys_addr: usize = 0;
     // Set from slot 1 of the device's 0x1007 reply; see MMAP_HINT_UNCACHED.
     let mut dev_uncached = false;
@@ -1741,7 +1806,10 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
         // a device server sees one consistent open across ioctl and mmap.
         proxy_msg.data[32..40].copy_from_slice(&(open_id as u64).to_le_bytes());
 
+        tr.kind = 2;
+        let tc = monotonic_ns();
         let reply = vfs::call_port(port, proxy_msg);
+        tr.io_ns += monotonic_ns().wrapping_sub(tc);
         if reply.tag == 0 {
             let res = u64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8])) as usize;
             if DBG_MMAP {
@@ -1781,10 +1849,12 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
         } else {
             page_flags
         };
+        let tm = monotonic_ns();
         let mapped = with_current_address_space_mut(|as_| {
             if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
             as_.map_device(virt, phys_addr, len, dev_flags)
         });
+        tr.map_ns = monotonic_ns().wrapping_sub(tm);
         let ret = match mapped {
             Some(true)  => virt as isize,
             _           => enomem_map_site(("mmap/device")),
@@ -1808,7 +1878,11 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     // MAP_SHARED still falls through to the eager private-copy path below.
     if flags & MAP_SHARED != 0 {
         if let Some(vfs::VnodeKind::TmpFile { idx, .. }) = kind {
-            match vfs::vmo_acquire_frames(pid, fd, off, len) {
+            tr.kind = 3;
+            let ta = monotonic_ns();
+            let acquired = vfs::vmo_acquire_frames(pid, fd, off, len);
+            tr.io_ns += monotonic_ns().wrapping_sub(ta);
+            match acquired {
                 Some(frames) => {
                     // [GAP2] snapshot before the frames are consumed by the map.
                     let g2_p0 = frames.first().copied().unwrap_or(0);
@@ -1885,7 +1959,9 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     // the copy in step 4 lands in physical memory regardless of prot bits.
     // The final page_flags (which may be read-only) are applied via map_flags
     // on the VMA; subsequent accesses use those bits.
+    tr.kind = 4;
     let write_flags = page_flags | PageFlags::WRITABLE;
+    let tm = monotonic_ns();
     let mapped_phys = with_current_address_space_mut(|as_| {
         if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
         if !as_.map(virt, len, write_flags) { return None; }
@@ -1893,6 +1969,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
         as_.find(virt).map(|vma| vma.phys)
     });
 
+    tr.map_ns = monotonic_ns().wrapping_sub(tm);
     // mapped_phys : Option<Option<usize>> — outer None = no address space
     let phys = match mapped_phys {
         Some(Some(p)) => p,
@@ -1908,15 +1985,32 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     let hhdm_ptr = mm::phys_to_virt(phys) as *mut u8;
     let mut filled: usize = 0;
     let mut n: isize = 0;
+    let tio = monotonic_ns();
+    //
+    // Bounded chunks with an interrupt window between them. Syscalls run with
+    // IRQs masked, and this copy is EAGER: a MAP_PRIVATE map of a whole file
+    // reads all of it here. Rust binaries map their own executable to
+    // symbolize a backtrace (cosmic-comp 33 MiB, cosmic-greeter-login 36 MiB)
+    // and ld-musl maps libgallium's 23 MiB text segment the same way, so one
+    // unbroken read was 1.1-1.4 s on x86_64/KVM and 2.3-3.7 s on x86_64/TCG
+    // with no timer tick on that CPU -- the `[WDOG] ... cosmic-comp ... last
+    // syscall 9` report. Nothing is held between chunks (the VMA is already
+    // mapped and the copy goes through the kernel direct map), so the window
+    // may also reschedule; the total cost is unchanged, the CPU is simply no
+    // longer deaf for all of it.
     while filled < len {
+        let want = (len - filled).min(MMAP_READ_CHUNK);
         let read_msg = make_vfs_msg(vfs::VFS_READ,
-            &[fd as u64, (hhdm_ptr as usize + filled) as u64, (len - filled) as u64]);
+            &[fd as u64, (hhdm_ptr as usize + filled) as u64, want as u64]);
         let r = vfs_reply_val(&vfs::handle(&read_msg, pid));
         if r < 0 { n = r; break; }
         if r == 0 { break; } // genuine EOF; the rest of the mapping stays zero
         filled += r as usize;
+        irq_window();
     }
     if n >= 0 { n = filled as isize; }
+    tr.io_ns += monotonic_ns().wrapping_sub(tio);
+    tr.bytes = filled;
 
     // Restore the descriptor's original file position — mmap(2) leaves it alone.
     if saved_pos >= 0 {
@@ -1936,7 +2030,9 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     if !page_flags.contains(PageFlags::WRITABLE) {
         // mprotect the VMA to remove the temporary WRITABLE bit.
         // Use sys_mprotect's logic: walk VMA list, remap pages.
+        let tf = monotonic_ns();
         let _ = sys_mprotect(virt, len, prot);
+        tr.fixup_ns = monotonic_ns().wrapping_sub(tf);
     }
 
     virt as isize
