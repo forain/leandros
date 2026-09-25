@@ -5464,7 +5464,7 @@ fn fstatat_into(
     }
 
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
-    if SC_STATS { sc_stat_path_trace(path.bytes()); }
+    let trace = SC_STATS && sc_stat_path_focus();
     let path_ptr = path.ptr();
     let pid = current_pid();
 
@@ -5481,7 +5481,11 @@ fn fstatat_into(
     // uses it to avoid descending through a link into a directory.
     let stat_tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LSTAT } else { vfs::VFS_STAT };
     let smsg = make_vfs_msg(stat_tag, &[path_ptr as u64, statbuf_ptr as u64]);
-    if vfs_reply_val(&vfs::handle(&smsg, pid)) >= 0 {
+    let t0 = if trace { monotonic_ns() } else { 0 };
+    let sr = vfs_reply_val(&vfs::handle(&smsg, pid));
+    let t1 = if trace { monotonic_ns() } else { 0 };
+    if sr >= 0 {
+        if trace { sc_stat_path_trace(path.bytes(), sr, t1 - t0, 0, 0); }
         return 0;
     }
 
@@ -5491,9 +5495,11 @@ fn fstatat_into(
         vfs::write_stat_full(statbuf_ptr, 0o040755, 2, 0, 0, 0, 0);
         return 0;
     }
+    let t2 = if trace { monotonic_ns() } else { 0 };
     // Open path, use sys_fstat, then close.
     let omsg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, 0u64, 0]);
     let fd = vfs_reply_val(&vfs::handle(&omsg, pid));
+    if trace { sc_stat_path_trace(path.bytes(), sr, t1 - t0, t2 - t1, monotonic_ns() - t2); }
     if fd < 0 { return fd; }
     let r = fstat_into(fd as usize, statbuf_ptr, user_dest);
     let cmsg = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]);
@@ -8085,13 +8091,19 @@ fn evstat_tick() {
 
 /// `[SCPATH]`: the path of a stat() by the second focus (cosmic-greeter-login),
 /// the first 300 and then every 500th — enough to name a stat loop's target.
-fn sc_stat_path_trace(path: &[u8]) {
-    static N: AtomicUsize = AtomicUsize::new(0);
+fn sc_stat_path_focus() -> bool {
     let f2 = sched::SC_FOCUS2_TGID.load(Ordering::Relaxed);
-    if f2 == 0 || sched::current_tgid() != f2 { return; }
+    f2 != 0 && sched::current_tgid() == f2
+}
+fn sc_stat_path_trace(path: &[u8], r: isize, stat_ns: u64, isdir_ns: u64, open_ns: u64) {
+    static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     if n >= 300 && n % 500 != 0 { return; }
     mm::gap2::s("[SCPATH] n="); mm::gap2::h(n);
+    mm::gap2::kv(" r=", r as usize);
+    mm::gap2::kv(" stat_us=", (stat_ns / 1000) as usize);
+    mm::gap2::kv(" isdir_us=", (isdir_ns / 1000) as usize);
+    mm::gap2::kv(" open_us=", (open_ns / 1000) as usize);
     mm::gap2::kv(" t=", ticks() as usize);
     mm::gap2::kv(" pid=", current_pid() as usize);
     mm::gap2::s(" ");
