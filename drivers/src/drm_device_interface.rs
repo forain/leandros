@@ -1441,11 +1441,34 @@ pub fn drm_release_open(open_id: u32) {
     // blobs, above, still had to be reclaimed.
     if ctx == 0 { return; }
 
+    // Let the context's in-flight fenced work retire BEFORE destroying it: the
+    // host answers a context-ring fence only through its context, so a fence
+    // still outstanding at CTX_DESTROY is never answered (see
+    // `ctx_abandon_fences`). A client killed mid-frame has a submit or two in
+    // flight that the GPU finishes within a frame; wait for that, bounded,
+    // with the device lock released between looks.
+    let t0 = crate::snd::monotonic_us();
+    loop {
+        let left = match crate::virtio_gpu::lock_gpu() {
+            Some(mut g) => g.ctx_fences_outstanding_now(ctx),
+            None => 0,
+        };
+        if left == 0 || crate::snd::monotonic_us().wrapping_sub(t0) >= CTX_DRAIN_US { break; }
+        sched::yield_now("gpu-ctx-drain");
+    }
+
     let mut guard = crate::virtio_gpu::lock_gpu();
     if let Some(gpu) = guard.as_mut() {
         gpu.ctx_destroy(ctx);
+        // Whatever did not retire in time never will.
+        gpu.ctx_abandon_fences(ctx);
     }
 }
+
+/// Bound on waiting for a closing open's in-flight GPU work before its context
+/// is destroyed. Normal work retires within a frame; this only caps a client
+/// that left the GPU waiting on something that will never happen.
+const CTX_DRAIN_US: u64 = 200_000;
 
 /// Record `fence` as the most recent submission on `open_id`. Silently does
 /// nothing for an open with no context, which cannot have submitted anything.
