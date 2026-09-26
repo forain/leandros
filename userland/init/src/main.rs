@@ -152,7 +152,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // also reaps any orphan reparented to init, which is simply ignored.
     write_str("Starting getty loop...\n");
     let mut login_pid: i32 = spawn_login();
-    let mut guard = MemGuard { last_check: 0, strikes: 0 };
+    let mut guard = MemGuard { last_check: 0, strikes: 0, victims: 0 };
     loop {
         let mut status = 0i32;
         // WNOHANG and a short sleep instead of a blocking wait4, so the
@@ -160,7 +160,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
         const WNOHANG: i32 = 1;
         let pid = wait4(-1, &mut status, WNOHANG, core::ptr::null_mut());
         if pid == 0 {
-            if dm_pid > 0 { mem_guard(&mut guard, dm_pid); }
+            if dm_pid > 0 { mem_guard(&mut guard, dm_pid, login_pid, dm_logger); }
             usleep(250_000);
             continue;
         }
@@ -539,19 +539,37 @@ unsafe fn run_dm_logger(rfd: i32) -> ! {
 struct MemGuard {
     last_check: u64,
     strikes: u32,
+    /// Single processes killed in the current low-memory episode (reset once
+    /// MemAvailable is back above the floor).
+    victims: u32,
 }
 
-/// Kill the graphical login's tree when the guest is about to run out of
-/// memory, instead of letting the kernel's allocator fail under everything.
+/// Single-process kills per low-memory episode before the guard gives up on
+/// picking and kills the whole graphical login.
+const MEM_GUARD_MAX_VICTIMS: u32 = 3;
+
+/// Executables killed only when nothing else in the session is left to
+/// pick: the compositor (every client dies with it) and greetd's own
+/// processes (the session worker; killing it ends the whole login).
+const MEM_GUARD_LAST: &[&[u8]] = &[b"cosmic-comp", b"greetd"];
+
+/// Relieve memory pressure before the kernel's allocator fails under
+/// everything, the way the kernel OOM killer and systemd-oomd do.
 ///
-/// systemd-oomd does the same at a session's cgroup. There is no per-process
-/// RSS to pick a single victim by (`/proc/<pid>/status` VmRSS is a constant),
-/// and the graphical tree is where every such runaway seen so far lived: a
-/// greeter spinning on a dead compositor, or cosmic-session queueing the
-/// lines of a panel spinning on a dead Wayland connection. SIGKILL goes to
-/// greetd. The normal exit path then sweeps the orphans (`sweep_strays`) and
-/// respawns the login under the usual backoff and ceiling.
-unsafe fn mem_guard(g: &mut MemGuard, dm_pid: i32) {
+/// When MemAvailable stays below the floor for `MEM_GUARD_STRIKES` checks,
+/// the guard SIGKILLs the one process with the largest resident set
+/// (`/proc/<pid>/statm`) among those that belong to the graphical side:
+/// everything except init, the serial login's session, the log writer and
+/// greetd itself, with the compositor and greetd's session worker taken
+/// only if nothing else is left. It names the victim on the console and in
+/// greetd.log. If memory is still low after `MEM_GUARD_MAX_VICTIMS` such
+/// kills (or there is nothing to pick), it falls back to killing greetd,
+/// whose exit path sweeps the rest of the tree and respawns the login under
+/// the usual backoff.
+///
+/// Until 2026-09-26 the fallback was the only action: `/proc/<pid>/status`
+/// reported a constant VmRSS, so there was no way to choose a victim.
+unsafe fn mem_guard(g: &mut MemGuard, dm_pid: i32, login_pid: i32, logger_pid: i32) {
     let now = monotonic_secs();
     if now < g.last_check + MEM_GUARD_PERIOD_SECS { return; }
     g.last_check = now;
@@ -559,41 +577,122 @@ unsafe fn mem_guard(g: &mut MemGuard, dm_pid: i32) {
     let floor = core::cmp::max(MEM_GUARD_MIN_KIB, total / MEM_GUARD_DIVISOR);
     if avail >= floor {
         g.strikes = 0;
+        g.victims = 0;
         return;
     }
     g.strikes += 1;
     if g.strikes < MEM_GUARD_STRIKES { return; }
     g.strikes = 0;
-    write_str("\n");
-    write_str("################################################################\n");
-    write_str("## MEMORY PRESSURE: MemAvailable ");
-    write_u32((avail / 1024) as u32);
-    write_str(" MiB < floor ");
-    write_u32((floor / 1024) as u32);
-    write_str(" MiB.\n");
-    write_str("## Killing the graphical login (greetd pid ");
-    write_u32(dm_pid as u32);
-    write_str(") and its session;\n");
-    write_str("## it restarts under the usual backoff. See /var/log/greetd.log.\n");
+
+    let mut line = [0u8; 192];
+    let mut p = 0;
+    let put = |line: &mut [u8; 192], p: &mut usize, s: &[u8]| {
+        let n = s.len().min(line.len() - *p);
+        line[*p..*p + n].copy_from_slice(&s[..n]);
+        *p += n;
+    };
+    put(&mut line, &mut p, b"[init] MEMORY PRESSURE: MemAvailable ");
+    let mut num = [0u8; 10];
+    let n = fmt_u32(&mut num, (avail / 1024) as u32); put(&mut line, &mut p, &num[..n]);
+    put(&mut line, &mut p, b" MiB < floor ");
+    let n = fmt_u32(&mut num, (floor / 1024) as u32); put(&mut line, &mut p, &num[..n]);
+    put(&mut line, &mut p, b" MiB; ");
+
+    let victim = if g.victims < MEM_GUARD_MAX_VICTIMS {
+        pick_victim(dm_pid, login_pid, logger_pid)
+    } else { None };
+    match victim {
+        Some(v) => {
+            g.victims += 1;
+            put(&mut line, &mut p, b"killed pid ");
+            let n = fmt_u32(&mut num, v.pid); put(&mut line, &mut p, &num[..n]);
+            put(&mut line, &mut p, b" (");
+            put(&mut line, &mut p, &v.comm[..v.comm_len]);
+            put(&mut line, &mut p, b"), RSS ");
+            let n = fmt_u32(&mut num, (v.rss_kib / 1024) as u32); put(&mut line, &mut p, &num[..n]);
+            put(&mut line, &mut p, b" MiB, the largest in the graphical session\n");
+            syscall2(nr::KILL, v.pid as usize, 9);
+        }
+        None => {
+            g.victims = 0;
+            put(&mut line, &mut p, b"killing the graphical login (greetd pid ");
+            let n = fmt_u32(&mut num, dm_pid as u32); put(&mut line, &mut p, &num[..n]);
+            put(&mut line, &mut p, b") and its session\n");
+            syscall2(nr::KILL, dm_pid as usize, 9);
+        }
+    }
+    write_str("\n################################################################\n## ");
+    write(STDOUT_FILENO, line.as_ptr().add(7), p - 7); // without the "[init] " prefix
     write_str("################################################################\n");
     // The serial console is not always being read (a driver socket with no
     // client drops it), so leave the same fact in the log the chain wrote.
     let fd = open(DM_LOG.as_ptr(), O_WRONLY | O_APPEND, 0);
     if fd >= 0 {
-        let mut line = [0u8; 128];
-        let mut p = 0;
-        let head = b"[init] MEMORY PRESSURE: MemAvailable ";
-        line[..head.len()].copy_from_slice(head); p += head.len();
-        p += fmt_u32(&mut line[p..], (avail / 1024) as u32);
-        let mid = b" MiB < floor ";
-        line[p..p + mid.len()].copy_from_slice(mid); p += mid.len();
-        p += fmt_u32(&mut line[p..], (floor / 1024) as u32);
-        let tail = b" MiB; killing the graphical login\n";
-        line[p..p + tail.len()].copy_from_slice(tail); p += tail.len();
         write(fd, line.as_ptr(), p);
         close(fd);
     }
-    syscall2(nr::KILL, dm_pid as usize, 9);
+}
+
+struct Victim { pid: u32, rss_kib: u64, comm: [u8; 16], comm_len: usize }
+
+/// The largest-RSS process on the graphical side (see `mem_guard`), with
+/// `MEM_GUARD_LAST` executables considered only when nothing else is.
+unsafe fn pick_victim(dm_pid: i32, login_pid: i32, logger_pid: i32) -> Option<Victim> {
+    let me = getpid() as u32;
+    let login_sid = if login_pid > 0 { proc_stat(login_pid as u32).map(|(_, _, _, s)| s) } else { None };
+    let last = proc_last_pid();
+    let mut best: Option<Victim> = None;
+    let mut best_last: Option<Victim> = None;
+    let mut pid = 2u32;
+    while pid <= last {
+        let cur = pid;
+        pid += 1;
+        if cur == me || cur as i32 == login_pid || cur as i32 == logger_pid || cur as i32 == dm_pid {
+            continue;
+        }
+        let (state, _ppid, _pgid, sid) = match proc_stat(cur) { Some(v) => v, None => continue };
+        if state == b'Z' || login_sid == Some(sid) { continue; }
+        let rss_kib = match proc_rss_kib(cur) { Some(r) if r > 0 => r, _ => continue };
+        let mut v = Victim { pid: cur, rss_kib, comm: [0; 16], comm_len: 0 };
+        v.comm_len = proc_comm(cur, &mut v.comm);
+        let is_last = MEM_GUARD_LAST.iter().any(|n| &v.comm[..v.comm_len] == *n);
+        let slot = if is_last { &mut best_last } else { &mut best };
+        if slot.as_ref().map_or(true, |b| rss_kib > b.rss_kib) { *slot = Some(v); }
+    }
+    best.or(best_last)
+}
+
+/// Resident set of `pid` in KiB (`/proc/<pid>/statm` field 2, pages).
+unsafe fn proc_rss_kib(pid: u32) -> Option<u64> {
+    let mut path = [0u8; 32];
+    let mut p = 0;
+    for &b in b"/proc/" { path[p] = b; p += 1; }
+    p += fmt_u32(&mut path[p..], pid);
+    for &b in b"/statm\0" { path[p] = b; p += 1; }
+    let mut buf = [0u8; 128];
+    let n = read_file(&path[..p], &mut buf);
+    if n == 0 { return None; }
+    let mut f = buf[..n].split(|&b| b == b' ' || b == b'\n').filter(|f| !f.is_empty());
+    let _size = f.next()?;
+    Some(parse_u32(f.next()?)? as u64 * 4)
+}
+
+/// The comm (executable name) from `/proc/<pid>/stat`, into `out`.
+unsafe fn proc_comm(pid: u32, out: &mut [u8; 16]) -> usize {
+    let mut path = [0u8; 32];
+    let mut p = 0;
+    for &b in b"/proc/" { path[p] = b; p += 1; }
+    p += fmt_u32(&mut path[p..], pid);
+    for &b in b"/stat\0" { path[p] = b; p += 1; }
+    let mut buf = [0u8; 128];
+    let n = read_file(&path[..p], &mut buf);
+    let line = &buf[..n];
+    let open = match line.iter().position(|&b| b == b'(') { Some(i) => i + 1, None => return 0 };
+    let close = match line.iter().rposition(|&b| b == b')') { Some(i) => i, None => return 0 };
+    if close < open { return 0; }
+    let len = (close - open).min(out.len());
+    out[..len].copy_from_slice(&line[open..open + len]);
+    len
 }
 
 /// `(MemTotal, MemAvailable)` in KiB from /proc/meminfo.
