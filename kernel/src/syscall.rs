@@ -911,6 +911,15 @@ fn churn_tick() {
     mm::gap2::s("[CHURN] win_ms="); mm::gap2::h(win_ms);
     mm::gap2::kv(" dropped=", CHURN_DROPPED.swap(0, Relaxed) as usize);
     mm::gap2::nl();
+    mm::gap2::s("[CHURN] alltag sock="); mm::gap2::h(ALLTAG[0].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" epoll=", ALLTAG[1].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" signalfd=", ALLTAG[2].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" inotify=", ALLTAG[3].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" dev=", ALLTAG[4].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" stdio=", ALLTAG[5].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" file=", ALLTAG[6].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" other=", ALLTAG[7].swap(0, Relaxed) as usize);
+    mm::gap2::nl();
     let mut taken = [false; CHURN_ROWS];
     for _ in 0..24 {
         let mut best = usize::MAX; let mut bn = 0u32;
@@ -8234,6 +8243,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
             let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
             if !interest.in_use || !interest.armed { continue; }
             let (cur, seq, tag) = probe_fd_events_seq(pid, interest.fd as usize, interest.events);
+            if CHURN_STATS && tag == sched::POLL_TAG_ALL { churn_all_tag_note(pid, interest.fd as usize); }
             mask |= tag;
             let et = interest.events & EPOLLET != 0;
             let fire = cur != 0 && (!et || match seq {
@@ -8923,9 +8933,31 @@ fn epoll_tag_mask(pid: u32, slot: usize, depth: u32) -> u64 {
         if !interest.in_use || !interest.armed { continue; }
         let (_cur, _seq, tag) =
             probe_fd_events_seq_nested(pid, interest.fd as usize, interest.events, depth + 1);
+        if CHURN_STATS && tag == sched::POLL_TAG_ALL { churn_all_tag_note(pid, interest.fd as usize); }
         mask |= tag;
     }
     mask
+}
+
+/// `[CHURN] alltag` census: which interest kinds make an epoll wait mask a
+/// broadcast one (index: 0 inet/listener socket, 1 epoll nest, 2 signalfd,
+/// 3 inotify, 4 device, 5 stdio/none, 6 file, 7 other).
+static ALLTAG: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+fn churn_all_tag_note(pid: u32, fd: usize) {
+    let k = if fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE { 0 }
+        else if fd >= EPOLL_FD_BASE { 1 }
+        else {
+            match vfs::vfs_get_node_kind(pid, fd) {
+                Some(vfs::VnodeKind::SignalFd { .. }) => 2,
+                Some(vfs::VnodeKind::Inotify { .. }) => 3,
+                Some(vfs::VnodeKind::DynamicDevice { .. }) => 4,
+                Some(vfs::VnodeKind::DevStdio { .. }) | Some(vfs::VnodeKind::None) | None => 5,
+                Some(vfs::VnodeKind::MountedFile { .. }) | Some(vfs::VnodeKind::TmpFile { .. })
+                    | Some(vfs::VnodeKind::RamFile { .. }) => 6,
+                _ => 7,
+            }
+        };
+    ALLTAG[k].fetch_add(1, Ordering::Relaxed);
 }
 
 fn sys_eventfd2(initval: usize, flags: usize) -> isize {
