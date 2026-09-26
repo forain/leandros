@@ -7199,6 +7199,8 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     // new value in, old value out). drmsmoke uses it to force a parked wait.
     const DRM_IOCTL_GPU_PARK_SPIN: usize = 0x1009;
     if cmd == DRM_IOCTL_GPU_PARK_SPIN && (arg == 0 || !validate_user_buf(arg, 8)) { return -14; } // EFAULT
+    const DRM_IOCTL_CTX_DRAIN_US: usize = 0x100A;
+    if cmd == DRM_IOCTL_CTX_DRAIN_US && (arg == 0 || !validate_user_buf(arg, 8)) { return -14; } // EFAULT
 
     // Check if it's a standard Linux EVDEV (type 'E' = 0x45) or DRM (type 'd' = 0x64) ioctl
     let ioctl_type = (cmd >> 8) & 0xFF;
@@ -7460,6 +7462,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
        cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||
        cmd == DRM_IOCTL_SET_PLANE || cmd == DRM_IOCTL_GET_CAPS ||
        cmd == DRM_IOCTL_GPU_IRQ_STATS || cmd == DRM_IOCTL_GPU_PARK_SPIN ||
+       cmd == DRM_IOCTL_CTX_DRAIN_US ||
        is_evdev || is_drm {
         
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);

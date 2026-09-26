@@ -124,8 +124,13 @@ pub struct VirtioGpuDevice {
     /// `submit`/`submit_async` from task context. Capacity reserved at init so
     /// a push never allocates.
     deferred_free: Vec<(usize, usize)>,
-    /// Next 3D context id to hand out.  Context 0 means "no context".
+    /// Next 3D context id to hand out once the recycled pool is exhausted.
+    /// Context 0 means "no context".
     next_ctx_id: u32,
+    /// Context ids in use (bit n = id n, ids below `CTX_ID_POOL`).
+    ctx_ids_used: [u64; (CTX_ID_POOL / 64) as usize],
+    /// Ids whose destroyed context left a chain parked host-side.
+    ctx_ids_parked: [u64; (CTX_ID_POOL / 64) as usize],
     /// Next resource id for 3D/blob resources.  1 is the console scanout and 2
     /// is the cursor, so 3D allocation starts above them.
     next_3d_resource_id: u32,
@@ -543,6 +548,9 @@ struct Inflight {
     sync: bool,
     done: bool,
     resp_type: u32,
+    /// Its fence was written off by `ctx_abandon_fences` (context destroyed
+    /// with the command unanswered). The chain is still the host's.
+    abandoned: bool,
 }
 
 /// Bound on any control-queue wait, in spin iterations (each ≤ one
@@ -563,6 +571,14 @@ pub static GPU_FENCE_FLOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// never will (`VirtioGpuDevice::ctx_abandon_fences`). Each one also leaves a
 /// control-queue chain parked host-side.
 pub static CTX_FENCES_ABANDONED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Abandoned chains the host answered after all (see `ctx_alloc_id`), and
+/// how many are parked host-side right now.
+pub static CTX_CHAINS_RECLAIMED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CTX_CHAINS_PARKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Context ids `1..CTX_ID_POOL` are recycled (lowest free first, like Linux's
+/// ida); above that they are handed out monotonically.
+const CTX_ID_POOL: u32 = 256;
 
 /// A reap retired at least one fence and the DRM layer has not been told yet.
 /// Set under `VIRTIO_GPU` (any context), consumed by `ctrlq_tick`.
@@ -1222,7 +1238,9 @@ impl VirtioGpuDevice {
             fences_ahead: Vec::new(),
             inflight: Vec::new(),
             deferred_free: Vec::new(),
-            next_ctx_id: 1,
+            next_ctx_id: CTX_ID_POOL,
+            ctx_ids_used: [1; (CTX_ID_POOL / 64) as usize], // id 0 is never handed out
+            ctx_ids_parked: [0; (CTX_ID_POOL / 64) as usize],
             next_3d_resource_id: 16,
             current_resource_id: 0,
             scanout_w: 1280,
@@ -1729,11 +1747,60 @@ impl VirtioGpuDevice {
                 CTRLQ_ASYNC_LAT_US.fetch_add(lat, Relaxed);
                 CTRLQ_ASYNC_LAT_MAX_US.fetch_max(lat, Relaxed);
             }
+            if e.abandoned {
+                use core::sync::atomic::Ordering::Relaxed;
+                let _ = CTX_CHAINS_PARKED.fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
+                let n = CTX_CHAINS_RECLAIMED.fetch_add(1, Relaxed);
+                if n < 8 {
+                    crate::pci::serial_debug("[GPU] abandoned chain answered, reclaimed: ctx ");
+                    crate::pci::serial_debug_hex(Self::inflight_ctx(&e));
+                    crate::pci::serial_debug(" parked now ");
+                    crate::pci::serial_debug_hex(CTX_CHAINS_PARKED.load(Relaxed) as u32);
+                    crate::pci::serial_debug("\n");
+                }
+            }
             if let Some(q) = self.queues[0].as_mut() { unsafe { q.free_chain(head as u16); } }
             self.inflight[head] = None;
             self.release_buffers(&e, task_ctx);
         }
         retired
+    }
+
+    /// A context id for CTX_CREATE. Ids are recycled, lowest free first, and
+    /// an id whose destroyed context left a chain parked host-side is
+    /// preferred: QEMU retires a context-ring fence when that (ctx id, ring)
+    /// signals any fence at or above it, so the next context created under
+    /// the id answers the parked command with its first fence on that ring,
+    /// and the reap frees the chain. With ids never reused (as before) a
+    /// parked chain held its descriptors and buffers until reboot.
+    fn ctx_alloc_id(&mut self) -> u32 {
+        let words = self.ctx_ids_used.len();
+        for pass in 0..2 {
+            for w in 0..words {
+                let mut cand = !self.ctx_ids_used[w];
+                if pass == 0 { cand &= self.ctx_ids_parked[w]; }
+                if cand != 0 {
+                    let b = cand.trailing_zeros();
+                    self.ctx_ids_used[w] |= 1u64 << b;
+                    return w as u32 * 64 + b;
+                }
+            }
+        }
+        let id = self.next_ctx_id;
+        self.next_ctx_id = self.next_ctx_id.wrapping_add(1).max(CTX_ID_POOL);
+        id
+    }
+
+    fn ctx_free_id(&mut self, id: u32) {
+        if id != 0 && id < CTX_ID_POOL {
+            self.ctx_ids_used[(id / 64) as usize] &= !(1u64 << (id % 64));
+            // Still parked? Keep preferring it until its chains come back.
+            let parked = self.inflight.iter().flatten()
+                .any(|e| e.abandoned && Self::inflight_ctx(e) == id);
+            let bit = 1u64 << (id % 64);
+            if parked { self.ctx_ids_parked[(id / 64) as usize] |= bit; }
+            else { self.ctx_ids_parked[(id / 64) as usize] &= !bit; }
+        }
     }
 
     /// Build, record and kick one control-queue chain. The caller has already
@@ -1821,6 +1888,7 @@ impl VirtioGpuDevice {
             self.inflight[head_idx as usize] = Some(Inflight {
                 req_phys, req_order, pay_phys, pay_order, resp_phys, resp_order, resp_capacity,
                 fence_id, hdr_type, submitted_us, sync, done: false, resp_type: 0,
+                abandoned: false,
             });
 
             let q = self.queues[0].as_mut().ok_or(())?;
@@ -2661,6 +2729,7 @@ impl VirtioGpuDevice {
                     ids[n] = e.fence_id;
                     n += 1;
                     e.fence_id = 0;
+                    e.abandoned = true;
                 }
             }
             if n == 0 { break; }
@@ -2668,6 +2737,10 @@ impl VirtioGpuDevice {
             total += n;
         }
         if total != 0 {
+            CTX_CHAINS_PARKED.fetch_add(total as u64, core::sync::atomic::Ordering::Relaxed);
+            if ctx_id != 0 && ctx_id < CTX_ID_POOL {
+                self.ctx_ids_parked[(ctx_id / 64) as usize] |= 1u64 << (ctx_id % 64);
+            }
             FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release);
             let k = CTX_FENCES_ABANDONED.fetch_add(total as u64, core::sync::atomic::Ordering::Relaxed);
             if k < 8 {
@@ -3071,12 +3144,7 @@ pub trait GpuSync {
         // Reserved before the round trip: a `GpuLocked` wait releases the
         // device lock, and a concurrent create must not pick the same id. A
         // failed create leaks the id, which is harmless.
-        let ctx_id = {
-            let d = self.dev();
-            let id = d.next_ctx_id;
-            d.next_ctx_id += 1;
-            id
-        };
+        let ctx_id = self.dev().ctx_alloc_id();
         let mut name = [0u8; 64];
         let n = debug_name.len().min(63);
         name[..n].copy_from_slice(&debug_name.as_bytes()[..n]);
@@ -3093,7 +3161,10 @@ pub trait GpuSync {
                 core::mem::size_of::<CtxCreate>(),
             )
         };
-        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)?;
+        if self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA).is_err() {
+            self.dev().ctx_free_id(ctx_id);
+            return Err(());
+        }
         Ok(ctx_id)
     }
 
@@ -3105,8 +3176,12 @@ pub trait GpuSync {
                 core::mem::size_of::<VirtioGpuCtrlHdr>(),
             )
         };
-        self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
-            .is_ok()
+        let ok = self.submit_checked(bytes, None, 64, false, VIRTIO_GPU_RESP_OK_NODATA)
+            .is_ok();
+        // The host has answered the destroy (the ctrlq is processed in
+        // order), so the id is free for the next CTX_CREATE.
+        if ok { self.dev().ctx_free_id(ctx_id); }
+        ok
     }
 
     /// RESOURCE_CREATE_BLOB.
