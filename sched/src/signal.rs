@@ -723,7 +723,7 @@ fn pgrp_has_stopped_locked(rq: &super::runqueue::RunQueue, pgid: super::task::Pi
 /// naturally ignores it. Runs with no locks held: the signals go out after
 /// the run-queue scan.
 pub(crate) fn kill_orphaned_pgrps(exiting: super::task::Pid) {
-    const MAX_GROUPS: usize = 16;
+    const MAX_GROUPS: usize = ORPHAN_MAX_GROUPS;
     let mut doomed = [0 as super::task::Pid; MAX_GROUPS];
     let mut n = 0usize;
     {
@@ -763,6 +763,58 @@ pub(crate) fn kill_orphaned_pgrps(exiting: super::task::Pid) {
         let _ = super::kill_pgrp(g, SIGHUP, crate::task::SigInfo::KERNEL);
         let _ = super::kill_pgrp(g, SIGCONT, crate::task::SigInfo::KERNEL);
     }
+}
+
+/// Bound on the groups one exit can orphan that the rule tracks.
+pub(crate) const ORPHAN_MAX_GROUPS: usize = 16;
+
+/// The child half of the orphaned-process-group rule, for `reparent_children`:
+/// each of `cands` (groups of children the dying process just handed to init)
+/// that is now orphaned and has a stopped member gets SIGHUP then SIGCONT.
+/// Runs with no locks held; takes the run queue for the scan only.
+pub(crate) fn hup_orphaned_stopped_pgrps(cands: &[super::task::Pid]) {
+    let mut doomed = [0 as super::task::Pid; ORPHAN_MAX_GROUPS];
+    let mut n = 0usize;
+    {
+        let rq = super::RUN_QUEUE.lock();
+        for &g in cands {
+            if n < doomed.len() && pgrp_has_stopped_locked(&rq, g) && pgrp_orphaned_locked(&rq, g) {
+                doomed[n] = g; n += 1;
+            }
+        }
+    }
+    for &g in &doomed[..n] {
+        let _ = super::kill_pgrp(g, SIGHUP, crate::task::SigInfo::KERNEL);
+        let _ = super::kill_pgrp(g, SIGCONT, crate::task::SigInfo::KERNEL);
+    }
+}
+
+/// A SIGKILL is on its way to the calling process: pending on any of its
+/// threads or on the group, or the group is already being torn down.
+///
+/// Linux's `fatal_signal_pending()`. A syscall that parks and retries in a
+/// loop inside the kernel — the terminal job-control stop, which this kernel
+/// runs in place because it has no syscall restart — must give up when this
+/// is true, or it never reaches the return to user space where the kill is
+/// acted on: SIGKILL resumes the stopped thread, the retry re-raises SIGTTOU
+/// and it stops again, for ever.
+pub fn fatal_signal_pending() -> bool {
+    let pid = super::current_pid();
+    if pid == 0 { return false; }
+    let bit = 1u64 << (SIGKILL - 1);
+    let rq = super::RUN_QUEUE.lock();
+    let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return false };
+    if let Some(l) = rq.find_pid(tgid) {
+        if l.shared_signal_pending & bit != 0 || l.group_exit_owner != 0 { return true; }
+    } else {
+        return true; // leader gone: the group is dying
+    }
+    for i in 0..super::runqueue::MAX_TASKS {
+        if let Some(t) = rq.get(i) {
+            if t.tgid == tgid && t.signal_pending & bit != 0 { return true; }
+        }
+    }
+    false
 }
 
 /// SIGCHLD to the parent of process `tgid` for a stop/continue, honouring

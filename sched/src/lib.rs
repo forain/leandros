@@ -563,21 +563,48 @@ pub fn init_pid() -> Pid { INIT_PID.load(Ordering::Acquire) }
 /// while the dying group's threads are still on the run queue (before the
 /// group kill reaps them), or a child forked by a non-leader thread cannot be
 /// resolved to the group any more.
+///
+/// The move also decides the orphaned-process-group rule for the children's
+/// groups (see `signal::kill_orphaned_pgrps`): once a child's `ppid` names
+/// init, nothing can tell any more that the dying process was what anchored
+/// that child's group, so the child half of the rule is evaluated here, from
+/// the moved set, and the dying process's own group is left to `exit`. Before
+/// 2026-09-26 the whole rule ran after this move and its child scan matched
+/// `ppid == exiting` — which by then was never true — so a stopped job whose
+/// shell died (jobtest's TOSTOP writer, left behind on both arches) stayed
+/// stopped for ever instead of getting SIGHUP + SIGCONT.
 fn reparent_children(dead_tgid: Pid) {
     let init = init_pid();
     if init == 0 || init == dead_tgid { return; }
-    let mut rq = RUN_QUEUE.lock();
-    let mut moved: [Pid; runqueue::MAX_TASKS] = [0; runqueue::MAX_TASKS];
-    let mut n = 0usize;
-    for i in 0..runqueue::MAX_TASKS {
-        let (pid, tgid, ppid) = match rq.get(i) { Some(t) => (t.pid, t.tgid, t.ppid), None => continue };
-        if pid != tgid || pid == dead_tgid { continue; }
-        let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
-        if parent_tgid == dead_tgid { moved[n] = pid; n += 1; }
+    let mut cands = [0 as Pid; signal::ORPHAN_MAX_GROUPS];
+    let mut nc = 0usize;
+    {
+        let mut rq = RUN_QUEUE.lock();
+        let (my_pgid, my_sid) = rq.find_pid(dead_tgid).map(|t| (t.pgid, t.sid)).unwrap_or((0, 0));
+        let mut moved: [Pid; runqueue::MAX_TASKS] = [0; runqueue::MAX_TASKS];
+        let mut n = 0usize;
+        for i in 0..runqueue::MAX_TASKS {
+            let (pid, tgid, ppid) = match rq.get(i) { Some(t) => (t.pid, t.tgid, t.ppid), None => continue };
+            if pid != tgid || pid == dead_tgid { continue; }
+            let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
+            if parent_tgid == dead_tgid { moved[n] = pid; n += 1; }
+        }
+        for &pid in &moved[..n] {
+            if let Some(t) = rq.find_pid_mut(pid) {
+                t.ppid = init;
+                // A child in the dying process's session but another group:
+                // that group may just have lost its last outside anchor.
+                if my_sid != 0 && t.sid == my_sid && t.pgid != 0 && t.pgid != my_pgid
+                    && t.state != TaskState::Zombie
+                    && !cands[..nc].contains(&t.pgid) && nc < cands.len()
+                {
+                    cands[nc] = t.pgid;
+                    nc += 1;
+                }
+            }
+        }
     }
-    for &pid in &moved[..n] {
-        if let Some(t) = rq.find_pid_mut(pid) { t.ppid = init; }
-    }
+    if nc != 0 { signal::hup_orphaned_stopped_pgrps(&cands[..nc]); }
 }
 
 pub fn current_pid() -> Pid {

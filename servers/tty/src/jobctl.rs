@@ -64,6 +64,13 @@ pub fn check(term_sid: u32, term_pgrp: u32, sig: u32) -> Verdict {
     if sched::signal::pgrp_is_orphaned(my_pgid) {
         return Verdict::Eio;
     }
+    // A SIGKILL resumed us out of the stop below: leave, so the return to
+    // user space acts on it. Retrying would re-raise the signal and park
+    // again, and the process could then never be killed while its group
+    // stays in the background (Linux: `-ERESTARTSYS` on a pending signal).
+    if sched::signal::fatal_signal_pending() {
+        return Verdict::Eintr;
+    }
     // SI_KERNEL, as for ^C: the terminal, not a process, raised this.
     let _ = sched::kill_pgrp(my_pgid, sig, sched::SigInfo::KERNEL);
     if sched::signal::stop_now_if_pending(sig) {
