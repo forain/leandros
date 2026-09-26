@@ -1685,6 +1685,8 @@ pub mod poll_class {
     pub const EVDEV:   u32 = 10;
     /// A parent parked in wait4/waitid, indexed by its tgid.
     pub const WAIT:    u32 = 11;
+    /// inotify fds: nothing produces their events, so nothing wakes this tag.
+    pub const INOTIFY: u32 = 12;
 }
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision
