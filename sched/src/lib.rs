@@ -689,6 +689,77 @@ pub fn proc_stat_of(pid: Pid) -> Option<(Pid, Pid, Pid, u8)> {
     Some((t.ppid, t.pgid, t.sid, letter))
 }
 
+// ── Per-process memory figures (/proc/<pid>/status, statm, smaps) ──────────
+
+/// Run `f` on `pid`'s address space with its `busy` flag held, and return
+/// its result plus the number of live threads in the group.
+///
+/// Unlike `with_address_space`, this is for looking at ANOTHER process,
+/// which may exit and be reaped meanwhile: the `Arc` is cloned under the
+/// run-queue lock, so the address space outlives the read whatever its
+/// owner does; `busy` then orders the read against that owner's faults and
+/// mm syscalls. `f` must not block (the usual `busy` rule).
+fn with_process_as<R>(pid: Pid, f: impl FnOnce(&mm::vmm::AddressSpace) -> R) -> Option<(R, u32)> {
+    let (as_arc, threads) = {
+        let rq = RUN_QUEUE.lock();
+        let t = rq.find_pid(pid)?;
+        let tgid = t.tgid;
+        let a = match t.address_space.as_ref() {
+            Some(a) => a.clone(),
+            None => rq.find_pid(tgid)?.address_space.as_ref()?.clone(),
+        };
+        let mut n = 0u32;
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(x) = rq.get(i) {
+                if x.tgid == tgid && x.state != TaskState::Zombie { n += 1; }
+            }
+        }
+        (a, n)
+    };
+    while as_arc.busy
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        // The holder may be waiting for this CPU's TLB flush acknowledgement.
+        mm::paging::tlb_service_pending();
+        core::hint::spin_loop();
+    }
+    let r = f(&as_arc);
+    as_arc.busy.store(false, Ordering::Release);
+    drop(as_arc);
+    Some((r, threads))
+}
+
+/// Memory totals and live thread count of process `pid` (`None`: no such
+/// task, or it has no address space — a kernel task or a reaped zombie).
+pub fn proc_mem_of(pid: Pid) -> Option<(mm::vmm::MemCounters, u32)> {
+    with_process_as(pid, |a| a.mem_counters())
+}
+
+/// `/proc/<pid>/smaps`: one `emit` per VMA, in address order.
+pub fn proc_vma_census(pid: Pid, emit: &mut dyn FnMut(&mm::vmm::VmaStat)) -> bool {
+    with_process_as(pid, |a| a.vma_census(emit)).is_some()
+}
+
+/// Pids of every process (thread-group leader, zombies included) that is
+/// `>= from`, ascending, into `out`; returns how many were written. The
+/// `/proc` directory listing.
+pub fn process_pids_from(from: Pid, out: &mut [Pid]) -> usize {
+    let mut n = 0usize;
+    {
+        let rq = RUN_QUEUE.lock();
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(t) = rq.get(i) {
+                if t.pid == t.tgid && t.pid >= from && t.pid != 0 {
+                    if n < out.len() { out[n] = t.pid; n += 1; }
+                }
+            }
+        }
+    }
+    out[..n].sort_unstable();
+    n
+}
+
 /// The thread-group id of `pid`, or `pid` itself if it's not a live task
 /// (matches every task's own fallback of being its own tgid at creation).
 // ── pid → tgid side table ────────────────────────────────────────────────────
@@ -2043,7 +2114,7 @@ pub static SC_FOCUS2_TGID: AtomicU32 = AtomicU32::new(0);
 // task layout is untouched. `sys_execve` sets it on success; a process leader's
 // exit clears it; fork inherits the parent's until the child execs; unset falls
 // back to "/bin/init" (correct for the boot-loaded PID1, which never execs).
-const MAX_EXE_PATHS: usize = 64;
+const MAX_EXE_PATHS: usize = runqueue::MAX_TASKS;
 const EXE_PATH_MAX: usize = 256;
 struct ExePathEntry { tgid: Pid, len: u16, path: [u8; EXE_PATH_MAX] }
 impl ExePathEntry {

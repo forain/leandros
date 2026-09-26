@@ -62,6 +62,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
     let mut dst = AddressSpace::new(new_page_table_root);
     dst.heap_start = src.heap_start;
     dst.heap_end   = src.heap_end;
+    dst.stack_top  = src.stack_top;
 
     dst.regions.resize(src.regions.len(), None);
 

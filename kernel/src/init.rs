@@ -407,6 +407,7 @@ fn load_and_spawn_elf(elf_data: &[u8]) -> u32 {
         PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE,
     );
     if !ok { panic!("failed to map userspace stack"); }
+    as_.stack_top = stack_top;
 
     // ── Initialize userspace stack with zeros ───────────────────────────────
     let zero = [0u8; 64];

@@ -2146,6 +2146,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
         if !as_.map(virt, len, page_flags) { return None; }
         as_.set_prot(virt, prot as u32);
+        as_.mark_file_copy(virt);
         // Retrieve the physical base of the just-created VMA.
         as_.find(virt).map(|vma| vma.phys)
     });
@@ -4108,6 +4109,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         let r = enomem_map_site("execve/user-stack");
         drop(new_as); return r;
     }
+    new_as.stack_top = USER_STACK_TOP;
 
     // Map the sigreturn trampoline page (read+exec) and fill in the
     // rt_sigreturn stub. Signal delivery points a handler's return address
