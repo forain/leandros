@@ -114,11 +114,11 @@ export COSMIC_BACKEND COSMIC_RENDER_DEVICE
 # explicit opt-in (/etc/leandros/allow-software-render), and loudly.
 . /bin/gpu-env
 COSMIC_DISABLE_SYNCOBJ=1
-# Clients (cosmic-greeter, panel, applets) are built with iced's tiny-skia
-# backend only; their widgets are CPU-drawn into shm buffers that the
-# compositor then composites (and blurs) on the GPU.
-ICED_BACKEND=tiny-skia
-export COSMIC_DISABLE_SYNCOBJ ICED_BACKEND
+# Clients (greeter, applets, launcher, settings, ...) draw their widgets with
+# iced's wgpu renderer on the same GPU path: gpu-env exports ICED_BACKEND=wgpu
+# and WGPU_BACKEND=vulkan (Venus) or gl (virgl). tiny-skia (CPU) is not a
+# fallback; it is used only on the explicit software opt-in.
+export COSMIC_DISABLE_SYNCOBJ
 
 # NOT COSMIC_DISABLE_DIRECT_SCANOUT: in smithay that clears FrameFlags::
 # ALLOW_SCANOUT, a union that INCLUDES ALLOW_CURSOR_PLANE_SCANOUT, so it

@@ -143,6 +143,26 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
         echo "gpu-env: renderer=$LEANDROS_RENDERER_PATH GL_RENDERER='$LEANDROS_GL_RENDERER'" >&2
     fi
 
+    # -- client apps (libcosmic/iced): the same GPU, through wgpu -------------
+    # The COSMIC client binaries are built with libcosmic's `wgpu` feature
+    # (ports/cosmic-wgpu/build-wgpu-clients.sh), so iced's renderer is a
+    # fallback pair: wgpu first, tiny-skia (CPU) second. ICED_BACKEND=wgpu
+    # removes the CPU half: if wgpu cannot get the GPU the app fails to
+    # start, loudly, instead of silently rasterising on the CPU.
+    # WGPU_BACKEND pins the backend to the path verified above: Vulkan on
+    # Venus (the same device zink uses), GLES through EGL on virgl.
+    # LEANDROS_ICED_BACKEND overrides (e.g. "wgpu,tiny-skia" to allow the
+    # fallback while debugging a client).
+    unset WGPU_BACKEND || true
+    case $LEANDROS_RENDERER_PATH in
+    zink)  ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu}; WGPU_BACKEND=vulkan ;;
+    virgl) ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu}; WGPU_BACKEND=gl ;;
+    *)     ICED_BACKEND=${LEANDROS_ICED_BACKEND:-tiny-skia} ;;
+    esac
+    export ICED_BACKEND
+    [ -n "${WGPU_BACKEND:-}" ] && export WGPU_BACKEND
+    echo "gpu-env: clients ICED_BACKEND=$ICED_BACKEND WGPU_BACKEND=${WGPU_BACKEND:-unset}" >&2
+
     LEANDROS_RENDERER_DECIDED=1
     export LEANDROS_RENDERER_PATH LEANDROS_GL_RENDERER LEANDROS_RENDERER_DECIDED
     unset _gpu_want _gpu_allow_sw _gpu_icd _gpu_rc _gpu_out GL_RENDERER
