@@ -10,6 +10,7 @@
 
 extern crate leandros_libc;
 use leandros_libc::*;
+use leandros_libc::syscall::{nr, syscall2, syscall3, syscall4};
 
 const PROT_READ:     i32 = 1;
 const PROT_WRITE:    i32 = 2;
@@ -19,7 +20,13 @@ const MAP_ANONYMOUS: i32 = 0x20;
 const PAGE:          usize = 4096;
 
 #[no_mangle]
-pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
+pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
+    if argc >= 2 {
+        let a = *argv.add(1);
+        if *a == b'h' && *a.add(1) == b'o' && *a.add(2) == b'g' && *a.add(3) == 0 {
+            memory_hog();
+        }
+    }
     let mut failures = 0;
 
     if !test_fork_cow_isolation() { failures += 1; }
@@ -34,6 +41,11 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_file_private_no_leak() { failures += 1; }
     if !test_file_private_survives_unlink() { failures += 1; }
     if !test_file_private_map_cost() { failures += 1; }
+    if !test_proc_rss_anon() { failures += 1; }
+    if !test_proc_rss_fork_cow() { failures += 1; }
+    if !test_proc_rss_file_lazy() { failures += 1; }
+    if !test_proc_pid_dir() { failures += 1; }
+    if !test_slab_reclaims_empty_pages() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -607,3 +619,329 @@ unsafe fn report(name: &[u8], passed: bool) -> bool {
     passed
 }
 
+
+
+// ── /proc/<pid>/status, statm, smaps_rollup accounting (2026-09-26) ─────────
+
+/// Read `path` (NUL-terminated) into `buf`; returns the byte count.
+unsafe fn slurp(path: &[u8], buf: &mut [u8]) -> usize {
+    let fd = open(path.as_ptr(), 0, 0);
+    if fd < 0 { return 0; }
+    let mut n = 0usize;
+    while n < buf.len() {
+        let r = read(fd, buf.as_mut_ptr().add(n), buf.len() - n);
+        if r <= 0 { break; }
+        n += r as usize;
+    }
+    close(fd);
+    n
+}
+
+/// `/proc/<pid>/<file>\0` (pid 0 = self) into `out`.
+fn proc_path(pid: i32, file: &[u8], out: &mut [u8; 64]) -> usize {
+    let mut p = 0;
+    for &b in b"/proc/" { out[p] = b; p += 1; }
+    if pid == 0 {
+        for &b in b"self" { out[p] = b; p += 1; }
+    } else {
+        let mut d = [0u8; 10]; let mut k = 0; let mut v = pid as u32;
+        loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+        while k > 0 { k -= 1; out[p] = d[k]; p += 1; }
+    }
+    out[p] = b'/'; p += 1;
+    for &b in file { out[p] = b; p += 1; }
+    out[p] = 0;
+    p + 1
+}
+
+fn parse_num(s: &[u8]) -> Option<usize> {
+    let mut v = 0usize; let mut any = false;
+    for &b in s {
+        if b.is_ascii_digit() { v = v * 10 + (b - b'0') as usize; any = true; }
+        else if any { break; }
+    }
+    if any { Some(v) } else { None }
+}
+
+/// Value of `key` (e.g. b"RssAnon:") in a `Key: value kB` file of `pid`.
+unsafe fn proc_kb(pid: i32, file: &[u8], key: &[u8]) -> Option<usize> {
+    let mut path = [0u8; 64];
+    proc_path(pid, file, &mut path);
+    let mut buf = [0u8; 2048];
+    let n = slurp(&path, &mut buf);
+    for line in buf[..n].split(|&b| b == b'\n') {
+        if line.starts_with(key) { return parse_num(&line[key.len()..]); }
+    }
+    None
+}
+
+/// Field `idx` (0-based) of `/proc/<pid>/statm`, in pages.
+unsafe fn statm(pid: i32, idx: usize) -> Option<usize> {
+    let mut path = [0u8; 64];
+    proc_path(pid, b"statm", &mut path);
+    let mut buf = [0u8; 128];
+    let n = slurp(&path, &mut buf);
+    buf[..n].split(|&b| b == b' ' || b == b'\n').filter(|f| !f.is_empty()).nth(idx).and_then(parse_num)
+}
+
+unsafe fn say_kb(label: &[u8], v: usize) {
+    write(STDOUT_FILENO, label.as_ptr(), label.len());
+    print_dec(v);
+}
+
+/// Mapping and touching N MiB of anonymous memory raises RssAnon (and VmRSS,
+/// statm resident) by N MiB; unmapping takes it back off while VmHWM keeps
+/// the peak. VmSize grows by the mapping as soon as it exists.
+unsafe fn test_proc_rss_anon() -> bool {
+    let name = b"proc_rss_anon\0";
+    const MIB: usize = 32;
+    const LEN: usize = MIB << 20;
+    let a0 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(usize::MAX);
+    let s0 = proc_kb(0, b"status", b"VmSize:").unwrap_or(0);
+    let p = mmap(core::ptr::null_mut(), LEN, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p as isize == -1 || a0 == usize::MAX { return report(name, false); }
+    let s1 = proc_kb(0, b"status", b"VmSize:").unwrap_or(0);
+    let mut off = 0; while off < LEN { *p.add(off) = 1; off += PAGE; }
+    let a1 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+    let rss1 = proc_kb(0, b"status", b"VmRSS:").unwrap_or(0);
+    let res1 = statm(0, 1).unwrap_or(0) * 4;
+    munmap(p, LEN);
+    let a2 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+    let hwm = proc_kb(0, b"status", b"VmHWM:").unwrap_or(0);
+    let grew = a1.saturating_sub(a0);
+    say_kb(b"  rss_anon_kib before=", a0); say_kb(b" touched=", a1); say_kb(b" unmapped=", a2);
+    say_kb(b" vmhwm=", hwm); say_kb(b" vmrss=", rss1); say_kb(b" statm_res_kib=", res1);
+    say_kb(b" vmsize_delta=", s1.saturating_sub(s0));
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    let want = MIB << 10;
+    report(name,
+        grew >= want && grew <= want + 256              // +N MiB (a little stack/heap slack)
+        && a2 <= a0 + 256                                 // and back off on munmap
+        && hwm >= a1                                      // peak kept
+        && s1.saturating_sub(s0) >= want                  // VmSize counts the whole VMA
+        && res1 + 16 >= rss1 && rss1 + 16 >= res1)       // statm agrees with status
+}
+
+/// After fork the child's RSS includes every frame it still shares with the
+/// parent (as on Linux), smaps_rollup reports them as shared with Pss about
+/// half; the child's writes (CoW copies) leave its RSS unchanged and turn the
+/// pages private. The parent reads the child's files by pid.
+unsafe fn test_proc_rss_fork_cow() -> bool {
+    let name = b"proc_rss_fork_cow\0";
+    const LEN: usize = 16 << 20;
+    let want = LEN >> 10;
+    let p = mmap(core::ptr::null_mut(), LEN, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p as isize == -1 { return report(name, false); }
+    let mut off = 0; while off < LEN { *p.add(off) = 7; off += PAGE; }
+    let mut go = [0i32; 2];
+    let mut done = [0i32; 2];
+    if syscall2(nr::PIPE2, go.as_mut_ptr() as usize, 0) != 0
+        || syscall2(nr::PIPE2, done.as_mut_ptr() as usize, 0) != 0
+    {
+        return report(name, false);
+    }
+    let pid = fork();
+    if pid == 0 {
+        let mut b = [0u8; 1];
+        let before = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+        read(go[0], b.as_mut_ptr(), 1);
+        let mut off = 0; while off < LEN { *p.add(off) = 9; off += PAGE; }
+        let after = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+        write(done[1], b.as_ptr(), 1);
+        read(go[0], b.as_mut_ptr(), 1); // parent has looked; exit
+        // CoW copies replace shared frames one for one: RSS must not move.
+        exit(if before >= want && after + 64 >= before && after <= before + 64 { 0 } else { 1 });
+    }
+    if pid < 0 { return report(name, false); }
+    let c_rss = proc_kb(pid, b"status", b"RssAnon:").unwrap_or(0);
+    let c_rss_statm = statm(pid, 1).unwrap_or(0) * 4;
+    let sh0 = proc_kb(pid, b"smaps_rollup", b"Shared_Dirty:").unwrap_or(0);
+    let pss0 = proc_kb(pid, b"smaps_rollup", b"Pss:").unwrap_or(0);
+    let rss0 = proc_kb(pid, b"smaps_rollup", b"Rss:").unwrap_or(0);
+    let b = [1u8; 1];
+    write(go[1], b.as_ptr(), 1);
+    let mut r = [0u8; 1];
+    read(done[0], r.as_mut_ptr(), 1);
+    let pd1 = proc_kb(pid, b"smaps_rollup", b"Private_Dirty:").unwrap_or(0);
+    let pss1 = proc_kb(pid, b"smaps_rollup", b"Pss:").unwrap_or(0);
+    write(go[1], b.as_ptr(), 1);
+    let mut status = 0i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    munmap(p, LEN);
+    for fd in [go[0], go[1], done[0], done[1]] { close(fd); }
+    say_kb(b"  child rss_anon_kib=", c_rss); say_kb(b" statm_res_kib=", c_rss_statm);
+    say_kb(b" rollup rss=", rss0); say_kb(b" shared=", sh0); say_kb(b" pss=", pss0);
+    say_kb(b" after_write private=", pd1); say_kb(b" pss=", pss1);
+    say_kb(b" child_status=", status as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name,
+        status == 0
+        && c_rss >= want
+        && sh0 >= want                   // the parent's frames, still shared
+        && pss0 * 10 <= rss0 * 7         // shared frames count half
+        && pd1 >= want                   // the child's own copies now
+        && pss1 >= pss0 + want / 2 - 256)
+}
+
+/// A MAP_PRIVATE file mapping is demand-paged: mapping it adds nothing to
+/// RssFile, touching 1 MiB of it adds 1 MiB.
+unsafe fn test_proc_rss_file_lazy() -> bool {
+    let name = b"proc_rss_file_lazy\0";
+    const TOUCH: usize = 1 << 20;
+    let fd = open_big_file();
+    if fd < 0 { return report(name, false); }
+    let size = file_size(fd) & !(PAGE - 1);
+    if size < 2 * TOUCH { close(fd); return report(name, false); }
+    let f0 = proc_kb(0, b"status", b"RssFile:").unwrap_or(usize::MAX);
+    let p = mmap(core::ptr::null_mut(), size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if p as isize == -1 || f0 == usize::MAX { return report(name, false); }
+    let f1 = proc_kb(0, b"status", b"RssFile:").unwrap_or(0);
+    let mut sum = 0u32;
+    let mut off = 0; while off < TOUCH { sum = sum.wrapping_add(*p.add(off) as u32); off += PAGE; }
+    let f2 = proc_kb(0, b"status", b"RssFile:").unwrap_or(0);
+    munmap(p, size);
+    let f3 = proc_kb(0, b"status", b"RssFile:").unwrap_or(0);
+    say_kb(b"  rss_file_kib before=", f0); say_kb(b" mapped=", f1); say_kb(b" touched=", f2);
+    say_kb(b" unmapped=", f3); say_kb(b" map_kib=", size >> 10); say_kb(b" sum=", sum as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    let grew = f2.saturating_sub(f1);
+    report(name,
+        f1 <= f0 + 64                               // nothing read at mmap
+        && grew >= TOUCH >> 10 && grew <= (TOUCH >> 10) + 64 // exactly what was touched (+1 fault-around window)
+        && f3 <= f0 + 64)
+}
+
+/// `/proc` lists this process, `/proc/<pid>` opens as a directory listing
+/// its files, and `openat(dirfd, "statm")` works — what bottom/procps do.
+unsafe fn test_proc_pid_dir() -> bool {
+    let name = b"proc_pid_dir\0";
+    let me = getpid();
+    let mut want = [0u8; 12]; let mut wl = 0;
+    { let mut d = [0u8; 10]; let mut k = 0; let mut v = me as u32;
+      loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+      while k > 0 { k -= 1; want[wl] = d[k]; wl += 1; } }
+    let find_in = |fd: i32, name: &[u8]| -> (bool, usize) {
+        let mut buf = [0u8; 4096];
+        let mut found = false; let mut entries = 0usize;
+        loop {
+            let n = syscall3(nr::GETDENTS64, fd as usize, buf.as_mut_ptr() as usize, buf.len());
+            if n <= 0 { break; }
+            let mut o = 0usize;
+            while o < n as usize {
+                let reclen = u16::from_le_bytes([buf[o + 16], buf[o + 17]]) as usize;
+                let nm = &buf[o + 19..o + reclen];
+                let nl = nm.iter().position(|&b| b == 0).unwrap_or(nm.len());
+                if &nm[..nl] == name { found = true; }
+                entries += 1;
+                o += reclen;
+            }
+        }
+        (found, entries)
+    };
+    let pfd = open(b"/proc\0".as_ptr(), 0, 0);
+    let (in_proc, n_proc) = if pfd >= 0 { let r = find_in(pfd, &want[..wl]); close(pfd); r } else { (false, 0) };
+    let mut dpath = [0u8; 20];
+    dpath[..6].copy_from_slice(b"/proc/");
+    dpath[6..6 + wl].copy_from_slice(&want[..wl]);
+    let dfd = open(dpath.as_ptr(), 0, 0);
+    let (has_statm, _) = if dfd >= 0 { find_in(dfd, b"statm") } else { (false, 0) };
+    let mut rss_at = 0usize;
+    if dfd >= 0 {
+        let f = syscall4(nr::OPENAT, dfd as usize, b"statm\0".as_ptr() as usize, 0, 0);
+        if f >= 0 {
+            let mut b = [0u8; 128];
+            let n = read(f as i32, b.as_mut_ptr(), b.len());
+            if n > 0 {
+                rss_at = b[..n as usize].split(|&c| c == b' ').nth(1).and_then(parse_num).unwrap_or(0);
+            }
+            close(f as i32);
+        }
+        close(dfd);
+    }
+    say_kb(b"  /proc entries=", n_proc); say_kb(b" self_listed=", in_proc as usize);
+    say_kb(b" dir_lists_statm=", has_statm as usize); say_kb(b" openat_statm_rss_pages=", rss_at);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, in_proc && has_statm && rss_at > 0)
+}
+
+/// `/proc/kmemstat` figures: pages of slab class `class`, and the running
+/// count of empty slab pages returned to the buddy allocator.
+unsafe fn slab_figures(class: usize) -> (usize, usize) {
+    static mut BUF: [u8; 32768] = [0; 32768];
+    let buf = &mut *core::ptr::addr_of_mut!(BUF);
+    let n = slurp(b"/proc/kmemstat\0", buf);
+    let (mut pages, mut reclaimed) = (0, 0);
+    for line in buf[..n].split(|&b| b == b'\n') {
+        if let Some(r) = line.strip_prefix(b"slab_reclaimed_pages ") { reclaimed = parse_num(r).unwrap_or(0); }
+        if let Some(r) = line.strip_prefix(b"slab ") {
+            let mut f = r.split(|&b| b == b' ');
+            if f.next().and_then(parse_num) == Some(class) {
+                pages = f.next().and_then(parse_num).unwrap_or(0);
+            }
+        }
+    }
+    (pages, reclaimed)
+}
+
+/// A burst of kernel heap objects must not stay charged to the slab once
+/// freed: a child maps 2000 256-KiB regions touching only the last page of
+/// each (a 64-entry, 512-byte page vector per region: ~250 pages of the
+/// 512-byte class) and exits. Afterwards the class holds at most a few
+/// pages more than before (the empty-page reserve), and the reclaim counter
+/// has moved. Until 2026-09-26 the slab never gave a page back.
+unsafe fn test_slab_reclaims_empty_pages() -> bool {
+    let name = b"slab_reclaims_empty_pages\0";
+    const REGIONS: usize = 2000;
+    const REGION: usize = 64 * PAGE;
+    let (p0, r0) = slab_figures(512);
+    let pid = fork();
+    if pid == 0 {
+        for _ in 0..REGIONS {
+            let p = mmap(core::ptr::null_mut(), REGION, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if p as isize == -1 { exit(0); }
+            *p.add(REGION - PAGE) = 1;
+        }
+        let (peak, _) = slab_figures(512);
+        exit(if peak > 0 { ((peak / 50).min(200)) as i32 } else { 0 });
+    }
+    if pid < 0 { return report(name, false); }
+    let mut status = 0i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    let (p1, r1) = slab_figures(512);
+    let peak_approx = ((status >> 8) & 0xff) as usize * 50;
+    say_kb(b"  slab512_pages before=", p0); say_kb(b" peak~", peak_approx);
+    say_kb(b" after=", p1); say_kb(b" reclaimed_delta=", r1.saturating_sub(r0));
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, p1 <= p0 + 16 && r1 >= r0 + 100 && peak_approx >= p0 + 100)
+}
+
+
+/// `memtest hog`: the memory-pressure guard's test offender. Detaches into a
+/// session of its own (off the serial login's, so init's guard may pick it)
+/// and touches 16 MiB more anonymous memory every 500 ms (32 MiB/s: slow
+/// enough for a guard that samples every 2 s and wants two low samples),
+/// forever, printing its size; init's guard should SIGKILL exactly this
+/// process.
+unsafe fn memory_hog() -> ! {
+    if fork() != 0 { exit(0); }
+    setsid();
+    let mut mib = 0usize;
+    loop {
+        let p = mmap(core::ptr::null_mut(), 16 << 20, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if p as isize != -1 {
+            let mut off = 0; while off < (16 << 20) { *p.add(off) = 1; off += PAGE; }
+            mib += 16;
+        }
+        if mib % 128 == 0 {
+            write(STDOUT_FILENO, b"hog: pid ".as_ptr(), 9); print_dec(getpid() as usize);
+            write(STDOUT_FILENO, b" holds ".as_ptr(), 7); print_dec(mib);
+            write(STDOUT_FILENO, b" MiB\n".as_ptr(), 5);
+        }
+        usleep(500_000);
+    }
+}

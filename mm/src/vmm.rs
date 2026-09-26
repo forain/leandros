@@ -185,6 +185,18 @@ pub struct AddressSpace {
     /// scheduler lock stalls every other CPU (see
     /// `sched::lock_leader_address_space`).
     pub busy: core::sync::atomic::AtomicBool,
+    /// One past the top of the main thread's stack VMA (0 = unknown), so
+    /// `/proc/<pid>/status` can report `VmStk` and keep the stack out of
+    /// `VmData`, as Linux's VM_STACK does. Set by whoever maps the stack.
+    pub stack_top: usize,
+    /// Peak resident pages (`VmHWM`) and peak mapped pages (`VmPeak`), as of
+    /// the last time either could have gone down. Linux's `hiwater_rss` /
+    /// `hiwater_vm` scheme: resident and mapped totals only ever drop in
+    /// `unmap_range` and `brk` shrink, so snapshotting there (plus the current
+    /// value at read time) yields the exact peak with nothing on the fault
+    /// path. See [`AddressSpace::mem_counters`].
+    pub hiwater_rss: usize,
+    pub hiwater_vm: usize,
 }
 
 impl Drop for AddressSpace {
@@ -240,6 +252,9 @@ impl AddressSpace {
             heap_start: 0,
             heap_end: 0,
             busy: core::sync::atomic::AtomicBool::new(false),
+            stack_top: 0,
+            hiwater_rss: 0,
+            hiwater_vm: 0,
         }
     }
 
@@ -1105,6 +1120,9 @@ impl AddressSpace {
         let len  = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let end  = match virt.checked_add(len) { Some(e) => e, None => return };
 
+        // Resident and mapped totals are about to drop: record the peaks.
+        self.update_hiwater();
+
         // After splitting at both boundaries, any VMA overlapping [virt,end) is
         // fully contained within it.
         self.split_at(virt);
@@ -1426,6 +1444,7 @@ impl AddressSpace {
             self.regions[idx].as_mut().unwrap().end = new_end;
         } else {
             // Shrink: unmap and free pages from new_end to old_end.
+            self.update_hiwater();
             let region = self.regions[idx].as_mut().unwrap();
             let heap_start = region.start; // = self.heap_start
             let old_end    = region.end;
@@ -1530,4 +1549,216 @@ fn pages_to_order(pages: usize) -> usize {
     let mut cap   = 1usize;
     while cap < pages { cap <<= 1; order += 1; }
     order
+}
+
+// ── Per-process memory accounting (/proc/<pid>/status, statm, smaps) ─────────
+//
+// Nothing here walks a page table. Every VMA already keeps an exact count of
+// the frames it maps: an eager VMA maps all of its pages, a per-page tracked
+// one keeps `lazy_count` in step with `lazy_pages` on every fault, fork,
+// split, brk shrink and unmap (the only places a frame enters or leaves a
+// VMA). A CoW promotion swaps one frame for another and leaves the count
+// alone. So the process totals are a sum over its VMAs — O(VMAs), taken
+// under the address space's `busy` flag — and a frame still shared
+// copy-on-write after fork counts once in each address space that maps it,
+// which is what Linux's RSS does too.
+
+/// Which RSS bucket a VMA's resident pages fall in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RssKind {
+    /// Device/MMIO aliasing (`map_device`): not RAM this process owns, and
+    /// not in RSS on Linux either (VM_PFNMAP).
+    None,
+    Anon,
+    File,
+    Shmem,
+}
+
+/// Memory totals of one address space, in 4 KiB pages.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MemCounters {
+    /// Mapped span of every VMA (`VmSize`).
+    pub size: usize,
+    pub rss_anon: usize,
+    pub rss_file: usize,
+    pub rss_shmem: usize,
+    /// Private writable span outside the stack (`VmData`).
+    pub data: usize,
+    /// Main-thread stack span (`VmStk`).
+    pub stk: usize,
+    /// Executable span (`VmExe`; libraries included, there is no exe/lib
+    /// split).
+    pub exe: usize,
+    /// Peak of `rss()` (`VmHWM`).
+    pub hwm: usize,
+    /// Peak of `size` (`VmPeak`).
+    pub peak: usize,
+}
+
+impl MemCounters {
+    pub fn rss(&self) -> usize { self.rss_anon + self.rss_file + self.rss_shmem }
+}
+
+/// One VMA's line in `/proc/<pid>/smaps`.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct VmaStat {
+    pub start: usize,
+    pub end: usize,
+    pub prot: u32,
+    pub shared: bool,
+    pub file_backed: bool,
+    pub file_off: u64,
+    pub is_stack: bool,
+    pub is_heap: bool,
+    /// Resident pages.
+    pub rss: usize,
+    /// Resident pages counted in the anonymous bucket.
+    pub anon: usize,
+    /// Resident pages some other owner also holds (fork CoW, shared memory).
+    pub shared_pages: usize,
+    /// Proportional set size in bytes: each frame's 4 KiB divided by the
+    /// number of its owners.
+    pub pss_bytes: usize,
+}
+
+/// `map_flags` bit (kernel-private, like [`MAP_EOF_SIGBUS`]): an eager VMA
+/// holding a *copy* of file data (mmap's non-f2fs / MAP_SHARED f2fs path).
+/// Only accounting reads it: such pages are `RssFile`, not `RssAnon`.
+pub const MAP_FILE_COPY: u32 = 1 << 29;
+
+impl VmaRegion {
+    fn pages(&self) -> usize { (self.end - self.start) / PAGE_SIZE }
+
+    /// Frames this VMA maps.
+    pub fn resident_pages(&self) -> usize {
+        if self.file_cap == usize::MAX { 0 }
+        else if self.lazy { self.lazy_count }
+        else if self.phys != 0 { self.pages() }
+        else { 0 }
+    }
+
+    pub fn rss_kind(&self) -> RssKind {
+        if self.file_cap == usize::MAX { RssKind::None }
+        else if self.map_flags & MAP_SHARED != 0 { RssKind::Shmem }
+        else if is_file_backed(self.file_cap) || self.map_flags & MAP_FILE_COPY != 0 { RssKind::File }
+        else { RssKind::Anon }
+    }
+
+    /// Split of `resident_pages()` into (file, anon). A file-backed VMA's
+    /// pages past its file extent are the ELF segment's BSS — anonymous
+    /// memory on Linux too — so only that tail is walked, never the file
+    /// part. Written private file pages stay `file` here (no dirty tracking).
+    fn file_anon_split(&self) -> (usize, usize) {
+        let n = self.resident_pages();
+        if !is_file_backed(self.file_cap) || !self.lazy { return (n, 0); }
+        let file_pages = ((self.file_len as usize) + PAGE_SIZE - 1) / PAGE_SIZE;
+        if file_pages >= self.pages() { return (n, 0); }
+        let bss = self.lazy_pages.iter().skip(file_pages).filter(|&&p| p != 0).count();
+        (n - bss.min(n), bss.min(n))
+    }
+}
+
+impl AddressSpace {
+    fn is_stack_vma(&self, r: &VmaRegion) -> bool {
+        self.stack_top != 0 && r.start < self.stack_top && self.stack_top <= r.end
+    }
+
+    /// (resident, mapped) page totals — the cheap part of `mem_counters`.
+    fn totals(&self) -> (usize, usize) {
+        let mut rss = 0; let mut size = 0;
+        for r in self.regions.iter().filter_map(|r| r.as_ref()) {
+            size += r.pages();
+            rss += r.resident_pages();
+        }
+        (rss, size)
+    }
+
+    /// Record `VmHWM`/`VmPeak` before something lowers them.
+    pub fn update_hiwater(&mut self) {
+        let (rss, size) = self.totals();
+        if rss > self.hiwater_rss { self.hiwater_rss = rss; }
+        if size > self.hiwater_vm { self.hiwater_vm = size; }
+    }
+
+    /// Mark the eager VMA starting at `virt` as a copy of file data (see
+    /// [`MAP_FILE_COPY`]).
+    pub fn mark_file_copy(&mut self, virt: usize) {
+        let virt = virt & !(PAGE_SIZE - 1);
+        if let Some(r) = self.regions.iter_mut().filter_map(|r| r.as_mut())
+            .find(|r| r.start == virt)
+        {
+            r.map_flags = (r.map_flags & !MAP_ANONYMOUS) | MAP_FILE_COPY;
+        }
+    }
+
+    /// Process memory totals for `/proc/<pid>/status` and `statm`.
+    pub fn mem_counters(&self) -> MemCounters {
+        let mut c = MemCounters::default();
+        for r in self.regions.iter().filter_map(|r| r.as_ref()) {
+            let span = r.pages();
+            c.size += span;
+            let stack = self.is_stack_vma(r);
+            if stack { c.stk += span; }
+            else if r.map_flags & MAP_SHARED == 0 && r.prot & PROT_WRITE != 0
+                && r.file_cap != usize::MAX
+            {
+                c.data += span;
+            }
+            if r.prot & PROT_EXEC != 0 && r.prot & PROT_WRITE == 0 { c.exe += span; }
+            match r.rss_kind() {
+                RssKind::None  => {}
+                RssKind::Anon  => c.rss_anon += r.resident_pages(),
+                RssKind::Shmem => c.rss_shmem += r.resident_pages(),
+                RssKind::File  => {
+                    let (f, a) = r.file_anon_split();
+                    c.rss_file += f;
+                    c.rss_anon += a;
+                }
+            }
+        }
+        c.hwm = self.hiwater_rss.max(c.rss());
+        c.peak = self.hiwater_vm.max(c.size);
+        c
+    }
+
+    /// Per-VMA figures for `/proc/<pid>/smaps`, in address order. This one
+    /// does visit every resident frame (its owner count is what `Pss` and
+    /// `Shared_*` are made of), so it is for smaps only.
+    pub fn vma_census(&self, emit: &mut dyn FnMut(&VmaStat)) {
+        let mut order: Vec<(usize, usize)> = self.regions.iter().enumerate()
+            .filter_map(|(i, r)| r.as_ref().map(|r| (r.start, i))).collect();
+        order.sort_unstable();
+        for (_, i) in order {
+            let r = match self.regions[i].as_ref() { Some(r) => r, None => continue };
+            let kind = r.rss_kind();
+            let mut st = VmaStat {
+                start: r.start, end: r.end, prot: r.prot,
+                shared: r.map_flags & MAP_SHARED != 0,
+                file_backed: is_file_backed(r.file_cap) || r.map_flags & MAP_FILE_COPY != 0,
+                file_off: r.file_off,
+                is_stack: self.is_stack_vma(r),
+                is_heap: self.heap_start != 0 && r.start == self.heap_start,
+                ..VmaStat::default()
+            };
+            if kind != RssKind::None {
+                st.rss = r.resident_pages();
+                st.anon = match kind {
+                    RssKind::Anon => st.rss,
+                    RssKind::File => r.file_anon_split().1,
+                    _ => 0,
+                };
+                if r.lazy {
+                    for &phys in r.lazy_pages.iter() {
+                        if phys == 0 { continue; }
+                        let owners = crate::pageref::get(phys).max(1) as usize;
+                        if owners > 1 { st.shared_pages += 1; }
+                        st.pss_bytes += PAGE_SIZE / owners;
+                    }
+                } else {
+                    st.pss_bytes = st.rss * PAGE_SIZE; // eager: never shared
+                }
+            }
+            emit(&st);
+        }
+    }
 }

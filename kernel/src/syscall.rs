@@ -2146,6 +2146,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
         if !as_.map(virt, len, page_flags) { return None; }
         as_.set_prot(virt, prot as u32);
+        as_.mark_file_copy(virt);
         // Retrieve the physical base of the just-created VMA.
         as_.find(virt).map(|vma| vma.phys)
     });
@@ -2787,6 +2788,7 @@ fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> 
     const PR_GET_NAME: usize = 16;
     const PR_SET_DUMPABLE: usize = 4;
     const PR_GET_DUMPABLE: usize = 3;
+    const PR_GET_AUXV: usize = 0x4155_5856; // "AUXV"
     match option {
         PR_SET_NAME => 0,
         PR_GET_NAME => {
@@ -2799,6 +2801,11 @@ fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> 
         }
         PR_SET_DUMPABLE => 0,
         PR_GET_DUMPABLE => 1,
+        // PR_GET_AUXV (Linux 6.4): EINVAL, as on older kernels. Answering 0
+        // ("success, 0 bytes") made rustix take an EMPTY aux vector as the
+        // real one, so its page_size() was 0 and bottom showed every
+        // process's memory as 0 B. On EINVAL it reads /proc/self/auxv.
+        PR_GET_AUXV => -22,
         _ => 0, // silently accept anything else
     }
 }
@@ -4108,6 +4115,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         let r = enomem_map_site("execve/user-stack");
         drop(new_as); return r;
     }
+    new_as.stack_top = USER_STACK_TOP;
 
     // Map the sigreturn trampoline page (read+exec) and fill in the
     // rt_sigreturn stub. Signal delivery points a handler's return address
