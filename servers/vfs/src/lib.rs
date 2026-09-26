@@ -3402,6 +3402,7 @@ fn gen_kmemstat() -> Option<VnodeKind> {
             w.s(" "); w.i(live); w.s(" "); w.i(peak); w.s("\n");
         });
         w.s("site_sum "); w.i(sum);
+        w.s("\nslab_reclaimed_pages "); w.i(mm::slab::reclaimed_pages() as isize);
         w.s("\nfields slab class_bytes pages live_objs\n");
         mm::slab::class_census(&mut |c, pages, live| {
             w.s("slab "); w.i(c as isize); w.s(" "); w.i(pages as isize); w.s(" "); w.i(live); w.s("\n");
