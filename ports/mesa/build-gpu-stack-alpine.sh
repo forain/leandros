@@ -40,7 +40,7 @@ esac
   apk add --no-cache build-base meson samurai bison flex python3 py3-mako \
     py3-packaging py3-yaml libdrm-dev wayland-dev wayland-protocols \
     expat-dev zlib-dev zstd-dev linux-headers pkgconf patchelf file \
-    vulkan-headers vulkan-loader
+    vulkan-headers vulkan-loader patch
   apk add --no-cache -X https://dl-cdn.alpinelinux.org/alpine/edge/main --allow-untrusted \
     libdisplay-info=0.3.0-r1 libdisplay-info-dev=0.3.0-r1
   cc -fPIC -fno-stack-protector -c /src/ssp_guard.c -o /tmp/ssp_guard.o
@@ -48,9 +48,15 @@ esac
   if [ "$MODE" = probe ]; then
     rm -rf "$S"; mkdir -p "$S"; cp -a "/out/gpu-stage-$ARCH/." "$S/"
   else
+  # Patches from ports/mesa/patches go onto a private copy of the tree.
+  MESA=/work/mesa
+  if ls /src/patches/*.patch >/dev/null 2>&1; then
+    rm -rf /tmp/mesa-src; cp -a /work/mesa /tmp/mesa-src; MESA=/tmp/mesa-src
+    for p in /src/patches/*.patch; do echo "applying $p"; patch -d "$MESA" -p1 < "$p"; done
+  fi
   B=/tmp/build-gpu-$ARCH
   rm -rf "$B"
-  meson setup "$B" /work/mesa --prefix=/usr --buildtype=release --wrap-mode=nodownload \
+  meson setup "$B" "$MESA" --prefix=/usr --buildtype=release --wrap-mode=nodownload \
     -Dplatforms=wayland -Dlegacy-wayland=bind-wayland-display \
     -Degl=enabled -Dgles2=enabled -Dgbm=enabled -Dopengl=true \
     -Dglx=disabled -Dgallium-drivers=$DRIVERS -Dvulkan-drivers=virtio \

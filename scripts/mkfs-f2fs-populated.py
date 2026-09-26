@@ -591,6 +591,11 @@ def main():
     # has no GPU renderer and /bin/gpu-env refuses to start COSMIC — say so
     # here, at build time, rather than on a black screen.
     gpu_stage = f"{gl_root}/gpu-stage-{arch}"
+    # LEANDROS_GPU_STAGE=<dir> (containing gpu-stage-<arch>/) tests a rebuilt
+    # ship-set without replacing the shared one.
+    if os.environ.get("LEANDROS_GPU_STAGE"):
+        gpu_stage = os.path.join(os.path.expanduser(os.environ["LEANDROS_GPU_STAGE"]), f"gpu-stage-{arch}")
+        print(f"  GPU ship-set override: {gpu_stage}")
     gpu_lib_dir = f"{gpu_stage}/usr/lib"
     if not os.path.exists(f"{gpu_lib_dir}/libgallium-25.3.6.so"):
         print(f"⚠️  no GPU Mesa ship-set at {gpu_stage} — COSMIC will have NO GPU "
