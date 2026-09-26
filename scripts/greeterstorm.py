@@ -3,6 +3,7 @@
 memory each death costs.
 
 usage: greeterstorm.py <arch> <deaths> [--settle S] [--first S] [--keep] [--tag T]
+                       [--venus|--virgl] [--attach]
 
 Boots the default graphical login (greetd -> cosmic-comp -> cosmic-greeter),
 logs in as root on the serial console and then, per death:
@@ -134,7 +135,13 @@ def median_sample(recs):
             "procs": recs[-1]["procs"], "km": km}
 
 if "--attach" not in args:
-    driver.cmd_start(ARCH)
+    # The greeter only starts on a GPU path (gpu-env refuses software
+    # rendering), so boot with the device --venus/--virgl or LEANDROS_GPU asks
+    # for; with neither, the chain exits 78 and there is nothing to kill.
+    gpu = driver._gpu_request(args)
+    if gpu is None:
+        log("WARNING: no --venus/--virgl/LEANDROS_GPU: the greeter will refuse to start")
+    driver.cmd_start(ARCH, venus=(gpu == "venus"), virgl=(gpu == "virgl"))
     driver.cmd_login("root", "root")
 log(f"booted; first settle {FIRST}s")
 time.sleep(FIRST)

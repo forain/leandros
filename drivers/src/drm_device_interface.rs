@@ -3162,18 +3162,36 @@ fn v3d_fence_done(fence: u64) -> bool {
 //   * `drm_tick()`, the 100 Hz tick hook, at most one per tick — the fallback
 //     for an unfenced entry (a commit that moved no pixels, delivered on the
 //     next tick as before) and for a fenced one the host has not answered
-//     within `FLIP_FALLBACK_TICKS` (a lost interrupt, or a present slower
+//     within `FLIP_FALLBACK_NS` (a lost interrupt, or a present slower
 //     than that: the event then says "done" before the pixels are, which is
 //     what every flip event said before the fence existed).
 // Either way delivery is in queue order. This gives Smithay/kmscube a stable
 // frame cadence and keeps idle CPU at zero (idletest guards it).
 //
-// Entry: (event bytes, present fence or 0, tick queued at).
+// Entry: (event bytes, present fence or 0, ns queued at).
+//
+// The queued-at timestamp is `arch_monotonic_ns()`, NOT `sched::ticks()`.
+// This one used to be tick-counted, like every other deadline before the
+// `monotonic_ns` fix (see its doc comment: "Deadlines used to be tick
+// counts: ... floored to whole ticks ... released ... up to 10 ms before the
+// requested interval had elapsed" — the same class as the FUTEX_WAIT_BITSET
+// and timerfd ABSTIME bugs). A tick count sampled at an arbitrary phase
+// within the 10 ms period means `now - queued >= 2` can go true as little as
+// just over ONE tick period after queuing, not two: queue right after a tick
+// increments, and the counter only needs to advance twice more. Measured on
+// real virgl/iris hardware (not softpipe), present latency of ~13-15 ms is
+// comfortably under a true 20 ms grace but sometimes loses that race against
+// the quantized ~10-20 ms one, so `FLIP_EVENT_DELIVERED_ON_FENCE` (drmsmoke)
+// flaked intermittently (wave 2026-09-24, lane/drmflake) even though every
+// flip was delivered and nothing hung, timed out, or lost an interrupt. Using
+// the free-running clock instead gives every entry the full, real grace
+// period regardless of phase.
 static PENDING_FLIPS: Mutex<VecDeque<([u8; 32], u64, u64)>> = Mutex::new(VecDeque::new());
-/// Ticks a fenced flip may wait for its fence before the tick delivers it
-/// anyway. Two ticks: one is the poller's own reap latency when no interrupt
-/// is armed, so one would make the fallback race the poller it backs up.
-const FLIP_FALLBACK_TICKS: u64 = 2;
+/// Nanoseconds a fenced flip may wait for its fence before the tick delivers
+/// it anyway: two full 100 Hz tick periods (10 ms each). One tick's worth is
+/// the poller's own reap latency when no interrupt is armed, so one would
+/// make the fallback race the poller it backs up.
+const FLIP_FALLBACK_NS: u64 = 2 * 10_000_000;
 static READY_EVENTS:  Mutex<VecDeque<[u8; 32]>> = Mutex::new(VecDeque::new());
 static FLIP_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static LAST_FLIP_DELIVER_TICK: AtomicU64 = AtomicU64::new(0);
@@ -3244,7 +3262,7 @@ fn queue_flip_event(crtc_id: u32, user_data: u64, fence: u64) {
     };
     let mut blob = [0u8; 32];
     unsafe { ptr::copy_nonoverlapping(&ev as *const _ as *const u8, blob.as_mut_ptr(), 32); }
-    PENDING_FLIPS.lock().push_back((blob, fence, sched::ticks()));
+    PENDING_FLIPS.lock().push_back((blob, fence, now_ns));
 }
 
 /// Promote every pending flip, in order, whose present the host has retired.
@@ -3527,8 +3545,15 @@ pub fn drm_tick() {
     // fence has gone unanswered for the fallback window; a fenced one inside
     // the window belongs to `flip_fence_service`, which ran just above through
     // `ctrlq_tick` if the fence retired.
+    //
+    // Compared on `arch_monotonic_ns()`, NOT the tick counter `now` above —
+    // see the note on `PENDING_FLIPS`'s entry shape. A tick-count comparison
+    // here let the fallback fire after as little as one real tick period
+    // instead of the intended two, occasionally racing ahead of a real (not
+    // lost) fence retirement under real GPU present latency.
+    let now_ns = unsafe { arch_monotonic_ns() };
     let tick_due = match pend.front() {
-        Some(&(_, f, queued)) => f == 0 || now.wrapping_sub(queued) >= FLIP_FALLBACK_TICKS,
+        Some(&(_, f, queued)) => f == 0 || now_ns.wrapping_sub(queued) >= FLIP_FALLBACK_NS,
         None => false,
     };
     if !tick_due { return; }
