@@ -2788,6 +2788,7 @@ fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> 
     const PR_GET_NAME: usize = 16;
     const PR_SET_DUMPABLE: usize = 4;
     const PR_GET_DUMPABLE: usize = 3;
+    const PR_GET_AUXV: usize = 0x4155_5856; // "AUXV"
     match option {
         PR_SET_NAME => 0,
         PR_GET_NAME => {
@@ -2800,6 +2801,11 @@ fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> 
         }
         PR_SET_DUMPABLE => 0,
         PR_GET_DUMPABLE => 1,
+        // PR_GET_AUXV (Linux 6.4): EINVAL, as on older kernels. Answering 0
+        // ("success, 0 bytes") made rustix take an EMPTY aux vector as the
+        // real one, so its page_size() was 0 and bottom showed every
+        // process's memory as 0 B. On EINVAL it reads /proc/self/auxv.
+        PR_GET_AUXV => -22,
         _ => 0, // silently accept anything else
     }
 }
