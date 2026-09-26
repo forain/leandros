@@ -11,7 +11,7 @@
 # greetd sources this via `source_profile = true`, which wraps the session
 # command in `sh -c '[ -f /etc/profile ] && . /etc/profile; ... exec <cmd>'`.
 # It applies to the greeter session and to the user session alike, which is
-# correct — both are COSMIC on the same software-rendered GPU.
+# correct — both are COSMIC on the same GPU path (see /bin/gpu-env).
 #
 # POSIX sh only: /bin/sh is brush. No bashisms.
 
@@ -105,13 +105,20 @@ COSMIC_BACKEND=kms
 COSMIC_RENDER_DEVICE=226:0
 export COSMIC_BACKEND COSMIC_RENDER_DEVICE
 
-# ---- renderer: software everywhere -----------------------------------------
-# No hardware GL on the guest: GBM hands out software buffers and the toolkit
-# uses the CPU rasteriser.
-GBM_ALWAYS_SOFTWARE=1
+# ---- renderer: the GPU, verified — never a silent software fallback -------
+# /bin/gpu-env probes card0 (Venus / virgl capsets), brings up a real GBM+EGL
+# context the way cosmic-comp will, and exports the driver selection for the
+# path that produced a HARDWARE GL_RENDERER: zink (GL on Vulkan over Venus)
+# first, virgl second. With neither, LEANDROS_RENDERER_PATH=refused and the
+# session command is NOT run — see the end of this file. softpipe only with an
+# explicit opt-in (/etc/leandros/allow-software-render), and loudly.
+. /bin/gpu-env
 COSMIC_DISABLE_SYNCOBJ=1
+# Clients (cosmic-greeter, panel, applets) are built with iced's tiny-skia
+# backend only; their widgets are CPU-drawn into shm buffers that the
+# compositor then composites (and blurs) on the GPU.
 ICED_BACKEND=tiny-skia
-export GBM_ALWAYS_SOFTWARE COSMIC_DISABLE_SYNCOBJ ICED_BACKEND
+export COSMIC_DISABLE_SYNCOBJ ICED_BACKEND
 
 # NOT COSMIC_DISABLE_DIRECT_SCANOUT: in smithay that clears FrameFlags::
 # ALLOW_SCANOUT, a union that INCLUDES ALLOW_CURSOR_PLANE_SCANOUT, so it
@@ -143,4 +150,15 @@ export RUST_LOG RUST_BACKTRACE
 # wrapper greetd `exec`s the session command from, it is the last point that
 # can say so — and the marker landing followed by nothing else localises the
 # failure to the exec itself.
-echo "profile: session starting, uid=$(/bin/id -u) XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >&2
+echo "profile: session starting, uid=$(/bin/id -u) XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR renderer=$LEANDROS_RENDERER_PATH" >&2
+
+# ---- no GPU renderer: do not start a compositor ----------------------------
+# greetd runs the session command right after this file returns, so this is
+# the last point that can stop it. `exit` here ends greetd's wrapper shell;
+# greetd sees the greeter session die and exits, and init (which already
+# refused in greeter-real before starting greetd in the normal case) reports
+# it on the console.
+if [ "$LEANDROS_RENDERER_PATH" = refused ]; then
+    echo "profile: refusing to start a software-rendered COSMIC session" >&2
+    exit 78
+fi

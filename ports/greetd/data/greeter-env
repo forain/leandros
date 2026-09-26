@@ -89,11 +89,12 @@ COSMIC_BACKEND=kms
 COSMIC_RENDER_DEVICE=226:0
 export COSMIC_BACKEND COSMIC_RENDER_DEVICE
 
-# ---- renderer: software everywhere ------------------------------------------
-GBM_ALWAYS_SOFTWARE=1
+# ---- renderer: the GPU, verified (see /bin/gpu-env) -------------------------
+# Callers check LEANDROS_RENDERER_PATH and refuse to start on "refused".
+. /bin/gpu-env
 COSMIC_DISABLE_SYNCOBJ=1
 ICED_BACKEND=tiny-skia
-export GBM_ALWAYS_SOFTWARE COSMIC_DISABLE_SYNCOBJ ICED_BACKEND
+export COSMIC_DISABLE_SYNCOBJ ICED_BACKEND
 
 # NOT COSMIC_DISABLE_DIRECT_SCANOUT: in smithay that clears FrameFlags::
 # ALLOW_SCANOUT, a union that INCLUDES ALLOW_CURSOR_PLANE_SCANOUT, so it

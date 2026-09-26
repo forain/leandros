@@ -115,6 +115,37 @@ list, not just first.
 
 This is useless headless and blocks the terminal; use the agent path above.
 
+### GPU path (COSMIC never renders in software)
+
+`run-qemu.sh` picks the GPU device by default (`--gpu auto`): Venus
+(`venus=on`, guest renders through zink) where the host QEMU/virglrenderer
+supports it, virgl where only GL passthrough exists, nothing otherwise
+(macOS Homebrew QEMU has no virglrenderer — it prints a warning). Override
+with `--venus`, `--virgl`, `--no-gpu` or `LEANDROS_GPU=auto|venus|virgl|none`.
+
+**Mac GPU QEMU.** `scripts/mac-qemu-gpu/build.sh` builds QEMU 11.1.1 + HVF +
+virglrenderer on ANGLE/Metal into `~/.local/qemu-gpu` (about 10 min, no Xcode
+needed). Both `run-qemu.sh` and `driver.py` use it automatically when it is
+present (`LEANDROS_QEMU_PREFIX=<prefix>` overrides this on any host), and
+`--gpu auto` then resolves to virgl. The guest reports `virgl (ANGLE (Apple,
+ANGLE Metal Renderer: Apple M…))`. The display is `egl-headless` plus VNC
+(`run-qemu.sh` prints the `vnc://` URL, and `LEANDROS_VNC` moves it).
+`driver.py start aarch64 --virgl` (or `LEANDROS_GPU=virgl`) does the same.
+`driver.py screenshot` then grabs over VNC (`LEANDROS_VNC_PORT`, default 5909),
+because `screendump` has no surface for a GL scanout. Venus on the Mac is only
+an experimental extra stage and does not work yet (see the script).
+
+In the guest, `/bin/gpu-env` (sourced by `/etc/profile`, `greeter-real`,
+`start-cosmic-leandros`) verifies a hardware `GL_RENDERER` with
+`/bin/gpuprobe gl` before any compositor starts. No GPU renderer ⇒ the
+graphical login is **not started**, init prints a `NO GPU RENDERER` banner on
+serial, and `start-cosmic-leandros` exits 78. The serial login is unaffected,
+so **`driver.py start` without `--venus` is the headless-test path** (plain
+virtio-gpu, no greeter burning CPU). softpipe is explicit opt-in only:
+`touch /etc/leandros/allow-software-render` (or `LEANDROS_RENDERER=software`).
+The Mesa ship-set comes from `ports/mesa/build-gpu-stack.sh <arch>`
+(→ `leandros-artifacts/m3-gl-stack/gpu-stage-<arch>`); mkfs warns if it is absent.
+
 ## Build
 
 ```sh

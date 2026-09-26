@@ -47,6 +47,16 @@ extern "C" {
     /// Arch-provided: broadcast TLB invalidation for all user-space entries to
     /// all CPUs (inner-shareable TLBI on AArch64; CR3 reload on x86-64).
     fn arch_tlb_shootdown_all();
+    /// Arch-provided: invalidate `pages` pages at `va` of the address space
+    /// rooted at `root` (`usize::MAX` pages: all of it) on every CPU that may
+    /// cache them. x86-64: local `invlpg` + an IPI only to CPUs with `root`
+    /// in CR3; AArch64: broadcast `tlbi vaae1is`.
+    fn arch_tlb_flush_range(root: usize, va: usize, pages: usize);
+    /// Arch-provided: invalidate one page on this CPU only.
+    fn arch_tlb_flush_local_page(va: usize);
+    /// Arch-provided: perform a flush another CPU requested of this one
+    /// (x86-64; no-op on AArch64). Called from IRQ-masked spin loops.
+    fn arch_tlb_service_pending();
     /// Arch-provided: free every intermediate page-table node below the user
     /// root `page_table_root` (not the root itself, never the kernel's shared
     /// nodes). Returns the number of 4 KiB table pages released.
@@ -80,6 +90,33 @@ pub fn tlb_shootdown_all() {
     unsafe { arch_tlb_shootdown_all(); }
 }
 
+/// Invalidate `[va, va + pages * 4 KiB)` of the address space rooted at
+/// `root` on every CPU that may cache it — only those (x86-64 tracks which
+/// CPUs have which root loaded). Waits, bounded, for remote completion.
+pub fn tlb_flush_range(root: usize, va: usize, pages: usize) {
+    if pages == 0 { return; }
+    unsafe { arch_tlb_flush_range(root, va, pages); }
+}
+
+/// Invalidate every user translation of the address space rooted at `root`
+/// on every CPU that may cache it.
+pub fn tlb_flush_as(root: usize) {
+    unsafe { arch_tlb_flush_range(root, 0, usize::MAX); }
+}
+
+/// Invalidate one page on this CPU only.
+pub fn tlb_flush_local_page(va: usize) {
+    unsafe { arch_tlb_flush_local_page(va); }
+}
+
+/// Perform any TLB flush another CPU is waiting for on this one. Spin loops
+/// that run with IRQs masked call this so a shootdown initiator is not left
+/// waiting on a CPU that is waiting on it.
+#[inline]
+pub fn tlb_service_pending() {
+    unsafe { arch_tlb_service_pending(); }
+}
+
 pub fn get_current_root() -> usize {
     unsafe { arch_get_current_root() }
 }
@@ -104,4 +141,46 @@ pub unsafe fn map_kernel_device(phys: usize, size: usize, flags: PageFlags) -> O
         }
     }
     Some(virt)
+}
+
+/// TLB-maintenance and CoW-promotion counters (always on: relaxed atomics).
+/// Printed as a `[TLBSTAT]` delta line every 10 s by the BSP's timer tick
+/// when there was activity (`sched::tlbstat_tick`).
+pub mod tlbstat {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Cross-CPU flush requests (every shootdown call, targeted or not).
+    pub static FLUSHES: AtomicU64 = AtomicU64::new(0);
+    /// Flush requests that needed at least one remote CPU (x86: an IPI).
+    pub static REMOTE_FLUSHES: AtomicU64 = AtomicU64::new(0);
+    /// Shootdown IPIs sent (a broadcast counts once per target CPU).
+    pub static IPIS: AtomicU64 = AtomicU64::new(0);
+    /// Time initiators spent waiting for remote acknowledgements.
+    pub static WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WAIT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+    /// Waits that gave up before every target acknowledged.
+    pub static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+    /// Flush requests a lock spinner serviced itself (x86).
+    pub static SERVICED: AtomicU64 = AtomicU64::new(0);
+    /// CoW promotions that copied the page (frame changed), with cost.
+    pub static COW_COPY: AtomicU64 = AtomicU64::new(0);
+    pub static COW_COPY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COW_COPY_MAX_NS: AtomicU64 = AtomicU64::new(0);
+    /// CoW promotions that reused the frame in place (sole owner).
+    pub static COW_REUSE: AtomicU64 = AtomicU64::new(0);
+    /// execve: argv/envp prefault + collection, per call.
+    pub static EXEC_PRE: AtomicU64 = AtomicU64::new(0);
+    pub static EXEC_PRE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static EXEC_PRE_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" { fn arch_monotonic_ns() -> u64; }
+
+    #[inline]
+    pub fn now_ns() -> u64 { unsafe { arch_monotonic_ns() } }
+
+    #[inline]
+    pub fn add(total: &AtomicU64, max: &AtomicU64, ns: u64) {
+        total.fetch_add(ns, Relaxed);
+        max.fetch_max(ns, Relaxed);
+    }
 }

@@ -2720,6 +2720,27 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
 /// scan; `MAX_OPEN_FILES` is small.
 fn ino_is_open(ms: &MountState, ino: u32) -> bool {
     ms.open_files.iter().any(|f| f.in_use && f.inode == ino)
+        || MMAP_PINS.lock().iter().any(|&(port, i)| port == ms.port && i == ino)
+}
+
+/// Inodes pinned by the kernel's private file mappings (`pin_inode`): a
+/// mapping outlives the descriptor it was made from, and its pages are read
+/// on first touch, so the inode must survive an unlink/rename-over exactly as
+/// an open descriptor makes it. One entry per mapped inode (the kernel
+/// dedups and refcounts); lock order: taken inside F2FS_MOUNTS, never around it.
+static MMAP_PINS: Mutex<alloc::vec::Vec<(u32, u32)>> = Mutex::new(alloc::vec::Vec::new());
+
+/// Pin inode `ino` of the mount on `port` against reclaim (see MMAP_PINS).
+pub fn pin_inode(port: u32, ino: u32) {
+    MMAP_PINS.lock().push((port, ino));
+}
+
+/// Drop one pin taken by `pin_inode`.
+pub fn unpin_inode(port: u32, ino: u32) {
+    let mut pins = MMAP_PINS.lock();
+    if let Some(i) = pins.iter().position(|&(p, n)| p == port && n == ino) {
+        pins.swap_remove(i);
+    }
 }
 
 /// symlink(target, linkpath) — create a symlink inode holding `target` as its
@@ -3900,6 +3921,36 @@ pub fn pread_by_port(port: u32, file_id: u64, dst: *mut u8, len: usize, pos: u64
                     return -9; // EBADF
                 }
                 let ino = ms.open_files[idx].inode;
+                return read_file_data(ms, ino, pos, dst, len) as isize;
+            }
+        }
+    }
+    -9 // EBADF — no mount on this port
+}
+
+/// Inode behind open-file slot `file_id` on the mount at `port`.
+pub fn inode_by_port(port: u32, file_id: u64) -> Option<u32> {
+    let mounts = F2FS_MOUNTS.lock();
+    for slot in mounts.iter() {
+        if let Some(ref ms) = slot {
+            if ms.port == port {
+                let idx = file_id as usize;
+                if idx >= MAX_OPEN_FILES || !ms.open_files[idx].in_use { return None; }
+                return Some(ms.open_files[idx].inode);
+            }
+        }
+    }
+    None
+}
+
+/// Positional read by inode, for the kernel's private file mappings: the
+/// mapping holds no descriptor (it outlives the one it was made from), only
+/// a `pin_inode` pin. Same contract as `pread_by_port`; short at EOF.
+pub fn pread_ino_by_port(port: u32, ino: u32, dst: *mut u8, len: usize, pos: u64) -> isize {
+    let mut mounts = F2FS_MOUNTS.lock();
+    for slot in mounts.iter_mut() {
+        if let Some(ref mut ms) = slot {
+            if ms.port == port {
                 return read_file_data(ms, ino, pos, dst, len) as isize;
             }
         }

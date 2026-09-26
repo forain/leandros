@@ -17,6 +17,16 @@ set -u
 
 . /bin/greeter-env
 
+# No hardware GL renderer: do not start greetd at all. Exit status 78
+# (EX_CONFIG) tells init this is a configuration refusal, not a crash — it
+# prints the reason on the serial console once and stops respawning, so a
+# headless test boot gets its serial login without a fork storm.
+if [ "$LEANDROS_RENDERER_PATH" = refused ]; then
+    echo "GREETER-REAL: no GPU renderer (card0=${GPU_DRM_NAME:-none} venus=$GPU_VENUS virgl=$GPU_VIRGL); not starting greetd" >&2
+    exit 78
+fi
+echo "GREETER-REAL: renderer=$LEANDROS_RENDERER_PATH GL_RENDERER='$LEANDROS_GL_RENDERER'"
+
 # No passwd role switch — see greeter-fake. greetd's default_session.user stays
 # "root" so cosmic-comp keeps its privileges; /bin/greeter-launch, the kiosk
 # child named in greetd.conf, is what drops to uid 990.

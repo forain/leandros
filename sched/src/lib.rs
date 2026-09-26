@@ -2536,6 +2536,54 @@ fn watchdog_scan(me: usize) {
     }
 }
 
+/// Emit the periodic `[TLBSTAT]` line. Off by default: raw UART writes from
+/// the timer IRQ interleave with the serial console and break harnesses that
+/// expect the shell prompt at the end of output.
+const TLBSTAT_PRINT: bool = false;
+
+/// `[TLBSTAT]` period: 10 s of 100 Hz ticks.
+const TLBSTAT_PERIOD_TICKS: u64 = 1000;
+
+/// Print the TLB-shootdown / CoW-promotion counters of `mm::paging::tlbstat`
+/// as deltas over the last period, when there was real activity. BSP timer IRQ
+/// only; raw UART, no locks.
+fn tlbstat_tick(now: u64) {
+    use mm::paging::tlbstat as ts;
+    use core::sync::atomic::AtomicU64;
+    extern "C" { fn arch_serial_putc(c: u8); }
+    fn s(msg: &str) { for &b in msg.as_bytes() { unsafe { arch_serial_putc(b) } } }
+    fn n(mut v: u64) {
+        let mut buf = [0u8; 20]; let mut i = 0;
+        if v == 0 { s("0"); return; }
+        while v > 0 { buf[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
+        for j in (0..i).rev() { unsafe { arch_serial_putc(buf[j]) } }
+    }
+    const K: usize = 11;
+    static PREV: [AtomicU64; K] = [const { AtomicU64::new(0) }; K];
+    let cur: [&AtomicU64; K] = [&ts::FLUSHES, &ts::REMOTE_FLUSHES, &ts::IPIS, &ts::WAIT_NS,
+        &ts::TIMEOUTS, &ts::SERVICED, &ts::COW_COPY, &ts::COW_COPY_NS, &ts::COW_REUSE,
+        &ts::EXEC_PRE, &ts::EXEC_PRE_NS];
+    let mut d = [0u64; K];
+    for i in 0..K {
+        let c = cur[i].load(Ordering::Relaxed);
+        d[i] = c.wrapping_sub(PREV[i].swap(c, Ordering::Relaxed));
+    }
+    // Quiet on an idle system (a desktop still does a few flushes per
+    // period): only periods with an exec, an ack timeout or a burst of CoW
+    // copies are printed.
+    if d[9] == 0 && d[4] == 0 && d[6] < 64 { return; }
+    s("[TLBSTAT] t="); n(now / 100);
+    s(" flush="); n(d[0]); s(" remote="); n(d[1]); s(" ipi="); n(d[2]);
+    s(" wait_us="); n(d[3] / 1000); s(" wait_max_us="); n(ts::WAIT_MAX_NS.swap(0, Ordering::Relaxed) / 1000);
+    s(" timeout="); n(d[4]); s(" serviced="); n(d[5]);
+    s(" cow_copy="); n(d[6]); s(" cow_us="); n(d[7] / 1000);
+    s(" cow_max_us="); n(ts::COW_COPY_MAX_NS.swap(0, Ordering::Relaxed) / 1000);
+    s(" cow_reuse="); n(d[8]);
+    s(" exec="); n(d[9]); s(" exec_pre_us="); n(d[10] / 1000);
+    s(" exec_pre_max_us="); n(ts::EXEC_PRE_MAX_NS.swap(0, Ordering::Relaxed) / 1000);
+    s("\n");
+}
+
 /// The local timer interrupt on this CPU.
 ///
 /// `elapsed` is how many 10 ms ticks of real time the arch timer found had
@@ -2556,7 +2604,12 @@ pub fn timer_tick_irq(elapsed: u64) {
     // Every CPU has its own local timer; only the BSP advances global time so
     // TIMER_TICKS keeps its 100 Hz meaning regardless of CPU count.
     if id == 0 {
-        TIMER_TICKS.fetch_add(elapsed, Ordering::Relaxed);
+        let before = TIMER_TICKS.fetch_add(elapsed, Ordering::Relaxed);
+        if TLBSTAT_PRINT
+            && before / TLBSTAT_PERIOD_TICKS != (before + elapsed) / TLBSTAT_PERIOD_TICKS
+        {
+            tlbstat_tick(before + elapsed);
+        }
         for h in TICK_HOOKS.iter() {
             let hook = h.load(Ordering::Acquire);
             if hook != 0 {
@@ -2697,6 +2750,9 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
                 }
                 spins = spins.wrapping_add(1);
                 if spins == 1 { lockwatch::note_wait(lockwatch::L_AS_BUSY); }
+                // The holder may be waiting for this CPU's TLB flush (it
+                // shares this address space, and IRQs are masked here).
+                mm::paging::tlb_service_pending();
                 core::hint::spin_loop();
             }
         }
@@ -2740,6 +2796,7 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
         // dropped so schedulers stay unblocked while we wait.
         spins = spins.wrapping_add(1);
         if spins == 1 { lockwatch::note_wait(lockwatch::L_AS_BUSY); }
+        mm::paging::tlb_service_pending();
         core::hint::spin_loop();
     }
 }
@@ -2752,6 +2809,18 @@ pub(crate) unsafe fn unlock_address_space(as_ptr: *mut mm::vmm::AddressSpace) {
 }
 
 pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
+    page_fault(addr, is_write, false)
+}
+
+/// Fault in one page of the current process for a kernel access about to
+/// happen (syscall-layer prefault), through the same path as a real fault —
+/// so a file-backed page is read with the address space unlocked. Silent
+/// on failure: the caller's own access reports the bad pointer.
+pub fn prefault_user_page(addr: usize) -> bool {
+    page_fault(addr, false, true)
+}
+
+fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
     fn print_str(s: &str) {
         extern "C" { fn arch_serial_putc(c: u8); }
         for &b in s.as_bytes() {
@@ -2760,6 +2829,7 @@ pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
     }
 
     let pid = current_pid();
+    FAULT_SIGBUS[unsafe { cpu_id() } % MAX_CPUS].store(false, Ordering::Relaxed);
     if pid == 0 { return false; }
 
     // Service the fault under the per-address-space lock, not RUN_QUEUE:
@@ -2788,12 +2858,64 @@ pub fn handle_page_fault(addr: usize, is_write: bool) -> bool {
             return false;
         }
     };
-    let ok = unsafe { (*as_ptr).handle_user_page_fault(addr, is_write) };
-    unsafe { unlock_address_space(as_ptr); }
-    if !ok {
-        print_str("[PF] handle_user_page_fault returned false\n");
+    // A file-backed page is read with the address space UNLOCKED: the read
+    // is milliseconds of filesystem/device work, and holding `busy` across
+    // it stalls every sibling thread's faults and mm syscalls (runqlock saw
+    // one 1.5 s hold at session start). The file is pinned by an extra
+    // reference for the duration; `install_file_fault` re-validates the VMA
+    // after relocking, so a concurrent munmap/MAP_FIXED/mprotect costs at
+    // most a retried access.
+    let plan = unsafe { (*as_ptr).plan_user_page_fault(addr, is_write) };
+    let outcome = match plan {
+        mm::vmm::FaultPlan::Done(f) => {
+            unsafe { unlock_address_space(as_ptr); }
+            f
+        }
+        mm::vmm::FaultPlan::Read(p) => {
+            mm::vmm::file_retain(p.cap);
+            unsafe { unlock_address_space(as_ptr); }
+            let mut bounce: alloc::vec::Vec<u8> = alloc::vec![0u8; p.len];
+            let got = if p.len == 0 { 0 } else {
+                mm::vmm::file_read(p.cap, p.pos, bounce.as_mut_ptr(), p.len)
+            };
+            let f = match lock_leader_address_space(pid) {
+                Some(a) => {
+                    let f = unsafe { (*a).install_file_fault(&p, &bounce, got) };
+                    unsafe { unlock_address_space(a); }
+                    f
+                }
+                // Exiting meanwhile: retrying the access lands in the dying
+                // path above.
+                None => mm::vmm::Fault::Handled,
+            };
+            drop(bounce);
+            mm::vmm::file_release(p.cap);
+            f
+        }
+    };
+    match outcome {
+        mm::vmm::Fault::Handled => true,
+        mm::vmm::Fault::Bus => {
+            FAULT_SIGBUS[unsafe { cpu_id() } % MAX_CPUS].store(true, Ordering::Relaxed);
+            false
+        }
+        mm::vmm::Fault::Segv => {
+            if !quiet { print_str("[PF] handle_user_page_fault returned false\n"); }
+            false
+        }
     }
-    ok
+}
+
+/// Set by `handle_page_fault` when the fault it refused was a file page past
+/// end of file (SIGBUS, not SIGSEGV); consumed by the arch fault handler on
+/// the same CPU, which runs straight on without rescheduling.
+static FAULT_SIGBUS: [core::sync::atomic::AtomicBool; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_CPUS];
+
+/// True (once) if the page fault this CPU just failed to resolve was a
+/// file-mapping access past end of file — deliver SIGBUS/BUS_ADRERR.
+pub fn take_fault_sigbus() -> bool {
+    FAULT_SIGBUS[unsafe { cpu_id() } % MAX_CPUS].swap(false, Ordering::Relaxed)
 }
 
 /// Number printers for the Ctrl-T dumps: raw UART only. The kernel's

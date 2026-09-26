@@ -89,63 +89,39 @@ export COSMIC_BACKEND="${COSMIC_BACKEND:-kms}"
 # bring-up used when the compositor first presented on both arches.
 export COSMIC_RENDER_DEVICE="${COSMIC_RENDER_DEVICE:-226:0}"
 
-# ---- renderer: hardware GL when the host offers it, software otherwise ------
-# The syncobj / direct-scanout fast paths still need real DRM features we do not
-# emulate, so those stay disabled below regardless. What changed is GBM.
+# ---- renderer: the GPU, verified — never a silent software fallback -------
+# /bin/gpu-env (ports/greetd/data/gpu-env) probes card0's capsets, brings up a
+# real GBM+EGL context exactly as cosmic-comp will, and exports the driver
+# selection for the first path that yields a HARDWARE GL_RENDERER:
 #
-# GBM_ALWAYS_SOFTWARE=1 forces GBM's swrast backend, which pins the whole stack
-# to softpipe no matter what the card can do. That was correct while every host
-# device was a plain virtio-vga/virtio-gpu-pci with no 3D. It is NOT correct on
-# `virtio-vga-gl`, where the host runs virglrenderer and the guest's Mesa has
-# the `virgl` gallium driver: leaving this set makes the GPU unreachable and
-# silently keeps the CPU rasterizer.
+#   zink   OpenGL on Vulkan over Venus (virtio-gpu venus=on): cosmic-comp's
+#          GLES becomes Vulkan work on the host GPU. smithay has no Vulkan
+#          renderer (only Gles/Glow/Pixman/Dummy), so Zink is how compositing
+#          reaches Vulkan with no smithay/cosmic-comp source change.
+#   virgl  OpenGL passthrough (virtio-vga-gl / virtio-gpu-gl-pci, no Venus).
 #
-# Unset by default so GBM binds the real virtio_gpu device. The shipped
-# megadriver carries BOTH virgl and softpipe, so a host without 3D still has a
-# working driver to fall back to. Export GBM_ALWAYS_SOFTWARE=1 before starting
-# the session to force the old CPU-only path — pair it with `run-qemu.sh
-# --no-virgl` when you need to know whether 3D is implicated in a display bug.
-if [ -n "${GBM_ALWAYS_SOFTWARE:-}" ]; then
-	export GBM_ALWAYS_SOFTWARE
+# Neither available => LEANDROS_RENDERER_PATH=refused and this launcher exits
+# 78 instead of starting a softpipe desktop (seconds per frame). The explicit
+# debugging opt-in is `touch /etc/leandros/allow-software-render` (or
+# LEANDROS_RENDERER=software). LEANDROS_RENDERER=zink|virgl forces a path.
+# Under greetd, /etc/profile already sourced gpu-env and this is a no-op.
+#
+# (Replaces the pre-2026-09-25 LEANDROS_ZINK=1 opt-in and the
+# GBM_ALWAYS_SOFTWARE switch; LEANDROS_ZINK=1 still maps to forcing zink.)
+if [ "${LEANDROS_ZINK:-0}" = "1" ] && [ -z "${LEANDROS_RENDERER:-}" ]; then
+	LEANDROS_RENDERER=zink
+	export LEANDROS_RENDERER
 fi
-
-# ---- Vulkan-backed rendering via Zink ---------------------------------------
-# smithay has NO Vulkan renderer — its only `impl Renderer` are Gles, Glow,
-# Pixman and Dummy — so cosmic-comp composites through GLES no matter what.
-# Zink is Mesa's gallium driver that implements OpenGL *on Vulkan*, so pointing
-# the GLES stack at it turns every compositor draw into Vulkan work, which the
-# Venus ICD carries to the host GPU. No smithay or cosmic-comp change involved.
-#
-# (cosmic-comp does enable smithay's `backend_vulkan` feature, but that is the
-# Vulkan *allocator*, and only in the nested-X11 backend — src/backend/kms/,
-# which is what we run, never touches it. It allocates buffers; it does not
-# render.)
-#
-# ⚠ OPT-IN (LEANDROS_ZINK=1), because cosmic-comp does NOT yet work on it.
-# kmscube does — `renderer: "zink Vulkan 1.4(Virtio-GPU Venus (AMD Ryzen 9 7950X
-# (RADV RAPHAEL_MENDOCINO)))"`, GLES 3.2, 99.96 fps — so the stack itself is
-# sound. cosmic-comp's GBM scanout allocation takes the classic
-# VIRTGPU_RESOURCE_CREATE path, and under a *Venus* host context virglrenderer
-# has no virgl 3D context to own that resource, so RESOURCE_ATTACH_BACKING is
-# rejected (`virtio_gpu_virgl_process_cmd: ctrl 0x106, error 0x1200`) and the
-# guest goes down with it. Proven Zink-specific: the identical Venus device with
-# LEANDROS_NO_ZINK=1 runs cosmic-comp cleanly with zero 0x106 errors. The fix is
-# to route allocation through blob resources when the capset is Venus.
-#
-# Both halves must also be present. The failure mode is silent otherwise:
-# MESA_LOADER_DRIVER_OVERRIDE=zink with no reachable ICD does not fall back to
-# softpipe, it fails to create a screen at all. zink dlopen()s "libvulkan.so.1" —
-# unlike vktest, which dlopens the ICD directly by absolute path and needs no
-# loader, which is why one was never shipped before.
-_leandros_icd="/usr/share/vulkan/icd.d/virtio_icd.$(uname -m).json"
-if [ "${LEANDROS_ZINK:-0}" = "1" ] && [ -r "$_leandros_icd" ] && [ -r /usr/lib/libvulkan.so.1 ]; then
-	# Name the ICD explicitly rather than relying on the loader's directory
-	# scan: there is exactly one, and a scan needs a working /usr/share walk.
-	export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-$_leandros_icd}"
-	export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-zink}"
-	export GALLIUM_DRIVER="${GALLIUM_DRIVER:-zink}"
+if [ "${LEANDROS_NO_ZINK:-0}" = "1" ] && [ -z "${LEANDROS_RENDERER:-}" ]; then
+	LEANDROS_RENDERER=virgl
+	export LEANDROS_RENDERER
 fi
-unset _leandros_icd
+. /bin/gpu-env
+if [ "$LEANDROS_RENDERER_PATH" = refused ]; then
+	echo "start-cosmic-leandros: no GPU renderer; not starting COSMIC (see above)" >&2
+	exit 78
+fi
+echo "start-cosmic-leandros: renderer=$LEANDROS_RENDERER_PATH GL_RENDERER='$LEANDROS_GL_RENDERER'" >&2
 # The card now implements atomic KMS, and atomic is the ONLY smithay path
 # that can program a cursor plane (the legacy backend clears the cursor and
 # overlay plane lists outright), so leave it unset by default. Export

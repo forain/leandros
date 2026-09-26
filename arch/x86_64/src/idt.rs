@@ -525,7 +525,13 @@ extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, e
     // siginfo and let the stub deliver it. Silent on purpose — a program
     // that handles its own faults (GC barriers, stack probes, siglongjmp
     // recovery) must not spam the console on each one.
-    let (sig, si_code, si_addr) = fault_siginfo(vector, error_code, cr2, frame.rip);
+    // A file-mapping page past end of file is a bus error, not a bad
+    // address (handle_page_fault recorded which it was).
+    let (sig, si_code, si_addr) = if vector == 14 && sched::take_fault_sigbus() {
+        (SIGBUS, sched::BUS_ADRERR, cr2 as usize)
+    } else {
+        fault_siginfo(vector, error_code, cr2, frame.rip)
+    };
     if sched::fault_signal(sig, si_code, si_addr) {
         return;
     }
@@ -561,7 +567,8 @@ extern "C" fn exc_misc(_frame: InterruptStackFrame) { loop {} }
 
 /// TLB shootdown IPI handler — vector 0xFD.
 ///
-/// Flushes this CPU's TLB (CR3 reload) and acknowledges the initiator.
+/// Flushes this CPU's TLB (CR3 reload) after bumping its flush generation,
+/// which is the initiator's acknowledgement (see paging.rs).
 /// Must NOT reschedule: the initiator is spin-waiting for the ack and the
 /// flush must complete on this CPU before any user memory is touched again.
 #[cfg(target_arch = "x86_64")]
@@ -571,16 +578,8 @@ extern "x86-interrupt" fn tlb_shootdown_irq(frame: InterruptStackFrame) {
         unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
     }
 
-    unsafe {
-        core::arch::asm!(
-            "mov {tmp}, cr3",
-            "mov cr3, {tmp}",
-            tmp = out(reg) _,
-            options(nostack)
-        );
-    }
+    super::paging::tlb_shootdown_irq_body();
     super::apic::eoi();
-    super::paging::tlb_shootdown_ack();
 
     if from_user {
         // No reschedule happens here, but keep the exit path uniform.

@@ -25,7 +25,7 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use crate::vmm::{AddressSpace, VmaRegion, MAP_SHARED};
-use crate::paging::{map_page, tlb_shootdown_all, PageFlags};
+use crate::paging::{map_page, tlb_flush_as, PageFlags};
 use crate::buddy::PAGE_SIZE;
 use crate::pageref;
 
@@ -240,8 +240,9 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
     // page-table switch, the write silently lands on the still-shared frame
     // (no fault, no copy) and the child later reads the corruption. Flush
     // now, while the parent's root is the active one, so the parent's first
-    // post-fork write takes the CoW fault it must.
-    tlb_shootdown_all();
+    // post-fork write takes the CoW fault it must. Only CPUs with the parent's
+    // root loaded can hold such entries (its other threads are quiesced).
+    tlb_flush_as(src_root);
 
     use core::sync::atomic::Ordering;
     LAST_SHARED_PAGES.store(shared_pages, Ordering::Relaxed);

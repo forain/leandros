@@ -1,0 +1,113 @@
+--- a/include/ui/egl-helpers.h	2026-09-25 16:49:48
++++ b/include/ui/egl-helpers.h	2026-09-25 16:49:48
+@@ -61,7 +61,8 @@
+ 
+ EGLSurface qemu_egl_init_surface_x11(EGLContext ectx, EGLNativeWindowType win);
+ 
+-#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32)
++#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32) || \
++    defined(CONFIG_DARWIN)
+ EGLDisplay qemu_egl_get_display(EGLNativeDisplayType native,
+                                 EGLenum platform);
+ #endif
+@@ -77,6 +78,10 @@
+ int qemu_egl_init_dpy_win32(EGLNativeDisplayType dpy, DisplayGLMode mode);
+ #endif
+ 
++#ifdef CONFIG_DARWIN
++int qemu_egl_init_dpy_angle(DisplayGLMode mode);
++#endif
++
+ EGLContext qemu_egl_init_ctx(void);
+ bool qemu_egl_has_dmabuf(void);
+ 
+--- a/ui/egl-helpers.c	2026-09-25 16:49:48
++++ b/ui/egl-helpers.c	2026-09-25 17:16:29
+@@ -132,6 +132,18 @@
+ 
+     glGenTextures(1, &texture);
+     glBindTexture(GL_TEXTURE_2D, texture);
++#ifdef CONFIG_DARWIN
++    /*
++     * ANGLE is strict OpenGL ES: GL_BGRA pixel data needs a GL_BGRA_EXT
++     * internal format (EXT_texture_format_BGRA8888); RGBA + BGRA is
++     * GL_INVALID_OPERATION, which leaves the texture (and every
++     * egl-headless readback through it) empty.
++     */
++    if (!epoxy_is_desktop_gl()) {
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT, width, height,
++                     0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, 0);
++    } else
++#endif
+     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height,
+                  0, GL_BGRA, GL_UNSIGNED_BYTE, 0);
+ 
+@@ -490,7 +502,8 @@
+ 
+ /* ---------------------------------------------------------------------- */
+ 
+-#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32)
++#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32) || \
++    defined(CONFIG_DARWIN)
+ 
+ /*
+  * Taken from glamor_egl.h from the Xorg xserver, which is MIT licensed
+@@ -528,7 +541,8 @@
+     /* In practise any EGL 1.5 implementation would support the EXT extension */
+     if (epoxy_has_egl_extension(NULL, "EGL_EXT_platform_base")) {
+         if (platform != 0) {
+-            dpy = eglGetPlatformDisplayEXT(platform, native, NULL);
++            dpy = eglGetPlatformDisplayEXT(platform, (void *)(uintptr_t)native,
++                                           NULL);
+         }
+     }
+ 
+@@ -659,6 +673,31 @@
+ }
+ #endif
+ 
++#ifdef CONFIG_DARWIN
++/*
++ * macOS: EGL + GLES come from ANGLE (libEGL/libGLESv2.dylib, loaded by
++ * libepoxy).  There is no render node and no GBM; contexts are surfaceless
++ * and scanouts are read back (egl-headless) or shown by a GL-capable UI.
++ * ANGLE picks its backend from $ANGLE_DEFAULT_PLATFORM ("metal" or "gl");
++ * default to Metal, the only one that is not a deprecated API.
++ */
++int qemu_egl_init_dpy_angle(DisplayGLMode mode)
++{
++    /* ANGLE implements OpenGL ES only */
++    if (mode == DISPLAY_GL_MODE_ON || mode == DISPLAY_GL_MODE_CORE) {
++        mode = DISPLAY_GL_MODE_ES;
++    }
++    g_setenv("ANGLE_DEFAULT_PLATFORM", "metal", FALSE);
++
++#ifdef EGL_PLATFORM_ANGLE_ANGLE
++    return qemu_egl_init_dpy(EGL_DEFAULT_DISPLAY, EGL_PLATFORM_ANGLE_ANGLE,
++                             mode);
++#else
++    return qemu_egl_init_dpy(EGL_DEFAULT_DISPLAY, 0, mode);
++#endif
++}
++#endif
++
+ bool qemu_egl_has_dmabuf(void)
+ {
+     if (qemu_egl_display == EGL_NO_DISPLAY) {
+@@ -723,6 +762,16 @@
+         error_setg(errp, "egl: render node init failed");
+         return false;
+     }
++#elif defined(CONFIG_DARWIN)
++    if (qemu_egl_init_dpy_angle(mode) < 0) {
++        error_setg(errp, "egl: ANGLE init failed");
++        return false;
++    }
++    qemu_egl_rn_ctx = qemu_egl_init_ctx();
++    if (!qemu_egl_rn_ctx) {
++        error_setg(errp, "egl: egl_init_ctx failed");
++        return false;
++    }
+ #endif
+ 
+     if (!qemu_egl_rn_ctx) {

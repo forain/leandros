@@ -2315,17 +2315,42 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     let import_errno = errno();
     if !report_errno(b"PRIME_FD_TO_HANDLE", import_ok, import_errno) { failures += 1; }
 
-    // A dumb buffer's handles are deliberately global (ADDFB2, the console and
-    // PRIME consume them with no open identity), so importing its fd on a
-    // SECOND open answers with the very same handle — unlike a blob, whose
-    // importer is minted a handle of its own (venustest phase 5b).
+    // Importing the fd on a SECOND open mints that open its own handle, as
+    // upstream's per-drm_file tables do (`prime_import_dumb`). It used to
+    // echo the exporter's handle, and the importer's DESTROY_DUMB/GEM_CLOSE
+    // then retired the EXPORTER's handle — under virgl, cosmic-comp closing
+    // an imported cosmic-panel buffer killed the panel's own handle, and the
+    // panel never appeared. Asserted: a distinct handle; a re-import on the
+    // same open answers with it again; it maps the same pages; and closing it
+    // leaves the exporter's handle alive.
     let fd_other = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
     let mut ph3 = DrmPrimeHandle::default();
     ph3.fd = ph.fd;
-    let other_ok = fd_other >= 0 && export_ok
+    let mut other_ok = fd_other >= 0 && export_ok
         && ioctl(fd_other, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut ph3 as *mut _) == 0
-        && ph3.handle == cd.handle;
+        && ph3.handle != 0 && ph3.handle != cd.handle;
     let other_errno = errno();
+    if other_ok {
+        let mut ph4 = DrmPrimeHandle::default();
+        ph4.fd = ph.fd;
+        other_ok = ioctl(fd_other, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut ph4 as *mut _) == 0
+            && ph4.handle == ph3.handle;
+    }
+    if other_ok && cd.size > 0 {
+        let mut mo = DrmModeMapDumb { handle: ph3.handle, ..Default::default() };
+        other_ok = ioctl(fd_other, DRM_IOCTL_MODE_MAP_DUMB, &mut mo as *mut _) == 0;
+        if other_ok {
+            let op = mmap(core::ptr::null_mut(), cd.size as usize, PROT_READ,
+                          MAP_SHARED, fd_other, mo.offset as i64);
+            other_ok = op as isize > 0 && *(op as *const u32) == 0x0040_0000;
+        }
+    }
+    if other_ok {
+        let mut hc = ph3.handle;
+        other_ok = ioctl(fd_other, DRM_IOCTL_MODE_DESTROY_DUMB, &mut hc as *mut u32) == 0;
+        let mut mo = DrmModeMapDumb { handle: cd.handle, ..Default::default() };
+        other_ok = other_ok && ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut mo as *mut _) == 0;
+    }
     if !report_errno(b"PRIME_FD_TO_HANDLE_OTHER_OPEN_DUMB", other_ok, other_errno) { failures += 1; }
     if fd_other >= 0 { close(fd_other); }
 

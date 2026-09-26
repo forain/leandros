@@ -17,30 +17,32 @@ ARCH="x86_64"
 # to launch).
 ACCEL=""
 QEMU_EXTRA_ARGS=()
-# Venus (Vulkan over virtio-gpu) mode. Opt-in only, via --venus below or
-# LEANDROS_VENUS=1 for harnesses that cannot pass a flag. See the --venus block
-# after the display selection for what it changes and why it never autodetects.
+# ── GPU path ────────────────────────────────────────────────────────────────
+# COSMIC renders on the host GPU, never in software: the guest's /bin/gpu-env
+# refuses to start a compositor unless GBM+EGL come up on a hardware renderer
+# (zink over Venus, or virgl), and the graphical login is then simply not
+# started (init prints a banner; the serial login is unaffected). So the host
+# side picks a GPU device BY DEFAULT wherever one can work:
+#
+#   auto   (default) Venus where the host QEMU/virglrenderer can do it, virgl
+#          where only GL passthrough exists, and nothing where neither does
+#          (macOS Homebrew QEMU has no virglrenderer — see the warning below).
+#   venus  --venus / LEANDROS_VENUS=1: virtio-gpu venus=on,blob=on — the guest
+#          renders through zink -> Venus -> host Vulkan. Also carries the virgl
+#          capset, so gpu-env can fall back to virgl on the same device.
+#   virgl  --virgl / LEANDROS_VIRGL=1: virtio-vga-gl / virtio-gpu-gl-pci.
+#   none   --no-gpu (alias --no-virgl) / LEANDROS_GPU=none: plain virtio-gpu.
+#          For headless kernel tests that never draw: the guest skips the
+#          graphical login and the serial console works as always.
+GPU_MODE="${LEANDROS_GPU:-auto}"
+if [ "${LEANDROS_VENUS:-0}" = "1" ]; then GPU_MODE=venus; fi
+if [ "${LEANDROS_VIRGL:-0}" = "1" ]; then GPU_MODE=virgl; fi
 VENUS=0
-if [ "${LEANDROS_VENUS:-0}" = "1" ]; then VENUS=1; fi
+VIRGL=0
 # --venus opens a real window when the host has a display server; this forces
 # the offscreen egl-headless path instead, for harnesses that must not open one.
 VENUS_HEADLESS=0
 if [ "${LEANDROS_VENUS_HEADLESS:-0}" = "1" ]; then VENUS_HEADLESS=1; fi
-# virgl (OpenGL passthrough) on x86_64 via virtio-vga-gl.
-#
-# OPT-IN, not default. The plumbing works end to end — `kmscube` inside the
-# guest reports `renderer: "virgl (AMD Ryzen 9 7950X ... radeonsi ...)"`, i.e.
-# real host-GPU OpenGL — but **cosmic-comp still dies with SIGSEGV** somewhere
-# in the classic virgl resource path (RESOURCE_CREATE_3D / TRANSFER_*_3D, which
-# Venus never exercised because it uses blob resources). Until that is fixed,
-# the default has to stay on the device that gives a working desktop.
-#
-# `--virgl` (or LEANDROS_VIRGL=1) selects virtio-vga-gl. Note the guest's DRM
-# identity follows the device automatically: with virgl negotiated card0 reports
-# `virtio_gpu` so Mesa loads the virgl driver, otherwise it reports
-# `leandros-drm` and Mesa falls through to softpipe.
-VIRGL=0
-if [ "${LEANDROS_VIRGL:-0}" = "1" ]; then VIRGL=1; fi
 
 # Hardware acceleration only applies when the guest architecture matches the
 # host's — a hypervisor virtualises, it does not translate. Map uname's arch
@@ -80,6 +82,17 @@ select_audio_args() {
     fi
 }
 
+# ── Host QEMU ───────────────────────────────────────────────────────────────
+# macOS: Homebrew's qemu has no virglrenderer, so on a Mac prefer the GPU build
+# from scripts/mac-qemu-gpu/build.sh (virglrenderer on ANGLE/Metal, HVF,
+# egl-headless). LEANDROS_QEMU_PREFIX picks a prefix explicitly on any host
+# (its bin/qemu-system-* and share/qemu firmware win); otherwise the default
+# install location ~/.local/qemu-gpu is used when present, else $PATH.
+QEMU_PREFIX="${LEANDROS_QEMU_PREFIX:-}"
+if [ -z "$QEMU_PREFIX" ] && [ "$OS" = "Darwin" ] && [ -x "$HOME/.local/qemu-gpu/bin/qemu-system-aarch64" ]; then
+    QEMU_PREFIX="$HOME/.local/qemu-gpu"
+fi
+
 # Firmware search paths. Ordered most-specific first; the first hit wins.
 # Arch/EndeavourOS keeps edk2 under /usr/share/edk2/<arch>/ with a 4 MB split
 # CODE/VARS pair, which is why the plain OVMF.fd names below do not match there.
@@ -90,6 +103,12 @@ AARCH64_FW_PATHS=("/usr/share/AAVMF/AAVMF_CODE.fd" "/opt/homebrew/share/qemu/edk
 # build needs its own VARS pflash; a combined image (OVMF.fd) does not.
 X86_64_VARS_PATHS=("/opt/homebrew/share/qemu/edk2-i386-vars.fd" "/usr/share/edk2/x64/OVMF_VARS.4m.fd" "/usr/share/edk2/x64/OVMF_VARS.fd" "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd" "/usr/share/OVMF/OVMF_VARS.fd")
 AARCH64_VARS_PATHS=("/opt/homebrew/share/qemu/edk2-arm-vars.fd" "/usr/share/edk2/aarch64/QEMU_VARS.4m.fd" "/usr/share/edk2/aarch64/QEMU_VARS.fd" "/usr/share/edk2-armvirt/aarch64/vars-template-pflash.raw" "/usr/share/AAVMF/AAVMF_VARS.fd")
+if [ -n "$QEMU_PREFIX" ]; then
+    X86_64_FW_PATHS=("$QEMU_PREFIX/share/qemu/edk2-x86_64-code.fd" "${X86_64_FW_PATHS[@]}")
+    AARCH64_FW_PATHS=("$QEMU_PREFIX/share/qemu/edk2-aarch64-code.fd" "${AARCH64_FW_PATHS[@]}")
+    X86_64_VARS_PATHS=("$QEMU_PREFIX/share/qemu/edk2-i386-vars.fd" "${X86_64_VARS_PATHS[@]}")
+    AARCH64_VARS_PATHS=("$QEMU_PREFIX/share/qemu/edk2-arm-vars.fd" "${AARCH64_VARS_PATHS[@]}")
+fi
 
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -103,10 +122,11 @@ while [[ "$#" -gt 0 ]]; do
         --hvf) ACCEL="hvf"; shift ;;
         --kvm) ACCEL="kvm"; shift ;;
         --tcg) ACCEL="tcg"; shift ;;
-        --venus) VENUS=1; shift ;;
-        --venus-headless) VENUS=1; VENUS_HEADLESS=1; shift ;;
-        --virgl) VIRGL=1; shift ;;
-        --no-virgl) VIRGL=0; shift ;;
+        --venus) GPU_MODE=venus; shift ;;
+        --venus-headless) GPU_MODE=venus; VENUS_HEADLESS=1; shift ;;
+        --virgl) GPU_MODE=virgl; shift ;;
+        --no-gpu|--no-virgl) GPU_MODE=none; shift ;;
+        --gpu) GPU_MODE="$2"; shift 2 ;;
         -d) QEMU_EXTRA_ARGS+=("$2"); shift 2 ;;
         *) QEMU_EXTRA_ARGS+=("$1"); shift ;;
     esac
@@ -188,6 +208,68 @@ else
     DISK_IMAGE="leandros-limine-x86_64.img"
 fi
 
+if [ -n "$QEMU_PREFIX" ]; then
+    QEMU_SYSTEM="$QEMU_PREFIX/bin/$QEMU_SYSTEM"
+    [ -x "$QEMU_SYSTEM" ] || { echo "❌ $QEMU_SYSTEM not found (LEANDROS_QEMU_PREFIX=$QEMU_PREFIX)"; exit 1; }
+    echo "🧰 QEMU: $QEMU_SYSTEM"
+fi
+
+# Resolve GPU_MODE=auto into a concrete path for THIS host. Every check is
+# a capability probe of the QEMU we are about to run, never an OS-name guess.
+qemu_has_device() { $QEMU_SYSTEM -device help 2>&1 | grep -q "\"$1\""; }
+host_gl_possible() {
+    # virglrenderer needs a host EGL: a render node on Linux; on macOS the
+    # ANGLE (Metal) EGL of a scripts/mac-qemu-gpu/build.sh QEMU, whose display
+    # is egl-headless. Homebrew's QEMU has neither *-gl devices nor
+    # egl-headless, so it still resolves to none.
+    if [ "$OS" = "Darwin" ]; then
+        $QEMU_SYSTEM -display help 2>/dev/null | grep -qx egl-headless || return 1
+    else
+        [ "$OS" = "Linux" ] || return 1
+        ls /dev/dri/renderD* >/dev/null 2>&1 || return 1
+    fi
+    qemu_has_device virtio-gpu-gl-pci || qemu_has_device virtio-vga-gl
+}
+host_venus_possible() {
+    # QEMU exposes the venus= property only when built against a
+    # virglrenderer with Venus; the device still needs a host Vulkan driver
+    # for the GPU, which the guest verifies (zink probe) and falls back from.
+    $QEMU_SYSTEM -device virtio-gpu-gl-pci,help 2>&1 | grep -q '^ *venus='
+}
+case "$GPU_MODE" in
+    auto)
+        if [ "$BOOT_MODE" = "raspi4b" ]; then GPU_MODE=none
+        # macOS Venus (UTM's virglrenderer fork + MoltenVK) is experimental:
+        # the host rejects the guest's vkCreateInstance, so auto never picks it.
+        elif [ "$OS" != "Darwin" ] && host_gl_possible && host_venus_possible; then GPU_MODE=venus
+        elif host_gl_possible; then GPU_MODE=virgl
+        else GPU_MODE=none
+        fi ;;
+    venus|virgl|none) ;;
+    *) echo "❌ --gpu must be auto|venus|virgl|none (got '$GPU_MODE')"; exit 1 ;;
+esac
+case "$GPU_MODE" in
+    venus) VENUS=1 ;;
+    virgl) VIRGL=1 ;;
+esac
+if [ "$GPU_MODE" = "none" ] && [ "$BOOT_MODE" != "raspi4b" ]; then
+    echo "⚠️  ────────────────────────────────────────────────────────────────"
+    echo "⚠️  NO GPU PATH: this guest gets a plain virtio-gpu (no 3D)."
+    if [ "$OS" = "Darwin" ]; then
+        echo "⚠️  $QEMU_SYSTEM on macOS has no virglrenderer, so neither Venus"
+        echo "⚠️  nor virgl exists here. Build the GPU QEMU once with"
+        echo "⚠️  scripts/mac-qemu-gpu/build.sh (virgl over ANGLE/Metal; installs to"
+        echo "⚠️  ~/.local/qemu-gpu, picked up automatically), or run on the linux"
+        echo "⚠️  desktop (x86_64/KVM, Venus)."
+    fi
+    echo "⚠️  COSMIC will NOT start (no software rendering); serial login only."
+    echo "⚠️  Opt in to softpipe for debugging, in the guest:"
+    echo "⚠️      touch /etc/leandros/allow-software-render"
+    echo "⚠️  ────────────────────────────────────────────────────────────────"
+else
+    echo "🎮 GPU path: $GPU_MODE"
+fi
+
 # Select GPU device.
 # x86_64: prefer virtio-vga — it is VGA-compatible so UEFI/OVMF exposes a GOP
 #         framebuffer that Limine can use.  virtio-gpu-pci has no VGA interface
@@ -195,7 +277,7 @@ fi
 # aarch64: virtio-gpu-pci is correct; VGA is an x86 concept.
 GL_ARGS=()
 if [ "$ARCH" = "aarch64" ]; then
-    if $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-gpu-gl-pci; then
+    if [ "$VIRGL" = "1" ] && qemu_has_device virtio-gpu-gl-pci; then
         GPU_DEV="virtio-gpu-gl-pci"
         GL_ARGS=("-display" "default,gl=on")
     else
@@ -215,11 +297,8 @@ else
     if [ "$VIRGL" = "1" ] && $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-vga-gl; then
         GPU_DEV="virtio-vga-gl"
         GL_ARGS=("-display" "default,gl=on")
-    elif $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-vga; then
+    elif qemu_has_device virtio-vga; then
         GPU_DEV="virtio-vga"
-    elif $QEMU_SYSTEM -device help 2>&1 | grep -q virtio-gpu-gl-pci; then
-        GPU_DEV="virtio-gpu-gl-pci"
-        GL_ARGS=("-display" "default,gl=on")
     else
         GPU_DEV="virtio-gpu-pci"
     fi
@@ -232,6 +311,15 @@ fi
 # boot mode, so it lives before the boot-mode dispatch below.
 # --venus makes its own display choice below and would only override this one,
 # so skip it here rather than print a message that the next block contradicts.
+# macOS: upstream QEMU's cocoa UI has no GL, so a GL device always runs under
+# egl-headless (ANGLE/Metal, offscreen) and is viewed over VNC: the readback
+# lands on the console surface, which VNC and QMP screendump both serve.
+# LEANDROS_VNC (default 127.0.0.1:0 → port 5900) moves the listener.
+if [ "$OS" = "Darwin" ] && [ "${#GL_ARGS[@]}" -gt 0 ]; then
+    MAC_VNC="${LEANDROS_VNC:-127.0.0.1:0}"
+    GL_ARGS=("-display" "egl-headless" "-vnc" "$MAC_VNC")
+    echo "🖥️  virgl on ANGLE/Metal via egl-headless; view: open vnc://${MAC_VNC%:*}:$((5900 + ${MAC_VNC##*:}))"
+fi
 if [ "$VENUS" = "0" ] && [ "$OS" != "Darwin" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     if [ "${#GL_ARGS[@]}" -gt 0 ] && $QEMU_SYSTEM -display help 2>/dev/null | grep -q egl-headless; then
         GL_ARGS=("-display" "egl-headless")
@@ -253,9 +341,9 @@ X86_UEFI_VGA_ARGS=(-vga none)
 # merely reports "no Venus capset". So --venus never autodetects and never
 # degrades: it either produces the proven line or refuses with the reason.
 if [ "$VENUS" = "1" ]; then
-    if [ "$OS" = "Darwin" ]; then
-        echo "❌ --venus needs a host EGL implementation; macOS has none, so"
-        echo "   virtio-gpu-gl-pci,venus=on cannot initialise. Use the Linux box."
+    if [ "$OS" = "Darwin" ] && ! host_venus_possible; then
+        echo "❌ --venus: this macOS QEMU has no venus= property (upstream"
+        echo "   virglrenderer has no macOS Venus). Use --virgl, or the Linux box."
         exit 1
     fi
     if [ "$BOOT_MODE" = "raspi4b" ]; then
@@ -318,6 +406,9 @@ if [ "$VENUS" = "1" ]; then
         GL_ARGS=("-display" "gtk,gl=on")
     else
         GL_ARGS=("-display" "egl-headless")
+    fi
+    if [ "$OS" = "Darwin" ] && [ -z "${LEANDROS_VENUS_DISPLAY:-}" ]; then
+        GL_ARGS+=("-vnc" "${LEANDROS_VNC:-127.0.0.1:0},display=venusgpu")
     fi
     echo "🌋 Venus: -device $GPU_DEV ${GL_ARGS[*]}"
     if [ "${#X86_UEFI_VGA_ARGS[@]}" -eq 0 ] && [ "$ARCH" != "aarch64" ]; then

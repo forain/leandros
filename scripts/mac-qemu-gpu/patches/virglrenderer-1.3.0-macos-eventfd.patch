@@ -1,0 +1,50 @@
+--- a/src/virgl_util.c	2026-09-25 17:43:26
++++ b/src/virgl_util.c	2026-09-25 17:43:26
+@@ -31,6 +31,10 @@
+ #include <errno.h>
+ #ifdef HAVE_EVENTFD_H
+ #include <sys/eventfd.h>
++#elif defined(__APPLE__)
++#include <fcntl.h>
++#include <stdlib.h>
++#include <sys/stat.h>
+ #endif
+ #include <unistd.h>
+ 
+@@ -88,7 +92,7 @@
+ 
+ bool has_eventfd(void)
+ {
+-#ifdef HAVE_EVENTFD_H
++#if defined(HAVE_EVENTFD_H) || defined(__APPLE__)
+    return true;
+ #else
+    return false;
+@@ -99,6 +103,27 @@
+ {
+ #ifdef HAVE_EVENTFD_H
+    return eventfd(initval, EFD_CLOEXEC | EFD_NONBLOCK);
++#elif defined(__APPLE__)
++   /*
++    * macOS has no eventfd. A FIFO opened O_RDWR is a single pollable fd that
++    * both write_eventfd() and flush_eventfd() can use, which is all the
++    * callers need. Without it VIRGL_RENDERER_THREAD_SYNC is dropped and every
++    * fence waits for the host's 10 ms poll timer.
++    */
++   char path[] = "/tmp/virgl-eventfd-XXXXXX";
++   int fd = -1;
++   if (!mkdtemp(path))
++      return -1;
++   char fifo[sizeof(path) + 8];
++   snprintf(fifo, sizeof(fifo), "%s/fifo", path);
++   if (mkfifo(fifo, 0600) == 0) {
++      fd = open(fifo, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++      unlink(fifo);
++   }
++   rmdir(path);
++   if (fd >= 0 && initval)
++      write_eventfd(fd, initval);
++   return fd;
+ #else
+    (void)initval;
+    return -1;
