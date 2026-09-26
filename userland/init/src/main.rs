@@ -14,7 +14,7 @@ extern crate leandros_libc;
 use leandros_libc::{
     write, STDOUT_FILENO, getpid, execve, sched_yield, mount, pivot_root, mkdir, chown,
     open, read, close, dup3, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND,
-    fork, wait4, setsid, ioctl, usleep, exit, clock_gettime, timespec,
+    fork, wait4, setsid, ioctl, usleep, exit, clock_gettime, timespec, unlink,
 };
 use leandros_libc::syscall::{nr, syscall2, syscall4};
 
@@ -135,6 +135,10 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     seed_runtime_dirs();
 
     // 5. Graphical login, when the image carries one and nothing opted out.
+    // /run is on the persistent root, so a pid file from an earlier boot
+    // would name whatever process now has that pid (a `kill $(cat ...)` then
+    // hits the serial login shell). It names a live greetd or nothing.
+    unlink(DM_PID_FILE.as_ptr());
     let graphical = graphical_login_wanted();
     let (mut dm_pid, mut dm_logger) = if graphical { spawn_display_manager() } else { (0, 0) };
     let mut dm_respawns: u32 = 0;
@@ -176,6 +180,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             login_pid = spawn_login();
         } else if dm_pid > 0 && pid == dm_pid {
             dm_pid = 0;
+            unlink(DM_PID_FILE.as_ptr());
             // greetd is gone, but its session tree may not be: a greeter
             // whose compositor died spins on the broken Wayland socket
             // forever, at ~180 MiB and a full CPU apiece, and every respawn
