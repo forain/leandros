@@ -412,6 +412,11 @@ impl RunQueue {
                 let is_futex = task.blocked_futex != 0;
                 if !is_poll && !is_futex { continue; }
                 if (is_poll && task.poll_mask & timerfd_tags != 0) || task.poll_deadline <= now {
+                    if crate::idlestat::ENABLED {
+                        crate::idlestat::note_deadline_wake(
+                            task.poll_deadline <= now,
+                            is_poll && task.poll_mask == crate::POLL_TAG_ALL);
+                    }
                     self.maybe_ready[i / 64] |= 1u64 << (i % 64);
                     task.state         = TaskState::Ready;
                     if is_poll  { task.blocked_on = None; task.poll_mask = crate::POLL_TAG_ALL; }

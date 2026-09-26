@@ -73,6 +73,20 @@ pub fn note_wake(loc: &'static core::panic::Location<'static>, broadcast: bool, 
     }
 }
 
+/// Deadline-service wakes by reason: own deadline due; timerfd expiry
+/// matched a broadcast (`POLL_TAG_ALL`) mask; matched a narrow mask.
+static DL_OWN: AtomicU32 = AtomicU32::new(0);
+static DL_TFD_ALL: AtomicU32 = AtomicU32::new(0);
+static DL_TFD_NARROW: AtomicU32 = AtomicU32::new(0);
+
+#[inline]
+pub fn note_deadline_wake(own_deadline: bool, broadcast_mask: bool) {
+    if !ENABLED { return; }
+    if own_deadline { DL_OWN.fetch_add(1, Relaxed); }
+    else if broadcast_mask { DL_TFD_ALL.fetch_add(1, Relaxed); }
+    else { DL_TFD_NARROW.fetch_add(1, Relaxed); }
+}
+
 /// Dispatcher hook: `pid` (thread group `tgid`) is about to run.
 #[inline]
 pub fn on_dispatch(pid: u32, tgid: u32, resume_sc: u32) {
@@ -140,6 +154,9 @@ pub fn tick(now: u64) {
         total_disp += disp[s] as u64;
     }
     g::s(" disp_per_s="); g::d((total_disp * 1_000_000_000 / win.max(1)) as usize);
+    g::s(" dl_own="); g::d(DL_OWN.swap(0, Relaxed) as usize);
+    g::s(" dl_tfd_all="); g::d(DL_TFD_ALL.swap(0, Relaxed) as usize);
+    g::s(" dl_tfd_narrow="); g::d(DL_TFD_NARROW.swap(0, Relaxed) as usize);
     g::nl();
     for i in 0..SITES {
         let calls = SITE_CALLS[i].swap(0, Relaxed);
