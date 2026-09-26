@@ -152,15 +152,22 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
     # WGPU_BACKEND pins the backend to the path verified above: Vulkan on
     # Venus (the same device zink uses), GLES through EGL on virgl.
     # LEANDROS_ICED_BACKEND overrides (e.g. "wgpu,tiny-skia" to allow the
-    # fallback while debugging a client).
+    # fallback while debugging a client), as does the first line of
+    # /etc/leandros/iced-backend. Only "tiny-skia" alone means CPU widgets.
     unset WGPU_BACKEND || true
+    if [ -z "${LEANDROS_ICED_BACKEND:-}" ] && [ -r /etc/leandros/iced-backend ]; then
+        read -r LEANDROS_ICED_BACKEND < /etc/leandros/iced-backend || true
+    fi
     case $LEANDROS_RENDERER_PATH in
     zink)  ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu}; WGPU_BACKEND=vulkan ;;
     virgl) ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu}; WGPU_BACKEND=gl ;;
     *)     ICED_BACKEND=${LEANDROS_ICED_BACKEND:-tiny-skia} ;;
     esac
     export ICED_BACKEND
-    [ -n "${WGPU_BACKEND:-}" ] && export WGPU_BACKEND
+    if [ -n "${WGPU_BACKEND:-}" ]; then export WGPU_BACKEND; fi
+    case $ICED_BACKEND in *tiny-skia*|*tiny_skia*)
+        echo "gpu-env: WARNING client widgets may rasterise on the CPU (ICED_BACKEND=$ICED_BACKEND)" >&2 ;;
+    esac
     echo "gpu-env: clients ICED_BACKEND=$ICED_BACKEND WGPU_BACKEND=${WGPU_BACKEND:-unset}" >&2
 
     LEANDROS_RENDERER_DECIDED=1

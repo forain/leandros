@@ -16,8 +16,24 @@
 # /bin/gpu-env (WGPU_BACKEND / ICED_BACKEND).
 #
 # Usage: build-wgpu-clients.sh <x86_64|aarch64> [app ...]
-#   apps: greeter launcher notifications osd workspaces files-applet applets
-#   (default: all). Output: $ART/m6-session-bins/out-wgpu/<name>-<arch>.
+#   apps: greeter launcher notifications osd workspaces files-applet
+#   (default: those six), and "applets" (NOT in the default set, see below).
+#   Output: $ART/m6-session-bins/out-wgpu/<name>-<arch>.
+#
+# applibrary, settings and term already ship with wgpu (their original
+# recipes enable it) and need no rebuild.
+#
+# PANEL APPLETS STAY ON tiny-skia (cosmic-panel-button, applet-minimize,
+# applet-tiling): they are clients of cosmic-panel's embedded Wayland server,
+# which only creates its zwp_linux_dmabuf_v1 global if its GLES renderer
+# already exists when bind_display() runs at startup
+# (xdg_shell_wrapper/mod.rs:93 -> shared_state.rs:139); on LeandrOS the
+# renderer comes up ~0.3 s later, so the applets' server has no dmabuf, and
+# Mesa's Wayland WSI (Venus) / EGL (virgl) cannot present from a hardware
+# driver without it: wgpu fails with ERROR_SURFACE_LOST_KHR and the applet
+# exits. Fixing that needs a cosmic-panel source change, which is out of
+# bounds. The original tiny-skia-only applet builds ignore ICED_BACKEND
+# (only iced's fallback compositor reads it), so they keep working.
 # Runs on any machine that has the m6-session-bins toolchain (Mac, linux
 # desktop). The per-machine build-rust.sh / gen-cargo-config.sh are used.
 set -uo pipefail
@@ -30,7 +46,7 @@ OUT=$D/out-wgpu
 mkdir -p "$OUT"
 triple=$arch-unknown-linux-musl
 apps=("$@")
-[ ${#apps[@]} -gt 0 ] || apps=(greeter launcher notifications osd workspaces files-applet applets)
+[ ${#apps[@]} -gt 0 ] || apps=(greeter launcher notifications osd workspaces files-applet)
 
 # The cargo config carries absolute toolchain/sysroot paths; regenerate it
 # if it names another machine's tree.
