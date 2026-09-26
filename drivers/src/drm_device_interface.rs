@@ -1453,7 +1453,7 @@ pub fn drm_release_open(open_id: u32) {
             Some(mut g) => g.ctx_fences_outstanding_now(ctx),
             None => 0,
         };
-        let limit = CTX_DRAIN_US_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed);
+        let limit = CTX_DRAIN_US_OVERRIDE.load(::core::sync::atomic::Ordering::Relaxed);
         let limit = if limit == u64::MAX { CTX_DRAIN_US } else { limit };
         if left == 0 || crate::snd::monotonic_us().wrapping_sub(t0) >= limit { break; }
         sched::yield_now("gpu-ctx-drain");
@@ -1473,8 +1473,8 @@ pub fn drm_release_open(open_id: u32) {
 const CTX_DRAIN_US: u64 = 200_000;
 /// Test knob (root ioctl 0x100A): replaces `CTX_DRAIN_US`; u64::MAX = default.
 /// 0 forces the abandon path, so the parked-chain reclaim can be exercised.
-pub static CTX_DRAIN_US_OVERRIDE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(u64::MAX);
+pub static CTX_DRAIN_US_OVERRIDE: ::core::sync::atomic::AtomicU64 =
+    ::core::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// Record `fence` as the most recent submission on `open_id`. Silently does
 /// nothing for an open with no context, which cannot have submitted anything.
@@ -4364,7 +4364,7 @@ impl DrmDeviceInterface {
         if sched::current_euid() != 0 { return Err(DriverError::Access); }
         let p = arg as *mut u64;
         let old = CTX_DRAIN_US_OVERRIDE.swap(unsafe { p.read_volatile() },
-                                             core::sync::atomic::Ordering::Relaxed);
+                                             ::core::sync::atomic::Ordering::Relaxed);
         unsafe { p.write_volatile(old); }
         Ok(0)
     }
