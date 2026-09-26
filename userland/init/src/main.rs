@@ -16,7 +16,9 @@ use leandros_libc::{
     open, read, close, dup3, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND,
     fork, wait4, setsid, ioctl, usleep, exit, clock_gettime, timespec,
 };
-use leandros_libc::syscall::{nr, syscall2};
+use leandros_libc::syscall::{nr, syscall2, syscall4};
+
+const O_CLOEXEC: usize = 0x8_0000;
 
 const TIOCSCTTY: usize = 0x540E;
 
@@ -52,6 +54,23 @@ const DM_TEXT_LOGIN_MARKER: &[u8] = b"/etc/leandros/text-login\0";
 /// compositor is about to draw over, and painting thousands of tracing lines
 /// into it costs a full-surface memmove per scrolled line.
 const DM_LOG: &[u8] = b"/var/log/greetd.log\0";
+/// The previous generation, kept when `DM_LOG` reaches `DM_LOG_CAP`.
+const DM_LOG_OLD: &[u8] = b"/var/log/greetd.log.1\0";
+/// Size cap of one log generation. The chain writes through a pipe to a
+/// logger child (`run_dm_logger`), which rotates at this size, so the log
+/// costs at most two generations of disk however hard something spams it.
+/// A cosmic-panel spinning on a dead Wayland connection (virgl, 2026-09-25)
+/// wrote 8.4 M lines, over a gigabyte, before the guest died.
+const DM_LOG_CAP: usize = 8 << 20;
+/// Memory-pressure guard (`mem_guard`): when MemAvailable stays below this
+/// floor for `MEM_GUARD_STRIKES` consecutive checks `MEM_GUARD_PERIOD_SECS`
+/// apart, init kills the graphical login's tree, as systemd-oomd kills a
+/// session's cgroup. The floor is the larger of a fixed minimum and a
+/// fraction of RAM.
+const MEM_GUARD_MIN_KIB: u64 = 96 * 1024;
+const MEM_GUARD_DIVISOR: u64 = 10;
+const MEM_GUARD_PERIOD_SECS: u64 = 2;
+const MEM_GUARD_STRIKES: u32 = 2;
 const DM_PID_FILE: &[u8] = b"/run/greetd-init.pid\0";
 /// Respawn spacing and ceiling. A greeter chain that dies at once (a missing
 /// library, a compositor that cannot open the GPU) must not become a fork
@@ -117,7 +136,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
 
     // 5. Graphical login, when the image carries one and nothing opted out.
     let graphical = graphical_login_wanted();
-    let mut dm_pid: i32 = if graphical { spawn_display_manager() } else { 0 };
+    let (mut dm_pid, mut dm_logger) = if graphical { spawn_display_manager() } else { (0, 0) };
     let mut dm_respawns: u32 = 0;
     let mut dm_delay_us: u32 = DM_RESPAWN_DELAY_US;
     let mut dm_started: u64 = monotonic_secs();
@@ -129,9 +148,22 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // also reaps any orphan reparented to init, which is simply ignored.
     write_str("Starting getty loop...\n");
     let mut login_pid: i32 = spawn_login();
+    let mut guard = MemGuard { last_check: 0, strikes: 0 };
     loop {
         let mut status = 0i32;
-        let pid = wait4(-1, &mut status, 0, core::ptr::null_mut());
+        // WNOHANG and a short sleep instead of a blocking wait4, so the
+        // memory-pressure guard gets to run while nothing exits.
+        const WNOHANG: i32 = 1;
+        let pid = wait4(-1, &mut status, WNOHANG, core::ptr::null_mut());
+        if pid == 0 {
+            if dm_pid > 0 { mem_guard(&mut guard, dm_pid); }
+            usleep(250_000);
+            continue;
+        }
+        if pid == dm_logger {
+            dm_logger = 0;
+            continue;
+        }
         if pid <= 0 {
             // No children at all (both spawns failed): back off and retry.
             usleep(1_000_000);
@@ -149,7 +181,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             // forever, at ~180 MiB and a full CPU apiece, and every respawn
             // adds another. systemd would kill the unit's cgroup here; we
             // kill what the kernel has reparented to us (see `sweep_strays`).
-            sweep_strays(login_pid);
+            sweep_strays(login_pid, dm_logger);
             // Exit 78 (EX_CONFIG) from /bin/greeter-real: /bin/gpu-env found
             // no hardware GL renderer and refused to start a software-rendered
             // COSMIC. Not a crash — respawning cannot fix it — so say it once,
@@ -187,7 +219,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             usleep(dm_delay_us);
             dm_delay_us = (dm_delay_us.saturating_mul(2)).min(DM_RESPAWN_DELAY_MAX_US);
             if graphical_login_wanted() {
-                dm_pid = spawn_display_manager();
+                let (p, l) = spawn_display_manager();
+                dm_pid = p;
+                if l > 0 { dm_logger = l; }
                 dm_started = monotonic_secs();
             }
         }
@@ -216,7 +250,7 @@ unsafe fn monotonic_secs() -> u64 {
 /// SIGKILL, not SIGTERM: a greeter spinning on a dead compositor socket is
 /// past graceful shutdown, and nothing else in that tree survives greetd on
 /// a systemd host either.
-unsafe fn sweep_strays(login_pid: i32) {
+unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
     const SIGKILL: usize = 9;
     let me = getpid() as u32;
     let login_sid = if login_pid > 0 { proc_stat(login_pid as u32).map(|(_, _, _, s)| s) } else { None };
@@ -231,7 +265,10 @@ unsafe fn sweep_strays(login_pid: i32) {
         let mut killed_this_pass = 0u32;
         let mut pid = 1u32;
         while pid <= last {
-            if pid != me && pid as i32 != login_pid {
+            // The log writer is spared: it exits by itself on EOF, once the
+            // last process holding the chain's stdout is gone, and killing it
+            // would lose the dying chain's last lines.
+            if pid != me && pid as i32 != login_pid && pid as i32 != logger_pid {
                 if let Some((state, ppid, _pgid, sid)) = proc_stat(pid) {
                     let protected = match login_sid { Some(s) => s == sid, None => false };
                     // A zombie is already dead and waiting for the wait4 loop.
@@ -348,28 +385,57 @@ unsafe fn graphical_login_wanted() -> bool {
     true
 }
 
-/// Fork the graphical login chain. Returns the child's pid, or -1.
+/// Fork the graphical login chain. Returns `(chain pid, logger pid)`; either
+/// is -1 (chain) or 0 (logger) when it could not be started.
 ///
 /// The child becomes a session leader with no controlling tty (greetd runs with
 /// `vt = "none"`, and the compositor takes the display through DRM, not through
-/// a tty), reads nothing (stdin is /dev/null) and logs to `DM_LOG`. It then
+/// a tty), reads nothing (stdin is /dev/null) and writes its stdout/stderr to
+/// a pipe drained by a logger child (`run_dm_logger`) into `DM_LOG`. It then
 /// execs `/bin/sh /bin/greeter-real` with the minimal environment the launcher
 /// itself completes.
-unsafe fn spawn_display_manager() -> i32 {
+///
+/// WHY A PIPE, not the file itself: the log has to be bounded, and nothing in
+/// the chain can bound it. Every COSMIC component's output reaches the file
+/// through cosmic-session, whose launch-pad forwards each child line through
+/// an unbounded channel. A child that spins printing an error therefore grows
+/// cosmic-session's heap as well as the file whenever the file writes lag
+/// behind (2026-09-25, virgl: ~110 MiB/min of user pages, guest OOM at
+/// ~13.5 min). The logger reads the pipe in 64 KiB chunks and rotates the file
+/// at `DM_LOG_CAP`. The memory side is `mem_guard`'s job.
+unsafe fn spawn_display_manager() -> (i32, i32) {
     mkdir(b"/var\0".as_ptr(), 0o755);
     mkdir(b"/var/log\0".as_ptr(), 0o755);
     mkdir(b"/etc/leandros\0".as_ptr(), 0o755);
+
+    // Log pipe. The read end goes to the logger, the write end becomes the
+    // chain's stdout/stderr. init keeps neither end, or the logger could never
+    // see EOF.
+    let mut fds = [-1i32; 2];
+    let have_pipe = syscall2(nr::PIPE2, fds.as_mut_ptr() as usize, O_CLOEXEC) == 0;
+    let mut logger: i32 = 0;
+    if have_pipe {
+        let lp = fork();
+        if lp == 0 {
+            close(fds[1]);
+            run_dm_logger(fds[0]);
+        }
+        if lp > 0 { logger = lp; } else { write_str("ERROR: fork failed for the greetd logger\n"); }
+    }
+
     let pid = fork();
     if pid < 0 {
         write_str("ERROR: fork failed for the graphical login\n");
-        return pid;
+        if have_pipe { close(fds[0]); close(fds[1]); }
+        return (pid, logger);
     }
     if pid > 0 {
+        if have_pipe { close(fds[0]); close(fds[1]); }
         write_str("graphical login started (greetd, pid ");
         write_u32(pid as u32);
         write_str("), log at /var/log/greetd.log\n");
         write_pid_file(pid as u32);
-        return pid;
+        return (pid, logger);
     }
     // Child.
     setsid();
@@ -378,11 +444,22 @@ unsafe fn spawn_display_manager() -> i32 {
         dup3(devnull, 0, 0);
         if devnull != 0 { close(devnull); }
     }
-    let log = open(DM_LOG.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0o644);
-    if log >= 0 {
-        dup3(log, 1, 0);
-        dup3(log, 2, 0);
-        if log > 2 { close(log); }
+    if have_pipe && logger > 0 {
+        // dup3 with no flags clears O_CLOEXEC on 1 and 2; the originals
+        // close here (and on exec anyway).
+        dup3(fds[1], 1, 0);
+        dup3(fds[1], 2, 0);
+        close(fds[0]);
+        close(fds[1]);
+    } else {
+        // No pipe or no logger: the old direct file, unbounded but working.
+        if have_pipe { close(fds[0]); close(fds[1]); }
+        let log = open(DM_LOG.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0o644);
+        if log >= 0 {
+            dup3(log, 1, 0);
+            dup3(log, 2, 0);
+            if log > 2 { close(log); }
+        }
     }
     let argv: [*const u8; 3] = [DM_SHELL.as_ptr(), DM_LAUNCHER.as_ptr(), core::ptr::null()];
     let envp: [*const u8; 3] = [
@@ -395,6 +472,143 @@ unsafe fn spawn_display_manager() -> i32 {
     // applies its ceiling.
     write_str("ERROR: execve /bin/sh /bin/greeter-real failed\n");
     exit(1);
+}
+
+/// The logger child: drain the chain's pipe into `DM_LOG`, rotating to
+/// `DM_LOG_OLD` at `DM_LOG_CAP`, and exit on EOF, which comes when the last
+/// process holding the chain's stdout/stderr is gone. Never returns.
+unsafe fn run_dm_logger(rfd: i32) -> ! {
+    static mut BUF: [u8; 65536] = [0; 65536];
+    const AT_FDCWD: usize = -100isize as usize;
+    // Leave the serial console alone: nothing here should print there except
+    // a failure to open the log.
+    let open_log = || open(DM_LOG.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0o644);
+    let mut log = open_log();
+    if log < 0 {
+        write_str("ERROR: greetd logger cannot open /var/log/greetd.log\n");
+    }
+    let mut size = 0usize;
+    let mut rotations = 0u32;
+    let buf = &mut *core::ptr::addr_of_mut!(BUF);
+    loop {
+        let n = read(rfd, buf.as_mut_ptr(), buf.len());
+        if n == 0 { break; }
+        if n < 0 {
+            if leandros_libc::errno::get_errno() == 4 { continue; } // EINTR
+            break;
+        }
+        let n = n as usize;
+        if log >= 0 && size + n > DM_LOG_CAP {
+            close(log);
+            syscall4(nr::RENAMEAT, AT_FDCWD, DM_LOG.as_ptr() as usize,
+                     AT_FDCWD, DM_LOG_OLD.as_ptr() as usize);
+            log = open_log();
+            size = 0;
+            rotations = rotations.saturating_add(1);
+            if log >= 0 {
+                let mut line = [0u8; 96];
+                let head = b"[init] greetd.log rotated (generation ";
+                let mut p = head.len();
+                line[..p].copy_from_slice(head);
+                p += fmt_u32(&mut line[p..], rotations);
+                let tail = b"; previous in greetd.log.1)\n";
+                line[p..p + tail.len()].copy_from_slice(tail);
+                p += tail.len();
+                write(log, line.as_ptr(), p);
+                size += p;
+            }
+        }
+        if log < 0 { continue; } // keep draining so the writers never block
+        let mut off = 0usize;
+        while off < n {
+            let w = write(log, buf.as_ptr().add(off), n - off);
+            if w <= 0 { break; }
+            off += w as usize;
+        }
+        size += n;
+    }
+    exit(0);
+}
+
+/// State of the memory-pressure guard between supervisor iterations.
+struct MemGuard {
+    last_check: u64,
+    strikes: u32,
+}
+
+/// Kill the graphical login's tree when the guest is about to run out of
+/// memory, instead of letting the kernel's allocator fail under everything.
+///
+/// systemd-oomd does the same at a session's cgroup. There is no per-process
+/// RSS to pick a single victim by (`/proc/<pid>/status` VmRSS is a constant),
+/// and the graphical tree is where every such runaway seen so far lived: a
+/// greeter spinning on a dead compositor, or cosmic-session queueing the
+/// lines of a panel spinning on a dead Wayland connection. SIGKILL goes to
+/// greetd. The normal exit path then sweeps the orphans (`sweep_strays`) and
+/// respawns the login under the usual backoff and ceiling.
+unsafe fn mem_guard(g: &mut MemGuard, dm_pid: i32) {
+    let now = monotonic_secs();
+    if now < g.last_check + MEM_GUARD_PERIOD_SECS { return; }
+    g.last_check = now;
+    let (total, avail) = match meminfo_kib() { Some(v) => v, None => return };
+    let floor = core::cmp::max(MEM_GUARD_MIN_KIB, total / MEM_GUARD_DIVISOR);
+    if avail >= floor {
+        g.strikes = 0;
+        return;
+    }
+    g.strikes += 1;
+    if g.strikes < MEM_GUARD_STRIKES { return; }
+    g.strikes = 0;
+    write_str("\n");
+    write_str("################################################################\n");
+    write_str("## MEMORY PRESSURE: MemAvailable ");
+    write_u32((avail / 1024) as u32);
+    write_str(" MiB < floor ");
+    write_u32((floor / 1024) as u32);
+    write_str(" MiB.\n");
+    write_str("## Killing the graphical login (greetd pid ");
+    write_u32(dm_pid as u32);
+    write_str(") and its session;\n");
+    write_str("## it restarts under the usual backoff. See /var/log/greetd.log.\n");
+    write_str("################################################################\n");
+    // The serial console is not always being read (a driver socket with no
+    // client drops it), so leave the same fact in the log the chain wrote.
+    let fd = open(DM_LOG.as_ptr(), O_WRONLY | O_APPEND, 0);
+    if fd >= 0 {
+        let mut line = [0u8; 128];
+        let mut p = 0;
+        let head = b"[init] MEMORY PRESSURE: MemAvailable ";
+        line[..head.len()].copy_from_slice(head); p += head.len();
+        p += fmt_u32(&mut line[p..], (avail / 1024) as u32);
+        let mid = b" MiB < floor ";
+        line[p..p + mid.len()].copy_from_slice(mid); p += mid.len();
+        p += fmt_u32(&mut line[p..], (floor / 1024) as u32);
+        let tail = b" MiB; killing the graphical login\n";
+        line[p..p + tail.len()].copy_from_slice(tail); p += tail.len();
+        write(fd, line.as_ptr(), p);
+        close(fd);
+    }
+    syscall2(nr::KILL, dm_pid as usize, 9);
+}
+
+/// `(MemTotal, MemAvailable)` in KiB from /proc/meminfo.
+unsafe fn meminfo_kib() -> Option<(u64, u64)> {
+    let mut buf = [0u8; 512];
+    let n = read_file(b"/proc/meminfo\0", &mut buf);
+    if n == 0 { return None; }
+    let mut total = None;
+    let mut avail = None;
+    for line in buf[..n].split(|&b| b == b'\n') {
+        let key_end = match line.iter().position(|&b| b == b':') { Some(i) => i, None => continue };
+        let val = line[key_end + 1..].split(|&b| b == b' ').find(|f| !f.is_empty());
+        let v = match val.and_then(parse_u32) { Some(v) => v as u64, None => continue };
+        match &line[..key_end] {
+            b"MemTotal" => total = Some(v),
+            b"MemAvailable" => avail = Some(v),
+            _ => {}
+        }
+    }
+    Some((total?, avail?))
 }
 
 /// Record the supervised greetd pid so a root shell can `kill` the chain

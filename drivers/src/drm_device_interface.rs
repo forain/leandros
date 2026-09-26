@@ -930,6 +930,14 @@ struct DumbBuf {
     /// panic, greetd's SIGKILL alarm — leaked every scanout buffer it had:
     /// three 8 MiB dumb buffers per 1920x1080 cosmic-comp death, forever.
     owner: u32,
+    /// 0 for the record CREATE_DUMB / VIRTGPU_RESOURCE_CREATE made (the
+    /// *primary*, which owns the pages, `refs` and the host resource). Nonzero
+    /// for an **import alias**: the gem handle PRIME_FD_TO_HANDLE minted for
+    /// another open (`prime_import_dumb`), holding the primary's handle key.
+    /// An alias carries one reference on the primary and nothing else; see
+    /// `prime_import_dumb` for why the importer may not share the exporter's
+    /// handle number.
+    alias_of: u32,
 }
 
 static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new());
@@ -1605,7 +1613,72 @@ fn blob_lookup(handle: u32, open_id: u32) -> Option<BlobView> {
 /// to keep an exported dmabuf fd valid; it must resolve nowhere, so the handle
 /// number is exactly as dead as it was before the refcount existed.
 fn dumb_lookup(handle: u32) -> Option<DumbBuf> {
-    DUMB_BUFFERS.lock().get(&handle).filter(|b| b.handle_live).copied()
+    let map = DUMB_BUFFERS.lock();
+    let b = map.get(&handle).filter(|b| b.handle_live).copied()?;
+    if b.alias_of == 0 { return Some(b); }
+    // An import alias resolves to its primary's live state (host resource,
+    // fence), under the alias's own identity. The primary may already have
+    // had its own handle retired; the alias's reference keeps it in the map.
+    let p = map.get(&b.alias_of).copied()?;
+    Some(DumbBuf { handle_live: true, owner: b.owner, alias_of: b.alias_of, ..p })
+}
+
+/// The registry key that owns `handle`'s object state: the primary record's
+/// handle for an import alias, `handle` itself otherwise. Taken with the map
+/// already locked by the caller.
+fn dumb_primary_key(map: &BTreeMap<u32, DumbBuf>, handle: u32) -> u32 {
+    match map.get(&handle) {
+        Some(b) if b.alias_of != 0 => b.alias_of,
+        _ => handle,
+    }
+}
+
+/// PRIME_FD_TO_HANDLE for a **dumb / virgl 3D** object: give the IMPORTING
+/// open a gem handle of its own, or the one it already holds on the object.
+///
+/// WHY. The dumb registry's handle space is global, and FD_TO_HANDLE used to
+/// echo the exporter's handle number to the importer. Upstream gives every
+/// `drm_file` its own handle, and a GEM_CLOSE only retires the caller's. Here
+/// the importer's GEM_CLOSE (`free_dumb`) retired the EXPORTER's handle, and
+/// so did an importer's `drm_release_open` sweep. Under virgl this is the
+/// normal flow: Mesa's virgl winsys imports every client dmabuf with
+/// PRIME_FD_TO_HANDLE + RESOURCE_INFO and closes the handle when the
+/// wl_buffer goes. cosmic-comp closing a cosmic-panel buffer therefore killed
+/// the panel's own handle, and every later import of that buffer, by the
+/// compositor or the panel's nested applet server, hit a retired handle
+/// (`RESOURCE_INFO: unknown bo_handle`). The import failed, and the panel
+/// never appeared. The same happened when the exporter destroyed a buffer
+/// whose dmabuf fd was still in flight: upstream the fd keeps the object
+/// importable, and here the import resolved to a dead handle.
+///
+/// The alias is one reference on the primary, released by GEM_CLOSE like any
+/// other handle and swept with the importer's open. `None` for no identity
+/// (open 0, where every handle is reachable anyway) or no such object. The
+/// caller then falls back to the exporter's handle, as before.
+pub fn prime_import_dumb(obj: u32, open_id: u32) -> Option<u32> {
+    if open_id == 0 || obj == 0 { return None; }
+    let mut map = DUMB_BUFFERS.lock();
+    // A handle this open already holds on the object: its own primary, or an
+    // alias minted by an earlier import. Upstream dedups the same way.
+    if let Some((h, _)) = map.iter().find(|(_, b)| {
+        b.obj == obj && b.owner == open_id && b.handle_live
+    }) {
+        return Some(*h);
+    }
+    let pkey = map.iter().find(|(_, b)| b.obj == obj && b.alias_of == 0).map(|(h, _)| *h)?;
+    let p = map.get_mut(&pkey)?;
+    p.refs = p.refs.saturating_add(1);
+    let alias = DumbBuf {
+        last_fence: 0,
+        refs: 1,
+        handle_live: true,
+        owner: open_id,
+        alias_of: pkey,
+        ..*p
+    };
+    let handle = DrmDumbBuffer::next_handle();
+    map.insert(handle, alias);
+    Some(handle)
 }
 
 /// The host virtio-gpu resource already bound to `handle`, if any.
@@ -1630,13 +1703,18 @@ fn dumb_lookup(handle: u32) -> Option<DumbBuf> {
 /// created by `VIRTGPU_RESOURCE_CREATE` keeps the 3D resource it already owns
 /// instead of having a 2D one created over the top of it.
 fn fb_resource_id(handle: u32) -> Option<u32> {
-    DUMB_BUFFERS.lock().get(&handle).map(|b| b.res_id).filter(|r| *r != 0)
+    let map = DUMB_BUFFERS.lock();
+    let key = dumb_primary_key(&map, handle);
+    map.get(&key).map(|b| b.res_id).filter(|r| *r != 0)
 }
 
 /// Remember the host resource bound to `handle`, so a second ADDFB on the same
 /// BO reuses it rather than allocating (and re-attaching) a second one.
 fn fb_set_resource_id(handle: u32, res_id: u32) {
-    if let Some(b) = DUMB_BUFFERS.lock().get_mut(&handle) { b.res_id = res_id; }
+    // On the primary: it is the record whose death releases the resource.
+    let mut map = DUMB_BUFFERS.lock();
+    let key = dumb_primary_key(&map, handle);
+    if let Some(b) = map.get_mut(&key) { b.res_id = res_id; }
 }
 
 // ── Blob framebuffers ────────────────────────────────────────────────────────
@@ -1744,10 +1822,19 @@ fn present_blob_fb(
     fb_id: DrmObjectId,
     rects: Option<&[(i32, i32, i32, i32)]>,
 ) -> Option<Result<(), DriverError>> {
-    let (res, w, h, format, stride, offset) = {
+    // A virgl 3D BO (VIRTGPU_RESOURCE_CREATE) is presented the same way minus
+    // the blob: its pixels live in the host texture and its guest pages are
+    // only TRANSFER_3D staging, so the CPU-copy present below would upload
+    // stale staging memory into the console resource — the noise every virgl
+    // scanout showed. Upstream (`virtio_gpu_primary_plane_update`) points the
+    // scanout at the 3D resource with plain SET_SCANOUT and repaints with
+    // RESOURCE_FLUSH; so do we.
+    let (res, w, h, format, stride, offset, virgl) = {
         let fb = device.get_framebuffer(fb_id)?;
-        if fb.blob_res == 0 || fb.physical_addresses[0] != 0 { return None; }
-        (fb.blob_res, fb.width, fb.height, fb.virtio_format, fb.pitches[0], fb.offsets[0])
+        let virgl = fb.blob_res == 0 && crate::virtio_gpu::is_host_rendered(fb.handles[0]);
+        if !virgl && (fb.blob_res == 0 || fb.physical_addresses[0] != 0) { return None; }
+        let res = if virgl { fb.handles[0] } else { fb.blob_res };
+        (res, fb.width, fb.height, fb.virtio_format, fb.pitches[0], fb.offsets[0], virgl)
     };
     if w == 0 || h == 0 { return Some(Err(DriverError::InvalidParameter)); }
 
@@ -1778,7 +1865,15 @@ fn present_blob_fb(
             None => return Some(Err(DriverError::NotFound)),
         };
         let mut switched = false;
-        if gpu.current_scanout() != res {
+        if gpu.current_scanout() != res && virgl {
+            if !gpu.set_scanout_resource(res, w, h) {
+                crate::pci::serial_debug("[DRM] SET_SCANOUT (virgl) refused res=");
+                crate::pci::serial_debug_hex(res);
+                crate::pci::serial_debug("\n");
+                return Some(Err(DriverError::Io));
+            }
+            switched = true;
+        } else if gpu.current_scanout() != res {
             if !gpu.set_scanout_blob(res, w, h, format, stride, offset) {
                 crate::pci::serial_debug("[DRM] SET_SCANOUT_BLOB refused res=");
                 crate::pci::serial_debug_hex(res);
@@ -1792,7 +1887,7 @@ fn present_blob_fb(
         // there is damage or the binding just moved.
         if x0 < x1 && y0 < y1 {
             if !gpu.resource_flush(res, x0, y0, x1 - x0, y1 - y0) {
-                crate::pci::serial_debug("[DRM] blob RESOURCE_FLUSH refused res=");
+                crate::pci::serial_debug("[DRM] scanout RESOURCE_FLUSH refused res=");
                 crate::pci::serial_debug_hex(res);
                 crate::pci::serial_debug("\n");
                 return Some(Err(DriverError::Io));
@@ -1853,9 +1948,13 @@ fn bo_attach_fence(handle: u32, open_id: u32, fence: u64) -> bool {
             None => false,
         };
     }
-    match DUMB_BUFFERS.lock().get_mut(&handle) {
-        Some(b) if b.handle_live => { b.last_fence = fence; true }
-        _ => false,
+    let mut map = DUMB_BUFFERS.lock();
+    if !map.get(&handle).map_or(false, |b| b.handle_live) { return false; }
+    // The fence belongs to the object: an alias writes its primary's.
+    let key = dumb_primary_key(&map, handle);
+    match map.get_mut(&key) {
+        Some(b) => { b.last_fence = fence; true }
+        None => false,
     }
 }
 
@@ -1951,7 +2050,7 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
 /// release, never on a per-frame path.
 fn dumb_unref_by_obj(obj: u32) -> bool {
     let mut m = DUMB_BUFFERS.lock();
-    let handle = match m.iter().find(|(_, b)| b.obj == obj) {
+    let handle = match m.iter().find(|(_, b)| b.obj == obj && b.alias_of == 0) {
         Some((h, _)) => *h,
         None => return false,
     };
@@ -2304,7 +2403,11 @@ pub fn prime_export_acquire(handle: u32, open_id: u32) -> Option<PrimeExport> {
     // reported before this function existed: GBM/EGL fstat the exported fd and
     // the compositor has been running against that number since 36f62d0.
     let mut dumb = DUMB_BUFFERS.lock();
-    let b = dumb.get_mut(&handle).filter(|b| b.handle_live)?;
+    if !dumb.get(&handle).map_or(false, |b| b.handle_live) { return None; }
+    // The fd's reference is on the object (`bo_release_exported` drops it by
+    // obj, on the primary), so an alias's export charges its primary.
+    let key = dumb_primary_key(&dumb, handle);
+    let b = dumb.get_mut(&key)?;
     b.refs = b.refs.saturating_add(1);
     Some(PrimeExport {
         phys: b.phys,
@@ -4579,17 +4682,30 @@ impl DrmDeviceInterface {
     fn free_dumb(handle: u32) {
         let mut map = DUMB_BUFFERS.lock();
         let zero = match map.get_mut(&handle) {
+            // An import alias owns no pages: retiring it removes the alias and
+            // drops the one reference it held on its primary. The primary's
+            // own `handle_live` is untouched — that handle is the exporter's.
+            Some(b) if b.alias_of != 0 => {
+                let pkey = b.alias_of;
+                map.remove(&handle);
+                match map.get_mut(&pkey) {
+                    Some(p) => {
+                        p.refs = p.refs.saturating_sub(1);
+                        if p.refs == 0 { map.remove(&pkey) } else { None }
+                    }
+                    None => None,
+                }
+            }
             Some(b) if !b.handle_live => return, // already retired
             Some(b) => {
                 b.handle_live = false;
                 b.refs = b.refs.saturating_sub(1);
-                b.refs == 0
+                if b.refs == 0 { map.remove(&handle) } else { None }
             }
             None => return,
         };
-        let dead = if zero { map.remove(&handle) } else { None };
         drop(map);
-        if let Some(b) = dead {
+        if let Some(b) = zero {
             dumb_release_host_resource(b.res_id);
             mm::buddy::free(b.phys, b.order);
         }
@@ -5574,6 +5690,16 @@ impl DrmDeviceInterface {
         };
         if size == 0 { return Err(DriverError::InvalidParameter); }
 
+        // Upstream parity: `virtio_gpu_resource_create_ioctl` creates the
+        // open's context first (lazily, host-default capset) and
+        // `virtio_gpu_gem_object_open` then CTX_ATTACH_RESOURCEs the new BO to
+        // it. We did neither, so virglrenderer's per-context resource table
+        // never held the resource: the first TRANSFER_3D that named it failed
+        // with `Illegal resource N`, the renderer put the whole context in the
+        // error state, and every later draw/blit was silently dropped — the
+        // virgl scanout showed noise (kmscube) or black (cosmic-greeter).
+        let ctx = ctx_ensure(open_id);
+
         let pages = size.div_ceil(4096);
         let order = pages.next_power_of_two().trailing_zeros() as usize;
         let phys = mm::buddy::alloc(order).ok_or(DriverError::Io)?;
@@ -5602,6 +5728,14 @@ impl DrmDeviceInterface {
                 mm::buddy::free(phys, order);
                 return Err(DriverError::Io);
             }
+            // Logged, not propagated — as in the blob path and upstream.
+            if ctx != 0 && !gpu.ctx_attach_resource(ctx, rid) {
+                crate::pci::serial_debug("[DRM] RESOURCE_CREATE: CTX_ATTACH_RESOURCE refused ctx=");
+                crate::pci::serial_debug_hex(ctx);
+                crate::pci::serial_debug(" res=");
+                crate::pci::serial_debug_hex(rid);
+                crate::pci::serial_debug("\n");
+            }
             rid
         };
         // The host renders into it; presents must not 2D-transfer over it.
@@ -5622,6 +5756,7 @@ impl DrmDeviceInterface {
             handle_live: true,
             res_id: res_handle,
             owner: open_id,
+            alias_of: 0,
         });
 
         // bo_handle @40, res_handle @44, size @48, stride @52.
@@ -6463,10 +6598,11 @@ impl DrmDeviceInterface {
     /// carries the ownership that upstream's per-`drm_file` GEM table carries.
     /// It costs Mesa nothing: it creates and queries on the same fd.
     ///
-    /// Only blob BOs are known here. A dumb-buffer handle has no `res_handle`
-    /// recorded (DumbBuf carries no host resource id), and Venus never creates
-    /// dumb buffers, so an unknown handle is refused with NotFound — upstream's
-    /// -ENOENT for a handle lookup miss.
+    /// Blob BOs, plus virgl 3D BOs from VIRTGPU_RESOURCE_CREATE (dumb registry,
+    /// `res_id` host-rendered) — the latter also take a CTX_ATTACH_RESOURCE
+    /// for the asking open, the only VIRTIO_GPU lock taken here and with no
+    /// user memory touched under it. A plain 2D dumb buffer is still refused
+    /// with NotFound — upstream's -ENOENT for a handle lookup miss.
     fn virtgpu_handle_resource_info(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         // Read the input BEFORE taking any lock, and write the outputs back
@@ -6474,6 +6610,35 @@ impl DrmDeviceInterface {
         // 82d0cc3 all-vCPU freeze class. No device round-trip is needed — this
         // is pure guest-side bookkeeping — so VIRTIO_GPU is never locked at all.
         let req = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_resource_info) };
+
+        // A virgl 3D BO (VIRTGPU_RESOURCE_CREATE) lives in the dumb registry,
+        // not the blob maps. Mesa's virgl winsys imports every dmabuf with
+        // PRIME_FD_TO_HANDLE + RESOURCE_INFO, so refusing it here failed every
+        // cross-process import: cosmic-comp answered cosmic-panel's
+        // linux-dmabuf `create_immed` with "produced an invalid wl_buffer" and
+        // the panel/dock never appeared under virgl. Answer it, and attach the
+        // resource to the asking open's context the way upstream's
+        // `virtio_gpu_gem_object_open` does for an imported object — the host
+        // refuses commands naming a resource its context was never given.
+        if blob_lookup(req.bo_handle, open_id).is_none() {
+            if let Some(d) = dumb_lookup(req.bo_handle).filter(|d| {
+                d.res_id != 0 && crate::virtio_gpu::is_host_rendered(d.res_id)
+            }) {
+                let ctx = ctx_ensure(open_id);
+                if ctx != 0 {
+                    if let Some(gpu) = crate::virtio_gpu::VIRTIO_GPU.lock().as_mut() {
+                        let _ = gpu.ctx_attach_resource(ctx, d.res_id);
+                    }
+                }
+                let size = ((1usize << d.order) * 4096) as u32;
+                unsafe {
+                    (arg as *mut u8).add(4).cast::<u32>().write_volatile(d.res_id);
+                    (arg as *mut u8).add(8).cast::<u32>().write_volatile(size);
+                    (arg as *mut u8).add(12).cast::<u32>().write_volatile(0);
+                }
+                return Ok(0);
+            }
+        }
 
         let blob = match blob_lookup(req.bo_handle, open_id) {
             Some(b) => b,
@@ -7424,6 +7589,7 @@ impl DrmDumbBuffer {
                 // time (see fb_resource_id), not here.
                 res_id: 0,
                 owner,
+                alias_of: 0,
             },
         );
         
@@ -7442,14 +7608,15 @@ impl DrmDumbBuffer {
         })
     }
 
-    /// Get next available handle
+    /// Next gem handle. Drawn from the SAME atomic counter as blob handles:
+    /// the two registries are told apart only by which map holds a handle,
+    /// and `gem_handle_delete` tries both, so their key spaces must never
+    /// meet. The old private counter started at 1 and was a non-atomic
+    /// `static mut` read-modify-write (two CPUs could mint one handle twice),
+    /// and after 0x4000 dumb/virgl allocations — a virgl client reallocating
+    /// per resize gets there — it walked into `NEXT_BLOB_HANDLE`'s range.
     fn next_handle() -> u32 {
-        static mut NEXT_HANDLE: u32 = 1;
-        unsafe {
-            let handle = NEXT_HANDLE;
-            NEXT_HANDLE += 1;
-            handle
-        }
+        NEXT_BLOB_HANDLE.fetch_add(1, Ordering::Relaxed)
     }
 }
 

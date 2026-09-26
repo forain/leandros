@@ -2304,6 +2304,14 @@ impl VirtioGpuDevice {
         self.send_command_async(data)
     }
 
+    /// Point scanout 0 at `resource_id` (a whole `width`x`height` surface) and
+    /// record it as current — the virgl 3D counterpart of `set_scanout_blob`.
+    pub fn set_scanout_resource(&mut self, resource_id: u32, width: u32, height: u32) -> bool {
+        if !self.set_scanout(resource_id, width, height) { return false; }
+        self.current_resource_id = resource_id;
+        true
+    }
+
     pub fn flush(&mut self, resource_id: u32, x: u32, y: u32, width: u32, height: u32) -> bool {
         // Switch scanout if needed
         if self.current_resource_id != resource_id {
