@@ -559,6 +559,11 @@ pub static LAST_PRESENT_FENCE: core::sync::atomic::AtomicU64 = core::sync::atomi
 /// runs from the tick and must not take `VIRTIO_GPU`.
 pub static GPU_FENCE_FLOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Fences of destroyed contexts retired in the accounting because the host
+/// never will (`VirtioGpuDevice::ctx_abandon_fences`). Each one also leaves a
+/// control-queue chain parked host-side.
+pub static CTX_FENCES_ABANDONED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// A reap retired at least one fence and the DRM layer has not been told yet.
 /// Set under `VIRTIO_GPU` (any context), consumed by `ctrlq_tick`.
 static FENCE_EVENT_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -2609,6 +2614,71 @@ impl VirtioGpuDevice {
         self.drain_deferred_frees();
         if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
         self.fence_retired(id)
+    }
+
+    /// The context a queued chain was submitted on (`VirtioGpuCtrlHdr::ctx_id`,
+    /// read back from the request buffer, which the chain owns until reaped).
+    fn inflight_ctx(e: &Inflight) -> u32 {
+        unsafe { ((mm::phys_to_virt(e.req_phys) as *const u8).add(16) as *const u32).read_unaligned() }
+    }
+
+    /// Fenced commands of `ctx_id` the host has not answered, after draining
+    /// the used ring. Task context.
+    pub fn ctx_fences_outstanding_now(&mut self, ctx_id: u32) -> usize {
+        self.drain_deferred_frees();
+        if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
+        self.inflight.iter().flatten()
+            .filter(|e| e.fence_id != 0 && !e.sync && Self::inflight_ctx(e) == ctx_id)
+            .count()
+    }
+
+    /// `ctx_id` has been destroyed: every fenced command of it still in flight
+    /// will never be answered. The host (QEMU's virgl backend) retires a
+    /// context-ring fence only through that context, and a destroyed context
+    /// retires nothing, so the command stays parked host-side for good.
+    ///
+    /// Left alone, that one fence is a hole under `fence_floor`: the floor is
+    /// exact and stops below it, so every later fence — every present, every
+    /// other client's — reads "not retired" until `fences_ahead` overflows and
+    /// the floor jumps (about two drmsmoke runs' worth). That was drmsmoke's
+    /// `FLIP_EVENT_DELIVERED_ON_FENCE` 0/32 right after a Venus compositor was
+    /// killed: every flip fell to the tick fallback, then it healed by itself.
+    ///
+    /// So retire those ids in the accounting now. The chains themselves stay
+    /// in `inflight`: the device still owns their buffers, and if it ever does
+    /// answer, the reap frees them (with the fence already cleared here, so it
+    /// is not retired twice). Returns how many were abandoned.
+    pub fn ctx_abandon_fences(&mut self, ctx_id: u32) -> usize {
+        let mut total = 0usize;
+        loop {
+            // In batches, because `fence_complete` needs `self` back.
+            let mut ids = [0u64; 16];
+            let mut n = 0usize;
+            for slot in self.inflight.iter_mut() {
+                if n == ids.len() { break; }
+                if let Some(e) = slot.as_mut() {
+                    if e.fence_id == 0 || e.sync || Self::inflight_ctx(e) != ctx_id { continue; }
+                    ids[n] = e.fence_id;
+                    n += 1;
+                    e.fence_id = 0;
+                }
+            }
+            if n == 0 { break; }
+            for &id in &ids[..n] { self.fence_complete(id); }
+            total += n;
+        }
+        if total != 0 {
+            FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release);
+            let k = CTX_FENCES_ABANDONED.fetch_add(total as u64, core::sync::atomic::Ordering::Relaxed);
+            if k < 8 {
+                crate::pci::serial_debug("[GPU] ctx ");
+                crate::pci::serial_debug_hex(ctx_id);
+                crate::pci::serial_debug(" destroyed with unanswered fences: abandoned ");
+                crate::pci::serial_debug_hex(total as u32);
+                crate::pci::serial_debug("\n");
+            }
+        }
+        total
     }
 
     fn hdr_for(&self, cmd: VirtioGpuCmd, ctx_id: u32) -> VirtioGpuCtrlHdr {

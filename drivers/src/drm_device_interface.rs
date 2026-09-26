@@ -1370,6 +1370,8 @@ pub fn drm_release_open(open_id: u32) {
     // exits — or crashes — while holding master leaves the node permanently
     // EBUSY for the next one, and nothing short of a reboot can present again.
     drm_master_clear(open_id);
+    // Its page-flip events: see `PENDING_FLIPS`.
+    drm_events_release_open(open_id);
     // Take the slot and DROP the guard before touching the device — see the
     // lock-order note above.
     let ctx = {
@@ -1439,11 +1441,34 @@ pub fn drm_release_open(open_id: u32) {
     // blobs, above, still had to be reclaimed.
     if ctx == 0 { return; }
 
+    // Let the context's in-flight fenced work retire BEFORE destroying it: the
+    // host answers a context-ring fence only through its context, so a fence
+    // still outstanding at CTX_DESTROY is never answered (see
+    // `ctx_abandon_fences`). A client killed mid-frame has a submit or two in
+    // flight that the GPU finishes within a frame; wait for that, bounded,
+    // with the device lock released between looks.
+    let t0 = crate::snd::monotonic_us();
+    loop {
+        let left = match crate::virtio_gpu::lock_gpu() {
+            Some(mut g) => g.ctx_fences_outstanding_now(ctx),
+            None => 0,
+        };
+        if left == 0 || crate::snd::monotonic_us().wrapping_sub(t0) >= CTX_DRAIN_US { break; }
+        sched::yield_now("gpu-ctx-drain");
+    }
+
     let mut guard = crate::virtio_gpu::lock_gpu();
     if let Some(gpu) = guard.as_mut() {
         gpu.ctx_destroy(ctx);
+        // Whatever did not retire in time never will.
+        gpu.ctx_abandon_fences(ctx);
     }
 }
+
+/// Bound on waiting for a closing open's in-flight GPU work before its context
+/// is destroyed. Normal work retires within a frame; this only caps a client
+/// that left the GPU waiting on something that will never happen.
+const CTX_DRAIN_US: u64 = 200_000;
 
 /// Record `fence` as the most recent submission on `open_id`. Silently does
 /// nothing for an open with no context, which cannot have submitted anything.
@@ -3168,7 +3193,17 @@ fn v3d_fence_done(fence: u64) -> bool {
 // Either way delivery is in queue order. This gives Smithay/kmscube a stable
 // frame cadence and keeps idle CPU at zero (idletest guards it).
 //
-// Entry: (event bytes, present fence or 0, ns queued at).
+// Entry: (event bytes, present fence or 0, ns queued at, open it is for).
+//
+// PER OPEN. An event belongs to the card0 open that asked for it, the way a
+// DRM event belongs to its `drm_file` upstream: read()/poll() on an open see
+// only that open's events, and `drm_release_open` drops whatever a closed open
+// still had queued. Both queues used to be global, so a client killed with a
+// flip in flight (a compositor, kmscube) left its event behind and the NEXT
+// client's first read() returned it — wrong `user_data`, and every later read
+// of that client one event behind (drmsmoke right after SIGKILLing a zink
+// kmscube: READ_FLIP_EVENT, FLIP_TS_SUBTICK and all five GPU_IRQ burst checks
+// failed, 1 of 32 flips counted on the fence; lane/polish 2026-09-26).
 //
 // The queued-at timestamp is `arch_monotonic_ns()`, NOT `sched::ticks()`.
 // This one used to be tick-counted, like every other deadline before the
@@ -3186,13 +3221,13 @@ fn v3d_fence_done(fence: u64) -> bool {
 // flip was delivered and nothing hung, timed out, or lost an interrupt. Using
 // the free-running clock instead gives every entry the full, real grace
 // period regardless of phase.
-static PENDING_FLIPS: Mutex<VecDeque<([u8; 32], u64, u64)>> = Mutex::new(VecDeque::new());
+static PENDING_FLIPS: Mutex<VecDeque<([u8; 32], u64, u64, u32)>> = Mutex::new(VecDeque::new());
 /// Nanoseconds a fenced flip may wait for its fence before the tick delivers
 /// it anyway: two full 100 Hz tick periods (10 ms each). One tick's worth is
 /// the poller's own reap latency when no interrupt is armed, so one would
 /// make the fallback race the poller it backs up.
 const FLIP_FALLBACK_NS: u64 = 2 * 10_000_000;
-static READY_EVENTS:  Mutex<VecDeque<[u8; 32]>> = Mutex::new(VecDeque::new());
+static READY_EVENTS:  Mutex<VecDeque<(u32, [u8; 32])>> = Mutex::new(VecDeque::new());
 static FLIP_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static LAST_FLIP_DELIVER_TICK: AtomicU64 = AtomicU64::new(0);
 
@@ -3243,7 +3278,7 @@ extern "C" {
 /// try_lock). `fence` is the present's (`virtio_gpu::LAST_PRESENT_FENCE`,
 /// read by the caller right after the present it issued) or 0 for a commit
 /// that presented nothing, which the tick delivers.
-fn queue_flip_event(crtc_id: u32, user_data: u64, fence: u64) {
+fn queue_flip_event(open_id: u32, crtc_id: u32, user_data: u64, fence: u64) {
     let seq = FLIP_SEQUENCE.fetch_add(1, Ordering::SeqCst);
     // Sub-tick-resolution timestamp (interpolated inside the current 100 Hz
     // tick from the arch's free-running counter) rather than the raw tick
@@ -3262,7 +3297,7 @@ fn queue_flip_event(crtc_id: u32, user_data: u64, fence: u64) {
     };
     let mut blob = [0u8; 32];
     unsafe { ptr::copy_nonoverlapping(&ev as *const _ as *const u8, blob.as_mut_ptr(), 32); }
-    PENDING_FLIPS.lock().push_back((blob, fence, now_ns));
+    PENDING_FLIPS.lock().push_back((blob, fence, now_ns, open_id));
 }
 
 /// Promote every pending flip, in order, whose present the host has retired.
@@ -3271,13 +3306,13 @@ fn queue_flip_event(crtc_id: u32, user_data: u64, fence: u64) {
 fn flip_fence_service() -> bool {
     let floor = crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire);
     let mut pend = match PENDING_FLIPS.try_lock() { Some(g) => g, None => return false };
-    let due = pend.front().map(|&(_, f, _)| f != 0 && f <= floor).unwrap_or(false);
+    let due = pend.front().map(|&(_, f, _, _)| f != 0 && f <= floor).unwrap_or(false);
     if !due { return true; }
     let mut ready = match READY_EVENTS.try_lock() { Some(g) => g, None => return false };
     let mut n = 0u64;
-    while let Some(&(_, f, _)) = pend.front() {
+    while let Some(&(_, f, _, _)) = pend.front() {
         if f == 0 || f > floor { break; }
-        if let Some((blob, _, _)) = pend.pop_front() { ready.push_back(blob); n += 1; }
+        if let Some((blob, _, _, o)) = pend.pop_front() { ready.push_back((o, blob)); n += 1; }
     }
     drop(ready);
     drop(pend);
@@ -3553,13 +3588,13 @@ pub fn drm_tick() {
     // lost) fence retirement under real GPU present latency.
     let now_ns = unsafe { arch_monotonic_ns() };
     let tick_due = match pend.front() {
-        Some(&(_, f, queued)) => f == 0 || now_ns.wrapping_sub(queued) >= FLIP_FALLBACK_NS,
+        Some(&(_, f, queued, _)) => f == 0 || now_ns.wrapping_sub(queued) >= FLIP_FALLBACK_NS,
         None => false,
     };
     if !tick_due { return; }
     let mut ready = match READY_EVENTS.try_lock() { Some(g) => g, None => return };
-    if let Some((blob, _, _)) = pend.pop_front() {
-        ready.push_back(blob);
+    if let Some((blob, _, _, o)) = pend.pop_front() {
+        ready.push_back((o, blob));
         drop(ready);
         drop(pend);
         LAST_FLIP_DELIVER_TICK.store(now, Ordering::Relaxed);
@@ -3568,22 +3603,33 @@ pub fn drm_tick() {
     }
 }
 
-/// Drain whole (32-byte) DRM events into `out`. Returns bytes written (0 = EAGAIN).
-pub fn drm_read_events(out: &mut [u8]) -> usize {
+/// Drain whole (32-byte) DRM events of `open_id` into `out`, in order.
+/// Returns bytes written (0 = EAGAIN). Other opens' events stay queued.
+pub fn drm_read_events(open_id: u32, out: &mut [u8]) -> usize {
     let mut ready = READY_EVENTS.lock();
     let mut written = 0;
-    while out.len() - written >= 32 {
-        match ready.pop_front() {
-            Some(ev) => { out[written..written + 32].copy_from_slice(&ev); written += 32; }
-            None => break,
+    let mut i = 0;
+    while i < ready.len() && out.len() - written >= 32 {
+        if ready[i].0 != open_id { i += 1; continue; }
+        if let Some((_, ev)) = ready.remove(i) {
+            out[written..written + 32].copy_from_slice(&ev);
+            written += 32;
         }
     }
     written
 }
 
-/// Poll readiness for the card fd: true when a DRM event is queued to read.
-pub fn drm_has_events() -> bool {
-    !READY_EVENTS.lock().is_empty()
+/// Poll readiness for a card fd: true when an event of `open_id` is queued.
+pub fn drm_has_events(open_id: u32) -> bool {
+    READY_EVENTS.lock().iter().any(|&(o, _)| o == open_id)
+}
+
+/// Drop every event, pending or ready, that a closing open still had queued.
+/// Nobody can read them any more; left in place, a pending one would also
+/// hold up the queue behind it until the tick fallback.
+fn drm_events_release_open(open_id: u32) {
+    PENDING_FLIPS.lock().retain(|e| e.3 != open_id);
+    READY_EVENTS.lock().retain(|e| e.0 != open_id);
 }
 
 // ── DRM master ───────────────────────────────────────────────────────────────
@@ -3841,7 +3887,7 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_MAP_DUMB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_map_dumb(&mut g, arg) },
             DRM_IOCTL_MODE_ADDFB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_addfb(&mut g, arg, open_id) },
             DRM_IOCTL_MODE_SETCRTC => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_set_crtc(&mut g, arg) },
-            DRM_IOCTL_MODE_PAGE_FLIP => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_page_flip(&mut g, arg) },
+            DRM_IOCTL_MODE_PAGE_FLIP => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_page_flip(&mut g, arg, open_id) },
 
             // ── Virtio-GPU 3D IOCTLs (lock VIRTIO_GPU, not the DRM device) ──
             DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => self.virtgpu_handle_resource_create(arg, open_id),
@@ -3874,7 +3920,7 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_GETPROPERTY => self.std_handle_get_property(arg),
 
             // ── Atomic KMS ──
-            DRM_IOCTL_MODE_ATOMIC => self.std_handle_atomic(arg),
+            DRM_IOCTL_MODE_ATOMIC => self.std_handle_atomic(arg, open_id),
             DRM_IOCTL_MODE_CREATEPROPBLOB => self.std_handle_create_blob(arg),
             DRM_IOCTL_MODE_DESTROYPROPBLOB => self.std_handle_destroy_blob(arg),
             DRM_IOCTL_MODE_GETPROPBLOB => self.std_handle_get_blob(arg),
@@ -4658,7 +4704,7 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
-    fn std_handle_page_flip(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+    fn std_handle_page_flip(&mut self, device: &mut DrmDevice, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let flip = unsafe { &mut *(arg as *mut drm_mode_crtc_page_flip) };
 
@@ -4683,7 +4729,7 @@ impl DrmDeviceInterface {
         // the next frame.
         if r.is_ok() { FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed); }
         if r.is_ok() && (flags & DRM_MODE_PAGE_FLIP_EVENT != 0) {
-            queue_flip_event(crtc_id, user_data,
+            queue_flip_event(open_id, crtc_id, user_data,
                 crate::virtio_gpu::LAST_PRESENT_FENCE.load(Ordering::Acquire));
         }
         r
@@ -5029,7 +5075,7 @@ impl DrmDeviceInterface {
     /// connector and encoder all have id 1, so the type is recovered from the
     /// property id instead — the property-id ranges are disjoint per object
     /// class exactly so this is unambiguous.
-    fn std_handle_atomic(&mut self, arg: usize) -> Result<usize, DriverError> {
+    fn std_handle_atomic(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
 
         // Copy the entire request into kernel memory BEFORE taking any lock: a
@@ -5259,7 +5305,7 @@ impl DrmDeviceInterface {
             } else {
                 0
             };
-            queue_flip_event(DRM_CRTC_ID, user_data, fence);
+            queue_flip_event(open_id, DRM_CRTC_ID, user_data, fence);
         }
         Ok(0)
     }
