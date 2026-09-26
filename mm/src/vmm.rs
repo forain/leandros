@@ -917,15 +917,35 @@ impl AddressSpace {
         Fault::Handled
     }
 
+    /// Is `va` an absent page of a file-backed VMA — one whose fault must read
+    /// the file, which is only done with the address space unlocked?
+    fn is_absent_file_page(&self, va: usize) -> bool {
+        self.regions.iter().filter_map(|r| r.as_ref())
+            .find(|r| va >= r.start && va < r.end)
+            .map_or(false, |r| {
+                r.lazy && is_file_backed(r.file_cap)
+                    && r.lazy_pages.get((va - r.start) / PAGE_SIZE).copied().unwrap_or(0) == 0
+            })
+    }
+
     /// Demand-page all unmapped pages in `[addr, addr+len)` so the kernel can
     /// safely write to user buffers without taking a kernel-mode page fault.
-    pub fn prefault_range(&mut self, addr: usize, len: usize) {
-        if len == 0 { return; }
+    ///
+    /// Never reads a file: it stops at the first absent page of a file-backed
+    /// VMA and returns its address. The caller (it holds this address space)
+    /// must drop the lock, fault that page in through the unlocked fault path
+    /// (`sched::prefault_user_page`) and call again from the next page —
+    /// `sched::prefault_current_range` is that loop. `None`: the whole range
+    /// was handled.
+    #[must_use]
+    pub fn prefault_range(&mut self, addr: usize, len: usize) -> Option<usize> {
+        if len == 0 { return None; }
         let page_start = addr & !(PAGE_SIZE - 1);
         let page_end   = (addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let mut va = page_start;
         while va < page_end {
             if self.virt_to_phys(va).is_none() {
+                if self.is_absent_file_page(va) { return Some(va); }
                 self.handle_user_page_fault(va, false);
             } else {
                 // A kernel store into a writable page still shared
@@ -937,6 +957,7 @@ impl AddressSpace {
             }
             va += PAGE_SIZE;
         }
+        None
     }
 
     /// [`prefault_range`](Self::prefault_range) for a buffer the kernel will
@@ -945,17 +966,22 @@ impl AddressSpace {
     /// the HHDM) never faults. Copying it would be pure waste: execve reads
     /// argv/envp from a freshly forked child's CoW stack just before throwing
     /// the whole address space away.
-    pub fn prefault_range_ro(&mut self, addr: usize, len: usize) {
-        if len == 0 { return; }
+    ///
+    /// Stops at an absent file-backed page like `prefault_range`.
+    #[must_use]
+    pub fn prefault_range_ro(&mut self, addr: usize, len: usize) -> Option<usize> {
+        if len == 0 { return None; }
         let page_start = addr & !(PAGE_SIZE - 1);
         let page_end   = (addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let mut va = page_start;
         while va < page_end {
             if self.virt_to_phys(va).is_none() {
+                if self.is_absent_file_page(va) { return Some(va); }
                 self.handle_user_page_fault(va, false);
             }
             va += PAGE_SIZE;
         }
+        None
     }
 
     /// If the page at `va` is still shared copy-on-write with another address

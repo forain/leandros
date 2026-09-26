@@ -26,6 +26,7 @@ pub mod clone;
 pub mod context;
 pub mod futex;
 pub mod lockwatch;
+pub mod idlestat;
 pub mod pcsample;
 pub mod runqueue;
 pub mod signal;
@@ -2816,6 +2817,34 @@ pub fn prefault_user_page(addr: usize) -> bool {
     page_fault(addr, false, true)
 }
 
+/// Make `[ptr, ptr+len)` of the current process safe for a kernel access:
+/// every page present, and (unless `read_only`) no page still shared
+/// copy-on-write. File-backed pages are read with the address space
+/// UNLOCKED, through the real fault path: `prefault_range` stops at each
+/// absent file page, the lock is dropped, the page is faulted in, and the
+/// walk resumes after it. So no prefault ever holds `busy` across file I/O.
+/// A page that cannot be populated (past EOF, bad address) is skipped and
+/// left to the caller's own access to report.
+pub fn prefault_current_range(ptr: usize, len: usize, read_only: bool) {
+    if ptr == 0 || len == 0 { return; }
+    let end = match ptr.checked_add(len) { Some(e) => e, None => return };
+    let mut from = ptr;
+    while from < end {
+        let pid = current_pid();
+        let next = with_address_space_mut(pid, |as_| {
+            if read_only { as_.prefault_range_ro(from, end - from) }
+            else { as_.prefault_range(from, end - from) }
+        }).flatten();
+        match next {
+            None => return,
+            Some(va) => {
+                let _ = prefault_user_page(va);
+                from = va + mm::buddy::PAGE_SIZE;
+            }
+        }
+    }
+}
+
 fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
     fn print_str(s: &str) {
         extern "C" { fn arch_serial_putc(c: u8); }
@@ -3342,6 +3371,13 @@ fn scheduler_run_loop() -> ! {
         if let Some((idx, ctx_ptr, dispatched_pid, kernel_stack_top_virt, page_table, tgid, reply_port, as_ptr)) = picked {
             let dispatched_at = ticks();
             let dispatched_ns = unsafe { arch_monotonic_ns() };
+            if idlestat::ENABLED {
+                let l = LAST_SYSCALL[(dispatched_pid as usize) & 1023].load(Ordering::Relaxed);
+                let sc = if (l >> 32) as u32 == dispatched_pid && l & 1 != 0 {
+                    ((l >> 1) & 0x7FFF_FFFF) as u32
+                } else { u32::MAX };
+                idlestat::on_dispatch(dispatched_pid, tgid, sc);
+            }
             let pid;
 
             unsafe {
@@ -3450,11 +3486,15 @@ fn scheduler_run_loop() -> ! {
                 mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
             }
         } else {
+            let t_idle = if idlestat::ENABLED { unsafe { arch_monotonic_ns() } } else { 0 };
             unsafe {
                 #[cfg(target_arch = "x86_64")]
                 core::arch::asm!("sti; hlt; cli");
                 #[cfg(target_arch = "aarch64")]
                 core::arch::asm!("msr daifclr, #2; wfi; msr daifset, #2");
+            }
+            if idlestat::ENABLED {
+                idlestat::on_idle(id, unsafe { arch_monotonic_ns() }.saturating_sub(t_idle));
             }
         }
     }
