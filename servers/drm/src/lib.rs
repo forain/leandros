@@ -366,7 +366,9 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
 
         let mut kbuf = [0u8; 256];
         let cap = count.min(kbuf.len());
-        let n = drivers::drm_device_interface::drm_read_events(&mut kbuf[..cap]);
+        // Slot 4: the open this read is on (VFS cookie) — events are per open.
+        let open_id = arg(msg, 4) as u32;
+        let n = drivers::drm_device_interface::drm_read_events(open_id, &mut kbuf[..cap]);
         if n == 0 { return err_reply(-11); } // EAGAIN
 
         let ok = sched::with_task_address_space(pid, || {
@@ -381,7 +383,8 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         }
     } else if msg.tag == vfs_server::VFS_POLL {
         // POLLIN when a page-flip event is queued to read.
-        let revents: u32 = if drivers::drm_device_interface::drm_has_events() { 0x1 } else { 0 };
+        // Slot 4: the open this poll is on — answered from that open's queue.
+        let revents: u32 = if drivers::drm_device_interface::drm_has_events(arg(msg, 4) as u32) { 0x1 } else { 0 };
         // (revents, seq): seq echoes the delivered-flip counter so epoll's
         // edge emulation re-arms on each new event.
         let seq = drivers::drm_device_interface::drm_event_seq();
