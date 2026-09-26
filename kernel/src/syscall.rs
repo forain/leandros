@@ -2512,7 +2512,15 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
                 // (e.g. a compositor that runs for the session) at 100 % CPU —
                 // init/shell waiters stayed perpetually runnable, churning the
                 // scheduler run-loop and starving the very child's event loop.
-                sched::block_on_poll_prepare_until(sched::monotonic_ns() + 20_000_000);
+                //
+                // The park names this process (poll_class::WAIT): an exit
+                // requests that tag as it is logged (`log_exit`), and a
+                // SIGCHLD or any broadcast wake still reaches it. The deadline
+                // is only a backstop now; at 20 ms it woke every idle waiter
+                // (greetd, init's shells) 50 times a second for nothing.
+                sched::block_on_poll_prepare_masked(
+                    sched::monotonic_ns() + 1_000_000_000,
+                    sched::poll_tag(sched::poll_class::WAIT, caller_tgid));
                 if matches!(sched::wait_peek(sel, caller_tgid, what), sched::WaitTry::StillRunning)
                     && !interrupted() {
                     sched::block_on_poll_commit();
@@ -2605,7 +2613,10 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
                 // a service) otherwise pins its blocking-waitid reaper at
                 // 100 % CPU. Woken by child-exit SIGCHLD -> wake_poll; the
                 // 2-tick poll deadline bounds a missed edge to ~20 ms.
-                sched::block_on_poll_prepare_until(sched::monotonic_ns() + 20_000_000);
+                // Same park as wait4 (see there): tagged, 1 s backstop.
+                sched::block_on_poll_prepare_masked(
+                    sched::monotonic_ns() + 1_000_000_000,
+                    sched::poll_tag(sched::poll_class::WAIT, caller_tgid));
                 let peek = sched::wait_peek(sel, caller_tgid, what);
                 if !matches!(peek, sched::WaitTry::StillRunning) || interrupted() {
                     sched::block_on_poll_cancel();
@@ -8570,7 +8581,7 @@ pub fn poll_deadline_service(now: u64) -> u64 {
         // reporting it and the waiter would sleep until its own timeout. Hand
         // the expired timerfds' tags to the deferred-wake path, which the next
         // tick pays with `try_wake_poll_tagged` (and re-arms on contention).
-        if !sched::service_poll_deadlines(now, timerfd_tags != 0) && timerfd_tags != 0 {
+        if !sched::service_poll_deadlines(now, timerfd_tags) && timerfd_tags != 0 {
             sched::request_poll_wake_tagged(timerfd_tags);
         }
     }

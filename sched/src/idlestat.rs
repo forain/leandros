@@ -35,6 +35,44 @@ static IDLE_NS: [AtomicU64; crate::MAX_CPUS] = [const { AtomicU64::new(0) }; cra
 static IDLE0: [AtomicU64; crate::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::MAX_CPUS];
 static WIN_START: AtomicU64 = AtomicU64::new(0);
 
+/// Poll-channel wakes by call site: (file ptr, line, calls, tasks woken).
+/// Broadcast (`POLL_TAG_ALL`) wakes and timerfd deadline wakes are what the
+/// idle census needs to attribute; a small open-addressed table is enough.
+const SITES: usize = 48;
+static SITE_FILE: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+static SITE_LINE: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
+static SITE_LEN: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
+static SITE_CALLS: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
+static SITE_WOKEN: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
+static SITE_TAGGED: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
+
+/// Record a poll-channel wake from `loc` that made `woken` tasks Ready.
+#[inline]
+pub fn note_wake(loc: &'static core::panic::Location<'static>, broadcast: bool, woken: usize) {
+    if !ENABLED { return; }
+    let f = loc.file().as_ptr() as u64;
+    let l = loc.line();
+    let h = ((f >> 3) as usize ^ (l as usize).wrapping_mul(31)) % SITES;
+    for k in 0..SITES {
+        let i = (h + k) % SITES;
+        let cur = SITE_FILE[i].load(Relaxed);
+        if cur == 0 {
+            if SITE_FILE[i].compare_exchange(0, f, Relaxed, Relaxed).is_ok() || SITE_FILE[i].load(Relaxed) == f {
+                if SITE_LINE[i].load(Relaxed) == 0 {
+                    SITE_LEN[i].store(loc.file().len() as u32, Relaxed);
+                    SITE_LINE[i].store(l, Relaxed);
+                }
+            }
+        }
+        if SITE_FILE[i].load(Relaxed) == f && SITE_LINE[i].load(Relaxed) == l {
+            SITE_CALLS[i].fetch_add(1, Relaxed);
+            SITE_WOKEN[i].fetch_add(woken as u32, Relaxed);
+            if !broadcast { SITE_TAGGED[i].fetch_add(1, Relaxed); }
+            return;
+        }
+    }
+}
+
 /// Dispatcher hook: `pid` (thread group `tgid`) is about to run.
 #[inline]
 pub fn on_dispatch(pid: u32, tgid: u32, resume_sc: u32) {
@@ -103,6 +141,21 @@ pub fn tick(now: u64) {
     }
     g::s(" disp_per_s="); g::d((total_disp * 1_000_000_000 / win.max(1)) as usize);
     g::nl();
+    for i in 0..SITES {
+        let calls = SITE_CALLS[i].swap(0, Relaxed);
+        let woken = SITE_WOKEN[i].swap(0, Relaxed);
+        let tagged = SITE_TAGGED[i].swap(0, Relaxed);
+        if calls == 0 { continue; }
+        let f = SITE_FILE[i].load(Relaxed) as *const u8;
+        g::s("[WAKESITE] ");
+        let n = SITE_LEN[i].load(Relaxed) as usize;
+        g::bytes(unsafe { core::slice::from_raw_parts(f, n) });
+        g::s(":"); g::d(SITE_LINE[i].load(Relaxed) as usize);
+        g::s(" calls="); g::d(calls as usize);
+        g::s(" tagged="); g::d(tagged as usize);
+        g::s(" woken="); g::d(woken as usize);
+        g::nl();
+    }
     let mut taken = [false; SLOTS];
     for _ in 0..TOP {
         let mut best = usize::MAX; let mut bv = 0u64;
@@ -136,4 +189,5 @@ mod g {
         for &b in &buf[i..] { unsafe { arch_serial_putc(b) } }
     }
     pub fn nl() { s("\n"); }
+    pub fn bytes(b: &[u8]) { for &c in b { unsafe { arch_serial_putc(c) } } }
 }

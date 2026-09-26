@@ -383,14 +383,19 @@ impl RunQueue {
     }
 
     /// Poll-deadline tick service: wake every task on `port` whose
-    /// `poll_deadline` is due (`<= now`) or, when `timerfd_due`, all of them
-    /// (a timerfd expired — every parked poller must re-probe it). Returns
+    /// `poll_deadline` is due (`<= now`), and every poller whose interest mask
+    /// names a timerfd that expired on this pass (`timerfd_tags`, an OR of
+    /// `poll_tag(TIMERFD, slot)`; a broadcast-mask waiter always matches).
+    /// This used to wake EVERY parked poller on any timerfd expiry: on the
+    /// idle COSMIC desktop that was ~100 threads re-probing their epoll sets
+    /// at each of the ~6.6 expiries a second — most of the guest's wakeups.
+    /// Returns
     /// `(earliest_remaining_deadline, woken)` so the caller can republish the
     /// exact next deadline (no single-global clobber) and kick an idle CPU.
     /// The whole scan runs under one RUN_QUEUE hold, so a woken task can only
     /// re-register its next deadline after this returns — the recomputed
     /// minimum can never be stale-clobbered by a concurrent register.
-    pub fn wake_due_poll_deadlines(&mut self, port: u32, now: u64, timerfd_due: bool)
+    pub fn wake_due_poll_deadlines(&mut self, port: u32, now: u64, timerfd_tags: u64)
         -> (u64, usize)
     {
         let min_vr = self.min_vruntime();
@@ -402,12 +407,11 @@ impl RunQueue {
                 let is_poll  = task.blocked_on == Some(port);
                 // Timed futex waiters (see sched::futex_wait) register a
                 // `poll_deadline` and must be released at timeout too — they are
-                // Blocked on `blocked_futex`, not the poll channel. `timerfd_due`
-                // is a poll-channel concept (an expired timerfd every poller must
-                // re-probe) and never mass-wakes futex waiters.
+                // Blocked on `blocked_futex`, not the poll channel. A timerfd
+                // expiry is a poll-channel concept and never wakes futex waiters.
                 let is_futex = task.blocked_futex != 0;
                 if !is_poll && !is_futex { continue; }
-                if (timerfd_due && is_poll) || task.poll_deadline <= now {
+                if (is_poll && task.poll_mask & timerfd_tags != 0) || task.poll_deadline <= now {
                     self.maybe_ready[i / 64] |= 1u64 << (i % 64);
                     task.state         = TaskState::Ready;
                     if is_poll  { task.blocked_on = None; task.poll_mask = crate::POLL_TAG_ALL; }

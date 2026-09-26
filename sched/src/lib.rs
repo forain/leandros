@@ -207,6 +207,11 @@ fn log_exit(pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid, is_proces
     let mut idx = EXIT_LOG_IDX.lock();
     log[*idx] = Some(ExitRecord { pid, status, parent_tgid, pgid, is_process, consumed });
     *idx = (*idx + 1) % EXIT_LOG_LEN;
+    // A parent parked in wait4 on this child: every exit passes through here
+    // on its way out of the run queue, so this is the one edge its park can
+    // rely on (lock-free; the next tick pays it). The child's SIGCHLD wakes it
+    // too, but only when one is sent.
+    request_poll_wake_tagged(poll_tag(poll_class::WAIT, parent_tgid));
 }
 
 pub fn get_exit_code(pid: Pid) -> Option<i32> {
@@ -1678,6 +1683,8 @@ pub mod poll_class {
     pub const DEVVT:   u32 = 8;
     pub const DRM:     u32 = 9;
     pub const EVDEV:   u32 = 10;
+    /// A parent parked in wait4/waitid, indexed by its tgid.
+    pub const WAIT:    u32 = 11;
 }
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision
@@ -1739,14 +1746,19 @@ pub fn block_on_poll_commit()  { block_on_port_commit() }
 /// in net/vfs, the deadline tick, signal delivery) MUST hold no server lock —
 /// this takes RUN_QUEUE. Task context only (blocking lock); IRQ context uses
 /// `try_wake_poll`.
+#[track_caller]
 pub fn wake_poll() { wake_poll_tagged(POLL_TAG_ALL); }
 
 /// Wake every poll-channel waiter whose `poll_mask` intersects `tag`. A
 /// producer passes the `poll_tag(class, index)` of the object it changed; an
 /// unconvertible producer passes `POLL_TAG_ALL` (== `wake_poll`). Same lock /
 /// context contract as `wake_poll`.
+#[track_caller]
 pub fn wake_poll_tagged(tag: u64) {
     let woken = RUN_QUEUE.lock().unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
+    if idlestat::ENABLED {
+        idlestat::note_wake(core::panic::Location::caller(), tag == POLL_TAG_ALL, woken);
+    }
     if woken > 0 { wake_up_an_idle_cpu(); }
 }
 
@@ -1811,6 +1823,7 @@ pub fn service_deferred_poll_wake() {
 /// no-indefinite-wait contract (bounded `try_lock_spin`). Returns false (wake
 /// deferred) if RUN_QUEUE stays held on another CPU past the bound; the next
 /// tick retries.
+#[track_caller]
 pub fn try_wake_poll() -> bool { try_wake_poll_tagged(POLL_TAG_ALL) }
 
 /// How long an IRQ-context poll wake may wait for `RUN_QUEUE` before deferring
@@ -1820,12 +1833,16 @@ pub fn try_wake_poll() -> bool { try_wake_poll_tagged(POLL_TAG_ALL) }
 const TICK_LOCK_WAIT_NS: u64 = 50_000;
 
 /// Non-blocking `wake_poll_tagged` for IRQ / tick context.
+#[track_caller]
 pub fn try_wake_poll_tagged(tag: u64) -> bool {
     match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
             lockwatch::note_wake_try(true);
             let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
             drop(rq);
+            if idlestat::ENABLED {
+                idlestat::note_wake(core::panic::Location::caller(), tag == POLL_TAG_ALL, woken);
+            }
             if woken > 0 { wake_up_an_idle_cpu(); }
             true
         }
@@ -1834,7 +1851,8 @@ pub fn try_wake_poll_tagged(tag: u64) -> bool {
 }
 
 /// Poll-deadline tick service (IRQ/tick context): wake every poll-channel
-/// waiter whose per-task deadline is due (or all, when a timerfd has expired),
+/// waiter whose per-task deadline is due, or whose interest mask names a
+/// timerfd that expired on this pass (`timerfd_tags`),
 /// then republish `NEXT_POLL_DEADLINE` to the EXACT earliest remaining deadline.
 ///
 /// This replaces the old wake-then-`store(u64::MAX)` reset. That reset raced
@@ -1852,14 +1870,17 @@ pub fn try_wake_poll_tagged(tag: u64) -> bool {
 /// Bounded wait (`try_lock_spin`, ≤ `TICK_LOCK_WAIT_NS`) for the tick's
 /// contract; a tick that still finds the lock held leaves the hint and retries
 /// next tick (≤10 ms defer, within the timeout granularity).
-pub fn service_poll_deadlines(now: u64, timerfd_due: bool) -> bool {
+pub fn service_poll_deadlines(now: u64, timerfd_tags: u64) -> bool {
     match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
             lockwatch::note_tick_try(lockwatch::L_RUN_QUEUE, true);
             let (new_min, woken) =
-                rq.wake_due_poll_deadlines(POLL_WAIT_CHANNEL, now, timerfd_due);
+                rq.wake_due_poll_deadlines(POLL_WAIT_CHANNEL, now, timerfd_tags);
             NEXT_POLL_DEADLINE.store(new_min, Ordering::Relaxed); // exact, under the lock
             drop(rq);
+            if idlestat::ENABLED && woken > 0 {
+                idlestat::note_wake(core::panic::Location::caller(), timerfd_tags == POLL_TAG_ALL, woken);
+            }
             if woken > 0 { wake_up_an_idle_cpu(); }
             true
         }
