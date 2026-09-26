@@ -3249,6 +3249,9 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
     const FUTEX_WAIT:           usize = 0;
     const FUTEX_WAIT_BITSET:    usize = 9;
     let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+    // The private flag is part of the key: a private futex is only reachable
+    // from the caller's own thread group (sched::futex::key_matches).
+    let private = op & FUTEX_PRIVATE_FLAG != 0;
     match cmd {
         // FUTEX_WAIT and FUTEX_WAIT_BITSET: the bitset form is only ever
         // called with FUTEX_BITSET_MATCH_ANY by the libcs in this tree (musl,
@@ -3313,11 +3316,11 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
                     Some(deadline_after_ns(ns))
                 }
             };
-            sched::futex_wait(uaddr, val as u32, deadline)
+            sched::futex_wait_keyed(uaddr, val as u32, deadline, private)
         }
         1 => {
             // FUTEX_WAKE: wake up to `val` tasks sleeping on `uaddr`.
-            sched::futex_wake(uaddr, val as u32) as isize
+            sched::futex_wake_keyed(uaddr, val as u32, private) as isize
         }
         3 | 4 => {
             // FUTEX_REQUEUE = 3, FUTEX_CMP_REQUEUE = 4
@@ -3329,7 +3332,7 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
                     return -11; // EAGAIN
                 }
             }
-            sched::futex_requeue(uaddr, uaddr2, val as u32, timeout_ptr as u32)
+            sched::futex_requeue_keyed(uaddr, uaddr2, val as u32, timeout_ptr as u32, private)
         }
         _ => -38, // ENOSYS
     }
