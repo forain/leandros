@@ -793,6 +793,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_symlink_read(b"/data/xa", b"symlink_read_relative_f2fs\0", b"symlink_read_absolute_f2fs\0") { failures += 1; }
     if !test_symlink_cross_mount(b"symlink_cross_mount_tmpfs_to_f2fs\0") { failures += 1; }
 
+    if !test_fd_layout() { failures += 1; }
     if !test_timestamps(b"/tmp/xa", b"timestamps_tmpfs\0") { failures += 1; }
     if !test_timestamps(b"/data/xa", b"timestamps_f2fs\0") { failures += 1; }
     if !test_atime_relatime(b"/tmp/xa", b"atime_relatime_tmpfs\0") { failures += 1; }
@@ -1245,6 +1246,72 @@ unsafe fn test_append_after_lseek(dir: &[u8], name: &[u8]) -> bool {
     unlink(path);
     // "HEADTAIL", not "TAIL" (overwritten in place) and not "TAILHEAD".
     report(name, got == 8 && &buf[..8] == b"HEADTAIL")
+}
+
+#[cfg(target_arch = "aarch64")] const SYS_SOCKETPAIR_: usize = 199;
+#[cfg(target_arch = "x86_64")]  const SYS_SOCKETPAIR_: usize = 53;
+#[cfg(target_arch = "aarch64")] const SYS_PPOLL_: usize = 73;
+#[cfg(target_arch = "x86_64")]  const SYS_PPOLL_: usize = 271;
+#[cfg(target_arch = "aarch64")] const SYS_PSELECT6_: usize = 72;
+#[cfg(target_arch = "x86_64")]  const SYS_PSELECT6_: usize = 270;
+
+/// The fd-number layout (lane term20): VFS fds are [0, 512), socket fds start
+/// at 0x200 and stay below 1024 so select() covers them. A compositor with 20
+/// GL clients needed more than the old 256 VFS fds.
+///   * dup2 of a pipe end onto 255, 256 and 511 works and carries data;
+///     512 (the first socket number) is refused with EBADF.
+///   * a socketpair lands in [0x200, 0x400), passes data, and both ppoll and
+///     pselect6 see it readable.
+///   * a process can hold at least 500 VFS fds before EMFILE.
+unsafe fn test_fd_layout() -> bool {
+    let name = b"fd_layout_512\0";
+    let mut p = [0i32; 2];
+    if pipe(p.as_mut_ptr()) != 0 { return report(name, false); }
+    let mut ok = true;
+    for &t in &[255i32, 256, 511] {
+        if dup3(p[1], t, 0) != t { ok = false; continue; }
+        let b = [t as u8];
+        if write(t, b.as_ptr(), 1) != 1 { ok = false; }
+        let mut r = [0u8; 1];
+        if read(p[0], r.as_mut_ptr(), 1) != 1 || r[0] != t as u8 { ok = false; }
+        close(t);
+    }
+    if dup3(p[1], 512, 0) != -1 || get_errno() != EBADF { ok = false; }
+    close(p[0]); close(p[1]);
+
+    let mut sv = [0i32; 2];
+    let r = syscall4(SYS_SOCKETPAIR_, 1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0, sv.as_mut_ptr() as usize);
+    if r != 0 { return report(name, false); }
+    for &f in &sv { if !(0x200..0x400).contains(&f) { ok = false; } }
+    if write(sv[0], b"x".as_ptr(), 1) != 1 { ok = false; }
+    // struct pollfd { int fd; short events; short revents; }
+    let mut pfd = [0u8; 8];
+    pfd[..4].copy_from_slice(&sv[1].to_le_bytes());
+    pfd[4] = 1; // POLLIN
+    let ts = [0i64; 2];
+    let n = syscall5(SYS_PPOLL_, pfd.as_mut_ptr() as usize, 1, ts.as_ptr() as usize, 0, 8);
+    if n != 1 || pfd[6] & 1 == 0 { ok = false; }
+    let mut set = [0u64; 16]; // fd_set, FD_SETSIZE 1024
+    let fd = sv[1] as usize;
+    set[fd / 64] |= 1u64 << (fd % 64);
+    let n = leandros_libc::syscall::syscall6(SYS_PSELECT6_, fd + 1, set.as_mut_ptr() as usize, 0, 0, ts.as_ptr() as usize, 0);
+    if n != 1 || set[fd / 64] & (1u64 << (fd % 64)) == 0 { ok = false; }
+    let mut c = [0u8; 1];
+    if read(sv[1], c.as_mut_ptr(), 1) != 1 || c[0] != b'x' { ok = false; }
+    close(sv[0]); close(sv[1]);
+
+    // Capacity: dup until EMFILE, then give them all back.
+    let mut held = [0i32; 600];
+    let mut n = 0;
+    while n < held.len() {
+        let f = dup(0);
+        if f < 0 { break; }
+        held[n] = f;
+        n += 1;
+    }
+    if n < 500 || n == held.len() { ok = false; }
+    for &f in &held[..n] { close(f); }
+    report(name, ok)
 }
 
 // `struct flock` from leandros_libc::io, aliased for readability.

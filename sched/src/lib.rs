@@ -3277,6 +3277,37 @@ pub fn dump_tasks() {
                     }
                 }
             }
+            // A task parked in ppoll with no deadline: its pollfd array
+            // (fd:events) and the return addresses on its stack that land in
+            // executable file mappings, as `addr@vma_start+file_off`, so the
+            // caller can be symbolised offline against the library it came
+            // from. The wait with no wake is then named by fd and by frame.
+            if t.state == TaskState::Blocked && f.x[8] == 0x49 && t.poll_deadline == u64::MAX {
+                if let Some(a) = rq.find_pid(t.tgid).and_then(|l| l.address_space.as_ref()) {
+                    print_str("\n[TASKS]   pollfds n="); pn(f.x[1] as u32); print_str(":");
+                    for i in 0..(f.x[1] as usize).min(16) {
+                        let mut pf = [0u8; 8];
+                        if !a.read_user_buf(f.x[0] as usize + i * 8, &mut pf) { break; }
+                        print_str(" "); pn(i32::from_le_bytes([pf[0], pf[1], pf[2], pf[3]]) as u32);
+                        print_str(":"); ph(u16::from_le_bytes([pf[4], pf[5]]) as usize);
+                    }
+                    print_str("\n[TASKS]   ret:");
+                    let mut shown = 0;
+                    for i in 0..1024usize {
+                        let va = f.sp_el0 as usize + i * 8;
+                        let phys = match a.virt_to_phys(va) { Some(p) => p, None => break };
+                        let v = unsafe { (mm::phys_to_virt(phys) as *const u64).read_volatile() } as usize;
+                        if let Some(r) = a.find(v) {
+                            if r.prot & mm::vmm::PROT_EXEC != 0 && mm::vmm::is_file_backed(r.file_cap) {
+                                print_str(" "); ph(v); print_str("@"); ph(r.start);
+                                print_str("+"); ph(r.file_off as usize);
+                                shown += 1;
+                                if shown >= 24 { break; }
+                            }
+                        }
+                    }
+                }
+            }
         }
         print_str("\n");
     }

@@ -134,11 +134,16 @@ const EOPNOTSUPP: i32 = 95;
 
 pub const IPPROTO_ICMP: usize = 1;
 
-pub const SOCK_FD_BASE: usize = 0x100;
+/// First socket fd. VFS fds sit below it (vfs `MAX_FDS`). 0x100 -> 0x200
+/// (lane term20, 2026-09-27) when the VFS table grew to 512: a compositor with
+/// 20 GL clients needed more than 256 VFS fds.
+pub const SOCK_FD_BASE: usize = 0x200;
 /// One past the last socket fd. Socket fds occupy [SOCK_FD_BASE, SOCK_FD_END) =
-/// [0x100, 0x300); this stays below EPOLL_FD_BASE (0x400) and — with the dormant
+/// [0x200, 0x3FE); this stays below EPOLL_FD_BASE (0x400), and below 1024 so
+/// select()'s FD_SETSIZE still covers every socket, and — with the dormant
 /// TTY_FD_BASE relocated to 0x1000 — is disjoint from every other fd range.
 pub const SOCK_FD_END: usize = SOCK_FD_BASE + MAX_SOCKS;
+const _: () = assert!(SOCK_FD_END <= 0x400); // kernel EPOLL_FD_BASE
 
 /// Processes that can hold a socket table: every process can (fork copies the
 /// parent's), so this is the system's process limit. 64 -> 512 (lane procpool,
@@ -153,7 +158,23 @@ const MAX_PROCS:   usize = sched::runqueue::MAX_PROCESSES;
 const MAX_SOCKS:   usize = 510;
 /// Connection-pair pool. Raised 32→256 (K1 acceptance: 64 socketpairs + 32
 /// listener connections concurrently; headroom for the desktop session).
-const MAX_CONNS:   usize = 256;
+/// 256 -> 512 (lane term20, 2026-09-27): a COSMIC session holds about 110 and
+/// each cosmic-term adds 5 (its Wayland connection, its shell's and its own
+/// socketpairs), so 20 terminals used 209. A `UnixConn` carries its two 4 KiB
+/// rings inline and the pool is in .data (Vec::new is not all-zero), so this
+/// costs about 4 MiB; 512 matches what the VFS fd table lets one compositor
+/// serve (about 50 clients).
+const MAX_CONNS:   usize = 512;
+
+/// One serial line, the first time the global connection pool is empty.
+fn report_conns_full() {
+    static REPORTED: ::core::sync::atomic::AtomicBool = ::core::sync::atomic::AtomicBool::new(false);
+    if REPORTED.swap(true, ::core::sync::atomic::Ordering::Relaxed) { return; }
+    extern "C" { fn arch_serial_putc(c: u8); }
+    for &b in b"\n[NET] unix connection pool FULL (net::MAX_CONNS) -- global, not this process's fd limit\n" {
+        unsafe { arch_serial_putc(b); }
+    }
+}
 /// Bound-address pool (abstract + pathname listeners). Raised 16→512.
 const MAX_BOUND:   usize = 512;
 const RING_SIZE:   usize = 4096;
@@ -2028,7 +2049,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         let (conn_idx, orphans) = {
             let mut conns = UNIX_CONNS.lock();
             let idx = match conns.iter().position(|c| !c.in_use) {
-                Some(i) => i, None => return err_reply(-12),
+                Some(i) => i, None => { drop(conns); report_conns_full(); return err_reply(-12) }
             };
             let orphans = conns[idx].take_fds();
             conns[idx] = UnixConn::new();
@@ -2066,7 +2087,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     let (conn_idx, orphans) = {
         let mut conns = UNIX_CONNS.lock();
         let idx = match conns.iter().position(|c| !c.in_use) {
-            Some(i) => i, None => return err_reply(-12),
+            Some(i) => i, None => { drop(conns); report_conns_full(); return err_reply(-12) }
         };
         let orphans = conns[idx].take_fds();
         conns[idx] = UnixConn::new();
