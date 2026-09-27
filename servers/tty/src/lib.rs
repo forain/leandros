@@ -39,7 +39,7 @@
 
 #![no_std]
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use ipc::Message;
 use spin::Mutex;
 
@@ -60,7 +60,30 @@ pub const TIMER_GETOVERRUN: u64 = 0x54;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MAX_PROCS:  usize = 64;
+// Per-process console termios and timer tables. 64 -> 512 (lane procpool,
+// 2026-09-27): sized to the process limit, since every process can own one. Scans stop at a high-water mark (`timer_hwm`/`console_hwm`): slots are
+// claimed first-free, so lookups cost the session's peak process count, not 512
+// — `check_timers` runs on every syscall return and usually misses.
+const MAX_PROCS:  usize = sched::runqueue::MAX_PROCESSES;
+
+static TIMER_HWM:   AtomicUsize = AtomicUsize::new(0);
+static CONSOLE_HWM: AtomicUsize = AtomicUsize::new(0);
+#[inline] fn timer_hwm() -> usize { TIMER_HWM.load(Ordering::Relaxed).min(MAX_PROCS) }
+#[inline] fn console_hwm() -> usize { CONSOLE_HWM.load(Ordering::Relaxed).min(MAX_PROCS) }
+/// Only called with the owning table's lock held, so the max needs no CAS.
+#[inline] fn note_claimed(hwm: &AtomicUsize, pos: usize) {
+    if pos + 1 > hwm.load(Ordering::Relaxed) { hwm.store(pos + 1, Ordering::Relaxed); }
+}
+
+/// One serial line per table, the first time a per-process tty table is full.
+fn report_tty_table_full(bit: u32, what: &str) {
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+    if REPORTED.fetch_or(bit, Ordering::Relaxed) & bit != 0 { return; }
+    extern "C" { fn arch_serial_putc(c: u8); }
+    let msg: &[&[u8]] = &[b"\n[TTY] per-process ", what.as_bytes(),
+                          b" table FULL -- tty::MAX_PROCS, not RAM\n"];
+    for part in msg { for &b in *part { unsafe { arch_serial_putc(b); } } }
+}
 const MAX_TIMERS: usize = 8;   // per process POSIX timers
 
 // ── termios structure (matches Linux struct termios) ──────────────────────────
@@ -164,7 +187,7 @@ pub fn console_fg_pgid() -> u32 { *CONSOLE_FG_PGID.lock() }
 fn console_tostop(fg: u32) -> bool {
     const TOSTOP: u32 = 0x0100;
     let tbl = CONSOLE_TERMIOS.lock();
-    tbl.iter().find(|c| c.in_use && c.pid == fg)
+    tbl[..console_hwm()].iter().find(|c| c.in_use && c.pid == fg)
         .map(|c| c.termios.c_lflag & TOSTOP != 0)
         .unwrap_or(false)
 }
@@ -220,7 +243,7 @@ pub fn console_intercept_byte(b: u8) -> bool {
     if pgid == 0 { return false; }
     let (lflag, cc) = {
         let tbl = CONSOLE_TERMIOS.lock();
-        match tbl.iter().find(|c| c.in_use && c.pid == pgid) {
+        match tbl[..console_hwm()].iter().find(|c| c.in_use && c.pid == pgid) {
             Some(c) => (c.termios.c_lflag, c.termios.c_cc),
             None => {
                 let d = Termios::default_console();
@@ -306,10 +329,14 @@ fn jobctl_ioctl(cmd: usize, arg_ptr: usize) -> Option<Message> {
 }
 
 fn get_or_create_console<'a>(pid: u32, tbl: &'a mut [ConsoleTermios]) -> Option<&'a mut ConsoleTermios> {
-    if let Some(pos) = tbl.iter().position(|t| t.in_use && t.pid == pid) {
+    if let Some(pos) = tbl[..console_hwm()].iter().position(|t| t.in_use && t.pid == pid) {
         return Some(&mut tbl[pos]);
     }
-    let pos = tbl.iter().position(|t| !t.in_use)?;
+    let Some(pos) = tbl.iter().position(|t| !t.in_use) else {
+        report_tty_table_full(1, "console-termios (ENOTTY)");
+        return None;
+    };
+    note_claimed(&CONSOLE_HWM, pos);
     tbl[pos] = ConsoleTermios { pid, in_use: true, termios: Termios::default_console() };
     Some(&mut tbl[pos])
 }
@@ -365,10 +392,14 @@ static TIMER_TABLES: Mutex<[ProcTimerTable; MAX_PROCS]> =
 /// Returns `None` only if every one of `MAX_PROCS` process slots is already
 /// in use by a different pid.
 fn get_or_create_timer_table<'a>(pid: u32, tbls: &'a mut [ProcTimerTable]) -> Option<&'a mut ProcTimerTable> {
-    if let Some(pos) = tbls.iter().position(|t| t.in_use && t.pid == pid) {
+    if let Some(pos) = tbls[..timer_hwm()].iter().position(|t| t.in_use && t.pid == pid) {
         return Some(&mut tbls[pos]);
     }
-    let pos = tbls.iter().position(|t| !t.in_use)?;
+    let Some(pos) = tbls.iter().position(|t| !t.in_use) else {
+        report_tty_table_full(2, "timer (ENOMEM/EAGAIN)");
+        return None;
+    };
+    note_claimed(&TIMER_HWM, pos);
     tbls[pos] = ProcTimerTable::empty();
     tbls[pos].in_use = true;
     tbls[pos].pid    = pid;
@@ -440,7 +471,7 @@ pub fn check_timers(pid: u32) {
     // timer would otherwise be checked by nobody.
     let now = sched::monotonic_ns();
     let mut tbls = TIMER_TABLES.lock();
-    let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
+    let tbl = match tbls[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t, None => return,
     };
     for (idx, timer) in tbl.timers.iter_mut().enumerate() {
@@ -503,7 +534,7 @@ pub fn service_timers_irq(now: u64) -> bool {
     let mut tbls = match TIMER_TABLES.try_lock() { Some(t) => t, None => return false };
     let mut done = true;
     let mut next = u64::MAX;
-    for tbl in tbls.iter_mut().filter(|t| t.in_use) {
+    for tbl in tbls[..timer_hwm()].iter_mut().filter(|t| t.in_use) {
         for (idx, timer) in tbl.timers.iter_mut().enumerate() {
             if !timer.in_use || timer.deadline == 0 { continue; }
             // SIGCONT's parent notification needs task context: leave it to
@@ -570,11 +601,11 @@ pub fn ensure_real_timer(pid: u32, signo: u32) {
 /// Drop all terminal and timer state for a process on exit.
 pub fn close_all(pid: u32) {
     let mut timers = TIMER_TABLES.lock();
-    if let Some(t) = timers.iter_mut().find(|t| t.in_use && t.pid == pid) {
+    if let Some(t) = timers[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == pid) {
         *t = ProcTimerTable::empty();
     }
     let mut console = CONSOLE_TERMIOS.lock();
-    if let Some(c) = console.iter_mut().find(|c| c.in_use && c.pid == pid) {
+    if let Some(c) = console[..console_hwm()].iter_mut().find(|c| c.in_use && c.pid == pid) {
         *c = ConsoleTermios::empty();
     }
 }
@@ -741,7 +772,7 @@ fn handle_timer_create(pid: u32, signo: u32, timerid_ptr: usize, sigev_value: u6
             // Roll back: the pointer turned out to be unmapped even though
             // it passed the earlier range check, so don't leak the slot.
             let mut tbls = TIMER_TABLES.lock();
-            if let Some(tbl) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
+            if let Some(tbl) = tbls[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == pid) {
                 tbl.timers[slot] = PosixTimer::new();
             }
             return err_reply(-14);
@@ -761,7 +792,7 @@ fn set_timer_ns(pid: u32, timerid: usize, interval_ns: u64, value_ns: u64)
     -> Option<(u64, u64)>
 {
     let mut tbls = TIMER_TABLES.lock();
-    let tbl = tbls.iter_mut().find(|t| t.in_use && t.pid == pid)?;
+    let tbl = tbls[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == pid)?;
     if timerid >= MAX_TIMERS || !tbl.timers[timerid].in_use { return None; }
     let old_interval = tbl.timers[timerid].interval;
     let now = sched::monotonic_ns();
@@ -788,7 +819,7 @@ fn set_timer_ns(pid: u32, timerid: usize, interval_ns: u64, value_ns: u64)
 /// split out from the user-pointer-parsing IPC handler.
 fn get_timer_ns(pid: u32, timerid: usize) -> Option<(u64, u64)> {
     let tbls = TIMER_TABLES.lock();
-    let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+    let tbl = tbls[..timer_hwm()].iter().find(|t| t.in_use && t.pid == pid)?;
     if timerid >= MAX_TIMERS || !tbl.timers[timerid].in_use { return None; }
     let interval_ns = tbl.timers[timerid].interval;
     let now = sched::monotonic_ns();
@@ -866,7 +897,7 @@ fn handle_timer_gettime(pid: u32, timerid: usize, ospec_ptr: usize) -> Message {
 /// last delivered signal since this was last queried; resets to 0 on read.
 fn handle_timer_getoverrun(pid: u32, timerid: usize) -> Message {
     let mut tbls = TIMER_TABLES.lock();
-    match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
+    match tbls[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == pid) {
         Some(tbl) if timerid < MAX_TIMERS && tbl.timers[timerid].in_use => {
             let overrun = tbl.timers[timerid].overrun;
             tbl.timers[timerid].overrun = 0;
@@ -878,7 +909,7 @@ fn handle_timer_getoverrun(pid: u32, timerid: usize) -> Message {
 
 fn handle_timer_delete(pid: u32, timerid: usize) -> Message {
     let mut tbls = TIMER_TABLES.lock();
-    if let Some(tbl) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
+    if let Some(tbl) = tbls[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == pid) {
         if timerid < MAX_TIMERS { tbl.timers[timerid] = PosixTimer::new(); }
     }
     ok_reply()

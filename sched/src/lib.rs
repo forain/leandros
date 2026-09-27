@@ -784,12 +784,12 @@ pub fn process_pids_from(from: Pid, out: &mut [Pid]) -> usize {
 // open-addressed table, written only under the RUN_QUEUE lock (so writes are
 // already serialised by the scheduler) and read lock-free.
 //
-// Sizing: 2048 slots against `runqueue::MAX_TASKS` = 512, so the table never
+// Sizing: 4096 slots against `runqueue::MAX_TASKS` = 1024, so the table never
 // exceeds a quarter load and linear probes stay short. pids are allocated
 // sequentially from 1, so `pid & (SLOTS-1)` distributes perfectly — the
 // pathological clustering open addressing is usually warned about needs a
 // clumped key space, and this one is a counter.
-const PID_TGID_SLOTS: usize = 2048;
+const PID_TGID_SLOTS: usize = 4096;
 /// Packed `(pid << 32) | tgid`. `0` = never used, `u64::MAX` = tombstone.
 ///
 /// A tombstone rather than a zero on removal is load-bearing: zeroing a slot in
@@ -2223,7 +2223,7 @@ pub static SC_FOCUS2_TGID: AtomicU32 = AtomicU32::new(0);
 // task layout is untouched. `sys_execve` sets it on success; a process leader's
 // exit clears it; fork inherits the parent's until the child execs; unset falls
 // back to "/bin/init" (correct for the boot-loaded PID1, which never execs).
-const MAX_EXE_PATHS: usize = runqueue::MAX_TASKS;
+const MAX_EXE_PATHS: usize = runqueue::MAX_PROCESSES; // keyed by tgid
 const EXE_PATH_MAX: usize = 256;
 struct ExePathEntry { tgid: Pid, len: u16, path: [u8; EXE_PATH_MAX] }
 impl ExePathEntry {

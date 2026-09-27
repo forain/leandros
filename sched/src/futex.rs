@@ -65,7 +65,11 @@ struct FutexWaiter {
     woken: bool,
 }
 
-const MAX_FUTEX_WAITERS: usize = 256;
+// A task waits on at most one futex at a time, so one slot per task means the
+// table can never be full (it answered EAGAIN when full, which user space
+// reads as "value changed" and retries: a silent spin). 256 -> MAX_TASKS
+// (512) with the task-limit raise; lane procpool 2026-09-27.
+const MAX_FUTEX_WAITERS: usize = crate::runqueue::MAX_TASKS;
 
 static FUTEX_TABLE: Mutex<[Option<FutexWaiter>; MAX_FUTEX_WAITERS]> =
     Mutex::new([const { None }; MAX_FUTEX_WAITERS]);
