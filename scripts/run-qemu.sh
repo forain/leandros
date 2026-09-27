@@ -84,13 +84,54 @@ select_audio_args() {
 
 # ── Host QEMU ───────────────────────────────────────────────────────────────
 # macOS: Homebrew's qemu has no virglrenderer, so on a Mac prefer the GPU build
-# from scripts/mac-qemu-gpu/build.sh (virglrenderer on ANGLE/Metal, HVF,
-# egl-headless). LEANDROS_QEMU_PREFIX picks a prefix explicitly on any host
-# (its bin/qemu-system-* and share/qemu firmware win); otherwise the default
-# install location ~/.local/qemu-gpu is used when present, else $PATH.
+# from scripts/mac-qemu-gpu/build.sh. LEANDROS_QEMU_PREFIX picks a prefix
+# explicitly on any host (its bin/qemu-system-* and share/qemu firmware win).
+# Otherwise, on macOS, the first installed of:
+#   ~/.local/qemu-gpu-gles31  build.sh --angle-vulkan: ANGLE on Vulkan/MoltenVK,
+#                             guest GLES 3.1 + SSBOs, so iced/wgpu works
+#   ~/.local/qemu-gpu         build.sh default: ANGLE on Metal, guest GLES 3.0
+# else $PATH.
 QEMU_PREFIX="${LEANDROS_QEMU_PREFIX:-}"
-if [ -z "$QEMU_PREFIX" ] && [ "$OS" = "Darwin" ] && [ -x "$HOME/.local/qemu-gpu/bin/qemu-system-aarch64" ]; then
-    QEMU_PREFIX="$HOME/.local/qemu-gpu"
+
+# An --angle-vulkan prefix's ANGLE dlopens Homebrew's Vulkan loader by the
+# absolute path baked in at build time, and the loader must find MoltenVK.
+# setup_moltenvk_env fails with a clear message when either is missing, and
+# otherwise pins VK_DRIVER_FILES to MoltenVK's ICD (unless the caller chose an
+# ICD already), so nothing needs exporting by hand.
+angle_vulkan_loader() { strings "$1/lib/libGLESv2.dylib" 2>/dev/null | grep -m1 '^/.*/libvulkan\.1\.dylib$'; }
+setup_moltenvk_env() {
+    local loader icd="" brew
+    loader="$(angle_vulkan_loader "$1")"
+    for brew in /opt/homebrew /usr/local; do
+        [ -e "$brew/etc/vulkan/icd.d/MoltenVK_icd.json" ] && { icd="$brew/etc/vulkan/icd.d/MoltenVK_icd.json"; break; }
+    done
+    if [ ! -e "$loader" ] || [ -z "$icd" ]; then
+        echo "❌ $1 is an ANGLE-on-Vulkan QEMU; it needs Homebrew's Vulkan runtime:"
+        [ -e "$loader" ] || echo "❌   missing vulkan-loader ($loader)"
+        [ -n "$icd" ] || echo "❌   missing molten-vk (etc/vulkan/icd.d/MoltenVK_icd.json)"
+        echo "❌ Install with:  brew install molten-vk vulkan-loader"
+        return 1
+    fi
+    if [ -z "${VK_DRIVER_FILES:-}" ] && [ -z "${VK_ICD_FILENAMES:-}" ]; then
+        # Resolve Homebrew's symlink: the ICD's library_path is relative to the file.
+        export VK_DRIVER_FILES="$(cd "$(dirname "$icd")" && cd "$(dirname "$(readlink "$icd" || echo "$icd")")" && pwd)/MoltenVK_icd.json"
+    fi
+}
+if [ "$OS" = "Darwin" ]; then
+    if [ -n "$QEMU_PREFIX" ]; then
+        if [ -n "$(angle_vulkan_loader "$QEMU_PREFIX")" ]; then setup_moltenvk_env "$QEMU_PREFIX" || exit 1; fi
+    else
+        if [ -x "$HOME/.local/qemu-gpu-gles31/bin/qemu-system-aarch64" ]; then
+            if setup_moltenvk_env "$HOME/.local/qemu-gpu-gles31"; then
+                QEMU_PREFIX="$HOME/.local/qemu-gpu-gles31"
+            else
+                echo "❌ Falling back to the next GPU QEMU: the guest gets GLES 3.0, so no wgpu."
+            fi
+        fi
+        if [ -z "$QEMU_PREFIX" ] && [ -x "$HOME/.local/qemu-gpu/bin/qemu-system-aarch64" ]; then
+            QEMU_PREFIX="$HOME/.local/qemu-gpu"
+        fi
+    fi
 fi
 
 # Firmware search paths. Ordered most-specific first; the first hit wins.
@@ -219,7 +260,7 @@ fi
 qemu_has_device() { $QEMU_SYSTEM -device help 2>&1 | grep -q "\"$1\""; }
 host_gl_possible() {
     # virglrenderer needs a host EGL: a render node on Linux; on macOS the
-    # ANGLE (Metal) EGL of a scripts/mac-qemu-gpu/build.sh QEMU, whose display
+    # ANGLE EGL of a scripts/mac-qemu-gpu/build.sh QEMU, whose display
     # is egl-headless. Homebrew's QEMU has neither *-gl devices nor
     # egl-headless, so it still resolves to none.
     if [ "$OS" = "Darwin" ]; then
@@ -258,8 +299,9 @@ if [ "$GPU_MODE" = "none" ] && [ "$BOOT_MODE" != "raspi4b" ]; then
     if [ "$OS" = "Darwin" ]; then
         echo "⚠️  $QEMU_SYSTEM on macOS has no virglrenderer, so neither Venus"
         echo "⚠️  nor virgl exists here. Build the GPU QEMU once with"
-        echo "⚠️  scripts/mac-qemu-gpu/build.sh (virgl over ANGLE/Metal; installs to"
-        echo "⚠️  ~/.local/qemu-gpu, picked up automatically), or run on the linux"
+        echo "⚠️  scripts/mac-qemu-gpu/build.sh --angle-vulkan (virgl over ANGLE on"
+        echo "⚠️  MoltenVK, GLES 3.1; installs to ~/.local/qemu-gpu-gles31, picked up"
+        echo "⚠️  automatically; needs brew molten-vk vulkan-loader), or run on the linux"
         echo "⚠️  desktop (x86_64/KVM, Venus)."
     fi
     echo "⚠️  COSMIC will NOT start (no software rendering); serial login only."
@@ -336,10 +378,44 @@ fi
 # egl-headless (ANGLE/Metal, offscreen) and is viewed over VNC: the readback
 # lands on the console surface, which VNC and QMP screendump both serve.
 # LEANDROS_VNC (default 127.0.0.1:0 → port 5900) moves the listener.
+#
+# Interactive runs (stdout is a terminal, LEANDROS_NO_VIEWER unset) open a
+# viewer window by themselves once QEMU's VNC port listens, so the display
+# shows up like a cocoa window would; the serial console stays on stdio.
+# macOS Screen Sharing refuses a no-auth VNC server (it asks for a password
+# that nothing accepts), so an interactive run gives the listener a random
+# one-run password (QEMU VNC auth via -object secret) and hands it to Screen
+# Sharing in the vnc:// URL: no prompt. Non-interactive runs keep the no-auth
+# listener and never open a window (driver.py does not use this script).
 if [ "$OS" = "Darwin" ] && [ "${#GL_ARGS[@]}" -gt 0 ]; then
     MAC_VNC="${LEANDROS_VNC:-127.0.0.1:0}"
-    GL_ARGS=("-display" "egl-headless" "-vnc" "$MAC_VNC")
-    echo "🖥️  virgl on ANGLE/Metal via egl-headless; view: open vnc://${MAC_VNC%:*}:$((5900 + ${MAC_VNC##*:}))"
+    MAC_VNC_HOST="${MAC_VNC%:*}"
+    MAC_VNC_PORT=$((5900 + ${MAC_VNC##*:}))
+    if [ -t 1 ] && [ -z "${LEANDROS_NO_VIEWER:-}" ]; then
+        MAC_VNC_PW="$(LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 8)"
+        GL_ARGS=("-display" "egl-headless"
+                 "-object" "secret,id=leandrosvncpw,data=$MAC_VNC_PW"
+                 "-vnc" "$MAC_VNC,password-secret=leandrosvncpw")
+        echo "🖥️  GPU display (virgl on ANGLE, egl-headless) opens in Screen Sharing when QEMU is up"
+        echo "🖥️  (LEANDROS_NO_VIEWER=1: no window; --no-gpu: plain cocoa window, no GPU, no COSMIC)"
+        # This PID becomes QEMU's (exec below), so wait for *our* listener:
+        # another QEMU may already hold the port, and then ours fails to start.
+        (
+            for _ in $(seq 1 120); do
+                kill -0 $$ 2>/dev/null || exit 0
+                if lsof -nP -a -p $$ -iTCP:"$MAC_VNC_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+                    open "vnc://:$MAC_VNC_PW@$MAC_VNC_HOST:$MAC_VNC_PORT"
+                    exit 0
+                fi
+                sleep 0.5
+            done
+        ) </dev/null >/dev/null 2>&1 &
+    else
+        GL_ARGS=("-display" "egl-headless" "-vnc" "$MAC_VNC")
+        echo "🖥️  virgl on ANGLE via egl-headless; no-auth VNC at $MAC_VNC_HOST:$MAC_VNC_PORT"
+        echo "🖥️  (Screen Sharing needs a password: run from a terminal to get the auto-viewer)"
+        echo "🖥️  (--no-gpu: plain cocoa window, no GPU, no COSMIC)"
+    fi
 fi
 if [ "$VENUS" = "0" ] && [ "$OS" != "Darwin" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     if [ "${#GL_ARGS[@]}" -gt 0 ] && $QEMU_SYSTEM -display help 2>/dev/null | grep -q egl-headless; then

@@ -124,12 +124,26 @@ supports it, virgl where only GL passthrough exists, nothing otherwise
 with `--venus`, `--virgl`, `--no-gpu` or `LEANDROS_GPU=auto|venus|virgl|none`.
 
 **Mac GPU QEMU.** `scripts/mac-qemu-gpu/build.sh` builds QEMU 11.1.1 + HVF +
-virglrenderer on ANGLE/Metal into `~/.local/qemu-gpu` (about 10 min, no Xcode
-needed). Both `run-qemu.sh` and `driver.py` use it automatically when it is
-present (`LEANDROS_QEMU_PREFIX=<prefix>` overrides this on any host), and
-`--gpu auto` then resolves to virgl. The guest reports `virgl (ANGLE (Apple,
-ANGLE Metal Renderer: Apple M…))`. The display is `egl-headless` plus VNC
-(`run-qemu.sh` prints the `vnc://` URL, and `LEANDROS_VNC` moves it).
+virglrenderer on ANGLE (about 10 min, no Xcode needed). Two variants:
+`--angle-vulkan` → `~/.local/qemu-gpu-gles31` (ANGLE on Vulkan/MoltenVK, guest
+**GLES 3.1 + SSBOs**, so iced/wgpu runs: gpu-env reports `GL_WGPU=1`; guest
+`GL_RENDERER` is `virgl (ANGLE (Apple, Vulkan 1.x (Apple M…), MoltenVK))`), and
+the default → `~/.local/qemu-gpu` (ANGLE/Metal, guest GLES 3.0, no wgpu).
+Both `run-qemu.sh` and `driver.py` use the first one installed, in that order
+(`LEANDROS_QEMU_PREFIX=<prefix>` overrides this on any host), and `--gpu auto`
+then resolves to virgl. The `--angle-vulkan` build needs
+`brew install molten-vk vulkan-loader` at runtime; the launchers point
+`VK_DRIVER_FILES` at MoltenVK's ICD themselves (unless you set it or
+`VK_ICD_FILENAMES`), and print an error and fall back to `~/.local/qemu-gpu`
+when the Homebrew runtime is missing. The display is `egl-headless` plus VNC
+(`LEANDROS_VNC` moves the listener, default 127.0.0.1:0 = port 5900): cocoa has
+no GL, so there is no native window on a GPU boot. Run interactively (stdout a
+terminal), `run-qemu.sh` opens the display in macOS Screen Sharing by itself once
+QEMU listens; Screen Sharing refuses no-auth VNC, so that run gets a random
+one-run VNC password (`-object secret` + `password-secret=`) passed in the
+`vnc://:pw@…` URL, with no prompt. `LEANDROS_NO_VIEWER=1` suppresses the window;
+non-interactive runs keep a no-auth listener and never open one; `--no-gpu` gives
+the plain cocoa window without GPU (no COSMIC).
 `driver.py start aarch64 --virgl` (or `LEANDROS_GPU=virgl`) does the same.
 `driver.py screenshot` then grabs over VNC (`LEANDROS_VNC_PORT`, default 5909),
 because `screendump` has no surface for a GL scanout. Venus on the Mac is only

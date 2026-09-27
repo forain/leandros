@@ -24,6 +24,8 @@
 # (patches/angle-vulkan-moltenvk.patch: flat varyings take the first vertex).
 # Installs to its own prefix/work dir unless LEANDROS_QEMU_PREFIX/_WORK are set.
 # Runtime ANGLE backend is still switchable: ANGLE_DEFAULT_PLATFORM=metal|vulkan.
+# run-qemu.sh and driver.py prefer ~/.local/qemu-gpu-gles31 over ~/.local/qemu-gpu
+# when both exist, and set VK_DRIVER_FILES to Homebrew's MoltenVK ICD for it.
 #
 # Usage: scripts/mac-qemu-gpu/build.sh [--angle-vulkan] [--force] [stage...]
 #   stages: gn angle epoxy virgl qemu   (default: all, in order; each stage is

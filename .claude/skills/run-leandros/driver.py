@@ -63,13 +63,16 @@ and a 2D listener is what turns that into pixels a client can fetch.
 `virtio-gpu-gl-pci,id=virglgpu`, x86_64 `virtio-vga-gl` — under
 `-display egl-headless` plus a loopback VNC listener on that console
 (LEANDROS_VNC_PORT, default 5909). `LEANDROS_GPU=virgl` does the same.
-On macOS this needs the GPU QEMU from scripts/mac-qemu-gpu/build.sh (virgl on
-ANGLE/Metal); `screenshot` then photographs the GL scanout over that VNC
+On macOS this needs a GPU QEMU from scripts/mac-qemu-gpu/build.sh (virgl on
+ANGLE; `--angle-vulkan` gives the guest GLES 3.1 so wgpu works); `screenshot` then photographs the GL scanout over that VNC
 listener (screendump has no surface for a GL scanout — see above).
 
 Host QEMU: `LEANDROS_QEMU_PREFIX=<prefix>` runs <prefix>/bin/qemu-system-*
-with <prefix>/share/qemu firmware; on macOS ~/.local/qemu-gpu (the
-scripts/mac-qemu-gpu/build.sh default) is used automatically when present.
+with <prefix>/share/qemu firmware. On macOS, when unset, the first installed of
+~/.local/qemu-gpu-gles31 (build.sh --angle-vulkan: ANGLE on Vulkan/MoltenVK,
+guest GLES 3.1 + SSBOs) and ~/.local/qemu-gpu (build.sh default, ANGLE/Metal,
+GLES 3.0) is used. The --angle-vulkan build needs `brew install molten-vk
+vulkan-loader`; VK_DRIVER_FILES is pointed at MoltenVK's ICD automatically.
 
 All paths relative to the repo root (three levels up from this file).
 """
@@ -111,23 +114,68 @@ REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../..")
 )
 
-def _qemu_prefix():
-    """Install prefix of the QEMU to run, or None for plain $PATH lookup.
+def _angle_vulkan_loader(prefix):
+    """The absolute libvulkan path an --angle-vulkan ANGLE dlopens, or None
+    when the prefix's ANGLE is the Metal-only build."""
+    import re
+    try:
+        with open(os.path.join(prefix, "lib", "libGLESv2.dylib"), "rb") as f:
+            m = re.search(rb"(/[\x21-\x7e]*/libvulkan\.1\.dylib)\x00", f.read())
+    except OSError:
+        return None
+    return m.group(1).decode() if m else None
 
-    macOS: Homebrew's qemu has no virglrenderer, so the GPU build from
-    scripts/mac-qemu-gpu/build.sh (default ~/.local/qemu-gpu) wins when it is
-    installed. LEANDROS_QEMU_PREFIX overrides on any host."""
-    p = os.environ.get("LEANDROS_QEMU_PREFIX")
-    if p:
-        return os.path.expanduser(p)
-    if sys.platform == "darwin":
-        d = os.path.expanduser("~/.local/qemu-gpu")
-        if os.access(os.path.join(d, "bin", "qemu-system-aarch64"), os.X_OK):
-            return d
+
+def _moltenvk_icd(prefix):
+    """MoltenVK ICD json (symlinks resolved, since its library_path is relative)
+    for an --angle-vulkan prefix, or None after printing what is missing."""
+    loader = _angle_vulkan_loader(prefix)
+    icd = next((p for p in ("/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json",
+                            "/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json")
+                if os.path.exists(p)), None)
+    if loader and os.path.exists(loader) and icd:
+        return os.path.realpath(icd)
+    print(f"ERROR: {prefix} is an ANGLE-on-Vulkan QEMU; it needs Homebrew's Vulkan runtime:",
+          file=sys.stderr)
+    if not (loader and os.path.exists(loader)):
+        print(f"ERROR:   missing vulkan-loader ({loader})", file=sys.stderr)
+    if not icd:
+        print("ERROR:   missing molten-vk (etc/vulkan/icd.d/MoltenVK_icd.json)", file=sys.stderr)
+    print("ERROR: Install with:  brew install molten-vk vulkan-loader", file=sys.stderr)
     return None
 
 
-QEMU_PREFIX = _qemu_prefix()
+def _qemu_prefix():
+    """(install prefix of the QEMU to run or None for $PATH, MoltenVK ICD or None).
+
+    macOS: Homebrew's qemu has no virglrenderer, so a GPU build from
+    scripts/mac-qemu-gpu/build.sh wins when installed: ~/.local/qemu-gpu-gles31
+    (--angle-vulkan, guest GLES 3.1, wgpu works) first, then ~/.local/qemu-gpu
+    (ANGLE/Metal, GLES 3.0). LEANDROS_QEMU_PREFIX overrides on any host."""
+    p = os.environ.get("LEANDROS_QEMU_PREFIX")
+    if p:
+        p = os.path.expanduser(p)
+        if sys.platform == "darwin" and _angle_vulkan_loader(p):
+            icd = _moltenvk_icd(p)
+            if not icd:
+                sys.exit(1)
+            return p, icd
+        return p, None
+    if sys.platform == "darwin":
+        d = os.path.expanduser("~/.local/qemu-gpu-gles31")
+        if os.access(os.path.join(d, "bin", "qemu-system-aarch64"), os.X_OK):
+            icd = _moltenvk_icd(d)
+            if icd:
+                return d, icd
+            print("ERROR: falling back to the next GPU QEMU: the guest gets GLES 3.0, "
+                  "so no wgpu.", file=sys.stderr)
+        d = os.path.expanduser("~/.local/qemu-gpu")
+        if os.access(os.path.join(d, "bin", "qemu-system-aarch64"), os.X_OK):
+            return d, None
+    return None, None
+
+
+QEMU_PREFIX, MOLTENVK_ICD = _qemu_prefix()
 
 
 def _qemu_bin(name):
@@ -552,6 +600,8 @@ def _qemu_env(qemu_cmd):
     addresses, ring reset, QEMU exits "context is lost"). Same workaround and
     evidence as scripts/run-qemu.sh (lane hostgpufault, 2026-09-27)."""
     env = os.environ.copy()
+    if MOLTENVK_ICD and not env.get("VK_DRIVER_FILES") and not env.get("VK_ICD_FILENAMES"):
+        env["VK_DRIVER_FILES"] = MOLTENVK_ICD
     if (sys.platform.startswith("linux") and "egl-headless" in qemu_cmd
             and "GALLIUM_THREAD" not in env and _host_has_amdgpu()):
         env["GALLIUM_THREAD"] = "0"
