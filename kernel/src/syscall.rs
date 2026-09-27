@@ -8623,8 +8623,8 @@ const EPOLL_EVENT_SIZE: usize = 16;
 #[cfg(not(target_arch = "x86_64"))]
 const EPOLL_EVENT_DATA_OFF: usize = 8;
 
-static EPOLL_INSTANCES: sched::lockwatch::TrackedMutex<[EpollInstance; MAX_EPOLL_INSTANCES]> =
-    sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_EPOLL, [const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES]);
+static EPOLL_INSTANCES: sched::lockwatch::TrackedMutex<[EpollInstance; MAX_EPOLL_INSTANCES], { sched::lockwatch::L_EPOLL }> =
+    sched::lockwatch::TrackedMutex::new_typed([const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES]);
 
 /// Close an epoll fd alias: drop its fd entry; release the instance slot
 /// (and all interests with it) when the last alias goes away.
