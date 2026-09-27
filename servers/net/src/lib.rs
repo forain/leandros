@@ -1207,7 +1207,13 @@ pub fn net_daemon() -> ! {
         // 100 % from boot — the dominant component of the "compositor is
         // compute-bound" misread. 100 Hz smoltcp polling is ample here, and an
         // earlier wake (any wake_poll from socket traffic) re-polls immediately.
-        sched::block_on_poll_prepare_until(sched::monotonic_ns() + 10_000_000);
+        // Timed-only mask: the inet producers wake with a broadcast
+        // (`wake_poll`), which reaches it; the AF_UNIX / eventfd / DRM
+        // targeted wakes that make up nearly all idle-desktop traffic have
+        // nothing for smoltcp and no longer re-run this loop (~25 extra
+        // passes a second on the idle greeter).
+        sched::block_on_poll_prepare_masked(sched::monotonic_ns() + 10_000_000,
+                                            sched::POLL_MASK_TIMED_ONLY);
         sched::block_on_poll_commit();
     }
 }
