@@ -174,7 +174,7 @@ def launcher(v, n):
         opened = v.frame()
         t0 = time.time()
         keys("t")
-        t_echo = v.wait(lambda: v.diff(opened) > 0.0005, 30)
+        t_echo = v.wait(lambda: v.diff(opened) * v.fb[::2, ::2].shape[0] * v.fb[::2, ::2].shape[1] > 15, 30)
         last = v.quiet(1.5)
         t_settle = (last - t0) if t_echo is not None else None
         snap(v, f"launcher{i}-typed")
