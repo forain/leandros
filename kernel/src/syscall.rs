@@ -1799,7 +1799,7 @@ fn dispatch_inner(
         FSTAT       => sys_fstat(a0, a1),
         NEWFSTATAT  => sys_newfstatat(a0, a1, a2, a3),
         LSEEK       => sys_lseek(a0, a1, a2),
-        IOCTL       => sys_ioctl(a0, a1, a2),
+        IOCTL       => sys_ioctl(a0, a1, a2, frame_ptr),
         FCNTL       => sys_fcntl(a0, a1, a2),
         PIPE2       => sys_pipe2(a0, a1),
         FLOCK       => sys_flock(a0, a1),
@@ -2002,7 +2002,7 @@ fn dispatch_inner(
         EPOLL_CTL      => sys_epoll_ctl(a0, a1, a2, a3),
         EPOLL_PWAIT  => sys_epoll_wait(a0, a1, a2, a3),
         EPOLL_PWAIT2 => sys_epoll_pwait2(a0, a1, a2, a3),
-        EVENTFD2       => sys_eventfd2(a0, a1),
+        EVENTFD2       => sys_eventfd2(a0, a1, frame_ptr),
         SIGNALFD4      => sys_signalfd4(a0, a1, a2, a3),
 
         // ── Scheduling policy/affinity ────────────────────────────────────────
@@ -7731,7 +7731,7 @@ fn vfs_close_all_for(pid: u32) {
 }
 
 /// sys_ioctl — try VFS first (FIONREAD on pipes/files), then TTY server.
-fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
+fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     let pid = current_pid();
     // musl's `int ioctl(int fd, int request, ...)` sign-extends the request when
     // it forwards to the raw syscall, so a request with bit 31 set (every _IOWR
@@ -7975,6 +7975,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
             .and_then(|obj| drivers::drm_device_interface::prime_import_blob(obj, open_id))
             .or_else(|| obj.and_then(|obj| drivers::drm_device_interface::prime_import_dumb(obj, open_id)))
             .unwrap_or(exporter_handle);
+        if FD_PROVENANCE_BT { prime_import_note(open_id, handle, user_backtrace(frame_ptr)); }
         unsafe { (arg as *mut u32).write(handle); }
         return 0;
     }
@@ -8074,6 +8075,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
             fn out_fence_signal(token: u64) -> bool { vfs::eventfd_slot_signal_unref(token as usize) }
             drivers::drm_device_interface::set_out_fence_signaller(out_fence_signal);
         }
+        vfs::eventfd_note(pid, efd as usize, vfs::EVFD_ORIGIN_FENCE, fence, user_backtrace(frame_ptr));
         if let Some(vfs::VnodeKind::EventFd { slot }) = vfs::vfs_get_node_kind(pid, efd as usize) {
             if fence != 0 {
                 vfs::eventfd_slot_ref(slot);
@@ -8730,6 +8732,46 @@ fn dump_epoll_census() {
         None => ps(" fds=busy"),
     }
     ps("\n");
+    let mut per = [(0u32, 0u32); 16];
+    if let Some((n, objs)) = drivers::drm_device_interface::blob_census(&mut per) {
+        ps("[DRMH] blob_objs="); pn(objs);
+        for &(o, c) in &per[..n] { ps(" open"); pn(o as usize); ps("="); pn(c as usize); }
+        ps("\n");
+    }
+    if FD_PROVENANCE_BT { dump_prime_notes(); }
+}
+
+/// PRIME imports (diagnostic, Ctrl-T, `FD_PROVENANCE_BT` only): the user
+/// backtrace of the most recent PRIME_FD_TO_HANDLE that returned each handle,
+/// so a gem handle an importer never closes can be traced to its importer.
+const PRIME_NOTES: usize = 256;
+static PRIME_NOTE: spin::Mutex<[(u32, u32, u32, [u64; 16]); PRIME_NOTES]> = spin::Mutex::new([(0, 0, 0, [0; 16]); PRIME_NOTES]);
+static PRIME_SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn prime_import_note(open_id: u32, handle: u32, bt: [u64; 16]) {
+    let seq = PRIME_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut t = PRIME_NOTE.lock();
+    let slot = t.iter().position(|e| e.1 == handle && e.0 == open_id)
+        .unwrap_or_else(|| (0..PRIME_NOTES).min_by_key(|&i| t[i].2).unwrap_or(0));
+    t[slot] = (open_id, handle, seq, bt);
+}
+
+fn dump_prime_notes() {
+    extern "C" { fn arch_serial_putc(c: u8); }
+    fn ps(s: &str) { for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } } }
+    fn px(v: u64) {
+        const H: &[u8; 16] = b"0123456789abcdef";
+        let mut i = 60i32; let mut st = false;
+        while i >= 0 { let d = ((v >> i) & 0xF) as usize; if d != 0 || st || i == 0 { st = true; unsafe { arch_serial_putc(H[d]); } } i -= 4; }
+    }
+    let t = match PRIME_NOTE.try_lock() { Some(t) => t, None => return };
+    for e in t.iter() {
+        if e.2 == 0 { continue; }
+        if drivers::drm_device_interface::gem_handle_live(e.1) != Some(true) { continue; }
+        ps("[PRIME] open="); px(e.0 as u64); ps(" h="); px(e.1 as u64); ps(" q="); px(e.2 as u64); ps(" bt=");
+        for b in e.3 { if b == 0 { break; } px(b); ps(","); }
+        ps("\n");
+    }
 }
 
 fn sys_epoll_create1(_flags: usize) -> isize {
@@ -9710,12 +9752,51 @@ fn churn_all_tag_note(pid: u32, fd: usize) {
     ALLTAG[k].fetch_add(1, Ordering::Relaxed);
 }
 
-fn sys_eventfd2(initval: usize, flags: usize) -> isize {
+fn sys_eventfd2(initval: usize, flags: usize, frame_ptr: usize) -> isize {
     let pid = current_pid();
     // EFD_NONBLOCK/EFD_CLOEXEC (== O_NONBLOCK/O_CLOEXEC) must be recorded — see
     // sys_timerfd_create for why a dropped O_NONBLOCK wedges an event loop.
     let msg = make_vfs_msg(vfs::VFS_EVENTFD, &[initval as u64, flags as u64]);
-    vfs_reply_val(&vfs::handle(&msg, pid))
+    let fd = vfs_reply_val(&vfs::handle(&msg, pid));
+    if fd >= 0 { vfs::eventfd_note(pid, fd as usize, vfs::EVFD_ORIGIN_EVENTFD2, 0, user_backtrace(frame_ptr)); }
+    fd
+}
+
+/// Capture user backtraces for fd/handle provenance (eventfd2, the virtgpu
+/// out-fence eventfd, PRIME imports) and print them on Ctrl-T (`[EVFD]`,
+/// `[PRIME]`). Off by default: it walks up to 16 user frames per EXECBUFFER.
+/// This is how lane compfdleak (2026-09-27) traced cosmic-comp's retained fence
+/// eventfds to smithay `GlesFrame::render_texture_from_to` (a GlesTexture
+/// read_sync) and the retained import to `GlesRenderer::import_dmabuf` of a
+/// closed window's last buffer. Symbolize a PIE main image at 0x20_0000
+/// (`MAIN_DYN_BASE`), e.g. `eu-addr2line -e cosmic-comp $((pc - 0x200000))`.
+const FD_PROVENANCE_BT: bool = false;
+
+/// The caller's user pc plus up to fifteen return addresses from its frame-
+/// pointer chain (aarch64 x29 records, x86_64 rbp records). Diagnostic only;
+/// all-zero unless `FD_PROVENANCE_BT`. Unreadable frames just end the list.
+fn user_backtrace(frame_ptr: usize) -> [u64; 16] {
+    let mut bt = [0u64; 16];
+    if !FD_PROVENANCE_BT || frame_ptr == 0 { return bt; }
+    let uf = unsafe { &*(frame_ptr as *const sched::context::UserFrame) };
+    #[cfg(target_arch = "aarch64")]
+    let (pc, lr, mut fp) = (uf.elr_el1, uf.x[30], uf.x[29] as usize);
+    #[cfg(target_arch = "x86_64")]
+    let (pc, lr, mut fp) = (uf.rcx, 0u64, uf.rbp as usize);
+    bt[0] = pc;
+    let mut n = 1;
+    if lr != 0 { bt[1] = lr; n = 2; }
+    while n < 16 {
+        if fp == 0 || fp % 8 != 0 { break; }
+        let mut rec = [0u8; 16];
+        if !with_current_address_space(|as_| as_.read_user_buf(fp, &mut rec)).unwrap_or(false) { break; }
+        let prev = usize::from_ne_bytes(rec[0..8].try_into().unwrap());
+        let ret = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
+        if ret != bt[n - 1] { bt[n] = ret; n += 1; }
+        if prev <= fp { break; }
+        fp = prev;
+    }
+    bt
 }
 
 /// signalfd4(ufd, mask, sizemask, flags) — minimal: a pseudo-fd that reports

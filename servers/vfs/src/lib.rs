@@ -1568,6 +1568,33 @@ static EVENTFD_SEQ: Mutex<[u64; MAX_EVENTFDS]> = Mutex::new([0u64; MAX_EVENTFDS]
 /// Mirrors the pipe reader/writer refcount; bumped by pipe_ref_inc on every dup.
 static EVENTFD_REFS: Mutex<[u32; MAX_EVENTFDS]> = Mutex::new([0u32; MAX_EVENTFDS]);
 
+// ── eventfd provenance (diagnostic, Ctrl-T) ─────────────────────────────────
+//
+// Who minted each live slot: the creating tgid, a boot-wide creation serial,
+// the origin (EVFD_ORIGIN_*), the GPU fence id for an out-fence, and a user
+// backtrace when the kernel's FD_PROVENANCE_BT is on. All-zero when empty, so
+// it stays in .bss. Ctrl-T prints `[FDK] … ev_fence=N` for every heavy table,
+// and one `[EVFD]` line per eventfd with EVFD_DUMP_DETAIL. A virgl client's
+// GL sync objects each hold one out-fence eventfd, so a compositor that keeps
+// GL textures (smithay's per-texture read_sync) shows them here — which is how
+// cosmic-comp's retained closed-window textures were found (lane compfdleak).
+pub const EVFD_ORIGIN_EVENTFD2: u8 = 1;
+pub const EVFD_ORIGIN_FENCE: u8 = 2;
+const EVFD_DUMP_DETAIL: bool = false;
+#[derive(Clone, Copy)]
+pub struct EvMeta { pub origin: u8, pub tgid: u32, pub serial: u32, pub fence: u64, pub bt: [u64; 16] }
+static EVENTFD_META: Mutex<[EvMeta; MAX_EVENTFDS]> =
+    Mutex::new([EvMeta { origin: 0, tgid: 0, serial: 0, fence: 0, bt: [0; 16] }; MAX_EVENTFDS]);
+static EVENTFD_SERIAL: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+
+/// Record provenance for the eventfd `fd` of `pid` (just created).
+pub fn eventfd_note(pid: u32, fd: usize, origin: u8, fence: u64, bt: [u64; 16]) {
+    if let Some(VnodeKind::EventFd { slot }) = vfs_get_node_kind(pid, fd) {
+        let serial = EVENTFD_SERIAL.fetch_add(1, atomic::Ordering::Relaxed) + 1;
+        EVENTFD_META.lock()[slot] = EvMeta { origin, tgid: sched::tgid_of(pid), serial, fence, bt };
+    }
+}
+
 // ── Kernel-side eventfd signalling (GPU out-fences) ──────────────────────────
 //
 // A `FENCE_FD_OUT` eventfd is signalled by the DRM layer when the GPU fence it
@@ -2170,6 +2197,11 @@ pub fn dump_vfs_census() {
         loop { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
         for &b in &buf[i..] { unsafe { arch_serial_putc(b); } }
     }
+    fn phx(v: u64) {
+        const H: &[u8; 16] = b"0123456789abcdef";
+        let mut i = 60i32; let mut started = false;
+        while i >= 0 { let d = ((v >> i) & 0xF) as usize; if d != 0 || started || i == 0 { started = true; unsafe { arch_serial_putc(H[d]); } } i -= 4; }
+    }
     ps("[VFS]");
     match TMP_FILES.try_lock() {
         Some(t) => {
@@ -2227,6 +2259,53 @@ pub fn dump_vfs_census() {
         None => ps(" timerfds=busy"),
     }
     ps("\n");
+    // Heavy tables (>= 20 eventfds, i.e. compositor-class processes): fds by
+    // kind, eventfds split by origin, and with EVFD_DUMP_DETAIL one line per
+    // eventfd with its provenance (see EVENTFD_META).
+    if let Some(t) = FD_TABLES.try_lock() {
+        let (meta, cnt) = match (EVENTFD_META.try_lock(), EVENTFD_COUNTERS.try_lock()) {
+            (Some(m), Some(c)) => (m, c),
+            _ => return,
+        };
+        for tb in t.iter() {
+            if !tb.in_use { continue; }
+            let ev = tb.fds.iter().filter(|f| f.in_use && matches!(f.kind, VnodeKind::EventFd { .. })).count();
+            if ev < 20 { continue; }
+            // A dmabuf fd is a TmpFile over a borrowed VMO.
+            let (mut fence, mut tmp, mut dmabuf, mut dev, mut pipe, mut other) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+            let vmos = TMP_VMOS.try_lock();
+            for f in tb.fds.iter().filter(|f| f.in_use) {
+                match f.kind {
+                    VnodeKind::EventFd { slot } => if meta[slot].origin == EVFD_ORIGIN_FENCE { fence += 1 },
+                    VnodeKind::TmpFile { idx, .. } => {
+                        let db = vmos.as_ref().map_or(false, |v| v.get(idx).and_then(|o| o.as_ref()).map_or(false, |o| o.borrowed && o.dmabuf_obj != 0));
+                        if db { dmabuf += 1 } else { tmp += 1 }
+                    }
+                    VnodeKind::DynamicDevice { .. } => dev += 1,
+                    VnodeKind::Pipe { .. } => pipe += 1,
+                    _ => other += 1,
+                }
+            }
+            drop(vmos);
+            ps("[FDK] pid="); pn(tb.pid as usize); ps(" ev="); pn(ev); ps(" ev_fence="); pn(fence);
+            ps(" tmp="); pn(tmp); ps(" dmabuf="); pn(dmabuf); ps(" dev="); pn(dev);
+            ps(" pipe="); pn(pipe); ps(" other="); pn(other); ps("\n");
+            if !EVFD_DUMP_DETAIL { continue; }
+            for (fd, f) in tb.fds.iter().enumerate() {
+                if !f.in_use { continue; }
+                if let VnodeKind::EventFd { slot } = f.kind {
+                    let m = meta[slot];
+                    ps("[EVFD] pid="); pn(tb.pid as usize); ps(" fd="); pn(fd);
+                    ps(" s="); pn(slot); ps(" o="); pn(m.origin as usize);
+                    ps(" t="); pn(m.tgid as usize); ps(" q="); pn(m.serial as usize);
+                    ps(" f="); phx(m.fence);
+                    ps(" c="); pn(if cnt[slot] == u64::MAX { 99999 } else { cnt[slot].min(99998) as usize });
+                    ps(" bt="); for b in m.bt { if b == 0 { break; } phx(b); ps(","); }
+                    ps("\n");
+                }
+            }
+        }
+    }
 }
 
 pub fn init(owner_pid: u32) -> Option<u32> {
