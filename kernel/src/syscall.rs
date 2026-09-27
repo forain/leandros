@@ -1023,7 +1023,7 @@ fn churn_tick() {
 /// (waker site, tgid): useful vs spurious wakes. Printed every 10 s as
 /// `[GDT]`/`[GDFD]`/`[GDSITE]`. Compile-time gated with `sched::gdwake`.
 pub const GD_STATS: bool = sched::gdwake::ENABLED;
-const GD_K: usize = 19;
+const GD_K: usize = 24;
 const K_EP_CALL: usize = 0; const K_EP_EV: usize = 1; const K_EP_TMO: usize = 2;
 const K_EP_INTR: usize = 3; const K_EP_SPUR: usize = 4; const K_EP_ZERO: usize = 5;
 const K_EP_SHORT: usize = 6; const K_EP_PARK: usize = 7;
@@ -1031,9 +1031,12 @@ const K_PO_CALL: usize = 8; const K_PO_EV: usize = 9; const K_PO_TMO: usize = 10
 const K_PO_SPUR: usize = 11; const K_PO_ZERO: usize = 12; const K_PO_SHORT: usize = 13;
 const K_PO_PARK: usize = 14; const K_EAGAIN: usize = 15; const K_SC: usize = 16;
 const K_USEFUL: usize = 17; const K_PARKALL: usize = 18;
+const K_FXW_OK: usize = 19; const K_FXW_TMO: usize = 20; const K_FXW_AGAIN: usize = 21;
+const K_FX_WAKE: usize = 22; const K_FX_WOKEN: usize = 23;
 const GD_NAMES: [&str; GD_K] = ["ep", "ep_ev", "ep_tmo", "ep_intr", "ep_spur", "ep_zero",
     "ep_short", "ep_park", "po", "po_ev", "po_tmo", "po_spur", "po_zero", "po_short",
-    "po_park", "eagain", "sc", "useful", "park_all"];
+    "po_park", "eagain", "sc", "useful", "park_all", "fxw_ok", "fxw_tmo", "fxw_again",
+    "fx_wake", "fx_woken"];
 static GD_PID: [AtomicU32; 1024] = [const { AtomicU32::new(0) }; 1024];
 static GD_TGID: [AtomicU32; 1024] = [const { AtomicU32::new(0) }; 1024];
 static GD_C: [[AtomicU32; GD_K]; 1024] = [const { [const { AtomicU32::new(0) }; GD_K] }; 1024];
@@ -1251,6 +1254,20 @@ pub fn dispatch(
         #[cfg(target_arch = "aarch64")]
         let rd = matches!(number, 63 | 65 | 207 | 212);
         if ret == -11 && rd { gd_inc(K_EAGAIN); }
+        #[cfg(target_arch = "x86_64")]
+        let fx = number == 202;
+        #[cfg(target_arch = "aarch64")]
+        let fx = number == 98;
+        if fx {
+            match a1 & 0x7F {
+                0 | 9 => gd_inc(match ret { 0 => K_FXW_OK, -110 => K_FXW_TMO, _ => K_FXW_AGAIN }),
+                1 | 10 => {
+                    gd_inc(K_FX_WAKE);
+                    for _ in 0..(ret.max(0) as usize).min(64) { gd_inc(K_FX_WOKEN); }
+                }
+                _ => {}
+            }
+        }
     }
     if SC_STATS && sc_focus == 1 && SC_VMA_DUMP.load(Ordering::Relaxed) == 1 {
         SC_VMA_DUMP.store(2, Ordering::Relaxed);
