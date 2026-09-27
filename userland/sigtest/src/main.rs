@@ -1276,6 +1276,7 @@ unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
             // sigtest itself would hand the terminal back to the shell.
             let mut fds = [0 as c_int; 2];
             pipe(fds.as_mut_ptr());
+            FWORD.store(7, Ordering::SeqCst);
             let child = fork();
             if child == 0 {
                 let ts = timespec { tv_sec: 0, tv_nsec: 500_000_000 };
