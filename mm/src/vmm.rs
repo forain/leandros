@@ -66,6 +66,13 @@ pub struct VmaRegion {
     /// True if this VMA is a copy-on-write clone; write faults allocate a
     /// new page and copy the content before remapping writable.
     pub cow:       bool,
+    /// Private file-backed VMAs only: bit `i` set once page `i` (inside the
+    /// file extent) has been written — it is then an anonymous copy, counted
+    /// `RssAnon` like Linux's CoW'd private file page, not `RssFile`. A clean
+    /// such page is mapped read-only even in a writable VMA, so its first
+    /// write faults here (`plan_user_page_fault`) and sets the bit. Only
+    /// meaningful where `lazy_pages[i] != 0`: every install clears it.
+    pub written:   Vec<u64>,
 }
 
 // ── File-backed VMA hooks ─────────────────────────────────────────────────────
@@ -334,6 +341,7 @@ impl AddressSpace {
             file_off:  0,
             file_len:  0,
             cow:       false,
+            written:   Vec::new(),
         });
 
         true
@@ -397,6 +405,7 @@ impl AddressSpace {
             file_off:  0,
             file_len:  0,
             cow:       false,
+            written:   Vec::new(),
         });
 
         true
@@ -452,6 +461,7 @@ impl AddressSpace {
             file_off:  0,
             file_len:  0,
             cow:       false,
+            written:   Vec::new(),
         });
         true
     }
@@ -537,6 +547,7 @@ impl AddressSpace {
             file_off:  0,
             file_len:  0,
             cow:       false,
+            written:   Vec::new(),
         });
         true
     }
@@ -635,6 +646,7 @@ impl AddressSpace {
             file_off,
             file_len,
             cow:       false,
+            written:   Vec::new(),
         });
         true
     }
@@ -719,6 +731,21 @@ impl AddressSpace {
 
         let lazy_phys = region.lazy_pages.get(page_idx).copied().unwrap_or(0);
         if lazy_phys != 0 {
+            // A first write to a clean private file page in a writable VMA:
+            // from now on it is this process's own (anonymous) copy. The
+            // frame is already private (file pages are read into a fresh
+            // frame, never shared with a page cache), so this is only a
+            // permission upgrade plus the bookkeeping bit.
+            if is_write && !region.cow && region.flags.contains(PageFlags::WRITABLE)
+                && region.clean_file_page(page_idx)
+            {
+                region.set_written(page_idx, true);
+                if !unsafe { map_page(page_table_root, page_va, lazy_phys, region.flags) } {
+                    return FaultPlan::Done(Fault::Segv);
+                }
+                tlb_flush_local_page(page_va);
+                return FaultPlan::Done(Fault::Handled);
+            }
             // Page already present. A write to a CoW-shared page needs a
             // promotion (below). Any other fault on a present page is most
             // likely a *concurrent* fault: a sibling thread touched the same
@@ -746,6 +773,7 @@ impl AddressSpace {
                     return FaultPlan::Done(Fault::Segv);
                 }
                 tlb_flush_local_page(page_va);
+                region.set_written(page_idx, true);
                 crate::paging::tlbstat::COW_REUSE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return FaultPlan::Done(Fault::Handled);
             }
@@ -780,6 +808,7 @@ impl AddressSpace {
                 return FaultPlan::Done(Fault::Segv);
             }
             region.lazy_pages[page_idx] = new_phys;
+            region.set_written(page_idx, true);
             // Drop our reference to the shared frame only now that no CPU can
             // still reach it through this address space: the other owner may
             // reuse it in place (and write it) as soon as it is sole owner.
@@ -925,8 +954,10 @@ impl AddressSpace {
                     }
                 }
             }
+            region.set_written(idx, false);
+            let install = region.install_flags(idx, region.flags);
             let mapped = unsafe {
-                map_page(page_table_root, region.start + idx * PAGE_SIZE, phys, region.flags)
+                map_page(page_table_root, region.start + idx * PAGE_SIZE, phys, install)
             };
             if !mapped {
                 buddy_free(phys, 0);
@@ -945,6 +976,19 @@ impl AddressSpace {
         }
 
         Fault::Handled
+    }
+
+    /// Is `va` a resident, still-unwritten page of a writable private file
+    /// VMA (mapped read-only until its first write)?
+    fn is_clean_writable_file_page(&self, va: usize) -> bool {
+        self.regions.iter().filter_map(|r| r.as_ref())
+            .find(|r| va >= r.start && va < r.end)
+            .map_or(false, |r| {
+                let idx = (va - r.start) / PAGE_SIZE;
+                r.flags.contains(PageFlags::WRITABLE)
+                    && r.lazy_pages.get(idx).copied().unwrap_or(0) != 0
+                    && r.clean_file_page(idx)
+            })
     }
 
     /// Is `va` an absent page of a file-backed VMA — one whose fault must read
@@ -984,6 +1028,11 @@ impl AddressSpace {
                 // take. Prefaulting promises no fault afterwards, so give
                 // this side its private copy now.
                 let _ = self.unshare_cow_page(va, true);
+                // Same promise for a clean private file page, whose PTE is
+                // read-only until its first write (see `VmaRegion::written`).
+                if self.is_clean_writable_file_page(va) {
+                    self.handle_user_page_fault(va, true);
+                }
             }
             va += PAGE_SIZE;
         }
@@ -1081,7 +1130,7 @@ impl AddressSpace {
 
         // Convert eager → per-page lazy in place, then peel the tail pages off.
         let (r_end, tail_pages, flags, prot, map_flags,
-             file_cap, right_off, right_len, cow) = {
+             file_cap, right_off, right_len, cow, tail_written) = {
             let r = self.regions[idx].as_mut().unwrap();
             if !r.lazy {
                 let n = (r.end - r.start) / PAGE_SIZE;
@@ -1103,6 +1152,21 @@ impl AddressSpace {
             } else {
                 Vec::new()
             };
+            // Same cut through the written bitmap: bit `split_idx + k` of
+            // the left half becomes bit `k` of the right one.
+            let mut tail_w: Vec<u64> = Vec::new();
+            for i in split_idx..r.written.len() * 64 {
+                if r.is_written(i) {
+                    let k = i - split_idx;
+                    if tail_w.len() <= k / 64 { tail_w.resize(k / 64 + 1, 0); }
+                    tail_w[k / 64] |= 1u64 << (k % 64);
+                }
+            }
+            if split_idx / 64 < r.written.len() {
+                r.written.truncate(split_idx / 64 + 1);
+                if split_idx % 64 == 0 { r.written.truncate(split_idx / 64); }
+                else { r.written[split_idx / 64] &= (1u64 << (split_idx % 64)) - 1; }
+            }
             let r_end = r.end;
 
             // Left half: ends at boundary, keeps its file offset but its file
@@ -1116,7 +1180,7 @@ impl AddressSpace {
             }
 
             (r_end, tail, r.flags, r.prot, r.map_flags,
-             r.file_cap, right_off, right_len, r.cow)
+             r.file_cap, right_off, right_len, r.cow, tail_w)
         };
 
         // Each surviving VMA holds its own reference on the backing file.
@@ -1137,6 +1201,7 @@ impl AddressSpace {
             file_off: right_off,
             file_len: right_len,
             cow,
+            written: tail_written,
         };
 
         match self.regions.iter().position(|r| r.is_none()) {
@@ -1356,6 +1421,11 @@ impl AddressSpace {
         while offset < src.len() {
             let va = user_va + offset;
             if !self.unshare_cow_page(va, false) { return false; }
+            // A store through the HHDM bypasses the read-only PTE of a clean
+            // file page: account it as written, as the user's store would.
+            if self.is_clean_writable_file_page(va) {
+                self.handle_user_page_fault(va, true);
+            }
             let phys = match self.virt_to_phys(va) {
                 Some(p) => p,
                 None => return false,
@@ -1445,7 +1515,7 @@ impl AddressSpace {
                         let install = if is_cow && crate::pageref::get(phys) > 1 {
                             new_flags & !PageFlags::WRITABLE
                         } else {
-                            new_flags
+                            region.install_flags(i, new_flags)
                         };
                         unsafe { map_page(self.page_table_root, page_va, phys, install); }
                     }
@@ -1544,6 +1614,7 @@ impl AddressSpace {
                     unsafe { unmap_page(self.page_table_root, page_va); }
                     crate::pageref::unref_or_free(region.lazy_pages[i], 0);
                     region.lazy_pages[i] = 0;
+                    region.set_written(i, false);
                     region.lazy_count = region.lazy_count.saturating_sub(1);
                 }
             }
@@ -1714,6 +1785,49 @@ pub const MAP_FILE_COPY: u32 = 1 << 29;
 impl VmaRegion {
     fn pages(&self) -> usize { (self.end - self.start) / PAGE_SIZE }
 
+    /// Pages holding file data (the rest of a file VMA is BSS).
+    fn file_pages(&self) -> usize {
+        ((self.file_len as usize) + PAGE_SIZE - 1) / PAGE_SIZE
+    }
+
+    /// Private file-backed per-page VMA: its pages start as clean copies of
+    /// the file and are tracked in `written` once they diverge.
+    fn tracks_written(&self) -> bool {
+        self.lazy && is_file_backed(self.file_cap) && self.map_flags & MAP_SHARED == 0
+    }
+
+    pub fn is_written(&self, idx: usize) -> bool {
+        self.written.get(idx / 64).map_or(false, |w| (w >> (idx % 64)) & 1 != 0)
+    }
+
+    /// Record that page `idx` was (`on`) or was not written. Only pages of
+    /// the file extent of a tracking VMA are ever set, and only while
+    /// present, so a popcount of `written` is the written-page total.
+    fn set_written(&mut self, idx: usize, on: bool) {
+        if on {
+            if !self.tracks_written() || idx >= self.file_pages() { return; }
+            if self.written.len() <= idx / 64 { self.written.resize(idx / 64 + 1, 0); }
+            self.written[idx / 64] |= 1u64 << (idx % 64);
+        } else if let Some(w) = self.written.get_mut(idx / 64) {
+            *w &= !(1u64 << (idx % 64));
+        }
+    }
+
+    /// Resident page `idx` is still an unwritten copy of file data, so its
+    /// PTE stays read-only whatever the VMA's protection: the first write
+    /// must fault to be seen.
+    fn clean_file_page(&self, idx: usize) -> bool {
+        self.tracks_written() && idx < self.file_pages() && !self.is_written(idx)
+    }
+
+    /// PTE flags for resident page `idx`: `flags` without WRITABLE while it
+    /// is a clean file page.
+    fn install_flags(&self, idx: usize, flags: PageFlags) -> PageFlags {
+        if flags.contains(PageFlags::WRITABLE) && self.clean_file_page(idx) {
+            flags & !PageFlags::WRITABLE
+        } else { flags }
+    }
+
     /// Frames this VMA maps.
     pub fn resident_pages(&self) -> usize {
         if self.file_cap == usize::MAX { 0 }
@@ -1732,14 +1846,18 @@ impl VmaRegion {
     /// Split of `resident_pages()` into (file, anon). A file-backed VMA's
     /// pages past its file extent are the ELF segment's BSS — anonymous
     /// memory on Linux too — so only that tail is walked, never the file
-    /// part. Written private file pages stay `file` here (no dirty tracking).
+    /// part. A written page of the file part is anonymous as well (Linux's
+    /// CoW'd private file page): `written` has one bit per such page.
     fn file_anon_split(&self) -> (usize, usize) {
         let n = self.resident_pages();
         if !is_file_backed(self.file_cap) || !self.lazy { return (n, 0); }
-        let file_pages = ((self.file_len as usize) + PAGE_SIZE - 1) / PAGE_SIZE;
-        if file_pages >= self.pages() { return (n, 0); }
-        let bss = self.lazy_pages.iter().skip(file_pages).filter(|&&p| p != 0).count();
-        (n - bss.min(n), bss.min(n))
+        let file_pages = self.file_pages();
+        let bss = if file_pages >= self.pages() { 0 } else {
+            self.lazy_pages.iter().skip(file_pages).filter(|&&p| p != 0).count()
+        };
+        let dirty: usize = self.written.iter().map(|w| w.count_ones() as usize).sum();
+        let anon = (bss + dirty).min(n);
+        (n - anon, anon)
     }
 }
 
