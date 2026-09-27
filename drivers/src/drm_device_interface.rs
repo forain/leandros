@@ -1117,6 +1117,34 @@ struct BlobHandle {
 static BLOB_OBJS: Mutex<BTreeMap<u32, BlobObj>> = Mutex::new(BTreeMap::new());
 /// Handles. Unchanged key space (`NEXT_BLOB_HANDLE`), new value.
 static BLOB_BUFFERS: Mutex<BTreeMap<u32, BlobHandle>> = Mutex::new(BTreeMap::new());
+/// Ctrl-T (diagnostic): is gem `handle` (blob, dumb or 3D) still live? `None` if busy.
+pub fn gem_handle_live(handle: u32) -> Option<bool> {
+    if BLOB_BUFFERS.try_lock()?.contains_key(&handle) { return Some(true); }
+    let d = DUMB_BUFFERS.try_lock()?;
+    Some(d.get(&handle).map_or(false, |b| b.handle_live))
+}
+
+/// Ctrl-T census (diagnostic, `[DRMH]`): live GEM handles (blob + dumb/3D) per
+/// owning open, and the object count. An importer whose handle count only grows
+/// is holding imports of buffers whose exporters are gone. IRQ context, so
+/// try-lock only; `None` if a table is busy. Fills `out` with (open_id,
+/// handles) and returns (entries used, objects).
+pub fn blob_census(out: &mut [(u32, u32); 16]) -> Option<(usize, usize)> {
+    let objs = BLOB_OBJS.try_lock()?.len();
+    let h = BLOB_BUFFERS.try_lock()?;
+    let d = DUMB_BUFFERS.try_lock()?;
+    let mut n = 0usize;
+    let owners = h.values().map(|b| b.owner)
+        .chain(d.values().filter(|b| b.handle_live).map(|b| b.owner));
+    for owner in owners {
+        match out[..n].iter_mut().find(|e| e.0 == owner) {
+            Some(e) => e.1 += 1,
+            None => if n < out.len() { out[n] = (owner, 1); n += 1; },
+        }
+    }
+    Some((n, objs + d.len()))
+}
+
 /// GEM handles for blob BOs. Kept well above the dumb-buffer handle space so a
 /// handle is unambiguously one or the other.
 static NEXT_BLOB_HANDLE: AtomicU32 = AtomicU32::new(0x4000);
