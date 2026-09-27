@@ -160,7 +160,17 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
     fi
     case $LEANDROS_RENDERER_PATH in
     zink)  ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu}; WGPU_BACKEND=vulkan ;;
-    virgl) ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu}; WGPU_BACKEND=gl ;;
+    # virgl keeps the CPU fallback behind wgpu for now: wgpu's GLES backend
+    # only gets a context from a Mesa carrying
+    # ports/mesa/patches/0001-egl-robust-access-unsupported-is-bad-attribute
+    # when the host GL lacks robust buffer access (ANGLE/Metal on the Mac);
+    # with an older ship-set every client would otherwise fail to start.
+    # The warning below fires. Do NOT ship the patched Mesa on aarch64 yet:
+    # there wgpu does get a context on ANGLE/Metal, but iced clients
+    # (greeter, launcher) then die intermittently with EBADF on their
+    # event loop (never seen with tiny-skia on the same ship-set, nor on
+    # x86_64 virgl).
+    virgl) ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu,tiny-skia}; WGPU_BACKEND=gl ;;
     *)     ICED_BACKEND=${LEANDROS_ICED_BACKEND:-tiny-skia} ;;
     esac
     export ICED_BACKEND
