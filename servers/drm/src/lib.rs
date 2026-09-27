@@ -384,13 +384,20 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
     } else if msg.tag == vfs_server::VFS_POLL {
         // POLLIN when a page-flip event is queued to read.
         // Slot 4: the open this poll is on — answered from that open's queue.
-        let revents: u32 = if drivers::drm_device_interface::drm_has_events(arg(msg, 4) as u32) { 0x1 } else { 0 };
+        let open_id = arg(msg, 4) as u32;
+        let revents: u32 = if drivers::drm_device_interface::drm_has_events(open_id) { 0x1 } else { 0 };
         // (revents, seq): seq echoes the delivered-flip counter so epoll's
         // edge emulation re-arms on each new event.
         let seq = drivers::drm_device_interface::drm_event_seq();
         let mut m = Message::empty();
         m.data[0..8].copy_from_slice(&(revents as u64).to_le_bytes());
         m.data[8..16].copy_from_slice(&(seq as u64).to_le_bytes());
+        // The open's event-queue tag (data[32]=1 marks it valid; see the VFS
+        // DynamicDevice poll arm): the only thing that makes this fd readable
+        // is a READY_EVENTS push for this open, which wakes exactly this tag.
+        m.data[24..32].copy_from_slice(
+            &drivers::drm_device_interface::drm_event_poll_tag(open_id).to_le_bytes());
+        m.data[32] = 1;
         m
     } else if msg.tag == vfs_server::VFS_CLOSE {
         // The VFS sends this once the LAST fd on this open is gone, with the

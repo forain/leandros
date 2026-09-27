@@ -27,6 +27,7 @@ pub mod context;
 pub mod futex;
 pub mod lockwatch;
 pub mod idlestat;
+pub mod gdwake;
 pub mod pcsample;
 pub mod runqueue;
 pub mod signal;
@@ -1791,6 +1792,15 @@ pub const POLL_WAIT_CHANNEL: u32 = 0xFFFF_FF01;
 // so a forgotten site degrades to today's herd, never to a missed wake.
 pub const POLL_TAG_ALL: u64 = u64::MAX;
 
+/// The mask of a park that waits only for its deadline or a signal (nanosleep,
+/// sigsuspend, sigtimedwait): no object tag reaches it, only the broadcast
+/// (`POLL_TAG_ALL`, which every signal delivery issues) and the deadline tick.
+/// Such parks used to register `POLL_TAG_ALL` themselves, so every targeted
+/// wake in the system (each socket write, eventfd, epoll_ctl) woke every
+/// sleeping thread to re-check its clock: ~55 wakes/s for one `sleep 60` on
+/// the idle greeter, the same for init's getty-loop sleep.
+pub const POLL_MASK_TIMED_ONLY: u64 = 0;
+
 /// Poll-object classes. The class disambiguates index spaces that would
 /// otherwise collide (pipe ring 3 vs eventfd slot 3) before hashing.
 pub mod poll_class {
@@ -1810,6 +1820,13 @@ pub mod poll_class {
     pub const INOTIFY: u32 = 12;
     /// An epoll instance itself, indexed by its slot: what `epoll_ctl` wakes.
     pub const EPOLL:   u32 = 13;
+    /// A connected AF_UNIX end became readable (data or fds queued for it),
+    /// indexed `conn * 2 + side` (side 0 = end A, 1 = end B).
+    pub const UNIX_RD: u32 = 14;
+    /// A connected AF_UNIX end gained write space (its peer drained), same
+    /// index. Data edges wake only these, so a reader parked for POLLIN is
+    /// not woken by its peer draining what it sent, nor by its own sends.
+    pub const UNIX_WR: u32 = 15;
 }
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision
@@ -1880,11 +1897,26 @@ pub fn wake_poll() { wake_poll_tagged(POLL_TAG_ALL); }
 /// context contract as `wake_poll`.
 #[track_caller]
 pub fn wake_poll_tagged(tag: u64) {
-    let woken = RUN_QUEUE.lock().unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
+    let woken = {
+        let mut rq = RUN_QUEUE.lock();
+        gdwake::set_site(core::panic::Location::caller());
+        rq.unblock_port_tagged(POLL_WAIT_CHANNEL, tag)
+    };
     if idlestat::ENABLED {
         idlestat::note_wake(core::panic::Location::caller(), tag == POLL_TAG_ALL, woken);
     }
     if woken > 0 { wake_up_an_idle_cpu(); }
+}
+
+/// OR `add` into the interest mask of every task parked on the poll channel
+/// whose mask intersects `match_tag`, without waking it. `sys_epoll_ctl` uses
+/// it when it (re-)arms an interest that is not ready: the instance's parked
+/// waiters (tag `poll_tag(EPOLL, slot)`) computed their masks without the new
+/// fd, and must be reachable by that fd's own later wake. Widening a mask can
+/// only add wakes, never lose one. Task context (takes RUN_QUEUE).
+pub fn widen_poll_masks(match_tag: u64, add: u64) {
+    if add == 0 { return; }
+    RUN_QUEUE.lock().widen_port_masks(POLL_WAIT_CHANNEL, match_tag, add);
 }
 
 /// A `wake_poll` that has been asked for but not yet paid for, as an OR of the
@@ -1963,6 +1995,7 @@ pub fn try_wake_poll_tagged(tag: u64) -> bool {
     match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
             lockwatch::note_wake_try(true);
+            gdwake::set_site(core::panic::Location::caller());
             let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
             drop(rq);
             if idlestat::ENABLED {
