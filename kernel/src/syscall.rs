@@ -3517,6 +3517,7 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> 
     let mut gd_woke = 0u64;
 
     loop {
+        let gen0 = EPOLL_CTL_GEN.load(Ordering::Acquire);
         let mut nready = 0isize;
         for i in 0..nfds {
             let pfd = fds_ptr + i * 8;
@@ -3547,7 +3548,7 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> 
         if !infinite && monotonic_ns() >= deadline { return 0; }
 
         if GD_STATS { gd_inc(K_PO_PARK); }
-        poll_block(infinite, deadline, poll_fds_mask(pid, fds_ptr, nfds), || poll_any_ready(pid, fds_ptr, nfds));
+        poll_block(infinite, deadline, poll_fds_mask(pid, fds_ptr, nfds), gen0, || poll_any_ready(pid, fds_ptr, nfds));
         if GD_STATS { gd_woke = sched::gdwake::take(pid); }
     }
 }
@@ -8665,19 +8666,53 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
         }
         _ => -22, // EINVAL
     };
+    // Published while the mutation is already visible (the lock was held
+    // above): a waiter that read the old generation before its probe pass
+    // sees the new one after it parks and re-probes (see `epoll_wait_until`).
+    if r >= 0 { EPOLL_CTL_GEN.fetch_add(1, Ordering::AcqRel); }
     drop(ep);
     // THE ONE REAL LOST-WAKE HOLE (see the targeted-wake design): a sibling
     // thread may be parked in epoll_wait on this instance with a `poll_mask`
-    // computed BEFORE this add/mod/del, so a *targeted* wake for the newly
-    // added fd would never reach it. Wake every waiter of THIS instance on
-    // any successful mutation, as Linux does from ep_insert/ep_modify: each
-    // epoll_wait park, and every mask an enclosing epoll/poll/select computes
-    // for this fd (`epoll_tag_mask`), carries `poll_tag(EPOLL, slot)`. This
-    // used to be a system-wide broadcast: on the idle desktop ~11 epoll_ctl
-    // calls a second woke ~570 unrelated threads a second.
-    if r >= 0 { sched::wake_poll_tagged(epoll_self_tag(slot)); }
+    // computed BEFORE this add/mod, so a *targeted* wake for the newly armed
+    // fd would never reach it. Every epoll_wait park on this instance, and
+    // every mask an enclosing epoll/poll/select computes for it
+    // (`epoll_tag_mask`), carries `poll_tag(EPOLL, slot)`.
+    //
+    // Linux wakes those waiters only when the (re-)armed item is ready now
+    // (ep_insert/ep_modify: `if (revents && !ep_is_linked(...)) wake_up`).
+    // This kernel used to wake them on EVERY successful mutation, and
+    // calloop/`polling` re-arm an EPOLLONESHOT interest with MOD after every
+    // event it dispatches: on the idle greeter that was ~80 epoll_ctl calls
+    // a second, each waking every thread whose mask shared the instance's
+    // tag bit to re-probe and park again (~55 spurious wakes/s in
+    // cosmic-comp + cosmic-greeter). Now:
+    //  - ready now → wake the instance's waiters (Linux);
+    //  - not ready → no wake; instead OR the fd's tag into every parked mask
+    //    that carries the instance's tag, so the fd's own later edge reaches
+    //    them (what the wake used to buy);
+    //  - DEL → nothing (Linux does not wake on removal either).
+    // A waiter between its probe pass and its park is covered by
+    // EPOLL_CTL_GEN, which it re-checks after publishing Blocked.
+    if r >= 0 && (op == CTL_ADD || op == CTL_MOD) {
+        let events = unsafe { core::ptr::read(event_ptr as *const u32) };
+        let (cur, _seq, tag) = probe_fd_events_seq(current_pid(), fd, events);
+        let self_tag = epoll_self_tag(slot);
+        if cur != 0 {
+            sched::wake_poll_tagged(self_tag);
+        } else {
+            sched::widen_poll_masks(self_tag, tag);
+        }
+    }
     r
 }
+
+/// Bumped by every successful epoll_ctl. A poll/epoll waiter reads it before
+/// its probe pass and again after publishing Blocked: a change means an
+/// interest set it may be watching (directly or nested) changed after it
+/// computed its mask, so it re-probes instead of parking on a stale mask. A
+/// ctl that lands after the second read finds the waiter already Blocked and
+/// widens its mask (`sched::widen_poll_masks`).
+static EPOLL_CTL_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms)
 ///
@@ -8758,6 +8793,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
     }
     let mut gd_woke = 0u64;
     loop {
+        let gen0 = EPOLL_CTL_GEN.load(Ordering::Acquire);
         // ---- PROBE ---- per-interest snapshot: hold EPOLL_INSTANCES only to
         // copy one interest out, drop it before probe_fd_events_seq (which
         // calls vfs/net and must never run under a spinlock — invariant
@@ -8825,7 +8861,8 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         let mask = if mask == 0 { sched::POLL_TAG_ALL } else { mask };
         if GD_STATS && mask == sched::POLL_TAG_ALL { gd_inc(K_PARKALL); }
         sched::block_on_poll_prepare_masked(if infinite { u64::MAX } else { deadline }, mask);
-        if epoll_any_ready(pid, slot) || interrupted()
+        if EPOLL_CTL_GEN.load(Ordering::Acquire) != gen0
+            || epoll_any_ready(pid, slot) || interrupted()
             || (!infinite && monotonic_ns() >= deadline) {
             sched::block_on_poll_cancel();
             continue;
@@ -9179,12 +9216,13 @@ pub fn poll_deadline_tick() {
 /// deadline tick. `reprobe` is a read-only "is anything ready now" check — it
 /// must not write user memory (that happens at the caller's loop top). The
 /// re-probe between prepare and commit closes the check-then-sleep lost-wake.
-fn poll_block(infinite: bool, deadline: u64, mask: u64, reprobe: impl FnOnce() -> bool) {
+fn poll_block(infinite: bool, deadline: u64, mask: u64, gen0: u64, reprobe: impl FnOnce() -> bool) {
     // `mask` is the OR of the interest set's tags; 0 (empty/untaggable set)
     // falls back to broadcast so the parked task is never immune to a wake.
     let mask = if mask == 0 { sched::POLL_TAG_ALL } else { mask };
     sched::block_on_poll_prepare_masked(if infinite { u64::MAX } else { deadline }, mask);
-    if reprobe() || interrupted() || (!infinite && monotonic_ns() >= deadline) {
+    if EPOLL_CTL_GEN.load(Ordering::Acquire) != gen0
+        || reprobe() || interrupted() || (!infinite && monotonic_ns() >= deadline) {
         sched::block_on_poll_cancel();
         return;
     }
@@ -9830,6 +9868,7 @@ fn select_wait(nfds: usize, rfds: usize, wfds: usize, efds: usize, deadline: u64
     let has_e = efds != 0 && validate_user_buf(efds, bytes);
 
     loop {
+        let gen0 = EPOLL_CTL_GEN.load(Ordering::Acquire);
         // fd_set is capped at 1024 bits (FD_SETSIZE) above, so 128 bytes
         // always covers `bytes`.
         let mut out_r = [0u8; 128];
@@ -9857,7 +9896,7 @@ fn select_wait(nfds: usize, rfds: usize, wfds: usize, efds: usize, deadline: u64
             return nready;
         }
 
-        poll_block(infinite, deadline, select_fds_mask(pid, nfds, rfds, wfds, has_r, has_w), || select_any_ready(pid, nfds, rfds, wfds, has_r, has_w));
+        poll_block(infinite, deadline, select_fds_mask(pid, nfds, rfds, wfds, has_r, has_w), gen0, || select_any_ready(pid, nfds, rfds, wfds, has_r, has_w));
     }
 }
 

@@ -388,6 +388,19 @@ impl RunQueue {
         woken
     }
 
+    /// See `crate::widen_poll_masks`: OR `add` into the `poll_mask` of every
+    /// task Blocked on `port` whose mask intersects `match_tag`.
+    pub fn widen_port_masks(&mut self, port: u32, match_tag: u64, add: u64) {
+        for slot in self.tasks.iter_mut() {
+            if let Some(task) = slot {
+                if task.blocked_on == Some(port) && task.state == TaskState::Blocked
+                    && (task.poll_mask & match_tag) != 0 {
+                    task.poll_mask |= add;
+                }
+            }
+        }
+    }
+
     /// Poll-deadline tick service: wake every task on `port` whose
     /// `poll_deadline` is due (`<= now`), and every poller whose interest mask
     /// names a timerfd that expired on this pass (`timerfd_tags`, an OR of

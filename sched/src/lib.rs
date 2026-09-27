@@ -1891,6 +1891,17 @@ pub fn wake_poll_tagged(tag: u64) {
     if woken > 0 { wake_up_an_idle_cpu(); }
 }
 
+/// OR `add` into the interest mask of every task parked on the poll channel
+/// whose mask intersects `match_tag`, without waking it. `sys_epoll_ctl` uses
+/// it when it (re-)arms an interest that is not ready: the instance's parked
+/// waiters (tag `poll_tag(EPOLL, slot)`) computed their masks without the new
+/// fd, and must be reachable by that fd's own later wake. Widening a mask can
+/// only add wakes, never lose one. Task context (takes RUN_QUEUE).
+pub fn widen_poll_masks(match_tag: u64, add: u64) {
+    if add == 0 { return; }
+    RUN_QUEUE.lock().widen_port_masks(POLL_WAIT_CHANNEL, match_tag, add);
+}
+
 /// A `wake_poll` that has been asked for but not yet paid for, as an OR of the
 /// tags requested since the last service. `0` = nothing pending. See
 /// `request_poll_wake`.
