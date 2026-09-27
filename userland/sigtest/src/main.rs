@@ -245,7 +245,7 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
                 if !test_futex_wait_restart_stress(iters) { failures += 1; }
                 if !test_futex_wake_beats_restart(iters) { failures += 1; }
                 if !test_futex_ignored_signal_keeps_waiting() { failures += 1; }
-                if !test_futex_wait_bitset_unaffected() { failures += 1; }
+                if !test_futex_wait_bitset_signal() { failures += 1; }
                 if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
                 puts(b"--- sigtest futex done ---\n\0".as_ptr());
                 return failures;
@@ -253,6 +253,13 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
             b"stoprem" => {
                 if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
                 puts(b"--- sigtest stoprem done ---\n\0".as_ptr());
+                return failures;
+            }
+            b"pollmask" => {
+                if !test_ppoll_pselect_sigmask() { failures += 1; }
+                if !test_futex_wait_bitset_signal() { failures += 1; }
+                if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
+                puts(b"--- sigtest pollmask done ---\n\0".as_ptr());
                 return failures;
             }
             b"futexab" => {
@@ -279,8 +286,9 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     if !test_futex_wait_restart_stress(20) { failures += 1; }
     if !test_futex_wake_beats_restart(20) { failures += 1; }
     if !test_futex_ignored_signal_keeps_waiting() { failures += 1; }
-    if !test_futex_wait_bitset_unaffected() { failures += 1; }
+    if !test_futex_wait_bitset_signal() { failures += 1; }
     if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
+    if !test_ppoll_pselect_sigmask() { failures += 1; }
     if !test_stack_overflow_sigsegv_on_altstack() { failures += 1; }
 
     puts(b"--- sigtest done ---\n\0".as_ptr());
@@ -1014,6 +1022,12 @@ extern "C" fn futex_helper(_: *mut c_void) -> *mut c_void {
 /// One FUTEX_WAIT on `FWORD` by the main thread with `futex_helper` running
 /// alongside. Returns (r, elapsed_ns).
 unsafe fn futex_signal_round(restart: bool, timeout_ms: i32, sig_ms: i32, wake_ms: i32) -> (c_long, i64) {
+    futex_signal_round_op(FUTEX_WAIT, restart, timeout_ms, sig_ms, wake_ms)
+}
+
+/// `futex_signal_round` with the op chosen: FUTEX_WAIT (relative timeout) or
+/// FUTEX_WAIT_BITSET (absolute CLOCK_MONOTONIC deadline `now + timeout_ms`).
+unsafe fn futex_signal_round_op(op: c_long, restart: bool, timeout_ms: i32, sig_ms: i32, wake_ms: i32) -> (c_long, i64) {
     FUTEX_SIG_COUNT.store(0, Ordering::SeqCst);
     let act = sigaction {
         sa_handler: Some(futex_sig_handler),
@@ -1031,11 +1045,16 @@ unsafe fn futex_signal_round(restart: bool, timeout_ms: i32, sig_ms: i32, wake_m
     if pthread_create(&mut th, core::ptr::null(), futex_helper, core::ptr::null_mut()) != 0 {
         return (-9998, 0);
     }
-    let to = timespec { tv_sec: (timeout_ms / 1000) as i64, tv_nsec: (timeout_ms % 1000) as c_long * 1_000_000 };
-    let top = if timeout_ms > 0 { &to as *const timespec as c_long } else { 0 };
     let t0 = now_ns();
-    let r = syscall(nr::FUTEX, FWORD.as_ptr() as c_long, FUTEX_WAIT | FUTEX_PRIVATE,
-                    7 as c_long, top, 0 as c_long, 0 as c_long);
+    let to = if op == FUTEX_WAIT_BITSET {
+        let d = t0 + timeout_ms as i64 * 1_000_000;
+        timespec { tv_sec: d / 1_000_000_000, tv_nsec: d % 1_000_000_000 }
+    } else {
+        timespec { tv_sec: (timeout_ms / 1000) as i64, tv_nsec: (timeout_ms % 1000) as c_long * 1_000_000 }
+    };
+    let top = if timeout_ms > 0 { &to as *const timespec as c_long } else { 0 };
+    let r = syscall(nr::FUTEX, FWORD.as_ptr() as c_long, op | FUTEX_PRIVATE,
+                    7 as c_long, top, 0 as c_long, FUTEX_BITSET_MATCH_ANY as c_long);
     let el = now_ns() - t0;
     pthread_join(th, core::ptr::null_mut());
     (r, el)
@@ -1213,36 +1232,36 @@ extern "C" fn ab_waker(_: *mut c_void) -> *mut c_void {
     core::ptr::null_mut()
 }
 
-/// FUTEX_WAIT_BITSET's absolute deadline is deliberately left unaffected by
-/// the restart fix above: a signal still just releases it early as a plain
-/// spurious wake (return 0), never EINTR/restart bookkeeping. This guards
-/// against the fix overreaching to the bitset form, which Linux does not
-/// restart either (its deadline is already absolute).
-unsafe fn test_futex_wait_bitset_unaffected() -> bool {
-    let name = b"futex_wait_bitset_unaffected\0";
-    let parent = getpid();
-    FUTEX_SIG_COUNT.store(0, Ordering::SeqCst);
-    let act = sigaction { sa_handler: Some(futex_sig_handler), sa_flags: 0, sa_restorer: None, sa_mask: 0 };
-    if sigaction(SIGALRM, &act, core::ptr::null_mut()) != 0 { return report(name, false); }
-
-    let child = fork();
-    if child == 0 {
-        let fire = timespec { tv_sec: 0, tv_nsec: 30_000_000 };
-        nanosleep(&fire, core::ptr::null_mut());
-        kill(parent, SIGALRM);
-        _exit(0);
+/// FUTEX_WAIT_BITSET interrupted by a handled signal answers exactly like
+/// FUTEX_WAIT (Linux futex_wait: -ERESTARTSYS untimed, -ERESTART_RESTARTBLOCK
+/// timed). It used to return a spurious 0 at the signal in every case:
+///   untimed + SA_RESTART -> restarted, ends at the genuine wake (~300 ms)
+///   untimed, no SA_RESTART -> EINTR at the signal
+///   timed (absolute), either way -> EINTR at the signal
+unsafe fn test_futex_wait_bitset_signal() -> bool {
+    let name = b"futex_wait_bitset_signal\0";
+    let mut ok = true;
+    let one = || FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 1;
+    let cases: [(bool, i32, i32, &[u8]); 4] = [
+        (true, 0, 250, b"  bitset untimed+SA_RESTART"),
+        (false, 0, 250, b"  bitset untimed           "),
+        (true, 1000, -1, b"  bitset timed+SA_RESTART  "),
+        (false, 1000, -1, b"  bitset timed             "),
+    ];
+    for &(restart, timeout_ms, wake_ms, label) in &cases {
+        let (r, el) = futex_signal_round_op(FUTEX_WAIT_BITSET, restart, timeout_ms, 50, wake_ms);
+        let c = if restart && timeout_ms == 0 {
+            r == 0 && el >= 280_000_000 && one()
+        } else {
+            r == -(EINTR as c_long) && el >= 30_000_000 && el < 250_000_000 && one()
+        };
+        write(1, label.as_ptr(), label.len());
+        write(1, b" r=".as_ptr(), 3); put_i32(r as i32);
+        write(1, b" el_ms=".as_ptr(), 7); put_i32((el / 1_000_000) as i32);
+        write(1, if c { b" ok\n".as_ptr() } else { b" BAD\n".as_ptr() }, if c { 4 } else { 5 });
+        ok &= c;
     }
-
-    let word: u32 = 7;
-    let t0 = now_ns();
-    let deadline = t0 + 200_000_000;
-    let to = timespec { tv_sec: deadline / 1_000_000_000, tv_nsec: deadline % 1_000_000_000 };
-    let r = syscall(nr::FUTEX, &word as *const u32 as c_long, FUTEX_WAIT_BITSET | FUTEX_PRIVATE,
-                    7 as c_long, &to as *const timespec as c_long, 0 as c_long,
-                    FUTEX_BITSET_MATCH_ANY as c_long);
-    let el = now_ns() - t0;
-    reap(child);
-    report(name, r == 0 && el < 150_000_000 && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 1)
+    report(name, ok)
 }
 
 // ── Timed waits across a stop/continue: resume the REMAINDER ────────────────
@@ -1269,9 +1288,12 @@ unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
     let mut old_chld = zeroed_sigaction(None);
     sigaction(SIGCHLD, &zeroed_sigaction(None), &mut old_chld);
     let mut ok = true;
-    let labels: [&[u8]; 4] = [b"  futex    ", b"  nanosleep", b"  ppoll    ", b"  pselect6 "];
+    let labels: [&[u8]; 6] = [b"  futex    ", b"  nanosleep", b"  ppoll    ", b"  pselect6 ",
+                              b"  futex_bs ", b"  poll     "];
+    // poll(2) (nr 7) exists on x86_64 only.
+    let kinds = if cfg!(target_arch = "x86_64") { 6 } else { 5 };
     for &(stop_ms, cont_ms, lo, hi) in &[(150i32, 250i32, 480i64, 680i64), (300, 700, 680, 950)] {
-        for which in 0..4 {
+        for which in 0..kinds {
             // The waiter is a forked child that the parent stops: stopping
             // sigtest itself would hand the terminal back to the shell.
             let mut fds = [0 as c_int; 2];
@@ -1287,8 +1309,17 @@ unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
                     1 => syscall(nr::NANOSLEEP, &ts as *const timespec as c_long, 0 as c_long),
                     2 => syscall(nr::PPOLL, 0 as c_long, 0 as c_long, &ts as *const timespec as c_long,
                                  0 as c_long, 8 as c_long),
-                    _ => syscall(nr::PSELECT6, 0 as c_long, 0 as c_long, 0 as c_long, 0 as c_long,
+                    3 => syscall(nr::PSELECT6, 0 as c_long, 0 as c_long, 0 as c_long, 0 as c_long,
                                  &ts as *const timespec as c_long, 0 as c_long),
+                    4 => {
+                        // Absolute deadline t0 + 500 ms.
+                        let d = t0 + 500_000_000;
+                        let abs = timespec { tv_sec: d / 1_000_000_000, tv_nsec: d % 1_000_000_000 };
+                        syscall(nr::FUTEX, FWORD.as_ptr() as c_long, FUTEX_WAIT_BITSET | FUTEX_PRIVATE,
+                                7 as c_long, &abs as *const timespec as c_long, 0 as c_long,
+                                FUTEX_BITSET_MATCH_ANY as c_long)
+                    }
+                    _ => poll_ms(500),
                 };
                 let out: [i64; 2] = [r as i64, now_ns() - t0];
                 write(fds[1], out.as_ptr() as *const u8, 16);
@@ -1307,7 +1338,7 @@ unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
             let r = out[0];
             let el_ms = out[1] / 1_000_000;
             // raw syscall() hands back the kernel's -errno.
-            let want_ok = if which == 0 { r == -(ETIMEDOUT as i64) } else { r == 0 };
+            let want_ok = if which == 0 || which == 4 { r == -(ETIMEDOUT as i64) } else { r == 0 };
             let c = want_ok && el_ms >= lo && el_ms <= hi;
             write(1, labels[which].as_ptr(), 11);
             write(1, b" stop/cont=".as_ptr(), 11);
@@ -1318,6 +1349,220 @@ unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
             ok &= c;
         }
     }
+    sigaction(SIGCHLD, &old_chld, core::ptr::null_mut());
+    report(name, ok)
+}
+
+/// poll(NULL, 0, ms) through the x86_64-only poll(2) (nr 7).
+#[cfg(target_arch = "x86_64")]
+unsafe fn poll_ms(ms: i32) -> c_long { syscall(7, 0 as c_long, 0 as c_long, ms as c_long) }
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn poll_ms(_ms: i32) -> c_long { -38 }
+
+// ── ppoll/pselect6: temporary sigmask, remaining-time write-back ───────────
+//
+// Linux (fs/select.c): ppoll and pselect6 install their sigmask argument for
+// the duration of the wait (set_user_sigmask) and put the caller's mask back
+// on return — unless the wait ended in EINTR, in which case the handler runs
+// under the TEMPORARY mask and the old one comes back through the handler
+// frame (restore_saved_sigmask_unless). That is the race-free pselect
+// pattern: block SIGUSR1, test the flag, then wait with SIGUSR1 unblocked.
+// select, pselect6 and ppoll also write the time not slept back into the
+// caller's timeout (poll_select_finish), whatever the result, except for a
+// zero timeout.
+
+static PM_COUNT: AtomicI32 = AtomicI32::new(0);
+static PM_MASK_IN_HANDLER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+extern "C" fn pm_handler(_sig: c_int) {
+    unsafe {
+        let mut cur: sigset_t = 0;
+        sigprocmask(SIG_BLOCK, core::ptr::null(), &mut cur);
+        PM_MASK_IN_HANDLER.store(cur, Ordering::SeqCst);
+    }
+    PM_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+fn sbit(s: c_int) -> u64 { 1u64 << (s - 1) }
+
+unsafe fn cur_mask() -> sigset_t {
+    let mut m: sigset_t = 0;
+    sigprocmask(SIG_BLOCK, core::ptr::null(), &mut m);
+    m
+}
+
+#[repr(C)]
+struct pollfd { fd: c_int, events: i16, revents: i16 }
+
+/// One masked wait. `kind` 0 = ppoll, 1 = pselect6. `fd` < 0: no fds.
+/// `mask` None passes a NULL sigmask.
+unsafe fn pm_wait(kind: i32, fd: c_int, ts: *mut timespec, mask: Option<&sigset_t>) -> c_long {
+    let mp = mask.map(|m| m as *const sigset_t as c_long).unwrap_or(0);
+    if kind == 0 {
+        let mut pfd = pollfd { fd, events: 1, revents: 0 };
+        let (p, n) = if fd >= 0 { (&mut pfd as *mut pollfd as c_long, 1) } else { (0, 0) };
+        syscall(nr::PPOLL, p, n as c_long, ts as c_long, mp, 8 as c_long)
+    } else {
+        let mut set = [0u64; 16];
+        let nfds = if fd >= 0 { set[fd as usize / 64] |= 1u64 << (fd % 64); fd + 1 } else { 0 };
+        let sp = if fd >= 0 { set.as_mut_ptr() as c_long } else { 0 };
+        // pselect6's sixth argument: { const sigset_t *ss; size_t ss_len }.
+        let data: [u64; 2] = [mp as u64, 8];
+        let dp = if mask.is_some() { data.as_ptr() as c_long } else { 0 };
+        syscall(nr::PSELECT6, nfds as c_long, sp, 0 as c_long, 0 as c_long, ts as c_long, dp)
+    }
+}
+
+unsafe fn ts_ms(ts: &timespec) -> i64 { ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000 }
+
+unsafe fn pm_line(label: &[u8], r: c_long, el_ms: i64, rem_ms: i64, c: bool) {
+    write(1, label.as_ptr(), label.len());
+    write(1, b" r=".as_ptr(), 3); put_i32(r as i32);
+    write(1, b" el_ms=".as_ptr(), 7); put_i32(el_ms as i32);
+    write(1, b" rem_ms=".as_ptr(), 8); put_i32(rem_ms as i32);
+    write(1, if c { b" ok\n".as_ptr() } else { b" BAD\n".as_ptr() }, if c { 4 } else { 5 });
+}
+
+unsafe fn test_ppoll_pselect_sigmask() -> bool {
+    let name = b"ppoll_pselect_sigmask\0";
+    let mut ok = true;
+    let mut old_chld = zeroed_sigaction(None);
+    sigaction(SIGCHLD, &zeroed_sigaction(None), &mut old_chld);
+    let act = sigaction { sa_handler: Some(pm_handler), sa_flags: 0, sa_restorer: None, sa_mask: 0 };
+    sigaction(SIGUSR1, &act, core::ptr::null_mut());
+    let entry = cur_mask();
+    let usr1 = sbit(SIGUSR1);
+    let usr2 = sbit(SIGUSR2);
+    for kind in 0..2 {
+        let pfx: &[u8] = if kind == 0 { b"  ppoll   " } else { b"  pselect6" };
+        // SIGUSR1 blocked outside the wait; the wait unblocks it and blocks
+        // SIGUSR2 instead (a marker the handler must observe).
+        let orig = (entry | usr1) & !usr2;
+        let temp = (orig | usr2) & !usr1;
+
+        // 1. A signal arriving during the wait interrupts it: EINTR, handler
+        //    ran under the temporary mask, caller's mask back afterwards.
+        sigprocmask(2 /* SIG_SETMASK */, &orig, core::ptr::null_mut());
+        PM_COUNT.store(0, Ordering::SeqCst);
+        PM_MASK_IN_HANDLER.store(0, Ordering::SeqCst);
+        FH_TID.store(syscall(nr::GETTID) as i32, Ordering::SeqCst);
+        FH_SIG_MS.store(60, Ordering::SeqCst);
+        FH_WAKE_MS.store(-1, Ordering::SeqCst);
+        FH_SIGNO.store(SIGUSR1, Ordering::SeqCst);
+        let mut th: pthread_t = core::ptr::null_mut();
+        pthread_create(&mut th, core::ptr::null(), futex_helper, core::ptr::null_mut());
+        let mut ts = timespec { tv_sec: 1, tv_nsec: 0 };
+        let t0 = now_ns();
+        let r = pm_wait(kind, -1, &mut ts, Some(&temp));
+        let el = (now_ns() - t0) / 1_000_000;
+        pthread_join(th, core::ptr::null_mut());
+        FH_SIGNO.store(SIGALRM, Ordering::SeqCst);
+        let after = cur_mask();
+        let hm = PM_MASK_IN_HANDLER.load(Ordering::SeqCst);
+        let rem = ts_ms(&ts);
+        let c = r == -(EINTR as c_long) && el < 500 && PM_COUNT.load(Ordering::SeqCst) == 1
+            && hm & usr2 != 0 && after == orig;
+        write(1, pfx.as_ptr(), pfx.len()); pm_line(b" arrives ", r, el, rem, c);
+        ok &= c;
+        // 2 (item 2). The time not slept was written back: ~940 ms of 1000.
+        let c = rem > 700 && rem < 1000;
+        write(1, pfx.as_ptr(), pfx.len()); pm_line(b" wb_eintr", r, el, rem, c);
+        ok &= c;
+        // Consume a USR1 the unfixed kernel leaves pending.
+        sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
+        sigprocmask(2, &orig, core::ptr::null_mut());
+
+        // 3. Pending before the call: delivered at once.
+        PM_COUNT.store(0, Ordering::SeqCst);
+        raise(SIGUSR1);
+        let mut ts = timespec { tv_sec: 1, tv_nsec: 0 };
+        let t0 = now_ns();
+        let r = pm_wait(kind, -1, &mut ts, Some(&temp));
+        let el = (now_ns() - t0) / 1_000_000;
+        let after = cur_mask();
+        let c = r == -(EINTR as c_long) && el < 100 && PM_COUNT.load(Ordering::SeqCst) == 1 && after == orig;
+        write(1, pfx.as_ptr(), pfx.len()); pm_line(b" pending ", r, el, ts_ms(&ts), c);
+        ok &= c;
+        sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
+        sigprocmask(2, &orig, core::ptr::null_mut());
+
+        // 4. An fd is ready AND a signal the temporary mask unblocks is
+        //    pending: the fd wins, the mask is restored at once, and the
+        //    signal stays pending (Linux do_poll/do_select check fds first).
+        PM_COUNT.store(0, Ordering::SeqCst);
+        let mut fds = [0 as c_int; 2];
+        pipe(fds.as_mut_ptr());
+        write(fds[1], b"x".as_ptr(), 1);
+        raise(SIGUSR1);
+        let mut ts = timespec { tv_sec: 1, tv_nsec: 0 };
+        let t0 = now_ns();
+        let r = pm_wait(kind, fds[0], &mut ts, Some(&temp));
+        let el = (now_ns() - t0) / 1_000_000;
+        let after = cur_mask();
+        let mut pend: sigset_t = 0;
+        sigpending(&mut pend);
+        let rem = ts_ms(&ts);
+        let c = r == 1 && PM_COUNT.load(Ordering::SeqCst) == 0 && after == orig && pend & usr1 != 0;
+        write(1, pfx.as_ptr(), pfx.len()); pm_line(b" ready   ", r, el, rem, c);
+        ok &= c;
+        let c = rem > 900 && rem <= 1000;
+        write(1, pfx.as_ptr(), pfx.len()); pm_line(b" wb_ready", r, el, rem, c);
+        ok &= c;
+        close(fds[0]); close(fds[1]);
+        sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut()); // runs the handler
+        sigprocmask(2, &orig, core::ptr::null_mut());
+
+        // 5. Timeout: 0, mask restored, timeout written back as {0, 0}.
+        let mut ts = timespec { tv_sec: 0, tv_nsec: 40_000_000 };
+        let t0 = now_ns();
+        let r = pm_wait(kind, -1, &mut ts, Some(&temp));
+        let el = (now_ns() - t0) / 1_000_000;
+        let after = cur_mask();
+        let c = r == 0 && el >= 39 && after == orig && ts.tv_sec == 0 && ts.tv_nsec == 0;
+        write(1, pfx.as_ptr(), pfx.len()); pm_line(b" timeout ", r, el, ts_ms(&ts), c);
+        ok &= c;
+
+        // 6. NULL sigmask: the caller's mask stands (SIGUSR1 stays blocked,
+        //    the wait times out, the signal stays pending).
+        PM_COUNT.store(0, Ordering::SeqCst);
+        raise(SIGUSR1);
+        let mut ts = timespec { tv_sec: 0, tv_nsec: 40_000_000 };
+        let r = pm_wait(kind, -1, &mut ts, None);
+        let c = r == 0 && PM_COUNT.load(Ordering::SeqCst) == 0 && cur_mask() == orig;
+        write(1, pfx.as_ptr(), pfx.len()); pm_line(b" nullmask", r, 0, ts_ms(&ts), c);
+        ok &= c;
+        sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
+    }
+
+    // select(2) (x86_64 only): the struct timeval is written back too.
+    #[cfg(target_arch = "x86_64")]
+    {
+        sigprocmask(2, &(entry & !usr1), core::ptr::null_mut());
+        PM_COUNT.store(0, Ordering::SeqCst);
+        FH_TID.store(syscall(nr::GETTID) as i32, Ordering::SeqCst);
+        FH_SIG_MS.store(60, Ordering::SeqCst);
+        FH_WAKE_MS.store(-1, Ordering::SeqCst);
+        FH_SIGNO.store(SIGUSR1, Ordering::SeqCst);
+        let mut th: pthread_t = core::ptr::null_mut();
+        pthread_create(&mut th, core::ptr::null(), futex_helper, core::ptr::null_mut());
+        let mut tv: [i64; 2] = [1, 0];
+        let t0 = now_ns();
+        let r = syscall(23, 0 as c_long, 0 as c_long, 0 as c_long, 0 as c_long, tv.as_mut_ptr() as c_long);
+        let el = (now_ns() - t0) / 1_000_000;
+        pthread_join(th, core::ptr::null_mut());
+        FH_SIGNO.store(SIGALRM, Ordering::SeqCst);
+        let rem = tv[0] * 1000 + tv[1] / 1000;
+        let c = r == -(EINTR as c_long) && PM_COUNT.load(Ordering::SeqCst) == 1 && rem > 700 && rem < 1000;
+        pm_line(b"  select    wb_eintr", r, el, rem, c);
+        ok &= c;
+        let mut tv: [i64; 2] = [0, 40_000];
+        let r = syscall(23, 0 as c_long, 0 as c_long, 0 as c_long, 0 as c_long, tv.as_mut_ptr() as c_long);
+        let c = r == 0 && tv[0] == 0 && tv[1] == 0;
+        pm_line(b"  select    timeout ", r, 0, tv[0] * 1000 + tv[1] / 1000, c);
+        ok &= c;
+    }
+
+    sigprocmask(2, &entry, core::ptr::null_mut());
+    sigaction(SIGUSR1, &zeroed_sigaction(None), core::ptr::null_mut());
     sigaction(SIGCHLD, &old_chld, core::ptr::null_mut());
     report(name, ok)
 }
