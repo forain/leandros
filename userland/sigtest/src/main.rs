@@ -118,6 +118,7 @@ extern "C" {
         arg: *mut c_void,
     ) -> c_int;
     pub fn pthread_join(thread: pthread_t, retval: *mut *mut c_void) -> c_int;
+    pub fn sigaltstack(ss: *const stack_t, old: *mut stack_t) -> c_int;
 
     // signalfd4 has no relibc C wrapper — go straight through the raw syscall
     // entry point, exactly as epolltest does.
@@ -219,6 +220,7 @@ pub unsafe extern "C" fn sig_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut
     if !test_sigchld_siginfo_killed() { failures += 1; }
     if !test_signalfd_agrees_with_handler() { failures += 1; }
     if !test_shared_handoff_keeps_payloads_apart() { failures += 1; }
+    if !test_stack_overflow_sigsegv_on_altstack() { failures += 1; }
 
     puts(b"--- sigtest done ---\n\0".as_ptr());
     failures
@@ -763,6 +765,92 @@ unsafe fn test_shared_handoff_keeps_payloads_apart() -> bool {
         && HANDOFF_USR.pid.load(Ordering::SeqCst)  == me;
 
     report(name, armed && parked && leader_saw_si_user && chld_ok && usr_ok)
+}
+
+// ── 12. Main-stack overflow is a catchable SIGSEGV ──────────────────────────
+//
+// The main stack is a fixed 8 MiB demand-paged VMA with nothing mapped below
+// it. Unbounded recursion must fault on the first page below it and deliver
+// SIGSEGV (SEGV_MAPERR, si_addr just under the stack) to a handler running on
+// the alternate stack — the path Rust's "has overflowed its stack" report and
+// every sigaltstack-based overflow handler depend on.
+
+#[repr(C)]
+pub struct stack_t {
+    pub ss_sp:    *mut c_void,
+    pub ss_flags: c_int,
+    pub ss_size:  usize,
+}
+
+const SIGSEGV:     c_int = 11;
+const SA_ONSTACK:  c_int = 0x0800_0000;
+const SEGV_MAPERR: c_int = 1;
+
+static mut ALT_STACK: [u8; 65536] = [0; 65536];
+static OVF_TOP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[inline(never)]
+unsafe fn recurse(depth: usize) -> usize {
+    let mut buf = [0u8; 1024];
+    // Escape the whole buffer, or SROA shrinks the frame to the two bytes used.
+    core::hint::black_box(&mut buf);
+    core::ptr::write_volatile(buf.as_mut_ptr(), depth as u8);
+    core::ptr::write_volatile(buf.as_mut_ptr().add(1023), depth as u8);
+    if depth == 0 { return 0; }
+    let r = recurse(depth - 1);
+    r + core::ptr::read_volatile(buf.as_ptr().add(1023)) as usize
+}
+
+extern "C" fn overflow_handler(_sig: c_int, info: *const siginfo_t, _uc: *mut c_void) {
+    unsafe {
+        let code = (*info).si_code;
+        let addr = *((info as *const u8).add(16) as *const usize);
+        let top = OVF_TOP.load(Ordering::SeqCst);
+        // Where the handler runs: on the alternate stack, not the dead one.
+        let here = &code as *const c_int as usize;
+        let alt = core::ptr::addr_of!(ALT_STACK) as usize;
+        let on_alt = here >= alt && here < alt + 65536;
+        let depth = top.wrapping_sub(addr);
+        let ok = code == SEGV_MAPERR && on_alt
+            && depth > 7 * 1024 * 1024 && depth < 9 * 1024 * 1024;
+        _exit(if ok { 42 } else if !on_alt { 44 } else { 43 });
+    }
+}
+
+unsafe fn test_stack_overflow_sigsegv_on_altstack() -> bool {
+    let name = b"stack_overflow_sigsegv_on_altstack\0";
+    let child = fork();
+    if child < 0 { return report(name, false); }
+    if child == 0 {
+        let marker = 0u8;
+        OVF_TOP.store(&marker as *const u8 as usize, Ordering::SeqCst);
+        let ss = stack_t {
+            ss_sp: core::ptr::addr_of_mut!(ALT_STACK) as *mut c_void,
+            ss_flags: 0,
+            ss_size: 65536,
+        };
+        if sigaltstack(&ss, core::ptr::null_mut()) != 0 { _exit(50); }
+        let mut act = zeroed_sigaction(Some(core::mem::transmute::<
+            extern "C" fn(c_int, *const siginfo_t, *mut c_void),
+            extern "C" fn(c_int),
+        >(overflow_handler)));
+        act.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        if sigaction(SIGSEGV, &act, core::ptr::null_mut()) != 0 { _exit(51); }
+        let r = recurse(usize::MAX);
+        _exit(if r == 7 { 52 } else { 53 });
+    }
+    let mut status: c_int = 0;
+    let mut got = 0;
+    for _ in 0..500 {
+        got = waitpid(child, &mut status, WNOHANG);
+        if got == child { break; }
+        nap();
+    }
+    write(1, b"overflow: status=".as_ptr(), 17);
+    put_i32(status);
+    write(1, b"\n".as_ptr(), 1);
+    // WIFEXITED && WEXITSTATUS == 42
+    report(name, got == child && status & 0x7f == 0 && (status >> 8) & 0xff == 42)
 }
 
 // ── Helper ──────────────────────────────────────────────────────────────────

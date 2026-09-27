@@ -21,6 +21,8 @@ pub const PROT_NONE:  u32 = 0;
 pub const PROT_READ:  u32 = 1 << 0;
 pub const PROT_WRITE: u32 = 1 << 1;
 pub const PROT_EXEC:  u32 = 1 << 2;
+/// Any access bit; a VMA whose `prot` has none of them is PROT_NONE.
+pub const PROT_ACCESS: u32 = PROT_READ | PROT_WRITE | PROT_EXEC;
 
 // ── POSIX mmap map flags ──────────────────────────────────────────────────────
 pub const MAP_SHARED:    u32 = 1 << 0;
@@ -702,6 +704,15 @@ impl AddressSpace {
         if !region.lazy {
             return FaultPlan::Done(Fault::Segv);
         }
+        // PROT_NONE: no access at all — pthread stack guards (musl maps the
+        // whole thread stack PROT_NONE and mprotects all but the guard), and
+        // reservations. Such a VMA never has PTEs installed (see `mprotect`,
+        // `cow::clone_as`), so every touch lands here. Until 2026-09-26 the
+        // fault path ignored `prot`: a read of a guard page got a fresh zero
+        // page and a write livelocked on the read-only PTE it installed.
+        if region.prot & PROT_ACCESS == 0 {
+            return FaultPlan::Done(Fault::Segv);
+        }
 
         // Compute the page index within this VMA.
         let page_idx = (page_va - region.start) / PAGE_SIZE;
@@ -812,7 +823,11 @@ impl AddressSpace {
             });
         }
 
-        // Anonymous: one zeroed page.
+        // Anonymous: one zeroed page. A write to a region userspace may not
+        // write is refused up front rather than after installing a page.
+        if is_write && region.prot & PROT_WRITE == 0 && !region.flags.contains(PageFlags::WRITABLE) {
+            return FaultPlan::Done(Fault::Segv);
+        }
         let phys = match buddy_alloc(0) {
             Some(p) => p,
             None    => return FaultPlan::Done(Fault::Segv), // OOM
@@ -1222,6 +1237,36 @@ impl AddressSpace {
         }
     }
 
+    /// `mremap` without MREMAP_MAYMOVE: grow `[addr, addr+old_len)` to
+    /// `new_len` without moving it. Returns `addr` or a negative errno:
+    /// EFAULT (-14) if the old range is not wholly inside one VMA, ENOMEM
+    /// (-12) if it does not end that VMA, the VMA is not a plain anonymous
+    /// demand-paged one, or the room above is taken.
+    pub fn grow_in_place(&mut self, addr: usize, old_len: usize, new_len: usize) -> isize {
+        if addr & (PAGE_SIZE - 1) != 0 { return -22; }
+        let old_end = match addr.checked_add(old_len) { Some(e) => e, None => return -14 };
+        let new_end = match addr.checked_add(new_len) { Some(e) => e, None => return -12 };
+        let idx = match self.regions.iter().position(|r| matches!(r,
+            Some(r) if addr >= r.start && addr < r.end))
+        {
+            Some(i) => i,
+            None => return -14,
+        };
+        let (end, growable) = {
+            let r = self.regions[idx].as_ref().unwrap();
+            (r.end, r.lazy && r.file_cap == 0 && r.map_flags & MAP_SHARED == 0)
+        };
+        if old_end > end { return -14; }
+        if old_end != end || !growable || new_end > 0x0000_8000_0000_0000 { return -12; }
+        if self.regions.iter().filter_map(|r| r.as_ref())
+            .any(|r| r.start < new_end && r.end > end)
+        {
+            return -12;
+        }
+        self.regions[idx].as_mut().unwrap().end = new_end;
+        addr as isize
+    }
+
     /// Look up the VmaRegion that contains `virt`, if any.
     pub fn find(&self, virt: usize) -> Option<&VmaRegion> {
         self.regions.iter()
@@ -1344,9 +1389,23 @@ impl AddressSpace {
 
             region.prot  = prot;
             region.flags = new_flags;
+            let no_access = prot & PROT_ACCESS == 0;
 
             // Remap every already-backed page of this now wholly-contained VMA.
-            if region.lazy {
+            // PROT_NONE drops the PTEs instead (the frames stay owned by the
+            // VMA, and a later mprotect reinstalls them): PageFlags have no
+            // "present but inaccessible" encoding.
+            if no_access {
+                let n_pages = (region.end - region.start) / PAGE_SIZE;
+                for i in 0..n_pages {
+                    let backed = if region.lazy {
+                        region.lazy_pages.get(i).copied().unwrap_or(0) != 0
+                    } else { region.phys != 0 };
+                    if backed {
+                        unsafe { unmap_page(self.page_table_root, region.start + i * PAGE_SIZE); }
+                    }
+                }
+            } else if region.lazy {
                 let is_cow = region.cow;
                 for (i, &phys) in region.lazy_pages.iter().enumerate() {
                     if phys != 0 {

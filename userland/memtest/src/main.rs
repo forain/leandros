@@ -10,7 +10,7 @@
 
 extern crate leandros_libc;
 use leandros_libc::*;
-use leandros_libc::syscall::{nr, syscall2, syscall3, syscall4};
+use leandros_libc::syscall::{nr, syscall2, syscall3, syscall4, syscall5};
 
 const PROT_READ:     i32 = 1;
 const PROT_WRITE:    i32 = 2;
@@ -46,6 +46,11 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_proc_rss_file_lazy() { failures += 1; }
     if !test_proc_pid_dir() { failures += 1; }
     if !test_slab_reclaims_empty_pages() { failures += 1; }
+    if !test_stack_demand_paged() { failures += 1; }
+    if !test_stack_deep_recursion() { failures += 1; }
+    if !test_stack_overflow_segv() { failures += 1; }
+    if !test_prot_none_faults() { failures += 1; }
+    if !test_mremap_nomove() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -944,4 +949,129 @@ unsafe fn memory_hog() -> ! {
         }
         usleep(500_000);
     }
+}
+
+
+// ── Demand-paged main stack, guard, PROT_NONE (2026-09-26) ──────────────────
+
+/// Recurse `depth` frames of a little over 1 KiB each, touching both ends of
+/// every frame's buffer so every stack page on the way down is written.
+#[inline(never)]
+unsafe fn recurse(depth: usize) -> usize {
+    let mut buf = [0u8; 1024];
+    // Escape the whole buffer, or SROA shrinks the frame to the two bytes used.
+    core::hint::black_box(&mut buf);
+    core::ptr::write_volatile(buf.as_mut_ptr(), depth as u8);
+    core::ptr::write_volatile(buf.as_mut_ptr().add(1023), depth as u8);
+    if depth == 0 { return core::ptr::read_volatile(buf.as_ptr()) as usize; }
+    let r = recurse(depth - 1);
+    r + core::ptr::read_volatile(buf.as_ptr().add(1023)) as usize
+}
+
+/// Run `f` in a forked child and return its raw wait status.
+unsafe fn in_child(f: unsafe fn() -> i32) -> i32 {
+    let pid = fork();
+    if pid == 0 { exit(f()); }
+    if pid < 0 { return -1; }
+    let mut status: i32 = 0;
+    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    status
+}
+
+/// The main stack is demand-paged: untouched stack is not resident, and
+/// touching 4 MiB of it raises RssAnon by about 4 MiB. With the eager stack
+/// (before 2026-09-26) all 8 MiB were resident from exec, so the delta was 0.
+unsafe fn test_stack_demand_paged() -> bool {
+    let name = b"stack_demand_paged\0";
+    unsafe fn child() -> i32 {
+        let a0 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+        let r = recurse(4000); // ~4.2 MiB of stack
+        let a1 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+        say_kb(b"  stack rss_anon_kib before=", a0); say_kb(b" after_4MiB_recursion=", a1);
+        write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+        if r == usize::MAX { return 9; }
+        if a1.saturating_sub(a0) >= 3900 { 0 } else { 1 }
+    }
+    let st = in_child(child);
+    report(name, st == 0)
+}
+
+/// Recursing ~6.8 MiB deep on the 8 MiB main stack works.
+unsafe fn test_stack_deep_recursion() -> bool {
+    let name = b"stack_deep_recursion\0";
+    unsafe fn child() -> i32 { if recurse(6500) == usize::MAX { 1 } else { 0 } }
+    let st = in_child(child);
+    write(STDOUT_FILENO, b"  deep_recursion_status=".as_ptr(), 24); print_dec(st as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, st == 0)
+}
+
+/// Unbounded recursion runs off the bottom of the stack into the guard and
+/// dies of SIGSEGV (not a hang, not a silent overwrite of another mapping).
+unsafe fn test_stack_overflow_segv() -> bool {
+    let name = b"stack_overflow_segv\0";
+    unsafe fn child() -> i32 { if recurse(usize::MAX) == 7 { 2 } else { 3 } }
+    let st = in_child(child);
+    write(STDOUT_FILENO, b"  overflow_status=".as_ptr(), 18); print_dec(st as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, st & 0x7f == 11)
+}
+
+unsafe fn mprotect_raw(p: *mut u8, len: usize, prot: i32) -> isize {
+    syscall3(nr::MPROTECT, p as usize, len, prot as usize)
+}
+
+static mut PN: *mut u8 = core::ptr::null_mut();
+
+/// PROT_NONE really is no access — the mechanism musl's pthread stack guard
+/// pages rely on (the whole stack is mapped PROT_NONE, all but the guard then
+/// mprotected RW). Reads and writes of an untouched PROT_NONE page, and of a
+/// populated page mprotected to PROT_NONE (also across fork), raise SIGSEGV;
+/// mprotect back to RW finds the data intact. Before 2026-09-26 a read got a
+/// zero page and a write livelocked in the fault handler.
+unsafe fn test_prot_none_faults() -> bool {
+    let name = b"prot_none_faults\0";
+    unsafe fn rd() -> i32 { core::ptr::read_volatile(PN) as i32 + 100 }
+    unsafe fn wr() -> i32 { core::ptr::write_volatile(PN, 5); 100 }
+    let fresh = mmap(core::ptr::null_mut(), 2 * PAGE, 0, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let used = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if fresh as isize == -1 || used as isize == -1 { return report(name, false); }
+    PN = fresh;             let s1 = in_child(rd);
+    PN = fresh.add(PAGE);   let s2 = in_child(wr);
+    *used = 0xAB;
+    let m1 = mprotect_raw(used, PAGE, 0);
+    PN = used;              let s3 = in_child(rd);
+                            let s4 = in_child(wr);
+    let m2 = mprotect_raw(used, PAGE, PROT_READ | PROT_WRITE);
+    let v = core::ptr::read_volatile(used);
+    let m3 = mprotect_raw(fresh, 2 * PAGE, PROT_READ | PROT_WRITE);
+    let z = core::ptr::read_volatile(fresh.add(PAGE));
+    munmap(fresh, 2 * PAGE); munmap(used, PAGE);
+    write(STDOUT_FILENO, b"  prot_none status".as_ptr(), 18);
+    for s in [s1, s2, s3, s4] { write(STDOUT_FILENO, b" ".as_ptr(), 1); print_dec(s as usize); }
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, s1 & 0x7f == 11 && s2 & 0x7f == 11 && s3 & 0x7f == 11 && s4 & 0x7f == 11
+        && m1 == 0 && m2 == 0 && m3 == 0 && v == 0xAB && z == 0)
+}
+
+/// mremap without MREMAP_MAYMOVE never moves: growing a range that does not
+/// end its mapping is ENOMEM (content left in place), growing the last page
+/// of a mapping with free room above succeeds in place, and an unmapped old
+/// range is EFAULT. musl's pthread_getattr_np() probes the main stack this way.
+unsafe fn test_mremap_nomove() -> bool {
+    let name = b"mremap_nomove\0";
+    let p = mmap(core::ptr::null_mut(), 4 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p as isize == -1 { return report(name, false); }
+    *p.add(PAGE) = 7;
+    let r1 = syscall5(nr::MREMAP, p as usize + PAGE, PAGE, 2 * PAGE, 0, 0);
+    let still = core::ptr::read_volatile(p.add(PAGE));
+    munmap(p.add(2 * PAGE), 2 * PAGE);
+    let r2 = syscall5(nr::MREMAP, p as usize + PAGE, PAGE, 2 * PAGE, 0, 0);
+    if r2 == p as isize + PAGE as isize { *p.add(2 * PAGE) = 1; } // the grown page is usable
+    munmap(p, 4 * PAGE);
+    let r3 = syscall5(nr::MREMAP, p as usize, PAGE, 2 * PAGE, 0, 0);
+    say_kb(b"  mremap_nomove r1=", (-r1) as usize); say_kb(b" r2_inplace=", (r2 == p as isize + PAGE as isize) as usize);
+    say_kb(b" r3=", (-r3) as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, r1 == -12 && still == 7 && r2 == p as isize + PAGE as isize && r3 == -14)
 }
