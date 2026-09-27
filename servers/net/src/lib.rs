@@ -141,11 +141,11 @@ pub const SOCK_FD_BASE: usize = 0x100;
 pub const SOCK_FD_END: usize = SOCK_FD_BASE + MAX_SOCKS;
 
 /// Processes that can hold a socket table: every process can (fork copies the
-/// parent's), so this is the scheduler's task limit. 64 -> 512 (lane procpool,
+/// parent's), so this is the system's process limit. 64 -> 512 (lane procpool,
 /// 2026-09-27): a COSMIC session holds 27 tables and each cosmic-term adds 2,
 /// so 64 capped a desktop at ~18 terminals. Tables are heap-allocated on first
 /// use (see `SockTables`), so the cap costs 8 bytes per slot until used.
-const MAX_PROCS:   usize = sched::runqueue::MAX_TASKS;
+const MAX_PROCS:   usize = sched::runqueue::MAX_PROCESSES;
 /// Per-process socket fd cap. Raised 16→512 for a COSMIC-class workload (a
 /// compositor holds a socket per client + the bus + internal socketpairs).
 /// 510, not 512: that keeps a whole `ProcSockTable` (pid + flag + entries)

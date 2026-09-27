@@ -61,11 +61,10 @@ pub const TIMER_GETOVERRUN: u64 = 0x54;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 // Per-process console termios and timer tables. 64 -> 512 (lane procpool,
-// 2026-09-27): sized to the scheduler's task limit, since every process can own
-// one. Scans stop at a high-water mark (`timer_hwm`/`console_hwm`): slots are
+// 2026-09-27): sized to the process limit, since every process can own one. Scans stop at a high-water mark (`timer_hwm`/`console_hwm`): slots are
 // claimed first-free, so lookups cost the session's peak process count, not 512
 // — `check_timers` runs on every syscall return and usually misses.
-const MAX_PROCS:  usize = sched::runqueue::MAX_TASKS;
+const MAX_PROCS:  usize = sched::runqueue::MAX_PROCESSES;
 
 static TIMER_HWM:   AtomicUsize = AtomicUsize::new(0);
 static CONSOLE_HWM: AtomicUsize = AtomicUsize::new(0);

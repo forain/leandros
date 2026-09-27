@@ -20,7 +20,18 @@ use super::task::{Pid, Task, TaskState};
 /// COSMIC session runs ~200 threads with an empty desktop and each
 /// cosmic-term adds ~19 (more while it starts), so the table filled at the
 /// third terminal ("[SCHED] task table FULL") and its thread spawn failed.
-pub const MAX_TASKS: usize = 512;
+/// 512 -> 1024 (lane procpool, 2026-09-27): on x86_64/KVM Venus a cosmic-term
+/// runs ~18 threads over a ~220-thread session, so 512 filled at 16 terminals.
+pub const MAX_TASKS: usize = 1024;
+
+/// Processes (thread groups), as opposed to threads. The per-process tables in
+/// the servers and the kernel (vfs fd tables, net socket tables, tty termios and
+/// timers, stdio flags, exe paths) are sized to this; the vfs fd-table pool is
+/// what enforces it, failing fork/vfork with EAGAIN plus one serial line. It is
+/// below MAX_TASKS because a process costs ~10 KiB of fd table in .bss while a
+/// thread costs a pointer here, and a desktop runs ~18 threads per process.
+pub const MAX_PROCESSES: usize = 512;
+const _: () = assert!(MAX_PROCESSES <= MAX_TASKS);
 
 use alloc::boxed::Box;
 
@@ -33,7 +44,7 @@ const IDX_BITS: u32 = 16;
 const IDX_MASK: u64 = (1 << IDX_BITS) - 1;
 /// pid → slot hint table: `PID_INDEX_SLOTS` entries, each pid hashed to a
 /// window of `PID_INDEX_PROBE` consecutive entries.
-const PID_INDEX_SLOTS: usize = 2048;
+const PID_INDEX_SLOTS: usize = 4096; // 4x MAX_TASKS, as 2048 was for 512
 const PID_INDEX_PROBE: usize = 8;
 
 pub struct RunQueue {

@@ -1716,12 +1716,12 @@ fn timerfd_poll_expirations(slot: usize) -> u64 {
 // ── FD table ─────────────────────────────────────────────────────────────────
 
 // One fd table per live process (tgid). 64 -> 512 (lane procpool,
-// 2026-09-27): 46 were in use with 8 cosmic-terms open, and every process
-// needs at least one task, so sizing this to the scheduler's task limit makes
-// the fd-table pool impossible to exhaust before fork itself fails there.
+// 2026-09-27): 46 were in use with 8 cosmic-terms open. This pool is what
+// enforces `sched::runqueue::MAX_PROCESSES`: fork/vfork check it first and fail
+// with EAGAIN (see `fd_table_slot_free`), so no child is born without a table.
 // 512 x ~10 KiB is ~5 MiB, all of it .bss: `ProcFdTable::empty()` is zero
 // bytes and the lock id is carried in the type (`new_typed`).
-const MAX_PROCS: usize = sched::runqueue::MAX_TASKS;
+const MAX_PROCS: usize = sched::runqueue::MAX_PROCESSES;
 // 64 is too tight for a real Wayland compositor: cosmic-comp alone holds its
 // wayland listen socket, epoll, DRM card fd, GBM fds, per-frame dmabuf exports,
 // D-Bus, inotify config watches and per-client sockets, and hit EMFILE ("No file
