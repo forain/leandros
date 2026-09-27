@@ -27,6 +27,7 @@ pub mod context;
 pub mod futex;
 pub mod lockwatch;
 pub mod idlestat;
+pub mod gdwake;
 pub mod pcsample;
 pub mod runqueue;
 pub mod signal;
@@ -1879,7 +1880,11 @@ pub fn wake_poll() { wake_poll_tagged(POLL_TAG_ALL); }
 /// context contract as `wake_poll`.
 #[track_caller]
 pub fn wake_poll_tagged(tag: u64) {
-    let woken = RUN_QUEUE.lock().unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
+    let woken = {
+        let mut rq = RUN_QUEUE.lock();
+        gdwake::set_site(core::panic::Location::caller());
+        rq.unblock_port_tagged(POLL_WAIT_CHANNEL, tag)
+    };
     if idlestat::ENABLED {
         idlestat::note_wake(core::panic::Location::caller(), tag == POLL_TAG_ALL, woken);
     }
@@ -1962,6 +1967,7 @@ pub fn try_wake_poll_tagged(tag: u64) -> bool {
     match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
             lockwatch::note_wake_try(true);
+            gdwake::set_site(core::panic::Location::caller());
             let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
             drop(rq);
             if idlestat::ENABLED {

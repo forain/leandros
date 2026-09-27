@@ -369,6 +369,9 @@ impl RunQueue {
             if let Some(task) = slot {
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
                     && (task.poll_mask & tag) != 0 {
+                    if crate::gdwake::ENABLED {
+                        crate::gdwake::mark(task.pid, crate::gdwake::SITE.load(core::sync::atomic::Ordering::Relaxed));
+                    }
                     self.maybe_ready[i / 64] |= 1u64 << (i % 64);
                     task.state         = TaskState::Ready;
                     task.blocked_on    = None;
@@ -378,6 +381,9 @@ impl RunQueue {
                     woken += 1;
                 }
             }
+        }
+        if crate::gdwake::ENABLED {
+            crate::gdwake::SITE.store(crate::gdwake::UNATTRIBUTED, core::sync::atomic::Ordering::Relaxed);
         }
         woken
     }
@@ -416,6 +422,10 @@ impl RunQueue {
                         crate::idlestat::note_deadline_wake(
                             task.poll_deadline <= now,
                             is_poll && task.poll_mask == crate::POLL_TAG_ALL);
+                    }
+                    if crate::gdwake::ENABLED {
+                        crate::gdwake::mark(task.pid, if task.poll_deadline <= now {
+                            crate::gdwake::DL_OWN } else { crate::gdwake::DL_TFD });
                     }
                     self.maybe_ready[i / 64] |= 1u64 << (i % 64);
                     task.state         = TaskState::Ready;
