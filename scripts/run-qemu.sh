@@ -270,6 +270,27 @@ else
     echo "🎮 GPU path: $GPU_MODE"
 fi
 
+# Host-side workaround, AMD radeonsi hosts only (lane hostgpufault, 2026-09-27).
+# With radeonsi's threaded context (u_threaded_context) on, a virgl COSMIC
+# session that opens cosmic-term faulted the HOST GPU in most boots on the
+# linux desktop (Raphael iGPU, Mesa 26.1.3, virglrenderer 1.3.0): `[gfxhub]
+# page fault ... SQC (data)` at garbage GPU addresses (0x0, 0x3f800000 = 1.0f,
+# 0x80010xx000), a gfx ring reset, and QEMU exiting with "The CS has cancelled
+# because the context is lost". GALLIUM_THREAD=0 made it go away; Venus (RADV)
+# never faulted. Guest pages cannot be involved: without blob resources virgl
+# never lets the host GPU see guest memory, and the address comes from the host
+# driver. Setting GALLIUM_THREAD yourself overrides this.
+if [ "$OS" = "Linux" ] && [ "$GPU_MODE" != "none" ] && [ -z "${GALLIUM_THREAD+x}" ]; then
+    for _drv in /sys/class/drm/renderD*/device/driver; do
+        if [ "$(basename "$(readlink -f "$_drv" 2>/dev/null)")" = "amdgpu" ]; then
+            export GALLIUM_THREAD=0
+            echo "🛡️  amdgpu host: GALLIUM_THREAD=0 for QEMU (radeonsi threaded-context GPU fault workaround)"
+            break
+        fi
+    done
+    unset _drv
+fi
+
 # Select GPU device.
 # x86_64: prefer virtio-vga — it is VGA-compatible so UEFI/OVMF exposes a GOP
 #         framebuffer that Limine can use.  virtio-gpu-pci has no VGA interface

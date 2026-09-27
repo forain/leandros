@@ -536,6 +536,28 @@ def _guest_mem():
     return os.environ.get("LEANDROS_QEMU_MEM", "2G")
 
 
+def _host_has_amdgpu():
+    """True when a host render node is driven by amdgpu (Linux only)."""
+    import glob
+    for d in glob.glob("/sys/class/drm/renderD*/device/driver"):
+        if os.path.basename(os.path.realpath(d)) == "amdgpu":
+            return True
+    return False
+
+
+def _qemu_env(qemu_cmd):
+    """QEMU's environment. On an amdgpu host with a GL display (virgl or Venus),
+    GALLIUM_THREAD=0 unless the caller set it: radeonsi's threaded context made
+    virgl COSMIC sessions fault the HOST GPU (SQC (data) page faults at garbage
+    addresses, ring reset, QEMU exits "context is lost"). Same workaround and
+    evidence as scripts/run-qemu.sh (lane hostgpufault, 2026-09-27)."""
+    env = os.environ.copy()
+    if (sys.platform.startswith("linux") and "egl-headless" in qemu_cmd
+            and "GALLIUM_THREAD" not in env and _host_has_amdgpu()):
+        env["GALLIUM_THREAD"] = "0"
+    return env
+
+
 def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
     if virgl:
         if mode not in ("uefi", "uefi-hvf", "uefi-tcg"):
@@ -902,6 +924,7 @@ def cmd_start(arch="aarch64", mode="uefi", venus=False, virgl=False):
         stdout=subprocess.DEVNULL,
         stderr=stderr_f,
         close_fds=True,
+        env=_qemu_env(qemu_cmd),
     )
     with open(PID_FILE, "w") as f:
         f.write(str(proc.pid))
