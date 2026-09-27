@@ -171,6 +171,17 @@ Build time: ~3–5 minutes clean, ~30s incremental.
   kernel lines, and a userspace heartbeat. Serial output still works during a
   main-loop hang (PL011 TX runs on the vCPU thread), serial *input* does not.
 
+- **Host GPU faults (linux desktop, AMD Raphael iGPU) — `GALLIUM_THREAD=0` on amdgpu hosts.**
+  A virgl session that opens cosmic-term faulted the HOST GPU in most boots: `[gfxhub] page fault ...
+  SQC (data)` at garbage GPU addresses (0x0, 0x3f800000 = 1.0f, 0x80010xx000), gfx ring reset, QEMU exits
+  with "The CS has cancelled because the context is lost". It is radeonsi's threaded context (host Mesa
+  26.1.3, virglrenderer 1.3.0): with `GALLIUM_THREAD=0` it never happened, Venus/RADV never faulted, and
+  a virgl guest cannot hand the host GPU an address (no blob resources, so guest pages are never
+  GPU-mapped). `run-qemu.sh` and `driver.py` therefore export `GALLIUM_THREAD=0` to QEMU on a Linux host
+  whose render node is amdgpu (set it yourself to override). `gpu-session-loop.py <n> <tag> [virgl|venus]`
+  (APPS=1 also opens cosmic-term) soaks N sessions and counts host `amdgpu` faults per boot from
+  `journalctl -k`.
+
 - **`liveness-run.py <label> "<cmd>" [--wav] [--timeout S]`** runs one guest
   command with a userspace heartbeat, a persistent (nothing-dropped, timestamped)
   serial reader, optional wav-growth tracking, and — only at a stall — a
