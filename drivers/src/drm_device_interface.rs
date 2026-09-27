@@ -3316,9 +3316,14 @@ fn flip_fence_service() -> bool {
     if !due { return true; }
     let mut ready = match READY_EVENTS.try_lock() { Some(g) => g, None => return false };
     let mut n = 0u64;
+    let mut tags = 0u64;
     while let Some(&(_, f, _, _)) = pend.front() {
         if f == 0 || f > floor { break; }
-        if let Some((blob, _, _, o)) = pend.pop_front() { ready.push_back((o, blob)); n += 1; }
+        if let Some((blob, _, _, o)) = pend.pop_front() {
+            ready.push_back((o, blob));
+            tags |= drm_event_poll_tag(o);
+            n += 1;
+        }
     }
     drop(ready);
     drop(pend);
@@ -3326,9 +3331,27 @@ fn flip_fence_service() -> bool {
         LAST_FLIP_DELIVER_TICK.store(sched::ticks(), Ordering::Relaxed);
         FLIPS_IRQ_DELIVERED.fetch_add(n, Ordering::Relaxed);
         DELIVERED_SEQ.fetch_add(n, Ordering::Relaxed);
-        sched::try_wake_poll();
+        drm_event_wake(tags);
     }
     true
+}
+
+/// The targeted-wake tag of `open_id`'s event queue: what a card fd's
+/// VFS_POLL reports (servers/drm) and what every READY_EVENTS push wakes.
+/// It used to be neither: DRM polls reported `POLL_TAG_ALL`, which made
+/// cosmic-comp's whole epoll mask a broadcast one (woken by every unix-socket
+/// write, eventfd and epoll_ctl in the system), and each delivered flip woke
+/// every parked poller in the system (~24 threads per flip on the idle
+/// greeter).
+pub fn drm_event_poll_tag(open_id: u32) -> u64 {
+    sched::poll_tag(sched::poll_class::DRM, 0x4000_0000 | open_id)
+}
+
+/// Wake the pollers of the opens in `tags` from IRQ/tick context; a
+/// contended RUN_QUEUE defers the wake to the next tick rather than dropping
+/// it (the events are already queued, so a lost wake would strand them).
+fn drm_event_wake(tags: u64) {
+    if !sched::try_wake_poll_tagged(tags) { sched::request_poll_wake_tagged(tags); }
 }
 
 /// Flip events delivered on their present's fence (the interrupt path), as
@@ -3605,7 +3628,7 @@ pub fn drm_tick() {
         drop(pend);
         LAST_FLIP_DELIVER_TICK.store(now, Ordering::Relaxed);
         DELIVERED_SEQ.fetch_add(1, Ordering::Relaxed);
-        sched::try_wake_poll();
+        drm_event_wake(drm_event_poll_tag(o));
     }
 }
 
