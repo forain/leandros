@@ -239,6 +239,7 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
                 if !test_futex_wait_signal_restart() { failures += 1; }
                 if !test_futex_wait_restart_stress(iters) { failures += 1; }
                 if !test_futex_wake_beats_restart(iters) { failures += 1; }
+                if !test_futex_ignored_signal_keeps_waiting() { failures += 1; }
                 if !test_futex_wait_bitset_unaffected() { failures += 1; }
                 puts(b"--- sigtest futex done ---\n\0".as_ptr());
                 return failures;
@@ -266,6 +267,7 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     if !test_futex_wait_signal_restart() { failures += 1; }
     if !test_futex_wait_restart_stress(20) { failures += 1; }
     if !test_futex_wake_beats_restart(20) { failures += 1; }
+    if !test_futex_ignored_signal_keeps_waiting() { failures += 1; }
     if !test_futex_wait_bitset_unaffected() { failures += 1; }
     if !test_stack_overflow_sigsegv_on_altstack() { failures += 1; }
 
@@ -960,6 +962,8 @@ static FH_SIG_MS:   AtomicI32 = AtomicI32::new(50);
 static FH_WAKE_MS:  AtomicI32 = AtomicI32::new(-1);
 /// What the racing FUTEX_WAKE (FH_WAKE_MS == 0) returned.
 static FH_WOKEN:    AtomicI32 = AtomicI32::new(0);
+/// Signal the helper sends (SIGALRM unless a test says otherwise).
+static FH_SIGNO:    AtomicI32 = AtomicI32::new(SIGALRM);
 
 unsafe fn sleep_ms(ms: i32) {
     let ts = timespec { tv_sec: (ms / 1000) as i64, tv_nsec: (ms % 1000) as c_long * 1_000_000 };
@@ -978,7 +982,7 @@ extern "C" fn futex_helper(_: *mut c_void) -> *mut c_void {
         sigprocmask(SIG_BLOCK, &m, core::ptr::null_mut());
         sleep_ms(FH_SIG_MS.load(Ordering::SeqCst));
         syscall(nr::TGKILL, getpid() as c_long, FH_TID.load(Ordering::SeqCst) as c_long,
-                SIGALRM as c_long);
+                FH_SIGNO.load(Ordering::SeqCst) as c_long);
         let w = FH_WAKE_MS.load(Ordering::SeqCst);
         if w == 0 {
             FH_WOKEN.store(futex_wake_word() as i32, Ordering::SeqCst);
@@ -1113,6 +1117,26 @@ unsafe fn test_futex_wake_beats_restart(iters: i32) -> bool {
     put_i32(bad);
     write(1, b"\n".as_ptr(), 1);
     report(name, lost == 0 && bad == 0)
+}
+
+/// A signal that is ignored (SIGCHLD at SIG_DFL, or SIG_IGN) must not end a
+/// FUTEX_WAIT at all: no handler runs, so there is nothing to restart and no
+/// reason for the wait to return. It used to come back as a spurious 0 at
+/// the signal (the generic Blocked -> Ready wake).
+unsafe fn test_futex_ignored_signal_keeps_waiting() -> bool {
+    let name = b"futex_ignored_signal_keeps_waiting\0";
+    let mut ok = true;
+    for &ign in &[false, true] {
+        let h = if ign { sig_ign() } else { None };
+        sigaction(SIGCHLD, &zeroed_sigaction(h), core::ptr::null_mut());
+        FH_SIGNO.store(SIGCHLD, Ordering::SeqCst);
+        let (r, el) = futex_signal_round(true, 0, 20, 80);
+        FH_SIGNO.store(SIGALRM, Ordering::SeqCst);
+        let c = r == 0 && el >= 90_000_000 && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 0;
+        if !c { write(1, b"  ignored r=".as_ptr(), 12); put_i32(r as i32); write(1, b" el_us=".as_ptr(), 7); put_i32((el / 1000) as i32); write(1, b"\n".as_ptr(), 1); }
+        ok &= c;
+    }
+    report(name, ok)
 }
 
 /// Diagnostic (`sigtest futexab N`), the shape of the original stress test:

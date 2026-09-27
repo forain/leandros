@@ -129,7 +129,13 @@ pub const FUTEX_INTERRUPTED: isize = -512;
 pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, private: bool) -> isize {
     // Before any lock: the slow path of current_tgid takes RUN_QUEUE.
     let tgid = super::current_tgid();
-    unsafe {
+    // Each pass is one register / re-check / park round. A release that is
+    // neither a claimed wake, nor the deadline, nor a deliverable signal (an
+    // ignored signal's Blocked -> Ready, a job-control continue) goes round
+    // again instead of returning a spurious 0 — Linux's `goto retry` in
+    // futex_wait. The value re-check on the next pass still ends it with
+    // EAGAIN if the word moved meanwhile.
+    loop { unsafe {
         let pid = current_pid();
 
         // ── Phase 1: prepare ────────────────────────────────────────────────
@@ -292,14 +298,12 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
 
         // No wake claimed this waiter: a timed one whose deadline has passed
         // reports ETIMEDOUT, one released with a deliverable signal is
-        // interrupted, anything else is a spurious wake (a stray poll wake)
-        // and returns 0, since every futex caller re-checks its own condition.
+        // interrupted, anything else waits again (see the loop comment).
         if let Some(dl) = deadline {
             if super::monotonic_ns() >= dl { return -110; } // ETIMEDOUT
         }
         if signalled { return FUTEX_INTERRUPTED; }
-    }
-    0
+    } }
 }
 
 /// Does waiter `w` belong to the futex a (`tgid`, `private`) caller names by
