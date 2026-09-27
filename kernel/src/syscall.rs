@@ -3091,6 +3091,10 @@ fn sys_clock_getres(_clkid: usize, res_ptr: usize) -> isize {
 fn sys_pread64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize {
     if count == 0 { return 0; }
     if !validate_user_buf(buf_ptr, count) { return -14; }
+    // As for read(2): the destination must be resident and private before it
+    // reaches f2fs (F2FS_MOUNTS held), a pipe ring or a pty — a fault there on
+    // a lazy private-file page would re-enter the filesystem and deadlock.
+    prefault_user(buf_ptr, count);
     let pid = current_pid();
     // Seek to offset, read, seek back (best-effort; position state is in VFS).
     let seek_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, offset as u64, 0 /* SEEK_SET */]);
@@ -3108,6 +3112,8 @@ fn sys_pread64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize 
 fn sys_pwrite64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize {
     if count == 0 { return 0; }
     if !validate_user_buf(buf_ptr, count) { return -14; }
+    // As for write(2): see sys_pread64.
+    prefault_user_ro(buf_ptr, count);
     let pid = current_pid();
     // Get current position.
     let cur_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, 0u64, 1 /* SEEK_CUR */]);
@@ -5377,6 +5383,28 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
             }
             0
         }
+        // A socket: VFS_READ answered EBADF for the whole socket fd range, so
+        // readv(2) on a socket never worked. The first non-empty iovec is a
+        // read(2) (blocking unless O_NONBLOCK); the rest only take what is
+        // already queued, like one recvmsg over the whole vector.
+        f if f >= net_server::SOCK_FD_BASE && f < EPOLL_FD_BASE => {
+            const MSG_DONTWAIT: usize = 0x40;
+            let mut total: isize = 0;
+            let mut first = true;
+            for i in 0..iovcnt {
+                let iov_addr = iov_ptr + i * 16;
+                let base = unsafe { core::ptr::read(iov_addr as *const usize) };
+                let len  = unsafe { core::ptr::read((iov_addr + 8) as *const usize) };
+                if len == 0 { continue; }
+                let n = if first { sys_read(fd, base, len) }
+                        else { sys_recvfrom(fd, base, len, MSG_DONTWAIT, 0, 0) };
+                first = false;
+                if n < 0 { return if total > 0 { total } else { n }; }
+                total = total.saturating_add(n);
+                if (n as usize) < len { break; } // short read
+            }
+            total
+        }
         _ => {
             let pid = current_pid();
             let mut total: isize = 0;
@@ -6573,6 +6601,8 @@ fn sys_flock(fd: usize, op: usize) -> isize {
 fn sys_pipe2(pipefd_ptr: usize, flags: usize) -> isize {
     // int pipefd[2] — two ints (4 bytes each) packed at pipefd_ptr.
     if !validate_user_buf(pipefd_ptr, 8) { return -14; }
+    // The VFS stores both fds with FD_TABLES held.
+    prefault_user(pipefd_ptr, 8);
     let rfd_ptr = pipefd_ptr;
     let wfd_ptr = pipefd_ptr + 4;
     let pid = current_pid();
@@ -7772,7 +7802,8 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
        cmd == DRM_IOCTL_GPU_IRQ_STATS || cmd == DRM_IOCTL_GPU_PARK_SPIN ||
        cmd == DRM_IOCTL_CTX_DRAIN_US ||
        is_evdev || is_drm {
-        
+        // FIONREAD on a RAM file stores the count with FD_TABLES held.
+        if cmd == FIONREAD && validate_user_buf(arg, 4) { prefault_user(arg, 4); }
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
         let reply = vfs::handle(&msg, pid);
         return u64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8])) as isize;
@@ -7857,6 +7888,9 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         return ENOTTY;
     }
 
+    // termios/winsize are copied with CONSOLE_TERMIOS held: fault the
+    // argument in first (a no-op for a non-pointer argument).
+    if arg != 0 && validate_user_buf(arg, 64) { prefault_user(arg, 64); }
     let msg = make_vfs_msg(tty_server::TTY_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
     net_reply_val(&tty_server::handle(&msg, pid))
 }
@@ -8399,18 +8433,24 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     // process (real POSIX fd-table semantics) — see the identical comment on
     // sys_epoll_wait's check for the bug this fixes.
     let tgid = sched::current_tgid();
+    // The event is read before EPOLL_INSTANCES is taken, fault-tolerantly: a
+    // fault under that lock stalls every epoll caller, and a bad pointer is
+    // EFAULT, not a killed caller holding it. (Not necessarily 8-byte
+    // aligned on x86_64 — the data word sits at offset 4 there.)
+    let ev = if op == CTL_ADD || op == CTL_MOD {
+        if event_ptr == 0 || !validate_user_buf(event_ptr, EPOLL_EVENT_SIZE) { return -14; }
+        match (sched::uaccess::read_user::<u32>(event_ptr),
+               sched::uaccess::read_user::<u64>(event_ptr + EPOLL_EVENT_DATA_OFF)) {
+            (Some(e), Some(d)) => (e, d),
+            _ => return -14,
+        }
+    } else { (0, 0) };
     let mut ep = EPOLL_INSTANCES.lock();
     if !ep[slot].in_use || ep[slot].owner_tgid != tgid { return -9; }
 
     let r = match op {
         CTL_ADD | CTL_MOD => {
-            if event_ptr == 0 || !validate_user_buf(event_ptr, EPOLL_EVENT_SIZE) { return -14; }
-            let events = unsafe { core::ptr::read(event_ptr as *const u32) };
-            // Not necessarily 8-byte aligned on x86_64 (offset 4 in the
-            // packed layout) — read_unaligned is required, not read.
-            let data = unsafe {
-                core::ptr::read_unaligned((event_ptr + EPOLL_EVENT_DATA_OFF) as *const u64)
-            };
+            let (events, data) = ev;
             // Find existing entry or allocate new one.
             let inst = &mut ep[slot];
             let idx = inst.interests.iter().position(|i| i.in_use && i.fd == fd as i32)

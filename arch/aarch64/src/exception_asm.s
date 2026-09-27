@@ -80,6 +80,7 @@ exc_el1_sync:
 exc_el1_sync_prologue_end:
     mrs  x0, esr_el1
     mrs  x1, elr_el1
+    mov  x2, sp
     bl   exc_el1_sync_handler
 
     b    ret_to_user

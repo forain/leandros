@@ -135,6 +135,13 @@ pub(crate) unsafe fn enable_sse() {
     let mut cr0: u64;
     asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
     cr0 &= !((1u64 << 2) | (1u64 << 3)); // clear EM (bit 2) and TS (bit 3)
+    // WP (bit 16): supervisor stores honour read-only user PTEs. Limine hands
+    // the BSP over with WP set, but the APs come up through our own SIPI
+    // trampoline, which sets only PE and PG — so on every AP a kernel store
+    // into a copy-on-write-shared user page (recv(2), read(2), a wait status,
+    // a signal frame) went straight into the frame the parent still maps,
+    // and a store into a PROT_READ page succeeded instead of faulting.
+    cr0 |= 1u64 << 16;
     asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack));
 
     let mut cr4: u64;
