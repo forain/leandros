@@ -65,6 +65,7 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
     echo "gpu-env: card0=${GPU_DRM_NAME:-none} capsets=$GPU_CAPSETS venus=$GPU_VENUS virgl=$GPU_VIRGL want=$_gpu_want" >&2
 
     LEANDROS_RENDERER_PATH=
+    _gpu_wgpu=
     LEANDROS_GL_RENDERER=
     # One ICD manifest per image (virtio_icd.<arch>.json); glob it rather
     # than spawn uname.
@@ -104,12 +105,15 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
     if [ -z "$LEANDROS_RENDERER_PATH" ] && [ "$GPU_VIRGL" = 1 ] \
        && { [ "$_gpu_want" = auto ] || [ "$_gpu_want" = virgl ]; }; then
         GL_RENDERER=
+        GL_WGPU=
+        GL_WGPU_ERR=
         _gpu_out=$(/bin/gpuprobe gl 2>/dev/null)
         _gpu_rc=$?
         eval "$_gpu_out"
         if [ "$_gpu_rc" = 0 ]; then
             LEANDROS_RENDERER_PATH=virgl
             LEANDROS_GL_RENDERER=$GL_RENDERER
+            _gpu_wgpu=${GL_WGPU:-unknown}
         else
             echo "gpu-env: virgl probe failed (rc=$_gpu_rc renderer='$GL_RENDERER')" >&2
         fi
@@ -160,17 +164,28 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
     fi
     case $LEANDROS_RENDERER_PATH in
     zink)  ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu}; WGPU_BACKEND=vulkan ;;
-    # virgl keeps the CPU fallback behind wgpu for now: wgpu's GLES backend
-    # only gets a context from a Mesa carrying
-    # ports/mesa/patches/0001-egl-robust-access-unsupported-is-bad-attribute
-    # when the host GL lacks robust buffer access (ANGLE/Metal on the Mac);
-    # with an older ship-set every client would otherwise fail to start.
-    # The warning below fires. Do NOT ship the patched Mesa on aarch64 yet:
-    # there wgpu does get a context on ANGLE/Metal, but iced clients
-    # (greeter, launcher) then die intermittently with EBADF on their
-    # event loop (never seen with tiny-skia on the same ship-set, nor on
-    # x86_64 virgl).
-    virgl) ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu,tiny-skia}; WGPU_BACKEND=gl ;;
+    # virgl: wgpu's GLES backend, verified by `gpuprobe gl` (GL_WGPU=1) doing
+    # the same robust-then-plain context creation wgpu-hal does. A Mesa
+    # without ports/mesa/patches/0001-egl-robust-access-unsupported-is-bad-
+    # attribute answers BAD_MATCH on a host GL without robust buffer access
+    # (ANGLE/Metal on the Mac) and wgpu then never gets a context; only in
+    # that case do clients keep iced's CPU fallback, with the banner below.
+    virgl)
+        WGPU_BACKEND=gl
+        if [ -n "${LEANDROS_ICED_BACKEND:-}" ]; then
+            ICED_BACKEND=$LEANDROS_ICED_BACKEND
+        elif [ "$_gpu_wgpu" = 1 ]; then
+            ICED_BACKEND=wgpu
+        else
+            ICED_BACKEND=wgpu,tiny-skia
+            echo "" >&2
+            echo "################################################################" >&2
+            echo "## gpu-env: wgpu cannot create a GLES context on this virgl    ##" >&2
+            echo "## (GL_WGPU=$_gpu_wgpu err=${GL_WGPU_ERR:-none}); COSMIC client widgets" >&2
+            echo "## FALL BACK TO tiny-skia (CPU). Ship the patched Mesa stage   ##" >&2
+            echo "## (ports/mesa/build-gpu-stack.sh) to render them on the GPU.  ##" >&2
+            echo "################################################################" >&2
+        fi ;;
     *)     ICED_BACKEND=${LEANDROS_ICED_BACKEND:-tiny-skia} ;;
     esac
     export ICED_BACKEND
@@ -182,5 +197,5 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
 
     LEANDROS_RENDERER_DECIDED=1
     export LEANDROS_RENDERER_PATH LEANDROS_GL_RENDERER LEANDROS_RENDERER_DECIDED
-    unset _gpu_want _gpu_allow_sw _gpu_icd _gpu_rc _gpu_out GL_RENDERER
+    unset _gpu_want _gpu_allow_sw _gpu_icd _gpu_rc _gpu_out _gpu_wgpu GL_RENDERER GL_WGPU GL_WGPU_ERR GL_WGPU_ROBUST
 fi
