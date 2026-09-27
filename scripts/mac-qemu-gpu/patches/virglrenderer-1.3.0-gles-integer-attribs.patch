@@ -1,0 +1,28 @@
+--- a/src/vrend/vrend_renderer.c	2026-09-27 04:27:49
++++ b/src/vrend/vrend_renderer.c	2026-09-27 04:27:49
+@@ -3413,6 +3413,9 @@
+       }
+ 
+       v->elements[i].type = type;
++      /* for the legacy (non vertex_attrib_binding) path too, e.g. ES 3.0 */
++      UPDATE_INT_SIGN_MASK(elements[i].src_format, i,
++                           v->signed_int_bitmask, v->unsigned_int_bitmask);
+       if (desc->channel[0].normalized)
+          v->elements[i].norm = GL_TRUE;
+       v->elements[i].nr_chan = desc->nr_channels;
+@@ -7553,6 +7556,15 @@
+ 
+ static bool use_integer(void) {
+    if (getenv("VIRGL_USE_INTEGER"))
++      return true;
++
++   /* OpenGL ES leaves a float shader input fed by integer vertex data (or an
++    * integer fragment output mismatched the other way) undefined, and ANGLE
++    * (Metal and Vulkan) does not reinterpret the bits: an instanced integer
++    * attribute read instance 0's value for every instance, so wgpu's text
++    * (glyph instances with u32 attributes) drew only its first glyph.  Type
++    * the shader interface from the bound formats on every GLES host. */
++   if (vrend_state.use_gles)
+       return true;
+ 
+    const char * a = (const char *) glGetString(GL_VENDOR);

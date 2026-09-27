@@ -1,0 +1,53 @@
+diff -ru a/build_overrides/angle.gni b/build_overrides/angle.gni
+--- a/build_overrides/angle.gni	2026-09-14 19:01:31
++++ b/build_overrides/angle.gni	2026-09-27 04:05:07
+@@ -27,3 +27,4 @@
+ # Embedder override for `-fsanitize=array-bounds`
+ # (see https://crbug.com/386992829)
+ angle_sanitize_array_bounds = false
++angle_shared_libvulkan_on_mac = true
+diff -ru a/src/common/vulkan/BUILD.gn b/src/common/vulkan/BUILD.gn
+--- a/src/common/vulkan/BUILD.gn	2026-09-14 19:01:31
++++ b/src/common/vulkan/BUILD.gn	2026-09-27 04:05:07
+@@ -123,7 +123,7 @@
+       if (!angle_use_vulkan_null_display) {
+         public_deps += [ "//third_party/fuchsia-sdk/sdk/pkg/vulkan_layers:VkLayer_image_pipe_swapchain" ]
+       }
+-    } else if (!is_android) {
++    } else if (!is_android && angle_use_custom_libvulkan) {
+       if (angle_shared_libvulkan) {
+         data_deps = [ "$angle_vulkan_loader_dir:libvulkan" ]
+       } else {
+diff -ru a/src/common/vulkan/libvulkan_loader.cpp b/src/common/vulkan/libvulkan_loader.cpp
+--- a/src/common/vulkan/libvulkan_loader.cpp	2026-09-14 19:01:31
++++ b/src/common/vulkan/libvulkan_loader.cpp	2026-09-27 04:05:07
+@@ -21,6 +21,9 @@
+ #if defined(ANGLE_PLATFORM_WINDOWS)
+         "vulkan-1.dll",
+ #elif defined(ANGLE_PLATFORM_APPLE)
++        // leandros: the host Vulkan loader (MoltenVK ICD) by absolute path, so
++        // no DYLD_* is needed at runtime; build.sh substitutes the placeholder
++        "@ANGLE_VULKAN_LOADER@",
+         "libvulkan.dylib", "libvulkan.1.dylib", "libMoltenVK.dylib",
+         // Fallback paths for static macOS builds where the Vulkan loader is bundled
+         // in the "Libraries/" subdirectory but the host module (containing ANGLE)
+diff -ru a/src/libANGLE/renderer/vulkan/vk_renderer.cpp b/src/libANGLE/renderer/vulkan/vk_renderer.cpp
+--- a/src/libANGLE/renderer/vulkan/vk_renderer.cpp	2026-09-14 19:01:31
++++ b/src/libANGLE/renderer/vulkan/vk_renderer.cpp	2026-09-27 04:05:07
+@@ -5266,11 +5266,15 @@
+ 
+     // Limit to ES2.0 if there are any blockers for 3.0.
+ 
+-    // VK_EXT_provoking_vertex is required for flat shading.
++    // VK_EXT_provoking_vertex is required for flat shading.  MoltenVK cannot
++    // offer it (Metal has no last-vertex convention), which would cap every
++    // Apple device at ES 2.0.  Accept first-vertex flat varyings there instead.
++#if !defined(ANGLE_PLATFORM_APPLE)
+     if (!mFeatures.provokingVertex.enabled)
+     {
+         maxVersion = LimitVersionTo(maxVersion, {2, 0});
+     }
++#endif
+ 
+     // Multisample textures (ES3.1) and multisample renderbuffers (ES3.0) require the Vulkan driver
+     // to support the standard sample locations (in order to pass dEQP tests that check these
