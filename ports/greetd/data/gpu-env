@@ -107,6 +107,9 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
         GL_RENDERER=
         GL_WGPU=
         GL_WGPU_ERR=
+        GL_ES_VERSION=
+        GL_SSBO_VS=
+        GL_SSBO_FS=
         _gpu_out=$(/bin/gpuprobe gl 2>/dev/null)
         _gpu_rc=$?
         eval "$_gpu_out"
@@ -114,6 +117,7 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
             LEANDROS_RENDERER_PATH=virgl
             LEANDROS_GL_RENDERER=$GL_RENDERER
             _gpu_wgpu=${GL_WGPU:-unknown}
+            echo "gpu-env: virgl GLES ${GL_ES_VERSION:-?} SSBO blocks vs=${GL_SSBO_VS:-?} fs=${GL_SSBO_FS:-?} wgpu=${GL_WGPU:-?}${GL_WGPU_ERR:+ ($GL_WGPU_ERR)}" >&2
         else
             echo "gpu-env: virgl probe failed (rc=$_gpu_rc renderer='$GL_RENDERER')" >&2
         fi
@@ -180,10 +184,27 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
             ICED_BACKEND=wgpu,tiny-skia
             echo "" >&2
             echo "################################################################" >&2
+            case ${GL_WGPU_ERR:-} in
+            gles*)
+            # A context, but a GLES < 3.1 / no-SSBO host: iced_wgpu's device
+            # request (Limits::default / downlevel_defaults, both with storage
+            # buffers) fails and iced_winit exits 0 without a word. This is
+            # the Mac's virgl on ANGLE/Metal (GLES 3.0). MITIGATION ONLY: the
+            # goal is a GLES >= 3.1 host (Mac host-GL work in progress in
+            # scripts/mac-qemu-gpu), not tiny-skia.
+            echo "## gpu-env: host GL too old for wgpu: GLES ${GL_ES_VERSION:-?}, SSBO blocks" >&2
+            echo "## vs=${GL_SSBO_VS:-?} fs=${GL_SSBO_FS:-?} (iced_wgpu needs GLES >= 3.1 and >= 4 each)." >&2
+            echo "## COSMIC client widgets FALL BACK TO tiny-skia (CPU); the     ##" >&2
+            echo "## compositor still renders on the GPU. Mac GLES >= 3.1 host   ##" >&2
+            echo "## work is in progress (scripts/mac-qemu-gpu).                 ##" >&2
+            ;;
+            *)
             echo "## gpu-env: wgpu cannot create a GLES context on this virgl    ##" >&2
             echo "## (GL_WGPU=$_gpu_wgpu err=${GL_WGPU_ERR:-none}); COSMIC client widgets" >&2
             echo "## FALL BACK TO tiny-skia (CPU). Ship the patched Mesa stage   ##" >&2
             echo "## (ports/mesa/build-gpu-stack.sh) to render them on the GPU.  ##" >&2
+            ;;
+            esac
             echo "################################################################" >&2
         fi ;;
     *)     ICED_BACKEND=${LEANDROS_ICED_BACKEND:-tiny-skia} ;;
@@ -197,5 +218,5 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
 
     LEANDROS_RENDERER_DECIDED=1
     export LEANDROS_RENDERER_PATH LEANDROS_GL_RENDERER LEANDROS_RENDERER_DECIDED
-    unset _gpu_want _gpu_allow_sw _gpu_icd _gpu_rc _gpu_out _gpu_wgpu GL_RENDERER GL_WGPU GL_WGPU_ERR GL_WGPU_ROBUST
+    unset _gpu_want _gpu_allow_sw _gpu_icd _gpu_rc _gpu_out _gpu_wgpu GL_RENDERER GL_WGPU GL_WGPU_ERR GL_WGPU_ROBUST GL_ES_VERSION GL_SSBO_VS GL_SSBO_FS
 fi
