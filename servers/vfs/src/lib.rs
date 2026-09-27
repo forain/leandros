@@ -1060,7 +1060,7 @@ pub enum VnodeKind {
 }
 
 // `VnodeKind` is embedded in `FdEntry`, and the fd tables are a static
-// `[[FdEntry; MAX_FDS]; MAX_PROCS]` — every byte added here costs 8K of BSS.
+// `[[FdEntry; MAX_FDS]; MAX_PROCS]` — every byte added here costs 256K of BSS.
 // 32 is the size before `DynamicDevice` grew its `open_id` (the `RamFile`
 // variant, a 16-byte slice plus a usize, sets the floor), and it must stay
 // that size: adding the u32 has to land in padding, not widen the enum.
@@ -1734,10 +1734,32 @@ const MAX_PROCS: usize = sched::runqueue::MAX_PROCESSES;
 // with an empty desktop and gains ~8-9 per mapped client window (its per-client
 // keymap memfd, imported dmabufs, sync eventfds), so it hit 128/128 at the
 // third cosmic-term and could no longer create the pipe/eventfd it needs to
-// spawn a fourth. 256 is the ceiling this layout allows: VFS fds are
-// [0, SOCK_FD_BASE = 0x100) and socket fds start right above.
-const MAX_FDS:   usize = 256;
-const _: () = assert!(MAX_FDS <= 0x100); // net_server::SOCK_FD_BASE (no dependency on net here)
+// spawn a fourth.
+//
+// 256 -> 512 (lane term20, 2026-09-27): on aarch64/HVF virgl cosmic-comp held
+// 255 VFS fds with 19 cosmic-terms (about 100 at idle, +8 per client) and
+// reached 256/256 on the 20th. The 20th client's buffer imports then failed
+// with EMFILE, the compositor never presented its surface, and the client sat
+// in eglSwapBuffers waiting for a frame callback: a blank window that ignored
+// Super+Q. VFS fds are [0, SOCK_FD_BASE) and socket fds start right above, so
+// the socket range moved up to 0x200 with this change (still below 1024, so
+// select() keeps working on sockets). An FdEntry is 40 bytes, so this table
+// is 20 KiB per process and 10 MiB of .bss for MAX_PROCS tables.
+const MAX_FDS:   usize = 512;
+const _: () = assert!(MAX_FDS <= 0x200); // net_server::SOCK_FD_BASE (no dependency on net here)
+
+/// One serial line when a process's own fd table is full (EMFILE), once per
+/// pid in a row. Without it a compositor that runs out of fds fails the
+/// client's buffer import in silence and the client just never draws.
+fn report_fd_table_full(pid: u32) {
+    static LAST: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+    if LAST.swap(pid, atomic::Ordering::Relaxed) == pid { return; }
+    dbg_str("\n[VFS] pid ");
+    dbg_dec(pid as usize);
+    dbg_str(": fd table FULL at ");
+    dbg_dec(MAX_FDS);
+    dbg_str(" (EMFILE) -- this process's own fd limit\n");
+}
 const O_CLOEXEC: u32   = 0x8_0000;
 /// O_NONBLOCK (== EFD_NONBLOCK/TFD_NONBLOCK/SFD_NONBLOCK). Module-level so the
 /// eventfd/timerfd/signalfd creators can record it on the fd (fd_nonblock reads
@@ -1776,8 +1798,10 @@ impl ProcFdTable {
         // writes to the UART, its data never reaches the ring). Processes
         // whose table is created fresh (no inherited entries) would otherwise
         // get exactly that from their first pipe()/open().
-        self.fds.iter().enumerate().skip(3)
-            .find(|(_, f)| !f.in_use).map(|(i, _)| i)
+        let fd = self.fds.iter().enumerate().skip(3)
+            .find(|(_, f)| !f.in_use).map(|(i, _)| i);
+        if fd.is_none() { report_fd_table_full(self.pid); }
+        fd
     }
 }
 
@@ -5913,7 +5937,7 @@ fn dup_fd_min(pid: u32, oldfd: usize, minfd: usize, cloexec: bool) -> Message {
     let newfd = match tbl.fds.iter().enumerate()
                     .find(|(i, f)| *i >= floor && *i != oldfd && !f.in_use)
                     .map(|(i, _)| i) {
-        Some(f) => f, None => return err_reply(-24) // EMFILE
+        Some(f) => f, None => { report_fd_table_full(pid); return err_reply(-24) } // EMFILE
     };
 
     if !tbl.fds[oldfd].in_use {

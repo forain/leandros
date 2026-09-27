@@ -8587,7 +8587,7 @@ impl EpollInstance {
 /// Epoll fd numbers are an indirection over instance slots so that two fds
 /// can alias one instance (dup semantics). fd = EPOLL_FD_BASE + entry index.
 /// ≥ MAX_EPOLL_INSTANCES to allow dup aliases; the [0x400, 0xC00) fd range
-/// stays clear of TTY_FD_BASE (0x1000) and the socket range [0x100, 0x300).
+/// stays clear of TTY_FD_BASE (0x1000) and the socket range [0x200, 0x3FE).
 /// 128→512 (m7z2), 512→2048 (multiterm): kept at 2× MAX_EPOLL_INSTANCES for
 /// dup aliases. Range top 0xC00 < TTY 0x1000.
 const MAX_EPOLL_FDS: usize = 2048;
@@ -9500,7 +9500,7 @@ fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
     // A nested epoll fd is itself pollable, and Linux reports it readable
     // exactly when its OWN interest list has at least one ready event (never
     // writable). Without this case the fd falls through to the socket branch
-    // below — EPOLL_FD_BASE (0x400) is above SOCK_FD_BASE (0x100) — NET_POLL
+    // below — EPOLL_FD_BASE (0x400) is above SOCK_FD_BASE (0x200) — NET_POLL
     // rejects it as not-a-socket, and probe_fd_events passes the resulting
     // POLLNVAL through unconditionally, so the interest fires on EVERY pass.
     // Any event loop that nests one reactor inside another then busy-spins
