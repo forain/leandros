@@ -42,7 +42,8 @@ ART=${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}
 ART=$(cd "$ART" && pwd -P)
 D=$ART/m6-session-bins
 S=$ART/m3-gl-stack/sysroot-$arch
-OUT=$D/out-wgpu
+# LEANDROS_WGPU_OUT redirects the output (e.g. a lane-private overlay dir).
+OUT=${LEANDROS_WGPU_OUT:-$D/out-wgpu}
 mkdir -p "$OUT"
 triple=$arch-unknown-linux-musl
 apps=("$@")
