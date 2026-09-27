@@ -58,9 +58,11 @@ use spin::Mutex;
 use crate::Termios;
 
 /// Pairs available system-wide. Each pair is ~24 KiB of ring, so this is the
-/// knob that decides the subsystem's BSS footprint; eight covers a terminal
-/// with several tabs plus a login session.
-pub const MAX_PTYS: usize = 8;
+/// knob that decides the subsystem's BSS footprint. 8 -> 64 (lane multiterm,
+/// 2026-09-27): every cosmic-term window and tab holds one, so eight capped a
+/// desktop at about seven terminals. `/dev/pts` names are two digits (< 100).
+pub const MAX_PTYS: usize = 64;
+const _: () = assert!(MAX_PTYS <= 100);
 
 const IN_BUF: usize = 4096;
 const OUT_BUF: usize = 16384;

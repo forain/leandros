@@ -286,11 +286,11 @@ fn report_send_failed() {
 /// fds, which is otherwise indistinguishable from a per-process leak.
 fn report_pool_full(name: &str, cap: usize) {
     static REPORTED: atomic::AtomicU32 = atomic::AtomicU32::new(0);
-    let bit = match name { "eventfd" => 1, "timerfd" => 2, "pipe" => 4, _ => 8 };
+    let bit = match name { "eventfd" => 1, "timerfd" => 2, "pipe" => 4, "tmpfs" => 16, "pty" => 32, _ => 8 };
     if REPORTED.fetch_or(bit, atomic::Ordering::Relaxed) & bit != 0 { return; }
-    dbg_str("\n[VFS] ENFILE: global ");
+    dbg_str("\n[VFS] global ");
     dbg_str(name);
-    dbg_str(" pool FULL at ");
+    dbg_str(" pool FULL (ENFILE; tmpfs/pty: ENOSPC) at ");
     dbg_dec(cap);
     dbg_str(" -- a vfs fixed table, not this process's fd limit\n");
 }
@@ -366,7 +366,11 @@ pub fn call_port(port_id: u32, mut msg: Message) -> Message {
 // coreutils run in /tmp exhausts 32 slots quickly and then reports ENOSPC
 // from creat/mkdir, and 64 bytes of path cannot hold a couple of nested
 // directories. Raise before assuming a tmpfs failure is a logic bug.
-const MAX_TMP_FILES: usize = 128;
+// 128 -> 512 (lane multiterm, 2026-09-27): every Wayland client holds several
+// memfds here (wl_shm pools, keymaps), and five cosmic-terms took the pool to
+// 120/128. The entry is all-zero when empty (`link_to` is biased by one), so
+// the table lands in .bss instead of the kernel image.
+const MAX_TMP_FILES: usize = 512;
 const MAX_TMP_SIZE:  usize = 32768;
 const MAX_TMP_PATH:  usize = 128;
 
@@ -400,7 +404,9 @@ struct TmpFileEntry {
     /// `st_ino` and every read/write/truncate funnel through `tmp_owner()`, so
     /// two hard links genuinely share one file rather than two copies of it.
     /// Directories are never hard-linked (link(2) returns EPERM for them), so
-    /// `link_to` is always `usize::MAX` on an `is_dir` slot.
+    /// `link_to` is always 0 on an `is_dir` slot. Stored as owner + 1 so that
+    /// 0 means "owns its own bytes" and an empty entry is all zero bytes
+    /// (keeps the pool in .bss rather than the kernel image's .data).
     link_to:  usize,
     mode:     u32, // permission bits (rwxrwxrwx), set at creation from umask
     uid:      u32, // owner, set at creation from the creating task's euid
@@ -429,7 +435,7 @@ impl TmpFileEntry {
                data: [0u8; MAX_TMP_SIZE], len: 0,
                in_use: false, is_dir: false, is_fifo: false, is_link: false,
                is_sock: false, sock_id: 0,
-               link_to: usize::MAX,
+               link_to: 0,
                mode: 0, uid: 0, gid: 0, ephemeral: false,
                xattr: [0u8; xattr::TMP_XATTR_ARENA],
                atime: (0, 0), mtime: (0, 0), ctime: (0, 0) }
@@ -2923,14 +2929,14 @@ fn tmp_set_path(e: &mut TmpFileEntry, path: &[u8]) {
 
 /// Map a pool index to the slot that actually owns the bytes.
 fn tmp_owner(tmp: &[TmpFileEntry], idx: usize) -> usize {
-    let to = tmp[idx].link_to;
-    if to == usize::MAX || to >= tmp.len() || !tmp[to].in_use { idx } else { to }
+    let to = tmp[idx].link_to.wrapping_sub(1);
+    if tmp[idx].link_to == 0 || to >= tmp.len() || !tmp[to].in_use { idx } else { to }
 }
 
 /// Number of aliases pointing at data-owning slot `owner`.
 fn tmp_alias_count(tmp: &[TmpFileEntry], owner: usize) -> usize {
     tmp.iter().enumerate().filter(|(i, e)| {
-        *i != owner && e.in_use && e.link_to == owner
+        *i != owner && e.in_use && e.link_to == owner + 1
     }).count()
 }
 
@@ -2967,8 +2973,8 @@ fn tmp_nlink(tmp: &[TmpFileEntry], idx: usize) -> u64 {
 /// reference from under it (see `DMABUF_RELEASE`). Every caller passes the
 /// value to `dmabuf_release` after its guard has died.
 #[must_use = "the dmabuf reference must be dropped, with TMP_FILES released"]
-fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: u128) -> Option<u32> {
-    let referenced = |i: usize| i < MAX_TMP_FILES && open_fds & (1u128 << i) != 0;
+fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: TmpMask) -> Option<u32> {
+    let referenced = |i: usize| open_fds.has(i);
     let owner = tmp_owner(tmp, idx);
     if owner != idx {
         // An alias. Free it (an alias never owns a VMO — the VMO is keyed on
@@ -3036,11 +3042,23 @@ fn tmp_inflight_dec(kind: &VnodeKind) {
 }
 
 /// Bitmask of tmpfs slots held by a queued SCM_RIGHTS descriptor.
-fn tmp_inflight_mask() -> u128 {
+/// One bit per tmpfs pool slot (was a `u128`, which capped the pool at 128).
+#[derive(Clone, Copy)]
+struct TmpMask([u64; MAX_TMP_FILES / 64]);
+const _: () = assert!(MAX_TMP_FILES % 64 == 0);
+
+impl TmpMask {
+    const fn new() -> Self { Self([0; MAX_TMP_FILES / 64]) }
+    fn set(&mut self, i: usize) { if i < MAX_TMP_FILES { self.0[i / 64] |= 1u64 << (i % 64); } }
+    fn has(&self, i: usize) -> bool { i < MAX_TMP_FILES && self.0[i / 64] & (1u64 << (i % 64)) != 0 }
+    fn or(mut self, o: TmpMask) -> Self { for (a, b) in self.0.iter_mut().zip(o.0) { *a |= b; } self }
+}
+
+fn tmp_inflight_mask() -> TmpMask {
     let f = TMP_INFLIGHT.lock();
-    let mut mask: u128 = 0;
+    let mut mask = TmpMask::new();
     for (i, &n) in f.iter().enumerate() {
-        if n > 0 { mask |= 1u128 << i; }
+        if n > 0 { mask.set(i); }
     }
     mask
 }
@@ -3049,19 +3067,19 @@ fn tmp_inflight_mask() -> u128 {
 ///
 /// Lock order is the established FD_TABLES → TMP_FILES, so callers must invoke
 /// this *before* taking the TMP_FILES lock and pass the result down.
-fn tmp_open_fd_mask() -> u128 {
+fn tmp_open_fd_mask() -> TmpMask {
     let tbls = FD_TABLES.lock();
-    let mut mask: u128 = 0;
+    let mut mask = TmpMask::new();
     for t in tbls.iter().filter(|t| t.in_use) {
         for f in t.fds.iter().filter(|f| f.in_use) {
             if let VnodeKind::TmpFile { idx, .. } = f.kind {
-                if idx < MAX_TMP_FILES { mask |= 1u128 << idx; }
+                mask.set(idx);
             }
         }
     }
     // A queued SCM_RIGHTS descriptor counts as a reference too: unlinking a slot
     // that is only held in flight must mark it ephemeral, not free it.
-    mask | tmp_inflight_mask()
+    mask.or(tmp_inflight_mask())
 }
 
 // ── Symlinks ─────────────────────────────────────────────────────────────────
@@ -4097,7 +4115,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // TIOCGPTN then reports.
             match tty_server::pty::alloc() {
                 Some(pair) => VnodeKind::Pty { pair: pair as u16, is_master: true },
-                None => return err_reply(-24), // EMFILE — pool exhausted
+                // ENOSPC, as Linux's devpts answers at its pty limit.
+                None => { report_pool_full("pty", tty_server::pty::MAX_PTYS); return err_reply(-28) }
             }
         } else if let Some(n) = pts_number(lookup_path) {
             // The slave half. `slave_open` enforces the TIOCSPTLCK lock and the
@@ -4194,7 +4213,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                             tmp_init_created(&mut tmp[..], idx, path, m, um, false);
                             VnodeKind::TmpFile { idx, pos: 0, writable: true }
                         }
-                        None => return err_reply(-28), // ENOSPC
+                        None => { drop(tmp); report_pool_full("tmpfs", MAX_TMP_FILES); return err_reply(-28) } // ENOSPC: tmpfs full
                     }
                 }
                 None => return err_reply(-2), // ENOENT
@@ -7579,7 +7598,7 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
             // content goes through tmp_owner() to `owner`. Mode/uid/gid are
             // mirrored only so a lock-free peek at the slot isn't nonsense;
             // stat() reads them from the owner regardless.
-            tmp[idx].link_to = owner;
+            tmp[idx].link_to = owner + 1;
             tmp[idx].is_fifo = tmp[owner].is_fifo;
             tmp[idx].is_link = tmp[owner].is_link;
             tmp[idx].is_sock = tmp[owner].is_sock;
@@ -8612,9 +8631,9 @@ fn tmpfs_statfs() -> StatfsVals {
         for e in tmp.iter() {
             if !e.in_use { continue; }
             slots += 1;
-            // Aliases (link_to != MAX) carry no bytes of their own — counting
+            // Aliases (link_to != 0) carry no bytes of their own — counting
             // them would charge a hard-linked file to the volume twice.
-            if !e.is_dir && e.link_to == usize::MAX { bytes += e.len as u64; }
+            if !e.is_dir && e.link_to == 0 { bytes += e.len as u64; }
         }
         (bytes, slots)
     };

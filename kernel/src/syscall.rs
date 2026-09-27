@@ -8460,7 +8460,11 @@ fn sys_getsockopt(sockfd: usize, level: usize, optname: usize,
 // interests), so 256 = ~4 MB of zero-init .bss (NOBITS — no ELF/file cost, only
 // runtime RAM, abundant in the guest). MAX_EPOLL_INTERESTS stays 512 (the
 // compositor's single instance watches every client fd + input + timers).
-const MAX_EPOLL_INSTANCES: usize = 256;
+// 256 -> 1024 (lane multiterm, 2026-09-27): each cosmic-term adds ~11
+// instances (tokio workers, calloop, wgpu), and five terminals took the pool
+// to 177/256. An empty instance is now all-zero bytes (see
+// `EpollInterest::empty`), so the ~20 MB table is .bss, not kernel image.
+const MAX_EPOLL_INSTANCES: usize = 1024;
 const MAX_EPOLL_INTERESTS: usize = 512;
 
 #[derive(Clone, Copy)]
@@ -8483,7 +8487,10 @@ struct EpollInterest {
 }
 
 impl EpollInterest {
-    const fn empty() -> Self { Self { fd: -1, events: 0, data: 0, in_use: false, last_seq: u64::MAX, armed: true } }
+    /// All-zero on purpose, so `EPOLL_INSTANCES` is zero-initialised (.bss).
+    /// Every reader skips `!in_use` entries, and CTL_ADD writes all fields
+    /// (last_seq = u64::MAX, armed = true), so these values are never seen.
+    const fn empty() -> Self { Self { fd: 0, events: 0, data: 0, in_use: false, last_seq: 0, armed: false } }
 }
 
 #[derive(Clone, Copy)]
@@ -8538,14 +8545,16 @@ impl EpollInstance {
 
 /// Epoll fd numbers are an indirection over instance slots so that two fds
 /// can alias one instance (dup semantics). fd = EPOLL_FD_BASE + entry index.
-/// ≥ MAX_EPOLL_INSTANCES to allow dup aliases; the [0x400, 0x600) fd range
+/// ≥ MAX_EPOLL_INSTANCES to allow dup aliases; the [0x400, 0xC00) fd range
 /// stays clear of TTY_FD_BASE (0x1000) and the socket range [0x100, 0x300).
-/// 128→512 (m7z2): tracks MAX_EPOLL_INSTANCES 64→256 (kept at 2× for dup
-/// aliases); just a 512-byte EPOLL_FDS table. Range top 0x600 < TTY 0x1000.
-const MAX_EPOLL_FDS: usize = 512;
+/// 128→512 (m7z2), 512→2048 (multiterm): kept at 2× MAX_EPOLL_INSTANCES for
+/// dup aliases. Range top 0xC00 < TTY 0x1000.
+const MAX_EPOLL_FDS: usize = 2048;
+const _: () = assert!(EPOLL_FD_BASE + MAX_EPOLL_FDS <= 0x1000);
+const _: () = assert!(MAX_EPOLL_INSTANCES <= u16::MAX as usize + 1);
 
 #[derive(Clone, Copy)]
-struct EpollFdEntry { in_use: bool, slot: u8 }
+struct EpollFdEntry { in_use: bool, slot: u16 }
 
 static EPOLL_FDS: spin::Mutex<[EpollFdEntry; MAX_EPOLL_FDS]> =
     spin::Mutex::new([EpollFdEntry { in_use: false, slot: 0 }; MAX_EPOLL_FDS]);
@@ -8574,7 +8583,7 @@ fn epoll_fcntl(epfd: usize, cmd: usize) -> isize {
             let mut t = EPOLL_FDS.lock();
             match t.iter().position(|e| !e.in_use) {
                 Some(i) => {
-                    t[i] = EpollFdEntry { in_use: true, slot: slot as u8 };
+                    t[i] = EpollFdEntry { in_use: true, slot: slot as u16 };
                     ep[slot].refs += 1;
                     (EPOLL_FD_BASE + i) as isize
                 }
@@ -8647,6 +8656,18 @@ fn epoll_close_all(pid: u32) {
     }
 }
 
+/// One serial line per table, the first time a global epoll table runs dry.
+fn report_epoll_full(what: &str, cap: usize) {
+    static REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let bit = if what == "fd" { 1 } else { 2 };
+    if REPORTED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit != 0 { return; }
+    serial_print_str("\n[EPOLL] global ");
+    serial_print_str(what);
+    serial_print_str(" table FULL (ENFILE) at ");
+    crate::print_number(cap as u32);
+    serial_print_str("\n");
+}
+
 /// Ctrl-T dump hook: the GLOBAL epoll pools (instances, fds). Both are
 /// session-wide fixed tables, so their fill level is what predicts the next
 /// "EMFILE in a fresh process". IRQ context: try_lock only.
@@ -8684,7 +8705,7 @@ fn sys_epoll_create1(_flags: usize) -> isize {
     let mut t = EPOLL_FDS.lock();
     let fd_idx = match t.iter().position(|e| !e.in_use) {
         Some(i) => i,
-        None => return -24, // EMFILE
+        None => { drop(t); drop(ep); report_epoll_full("fd", MAX_EPOLL_FDS); return -23; } // ENFILE: global table
     };
     match ep.iter().position(|e| !e.in_use) {
         Some(i) => {
@@ -8693,10 +8714,10 @@ fn sys_epoll_create1(_flags: usize) -> isize {
             ep[i].owner_pid  = pid;
             ep[i].owner_tgid = sched::current_tgid();
             ep[i].refs      = 1;
-            t[fd_idx] = EpollFdEntry { in_use: true, slot: i as u8 };
+            t[fd_idx] = EpollFdEntry { in_use: true, slot: i as u16 };
             (fd_idx + EPOLL_FD_BASE) as isize
         }
-        None => -12, // ENOMEM
+        None => { drop(t); drop(ep); report_epoll_full("instance", MAX_EPOLL_INSTANCES); -23 } // ENFILE: global table
     }
 }
 
