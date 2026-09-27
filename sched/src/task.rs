@@ -292,6 +292,13 @@ pub struct Task {
     /// the handler frame's `uc_sigmask` (so `rt_sigreturn` restores it), or
     /// the no-signal path restores it directly. Linux: `restore_saved_sigmask`.
     pub saved_sigmask: Option<u64>,
+    /// Linux `restart_block`: what `restart_syscall(2)` resumes after a timed
+    /// wait returned -ERESTART_RESTARTBLOCK and no handler ran (a stop and
+    /// continue, a signal a sibling took). `[0]` is the kernel's kind tag
+    /// (0 = nothing to resume), the rest its arguments — for every current
+    /// kind including the ABSOLUTE deadline, so the resumed wait ends when the
+    /// original would have instead of re-arming the full relative interval.
+    pub restart_block: [u64; 7],
     /// EEVDF virtual deadline; the runnable, eligible task with the earliest
     /// deadline is picked next.
     pub vdeadline:    u64,
@@ -522,6 +529,7 @@ impl Task {
             vruntime: 0,
             cpu_ns: 0,
             saved_sigmask: None,
+            restart_block: [0; 7],
             vdeadline: 0,
             ctx: if entry == 0 {
                 CpuContext::zeroed()
@@ -905,6 +913,7 @@ impl Task {
             vruntime: 0,
             cpu_ns: 0,
             saved_sigmask: None,
+            restart_block: [0; 7],
             vdeadline: 0,
             ctx: crate::context::CpuContext::new_user_task_with_pt(user_entry, user_sp, kernel_stack_virt + kernel_stack_size, page_table),
             page_table,

@@ -217,8 +217,10 @@ fn rewind_syscall(frame_ptr: usize, (nr, a0): (u64, u64)) {
     let f = unsafe { &mut *(frame_ptr as *mut crate::context::UserFrame) };
     #[cfg(target_arch = "x86_64")]
     { let _ = a0; f.rax = nr; f.rip -= 2; f.rcx = f.rip; } // `syscall` is 0F 05
+    // x8 is rewritten too: it is the same number for a plain restart, and
+    // `restart_syscall` for -ERESTART_RESTARTBLOCK (Linux does the same).
     #[cfg(target_arch = "aarch64")]
-    { let _ = nr; f.x[0] = a0; f.elr_el1 -= 4; }            // `svc #0`, x8 intact
+    { f.x[8] = nr; f.x[0] = a0; f.elr_el1 -= 4; }           // `svc #0`
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     { let _ = (f, nr, a0); }
 }

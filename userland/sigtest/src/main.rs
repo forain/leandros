@@ -39,6 +39,8 @@ const SIGKILL: c_int = 9;
 const SIGUSR1: c_int = 10;
 const SIGUSR2: c_int = 12;
 const SIGCHLD: c_int = 17;
+const SIGCONT: c_int = 18;
+const SIGSTOP: c_int = 19;
 
 const SIG_BLOCK: c_int = 0;
 const SIG_UNBLOCK: c_int = 1;
@@ -87,9 +89,11 @@ mod ssi {
 }
 
 #[cfg(target_arch = "x86_64")]
-mod nr { pub const SIGNALFD4: i64 = 289; pub const FUTEX: i64 = 202; pub const GETTID: i64 = 186; pub const TGKILL: i64 = 234; }
+mod nr { pub const SIGNALFD4: i64 = 289; pub const FUTEX: i64 = 202; pub const GETTID: i64 = 186; pub const TGKILL: i64 = 234;
+         pub const NANOSLEEP: i64 = 35; pub const PPOLL: i64 = 271; pub const PSELECT6: i64 = 270; }
 #[cfg(target_arch = "aarch64")]
-mod nr { pub const SIGNALFD4: i64 = 74; pub const FUTEX: i64 = 98; pub const GETTID: i64 = 178; pub const TGKILL: i64 = 131; }
+mod nr { pub const SIGNALFD4: i64 = 74; pub const FUTEX: i64 = 98; pub const GETTID: i64 = 178; pub const TGKILL: i64 = 131;
+         pub const NANOSLEEP: i64 = 101; pub const PPOLL: i64 = 73; pub const PSELECT6: i64 = 72; }
 
 pub type pthread_t = *mut c_void;
 
@@ -103,6 +107,7 @@ extern "C" {
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     pub fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
     pub fn close(fd: i32) -> i32;
+    pub fn pipe(fds: *mut i32) -> i32;
     pub fn exit(status: i32) -> !;
     pub fn _exit(status: i32) -> !;
 
@@ -241,7 +246,13 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
                 if !test_futex_wake_beats_restart(iters) { failures += 1; }
                 if !test_futex_ignored_signal_keeps_waiting() { failures += 1; }
                 if !test_futex_wait_bitset_unaffected() { failures += 1; }
+                if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
                 puts(b"--- sigtest futex done ---\n\0".as_ptr());
+                return failures;
+            }
+            b"stoprem" => {
+                if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
+                puts(b"--- sigtest stoprem done ---\n\0".as_ptr());
                 return failures;
             }
             b"futexab" => {
@@ -269,6 +280,7 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     if !test_futex_wake_beats_restart(20) { failures += 1; }
     if !test_futex_ignored_signal_keeps_waiting() { failures += 1; }
     if !test_futex_wait_bitset_unaffected() { failures += 1; }
+    if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
     if !test_stack_overflow_sigsegv_on_altstack() { failures += 1; }
 
     puts(b"--- sigtest done ---\n\0".as_ptr());
@@ -1231,4 +1243,81 @@ unsafe fn test_futex_wait_bitset_unaffected() -> bool {
     let el = now_ns() - t0;
     reap(child);
     report(name, r == 0 && el < 150_000_000 && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 1)
+}
+
+// ── Timed waits across a stop/continue: resume the REMAINDER ────────────────
+
+/// A relative-timeout wait interrupted by a signal for which no handler runs
+/// — here SIGSTOP then SIGCONT from a forked child — is restarted
+/// transparently, and on Linux the restarted wait keeps the ORIGINAL
+/// deadline (restart_block / -ERESTART_RESTARTBLOCK, or the written-back
+/// timeout for select). The bug: the restart re-read the relative timeout and
+/// waited the full interval again.
+///
+/// Each syscall waits 500 ms in a forked child, which the parent stops at
+/// `stop_ms` and continues at `cont_ms`.
+///   * 150 -> 250: restart must end at ~500 ms (old: ~750 ms).
+///   * 300 -> 700: the deadline passes while stopped, so the restart must
+///     return at once, at ~700 ms (old: ~1200 ms). That the elapsed time is
+///     >= 700 also proves the stop really took effect.
+/// nanosleep used to fail with EINTR at the continue instead (Linux has
+/// restarted it since 2.6.24); ppoll/pselect6 likewise.
+unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
+    let name = b"timed_wait_stop_resumes_remainder\0";
+    // SIGCHLD at SIG_DFL: the child's exit must not end the wait with a
+    // handler's EINTR (earlier cases leave a SA_RESTART-less handler).
+    let mut old_chld = zeroed_sigaction(None);
+    sigaction(SIGCHLD, &zeroed_sigaction(None), &mut old_chld);
+    let mut ok = true;
+    let labels: [&[u8]; 4] = [b"  futex    ", b"  nanosleep", b"  ppoll    ", b"  pselect6 "];
+    for &(stop_ms, cont_ms, lo, hi) in &[(150i32, 250i32, 480i64, 680i64), (300, 700, 680, 950)] {
+        for which in 0..4 {
+            // The waiter is a forked child that the parent stops: stopping
+            // sigtest itself would hand the terminal back to the shell.
+            let mut fds = [0 as c_int; 2];
+            pipe(fds.as_mut_ptr());
+            FWORD.store(7, Ordering::SeqCst);
+            let child = fork();
+            if child == 0 {
+                let ts = timespec { tv_sec: 0, tv_nsec: 500_000_000 };
+                let t0 = now_ns();
+                let r = match which {
+                    0 => syscall(nr::FUTEX, FWORD.as_ptr() as c_long, FUTEX_WAIT | FUTEX_PRIVATE,
+                                 7 as c_long, &ts as *const timespec as c_long, 0 as c_long, 0 as c_long),
+                    1 => syscall(nr::NANOSLEEP, &ts as *const timespec as c_long, 0 as c_long),
+                    2 => syscall(nr::PPOLL, 0 as c_long, 0 as c_long, &ts as *const timespec as c_long,
+                                 0 as c_long, 8 as c_long),
+                    _ => syscall(nr::PSELECT6, 0 as c_long, 0 as c_long, 0 as c_long, 0 as c_long,
+                                 &ts as *const timespec as c_long, 0 as c_long),
+                };
+                let out: [i64; 2] = [r as i64, now_ns() - t0];
+                write(fds[1], out.as_ptr() as *const u8, 16);
+                _exit(0);
+            }
+            close(fds[1]);
+            sleep_ms(stop_ms);
+            kill(child, SIGSTOP);
+            sleep_ms(cont_ms - stop_ms);
+            kill(child, SIGCONT);
+            let mut out: [i64; 2] = [-9999, 0];
+            read(fds[0], out.as_mut_ptr() as *mut u8, 16);
+            close(fds[0]);
+            let mut st = 0;
+            waitpid(child, &mut st, 0);
+            let r = out[0];
+            let el_ms = out[1] / 1_000_000;
+            // raw syscall() hands back the kernel's -errno.
+            let want_ok = if which == 0 { r == -(ETIMEDOUT as i64) } else { r == 0 };
+            let c = want_ok && el_ms >= lo && el_ms <= hi;
+            write(1, labels[which].as_ptr(), 11);
+            write(1, b" stop/cont=".as_ptr(), 11);
+            put_i32(stop_ms); write(1, b"/".as_ptr(), 1); put_i32(cont_ms);
+            write(1, b" r=".as_ptr(), 3); put_i32(r as i32);
+            write(1, b" el_ms=".as_ptr(), 7); put_i32(el_ms as i32);
+            write(1, if c { b" ok\n".as_ptr() } else { b" BAD\n".as_ptr() }, if c { 4 } else { 5 });
+            ok &= c;
+        }
+    }
+    sigaction(SIGCHLD, &old_chld, core::ptr::null_mut());
+    report(name, ok)
 }
