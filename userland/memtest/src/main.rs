@@ -24,7 +24,13 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if argc >= 2 {
         let a = *argv.add(1);
         if *a == b'h' && *a.add(1) == b'o' && *a.add(2) == b'g' && *a.add(3) == 0 {
-            memory_hog();
+            // `memtest hog [MiB/s]` (default 32).
+            let mut rate = 0usize;
+            if argc >= 3 {
+                let mut q = *argv.add(2);
+                while (*q).is_ascii_digit() { rate = rate * 10 + (*q - b'0') as usize; q = q.add(1); }
+            }
+            memory_hog(if rate == 0 { 32 } else { rate });
         }
     }
     let mut failures = 0;
@@ -44,6 +50,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_proc_rss_anon() { failures += 1; }
     if !test_proc_rss_fork_cow() { failures += 1; }
     if !test_proc_rss_file_lazy() { failures += 1; }
+    if !test_proc_rss_file_written() { failures += 1; }
     if !test_proc_pid_dir() { failures += 1; }
     if !test_slab_reclaims_empty_pages() { failures += 1; }
     if !test_stack_demand_paged() { failures += 1; }
@@ -819,6 +826,64 @@ unsafe fn test_proc_rss_file_lazy() -> bool {
         && f3 <= f0 + 64)
 }
 
+/// A written page of a MAP_PRIVATE file mapping is the process's own copy:
+/// it moves from RssFile to RssAnon (Linux's CoW'd private file page), both
+/// for a user store and for a kernel store (read(2) into the mapping). The
+/// file itself is untouched, the data written stays, and mprotect RO -> RW
+/// does not make clean pages silently writable-uncounted.
+unsafe fn test_proc_rss_file_written() -> bool {
+    let name = b"proc_rss_file_written\0";
+    const TOUCH: usize = 1 << 20;
+    const WRITE: usize = 256 << 10;
+    const KREAD: usize = 64 << 10;
+    let fd = open_big_file();
+    if fd < 0 { return report(name, false); }
+    let size = file_size(fd) & !(PAGE - 1);
+    if size < 2 * TOUCH { close(fd); return report(name, false); }
+    let p = mmap(core::ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if p as isize == -1 { close(fd); return report(name, false); }
+    let mut sum = 0u32;
+    let mut off = 0; while off < TOUCH { sum = sum.wrapping_add(*p.add(off) as u32); off += PAGE; }
+    let f1 = proc_kb(0, b"status", b"RssFile:").unwrap_or(0);
+    let a1 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+    // User stores into the first 256 KiB.
+    let mut off = 0; while off < WRITE { *p.add(off) = (*p.add(off)).wrapping_add(1); off += PAGE; }
+    let f2 = proc_kb(0, b"status", b"RssFile:").unwrap_or(0);
+    let a2 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+    // Kernel stores: read(2) the file's first 64 KiB into [512 KiB, 576 KiB).
+    let kdst = p.add(512 << 10);
+    let ok_read = pread_all(fd, 0, kdst, KREAD);
+    let f3 = proc_kb(0, b"status", b"RssFile:").unwrap_or(0);
+    let a3 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+    // mprotect RO then RW over a clean page, then write it: must not crash
+    // and must count.
+    let clean = p.add(768 << 10);
+    let ok_mp = mprotect_raw(clean, PAGE, PROT_READ) == 0
+        && mprotect_raw(clean, PAGE, PROT_READ | PROT_WRITE) == 0;
+    *clean = (*clean).wrapping_add(1);
+    let a4 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+    // The file still holds the original bytes; the mapping holds ours.
+    let mut orig = [0u8; 1];
+    let file_ok = pread_all(fd, 0, orig.as_mut_ptr(), 1) && *p == orig[0].wrapping_add(1);
+    let mut first = [0u8; 16];
+    let kread_ok = ok_read && pread_all(fd, 16, first.as_mut_ptr(), 16)
+        && core::slice::from_raw_parts(kdst.add(16), 16) == &first[..];
+    close(fd);
+    munmap(p, size);
+    say_kb(b"  file_kib touched=", f1); say_kb(b" anon_kib=", a1);
+    say_kb(b" | user_write file=", f2); say_kb(b" anon=", a2);
+    say_kb(b" | kernel_write file=", f3); say_kb(b" anon=", a3);
+    say_kb(b" | mprotect_write anon=", a4); say_kb(b" file_ok=", file_ok as usize);
+    say_kb(b" kread_ok=", kread_ok as usize); say_kb(b" sum=", sum as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    let w = WRITE >> 10; let k = KREAD >> 10;
+    report(name,
+        file_ok && kread_ok && ok_mp
+        && a2 >= a1 + w && a2 <= a1 + w + 64 && f1 >= f2 + w - 16 && f1 <= f2 + w + 64
+        && a3 >= a2 + k && a3 <= a2 + k + 64 && f2 >= f3 + k - 16
+        && a4 >= a3 + 4 && a4 <= a3 + 64)
+}
+
 /// `/proc` lists this process, `/proc/<pid>` opens as a directory listing
 /// its files, and `openat(dirfd, "statm")` works — what bottom/procps do.
 unsafe fn test_proc_pid_dir() -> bool {
@@ -931,23 +996,29 @@ unsafe fn test_slab_reclaims_empty_pages() -> bool {
 /// enough for a guard that samples every 2 s and wants two low samples),
 /// forever, printing its size; init's guard should SIGKILL exactly this
 /// process.
-unsafe fn memory_hog() -> ! {
+unsafe fn memory_hog(rate_mib_s: usize) -> ! {
     if fork() != 0 { exit(0); }
     setsid();
+    // 4 MiB steps, paced against the clock so the rate holds whatever the
+    // touch itself costs.
+    const STEP: usize = 4 << 20;
+    let t0 = now_ns();
     let mut mib = 0usize;
     loop {
-        let p = mmap(core::ptr::null_mut(), 16 << 20, PROT_READ | PROT_WRITE,
+        let p = mmap(core::ptr::null_mut(), STEP, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if p as isize != -1 {
-            let mut off = 0; while off < (16 << 20) { *p.add(off) = 1; off += PAGE; }
-            mib += 16;
+            let mut off = 0; while off < STEP { *p.add(off) = 1; off += PAGE; }
+            mib += STEP >> 20;
         }
         if mib % 128 == 0 {
             write(STDOUT_FILENO, b"hog: pid ".as_ptr(), 9); print_dec(getpid() as usize);
             write(STDOUT_FILENO, b" holds ".as_ptr(), 7); print_dec(mib);
             write(STDOUT_FILENO, b" MiB\n".as_ptr(), 5);
         }
-        usleep(500_000);
+        let due_ns = (mib as u64) * 1_000_000_000 / rate_mib_s as u64;
+        let el = now_ns().saturating_sub(t0);
+        if due_ns > el { usleep(((due_ns - el) / 1000) as u32); }
     }
 }
 

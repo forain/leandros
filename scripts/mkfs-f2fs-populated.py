@@ -1332,15 +1332,27 @@ def main():
     # same pinned checkout in the ../cosmic-epoch sibling.
     popl_bin = os.path.expanduser(
         f"~/code/leandros-artifacts/m6-session-bins/out/pop-launcher-{arch}")
-    popl_src = os.path.expanduser("~/code/cosmic-epoch/pop-launcher/plugins/src")
+    #
+    # The plugins are NOT optional. With none registered, the service answers
+    # a Search by querying nobody, so `finished()` never runs and no Update is
+    # ever sent (service/src/lib.rs search/finished); cosmic-launcher shows its
+    # window only on that first Update (app.rs, SurfaceState::WaitingToBeShown),
+    # so Super does nothing at all. That was every Linux-built image until
+    # 2026-09-27: popl_src was hardcoded to the Mac's ~/code/cosmic-epoch, the
+    # same trap sessmisc found for the Shortcuts defaults — so it resolves
+    # through _find_cosmic_epoch() now, and a missing plugin.ron stops the
+    # build instead of printing a warning nobody reads.
+    popl_src = os.path.join(_find_cosmic_epoch(), "pop-launcher", "plugins", "src")
     if os.path.exists(popl_bin):
         m4_share_dirs.add("/usr/bin")
         m5_exec_files.append(("/usr/bin", "pop-launcher", popl_bin))
         for _plugin in ("desktop_entries", "cosmic_toplevel"):
             _ron = f"{popl_src}/{_plugin}/plugin.ron"
             if not os.path.exists(_ron):
-                print(f"  WARNING: pop-launcher plugin {_plugin}: {_ron} absent, not staged")
-                continue
+                raise SystemExit(
+                    f"ERROR: pop-launcher plugin {_plugin}: {_ron} absent. Without "
+                    "plugins the launcher never opens. Point LEANDROS_COSMIC_EPOCH at a "
+                    "cosmic-epoch checkout with pop-launcher/plugins/src.")
             _pdir = f"/usr/lib/pop-launcher/plugins/{_plugin}"
             for _d in ("/usr/lib/pop-launcher", "/usr/lib/pop-launcher/plugins", _pdir):
                 m4_share_dirs.add(_d)

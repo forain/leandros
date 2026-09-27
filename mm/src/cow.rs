@@ -128,7 +128,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
                 flags: region.flags, lazy: false, lazy_pages: Vec::new(), lazy_count: 0,
                 prot: region.prot, map_flags: region.map_flags,
                 file_cap: region.file_cap, file_off: region.file_off,
-                file_len: region.file_len, cow: false,
+                file_len: region.file_len, cow: false, written: Vec::new(),
             });
             continue;
         }
@@ -232,6 +232,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
             file_off:   region.file_off,
             file_len:   region.file_len,
             cow:        !is_shared,
+            written:    region.written.clone(),
         });
     }
 
