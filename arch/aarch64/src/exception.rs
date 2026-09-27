@@ -201,8 +201,12 @@ fn el0_fault_signal(esr: u64, far: u64, elr: u64, sp: u64) -> (u32, i32, usize) 
     }
 }
 
+/// Index of the saved ELR_EL1 in the exception frame (`[sp, #256]`, see
+/// exception_asm.s).
+const ELR_SLOT: usize = 256 / 8;
+
 #[no_mangle]
-unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
+unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64, frame: *mut u64) {
     let far: u64;
     let tcr: u64;
     core::arch::asm!("mrs {}, far_el1", out(reg) far);
@@ -231,6 +235,13 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
             && sched::handle_page_fault(far as usize, is_write)
         {
             return; // fault serviced — resume the interrupted kernel code
+        }
+        // A bad user pointer met inside the fault-tolerant copy: resume at
+        // its landing pad (the frame's saved ELR, restored by ret_to_user),
+        // which returns the short count so the syscall answers EFAULT.
+        if let Some(landing) = sched::uaccess::fixup(elr as usize) {
+            *frame.add(ELR_SLOT) = landing as u64;
+            return;
         }
     }
 

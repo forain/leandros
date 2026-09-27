@@ -479,6 +479,26 @@ extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, e
         if (from_user || cr2 < USER_VA_LIMIT) && sched::handle_page_fault(cr2 as usize, is_write) {
             return; // fault handled — resume the interrupted instruction
         }
+        if !from_user && cr2 < USER_VA_LIMIT {
+            // A bad user pointer met inside the fault-tolerant copy: resume
+            // at its landing pad, which returns the short count (EFAULT).
+            if let Some(landing) = sched::uaccess::fixup(frame.rip as usize) {
+                frame.rip = landing as u64;
+                return;
+            }
+            // Any other kernel access to a bad user pointer is the task's
+            // bad pointer, not a kernel bug: kill the task (SIGSEGV), as
+            // aarch64 does, instead of halting this CPU. A halted CPU keeps
+            // every lock the faulting code held, and the rest of the
+            // machine spins on them (the laptop wgpu-session wedge: halted
+            // in UnixRing::write with UNIX_CONNS held, QEMU at 300 %).
+            serial_str(b"[EXC] kernel fault on user address CR2=0x"); serial_hex64(cr2);
+            serial_str(b" RIP=0x"); serial_hex64(frame.rip);
+            serial_str(b" err=0x"); serial_hex64(error_code);
+            serial_str(b": killing PID=0x"); serial_hex64(sched::current_pid() as u64);
+            serial_str(b" (unresolvable user-pointer fault in kernel)\r\n");
+            sched::exit_group_signal(SIGSEGV);
+        }
     }
 
     if !from_user {

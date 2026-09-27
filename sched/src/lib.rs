@@ -31,6 +31,7 @@ pub mod pcsample;
 pub mod runqueue;
 pub mod signal;
 pub mod task;
+pub mod uaccess;
 
 pub use clone::{fork_current, clone_thread};
 pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec, fault_signal};
