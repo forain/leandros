@@ -1568,7 +1568,8 @@ unsafe fn test_itimer_periodic_sigsuspend_never_early() -> bool {
 }
 
 /// A blocking pipe read interrupted by a timer signal: with SA_RESTART it is
-/// transparently restarted and returns the byte a child writes at ~150 ms;
+/// transparently restarted and returns the byte a child writes at ~150 ms
+/// (measured from before the fork);
 /// without it, it fails EINTR at the timer (~20 ms).
 unsafe fn test_blocked_read_sa_restart() -> bool {
     let name = b"blocked_read_sa_restart\0";
@@ -1580,6 +1581,11 @@ unsafe fn test_blocked_read_sa_restart() -> bool {
         }
         let mut fds = [0 as c_int; 2];
         if pipe(fds.as_mut_ptr()) != 0 { return report(name, false); }
+        // Start the clock before fork: the child's 150 ms sleep begins after
+        // this point, so a restarted read cannot legitimately return before
+        // el = 150 ms. Taking t0 after fork let the child's sleep start first
+        // and failed the bound by the fork-return latency (144 ms seen).
+        let t0 = now_ns();
         let child = fork();
         if child == 0 {
             close(fds[0]);
@@ -1592,7 +1598,6 @@ unsafe fn test_blocked_read_sa_restart() -> bool {
             it_interval: timeval { tv_sec: 0, tv_usec: 0 },
             it_value:    timeval { tv_sec: 0, tv_usec: 20_000 },
         };
-        let t0 = now_ns();
         setitimer(ITIMER_REAL, &v, core::ptr::null_mut());
         let mut b = 0u8;
         let r = read(fds[0], &mut b, 1);

@@ -143,6 +143,43 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
         echo "gpu-env: renderer=$LEANDROS_RENDERER_PATH GL_RENDERER='$LEANDROS_GL_RENDERER'" >&2
     fi
 
+    # -- client apps (libcosmic/iced): the same GPU, through wgpu -------------
+    # The COSMIC client binaries are built with libcosmic's `wgpu` feature
+    # (ports/cosmic-wgpu/build-wgpu-clients.sh), so iced's renderer is a
+    # fallback pair: wgpu first, tiny-skia (CPU) second. ICED_BACKEND=wgpu
+    # removes the CPU half: if wgpu cannot get the GPU the app fails to
+    # start, loudly, instead of silently rasterising on the CPU.
+    # WGPU_BACKEND pins the backend to the path verified above: Vulkan on
+    # Venus (the same device zink uses), GLES through EGL on virgl.
+    # LEANDROS_ICED_BACKEND overrides (e.g. "wgpu,tiny-skia" to allow the
+    # fallback while debugging a client), as does the first line of
+    # /etc/leandros/iced-backend. Only "tiny-skia" alone means CPU widgets.
+    unset WGPU_BACKEND || true
+    if [ -z "${LEANDROS_ICED_BACKEND:-}" ] && [ -r /etc/leandros/iced-backend ]; then
+        read -r LEANDROS_ICED_BACKEND < /etc/leandros/iced-backend || true
+    fi
+    case $LEANDROS_RENDERER_PATH in
+    zink)  ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu}; WGPU_BACKEND=vulkan ;;
+    # virgl keeps the CPU fallback behind wgpu for now: wgpu's GLES backend
+    # only gets a context from a Mesa carrying
+    # ports/mesa/patches/0001-egl-robust-access-unsupported-is-bad-attribute
+    # when the host GL lacks robust buffer access (ANGLE/Metal on the Mac);
+    # with an older ship-set every client would otherwise fail to start.
+    # The warning below fires. Do NOT ship the patched Mesa on aarch64 yet:
+    # there wgpu does get a context on ANGLE/Metal, but iced clients
+    # (greeter, launcher) then die intermittently with EBADF on their
+    # event loop (never seen with tiny-skia on the same ship-set, nor on
+    # x86_64 virgl).
+    virgl) ICED_BACKEND=${LEANDROS_ICED_BACKEND:-wgpu,tiny-skia}; WGPU_BACKEND=gl ;;
+    *)     ICED_BACKEND=${LEANDROS_ICED_BACKEND:-tiny-skia} ;;
+    esac
+    export ICED_BACKEND
+    if [ -n "${WGPU_BACKEND:-}" ]; then export WGPU_BACKEND; fi
+    case $ICED_BACKEND in *tiny-skia*|*tiny_skia*)
+        echo "gpu-env: WARNING client widgets may rasterise on the CPU (ICED_BACKEND=$ICED_BACKEND)" >&2 ;;
+    esac
+    echo "gpu-env: clients ICED_BACKEND=$ICED_BACKEND WGPU_BACKEND=${WGPU_BACKEND:-unset}" >&2
+
     LEANDROS_RENDERER_DECIDED=1
     export LEANDROS_RENDERER_PATH LEANDROS_GL_RENDERER LEANDROS_RENDERER_DECIDED
     unset _gpu_want _gpu_allow_sw _gpu_icd _gpu_rc _gpu_out GL_RENDERER

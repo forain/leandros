@@ -401,12 +401,16 @@ fn load_and_spawn_elf(elf_data: &[u8]) -> u32 {
     let stack_base = stack_top - stack_size;
     let user_sp = stack_top - 64; // Well within mapping and 16-byte aligned
     
-    let ok = as_.map(
+    // Demand-paged like an exec'd stack; only the top page is populated.
+    let ok = as_.map_lazy(
         stack_base,
         stack_size,
         PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE,
+        false,
     );
     if !ok { panic!("failed to map userspace stack"); }
+    as_.stack_top = stack_top;
+    as_.prefault_range(stack_top - 4096, 4096);
 
     // ── Initialize userspace stack with zeros ───────────────────────────────
     let zero = [0u8; 64];

@@ -88,6 +88,9 @@ fn check_links(node: usize, order: usize, next: usize, prev: usize) {
     if !link_ok(prev) { report_bad_link(node, order, b"prev", prev); }
 }
 
+/// One past the highest physical address the allocator manages.
+pub fn phys_end() -> usize { PHYS_END.load(Ordering::Relaxed) }
+
 /// Return total pages registered with the buddy allocator.
 pub fn total_pages() -> usize { TOTAL_PAGES.load(Ordering::Relaxed) }
 /// Return approximate number of free pages.

@@ -15,6 +15,10 @@
 //!     terminal has TOSTOP; without it the write goes through.
 //!  6. The orphaned-process-group rule: a stopped job whose last anchor
 //!     exits gets SIGHUP + SIGCONT.
+//!  7. The same rule for the exiting process's CHILD's group: a stopped child
+//!     in its own group, anchored only by its parent, gets SIGHUP + SIGCONT
+//!     when that parent exits (the half of the rule that runs after the
+//!     child has been reparented to init).
 //!
 //! The test process forks once; the child becomes a session leader with the
 //! slave as its controlling terminal and runs every case as that terminal's
@@ -220,6 +224,7 @@ unsafe fn session_main(master: c_int, slave: c_int) -> i32 {
     if !test_tcsetpgrp_from_background_sigttou(slave, me) { failures += 1; }
     if !test_background_write_tostop(slave, me) { failures += 1; }
     if !test_orphaned_pgrp_gets_sighup(slave, me) { failures += 1; }
+    if !test_orphaned_child_pgrp_gets_sighup() { failures += 1; }
 
     puts(b"--- jobtest done ---\0".as_ptr());
     if failures == 0 {
@@ -649,5 +654,68 @@ unsafe fn test_orphaned_pgrp_gets_sighup(_slave: c_int, _me: pid_t) -> bool {
     let got = read_byte_timeout(rfd);
     close(rfd);
     if got != Some(b'H') { return fail_at(name, 6); }
+    report(name, true)
+}
+
+// ── 7. a stopped child in its own group is orphaned by its parent's exit ───
+
+unsafe fn test_orphaned_child_pgrp_gets_sighup() -> bool {
+    let name = b"orphaned_child_pgrp_sighup\0";
+    let mut fds: [c_int; 2] = [0; 2];
+    if pipe(fds.as_mut_ptr()) != 0 { return fail_at(name, 1); }
+    let (rfd, wfd) = (fds[0], fds[1]);
+    if !set_nonblock(rfd) { return fail_at(name, 2); }
+    // P tells the test C's pid, so a failure can still clean C up.
+    let mut pfds: [c_int; 2] = [0; 2];
+    if pipe(pfds.as_mut_ptr()) != 0 { return fail_at(name, 2); }
+
+    // P: its own group, in this session. C: P's child in ANOTHER group of the
+    // same session, stopped. P is C's group's only anchor; when P exits, C's
+    // group is orphaned with a stopped member, so C must get SIGHUP + SIGCONT.
+    // Unlike case 6 the orphaned group is not the exiting process's own.
+    let p = fork();
+    if p < 0 { return fail_at(name, 3); }
+    if p == 0 {
+        close(rfd);
+        close(pfds[0]);
+        if !own_pgrp() { _exit(90); }
+        let mut gfds: [c_int; 2] = [0; 2];
+        if pipe(gfds.as_mut_ptr()) != 0 { _exit(94); }
+        let c = fork();
+        if c < 0 { _exit(94); }
+        if c == 0 {
+            close(gfds[0]);
+            if !own_pgrp() { _exit(90); }
+            HUP_PIPE.store(wfd, Ordering::SeqCst);
+            let act = sigaction { sa_handler: Some(on_hup), sa_flags: 0, sa_restorer: None, sa_mask: 0 };
+            sigaction(SIGHUP, &act, core::ptr::null_mut());
+            write(gfds[1], b"c".as_ptr(), 1);
+            loop { nap(); }
+        }
+        close(gfds[1]);
+        close(wfd);
+        let cb = (c as u32).to_le_bytes();
+        write(pfds[1], cb.as_ptr(), 4);
+        let mut b = 0u8;
+        if read(gfds[0], &mut b, 1) != 1 || b != b'c' { kill(c, SIGKILL); _exit(95); }
+        kill(c, SIGSTOP);
+        let mut st: c_int = 0;
+        if waitpid(c, &mut st, WUNTRACED) != c || !wifstopped(st) { kill(c, SIGKILL); _exit(96); }
+        _exit(0);
+    }
+    close(wfd);
+    close(pfds[1]);
+    let mut cb = [0u8; 4];
+    let c = if read(pfds[0], cb.as_mut_ptr(), 4) == 4 { i32::from_le_bytes(cb) } else { -1 };
+    close(pfds[0]);
+    let st = match reap(p) { Some(s) => s, None => { kill_reap(p); close(rfd); if c > 0 { kill(c, SIGKILL); } return fail_at(name, 4); } };
+    if !wifexited(st) || wexitstatus(st) != 0 { close(rfd); if c > 0 { kill(c, SIGKILL); } return fail_at(name, 5); }
+    let got = read_byte_timeout(rfd);
+    close(rfd);
+    if got != Some(b'H') {
+        // Not HUP'd: it would stay stopped under init for ever. Clean up.
+        if c > 0 { kill(c, SIGKILL); }
+        return fail_at(name, 6);
+    }
     report(name, true)
 }

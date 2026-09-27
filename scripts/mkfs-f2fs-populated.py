@@ -591,6 +591,11 @@ def main():
     # has no GPU renderer and /bin/gpu-env refuses to start COSMIC — say so
     # here, at build time, rather than on a black screen.
     gpu_stage = f"{gl_root}/gpu-stage-{arch}"
+    # LEANDROS_GPU_STAGE=<dir> (containing gpu-stage-<arch>/) tests a rebuilt
+    # ship-set without replacing the shared one.
+    if os.environ.get("LEANDROS_GPU_STAGE"):
+        gpu_stage = os.path.join(os.path.expanduser(os.environ["LEANDROS_GPU_STAGE"]), f"gpu-stage-{arch}")
+        print(f"  GPU ship-set override: {gpu_stage}")
     gpu_lib_dir = f"{gpu_stage}/usr/lib"
     if not os.path.exists(f"{gpu_lib_dir}/libgallium-25.3.6.so"):
         print(f"⚠️  no GPU Mesa ship-set at {gpu_stage} — COSMIC will have NO GPU "
@@ -963,6 +968,19 @@ def main():
     # DT_NEEDED); only libudev (cosmic-settings) and the pipewire stub are new,
     # both already present. No source patches — feature flags only (see manifest).
     m6_out = os.path.expanduser("~/code/leandros-artifacts/m6-session-bins/out")
+    # LEANDROS_COSMIC_BINS_OVERLAY=<dir>: a file there named like one in
+    # m6_out (e.g. m6-session-bins/out-wgpu/cosmic-greeter-x86_64, the wgpu
+    # renderer builds from ports/cosmic-wgpu) is staged instead of it. Lets a
+    # lane test rebuilt clients without touching the shared out/ directory.
+    m6_overlay = os.environ.get("LEANDROS_COSMIC_BINS_OVERLAY", "")
+
+    def m6_pick(src):
+        if m6_overlay:
+            cand = os.path.join(os.path.expanduser(m6_overlay), os.path.basename(src))
+            if os.path.exists(cand):
+                print(f"  overlay: {os.path.basename(src)} <- {cand}")
+                return cand
+        return src
     pw_out = os.path.expanduser("~/code/leandros-artifacts/pipewire-gap/out")
     m6_session_bins = [
         ("cosmic-session",         f"{m6_out}/cosmic-session-{arch}"),
@@ -1021,6 +1039,7 @@ def main():
         ("cosmic-greeter-login",   f"{m6_out}/cosmic-greeter-{arch}"),
     ]
     for name, src in m6_session_bins:
+        src = m6_pick(src)
         if os.path.exists(src):
             bin_files.append((name, src, 0o100755))
 
@@ -1126,6 +1145,7 @@ def main():
         ("cosmic-applet-tiling",    f"{m6_out}/cosmic-applet-tiling-{arch}"),
     ]
     for name, src in m6_applets:
+        src = m6_pick(src)
         if os.path.exists(src):
             bin_files.append((name, src, 0o100755))
         else:

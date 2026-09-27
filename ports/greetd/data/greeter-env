@@ -93,8 +93,9 @@ export COSMIC_BACKEND COSMIC_RENDER_DEVICE
 # Callers check LEANDROS_RENDERER_PATH and refuse to start on "refused".
 . /bin/gpu-env
 COSMIC_DISABLE_SYNCOBJ=1
-ICED_BACKEND=tiny-skia
-export COSMIC_DISABLE_SYNCOBJ ICED_BACKEND
+# ICED_BACKEND / WGPU_BACKEND (the greeter's own widget renderer) come from
+# gpu-env: wgpu on the verified GPU path, never a silent tiny-skia fallback.
+export COSMIC_DISABLE_SYNCOBJ
 
 # NOT COSMIC_DISABLE_DIRECT_SCANOUT: in smithay that clears FrameFlags::
 # ALLOW_SCANOUT, a union that INCLUDES ALLOW_CURSOR_PLANE_SCANOUT, so it

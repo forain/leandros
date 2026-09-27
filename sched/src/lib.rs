@@ -26,6 +26,7 @@ pub mod clone;
 pub mod context;
 pub mod futex;
 pub mod lockwatch;
+pub mod idlestat;
 pub mod pcsample;
 pub mod runqueue;
 pub mod signal;
@@ -207,6 +208,11 @@ fn log_exit(pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid, is_proces
     let mut idx = EXIT_LOG_IDX.lock();
     log[*idx] = Some(ExitRecord { pid, status, parent_tgid, pgid, is_process, consumed });
     *idx = (*idx + 1) % EXIT_LOG_LEN;
+    // A parent parked in wait4 on this child: every exit passes through here
+    // on its way out of the run queue, so this is the one edge its park can
+    // rely on (lock-free; the next tick pays it). The child's SIGCHLD wakes it
+    // too, but only when one is sent.
+    request_poll_wake_tagged(poll_tag(poll_class::WAIT, parent_tgid));
 }
 
 pub fn get_exit_code(pid: Pid) -> Option<i32> {
@@ -564,21 +570,48 @@ pub fn init_pid() -> Pid { INIT_PID.load(Ordering::Acquire) }
 /// while the dying group's threads are still on the run queue (before the
 /// group kill reaps them), or a child forked by a non-leader thread cannot be
 /// resolved to the group any more.
+///
+/// The move also decides the orphaned-process-group rule for the children's
+/// groups (see `signal::kill_orphaned_pgrps`): once a child's `ppid` names
+/// init, nothing can tell any more that the dying process was what anchored
+/// that child's group, so the child half of the rule is evaluated here, from
+/// the moved set, and the dying process's own group is left to `exit`. Before
+/// 2026-09-26 the whole rule ran after this move and its child scan matched
+/// `ppid == exiting` — which by then was never true — so a stopped job whose
+/// shell died (jobtest's TOSTOP writer, left behind on both arches) stayed
+/// stopped for ever instead of getting SIGHUP + SIGCONT.
 fn reparent_children(dead_tgid: Pid) {
     let init = init_pid();
     if init == 0 || init == dead_tgid { return; }
-    let mut rq = RUN_QUEUE.lock();
-    let mut moved: [Pid; runqueue::MAX_TASKS] = [0; runqueue::MAX_TASKS];
-    let mut n = 0usize;
-    for i in 0..runqueue::MAX_TASKS {
-        let (pid, tgid, ppid) = match rq.get(i) { Some(t) => (t.pid, t.tgid, t.ppid), None => continue };
-        if pid != tgid || pid == dead_tgid { continue; }
-        let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
-        if parent_tgid == dead_tgid { moved[n] = pid; n += 1; }
+    let mut cands = [0 as Pid; signal::ORPHAN_MAX_GROUPS];
+    let mut nc = 0usize;
+    {
+        let mut rq = RUN_QUEUE.lock();
+        let (my_pgid, my_sid) = rq.find_pid(dead_tgid).map(|t| (t.pgid, t.sid)).unwrap_or((0, 0));
+        let mut moved: [Pid; runqueue::MAX_TASKS] = [0; runqueue::MAX_TASKS];
+        let mut n = 0usize;
+        for i in 0..runqueue::MAX_TASKS {
+            let (pid, tgid, ppid) = match rq.get(i) { Some(t) => (t.pid, t.tgid, t.ppid), None => continue };
+            if pid != tgid || pid == dead_tgid { continue; }
+            let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
+            if parent_tgid == dead_tgid { moved[n] = pid; n += 1; }
+        }
+        for &pid in &moved[..n] {
+            if let Some(t) = rq.find_pid_mut(pid) {
+                t.ppid = init;
+                // A child in the dying process's session but another group:
+                // that group may just have lost its last outside anchor.
+                if my_sid != 0 && t.sid == my_sid && t.pgid != 0 && t.pgid != my_pgid
+                    && t.state != TaskState::Zombie
+                    && !cands[..nc].contains(&t.pgid) && nc < cands.len()
+                {
+                    cands[nc] = t.pgid;
+                    nc += 1;
+                }
+            }
+        }
     }
-    for &pid in &moved[..n] {
-        if let Some(t) = rq.find_pid_mut(pid) { t.ppid = init; }
-    }
+    if nc != 0 { signal::hup_orphaned_stopped_pgrps(&cands[..nc]); }
 }
 
 pub fn current_pid() -> Pid {
@@ -661,6 +694,77 @@ pub fn proc_stat_of(pid: Pid) -> Option<(Pid, Pid, Pid, u8)> {
         TaskState::Ready | TaskState::Running => b'R',
     };
     Some((t.ppid, t.pgid, t.sid, letter))
+}
+
+// ── Per-process memory figures (/proc/<pid>/status, statm, smaps) ──────────
+
+/// Run `f` on `pid`'s address space with its `busy` flag held, and return
+/// its result plus the number of live threads in the group.
+///
+/// Unlike `with_address_space`, this is for looking at ANOTHER process,
+/// which may exit and be reaped meanwhile: the `Arc` is cloned under the
+/// run-queue lock, so the address space outlives the read whatever its
+/// owner does; `busy` then orders the read against that owner's faults and
+/// mm syscalls. `f` must not block (the usual `busy` rule).
+fn with_process_as<R>(pid: Pid, f: impl FnOnce(&mm::vmm::AddressSpace) -> R) -> Option<(R, u32)> {
+    let (as_arc, threads) = {
+        let rq = RUN_QUEUE.lock();
+        let t = rq.find_pid(pid)?;
+        let tgid = t.tgid;
+        let a = match t.address_space.as_ref() {
+            Some(a) => a.clone(),
+            None => rq.find_pid(tgid)?.address_space.as_ref()?.clone(),
+        };
+        let mut n = 0u32;
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(x) = rq.get(i) {
+                if x.tgid == tgid && x.state != TaskState::Zombie { n += 1; }
+            }
+        }
+        (a, n)
+    };
+    while as_arc.busy
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        // The holder may be waiting for this CPU's TLB flush acknowledgement.
+        mm::paging::tlb_service_pending();
+        core::hint::spin_loop();
+    }
+    let r = f(&as_arc);
+    as_arc.busy.store(false, Ordering::Release);
+    drop(as_arc);
+    Some((r, threads))
+}
+
+/// Memory totals and live thread count of process `pid` (`None`: no such
+/// task, or it has no address space — a kernel task or a reaped zombie).
+pub fn proc_mem_of(pid: Pid) -> Option<(mm::vmm::MemCounters, u32)> {
+    with_process_as(pid, |a| a.mem_counters())
+}
+
+/// `/proc/<pid>/smaps`: one `emit` per VMA, in address order.
+pub fn proc_vma_census(pid: Pid, emit: &mut dyn FnMut(&mm::vmm::VmaStat)) -> bool {
+    with_process_as(pid, |a| a.vma_census(emit)).is_some()
+}
+
+/// Pids of every process (thread-group leader, zombies included) that is
+/// `>= from`, ascending, into `out`; returns how many were written. The
+/// `/proc` directory listing.
+pub fn process_pids_from(from: Pid, out: &mut [Pid]) -> usize {
+    let mut n = 0usize;
+    {
+        let rq = RUN_QUEUE.lock();
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(t) = rq.get(i) {
+                if t.pid == t.tgid && t.pid >= from && t.pid != 0 {
+                    if n < out.len() { out[n] = t.pid; n += 1; }
+                }
+            }
+        }
+    }
+    out[..n].sort_unstable();
+    n
 }
 
 /// The thread-group id of `pid`, or `pid` itself if it's not a live task
@@ -1681,6 +1785,12 @@ pub mod poll_class {
     pub const DEVVT:   u32 = 8;
     pub const DRM:     u32 = 9;
     pub const EVDEV:   u32 = 10;
+    /// A parent parked in wait4/waitid, indexed by its tgid.
+    pub const WAIT:    u32 = 11;
+    /// inotify fds: nothing produces their events, so nothing wakes this tag.
+    pub const INOTIFY: u32 = 12;
+    /// An epoll instance itself, indexed by its slot: what `epoll_ctl` wakes.
+    pub const EPOLL:   u32 = 13;
 }
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision
@@ -1742,14 +1852,19 @@ pub fn block_on_poll_commit()  { block_on_port_commit() }
 /// in net/vfs, the deadline tick, signal delivery) MUST hold no server lock —
 /// this takes RUN_QUEUE. Task context only (blocking lock); IRQ context uses
 /// `try_wake_poll`.
+#[track_caller]
 pub fn wake_poll() { wake_poll_tagged(POLL_TAG_ALL); }
 
 /// Wake every poll-channel waiter whose `poll_mask` intersects `tag`. A
 /// producer passes the `poll_tag(class, index)` of the object it changed; an
 /// unconvertible producer passes `POLL_TAG_ALL` (== `wake_poll`). Same lock /
 /// context contract as `wake_poll`.
+#[track_caller]
 pub fn wake_poll_tagged(tag: u64) {
     let woken = RUN_QUEUE.lock().unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
+    if idlestat::ENABLED {
+        idlestat::note_wake(core::panic::Location::caller(), tag == POLL_TAG_ALL, woken);
+    }
     if woken > 0 { wake_up_an_idle_cpu(); }
 }
 
@@ -1814,6 +1929,7 @@ pub fn service_deferred_poll_wake() {
 /// no-indefinite-wait contract (bounded `try_lock_spin`). Returns false (wake
 /// deferred) if RUN_QUEUE stays held on another CPU past the bound; the next
 /// tick retries.
+#[track_caller]
 pub fn try_wake_poll() -> bool { try_wake_poll_tagged(POLL_TAG_ALL) }
 
 /// How long an IRQ-context poll wake may wait for `RUN_QUEUE` before deferring
@@ -1823,12 +1939,16 @@ pub fn try_wake_poll() -> bool { try_wake_poll_tagged(POLL_TAG_ALL) }
 const TICK_LOCK_WAIT_NS: u64 = 50_000;
 
 /// Non-blocking `wake_poll_tagged` for IRQ / tick context.
+#[track_caller]
 pub fn try_wake_poll_tagged(tag: u64) -> bool {
     match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
             lockwatch::note_wake_try(true);
             let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
             drop(rq);
+            if idlestat::ENABLED {
+                idlestat::note_wake(core::panic::Location::caller(), tag == POLL_TAG_ALL, woken);
+            }
             if woken > 0 { wake_up_an_idle_cpu(); }
             true
         }
@@ -1837,7 +1957,8 @@ pub fn try_wake_poll_tagged(tag: u64) -> bool {
 }
 
 /// Poll-deadline tick service (IRQ/tick context): wake every poll-channel
-/// waiter whose per-task deadline is due (or all, when a timerfd has expired),
+/// waiter whose per-task deadline is due, or whose interest mask names a
+/// timerfd that expired on this pass (`timerfd_tags`),
 /// then republish `NEXT_POLL_DEADLINE` to the EXACT earliest remaining deadline.
 ///
 /// This replaces the old wake-then-`store(u64::MAX)` reset. That reset raced
@@ -1855,14 +1976,17 @@ pub fn try_wake_poll_tagged(tag: u64) -> bool {
 /// Bounded wait (`try_lock_spin`, ≤ `TICK_LOCK_WAIT_NS`) for the tick's
 /// contract; a tick that still finds the lock held leaves the hint and retries
 /// next tick (≤10 ms defer, within the timeout granularity).
-pub fn service_poll_deadlines(now: u64, timerfd_due: bool) -> bool {
+pub fn service_poll_deadlines(now: u64, timerfd_tags: u64) -> bool {
     match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
             lockwatch::note_tick_try(lockwatch::L_RUN_QUEUE, true);
             let (new_min, woken) =
-                rq.wake_due_poll_deadlines(POLL_WAIT_CHANNEL, now, timerfd_due);
+                rq.wake_due_poll_deadlines(POLL_WAIT_CHANNEL, now, timerfd_tags);
             NEXT_POLL_DEADLINE.store(new_min, Ordering::Relaxed); // exact, under the lock
             drop(rq);
+            if idlestat::ENABLED && woken > 0 {
+                idlestat::note_wake(core::panic::Location::caller(), timerfd_tags == POLL_TAG_ALL, woken);
+            }
             if woken > 0 { wake_up_an_idle_cpu(); }
             true
         }
@@ -2047,7 +2171,7 @@ pub static SC_FOCUS2_TGID: AtomicU32 = AtomicU32::new(0);
 // task layout is untouched. `sys_execve` sets it on success; a process leader's
 // exit clears it; fork inherits the parent's until the child execs; unset falls
 // back to "/bin/init" (correct for the boot-loaded PID1, which never execs).
-const MAX_EXE_PATHS: usize = 64;
+const MAX_EXE_PATHS: usize = runqueue::MAX_TASKS;
 const EXE_PATH_MAX: usize = 256;
 struct ExePathEntry { tgid: Pid, len: u16, path: [u8; EXE_PATH_MAX] }
 impl ExePathEntry {
@@ -2820,6 +2944,34 @@ pub fn prefault_user_page(addr: usize) -> bool {
     page_fault(addr, false, true)
 }
 
+/// Make `[ptr, ptr+len)` of the current process safe for a kernel access:
+/// every page present, and (unless `read_only`) no page still shared
+/// copy-on-write. File-backed pages are read with the address space
+/// UNLOCKED, through the real fault path: `prefault_range` stops at each
+/// absent file page, the lock is dropped, the page is faulted in, and the
+/// walk resumes after it. So no prefault ever holds `busy` across file I/O.
+/// A page that cannot be populated (past EOF, bad address) is skipped and
+/// left to the caller's own access to report.
+pub fn prefault_current_range(ptr: usize, len: usize, read_only: bool) {
+    if ptr == 0 || len == 0 { return; }
+    let end = match ptr.checked_add(len) { Some(e) => e, None => return };
+    let mut from = ptr;
+    while from < end {
+        let pid = current_pid();
+        let next = with_address_space_mut(pid, |as_| {
+            if read_only { as_.prefault_range_ro(from, end - from) }
+            else { as_.prefault_range(from, end - from) }
+        }).flatten();
+        match next {
+            None => return,
+            Some(va) => {
+                let _ = prefault_user_page(va);
+                from = va + mm::buddy::PAGE_SIZE;
+            }
+        }
+    }
+}
+
 fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
     fn print_str(s: &str) {
         extern "C" { fn arch_serial_putc(c: u8); }
@@ -3346,6 +3498,13 @@ fn scheduler_run_loop() -> ! {
         if let Some((idx, ctx_ptr, dispatched_pid, kernel_stack_top_virt, page_table, tgid, reply_port, as_ptr)) = picked {
             let dispatched_at = ticks();
             let dispatched_ns = unsafe { arch_monotonic_ns() };
+            if idlestat::ENABLED {
+                let l = LAST_SYSCALL[(dispatched_pid as usize) & 1023].load(Ordering::Relaxed);
+                let sc = if (l >> 32) as u32 == dispatched_pid && l & 1 != 0 {
+                    ((l >> 1) & 0x7FFF_FFFF) as u32
+                } else { u32::MAX };
+                idlestat::on_dispatch(dispatched_pid, tgid, sc);
+            }
             let pid;
 
             unsafe {
@@ -3454,11 +3613,15 @@ fn scheduler_run_loop() -> ! {
                 mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
             }
         } else {
+            let t_idle = if idlestat::ENABLED { unsafe { arch_monotonic_ns() } } else { 0 };
             unsafe {
                 #[cfg(target_arch = "x86_64")]
                 core::arch::asm!("sti; hlt; cli");
                 #[cfg(target_arch = "aarch64")]
                 core::arch::asm!("msr daifclr, #2; wfi; msr daifset, #2");
+            }
+            if idlestat::ENABLED {
+                idlestat::on_idle(id, unsafe { arch_monotonic_ns() }.saturating_sub(t_idle));
             }
         }
     }

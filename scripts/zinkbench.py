@@ -215,6 +215,64 @@ def input_loop(dur):
     finally:
         ses.close()
 
+# ---------------------------------------------------------------- greeter
+# The default boot is a graphical login (greetd -> cosmic-comp), which owns the
+# display; the census needs the bare text login so the session it launches is
+# the only compositor. This used to write /etc/leandros/text-login and reboot —
+# and the marker lives on the persistent root image, so every later boot of
+# that image (anyone's, not just the bench's) came up with no greeter.
+#
+# Now the greeter is stopped for THIS boot only and the image is left as found:
+# init re-reads the marker exactly once after greetd exits (after
+# DM_RESPAWN_DELAY_US = 3 s), so the marker only has to exist across that one
+# decision. The steps below create it, stop greetd, wait for it to be gone
+# plus the respawn delay, and remove it again; `restore_marker()` is the
+# host-side backstop if that command never got to its `rm`. A marker that was
+# already there (set by hand, or left by an older zinkbench) is not touched.
+MARKER = "/etc/leandros/text-login"
+_marker_is_ours = False
+
+def stop_greeter_for_this_boot():
+    # Short commands, one step each: driver._serial_send arms its end-of-output
+    # check on seeing the command echoed, and a line long enough to wrap in
+    # the guest's line editor is not echoed verbatim.
+    global _marker_is_ours
+    sh = driver._serial_send
+    if "HAD_MARKER" in sh(f"test -e {MARKER} && echo HAD_MARKER || echo NO_MARKER"):
+        log(f"{MARKER} already present on the image (left as found): text login, no greeter")
+        return
+    if "HAVE_PID" not in sh("test -e /run/greetd-init.pid && echo HAVE_PID || echo NO_PID"):
+        log("no greetd pid file: nothing owns the display")
+        return
+    sh("mkdir -p /etc/leandros")
+    _marker_is_ours = "MARKER_SET" in sh(f"echo 1 > {MARKER} && echo MARKER_SET")
+    sh("kill $(cat /run/greetd-init.pid) && echo KILLED")
+    for _ in range(30):
+        if "GONE" in sh("test -e /proc/$(cat /run/greetd-init.pid) && echo ALIVE || echo GONE"):
+            break
+        time.sleep(1)
+    # init notices within 250 ms, sweeps the strays, waits DM_RESPAWN_DELAY_US
+    # (3 s) and only then reads the marker.
+    time.sleep(6)
+    if "MARKER_CLEARED" in sh(f"rm -f {MARKER}; sync; echo MARKER_CLEARED"):
+        _marker_is_ours = False
+        log("greeter stopped for this boot; image unchanged")
+    else:
+        log("WARNING: could not confirm the marker was removed; retrying at exit")
+
+def restore_marker():
+    """Backstop: remove a marker this run created if the guest command did not."""
+    global _marker_is_ours
+    if not _marker_is_ours or not driver._qemu_pid():
+        return
+    try:
+        out = driver._serial_send(f"rm -f {MARKER}; sync; echo MARKER_CLEARED", timeout=10)
+        if "MARKER_CLEARED" in out:
+            _marker_is_ours = False
+            log(f"removed {MARKER} left by this run")
+    except Exception as e:  # best effort: say so rather than hide it
+        log(f"WARNING: could not remove {MARKER} ({e}); the image now boots to text login")
+
 # ---------------------------------------------------------------- main
 def main():
     log(f"=== zinkbench {TAG} zink={ZINK} dur={DUR} settle={SETTLE} ===")
@@ -223,18 +281,7 @@ def main():
     time.sleep(1)
     driver.cmd_start("x86_64", "uefi", venus=True)
     driver.cmd_login("root", "root")
-    # The default boot is a graphical login (greetd -> cosmic-comp, softpipe),
-    # which owns the display; the census needs the bare text login so the
-    # session it launches is the only compositor. The marker is persistent on
-    # the root image, so it costs one reboot per freshly built image.
-    probe = driver._serial_send(
-        "test -e /etc/leandros/text-login && echo HAVE_MARKER || "
-        "(mkdir -p /etc/leandros; echo 1 > /etc/leandros/text-login; echo SET_MARKER)", timeout=6)
-    if "SET_MARKER" in probe or "HAVE_MARKER" not in probe:
-        log("text-login marker set; rebooting so no greeter owns the display")
-        driver.cmd_stop(); time.sleep(2)
-        driver.cmd_start("x86_64", "uefi", venus=True)
-        driver.cmd_login("root", "root")
+    stop_greeter_for_this_boot()
     s = driver._connect_with_retry(driver.SERIAL_SOCK)
     s.setblocking(False)
     th = threading.Thread(target=serial_reader, args=(s,), daemon=True); th.start()
@@ -298,4 +345,10 @@ def main():
     log("done")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        stop.set()
+        restore_marker()
+        if _marker_is_ours:
+            log(f"WARNING: {MARKER} may remain on the image; remove it from a root shell")

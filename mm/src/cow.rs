@@ -62,6 +62,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
     let mut dst = AddressSpace::new(new_page_table_root);
     dst.heap_start = src.heap_start;
     dst.heap_end   = src.heap_end;
+    dst.stack_top  = src.stack_top;
 
     dst.regions.resize(src.regions.len(), None);
 
@@ -133,6 +134,9 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
         }
 
         let downgraded = region.flags & !PageFlags::WRITABLE;
+        // PROT_NONE regions keep their frames but never have PTEs (see
+        // `AddressSpace::mprotect`); the frames are still shared CoW.
+        let no_access = region.prot & crate::vmm::PROT_ACCESS == 0;
         let private_rw = !is_shared && region.flags.contains(PageFlags::WRITABLE);
         let shared_before = shared_pages;
         let mut dst_lazy_pages = Vec::new();
@@ -173,10 +177,10 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
                 dst_lazy_pages[i] = phys;
                 dst_lazy_count += 1;
                 let install_flags = if is_shared { region.flags } else { downgraded };
-                unsafe {
+                if !no_access { unsafe {
                     map_page(new_page_table_root, region.start + i * PAGE_SIZE, phys, install_flags);
                     map_page(src_root, region.start + i * PAGE_SIZE, phys, install_flags);
-                }
+                } }
             }
             crate::vmm::free_eager_tail(region.phys, n_pages);
             region.lazy = true;
@@ -195,12 +199,12 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
                 dst_lazy_pages[i] = phys;
                 dst_lazy_count += 1;
                 let install_flags = if is_shared { region.flags } else { downgraded };
-                unsafe {
+                if !no_access { unsafe {
                     map_page(new_page_table_root, region.start + i * PAGE_SIZE, phys, install_flags);
                     if !is_shared {
                         map_page(src_root, region.start + i * PAGE_SIZE, phys, install_flags);
                     }
-                }
+                } }
             }
             if !is_shared { region.cow = true; }
         }

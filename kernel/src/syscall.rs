@@ -241,22 +241,10 @@ pub fn init_exec_file_backing() {
 /// F2FS_MOUNTS.  Every user pointer that flows into vfs::handle must
 /// therefore be faulted in first, while no filesystem lock is held.
 fn prefault_user(ptr: usize, len: usize) {
-    if ptr == 0 || len == 0 { return; }
-    // Absent pages first, one real fault each: a page of a demand-paged file
-    // mapping (exec image, private mmap) is then read with the address space
-    // unlocked instead of inside `prefault_range`'s locked walk. The walk
-    // below still does what is left: CoW unsharing of present pages.
-    let end = match ptr.checked_add(len) { Some(e) => e, None => return };
-    let mut from = ptr;
-    while let Some(Some(va)) = with_current_address_space_mut(|as_| {
-        as_.first_absent_file_page(from, end)
-    }) {
-        // Each fault reads a fault-around window; a page it cannot populate
-        // (past EOF) is skipped and left to the caller's own access.
-        let _ = sched::prefault_user_page(va);
-        from = va + mm::buddy::PAGE_SIZE;
-    }
-    let _ = with_current_address_space_mut(|as_| as_.prefault_range(ptr, len));
+    // Absent file-backed pages (exec image, private mmap) are read with the
+    // address space unlocked; the locked walk does the rest (anonymous
+    // pages, CoW unsharing of present pages). See sched::prefault_current_range.
+    sched::prefault_current_range(ptr, len, false);
 }
 
 /// [`prefault_user`] for a buffer the kernel only reads (paths, execve's
@@ -264,16 +252,7 @@ fn prefault_user(ptr: usize, len: usize) {
 /// pages — reading one never faults, so the private copy (and its TLB flush)
 /// would be wasted.
 fn prefault_user_ro(ptr: usize, len: usize) {
-    if ptr == 0 || len == 0 { return; }
-    let end = match ptr.checked_add(len) { Some(e) => e, None => return };
-    let mut from = ptr;
-    while let Some(Some(va)) = with_current_address_space_mut(|as_| {
-        as_.first_absent_file_page(from, end)
-    }) {
-        let _ = sched::prefault_user_page(va);
-        from = va + mm::buddy::PAGE_SIZE;
-    }
-    let _ = with_current_address_space_mut(|as_| as_.prefault_range_ro(ptr, len));
+    sched::prefault_current_range(ptr, len, true);
 }
 
 // ── VFS call helper ───────────────────────────────────────────────────────────
@@ -311,11 +290,13 @@ const USER_STACK_TOP: usize = 0x0000_7fff_ffff_f000;
 /// main-thread stack `ulimit -s`). The prior 256 KiB was far too small for real
 /// Rust async runtimes (tokio + zbus): legitimate deep async call chains can
 /// exceed it, faulting exactly one frame below the stack base. The stack is
-/// mapped eagerly; 8 MiB × the handful of concurrent desktop processes is well
-/// within the 2 GiB guest. (Note: a truly *unbounded*-recursion bug still
-/// overflows any finite stack — see the cosmic-comp COSMIC_SESSION_SOCK issue —
-/// so this is a correctness/robustness raise, not a fix for that.)
+/// demand-paged (see execve), so only the touched part is resident. (Note: a
+/// truly *unbounded*-recursion bug still overflows any finite stack — see the
+/// cosmic-comp COSMIC_SESSION_SOCK issue — so this is a correctness/robustness
+/// raise, not a fix for that.)
 const USER_STACK_SIZE: usize = 2048 * mm::buddy::PAGE_SIZE;
+/// Stack populated below the initial SP at exec (demand-paged beyond that).
+const STACK_PREFAULT: usize = 4 * mm::buddy::PAGE_SIZE;
 
 /// ELF `e_type` for a position-independent (dynamic/PIE) object.
 const ET_DYN: u16 = 3;
@@ -878,6 +859,92 @@ static SC_MAX: [[AtomicU64; SC_SLOTS]; 2] = [const { [const { AtomicU64::new(0) 
 static LAST_SC: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
 /// 0 = not requested, 1 = dump the focus process's VMAs on its next syscall, 2 = done.
 static SC_VMA_DUMP: AtomicU32 = AtomicU32::new(0);
+
+/// compchurn instrumentation: mmap/munmap census keyed by (tgid, pid, op,
+/// kind, len, flags), printed every 10 s as `[CHURN]` lines (top rows by
+/// count, then reset). `op` 0 = mmap, 1 = munmap. mmap `kind` is
+/// `MmapTrace::kind`; munmap `kind` names the VMA at `addr` (1 anon, 2 device,
+/// 3 shared frames, 5 file, 0 none) and `pres` its present pages. `ns` is the
+/// syscall's own time. Compile-time gated like `SC_STATS`.
+pub const CHURN_STATS: bool = false;
+#[derive(Clone, Copy)]
+struct ChurnRow { tgid: u32, pid: u32, op: u8, kind: u8, len: usize, flags: u32, n: u32, ns: u64, max_ns: u64, pres: u64 }
+const CHURN_ROWS: usize = 96;
+static CHURN: spin::Mutex<[Option<ChurnRow>; CHURN_ROWS]> = spin::Mutex::new([None; CHURN_ROWS]);
+static CHURN_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+fn churn_note(op: u8, kind: u8, len: usize, flags: u32, ns: u64, pres: u64) {
+    if !CHURN_STATS { return; }
+    let pid = current_pid();
+    let tgid = sched::current_tgid();
+    let mut t = CHURN.lock();
+    let mut free = None;
+    for (i, r) in t.iter_mut().enumerate() {
+        match r {
+            Some(r) if r.tgid == tgid && r.pid == pid && r.op == op && r.kind == kind
+                && r.len == len && r.flags == flags => {
+                r.n += 1; r.ns += ns; r.max_ns = r.max_ns.max(ns); r.pres += pres;
+                return;
+            }
+            None if free.is_none() => free = Some(i),
+            _ => {}
+        }
+    }
+    match free {
+        Some(i) => t[i] = Some(ChurnRow { tgid, pid, op, kind, len, flags, n: 1, ns, max_ns: ns, pres }),
+        None => { CHURN_DROPPED.fetch_add(1, Ordering::Relaxed); }
+    }
+}
+
+fn churn_tick() {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !CHURN_STATS { return; }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = monotonic_ns();
+    let last = LAST.load(Relaxed);
+    if last == 0 { LAST.store(now, Relaxed); return; }
+    if now.wrapping_sub(last) < 10_000_000_000 { return; }
+    let rows = match CHURN.try_lock() {
+        Some(mut t) => { let r = *t; *t = [None; CHURN_ROWS]; r }
+        None => return,
+    };
+    LAST.store(now, Relaxed);
+    let win_ms = (now.wrapping_sub(last) / 1_000_000) as usize;
+    mm::gap2::s("[CHURN] win_ms="); mm::gap2::h(win_ms);
+    mm::gap2::kv(" dropped=", CHURN_DROPPED.swap(0, Relaxed) as usize);
+    mm::gap2::nl();
+    mm::gap2::s("[CHURN] alltag sock="); mm::gap2::h(ALLTAG[0].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" epoll=", ALLTAG[1].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" signalfd=", ALLTAG[2].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" inotify=", ALLTAG[3].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" dev=", ALLTAG[4].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" stdio=", ALLTAG[5].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" file=", ALLTAG[6].swap(0, Relaxed) as usize);
+    mm::gap2::kv(" other=", ALLTAG[7].swap(0, Relaxed) as usize);
+    mm::gap2::nl();
+    let mut taken = [false; CHURN_ROWS];
+    for _ in 0..24 {
+        let mut best = usize::MAX; let mut bn = 0u32;
+        for (i, r) in rows.iter().enumerate() {
+            if taken[i] { continue; }
+            if let Some(r) = r { if r.n > bn { bn = r.n; best = i; } }
+        }
+        if best == usize::MAX { break; }
+        taken[best] = true;
+        let r = rows[best].unwrap();
+        mm::gap2::s(if r.op == 0 { "[CHURN] mmap" } else { "[CHURN] munmap" });
+        mm::gap2::kv(" tgid=", r.tgid as usize);
+        mm::gap2::kv(" pid=", r.pid as usize);
+        mm::gap2::kv(" kind=", r.kind as usize);
+        mm::gap2::kv(" len=", r.len);
+        mm::gap2::kv(" flags=", r.flags as usize);
+        mm::gap2::kv(" n=", r.n as usize);
+        mm::gap2::kv(" avg_ns=", (r.ns / r.n.max(1) as u64) as usize);
+        mm::gap2::kv(" max_ns=", r.max_ns as usize);
+        mm::gap2::kv(" pres=", r.pres as usize);
+        mm::gap2::nl();
+    }
+}
 
 pub fn dispatch(
     number: usize,
@@ -1799,6 +1866,7 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     let t0 = monotonic_ns();
     let r = sys_mmap_inner(addr, len, prot, flags, fd, off, &mut tr);
     let dt = monotonic_ns().wrapping_sub(t0);
+    if CHURN_STATS { churn_note(0, tr.kind, len, (flags as u32) | ((prot as u32) << 24), dt, 0); }
     // Every big file mapping, however fast: the per-mmap latency of the
     // mappings that used to be copied eagerly (a Rust binary mapping its own
     // executable, ld-musl mapping libgallium).
@@ -1890,7 +1958,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         let tm = monotonic_ns();
         let mapped = with_current_address_space_mut(|as_| {
             if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
-            as_.map_lazy(virt, len, page_flags, is_shared)
+            // Record the real protection: PROT_NONE (thread-stack guards,
+            // reservations) must fault, not read as zero (see the fault path).
+            as_.map_lazy(virt, len, page_flags, is_shared) && { as_.set_prot(virt, prot as u32 & 7); true }
         });
         tr.map_ns = monotonic_ns().wrapping_sub(tm);
         return match mapped {
@@ -1898,7 +1968,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             Some(false) => {
                 if flags & MAP_FIXED == 0 && addr != 0 {
                     let bump = MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed);
-                    let m2 = with_current_address_space_mut(|as_| as_.map_lazy(bump, len, page_flags, is_shared));
+                    let m2 = with_current_address_space_mut(|as_| {
+                        as_.map_lazy(bump, len, page_flags, is_shared) && { as_.set_prot(bump, prot as u32 & 7); true }
+                    });
                     match m2 {
                         Some(true) => bump as isize,
                         _ => enomem_map_site(("mmap/anon/bump-retry")),
@@ -2146,6 +2218,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
         if !as_.map(virt, len, page_flags) { return None; }
         as_.set_prot(virt, prot as u32);
+        as_.mark_file_copy(virt);
         // Retrieve the physical base of the just-created VMA.
         as_.find(virt).map(|vma| vma.phys)
     });
@@ -2229,6 +2302,21 @@ fn sys_unmap_mem(virt: usize, size: usize) -> isize {
     if virt == 0 || size == 0 { return -22; } // EINVAL
     if virt >= USER_SPACE_END  { return -22; }
 
+    if CHURN_STATS {
+        let t0 = monotonic_ns();
+        let (kind, pres) = with_current_address_space_mut(|as_| {
+            let k = as_.find(virt).map(|r| {
+                let kind = if r.file_cap == usize::MAX { 2 }
+                    else if r.file_cap != 0 { 5 }
+                    else if !r.lazy { 3 } else { 1 };
+                (kind, r.lazy_count as u64)
+            }).unwrap_or((0, 0));
+            as_.unmap(virt, size);
+            k
+        }).unwrap_or((0, 0));
+        churn_note(1, kind, size, 0, monotonic_ns().wrapping_sub(t0), pres);
+        return 0;
+    }
     with_current_address_space_mut(|as_| as_.unmap(virt, size));
     0
 }
@@ -2245,6 +2333,7 @@ fn sys_mremap(
     old_addr: usize, old_size: usize, new_size: usize,
     flags: usize, new_addr: usize,
 ) -> isize {
+    const MREMAP_MAYMOVE: usize = 1;
     const MREMAP_FIXED: usize = 2;
     const PAGE: usize = 4096;
 
@@ -2259,6 +2348,19 @@ fn sys_mremap(
         let tail_len = (old_pages - new_pages) * PAGE;
         with_current_address_space_mut(|as_| as_.unmap(tail, tail_len));
         return old_addr as isize;
+    }
+
+    // Without MREMAP_MAYMOVE (or MREMAP_FIXED) Linux never moves the
+    // mapping: it grows in place or fails ENOMEM, and an unmapped old range
+    // is EFAULT. musl's pthread_getattr_np() on the main thread relies on
+    // exactly that, probing `mremap(p, PAGE, 2*PAGE, 0)` page by page down
+    // the stack until the answer is no longer ENOMEM. The move below would
+    // instead have carried a live stack page away (punching a hole in the
+    // stack) and, below the stack, answered ENOMEM forever.
+    if flags & (MREMAP_MAYMOVE | MREMAP_FIXED) == 0 {
+        return with_current_address_space_mut(|as_| {
+            as_.grow_in_place(old_addr, old_pages * PAGE, new_pages * PAGE)
+        }).unwrap_or(-14);
     }
 
     // Grow: allocate a new (larger) anonymous region.
@@ -2276,7 +2378,7 @@ fn sys_mremap(
     // always in the caller's own address space, so both can be reached
     // through a single lock acquisition.
     let copied = with_current_address_space_mut(|as_| -> bool {
-        as_.prefault_range(new_va, old_size);
+        let _ = as_.prefault_range(new_va, old_size); // fresh anonymous: never stops early
         let mut off = 0usize;
         while off < old_size {
             let chunk = core::cmp::min(PAGE, old_size - off);
@@ -2440,7 +2542,15 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
                 // (e.g. a compositor that runs for the session) at 100 % CPU —
                 // init/shell waiters stayed perpetually runnable, churning the
                 // scheduler run-loop and starving the very child's event loop.
-                sched::block_on_poll_prepare_until(sched::monotonic_ns() + 20_000_000);
+                //
+                // The park names this process (poll_class::WAIT): an exit
+                // requests that tag as it is logged (`log_exit`), and a
+                // SIGCHLD or any broadcast wake still reaches it. The deadline
+                // is only a backstop now; at 20 ms it woke every idle waiter
+                // (greetd, init's shells) 50 times a second for nothing.
+                sched::block_on_poll_prepare_masked(
+                    sched::monotonic_ns() + 1_000_000_000,
+                    sched::poll_tag(sched::poll_class::WAIT, caller_tgid));
                 if matches!(sched::wait_peek(sel, caller_tgid, what), sched::WaitTry::StillRunning)
                     && !interrupted() {
                     sched::block_on_poll_commit();
@@ -2533,7 +2643,10 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
                 // a service) otherwise pins its blocking-waitid reaper at
                 // 100 % CPU. Woken by child-exit SIGCHLD -> wake_poll; the
                 // 2-tick poll deadline bounds a missed edge to ~20 ms.
-                sched::block_on_poll_prepare_until(sched::monotonic_ns() + 20_000_000);
+                // Same park as wait4 (see there): tagged, 1 s backstop.
+                sched::block_on_poll_prepare_masked(
+                    sched::monotonic_ns() + 1_000_000_000,
+                    sched::poll_tag(sched::poll_class::WAIT, caller_tgid));
                 let peek = sched::wait_peek(sel, caller_tgid, what);
                 if !matches!(peek, sched::WaitTry::StillRunning) || interrupted() {
                     sched::block_on_poll_cancel();
@@ -2793,6 +2906,7 @@ fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> 
     const PR_GET_NAME: usize = 16;
     const PR_SET_DUMPABLE: usize = 4;
     const PR_GET_DUMPABLE: usize = 3;
+    const PR_GET_AUXV: usize = 0x4155_5856; // "AUXV"
     match option {
         PR_SET_NAME => 0,
         PR_GET_NAME => {
@@ -2805,6 +2919,11 @@ fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> 
         }
         PR_SET_DUMPABLE => 0,
         PR_GET_DUMPABLE => 1,
+        // PR_GET_AUXV (Linux 6.4): EINVAL, as on older kernels. Answering 0
+        // ("success, 0 bytes") made rustix take an EMPTY aux vector as the
+        // real one, so its page_size() was 0 and bottom showed every
+        // process's memory as 0 B. On EINVAL it reads /proc/self/auxv.
+        PR_GET_AUXV => -22,
         _ => 0, // silently accept anything else
     }
 }
@@ -3824,6 +3943,22 @@ fn read_file_from_vfs(path: &str) -> Option<alloc::vec::Vec<u8>> {
     Some(buf)
 }
 
+/// Open the dynamic interpreter for demand paging: its ELF headers, and a
+/// private-mmap registry cap (one reference, the caller's) naming its inode.
+/// None when it is not an f2fs file (or the registry is full): the caller
+/// falls back to the eager loader.
+fn open_interp_lazy(path: &str, pid: u32) -> Option<(usize, alloc::vec::Vec<u8>)> {
+    let (fd, hdr) = open_exec_header(path, pid)?;
+    let cap = match vfs::vfs_get_node_kind(pid, fd) {
+        Some(vfs::VnodeKind::MountedFile { port, file_id }) =>
+            f2fs_server::inode_by_port(port, file_id as u64)
+                .and_then(|ino| mmap_file_register(port, ino)),
+        _ => None,
+    };
+    let _ = sys_close(fd);
+    Some((cap?, hdr))
+}
+
 fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let pid = current_pid();
 
@@ -3954,75 +4089,12 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
 
     if exec_cap == 0 && elf_len == 0 { return -22; }
 
-    // ── Collect argv / envp strings ───────────────────────────────────────────
-    let mut argv = EXEC_ARGV.lock();
-    let mut envp = EXEC_ENVP.lock();
-    argv.reset();
-    envp.reset();
-
-    let t_pre = mm::paging::tlbstat::now_ns();
-    // Fault in the pointer arrays themselves (they can live in .data/.rodata
-    // of a demand-paged image, not just on the stack).
-    prefault_user_ro(argv_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
-    prefault_user_ro(envp_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
-
-    // A script's rewritten head goes first (see the `#!` loop above).
-    for a in &head_args {
-        if !argv.push_bytes(a) { return -7; } // E2BIG
-    }
-    drop(head_args);
-    // Read argv[] from user-space (array of pointers, null-terminated). For a
-    // script, argv[0] was replaced by the head above and is skipped.
-    if argv_ptr != 0 {
-        let mut i = 0usize;
-        loop {
-            if i >= MAX_EXEC_ARGS { break; }
-            let ptr_addr = argv_ptr + i * core::mem::size_of::<usize>();
-            if !validate_user_buf(ptr_addr, core::mem::size_of::<usize>()) { break; }
-
-            let mut str_ptr: usize = 0;
-            let ok = with_current_address_space(|as_| {
-                as_.read_user_buf(ptr_addr, unsafe {
-                    core::slice::from_raw_parts_mut(&mut str_ptr as *mut usize as *mut u8, core::mem::size_of::<usize>())
-                })
-            }).unwrap_or(false);
-            if !ok || str_ptr == 0 { break; }
-
-            if script && i == 0 { i += 1; continue; }
-            // push_cstr faults in + fault-checks each page of the string itself
-            // (demand-paged argv literals live in .rodata); it never raw-derefs.
-            argv.push_cstr(str_ptr);
-            i += 1;
-        }
-    }
-    // Read envp[] similarly.
-    if envp_ptr != 0 {
-        let mut i = 0usize;
-        loop {
-            if i >= MAX_EXEC_ARGS { break; }
-            let ptr_addr = envp_ptr + i * core::mem::size_of::<usize>();
-            if !validate_user_buf(ptr_addr, core::mem::size_of::<usize>()) { break; }
-
-            let mut str_ptr: usize = 0;
-            let ok = with_current_address_space(|as_| {
-                as_.read_user_buf(ptr_addr, unsafe {
-                    core::slice::from_raw_parts_mut(&mut str_ptr as *mut usize as *mut u8, core::mem::size_of::<usize>())
-                })
-            }).unwrap_or(false);
-            if !ok || str_ptr == 0 { break; }
-
-            envp.push_cstr(str_ptr);
-            i += 1;
-        }
-    }
-    let argc = argv.count;
-    let envc = envp.count;
-    {
-        use mm::paging::tlbstat as ts;
-        ts::EXEC_PRE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        ts::add(&ts::EXEC_PRE_NS, &ts::EXEC_PRE_MAX_NS, ts::now_ns().saturating_sub(t_pre));
-    }
-
+    // The image and its interpreter are loaded into the new address space
+    // BEFORE argv/envp are collected. The collection holds the global
+    // EXEC_ARGV/EXEC_ENVP buffers, and the loaders' file I/O (headers; the
+    // eager fallback's whole-file reads) used to run under them, making
+    // every other execve in the system wait on it. The new address space is
+    // private to this call until replace_address_space, so no lock is needed.
     // ── Load ELF into fresh address space ─────────────────────────────────────
     let pt_root = unsafe { arch_alloc_page_table_root() };
     if pt_root == 0 {
@@ -4097,6 +4169,20 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
             Err(_) => { drop(new_as); return -8; }
         };
 
+        // Preferred: demand-paged, like the main image. The interpreter is
+        // the same file for every dynamic process, so it goes through the
+        // deduplicated, inode-keyed private-mmap registry (one entry for all
+        // of them, no open-file slot held) rather than EXEC_FILES. Nothing is
+        // read here beyond its headers; the eager whole-file read and copy
+        // below (~1 MiB of libc per exec) is only the fallback.
+        if let Some((icap, ihdr)) = open_interp_lazy(interp_path, pid) {
+            let r = elf::load_lazy(&ihdr, &mut new_as, icap, INTERP_BASE);
+            mmap_file_ref(icap, false); // the VMAs hold their own references
+            match r {
+                Ok(ii) => { entry = ii.entry; at_base = INTERP_BASE as u64; }
+                Err(_) => { drop(new_as); return -8; }
+            }
+        } else {
         match read_file_from_vfs(interp_path) {
             Some(ibytes) => match elf::load(&ibytes, &mut new_as, INTERP_BASE) {
                 Ok(ii) => { entry = ii.entry; at_base = INTERP_BASE as u64; }
@@ -4108,6 +4194,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
                 serial_print_str("\n");
                 drop(new_as); return -8;
             }
+        }
         }
     }
     // Pin the heap to the main image regardless of whether the interpreter load
@@ -4123,12 +4210,89 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     drop(vfs_elf_data);
     drop(header_data);
 
-    // Map user stack (read+write, eager so virt_to_phys works immediately).
+    // ── Collect argv / envp strings ───────────────────────────────────────────
+    let mut argv = EXEC_ARGV.lock();
+    let mut envp = EXEC_ENVP.lock();
+    argv.reset();
+    envp.reset();
+
+    let t_pre = mm::paging::tlbstat::now_ns();
+    // Fault in the pointer arrays themselves (they can live in .data/.rodata
+    // of a demand-paged image, not just on the stack).
+    prefault_user_ro(argv_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
+    prefault_user_ro(envp_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
+
+    // A script's rewritten head goes first (see the `#!` loop above).
+    for a in &head_args {
+        if !argv.push_bytes(a) { return -7; } // E2BIG
+    }
+    drop(head_args);
+    // Read argv[] from user-space (array of pointers, null-terminated). For a
+    // script, argv[0] was replaced by the head above and is skipped.
+    if argv_ptr != 0 {
+        let mut i = 0usize;
+        loop {
+            if i >= MAX_EXEC_ARGS { break; }
+            let ptr_addr = argv_ptr + i * core::mem::size_of::<usize>();
+            if !validate_user_buf(ptr_addr, core::mem::size_of::<usize>()) { break; }
+
+            let mut str_ptr: usize = 0;
+            let ok = with_current_address_space(|as_| {
+                as_.read_user_buf(ptr_addr, unsafe {
+                    core::slice::from_raw_parts_mut(&mut str_ptr as *mut usize as *mut u8, core::mem::size_of::<usize>())
+                })
+            }).unwrap_or(false);
+            if !ok || str_ptr == 0 { break; }
+
+            if script && i == 0 { i += 1; continue; }
+            // push_cstr faults in + fault-checks each page of the string itself
+            // (demand-paged argv literals live in .rodata); it never raw-derefs.
+            argv.push_cstr(str_ptr);
+            i += 1;
+        }
+    }
+    // Read envp[] similarly.
+    if envp_ptr != 0 {
+        let mut i = 0usize;
+        loop {
+            if i >= MAX_EXEC_ARGS { break; }
+            let ptr_addr = envp_ptr + i * core::mem::size_of::<usize>();
+            if !validate_user_buf(ptr_addr, core::mem::size_of::<usize>()) { break; }
+
+            let mut str_ptr: usize = 0;
+            let ok = with_current_address_space(|as_| {
+                as_.read_user_buf(ptr_addr, unsafe {
+                    core::slice::from_raw_parts_mut(&mut str_ptr as *mut usize as *mut u8, core::mem::size_of::<usize>())
+                })
+            }).unwrap_or(false);
+            if !ok || str_ptr == 0 { break; }
+
+            envp.push_cstr(str_ptr);
+            i += 1;
+        }
+    }
+    let argc = argv.count;
+    let envc = envp.count;
+    {
+        use mm::paging::tlbstat as ts;
+        ts::EXEC_PRE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        ts::add(&ts::EXEC_PRE_NS, &ts::EXEC_PRE_MAX_NS, ts::now_ns().saturating_sub(t_pre));
+    }
+
+
+    // Reserve the user stack. It is demand-paged like any anonymous private
+    // mapping: only the pages holding argv/envp/auxv (plus a small prefault
+    // below the initial SP, see STACK_PREFAULT) are populated here, the rest
+    // on first touch. The VMA is fixed at USER_STACK_SIZE; nothing is mapped
+    // below it, so running off its bottom faults outside any VMA and raises
+    // SIGSEGV (the guard). Until 2026-09-26 all 8 MiB were allocated eagerly
+    // at every exec — ~8 MiB of untouched RSS per process.
     let stack_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE;
-    if !new_as.map(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, stack_flags) {
+    if !new_as.map_lazy(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, stack_flags, false) {
         let r = enomem_map_site("execve/user-stack");
         drop(new_as); return r;
     }
+    new_as.stack_top = USER_STACK_TOP;
 
     // Map the sigreturn trampoline page (read+exec) and fill in the
     // rt_sigreturn stub. Signal delivery points a handler's return address
@@ -4213,19 +4377,22 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let str_base_va = user_sp + total_ptr_bytes;
     let rand_va     = str_base_va + argv_str_total + envp_str_total;
 
-    // Get physical address of the start of the stack frame.
-    let phys_base = match new_as.virt_to_phys(user_sp) {
-        Some(p) => p, None => { drop(new_as); return enomem_site("execve/stack-not-backed"); }
-    };
-    let virt_base = mm::phys_to_virt(phys_base);
+    // Populate the frame's pages plus STACK_PREFAULT below the initial SP
+    // (the first few call frames of ld.so / _start, which would otherwise
+    // each take a fault straight away).
+    let prefault_lo = user_sp.saturating_sub(STACK_PREFAULT).max(USER_STACK_TOP - USER_STACK_SIZE);
+    new_as.prefault_range(prefault_lo, USER_STACK_TOP - prefault_lo);
 
-    // Write the stack frame to kernel-accessible virtual memory (HHDM).
-    // Helper: write a u64 at byte offset `off` into the physical frame.
+    // Build the frame [user_sp, USER_STACK_TOP) in a kernel buffer, then copy
+    // it in page by page (the stack's frames are no longer one contiguous
+    // physical block).
+    let mut frame: Vec<u8> = alloc::vec![0u8; USER_STACK_TOP - user_sp];
+    let fb = frame.as_mut_ptr();
     let write64 = |off: usize, val: u64| unsafe {
-        core::ptr::write((virt_base + off) as *mut u64, val);
+        core::ptr::copy_nonoverlapping(val.to_le_bytes().as_ptr(), fb.add(off), 8);
     };
     let write8 = |off: usize, src: *const u8, len: usize| unsafe {
-        core::ptr::copy_nonoverlapping(src, (virt_base + off) as *mut u8, len);
+        core::ptr::copy_nonoverlapping(src, fb.add(off), len);
     };
 
     // Pointer table section.
@@ -4278,16 +4445,20 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     }
 
     // String data section.
-    let str_phys = phys_base + total_ptr_bytes;
-    write8(str_phys - phys_base, argv.data.as_ptr(), argv_str_total);
-    write8(str_phys - phys_base + argv_str_total, envp.data.as_ptr(), envp_str_total);
+    write8(total_ptr_bytes, argv.data.as_ptr(), argv_str_total);
+    write8(total_ptr_bytes + argv_str_total, envp.data.as_ptr(), envp_str_total);
 
     // AT_RANDOM data: 16 bytes of pseudo-random.
-    let rand_phys = phys_base + total_ptr_bytes + argv_str_total + envp_str_total;
+    let rand_off = total_ptr_bytes + argv_str_total + envp_str_total;
     let r0 = t ^ 0xdeadbeef_cafebabe_u64;
     let r1 = t.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    write8(rand_phys - phys_base, r0.to_le_bytes().as_ptr(), 8);
-    write8(rand_phys - phys_base + 8, r1.to_le_bytes().as_ptr(), 8);
+    write8(rand_off, r0.to_le_bytes().as_ptr(), 8);
+    write8(rand_off + 8, r1.to_le_bytes().as_ptr(), 8);
+
+    if !new_as.write_user_buf(user_sp, &frame) {
+        drop(new_as); return enomem_site("execve/stack-not-backed");
+    }
+    drop(frame);
 
     // Release argv/envp buffers before the AS swap.
     drop(argv);
@@ -4866,7 +5037,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
             if !is_kernel {
                 if count != 0 && !validate_user_buf(buf_ptr, count) { return -14; }
                 if count != 0 {
-                    with_current_address_space_mut(|as_| as_.prefault_range(buf_ptr, count));
+                    prefault_user(buf_ptr, count);
                 }
             }
             let pid = current_pid();
@@ -4883,7 +5054,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                 // Demand-page any not-yet-faulted pages in the destination buffer
                 // so the VFS can copy directly without taking a kernel-mode fault.
                 if count != 0 {
-                    with_current_address_space_mut(|as_| as_.prefault_range(buf_ptr, count));
+                    prefault_user(buf_ptr, count);
                 }
             }
             let pid = current_pid();
@@ -7110,6 +7281,8 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
     // new value in, old value out). drmsmoke uses it to force a parked wait.
     const DRM_IOCTL_GPU_PARK_SPIN: usize = 0x1009;
     if cmd == DRM_IOCTL_GPU_PARK_SPIN && (arg == 0 || !validate_user_buf(arg, 8)) { return -14; } // EFAULT
+    const DRM_IOCTL_CTX_DRAIN_US: usize = 0x100A;
+    if cmd == DRM_IOCTL_CTX_DRAIN_US && (arg == 0 || !validate_user_buf(arg, 8)) { return -14; } // EFAULT
 
     // Check if it's a standard Linux EVDEV (type 'E' = 0x45) or DRM (type 'd' = 0x64) ioctl
     let ioctl_type = (cmd >> 8) & 0xFF;
@@ -7371,6 +7544,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
        cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||
        cmd == DRM_IOCTL_SET_PLANE || cmd == DRM_IOCTL_GET_CAPS ||
        cmd == DRM_IOCTL_GPU_IRQ_STATS || cmd == DRM_IOCTL_GPU_PARK_SPIN ||
+       cmd == DRM_IOCTL_CTX_DRAIN_US ||
        is_evdev || is_drm {
         
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
@@ -8039,10 +8213,13 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     // THE ONE REAL LOST-WAKE HOLE (see the targeted-wake design): a sibling
     // thread may be parked in epoll_wait on this instance with a `poll_mask`
     // computed BEFORE this add/mod/del, so a *targeted* wake for the newly
-    // added fd would never reach it. Broadcast unconditionally on any
-    // successful mutation — epoll_ctl is not a hot path, and Linux likewise
-    // wakes waiters from ep_insert/ep_modify.
-    if r >= 0 { sched::wake_poll(); }
+    // added fd would never reach it. Wake every waiter of THIS instance on
+    // any successful mutation, as Linux does from ep_insert/ep_modify: each
+    // epoll_wait park, and every mask an enclosing epoll/poll/select computes
+    // for this fd (`epoll_tag_mask`), carries `poll_tag(EPOLL, slot)`. This
+    // used to be a system-wide broadcast: on the idle desktop ~11 epoll_ctl
+    // calls a second woke ~570 unrelated threads a second.
+    if r >= 0 { sched::wake_poll_tagged(epoll_self_tag(slot)); }
     r
 }
 
@@ -8125,11 +8302,12 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         // commit last_seq / disarm ONESHOT, matching by fd since a sibling
         // epoll_ctl may have mutated the slot meanwhile.
         let mut n = 0usize;
-        // OR of every armed interest's targeted-wake tag; becomes this task's
+        // This instance's own tag (what epoll_ctl on it wakes) OR every armed
+        // interest's targeted-wake tag; becomes this task's
         // `poll_mask` if we park below. The loop only `break`s early once an
         // event has fired (n > 0), in which case we return before using `mask`,
         // so whenever we reach the park `mask` has seen every armed interest.
-        let mut mask = 0u64;
+        let mut mask = epoll_self_tag(slot);
         // Re-read the high-water mark on every pass: a CLONE_THREAD sibling
         // sharing this epoll fd may epoll_ctl(ADD) while we are blocked below,
         // and the new interest must be visible to the next probe.
@@ -8139,6 +8317,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
             let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
             if !interest.in_use || !interest.armed { continue; }
             let (cur, seq, tag) = probe_fd_events_seq(pid, interest.fd as usize, interest.events);
+            if CHURN_STATS && tag == sched::POLL_TAG_ALL { churn_all_tag_note(pid, interest.fd as usize); }
             mask |= tag;
             let et = interest.events & EPOLLET != 0;
             let fire = cur != 0 && (!et || match seq {
@@ -8486,7 +8665,7 @@ pub fn poll_deadline_service(now: u64) -> u64 {
         // reporting it and the waiter would sleep until its own timeout. Hand
         // the expired timerfds' tags to the deferred-wake path, which the next
         // tick pays with `try_wake_poll_tagged` (and re-arms on contention).
-        if !sched::service_poll_deadlines(now, timerfd_tags != 0) && timerfd_tags != 0 {
+        if !sched::service_poll_deadlines(now, timerfd_tags) && timerfd_tags != 0 {
             sched::request_poll_wake_tagged(timerfd_tags);
         }
     }
@@ -8504,6 +8683,8 @@ pub fn poll_deadline_tick() {
     gap2_sample_tick();
     evstat_tick();
     scstat_tick();
+    churn_tick();
+    sched::idlestat::tick(monotonic_ns());
     poll_deadline_service(monotonic_ns());
     // Pay any wake a pipe deferred because it only advanced an object's edge
     // `seq` without changing its readable/writable level (see
@@ -8731,8 +8912,8 @@ fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
     // level-triggered (None) — its readiness is recomputed from its interest
     // list on every probe. Checked before the console/socket routing below
     // because EPOLL_FD_BASE sits inside the "not a VFS fd" range. Its tag is
-    // the OR of its children's tags (see `epoll_tag_mask`); an empty nested set
-    // contributes 0 (any later add broadcasts via sys_epoll_ctl).
+    // its own tag OR its children's (see `epoll_tag_mask`); an empty nested
+    // set contributes just its own tag, which a later add wakes.
     if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&fd) {
         let state = probe_fd_events_nested(pid, fd, requested, depth);
         let tag = match epoll_slot_of(fd) {
@@ -8820,15 +9001,44 @@ fn reply_poll_tag(reply: &Message) -> u64 {
 fn epoll_tag_mask(pid: u32, slot: usize, depth: u32) -> u64 {
     if depth >= EPOLL_MAX_NEST { return sched::POLL_TAG_ALL; }
     let hi = { EPOLL_INSTANCES.lock()[slot].hi as usize };
-    let mut mask = 0u64;
+    // The instance's own tag first: an epoll_ctl on it must reach whoever
+    // watches it (see sys_epoll_ctl).
+    let mut mask = epoll_self_tag(slot);
     for i in 0..hi {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
         if !interest.in_use || !interest.armed { continue; }
         let (_cur, _seq, tag) =
             probe_fd_events_seq_nested(pid, interest.fd as usize, interest.events, depth + 1);
+        if CHURN_STATS && tag == sched::POLL_TAG_ALL { churn_all_tag_note(pid, interest.fd as usize); }
         mask |= tag;
     }
     mask
+}
+
+/// The tag `epoll_ctl` on instance `slot` wakes (see sys_epoll_ctl).
+fn epoll_self_tag(slot: usize) -> u64 {
+    sched::poll_tag(sched::poll_class::EPOLL, slot as u32)
+}
+
+/// `[CHURN] alltag` census: which interest kinds make an epoll wait mask a
+/// broadcast one (index: 0 inet/listener socket, 1 epoll nest, 2 signalfd,
+/// 3 inotify, 4 device, 5 stdio/none, 6 file, 7 other).
+static ALLTAG: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+fn churn_all_tag_note(pid: u32, fd: usize) {
+    let k = if fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE { 0 }
+        else if fd >= EPOLL_FD_BASE { 1 }
+        else {
+            match vfs::vfs_get_node_kind(pid, fd) {
+                Some(vfs::VnodeKind::SignalFd { .. }) => 2,
+                Some(vfs::VnodeKind::Inotify { .. }) => 3,
+                Some(vfs::VnodeKind::DynamicDevice { .. }) => 4,
+                Some(vfs::VnodeKind::DevStdio { .. }) | Some(vfs::VnodeKind::None) | None => 5,
+                Some(vfs::VnodeKind::MountedFile { .. }) | Some(vfs::VnodeKind::TmpFile { .. })
+                    | Some(vfs::VnodeKind::RamFile { .. }) => 6,
+                _ => 7,
+            }
+        };
+    ALLTAG[k].fetch_add(1, Ordering::Relaxed);
 }
 
 fn sys_eventfd2(initval: usize, flags: usize) -> isize {

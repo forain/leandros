@@ -19,6 +19,77 @@ conclusion that rested on them being out of scope is void. **VT switching has si
 
 ---
 
+## Open work (2026-09-24 reconciliation)
+
+Reconciled against `main` following the 2026-09-24 wave (`artifacts/notes/wave-2026-09-24.md`;
+per-lane detail in `artifacts/notes/lane-<name>-2026-09-24.md`). Twenty-four lanes ran; all but
+`sigmisc` (still in progress, unmerged) landed through `integ-wave-0924` into `main` (`a5b5b62`):
+`lane/buildobj`, `lane/zinkverify`, `lane/ctrlqout`, `lane/execleak`, `lane/polltimer`,
+`lane/vfsmisc`, `lane/sessmisc`, `lane/sigalrm`, `lane/greeterleak`, `lane/greeterlag`,
+`lane/runqlock`, `lane/forkcow`, `lane/icons`, `lane/gpudefault`, `lane/killmtbound`,
+`lane/lazymmap`, `lane/macqemu`, `lane/macgpu`, `lane/cowtlb`, `lane/epollwake`,
+`lane/virglpanel`, `lane/drmflake`, `lane/applets`, `lane/polish`.
+
+**Closed this wave (from the 2026-09-18 list above — see `wave-2026-09-24.md` for detail/numbers):**
+`polltest poll_timeout_wake_latency` (fixed by a one-shot deadline timer); the ~55 MiB
+per-greeter-death leak (was an untracked eager-VMA rounding tail, not kernel heap/f2fs); the
+`killmt exec_worker`/plain-process "leak" (was a reap-timing measurement window, refuted; two
+small real bugs fixed instead); `fork`'s ~210 MiB eager copy (now lazy CoW); gpuirq re-run on
+KVM/Zink (no regression; found and fixed a new parked-ctrlq-wait issue instead); the x86_64 audio
+stall re-run (PASS); POSIX timers/`setitimer` tick-floored delivery (now ns-based, serviced from
+timer-IRQ context, not just syscall return); `access(2)` euid-vs-ruid; atime-on-read; greeter-launch
+`initgroups`; the vfstest header comment; `lock_leader_address_space` as the top RUN_QUEUE site
+(now negligible except during the session-start fault storm, which is itself much cheaper); the
+shared `../doomgeneric` `make clean` build collision; Super+T in a serial-started session; the
+greetd/brush `EBADF` self-pipe race; `[WDOG] … cosmic-comp mmap ~2 s`; and the greeter keystroke
+lag (35.5 s p50 → sub-200 ms, via the f2fs cache-size bug plus GPU-by-default).
+
+**Still open:**
+- **`FUTEX_WAIT` + `SA_RESTART` race under load** (`lane/sigmisc`, unmerged): restarts correctly on
+  an idle host, but 10–20% of iterations return EINTR instead of ETIMEDOUT under concurrent host
+  load. Narrowed to `futex_wait`'s own block/resume path (`sched/src/futex.rs`) — a control test
+  proved the shared signal-restart machinery itself is clean (100/100 under the same load with a
+  pipe read instead of a futex). Two hypotheses tried and disproven; reproduces stone cold with
+  `for i in 1..6; do yes >/dev/null & done` + repeated `sigtest`. Test shipped, marked
+  known-flaky-under-load.
+- **Venus (Vulkan) is infeasible on the Mac with any QEMU today** (`lane/macqemu`/`macgpu`):
+  upstream virglrenderer's Venus is Linux-only (epoll/memfd/udmabuf/eventfd); UTM's macOS fork
+  fails at host `vkCreateInstance` with an undetermined CS error. The Mac's GPU path is virgl over
+  ANGLE/Metal only, via the new from-source QEMU at `~/.local/qemu-gpu`.
+- **cosmic-session's launch-pad output queue is unbounded** (upstream weakness, not fixable in this
+  repo) — contained, not fixed, by an init-side rotating logger (16 MiB cap) plus a
+  memory-pressure guard that kills and lets greetd's own respawn/backoff recover.
+- **Lazy-fault residual noise, ~27 pages/death** (`lane/greeterleak`'s remaining `vmm.rs:686`
+  residual after the eager-tail fix) — within noise, execleak/lazymmap territory, not chased
+  further this wave.
+- **`/proc/kmemstat` has a parse flake** in at least one consuming script — not root-caused.
+- **One control-queue chain stays parked host-side per abandoned GPU fence** (`lane/polish`'s
+  `ctx_abandon_fences` open item): only reached if the 200 ms drain-before-`CTX_DESTROY` times out;
+  QEMU never completes that chain.
+- **COSMIC's own clients (greeter, panel, applets) still render with iced's tiny-skia (CPU)**, even
+  though compositing and blur are now GPU-accelerated — needs rebuilding those binaries with iced's
+  wgpu backend (a build flag, not a source patch). `lane/wgpuapps` in progress.
+- **Per-process RSS is not tracked** (`/proc/<pid>/status`'s `VmRSS` is a constant), which is why
+  virglpanel's OOM guard can only kill the whole graphical login, not pick a victim.
+  `lane/procrss` in progress.
+- **cosmic-comp's compositor thread is never idle**, doing ~55 mmap+munmap/s even with a static
+  screen (`lane/runqlock`'s characterization: a per-wakeup buffer allocate/free cycle, not
+  rendering) — `lane/compchurn` in progress.
+- **Worktree/branch hygiene**: the desktop's `leandros-complk` worktree has 12 uncommitted source
+  files that need triage (keep, discard, or land as a proper lane); the Mac's scratch
+  `~/code/leandros-macqemu-test` worktree has an unpushed, uncommitted diff to
+  `drivers/src/drm_device_interface.rs` (and `virtio_gpu.rs`, `driver.py`) left over from an
+  in-lane repro snapshot — confirmed still present, not yet reconciled against the now-merged
+  `macgpu`/`virglpanel` fixes it was snapshotting.
+- Laptop needs `sudo pacman -S vulkan-intel` if Venus/ANV there is ever found not to work (gpudefault
+  found it missing mid-wave; the machine note says it's since installed, but this wasn't
+  re-verified against a fresh Venus run on the laptop this wave).
+- Everything in the 2026-09-18 list below not named above as closed still stands (P0 #5 aarch64
+  clicks needing a physical mouse, the Mac `~/code/brush` sibling sync step, and the pre-existing
+  numbered `## Open work` table / *Road to a complete COSMIC desktop* section further down).
+
+---
+
 ## Open work (2026-09-18 reconciliation)
 
 Reconciled against `main` following the 2026-09-18 ten-lane bug sweep
