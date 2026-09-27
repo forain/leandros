@@ -1199,6 +1199,7 @@ fn gd_tick() {
         mm::gap2::s("/"); gd_dec((kd & 0xFF_FFFF) as usize);
         mm::gap2::s(" n="); gd_dec(n as usize); mm::gap2::nl();
     }
+    for i in 0..GD_FDS { GD_FD_KEY[i].store(0, Relaxed); GD_FD_N[i].store(0, Relaxed); GD_FD_KIND[i].store(0, Relaxed); }
     for i in 0..GD_SCN {
         let n = GD_SCN_N[i].swap(0, Relaxed);
         if n < 50 { continue; }
@@ -1207,6 +1208,9 @@ fn gd_tick() {
         mm::gap2::s(" nr="); gd_dec((key & 0xFFFF) as usize);
         mm::gap2::s(" n="); gd_dec(n as usize); mm::gap2::nl();
     }
+    // Keys are claimed for good; start every window with empty tables so a
+    // boot's worth of dead (pid, nr) / (tgid, fd) keys cannot fill them.
+    for i in 0..GD_SCN { GD_SCN_KEY[i].store(0, Relaxed); GD_SCN_N[i].store(0, Relaxed); }
     for i in 0..GD_SITES {
         let u = GD_SITE_USE[i].swap(0, Relaxed);
         let sp = GD_SITE_SPUR[i].swap(0, Relaxed);
@@ -1215,6 +1219,9 @@ fn gd_tick() {
         mm::gap2::s(" useful="); gd_dec(u as usize);
         mm::gap2::s(" spurious="); gd_dec(sp as usize);
         mm::gap2::s(" site="); gd_site_name(GD_SITE_KEY[i].load(Relaxed)); mm::gap2::nl();
+    }
+    for i in 0..GD_SITES {
+        GD_SITE_KEY[i].store(0, Relaxed); GD_SITE_USE[i].store(0, Relaxed); GD_SITE_SPUR[i].store(0, Relaxed);
     }
 }
 
