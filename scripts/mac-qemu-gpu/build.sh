@@ -6,7 +6,8 @@
 # virglrenderer and no *-gl devices; this does not use UTM's app or binaries.
 #
 #   GL stack:  guest Mesa virgl -> virtio-gpu-gl -> virglrenderer 1.3.0
-#              (patched: eventfd stand-in, so fences retire on virgl's thread)
+#              (patched: eventfd stand-in, so fences retire on virgl's thread;
+#              integer-typed vertex inputs on GLES hosts)
 #              -> libepoxy 1.5.10 (patched: EGL on macOS) -> ANGLE libEGL/
 #              libGLESv2 (Metal backend, built here from source) -> Metal
 #   QEMU:      11.1.1 + one patch to ui/egl-helpers.c: an ANGLE EGL display
@@ -231,6 +232,10 @@ stage_virgl() {
     # eventfd stand-in (an O_RDWR FIFO) so VIRGL_RENDERER_THREAD_SYNC works:
     # fences retire from virgl's sync thread instead of QEMU's 10 ms poll
     (cd "$WORK/virglrenderer" && patch -s -p1 < "$PATCHES/virglrenderer-1.3.0-macos-eventfd.patch")
+    # type vertex inputs / fragment outputs as int where the formats are (the
+    # "VIRGL_USE_INTEGER" path) on every GLES host: ANGLE does not reinterpret
+    # a float-declared input fed integer data, so wgpu text drew one glyph
+    (cd "$WORK/virglrenderer" && patch -s -p1 < "$PATCHES/virglrenderer-1.3.0-gles-integer-attribs.patch")
     # virglrenderer's code generators want PyYAML
     [ -x "$WORK/venv/bin/python3" ] || python3 -m venv "$WORK/venv"
     "$WORK/venv/bin/pip" -q install pyyaml
