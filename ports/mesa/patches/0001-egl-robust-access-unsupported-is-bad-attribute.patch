@@ -1,0 +1,19 @@
+--- a/src/egl/main/eglcontext.c	2026-09-26 20:36:59
++++ b/src/egl/main/eglcontext.c	2026-09-26 20:37:00
+@@ -348,7 +348,15 @@
+           *     OpenGL ES extension".
+           */
+          if (val == EGL_TRUE && !disp->RobustBufferAccess) {
+-            err = EGL_BAD_MATCH;
++            /* LeandrOS: BAD_ATTRIBUTE, not the spec's BAD_MATCH. wgpu-hal
++             * (iced's GLES backend, egl.rs) asks for a robust context on
++             * every EGL 1.5 display and retries without robustness ONLY on
++             * EGL_BAD_ATTRIBUTE, so on a driver without robust buffer access
++             * (virgl on a host GL without it, e.g. ANGLE/Metal on macOS) it
++             * never gets a context at all. The request still fails; only the
++             * error code differs.
++             */
++            err = EGL_BAD_ATTRIBUTE;
+             break;
+          }
+ 

@@ -140,9 +140,8 @@ export COSMIC_DISABLE_OVERLAY_SCANOUT="${COSMIC_DISABLE_OVERLAY_SCANOUT:-1}"
 if [ -n "${COSMIC_DISABLE_DIRECT_SCANOUT:-}" ]; then
 	export COSMIC_DISABLE_DIRECT_SCANOUT
 fi
-# libcosmic/iced applets (panel, notifications, launcher, osd, app-library) must
-# use the tiny-skia CPU backend on LeandrOS.
-export ICED_BACKEND="${ICED_BACKEND:-tiny-skia}"
+# libcosmic/iced clients render with wgpu on the GPU path gpu-env chose
+# (ICED_BACKEND/WGPU_BACKEND are exported by /bin/gpu-env above).
 
 # ---- cursor (optional; embedded fallback cursor renders even with no theme) --
 export XCURSOR_THEME="${XCURSOR_THEME:-default}"
