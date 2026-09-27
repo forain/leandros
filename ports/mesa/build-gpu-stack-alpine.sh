@@ -82,7 +82,19 @@ esac
   # (the older softpipe-only sysroots never had it).
   cp -L /usr/lib/libvulkan.so.1 "$S/usr/lib/"
   cp -L /usr/lib/libzstd.so.1 "$S/usr/lib/"
+  # Alpine's prebuilt loader is built -fstack-protector. On aarch64 GCC reads
+  # the canary from the GLOBAL __stack_chk_guard (x86_64 uses %fs:0x28), which
+  # LeandrOS libc.so does not export, so the loader failed to relocate there.
+  # Ship the guard as a tiny shared object and make every prebuilt Alpine ELF
+  # we copy that references it depend on it.
+  cc -shared -fPIC -fno-stack-protector -Wl,-soname,libleandros_ssp.so.1 \
+    -o "$S/usr/lib/libleandros_ssp.so.1" /src/ssp_guard.c
   cd "$S/usr/lib"
+  for f in libvulkan.so.1 libzstd.so.1; do
+    if readelf --dyn-syms -W "$f" | awk '$7=="UND"{print $8}' | grep -qx '__stack_chk_guard'; then
+      patchelf --add-needed libleandros_ssp.so.1 "$f"; echo "ssp shim: $f"
+    fi
+  done
   for f in $(find . ../bin -type f); do
     if file "$f" | grep -q ELF; then
       patchelf --replace-needed "libc.musl-$ARCH.so.1" libc.so "$f" 2>/dev/null || true
@@ -95,12 +107,19 @@ esac
   echo "== ICD =="; ls -l libvulkan_virtio.so libvulkan.so.1
   cat "$S/usr/share/vulkan/icd.d/"virtio_icd*.json
   echo "== NEEDED (musl soname must be gone) =="
-  for f in libgallium-25.3.6.so libEGL.so.1.0.0 libGLESv2.so.2.0.0 libgbm.so.1.0.0 gbm/dri_gbm.so libvulkan_virtio.so libvulkan.so.1 libzstd.so.1; do
+  for f in libgallium-25.3.6.so libEGL.so.1.0.0 libGLESv2.so.2.0.0 libgbm.so.1.0.0 gbm/dri_gbm.so libvulkan_virtio.so libvulkan.so.1 libzstd.so.1 libleandros_ssp.so.1; do
     printf '%s: ' "$f"; readelf -d "$f" | awk '/NEEDED/{printf "%s ", $5} END{print ""}'
   done
   if readelf -d libgallium-25.3.6.so libvulkan_virtio.so libvulkan.so.1 | grep -q 'libc.musl'; then
     echo "musl soname still present"; exit 4
   fi
+  # Every shipped ELF that imports __stack_chk_guard must be able to find it.
+  for f in $(find . ../bin -type f); do
+    file "$f" | grep -q ELF || continue
+    if readelf --dyn-syms -W "$f" | awk '$7=="UND"{print $8}' | grep -qx '__stack_chk_guard'; then
+      readelf -d "$f" | grep -q 'libleandros_ssp' || { echo "unresolved __stack_chk_guard: $f"; exit 5; }
+    fi
+  done
   # Never copy anything but a finished stage: an empty $S here once made
   # `cp -a "$S/."` copy the container's whole root (with /proc) into /out.
   [ -n "$S" ] && [ "$S" != / ] && [ -f "$S/usr/lib/libgallium-25.3.6.so" ] && [ -x "$S/usr/bin/gpuprobe" ]

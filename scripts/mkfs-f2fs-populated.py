@@ -624,6 +624,10 @@ def main():
                # "libvulkan.so.1" and has no other way to find an ICD, so
                # without this the whole GL stack silently falls back.
                "libvulkan.so.1",
+               # __stack_chk_guard for Alpine's prebuilt loader (aarch64 GCC
+               # reads the global guard; LeandrOS libc.so does not export it).
+               # The stage patchelf-adds it to libvulkan.so.1's DT_NEEDED.
+               "libleandros_ssp.so.1",
                "libwayland-client.so.0", "libwayland-server.so.0",
                # libwayland-egl.so.1 is dlopen()ed at runtime by wayland-sys
                # (wayland-egl.rs egl.rs:25 tries "libwayland-egl.so.1" then
