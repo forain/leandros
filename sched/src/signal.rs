@@ -1229,8 +1229,18 @@ mod aarch64 {
     // [560 ..  568)  uc.uc_mcontext.pc
     // [568 ..  576)  uc.uc_mcontext.pstate
     // [576 .. 4672)  uc.uc_mcontext.__reserved[4096]
-    //                  → starts with null _aarch64_ctx terminator (8 zero bytes)
-    //                  → rest zeroed (no FPSIMD context in Phase 2)
+    //                  → fpsimd_context (magic FPSIMD_MAGIC, size 528:
+    //                    fpsr u32, fpcr u32, vregs[32] u128), then the
+    //                    null _aarch64_ctx terminator (8 zero bytes)
+    //
+    // The FP/SIMD record is not optional. A handler is ordinary compiled code
+    // and uses q0-q31 freely (Rust and memcpy move structs through q
+    // registers), and nothing else preserves the interrupted code's vector
+    // state across it: Linux saves it here and restores it in rt_sigreturn.
+    // Without it every handled signal (SIGCHLD, a timer signal, a tokio or
+    // signal-hook handler) could silently rewrite the interrupted thread's
+    // vector registers: a value or a struct copy that was live in q0-q31 at
+    // the moment of delivery came back as whatever the handler left there.
 
     const SIGINFO_SIZE:       usize = 128;
     const UC_OFFSET:          usize = SIGINFO_SIZE;              // 128
@@ -1242,6 +1252,19 @@ mod aarch64 {
     const PSTATE_OFFSET:      usize = PC_OFFSET + 8;             // 568
     const RESERVED_OFFSET:    usize = PSTATE_OFFSET + 8;         // 576
     pub const SIGFRAME_SIZE:  usize = RESERVED_OFFSET + 4096;    // 4672
+
+    /// `struct fpsimd_context` (arch/arm64/include/uapi/asm/sigcontext.h).
+    const FPSIMD_MAGIC: u32 = 0x4650_8001;
+    const FPSIMD_SIZE:  usize = 528;
+
+    #[repr(C, align(16))]
+    struct FpBuf([u8; 528]);
+
+    extern "C" {
+        /// q0-q31 at +0, fpsr at +512, fpcr at +516 (sched/src/context.rs).
+        fn fpsimd_save_live(buf: *mut u8);
+        fn fpsimd_load_live(buf: *const u8);
+    }
 
     // Offsets within siginfo: see `super::si_off`, shared with x86-64.
     const SI_OFFSET: usize = 0;
@@ -1305,6 +1328,21 @@ mod aarch64 {
         buf[PSTATE_OFFSET..PSTATE_OFFSET + 8]
             .copy_from_slice(&user_frame.spsr_el1.to_le_bytes());
 
+        // uc_mcontext.__reserved: the interrupted thread's FP/SIMD state as an
+        // fpsimd_context record (the live registers are the user's: the
+        // kernel is softfloat, and a switch away and back restores them).
+        {
+            let mut fp = FpBuf([0u8; 528]);
+            unsafe { fpsimd_save_live(fp.0.as_mut_ptr()); }
+            let o = RESERVED_OFFSET;
+            buf[o..o + 4].copy_from_slice(&FPSIMD_MAGIC.to_le_bytes());
+            buf[o + 4..o + 8].copy_from_slice(&(FPSIMD_SIZE as u32).to_le_bytes());
+            buf[o + 8..o + 12].copy_from_slice(&fp.0[512..516]);   // fpsr
+            buf[o + 12..o + 16].copy_from_slice(&fp.0[516..520]);  // fpcr
+            buf[o + 16..o + 16 + 512].copy_from_slice(&fp.0[..512]);
+            // The terminating null _aarch64_ctx at o + 528 is already zero.
+        }
+
         // Prefault any lazy stack pages and write via TGID leader's address
         // space.  write_user_buf translates each page through the HHDM and
         // handles non-contiguous physical pages, so no physical-contiguity
@@ -1366,6 +1404,24 @@ mod aarch64 {
         let saved_pstate = u64::from_le_bytes(buf[PSTATE_OFFSET..PSTATE_OFFSET+8].try_into().unwrap());
         user_frame.spsr_el1 = saved_pstate & SPSR_NZCV_MASK;
 
+        // FP/SIMD state from the fpsimd_context record written at delivery,
+        // straight into the live registers: nothing between here and the
+        // eret touches them, and a context switch in between saves exactly
+        // these values. A frame without the record (a handler that rewrote
+        // __reserved) leaves the handler's registers in place.
+        {
+            let o = RESERVED_OFFSET;
+            let magic = u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+            let size  = u32::from_le_bytes(buf[o + 4..o + 8].try_into().unwrap()) as usize;
+            if magic == FPSIMD_MAGIC && size == FPSIMD_SIZE {
+                let mut fp = FpBuf([0u8; 528]);
+                fp.0[..512].copy_from_slice(&buf[o + 16..o + 16 + 512]);
+                fp.0[512..516].copy_from_slice(&buf[o + 8..o + 12]);
+                fp.0[516..520].copy_from_slice(&buf[o + 12..o + 16]);
+                unsafe { fpsimd_load_live(fp.0.as_ptr()); }
+            }
+        }
+
         // Restore the pre-handler signal mask from uc_sigmask.
         let saved_mask =
             u64::from_le_bytes(buf[SIGMASK_OFFSET..SIGMASK_OFFSET+8].try_into().unwrap());
@@ -1397,7 +1453,7 @@ mod x86_64 {
     // [ 16 ..  24)  uc.uc_link
     // [ 24 ..  48)  uc.uc_stack                (stack_t: sp, flags, pad, size)
     // [ 48 .. 232)  uc.uc_mcontext.gregs[23]    (REG_R8 .. REG_CR2, 8 bytes each)
-    // [232 .. 240)  uc.uc_mcontext.fpregs       (null — no FP context in Phase 2)
+    // [232 .. 240)  uc.uc_mcontext.fpregs       (-> the FXSAVE area below)
     // [240 .. 304)  uc.uc_mcontext.__private    (8 * 8, zeroed)
     // [304 .. 312)  uc.uc_sigmask
     // [312 .. 824)  uc.__private                (512 bytes, zeroed)
@@ -1418,7 +1474,25 @@ mod x86_64 {
     // value, which would take the tail out of whatever user stack happened to
     // sit above the frame. Reserving all 128 costs 80 bytes of user stack per
     // delivery and makes the region an actual siginfo_t.
-    pub const SIGFRAME_SIZE: usize = INFO_OFFSET + 128;     // 952
+    // [952 .. 968)  pad, so the area below is 16-byte aligned in user memory
+    //               (the frame base is ≡ 8 mod 16, see prepare())
+    // [968 ..1480)  FXSAVE area (x87/MMX/SSE state of the interrupted code);
+    //               uc_mcontext.fpregs points at it, as on Linux.
+    // Saved and restored for the same reason as the AArch64 fpsimd_context:
+    // a handler uses xmm registers freely and nothing else preserves the
+    // interrupted code's copies across it.
+    const FPREGS_PTR_OFFSET: usize = MCONTEXT_OFFSET + 184; // 232
+    const FPSTATE_OFFSET:    usize = 968;
+    pub const SIGFRAME_SIZE: usize = FPSTATE_OFFSET + 512;  // 1480
+
+    #[repr(C, align(16))]
+    struct FxArea([u8; 512]);
+
+    extern "C" {
+        /// fxsave64 / fxrstor64 of the live state (sched/src/context.rs).
+        fn fpu_save_live(area: *mut u8);
+        fn fpu_load_live(area: *const u8);
+    }
 
     // gregs[] indices — Linux REG_* enum order for x86-64.
     const REG_R8: usize = 0; const REG_R9: usize = 1; const REG_R10: usize = 2; const REG_R11: usize = 3;
@@ -1551,6 +1625,16 @@ mod x86_64 {
         wreg(&mut buf, REG_EFL, user_frame.rflags);
         wreg(&mut buf, REG_CSGSFS, user_frame.cs);
 
+        // x87/SSE state of the interrupted code (the kernel is soft-float,
+        // so the live FPU state is the user thread's).
+        {
+            let mut fx = FxArea([0u8; 512]);
+            unsafe { fpu_save_live(fx.0.as_mut_ptr()); }
+            buf[FPSTATE_OFFSET..FPSTATE_OFFSET + 512].copy_from_slice(&fx.0);
+            buf[FPREGS_PTR_OFFSET..FPREGS_PTR_OFFSET + 8]
+                .copy_from_slice(&((new_sp + FPSTATE_OFFSET) as u64).to_le_bytes());
+        }
+
         // Prefault any lazy stack pages and write via TGID leader's address
         // space, exactly as the AArch64 path does — under the
         // per-address-space lock (see that path's comment).
@@ -1625,6 +1709,26 @@ mod x86_64 {
         // cs/ss are NOT restored from user-writable memory (see prepare()).
         let saved_efl = rreg(&buf, REG_EFL);
         user_frame.rflags = (saved_efl & SAFE_RFLAGS_MASK) | RFLAGS_FIXED;
+
+        // x87/SSE state from the FXSAVE area written at delivery, straight
+        // into the live FPU (nothing before the return to user touches it; a
+        // context switch in between saves exactly this). A NULL fpregs means
+        // the handler asked for no FP restore. MXCSR comes from user-writable
+        // memory and a reserved bit set there would #GP the fxrstor64 in the
+        // kernel, so it is masked with the CPU's own MXCSR_MASK first.
+        let fpregs = u64::from_le_bytes(
+            buf[FPREGS_PTR_OFFSET..FPREGS_PTR_OFFSET + 8].try_into().unwrap());
+        if fpregs != 0 {
+            let mut live = FxArea([0u8; 512]);
+            unsafe { fpu_save_live(live.0.as_mut_ptr()); }
+            let mut mask = u32::from_le_bytes(live.0[28..32].try_into().unwrap());
+            if mask == 0 { mask = 0xFFBF; }
+            let mut fx = FxArea([0u8; 512]);
+            fx.0.copy_from_slice(&buf[FPSTATE_OFFSET..FPSTATE_OFFSET + 512]);
+            let mxcsr = u32::from_le_bytes(fx.0[24..28].try_into().unwrap()) & mask;
+            fx.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+            unsafe { fpu_load_live(fx.0.as_ptr()); }
+        }
 
         // Restore the pre-handler signal mask from uc_sigmask.
         let saved_mask =
