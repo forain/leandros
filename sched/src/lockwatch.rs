@@ -352,7 +352,11 @@ pub fn name(id: u8) -> &'static str {
     NAMES[(id as usize).min(N_LOCKS - 1)]
 }
 
-pub struct TrackedMutex<T> {
+/// `ID` (optional) carries the lock id in the TYPE instead of the value, so a
+/// static whose payload is all zero stays all zero and lands in .bss rather
+/// than the kernel image (a 16 MB table in .data is 16 MB of image to load).
+/// With `ID == 0` the runtime `id` field is used, as before.
+pub struct TrackedMutex<T, const ID: u8 = 0> {
     id: u8,
     inner: spin::Mutex<T>,
 }
@@ -364,10 +368,18 @@ pub struct TrackedGuard<'a, T> {
     guard: spin::MutexGuard<'a, T>,
 }
 
-impl<T> TrackedMutex<T> {
+impl<T, const ID: u8> TrackedMutex<T, ID> {
     pub const fn new(id: u8, value: T) -> Self {
         Self { id, inner: spin::Mutex::new(value) }
     }
+
+    /// Construct with the id taken from the `ID` type parameter only.
+    pub const fn new_typed(value: T) -> Self {
+        Self { id: 0, inner: spin::Mutex::new(value) }
+    }
+
+    #[inline(always)]
+    fn lock_id(&self) -> u8 { if ID != 0 { ID } else { self.id } }
 
     #[inline]
     #[track_caller]
@@ -375,11 +387,11 @@ impl<T> TrackedMutex<T> {
         let cpu = me();
         let loc = core::panic::Location::caller();
         if let Some(guard) = self.inner.try_lock() {
-            HOLDER[self.id as usize].store(cpu as u8 + 1, Ordering::Relaxed);
-            let (site1, since) = on_acquire(self.id, loc);
-            return TrackedGuard { id: self.id, site1, since, guard };
+            HOLDER[self.lock_id() as usize].store(cpu as u8 + 1, Ordering::Relaxed);
+            let (site1, since) = on_acquire(self.lock_id(), loc);
+            return TrackedGuard { id: self.lock_id(), site1, since, guard };
         }
-        WANT[cpu].store(self.id, Ordering::Relaxed);
+        WANT[cpu].store(self.lock_id(), Ordering::Relaxed);
         let w0 = if HOLD_PROFILE { now_ns() } else { 0 };
         // Spin with try_lock rather than `inner.lock()` so a CPU waiting here
         // with IRQs masked still answers TLB-shootdown requests: the holder
@@ -392,22 +404,22 @@ impl<T> TrackedMutex<T> {
             core::hint::spin_loop();
         };
         WANT[cpu].store(0, Ordering::Relaxed);
-        HOLDER[self.id as usize].store(cpu as u8 + 1, Ordering::Relaxed);
-        let (site1, since) = on_acquire(self.id, loc);
+        HOLDER[self.lock_id() as usize].store(cpu as u8 + 1, Ordering::Relaxed);
+        let (site1, since) = on_acquire(self.lock_id(), loc);
         if HOLD_PROFILE && site1 != 0 {
             SITE_CWAITS[site1 as usize - 1].fetch_add(1, Ordering::Relaxed);
             SITE_CWAIT_NS[site1 as usize - 1].fetch_add(since.saturating_sub(w0), Ordering::Relaxed);
         }
-        TrackedGuard { id: self.id, site1, since, guard }
+        TrackedGuard { id: self.lock_id(), site1, since, guard }
     }
 
     #[inline]
     #[track_caller]
     pub fn try_lock(&self) -> Option<TrackedGuard<'_, T>> {
         let guard = self.inner.try_lock()?;
-        HOLDER[self.id as usize].store(me() as u8 + 1, Ordering::Relaxed);
-        let (site1, since) = on_acquire(self.id, core::panic::Location::caller());
-        Some(TrackedGuard { id: self.id, site1, since, guard })
+        HOLDER[self.lock_id() as usize].store(me() as u8 + 1, Ordering::Relaxed);
+        let (site1, since) = on_acquire(self.lock_id(), core::panic::Location::caller());
+        Some(TrackedGuard { id: self.lock_id(), site1, since, guard })
     }
 
     /// `try_lock` that keeps trying for up to `max_ns` before giving up.
@@ -428,12 +440,12 @@ impl<T> TrackedMutex<T> {
             core::hint::spin_loop();
             if let Some(g) = self.try_lock() {
                 let waited = now_ns().saturating_sub(t0);
-                SPIN_HITS[self.id as usize].fetch_add(1, Ordering::Relaxed);
-                SPIN_MAX_NS[self.id as usize].fetch_max(waited.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+                SPIN_HITS[self.lock_id() as usize].fetch_add(1, Ordering::Relaxed);
+                SPIN_MAX_NS[self.lock_id() as usize].fetch_max(waited.min(u32::MAX as u64) as u32, Ordering::Relaxed);
                 return Some(g);
             }
             if now_ns().saturating_sub(t0) >= max_ns {
-                SPIN_GAVE_UP[self.id as usize].fetch_add(1, Ordering::Relaxed);
+                SPIN_GAVE_UP[self.lock_id() as usize].fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         }

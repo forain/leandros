@@ -281,6 +281,20 @@ fn report_send_failed() {
 }
 
 /// `FD_TABLES` has no slot left for a new pid. `MAX_PROCS`, not RAM.
+/// One serial line per pool, the first time a GLOBAL fixed-size pool runs
+/// dry. Such a pool fails an allocation in a process that holds almost no
+/// fds, which is otherwise indistinguishable from a per-process leak.
+fn report_pool_full(name: &str, cap: usize) {
+    static REPORTED: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+    let bit = match name { "eventfd" => 1, "timerfd" => 2, "pipe" => 4, "tmpfs" => 16, "pty" => 32, _ => 8 };
+    if REPORTED.fetch_or(bit, atomic::Ordering::Relaxed) & bit != 0 { return; }
+    dbg_str("\n[VFS] global ");
+    dbg_str(name);
+    dbg_str(" pool FULL (ENFILE; tmpfs/pty: ENOSPC) at ");
+    dbg_dec(cap);
+    dbg_str(" -- a vfs fixed table, not this process's fd limit\n");
+}
+
 fn report_fd_tables_full() {
     static REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
     if REPORTED.swap(true, atomic::Ordering::Relaxed) { return; }
@@ -352,7 +366,11 @@ pub fn call_port(port_id: u32, mut msg: Message) -> Message {
 // coreutils run in /tmp exhausts 32 slots quickly and then reports ENOSPC
 // from creat/mkdir, and 64 bytes of path cannot hold a couple of nested
 // directories. Raise before assuming a tmpfs failure is a logic bug.
-const MAX_TMP_FILES: usize = 128;
+// 128 -> 512 (lane multiterm, 2026-09-27): every Wayland client holds several
+// memfds here (wl_shm pools, keymaps), and five cosmic-terms took the pool to
+// 120/128. The entry is all-zero when empty (`link_to` is biased by one), so
+// the table lands in .bss instead of the kernel image.
+const MAX_TMP_FILES: usize = 512;
 const MAX_TMP_SIZE:  usize = 32768;
 const MAX_TMP_PATH:  usize = 128;
 
@@ -386,7 +404,9 @@ struct TmpFileEntry {
     /// `st_ino` and every read/write/truncate funnel through `tmp_owner()`, so
     /// two hard links genuinely share one file rather than two copies of it.
     /// Directories are never hard-linked (link(2) returns EPERM for them), so
-    /// `link_to` is always `usize::MAX` on an `is_dir` slot.
+    /// `link_to` is always 0 on an `is_dir` slot. Stored as owner + 1 so that
+    /// 0 means "owns its own bytes" and an empty entry is all zero bytes
+    /// (keeps the pool in .bss rather than the kernel image's .data).
     link_to:  usize,
     mode:     u32, // permission bits (rwxrwxrwx), set at creation from umask
     uid:      u32, // owner, set at creation from the creating task's euid
@@ -415,7 +435,7 @@ impl TmpFileEntry {
                data: [0u8; MAX_TMP_SIZE], len: 0,
                in_use: false, is_dir: false, is_fifo: false, is_link: false,
                is_sock: false, sock_id: 0,
-               link_to: usize::MAX,
+               link_to: 0,
                mode: 0, uid: 0, gid: 0, ephemeral: false,
                xattr: [0u8; xattr::TMP_XATTR_ARENA],
                atime: (0, 0), mtime: (0, 0), ctime: (0, 0) }
@@ -1522,7 +1542,14 @@ fn pipe_ref_dec(kind: &VnodeKind) {
 // which crash-looped cosmic-panel/cosmic-greeter (calloop Ping / winit loop
 // creation). ~20 procs × ~6-8 eventfds ⇒ ~150; 256 covers that plus restart
 // overlap. Pool arrays are u64/u32 (256 × 20 B ≈ 5 KB), a cheap bump.
-const MAX_EVENTFDS: usize = 256;
+//
+// 256 -> 1024 (lane multiterm, 2026-09-27): measured on a GPU session, the
+// pool held 235 slots with an empty desktop and 254 after the first
+// cosmic-term (~17 per instance: tokio + calloop + wgpu), so the second
+// cosmic-term died at startup on calloop's Ping ("Failed to create a Ping:
+// TooManyOpenFiles") and no window ever appeared. There was no leak: slots
+// tracked live fds. 1024 x 20 B is ~20 KB.
+const MAX_EVENTFDS: usize = 1024;
 // u64::MAX = free slot sentinel.
 static EVENTFD_COUNTERS: Mutex<[u64; MAX_EVENTFDS]> = Mutex::new([u64::MAX; MAX_EVENTFDS]);
 /// Per-eventfd monotonic event counter, bumped on every write. mio registers
@@ -1695,7 +1722,15 @@ const MAX_PROCS: usize = 64;
 // of clients comfortable headroom. The fd table is a plain bound (`fd >= MAX_FDS`
 // / array index) — no fd bitmask assumes ≤64 (the u128 tmp mask is keyed by the
 // tmpfs slot, not the fd), so this is a pure sizing bump.
-const MAX_FDS:   usize = 128;
+//
+// 128 -> 256 (lane multiterm, 2026-09-27): cosmic-comp sits at ~100 VFS fds
+// with an empty desktop and gains ~8-9 per mapped client window (its per-client
+// keymap memfd, imported dmabufs, sync eventfds), so it hit 128/128 at the
+// third cosmic-term and could no longer create the pipe/eventfd it needs to
+// spawn a fourth. 256 is the ceiling this layout allows: VFS fds are
+// [0, SOCK_FD_BASE = 0x100) and socket fds start right above.
+const MAX_FDS:   usize = 256;
+const _: () = assert!(MAX_FDS <= 0x100); // net_server::SOCK_FD_BASE (no dependency on net here)
 const O_CLOEXEC: u32   = 0x8_0000;
 /// O_NONBLOCK (== EFD_NONBLOCK/TFD_NONBLOCK/SFD_NONBLOCK). Module-level so the
 /// eventfd/timerfd/signalfd creators can record it on the fd (fd_nonblock reads
@@ -2124,8 +2159,26 @@ pub fn dump_vfs_census() {
             let (mut tables, mut fds) = (0usize, 0usize);
             for tb in t.iter() { if tb.in_use { tables += 1; fds += tb.fds.iter().filter(|f| f.in_use).count(); } }
             ps(" fdtables="); pn(tables); ps(" fds="); pn(fds);
+            // Per-process detail for the heavy tables: the fixed MAX_FDS
+            // bound is per process, so a table near it is the next EMFILE.
+            ps(" heavy:");
+            for tb in t.iter() {
+                if !tb.in_use { continue; }
+                let n = tb.fds.iter().filter(|f| f.in_use).count();
+                if n < 24 { continue; }
+                let ev = tb.fds.iter().filter(|f| f.in_use && matches!(f.kind, VnodeKind::EventFd { .. })).count();
+                ps(" "); pn(tb.pid as usize); ps("="); pn(n); ps("/ev"); pn(ev);
+            }
         }
         None => ps(" fdtables=busy"),
+    }
+    match EVENTFD_COUNTERS.try_lock() {
+        Some(c) => { ps(" eventfds="); pn(c.iter().filter(|&&v| v != u64::MAX).count()); ps("/"); pn(MAX_EVENTFDS); }
+        None => ps(" eventfds=busy"),
+    }
+    match TIMERFD_REFS.try_lock() {
+        Some(r) => { ps(" timerfds="); pn(r.iter().filter(|&&v| v > 0).count()); ps("/"); pn(MAX_TIMERFDS); }
+        None => ps(" timerfds=busy"),
     }
     ps("\n");
 }
@@ -2876,14 +2929,14 @@ fn tmp_set_path(e: &mut TmpFileEntry, path: &[u8]) {
 
 /// Map a pool index to the slot that actually owns the bytes.
 fn tmp_owner(tmp: &[TmpFileEntry], idx: usize) -> usize {
-    let to = tmp[idx].link_to;
-    if to == usize::MAX || to >= tmp.len() || !tmp[to].in_use { idx } else { to }
+    let to = tmp[idx].link_to.wrapping_sub(1);
+    if tmp[idx].link_to == 0 || to >= tmp.len() || !tmp[to].in_use { idx } else { to }
 }
 
 /// Number of aliases pointing at data-owning slot `owner`.
 fn tmp_alias_count(tmp: &[TmpFileEntry], owner: usize) -> usize {
     tmp.iter().enumerate().filter(|(i, e)| {
-        *i != owner && e.in_use && e.link_to == owner
+        *i != owner && e.in_use && e.link_to == owner + 1
     }).count()
 }
 
@@ -2920,8 +2973,8 @@ fn tmp_nlink(tmp: &[TmpFileEntry], idx: usize) -> u64 {
 /// reference from under it (see `DMABUF_RELEASE`). Every caller passes the
 /// value to `dmabuf_release` after its guard has died.
 #[must_use = "the dmabuf reference must be dropped, with TMP_FILES released"]
-fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: u128) -> Option<u32> {
-    let referenced = |i: usize| i < MAX_TMP_FILES && open_fds & (1u128 << i) != 0;
+fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: TmpMask) -> Option<u32> {
+    let referenced = |i: usize| open_fds.has(i);
     let owner = tmp_owner(tmp, idx);
     if owner != idx {
         // An alias. Free it (an alias never owns a VMO — the VMO is keyed on
@@ -2989,11 +3042,23 @@ fn tmp_inflight_dec(kind: &VnodeKind) {
 }
 
 /// Bitmask of tmpfs slots held by a queued SCM_RIGHTS descriptor.
-fn tmp_inflight_mask() -> u128 {
+/// One bit per tmpfs pool slot (was a `u128`, which capped the pool at 128).
+#[derive(Clone, Copy)]
+struct TmpMask([u64; MAX_TMP_FILES / 64]);
+const _: () = assert!(MAX_TMP_FILES % 64 == 0);
+
+impl TmpMask {
+    const fn new() -> Self { Self([0; MAX_TMP_FILES / 64]) }
+    fn set(&mut self, i: usize) { if i < MAX_TMP_FILES { self.0[i / 64] |= 1u64 << (i % 64); } }
+    fn has(&self, i: usize) -> bool { i < MAX_TMP_FILES && self.0[i / 64] & (1u64 << (i % 64)) != 0 }
+    fn or(mut self, o: TmpMask) -> Self { for (a, b) in self.0.iter_mut().zip(o.0) { *a |= b; } self }
+}
+
+fn tmp_inflight_mask() -> TmpMask {
     let f = TMP_INFLIGHT.lock();
-    let mut mask: u128 = 0;
+    let mut mask = TmpMask::new();
     for (i, &n) in f.iter().enumerate() {
-        if n > 0 { mask |= 1u128 << i; }
+        if n > 0 { mask.set(i); }
     }
     mask
 }
@@ -3002,19 +3067,19 @@ fn tmp_inflight_mask() -> u128 {
 ///
 /// Lock order is the established FD_TABLES → TMP_FILES, so callers must invoke
 /// this *before* taking the TMP_FILES lock and pass the result down.
-fn tmp_open_fd_mask() -> u128 {
+fn tmp_open_fd_mask() -> TmpMask {
     let tbls = FD_TABLES.lock();
-    let mut mask: u128 = 0;
+    let mut mask = TmpMask::new();
     for t in tbls.iter().filter(|t| t.in_use) {
         for f in t.fds.iter().filter(|f| f.in_use) {
             if let VnodeKind::TmpFile { idx, .. } = f.kind {
-                if idx < MAX_TMP_FILES { mask |= 1u128 << idx; }
+                mask.set(idx);
             }
         }
     }
     // A queued SCM_RIGHTS descriptor counts as a reference too: unlinking a slot
     // that is only held in flight must mark it ephemeral, not free it.
-    mask | tmp_inflight_mask()
+    mask.or(tmp_inflight_mask())
 }
 
 // ── Symlinks ─────────────────────────────────────────────────────────────────
@@ -4050,7 +4115,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // TIOCGPTN then reports.
             match tty_server::pty::alloc() {
                 Some(pair) => VnodeKind::Pty { pair: pair as u16, is_master: true },
-                None => return err_reply(-24), // EMFILE — pool exhausted
+                // ENOSPC, as Linux's devpts answers at its pty limit.
+                None => { report_pool_full("pty", tty_server::pty::MAX_PTYS); return err_reply(-28) }
             }
         } else if let Some(n) = pts_number(lookup_path) {
             // The slave half. `slave_open` enforces the TIOCSPTLCK lock and the
@@ -4147,7 +4213,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                             tmp_init_created(&mut tmp[..], idx, path, m, um, false);
                             VnodeKind::TmpFile { idx, pos: 0, writable: true }
                         }
-                        None => return err_reply(-28), // ENOSPC
+                        None => { drop(tmp); report_pool_full("tmpfs", MAX_TMP_FILES); return err_reply(-28) } // ENOSPC: tmpfs full
                     }
                 }
                 None => return err_reply(-2), // ENOENT
@@ -5150,7 +5216,7 @@ fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize, flags: u32) -> Message 
                 found = Some(i); break;
             }
         }
-        let i = match found { Some(i) => i, None => return err_reply(-23) };
+        let i = match found { Some(i) => i, None => { drop(rings); report_pool_full("pipe", MAX_PIPES); return err_reply(-23) } };
         rings[i].readers = 1;
         rings[i].writers = 1;
         i
@@ -6438,7 +6504,11 @@ fn handle_eventfd(pid: u32, initval: u64, flags: u32) -> Message {
     let stored = flags & (O_NONBLOCK_FL | O_CLOEXEC);
     let mut counters = EVENTFD_COUNTERS.lock();
     let slot = match counters.iter().position(|&v| v == u64::MAX) {
-        Some(s) => s, None => return err_reply(-24),
+        Some(s) => s,
+        // The pool is system-wide, so its exhaustion is ENFILE ("file table
+        // overflow"), not the caller's own EMFILE -- a fresh process holding
+        // a handful of fds must not be told *it* has too many.
+        None => { drop(counters); report_pool_full("eventfd", MAX_EVENTFDS); return err_reply(-23); }
     };
     counters[slot] = if initval == u64::MAX { u64::MAX - 1 } else { initval };
     drop(counters);
@@ -6524,7 +6594,8 @@ fn handle_timerfd_create(pid: u32, flags: u32, clockid: u32) -> Message {
     let stored = flags & (O_NONBLOCK_FL | O_CLOEXEC);
     let mut pool = TIMERFD_POOL.lock();
     let slot = match pool.iter().position(|e| e.is_free()) {
-        Some(s) => s, None => return err_reply(-24),
+        Some(s) => s,
+        None => { drop(pool); report_pool_full("timerfd", MAX_TIMERFDS); return err_reply(-23); }
     };
     pool[slot] = TimerFdEntry::free();
     pool[slot].deadline_ns = 1;
@@ -7527,7 +7598,7 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
             // content goes through tmp_owner() to `owner`. Mode/uid/gid are
             // mirrored only so a lock-free peek at the slot isn't nonsense;
             // stat() reads them from the owner regardless.
-            tmp[idx].link_to = owner;
+            tmp[idx].link_to = owner + 1;
             tmp[idx].is_fifo = tmp[owner].is_fifo;
             tmp[idx].is_link = tmp[owner].is_link;
             tmp[idx].is_sock = tmp[owner].is_sock;
@@ -8560,9 +8631,9 @@ fn tmpfs_statfs() -> StatfsVals {
         for e in tmp.iter() {
             if !e.in_use { continue; }
             slots += 1;
-            // Aliases (link_to != MAX) carry no bytes of their own — counting
+            // Aliases (link_to != 0) carry no bytes of their own — counting
             // them would charge a hard-linked file to the volume twice.
-            if !e.is_dir && e.link_to == usize::MAX { bytes += e.len as u64; }
+            if !e.is_dir && e.link_to == 0 { bytes += e.len as u64; }
         }
         (bytes, slots)
     };
