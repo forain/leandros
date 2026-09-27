@@ -1485,8 +1485,18 @@ mod x86_64 {
     const FPSTATE_OFFSET:    usize = 968;
     pub const SIGFRAME_SIZE: usize = FPSTATE_OFFSET + 512;  // 1480
 
-    #[repr(C, align(16))]
-    struct FxArea([u8; 512]);
+    /// A 512-byte FXSAVE area. fxsave64/fxrstor64 #GP on an address that is
+    /// not 16-byte aligned, and the kernel stack's alignment is not something
+    /// to rely on (an `align(16)` local is only as aligned as the rsp the trap
+    /// entry handed to Rust), so the area is carved out of a larger buffer at
+    /// a runtime-aligned offset instead.
+    struct FxArea { raw: [u8; 512 + 16] }
+    impl FxArea {
+        fn new() -> Self { FxArea { raw: [0u8; 512 + 16] } }
+        fn off(&self) -> usize { (16 - (self.raw.as_ptr() as usize & 15)) & 15 }
+        fn bytes(&self) -> &[u8] { let o = self.off(); &self.raw[o..o + 512] }
+        fn bytes_mut(&mut self) -> &mut [u8] { let o = self.off(); &mut self.raw[o..o + 512] }
+    }
 
     extern "C" {
         /// fxsave64 / fxrstor64 of the live state (sched/src/context.rs).
@@ -1628,9 +1638,9 @@ mod x86_64 {
         // x87/SSE state of the interrupted code (the kernel is soft-float,
         // so the live FPU state is the user thread's).
         {
-            let mut fx = FxArea([0u8; 512]);
-            unsafe { fpu_save_live(fx.0.as_mut_ptr()); }
-            buf[FPSTATE_OFFSET..FPSTATE_OFFSET + 512].copy_from_slice(&fx.0);
+            let mut fx = FxArea::new();
+            unsafe { fpu_save_live(fx.bytes_mut().as_mut_ptr()); }
+            buf[FPSTATE_OFFSET..FPSTATE_OFFSET + 512].copy_from_slice(fx.bytes());
             buf[FPREGS_PTR_OFFSET..FPREGS_PTR_OFFSET + 8]
                 .copy_from_slice(&((new_sp + FPSTATE_OFFSET) as u64).to_le_bytes());
         }
@@ -1719,15 +1729,15 @@ mod x86_64 {
         let fpregs = u64::from_le_bytes(
             buf[FPREGS_PTR_OFFSET..FPREGS_PTR_OFFSET + 8].try_into().unwrap());
         if fpregs != 0 {
-            let mut live = FxArea([0u8; 512]);
-            unsafe { fpu_save_live(live.0.as_mut_ptr()); }
-            let mut mask = u32::from_le_bytes(live.0[28..32].try_into().unwrap());
+            let mut live = FxArea::new();
+            unsafe { fpu_save_live(live.bytes_mut().as_mut_ptr()); }
+            let mut mask = u32::from_le_bytes(live.bytes()[28..32].try_into().unwrap());
             if mask == 0 { mask = 0xFFBF; }
-            let mut fx = FxArea([0u8; 512]);
-            fx.0.copy_from_slice(&buf[FPSTATE_OFFSET..FPSTATE_OFFSET + 512]);
-            let mxcsr = u32::from_le_bytes(fx.0[24..28].try_into().unwrap()) & mask;
-            fx.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
-            unsafe { fpu_load_live(fx.0.as_ptr()); }
+            let mut fx = FxArea::new();
+            fx.bytes_mut().copy_from_slice(&buf[FPSTATE_OFFSET..FPSTATE_OFFSET + 512]);
+            let mxcsr = u32::from_le_bytes(fx.bytes()[24..28].try_into().unwrap()) & mask;
+            fx.bytes_mut()[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+            unsafe { fpu_load_live(fx.bytes().as_ptr()); }
         }
 
         // Restore the pre-handler signal mask from uc_sigmask.
