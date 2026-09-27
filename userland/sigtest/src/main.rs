@@ -1288,10 +1288,10 @@ unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
     let mut old_chld = zeroed_sigaction(None);
     sigaction(SIGCHLD, &zeroed_sigaction(None), &mut old_chld);
     let mut ok = true;
-    let labels: [&[u8]; 6] = [b"  futex    ", b"  nanosleep", b"  ppoll    ", b"  pselect6 ",
-                              b"  futex_bs ", b"  poll     "];
+    let labels: [&[u8]; 7] = [b"  futex    ", b"  nanosleep", b"  ppoll    ", b"  pselect6 ",
+                              b"  futex_bs ", b"  ppoll_msk", b"  poll     "];
     // poll(2) (nr 7) exists on x86_64 only.
-    let kinds = if cfg!(target_arch = "x86_64") { 6 } else { 5 };
+    let kinds = if cfg!(target_arch = "x86_64") { 7 } else { 6 };
     for &(stop_ms, cont_ms, lo, hi) in &[(150i32, 250i32, 480i64, 680i64), (300, 700, 680, 950)] {
         for which in 0..kinds {
             // The waiter is a forked child that the parent stops: stopping
@@ -1318,6 +1318,16 @@ unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
                         syscall(nr::FUTEX, FWORD.as_ptr() as c_long, FUTEX_WAIT_BITSET | FUTEX_PRIVATE,
                                 7 as c_long, &abs as *const timespec as c_long, 0 as c_long,
                                 FUTEX_BITSET_MATCH_ANY as c_long)
+                    }
+                    5 => {
+                        // With a temporary mask (SIGUSR2 added): the restart
+                        // after the continue must reinstall it, and the
+                        // caller's mask must be back afterwards.
+                        let before = cur_mask();
+                        let temp = before | sbit(SIGUSR2);
+                        let r = syscall(nr::PPOLL, 0 as c_long, 0 as c_long, &ts as *const timespec as c_long,
+                                        &temp as *const sigset_t as c_long, 8 as c_long);
+                        if cur_mask() != before { -7777 } else { r }
                     }
                     _ => poll_ms(500),
                 };

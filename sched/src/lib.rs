@@ -1315,8 +1315,8 @@ pub fn shared_pending_signals() -> u64 {
     rq.find_pid(tgid).map(|l| l.shared_signal_pending).unwrap_or(0)
 }
 
-/// Park `sigsuspend(2)`'s caller mask for the delivery pass on this syscall's
-/// return (see `Task::saved_sigmask`).
+/// Park `sigsuspend(2)`'s — or an interrupted ppoll/pselect6's — caller mask
+/// for the delivery pass on this syscall's return (see `Task::saved_sigmask`).
 pub fn stash_sigsuspend_mask(old_mask: u64) {
     let pid = current_pid();
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
@@ -1325,7 +1325,7 @@ pub fn stash_sigsuspend_mask(old_mask: u64) {
 }
 
 /// Store the calling thread's `restart_block` (see `Task::restart_block`).
-pub fn set_restart_block(block: [u64; 7]) {
+pub fn set_restart_block(block: [u64; 8]) {
     let pid = current_pid();
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
         t.restart_block = block;
@@ -1334,11 +1334,11 @@ pub fn set_restart_block(block: [u64; 7]) {
 
 /// Take (and clear) the calling thread's `restart_block`; `[0] == 0` means
 /// there is nothing to resume.
-pub fn take_restart_block() -> [u64; 7] {
+pub fn take_restart_block() -> [u64; 8] {
     let pid = current_pid();
     match RUN_QUEUE.lock().find_pid_mut(pid) {
-        Some(t) => core::mem::replace(&mut t.restart_block, [0; 7]),
-        None => [0; 7],
+        Some(t) => core::mem::replace(&mut t.restart_block, [0; 8]),
+        None => [0; 8],
     }
 }
 
