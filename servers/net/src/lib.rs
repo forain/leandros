@@ -277,61 +277,107 @@ impl UnixRing {
         Self { buf: [0u8; RING_SIZE], rpos: 0, wpos: 0, count: 0, wtotal: 0, rtotal: 0 }
     }
 
-    fn write(&mut self, data: *const u8, len: usize) -> usize {
-        let free = RING_SIZE - self.count;
-        let n = len.min(free);
-        for i in 0..n {
-            self.buf[self.wpos] = unsafe { *data.add(i) };
-            self.wpos = (self.wpos + 1) % RING_SIZE;
+    /// Append up to `len` bytes from `data` — the caller's buffer, user or
+    /// kernel memory. Callers hold UNIX_CONNS, so the copy is the
+    /// fault-tolerant one: a page fault it cannot resolve ends the copy
+    /// instead of killing the caller with the lock held (every later unix
+    /// socket operation would then spin on it forever). Only bytes actually
+    /// copied are committed. `Err(EFAULT)` when a fault stopped the copy
+    /// before its first byte.
+    fn write(&mut self, data: *const u8, len: usize) -> Result<usize, i32> {
+        let n = len.min(RING_SIZE - self.count);
+        let mut done = 0usize;
+        let mut faulted = false;
+        while done < n {
+            let chunk = (n - done).min(RING_SIZE - self.wpos);
+            let left = unsafe {
+                sched::uaccess::copy_raw(self.buf.as_mut_ptr().add(self.wpos), data.add(done), chunk)
+            };
+            let copied = chunk - left;
+            self.wpos = (self.wpos + copied) % RING_SIZE;
+            done += copied;
+            if left != 0 { faulted = true; break; }
         }
-        self.count += n;
-        self.wtotal += n as u64;
-        n
+        self.count += done;
+        self.wtotal += done as u64;
+        if faulted && done == 0 { Err(-14) } else { Ok(done) }
     }
 
-    fn read(&mut self, data: *mut u8, len: usize) -> usize {
+    /// Consume up to `len` bytes into `data` (user or kernel memory), same
+    /// fault rules as [`write`](Self::write): only bytes that reached the
+    /// caller are consumed, and `Err(EFAULT)` means none did.
+    fn read(&mut self, data: *mut u8, len: usize) -> Result<usize, i32> {
         let n = len.min(self.count);
-        for i in 0..n {
-            unsafe { *data.add(i) = self.buf[self.rpos]; }
-            self.rpos = (self.rpos + 1) % RING_SIZE;
+        let mut done = 0usize;
+        let mut faulted = false;
+        while done < n {
+            let chunk = (n - done).min(RING_SIZE - self.rpos);
+            let left = unsafe {
+                sched::uaccess::copy_raw(data.add(done), self.buf.as_ptr().add(self.rpos), chunk)
+            };
+            let copied = chunk - left;
+            self.rpos = (self.rpos + copied) % RING_SIZE;
+            done += copied;
+            if left != 0 { faulted = true; break; }
         }
-        self.count -= n;
-        self.rtotal += n as u64;
-        n
+        self.count -= done;
+        self.rtotal += done as u64;
+        if faulted && done == 0 { Err(-14) } else { Ok(done) }
     }
 
-    fn write_dgram(&mut self, data: *const u8, len: usize) -> Option<usize> {
+    /// Ring position, for undoing a datagram that faulted half-way.
+    fn mark(&self) -> (usize, usize, usize, u64, u64) {
+        (self.rpos, self.wpos, self.count, self.wtotal, self.rtotal)
+    }
+    fn reset(&mut self, m: (usize, usize, usize, u64, u64)) {
+        (self.rpos, self.wpos, self.count, self.wtotal, self.rtotal) = m;
+    }
+
+    /// Queue one datagram, whole or not at all: `Ok(None)` when it does not
+    /// fit, `Err(EFAULT)` when its bytes could not all be read.
+    fn write_dgram(&mut self, data: *const u8, len: usize) -> Result<Option<usize>, i32> {
         let free = RING_SIZE - self.count;
         if free < 4 + len {
-            return None;
+            return Ok(None);
         }
+        let m = self.mark();
         let len_bytes = (len as u32).to_le_bytes();
-        self.write(len_bytes.as_ptr(), 4);
-        self.write(data, len);
-        Some(len)
+        let _ = self.write(len_bytes.as_ptr(), 4);
+        if self.write(data, len) != Ok(len) {
+            self.reset(m);
+            return Err(-14);
+        }
+        Ok(Some(len))
     }
 
-    fn read_dgram(&mut self, data: *mut u8, len: usize) -> Option<usize> {
+    /// Dequeue one datagram (truncated to `len`): `Ok(None)` when none is
+    /// queued, `Err(EFAULT)` — datagram left queued — when it could not be
+    /// stored.
+    fn read_dgram(&mut self, data: *mut u8, len: usize) -> Result<Option<usize>, i32> {
         if self.count < 4 {
-            return None;
+            return Ok(None);
         }
+        let m = self.mark();
         let mut len_bytes = [0u8; 4];
-        self.read(len_bytes.as_mut_ptr(), 4);
+        let _ = self.read(len_bytes.as_mut_ptr(), 4);
         let dgram_len = u32::from_le_bytes(len_bytes) as usize;
-        
+
         let to_read = dgram_len.min(len);
-        self.read(data, to_read);
+        if to_read > 0 && self.read(data, to_read) != Ok(to_read) {
+            self.reset(m);
+            return Err(-14);
+        }
         if dgram_len > to_read {
             let discard = dgram_len - to_read;
             let mut discard_buf = [0u8; 128];
             let mut remaining = discard;
             while remaining > 0 {
                 let chunk = remaining.min(128);
-                self.read(discard_buf.as_mut_ptr(), chunk);
+                let _ = self.read(discard_buf.as_mut_ptr(), chunk);
                 remaining -= chunk;
             }
         }
-        Some(to_read)
+        Ok(Some(to_read))
     }
 }
 
@@ -693,9 +739,9 @@ unsafe fn write_sockaddr_in(addr_ptr: usize, addrlen_ptr: usize, endpoint: IpEnd
     if let IpAddress::Ipv4(ipv4) = endpoint.addr {
         sa[4..8].copy_from_slice(&ipv4.0); // already network order
     }
-    let cap = ((addrlen_ptr as *const u32).read_unaligned() as usize).min(sa.len());
-    core::ptr::copy_nonoverlapping(sa.as_ptr(), addr_ptr as *mut u8, cap);
-    (addrlen_ptr as *mut u32).write_unaligned(sa.len() as u32);
+    let cap = match sched::uaccess::read_user::<u32>(addrlen_ptr) { Some(c) => c as usize, None => return };
+    ucopy_out(addr_ptr, &sa[..cap.min(sa.len())]);
+    wr_user(addrlen_ptr, sa.len() as u32);
 }
 
 /// Add a fresh listening TCP socket for `port` to one stack. `None` when that
@@ -1327,7 +1373,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     if addrlen < 2 { return err_reply(-22); }
 
-    let sa_family = unsafe { (addr_ptr as *const u16).read_unaligned() } as usize;
+    let sa_family = match sched::uaccess::read_user::<u16>(addr_ptr) { Some(f) => f as usize, None => return err_reply(-14) };
 
     match sa_family {
         AF_INET => {
@@ -1335,9 +1381,9 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
             // sockaddr_in is read out of user memory here, before any lock is
             // taken: a demand-paging fault under SOCK_TABLES would re-enter the
             // scheduler with a server lock held.
-            let port_be = unsafe { ((addr_ptr + 2) as *const u16).read_unaligned() };
+            let port_be = match sched::uaccess::read_user::<u16>(addr_ptr + 2) { Some(v) => v, None => return err_reply(-14) };
             let port = u16::from_be(port_be);
-            let sin_addr = unsafe { ((addr_ptr + 4) as *const u32).read_unaligned() };
+            let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
             let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
 
             // An address no interface owns is EADDRNOTAVAIL on Linux. INADDR_ANY
@@ -1415,7 +1461,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
             // Copy sun_path out of user memory into a kernel buffer up front —
             // no user dereference happens under any lock or inside the VFS.
             let mut pbytes = [0u8; PATH_MAX];
-            unsafe { core::ptr::copy_nonoverlapping(path_ptr, pbytes.as_mut_ptr(), path_len); }
+            if !ucopy_in(&mut pbytes[..path_len], path_ptr as usize) { return err_reply(-14); }
             let is_abstract = pbytes[0] == 0;
             let sock_id = alloc_sock_id();
 
@@ -1734,15 +1780,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     // AF_UNIX ("file descriptor did not correspond to a Unix socket"),
                     // so both fields must be set — previously sun_family was zeroed to
                     // AF_UNSPEC and addrlen was left untouched.
-                    if addr_ptr != 0 {
-                        unsafe {
-                            core::ptr::write_bytes(addr_ptr as *mut u8, 0, 2);
-                            core::ptr::write(addr_ptr as *mut u16, AF_UNIX as u16);
-                        }
-                    }
-                    if addrlen_ptr != 0 {
-                        unsafe { *(addrlen_ptr as *mut u32) = 2; }
-                    }
+                    put_sockaddr_unnamed(addr_ptr, addrlen_ptr, AF_UNIX as u16);
                     dbg("[NET] accept pid="); dbg_u(pid as u64);
                     dbg(" sid="); dbg_u(listen_sock_id);
                     dbg(" conn="); dbg_u(conn_idx as u64);
@@ -1776,13 +1814,13 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     if addrlen < 2 { return err_reply(-22); }
 
-    let sa_family = unsafe { (addr_ptr as *const u16).read_unaligned() } as usize;
+    let sa_family = match sched::uaccess::read_user::<u16>(addr_ptr) { Some(f) => f as usize, None => return err_reply(-14) };
 
     if sa_family == AF_INET {
         if addrlen < 8 { return err_reply(-22); }
-        let port_be  = unsafe { ((addr_ptr + 2) as *const u16).read_unaligned() };
+        let port_be  = match sched::uaccess::read_user::<u16>(addr_ptr + 2) { Some(v) => v, None => return err_reply(-14) };
         let port     = u16::from_be(port_be);
-        let sin_addr = unsafe { ((addr_ptr + 4) as *const u32).read_unaligned() };
+        let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
 
         let remote_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
         let remote_endpoint = IpEndpoint::new(remote_ip, port);
@@ -1863,7 +1901,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         let path_len = addrlen - 2;
         let path_ptr = (addr_ptr + 2) as *const u8;
         let mut pbytes = [0u8; PATH_MAX];
-        unsafe { core::ptr::copy_nonoverlapping(path_ptr, pbytes.as_mut_ptr(), path_len); }
+        if !ucopy_in(&mut pbytes[..path_len], path_ptr as usize) { return err_reply(-14); }
         let is_abstract = pbytes[0] == 0;
 
         // Resolve the address to the sock_id of a live listener. Abstract
@@ -1971,9 +2009,14 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
         cloexec, nonblock, reuseaddr: false,
     };
-    unsafe {
-        core::ptr::write(sv_ptr as *mut u32, (slot_a + SOCK_FD_BASE) as u32);
-        core::ptr::write((sv_ptr + 4) as *mut u32, (slot_b + SOCK_FD_BASE) as u32);
+    drop(tbls);
+    // sv[] is written with no lock held (a fault under SOCK_TABLES would
+    // stall every socket call behind it), and fault-tolerantly.
+    let sv = [(slot_a + SOCK_FD_BASE) as u32, (slot_b + SOCK_FD_BASE) as u32];
+    if !wr_user(sv_ptr, sv) {
+        let _ = handle_close(pid, slot_a + SOCK_FD_BASE);
+        let _ = handle_close(pid, slot_b + SOCK_FD_BASE);
+        return err_reply(-14);
     }
     ok_reply()
 }
@@ -1992,6 +2035,10 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
     match state {
         SockState::UnixConnected { conn_idx, is_a } => {
             drop(tbls);
+            // Fault the source in before UNIX_CONNS is taken (a file-backed
+            // page is read with no lock held); the ring copy under the lock
+            // is fault-tolerant for whatever this could not populate.
+            sched::uaccess::prefault(buf_ptr, len.min(RING_SIZE), true);
             let mut conns = UNIX_CONNS.lock();
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return err_reply(-32); }
@@ -2005,7 +2052,7 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // whole defect (the first send after the peer's OwnedWriteHalf
             // dropped got EPIPE instead of going through).
             if conn.wr_shut(is_a) || conn.rd_shut(!is_a) { return err_reply(-32); } // EPIPE
-            let n = if sock_type == SOCK_STREAM as u8 {
+            let r = if sock_type == SOCK_STREAM as u8 {
                 if is_a {
                     conn.ring_ab.write(buf_ptr as *const u8, len)
                 } else {
@@ -2013,11 +2060,12 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                 }
             } else {
                 if is_a {
-                    conn.ring_ab.write_dgram(buf_ptr as *const u8, len).unwrap_or(0)
+                    conn.ring_ab.write_dgram(buf_ptr as *const u8, len).map(|o| o.unwrap_or(0))
                 } else {
-                    conn.ring_ba.write_dgram(buf_ptr as *const u8, len).unwrap_or(0)
+                    conn.ring_ba.write_dgram(buf_ptr as *const u8, len).map(|o| o.unwrap_or(0))
                 }
             };
+            let n = match r { Ok(n) => n, Err(e) => return err_reply(e) }; // EFAULT
             // New readable edge for the peer end.
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns); // release UNIX_CONNS before waking pollers (K2 lock order)
@@ -2040,6 +2088,7 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // (which preserves conn_idx + ring_ab). Stream only — connect()/accept
             // are stream, so no dgram path here.
             drop(tbls);
+            sched::uaccess::prefault(buf_ptr, len.min(RING_SIZE), true);
             let mut conns = UNIX_CONNS.lock();
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return err_reply(-32); } // EPIPE — conn torn down
@@ -2047,7 +2096,10 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // Pre-accept the connector is end A, so its own half-close counts
             // here too (accept preserves conn_idx, so the flag carries over).
             if conn.wr_shut(true) { return err_reply(-32); } // EPIPE
-            let n = conn.ring_ab.write(buf_ptr as *const u8, len);
+            let n = match conn.ring_ab.write(buf_ptr as *const u8, len) {
+                Ok(n) => n,
+                Err(e) => return err_reply(e), // EFAULT
+            };
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns);
             if n > 0 { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
@@ -2067,11 +2119,7 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // in, and sys_sendto only validates the range, so a first-touch .rodata
             // send buffer would spuriously EFAULT. Same idiom as the ICMP arm below.
             let mut data = alloc::vec![0u8; len];
-            if len > 0 {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(buf_ptr as *const u8, data.as_mut_ptr(), len);
-                }
-            }
+            if len > 0 && !ucopy_in(&mut data, buf_ptr) { return err_reply(-14); }
             // Destination sockaddr, likewise read before locking. Datagram-only:
             // the stream path never dereferenced `addr_ptr` and sys_sendto does not
             // validate it, so it must stay untouched there. Kept as an Option so the
@@ -2079,9 +2127,9 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             let dest = if sock_type == SOCK_STREAM as u8 {
                 None
             } else if addr_ptr != 0 && addrlen >= 8 {
-                let port_be = unsafe { ((addr_ptr + 2) as *const u16).read_unaligned() };
+                let port_be = match sched::uaccess::read_user::<u16>(addr_ptr + 2) { Some(v) => v, None => return err_reply(-14) };
                 let port = u16::from_be(port_be);
-                let sin_addr = unsafe { ((addr_ptr + 4) as *const u32).read_unaligned() };
+                let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
                 let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
                 Some(IpEndpoint::new(ip, port))
             } else {
@@ -2117,16 +2165,14 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
         SockState::IcmpUnbound => {
             if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); }
             if len < 8 { return err_reply(-22); }
-            let sin_addr = unsafe { ((addr_ptr + 4) as *const u32).read_unaligned() };
+            let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
             let dest_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
             // Bind smoltcp's filter to whatever ident the caller already put in its
             // own ICMP header (bytes 4..6), rather than picking one ourselves and
             // having no way to tell the caller — see plan for why.
-            let ident = u16::from_be_bytes(unsafe {
-                [*(buf_ptr as *const u8).add(4), *(buf_ptr as *const u8).add(5)]
-            });
             let mut data = alloc::vec![0u8; len];
-            unsafe { core::ptr::copy_nonoverlapping(buf_ptr as *const u8, data.as_mut_ptr(), len); }
+            if !ucopy_in(&mut data, buf_ptr) { return err_reply(-14); }
+            let ident = u16::from_be_bytes([data[4], data[5]]);
             drop(tbls);
 
             let mut stack = NET_STACK.lock();
@@ -2154,10 +2200,10 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
         }
         SockState::IcmpBound { socket_handle } => {
             if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); }
-            let sin_addr = unsafe { ((addr_ptr + 4) as *const u32).read_unaligned() };
+            let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
             let dest_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
             let mut data = alloc::vec![0u8; len];
-            unsafe { core::ptr::copy_nonoverlapping(buf_ptr as *const u8, data.as_mut_ptr(), len); }
+            if !ucopy_in(&mut data, buf_ptr) { return err_reply(-14); }
             drop(tbls);
 
             let mut stack = NET_STACK.lock();
@@ -2188,13 +2234,16 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
 
     match state {
         SockState::UnixConnected { conn_idx, is_a } => {
+            // Destination faulted in (and unshared from copy-on-write) before
+            // UNIX_CONNS is taken; see handle_send.
+            sched::uaccess::prefault(buf_ptr, len.min(RING_SIZE), false);
             let mut conns = UNIX_CONNS.lock();
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return val_reply(0); }
             // Our own read direction retired (shutdown(fd, SHUT_RD)): EOF at
             // once, queued bytes included — Linux discards them.
             if conn.rd_shut(is_a) { return val_reply(0); }
-            let n = if sock_type == SOCK_STREAM as u8 {
+            let r = if sock_type == SOCK_STREAM as u8 {
                 if is_a {
                     conn.ring_ba.read(buf_ptr as *mut u8, len)
                 } else {
@@ -2202,11 +2251,12 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                 }
             } else {
                 if is_a {
-                    conn.ring_ba.read_dgram(buf_ptr as *mut u8, len).unwrap_or(0)
+                    conn.ring_ba.read_dgram(buf_ptr as *mut u8, len).map(|o| o.unwrap_or(0))
                 } else {
-                    conn.ring_ab.read_dgram(buf_ptr as *mut u8, len).unwrap_or(0)
+                    conn.ring_ab.read_dgram(buf_ptr as *mut u8, len).map(|o| o.unwrap_or(0))
                 }
             };
+            let n = match r { Ok(n) => n, Err(e) => return err_reply(e) }; // EFAULT
             // POSIX stream semantics: 0 bytes means EOF, and EOF only exists
             // once the peer will never write again. An empty ring with a live
             // peer is EAGAIN — returning 0 here made tokio's signal driver see
@@ -2227,11 +2277,15 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // Connector (end A) before the peer accept()s: reads its inbound
             // direction (ring_ba), which stays empty until the peer accepts and
             // replies. Empty + peer-not-closed is EAGAIN, never a spurious EOF.
+            sched::uaccess::prefault(buf_ptr, len.min(RING_SIZE), false);
             let mut conns = UNIX_CONNS.lock();
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return val_reply(0); }
             if conn.rd_shut(true) { return val_reply(0); } // own read half retired
-            let n = conn.ring_ba.read(buf_ptr as *mut u8, len);
+            let n = match conn.ring_ba.read(buf_ptr as *mut u8, len) {
+                Ok(n) => n,
+                Err(e) => return err_reply(e), // EFAULT
+            };
             if n == 0 && len > 0 && !conn.closed_b { return err_reply(-11); } // EAGAIN
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns);
@@ -2252,9 +2306,9 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                     let mut data = alloc::vec![0u8; len];
                     match socket.recv_slice(&mut data) {
                         Ok(n) => {
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, n);
-                            }
+                            // Out to the caller with the stack lock released.
+                            drop(stack);
+                            if !ucopy_out(buf_ptr, &data[..n]) { return err_reply(-14); }
                             val_reply(n as u64)
                         }
                         Err(_) => err_reply(-104),
@@ -2267,23 +2321,15 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                     let mut data = alloc::vec![0u8; len];
                     match socket.recv_slice(&mut data) {
                         Ok((n, endpoint)) => {
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, n);
-                            }
+                            // Out to the caller with the stack lock released.
+                            drop(stack);
+                            if !ucopy_out(buf_ptr, &data[..n]) { return err_reply(-14); }
                             if addr_ptr != 0 && addrlen_ptr != 0 {
-                                let max_len = unsafe { *(addrlen_ptr as *mut u32) } as usize;
-                                if max_len >= 8 {
-                                    unsafe {
-                                        core::ptr::write_bytes(addr_ptr as *mut u8, 0, max_len);
-                                        core::ptr::write(addr_ptr as *mut u16, AF_INET as u16);
-                                        let port_be = endpoint.endpoint.port.to_be();
-                                        core::ptr::write((addr_ptr + 2) as *mut u16, port_be);
-                                        if let IpAddress::Ipv4(ipv4) = endpoint.endpoint.addr {
-                                            core::ptr::write((addr_ptr + 4) as *mut u32, u32::from_ne_bytes(ipv4.0));
-                                        }
-                                        *(addrlen_ptr as *mut u32) = 16;
-                                    }
-                                }
+                                let ip = match endpoint.endpoint.addr {
+                                    IpAddress::Ipv4(v) => Some(v.0),
+                                    #[allow(unreachable_patterns)] _ => None,
+                                };
+                                put_sockaddr_in(addr_ptr, addrlen_ptr, ip, endpoint.endpoint.port);
                             }
                             val_reply(n as u64)
                         }
@@ -2303,19 +2349,17 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             match socket.recv() {
                 Ok((payload, from_addr)) => {
                     let n = len.min(payload.len());
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(payload.as_ptr(), buf_ptr as *mut u8, n);
-                    }
+                    // Out to the caller with NET_STACK released.
+                    let data: alloc::vec::Vec<u8> = payload[..n].to_vec();
+                    drop(stack);
+                    if !ucopy_out(buf_ptr, &data) { return err_reply(-14); }
                     if addr_ptr != 0 && addrlen_ptr != 0 {
-                        unsafe {
-                            core::ptr::write_bytes(addr_ptr as *mut u8, 0, 16);
-                            core::ptr::write(addr_ptr as *mut u16, AF_INET as u16);
-                            core::ptr::write((addr_ptr + 2) as *mut u16, 0u16); // ICMP has no port
-                            if let IpAddress::Ipv4(ipv4) = from_addr {
-                                core::ptr::write((addr_ptr + 4) as *mut u32, u32::from_ne_bytes(ipv4.0));
-                            }
-                            *(addrlen_ptr as *mut u32) = 16;
-                        }
+                        let mut sa = [0u8; 16];
+                        sa[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes()); // ICMP has no port
+                        #[allow(irrefutable_let_patterns)]
+                        if let IpAddress::Ipv4(ipv4) = from_addr { sa[4..8].copy_from_slice(&ipv4.0); }
+                        ucopy_out(addr_ptr, &sa);
+                        wr_user(addrlen_ptr, 16u32);
                     }
                     val_reply(n as u64)
                 }
@@ -2349,7 +2393,47 @@ fn unix_stream_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
 }
 
 #[inline]
-unsafe fn rd_usize(p: usize) -> usize { core::ptr::read_unaligned(p as *const usize) }
+/// Read a user word (msghdr / iovec / cmsghdr field); EFAULT on a bad
+/// pointer instead of a kernel fault that kills the caller.
+fn rd_usize(p: usize) -> Result<usize, i32> {
+    sched::uaccess::read_user::<usize>(p).ok_or(-14)
+}
+
+/// `rd_usize` for a handler returning a reply: `?`-style early EFAULT.
+macro_rules! rd_or_efault {
+    ($p:expr) => { match rd_usize($p) { Ok(v) => v, Err(e) => return err_reply(e) } };
+}
+
+/// Store to user memory that only reports failure (the result was already
+/// produced; a bad pointer here leaves the caller's field unwritten).
+fn wr_user<T: Copy>(p: usize, v: T) -> bool { sched::uaccess::write_user(p, v) }
+
+/// Fault-tolerant copy of a caller buffer (user, or a kernel buffer from an
+/// in-kernel caller) into `dst`; false if it could not all be read.
+fn ucopy_in(dst: &mut [u8], src: usize) -> bool {
+    unsafe { sched::uaccess::copy_raw(dst.as_mut_ptr(), src as *const u8, dst.len()) == 0 }
+}
+
+/// Fault-tolerant copy of `src` out to a caller buffer; false on a fault.
+fn ucopy_out(dst: usize, src: &[u8]) -> bool {
+    unsafe { sched::uaccess::copy_raw(dst as *mut u8, src.as_ptr(), src.len()) == 0 }
+}
+
+/// Store an AF_INET sockaddr for `ip:port` and its length (16) to the
+/// caller, honouring the capacity in `*addrlen_ptr`. Fault-tolerant.
+fn put_sockaddr_in(addr_ptr: usize, addrlen_ptr: usize, ip: Option<[u8; 4]>, port: u16) -> bool {
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    if let Some(ip) = ip { sa[4..8].copy_from_slice(&ip); }
+    let cap = match sched::uaccess::read_user::<u32>(addrlen_ptr) { Some(c) => c as usize, None => return false };
+    ucopy_out(addr_ptr, &sa[..cap.min(sa.len())]) && wr_user(addrlen_ptr, 16u32)
+}
+
+/// Store an unnamed address (family only, addrlen 2). Fault-tolerant.
+fn put_sockaddr_unnamed(addr_ptr: usize, addrlen_ptr: usize, family: u16) -> bool {
+    (addr_ptr == 0 || wr_user(addr_ptr, family)) && (addrlen_ptr == 0 || wr_user(addrlen_ptr, 2u32))
+}
 
 /// Parse SCM_RIGHTS control messages out of a user control buffer into
 /// `out` (int fds). Returns the fd count, or Err(errno) on a malformed cmsg
@@ -2359,16 +2443,16 @@ unsafe fn parse_scm_rights(ctrl_ptr: usize, ctrl_len: usize, out: &mut [i32; SCM
     let mut pos = 0usize;
     let mut nfd = 0usize;
     while pos + CMSG_HDR_LEN <= ctrl_len {
-        let cmsg_len   = rd_usize(ctrl_ptr + pos);
-        let cmsg_level = core::ptr::read_unaligned((ctrl_ptr + pos + 8) as *const i32);
-        let cmsg_type  = core::ptr::read_unaligned((ctrl_ptr + pos + 12) as *const i32);
+        let cmsg_len   = rd_usize(ctrl_ptr + pos)?;
+        let cmsg_level = sched::uaccess::read_user::<i32>(ctrl_ptr + pos + 8).ok_or(-14)?;
+        let cmsg_type  = sched::uaccess::read_user::<i32>(ctrl_ptr + pos + 12).ok_or(-14)?;
         if cmsg_len < CMSG_HDR_LEN || pos + cmsg_len > ctrl_len { return Err(-22); } // EINVAL
         if cmsg_level == SOL_SOCKET && cmsg_type == SCM_RIGHTS {
             let data_len = cmsg_len - CMSG_HDR_LEN;
             let count = data_len / 4;
             for i in 0..count {
                 if nfd >= SCM_MAX_FD { return Err(-22); } // > SCM_MAX_FD → EINVAL
-                out[nfd] = core::ptr::read_unaligned((ctrl_ptr + pos + CMSG_HDR_LEN + i * 4) as *const i32);
+                out[nfd] = sched::uaccess::read_user::<i32>(ctrl_ptr + pos + CMSG_HDR_LEN + i * 4).ok_or(-14)?;
                 nfd += 1;
             }
         }
@@ -2381,10 +2465,10 @@ unsafe fn parse_scm_rights(ctrl_ptr: usize, ctrl_len: usize, out: &mut [i32; SCM
 
 fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Message {
     if msghdr_ptr == 0 { return err_reply(-14); }
-    let iov_ptr  = unsafe { rd_usize(msghdr_ptr + 16) };
-    let iovcnt   = unsafe { rd_usize(msghdr_ptr + 24) };
-    let ctrl_ptr = unsafe { rd_usize(msghdr_ptr + 32) };
-    let ctrl_len = unsafe { rd_usize(msghdr_ptr + 40) };
+    let iov_ptr  = rd_or_efault!(msghdr_ptr + 16);
+    let iovcnt   = rd_or_efault!(msghdr_ptr + 24);
+    let ctrl_ptr = rd_or_efault!(msghdr_ptr + 32);
+    let ctrl_len = rd_or_efault!(msghdr_ptr + 40);
 
     let unix_end = unix_stream_end(pid, fd);
 
@@ -2404,8 +2488,8 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
         let mut total = 0isize;
         for i in 0..iovcnt.min(16) {
             let iov  = iov_ptr + i * 16;
-            let base = unsafe { rd_usize(iov) };
-            let len  = unsafe { rd_usize(iov + 8) };
+            let base = rd_or_efault!(iov);
+            let len  = rd_or_efault!(iov + 8);
             let n = net_val(&handle_send(pid, fd, base, len, 0, 0));
             if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
             total += n;
@@ -2430,8 +2514,20 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     let mut requested = 0usize;
     for i in 0..n_iov {
         let iov = iov_ptr + i * 16;
-        iovs[i] = (unsafe { rd_usize(iov) }, unsafe { rd_usize(iov + 8) });
+        iovs[i] = match (rd_usize(iov), rd_usize(iov + 8)) {
+            (Ok(b), Ok(l)) => (b, l),
+            _ => { for tf in batch { xfer_drop(tf); } return err_reply(-14); }
+        };
         requested += iovs[i].1;
+    }
+    // Source bytes faulted in before UNIX_CONNS is taken (see handle_send).
+    {
+        let mut budget = RING_SIZE;
+        for &(base, len) in iovs[..n_iov].iter() {
+            if budget == 0 { break; }
+            sched::uaccess::prefault(base, len.min(budget), true);
+            budget -= len.min(budget);
+        }
     }
     // A stream sendmsg needs at least one data byte to carry the fds; with none
     // requested there is no byte to ride and no EAGAIN retry could ever place
@@ -2478,15 +2574,22 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     }
     let seq = if is_a { conn.ring_ab.wtotal } else { conn.ring_ba.wtotal };
     let mut total = 0usize;
+    let mut fault = false;
     for i in 0..n_iov {
         let (base, len) = iovs[i];
-        let n = if is_a {
+        let r = if is_a {
             conn.ring_ab.write(base as *const u8, len)
         } else {
             conn.ring_ba.write(base as *const u8, len)
         };
+        let n = match r { Ok(n) => n, Err(_) => { fault = true; break; } };
         total += n;
-        if n < len { break; } // ring full → partial write
+        if n < len { break; } // ring full (or a fault mid-buffer) → partial write
+    }
+    if total == 0 && fault {
+        drop(conns);
+        for tf in batch { xfer_drop(tf); }
+        return err_reply(-14); // EFAULT
     }
     if total == 0 {
         // Couldn't place even the first byte; the blocking wrapper will retry.
@@ -2511,16 +2614,16 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
 /// msghdr. Always called on the recvmsg success path — msg_flags must be set
 /// even when it is 0.
 unsafe fn write_msg_tail(msghdr_ptr: usize, controllen: usize, msg_flags: i32) {
-    core::ptr::write_unaligned((msghdr_ptr + 40) as *mut usize, controllen);
-    core::ptr::write_unaligned((msghdr_ptr + 48) as *mut i32, msg_flags);
+    wr_user(msghdr_ptr + 40, controllen);
+    wr_user(msghdr_ptr + 48, msg_flags);
 }
 
 fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Message {
     if msghdr_ptr == 0 { return err_reply(-14); }
-    let iov_ptr  = unsafe { rd_usize(msghdr_ptr + 16) };
-    let iovcnt   = unsafe { rd_usize(msghdr_ptr + 24) };
-    let ctrl_ptr = unsafe { rd_usize(msghdr_ptr + 32) };
-    let ctrl_cap = unsafe { rd_usize(msghdr_ptr + 40) };
+    let iov_ptr  = rd_or_efault!(msghdr_ptr + 16);
+    let iovcnt   = rd_or_efault!(msghdr_ptr + 24);
+    let ctrl_ptr = rd_or_efault!(msghdr_ptr + 32);
+    let ctrl_cap = rd_or_efault!(msghdr_ptr + 40);
 
     let unix_end = unix_stream_end(pid, fd);
 
@@ -2531,8 +2634,8 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
             let mut total = 0isize;
             for i in 0..iovcnt.min(16) {
                 let iov  = iov_ptr + i * 16;
-                let base = unsafe { rd_usize(iov) };
-                let len  = unsafe { rd_usize(iov + 8) };
+                let base = rd_or_efault!(iov);
+                let len  = rd_or_efault!(iov + 8);
                 let n = net_val(&handle_recv(pid, fd, base, len, 0, 0));
                 if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
                 total += n;
@@ -2548,8 +2651,19 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     let mut requested = 0usize;
     for i in 0..n_iov {
         let iov = iov_ptr + i * 16;
-        iovs[i] = (unsafe { rd_usize(iov) }, unsafe { rd_usize(iov + 8) });
+        iovs[i] = (rd_or_efault!(iov), rd_or_efault!(iov + 8));
         requested += iovs[i].1;
+    }
+    // Destination bytes (and the control buffer) faulted in and unshared
+    // before UNIX_CONNS is taken (see handle_send).
+    {
+        let mut budget = RING_SIZE;
+        for &(base, len) in iovs[..n_iov].iter() {
+            if budget == 0 { break; }
+            sched::uaccess::prefault(base, len.min(budget), false);
+            budget -= len.min(budget);
+        }
+        if ctrl_ptr != 0 { sched::uaccess::prefault(ctrl_ptr, ctrl_cap.min(MAX_CONTROL), false); }
     }
     // A zero-length recv can't consume the fd-carrying byte and would spin the
     // blocking wrapper on EAGAIN forever — return 0 immediately (msg_flags set).
@@ -2579,17 +2693,23 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     };
 
     let mut nread = 0usize;
+    let mut fault = false;
     for i in 0..n_iov {
         if nread >= max_read { break; }
         let (base, len) = iovs[i];
         let want = len.min(max_read - nread);
-        let n = if is_a {
+        let r = if is_a {
             conn.ring_ba.read(base as *mut u8, want)
         } else {
             conn.ring_ab.read(base as *mut u8, want)
         };
+        let n = match r { Ok(n) => n, Err(_) => { fault = true; break; } };
         nread += n;
-        if n < want { break; } // ring drained
+        if n < want { break; } // ring drained (or a fault mid-buffer)
+    }
+    if nread == 0 && fault {
+        drop(conns);
+        return err_reply(-14); // EFAULT — nothing consumed
     }
 
     if nread == 0 {
@@ -2652,16 +2772,16 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         // failed (Linux drops the overflow).
         for j in fit..nfds { xfer_drop(fds[j]); }
         if fit > 0 {
-            unsafe {
-                let clen = CMSG_HDR_LEN + fit * 4;
-                core::ptr::write_unaligned(ctrl_ptr as *mut usize, clen);
-                core::ptr::write_unaligned((ctrl_ptr + 8) as *mut i32, SOL_SOCKET);
-                core::ptr::write_unaligned((ctrl_ptr + 12) as *mut i32, SCM_RIGHTS);
-                for k in 0..fit {
-                    core::ptr::write_unaligned((ctrl_ptr + CMSG_HDR_LEN + k * 4) as *mut i32, installed[k]);
-                }
-                ctrl_written = clen;
+            let clen = CMSG_HDR_LEN + fit * 4;
+            let mut ok = wr_user(ctrl_ptr, clen)
+                && wr_user(ctrl_ptr + 8, SOL_SOCKET)
+                && wr_user(ctrl_ptr + 12, SCM_RIGHTS);
+            for k in 0..fit {
+                ok = ok && wr_user(ctrl_ptr + CMSG_HDR_LEN + k * 4, installed[k]);
             }
+            // A control buffer that could not be written reports no cmsg
+            // (the fds are installed either way, as on Linux's EFAULT path).
+            if ok { ctrl_written = clen; } else { ctrunc = true; }
         }
     }
 
@@ -2756,10 +2876,7 @@ fn handle_getsockname(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
     let endpoint = inet_local_endpoint(pid, fd);
     match endpoint {
         Some(ep) => unsafe { write_sockaddr_in(addr_ptr, addrlen_ptr, ep); },
-        None => unsafe {
-            core::ptr::write_bytes(addr_ptr as *mut u8, 0, 2);
-            core::ptr::write(addrlen_ptr as *mut u32, 2);
-        },
+        None => if !put_sockaddr_unnamed(addr_ptr, addrlen_ptr, 0) { return err_reply(-14); },
     }
     ok_reply()
 }
@@ -2769,10 +2886,7 @@ fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
     let endpoint = inet_remote_endpoint(pid, fd);
     match endpoint {
         Some(ep) => unsafe { write_sockaddr_in(addr_ptr, addrlen_ptr, ep); },
-        None => unsafe {
-            core::ptr::write_bytes(addr_ptr as *mut u8, 0, 2);
-            core::ptr::write(addrlen_ptr as *mut u32, 2);
-        },
+        None => if !put_sockaddr_unnamed(addr_ptr, addrlen_ptr, 0) { return err_reply(-14); },
     }
     ok_reply()
 }
@@ -2796,7 +2910,7 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         // a demand-paging fault under SOCK_TABLES would re-enter the scheduler
         // with a server lock held.
         let on = optval_ptr != 0 && optlen >= 4
-            && unsafe { (optval_ptr as *const u32).read_unaligned() } != 0;
+            && sched::uaccess::read_user::<u32>(optval_ptr).unwrap_or(0) != 0;
         let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
         let mut tbls = SOCK_TABLES.lock();
         let tbl = match find_tbl(pid, &mut *tbls) {
@@ -2816,25 +2930,15 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
     if level == SOL_SOCKET as usize && optname == SO_PEERCRED {
         if optval_ptr == 0 { return err_reply(-14); }
         let cred = unix_peer_cred(pid, fd);
-        unsafe {
-            core::ptr::write_unaligned(optval_ptr as *mut u32, cred.pid);
-            core::ptr::write_unaligned((optval_ptr + 4) as *mut u32, cred.uid);
-            core::ptr::write_unaligned((optval_ptr + 8) as *mut u32, cred.gid);
-        }
-        if optlen_ptr != 0 {
-            unsafe { core::ptr::write_unaligned(optlen_ptr as *mut u32, 12); }
-        }
+        if !wr_user(optval_ptr, [cred.pid, cred.uid, cred.gid]) { return err_reply(-14); }
+        if optlen_ptr != 0 && !wr_user(optlen_ptr, 12u32) { return err_reply(-14); }
         return ok_reply();
     }
     // SO_ERROR: report "no pending error" (0). mio/tokio read this after a
     // non-blocking connect to detect completion; keep it a success.
     if level == SOL_SOCKET as usize && optname == SO_ERROR {
-        if optval_ptr != 0 {
-            unsafe { core::ptr::write(optval_ptr as *mut u32, 0); }
-        }
-        if optlen_ptr != 0 {
-            unsafe { core::ptr::write(optlen_ptr as *mut u32, 4); }
-        }
+        if optval_ptr != 0 && !wr_user(optval_ptr, 0u32) { return err_reply(-14); }
+        if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
         return ok_reply();
     }
     // Any other option is unsupported. Linux returns ENOPROTOOPT; returning a
