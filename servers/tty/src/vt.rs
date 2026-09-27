@@ -1090,17 +1090,26 @@ const MOD_ALT: u32 = 1 << 1;
 /// release-handshake watchdog remain, and matching Linux is worth more than a
 /// second escape hatch that no userspace would expect to exist.
 pub fn chord_key(code: u16, value: i32) -> bool {
-    let down = value != 0;
     let bit = match code {
         KEY_LEFTCTRL | KEY_RIGHTCTRL => MOD_CTRL,
         KEY_LEFTALT | KEY_RIGHTALT => MOD_ALT,
         _ => 0,
     };
     if bit != 0 {
-        if down {
-            CHORD_MODS.fetch_or(bit, Ordering::Relaxed);
-        } else {
-            CHORD_MODS.fetch_and(!bit, Ordering::Relaxed);
+        // Only real edges move the modifier state. value 2 is a repeat — or,
+        // far more often, a serial byte: the UART drain pushes every byte as
+        // EV_KEY with code = the byte and value 2 (arch/*/timer.rs), and
+        // 'a' (97) = KEY_RIGHTCTRL, 'd' (100) = KEY_RIGHTALT, '8' (56) =
+        // KEY_LEFTALT, 0x1d = KEY_LEFTCTRL. Counting those as presses latched
+        // Ctrl+Alt for the rest of the boot after any serial command such as
+        // `rm /etc/leandros/text-login`, so a later plain Esc was the
+        // Ctrl+Alt+Esc rescue: it revoked the compositor's scanout and put
+        // the text console on screen instead of reaching the workspaces
+        // overview (or any other client).
+        match value {
+            1 => { CHORD_MODS.fetch_or(bit, Ordering::Relaxed); }
+            0 => { CHORD_MODS.fetch_and(!bit, Ordering::Relaxed); }
+            _ => {}
         }
         return false;
     }
