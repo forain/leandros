@@ -97,8 +97,36 @@ pub fn futex_wait(uaddr: usize, expected: u32, deadline: Option<u64>) -> isize {
 }
 
 /// [`futex_wait`] with the caller's FUTEX_PRIVATE_FLAG: a private waiter can
-/// only be woken from its own thread group (see [`key_matches`]).
+/// only be woken from its own thread group (see [`key_matches`]). A release by
+/// signal is reported as a spurious wake (0); callers that restart or fail
+/// with EINTR use [`futex_wait_intr`].
 pub fn futex_wait_keyed(uaddr: usize, expected: u32, deadline: Option<u64>, private: bool) -> isize {
+    match futex_wait_intr(uaddr, expected, deadline, private) {
+        FUTEX_INTERRUPTED => 0,
+        r => r,
+    }
+}
+
+/// [`futex_wait_intr`]'s "released by a deliverable signal, no wake claimed
+/// us" result. Kernel-internal, never seen by user space: `sys_futex` turns
+/// it into -ERESTARTSYS / -ERESTARTNOHAND (the numeric value is Linux's
+/// ERESTARTSYS only for recognisability in traces).
+pub const FUTEX_INTERRUPTED: isize = -512;
+
+/// [`futex_wait_keyed`] with one authoritative wake reason:
+///
+/// * `0` — a `futex_wake`/requeue claimed this waiter (always wins, even when
+///   a signal is also pending: the wake was counted by the waker, so it must
+///   be consumed here, exactly as Linux returns 0 when `unqueue_me` finds the
+///   waiter already dequeued), or a stray release with nothing pending;
+/// * `-110` — no wake claimed it and the deadline has passed (checked before
+///   signals, as Linux does);
+/// * [`FUTEX_INTERRUPTED`] — no wake claimed it and a signal is deliverable.
+///
+/// The claim and the signal test are read in the same `FUTEX_TABLE` hold
+/// that frees the slot, so after the verdict no wake can land on this waiter
+/// any more: "woken" and "interrupted" can never both be true.
+pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, private: bool) -> isize {
     // Before any lock: the slow path of current_tgid takes RUN_QUEUE.
     let tgid = super::current_tgid();
     unsafe {
@@ -188,13 +216,13 @@ pub fn futex_wait_keyed(uaddr: usize, expected: u32, deadline: Option<u64>, priv
                 drop(rq);
                 // Un-register: we are not going to sleep after all.
                 clear_slot(&mut tbl, idx, pid);
-                // Report a spurious wake rather than -EINTR. Every futex caller
-                // re-checks its own condition in a loop and treats a spurious
-                // wake as a retry, whereas -EINTR escapes to callers that may
-                // not expect it. The retry is bounded: returning to user space
-                // runs `check_and_deliver_signals`, which delivers (or discards)
-                // the pending signal, so the next `futex_wait` parks normally.
-                return 0;
+                // Interrupted before parking. `futex_wait_keyed` reports this
+                // as a spurious wake (every futex caller re-checks its own
+                // condition), `sys_futex` as a restartable interruption. Either
+                // way the retry is bounded: returning to user space runs
+                // `check_and_deliver_signals`, which delivers the signal, so
+                // the next wait parks normally.
+                return FUTEX_INTERRUPTED;
             }
 
             if let Some(t) = rq.find_pid_mut(pid) {
@@ -234,38 +262,42 @@ pub fn futex_wait_keyed(uaddr: usize, expected: u32, deadline: Option<u64>, priv
         }
 
         // ── Woken: by futex_wake, by the deadline tick, or by signal delivery.
-        // Our own slot says which: only a wake sets `woken`.  Free it either
-        // way, so no stale waiter remains.
-        let was_woken = {
+        // Our own slot says which: only a wake sets `woken`. Free it and take
+        // the signal verdict in the same FUTEX_TABLE hold (lock order
+        // FUTEX_TABLE -> RUN_QUEUE), so a wake can no longer claim this
+        // waiter once it has been judged "interrupted": a signal-woken waiter
+        // that a FUTEX_WAKE claimed in the gap before it ran returns 0, and
+        // one that no wake claimed is out of the table before it restarts.
+        let (was_woken, signalled) = {
             let mut tbl = FUTEX_TABLE.lock();
             let claimed = match tbl[idx] {
                 Some(w) if w.pid == pid => w.woken,
                 _                       => true, // reclaimed by remove_waiter
             };
             clear_slot(&mut tbl, idx, pid);
-            claimed
-        };
-        {
             let mut rq = RUN_QUEUE.lock();
             if let Some(t) = rq.find_pid_mut(pid) {
                 t.blocked_futex = 0;
                 t.poll_deadline = u64::MAX;
             }
-        }
+            let signalled = !claimed && super::signal::has_deliverable_signal_locked(&rq, pid);
+            (claimed, signalled)
+        };
 
-        // A wake was delivered to us — never report it as a timeout, however
-        // late this task was rescheduled.
+        // A wake was delivered to us — never report it as a timeout or an
+        // interruption, however late this task was rescheduled.
         if was_woken {
             return 0;
         }
-    }
 
-    // No wake claimed this waiter: a timed one whose deadline has passed
-    // reports ETIMEDOUT, anything else is a spurious wake (signal delivery, a
-    // stray poll wake) and returns 0, since every futex caller re-checks its
-    // own condition on wake.
-    if let Some(dl) = deadline {
-        if super::monotonic_ns() >= dl { return -110; } // ETIMEDOUT
+        // No wake claimed this waiter: a timed one whose deadline has passed
+        // reports ETIMEDOUT, one released with a deliverable signal is
+        // interrupted, anything else is a spurious wake (a stray poll wake)
+        // and returns 0, since every futex caller re-checks its own condition.
+        if let Some(dl) = deadline {
+            if super::monotonic_ns() >= dl { return -110; } // ETIMEDOUT
+        }
+        if signalled { return FUTEX_INTERRUPTED; }
     }
     0
 }

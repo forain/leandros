@@ -829,11 +829,11 @@ pub extern "C" fn syscall_dispatch(
     a5: usize, frame_ptr: usize, _padding: usize,
 ) -> isize {
     let ret = dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr);
-    if ret == ERESTARTSYS {
+    if ret == ERESTARTSYS || ret == ERESTARTNOHAND {
         // Never reaches user space: the frame gets EINTR, and the signal
-        // pass that runs next rewinds to re-execute the syscall when the
-        // handler has SA_RESTART (or no handler runs).
-        sched::signal::note_syscall_restart(number, a0);
+        // pass that runs next rewinds to re-execute the syscall when no
+        // handler runs, or (ERESTARTSYS only) when the handler has SA_RESTART.
+        sched::signal::note_syscall_restart(number, a0, ret == ERESTARTSYS);
         return -4;
     }
     ret
@@ -844,6 +844,11 @@ pub extern "C" fn syscall_dispatch(
 /// (nanosleep, poll, select, epoll_wait, sigsuspend, sigtimedwait) return a
 /// plain EINTR, as on Linux, whatever SA_RESTART says.
 const ERESTARTSYS: isize = -512;
+/// Linux -ERESTARTNOHAND: restarted only when no handler runs (a stop and
+/// continue, or a signal another thread took); EINTR whenever a handler runs,
+/// SA_RESTART or not. Used by timed FUTEX_WAIT, which Linux answers with
+/// -ERESTART_RESTARTBLOCK — the same user-visible rule.
+const ERESTARTNOHAND: isize = -514;
 
 /// zink-lane instrumentation: per-syscall time census for the focus tgid
 /// (`sched::SC_FOCUS_TGID`, cosmic-comp) plus a lock-free pid -> last syscall
@@ -3441,22 +3446,25 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
                     Some(deadline_after_ns(ns))
                 }
             };
-            let r = sched::futex_wait_keyed(uaddr, val as u32, deadline, private);
-            // Linux: FUTEX_WAIT (relative timeout, or none) is interrupted by
-            // a signal via -ERESTARTSYS/restart_syscall — SA_RESTART (or no
-            // handler run) replays it transparently, otherwise EINTR — the
-            // exact SA_RESTART decision every other restartable syscall here
-            // gets from `note_syscall_restart`/`check_and_deliver_signals`.
-            // `futex_wait_keyed` cannot itself tell "a real FUTEX_WAKE claimed
-            // this waiter" apart from "released with nothing pending" once it
-            // has returned, so it reports the latter as a plain 0 (a spurious
-            // wake, by its own docs) whenever no wake and no timeout claimed
-            // the waiter; that is precisely the case a pending/just-delivered
-            // signal produces. FUTEX_WAIT_BITSET keeps the old behaviour
-            // unchanged: its deadline is already absolute, Linux does not
-            // restart it, and nothing here has reason to.
-            if r == 0 && cmd == FUTEX_WAIT && interrupted() { return ERESTARTSYS; }
-            r
+            let r = sched::futex_wait_intr(uaddr, val as u32, deadline, private);
+            if r != sched::FUTEX_INTERRUPTED { return r; }
+            // Released by a deliverable signal with no wake claimed
+            // (futex_wait_intr decides that under the same FUTEX_TABLE hold
+            // that frees the waiter, so a FUTEX_WAKE that claimed us is never
+            // turned into a restart and lost). Linux (futex_wait):
+            //   * untimed FUTEX_WAIT -> -ERESTARTSYS: SA_RESTART (or no
+            //     handler run) re-executes it transparently, else EINTR;
+            //   * timed FUTEX_WAIT -> -ERESTART_RESTARTBLOCK: EINTR whenever
+            //     a handler runs, SA_RESTART or not; restarted only when none
+            //     does (we re-arm the full relative interval there, Linux the
+            //     remainder). Measured on Linux 7.0: timed + SA_RESTART
+            //     handler -> EINTR at the signal; untimed -> restarted.
+            //     Restarting timed waits under SA_RESTART would let a periodic
+            //     signal postpone the timeout forever.
+            // FUTEX_WAIT_BITSET keeps its old behaviour (a spurious 0 wake):
+            // Rust std and relibc re-check their own deadline on any return.
+            if cmd == FUTEX_WAIT_BITSET { return 0; }
+            if deadline.is_none() { ERESTARTSYS } else { ERESTARTNOHAND }
         }
         1 => {
             // FUTEX_WAKE: wake up to `val` tasks sleeping on `uaddr`.
