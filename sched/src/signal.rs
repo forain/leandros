@@ -188,25 +188,32 @@ static RESTART_A0: [core::sync::atomic::AtomicU64; super::MAX_CPUS] =
 /// Record that the syscall being returned from on this CPU may be restarted
 /// (the dispatcher reports EINTR to the frame; see
 /// [`check_and_deliver_signals`]).
-pub fn note_syscall_restart(nr: usize, a0: usize) {
+pub fn note_syscall_restart(nr: usize, a0: usize, sa_restart_ok: bool) {
     use core::sync::atomic::Ordering::Relaxed;
     let cpu = unsafe { super::cpu_id() };
     RESTART_A0[cpu].store(a0 as u64, Relaxed);
-    RESTART_NR[cpu].store(nr as u64 + 1, Relaxed);
+    let nohand = if sa_restart_ok { 0 } else { RESTART_NOHAND };
+    RESTART_NR[cpu].store((nr as u64 + 1) | nohand, Relaxed);
 }
+
+/// Set in the `RESTART_NR` record for -ERESTARTNOHAND: restart only if no
+/// handler runs, whatever SA_RESTART says. Kept in the (restart-number) tuple
+/// as bit 63 of `nr`, stripped again before the rewind.
+const RESTART_NOHAND: u64 = 1 << 63;
 
 fn take_syscall_restart() -> Option<(u64, u64)> {
     use core::sync::atomic::Ordering::Relaxed;
     let cpu = unsafe { super::cpu_id() };
     let nr = RESTART_NR[cpu].swap(0, Relaxed);
     if nr == 0 { return None; }
-    Some((nr - 1, RESTART_A0[cpu].load(Relaxed)))
+    Some(((nr & !RESTART_NOHAND) - 1 | (nr & RESTART_NOHAND), RESTART_A0[cpu].load(Relaxed)))
 }
 
 /// Point the user frame back at the syscall instruction with its original
 /// number/first argument, so returning to user space re-executes it.
 fn rewind_syscall(frame_ptr: usize, (nr, a0): (u64, u64)) {
     if frame_ptr == 0 { return; }
+    let nr = nr & !RESTART_NOHAND;
     let f = unsafe { &mut *(frame_ptr as *mut crate::context::UserFrame) };
     #[cfg(target_arch = "x86_64")]
     { let _ = a0; f.rax = nr; f.rip -= 2; f.rcx = f.rip; } // `syscall` is 0F 05
@@ -473,7 +480,9 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
                 // snapshots the registers: SA_RESTART re-executes it after
                 // the handler returns, otherwise it reports EINTR.
                 if let Some(r) = restart.take() {
-                    if action.get_flags() & SA_RESTART != 0 { rewind_syscall(frame_ptr, r); }
+                    if action.get_flags() & SA_RESTART != 0 && r.0 & RESTART_NOHAND == 0 {
+                        rewind_syscall(frame_ptr, r);
+                    }
                 }
 
                 if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask, action.get_flags(), info) {

@@ -87,9 +87,9 @@ mod ssi {
 }
 
 #[cfg(target_arch = "x86_64")]
-mod nr { pub const SIGNALFD4: i64 = 289; pub const FUTEX: i64 = 202; }
+mod nr { pub const SIGNALFD4: i64 = 289; pub const FUTEX: i64 = 202; pub const GETTID: i64 = 186; pub const TGKILL: i64 = 234; }
 #[cfg(target_arch = "aarch64")]
-mod nr { pub const SIGNALFD4: i64 = 74; pub const FUTEX: i64 = 98; }
+mod nr { pub const SIGNALFD4: i64 = 74; pub const FUTEX: i64 = 98; pub const GETTID: i64 = 178; pub const TGKILL: i64 = 131; }
 
 pub type pthread_t = *mut c_void;
 
@@ -219,8 +219,39 @@ core::arch::global_asm!(
 );
 
 #[no_mangle]
-pub unsafe extern "C" fn sig_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0;
+
+    // `sigtest futex N`: only the futex restart checks, N stress iterations.
+    // `sigtest futexab N`: the SIGCHLD A/B diagnostic (see futex_sigchld_ab).
+    if argc >= 2 {
+        let arg = |i: isize| -> &[u8] {
+            let p = *argv.offset(i);
+            let mut n = 0;
+            while *p.add(n) != 0 { n += 1; }
+            core::slice::from_raw_parts(p, n)
+        };
+        let iters = if argc >= 3 {
+            arg(2).iter().fold(0i32, |a, &c| if c.is_ascii_digit() { a * 10 + (c - b'0') as i32 } else { a })
+        } else { 20 };
+        match arg(1) {
+            b"futex" => {
+                if !test_futex_wait_signal_restart() { failures += 1; }
+                if !test_futex_wait_restart_stress(iters) { failures += 1; }
+                if !test_futex_wake_beats_restart(iters) { failures += 1; }
+                if !test_futex_ignored_signal_keeps_waiting() { failures += 1; }
+                if !test_futex_wait_bitset_unaffected() { failures += 1; }
+                puts(b"--- sigtest futex done ---\n\0".as_ptr());
+                return failures;
+            }
+            b"futexab" => {
+                futex_sigchld_ab(iters);
+                puts(b"--- sigtest futexab done ---\n\0".as_ptr());
+                return 0;
+            }
+            _ => {}
+        }
+    }
 
     if !test_sigaction_struct_roundtrip() { failures += 1; }
     if !test_signal_delivery_and_return() { failures += 1; }
@@ -234,7 +265,9 @@ pub unsafe extern "C" fn sig_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut
     if !test_signalfd_agrees_with_handler() { failures += 1; }
     if !test_shared_handoff_keeps_payloads_apart() { failures += 1; }
     if !test_futex_wait_signal_restart() { failures += 1; }
-    if !test_futex_wait_restart_stress() { failures += 1; }
+    if !test_futex_wait_restart_stress(20) { failures += 1; }
+    if !test_futex_wake_beats_restart(20) { failures += 1; }
+    if !test_futex_ignored_signal_keeps_waiting() { failures += 1; }
     if !test_futex_wait_bitset_unaffected() { failures += 1; }
     if !test_stack_overflow_sigsegv_on_altstack() { failures += 1; }
 
@@ -911,131 +944,261 @@ static FUTEX_SIG_COUNT: AtomicI32 = AtomicI32::new(0);
 extern "C" fn futex_sig_handler(_sig: c_int) { FUTEX_SIG_COUNT.fetch_add(1, Ordering::SeqCst); }
 
 const FUTEX_WAIT:        c_long = 0;
+const FUTEX_WAKE:        c_long = 1;
 const FUTEX_WAIT_BITSET: c_long = 9;
 const FUTEX_PRIVATE:     c_long = 128;
 const FUTEX_BITSET_MATCH_ANY: u32 = !0;
 
-/// FUTEX_WAIT (relative timeout) interrupted by a signal: Linux restarts it
-/// transparently (via restart_syscall) when the handler has SA_RESTART or no
-/// handler ran, and reports EINTR otherwise — the same SA_RESTART/no-handler
-/// rule every other restartable syscall here follows. A child sends SIGALRM
-/// ~50 ms in; the futex word never changes, so no genuine FUTEX_WAKE is ever
-/// coming and the only way the wait ends is via that signal or the 300 ms
-/// timeout. Margins are wide (50 ms fire / 300 ms timeout, 220 ms window
-/// between "restarted" and "not restarted") to stay clear of scheduling
-/// jitter on a loaded host — this is a real end-to-end wait, not a tight
-/// busy-loop, and the two outcomes differ by hundreds of ms.
+/// The futex word every restart test waits on. 7 = "keep waiting".
+static FWORD: AtomicU32 = AtomicU32::new(7);
+/// Parameters for `futex_helper`, a sibling thread that signals the waiting
+/// main thread with a thread-directed tgkill (so no other thread and no
+/// child exit — no SIGCHLD — is involved) and then optionally wakes it.
+static FH_TID:      AtomicI32 = AtomicI32::new(0);
+static FH_SIG_MS:   AtomicI32 = AtomicI32::new(50);
+/// < 0: never wake. 0: FUTEX_WAKE right after the signal WITHOUT changing the
+/// word (races the signal wake). > 0: after this many more ms, set the word
+/// to 8 and FUTEX_WAKE.
+static FH_WAKE_MS:  AtomicI32 = AtomicI32::new(-1);
+/// What the racing FUTEX_WAKE (FH_WAKE_MS == 0) returned.
+static FH_WOKEN:    AtomicI32 = AtomicI32::new(0);
+/// Signal the helper sends (SIGALRM unless a test says otherwise).
+static FH_SIGNO:    AtomicI32 = AtomicI32::new(SIGALRM);
+
+unsafe fn sleep_ms(ms: i32) {
+    let ts = timespec { tv_sec: (ms / 1000) as i64, tv_nsec: (ms % 1000) as c_long * 1_000_000 };
+    nanosleep(&ts, core::ptr::null_mut());
+}
+
+unsafe fn futex_wake_word() -> c_long {
+    syscall(nr::FUTEX, FWORD.as_ptr() as c_long, FUTEX_WAKE | FUTEX_PRIVATE, 1 as c_long,
+            0 as c_long, 0 as c_long, 0 as c_long)
+}
+
+extern "C" fn futex_helper(_: *mut c_void) -> *mut c_void {
+    unsafe {
+        // Never take the signal ourselves.
+        let m: sigset_t = (1u64 << (SIGALRM - 1)) | (1u64 << (SIGCHLD - 1));
+        sigprocmask(SIG_BLOCK, &m, core::ptr::null_mut());
+        sleep_ms(FH_SIG_MS.load(Ordering::SeqCst));
+        syscall(nr::TGKILL, getpid() as c_long, FH_TID.load(Ordering::SeqCst) as c_long,
+                FH_SIGNO.load(Ordering::SeqCst) as c_long);
+        let w = FH_WAKE_MS.load(Ordering::SeqCst);
+        if w == 0 {
+            FH_WOKEN.store(futex_wake_word() as i32, Ordering::SeqCst);
+            // Whatever happened, end the wait eventually.
+            sleep_ms(300);
+            FWORD.store(8, Ordering::SeqCst);
+            futex_wake_word();
+        } else if w > 0 {
+            sleep_ms(w);
+            FWORD.store(8, Ordering::SeqCst);
+            futex_wake_word();
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// One FUTEX_WAIT on `FWORD` by the main thread with `futex_helper` running
+/// alongside. Returns (r, elapsed_ns).
+unsafe fn futex_signal_round(restart: bool, timeout_ms: i32, sig_ms: i32, wake_ms: i32) -> (c_long, i64) {
+    FUTEX_SIG_COUNT.store(0, Ordering::SeqCst);
+    let act = sigaction {
+        sa_handler: Some(futex_sig_handler),
+        sa_flags: if restart { SA_RESTART } else { 0 },
+        sa_restorer: None,
+        sa_mask: 0,
+    };
+    if sigaction(SIGALRM, &act, core::ptr::null_mut()) != 0 { return (-9999, 0); }
+    FWORD.store(7, Ordering::SeqCst);
+    FH_TID.store(syscall(nr::GETTID) as i32, Ordering::SeqCst);
+    FH_SIG_MS.store(sig_ms, Ordering::SeqCst);
+    FH_WAKE_MS.store(wake_ms, Ordering::SeqCst);
+    FH_WOKEN.store(-1, Ordering::SeqCst);
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(), futex_helper, core::ptr::null_mut()) != 0 {
+        return (-9998, 0);
+    }
+    let to = timespec { tv_sec: (timeout_ms / 1000) as i64, tv_nsec: (timeout_ms % 1000) as c_long * 1_000_000 };
+    let top = if timeout_ms > 0 { &to as *const timespec as c_long } else { 0 };
+    let t0 = now_ns();
+    let r = syscall(nr::FUTEX, FWORD.as_ptr() as c_long, FUTEX_WAIT | FUTEX_PRIVATE,
+                    7 as c_long, top, 0 as c_long, 0 as c_long);
+    let el = now_ns() - t0;
+    pthread_join(th, core::ptr::null_mut());
+    (r, el)
+}
+
+/// FUTEX_WAIT interrupted by a handled signal, Linux semantics (measured on
+/// Linux 7.0, and what kernel/futex/waitwake.c does):
+///   untimed + SA_RESTART    -> restarted transparently (-ERESTARTSYS)
+///   untimed, no SA_RESTART  -> EINTR
+///   timed, either way       -> EINTR (-ERESTART_RESTARTBLOCK: restarted only
+///                              when no handler runs)
+/// The signal is a tgkill from a sibling thread at ~50 ms; the untimed waits
+/// are ended by that thread's FUTEX_WAKE at ~300 ms.
 unsafe fn test_futex_wait_signal_restart() -> bool {
     let name = b"futex_wait_signal_restart\0";
-    let parent = getpid();
     let mut ok = true;
+    let one = |n| FUTEX_SIG_COUNT.load(Ordering::SeqCst) == n;
+
+    let (r, el) = futex_signal_round(true, 0, 50, 250);
+    let c = r == 0 && el >= 280_000_000 && one(1);
+    if !c { write(1, b"  untimed+SA_RESTART r=".as_ptr(), 23); put_i32(r as i32); write(1, b" el_us=".as_ptr(), 7); put_i32((el / 1000) as i32); write(1, b"\n".as_ptr(), 1); }
+    ok &= c;
+
+    let (r, el) = futex_signal_round(false, 0, 50, 250);
+    let c = r == -(EINTR as c_long) && el >= 30_000_000 && el < 250_000_000 && one(1);
+    if !c { write(1, b"  untimed r=".as_ptr(), 12); put_i32(r as i32); write(1, b" el_us=".as_ptr(), 7); put_i32((el / 1000) as i32); write(1, b"\n".as_ptr(), 1); }
+    ok &= c;
 
     for &restart in &[true, false] {
-        FUTEX_SIG_COUNT.store(0, Ordering::SeqCst);
-        let act = sigaction {
-            sa_handler: Some(futex_sig_handler),
-            sa_flags: if restart { SA_RESTART } else { 0 },
-            sa_restorer: None,
-            sa_mask: 0,
-        };
-        if sigaction(SIGALRM, &act, core::ptr::null_mut()) != 0 { ok = false; continue; }
-
-        let child = fork();
-        if child == 0 {
-            let fire = timespec { tv_sec: 0, tv_nsec: 50_000_000 }; // ~50 ms
-            nanosleep(&fire, core::ptr::null_mut());
-            kill(parent, SIGALRM);
-            _exit(0);
-        }
-
-        let word: u32 = 7; // never mutated: no real FUTEX_WAKE is ever coming
-        let to = timespec { tv_sec: 0, tv_nsec: 300_000_000 }; // 300 ms relative
-        let t0 = now_ns();
-        let r = syscall(nr::FUTEX, &word as *const u32 as c_long, FUTEX_WAIT | FUTEX_PRIVATE,
-                        7 as c_long, &to as *const timespec as c_long, 0 as c_long, 0 as c_long);
-        let el = now_ns() - t0;
-        reap(child);
-
-        let case_ok = if restart {
-            // Restarted transparently: the wait re-arms with the same 300 ms
-            // relative timeout (our restart mechanism replays the syscall
-            // verbatim), so it ends at ETIMEDOUT well after the ~50 ms
-            // signal, never with EINTR.
-            r == -(ETIMEDOUT as c_long) && el >= 280_000_000
-                && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 1
-        } else {
-            // No SA_RESTART: EINTR right at the signal, long before the
-            // 300 ms timeout.
-            r == -(EINTR as c_long) && el >= 30_000_000 && el < 250_000_000
-                && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 1
-        };
-        ok &= case_ok;
+        let (r, el) = futex_signal_round(restart, 1000, 50, -1);
+        let c = r == -(EINTR as c_long) && el >= 30_000_000 && el < 600_000_000 && one(1);
+        if !c { write(1, b"  timed r=".as_ptr(), 10); put_i32(r as i32); write(1, b" el_us=".as_ptr(), 7); put_i32((el / 1000) as i32); write(1, b"\n".as_ptr(), 1); }
+        ok &= c;
     }
     report(name, ok)
 }
 
-/// Stress the SA_RESTART case alone, 20×, tallying outcomes: a margin problem
-/// (scheduling jitter around the pass/fail elapsed-time thresholds) would show
-/// up as occasional EINTR *near the 30-300 ms boundary* while still being
-/// "restarted" in substance, but a genuine restart-mechanism failure shows up
-/// as EINTR at the SIGALRM's ~50 ms mark, indistinguishable from the
-/// non-restart case. Printing raw (r, el_us) per iteration makes that
-/// distinction visible instead of collapsing it into a single pass/fail.
-unsafe fn test_futex_wait_restart_stress() -> bool {
+/// Stress the transparent-restart case (untimed + SA_RESTART) `iters` times:
+/// signal at ~20 ms, genuine wake at ~100 ms. Any EINTR is a lost restart.
+unsafe fn test_futex_wait_restart_stress(iters: i32) -> bool {
     let name = b"futex_wait_restart_stress\0";
-    let parent = getpid();
-    let mut timedout = 0i32;
-    let mut eintr = 0i32;
-    let mut other = 0i32;
-
-    for i in 0..20 {
-        FUTEX_SIG_COUNT.store(0, Ordering::SeqCst);
-        let act = sigaction {
-            sa_handler: Some(futex_sig_handler),
-            sa_flags: SA_RESTART,
-            sa_restorer: None,
-            sa_mask: 0,
-        };
-        if sigaction(SIGALRM, &act, core::ptr::null_mut()) != 0 { other += 1; continue; }
-
-        let child = fork();
-        if child == 0 {
-            let fire = timespec { tv_sec: 0, tv_nsec: 50_000_000 };
-            nanosleep(&fire, core::ptr::null_mut());
-            kill(parent, SIGALRM);
-            _exit(0);
-        }
-
-        let word: u32 = 7;
-        let to = timespec { tv_sec: 0, tv_nsec: 300_000_000 };
-        let t0 = now_ns();
-        let r = syscall(nr::FUTEX, &word as *const u32 as c_long, FUTEX_WAIT | FUTEX_PRIVATE,
-                        7 as c_long, &to as *const timespec as c_long, 0 as c_long, 0 as c_long);
-        let el = now_ns() - t0;
-        reap(child);
-
-        write(1, b"  restart_stress[".as_ptr(), 18);
+    let (mut good, mut eintr, mut other) = (0i32, 0i32, 0i32);
+    for i in 0..iters {
+        let (r, el) = futex_signal_round(true, 0, 20, 80);
+        if r == 0 && el >= 90_000_000 && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 1 { good += 1; continue; }
+        if r == -(EINTR as c_long) { eintr += 1; } else { other += 1; }
+        write(1, b"  restart_stress[".as_ptr(), 17);
         put_i32(i);
         write(1, b"] r=".as_ptr(), 4);
         put_i32(r as i32);
         write(1, b" el_us=".as_ptr(), 7);
         put_i32((el / 1000) as i32);
         write(1, b"\n".as_ptr(), 1);
-
-        if r == -(ETIMEDOUT as c_long) { timedout += 1; }
-        else if r == -(EINTR as c_long) { eintr += 1; }
-        else { other += 1; }
     }
-
-    write(1, b"  restart_stress: timedout=".as_ptr(), 28);
-    put_i32(timedout);
+    write(1, b"  restart_stress: ok=".as_ptr(), 21);
+    put_i32(good);
     write(1, b" eintr=".as_ptr(), 7);
     put_i32(eintr);
     write(1, b" other=".as_ptr(), 7);
     put_i32(other);
     write(1, b"\n".as_ptr(), 1);
+    report(name, good == iters)
+}
 
-    report(name, eintr == 0 && other == 0 && timedout == 20)
+/// A FUTEX_WAKE racing the signal: when the wake reports it woke our waiter
+/// (returned 1), the waiter must return 0 promptly — the wake was consumed.
+/// Restarting it instead (the waiter being judged "interrupted" after a wake
+/// had claimed it) would put it back to sleep with the wake lost; here it
+/// would then only end at the helper's fallback wake ~300 ms later.
+unsafe fn test_futex_wake_beats_restart(iters: i32) -> bool {
+    let name = b"futex_wake_beats_restart\0";
+    let (mut claimed, mut unclaimed, mut lost, mut bad) = (0i32, 0i32, 0i32, 0i32);
+    for _ in 0..iters {
+        let (r, el) = futex_signal_round(true, 0, 10, 0);
+        let n = FH_WOKEN.load(Ordering::SeqCst);
+        if n == 1 {
+            claimed += 1;
+            if r != 0 { bad += 1; } else if el >= 200_000_000 { lost += 1; }
+        } else {
+            unclaimed += 1;
+            if r != 0 && r != -11 { bad += 1; }
+        }
+    }
+    write(1, b"  wake_race: claimed=".as_ptr(), 21);
+    put_i32(claimed);
+    write(1, b" unclaimed=".as_ptr(), 11);
+    put_i32(unclaimed);
+    write(1, b" lost=".as_ptr(), 6);
+    put_i32(lost);
+    write(1, b" bad=".as_ptr(), 5);
+    put_i32(bad);
+    write(1, b"\n".as_ptr(), 1);
+    report(name, lost == 0 && bad == 0)
+}
+
+/// A signal that is ignored (SIGCHLD at SIG_DFL, or SIG_IGN) must not end a
+/// FUTEX_WAIT at all: no handler runs, so there is nothing to restart and no
+/// reason for the wait to return. It used to come back as a spurious 0 at
+/// the signal (the generic Blocked -> Ready wake).
+unsafe fn test_futex_ignored_signal_keeps_waiting() -> bool {
+    let name = b"futex_ignored_signal_keeps_waiting\0";
+    let mut ok = true;
+    for &ign in &[false, true] {
+        let h = if ign { sig_ign() } else { None };
+        sigaction(SIGCHLD, &zeroed_sigaction(h), core::ptr::null_mut());
+        FH_SIGNO.store(SIGCHLD, Ordering::SeqCst);
+        let (r, el) = futex_signal_round(true, 0, 20, 80);
+        FH_SIGNO.store(SIGALRM, Ordering::SeqCst);
+        let c = r == 0 && el >= 90_000_000 && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 0;
+        if !c { write(1, b"  ignored r=".as_ptr(), 12); put_i32(r as i32); write(1, b" el_us=".as_ptr(), 7); put_i32((el / 1000) as i32); write(1, b"\n".as_ptr(), 1); }
+        ok &= c;
+    }
+    report(name, ok)
+}
+
+/// Diagnostic (`sigtest futexab N`), the shape of the original stress test:
+/// a forked CHILD kill()s the parent with SIGALRM at ~20 ms and then exits,
+/// so a SIGCHLD follows. Run once with a SIGCHLD handler installed WITHOUT
+/// SA_RESTART (what the earlier sigtest cases leave behind) and once with
+/// SIGCHLD at SIG_DFL. A SIGCHLD that lands while the restarted wait is
+/// parked legitimately ends it with EINTR (Linux does the same); with SIG_DFL
+/// nothing may.
+unsafe fn futex_sigchld_ab(iters: i32) {
+    for &with_handler in &[true, false] {
+        if with_handler {
+            install_siginfo(SIGCHLD, handoff_chld_handler);
+        } else {
+            sigaction(SIGCHLD, &zeroed_sigaction(None), core::ptr::null_mut());
+        }
+        let (mut good, mut eintr, mut other) = (0i32, 0i32, 0i32);
+        let parent = getpid();
+        for _ in 0..iters {
+            FUTEX_SIG_COUNT.store(0, Ordering::SeqCst);
+            let act = sigaction { sa_handler: Some(futex_sig_handler), sa_flags: SA_RESTART, sa_restorer: None, sa_mask: 0 };
+            sigaction(SIGALRM, &act, core::ptr::null_mut());
+            FWORD.store(7, Ordering::SeqCst);
+            let child = fork();
+            if child == 0 {
+                sleep_ms(20);
+                kill(parent, SIGALRM);
+                _exit(0);
+            }
+            let t0 = now_ns();
+            // The genuine wake: a sibling thread (both signals masked) at ~150 ms.
+            let mut th: pthread_t = core::ptr::null_mut();
+            pthread_create(&mut th, core::ptr::null(), ab_waker, core::ptr::null_mut());
+            let r = syscall(nr::FUTEX, FWORD.as_ptr() as c_long, FUTEX_WAIT | FUTEX_PRIVATE,
+                            7 as c_long, 0 as c_long, 0 as c_long, 0 as c_long);
+            let el = now_ns() - t0;
+            pthread_join(th, core::ptr::null_mut());
+            reap(child);
+            if r == 0 && el >= 140_000_000 { good += 1; }
+            else if r == -(EINTR as c_long) { eintr += 1; }
+            else { other += 1; }
+        }
+        write(1, if with_handler { b"  futexab sigchld=handler ".as_ptr() } else { b"  futexab sigchld=SIG_DFL ".as_ptr() }, 26);
+        write(1, b"ok=".as_ptr(), 3);
+        put_i32(good);
+        write(1, b" eintr=".as_ptr(), 7);
+        put_i32(eintr);
+        write(1, b" other=".as_ptr(), 7);
+        put_i32(other);
+        write(1, b"\n".as_ptr(), 1);
+    }
+}
+
+extern "C" fn ab_waker(_: *mut c_void) -> *mut c_void {
+    unsafe {
+        let m: sigset_t = (1u64 << (SIGALRM - 1)) | (1u64 << (SIGCHLD - 1));
+        sigprocmask(SIG_BLOCK, &m, core::ptr::null_mut());
+        sleep_ms(150);
+        FWORD.store(8, Ordering::SeqCst);
+        futex_wake_word();
+    }
+    core::ptr::null_mut()
 }
 
 /// FUTEX_WAIT_BITSET's absolute deadline is deliberately left unaffected by
