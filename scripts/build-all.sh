@@ -3,6 +3,8 @@
 # Builds userland, kernel, and generates disk images
 
 set -e  # Exit on any error
+# macOS: pick an SDK whose libSystem the linker can read (see darwin-sdk.sh).
+source "$(dirname "${BASH_SOURCE[0]}")/darwin-sdk.sh"
 
 # Default configuration
 DEFAULT_ARCH="both"

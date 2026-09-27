@@ -2,6 +2,8 @@
 # Build Leandros user-space programs.
 
 set -euo pipefail
+# macOS: pick an SDK whose libSystem the linker can read (see darwin-sdk.sh).
+source "$(dirname "${BASH_SOURCE[0]}")/darwin-sdk.sh"
 cd "$(dirname "$0")/.."
 
 TARGET="aarch64-unknown-none"

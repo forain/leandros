@@ -11,6 +11,8 @@
 # fetch/patch), so there is no $WORK clone step -- it builds directly out of
 # ports/mkfs-fat/.
 set -euo pipefail
+# macOS: pick an SDK whose libSystem the linker can read (see darwin-sdk.sh).
+source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/darwin-sdk.sh"
 
 if [[ $# -ne 1 || ( "$1" != "aarch64" && "$1" != "x86_64" ) ]]; then
     echo "usage: $0 <aarch64|x86_64>" >&2

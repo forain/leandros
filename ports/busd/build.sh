@@ -42,6 +42,8 @@
 #
 # Usage: build.sh [aarch64|x86_64|both]   (default: both)
 set -euo pipefail
+# macOS: pick an SDK whose libSystem the linker can read (see darwin-sdk.sh).
+source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/darwin-sdk.sh"
 
 VERSION=0.5.0
 HERE="$(cd "$(dirname "$0")" && pwd)"

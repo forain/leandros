@@ -34,6 +34,8 @@
 #   ~/code/leandros-artifacts/greetd-lane/<arch>/greetd
 # which is where scripts/mkfs-f2fs-populated.py picks them up for /bin/greetd.
 set -euo pipefail
+# macOS: pick an SDK whose libSystem the linker can read (see darwin-sdk.sh).
+source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/darwin-sdk.sh"
 
 PIN=d6733e983ff7821c3044007d5555345c7553188f   # 0.10.3-22-gd6733e9
 REPO=https://github.com/kennylevinsen/greetd.git

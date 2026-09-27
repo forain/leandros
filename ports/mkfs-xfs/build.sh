@@ -15,6 +15,8 @@
 # Binaries land in ports/mkfs-xfs/out/<arch>/mkfs.xfs, ready for
 # scripts/mkfs-f2fs-populated.py to pack as /sbin/mkfs.xfs.
 set -euo pipefail
+# macOS: pick an SDK whose libSystem the linker can read (see darwin-sdk.sh).
+source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/darwin-sdk.sh"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$HERE/../.." && pwd)"
