@@ -298,7 +298,7 @@ pub struct Task {
     /// (0 = nothing to resume), the rest its arguments — for every current
     /// kind including the ABSOLUTE deadline, so the resumed wait ends when the
     /// original would have instead of re-arming the full relative interval.
-    pub restart_block: [u64; 7],
+    pub restart_block: [u64; 8],
     /// EEVDF virtual deadline; the runnable, eligible task with the earliest
     /// deadline is picked next.
     pub vdeadline:    u64,
@@ -529,7 +529,7 @@ impl Task {
             vruntime: 0,
             cpu_ns: 0,
             saved_sigmask: None,
-            restart_block: [0; 7],
+            restart_block: [0; 8],
             vdeadline: 0,
             ctx: if entry == 0 {
                 CpuContext::zeroed()
@@ -913,7 +913,7 @@ impl Task {
             vruntime: 0,
             cpu_ns: 0,
             saved_sigmask: None,
-            restart_block: [0; 7],
+            restart_block: [0; 8],
             vdeadline: 0,
             ctx: crate::context::CpuContext::new_user_task_with_pt(user_entry, user_sp, kernel_stack_virt + kernel_stack_size, page_table),
             page_table,

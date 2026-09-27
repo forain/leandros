@@ -870,8 +870,16 @@ const ERESTART_RESTARTBLOCK: isize = -516;
 /// `restart_block[0]` kinds (0 = nothing to resume).
 const RB_FUTEX:     u64 = 1; // [uaddr, val, private, deadline]
 const RB_NANOSLEEP: u64 = 2; // [deadline, rmtp]
-const RB_POLL:      u64 = 3; // [fds_ptr, nfds, deadline (u64::MAX = none)]
-const RB_SELECT:    u64 = 4; // [nfds, rfds, wfds, efds, deadline (u64::MAX = none)]
+const RB_POLL:      u64 = 3; // [fds_ptr, nfds, deadline (u64::MAX = none), sigmask, wb]
+const RB_SELECT:    u64 = 4; // [nfds, rfds, wfds, efds, deadline (u64::MAX = none), sigmask, wb]
+
+/// ppoll/pselect6 with a NULL sigmask (a real one never has SIGKILL set).
+const NO_SIGMASK: u64 = u64::MAX;
+/// SIGKILL and SIGSTOP: dropped from any mask user space installs.
+const SIG_UNBLOCKABLE: u64 = (1 << 8) | (1 << 18);
+/// Timeout write-back word: the user pointer, with this bit set when it is a
+/// `struct timeval` (select) rather than a `struct timespec`; 0 = none.
+const WB_TIMEVAL: u64 = 1 << 63;
 
 /// restart_syscall(2): resume the calling thread's `restart_block`. Only ever
 /// reached through the rewind that ERESTART_RESTARTBLOCK sets up; with
@@ -898,9 +906,9 @@ fn sys_restart_syscall() -> isize {
         RB_POLL => {
             let nfds = b[2] as usize;
             if nfds != 0 && !validate_user_buf(b[1] as usize, nfds.saturating_mul(8)) { return -14; }
-            poll_wait(b[1] as usize, nfds, b[3])
+            poll_masked(b[1] as usize, nfds, b[3], b[4], b[5])
         }
-        RB_SELECT => select_wait(b[1] as usize, b[2] as usize, b[3] as usize, b[4] as usize, b[5]),
+        RB_SELECT => select_masked(b[1] as usize, b[2] as usize, b[3] as usize, b[4] as usize, b[5], b[6], b[7]),
         _ => -4,
     }
 }
@@ -1559,7 +1567,7 @@ fn dispatch_inner(
         #[cfg(not(target_arch = "aarch64"))]
         DUP2        => sys_dup3(a0, a1, 0),  // dup2(old,new) == dup3(old,new,0)
         READLINKAT  => sys_readlinkat(a0, a1, a2, a3),
-        PPOLL       => sys_ppoll(a0, a1, a2, a3),
+        PPOLL       => sys_ppoll(a0, a1, a2, a3, a4),
         #[cfg(not(target_arch = "aarch64"))]
         POLL        => sys_poll(a0, a1, a2 as isize),
         // Process management
@@ -1729,8 +1737,8 @@ fn dispatch_inner(
         TIME         => sys_time(a0),
 
         // ── poll / select / epoll (Phase 9) ───────────────────────────────────
-        SELECT   => sys_select(a0, a1, a2, a3, a4, false),
-        PSELECT6 => sys_select(a0, a1, a2, a3, a4, true),
+        SELECT   => sys_select(a0, a1, a2, a3, a4, false, 0),
+        PSELECT6 => sys_select(a0, a1, a2, a3, a4, true, a5),
         EPOLL_CREATE1  => sys_epoll_create1(a0),
         EPOLL_CTL      => sys_epoll_ctl(a0, a1, a2, a3),
         EPOLL_PWAIT  => sys_epoll_wait(a0, a1, a2, a3),
@@ -3173,7 +3181,7 @@ fn sys_poll(fds_ptr: usize, nfds: usize, timeout_ms: isize) -> isize {
     // zero-extending register still means "forever".
     let timeout_ms = timeout_ms as i32;
     let deadline = if timeout_ms < 0 { u64::MAX } else { deadline_after_ms(timeout_ms as u64) };
-    poll_wait(fds_ptr, nfds, deadline)
+    poll_masked(fds_ptr, nfds, deadline, NO_SIGMASK, 0)
 }
 
 /// sys_ppoll(fds_ptr, nfds, timeout_ptr, sigmask_ptr) — wait for events on fd set.
@@ -3183,26 +3191,106 @@ fn sys_poll(fds_ptr: usize, nfds: usize, timeout_ms: isize) -> isize {
 /// ready or `timeout_ptr`'s `struct timespec` elapses (NULL = block
 /// indefinitely, `{0,0}` = check once and return immediately). If all fds
 /// report POLLNVAL (bad fd) or no events by the deadline, returns 0.
-fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -> isize {
+///
+/// `sigmask_ptr` (with `sigsetsize` == 8) is installed for the wait and the
+/// caller's mask restored on return — see `masked_timed_wait` — and the time
+/// not slept is written back into `*timeout_ptr` (Linux `poll_select_finish`).
+/// The sigmask used to be ignored, which broke the race-free
+/// block-then-ppoll(unblocking mask) pattern: the signal stayed blocked and
+/// the wait ran to its timeout.
+fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, sigmask_ptr: usize, sigsetsize: usize) -> isize {
     let sz = nfds.saturating_mul(8);
     if nfds != 0 && !validate_user_buf(fds_ptr, sz) { return -14; }
 
-    let deadline = if timeout_ptr == 0 {
-        u64::MAX
+    let (deadline, wb) = if timeout_ptr == 0 {
+        (u64::MAX, 0)
     } else {
         match read_user_timespec(timeout_ptr) {
-            Ok(ns) => deadline_after_ns(ns),
+            // A zero timeout is never written back (Linux: "no update for
+            // zero timeout").
+            Ok(ns) => (deadline_after_ns(ns), if ns == 0 { 0 } else { timeout_ptr as u64 }),
             Err(e) => return e,
         }
     };
-    poll_wait(fds_ptr, nfds, deadline)
+    let mask = if sigmask_ptr == 0 {
+        NO_SIGMASK
+    } else {
+        match read_user_sigmask(sigmask_ptr, sigsetsize) { Ok(m) => m, Err(e) => return e }
+    };
+    poll_masked(fds_ptr, nfds, deadline, mask, wb)
+}
+
+/// poll/ppoll under `mask` (NO_SIGMASK = none) with timeout write-back `wb`;
+/// also the `restart_syscall` resume of one.
+fn poll_masked(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> isize {
+    masked_timed_wait(mask, wb, deadline, || poll_wait(fds_ptr, nfds, deadline, mask, wb))
+}
+
+/// Read a ppoll/pselect6 sigmask argument. `sigsetsize` must be 8 (Linux:
+/// EINVAL otherwise). SIGKILL and SIGSTOP are silently dropped, as
+/// `sigprocmask` does.
+fn read_user_sigmask(ptr: usize, sigsetsize: usize) -> Result<u64, isize> {
+    if sigsetsize != 8 { return Err(-22); }
+    if !validate_user_buf(ptr, 8) { return Err(-14); }
+    Ok(unsafe { core::ptr::read(ptr as *const u64) } & !SIG_UNBLOCKABLE)
+}
+
+/// The shared ppoll/pselect6/select frame (Linux `set_user_sigmask` +
+/// `poll_select_finish`):
+///
+/// * `mask` (unless NO_SIGMASK) replaces the signal mask for the wait. If the
+///   wait was interrupted, the caller's mask is parked with
+///   `stash_sigsuspend_mask`: the signal that ended it is delivered on the way
+///   out under the TEMPORARY mask, and the handler frame's `uc_sigmask` puts
+///   the old one back — the same mechanism as sigsuspend. With no handler (a
+///   stop/continue: the call restarts through `restart_syscall`, which
+///   reinstalls `mask`) the delivery pass restores it directly. Any other
+///   result restores the caller's mask at once, so a signal only the
+///   temporary mask unblocked stays pending (Linux
+///   `restore_saved_sigmask_unless(ret == -ERESTARTNOHAND)`).
+/// * `wb` (unless 0) receives the time left until `deadline`, whatever the
+///   result — timeout ({0,0}), ready, or interrupted.
+fn masked_timed_wait(mask: u64, wb: u64, deadline: u64, body: impl FnOnce() -> isize) -> isize {
+    let old = if mask != NO_SIGMASK { Some(sched::replace_signal_mask(mask)) } else { None };
+    let r = body();
+    if let Some(old) = old {
+        if r == ERESTART_RESTARTBLOCK || r == -4 {
+            sched::stash_sigsuspend_mask(old);
+        } else {
+            sched::replace_signal_mask(old);
+        }
+    }
+    if wb != 0 { write_back_timeout(wb, deadline); }
+    r
+}
+
+/// Write the time left until `deadline` into the caller's select/pselect6/
+/// ppoll timeout (`wb`: pointer | WB_TIMEVAL for a `struct timeval`). A fault
+/// is ignored, as Linux does.
+fn write_back_timeout(wb: u64, deadline: u64) {
+    let ptr = (wb & !WB_TIMEVAL) as usize;
+    if !validate_user_buf(ptr, 16) { return; }
+    let rem = deadline.saturating_sub(monotonic_ns());
+    if wb & WB_TIMEVAL != 0 {
+        unsafe {
+            core::ptr::write(ptr       as *mut i64, (rem / 1_000_000_000) as i64);
+            core::ptr::write((ptr + 8) as *mut i64, ((rem % 1_000_000_000) / 1_000) as i64);
+        }
+    } else {
+        write_user_timespec(ptr, rem);
+    }
 }
 
 /// The poll/ppoll loop proper, on an absolute `deadline` (`u64::MAX` = none);
 /// also what `restart_syscall` resumes. Interrupted by a deliverable signal it
 /// is EINTR when a handler runs and otherwise restarts on the SAME deadline
 /// (Linux's `do_restart_poll`); it used to be EINTR even for a stop/continue.
-fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64) -> isize {
+/// `mask`/`wb` only travel into the restart block (see `poll_masked`).
+///
+/// With nothing ready, a deliverable signal wins over an expired deadline, as
+/// in Linux's `do_poll` — so a zero-timeout ppoll whose mask unblocks a
+/// pending signal reports EINTR and runs the handler.
+fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> isize {
     // struct pollfd { fd: i32, events: i16, revents: i16 } = 8 bytes.
     const POLLNVAL: i16 = 0x0020;
     let pid = current_pid();
@@ -3224,11 +3312,11 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64) -> isize {
             if revents != 0 && revents != POLLNVAL { nready += 1; }
         }
         if nready > 0 { return nready; }
-        if !infinite && monotonic_ns() >= deadline { return 0; }
         if interrupted() {
-            sched::set_restart_block([RB_POLL, fds_ptr as u64, nfds as u64, deadline, 0, 0, 0]);
+            sched::set_restart_block([RB_POLL, fds_ptr as u64, nfds as u64, deadline, mask, wb, 0, 0]);
             return ERESTART_RESTARTBLOCK;
         }
+        if !infinite && monotonic_ns() >= deadline { return 0; }
 
         poll_block(infinite, deadline, poll_fds_mask(pid, fds_ptr, nfds), || poll_any_ready(pid, fds_ptr, nfds));
     }
@@ -3277,7 +3365,7 @@ fn sleep_until_ns(deadline: u64, rmtp_ptr: usize, relative: bool) -> isize {
                 write_user_timespec(rmtp_ptr, deadline.saturating_sub(monotonic_ns()));
             }
             if !relative { return ERESTARTNOHAND; }
-            sched::set_restart_block([RB_NANOSLEEP, deadline, rmtp_ptr as u64, 0, 0, 0, 0]);
+            sched::set_restart_block([RB_NANOSLEEP, deadline, rmtp_ptr as u64, 0, 0, 0, 0, 0]);
             return ERESTART_RESTARTBLOCK;
         }
         if monotonic_ns() >= deadline { break; }
@@ -3489,7 +3577,7 @@ fn sys_set_tid_address(tidptr: usize) -> isize {
 fn futex_wait_timed(uaddr: usize, val: u32, private: bool, deadline: u64) -> isize {
     let r = sched::futex_wait_intr(uaddr, val, Some(deadline), private);
     if r != sched::FUTEX_INTERRUPTED { return r; }
-    sched::set_restart_block([RB_FUTEX, uaddr as u64, val as u64, private as u64, deadline, 0, 0]);
+    sched::set_restart_block([RB_FUTEX, uaddr as u64, val as u64, private as u64, deadline, 0, 0, 0]);
     ERESTART_RESTARTBLOCK
 }
 
@@ -3570,9 +3658,11 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
                     Some(deadline_after_ns(ns))
                 }
             };
-            if cmd == FUTEX_WAIT {
-                if let Some(d) = deadline { return futex_wait_timed(uaddr, val as u32, private, d); }
-            }
+            // Timed, either form: EINTR if a handler runs, else a restart on
+            // the same absolute deadline. (A CLOCK_REALTIME BITSET deadline
+            // was translated to monotonic above, so a clock step while the
+            // waiter is stopped is not re-applied on the restart.)
+            if let Some(d) = deadline { return futex_wait_timed(uaddr, val as u32, private, d); }
             let r = sched::futex_wait_intr(uaddr, val as u32, deadline, private);
             if r != sched::FUTEX_INTERRUPTED { return r; }
             // Released by a deliverable signal with no wake claimed
@@ -3588,9 +3678,10 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
             //     handler -> EINTR at the signal; untimed -> restarted.
             //     Restarting timed waits under SA_RESTART would let a periodic
             //     signal postpone the timeout forever.
-            // FUTEX_WAIT_BITSET keeps its old behaviour (a spurious 0 wake):
-            // Rust std and relibc re-check their own deadline on any return.
-            if cmd == FUTEX_WAIT_BITSET { return 0; }
+            // FUTEX_WAIT_BITSET answers the same way (Linux futex_wait does
+            // not tell the two apart). It used to return a spurious 0 at the
+            // signal: harmless for Rust std and relibc, which re-check, but
+            // an SA_RESTART-less caller could not see the EINTR.
             ERESTARTSYS
         }
         1 => {
@@ -9426,14 +9517,19 @@ fn sys_timerfd_gettime(fd: usize, cur_ptr: usize) -> isize {
 /// a `struct timeval` (µs), `pselect6(2)` — the only form on AArch64 — a
 /// `struct timespec` (ns). Reading a timespec as a timeval made every
 /// pselect6 timeout 1000× too long.
-fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize, timespec: bool) -> isize {
+///
+/// `sigdata` (pselect6 only) points at `{ const sigset_t *ss; size_t ss_len }`;
+/// a non-NULL `ss` is installed for the wait (see `masked_timed_wait`). Both
+/// forms write the time not slept back into the timeout, as the Linux kernel
+/// does (glibc/musl hide that from pselect callers by passing a copy).
+fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize, timespec: bool, sigdata: usize) -> isize {
     if nfds > 1024 { return -22; } // EINVAL — matches relibc's FD_SETSIZE
 
-    let deadline = if tv_ptr == 0 {
-        u64::MAX
+    let ns = if tv_ptr == 0 {
+        None
     } else if timespec {
         match read_user_timespec(tv_ptr) {
-            Ok(ns) => deadline_after_ns(ns),
+            Ok(ns) => Some(ns),
             Err(e) => return e,
         }
     } else {
@@ -9441,17 +9537,38 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize,
         let tv_sec  = unsafe { core::ptr::read(tv_ptr       as *const i64) };
         let tv_usec = unsafe { core::ptr::read((tv_ptr + 8) as *const i64) };
         if tv_sec < 0 || tv_usec < 0 { return -22; } // EINVAL
-        let ns = (tv_sec as u64).saturating_mul(1_000_000_000).saturating_add((tv_usec as u64).saturating_mul(1_000));
-        deadline_after_ns(ns)
+        Some((tv_sec as u64).saturating_mul(1_000_000_000).saturating_add((tv_usec as u64).saturating_mul(1_000)))
     };
-    select_wait(nfds, rfds, wfds, efds, deadline)
+    let (deadline, wb) = match ns {
+        None => (u64::MAX, 0),
+        Some(0) => (deadline_after_ns(0), 0), // zero timeout: never written back
+        Some(ns) => (deadline_after_ns(ns), tv_ptr as u64 | if timespec { 0 } else { WB_TIMEVAL }),
+    };
+    let mut mask = NO_SIGMASK;
+    if sigdata != 0 {
+        if !validate_user_buf(sigdata, 16) { return -14; }
+        let ss     = unsafe { core::ptr::read(sigdata as *const usize) };
+        let ss_len = unsafe { core::ptr::read((sigdata + 8) as *const usize) };
+        if ss != 0 {
+            mask = match read_user_sigmask(ss, ss_len) { Ok(m) => m, Err(e) => return e };
+        }
+    }
+    select_masked(nfds, rfds, wfds, efds, deadline, mask, wb)
+}
+
+/// select/pselect6 under `mask` with timeout write-back `wb`; also the
+/// `restart_syscall` resume of one.
+fn select_masked(nfds: usize, rfds: usize, wfds: usize, efds: usize, deadline: u64, mask: u64, wb: u64) -> isize {
+    masked_timed_wait(mask, wb, deadline, || select_wait(nfds, rfds, wfds, efds, deadline, mask, wb))
 }
 
 /// The select/pselect6 loop proper, on an absolute `deadline` (`u64::MAX` =
 /// none); also what `restart_syscall` resumes. Interrupted: EINTR when a
 /// handler runs, else a restart on the SAME deadline (Linux gets there with
 /// -ERESTARTNOHAND after writing the remainder back into the timeout).
-fn select_wait(nfds: usize, rfds: usize, wfds: usize, efds: usize, deadline: u64) -> isize {
+/// As in Linux's `do_select`, with nothing ready a deliverable signal wins
+/// over an expired deadline. `mask`/`wb` only travel into the restart block.
+fn select_wait(nfds: usize, rfds: usize, wfds: usize, efds: usize, deadline: u64, mask: u64, wb: u64) -> isize {
     const POLLIN:  u32 = 0x0001;
     const POLLOUT: u32 = 0x0004;
 
@@ -9481,15 +9598,15 @@ fn select_wait(nfds: usize, rfds: usize, wfds: usize, efds: usize, deadline: u64
             if want_w && ev & POLLOUT != 0 { out_w[fd / 8] |= 1 << (fd % 8); nready += 1; }
         }
 
+        if nready == 0 && interrupted() {
+            sched::set_restart_block([RB_SELECT, nfds as u64, rfds as u64, wfds as u64, efds as u64, deadline, mask, wb]);
+            return ERESTART_RESTARTBLOCK;
+        }
         if nready > 0 || (!infinite && monotonic_ns() >= deadline) {
             if has_r { unsafe { core::ptr::copy_nonoverlapping(out_r.as_ptr(), rfds as *mut u8, bytes); } }
             if has_w { unsafe { core::ptr::copy_nonoverlapping(out_w.as_ptr(), wfds as *mut u8, bytes); } }
             if has_e { unsafe { core::ptr::write_bytes(efds as *mut u8, 0, bytes); } }
             return nready;
-        }
-        if interrupted() {
-            sched::set_restart_block([RB_SELECT, nfds as u64, rfds as u64, wfds as u64, efds as u64, deadline, 0]);
-            return ERESTART_RESTARTBLOCK;
         }
 
         poll_block(infinite, deadline, select_fds_mask(pid, nfds, rfds, wfds, has_r, has_w), || select_any_ready(pid, nfds, rfds, wfds, has_r, has_w));

@@ -357,9 +357,12 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
                     }
                     None => return,
                 };
-                if saved.is_some() {
-                    if let Some(t) = rq.get_mut(idx) { t.saved_sigmask = None; }
-                }
+                // `saved` is NOT consumed here: an ignored signal or a stop
+                // (the `continue` paths below) runs no handler, and the saved
+                // mask must still come back — through the `unmasked == 0`
+                // branch above on the next pass — rather than leave the
+                // temporary sigsuspend/ppoll/pselect6 mask installed for good.
+                // Only a handler frame takes it over (see below).
                 step
             }
         };
@@ -442,6 +445,11 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
                 {
                     let mut rq = super::RUN_QUEUE.lock();
                     let tgid = rq.find_pid(pid).map(|t| t.tgid).unwrap_or(0);
+                    // The frame's `uc_sigmask` (`old_mask`) now carries any
+                    // saved sigsuspend/ppoll/pselect6 mask; rt_sigreturn puts
+                    // it back. The handler itself runs under the temporary
+                    // mask plus its own blocked set, as on Linux.
+                    if let Some(t) = rq.find_pid_mut(pid) { t.saved_sigmask = None; }
                     if action.get_flags() & SA_NODEFER == 0 {
                         if let Some(idx) = rq.find_pid_idx(pid) {
                             if let Some(t) = rq.get_mut(idx) {
