@@ -1030,6 +1030,9 @@ pub fn dispatch(
         crate::serial_print_hex(current_pid() as usize);
         crate::serial_print_str("\n");
     }
+    if SYSCALL_TRACE_EBADF && ret == -9 && current_pid() >= 3 {
+        ebadf_trace(number, a0, a1, a2, frame_ptr);
+    }
     if SYSCALL_TRACE && current_pid() >= 3 && number != 0x16 && number != 0x65 {
         let _g = TRACE_LOCK.lock();
         crate::serial_print_str("[SC] p=");
@@ -1137,6 +1140,66 @@ const SYSCALL_TRACE_EACCES: bool = false;
 /// expect pipe2 → fcntl(F_DUPFD_CLOEXEC)→N → clone → dup3(N,1,0) → execve, and
 /// then `write fd=1 -> pipe`. A `write fd=1 -> console` line is the smoking gun.
 const SYSCALL_TRACE_FDS: bool = false;
+
+/// Log every syscall that fails with EBADF: nr, args, pid/tgid, the image name
+/// and (aarch64) the user pc/lr plus a short frame-pointer backtrace. Capped
+/// at `EBADF_TRACE_MAX` lines per boot.
+const SYSCALL_TRACE_EBADF: bool = false;
+const EBADF_TRACE_MAX: usize = 400;
+
+fn ebadf_trace(number: usize, a0: usize, a1: usize, a2: usize, frame_ptr: usize) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= EBADF_TRACE_MAX { return; }
+    let tgid = sched::current_tgid();
+    let mut name = [0u8; 128];
+    let nl = sched::exe_path(tgid, &mut name).unwrap_or(0).min(name.len());
+    let base = name[..nl].rsplit(|&b| b == b'/').next().unwrap_or(&[]);
+    let _g = TRACE_LOCK.lock();
+    crate::serial_print_str("[EBADF] n=");
+    crate::serial_print_hex(n);
+    crate::serial_print_str(" nr=");
+    crate::serial_print_hex(number);
+    crate::serial_print_str(" a0=");
+    crate::serial_print_hex(a0);
+    crate::serial_print_str(" a1=");
+    crate::serial_print_hex(a1);
+    crate::serial_print_str(" a2=");
+    crate::serial_print_hex(a2);
+    crate::serial_print_str(" pid=");
+    crate::serial_print_hex(current_pid() as usize);
+    crate::serial_print_str(" tgid=");
+    crate::serial_print_hex(tgid as usize);
+    crate::serial_print_str(" t=");
+    crate::serial_print_hex(ticks() as usize);
+    crate::serial_print_str(" ");
+    crate::serial_print_str(core::str::from_utf8(base).unwrap_or("?"));
+    #[cfg(target_arch = "aarch64")]
+    if frame_ptr != 0 {
+        let uf = unsafe { &*(frame_ptr as *const sched::context::UserFrame) };
+        crate::serial_print_str(" pc=");
+        crate::serial_print_hex(uf.elr_el1 as usize);
+        crate::serial_print_str(" lr=");
+        crate::serial_print_hex(uf.x[30] as usize);
+        let mut fp = uf.x[29] as usize;
+        for _ in 0..8 {
+            if fp == 0 || fp % 8 != 0 { break; }
+            let mut rec = [0u8; 16];
+            let ok = with_current_address_space(|as_| as_.read_user_buf(fp, &mut rec))
+                .unwrap_or(false);
+            if !ok { break; }
+            let prev_fp = usize::from_ne_bytes(rec[0..8].try_into().unwrap());
+            let lr = usize::from_ne_bytes(rec[8..16].try_into().unwrap());
+            crate::serial_print_str(" <- ");
+            crate::serial_print_hex(lr);
+            if prev_fp <= fp { break; }
+            fp = prev_fp;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = frame_ptr;
+    crate::serial_print_str("\n");
+}
 
 /// Serializes multi-part trace prints — concurrent syscalls on other CPUs
 /// otherwise interleave their serial output into an unreadable shuffle.

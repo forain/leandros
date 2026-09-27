@@ -14,7 +14,16 @@
  *                     GL_RENDERER=<string>
  *                   Exit 0 on a hardware renderer, 2 on a software one
  *                   (softpipe / llvmpipe / swrast / lavapipe), 3 if no context
- *                   could be created at all.
+ *                   could be created at all. Also prints
+ *                     GL_WGPU=1|0 GL_WGPU_ERR=0x....
+ *                   whether wgpu-hal's GLES backend (iced's `wgpu` renderer in
+ *                   the COSMIC clients) can get a context here: it asks for a
+ *                   GLES 3 context with robust buffer access first and falls
+ *                   back without it ONLY on EGL_BAD_ATTRIBUTE (egl.rs). Mesa
+ *                   answers EGL_BAD_MATCH per spec on a driver without robust
+ *                   access (virgl on ANGLE/Metal) unless it carries
+ *                   ports/mesa/patches/0001-egl-robust-access-unsupported-is-
+ *                   bad-attribute.patch, and then wgpu never gets a context.
  *
  * /bin/gpu-env runs both before every COSMIC launch (greeter and session) so a
  * software-rendered desktop can never happen silently.
@@ -87,6 +96,40 @@ static int is_software(const char *r)
 	return 0;
 }
 
+#ifndef EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT
+#define EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT 0x30BF
+#endif
+
+/* wgpu-hal 28 gles/egl.rs context creation, reduced to the part that decides
+ * whether it gets a context at all: GLES 3 + robust access (core on EGL 1.5,
+ * else the EXT attribute when advertised), retried without robustness only
+ * after EGL_BAD_ATTRIBUTE. */
+static void wgpu_probe(EGLDisplay dpy, EGLint maj, EGLint min)
+{
+	const char *ext = eglQueryString(dpy, EGL_EXTENSIONS);
+	int has_ext = ext && strstr(ext, "EGL_EXT_create_context_robustness");
+	int level = (maj > 1 || (maj == 1 && min >= 5)) ? 2 : (has_ext ? 1 : 0);
+	EGLint err = EGL_SUCCESS;
+	for (;;) {
+		EGLint a[8], n = 0;
+		a[n++] = EGL_CONTEXT_MAJOR_VERSION; a[n++] = 3;
+		if (level == 2) { a[n++] = EGL_CONTEXT_OPENGL_ROBUST_ACCESS; a[n++] = EGL_TRUE; }
+		if (level == 1) { a[n++] = EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT; a[n++] = EGL_TRUE; }
+		a[n++] = EGL_NONE;
+		EGLContext c = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, a);
+		if (c != EGL_NO_CONTEXT) {
+			eglDestroyContext(dpy, c);
+			printf("GL_WGPU=1 GL_WGPU_ROBUST=%d\n", level);
+			return;
+		}
+		err = eglGetError();
+		if (err == EGL_BAD_ATTRIBUTE && level == 2) { level = has_ext ? 1 : 0; continue; }
+		if (err == EGL_BAD_ATTRIBUTE && level == 1) { level = 0; continue; }
+		break;
+	}
+	printf("GL_WGPU=0 GL_WGPU_ERR=0x%x\n", err);
+}
+
 static int gl(void)
 {
 	int fd = open(CARD, O_RDWR | O_CLOEXEC);
@@ -116,6 +159,7 @@ static int gl(void)
 	int sw = !r || is_software(r);
 	eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 	eglDestroyContext(dpy, ctx);
+	wgpu_probe(dpy, maj, min);
 	eglTerminate(dpy);
 	gbm_device_destroy(gbm);
 	close(fd);
