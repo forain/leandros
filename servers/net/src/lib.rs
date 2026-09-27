@@ -3329,7 +3329,12 @@ fn handle_poll(pid: u32, fd: usize, requested: u32) -> Message {
             if readable > 0 || !conn.in_use || conn.rd_shut(true) { ev |= POLLIN; }
             if conn.in_use && !conn.closed_b && !conn.wr_shut(true) && write_free > 0 { ev |= POLLOUT; }
             if !conn.in_use || conn.closed_b { ev |= POLLHUP; }
-            (ev, Some(conn.seq), Some(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)))
+            // End A's full tag, not just the connection's: accept() turns this
+            // socket into UnixConnected { is_a: true } and then wakes the
+            // connection tag, but a poller that probed before the accept and
+            // parks after that wake keeps this mask, and the acceptor's data
+            // then wakes only UNIX_RD(conn, A).
+            (ev, Some(conn.seq), Some(unix_end_tag(conn_idx, true, requested)))
         }
         SockState::UnixListening { bound_idx } => {
             drop(tbls);
