@@ -1741,14 +1741,18 @@ fn dispatch_inner(
             // The fd table must be duplicated BEFORE the child is enqueued:
             // on SMP another CPU can run the child immediately, and its
             // first fd-allocating syscall would otherwise see an empty table.
-            fork_current(frame_ptr, |child_pid| {
+            let mut child = 0u32;
+            let ret = fork_current(frame_ptr, |child_pid| {
+                child = child_pid;
                 let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
                                        &[parent_pid as u64, child_pid as u64]);
                 let _ = vfs::handle(&msg, parent_pid);
                 let nmsg = make_vfs_msg(net_server::NET_FORK_DUP,
                                         &[parent_pid as u64, child_pid as u64]);
                 let _ = net_server::handle(&nmsg, parent_pid);
-            })
+            });
+            if ret < 0 { undo_unborn_child(child); }
+            ret
         }
 
         // ── Time ─────────────────────────────────────────────────────────────
@@ -6444,9 +6448,9 @@ fn sys_lseek(fd: usize, offset: usize, whence: usize) -> isize {
 // chasing why `bottom`'s interactive TUI never responded to input; see
 // project_tty_isatty_and_vfork_tls.md. Only O_NONBLOCK is tracked: it's
 // the only flag `sys_read_impl`'s fd-0 branch actually consults.
-// One slot per process that has F_SETFL'd its stdio: sized to the task limit
+// One slot per process that has F_SETFL'd its stdio: sized to the process limit
 // (was 64, lane procpool 2026-09-27), 12 contiguous bytes a slot.
-const MAX_STDIO_FLAGS_PROCS: usize = sched::runqueue::MAX_TASKS;
+const MAX_STDIO_FLAGS_PROCS: usize = sched::runqueue::MAX_PROCESSES;
 const O_NONBLOCK: u32 = 0x800;
 
 struct StdioFlags { pid: u32, in_use: bool, flags: u32 }
@@ -7685,6 +7689,16 @@ fn vfs_close_all_current() {
 /// (`EXIT_GROUP` below) can release a *sibling* thread's resources too — that
 /// thread never gets to run its own `EXIT` syscall, since it's being killed
 /// out from under it.
+/// A fork/vfork whose `before_enqueue` hook already duplicated the parent's fd
+/// and socket tables for `child`, and which then failed (the task table was
+/// full at enqueue): release everything the hook took, or those tables stay
+/// claimed by a pid that never ran. `child == 0`: the hook never ran.
+fn undo_unborn_child(child: u32) {
+    if child == 0 { return; }
+    vfs_close_all_for(child);
+    sched::clear_exe_path(child);
+}
+
 fn vfs_close_all_for(pid: u32) {
     let msg = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[pid as u64]);
     let _ = vfs::handle(&msg, pid);
@@ -10327,7 +10341,8 @@ fn sys_clone_or_fork(
         // A vfork-style child gets its own fd table (below): EAGAIN up front
         // when the vfs pool has none left, as for fork.
         if flags & CLONE_THREAD == 0 && !vfs::fd_table_slot_free() { return -11; }
-        clone_thread(flags, child_stack, tls, ptid, ctid, frame_ptr, |child_pid| {
+        let mut child = 0u32;
+        let ret = clone_thread(flags, child_stack, tls, ptid, ctid, frame_ptr, |child_pid| {
             // Real CLONE_THREAD siblings (pthread_create) share the leader's
             // tgid and, today, have no fd table of their own at all — every
             // VFS call from such a thread already resolves fds by its own
@@ -10342,6 +10357,7 @@ fn sys_clone_or_fork(
             // first fd syscall — VFS_FORK_DUP is exactly fork_current's own
             // fix for the identical fork() case (see the FORK arm above).
             if flags & CLONE_THREAD == 0 {
+                child = child_pid;
                 let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
                                        &[parent_pid as u64, child_pid as u64]);
                 let _ = vfs::handle(&msg, parent_pid);
@@ -10349,7 +10365,9 @@ fn sys_clone_or_fork(
                                         &[parent_pid as u64, child_pid as u64]);
                 let _ = net_server::handle(&nmsg, parent_pid);
             }
-        })
+        });
+        if ret < 0 { undo_unborn_child(child); }
+        ret
     } else {
         let _ = (child_stack, tls, ctid);
         // fd tables are keyed by tgid, so the parent must be identified by its
@@ -10360,7 +10378,9 @@ fn sys_clone_or_fork(
         if !vfs::fd_table_slot_free() { return -11; } // EAGAIN, as for FORK
         // Duplicate the fd table before the child becomes runnable (see the
         // FORK arm of syscall_dispatch for the SMP race this prevents).
+        let mut child = 0u32;
         let ret = fork_current(frame_ptr, |child_pid| {
+            child = child_pid;
             let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
                                    &[parent_pid as u64, child_pid as u64]);
             let _ = vfs::handle(&msg, parent_pid);
@@ -10368,6 +10388,7 @@ fn sys_clone_or_fork(
                                     &[parent_pid as u64, child_pid as u64]);
             let _ = net_server::handle(&nmsg, parent_pid);
         });
+        if ret < 0 { undo_unborn_child(child); }
         // CLONE_PARENT_SETTID on a plain fork names a word in the PARENT's
         // memory (the child got its own copy at fork), and only the parent
         // returns here with a positive pid.
