@@ -1453,7 +1453,9 @@ pub fn drm_release_open(open_id: u32) {
             Some(mut g) => g.ctx_fences_outstanding_now(ctx),
             None => 0,
         };
-        if left == 0 || crate::snd::monotonic_us().wrapping_sub(t0) >= CTX_DRAIN_US { break; }
+        let limit = CTX_DRAIN_US_OVERRIDE.load(::core::sync::atomic::Ordering::Relaxed);
+        let limit = if limit == u64::MAX { CTX_DRAIN_US } else { limit };
+        if left == 0 || crate::snd::monotonic_us().wrapping_sub(t0) >= limit { break; }
         sched::yield_now("gpu-ctx-drain");
     }
 
@@ -1469,6 +1471,10 @@ pub fn drm_release_open(open_id: u32) {
 /// is destroyed. Normal work retires within a frame; this only caps a client
 /// that left the GPU waiting on something that will never happen.
 const CTX_DRAIN_US: u64 = 200_000;
+/// Test knob (root ioctl 0x100A): replaces `CTX_DRAIN_US`; u64::MAX = default.
+/// 0 forces the abandon path, so the parked-chain reclaim can be exercised.
+pub static CTX_DRAIN_US_OVERRIDE: ::core::sync::atomic::AtomicU64 =
+    ::core::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// Record `fence` as the most recent submission on `open_id`. Silently does
 /// nothing for an open with no context, which cannot have submitted anything.
@@ -3875,6 +3881,7 @@ impl DrmDeviceInterface {
             0x1006 => self.handle_get_capabilities(arg),
             0x1008 => Self::handle_gpu_irq_stats(arg),
             0x1009 => Self::handle_gpu_park_spin(arg),
+            0x100A => Self::handle_ctx_drain_us(arg),
             0x1007 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_ioctl_mmap(&mut g, arg) },
 
             // ── Standard Linux DRM IOCTLs (already wired) ──
@@ -4346,6 +4353,18 @@ impl DrmDeviceInterface {
         if sched::current_euid() != 0 { return Err(DriverError::Access); }
         let p = arg as *mut u64;
         let old = crate::virtio_gpu::set_park_spin_us(unsafe { p.read_volatile() });
+        unsafe { p.write_volatile(old); }
+        Ok(0)
+    }
+
+    /// LeandrOS 0x100A: read and set `CTX_DRAIN_US_OVERRIDE` (one u64, new in,
+    /// old out; u64::MAX = default). Root only; a test knob.
+    fn handle_ctx_drain_us(arg: usize) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        if sched::current_euid() != 0 { return Err(DriverError::Access); }
+        let p = arg as *mut u64;
+        let old = CTX_DRAIN_US_OVERRIDE.swap(unsafe { p.read_volatile() },
+                                             ::core::sync::atomic::Ordering::Relaxed);
         unsafe { p.write_volatile(old); }
         Ok(0)
     }

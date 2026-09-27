@@ -6812,7 +6812,13 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
         }
         VnodeKind::Inotify { .. } => {
             drop(tbls);
-            (0, 0, sched::POLL_TAG_ALL) // never fires — accepted watches silently produce no events
+            // Never fires: accepted watches silently produce no events. Its
+            // own tag, not the broadcast mask — with POLL_TAG_ALL every event
+            // loop holding a config watch (every COSMIC client) parked on a
+            // broadcast mask and was woken by every timerfd expiry and every
+            // untagged wake in the system: ~180 of the idle desktop's ~800
+            // wakeups a second.
+            (0, 0, sched::poll_tag(sched::poll_class::INOTIFY, 0))
         }
         VnodeKind::DynamicDevice { port, dev_id, open_id } => {
             let port = *port;

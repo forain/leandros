@@ -26,6 +26,7 @@ pub mod clone;
 pub mod context;
 pub mod futex;
 pub mod lockwatch;
+pub mod idlestat;
 pub mod pcsample;
 pub mod runqueue;
 pub mod signal;
@@ -206,6 +207,11 @@ fn log_exit(pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid, is_proces
     let mut idx = EXIT_LOG_IDX.lock();
     log[*idx] = Some(ExitRecord { pid, status, parent_tgid, pgid, is_process, consumed });
     *idx = (*idx + 1) % EXIT_LOG_LEN;
+    // A parent parked in wait4 on this child: every exit passes through here
+    // on its way out of the run queue, so this is the one edge its park can
+    // rely on (lock-free; the next tick pays it). The child's SIGCHLD wakes it
+    // too, but only when one is sent.
+    request_poll_wake_tagged(poll_tag(poll_class::WAIT, parent_tgid));
 }
 
 pub fn get_exit_code(pid: Pid) -> Option<i32> {
@@ -1748,6 +1754,12 @@ pub mod poll_class {
     pub const DEVVT:   u32 = 8;
     pub const DRM:     u32 = 9;
     pub const EVDEV:   u32 = 10;
+    /// A parent parked in wait4/waitid, indexed by its tgid.
+    pub const WAIT:    u32 = 11;
+    /// inotify fds: nothing produces their events, so nothing wakes this tag.
+    pub const INOTIFY: u32 = 12;
+    /// An epoll instance itself, indexed by its slot: what `epoll_ctl` wakes.
+    pub const EPOLL:   u32 = 13;
 }
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision
@@ -1809,14 +1821,19 @@ pub fn block_on_poll_commit()  { block_on_port_commit() }
 /// in net/vfs, the deadline tick, signal delivery) MUST hold no server lock —
 /// this takes RUN_QUEUE. Task context only (blocking lock); IRQ context uses
 /// `try_wake_poll`.
+#[track_caller]
 pub fn wake_poll() { wake_poll_tagged(POLL_TAG_ALL); }
 
 /// Wake every poll-channel waiter whose `poll_mask` intersects `tag`. A
 /// producer passes the `poll_tag(class, index)` of the object it changed; an
 /// unconvertible producer passes `POLL_TAG_ALL` (== `wake_poll`). Same lock /
 /// context contract as `wake_poll`.
+#[track_caller]
 pub fn wake_poll_tagged(tag: u64) {
     let woken = RUN_QUEUE.lock().unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
+    if idlestat::ENABLED {
+        idlestat::note_wake(core::panic::Location::caller(), tag == POLL_TAG_ALL, woken);
+    }
     if woken > 0 { wake_up_an_idle_cpu(); }
 }
 
@@ -1881,6 +1898,7 @@ pub fn service_deferred_poll_wake() {
 /// no-indefinite-wait contract (bounded `try_lock_spin`). Returns false (wake
 /// deferred) if RUN_QUEUE stays held on another CPU past the bound; the next
 /// tick retries.
+#[track_caller]
 pub fn try_wake_poll() -> bool { try_wake_poll_tagged(POLL_TAG_ALL) }
 
 /// How long an IRQ-context poll wake may wait for `RUN_QUEUE` before deferring
@@ -1890,12 +1908,16 @@ pub fn try_wake_poll() -> bool { try_wake_poll_tagged(POLL_TAG_ALL) }
 const TICK_LOCK_WAIT_NS: u64 = 50_000;
 
 /// Non-blocking `wake_poll_tagged` for IRQ / tick context.
+#[track_caller]
 pub fn try_wake_poll_tagged(tag: u64) -> bool {
     match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
             lockwatch::note_wake_try(true);
             let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
             drop(rq);
+            if idlestat::ENABLED {
+                idlestat::note_wake(core::panic::Location::caller(), tag == POLL_TAG_ALL, woken);
+            }
             if woken > 0 { wake_up_an_idle_cpu(); }
             true
         }
@@ -1904,7 +1926,8 @@ pub fn try_wake_poll_tagged(tag: u64) -> bool {
 }
 
 /// Poll-deadline tick service (IRQ/tick context): wake every poll-channel
-/// waiter whose per-task deadline is due (or all, when a timerfd has expired),
+/// waiter whose per-task deadline is due, or whose interest mask names a
+/// timerfd that expired on this pass (`timerfd_tags`),
 /// then republish `NEXT_POLL_DEADLINE` to the EXACT earliest remaining deadline.
 ///
 /// This replaces the old wake-then-`store(u64::MAX)` reset. That reset raced
@@ -1922,14 +1945,17 @@ pub fn try_wake_poll_tagged(tag: u64) -> bool {
 /// Bounded wait (`try_lock_spin`, ≤ `TICK_LOCK_WAIT_NS`) for the tick's
 /// contract; a tick that still finds the lock held leaves the hint and retries
 /// next tick (≤10 ms defer, within the timeout granularity).
-pub fn service_poll_deadlines(now: u64, timerfd_due: bool) -> bool {
+pub fn service_poll_deadlines(now: u64, timerfd_tags: u64) -> bool {
     match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
             lockwatch::note_tick_try(lockwatch::L_RUN_QUEUE, true);
             let (new_min, woken) =
-                rq.wake_due_poll_deadlines(POLL_WAIT_CHANNEL, now, timerfd_due);
+                rq.wake_due_poll_deadlines(POLL_WAIT_CHANNEL, now, timerfd_tags);
             NEXT_POLL_DEADLINE.store(new_min, Ordering::Relaxed); // exact, under the lock
             drop(rq);
+            if idlestat::ENABLED && woken > 0 {
+                idlestat::note_wake(core::panic::Location::caller(), timerfd_tags == POLL_TAG_ALL, woken);
+            }
             if woken > 0 { wake_up_an_idle_cpu(); }
             true
         }
@@ -2887,6 +2913,34 @@ pub fn prefault_user_page(addr: usize) -> bool {
     page_fault(addr, false, true)
 }
 
+/// Make `[ptr, ptr+len)` of the current process safe for a kernel access:
+/// every page present, and (unless `read_only`) no page still shared
+/// copy-on-write. File-backed pages are read with the address space
+/// UNLOCKED, through the real fault path: `prefault_range` stops at each
+/// absent file page, the lock is dropped, the page is faulted in, and the
+/// walk resumes after it. So no prefault ever holds `busy` across file I/O.
+/// A page that cannot be populated (past EOF, bad address) is skipped and
+/// left to the caller's own access to report.
+pub fn prefault_current_range(ptr: usize, len: usize, read_only: bool) {
+    if ptr == 0 || len == 0 { return; }
+    let end = match ptr.checked_add(len) { Some(e) => e, None => return };
+    let mut from = ptr;
+    while from < end {
+        let pid = current_pid();
+        let next = with_address_space_mut(pid, |as_| {
+            if read_only { as_.prefault_range_ro(from, end - from) }
+            else { as_.prefault_range(from, end - from) }
+        }).flatten();
+        match next {
+            None => return,
+            Some(va) => {
+                let _ = prefault_user_page(va);
+                from = va + mm::buddy::PAGE_SIZE;
+            }
+        }
+    }
+}
+
 fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
     fn print_str(s: &str) {
         extern "C" { fn arch_serial_putc(c: u8); }
@@ -3413,6 +3467,13 @@ fn scheduler_run_loop() -> ! {
         if let Some((idx, ctx_ptr, dispatched_pid, kernel_stack_top_virt, page_table, tgid, reply_port, as_ptr)) = picked {
             let dispatched_at = ticks();
             let dispatched_ns = unsafe { arch_monotonic_ns() };
+            if idlestat::ENABLED {
+                let l = LAST_SYSCALL[(dispatched_pid as usize) & 1023].load(Ordering::Relaxed);
+                let sc = if (l >> 32) as u32 == dispatched_pid && l & 1 != 0 {
+                    ((l >> 1) & 0x7FFF_FFFF) as u32
+                } else { u32::MAX };
+                idlestat::on_dispatch(dispatched_pid, tgid, sc);
+            }
             let pid;
 
             unsafe {
@@ -3521,11 +3582,15 @@ fn scheduler_run_loop() -> ! {
                 mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
             }
         } else {
+            let t_idle = if idlestat::ENABLED { unsafe { arch_monotonic_ns() } } else { 0 };
             unsafe {
                 #[cfg(target_arch = "x86_64")]
                 core::arch::asm!("sti; hlt; cli");
                 #[cfg(target_arch = "aarch64")]
                 core::arch::asm!("msr daifclr, #2; wfi; msr daifset, #2");
+            }
+            if idlestat::ENABLED {
+                idlestat::on_idle(id, unsafe { arch_monotonic_ns() }.saturating_sub(t_idle));
             }
         }
     }

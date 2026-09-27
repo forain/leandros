@@ -983,6 +983,24 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     // hunting for a driver that cannot work under QEMU.
     if argc > 1 {
         let a1 = *argv.add(1) as *const u8;
+        // `--ctx-drain-us N`: set how long a closing open waits for its GPU
+        // context's fenced work before destroying it (root ioctl 0x100A;
+        // `-1` or no N restores the default). 0 forces the abandon path.
+        if arg_is(a1, b"--ctx-drain-us") {
+            let mut v = u64::MAX;
+            if argc > 2 {
+                let p = *argv.add(2) as *const u8;
+                if !p.is_null() && (*p).is_ascii_digit() {
+                    v = 0; let mut k = 0usize;
+                    while (*p.add(k)).is_ascii_digit() { v = v * 10 + (*p.add(k) - b'0') as u64; k += 1; }
+                }
+            }
+            let mut val = v;
+            let ok = ioctl(fd, 0x100A as c_ulong, &mut val as *mut u64) == 0;
+            print_dec(b"drmsmoke: ctx drain override old=", val);
+            close(fd);
+            return if ok { 0 } else { 1 };
+        }
         let arm = arg_is(a1, b"--arm-v3d");
         if arm || arg_is(a1, b"--disarm-v3d") {
             let mut cc = DrmSetClientCap {

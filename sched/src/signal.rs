@@ -1282,8 +1282,8 @@ mod aarch64 {
         // syscalls on other CPUs without pinning the run-queue lock.
         let ok = {
             let pid = super::super::current_pid();
+            super::super::prefault_current_range(new_sp, SIGFRAME_SIZE, false);
             super::super::with_address_space_mut(pid, |as_| {
-                as_.prefault_range(new_sp, SIGFRAME_SIZE);
                 as_.write_user_buf(new_sp, &buf)
             }).unwrap_or(false)
         };
@@ -1525,8 +1525,8 @@ mod x86_64 {
         // per-address-space lock (see that path's comment).
         let ok = {
             let pid = super::super::current_pid();
+            super::super::prefault_current_range(new_sp, SIGFRAME_SIZE, false);
             super::super::with_address_space_mut(pid, |as_| {
-                as_.prefault_range(new_sp, SIGFRAME_SIZE);
                 as_.write_user_buf(new_sp, &buf)
             }).unwrap_or(false)
         };
