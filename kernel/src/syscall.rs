@@ -311,11 +311,13 @@ const USER_STACK_TOP: usize = 0x0000_7fff_ffff_f000;
 /// main-thread stack `ulimit -s`). The prior 256 KiB was far too small for real
 /// Rust async runtimes (tokio + zbus): legitimate deep async call chains can
 /// exceed it, faulting exactly one frame below the stack base. The stack is
-/// mapped eagerly; 8 MiB × the handful of concurrent desktop processes is well
-/// within the 2 GiB guest. (Note: a truly *unbounded*-recursion bug still
-/// overflows any finite stack — see the cosmic-comp COSMIC_SESSION_SOCK issue —
-/// so this is a correctness/robustness raise, not a fix for that.)
+/// demand-paged (see execve), so only the touched part is resident. (Note: a
+/// truly *unbounded*-recursion bug still overflows any finite stack — see the
+/// cosmic-comp COSMIC_SESSION_SOCK issue — so this is a correctness/robustness
+/// raise, not a fix for that.)
 const USER_STACK_SIZE: usize = 2048 * mm::buddy::PAGE_SIZE;
+/// Stack populated below the initial SP at exec (demand-paged beyond that).
+const STACK_PREFAULT: usize = 4 * mm::buddy::PAGE_SIZE;
 
 /// ELF `e_type` for a position-independent (dynamic/PIE) object.
 const ET_DYN: u16 = 3;
@@ -1890,7 +1892,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         let tm = monotonic_ns();
         let mapped = with_current_address_space_mut(|as_| {
             if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
-            as_.map_lazy(virt, len, page_flags, is_shared)
+            // Record the real protection: PROT_NONE (thread-stack guards,
+            // reservations) must fault, not read as zero (see the fault path).
+            as_.map_lazy(virt, len, page_flags, is_shared) && { as_.set_prot(virt, prot as u32 & 7); true }
         });
         tr.map_ns = monotonic_ns().wrapping_sub(tm);
         return match mapped {
@@ -1898,7 +1902,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             Some(false) => {
                 if flags & MAP_FIXED == 0 && addr != 0 {
                     let bump = MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed);
-                    let m2 = with_current_address_space_mut(|as_| as_.map_lazy(bump, len, page_flags, is_shared));
+                    let m2 = with_current_address_space_mut(|as_| {
+                        as_.map_lazy(bump, len, page_flags, is_shared) && { as_.set_prot(bump, prot as u32 & 7); true }
+                    });
                     match m2 {
                         Some(true) => bump as isize,
                         _ => enomem_map_site(("mmap/anon/bump-retry")),
@@ -2246,6 +2252,7 @@ fn sys_mremap(
     old_addr: usize, old_size: usize, new_size: usize,
     flags: usize, new_addr: usize,
 ) -> isize {
+    const MREMAP_MAYMOVE: usize = 1;
     const MREMAP_FIXED: usize = 2;
     const PAGE: usize = 4096;
 
@@ -2260,6 +2267,19 @@ fn sys_mremap(
         let tail_len = (old_pages - new_pages) * PAGE;
         with_current_address_space_mut(|as_| as_.unmap(tail, tail_len));
         return old_addr as isize;
+    }
+
+    // Without MREMAP_MAYMOVE (or MREMAP_FIXED) Linux never moves the
+    // mapping: it grows in place or fails ENOMEM, and an unmapped old range
+    // is EFAULT. musl's pthread_getattr_np() on the main thread relies on
+    // exactly that, probing `mremap(p, PAGE, 2*PAGE, 0)` page by page down
+    // the stack until the answer is no longer ENOMEM. The move below would
+    // instead have carried a live stack page away (punching a hole in the
+    // stack) and, below the stack, answered ENOMEM forever.
+    if flags & (MREMAP_MAYMOVE | MREMAP_FIXED) == 0 {
+        return with_current_address_space_mut(|as_| {
+            as_.grow_in_place(old_addr, old_pages * PAGE, new_pages * PAGE)
+        }).unwrap_or(-14);
     }
 
     // Grow: allocate a new (larger) anonymous region.
@@ -4109,9 +4129,15 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     drop(vfs_elf_data);
     drop(header_data);
 
-    // Map user stack (read+write, eager so virt_to_phys works immediately).
+    // Reserve the user stack. It is demand-paged like any anonymous private
+    // mapping: only the pages holding argv/envp/auxv (plus a small prefault
+    // below the initial SP, see STACK_PREFAULT) are populated here, the rest
+    // on first touch. The VMA is fixed at USER_STACK_SIZE; nothing is mapped
+    // below it, so running off its bottom faults outside any VMA and raises
+    // SIGSEGV (the guard). Until 2026-09-26 all 8 MiB were allocated eagerly
+    // at every exec — ~8 MiB of untouched RSS per process.
     let stack_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE;
-    if !new_as.map(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, stack_flags) {
+    if !new_as.map_lazy(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, stack_flags, false) {
         let r = enomem_map_site("execve/user-stack");
         drop(new_as); return r;
     }
@@ -4200,19 +4226,22 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let str_base_va = user_sp + total_ptr_bytes;
     let rand_va     = str_base_va + argv_str_total + envp_str_total;
 
-    // Get physical address of the start of the stack frame.
-    let phys_base = match new_as.virt_to_phys(user_sp) {
-        Some(p) => p, None => { drop(new_as); return enomem_site("execve/stack-not-backed"); }
-    };
-    let virt_base = mm::phys_to_virt(phys_base);
+    // Populate the frame's pages plus STACK_PREFAULT below the initial SP
+    // (the first few call frames of ld.so / _start, which would otherwise
+    // each take a fault straight away).
+    let prefault_lo = user_sp.saturating_sub(STACK_PREFAULT).max(USER_STACK_TOP - USER_STACK_SIZE);
+    new_as.prefault_range(prefault_lo, USER_STACK_TOP - prefault_lo);
 
-    // Write the stack frame to kernel-accessible virtual memory (HHDM).
-    // Helper: write a u64 at byte offset `off` into the physical frame.
+    // Build the frame [user_sp, USER_STACK_TOP) in a kernel buffer, then copy
+    // it in page by page (the stack's frames are no longer one contiguous
+    // physical block).
+    let mut frame: Vec<u8> = alloc::vec![0u8; USER_STACK_TOP - user_sp];
+    let fb = frame.as_mut_ptr();
     let write64 = |off: usize, val: u64| unsafe {
-        core::ptr::write((virt_base + off) as *mut u64, val);
+        core::ptr::copy_nonoverlapping(val.to_le_bytes().as_ptr(), fb.add(off), 8);
     };
     let write8 = |off: usize, src: *const u8, len: usize| unsafe {
-        core::ptr::copy_nonoverlapping(src, (virt_base + off) as *mut u8, len);
+        core::ptr::copy_nonoverlapping(src, fb.add(off), len);
     };
 
     // Pointer table section.
@@ -4265,16 +4294,20 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     }
 
     // String data section.
-    let str_phys = phys_base + total_ptr_bytes;
-    write8(str_phys - phys_base, argv.data.as_ptr(), argv_str_total);
-    write8(str_phys - phys_base + argv_str_total, envp.data.as_ptr(), envp_str_total);
+    write8(total_ptr_bytes, argv.data.as_ptr(), argv_str_total);
+    write8(total_ptr_bytes + argv_str_total, envp.data.as_ptr(), envp_str_total);
 
     // AT_RANDOM data: 16 bytes of pseudo-random.
-    let rand_phys = phys_base + total_ptr_bytes + argv_str_total + envp_str_total;
+    let rand_off = total_ptr_bytes + argv_str_total + envp_str_total;
     let r0 = t ^ 0xdeadbeef_cafebabe_u64;
     let r1 = t.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    write8(rand_phys - phys_base, r0.to_le_bytes().as_ptr(), 8);
-    write8(rand_phys - phys_base + 8, r1.to_le_bytes().as_ptr(), 8);
+    write8(rand_off, r0.to_le_bytes().as_ptr(), 8);
+    write8(rand_off + 8, r1.to_le_bytes().as_ptr(), 8);
+
+    if !new_as.write_user_buf(user_sp, &frame) {
+        drop(new_as); return enomem_site("execve/stack-not-backed");
+    }
+    drop(frame);
 
     // Release argv/envp buffers before the AS swap.
     drop(argv);
