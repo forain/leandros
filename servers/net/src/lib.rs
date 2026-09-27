@@ -140,10 +140,17 @@ pub const SOCK_FD_BASE: usize = 0x100;
 /// TTY_FD_BASE relocated to 0x1000 — is disjoint from every other fd range.
 pub const SOCK_FD_END: usize = SOCK_FD_BASE + MAX_SOCKS;
 
-const MAX_PROCS:   usize = 64;
+/// Processes that can hold a socket table: every process can (fork copies the
+/// parent's), so this is the scheduler's task limit. 64 -> 512 (lane procpool,
+/// 2026-09-27): a COSMIC session holds 27 tables and each cosmic-term adds 2,
+/// so 64 capped a desktop at ~18 terminals. Tables are heap-allocated on first
+/// use (see `SockTables`), so the cap costs 8 bytes per slot until used.
+const MAX_PROCS:   usize = sched::runqueue::MAX_TASKS;
 /// Per-process socket fd cap. Raised 16→512 for a COSMIC-class workload (a
 /// compositor holds a socket per client + the bus + internal socketpairs).
-const MAX_SOCKS:   usize = 512;
+/// 510, not 512: that keeps a whole `ProcSockTable` (pid + flag + entries)
+/// within 32 KiB, one order-3 buddy block instead of an order-4 one.
+const MAX_SOCKS:   usize = 510;
 /// Connection-pair pool. Raised 32→256 (K1 acceptance: 64 socketpairs + 32
 /// listener connections concurrently; headroom for the desktop session).
 const MAX_CONNS:   usize = 256;
@@ -663,25 +670,102 @@ impl ProcSockTable {
     }
 }
 
-static SOCK_TABLES: Mutex<[ProcSockTable; MAX_PROCS]> =
-    Mutex::new([const { ProcSockTable::empty() }; MAX_PROCS]);
+const _: () = assert!(::core::mem::size_of::<ProcSockTable>() <= 32 * 1024);
+
+/// The per-process socket tables. A static `[ProcSockTable; 512]` would be
+/// 16 MiB, and the old 64-slot one already put 2 MiB in the kernel image
+/// (`SockState::None` is not zero bytes). So each table is allocated on first
+/// use and then kept for reuse: a freed table is only marked `!in_use`.
+///
+/// Invariant: `slots[..n]` are all `Some` and `slots[n..]` all `None`, so the
+/// k-th table `iter()` yields is `self[k]` — which is what lets the call sites
+/// keep their `iter().position(..)` + index pattern.
+struct SockTables {
+    n:     usize,
+    slots: [Option<TableBox>; MAX_PROCS],
+}
+
+type TableBox = alloc::boxed::Box<ProcSockTable>;
+type SockIter<'a> = ::core::iter::Map<::core::iter::Flatten<::core::slice::Iter<'a, Option<TableBox>>>,
+                                      fn(&TableBox) -> &ProcSockTable>;
+type SockIterMut<'a> = ::core::iter::Map<::core::iter::Flatten<::core::slice::IterMut<'a, Option<TableBox>>>,
+                                         fn(&mut TableBox) -> &mut ProcSockTable>;
+
+impl SockTables {
+    const fn new() -> Self { Self { n: 0, slots: [const { None }; MAX_PROCS] } }
+
+    // Named iterator types, not `impl Iterator`: an opaque type may have a
+    // destructor, which would stretch every `match tbls.iter().find(..)`
+    // borrow to the end of the statement and break the call sites.
+    fn iter(&self) -> SockIter<'_> {
+        fn deref(b: &TableBox) -> &ProcSockTable { b }
+        self.slots[..self.n].iter().flatten().map(deref as fn(&TableBox) -> &ProcSockTable)
+    }
+
+    fn iter_mut(&mut self) -> SockIterMut<'_> {
+        fn deref(b: &mut TableBox) -> &mut ProcSockTable { b }
+        self.slots[..self.n].iter_mut().flatten().map(deref as fn(&mut TableBox) -> &mut ProcSockTable)
+    }
+
+    /// A free table, allocating one if every allocated table is live. Built in
+    /// place on the heap: `ProcSockTable::empty()` by value would be a ~32 KiB
+    /// temporary on the kernel stack.
+    fn claim(&mut self) -> Option<usize> {
+        if let Some(pos) = self.iter().position(|t| !t.in_use) { return Some(pos); }
+        if self.n == MAX_PROCS { return None; }
+        let layout = ::core::alloc::Layout::new::<ProcSockTable>();
+        let p = unsafe { alloc::alloc::alloc(layout) } as *mut ProcSockTable;
+        if p.is_null() { return None; }
+        unsafe {
+            ::core::ptr::addr_of_mut!((*p).pid).write(0);
+            ::core::ptr::addr_of_mut!((*p).in_use).write(false);
+            let socks = ::core::ptr::addr_of_mut!((*p).socks) as *mut SockEntry;
+            for i in 0..MAX_SOCKS { socks.add(i).write(SockEntry::empty()); }
+            self.slots[self.n] = Some(alloc::boxed::Box::from_raw(p));
+        }
+        self.n += 1;
+        Some(self.n - 1)
+    }
+}
+
+impl ::core::ops::Index<usize> for SockTables {
+    type Output = ProcSockTable;
+    fn index(&self, i: usize) -> &ProcSockTable { self.slots[..self.n][i].as_deref().unwrap() }
+}
+
+impl ::core::ops::IndexMut<usize> for SockTables {
+    fn index_mut(&mut self, i: usize) -> &mut ProcSockTable { self.slots[..self.n][i].as_deref_mut().unwrap() }
+}
+
+static SOCK_TABLES: Mutex<SockTables> = Mutex::new(SockTables::new());
+
+/// One serial line, the first time no socket table can be had for a process.
+fn report_sock_tables_full() {
+    static REPORTED: ::core::sync::atomic::AtomicBool = ::core::sync::atomic::AtomicBool::new(false);
+    if REPORTED.swap(true, ::core::sync::atomic::Ordering::Relaxed) { return; }
+    extern "C" { fn arch_serial_putc(c: u8); }
+    for &b in b"\n[NET] socket-table pool FULL (ENFILE) -- net::MAX_PROCS or heap, not this process's fd limit\n" {
+        unsafe { arch_serial_putc(b); }
+    }
+}
 
 // ── Table helpers ─────────────────────────────────────────────────────────────
 
-fn find_tbl<'a>(pid: u32, tbls: &'a mut [ProcSockTable]) -> Option<&'a mut ProcSockTable> {
+fn find_tbl<'a>(pid: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcSockTable> {
     tbls.iter_mut().find(|t| t.in_use && t.pid == pid)
 }
 
-fn get_or_create<'a>(pid: u32, tbls: &'a mut [ProcSockTable]) -> Option<&'a mut ProcSockTable> {
+fn get_or_create<'a>(pid: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcSockTable> {
     if let Some(pos) = tbls.iter().position(|t| t.in_use && t.pid == pid) {
         return Some(&mut tbls[pos]);
     }
-    if let Some(pos) = tbls.iter().position(|t| !t.in_use) {
+    if let Some(pos) = tbls.claim() {
         tbls[pos].reset();
         tbls[pos].in_use = true;
         tbls[pos].pid    = pid;
         return Some(&mut tbls[pos]);
     }
+    report_sock_tables_full();
     None
 }
 
@@ -711,7 +795,7 @@ fn is_loopback_addr(addr: IpAddress) -> bool {
 /// `reserved` is a `time_wait_snapshot` taken by the caller before it locked
 /// SOCK_TABLES: an automatic port must skip a port still in TIME_WAIT, and the
 /// snapshot is what keeps TIME_WAIT from being locked underneath SOCK_TABLES.
-fn alloc_ephemeral_port(tbls: &[ProcSockTable], reserved: &[u16]) -> Option<u16> {
+fn alloc_ephemeral_port(tbls: &SockTables, reserved: &[u16]) -> Option<u16> {
     const EPHEMERAL_LO: u32 = 32768;
     const EPHEMERAL_HI: u32 = 60999;
     let span  = EPHEMERAL_HI - EPHEMERAL_LO + 1;
@@ -929,7 +1013,7 @@ fn xfer_import(pid: u32, x: XferFd, cloexec: bool) -> isize {
         XferFd::Vfs(tf) => vfs::import_fd(pid, tf, cloexec),
         XferFd::Sock(entry) => {
             let mut tbls = SOCK_TABLES.lock();
-            let Some(tbl) = get_or_create(pid, &mut *tbls) else { return -12 }; // ENOMEM
+            let Some(tbl) = get_or_create(pid, &mut *tbls) else { return -23 }; // ENFILE
             let Some(slot) = tbl.alloc() else { return -24 };                   // EMFILE
             let mut e = entry;
             e.cloexec = cloexec;
@@ -1354,7 +1438,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
     }
     let mut tbls = SOCK_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) {
-        Some(t) => t, None => return err_reply(-12),
+        Some(t) => t, None => return err_reply(-23), // ENFILE: table pool full
     };
     let slot = match tbl.alloc() { Some(s) => s, None => return err_reply(-24) };
     let state = if domain == AF_INET && protocol == IPPROTO_ICMP {
@@ -1995,7 +2079,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
 
     let mut tbls = SOCK_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) {
-        Some(t) => t, None => return err_reply(-12),
+        Some(t) => t, None => return err_reply(-23), // ENFILE: table pool full
     };
     const SOCK_CLOEXEC: usize = 0x80000;
     const SOCK_NONBLOCK: usize = 0x800;

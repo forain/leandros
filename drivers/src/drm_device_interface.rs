@@ -535,6 +535,10 @@ static UNKNOWN_IOCTLS: Mutex<NoteSet> = Mutex::new(NoteSet::new());
 /// EXECBUFFER requests carrying fields we do not act on, keyed by the shape of
 /// the divergence rather than by the call.
 static EXEC_DIVERGENCE: Mutex<NoteSet> = Mutex::new(NoteSet::new());
+/// VIRTGPU_GET_CAPS requests, keyed by `(cap_set_id, cap_set_ver)`. Mesa's
+/// venus driver asks once per context, so every new GL/Vulkan client printed
+/// the same line and a desktop of terminals flooded serial with it.
+static GET_CAPS_NOTED: Mutex<NoteSet> = Mutex::new(NoteSet::new());
 
 
 // ── Standard Linux DRM Structs ───────────────────────────────────────────────
@@ -1233,7 +1237,10 @@ fn hostvis_free(off: u64) {
 // LOCK ORDER: VIRTGPU_CTXS is a leaf. Never hold it across `VIRTIO_GPU.lock()`
 // and never across a user-memory access — a demand fault taken under a spinlock
 // is the 82d0cc3 all-vCPU freeze class.
-const MAX_GPU_CTXS: usize = 16;
+// One per open of the render node, i.e. per GL/Vulkan client. 16 -> 256 (lane
+// procpool, 2026-09-27): every cosmic-term is a wgpu client, so 16 capped a
+// desktop at about ten terminals, the rest refused a context with no message.
+const MAX_GPU_CTXS: usize = 256;
 
 #[derive(Clone, Copy)]
 struct GpuCtx {
@@ -1358,7 +1365,14 @@ fn ctx_bind(open_id: u32, ctx_id: u32, capset: u32, num_rings: u32) -> Result<()
             };
             Ok(())
         }
-        None => Err(CTX_BIND_NO_SLOT),
+        None => {
+            drop(t);
+            static REPORTED: ::core::sync::atomic::AtomicBool = ::core::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, ::core::sync::atomic::Ordering::Relaxed) {
+                crate::pci::serial_debug("[DRM] VIRTGPU_CTXS FULL: 3D context refused -- MAX_GPU_CTXS, not the host\n");
+            }
+            Err(CTX_BIND_NO_SLOT)
+        }
     }
 }
 
@@ -6128,6 +6142,9 @@ impl DrmDeviceInterface {
         const MAX_CAPS_BYTES: usize = 1 << 20;
         let want = (caps.size as usize).min(MAX_CAPS_BYTES);
 
+        // Decided before the device lock: NoteSet locks are leaves.
+        let note = GET_CAPS_NOTED.lock().first((caps.cap_set_id & 0xffff) | (caps.cap_set_ver << 16));
+
         // Fetch into a kernel buffer under the device lock …
         let blob = {
             let mut guard = crate::virtio_gpu::lock_gpu();
@@ -6140,19 +6157,25 @@ impl DrmDeviceInterface {
             let (max_ver, max_size) = match gpu.find_capset(caps.cap_set_id) {
                 Some(v) => v,
                 None => {
-                    crate::pci::serial_debug("[DRM] GET_CAPS: host exposes no capset id ");
-                    crate::pci::serial_debug_hex(caps.cap_set_id);
-                    crate::pci::serial_debug("\n");
+                    if note {
+                        crate::pci::serial_debug("[DRM] GET_CAPS: host exposes no capset id ");
+                        crate::pci::serial_debug_hex(caps.cap_set_id);
+                        crate::pci::serial_debug(" (first request; repeats not logged)\n");
+                    }
                     return Err(DriverError::InvalidParameter);
                 }
             };
-            crate::pci::serial_debug("[DRM] GET_CAPS capset=");
-            crate::pci::serial_debug_hex(caps.cap_set_id);
-            crate::pci::serial_debug(" host max_ver=");
-            crate::pci::serial_debug_hex(max_ver);
-            crate::pci::serial_debug(" max_size=");
-            crate::pci::serial_debug_hex(max_size);
-            crate::pci::serial_debug("\n");
+            if note {
+                crate::pci::serial_debug("[DRM] GET_CAPS capset=");
+                crate::pci::serial_debug_hex(caps.cap_set_id);
+                crate::pci::serial_debug(" ver=");
+                crate::pci::serial_debug_hex(caps.cap_set_ver);
+                crate::pci::serial_debug(" host max_ver=");
+                crate::pci::serial_debug_hex(max_ver);
+                crate::pci::serial_debug(" max_size=");
+                crate::pci::serial_debug_hex(max_size);
+                crate::pci::serial_debug(" (first request; repeats not logged)\n");
+            }
             if max_size == 0 {
                 return Err(DriverError::InvalidParameter);
             }

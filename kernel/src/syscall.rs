@@ -99,6 +99,13 @@ fn exec_file_register(port: u32, file_id: u32) -> Option<usize> {
             return Some(i + 1);
         }
     }
+    drop(tbl);
+    // Not an error (exec falls back to loading the whole image), but it costs
+    // RAM per process, so say so once.
+    static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::serial_print_str("\n[EXEC] EXEC_FILES full: exec falls back to eager whole-image loads -- MAX_EXEC_FILES\n");
+    }
     None
 }
 
@@ -1728,6 +1735,9 @@ fn dispatch_inner(
             // fd tables are keyed by tgid — see the identical note in
             // sys_clone_or_fork's fork arm.
             let parent_pid = sched::tgid_of(current_pid());
+            // The child needs its own fd table; fail like Linux on a full
+            // process pool rather than create a child whose fds are invisible.
+            if !vfs::fd_table_slot_free() { return -11; } // EAGAIN
             // The fd table must be duplicated BEFORE the child is enqueued:
             // on SMP another CPU can run the child immediately, and its
             // first fd-allocating syscall would otherwise see an empty table.
@@ -6434,7 +6444,9 @@ fn sys_lseek(fd: usize, offset: usize, whence: usize) -> isize {
 // chasing why `bottom`'s interactive TUI never responded to input; see
 // project_tty_isatty_and_vfork_tls.md. Only O_NONBLOCK is tracked: it's
 // the only flag `sys_read_impl`'s fd-0 branch actually consults.
-const MAX_STDIO_FLAGS_PROCS: usize = 64;
+// One slot per process that has F_SETFL'd its stdio: sized to the task limit
+// (was 64, lane procpool 2026-09-27), 12 contiguous bytes a slot.
+const MAX_STDIO_FLAGS_PROCS: usize = sched::runqueue::MAX_TASKS;
 const O_NONBLOCK: u32 = 0x800;
 
 struct StdioFlags { pid: u32, in_use: bool, flags: u32 }
@@ -6468,6 +6480,13 @@ fn set_stdio_flags(pid: u32, flags: u32) {
     }
     if let Some(s) = tbl.iter_mut().find(|s| !s.in_use) {
         *s = StdioFlags { pid, in_use: true, flags };
+        return;
+    }
+    drop(tbl);
+    // F_SETFL still answers 0 (it has no error for this), so say it once.
+    static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::serial_print_str("\n[SYSCALL] STDIO_FLAGS table FULL: fcntl(0-2, F_SETFL) flags dropped -- MAX_STDIO_FLAGS_PROCS, not RAM\n");
     }
 }
 
@@ -10305,6 +10324,9 @@ fn sys_clone_or_fork(
         // Identify the parent by tgid: its fd table is keyed there, not by the
         // (possibly non-leader) forking thread's pid.
         let parent_pid = sched::tgid_of(current_pid());
+        // A vfork-style child gets its own fd table (below): EAGAIN up front
+        // when the vfs pool has none left, as for fork.
+        if flags & CLONE_THREAD == 0 && !vfs::fd_table_slot_free() { return -11; }
         clone_thread(flags, child_stack, tls, ptid, ctid, frame_ptr, |child_pid| {
             // Real CLONE_THREAD siblings (pthread_create) share the leader's
             // tgid and, today, have no fd table of their own at all — every
@@ -10335,6 +10357,7 @@ fn sys_clone_or_fork(
         // worker calling std's pre_exec fork path) otherwise names a pid the
         // fd-table search never matches, and the child inherits an empty table.
         let parent_pid = sched::tgid_of(current_pid());
+        if !vfs::fd_table_slot_free() { return -11; } // EAGAIN, as for FORK
         // Duplicate the fd table before the child becomes runnable (see the
         // FORK arm of syscall_dispatch for the SMP race this prevents).
         let ret = fork_current(frame_ptr, |child_pid| {
