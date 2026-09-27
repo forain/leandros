@@ -63,14 +63,25 @@ const DM_LOG_OLD: &[u8] = b"/var/log/greetd.log.1\0";
 /// wrote 8.4 M lines, over a gigabyte, before the guest died.
 const DM_LOG_CAP: usize = 8 << 20;
 /// Memory-pressure guard (`mem_guard`): when MemAvailable stays below this
-/// floor for `MEM_GUARD_STRIKES` consecutive checks `MEM_GUARD_PERIOD_SECS`
-/// apart, init kills the graphical login's tree, as systemd-oomd kills a
-/// session's cgroup. The floor is the larger of a fixed minimum and a
-/// fraction of RAM.
+/// floor for `MEM_GUARD_PERSIST_MS`, init kills the largest process on the
+/// graphical side (see `mem_guard`), as systemd-oomd does. The floor is the
+/// larger of a fixed minimum and a fraction of RAM.
 const MEM_GUARD_MIN_KIB: u64 = 96 * 1024;
 const MEM_GUARD_DIVISOR: u64 = 10;
-const MEM_GUARD_PERIOD_SECS: u64 = 2;
-const MEM_GUARD_STRIKES: u32 = 2;
+/// Sampling period while memory is plentiful and not falling fast.
+const MEM_GUARD_PERIOD_MS: u64 = 2000;
+/// Sampling period once MemAvailable is near/below the floor or falling fast
+/// enough to reach it within `MEM_GUARD_HORIZON_MS` — the supervisor loop's
+/// own tick, so it costs no extra wakeups.
+const MEM_GUARD_FAST_MS: u64 = 250;
+const MEM_GUARD_HORIZON_MS: u64 = 2 * MEM_GUARD_PERIOD_MS + 1000;
+/// How long MemAvailable must stay below the floor before a kill, unless it
+/// is falling so fast that it would be gone within `MEM_GUARD_URGENT_MS`.
+const MEM_GUARD_PERSIST_MS: u64 = 1000;
+const MEM_GUARD_URGENT_MS: u64 = 2000;
+/// After a kill, give the victim's teardown this long to return its memory
+/// before judging again.
+const MEM_GUARD_GRACE_MS: u64 = 2000;
 const DM_PID_FILE: &[u8] = b"/run/greetd-init.pid\0";
 /// Respawn spacing and ceiling. A greeter chain that dies at once (a missing
 /// library, a compositor that cannot open the GPU) must not become a fork
@@ -152,7 +163,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // also reaps any orphan reparented to init, which is simply ignored.
     write_str("Starting getty loop...\n");
     let mut login_pid: i32 = spawn_login();
-    let mut guard = MemGuard { last_check: 0, strikes: 0, victims: 0 };
+    let mut guard = MemGuard { last_ms: 0, last_avail: 0, below_since: 0, fast: false,
+                               grace_until: 0, victims: 0 };
     loop {
         let mut status = 0i32;
         // WNOHANG and a short sleep instead of a blocking wait4, so the
@@ -234,6 +246,12 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
 }
 
 /// CLOCK_MONOTONIC in whole seconds (0 if the clock is unavailable).
+unsafe fn monotonic_ms() -> u64 {
+    let mut ts = timespec { tv_sec: 0, tv_nsec: 0 };
+    if clock_gettime(1, &mut ts) != 0 { return 0; }
+    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
+}
+
 unsafe fn monotonic_secs() -> u64 {
     let mut ts = timespec { tv_sec: 0, tv_nsec: 0 };
     if clock_gettime(1, &mut ts) != 0 { return 0; }
@@ -537,8 +555,15 @@ unsafe fn run_dm_logger(rfd: i32) -> ! {
 
 /// State of the memory-pressure guard between supervisor iterations.
 struct MemGuard {
-    last_check: u64,
-    strikes: u32,
+    /// Time (monotonic ms) and MemAvailable (KiB) of the previous sample.
+    last_ms: u64,
+    last_avail: u64,
+    /// When MemAvailable first went below the floor (0: it is not).
+    below_since: u64,
+    /// Sample every `MEM_GUARD_FAST_MS` instead of `MEM_GUARD_PERIOD_MS`.
+    fast: bool,
+    /// No action before this time (a victim is still being torn down).
+    grace_until: u64,
     /// Single processes killed in the current low-memory episode (reset once
     /// MemAvailable is back above the floor).
     victims: u32,
@@ -556,7 +581,7 @@ const MEM_GUARD_LAST: &[&[u8]] = &[b"cosmic-comp", b"greetd"];
 /// Relieve memory pressure before the kernel's allocator fails under
 /// everything, the way the kernel OOM killer and systemd-oomd do.
 ///
-/// When MemAvailable stays below the floor for `MEM_GUARD_STRIKES` checks,
+/// When MemAvailable stays below the floor for `MEM_GUARD_PERSIST_MS`,
 /// the guard SIGKILLs the one process with the largest resident set
 /// (`/proc/<pid>/statm`) among those that belong to the graphical side:
 /// everything except init, the serial login's session, the log writer and
@@ -569,24 +594,45 @@ const MEM_GUARD_LAST: &[&[u8]] = &[b"cosmic-comp", b"greetd"];
 ///
 /// Until 2026-09-26 the fallback was the only action: `/proc/<pid>/status`
 /// reported a constant VmRSS, so there was no way to choose a victim.
+///
+/// Sampling is adaptive: every `MEM_GUARD_PERIOD_MS` while memory is
+/// plentiful, every `MEM_GUARD_FAST_MS` once MemAvailable is within reach of
+/// the floor at the rate it last fell. A fixed 2 s x 2 checks let a hog
+/// allocating ~160 MiB/s exhaust the guest before the second check (x86_64
+/// and aarch64 alike), which is what the fast mode is for.
 unsafe fn mem_guard(g: &mut MemGuard, dm_pid: i32, login_pid: i32, logger_pid: i32) {
-    let now = monotonic_secs();
-    if now < g.last_check + MEM_GUARD_PERIOD_SECS { return; }
-    g.last_check = now;
+    let now = monotonic_ms();
+    let period = if g.fast { MEM_GUARD_FAST_MS } else { MEM_GUARD_PERIOD_MS };
+    if now < g.last_ms + period { return; }
     let (total, avail) = match meminfo_kib() { Some(v) => v, None => return };
+    let dt = now - g.last_ms;
+    // Rate MemAvailable fell since the last sample, KiB/s (0 if it rose).
+    let falling = if g.last_ms != 0 && g.last_avail > avail && dt > 0 {
+        (g.last_avail - avail) * 1000 / dt
+    } else { 0 };
+    g.last_ms = now;
+    g.last_avail = avail;
     let floor = core::cmp::max(MEM_GUARD_MIN_KIB, total / MEM_GUARD_DIVISOR);
     if avail >= floor {
-        g.strikes = 0;
+        g.below_since = 0;
         g.victims = 0;
+        // Near the floor, or heading there before two slow samples could
+        // confirm it: watch closely.
+        g.fast = avail < floor + floor / 4
+            || (falling > 0 && (avail - floor) * 1000 / falling < MEM_GUARD_HORIZON_MS);
         return;
     }
-    g.strikes += 1;
-    if g.strikes < MEM_GUARD_STRIKES { return; }
-    g.strikes = 0;
+    g.fast = true;
+    if g.below_since == 0 { g.below_since = now; }
+    if now < g.grace_until { return; }
+    let urgent = falling > 0 && avail * 1000 / falling < MEM_GUARD_URGENT_MS;
+    if !urgent && now - g.below_since < MEM_GUARD_PERSIST_MS { return; }
+    g.below_since = 0;
+    g.grace_until = now + MEM_GUARD_GRACE_MS;
 
-    let mut line = [0u8; 192];
+    let mut line = [0u8; 224];
     let mut p = 0;
-    let put = |line: &mut [u8; 192], p: &mut usize, s: &[u8]| {
+    let put = |line: &mut [u8; 224], p: &mut usize, s: &[u8]| {
         let n = s.len().min(line.len() - *p);
         line[*p..*p + n].copy_from_slice(&s[..n]);
         *p += n;
@@ -596,7 +642,13 @@ unsafe fn mem_guard(g: &mut MemGuard, dm_pid: i32, login_pid: i32, logger_pid: i
     let n = fmt_u32(&mut num, (avail / 1024) as u32); put(&mut line, &mut p, &num[..n]);
     put(&mut line, &mut p, b" MiB < floor ");
     let n = fmt_u32(&mut num, (floor / 1024) as u32); put(&mut line, &mut p, &num[..n]);
-    put(&mut line, &mut p, b" MiB; ");
+    put(&mut line, &mut p, b" MiB");
+    if falling > 0 {
+        put(&mut line, &mut p, b", falling ");
+        let n = fmt_u32(&mut num, (falling / 1024) as u32); put(&mut line, &mut p, &num[..n]);
+        put(&mut line, &mut p, b" MiB/s");
+    }
+    put(&mut line, &mut p, b"; ");
 
     let victim = if g.victims < MEM_GUARD_MAX_VICTIMS {
         pick_victim(dm_pid, login_pid, logger_pid)
