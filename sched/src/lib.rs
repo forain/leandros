@@ -1810,6 +1810,13 @@ pub mod poll_class {
     pub const INOTIFY: u32 = 12;
     /// An epoll instance itself, indexed by its slot: what `epoll_ctl` wakes.
     pub const EPOLL:   u32 = 13;
+    /// A connected AF_UNIX end became readable (data or fds queued for it),
+    /// indexed `conn * 2 + side` (side 0 = end A, 1 = end B).
+    pub const UNIX_RD: u32 = 14;
+    /// A connected AF_UNIX end gained write space (its peer drained), same
+    /// index. Data edges wake only these, so a reader parked for POLLIN is
+    /// not woken by its peer draining what it sent, nor by its own sends.
+    pub const UNIX_WR: u32 = 15;
 }
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision

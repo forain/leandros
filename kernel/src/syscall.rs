@@ -9477,7 +9477,9 @@ fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
     // report no seq (data[16]==0) → level. data[32]==1 carries the poll tag
     // (AF_UNIX); inet leaves it 0 → broadcast.
     if fd >= net_server::SOCK_FD_BASE {
-        let msg = make_vfs_msg(net_server::NET_POLL, &[fd as u64]);
+        // `requested` narrows a connected AF_UNIX end's tag to the directions
+        // asked for (see net_server's unix_end_tag); u32::MAX / 0 = both.
+        let msg = make_vfs_msg(net_server::NET_POLL, &[fd as u64, requested as u64]);
         let reply = net_server::handle(&msg, pid);
         let r = net_reply_val(&reply);
         let state = if r < 0 { POLLNVAL } else { r as u32 };
