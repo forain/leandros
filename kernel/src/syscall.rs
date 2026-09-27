@@ -1023,23 +1023,61 @@ fn churn_tick() {
 /// (waker site, tgid): useful vs spurious wakes. Printed every 10 s as
 /// `[GDT]`/`[GDFD]`/`[GDSITE]`. Compile-time gated with `sched::gdwake`.
 pub const GD_STATS: bool = sched::gdwake::ENABLED;
-const GD_K: usize = 18;
+const GD_K: usize = 19;
 const K_EP_CALL: usize = 0; const K_EP_EV: usize = 1; const K_EP_TMO: usize = 2;
 const K_EP_INTR: usize = 3; const K_EP_SPUR: usize = 4; const K_EP_ZERO: usize = 5;
 const K_EP_SHORT: usize = 6; const K_EP_PARK: usize = 7;
 const K_PO_CALL: usize = 8; const K_PO_EV: usize = 9; const K_PO_TMO: usize = 10;
 const K_PO_SPUR: usize = 11; const K_PO_ZERO: usize = 12; const K_PO_SHORT: usize = 13;
 const K_PO_PARK: usize = 14; const K_EAGAIN: usize = 15; const K_SC: usize = 16;
-const K_USEFUL: usize = 17;
+const K_USEFUL: usize = 17; const K_PARKALL: usize = 18;
 const GD_NAMES: [&str; GD_K] = ["ep", "ep_ev", "ep_tmo", "ep_intr", "ep_spur", "ep_zero",
     "ep_short", "ep_park", "po", "po_ev", "po_tmo", "po_spur", "po_zero", "po_short",
-    "po_park", "eagain", "sc", "useful"];
+    "po_park", "eagain", "sc", "useful", "park_all"];
 static GD_PID: [AtomicU32; 1024] = [const { AtomicU32::new(0) }; 1024];
 static GD_TGID: [AtomicU32; 1024] = [const { AtomicU32::new(0) }; 1024];
 static GD_C: [[AtomicU32; GD_K]; 1024] = [const { [const { AtomicU32::new(0) }; GD_K] }; 1024];
 const GD_FDS: usize = 128;
 static GD_FD_KEY: [AtomicU64; GD_FDS] = [const { AtomicU64::new(0) }; GD_FDS];
 static GD_FD_N: [AtomicU32; GD_FDS] = [const { AtomicU32::new(0) }; GD_FDS];
+/// kind << 24 | index: 1 pipe, 2 pty, 3 eventfd, 4 timerfd, 5 device (dev_id),
+/// 6 signalfd, 7 inotify, 8 file, 9 other vfs, 10 socket, 11 epoll.
+static GD_FD_KIND: [AtomicU32; GD_FDS] = [const { AtomicU32::new(0) }; GD_FDS];
+/// Syscalls by (pid, nr): key = pid << 16 | nr.
+const GD_SCN: usize = 256;
+static GD_SCN_KEY: [AtomicU64; GD_SCN] = [const { AtomicU64::new(0) }; GD_SCN];
+static GD_SCN_N: [AtomicU32; GD_SCN] = [const { AtomicU32::new(0) }; GD_SCN];
+
+fn gd_scn(nr: usize) {
+    let key = ((current_pid() as u64) << 16) | (nr as u64 & 0xFFFF);
+    let h = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize % GD_SCN;
+    for k in 0..GD_SCN {
+        let i = (h + k) % GD_SCN;
+        let cur = GD_SCN_KEY[i].load(Ordering::Relaxed);
+        if cur == key || (cur == 0 && GD_SCN_KEY[i].compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed)
+            .map_or_else(|v| v == key, |_| true)) {
+            GD_SCN_N[i].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+fn gd_fd_kind(pid: u32, fd: usize) -> u32 {
+    if fd >= EPOLL_FD_BASE { return 11 << 24; }
+    if fd >= net_server::SOCK_FD_BASE { return 10 << 24; }
+    match vfs::vfs_get_node_kind(pid, fd) {
+        Some(vfs::VnodeKind::Pipe { ring, .. }) => (1 << 24) | ring as u32,
+        Some(vfs::VnodeKind::Pty { pair, .. }) => (2 << 24) | pair as u32,
+        Some(vfs::VnodeKind::EventFd { slot }) => (3 << 24) | slot as u32,
+        Some(vfs::VnodeKind::TimerFd { slot }) => (4 << 24) | slot as u32,
+        Some(vfs::VnodeKind::DynamicDevice { dev_id, .. }) => (5 << 24) | dev_id,
+        Some(vfs::VnodeKind::SignalFd { .. }) => 6 << 24,
+        Some(vfs::VnodeKind::Inotify { .. }) => 7 << 24,
+        Some(vfs::VnodeKind::MountedFile { .. }) | Some(vfs::VnodeKind::TmpFile { .. })
+            | Some(vfs::VnodeKind::RamFile { .. }) => 8 << 24,
+        _ => 9 << 24,
+    }
+}
 const GD_SITES: usize = 64;
 static GD_SITE_KEY: [AtomicU64; GD_SITES] = [const { AtomicU64::new(0) }; GD_SITES];
 static GD_SITE_TG: [AtomicU32; GD_SITES] = [const { AtomicU32::new(0) }; GD_SITES];
@@ -1070,7 +1108,9 @@ fn gd_fd(fd: usize, kind: u64) {
         let cur = GD_FD_KEY[i].load(Ordering::Relaxed);
         if cur == key || (cur == 0 && GD_FD_KEY[i].compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed)
             .map_or_else(|v| v == key, |_| true)) {
-            GD_FD_N[i].fetch_add(1, Ordering::Relaxed);
+            if GD_FD_N[i].fetch_add(1, Ordering::Relaxed) == 0 || GD_FD_KIND[i].load(Ordering::Relaxed) == 0 {
+                GD_FD_KIND[i].store(gd_fd_kind(current_pid(), fd), Ordering::Relaxed);
+            }
             return;
         }
     }
@@ -1136,7 +1176,7 @@ fn gd_tick() {
         if pid == 0 { continue; }
         let mut v = [0u32; GD_K];
         for k in 0..GD_K { v[k] = GD_C[s][k].swap(0, Relaxed); }
-        if v[K_SC] < 20 { continue; }
+        if v.iter().all(|&x| x < 20) { continue; }
         mm::gap2::s("[GDT] pid="); gd_dec(pid as usize);
         mm::gap2::s(" tgid="); gd_dec(GD_TGID[s].load(Relaxed) as usize);
         for k in 0..GD_K {
@@ -1152,6 +1192,19 @@ fn gd_tick() {
         mm::gap2::s("[GDFD] tgid="); gd_dec((key >> 32) as usize);
         mm::gap2::s(" fd="); gd_dec(((key >> 1) & 0xFFFF) as usize);
         mm::gap2::s(if key & 1 == 0 { " via=epoll" } else { " via=poll" });
+        let kd = GD_FD_KIND[i].load(Relaxed);
+        const KN: [&str; 12] = ["?", "pipe", "pty", "eventfd", "timerfd", "dev", "signalfd",
+            "inotify", "file", "vfs", "socket", "epoll"];
+        mm::gap2::s(" kind="); mm::gap2::s(KN[((kd >> 24) as usize).min(11)]);
+        mm::gap2::s("/"); gd_dec((kd & 0xFF_FFFF) as usize);
+        mm::gap2::s(" n="); gd_dec(n as usize); mm::gap2::nl();
+    }
+    for i in 0..GD_SCN {
+        let n = GD_SCN_N[i].swap(0, Relaxed);
+        if n < 50 { continue; }
+        let key = GD_SCN_KEY[i].load(Relaxed);
+        mm::gap2::s("[GDSC] pid="); gd_dec((key >> 16) as usize);
+        mm::gap2::s(" nr="); gd_dec((key & 0xFFFF) as usize);
         mm::gap2::s(" n="); gd_dec(n as usize); mm::gap2::nl();
     }
     for i in 0..GD_SITES {
@@ -1185,6 +1238,7 @@ pub fn dispatch(
     let ret = dispatch_inner(number, a0, a1, a2, a3, a4, a5, frame_ptr);
     if GD_STATS {
         gd_inc(K_SC);
+        gd_scn(number);
         #[cfg(target_arch = "x86_64")]
         let rd = matches!(number, 0 | 19 | 45 | 47);
         #[cfg(target_arch = "aarch64")]
@@ -8741,13 +8795,13 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
                     core::ptr::write_unaligned(
                         (events_ptr + off + EPOLL_EVENT_DATA_OFF) as *mut u64, interest.data);
                 }
+                if GD_STATS { gd_fd(interest.fd as usize, 0); }
                 let mut ep = EPOLL_INSTANCES.lock();
                 if let Some(j) = ep[slot].interests.iter()
                     .position(|x| x.in_use && x.fd == interest.fd) {
                     if let Some(s) = seq { ep[slot].interests[j].last_seq = s; }
                     if interest.events & EPOLLONESHOT != 0 { ep[slot].interests[j].armed = false; }
                 }
-                if GD_STATS { gd_fd(interest.fd as usize, 0); }
                 n += 1;
             }
         }
@@ -8769,6 +8823,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         // NOT park narrow — poll_mask 0 is immune even to a broadcast wake, a
         // hang. Fall back to broadcast.
         let mask = if mask == 0 { sched::POLL_TAG_ALL } else { mask };
+        if GD_STATS && mask == sched::POLL_TAG_ALL { gd_inc(K_PARKALL); }
         sched::block_on_poll_prepare_masked(if infinite { u64::MAX } else { deadline }, mask);
         if epoll_any_ready(pid, slot) || interrupted()
             || (!infinite && monotonic_ns() >= deadline) {
