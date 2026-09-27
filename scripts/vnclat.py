@@ -112,6 +112,22 @@ class Vnc:
                 last = time.time()
         return last
 
+    def quiet_big(self, dur, px, limit=15.0):
+        """Like `quiet`, but only updates that change more than `px`
+        (subsampled) pixels against the previous frame count, so a blinking
+        caret does not keep the window open. Returns the time of the last
+        such update (or the call time if none)."""
+        t0 = time.time()
+        last = t0
+        prev = self.frame()
+        while time.time() - last < dur and time.time() - t0 < limit:
+            if self.pump(0.1):
+                n = self.diff(prev) * (self.h // 2) * (self.w // 2)
+                prev = self.frame()
+                if n > px:
+                    last = self.last_update
+        return last
+
     def wait(self, pred, timeout):
         """Pump until pred() holds; seconds waited, or None on timeout."""
         t0 = time.time()
@@ -175,7 +191,8 @@ def launcher(v, n):
         t0 = time.time()
         keys("t")
         t_echo = v.wait(lambda: v.diff(opened) * v.fb[::2, ::2].shape[0] * v.fb[::2, ::2].shape[1] > 15, 30)
-        last = v.quiet(1.5)
+        # results: the last large repaint (the list), ignoring caret blinks
+        last = v.quiet_big(2.0, 400)
         t_settle = (last - t0) if t_echo is not None else None
         snap(v, f"launcher{i}-typed")
         keys("esc")
