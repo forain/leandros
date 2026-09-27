@@ -1,0 +1,13 @@
+[package]
+name = "uptrtest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "uptrtest"
+path = "src/main.rs"
+
+[dependencies]
+# Linked against librelibc.a (see build.rs), like forktest: fork() goes
+# through the real libc. Every call under test is a raw syscall so the
+# kernel sees exactly the pointer the test chose.
