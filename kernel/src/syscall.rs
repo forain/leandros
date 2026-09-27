@@ -100,13 +100,21 @@ fn exec_file_register(port: u32, file_id: u32) -> Option<usize> {
         }
     }
     drop(tbl);
-    // Not an error (exec falls back to loading the whole image), but it costs
-    // RAM per process, so say so once.
+    // Full: ~70 live processes on a desktop of terminals outnumber the 64
+    // slots, and each slot pins one of the mount's 256 open files, so it is not
+    // simply raised. Back the image by inode instead, through the same
+    // registry private file mappings use: deduplicated per (mount, inode),
+    // pinned with `pin_inode`, and no open-file slot held. The stolen open
+    // file is then released. Without this the image was loaded eagerly
+    // (whole-file read into anonymous memory), per process.
     static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if !REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-        crate::serial_print_str("\n[EXEC] EXEC_FILES full: exec falls back to eager whole-image loads -- MAX_EXEC_FILES\n");
+        crate::serial_print_str("\n[EXEC] EXEC_FILES full: further exec images are backed by inode (MMAP_FILES)\n");
     }
-    None
+    let ino = f2fs_server::inode_by_port(port, file_id as u64)?;
+    let cap = mmap_file_register(port, ino)?;
+    f2fs_server::close_by_port(port, file_id as u64);
+    Some(cap)
 }
 
 /// mm file-read hook.  Runs in page-fault context: everything below is a
