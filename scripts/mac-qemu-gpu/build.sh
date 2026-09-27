@@ -14,21 +14,41 @@
 #              BGRA_EXT readback texture (strict ES rejects RGBA+BGRA, which
 #              made every egl-headless frame black)
 #
-# Usage: scripts/mac-qemu-gpu/build.sh [stage...]
+# ANGLE-on-Vulkan variant (--angle-vulkan): ANGLE also gets its Vulkan backend
+# over MoltenVK, and QEMU defaults ANGLE to it.  ANGLE's Metal backend stops at
+# OpenGL ES 3.0 (upstream too), so the guest's virgl reports ES 3.0 and has no
+# SSBOs; wgpu/iced need ES 3.1 + storage buffers.  ANGLE-Vulkan-MoltenVK
+# reaches ES 3.1 (19 vertex / 23 fragment SSBOs on an M4 Max) once its ES 2.0
+# cap for the missing VK_EXT_provoking_vertex is lifted on Apple
+# (patches/angle-vulkan-moltenvk.patch: flat varyings take the first vertex).
+# Installs to its own prefix/work dir unless LEANDROS_QEMU_PREFIX/_WORK are set.
+# Runtime ANGLE backend is still switchable: ANGLE_DEFAULT_PLATFORM=metal|vulkan.
+#
+# Usage: scripts/mac-qemu-gpu/build.sh [--angle-vulkan] [--force] [stage...]
 #   stages: gn angle epoxy virgl qemu   (default: all, in order; each stage is
 #           skipped when its stamp exists — pass --force to rebuild)
 #           venus: EXPERIMENTAL extra QEMU in $PREFIX-venus (see stage_venus)
 # Env:    LEANDROS_QEMU_PREFIX  install prefix   (default ~/.local/qemu-gpu)
 #         LEANDROS_QEMU_WORK    sources + builds (default ~/.cache/leandros-qemu-gpu)
 #         SDKROOT               (default: newest CLT SDK that has libc++ headers)
+#         --angle-vulkan changes the defaults to ~/.local/qemu-gpu-gles31 and
+#         ~/.cache/leandros-qemu-gpu-gles31, and also needs
+#         `brew install molten-vk vulkan-loader` (runtime dependencies)
 # Host needs: Command Line Tools (no Xcode required), Homebrew with
 #   meson ninja pkgconf python3 glib pixman libslirp libpng jpeg-turbo zstd
 #   libusb snappy lzo gnutls capstone dtc
 # Everything installs under the prefix; nothing touches Homebrew or /usr/local.
 set -euo pipefail
 
-PREFIX="${LEANDROS_QEMU_PREFIX:-$HOME/.local/qemu-gpu}"
-WORK="${LEANDROS_QEMU_WORK:-$HOME/.cache/leandros-qemu-gpu}"
+ANGLE_VK=0
+for a in "$@"; do [ "$a" = --angle-vulkan ] && ANGLE_VK=1; done
+if [ "$ANGLE_VK" = 1 ]; then
+    PREFIX="${LEANDROS_QEMU_PREFIX:-$HOME/.local/qemu-gpu-gles31}"
+    WORK="${LEANDROS_QEMU_WORK:-$HOME/.cache/leandros-qemu-gpu-gles31}"
+else
+    PREFIX="${LEANDROS_QEMU_PREFIX:-$HOME/.local/qemu-gpu}"
+    WORK="${LEANDROS_QEMU_WORK:-$HOME/.cache/leandros-qemu-gpu}"
+fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PATCHES="$HERE/patches"
 NCPU="$(sysctl -n hw.ncpu)"
@@ -68,6 +88,13 @@ ANGLE_DEPS=(
   "astc https://github.com/ARM-software/astc-encoder/archive/2319d9c4d4af53a7fc7c52985e264ce6e8a02a9b.tar.gz 8b5068ef28a8db1cb354d89d9cefd19d43eddfc72c3468fce7ebb92b2431d4c4 third_party/astc-encoder/src"
   "jsoncpp https://github.com/open-source-parsers/jsoncpp/archive/42e892d96e47b1f6e29844cc705e148ec4856448.tar.gz 0b40e4598d68d3dbd8cab90b249e18f1363ecc694c38f727851f4db34b6887ec third_party/jsoncpp/source"
 )
+# --angle-vulkan only (pins from ANGLE's DEPS at $ANGLE_REV). Chromium's VMA
+# commit carries its BUILD.gn and exists only on googlesource: git, by hash.
+ANGLE_VK_DEPS=(
+  "vul https://github.com/KhronosGroup/Vulkan-Utility-Libraries/archive/634022187b2cd1e02e4793e75cdc569ed90e1f51.tar.gz a995530e9761333daa8cc63a2a7b4ed3f2d008258214ad5a16eb15d17666e3b6 third_party/vulkan-utility-libraries/src"
+)
+ANGLE_VMA_REPO=https://chromium.googlesource.com/external/github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+ANGLE_VMA_COMMIT=7e55b011e16182fc349149abbd3aaf3b1db46421
 
 # ── toolchain ───────────────────────────────────────────────────────────────
 [ "$(uname -s)/$(uname -m)" = "Darwin/arm64" ] || { echo "Apple Silicon macOS only" >&2; exit 1; }
@@ -128,6 +155,23 @@ stage_angle() {
     for d in "${ANGLE_DEPS[@]:1}"; do
         read -r name url sha dest <<<"$d"; unpack "angle-$name.tgz" "$src/$dest"
     done
+    if [ "$ANGLE_VK" = 1 ]; then
+        for f in molten-vk vulkan-loader; do
+            [ -d "$BREW/opt/$f" ] || { echo "angle-vulkan: brew install $f" >&2; exit 1; }
+        done
+        for d in "${ANGLE_VK_DEPS[@]}"; do
+            read -r name url sha dest <<<"$d"; fetch "$url" "$sha" "angle-$name.tgz"
+            unpack "angle-$name.tgz" "$src/$dest"
+        done
+        local vma="$WORK/dl/angle-vma.git"
+        if [ "$(git -C "$vma" rev-parse HEAD 2>/dev/null)" != "$ANGLE_VMA_COMMIT" ]; then
+            rm -rf "$vma"; git init -q "$vma"
+            git -C "$vma" fetch -q --depth 1 "$ANGLE_VMA_REPO" "$ANGLE_VMA_COMMIT"
+            git -C "$vma" checkout -q FETCH_HEAD
+        fi
+        rm -rf "$src/third_party/vulkan_memory_allocator"
+        git -C "$vma" archive --prefix=vulkan_memory_allocator/ HEAD | tar x -C "$src/third_party"
+    fi
     cp "$PATCHES/angle-macports/gclient_args.gni" "$src/build/config/"
     (cd "$src"
      for p in patch-commit-id.diff patch-apple-toolchain.diff patch-src-common-platform.diff; do
@@ -135,13 +179,21 @@ stage_angle() {
      done
      patch -s -p1 < "$PATCHES/angle-clt-no-xcode.patch"
      sed -i '' "s|@COMMIT_POSITION@|$ANGLE_POS|" src/commit_id.py
+     local vkargs="angle_enable_vulkan=false"
+     if [ "$ANGLE_VK" = 1 ]; then
+         patch -s -p1 < "$PATCHES/angle-vulkan-moltenvk.patch"
+         sed -i '' "s|@ANGLE_VULKAN_LOADER@|$BREW/opt/vulkan-loader/lib/libvulkan.1.dylib|" \
+             src/common/vulkan/libvulkan_loader.cpp
+         vkargs="angle_enable_vulkan=true angle_use_custom_libvulkan=false
+            angle_enable_swiftshader=false angle_enable_vulkan_validation_layers=false"
+     fi
      "$WORK/gn/out/gn" gen out --script-executable=python3 --args="
         mac_sdk_min=\"14.0\" mac_deployment_target=\"14.0\" target_cpu=\"arm64\"
         install_prefix=\"$PREFIX\"
         is_official_build=true is_clang=false use_custom_libcxx=false
         treat_warnings_as_errors=false fatal_linker_warnings=false
         enable_rust=false angle_build_tests=false
-        angle_enable_metal=true angle_enable_gl=true angle_enable_vulkan=false"
+        angle_enable_metal=true angle_enable_gl=true $vkargs"
      ANGLE_UPSTREAM_HASH="${ANGLE_REV:0:12}" ninja -C out angle
      ninja -C out install_angle >/dev/null)
     local f
@@ -207,6 +259,11 @@ stage_qemu() {
     fetch "$QEMU_URL" "$QEMU_SHA" "qemu-$QEMU_VER.tar.xz"
     unpack "qemu-$QEMU_VER.tar.xz" "$WORK/qemu"
     (cd "$WORK/qemu" && patch -s -p1 < "$PATCHES/qemu-11.1-egl-angle-macos.patch")
+    if [ "$ANGLE_VK" = 1 ]; then # ANGLE's default backend: Vulkan (ES 3.1)
+        sed -i '' 's|g_setenv("ANGLE_DEFAULT_PLATFORM", "metal", FALSE)|g_setenv("ANGLE_DEFAULT_PLATFORM", "vulkan", FALSE)|' \
+            "$WORK/qemu/ui/egl-helpers.c"
+        grep -q '"ANGLE_DEFAULT_PLATFORM", "vulkan"' "$WORK/qemu/ui/egl-helpers.c"
+    fi
     qemu_build build "$PREFIX"
     done_stamp qemu
 }
@@ -239,6 +296,7 @@ STAGES=()
 for a in "$@"; do
     case "$a" in
         --force) FORCE=1 ;;
+        --angle-vulkan) ;;
         gn|angle|epoxy|virgl|qemu|venus) STAGES+=("$a") ;;
         *) echo "unknown stage/flag: $a" >&2; exit 2 ;;
     esac
