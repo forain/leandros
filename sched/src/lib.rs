@@ -1687,6 +1687,8 @@ pub mod poll_class {
     pub const WAIT:    u32 = 11;
     /// inotify fds: nothing produces their events, so nothing wakes this tag.
     pub const INOTIFY: u32 = 12;
+    /// An epoll instance itself, indexed by its slot: what `epoll_ctl` wakes.
+    pub const EPOLL:   u32 = 13;
 }
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision

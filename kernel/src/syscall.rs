@@ -8143,10 +8143,13 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     // THE ONE REAL LOST-WAKE HOLE (see the targeted-wake design): a sibling
     // thread may be parked in epoll_wait on this instance with a `poll_mask`
     // computed BEFORE this add/mod/del, so a *targeted* wake for the newly
-    // added fd would never reach it. Broadcast unconditionally on any
-    // successful mutation — epoll_ctl is not a hot path, and Linux likewise
-    // wakes waiters from ep_insert/ep_modify.
-    if r >= 0 { sched::wake_poll(); }
+    // added fd would never reach it. Wake every waiter of THIS instance on
+    // any successful mutation, as Linux does from ep_insert/ep_modify: each
+    // epoll_wait park, and every mask an enclosing epoll/poll/select computes
+    // for this fd (`epoll_tag_mask`), carries `poll_tag(EPOLL, slot)`. This
+    // used to be a system-wide broadcast: on the idle desktop ~11 epoll_ctl
+    // calls a second woke ~570 unrelated threads a second.
+    if r >= 0 { sched::wake_poll_tagged(epoll_self_tag(slot)); }
     r
 }
 
@@ -8229,11 +8232,12 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         // commit last_seq / disarm ONESHOT, matching by fd since a sibling
         // epoll_ctl may have mutated the slot meanwhile.
         let mut n = 0usize;
-        // OR of every armed interest's targeted-wake tag; becomes this task's
+        // This instance's own tag (what epoll_ctl on it wakes) OR every armed
+        // interest's targeted-wake tag; becomes this task's
         // `poll_mask` if we park below. The loop only `break`s early once an
         // event has fired (n > 0), in which case we return before using `mask`,
         // so whenever we reach the park `mask` has seen every armed interest.
-        let mut mask = 0u64;
+        let mut mask = epoll_self_tag(slot);
         // Re-read the high-water mark on every pass: a CLONE_THREAD sibling
         // sharing this epoll fd may epoll_ctl(ADD) while we are blocked below,
         // and the new interest must be visible to the next probe.
@@ -8838,8 +8842,8 @@ fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
     // level-triggered (None) — its readiness is recomputed from its interest
     // list on every probe. Checked before the console/socket routing below
     // because EPOLL_FD_BASE sits inside the "not a VFS fd" range. Its tag is
-    // the OR of its children's tags (see `epoll_tag_mask`); an empty nested set
-    // contributes 0 (any later add broadcasts via sys_epoll_ctl).
+    // its own tag OR its children's (see `epoll_tag_mask`); an empty nested
+    // set contributes just its own tag, which a later add wakes.
     if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&fd) {
         let state = probe_fd_events_nested(pid, fd, requested, depth);
         let tag = match epoll_slot_of(fd) {
@@ -8927,7 +8931,9 @@ fn reply_poll_tag(reply: &Message) -> u64 {
 fn epoll_tag_mask(pid: u32, slot: usize, depth: u32) -> u64 {
     if depth >= EPOLL_MAX_NEST { return sched::POLL_TAG_ALL; }
     let hi = { EPOLL_INSTANCES.lock()[slot].hi as usize };
-    let mut mask = 0u64;
+    // The instance's own tag first: an epoll_ctl on it must reach whoever
+    // watches it (see sys_epoll_ctl).
+    let mut mask = epoll_self_tag(slot);
     for i in 0..hi {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
         if !interest.in_use || !interest.armed { continue; }
@@ -8937,6 +8943,11 @@ fn epoll_tag_mask(pid: u32, slot: usize, depth: u32) -> u64 {
         mask |= tag;
     }
     mask
+}
+
+/// The tag `epoll_ctl` on instance `slot` wakes (see sys_epoll_ctl).
+fn epoll_self_tag(slot: usize) -> u64 {
+    sched::poll_tag(sched::poll_class::EPOLL, slot as u32)
 }
 
 /// `[CHURN] alltag` census: which interest kinds make an epoll wait mask a
