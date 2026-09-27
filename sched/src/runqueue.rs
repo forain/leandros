@@ -368,7 +368,7 @@ impl RunQueue {
         for (i, slot) in self.tasks.iter_mut().enumerate() {
             if let Some(task) = slot {
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
-                    && (task.poll_mask & tag) != 0 {
+                    && ((task.poll_mask & tag) != 0 || tag == crate::POLL_TAG_ALL) {
                     if crate::gdwake::ENABLED {
                         crate::gdwake::mark(task.pid, crate::gdwake::SITE.load(core::sync::atomic::Ordering::Relaxed));
                     }

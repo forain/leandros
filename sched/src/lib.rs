@@ -1791,6 +1791,15 @@ pub const POLL_WAIT_CHANNEL: u32 = 0xFFFF_FF01;
 // so a forgotten site degrades to today's herd, never to a missed wake.
 pub const POLL_TAG_ALL: u64 = u64::MAX;
 
+/// The mask of a park that waits only for its deadline or a signal (nanosleep,
+/// sigsuspend, sigtimedwait): no object tag reaches it, only the broadcast
+/// (`POLL_TAG_ALL`, which every signal delivery issues) and the deadline tick.
+/// Such parks used to register `POLL_TAG_ALL` themselves, so every targeted
+/// wake in the system (each socket write, eventfd, epoll_ctl) woke every
+/// sleeping thread to re-check its clock: ~55 wakes/s for one `sleep 60` on
+/// the idle greeter, the same for init's getty-loop sleep.
+pub const POLL_MASK_TIMED_ONLY: u64 = 0;
+
 /// Poll-object classes. The class disambiguates index spaces that would
 /// otherwise collide (pipe ring 3 vs eventfd slot 3) before hashing.
 pub mod poll_class {

@@ -3040,7 +3040,7 @@ fn sigsuspend_with(new_mask: u64) -> isize {
     let wakeable = || (pending_signals() | sched::shared_pending_signals()) & !new_mask != 0;
     loop {
         if wakeable() { break; }
-        sched::block_on_poll_prepare();
+        sched::block_on_poll_prepare_masked(u64::MAX, sched::POLL_MASK_TIMED_ONLY);
         if wakeable() { sched::block_on_poll_cancel(); break; }
         sched::block_on_poll_commit();
     }
@@ -3110,7 +3110,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
             if monotonic_ns() >= dl { return -11; }
         }
         // Park (see sys_rt_sigsuspend); the deadline rides the poll tick.
-        sched::block_on_poll_prepare_until(deadline.unwrap_or(u64::MAX));
+        sched::block_on_poll_prepare_masked(deadline.unwrap_or(u64::MAX), sched::POLL_MASK_TIMED_ONLY);
         if (pending_signals() | sched::shared_pending_signals()) & wait_mask != 0 || interrupted() {
             sched::block_on_poll_cancel(); continue;
         }
@@ -3613,7 +3613,7 @@ fn sleep_until_ns(deadline: u64, rmtp_ptr: usize, relative: bool) -> isize {
         // run-loop at 100 %+ CPU and starving every other task). The first
         // tick at or after `deadline` wakes us; a spurious early wake (another
         // waiter's nearer deadline) just re-checks the clock and re-blocks.
-        sched::block_on_poll_prepare_until(deadline);
+        sched::block_on_poll_prepare_masked(deadline, sched::POLL_MASK_TIMED_ONLY);
         if monotonic_ns() >= deadline || interrupted() {
             sched::block_on_poll_cancel();
         } else {
