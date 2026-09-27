@@ -514,7 +514,10 @@ fn vmo_alloc_zeroed_frame() -> Option<usize> {
 /// Copy `n` bytes out of the VMO frames starting at logical offset `off` into
 /// kernel/user `dst`. Walks page by page (an unaligned `off` may cross one
 /// frame boundary). Every touched page index is guaranteed present.
-unsafe fn vmo_copy_out(vmo: &TmpVmo, off: usize, dst: *mut u8, n: usize) {
+///
+/// `dst` is the caller's buffer and TMP_FILES/TMP_VMOS are held, so the copy
+/// is fault-tolerant (see `sched::uaccess`): false = a fault stopped it.
+unsafe fn vmo_copy_out(vmo: &TmpVmo, off: usize, dst: *mut u8, n: usize) -> bool {
     let mut done = 0usize;
     while done < n {
         let pos  = off + done;
@@ -522,14 +525,16 @@ unsafe fn vmo_copy_out(vmo: &TmpVmo, off: usize, dst: *mut u8, n: usize) {
         let poff = pos % 4096;
         let cnt  = (4096 - poff).min(n - done);
         let src  = (mm::phys_to_virt(vmo.pages[page]) + poff) as *const u8;
-        core::ptr::copy_nonoverlapping(src, dst.add(done), cnt);
+        if sched::uaccess::copy_raw(dst.add(done), src, cnt) != 0 { return false; }
         done += cnt;
     }
+    true
 }
 
 /// Copy `n` bytes from `src` into the VMO frames at logical offset `off`. The
 /// caller must have grown `pages` to cover `off + n` first.
-unsafe fn vmo_copy_in(vmo: &mut TmpVmo, off: usize, src: *const u8, n: usize) {
+/// Fault-tolerant like [`vmo_copy_out`]; false = a fault stopped it.
+unsafe fn vmo_copy_in(vmo: &mut TmpVmo, off: usize, src: *const u8, n: usize) -> bool {
     let mut done = 0usize;
     while done < n {
         let pos  = off + done;
@@ -537,9 +542,10 @@ unsafe fn vmo_copy_in(vmo: &mut TmpVmo, off: usize, src: *const u8, n: usize) {
         let poff = pos % 4096;
         let cnt  = (4096 - poff).min(n - done);
         let dst  = (mm::phys_to_virt(vmo.pages[page]) + poff) as *mut u8;
-        core::ptr::copy_nonoverlapping(src.add(done), dst, cnt);
+        if sched::uaccess::copy_raw(dst, src.add(done), cnt) != 0 { return false; }
         done += cnt;
     }
+    true
 }
 
 /// Zero bytes `[from, to)` of the VMO frames (HHDM only). Used to clear the
@@ -1354,6 +1360,48 @@ impl PipeRing {
         self.read_pos = (self.read_pos + 1) % PIPE_RING_SIZE;
         self.count -= 1;
         Some(b)
+    }
+
+    /// Move up to `max` bytes out to the caller's buffer (user or kernel
+    /// memory). PIPE_RINGS is held, so the copy is the fault-tolerant one: a
+    /// fault it cannot resolve (a read-only or PROT_NONE buffer) stops it
+    /// instead of killing the caller with the lock held — which left every
+    /// later pipe user spinning on PIPE_RINGS. Only delivered bytes are
+    /// consumed; `Err(EFAULT)` means none were.
+    fn copy_out(&mut self, dst: *mut u8, max: usize) -> Result<usize, i32> {
+        let n = max.min(self.count);
+        let mut done = 0usize;
+        while done < n {
+            let chunk = (n - done).min(PIPE_RING_SIZE - self.read_pos);
+            let left = unsafe {
+                sched::uaccess::copy_raw(dst.add(done), self.buf.as_ptr().add(self.read_pos), chunk)
+            };
+            let copied = chunk - left;
+            self.read_pos = (self.read_pos + copied) % PIPE_RING_SIZE;
+            self.count -= copied;
+            done += copied;
+            if left != 0 { return if done == 0 { Err(-14) } else { Ok(done) }; }
+        }
+        Ok(done)
+    }
+
+    /// Append up to `max` bytes from the caller's buffer; same fault rules
+    /// as [`copy_out`](Self::copy_out).
+    fn copy_in(&mut self, src: *const u8, max: usize) -> Result<usize, i32> {
+        let n = max.min(PIPE_RING_SIZE - self.count);
+        let mut done = 0usize;
+        while done < n {
+            let chunk = (n - done).min(PIPE_RING_SIZE - self.write_pos);
+            let left = unsafe {
+                sched::uaccess::copy_raw(self.buf.as_mut_ptr().add(self.write_pos), src.add(done), chunk)
+            };
+            let copied = chunk - left;
+            self.write_pos = (self.write_pos + copied) % PIPE_RING_SIZE;
+            self.count += copied;
+            done += copied;
+            if left != 0 { return if done == 0 { Err(-14) } else { Ok(done) }; }
+        }
+        Ok(done)
     }
 }
 
@@ -4449,10 +4497,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // rule in the write arm), so only a drain that crosses that line
             // is a level change.
             let was_full = PIPE_RING_SIZE - r.count < PIPE_BUF;
-            let mut n = 0usize;
-            while n < count.min(4096) {
-                match r.get() { Some(b) => { unsafe { *buf.add(n) = b; } n += 1; } None => break }
-            }
+            let n = match r.copy_out(buf, count.min(4096)) { Ok(n) => n, Err(e) => return err_reply(e) };
             let now_writable = PIPE_RING_SIZE - r.count >= PIPE_BUF;
             // Draining bytes frees ring space → a new POLLOUT edge for the
             // write end. Advance the seq so an epoll writer blocked on a full
@@ -4510,9 +4555,9 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 // kernel.
                 n = n.min((vmo.pages.len() * 4096).saturating_sub(cur));
                 if n == 0 { return val_reply(0); }
-                unsafe { vmo_copy_out(vmo, cur, buf, n); }
-            } else {
-                unsafe { core::ptr::copy_nonoverlapping(tmp[idx].data.as_ptr().add(cur), buf, n); }
+                if !unsafe { vmo_copy_out(vmo, cur, buf, n) } { return err_reply(-14); }
+            } else if unsafe { sched::uaccess::copy_raw(buf, tmp[idx].data.as_ptr().add(cur), n) } != 0 {
+                return err_reply(-14);
             }
             drop(vmos);
             // relatime: a real read happened, so consider bumping atime.
@@ -4677,10 +4722,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             let free = PIPE_RING_SIZE - r.count;
             let mut n = 0usize;
             if count > PIPE_BUF || free >= count {
-                while n < count {
-                    if !r.put(unsafe { *buf.add(n) }) { break; }
-                    n += 1;
-                }
+                n = match r.copy_in(buf, count) { Ok(n) => n, Err(e) => return err_reply(e) };
             }
             if n > 0 { r.seq = r.seq.wrapping_add(1); } // new readable edge for the read end
             let no_space = n == 0 && count > 0;
@@ -4766,7 +4808,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 let cap_bytes = vmo.pages.len() * 4096;
                 let n = count.min(cap_bytes.saturating_sub(cur));
                 if n == 0 { return err_reply(-28); } // ENOSPC
-                unsafe { vmo_copy_in(vmo, cur, buf, n); }
+                if !unsafe { vmo_copy_in(vmo, cur, buf, n) } { return err_reply(-14); }
                 let new_pos = cur + n;
                 if new_pos > vmo.len { vmo.len = new_pos; tmp[idx].len = new_pos; } // mirror EOF
                 (n, new_pos)
@@ -4775,7 +4817,9 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 let avail = MAX_TMP_SIZE.saturating_sub(cur);
                 let n = count.min(avail);
                 if n == 0 { return err_reply(-28); } // ENOSPC
-                unsafe { core::ptr::copy_nonoverlapping(buf, entry.data.as_mut_ptr().add(cur), n); }
+                if unsafe { sched::uaccess::copy_raw(entry.data.as_mut_ptr().add(cur), buf, n) } != 0 {
+                    return err_reply(-14);
+                }
                 let new_pos = cur + n;
                 if new_pos > entry.len { entry.len = new_pos; }
                 (n, new_pos)
