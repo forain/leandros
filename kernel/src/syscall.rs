@@ -8647,7 +8647,36 @@ fn epoll_close_all(pid: u32) {
     }
 }
 
+/// Ctrl-T dump hook: the GLOBAL epoll pools (instances, fds). Both are
+/// session-wide fixed tables, so their fill level is what predicts the next
+/// "EMFILE in a fresh process". IRQ context: try_lock only.
+fn dump_epoll_census() {
+    extern "C" { fn arch_serial_putc(c: u8); }
+    fn ps(s: &str) { for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } } }
+    fn pn(mut v: usize) {
+        let mut buf = [0u8; 20]; let mut i = buf.len();
+        loop { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+        for &b in &buf[i..] { unsafe { arch_serial_putc(b); } }
+    }
+    ps("[EPOLL]");
+    match EPOLL_INSTANCES.try_lock() {
+        Some(ep) => { ps(" instances="); pn(ep.iter().filter(|e| e.in_use).count()); ps("/"); pn(MAX_EPOLL_INSTANCES); }
+        None => ps(" instances=busy"),
+    }
+    match EPOLL_FDS.try_lock() {
+        Some(t) => { ps(" fds="); pn(t.iter().filter(|e| e.in_use).count()); ps("/"); pn(MAX_EPOLL_FDS); }
+        None => ps(" fds=busy"),
+    }
+    ps("\n");
+}
+
 fn sys_epoll_create1(_flags: usize) -> isize {
+    {
+        static HOOKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !HOOKED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            sched::register_dump_hook(dump_epoll_census);
+        }
+    }
     // Owner is the thread group, not the creating thread: the instance must
     // survive its creator thread's exit and be cleaned up with the process.
     let pid = sched::current_tgid();

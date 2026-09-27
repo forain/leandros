@@ -16,17 +16,24 @@
 //! is still live on another core.
 
 use super::task::{Pid, Task, TaskState};
-pub const MAX_TASKS: usize = 256;
+/// Every thread in the system. 256 -> 512 (lane multiterm, 2026-09-27): a GPU
+/// COSMIC session runs ~200 threads with an empty desktop and each
+/// cosmic-term adds ~19 (more while it starts), so the table filled at the
+/// third terminal ("[SCHED] task table FULL") and its thread spawn failed.
+pub const MAX_TASKS: usize = 512;
 
 use alloc::boxed::Box;
 
 /// Words in the slot-occupancy bitmap.
 const OCC_WORDS: usize = MAX_TASKS / 64;
-// Slot indices are packed into a byte (`pid_index`, `pick_next`'s candidates).
-const _: () = assert!(MAX_TASKS <= 256 && MAX_TASKS % 64 == 0);
+// Slot indices are packed into 16 bits (`pid_index`, `pick_next`'s candidates).
+const _: () = assert!(MAX_TASKS <= 1 << IDX_BITS && MAX_TASKS % 64 == 0);
+/// Bits of a `pid_index` entry that hold the slot index; the pid sits above.
+const IDX_BITS: u32 = 16;
+const IDX_MASK: u64 = (1 << IDX_BITS) - 1;
 /// pid → slot hint table: `PID_INDEX_SLOTS` entries, each pid hashed to a
 /// window of `PID_INDEX_PROBE` consecutive entries.
-const PID_INDEX_SLOTS: usize = 1024;
+const PID_INDEX_SLOTS: usize = 2048;
 const PID_INDEX_PROBE: usize = 8;
 
 pub struct RunQueue {
@@ -46,7 +53,7 @@ pub struct RunQueue {
     maybe_ready: [u64; OCC_WORDS],
     /// `ticks()` of the last full-scan pick.
     last_full_scan: u64,
-    /// pid → slot index, packed `(pid << 8) | idx`, `0` = empty.
+    /// pid → slot index, packed `(pid << IDX_BITS) | idx`, `0` = empty.
     ///
     /// Every pid lookup (`find_pid*`) used to be a linear scan of all 256
     /// slots under RUN_QUEUE, dereferencing each live `Task` — ~1 µs per
@@ -55,8 +62,8 @@ pub struct RunQueue {
     /// a hit is verified against `tasks[idx].pid` and anything else falls back
     /// to the scan, so a stale or missing entry can cost time but can never
     /// return the wrong task. Probing is bounded to a fixed window (no
-    /// tombstones, no unbounded chains): pids are sequential, so with ≤ 256
-    /// live tasks in 1024 entries a window is essentially never full; if it
+    /// tombstones, no unbounded chains): pids are sequential, so with ≤ 512
+    /// live tasks in 2048 entries a window is essentially never full; if it
     /// is, the pid just isn't indexed.
     pid_index: [u64; PID_INDEX_SLOTS],
 }
@@ -79,14 +86,14 @@ impl RunQueue {
     /// Record `tasks[idx]`'s pid in the hint table (pid 0 is never indexed).
     fn index_insert(&mut self, pid: Pid, idx: usize) {
         if pid == 0 { return; }
-        let want = ((pid as u64) << 8) | idx as u64;
+        let want = ((pid as u64) << IDX_BITS) | idx as u64;
         let home = Self::index_home(pid);
         let mut free = None;
         for k in 0..PID_INDEX_PROBE {
             let s = (home + k) & (PID_INDEX_SLOTS - 1);
             let e = self.pid_index[s];
             if e == want { return; }
-            if (e >> 8) as u32 == pid { self.pid_index[s] = want; return; }
+            if (e >> IDX_BITS) as u32 == pid { self.pid_index[s] = want; return; }
             if free.is_none() && (e == 0 || !self.index_entry_live(e)) { free = Some(s); }
         }
         if let Some(s) = free { self.pid_index[s] = want; }
@@ -98,7 +105,7 @@ impl RunQueue {
         let home = Self::index_home(pid);
         for k in 0..PID_INDEX_PROBE {
             let s = (home + k) & (PID_INDEX_SLOTS - 1);
-            if self.pid_index[s] != 0 && (self.pid_index[s] >> 8) as u32 == pid {
+            if self.pid_index[s] != 0 && (self.pid_index[s] >> IDX_BITS) as u32 == pid {
                 self.pid_index[s] = 0;
             }
         }
@@ -107,8 +114,8 @@ impl RunQueue {
     /// An entry still describes the task in its slot.
     #[inline]
     fn index_entry_live(&self, e: u64) -> bool {
-        let idx = (e & 0xff) as usize;
-        self.tasks[idx].as_ref().map_or(false, |t| t.pid == (e >> 8) as u32)
+        let idx = (e & IDX_MASK) as usize;
+        self.tasks[idx].as_ref().map_or(false, |t| t.pid == (e >> IDX_BITS) as u32)
     }
 
     /// Slot of `pid` via the hint table (verified), else `None`.
@@ -118,8 +125,8 @@ impl RunQueue {
         let home = Self::index_home(pid);
         for k in 0..PID_INDEX_PROBE {
             let e = self.pid_index[(home + k) & (PID_INDEX_SLOTS - 1)];
-            if e != 0 && (e >> 8) as u32 == pid {
-                let idx = (e & 0xff) as usize;
+            if e != 0 && (e >> IDX_BITS) as u32 == pid {
+                let idx = (e & IDX_MASK) as usize;
                 if self.tasks[idx].as_ref().map_or(false, |t| t.pid == pid) {
                     return Some(idx);
                 }
@@ -221,7 +228,7 @@ impl RunQueue {
         // the weighted average sum_wv / sum_w is the virtual time "V" against
         // which eligibility is judged — and the candidates' slot indices, in
         // slot order (the same tie-break order as a full scan).
-        let mut cand = [0u8; MAX_TASKS];
+        let mut cand = [0u16; MAX_TASKS];
         let mut n = 0usize;
         let mut sum_w:  u64  = 0;
         let mut sum_wv: u128 = 0;
@@ -253,7 +260,7 @@ impl RunQueue {
                 if t.on_cpu.is_some() || super::quiesce_filtered(t.tgid, t.pid) { continue; }
                 sum_w  += t.weight as u64;
                 sum_wv += t.weight as u128 * t.vruntime as u128;
-                cand[n] = i as u8;
+                cand[n] = i as u16;
                 n += 1;
             }
         }

@@ -784,12 +784,12 @@ pub fn process_pids_from(from: Pid, out: &mut [Pid]) -> usize {
 // open-addressed table, written only under the RUN_QUEUE lock (so writes are
 // already serialised by the scheduler) and read lock-free.
 //
-// Sizing: 1024 slots against `runqueue::MAX_TASKS` = 256, so the table never
+// Sizing: 2048 slots against `runqueue::MAX_TASKS` = 512, so the table never
 // exceeds a quarter load and linear probes stay short. pids are allocated
 // sequentially from 1, so `pid & (SLOTS-1)` distributes perfectly — the
 // pathological clustering open addressing is usually warned about needs a
 // clumped key space, and this one is a counter.
-const PID_TGID_SLOTS: usize = 1024;
+const PID_TGID_SLOTS: usize = 2048;
 /// Packed `(pid << 32) | tgid`. `0` = never used, `u64::MAX` = tombstone.
 ///
 /// A tombstone rather than a zero on removal is load-bearing: zeroing a slot in
