@@ -15,7 +15,7 @@
  *                   Exit 0 on a hardware renderer, 2 on a software one
  *                   (softpipe / llvmpipe / swrast / lavapipe), 3 if no context
  *                   could be created at all. Also prints
- *                     GL_WGPU=1|0 GL_WGPU_ERR=0x....
+ *                     GL_WGPU=1|0 GL_WGPU_ERR=0x....|glesX.Y-ssboV/F
  *                   whether wgpu-hal's GLES backend (iced's `wgpu` renderer in
  *                   the COSMIC clients) can get a context here: it asks for a
  *                   GLES 3 context with robust buffer access first and falls
@@ -24,6 +24,17 @@
  *                   access (virgl on ANGLE/Metal) unless it carries
  *                   ports/mesa/patches/0001-egl-robust-access-unsupported-is-
  *                   bad-attribute.patch, and then wgpu never gets a context.
+ *                   A context is not enough, though: iced_wgpu then asks for a
+ *                   device with wgpu::Limits::default() or, failing that,
+ *                   ::downlevel_defaults(), and both need storage buffers in
+ *                   the vertex and fragment stages, i.e. GLES >= 3.1. On a
+ *                   GLES 3.0 host (virgl on ANGLE/Metal) both requests fail,
+ *                   and iced_winit drops that error (Control::Crash is never
+ *                   returned from run_app): every wgpu client exits 0 right
+ *                   after "Selected format", the greeter included. So
+ *                   GL_WGPU=1 also requires GLES >= 3.1 and at least 4 SSBO
+ *                   blocks in both stages, and the probe prints what it saw:
+ *                     GL_ES_VERSION=3.0 GL_SSBO_VS=0 GL_SSBO_FS=0
  *
  * /bin/gpu-env runs both before every COSMIC launch (greeter and session) so a
  * software-rendered desktop can never happen silently.
@@ -96,6 +107,10 @@ static int is_software(const char *r)
 	return 0;
 }
 
+/* GLES 3.1 enums; this file builds against the GLES2 headers. */
+#define GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS_   0x90D6
+#define GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS_ 0x90DA
+
 #ifndef EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT
 #define EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT 0x30BF
 #endif
@@ -118,8 +133,27 @@ static void wgpu_probe(EGLDisplay dpy, EGLint maj, EGLint min)
 		a[n++] = EGL_NONE;
 		EGLContext c = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, a);
 		if (c != EGL_NO_CONTEXT) {
+			int esmaj = 0, esmin = 0;
+			GLint vs = 0, fs = 0;
+			if (eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, c)) {
+				const char *v = (const char *)glGetString(GL_VERSION);
+				if (v) sscanf(v, "OpenGL ES %d.%d", &esmaj, &esmin);
+				/* Invalid enums before GLES 3.1: the values stay 0. */
+				glGetIntegerv(GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS_, &vs);
+				glGetIntegerv(GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS_, &fs);
+				while (glGetError() != GL_NO_ERROR) {}
+				eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+			}
 			eglDestroyContext(dpy, c);
-			printf("GL_WGPU=1 GL_WGPU_ROBUST=%d\n", level);
+			printf("GL_ES_VERSION=%d.%d GL_SSBO_VS=%d GL_SSBO_FS=%d\n", esmaj, esmin, vs, fs);
+			int es31 = esmaj > 3 || (esmaj == 3 && esmin >= 1);
+			if (es31 && vs >= 4 && fs >= 4) {
+				printf("GL_WGPU=1 GL_WGPU_ROBUST=%d\n", level);
+			} else {
+				/* A context, but iced_wgpu cannot get a device on it. */
+				printf("GL_WGPU=0 GL_WGPU_ERR=gles%d.%d-ssbo%d/%d GL_WGPU_ROBUST=%d\n",
+				       esmaj, esmin, vs, fs, level);
+			}
 			return;
 		}
 		err = eglGetError();

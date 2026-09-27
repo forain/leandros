@@ -273,6 +273,7 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
 
     if !test_sigaction_struct_roundtrip() { failures += 1; }
     if !test_signal_delivery_and_return() { failures += 1; }
+    if !test_handler_preserves_vector_regs() { failures += 1; }
     if !test_two_signals_distinct_handlers() { failures += 1; }
     if !test_sigprocmask_blocks_and_defers() { failures += 1; }
     if !test_sig_ign_default_disposition() { failures += 1; }
@@ -366,6 +367,120 @@ unsafe fn test_signal_delivery_and_return() -> bool {
 
     report(name, DELIVERY_COUNT.load(Ordering::SeqCst) == 1
         && RESUMED_AFTER_KILL.load(Ordering::SeqCst) == 1)
+}
+
+// ── 2b. A handler must not leak into the interrupted code's vector registers
+//
+// The signal frame has to carry the FP/SIMD state (aarch64 fpsimd_context,
+// x86-64 FXSAVE area) and rt_sigreturn has to put it back: handlers are
+// ordinary compiled code and use q/xmm registers freely. The kill(2) below is
+// issued from inside one asm block with a known pattern live in the vector
+// registers, so the signal is delivered on that syscall's return, the handler
+// overwrites every vector register, and the block reads them back after
+// sigreturn. Before the fix they came back holding the handler's pattern.
+
+static VREG_HANDLER_RAN: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn vreg_clobber_handler(_sig: c_int) {
+    VREG_HANDLER_RAN.fetch_add(1, Ordering::SeqCst);
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!(
+            "movi v0.16b, #0xa5", "movi v1.16b, #0xa5", "movi v2.16b, #0xa5", "movi v3.16b, #0xa5",
+            "movi v4.16b, #0xa5", "movi v5.16b, #0xa5", "movi v6.16b, #0xa5", "movi v7.16b, #0xa5",
+            "movi v8.16b, #0xa5", "movi v9.16b, #0xa5", "movi v10.16b, #0xa5", "movi v11.16b, #0xa5",
+            "movi v12.16b, #0xa5", "movi v13.16b, #0xa5", "movi v14.16b, #0xa5", "movi v15.16b, #0xa5",
+            "movi v16.16b, #0xa5", "movi v17.16b, #0xa5", "movi v18.16b, #0xa5", "movi v19.16b, #0xa5",
+            "movi v20.16b, #0xa5", "movi v21.16b, #0xa5", "movi v22.16b, #0xa5", "movi v23.16b, #0xa5",
+            "movi v24.16b, #0xa5", "movi v25.16b, #0xa5", "movi v26.16b, #0xa5", "movi v27.16b, #0xa5",
+            "movi v28.16b, #0xa5", "movi v29.16b, #0xa5", "movi v30.16b, #0xa5", "movi v31.16b, #0xa5",
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _,
+            out("v6") _, out("v7") _, out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _, out("v16") _, out("v17") _,
+            out("v18") _, out("v19") _, out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _,
+            out("v30") _, out("v31") _,
+        );
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!(
+            "pcmpeqd xmm0, xmm0", "pcmpeqd xmm1, xmm1", "pcmpeqd xmm2, xmm2", "pcmpeqd xmm3, xmm3",
+            "pcmpeqd xmm4, xmm4", "pcmpeqd xmm5, xmm5", "pcmpeqd xmm6, xmm6", "pcmpeqd xmm7, xmm7",
+            "pcmpeqd xmm8, xmm8", "pcmpeqd xmm9, xmm9", "pcmpeqd xmm10, xmm10", "pcmpeqd xmm11, xmm11",
+            "pcmpeqd xmm12, xmm12", "pcmpeqd xmm13, xmm13", "pcmpeqd xmm14, xmm14", "pcmpeqd xmm15, xmm15",
+            out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _, out("xmm4") _, out("xmm5") _,
+            out("xmm6") _, out("xmm7") _, out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
+            out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+        );
+    }
+}
+
+unsafe fn test_handler_preserves_vector_regs() -> bool {
+    let name = b"handler_preserves_vector_regs\0";
+    VREG_HANDLER_RAN.store(0, Ordering::SeqCst);
+    let act = zeroed_sigaction(Some(vreg_clobber_handler));
+    if sigaction(SIGUSR1, &act, core::ptr::null_mut()) != 0 { return report(name, false); }
+    let pid = getpid();
+    // Each register i gets bytes (0x10 + i); read back into `out`.
+    #[cfg(target_arch = "aarch64")]
+    let (nregs, mut out) = (32usize, [0u8; 32 * 16]);
+    #[cfg(target_arch = "x86_64")]
+    let (nregs, mut out) = (16usize, [0u8; 16 * 16]);
+    let mut pat = [0u8; 32 * 16];
+    for r in 0..32 { for b in 0..16 { pat[r * 16 + b] = 0x10 + r as u8; } }
+    #[cfg(target_arch = "aarch64")]
+    core::arch::asm!(
+        "ldp q0, q1, [{p}, #0]", "ldp q2, q3, [{p}, #32]", "ldp q4, q5, [{p}, #64]",
+        "ldp q6, q7, [{p}, #96]", "ldp q8, q9, [{p}, #128]", "ldp q10, q11, [{p}, #160]",
+        "ldp q12, q13, [{p}, #192]", "ldp q14, q15, [{p}, #224]", "ldp q16, q17, [{p}, #256]",
+        "ldp q18, q19, [{p}, #288]", "ldp q20, q21, [{p}, #320]", "ldp q22, q23, [{p}, #352]",
+        "ldp q24, q25, [{p}, #384]", "ldp q26, q27, [{p}, #416]", "ldp q28, q29, [{p}, #448]",
+        "ldp q30, q31, [{p}, #480]",
+        "mov x8, #129", // kill
+        "svc #0",
+        "stp q0, q1, [{o}, #0]", "stp q2, q3, [{o}, #32]", "stp q4, q5, [{o}, #64]",
+        "stp q6, q7, [{o}, #96]", "stp q8, q9, [{o}, #128]", "stp q10, q11, [{o}, #160]",
+        "stp q12, q13, [{o}, #192]", "stp q14, q15, [{o}, #224]", "stp q16, q17, [{o}, #256]",
+        "stp q18, q19, [{o}, #288]", "stp q20, q21, [{o}, #320]", "stp q22, q23, [{o}, #352]",
+        "stp q24, q25, [{o}, #384]", "stp q26, q27, [{o}, #416]", "stp q28, q29, [{o}, #448]",
+        "stp q30, q31, [{o}, #480]",
+        p = in(reg) pat.as_ptr(), o = in(reg) out.as_mut_ptr(),
+        inout("x0") pid as usize => _, in("x1") SIGUSR1 as usize, out("x8") _,
+        out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _,
+        out("v6") _, out("v7") _, out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+        out("v12") _, out("v13") _, out("v14") _, out("v15") _, out("v16") _, out("v17") _,
+        out("v18") _, out("v19") _, out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+        out("v24") _, out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _,
+        out("v30") _, out("v31") _,
+    );
+    #[cfg(target_arch = "x86_64")]
+    core::arch::asm!(
+        "movdqu xmm0, [{p} + 0]", "movdqu xmm1, [{p} + 16]", "movdqu xmm2, [{p} + 32]",
+        "movdqu xmm3, [{p} + 48]", "movdqu xmm4, [{p} + 64]", "movdqu xmm5, [{p} + 80]",
+        "movdqu xmm6, [{p} + 96]", "movdqu xmm7, [{p} + 112]", "movdqu xmm8, [{p} + 128]",
+        "movdqu xmm9, [{p} + 144]", "movdqu xmm10, [{p} + 160]", "movdqu xmm11, [{p} + 176]",
+        "movdqu xmm12, [{p} + 192]", "movdqu xmm13, [{p} + 208]", "movdqu xmm14, [{p} + 224]",
+        "movdqu xmm15, [{p} + 240]",
+        "mov eax, 62", // kill
+        "syscall",
+        "movdqu [{o} + 0], xmm0", "movdqu [{o} + 16], xmm1", "movdqu [{o} + 32], xmm2",
+        "movdqu [{o} + 48], xmm3", "movdqu [{o} + 64], xmm4", "movdqu [{o} + 80], xmm5",
+        "movdqu [{o} + 96], xmm6", "movdqu [{o} + 112], xmm7", "movdqu [{o} + 128], xmm8",
+        "movdqu [{o} + 144], xmm9", "movdqu [{o} + 160], xmm10", "movdqu [{o} + 176], xmm11",
+        "movdqu [{o} + 192], xmm12", "movdqu [{o} + 208], xmm13", "movdqu [{o} + 224], xmm14",
+        "movdqu [{o} + 240], xmm15",
+        p = in(reg) pat.as_ptr(), o = in(reg) out.as_mut_ptr(),
+        in("rdi") pid as usize, in("rsi") SIGUSR1 as usize, out("rax") _, out("rcx") _, out("r11") _,
+        out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _, out("xmm4") _, out("xmm5") _,
+        out("xmm6") _, out("xmm7") _, out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
+        out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+    );
+    let ran = VREG_HANDLER_RAN.load(Ordering::SeqCst) == 1;
+    let mut bad = 0usize;
+    for r in 0..nregs { if out[r * 16..r * 16 + 16] != pat[r * 16..r * 16 + 16] { bad += 1; } }
+    if bad != 0 {
+        puts(b"  vector registers came back holding the handler's values\0".as_ptr());
+    }
+    report(name, ran && bad == 0)
 }
 
 // ── 3. Two signals, two handlers, no cross-wiring ───────────────────────────
