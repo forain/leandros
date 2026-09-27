@@ -1324,6 +1324,24 @@ pub fn stash_sigsuspend_mask(old_mask: u64) {
     }
 }
 
+/// Store the calling thread's `restart_block` (see `Task::restart_block`).
+pub fn set_restart_block(block: [u64; 7]) {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        t.restart_block = block;
+    }
+}
+
+/// Take (and clear) the calling thread's `restart_block`; `[0] == 0` means
+/// there is nothing to resume.
+pub fn take_restart_block() -> [u64; 7] {
+    let pid = current_pid();
+    match RUN_QUEUE.lock().find_pid_mut(pid) {
+        Some(t) => core::mem::replace(&mut t.restart_block, [0; 7]),
+        None => [0; 7],
+    }
+}
+
 pub fn pending_signals() -> u64 {
     let pid = current_pid();
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.signal_pending).unwrap_or(0)

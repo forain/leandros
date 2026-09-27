@@ -366,6 +366,7 @@ pub const SYS_DBG_SERIAL_WRITE: usize = 590;
 // ── AArch64 Linux syscall numbers ─────────────────────────────────────────────
 #[cfg(target_arch = "aarch64")]
 mod nr {
+    pub const RESTART_SYSCALL: usize = 128;
     pub const MMAP:           usize = 222;
     pub const MUNMAP:         usize = 215;
     pub const MPROTECT:       usize = 226;
@@ -578,6 +579,7 @@ mod nr {
 // ── x86-64 Linux syscall numbers ──────────────────────────────────────────────
 #[cfg(not(target_arch = "aarch64"))]
 mod nr {
+    pub const RESTART_SYSCALL: usize = 219;
     pub const MMAP:           usize = 9;
     pub const POLL:           usize = 7;
     pub const MUNMAP:         usize = 11;
@@ -836,6 +838,14 @@ pub extern "C" fn syscall_dispatch(
         sched::signal::note_syscall_restart(number, a0, ret == ERESTARTSYS);
         return -4;
     }
+    if ret == ERESTART_RESTARTBLOCK {
+        // Same rule as ERESTARTNOHAND, but what gets re-executed is
+        // restart_syscall(2), which resumes this thread's `restart_block`
+        // (the original absolute deadline) rather than the original call
+        // with its relative timeout re-read from scratch.
+        sched::signal::note_syscall_restart(RESTART_SYSCALL, a0, false);
+        return -4;
+    }
     ret
 }
 
@@ -849,6 +859,51 @@ const ERESTARTSYS: isize = -512;
 /// SA_RESTART or not. Used by timed FUTEX_WAIT, which Linux answers with
 /// -ERESTART_RESTARTBLOCK — the same user-visible rule.
 const ERESTARTNOHAND: isize = -514;
+/// Linux -ERESTART_RESTARTBLOCK: restarted (as `restart_syscall`) only when no
+/// handler runs, EINTR otherwise. The interrupted call first stores what to
+/// resume — for every user here, its absolute deadline — with
+/// `sched::set_restart_block`, so a relative timeout is not re-armed in full
+/// on the restart (Linux: `hrtimer_nanosleep_restart`, `futex_wait_restart`,
+/// `do_restart_poll`).
+const ERESTART_RESTARTBLOCK: isize = -516;
+
+/// `restart_block[0]` kinds (0 = nothing to resume).
+const RB_FUTEX:     u64 = 1; // [uaddr, val, private, deadline]
+const RB_NANOSLEEP: u64 = 2; // [deadline, rmtp]
+const RB_POLL:      u64 = 3; // [fds_ptr, nfds, deadline (u64::MAX = none)]
+const RB_SELECT:    u64 = 4; // [nfds, rfds, wfds, efds, deadline (u64::MAX = none)]
+
+/// restart_syscall(2): resume the calling thread's `restart_block`. Only ever
+/// reached through the rewind that ERESTART_RESTARTBLOCK sets up; with
+/// nothing stored (a direct call) it answers EINTR, as Linux's
+/// `do_no_restart_syscall` does.
+fn sys_restart_syscall() -> isize {
+    let b = sched::take_restart_block();
+    match b[0] {
+        RB_FUTEX => {
+            let (uaddr, val) = (b[1] as usize, b[2] as u32);
+            if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
+            if monotonic_ns() >= b[4] {
+                // Deadline passed while stopped: the value check still comes
+                // first, as for an expired FUTEX_WAIT_BITSET.
+                let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+                return if cur != val { -11 } else { -110 }; // EAGAIN / ETIMEDOUT
+            }
+            futex_wait_timed(uaddr, val, b[3] != 0, b[4])
+        }
+        RB_NANOSLEEP => {
+            if monotonic_ns() >= b[1] { return 0; }
+            sleep_until_ns(b[1], b[2] as usize, true)
+        }
+        RB_POLL => {
+            let nfds = b[2] as usize;
+            if nfds != 0 && !validate_user_buf(b[1] as usize, nfds.saturating_mul(8)) { return -14; }
+            poll_wait(b[1] as usize, nfds, b[3])
+        }
+        RB_SELECT => select_wait(b[1] as usize, b[2] as usize, b[3] as usize, b[4] as usize, b[5]),
+        _ => -4,
+    }
+}
 
 /// zink-lane instrumentation: per-syscall time census for the focus tgid
 /// (`sched::SC_FOCUS_TGID`, cosmic-comp) plus a lock-free pid -> last syscall
@@ -1457,6 +1512,7 @@ fn dispatch_inner(
         // ── Threads ────────────────────────────────────────────────────────────
         SET_TID_ADDR => sys_set_tid_address(a0),
         FUTEX        => sys_futex(a0, a1, a2, a3, a4, a5),
+        RESTART_SYSCALL => sys_restart_syscall(),
 
         // ── Architecture-specific ─────────────────────────────────────────────
         #[cfg(not(target_arch = "aarch64"))]
@@ -3113,39 +3169,11 @@ fn sys_poll(fds_ptr: usize, nfds: usize, timeout_ms: isize) -> isize {
     let sz = nfds.saturating_mul(8);
     if nfds != 0 && !validate_user_buf(fds_ptr, sz) { return -14; }
 
-    let pid = current_pid();
-
     // The low 32 bits are the C `int`; a caller that passed -1 through a
     // zero-extending register still means "forever".
     let timeout_ms = timeout_ms as i32;
-    let (infinite, deadline) = if timeout_ms < 0 {
-        (true, 0)
-    } else {
-        (false, deadline_after_ms(timeout_ms as u64))
-    };
-
-    loop {
-        let mut nready = 0isize;
-        for i in 0..nfds {
-            let pfd = fds_ptr + i * 8;
-            let fd     = unsafe { core::ptr::read(pfd       as *const i32) };
-            let events = unsafe { core::ptr::read((pfd + 4) as *const i16) };
-
-            if fd < 0 {
-                unsafe { core::ptr::write((pfd + 6) as *mut i16, 0); }
-                continue;
-            }
-            let revents = probe_fd_events(pid, fd as usize, events as u16 as u32) as i16;
-            unsafe { core::ptr::write((pfd + 6) as *mut i16, revents); }
-            const POLLNVAL: i16 = 0x0020;
-            if revents != 0 && revents != POLLNVAL { nready += 1; }
-        }
-        if nready > 0 { return nready; }
-        if !infinite && monotonic_ns() >= deadline { return 0; }
-        if interrupted() { return -4; } // EINTR
-
-        poll_block(infinite, deadline, poll_fds_mask(pid, fds_ptr, nfds), || poll_any_ready(pid, fds_ptr, nfds));
-    }
+    let deadline = if timeout_ms < 0 { u64::MAX } else { deadline_after_ms(timeout_ms as u64) };
+    poll_wait(fds_ptr, nfds, deadline)
 }
 
 /// sys_ppoll(fds_ptr, nfds, timeout_ptr, sigmask_ptr) — wait for events on fd set.
@@ -3156,22 +3184,29 @@ fn sys_poll(fds_ptr: usize, nfds: usize, timeout_ms: isize) -> isize {
 /// indefinitely, `{0,0}` = check once and return immediately). If all fds
 /// report POLLNVAL (bad fd) or no events by the deadline, returns 0.
 fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -> isize {
-    // struct pollfd { fd: i32, events: i16, revents: i16 } = 8 bytes.
-    const POLLNVAL: i16 = 0x0020;
-
     let sz = nfds.saturating_mul(8);
     if nfds != 0 && !validate_user_buf(fds_ptr, sz) { return -14; }
 
-    let pid = current_pid();
-
-    let (infinite, deadline) = if timeout_ptr == 0 {
-        (true, 0)
+    let deadline = if timeout_ptr == 0 {
+        u64::MAX
     } else {
         match read_user_timespec(timeout_ptr) {
-            Ok(ns) => (false, deadline_after_ns(ns)),
+            Ok(ns) => deadline_after_ns(ns),
             Err(e) => return e,
         }
     };
+    poll_wait(fds_ptr, nfds, deadline)
+}
+
+/// The poll/ppoll loop proper, on an absolute `deadline` (`u64::MAX` = none);
+/// also what `restart_syscall` resumes. Interrupted by a deliverable signal it
+/// is EINTR when a handler runs and otherwise restarts on the SAME deadline
+/// (Linux's `do_restart_poll`); it used to be EINTR even for a stop/continue.
+fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64) -> isize {
+    // struct pollfd { fd: i32, events: i16, revents: i16 } = 8 bytes.
+    const POLLNVAL: i16 = 0x0020;
+    let pid = current_pid();
+    let infinite = deadline == u64::MAX;
 
     loop {
         let mut nready = 0isize;
@@ -3190,7 +3225,10 @@ fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, _sigmask: usize) -
         }
         if nready > 0 { return nready; }
         if !infinite && monotonic_ns() >= deadline { return 0; }
-        if interrupted() { return -4; } // EINTR
+        if interrupted() {
+            sched::set_restart_block([RB_POLL, fds_ptr as u64, nfds as u64, deadline, 0, 0, 0]);
+            return ERESTART_RESTARTBLOCK;
+        }
 
         poll_block(infinite, deadline, poll_fds_mask(pid, fds_ptr, nfds), || poll_any_ready(pid, fds_ptr, nfds));
     }
@@ -3212,13 +3250,21 @@ fn sys_nanosleep(rqtp_ptr: usize, rmtp_ptr: usize) -> isize {
     if rqtp_ptr == 0 { return 0; }
     let ns = match read_user_timespec(rqtp_ptr) { Ok(n) => n, Err(e) => return e };
     if ns == 0 { return 0; }
-    sleep_until_ns(deadline_after_ns(ns), rmtp_ptr)
+    sleep_until_ns(deadline_after_ns(ns), rmtp_ptr, true)
 }
 
 /// Shared sleep body for the relative and absolute paths: park on the poll
 /// wait-channel until `monotonic_ns() >= deadline`. `rmtp_ptr` may be 0
 /// (nothing to report back).
-fn sleep_until_ns(deadline: u64, rmtp_ptr: usize) -> isize {
+///
+/// Interrupted by a deliverable signal it answers the way Linux does: EINTR
+/// when a handler runs, otherwise (a stop and continue, a signal a sibling
+/// thread took) a transparent restart — the relative form (`relative`)
+/// through the restart block, so only the remainder of `deadline` is slept
+/// (`hrtimer_nanosleep_restart`); the absolute form simply re-executes with
+/// the same deadline (-ERESTARTNOHAND). It used to be a plain EINTR, which
+/// Linux has not reported for a stopped nanosleep since 2.6.24.
+fn sleep_until_ns(deadline: u64, rmtp_ptr: usize, relative: bool) -> isize {
     loop {
         if interrupted() {
             // Report the time still owed in `rmtp`. Leaving it untouched is
@@ -3230,7 +3276,9 @@ fn sleep_until_ns(deadline: u64, rmtp_ptr: usize) -> isize {
             if rmtp_ptr != 0 && validate_user_buf(rmtp_ptr, 16) {
                 write_user_timespec(rmtp_ptr, deadline.saturating_sub(monotonic_ns()));
             }
-            return -4; // EINTR
+            if !relative { return ERESTARTNOHAND; }
+            sched::set_restart_block([RB_NANOSLEEP, deadline, rmtp_ptr as u64, 0, 0, 0, 0]);
+            return ERESTART_RESTARTBLOCK;
         }
         if monotonic_ns() >= deadline { break; }
         // Block on the poll wait-channel until the sleep deadline instead of a
@@ -3278,7 +3326,7 @@ fn sys_clock_nanosleep(clkid: usize, flags: usize, rqtp_ptr: usize, rmtp_ptr: us
     if target <= monotonic_ns() { return 0; }
     // Absolute sleeps have nothing to report in rmtp on EINTR (the caller
     // simply re-issues with the same deadline), so pass 0 for it.
-    sleep_until_ns(target, 0)
+    sleep_until_ns(target, 0, false)
 }
 
 /// sys_gettimeofday(tv_ptr, tz_ptr) — fill `struct timeval` with wall-clock time.
@@ -3432,6 +3480,19 @@ fn sys_set_tid_address(tidptr: usize) -> isize {
     current_pid() as isize
 }
 
+/// Timed FUTEX_WAIT with its relative timeout already turned into the
+/// absolute `deadline`; also the `restart_syscall` resume of one. Interrupted
+/// by a deliverable signal it stores `deadline` in the restart block, so a
+/// restart (no handler ran) waits out only the remainder — Linux's
+/// `futex_wait_restart`. It used to be ERESTARTNOHAND, which re-executed the
+/// original call and re-read the full relative interval.
+fn futex_wait_timed(uaddr: usize, val: u32, private: bool, deadline: u64) -> isize {
+    let r = sched::futex_wait_intr(uaddr, val, Some(deadline), private);
+    if r != sched::FUTEX_INTERRUPTED { return r; }
+    sched::set_restart_block([RB_FUTEX, uaddr as u64, val as u64, private as u64, deadline, 0, 0]);
+    ERESTART_RESTARTBLOCK
+}
+
 fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: usize, val3: usize) -> isize {
     // Strip FUTEX_PRIVATE_FLAG (128) and FUTEX_CLOCK_REALTIME (256). The
     // clock flag matters for FUTEX_WAIT_BITSET only: its absolute deadline is
@@ -3509,6 +3570,9 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
                     Some(deadline_after_ns(ns))
                 }
             };
+            if cmd == FUTEX_WAIT {
+                if let Some(d) = deadline { return futex_wait_timed(uaddr, val as u32, private, d); }
+            }
             let r = sched::futex_wait_intr(uaddr, val as u32, deadline, private);
             if r != sched::FUTEX_INTERRUPTED { return r; }
             // Released by a deliverable signal with no wake claimed
@@ -3519,15 +3583,15 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
             //     handler run) re-executes it transparently, else EINTR;
             //   * timed FUTEX_WAIT -> -ERESTART_RESTARTBLOCK: EINTR whenever
             //     a handler runs, SA_RESTART or not; restarted only when none
-            //     does (we re-arm the full relative interval there, Linux the
-            //     remainder). Measured on Linux 7.0: timed + SA_RESTART
+            //     does, with the remainder of the original deadline
+            //     (`futex_wait_timed`). Measured on Linux 7.0: timed + SA_RESTART
             //     handler -> EINTR at the signal; untimed -> restarted.
             //     Restarting timed waits under SA_RESTART would let a periodic
             //     signal postpone the timeout forever.
             // FUTEX_WAIT_BITSET keeps its old behaviour (a spurious 0 wake):
             // Rust std and relibc re-check their own deadline on any return.
             if cmd == FUTEX_WAIT_BITSET { return 0; }
-            if deadline.is_none() { ERESTARTSYS } else { ERESTARTNOHAND }
+            ERESTARTSYS
         }
         1 => {
             // FUTEX_WAKE: wake up to `val` tasks sleeping on `uaddr`.
@@ -9363,22 +9427,13 @@ fn sys_timerfd_gettime(fd: usize, cur_ptr: usize) -> isize {
 /// `struct timespec` (ns). Reading a timespec as a timeval made every
 /// pselect6 timeout 1000× too long.
 fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize, timespec: bool) -> isize {
-    const POLLIN:  u32 = 0x0001;
-    const POLLOUT: u32 = 0x0004;
-
     if nfds > 1024 { return -22; } // EINVAL — matches relibc's FD_SETSIZE
-    let bytes = (nfds + 7) / 8;
-    let pid = current_pid();
 
-    let has_r = rfds != 0 && validate_user_buf(rfds, bytes);
-    let has_w = wfds != 0 && validate_user_buf(wfds, bytes);
-    let has_e = efds != 0 && validate_user_buf(efds, bytes);
-
-    let (infinite, deadline) = if tv_ptr == 0 {
-        (true, 0)
+    let deadline = if tv_ptr == 0 {
+        u64::MAX
     } else if timespec {
         match read_user_timespec(tv_ptr) {
-            Ok(ns) => (false, deadline_after_ns(ns)),
+            Ok(ns) => deadline_after_ns(ns),
             Err(e) => return e,
         }
     } else {
@@ -9387,8 +9442,27 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize,
         let tv_usec = unsafe { core::ptr::read((tv_ptr + 8) as *const i64) };
         if tv_sec < 0 || tv_usec < 0 { return -22; } // EINVAL
         let ns = (tv_sec as u64).saturating_mul(1_000_000_000).saturating_add((tv_usec as u64).saturating_mul(1_000));
-        (false, deadline_after_ns(ns))
+        deadline_after_ns(ns)
     };
+    select_wait(nfds, rfds, wfds, efds, deadline)
+}
+
+/// The select/pselect6 loop proper, on an absolute `deadline` (`u64::MAX` =
+/// none); also what `restart_syscall` resumes. Interrupted: EINTR when a
+/// handler runs, else a restart on the SAME deadline (Linux gets there with
+/// -ERESTARTNOHAND after writing the remainder back into the timeout).
+fn select_wait(nfds: usize, rfds: usize, wfds: usize, efds: usize, deadline: u64) -> isize {
+    const POLLIN:  u32 = 0x0001;
+    const POLLOUT: u32 = 0x0004;
+
+    if nfds > 1024 { return -22; }
+    let bytes = (nfds + 7) / 8;
+    let pid = current_pid();
+    let infinite = deadline == u64::MAX;
+
+    let has_r = rfds != 0 && validate_user_buf(rfds, bytes);
+    let has_w = wfds != 0 && validate_user_buf(wfds, bytes);
+    let has_e = efds != 0 && validate_user_buf(efds, bytes);
 
     loop {
         // fd_set is capped at 1024 bits (FD_SETSIZE) above, so 128 bytes
@@ -9413,7 +9487,10 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize,
             if has_e { unsafe { core::ptr::write_bytes(efds as *mut u8, 0, bytes); } }
             return nready;
         }
-        if interrupted() { return -4; } // EINTR
+        if interrupted() {
+            sched::set_restart_block([RB_SELECT, nfds as u64, rfds as u64, wfds as u64, efds as u64, deadline, 0]);
+            return ERESTART_RESTARTBLOCK;
+        }
 
         poll_block(infinite, deadline, select_fds_mask(pid, nfds, rfds, wfds, has_r, has_w), || select_any_ready(pid, nfds, rfds, wfds, has_r, has_w));
     }
