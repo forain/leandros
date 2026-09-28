@@ -348,6 +348,8 @@ build_firefox() {
     if [[ "${LEANDROS_FIREFOX_REBUILD:-0}" != 1 && -f "$stamp" \
           && ! "$port/build.sh" -nt "$stamp" \
           && ! "$port/build-in-alpine.sh" -nt "$stamp" \
+          && ! "$port/icons.txt" -nt "$stamp" \
+          && ! "$port/icontrace.c" -nt "$stamp" \
           && ! "$ROOT_DIR/ports/mesa/ssp_guard.c" -nt "$stamp" ]]; then
         echo "  up to date ($port/out/$arch)"
         return 0

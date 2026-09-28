@@ -160,6 +160,99 @@ esac
     cp /usr/share/glib-2.0/schemas/gschemas.compiled "$S/usr/share/glib-2.0/schemas/"
   fi
 
+  # -- icon theme -----------------------------------------------------------------
+  # GTK aborts the process when an icon lookup misses and 'image-missing' (its
+  # last resort) is not in the theme either ("Icon 'image-missing' not present
+  # in theme Adwaita"). GTK3 on Wayland with no org.gnome.desktop.interface
+  # schema resolves the theme name "Adwaita", so the minimal theme lives at
+  # /usr/share/icons/Adwaita, inheriting hicolor (already in the image).
+  #
+  # It is NOT adwaita-icon-theme (13.6 MB, 10 MB of cursors, SVG-only, which
+  # would also need librsvg's gdk-pixbuf loader at runtime). It is those of
+  # Adwaita's icons that are actually requested, rendered to PNG here with
+  # rsvg-convert (container-only) at the sizes GTK asks for:
+  #   * every -gtk-icontheme() name in GTK's built-in CSS theme, extracted
+  #     from libgtk's registered resources by a throwaway program below;
+  #   * the names listed in /src/icons.txt — observed at runtime with the
+  #     icontrace preload (LEANDROS_FIREFOX_ICON_TRACE=1, see firefox.sh).
+  # Symbolic icons become plain PNGs in Adwaita's own grey: GTK loads
+  # "<name>-symbolic.png" as-is rather than recolouring it.
+  # (No gtk+3.0-dev: it drags in icu-data-en, which conflicts with Firefox's
+  # icu-data-full. The few GLib/GTK entry points are declared by hand.)
+  apk add --no-cache adwaita-icon-theme rsvg-convert
+  cat > /tmp/gtkcss.c <<'EOF'
+#include <stdio.h>
+#include <string.h>
+typedef struct _GBytes GBytes;
+int gtk_init_check(int *argc, char ***argv);
+char **g_resources_enumerate_children(const char *path, int flags, void **err);
+GBytes *g_resources_lookup_data(const char *path, int flags, void **err);
+const void *g_bytes_get_data(GBytes *b, size_t *n);
+static void walk(const char *path) {
+  char **kids = g_resources_enumerate_children(path, 0, NULL);
+  if (!kids) return;
+  for (int i = 0; kids[i]; i++) {
+    char p[1024];
+    snprintf(p, sizeof p, "%s%s", path, kids[i]);
+    size_t k = strlen(kids[i]);
+    if (k && kids[i][k - 1] == '/') walk(p);
+    else if (k > 4 && !strcmp(kids[i] + k - 4, ".css")) {
+      GBytes *b = g_resources_lookup_data(p, 0, NULL);
+      if (b) { size_t n; const char *d = g_bytes_get_data(b, &n); fwrite(d, 1, n, stdout); }
+    }
+  }
+}
+int main(void) { gtk_init_check(NULL, NULL); walk("/org/gtk/libgtk/"); return 0; }
+EOF
+  cc -o /tmp/gtkcss /tmp/gtkcss.c /usr/lib/libgtk-3.so.0 /usr/lib/libgio-2.0.so.0 /usr/lib/libglib-2.0.so.0
+  /tmp/gtkcss | grep -o "gtk-icontheme([\"'][^\"']*" | sed "s/gtk-icontheme([\"']//" > /tmp/icon-names
+  grep -v '^#' /src/icons.txt | awk 'NF{print $1}' >> /tmp/icon-names
+  sort -u /tmp/icon-names -o /tmp/icon-names
+  T="$S/usr/share/icons/Adwaita"
+  mkdir -p "$T"
+  : > /tmp/icon-dirs
+  : > "$S/ICONS.txt"
+  for name in $(cat /tmp/icon-names); do
+    src=$(find /usr/share/icons/Adwaita -name "$name.svg" | sort | head -1)
+    if [ -z "$src" ]; then echo "missing $name" >> "$S/ICONS.txt"; continue; fi
+    ctx=$(basename "$(dirname "$src")")
+    for sz in 16 24 32 48; do
+      d="${sz}x${sz}/$ctx"
+      mkdir -p "$T/$d"
+      rsvg-convert -w "$sz" -h "$sz" -o "$T/$d/$name.png" "$src"
+      echo "$d $sz $ctx" >> /tmp/icon-dirs
+    done
+    echo "icon    $name  <- ${src#/usr/share/icons/Adwaita/}" >> "$S/ICONS.txt"
+  done
+  [ -f "$T/16x16/status/image-missing.png" ] || { echo "no image-missing rendered"; exit 6; }
+  sort -u /tmp/icon-dirs -o /tmp/icon-dirs
+  {
+    echo "[Icon Theme]"
+    echo "Name=Adwaita"
+    echo "Comment=LeandrOS subset of Adwaita, pre-rendered to PNG (ports/firefox)"
+    echo "Inherits=hicolor"
+    echo "Hidden=true"
+    printf 'Directories='; awk '{printf "%s,", $1}' /tmp/icon-dirs; echo
+    while read -r d sz ctx; do
+      echo; echo "[$d]"; echo "Size=$sz"; echo "Type=Fixed"
+      echo "Context=$(echo "$ctx" | awk '{print toupper(substr($1,1,1)) substr($1,2)}')"
+    done < /tmp/icon-dirs
+  } > "$T/index.theme"
+  gtk-update-icon-cache -f -t "$T"
+  echo "icon theme: $(grep -c '^icon ' "$S/ICONS.txt") icons, $(grep -c '^missing ' "$S/ICONS.txt") names with no Adwaita source, $(du -sh "$T" | cut -f1)"
+
+  # gdk-pixbuf picks a loader by sniffing the content type through GIO, which
+  # needs shared-mime-info's compiled database; without it every icon PNG
+  # fails with "Unrecognized image file format" and GTK aborts just the same.
+  # Ship the compiled files only (mime.cache, magic, globs2, ...), not the
+  # per-type XML under packages/ and the media-type directories (~5 MB).
+  mkdir -p "$S/usr/share/mime"
+  find /usr/share/mime -maxdepth 1 -type f -exec cp {} "$S/usr/share/mime/" \;
+  [ -f "$S/usr/share/mime/mime.cache" ] || { echo "no shared-mime-info cache"; exit 6; }
+
+  # The icon-lookup tracer (LD_PRELOAD'ed by /bin/firefox on request).
+  cc -shared -fPIC -O2 -fno-stack-protector -o "$S/usr/lib/firefox/libleandros-icontrace.so" /src/icontrace.c
+
   # -- ELF fix-ups --------------------------------------------------------------
   cc -shared -fPIC -fno-stack-protector -Wl,-soname,libleandros_ssp.so.1 \
     -o "$S/usr/lib/libleandros_ssp.so.1" /src/ssp_guard.c

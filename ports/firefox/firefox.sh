@@ -57,4 +57,11 @@ GTK_USE_PORTAL=0
 GIO_USE_VFS=local
 export MOZ_CRASHREPORTER_DISABLE NO_AT_BRIDGE GTK_A11Y GSETTINGS_BACKEND GTK_USE_PORTAL GIO_USE_VFS
 
+# LEANDROS_FIREFOX_ICON_TRACE=1: log every icon name GTK/Firefox look up
+# ("ICONTRACE ..." on stderr) — how ports/firefox/icons.txt is maintained.
+if [ "${LEANDROS_FIREFOX_ICON_TRACE:-0}" = 1 ] && [ -r /usr/lib/firefox/libleandros-icontrace.so ]; then
+    LD_PRELOAD=/usr/lib/firefox/libleandros-icontrace.so${LD_PRELOAD:+:$LD_PRELOAD}
+    export LD_PRELOAD
+fi
+
 exec /usr/lib/firefox/firefox "$@"

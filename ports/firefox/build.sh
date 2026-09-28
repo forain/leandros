@@ -32,7 +32,7 @@ mkdir -p "$OUT"
 # so editing the checkout mid-build would otherwise change the running build.
 SNAP=$(mktemp -d "${TMPDIR:-/tmp}/firefox-port-src.XXXXXX")
 trap 'rm -rf "$SNAP"' EXIT
-cp "$HERE/build-in-alpine.sh" "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
+cp "$HERE/build-in-alpine.sh" "$HERE/icontrace.c" "$HERE/icons.txt" "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
 # The sonames scripts/mkfs-f2fs-populated.py packs into /usr/lib on its own
 # (its usr_lib_files list). A staged library with one of these names is
 # dropped at image time and the image's copy is loaded instead, so the
