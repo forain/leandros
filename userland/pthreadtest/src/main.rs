@@ -46,6 +46,9 @@ extern "C" {
     pub fn exit(status: i32) -> !;
     pub fn usleep(usec: u32) -> i32;
     pub fn syscall(sysno: i64, ...) -> i64;
+    pub fn open(path: *const u8, flags: i32, ...) -> i32;
+    pub fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    pub fn close(fd: i32) -> i32;
 
     pub fn pthread_create(
         thread: *mut pthread_t,
@@ -151,6 +154,7 @@ pub unsafe extern "C" fn pthread_main(argc: isize, argv: *mut *mut u8, _envp: *m
     if !test_pthread_cleanup() { failures += 1; }
     if !test_thread_getpid_is_process() { failures += 1; }
     if !test_getrandom_distinct() { failures += 1; }
+    if !test_getrandom_quality() { failures += 1; }
 
     puts(b"--- pthreadtest done ---\n\0".as_ptr());
     failures
@@ -264,6 +268,86 @@ unsafe fn test_getrandom_distinct() -> bool {
         }
     }
     report(name, !short && distinct)
+}
+
+// ── 1d. getrandom() / /dev/urandom output quality and flags ─────────────────
+//
+// A sanity net under the kernel CSPRNG (sched::random), not a proof:
+//   * byte frequencies over 1 MiB pass a chi-square test (255 dof: mean 255,
+//     sd ~22.6; accepted 170..350, which also rejects output that is TOO
+//     even, e.g. a counter);
+//   * 8192 successive 64-bit draws contain no repeat (no short cycle);
+//   * GRND_NONBLOCK and GRND_RANDOM return full reads, an unknown flag and
+//     GRND_INSECURE|GRND_RANDOM are rejected;
+//   * /dev/urandom and /dev/random return bytes that differ from each other
+//     and from the last getrandom draw.
+
+static mut RAND_MIB: [u8; 1 << 20] = [0; 1 << 20];
+static mut RAND_WORDS: [u64; 8192] = [0; 8192];
+
+unsafe fn chi_square_x4096(buf: &[u8]) -> u64 {
+    let mut counts = [0u64; 256];
+    for &b in buf { counts[b as usize] += 1; }
+    let expect = (buf.len() / 256) as i64;
+    counts.iter().map(|&c| { let d = c as i64 - expect; (d * d) as u64 }).sum()
+}
+
+unsafe fn test_getrandom_quality() -> bool {
+    let name = b"getrandom_quality\0";
+    let mib = &mut *core::ptr::addr_of_mut!(RAND_MIB);
+    let mut got = 0usize;
+    while got < mib.len() {
+        let r = syscall(SYS_GETRANDOM, mib.as_mut_ptr().add(got), mib.len() - got, 0usize);
+        if r <= 0 { return report(name, false); }
+        got += r as usize;
+    }
+    // sum((c - 4096)^2) / 4096 is the chi-square statistic for 1 MiB.
+    let chi_x = chi_square_x4096(mib);
+    let chi_ok = chi_x >= 170 * 4096 && chi_x <= 350 * 4096;
+
+    let words = &mut *core::ptr::addr_of_mut!(RAND_WORDS);
+    for w in words.iter_mut() {
+        if syscall(SYS_GETRANDOM, w as *mut u64, 8usize, 0usize) != 8 { return report(name, false); }
+    }
+    let last = words[8191];
+    words.sort_unstable();
+    let no_repeat = words.windows(2).all(|p| p[0] != p[1]);
+
+    let mut b = [0u8; 16];
+    let nb = syscall(SYS_GETRANDOM, b.as_mut_ptr(), 16usize, 1usize) == 16;   // GRND_NONBLOCK
+    let rnd = syscall(SYS_GETRANDOM, b.as_mut_ptr(), 16usize, 2usize) == 16;  // GRND_RANDOM
+    let bad = syscall(SYS_GETRANDOM, b.as_mut_ptr(), 16usize, 0x40usize) < 0;
+    let bad2 = syscall(SYS_GETRANDOM, b.as_mut_ptr(), 16usize, 6usize) < 0;   // INSECURE|RANDOM
+
+    let mut u = [0u8; 4096];
+    let mut r = [0u8; 4096];
+    let fu = open(b"/dev/urandom\0".as_ptr(), 0);
+    let fr = open(b"/dev/random\0".as_ptr(), 0);
+    let nu = if fu >= 0 { read(fu, u.as_mut_ptr(), u.len()) } else { -1 };
+    let nr = if fr >= 0 { read(fr, r.as_mut_ptr(), r.len()) } else { -1 };
+    if fu >= 0 { close(fu); }
+    if fr >= 0 { close(fr); }
+    let dev_ok = nu == 4096 && nr == 4096 && u != r
+        && u[..8] != last.to_le_bytes() && u.iter().any(|&x| x != 0);
+    // 4 KiB is too little for a tight chi-square; allow a wide band.
+    let mut dev_counts = [0u32; 256];
+    for &x in u.iter() { dev_counts[x as usize] += 1; }
+    let dev_spread = dev_counts.iter().filter(|&&c| c > 0).count() > 200;
+
+    let say = |label: &[u8], v: u64| {
+        write(1, label.as_ptr(), label.len());
+        let mut buf = [0u8; 20]; let mut n = 0; let mut x = v;
+        if x == 0 { buf[0] = b'0'; n = 1; }
+        while x > 0 { buf[n] = b'0' + (x % 10) as u8; x /= 10; n += 1; }
+        let mut o = [0u8; 20]; for i in 0..n { o[i] = buf[n - 1 - i]; }
+        write(1, o.as_ptr(), n);
+    };
+    say(b"  getrandom chi2(1MiB)=", chi_x / 4096);
+    say(b" no_repeat=", no_repeat as u64);
+    say(b" flags nb/rnd/bad/bad2=", ((nb as u64) << 3) | ((rnd as u64) << 2) | ((bad as u64) << 1) | bad2 as u64);
+    say(b" dev u/r=", ((nu.max(0) as u64) << 16) | nr.max(0) as u64);
+    write(1, b"\n".as_ptr(), 1);
+    report(name, chi_ok && no_repeat && nb && rnd && bad && bad2 && dev_ok && dev_spread)
 }
 
 // ── 2. Mutex Contention ─────────────────────────────────────────────────────

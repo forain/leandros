@@ -31,6 +31,7 @@ pub mod gdwake;
 pub mod pcsample;
 pub mod runqueue;
 pub mod signal;
+pub mod random;
 pub mod task;
 pub mod uaccess;
 

@@ -1640,18 +1640,6 @@ pub fn eventfd_slot_signal(slot: usize) {
     sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::EVENTFD, slot as u32));
 }
 
-// ── /dev/urandom LFSR ─────────────────────────────────────────────────────────
-
-static LFSR_STATE: Mutex<u64> = Mutex::new(0xdeadbeef_cafebabe);
-
-fn lfsr_next() -> u8 {
-    let mut state = LFSR_STATE.lock();
-    *state ^= sched::ticks().wrapping_mul(0x9e3779b97f4a7c15); // mix ticks for entropy
-    let lsb = *state & 1;
-    *state >>= 1;
-    if lsb != 0 { *state ^= 0xB400000000000000; }
-    (*state & 0xFF) as u8
-}
 
 // ── timerfd pool ──────────────────────────────────────────────────────────────
 
@@ -4480,8 +4468,19 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             val_reply(n as u64)
         }
         VnodeKind::DevUrandom => {
+            // /dev/urandom and /dev/random: the kernel CSPRNG, the same one
+            // getrandom(2) uses (sched::random). Never blocks — it is seeded
+            // before userspace starts.
+            drop(tbls);
             let n = count.min(4096);
-            for i in 0..n { unsafe { *buf.add(i) = lfsr_next(); } }
+            let mut chunk = [0u8; sched::random::CHUNK];
+            let mut done = 0;
+            while done < n {
+                let k = (n - done).min(chunk.len());
+                sched::random::fill(&mut chunk[..k]);
+                unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), buf.add(done), k); }
+                done += k;
+            }
             val_reply(n as u64)
         }
         VnodeKind::DevStdio { target_fd } => {

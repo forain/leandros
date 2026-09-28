@@ -3294,42 +3294,38 @@ fn sys_settimeofday(tv_ptr: usize, _tz_ptr: usize) -> isize {
     0
 }
 
-/// sys_getrandom(buf, count, flags) — fill buffer with pseudo-random bytes.
+/// sys_getrandom(buf, count, flags) — bytes from the kernel CSPRNG
+/// (`sched::random`: ChaCha20, fast key erasure, seeded at boot from the
+/// CPU's hardware RNG where present plus timing jitter).
 ///
-/// Uses a simple LCG seeded from ticks.  Not cryptographically secure, but
-/// satisfies musl's use for arc4random seeding.
-fn sys_getrandom(buf_ptr: usize, count: usize, _flags: usize) -> isize {
+/// Flags follow Linux: GRND_NONBLOCK (1), GRND_RANDOM (2), GRND_INSECURE (4);
+/// anything else, or GRND_INSECURE together with GRND_RANDOM, is EINVAL. The
+/// generator is seeded before the first user process runs, so there is no
+/// "not yet initialised" state to block on or report EAGAIN for, and
+/// GRND_RANDOM draws from the same generator (Linux >= 5.6 semantics). A
+/// single call returns at most 32 MiB - 1 bytes, as Linux does.
+fn sys_getrandom(buf_ptr: usize, count: usize, flags: usize) -> isize {
+    const GRND_NONBLOCK: usize = 1;
+    const GRND_RANDOM:   usize = 2;
+    const GRND_INSECURE: usize = 4;
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0 { return -22; }
+    if flags & GRND_INSECURE != 0 && flags & GRND_RANDOM != 0 { return -22; }
+    let count = count.min((32 << 20) - 1);
     if count == 0 { return 0; }
     if !validate_user_buf(buf_ptr, count) { return -14; }
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
-    for chunk in buf.chunks_mut(8) {
-        let bytes = rng_next().to_le_bytes();
-        for (d, &s) in chunk.iter_mut().zip(bytes.iter()) { *d = s; }
+    // Generate into a kernel buffer (the generator's lock is never held
+    // across a user-memory access), then copy out.
+    let mut chunk = [0u8; sched::random::CHUNK];
+    let mut done = 0;
+    while done < count {
+        let n = (count - done).min(chunk.len());
+        sched::random::fill(&mut chunk[..n]);
+        prefault_user(buf_ptr + done, n);
+        unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), (buf_ptr + done) as *mut u8, n); }
+        done += n;
     }
+    for b in chunk.iter_mut() { unsafe { core::ptr::write_volatile(b, 0); } }
     count as isize
-}
-
-/// Global state of `rng_next`: a Weyl sequence every caller advances.
-static RNG_STATE: AtomicU64 = AtomicU64::new(0x243F_6A88_85A3_08D3);
-
-/// One 64-bit value for getrandom(2): SplitMix64 over a system-wide counter,
-/// perturbed by the nanosecond clock. Not cryptographic, but never repeats
-/// within a boot.
-///
-/// getrandom used to restart an LCG from `ticks()` (the 100 Hz scheduler
-/// tick) on every call, so all calls within one tick returned the SAME bytes.
-/// Firefox names its IPC ports with 128-bit random ids drawn back to back,
-/// got two equal names, and warned `Oops: ERROR_PORT_EXISTS`; any
-/// UUID/hash-seed/temp-name user saw the same collisions.
-fn rng_next() -> u64 {
-    const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
-    let t = monotonic_ns();
-    let mut z = RNG_STATE.fetch_add(GOLDEN, Ordering::Relaxed)
-        .wrapping_add(GOLDEN)
-        .wrapping_add(t.rotate_left(29));
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 
 /// sys_prctl(option, arg2..5) — process control.

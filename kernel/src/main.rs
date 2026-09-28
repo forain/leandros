@@ -991,6 +991,10 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         serial_print_hex(boot_info_addr);
         serial_print_str("\n");
 
+        // Seed the kernel CSPRNG before any user process exists, so
+        // getrandom(2) and /dev/urandom never hand out unseeded output.
+        sched::random::init();
+
         init::init_task_main(bi);
     }
     
