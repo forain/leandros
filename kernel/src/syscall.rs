@@ -1720,7 +1720,13 @@ fn dispatch_inner(
         SYS_SPAWN => sys_spawn(a0, a1, a2),
         WAIT4   => sys_wait4(a0, a1, a2, a3),
         WAITID  => sys_waitid(a0, a1, a2, a3),
-        GETPID  => current_pid() as isize,
+        // getpid(2) names the *process* (thread group), from every thread;
+        // the thread's own id is gettid(2). This returned the calling
+        // thread's id, so any non-main thread saw a different "pid" from
+        // its own process: Firefox's IPC endpoints record getpid() when
+        // created and MOZ_RELEASE_ASSERT it on bind from another thread
+        // (`mMyProcInfo == EndpointProcInfo::Current()`), and died there.
+        GETPID  => sched::current_tgid() as isize,
         GETPPID => sys_getppid(),
 
         // ── exec / fork ───────────────────────────────────────────────────────
@@ -3295,15 +3301,35 @@ fn sys_settimeofday(tv_ptr: usize, _tz_ptr: usize) -> isize {
 fn sys_getrandom(buf_ptr: usize, count: usize, _flags: usize) -> isize {
     if count == 0 { return 0; }
     if !validate_user_buf(buf_ptr, count) { return -14; }
-    // LCG with 64-bit state; seeded from monotonic ticks.
-    let mut state = ticks().wrapping_add(0x_dead_beef_cafe_babe);
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
     for chunk in buf.chunks_mut(8) {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let bytes = state.to_le_bytes();
+        let bytes = rng_next().to_le_bytes();
         for (d, &s) in chunk.iter_mut().zip(bytes.iter()) { *d = s; }
     }
     count as isize
+}
+
+/// Global state of `rng_next`: a Weyl sequence every caller advances.
+static RNG_STATE: AtomicU64 = AtomicU64::new(0x243F_6A88_85A3_08D3);
+
+/// One 64-bit value for getrandom(2): SplitMix64 over a system-wide counter,
+/// perturbed by the nanosecond clock. Not cryptographic, but never repeats
+/// within a boot.
+///
+/// getrandom used to restart an LCG from `ticks()` (the 100 Hz scheduler
+/// tick) on every call, so all calls within one tick returned the SAME bytes.
+/// Firefox names its IPC ports with 128-bit random ids drawn back to back,
+/// got two equal names, and warned `Oops: ERROR_PORT_EXISTS`; any
+/// UUID/hash-seed/temp-name user saw the same collisions.
+fn rng_next() -> u64 {
+    const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+    let t = monotonic_ns();
+    let mut z = RNG_STATE.fetch_add(GOLDEN, Ordering::Relaxed)
+        .wrapping_add(GOLDEN)
+        .wrapping_add(t.rotate_left(29));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// sys_prctl(option, arg2..5) — process control.
@@ -3859,8 +3885,13 @@ fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
     sched::kill_pgrp(pgid, sig, info)
 }
 
+/// getppid(2): the parent *process* of the calling process. A thread's own
+/// `ppid` is the thread that created it, and a process forked from a
+/// non-main thread records that thread; report the leader's parent, as a
+/// thread group id.
 fn sys_getppid() -> isize {
-    current_ppid() as isize
+    let leader_ppid = sched::task_ppid(sched::current_tgid()).unwrap_or_else(|| current_ppid());
+    sched::tgid_of(leader_ppid) as isize
 }
 
 // ── Thread primitives (futex, TID address, TLS base) ──────────────────────────

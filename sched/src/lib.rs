@@ -625,6 +625,11 @@ pub fn current_ppid() -> Pid {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.ppid).unwrap_or(0)
 }
 
+/// The recorded parent of task `pid` (a thread id), if the task is live.
+pub fn task_ppid(pid: Pid) -> Option<Pid> {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.ppid)
+}
+
 pub fn current_pgid() -> Pid {
     let pid = current_pid();
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.pgid).unwrap_or(0)

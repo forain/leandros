@@ -45,6 +45,7 @@ extern "C" {
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     pub fn exit(status: i32) -> !;
     pub fn usleep(usec: u32) -> i32;
+    pub fn syscall(sysno: i64, ...) -> i64;
 
     pub fn pthread_create(
         thread: *mut pthread_t,
@@ -148,6 +149,8 @@ pub unsafe extern "C" fn pthread_main(argc: isize, argv: *mut *mut u8, _envp: *m
     if !test_pthread_condvar() { failures += 1; }
     if !test_pthread_tsd() { failures += 1; }
     if !test_pthread_cleanup() { failures += 1; }
+    if !test_thread_getpid_is_process() { failures += 1; }
+    if !test_getrandom_distinct() { failures += 1; }
 
     puts(b"--- pthreadtest done ---\n\0".as_ptr());
     failures
@@ -177,6 +180,90 @@ unsafe fn test_pthread_create_join() -> bool {
     if r2 != 0 { return report(name, false); }
 
     report(name, retval == magic)
+}
+
+// ── 1b. getpid() from a thread names the process ────────────────────────────
+//
+// getpid(2)/getppid(2) are per-process: every thread of a process gets the
+// same answers, and only gettid(2) differs. The kernel used to return the
+// calling thread's id from getpid, which made Firefox's IPC layer abort
+// (`MOZ_RELEASE_ASSERT(mMyProcInfo == ... EndpointProcInfo::Current())`).
+
+#[cfg(target_arch = "x86_64")]
+mod ids { pub const GETPID: i64 = 39; pub const GETPPID: i64 = 110; pub const GETTID: i64 = 186; }
+#[cfg(target_arch = "aarch64")]
+mod ids { pub const GETPID: i64 = 172; pub const GETPPID: i64 = 173; pub const GETTID: i64 = 178; }
+
+static mut THREAD_IDS: [i64; 3] = [0; 3];
+
+extern "C" fn ids_worker(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        THREAD_IDS = [syscall(ids::GETPID), syscall(ids::GETPPID), syscall(ids::GETTID)];
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_thread_getpid_is_process() -> bool {
+    let name = b"thread_getpid_is_process\0";
+    let (pid, ppid, tid) = (syscall(ids::GETPID), syscall(ids::GETPPID), syscall(ids::GETTID));
+    let mut thread: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut thread, core::ptr::null(), ids_worker, core::ptr::null_mut()) != 0 {
+        return report(name, false);
+    }
+    let mut rv: *mut c_void = core::ptr::null_mut();
+    if pthread_join(thread, &mut rv) != 0 { return report(name, false); }
+    let [tpid, tppid, ttid] = THREAD_IDS;
+    report(name, pid == tid && tpid == pid && tppid == ppid && ttid != tid && ttid > 0)
+}
+
+// ── 1c. getrandom() never repeats back to back ──────────────────────────────
+//
+// getrandom(2) used to reseed from the 100 Hz tick on every call, so calls in
+// the same tick returned identical bytes — Firefox drew two equal 128-bit IPC
+// port names from it (`ERROR_PORT_EXISTS`). Draw 64 values in a tight loop,
+// from this thread and a second one at once, and require them all distinct.
+
+#[cfg(target_arch = "x86_64")]
+const SYS_GETRANDOM: i64 = 318;
+#[cfg(target_arch = "aarch64")]
+const SYS_GETRANDOM: i64 = 278;
+
+static mut RAND_WORKER: [u64; 32] = [0; 32];
+
+extern "C" fn rand_worker(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        for i in 0..32 {
+            let mut v: u64 = 0;
+            syscall(SYS_GETRANDOM, &mut v as *mut u64, 8usize, 0usize);
+            RAND_WORKER[i] = v;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_getrandom_distinct() -> bool {
+    let name = b"getrandom_distinct\0";
+    let mut thread: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut thread, core::ptr::null(), rand_worker, core::ptr::null_mut()) != 0 {
+        return report(name, false);
+    }
+    let mut mine = [0u64; 32];
+    let mut short = false;
+    for v in mine.iter_mut() {
+        if syscall(SYS_GETRANDOM, v as *mut u64, 8usize, 0usize) != 8 { short = true; }
+    }
+    let mut rv: *mut c_void = core::ptr::null_mut();
+    if pthread_join(thread, &mut rv) != 0 { return report(name, false); }
+    let mut all = [0u64; 64];
+    all[..32].copy_from_slice(&mine);
+    all[32..].copy_from_slice(&*core::ptr::addr_of!(RAND_WORKER));
+    let mut distinct = true;
+    for i in 0..64 {
+        for j in i + 1..64 {
+            if all[i] == all[j] { distinct = false; }
+        }
+    }
+    report(name, !short && distinct)
 }
 
 // ── 2. Mutex Contention ─────────────────────────────────────────────────────
