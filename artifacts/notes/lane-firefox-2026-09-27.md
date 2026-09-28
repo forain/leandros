@@ -1,5 +1,40 @@
 # Lane firefox — 2026-09-27
 
+## RESUME HERE (paused 2026-09-28)
+Branch `lane/firefox`, worktree `.claude/worktrees/agent-a40da30690bad16e4`. Not merged, not pushed. The tree is clean. Commits after `b88f48b5`:
+- `b97e2526` random: ChaCha20 CSPRNG for getrandom and /dev/urandom (item B)
+- `062f852` ports/firefox: minimal PNG icon theme and MIME database (item A)
+- a tools/notes commit: `artifacts/notes/lane-firefox-tools/`
+
+Tools:
+- `ffsession.py <arch> <tag> [--wait S] [--env "K=V ..."]` boots `--virgl`, logs `leandro` in at the greeter, opens cosmic-term with Super+T and runs Firefox. It saves screenshots, ff.log and the serial logs to `$FFSESSION_OUT/run-<tag>/` (default `/tmp/ffsession`).
+- `runtests.py <arch> <tag> <cmd>...` is a headless boot + root login + test runner.
+- Run both with `LEANDROS_QEMU_MEM=4G` from the worktree root. `firefox-window-aarch64.png` is the proof screenshot.
+
+**Item B (CSPRNG getrandom): DONE, partly verified.**
+- `sched/src/random.rs`: ChaCha20 with fast key erasure, BLAKE2s seed extraction, and reseeding every 1 MiB or 60 s. getrandom, /dev/urandom and /dev/random all use it, and the Linux flag semantics are implemented.
+- Sources per arch/accelerator, from the boot log:
+  - x86_64/TCG `-cpu max`: `hardware=RDSEED (64 bytes)` + jitter (31 distinct low bytes / 4096).
+  - aarch64/HVF `-cpu host` (Apple M4): `hardware=none` — no FEAT_RNG is exposed, so it runs on jitter only (26 distinct low bytes; CNTVCT is 24 MHz).
+  - aarch64 TCG `-cpu max` and x86_64 KVM have not been run; both should report RNDRRS and RDSEED respectively.
+- Verified: pthreadtest (distinct + quality: chi2 266 on aarch64, 283 on x86_64, no repeats, flags, /dev/(u)random) passes on both arches.
+- **Still to do for B:** the full regression suite (sigtest… sigchldtest, see below) and a desktop boot with this commit on both arches. Use `runtests.py <arch> <tag> /bin/sigtest /bin/sigtest2 /bin/memtest /bin/scmtest /bin/polltest /bin/forktest /bin/exectest /bin/pthreadtest /bin/epolltest /bin/timertest /bin/jobtest /bin/waittest /bin/sigchldtest`.
+- Open idea: the aarch64 HVF entropy is weak. Candidates are a virtio-rng device plus driver, or EFI_RNG_PROTOCOL. No DTB reaches the kernel on the UEFI path, so `/chosen/rng-seed` is unavailable.
+
+**Item A (icon theme): DONE for aarch64, x86_64 not yet run.**
+- GTK no longer aborts. **On aarch64/HVF virgl a Firefox window appears and draws its browser chrome** (tab strip, URL bar, toolbar, the "security features" notification bar) with hardware WebRender (virgl GLES 3.1 on ANGLE/Vulkan/Apple M4).
+- Small magenta rendering artifacts appear around the back/forward buttons and at bar edges.
+- **The content area is blank:** every content process (types web, extension, privilegedabout) exits with **status 127** (`process_watcher_posix_sigchld.cc:126`).
+- **Next step (this was in progress):** find why the children exit with 127.
+  - The temporary execve logging (removed, not committed) showed **no execve from the Firefox parent for them**, only glxtest's. A capture-gap caveat applies: `serial-live` held only ~16 lines in that run.
+  - **Hypotheses:**
+    - (1) Firefox 136's fork server: children are forked, not exec'd, and something in the forkserver/child path `_exit(127)`s. Test with `--env "MOZ_DISABLE_FORKSERVER=1"`, or pref `dom.ipc.forkserver.enable=false` in `ports/firefox/leandros-prefs.js`.
+    - (2) The exec goes through posix_spawn / clone(CLONE_VM|CLONE_VFORK) and fails before execve (musl `_exit(127)` on a pre-exec failure). Log clone flags and exit codes for Firefox's children.
+    - (3) The execve fails with ENOENT on a bad path from `/proc/self/exe`. The kernel does not log ENOENT.
+  - Useful log: `--env "MOZ_LOG=ProcessLaunch:5,ForkServer:5,Process:5"` (it showed only "Launching new process immediately for type …" then 127).
+- After that: load `about:` pages or a `file://` page. Networking is untested.
+- Then rerun on x86_64. `ports/firefox/out/*` are already restaged with the theme, and the x86_64 image must be rebuilt by `./scripts/build-all.sh`.
+
 Branch `lane/firefox` (local, not pushed, not merged), base `7b28aa05`. Commits:
 - `8ba66dca` ports: stage Alpine's prebuilt Firefox as an optional image component
 - `89c8a7df` signal: reset the alternate signal stack on execve, inherit it on fork
