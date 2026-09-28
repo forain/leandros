@@ -7825,6 +7825,23 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize) -> isize {
         let set_msg = make_vfs_msg(net_server::NET_SETFL, &[fd as u64, flags as u64]);
         return net_reply_val(&net_server::handle(&set_msg, pid));
     }
+    // FIONREAD / TIOCOUTQ (SIOCINQ / SIOCOUTQ) on a socket fd: answered by the
+    // net server from the connection's own queues. They used to fall through
+    // to the VFS below, which does not know socket fds and said EBADF — see
+    // net_server::handle_queue_len for what that broke.
+    const TIOCOUTQ: usize = 0x5411;
+    if (cmd == FIONREAD || cmd == TIOCOUTQ)
+        && fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE
+    {
+        if arg == 0 || !validate_user_buf(arg, 4) { return -14; }
+        let msg = make_vfs_msg(net_server::NET_QUEUE_LEN, &[fd as u64, (cmd == TIOCOUTQ) as u64]);
+        let n = net_reply_val(&net_server::handle(&msg, pid));
+        if n < 0 { return n; }
+        // Written with no net-server lock held (the handler has returned).
+        prefault_user(arg, 4);
+        unsafe { (arg as *mut i32).write(n.min(i32::MAX as isize) as i32) };
+        return 0;
+    }
 
     // ── Block devices ────────────────────────────────────────────────────────
     // BLKGETSIZE64/BLKSSZGET/BLKPG/LOOP_* live in the VFS's block registry,

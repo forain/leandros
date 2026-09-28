@@ -897,6 +897,55 @@ unsafe fn pending_connector_child_exits_first() -> bool {
 //   - EINVAL (-> raw -22) for a non-page-aligned addr.
 // Raw syscall returns are inspected directly (no errno wrapper) so the exact
 // error codes are asserted.
+// ── FIONREAD / TIOCOUTQ on a socket ─────────────────────────────────────────
+//
+// Firefox's in-process Wayland proxy sizes every relay read with
+// ioctl(FIONREAD) and drops the connection when it fails. Socket fds used to
+// reach the VFS ioctl path, which answered EBADF for them. Check the counts
+// on both ends of a socketpair across a write, a partial read and a drain.
+unsafe fn test_socket_fionread() -> bool {
+    let name = b"socket_fionread\0";
+    const FIONREAD: usize = 0x541B;
+    const TIOCOUTQ: usize = 0x5411;
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 { return report(name, false); }
+    let (a, b) = (sv[0], sv[1]);
+    let q = |fd: i32, cmd: usize| -> (isize, i32) {
+        let mut n: i32 = -1;
+        let r = syscall3(nr::IOCTL, fd as usize, cmd, &mut n as *mut i32 as usize);
+        (r, n)
+    };
+    let empty = q(b, FIONREAD);
+    let w = write(a, b"hello, proxy".as_ptr(), 12);
+    let after_write_b = q(b, FIONREAD);
+    let after_write_a_out = q(a, TIOCOUTQ);
+    let after_write_a_in = q(a, FIONREAD);
+    let mut buf = [0u8; 5];
+    let r1 = read(b, buf.as_mut_ptr(), 5);
+    let after_part = q(b, FIONREAD);
+    let mut rest = [0u8; 16];
+    let r2 = read(b, rest.as_mut_ptr(), 16);
+    let drained = q(b, FIONREAD);
+    let drained_out = q(a, TIOCOUTQ);
+    close(a); close(b);
+    let ok = empty == (0, 0) && w == 12 && after_write_b == (0, 12) && after_write_a_out == (0, 12)
+        && after_write_a_in == (0, 0) && r1 == 5 && after_part == (0, 7) && r2 == 7
+        && drained == (0, 0) && drained_out == (0, 0);
+    if !ok {
+        for (tag, (r, n)) in [(&b"[fionread] empty rc=%ld n=%ld\n\0"[..], empty),
+                              (b"[fionread] b-after-write rc=%ld n=%ld\n\0", after_write_b),
+                              (b"[fionread] a-outq rc=%ld n=%ld\n\0", after_write_a_out),
+                              (b"[fionread] a-in rc=%ld n=%ld\n\0", after_write_a_in),
+                              (b"[fionread] b-after-partial rc=%ld n=%ld\n\0", after_part),
+                              (b"[fionread] b-drained rc=%ld n=%ld\n\0", drained),
+                              (b"[fionread] a-outq-drained rc=%ld n=%ld\n\0", drained_out)] {
+            printf(tag.as_ptr(), r as u64, n as i64 as u64, 0, 0);
+        }
+        dbg1(b"[fionread] write=%ld\n\0", w as i64);
+    }
+    report(name, ok)
+}
+
 unsafe fn test_mincore() -> bool {
     let name = b"mincore";
     let page = 4096usize;
@@ -977,6 +1026,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
 
     // ── M7u: mincore residency probe (Mesa EGL pointer-dereferenceable signal) ──
     if !test_mincore() { failures += 1; }
+
+    // ── FIONREAD / TIOCOUTQ on AF_UNIX sockets (Firefox's Wayland proxy) ──
+    if !test_socket_fionread() { failures += 1; }
 
     // ── AF_INET TCP over the loopback interface ────────────────
     if !test_inet_loopback_tcp() { failures += 1; }

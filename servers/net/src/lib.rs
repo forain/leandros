@@ -41,6 +41,8 @@ pub const NET_SETFL:      u64 = 0x45;
 pub const NET_GETFL:      u64 = 0x46;
 pub const NET_SETFD:      u64 = 0x47;
 pub const NET_GETFD:      u64 = 0x48;
+/// ioctl FIONREAD (arg1 = 0) / TIOCOUTQ (arg1 = 1) on a socket fd.
+pub const NET_QUEUE_LEN:  u64 = 0x49;
 
 const POLLIN:  u64 = 0x0001;
 const POLLOUT: u64 = 0x0004;
@@ -1425,6 +1427,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         NET_GETFL       => handle_getfl(caller_pid, arg(msg,0) as usize),
         NET_SETFD       => handle_setfd(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         NET_GETFD       => handle_getfd(caller_pid, arg(msg,0) as usize),
+        NET_QUEUE_LEN   => handle_queue_len(caller_pid, arg(msg,0) as usize, arg(msg,1) != 0),
         _               => err_reply(-38),
     }
 }
@@ -3177,6 +3180,61 @@ fn handle_setfl(pid: u32, sockfd: usize, flags: u32) -> Message {
 }
 
 /// fcntl(F_GETFL) for sockets: report O_NONBLOCK.
+/// ioctl(FIONREAD) (`outq == false`) / ioctl(TIOCOUTQ, alias SIOCOUTQ) on a
+/// socket: bytes queued for the next read, or written but not yet consumed
+/// by the peer. Linux answers both for AF_UNIX and TCP sockets; FIONREAD on
+/// a UDP socket is the size of the next datagram. A listener or an unbound
+/// socket has nothing queued (0).
+///
+/// Firefox's in-process Wayland proxy (widget/gtk/wayland-proxy) sizes every
+/// relay read with FIONREAD and treats a failing ioctl as a dead connection.
+/// Socket fds used to fall through to the VFS, which knows only its own fds
+/// and answered EBADF, so the proxy dropped GTK's connection on the first
+/// message ("ProxiedConnection::TransferOrQueue() broken source socket: Bad
+/// file descriptor") and Firefox exited with "we don't have any display".
+fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
+    let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
+    let tbls = SOCK_TABLES.lock();
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    let state = tbl.socks[slot].state;
+    let sock_type = tbl.socks[slot].sock_type;
+    drop(tbls);
+    let n = match state {
+        SockState::UnixConnected { conn_idx, is_a } => {
+            let conns = UNIX_CONNS.lock();
+            let conn = &conns[conn_idx];
+            // End A reads ring_ba and writes ring_ab; end B the opposite.
+            match (is_a, outq) {
+                (true, false) | (false, true) => conn.ring_ba.count,
+                (true, true) | (false, false) => conn.ring_ab.count,
+            }
+        }
+        SockState::UnixPendingAccept { conn_idx, .. } => {
+            // The connector is end A until the accept.
+            let conns = UNIX_CONNS.lock();
+            let conn = &conns[conn_idx];
+            if outq { conn.ring_ab.count } else { conn.ring_ba.count }
+        }
+        SockState::InetConnected { socket_handle, lo, .. } => {
+            let mut stack = stack_for(lo);
+            match *stack {
+                Some(ref mut s) if sock_type == SOCK_STREAM as u8 => {
+                    let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
+                    if outq { socket.send_queue() } else { socket.recv_queue() }
+                }
+                Some(ref mut s) => {
+                    let socket = s.socket_set.get_mut::<udp::Socket>(socket_handle);
+                    if outq { 0 } else { socket.peek().map(|(p, _)| p.len()).unwrap_or(0) }
+                }
+                None => 0,
+            }
+        }
+        _ => 0,
+    };
+    val_reply(n as u64)
+}
+
 fn handle_getfl(pid: u32, sockfd: usize) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.lock();

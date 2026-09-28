@@ -24,15 +24,7 @@ esac
 # Native Wayland, through GTK3's Wayland backend.
 MOZ_ENABLE_WAYLAND=1
 GDK_BACKEND=wayland
-# Firefox's in-process Wayland proxy (a relay socket between GTK and the
-# compositor) fails on this kernel on both arches before any window exists:
-#   ProxiedConnection::TransferOrQueue() broken source socket: Bad file descriptor
-#   ProxiedConnection::Process(): Failed to read data from client!: Bad file descriptor
-#   Error: we don't have any display, WAYLAND_DISPLAY='wayland-1'
-# (open kernel issue, see artifacts/notes/lane-firefox-2026-09-27.md). With the
-# proxy off GTK connects straight to cosmic-comp and gets its dmabuf feedback.
-MOZ_DISABLE_WAYLAND_PROXY=1
-export MOZ_ENABLE_WAYLAND GDK_BACKEND MOZ_DISABLE_WAYLAND_PROXY
+export MOZ_ENABLE_WAYLAND GDK_BACKEND
 
 # Hardware compositing: WebRender on EGL (our Mesa: zink or virgl). The prefs
 # in /usr/lib/firefox/defaults/pref/leandros-prefs.js force it past the GPU
