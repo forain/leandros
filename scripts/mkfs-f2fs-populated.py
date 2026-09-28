@@ -918,8 +918,15 @@ def main():
     verify_dbus_staging(arch)
     m5_arch_root = os.path.expanduser(f"~/code/leandros-artifacts/m5-session-ship/{arch}")
     m5_fonts_src = os.path.expanduser("~/code/leandros-artifacts/m5-session-ship/share/fonts")
-    cosmic_comp  = os.path.expanduser(f"~/code/leandros-artifacts/m3-gl-stack/out/cosmic-comp-{arch}")
-    if os.path.exists(cosmic_comp):
+    # cosmic-comp: LEANDROS_COSMIC_COMP=<file> wins; else the m6 rebuild that
+    # carries ports/cosmic-comp's patches (ports/cosmic-comp/build.sh);
+    # else the original M5 probe build.
+    cosmic_comp = os.environ.get("LEANDROS_COSMIC_COMP") or next(
+        (p for p in (os.path.expanduser(f"~/code/leandros-artifacts/{d}/cosmic-comp-{arch}")
+                     for d in ("m6-session-bins/out", "m3-gl-stack/out"))
+         if os.path.exists(p)), "")
+    if cosmic_comp:
+        print(f"  cosmic-comp: {cosmic_comp}")
         bin_files.append(("cosmic-comp", cosmic_comp, 0o100755))
     # (image_dir_abspath, name, hostpath) packed 0755 after inode registration.
     m5_exec_files = []
