@@ -58,6 +58,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_stack_overflow_segv() { failures += 1; }
     if !test_prot_none_faults() { failures += 1; }
     if !test_mremap_nomove() { failures += 1; }
+    if !test_big_lazy_reservations() { failures += 1; }
     if !test_el0_cache_maintenance() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
@@ -1146,6 +1147,68 @@ unsafe fn test_mremap_nomove() -> bool {
     say_kb(b" r3=", (-r3) as usize);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, r1 == -12 && still == 7 && r2 == p as isize + PAGE as isize && r3 == -14)
+}
+
+/// Large demand-paged reservations cost nothing until touched (Firefox).
+///
+/// SpiderMonkey reserves ~2 GiB of JIT code space up front
+/// (`mmap(NULL, 0x7FC00000, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE)`)
+/// and commits pieces of it with MAP_FIXED; musl's ld.so maps a library's
+/// whole span from its file before overlaying the segments. Both used to hit
+/// the 512 MiB anonymous / 256 MiB file caps with EINVAL. Checks that the
+/// mappings succeed, that touching the far end of a 4 GiB mapping raises
+/// RssAnon by about two pages (no span-proportional allocation), and that a
+/// 300 MiB private file mapping reads the file.
+unsafe fn test_big_lazy_reservations() -> bool {
+    let name = b"big_lazy_reservations\0";
+    unsafe fn child() -> i32 {
+        const MAP_NORESERVE: i32 = 0x4000;
+        const MAP_FIXED: i32 = 0x10;
+        const GIB: usize = 1 << 30;
+        let rss0 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+        // The JIT reservation, and one committed 64 KiB chunk near its top.
+        let jit = mmap(core::ptr::null_mut(), 0x7FC0_0000, 0,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if jit as isize == -1 { return 10; }
+        let chunk = jit.add(0x7F00_0000);
+        let c = mmap(chunk, 0x1_0000, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if c != chunk { return 11; }
+        core::ptr::write_volatile(chunk.add(0x1_0000 - 1), 0x5A);
+        if core::ptr::read_volatile(chunk.add(0x1_0000 - 1)) != 0x5A { return 12; }
+        // A 4 GiB read-write mapping touched only at both ends.
+        let big = mmap(core::ptr::null_mut(), 4 * GIB, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if big as isize == -1 { return 13; }
+        core::ptr::write_volatile(big, 1);
+        core::ptr::write_volatile(big.add(4 * GIB - 1), 2);
+        if core::ptr::read_volatile(big) != 1 || core::ptr::read_volatile(big.add(4 * GIB - 1)) != 2 {
+            return 14;
+        }
+        let rss1 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+        say_kb(b"  big_lazy rss_anon_kib before=", rss0);
+        say_kb(b" after=", rss1);
+        write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+        // Three touched pages (the chunk's last, and the two ends): allow slack
+        // for the stack and allocator, but nothing near the spans' size.
+        if rss1 > rss0 + 1024 { return 15; }
+        if munmap(big, 4 * GIB) != 0 || munmap(jit, 0x7FC0_0000) != 0 { return 16; }
+        // A private file mapping far past both the file and the old 256 MiB cap.
+        let fd = open(b"/bin/memtest\0".as_ptr(), 0, 0);
+        if fd < 0 { return 17; }
+        let f = mmap(core::ptr::null_mut(), 300 << 20, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if f as isize == -1 { return 18; }
+        let elf = core::ptr::read_volatile(f) == 0x7f && core::ptr::read_volatile(f.add(1)) == b'E';
+        munmap(f, 300 << 20);
+        if !elf { return 19; }
+        100
+    }
+    let s = in_child(child);
+    write(STDOUT_FILENO, b"  big_lazy status".as_ptr(), 17);
+    write(STDOUT_FILENO, b" ".as_ptr(), 1); print_dec(s as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, s & 0x7f == 0 && (s >> 8) & 0xff == 100)
 }
 
 /// EL0 cache maintenance on aarch64 (SCTLR_EL1.UCT/UCI/DZE), the sequence a

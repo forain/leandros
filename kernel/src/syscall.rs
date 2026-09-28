@@ -2194,11 +2194,24 @@ fn sys_call(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
 
 // ── Memory syscalls ───────────────────────────────────────────────────────────
 
-/// Limit eagerly populated file/device mappings per call.
+/// Limit for the mmap paths that populate the whole range up front: device
+/// apertures, MAP_SHARED tmpfs/memfd VMO frames and the eager private copy
+/// (unaligned offset / non-f2fs file). Each costs memory proportional to `len`
+/// at map time.
 const MAP_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
-/// Anonymous mappings are demand-paged. FluidR3's floating-point sample
-/// bank needs about 283 MiB in one contiguous virtual allocation.
-const ANON_MAP_MAX_BYTES: usize = 512 * 1024 * 1024;
+/// Demand-paged mappings — anonymous memory and private f2fs file mappings —
+/// cost nothing until touched: the VMA is one record, page tables and frames
+/// appear per faulted page, and the per-VMA frame table (`mm::pagevec`) is
+/// chunked, so an untouched span allocates nothing and a touched one pays
+/// 8 bytes per 2 MiB of span for the chunk directory. The limits only bound
+/// virtual-address consumption: SpiderMonkey reserves ~2 GiB of JIT code
+/// space and up to ~8 GiB per wasm memory with MAP_NORESERVE, and musl's
+/// ld.so maps a library's whole span from its file before overlaying the
+/// segments (scudo's .bss makes that ~512 MiB). The mmap allocator bumps a
+/// system-wide cursor through the 0x4000_0000..0x7fff_ff00_0000 hole
+/// (~128 TiB), so these sizes do not threaten the layout.
+const ANON_MAP_MAX_BYTES: usize = 64 * 1024 * 1024 * 1024;
+const FILE_LAZY_MAP_MAX_BYTES: usize = 64 * 1024 * 1024 * 1024;
 
 /// Translate Linux `mmap(2)` `prot` bits to kernel `PageFlags`.
 fn prot_to_page_flags(prot: usize) -> PageFlags {
@@ -2315,9 +2328,12 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     let max_bytes = if flags & MAP_ANONYMOUS != 0 {
         ANON_MAP_MAX_BYTES
     } else {
-        MAP_MAX_BYTES
+        FILE_LAZY_MAP_MAX_BYTES
     };
     if len > max_bytes { return -22; }
+    // Every file path except the demand-paged private f2fs one populates the
+    // range at map time; those keep the old ceiling (checked on entry below).
+    let eager_too_big = len > MAP_MAX_BYTES;
 
     let page_flags = prot_to_page_flags(prot);
 
@@ -2443,6 +2459,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
 
     if phys_addr != 0 {
         // This is a device mapping — map the physical address directly.
+        if eager_too_big { return -22; }
         //
         // WRITECOMBINE rather than NOCACHE: on AArch64 NOCACHE means Device
         // memory (MAIR index 3), which forbids unaligned access and is wrong for
@@ -2483,6 +2500,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // MAP_SHARED still falls through to the eager private-copy path below.
     if flags & MAP_SHARED != 0 {
         if let Some(vfs::VnodeKind::TmpFile { idx, .. }) = kind {
+            if eager_too_big { return -22; }
             tr.kind = 3;
             let ta = monotonic_ns();
             let acquired = vfs::vmo_acquire_frames(pid, fd, off, len);
@@ -2603,6 +2621,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // installed with its final protection right away (no temporary WRITABLE
     // + mprotect fixup: on x86_64/TCG that second locked pass with its TLB
     // shootdown cost 0.5-1.7 s per map during session start).
+    if eager_too_big { return -22; }
     tr.kind = 4;
     let tm = monotonic_ns();
     let mapped_phys = with_current_address_space_mut(|as_| {

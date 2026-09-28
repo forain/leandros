@@ -66,20 +66,11 @@ esac
 
   # -- Firefox itself ---------------------------------------------------------
   cp -a /usr/lib/firefox "$S/usr/lib/firefox"
-  # Alpine links the firefox launcher against scudo (libscudo.so) as its
-  # malloc. That library cannot even be mapped here: its RW segment carries a
-  # 512 MiB .bss, so musl's first whole-span file mmap is ~512 MiB and the
-  # kernel refuses file mappings over 256 MiB (MAP_MAX_BYTES) with EINVAL —
-  # measured on aarch64: "Error loading shared library libscudo.so: Invalid
-  # argument (needed by /usr/lib/firefox/firefox)". Drop it: Firefox is built
-  # --disable-jemalloc on Alpine, so without scudo every allocation goes to
-  # the guest libc's malloc, which is what every other program here uses. The
-  # symbol audit below proves nothing else needed a scudo-only symbol.
-  for f in $(find "$S/usr/lib/firefox" -type f); do
-    if file -b "$f" | grep -q '^ELF' && readelf -d "$f" | grep -q 'Shared library: \[libscudo\.so\]'; then
-      patchelf --remove-needed libscudo.so "$f"; echo "dropped libscudo.so from ${f#$S}"
-    fi
-  done
+  # The firefox launcher stays linked against scudo (libscudo.so), Alpine's
+  # malloc for Firefox (built --disable-jemalloc). Its RW segment carries a
+  # 512 MiB .bss, so musl's first whole-span file mmap is ~512 MiB; that
+  # needs the kernel's demand-paged file-mmap limit above 256 MiB (it used to
+  # fail with "Error loading shared library libscudo.so: Invalid argument").
 
   # -- closure ----------------------------------------------------------------
   # Sonames never shipped from Alpine (see header). Globs, matched by `case`.
