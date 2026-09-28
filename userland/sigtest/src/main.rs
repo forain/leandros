@@ -131,6 +131,9 @@ extern "C" {
     ) -> c_int;
     pub fn pthread_join(thread: pthread_t, retval: *mut *mut c_void) -> c_int;
     pub fn sigaltstack(ss: *const stack_t, old: *mut stack_t) -> c_int;
+    pub fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
+    pub fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
+    pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> c_int;
 
     // signalfd4 has no relibc C wrapper — go straight through the raw syscall
     // entry point, exactly as epolltest does.
@@ -240,6 +243,17 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
             arg(2).iter().fold(0i32, |a, &c| if c.is_ascii_digit() { a * 10 + (c - b'0') as i32 } else { a })
         } else { 20 };
         match arg(1) {
+            // Re-exec'd by test_altstack_reset_on_exec: the new image must
+            // start with no alternate signal stack.
+            b"altexec" => altexec_child(),
+            b"altstack" => {
+                if !test_stack_overflow_sigsegv_on_altstack() { failures += 1; }
+                if !test_altstack_on_fresh_mmap() { failures += 1; }
+                if !test_altstack_inherited_by_fork() { failures += 1; }
+                if !test_altstack_reset_on_exec(_envp) { failures += 1; }
+                puts(b"--- sigtest altstack done ---\n\0".as_ptr());
+                return failures;
+            }
             b"futex" => {
                 if !test_futex_wait_signal_restart() { failures += 1; }
                 if !test_futex_wait_restart_stress(iters) { failures += 1; }
@@ -291,6 +305,9 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
     if !test_ppoll_pselect_sigmask() { failures += 1; }
     if !test_stack_overflow_sigsegv_on_altstack() { failures += 1; }
+    if !test_altstack_on_fresh_mmap() { failures += 1; }
+    if !test_altstack_inherited_by_fork() { failures += 1; }
+    if !test_altstack_reset_on_exec(_envp) { failures += 1; }
 
     puts(b"--- sigtest done ---\n\0".as_ptr());
     failures
@@ -1035,6 +1052,154 @@ unsafe fn test_stack_overflow_sigsegv_on_altstack() -> bool {
     write(1, b"\n".as_ptr(), 1);
     // WIFEXITED && WEXITSTATUS == 42
     report(name, got == child && status & 0x7f == 0 && (status >> 8) & 0xff == 42)
+}
+
+// ── 13. Alternate signal stack lifetime ─────────────────────────────────────
+//
+// Firefox's SIGILL/SIGSEGV handlers are SA_ONSTACK. Launched from a shell
+// script, the exec'ing process still carried brush's alternate stack (Rust's
+// std installs one on the main thread) because execve did not reset it, so
+// the first fault built its frame at an address that no longer existed in
+// the new image, frame delivery failed and the kernel turned it into a bare
+// SIGSEGV (exit 139). These checks pin the Linux semantics down:
+//   * a handler runs on an alt stack that is fresh, never-touched mmap memory
+//     laid out the way Rust's std does it (PROT_NONE guard page below);
+//   * fork() inherits the alt stack (the child's memory is a copy);
+//   * execve() resets it to SS_DISABLE, and an SA_ONSTACK handler in the new
+//     image then simply runs on the normal stack.
+
+const PROT_NONE:  c_int = 0;
+const PROT_RW:    c_int = 3;
+const MAP_PRIVATE_ANON: c_int = 0x02 | 0x20;
+const SS_DISABLE: c_int = 2;
+
+static ALT_LO: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static ALT_HI: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static ALT_HITS: AtomicU32 = AtomicU32::new(0);
+static ALT_OK: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn alt_probe_handler(sig: c_int, info: *const siginfo_t, _uc: *mut c_void) {
+    let here = &sig as *const c_int as usize;
+    let lo = ALT_LO.load(Ordering::SeqCst);
+    let hi = ALT_HI.load(Ordering::SeqCst);
+    let on_alt = here >= lo && here < hi;
+    // ALT_LO == 0 means "expect the normal stack".
+    let where_ok = if lo == 0 { true } else { on_alt };
+    let signo = unsafe { (*info).si_signo };
+    if where_ok && signo == SIGUSR1 { ALT_OK.fetch_add(1, Ordering::SeqCst); }
+    ALT_HITS.fetch_add(1, Ordering::SeqCst);
+}
+
+unsafe fn install_alt_probe() -> bool {
+    let mut act = zeroed_sigaction(Some(core::mem::transmute::<
+        extern "C" fn(c_int, *const siginfo_t, *mut c_void),
+        extern "C" fn(c_int),
+    >(alt_probe_handler)));
+    act.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGUSR1, &act, core::ptr::null_mut()) == 0
+}
+
+/// Wait for `child` and report whether it exited with status 42.
+unsafe fn child_exit_42(name: &[u8], child: pid_t) -> bool {
+    let mut status: c_int = 0;
+    let mut got = 0;
+    for _ in 0..500 {
+        got = waitpid(child, &mut status, WNOHANG);
+        if got == child { break; }
+        nap();
+    }
+    if !(got == child && status & 0x7f == 0 && (status >> 8) & 0xff == 42) {
+        write(1, name.as_ptr(), name.len() - 1);
+        write(1, b": child status=".as_ptr(), 15);
+        put_i32(status);
+        write(1, b"\n".as_ptr(), 1);
+        return false;
+    }
+    true
+}
+
+/// Rust std's layout: one PROT_NONE guard page, then the stack, never touched
+/// before the kernel writes the first signal frame into it.
+unsafe fn fresh_alt_stack(size: usize) -> Option<usize> {
+    let p = mmap(core::ptr::null_mut(), size + 4096, PROT_RW, MAP_PRIVATE_ANON, -1, 0);
+    if p as isize == -1 || p.is_null() { return None; }
+    if mprotect(p, 4096, PROT_NONE) != 0 { return None; }
+    Some(p as usize + 4096)
+}
+
+unsafe fn test_altstack_on_fresh_mmap() -> bool {
+    let name = b"altstack_on_fresh_mmap\0";
+    let child = fork();
+    if child < 0 { return report(name, false); }
+    if child == 0 {
+        const SZ: usize = 12288; // musl's aarch64 SIGSTKSZ, Rust's choice there
+        let base = match fresh_alt_stack(SZ) { Some(b) => b, None => _exit(60) };
+        ALT_LO.store(base, Ordering::SeqCst);
+        ALT_HI.store(base + SZ, Ordering::SeqCst);
+        let ss = stack_t { ss_sp: base as *mut c_void, ss_flags: 0, ss_size: SZ };
+        if sigaltstack(&ss, core::ptr::null_mut()) != 0 { _exit(61); }
+        if !install_alt_probe() { _exit(62); }
+        for _ in 0..3 { raise(SIGUSR1); }
+        _exit(if ALT_OK.load(Ordering::SeqCst) == 3 { 42 } else { 63 });
+    }
+    report(name, child_exit_42(name, child))
+}
+
+unsafe fn test_altstack_inherited_by_fork() -> bool {
+    let name = b"altstack_inherited_by_fork\0";
+    let child = fork();
+    if child < 0 { return report(name, false); }
+    if child == 0 {
+        const SZ: usize = 16384;
+        let base = match fresh_alt_stack(SZ) { Some(b) => b, None => _exit(60) };
+        let ss = stack_t { ss_sp: base as *mut c_void, ss_flags: 0, ss_size: SZ };
+        if sigaltstack(&ss, core::ptr::null_mut()) != 0 { _exit(61); }
+        let grandchild = fork();
+        if grandchild < 0 { _exit(64); }
+        if grandchild == 0 {
+            let mut old = core::mem::zeroed::<stack_t>();
+            if sigaltstack(core::ptr::null(), &mut old) != 0 { _exit(65); }
+            if old.ss_sp as usize != base || old.ss_size != SZ || old.ss_flags & SS_DISABLE != 0 {
+                _exit(66);
+            }
+            ALT_LO.store(base, Ordering::SeqCst);
+            ALT_HI.store(base + SZ, Ordering::SeqCst);
+            if !install_alt_probe() { _exit(62); }
+            raise(SIGUSR1);
+            _exit(if ALT_OK.load(Ordering::SeqCst) == 1 { 42 } else { 63 });
+        }
+        let ok = child_exit_42(b"altstack_inherited_by_fork(grandchild)\0", grandchild);
+        _exit(if ok { 42 } else { 67 });
+    }
+    report(name, child_exit_42(name, child))
+}
+
+unsafe fn test_altstack_reset_on_exec(envp: *mut *mut u8) -> bool {
+    let name = b"altstack_reset_on_exec\0";
+    let child = fork();
+    if child < 0 { return report(name, false); }
+    if child == 0 {
+        const SZ: usize = 16384;
+        let base = match fresh_alt_stack(SZ) { Some(b) => b, None => _exit(60) };
+        let ss = stack_t { ss_sp: base as *mut c_void, ss_flags: 0, ss_size: SZ };
+        if sigaltstack(&ss, core::ptr::null_mut()) != 0 { _exit(61); }
+        let argv: [*const u8; 3] = [b"sigtest\0".as_ptr(), b"altexec\0".as_ptr(), core::ptr::null()];
+        execve(b"/bin/sigtest\0".as_ptr(), argv.as_ptr(), envp as *const *const u8);
+        _exit(68);
+    }
+    report(name, child_exit_42(name, child))
+}
+
+/// `sigtest altexec`: runs in the image test_altstack_reset_on_exec exec'd.
+unsafe fn altexec_child() -> ! {
+    let mut old = core::mem::zeroed::<stack_t>();
+    if sigaltstack(core::ptr::null(), &mut old) != 0 { _exit(70); }
+    if old.ss_flags & SS_DISABLE == 0 { _exit(71); }
+    // No alt stack: an SA_ONSTACK handler runs on the normal stack.
+    ALT_LO.store(0, Ordering::SeqCst);
+    if !install_alt_probe() { _exit(72); }
+    raise(SIGUSR1);
+    _exit(if ALT_OK.load(Ordering::SeqCst) == 1 { 42 } else { 73 });
 }
 
 // ── Helper ──────────────────────────────────────────────────────────────────

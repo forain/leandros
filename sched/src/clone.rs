@@ -262,7 +262,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
 
         // ── Step 6: gather parent credentials ────────────────────────────────
         let (heap_start, heap_end, pid, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, cwd, tls_base,
-             nice, umask, root, signal_mask, groups) = {
+             nice, umask, root, signal_mask, groups, altstack) = {
             let rq = super::RUN_QUEUE.lock();
             if let Some(t) = rq.find_pid(parent_pid) {
                 let leader = rq.find_pid(t.tgid).unwrap_or(t);
@@ -271,7 +271,8 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
                     .unwrap_or((0, 0));
                 (hs, he, t.pid, t.tgid, t.pgid, t.sid,
                  t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, (t.cwd.clone(), t.cwd_len), t.tls_base,
-                 t.priority, t.umask, (t.root.clone(), t.root_len), t.signal_mask, (t.ngroups, t.groups))
+                 t.priority, t.umask, (t.root.clone(), t.root_len), t.signal_mask, (t.ngroups, t.groups),
+                 (t.altstack_sp, t.altstack_size, t.altstack_flags))
             } else {
                 // `child_as` owns `child_pt` and is dropped on this return,
                 // which frees it; an explicit free here would double it.
@@ -367,6 +368,14 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         // child that did not exec.
         child.signal_mask   = signal_mask;
         inherit_signal_actions(&mut child, parent_tgid);
+        // sigaltstack(2): "A child created via fork(2) inherits a copy of its
+        // parent's alternate signal stack settings" — the child's memory is a
+        // copy, so the same address is valid there. (A CLONE_VM thread starts
+        // with none; see clone_thread. execve resets it; see
+        // reset_handlers_on_exec.)
+        child.altstack_sp    = altstack.0;
+        child.altstack_size  = altstack.1;
+        child.altstack_flags = altstack.2;
 
         // The child is a new process (its tgid == child_pid); inherit the
         // parent's /proc/self/exe path until it execs.
