@@ -305,7 +305,14 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
         if ec == 0x24 || ec == 0x20 {
             let is_translation = (0x04..=0x07).contains(&dfsc);
             let is_permission  = (0x0D..=0x0F).contains(&dfsc);
-            let is_write = ec == 0x24 && (esr >> 6) & 1 != 0;
+            // A cache-maintenance instruction (DC CVAU/CIVAC, IC IVAU — EL0 may
+            // run them since SCTLR_EL1.UCI) sets ISS.CM (bit 8) and, on most
+            // cores, WnR too. It needs only read permission, so service it as a
+            // read, as Linux does (`is_write_abort` masks CM): a JIT flushing
+            // freshly mprotect()ed PROT_READ|PROT_EXEC code must not be refused
+            // as a write to a read-only mapping.
+            let is_cm = (esr >> 8) & 1 != 0;
+            let is_write = ec == 0x24 && (esr >> 6) & 1 != 0 && !is_cm;
             if (is_translation || is_permission) && sched::handle_page_fault(far as usize, is_write) {
                 return; // page mapped — resume EL0 and retry the faulting access
             }

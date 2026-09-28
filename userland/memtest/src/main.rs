@@ -58,6 +58,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_stack_overflow_segv() { failures += 1; }
     if !test_prot_none_faults() { failures += 1; }
     if !test_mremap_nomove() { failures += 1; }
+    if !test_el0_cache_maintenance() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -1146,3 +1147,59 @@ unsafe fn test_mremap_nomove() -> bool {
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, r1 == -12 && still == 7 && r2 == p as isize + PAGE as isize && r3 == -14)
 }
+
+/// EL0 cache maintenance on aarch64 (SCTLR_EL1.UCT/UCI/DZE), the sequence a
+/// JIT runs: read CTR_EL0 for line sizes, write code, mprotect it RX, clean
+/// the D-cache and invalidate the I-cache by VA, then call it. DC ZVA is
+/// checked against DCZID_EL0, and DC CVAU on untouched pages of an RW and an
+/// RX mapping must be served as reads (ISS.CM), not refused as writes.
+#[cfg(target_arch = "aarch64")]
+unsafe fn test_el0_cache_maintenance() -> bool {
+    let name = b"el0_cache_maintenance\0";
+    unsafe fn child() -> i32 {
+        const PROT_EXEC: i32 = 4;
+        let ctr: u64; let dczid: u64;
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr);
+        core::arch::asm!("mrs {}, dczid_el0", out(reg) dczid);
+        if dczid & (1 << 4) != 0 { return 20; } // DZP: DC ZVA prohibited
+        let zva = 4usize << (dczid & 0xf);
+        let dline = 4usize << ((ctr >> 16) & 0xf);
+        let iline = 4usize << (ctr & 0xf);
+        if dline < 16 || iline < 16 || zva < 16 || zva > PAGE { return 21; }
+        let p = mmap(core::ptr::null_mut(), 4 * PAGE, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if p as isize == -1 { return 22; }
+        // DC ZVA zeroes exactly one block.
+        for i in 0..PAGE { core::ptr::write_volatile(p.add(i), 0xFF); }
+        core::arch::asm!("dc zva, {}", in(reg) p);
+        for i in 0..zva { if core::ptr::read_volatile(p.add(i)) != 0 { return 23; } }
+        if zva < PAGE && core::ptr::read_volatile(p.add(zva)) != 0xFF { return 24; }
+        // DC CVAU / IC IVAU on an untouched RW page.
+        core::arch::asm!("dc cvau, {0}", "dsb ish", "ic ivau, {0}", "dsb ish", "isb", in(reg) p.add(PAGE));
+        // JIT: `mov w0, #42; ret`, made executable, flushed by line, called.
+        let code = p.add(2 * PAGE) as *mut u32;
+        core::ptr::write_volatile(code, 0x5280_0540);
+        core::ptr::write_volatile(code.add(1), 0xd65f_03c0);
+        if mprotect_raw(p.add(2 * PAGE), 2 * PAGE, PROT_READ | PROT_EXEC) != 0 { return 25; }
+        let mut a = code as usize & !(dline - 1);
+        while a < code as usize + 8 { core::arch::asm!("dc cvau, {}", in(reg) a); a += dline; }
+        core::arch::asm!("dsb ish");
+        let mut a = code as usize & !(iline - 1);
+        while a < code as usize + 8 { core::arch::asm!("ic ivau, {}", in(reg) a); a += iline; }
+        core::arch::asm!("dsb ish", "isb");
+        let f: extern "C" fn() -> i32 = core::mem::transmute(code);
+        if f() != 42 { return 26; }
+        // Untouched page of the RX mapping: a read-permission CM fault.
+        core::arch::asm!("dc cvau, {0}", "dsb ish", "ic ivau, {0}", "dsb ish", "isb", in(reg) p.add(3 * PAGE));
+        munmap(p, 4 * PAGE);
+        100
+    }
+    let s = in_child(child);
+    write(STDOUT_FILENO, b"  cachemaint status".as_ptr(), 19);
+    write(STDOUT_FILENO, b" ".as_ptr(), 1); print_dec(s as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, s & 0x7f == 0 && (s >> 8) & 0xff == 100)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn test_el0_cache_maintenance() -> bool { true }
