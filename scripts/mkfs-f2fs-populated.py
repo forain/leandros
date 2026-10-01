@@ -444,7 +444,7 @@ def main():
         bin_files.append(("mame", p, 0o100755))
 
     brush_target = "aarch64-unknown-linux-musl" if arch == "aarch64" else "x86_64-unknown-linux-musl"
-    p = f"../brush/target/{brush_target}/release/brush"
+    p = os.path.join(os.environ.get("LEANDROS_BRUSH_DIR", "../brush"), "target", brush_target, "release", "brush")
     if os.path.exists(p):
         bin_files.append(("brush", p, 0o100755))
 
@@ -1523,7 +1523,7 @@ def main():
     # Shell scripts (start-cosmic-leandros, dbus-run-session) are still invoked
     # as `sh <script>` by init/greetd — that predates the kernel's `#!` support
     # and keeps working; scripts with a `#!/bin/sh` line now also exec directly.
-    _brush_p = f"../brush/target/{brush_target}/release/brush"
+    _brush_p = os.path.join(os.environ.get("LEANDROS_BRUSH_DIR", "../brush"), "target", brush_target, "release", "brush")
     if os.path.exists(_brush_p):
         bin_files.append(("sh", _brush_p, 0o100755))
 
