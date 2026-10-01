@@ -15,6 +15,12 @@ pref("media.ffmpeg.vaapi.enabled", false);
 // No seccomp or namespaces in the kernel (see /bin/firefox).
 pref("security.sandbox.content.level", 0);
 
+// JIT code W^X in content processes too. The kernel refuses a mapping that is
+// writable and executable at once, and with this off a content process's JIT
+// commits its code pages RWX, fails, and dies at startup in MOZ_CRASH(OOM).
+// The parent process always writes code W^X.
+pref("javascript.options.content_process_write_protect_code", true);
+
 // Bring-up: as few processes as Firefox allows.
 pref("fission.autostart", false);
 pref("dom.ipc.processCount", 1);
