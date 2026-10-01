@@ -318,6 +318,8 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         );
         child.ctx           = child_ctx;
         child.tls_base      = tls_base;
+        // fork copies the user GS base along with everything else (Linux).
+        child.user_gs_base  = super::get_user_gs_base();
         child.address_space = Some(alloc::sync::Arc::new(child_as));
         child.ppid          = pid;
         child.tgid          = child_pid;
@@ -590,6 +592,8 @@ pub fn clone_thread(
         );
         child.ctx        = child_ctx;
         child.tls_base   = child_tls;
+        // A thread starts with its creator's GS base, as on Linux.
+        child.user_gs_base = super::get_user_gs_base();
         child.ppid       = parent_pid;
         child.tgid       = if flags & CLONE_THREAD != 0 { parent_tgid } else { child_pid };
         // Every child aliases the same Arc — not a copy: the whole point of

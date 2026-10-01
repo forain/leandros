@@ -39,6 +39,11 @@ fn exc_vector_table_ptr() -> usize {
     core::ptr::addr_of!(__exception_vectors) as usize
 }
 
+/// x86-64's user GS base has no AArch64 counterpart (`sched` calls it on
+/// every dispatch).
+#[no_mangle]
+pub unsafe extern "C" fn arch_set_user_gs(_base: u64) {}
+
 /// Updates the per-CPU kernel stack pointer used on EL0 exception entry.
 #[no_mangle]
 pub unsafe extern "C" fn arch_set_kernel_stack(kst: u64) {

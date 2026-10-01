@@ -4046,9 +4046,25 @@ fn sys_arch_prctl(code: usize, addr: usize) -> isize {
     // ARCH_SET_FS = 0x1002, ARCH_GET_FS = 0x1003 (x86-64 only)
     #[cfg(target_arch = "x86_64")]
     {
+        const ARCH_SET_GS: usize = 0x1001;
         const ARCH_SET_FS: usize = 0x1002;
         const ARCH_GET_FS: usize = 0x1003;
+        const ARCH_GET_GS: usize = 0x1004;
         match code {
+            // A per-thread user GS base, restored on every return to user
+            // mode. wasm2c "segue" sandboxes (Firefox's RLBox libraries) put
+            // their memory base here and abort when this fails.
+            ARCH_SET_GS => {
+                if addr >= 0x0000_8000_0000_0000 { return -1; } // EPERM: not a user address
+                sched::set_user_gs_base(addr as u64);
+                0
+            }
+            ARCH_GET_GS => {
+                if !validate_user_ptr_aligned(addr, 8, 8) { return -14; }
+                let base = sched::get_user_gs_base();
+                unsafe { core::ptr::write(addr as *mut u64, base); }
+                0
+            }
             ARCH_SET_FS => {
                 set_fs_base(addr as u64);
                 // Immediately write to hardware for the current task.

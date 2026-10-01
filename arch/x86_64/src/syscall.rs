@@ -157,7 +157,26 @@ pub unsafe extern "C" fn restore_user_gs() {
     let cpu = crate::smp::arch_cpu_id().min(MAX_CPUS - 1);
     let ptr = core::ptr::addr_of!(PER_CPU[cpu]) as u64;
     wrmsr(MSR_KERNEL_GSBASE, ptr);
-    wrmsr(MSR_GSBASE, 0);
+    wrmsr(MSR_GSBASE, USER_GS[cpu].load(core::sync::atomic::Ordering::Relaxed));
+}
+
+/// The user GS.base of the task running on each CPU (arch_prctl ARCH_SET_GS;
+/// 0 for nearly everything). `restore_user_gs` loads it on every return to
+/// user mode; the scheduler sets it at dispatch. wasm2c's "segue" sandboxes
+/// (Firefox's RLBox libraries on x86-64) keep their linear-memory base in GS
+/// and abort when ARCH_SET_GS fails.
+static USER_GS: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
+/// Set this CPU's user GS base (see `USER_GS`). Interrupts are held off so the
+/// CPU index cannot go stale between the read and the store.
+#[no_mangle]
+pub unsafe extern "C" fn arch_set_user_gs(base: u64) {
+    let flags: u64;
+    core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nomem));
+    let cpu = crate::smp::arch_cpu_id().min(MAX_CPUS - 1);
+    USER_GS[cpu].store(base, core::sync::atomic::Ordering::Relaxed);
+    if flags & (1 << 9) != 0 { core::arch::asm!("sti", options(nomem, nostack)); }
 }
 
 /// Initialise SYSCALL support on an Application Processor: the full MSR set

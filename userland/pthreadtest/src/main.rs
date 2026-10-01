@@ -49,6 +49,8 @@ extern "C" {
     pub fn open(path: *const u8, flags: i32, ...) -> i32;
     pub fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
     pub fn close(fd: i32) -> i32;
+    pub fn fork() -> i32;
+    pub fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
 
     pub fn pthread_create(
         thread: *mut pthread_t,
@@ -155,6 +157,8 @@ pub unsafe extern "C" fn pthread_main(argc: isize, argv: *mut *mut u8, _envp: *m
     if !test_thread_getpid_is_process() { failures += 1; }
     if !test_getrandom_distinct() { failures += 1; }
     if !test_getrandom_quality() { failures += 1; }
+    #[cfg(target_arch = "x86_64")]
+    if !test_arch_gs_base() { failures += 1; }
 
     puts(b"--- pthreadtest done ---\n\0".as_ptr());
     failures
@@ -218,6 +222,84 @@ unsafe fn test_thread_getpid_is_process() -> bool {
     if pthread_join(thread, &mut rv) != 0 { return report(name, false); }
     let [tpid, tppid, ttid] = THREAD_IDS;
     report(name, pid == tid && tpid == pid && tppid == ppid && ttid != tid && ttid > 0)
+}
+
+// ── 1d. arch_prctl(ARCH_SET_GS) is a per-thread register that survives ──────
+//
+// wasm2c's "segue" sandboxes (Firefox's RLBox libraries on x86-64) keep their
+// memory base in GS: they set it with arch_prctl(ARCH_SET_GS) and read memory
+// through %gs. The kernel answered EINVAL and zeroed GS.base on every return
+// to user mode, so Firefox aborted at startup. Check: the value reads back,
+// %gs-relative loads see it across sleeps (context switches), a second thread
+// keeps its own, and a forked child inherits it.
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn gs_read_u64() -> u64 {
+    let v: u64;
+    core::arch::asm!("mov {}, qword ptr gs:[0]", out(reg) v, options(nostack, readonly));
+    v
+}
+
+#[cfg(target_arch = "x86_64")]
+static mut GS_CELL_MAIN: u64 = 0x1111_2222_3333_4444;
+#[cfg(target_arch = "x86_64")]
+static mut GS_CELL_WORKER: u64 = 0x5555_6666_7777_8888;
+#[cfg(target_arch = "x86_64")]
+static mut GS_WORKER_SAW: [u64; 2] = [0; 2];
+
+#[cfg(target_arch = "x86_64")]
+const ARCH_SET_GS: i64 = 0x1001;
+#[cfg(target_arch = "x86_64")]
+const ARCH_GET_GS: i64 = 0x1004;
+#[cfg(target_arch = "x86_64")]
+const SYS_ARCH_PRCTL: i64 = 158;
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn gs_worker(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let r = syscall(SYS_ARCH_PRCTL, ARCH_SET_GS, core::ptr::addr_of!(GS_CELL_WORKER) as u64);
+        usleep(20_000);
+        GS_WORKER_SAW = [r as u64, gs_read_u64()];
+    }
+    core::ptr::null_mut()
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn test_arch_gs_base() -> bool {
+    let name = b"arch_gs_base\0";
+    let cell = core::ptr::addr_of!(GS_CELL_MAIN) as u64;
+    if syscall(SYS_ARCH_PRCTL, ARCH_SET_GS, cell) != 0 { return report(name, false); }
+    let mut got: u64 = 0;
+    let get_ok = syscall(SYS_ARCH_PRCTL, ARCH_GET_GS, &mut got as *mut u64) == 0 && got == cell;
+    let mut thread: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut thread, core::ptr::null(), gs_worker, core::ptr::null_mut()) != 0 {
+        return report(name, false);
+    }
+    let mut seen_ok = true;
+    for _ in 0..10 {
+        usleep(5_000);
+        if gs_read_u64() != GS_CELL_MAIN { seen_ok = false; }
+    }
+    let mut rv: *mut c_void = core::ptr::null_mut();
+    pthread_join(thread, &mut rv);
+    let worker_ok = GS_WORKER_SAW == [0, GS_CELL_WORKER];
+    let main_after = gs_read_u64() == GS_CELL_MAIN;
+    // fork: the child inherits GS.base.
+    let child = fork();
+    if child == 0 {
+        usleep(5_000);
+        exit(if gs_read_u64() == GS_CELL_MAIN { 0 } else { 1 });
+    }
+    let mut st: i32 = -1;
+    waitpid(child, &mut st, 0);
+    let fork_ok = st == 0;
+    syscall(SYS_ARCH_PRCTL, ARCH_SET_GS, 0u64);
+    let ok = get_ok && seen_ok && worker_ok && main_after && fork_ok;
+    if !ok {
+        let msg = b"[arch_gs_base] get/seen/worker/after/fork mismatch\n";
+        write(1, msg.as_ptr(), msg.len());
+    }
+    report(name, ok)
 }
 
 // ── 1c. getrandom() never repeats back to back ──────────────────────────────

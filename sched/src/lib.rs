@@ -368,6 +368,9 @@ extern "C" {
     /// an exited task's freed page tables are never left live on a CPU.
     fn arch_load_kernel_page_table();
     fn arch_set_kernel_stack(rsp: u64);
+    /// x86-64: the user GS.base the next return to user mode on this CPU
+    /// loads. AArch64: no-op.
+    fn arch_set_user_gs(base: u64);
     fn arch_cpu_id() -> usize;
     fn arch_timer_check_alive() -> bool;
     /// Arm this CPU's one-shot timer for the absolute `monotonic_ns()` instant
@@ -3547,6 +3550,7 @@ fn scheduler_run_loop() -> ! {
                     let kst = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
                     let as_ptr = t.address_space.as_ref()
                         .map_or(core::ptr::null_mut(), |a| alloc::sync::Arc::as_ptr(a) as *mut mm::vmm::AddressSpace);
+                    unsafe { arch_set_user_gs(t.user_gs_base); }
                     Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port, as_ptr))
                 }
                 None => None,
@@ -4369,6 +4373,21 @@ pub fn set_fs_base(addr: u64) {
     }
 }
 
+/// arch_prctl(ARCH_SET_GS): record the calling thread's user GS base and make
+/// this CPU's next return to user mode load it.
+pub fn set_user_gs_base(addr: u64) {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        t.user_gs_base = addr;
+    }
+    unsafe { arch_set_user_gs(addr); }
+}
+
+pub fn get_user_gs_base() -> u64 {
+    let pid = current_pid();
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.user_gs_base).unwrap_or(0)
+}
+
 pub fn get_fs_base() -> u64 {
     let pid = current_pid();
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.tls_base).unwrap_or(0)
@@ -4400,6 +4419,8 @@ pub fn replace_address_space(
             // static_init, cpu_switch_to restores from ctx, overwriting the zeroed
             // hardware register with the previous program's stale TLS pointer.
             t.tls_base = 0;
+            t.user_gs_base = 0;
+            unsafe { arch_set_user_gs(0); }
             #[cfg(target_arch = "aarch64")]
             { t.ctx.tpidr_el0 = 0; }
             #[cfg(target_arch = "x86_64")]
