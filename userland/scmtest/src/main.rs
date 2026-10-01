@@ -946,6 +946,96 @@ unsafe fn test_socket_fionread() -> bool {
     report(name, ok)
 }
 
+// ── dup2 of a socket onto a low (VFS-range) descriptor ──────────────────────
+//
+// Socket fds live at and above the net server's SOCK_FD_BASE, so dup2(sock, 100)
+// used to reach the VFS, which answered EBADF. Firefox launches every child
+// with exactly that — dup2(ipc_socketpair_end, 3), a sweep closing every other
+// fd, then execve — and `_exit(127)`s when the dup2 fails, which killed every
+// content process. The kernel now installs an alias at the low number, backed
+// by a hidden duplicate of the socket.
+const ALIAS_FD: i32 = 100;
+const O_CLOEXEC_FL: i32 = 0x80000;
+
+unsafe fn test_socket_dup2_low_fd() -> bool {
+    let name = b"socket_dup2_low_fd\0";
+    const FIONREAD: usize = 0x541B;
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM | O_CLOEXEC_FL, 0, sv.as_mut_ptr()) != 0 {
+        return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+    let mut ok = true;
+    let mut step = 0i64;
+    let mut check = |c: bool, s: &mut i64| { *s += 1; if !c && ok { dbg1(b"[dup2low] failed at step %ld\n\0", *s); ok = false; } };
+
+    check(dup3(a, ALIAS_FD, 0) == ALIAS_FD, &mut step);                          // 1
+    check(raw_fcntl(ALIAS_FD, F_GETFD, 0) == 0, &mut step);                     // 2 dup2 clears cloexec
+    check(dup3(a, ALIAS_FD + 1, O_CLOEXEC_FL) == ALIAS_FD + 1, &mut step);       // 3
+    check(raw_fcntl(ALIAS_FD + 1, F_GETFD, 0) == FD_CLOEXEC, &mut step);        // 4
+    check(write(ALIAS_FD, b"ping".as_ptr(), 4) == 4, &mut step);                 // 5 alias writes the socket
+    let mut buf = [0u8; 8];
+    check(read(b, buf.as_mut_ptr(), 8) == 4 && &buf[..4] == b"ping", &mut step); // 6
+    check(write(b, b"pong".as_ptr(), 4) == 4, &mut step);                        // 7
+    let mut n: i32 = -1;
+    let q = syscall3(nr::IOCTL, ALIAS_FD as usize, FIONREAD, &mut n as *mut i32 as usize);
+    check(q == 0 && n == 4, &mut step);                                          // 8 ioctl reaches the socket
+    let mut rd = [0u8; 8];
+    let mut iov = iovec { iov_base: rd.as_mut_ptr(), iov_len: 8 };
+    let mut mh: msghdr = core::mem::zeroed();
+    mh.msg_iov = &mut iov; mh.msg_iovlen = 1;
+    check(raw_recvmsg(ALIAS_FD, &mut mh, 0) == 4 && &rd[..4] == b"pong", &mut step); // 9 recvmsg
+    let d = dup(ALIAS_FD);
+    check(d >= 0 && write(d, b"x".as_ptr(), 1) == 1, &mut step);                // 10 dup of an alias
+    check(read(b, buf.as_mut_ptr(), 8) == 1, &mut step);                         // 11
+    if d >= 0 { close(d); }
+    check(close(ALIAS_FD) == 0, &mut step);                                       // 12
+    check(raw_fcntl(ALIAS_FD, F_GETFD, 0) < 0, &mut step);                      // 13 closed for real
+    check(write(a, b"y".as_ptr(), 1) == 1, &mut step);                           // 14 original unaffected
+    check(read(b, buf.as_mut_ptr(), 8) == 1, &mut step);                         // 15
+    // An ordinary fd dup2'd over an alias replaces it.
+    let nul = open(b"/dev/null\0".as_ptr(), O_RDWR, 0);
+    check(nul >= 0 && dup3(nul, ALIAS_FD + 1, 0) == ALIAS_FD + 1, &mut step);    // 16
+    check(write(ALIAS_FD + 1, b"zz".as_ptr(), 2) == 2, &mut step);              // 17 now /dev/null
+    let mut n2: i32 = -1;
+    let q2 = syscall3(nr::IOCTL, a as usize, FIONREAD, &mut n2 as *mut i32 as usize);
+    check(q2 == 0 && n2 == 0, &mut step);                                        // 18 nothing reached the peer
+    close(ALIAS_FD + 1); if nul >= 0 { close(nul); }
+    close(a); close(b);
+    report(name, ok)
+}
+
+/// Firefox's child launch, step for step: dup2 the SOCK_CLOEXEC socket onto a
+/// low fd, close every other descriptor by brute force (as its
+/// CloseSuperfluousFds does when it cannot list /proc/self/fd), then execve.
+/// The re-exec'd helper writes the framed message through the low fd.
+unsafe fn test_fork_dup2_low_exec() -> bool {
+    let name = b"fork_dup2_low_exec\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM | O_CLOEXEC_FL, 0, sv.as_mut_ptr()) != 0 {
+        return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+    let mut envbuf = [0u8; 48];
+    build_name(&mut envbuf, b"SCMTEST_INHERIT_FD=", ALIAS_FD as usize);
+    let pid = fork();
+    if pid == 0 {
+        if dup3(a, ALIAS_FD, 0) != ALIAS_FD {
+            dbg0(b"[fdle:child] dup2(sock, low) failed\n\0");
+            exit(127);
+        }
+        let mut fd = 3;
+        while fd < 0x400 { if fd != ALIAS_FD { close(fd); } fd += 1; }
+        let path = b"/bin/scmtest\0";
+        let av: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let ev: [*const u8; 2] = [envbuf.as_ptr(), core::ptr::null()];
+        syscall3(SYS_EXECVE, path.as_ptr() as usize, av.as_ptr() as usize, ev.as_ptr() as usize);
+        exit(127);
+    }
+    close(a);
+    report(name, parent_epoll_read_ok(b, pid))
+}
+
 unsafe fn test_mincore() -> bool {
     let name = b"mincore";
     let page = 4096usize;
@@ -1029,6 +1119,10 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
 
     // ── FIONREAD / TIOCOUTQ on AF_UNIX sockets (Firefox's Wayland proxy) ──
     if !test_socket_fionread() { failures += 1; }
+
+    // ── dup2 of a socket onto a low fd (Firefox's child launch) ──
+    if !test_socket_dup2_low_fd() { failures += 1; }
+    if !test_fork_dup2_low_exec() { failures += 1; }
 
     // ── AF_INET TCP over the loopback interface ────────────────
     if !test_inet_loopback_tcp() { failures += 1; }

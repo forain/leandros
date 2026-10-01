@@ -650,12 +650,30 @@ impl SockEntry {
 struct ProcSockTable {
     pid:    u32,
     socks:  [SockEntry; MAX_SOCKS],
+    /// Slots that back a VFS-range descriptor (`dup2(sock, 3)`; see
+    /// `vfs::VnodeKind::SockAlias`), one bit per slot. Such a slot's own number
+    /// is not a descriptor the process holds, so a user `close()` of it answers
+    /// EBADF — Firefox's child-side fd sweep must not tear down the socket it
+    /// just dup2'd. A bitmap rather than a `SockEntry` field: the table must
+    /// stay within its 32 KiB budget. `alloc` clears a slot's bit.
+    hidden: [u64; MAX_SOCKS.div_ceil(64)],
     in_use: bool,
 }
 
 impl ProcSockTable {
     const fn empty() -> Self {
-        Self { pid: 0, socks: [const { SockEntry::empty() }; MAX_SOCKS], in_use: false }
+        Self { pid: 0, socks: [const { SockEntry::empty() }; MAX_SOCKS],
+               hidden: [0; MAX_SOCKS.div_ceil(64)], in_use: false }
+    }
+
+    fn is_hidden(&self, slot: usize) -> bool {
+        slot < MAX_SOCKS && self.hidden[slot / 64] & (1 << (slot % 64)) != 0
+    }
+
+    fn set_hidden(&mut self, slot: usize, on: bool) {
+        if slot >= MAX_SOCKS { return; }
+        if on { self.hidden[slot / 64] |= 1 << (slot % 64); }
+        else  { self.hidden[slot / 64] &= !(1 << (slot % 64)); }
     }
 
     /// Clear in place. At MAX_SOCKS=512 a `*self = ProcSockTable::empty()` would
@@ -665,10 +683,13 @@ impl ProcSockTable {
         self.pid = 0;
         self.in_use = false;
         for s in self.socks.iter_mut() { *s = SockEntry::empty(); }
+        self.hidden = [0; MAX_SOCKS.div_ceil(64)];
     }
 
     fn alloc(&mut self) -> Option<usize> {
-        self.socks.iter().position(|s| !s.in_use)
+        let slot = self.socks.iter().position(|s| !s.in_use)?;
+        self.set_hidden(slot, false);
+        Some(slot)
     }
 }
 
@@ -983,6 +1004,9 @@ fn bound_ref_inc(bound_idx: usize) {
 /// reference on whatever it names. `None` (→ EBADF) for a descriptor that
 /// cannot be transferred.
 fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
+    // A VFS-range descriptor that aliases a socket (`dup2(sock, 3)`) sends
+    // the socket it names.
+    let fd = vfs::sock_alias_of(pid, fd).unwrap_or(fd);
     let Some(slot) = fd_to_slot(fd) else {
         // Ordinary VFS descriptor (memfd, pipe, file).
         return vfs::export_fd(pid, fd).map(XferFd::Vfs);
@@ -1420,7 +1444,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         NET_CLOSE_ALL   => { handle_close_all(caller_pid); ok_reply() }
         NET_CLOSE       => handle_close(caller_pid, arg(msg,0) as usize),
         NET_POLL        => handle_poll(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
-        NET_DUP         => handle_dup(caller_pid, arg(msg,0) as usize, arg(msg,1) != 0),
+        NET_DUP         => handle_dup(caller_pid, arg(msg,0) as usize, arg(msg,1) != 0, arg(msg,2) != 0),
         NET_FORK_DUP    => handle_fork_dup(arg(msg,0) as u32, arg(msg,1) as u32),
         NET_EXEC_CLOEXEC => handle_exec_cloexec(arg(msg,0) as u32),
         NET_SETFL       => handle_setfl(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
@@ -3139,6 +3163,10 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
             _ => {} // inet/listening: skipped (see doc comment)
         }
     }
+    // Socket aliases are inherited, so their hidden slots stay hidden. A bit
+    // for a slot not copied above is harmless: `alloc` clears it on reuse.
+    let hidden = tbls[parent_pos].hidden;
+    tbls[child_pos].hidden = hidden;
     drop(conns);
     drop(tbls);
     // TEMPORARY trace, deliberately outside both critical sections: per-byte
@@ -3286,7 +3314,7 @@ fn handle_getfd(pid: u32, sockfd: usize) -> Message {
 /// fcntl(F_DUPFD/F_DUPFD_CLOEXEC) on a socket fd: allocate a second slot
 /// aliasing the same connection end (tokio/mio clone the fd of one
 /// socketpair end this way for their signal driver).
-fn handle_dup(pid: u32, sockfd: usize, cloexec: bool) -> Message {
+fn handle_dup(pid: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let mut tbls = SOCK_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) {
@@ -3319,7 +3347,7 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool) -> Message {
         let mut tbls = SOCK_TABLES.lock();
         let placed = match find_tbl(pid, &mut *tbls) {
             Some(t) => match t.alloc() {
-                Some(s) => { let mut e = entry; e.cloexec = cloexec; t.socks[s] = e; Some(s) }
+                Some(s) => { let mut e = entry; e.cloexec = cloexec; t.socks[s] = e; t.set_hidden(s, hidden); Some(s) }
                 None => None,
             },
             None => None,
@@ -3341,7 +3369,28 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool) -> Message {
     let mut new_entry = entry;
     new_entry.cloexec = cloexec;
     tbl.socks[new_slot] = new_entry;
+    tbl.set_hidden(new_slot, hidden);
     val_reply((new_slot + SOCK_FD_BASE) as u64)
+}
+
+/// Whether `fd` is a socket slot that backs a VFS-range alias (see
+/// `SockEntry::hidden`). The kernel refuses a user `close()` of one.
+pub fn sock_is_hidden(pid: u32, fd: usize) -> bool {
+    let pid = sched::tgid_of(pid);
+    let Some(slot) = fd_to_slot(fd) else { return false };
+    let tbls = SOCK_TABLES.lock();
+    tbls.iter().find(|t| t.in_use && t.pid == pid)
+        .map_or(false, |t| slot < MAX_SOCKS && t.socks[slot].in_use && t.is_hidden(slot))
+}
+
+/// Whether `fd` is an open socket of `pid` (used to drop VFS aliases whose
+/// socket the close-on-exec sweep retired).
+pub fn sock_is_open(pid: u32, fd: usize) -> bool {
+    let pid = sched::tgid_of(pid);
+    let Some(slot) = fd_to_slot(fd) else { return false };
+    let tbls = SOCK_TABLES.lock();
+    tbls.iter().find(|t| t.in_use && t.pid == pid)
+        .map_or(false, |t| slot < MAX_SOCKS && t.socks[slot].in_use)
 }
 
 fn handle_close(pid: u32, sockfd: usize) -> Message {

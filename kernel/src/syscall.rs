@@ -1683,6 +1683,7 @@ fn dispatch_inner(
     a3: usize, a4: usize, a5: usize,
     frame_ptr: usize,
 ) -> isize {
+    let (a0, a2) = sock_alias_args(number, a0, a2);
     match number {
         // ── Leandros-private IPC syscalls ───────────────────────────────────────
         SYS_IPC_SEND => sys_send(a0, a1, a2),
@@ -5055,6 +5056,9 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let _ = vfs::handle(&cloexec_msg, fd_owner);
     let net_cloexec = make_vfs_msg(net_server::NET_EXEC_CLOEXEC, &[fd_owner as u64]);
     let _ = net_server::handle(&net_cloexec, fd_owner);
+    // A socket alias's close-on-exec flag lives on its hidden socket, which
+    // the net sweep just closed if it was set; drop the aliases left dangling.
+    vfs::prune_sock_aliases(fd_owner, |sock| net_server::sock_is_open(fd_owner, sock));
 
     // A CLONE_VFORK child stops borrowing the parent's address space here —
     // release the parent from its vfork suspension (POSIX: parent resumes on
@@ -6034,6 +6038,9 @@ fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
     let pid = current_pid();
     let end = last.min(1023);
     for fd in first..=end {
+        if let Some(sock) = vfs::sock_alias_of(pid, fd) {
+            close_sock_alias_target(pid, sock);
+        }
         let msg = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]);
         let _ = vfs::handle(&msg, pid);
     }
@@ -6129,8 +6136,24 @@ fn sys_openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize
     vfs_open_resolved(path.ptr(), flags, mode)
 }
 
+/// Close the hidden socket behind a VFS-range alias (the alias entry itself is
+/// the caller's to remove).
+fn close_sock_alias_target(pid: u32, sock: usize) {
+    let msg = make_vfs_msg(net_server::NET_CLOSE, &[sock as u64]);
+    let _ = net_server::handle(&msg, pid);
+}
+
 fn sys_close(fd: usize) -> isize {
     let pid = current_pid();
+    // A VFS-range alias of a socket: close the socket behind it, then the
+    // entry. A hidden socket slot is not a descriptor the process holds.
+    if fd < net_server::SOCK_FD_BASE {
+        if let Some(sock) = vfs::sock_alias_of(pid, fd) {
+            close_sock_alias_target(pid, sock);
+        }
+    } else if fd < EPOLL_FD_BASE && net_server::sock_is_hidden(pid, fd) {
+        return -9; // EBADF
+    }
     // Epoll fds sit above the socket range, so this check must come before
     // the `>= SOCK_FD_BASE` net-server routing or they never get freed.
     if fd >= EPOLL_FD_BASE && fd < EPOLL_FD_BASE + MAX_EPOLL_FDS {
@@ -6950,8 +6973,43 @@ fn sys_pipe2(pipefd_ptr: usize, flags: usize) -> isize {
     r
 }
 
+/// A VFS-range fd that aliases a socket (`dup2(sock, 3)`, see
+/// `vfs::VnodeKind::SockAlias`) names that socket; any other fd names itself.
+fn sock_alias_fd(fd: usize) -> usize {
+    if fd < net_server::SOCK_FD_BASE {
+        if let Some(sock) = vfs::sock_alias_of(current_pid(), fd) { return sock; }
+    }
+    fd
+}
+
+/// Translate the fd arguments of the syscalls that take a descriptor and act
+/// on what it names (I/O, socket calls, fcntl/ioctl/fstat, epoll_ctl's target)
+/// so a socket alias reaches the net server like the socket itself. close,
+/// dup and dup2/dup3 are not translated here: they act on the descriptor
+/// number and handle aliases themselves. poll/select/epoll readiness is
+/// translated per fd in the probe functions.
+fn sock_alias_args(number: usize, a0: usize, a2: usize) -> (usize, usize) {
+    match number {
+        READ | WRITE | READV | WRITEV | PREAD64 | PWRITE64 | FSTAT | LSEEK | IOCTL
+        | FCNTL | FLOCK | FSYNC | FDATASYNC | FTRUNCATE | FSTATFS | FCHMOD | FCHOWN
+        | NEWFSTATAT | STATX | SENDFILE
+        | BIND | LISTEN | ACCEPT | ACCEPT4 | CONNECT | SENDTO | RECVFROM | SENDMSG
+        | RECVMSG | SHUTDOWN | GETSOCKNAME | GETPEERNAME | SETSOCKOPT | GETSOCKOPT
+            => (sock_alias_fd(a0), a2),
+        EPOLL_CTL => (a0, sock_alias_fd(a2)),
+        _ => (a0, a2),
+    }
+}
+
 fn sys_dup(oldfd: usize) -> isize {
     let pid = current_pid();
+    // A socket (or a VFS-range alias of one) duplicates in the net server;
+    // the new descriptor is a socket-range number.
+    let sock = sock_alias_fd(oldfd);
+    if sock >= net_server::SOCK_FD_BASE && sock < EPOLL_FD_BASE {
+        let msg = make_vfs_msg(net_server::NET_DUP, &[sock as u64, 0]);
+        return net_reply_val(&net_server::handle(&msg, pid));
+    }
     // dup() picks the lowest free fd — that's VFS_ALLOC_FD. (VFS_DUP2 targets a
     // specific newfd and rejects the u64::MAX "any" sentinel as out of range.)
     let msg = make_vfs_msg(vfs::VFS_ALLOC_FD, &[oldfd as u64]);
@@ -6968,6 +7026,43 @@ fn sys_dup(oldfd: usize) -> isize {
 /// immediately closed.
 fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     let pid = current_pid();
+    const O_CLOEXEC: usize = 0x8_0000;
+    if newfd != usize::MAX {
+        let old = sock_alias_fd(oldfd);
+        let new_alias = sock_alias_fd(newfd);
+        let old_is_sock = old >= net_server::SOCK_FD_BASE && old < EPOLL_FD_BASE;
+        if oldfd == newfd {
+            // dup2(fd, fd) is a no-op on an open fd; let the VFS answer the
+            // ordinary case (it also knows the untracked console fds).
+            if old_is_sock {
+                if oldfd >= net_server::SOCK_FD_BASE && net_server::sock_is_hidden(pid, oldfd) {
+                    return -9;
+                }
+                return newfd as isize;
+            }
+        } else if old_is_sock {
+            // A socket cannot occupy a VFS-range number itself, so dup2 onto
+            // one installs an alias backed by a hidden duplicate of the
+            // socket. (Firefox's child launch: dup2(ipc_socket, 3), then
+            // execve; a failed dup2 there is `_exit(127)`.)
+            if newfd >= net_server::SOCK_FD_BASE { return -9; } // socket-range target: unsupported
+            if oldfd >= net_server::SOCK_FD_BASE && net_server::sock_is_hidden(pid, oldfd) {
+                return -9;
+            }
+            let cloexec = flags & O_CLOEXEC != 0;
+            let msg = make_vfs_msg(net_server::NET_DUP, &[old as u64, cloexec as u64, 1]);
+            let dup = net_reply_val(&net_server::handle(&msg, pid));
+            if dup < 0 { return dup; }
+            if new_alias != newfd { close_sock_alias_target(pid, new_alias); }
+            let r = vfs::install_sock_alias(pid, newfd, dup as usize);
+            if r < 0 { close_sock_alias_target(pid, dup as usize); }
+            trace_fd("dup3 sock-alias", oldfd, newfd, flags, r);
+            return r;
+        } else if new_alias != newfd {
+            // Overwriting an alias with an ordinary fd: its socket goes too.
+            close_sock_alias_target(pid, new_alias);
+        }
+    }
     // If newfd == u64::MAX this is sys_dup (allocate any free fd).
     let tag = if newfd == usize::MAX { vfs::VFS_ALLOC_FD } else { vfs::VFS_DUP2 };
     let msg = make_vfs_msg(tag, &[oldfd as u64, newfd as u64, flags as u64]);
@@ -9523,6 +9618,7 @@ fn poll_fd_state(pid: u32, fd: usize) -> u32 { poll_fd_state_nested(pid, fd, 0) 
 /// `depth` is 0 for a poll/select/epoll_wait interest named directly by
 /// userspace, and one higher for each epoll fd traversed to reach it.
 fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
+    let fd = sock_alias_fd(fd);
     const POLLIN:   u32 = 0x0001;
     const POLLOUT:  u32 = 0x0004;
     const POLLNVAL: u32 = 0x0020;
@@ -9634,6 +9730,7 @@ fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>
 fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
     -> (u32, Option<u64>, u64)
 {
+    let fd = sock_alias_fd(fd);
     const POLLERR:  u32 = 0x0008;
     const POLLHUP:  u32 = 0x0010;
     const POLLNVAL: u32 = 0x0020;

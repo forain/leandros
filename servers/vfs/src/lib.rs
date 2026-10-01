@@ -1029,6 +1029,17 @@ pub enum VnodeKind {
     /// delivers events — keeps a config-watch source quiet in an event loop.
     /// `next_wd` hands out monotonic watch descriptors (≥1).
     Inotify { next_wd: u32 },
+    /// A VFS-range descriptor that names a socket: `dup2(sockfd, 3)`.
+    ///
+    /// Socket descriptors live at and above `net_server::SOCK_FD_BASE`, so a
+    /// socket cannot sit at a low number by itself. Firefox (and any
+    /// Chromium-derived launcher) hands its child the IPC socketpair end by
+    /// dup2'ing it onto a small fd before execve, and treats a failed dup2 as
+    /// fatal (`_exit(127)`). The entry holds the number of a *hidden* socket
+    /// slot (see `net_server::SockEntry::hidden`); the kernel translates every
+    /// syscall on this fd to that socket before routing it, so nothing in the
+    /// VFS ever reads or writes through one.
+    SockAlias { sock: usize },
     /// `/dev/tty0` .. `/dev/tty6` — a virtual console (`tty_server::vt`).
     ///
     /// `vt` is 0 for `/dev/tty0`, which names *the active VT* rather than a
@@ -1168,6 +1179,75 @@ pub fn steal_mounted_file(pid: u32, fd: usize) -> Option<(u32, u32)> {
         Some((port, file_id))
     } else {
         None
+    }
+}
+
+/// Live `SockAlias` entries across every fd table. While it is zero the
+/// kernel's per-syscall alias lookup is a single atomic load.
+static SOCK_ALIASES: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+
+fn sock_alias_dropped(kind: &VnodeKind) {
+    if matches!(kind, VnodeKind::SockAlias { .. }) {
+        SOCK_ALIASES.fetch_sub(1, atomic::Ordering::Relaxed);
+    }
+}
+
+/// The socket descriptor a VFS-range alias names, if `fd` is one.
+pub fn sock_alias_of(pid: u32, fd: usize) -> Option<usize> {
+    if fd >= MAX_FDS || SOCK_ALIASES.load(atomic::Ordering::Relaxed) == 0 { return None; }
+    match vfs_get_node_kind(pid, fd) {
+        Some(VnodeKind::SockAlias { sock }) => Some(sock),
+        _ => None,
+    }
+}
+
+/// Make `fd` an alias of socket descriptor `sock` (dup2/dup3 of a socket onto
+/// a VFS-range number). Whatever `fd` held is released, as dup2 does; the
+/// caller has already closed the socket behind an alias it replaces.
+/// Returns `fd`, or a negative errno.
+pub fn install_sock_alias(pid: u32, fd: usize, sock: usize) -> isize {
+    if fd >= MAX_FDS { return -9; } // EBADF
+    let pid = sched::tgid_of(pid);
+    let replaced = {
+        let mut tbls = FD_TABLES.lock();
+        let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return -23 };
+        let replaced = if tbl.fds[fd].in_use { Some(tbl.fds[fd].kind) } else { None };
+        // Close-on-exec lives on the hidden socket slot (fcntl on this fd is
+        // translated to it), so the entry itself never carries O_CLOEXEC; the
+        // exec path drops aliases whose socket the net sweep closed.
+        tbl.fds[fd] = FdEntry { kind: VnodeKind::SockAlias { sock }, flags: 0, in_use: true };
+        SOCK_ALIASES.fetch_add(1, atomic::Ordering::Relaxed);
+        replaced
+    };
+    if let Some(old) = replaced { release_vnode(old, pid); }
+    fd as isize
+}
+
+/// After execve's close-on-exec sweeps: drop every alias in `pid`'s table whose
+/// socket is no longer open (`alive(sock)` is false).
+pub fn prune_sock_aliases(pid: u32, alive: impl Fn(usize) -> bool) {
+    if SOCK_ALIASES.load(atomic::Ordering::Relaxed) == 0 { return; }
+    let pid = sched::tgid_of(pid);
+    let mut found = [(0usize, 0usize); 16];
+    let mut n = 0;
+    {
+        let mut tbls = FD_TABLES.lock();
+        let Some(tbl) = find_tbl(pid, &mut *tbls) else { return };
+        for (fd, e) in tbl.fds.iter().enumerate() {
+            if let (true, VnodeKind::SockAlias { sock }) = (e.in_use, e.kind) {
+                if n < found.len() { found[n] = (fd, sock); n += 1; }
+            }
+        }
+    }
+    for &(fd, sock) in &found[..n] {
+        if alive(sock) { continue; }
+        let mut tbls = FD_TABLES.lock();
+        if let Some(tbl) = find_tbl(pid, &mut *tbls) {
+            if tbl.fds[fd].in_use && tbl.fds[fd].kind == (VnodeKind::SockAlias { sock }) {
+                tbl.fds[fd] = FdEntry::empty();
+                SOCK_ALIASES.fetch_sub(1, atomic::Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -5080,6 +5160,7 @@ fn handle_close(pid: u32, fd: usize) -> Message {
     let kind = tbl.fds[fd].kind;
     tbl.fds[fd] = FdEntry::empty();
     drop(tbls);
+    sock_alias_dropped(&kind);
 
     if let Some(key) = lock_key_of(&kind) { release_locks(key, pid); }
 
@@ -5329,7 +5410,7 @@ fn handle_dup2(pid: u32, oldfd: usize, newfd: usize, cloexec: bool) -> Message {
                 in_use: true,
             };
             drop(tbls);
-            if let Some(old) = replaced { pipe_ref_dec(&old); }
+            if let Some(old) = replaced { sock_alias_dropped(&old); pipe_ref_dec(&old); }
             return val_reply(newfd as u64);
         }
         if oldfd <= 2 && oldfd == newfd { return val_reply(newfd as u64); }
@@ -5344,7 +5425,7 @@ fn handle_dup2(pid: u32, oldfd: usize, newfd: usize, cloexec: bool) -> Message {
     if cloexec { tbl.fds[newfd].flags |= O_CLOEXEC; }
     else       { tbl.fds[newfd].flags &= !O_CLOEXEC; }
     drop(tbls);
-    if let Some(old) = replaced { pipe_ref_dec(&old); }
+    if let Some(old) = replaced { sock_alias_dropped(&old); pipe_ref_dec(&old); }
     pipe_ref_inc(&dupled); // newfd is a second fd on the same pipe endpoint
     val_reply(newfd as u64)
 }
@@ -5491,6 +5572,9 @@ fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
     // versa) — the exact defect that broke poll/select/epoll across fork.
     for f in parent_fds.iter() {
         if f.in_use { pipe_ref_inc(&f.kind); }
+        if f.in_use && matches!(f.kind, VnodeKind::SockAlias { .. }) {
+            SOCK_ALIASES.fetch_add(1, atomic::Ordering::Relaxed);
+        }
     }
     ok_reply()
 }
@@ -5501,6 +5585,7 @@ fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
 /// (close_all on exit, the O_CLOEXEC sweep on exec) so they can't drift apart.
 /// Caller must NOT hold the FD_TABLES lock.
 fn release_vnode(kind: VnodeKind, pid: u32) {
+    sock_alias_dropped(&kind);
     if let Some(key) = lock_key_of(&kind) { release_locks(key, pid); }
     match kind {
         VnodeKind::Pipe { ring, is_write } => {
@@ -7050,7 +7135,9 @@ fn handle_poll(pid: u32, fd: usize) -> Message {
                 (ev, cur as u64, sched::poll_tag(sched::poll_class::DEVVT, 0))
             }
         }
-        VnodeKind::DevStdio { .. } | VnodeKind::None => {
+        // A socket alias is translated by the kernel before it polls; reaching
+        // here would mean a caller skipped that, so report it never-ready.
+        VnodeKind::DevStdio { .. } | VnodeKind::None | VnodeKind::SockAlias { .. } => {
             drop(tbls);
             (0, 0, sched::POLL_TAG_ALL)
         }
@@ -8847,7 +8934,8 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         // Handled by the early return above (proxied to the owning mount);
         // this arm exists only for match exhaustiveness.
         VnodeKind::MountedFile { .. } => return err_reply(-9),
-        VnodeKind::None => return err_reply(-9),
+        // The kernel answers fstat on a socket alias from the socket.
+        VnodeKind::None | VnodeKind::SockAlias { .. } => return err_reply(-9),
     };
 
     // st_nlink must agree with what path-based stat reports for the same file,
