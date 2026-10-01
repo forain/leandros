@@ -139,7 +139,7 @@ pub const IPPROTO_ICMP: usize = 1;
 /// 20 GL clients needed more than 256 VFS fds.
 pub const SOCK_FD_BASE: usize = 0x200;
 /// One past the last socket fd. Socket fds occupy [SOCK_FD_BASE, SOCK_FD_END) =
-/// [0x200, 0x3FE); this stays below EPOLL_FD_BASE (0x400), and below 1024 so
+/// [0x200, 0x3C7); this stays below EPOLL_FD_BASE (0x400), and below 1024 so
 /// select()'s FD_SETSIZE still covers every socket, and — with the dormant
 /// TTY_FD_BASE relocated to 0x1000 — is disjoint from every other fd range.
 pub const SOCK_FD_END: usize = SOCK_FD_BASE + MAX_SOCKS;
@@ -155,7 +155,10 @@ const MAX_PROCS:   usize = sched::runqueue::MAX_PROCESSES;
 /// compositor holds a socket per client + the bus + internal socketpairs).
 /// 510, not 512: that keeps a whole `ProcSockTable` (pid + flag + entries)
 /// within 32 KiB, one order-3 buddy block instead of an order-4 one.
-const MAX_SOCKS:   usize = 510;
+/// 510 -> 455 (lane epollofd, 2026-10-01): each entry grew 64 -> 72 bytes for
+/// its open-file-description id (`SockEntry::ofd`), and 455 is what still
+/// fits one order-3 block.
+const MAX_SOCKS:   usize = 455;
 /// Connection-pair pool. Raised 32→256 (K1 acceptance: 64 socketpairs + 32
 /// listener connections concurrently; headroom for the desktop session).
 /// 256 -> 512 (lane term20, 2026-09-27): a COSMIC session holds about 110 and
@@ -704,12 +707,15 @@ struct SockEntry {
     /// server sets it at all. It is recorded per socket and must be set before
     /// bind(), as on Linux.
     reuseaddr:  bool,
+    /// The open file description (`vfs::ofd`): new at socket/socketpair/
+    /// accept, shared by dup/fork/SCM_RIGHTS copies, one reference per entry.
+    ofd:        u32,
 }
 
 impl SockEntry {
     const fn empty() -> Self {
         Self { state: SockState::None, in_use: false, bound_port: 0, domain: 0,
-               sock_type: 0, cloexec: false, nonblock: false, reuseaddr: false }
+               sock_type: 0, cloexec: false, nonblock: false, reuseaddr: false, ofd: 0 }
     }
 }
 
@@ -836,6 +842,38 @@ fn get_or_create<'a>(pid: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcS
     }
     report_sock_tables_full();
     None
+}
+
+/// Every open socket fd of `pid`'s process (close_range).
+pub fn open_fds(pid: u32) -> alloc::vec::Vec<usize> {
+    let pid = sched::tgid_of(pid);
+    let tbls = SOCK_TABLES.lock();
+    match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+        Some(t) => t.socks.iter().enumerate().filter(|(_, e)| e.in_use).map(|(i, _)| i + SOCK_FD_BASE).collect(),
+        None => alloc::vec::Vec::new(),
+    }
+}
+
+/// The open file description socket `fd` names in `pid`'s process (`Some(0)`:
+/// none), or `None` when `fd` is not an open socket.
+pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
+    let pid = sched::tgid_of(pid);
+    let slot = fd_to_slot(fd)?;
+    let tbls = SOCK_TABLES.lock();
+    let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+    if slot < MAX_SOCKS && t.socks[slot].in_use { Some(t.socks[slot].ofd) } else { None }
+}
+
+/// Some process's socket fd naming description `id`, as (process id, fd),
+/// preferring `pid`'s own process (see `vfs::ofd_holder`).
+pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
+    if id == 0 { return None; }
+    let pid = sched::tgid_of(pid);
+    let tbls = SOCK_TABLES.lock();
+    let find = |t: &ProcSockTable| t.socks.iter().position(|e| e.in_use && e.ofd == id)
+        .map(|s| (t.pid, s + SOCK_FD_BASE));
+    if let Some(r) = tbls.iter().find(|t| t.in_use && t.pid == pid).and_then(find) { return Some(r); }
+    tbls.iter().filter(|t| t.in_use && t.pid != pid).find_map(find)
 }
 
 fn fd_to_slot(fd: usize) -> Option<usize> {
@@ -1071,6 +1109,7 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
         // Refused explicitly rather than silently mis-refcounted.
         _ => return None,
     }
+    vfs::ofd::get(entry.ofd); // the in-flight copy names the same description
     Some(XferFd::Sock(entry))
 }
 
@@ -1097,11 +1136,14 @@ fn xfer_import(pid: u32, x: XferFd, cloexec: bool) -> isize {
 fn xfer_drop(x: XferFd) {
     match x {
         XferFd::Vfs(tf) => vfs::drop_transfer(tf),
-        XferFd::Sock(entry) => match entry.state {
-            SockState::UnixListening { bound_idx } => free_bound_idx(bound_idx),
-            // `xfer_export` admits no other reference-holding state.
-            _ => {}
-        },
+        XferFd::Sock(entry) => {
+            match entry.state {
+                SockState::UnixListening { bound_idx } => free_bound_idx(bound_idx),
+                // `xfer_export` admits no other reference-holding state.
+                _ => {}
+            }
+            vfs::ofd::put(entry.ofd);
+        }
     }
 }
 
@@ -1486,7 +1528,7 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                              arg(msg,3) as usize, arg(msg,4) as usize),
         NET_CLOSE_ALL   => { handle_close_all(caller_pid); ok_reply() }
         NET_CLOSE       => handle_close(caller_pid, arg(msg,0) as usize),
-        NET_POLL        => handle_poll(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
+        NET_POLL        => handle_poll(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32),
         NET_DUP         => handle_dup(caller_pid, arg(msg,0) as usize, arg(msg,1) != 0),
         NET_FORK_DUP    => handle_fork_dup(arg(msg,0) as u32, arg(msg,1) as u32),
         NET_EXEC_CLOEXEC => handle_exec_cloexec(arg(msg,0) as u32),
@@ -1524,6 +1566,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         cloexec:    sock_type & 0x80000 != 0, // SOCK_CLOEXEC
         nonblock:   sock_type & 0x800 != 0,    // SOCK_NONBLOCK
         reuseaddr:  false,                     // set by setsockopt, before bind
+        ofd:        vfs::ofd::alloc(),
     };
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
@@ -1824,6 +1867,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     // An accepted socket is never bind()ed, so the flag has no
                     // consumer on it.
                     reuseaddr: false,
+                    ofd: vfs::ofd::alloc(),
                 };
                 new_slot
             };
@@ -1906,6 +1950,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                         cloexec:    acc_cloexec,
                         nonblock:   acc_nonblock,
                         reuseaddr:  false,
+                        ofd:        vfs::ofd::alloc(),
                     };
 
                     // EVERY alias of this connection flips, in every table —
@@ -2158,7 +2203,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_a] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: true },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
-        cloexec, nonblock, reuseaddr: false,
+        cloexec, nonblock, reuseaddr: false, ofd: 0,
     };
     let slot_b = match tbl.alloc() { Some(s) => s, None => {
         tbl.socks[slot_a] = SockEntry::empty(); return err_reply(-24);
@@ -2166,8 +2211,9 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_b] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: false },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
-        cloexec, nonblock, reuseaddr: false,
+        cloexec, nonblock, reuseaddr: false, ofd: vfs::ofd::alloc(),
     };
+    tbl.socks[slot_a].ofd = vfs::ofd::alloc();
     drop(tbls);
     // sv[] is written with no lock held (a fault under SOCK_TABLES would
     // stall every socket call behind it), and fault-tolerantly.
@@ -3191,6 +3237,7 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
                 if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { continue; }
                 if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
                 tbls[child_pos].socks[i] = e;
+                vfs::ofd::get(e.ofd);
             }
             // An unaccepted connect() is end A of a real connection — see the
             // doc comment for why dropping it here broke COSMIC's privileged
@@ -3199,9 +3246,10 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
                 if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { continue; }
                 conns[conn_idx].refs_a += 1; // the connector is always end A
                 tbls[child_pos].socks[i] = e;
+                vfs::ofd::get(e.ofd);
                 if NET_DEBUG { traced.push((i, conn_idx)); }
             }
-            SockState::Unbound { .. } => { tbls[child_pos].socks[i] = e; }
+            SockState::Unbound { .. } => { tbls[child_pos].socks[i] = e; vfs::ofd::get(e.ofd); }
             _ => {} // inet/listening: skipped (see doc comment)
         }
     }
@@ -3336,6 +3384,7 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool) -> Message {
             None => None,
         };
         drop(tbls);
+        if placed.is_some() { vfs::ofd::get(entry.ofd); }
         return match placed {
             Some(s) => val_reply((s + SOCK_FD_BASE) as u64),
             // Nothing was installed, so hand the reference straight back
@@ -3352,10 +3401,26 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool) -> Message {
     let mut new_entry = entry;
     new_entry.cloexec = cloexec;
     tbl.socks[new_slot] = new_entry;
+    vfs::ofd::get(entry.ofd); // leaf lock: fine under SOCK_TABLES
     val_reply((new_slot + SOCK_FD_BASE) as u64)
 }
 
+/// close(2) on a socket fd: the object's own teardown (`close_entry`), then
+/// the fd's reference on its open file description — the last one releases
+/// the description's epoll registrations (`vfs::ofd`).
 fn handle_close(pid: u32, sockfd: usize) -> Message {
+    let desc = fd_to_slot(sockfd).and_then(|slot| {
+        let tbls = SOCK_TABLES.lock();
+        let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+        if slot < MAX_SOCKS && t.socks[slot].in_use { Some(t.socks[slot].ofd) } else { None }
+    });
+    let r = close_entry(pid, sockfd);
+    let ok = i64::from_le_bytes(r.data[0..8].try_into().unwrap_or([0xFF; 8])) >= 0;
+    if ok { if let Some(d) = desc { vfs::ofd::put(d); } }
+    r
+}
+
+fn close_entry(pid: u32, sockfd: usize) -> Message {
     if sockfd < SOCK_FD_BASE { return err_reply(-9); }
     let slot = sockfd - SOCK_FD_BASE;
     let mut tbls = SOCK_TABLES.lock();
@@ -3534,13 +3599,17 @@ fn unix_end_tag(conn_idx: usize, is_a: bool, requested: u32) -> u64 {
         | if want_out { unix_wr_tag(conn_idx, is_a) } else { 0 }
 }
 
-fn handle_poll(pid: u32, fd: usize, requested: u32) -> Message {
+/// `want_ofd` != 0: answer only if `fd` still names that open file
+/// description, else ESTALE (an epoll registration whose fd number was closed
+/// or reused; see `vfs::ofd`).
+fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.lock();
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t, None => return err_reply(-9),
     };
     if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    if want_ofd != 0 && tbl.socks[slot].ofd != want_ofd { return err_reply(-116); } // ESTALE
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
 
@@ -3694,7 +3763,9 @@ fn handle_close_all(pid: u32) {
         let mut inet_to_close: alloc::vec::Vec<(bool, SocketHandle)> = alloc::vec::Vec::new();
         let mut bound_to_free: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
 
+        let mut ofds: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
         for s in tbl.socks.iter() {
+            if s.in_use && s.ofd != 0 { ofds.push(s.ofd); }
             match s.state {
                 SockState::UnixConnected { conn_idx, is_a } => {
                     unix_conn_close.push((conn_idx, is_a));
@@ -3719,6 +3790,7 @@ fn handle_close_all(pid: u32) {
             }
         }
         drop(tbls);
+        for d in ofds { vfs::ofd::put(d); }
 
         let mut conns = UNIX_CONNS.lock();
         let mut peer_hup = false;
