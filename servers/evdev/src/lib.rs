@@ -565,6 +565,28 @@ static SERIAL_RX: Mutex<SerialBacklog> =
 /// Times the drain stopped reading the UART because the backlog was full.
 pub static SERIAL_RX_THROTTLED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+/// Bytes read out of the UART by the drain, ever (ISIG bytes included).
+pub static SERIAL_RX_BYTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Bytes pushed into the console tap (KEY frames), ever.
+pub static SERIAL_RX_PUSHED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Serial bytes the line discipline consumed as ISIG/Ctrl-T.
+pub static SERIAL_RX_INTERCEPTED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Console-tap overflows (whole queue discarded) — must stay 0 for serial.
+pub fn console_tap_dropped() -> u64 {
+    let f = unsafe { arch_interrupt_save() };
+    let st = STATE.lock();
+    let d = st.find(DEV_KEYBOARD as u32, CONSOLE_OPEN_ID, 0).map_or(0, |i| st.clients[i].dropped);
+    drop(st);
+    unsafe { arch_interrupt_restore(f); }
+    d
+}
+/// Bytes waiting in the serial backlog right now.
+pub fn serial_backlog_len() -> usize {
+    SERIAL_RX.try_lock().map_or(usize::MAX, |q| q.len)
+}
 
 /// Free slots in the console tap's keyboard queue (CLIENT_EVENTS if absent).
 fn console_room() -> usize {
@@ -577,6 +599,7 @@ fn console_room() -> usize {
 }
 
 fn push_serial_byte(b: u8) {
+    SERIAL_RX_PUSHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     push_event(DEV_KEYBOARD as u32, EV_KEY, b as u16, 2); // 2 = serial byte
     push_event(DEV_KEYBOARD as u32, EV_SYN, SYN_REPORT, 0);
 }
@@ -603,9 +626,13 @@ pub fn serial_rx_drain(read: &mut dyn FnMut() -> Option<u8>) -> bool {
             return true;
         }
         let b = match read() { Some(b) => b, None => return false };
+        SERIAL_RX_BYTES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Line-discipline ISIG intercept: ^C/^\/^Z become signals to the
         // foreground process group instead of input bytes.
-        if tty_server::console_intercept_byte(b) { continue; }
+        if tty_server::console_intercept_byte(b) {
+            SERIAL_RX_INTERCEPTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         if q.len == 0 && console_room() >= SERIAL_ROOM {
             push_serial_byte(b);
         } else {

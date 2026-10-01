@@ -5161,6 +5161,45 @@ fn console_write_user(bytes: &[u8]) {
     if start < bytes.len() { serial_write_raw(&bytes[start..]); }
 }
 
+/// Console-input accounting (lane seriallogin): who consumes console bytes.
+/// One line whenever the consuming pid changes, or a read's bytes are lost
+/// to a failed copy-out, with the UART/console-tap totals at that instant.
+static CON_LAST_READER: AtomicU32 = AtomicU32::new(0);
+static CON_DELIVERED: AtomicU64 = AtomicU64::new(0);
+fn console_read_trace(n: usize, efault: bool) {
+    let pid = current_pid();
+    let tot = CON_DELIVERED.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+    let prev = CON_LAST_READER.swap(pid, Ordering::Relaxed);
+    if prev == pid && !efault { return; }
+    let mut line = [0u8; 256];
+    let mut p = 0usize;
+    fn put(b: &mut [u8; 256], p: &mut usize, s: &[u8]) {
+        for &c in s { if *p < b.len() { b[*p] = c; *p += 1; } }
+    }
+    fn num(b: &mut [u8; 256], p: &mut usize, mut v: u64) {
+        let mut d = [0u8; 20]; let mut i = d.len();
+        loop { i -= 1; d[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+        put(b, p, &d[i..]);
+    }
+    put(&mut line, &mut p, if efault { b"[CONRD] EFAULT lost=" } else { b"[CONRD] reader pid=" });
+    if efault { num(&mut line, &mut p, n as u64); put(&mut line, &mut p, b" pid="); }
+    num(&mut line, &mut p, pid as u64);
+    put(&mut line, &mut p, b" prev="); num(&mut line, &mut p, prev as u64);
+    put(&mut line, &mut p, b" delivered="); num(&mut line, &mut p, tot);
+    put(&mut line, &mut p, b" uart_rx=");
+    num(&mut line, &mut p, evdev_server::SERIAL_RX_BYTES.load(Ordering::Relaxed));
+    put(&mut line, &mut p, b" isig=");
+    num(&mut line, &mut p, evdev_server::SERIAL_RX_INTERCEPTED.load(Ordering::Relaxed));
+    put(&mut line, &mut p, b" pushed=");
+    num(&mut line, &mut p, evdev_server::SERIAL_RX_PUSHED.load(Ordering::Relaxed));
+    put(&mut line, &mut p, b" tapdrop=");
+    num(&mut line, &mut p, evdev_server::console_tap_dropped());
+    put(&mut line, &mut p, b" backlog=");
+    num(&mut line, &mut p, evdev_server::serial_backlog_len() as u64);
+    put(&mut line, &mut p, b"\n");
+    if let Ok(s) = core::str::from_utf8(&line[..p]) { serial_print_str(s); }
+}
+
 /// Helper to read a single ASCII byte from evdev0 (unifying UART and keyboard).
 fn read_input_byte() -> Option<u8> {
     static mut SHIFT_PRESSED: bool = false;
@@ -5543,9 +5582,12 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                 let ok = with_current_address_space_mut(|as_| {
                     as_.write_user_buf(buf_ptr, &kbuf[..n])
                 }).unwrap_or(false);
-                if !ok { return -14; }
+                if !ok {
+                    console_read_trace(n, true);
+                    return -14;
+                }
             }
-            
+            console_read_trace(n, false);
             n as isize
         }
         // read(2) on a socket ≡ recv(fd, buf, len, 0) — see the matching
