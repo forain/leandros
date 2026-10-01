@@ -534,6 +534,88 @@ pub fn flush_pending_wake() {
     }
 }
 
+// ── Serial RX flow control ───────────────────────────────────────────────────
+//
+// THE LOSS THIS CLOSES. The UART drain pushed every byte straight into the
+// console tap's evdev queue (CLIENT_EVENTS = 256 slots, two per byte while the
+// console owns the keyboard: EV_KEY + SYN). A full queue is handled the evdev
+// way (`EvClient::push`): the WHOLE queue is discarded and SYN_DROPPED queued.
+// That is right for a key/pointer state stream and wrong for a byte stream:
+// any burst of more than ~128 bytes that arrived while the shell was not
+// reading (a long command line, a paste, a reader held off for a tick or two)
+// silently lost everything queued before it — the "serial input lost ~100
+// bytes, shell left in continuation mode" symptom.
+//
+// THE FIX is the tty one: the console tap is never pushed past `SERIAL_ROOM`
+// free slots. Bytes it cannot take yet wait, in order, in a 4 KiB backlog that
+// the next drain refills from first; only when the backlog is full does the
+// drain stop reading the UART, leaving the rest in the device FIFO, where QEMU
+// holds the host side back (16550/PL011 accept only what the FIFO has room
+// for) — flow control, not loss. ISIG bytes (^C, ^\, ^Z) and Ctrl-T are still
+// acted on as they are read, ahead of the backlog, as n_tty does.
+const SERIAL_BACKLOG: usize = 4096;
+/// Free console-tap slots required before a serial byte is pushed: two for the
+/// KEY + SYN pair, plus headroom for a virtio keyboard frame racing the drain
+/// (an overflow from that would wipe the queue just the same).
+const SERIAL_ROOM: usize = 8;
+
+struct SerialBacklog { buf: [u8; SERIAL_BACKLOG], head: usize, len: usize }
+static SERIAL_RX: Mutex<SerialBacklog> =
+    Mutex::new(SerialBacklog { buf: [0; SERIAL_BACKLOG], head: 0, len: 0 });
+/// Times the drain stopped reading the UART because the backlog was full.
+pub static SERIAL_RX_THROTTLED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Free slots in the console tap's keyboard queue (CLIENT_EVENTS if absent).
+fn console_room() -> usize {
+    let f = unsafe { arch_interrupt_save() };
+    let st = STATE.lock();
+    let n = st.find(DEV_KEYBOARD as u32, CONSOLE_OPEN_ID, 0).map_or(0, |i| st.clients[i].count);
+    drop(st);
+    unsafe { arch_interrupt_restore(f); }
+    CLIENT_EVENTS.saturating_sub(n)
+}
+
+fn push_serial_byte(b: u8) {
+    push_event(DEV_KEYBOARD as u32, EV_KEY, b as u16, 2); // 2 = serial byte
+    push_event(DEV_KEYBOARD as u32, EV_SYN, SYN_REPORT, 0);
+}
+
+/// The serial input drain (UART RX → console tap) with flow control — see
+/// above. `read` pops one byte from the UART RX FIFO. IRQ context: the cpu0
+/// tick on both arches, and the aarch64 PL011 RX interrupt.
+///
+/// Returns true when it stopped with the backlog full, i.e. the UART may still
+/// hold unread bytes; a level-triggered RX interrupt must then stay masked
+/// until a later call returns false. Callers still `flush_pending_wake()`.
+pub fn serial_rx_drain(read: &mut dyn FnMut() -> Option<u8>) -> bool {
+    // Another CPU is draining right now; it empties the same FIFO.
+    let mut q = match SERIAL_RX.try_lock() { Some(q) => q, None => return false };
+    while q.len > 0 && console_room() >= SERIAL_ROOM {
+        let b = q.buf[q.head];
+        q.head = (q.head + 1) % SERIAL_BACKLOG;
+        q.len -= 1;
+        push_serial_byte(b);
+    }
+    loop {
+        if q.len >= SERIAL_BACKLOG {
+            SERIAL_RX_THROTTLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        let b = match read() { Some(b) => b, None => return false };
+        // Line-discipline ISIG intercept: ^C/^\/^Z become signals to the
+        // foreground process group instead of input bytes.
+        if tty_server::console_intercept_byte(b) { continue; }
+        if q.len == 0 && console_room() >= SERIAL_ROOM {
+            push_serial_byte(b);
+        } else {
+            let tail = (q.head + q.len) % SERIAL_BACKLOG;
+            q.buf[tail] = b;
+            q.len += 1;
+        }
+    }
+}
+
 /// True while the last `EV_KEY` pushed on the keyboard node was a serial
 /// synthetic, so the `SYN_REPORT` that follows it can be exempted from the VT
 /// gate along with the key itself.

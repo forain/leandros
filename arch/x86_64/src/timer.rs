@@ -606,13 +606,10 @@ pub fn on_tick() {
 
         // Poll UART for keyboard input and push to evdev.
         // NOTE: This consumes bytes that would otherwise go to fd 0 (stdin).
-        while let Some(b) = unsafe { super::serial_read_byte() } {
-            // Line-discipline ISIG intercept: ^C/^\/^Z become signals to the
-            // foreground process group instead of input bytes.
-            if tty_server::console_intercept_byte(b) { continue; }
-            evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2); // 2 = typematic/serial
-            evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
-        }
+        // Flow-controlled (evdev_server::serial_rx_drain): bytes the console
+        // cannot take yet wait in its backlog or in the UART, never dropped.
+        // Polled, so a throttled return needs nothing more here.
+        let _ = evdev_server::serial_rx_drain(&mut || unsafe { super::serial_read_byte() });
 
         // One poll wake for everything this tick drained — virtio input above
         // and the UART bytes just now. Must come after BOTH, which is why it is

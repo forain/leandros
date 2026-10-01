@@ -151,6 +151,17 @@ pub unsafe fn reinit(base: usize) {
     wr(IMSC, (1 << 4) | (1 << 6));
 }
 
+/// Unmask (`true`) or mask the RX + RX-timeout interrupts — serial input flow
+/// control, see `evdev_server::serial_rx_drain`. Touches the device only on a
+/// change, so the per-tick call costs no MMIO exit in the common case.
+pub unsafe fn set_rx_irq(on: bool) {
+    use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static RX_MASKED: AtomicBool = AtomicBool::new(false);
+    if UART_BASE_ADDR == 0 || RX_MASKED.load(Relaxed) != on { return; }
+    RX_MASKED.store(!on, Relaxed);
+    wr(IMSC, if on { (1 << 4) | (1 << 6) } else { 0 });
+}
+
 pub unsafe fn clear_irq() {
     if UART_BASE_ADDR == 0 { return; }
     wr(ICR, (1 << 4) | (1 << 6));

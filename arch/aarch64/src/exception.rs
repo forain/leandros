@@ -81,12 +81,11 @@ fn resched_ipi() {}
 /// memory, and clears the device condition before returning — required,
 /// because INTID 33 is level-triggered and EOI follows immediately.
 fn uart_irq() {
-    while let Some(b) = unsafe { super::uart::getc() } {
-        // Line-discipline ISIG intercept: ^C/^\/^Z become signals to
-        // the foreground process group instead of input bytes.
-        if tty_server::console_intercept_byte(b) { continue; }
-        evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2);
-        evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
+    // Flow-controlled (evdev_server::serial_rx_drain). If it stopped with the
+    // backlog full the FIFO may still hold bytes, and INTID 33 is level-
+    // triggered: mask RX until the cpu0 tick drains without throttling.
+    if evdev_server::serial_rx_drain(&mut || unsafe { super::uart::getc() }) {
+        unsafe { super::uart::set_rx_irq(false); }
     }
     // This is the PRIMARY aarch64 console path, not the tick fallback, so
     // it flushes its own burst rather than waiting up to 10 ms for the next
