@@ -564,6 +564,19 @@ else
     NET_DESC="user-mode/SLIRP, guest gets 10.0.2.15 via DHCP, gateway+DNS 10.0.2.2"
 fi
 
+# ── Keep the Mac awake while the VM runs ────────────────────────────────────
+# A MacBook on battery idle-sleeps a few minutes after the last user input,
+# whatever the CPU load, and a sleeping host freezes the guest, its serial line
+# and its display together: from outside that is indistinguishable from a
+# guest wedge (the 6 and 8 minute "stalls" of wave 2026-09-24 were the host's
+# Idle Sleep periods in `pmset -g log`). Every launch below execs, so this PID
+# becomes QEMU's and `caffeinate -w $$` holds PreventUserIdleSystemSleep
+# exactly as long as QEMU lives. Display sleep stays allowed.
+# LEANDROS_ALLOW_HOST_SLEEP=1 opts out.
+if [ "$OS" = "Darwin" ] && [ -z "${LEANDROS_ALLOW_HOST_SLEEP:-}" ] && command -v caffeinate >/dev/null 2>&1; then
+    caffeinate -i -w $$ </dev/null >/dev/null 2>&1 &
+fi
+
 # ── F2FS data disks (created once, reused across runs) ──────────────────────
 DATA0_IMG="f2fs-data0-${ARCH}.img"
 DATA1_IMG="f2fs-data1-${ARCH}.img"

@@ -936,6 +936,30 @@ def _read_serial_until(sentinel, timeout=120, at_prompt=False):
     return None
 
 
+def _hold_host_awake(qemu_pid):
+    """macOS: hold off host idle sleep for as long as QEMU `qemu_pid` lives.
+
+    A MacBook on battery idle-sleeps a few minutes after the last user input,
+    whatever the CPU load, and a sleeping host freezes the guest, its serial
+    line and its display together. To a harness that is indistinguishable
+    from a guest wedge: the 6 and 8 minute "stalls" of wave 2026-09-24 were
+    the host's Idle Sleep periods in `pmset -g log` (2026-09-27 11:57:26 for
+    320 s plus maintenance sleeps, and 12:27:39 for 368 s). `caffeinate -i
+    -w PID` takes PreventUserIdleSystemSleep (honoured on battery) and drops
+    it when QEMU exits. Display sleep stays allowed.
+    LEANDROS_ALLOW_HOST_SLEEP=1 opts out."""
+    if platform.system() != "Darwin" or os.environ.get("LEANDROS_ALLOW_HOST_SLEEP"):
+        return
+    if shutil.which("caffeinate") is None:
+        return
+    try:
+        subprocess.Popen(["caffeinate", "-i", "-w", str(qemu_pid)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
 def cmd_start(arch="aarch64", mode="uefi", venus=False, virgl=False):
     if _qemu_pid() is not None:
         print("QEMU already running. Run 'stop' first.")
@@ -978,6 +1002,7 @@ def cmd_start(arch="aarch64", mode="uefi", venus=False, virgl=False):
     )
     with open(PID_FILE, "w") as f:
         f.write(str(proc.pid))
+    _hold_host_awake(proc.pid)
 
     print(f"Launching QEMU (PID {proc.pid}, arch={arch}{', venus' if venus else ''})...")
 
