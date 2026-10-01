@@ -323,13 +323,11 @@ pub fn on_tick() {
 
         // Poll UART for keyboard input and push to evdev (fallback drain;
         // the primary aarch64 path is the UART IRQ in exception.rs).
-        while let Some(b) = unsafe { super::uart::getc() } {
-            // Line-discipline ISIG intercept: ^C/^\/^Z become signals to the
-            // foreground process group instead of input bytes.
-            if tty_server::console_intercept_byte(b) { continue; }
-            evdev_server::push_event(0, 1 /* EV_KEY */, b as u16, 2); // 2 = typematic/serial
-            evdev_server::push_event(0, 0 /* EV_SYN */, 0 /* SYN_REPORT */, 0);
-        }
+        // Flow-controlled (evdev_server::serial_rx_drain). The RX interrupt
+        // is masked while the backlog is full; once a drain gets through
+        // without throttling, unmask it again.
+        let throttled = evdev_server::serial_rx_drain(&mut || unsafe { super::uart::getc() });
+        unsafe { super::uart::set_rx_irq(!throttled); }
 
         // One poll wake for everything this tick drained — virtio input above
         // and the UART bytes just now. Must come after BOTH, which is why it is
