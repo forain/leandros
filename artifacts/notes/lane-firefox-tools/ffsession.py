@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""ffsession.py <arch> <tag> [--nofirefox] [--wait S]
+"""ffsession.py <arch> <tag> [--nofirefox] [--wait S] [--env "K=V ..."] [--url URL]
+--url defaults to about:blank. `file:///tmp/fftest.html` is a test page this
+script writes into the guest first (headings, colours, a table, an SVG).
 Boot --virgl, serial root login, greeter login as leandro, Super+T cosmic-term,
 type `sh /tmp/ffrun.sh` (launches /bin/firefox with output to /tmp/ff.log),
 screenshot, collect logs."""
@@ -37,8 +39,17 @@ log(sh("ls -l /bin/firefox /usr/lib/firefox/libxul.so /usr/lib/libgtk-3.so.0 /us
 # The launcher script, written from the serial root shell so the terminal only
 # has to type a short command.
 EXTRA = sys.argv[sys.argv.index("--env") + 1] + " " if "--env" in sys.argv else ""
+URL = sys.argv[sys.argv.index("--url") + 1] if "--url" in sys.argv else "about:blank"
+PAGE = ("<html><title>LeandrOS test page</title><body style=\\\"font-family:sans-serif;background:#eef\\\">"
+        "<h1 style=\\\"color:#235\\\">Hello from LeandrOS</h1><p>Firefox rendering a <b>file://</b> page on the GPU.</p>"
+        "<div style=\\\"width:300px;height:80px;background:linear-gradient(90deg,red,orange,yellow,green,blue)\\\"></div>"
+        "<table border=1><tr><th>arch</th><th>renderer</th></tr><tr><td>guest</td><td>WebRender</td></tr></table>"
+        "<svg width=200 height=120><circle cx=60 cy=60 r=50 fill=teal /><rect x=120 y=20 width=70 height=80 fill=purple /></svg>"
+        "</body>")
+if URL.startswith("file:///tmp/fftest.html"):
+    sh("printf '%s' \"" + PAGE + "\" > /tmp/fftest.html; chmod 644 /tmp/fftest.html; wc -c /tmp/fftest.html")
 script = ("echo START >/tmp/ff.log; env | sort >/tmp/ff.env; " + EXTRA +
-          "/bin/firefox --no-remote about:blank >>/tmp/ff.log 2>&1; echo EXIT=$? >>/tmp/ff.log")
+          "/bin/firefox --no-remote " + URL + " >>/tmp/ff.log 2>&1; echo EXIT=$? >>/tmp/ff.log")
 sh(f"printf '%s\\n' '{script}' > /tmp/ffrun.sh; chmod 755 /tmp/ffrun.sh; cat /tmp/ffrun.sh")
 time.sleep(40)
 typ("leandro"); key("ret")

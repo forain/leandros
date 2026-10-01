@@ -1,6 +1,84 @@
 # Lane firefox — 2026-09-27
 
-## RESUME HERE (paused 2026-09-28)
+## RESUME HERE (paused 2026-10-01)
+Branch `lane/firefox`, worktree `.claude/worktrees/agent-a40da30690bad16e4`. Not merged, not pushed. Base `7b28aa05`; everything up to `bb26903` is described further down. The tree is clean.
+
+**State: Firefox 136 renders pages on both arches, on the GPU (virgl, hardware WebRender).** `about:license` and a local `file://` test page are screenshot-verified on aarch64/HVF and x86_64/TCG. Proof images are in `artifacts/notes/lane-firefox-tools/`:
+- `firefox-file-page-aarch64.png`, `firefox-about-license-aarch64.png`
+- `firefox-file-page-x86_64.png`, `firefox-about-license-x86_64.png`
+
+Commits of this session, after `bb26903`:
+- `1bd2177` fd: dup2 a socket onto a VFS-range descriptor. **This was the exit-127 root cause.**
+- `fabdb1c` net: pass connected AF_UNIX ends over SCM_RIGHTS
+- `9437f52` vfs: open("/proc/self/fd/N") reopens a tmpfs file or memfd
+- `cb5a466` mm: an mmap address hint the kernel cannot use is ignored, not EINVAL
+- `0c5c9ea` x86_64: per-thread user GS base (arch_prctl ARCH_SET_GS/ARCH_GET_GS)
+- `04fd240` ports/firefox: write-protect JIT code in content processes too
+- `2ca54ee` net: a short sendmsg write ends the call instead of skipping to the next iovec
+- a notes/tools commit: this section, `ffsession.py --url`, and the proof screenshots
+
+### The exit 127, root cause with evidence
+None of the earlier hypotheses held: not the fork server, not posix_spawn/CLONE_VFORK, and not an execve ENOENT.
+- Firefox's `LaunchApp` (`ipc/chromium/src/base/process_util_linux.cc`) forks, then dup2's each remapped fd onto its target. If a dup2 fails it calls `_exit(127)` before it ever reaches execve. That is why the old execve logging saw nothing.
+- The IPC channel end is a socketpair fd (≥ `SOCK_FD_BASE` = 0x100). Its target is a small number (5 or 6).
+- `sys_dup3` sent every dup2 to the VFS, which rejects any fd ≥ `MAX_FDS` with EBADF.
+- Evidence: temporary logging, since removed, showed every child doing `dup3 old=0x107/0x108 new=0x5/0x6 → -9 (EBADF)` and then `exit_group(127)`. It was 13 out of 13 children on aarch64 and the same on x86_64.
+
+The fix is `VnodeKind::SockAlias` plus a hidden net slot; the commit message has the design. Regression tests: scmtest `socket_dup2_low_fd` and `fork_dup2_low_exec`.
+
+### What was behind the 127 (each found by temporary logging, all fixed above)
+1. **The parent's sendmsg failed with EBADF.** Firefox passes connected socket ends over SCM_RIGHTS, and the net server refused them (`fabdb1c`).
+2. **Content processes crashed with SIGSEGV at startup in MOZ_CRASH(OOM).** The locations were found with a temporary EL0-fault VMA locator: libxul text, a MOZ_CRASH stub at line 689 whose reason string is "MOZ_CRASH(OOM)", called from JS runtime init.
+   - Cause: with `content_process_write_protect_code` off, the content JIT commits its code RWX, and the kernel's mmap W^X check returns EINVAL.
+   - Fixed by the pref (`04fd240`). The kernel policy is unchanged.
+3. **mmap hints above 128 TiB returned EINVAL.** SpiderMonkey and mozjemalloc make thousands of these random-address probes per process (`cb5a466`).
+4. **x86_64 only: the parent aborted on `wasm_rt_syscall_set_segue_base error: Invalid argument`.** This is RLBox wasm2c "segue", which needs ARCH_SET_GS (`0c5c9ea`).
+5. **"read-only dup failed; not using memfd".** The `/proc/self/fd/N` reopen was ENOENT (`9437f52`).
+6. **Intermittent failures on both arches, about half the runs: `IPDL protocol error: File handle not found in message!`, then an abort and EXIT=139.**
+   - The fds were not being lost; the message bytes were corrupt. The no-fd sendmsg path kept writing later iovecs after a short write.
+   - The AF_UNIX ring is only 4 KiB, so most Firefox messages are short-written.
+   - scmtest `sendmsg_short_write_keeps_stream` failed 5 of 5 before the fix and passes after it (`2ca54ee`).
+
+### Verification (final tree)
+- `./scripts/build-all.sh`: OK.
+- The 13-suite regression via runtests.py: **13/13 RC=0 on aarch64/HVF and on x86_64/TCG**, including all the new checks:
+  - scmtest: socket_dup2_low_fd, fork_dup2_low_exec, pass_connected_socket, memfd_reopen_readonly, sendmsg_short_write_keeps_stream;
+  - memtest: mmap_hint_is_only_a_hint;
+  - pthreadtest: arch_gs_base (x86_64).
+- b97e252 (CSPRNG), the owed verification: 13/13 on both arches before any of the above, and a desktop boot on both arches (greeter, panel, cosmic-term).
+- Firefox stability on the final tree:
+  - 5 of 5 sessions stayed up for the whole wait with no IPDL error, crash or channel error: aarch64 3 runs (about:license, file://, about:license), x86_64 2 runs (about:license, file://).
+  - Before `2ca54ee`, about half the runs on each arch hit the IPDL abort.
+  - The guest profile persists on the image, so later runs restore the previous tab next to the new one.
+
+### Open / next
+- **Magenta artifacts (both arches, not investigated).**
+  - aarch64: a solid magenta bar in the URL bar, right of the text.
+  - Both arches: magenta slivers around the back/forward buttons and at the notification-bar edges.
+  - Page content is clean. This looks like a WebRender texture or picture-cache problem on virgl/ANGLE rather than a kernel one. Cheap first step: `gfx.webrender.debug.*`, or disable the picture cache to see which cache tiles go magenta.
+- x86_64 logs `Failed to create EGLContext!: 0x3009` once. It is benign, because WebRender retries and succeeds.
+- `Unable to determine pipe buffer size: Protocol not available`: the kernel has no F_GETPIPE_SZ on sockets. Benign.
+- Networking (http/https) is untested. Do this next.
+- Kernel debt this lane leaves:
+  - A connected AF_UNIX end queued over its own connection keeps the connection alive. It is a leak, accepted, with no GC.
+  - The SockAlias table is per process; the alias count is global.
+  - Plain `read()`/`recv()` on a unix stream ignores queued fd batches. That is pre-existing; Firefox only uses recvmsg.
+  - The no-fd recvmsg path for unix SOCK_DGRAM/SEQPACKET reads one datagram per iovec. Also pre-existing.
+- aarch64/HVF entropy is jitter only (no FEAT_RNG). See the item B notes in the old section below.
+
+### Tools
+- `ffsession.py <arch> <tag> [--wait S] [--env "K=V ..."] [--url URL]`:
+  - boots `--virgl`, logs in at the greeter, opens cosmic-term with Super+T and runs `/bin/firefox --no-remote URL`;
+  - `--url file:///tmp/fftest.html` writes a test page into the guest first;
+  - output goes to `$FFSESSION_OUT/run-<tag>/`: ff.log, screenshots every 30 s, serial-live.log and ps.txt.
+- `runtests.py <arch> <tag> <cmd>...` is the headless root-login test runner. The 13-suite list is `/bin/sigtest /bin/sigtest2 /bin/memtest /bin/scmtest /bin/polltest /bin/forktest /bin/exectest /bin/pthreadtest /bin/epolltest /bin/timertest /bin/jobtest /bin/waittest /bin/sigchldtest`.
+- Run both with `LEANDROS_QEMU_MEM=4G` from the worktree root.
+  - Give each concurrent QEMU its own `LEANDROS_RUN_ID` and `LEANDROS_VNC_PORT`.
+  - **Two QEMUs of the same arch cannot run at once** (image write lock).
+  - **Never run build-all.sh while a QEMU of this tree is up**: it rewrites the images under it.
+- Locating a userland crash: temporarily print `as_.regions` for ELR/LR in the EL0 fault path. The VMA's `file_off` gives the file offset; for libxul text, vaddr = file offset + 0x10000. Disassemble with `llvm-objdump --start-address`, and read MOZ_CRASH reason strings straight from the file.
+
+## Previous RESUME HERE (2026-09-28, superseded)
 Branch `lane/firefox`, worktree `.claude/worktrees/agent-a40da30690bad16e4`. Not merged, not pushed. The tree is clean. Commits after `b88f48b5`:
 - `b97e2526` random: ChaCha20 CSPRNG for getrandom and /dev/urandom (item B)
 - `062f852` ports/firefox: minimal PNG icon theme and MIME database (item A)
