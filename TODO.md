@@ -45,13 +45,10 @@ greetd/brush `EBADF` self-pipe race; `[WDOG] … cosmic-comp mmap ~2 s`; and the
 lag (35.5 s p50 → sub-200 ms, via the f2fs cache-size bug plus GPU-by-default).
 
 **Still open:**
-- **`FUTEX_WAIT` + `SA_RESTART` race under load** (`lane/sigmisc`, unmerged): restarts correctly on
-  an idle host, but 10–20% of iterations return EINTR instead of ETIMEDOUT under concurrent host
-  load. Narrowed to `futex_wait`'s own block/resume path (`sched/src/futex.rs`) — a control test
-  proved the shared signal-restart machinery itself is clean (100/100 under the same load with a
-  pipe read instead of a futex). Two hypotheses tried and disproven; reproduces stone cold with
-  `for i in 1..6; do yes >/dev/null & done` + repeated `sigtest`. Test shipped, marked
-  known-flaky-under-load.
+- ~~`FUTEX_WAIT` + `SA_RESTART` race under load~~ — **CLOSED 2026-10-01 (`lane/futexload`)**: fixed by
+  futexsig/futexrem; a timed FUTEX_WAIT hit by a handled signal returns EINTR (with or without
+  SA_RESTART), as on Linux 7.2; the old 10–20% came from a leftover SIGCHLD handler. 0 EINTR in 200
+  loaded iterations per arch; sigtest `futex_timed_signal_stress` is strict.
 - **Venus (Vulkan) is infeasible on the Mac with any QEMU today** (`lane/macqemu`/`macgpu`):
   upstream virglrenderer's Venus is Linux-only (epoll/memfd/udmabuf/eventfd); UTM's macOS fork
   fails at host `vkCreateInstance` with an undetermined CS error. The Mac's GPU path is virgl over

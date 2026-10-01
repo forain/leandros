@@ -157,6 +157,43 @@ by the fact that `-4` is only ever producible via that one conversion, so `note_
 provably being called every time — the loss is in what happens after, not a bypass of the note
 itself).
 
+## Follow-up: the futex VA-keying fix (a19267d) made it WORSE, not better
+
+Per request, merged `origin/integ-wave-0924` @ 2af5ad4 (includes `a19267d`, "futex: key private
+futexes by thread group, not by address alone" — a real, independently-found bug where a
+FUTEX_WAKE in one process could wake a waiter at the same VA in another process) and re-ran the
+100× SA_RESTART stress under the same `for i in 1..6; do yes >/dev/null & done` load, aarch64/HVF.
+**Result: 39/100 timedout, 61/100 EINTR — up from ~10-20% EINTR before that merge, same load,
+same machine.** The fix did not help and the failure rate roughly tripled. This is strong evidence
+the two mechanisms disagree, not just that the underlying bug is elsewhere:
+
+- The **generic wake-on-signal path**: `deliver_signal` / `post_signal_thread` (`sched/src/lib.rs`)
+  do a plain `TaskState::Blocked -> Ready` flip on the target task. They know nothing about futex,
+  keys, or `FutexWaiter` — signal delivery is not futex-aware at all.
+- The **futex-specific post-wake reporting**: `futex_wait_keyed` (`sched/src/futex.rs`, ~line 101)
+  decides its own return value from its `was_woken` check (~line 239-258) against its own
+  `FutexWaiter` table entry, matched by the new `key_matches(w, uaddr, tgid, private)` predicate
+  (~line 299) rather than the old bare-VA comparison. A task woken by a *signal* (not a real
+  `FUTEX_WAKE`) was never "claimed" in that table either way — `was_woken` should read `false` for
+  it regardless of keying — so the keying change should have been a no-op for this exact
+  interaction. That it instead roughly tripled the failure rate suggests `futex_wait_keyed`'s
+  internal bookkeeping (locking shape, or how/when a slot is registered vs. matched) shifted timing
+  enough to widen whatever window the underlying race depends on, or that `key_matches` changes
+  which slot `FUTEX_TABLE.lock()`-held code paths agree is "this waiter" under contention.
+
+**A fresh lane picking this up should start by diffing `futex_wait` (pre-a19267d) against
+`futex_wait_keyed` (post-a19267d) side by side for the SA_RESTART-under-signal path specifically**,
+not by re-deriving it from scratch — the delta between those two functions is now the prime
+suspect, not the note/take restart-bookkeeping this lane spent most of its time on (which was
+checked twice, independently, and is not it).
+
+**Cross-machine data point**: the same 100 iterations under the same load recipe on x86_64/KVM (the
+`forain@172.16.149.179` laptop, post-a19267d) showed only **6/100 EINTR** (94/100 timedout) — much
+closer to the pre-a19267d aarch64/HVF rate than to post-a19267d aarch64/HVF's 61%. So the race's
+severity is also accelerator/arch-sensitive (HVF significantly worse than KVM here), which may be
+a useful clue about what kind of timing window is involved (scheduling granularity, vCPU exit
+latency, etc.) rather than being purely a logical/instruction-count race.
+
 ## Open
 
 - **The FUTEX_WAIT SA_RESTART-under-load race, now narrowed to `sched/src/futex.rs` /
