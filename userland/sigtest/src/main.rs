@@ -245,6 +245,7 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
                 if !test_futex_wait_restart_stress(iters) { failures += 1; }
                 if !test_futex_wake_beats_restart(iters) { failures += 1; }
                 if !test_futex_ignored_signal_keeps_waiting() { failures += 1; }
+                if !test_futex_timed_signal_stress(iters) { failures += 1; }
                 if !test_futex_wait_bitset_signal() { failures += 1; }
                 if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
                 puts(b"--- sigtest futex done ---\n\0".as_ptr());
@@ -287,6 +288,7 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     if !test_futex_wait_restart_stress(20) { failures += 1; }
     if !test_futex_wake_beats_restart(20) { failures += 1; }
     if !test_futex_ignored_signal_keeps_waiting() { failures += 1; }
+    if !test_futex_timed_signal_stress(5) { failures += 1; }
     if !test_futex_wait_bitset_signal() { failures += 1; }
     if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
     if !test_ppoll_pselect_sigmask() { failures += 1; }
@@ -1086,6 +1088,9 @@ const FUTEX_BITSET_MATCH_ANY: u32 = !0;
 
 /// The futex word every restart test waits on. 7 = "keep waiting".
 static FWORD: AtomicU32 = AtomicU32::new(7);
+/// `FWORD` as the waiter saw it right after FUTEX_WAIT returned: 8 means the
+/// genuine wake had happened, 7 means the wait ended before it (spurious).
+static FW_AT_RETURN: AtomicU32 = AtomicU32::new(0);
 /// Parameters for `futex_helper`, a sibling thread that signals the waiting
 /// main thread with a thread-directed tgkill (so no other thread and no
 /// child exit — no SIGCHLD — is involved) and then optionally wakes it.
@@ -1156,11 +1161,14 @@ unsafe fn futex_signal_round_op(op: c_long, restart: bool, timeout_ms: i32, sig_
     FH_SIG_MS.store(sig_ms, Ordering::SeqCst);
     FH_WAKE_MS.store(wake_ms, Ordering::SeqCst);
     FH_WOKEN.store(-1, Ordering::SeqCst);
+    // The clock starts BEFORE the helper exists: its sleeps begin inside
+    // pthread_create, so a t0 taken after it could start up to a timeslice
+    // late under load and make a genuine wake at "100 ms" read as ~85 ms.
+    let t0 = now_ns();
     let mut th: pthread_t = core::ptr::null_mut();
     if pthread_create(&mut th, core::ptr::null(), futex_helper, core::ptr::null_mut()) != 0 {
         return (-9998, 0);
     }
-    let t0 = now_ns();
     let to = if op == FUTEX_WAIT_BITSET {
         let d = t0 + timeout_ms as i64 * 1_000_000;
         timespec { tv_sec: d / 1_000_000_000, tv_nsec: d % 1_000_000_000 }
@@ -1171,6 +1179,7 @@ unsafe fn futex_signal_round_op(op: c_long, restart: bool, timeout_ms: i32, sig_
     let r = syscall(nr::FUTEX, FWORD.as_ptr() as c_long, op | FUTEX_PRIVATE,
                     7 as c_long, top, 0 as c_long, FUTEX_BITSET_MATCH_ANY as c_long);
     let el = now_ns() - t0;
+    FW_AT_RETURN.store(FWORD.load(Ordering::SeqCst), Ordering::SeqCst);
     pthread_join(th, core::ptr::null_mut());
     (r, el)
 }
@@ -1214,7 +1223,10 @@ unsafe fn test_futex_wait_restart_stress(iters: i32) -> bool {
     let (mut good, mut eintr, mut other) = (0i32, 0i32, 0i32);
     for i in 0..iters {
         let (r, el) = futex_signal_round(true, 0, 20, 80);
-        if r == 0 && el >= 90_000_000 && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 1 { good += 1; continue; }
+        // A real restart ends only at the genuine wake: the word is already 8
+        // when the wait returns, and no earlier than the helper's 20+80 ms.
+        let w = FW_AT_RETURN.load(Ordering::SeqCst);
+        if r == 0 && w == 8 && el >= 100_000_000 && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 1 { good += 1; continue; }
         if r == -(EINTR as c_long) { eintr += 1; } else { other += 1; }
         write(1, b"  restart_stress[".as_ptr(), 17);
         put_i32(i);
@@ -1222,6 +1234,8 @@ unsafe fn test_futex_wait_restart_stress(iters: i32) -> bool {
         put_i32(r as i32);
         write(1, b" el_us=".as_ptr(), 7);
         put_i32((el / 1000) as i32);
+        write(1, b" word=".as_ptr(), 6);
+        put_i32(w as i32);
         write(1, b"\n".as_ptr(), 1);
     }
     write(1, b"  restart_stress: ok=".as_ptr(), 21);
@@ -1283,6 +1297,48 @@ unsafe fn test_futex_ignored_signal_keeps_waiting() -> bool {
         ok &= c;
     }
     report(name, ok)
+}
+
+/// Stress the TIMED FUTEX_WAIT against a signal at ~50 ms, `iters` times per
+/// shape, with Linux's answers (re-measured on a Linux 7.2 host, 20/20 each):
+///   * SA_RESTART handler, 1000 ms timeout -> EINTR at the signal, handler ran
+///     once (-ERESTART_RESTARTBLOCK becomes EINTR whenever a handler runs);
+///   * SIGCHLD at SIG_DFL (ignored), 350 ms timeout -> ETIMEDOUT at >= 350 ms,
+///     no handler: the ignored signal neither ends nor shortens the wait.
+/// Any other outcome (a 0, an EINTR for the ignored signal, an ETIMEDOUT for
+/// the handled one) is a failure; load does not change either answer.
+unsafe fn test_futex_timed_signal_stress(iters: i32) -> bool {
+    let name = b"futex_timed_signal_stress\0";
+    let (mut h_ok, mut h_bad, mut i_ok, mut i_bad) = (0i32, 0i32, 0i32, 0i32);
+    for i in 0..iters {
+        let (r, el) = futex_signal_round(true, 1000, 50, -1);
+        if r == -(EINTR as c_long) && el >= 30_000_000 && el < 1_000_000_000
+            && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 1 { h_ok += 1; } else {
+            h_bad += 1;
+            write(1, b"  timed_stress handler[".as_ptr(), 23); put_i32(i);
+            write(1, b"] r=".as_ptr(), 4); put_i32(r as i32);
+            write(1, b" el_us=".as_ptr(), 7); put_i32((el / 1000) as i32);
+            write(1, b"\n".as_ptr(), 1);
+        }
+
+        sigaction(SIGCHLD, &zeroed_sigaction(None), core::ptr::null_mut());
+        FH_SIGNO.store(SIGCHLD, Ordering::SeqCst);
+        let (r, el) = futex_signal_round(true, 350, 50, -1);
+        FH_SIGNO.store(SIGALRM, Ordering::SeqCst);
+        if r == -110 && el >= 350_000_000 && FUTEX_SIG_COUNT.load(Ordering::SeqCst) == 0 { i_ok += 1; } else {
+            i_bad += 1;
+            write(1, b"  timed_stress ignored[".as_ptr(), 23); put_i32(i);
+            write(1, b"] r=".as_ptr(), 4); put_i32(r as i32);
+            write(1, b" el_us=".as_ptr(), 7); put_i32((el / 1000) as i32);
+            write(1, b"\n".as_ptr(), 1);
+        }
+    }
+    write(1, b"  timed_stress: handler_eintr=".as_ptr(), 30); put_i32(h_ok);
+    write(1, b" handler_bad=".as_ptr(), 13); put_i32(h_bad);
+    write(1, b" ignored_etimedout=".as_ptr(), 19); put_i32(i_ok);
+    write(1, b" ignored_bad=".as_ptr(), 13); put_i32(i_bad);
+    write(1, b"\n".as_ptr(), 1);
+    report(name, h_bad == 0 && i_bad == 0)
 }
 
 /// Diagnostic (`sigtest futexab N`), the shape of the original stress test:
