@@ -1875,7 +1875,7 @@ fn dispatch_inner(
         FSTATFS => sys_fstatfs(a0, a1),
         FSYNC | FDATASYNC | SYNCFS => sys_fsync(a0),
         SYNC        => sys_sync(),
-        FALLOCATE   => 0, // advisory pre-allocation; no-op is valid
+        FALLOCATE   => sys_fallocate(a0, a1, a2, a3),
         UTIMENSAT   => sys_utimensat(a0, a1, a2, a3),
         #[cfg(not(target_arch = "aarch64"))]
         UTIMES      => sys_utimes(AT_FDCWD, a0, a1, false),
@@ -3419,6 +3419,17 @@ fn sys_sync() -> isize {
 fn sys_ftruncate(fd: usize, length: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_FTRUNCATE, &[fd as u64, length as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// fallocate(fd, mode, offset, len) — see vfs::handle_fallocate for the
+/// supported modes. This used to answer 0 without doing anything, so
+/// posix_fallocate reported success and left the file at its old size.
+fn sys_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
+    // Sockets and epoll instances live outside the VFS fd table.
+    if fd >= net_server::SOCK_FD_BASE { return -29; } // ESPIPE
+    let pid = current_pid();
+    let msg = make_vfs_msg(vfs::VFS_FALLOCATE, &[fd as u64, mode as u64, offset as u64, len as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 

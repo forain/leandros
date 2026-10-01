@@ -2476,12 +2476,15 @@ unsafe fn test_scm_import_emfile_single_release() -> bool {
 
     let sret = send_fd_and_byte(a, wr, b'E');
 
-    // Saturate the fd table. `alloc_fd` never hands out 0-2, so this stops at
-    // MAX_FDS - 3 entries; 256 only bounds the loop.
-    let mut hogs = [-1i32; 256];
+    // Saturate the fd table: dup until EMFILE, whatever the per-process
+    // limit is (it was 256, is 512 now). The bound only stops a kernel that
+    // never says EMFILE from looping forever; it is far above any limit.
+    const HOG_CAP: usize = 8192;
+    static mut HOGS: [i32; HOG_CAP] = [-1; HOG_CAP];
+    let hogs = &mut *core::ptr::addr_of_mut!(HOGS);
     let mut nhogs = 0usize;
     let mut hog_errno = 0i32;
-    while nhogs < 256 {
+    while nhogs < HOG_CAP {
         let d = dup(rd);
         if d < 0 { hog_errno = get_errno(); break; }
         hogs[nhogs] = d;

@@ -20,6 +20,12 @@
 //!     closing cloexec fds; closing first let a tokio worker blocked on its
 //!     signal self-pipe (a SOCK_CLOEXEC socketpair) wake to EBADF and panic
 //!     "Bad read on self-pipe" whenever brush ran `exec <cmd>`.
+//! 11. stdio redirection through fork + dup2 + execve, the way a shell sets
+//!     it up: `2>FILE`, `>&2` inside a child whose stderr was redirected by
+//!     its parent (`sh -c 'cmd >&2' 2>FILE`), `>FILE 2>&1`, `2>&1 >FILE`
+//!     against both the raw console and a pipe, `/dev/stdout` opened before a
+//!     redirect, `/dev/console` while stdin is redirected, and the same
+//!     shapes feeding a pipeline. Each on tmpfs (/tmp) and f2fs (/data).
 //!
 //! Shape as sigtest2: relibc_start_v1 entry, "<name>: PASS"/"<name>: FAIL at
 //! step N" per check, "EXECTEST: PASS"/"EXECTEST: FAIL <n>" summary, exit
@@ -47,6 +53,9 @@ const SIGKILL: c_int = 9;
 const WNOHANG: c_int = 1;
 
 const O_RDONLY: c_int = 0;
+const O_WRONLY: c_int = 1;
+const O_CREAT:  c_int = 0o100;
+const O_TRUNC:  c_int = 0o1000;
 
 const ENOENT:  c_int = 2;
 const ENOEXEC: c_int = 8;
@@ -74,6 +83,7 @@ extern "C" {
     pub fn pipe(fds: *mut c_int) -> c_int;
     pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     pub fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
+    pub fn unlink(path: *const u8) -> c_int;
     pub fn exit(status: i32) -> !;
     pub fn _exit(status: i32) -> !;
     pub fn __errno_location() -> *mut c_int;
@@ -130,6 +140,8 @@ const ENVP: [*const u8; 3] = [
 pub unsafe extern "C" fn exec_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     // Re-exec target for test 10: exit at once, touching nothing.
     if argc > 1 && cstr_is(*argv.add(1), b"--exit0\0") { return 0; }
+    // Re-exec targets for test 11.
+    if argc > 1 { redir_stage(*argv.add(1)); }
 
     let mut failures = 0;
 
@@ -143,13 +155,19 @@ pub unsafe extern "C" fn exec_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     if !test_self_interpreter_eloop() { failures += 1; }
     if !test_launcher_has_shebang() { failures += 1; }
     if !test_exec_hides_cloexec_from_siblings() { failures += 1; }
+    for base in [b"/tmp/.exectest-redir\0".as_slice(), b"/data/.exectest-redir\0".as_slice()] {
+        for (i, c) in REDIR_CASES.iter().enumerate() {
+            if !test_redir(base, c, i) { failures += 1; }
+        }
+    }
 
     puts(b"--- exectest done ---\0".as_ptr());
     if failures == 0 {
         puts(b"EXECTEST: PASS\0".as_ptr());
     } else {
-        let mut line = *b"EXECTEST: FAIL 0\0";
-        line[15] = b'0' + (failures as u8 % 10);
+        let mut line = *b"EXECTEST: FAIL 00\0";
+        line[15] = b'0' + (failures as u8 / 10 % 10);
+        line[16] = b'0' + (failures as u8 % 10);
         puts(line.as_ptr());
     }
     failures
@@ -461,6 +479,217 @@ unsafe fn test_exec_hides_cloexec_from_siblings() -> bool {
             puts(line.as_ptr());
             return fail_at(name, 5);
         }
+    }
+    report(name, true)
+}
+
+// ── 11. stdio redirection across fork/exec ──────────────────────────────────
+//
+// Re-exec stages (argv[1]); each is one link of what a shell does:
+//   --emit        write "<O>\n" to fd 1, then "<E>\n" to fd 2, exit 0
+//
+// Checks are by marker, not exact bytes: the exec'd image's startup writes
+// loader diagnostics to fd 2, which lands wherever stderr was redirected.
+//   --dup21-emit  dup2(2, 1), then exec --emit   (`cmd >&2`)
+//   --dup12-emit  dup2(1, 2), then exec --emit   (`cmd 2>&1`)
+
+unsafe fn exec_stage(stage: &[u8]) -> ! {
+    let argv: [*const u8; 3] = [b"/bin/exectest\0".as_ptr(), stage.as_ptr(), core::ptr::null()];
+    execve(b"/bin/exectest\0".as_ptr(), argv.as_ptr(), ENVP.as_ptr());
+    _exit(99);
+}
+
+unsafe fn redir_stage(arg: *const u8) {
+    if cstr_is(arg, b"--emit\0") {
+        let a = write(1, b"<O>\n".as_ptr(), 4);
+        let b = write(2, b"<E>\n".as_ptr(), 4);
+        _exit(if a == 4 && b == 4 { 0 } else { 91 });
+    }
+    if cstr_is(arg, b"--dup21-emit\0") {
+        if dup2(2, 1) != 1 { _exit(90); }
+        exec_stage(b"--emit\0");
+    }
+    if cstr_is(arg, b"--dup12-emit\0") {
+        if dup2(1, 2) != 2 { _exit(90); }
+        exec_stage(b"--emit\0");
+    }
+}
+
+/// One redirect scenario. `setup` runs in the forked child with `f` (FILE,
+/// opened O_WRONLY|O_CREAT|O_TRUNC) and `w` (the write end of the parent's
+/// capture pipe); it must exec or `_exit`. The parent then compares what
+/// reached the pipe and the file: each of `<O>` (stdout), `<E>` (stderr),
+/// `<S>` and `<C>` must appear exactly where listed and nowhere else.
+struct RedirCase {
+    name: &'static [u8],
+    setup: unsafe fn(f: c_int, w: c_int) -> !,
+    want_pipe: &'static [&'static [u8]],
+    want_file: &'static [&'static [u8]],
+}
+
+const MARKERS: [&[u8]; 4] = [b"<O>", b"<E>", b"<S>", b"<C>"];
+
+fn has(hay: &[u8], needle: &[u8]) -> bool {
+    hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Every marker in `want` present in `got`, every other marker absent.
+fn markers_match(got: &[u8], want: &[&[u8]]) -> bool {
+    MARKERS.iter().all(|m| has(got, m) == want.contains(m))
+}
+
+/// `sh -c 'cmd' 2>FILE`, stdout captured.
+unsafe fn rc_stderr_file(f: c_int, w: c_int) -> ! {
+    dup2(f, 2); dup2(w, 1); close(f); close(w);
+    exec_stage(b"--emit\0");
+}
+/// `sh -c 'cmd >&2' 2>FILE`: the redirect is made in the parent, survives
+/// exec, and the exec'd image dups it again before exec'ing the command.
+unsafe fn rc_nested_gt_amp2(f: c_int, w: c_int) -> ! {
+    dup2(f, 2); dup2(w, 1); close(f); close(w);
+    exec_stage(b"--dup21-emit\0");
+}
+/// `cmd >FILE 2>&1`.
+unsafe fn rc_file_then_2to1(f: c_int, w: c_int) -> ! {
+    dup2(f, 1); dup2(1, 2); close(f); close(w);
+    exec_stage(b"--emit\0");
+}
+/// `cmd 2>&1 >FILE` with stdout on the raw console: stderr must stay on the
+/// console (the "E" is printed there), FILE gets stdout only.
+unsafe fn rc_2to1_then_file_console(f: c_int, w: c_int) -> ! {
+    close(w);
+    close(1); // fd 1 untracked = the raw console
+    dup2(1, 2); dup2(f, 1); close(f);
+    exec_stage(b"--emit\0");
+}
+/// `cmd 2>&1 >FILE` with stdout a pipe: stderr to the pipe, stdout to FILE.
+unsafe fn rc_2to1_then_file_pipe(f: c_int, w: c_int) -> ! {
+    dup2(w, 1); dup2(1, 2); dup2(f, 1); close(f); close(w);
+    exec_stage(b"--emit\0");
+}
+/// `/dev/stdout` names the object fd 1 held at open time, not the slot.
+unsafe fn rc_dev_stdout_snapshot(f: c_int, w: c_int) -> ! {
+    dup2(f, 1); close(f);
+    let g = open(b"/dev/stdout\0".as_ptr(), O_WRONLY);
+    if g < 0 { _exit(92); }
+    dup2(w, 1); close(w);
+    _exit(if write(g, b"<S>\n".as_ptr(), 4) == 4 { 0 } else { 93 });
+}
+/// `/dev/console` is the console even while stdin is redirected from a file
+/// (it used to write into whatever fd 0 named). The "C" lands on the console.
+unsafe fn rc_dev_console_vs_stdin(f: c_int, w: c_int) -> ! {
+    close(w);
+    dup2(f, 0); close(f);
+    let g = open(b"/dev/console\0".as_ptr(), O_WRONLY);
+    if g < 0 { _exit(92); }
+    _exit(if write(g, b"<C>\n".as_ptr(), 4) == 4 { 0 } else { 93 });
+}
+/// `sh -c 'cmd >&2' 2>&1 | reader`.
+unsafe fn rc_pipeline_gt_amp2(f: c_int, w: c_int) -> ! {
+    close(f);
+    dup2(w, 2); close(w);
+    close(1);
+    exec_stage(b"--dup21-emit\0");
+}
+/// `sh -c 'cmd 2>&1' | reader`.
+unsafe fn rc_pipeline_2to1(f: c_int, w: c_int) -> ! {
+    close(f);
+    dup2(w, 1); close(w);
+    exec_stage(b"--dup12-emit\0");
+}
+
+static REDIR_CASES: [RedirCase; 9] = [
+    RedirCase { name: b"redir_stderr_file", setup: rc_stderr_file, want_pipe: &[b"<O>"], want_file: &[b"<E>"] },
+    RedirCase { name: b"redir_nested_gt_amp2", setup: rc_nested_gt_amp2, want_pipe: &[], want_file: &[b"<O>", b"<E>"] },
+    RedirCase { name: b"redir_file_then_2to1", setup: rc_file_then_2to1, want_pipe: &[], want_file: &[b"<O>", b"<E>"] },
+    RedirCase { name: b"redir_2to1_then_file_console", setup: rc_2to1_then_file_console, want_pipe: &[], want_file: &[b"<O>"] },
+    RedirCase { name: b"redir_2to1_then_file_pipe", setup: rc_2to1_then_file_pipe, want_pipe: &[b"<E>"], want_file: &[b"<O>"] },
+    RedirCase { name: b"redir_dev_stdout_snapshot", setup: rc_dev_stdout_snapshot, want_pipe: &[], want_file: &[b"<S>"] },
+    RedirCase { name: b"redir_dev_console_vs_stdin", setup: rc_dev_console_vs_stdin, want_pipe: &[], want_file: &[] },
+    RedirCase { name: b"redir_pipeline_gt_amp2", setup: rc_pipeline_gt_amp2, want_pipe: &[b"<O>", b"<E>"], want_file: &[] },
+    RedirCase { name: b"redir_pipeline_2to1", setup: rc_pipeline_2to1, want_pipe: &[b"<O>", b"<E>"], want_file: &[] },
+];
+
+unsafe fn test_redir(base: &[u8], c: &RedirCase, _idx: usize) -> bool {
+    // "<name>_tmp" / "<name>_f2fs"
+    let mut name = [0u8; 64];
+    let suffix: &[u8] = if base.starts_with(b"/tmp") { b"_tmp\0" } else { b"_f2fs\0" };
+    name[..c.name.len()].copy_from_slice(c.name);
+    name[c.name.len()..c.name.len() + suffix.len()].copy_from_slice(suffix);
+    let name = &name[..c.name.len() + suffix.len()];
+
+    unlink(base.as_ptr());
+    let mut fds: [c_int; 2] = [0; 2];
+    if pipe(fds.as_mut_ptr()) != 0 { return fail_at(name, 1); }
+    let (rfd, wfd) = (fds[0], fds[1]);
+    let fl = fcntl(rfd, F_GETFL, 0);
+    if fl < 0 || fcntl(rfd, F_SETFL, fl | O_NONBLOCK) != 0 { return fail_at(name, 2); }
+
+    let child = fork();
+    if child < 0 { return fail_at(name, 3); }
+    if child == 0 {
+        close(rfd);
+        let f = open(base.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+        if f < 0 { _exit(94); }
+        (c.setup)(f, wfd);
+    }
+    close(wfd);
+
+    let mut out = [0u8; 4096];
+    let mut out_len = 0usize;
+    let mut st: c_int = 0;
+    let mut reaped = false;
+    let mut eof = false;
+    for _ in 0..500 {
+        if !eof && out_len < out.len() {
+            let n = read(rfd, out.as_mut_ptr().add(out_len), out.len() - out_len);
+            if n > 0 { out_len += n as usize; continue; }
+            if n == 0 { eof = true; }
+        }
+        if !reaped {
+            let w = waitpid(child, &mut st, WNOHANG);
+            if w == child { reaped = true; } else if w < 0 { break; }
+        }
+        if reaped && eof { break; }
+        nap();
+    }
+    close(rfd);
+    if !reaped {
+        kill(child, SIGKILL);
+        for _ in 0..300 { if waitpid(child, &mut st, WNOHANG) == child { break; } nap(); }
+        return fail_at(name, 4);
+    }
+    if !wifexited(st) || wexitstatus(st) != 0 {
+        let got = wexitstatus(st) as u8;
+        let mut line = *b"  child exit 000\0";
+        line[13] = b'0' + got / 100;
+        line[14] = b'0' + (got / 10) % 10;
+        line[15] = b'0' + got % 10;
+        puts(line.as_ptr());
+        return fail_at(name, 5);
+    }
+
+    let mut file = [0u8; 4096];
+    let mut file_len = 0usize;
+    let fd = open(base.as_ptr(), O_RDONLY);
+    if fd < 0 { return fail_at(name, 6); }
+    loop {
+        let n = read(fd, file.as_mut_ptr().add(file_len), file.len() - file_len);
+        if n <= 0 || file_len + n as usize >= file.len() { if n > 0 { file_len += n as usize; } break; }
+        file_len += n as usize;
+    }
+    close(fd);
+    unlink(base.as_ptr());
+
+    if !markers_match(&out[..out_len], c.want_pipe) {
+        puts(b"  pipe got:\0".as_ptr());
+        write(1, out.as_ptr(), out_len);
+        return fail_at(name, 7);
+    }
+    if !markers_match(&file[..file_len], c.want_file) {
+        puts(b"  file got:\0".as_ptr());
+        write(1, file.as_ptr(), file_len);
+        return fail_at(name, 8);
     }
     report(name, true)
 }

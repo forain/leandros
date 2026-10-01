@@ -31,6 +31,7 @@ const VFS_GETDENTS64: u64 = 0x1D;
 const VFS_UNLINK:     u64 = 0x1F;
 const VFS_MKDIR:      u64 = 0x20;
 const VFS_FTRUNCATE:  u64 = 0x21;
+const VFS_FALLOCATE:  u64 = vfs_server::VFS_FALLOCATE;
 const VFS_RENAME:     u64 = 0x22;
 const VFS_RMDIR:      u64 = 0x29;
 const VFS_STATFS:     u64 = 0x33;
@@ -3243,6 +3244,27 @@ fn handle_ftruncate(ms: &mut MountState, file_id: u64, length: u64) -> Message {
     ok_reply()
 }
 
+/// `VFS_FALLOCATE(file_id, mode, offset, len)` — the VFS has already
+/// validated the range and rejected every mode but 0 and `FALLOC_FL_KEEP_SIZE`
+/// (punching holes is EOPNOTSUPP on this volume).
+///
+/// Mode 0 grows `i_size` to `offset + len` exactly as a growing ftruncate does;
+/// KEEP_SIZE changes nothing. Neither reserves blocks — this F2FS allocates at
+/// write time only, so a later write can still meet ENOSPC — but the file-size
+/// contract posix_fallocate(3) callers rely on (musl does not emulate it) holds.
+fn handle_fallocate(ms: &mut MountState, file_id: u64, mode: u64, offset: u64, len: u64) -> Message {
+    let slot = file_id as usize;
+    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); }
+    if !ms.open_files[slot].writable { return err_reply(-9); } // EBADF, as Linux
+    if mode != 0 { return ok_reply(); } // KEEP_SIZE: size unchanged, nothing reserved
+    let end = offset.saturating_add(len);
+    let ino = ms.open_files[slot].inode;
+    let iblkaddr = nat_lookup(ms, ino);
+    let old_size = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_size(iblk) };
+    if end <= old_size { return ok_reply(); }
+    handle_ftruncate(ms, file_id, end)
+}
+
 /// statfs — report this volume's real geometry from the superblock and the
 /// active checkpoint.
 ///
@@ -3746,6 +3768,7 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
         VFS_RMDIR      => handle_rmdir(ms, arg(msg,0)),
         VFS_RENAME     => handle_rename(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_FTRUNCATE  => handle_ftruncate(ms, arg(msg,0), arg(msg,1)),
+        VFS_FALLOCATE  => handle_fallocate(ms, arg(msg,0), arg(msg,1), arg(msg,2), arg(msg,3)),
         VFS_STATFS     => handle_statfs(ms, arg(msg,1)),
         VFS_LSTAT      => handle_lstat(ms, arg(msg,0), arg(msg,1)),
         VFS_SYMLINK    => handle_symlink(ms, arg(msg,0), arg(msg,1), &cred),

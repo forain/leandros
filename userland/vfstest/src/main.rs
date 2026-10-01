@@ -810,6 +810,10 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_tmpfs_mmap_sparse() { failures += 1; }
     if !test_tmpfs_shared_offset() { failures += 1; }
     if !test_tmpfs_enospc() { failures += 1; }
+    if !test_fallocate_tmpfs() { failures += 1; }
+    if !test_fallocate_f2fs() { failures += 1; }
+    if !test_dev_zero_big_read() { failures += 1; }
+    if !test_mount_table_tmpfs() { failures += 1; }
 
     puts(b"--- vfstest done ---\0".as_ptr());
     failures
@@ -1700,5 +1704,139 @@ unsafe fn test_tmpfs_shared_offset() -> bool {
     ok = ok && r >= 0 && check_pat(r, 0, 36_000);
     if r >= 0 { close(r); }
     unlink(path);
+    report(name, ok)
+}
+
+// ── fallocate, /dev/zero, mount table (lane stdioredir) ─────────────────────
+
+#[cfg(target_arch = "aarch64")] const SYS_FALLOCATE: usize = 47;
+#[cfg(target_arch = "x86_64")]  const SYS_FALLOCATE: usize = 285;
+const FALLOC_FL_KEEP_SIZE: usize = 0x01;
+const FALLOC_FL_PUNCH_HOLE: usize = 0x02;
+const FALLOC_FL_ZERO_RANGE: usize = 0x10;
+
+unsafe fn raw_fallocate(fd: i32, mode: usize, off: usize, len: usize) -> isize {
+    xret(syscall4(SYS_FALLOCATE, fd as usize, mode, off, len))
+}
+
+/// fallocate on tmpfs: mode 0 extends EOF and really allocates (st_blocks,
+/// statfs), KEEP_SIZE allocates without moving EOF, PUNCH_HOLE|KEEP_SIZE
+/// zeroes the range and frees its whole pages; unsupported modes are
+/// EOPNOTSUPP and bad ranges EINVAL. It used to be a silent no-op.
+unsafe fn test_fallocate_tmpfs() -> bool {
+    let name = b"fallocate_tmpfs\0";
+    let path = b"/tmp/vt_falloc\0".as_ptr();
+    let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    let free0 = tmp_bfree().unwrap_or(0);
+    let mut ok = raw_fallocate(fd, 0, 0, 100_000) == 0;
+    ok = ok && raw_fsize(fd) == Some((100_000, 25 * 8));
+    let free1 = tmp_bfree().unwrap_or(0);
+    ok = ok && free0 >= free1 + 25;
+    // KEEP_SIZE: two pages past EOF, size unchanged.
+    ok = ok && raw_fallocate(fd, FALLOC_FL_KEEP_SIZE, 102_400, 8192) == 0;
+    ok = ok && raw_fsize(fd) == Some((100_000, 27 * 8));
+    // Allocated range reads back as zeros.
+    ok = ok && lseek(fd, 0, 0) == 0;
+    ok = ok && read(fd, BUF_B.as_mut_ptr(), 65536) == 65536;
+    for i in 0..65536 { if ok && BUF_B[i] != 0 { ok = false; } }
+    // Punch: fill 3 pages with 0xFF, punch the middle one plus 100 bytes on
+    // either side.
+    for i in 0..12288 { BUF_A[i] = 0xFF; }
+    ok = ok && raw_pwrite(fd, BUF_A.as_ptr(), 12288, 0) == 12288;
+    ok = ok && raw_fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 4096 - 100, 4096 + 200) == 0;
+    ok = ok && raw_fsize(fd) == Some((100_000, 26 * 8));
+    ok = ok && lseek(fd, 0, 0) == 0;
+    ok = ok && read(fd, BUF_B.as_mut_ptr(), 12288) == 12288;
+    for i in 0..12288 {
+        let want = if (3996..8292).contains(&i) { 0 } else { 0xFF };
+        if ok && BUF_B[i] != want { ok = false; }
+    }
+    // Rejected modes / ranges.
+    ok = ok && raw_fallocate(fd, FALLOC_FL_PUNCH_HOLE, 0, 4096) == -1 && get_errno() == EOPNOTSUPP;
+    ok = ok && raw_fallocate(fd, FALLOC_FL_ZERO_RANGE, 0, 4096) == -1 && get_errno() == EOPNOTSUPP;
+    ok = ok && raw_fallocate(fd, 0, 0, 0) == -1 && get_errno() == EINVAL;
+    close(fd);
+    unlink(path);
+    ok = ok && tmp_bfree() == Some(free0);
+    report(name, ok)
+}
+
+/// fallocate on f2fs: mode 0 extends EOF (posix_fallocate's contract);
+/// KEEP_SIZE leaves it; PUNCH_HOLE is EOPNOTSUPP.
+unsafe fn test_fallocate_f2fs() -> bool {
+    let name = b"fallocate_f2fs\0";
+    let path = b"/data/vt_falloc\0".as_ptr();
+    let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    let mut ok = write(fd, b"abc".as_ptr(), 3) == 3;
+    ok = ok && raw_fallocate(fd, 0, 0, 50_000) == 0;
+    ok = ok && raw_fsize(fd).map(|s| s.0) == Some(50_000);
+    ok = ok && raw_fallocate(fd, 0, 0, 10) == 0;
+    ok = ok && raw_fsize(fd).map(|s| s.0) == Some(50_000);
+    ok = ok && raw_fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 90_000) == 0;
+    ok = ok && raw_fsize(fd).map(|s| s.0) == Some(50_000);
+    ok = ok && raw_fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 4096) == -1
+            && get_errno() == EOPNOTSUPP;
+    ok = ok && lseek(fd, 0, 0) == 0;
+    ok = ok && read(fd, BUF_B.as_mut_ptr(), 8) == 8 && &BUF_B[..8] == b"abc\0\0\0\0\0";
+    close(fd);
+    unlink(path);
+    report(name, ok)
+}
+
+/// One read(2) of /dev/zero fills the whole buffer (it stopped at 4 KiB),
+/// and /dev/null and /dev/zero accept lseek like Linux's.
+unsafe fn test_dev_zero_big_read() -> bool {
+    let name = b"dev_zero_big_read\0";
+    let fd = open(b"/dev/zero\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 { return report(name, false); }
+    let len = 4 << 20;
+    let big = mmap(core::ptr::null_mut(), len, 3, 0x22, -1, 0);
+    let mut ok = big as isize != -1;
+    if ok {
+        for i in (0..len).step_by(997) { *big.add(i) = 0xAA; }
+        ok = read(fd, big, len) == len as isize;
+        for i in (0..len).step_by(997) { if ok && *big.add(i) != 0 { ok = false; } }
+        munmap(big, len);
+    }
+    ok = ok && lseek(fd, 12345, 0) == 0;
+    close(fd);
+    let nfd = open(b"/dev/null\0".as_ptr(), O_WRONLY, 0);
+    ok = ok && nfd >= 0 && lseek(nfd, 0, 2) == 0;
+    if nfd >= 0 { close(nfd); }
+    report(name, ok)
+}
+
+/// True if the NUL-free `needle` occurs in the first `n` bytes of BUF_B.
+unsafe fn buf_b_contains(n: usize, needle: &[u8]) -> bool {
+    n >= needle.len() && (0..=n - needle.len()).any(|i| &BUF_B[i..i + needle.len()] == needle)
+}
+unsafe fn slurp_b(path: &[u8]) -> usize {
+    let fd = open(path.as_ptr(), O_RDONLY, 0);
+    if fd < 0 { return 0; }
+    let mut n = 0usize;
+    loop {
+        let r = read(fd, BUF_B.as_mut_ptr().add(n), 65536 - n);
+        if r <= 0 { break; }
+        n += r as usize;
+        if n == 65536 { break; }
+    }
+    close(fd);
+    n
+}
+
+/// The tmpfs roots are in the mount table, so `df /tmp` finds tmpfs instead
+/// of matching "/" (it showed the root f2fs volume).
+unsafe fn test_mount_table_tmpfs() -> bool {
+    let name = b"mount_table_tmpfs\0";
+    let n = slurp_b(b"/proc/self/mountinfo\0");
+    let mut ok = buf_b_contains(n, b" / /tmp rw,relatime - tmpfs tmpfs rw\n");
+    ok = ok && buf_b_contains(n, b" / /dev/shm rw,relatime - tmpfs tmpfs rw\n");
+    let n = slurp_b(b"/proc/mounts\0");
+    ok = ok && buf_b_contains(n, b"tmpfs /tmp tmpfs rw 0 0\n");
+    ok = ok && buf_b_contains(n, b"tmpfs /run/user tmpfs rw 0 0\n");
+    let n = slurp_b(b"/etc/mtab\0");
+    ok = ok && buf_b_contains(n, b"tmpfs /tmp tmpfs rw 0 0\n");
     report(name, ok)
 }

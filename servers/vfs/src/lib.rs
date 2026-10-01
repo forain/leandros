@@ -183,6 +183,9 @@ pub const VFS_INOTIFY_ADD:     u64 = 0x4C;
 pub const VFS_UTIMENS:         u64 = 0x4D;
 pub const VFS_LUTIMENS:        u64 = 0x4E;
 pub const VFS_FUTIMENS:        u64 = 0x4F;
+/// fallocate(fd, mode, offset, len). Forwarded to a mount's server for a
+/// `MountedFile` with the same argument layout (`file_id` in place of fd).
+pub const VFS_FALLOCATE:       u64 = 0x50;
 pub const UTIME_NOW:  i64 = (1 << 30) - 1;
 pub const UTIME_OMIT: i64 = (1 << 30) - 2;
 pub const UTIMENS_EXPLICIT: u64 = 1;
@@ -1276,7 +1279,14 @@ pub enum VnodeKind {
     TimerFd { slot: usize },
     /// /dev/urandom — reads return LFSR pseudo-random bytes.
     DevUrandom,
-    /// /dev/stdin|stdout|stderr — proxy to fd 0/1/2 of the owning process.
+    /// The machine console, as reached through a descriptor: a dup of a raw
+    /// (untracked) fd 0-2, `/dev/console`, `/dev/tty` with no controlling
+    /// pty, or `/dev/std*` opened while that fd was the raw console.
+    /// `target_fd` only records which stdio name it was made from (for
+    /// /proc/self/fd); it is NOT a live link to that slot. A descriptor names
+    /// an object, fixed when it is created: following the slot made
+    /// `cmd 2>&1 >FILE` send stderr into FILE once fd 1 was redirected, and
+    /// `/dev/console` write into whatever file stdin had been redirected from.
     DevStdio { target_fd: usize },
     /// /dev/fb0 — linear framebuffer.
     DevFb { pos: usize },
@@ -1397,27 +1407,21 @@ pub fn fd_is_console_stdio(pid: u32, fd: usize) -> bool {
     if fd >= MAX_FDS { return false; }
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return false };
-    let mut cur = fd;
-    // Follow at most a few proxy hops (cycles collapse to "console").
-    for _ in 0..4 {
-        if !tbl.fds[cur].in_use { return cur <= 2; }
-        match tbl.fds[cur].kind {
-            VnodeKind::DevStdio { target_fd } => {
-                if target_fd == cur { return true; }
-                cur = target_fd;
-            }
-            // A virtual console IS the console: writes land on the active VT
-            // (the mirror `vt::console_out` feeds), reads take console input.
-            VnodeKind::DevVt { .. } => return true,
-            // Everything else — including a `Pty` on fd 0/1/2, which is a
-            // terminal but emphatically NOT *this* terminal. Answering true
-            // for one would hand every read and write on a shell's pty stdio
-            // to the kernel's serial fast path, and the pty would never see a
-            // byte.
-            _ => return false,
-        }
+    if !tbl.fds[fd].in_use { return fd <= 2; }
+    match tbl.fds[fd].kind {
+        // A console proxy is the console itself — never a link to whatever
+        // its `target_fd` slot holds now (see `VnodeKind::DevStdio`).
+        VnodeKind::DevStdio { .. } => true,
+        // A virtual console IS the console: writes land on the active VT
+        // (the mirror `vt::console_out` feeds), reads take console input.
+        VnodeKind::DevVt { .. } => true,
+        // Everything else — including a `Pty` on fd 0/1/2, which is a
+        // terminal but emphatically NOT *this* terminal. Answering true
+        // for one would hand every read and write on a shell's pty stdio
+        // to the kernel's serial fast path, and the pty would never see a
+        // byte.
+        _ => false,
     }
-    true
 }
 
 /// Transfer ownership of a mounted-file fd out of `pid`'s FD table.
@@ -2847,6 +2851,8 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_MKDIR        => handle_mkdir(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         VFS_MKNOD        => handle_mknod(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         VFS_FTRUNCATE    => handle_ftruncate(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
+        VFS_FALLOCATE    => handle_fallocate(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32,
+                                             arg(msg,2) as i64, arg(msg,3) as i64),
         VFS_FSYNC        => handle_fsync(caller_pid, arg(msg,0) as usize),
         VFS_SYNC         => handle_sync(),
         VFS_RENAME       => handle_rename(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize,
@@ -3793,7 +3799,18 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, m.fstype.as_bytes());
         p = write_lit(buf, p, b" rw 0 0\n");
-        if p >= buf.len() { p = start; break; }
+        if p >= buf.len() { return start; }
+    }
+    // The in-memory tmpfs roots are served by this server rather than a
+    // registered mount, but they are mounts all the same (statfs answers
+    // TMPFS_MAGIC for them). Without these lines `df /tmp` matched "/" and
+    // reported the root f2fs volume.
+    for root in TMPFS_ROOTS.iter() {
+        let start = p;
+        p = write_lit(buf, p, b"tmpfs ");
+        p = write_lit(buf, p, root);
+        p = write_lit(buf, p, b" tmpfs rw 0 0\n");
+        if p >= buf.len() { return start; }
     }
     p
 }
@@ -3822,7 +3839,20 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, m.device.as_bytes());
         p = write_lit(buf, p, b" rw\n");
-        if p >= buf.len() { p = start; break; }
+        if p >= buf.len() { return start; }
+        mount_id += 1;
+    }
+    // tmpfs roots — see write_mtab_lines. Each gets its own minor so `df`
+    // (which de-duplicates mounts by device number) lists all of them.
+    for root in TMPFS_ROOTS.iter() {
+        let start = p;
+        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" 1 0:");
+        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" / ");
+        p = write_lit(buf, p, root);
+        p = write_lit(buf, p, b" rw,relatime - tmpfs tmpfs rw\n");
+        if p >= buf.len() { return start; }
         mount_id += 1;
     }
     p
@@ -4786,16 +4816,46 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
     if let VnodeKind::TmpFile { idx, pos, ofd, .. } = &mut kind {
         if !TMP_FILES.lock()[*idx].is_dir { *ofd = tmp_ofd_alloc(*pos); }
     }
+    // `/dev/stdin|stdout|stderr` name whatever object fd 0/1/2 holds at the
+    // moment of the open (Linux reopens it through /proc/self/fd/N; the BSDs
+    // dup it, which is what this does — the copy shares the description).
+    // Only a raw-console fd 0-2 yields a console proxy. The proxy used to
+    // follow the slot forever, so `exec 3>/dev/stdout; exec >FILE` sent fd 3
+    // into FILE as well.
+    let std_alias = match should_lookup_ramfs(path) {
+        Some(b"/dev/stdin")  => Some(0usize),
+        Some(b"/dev/stdout") => Some(1usize),
+        Some(b"/dev/stderr") => Some(2usize),
+        _ => None,
+    };
+    let mut aliased = false;
     let installed = {
         let mut tbls = FD_TABLES.lock();
         match get_or_create(pid, &mut *tbls) {
             None => Err(-23), // ENFILE: fd-table pool full
-            Some(tbl) => match tbl.alloc_fd() {
-                None     => Err(-24),
-                Some(fd) => { tbl.fds[fd] = FdEntry { kind, flags, in_use: true }; Ok(fd) }
-            },
+            Some(tbl) => {
+                if let Some(t) = std_alias {
+                    if tbl.fds[t].in_use && !matches!(tbl.fds[t].kind,
+                        VnodeKind::DevStdio { .. } | VnodeKind::DevVt { .. } | VnodeKind::None) {
+                        kind = tbl.fds[t].kind;
+                        aliased = true;
+                    }
+                }
+                match tbl.alloc_fd() {
+                    None     => Err(-24),
+                    Some(fd) => { tbl.fds[fd] = FdEntry { kind, flags, in_use: true }; Ok(fd) }
+                }
+            }
         }
     };
+    if aliased {
+        // A second descriptor on fd N's object: take the reference dup takes.
+        // On failure nothing was claimed, so there is nothing to release.
+        return match installed {
+            Ok(fd) => { pipe_ref_inc(&kind); val_reply(fd as u64) }
+            Err(e) => err_reply(e),
+        };
+    }
     match installed {
         Ok(fd) => val_reply(fd as u64),
         Err(e) => {
@@ -4857,8 +4917,23 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
         VnodeKind::DevNull =>
             val_reply(0),
         VnodeKind::DevZero => {
-            let n = count.min(4096);
-            unsafe { buf.write_bytes(0, n); }
+            // Whole request in one read, as on Linux (bounded by its
+            // MAX_RW_COUNT). The kernel prefaulted the full buffer; the table
+            // lock is dropped before the user memory is touched. This used to
+            // stop at 4 KiB, so `dd bs=1M` saw only short reads.
+            const MAX_RW_COUNT: usize = 0x7fff_f000;
+            drop(tbls);
+            let n = count.min(MAX_RW_COUNT);
+            // Fault-tolerant page-sized copies from the shared zero page: a
+            // fault ends the read short (EFAULT if nothing was written).
+            let mut done = 0usize;
+            while done < n {
+                let cnt = (n - done).min(4096);
+                if unsafe { sched::uaccess::copy_raw(buf.add(done), TMP_ZERO_PAGE.as_ptr(), cnt) } != 0 {
+                    return if done > 0 { val_reply(done as u64) } else { err_reply(-14) };
+                }
+                done += cnt;
+            }
             val_reply(n as u64)
         }
         VnodeKind::DevUrandom => {
@@ -4866,16 +4941,13 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             for i in 0..n { unsafe { *buf.add(i) = lfsr_next(); } }
             val_reply(n as u64)
         }
-        VnodeKind::DevStdio { target_fd } => {
-            let tfd = *target_fd;
-            // Same console/recursion guard as the write arm.
-            let target_is_proxy = tfd < MAX_FDS && tbl.fds[tfd].in_use
-                && matches!(tbl.fds[tfd].kind, VnodeKind::DevStdio { .. });
-            let target_tracked = tfd < MAX_FDS && tbl.fds[tfd].in_use;
+        VnodeKind::DevStdio { .. } => {
+            // The console is served by the kernel's fast path (sys_read
+            // consults fd_is_console_stdio before routing here). Never
+            // re-enter on the `target_fd` slot: it may name a different
+            // object now (see `VnodeKind::DevStdio`).
             drop(tbls);
-            if !target_tracked || target_is_proxy { return err_reply(-9); }
-            // Re-enter as read on the target fd.
-            handle_read(pid, tfd, buf_ptr, count)
+            err_reply(-9)
         }
         VnodeKind::DevVt { vt, seen } => {
             if *vt == 0 {
@@ -5333,17 +5405,12 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::EVENTFD, slot as u32));
             val_reply(8)
         }
-        VnodeKind::DevStdio { target_fd } => {
-            let tfd = *target_fd;
-            // Console targets are served by the kernel's serial fast path
+        VnodeKind::DevStdio { .. } => {
+            // Console output is served by the kernel's serial fast path
             // (sys_write consults fd_is_console_stdio before routing here);
-            // recursing into another DevStdio would loop forever.
-            let target_is_proxy = tfd < MAX_FDS && tbl.fds[tfd].in_use
-                && matches!(tbl.fds[tfd].kind, VnodeKind::DevStdio { .. });
-            let target_tracked = tfd < MAX_FDS && tbl.fds[tfd].in_use;
+            // see the read arm for why the `target_fd` slot is not followed.
             drop(tbls);
-            if !target_tracked || target_is_proxy { return err_reply(-9); }
-            handle_write(pid, tfd, buf_ptr, count)
+            err_reply(-9)
         }
         VnodeKind::DevVt { .. } => {
             // Every /dev/ttyN write is a console write, including one to a VT
@@ -5625,7 +5692,11 @@ fn handle_lseek(pid: u32, fd: usize, offset: i64, whence: u32) -> Message {
             proxy.data[16..24].copy_from_slice(&(whence as u64).to_le_bytes());
             call_port(port, proxy)
         }
-        _ => err_reply(-29), // ESPIPE — not seekable (pipes, devnull, etc.)
+        // Linux's null/zero/random char devices accept any seek and report
+        // offset 0 (`noop_llseek` / `null_lseek`). uutils dd seeks its output
+        // even for `of=/dev/null` and aborted with "Invalid seek" on ESPIPE.
+        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom => val_reply(0),
+        _ => err_reply(-29), // ESPIPE — not seekable (pipes, ttys, etc.)
     }
 }
 
@@ -7476,6 +7547,85 @@ fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
             call_port(port, proxy)
         }
         _ => err_reply(-22),
+    }
+}
+
+/// fallocate(fd, mode, offset, len).
+///
+/// Supported modes are 0, `FALLOC_FL_KEEP_SIZE` and `FALLOC_FL_PUNCH_HOLE |
+/// FALLOC_FL_KEEP_SIZE` (the last on tmpfs only); anything else is
+/// EOPNOTSUPP, exactly the answer Linux gives for a mode a filesystem lacks.
+/// This used to be a kernel-side `0`, so posix_fallocate "succeeded" while
+/// leaving the file at its old size.
+///
+/// tmpfs really allocates: every page of the range becomes a charged frame
+/// (ENOSPC against the tmpfs budget), and mode 0 moves EOF to the end of the
+/// range. A punched range reads back as zeros and its whole pages are freed.
+fn handle_fallocate(pid: u32, fd: usize, mode: u32, offset: i64, len: i64) -> Message {
+    const FALLOC_FL_KEEP_SIZE:  u32 = 0x01;
+    const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+    if offset < 0 || len <= 0 { return err_reply(-22); } // EINVAL
+    let punch = mode == FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+    if mode != 0 && mode != FALLOC_FL_KEEP_SIZE && !punch { return err_reply(-95); } // EOPNOTSUPP
+    let end = match (offset as u64).checked_add(len as u64) {
+        Some(e) if e <= i64::MAX as u64 => e as usize,
+        _ => return err_reply(-27), // EFBIG
+    };
+    let offset = offset as usize;
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if tbl.fds[fd].flags & O_PATH != 0 { return err_reply(-9); }
+    let kind = tbl.fds[fd].kind;
+    drop(tbls);
+    match kind {
+        VnodeKind::TmpFile { writable, .. } => {
+            let idx = tmp_idx_of(&kind);
+            let mut tmp = TMP_FILES.lock();
+            if tmp[idx].is_dir { return err_reply(-21); } // EISDIR
+            if !writable { return err_reply(-9); }
+            if end > MAX_TMP_FILE_SIZE { return err_reply(-27); } // EFBIG
+            let mut vmos = TMP_VMOS.lock();
+            let len = tmp[idx].len;
+            let vmo = vmos[idx].get_or_insert_with(|| { let mut v = TmpVmo::new_owned(false); v.len = len; v });
+            // A dmabuf export's frames belong to the DRM layer.
+            if vmo.borrowed { return err_reply(-19); } // ENODEV
+            if punch {
+                // Zero what the range covers in existing frames, then drop the
+                // pages it covers whole. Bounded by the page list, so punching
+                // far past the data costs nothing.
+                vmo_zero_range(vmo, offset, end);
+                let first = (offset + 4095) / 4096;
+                let last = (end / 4096).min(vmo.pages.len()); // exclusive
+                for i in first..last.max(first) {
+                    let phys = core::mem::replace(&mut vmo.pages[i], 0);
+                    tmp_page_put(phys);
+                }
+                while vmo.pages.last() == Some(&0) { vmo.pages.pop(); }
+            } else {
+                // Bytes between the old EOF and the range in an existing
+                // frame must read as zeros once EOF moves past them.
+                if mode == 0 && end > len { vmo_zero_range(vmo, len, end); }
+                for i in offset / 4096..(end + 4095) / 4096 {
+                    if let Err(e) = vmo.ensure_page(i, true) { return make_reply(e); }
+                }
+                if mode == 0 && end > len { vmo.len = end; tmp[idx].len = end; }
+            }
+            tmp_touch_mtime(&mut tmp[idx]);
+            ok_reply()
+        }
+        VnodeKind::MountedFile { port, file_id } => {
+            if punch { return err_reply(-95); } // EOPNOTSUPP
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_FALLOCATE;
+            proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&(mode as u64).to_le_bytes());
+            proxy.data[16..24].copy_from_slice(&(offset as u64).to_le_bytes());
+            proxy.data[24..32].copy_from_slice(&((end - offset) as u64).to_le_bytes());
+            call_port(port, proxy)
+        }
+        VnodeKind::Pipe { .. } => err_reply(-29), // ESPIPE
+        _ => err_reply(-19), // ENODEV — not a regular file
     }
 }
 
