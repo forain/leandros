@@ -5998,6 +5998,9 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
 fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
     let pid = current_pid();
     let end = last.min(1023);
+    // Registrations first, while the numbers still name the files being
+    // closed (see `epoll_release_fd`).
+    if first <= end { epoll_drop_range(sched::current_tgid(), first, end); }
     for fd in first..=end {
         let msg = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]);
         let _ = vfs::handle(&msg, pid);
@@ -6101,6 +6104,12 @@ fn sys_close(fd: usize) -> isize {
     if fd >= EPOLL_FD_BASE && fd < EPOLL_FD_BASE + MAX_EPOLL_FDS {
         return sys_epoll_close(fd);
     }
+    // The fd's epoll registrations go BEFORE the close: once the VFS frees the
+    // number, a sibling thread can be handed it for a new file and register
+    // that — a forget after the close would then delete the newcomer's
+    // registration (measured: a notify/mio waker lost that way hung
+    // cosmic-term's exit in tokio's blocking-pool shutdown).
+    epoll_release_fd(pid, sched::current_tgid(), fd);
     // Route socket fds (≥ SOCK_FD_BASE) to the net server.
     if fd >= net_server::SOCK_FD_BASE {
         let msg = make_vfs_msg(net_server::NET_CLOSE, &[fd as u64]);
@@ -6935,6 +6944,12 @@ fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     let pid = current_pid();
     // If newfd == u64::MAX this is sys_dup (allocate any free fd).
     let tag = if newfd == usize::MAX { vfs::VFS_ALLOC_FD } else { vfs::VFS_DUP2 };
+    // dup2/dup3 onto an open newfd closes the file that was there: its epoll
+    // registrations go with it, before the number is reused (Linux keys them
+    // by file, and the file that lands on newfd was never registered).
+    if newfd != usize::MAX && newfd != oldfd && vfs::vfs_get_node_kind(pid, oldfd).is_some() {
+        epoll_release_fd(pid, sched::current_tgid(), newfd);
+    }
     let msg = make_vfs_msg(tag, &[oldfd as u64, newfd as u64, flags as u64]);
     let r = vfs_reply_val(&vfs::handle(&msg, pid));
     trace_fd("dup3", oldfd, newfd, flags, r);
@@ -8743,6 +8758,33 @@ fn dump_epoll_census() {
         None => ps(" fds=busy"),
     }
     ps("\n");
+    // Diagnostic (termsegv): every live epoll instance, its fd aliases and
+    // its interests (fd:events:armed), so a waiter that never wakes can be
+    // checked for a missing registration vs a lost wake.
+    if EPOLL_DUMP_INTERESTS {
+        let mut got = None;
+        for _ in 0..100_000 {
+            if let Some(ep) = EPOLL_INSTANCES.try_lock() {
+                if let Some(t) = EPOLL_FDS.try_lock() { got = Some((ep, t)); break; }
+            }
+            core::hint::spin_loop();
+        }
+        if got.is_none() { ps("[EPI] busy\n"); }
+        if let Some((ep, t)) = got {
+            for (i, inst) in ep.iter().enumerate() {
+                if !inst.in_use { continue; }
+                ps("[EPI] s="); pn(i); ps(" tgid="); pn(inst.owner_tgid as usize); ps(" epfd=");
+                for (j, e) in t.iter().enumerate() { if e.in_use && e.slot as usize == i { pn(EPOLL_FD_BASE + j); ps(","); } }
+                ps(" :");
+                for it in inst.interests[..inst.hi as usize].iter() {
+                    if !it.in_use { continue; }
+                    ps(" "); pn(it.fd as usize); ps("/"); pn(it.events as usize);
+                    if !it.armed { ps("/off"); }
+                }
+                ps("\n");
+            }
+        }
+    }
     let mut per = [(0u32, 0u32); 16];
     if let Some((n, objs)) = drivers::drm_device_interface::blob_census(&mut per) {
         ps("[DRMH] blob_objs="); pn(objs);
@@ -9031,6 +9073,14 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
                 Some(s) => s != interest.last_seq,
                 None    => true,
             });
+            // POLLNVAL: the number is not open (any more). Linux has no
+            // EPOLLNVAL — a released file's registration is gone — so a
+            // registration that outlived its fd (a close path that does not
+            // go through `epoll_release_fd`, e.g. exec's close-on-exec
+            // sweep, or a close racing this snapshot) reports nothing. It is
+            // left in place, not removed: a probe can also miss a live fd
+            // transiently, and a removed registration never comes back.
+            if cur & POLLNVAL_EP != 0 { continue; }
             if fire {
                 let off = n * EPOLL_EVENT_SIZE;
                 unsafe {
@@ -9081,6 +9131,90 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
     }
 }
 
+/// Ctrl-T: list every epoll instance's interests (diagnostic, off by default:
+/// it is one line per live instance).
+const EPOLL_DUMP_INTERESTS: bool = false;
+
+/// `poll(2)`'s POLLNVAL as the probes report it for an fd that is not open.
+const POLLNVAL_EP: u32 = 0x0020;
+
+/// Release `fd`'s epoll registrations in thread group `tgid` because `fd` is
+/// about to be closed (or overwritten by dup2/dup3). Call it BEFORE the close.
+///
+/// Linux keys an epoll item by (file, fd) and removes it when the *file* is
+/// released (`eventpoll_release`): a closed fd never wakes or reports anything
+/// again, and `epoll_wait` has no EPOLLNVAL at all. This table keys interests
+/// by fd number only and nothing removed them on close, so the probe asked
+/// about a dead number, got EBADF, and reported POLLNVAL to every waiter of
+/// the instance — and once the number was reused, probed the new file under
+/// the old registration.
+///
+/// That is what made closing cosmic-term windows crash (lane termsegv,
+/// 2026-10-01). On exit the main thread disconnects its `wl_display` (closes
+/// the Wayland socket) and frees it while iced's SCTK event-loop thread is
+/// parked in epoll_wait on the same socket. The close woke that thread,
+/// epoll_wait handed it the socket with POLLNVAL, and it dispatched through
+/// the freed display: a write to NULL+0x254 in `wl_map_insert_at`, SIGSEGV.
+/// On Linux the thread sleeps on until exit_group takes it. (The thread can
+/// still lose the same race when real compositor traffic wakes it during the
+/// teardown — that use-after-free is the application's, and Linux has it too.)
+///
+/// If another fd of the same process still names the same open object (a
+/// dup), the registration moves to that fd instead of being dropped — on
+/// Linux the file is still alive and keeps reporting. A file kept alive only
+/// by another process (a forked child's copy) is dropped; this table cannot
+/// probe it through this process's fds.
+fn epoll_release_fd(pid: u32, tgid: u32, fd: usize) {
+    if !epoll_watches_fd(tgid, fd) { return; }
+    // Outside EPOLL_INSTANCES: the alias lookup takes the VFS fd-table lock.
+    let alias = if fd < net_server::SOCK_FD_BASE {
+        vfs::vfs_get_node_kind(pid, fd).and_then(|k| vfs::find_alias_fd(pid, &k, fd))
+    } else { None };
+    let mut ep = EPOLL_INSTANCES.lock();
+    let mut changed = false;
+    for inst in ep.iter_mut() {
+        if !inst.in_use || inst.owner_tgid != tgid { continue; }
+        let n = inst.hi as usize;
+        let alias_free = alias.map_or(false, |a| !inst.interests[..n].iter().any(|x| x.in_use && x.fd == a as i32));
+        for it in inst.interests[..n].iter_mut() {
+            if it.in_use && it.fd == fd as i32 {
+                match alias {
+                    Some(a) if alias_free => it.fd = a as i32,
+                    _ => *it = EpollInterest::empty(),
+                }
+                changed = true;
+            }
+        }
+    }
+    if changed { EPOLL_CTL_GEN.fetch_add(1, Ordering::AcqRel); }
+}
+
+/// `epoll_release_fd` for every fd in `lo..=hi` (close_range), without the
+/// alias search: the whole range is going.
+fn epoll_drop_range(tgid: u32, lo: usize, hi: usize) {
+    let mut ep = EPOLL_INSTANCES.lock();
+    let mut changed = false;
+    for inst in ep.iter_mut() {
+        if !inst.in_use || inst.owner_tgid != tgid { continue; }
+        let n = inst.hi as usize;
+        for it in inst.interests[..n].iter_mut() {
+            if it.in_use && it.fd >= 0 && (lo..=hi).contains(&(it.fd as usize)) {
+                *it = EpollInterest::empty();
+                changed = true;
+            }
+        }
+    }
+    if changed { EPOLL_CTL_GEN.fetch_add(1, Ordering::AcqRel); }
+}
+
+/// Does any epoll instance of `tgid` have a registration on `fd`? (The cheap
+/// pre-check that keeps an ordinary close from paying for the alias search.)
+fn epoll_watches_fd(tgid: u32, fd: usize) -> bool {
+    let ep = EPOLL_INSTANCES.lock();
+    ep.iter().any(|inst| inst.in_use && inst.owner_tgid == tgid
+        && inst.interests[..inst.hi as usize].iter().any(|i| i.in_use && i.fd == fd as i32))
+}
+
 /// Read-only readiness check for the block-loop re-probe: like the epoll_wait
 /// probe but mutates no `last_seq` and writes no user memory, so cancelling the
 /// block and looping re-delivers the edge instead of consuming it silently.
@@ -9096,6 +9230,7 @@ fn epoll_any_ready_nested(pid: u32, slot: usize, depth: u32) -> bool {
         if !interest.in_use || !interest.armed { continue; }
         let (cur, seq, _tag) =
             probe_fd_events_seq_nested(pid, interest.fd as usize, interest.events, depth);
+        if cur & POLLNVAL_EP != 0 { continue; } // closed fd: never ready (see epoll_wait_until)
         let et = interest.events & EPOLLET != 0;
         let fire = cur != 0 && (!et || match seq {
             Some(s) => s != interest.last_seq,

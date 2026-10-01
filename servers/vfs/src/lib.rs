@@ -1443,6 +1443,34 @@ pub fn steal_mounted_file(pid: u32, fd: usize) -> Option<(u32, u32)> {
     }
 }
 
+/// The open object behind an fd, as (kind tag, object id), for the kinds whose
+/// object is shared by `dup`/fork: two fds with the same identity name the
+/// same open file. None for kinds with no shared object id.
+pub fn fd_object_identity(k: &VnodeKind) -> Option<(u8, u64)> {
+    match *k {
+        VnodeKind::Pipe { ring, is_write } => Some((1, (ring as u64) << 1 | is_write as u64)),
+        VnodeKind::Pty { pair, is_master } => Some((2, (pair as u64) << 1 | is_master as u64)),
+        VnodeKind::TmpFile { idx, .. } => Some((3, idx as u64)),
+        VnodeKind::EventFd { slot } => Some((4, slot as u64)),
+        VnodeKind::TimerFd { slot } => Some((5, slot as u64)),
+        VnodeKind::DynamicDevice { port, open_id, .. } => Some((6, (port as u64) << 32 | open_id as u64)),
+        VnodeKind::MountedFile { port, file_id } => Some((7, (port as u64) << 32 | file_id as u64)),
+        _ => None,
+    }
+}
+
+/// Another open fd of `pid`'s process, other than `except`, naming the same
+/// object as `kind` (see `fd_object_identity`), if any. The epoll layer uses
+/// it to keep a registration alive across close() of one of two dups.
+pub fn find_alias_fd(pid: u32, kind: &VnodeKind, except: usize) -> Option<usize> {
+    let id = fd_object_identity(kind)?;
+    let pid = sched::tgid_of(pid);
+    let mut tbls = FD_TABLES.lock();
+    let tbl = find_tbl(pid, &mut *tbls)?;
+    tbl.fds.iter().enumerate()
+        .position(|(i, f)| i != except && f.in_use && fd_object_identity(&f.kind) == Some(id))
+}
+
 /// Identify the kind of a vnode from a process's FD table.
 pub fn vfs_get_node_kind(pid: u32, fd: usize) -> Option<VnodeKind> {
     let pid = sched::tgid_of(pid); // fd tables are per-process, not per-thread:

@@ -231,6 +231,7 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64, frame: *mut u64) {
         let is_translation = (0x04..=0x07).contains(&dfsc);
         let is_permission  = (0x0D..=0x0F).contains(&dfsc);
         let is_write = (esr >> 6) & 1 != 0;
+        sched::note_fault_pc(elr as usize);
         if (is_translation || is_permission)
             && sched::handle_page_fault(far as usize, is_write)
         {
@@ -306,6 +307,7 @@ unsafe extern "C" fn exc_el0_sync_handler(esr: u64, elr: u64, frame: *mut UserFr
             let is_translation = (0x04..=0x07).contains(&dfsc);
             let is_permission  = (0x0D..=0x0F).contains(&dfsc);
             let is_write = ec == 0x24 && (esr >> 6) & 1 != 0;
+            sched::note_fault_pc(elr as usize);
             if (is_translation || is_permission) && sched::handle_page_fault(far as usize, is_write) {
                 return; // page mapped — resume EL0 and retry the faulting access
             }

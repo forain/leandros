@@ -476,6 +476,7 @@ extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, e
     if vector == 14 {
         const USER_VA_LIMIT: u64 = 0x0000_8000_0000_0000;
         let is_write = error_code & 2 != 0;
+        sched::note_fault_pc(frame.rip as usize);
         if (from_user || cr2 < USER_VA_LIMIT) && sched::handle_page_fault(cr2 as usize, is_write) {
             return; // fault handled — resume the interrupted instruction
         }
