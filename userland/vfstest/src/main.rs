@@ -799,6 +799,18 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_atime_relatime(b"/tmp/xa", b"atime_relatime_tmpfs\0") { failures += 1; }
     if !test_atime_relatime(b"/data/xa", b"atime_relatime_f2fs\0") { failures += 1; }
 
+    // tmpfs file size (lane tmpcap): files grow page by page, bounded by the
+    // tmpfs page budget, instead of a fixed 32 KiB in-struct array.
+    if !test_tmpfs_large_rw() { failures += 1; }
+    if !test_tmpfs_sparse_hole() { failures += 1; }
+    if !test_tmpfs_truncate() { failures += 1; }
+    if !test_tmpfs_append_big() { failures += 1; }
+    if !test_tmpfs_cp_multi_mb() { failures += 1; }
+    if !test_tmpfs_unlink_frees() { failures += 1; }
+    if !test_tmpfs_mmap_sparse() { failures += 1; }
+    if !test_tmpfs_shared_offset() { failures += 1; }
+    if !test_tmpfs_enospc() { failures += 1; }
+
     puts(b"--- vfstest done ---\0".as_ptr());
     failures
 }
@@ -1326,4 +1338,367 @@ unsafe fn report(name: &[u8], passed: bool) -> bool {
         write(STDOUT_FILENO, b": FAIL\n".as_ptr(), 7);
     }
     passed
+}
+
+// ── tmpfs file size (lane tmpcap) ───────────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")] const SYS_FTRUNCATE: usize = 46;
+#[cfg(target_arch = "x86_64")]  const SYS_FTRUNCATE: usize = 77;
+#[cfg(target_arch = "aarch64")] const SYS_FSTAT: usize = 80;
+#[cfg(target_arch = "x86_64")]  const SYS_FSTAT: usize = 5;
+#[cfg(target_arch = "aarch64")] const SYS_STATFS: usize = 43;
+#[cfg(target_arch = "x86_64")]  const SYS_STATFS: usize = 137;
+#[cfg(target_arch = "aarch64")] const SYS_PWRITE64: usize = 68;
+#[cfg(target_arch = "x86_64")]  const SYS_PWRITE64: usize = 18;
+// st_size / st_blocks: same offsets in both ABIs' `struct stat`.
+const STAT_SIZE_OFF: usize = 48;
+const STAT_BLOCKS_OFF: usize = 64;
+const SEEK_DATA: i32 = 3;
+const SEEK_HOLE: i32 = 4;
+const EFBIG: i32 = 27;
+/// The kernel's per-file limit (`MAX_TMP_FILE_SIZE` in servers/vfs).
+const TMP_FILE_MAX: usize = 16 << 30;
+
+static mut BUF_A: [u8; 65536] = [0u8; 65536];
+static mut BUF_B: [u8; 65536] = [0u8; 65536];
+
+/// Deterministic, offset-dependent fill so a misplaced page shows up.
+fn pat(off: usize) -> u8 { ((off.wrapping_mul(2654435761) >> 13) ^ (off >> 12)) as u8 }
+
+unsafe fn raw_ftruncate(fd: i32, len: usize) -> isize { xret(syscall2(SYS_FTRUNCATE, fd as usize, len)) }
+unsafe fn raw_pwrite(fd: i32, buf: *const u8, n: usize, off: usize) -> isize {
+    xret(syscall4(SYS_PWRITE64, fd as usize, buf as usize, n, off))
+}
+/// (st_size, st_blocks) of an open fd.
+unsafe fn raw_fsize(fd: i32) -> Option<(u64, u64)> {
+    let mut buf = [0u8; STAT_SIZE];
+    if syscall2(SYS_FSTAT, fd as usize, buf.as_mut_ptr() as usize) < 0 { return None; }
+    Some((core::ptr::read_unaligned(buf.as_ptr().add(STAT_SIZE_OFF) as *const u64),
+          core::ptr::read_unaligned(buf.as_ptr().add(STAT_BLOCKS_OFF) as *const u64)))
+}
+/// Free 4 KiB blocks on /tmp (statfs f_bfree).
+unsafe fn tmp_bfree() -> Option<u64> {
+    let mut buf = [0u8; 128];
+    if syscall2(SYS_STATFS, b"/tmp\0".as_ptr() as usize, buf.as_mut_ptr() as usize) < 0 { return None; }
+    Some(core::ptr::read_unaligned(buf.as_ptr().add(24) as *const u64))
+}
+/// Write `total` pattern bytes from the current position in `chunk`-sized
+/// writes. `base` is the file offset of the first byte (for the pattern).
+unsafe fn fill_pat(fd: i32, base: usize, total: usize, chunk: usize) -> bool {
+    let mut done = 0;
+    while done < total {
+        let n = chunk.min(total - done).min(65536);
+        for i in 0..n { BUF_A[i] = pat(base + done + i); }
+        if write(fd, BUF_A.as_ptr(), n) != n as isize { return false; }
+        done += n;
+    }
+    true
+}
+/// Read `total` bytes from the current position and compare to the pattern.
+unsafe fn check_pat(fd: i32, base: usize, total: usize) -> bool {
+    let mut done = 0;
+    while done < total {
+        let want = (total - done).min(65536);
+        let r = read(fd, BUF_B.as_mut_ptr(), want);
+        if r <= 0 { return false; }
+        for i in 0..r as usize { if BUF_B[i] != pat(base + done + i) { return false; } }
+        done += r as usize;
+    }
+    // ...and EOF right after.
+    read(fd, BUF_B.as_mut_ptr(), 1) == 0
+}
+
+/// 3 MiB — about a hundred times the old 32 KiB cap — written in one 1 MiB
+/// write plus odd-sized chunks, then read back byte-exact; a single read()
+/// of 1 MiB must come back whole (regular files do not short-read).
+unsafe fn test_tmpfs_large_rw() -> bool {
+    let name = b"tmpfs_large_rw\0";
+    let path = b"/tmp/vt_large\0".as_ptr();
+    let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    let total = 3 << 20;
+    // One big write straight from a mapping-sized region.
+    let big = mmap(core::ptr::null_mut(), 1 << 20, 3, 0x22, -1, 0);
+    let mut ok = big as isize != -1;
+    if ok {
+        for i in 0..(1 << 20) { *big.add(i) = pat(i); }
+        ok = write(fd, big, 1 << 20) == 1 << 20;
+    }
+    ok = ok && fill_pat(fd, 1 << 20, total - (1 << 20), 12345);
+    ok = ok && raw_fsize(fd).map(|s| s.0) == Some(total as u64);
+    ok = ok && lseek(fd, 0, 0) == 0;
+    if ok {
+        for i in 0..(1 << 20) { *big.add(i) = 0; }
+        ok = read(fd, big, 1 << 20) == 1 << 20;
+        for i in 0..(1 << 20) { if ok && *big.add(i) != pat(i) { ok = false; } }
+    }
+    ok = ok && check_pat(fd, 1 << 20, total - (1 << 20));
+    if big as isize != -1 { munmap(big, 1 << 20); }
+    close(fd);
+    unlink(path);
+    report(name, ok)
+}
+
+/// lseek past EOF + write leaves a hole that reads as zeros, costs no pages
+/// (st_blocks), and is reported by SEEK_DATA/SEEK_HOLE; writes at and past the
+/// 16 GiB file limit are EFBIG.
+unsafe fn test_tmpfs_sparse_hole() -> bool {
+    let name = b"tmpfs_sparse_hole\0";
+    let path = b"/tmp/vt_sparse\0".as_ptr();
+    let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    let off = (8 << 20) + 123;
+    let mut ok = lseek(fd, off as i64, 0) == off as i64;
+    ok = ok && write(fd, b"X".as_ptr(), 1) == 1;
+    ok = ok && raw_fsize(fd) == Some(((off + 1) as u64, 8)); // one page
+    // The hole reads back as zeros, in one read across many pages.
+    ok = ok && lseek(fd, (off - 40000) as i64, 0) >= 0;
+    ok = ok && read(fd, BUF_B.as_mut_ptr(), 40001) == 40001;
+    for i in 0..40000 { if ok && BUF_B[i] != 0 { ok = false; } }
+    ok = ok && BUF_B[40000] == b'X';
+    ok = ok && lseek(fd, 0, SEEK_DATA) == (8 << 20);
+    ok = ok && lseek(fd, 0, SEEK_HOLE) == 0;
+    ok = ok && lseek(fd, (8 << 20) as i64, SEEK_HOLE) == (off + 1) as i64;
+    // EFBIG at the limit, and a sparse write just below it works.
+    ok = ok && raw_pwrite(fd, b"Y".as_ptr(), 1, TMP_FILE_MAX) == -1 && get_errno() == EFBIG;
+    ok = ok && raw_ftruncate(fd, TMP_FILE_MAX + 1) == -1 && get_errno() == EFBIG;
+    ok = ok && raw_ftruncate(fd, 1 << 30) == 0;
+    ok = ok && raw_fsize(fd) == Some((1 << 30, 8));
+    close(fd);
+    unlink(path);
+    report(name, ok)
+}
+
+/// ftruncate shrink drops the tail (and its pages), grow exposes zeros —
+/// including over bytes that were written and then truncated away.
+unsafe fn test_tmpfs_truncate() -> bool {
+    let name = b"tmpfs_truncate\0";
+    let path = b"/tmp/vt_trunc\0".as_ptr();
+    let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    let mut ok = fill_pat(fd, 0, 100_000, 7000);
+    ok = ok && raw_fsize(fd) == Some((100_000, 200));
+    ok = ok && raw_ftruncate(fd, 5000) == 0;
+    ok = ok && raw_fsize(fd) == Some((5000, 16)); // pages 0 and 1
+    ok = ok && raw_ftruncate(fd, 70_000) == 0;
+    ok = ok && raw_fsize(fd).map(|s| s.0) == Some(70_000);
+    ok = ok && lseek(fd, 0, 0) == 0 && read(fd, BUF_B.as_mut_ptr(), 65536) == 65536;
+    for i in 0..65536 {
+        let want = if i < 5000 { pat(i) } else { 0 };
+        if ok && BUF_B[i] != want { ok = false; }
+    }
+    // O_TRUNC on reopen empties it and frees the pages.
+    close(fd);
+    let fd = open(path, O_RDWR | O_TRUNC, 0);
+    ok = ok && fd >= 0 && raw_fsize(fd) == Some((0, 0));
+    if fd >= 0 { close(fd); }
+    unlink(path);
+    report(name, ok)
+}
+
+/// O_APPEND well past 4 KiB and 32 KiB, from two descriptors in turn (what
+/// `cmd >>log 2>>log` does), lands every byte in order.
+unsafe fn test_tmpfs_append_big() -> bool {
+    let name = b"tmpfs_append_big\0";
+    let path = b"/tmp/vt_append\0".as_ptr();
+    let fd0 = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd0 >= 0 { close(fd0); }
+    let a = open(path, O_WRONLY | O_APPEND, 0);
+    let b = open(path, O_WRONLY | O_APPEND, 0);
+    let mut ok = a >= 0 && b >= 0;
+    let chunk = 6001;
+    let mut off = 0;
+    for k in 0..20 {
+        if !ok { break; }
+        let fd = if k % 2 == 0 { a } else { b };
+        ok = fill_pat(fd, off, chunk, chunk);
+        off += chunk;
+    }
+    if a >= 0 { close(a); }
+    if b >= 0 { close(b); }
+    let r = open(path, O_RDONLY, 0);
+    ok = ok && r >= 0 && raw_fsize(r).map(|s| s.0) == Some(off as u64) && check_pat(r, 0, off);
+    if r >= 0 { close(r); }
+    unlink(path);
+    report(name, ok)
+}
+
+/// What `cp` does: a 5 MiB source copied through a 64 KiB buffer into a new
+/// /tmp file, then compared. Also copies a real binary (a few MB) when one
+/// is installed, checking the sizes agree.
+unsafe fn test_tmpfs_cp_multi_mb() -> bool {
+    let name = b"tmpfs_cp_multi_mb\0";
+    let src = b"/tmp/vt_cp_src\0".as_ptr();
+    let dst = b"/tmp/vt_cp_dst\0".as_ptr();
+    let total = 5 << 20;
+    let s = open(src, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    let mut ok = s >= 0 && fill_pat(s, 0, total, 65536);
+    if s >= 0 { close(s); }
+    ok = ok && copy_file(src, dst) == Some(total);
+    let d = open(dst, O_RDONLY, 0);
+    ok = ok && d >= 0 && check_pat(d, 0, total);
+    if d >= 0 { close(d); }
+    unlink(src);
+    unlink(dst);
+    // A real executable, if this image ships one.
+    for bin in [b"/bin/brush\0".as_ptr(), b"/usr/bin/brush\0".as_ptr()] {
+        let f = open(bin, O_RDONLY, 0);
+        if f < 0 { continue; }
+        let sz = raw_fsize(f).map(|s| s.0 as usize).unwrap_or(0);
+        close(f);
+        let copied = copy_file(bin, dst);
+        ok = ok && sz > (1 << 20) && copied == Some(sz);
+        let d = open(dst, O_RDONLY, 0);
+        ok = ok && d >= 0 && raw_fsize(d).map(|s| s.0 as usize) == Some(sz);
+        if d >= 0 { close(d); }
+        unlink(dst);
+        break;
+    }
+    report(name, ok)
+}
+
+unsafe fn copy_file(src: *const u8, dst: *const u8) -> Option<usize> {
+    let s = open(src, O_RDONLY, 0);
+    if s < 0 { return None; }
+    let d = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if d < 0 { close(s); return None; }
+    let mut total = 0usize;
+    let ok = loop {
+        let r = read(s, BUF_A.as_mut_ptr(), 65536);
+        if r < 0 { break false; }
+        if r == 0 { break true; }
+        if write(d, BUF_A.as_ptr(), r as usize) != r { break false; }
+        total += r as usize;
+    };
+    close(s);
+    close(d);
+    if ok { Some(total) } else { None }
+}
+
+/// Pages come back to the tmpfs budget on unlink, and for an
+/// open-then-unlinked file only on its last close.
+unsafe fn test_tmpfs_unlink_frees() -> bool {
+    let name = b"tmpfs_unlink_frees\0";
+    let path = b"/tmp/vt_frees\0".as_ptr();
+    let size = 2 << 20; // 512 pages
+    let before = match tmp_bfree() { Some(v) => v, None => return report(name, false) };
+    let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    let mut ok = fd >= 0 && fill_pat(fd, 0, size, 65536);
+    if fd >= 0 { close(fd); }
+    let full = tmp_bfree().unwrap_or(0);
+    ok = ok && before.saturating_sub(full) >= 512;
+    ok = ok && unlink(path) == 0;
+    // Other processes may be using /tmp concurrently; allow a little slack.
+    let after = tmp_bfree().unwrap_or(0);
+    ok = ok && after + 16 >= before;
+    // open → unlink → (still readable) → close frees.
+    let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    ok = ok && fd >= 0 && fill_pat(fd, 0, size, 65536) && unlink(path) == 0;
+    let held = tmp_bfree().unwrap_or(0);
+    ok = ok && before.saturating_sub(held) >= 512;
+    ok = ok && lseek(fd, 0, 0) == 0 && check_pat(fd, 0, size);
+    if fd >= 0 { close(fd); }
+    let released = tmp_bfree().unwrap_or(0);
+    ok = ok && released + 16 >= before;
+    report(name, ok)
+}
+
+/// MAP_SHARED of a sparse, ftruncate-grown file: the mapping reads zeros,
+/// stores through it are seen by read(), and write() is seen by the mapping.
+unsafe fn test_tmpfs_mmap_sparse() -> bool {
+    let name = b"tmpfs_mmap_sparse\0";
+    let path = b"/tmp/vt_mmap\0".as_ptr();
+    let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    let len = 256 * 1024;
+    let mut ok = raw_ftruncate(fd, len) == 0;
+    ok = ok && raw_fsize(fd) == Some((len as u64, 0));
+    let m = mmap(core::ptr::null_mut(), len, 3, 1 /* MAP_SHARED */, fd, 0);
+    ok = ok && m as isize != -1;
+    if ok {
+        for i in (0..len).step_by(997) { if *m.add(i) != 0 { ok = false; } }
+        *m.add(200_000) = 0x5a;
+        ok = ok && lseek(fd, 200_000, 0) == 200_000 && read(fd, BUF_B.as_mut_ptr(), 1) == 1 && BUF_B[0] == 0x5a;
+        ok = ok && raw_pwrite(fd, b"Q".as_ptr(), 1, 70_000) == 1 && *m.add(70_000) == b'Q';
+        munmap(m, len);
+    }
+    close(fd);
+    unlink(path);
+    report(name, ok)
+}
+
+/// Fill /tmp to its page budget (half of RAM): the write that hits it is
+/// short or fails with ENOSPC, statfs reports it full, a /proc snapshot still
+/// opens (kernel-generated files are never budget-refused), and unlink gives
+/// every page back.
+unsafe fn test_tmpfs_enospc() -> bool {
+    let name = b"tmpfs_enospc\0";
+    let path = b"/tmp/vt_enospc\0".as_ptr();
+    let before = match tmp_bfree() { Some(v) => v, None => return report(name, false) };
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    for i in 0..65536 { BUF_A[i] = i as u8; }
+    let mut written = 0usize;
+    let mut errno = 0;
+    loop {
+        let r = write(fd, BUF_A.as_ptr(), 65536);
+        if r < 0 { errno = get_errno(); break; }
+        written += r as usize;
+        if r < 65536 { continue; } // short at the limit; the next one fails
+        if written > (64usize << 30) { break; } // runaway guard
+    }
+    let full = tmp_bfree().unwrap_or(u64::MAX);
+    let mut ok = errno == ENOSPC && written as u64 / 4096 + 64 >= before && full < 64;
+    let p = open(b"/proc/meminfo\0".as_ptr(), O_RDONLY, 0);
+    ok = ok && p >= 0 && read(p, BUF_B.as_mut_ptr(), 512) > 0;
+    if p >= 0 { close(p); }
+    close(fd);
+    ok = ok && unlink(path) == 0;
+    let after = tmp_bfree().unwrap_or(0);
+    ok = ok && after + 16 >= before;
+    if !ok {
+        puts(b"tmpfs_enospc detail follows (errno, MiB written, bfree before/full/after)\0".as_ptr());
+        print_num(errno as u64); print_num((written >> 20) as u64);
+        print_num(before); print_num(full); print_num(after);
+    }
+    report(name, ok)
+}
+
+unsafe fn print_num(mut v: u64) {
+    let mut d = [0u8; 21];
+    let mut n = 20;
+    d[20] = b'\n';
+    loop { n -= 1; d[n] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+    write(STDOUT_FILENO, d.as_ptr().add(n), 21 - n);
+}
+
+/// dup(2) and fork(2) copies of a tmpfs fd share one offset (one open file
+/// description): `(child; parent) > /tmp/f` must append, not overwrite. This
+/// was the "50 KB of session logs, wc -c says 4089" bug.
+unsafe fn test_tmpfs_shared_offset() -> bool {
+    let name = b"tmpfs_shared_offset\0";
+    let path = b"/tmp/vt_ofd\0".as_ptr();
+    let fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 { return report(name, false); }
+    let mut ok = fill_pat(fd, 0, 10_000, 10_000);
+    let pid = fork();
+    if pid == 0 {
+        // Child: continue where the parent left off, through the inherited fd.
+        let r = fill_pat(fd, 10_000, 20_000, 3000);
+        exit(if r { 0 } else { 1 });
+    }
+    let mut status = 0i32;
+    ok = ok && pid > 0 && wait4(pid, &mut status, 0, core::ptr::null_mut()) == pid && status == 0;
+    // The parent's offset moved with the child's writes.
+    ok = ok && lseek(fd, 0, 1) == 30_000;
+    let d = dup(fd);
+    ok = ok && d >= 0 && fill_pat(d, 30_000, 5000, 5000) && lseek(fd, 0, 1) == 35_000;
+    if d >= 0 { close(d); }
+    ok = ok && fill_pat(fd, 35_000, 1000, 1000);
+    close(fd);
+    let r = open(path, O_RDONLY, 0);
+    ok = ok && r >= 0 && check_pat(r, 0, 36_000);
+    if r >= 0 { close(r); }
+    unlink(path);
+    report(name, ok)
 }

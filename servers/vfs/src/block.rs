@@ -395,11 +395,8 @@ fn backing_read(kind: VnodeKind, off: u64, buf: &mut [u8]) -> bool {
         VnodeKind::TmpFile { idx, .. } => {
             let tmp = TMP_FILES.lock();
             if !tmp[idx].in_use { return false; }
-            let len = tmp[idx].len as u64;
-            if off < len {
-                let n = ((len - off) as usize).min(buf.len());
-                buf[..n].copy_from_slice(&tmp[idx].data[off as usize..off as usize + n]);
-            }
+            // Holes and the tail past EOF stay as the zeros already in `buf`.
+            let _ = tmp_read_kernel(&tmp[..], idx, off as usize, buf);
             true
         }
         _ => false,
@@ -432,11 +429,7 @@ fn backing_write(kind: VnodeKind, off: u64, buf: &[u8]) -> bool {
         VnodeKind::TmpFile { idx, .. } => {
             let mut tmp = TMP_FILES.lock();
             if !tmp[idx].in_use { return false; }
-            let end = off as usize + buf.len();
-            if end > MAX_TMP_SIZE { return false; }
-            tmp[idx].data[off as usize..end].copy_from_slice(buf);
-            if end > tmp[idx].len { tmp[idx].len = end; }
-            true
+            tmp_write_kernel(&mut tmp[..], idx, off as usize, buf)
         }
         _ => false,
     }
@@ -1011,7 +1004,7 @@ fn open_backing(path: &[u8]) -> Option<(VnodeKind, u64)> {
         let idx = tmp_find(&tmp[..], tp)?;
         let owner = tmp_owner(&tmp[..], idx);
         let len = tmp[owner].len as u64;
-        return Some((VnodeKind::TmpFile { idx: owner, pos: 0, writable: true }, len));
+        return Some((VnodeKind::TmpFile { idx: owner, pos: 0, writable: true, ofd: 0 }, len));
     }
     let port = find_mount_port(path)?;
     // NUL-terminate for the mount server's own `read_cstr`.

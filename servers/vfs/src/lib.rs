@@ -361,24 +361,37 @@ pub fn call_port(port_id: u32, mut msg: Message) -> Message {
 
 // ── Writable tmpfs pool ───────────────────────────────────────────────────────
 
-// Every entry is stored inline, so these bounds are a straight static-memory
-// trade: MAX_TMP_FILES * (MAX_TMP_SIZE + MAX_TMP_PATH) ≈ 4.2 MB of BSS.
-// The previous 32 / 4 KiB / 64 was far too tight for real userland — a
-// coreutils run in /tmp exhausts 32 slots quickly and then reports ENOSPC
-// from creat/mkdir, and 64 bytes of path cannot hold a couple of nested
-// directories. Raise before assuming a tmpfs failure is a logic bug.
+// The pool holds *metadata* only: a regular file's bytes live in page frames
+// owned by its `TmpVmo` (see "Shared VMO store" below), allocated one 4 KiB
+// page at a time as they are written, so a file is bounded by the tmpfs page
+// budget (`tmpfs_budget_pages`, half of RAM as on Linux) rather than by a
+// fixed in-struct array. Until 2026-10-01 every entry carried a 32 KiB inline
+// `data` array — 16 MiB of BSS for 512 entries and a hard 32 KiB file cap
+// (`cp` of a 371 KB file into /tmp was ENOSPC, captured stderr was silently
+// cut at 32 KiB).
 // 128 -> 512 (lane multiterm, 2026-09-27): every Wayland client holds several
 // memfds here (wl_shm pools, keymaps), and five cosmic-terms took the pool to
 // 120/128. The entry is all-zero when empty (`link_to` is biased by one), so
 // the table lands in .bss instead of the kernel image.
 const MAX_TMP_FILES: usize = 512;
-const MAX_TMP_SIZE:  usize = 32768;
 const MAX_TMP_PATH:  usize = 128;
+/// Longest symlink body. Matches `read_cstr_raw`'s 256-byte buffer, which is
+/// the most `symlink(2)` can ever hand us.
+const TMP_LINK_MAX:  usize = 256;
+/// Largest offset a tmpfs file may reach (EFBIG beyond it). The page index is
+/// a dense `Vec` grown only as far as the highest *populated* page — holes
+/// after it are implicit — so this bounds the worst-case index (a single byte
+/// written at the very end) at 32 MiB of kernel heap, allocated fallibly.
+const MAX_TMP_FILE_SIZE: usize = 16 << 30;
 
 struct TmpFileEntry {
     path:     [u8; MAX_TMP_PATH],
     path_len: usize,
-    data:     [u8; MAX_TMP_SIZE],
+    /// Symlink body (`is_link` only; `len` is its length). A regular file's
+    /// bytes are never stored here — they live in `TMP_VMOS[owner]`.
+    link:     [u8; TMP_LINK_MAX],
+    /// Logical size (EOF) of a regular file, or the symlink body length.
+    /// Authoritative; mirrored into `TmpVmo.len` whenever a VMO exists.
     len:      usize,
     in_use:   bool,
     is_dir:   bool,
@@ -433,7 +446,7 @@ struct TmpFileEntry {
 impl TmpFileEntry {
     const fn empty() -> Self {
         Self { path: [0u8; MAX_TMP_PATH], path_len: 0,
-               data: [0u8; MAX_TMP_SIZE], len: 0,
+               link: [0u8; TMP_LINK_MAX], len: 0,
                in_use: false, is_dir: false, is_fifo: false, is_link: false,
                is_sock: false, sock_id: 0,
                link_to: 0,
@@ -465,15 +478,32 @@ static TMP_FILES: Mutex<[TmpFileEntry; MAX_TMP_FILES]> =
 // implicit ref with `unref_or_free`, freeing a frame only once the last mapping
 // is also gone.
 //
-// A file that is never memfd'd and never `MAP_SHARED`-mapped keeps its inline
-// `TmpFileEntry.data` path byte-for-byte, so vfstest/coreutils tmpfs I/O is
-// unchanged. The VMO branch in read/write/ftruncate activates only when
-// `TMP_VMOS[owner].is_some()`.
+// Every regular tmpfs file stores its bytes here (2026-10-01; before that a
+// file that was never memfd'd or MAP_SHARED-mapped lived in a 32 KiB inline
+// array). The VMO is created lazily on the first page a file needs, so an
+// empty or never-written file costs nothing beyond its pool entry.
+//
+// Pages are allocated on demand and may be absent: `pages[i] == 0`, and every
+// index at or past `pages.len()`, is a *hole* that reads as zeros and costs no
+// memory — so `lseek` past EOF + write, and ftruncate-grow, are sparse exactly
+// as on Linux tmpfs. Bytes past EOF inside an allocated page are don't-care:
+// every operation that moves EOF forward zeroes the gap it exposes first
+// (`vmo_zero_range`), and ftruncate-shrink zeroes the tail of the new last page.
+//
+// Accounting: every frame a non-borrowed VMO owns is counted in
+// `TMP_PAGES_USED` from allocation until the VMO drops it (truncate, unlink of
+// the last name, last close of an unlinked file). Page allocation driven by
+// userspace (write, MAP_SHARED over a hole; ftruncate allocates nothing) is
+// refused with ENOSPC once the count reaches `tmpfs_budget_pages()`.
+// Kernel-generated /proc snapshots are counted but never refused, so a full
+// /tmp cannot make /proc unreadable. The budget is shared by /tmp, /dev/shm,
+// /run/user and memfds, which all live in this one pool.
 struct TmpVmo {
-    /// Physical frame for each 4 KiB page index; non-sparse (every index in
-    /// `0..pages.len()` is a real buddy frame). Capacity (frame count) is
-    /// decoupled from `len`: a mapping larger than the file grows `pages`
-    /// without moving EOF.
+    /// Physical frame for each 4 KiB page index; `0` (and any index past the
+    /// end of the list) is a hole. Never sparse for a borrowed VMO. The list
+    /// is decoupled from `len` both ways: a mapping larger than the file grows
+    /// it without moving EOF, and a sparse file's trailing hole is simply not
+    /// listed.
     pages: alloc::vec::Vec<usize>,
     /// Logical file size in bytes (EOF). Mirrored into `TmpFileEntry.len` so
     /// fstat/lseek/poll — which read `entry.len` — stay correct unchanged.
@@ -532,55 +562,230 @@ fn vmo_alloc_zeroed_frame() -> Option<usize> {
     Some(phys)
 }
 
-/// Copy `n` bytes out of the VMO frames starting at logical offset `off` into
-/// kernel/user `dst`. Walks page by page (an unaligned `off` may cross one
-/// frame boundary). Every touched page index is guaranteed present.
+/// Frames currently owned by non-borrowed tmpfs VMOs (see the accounting note
+/// above `TmpVmo`).
+static TMP_PAGES_USED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The tmpfs size limit in pages: half of RAM, Linux's default `size=`.
+fn tmpfs_budget_pages() -> usize {
+    (mm::buddy::total_pages() / 2).max(1024)
+}
+
+/// Pages currently charged to tmpfs (for statfs and the tests).
+pub fn tmpfs_used_pages() -> usize {
+    TMP_PAGES_USED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Allocate one charged tmpfs page. `check_budget` is false only for
+/// kernel-generated snapshots. Err is a negative errno: ENOSPC for the
+/// budget, ENOMEM when the buddy allocator itself is empty.
+fn tmp_page_alloc(check_budget: bool) -> Result<usize, i64> {
+    use core::sync::atomic::Ordering;
+    if check_budget && TMP_PAGES_USED.load(Ordering::Relaxed) >= tmpfs_budget_pages() {
+        return Err(-28); // ENOSPC
+    }
+    let phys = vmo_alloc_zeroed_frame().ok_or(-12i64)?; // ENOMEM
+    TMP_PAGES_USED.fetch_add(1, Ordering::Relaxed);
+    Ok(phys)
+}
+
+/// Drop a VMO's own reference on one of its pages and uncharge it. A frame a
+/// live mapping still holds survives until that mapping goes (`pageref`).
+fn tmp_page_put(phys: usize) {
+    if phys == 0 { return; }
+    mm::pageref::unref_or_free(phys, 0);
+    TMP_PAGES_USED.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// What a hole reads as.
+static TMP_ZERO_PAGE: [u8; 4096] = [0u8; 4096];
+
+impl TmpVmo {
+    /// An empty, owning VMO (no pages: the whole file is a hole).
+    const fn new_owned(is_memfd: bool) -> Self {
+        TmpVmo { pages: alloc::vec::Vec::new(), len: 0, seals: 0, is_memfd,
+                 borrowed: false, dmabuf_handle: 0, dmabuf_obj: 0 }
+    }
+
+    /// The frame backing page `i`, or 0 for a hole.
+    fn page(&self, i: usize) -> usize {
+        self.pages.get(i).copied().unwrap_or(0)
+    }
+
+    /// Frames this VMO actually holds (holes excluded) — `st_blocks / 8`.
+    fn resident_pages(&self) -> usize {
+        self.pages.iter().filter(|&&p| p != 0).count()
+    }
+
+    /// Make page `i` real, allocating it (zeroed) if it is a hole. A borrowed
+    /// VMO's page list is immutable (see `vmo_acquire_frames`): any hole in it
+    /// is ENOSPC. The index grows fallibly — a write at a huge offset gets
+    /// ENOMEM, never a kernel panic on a failed `Vec` reallocation.
+    fn ensure_page(&mut self, i: usize, check_budget: bool) -> Result<usize, i64> {
+        if i < self.pages.len() && self.pages[i] != 0 { return Ok(self.pages[i]); }
+        if self.borrowed { return Err(-28); }
+        if i >= self.pages.len() {
+            if self.pages.try_reserve(i + 1 - self.pages.len()).is_err() { return Err(-12); }
+            self.pages.resize(i + 1, 0);
+        }
+        let phys = tmp_page_alloc(check_budget)?;
+        self.pages[i] = phys;
+        Ok(phys)
+    }
+
+    /// Free every page wholly at or past byte `from` (rounded up to a page)
+    /// and drop them from the index. Never called on a borrowed VMO.
+    fn free_from(&mut self, from: usize) {
+        let keep = (from + 4095) / 4096;
+        if keep >= self.pages.len() { return; }
+        for &phys in &self.pages[keep..] { tmp_page_put(phys); }
+        self.pages.truncate(keep);
+        // Drop trailing holes too, so the index never outlives the data.
+        while self.pages.last() == Some(&0) { self.pages.pop(); }
+    }
+}
+
+/// Copy `n` bytes of file content starting at logical offset `off` into
+/// kernel/user `dst`, page by page; holes (no VMO at all, a 0 entry, or past
+/// the page list) read as zeros.
 ///
 /// `dst` is the caller's buffer and TMP_FILES/TMP_VMOS are held, so the copy
 /// is fault-tolerant (see `sched::uaccess`): false = a fault stopped it.
-unsafe fn vmo_copy_out(vmo: &TmpVmo, off: usize, dst: *mut u8, n: usize) -> bool {
+unsafe fn vmo_copy_out(vmo: Option<&TmpVmo>, off: usize, dst: *mut u8, n: usize) -> bool {
     let mut done = 0usize;
     while done < n {
         let pos  = off + done;
         let page = pos / 4096;
         let poff = pos % 4096;
         let cnt  = (4096 - poff).min(n - done);
-        let src  = (mm::phys_to_virt(vmo.pages[page]) + poff) as *const u8;
+        let phys = vmo.map_or(0, |v| v.page(page));
+        let src  = if phys == 0 { TMP_ZERO_PAGE.as_ptr().add(poff) }
+                   else { (mm::phys_to_virt(phys) + poff) as *const u8 };
         if sched::uaccess::copy_raw(dst.add(done), src, cnt) != 0 { return false; }
         done += cnt;
     }
     true
 }
 
-/// Copy `n` bytes from `src` into the VMO frames at logical offset `off`. The
-/// caller must have grown `pages` to cover `off + n` first.
-/// Fault-tolerant like [`vmo_copy_out`]; false = a fault stopped it.
-unsafe fn vmo_copy_in(vmo: &mut TmpVmo, off: usize, src: *const u8, n: usize) -> bool {
+/// Copy `n` bytes from `src` into the file at logical offset `off`,
+/// allocating hole pages on the way. Returns the bytes copied — fewer than
+/// `n` only when a page could not be allocated after some progress — or a
+/// negative errno when nothing was copied (ENOSPC/ENOMEM from the allocator,
+/// EFAULT from a faulting `src`).
+unsafe fn vmo_copy_in(vmo: &mut TmpVmo, off: usize, src: *const u8, n: usize,
+                      check_budget: bool) -> Result<usize, i64> {
     let mut done = 0usize;
     while done < n {
         let pos  = off + done;
         let page = pos / 4096;
         let poff = pos % 4096;
         let cnt  = (4096 - poff).min(n - done);
-        let dst  = (mm::phys_to_virt(vmo.pages[page]) + poff) as *mut u8;
-        if sched::uaccess::copy_raw(dst, src.add(done), cnt) != 0 { return false; }
+        let phys = match vmo.ensure_page(page, check_budget) {
+            Ok(p) => p,
+            Err(e) => return if done > 0 { Ok(done) } else { Err(e) },
+        };
+        let dst = (mm::phys_to_virt(phys) + poff) as *mut u8;
+        if sched::uaccess::copy_raw(dst, src.add(done), cnt) != 0 { return Err(-14); }
         done += cnt;
     }
-    true
+    Ok(done)
 }
 
-/// Zero bytes `[from, to)` of the VMO frames (HHDM only). Used to clear the
-/// tail of the last previously-existing page on ftruncate-grow.
+/// Zero bytes `[from, to)` of whatever frames back that range (HHDM only);
+/// holes are already zero. Used whenever EOF moves forward, so stale bytes
+/// past the old EOF inside its page never become file content. Bounded by
+/// the page list, so a hole gigabytes long costs nothing.
 fn vmo_zero_range(vmo: &mut TmpVmo, from: usize, to: usize) {
+    if vmo.borrowed { return; }
+    let to = to.min(vmo.pages.len() * 4096);
     let mut pos = from;
     while pos < to {
         let page = pos / 4096;
-        if page >= vmo.pages.len() { break; }
         let poff = pos % 4096;
         let cnt  = (4096 - poff).min(to - pos);
-        unsafe { ((mm::phys_to_virt(vmo.pages[page]) + poff) as *mut u8).write_bytes(0, cnt); }
+        let phys = vmo.pages[page];
+        if phys != 0 {
+            unsafe { ((mm::phys_to_virt(phys) + poff) as *mut u8).write_bytes(0, cnt); }
+        }
         pos += cnt;
     }
+}
+
+/// Set a regular file's size, Linux `truncate` semantics: growing exposes
+/// zeros (sparse — no page is allocated), shrinking frees every page past the
+/// new EOF and zeroes the tail of the new last page. Enforces F_SEAL_SHRINK
+/// and refuses a borrowed (dmabuf) VMO. Returns 0 or a negative errno.
+/// Caller holds TMP_FILES → TMP_VMOS and passes `owner`.
+fn tmp_set_size(tmp: &mut [TmpFileEntry], vmos: &mut [Option<TmpVmo>], owner: usize,
+                new_len: usize) -> i64 {
+    if new_len > MAX_TMP_FILE_SIZE { return -27; } // EFBIG
+    let old_len = tmp[owner].len;
+    if let Some(vmo) = vmos[owner].as_mut() {
+        // A borrowed dmabuf export is not resizable, in either direction.
+        // Growing would append frames `vmo_free_slot` never frees; shrinking
+        // would `unref_or_free` frames the DRM layer owns — order-0 frees out
+        // of an order-N buddy block, i.e. allocator corruption. Linux does not
+        // let you ftruncate a dmabuf either.
+        if vmo.borrowed { return -1; } // EPERM
+        if new_len < old_len && vmo.seals & F_SEAL_SHRINK != 0 { return -1; } // EPERM
+        if new_len > old_len {
+            vmo_zero_range(vmo, old_len, new_len);
+        } else if new_len < old_len {
+            // Frames a live mapping still holds survive (unref_or_free), so
+            // there is no use-after-free (Linux would SIGBUS — out of scope).
+            vmo.free_from(new_len);
+            let page_end = ((new_len + 4095) / 4096) * 4096;
+            vmo_zero_range(vmo, new_len, page_end);
+        }
+        vmo.len = new_len;
+    }
+    tmp[owner].len = new_len;
+    0
+}
+
+/// Replace a fresh slot's content with kernel bytes (a /proc, /sys or mtab
+/// snapshot). Uncapped and never budget-refused; false only if the buddy
+/// allocator is empty. Caller holds TMP_FILES; takes TMP_VMOS.
+fn tmp_fill_kernel(tmp: &mut [TmpFileEntry], idx: usize, data: &[u8]) -> bool {
+    let mut vmos = TMP_VMOS.lock();
+    // A fresh slot has no VMO (every free site clears it); be defensive anyway.
+    // (A slot is only reused after its VMO is torn down, so this never holds
+    // a dmabuf reference to leak.)
+    if let Some(old) = vmos[idx].take() { let _ = vmo_free_owned(old); }
+    let mut vmo = TmpVmo::new_owned(false);
+    let ok = data.is_empty()
+        || unsafe { vmo_copy_in(&mut vmo, 0, data.as_ptr(), data.len(), false) } == Ok(data.len());
+    if !ok { let _ = vmo_free_owned(vmo); return false; }
+    vmo.len = data.len();
+    tmp[idx].len = data.len();
+    if !vmo.pages.is_empty() { vmos[idx] = Some(vmo); }
+    true
+}
+
+/// Kernel-buffer read of a tmpfs file's content at `off` (loop devices, the
+/// serial-dump diagnostic). Caller holds TMP_FILES. Returns bytes copied,
+/// clamped to EOF.
+fn tmp_read_kernel(tmp: &[TmpFileEntry], owner: usize, off: usize, out: &mut [u8]) -> usize {
+    let len = tmp[owner].len;
+    if off >= len { return 0; }
+    let n = (len - off).min(out.len());
+    let vmos = TMP_VMOS.lock();
+    if !unsafe { vmo_copy_out(vmos[owner].as_ref(), off, out.as_mut_ptr(), n) } { return 0; }
+    n
+}
+
+/// Kernel-buffer write into a tmpfs file at `off`, extending EOF (loop
+/// devices). Caller holds TMP_FILES. Returns false on EFBIG/ENOSPC/ENOMEM or
+/// a short write.
+fn tmp_write_kernel(tmp: &mut [TmpFileEntry], owner: usize, off: usize, data: &[u8]) -> bool {
+    let end = match off.checked_add(data.len()) { Some(e) if e <= MAX_TMP_FILE_SIZE => e, _ => return false };
+    let mut vmos = TMP_VMOS.lock();
+    let len = tmp[owner].len;
+    let vmo = vmos[owner].get_or_insert_with(|| TmpVmo::new_owned(false));
+    if off > len { vmo_zero_range(vmo, len, off); }
+    let ok = unsafe { vmo_copy_in(vmo, off, data.as_ptr(), data.len(), true) } == Ok(data.len());
+    if ok && end > len { vmo.len = end; tmp[owner].len = end; }
+    ok
 }
 
 // ── The DRM dmabuf release hook ───────────────────────────────────────────────
@@ -641,20 +846,23 @@ fn dmabuf_release(obj: u32) {
 /// function lock-order-neutral.
 #[must_use = "the dmabuf reference must be dropped, with TMP_FILES released"]
 fn vmo_free_slot(owner: usize) -> Option<u32> {
-    if let Some(vmo) = TMP_VMOS.lock()[owner].take() {
-        // Borrowed (dmabuf) VMOs alias frames the DRM layer owns — dropping the
-        // slot must forget the page list WITHOUT freeing; the buddy block is
-        // freed by the DRM layer once the LAST reference goes, and this slot
-        // was one of them. Any live mmap of the fd already balances its own
-        // pageref inc/dec (the frames start untracked so a mapping's unref
-        // never reaches the free branch).
-        if vmo.borrowed {
-            return if vmo.dmabuf_obj != 0 { Some(vmo.dmabuf_obj) } else { None };
-        }
-        for phys in vmo.pages {
-            if phys != 0 { mm::pageref::unref_or_free(phys, 0); }
-        }
+    let vmo = TMP_VMOS.lock()[owner].take()?;
+    vmo_free_owned(vmo)
+}
+
+/// Tear down a VMO already taken out of `TMP_VMOS` (see `vmo_free_slot`).
+#[must_use = "the dmabuf reference must be dropped, with TMP_FILES released"]
+fn vmo_free_owned(vmo: TmpVmo) -> Option<u32> {
+    // Borrowed (dmabuf) VMOs alias frames the DRM layer owns — dropping the
+    // slot must forget the page list WITHOUT freeing; the buddy block is
+    // freed by the DRM layer once the LAST reference goes, and this slot
+    // was one of them. Any live mmap of the fd already balances its own
+    // pageref inc/dec (the frames start untracked so a mapping's unref
+    // never reaches the free branch).
+    if vmo.borrowed {
+        return if vmo.dmabuf_obj != 0 { Some(vmo.dmabuf_obj) } else { None };
     }
+    for phys in vmo.pages { tmp_page_put(phys); }
     None
 }
 
@@ -742,13 +950,16 @@ pub fn vmo_debug_probe(idx: usize) -> Option<(usize, usize, u64, usize)> {
 /// VMO on its owner slot. Called by `sys_memfd_create` right after open.
 pub fn mark_memfd(pid: u32, fd: usize) {
     let idx = match tmpfile_owner_of(pid, fd) { Some(i) => i, None => return };
+    // Lock order TMP_FILES -> TMP_VMOS, even though only `len` is read.
+    let tmp = TMP_FILES.lock();
     let mut vmos = TMP_VMOS.lock();
     match vmos[idx].as_mut() {
         Some(vmo) => vmo.is_memfd = true,
-        None => vmos[idx] = Some(TmpVmo {
-            pages: alloc::vec::Vec::new(), len: 0, seals: 0, is_memfd: true,
-            borrowed: false, dmabuf_handle: 0, dmabuf_obj: 0,
-        }),
+        None => {
+            let mut v = TmpVmo::new_owned(true);
+            v.len = tmp[idx].len;
+            vmos[idx] = Some(v);
+        }
     }
 }
 
@@ -872,31 +1083,16 @@ pub fn vmo_acquire_frames(pid: u32, fd: usize, off: usize, len: usize)
     let n = (len + 4095) / 4096;
     let need_pages = first.checked_add(n)?;
 
-    let mut tmp = TMP_FILES.lock();
+    let tmp = TMP_FILES.lock();
     let mut vmos = TMP_VMOS.lock();
 
-    // Promote a plain tmpfs file on first MAP_SHARED: migrate inline bytes.
+    // Every regular file's bytes already live in its VMO; one that has never
+    // been written simply has none yet.
     let g2_promoted = vmos[idx].is_none();
     if vmos[idx].is_none() {
-        let cur_len = tmp[idx].len;
-        let cur_pages = (cur_len + 4095) / 4096;
-        let mut pages = alloc::vec::Vec::new();
-        for p in 0..cur_pages {
-            let phys = match vmo_alloc_zeroed_frame() {
-                Some(f) => f,
-                None => { for &f in &pages { mm::buddy::free(f, 0); } return None; }
-            };
-            let start = p * 4096;
-            let cnt = (cur_len - start).min(4096);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    tmp[idx].data.as_ptr().add(start),
-                    mm::phys_to_virt(phys) as *mut u8, cnt);
-            }
-            pages.push(phys);
-        }
-        vmos[idx] = Some(TmpVmo { pages, len: cur_len, seals: 0, is_memfd: false,
-            borrowed: false, dmabuf_handle: 0, dmabuf_obj: 0 });
+        let mut v = TmpVmo::new_owned(false);
+        v.len = tmp[idx].len;
+        vmos[idx] = Some(v);
     }
 
     let vmo = vmos[idx].as_mut().unwrap();
@@ -911,11 +1107,13 @@ pub fn vmo_acquire_frames(pid: u32, fd: usize, off: usize, len: usize)
     // Refuse instead: sys_mmap turns None into ENOMEM, which is what "this fd
     // is a shareable token, not a mapping" looks like from userspace.
     if vmo.borrowed && need_pages > vmo.pages.len() { return None; }
-    // Grow frame capacity to cover the mapped range. This does NOT move EOF
-    // (`vmo.len`) — a mapping past end-of-file gets zero-filled frames.
-    while vmo.pages.len() < need_pages {
-        let phys = vmo_alloc_zeroed_frame()?; // partial growth is harmless (VMO owns them)
-        vmo.pages.push(phys);
+    // Fill every hole in the mapped range — sparse pages, and pages past EOF
+    // for a mapping larger than the file. This does NOT move EOF (`vmo.len`):
+    // those frames are zero-filled. Partial growth is harmless (the VMO owns
+    // and accounts every frame it got). The mapping aliases these frames, so
+    // they must exist now; a full tmpfs refuses the mmap (ENOMEM).
+    for p in first..need_pages {
+        if vmo.ensure_page(p, true).is_err() { return None; }
     }
 
     // Pin and collect the mapped range's frames (inc under the lock).
@@ -969,6 +1167,70 @@ pub fn vmo_release_frames(frames: &[usize]) {
     }
 }
 
+// ── Shared open file descriptions (tmpfs offsets) ──────────────────────────────
+//
+// POSIX: dup(2), fork(2) and SCM_RIGHTS copy a *descriptor*, and every copy
+// shares one open file description — one offset. A tmpfs fd used to carry its
+// offset inside its own `VnodeKind::TmpFile`, i.e. per descriptor, so
+// `(seq 1 10000; seq 1 10) > /tmp/x` wrote the second child's bytes over the
+// first child's from offset 0 (48894 bytes instead of 48915), and a session
+// whose many children inherit one redirected stderr ended up with a log as
+// long as its single largest writer — "50 KB of logs, wc -c says 4089".
+// f2fs never had the bug: its offset lives in the mount server's open-file slot.
+//
+// One entry per open(2) of a tmpfs regular file, refcounted by every fd copy
+// (`pipe_ref_inc` / `pipe_ref_dec` / `release_vnode` / `handle_close`). Leaf
+// lock: may be taken under FD_TABLES, never held while taking another lock.
+const MAX_TMP_OFDS: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct TmpOfd { pos: usize, refs: u32 }
+
+static TMP_OFDS: Mutex<[TmpOfd; MAX_TMP_OFDS]> =
+    Mutex::new([TmpOfd { pos: 0, refs: 0 }; MAX_TMP_OFDS]);
+
+/// Claim a description with one reference and offset `pos`; 0 when the table
+/// is full (the fd then keeps a private offset, the pre-2026-10-01 behaviour).
+fn tmp_ofd_alloc(pos: usize) -> u16 {
+    let mut t = TMP_OFDS.lock();
+    for i in 1..MAX_TMP_OFDS {
+        if t[i].refs == 0 { t[i] = TmpOfd { pos, refs: 1 }; return i as u16; }
+    }
+    0
+}
+
+fn tmp_ofd_get(ofd: u16) {
+    if ofd != 0 { let mut t = TMP_OFDS.lock(); t[ofd as usize].refs += 1; }
+}
+
+fn tmp_ofd_put(ofd: u16) {
+    if ofd != 0 {
+        let mut t = TMP_OFDS.lock();
+        let e = &mut t[ofd as usize];
+        e.refs = e.refs.saturating_sub(1);
+    }
+}
+
+fn tmp_idx_of(kind: &VnodeKind) -> usize {
+    match *kind { VnodeKind::TmpFile { idx, .. } => idx, _ => 0 }
+}
+
+/// The offset of a tmpfs fd: its shared description's, or its own.
+fn tmp_pos_get(kind: &VnodeKind) -> usize {
+    match *kind {
+        VnodeKind::TmpFile { ofd, .. } if ofd != 0 => TMP_OFDS.lock()[ofd as usize].pos,
+        VnodeKind::TmpFile { pos, .. } => pos,
+        _ => 0,
+    }
+}
+
+fn tmp_pos_set(kind: &mut VnodeKind, new_pos: usize) {
+    if let VnodeKind::TmpFile { pos, ofd, .. } = kind {
+        *pos = new_pos;
+        if *ofd != 0 { TMP_OFDS.lock()[*ofd as usize].pos = new_pos; }
+    }
+}
+
 // ── Vnode kinds ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1001,7 +1263,13 @@ pub enum VnodeKind {
     /// each `VnodeKind::Pipe` arm in this file has a `Pty` neighbour.
     Pty { pair: u16, is_master: bool },
     /// Writable entry in the TmpFiles pool (idx into TMP_FILES).
-    TmpFile { idx: usize, pos: usize, writable: bool },
+    ///
+    /// `ofd` names the shared open file description (`TMP_OFDS`) whose offset
+    /// every dup/fork/SCM_RIGHTS copy of this fd shares, as POSIX requires;
+    /// 0 = none (directories, which keep their getdents cursor in `pos`, and
+    /// the rare open that found the description table full). Always go through
+    /// `tmp_pos_get`/`tmp_pos_set` for the offset of a regular file.
+    TmpFile { idx: usize, pos: usize, writable: bool, ofd: u16 },
     /// eventfd: counter value; read returns counter as u64, write adds to it.
     EventFd { slot: usize },
     /// timerfd: index into TIMERFD_POOL.
@@ -1455,6 +1723,8 @@ fn pipe_ref_inc(kind: &VnodeKind) {
         // one arm covers dup/dup2/dup3, fcntl(F_DUPFD{,_CLOEXEC}), fork
         // inheritance and SCM_RIGHTS export — they all funnel through here.
         VnodeKind::DynamicDevice { open_id, .. } => device_open_inc(*open_id),
+        // The copy shares the open file description, and with it the offset.
+        VnodeKind::TmpFile { ofd, .. } => tmp_ofd_get(*ofd),
         _ => {}
     }
 }
@@ -1520,6 +1790,8 @@ fn pipe_ref_dec(kind: &VnodeKind) {
         VnodeKind::DynamicDevice { port, dev_id, open_id } => {
             device_close(*port, *dev_id, *open_id);
         }
+        // A dup2/dup3 overwriting a tmpfs fd drops its description reference.
+        VnodeKind::TmpFile { ofd, .. } => tmp_ofd_put(*ofd),
         _ => {}
     }
 }
@@ -2240,7 +2512,7 @@ pub fn dump_vfs_census() {
             let (mut slots, mut pages, mut borrowed, mut memfd) = (0usize, 0usize, 0usize, 0usize);
             for e in v.iter().flatten() {
                 slots += 1;
-                if e.borrowed { borrowed += 1; } else { pages += e.pages.len(); }
+                if e.borrowed { borrowed += 1; } else { pages += e.resident_pages(); }
                 if e.is_memfd { memfd += 1; }
             }
             ps(" vmos="); pn(slots); ps(" vmo_pages="); pn(pages);
@@ -2425,9 +2697,7 @@ pub fn tmpfs_read_all(path: &str, out: &mut [u8]) -> Option<usize> {
         return None;
     }
     let owner = tmp_owner(&tmp[..], idx);
-    let n = tmp[owner].len.min(out.len());
-    out[..n].copy_from_slice(&tmp[owner].data[..n]);
-    Some(n)
+    Some(tmp_read_kernel(&tmp[..], owner, 0, out))
 }
 
 /// Look up a path string in RamFS and return a pointer + length to its data.
@@ -3073,7 +3343,7 @@ fn tmp_set_path(e: &mut TmpFileEntry, path: &[u8]) {
 // untouched — at the cost of one rule that must be honoured everywhere:
 //
 //   *Never* index the pool with a raw `tmp_find()` result when you are about
-//   to touch `.data`, `.len`, `.mode`, `.uid` or `.gid`. Map it through
+//   to touch the file's VMO, `.len`, `.mode`, `.uid` or `.gid`. Map it through
 //   `tmp_owner()` first. Only path-shaped operations (rename, getdents,
 //   lookup) legitimately use the un-mapped index.
 
@@ -3354,11 +3624,10 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
                     if let Some(idx) = tmp_find(&tmp[..], &path[..comp_end]) {
                         if tmp[idx].is_link {
                             // A link body is a path, so 256 bytes is the whole
-                            // range — copying MAX_TMP_SIZE here would put a
-                            // 32 KiB buffer on the kernel stack per hop.
+                            // range.
                             let mut target = [0u8; 256];
                             let tlen = tmp[idx].len.min(255);
-                            target[..tlen].copy_from_slice(&tmp[idx].data[..tlen]);
+                            target[..tlen].copy_from_slice(&tmp[idx].link[..tlen]);
                             found = Some((comp_start, comp_end, target, tlen));
                             break;
                         }
@@ -3588,9 +3857,8 @@ fn gen_etc_mtab() -> Option<VnodeKind> {
     tmp[idx].path[..fp_len].copy_from_slice(&fake_path[..fp_len]);
     tmp[idx].path_len = fp_len;
     let copy = len.min(TMP_BUF_SIZE);
-    tmp[idx].data[..copy].copy_from_slice(&buf[..copy]);
-    tmp[idx].len = copy;
-    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
+    if !tmp_fill_kernel(&mut tmp[..], idx, &buf[..copy]) { tmp[idx] = TmpFileEntry::empty(); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
 /// Generate dynamic /proc/ system-wide entries (meminfo, uptime, loadavg, stat).
@@ -3618,9 +3886,8 @@ fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
     tmp[idx].path[..fl].copy_from_slice(&fake_path[..fl]);
     tmp[idx].path_len = fl;
     let copy = len.min(TMP_BUF_SIZE);
-    tmp[idx].data[..copy].copy_from_slice(&buf[..copy]);
-    tmp[idx].len = copy;
-    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
+    if !tmp_fill_kernel(&mut tmp[..], idx, &buf[..copy]) { tmp[idx] = TmpFileEntry::empty(); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
 /// `/proc/kmemstat`: where the kernel's pages are, for leak hunting.
@@ -3629,10 +3896,14 @@ fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
 /// site (`mm::buddy` charges every block to its caller's file:line), slab
 /// pages and live objects per size class, and live heap objects per exact
 /// size. Too large for the 512-byte `gen_proc_system` buffer, so it is
-/// formatted straight into the tmpfs slot (32 KiB).
+/// formatted into a pre-sized heap buffer and parked in a tmpfs slot.
 fn gen_kmemstat() -> Option<VnodeKind> {
-    struct W<'a> { buf: &'a mut [u8], p: usize }
-    impl W<'_> {
+    // The census callbacks run with allocator-internal state held, so nothing
+    // may allocate inside them: `W` writes into a buffer sized up front and
+    // silently stops at its end, exactly as the old fixed 32 KiB slot did.
+    const KMEMSTAT_MAX: usize = 128 * 1024;
+    struct W { buf: alloc::vec::Vec<u8>, p: usize }
+    impl W {
         fn s(&mut self, t: &str) {
             for &b in t.as_bytes() { if self.p < self.buf.len() { self.buf[self.p] = b; self.p += 1; } }
         }
@@ -3644,40 +3915,31 @@ fn gen_kmemstat() -> Option<VnodeKind> {
             for k in n..d.len() { if self.p < self.buf.len() { self.buf[self.p] = d[k]; self.p += 1; } }
         }
     }
-    let mut tmp = TMP_FILES.lock();
-    let idx = tmp.iter().position(|e| !e.in_use)?;
-    tmp[idx] = TmpFileEntry::empty();
-    tmp[idx].in_use = true;
-    tmp[idx].ephemeral = true;
-    let fake = b"/tmp/.kmemstat";
-    tmp[idx].path[..fake.len()].copy_from_slice(fake);
-    tmp[idx].path_len = fake.len();
-    let len = {
-        let mut w = W { buf: &mut tmp[idx].data[..], p: 0 };
-        w.s("total_pages "); w.i(mm::buddy::total_pages() as isize);
-        w.s("\nfree_pages "); w.i(mm::buddy::free_pages() as isize);
-        w.s("\nrefused_frees "); w.i(mm::buddy::bad_frees() as isize);
-        w.s("\nfields site file:line live_pages peak_pages\n");
-        let mut sum = 0isize;
-        mm::buddy::site_census(&mut |f, l, live, peak| {
-            sum += live;
-            w.s("site "); w.s(f); w.s(":"); w.i(l as isize);
-            w.s(" "); w.i(live); w.s(" "); w.i(peak); w.s("\n");
-        });
-        w.s("site_sum "); w.i(sum);
-        w.s("\nslab_reclaimed_pages "); w.i(mm::slab::reclaimed_pages() as isize);
-        w.s("\nfields slab class_bytes pages live_objs\n");
-        mm::slab::class_census(&mut |c, pages, live| {
-            w.s("slab "); w.i(c as isize); w.s(" "); w.i(pages as isize); w.s(" "); w.i(live); w.s("\n");
-        });
-        w.s("fields heap size_bytes live_objs (small: 8-byte bucket upper bound; large: pages*4096)\n");
-        mm::slab::size_census(&mut |sz, n| {
-            w.s("heap "); w.i(sz as isize); w.s(" "); w.i(n); w.s("\n");
-        });
-        w.p
-    };
-    tmp[idx].len = len;
-    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
+    let mut w = W { buf: alloc::vec![0u8; KMEMSTAT_MAX], p: 0 };
+    w.s("total_pages "); w.i(mm::buddy::total_pages() as isize);
+    w.s("\nfree_pages "); w.i(mm::buddy::free_pages() as isize);
+    w.s("\nrefused_frees "); w.i(mm::buddy::bad_frees() as isize);
+    w.s("\ntmpfs_pages "); w.i(tmpfs_used_pages() as isize);
+    w.s("\ntmpfs_budget_pages "); w.i(tmpfs_budget_pages() as isize);
+    w.s("\nfields site file:line live_pages peak_pages\n");
+    let mut sum = 0isize;
+    mm::buddy::site_census(&mut |f, l, live, peak| {
+        sum += live;
+        w.s("site "); w.s(f); w.s(":"); w.i(l as isize);
+        w.s(" "); w.i(live); w.s(" "); w.i(peak); w.s("\n");
+    });
+    w.s("site_sum "); w.i(sum);
+    w.s("\nslab_reclaimed_pages "); w.i(mm::slab::reclaimed_pages() as isize);
+    w.s("\nfields slab class_bytes pages live_objs\n");
+    mm::slab::class_census(&mut |c, pages, live| {
+        w.s("slab "); w.i(c as isize); w.s(" "); w.i(pages as isize); w.s(" "); w.i(live); w.s("\n");
+    });
+    w.s("fields heap size_bytes live_objs (small: 8-byte bucket upper bound; large: pages*4096)\n");
+    mm::slab::size_census(&mut |sz, n| {
+        w.s("heap "); w.i(sz as isize); w.s(" "); w.i(n); w.s("\n");
+    });
+    let len = w.p;
+    proc_snapshot(b"/tmp/.kmemstat", &w.buf[..len], false)
 }
 
 /// Generate a `/sys/class/block/...` attribute file.
@@ -3709,9 +3971,8 @@ fn gen_sysfs(path: &[u8]) -> Option<VnodeKind> {
     tmp[idx].path[..fl].copy_from_slice(&fake[..fl]);
     tmp[idx].path_len = fl;
     let copy = len.min(TMP_BUF_SIZE);
-    tmp[idx].data[..copy].copy_from_slice(&buf[..copy]);
-    tmp[idx].len = copy;
-    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
+    if !tmp_fill_kernel(&mut tmp[..], idx, &buf[..copy]) { tmp[idx] = TmpFileEntry::empty(); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
 fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<usize> {
@@ -3832,22 +4093,23 @@ fn proc_snapshot(fake: &[u8], data: &[u8], is_dir: bool) -> Option<VnodeKind> {
     let fl = fake.len().min(MAX_TMP_PATH - 1);
     tmp[idx].path[..fl].copy_from_slice(&fake[..fl]);
     tmp[idx].path_len = fl;
-    let n = data.len().min(MAX_TMP_SIZE);
-    tmp[idx].data[..n].copy_from_slice(&data[..n]);
-    tmp[idx].len = n;
-    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
+    if !tmp_fill_kernel(&mut tmp[..], idx, data) { tmp[idx] = TmpFileEntry::empty(); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
-/// `/proc/<pid>/smaps` (one block per VMA, cut at the pool slot's 32 KiB)
+/// `/proc/<pid>/smaps` (one block per VMA, cut at `SMAPS_MAX`)
 /// or `smaps_rollup` (the totals, always complete).
 ///
 /// Generated into a heap buffer first: the census holds the target's
 /// address-space `busy` flag, and no VFS lock may be held under it.
 fn gen_proc_smaps(pid: u32, rollup: bool) -> Option<VnodeKind> {
+    // The census runs under the target's address-space `busy` flag, so the
+    // buffer is sized up front and never reallocates inside the callback.
+    const SMAPS_MAX: usize = 256 * 1024;
     struct W { buf: alloc::vec::Vec<u8>, full: bool }
     impl W {
         fn s(&mut self, t: &[u8]) {
-            if self.buf.len() + t.len() > MAX_TMP_SIZE { self.full = true; return; }
+            if self.buf.len() + t.len() > SMAPS_MAX { self.full = true; return; }
             self.buf.extend_from_slice(t);
         }
         fn hex(&mut self, v: usize, width: usize) {
@@ -3865,7 +4127,7 @@ fn gen_proc_smaps(pid: u32, rollup: bool) -> Option<VnodeKind> {
             self.s(b" kB\n");
         }
     }
-    let mut w = W { buf: alloc::vec::Vec::with_capacity(if rollup { 1024 } else { MAX_TMP_SIZE }), full: false };
+    let mut w = W { buf: alloc::vec::Vec::with_capacity(if rollup { 1024 } else { SMAPS_MAX }), full: false };
     let mut tot = mm::vmm::VmaStat::default();
     let mut lo = usize::MAX; let mut hi = 0usize;
     let ok = sched::proc_vma_census(pid, &mut |v: &mm::vmm::VmaStat| {
@@ -3962,9 +4224,8 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
     tmp[idx].path_len = fp_len;
     // Copy the generated content into the data buffer.
     let copy = len.min(TMP_BUF_SIZE);
-    tmp[idx].data[..copy].copy_from_slice(&buf[..copy]);
-    tmp[idx].len = copy;
-    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false })
+    if !tmp_fill_kernel(&mut tmp[..], idx, &buf[..copy]) { tmp[idx] = TmpFileEntry::empty(); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
 /// Files served under `/proc/<pid>/` for any live process — what `ps`/`top`
@@ -4310,7 +4571,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                         return err_reply(-13); // EACCES
                     }
                 }
-                VnodeKind::TmpFile { idx, pos: 0, writable: false }
+                VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 }
             } else {
             // Look for an existing entry. A hard-link alias carries no bytes,
             // so the fd must be bound to the slot that owns them — do that
@@ -4331,11 +4592,17 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                             return err_reply(-13); // EACCES
                         }
                     }
-                    if trunc { tmp[idx].len = 0; }
+                    if trunc && tmp[idx].len != 0 && !tmp[idx].is_link {
+                        let mut vmos = TMP_VMOS.lock();
+                        let r = tmp_set_size(&mut tmp[..], &mut vmos[..], idx, 0);
+                        drop(vmos);
+                        if r != 0 { return make_reply(r); }
+                        tmp_touch_mtime(&mut tmp[idx]);
+                    }
                     let pos = if writable && trunc { 0 }
                               else if flags & O_APPEND != 0 { tmp[idx].len }
                               else { 0 };
-                    VnodeKind::TmpFile { idx, pos, writable: writable || create }
+                    VnodeKind::TmpFile { idx, pos, writable: writable || create, ofd: 0 }
                 }
                 None if create => {
                     // The parent directory must already exist, exactly as on
@@ -4361,7 +4628,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                             tmp_set_path(&mut tmp[idx], path);
                             let (m, um) = xattr::unpack_create_mode(mode as u64);
                             tmp_init_created(&mut tmp[..], idx, path, m, um, false);
-                            VnodeKind::TmpFile { idx, pos: 0, writable: true }
+                            VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 }
                         }
                         None => { drop(tmp); report_pool_full("tmpfs", MAX_TMP_FILES); return err_reply(-28) } // ENOSPC: tmpfs full
                     }
@@ -4513,6 +4780,12 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
     }
 
+    // A regular tmpfs file gets its own open file description, so every
+    // dup/fork copy of this fd shares one offset (see `TMP_OFDS`).
+    let mut kind = kind;
+    if let VnodeKind::TmpFile { idx, pos, ofd, .. } = &mut kind {
+        if !TMP_FILES.lock()[*idx].is_dir { *ofd = tmp_ofd_alloc(*pos); }
+    }
     let installed = {
         let mut tbls = FD_TABLES.lock();
         match get_or_create(pid, &mut *tbls) {
@@ -4558,6 +4831,12 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     proxy.tag = VFS_CLOSE;
                     proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
                     let _ = call_port(port, proxy);
+                }
+                // No fd owns the description (or, for a /proc snapshot, the
+                // ephemeral slot) this open claimed.
+                VnodeKind::TmpFile { idx, ofd, .. } => {
+                    tmp_ofd_put(ofd);
+                    tmp_release_ephemeral(idx);
                 }
                 _ => {}
             }
@@ -4749,32 +5028,31 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             };
             make_reply(n as i64)
         }
-        VnodeKind::TmpFile { idx, pos, .. } => {
-            let idx = *idx;
-            let cur = *pos;
+        VnodeKind::TmpFile { .. } => {
+            let kind = tbl.fds[fd].kind;
+            let idx = tmp_idx_of(&kind);
+            let cur = tmp_pos_get(&kind);
             drop(tbls);
             let mut tmp = TMP_FILES.lock();
-            // `entry.len` mirrors `vmo.len` for a promoted file, so the EOF
-            // bound is the same whether or not a VMO backs this inode.
+            // `entry.len` is the EOF for every regular file. A read is served
+            // whole (up to TMP_READ_MAX per call, which bounds how long the
+            // tmpfs locks are held): a short read from a regular file before
+            // EOF is legal but breaks callers that size one read() by st_size.
+            const TMP_READ_MAX: usize = 1 << 20;
             let remaining = tmp[idx].len.saturating_sub(cur);
-            let mut n = count.min(remaining).min(4096);
+            let mut n = count.min(remaining).min(TMP_READ_MAX);
             if n == 0 { return val_reply(0); }
-            // Promoted (memfd / MAP_SHARED-mapped) files read from their VMO
-            // frames — the pages ARE the file, so read()↔mmap coherence is free.
+            // The VMO frames ARE the file, so read()↔mmap coherence is free;
+            // holes (and a file with no VMO yet) read as zeros.
             let vmos = TMP_VMOS.lock();
-            if let Some(vmo) = vmos[idx].as_ref() {
-                // Never read past the frames that actually exist. For every
-                // ordinary VMO `pages` already covers `len`, so this clamp is a
-                // no-op; it is here for a borrowed dmabuf export of a host-side
-                // BO, whose `len` is the resource size while `pages` is empty —
-                // `vmo_copy_out` would index an empty list and panic in the
-                // kernel.
+            if let Some(vmo) = vmos[idx].as_ref().filter(|v| v.borrowed) {
+                // Never read past the frames a borrowed dmabuf export actually
+                // has: a host-side BO's `len` is the resource size while its
+                // `pages` is empty, and it has no bytes to give — EOF, not zeros.
                 n = n.min((vmo.pages.len() * 4096).saturating_sub(cur));
                 if n == 0 { return val_reply(0); }
-                if !unsafe { vmo_copy_out(vmo, cur, buf, n) } { return err_reply(-14); }
-            } else if unsafe { sched::uaccess::copy_raw(buf, tmp[idx].data.as_ptr().add(cur), n) } != 0 {
-                return err_reply(-14);
             }
+            if !unsafe { vmo_copy_out(vmos[idx].as_ref(), cur, buf, n) } { return err_reply(-14); }
             drop(vmos);
             // relatime: a real read happened, so consider bumping atime.
             let now = sched::clock_ts();
@@ -4785,7 +5063,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             let mut tbls2 = FD_TABLES.lock();
             if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
                 if fd < MAX_FDS {
-                    if let VnodeKind::TmpFile { pos: p, .. } = &mut tbl2.fds[fd].kind { *p = cur + n; }
+                    tmp_pos_set(&mut tbl2.fds[fd].kind, cur + n);
                 }
             }
             val_reply(n as u64)
@@ -4993,60 +5271,47 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             }
             val_reply(n as u64)
         }
-        VnodeKind::TmpFile { idx, pos, writable } => {
+        VnodeKind::TmpFile { writable, .. } => {
             if !*writable { return err_reply(-9); } // not open for writing
-            let idx = *idx;
+            let kind = tbl.fds[fd].kind;
+            let idx = tmp_idx_of(&kind);
             let append = tbl.fds[fd].flags & O_APPEND != 0;
-            let cur = if append {
-                drop(tbls);
-                TMP_FILES.lock()[idx].len
-            } else {
-                let c = *pos;
-                drop(tbls);
-                c
-            };
+            drop(tbls);
+            let ofd = match kind { VnodeKind::TmpFile { ofd, .. } => ofd, _ => 0 };
             let mut tmp = TMP_FILES.lock();
             let mut vmos = TMP_VMOS.lock();
-            let (n, new_pos) = if let Some(vmo) = vmos[idx].as_mut() {
-                // Promoted file: write into VMO frames, no 32 KiB cap. Grow the
-                // frame list to cover cur+count first (F_SEAL_WRITE/GROW are
-                // out of scope — not enforced here).
-                let end = cur + count;
-                let need_pages = (end + 4095) / 4096;
-                // Borrowed (dmabuf) VMOs never grow — see vmo_acquire_frames.
-                // A write past the frames the DRM layer lent us then falls out
-                // as ENOSPC below rather than as a leaked frame.
-                if !vmo.borrowed {
-                    while vmo.pages.len() < need_pages {
-                        match vmo_alloc_zeroed_frame() { Some(f) => vmo.pages.push(f), None => break }
-                    }
-                }
-                let cap_bytes = vmo.pages.len() * 4096;
-                let n = count.min(cap_bytes.saturating_sub(cur));
-                if n == 0 { return err_reply(-28); } // ENOSPC
-                if !unsafe { vmo_copy_in(vmo, cur, buf, n) } { return err_reply(-14); }
-                let new_pos = cur + n;
-                if new_pos > vmo.len { vmo.len = new_pos; tmp[idx].len = new_pos; } // mirror EOF
-                (n, new_pos)
-            } else {
-                let entry = &mut tmp[idx];
-                let avail = MAX_TMP_SIZE.saturating_sub(cur);
-                let n = count.min(avail);
-                if n == 0 { return err_reply(-28); } // ENOSPC
-                if unsafe { sched::uaccess::copy_raw(entry.data.as_mut_ptr().add(cur), buf, n) } != 0 {
-                    return err_reply(-14);
-                }
-                let new_pos = cur + n;
-                if new_pos > entry.len { entry.len = new_pos; }
-                (n, new_pos)
+            // The starting offset is read under TMP_FILES and the shared one
+            // advanced before it is released, so writers sharing a description
+            // (or appending) never land on the same bytes.
+            let cur = if append { tmp[idx].len }
+                      else if ofd != 0 { TMP_OFDS.lock()[ofd as usize].pos }
+                      else { tmp_pos_get(&kind) };
+            // EFBIG at the file-size limit, and a write straddling it is cut
+            // short there (Linux generic_write_checks).
+            if cur >= MAX_TMP_FILE_SIZE { return err_reply(-27); } // EFBIG
+            let want = count.min(MAX_TMP_FILE_SIZE - cur);
+            let len = tmp[idx].len;
+            let vmo = vmos[idx].get_or_insert_with(|| { let mut v = TmpVmo::new_owned(false); v.len = len; v });
+            // Pages are allocated as the bytes land (F_SEAL_WRITE/GROW are out
+            // of scope — not enforced here). A borrowed (dmabuf) VMO never
+            // grows: a write past the frames the DRM layer lent us is ENOSPC.
+            // Writing past EOF leaves a hole; whatever stale bytes sit between
+            // the old EOF and `cur` inside an existing page are zeroed first.
+            if cur > len { vmo_zero_range(vmo, len, cur); }
+            let n = match unsafe { vmo_copy_in(vmo, cur, buf, want, true) } {
+                Ok(n) => n,
+                Err(e) => return make_reply(e),
             };
+            let new_pos = cur + n;
+            if new_pos > len { vmo.len = new_pos; tmp[idx].len = new_pos; }
             tmp_touch_mtime(&mut tmp[idx]);
+            if ofd != 0 { TMP_OFDS.lock()[ofd as usize].pos = new_pos; }
             drop(vmos);
             drop(tmp);
             let mut tbls2 = FD_TABLES.lock();
             if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
                 if fd < MAX_FDS {
-                    if let VnodeKind::TmpFile { pos: p, .. } = &mut tbl2.fds[fd].kind { *p = new_pos; }
+                    tmp_pos_set(&mut tbl2.fds[fd].kind, new_pos);
                 }
             }
             val_reply(n as u64)
@@ -5236,7 +5501,7 @@ fn handle_close(pid: u32, fd: usize) -> Message {
                 let _ = call_port(port, proxy);
             }
         }
-        VnodeKind::TmpFile { idx, .. } => tmp_release_ephemeral(idx),
+        VnodeKind::TmpFile { idx, ofd, .. } => { tmp_ofd_put(ofd); tmp_release_ephemeral(idx) }
         _ => {}
     }
     ok_reply()
@@ -5246,6 +5511,8 @@ fn handle_lseek(pid: u32, fd: usize, offset: i64, whence: u32) -> Message {
     const SEEK_SET: u32 = 0;
     const SEEK_CUR: u32 = 1;
     const SEEK_END: u32 = 2;
+    const SEEK_DATA: u32 = 3;
+    const SEEK_HOLE: u32 = 4;
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
@@ -5278,20 +5545,44 @@ fn handle_lseek(pid: u32, fd: usize, offset: i64, whence: u32) -> Message {
             *pos = new_pos as usize;
             val_reply(new_pos as u64)
         }
-        VnodeKind::TmpFile { idx, pos, .. } => {
+        VnodeKind::TmpFile { idx, .. } => {
             let idx = *idx;
-            let cur = *pos as i64;
+            let cur = tmp_pos_get(&tbl.fds[fd].kind) as i64;
             let tmp = TMP_FILES.lock();
             let file_len = tmp[idx].len as i64;
+            // SEEK_DATA / SEEK_HOLE at page granularity, as Linux tmpfs
+            // reports them: a hole is an unallocated page, and EOF is the
+            // implicit hole every file ends with. Both answer ENXIO for an
+            // offset at or past EOF.
+            let sparse = if whence == SEEK_DATA || whence == SEEK_HOLE {
+                if offset < 0 || offset >= file_len { return err_reply(-6); } // ENXIO
+                let vmos = TMP_VMOS.lock();
+                let vmo = vmos[idx].as_ref();
+                let mut page = offset as usize / 4096;
+                let last = (file_len as usize + 4095) / 4096;
+                let want_data = whence == SEEK_DATA;
+                // Past the page list everything is hole, so the scan never
+                // walks a long trailing hole page by page.
+                let scan_end = last.min(vmo.map_or(0, |v| v.pages.len()));
+                while page < scan_end && (vmo.map_or(0, |v| v.page(page)) != 0) != want_data { page += 1; }
+                if page >= scan_end && want_data {
+                    return err_reply(-6); // ENXIO: only hole remains
+                } else if page >= last {
+                    Some(file_len)
+                } else {
+                    Some(((page * 4096) as i64).max(offset).min(file_len))
+                }
+            } else { None };
             drop(tmp);
             let new_pos = match whence {
                 SEEK_SET => offset,
                 SEEK_CUR => cur + offset,
                 SEEK_END => file_len + offset,
+                SEEK_DATA | SEEK_HOLE => sparse.unwrap_or(file_len),
                 _        => return err_reply(-22),
             };
             if new_pos < 0 { return err_reply(-22); }
-            *pos = new_pos as usize;
+            tmp_pos_set(&mut tbl.fds[fd].kind, new_pos as usize);
             val_reply(new_pos as u64)
         }
         // A block device is seekable and `SEEK_END` must report its real
@@ -5632,7 +5923,7 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
         VnodeKind::DynamicDevice { port, dev_id, open_id } => {
             device_close(port, dev_id, open_id);
         }
-        VnodeKind::TmpFile { idx, .. } => tmp_release_ephemeral(idx),
+        VnodeKind::TmpFile { idx, ofd, .. } => { tmp_ofd_put(ofd); tmp_release_ephemeral(idx) }
         _ => {}
     }
 }
@@ -5754,7 +6045,7 @@ fn resolve_lock_range(kind: &VnodeKind, whence: i16, l_start: i64, l_len: i64) -
     const SEEK_END: i16 = 2;
     let base: i64 = match whence {
         SEEK_SET => 0,
-        SEEK_CUR => match kind { VnodeKind::TmpFile { pos, .. } => *pos as i64, _ => return None },
+        SEEK_CUR => match kind { VnodeKind::TmpFile { .. } => tmp_pos_get(kind) as i64, _ => return None },
         SEEK_END => match kind {
             VnodeKind::TmpFile { idx, .. } => TMP_FILES.lock()[*idx].len as i64,
             _ => return None,
@@ -6990,7 +7281,7 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
             if *is_dir { return err_reply(-25); } // ENOTTY — no readable byte stream
             (data.len().saturating_sub(*pos)) as i32
         }
-        VnodeKind::TmpFile { idx, pos, .. } => { let i = *idx; let c = *pos; drop(tbls); TMP_FILES.lock()[i].len.saturating_sub(c) as i32 }
+        VnodeKind::TmpFile { idx, .. } => { let i = *idx; let c = tmp_pos_get(&tbl.fds[fd].kind); drop(tbls); TMP_FILES.lock()[i].len.saturating_sub(c) as i32 }
         VnodeKind::EventFd { slot } => { let s = *slot; drop(tbls); if EVENTFD_COUNTERS.lock()[s] > 0 { 8 } else { 0 } }
         VnodeKind::TimerFd { slot } => { let s = *slot; drop(tbls); if timerfd_poll_expirations(s) > 0 { 8 } else { 0 } }
         _ => return err_reply(-25),
@@ -7171,52 +7462,9 @@ fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
             drop(tbls);
             let mut tmp = TMP_FILES.lock();
             let mut vmos = TMP_VMOS.lock();
-            if let Some(vmo) = vmos[idx].as_mut() {
-                // A borrowed dmabuf export is not resizable, in either
-                // direction. Growing would append frames `vmo_free_slot` never
-                // frees; shrinking would `unref_or_free` frames the DRM layer
-                // owns — order-0 frees out of an order-N buddy block, i.e.
-                // allocator corruption. Linux does not let you ftruncate a
-                // dmabuf either.
-                if vmo.borrowed { return err_reply(-1); } // EPERM
-                // Enforce F_SEAL_SHRINK; grow/shrink the frame list. Frames a
-                // live mapping still holds survive shrink (unref_or_free), so
-                // there is no use-after-free (Linux would SIGBUS — out of scope).
-                if new_len < vmo.len && vmo.seals & F_SEAL_SHRINK != 0 {
-                    return err_reply(-1); // EPERM
-                }
-                let old_len   = vmo.len;
-                let old_pages = vmo.pages.len();
-                let new_pages = (new_len + 4095) / 4096;
-                if new_pages >= old_pages {
-                    while vmo.pages.len() < new_pages {
-                        match vmo_alloc_zeroed_frame() {
-                            Some(f) => vmo.pages.push(f),
-                            None    => return err_reply(-28), // ENOSPC
-                        }
-                    }
-                    // Clear the tail of the last previously-existing page; newly
-                    // appended frames are already zero from allocation.
-                    if new_len > old_len {
-                        let end = new_len.min(old_pages * 4096);
-                        if end > old_len { vmo_zero_range(vmo, old_len, end); }
-                    }
-                } else {
-                    for p in new_pages..old_pages {
-                        mm::pageref::unref_or_free(vmo.pages[p], 0);
-                    }
-                    vmo.pages.truncate(new_pages);
-                }
-                vmo.len = new_len;
-                tmp[idx].len = new_len; // mirror EOF
-                tmp_touch_mtime(&mut tmp[idx]);
-                return ok_reply();
-            }
-            let entry = &mut tmp[idx];
-            if new_len > MAX_TMP_SIZE { return err_reply(-28); }
-            if new_len > entry.len { for b in &mut entry.data[entry.len..new_len] { *b = 0; } }
-            entry.len = new_len;
-            tmp_touch_mtime(entry);
+            let r = tmp_set_size(&mut tmp[..], &mut vmos[..], idx, new_len);
+            if r != 0 { return make_reply(r); }
+            tmp_touch_mtime(&mut tmp[idx]);
             ok_reply()
         }
         VnodeKind::MountedFile { port, file_id } => {
@@ -7663,7 +7911,7 @@ fn handle_symlink(pid: u32, target_ptr: usize, link_ptr: usize) -> Message {
         tmp[idx].uid  = cred.euid;
         tmp[idx].gid  = cred.egid;
         tmp[idx].len  = tlen;
-        tmp[idx].data[..tlen].copy_from_slice(&tbuf[..tlen]);
+        tmp[idx].link[..tlen].copy_from_slice(&tbuf[..tlen]);
         tmp_set_path(&mut tmp[idx], path);
         tmp_stamp_new(&mut tmp[idx]);
         return ok_reply();
@@ -7694,7 +7942,7 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
         return match tmp_find(&tmp[..], path) {
             Some(idx) if tmp[idx].is_link => {
                 let n = tmp[idx].len.min(buf_len);
-                unsafe { core::ptr::copy_nonoverlapping(tmp[idx].data.as_ptr(), buf_ptr as *mut u8, n); }
+                unsafe { core::ptr::copy_nonoverlapping(tmp[idx].link.as_ptr(), buf_ptr as *mut u8, n); }
                 val_reply(n as u64)
             }
             Some(_) => err_reply(-22), // EINVAL — exists, not a link
@@ -8564,6 +8812,14 @@ pub fn write_stat_full(
     write_stat_full_rdev(stat_ptr, mode, nlink, size, ino, uid, gid, 0);
 }
 
+/// `st_blocks` (512-byte units) of a tmpfs regular file: its allocated pages,
+/// so a sparse file's holes are not billed (`du`, `ls -s`). Caller holds
+/// TMP_FILES (lock order TMP_FILES → TMP_VMOS).
+fn tmp_st_blocks(owner: usize) -> u64 {
+    TMP_VMOS.lock()[owner].as_ref()
+        .map_or(0, |v| if v.borrowed { v.pages.len() } else { v.resident_pages() }) as u64 * 8
+}
+
 /// As `write_stat_full`, but with `st_blocks` supplied rather than derived from
 /// `st_size`.
 ///
@@ -8779,27 +9035,17 @@ fn handle_fstatfs(pid: u32, fd: usize, buf_ptr: usize) -> Message {
     statfs_reply()
 }
 
-/// Live figures for the tmpfs pool: `MAX_TMP_FILES` slots of `MAX_TMP_SIZE`
-/// bytes each, counted in 4 KiB blocks. These are real, not invented — the
-/// pool is a fixed BSS array, so its capacity *is* the filesystem size and the
-/// used byte count is exact.
+/// Live figures for tmpfs: `MAX_TMP_FILES` inodes sharing the page budget,
+/// counted in 4 KiB blocks. Both numbers are exact — every page a tmpfs file
+/// holds is charged in `TMP_PAGES_USED` until it is freed.
 fn tmpfs_statfs() -> StatfsVals {
     const BSIZE: u64 = 4096;
-    let total_blocks = (MAX_TMP_FILES * MAX_TMP_SIZE) as u64 / BSIZE;
-    let (used_bytes, used_slots) = {
-        let tmp = TMP_FILES.lock();
-        let mut bytes = 0u64;
-        let mut slots = 0u64;
-        for e in tmp.iter() {
-            if !e.in_use { continue; }
-            slots += 1;
-            // Aliases (link_to != 0) carry no bytes of their own — counting
-            // them would charge a hard-linked file to the volume twice.
-            if !e.is_dir && e.link_to == 0 { bytes += e.len as u64; }
-        }
-        (bytes, slots)
-    };
-    let used_blocks = (used_bytes + BSIZE - 1) / BSIZE;
+    // Capacity is the page budget (half of RAM, Linux's default `size=`), and
+    // usage is the pages tmpfs actually holds — holes cost nothing, exactly as
+    // `df` reports a sparse file on Linux tmpfs.
+    let total_blocks = tmpfs_budget_pages() as u64;
+    let used_blocks = tmpfs_used_pages() as u64;
+    let used_slots = TMP_FILES.lock().iter().filter(|e| e.in_use).count() as u64;
     let free_blocks = total_blocks.saturating_sub(used_blocks);
     StatfsVals {
         f_type:  TMPFS_MAGIC,
@@ -8963,8 +9209,15 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
     write_stat_full(stat_ptr, mode, nlink, size, ino, 0, 0);
     if let VnodeKind::TmpFile { idx, .. } = kind {
         let t = TMP_FILES.lock();
-        let e = &t[tmp_owner(&t[..], idx)];
-        write_stat_times(stat_ptr, e.atime, e.mtime, e.ctime);
+        let owner = tmp_owner(&t[..], idx);
+        let e = &t[owner];
+        let (at, mt, ct) = (e.atime, e.mtime, e.ctime);
+        let blocks = if mode & 0o170000 == S_IFREG { Some(tmp_st_blocks(owner)) } else { None };
+        drop(t);
+        write_stat_times(stat_ptr, at, mt, ct);
+        if let Some(b) = blocks {
+            unsafe { ((stat_ptr as *mut u8).add(64) as *mut u64).write_unaligned(b); }
+        }
     }
     ok_reply()
 }
@@ -9126,8 +9379,12 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
                 let ino = 0x2000_0000 + owner as u64;
                 let (uid, gid) = (e.uid, e.gid);
                 let (at, mt, ct) = (e.atime, e.mtime, e.ctime);
+                let blocks = if ifmt == 0o100000 { Some(tmp_st_blocks(owner)) } else { None };
                 drop(tmp);
-                write_stat_full(stat_ptr, mode, nlink, size, ino, uid, gid);
+                match blocks {
+                    Some(b) => write_stat_full_blocks(stat_ptr, mode, nlink, size, ino, uid, gid, b),
+                    None    => write_stat_full(stat_ptr, mode, nlink, size, ino, uid, gid),
+                }
                 write_stat_times(stat_ptr, at, mt, ct);
                 return ok_reply();
             }
